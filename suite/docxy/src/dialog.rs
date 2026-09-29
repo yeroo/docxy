@@ -5,9 +5,11 @@
 //! reaches it through [`DialogStack::key_button`], and the harness verbs
 //! `dialog-read`, `dialog-set`, `dialog-tab` and `dialog-click` drive it. The
 //! drawn buttons, Enter/Escape and `dialog-click` all press through
-//! [`DialogStack::click`]. Controls are drawn read-only for now: `Control::set`
-//! is the handler a form's widgets will call, and today only `dialog-set` calls
-//! it. A modal loop would block the harness pump; this cannot.
+//! [`DialogStack::click`]. A form's controls are editable widgets (#649): a
+//! click focuses a field, toggles a checkbox, picks a radio item or steps a
+//! dropdown, and typed keys edit the focused field. Every one of those, and
+//! `dialog-set`, changes a value through `Control::set`. A modal loop would
+//! block the harness pump; this cannot.
 //!
 //! Staged values live in the [`Dialog`] until an accept button hands it to its
 //! owner, so Cancel discards by construction: it drops the dialog.
@@ -112,6 +114,26 @@ impl ControlKind {
     fn has_items(self) -> bool {
         matches!(self, Self::Radio | Self::Dropdown | Self::List)
     }
+    /// A field typed into.
+    pub fn is_text(self) -> bool {
+        matches!(
+            self,
+            Self::Text | Self::Number | Self::Date | Self::Duration
+        )
+    }
+    /// A control the keyboard and pointer can edit: a list and a grid are
+    /// still read-only widgets, and a label is never edited.
+    pub fn is_editable(self) -> bool {
+        self.is_text() || matches!(self, Self::Checkbox | Self::Radio | Self::Dropdown)
+    }
+}
+
+/// Text a number field accepts while it is being typed: a number, or the
+/// start of one (empty, a sign, a trailing point). The owner parses it on OK.
+fn partial_number(s: &str) -> bool {
+    let t = s.trim();
+    let body = t.strip_prefix(['-', '+']).unwrap_or(t);
+    body.chars().all(|c| c.is_ascii_digit() || c == '.') && body.matches('.').count() <= 1
 }
 
 /// A control's staged value.
@@ -238,7 +260,9 @@ impl Control {
             ControlKind::Number => match value()? {
                 Json::Num(n) if n.is_finite() => Value::Text(n.to_string()),
                 // Rust parses "NaN", "inf" and "1e999"; a field takes none of them.
-                Json::Str(s) if s.trim().parse::<f64>().is_ok_and(f64::is_finite) => {
+                Json::Str(s)
+                    if s.trim().parse::<f64>().is_ok_and(f64::is_finite) || partial_number(s) =>
+                {
                     Value::Text(s.clone())
                 }
                 _ => return Err(format!("'{label}' takes a number")),
@@ -380,6 +404,8 @@ pub(crate) struct Dialog {
     pub controls: Vec<Control>,
     pub buttons: Vec<Button>,
     pub owner: DialogOwner,
+    /// The control typed keys go to (an index into `controls`).
+    pub focus: Option<usize>,
 }
 
 impl Dialog {
@@ -408,6 +434,7 @@ impl Dialog {
                 })
                 .collect(),
             owner,
+            focus: None,
         }
     }
 
@@ -469,6 +496,125 @@ impl Dialog {
         self.controls[i].set(args)
     }
 
+    /// The controls Tab steps through on the current tab, in order.
+    fn focusable(&self) -> Vec<usize> {
+        (0..self.controls.len())
+            .filter(|&i| {
+                let c = &self.controls[i];
+                self.on_page(c) && c.visible && c.enabled && c.kind.is_editable()
+            })
+            .collect()
+    }
+
+    /// The focused control, when it is still on the current tab.
+    pub fn focused(&self) -> Option<&Control> {
+        self.focus
+            .filter(|i| self.focusable().contains(i))
+            .map(|i| &self.controls[i])
+    }
+
+    /// Move the focus to the next (or previous) editable control, wrapping.
+    pub fn focus_step(&mut self, back: bool) {
+        let order = self.focusable();
+        if order.is_empty() {
+            self.focus = None;
+            return;
+        }
+        let at = self.focus.and_then(|f| order.iter().position(|&i| i == f));
+        let next = match (at, back) {
+            (None, false) => 0,
+            (None, true) => order.len() - 1,
+            (Some(i), false) => (i + 1) % order.len(),
+            (Some(i), true) => (i + order.len() - 1) % order.len(),
+        };
+        self.focus = Some(order[next]);
+    }
+
+    /// Change the focused field's text through its input handler.
+    fn edit_focused(&mut self, edit: impl FnOnce(&mut String)) -> Result<(), String> {
+        let Some(c) = self.focused() else {
+            return Ok(());
+        };
+        if !c.kind.is_text() {
+            return Ok(());
+        }
+        let mut text = c.text();
+        edit(&mut text);
+        let i = self.focus.unwrap_or_default();
+        self.controls[i].set(&Json::obj(vec![("value", Json::Str(text))]))
+    }
+
+    /// A typed character: appended to the focused field. A character the
+    /// field refuses (a letter in a number) is the error, and changes nothing.
+    pub fn type_char(&mut self, ch: char) -> Result<(), String> {
+        self.edit_focused(|t| t.push(ch))
+    }
+
+    /// Backspace in the focused field.
+    pub fn backspace(&mut self) -> Result<(), String> {
+        self.edit_focused(|t| {
+            t.pop();
+        })
+    }
+
+    /// A press on a control, as the pointer makes it: a field takes the
+    /// focus, a checkbox toggles, a radio picks `item`, a dropdown steps to its
+    /// next item (or picks `item`). Each change goes through `Control::set`.
+    pub fn click_control(&mut self, index: usize, item: Option<usize>) -> Result<(), String> {
+        let c = self.controls.get(index).ok_or("no such control")?;
+        if !self.focusable().contains(&index) {
+            return Err(format!("'{}' cannot be edited", shown(&c.label)));
+        }
+        self.focus = Some(index);
+        let value = match (c.kind, &c.value) {
+            (ControlKind::Checkbox, Value::Bool(b)) => Json::Bool(!b),
+            (ControlKind::Radio | ControlKind::Dropdown, Value::Choice(cur)) => {
+                let n = c.items.len().max(1);
+                let pick = match (item, c.kind) {
+                    (Some(i), _) => i,
+                    (None, ControlKind::Dropdown) => cur.map_or(0, |i| (i + 1) % n),
+                    (None, _) => return Ok(()),
+                };
+                Json::Str(c.items.get(pick).ok_or("no such item")?.clone())
+            }
+            _ => return Ok(()),
+        };
+        self.controls[index].set(&Json::obj(vec![("value", value)]))
+    }
+
+    /// Up or Down on the focused radio group or dropdown: the item before or
+    /// after the chosen one.
+    pub fn step_focused(&mut self, down: bool) -> Result<(), String> {
+        let Some(c) = self.focused() else {
+            return Ok(());
+        };
+        let (Value::Choice(cur), true) = (&c.value, c.kind.has_items()) else {
+            return Ok(());
+        };
+        let n = c.items.len();
+        if n == 0 {
+            return Ok(());
+        }
+        let pick = match (cur, down) {
+            (None, _) => 0,
+            (Some(i), true) => (i + 1).min(n - 1),
+            (Some(i), false) => i.saturating_sub(1),
+        };
+        let i = self.focus.unwrap_or_default();
+        self.click_control(i, Some(pick))
+    }
+
+    /// Space: toggles a focused checkbox; a field takes it as a character.
+    pub fn space(&mut self) -> Result<(), String> {
+        match self.focused().map(|c| c.kind) {
+            Some(ControlKind::Checkbox) => {
+                let i = self.focus.unwrap_or_default();
+                self.click_control(i, None)
+            }
+            _ => self.type_char(' '),
+        }
+    }
+
     /// Switch to a tab by its label.
     pub fn select_tab(&mut self, want: &str) -> Result<(), String> {
         if self.tabs.is_empty() {
@@ -479,6 +625,9 @@ impl Dialog {
             .iter()
             .position(|t| fold(t) == fold(want))
             .ok_or_else(|| format!("no tab '{want}'; tabs: {}", self.tabs.join(", ")))?;
+        if self.focused().is_none() {
+            self.focus = None;
+        }
         Ok(())
     }
 
@@ -591,6 +740,11 @@ impl DialogStack {
         self.top_mut()?.select_tab(tab)
     }
 
+    /// The top dialog, for a widget's input (typing, a click on a control).
+    pub fn top_dialog_mut(&mut self) -> Result<&mut Dialog, String> {
+        self.top_mut()
+    }
+
     /// Press a button on the top dialog. Cancel drops it; Open pushes its
     /// child; Accept and Apply hand it to `apply` (the owner), and Accept
     /// closes it once the owner took it. An owner that refuses leaves the
@@ -666,6 +820,7 @@ mod tests_support {
                 Button::new("Cancel", ButtonRole::Cancel),
             ],
             owner: DialogOwner::Test,
+            focus: None,
         }
     }
 }

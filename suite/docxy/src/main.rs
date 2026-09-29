@@ -13691,7 +13691,7 @@ impl Docxy {
     /// swallows Tab for focus traversal before on_key_down sees it).
     fn tab_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // An open dialog takes Tab too; see `on_key`.
-        if self.dialog_takes_key("tab", Modifiers::default(), cx) {
+        if self.dialog_takes_key("tab", None, Modifiers::default(), cx) {
             return;
         }
         if self.tab_more_open {
@@ -13761,7 +13761,7 @@ impl Docxy {
             shift: true,
             ..Modifiers::default()
         };
-        if self.dialog_takes_key("tab", shift, cx) {
+        if self.dialog_takes_key("tab", None, shift, cx) {
             return;
         }
         if self.tab_more_open {
@@ -13805,7 +13805,12 @@ impl Docxy {
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // An open dialog takes every key first (#393): nothing under it, not
         // the tab list, KeyTips or a Project shortcut, may see one.
-        if self.dialog_takes_key(&ev.keystroke.key, ev.keystroke.modifiers, cx) {
+        if self.dialog_takes_key(
+            &ev.keystroke.key,
+            ev.keystroke.key_char.as_deref(),
+            ev.keystroke.modifiers,
+            cx,
+        ) {
             return;
         }
         if self.tab_more_open {

@@ -1218,7 +1218,7 @@ fn summary_tab() -> DocTab {
 /// A key as the window delivers it: an open dialog takes it first, as
 /// `on_key` does, and only then does the Project see it.
 fn key(t: &mut DocTab, key: &str, text: Option<&str>, m: Modifiers) {
-    if dialog_key(t, key, m) {
+    if dialog_key(t, key, text, m) {
         return;
     }
     if let Some(act) = project_input(t, key, text, m) {
