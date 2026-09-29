@@ -24,6 +24,12 @@
 //! | `link.add` | `{uid, pred, type?, lag?}` | the updated task (`lag` uses Predecessors cell spellings such as `4h`, `2ed`, `50%`; other duration spellings such as `1 month` are read as working-days lags) |
 //! | `link.del` | `{uid, pred}` | the updated task |
 //! | `find` | `{query, fields?}` | `{count, tasks:[…]}` |
+//! | `assign.list` | `{uid?, resource?, fields?}` | `{count, assignments:[…]}`: every assignment, or those of task `uid` and/or of `resource` (a resource uid, or a name matched ignoring ASCII case) |
+//! | `assign.get` | `{uid, fields?}` | one assignment (by its own uid) |
+//! | `assign.fields` | — | `{count, fields:[name…]}`: the assignment field names `fields` can read |
+//! | `assign.add` | `{task, resource, units?, work?, fields?}` | the new assignment (`resource` a uid, or a name; a new name is staged as a work resource; a new name that is a number or contains a comma is refused: pass a uid as a number) |
+//! | `assign.set` | `{uid, units?, work?, rate_table?, delay?, fields?}` | the updated assignment, after its task is rescheduled |
+//! | `assign.del` | `{uid}` | `{deleted, task}` |
 //!
 //! `fields` is a list of Project field names (`["% Complete", "Baseline1
 //! Finish"]`, matched ignoring ASCII case and surrounding space). The verbs
@@ -38,23 +44,62 @@
 //! name fails the whole call. See `projcore::editor::fields` for each
 //! field's default and unit.
 //!
+//! An assignment reads as `{uid, task, resource, resource_name, units,
+//! work_hours, regular_work_hours, overtime_work_hours, cost, rate_table,
+//! baseline_work_hours, baseline_cost, actual_work_hours,
+//! remaining_work_hours, actual_cost, remaining_cost, percent_work_complete,
+//! start, finish, delay_hours, contour}`: units a fraction (1.0 = 100%; a
+//! material's quantity), work in hours, money in currency units, `null` for an
+//! absent stored value, `rate_table` a letter (`A` when unset), `contour`
+//! Project's name (`Flat`), `start`/`finish` its own dates. The assign verbs
+//! take `fields` too, with Project's assignment field names (see
+//! `projcore::editor::fields::assignment`; units read as a number). Arguments:
+//! `units` a number or a percent string (`"50%"`); `work` and `delay` a
+//! number of hours or a duration (`"40h"`, `"5d"`); `rate_table` `"A"`..`"E"`.
+//! The task is rescheduled by its type, as in Project: a units edit on a
+//! Fixed Units task keeps the work and moves the duration; on Fixed Duration
+//! the work follows the units, and units given together with work are
+//! recomputed from the work. Every argument is checked before the edit, so
+//! a rejected call leaves the editor untouched.
+//!
 //! `path_info` provides the common `proj.path` fields. File verbs (`proj.save`,
 //! `proj.reload`, `proj.open`) belong to the host and are not dispatched here.
 
 use ctlcore::json::Json;
 use projcore::datetime::DateTime;
 use projcore::editor::{
-    DURATION_HINT, Editor, Field, FieldReader, FieldValue, TaskPatch, duration_format_code,
-    field_names, parse_duration, parse_lag, parse_task_duration_unit,
+    AssignmentField, AssignmentPatch, DURATION_HINT, Editor, Field, FieldReader, FieldValue,
+    ResourceRef, TaskPatch, assignment_dates, assignment_field_names, duration_format_code,
+    field_names, parse_duration, parse_lag, parse_task_duration_unit, rate_table_letter,
+    read_assignment_field, work_contour_name,
 };
-use projcore::model::{LagFormat, LagUnit, LinkType, Predecessor, Task};
+use projcore::model::{Assignment, LagFormat, LagUnit, LinkType, Predecessor, Rate, Task};
 
 /// Successful calls to these verbs signal agent editing activity.
-pub const MUTATING: &[&str] = &["task.set", "task.add", "task.del", "link.add", "link.del"];
+pub const MUTATING: &[&str] = &[
+    "task.set",
+    "task.add",
+    "task.del",
+    "link.add",
+    "link.del",
+    "assign.add",
+    "assign.set",
+    "assign.del",
+];
 
 /// Recognize editor verbs before a host resolves its target document.
 pub fn is_editor_verb(verb: &str) -> bool {
-    MUTATING.contains(&verb) || matches!(verb, "task.list" | "task.get" | "task.fields" | "find")
+    MUTATING.contains(&verb)
+        || matches!(
+            verb,
+            "task.list"
+                | "task.get"
+                | "task.fields"
+                | "find"
+                | "assign.list"
+                | "assign.get"
+                | "assign.fields"
+        )
 }
 
 /// Project verbs independent of the host's file handling. `None` means the
@@ -70,6 +115,12 @@ pub fn dispatch_editor(ed: &mut Editor, verb: &str, args: &Json) -> Option<Resul
         "link.add" => link_add(ed, args),
         "link.del" => link_del(ed, args),
         "find" => find(ed, args),
+        "assign.list" => assign_list(ed, args),
+        "assign.get" => assign_get(ed, args),
+        "assign.fields" => Ok(assign_fields()),
+        "assign.add" => assign_add(ed, args),
+        "assign.set" => assign_set(ed, args),
+        "assign.del" => assign_del(ed, args),
         _ => return None,
     })
 }
@@ -125,6 +176,14 @@ fn parse_link_name(s: &str) -> Option<LinkType> {
 /// The fields a read asks for, each with the name as the caller wrote it;
 /// `None` when it asks for none. Every name resolves before any output.
 fn fields_arg(args: &Json) -> Result<Option<Vec<(String, Field)>>, String> {
+    fields_of(args, Field::parse)
+}
+
+/// `fields` resolved by `parse`, each with the name as the caller wrote it.
+fn fields_of<F>(
+    args: &Json,
+    parse: impl Fn(&str) -> Result<F, String>,
+) -> Result<Option<Vec<(String, F)>>, String> {
     let Some(fields) = args.get("fields") else {
         return Ok(None);
     };
@@ -137,7 +196,7 @@ fn fields_arg(args: &Json) -> Result<Option<Vec<(String, Field)>>, String> {
             let name = name
                 .as_str()
                 .ok_or("'fields' must be a list of field names")?;
-            Ok((name.to_string(), Field::parse(name)?))
+            Ok((name.to_string(), parse(name)?))
         })
         .collect::<Result<Vec<_>, String>>()
         .map(Some)
@@ -148,14 +207,17 @@ fn field_value_json(value: FieldValue) -> Json {
         FieldValue::Null => Json::Null,
         FieldValue::Bool(b) => Json::Bool(b),
         FieldValue::Int(n) | FieldValue::Minutes(n) => Json::Num(n as f64),
-        FieldValue::Money(m) => Json::Num(m),
+        FieldValue::Money(m) | FieldValue::Number(m) => Json::Num(m),
         FieldValue::Date(d) => Json::Str(dt_str(d)),
         FieldValue::Text(s) => Json::Str(s),
     }
 }
 
 fn task_fields() -> Json {
-    let names = field_names();
+    names_json(field_names())
+}
+
+fn names_json(names: Vec<String>) -> Json {
     Json::obj(vec![
         ("count", Json::Num(names.len() as f64)),
         (
@@ -432,6 +494,266 @@ fn link_del(ed: &mut Editor, args: &Json) -> Result<Json, String> {
     let asked = fields_arg(args)?;
     ed.remove_predecessor(uid, uid_arg(args, "pred")?)?;
     task_reply(ed, uid, asked.as_deref())
+}
+
+// ---------------------------------------------------------------------------
+// Assignments
+// ---------------------------------------------------------------------------
+
+fn assign_fields() -> Json {
+    names_json(assignment_field_names())
+}
+
+fn hours(min: i64) -> Json {
+    Json::Num(min as f64 / 60.0)
+}
+
+fn opt_hours(min: Option<i64>) -> Json {
+    min.map_or(Json::Null, hours)
+}
+
+/// Money MSPDI stores in hundredths, as currency units.
+fn money(rate: Option<&Rate>) -> Json {
+    rate.and_then(Rate::to_f64)
+        .map_or(Json::Null, |h| Json::Num(h / 100.0))
+}
+
+/// One assignment as JSON, with the `fields` asked for.
+fn assignment_json(
+    ed: &Editor,
+    a: &Assignment,
+    asked: Option<&[(String, AssignmentField)]>,
+) -> Json {
+    let proj = ed.project();
+    let resource = proj.resources.iter().find(|r| r.uid == a.resource_uid);
+    let baseline = a.baseline(0);
+    let dates = assignment_dates(ed, a);
+    let date = |d: Option<DateTime>| d.map_or(Json::Null, |d| Json::Str(dt_str(d)));
+    let mut out = vec![
+        ("uid", Json::Num(a.uid as f64)),
+        ("task", Json::Num(a.task_uid as f64)),
+        ("resource", Json::Num(a.resource_uid as f64)),
+        (
+            "resource_name",
+            resource.map_or(Json::Null, |r| Json::Str(r.name.clone())),
+        ),
+        ("units", Json::Num(a.units)),
+        ("work_hours", hours(a.work_min)),
+        ("regular_work_hours", opt_hours(a.regular_work_min)),
+        ("overtime_work_hours", opt_hours(a.overtime_work_min)),
+        ("cost", money(a.cost.as_ref())),
+        (
+            "rate_table",
+            Json::Str(rate_table_letter(a.cost_rate_table).to_string()),
+        ),
+        (
+            "baseline_work_hours",
+            opt_hours(baseline.and_then(|b| b.work_min)),
+        ),
+        (
+            "baseline_cost",
+            money(baseline.and_then(|b| b.cost.as_ref())),
+        ),
+        ("actual_work_hours", opt_hours(a.actual_work_min)),
+        ("remaining_work_hours", opt_hours(a.remaining_work_min)),
+        ("actual_cost", money(a.actual_cost.as_ref())),
+        ("remaining_cost", money(a.remaining_cost.as_ref())),
+        (
+            "percent_work_complete",
+            a.percent_work_complete
+                .map_or(Json::Null, |p| Json::Num(f64::from(p))),
+        ),
+        ("start", date(dates.map(|(s, _)| s))),
+        ("finish", date(dates.map(|(_, f)| f))),
+        ("delay_hours", hours(a.delay_min())),
+        (
+            "contour",
+            Json::Str(work_contour_name(a.work_contour).into()),
+        ),
+    ];
+    if let Some(asked) = asked {
+        let values = asked
+            .iter()
+            .map(|(name, field)| {
+                let read = read_assignment_field(ed, a, *field);
+                (
+                    name.clone(),
+                    Json::obj(vec![
+                        ("text", Json::Str(read.text)),
+                        ("value", field_value_json(read.value)),
+                    ]),
+                )
+            })
+            .collect();
+        out.push(("fields", Json::Obj(values)));
+    }
+    Json::obj(out)
+}
+
+fn assignment_uid(args: &Json) -> Result<i32, String> {
+    args.get("uid")
+        .and_then(Json::as_i64)
+        .and_then(|n| i32::try_from(n).ok())
+        .ok_or_else(|| "needs a numeric 'uid' (an assignment UID)".to_string())
+}
+
+/// Assignment `uid` as a read or an edit replies with it.
+fn assignment_reply(
+    ed: &Editor,
+    uid: i32,
+    asked: Option<&[(String, AssignmentField)]>,
+) -> Result<Json, String> {
+    let a = ed
+        .project()
+        .assignments
+        .iter()
+        .find(|a| a.uid == uid)
+        .ok_or_else(|| format!("no assignment with uid {uid}"))?;
+    Ok(assignment_json(ed, a, asked))
+}
+
+/// `resource` as a uid (a number) or a name (a string).
+fn resource_arg(args: &Json) -> Result<Option<ResourceRef<'_>>, String> {
+    let Some(r) = args.get("resource") else {
+        return Ok(None);
+    };
+    if let Some(name) = r.as_str() {
+        return Ok(Some(ResourceRef::Name(name)));
+    }
+    r.as_i64()
+        .and_then(|n| i32::try_from(n).ok())
+        .map(|uid| Some(ResourceRef::Uid(uid)))
+        .ok_or_else(|| "'resource' must be a resource uid or name".to_string())
+}
+
+/// `units` as a fraction: a number, or a percent string (`"50%"`).
+fn units_arg(args: &Json) -> Result<Option<f64>, String> {
+    let Some(u) = args.get("units") else {
+        return Ok(None);
+    };
+    let units = match u.as_str() {
+        Some(text) => {
+            let text = text.trim();
+            match text.strip_suffix('%') {
+                Some(n) => n.trim_end().parse::<f64>().ok().map(|n| n / 100.0),
+                None => text.parse::<f64>().ok(),
+            }
+        }
+        None => u.as_f64(),
+    };
+    units
+        .filter(|u| u.is_finite())
+        .map(Some)
+        .ok_or_else(|| "couldn't read 'units' (try 0.5 or \"50%\")".to_string())
+}
+
+/// `key` in minutes: a number of hours, or a duration (`"40h"`, `"5d"`).
+fn hours_arg(ed: &Editor, args: &Json, key: &str) -> Result<Option<i64>, String> {
+    let Some(v) = args.get(key) else {
+        return Ok(None);
+    };
+    // A bare number, even as a string, is hours; a duration needs its unit
+    // (`parse_duration` would read a bare number as days).
+    let hours = match v.as_str() {
+        Some(text) => text.trim().parse::<f64>().ok(),
+        None => v.as_f64(),
+    };
+    let min = match (hours, v.as_str()) {
+        (Some(h), _) => Some(h)
+            .filter(|h| h.is_finite())
+            .map(|h| (h * 60.0).round() as i64),
+        (None, Some(text)) => parse_duration(text, ed.project()),
+        (None, None) => None,
+    };
+    min.map(Some)
+        .ok_or_else(|| format!("couldn't read '{key}' (hours, or a duration such as 40h or 5d)"))
+}
+
+/// `rate_table` as a table number, from its letter `A`..`E`.
+fn rate_table_arg(args: &Json) -> Result<Option<u8>, String> {
+    let Some(t) = args.get("rate_table") else {
+        return Ok(None);
+    };
+    let letter = t.as_str().map(str::trim).unwrap_or_default();
+    match letter.to_ascii_uppercase().as_bytes() {
+        [l @ b'A'..=b'E'] => Ok(Some(l - b'A')),
+        _ => Err("'rate_table' must be a letter A to E".into()),
+    }
+}
+
+fn assign_list(ed: &Editor, args: &Json) -> Result<Json, String> {
+    let asked = fields_of(args, AssignmentField::parse)?;
+    let task = args.get("uid").map(|_| uid_arg(args, "uid")).transpose()?;
+    if let Some(uid) = task {
+        task_index(ed, uid)?;
+    }
+    let proj = ed.project();
+    let resource = match resource_arg(args)? {
+        None => None,
+        Some(ResourceRef::Uid(uid)) => {
+            if !proj.resources.iter().any(|r| r.uid == uid) {
+                return Err(format!("no resource with uid {uid}"));
+            }
+            Some(uid)
+        }
+        Some(ResourceRef::Name(name)) => Some(
+            proj.resources
+                .iter()
+                .find(|r| r.name.eq_ignore_ascii_case(name.trim()))
+                .ok_or_else(|| format!("no resource named '{name}'"))?
+                .uid,
+        ),
+    };
+    let assignments: Vec<Json> = proj
+        .assignments
+        .iter()
+        .filter(|a| task.is_none_or(|uid| a.task_uid == uid))
+        .filter(|a| resource.is_none_or(|uid| a.resource_uid == uid))
+        .map(|a| assignment_json(ed, a, asked.as_deref()))
+        .collect();
+    Ok(Json::obj(vec![
+        ("count", Json::Num(assignments.len() as f64)),
+        ("assignments", Json::Arr(assignments)),
+    ]))
+}
+
+fn assign_get(ed: &Editor, args: &Json) -> Result<Json, String> {
+    let uid = assignment_uid(args)?;
+    let asked = fields_of(args, AssignmentField::parse)?;
+    assignment_reply(ed, uid, asked.as_deref())
+}
+
+fn assign_add(ed: &mut Editor, args: &Json) -> Result<Json, String> {
+    let task = uid_arg(args, "task")?;
+    let resource =
+        resource_arg(args)?.ok_or("assign.add needs a 'resource' (a resource uid or name)")?;
+    let asked = fields_of(args, AssignmentField::parse)?;
+    let units = units_arg(args)?;
+    let work = hours_arg(ed, args, "work")?;
+    let uid = ed.add_assignment(task, resource, units, work)?;
+    assignment_reply(ed, uid, asked.as_deref())
+}
+
+fn assign_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
+    let uid = assignment_uid(args)?;
+    let asked = fields_of(args, AssignmentField::parse)?;
+    let patch = AssignmentPatch {
+        units: units_arg(args)?,
+        work_min: hours_arg(ed, args, "work")?,
+        rate_table: rate_table_arg(args)?,
+        delay_min: hours_arg(ed, args, "delay")?,
+    };
+    ed.set_assignment(uid, patch)?;
+    assignment_reply(ed, uid, asked.as_deref())
+}
+
+fn assign_del(ed: &mut Editor, args: &Json) -> Result<Json, String> {
+    let uid = assignment_uid(args)?;
+    let task = ed.delete_assignment(uid)?;
+    Ok(Json::obj(vec![
+        ("deleted", Json::Num(uid as f64)),
+        ("task", Json::Num(task as f64)),
+    ]))
 }
 
 #[cfg(test)]
@@ -1392,5 +1714,366 @@ mod tests {
             r#"{"path":"ctl-test.xml","modified":false,"name":"Untitled","tasks":1,"start":"2026-01-05 08:00","finish":"2026-01-05 17:00"}"#
         );
         assert_eq!(path_info(None, &ed).get("path"), Some(&Json::Null));
+    }
+
+    // ---- assignments (#395) ----
+
+    fn run(ed: &mut Editor, verb: &str, args: &str) -> Result<Json, String> {
+        dispatch_editor(ed, verb, &Json::parse(args).unwrap()).unwrap()
+    }
+
+    fn num(j: &Json, key: &str) -> f64 {
+        j.get(key).and_then(Json::as_f64).unwrap()
+    }
+
+    /// Task 1, "Build", 5 days, typed `kind`, with stored (zero) totals; Ann
+    /// (1) at $50/h and $80/h on rate table B, Bob (2) at $30/h.
+    fn staffed(kind: projcore::model::TaskType, effort_driven: bool) -> Editor {
+        use projcore::model::{RateEntry, Resource};
+        let mut p = new_project();
+        let t = &mut p.tasks[0];
+        t.name = "Build".into();
+        t.duration_min = 5 * 480;
+        t.task_type = Some(kind);
+        t.effort_driven = Some(effort_driven);
+        t.work_min = Some(0);
+        t.cost = Rate::parse("0");
+        let resource = |uid, name: &str, rate| Resource {
+            uid,
+            id: uid,
+            name: name.into(),
+            max_units: 1.0,
+            standard_rate: Rate::parse(rate),
+            ..Resource::default()
+        };
+        let mut ann = resource(1, "Ann", "50");
+        ann.rates.push(RateEntry {
+            rate_table: Some(1),
+            standard_rate: Rate::parse("80"),
+            ..RateEntry::default()
+        });
+        p.resources = vec![ann, resource(2, "Bob", "30")];
+        Editor::new(p)
+    }
+
+    #[test]
+    fn assign_verbs_are_editor_verbs_and_edits_mutate() {
+        for verb in ["assign.list", "assign.get", "assign.fields"] {
+            assert!(is_editor_verb(verb), "{verb}");
+            assert!(!MUTATING.contains(&verb), "{verb}");
+        }
+        for verb in ["assign.add", "assign.set", "assign.del"] {
+            assert!(is_editor_verb(verb), "{verb}");
+            assert!(MUTATING.contains(&verb), "{verb}");
+        }
+    }
+
+    /// The issue's acceptance script: two resources at different units on
+    /// one task, a units edit, a deletion and a rate table switch.
+    #[test]
+    fn a_script_assigns_changes_deletes_and_reprices_assignments() {
+        use projcore::model::TaskType;
+        let mut ed = staffed(TaskType::FixedDuration, false);
+        let ann = run(
+            &mut ed,
+            "assign.add",
+            r#"{"task":1,"resource":"Ann","units":1}"#,
+        )
+        .unwrap();
+        let bob = run(
+            &mut ed,
+            "assign.add",
+            r#"{"task":1,"resource":2,"units":"50%"}"#,
+        )
+        .unwrap();
+        let (ann_uid, bob_uid) = (num(&ann, "uid"), num(&bob, "uid"));
+        let list = run(&mut ed, "assign.list", r#"{"uid":1}"#).unwrap();
+        assert_eq!(num(&list, "count"), 2.0);
+        let rows = list.get("assignments").unwrap().as_array().unwrap();
+        let read = |a: &Json| {
+            (
+                a.get_str("resource_name").unwrap().to_string(),
+                num(a, "units"),
+                num(a, "work_hours"),
+                num(a, "cost"),
+            )
+        };
+        assert_eq!(read(&rows[0]), ("Ann".into(), 1.0, 40.0, 2000.0));
+        assert_eq!(read(&rows[1]), ("Bob".into(), 0.5, 20.0, 600.0));
+
+        // A units edit on a Fixed Duration task recomputes the work.
+        let set = format!(r#"{{"uid":{bob_uid},"units":1}}"#);
+        let bob = run(&mut ed, "assign.set", &set).unwrap();
+        assert_eq!((num(&bob, "work_hours"), num(&bob, "cost")), (40.0, 1200.0));
+        let task = run(
+            &mut ed,
+            "task.get",
+            r#"{"uid":1,"fields":["Duration","Work","Cost"]}"#,
+        )
+        .unwrap();
+        assert_eq!(num(&task, "duration_days"), 5.0);
+        assert_eq!(field(&task, "Work"), ("80 hrs", &Json::Num(4800.0)));
+        assert_eq!(field(&task, "Cost"), ("$3,200.00", &Json::Num(3200.0)));
+
+        // Deleting Bob leaves Ann exactly as she was.
+        let get_ann = format!(r#"{{"uid":{ann_uid}}}"#);
+        let before = run(&mut ed, "assign.get", &get_ann).unwrap();
+        let del = run(&mut ed, "assign.del", &format!(r#"{{"uid":{bob_uid}}}"#)).unwrap();
+        assert_eq!((num(&del, "deleted"), num(&del, "task")), (bob_uid, 1.0));
+        assert_eq!(run(&mut ed, "assign.get", &get_ann).unwrap(), before);
+        assert_eq!(
+            num(&run(&mut ed, "assign.list", "{}").unwrap(), "count"),
+            1.0
+        );
+
+        // Rate table B prices Ann at $80/h.
+        let set = format!(r#"{{"uid":{ann_uid},"rate_table":"b"}}"#);
+        let ann = run(&mut ed, "assign.set", &set).unwrap();
+        assert_eq!(ann.get_str("rate_table"), Some("B"));
+        assert_eq!(num(&ann, "cost"), 3200.0);
+    }
+
+    #[test]
+    fn a_units_edit_on_fixed_units_keeps_work_and_moves_the_duration() {
+        use projcore::model::TaskType;
+        let mut ed = staffed(TaskType::FixedUnits, false);
+        let ann = run(&mut ed, "assign.add", r#"{"task":1,"resource":1}"#).unwrap();
+        let set = format!(r#"{{"uid":{},"units":0.5}}"#, num(&ann, "uid"));
+        run(&mut ed, "assign.set", &set).unwrap();
+        let get = format!(r#"{{"uid":{}}}"#, num(&ann, "uid"));
+        let ann = run(&mut ed, "assign.get", &get).unwrap();
+        assert_eq!((num(&ann, "units"), num(&ann, "work_hours")), (0.5, 40.0));
+        let task = run(&mut ed, "task.get", r#"{"uid":1,"fields":["Work"]}"#).unwrap();
+        assert_eq!(num(&task, "duration_days"), 10.0);
+        assert_eq!(field(&task, "Work"), ("40 hrs", &Json::Num(2400.0)));
+    }
+
+    #[test]
+    fn an_assignment_reads_its_own_numbers_and_asked_fields() {
+        use projcore::model::TaskType;
+        let mut ed = staffed(TaskType::FixedUnits, false);
+        let ann = run(
+            &mut ed,
+            "assign.add",
+            r#"{"task":1,"resource":"ann","fields":["Work","Cost","Units"]}"#,
+        )
+        .unwrap();
+        assert_eq!(field(&ann, "Work"), ("40 hrs", &Json::Num(2400.0)));
+        assert_eq!(field(&ann, "Cost"), ("$2,000.00", &Json::Num(2000.0)));
+        assert_eq!(field(&ann, "Units"), ("100%", &Json::Num(1.0)));
+        let keys = [
+            "uid",
+            "task",
+            "resource",
+            "resource_name",
+            "units",
+            "work_hours",
+            "regular_work_hours",
+            "overtime_work_hours",
+            "cost",
+            "rate_table",
+            "baseline_work_hours",
+            "baseline_cost",
+            "actual_work_hours",
+            "remaining_work_hours",
+            "actual_cost",
+            "remaining_cost",
+            "percent_work_complete",
+            "start",
+            "finish",
+            "delay_hours",
+            "contour",
+            "fields",
+        ];
+        let Json::Obj(pairs) = &ann else { panic!() };
+        assert_eq!(
+            pairs.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            keys
+        );
+        assert_eq!(ann.get("overtime_work_hours"), Some(&Json::Null));
+        assert_eq!(ann.get("baseline_cost"), Some(&Json::Null));
+        assert_eq!(ann.get_str("rate_table"), Some("A"));
+        assert_eq!(ann.get_str("contour"), Some("Flat"));
+        assert_eq!(ann.get_str("start"), Some("2026-01-05 08:00"));
+        assert_eq!(ann.get_str("finish"), Some("2026-01-09 17:00"));
+        assert_eq!(num(&ann, "remaining_work_hours"), 40.0);
+
+        // Work and delay take hours or a duration.
+        let set = format!(r#"{{"uid":{},"work":"4d","delay":8}}"#, num(&ann, "uid"));
+        let ann = run(&mut ed, "assign.set", &set).unwrap();
+        assert_eq!(
+            (num(&ann, "work_hours"), num(&ann, "delay_hours")),
+            (32.0, 8.0)
+        );
+
+        let fields = run(&mut ed, "assign.fields", "{}").unwrap();
+        let listed = fields.get("fields").unwrap().as_array().unwrap();
+        assert_eq!(num(&fields, "count"), listed.len() as f64);
+        for name in ["Work", "Cost", "Units", "Cost Rate Table", "Budget Cost"] {
+            assert!(listed.iter().any(|n| n.as_str() == Some(name)), "{name}");
+        }
+        // Every listed name reads.
+        let get = Json::obj(vec![
+            ("uid", Json::Num(num(&ann, "uid"))),
+            ("fields", Json::Arr(listed.to_vec())),
+        ]);
+        let all = dispatch_editor(&mut ed, "assign.get", &get)
+            .unwrap()
+            .unwrap();
+        let Json::Obj(read) = all.get("fields").unwrap() else {
+            panic!()
+        };
+        assert_eq!(read.len(), listed.len());
+    }
+
+    #[test]
+    fn a_bare_number_of_work_or_delay_is_hours_even_as_a_string() {
+        use projcore::model::TaskType;
+        for (work, delay, hours) in [
+            ("8", "8", 8.0),
+            ("8.5", "2", 8.5),
+            ("\"8\"", "\"8\"", 8.0),
+            ("\" 12 \"", "\"4\"", 12.0),
+            ("\"1d\"", "\"1d\"", 8.0),
+            ("\"6h\"", "\"6h\"", 6.0),
+        ] {
+            let mut ed = staffed(TaskType::FixedUnits, false);
+            let ann = run(&mut ed, "assign.add", r#"{"task":1,"resource":1}"#).unwrap();
+            let uid = num(&ann, "uid");
+            let set = format!(r#"{{"uid":{uid},"work":{work},"delay":{delay}}}"#);
+            let ann = run(&mut ed, "assign.set", &set).unwrap();
+            assert_eq!(num(&ann, "work_hours"), hours, "{work}");
+            let expect = match delay {
+                "8" | "\"8\"" | "\"1d\"" => 8.0,
+                "2" => 2.0,
+                "\"4\"" => 4.0,
+                _ => 6.0,
+            };
+            assert_eq!(num(&ann, "delay_hours"), expect, "{delay}");
+        }
+        // Far beyond the scheduling horizon.
+        let mut ed = staffed(TaskType::FixedUnits, false);
+        let ann = run(&mut ed, "assign.add", r#"{"task":1,"resource":1}"#).unwrap();
+        let uid = num(&ann, "uid");
+        let before = (ed.project().clone(), ed.undo_depth());
+        for key in ["work", "delay"] {
+            let set = format!(r#"{{"uid":{uid},"{key}":1e17}}"#);
+            let err = run(&mut ed, "assign.set", &set).unwrap_err();
+            assert_eq!(err, format!("{key} is beyond the scheduling range"));
+            assert_eq!((ed.project().clone(), ed.undo_depth()), before);
+        }
+    }
+
+    #[test]
+    fn a_resource_uid_spelled_as_a_string_is_refused_not_staged() {
+        use projcore::model::TaskType;
+        let mut ed = staffed(TaskType::FixedUnits, false);
+        let before = (ed.project().clone(), ed.undo_depth(), ed.dirty());
+        let err = run(&mut ed, "assign.add", r#"{"task":1,"resource":"2"}"#).unwrap_err();
+        assert_eq!(
+            err,
+            "no resource named '2'; pass a resource uid as a number"
+        );
+        assert_eq!((ed.project().clone(), ed.undo_depth(), ed.dirty()), before);
+        let bob = run(&mut ed, "assign.add", r#"{"task":1,"resource":2}"#).unwrap();
+        assert_eq!(bob.get_str("resource_name"), Some("Bob"));
+    }
+
+    #[test]
+    fn assignments_filter_by_task_and_resource() {
+        use projcore::model::TaskType;
+        let mut ed = staffed(TaskType::FixedUnits, false);
+        run(&mut ed, "task.add", r#"{"name":"Test"}"#).unwrap();
+        run(&mut ed, "assign.add", r#"{"task":1,"resource":1}"#).unwrap();
+        run(&mut ed, "assign.add", r#"{"task":2,"resource":1}"#).unwrap();
+        run(&mut ed, "assign.add", r#"{"task":2,"resource":2}"#).unwrap();
+        let count = |ed: &mut Editor, args| num(&run(ed, "assign.list", args).unwrap(), "count");
+        assert_eq!(count(&mut ed, "{}"), 3.0);
+        assert_eq!(count(&mut ed, r#"{"uid":2}"#), 2.0);
+        assert_eq!(count(&mut ed, r#"{"resource":"ANN"}"#), 2.0);
+        assert_eq!(count(&mut ed, r#"{"resource":2}"#), 1.0);
+        assert_eq!(count(&mut ed, r#"{"uid":1,"resource":2}"#), 0.0);
+        for (args, err) in [
+            (r#"{"resource":"Nobody"}"#, "no resource named 'Nobody'"),
+            (r#"{"resource":9}"#, "no resource with uid 9"),
+            (r#"{"uid":9}"#, "no task with uid 9"),
+            (r#"{"fields":["Nope"]}"#, "unknown assignment field 'Nope'"),
+        ] {
+            assert_eq!(run(&mut ed, "assign.list", args).unwrap_err(), err);
+        }
+    }
+
+    #[test]
+    fn assign_edits_are_one_undo_step_and_rejections_touch_nothing() {
+        use projcore::model::TaskType;
+        let mut ed = staffed(TaskType::FixedUnits, false);
+        let before = ed.project().clone();
+        run(
+            &mut ed,
+            "assign.add",
+            r#"{"task":1,"resource":"Carol","work":10}"#,
+        )
+        .unwrap();
+        assert_eq!(ed.undo_depth(), 1);
+        assert!(ed.project().resources.iter().any(|r| r.name == "Carol"));
+        assert!(ed.undo());
+        assert_eq!(ed.project(), &before);
+        assert!(ed.redo());
+        let uid = ed.project().assignments[0].uid;
+        for (verb, args) in [
+            ("assign.add", r#"{"task":1,"resource":9}"#.to_string()),
+            ("assign.add", r#"{"task":1}"#.to_string()),
+            (
+                "assign.add",
+                r#"{"task":1,"resource":1,"units":0}"#.to_string(),
+            ),
+            (
+                "assign.add",
+                r#"{"task":1,"resource":1,"units":"lots"}"#.to_string(),
+            ),
+            (
+                "assign.add",
+                r#"{"task":1,"resource":1,"fields":["Nope"]}"#.to_string(),
+            ),
+            ("assign.set", r#"{"uid":99,"units":1}"#.to_string()),
+            ("assign.set", format!(r#"{{"uid":{uid}}}"#)),
+            ("assign.set", format!(r#"{{"uid":{uid},"rate_table":"F"}}"#)),
+            ("assign.set", format!(r#"{{"uid":{uid},"rate_table":1}}"#)),
+            ("assign.set", format!(r#"{{"uid":{uid},"work":"soon"}}"#)),
+            ("assign.set", format!(r#"{{"uid":{uid},"work":-1}}"#)),
+            (
+                "assign.set",
+                format!(r#"{{"uid":{uid},"units":2,"fields":["Nope"]}}"#),
+            ),
+            ("assign.del", r#"{"uid":99}"#.to_string()),
+            ("assign.get", r#"{"uid":99}"#.to_string()),
+        ] {
+            let state = (
+                ed.project().clone(),
+                ed.undo_depth(),
+                ed.redo_depth(),
+                ed.dirty(),
+            );
+            assert!(run(&mut ed, verb, &args).is_err(), "{verb} {args}");
+            let after = (
+                ed.project().clone(),
+                ed.undo_depth(),
+                ed.redo_depth(),
+                ed.dirty(),
+            );
+            assert_eq!(after, state, "{verb} {args}");
+        }
+        // A value it already has records nothing.
+        let depth = ed.undo_depth();
+        run(
+            &mut ed,
+            "assign.set",
+            &format!(r#"{{"uid":{uid},"rate_table":"A"}}"#),
+        )
+        .unwrap();
+        assert_eq!(ed.undo_depth(), depth);
+        run(&mut ed, "assign.del", &format!(r#"{{"uid":{uid}}}"#)).unwrap();
+        assert_eq!(ed.undo_depth(), depth + 1);
+        assert!(ed.project().assignments.is_empty());
     }
 }

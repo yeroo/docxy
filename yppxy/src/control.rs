@@ -24,12 +24,19 @@
 //! | `link.add` | `{uid, pred, type?, lag?, fields?}` | the updated task |
 //! | `link.del` | `{uid, pred, fields?}` | the updated task |
 //! | `find` | `{query, fields?}` | `{count, tasks:[…]}` |
+//! | `assign.list` | `{uid?, resource?, fields?}` | `{count, assignments:[…]}` (of task `uid` and/or `resource`, a uid or name) |
+//! | `assign.get` | `{uid, fields?}` | one assignment |
+//! | `assign.fields` | — | `{count, fields:[name…]}`: the assignment field names |
+//! | `assign.add` | `{task, resource, units?, work?, fields?}` | the new assignment |
+//! | `assign.set` | `{uid, units?, work?, rate_table?, delay?, fields?}` | the updated assignment |
+//! | `assign.del` | `{uid}` | `{deleted, task}` |
 //! | `proj.save` | `{path?}` (.yppx/.xml only; extensionless adds .yppx) | `{path, …}` with the actual saved path |
 //! | `proj.reload` | — | `{path, …}` |
 //! | `proj.open` | `{path}` | `{path, …}` |
 //!
 //! `fields` reads Project fields by name as `{text, value}`; it is checked
-//! before an edit, so a bad list changes nothing. See `projctl`.
+//! before an edit, so a bad list changes nothing. See `projctl`, which also
+//! describes an assignment's JSON.
 
 use crate::App;
 use ctlcore::json::Json;
