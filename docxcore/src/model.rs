@@ -1045,6 +1045,16 @@ impl Document {
         })
     }
 
+    /// Replace the trailing section properties, or append them when the body
+    /// has none.
+    pub fn set_trailing_section_properties(&mut self, section: SectionProperties) {
+        if let Some(current) = self.trailing_section_properties_mut() {
+            *current = section;
+        } else {
+            self.body.push(Block::SectionProperties(section));
+        }
+    }
+
     pub fn trailing_section_properties_mut(&mut self) -> Option<&mut SectionProperties> {
         self.body.iter_mut().rev().find_map(|block| match block {
             Block::SectionProperties(section) => Some(section),

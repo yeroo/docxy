@@ -70,6 +70,12 @@ impl Relationships {
     pub fn len(&self) -> usize {
         self.map.len()
     }
+    /// Every relationship as `(id, target, external)`, in no particular order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &str, bool)> {
+        self.map
+            .iter()
+            .map(|(id, (target, external))| (id.as_str(), target.as_str(), *external))
+    }
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
@@ -579,10 +585,9 @@ pub fn parse_header_footer(xml: &str, rels: &Relationships) -> Vec<Block> {
 /// so callers can render "no header/footer" as a zero-content result.
 ///
 /// `kind` is `"headerReference"`/`"footerReference"` (the section-property
-/// element name). Shared by every control surface that needs a section
-/// header/footer's live content: docxy's terminal app (all three variants,
-/// for its own editing UI) and docxwasm's `docx_ctl` (the `doc.header`/
+/// element name). Used by docxwasm's `docx_ctl` (the `doc.header`/
 /// `doc.footer` verbs, default variant only per their documented contract).
+/// docxy resolves from its live body sectPr instead (`PageState::derive`).
 pub fn resolve_header_footer(
     pkg: &crate::package::Package,
     rels: &Relationships,

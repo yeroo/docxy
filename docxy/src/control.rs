@@ -47,7 +47,7 @@ use crate::{
 use ctlcore::json::Json;
 use docxcore::agent;
 use docxcore::editor::RevisionLocation;
-use docxcore::export::{PdfOptions, to_pdf};
+use docxcore::export::to_pdf;
 use docxcore::model::{Block, RevisionCategory, RevisionTarget};
 use docxcore::review::{MalformedRevisionReason, RevisionAction, RevisionOutcome};
 use std::path::Path;
@@ -965,13 +965,7 @@ fn export_pdf(app: &App, args: &Json) -> Result<Json, String> {
     if let Some(parent) = abs.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create failed: {e}"))?;
     }
-    let pdf = to_pdf(
-        &app.editor.doc,
-        &PdfOptions {
-            styles: app.styles.clone(),
-            ..PdfOptions::default()
-        },
-    );
+    let pdf = to_pdf(app.pdf_document(), &app.pdf_options());
     // Publish a synced PDF with exclusive-create semantics. Filesystems without
     // hard links fall back to exclusive creation and copying (which can leave a
     // partial new file on an I/O failure, as the original export did).

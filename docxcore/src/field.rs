@@ -873,7 +873,7 @@ fn xml_unescape(s: &str) -> String {
 }
 
 /// Extract the `w:instr` value (entity-decoded) from a `<w:fldSimple>`'s raw XML.
-fn instr_of(raw: &str) -> Option<String> {
+pub(crate) fn instr_of(raw: &str) -> Option<String> {
     let k = "w:instr=\"";
     let s = raw.find(k)? + k.len();
     let e = raw[s..].find('"')? + s;

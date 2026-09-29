@@ -11,7 +11,7 @@
 //! section breaks, comments anchors — is not reconstructed by the serializer and
 //! is dropped on save. Full raw-node preservation is a later refinement.
 
-use crate::load::{LoadError, parse_document_xml, parse_rels_xml};
+use crate::load::{LoadError, Relationships, parse_document_xml, parse_rels_xml};
 use crate::model::{Block, Document, PropertyScope, SectionProperties};
 use crate::serialize::document_to_xml;
 use crate::xml::{Event, XmlParser};
@@ -30,7 +30,7 @@ fn decode_xml_entities(s: &str) -> String {
 /// Decode an OPC XML part in one of the encodings XML processors must
 /// recognize without an external declaration. OOXML normally uses UTF-8, but
 /// valid packages may use UTF-16LE/BE for individual XML parts.
-fn decode_xml_part(bytes: &[u8]) -> Option<Cow<'_, str>> {
+pub(crate) fn decode_xml_part(bytes: &[u8]) -> Option<Cow<'_, str>> {
     if let Some(utf8) = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]) {
         return std::str::from_utf8(utf8).ok().map(Cow::Borrowed);
     }
@@ -174,7 +174,7 @@ impl HeaderVariant {
         }
     }
 
-    fn index(self) -> usize {
+    pub(crate) fn index(self) -> usize {
         match self {
             Self::Default => 0,
             Self::First => 1,
@@ -208,6 +208,65 @@ pub struct WatermarkHeader {
 pub struct Watermark {
     pub kind: WatermarkKind,
     pub header: WatermarkHeader,
+}
+
+/// The header or footer part a section applies for one variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AppliedPart {
+    pub relationship_id: String,
+    pub part_name: String,
+    /// True when this section inherits the reference from an earlier one
+    /// (Word's "Link to Previous").
+    pub inherited: bool,
+}
+
+/// The header and footer parts one section applies, indexed by
+/// [`HeaderVariant::index`] (default, first, even), after link-to-previous
+/// inheritance. Whether a first/even variant is shown depends on `w:titlePg`
+/// and `w:evenAndOddHeaders`, which the caller checks.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SectionParts {
+    pub headers: [Option<AppliedPart>; 3],
+    pub footers: [Option<AppliedPart>; 3],
+}
+
+/// Resolve every section's header/footer parts. `sect_prs` holds each section's
+/// `w:sectPr` XML in document order (the trailing body sectPr last). A section
+/// without a reference of some variant inherits the previous section's; a
+/// reference that doesn't resolve through `rels` clears the variant.
+pub(crate) fn section_header_parts(sect_prs: &[&str], rels: &Relationships) -> Vec<SectionParts> {
+    const VARIANTS: [HeaderVariant; 3] = [
+        HeaderVariant::Default,
+        HeaderVariant::First,
+        HeaderVariant::Even,
+    ];
+    let mut current = SectionParts::default();
+    let mut out = Vec::with_capacity(sect_prs.len());
+    for sect_pr in sect_prs {
+        for (kind, slots) in [
+            ("headerReference", &mut current.headers),
+            ("footerReference", &mut current.footers),
+        ] {
+            for variant in VARIANTS {
+                let slot = &mut slots[variant.index()];
+                if let Some(relationship_id) =
+                    crate::load::header_footer_ref_rid(sect_pr, kind, variant.as_ooxml())
+                {
+                    *slot = rels.target(&relationship_id).and_then(|target| {
+                        Some(AppliedPart {
+                            relationship_id,
+                            part_name: resolve_document_relationship_target(target)?,
+                            inherited: false,
+                        })
+                    });
+                } else if let Some(part) = slot {
+                    part.inherited = true;
+                }
+            }
+        }
+        out.push(current.clone());
+    }
+    out
 }
 
 /// Compatibility label derived from already-parsed watermark metadata.
@@ -437,7 +496,13 @@ fn parse_protection(xml: &str) -> Protection {
     protection
 }
 
-fn resolve_document_relationship_target(target: &str) -> Option<String> {
+/// `word/header1.xml` -> `word/_rels/header1.xml.rels`.
+fn part_rels_name(part: &str) -> Option<String> {
+    let (dir, file) = part.rsplit_once('/')?;
+    Some(format!("{dir}/_rels/{file}.rels"))
+}
+
+pub(crate) fn resolve_document_relationship_target(target: &str) -> Option<String> {
     if target.contains('\\') || target.contains("://") {
         return None;
     }
@@ -650,16 +715,39 @@ impl Package {
     pub fn set_sect_pr(&mut self, xml: String) {
         let (raw, property_change) =
             crate::load::split_property_change_container(&xml, PropertyScope::Section);
-        let section = SectionProperties {
+        self.document
+            .set_trailing_section_properties(SectionProperties {
+                raw,
+                property_change,
+            });
+        self.sect_pr = xml;
+    }
+
+    /// The final section as split section properties: the document's own
+    /// trailing sectPr, else the captured one (an empty
+    /// `<w:sectPr></w:sectPr>` when the package has none).
+    pub fn final_section(&self) -> SectionProperties {
+        if let Some(section) = self.document.trailing_section_properties() {
+            return section.clone();
+        }
+        let xml = if self.sect_pr.trim().is_empty() {
+            "<w:sectPr></w:sectPr>"
+        } else {
+            &self.sect_pr
+        };
+        let (raw, property_change) =
+            crate::load::split_property_change_container(xml, PropertyScope::Section);
+        SectionProperties {
             raw,
             property_change,
-        };
-        if let Some(current) = self.document.trailing_section_properties_mut() {
-            *current = section;
-        } else {
-            self.document.body.push(Block::SectionProperties(section));
         }
-        self.sect_pr = xml;
+    }
+
+    /// Replace the trailing section properties with an already-split section
+    /// (an editor's copy, tracked change included).
+    pub fn set_trailing_section(&mut self, section: SectionProperties) {
+        self.sect_pr = section.raw.clone();
+        self.document.set_trailing_section_properties(section);
     }
 
     fn set_current_sect_pr_raw(&mut self, raw: String) {
@@ -713,23 +801,10 @@ impl Package {
         self.protection().label()
     }
 
-    /// Watermarks in headers that are actually applied by document section
-    /// relationships. Each inherited header is associated with every section in
-    /// which it remains effective rather than merely scanning orphan header parts.
-    pub fn watermarks(&self) -> Vec<Watermark> {
-        const VARIANTS: [HeaderVariant; 3] = [
-            HeaderVariant::Default,
-            HeaderVariant::First,
-            HeaderVariant::Even,
-        ];
-
-        let rels = self
-            .part("word/_rels/document.xml.rels")
-            .and_then(decode_xml_part)
-            .map(|xml| parse_rels_xml(&xml))
-            .unwrap_or_default();
-        let even_and_odd = self.has_even_odd();
-
+    /// Each section's `w:sectPr` XML in document order: every paragraph section
+    /// break, then the trailing body sectPr. Even an empty trailing value stands
+    /// for the one implicit section of a document without sectPr.
+    fn section_sect_prs(&self) -> Vec<&str> {
         let mut sections: Vec<&str> = self
             .document
             .body
@@ -741,39 +816,36 @@ impl Package {
                 | crate::model::Block::Raw(_) => None,
             })
             .collect();
-        // The trailing body sectPr describes the final section. Even an empty
-        // value represents the one implicit section of a document without sectPr.
         sections.push(self.sect_pr());
+        sections
+    }
 
-        #[derive(Clone)]
-        struct AppliedHeader {
-            relationship_id: String,
-            part_name: String,
-            inherited: bool,
-        }
+    /// The main document relationships (`word/_rels/document.xml.rels`).
+    pub(crate) fn document_rels(&self) -> Relationships {
+        self.part("word/_rels/document.xml.rels")
+            .and_then(decode_xml_part)
+            .map(|xml| parse_rels_xml(&xml))
+            .unwrap_or_default()
+    }
 
-        let mut applied: [Option<AppliedHeader>; 3] = [None, None, None];
+    /// Watermarks in headers that are actually applied by document section
+    /// relationships. Each inherited header is associated with every section in
+    /// which it remains effective rather than merely scanning orphan header parts.
+    pub fn watermarks(&self) -> Vec<Watermark> {
+        const VARIANTS: [HeaderVariant; 3] = [
+            HeaderVariant::Default,
+            HeaderVariant::First,
+            HeaderVariant::Even,
+        ];
+
+        let even_and_odd = self.has_even_odd();
+        let sections = self.section_sect_prs();
+        let applied_parts = section_header_parts(&sections, &self.document_rels());
+
         let mut out = Vec::new();
-        for (section_index, sect_pr) in sections.into_iter().enumerate() {
-            for variant in VARIANTS {
-                let slot = variant.index();
-                if let Some(relationship_id) = crate::load::header_footer_ref_rid(
-                    sect_pr,
-                    "headerReference",
-                    variant.as_ooxml(),
-                ) {
-                    applied[slot] = rels.target(&relationship_id).and_then(|target| {
-                        Some(AppliedHeader {
-                            relationship_id,
-                            part_name: resolve_document_relationship_target(target)?,
-                            inherited: false,
-                        })
-                    });
-                } else if let Some(header) = &mut applied[slot] {
-                    header.inherited = true;
-                }
-            }
-
+        for (section_index, (sect_pr, parts)) in sections.into_iter().zip(applied_parts).enumerate()
+        {
+            let applied = parts.headers;
             let title_page = settings_flag_of(sect_pr, "w:titlePg").unwrap_or(false);
             for variant in VARIANTS {
                 if (variant == HeaderVariant::First && !title_page)
@@ -821,6 +893,27 @@ impl Package {
                 matches!(b, crate::model::Block::Paragraph(p)
                     if p.props.section_break.as_deref().is_some_and(|s| s.contains("<w:pgBorders")))
             })
+    }
+
+    /// The main document part's raw bytes (`word/document.xml` or wherever the
+    /// package relationship points).
+    pub(crate) fn document_part(&self) -> Option<&[u8]> {
+        self.parts
+            .get(self.doc_index)
+            .map(|(_, bytes)| bytes.as_slice())
+    }
+
+    /// A header or footer part's blocks, with its relationships (hyperlinks,
+    /// images) resolved through the part's own `_rels`, not the document's.
+    /// `None` when the part is missing or unreadable.
+    pub fn header_footer_blocks(&self, part: &str) -> Option<Vec<Block>> {
+        let xml = self.part(part).and_then(decode_xml_part)?;
+        let rels = part_rels_name(part)
+            .and_then(|name| self.part(&name))
+            .and_then(decode_xml_part)
+            .map(|xml| parse_rels_xml(&xml))
+            .unwrap_or_default();
+        Some(crate::load::parse_header_footer(&xml, &rels))
     }
 
     /// The raw bytes of a part by name.
@@ -945,7 +1038,7 @@ impl Package {
 
     /// A boolean flag element's state in the related settings part: `None` when the
     /// element is absent, otherwise its `w:val` (absent `w:val` means on).
-    fn settings_flag(&self, elem: &str) -> Option<bool> {
+    pub(crate) fn settings_flag(&self, elem: &str) -> Option<bool> {
         let name = self.settings_part_name().ok()??;
         let b = self.part(&name)?;
         let xml = decode_xml_part(b)?;
@@ -1574,7 +1667,7 @@ fn tag_attr(attrs: &str, name: &str) -> Option<String> {
 /// A bare `contains("<w:autoHyphenation")` reads Word's explicit
 /// `<w:autoHyphenation w:val="false"/>` as ON, and matches the unrelated
 /// `<w:autoHyphenationZone>` too.
-fn settings_flag_of(xml: &str, elem: &str) -> Option<bool> {
+pub(crate) fn settings_flag_of(xml: &str, elem: &str) -> Option<bool> {
     let open = format!("<{elem}");
     let mut from = 0usize;
     while let Some(rel) = xml[from..].find(&open) {
@@ -3324,5 +3417,55 @@ mod tests {
         for ns in ["xmlns:w=", "xmlns:r=", "xmlns:m="] {
             assert!(doc_xml.contains(ns), "new-doc root missing {ns}");
         }
+    }
+
+    #[test]
+    fn section_header_parts_inherit_headers_and_footers_per_variant() {
+        let rels = parse_rels_xml(
+            r#"<Relationships>
+                <Relationship Id="rH1" Target="header1.xml"/>
+                <Relationship Id="rH2" Target="header2.xml"/>
+                <Relationship Id="rF1" Target="footer1.xml"/>
+                <Relationship Id="rFirst" Target="header3.xml"/>
+            </Relationships>"#,
+        );
+        let s1 = r#"<w:sectPr><w:headerReference w:type="default" r:id="rH1"/><w:footerReference w:type="default" r:id="rF1"/><w:headerReference w:type="first" r:id="rFirst"/></w:sectPr>"#;
+        let s2 = r#"<w:sectPr><w:headerReference w:type="default" r:id="rH2"/></w:sectPr>"#;
+        let s3 = r#"<w:sectPr><w:footerReference w:type="default" r:id="rMissing"/></w:sectPr>"#;
+        let parts = section_header_parts(&[s1, s2, s3], &rels);
+        assert_eq!(parts.len(), 3);
+        let name = |p: &Option<AppliedPart>| p.as_ref().map(|p| (p.part_name.clone(), p.inherited));
+        assert_eq!(
+            name(&parts[0].headers[0]),
+            Some(("word/header1.xml".into(), false))
+        );
+        assert_eq!(
+            name(&parts[0].headers[1]),
+            Some(("word/header3.xml".into(), false))
+        );
+        assert_eq!(
+            name(&parts[0].footers[0]),
+            Some(("word/footer1.xml".into(), false))
+        );
+        assert_eq!(name(&parts[0].headers[2]), None);
+        // Section 2 replaces the default header and links the rest to section 1.
+        assert_eq!(
+            name(&parts[1].headers[0]),
+            Some(("word/header2.xml".into(), false))
+        );
+        assert_eq!(
+            name(&parts[1].headers[1]),
+            Some(("word/header3.xml".into(), true))
+        );
+        assert_eq!(
+            name(&parts[1].footers[0]),
+            Some(("word/footer1.xml".into(), true))
+        );
+        // An unresolvable reference clears the variant instead of inheriting.
+        assert_eq!(name(&parts[2].footers[0]), None);
+        assert_eq!(
+            name(&parts[2].headers[0]),
+            Some(("word/header2.xml".into(), true))
+        );
     }
 }
