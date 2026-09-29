@@ -1565,13 +1565,6 @@ fn tab_list(tabs: &[crate::DocTab], active: usize) -> Json {
     ])
 }
 
-/// Refuse a verb that stands for a pointer gesture while the active tab has a
-/// dialog open: the dialog's backdrop covers the whole window, title bar and
-/// ribbon included, so a person could not make that gesture either.
-fn refuse_under_dialog(app: &crate::Docxy) -> Result<(), String> {
-    app.refuse_under_dialog()
-}
-
 /// The active tab's dialogs, for a verb that drives one.
 fn open_dialogs(app: &mut crate::Docxy) -> Result<&mut crate::dialog::DialogStack, String> {
     app.tabs
@@ -1707,7 +1700,7 @@ pub fn dispatch(
             ]))
         }
         "title-tab" => {
-            refuse_under_dialog(app)?;
+            app.refuse_under_dialog()?;
             match arg_str(args, "action")? {
                 "prev" => app.tab_prev(window, cx),
                 "next" => app.tab_next(window, cx),
@@ -1730,14 +1723,14 @@ pub fn dispatch(
         // The tab chip's click handler, by index or title/path substring.
         "tab-select" => {
             let tab = args.get("tab").ok_or("tab-select needs 'tab'")?;
-            refuse_under_dialog(app)?;
+            app.refuse_under_dialog()?;
             let i = crate::control::match_tab(&app.tabs, tab, false)?;
             app.select_tab(i, window, cx);
             Done::ok(state(app, window))
         }
         "doc" => Done::ok(live_doc_state(app, window)?),
         "selection-set" => {
-            refuse_under_dialog(app)?;
+            app.refuse_under_dialog()?;
             let (start, end) = (arg_usize(args, "start")?, arg_usize(args, "end")?);
             if app.hf_active() {
                 return Err("selection-set cannot address the body while a header or footer is being edited".into());
@@ -1798,7 +1791,7 @@ pub fn dispatch(
         "backstage" => {
             match arg_str(args, "action")? {
                 "open" => {
-                    refuse_under_dialog(app)?;
+                    app.refuse_under_dialog()?;
                     app.open_backstage(cx)
                 }
                 "close" => app.backstage_back(window, cx),
@@ -1837,7 +1830,7 @@ pub fn dispatch(
             Done::ok(ribbon_json(app))
         }
         "ribbon-click" => {
-            refuse_under_dialog(app)?;
+            app.refuse_under_dialog()?;
             ribbon_surface(app)?;
             let tab = arg_str(args, "tab")?.to_string();
             let command = arg_str(args, "command")?.to_string();
@@ -1847,7 +1840,7 @@ pub fn dispatch(
             Done::ok(state(app, window))
         }
         "close-tab" => {
-            refuse_under_dialog(app)?;
+            app.refuse_under_dialog()?;
             let index = match args.get("index") {
                 Some(_) => arg_usize(args, "index")?,
                 None => app.active,
@@ -1870,7 +1863,7 @@ pub fn dispatch(
         }
         // The same handler as the Backstage rail item, not a synthetic click.
         "backstage-close" => {
-            refuse_under_dialog(app)?;
+            app.refuse_under_dialog()?;
             app.backstage_close(window, cx);
             Done::ok(state(app, window))
         }
@@ -1915,7 +1908,7 @@ pub fn dispatch(
         // A click on a cell: press, click, release — the three events the
         // pointer delivers, in that order.
         "click-cell" => {
-            refuse_under_dialog(app)?;
+            app.refuse_under_dialog()?;
             let (shift, dbl) = (arg_flag(args, "shift")?, arg_flag(args, "double")?);
             if app.active_is_project() {
                 let tab = &mut app.tabs[app.active];
@@ -1956,7 +1949,7 @@ pub fn dispatch(
         // A drag: the press plants the anchor, each cell crossed is a move, the
         // release commits whatever the moves armed.
         "drag" => {
-            refuse_under_dialog(app)?;
+            app.refuse_under_dialog()?;
             let (from, to) = drag_args(args)?;
             sheet(app)?;
             app.grid_press_cell(from, cx);
@@ -2007,7 +2000,7 @@ pub fn dispatch(
         // Select a chart, as pressing its card does (press then release, with
         // no travel in between — the release ends the move the press armed).
         "select-chart" => {
-            refuse_under_dialog(app)?;
+            app.refuse_under_dialog()?;
             let idx = arg_usize(args, "index")?;
             sheet(app)?;
             let n = app.chart_count();
@@ -2024,7 +2017,7 @@ pub fn dispatch(
 
         // Give a reference field the keyboard, as clicking it does.
         "focus-field" => {
-            refuse_under_dialog(app)?;
+            app.refuse_under_dialog()?;
             let target = parse_field(arg_str(args, "field")?)?;
             if target.is_bar() && app.bar_field != Some(target) {
                 return Err(format!(
