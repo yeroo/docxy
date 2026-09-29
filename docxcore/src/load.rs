@@ -634,11 +634,6 @@ pub fn header_footer_ref_rid(sect: &str, kind: &str, wtype: &str) -> Option<Stri
     None
 }
 
-/// Read the value of attribute `key="…"` from a raw XML element slice (a
-/// small scoped scan, not a full attribute parser — sufficient for locating
-/// one known attribute on one already-located element, as used by
-/// [`header_footer_ref_rid`] and callers that check on/off flags like
-/// `w:val="false"`).
 /// Every start tag `<tag …>` in `xml` (not a longer tag name sharing the
 /// prefix, so `w:col` skips `w:cols`), up to its closing `>`, with its byte
 /// offset.
@@ -662,6 +657,11 @@ pub(crate) fn start_tags<'a>(xml: &'a str, tag: &str) -> Vec<(usize, &'a str)> {
     out
 }
 
+/// Read the value of attribute `key="…"` from a raw XML element slice (a
+/// small scoped scan, not a full attribute parser — sufficient for locating
+/// one known attribute on one already-located element, as used by
+/// [`header_footer_ref_rid`] and callers that check on/off flags like
+/// `w:val="false"`).
 pub fn xml_attr_value(el: &str, key: &str) -> Option<String> {
     let k = format!("{key}=\"");
     let s = el.find(&k)? + k.len();
@@ -881,10 +881,12 @@ impl FieldCollapse {
         let run = p.raw_slice(start, p.pos());
         let marker_run = is_run && is_field_marker_run(run, pushed);
         // Tracked changes can't be edited inside a Field (review would lose
-        // them), and loose markers from a nested container can't be paired.
-        let taints = pushed
-            .iter()
-            .any(|i| holds_revision(i) || (!marker_run && has_field_marker(i)));
+        // them), a Field can only show text (a picture or a text box in its
+        // result would vanish), and loose markers from a nested container
+        // can't be paired.
+        let taints = pushed.iter().any(|i| {
+            holds_revision(i) || (!marker_run && (holds_object(i) || has_field_marker(i)))
+        });
         if taints {
             if let Some(open) = self.open.as_mut() {
                 open.broken = true;
@@ -961,6 +963,77 @@ fn has_field_marker(inline: &Inline) -> bool {
         Inline::Revision { content, .. } => content.iter().any(has_field_marker),
         _ => false,
     }
+}
+
+/// Whether an inline is, or holds, something a [`Inline::Field`] can't show,
+/// since it draws only its result's text: a picture, embedded object, text box,
+/// chart, SmartArt, equation or note reference (an `INCLUDEPICTURE` result, an
+/// `EMBED` preview, …).
+fn holds_object(inline: &Inline) -> bool {
+    const OBJECTS: [&str; 4] = ["<w:drawing", "<w:pict", "<w:object", "<mc:AlternateContent"];
+    match inline {
+        Inline::Raw(raw) => OBJECTS.iter().any(|o| raw.contains(o)),
+        Inline::TextBox { .. }
+        | Inline::Chart { .. }
+        | Inline::SmartArt { .. }
+        | Inline::Equation { .. }
+        | Inline::FootnoteRef { .. } => true,
+        Inline::Hyperlink(h) => h.content.iter().any(holds_object),
+        Inline::Revision { content, .. } => content.iter().any(holds_object),
+        _ => false,
+    }
+}
+
+/// The run formatting a field's result is shown with: the direct `w:rPr` of the
+/// first run of the outermost field's result (after its `separate`), of a
+/// `w:fldSimple`'s first run, or of a `w:sym` run. Default when there is none.
+/// Read from `raw` on demand, so [`Inline::Field`] needs no copy of it.
+pub fn field_result_props(raw: &str) -> RunProps {
+    use crate::field::FieldEvent;
+    let mut p = XmlParser::new(raw);
+    let mut separated = !raw.contains("<w:fldChar");
+    let mut depth = 0usize;
+    loop {
+        match p.next() {
+            Event::Start if p.name() == "w:r" => {
+                let start = p.start_pos();
+                let mut props = RunProps::default();
+                let mut shows = false;
+                loop {
+                    match p.next() {
+                        Event::Start => match p.name() {
+                            "w:rPr" => parse_rpr(&mut p, &mut props),
+                            "w:t" | "w:delText" | "w:sym" | "w:tab" => {
+                                shows = true;
+                                p.skip_element();
+                            }
+                            _ => p.skip_element(),
+                        },
+                        Event::End | Event::Eof => break,
+                        Event::Text => {}
+                    }
+                }
+                let events = crate::field::field_events(p.raw_slice(start, p.pos()));
+                if events.is_empty() {
+                    if separated && depth <= 1 && shows {
+                        return props;
+                    }
+                    continue;
+                }
+                for event in events {
+                    match event {
+                        FieldEvent::Begin => depth += 1,
+                        FieldEvent::Separate if depth == 1 => separated = true,
+                        FieldEvent::End => depth = depth.saturating_sub(1),
+                        _ => {}
+                    }
+                }
+            }
+            Event::Eof => break,
+            Event::Start | Event::End | Event::Text => {}
+        }
+    }
+    RunProps::default()
 }
 
 /// Whether an inline is, or holds, a tracked change: an insertion, deletion or
@@ -2985,6 +3058,88 @@ mod tests {
             },
             other => panic!("expected a text box, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_field_whose_result_is_a_picture_stays_loose_642() {
+        let pic = "<w:r><w:drawing><wp:inline><wp:extent cx=\"952500\" cy=\"952500\"/>\
+            <a:graphic><a:graphicData><pic:pic><pic:blipFill><a:blip r:embed=\"rIdImg\"/>\
+            </pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>";
+        let include = format!(
+            "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+             <w:r><w:instrText> INCLUDEPICTURE \"https://x.test/a.png\" \\* MERGEFORMATINET </w:instrText></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>{pic}\
+             <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>"
+        );
+        // Nested: IF { INCLUDEPICTURE … } ….
+        let nested = format!(
+            "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+             <w:r><w:instrText> IF 1 = 1 </w:instrText></w:r>{include}\
+             <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>{pic}\
+             <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>"
+        );
+        for inner in [include, nested] {
+            let d = para_doc(&inner);
+            let p = first_para(&d);
+            assert!(
+                !p.content.iter().any(|i| matches!(i, Inline::Field { .. })),
+                "{:?}",
+                kinds(&p.content)
+            );
+            assert!(
+                p.content
+                    .iter()
+                    .any(|i| matches!(i, Inline::Raw(r) if r.contains("<w:drawing"))),
+                "the picture is still its own inline"
+            );
+            // And it renders exactly as the picture alone does.
+            let alone = para_doc(&pic.repeat(inner.matches("<w:drawing>").count()));
+            let opts = crate::render::RenderOptions {
+                width: 40,
+                ..Default::default()
+            };
+            let plain = |d: &Document| {
+                crate::render::render(d, &opts)
+                    .iter()
+                    .map(|l| l.plain())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(plain(&d), plain(&alone));
+        }
+    }
+
+    #[test]
+    fn field_result_props_are_the_first_result_runs_642() {
+        let bold = field_result_props(&format!(
+            "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+             <w:r><w:rPr><w:i/></w:rPr><w:instrText> PAGE </w:instrText></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+             <w:r><w:rPr><w:b/><w:color w:val=\"FF0000\"/></w:rPr><w:t>1</w:t></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>"
+        ));
+        assert!(bold.bold && !bold.italic);
+        assert_eq!(bold.color.as_deref(), Some("FF0000"));
+        let simple = field_result_props(
+            "<w:fldSimple w:instr=\" PAGE \"><w:r><w:rPr><w:vanish/></w:rPr><w:t>1</w:t></w:r></w:fldSimple>",
+        );
+        assert!(simple.vanish);
+        // A nested field in the instruction doesn't lend its formatting.
+        let nested = field_result_props(
+            "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+             <w:r><w:instrText> IF </w:instrText></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+             <w:r><w:instrText> PAGE </w:instrText></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+             <w:r><w:rPr><w:b/></w:rPr><w:t>1</w:t></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>\
+             <w:r><w:instrText> = 1 \"a\" \"b\" </w:instrText></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+             <w:r><w:rPr><w:i/></w:rPr><w:t>a</w:t></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>",
+        );
+        assert!(nested.italic && !nested.bold);
+        let plain = field_result_props(PAGE_FIELD);
+        assert!(!plain.bold && !plain.italic && !plain.vanish);
     }
 
     #[test]
