@@ -134,16 +134,7 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
     };
     let get_str = |name: &str| get(name).map(|b| String::from_utf8_lossy(b).into_owned());
 
-    // Locate the workbook part via the package rels (virtually always
-    // xl/workbook.xml, but resolve it properly).
-    let wb_part = get_str("_rels/.rels")
-        .and_then(|xml| {
-            parse_rels(&xml)
-                .into_iter()
-                .find(|(_, ty, _)| ty.ends_with("/officeDocument"))
-                .map(|(_, _, target)| target.trim_start_matches('/').to_string())
-        })
-        .unwrap_or_else(|| "xl/workbook.xml".to_string());
+    let wb_part = workbook_part_name(&parts);
     let wb_xml = get_str(&wb_part).ok_or(XlsxError::MissingWorkbook)?;
     let wb_dir = match wb_part.rfind('/') {
         Some(i) => &wb_part[..i],
@@ -337,6 +328,30 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
             iterate,
         },
     })
+}
+
+/// The workbook part, located via the package rels (virtually always
+/// `xl/workbook.xml`, but resolve it properly).
+fn workbook_part_name(parts: &[(String, Vec<u8>)]) -> String {
+    parts
+        .iter()
+        .find(|(n, _)| n == "_rels/.rels")
+        .and_then(|(_, b)| {
+            parse_rels(&String::from_utf8_lossy(b))
+                .into_iter()
+                .find(|(_, ty, _)| ty.ends_with("/officeDocument"))
+                .map(|(_, _, target)| target.trim_start_matches('/').to_string())
+        })
+        .unwrap_or_else(|| "xl/workbook.xml".to_string())
+}
+
+/// The rels part that belongs to `part`: `xl/workbook.xml` →
+/// `xl/_rels/workbook.xml.rels`.
+fn rels_part_name(part: &str) -> String {
+    match part.rsplit_once('/') {
+        Some((dir, file)) => format!("{dir}/_rels/{file}.rels"),
+        None => format!("_rels/{part}.rels"),
+    }
 }
 
 /// `<pivotCaches><pivotCache cacheId="0" r:id="rId4"/></pivotCaches>` in
@@ -1485,8 +1500,225 @@ fn num_repr(n: f64) -> String {
     }
 }
 
-/// Serialize the package back to `.xlsx` bytes (STORED ZIP).
+/// Serialize the package back to `.xlsx` bytes (STORED ZIP), keeping the
+/// loaded file's type: an `.xlsm` stays macro-enabled, an `.xltx` a template.
+/// Saving to a named file goes through [`save_xlsx_as`] with that file's kind.
 pub fn save_xlsx(pkg: &SheetPackage) -> Vec<u8> {
+    write_zip(&saved_parts(pkg))
+}
+
+/// Serialize the package as `kind`: the workbook part's content type follows
+/// the target file type, and a macro-free target (`.xlsx`, `.xltx`) loses the
+/// VBA project. Excel refuses an `.xlsx` that says it is a template or
+/// carries macros. `pkg` itself is untouched.
+pub fn save_xlsx_as(pkg: &SheetPackage, kind: SpreadsheetKind) -> Vec<u8> {
+    let mut parts = saved_parts(pkg);
+    let wb_part = workbook_part_name(&parts);
+    set_content_type_override(&mut parts, &format!("/{wb_part}"), kind.main_content_type());
+    if !kind.allows_macros() {
+        strip_vba_project(&mut parts);
+    }
+    write_zip(&parts)
+}
+
+/// [`save_xlsx_as`] with the kind of `path`'s extension; an extension that is
+/// not a spreadsheet type keeps the loaded type, as [`save_xlsx`] does.
+pub fn save_xlsx_for_path(pkg: &SheetPackage, path: impl AsRef<std::path::Path>) -> Vec<u8> {
+    match SpreadsheetKind::from_path(path) {
+        Some(kind) => save_xlsx_as(pkg, kind),
+        None => save_xlsx(pkg),
+    }
+}
+
+/// The four OOXML spreadsheet file types, which differ only in the workbook
+/// part's content type and whether a VBA project may ride along.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpreadsheetKind {
+    /// `.xlsx`
+    Workbook,
+    /// `.xlsm`
+    MacroWorkbook,
+    /// `.xltx`
+    Template,
+    /// `.xltm`
+    MacroTemplate,
+}
+
+impl SpreadsheetKind {
+    /// The kind for a file extension (without the dot, any case).
+    pub fn from_extension(ext: &str) -> Option<Self> {
+        match ext.to_ascii_lowercase().as_str() {
+            "xlsx" => Some(Self::Workbook),
+            "xlsm" => Some(Self::MacroWorkbook),
+            "xltx" => Some(Self::Template),
+            "xltm" => Some(Self::MacroTemplate),
+            _ => None,
+        }
+    }
+
+    /// The kind for a path's extension; `None` for anything else.
+    pub fn from_path(path: impl AsRef<std::path::Path>) -> Option<Self> {
+        path.as_ref()
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(Self::from_extension)
+    }
+
+    /// The file extension, without the dot.
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Workbook => "xlsx",
+            Self::MacroWorkbook => "xlsm",
+            Self::Template => "xltx",
+            Self::MacroTemplate => "xltm",
+        }
+    }
+
+    /// The content type of the workbook part in a file of this kind.
+    pub fn main_content_type(self) -> &'static str {
+        match self {
+            Self::Workbook => {
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
+            }
+            Self::MacroWorkbook => "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+            Self::Template => {
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml"
+            }
+            Self::MacroTemplate => "application/vnd.ms-excel.template.macroEnabled.main+xml",
+        }
+    }
+
+    /// Whether a file of this kind may carry a VBA project.
+    pub fn allows_macros(self) -> bool {
+        matches!(self, Self::MacroWorkbook | Self::MacroTemplate)
+    }
+}
+
+const VBA_PROJECT_REL: &str = "http://schemas.microsoft.com/office/2006/relationships/vbaProject";
+const VBA_PROJECT_CT: &str = "application/vnd.ms-office.vbaProject";
+
+impl SheetPackage {
+    /// Whether the workbook carries a VBA project (it came from an `.xlsm` or
+    /// `.xltm`, and saving it as `.xlsx`/`.xltx` would drop the macros).
+    pub fn has_vba_project(&self) -> bool {
+        !vba_relationships(&self.parts).is_empty()
+    }
+
+    /// Drop the VBA project in memory, exactly as [`save_xlsx_as`] does for a
+    /// macro-free kind: after a save without macros the open workbook matches
+    /// the file. Returns whether there was one.
+    pub fn remove_vba_project(&mut self) -> bool {
+        strip_vba_project(&mut self.parts)
+    }
+}
+
+/// The workbook's VBA project relationships as (rels part, Id, resolved
+/// target part). Matched on the exact Type: `…/vbaProjectSignature` shares the
+/// prefix.
+fn vba_relationships(parts: &[(String, Vec<u8>)]) -> Vec<(String, String, String)> {
+    let wb_part = workbook_part_name(parts);
+    let wb_dir = wb_part.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    let rels_name = rels_part_name(&wb_part);
+    let Some((_, xml)) = parts.iter().find(|(n, _)| *n == rels_name) else {
+        return Vec::new();
+    };
+    parse_rels(&String::from_utf8_lossy(xml))
+        .into_iter()
+        .filter(|(_, ty, _)| ty == VBA_PROJECT_REL)
+        .map(|(id, _, target)| (rels_name.clone(), id, resolve_relative(wb_dir, &target)))
+        .collect()
+}
+
+/// Remove the VBA project: each part the workbook names as its vbaProject,
+/// that relationship, the part's own rels and the parts they name (the
+/// signatures), and their content-type Overrides. The `.bin` Default goes
+/// too, unless another `.bin` part (printer settings) still relies on it.
+/// Returns whether anything was removed.
+fn strip_vba_project(parts: &mut Vec<(String, Vec<u8>)>) -> bool {
+    let rels = vba_relationships(parts);
+    if rels.is_empty() {
+        return false;
+    }
+    let mut doomed: Vec<String> = Vec::new();
+    for (rels_name, id, target) in &rels {
+        if let Some(p) = parts.iter_mut().find(|(n, _)| n == rels_name) {
+            let xml = String::from_utf8_lossy(&p.1).into_owned();
+            p.1 = remove_element_containing(&xml, "<Relationship ", &format!(" Id=\"{id}\""))
+                .into_bytes();
+        }
+        let own_rels = rels_part_name(target);
+        let dir = target.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        if let Some((_, xml)) = parts.iter().find(|(n, _)| *n == own_rels) {
+            for (_, _, t) in parse_rels(&String::from_utf8_lossy(xml)) {
+                doomed.push(resolve_relative(dir, &t));
+            }
+        }
+        doomed.push(target.clone());
+        doomed.push(own_rels);
+    }
+    parts.retain(|(n, _)| !doomed.contains(n));
+
+    if let Some(i) = parts.iter().position(|(n, _)| n == "[Content_Types].xml") {
+        let mut xml = String::from_utf8_lossy(&parts[i].1).into_owned();
+        for part in &doomed {
+            while let Some((start, end)) = override_span(&xml, &format!("/{part}")) {
+                xml.replace_range(start..end, "");
+            }
+        }
+        // A `.bin` part left without an Override of its own still needs it.
+        let bin_needs_default = parts.iter().any(|(n, _)| {
+            n.to_ascii_lowercase().ends_with(".bin")
+                && override_span(&xml, &format!("/{n}")).is_none()
+        });
+        if !bin_needs_default {
+            xml = remove_element_containing(&xml, "<Default ", VBA_PROJECT_CT);
+        }
+        parts[i].1 = xml.into_bytes();
+    }
+    true
+}
+
+/// The byte span of the `<Override>` whose PartName is `part_name` (OPC part
+/// names compare case-insensitively).
+fn override_span(xml: &str, part_name: &str) -> Option<(usize, usize)> {
+    let mut from = 0;
+    while let Some(rel) = xml[from..].find("<Override") {
+        let start = from + rel;
+        let gt = start + xml[start..].find('>')?;
+        let tag = &xml[start..=gt];
+        let end = if tag.ends_with("/>") {
+            gt + 1
+        } else {
+            xml[gt..]
+                .find("</Override>")
+                .map_or(gt + 1, |i| gt + i + "</Override>".len())
+        };
+        let name = attr_of_tag(tag, "<Override", "PartName");
+        if name.is_some_and(|n| n.eq_ignore_ascii_case(part_name)) {
+            return Some((start, end));
+        }
+        from = end;
+    }
+    None
+}
+
+/// Point `part_name`'s `<Override>` at `ct`, replacing whatever type it had,
+/// or add one. (`add_content_type_override` leaves an existing entry alone.)
+fn set_content_type_override(parts: &mut [(String, Vec<u8>)], part_name: &str, ct: &str) {
+    let Some(p) = parts.iter_mut().find(|(n, _)| n == "[Content_Types].xml") else {
+        return;
+    };
+    let mut xml = String::from_utf8_lossy(&p.1).into_owned();
+    let ov = format!("<Override PartName=\"{part_name}\" ContentType=\"{ct}\"/>");
+    match override_span(&xml, part_name) {
+        Some((start, end)) => xml.replace_range(start..end, &ov),
+        None => xml = xml.replacen("</Types>", &format!("{ov}</Types>"), 1),
+    }
+    p.1 = xml.into_bytes();
+}
+
+/// The parts [`save_xlsx`] writes: the originals with the model spliced in.
+fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
     let mut parts = pkg.parts.clone();
     let wb = &pkg.workbook;
 
@@ -1702,7 +1934,7 @@ pub fn save_xlsx(pkg: &SheetPackage) -> Vec<u8> {
         }
     }
 
-    write_zip(&parts)
+    parts
 }
 
 /// `<sheetData>` for one sheet: rows in order, preserved row attrs, cells
@@ -6901,5 +7133,233 @@ mod tests {
             xml.contains("<c:cat><c:strRef><c:f>Data!$A$2:$A$4</c:f>"),
             "{xml}"
         );
+    }
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::*;
+
+    const XLSX_CT: &str =
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml";
+    const XLSM_CT: &str = "application/vnd.ms-excel.sheet.macroEnabled.main+xml";
+    const XLTX_CT: &str =
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml";
+    const XLTM_CT: &str = "application/vnd.ms-excel.template.macroEnabled.main+xml";
+
+    fn content_types(pkg: &SheetPackage) -> String {
+        String::from_utf8_lossy(pkg.part("[Content_Types].xml").unwrap()).into_owned()
+    }
+
+    fn workbook_ct(pkg: &SheetPackage) -> String {
+        let xml = content_types(pkg);
+        let (s, e) = override_span(&xml, "/xl/workbook.xml").expect("workbook Override");
+        attr_of_tag(&xml[s..e], "<Override", "ContentType").unwrap()
+    }
+
+    fn retyped(pkg: &SheetPackage, from: &str, to: &str) -> SheetPackage {
+        let mut pkg = pkg.clone();
+        let ct = content_types(&pkg).replace(from, to);
+        pkg.set_part("[Content_Types].xml", ct.into_bytes());
+        pkg
+    }
+
+    /// A template, as Excel (or openpyxl with `template = True`) writes one.
+    fn xltx() -> SheetPackage {
+        retyped(&new_xlsx(), XLSX_CT, XLTX_CT)
+    }
+
+    /// A macro workbook as Excel writes one: the VBA project behind the `.bin`
+    /// Default, a signature named from the project's own rels, and printer
+    /// settings — another `.bin` that has its own Override and must survive.
+    fn xlsm() -> SheetPackage {
+        let mut pkg = retyped(&new_xlsx(), XLSX_CT, XLSM_CT);
+        let ct = content_types(&pkg).replace(
+            r#"<Default Extension="xml""#,
+            r#"<Default Extension="bin" ContentType="application/vnd.ms-office.vbaProject"/><Default Extension="xml""#,
+        );
+        let ct = ct.replace(
+            "</Types>",
+            r#"<Override PartName="/xl/vbaProjectSignature.bin" ContentType="application/vnd.ms-office.vbaProjectSignature"/><Override PartName="/xl/printerSettings/printerSettings1.bin" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.printerSettings"/></Types>"#,
+        );
+        pkg.set_part("[Content_Types].xml", ct.into_bytes());
+        let rels = String::from_utf8_lossy(pkg.part("xl/_rels/workbook.xml.rels").unwrap())
+            .replace(
+                "</Relationships>",
+                r#"<Relationship Id="rId9" Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" Target="vbaProject.bin"/></Relationships>"#,
+            );
+        pkg.set_part("xl/_rels/workbook.xml.rels", rels.into_bytes());
+        pkg.set_part("xl/vbaProject.bin", b"VBA".to_vec());
+        pkg.set_part(
+            "xl/_rels/vbaProject.bin.rels",
+            br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.microsoft.com/office/2006/relationships/vbaProjectSignature" Target="vbaProjectSignature.bin"/></Relationships>"#
+                .to_vec(),
+        );
+        pkg.set_part("xl/vbaProjectSignature.bin", b"SIG".to_vec());
+        pkg.set_part(
+            "xl/printerSettings/printerSettings1.bin",
+            b"DEVMODE".to_vec(),
+        );
+        pkg
+    }
+
+    fn roundtrip(pkg: &SheetPackage, kind: SpreadsheetKind) -> SheetPackage {
+        load_xlsx(&save_xlsx_as(pkg, kind)).expect("the saved file reloads")
+    }
+
+    #[test]
+    fn kinds_come_from_the_extension_in_any_case() {
+        use SpreadsheetKind::*;
+        assert_eq!(SpreadsheetKind::from_path("a/b.XLSX"), Some(Workbook));
+        assert_eq!(SpreadsheetKind::from_path("b.xlsm"), Some(MacroWorkbook));
+        assert_eq!(SpreadsheetKind::from_path("b.Xltx"), Some(Template));
+        assert_eq!(SpreadsheetKind::from_path("b.xltm"), Some(MacroTemplate));
+        assert_eq!(SpreadsheetKind::from_path("b.csv"), None);
+        assert_eq!(SpreadsheetKind::from_path("b"), None);
+        assert!(MacroWorkbook.allows_macros() && MacroTemplate.allows_macros());
+        assert!(!Workbook.allows_macros() && !Template.allows_macros());
+        assert_eq!(Workbook.main_content_type(), XLSX_CT);
+        assert_eq!(MacroWorkbook.main_content_type(), XLSM_CT);
+        assert_eq!(Template.main_content_type(), XLTX_CT);
+        assert_eq!(MacroTemplate.main_content_type(), XLTM_CT);
+    }
+
+    /// #601: a template saved as `.xlsx` must say it is a workbook, or Excel
+    /// refuses the file.
+    #[test]
+    fn a_template_saved_as_xlsx_is_a_workbook() {
+        let out = roundtrip(&xltx(), SpreadsheetKind::Workbook);
+        assert_eq!(workbook_ct(&out), XLSX_CT);
+        assert!(!content_types(&out).contains("template"));
+    }
+
+    /// #601: a macro workbook saved as `.xlsx` loses the macro type and the
+    /// whole VBA project, but nothing else.
+    #[test]
+    fn a_macro_workbook_saved_as_xlsx_drops_the_vba_project() {
+        let pkg = xlsm();
+        assert!(pkg.has_vba_project());
+        let out = roundtrip(&pkg, SpreadsheetKind::Workbook);
+        assert_eq!(workbook_ct(&out), XLSX_CT);
+        assert!(!out.has_vba_project());
+        for gone in [
+            "xl/vbaProject.bin",
+            "xl/_rels/vbaProject.bin.rels",
+            "xl/vbaProjectSignature.bin",
+        ] {
+            assert!(out.part(gone).is_none(), "{gone} survived");
+        }
+        let rels =
+            String::from_utf8_lossy(out.part("xl/_rels/workbook.xml.rels").unwrap()).into_owned();
+        assert!(!rels.contains("vbaProject"), "{rels}");
+        assert!(rels.contains("<Relationships "), "rels root intact: {rels}");
+        assert!(rels.contains("sharedStrings"), "other rels intact: {rels}");
+        let ct = content_types(&out);
+        assert!(!ct.contains("vbaProject"), "{ct}");
+        assert!(!ct.contains("macroEnabled"), "{ct}");
+        // Printer settings are not macros.
+        assert_eq!(
+            out.part("xl/printerSettings/printerSettings1.bin"),
+            Some(&b"DEVMODE"[..])
+        );
+        assert!(ct.contains("/xl/printerSettings/printerSettings1.bin"));
+        // The package we saved from still has its macros.
+        assert!(pkg.has_vba_project());
+    }
+
+    /// The `.bin` Default stays while a `.bin` part without an Override of its
+    /// own still relies on it.
+    #[test]
+    fn the_bin_default_stays_while_another_bin_part_relies_on_it() {
+        let mut pkg = xlsm();
+        let ct = content_types(&pkg).replace(
+            r#"<Override PartName="/xl/printerSettings/printerSettings1.bin" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.printerSettings"/>"#,
+            "",
+        );
+        pkg.set_part("[Content_Types].xml", ct.into_bytes());
+        let out = roundtrip(&pkg, SpreadsheetKind::Workbook);
+        assert!(content_types(&out).contains(r#"<Default Extension="bin""#));
+        assert!(out.part("xl/vbaProject.bin").is_none());
+    }
+
+    #[test]
+    fn saving_to_the_same_type_keeps_type_and_parts() {
+        let m = xlsm();
+        let out = roundtrip(&m, SpreadsheetKind::MacroWorkbook);
+        assert_eq!(workbook_ct(&out), XLSM_CT);
+        assert!(out.has_vba_project());
+        assert_eq!(out.part("xl/vbaProjectSignature.bin"), Some(&b"SIG"[..]));
+        assert_eq!(content_types(&out), content_types(&m));
+
+        let out = roundtrip(&m, SpreadsheetKind::MacroTemplate);
+        assert_eq!(workbook_ct(&out), XLTM_CT);
+        assert!(out.has_vba_project());
+
+        let t = xltx();
+        let out = roundtrip(&t, SpreadsheetKind::Template);
+        assert_eq!(workbook_ct(&out), XLTX_CT);
+        assert_eq!(content_types(&out), content_types(&t));
+    }
+
+    #[test]
+    fn a_workbook_can_be_saved_as_any_kind() {
+        for (kind, ct) in [
+            (SpreadsheetKind::Template, XLTX_CT),
+            (SpreadsheetKind::MacroTemplate, XLTM_CT),
+            (SpreadsheetKind::MacroWorkbook, XLSM_CT),
+        ] {
+            let out = roundtrip(&new_xlsx(), kind);
+            assert_eq!(workbook_ct(&out), ct);
+            assert_eq!(content_types(&out).matches("/xl/workbook.xml").count(), 1);
+        }
+    }
+
+    /// A workbook typed only by the `xml` Default gets an Override of its own.
+    #[test]
+    fn a_workbook_without_an_override_gets_one() {
+        let mut pkg = new_xlsx();
+        let xml = content_types(&pkg);
+        let (s, e) = override_span(&xml, "/xl/workbook.xml").unwrap();
+        pkg.set_part(
+            "[Content_Types].xml",
+            format!("{}{}", &xml[..s], &xml[e..]).into_bytes(),
+        );
+        let out = roundtrip(&pkg, SpreadsheetKind::Workbook);
+        assert_eq!(workbook_ct(&out), XLSX_CT);
+    }
+
+    /// OPC part names compare case-insensitively.
+    #[test]
+    fn the_workbook_override_is_found_in_any_case() {
+        let mut pkg = xltx();
+        let ct = content_types(&pkg).replace("/xl/workbook.xml", "/XL/Workbook.xml");
+        pkg.set_part("[Content_Types].xml", ct.into_bytes());
+        let out = save_xlsx_as(&pkg, SpreadsheetKind::Workbook);
+        let ct = content_types(&load_xlsx(&out).unwrap());
+        assert!(!ct.contains("template"), "{ct}");
+        assert_eq!(
+            ct.to_ascii_lowercase().matches("/xl/workbook.xml").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn remove_vba_project_strips_it_in_memory() {
+        let mut pkg = xlsm();
+        assert!(pkg.remove_vba_project());
+        assert!(!pkg.has_vba_project());
+        assert!(pkg.part("xl/vbaProject.bin").is_none());
+        assert!(!pkg.remove_vba_project());
+        // save_xlsx keeps the loaded type: only the kind-aware save retypes.
+        assert_eq!(workbook_ct(&load_xlsx(&save_xlsx(&pkg)).unwrap()), XLSM_CT);
+    }
+
+    #[test]
+    fn save_for_path_keeps_the_loaded_type_for_other_extensions() {
+        let out = load_xlsx(&save_xlsx_for_path(&xltx(), "out.bak")).unwrap();
+        assert_eq!(workbook_ct(&out), XLTX_CT);
+        let out = load_xlsx(&save_xlsx_for_path(&xltx(), "out.XLSX")).unwrap();
+        assert_eq!(workbook_ct(&out), XLSX_CT);
     }
 }
