@@ -1,6 +1,7 @@
 //! Task types and effort-driven scheduling (#159): what an edit of a task's
-//! duration, of an assignment's units, or of the resources assigned to it
-//! does to the other two of duration, work and units, as in Project.
+//! duration, of an assignment's units, work or delay (#395), or of the
+//! resources assigned to it does to the other two of duration, work and
+//! units, as in Project.
 //!
 //! An absent `Type` reads as Fixed Units and an absent `EffortDriven` as not
 //! effort-driven, Project's own defaults. Only work resources take part:
@@ -49,7 +50,7 @@ impl Editor {
 }
 
 /// Project's default: a task without a `Type` is Fixed Units.
-fn task_type(t: &Task) -> TaskType {
+pub(super) fn task_type(t: &Task) -> TaskType {
     t.task_type.unwrap_or(TaskType::FixedUnits)
 }
 
@@ -66,12 +67,8 @@ fn effort_driven(t: &Task) -> bool {
 ///   and had work, the work it had is kept and split by units: a Fixed Units
 ///   or Fixed Work task takes the duration that work needs, a Fixed Duration
 ///   one keeps its duration and scales the units instead.
-/// - Otherwise, when units changed on an assignment with work, a Fixed Units
-///   or Fixed Work task keeps that work and its duration becomes the longest
-///   its assignments need. The others keep their work, and so finish early
-///   in Project; here every assignment spans its task, so a later duration
-///   edit rescales them all to duration x units again. A Fixed Duration task
-///   keeps its duration and the work follows the units, as staged.
+/// - Otherwise the resources are the same, and [`same_resources`] reacts to
+///   an assignment's units, work or delay edit.
 ///
 /// Anything else is left as staged: work = duration x units.
 fn recalculate(
@@ -102,7 +99,7 @@ fn recalculate(
     if set_changed {
         redistribute(task, &before, assignments, &after)
     } else {
-        units_changed(task, &before, assignments, &after)
+        same_resources(task, &before, assignments, &after)
     }
 }
 
@@ -151,38 +148,77 @@ fn redistribute(
     }
 }
 
-/// Units changed on the same resources: a Fixed Units or Fixed Work task
-/// keeps each changed assignment's work and stretches to the longest.
-fn units_changed(
+/// The same resources, with one assignment's units, work or delay edited.
+/// Each assignment is judged by the first of these that changed:
+///
+/// - Units, on an assignment with work: a Fixed Units or Fixed Work task
+///   keeps that work and its duration becomes the longest its assignments
+///   need. The others keep their work, and so finish early in Project; here
+///   every assignment spans its task, so a later duration edit rescales them
+///   all to duration x units again. A Fixed Duration task keeps its duration
+///   and the work follows the units, as staged.
+/// - Work: a Fixed Units or Fixed Work task keeps the new work and takes the
+///   longest duration its assignments need, as for units. A Fixed Duration
+///   task keeps its duration and the units follow, work over the span from
+///   the delay to the task finish, as [`fixed_work_units`] does; without a
+///   span left they stay (the agent edit refuses that case before staging).
+/// - Delay, on an assignment with work: its work and units stay. A Fixed
+///   Units or Fixed Work task takes the longest `work / units + delay` its
+///   assignments need, so removing a delay can shorten it; a Fixed Duration
+///   task never shrinks, but grows when the delay pushes an assignment past
+///   its finish.
+///
+/// The work and delay rules follow this model's own conventions (a delayed
+/// flat assignment finishes with its task); they are not verified against
+/// Project.
+fn same_resources(
     task: &Task,
     before: &[&Assignment],
     assignments: &mut [Assignment],
     after: &[usize],
 ) -> Option<i64> {
-    if task_type(task) == TaskType::FixedDuration {
-        return None;
-    }
+    let fixed_duration = task_type(task) == TaskType::FixedDuration;
+    // Whether an edit changed the duration some assignment needs.
     let mut changed = false;
     for &k in after {
         let a = &mut assignments[k];
         let Some(old) = before.iter().find(|b| b.uid == a.uid) else {
             continue;
         };
-        if old.units != a.units && old.work_min > 0 {
-            a.set_work(old.work_min);
+        if old.units != a.units {
+            if !fixed_duration && old.work_min > 0 {
+                a.set_work(old.work_min);
+                changed = true;
+            }
+        } else if old.work_min != a.work_min {
+            if !fixed_duration {
+                changed = true;
+            } else if a.work_min > 0 {
+                let span = task.duration_min - a.delay_min();
+                if span > 0 {
+                    a.units = a.work_min as f64 / span as f64;
+                    a.peak_units = None;
+                }
+            }
+        } else if old.delay_min() != a.delay_min() && a.work_min > 0 {
             changed = true;
         }
     }
     if !changed {
         return None;
     }
-    after
+    let longest = after
         .iter()
         .map(|&k| &assignments[k])
         .filter(|a| a.units > 0.0 && a.work_min > 0)
         .map(|a| (a.work_min as f64 / a.units).round() as i64 + a.delay_min())
         .max()
-        .filter(|&d| d > 0)
+        .filter(|&d| d > 0)?;
+    Some(if fixed_duration {
+        longest.max(task.duration_min)
+    } else {
+        longest
+    })
 }
 
 /// A duration edit of a Fixed Work task: each flat work assignment keeps its

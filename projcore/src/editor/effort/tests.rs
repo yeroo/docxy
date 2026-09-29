@@ -212,6 +212,93 @@ fn a_units_edit_past_the_scheduling_range_changes_nothing() {
     assert_eq!((ed.project(), ed.undo_depth()), (&before, 0));
 }
 
+// ---- a work or delay edit of one assignment (#395) ----
+
+fn patch_work(ed: &mut Editor, uid: i32, work_min: i64) {
+    let patch = AssignmentPatch {
+        work_min: Some(work_min),
+        ..AssignmentPatch::default()
+    };
+    ed.set_assignment(uid, patch).unwrap();
+}
+
+fn patch_delay(ed: &mut Editor, uid: i32, delay_min: i64) {
+    let patch = AssignmentPatch {
+        delay_min: Some(delay_min),
+        ..AssignmentPatch::default()
+    };
+    ed.set_assignment(uid, patch).unwrap();
+}
+
+#[test]
+fn a_work_edit_keeps_units_and_takes_the_longest_duration_on_fixed_units_and_work() {
+    for kind in [None, Some(TaskType::FixedWork)] {
+        let both = vec![assignment(1, 1, 1., 2 * DAY), assignment(2, 2, 1., 2 * DAY)];
+        let mut ed = plan(kind, None, 2 * DAY, both);
+        patch_work(&mut ed, 1, 3 * DAY);
+        assert_eq!(alloc(&ed, 1), (1., 3 * DAY), "{kind:?}");
+        assert_eq!(duration(&ed), 3 * DAY, "{kind:?}");
+        // Less work shortens the task to what Carol still needs.
+        patch_work(&mut ed, 1, DAY);
+        assert_eq!(alloc(&ed, 1), (1., DAY));
+        assert_eq!(duration(&ed), 2 * DAY, "{kind:?}");
+        assert_eq!(alloc(&ed, 2), (1., 2 * DAY));
+    }
+}
+
+#[test]
+fn a_fixed_duration_work_edit_keeps_the_duration_and_changes_units() {
+    let mut ed = plan(
+        Some(TaskType::FixedDuration),
+        None,
+        2 * DAY,
+        vec![assignment(1, 1, 1., 2 * DAY)],
+    );
+    patch_work(&mut ed, 1, DAY);
+    assert_eq!(alloc(&ed, 1), (0.5, DAY));
+    assert_eq!(duration(&ed), 2 * DAY);
+    // A delayed assignment works its work from the delay to the finish.
+    let mut ed = plan(
+        Some(TaskType::FixedDuration),
+        None,
+        4 * DAY,
+        vec![assignment(1, 1, 1., 2 * DAY)],
+    );
+    patch_delay(&mut ed, 1, 2 * DAY);
+    patch_work(&mut ed, 1, 4 * DAY);
+    assert_eq!(alloc(&ed, 1), (2., 4 * DAY));
+    assert_eq!(duration(&ed), 4 * DAY);
+}
+
+#[test]
+fn a_delay_edit_keeps_work_and_units_and_moves_the_duration_by_task_type() {
+    // Fixed Units and Fixed Work: the longest work / units + delay, so
+    // removing the delay shrinks the task again.
+    for kind in [None, Some(TaskType::FixedWork)] {
+        let mut ed = plan(kind, None, 2 * DAY, vec![assignment(1, 1, 1., 2 * DAY)]);
+        patch_delay(&mut ed, 1, DAY);
+        assert_eq!(alloc(&ed, 1), (1., 2 * DAY), "{kind:?}");
+        assert_eq!(duration(&ed), 3 * DAY, "{kind:?}");
+        patch_delay(&mut ed, 1, 0);
+        assert_eq!(alloc(&ed, 1), (1., 2 * DAY), "{kind:?}");
+        assert_eq!(duration(&ed), 2 * DAY, "{kind:?}");
+    }
+    // Fixed Duration grows when the delay runs past its finish and never
+    // shrinks when it is removed.
+    let mut ed = plan(
+        Some(TaskType::FixedDuration),
+        None,
+        4 * DAY,
+        vec![assignment(1, 1, 1., 2 * DAY)],
+    );
+    patch_delay(&mut ed, 1, DAY);
+    assert_eq!((alloc(&ed, 1), duration(&ed)), ((1., 2 * DAY), 4 * DAY));
+    patch_delay(&mut ed, 1, 3 * DAY);
+    assert_eq!((alloc(&ed, 1), duration(&ed)), ((1., 2 * DAY), 5 * DAY));
+    patch_delay(&mut ed, 1, 0);
+    assert_eq!((alloc(&ed, 1), duration(&ed)), ((1., 2 * DAY), 5 * DAY));
+}
+
 // ---- adding and removing resources (AC7) ----
 
 #[test]

@@ -16,13 +16,19 @@ const UNDO_CAP: usize = 100;
 const EXTERNAL_TASK_DATES: &str = "External task: its dates come from its own project";
 pub const DURATION_HINT: &str = "try 3d, 4h, 2w, 1mo";
 
+mod assignments;
 mod batch;
 mod cells;
 mod effort;
 mod fields;
+pub use assignments::{AssignmentPatch, ResourceRef};
 pub use cells::{
     day_finish, format_duration_exact, format_predecessors, format_resource_names, parse_cell_date,
     parse_lag, parse_task_predecessors, split_resource_names,
+};
+pub use fields::assignment::{
+    AssignmentField, assignment_dates, assignment_field_names, rate_table_letter,
+    read_assignment_field, work_contour_name,
 };
 pub use fields::{
     BaselinePart, ENTRY_FIELDS, Field, FieldRead, FieldReader, FieldValue, field_names,
