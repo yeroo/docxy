@@ -2080,6 +2080,68 @@ mod tests {
         assert_eq!(g.get_str("formula"), Some("=A3"));
     }
 
+    /// A one-sheet `Report` workbook with a print area and a manual row break
+    /// before 0-based row 13.
+    fn print_setup_book() -> Vec<u8> {
+        let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        let rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        let pkg_rel = "http://schemas.openxmlformats.org/package/2006/relationships";
+        let parts: Vec<(String, Vec<u8>)> = vec![
+            (
+                "[Content_Types].xml".into(),
+                r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#.into(),
+            ),
+            (
+                "_rels/.rels".into(),
+                format!(r#"<?xml version="1.0"?><Relationships xmlns="{pkg_rel}"><Relationship Id="rId1" Type="{rel}/officeDocument" Target="xl/workbook.xml"/></Relationships>"#).into_bytes(),
+            ),
+            (
+                "xl/workbook.xml".into(),
+                format!(r#"<?xml version="1.0"?><workbook xmlns="{ns}" xmlns:r="{rel}"><sheets><sheet name="Report" sheetId="1" r:id="rId1"/></sheets><definedNames><definedName name="_xlnm.Print_Area" localSheetId="0">Report!$A$1:$D$20</definedName></definedNames></workbook>"#).into_bytes(),
+            ),
+            (
+                "xl/_rels/workbook.xml.rels".into(),
+                format!(r#"<?xml version="1.0"?><Relationships xmlns="{pkg_rel}"><Relationship Id="rId1" Type="{rel}/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#).into_bytes(),
+            ),
+            (
+                "xl/worksheets/sheet1.xml".into(),
+                format!(r#"<?xml version="1.0"?><worksheet xmlns="{ns}"><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><rowBreaks count="1" manualBreakCount="1"><brk id="13" max="16383" man="1"/></rowBreaks></worksheet>"#).into_bytes(),
+            ),
+        ];
+        opccore::zipwrite::write_zip(&parts)
+    }
+
+    /// The saved workbook.xml and sheet1.xml of what `a` would write now.
+    fn saved_print_setup(a: &mut App) -> (String, String) {
+        let pkg = gridcore::xlsx::load_xlsx(&a.package_bytes()).expect("saved file reloads");
+        let part = |n: &str| String::from_utf8_lossy(pkg.part(n).unwrap()).into_owned();
+        (part("xl/workbook.xml"), part("xl/worksheets/sheet1.xml"))
+    }
+
+    #[test]
+    fn row_insert_moves_print_area_and_breaks_and_undo_puts_them_back() {
+        let pkg = gridcore::xlsx::load_xlsx(&print_setup_book()).unwrap();
+        let mut a = App::new(pkg, "ctl-print-setup.xlsx");
+        a.os_clip = None;
+        dispatch(
+            &mut a,
+            "row.insert",
+            &Json::obj(vec![("at", Json::Num(0.0))]),
+        )
+        .unwrap();
+        let (wb, ws) = saved_print_setup(&mut a);
+        assert!(wb.contains(">Report!$A$2:$D$21</definedName>"), "{wb}");
+        assert!(ws.contains(r#"<brk id="14" max="16383" man="1"/>"#), "{ws}");
+
+        a.undo();
+        let (wb, ws) = saved_print_setup(&mut a);
+        assert!(wb.contains(">Report!$A$1:$D$20</definedName>"), "{wb}");
+        assert!(
+            ws.contains(r#"<rowBreaks count="1" manualBreakCount="1"><brk id="13" max="16383" man="1"/></rowBreaks>"#),
+            "{ws}"
+        );
+    }
+
     #[test]
     fn row_delete_removes_rows_with_structural_undo() {
         let mut a = app();
