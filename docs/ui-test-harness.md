@@ -328,7 +328,7 @@ footer editor; `selection-set` refuses while it is open.
 
 | Call | Effect |
 |---|---|
-| `selection-set {"start":5,"end":1}` | set main-story anchor and caret through `Editor`; backward selections keep the larger anchor; both offsets are validated before either changes |
+| `selection-set {"start":5,"end":1}` | set main-story anchor and caret through `Editor`; backward selections keep the larger anchor; an empty range leaves a collapsed caret, the state a click leaves; both offsets are validated before either changes |
 | `ribbon-read {}` | list File, ribbon tabs and the contextual tabs — Table while the caret is in a table, Gantt Chart Format while a Project's Gantt shows — with groups, commands, galleries and Quick Access Toolbar |
 | `ribbon-click {"tab":"Home","command":"Bold"}` | resolve a command on a valid tab, contextual tabs included, by id, else by unique label, else by unique screentip title, and invoke the same action handler as its button |
 | `status-read {}` | read the tab's status line as an ordered `items` array of `{id, text}`: on a Project tab `state` (Ready/Edit/Busy), `new-tasks` (`New Tasks: …`) and `message`; on other tabs only `message` (a document's word-count stats are not reported) |
