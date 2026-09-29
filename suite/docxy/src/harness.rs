@@ -1779,6 +1779,8 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
         verb,
         "click-cell"
             | "drag"
+            | "fill-drag"
+            | "save-as"
             | "select-chart"
             | "focus-field"
             | "ribbon-click"
@@ -3757,6 +3759,8 @@ mod tests {
         for verb in [
             "click-cell",
             "drag",
+            "fill-drag",
+            "save-as",
             "ribbon-click",
             "title-tab",
             "close-tab",
@@ -3775,6 +3779,7 @@ mod tests {
             "key",
             "type",
             "ribbon-read",
+            "clipboard",
             "dialog-read",
             "status-read",
             "doc",

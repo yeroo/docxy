@@ -184,7 +184,9 @@ times out with nothing on stderr to say why. The reload prompt, the Save As
 dialog a `key ctrl+s` on a never-saved workbook would raise, and the
 unsaved-changes prompt on close are each gated on `harness.is_none()`; anything
 new in that family needs the same guard, and should refuse in words instead
-(`tab.status`), which a case can read. The app's own dialogs are not in that
+(`tab.status`), which a case can read. Save As itself is driven with the
+[`save-as`](#save-as-the-clipboard-and-the-fill-handle) verb, which hands the
+save functions the path the dialog would have answered with. The app's own dialogs are not in that
 family: they are app state that never runs a loop of their own (see
 [Dialogs](#dialogs)).
 
@@ -342,7 +344,7 @@ footer editor; `selection-set` refuses while it is open.
 | `window-size {"w":600,"h":700}` | resize the harness window in logical pixels; accepts width 300..4096 and height 200..4096 |
 | `window-zoom {}` | call GPUI's zoom action; on Windows it maximizes, while the native caption Max button uses the OS control area. Use a fresh harness window for restored geometry on Windows |
 
-`ribbon-read` and `ribbon-click` work on document and Project tabs. Each
+`ribbon-read` and `ribbon-click` work on document, Project and sheet tabs. Each
 command's `enabled` is the predicate its button draws with (every ribbon
 command is enabled today), and a command inside a split button's menu carries
 `menu`, the split's id (Set Baseline's `Set Baseline...` and `Clear
@@ -353,6 +355,24 @@ and they differ for icon-only commands (Indent is `Indent Task`, Link Tasks is
 The Project ribbon holds only Project's commands, and its Report tab has no
 groups yet (`groups: []`). Extend Selection mode, native prompts,
 and backstage pages are not represented by these verbs.
+
+On a sheet tab the reply lists File, Home, Insert, Review and View from
+`sheet_ribbon::SHEET_RIBBON`, the table the sheet ribbon is drawn from, so a
+button cannot be drawn without being listed. Ids are kebab-case and unique
+across the sheet ribbon (`bold`, `sort-a-z`, `freeze-panes`); icon and glyph
+buttons carry Excel's names (`Top Align`, `Increase Decimal`, `Accounting
+Number Format`), and `tip.title` is the label (sheet buttons have no
+screentips or KeyTips). `checked` is the pressed state Bold, Italic, Borders
+and the three aligns draw for the selection. A toggle reads its current label
+(`Unfreeze Panes`, `Unprotect Sheet`) and resolves by it. Placeholder buttons
+that do nothing yet (Format Painter, Underline, Cell Styles, Spelling, …) are
+`enabled: false`, and `ribbon-click` refuses them (`'Spelling' is not
+implemented`) instead of replying green over a no-op. `ribbon-click` resolves
+by id, else label, else the drawn text (`Σ AutoSum`), selects the tab and runs
+the button's own `run_sheet_act`. Buttons that open a bar (Filter, Custom
+Sort, Data Validation, …) leave it open for `type` and `key enter`, as a click
+does. The sheet ribbon has no split buttons, so `menu-open {"ribbon": …}`
+refuses a sheet tab. `sheet-ribbon.uit` covers these.
 
 Levelling (Level, Level All, Clear Leveling, Ctrl+Shift+L) is asked for, not
 run, so the Project status bar can draw `Busy`; render schedules the pass for
@@ -500,6 +520,82 @@ The `project-rows` case collapses with Alt+Shift+- and expands with Alt+Shift+=.
 nothing`); `null` and `none` read the same, and `empty` matches an empty string.
 Comparison is case-insensitive, and `is not` negates.
 
+### Save As, the clipboard and the fill handle
+
+Three things a person does with a native dialog, the OS clipboard or a
+pointer on a few pixels, each driven through the app's own handlers (#699).
+
+| Call | Effect |
+|---|---|
+| `save-as {"path":"out.md"}` | Save As the active tab to `path` without the native dialog: the path goes to the same save function the dialog's answer feeds (`save_doc_to`, `save_sheet_as`, `save_project_to`), and the tab is rebound (title, path, clean, a document's Markdown flag) exactly as after a dialog Save As. Optional `format` and `overwrite` |
+| `clipboard {"action":"read"}` | the clipboard's text and what the active tab's paste would use |
+| `clipboard {"action":"write","text":"a\tb\n"}` | put text on the clipboard, as another app's copy would |
+| `fill-drag {"from":"B4:B5","to":"B8"}` | press the fill handle, cross each cell to `to`, release. Optional `from` |
+
+**`save-as`.** `path` is required; a relative one resolves against the folder
+of the tab's own file, where the dialog would open, so after `open copy:` it
+lands in the case's sandbox folder. A tab that was never saved needs an
+absolute path. The format follows the extension by the app's own rules:
+documents save as `.docx`, `.md` (`.markdown`) or an editable-HTML bundle
+(`.html`/`.htm`, only in a build that can make one or from a tab that is one);
+workbooks as `.xlsx`; Projects as `.yppx` or MSPDI `.xml`. A path with no
+extension takes `format`'s (`docx`, `md`, `html` → `.docx.html`, `xlsx`,
+`yppx`, `xml`) or the kind's first (`.docx`, `.xlsx`, `.yppx`). The reply is
+`{path, format, title, dirty, status}`. Refused in words, with nothing written
+and the tab unchanged:
+
+- a missing or empty `path`; a relative `path` on a never-saved tab;
+- a format the tab kind cannot save (`Documents can be saved as .docx, .md or
+  .html`, `Workbooks can only be saved as .xlsx`, `Project schedules can only
+  be saved as .yppx or .xml (MSPDI)`), including any other document extension,
+  which the save would otherwise write as a Word package under that name;
+- a `format` that does not match the extension given;
+- an existing file, unless `"overwrite": true` (the dialog would ask);
+- a write that fails: the reply is the tab's status (`save failed: …`), and
+  the tab stays bound where it was.
+
+`key ctrl+s` on a never-saved tab still refuses in a harness instance, now
+ending with `use the harness save-as verb`; the Backstage's Save As… item is
+a pointer-only control no verb reaches. `save-as.uit` covers each kind and
+refusal.
+
+**`clipboard`.** A harness instance never touches the OS clipboard: the app's
+clipboard reads and writes (sheet copy and paste, Project copy and paste) go
+through a private clipboard that starts empty, so a run neither reads nor
+overwrites what the person at the machine copied. `read` replies `{text, app}`:
+`text` is that clipboard's text (`null` when empty) and `app` is what the
+active tab's paste would take besides it: `{kind: "doc", text}` (a document's
+in-app clip), `{kind: "grid", text, rows, cols}` (the sheet's copied cells,
+kept while the clipboard still holds the text that copy wrote), or
+`{kind: "none"}`, when a sheet or Project paste takes `text`. `write` needs
+`text` and replies the same. Copy, cut and paste are the app's own keys and
+buttons (`key ctrl+c`, `ribbon-click {"tab":"Home","command":"Copy"}`), not
+actions of this verb, which refuses them and `paste-special` (`paste special is
+not implemented in this app`). A document never reads the clipboard's text,
+and its copy never writes it: a document paste uses only its own clip.
+`clipboard.uit` covers these.
+
+**`fill-drag`.** The `drag` verb presses the grid, so it only sweeps a
+selection; `fill-drag` does what a pointer on the fill handle does:
+`sheet_fill_start` (the handle's press), `grid_drag_over` for each cell of the
+straight path from the selection's bottom-right corner to `to`, and
+`grid_release`, which commits the fill as a series (`gridcore::edit::autofill`).
+`from`, a cell or range, is selected first with `click-cell`'s own
+press/click/release (then the same with Shift for the far corner). The reply is
+the state plus `filled`, the filled box (`B4:B8`), or `null` when released on
+the source. Refused:
+
+- while the handle is not drawn: `the fill handle is not shown: a cell is being
+  edited`, `… a reference is being pointed at`, `… a chart is selected`
+  (`fill_handle_hidden`, the grid's own condition). A handle hidden under a
+  chart card is decided by layout and is not modelled;
+- when the press does not arm a fill: `the fill did not arm: the sheet is
+  protected` (a protected sheet refuses a fill from the pointer too), or
+  `… another gesture is in flight`;
+- an `option`: `AutoFill Options are not implemented in this app`.
+
+`sheet-fill.uit` covers these.
+
 ### Dialogs
 
 A dialog is app state on its document tab, **never a native modal loop**, so the
@@ -571,7 +667,7 @@ While a dialog is open on the active tab:
   button. Every other key does nothing, including Tab, Ctrl chords, Alt and
   typed text.
 - **Pointer verbs are refused** with `a dialog is open: <title>`: `click-cell`,
-  `drag`, `ribbon-click`, `select-chart`, `focus-field`, `title-tab`,
+  `drag`, `fill-drag`, `save-as`, `ribbon-click`, `select-chart`, `focus-field`, `title-tab`,
   `tab-select`, `proj.new`, `backstage {open}`, `backstage-close`, `close-tab`
   and `selection-set`.
 - The state reads `dialog: <id>` (`none` on every surface when nothing is open),
@@ -637,7 +733,8 @@ or the document menu on a Project.
 A menu belongs to the moment it opened in. What moves on from it closes it:
 another tab, the backstage, a command run from anywhere, a control-pipe verb
 that edits, reloads, saves or focuses the plan, and every harness verb that
-stands for a press outside the menu (`click-cell`, `drag`, `select-chart`,
+stands for a press outside the menu (`click-cell`, `drag`, `fill-drag`,
+`save-as`, `select-chart`,
 `focus-field`, `ribbon-click`, `title-tab`, `close-tab`, `selection-set`,
 `open`, `backstage` open and close (not `read`), `backstage-close`,
 `theme-set`, `ask-on-close`, `autorecover` and the
