@@ -1,0 +1,132 @@
+# #397: menus through the harness. `menu-open` calls the opener a right-click
+# or a split button's arrow calls, `menu-click` the item's own click handler.
+
+test a task row's menu is Project's and Insert Task puts a blank row above
+  open ../fixtures/gantt-summary.xml
+  assert menu is nothing
+  call menu-read {}
+  assert reply.open is false
+  call menu-open {"target":{"row":2}}
+  assert reply.open is true
+  assert reply.target.row is 2
+  assert selected_name is Task 2
+  assert menu.target.row is 2
+  shot window
+  assert reply.items.0.label is Cut
+  assert reply.items.1.label is Copy
+  assert reply.items.2.label is Paste
+  assert reply.items.3.label is Paste Special...
+  assert reply.items.3.enabled is false
+  assert reply.items.4.separator is true
+  assert reply.items.5.label is Scroll to Task
+  assert reply.items.7.label is Insert Task
+  assert reply.items.8.label is Delete Task
+  assert reply.items.8.enabled is true
+  assert reply.items.9.label is Inactivate Task
+  assert reply.items.9.checked is false
+  assert reply.items.11.label is Manually Schedule
+  assert reply.items.12.label is Auto Schedule
+  assert reply.items.12.checked is true
+  assert reply.items.14.label is Assign Resources...
+  assert reply.items.16.label is Text Styles...
+  assert reply.items.17.label is Font...
+  assert reply.items.19.label is Fill Down
+  assert reply.items.20.label is Clear Contents
+  assert reply.items.22.label is Information...
+  assert reply.items.23.label is Notes...
+  assert reply.items.24.label is Add to Timeline
+  assert reply.items.26.label is Hyperlink...
+  call menu-read {}
+  assert reply.items.7.label is Insert Task
+  call-error menu-click {"label":"Font..."} => menu item 'Font...' is disabled
+  call-error menu-click {"label":"Bold"} => no menu item 'Bold'
+  call menu-click {"label":"Insert Task"}
+  assert reply.menu is nothing
+  assert menu is nothing
+  assert tasks is 4
+  call rows {}
+  assert reply.rows.1.kind is blank
+  assert cell C3 is Task 2
+  call-error menu-click {"label":"Insert Task"} => no menu is open
+
+test the document's Bold menu never opens on a Project, and Esc closes the row menu
+  open ../fixtures/gantt-summary.xml
+  call-error menu-open {"target":"document"} => does not open on a Project tab
+  call-error menu-open {"target":{"bar":2}} => menu target 'bar' is not supported yet
+  call-error menu-open {"target":{"column":"Duration"}} => menu target 'column' is not supported yet
+  call-error menu-open {"target":{"cell":"C3"}} => menu target 'cell' is not supported yet
+  call-error menu-open {"target":{"row":99}} => no task with uid 99
+  call menu-open {"target":{"row":1}}
+  call-error menu-click {"label":"Bold"} => no menu item 'Bold'
+  call-error menu-click {"label":"Italic"} => no menu item 'Italic'
+  key escape
+  assert menu is nothing
+  assert selected_name is Task 1
+  assert prompt is none
+  assert tasks is 3
+  call-error menu-close {} => no menu is open
+  # A task under a collapsed summary has no row to right-click.
+  click A1
+  key alt+shift+-
+  call-error menu-open {"target":{"row":2}} => hidden under a collapsed summary
+
+test Delete Task on a row's menu deletes from any column and asks for a summary
+  open ../fixtures/gantt-summary.xml
+  click C3
+  assert cell is Name
+  call menu-open {"target":{"row":3}}
+  call menu-click {"label":"Delete Task"}
+  assert tasks is 2
+  assert dialog is none
+  call menu-open {"target":{"row":1}}
+  call menu-click {"label":"Delete Task"}
+  assert dialog is delete-summary
+  call dialog-click {"button":"No"}
+  assert tasks is 2
+
+test Set Baseline's split menu sets and clears the baseline
+  open ../fixtures/gantt-summary.xml
+  call menu-open {"target":{"ribbon":["Project","Schedule","Set Baseline"]}}
+  assert ribbon_tab is Project
+  assert reply.target.ribbon.2 is Set Baseline
+  assert reply.items.0.label is Set Baseline...
+  assert reply.items.0.key_tip is B
+  assert reply.items.1.label is Clear Baseline...
+  assert reply.items.1.key_tip is L
+  shot window
+  call menu-click {"label":"Set Baseline..."}
+  assert status is Baseline set — baseline bars now show under the current bars
+  call menu-open {"target":{"ribbon":["Project","Schedule","Set Baseline"]}}
+  call menu-click {"label":"Clear Baseline..."}
+  assert status is Baseline cleared
+  call-error menu-open {"target":{"ribbon":["Project","Schedule","Calculate Project"]}} => 'Calculate Project' has no menu
+  # The ribbon still takes both by name and by KeyTip.
+  call ribbon-click {"tab":"Project","command":"Set Baseline"}
+  assert status is Baseline set — baseline bars now show under the current bars
+  call ribbon-click {"tab":"Project","command":"Clear Baseline"}
+  assert status is Baseline cleared
+  key alt p l
+  assert status is No baseline to clear
+  call ribbon-read {}
+  assert reply.tabs.4.groups.0.commands.1.label is Set Baseline
+  assert reply.tabs.4.groups.0.commands.1.enabled is true
+  assert reply.tabs.4.groups.0.commands.3.label is Clear Baseline...
+  assert reply.tabs.4.groups.0.commands.3.menu is pr-baseline
+  # menu-close closes as Esc does.
+  call menu-open {"target":{"ribbon":["Project","Schedule","Set Baseline"]}}
+  call menu-close {}
+  assert reply.menu is nothing
+
+test the document menu opens on a document through the right-click's opener
+  open copy:../fixtures/basic.docx
+  type hello
+  call-error menu-open {"target":{"row":1}} => a row menu needs a Project tab
+  call menu-open {"target":"document"}
+  assert reply.target is document
+  assert reply.items.0.label is Cut
+  assert reply.items.4.label is Bold
+  assert reply.items.8.label is New Comment
+  assert menu.target is document
+  key escape
+  assert menu is nothing
+  assert text is hello
