@@ -2040,6 +2040,29 @@ mod tests {
     }
 
     #[test]
+    fn backspace_after_a_field_selects_its_one_offset_atom_642() {
+        let xml = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:body><w:p><w:r><w:t>Body</w:t></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> PAGE </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>1</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p></w:body></w:document>"#;
+        let doc = docxcore::load::parse_document_xml(xml, &Default::default());
+        let mut s = Session::open(&save_package(&new_package(doc))).expect("open");
+        // The page draws the field as an atom spanning one editor offset.
+        let d = s.doc_json();
+        assert!(
+            d.contains(r#"{"k":"field","o":4,"w":1,"#),
+            "field atom: {d}"
+        );
+        s.exec_json("select\t0\t5\t0\t5");
+        let r = s.exec_json("backspace");
+        assert!(
+            r.contains(r#""caret":{"p":"0","o":5},"anchor":{"p":"0","o":4}"#),
+            "the first Backspace selects the field: {r}"
+        );
+        s.exec_json("backspace");
+        assert!(!s.editor.doc.plain_text().contains('1'));
+        assert_eq!(s.editor.doc.plain_text().trim_end(), "Body");
+    }
+
+    #[test]
     fn opens_and_renders_text() {
         let bytes = sample_docx("Hello world");
         let mut s = Session::open(&bytes).expect("open");
