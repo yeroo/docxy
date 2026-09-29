@@ -805,7 +805,10 @@ impl App {
         match self.ed.subtree_len(uid) {
             Ok(0) => self.delete_subtree(uid),
             Ok(n) => {
-                // As in `request_exit`: no hidden prompt may take the modal's keys.
+                // Defensive, as in `request_exit`: no hidden prompt may take
+                // the modal's keys. Today only the Delete/x keys reach here,
+                // and an open prompt takes those first, but a future caller
+                // (a ribbon or menu command) would not.
                 self.prompt = None;
                 let name = self.ed.project().task(uid).map_or("", |t| &t.name);
                 let noun = if n == 1 { "subtask" } else { "subtasks" };
@@ -3501,29 +3504,25 @@ mod tests {
         assert_eq!(app.ed.project(), &before);
     }
 
+    /// File ▸ Exit can be asked for while a text prompt is open (the File
+    /// backstage is a click away); the Exit question closes the prompt so the
+    /// prompt cannot take the modal's keys.
     #[test]
-    fn a_summary_delete_closes_any_text_prompt_under_its_modal() {
+    fn an_exit_question_closes_any_text_prompt_under_its_modal() {
         let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
-        app.add_task();
-        app.indent(1);
-        app.ed.select(0);
         let before = app.ed.project().clone();
-        // Ribbon clicks reach `apply_act` while a text prompt is open.
         app.apply_act(Act::Constraint);
         assert!(app.prompt.is_some());
-        app.delete_task();
+        app.request_exit();
         assert!(
             app.prompt.is_none(),
             "the prompt would take the modal's keys"
         );
+        assert!(app.confirm.is_some());
         on_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.confirm.is_none(), "Esc reaches the visible question");
+        assert!(!app.quit);
         assert_eq!(app.ed.project(), &before);
-
-        // File ▸ Exit over a prompt is the same case.
-        app.apply_act(Act::Constraint);
-        app.request_exit();
-        assert!(app.prompt.is_none());
     }
 
     #[test]
