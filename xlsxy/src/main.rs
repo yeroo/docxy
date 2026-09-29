@@ -2862,6 +2862,7 @@ impl App {
                 engine.seed = entropy_seed();
                 self.engine = engine;
                 self.pkg = pkg;
+                self.forget_clip();
                 self.path = p;
                 self.import_source = import_source;
                 self.model_rels = rels;
@@ -2877,6 +2878,15 @@ impl App {
         }
     }
 
+    /// Drop the internal clip when the workbook is replaced: its cells carry
+    /// the old workbook's style indices and `cm`/`vm` metadata indices, and a
+    /// cut names source cells that no longer exist. A later paste goes through
+    /// the OS clipboard's text (values only), as from any other program.
+    fn forget_clip(&mut self) {
+        self.clip = None;
+        self.clip_text = None;
+    }
+
     /// Start a fresh blank workbook (discarding the current one).
     fn new_workbook(&mut self) {
         let pkg = new_xlsx();
@@ -2885,6 +2895,7 @@ impl App {
         engine.seed = entropy_seed();
         self.engine = engine;
         self.pkg = pkg;
+        self.forget_clip();
         self.path = "untitled.xlsx".to_string();
         self.import_source = None;
         self.model_rels = Vec::new();
@@ -6456,6 +6467,28 @@ mod tests {
         assert!(load_xlsx(&std::fs::read(&source).unwrap()).is_ok());
         std::fs::remove_file(source).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn internal_clip_does_not_survive_a_workbook_switch() {
+        // A clip holds the old workbook's cells, whose style indices and
+        // cm/vm metadata indices mean nothing in another workbook.
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        let mut cell = Cell::number(1.0);
+        cell.meta = Some(Box::new(gridcore::sheet::CellMeta {
+            cm: Some("1".into()),
+            ..Default::default()
+        }));
+        app.pkg.workbook.sheets[0].set_cell(0, 0, cell);
+        app.copy(false);
+        app.cur = (0, 1);
+        app.paste();
+        assert!(app.sheet().cell(0, 1).is_some_and(|c| c.meta.is_some()));
+
+        app.new_workbook();
+        app.paste();
+        assert!(app.sheet().cell(0, 0).is_none());
     }
 
     #[test]
