@@ -16808,7 +16808,7 @@ impl Docxy {
                     cx.notify();
                 }),
             )
-            // Anchored where it was opened, flipped and nudged to stay inside
+            // Anchored where it was opened, slid (not flipped) to stay inside
             // the window, as a menu opened near an edge is.
             .child(
                 anchored()
