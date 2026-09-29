@@ -149,6 +149,41 @@ fn whole_document_writes_only_the_changed_fields() {
     assert!(setups(&t).iter().all(|s| !s.page.landscape), "one step");
 }
 
+/// A margin typed before Orientation changes goes where the dialog shows it
+/// (r1 M1): its changed-ness turns with the page.
+#[test]
+fn a_typed_margin_turns_with_the_page() {
+    // One section: Top 2", then Landscape; the dialog shows Right 2".
+    let mut t = three_sections();
+    let ed = ed_mut(&mut t);
+    ed.doc.body.truncate(2);
+    if let Block::Paragraph(p) = &mut ed.doc.body[0] {
+        p.props.section_break = None;
+    }
+    open(&mut t, PageSetupTab::Margins);
+    set(&mut t, "top", s("2"));
+    set(&mut t, "orientation", s("Landscape"));
+    let shown_sides = ["top", "right", "bottom", "left"].map(|n| shown(&t, n));
+    assert_eq!(shown_sides, ["1", "2", "1", "1"]);
+    ok(&mut t).unwrap();
+    let m = setups(&t)[0].margins;
+    assert_eq!((m.top, m.right, m.bottom, m.left), (1440, 2880, 1440, 1440));
+
+    // Three sections with their own left margins, Whole document: each turns
+    // its own margins, and the typed one lands on every section's right.
+    let mut t = three_sections();
+    distinct_margins(&mut t);
+    open(&mut t, PageSetupTab::Margins);
+    set(&mut t, "top", s("2"));
+    set(&mut t, "orientation", s("Landscape"));
+    set(&mut t, "apply", s("Whole document"));
+    ok(&mut t).unwrap();
+    for (k, left) in [(0, 1440), (1, 2160), (2, 2880)] {
+        let m = setups(&t)[k].margins;
+        assert_eq!((m.top, m.right), (left, 2880), "section {k}");
+    }
+}
+
 #[test]
 fn this_point_forward_starts_a_new_section_at_the_caret() {
     let mut t = three_sections();

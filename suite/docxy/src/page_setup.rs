@@ -204,16 +204,27 @@ fn chosen(d: &Dialog, name: &str) -> Option<usize> {
     }
 }
 
-/// Set a control's value and the value it opened on together, so a change
-/// the dialog makes itself does not count as the person's.
-fn set_both(d: &mut Dialog, name: &str, value: Value) {
-    let Some(i) = index(d, name) else {
+/// Move controls' values around, and the values they opened on with them:
+/// `names[k]` takes what `from[k]` held. The page turning moves the numbers,
+/// and a field the person had changed stays changed wherever its number goes.
+fn permute(d: &mut Dialog, names: &[&str], from: &[&str]) {
+    let at = |d: &Dialog, n: &str| index(d, n);
+    let taken: Vec<(Value, Option<Value>)> = from
+        .iter()
+        .filter_map(|n| at(d, n))
+        .map(|i| (d.controls[i].value.clone(), d.opened.get(i).cloned()))
+        .collect();
+    if taken.len() != names.len() {
         return;
-    };
-    let same = d.opened.get(i) == Some(&d.controls[i].value);
-    d.controls[i].value = value.clone();
-    if same && let Some(o) = d.opened.get_mut(i) {
-        *o = value;
+    }
+    for (name, (value, opened)) in names.iter().zip(taken) {
+        let Some(i) = at(d, name) else {
+            continue;
+        };
+        d.controls[i].value = value;
+        if let (Some(slot), Some(opened)) = (d.opened.get_mut(i), opened) {
+            *slot = opened;
+        }
     }
 }
 
@@ -247,18 +258,14 @@ pub(crate) fn after_set(d: &mut Dialog, i: usize) {
             if (w > h) == landscape || w == h {
                 return;
             }
-            set_both(d, "width", Value::Text(inches(h)));
-            set_both(d, "height", Value::Text(inches(w)));
-            let [top, right, bottom, left] =
-                ["top", "right", "bottom", "left"].map(|n| text_of(d, n));
-            let turned = if landscape {
-                [left, top, right, bottom]
+            permute(d, &["width", "height"], &["height", "width"]);
+            let sides = ["top", "right", "bottom", "left"];
+            let from = if landscape {
+                ["left", "top", "right", "bottom"]
             } else {
-                [right, bottom, left, top]
+                ["right", "bottom", "left", "top"]
             };
-            for (name, v) in ["top", "right", "bottom", "left"].into_iter().zip(turned) {
-                set_both(d, name, Value::Text(v));
-            }
+            permute(d, &sides, &from);
         }
         "paper" => {
             let Some(p) = chosen(d, "paper").and_then(|i| Paper::ALL.get(i).copied()) else {
