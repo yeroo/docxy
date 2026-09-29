@@ -128,6 +128,30 @@ pub struct Cell {
     /// load). The spilled cells themselves are plain values owned by this
     /// anchor. `None` = no spill (scalar result).
     pub spill: Option<(u32, u32)>,
+    /// `<c>` metadata attributes kept from the file (`cm`, `vm`, `ph`);
+    /// boxed because almost no cell has any.
+    pub meta: Option<Box<CellMeta>>,
+}
+
+/// The `<c>` attributes we don't interpret but must write back: Excel marks a
+/// dynamic-array anchor with `cm` (without it the spill reopens as a legacy
+/// Ctrl+Shift+Enter array), and a rich value (image, data type, `#SPILL!`
+/// details) with `vm`. Both are opaque indices into `xl/metadata.xml`.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct CellMeta {
+    /// Cell-metadata index; written only on an array `<f>`.
+    pub cm: Option<String>,
+    /// Value-metadata index and the value it was loaded with: it describes
+    /// that value, so it is written only while the cell still holds it.
+    pub vm: Option<(String, CellValue)>,
+    /// `ph="1"`: show phonetic text.
+    pub ph: bool,
+}
+
+/// Do preserved `<f>` attributes (see [`Cell::f_attrs`]) mark an array
+/// formula (`t="array"`)?
+pub fn is_array_f(attrs: &str) -> bool {
+    attrs.contains("t=\"array\"")
 }
 
 impl Cell {
@@ -152,6 +176,16 @@ impl Cell {
     /// Empty value, no formula — but possibly still worth keeping for `style`.
     pub fn is_blank(&self) -> bool {
         self.value.is_empty() && self.formula.is_none()
+    }
+    /// Is the formula an array one, evaluated by the dynamic-array engine: a
+    /// `t="array"` `<f>`, or a cell Excel marked dynamic with `cm` whose
+    /// `f_attrs` an edit dropped ([`crate::engine::Engine::set_cell`])?
+    pub fn is_array_formula(&self) -> bool {
+        self.f_attrs.as_deref().is_some_and(is_array_f) || self.has_cm()
+    }
+    /// Did Excel mark this cell a dynamic array (`cm`)?
+    pub fn has_cm(&self) -> bool {
+        self.meta.as_ref().is_some_and(|m| m.cm.is_some())
     }
 }
 

@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::formula::{
     self, DynResult, Eval, ExcelError, Expr, Resolver, Value, collect_refs, is_volatile,
 };
-use crate::sheet::{Cell, CellValue, Sheet, Workbook};
+use crate::sheet::{Cell, CellValue, Sheet, Workbook, is_array_f};
 
 /// (sheet index, row, col) — the engine's cell address.
 pub type Key = (usize, u32, u32);
@@ -67,14 +67,12 @@ impl Engine {
         for (s, sheet) in wb.sheets.iter().enumerate() {
             for (&(r, c), cell) in &sheet.cells {
                 if let Some(src) = &cell.formula {
-                    // Array formulas (`t="array"`) are ours to evaluate — the
+                    // Array formulas (`t="array"`, or `cm` after an edit
+                    // dropped `f_attrs`) are ours to evaluate — the
                     // dynamic-array engine recomputes their spill. Other
                     // preserved `<f>` attributes stay frozen.
-                    let is_array = cell
-                        .f_attrs
-                        .as_deref()
-                        .is_some_and(|a| a.contains("t=\"array\""));
-                    let preserved = cell.f_attrs.is_some() && !is_array;
+                    let is_array = cell.is_array_formula();
+                    let preserved = cell.f_attrs.as_deref().is_some_and(|a| !is_array_f(a));
                     // A plain loaded formula is legacy (implicit intersection);
                     // a dynamic-array (`t="array"`) one spills.
                     eng.index_formula(wb, (s, r, c), src, preserved, !is_array);
