@@ -16,7 +16,7 @@
 //! accrue when it is absent or Invalid), Constraint Type (As Soon As
 //! Possible), Leveling Delay (0 edays). Estimated and Milestone are what the
 //! grid shows (a summary is estimated when a leaf below it is; a zero-length
-//! task is a milestone). A blank row reads only its ID and Unique ID; every
+//! leaf is a milestone). A blank row reads only its ID and Unique ID; every
 //! other field is empty text and null.
 //!
 //! Units: a task's own durations (Actual, Remaining and Baseline Duration,
@@ -427,7 +427,9 @@ impl<'a> FieldReader<'a> {
             }
             Field::Priority => int(i64::from(task.priority.unwrap_or(500))),
             Field::Notes => optional_text(task.notes.as_deref()),
-            Field::Milestone => flag(task.is_milestone()),
+            // A summary's stored duration is stale and may be 0, so only a
+            // leaf is a milestone by length, as the grid's Duration reads it.
+            Field::Milestone => flag(task.milestone || (!task.summary && task.duration_min == 0)),
             Field::Summary => flag(task.summary),
             Field::Estimated => flag(!duration_suffix(proj, task.uid).is_empty()),
             Field::UniqueId => int(i64::from(task.uid)),

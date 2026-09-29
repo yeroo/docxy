@@ -292,6 +292,8 @@ fn every_name_reads_on_a_leaf_a_summary_a_milestone_and_a_blank_row() {
         }
     }
     assert_eq!(read(&ed, 10, "Summary").text, "Yes");
+    // Its stored duration is 0, but a summary is not a milestone by length.
+    assert_eq!(read(&ed, 10, "Milestone").text, "No");
     assert_eq!(read(&ed, 10, "Duration").text, "2d");
     assert_eq!(read(&ed, 2, "Milestone").text, "Yes");
     assert_eq!(read(&ed, 2, "Duration").text, "—");
@@ -505,6 +507,7 @@ fn the_project_summary_row_reads_its_rollup_and_stored_values() {
         ("Cost", "$1,400.00"),
         ("Notes", "Kickoff"),
         ("Outline Number", "0"),
+        ("Milestone", "No"),
     ] {
         assert_eq!(read(&ed, 0, name).text, text, "{name}");
     }
