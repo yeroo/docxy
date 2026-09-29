@@ -459,12 +459,27 @@ mod tests {
         assert!(key(&mut t, "tab", None));
         assert!(key(&mut t, "space", Some(" ")));
         assert_eq!(value(&t, "on"), Value::Bool(true));
-        // A chord is swallowed and edits nothing.
-        let ctrl = Modifiers {
-            control: true,
-            ..Modifiers::default()
-        };
-        assert!(dialog_key(&mut t, "a", Some("a"), ctrl));
+        // A chord or Alt is swallowed and edits nothing, even in a focused
+        // text field that a plain "a" would type into.
+        assert!(dialog_key(&mut t, "tab", None, shift));
+        assert_eq!(
+            t.dialogs.top().unwrap().focused().map(|c| c.name),
+            Some("note")
+        );
+        for m in [
+            Modifiers {
+                control: true,
+                ..Modifiers::default()
+            },
+            Modifiers {
+                alt: true,
+                ..Modifiers::default()
+            },
+        ] {
+            assert!(dialog_key(&mut t, "a", Some("a"), m));
+            assert!(dialog_key(&mut t, "backspace", None, m));
+        }
+        assert_eq!(value(&t, "note"), Value::Text("Hi ".into()));
         assert_eq!(value(&t, "on"), Value::Bool(true));
         assert!(key(&mut t, "enter", None));
         assert!(!t.dialogs.is_open(), "Enter pressed OK");
