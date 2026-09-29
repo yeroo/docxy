@@ -151,8 +151,8 @@ pub enum LagKind {
     Percent,
 }
 
-/// The unit a lag is entered and shown in (MSPDI `LagFormat` without its
-/// elapsed and estimated bits).
+/// The unit a lag or a task duration is entered and shown in (MSPDI
+/// `LagFormat` or `DurationFormat` without its elapsed and estimated bits).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LagUnit {
     Minute,
@@ -161,6 +161,21 @@ pub enum LagUnit {
     Week,
     Month,
     Percent,
+}
+
+impl LagUnit {
+    /// The unit's short spelling, as a cell shows it: `m`, `h`, `d`, `w`,
+    /// `mo`, `%`.
+    pub fn suffix(self) -> &'static str {
+        match self {
+            LagUnit::Minute => "m",
+            LagUnit::Hour => "h",
+            LagUnit::Day => "d",
+            LagUnit::Week => "w",
+            LagUnit::Month => "mo",
+            LagUnit::Percent => "%",
+        }
+    }
 }
 
 /// A link lag's MSPDI `LagFormat`, limited to the codes docxy can schedule:
@@ -354,6 +369,14 @@ pub struct Task {
     pub effort_driven: Option<bool>,
     /// Duration shown with `?` in Project.
     pub estimated: Option<bool>,
+    /// MSPDI `DurationFormat`: the unit the duration was entered in, which
+    /// its Duration and slack show in (see [`Task::duration_unit`]). `None`
+    /// is days (7), the default: a save writes 7 and a read of a plain 7
+    /// stores `None`. Any other code is kept as read, estimated bit (32)
+    /// included. Typing a duration sets its unit's plain code (see
+    /// `TaskPatch::duration_format`); only a stored estimated code of the
+    /// same unit, retyped with `?`, keeps its bit.
+    pub duration_format: Option<u8>,
     /// Levelling priority, 0..=1000.
     pub priority: Option<i32>,
     /// Bounds the late finish, so a missed deadline shows as negative total
@@ -541,6 +564,18 @@ impl Task {
 
     pub fn is_milestone(&self) -> bool {
         self.milestone || self.duration_min == 0
+    }
+
+    /// The working unit this task's Duration and slack show in, from its
+    /// `DurationFormat`: days when it has none. `None` for the elapsed,
+    /// percent, null and unknown codes, which keep the default display.
+    pub fn duration_unit(&self) -> Option<LagUnit> {
+        let Some(code) = self.duration_format else {
+            return Some(LagUnit::Day);
+        };
+        LagFormat::from_code(i64::from(code))
+            .filter(|f| f.kind() == LagKind::Working)
+            .map(LagFormat::unit)
     }
 
     /// Whether `finish` falls after the task's Deadline, as Project's missed
@@ -1762,6 +1797,34 @@ impl Project {
         (days * self.hours_per_day * 60.0).round() as i64
     }
 
+    /// Working minutes in one duration unit, as `parse_duration` counts
+    /// them; `None` for a percentage or a non-positive factor.
+    pub fn working_unit_min(&self, unit: LagUnit) -> Option<f64> {
+        let per = match unit {
+            LagUnit::Minute => 1.0,
+            LagUnit::Hour => 60.0,
+            LagUnit::Day => self.hours_per_day * 60.0,
+            LagUnit::Week => self.hours_per_week * 60.0,
+            LagUnit::Month => self.days_per_month() * self.hours_per_day * 60.0,
+            LagUnit::Percent => return None,
+        };
+        (per.is_finite() && per > 0.0).then_some(per)
+    }
+
+    /// Working minutes in `unit`, a whole value bare (`1w`) and a fraction
+    /// with `decimals` places (`0.50w`). `None` when the unit has no working
+    /// length, or when a non-zero time would print as zero (`0.0w`).
+    pub fn format_in_unit(&self, min: i64, unit: LagUnit, decimals: usize) -> Option<String> {
+        let value = min as f64 / self.working_unit_min(unit)?;
+        let suffix = unit.suffix();
+        if (value.round() - value).abs() < 1e-9 {
+            return Some(format!("{}{suffix}", value.round() as i64));
+        }
+        let shown = format!("{value:.decimals$}");
+        let zero = shown.parse::<f64>().is_ok_and(|v| v == 0.0);
+        (!zero).then(|| format!("{shown}{suffix}"))
+    }
+
     pub fn task(&self, uid: i32) -> Option<&Task> {
         self.tasks.iter().find(|t| t.uid == uid)
     }
@@ -1821,6 +1884,23 @@ impl Project {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_in_unit_never_prints_a_non_zero_time_as_zero() {
+        let p = Project::default();
+        assert_eq!(p.format_in_unit(60, LagUnit::Week, 1), None);
+        assert_eq!(p.format_in_unit(-60, LagUnit::Week, 1), None);
+        assert_eq!(p.format_in_unit(5, LagUnit::Week, 2), None);
+        assert_eq!(p.format_in_unit(0, LagUnit::Week, 1).as_deref(), Some("0w"));
+        assert_eq!(
+            p.format_in_unit(120, LagUnit::Week, 1).as_deref(),
+            Some("0.1w")
+        );
+        assert_eq!(
+            p.format_in_unit(-1200, LagUnit::Week, 2).as_deref(),
+            Some("-0.50w")
+        );
+    }
 
     #[test]
     fn days_per_month_uses_positive_finite_option_or_project_default() {

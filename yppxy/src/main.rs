@@ -1838,11 +1838,17 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
         } else if t.is_milestone() {
             "—".to_string()
         } else {
-            fmt_days(app.ed.project().minutes_to_days(t.duration_min))
+            in_task_unit(app.ed.project(), t, t.duration_min)
                 + duration_suffix(app.ed.project(), t.uid)
         };
         let slack = r
-            .map(|r| fmt_days(app.ed.project().minutes_to_days(r.total_slack_min)))
+            .map(|r| {
+                if t.summary {
+                    fmt_days(app.ed.project().minutes_to_days(r.total_slack_min))
+                } else {
+                    in_task_unit(app.ed.project(), t, r.total_slack_min)
+                }
+            })
             .unwrap_or_else(|| "?".into());
         let crit = r.is_some_and(|r| r.critical);
         let mut style = Style::default();
@@ -2147,6 +2153,13 @@ fn task_resources(proj: &Project, uid: i32) -> Vec<String> {
                 .map(|r| r.name.clone())
         })
         .collect()
+}
+
+/// Minutes in the unit a leaf's duration was entered in (`1w`, `0.5w`), else days.
+fn in_task_unit(proj: &Project, task: &Task, min: i64) -> String {
+    task.duration_unit()
+        .and_then(|unit| proj.format_in_unit(min, unit, 1))
+        .unwrap_or_else(|| fmt_days(proj.minutes_to_days(min)))
 }
 
 fn fmt_days(days: f64) -> String {
@@ -2516,6 +2529,61 @@ mod tests {
             row.split_whitespace().collect::<Vec<_>>(),
             ["•", "Late", "2d", "-1d"]
         );
+    }
+
+    #[test]
+    fn task_grid_shows_duration_and_slack_in_each_task_s_unit() {
+        use ratatui::backend::TestBackend;
+        let task = |uid: i32, name: &str, level: u32, min: i64, format: Option<u8>| Task {
+            uid,
+            id: uid,
+            name: name.into(),
+            outline_level: level,
+            duration_min: min,
+            duration_format: format,
+            ..Task::default()
+        };
+        let mut summary = task(1, "Sum", 1, 0, Some(9));
+        summary.summary = true;
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![
+                summary,
+                task(2, "Weeks", 2, 3600, Some(9)),
+                task(3, "Half", 1, 1200, Some(9)),
+                task(4, "Hours", 1, 240, Some(5)),
+                task(5, "Days", 1, 240, None),
+                task(6, "Mile", 1, 0, Some(9)),
+                // 60 min of slack is 0.025w: days, not a false `0.0w`.
+                task(7, "Tiny", 1, 3540, Some(9)),
+            ],
+            ..Project::default()
+        };
+        let mut app = App::new(proj, None, false);
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| draw_body(f, f.area(), &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let row = |y: u16| -> Vec<String> {
+            let text: String = (1..45)
+                .map(|x| buf.cell((x, app.list_y0 + y)).unwrap().symbol())
+                .collect();
+            text.split_whitespace()
+                .rev()
+                .take(2)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect()
+        };
+        // A summary keeps days; a milestone keeps its dash, slack in its unit.
+        assert_eq!(row(0), ["7.5d", "0d"]);
+        assert_eq!(row(1), ["1.5w", "0w"]);
+        assert_eq!(row(2), ["0.5w", "1w"]);
+        assert_eq!(row(3), ["4h", "56h"]);
+        assert_eq!(row(4), ["0.5d", "7d"]);
+        assert_eq!(row(5), ["—", "1.5w"]);
+        assert_eq!(row(6), ["1.5w", "0.1d"]);
     }
 
     #[test]

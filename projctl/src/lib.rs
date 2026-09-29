@@ -30,9 +30,10 @@
 use ctlcore::json::Json;
 use projcore::datetime::DateTime;
 use projcore::editor::{
-    DURATION_HINT, Editor, TaskPatch, parse_duration, parse_lag, parse_task_duration,
+    DURATION_HINT, Editor, TaskPatch, duration_format_code, parse_duration, parse_lag,
+    parse_task_duration_unit,
 };
-use projcore::model::{LagFormat, LinkType, Predecessor, Task};
+use projcore::model::{LagFormat, LagUnit, LinkType, Predecessor, Task};
 
 /// Successful calls to these verbs signal agent editing activity.
 pub const MUTATING: &[&str] = &["task.set", "task.add", "task.del", "link.add", "link.del"];
@@ -227,7 +228,7 @@ fn task_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
     let duration = args
         .get_str("duration")
         .map(|d| {
-            parse_task_duration(d, ed.project())
+            parse_task_duration_unit(d, ed.project())
                 .ok_or_else(|| format!("Couldn't read duration '{d}' ({DURATION_HINT})"))
         })
         .transpose()?;
@@ -251,6 +252,7 @@ fn task_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
             level,
             manual,
             estimated: duration.map(|d| d.1),
+            duration_format: duration.and_then(|d| duration_format_code(d.2)),
         },
     )?;
     task_get(ed, args)
@@ -261,18 +263,20 @@ fn task_add(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         .get("after")
         .map(|_| uid_arg(args, "after"))
         .transpose()?;
-    let (duration_min, estimated) = match args.get_str("duration") {
-        Some(d) => parse_task_duration(d, ed.project())
+    let (duration_min, estimated, unit) = match args.get_str("duration") {
+        Some(d) => parse_task_duration_unit(d, ed.project())
             .ok_or_else(|| format!("Couldn't read duration '{d}' ({DURATION_HINT})"))?,
         // The default duration is estimated when the plan's new tasks are.
-        None => (480, ed.project().new_tasks_estimated()),
+        None => (480, ed.project().new_tasks_estimated(), LagUnit::Day),
     };
-    let at = ed.add_task(
-        after,
-        args.get_str("name").unwrap_or("New task"),
-        duration_min,
-        estimated,
-    )?;
+    let name = args.get_str("name").unwrap_or("New task");
+    // One undo step: the task, then the unit its duration was typed in.
+    let at = ed.batch(|ed| {
+        let at = ed.add_task(after, name, duration_min, estimated)?;
+        let uid = ed.project().tasks[at].uid;
+        ed.set_duration_typed(uid, duration_min, estimated, unit)?;
+        Ok(at)
+    })?;
     Ok(task_json(ed, &ed.project().tasks[at]))
 }
 
@@ -662,6 +666,32 @@ mod tests {
         assert!(task_get(&a, &Json::obj(vec![("uid", Json::Num(999.0))])).is_err());
         assert_eq!(a.dirty(), dirty_before);
         assert_eq!(a.undo_depth(), undo_before, "failed edits push no snapshot");
+    }
+
+    #[test]
+    fn a_duration_s_unit_is_kept_and_saved() {
+        let mut ed = app();
+        let depth = ed.undo_depth();
+        let set = Json::parse(r#"{"uid":1,"duration":"1.5w"}"#).unwrap();
+        dispatch_editor(&mut ed, "task.set", &set).unwrap().unwrap();
+        let add = Json::parse(r#"{"name":"Hours","duration":"4h?"}"#).unwrap();
+        let added = dispatch_editor(&mut ed, "task.add", &add).unwrap().unwrap();
+        let uid = added.get_usize("uid").unwrap() as i32;
+        // The task and its unit are one step.
+        assert_eq!(ed.undo_depth(), depth + 2);
+        let task = ed.project().task(uid).unwrap();
+        assert_eq!(
+            (task.duration_min, task.estimated, task.duration_format),
+            (240, Some(true), Some(5))
+        );
+        let saved =
+            projcore::mspdi::read_mspdi(&projcore::mspdi::write_mspdi(ed.project())).unwrap();
+        assert_eq!(saved.task(1).unwrap().duration_format, Some(9));
+        assert_eq!(saved.task(1).unwrap().duration_min, 3600);
+        assert_eq!(saved.task(uid).unwrap().duration_format, Some(5));
+        ed.undo();
+        assert!(ed.project().task(uid).is_none());
+        assert_eq!(ed.project().task(1).unwrap().duration_format, Some(9));
     }
 
     #[test]

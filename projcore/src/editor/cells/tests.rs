@@ -186,7 +186,8 @@ fn unchanged_fields_and_constraints_preserve_redo_and_clean_state() {
     ed.undo();
     ed.mark_saved();
     ed.rename(10, "Task 1").unwrap();
-    ed.set_duration(10, "8h").unwrap();
+    // The same duration in the same unit; `8h` would switch it to hours.
+    ed.set_duration(10, "1d").unwrap();
     ed.set_constraint_typed(10, ConstraintType::AsSoonAsPossible, None)
         .unwrap();
     assert_eq!(
@@ -470,13 +471,266 @@ fn constraint_abbreviations_match_all_constraint_codes_and_hints() {
 }
 
 #[test]
+fn a_typed_duration_records_its_unit_and_undo_restores_it() {
+    let mut ed = editor();
+    let format = |ed: &Editor| ed.project().task(10).unwrap().duration_format;
+    for (text, minutes, expected) in [
+        ("2w", 4800, Some(9)),
+        ("4h", 240, Some(5)),
+        ("90m", 90, Some(3)),
+        ("1mo", 9600, Some(11)),
+        ("1.5 weeks", 3600, Some(9)),
+        // Days, and a bare number, are the default: no format.
+        ("3", 1440, None),
+        ("2d", 960, None),
+    ] {
+        ed.set_duration(10, "1w").unwrap();
+        let depth = ed.undo_depth();
+        ed.set_duration(10, text).unwrap();
+        assert_eq!(
+            ed.project().task(10).unwrap().duration_min,
+            minutes,
+            "{text}"
+        );
+        assert_eq!(format(&ed), expected, "{text}");
+        assert_eq!(ed.undo_depth(), depth + 1, "{text}");
+        ed.undo();
+        assert_eq!(format(&ed), Some(9), "{text}");
+    }
+    // The same minutes in another unit is still an edit: it changes the unit.
+    ed.set_duration(10, "1w").unwrap();
+    let depth = ed.undo_depth();
+    ed.set_duration(10, "5d").unwrap();
+    assert_eq!((format(&ed), ed.undo_depth()), (None, depth + 1));
+    // Re-entering the unit it has is not.
+    ed.set_duration(10, "5d").unwrap();
+    assert_eq!(ed.undo_depth(), depth + 1);
+}
+
+#[test]
+fn only_a_typed_duration_changes_the_unit() {
+    let mut ed = editor();
+    ed.set_duration(10, "2w?").unwrap();
+    let task = ed.project().task(10).unwrap();
+    // The estimate lives on `estimated`; the format is the plain unit.
+    assert_eq!(
+        (task.duration_format, task.estimated),
+        (Some(9), Some(true))
+    );
+    // A duration set without a unit keeps it.
+    ed.set_duration_min(10, 2400, false).unwrap();
+    assert_eq!(ed.project().task(10).unwrap().duration_format, Some(9));
+    // So does moving a manual task's finish, which changes its duration.
+    ed.set_manual(10, true).unwrap();
+    let start = ed.disp_start(10).unwrap();
+    ed.set_finish(10, start.add_days(9)).unwrap();
+    let task = ed.project().task(10).unwrap();
+    assert_ne!(task.manual_duration_min, Some(2400));
+    assert_eq!(task.duration_format, Some(9));
+    // A stored estimated format (41, weeks?) keeps its bit when weeks are
+    // typed again, and loses it for another unit.
+    let mut p = ed.project().clone();
+    p.tasks[0].duration_format = Some(41);
+    p.tasks[0].manual = false;
+    let mut ed = Editor::new(p);
+    ed.set_duration(10, "3w?").unwrap();
+    assert_eq!(ed.project().task(10).unwrap().duration_format, Some(41));
+    ed.set_duration(10, "3d").unwrap();
+    assert_eq!(ed.project().task(10).unwrap().duration_format, None);
+}
+
+#[test]
+fn a_retyped_estimate_keeps_the_estimated_format_only_with_a_question_mark() {
+    let with_format = |format: u8| {
+        let mut ed = editor();
+        let mut p = ed.project().clone();
+        p.tasks[0].duration_format = Some(format);
+        p.tasks[0].estimated = Some(true);
+        ed = Editor::new(p);
+        ed
+    };
+    let format = |ed: &Editor| ed.project().task(10).unwrap().duration_format;
+    for (stored, text, expected) in [
+        (41, "3w?", Some(41)),
+        (41, "3w", Some(9)),
+        (41, "3d?", None),
+        (9, "3w?", Some(9)),
+        (39, "1d?", Some(39)),
+        (39, "1d", None),
+    ] {
+        let mut ed = with_format(stored);
+        ed.set_duration(10, text).unwrap();
+        assert_eq!(format(&ed), expected, "{stored} {text}");
+    }
+    // Ctrl+Delete's reset (a day, estimated as new tasks are) follows it too.
+    let mut ed = with_format(39);
+    ed.set_duration_typed(10, 480, true, LagUnit::Day).unwrap();
+    assert_eq!(format(&ed), Some(39));
+    ed.set_duration_typed(10, 480, false, LagUnit::Day).unwrap();
+    assert_eq!(format(&ed), None);
+}
+
+#[test]
+fn summaries_external_leaves_and_unspellable_formats_keep_their_format() {
+    let mut ed = editor();
+    ed.indent(20, 1).unwrap();
+    ed.set_manual(10, true).unwrap();
+    let mut p = ed.project().clone();
+    p.tasks[0].duration_format = Some(9);
+    p.tasks[2].duration_format = Some(8);
+    let mut ed = Editor::new(p);
+    let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
+    let before = ed.project().clone();
+    // A manual summary's shown span, retyped in days, is no edit.
+    let span = ed.disp_duration_min(10).unwrap();
+    ed.set_duration_typed(10, span, false, LagUnit::Day)
+        .unwrap();
+    // An elapsed-days leaf re-entered as its cell spells it.
+    ed.set_duration_typed(30, 480, false, LagUnit::Day).unwrap();
+    unchanged(&ed, &before, history);
+    // A new duration on it is typed in days, which it now is.
+    ed.set_duration(30, "2d").unwrap();
+    assert_eq!(ed.project().task(30).unwrap().duration_format, None);
+    // A manual summary's new span keeps its format.
+    ed.set_duration(10, "3w").unwrap();
+    assert_eq!(ed.project().task(10).unwrap().duration_format, Some(9));
+    // An external leaf re-entered in another unit is still no edit.
+    let mut p = editor().project().clone();
+    p.tasks[0].external_task = Some(true);
+    p.tasks[0].duration_format = Some(8);
+    let mut ed = Editor::new(p);
+    let before = ed.project().clone();
+    let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
+    ed.set_duration(10, "8h").unwrap();
+    unchanged(&ed, &before, history);
+}
+
+#[test]
+fn an_unspellable_format_is_replaced_when_the_estimate_or_a_reset_changes_it() {
+    let with = |format: u8, estimated: Option<bool>| {
+        let mut p = editor().project().clone();
+        p.tasks[0].duration_format = Some(format);
+        p.tasks[0].estimated = estimated;
+        Editor::new(p)
+    };
+    let task = |ed: &Editor| {
+        let t = ed.project().task(10).unwrap();
+        (t.duration_format, t.estimated)
+    };
+    // Estimated null days (53) retyped without `?`: days, committed.
+    let mut ed = with(53, Some(true));
+    ed.set_duration_typed(10, 480, false, LagUnit::Day).unwrap();
+    assert_eq!(task(&ed), (None, Some(false)));
+    // Elapsed days (8) retyped with `?`: days, estimated.
+    let mut ed = with(8, None);
+    ed.set_duration(10, "1d?").unwrap();
+    assert_eq!(task(&ed), (None, Some(true)));
+    // The same text and estimate keeps it.
+    let mut ed = with(8, None);
+    ed.set_duration(10, "1d").unwrap();
+    assert_eq!((task(&ed), ed.undo_depth()), ((Some(8), None), 0));
+    // A reset to a new task's day replaces it even at the same minutes.
+    let mut ed = with(8, None);
+    ed.reset_duration(10, 480, false).unwrap();
+    assert_eq!(task(&ed), (None, None));
+    assert_eq!(ed.undo_depth(), 1);
+}
+
+#[test]
+fn an_untyped_duration_change_commits_the_format_with_the_estimate() {
+    let with = |format: u8, estimated: Option<bool>, manual: bool| {
+        let mut p = editor().project().clone();
+        p.tasks[0].duration_format = Some(format);
+        p.tasks[0].estimated = estimated;
+        let mut ed = Editor::new(p);
+        if manual {
+            ed.set_manual(10, true).unwrap();
+        }
+        ed
+    };
+    let task = |ed: &Editor| {
+        let t = ed.project().task(10).unwrap();
+        (t.duration_format, t.estimated)
+    };
+    let later = |ed: &mut Editor| {
+        let start = ed.disp_start(10).unwrap();
+        ed.set_finish(10, start.add_days(3)).unwrap();
+        assert_ne!(ed.project().task(10).unwrap().duration_min, 480);
+    };
+    // Estimated weeks (41): a later finish or a milestone toggle commits the
+    // estimate and drops the bit.
+    let mut ed = with(41, Some(true), true);
+    later(&mut ed);
+    assert_eq!(task(&ed), (Some(9), Some(false)));
+    let mut ed = with(41, Some(true), false);
+    ed.toggle_milestone(10).unwrap();
+    assert_eq!(task(&ed), (Some(9), Some(false)));
+    // Elapsed days (8) cannot state the new working minutes: days.
+    let mut ed = with(8, None, true);
+    later(&mut ed);
+    assert_eq!(task(&ed), (None, None));
+    // Estimated null (53): days, committed.
+    let mut ed = with(53, Some(true), false);
+    ed.toggle_milestone(10).unwrap();
+    assert_eq!(task(&ed), (None, Some(false)));
+    // A working format without the bit is kept.
+    let mut ed = with(9, None, true);
+    later(&mut ed);
+    assert_eq!(task(&ed), (Some(9), None));
+}
+
+#[test]
+fn exact_duration_text_prefers_the_task_s_unit() {
+    let p = untitled_project();
+    for (min, unit, expected) in [
+        (240, Some(LagUnit::Day), "0.5d"),
+        (480, Some(LagUnit::Day), "1d"),
+        (480, Some(LagUnit::Hour), "8h"),
+        (2400, Some(LagUnit::Week), "1w"),
+        (3600, Some(LagUnit::Week), "1.5w"),
+        (1200, Some(LagUnit::Week), "0.5w"),
+        (90, Some(LagUnit::Minute), "90m"),
+        (4800, Some(LagUnit::Month), "0.5mo"),
+        (-1200, Some(LagUnit::Week), "-0.5w"),
+        // The fewest decimals that read back exactly.
+        (2401, Some(LagUnit::Week), "1.0004w"),
+        (800, Some(LagUnit::Week), "0.3333w"),
+        (2880, Some(LagUnit::Week), "1.2w"),
+        (60, Some(LagUnit::Week), "0.025w"),
+        (100, Some(LagUnit::Day), "0.208d"),
+        (1, Some(LagUnit::Month), "0.0001mo"),
+        // No unit: the old choice.
+        (240, None, "4h"),
+        (2400, None, "5d"),
+    ] {
+        assert_eq!(
+            format_duration_exact(min, &p, unit),
+            expected,
+            "{min} {unit:?}"
+        );
+        assert_eq!(parse_duration(expected, &p), Some(min), "{expected}");
+    }
+}
+
+#[test]
 fn exact_duration_format_preserves_minutes_beyond_float_integer_precision() {
     let p = untitled_project();
+    let units = [
+        None,
+        Some(LagUnit::Minute),
+        Some(LagUnit::Hour),
+        Some(LagUnit::Day),
+        Some(LagUnit::Week),
+        Some(LagUnit::Month),
+    ];
     for min in [0, 1, -1, 9_007_199_254_740_993, i64::MAX, i64::MIN] {
-        assert_eq!(
-            parse_duration(&format_duration_exact(min, &p), &p),
-            Some(min)
-        );
+        for unit in units {
+            assert_eq!(
+                parse_duration(&format_duration_exact(min, &p, unit), &p),
+                Some(min),
+                "{min} in {unit:?}"
+            );
+        }
     }
 }
 

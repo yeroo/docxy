@@ -1,8 +1,9 @@
 //! Entry-table edit state and transitions, shared by keyboard, mouse and host actions.
 use super::*;
+use projcore::LagUnit;
 use projcore::editor::{
-    DURATION_HINT, duration_suffix, format_duration_exact, parse_cell_date, parse_task_duration,
-    parse_task_predecessors,
+    DURATION_HINT, duration_suffix, format_duration_exact, parse_cell_date,
+    parse_task_duration_unit, parse_task_predecessors,
 };
 
 pub(crate) const COL_ID: usize = 0;
@@ -167,8 +168,9 @@ impl ProjectView {
 }
 
 /// The text a cell edit opens with, which [`apply_cell`] reads back as the
-/// same value: a duration exactly (`2d`, not the rounded `2 days`). Copy
-/// writes it too, so a copied cell pastes as it was.
+/// same value: a duration exactly (`2d`, not the rounded `2 days`), in the
+/// task's own unit where that is exact (`1.5w`, `0.5d`) so re-entering it
+/// keeps the unit. Copy writes it too, so a copied cell pastes as it was.
 pub(crate) fn cell_edit_text(ed: &ProjectEditor, task: &Task, col: usize) -> String {
     if col != COL_DURATION {
         return project_row(ed, task)[col].clone();
@@ -179,14 +181,17 @@ pub(crate) fn cell_edit_text(ed: &ProjectEditor, task: &Task, col: usize) -> Str
     } else {
         task.duration_min
     };
-    if min == 0 {
+    // A zero in days reads as a bare `0`; in another unit it keeps it (`0w`).
+    if min == 0 && (task.summary || task.duration_unit().is_none_or(|u| u == LagUnit::Day)) {
         "0".into()
     } else if task.summary {
-        // A summary's `?` is its subtasks'; it takes no estimate.
-        format_duration_exact(min, ed.project())
+        // A summary's `?` is its subtasks'; it takes no estimate. Its
+        // duration shows in days, whatever its format.
+        format_duration_exact(min, ed.project(), None)
     } else {
         // An estimated duration reopens as it shows, `1d?`.
-        format_duration_exact(min, ed.project()) + duration_suffix(ed.project(), task.uid)
+        format_duration_exact(min, ed.project(), task.duration_unit())
+            + duration_suffix(ed.project(), task.uid)
     }
 }
 
@@ -228,9 +233,9 @@ pub(crate) fn apply_cell(
         COL_MODE => ed.set_manual(uid, parse_task_mode(buf)?)?,
         COL_NAME => ed.rename(uid, buf)?,
         COL_DURATION => {
-            let (min, estimated) = parse_task_duration(buf, ed.project())
+            let (min, estimated, unit) = parse_task_duration_unit(buf, ed.project())
                 .ok_or_else(|| format!("Invalid duration ({DURATION_HINT})"))?;
-            ed.set_duration_min(uid, min, estimated)?;
+            ed.set_duration_typed(uid, min, estimated, unit)?;
         }
         COL_START | COL_FINISH => {
             let day = parse_cell_date(buf)?;
@@ -293,7 +298,8 @@ pub(crate) fn reset_cell(
             }
             let proj = ed.project();
             let (min, estimated) = (proj.days_to_minutes(1.0), proj.new_tasks_estimated());
-            ed.set_duration_min(uid, min, estimated)?;
+            // A new task's duration, in days.
+            ed.reset_duration(uid, min, estimated)?;
             Ok(None)
         }
         COL_MODE => {

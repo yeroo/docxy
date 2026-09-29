@@ -120,6 +120,50 @@ fn all_columns_commit_as_one_step_and_undo_restores_schedule() {
 }
 
 #[test]
+fn a_duration_shows_reopens_and_commits_in_its_own_unit() {
+    let mut t = tab();
+    let format = |t: &DocTab| v(t).ed.project().task(10).unwrap().duration_format;
+    let shown = |t: &DocTab| {
+        let ed = &v(t).ed;
+        let task = ed.project().task(10).unwrap();
+        (
+            project_row(ed, task)[COL_DURATION].clone(),
+            cell_edit_text(ed, task, COL_DURATION),
+        )
+    };
+    vm(&mut t).ed.select(0);
+    edit(&mut t, COL_DURATION, "1.5w");
+    key(&mut t, "enter");
+    assert_eq!(format(&t), Some(9));
+    assert_eq!(shown(&t), ("1.5w".into(), "1.5w".into()));
+    // Reopening and committing keeps the unit, and is no edit.
+    let depth = v(&t).ed.undo_depth();
+    for (duration, format_before, row) in [
+        ("1.5w", Some(9), "1.5w"),
+        ("4h", Some(5), "4h"),
+        ("0.5d", None, "0.5d"),
+        ("1w?", Some(9), "1w?"),
+    ] {
+        vm(&mut t).ed.select(0);
+        edit(&mut t, COL_DURATION, duration);
+        key(&mut t, "enter");
+        assert_eq!((format(&t), shown(&t).0.as_str()), (format_before, row));
+        let depth = v(&t).ed.undo_depth();
+        vm(&mut t).ed.select(0);
+        vm(&mut t).col = COL_DURATION;
+        key(&mut t, "f2");
+        key(&mut t, "enter");
+        assert_eq!(format(&t), format_before, "{duration}");
+        assert_eq!(v(&t).ed.undo_depth(), depth, "{duration}");
+    }
+    assert!(v(&t).ed.undo_depth() > depth);
+    // Ctrl+Delete gives a new task's day, in days.
+    reset_cell(&mut vm(&mut t).ed, 10, COL_DURATION).unwrap();
+    assert_eq!(format(&t), None);
+    assert_eq!(shown(&t), ("1d?".into(), "1d?".into()));
+}
+
+#[test]
 fn no_op_date_duration_and_milestone_keep_history_and_redo() {
     let mut t = tab();
     vm(&mut t).ed.set_constraint(10, "MSO 2026-01-08").unwrap();
@@ -138,7 +182,8 @@ fn no_op_date_duration_and_milestone_keep_history_and_redo() {
         assert!(!t.dirty);
     }
     vm(&mut t).ed.select(0);
-    edit(&mut t, COL_DURATION, "8h");
+    // The same duration in the same unit; `8h` would switch it to hours.
+    edit(&mut t, COL_DURATION, "1d");
     key(&mut t, "enter");
     assert_eq!(v(&t).ed.undo_depth(), 1);
     vm(&mut t).ed.select(0);
@@ -423,7 +468,7 @@ fn a_manual_summary_s_dates_and_duration_are_editable() {
     vm(&mut t).open_cell(None).unwrap();
     assert_eq!(
         v(&t).cell.as_ref().unwrap().initial,
-        format_duration_exact(960, v(&t).ed.project())
+        format_duration_exact(960, v(&t).ed.project(), None)
     );
     vm(&mut t).cell = None;
     edit(&mut t, COL_DURATION, "3d");

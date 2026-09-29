@@ -11,7 +11,10 @@
 //! The accompanying table includes bold summary rows with rolled-up dates (a
 //! manually scheduled summary's own dates) and working durations, each task's
 //! Deadline (marked `⚠` when the row's Finish is after it), signed total slack,
-//! and the scheduler's free slack.
+//! and the scheduler's free slack. A task's Duration and slack show in the
+//! unit its `DurationFormat` names (`1w`, `0.50w`, days by default); summaries
+//! and elapsed or other non-working formats show whole days, hours or
+//! minutes, slack in days.
 //!
 //! [Mermaid `gantt`]: https://mermaid.js.org/syntax/gantt.html
 
@@ -118,9 +121,17 @@ pub fn to_markdown(proj: &Project, sched: &Schedule) -> String {
         };
         let duration_min =
             crate::schedule::summary_or_leaf_min(proj, task, r.early_start, r.early_finish);
-        let dur = duration_str(proj, duration_min);
-        let slack = fmt_days(proj.minutes_to_days(r.total_slack_min));
-        let free_slack = fmt_days(proj.minutes_to_days(r.free_slack_min));
+        // A leaf shows its Duration and slack in the unit it was entered in
+        // (a zero Duration stays `0d`); a summary keeps the default.
+        let unit = task.duration_unit().filter(|_| !task.summary);
+        let in_unit = |min| unit.and_then(|unit| proj.format_in_unit(min, unit, 2));
+        let dur = in_unit(duration_min)
+            .filter(|_| duration_min > 0)
+            .unwrap_or_else(|| duration_str(proj, duration_min));
+        let slack = in_unit(r.total_slack_min)
+            .unwrap_or_else(|| fmt_days(proj.minutes_to_days(r.total_slack_min)));
+        let free_slack = in_unit(r.free_slack_min)
+            .unwrap_or_else(|| fmt_days(proj.minutes_to_days(r.free_slack_min)));
         // Judged on this row's own (CPM) Finish cell; yppxy's grid judges
         // its displayed, possibly leveled, finish instead.
         let deadline = task.deadline.map_or_else(String::new, |deadline| {
@@ -510,6 +521,90 @@ mod tests {
                 ],
             ]
         );
+    }
+
+    #[test]
+    fn markdown_shows_duration_and_slack_in_each_task_s_unit() {
+        let proj = crate::mspdi::read_mspdi(crate::mspdi::DURATION_FORMATS_PLAN).unwrap();
+        let sched = schedule(&proj);
+        assert_eq!(sched.get(5).unwrap().total_slack_min, 1200);
+        let md = to_markdown(&proj, &sched);
+        let row = |name: &str| {
+            table_rows(&md)
+                .into_iter()
+                .find(|row| row[0] == name)
+                .unwrap()
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        for (name, start, finish, cells) in [
+            (
+                "S",
+                "2026-03-02 08:00:00",
+                "2026-03-02 17:00:00",
+                ["1d", "0d", "0d", "✓"],
+            ),
+            (
+                "Half",
+                "2026-03-03 08:00:00",
+                "2026-03-03 12:00:00",
+                ["4h", "4h", "4h", ""],
+            ),
+            (
+                "WkShort",
+                "2026-03-05 08:00:00",
+                "2026-03-11 17:00:00",
+                ["1w", "0.50w", "0.50w", ""],
+            ),
+            (
+                "WkLong",
+                "2026-03-05 08:00:00",
+                "2026-03-16 12:00:00",
+                ["1.50w", "0w", "0w", "✓"],
+            ),
+        ] {
+            let mut expected = vec![name, start, finish, ""];
+            expected.extend(cells);
+            assert_eq!(row(name), expected, "{name}");
+        }
+        // The Mermaid bars keep their day/hour tokens.
+        assert!(md.contains("WkLong :crit, 2026-03-05, 60h\n"), "{md}");
+    }
+
+    #[test]
+    fn markdown_keeps_summaries_and_zero_durations_out_of_the_unit() {
+        let mut parent = task(1, "P", 1);
+        parent.summary = true;
+        parent.duration_format = Some(9);
+        let mut a = task(2, "A", 240);
+        a.outline_level = 2;
+        a.duration_format = Some(9);
+        let mut m = task(3, "M", 0);
+        m.duration_format = Some(9);
+        m.deadline = Some(DateTime::from_ymd_hm(2026, 3, 2, 12, 0));
+        // Estimated weeks: the estimated bit does not change the unit.
+        let mut late = task(4, "Late", 2400);
+        late.duration_format = Some(41);
+        late.deadline = Some(DateTime::from_ymd_hm(2026, 3, 4, 12, 0));
+        // An elapsed format keeps the default display.
+        let mut elapsed = task(5, "Elapsed", 240);
+        elapsed.duration_format = Some(8);
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![parent, a, m, late, elapsed],
+            ..Project::default()
+        };
+        let sched = schedule(&proj);
+        assert_eq!(sched.get(4).unwrap().total_slack_min, -1200);
+        let md = to_markdown(&proj, &sched);
+        let cells = |row: &Vec<&str>| row[4..7].join(" | ");
+        let rows = table_rows(&md);
+        assert_eq!(cells(&rows[1]), "4h | 4.50d | 4.50d", "summary");
+        assert_eq!(cells(&rows[2]), "0.10w | 0.90w | 0.90w", "leaf");
+        assert_eq!(cells(&rows[3]), "0d | 0.10w | 0.10w", "milestone");
+        assert_eq!(cells(&rows[4]), "1w | -0.50w | 0w", "negative");
+        assert_eq!(cells(&rows[5]), "4h | 4.50d | 4.50d", "elapsed");
     }
 
     #[test]

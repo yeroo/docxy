@@ -201,6 +201,21 @@ fn check_task_fields(
     exclude_guid: bool,
     exclude_ignore_resource_calendar: bool,
 ) {
+    // A decoded working DurationFormat reaches the model as the MSPDI reader
+    // keeps it; any other reads as days.
+    if let Some(format) = a.duration_format {
+        let expected = if mppread::mpp::working_duration_format(format) {
+            e.duration_format
+        } else {
+            None
+        };
+        assert_eq!(
+            imported.duration_format,
+            expected,
+            "{}",
+            at("duration format")
+        );
+    }
     let Some(f) = &a.fields else {
         assert!(!require_fields, "{}", at("fields"));
         return;
