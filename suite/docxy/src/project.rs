@@ -19,6 +19,8 @@ mod clip;
 pub(super) use clip::*;
 mod timeline;
 pub(super) use timeline::*;
+mod rows;
+pub(super) use rows::*;
 
 pub(super) struct ProjectView {
     pub ed: ProjectEditor,
@@ -457,11 +459,10 @@ fn project_region(
             if r0 != r1 || c0 != c1 || c0 as usize >= COLUMN_COUNT {
                 return Err("Project regions address one entry-table cell".into());
             }
-            let tasks = &v.ed.project().tasks;
-            // The entry row sits just below the last task.
-            let row = match tasks.get(r0 as usize) {
-                Some(task) => task.id.to_string(),
-                None if r0 as usize == tasks.len() => "entry".into(),
+            // Rows are drawn rows; the entry row sits just below the last one.
+            let row = match shown_task(&v.ed, r0 as usize) {
+                Some(ShownRow::Task(i)) => v.ed.project().tasks[i].id.to_string(),
+                Some(ShownRow::Entry) => "entry".into(),
                 None => return Err("No task at this row".into()),
             };
             let cell = probes
@@ -511,6 +512,10 @@ pub(super) fn project_state(
     let scroll_y = -f32::from(v.scroll.0.borrow().base_handle.offset().y);
     let mut entries = vec![
         ("selected_task".into(), Json::Num(v.cursor_row() as f64)),
+        (
+            "selected_row".into(),
+            Json::Num((v.display_row() + 1) as f64),
+        ),
         ("tasks".into(), Json::Num(count as f64)),
         (
             "filler_rows".into(),

@@ -262,6 +262,7 @@ State keys, as the app reports them after every driving verb:
 | `filling`, `fill_preview`, `dragging` | the auto-fill and the sweep |
 | `picking`, `range_preview`, `sel_hidden` | point mode |
 | `selected_task`, `tasks`, `bar_<id>`, `baseline_<id>` | Project: cell cursor's row (zero-based; equals `tasks` on the entry row below the last task), task count, and each task's drawn bar and baseline bar by displayed ID |
+| `selected_row` | Project: the cell cursor's drawn row, **one-based** like `rows[].row` (a collapsed summary's hidden subtasks are not counted); the `rows` reply's `count + 1` on the entry row |
 | `prompt`, `selected_name`, `exported` | Project: `none` or `<kind>:<buffer>` for the open prompt, selected task name (empty on the entry row), and `none` or the filename of the last successful Gantt export |
 | `cell`, `cell_row`, `cell_edit` | Project: active column name, zero-based row index, and open cell editor buffer (`null` when closed) |
 | `undo_depth`, `redo_depth` | Project: number of available undo and redo steps |
@@ -373,7 +374,7 @@ Home/End (or Ctrl+Left/Right) go to the row's first and last column. Up/Down
 move between rows; Ctrl+Up/Down go to the first and last task, and
 Ctrl+Home/End to the first task's first column and the last task's last column.
 Down from the last task, or a click below it, goes to the entry row, where
-typing appends a task (`click C<tasks+1>` addresses it). Tab/Shift+Tab move
+typing appends a task (`click C<n>` addresses it, where `n` is one past the last drawn row). Tab/Shift+Tab move
 between columns.
 Insert inserts a blank row above the current row (above the entry row when the
 cursor is on it) and keeps the column. Delete clears the active Name,
@@ -427,9 +428,33 @@ cancels the prompt. The `project-cells`, `project-invalid`, `project-ribbon`, an
 
 `assert cell is Duration` checks the Project column state, while
 `assert cell D2 is 3d` reads the value displayed at that entry-table cell.
-Project A1 references use row positions and columns A through H (ID, Task
-Mode, Name, Duration, Start, Finish, Predecessors, Resource Names), rather than
-task IDs.
+Project A1 references use **drawn** row positions and columns A through H (ID,
+Task Mode, Name, Duration, Start, Finish, Predecessors, Resource Names), rather
+than task IDs. A collapsed summary's subtasks are not drawn, so they take no row:
+`C5` is the fifth row on screen, the row just below the last drawn task is the
+entry row, and anything past that is refused. `cell`, `click` and `rect cell:…`
+agree on this. With nothing collapsed a drawn row is a task's position in the plan.
+
+`call cell` and `call click-cell` also take `{"uid":3,"column":"Name"}` in place
+of `cell`: a task by UID, and a column by zero-based index or header name (any
+case). `cell` reads a task a collapsed summary hides (its reply's `cell` and
+`row` are then `null`); `click-cell` refuses one, since nothing is drawn to
+click. Giving both `cell` and `uid` is an error. The Project `cell` reply adds
+the task's `id` and `uid`, and `entry: true` on the entry row, which reads empty.
+
+`call rows {}` lists the rows the entry table draws, top to bottom, without the
+entry row; an optional `tab` picks a Project tab as the control verbs do, without
+switching to it. The reply is `{view, table, filter, group, sort, count, total,
+rows}`: `view`, `table`, `filter`, `group` and `sort` name what is applied
+(`Gantt Chart`, `Entry`, `All Tasks`, `No Group`, `ID`; the tab has no others
+yet), `count` is the rows listed and `total` every task, blank rows included, so
+`count < total` means a collapse hides some. Each row is `{row, kind, id, uid,
+name, level, summary, collapsed, blank, cells}`: `row` is one-based; `kind` is
+`blank`, `external` (an external task), `summary` or `task`, first match wins;
+`id` and `uid` are the task's own, never renumbered by a collapse; a blank row
+has an empty `name` and a `null` `level`; `collapsed` is true for a summary whose
+subtasks are hidden; and `cells` are the Entry table's texts, column A first.
+The `project-rows` case collapses with Alt+Shift+- and expands with Alt+Shift+=.
 
 `nothing` is how a script writes "this key is null" (`assert chart_sel is
 nothing`); `null` and `none` read the same, and `empty` matches an empty string.

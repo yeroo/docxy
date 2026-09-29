@@ -1,0 +1,65 @@
+test project rows list what the entry table draws after a collapse
+  open ../fixtures/project-rows.xml
+  call rows {}
+  assert reply.view is Gantt Chart
+  assert reply.table is Entry
+  assert reply.filter is All Tasks
+  assert reply.count is 6
+  assert reply.total is 6
+  assert reply.rows.0.kind is summary
+  assert reply.rows.2.level is 3
+  assert reply.rows.4.kind is blank
+  assert reply.rows.4.level is nothing
+  assert reply.rows.5.cells.2 is After
+  # The inner summary alone hides only its subtask.
+  click A2
+  key alt+shift+-
+  call rows {}
+  assert reply.count is 5
+  assert reply.total is 6
+  assert reply.rows.1.id is 2
+  assert reply.rows.1.collapsed is true
+  assert reply.rows.2.id is 4
+  assert reply.rows.2.row is 3
+  assert cell C3 is Sibling
+  # The outer one hides the collapsed inner one; the blank after it stays,
+  # and IDs keep their numbers.
+  click A1
+  key alt+shift+-
+  call rows {}
+  assert reply.count is 3
+  assert reply.rows.0.collapsed is true
+  assert reply.rows.1.id is 5
+  assert reply.rows.1.kind is blank
+  assert reply.rows.2.id is 6
+  assert cell C3 is After
+  call cell {"cell":"C3"}
+  assert reply.uid is 6
+  assert reply.row is 2
+  call cell {"cell":"C4"}
+  assert reply.entry is true
+  assert reply.empty is true
+  call-error cell {"cell":"C5"} => No task at this row
+  # A hidden task is readable by UID, but there is no row to click.
+  call cell {"uid":3,"column":"Name"}
+  assert reply.text is Deep
+  assert reply.row is nothing
+  call-error click-cell {"uid":3,"column":"Name"} => hidden under a collapsed summary
+  click C3
+  assert selected_task is 5
+  assert selected_row is 3
+  assert selected_name is After
+  shot cell:C3
+  # Expanding the outer summary keeps the inner one collapsed.
+  click A1
+  key alt+shift+=
+  call rows {}
+  assert reply.count is 5
+  assert reply.rows.2.id is 4
+  click A2
+  key alt+shift+=
+  call rows {}
+  assert reply.count is 6
+  assert reply.rows.2.id is 3
+  assert reply.rows.3.id is 4
+  assert cell C3 is Deep
