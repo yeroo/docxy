@@ -7,7 +7,7 @@ test pathless document Ctrl+S and close Save refuse and Backstage Close uses the
   key ctrl+s
   assert tabs is 1
   assert dirty is true
-  assert status is this document has never been saved, and a harness instance cannot open the Save As dialog
+  assert status is this document has never been saved, and a harness instance cannot open the Save As dialog; use the harness save-as verb
   call backstage-close {}
   assert tabs is 1
   assert dirty is true
@@ -15,7 +15,7 @@ test pathless document Ctrl+S and close Save refuse and Backstage Close uses the
   call close-tab {"answer":"save"}
   assert tabs is 1
   assert dirty is true
-  assert status is this document has never been saved, and a harness instance cannot open the Save As dialog
+  assert status is this document has never been saved, and a harness instance cannot open the Save As dialog; use the harness save-as verb
   call close-tab {"answer":"discard"}
   assert tabs is 0
 

@@ -1,0 +1,57 @@
+# The harness's private clipboard and the `clipboard` verb (#699).
+
+# Keep this case first: it is the instance's clipboard before anything is
+# copied. It only tells a private clipboard from the OS one when the real
+# clipboard holds text, which it usually does on a desktop.
+test a harness instance starts with an empty private clipboard
+  open ../fixtures/basic.xlsx
+  call clipboard {"action":"read"}
+  assert reply.text is nothing
+  assert reply.app.kind is none
+
+test a sheet copy puts its cells on the clipboard for the next paste
+  open ../fixtures/basic.xlsx
+  click A1
+  click B2 shift
+  key ctrl+c
+  call clipboard {"action":"read"}
+  assert reply.app.kind is grid
+  assert reply.app.rows is 2
+  assert reply.app.cols is 2
+  click D2
+  key ctrl+v
+  assert cell D2 is Region
+  assert cell E3 is 10
+
+test text another app copied wins over the older grid clip
+  open ../fixtures/basic.xlsx
+  click A1
+  key ctrl+c
+  call clipboard {"action":"write","text":"7\t8\n9\t10\n"}
+  assert reply.app.kind is none
+  click D8
+  key ctrl+v
+  assert cell D8 is 7
+  assert cell E8 is 8
+  assert cell D9 is 9
+  assert cell E9 is 10
+
+test a copy with no text in it is newer than the grid clip
+  # An empty write reads as an image or empty copy does: an item, no text.
+  open ../fixtures/basic.xlsx
+  click A1
+  key ctrl+c
+  call clipboard {"action":"write","text":""}
+  assert reply.text is nothing
+  assert reply.app.kind is none
+  click D8
+  key ctrl+v
+  assert cell D8 is nothing
+  assert dirty is false
+
+test the clipboard verb refuses what it does not do
+  open ../fixtures/basic.xlsx
+  call-error clipboard {"action":"paste-special"} => paste special is not implemented in this app
+  call-error clipboard {"action":"copy"} => press the app's own key
+  call-error clipboard {"action":"write"} => text
+  call-error clipboard {"action":"shuffle"} => unknown clipboard action

@@ -1478,19 +1478,18 @@ impl Docxy {
     }
     /// Copy/Cut write the cursor cell to the system clipboard; Paste reads it.
     fn project_clipboard(&mut self, act: ProjectAct, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get_mut(self.active) else {
-            return;
-        };
         if act == ProjectAct::Paste {
-            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                paste_project_text(tab, &text);
+            let now = self.clipboard_read(cx);
+            if let (Some(tab), Some(text)) = (self.tabs.get_mut(self.active), now.text()) {
+                paste_project_text(tab, text);
             }
             return;
         }
-        let Surface::Project(v) = &tab.surface else {
+        let Some(Surface::Project(v)) = self.tabs.get(self.active).map(|t| &t.surface) else {
             return;
         };
-        cx.write_to_clipboard(ClipboardItem::new_string(project_copy_text(v)));
+        let text = project_copy_text(v);
+        self.clipboard_write(text, cx);
         // A sheet pastes its own clipboard first; this copy is newer.
         self.grid_clip = None;
         if act == ProjectAct::Cut {
