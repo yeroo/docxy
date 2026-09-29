@@ -10,7 +10,7 @@
 
 use ctlcore::client::{self, Source};
 use ctlcore::json::Json;
-use ctlcore::mcp::{McpServer, prop, tool};
+use ctlcore::mcp::{McpServer, item_ty, prop, prop_array, tool};
 use std::path::PathBuf;
 
 /// Serve MCP over stdio until stdin closes.
@@ -50,19 +50,7 @@ fn do_tool_in(sources: &[Source<'_>], name: &str, args: &Json) -> Result<String,
     if name == "yppxy_list" {
         return Ok(client::list_running_in(sources).to_string());
     }
-    let verb = match name {
-        "yppxy_status" => "proj.path",
-        "yppxy_tasks" => "task.list",
-        "yppxy_get" => "task.get",
-        "yppxy_set" => "task.set",
-        "yppxy_add" => "task.add",
-        "yppxy_del" => "task.del",
-        "yppxy_link" => "link.add",
-        "yppxy_unlink" => "link.del",
-        "yppxy_find" => "find",
-        "yppxy_save" => "proj.save",
-        other => return Err(format!("unknown tool: {other}")),
-    };
+    let verb = tool_verb(name).ok_or_else(|| format!("unknown tool: {name}"))?;
     let (client, app) = client::resolve_target_in(sources, args.get_str("target"))?;
     if app == "yppxy" && args.get("tab").is_some() {
         return Err("'tab' is only supported by suite instances; yppxy has one project".into());
@@ -70,6 +58,26 @@ fn do_tool_in(sources: &[Source<'_>], name: &str, args: &Json) -> Result<String,
     let result = client.call(verb, args.clone())?;
     Ok(result.to_string())
 }
+
+/// The control verb a tool forwards to.
+fn tool_verb(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "yppxy_status" => "proj.path",
+        "yppxy_tasks" => "task.list",
+        "yppxy_get" => "task.get",
+        "yppxy_fields" => "task.fields",
+        "yppxy_set" => "task.set",
+        "yppxy_add" => "task.add",
+        "yppxy_del" => "task.del",
+        "yppxy_link" => "link.add",
+        "yppxy_unlink" => "link.del",
+        "yppxy_find" => "find",
+        "yppxy_save" => "proj.save",
+        _ => return None,
+    })
+}
+
+const FIELDS_DESC: &str = "Optional: Project field names to read for each task returned, e.g. [\"% Complete\", \"Actual Start\", \"Baseline Finish\", \"Total Slack\"] (yppxy_fields lists them). Each comes back under `fields` as {text: as the sheet shows it, value: dates \"YYYY-MM-DD HH:MM\", durations, work and slack in minutes, money a number, null when unset}. An unknown name fails the call before any edit.";
 
 const TARGET_DESC: &str = "Optional: which yppxy or suite instance to act on (a substring of its instance/pane id) when several are open.";
 
@@ -92,6 +100,7 @@ fn tool_defs() -> Json {
         )
     };
     let uid = || ("uid", prop("integer", "The task's UID (from yppxy_tasks)."));
+    let fields = || ("fields", prop_array(item_ty("string"), FIELDS_DESC));
     Json::Arr(vec![
         tool(
             "yppxy_list",
@@ -112,15 +121,24 @@ fn tool_defs() -> Json {
              flag, slack, and predecessors. Summaries add rollup_start/rollup_finish, the span of \
              their subtasks; a manually scheduled summary keeps its own start/finish and adds \
              warning (true when its subtasks finish after it, or it finishes after its parent \
-             manual summary).",
-            vec![target(), tab()],
+             manual summary). Each task also has its row id and outline_number; pass `fields` \
+             to read more.",
+            vec![fields(), target(), tab()],
             &[],
         ),
         tool(
             "yppxy_get",
-            "Read one task by UID.",
-            vec![uid(), target(), tab()],
+            "Read one task by UID; pass `fields` to read any Project field (progress, actuals, \
+             work, cost, baselines, variances, slack, constraints, ...) as shown and as a value.",
+            vec![uid(), fields(), target(), tab()],
             &["uid"],
+        ),
+        tool(
+            "yppxy_fields",
+            "List the Project field names `fields` can read, so a missing one is known to be \
+             unsupported rather than empty.",
+            vec![target(), tab()],
+            &[],
         ),
         tool(
             "yppxy_set",
@@ -140,6 +158,7 @@ fn tool_defs() -> Json {
                         "true = Manually Scheduled (pinned at its current dates), false = Auto Scheduled.",
                     ),
                 ),
+                fields(),
                 target(),
                 tab(),
             ],
@@ -168,6 +187,7 @@ fn tool_defs() -> Json {
                          NewTasksEstimated is off).",
                     ),
                 ),
+                fields(),
                 target(),
                 tab(),
             ],
@@ -195,6 +215,7 @@ fn tool_defs() -> Json {
                     "lag",
                     prop("string", "Lag duration, e.g. \"1d\" (default none)."),
                 ),
+                fields(),
                 target(),
                 tab(),
             ],
@@ -206,6 +227,7 @@ fn tool_defs() -> Json {
             vec![
                 uid(),
                 ("pred", prop("integer", "UID of the predecessor to unlink.")),
+                fields(),
                 target(),
                 tab(),
             ],
@@ -216,6 +238,7 @@ fn tool_defs() -> Json {
             "Find tasks whose name contains the query (case-insensitive).",
             vec![
                 ("query", prop("string", "Text to search for.")),
+                fields(),
                 target(),
                 tab(),
             ],
@@ -376,6 +399,40 @@ mod tests {
                 t.get("inputSchema").unwrap().get_str("type"),
                 Some("object")
             );
+        }
+    }
+
+    #[test]
+    fn task_tools_take_fields_and_yppxy_fields_lists_them() {
+        assert_eq!(tool_verb("yppxy_fields"), Some("task.fields"));
+        assert_eq!(tool_verb("yppxy_nope"), None);
+        let defs = tool_defs();
+        for tool in defs.as_array().unwrap() {
+            let name = tool.get_str("name").unwrap();
+            if name != "yppxy_list" {
+                assert!(tool_verb(name).is_some(), "{name} forwards nowhere");
+            }
+            let props = tool.get("inputSchema").unwrap().get("properties").unwrap();
+            let takes = matches!(
+                tool_verb(name),
+                Some(
+                    "task.list"
+                        | "task.get"
+                        | "task.set"
+                        | "task.add"
+                        | "link.add"
+                        | "link.del"
+                        | "find"
+                )
+            );
+            match props.get("fields") {
+                Some(f) if takes => {
+                    assert_eq!(f.get_str("type"), Some("array"), "{name}");
+                    assert_eq!(f.get("items").unwrap().get_str("type"), Some("string"));
+                }
+                None if !takes => {}
+                other => panic!("{name}: fields {other:?}"),
+            }
         }
     }
 

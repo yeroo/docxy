@@ -670,3 +670,84 @@ fn reloading_an_empty_plan_that_gained_tasks_keeps_the_entry_row() {
     assert_eq!(view(&tabs[0]).ed.project().tasks.len(), 3);
     assert_eq!(view(&tabs[0]).ed.project().tasks[0].name, "Task 1");
 }
+
+#[test]
+fn entry_cells_and_task_get_fields_never_disagree() {
+    assert_eq!(
+        projcore::editor::ENTRY_FIELDS.map(projcore::editor::Field::name),
+        COLUMNS.map(String::from)
+    );
+    let names = Json::Arr(COLUMNS.iter().map(|c| Json::Str(c.to_string())).collect());
+    for file in [
+        "06-lag.xml",
+        "08-milestone.xml",
+        "10-summary.xml",
+        "11-resource-assignment.xml",
+        "19-manual-tasks.xml",
+        "22-progress.xml",
+        "27-manual-summary.xml",
+    ] {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../corpus/mspdi")
+            .join(file);
+        let mut tabs = vec![project_tab_from_path(&path)];
+        let tasks = view(&tabs[0]).ed.project().tasks.clone();
+        for task in &tasks {
+            // The harness `cell` verb shows `project_row`'s text.
+            let row = project_row(&view(&tabs[0]).ed, task);
+            let get = Json::obj(vec![
+                ("uid", Json::Num(task.uid as f64)),
+                ("fields", names.clone()),
+            ]);
+            let (r, _) = call(&mut tabs, 0, "task.get", get).unwrap();
+            for (col, name) in COLUMNS.iter().enumerate() {
+                let text = r.get("fields").unwrap().get(name).unwrap().get_str("text");
+                assert_eq!(
+                    text,
+                    Some(row[col].as_str()),
+                    "{file} uid {} {name}",
+                    task.uid
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn set_baseline_then_a_duration_edit_shows_in_finish_variance() {
+    let mut tabs = vec![tab()];
+    call(&mut tabs, 0, "link.add", args(r#"{"uid":2,"pred":1}"#)).unwrap();
+    apply_project_act(&mut tabs[0], ProjectAct::Baseline);
+    let read = |tabs: &mut Vec<DocTab>| {
+        let (r, _) = call(
+            tabs,
+            0,
+            "task.get",
+            args(r#"{"uid":2,"fields":["Baseline Finish","Finish Variance"]}"#),
+        )
+        .unwrap();
+        let f = r.get("fields").unwrap().clone();
+        let pick = |name: &str| {
+            let v = f.get(name).unwrap();
+            (
+                v.get_str("text").unwrap().to_string(),
+                v.get("value").unwrap().clone(),
+            )
+        };
+        (pick("Baseline Finish"), pick("Finish Variance"))
+    };
+    let (baseline, variance) = read(&mut tabs);
+    assert_eq!(variance, ("0 days".to_string(), Json::Num(0.0)));
+    call(
+        &mut tabs,
+        0,
+        "task.set",
+        args(r#"{"uid":1,"duration":"3d"}"#),
+    )
+    .unwrap();
+    let (after, variance) = read(&mut tabs);
+    assert_eq!(after, baseline);
+    assert_eq!(variance, ("2 days".to_string(), Json::Num(960.0)));
+    let (fields, _) = call(&mut tabs, 0, "task.fields", Json::Null).unwrap();
+    assert!(fields.get("count").and_then(Json::as_usize).unwrap() > 100);
+}

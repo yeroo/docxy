@@ -15,14 +15,28 @@
 //! | Verb | Args | Result |
 //! |---|---|---|
 //! | `proj.path` | — | `{path, modified, name, tasks, start, finish}` |
-//! | `task.list` | — | `{count, tasks:[{uid, name, level, manual, duration, start, finish, critical, …}]}` |
-//! | `task.get` | `{uid}` | one task |
+//! | `task.list` | `{fields?}` | `{count, tasks:[{uid, id, outline_number, name, level, manual, duration, start, finish, critical, …}]}` |
+//! | `task.get` | `{uid, fields?}` | one task |
+//! | `task.fields` | — | `{count, fields:[name…]}`: the field names `fields` can read |
 //! | `task.set` | `{uid, name?, duration?, level?, manual?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled) |
 //! | `task.add` | `{after?, name?, duration?}` | the new task (without `duration`, 1 day, estimated when the plan's `NewTasksEstimated` is; inserted `after` a task that a finish-to-start link joins to the next, it is linked into that chain when the plan's `Autolink` is on, as it is by default) |
 //! | `task.del` | `{uid}` | `{deleted, removed:[uid…]}` (a summary takes its subtree) |
 //! | `link.add` | `{uid, pred, type?, lag?}` | the updated task (`lag` uses Predecessors cell spellings such as `4h`, `2ed`, `50%`; other duration spellings such as `1 month` are read as working-days lags) |
 //! | `link.del` | `{uid, pred}` | the updated task |
-//! | `find` | `{query}` | `{count, tasks:[…]}` |
+//! | `find` | `{query, fields?}` | `{count, tasks:[…]}` |
+//!
+//! `fields` is a list of Project field names (`["% Complete", "Baseline1
+//! Finish"]`, matched ignoring ASCII case and surrounding space). The verbs
+//! that reply with a task (`task.set`, `task.add`, `link.add`, `link.del`)
+//! take it too, and check it before they edit anything. Each task
+//! then carries `fields: {"<name as asked>": {text, value}}`: `text` as the
+//! sheet shows it (`1 day`, `4 hrs`, `$1,400.00`, `NA`; the Entry columns in
+//! the grid's own spellings, `2d`), `value` underneath: dates
+//! `YYYY-MM-DD HH:MM`, durations, work and slack signed minutes, money a
+//! number, percents integers, flags booleans, enums and text strings, and
+//! `null` for an absent stored value or a date that shows `NA`. An unknown
+//! name fails the whole call. See `projcore::editor::fields` for each
+//! field's default and unit.
 //!
 //! `path_info` provides the common `proj.path` fields. File verbs (`proj.save`,
 //! `proj.reload`, `proj.open`) belong to the host and are not dispatched here.
@@ -30,8 +44,8 @@
 use ctlcore::json::Json;
 use projcore::datetime::DateTime;
 use projcore::editor::{
-    DURATION_HINT, Editor, TaskPatch, duration_format_code, parse_duration, parse_lag,
-    parse_task_duration_unit,
+    DURATION_HINT, Editor, Field, FieldReader, FieldValue, TaskPatch, duration_format_code,
+    field_names, parse_duration, parse_lag, parse_task_duration_unit,
 };
 use projcore::model::{LagFormat, LagUnit, LinkType, Predecessor, Task};
 
@@ -40,15 +54,16 @@ pub const MUTATING: &[&str] = &["task.set", "task.add", "task.del", "link.add", 
 
 /// Recognize editor verbs before a host resolves its target document.
 pub fn is_editor_verb(verb: &str) -> bool {
-    MUTATING.contains(&verb) || matches!(verb, "task.list" | "task.get" | "find")
+    MUTATING.contains(&verb) || matches!(verb, "task.list" | "task.get" | "task.fields" | "find")
 }
 
 /// Project verbs independent of the host's file handling. `None` means the
 /// verb belongs to the host (or is unknown).
 pub fn dispatch_editor(ed: &mut Editor, verb: &str, args: &Json) -> Option<Result<Json, String>> {
     Some(match verb {
-        "task.list" => Ok(task_list(ed)),
+        "task.list" => task_list(ed, args),
         "task.get" => task_get(ed, args),
+        "task.fields" => Ok(task_fields()),
         "task.set" => task_set(ed, args),
         "task.add" => task_add(ed, args),
         "task.del" => task_del(ed, args),
@@ -107,8 +122,57 @@ fn parse_link_name(s: &str) -> Option<LinkType> {
     }
 }
 
-/// One task as JSON, including its scheduled (or leveled) dates.
-fn task_json(ed: &Editor, t: &Task) -> Json {
+/// The fields a read asks for, each with the name as the caller wrote it;
+/// `None` when it asks for none. Every name resolves before any output.
+fn fields_arg(args: &Json) -> Result<Option<Vec<(String, Field)>>, String> {
+    let Some(fields) = args.get("fields") else {
+        return Ok(None);
+    };
+    let names = fields
+        .as_array()
+        .ok_or("'fields' must be a list of field names")?;
+    names
+        .iter()
+        .map(|name| {
+            let name = name
+                .as_str()
+                .ok_or("'fields' must be a list of field names")?;
+            Ok((name.to_string(), Field::parse(name)?))
+        })
+        .collect::<Result<Vec<_>, String>>()
+        .map(Some)
+}
+
+fn field_value_json(value: FieldValue) -> Json {
+    match value {
+        FieldValue::Null => Json::Null,
+        FieldValue::Bool(b) => Json::Bool(b),
+        FieldValue::Int(n) | FieldValue::Minutes(n) => Json::Num(n as f64),
+        FieldValue::Money(m) => Json::Num(m),
+        FieldValue::Date(d) => Json::Str(dt_str(d)),
+        FieldValue::Text(s) => Json::Str(s),
+    }
+}
+
+fn task_fields() -> Json {
+    let names = field_names();
+    Json::obj(vec![
+        ("count", Json::Num(names.len() as f64)),
+        (
+            "fields",
+            Json::Arr(names.into_iter().map(Json::Str).collect()),
+        ),
+    ])
+}
+
+/// One task as JSON, including its scheduled (or leveled) dates, its row ID
+/// and outline number, and the `fields` asked for.
+fn task_json(
+    ed: &Editor,
+    reader: &FieldReader,
+    t: &Task,
+    asked: Option<&[(String, Field)]>,
+) -> Json {
     let preds = t
         .predecessors
         .iter()
@@ -126,6 +190,13 @@ fn task_json(ed: &Editor, t: &Task) -> Json {
         .collect();
     let mut fields = vec![
         ("uid", Json::Num(t.uid as f64)),
+        ("id", Json::Num(t.id as f64)),
+        (
+            "outline_number",
+            reader
+                .outline_number(t.uid)
+                .map_or(Json::Null, |n| Json::Str(n.to_string())),
+        ),
         ("name", Json::Str(t.name.clone())),
         ("level", Json::Num(t.outline_level as f64)),
         ("summary", Json::Bool(t.summary)),
@@ -165,31 +236,51 @@ fn task_json(ed: &Editor, t: &Task) -> Json {
             Json::Num(ed.project().minutes_to_days(r.total_slack_min)),
         ));
     }
+    if let Some(asked) = asked {
+        let values = asked
+            .iter()
+            .map(|(name, field)| {
+                let read = reader.read(t, *field);
+                (
+                    name.clone(),
+                    Json::obj(vec![
+                        ("text", Json::Str(read.text)),
+                        ("value", field_value_json(read.value)),
+                    ]),
+                )
+            })
+            .collect();
+        fields.push(("fields", Json::Obj(values)));
+    }
     Json::obj(fields)
 }
 
-fn task_list(ed: &Editor) -> Json {
+fn task_list(ed: &Editor, args: &Json) -> Result<Json, String> {
+    let asked = fields_arg(args)?;
+    let reader = FieldReader::new(ed);
     let tasks = ed
         .project()
         .tasks
         .iter()
-        .map(|t| task_json(ed, t))
+        .map(|t| task_json(ed, &reader, t, asked.as_deref()))
         .collect();
-    Json::obj(vec![
+    Ok(Json::obj(vec![
         ("count", Json::Num(ed.project().tasks.len() as f64)),
         ("tasks", Json::Arr(tasks)),
-    ])
+    ]))
 }
 
 fn find(ed: &Editor, args: &Json) -> Result<Json, String> {
     let query = args.get_str("query").ok_or("find needs a 'query'")?;
+    let asked = fields_arg(args)?;
+    let reader = FieldReader::new(ed);
     let needle = query.to_lowercase();
     let tasks: Vec<Json> = ed
         .project()
         .tasks
         .iter()
         .filter(|t| t.name.to_lowercase().contains(&needle))
-        .map(|t| task_json(ed, t))
+        .map(|t| task_json(ed, &reader, t, asked.as_deref()))
         .collect();
     Ok(Json::obj(vec![
         ("query", Json::Str(query.to_string())),
@@ -219,12 +310,26 @@ fn task_index(ed: &Editor, uid: i32) -> Result<usize, String> {
 
 fn task_get(ed: &Editor, args: &Json) -> Result<Json, String> {
     let uid = uid_arg(args, "uid")?;
+    let asked = fields_arg(args)?;
+    task_reply(ed, uid, asked.as_deref())
+}
+
+/// Task `uid` as a read or an edit replies with it, with the fields asked
+/// for. An edit resolves `fields` before it changes anything, so a bad list
+/// is rejected with the editor untouched.
+fn task_reply(ed: &Editor, uid: i32, asked: Option<&[(String, Field)]>) -> Result<Json, String> {
     let i = task_index(ed, uid)?;
-    Ok(task_json(ed, &ed.project().tasks[i]))
+    Ok(task_json(
+        ed,
+        &FieldReader::new(ed),
+        &ed.project().tasks[i],
+        asked,
+    ))
 }
 
 fn task_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
     let uid = uid_arg(args, "uid")?;
+    let asked = fields_arg(args)?;
     let duration = args
         .get_str("duration")
         .map(|d| {
@@ -255,7 +360,7 @@ fn task_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
             duration_format: duration.and_then(|d| duration_format_code(d.2)),
         },
     )?;
-    task_get(ed, args)
+    task_reply(ed, uid, asked.as_deref())
 }
 
 fn task_add(ed: &mut Editor, args: &Json) -> Result<Json, String> {
@@ -263,6 +368,7 @@ fn task_add(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         .get("after")
         .map(|_| uid_arg(args, "after"))
         .transpose()?;
+    let asked = fields_arg(args)?;
     let (duration_min, estimated, unit) = match args.get_str("duration") {
         Some(d) => parse_task_duration_unit(d, ed.project())
             .ok_or_else(|| format!("Couldn't read duration '{d}' ({DURATION_HINT})"))?,
@@ -277,7 +383,7 @@ fn task_add(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         ed.set_duration_typed(uid, duration_min, estimated, unit)?;
         Ok(at)
     })?;
-    Ok(task_json(ed, &ed.project().tasks[at]))
+    task_reply(ed, ed.project().tasks[at].uid, asked.as_deref())
 }
 
 fn task_del(ed: &mut Editor, args: &Json) -> Result<Json, String> {
@@ -295,6 +401,7 @@ fn task_del(ed: &mut Editor, args: &Json) -> Result<Json, String> {
 fn link_add(ed: &mut Editor, args: &Json) -> Result<Json, String> {
     let uid = uid_arg(args, "uid")?;
     let pred = uid_arg(args, "pred")?;
+    let asked = fields_arg(args)?;
     let link = match args.get_str("type") {
         Some(t) => parse_link_name(t).ok_or("'type' must be FS, SS, FF, or SF")?,
         None => LinkType::FinishStart,
@@ -317,12 +424,14 @@ fn link_add(ed: &mut Editor, args: &Json) -> Result<Json, String> {
             ..Predecessor::fs(pred)
         },
     )?;
-    task_get(ed, args)
+    task_reply(ed, uid, asked.as_deref())
 }
 
 fn link_del(ed: &mut Editor, args: &Json) -> Result<Json, String> {
-    ed.remove_predecessor(uid_arg(args, "uid")?, uid_arg(args, "pred")?)?;
-    task_get(ed, args)
+    let uid = uid_arg(args, "uid")?;
+    let asked = fields_arg(args)?;
+    ed.remove_predecessor(uid, uid_arg(args, "pred")?)?;
+    task_reply(ed, uid, asked.as_deref())
 }
 
 #[cfg(test)]
@@ -890,6 +999,296 @@ mod tests {
         assert_eq!((ed.undo_depth(), ed.redo_depth()), (1, 1));
         assert!(ed.dirty());
         assert_eq!(ed.project(), &before);
+    }
+
+    fn call(ed: &mut Editor, verb: &str, args: Vec<(&str, Json)>) -> Result<Json, String> {
+        dispatch_editor(ed, verb, &Json::obj(args)).unwrap()
+    }
+
+    fn names(names: &[&str]) -> Json {
+        Json::Arr(names.iter().map(|n| Json::Str(n.to_string())).collect())
+    }
+
+    /// `(text, value)` of one requested field in a task's JSON.
+    fn field<'a>(task: &'a Json, name: &str) -> (&'a str, &'a Json) {
+        let f = task.get("fields").unwrap().get(name).unwrap();
+        (f.get_str("text").unwrap(), f.get("value").unwrap())
+    }
+
+    #[test]
+    fn task_reads_carry_row_id_outline_number_and_asked_fields() {
+        let project =
+            projcore::mspdi::read_mspdi(include_str!("../../corpus/mspdi/10-summary.xml")).unwrap();
+        let mut ed = Editor::new(project);
+        let r = call(&mut ed, "task.get", vec![("uid", Json::Num(3.0))]).unwrap();
+        assert_eq!(r.get("id"), Some(&Json::Num(3.0)));
+        assert_eq!(r.get_str("outline_number"), Some("1.2"));
+        assert!(r.get("fields").is_none());
+
+        let asked = names(&["Duration", " % complete", "Actual Start", "Baseline10 Cost"]);
+        let r = call(
+            &mut ed,
+            "task.get",
+            vec![("uid", Json::Num(3.0)), ("fields", asked.clone())],
+        )
+        .unwrap();
+        assert_eq!(field(&r, "Duration"), ("1d", &Json::Num(480.0)));
+        // Keyed by the name as asked; unset values are null, shown as Project shows them.
+        assert_eq!(field(&r, " % complete"), ("0%", &Json::Null));
+        assert_eq!(field(&r, "Actual Start"), ("NA", &Json::Null));
+        assert_eq!(field(&r, "Baseline10 Cost"), ("$0.00", &Json::Null));
+
+        let list = call(&mut ed, "task.list", vec![("fields", asked)]).unwrap();
+        let tasks = list.get("tasks").unwrap().as_array().unwrap();
+        let outline: Vec<_> = tasks.iter().map(|t| t.get_str("outline_number")).collect();
+        assert_eq!(outline, [Some("1"), Some("1.1"), Some("1.2")]);
+        assert!(tasks.iter().all(|t| t.get("fields").is_some()));
+        assert_eq!(field(&tasks[0], "Duration").0, "2d");
+
+        let found = call(
+            &mut ed,
+            "find",
+            vec![
+                ("query", Json::Str("B".into())),
+                ("fields", names(&["Start"])),
+            ],
+        )
+        .unwrap();
+        let hit = &found.get("tasks").unwrap().as_array().unwrap()[0];
+        assert_eq!(
+            field(hit, "Start"),
+            ("2026-03-03", &Json::Str("2026-03-03 08:00".into()))
+        );
+    }
+
+    #[test]
+    fn task_fields_lists_every_readable_name() {
+        let mut ed = app();
+        assert!(is_editor_verb("task.fields"));
+        assert!(!MUTATING.contains(&"task.fields"));
+        let r = call(&mut ed, "task.fields", vec![]).unwrap();
+        let listed = r.get("fields").unwrap().as_array().unwrap();
+        assert_eq!(r.get("count"), Some(&Json::Num(listed.len() as f64)));
+        for name in ["% Complete", "Baseline10 Cost", "Total Slack", "Unique ID"] {
+            assert!(listed.iter().any(|n| n.as_str() == Some(name)), "{name}");
+        }
+        // Every listed name reads.
+        let r = call(
+            &mut ed,
+            "task.get",
+            vec![
+                ("uid", Json::Num(1.0)),
+                ("fields", Json::Arr(listed.to_vec())),
+            ],
+        )
+        .unwrap();
+        let read = match r.get("fields") {
+            Some(Json::Obj(pairs)) => pairs.len(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(read, listed.len());
+    }
+
+    #[test]
+    fn a_bad_field_list_rejects_an_edit_before_it_changes_anything() {
+        let mut ed = app();
+        let second = add(&mut ed, "Second", "1d");
+        let third = add(&mut ed, "Third", "1d");
+        ed.add_predecessor(second as i32, 1, LinkType::FinishStart, 0)
+            .unwrap();
+        ed.rename(1, "Change").unwrap();
+        ed.undo();
+        ed.mark_saved();
+        let before = ed.project().clone();
+        let edits = [
+            (
+                "task.set",
+                vec![("uid", Json::Num(1.0)), ("name", Json::Str("X".into()))],
+            ),
+            ("task.add", vec![("name", Json::Str("Y".into()))]),
+            (
+                "link.add",
+                vec![("uid", Json::Num(third as f64)), ("pred", Json::Num(1.0))],
+            ),
+            (
+                "link.del",
+                vec![("uid", Json::Num(second as f64)), ("pred", Json::Num(1.0))],
+            ),
+        ];
+        for (verb, extra) in edits {
+            for bad in [names(&["Name", "Status"]), Json::Str("x".into())] {
+                let mut args = extra.clone();
+                args.push(("fields", bad));
+                assert!(call(&mut ed, verb, args).is_err(), "{verb}");
+                assert_eq!(ed.project(), &before, "{verb}");
+                assert_eq!((ed.undo_depth(), ed.redo_depth()), (3, 1), "{verb}");
+                assert!(!ed.dirty(), "{verb}");
+            }
+        }
+        // A good list comes back on the edit's reply.
+        let r = call(
+            &mut ed,
+            "task.add",
+            vec![
+                ("name", Json::Str("Z".into())),
+                ("fields", names(&["Name", "Outline Number"])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(field(&r, "Name"), ("Z", &Json::Str("Z".into())));
+        let r = call(
+            &mut ed,
+            "link.add",
+            vec![
+                ("uid", Json::Num(third as f64)),
+                ("pred", Json::Num(1.0)),
+                ("fields", names(&["Predecessors"])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(field(&r, "Predecessors").0, "1");
+    }
+
+    #[test]
+    fn a_bad_field_list_fails_the_whole_read() {
+        let mut ed = app();
+        for (verb, extra) in [
+            ("task.get", vec![("uid", Json::Num(1.0))]),
+            ("task.list", vec![]),
+            ("find", vec![("query", Json::Str("task".into()))]),
+        ] {
+            let mut args = extra.clone();
+            args.push(("fields", names(&["Name", "Status", "Bogus"])));
+            assert_eq!(
+                call(&mut ed, verb, args),
+                Err("unknown task field 'Status'".into()),
+                "{verb}"
+            );
+            for bad in [Json::Str("Name".into()), Json::Arr(vec![Json::Num(1.0)])] {
+                let mut args = extra.clone();
+                args.push(("fields", bad));
+                assert_eq!(
+                    call(&mut ed, verb, args),
+                    Err("'fields' must be a list of field names".into()),
+                    "{verb}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn finish_variance_follows_a_duration_edit_after_set_baseline() {
+        let mut ed = app();
+        let first = add(&mut ed, "First", "2d");
+        let second = add(&mut ed, "Second", "1d");
+        link_add(
+            &mut ed,
+            &Json::obj(vec![
+                ("uid", Json::Num(second as f64)),
+                ("pred", Json::Num(first as f64)),
+            ]),
+        )
+        .unwrap();
+        ed.set_baseline();
+        let read = |ed: &mut Editor| {
+            call(
+                ed,
+                "task.get",
+                vec![
+                    ("uid", Json::Num(second as f64)),
+                    ("fields", names(&["Baseline Finish", "Finish Variance"])),
+                ],
+            )
+            .unwrap()
+        };
+        let before = read(&mut ed);
+        assert_eq!(
+            field(&before, "Finish Variance"),
+            ("0 days", &Json::Num(0.0))
+        );
+        call(
+            &mut ed,
+            "task.set",
+            vec![
+                ("uid", Json::Num(first as f64)),
+                ("duration", Json::Str("4d".into())),
+            ],
+        )
+        .unwrap();
+        let after = read(&mut ed);
+        assert_eq!(
+            field(&after, "Baseline Finish"),
+            field(&before, "Baseline Finish")
+        );
+        assert_eq!(
+            field(&after, "Finish Variance"),
+            ("2 days", &Json::Num(960.0))
+        );
+    }
+
+    #[test]
+    fn slack_reads_in_minutes_including_negative_total_slack() {
+        let mut ed = app();
+        let uid = add(&mut ed, "Late", "3d") as i32;
+        let mut p = ed.project().clone();
+        p.tasks.iter_mut().find(|t| t.uid == uid).unwrap().deadline =
+            Some(DateTime::from_ymd_hm(2026, 1, 5, 17, 0));
+        let mut ed = Editor::new(p);
+        let r = call(
+            &mut ed,
+            "task.get",
+            vec![
+                ("uid", Json::Num(uid as f64)),
+                ("fields", names(&["Total Slack", "Free Slack"])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(field(&r, "Total Slack"), ("-2 days", &Json::Num(-960.0)));
+        assert_eq!(field(&r, "Free Slack"), ("0 days", &Json::Num(0.0)));
+    }
+
+    #[test]
+    fn the_project_summary_row_reads_over_the_control_surface() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Project xmlns="http://schemas.microsoft.com/project">
+  <Name>plan</Name><CalendarUID>1</CalendarUID>
+  <StartDate>2026-03-02T08:00:00</StartDate>
+  <ProjectExternallyEdited>0</ProjectExternallyEdited>
+  <Tasks>
+    <Task><UID>0</UID><ID>0</ID><Name>Plan</Name><OutlineLevel>0</OutlineLevel><Summary>1</Summary>
+      <Duration>PT24H0M0S</Duration><Cost>140000</Cost><PercentComplete>25</PercentComplete>
+      <Notes>Kickoff Monday</Notes></Task>
+    <Task><UID>1</UID><ID>1</ID><Name>A</Name><OutlineLevel>1</OutlineLevel>
+      <Duration>PT16H0M0S</Duration></Task>
+    <Task><UID>2</UID><ID>2</ID><Name>B</Name><OutlineLevel>1</OutlineLevel>
+      <Duration>PT8H0M0S</Duration>
+      <PredecessorLink><PredecessorUID>1</PredecessorUID><Type>1</Type></PredecessorLink></Task>
+  </Tasks>
+</Project>"#;
+        let mut ed = Editor::new(projcore::mspdi::read_mspdi(xml).unwrap());
+        let asked = names(&["Duration", "Start", "Finish", "% Complete", "Cost", "Notes"]);
+        let r = call(
+            &mut ed,
+            "task.get",
+            vec![("uid", Json::Num(0.0)), ("fields", asked)],
+        )
+        .unwrap();
+        assert_eq!(r.get_str("outline_number"), Some("0"));
+        assert_eq!(field(&r, "Duration"), ("3d", &Json::Num(1440.0)));
+        assert_eq!(
+            field(&r, "Start"),
+            ("2026-03-02", &Json::Str("2026-03-02 08:00".into()))
+        );
+        assert_eq!(
+            field(&r, "Finish"),
+            ("2026-03-04", &Json::Str("2026-03-04 17:00".into()))
+        );
+        assert_eq!(field(&r, "% Complete"), ("25%", &Json::Num(25.0)));
+        assert_eq!(field(&r, "Cost"), ("$1,400.00", &Json::Num(1400.0)));
+        assert_eq!(
+            field(&r, "Notes"),
+            ("Kickoff Monday", &Json::Str("Kickoff Monday".into()))
+        );
     }
 
     #[test]

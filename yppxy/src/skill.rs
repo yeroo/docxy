@@ -33,7 +33,15 @@ use its tools:
   (true when its subtasks finish after it, or it finishes after its parent
   manual summary). Setting a manual summary's
   duration sets its own span.
-- `yppxy_get` `{uid}` — one task
+- `yppxy_get` `{uid, fields?}` — one task. Every task carries its row `id` and
+  `outline_number`; `fields` (also taken by `yppxy_tasks`, `yppxy_find` and the
+  editing tools) reads any Project field by name, e.g. `["% Complete", "Actual
+  Start", "Baseline Finish", "Finish Variance", "Total Slack", "Cost"]`, as
+  `fields: {name: {text, value}}`: `text` as the sheet shows it (`2 days`,
+  `$1,400.00`, `NA`), `value` underneath (dates `YYYY-MM-DD HH:MM`; durations,
+  work and slack in minutes; money a number; `null` when unset). An unknown
+  name fails the call, before any edit
+- `yppxy_fields` — every field name `fields` can read
 - `yppxy_set` `{uid, name?, duration?, level?, manual?}` — edit a task (duration like
   "3d", "4h", "2w"; level = outline depth 1..20; manual = true pins the task at
   its current dates as Manually Scheduled, false makes it Auto Scheduled)
@@ -68,8 +76,8 @@ where instance is `yppxy-<AGWINTERM_SESSION_ID>` — the pane id shown by
 ← {"ok":true,"result":{ … }}
 ```
 
-Verbs: `proj.path`, `task.list`, `task.get`, `task.set`, `task.add`, `task.del`,
-`link.add`, `link.del`, `find`, `proj.save`, `proj.reload`, `proj.open`.
+Verbs: `proj.path`, `task.list`, `task.get`, `task.fields`, `task.set`, `task.add`,
+`task.del`, `link.add`, `link.del`, `find`, `proj.save`, `proj.reload`, `proj.open`.
 
 ## Two panes in one agwinterm session
 `agwintermctl split on`, then launch `yppxy <file>` in the new pane (or press
@@ -103,6 +111,9 @@ mod tests {
             "agwintermctl split on",
             "rollup_finish",
             "warning",
+            "yppxy_fields",
+            "task.fields",
+            "outline_number",
         ] {
             assert!(SKILL_MD.contains(needle), "skill missing {needle}");
         }

@@ -19,9 +19,14 @@ pub const DURATION_HINT: &str = "try 3d, 4h, 2w, 1mo";
 mod batch;
 mod cells;
 mod effort;
+mod fields;
 pub use cells::{
     day_finish, format_duration_exact, format_predecessors, format_resource_names, parse_cell_date,
     parse_lag, parse_task_predecessors, split_resource_names,
+};
+pub use fields::{
+    BaselinePart, ENTRY_FIELDS, Field, FieldRead, FieldReader, FieldValue, field_names,
+    format_date_field, task_mode_name,
 };
 // Re-entering a task's cell goes through `parse_task_predecessors`, which
 // keeps links shown in a fallback unit; the plain parser stays internal.
@@ -1136,9 +1141,12 @@ impl Editor {
     }
 
     /// Project › Schedule › Set Baseline: record the plan as it is scheduled
-    /// now in the Baseline (slot 0) of every scheduled task, and of the
-    /// assignments and resources (see `baseline_assignments`), as one undo
-    /// step. Baseline1..10 stay.
+    /// now (CPM, the dates a save writes) in the Baseline (slot 0) of every
+    /// scheduled task, with its stored work and cost (absent ones stay
+    /// absent), and of the assignments and resources (see
+    /// `baseline_assignments`), as one undo step. Baseline1..10 stay.
+    /// Leveling is a view a save does not write, so a leveled view is not
+    /// what it records.
     pub fn set_baseline(&mut self) {
         self.snapshot();
         let baselines: Vec<_> = self
@@ -1160,6 +1168,8 @@ impl Editor {
                             r.early_start,
                             r.early_finish,
                         )),
+                        work_min: t.work_min,
+                        cost: t.cost.clone(),
                         ..Baseline::default()
                     },
                 ))
@@ -2146,6 +2156,8 @@ mod tests {
                 uid: 2,
                 outline_level: 2,
                 duration_min: 960,
+                work_min: Some(960),
+                cost: crate::model::Rate::parse("40000"),
                 ..Task::default()
             },
             Task {
@@ -2172,6 +2184,8 @@ mod tests {
             let baseline = task.baseline(0).unwrap();
             let r = ed.schedule().get(task.uid).unwrap();
             assert_eq!(baseline.duration_min, Some(expected));
+            assert_eq!(baseline.work_min, task.work_min);
+            assert_eq!(baseline.cost, task.cost);
             assert_eq!(baseline.start, Some(r.early_start));
             assert_eq!(baseline.finish, Some(r.early_finish));
             assert_eq!(task.baseline(1), Some(&saved));

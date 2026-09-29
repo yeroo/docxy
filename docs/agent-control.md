@@ -37,9 +37,9 @@ invalid indices, non-Project targets, and failed-load placeholders are errors.
 Explicit targets do not activate that tab. Task/link arguments use stable
 **UIDs**, as reported by `task.list`, not the table's displayed IDs.
 
-Supported verbs are `proj.path`, `task.list`, `task.get`, `task.set`, `task.add`,
-`task.del`, `link.add`, `link.del`, `find`, `proj.save`, `proj.reload`, and
-`proj.open`, with the yppxy argument/result shapes. `proj.path` additionally
+Supported verbs are `proj.path`, `task.list`, `task.get`, `task.fields`, `task.set`,
+`task.add`, `task.del`, `link.add`, `link.del`, `find`, `proj.save`, `proj.reload`,
+and `proj.open`, with the yppxy argument/result shapes. `proj.path` additionally
 reports `tab`, `imported`, `cell` (active column name), `cell_row` (zero-based row),
 and `cell_edit` (pending cell buffer, or `null` when closed). Reads and rejected
 edits leave selection, prompts, pending cell edits, history and scroll unchanged.
@@ -52,6 +52,54 @@ to switch a task between Manually and Auto Scheduled: a task that becomes manual
 is pinned at its shown start and finish, one that becomes auto is placed by its
 links and constraints again. It may be combined with `name`, `duration` and
 `level` in one undo step; every task in `task.list`/`task.get` reports `manual`.
+
+Every task in `task.list`, `task.get` and `find` also reports its row `id` and
+its `outline_number` (`1.2`; `0` for the project summary row, `null` for a
+blank row). To read any other field, pass `fields`, a list of Project's own
+field names; `task.fields` returns `{count, fields}`, every name this build can
+read, so a test can tell "not supported" from "empty":
+
+```json
+{"uid": 2, "fields": ["% Complete", "Actual Start", "Baseline1 Finish", "Total Slack"]}
+```
+
+Each task then carries `fields: {"<name as asked>": {"text": …, "value": …}}`.
+Names match ignoring ASCII case and surrounding space. An unknown name, or a
+`fields` that is not a list of strings, fails the whole call
+(`unknown task field 'Status'`). The verbs that reply with a task (`task.set`,
+`task.add`, `link.add`, `link.del`) take `fields` too and check it before they
+edit anything, so a bad list leaves the plan and its undo history unchanged. The fields are the Entry columns (ID, Task
+Mode, Name, Duration, Start, Finish, Predecessors, Resource Names), % Complete,
+% Work Complete, Physical % Complete, Actual Start/Finish/Duration/Work/Cost,
+Remaining Duration/Work/Cost, Work, Cost, Fixed Cost, Fixed Cost Accrual,
+Baseline and Baseline1–Baseline10 Start/Finish/Duration/Work/Cost, Start,
+Finish, Duration, Work and Cost Variance, Total, Free, Start and Finish Slack,
+Early and Late Start/Finish, Critical, Constraint Type and Date, Deadline,
+Active, Outline Number, Outline Level, WBS, Leveling Delay, Type, Effort Driven,
+Priority, Notes, Milestone, Summary, Estimated and Unique ID. Earned-value,
+Status and custom fields are not readable yet.
+
+- `text` is what the sheet shows. The Entry columns use the grid's own text,
+  which the harness `cell` verb also returns (`2d`, `2026-03-02`); the other
+  fields use Project's spellings: `0 days`, `1 day`, `-1 day`, `1.25 days`,
+  `2 wks`, `2 edays`, `4 hrs` (work is always hours), `$1,400.00`,
+  `($40,000.00)`, `50%`, `Yes`/`No`. Dates show `YYYY-MM-DD`, or `NA` when
+  unset, so Duration `2d` can sit next to Actual Duration `2 days`.
+- `value` is what lies underneath: dates `YYYY-MM-DD HH:MM`; durations, work
+  and slack signed minutes; money a number of currency units; percents
+  integers; flags booleans; enums (Task Mode, Constraint Type, Type, Fixed
+  Cost Accrual) their display names; text strings. It is `null` only for a date
+  that shows `NA` and for a stored quantity the plan does not have (unset %
+  Complete reads `"0%"` and `null`; a stored 0 reads `"0%"` and `0`). Fields
+  with a Project default read the default: Active Yes, Priority 500, Type and
+  Effort Driven the plan's new-task defaults, Fixed Cost Accrual Prorated.
+- Variances follow the live schedule, not the values a file stores. They
+  measure the scheduled (unleveled) dates, which a save writes and Set
+  Baseline records; while leveling is on, the grid's Start and Finish can
+  differ from them. Start and Finish Variance are working minutes from the
+  Baseline date to the scheduled one (0 without a baseline), and Duration, Work and Cost Variance are the
+  current value less the Baseline one (an absent Baseline value counts as 0).
+  Slack comes from the schedule, and total slack can be negative.
 
 File handling differs from the TUI:
 
@@ -807,12 +855,13 @@ Skill: `xlsxy install skill`.
 
 **yppxy** (project schedule; tasks addressed by UID, durations like `3d`/`4h`):
 `proj.path`, `task.list` (scheduled dates, critical path, slack, links),
-`task.get/set/add/del`, `link.add {uid, pred, type?, lag?}` / `link.del`,
+`task.get/set/add/del`, `task.fields` (`task.list`/`task.get`/`find` take
+`fields: [...]` to read any listed field by Project's name), `link.add {uid, pred, type?, lag?}` / `link.del`,
 `find {query}`, `proj.save {path?}`, `proj.reload`, `proj.open {path}`. Edits
 reschedule the plan (CPM) live. MCP: `claude mcp add yppxy -- yppxy --mcp` →
 `yppxy_list`, `yppxy_status`, `yppxy_tasks`, `yppxy_get`, `yppxy_set`,
-`yppxy_add`, `yppxy_del`, `yppxy_link`, `yppxy_unlink`, `yppxy_find`,
-`yppxy_save`. Skill: `yppxy install skill`.
+`yppxy_fields`, `yppxy_add`, `yppxy_del`, `yppxy_link`, `yppxy_unlink`,
+`yppxy_find`, `yppxy_save` (the task tools take `fields`). Skill: `yppxy install skill`.
 
 Everything else — discovery, the wire protocol, tokens, `target`
 disambiguation, the status-dot flash on agent edits — works identically across
