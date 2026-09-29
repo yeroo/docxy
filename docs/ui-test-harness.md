@@ -559,7 +559,7 @@ Menus open today:
 
 | Verb | Args | Reply |
 |---|---|---|
-| `menu-open` | `{target}`: `"document"`, `{"row": <task uid>}` or `{"ribbon": [tab, group, command]}` | the menu, as `menu-read` |
+| `menu-open` | `{target}`: `"document"`, `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task) or `{"ribbon": [tab, group, command]}` | the menu, as `menu-read` |
 | `menu-read` | `{}` | `{open: true, target, items}`, or `{open: false}` |
 | `menu-click` | `{label}` among the top-level items, or `{path: [labels]}` through submenus | `state` after the item's handler; the menu closes first |
 | `menu-close` | `{}` | `state`, as Esc leaves it |
@@ -576,6 +576,9 @@ Cut, Copy, Paste and Insert Task any row, the entry row included. `checked`
 is the ribbon's pressed state (Inactivate Task, the task's mode). Delete Task
 deletes the selected task whatever column the cursor is on; a summary asks
 first, in the `delete-summary` dialog.
+
+A press on a split button's arrow while its own menu is open shuts the menu,
+as in Office; the harness's `menu-open` always opens.
 
 `state` has `menu`: null, or `{target}`. The menu opens at the target's drawn
 position when the last frame drew it, else in the middle of the window; either

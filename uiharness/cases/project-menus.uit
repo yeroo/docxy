@@ -202,3 +202,20 @@ test a control-pipe edit closes an open menu without the harness's press rule
   assert menu is nothing
   call-error menu-click {"label":"Delete Task"} => no menu is open
   assert tasks is 3
+
+test the entry row's menu is the row menu for no task
+  open copy:../fixtures/gantt-summary.xml
+  call menu-open {"target":{"row":null}}
+  assert reply.target.row is nothing
+  assert menu.target.row is nothing
+  assert selected_name is empty
+  assert reply.items.7.label is Insert Task
+  assert reply.items.7.enabled is true
+  assert reply.items.8.label is Delete Task
+  assert reply.items.8.enabled is false
+  assert reply.items.5.label is Scroll to Task
+  assert reply.items.5.enabled is false
+  call-error menu-click {"label":"Delete Task"} => menu item 'Delete Task' is disabled
+  call menu-click {"label":"Insert Task"}
+  assert tasks is 4
+  call-error menu-open {"target":{"row":"x"}} => 'row' must be a task uid, or null for the entry row
