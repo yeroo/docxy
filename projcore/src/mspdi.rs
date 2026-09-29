@@ -1511,7 +1511,7 @@ fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 /// external placeholders, tasks the schedule skips and auto summaries with
 /// nothing scheduled below them, and for every task of a plan with an input
 /// Project schedules by and docxy's schedule ignores: `ScheduleFromStart` 0,
-/// a non-zero task or assignment `LevelingDelay` or assignment `Delay`, an
+/// a non-zero task or assignment `LevelingDelay`, an
 /// elapsed task `DurationFormat`, or a work resource whose calendar differs
 /// from its task's. See `scheduled_dates` and `schedule_reproduces`.
 ///
@@ -1526,7 +1526,9 @@ fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 /// plan with one still saves the schedule's dates: recurring exceptions
 /// (`Type` 2-8, or a `Period` above 1) are written back but not scheduled, and
 /// an untracked split (a gap in a task's work that is not a recorded
-/// Stop/Resume) is not modelled. On such a plan these fields and an auto
+/// Stop/Resume) is not modelled. A `.mpp` import does not decode assignment
+/// `LevelingDelay`, so a plan leveled only through its assignments passes the
+/// check. On such a plan these fields and an auto
 /// task's `Start`/`Finish` can differ from Project's, and the difference
 /// spreads through links, rollups and late dates to other tasks.
 ///
@@ -1769,7 +1771,6 @@ fn scheduled_dates(
 /// - `ScheduleFromStart` 0: docxy schedules forward;
 /// - a non-zero task or assignment `LevelingDelay`: Project's leveling result,
 ///   which the unleveled schedule ignores;
-/// - a non-zero assignment `Delay`, which only the leveling pass books;
 /// - an elapsed `DurationFormat` on a task: the schedule counts every duration
 ///   in working time;
 /// - a work assignment whose resource's calendar has other working time than
@@ -1778,8 +1779,12 @@ fn scheduled_dates(
 ///   of its own and derives from the task's calendar, as Project makes one for
 ///   each resource, has the same working time.
 ///
+/// An assignment `Delay` is not one: it moves the assignment within its task,
+/// whose duration already includes it, not the task.
+///
 /// Known limits, not checked: recurring calendar exceptions and untracked
-/// splits, see [`write_mspdi`].
+/// splits, and on a `.mpp` import an assignment `LevelingDelay`, which the
+/// importer does not decode; see [`write_mspdi`].
 fn schedule_reproduces(proj: &Project) -> bool {
     let nonzero = |value: Option<i64>| value.is_some_and(|v| v != 0);
     if proj.option("ScheduleFromStart").and_then(parse_bool) == Some(false) {
@@ -1797,9 +1802,10 @@ fn schedule_reproduces(proj: &Project) -> bool {
     {
         return false;
     }
-    !proj.assignments.iter().any(|a| {
-        nonzero(a.leveling_delay) || nonzero(a.delay) || resource_calendar_differs(proj, a)
-    })
+    !proj
+        .assignments
+        .iter()
+        .any(|a| nonzero(a.leveling_delay) || resource_calendar_differs(proj, a))
 }
 
 /// Whether `a`'s work resource works on a calendar other than its task's.
@@ -4802,13 +4808,7 @@ mod tests {
             ("", "", "", false),
             ("<LevelingDelay>4800</LevelingDelay>", "", "", true),
             ("", "<LevelingDelay>4800</LevelingDelay>", "", true),
-            ("", "<Delay>4800</Delay>", "", true),
-            (
-                "<LevelingDelay>0</LevelingDelay>",
-                "<Delay>0</Delay>",
-                "",
-                false,
-            ),
+            ("<LevelingDelay>0</LevelingDelay>", "", "", false),
             ("<DurationFormat>8</DurationFormat>", "", "", true),
             ("<DurationFormat>7</DurationFormat>", "", "", false),
             ("<DurationFormat>39</DurationFormat>", "", "", false),
@@ -4886,6 +4886,33 @@ mod tests {
                 "{task_extra} {assignment_extra} {alice_calendar} {alice_uid}"
             );
         }
+    }
+
+    /// An assignment Delay moves the assignment within its task, whose
+    /// duration already includes it: the schedule reproduces the task, so a
+    /// stale stored date is still replaced. B runs two days after A, with its
+    /// assignment starting a day late.
+    #[test]
+    fn an_assignment_delay_keeps_the_scheduled_dates() {
+        let source = include_str!("../../corpus/mspdi/02-link-fs.xml")
+            .replacen(
+                "<Start>2026-03-04T08:00:00</Start><Finish>2026-03-05T17:00:00</Finish>",
+                "<Start>2026-03-11T08:00:00</Start><Finish>2026-03-12T17:00:00</Finish>",
+                1,
+            )
+            .replacen(
+                "</Tasks>",
+                "</Tasks><Resources><Resource><UID>1</UID><Name>Alice</Name><Type>1</Type>                 </Resource></Resources><Assignments><Assignment><UID>1</UID>                 <TaskUID>2</TaskUID><ResourceUID>1</ResourceUID><Work>PT8H0M0S</Work>                 <Delay>4800</Delay></Assignment></Assignments>",
+                1,
+            );
+        let proj = read_mspdi(&source).unwrap();
+        assert_eq!(proj.assignments[0].delay, Some(4800));
+        let b = proj.task(2).unwrap();
+        assert_eq!(b.duration_min, 960, "B's duration spans the delay");
+        let xml = write_mspdi(&proj);
+        let b = one_task_xml(&xml, 2);
+        assert!(b.contains("<Start>2026-03-04T08:00:00</Start>"), "{b}");
+        assert!(b.contains("<Finish>2026-03-05T17:00:00</Finish>"), "{b}");
     }
 
     /// docxy schedules forward even when a plan is scheduled from its

@@ -54,13 +54,16 @@ blank rows, external placeholders, tasks the schedule skips, auto summaries with
 nothing scheduled below them), and for every task of a plan with an input
 Project schedules by and docxy's schedule ignores, whose effect reaches every
 task downstream: `ScheduleFromStart` 0, a non-zero task or assignment
-`LevelingDelay` or assignment `Delay`, an elapsed task `DurationFormat`, or a
+`LevelingDelay`, an elapsed task `DurationFormat`, or a
 work resource whose calendar has other working time than its task's (a
 resource calendar that states nothing of its own and derives from the task's
 calendar, as Project makes one per resource, does not count). Known limits no
 cheap check detects, where a save still writes docxy's dates and they can
 differ from Project's, spreading through links and rollups: recurring calendar
-exceptions (`Type` 2-8), which are not scheduled, and untracked splits. The
+exceptions (`Type` 2-8), which are not scheduled, untracked splits, and on a
+`.mpp` import an assignment `LevelingDelay`, which the importer does not decode
+(it does decode each resource's calendar). An assignment `Delay` is not such an
+input: it moves the assignment within its task, whose duration includes it. The
 editor rewrites the stored dates for a manual task
 whose dates it edits, so a save's `Start`/`Finish` agree with its
 `ManualStart`/`ManualDuration` (Project does not reschedule manual tasks on
