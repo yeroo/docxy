@@ -179,6 +179,16 @@ impl<A: Copy + PartialEq> Ribbon<A> {
         }
     }
 
+    /// Switch to tab `i` even when it has no groups, for an app whose empty
+    /// tab is a ribbon tab with nothing on it yet rather than a backstage
+    /// (yppxy's Report). The body lays out empty.
+    pub fn show_tab(&mut self, i: usize) {
+        if i < self.tabs.len() {
+            self.active = i;
+            self.layout();
+        }
+    }
+
     /// Whether tab `i` has an in-ribbon body (no body = a backstage tab).
     pub fn tab_has_body(&self, i: usize) -> bool {
         self.tab_groups.get(i).is_some_and(|g| !g.is_empty())
@@ -550,6 +560,20 @@ mod tests {
         assert_eq!(r.active_tab(), 1);
         r.set_active(2);
         assert_eq!(r.active_tab(), 2);
+    }
+
+    #[test]
+    fn show_tab_selects_an_empty_tab_with_nothing_to_focus() {
+        let mut r = sample();
+        r.show_tab(0);
+        assert_eq!(r.active_tab(), 0);
+        assert_eq!(r.button_count(), 0);
+        assert!(matches!(r.nav(Focus::Tab(0), Dir::Down), Focus::Tab(0)));
+        r.show_tab(9); // out of range: ignored
+        assert_eq!(r.active_tab(), 0);
+        r.show_tab(1);
+        assert_eq!(r.active_tab(), 1);
+        assert!(r.button_count() > 0);
     }
 
     #[test]
