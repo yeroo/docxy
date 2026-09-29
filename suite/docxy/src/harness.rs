@@ -1404,10 +1404,13 @@ fn split_primary(
         .find(|g| g.title == group)
         .ok_or_else(|| format!("no group '{group}' on tab '{}'", tab.name))?;
     for control in &g.items {
-        if let crate::Control::Split { primary, .. } = control {
-            if primary.label == label {
-                return Ok(primary.id);
+        match control {
+            crate::Control::Split { primary: cmd, .. } | crate::Control::Dropdown { cmd, .. }
+                if cmd.label == label =>
+            {
+                return Ok(cmd.id);
             }
+            _ => {}
         }
     }
     let mut commands = Vec::new();
@@ -2964,7 +2967,7 @@ mod tests {
             tabs.iter()
                 .map(|t| t.get_str("name").unwrap())
                 .collect::<Vec<_>>(),
-            vec!["File", "Home", "Insert", "Review", "View"]
+            vec!["File", "Home", "Insert", "Layout", "Review", "View"]
         );
         let tabs_on = on.get("tabs").unwrap().as_array().unwrap();
         assert_eq!(tabs_on.last().unwrap().get_str("name"), Some("Table"));

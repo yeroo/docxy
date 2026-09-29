@@ -28,6 +28,7 @@ mod dialog;
 mod dialog_host;
 mod harness;
 mod html_bundle;
+mod layout_tab;
 mod menu;
 mod project;
 mod recover;
@@ -278,6 +279,8 @@ enum RibbonTab {
     Project,
     Home,
     Insert,
+    /// Word's page Layout tab (#649); documents only.
+    Layout,
     Review,
     View,
     /// Contextual Table Tools tab — only reachable while the caret is in a table.
@@ -1412,6 +1415,8 @@ struct Docxy {
     range_pick: Option<((u32, u32), bool)>,
     // KeyTips (Alt access keys): Off, tab letters, or the active tab's commands.
     keytips: KeyTip,
+    /// The letters typed so far of a multi-letter command KeyTip.
+    keytip_prefix: String,
     // The open menu (a right-click's context menu or a split button's
     // drop-down), drawn from the same model the harness reads.
     menu: Option<menu::Menu>,
@@ -5859,6 +5864,7 @@ impl Docxy {
             drag_anchor: None,
             range_pick: None,
             keytips: KeyTip::Off,
+            keytip_prefix: String::new(),
             menu: None,
             menu_closed_at: None,
             mini_bar: None,
@@ -11325,39 +11331,24 @@ fn open_hf_tab(tab: &mut DocTab, is_header: bool, variant: &'static str) -> bool
 }
 
 /// Toggle "Different First Page" (`<w:titlePg/>`) in a tab's final section,
-/// mirrored into the body editor as one undo step. The new state; false for a
-/// package-less tab.
+/// the one the header/footer commands edit, as one body-editor undo step. The
+/// new state; false for a package-less tab.
 fn toggle_title_pg_tab(tab: &mut DocTab) -> bool {
-    let Some(on) = edit_final_sect_pr(tab, true, |pkg| {
-        let on = !pkg.has_title_pg();
-        pkg.set_title_pg(on);
-        on
-    }) else {
+    let (Some(_), Surface::Doc(ed)) = (tab.pkg.as_ref(), &mut tab.surface) else {
         return false;
     };
+    let last = ed.sections().len() - 1;
+    let on = !ed.sections()[last].contains("<w:titlePg");
+    ed.edit_sections(&[last], |raw| {
+        let raw = docxcore::sect::remove_element(raw, "w:titlePg");
+        if on {
+            docxcore::sect::insert_ordered(&raw, "w:titlePg", "<w:titlePg/>")
+        } else {
+            raw
+        }
+    });
     tab.dirty = true;
     on
-}
-
-/// Cycle a tab's final-section newspaper columns 1 → 2 → 3 → 1, mirrored into
-/// the body editor as one undo step.
-fn cycle_columns_tab(tab: &mut DocTab) {
-    let next = edit_final_sect_pr(tab, true, |pkg| {
-        let next = match pkg.columns() {
-            1 => 2,
-            2 => 3,
-            _ => 1,
-        };
-        pkg.set_columns(next);
-        next
-    });
-    match next {
-        Some(next) => {
-            tab.dirty = true;
-            tab.status = format!("Columns: {next}").into();
-        }
-        None => tab.status = "Columns need a .docx (not Markdown)".into(),
-    }
 }
 
 /// Set a tab's final-section page margins (twips) from a ruler drag. The first
@@ -12242,35 +12233,6 @@ impl Docxy {
     ) {
         self.picker = None;
         self.with_editor(window, cx, move |e| e.insert_equation(latex, false));
-    }
-
-    /// Cycle the section's newspaper columns 1 → 2 → 3 → 1 (Layout ▸ Columns).
-    /// docxy renders a single column, but the layout round-trips and Word lays it
-    /// out in columns.
-    fn cycle_columns(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(self.active) {
-            cycle_columns_tab(tab);
-        }
-        self.refocus(window, cx);
-    }
-
-    /// Toggle automatic hyphenation for the document (Layout ▸ Hyphenation).
-    fn toggle_hyphenation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(self.active) {
-            if let Some(pkg) = tab.pkg.as_mut() {
-                let on = !pkg.has_auto_hyphenation();
-                pkg.set_auto_hyphenation(on);
-                tab.dirty = true;
-                tab.status = if on {
-                    "Automatic hyphenation: on".into()
-                } else {
-                    "Automatic hyphenation: off".into()
-                };
-            } else {
-                tab.status = "Hyphenation needs a .docx (not Markdown)".into();
-            }
-        }
-        self.refocus(window, cx);
     }
 
     /// Apply an auto-rule line spacing to the selected paragraphs (Line Spacing menu).
@@ -14885,8 +14847,8 @@ enum Act {
     EditFooter,
     PageNumber,
     NoSpacing,
-    Columns,
-    Hyphenation,
+    /// A page Layout tab command (#649).
+    Layout(layout_tab::LayoutAct),
     InsertEquation,
     RowAbove,
     RowBelow,
@@ -15198,18 +15160,9 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                         Control::Large(cmdt("hr", "rule", "Rule", HRule, "").key("L")),
                     ],
                 ),
-                rs::group(
-                    "Layout",
-                    22,
-                    vec![
-                        Control::Large(cmdt("columns", "columns", "Columns", Columns, "").key("C")),
-                        Control::Large(
-                            cmdt("hyphen", "hyphenation", "Hyphenation", Hyphenation, "").key("Z"),
-                        ),
-                    ],
-                ),
             ],
         ),
+        layout_tab::layout_tab(),
         // Review: a large New Comment + a small pane-toggle column, then Editing.
         rs::tab(
             "Review",
@@ -15304,10 +15257,15 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
 }
 
 fn ribbon_for(kind: Kind) -> rs::Ribbon<Act> {
-    if kind == Kind::Project {
-        project_ribbon()
-    } else {
-        docxy_ribbon()
+    match kind {
+        Kind::Project => project_ribbon(),
+        Kind::Docx => docxy_ribbon(),
+        // The same tabs as `ribbon_tab_set` gives a workbook: no Layout.
+        _ => {
+            let mut ribbon = docxy_ribbon();
+            ribbon.tabs.retain(|t| t.name != "Layout");
+            ribbon
+        }
     }
 }
 
@@ -15322,7 +15280,17 @@ fn ribbon_tab_set(kind: Kind) -> &'static [(Option<RibbonTab>, &'static str, &'s
             (Some(Project), "Project", "P"),
             (Some(View), "View", "W"),
         ]
+    } else if kind == Kind::Docx {
+        &[
+            (None, "File", "F"),
+            (Some(Home), "Home", "H"),
+            (Some(Insert), "Insert", "N"),
+            (Some(Layout), "Layout", "P"),
+            (Some(Review), "Review", "R"),
+            (Some(View), "View", "W"),
+        ]
     } else {
+        // A workbook shows the document ribbon's tabs but has no page Layout.
         &[
             (None, "File", "F"),
             (Some(Home), "Home", "H"),
@@ -15355,6 +15323,7 @@ fn ribbon_tab_name(tab: RibbonTab) -> &'static str {
     match tab {
         RibbonTab::Home => "Home",
         RibbonTab::Insert => "Insert",
+        RibbonTab::Layout => "Layout",
         RibbonTab::Review => "Review",
         RibbonTab::View => "View",
         RibbonTab::Table => "Table",
@@ -15370,8 +15339,11 @@ fn ribbon_tab_name(tab: RibbonTab) -> &'static str {
 /// no click when it cannot, a split button's menu greys the item, and
 /// `ribbon-read` reports the same. Every ribbon command can run today; a
 /// row menu's items have their own rules (`project_row_menu`).
-fn act_enabled(_act: Act) -> bool {
-    true
+fn act_enabled(act: Act) -> bool {
+    match act {
+        Act::Layout(act) => layout_tab::layout_enabled(act),
+        _ => true,
+    }
 }
 
 /// Find the command in a control whose KeyTip matches `key` (case-insensitive).
@@ -15385,12 +15357,36 @@ fn control_keytip(c: &Control<Act>, key: &str) -> Option<Act> {
         // The primary's letter, then its menu's: Office reaches a split's
         // menu items through the menu, which has no keyboard yet (#397).
         Control::Split { primary, menu } => m(primary).or_else(|| menu.iter().find_map(m)),
+        // A drop-down's letter opens its menu (the button's own command).
+        Control::Dropdown { cmd, .. } => m(cmd),
         Control::Rows(rows) => rows.iter().flatten().find_map(|cell| match cell {
             rs::Cell::Btn(cmd) => m(cmd),
             rs::Cell::Combo { cmd, .. } => m(cmd),
         }),
         _ => None,
     }
+}
+
+/// Whether some command KeyTip on a tab is longer than `typed` and starts
+/// with it, so the next letter can still complete it.
+fn tab_keytip_starts(tab: &rs::Tab<Act>, typed: &str) -> bool {
+    let starts = |cmd: &rs::Cmd<Act>| {
+        cmd.key_tip.len() > typed.len() && cmd.key_tip[..typed.len()].eq_ignore_ascii_case(typed)
+    };
+    tab.groups
+        .iter()
+        .flat_map(|g| g.items.iter())
+        .any(|c| match c {
+            Control::Large(cmd) | Control::Toggle(cmd) | Control::Dropdown { cmd, .. } => {
+                starts(cmd)
+            }
+            Control::Column(cmds) => cmds.iter().any(starts),
+            Control::Split { primary, menu } => starts(primary) || menu.iter().any(starts),
+            Control::Rows(rows) => rows.iter().flatten().any(|cell| match cell {
+                rs::Cell::Btn(cmd) | rs::Cell::Combo { cmd, .. } => starts(cmd),
+            }),
+            _ => false,
+        })
 }
 
 /// Find a command in a tab by its KeyTip letter.
@@ -15520,7 +15516,7 @@ fn group_est(g: &rs::Group<Act>, icon_only: bool) -> f32 {
     for c in &g.items {
         w += match c {
             Control::Toggle(_) => 26.0,
-            Control::Large(_) | Control::Split { .. } => 58.0,
+            Control::Large(_) | Control::Split { .. } | Control::Dropdown { .. } => 58.0,
             Control::Column(_) => {
                 if icon_only {
                     34.0
@@ -15553,7 +15549,6 @@ fn group_est(g: &rs::Group<Act>, icon_only: bool) -> f32 {
                 .fold(0.0_f32, f32::max),
             Control::Gallery(gal) => style_gallery::well_width(gal.items.len()),
             Control::Separator => 10.0,
-            _ => 30.0,
         };
     }
     w.max(44.0)
@@ -16994,6 +16989,15 @@ impl Docxy {
                     },
                     menu::split_menu(menu, act_enabled, |a| self.act_active(a)),
                 )),
+                Control::Dropdown { cmd, .. } if cmd.id == primary_id => Some((
+                    menu::MenuTarget::Ribbon {
+                        id: cmd.id.into(),
+                        tab: tab.name.into(),
+                        group: group.title.into(),
+                        label: cmd.label.into(),
+                    },
+                    layout_tab::menu_items(layout_tab::menu_of(cmd.id)?, |a| self.act_active(a)),
+                )),
                 _ => None,
             })
         })
@@ -17182,6 +17186,7 @@ impl Docxy {
     fn keytip_input(&mut self, c: &str, window: &mut Window, cx: &mut Context<Self>) {
         match self.keytips {
             KeyTip::Tabs => {
+                self.keytip_prefix.clear();
                 if c.eq_ignore_ascii_case("F") {
                     self.keytips = KeyTip::Off;
                     return self.open_backstage(cx);
@@ -17210,7 +17215,16 @@ impl Docxy {
                 cx.notify();
             }
             KeyTip::Commands => {
-                let act = tab_keytip_cmd(&self.active_ribbon_tab_def(), c);
+                // Two-letter tips (Size's SZ): a letter that only starts one
+                // waits for the next.
+                let typed = format!("{}{c}", self.keytip_prefix);
+                let tab = self.active_ribbon_tab_def();
+                let act = tab_keytip_cmd(&tab, &typed);
+                if act.is_none() && tab_keytip_starts(&tab, &typed) {
+                    self.keytip_prefix = typed;
+                    return;
+                }
+                self.keytip_prefix.clear();
                 self.keytips = KeyTip::Off;
                 if let Some(a) = act {
                     self.dispatch(a, window, cx);
@@ -17266,8 +17280,7 @@ impl Docxy {
             EditHeader => self.enter_hf(true, "default", window, cx),
             EditFooter => self.enter_hf(false, "default", window, cx),
             PageNumber => self.insert_field("PAGE", "1", window, cx),
-            Columns => self.cycle_columns(window, cx),
-            Hyphenation => self.toggle_hyphenation(window, cx),
+            Layout(act) => self.layout_act(act, window, cx),
             RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable => {
                 self.table_op(act, window, cx)
             }
@@ -17338,9 +17351,9 @@ impl Docxy {
                 | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide
                 | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField
                 | PageBreak | ToggleNotes | InsertTable | InsertSymbol | InsertEquation
-                | LineSpacing | EditHeader | EditFooter | PageNumber | Columns | Hyphenation
-                | RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable
-                | PrintLayout | ToggleRuler => {}
+                | LineSpacing | EditHeader | EditFooter | PageNumber | Layout(_) | RowAbove
+                | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable | PrintLayout
+                | ToggleRuler => {}
             }),
         }
     }
@@ -19184,6 +19197,7 @@ impl Docxy {
             Control::Toggle(cmd) => self.icon_btn(cmd, false, pal, cx),
             Control::Large(cmd) => self.large_btn(cmd, pal, cx),
             Control::Split { primary, .. } => self.split_btn(primary, pal, cx),
+            Control::Dropdown { cmd, .. } => self.dropdown_btn(cmd, pal, cx),
             Control::Column(cmds) => {
                 // Office caps a button column at 3 rows; extra buttons wrap into
                 // the next column so nothing overflows the ribbon body height.
@@ -19231,7 +19245,6 @@ impl Docxy {
                 .bg(pal.border)
                 .mx_1()
                 .into_any_element(),
-            _ => div().into_any_element(),
         }
     }
 
@@ -19556,6 +19569,75 @@ impl Docxy {
             .into_any_element()
     }
 
+    /// A drop-down button (the Layout tab's Page Setup menus): icon over label
+    /// and a drop-down mark; a press anywhere on it opens its menu, or shuts
+    /// it when it is the one open.
+    fn dropdown_btn(&self, cmd: &rs::Cmd<Act>, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let enabled = act_enabled(cmd.act);
+        let fg = if enabled { pal.fg } else { pal.dim };
+        let tip = cmd_tip_text(cmd);
+        let keytip =
+            (self.keytips == KeyTip::Commands && !cmd.key_tip.is_empty()).then_some(cmd.key_tip);
+        let id = cmd.id;
+        let lines = label_lines(cmd.label);
+        let last = lines.len().saturating_sub(1);
+        let mut label = v_flex().items_center();
+        for (i, ln) in lines.into_iter().enumerate() {
+            let ln = if i == last {
+                format!("{ln} ▾")
+            } else {
+                ln.to_string()
+            };
+            label = label.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(fg)
+                    .child(SharedString::from(ln)),
+            );
+        }
+        div()
+            .id(SharedString::from(format!("{id}-dropdown")))
+            .relative()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_0p5()
+            .px_1()
+            .h_full()
+            .rounded(px(4.))
+            .cursor_pointer()
+            .hover(|d| d.bg(pal.hover))
+            .child(probe(&self.probes, format!("ribbon-split:{id}")))
+            .child(icon_svg(cmd.icon.0, 26., fg))
+            .child(label)
+            .when(enabled, |d| {
+                d.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        let closed = this
+                            .menu_closed_at
+                            .take()
+                            .filter(|(_, at)| *at == ev.position)
+                            .map(|(t, _)| t);
+                        let open = this.menu.as_ref().map(|m| &m.target);
+                        if menu::split_arrow_opens(id, open, closed.as_ref()) {
+                            let at =
+                                split_menu_anchor(&this.probes.borrow(), id).unwrap_or(ev.position);
+                            let _ = this.open_split_menu(id, at, cx);
+                        } else {
+                            this.close_menu();
+                            cx.notify();
+                        }
+                    }),
+                )
+            })
+            .when_some(keytip, |d, k| d.child(keytip_badge(k)))
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .into_any_element()
+    }
+
     /// Whether a toggle command is currently "on" for the caret's formatting, so
     /// the ribbon button can show a pressed state (Word highlights e.g. Bold when
     /// the caret sits in bold text).
@@ -19590,6 +19672,10 @@ impl Docxy {
             ToggleNotes => self.show_notes,
             PrintLayout => self.page_view,
             ToggleRuler => self.show_ruler,
+            Layout(act) => self
+                .tabs
+                .get(self.active)
+                .is_some_and(|t| layout_tab::layout_checked(t, act)),
             _ => false,
         }
     }

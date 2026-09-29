@@ -563,7 +563,7 @@ pub(crate) fn find_element(xml: &str, name: &str) -> Option<(usize, usize)> {
 }
 
 /// Remove the first `name` element (see [`find_element`]).
-pub(crate) fn remove_element(xml: &str, name: &str) -> String {
+pub fn remove_element(xml: &str, name: &str) -> String {
     match find_element(xml, name) {
         Some((a, b)) => format!("{}{}", &xml[..a], &xml[b..]),
         None => xml.to_string(),
