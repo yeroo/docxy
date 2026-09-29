@@ -15987,8 +15987,10 @@ const M_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/math";
 
 /// The final section's `w:sectPr` a tab's page view, header lookup and save all
 /// agree on: the body editor's trailing section properties (undo, redo and
-/// tracked-change rejection move only that copy), else the package's captured
-/// one. `None` for a package-less (Markdown) tab.
+/// tracked-change rejection move only that copy). A body without one has never
+/// had a section command run on it (`edit_final_sect_pr` seeds the editor
+/// first), so the package's captured one is still current and is what Save
+/// appends. `None` for a package-less (Markdown) tab.
 fn final_sect_pr(tab: &DocTab) -> Option<&str> {
     let pkg = tab.pkg.as_ref()?;
     if let Surface::Doc(ed) = &tab.surface {
@@ -16012,6 +16014,9 @@ fn final_page_geom(tab: &DocTab) -> docxcore::model::PageGeom {
 /// document with it). Always the body editor in `tab.surface`, even while a
 /// header/footer is open: that one is a separate `Editor`. `undoable` makes the
 /// mirror its own undo step; otherwise it rides on an earlier checkpoint.
+/// A body without its own trailing section is first given the package's, with
+/// no checkpoint, so undo restores it explicitly: otherwise undo would drop the
+/// section and reads and Save would fall back to the package's edited copy.
 /// `None` for a package-less tab.
 fn edit_final_sect_pr<R>(
     tab: &mut DocTab,
@@ -16023,11 +16028,11 @@ fn edit_final_sect_pr<R>(
         Surface::Doc(ed) => Some(ed),
         _ => None,
     };
-    if let Some(section) = editor
-        .as_ref()
-        .and_then(|ed| ed.doc.trailing_section_properties())
-    {
-        pkg.set_trailing_section(section.clone());
+    if let Some(ed) = editor.as_mut() {
+        match ed.doc.trailing_section_properties() {
+            Some(section) => pkg.set_trailing_section(section.clone()),
+            None => ed.doc.set_trailing_section_properties(pkg.final_section()),
+        }
     }
     let out = edit(pkg);
     if let (Some(ed), Some(section)) = (editor.as_mut(), pkg.document.trailing_section_properties())

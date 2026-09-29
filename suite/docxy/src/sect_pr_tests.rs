@@ -181,3 +181,59 @@ fn reads_follow_the_editor_after_undoing_a_header_creation() {
     let saved = save_and_reload(&mut t);
     assert!(saved.sect_pr().contains("headerReference"));
 }
+
+/// A clean tab on a .docx whose body has no `w:sectPr` at all.
+fn tab_without_sect_pr() -> DocTab {
+    let t = tab_from_path(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures/basic.docx"),
+    );
+    assert!(editor(&t).doc.trailing_section_properties().is_none());
+    assert!(!t.pkg.as_ref().unwrap().sect_pr().contains("w:cols w:num"));
+    t
+}
+
+#[test]
+fn undoing_columns_on_a_document_without_a_sect_pr_is_undone_for_reads_and_save() {
+    let mut t = tab_without_sect_pr();
+    cycle_columns_tab(&mut t);
+    assert_eq!(final_page_geom(&t).cols, 2);
+    assert!(editor_mut(&mut t).undo());
+    let sect = final_sect_pr(&t).unwrap();
+    assert!(!sect.contains("w:num"), "{sect}");
+    assert_eq!(final_page_geom(&t).cols, 1);
+    let saved = save_and_reload(&mut t);
+    assert_eq!(saved.columns(), 1, "{}", saved.sect_pr());
+    cycle_columns_tab(&mut t);
+    assert_eq!(t.status.as_ref(), "Columns: 2");
+}
+
+#[test]
+fn undoing_a_ruler_drag_on_a_document_without_a_sect_pr_takes_one_step() {
+    let mut t = tab_without_sect_pr();
+    let before = final_page_geom(&t);
+    assert!(set_page_margins_tab(&mut t, true, (1440, 1080, 1440, 1800)));
+    assert!(set_page_margins_tab(&mut t, false, (1440, 720, 1440, 2160)));
+    assert!(editor_mut(&mut t).undo());
+    let after = final_page_geom(&t);
+    assert_eq!((after.ml, after.mr), (before.ml, before.mr));
+    let saved = save_and_reload(&mut t);
+    let geom = saved.page_geom();
+    assert_eq!((geom.ml, geom.mr), (before.ml, before.mr));
+}
+
+#[test]
+fn undoing_a_header_creation_on_a_document_without_a_sect_pr_leaves_no_reference() {
+    let mut t = tab_without_sect_pr();
+    assert!(open_hf_tab(&mut t, true, "default"));
+    t.hf_edit.as_mut().unwrap().editor.insert_str("HDR");
+    exit_hf_tab(&mut t);
+    assert!(final_sect_pr(&t).unwrap().contains("headerReference"));
+    assert!(editor_mut(&mut t).undo());
+    assert!(!final_sect_pr(&t).unwrap().contains("headerReference"));
+    let saved = save_and_reload(&mut t);
+    assert!(
+        !saved.sect_pr().contains("headerReference"),
+        "{}",
+        saved.sect_pr()
+    );
+}
