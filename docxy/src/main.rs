@@ -9151,6 +9151,25 @@ mod tests {
     }
 
     #[test]
+    fn columns_on_a_document_with_its_own_sect_pr_survive_save() {
+        let mut app = app_with_trailing_sect_pr();
+        let dir = std::env::temp_dir().join(format!("docxy-cols-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        app.path = dir.join("t.docx").to_string_lossy().into_owned();
+        app.run_act(ribbon::Act::Columns);
+        app.save();
+        let bytes = std::fs::read(dir.join("t.docx")).expect("saved");
+        let reloaded = docxcore::package::load_package(&bytes).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            reloaded.sect_pr().contains("w:num=\"2\""),
+            "{}",
+            reloaded.sect_pr()
+        );
+    }
+
+    #[test]
     fn inserting_a_section_mirrors_the_final_sect_pr_and_undo_restores_it() {
         let mut app = app_with_trailing_sect_pr();
         let before = app.editor.doc.trailing_section_properties().cloned();

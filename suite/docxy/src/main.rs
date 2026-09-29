@@ -33,6 +33,8 @@ mod project;
 mod recover;
 #[cfg(test)]
 mod ribbon_export;
+#[cfg(test)]
+mod sect_pr_tests;
 mod style_gallery;
 mod tabstrip;
 use project::*;
@@ -2546,6 +2548,7 @@ mod ruler_geom_tests {
                 content_right: 900.0,
                 page_x: 100.0,
                 page_right: 100.0 + tw_px(PageGeom::default().w, zoom),
+                sect_checkpointed: false,
             };
             let pointer = 200.0 + 24.0 * zoom;
             let first = ruler_drag_result(d, pointer);
@@ -2688,6 +2691,9 @@ struct RulerDrag {
     content_right: f32,
     page_x: f32,
     page_right: f32,
+    /// A margin drag already took its undo checkpoint on the body editor, so
+    /// later moves of the same drag ride on it.
+    sect_checkpointed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2962,7 +2968,7 @@ fn is_markdown_path(path: &std::path::Path) -> bool {
 fn load_bytes(bytes: &[u8]) -> Loaded {
     match docxcore::package::load_package(bytes) {
         Ok(pkg) => Loaded {
-            doc: pkg.document.clone(),
+            doc: with_final_section(pkg.document.clone(), &pkg),
             comments: docxcore::comments::parse_comments(&pkg),
             notes: docxcore::notes::parse_notes(&pkg),
             pkg: Some(pkg),
@@ -11261,31 +11267,9 @@ impl Docxy {
         if !matches!(tab.surface, Surface::Doc(_)) {
             return;
         }
-        let Some(pkg) = tab.pkg.as_mut() else {
-            tab.status = "Headers/footers need a .docx (not a Markdown document)".into();
+        if !open_hf_tab(tab, is_header, variant) {
             return self.refocus(window, cx);
-        };
-        let part_name = match hf_part_name_typed(pkg, is_header, variant) {
-            Some(n) => n,
-            None => match pkg.create_hf(is_header, variant) {
-                Some(n) => {
-                    tab.dirty = true;
-                    n
-                }
-                None => {
-                    tab.status = "Could not create the header/footer part".into();
-                    return self.refocus(window, cx);
-                }
-            },
-        };
-        let blocks = parse_hf_part(pkg, &part_name);
-        let doc = docxcore::model::Document { body: blocks };
-        tab.hf_edit = Some(HfEdit {
-            editor: Editor::new(doc),
-            part_name,
-            is_header,
-            variant,
-        });
+        }
         self.page_view = true;
         if let Some(t) = self.tabs.get_mut(idx) {
             let region = if is_header { "header" } else { "footer" };
@@ -11299,6 +11283,101 @@ impl Docxy {
         }
         self.refocus(window, cx);
     }
+}
+
+/// Open a document tab's header (or footer) `variant` for editing: resolve the
+/// part the final section references, or create one. Creating it adds a
+/// reference to the section, mirrored into the body editor as one undo step
+/// so Save keeps it. False (with the reason in the status) when the tab has
+/// no package or the part could not be created.
+fn open_hf_tab(tab: &mut DocTab, is_header: bool, variant: &'static str) -> bool {
+    let Some(pkg) = tab.pkg.as_ref() else {
+        tab.status = "Headers/footers need a .docx (not a Markdown document)".into();
+        return false;
+    };
+    let existing =
+        final_sect_pr(tab).and_then(|sect| hf_part_name_typed(pkg, sect, is_header, variant));
+    let part_name = match existing {
+        Some(n) => n,
+        None => match edit_final_sect_pr(tab, true, |pkg| pkg.create_hf(is_header, variant)) {
+            Some(Some(n)) => {
+                tab.dirty = true;
+                n
+            }
+            _ => {
+                tab.status = "Could not create the header/footer part".into();
+                return false;
+            }
+        },
+    };
+    let Some(pkg) = tab.pkg.as_ref() else {
+        return false;
+    };
+    let blocks = parse_hf_part(pkg, &part_name);
+    let doc = docxcore::model::Document { body: blocks };
+    tab.hf_edit = Some(HfEdit {
+        editor: Editor::new(doc),
+        part_name,
+        is_header,
+        variant,
+    });
+    true
+}
+
+/// Toggle "Different First Page" (`<w:titlePg/>`) in a tab's final section,
+/// mirrored into the body editor as one undo step. The new state; false for a
+/// package-less tab.
+fn toggle_title_pg_tab(tab: &mut DocTab) -> bool {
+    let Some(on) = edit_final_sect_pr(tab, true, |pkg| {
+        let on = !pkg.has_title_pg();
+        pkg.set_title_pg(on);
+        on
+    }) else {
+        return false;
+    };
+    tab.dirty = true;
+    on
+}
+
+/// Cycle a tab's final-section newspaper columns 1 → 2 → 3 → 1, mirrored into
+/// the body editor as one undo step.
+fn cycle_columns_tab(tab: &mut DocTab) {
+    let next = edit_final_sect_pr(tab, true, |pkg| {
+        let next = match pkg.columns() {
+            1 => 2,
+            2 => 3,
+            _ => 1,
+        };
+        pkg.set_columns(next);
+        next
+    });
+    match next {
+        Some(next) => {
+            tab.dirty = true;
+            tab.status = format!("Columns: {next}").into();
+        }
+        None => tab.status = "Columns need a .docx (not Markdown)".into(),
+    }
+}
+
+/// Set a tab's final-section page margins (twips) from a ruler drag. The first
+/// change of a drag (`checkpoint`) is its own undo step and the later ones
+/// ride on it, so one drag undoes at once. Whether the section changed.
+fn set_page_margins_tab(
+    tab: &mut DocTab,
+    checkpoint: bool,
+    (top, right, bottom, left): (i32, i32, i32, i32),
+) -> bool {
+    let before = final_sect_pr(tab).map(str::to_owned);
+    if edit_final_sect_pr(tab, checkpoint, |pkg| {
+        pkg.set_page_margins(top, right, bottom, left)
+    })
+    .is_none()
+    {
+        return false;
+    }
+    tab.dirty = true;
+    final_sect_pr(tab).map(str::to_owned) != before
 }
 
 /// Serialize a tab's open header/footer editor, leaving the edit session open.
@@ -11461,14 +11540,7 @@ impl Docxy {
     fn toggle_title_pg(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.flush_hf();
         let idx = self.active;
-        let mut on = false;
-        if let Some(tab) = self.tabs.get_mut(idx) {
-            if let Some(pkg) = tab.pkg.as_mut() {
-                on = !pkg.has_title_pg();
-                pkg.set_title_pg(on);
-                tab.dirty = true;
-            }
-        }
+        let on = self.tabs.get_mut(idx).is_some_and(toggle_title_pg_tab);
         if !on {
             if let Some((is_h, "first")) = self
                 .tabs
@@ -11518,8 +11590,8 @@ impl Docxy {
             .map(|h| (h.is_header, h.variant))
             .unwrap_or((true, "default"));
         let title_pg = tab
-            .and_then(|t| t.pkg.as_ref())
-            .is_some_and(|p| p.has_title_pg());
+            .and_then(final_sect_pr)
+            .is_some_and(|sect| sect.contains("<w:titlePg"));
         let even_odd = tab
             .and_then(|t| t.pkg.as_ref())
             .is_some_and(|p| p.has_even_odd());
@@ -12177,18 +12249,7 @@ impl Docxy {
     /// out in columns.
     fn cycle_columns(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get_mut(self.active) {
-            if let Some(pkg) = tab.pkg.as_mut() {
-                let next = match pkg.columns() {
-                    1 => 2,
-                    2 => 3,
-                    _ => 1,
-                };
-                pkg.set_columns(next);
-                tab.dirty = true;
-                tab.status = format!("Columns: {next}").into();
-            } else {
-                tab.status = "Columns need a .docx (not Markdown)".into();
-            }
+            cycle_columns_tab(tab);
         }
         self.refocus(window, cx);
     }
@@ -12768,8 +12829,7 @@ impl Docxy {
         let geom = self
             .tabs
             .get(self.active)
-            .and_then(|t| t.pkg.as_ref())
-            .map(|p| p.page_geom())
+            .map(final_page_geom)
             .unwrap_or_default();
         self.ruler_drag = Some(RulerDrag {
             handle,
@@ -12781,6 +12841,7 @@ impl Docxy {
             content_right: g.content_right,
             page_x: g.page_x,
             page_right: g.page_right,
+            sect_checkpointed: false,
         });
         self.ruler_guide = Some(x); // guide starts under the pointer
         cx.notify();
@@ -12802,9 +12863,11 @@ impl Docxy {
             }
             RulerChange::Margins { left, right } => {
                 if let Some(t) = self.tabs.get_mut(self.active) {
-                    if let Some(pkg) = t.pkg.as_mut() {
-                        pkg.set_page_margins(d.page.mt, right, d.page.mb, left);
-                        t.dirty = true;
+                    let margins = (d.page.mt, right, d.page.mb, left);
+                    if set_page_margins_tab(t, !d.sect_checkpointed, margins) {
+                        if let Some(drag) = self.ruler_drag.as_mut() {
+                            drag.sect_checkpointed = true;
+                        }
                     }
                 }
             }
@@ -15922,10 +15985,85 @@ const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main
 const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const M_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/math";
 
+/// Give a loaded body document a final `SectionProperties` when it has none
+/// (its package's captured one, else an empty `<w:sectPr></w:sectPr>`), as
+/// terminal docxy does, so every undo snapshot carries the final section it was
+/// taken with and undoing a section command never falls back to the package's
+/// edited copy.
+fn with_final_section(mut doc: Document, pkg: &Package) -> Document {
+    if doc.trailing_section_properties().is_none() {
+        doc.set_trailing_section_properties(pkg.final_section());
+    }
+    doc
+}
+
+/// The final section's `w:sectPr` a tab's page view, header lookup and save all
+/// agree on: the body editor's trailing section properties (undo, redo and
+/// tracked-change rejection move only that copy). Every body loaded with a
+/// package has one (`with_final_section`); the package's is a fallback only.
+/// `None` for a package-less (Markdown) tab.
+fn final_sect_pr(tab: &DocTab) -> Option<&str> {
+    let pkg = tab.pkg.as_ref()?;
+    if let Surface::Doc(ed) = &tab.surface {
+        if let Some(section) = ed.doc.trailing_section_properties() {
+            return Some(&section.raw);
+        }
+    }
+    Some(pkg.sect_pr())
+}
+
+/// Page size/margins of a tab's final section (US Letter default).
+fn final_page_geom(tab: &DocTab) -> docxcore::model::PageGeom {
+    final_sect_pr(tab)
+        .map(docxcore::model::PageGeom::from_sect_pr)
+        .unwrap_or_default()
+}
+
+/// Run a package edit of the final section's `w:sectPr` against the body
+/// editor's current copy, then mirror the result back into that editor's
+/// document, the one Save writes (`doc_to_docx` replaces the package's
+/// document with it). Always the body editor in `tab.surface`, even while a
+/// header/footer is open: that one is a separate `Editor`. `undoable` makes the
+/// mirror its own undo step; otherwise it rides on an earlier checkpoint.
+/// A body without its own trailing section (loading seeds one, so only a tab
+/// built some other way) is first given the package's, with no checkpoint, so
+/// at least the undo of this edit restores it explicitly.
+/// `None` for a package-less tab.
+fn edit_final_sect_pr<R>(
+    tab: &mut DocTab,
+    undoable: bool,
+    edit: impl FnOnce(&mut Package) -> R,
+) -> Option<R> {
+    let pkg = tab.pkg.as_mut()?;
+    let mut editor = match &mut tab.surface {
+        Surface::Doc(ed) => Some(ed),
+        _ => None,
+    };
+    if let Some(ed) = editor.as_mut() {
+        match ed.doc.trailing_section_properties() {
+            Some(section) => pkg.set_trailing_section(section.clone()),
+            None => ed.doc.set_trailing_section_properties(pkg.final_section()),
+        }
+    }
+    let out = edit(pkg);
+    if let (Some(ed), Some(section)) = (editor.as_mut(), pkg.document.trailing_section_properties())
+    {
+        if ed.doc.trailing_section_properties() != Some(section) {
+            let section = section.clone();
+            if undoable {
+                ed.set_trailing_section_properties(section);
+            } else {
+                ed.doc.set_trailing_section_properties(section);
+            }
+        }
+    }
+    Some(out)
+}
+
 /// Resolve the package part name (e.g. `word/header1.xml`) backing a specific
-/// header/footer reference type (`"default"`, `"first"`, `"even"`).
-fn hf_part_name_typed(pkg: &Package, is_header: bool, wtype: &str) -> Option<String> {
-    let sect = pkg.sect_pr();
+/// header/footer reference type (`"default"`, `"first"`, `"even"`) in `sect`
+/// (the final section's `w:sectPr`, see [`final_sect_pr`]).
+fn hf_part_name_typed(pkg: &Package, sect: &str, is_header: bool, wtype: &str) -> Option<String> {
     let kind = if is_header {
         "headerReference"
     } else {
@@ -15939,8 +16077,13 @@ fn hf_part_name_typed(pkg: &Package, is_header: bool, wtype: &str) -> Option<Str
 }
 
 /// Blocks of a specific header/footer variant, or empty if that ref is absent.
-fn header_footer_blocks_typed(pkg: &Package, is_header: bool, wtype: &str) -> Vec<Block> {
-    match hf_part_name_typed(pkg, is_header, wtype) {
+fn header_footer_blocks_typed(
+    pkg: &Package,
+    sect: &str,
+    is_header: bool,
+    wtype: &str,
+) -> Vec<Block> {
+    match hf_part_name_typed(pkg, sect, is_header, wtype) {
         Some(name) => parse_hf_part(pkg, &name),
         None => vec![],
     }
@@ -20375,7 +20518,7 @@ impl Render for Docxy {
                     if self.page_view {
                         // Print Layout: split the body into discrete white page sheets
                         // (section margins), stacked on a grey canvas.
-                        let geom = tab.pkg.as_ref().map(|p| p.page_geom()).unwrap_or_default();
+                        let geom = final_page_geom(tab);
                         let zoom = self.zoom;
                         let tw = move |t: i32| px(zoom * (t.max(0) as f32) / 15.0); // twips → px @ ~96dpi, zoomed
                         let canvas = if self.applied == Some(ThemeMode::Dark) {
@@ -20413,14 +20556,14 @@ impl Render for Docxy {
                         // Per-page header/footer. A section can carry distinct
                         // first-page (w:titlePg) and even-page (evenAndOddHeaders)
                         // variants; every other page uses the "default" one.
+                        // The section is the body editor's (see `final_sect_pr`),
+                        // so an undone header or titlePg shows as undone.
                         let pkg = tab.pkg.as_ref();
-                        let title_pg = pkg.is_some_and(|p| p.has_title_pg());
+                        let sect = final_sect_pr(tab).unwrap_or_default();
+                        let title_pg = sect.contains("<w:titlePg");
                         let even_odd = pkg.is_some_and(|p| p.has_even_odd());
                         let refp = |kind: &str, wt: &str| {
-                            pkg.is_some_and(|p| {
-                                docxcore::load::header_footer_ref_rid(p.sect_pr(), kind, wt)
-                                    .is_some()
-                            })
+                            docxcore::load::header_footer_ref_rid(sect, kind, wt).is_some()
                         };
                         let (h_first_ref, h_even_ref) = (
                             refp("headerReference", "first"),
@@ -20431,7 +20574,7 @@ impl Render for Docxy {
                             refp("footerReference", "even"),
                         );
                         let parse = |is_h: bool, wt: &str| {
-                            pkg.map(|p| header_footer_blocks_typed(p, is_h, wt))
+                            pkg.map(|p| header_footer_blocks_typed(p, sect, is_h, wt))
                                 .unwrap_or_default()
                         };
                         let (hdef, hfirst, heven) = (
@@ -20772,7 +20915,7 @@ impl Render for Docxy {
             .and_then(|tab| match &tab.surface {
                 Surface::Doc(ed) => {
                     let words = ed.doc.plain_text().split_whitespace().count();
-                    let geom = tab.pkg.as_ref().map(|p| p.page_geom()).unwrap_or_default();
+                    let geom = final_page_geom(tab);
                     let ch = (geom.h - geom.mt - geom.mb).max(1) as f32 / 15.0;
                     let cw = (geom.w - geom.ml - geom.mr).max(1) as f32 / 15.0;
                     let pages = paginate(&ed.doc.body, ch, cw).len().max(1);
