@@ -30,7 +30,7 @@ fn decode_xml_entities(s: &str) -> String {
 /// Decode an OPC XML part in one of the encodings XML processors must
 /// recognize without an external declaration. OOXML normally uses UTF-8, but
 /// valid packages may use UTF-16LE/BE for individual XML parts.
-fn decode_xml_part(bytes: &[u8]) -> Option<Cow<'_, str>> {
+pub(crate) fn decode_xml_part(bytes: &[u8]) -> Option<Cow<'_, str>> {
     if let Some(utf8) = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]) {
         return std::str::from_utf8(utf8).ok().map(Cow::Borrowed);
     }
@@ -496,7 +496,7 @@ fn parse_protection(xml: &str) -> Protection {
     protection
 }
 
-fn resolve_document_relationship_target(target: &str) -> Option<String> {
+pub(crate) fn resolve_document_relationship_target(target: &str) -> Option<String> {
     if target.contains('\\') || target.contains("://") {
         return None;
     }
@@ -869,6 +869,14 @@ impl Package {
                 matches!(b, crate::model::Block::Paragraph(p)
                     if p.props.section_break.as_deref().is_some_and(|s| s.contains("<w:pgBorders")))
             })
+    }
+
+    /// The main document part's raw bytes (`word/document.xml` or wherever the
+    /// package relationship points).
+    pub(crate) fn document_part(&self) -> Option<&[u8]> {
+        self.parts
+            .get(self.doc_index)
+            .map(|(_, bytes)| bytes.as_slice())
     }
 
     /// The raw bytes of a part by name.

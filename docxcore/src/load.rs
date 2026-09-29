@@ -70,6 +70,12 @@ impl Relationships {
     pub fn len(&self) -> usize {
         self.map.len()
     }
+    /// Every relationship as `(id, target, external)`, in no particular order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str, bool)> {
+        self.map
+            .iter()
+            .map(|(id, (target, external))| (id.as_str(), target.as_str(), *external))
+    }
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
