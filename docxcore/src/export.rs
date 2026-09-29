@@ -1415,8 +1415,16 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Se
                 } else {
                     text.as_str()
                 };
+                // The result's own formatting (#642: a complex field's result
+                // runs are inside the Field).
+                let props = crate::load::field_result_props(raw);
+                let eff = styles.effective_run(pstyle, props.style_id.as_deref(), &props);
                 for (i, ch) in text.chars().enumerate() {
                     let mut cell = plain_cell(ch);
+                    cell.font = font_index(eff.bold || heading, eff.italic);
+                    cell.color = run_color(&eff);
+                    cell.underline = eff.underline;
+                    cell.strike = eff.strike;
                     cell.field = kind.map(|k| (k, i == 0));
                     push(&mut segs, cell);
                 }
@@ -1786,6 +1794,24 @@ mod tests {
         let text = s(&to_pdf(&d, &PdfOptions::default()));
         // bold = font index 1 = /F1
         assert!(text.contains("/F1"));
+    }
+
+    #[test]
+    fn a_fields_bold_result_uses_the_bold_font_642() {
+        let d = crate::load::parse_document_xml(
+            "<w:document><w:body><w:p><w:r><w:fldChar w:fldCharType=\"begin\"/></w:r><w:r><w:instrText> PAGE </w:instrText></w:r><w:r><w:fldChar w:fldCharType=\"separate\"/></w:r><w:r><w:rPr><w:b/></w:rPr><w:t>1</w:t></w:r><w:r><w:fldChar w:fldCharType=\"end\"/></w:r></w:p></w:body></w:document>",
+            &crate::load::Relationships::default(),
+        );
+        assert!(
+            matches!(&d.body[0], Block::Paragraph(p) if matches!(p.content[0], Inline::Field { .. }))
+        );
+        let text = s(&to_pdf(&d, &PdfOptions::default()));
+        let shown = text
+            .find("(1) Tj")
+            .or_else(|| text.find("(1)"))
+            .expect("the result is drawn");
+        let font = text[..shown].rfind("BT /F").expect("a font is set");
+        assert_eq!(&text[font..font + 6], "BT /F1", "the result is bold");
     }
 
     #[test]

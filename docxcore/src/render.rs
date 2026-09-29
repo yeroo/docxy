@@ -1647,12 +1647,22 @@ fn flatten_para(
             // offset (#642): every glyph carries it, so the caret stops only
             // before and after the whole result, a click anywhere in it snaps
             // to one of those, and selecting the offset highlights all of it.
-            // Its spaces don't break, so the result never wraps mid-field.
-            Inline::Field { text, .. } => {
-                let mut st = Style::default();
+            // Its spaces don't break, so the result never wraps mid-field. It
+            // shows in its result's formatting, like the runs it was loaded from.
+            Inline::Field { raw, text } => {
+                let props = crate::load::field_result_props(raw);
+                let eff = opts.styles.effective_run(
+                    para.props.style_id.as_deref(),
+                    props.style_id.as_deref(),
+                    &props,
+                );
+                let mut st = style_from_run(&eff);
                 if fi.link.is_some() {
                     st.underline = true;
                     st.color = Some(Color::Cyan);
+                }
+                if heading {
+                    st.bold = true;
                 }
                 st.highlight |= sel_at(mc);
                 for ch in text.chars() {
@@ -1678,13 +1688,19 @@ fn flatten_para(
             // field inside it (loaded as one unit, #642) gets the cue here.
             Inline::Revision { kind, content, .. } => {
                 for inner in content {
-                    if let Inline::Field { text, .. } = inner {
-                        let st = Style {
-                            underline: *kind == RevisionKind::Insert || fi.link.is_some(),
-                            strike: *kind == RevisionKind::Delete,
-                            color: fi.link.as_ref().map(|_| Color::Cyan),
-                            ..Style::default()
-                        };
+                    if let Inline::Field { raw, text } = inner {
+                        let props = crate::load::field_result_props(raw);
+                        let eff = opts.styles.effective_run(
+                            para.props.style_id.as_deref(),
+                            props.style_id.as_deref(),
+                            &props,
+                        );
+                        let mut st = style_from_run(&eff);
+                        st.underline |= *kind == RevisionKind::Insert || fi.link.is_some();
+                        st.strike |= *kind == RevisionKind::Delete;
+                        if fi.link.is_some() {
+                            st.color = Some(Color::Cyan);
+                        }
                         for ch in text.chars() {
                             segs.last_mut().unwrap().glyphs.push(Glyph {
                                 ch,
@@ -4408,6 +4424,45 @@ mod tests {
             .map(|s| s.text.as_str())
             .collect();
         assert_eq!(highlighted, "Page 1");
+    }
+
+    #[test]
+    fn a_field_shows_its_results_formatting_642() {
+        let field = |props: &str| Inline::Field {
+            raw: format!(
+                "<w:fldSimple w:instr=\" PAGE \"><w:r><w:rPr>{props}</w:rPr><w:t>7</w:t></w:r></w:fldSimple>"
+            ),
+            text: "7".into(),
+        };
+        let style_of = |d: &Document| {
+            render(d, &opts(40))[0]
+                .spans
+                .iter()
+                .find(|s| s.text.contains('7'))
+                .expect("the result is drawn")
+                .style
+                .clone()
+        };
+        let d = doc(vec![para(vec![
+            run("p ", RunProps::default()),
+            field("<w:b/>"),
+        ])]);
+        assert!(style_of(&d).bold, "a bold result renders bold");
+        let d = doc(vec![para(vec![
+            run("p ", RunProps::default()),
+            field("<w:vanish/>"),
+        ])]);
+        assert!(
+            style_of(&d).dim,
+            "a hidden result is drawn as hidden text is"
+        );
+        let mut heading = Paragraph {
+            props: ParProps::default(),
+            content: vec![run("Figure ", RunProps::default()), field("")],
+        };
+        heading.props.heading_level = Some(1);
+        let d = doc(vec![Block::Paragraph(heading)]);
+        assert!(style_of(&d).bold, "a field in a heading is bold");
     }
 
     #[test]

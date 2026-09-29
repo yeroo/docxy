@@ -326,7 +326,18 @@ impl SegWriter<'_, '_> {
                 }
                 self.atom("rev", width, &text, &extra);
             }
-            Inline::Field { text, .. } => self.atom("field", width, text, ""),
+            // Drawn in its result's formatting (the same keys a text run has).
+            Inline::Field { raw, text } => {
+                let direct = docxcore::load::field_result_props(raw);
+                let eff = self.ctx.styles.effective_run(
+                    self.para_style,
+                    direct.style_id.as_deref(),
+                    &direct,
+                );
+                let mut props = String::new();
+                push_props(&mut props, &eff, &direct);
+                self.atom("field", width, text, &props);
+            }
             Inline::Equation { text, .. } => self.atom("eq", width, text, ""),
             Inline::SmartArt { text, .. } => self.atom("art", width, &text.join(" · "), ""),
             Inline::Chart { chart, .. } => {

@@ -2051,6 +2051,21 @@ mod tests {
             d.contains(r#"{"k":"field","o":4,"w":1,"#),
             "field atom: {d}"
         );
+        // In its result's formatting, like a text run.
+        let doc = docxcore::load::parse_document_xml(
+            &xml.replace(
+                "<w:r><w:t>1</w:t></w:r>",
+                "<w:r><w:rPr><w:b/></w:rPr><w:t>1</w:t></w:r>",
+            ),
+            &Default::default(),
+        );
+        let bold = Session::open(&save_package(&new_package(doc))).expect("open");
+        assert!(
+            bold.doc_json()
+                .contains(r#"{"k":"field","o":4,"w":1,"x":"1","b":true"#),
+            "{}",
+            bold.doc_json()
+        );
         s.exec_json("select\t0\t5\t0\t5");
         let r = s.exec_json("backspace");
         assert!(
