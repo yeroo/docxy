@@ -51,6 +51,9 @@ pub(crate) enum ProjectAct {
     FindNext,
     /// Delete key: clear the active cell (the task itself on the ID column).
     ClearCell,
+    /// Ctrl+Delete: clear the active cell, or reset it to its default; never
+    /// deletes the task.
+    ResetCell,
     /// Ctrl+C / Ctrl+X / Ctrl+V on the cursor cell (see `clip.rs`).
     Copy,
     Cut,
@@ -648,6 +651,7 @@ pub(crate) fn key_act(key: &str, m: Modifiers) -> Option<ProjectAct> {
             "c" if !m.shift => Some(Copy),
             "x" if !m.shift => Some(Cut),
             "v" if !m.shift => Some(Paste),
+            "delete" if !m.shift => Some(ResetCell),
             _ => None,
         };
     }
@@ -899,6 +903,11 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                         }
                         _ => status = Some(format!("{} can't be cleared", COLUMNS[v.col])),
                     }
+                }
+            }
+            ResetCell => {
+                if let Some(uid) = v.selected_uid() {
+                    status = reset_cell(&mut v.ed, uid, v.col)?;
                 }
             }
             Milestone => {

@@ -271,6 +271,39 @@ pub(crate) fn apply_cell(
     }
     Ok(None)
 }
+/// Ctrl+Delete on task `uid`'s `col`: clear the field, or reset it to what a
+/// new task gets where it cannot be empty (a milestone's Duration becomes a
+/// day). Never deletes the task, and a blank row stays blank. A status line
+/// when the field has nothing to reset to.
+pub(crate) fn reset_cell(
+    ed: &mut ProjectEditor,
+    uid: i32,
+    col: usize,
+) -> Result<Option<String>, String> {
+    let task = ed.project().task(uid).ok_or("No task selected")?;
+    // Before every column: a mode or duration would make the row a task.
+    if task.is_null {
+        return Ok(None);
+    }
+    match col {
+        COL_NAME | COL_PREDECESSORS | COL_RESOURCES => apply_cell(ed, uid, col, ""),
+        COL_DURATION => {
+            if summary_read_only(task, col) {
+                return Err("Summary dates and duration are read-only".into());
+            }
+            let proj = ed.project();
+            let (min, estimated) = (proj.days_to_minutes(1.0), proj.new_tasks_estimated());
+            ed.set_duration_min(uid, min, estimated)?;
+            Ok(None)
+        }
+        COL_MODE => {
+            let manual = ed.project().new_tasks_are_manual;
+            ed.set_manual(uid, manual)?;
+            Ok(None)
+        }
+        _ => Ok(Some(format!("{} can't be cleared", COLUMNS[col]))),
+    }
+}
 /// Commit before changing focus or dispatching commands. Failure preserves edit and selection.
 pub(crate) fn commit_project_cell(tab: &mut DocTab) -> bool {
     let Surface::Project(v) = &mut tab.surface else {
