@@ -22,3 +22,212 @@ test f2 escape then typing the same text still commits
   key enter
   assert dirty is true
   assert sel is A2
+
+# #662 step 1: F2 while typing switches to Edit mode and keeps the text;
+# Ctrl+Left and Ctrl+Delete then edit it word-wise.
+test f2 while typing keeps the entry
+  open copy:../fixtures/basic.xlsx
+  click A7
+  type one two three
+  key f2
+  assert editing is true
+  assert edit is one two three
+  key ctrl+left ctrl+delete
+  type X
+  assert edit is one two X
+
+# #662 step 2: Insert toggles overtype for the editor session.
+test insert overtypes
+  open copy:../fixtures/basic.xlsx
+  click A8
+  type abcd
+  key enter
+  click A8
+  key f2 home insert
+  type XY
+  assert edit is XYcd
+  key enter
+  assert cell A8 is XYcd
+
+# #662 step 3: Alt+Enter is a line feed in the entry, not a commit.
+test alt enter inserts a line feed
+  open copy:../fixtures/basic.xlsx
+  click A9
+  type ab
+  key alt+enter
+  assert editing is true
+  assert sel is A9
+  type cd
+  key enter
+  assert editing is false
+  assert sel is A10
+
+# #662 step 4: Backspace opens an empty editor; Esc gives the content back.
+test backspace opens an empty editor
+  open copy:../fixtures/basic.xlsx
+  click E1
+  type Alpha
+  key enter
+  click E1
+  key backspace
+  assert editing is true
+  assert cell E1 is Alpha
+  key escape
+  assert editing is false
+  assert cell E1 is Alpha
+
+# #662 step 5: Ctrl+Z while editing undoes only the typing.
+test ctrl z while editing undoes the typing only
+  open copy:../fixtures/basic.xlsx
+  click E2
+  type 1
+  key enter
+  click F2
+  type abc
+  key ctrl+z
+  assert editing is true
+  assert cell E2 is 1
+  type Z
+  assert edit is Z
+
+# Enter mode: an arrow commits and moves; while a formula is typed it moves
+# the caret instead, so a half-typed formula is never committed.
+test enter mode arrows commit but not a half-typed formula
+  open copy:../fixtures/basic.xlsx
+  click A11
+  type xyz
+  key right
+  assert editing is false
+  assert sel is B11
+  assert cell A11 is xyz
+  click A12
+  type =1+
+  key left
+  assert editing is true
+  assert sel is A12
+  key escape
+
+# #653 #654 #599: typed entries are read the way Excel reads them.
+test typed entries are recognised
+  open copy:../fixtures/basic.xlsx
+  click R3
+  type '007
+  key enter
+  assert cell R3 is 007
+  call cell {"cell":"R3"}
+  assert reply.value is '007
+  type 1,234
+  key enter
+  assert cell R4 is 1,234
+  type $1,234.56
+  key enter
+  assert cell R5 is $1,234.56
+  type 12.5%
+  key enter
+  assert cell R6 is 12.50%
+  type 9:30 PM
+  key enter
+  assert cell R7 is 9:30 PM
+
+# #673: a negative number in a date format fills the cell with hash marks
+# (the harness reads a hash as a comment, so the case says what it is not:
+# the General "-1" it showed before, or blank).
+test a negative date shows hashes
+  open copy:../fixtures/basic.xlsx
+  click R1
+  type 1/15/2024
+  key enter
+  assert cell R1 is 1/15/2024
+  click R1
+  type =DATE(2024,1,1)-DATE(2024,1,2)
+  key enter
+  assert cell R1 is not -1
+  assert cell R1 is not empty
+
+# #663: Ctrl+Enter fills the selection and keeps it.
+test ctrl enter fills the selection
+  open copy:../fixtures/basic.xlsx
+  click G1
+  type 1
+  key enter
+  type 2
+  key enter
+  type 3
+  key enter
+  click H3
+  key shift+up shift+up
+  assert range is H1:H3
+  type =G1*10
+  key ctrl+enter
+  assert editing is false
+  assert range is H1:H3
+  assert cell H1 is 10
+  assert cell H3 is 30
+
+# #663: Ctrl+' copies the formula above, Ctrl+Shift+" its value.
+test ctrl quote copies from the cell above
+  open copy:../fixtures/basic.xlsx
+  click G1
+  type 1
+  key enter
+  click J1
+  type =G1*2
+  key enter
+  assert sel is J2
+  key ctrl+'
+  assert edit is =G1*2
+  key escape
+  key ctrl+shift+"
+  assert edit is 2
+  key escape
+
+# #663: Ctrl+D copies the first row down, Ctrl+R the first column right.
+test ctrl d and ctrl r fill
+  open copy:../fixtures/basic.xlsx
+  click G1
+  type 1
+  key enter
+  type 2
+  key enter
+  type 3
+  key enter
+  click J1
+  type =G1*2
+  key enter
+  click J1
+  key shift+down shift+down
+  key ctrl+d
+  assert cell J3 is 6
+  click L1
+  type x
+  key enter
+  click L1
+  key shift+right shift+right
+  key ctrl+r
+  assert cell N1 is x
+
+# #663: Ctrl+; puts today's date in the editor; Enter stores it.
+test ctrl semicolon enters today
+  open copy:../fixtures/basic.xlsx
+  click L3
+  key ctrl+;
+  assert editing is true
+  key enter
+  assert editing is false
+  assert cell L3 is not empty
+
+# #663: F9 while editing a formula replaces it with its value.
+test f9 replaces a formula with its value
+  open copy:../fixtures/basic.xlsx
+  click G6
+  type 6
+  key enter
+  click H6
+  type =G6*7
+  key enter
+  click H6
+  key f2 f9
+  assert edit is 42
+  key enter
+  call cell {"cell":"H6"}
+  assert reply.value is 42
