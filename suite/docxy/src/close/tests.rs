@@ -335,7 +335,7 @@ fn untouched_existing_header(name: &str, is_header: bool) -> (DocTab, String, Ve
     let _ = std::fs::remove_dir_all(&dir);
     assert!(!t.dirty, "{}", t.status);
     let pkg = t.pkg.as_ref().unwrap();
-    let part_name = hf_part_name_typed(pkg, is_header, "default").unwrap();
+    let part_name = hf_part_name_typed(pkg, pkg.sect_pr(), is_header, "default").unwrap();
     let before = pkg.part(&part_name).unwrap().to_vec();
     assert_eq!(before, word_xml.as_bytes());
     let body = parse_hf_part(pkg, &part_name);
