@@ -104,6 +104,25 @@ pub struct TaskResult {
     pub critical: bool,
 }
 
+impl TaskResult {
+    /// A span the schedule does not move: late dates equal early ones and
+    /// every slack is zero.
+    fn fixed(uid: i32, start: DateTime, finish: DateTime, critical: bool) -> TaskResult {
+        TaskResult {
+            uid,
+            early_start: start,
+            early_finish: finish,
+            late_start: start,
+            late_finish: finish,
+            total_slack_min: 0,
+            free_slack_min: 0,
+            start_slack_min: 0,
+            finish_slack_min: 0,
+            critical,
+        }
+    }
+}
+
 /// The whole computed schedule, addressable by task UID.
 #[derive(Clone, Debug)]
 pub struct Schedule {
@@ -1900,24 +1919,12 @@ impl<'a> Scheduler<'a> {
             }
             let result = match self.manual_spans.get(&t.uid) {
                 // Nothing scheduled below: the manual dates alone.
-                Some(&(start, finish)) if nodes.is_empty() => {
-                    let (start, finish) = (
-                        DateTime::from_minutes(start),
-                        DateTime::from_minutes(finish),
-                    );
-                    TaskResult {
-                        uid: t.uid,
-                        early_start: start,
-                        early_finish: finish,
-                        late_start: start,
-                        late_finish: finish,
-                        total_slack_min: 0,
-                        free_slack_min: 0,
-                        start_slack_min: 0,
-                        finish_slack_min: 0,
-                        critical: false,
-                    }
-                }
+                Some(&(start, finish)) if nodes.is_empty() => TaskResult::fixed(
+                    t.uid,
+                    DateTime::from_minutes(start),
+                    DateTime::from_minutes(finish),
+                    false,
+                ),
                 // A manual summary keeps its dates. Its late window spans its
                 // subtasks' late dates, never starting before its own start
                 // nor finishing before its own finish, so its slack is never
@@ -1952,30 +1959,18 @@ impl<'a> Scheduler<'a> {
                         critical: total <= critical_limit,
                     }
                 }
+                // Nothing scheduled below: its own stored dates, else the
+                // project start (see `place_empty_summaries`). With no child
+                // to inherit criticality from, it follows the leaf rule at
+                // zero slack.
+                None if nodes.is_empty() => {
+                    let (start, finish) =
+                        empty_summary_span(t, DateTime::from_minutes(self.anchor));
+                    TaskResult::fixed(t.uid, start, finish, 0 <= critical_limit)
+                }
                 None => {
                     let (Some(es_min), Some(ef_max)) = span else {
-                        // Nothing scheduled below: its own stored dates, else
-                        // the project start (see `place_empty_summaries`).
-                        // With no child to inherit criticality from, it
-                        // follows the leaf rule at zero slack.
-                        let (start, finish) =
-                            empty_summary_span(t, DateTime::from_minutes(self.anchor));
-                        results.insert(
-                            t.uid,
-                            TaskResult {
-                                uid: t.uid,
-                                early_start: start,
-                                early_finish: finish,
-                                late_start: start,
-                                late_finish: finish,
-                                total_slack_min: 0,
-                                free_slack_min: 0,
-                                start_slack_min: 0,
-                                finish_slack_min: 0,
-                                critical: 0 <= critical_limit,
-                            },
-                        );
-                        continue;
+                        unreachable!("a summary with nodes has a span");
                     };
                     let ls_min = nodes.iter().map(|n| n.late_start).min().unwrap();
                     let lf_max = nodes.iter().map(|n| n.late_finish).max().unwrap();
@@ -2827,21 +2822,8 @@ pub fn schedule(proj: &Project) -> Schedule {
         if task.is_external_leaf() {
             if let Some(start) = task.stored_start {
                 let finish = task.stored_finish.unwrap_or(start);
-                main.results.insert(
-                    task.uid,
-                    TaskResult {
-                        uid: task.uid,
-                        early_start: start,
-                        early_finish: finish,
-                        late_start: start,
-                        late_finish: finish,
-                        total_slack_min: 0,
-                        free_slack_min: 0,
-                        start_slack_min: 0,
-                        finish_slack_min: 0,
-                        critical: false,
-                    },
-                );
+                main.results
+                    .insert(task.uid, TaskResult::fixed(task.uid, start, finish, false));
             }
         }
     }
@@ -3733,6 +3715,9 @@ impl Scheduler<'_> {
         // Roll leveled dates up into summary tasks, deepest first: a manual
         // summary keeps its own dates, which its ancestors roll up.
         let mut rollups = HashMap::new();
+        // Summaries with nothing below them, which never extend the project
+        // finish (as in `run`).
+        let mut empty = std::collections::HashSet::new();
         for i in summaries_deepest_first(self.proj) {
             let t = &self.proj.tasks[i];
             let uids: Vec<i32> = rollup_nodes(self.proj, i, leaves)
@@ -3745,10 +3730,11 @@ impl Scheduler<'_> {
             }
             let own = match self.manual_spans.get(&t.uid) {
                 Some(_) => base.get(t.uid).map(|r| (r.early_start, r.early_finish)),
-                // Nothing below it: the dates `run` gave it.
-                None => cs
-                    .zip(cf)
-                    .or_else(|| base.get(t.uid).map(|r| (r.early_start, r.early_finish))),
+                None => cs.zip(cf).or_else(|| {
+                    // Nothing below it: the dates `run` gave it.
+                    empty.insert(t.uid);
+                    base.get(t.uid).map(|r| (r.early_start, r.early_finish))
+                }),
             };
             if let Some((s, f)) = own {
                 start.insert(t.uid, s);
@@ -3757,8 +3743,9 @@ impl Scheduler<'_> {
         }
 
         let project_finish = finish
-            .values()
-            .map(|d| d.minutes())
+            .iter()
+            .filter(|(uid, _)| !empty.contains(*uid))
+            .map(|(_, d)| d.minutes())
             .max()
             .map(DateTime::from_minutes)
             .unwrap_or(base.project_finish);
@@ -8305,6 +8292,14 @@ mod tests {
         assert_eq!(span_and_slack(&s, 1), fixed_span(at(2, 8), at(4, 17)));
         assert_eq!(task_duration_min(&proj, &s, &proj.tasks[0]), Some(3 * 480));
         assert_eq!(leveled_span(&proj, 1), (Some(at(2, 8)), Some(at(4, 17))));
+        // Its stored finish does not extend the project, leveled or not.
+        let proj = march2(vec![
+            empty_phase(1, Some(at(2, 8)), Some(at(10, 17))),
+            task(2, "Work", 480),
+        ]);
+        assert_eq!(schedule(&proj).project_finish, at(2, 17));
+        assert_eq!(level(&proj).project_finish, at(2, 17));
+        assert_eq!(leveled_span(&proj, 1), (Some(at(2, 8)), Some(at(10, 17))));
 
         // A finish before the start never gives a negative span.
         let proj = march2(vec![empty_phase(1, Some(at(4, 8)), Some(at(2, 8)))]);
