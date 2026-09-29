@@ -301,6 +301,9 @@ mod win {
         /// macro-free kind drops the VBA project without asking, as Excel does
         /// under automation with `DisplayAlerts = False`.
         fn save_as(&mut self, path: &str, kind: Option<SpreadsheetKind>) -> std::io::Result<()> {
+            // No OOXML FileFormat and no spreadsheet extension: Excel keeps
+            // the format last used.
+            let kind = kind.or(self.kind);
             self.recalc_if_dirty();
             let bytes = match kind {
                 Some(kind) => save_xlsx_as(&self.pkg, kind),
@@ -2444,8 +2447,6 @@ mod win {
             assert_eq!(kind_for(None, "x"), None);
         }
 
-        /// #601: `SaveAs "x.xlsx", 51` on a macro workbook writes a real
-        /// `.xlsx`: no macro type, no VBA project.
         /// A macro workbook with a VBA project, as Excel writes one.
         fn macro_pkg() -> SheetPackage {
             let mut pkg =
@@ -2460,6 +2461,8 @@ mod win {
             pkg
         }
 
+        /// #601: `SaveAs "x.xlsx", 51` on a macro workbook writes a real
+        /// `.xlsx`: no macro type, no VBA project.
         #[test]
         fn save_as_xlsx_drops_the_vba_project() {
             let mut book = Book::new();
@@ -2515,6 +2518,19 @@ mod win {
             book.save_as(p, kind_for(Some(52), p)).unwrap();
             book.save().unwrap().unwrap();
             assert!(saved(&odd).has_vba_project());
+
+            // `SaveAs "r2"` with no FileFormat keeps the format used last.
+            let mut book = Book::new();
+            book.pkg = macro_pkg();
+            let (r, r2) = (dir.join("r"), dir.join("r2"));
+            let p = r.to_str().unwrap();
+            book.save_as(p, kind_for(Some(51), p)).unwrap();
+            let p = r2.to_str().unwrap();
+            book.save_as(p, kind_for(None, p)).unwrap();
+            let ct = String::from_utf8_lossy(saved(&r2).part("[Content_Types].xml").unwrap())
+                .into_owned();
+            assert!(ct.contains("spreadsheetml.sheet.main+xml"), "{ct}");
+            assert!(!ct.contains("macroEnabled"), "{ct}");
 
             std::fs::remove_dir_all(dir).unwrap();
         }
