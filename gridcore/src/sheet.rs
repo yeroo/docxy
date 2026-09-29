@@ -148,6 +148,12 @@ pub struct CellMeta {
     pub ph: bool,
 }
 
+/// Do preserved `<f>` attributes (see [`Cell::f_attrs`]) mark an array
+/// formula (`t="array"`)?
+pub fn is_array_f(attrs: &str) -> bool {
+    attrs.contains("t=\"array\"")
+}
+
 impl Cell {
     pub fn number(n: f64) -> Cell {
         Cell {
