@@ -884,19 +884,15 @@ pub(crate) enum FieldEvent {
 /// The complex-field markers in `raw`, in document order.
 pub(crate) fn field_events(raw: &str) -> Vec<FieldEvent> {
     let mut events: Vec<(usize, FieldEvent)> = Vec::new();
-    for (start, el) in start_tags(raw, "w:fldChar") {
-        let kind = el.find("w:fldCharType=\"").map(|i| {
-            let v = &el[i + "w:fldCharType=\"".len()..];
-            &v[..v.find('"').unwrap_or(v.len())]
-        });
-        match kind {
+    for (start, el) in crate::load::start_tags(raw, "w:fldChar") {
+        match crate::load::xml_attr_value(el, "w:fldCharType").as_deref() {
             Some("begin") => events.push((start, FieldEvent::Begin)),
             Some("separate") => events.push((start, FieldEvent::Separate)),
             Some("end") => events.push((start, FieldEvent::End)),
             _ => {}
         }
     }
-    for (start, el) in start_tags(raw, "w:instrText") {
+    for (start, el) in crate::load::start_tags(raw, "w:instrText") {
         if el.ends_with("/>") {
             continue;
         }
@@ -911,27 +907,6 @@ pub(crate) fn field_events(raw: &str) -> Vec<FieldEvent> {
     }
     events.sort_by_key(|(pos, _)| *pos);
     events.into_iter().map(|(_, e)| e).collect()
-}
-
-/// Every `<tag …>` start tag in `xml`, with its byte offset.
-fn start_tags<'a>(xml: &'a str, tag: &str) -> Vec<(usize, &'a str)> {
-    let needle = format!("<{tag}");
-    let mut out = Vec::new();
-    let mut from = 0;
-    while let Some(off) = xml[from..].find(&needle) {
-        let start = from + off;
-        let after = start + needle.len();
-        from = after;
-        if xml[after..]
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_whitespace() || c == '/' || c == '>')
-        {
-            let end = xml[start..].find('>').map_or(xml.len(), |e| start + e + 1);
-            out.push((start, &xml[start..end]));
-        }
-    }
-    out
 }
 
 /// Extract a field's instruction (entity-decoded) from its raw XML: the

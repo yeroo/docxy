@@ -208,24 +208,9 @@ fn start_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
 }
 
 fn start_tags<'a>(xml: &'a str, tag: &str) -> impl Iterator<Item = &'a str> + use<'a> {
-    let needle = format!("<{tag}");
-    let mut from = 0;
-    std::iter::from_fn(move || {
-        while let Some(off) = xml[from..].find(&needle) {
-            let start = from + off;
-            let after = start + needle.len();
-            from = after;
-            if xml[after..]
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_whitespace() || c == '/' || c == '>')
-            {
-                let end = xml[start..].find('>').map_or(xml.len(), |e| start + e + 1);
-                return Some(&xml[start..end]);
-            }
-        }
-        None
-    })
+    crate::load::start_tags(xml, tag)
+        .into_iter()
+        .map(|(_, el)| el)
 }
 
 /// A numeric attribute (twips etc.) as f32; `inf`/`NaN` count as absent.

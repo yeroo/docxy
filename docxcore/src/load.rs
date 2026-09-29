@@ -639,6 +639,29 @@ pub fn header_footer_ref_rid(sect: &str, kind: &str, wtype: &str) -> Option<Stri
 /// one known attribute on one already-located element, as used by
 /// [`header_footer_ref_rid`] and callers that check on/off flags like
 /// `w:val="false"`).
+/// Every start tag `<tag …>` in `xml` (not a longer tag name sharing the
+/// prefix, so `w:col` skips `w:cols`), up to its closing `>`, with its byte
+/// offset.
+pub(crate) fn start_tags<'a>(xml: &'a str, tag: &str) -> Vec<(usize, &'a str)> {
+    let needle = format!("<{tag}");
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(off) = xml[from..].find(&needle) {
+        let start = from + off;
+        let after = start + needle.len();
+        from = after;
+        if xml[after..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_whitespace() || c == '/' || c == '>')
+        {
+            let end = xml[start..].find('>').map_or(xml.len(), |e| start + e + 1);
+            out.push((start, &xml[start..end]));
+        }
+    }
+    out
+}
+
 pub fn xml_attr_value(el: &str, key: &str) -> Option<String> {
     let k = format!("{key}=\"");
     let s = el.find(&k)? + k.len();
