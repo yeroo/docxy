@@ -1,0 +1,485 @@
+//! Section addressing for the page Layout commands (#649).
+//!
+//! A document's sections are its body paragraphs that carry a `section_break`
+//! (each closes the section it ends), in body order, then the body-level
+//! trailing `w:sectPr`, which describes the final section. Section `k` is the
+//! k-th of these. A paragraph carrying a break belongs to the section that
+//! break closes, and a table belongs to the section of the body block it sits
+//! in. Every edit here is one undo step on the editor's document, which is
+//! what the page view and Save read.
+
+use super::{Caret, EditKind, Editor, para_mut, split_content};
+use crate::model::{Block, BreakKind, Inline, Paragraph, SectionProperties};
+use crate::sect::{SectionSetup, SectionStart};
+
+use super::Clip;
+
+/// Where one section's properties live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SectAt {
+    /// The `section_break` of the body paragraph at this index.
+    Para(usize),
+    /// The body-level trailing section properties.
+    Trailing,
+}
+
+/// A raw sectPr for a section that has none of its own yet.
+const EMPTY_SECT: &str = "<w:sectPr></w:sectPr>";
+
+impl Editor {
+    fn section_slots(&self) -> Vec<SectAt> {
+        let mut out: Vec<SectAt> = self
+            .doc
+            .body
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| match b {
+                Block::Paragraph(p) if p.props.section_break.is_some() => Some(SectAt::Para(i)),
+                _ => None,
+            })
+            .collect();
+        out.push(SectAt::Trailing);
+        out
+    }
+
+    /// Every section's `w:sectPr`, in body order. The final section reads as an
+    /// empty sectPr when the document has no trailing one.
+    pub fn sections(&self) -> Vec<String> {
+        self.section_slots()
+            .into_iter()
+            .map(|at| self.sect_raw(at).to_string())
+            .collect()
+    }
+
+    fn sect_raw(&self, at: SectAt) -> &str {
+        match at {
+            SectAt::Para(i) => match &self.doc.body[i] {
+                Block::Paragraph(p) => p.props.section_break.as_deref().unwrap_or(EMPTY_SECT),
+                _ => EMPTY_SECT,
+            },
+            SectAt::Trailing => self
+                .doc
+                .trailing_section_properties()
+                .map_or(EMPTY_SECT, |s| s.raw.as_str()),
+        }
+    }
+
+    /// The section a body block belongs to.
+    pub fn section_of_block(&self, block: usize) -> usize {
+        self.doc.body[..block.min(self.doc.body.len())]
+            .iter()
+            .filter(|b| matches!(b, Block::Paragraph(p) if p.props.section_break.is_some()))
+            .count()
+    }
+
+    /// The caret's section.
+    pub fn caret_section(&self) -> usize {
+        self.section_of_block(self.caret.path.first().copied().unwrap_or(0))
+    }
+
+    /// The sections the Layout commands act on: each section containing a
+    /// selected paragraph, else the caret's.
+    pub fn target_sections(&self) -> Vec<usize> {
+        let mut out: Vec<usize> = self
+            .selection_spans()
+            .iter()
+            .filter_map(|(path, _, _)| path.first())
+            .map(|&b| self.section_of_block(b))
+            .collect();
+        if out.is_empty() {
+            out.push(self.caret_section());
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Rewrite the sectPr of each section in `indexes` with `edit` as one undo
+    /// step. Nothing is recorded when no section changes. Whether any did.
+    pub fn edit_sections(&mut self, indexes: &[usize], edit: impl Fn(&str) -> String) -> bool {
+        let slots = self.section_slots();
+        let changes: Vec<(SectAt, String)> = indexes
+            .iter()
+            .filter_map(|&k| slots.get(k).copied())
+            .filter_map(|at| {
+                let old = self.sect_raw(at);
+                let new = edit(old);
+                (new != old).then_some((at, new))
+            })
+            .collect();
+        if changes.is_empty() {
+            return false;
+        }
+        self.checkpoint(EditKind::Structural);
+        for (at, raw) in changes {
+            self.set_sect_raw(at, raw);
+        }
+        true
+    }
+
+    /// [`Editor::edit_sections`] through the typed [`SectionSetup`] view.
+    pub fn edit_section_setups(
+        &mut self,
+        indexes: &[usize],
+        edit: impl Fn(&mut SectionSetup),
+    ) -> bool {
+        self.edit_sections(indexes, |raw| {
+            let mut setup = SectionSetup::parse(raw);
+            edit(&mut setup);
+            setup.apply(raw)
+        })
+    }
+
+    fn set_sect_raw(&mut self, at: SectAt, raw: String) {
+        match at {
+            SectAt::Para(i) => {
+                if let Some(Block::Paragraph(p)) = self.doc.body.get_mut(i) {
+                    p.props.section_break = Some(raw);
+                }
+            }
+            SectAt::Trailing => match self.doc.trailing_section_properties_mut() {
+                Some(section) => section.raw = raw,
+                None => self.doc.set_trailing_section_properties(SectionProperties {
+                    raw,
+                    property_change: None,
+                }),
+            },
+        }
+    }
+
+    /// Insert a section break at the caret, as one undo step. With a selection,
+    /// the break goes at its start and the selection collapses there.
+    ///
+    /// The caret's paragraph P, in section k, splits at the caret. The first
+    /// half takes a copy of section k's sectPr with its original `w:type`, so it
+    /// closes a section just like the old one. Section k's own sectPr now closes
+    /// the section after the break, and `w:type` describes how *that* section
+    /// starts, so it takes `start`. The second half keeps P's own break, if P
+    /// had one.
+    ///
+    /// Refused (with the reason) when the caret is not in a body paragraph:
+    /// a table cell, a text box, or another story cannot carry a sectPr.
+    pub fn insert_section_break(&mut self, start: SectionStart) -> Result<(), String> {
+        let at = match self.selection_range() {
+            Some((lo, _)) => lo,
+            None => self.caret.clone(),
+        };
+        let &[block] = at.path.as_slice() else {
+            return Err("A section break can only go in the body text, not here".into());
+        };
+        if !matches!(self.doc.body.get(block), Some(Block::Paragraph(_))) {
+            return Err("A section break needs the caret in a paragraph".into());
+        }
+        let k = self.section_of_block(block);
+        let slot = self.section_slots()[k];
+        let old = self.sect_raw(slot).to_string();
+        let mut setup = SectionSetup::parse(&old);
+        setup.start = start;
+        let closing = setup.apply(&old);
+
+        self.anchor = None;
+        self.caret = at;
+        self.checkpoint(EditKind::Structural);
+        let Some(Block::Paragraph(p)) = self.doc.body.get_mut(block) else {
+            return Err("A section break needs the caret in a paragraph".into());
+        };
+        let right = split_content(&mut p.content, self.caret.offset);
+        let second = Paragraph {
+            props: p.props.clone(),
+            content: right,
+        };
+        p.props.section_break = Some(old);
+        p.props.section_property_change = None;
+        self.doc.body.insert(block + 1, Block::Paragraph(second));
+        // Section k's sectPr moved one section on; its slot shifts with the
+        // inserted paragraph when it was a paragraph at or after the split.
+        let moved = match slot {
+            SectAt::Para(i) if i == block => SectAt::Para(block + 1),
+            SectAt::Para(i) => SectAt::Para(i + 1),
+            SectAt::Trailing => SectAt::Trailing,
+        };
+        self.set_sect_raw(moved, closing);
+        self.caret = Caret::at(vec![block + 1], 0);
+        self.doc.initialize_revision_targets();
+        Ok(())
+    }
+
+    /// Insert a page, column or clearing line break at the caret.
+    pub fn insert_break(&mut self, kind: BreakKind) {
+        self.paste(&Clip {
+            paras: vec![vec![Inline::Break(kind)]],
+        });
+    }
+
+    /// The paragraphs a paragraph command acts on: the selected ones, else the
+    /// caret's.
+    fn target_paragraphs(&self) -> Vec<Vec<usize>> {
+        let spans = self.selection_spans();
+        if spans.is_empty() {
+            vec![self.caret.path.clone()]
+        } else {
+            spans.into_iter().map(|(p, _, _)| p).collect()
+        }
+    }
+
+    /// Whether the caret's paragraph suppresses line numbers
+    /// (`w:suppressLineNumbers`).
+    pub fn caret_suppresses_line_numbers(&self) -> bool {
+        super::resolve_para(&self.doc.body, &self.caret.path).is_some_and(suppresses_line_numbers)
+    }
+
+    /// Toggle `w:suppressLineNumbers` on the selected paragraphs (else the
+    /// caret's), as one undo step: on unless the caret's paragraph has it.
+    pub fn toggle_suppress_line_numbers(&mut self) {
+        let on = !self.caret_suppresses_line_numbers();
+        let paths = self.target_paragraphs();
+        self.checkpoint(EditKind::Structural);
+        for path in paths {
+            if let Some(p) = para_mut(&mut self.doc.body, &path) {
+                p.props
+                    .raw_props
+                    .retain(|r| !is_element(r, "w:suppressLineNumbers"));
+                if on {
+                    p.props.raw_props.push("<w:suppressLineNumbers/>".into());
+                }
+            }
+        }
+    }
+}
+
+fn is_element(raw: &str, name: &str) -> bool {
+    raw.strip_prefix('<')
+        .and_then(|r| r.strip_prefix(name))
+        .is_some_and(|r| r.starts_with([' ', '/', '>', '\t', '\n', '\r']))
+}
+
+fn suppresses_line_numbers(p: &Paragraph) -> bool {
+    p.props.raw_props.iter().any(|r| {
+        is_element(r, "w:suppressLineNumbers")
+            && !["\"0\"", "\"false\"", "\"off\""]
+                .iter()
+                .any(|v| r.contains(&format!("w:val={v}")))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Document, ParProps, Run, Table};
+
+    fn para(text: &str, sect: Option<&str>) -> Block {
+        Block::Paragraph(Paragraph {
+            props: ParProps {
+                section_break: sect.map(str::to_string),
+                ..ParProps::default()
+            },
+            content: vec![Inline::Run(Run {
+                text: text.into(),
+                ..Run::default()
+            })],
+        })
+    }
+
+    fn sect(tag: &str) -> String {
+        format!("<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/>{tag}</w:sectPr>")
+    }
+
+    /// Three sections: "one" closes section 0 (continuous), "two" and "two b"
+    /// are section 1 (closed by "two b", odd page), "three" is the final one.
+    fn three() -> Editor {
+        let mut doc = Document {
+            body: vec![
+                para("one", Some(&sect("<w:type w:val=\"continuous\"/>"))),
+                para("two", None),
+                para("two b", Some(&sect("<w:type w:val=\"oddPage\"/>"))),
+                para("three", None),
+            ],
+        };
+        doc.set_trailing_section_properties(SectionProperties {
+            raw: sect(""),
+            property_change: None,
+        });
+        Editor::new(doc)
+    }
+
+    fn start_of(raw: &str) -> SectionStart {
+        SectionSetup::parse(raw).start
+    }
+
+    #[test]
+    fn sections_follow_the_body() {
+        let mut e = three();
+        assert_eq!(e.sections().len(), 3);
+        assert_eq!(e.section_of_block(0), 0);
+        assert_eq!(e.section_of_block(1), 1);
+        assert_eq!(e.section_of_block(2), 1);
+        assert_eq!(e.section_of_block(3), 2);
+        e.caret = Caret::top(1, 1);
+        assert_eq!(e.target_sections(), vec![1]);
+        e.anchor = Some(Caret::top(0, 1));
+        assert_eq!(e.target_sections(), vec![0, 1]);
+    }
+
+    #[test]
+    fn edit_sections_changes_only_the_target_in_one_step() {
+        let mut e = three();
+        e.caret = Caret::top(1, 0);
+        let before = e.doc.clone();
+        let k = e.target_sections();
+        assert!(e.edit_section_setups(&k, |s| s.margins.left = 720));
+        let now = e.sections();
+        assert_eq!(SectionSetup::parse(&now[1]).margins.left, 720);
+        assert_eq!(now[0], before_sections(&before)[0]);
+        assert_eq!(now[2], before_sections(&before)[2]);
+        assert!(e.undo());
+        assert_eq!(e.doc, before);
+        assert!(e.redo());
+        assert_eq!(SectionSetup::parse(&e.sections()[1]).margins.left, 720);
+        // A no-op edit records nothing.
+        assert!(!e.edit_section_setups(&[1], |s| s.margins.left = 720));
+        assert!(e.undo());
+        assert_eq!(e.doc, before);
+    }
+
+    fn before_sections(doc: &Document) -> Vec<String> {
+        Editor::new(doc.clone()).sections()
+    }
+
+    #[test]
+    fn edit_sections_reaches_the_final_section() {
+        let mut e = three();
+        e.caret = Caret::top(3, 0);
+        let k = e.target_sections();
+        assert_eq!(k, vec![2]);
+        e.edit_section_setups(&k, |s| s.set_landscape(true));
+        let raw = &e.doc.trailing_section_properties().unwrap().raw;
+        assert!(raw.contains("w:orient=\"landscape\""), "{raw}");
+    }
+
+    #[test]
+    fn a_section_break_types_the_section_after_it() {
+        let mut e = three();
+        e.caret = Caret::top(1, 1); // "t|wo" in section 1
+        let before = e.doc.clone();
+        e.insert_section_break(SectionStart::Continuous).unwrap();
+        let s = e.sections();
+        assert_eq!(s.len(), 4);
+        // The new break on "t" keeps section 1's old type ...
+        assert_eq!(start_of(&s[1]), SectionStart::OddPage);
+        // ... and section 1's sectPr, now after the break, reads continuous.
+        assert_eq!(start_of(&s[2]), SectionStart::Continuous);
+        assert_eq!(start_of(&s[0]), SectionStart::Continuous);
+        let text: Vec<String> = e.doc.body.iter().map(|b| b.plain_text()).collect();
+        assert_eq!(text[..5], ["one", "t", "wo", "two b", "three"]);
+        assert_eq!(e.caret, Caret::top(2, 0));
+        assert!(e.undo());
+        assert_eq!(e.doc, before);
+    }
+
+    #[test]
+    fn a_break_in_a_closing_paragraph_leaves_its_break_on_the_second_half() {
+        let mut e = three();
+        e.caret = Caret::top(2, 3); // "two| b", which closes section 1
+        e.insert_section_break(SectionStart::EvenPage).unwrap();
+        let Block::Paragraph(first) = &e.doc.body[2] else {
+            panic!()
+        };
+        let Block::Paragraph(second) = &e.doc.body[3] else {
+            panic!()
+        };
+        assert_eq!(
+            start_of(first.props.section_break.as_deref().unwrap()),
+            SectionStart::OddPage
+        );
+        assert_eq!(
+            start_of(second.props.section_break.as_deref().unwrap()),
+            SectionStart::EvenPage
+        );
+        assert_eq!(e.sections().len(), 4);
+    }
+
+    #[test]
+    fn a_break_in_the_final_section_types_the_trailing_sectpr() {
+        let mut e = three();
+        e.caret = Caret::top(3, 5);
+        e.insert_section_break(SectionStart::NextPage).unwrap();
+        let s = e.sections();
+        assert_eq!(s.len(), 4);
+        assert_eq!(s[2], sect(""), "the copy keeps the old (default) type");
+        // nextPage is the default: no w:type is written.
+        assert_eq!(start_of(&s[3]), SectionStart::NextPage);
+        e.insert_section_break(SectionStart::OddPage).unwrap();
+        assert_eq!(start_of(&e.sections()[4]), SectionStart::OddPage);
+    }
+
+    #[test]
+    fn a_section_break_is_refused_in_a_table_cell() {
+        let mut doc = three().doc;
+        doc.body.insert(
+            0,
+            Block::Table(Table {
+                rows: vec![crate::model::Row {
+                    cells: vec![crate::model::Cell {
+                        blocks: vec![para("cell", None)],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        );
+        let mut e = Editor::new(doc);
+        e.caret = Caret::at(vec![0, 0, 0, 0], 2);
+        let before = e.doc.clone();
+        assert!(e.insert_section_break(SectionStart::Continuous).is_err());
+        assert_eq!(e.doc, before);
+        assert!(!e.undo(), "a refusal records no undo step");
+    }
+
+    #[test]
+    fn a_selection_collapses_to_its_start() {
+        let mut e = three();
+        e.anchor = Some(Caret::top(3, 4));
+        e.caret = Caret::top(1, 1);
+        e.insert_section_break(SectionStart::Continuous).unwrap();
+        assert!(e.anchor.is_none());
+        assert_eq!(e.doc.body[1].plain_text(), "t");
+        assert_eq!(e.doc.body.last().map(|_| e.sections().len()), Some(4));
+        assert!(e.doc.plain_text().contains("three"), "nothing was deleted");
+    }
+
+    #[test]
+    fn breaks_go_in_at_the_caret() {
+        let mut e = three();
+        e.caret = Caret::top(1, 1);
+        e.insert_break(BreakKind::Clear(crate::model::ClearKind::All));
+        let Block::Paragraph(p) = &e.doc.body[1] else {
+            panic!()
+        };
+        assert!(p.content.contains(&Inline::Break(BreakKind::Clear(
+            crate::model::ClearKind::All
+        ))));
+    }
+
+    #[test]
+    fn suppress_line_numbers_toggles_the_selected_paragraphs() {
+        let mut e = three();
+        e.anchor = Some(Caret::top(1, 0));
+        e.caret = Caret::top(2, 2);
+        assert!(!e.caret_suppresses_line_numbers());
+        e.toggle_suppress_line_numbers();
+        for i in [1, 2] {
+            let Block::Paragraph(p) = &e.doc.body[i] else {
+                panic!()
+            };
+            assert_eq!(p.props.raw_props, ["<w:suppressLineNumbers/>"]);
+        }
+        assert!(e.caret_suppresses_line_numbers());
+        e.toggle_suppress_line_numbers();
+        assert!(!e.caret_suppresses_line_numbers());
+        let Block::Paragraph(p) = &e.doc.body[1] else {
+            panic!()
+        };
+        assert!(p.props.raw_props.is_empty());
+    }
+}

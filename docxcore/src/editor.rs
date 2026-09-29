@@ -13,6 +13,7 @@ use crate::model::*;
 use crate::review::{RevisionAction, RevisionOutcome};
 
 mod flat;
+mod sections;
 pub use flat::{FlatDocument, FlatStory, StoryOffset};
 
 /// A path into the document tree (to a paragraph) plus a character offset.
