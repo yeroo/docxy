@@ -418,9 +418,17 @@ pub fn config_ctl_dir(app: &str) -> Option<PathBuf> {
 /// `<app>-<AGWINTERM_SESSION_ID>` — the pane id an agent sees in `agwintermctl
 /// tree`, so it can address exactly this editor — otherwise `<app>-<pid>`.
 pub fn instance_name(app: &str) -> String {
-    match std::env::var("AGWINTERM_SESSION_ID") {
-        Ok(id) if !id.is_empty() => format!("{app}-{id}"),
-        _ => format!("{app}-{}", std::process::id()),
+    let session = std::env::var("AGWINTERM_SESSION_ID").ok();
+    instance_name_from(app, session.as_deref(), std::process::id())
+}
+
+/// [`instance_name`] with its inputs passed in, so the rule is a unit test
+/// rather than something that depends on the pane the tests ran from. An empty
+/// session id counts as none.
+pub fn instance_name_from(app: &str, session_id: Option<&str>, pid: u32) -> String {
+    match session_id {
+        Some(id) if !id.is_empty() => format!("{app}-{id}"),
+        _ => format!("{app}-{pid}"),
     }
 }
 
@@ -445,12 +453,20 @@ pub fn signal_activity() {
         );
     }
     for cand in candidates {
-        let spawned = Command::new(&cand)
-            .args(["session", "status", "active", "--auto-reset"])
+        let mut cmd = Command::new(&cand);
+        cmd.args(["session", "status", "active", "--auto-reset"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+            .stderr(Stdio::null());
+        // A console CLI started from a GUI process would otherwise get a
+        // console window of its own.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let spawned = cmd.spawn();
         if spawned.is_ok() {
             return;
         }
@@ -495,6 +511,16 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
     use std::time::Duration;
+
+    #[test]
+    fn instance_name_is_the_pane_id_inside_agwinterm_else_the_pid() {
+        assert_eq!(
+            instance_name_from("docxy", Some("abc-1"), 42),
+            "docxy-abc-1"
+        );
+        assert_eq!(instance_name_from("docxy", None, 42), "docxy-42");
+        assert_eq!(instance_name_from("docxy", Some(""), 42), "docxy-42");
+    }
 
     #[test]
     fn mint_token_is_256_bits_of_hex_and_unique() {
