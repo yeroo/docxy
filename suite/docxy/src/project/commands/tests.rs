@@ -528,6 +528,7 @@ fn keys_and_whole_route_enforce_modifiers() {
         ("insert", InsertBlankRow),
         ("delete", ClearCell),
         ("f3", FindNext),
+        ("f11", NewProject),
     ] {
         assert_eq!(key_act(key, Modifiers::default()), Some(act));
     }
@@ -2141,4 +2142,47 @@ fn ribbon_link_hints_name_the_chords_the_keys_run() {
         assert_eq!(c.tip.shortcut, hint);
         assert_eq!(key_act("f2", m), Some(act), "{id}");
     }
+}
+
+#[test]
+fn f11_is_new_project_only_without_modifiers() {
+    let shift = Modifiers {
+        shift: true,
+        ..Modifiers::default()
+    };
+    let alt = Modifiers {
+        alt: true,
+        ..Modifiers::default()
+    };
+    let platform = Modifiers {
+        platform: true,
+        ..Modifiers::default()
+    };
+    // Shift+F11 is Project's New Window, which docxy does not have.
+    for m in [shift, ctrl(), alt, platform, ctrl_shift(), ctrl_alt()] {
+        assert_eq!(key_act("f11", m), None, "{m:?}");
+        let mut t = tab();
+        assert_eq!(project_input(&mut t, "f11", None, m), None, "{m:?}");
+    }
+    let mut t = tab();
+    assert_eq!(
+        project_input(&mut t, "f11", None, Modifiers::default()),
+        Some(ProjectAct::NewProject)
+    );
+    // The new tab is the host's; the plan itself is untouched.
+    let before = v(&t).ed.project().clone();
+    apply_project_act(&mut t, ProjectAct::NewProject);
+    assert_eq!(v(&t).ed.project(), &before);
+    assert!(!t.dirty);
+}
+
+#[test]
+fn an_open_prompt_swallows_f11() {
+    let mut t = tab();
+    apply_project_act(&mut t, ProjectAct::Find);
+    assert_eq!(
+        project_input(&mut t, "f11", None, Modifiers::default()),
+        None
+    );
+    assert!(v(&t).prompt.is_some());
 }

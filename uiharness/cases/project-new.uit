@@ -1,0 +1,18 @@
+test issue 372 F11 opens a new empty project tab and leaves the plan alone
+  open copy:../fixtures/project-clipboard.xml
+  call task.list {}
+  assert tabs is 2
+  assert title is project-clipboard.xml
+  assert tasks is 2
+  key f11
+  call task.list {}
+  assert tabs is 3
+  assert tab is 2
+  assert title is Untitled.yppx
+  assert tasks is 0
+  assert dirty is false
+  call title-tab {"action":"prev"}
+  call task.list {}
+  assert title is project-clipboard.xml
+  assert tasks is 2
+  assert dirty is false
