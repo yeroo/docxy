@@ -3761,7 +3761,7 @@ mod tests {
         assert_eq!(ed.caret, Caret::top(0, 2));
         assert!(!ed.has_selection());
         ed.insert_char('z');
-        assert_eq!(top_text(&ed), vec!["x	zy"]);
+        assert_eq!(top_text(&ed), vec!["x\tzy"]);
     }
 
     #[test]

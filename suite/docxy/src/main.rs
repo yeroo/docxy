@@ -2927,10 +2927,7 @@ mod click_caret_tests {
     use core::prelude::v1::test;
 
     fn typed_hello() -> Editor {
-        let mut ed = Editor::new(docxcore::markdown::from_markdown(
-            "x
-",
-        ));
+        let mut ed = Editor::new(docxcore::markdown::from_markdown("x\n"));
         ed.set_caret(Caret::at(vec![0], 0));
         ed.delete_forward();
         ed.insert_str("hello");
