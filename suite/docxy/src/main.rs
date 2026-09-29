@@ -15338,8 +15338,10 @@ fn ribbon_tab_name(tab: RibbonTab) -> &'static str {
 
 /// Whether a ribbon command can run now: its button draws greyed and takes
 /// no click when it cannot, a split button's menu greys the item, and
-/// `ribbon-read` reports the same. Every ribbon command can run today; a
-/// row menu's items have their own rules (`project_row_menu`).
+/// `ribbon-read` reports the same. Every ribbon command can run except the
+/// Layout tab's placeholders (`LayoutAct::Unavailable`: Line Numbering
+/// Options..., Manual and Hyphenation Options...); a row menu's items have
+/// their own rules (`project_row_menu`).
 fn act_enabled(act: Act) -> bool {
     match act {
         Act::Layout(act) => layout_tab::layout_enabled(act),
@@ -15396,6 +15398,53 @@ fn tab_keytip_cmd(tab: &rs::Tab<Act>, key: &str) -> Option<Act> {
         .iter()
         .flat_map(|g| g.items.iter())
         .find_map(|c| control_keytip(c, key))
+}
+
+/// A large menu button's label, with the drop-down mark on its last line, as
+/// Office draws a split button's lower half and a drop-down button.
+fn menu_button_label(text: &str, fg: Hsla) -> Div {
+    let lines = label_lines(text);
+    let last = lines.len().saturating_sub(1);
+    let mut label = v_flex().items_center();
+    for (i, ln) in lines.into_iter().enumerate() {
+        let ln = if i == last {
+            format!("{ln} ▾")
+        } else {
+            ln.to_string()
+        };
+        label = label.child(
+            div()
+                .text_size(px(11.))
+                .text_color(fg)
+                .child(SharedString::from(ln)),
+        );
+    }
+    label
+}
+
+/// The press that opens a ribbon button's menu (`id`: a split button's
+/// primary, or a drop-down), or shuts it when it is the one open, whichever
+/// of this handler and the menu backdrop's runs first.
+fn menu_toggle(
+    id: &'static str,
+    cx: &mut Context<Docxy>,
+) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static {
+    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+        cx.stop_propagation();
+        let closed = this
+            .menu_closed_at
+            .take()
+            .filter(|(_, at)| *at == ev.position)
+            .map(|(t, _)| t);
+        let open = this.menu.as_ref().map(|m| &m.target);
+        if menu::split_arrow_opens(id, open, closed.as_ref()) {
+            let at = split_menu_anchor(&this.probes.borrow(), id).unwrap_or(ev.position);
+            let _ = this.open_split_menu(id, at, cx);
+        } else {
+            this.close_menu();
+            cx.notify();
+        }
+    })
 }
 
 /// A small KeyTip access-key badge, centred at the bottom of its host element.
@@ -19492,24 +19541,6 @@ impl Docxy {
         let keytip =
             (self.keytips == KeyTip::Commands && !cmd.key_tip.is_empty()).then_some(cmd.key_tip);
         let primary_id = cmd.id;
-        // The label with the drop-down mark on its last line, as Office
-        // draws a large split button's lower half.
-        let lines = label_lines(cmd.label);
-        let last = lines.len().saturating_sub(1);
-        let mut label = v_flex().items_center();
-        for (i, ln) in lines.into_iter().enumerate() {
-            let ln = if i == last {
-                format!("{ln} ▾")
-            } else {
-                ln.to_string()
-            };
-            label = label.child(
-                div()
-                    .text_size(px(11.))
-                    .text_color(fg)
-                    .child(SharedString::from(ln)),
-            );
-        }
         let top = div()
             .id(cmd.id)
             .flex()
@@ -19529,29 +19560,8 @@ impl Docxy {
             .rounded_b(px(4.))
             .cursor_pointer()
             .hover(|d| d.bg(pal.hover))
-            .child(label)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                    cx.stop_propagation();
-                    // A press on the arrow of the open menu shuts it, whichever
-                    // of this handler and the backdrop's runs first.
-                    let closed = this
-                        .menu_closed_at
-                        .take()
-                        .filter(|(_, at)| *at == ev.position)
-                        .map(|(t, _)| t);
-                    let open = this.menu.as_ref().map(|m| &m.target);
-                    if menu::split_arrow_opens(primary_id, open, closed.as_ref()) {
-                        let at = split_menu_anchor(&this.probes.borrow(), primary_id)
-                            .unwrap_or(ev.position);
-                        let _ = this.open_split_menu(primary_id, at, cx);
-                    } else {
-                        this.close_menu();
-                        cx.notify();
-                    }
-                }),
-            );
+            .child(menu_button_label(cmd.label, fg))
+            .on_mouse_down(MouseButton::Left, menu_toggle(primary_id, cx));
         div()
             .id(SharedString::from(format!("{}-split", cmd.id)))
             .relative()
@@ -19580,22 +19590,6 @@ impl Docxy {
         let keytip =
             (self.keytips == KeyTip::Commands && !cmd.key_tip.is_empty()).then_some(cmd.key_tip);
         let id = cmd.id;
-        let lines = label_lines(cmd.label);
-        let last = lines.len().saturating_sub(1);
-        let mut label = v_flex().items_center();
-        for (i, ln) in lines.into_iter().enumerate() {
-            let ln = if i == last {
-                format!("{ln} ▾")
-            } else {
-                ln.to_string()
-            };
-            label = label.child(
-                div()
-                    .text_size(px(11.))
-                    .text_color(fg)
-                    .child(SharedString::from(ln)),
-            );
-        }
         div()
             .id(SharedString::from(format!("{id}-dropdown")))
             .relative()
@@ -19611,28 +19605,9 @@ impl Docxy {
             .hover(|d| d.bg(pal.hover))
             .child(probe(&self.probes, format!("ribbon-split:{id}")))
             .child(icon_svg(cmd.icon.0, 26., fg))
-            .child(label)
+            .child(menu_button_label(cmd.label, fg))
             .when(enabled, |d| {
-                d.on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                        cx.stop_propagation();
-                        let closed = this
-                            .menu_closed_at
-                            .take()
-                            .filter(|(_, at)| *at == ev.position)
-                            .map(|(t, _)| t);
-                        let open = this.menu.as_ref().map(|m| &m.target);
-                        if menu::split_arrow_opens(id, open, closed.as_ref()) {
-                            let at =
-                                split_menu_anchor(&this.probes.borrow(), id).unwrap_or(ev.position);
-                            let _ = this.open_split_menu(id, at, cx);
-                        } else {
-                            this.close_menu();
-                            cx.notify();
-                        }
-                    }),
-                )
+                d.on_mouse_down(MouseButton::Left, menu_toggle(id, cx))
             })
             .when_some(keytip, |d, k| d.child(keytip_badge(k)))
             .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
