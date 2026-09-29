@@ -127,27 +127,7 @@ impl ProjectView {
                     }
                 ));
             }
-            let initial = if self.col == COL_DURATION {
-                // A manual summary's duration is the span it shows.
-                let min = if task.summary {
-                    self.ed.disp_duration_min(task.uid).unwrap_or(0)
-                } else {
-                    task.duration_min
-                };
-                if min == 0 {
-                    "0".into()
-                } else if task.summary {
-                    // A summary's `?` is its subtasks'; it takes no estimate.
-                    format_duration_exact(min, self.ed.project())
-                } else {
-                    // An estimated duration reopens as it shows, `1d?`.
-                    format_duration_exact(min, self.ed.project())
-                        + duration_suffix(self.ed.project(), task.uid)
-                }
-            } else {
-                project_row(&self.ed, task)[self.col].clone()
-            };
-            (Some(task.uid), initial)
+            (Some(task.uid), cell_edit_text(&self.ed, task, self.col))
         };
         let buf = typed.map(str::to_owned).unwrap_or_else(|| initial.clone());
         self.cell = Some(CellEdit {
@@ -183,6 +163,30 @@ impl ProjectView {
             return Ok(status);
         };
         apply_cell(&mut self.ed, uid, col, &buf)
+    }
+}
+
+/// The text a cell edit opens with, which [`apply_cell`] reads back as the
+/// same value: a duration exactly (`2d`, not the rounded `2 days`). Copy
+/// writes it too, so a copied cell pastes as it was.
+pub(crate) fn cell_edit_text(ed: &ProjectEditor, task: &Task, col: usize) -> String {
+    if col != COL_DURATION {
+        return project_row(ed, task)[col].clone();
+    }
+    // A manual summary's duration is the span it shows.
+    let min = if task.summary {
+        ed.disp_duration_min(task.uid).unwrap_or(0)
+    } else {
+        task.duration_min
+    };
+    if min == 0 {
+        "0".into()
+    } else if task.summary {
+        // A summary's `?` is its subtasks'; it takes no estimate.
+        format_duration_exact(min, ed.project())
+    } else {
+        // An estimated duration reopens as it shows, `1d?`.
+        format_duration_exact(min, ed.project()) + duration_suffix(ed.project(), task.uid)
     }
 }
 

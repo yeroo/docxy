@@ -16,6 +16,7 @@ const UNDO_CAP: usize = 100;
 const EXTERNAL_TASK_DATES: &str = "External task: its dates come from its own project";
 pub const DURATION_HINT: &str = "try 3d, 4h, 2w, 1mo";
 
+mod batch;
 mod cells;
 mod effort;
 pub use cells::{
@@ -106,6 +107,8 @@ pub struct Editor {
     /// stack); undo, redo and a new document clear it, since they restore a
     /// model exactly and must not rewrite it.
     pending: Option<Schedule>,
+    /// Inside [`Self::batch`]; batches do not nest.
+    batching: bool,
 }
 
 impl Editor {
@@ -132,6 +135,7 @@ impl Editor {
             last_find: String::new(),
             pushes: 0,
             pending: None,
+            batching: false,
         }
     }
 

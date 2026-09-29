@@ -1,0 +1,24 @@
+test issue 369 copy a task name and paste it on another row and the entry row
+  open copy:../fixtures/project-clipboard.xml
+  call click-cell {"cell":"C1"}
+  key ctrl+c
+  key down
+  key ctrl+v
+  call task.list {}
+  assert selected_task is 1
+  assert selected_name is A
+  assert undo_depth is 1
+  assert dirty is true
+  key ctrl+z
+  call task.list {}
+  assert selected_name is B
+  assert undo_depth is 0
+  key down
+  key ctrl+v
+  call task.list {}
+  assert tasks is 3
+  assert selected_task is 2
+  assert selected_name is A
+  assert undo_depth is 1
+  key ctrl+z
+  assert tasks is 2

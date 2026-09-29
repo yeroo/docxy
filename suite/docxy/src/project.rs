@@ -12,6 +12,8 @@ mod commands;
 pub(super) use commands::*;
 mod cell;
 pub(super) use cell::*;
+mod clip;
+pub(super) use clip::*;
 mod timeline;
 pub(super) use timeline::*;
 
