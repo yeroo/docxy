@@ -15847,6 +15847,19 @@ fn emit_run(
     *idx = end;
 }
 
+/// How far one piece from `flat_inlines` advances `paragraph_el`'s caret offset
+/// (`idx`): a run's characters, one for a tab, a break or a field showing a
+/// result (#642), none for anything else (links are already opened up). This
+/// is the engine's `inline_len` for those pieces; `paragraph_el` asserts it.
+fn caret_advance(inline: &Inline) -> usize {
+    match inline {
+        Inline::Run(_) | Inline::Tab(_) | Inline::Break(_) | Inline::Field { .. } => {
+            docxcore::editor::inline_len(inline)
+        }
+        _ => 0,
+    }
+}
+
 /// A tab is ONE char in the engine; render it as a fixed-width spacer that
 /// advances to its tab stop (`width` px, computed by the caller). Keeps `idx` in
 /// sync and participates in caret/selection like any other char.
@@ -16294,6 +16307,7 @@ fn paragraph_el(
     }
     for i in 0..items.len() {
         let (inline, in_link) = (&*items[i].0, items[i].1);
+        let idx_before = idx;
         match inline {
             Inline::Run(r) => {
                 emit_run(
@@ -16353,7 +16367,7 @@ fn paragraph_el(
                 } else {
                     text.clone()
                 };
-                let width = docxcore::editor::inline_len(inline);
+                let width = caret_advance(inline);
                 let pos = idx;
                 if width == 1 && caret == Some(pos) {
                     spans.push(caret_bar());
@@ -16480,6 +16494,11 @@ fn paragraph_el(
                 );
             }
         }
+        debug_assert_eq!(
+            idx - idx_before,
+            caret_advance(inline),
+            "paragraph_el and the engine disagree on {inline:?}'s offsets"
+        );
     }
     if caret.is_some() {
         spans.push(caret_bar());
@@ -29568,7 +29587,7 @@ mod ribbon_fit_tests {
 
 #[cfg(test)]
 mod flat_inlines_tests {
-    use super::{Inline, flat_inlines};
+    use super::{Inline, caret_advance, flat_inlines};
     use docxcore::model::{BreakKind, Hyperlink, Run, RunProps};
 
     fn run(text: &str) -> Inline {
@@ -29578,19 +29597,10 @@ mod flat_inlines_tests {
         })
     }
 
-    /// The caret offsets `paragraph_el` hands out for these pieces: what
-    /// `emit_run`, `emit_tab`, `emit_break` and a field (one if it shows a
-    /// result, #642) advance `idx` by.
+    /// The caret offsets `paragraph_el` hands out for these pieces: the
+    /// `caret_advance` it asserts for each.
     fn offsets(items: &[(std::borrow::Cow<'_, Inline>, bool)]) -> usize {
-        items
-            .iter()
-            .map(|(i, _)| match &**i {
-                Inline::Run(r) => r.text.chars().count(),
-                Inline::Tab(_) | Inline::Break(_) => 1,
-                Inline::Field { text, .. } => usize::from(!text.is_empty()),
-                _ => 0,
-            })
-            .sum()
+        items.iter().map(|(i, _)| caret_advance(i)).sum()
     }
 
     /// #212: text after a complex link (one holding proofing marks, a tracked
