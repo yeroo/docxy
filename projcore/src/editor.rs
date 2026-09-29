@@ -50,10 +50,15 @@ pub fn default_anchor() -> DateTime {
     DateTime::from_ymd_hm(2026, 1, 5, 8, 0)
 }
 
+/// The name Microsoft Project gives a new blank plan (#407). A real
+/// Project file in the corpus, `corpus/mpp/saswat-part1.mpp`, still stores it
+/// (see `mppread/tests/real_mpp.rs`).
+pub const NEW_PROJECT_NAME: &str = "Project1";
+
 /// A new empty project. Hosts may add a starter task for their own UI.
 pub fn untitled_project() -> Project {
     Project {
-        name: "Untitled".into(),
+        name: NEW_PROJECT_NAME.into(),
         start_date: Some(default_anchor()),
         ..Project::default()
     }
@@ -1971,7 +1976,7 @@ mod tests {
     fn untitled_project_has_shared_anchor_and_no_tasks() {
         let p = untitled_project();
         assert!(p.tasks.is_empty());
-        assert_eq!(p.name, "Untitled");
+        assert_eq!(p.name, "Project1");
         assert_eq!(p.start_date, Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0)));
     }
 

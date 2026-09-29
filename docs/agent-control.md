@@ -165,7 +165,7 @@ File handling differs from the TUI:
   succeeds, or appends a new tab. Activation uses the normal tab lifecycle.
 - `proj.new {}` appends a blank Project tab and activates it through the same
   handler as the Backstage › New › Project card, so the plan is the app's
-  blank one: `Untitled.yppx`, named `Untitled`, no tasks, no path. It replies
+  blank one: `Untitled.yppx`, named `Project1`, no tasks, no path. It replies
   with `proj.path` for the new tab. It takes neither `tab` nor `name`; save the
   plan with `proj.save {"path":"..."}` to give it a file. It is refused while a
   dialog is open on the active tab.

@@ -1711,7 +1711,7 @@ mod tests {
         let ed = app();
         assert_eq!(
             path_info(Some("ctl-test.xml"), &ed).to_string(),
-            r#"{"path":"ctl-test.xml","modified":false,"name":"Untitled","tasks":1,"start":"2026-01-05 08:00","finish":"2026-01-05 17:00"}"#
+            r#"{"path":"ctl-test.xml","modified":false,"name":"Project1","tasks":1,"start":"2026-01-05 08:00","finish":"2026-01-05 17:00"}"#
         );
         assert_eq!(path_info(None, &ed).get("path"), Some(&Json::Null));
     }
