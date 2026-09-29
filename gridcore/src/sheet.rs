@@ -177,6 +177,16 @@ impl Cell {
     pub fn is_blank(&self) -> bool {
         self.value.is_empty() && self.formula.is_none()
     }
+    /// Is the formula an array one, evaluated by the dynamic-array engine: a
+    /// `t="array"` `<f>`, or a cell Excel marked dynamic with `cm` whose
+    /// `f_attrs` an edit dropped ([`crate::engine::Engine::set_cell`])?
+    pub fn is_array_formula(&self) -> bool {
+        self.f_attrs.as_deref().is_some_and(is_array_f) || self.has_cm()
+    }
+    /// Did Excel mark this cell a dynamic array (`cm`)?
+    pub fn has_cm(&self) -> bool {
+        self.meta.as_ref().is_some_and(|m| m.cm.is_some())
+    }
 }
 
 // ---------------------------------------------------------------------------

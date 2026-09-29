@@ -1785,7 +1785,7 @@ fn cell_xml(
         }
     };
 
-    let dynamic = cell.meta.as_ref().is_some_and(|m| m.cm.is_some());
+    let dynamic = cell.has_cm();
     let anchor = cell_name(row, col);
     let (f_xml, array_f) = match (&cell.formula, &cell.f_attrs) {
         // A spilling anchor writes fresh array attributes — its extent may
@@ -1809,13 +1809,15 @@ fn cell_xml(
         ),
         (Some(src), None) => (format!("<f>{}</f>", esc_text(src)), false),
         (Some(src), Some(fa)) if src.is_empty() => (format!("<f{fa}/>"), is_array_f(fa)),
-        // A loaded array that does not spill now: the `ref` it was loaded
-        // with is stale (its cells were cleared), so it covers the anchor.
-        (Some(src), Some(fa)) if is_array_f(fa) => (
+        // A loaded dynamic array that does not spill now: the `ref` it was
+        // loaded with is stale (its cells were cleared), so it covers the
+        // anchor. A legacy CSE array (no `cm`) keeps its ref: Excel refills
+        // that block on load.
+        (Some(src), Some(fa)) if dynamic && is_array_f(fa) => (
             format!("<f{}>{}</f>", with_ref(fa, &anchor), esc_text(src)),
             true,
         ),
-        (Some(src), Some(fa)) => (format!("<f{fa}>{}</f>", esc_text(src)), false),
+        (Some(src), Some(fa)) => (format!("<f{fa}>{}</f>", esc_text(src)), is_array_f(fa)),
         (None, _) => (String::new(), false),
     };
 
@@ -6341,6 +6343,57 @@ mod tests {
         let mut cell = pkg.workbook.sheets[0].cell(0, 3).cloned().unwrap();
         cell.style = 1;
         eng.set_cell(&mut pkg.workbook, (0, 0, 3), cell);
+    }
+
+    #[test]
+    fn legacy_array_block_keeps_its_ref_when_not_spilling() {
+        // A CSE array over D1:D3 (no `cm`) whose result is 1x1: Excel refills
+        // the block on load, so the ref must not shrink to the anchor.
+        let anchor = r#"<c r="D1"><f t="array" ref="D1:D3">SUM(A1:A5*A1:A5)</f><v>165</v></c>"#;
+        let rows = sort_anchor_rows(5, anchor)
+            .replacen(
+                r#"<c r="A2"><v>9</v></c>"#,
+                r#"<c r="A2"><v>9</v></c><c r="D2"><v>165</v></c>"#,
+                1,
+            )
+            .replacen(
+                r#"<c r="A3"><v>1</v></c>"#,
+                r#"<c r="A3"><v>1</v></c><c r="D3"><v>165</v></c>"#,
+                1,
+            );
+        let mut pkg = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        let ws = saved_sheet1(&pkg);
+        assert!(
+            ws.contains(r#"<c r="D1"><f t="array" ref="D1:D3">SUM(A1:A5*A1:A5)</f><v>165</v></c>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn format_edited_dynamic_anchor_still_spills_after_an_engine_rebuild() {
+        // xlsxy rebuilds the engine (Engine::new + recalc_all) after a
+        // structural edit; the format edit dropped `f_attrs`, so only `cm`
+        // still says the anchor is a dynamic array.
+        let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SORT_ANCHOR))).unwrap();
+        format_d1(&mut pkg);
+        assert!(pkg.workbook.sheets[0].cell(0, 3).unwrap().f_attrs.is_none());
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(0, 3).unwrap().spill,
+            Some((5, 1))
+        );
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(4, 3).unwrap().value,
+            CellValue::Number(1.0)
+        );
+        let ws = saved_sheet1(&pkg);
+        assert!(
+            ws.contains(r#"<c r="D1" s="1" cm="1"><f t="array" ref="D1:D5">"#),
+            "{ws}"
+        );
     }
 
     #[test]

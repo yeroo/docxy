@@ -413,8 +413,8 @@ pub fn autofill(
 /// — which is also what makes it safe to shift.
 ///
 /// Nor does it inherit `<c>` metadata: `vm` describes the source's value, and
-/// `cm` could not reach the file anyway (the copy is re-indexed as a legacy
-/// formula and written as a plain `<f>`), so the copy starts without any.
+/// a `cm` would make the copy a dynamic array (engine and writer both go by
+/// it) where this ordinary formula is meant, so the copy starts without any.
 fn rebase(cell: &mut Cell, dr: i64, dc: i64) {
     cell.meta = None;
     if cell.f_attrs.take().is_some() && cell.formula.as_deref() == Some("") {
