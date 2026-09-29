@@ -2916,7 +2916,10 @@ mod tests {
         let mut ed = crate::editor::Editor::new(d);
         ed.accept_all_revisions();
         let out = crate::serialize::document_to_xml(&ed.doc);
-        assert!(!out.contains("<w:ins ") && !out.contains("<w:del "), "{out}");
+        assert!(
+            !out.contains("<w:ins ") && !out.contains("<w:del "),
+            "{out}"
+        );
         // A formatting change on a result run, or a deleted instruction.
         for inner in [
             "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\

@@ -415,6 +415,10 @@ impl Editor {
     }
 
     pub fn insert_char(&mut self, ch: char) {
+        // A field's stand-in is not text: typing it does nothing at all.
+        if ch == FIELD_CHAR {
+            return;
+        }
         if self.has_selection() {
             self.delete_selection();
         }
@@ -1588,6 +1592,7 @@ impl Editor {
         let Some((lo, hi)) = self.selection_range() else {
             return;
         };
+        let text = &without_field_chars(text);
         if lo.path == hi.path && !text.contains('\n') {
             self.checkpoint(EditKind::Structural);
             if let Some(p) = para_mut(&mut self.doc.body, &lo.path) {
@@ -2164,7 +2169,7 @@ pub const FIELD_CHAR: char = '\u{FFFC}';
 /// it selects it first, and the next press deletes all of it (as Word does). A
 /// `w:sym` symbol run, which the loader also keeps as a [`Inline::Field`], is a
 /// plain character instead and is deleted at once.
-pub fn is_field_unit(inline: &Inline) -> bool {
+pub(crate) fn is_field_unit(inline: &Inline) -> bool {
     match inline {
         Inline::Field { raw, text } => {
             let symbol = raw.contains("<w:sym")
@@ -2174,6 +2179,12 @@ pub fn is_field_unit(inline: &Inline) -> bool {
         }
         _ => false,
     }
+}
+
+/// `text` without [`FIELD_CHAR`]s, for the entry points that insert text: the
+/// stand-in adds nothing, so callers must count what is left.
+fn without_field_chars(text: &str) -> String {
+    text.chars().filter(|&c| c != FIELD_CHAR).collect()
 }
 
 /// The inline holding editor offset `idx` (the character at `[idx, idx + 1)`),
@@ -2255,6 +2266,7 @@ fn push_display_text(
 /// [`typing_props`]: a tab's own), joining the following run only when that
 /// matches, right where the tab or break was.
 fn replace_range_in_content(content: &mut Vec<Inline>, start: usize, end: usize, with: &str) {
+    let with = &without_field_chars(with);
     if end <= start {
         for (k, ch) in with.chars().enumerate() {
             content_insert(content, start + k, ch);
@@ -2506,9 +2518,6 @@ fn is_marker(inline: &Inline) -> bool {
 }
 
 fn content_insert(content: &mut Vec<Inline>, o: usize, ch: char) {
-    if ch == FIELD_CHAR {
-        return;
-    }
     let Some((i, local)) = locate(content, o) else {
         if let Some(Inline::Run(r)) = content.last_mut() {
             let rl = r.text.chars().count();
@@ -5428,6 +5437,31 @@ mod tests {
         let (n, steps) = crate::agent::replace_range(&mut ed, 0, 0, "Body text\u{FFFC}").unwrap();
         assert_eq!((n, steps), (1, 2));
         assert_eq!(etext(&ed), "Body text");
+    }
+
+    #[test]
+    fn the_field_character_never_shifts_the_caret_or_a_replace_642() {
+        // Typed in the middle of a paragraph: nothing, not even a caret step.
+        let mut ed = Editor::new(xml_doc("<w:r><w:t>XY</w:t></w:r>"));
+        ed.set_caret(Caret::at(vec![0], 1));
+        ed.insert_str("a\u{FFFC}b");
+        assert_eq!(etext(&ed), "XabY");
+        assert_eq!(ed.caret.offset, 3);
+        // A replacement holding it: the rest is counted without it.
+        let mut content = vec![run("abcdef", RunProps::default())];
+        replace_range_in_content(&mut content, 0, 2, "X\u{FFFC}");
+        assert_eq!(editor_text(&content), "Xcdef");
+        let mut ed = Editor::new(xml_doc("<w:r><w:t>abcdef</w:t></w:r>"));
+        ed.select_match(&Match {
+            path: vec![0],
+            start: 1,
+            end: 3,
+        });
+        ed.replace_current_with("Z\u{FFFC}");
+        assert_eq!(etext(&ed), "aZdef");
+        assert_eq!(ed.caret.offset, 2);
+        assert_eq!(ed.replace_all("de", "\u{FFFC}Q", false), 1);
+        assert_eq!(etext(&ed), "aZQf");
     }
 
     #[test]
