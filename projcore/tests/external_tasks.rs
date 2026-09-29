@@ -183,8 +183,16 @@ fn external_leaf_is_not_local_work_or_a_project_bound() {
     dated.tasks.insert(0, summary);
     assert!(schedule(&dated).rolled_up(4).is_none());
     assert!(level(&dated).rolled_up(4).is_none());
+    // With nothing local to roll up, the summary sits at the project start.
+    let span = |sched: &projcore::schedule::Schedule| {
+        let r = sched.get(4).unwrap();
+        (r.early_start, r.early_finish)
+    };
+    assert_eq!(span(&schedule(&dated)), (at(2, 8), at(2, 8)));
+    assert_eq!(level(&dated).start(4), Some(at(2, 8)));
     dated.start_date = None;
     let fallback = DateTime::from_ymd_hm(2020, 1, 6, 8, 0);
+    assert_eq!(span(&schedule(&dated)), (fallback, fallback));
     assert_eq!(schedule(&dated).project_start, fallback);
     assert_eq!(schedule(&dated).project_finish, fallback);
     assert_eq!(level(&dated).project_finish, fallback);
