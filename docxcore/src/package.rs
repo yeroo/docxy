@@ -1951,8 +1951,13 @@ pub fn save_package(pkg: &Package) -> Vec<u8> {
         xml.find("<w:document"),
         xml.find("<w:body>"),
     ) {
+        // Content before `<w:body>` (in practice `w:background`, Word's page
+        // colour, with its VML fill) is not modelled. Carry it over verbatim;
+        // only here, where the original root declarations are re-emitted, so
+        // its `v:`/`o:` prefixes stay bound.
+        let prolog = document_prolog(&original_doc).unwrap_or_default();
         xml = format!(
-            "{}<w:document {attrs}>{}",
+            "{}<w:document {attrs}>{prolog}{}",
             &xml[..doc_pos],
             &xml[body_pos..]
         );
@@ -1962,6 +1967,26 @@ pub fn save_package(pkg: &Package) -> Vec<u8> {
     }
     parts[pkg.doc_index].1 = xml.into_bytes();
     write_zip(&parts)
+}
+
+/// The raw XML between the `<w:document …>` start tag and `<w:body`, such as
+/// `w:background`. `None` when there is no body or the slice is whitespace.
+fn document_prolog(original: &str) -> Option<&str> {
+    let mut parser = XmlParser::new(original);
+    let mut root_end = None;
+    loop {
+        match parser.next() {
+            Event::Start if root_end.is_none() && parser.name() == "w:document" => {
+                root_end = Some(parser.pos());
+            }
+            Event::Start if parser.name() == "w:body" => {
+                let prolog = parser.raw_slice(root_end?, parser.start_pos());
+                return (!prolog.trim().is_empty()).then_some(prolog);
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
 }
 
 /// Serialize a package without regenerating its main document part. This is the
@@ -2974,6 +2999,87 @@ mod tests {
         );
         // the second paragraph is untouched
         assert!(reloaded.document.plain_text().contains("World"));
+    }
+
+    const PAGE_COLOR: &str = r#"<w:background w:color="FFF2CC"/>"#;
+    const PAGE_GRADIENT: &str = r##"<w:background w:color="FFF2CC"><v:background id="_x0000_s1025" o:bwmode="white" o:targetscreensize="1024,768"><v:fill color2="#9DC3E6" type="gradient"/></v:background></w:background>"##;
+
+    /// A one-paragraph document with `prolog` between the root and `<w:body>`.
+    fn background_doc(prolog: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">{prolog}<w:body><w:p><w:r><w:t>Hello</w:t></w:r></w:p></w:body></w:document>"#
+        )
+    }
+
+    fn saved_document_xml(bytes: &[u8]) -> String {
+        let pkg = load_package(bytes).expect("reload");
+        String::from_utf8_lossy(pkg.part("word/document.xml").unwrap()).into_owned()
+    }
+
+    /// The text between the end of the `<w:document …>` start tag and `<w:body`.
+    fn prolog_of(doc_xml: &str) -> &str {
+        let root = doc_xml.find("<w:document").unwrap();
+        let root_end = root + doc_xml[root..].find('>').unwrap() + 1;
+        &doc_xml[root_end..doc_xml.find("<w:body").unwrap()]
+    }
+
+    #[test]
+    fn save_preserves_page_background_color() {
+        let pkg = load_package(&make_docx(&background_doc(PAGE_COLOR))).expect("load");
+        let once = save_package(&pkg);
+        assert_eq!(prolog_of(&saved_document_xml(&once)), PAGE_COLOR);
+
+        // A second round-trip keeps exactly one copy.
+        let twice = save_package(&load_package(&once).expect("reload"));
+        let doc_xml = saved_document_xml(&twice);
+        assert_eq!(prolog_of(&doc_xml), PAGE_COLOR);
+        assert_eq!(doc_xml.matches("<w:background").count(), 1, "{doc_xml}");
+    }
+
+    #[test]
+    fn save_preserves_gradient_page_background() {
+        let pkg = load_package(&make_docx(&background_doc(PAGE_GRADIENT))).expect("load");
+        let doc_xml = saved_document_xml(&save_package(&pkg));
+        assert_eq!(prolog_of(&doc_xml), PAGE_GRADIENT);
+        // The VML prefixes the fill uses are still declared on the root.
+        let root = &doc_xml[doc_xml.find("<w:document").unwrap()..];
+        let root = &root[..root.find('>').unwrap()];
+        assert!(
+            root.contains(r#"xmlns:v="urn:schemas-microsoft-com:vml""#),
+            "{root}"
+        );
+        assert!(
+            root.contains(r#"xmlns:o="urn:schemas-microsoft-com:office:office""#),
+            "{root}"
+        );
+    }
+
+    #[test]
+    fn save_without_background_adds_no_prolog() {
+        let pkg = load_package(&make_docx(&background_doc(""))).expect("load");
+        assert_eq!(prolog_of(&saved_document_xml(&save_package(&pkg))), "");
+
+        // Whitespace-only prolog is not carried over either.
+        let pkg = load_package(&make_docx(&background_doc("\n  "))).expect("load");
+        assert_eq!(prolog_of(&saved_document_xml(&save_package(&pkg))), "");
+
+        let doc = crate::markdown::from_markdown("Hello");
+        let bytes = save_package(&new_markdown_package(doc));
+        assert_eq!(prolog_of(&saved_document_xml(&bytes)), "");
+    }
+
+    #[test]
+    fn save_keeps_background_after_body_edit() {
+        let mut pkg = load_package(&make_docx(&background_doc(PAGE_COLOR))).expect("load");
+        if let Block::Paragraph(p) = &mut pkg.document.body[0] {
+            if let Inline::Run(r) = &mut p.content[0] {
+                r.text = "Goodbye".to_string();
+            }
+        }
+        let saved = save_package(&pkg);
+        assert_eq!(prolog_of(&saved_document_xml(&saved)), PAGE_COLOR);
+        let reloaded = load_package(&saved).expect("reload");
+        assert_eq!(reloaded.document.plain_text().trim(), "Goodbye");
     }
 
     #[test]
