@@ -1722,6 +1722,57 @@ fn resolve_commands(
 }
 
 /// The active spreadsheet, or the refusal every cell verb needs.
+/// What the active tab's paste would take besides the clipboard's text: the
+/// document's in-app clip, or the grid clip while the clipboard still holds
+/// what it put there (`grid_paste_uses_clip`); otherwise `none`, and a paste
+/// takes `text` (a document never reads it: see the stale-clip follow-up).
+fn clipboard_app_json(
+    surface: Option<&crate::Surface>,
+    doc: Option<&docxcore::editor::Clip>,
+    grid: Option<&crate::GridClip>,
+    now: Option<&str>,
+) -> Json {
+    match surface {
+        Some(crate::Surface::Doc(_)) => {
+            if let Some(clip) = doc {
+                return Json::obj(vec![
+                    ("kind", Json::Str("doc".into())),
+                    ("text", Json::Str(clip.to_text())),
+                ]);
+            }
+        }
+        Some(crate::Surface::Sheet(_)) => {
+            if let Some(clip) = grid.filter(|c| crate::grid_paste_uses_clip(&c.text, now)) {
+                return Json::obj(vec![
+                    ("kind", Json::Str("grid".into())),
+                    ("text", Json::Str(clip.text.clone())),
+                    ("rows", Json::Num(clip.cells.len() as f64)),
+                    (
+                        "cols",
+                        Json::Num(clip.cells.first().map_or(0, Vec::len) as f64),
+                    ),
+                ]);
+            }
+        }
+        _ => {}
+    }
+    Json::obj(vec![("kind", Json::Str("none".into()))])
+}
+
+/// The `clipboard` reply: the clipboard's text (the harness's private one)
+/// and what the active tab's paste would use.
+fn clipboard_json(app: &crate::Docxy, cx: &App) -> Json {
+    let now = app.clipboard_read(cx);
+    let surface = app.tabs.get(app.active).map(|t| &t.surface);
+    let used = clipboard_app_json(
+        surface,
+        app.clip.as_ref(),
+        app.grid_clip.as_ref(),
+        now.as_deref(),
+    );
+    Json::obj(vec![("text", str_or_null(now)), ("app", used)])
+}
+
 fn sheet(app: &crate::Docxy) -> Result<&SheetView, String> {
     app.active_sheet()
         .ok_or_else(|| "the active tab is not a spreadsheet".to_string())
@@ -2350,6 +2401,34 @@ pub fn dispatch(
             Done::ok(state(app, window))
         }
 
+        // The clipboard (#699). A harness instance has a private one (it starts
+        // empty and never touches the OS clipboard); `write` puts text on it
+        // as another app's copy would. Copy, cut and paste are the app's own
+        // keys and buttons (`key ctrl+c`, `ribbon-click`), not a second route.
+        "clipboard" => {
+            match arg_str(args, "action")? {
+                "read" => {}
+                "write" => {
+                    let text = arg_str(args, "text")?.to_string();
+                    app.clipboard_write(text, cx);
+                }
+                "paste-special" => {
+                    return Err("paste special is not implemented in this app".into());
+                }
+                action @ ("copy" | "cut" | "paste") => {
+                    return Err(format!(
+                        "clipboard does not {action}: press the app's own key (key ctrl+c, ctrl+x, ctrl+v) or ribbon-click its button"
+                    ));
+                }
+                other => {
+                    return Err(format!(
+                        "unknown clipboard action '{other}' (read, write, paste-special)"
+                    ));
+                }
+            }
+            Done::ok(clipboard_json(app, cx))
+        }
+
         // A drag: the press plants the anchor, each cell crossed is a move, the
         // release commits whatever the moves armed.
         "drag" => {
@@ -2696,6 +2775,49 @@ mod tests {
                 })],
             })],
         })
+    }
+
+    /// #699: `clipboard` reports what the active tab's paste would take: the
+    /// document clip on a document, the grid clip on a sheet only while the
+    /// clipboard still holds its text, and nothing on other surfaces.
+    #[test]
+    fn clipboard_reports_the_clip_the_next_paste_would_use() {
+        let doc = crate::Surface::Doc(editor(ParProps::default(), RunProps::default()));
+        let sheet = crate::new_sheet_surface();
+        let clip = docxcore::editor::Clip::from_text("one\ntwo");
+        let grid = crate::GridClip {
+            cells: vec![vec![Default::default(); 3]; 2],
+            text: "a\tb\tc\nd\te\tf\n".into(),
+        };
+        let kind = |j: Json| j.get_str("kind").unwrap().to_string();
+
+        let on_doc = clipboard_app_json(Some(&doc), Some(&clip), Some(&grid), None);
+        assert_eq!(kind(on_doc.clone()), "doc");
+        assert_eq!(on_doc.get_str("text"), Some("one\ntwo"));
+        let bare = clipboard_app_json(Some(&doc), None, Some(&grid), None);
+        assert_eq!(kind(bare), "none");
+
+        let ours = clipboard_app_json(Some(&sheet), Some(&clip), Some(&grid), Some(&grid.text));
+        assert_eq!(kind(ours.clone()), "grid");
+        assert_eq!(ours.get("rows"), Some(&Json::Num(2.)));
+        assert_eq!(ours.get("cols"), Some(&Json::Num(3.)));
+        let crlf = grid.text.replace('\n', "\r\n");
+        let echoed = clipboard_app_json(Some(&sheet), None, Some(&grid), Some(&crlf));
+        assert_eq!(kind(echoed), "grid");
+        let replaced = clipboard_app_json(Some(&sheet), None, Some(&grid), Some("x\ty"));
+        assert_eq!(kind(replaced), "none");
+
+        let placeholder = crate::Surface::Placeholder;
+        assert_eq!(
+            kind(clipboard_app_json(
+                Some(&placeholder),
+                Some(&clip),
+                Some(&grid),
+                None
+            )),
+            "none"
+        );
+        assert_eq!(kind(clipboard_app_json(None, None, None, None)), "none");
     }
 
     /// #697: a harness instance ignores the pane it was launched from and is

@@ -851,6 +851,43 @@ fn fill_box(src: (u32, u32, u32, u32), to: (u32, u32)) -> (u32, u32, u32, u32) {
 #[derive(Clone)]
 struct GridClip {
     cells: Vec<Vec<gridcore::sheet::Cell>>,
+    /// The TSV this copy put on the clipboard. While the clipboard still holds
+    /// it, a paste uses `cells` (formats and formulas intact); once something
+    /// else has been copied, the clipboard's text wins.
+    text: String,
+}
+
+/// Whether a sheet paste uses the grid clip recorded as `recorded` rather than
+/// the clipboard text `now` (#699). The grid clip is ours only while the
+/// clipboard still holds the text we put there: another app's copy replaces
+/// it, and pasting our older cells then would paste the wrong thing. An
+/// unreadable clipboard (`None`) cannot say it changed, so the clip stands.
+/// Line endings are compared loosely because the OS may hand CRLF back.
+fn grid_paste_uses_clip(recorded: &str, now: Option<&str>) -> bool {
+    now.is_none_or(|now| now.replace("\r\n", "\n") == recorded.replace("\r\n", "\n"))
+}
+
+/// The text clipboard the app reads and writes (#699). A normal instance uses
+/// the OS clipboard; a harness instance keeps a private one, so a UI test can
+/// neither read nor overwrite what the person at the machine copied, and
+/// starts from an empty clipboard whatever they have on theirs.
+#[derive(Default)]
+struct ClipboardStore {
+    private: Option<String>,
+}
+
+impl ClipboardStore {
+    fn write(&mut self, harness: bool, text: String, os: impl FnOnce(String)) {
+        if harness {
+            self.private = Some(text);
+        } else {
+            os(text);
+        }
+    }
+
+    fn read(&self, harness: bool, os: impl FnOnce() -> Option<String>) -> Option<String> {
+        if harness { self.private.clone() } else { os() }
+    }
 }
 
 /// A spreadsheet ribbon command (the sheet counterpart to the document `Act`).
@@ -1431,6 +1468,8 @@ struct Docxy {
     // The spreadsheet clipboard: a rectangular block of cells from the last grid
     // copy/cut, pasted at the selection on Ctrl+V.
     grid_clip: Option<GridClip>,
+    /// The text clipboard: the OS one, or a private one in a harness.
+    clipboard: ClipboardStore,
     // Open sheet colour-swatch picker (fill or font), None = closed.
     sheet_pick: Option<SheetPick>,
     // Inline sheet-tab rename in progress: (tab index, edit buffer). None = idle.
@@ -5868,6 +5907,7 @@ impl Docxy {
             zoom: 1.0,
             ruler_guide: None,
             grid_clip: None,
+            clipboard: ClipboardStore::default(),
             sheet_pick: None,
             sheet_rename: None,
             sheet_grid_w: 1000.0,
@@ -8590,6 +8630,21 @@ impl Docxy {
         cx.notify();
     }
 
+    /// Put `text` on the clipboard: the OS one, or the private one in a harness.
+    fn clipboard_write(&mut self, text: String, cx: &mut App) {
+        let harness = self.harness.is_some();
+        self.clipboard.write(harness, text, |text| {
+            cx.write_to_clipboard(ClipboardItem::new_string(text))
+        });
+    }
+
+    /// The clipboard's text: the OS one, or the private one in a harness.
+    fn clipboard_read(&self, cx: &App) -> Option<String> {
+        self.clipboard.read(self.harness.is_some(), || {
+            cx.read_from_clipboard().and_then(|item| item.text())
+        })
+    }
+
     /// Copy (or cut) the selected range into the grid clipboard and, as TSV, the
     /// system clipboard.
     fn sheet_copy(&mut self, cut: bool, cx: &mut Context<Self>) {
@@ -8609,8 +8664,11 @@ impl Docxy {
             cells.push(row);
             tsv.push('\n');
         }
-        self.grid_clip = Some(GridClip { cells });
-        cx.write_to_clipboard(ClipboardItem::new_string(tsv));
+        self.grid_clip = Some(GridClip {
+            cells,
+            text: tsv.clone(),
+        });
+        self.clipboard_write(tsv, cx);
         if cut {
             self.sheet_clear(cx); // snapshots, clears the range, marks dirty
         } else {
@@ -8618,15 +8676,21 @@ impl Docxy {
         }
     }
 
-    /// Paste at the selection: the grid clipboard when present (full-fidelity
-    /// cells), else the system clipboard parsed as TSV.
+    /// Paste at the selection: the grid clipboard while it is still what the
+    /// clipboard holds (full-fidelity cells), else the clipboard text parsed as
+    /// TSV.
     fn sheet_paste(&mut self, cx: &mut Context<Self>) {
         if self.sheet_protected() {
             return;
         }
-        let block: Vec<Vec<gridcore::sheet::Cell>> = if let Some(clip) = &self.grid_clip {
+        let now = self.clipboard_read(cx);
+        let block: Vec<Vec<gridcore::sheet::Cell>> = if let Some(clip) = self
+            .grid_clip
+            .as_ref()
+            .filter(|clip| grid_paste_uses_clip(&clip.text, now.as_deref()))
+        {
             clip.cells.clone()
-        } else if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+        } else if let Some(text) = now {
             text.replace("\r\n", "\n")
                 .trim_end_matches('\n')
                 .split('\n')
@@ -14168,6 +14232,47 @@ fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) {
             tab.dirty = false;
         }
         Err(e) => tab.status = format!("save failed: {e}").into(),
+    }
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::{ClipboardStore, grid_paste_uses_clip};
+
+    /// #699: a harness instance never reads or writes the OS clipboard, and
+    /// starts from an empty private one.
+    #[test]
+    fn a_harness_clipboard_is_private_and_starts_empty() {
+        let mut store = ClipboardStore::default();
+        let os_read = || -> Option<String> { panic!("a harness read the OS clipboard") };
+        assert_eq!(store.read(true, os_read), None);
+        store.write(true, "cells".into(), |_| {
+            panic!("a harness wrote the OS clipboard")
+        });
+        assert_eq!(store.read(true, os_read), Some("cells".into()));
+    }
+
+    #[test]
+    fn a_normal_instance_uses_the_os_clipboard_only() {
+        let mut store = ClipboardStore::default();
+        let mut written = None;
+        store.write(false, "tsv".into(), |t| written = Some(t));
+        assert_eq!(written.as_deref(), Some("tsv"));
+        assert_eq!(store.read(false, || Some("os".into())), Some("os".into()));
+        assert_eq!(store.read(false, || None), None);
+    }
+
+    /// #699: after another app copies, a sheet paste takes that text rather
+    /// than the older grid clip; while the clipboard still holds our TSV (the
+    /// OS may hand it back with CRLF) the grid clip keeps formats and formulas.
+    #[test]
+    fn a_grid_clip_is_pasted_only_while_the_clipboard_still_holds_it() {
+        let ours = "a\tb\n1\t2\n";
+        assert!(grid_paste_uses_clip(ours, Some(ours)));
+        assert!(grid_paste_uses_clip(ours, Some("a\tb\r\n1\t2\r\n")));
+        assert!(grid_paste_uses_clip(ours, None));
+        assert!(!grid_paste_uses_clip(ours, Some("from another app")));
+        assert!(!grid_paste_uses_clip(ours, Some("")));
     }
 }
 
