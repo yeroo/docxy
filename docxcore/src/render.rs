@@ -1643,25 +1643,60 @@ fn flatten_para(
                     });
                 }
             }
-            // A field's cached result flows as ordinary (non-editable) body text.
+            // A field's cached result flows as body text, but it is one editor
+            // offset (#642): every glyph carries it, so the caret stops only
+            // before and after the whole result, a click anywhere in it snaps
+            // to one of those, and selecting the offset highlights all of it.
+            // Its spaces don't break, so the result never wraps mid-field.
             Inline::Field { text, .. } => {
-                let st = Style::default();
+                let mut st = Style::default();
+                if fi.link.is_some() {
+                    st.underline = true;
+                    st.color = Some(Color::Cyan);
+                }
+                st.highlight |= sel_at(mc);
                 for ch in text.chars() {
+                    let (ch, disp) = if ch == ' ' {
+                        ('\u{00a0}', Some(' '))
+                    } else {
+                        (ch, None)
+                    };
                     segs.last_mut().unwrap().glyphs.push(Glyph {
                         ch,
-                        disp: None,
+                        disp,
                         style: st.clone(),
-                        link: None,
-                        src: None,
+                        link: fi.link.clone(),
+                        src: Some(mc),
                         dir: BidiRunDirection::Natural,
                         img: None,
                     });
                 }
+                mc += crate::editor::inline_len(item);
             }
             // A tracked change flows inline as (non-editable) text; the insert /
-            // delete cue (underline / strikethrough) is baked into its runs.
-            Inline::Revision { content, .. } => {
+            // delete cue (underline / strikethrough) is baked into its runs. A
+            // field inside it (loaded as one unit, #642) gets the cue here.
+            Inline::Revision { kind, content, .. } => {
                 for inner in content {
+                    if let Inline::Field { text, .. } = inner {
+                        let st = Style {
+                            underline: *kind == RevisionKind::Insert || fi.link.is_some(),
+                            strike: *kind == RevisionKind::Delete,
+                            color: fi.link.as_ref().map(|_| Color::Cyan),
+                            ..Style::default()
+                        };
+                        for ch in text.chars() {
+                            segs.last_mut().unwrap().glyphs.push(Glyph {
+                                ch,
+                                disp: None,
+                                style: st.clone(),
+                                link: fi.link.clone(),
+                                src: None,
+                                dir: BidiRunDirection::Natural,
+                                img: None,
+                            });
+                        }
+                    }
                     if let Inline::Run(r) = inner {
                         let eff = opts.styles.effective_run(
                             para.props.style_id.as_deref(),
@@ -4322,6 +4357,90 @@ mod tests {
             .map(|caret| (caret.offset, caret.col))
             .collect();
         assert_eq!(stops, vec![(0, 0), (1, 1), (2, 8), (3, 9)]);
+    }
+
+    fn field_642(text: &str) -> Inline {
+        Inline::Field {
+            raw: "<w:fldSimple w:instr=\" PAGE \"/>".into(),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn a_field_has_caret_stops_only_around_its_whole_result_642() {
+        let d = doc(vec![para(vec![
+            run("Body", RunProps::default()),
+            field_642("Page 1 of 3"),
+            field_642("7"),
+        ])]);
+        let (lines, maps) = render_mapped(&d, &opts(40));
+        assert_eq!(lines[0].plain(), "BodyPage 1 of 37");
+        let stops: Vec<(usize, usize)> = maps[0]
+            .visual_positions()
+            .into_iter()
+            .map(|caret| (caret.offset, caret.col))
+            .collect();
+        assert_eq!(
+            stops,
+            vec![(0, 0), (1, 1), (2, 2), (3, 3), (4, 4), (5, 15), (6, 16)]
+        );
+        // A click anywhere in the result lands on one of its edges.
+        for col in 5..15 {
+            let off = maps[0].nearest_caret(col).unwrap().offset;
+            assert!(off == 4 || off == 5, "col {col} -> offset {off}");
+        }
+    }
+
+    #[test]
+    fn selecting_a_field_highlights_its_whole_result_642() {
+        let d = doc(vec![para(vec![
+            run("Body", RunProps::default()),
+            field_642("Page 1"),
+            run("x", RunProps::default()),
+        ])]);
+        let mut o = opts(40);
+        o.selection = vec![(vec![0], 4, 5)];
+        let lines = render(&d, &o);
+        let highlighted: String = lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.style.highlight)
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(highlighted, "Page 1");
+    }
+
+    #[test]
+    fn a_fields_result_never_wraps_mid_field_642() {
+        let d = doc(vec![para(vec![
+            run("Body ", RunProps::default()),
+            field_642("Page 1 of 3"),
+        ])]);
+        let lines = render(&d, &opts(12));
+        let plain: Vec<String> = lines.iter().map(|l| l.plain()).collect();
+        assert_eq!(plain, vec!["Body", "Page 1 of 3"]);
+    }
+
+    #[test]
+    fn a_field_in_a_tracked_change_shows_its_result_642() {
+        let d = doc(vec![para(vec![
+            run("a", RunProps::default()),
+            Inline::Revision {
+                kind: RevisionKind::Delete,
+                metadata: RevisionMetadata::default(),
+                raw: "<w:del/>".into(),
+                content: vec![field_642("9")],
+                content_changed: false,
+            },
+        ])]);
+        let lines = render(&d, &opts(40));
+        assert_eq!(lines[0].plain(), "a9");
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|s| s.text == "9" && s.style.strike)
+        );
     }
 
     #[test]

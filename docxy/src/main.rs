@@ -7539,6 +7539,56 @@ mod tests {
         assert!(lines[2].spans.iter().any(|span| span.style.strike));
     }
 
+    #[test]
+    fn bidi_renderer_puts_caret_stops_only_around_a_whole_field_642() {
+        let field = |text: &str| Inline::Field {
+            raw: "<w:fldSimple w:instr=\" PAGE \"/>".to_string(),
+            text: text.to_string(),
+        };
+        let doc = bidi_doc(vec![
+            bidi_para_with(
+                ParProps::default(),
+                vec![bidi_run("Body"), field("Page 1"), bidi_run("x")],
+            ),
+            bidi_para_with(
+                ParProps::default(),
+                vec![bidi_run("אבג "), field("12"), bidi_run(" דה")],
+            ),
+        ]);
+        let (lines, maps) = docxcore::render::render_mapped(&doc, &bidi_opts(30));
+        assert_eq!(lines[0].plain(), "BodyPage 1x");
+        let stops: Vec<(usize, usize)> = maps[0]
+            .visual_positions()
+            .into_iter()
+            .map(|caret| (caret.offset, caret.col))
+            .collect();
+        assert_eq!(
+            stops,
+            vec![(0, 0), (1, 1), (2, 2), (3, 3), (4, 4), (5, 10), (6, 11)]
+        );
+        // In right-to-left text the field keeps two stops, one per edge of its
+        // whole result, and none inside it.
+        let stops: Vec<usize> = maps[1]
+            .visual_positions()
+            .into_iter()
+            .map(|caret| caret.offset)
+            .collect();
+        let line = lines[1].plain();
+        let at = line.find("12").expect("the field's result is drawn");
+        let field_cols: Vec<usize> = maps[1]
+            .visual_positions()
+            .into_iter()
+            .filter(|caret| caret.offset == 4 || caret.offset == 5)
+            .map(|caret| caret.col)
+            .collect();
+        assert!(stops.contains(&4) && stops.contains(&5), "{stops:?}");
+        let at = line[..at].chars().count();
+        assert!(
+            field_cols.iter().all(|&col| col <= at || col >= at + 2),
+            "no stop inside the field: {field_cols:?} around {at} in {line:?}"
+        );
+    }
+
     fn rendered_text(app: &mut App, width: u16) -> String {
         app.ensure_rendered(width);
         app.lines
