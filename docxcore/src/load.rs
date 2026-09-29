@@ -841,30 +841,29 @@ fn parse_paragraph(p: &mut XmlParser, rels: &Relationships) -> Paragraph {
 /// result, end) into one [`Inline::Field`], so the editor treats it as a single
 /// unit instead of editable result text between invisible markers (#642).
 ///
-/// One instance runs per inline loop, and only runs parsed *directly* by that
-/// loop open or close a field, so `raw` (the source slice from the begin run's
-/// `<w:r>` to the end run's `</w:r>`) is always well-formed: any element between
-/// them is inside it whole. A field is left as loose markers, exactly as before:
-/// - when its end is never seen by the same loop (it spans paragraphs, or sits
-///   in another container);
-/// - when its begin shares a run with another marker (a previous field's end),
-///   or a new begin follows its end in the same run, since the slice would cut
-///   into the other field;
-/// - when a child between begin and end brought field markers of its own (an
-///   unwrapped smart tag or content control holding half of a field), since
-///   those can't be paired reliably;
-/// - when its runs hold something a Field would hide or lose: a tracked change
-///   (review must still see it), a picture, object, text box, chart, SmartArt,
-///   equation or note reference, a tab or break (a TOC entry's tab leader, a
-///   line break in a result), or a comment's range or reference mark.
+/// One instance runs per inline loop, and only field-code runs parsed
+/// *directly* by that loop (runs holding `w:fldChar` / `w:instrText`) open or
+/// close a field, so `raw` (the source slice from the begin run's `<w:r>` to the
+/// end run's `</w:r>`) is always well-formed: any element between them is
+/// inside it whole. Open fields form a stack, so a field nested in another one
+/// collapses on its own even when the outer one can't.
+///
+/// A field collapses only when everything between its begin and end is
+/// something a Field can show and nothing else needs to reach (an allow-list,
+/// [`allowed_in_field`]): plain runs, fields, proofing marks, and its own clean
+/// field-code runs. Anything else (a link, tab, break, tracked change, picture,
+/// text box, bookmark, comment or permission mark, note reference, unknown
+/// XML, a field left loose inside it, …) leaves it as loose markers, exactly as
+/// before. So does an end never seen by the same loop (it spans paragraphs, or
+/// sits in another container), and a begin or end sharing its run with another
+/// field's marker, since the slice would cut into that other field.
 #[derive(Default)]
 struct FieldCollapse {
-    open: Option<OpenFieldSpan>,
+    /// The open fields, outermost first.
+    open: Vec<OpenFieldSpan>,
 }
 
 struct OpenFieldSpan {
-    /// Nesting depth of `begin`s seen so far.
-    depth: usize,
     /// Index in the loop's output of the begin run's inline.
     idx: usize,
     /// Source position of the begin run's `<w:r>`.
@@ -887,58 +886,46 @@ impl FieldCollapse {
         use crate::field::FieldEvent;
         let pushed = &out[n.min(out.len())..];
         let run = p.raw_slice(start, p.pos());
-        let marker_run = is_run && is_field_marker_run(run, pushed);
-        // Tracked changes can't be edited inside a Field (review would lose
-        // them), a Field can only show text (a picture or a text box in its
-        // result would vanish), and loose markers from a nested container
-        // can't be paired.
-        let taints = pushed.iter().any(|i| {
-            holds_revision(i)
-                || (!marker_run && (holds_object(i) || holds_layout(i) || has_field_marker(i)))
-                || holds_comment_mark(i)
-        });
+        let code_run = is_run && is_field_code_run(run, pushed);
+        // Content is inside every open field, so it rules on all of them.
+        let taints = if code_run {
+            !is_clean_code_run(run)
+        } else {
+            !pushed.iter().all(allowed_in_field)
+        };
         if taints {
-            if let Some(open) = self.open.as_mut() {
-                open.broken = true;
-            }
+            self.open.iter_mut().for_each(|open| open.broken = true);
         }
-        if !marker_run {
+        if !code_run {
             return;
         }
         let events = crate::field::field_events(run);
         for (k, event) in events.iter().enumerate() {
             match event {
-                FieldEvent::Begin => match self.open.as_mut() {
-                    Some(open) => open.depth += 1,
-                    None => {
-                        // A begin after another marker in the same run (the
-                        // end of a previous field, say) shares its run: the
-                        // slice would start inside that other field.
-                        let shares_run =
-                            !events[..k].iter().all(|e| matches!(e, FieldEvent::Begin));
-                        self.open = Some(OpenFieldSpan {
-                            depth: 1,
-                            idx: n,
-                            start,
-                            broken: taints || shares_run,
-                        })
-                    }
-                },
+                FieldEvent::Begin => {
+                    // A begin after another marker in the same run (the end of
+                    // a previous field, say) shares its run: the slice would
+                    // start inside that other field.
+                    let shares_run = !events[..k].iter().all(|e| matches!(e, FieldEvent::Begin));
+                    self.open.push(OpenFieldSpan {
+                        idx: n,
+                        start,
+                        broken: taints || shares_run,
+                    });
+                }
                 FieldEvent::End => {
-                    let Some(open) = self.open.as_mut() else {
+                    let Some(open) = self.open.pop() else {
                         continue;
                     };
-                    open.depth -= 1;
-                    if open.depth > 0 {
-                        continue;
-                    }
-                    let open = self.open.take().expect("open field");
-                    // A new field starting later in this same run would be
-                    // swallowed by the slice; leave both as they are.
-                    let reopens = events[k + 1..]
-                        .iter()
-                        .any(|e| matches!(e, FieldEvent::Begin));
-                    if !open.broken && !reopens {
+                    // Another marker later in this run (the next field's begin,
+                    // an outer field's end) would be swallowed by the slice.
+                    let shares_run = k + 1 < events.len();
+                    if open.broken || shares_run {
+                        // An outer field holding a loose one can't collapse.
+                        if let Some(outer) = self.open.last_mut() {
+                            outer.broken = true;
+                        }
+                    } else {
                         collapse_field(out, open.idx, p.raw_slice(open.start, p.pos()));
                     }
                 }
@@ -949,10 +936,10 @@ impl FieldCollapse {
 }
 
 /// Whether a run the loop parsed directly (source `run`, which pushed
-/// `pushed`) is a complex-field marker run: kept raw, with a `w:fldChar` of its
-/// own. A drawing, picture or object whose text box holds a field is not: those
-/// markers belong to the text box's own paragraphs.
-fn is_field_marker_run(run: &str, pushed: &[Inline]) -> bool {
+/// `pushed`) is a field-code run: kept raw, with a `w:fldChar` or
+/// `w:instrText` of its own. A drawing, picture or object whose text box holds
+/// a field is not: those markers belong to the text box's own paragraphs.
+fn is_field_code_run(run: &str, pushed: &[Inline]) -> bool {
     const CONTAINERS: [&str; 5] = [
         "<w:drawing",
         "<w:pict",
@@ -961,63 +948,38 @@ fn is_field_marker_run(run: &str, pushed: &[Inline]) -> bool {
         "<w:txbxContent",
     ];
     matches!(pushed, [Inline::Raw(_)])
-        && run.contains("<w:fldChar")
+        && (run.contains("<w:fldChar") || run.contains("<w:instrText"))
         && !CONTAINERS.iter().any(|c| run.contains(c))
 }
 
-/// Whether an inline (or anything inside it) holds loose complex-field markers.
-fn has_field_marker(inline: &Inline) -> bool {
-    match inline {
-        Inline::Raw(raw) => raw.contains("<w:fldChar"),
-        Inline::Hyperlink(h) => h.content.iter().any(has_field_marker),
-        Inline::Revision { content, .. } => content.iter().any(has_field_marker),
-        _ => false,
-    }
-}
-
-/// Whether an inline is, or holds, something a [`Inline::Field`] can't show,
-/// since it draws only its result's text: a picture, embedded object, text box,
-/// chart, SmartArt, equation or note reference (an `INCLUDEPICTURE` result, an
-/// `EMBED` preview, …).
-fn holds_object(inline: &Inline) -> bool {
-    const OBJECTS: [&str; 4] = ["<w:drawing", "<w:pict", "<w:object", "<mc:AlternateContent"];
-    match inline {
-        Inline::Raw(raw) => OBJECTS.iter().any(|o| raw.contains(o)),
-        Inline::TextBox { .. }
-        | Inline::Chart { .. }
-        | Inline::SmartArt { .. }
-        | Inline::Equation { .. }
-        | Inline::FootnoteRef { .. } => true,
-        Inline::Hyperlink(h) => h.content.iter().any(holds_object),
-        Inline::Revision { content, .. } => content.iter().any(holds_object),
-        _ => false,
-    }
-}
-
-/// Whether an inline is, or holds, a tab or a break: layout a Field's text
-/// can't carry (a `HYPERLINK \\l` TOC entry's tab leader, a manual line or
-/// page break in a result).
-fn holds_layout(inline: &Inline) -> bool {
-    match inline {
-        Inline::Tab(_) | Inline::Break(_) => true,
-        Inline::Hyperlink(h) => h.content.iter().any(holds_layout),
-        Inline::Revision { content, .. } => content.iter().any(holds_layout),
-        _ => false,
-    }
-}
-
-/// Whether an inline is, or holds, a comment's range or reference mark: the
-/// comment's anchors must stay loose so deleting the comment removes them.
-fn holds_comment_mark(inline: &Inline) -> bool {
-    const MARKS: [&str; 3] = [
-        "<w:commentRangeStart",
-        "<w:commentRangeEnd",
-        "<w:commentReference",
+/// Whether a field-code run holds only field code: nothing that shows (text, a
+/// tab, a break, a symbol) or anchors something (a comment or note reference),
+/// and no tracked formatting change, all of which a Field would hide.
+fn is_clean_code_run(run: &str) -> bool {
+    const OTHER: [&str; 10] = [
+        "w:t",
+        "w:delText",
+        "w:tab",
+        "w:br",
+        "w:cr",
+        "w:sym",
+        "w:rPrChange",
+        "w:commentReference",
+        "w:footnoteReference",
+        "w:endnoteReference",
     ];
+    OTHER.iter().all(|tag| start_tags(run, tag).is_empty())
+}
+
+/// Whether an inline may sit inside a field that collapses into one
+/// [`Inline::Field`]: a plain run (its text becomes the result), a field (a
+/// nested `w:fldSimple`, a `w:sym` symbol, or a nested field already
+/// collapsed), or a proofing mark, which shows nothing and anchors nothing.
+fn allowed_in_field(inline: &Inline) -> bool {
     match inline {
-        Inline::Raw(raw) => MARKS.iter().any(|m| raw.contains(m)),
-        Inline::Hyperlink(h) => h.content.iter().any(holds_comment_mark),
-        Inline::Revision { content, .. } => content.iter().any(holds_comment_mark),
+        Inline::Run(r) => r.props.property_change.is_none(),
+        Inline::Field { .. } => true,
+        Inline::Raw(raw) => raw.trim_start().starts_with("<w:proofErr"),
         _ => false,
     }
 }
@@ -1072,22 +1034,6 @@ pub fn field_result_props(raw: &str) -> RunProps {
         }
     }
     RunProps::default()
-}
-
-/// Whether an inline is, or holds, a tracked change: an insertion, deletion or
-/// unsupported revision record, or a formatting change on a run or tab.
-fn holds_revision(inline: &Inline) -> bool {
-    match inline {
-        Inline::Revision { .. } | Inline::UnsupportedRevision { .. } => true,
-        Inline::Run(r) => r.props.property_change.is_some(),
-        Inline::Tab(props) => props.property_change.is_some(),
-        Inline::Hyperlink(h) => {
-            h.runs.iter().any(|r| r.props.property_change.is_some())
-                || h.content.iter().any(holds_revision)
-        }
-        Inline::Raw(raw) => raw.contains("<w:rPrChange"),
-        _ => false,
-    }
 }
 
 /// Replace `out[idx..]` (a complex field's runs, begin to end) with one
@@ -3204,7 +3150,24 @@ mod tests {
             "{:?}",
             kinds(&p.content)
         );
-        assert!(!p.content.iter().any(|i| matches!(i, Inline::Field { .. })));
+        // The HYPERLINK field stays loose, but the PAGEREF inside it is still
+        // one unit (its own field collapses on its own), and nothing is lost.
+        let fields: Vec<&str> = p
+            .content
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Field { raw, text } => {
+                    assert!(
+                        raw.contains("PAGEREF") && !raw.contains("HYPERLINK"),
+                        "{raw}"
+                    );
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fields, ["7"]);
+        assert_round_trips(&d);
         let opts = crate::render::RenderOptions {
             width: 40,
             ..Default::default()
@@ -3252,6 +3215,86 @@ mod tests {
         ed.remove_comment_markers("5");
         let out = crate::serialize::document_to_xml(&ed.doc);
         assert!(!out.contains("comment"), "{out}");
+    }
+
+    /// `inner` between a PAGE-like field's separate and end, as `code`'s result.
+    fn field_around(inner: &str) -> String {
+        format!(
+            "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+             <w:r><w:instrText> ADDIN EN.CITE </w:instrText></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>{inner}\
+             <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>"
+        )
+    }
+
+    fn assert_loose_and_lossless(inner: &str) {
+        let xml = field_around(inner);
+        let d = para_doc(&xml);
+        let p = first_para(&d);
+        assert!(
+            !p.content.iter().any(|i| matches!(i, Inline::Field { .. })),
+            "{inner}: {:?}",
+            kinds(&p.content)
+        );
+        assert_round_trips(&d);
+    }
+
+    /// Saving `d` loses nothing: reloading the saved XML gives the same
+    /// inlines and text, and saving that again gives the same XML. (Loose runs
+    /// are re-serialized, so the saved bytes are not the source's.)
+    fn assert_round_trips(d: &Document) {
+        let saved = crate::serialize::document_to_xml(d);
+        let again = doc(&saved);
+        assert_eq!(
+            kinds(&first_para(&again).content),
+            kinds(&first_para(d).content)
+        );
+        assert_eq!(first_para(&again).plain_text(), first_para(d).plain_text());
+        assert_eq!(crate::serialize::document_to_xml(&again), saved);
+    }
+
+    #[test]
+    fn only_plain_runs_fields_and_proofing_marks_collapse_642() {
+        // An EndNote citation: the result is a link to the reference entry.
+        assert_loose_and_lossless(
+            "<w:hyperlink w:anchor=\"_ENREF_1\" w:tooltip=\"Smith\"><w:r><w:t>[1]</w:t></w:r></w:hyperlink>",
+        );
+        // Markup we don't model.
+        assert_loose_and_lossless(
+            "<w:customXml w:element=\"x\"><w:r><w:t>1</w:t></w:r></w:customXml>",
+        );
+        // A bookmark (a REF target) or a permission range in the result.
+        assert_loose_and_lossless(
+            "<w:bookmarkStart w:id=\"0\" w:name=\"_ENREF_1\"/><w:r><w:t>1</w:t></w:r><w:bookmarkEnd w:id=\"0\"/>",
+        );
+        assert_loose_and_lossless(
+            "<w:permStart w:id=\"1\" w:edGrp=\"everyone\"/><w:r><w:t>1</w:t></w:r><w:permEnd w:id=\"1\"/>",
+        );
+        // Text sharing a run with a field marker.
+        assert_loose_and_lossless(
+            "<w:r><w:t>1</w:t><w:fldChar w:fldCharType=\"begin\"/></w:r><w:r><w:fldChar w:fldCharType=\"end\"/></w:r>",
+        );
+        // Plain runs, proofing marks and a nested simple field do collapse.
+        let d = para_doc(&field_around(
+            "<w:proofErr w:type=\"spellStart\"/><w:r><w:t>[1</w:t></w:r><w:proofErr w:type=\"spellEnd\"/>\
+             <w:fldSimple w:instr=\" SEQ n \"><w:r><w:t>2</w:t></w:r></w:fldSimple><w:r><w:t>]</w:t></w:r>",
+        ));
+        assert!(
+            matches!(&first_para(&d).content[..], [Inline::Field { text, .. }] if text == "[12]")
+        );
+    }
+
+    #[test]
+    fn a_bookmark_in_a_ref_result_stays_findable_642() {
+        let d = para_doc(&field_around(
+            "<w:bookmarkStart w:id=\"0\" w:name=\"_ENREF_1\"/><w:r><w:t>1</w:t></w:r><w:bookmarkEnd w:id=\"0\"/>",
+        ));
+        assert!(
+            first_para(&d)
+                .content
+                .iter()
+                .any(|i| matches!(i, Inline::Raw(r) if r.contains("w:name=\"_ENREF_1\"")))
+        );
     }
 
     #[test]
