@@ -186,7 +186,8 @@ fn unchanged_fields_and_constraints_preserve_redo_and_clean_state() {
     ed.undo();
     ed.mark_saved();
     ed.rename(10, "Task 1").unwrap();
-    ed.set_duration(10, "8h").unwrap();
+    // The same duration in the same unit; `8h` would switch it to hours.
+    ed.set_duration(10, "1d").unwrap();
     ed.set_constraint_typed(10, ConstraintType::AsSoonAsPossible, None)
         .unwrap();
     assert_eq!(
@@ -472,11 +473,22 @@ fn constraint_abbreviations_match_all_constraint_codes_and_hints() {
 #[test]
 fn exact_duration_format_preserves_minutes_beyond_float_integer_precision() {
     let p = untitled_project();
+    let units = [
+        None,
+        Some(LagUnit::Minute),
+        Some(LagUnit::Hour),
+        Some(LagUnit::Day),
+        Some(LagUnit::Week),
+        Some(LagUnit::Month),
+    ];
     for min in [0, 1, -1, 9_007_199_254_740_993, i64::MAX, i64::MIN] {
-        assert_eq!(
-            parse_duration(&format_duration_exact(min, &p), &p),
-            Some(min)
-        );
+        for unit in units {
+            assert_eq!(
+                parse_duration(&format_duration_exact(min, &p, unit), &p),
+                Some(min),
+                "{min} in {unit:?}"
+            );
+        }
     }
 }
 

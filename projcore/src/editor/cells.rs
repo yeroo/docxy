@@ -627,8 +627,23 @@ fn cell_text(r: &Resource, a: &Assignment) -> String {
     format!("{}{}", r.name, units.unwrap_or_default())
 }
 
-/// Prefer whole days/hours, falling back to exact minutes (including signed lag).
-pub fn format_duration_exact(min: i64, proj: &Project) -> String {
+/// A duration as a cell edit reopens it, reading back to exactly `min`: in
+/// the task's own `unit` when that is exact (at most two decimals, `0.5d`,
+/// `1.5w`), else whole days, whole hours, or minutes. `None` (a summary, or a
+/// task with no working unit) goes straight to that fallback.
+pub fn format_duration_exact(min: i64, proj: &Project, unit: Option<LagUnit>) -> String {
+    if let Some(unit) = unit {
+        if let Some(per) = proj.working_unit_min(unit) {
+            let shown = format!("{:.2}", min as f64 / per)
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+                .to_string();
+            let text = format!("{shown}{}", unit.suffix());
+            if parse_duration(&text, proj) == Some(min) {
+                return text;
+            }
+        }
+    }
     let day = proj.hours_per_day * 60.;
     if day.is_finite() && day > 0. {
         let days = min as f64 / day;
@@ -659,26 +674,12 @@ fn elapsed_unit_min(unit: LagUnit) -> Option<f64> {
     })
 }
 
-/// Working minutes in one unit, as `parse_duration` counts them. Working
-/// months remain unsupported in the Predecessors cell.
-fn working_unit_min(unit: LagUnit, proj: &Project) -> Option<f64> {
+/// Working minutes in one lag unit. Working months remain unsupported in the
+/// Predecessors cell.
+fn working_lag_unit_min(unit: LagUnit, proj: &Project) -> Option<f64> {
     match unit {
-        LagUnit::Minute => Some(1.0),
-        LagUnit::Hour => Some(60.0),
-        LagUnit::Day => Some(proj.hours_per_day * 60.0),
-        LagUnit::Week => Some(proj.hours_per_week * 60.0),
-        LagUnit::Month | LagUnit::Percent => None,
-    }
-}
-
-fn unit_suffix(unit: LagUnit) -> &'static str {
-    match unit {
-        LagUnit::Minute => "m",
-        LagUnit::Hour => "h",
-        LagUnit::Day => "d",
-        LagUnit::Week => "w",
-        LagUnit::Month => "mo",
-        LagUnit::Percent => "%",
+        LagUnit::Month => None,
+        unit => proj.working_unit_min(unit),
     }
 }
 
@@ -715,7 +716,7 @@ pub fn parse_lag(text: &str, proj: &Project) -> Option<(i64, LagFormat)> {
     } else if !elapsed {
         // Only the lag's own numeric part may precede its single-letter unit.
         num.parse::<f64>().ok()?;
-        parse_duration(&format!("{num}{}", unit_suffix(unit)), proj)?
+        parse_duration(&format!("{num}{}", unit.suffix()), proj)?
     } else if let Ok(exact) = num.parse::<i64>() {
         exact.checked_mul(elapsed_unit_min(unit)? as i64)?
     } else {
@@ -737,7 +738,7 @@ pub fn format_lag(p: &Predecessor, proj: &Project) -> String {
     let elapsed = format.kind() == LagKind::Elapsed;
     let text = |value: String, unit: LagUnit| {
         let e = if elapsed { "e" } else { "" };
-        format!("{sign}{value}{e}{}{mark}", unit_suffix(unit))
+        format!("{sign}{value}{e}{}{mark}", unit.suffix())
     };
     if format.kind() == LagKind::Percent {
         return text(p.lag.to_string(), LagUnit::Percent);
@@ -746,7 +747,7 @@ pub fn format_lag(p: &Predecessor, proj: &Project) -> String {
         if elapsed {
             elapsed_unit_min(unit)
         } else {
-            working_unit_min(unit, proj)
+            working_lag_unit_min(unit, proj)
         }
     };
     let unit = match format.unit() {

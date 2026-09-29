@@ -803,6 +803,13 @@ pub(super) fn restore_project_tab(t: &PersistTab) -> DocTab {
     project_tab(t.title.clone().into(), path, surface, false, status)
 }
 
+/// A leaf's Duration in the unit it was entered in (`1w`, `1.5w`), else days.
+fn leaf_duration(project: &Project, task: &Task) -> String {
+    task.duration_unit()
+        .and_then(|unit| project.format_in_unit(task.duration_min, unit, 1))
+        .unwrap_or_else(|| days(project, task.duration_min))
+}
+
 fn days(project: &Project, min: i64) -> String {
     let d = project.minutes_to_days(min);
     if (d.round() - d).abs() < 1e-9 {
@@ -853,7 +860,7 @@ pub(crate) fn project_row(ed: &ProjectEditor, task: &Task) -> [String; COLUMN_CO
         } else if task.is_milestone() {
             "—".into()
         } else {
-            days(project, task.duration_min) + duration_suffix(project, task.uid)
+            leaf_duration(project, task) + duration_suffix(project, task.uid)
         },
         date(ed.disp_start(task.uid)),
         date(ed.disp_finish(task.uid)),

@@ -63,6 +63,11 @@ pub struct TaskPatch {
     /// flag stays unset), even when the minutes are unchanged. `None` keeps
     /// the old rule: a changed duration commits an estimate.
     pub estimated: Option<bool>,
+    /// The `DurationFormat` a typed duration's unit gives (see
+    /// [`parse_task_duration_unit`]); only with `duration_min`. A task whose
+    /// stored format has the same unit keeps it, estimated bit included.
+    /// `None` keeps the stored format.
+    pub duration_format: Option<u8>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -652,9 +657,29 @@ impl Editor {
     /// Set a typed duration; a trailing `?` marks it estimated (see
     /// [`parse_task_duration`]).
     pub fn set_duration(&mut self, uid: i32, text: &str) -> Result<(), String> {
-        let (min, estimated) = parse_task_duration(text, &self.proj)
+        let (min, estimated, unit) = parse_task_duration_unit(text, &self.proj)
             .ok_or_else(|| format!("Couldn't read duration '{text}' ({DURATION_HINT})"))?;
-        self.set_duration_min(uid, min, estimated)
+        self.set_duration_typed(uid, min, estimated, unit)
+    }
+
+    /// Set a duration typed in `unit`, which becomes the task's
+    /// `DurationFormat`: its Duration and slack then show in that unit.
+    pub fn set_duration_typed(
+        &mut self,
+        uid: i32,
+        min: i64,
+        estimated: bool,
+        unit: LagUnit,
+    ) -> Result<(), String> {
+        self.update_task(
+            uid,
+            TaskPatch {
+                duration_min: Some(min),
+                estimated: Some(estimated),
+                duration_format: duration_format_code(unit),
+                ..TaskPatch::default()
+            },
+        )
     }
 
     /// Set a duration as typed, estimated (`1d?`) or not. As in Project,
@@ -732,6 +757,9 @@ impl Editor {
         if patch.estimated.is_some() && patch.duration_min.is_none() {
             return Err("'estimated' needs a 'duration'".into());
         }
+        if patch.duration_format.is_some() && patch.duration_min.is_none() {
+            return Err("a duration format needs a 'duration'".into());
+        }
         if let Some(min) = patch.duration_min {
             validate_duration(min)?;
         }
@@ -754,7 +782,13 @@ impl Editor {
             && patch
                 .estimated
                 .is_some_and(|e| estimate_after(t.estimated, e) != t.estimated);
-        if t.is_external_leaf() && (duration_changed || mode_changed || estimate_changed) {
+        let format = patch
+            .duration_format
+            .map(|code| format_after(t.duration_format, code));
+        let format_changed = format.is_some_and(|f| f != t.duration_format);
+        if t.is_external_leaf()
+            && (duration_changed || mode_changed || estimate_changed || format_changed)
+        {
             return Err(EXTERNAL_TASK_DATES.into());
         }
         if t.is_external_leaf() {
@@ -771,6 +805,7 @@ impl Editor {
             && patch.level.is_none_or(|lv| lv == t.outline_level)
             && !mode_changed
             && !estimate_changed
+            && !format_changed
         {
             return Ok(());
         }
@@ -800,7 +835,13 @@ impl Editor {
                 // work belong to the rollup and are left alone.
                 t.manual_duration_min = Some(min);
                 t.manual_finish = None;
+                if let Some(format) = format {
+                    t.duration_format = format;
+                }
             } else if let Some(min) = patch.duration_min {
+                if let Some(format) = format {
+                    t.duration_format = format;
+                }
                 // Against the row as materialized: a blank row's default
                 // `1 day?` (and a manual plan's ManualDuration) is replaced.
                 let changed = was_blank || min != t.duration_min;
@@ -1662,13 +1703,34 @@ pub fn duration_suffix(proj: &Project, uid: i32) -> &'static str {
 /// trailing `?` for an estimate (`3d?`, `4h?`, `2?`). Returns the minutes and
 /// whether it was estimated.
 pub fn parse_task_duration(text: &str, proj: &Project) -> Option<(i64, bool)> {
+    parse_task_duration_unit(text, proj).map(|(min, estimated, _)| (min, estimated))
+}
+
+/// [`parse_task_duration`] with the unit it was typed in: a bare number is
+/// days, as Project reads it.
+pub fn parse_task_duration_unit(text: &str, proj: &Project) -> Option<(i64, bool, LagUnit)> {
     let text = text.trim();
     match text.strip_suffix('?') {
         Some(rest) if !rest.trim_end().ends_with('?') => {
-            parse_duration(rest, proj).map(|min| (min, true))
+            parse_duration_unit(rest, proj).map(|(min, unit)| (min, true, unit))
         }
         Some(_) => None,
-        None => parse_duration(text, proj).map(|min| (min, false)),
+        None => parse_duration_unit(text, proj).map(|(min, unit)| (min, false, unit)),
+    }
+}
+
+/// The plain (not estimated) working `DurationFormat` for a typed unit.
+pub fn duration_format_code(unit: LagUnit) -> Option<u8> {
+    LagFormat::new(unit, false, false).and_then(|f| u8::try_from(f.code()).ok())
+}
+
+/// A task's `DurationFormat` after typing a duration with format `code`: the
+/// stored one when it has the same unit (so its estimated bit stays), else
+/// `code`, with days as no format (see [`Task::duration_format`]).
+fn format_after(stored: Option<u8>, code: u8) -> Option<u8> {
+    match stored {
+        Some(s) if s & !32 == code => Some(s),
+        _ => Some(code).filter(|&c| c != 7),
     }
 }
 
@@ -1680,15 +1742,13 @@ fn recompute_summaries(proj: &mut Project) {
 
 /// Parse Project's minute, hour, day, week and month spellings as working time.
 pub fn parse_duration(text: &str, proj: &Project) -> Option<i64> {
+    parse_duration_unit(text, proj).map(|(min, _)| min)
+}
+
+/// [`parse_duration`] with the unit it was typed in; a bare number is days.
+fn parse_duration_unit(text: &str, proj: &Project) -> Option<(i64, LagUnit)> {
+    use LagUnit as Unit;
     let t = text.trim().to_lowercase();
-    #[derive(Clone, Copy, PartialEq)]
-    enum Unit {
-        Minute,
-        Hour,
-        Day,
-        Week,
-        Month,
-    }
     // Longest spellings first. The numeric remainder must parse in full, so
     // an unknown suffix cannot be mistaken for one of these units.
     let spellings = [
@@ -1730,19 +1790,19 @@ pub fn parse_duration(text: &str, proj: &Project) -> Option<i64> {
     // Exact minute literals must not lose integer precision through f64.
     if unit == Unit::Minute {
         if let Ok(minutes) = num.parse::<i64>() {
-            return Some(minutes);
+            return Some((minutes, unit));
         }
     }
     let minutes = match unit {
         Unit::Hour => v * 60.0,
         Unit::Week => v * proj.hours_per_week * 60.0,
         Unit::Month => v * proj.days_per_month() * proj.hours_per_day * 60.0,
-        Unit::Minute => v,
+        Unit::Minute | Unit::Percent => v,
         Unit::Day => v * proj.hours_per_day * 60.0,
     }
     .round();
     (minutes.is_finite() && minutes > i64::MIN as f64 && minutes < i64::MAX as f64)
-        .then_some(minutes as i64)
+        .then_some((minutes as i64, unit))
 }
 
 /// Parse `TYPE [date]`, retaining the TUI's input and rejection conventions.
@@ -2508,6 +2568,7 @@ mod tests {
                     level: Some(2),
                     manual: None,
                     estimated: None,
+                    duration_format: None,
                 },
             )
             .unwrap();

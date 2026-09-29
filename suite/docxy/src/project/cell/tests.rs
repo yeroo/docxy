@@ -138,7 +138,8 @@ fn no_op_date_duration_and_milestone_keep_history_and_redo() {
         assert!(!t.dirty);
     }
     vm(&mut t).ed.select(0);
-    edit(&mut t, COL_DURATION, "8h");
+    // The same duration in the same unit; `8h` would switch it to hours.
+    edit(&mut t, COL_DURATION, "1d");
     key(&mut t, "enter");
     assert_eq!(v(&t).ed.undo_depth(), 1);
     vm(&mut t).ed.select(0);
@@ -423,7 +424,7 @@ fn a_manual_summary_s_dates_and_duration_are_editable() {
     vm(&mut t).open_cell(None).unwrap();
     assert_eq!(
         v(&t).cell.as_ref().unwrap().initial,
-        format_duration_exact(960, v(&t).ed.project())
+        format_duration_exact(960, v(&t).ed.project(), None)
     );
     vm(&mut t).cell = None;
     edit(&mut t, COL_DURATION, "3d");

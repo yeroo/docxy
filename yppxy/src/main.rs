@@ -1838,11 +1838,17 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
         } else if t.is_milestone() {
             "—".to_string()
         } else {
-            fmt_days(app.ed.project().minutes_to_days(t.duration_min))
+            in_task_unit(app.ed.project(), t, t.duration_min)
                 + duration_suffix(app.ed.project(), t.uid)
         };
         let slack = r
-            .map(|r| fmt_days(app.ed.project().minutes_to_days(r.total_slack_min)))
+            .map(|r| {
+                if t.summary {
+                    fmt_days(app.ed.project().minutes_to_days(r.total_slack_min))
+                } else {
+                    in_task_unit(app.ed.project(), t, r.total_slack_min)
+                }
+            })
             .unwrap_or_else(|| "?".into());
         let crit = r.is_some_and(|r| r.critical);
         let mut style = Style::default();
@@ -2147,6 +2153,13 @@ fn task_resources(proj: &Project, uid: i32) -> Vec<String> {
                 .map(|r| r.name.clone())
         })
         .collect()
+}
+
+/// Minutes in the unit a leaf's duration was entered in (`1w`, `0.5w`), else days.
+fn in_task_unit(proj: &Project, task: &Task, min: i64) -> String {
+    task.duration_unit()
+        .and_then(|unit| proj.format_in_unit(min, unit, 1))
+        .unwrap_or_else(|| fmt_days(proj.minutes_to_days(min)))
 }
 
 fn fmt_days(days: f64) -> String {

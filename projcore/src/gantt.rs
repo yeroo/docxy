@@ -11,7 +11,10 @@
 //! The accompanying table includes bold summary rows with rolled-up dates (a
 //! manually scheduled summary's own dates) and working durations, each task's
 //! Deadline (marked `⚠` when the row's Finish is after it), signed total slack,
-//! and the scheduler's free slack.
+//! and the scheduler's free slack. A task's Duration and slack show in the
+//! unit its `DurationFormat` names (`1w`, `0.50w`, days by default); summaries
+//! and elapsed or other non-working formats show whole days, hours or
+//! minutes, slack in days.
 //!
 //! [Mermaid `gantt`]: https://mermaid.js.org/syntax/gantt.html
 
@@ -118,9 +121,17 @@ pub fn to_markdown(proj: &Project, sched: &Schedule) -> String {
         };
         let duration_min =
             crate::schedule::summary_or_leaf_min(proj, task, r.early_start, r.early_finish);
-        let dur = duration_str(proj, duration_min);
-        let slack = fmt_days(proj.minutes_to_days(r.total_slack_min));
-        let free_slack = fmt_days(proj.minutes_to_days(r.free_slack_min));
+        // A leaf shows its Duration and slack in the unit it was entered in
+        // (a zero Duration stays `0d`); a summary keeps the default.
+        let unit = task.duration_unit().filter(|_| !task.summary);
+        let in_unit = |min| unit.and_then(|unit| proj.format_in_unit(min, unit, 2));
+        let dur = in_unit(duration_min)
+            .filter(|_| duration_min > 0)
+            .unwrap_or_else(|| duration_str(proj, duration_min));
+        let slack = in_unit(r.total_slack_min)
+            .unwrap_or_else(|| fmt_days(proj.minutes_to_days(r.total_slack_min)));
+        let free_slack = in_unit(r.free_slack_min)
+            .unwrap_or_else(|| fmt_days(proj.minutes_to_days(r.free_slack_min)));
         // Judged on this row's own (CPM) Finish cell; yppxy's grid judges
         // its displayed, possibly leveled, finish instead.
         let deadline = task.deadline.map_or_else(String::new, |deadline| {

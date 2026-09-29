@@ -403,6 +403,9 @@ fn import_tasks(
             task.manual_start = date(&t.manual_start, "manual start")?;
             task.manual_finish = date(&t.manual_finish, "manual finish")?;
             task.manual_duration_min = t.manual_duration_min;
+            // The unit the duration shows (and saves) in; a code past `u8`
+            // is not an MSPDI format.
+            task.duration_format = t.duration_format.and_then(|f| u8::try_from(f).ok());
             if let Some(p) = &t.progress {
                 task.percent_complete = Some(p.percent_complete);
                 task.percent_work_complete = Some(p.percent_work_complete);

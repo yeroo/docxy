@@ -30,9 +30,10 @@
 use ctlcore::json::Json;
 use projcore::datetime::DateTime;
 use projcore::editor::{
-    DURATION_HINT, Editor, TaskPatch, parse_duration, parse_lag, parse_task_duration,
+    DURATION_HINT, Editor, TaskPatch, duration_format_code, parse_duration, parse_lag,
+    parse_task_duration_unit,
 };
-use projcore::model::{LagFormat, LinkType, Predecessor, Task};
+use projcore::model::{LagFormat, LagUnit, LinkType, Predecessor, Task};
 
 /// Successful calls to these verbs signal agent editing activity.
 pub const MUTATING: &[&str] = &["task.set", "task.add", "task.del", "link.add", "link.del"];
@@ -227,7 +228,7 @@ fn task_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
     let duration = args
         .get_str("duration")
         .map(|d| {
-            parse_task_duration(d, ed.project())
+            parse_task_duration_unit(d, ed.project())
                 .ok_or_else(|| format!("Couldn't read duration '{d}' ({DURATION_HINT})"))
         })
         .transpose()?;
@@ -251,6 +252,7 @@ fn task_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
             level,
             manual,
             estimated: duration.map(|d| d.1),
+            duration_format: duration.and_then(|d| duration_format_code(d.2)),
         },
     )?;
     task_get(ed, args)
@@ -261,18 +263,20 @@ fn task_add(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         .get("after")
         .map(|_| uid_arg(args, "after"))
         .transpose()?;
-    let (duration_min, estimated) = match args.get_str("duration") {
-        Some(d) => parse_task_duration(d, ed.project())
+    let (duration_min, estimated, unit) = match args.get_str("duration") {
+        Some(d) => parse_task_duration_unit(d, ed.project())
             .ok_or_else(|| format!("Couldn't read duration '{d}' ({DURATION_HINT})"))?,
         // The default duration is estimated when the plan's new tasks are.
-        None => (480, ed.project().new_tasks_estimated()),
+        None => (480, ed.project().new_tasks_estimated(), LagUnit::Day),
     };
-    let at = ed.add_task(
-        after,
-        args.get_str("name").unwrap_or("New task"),
-        duration_min,
-        estimated,
-    )?;
+    let name = args.get_str("name").unwrap_or("New task");
+    // One undo step: the task, then the unit its duration was typed in.
+    let at = ed.batch(|ed| {
+        let at = ed.add_task(after, name, duration_min, estimated)?;
+        let uid = ed.project().tasks[at].uid;
+        ed.set_duration_typed(uid, duration_min, estimated, unit)?;
+        Ok(at)
+    })?;
     Ok(task_json(ed, &ed.project().tasks[at]))
 }
 

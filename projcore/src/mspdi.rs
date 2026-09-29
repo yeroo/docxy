@@ -328,6 +328,8 @@ fn parse_task(p: &mut XmlParser) -> Result<(Task, Option<i32>), String> {
                     "Summary" => t.summary = bool_of(p),
                     "Milestone" => t.milestone = bool_of(p),
                     "Duration" => t.duration_min = iso8601_to_minutes(&text_of(p)),
+                    // Days, the default, is no format.
+                    "DurationFormat" => t.duration_format = opt_u8_of(p).filter(|&f| f != 7),
                     "Start" => t.stored_start = DateTime::parse_mspdi(&text_of(p)),
                     "Finish" => t.stored_finish = DateTime::parse_mspdi(&text_of(p)),
                     "Manual" => t.manual = bool_of(p),
@@ -1818,7 +1820,13 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     opt_date(s, "ManualFinish", t.manual_finish);
     opt_text(s, "ManualDuration", t.manual_duration_min.map(min_to_iso));
     if task {
-        tag(s, 3, "DurationFormat", "7");
+        // No format is days, as docxy always wrote.
+        tag(
+            s,
+            3,
+            "DurationFormat",
+            &t.duration_format.unwrap_or(7).to_string(),
+        );
     }
     opt_text(s, "Work", t.work_min.map(min_to_iso));
     opt_date(s, "Stop", t.stop);
