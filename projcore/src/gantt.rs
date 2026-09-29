@@ -881,8 +881,8 @@ mod tests {
         assert!(m.contains("Design phase one :"), "got:\n{m}");
     }
 
-    /// A parsed cell as a Markdown reader shows it: each `\` escapes the
-    /// next character, the way docxy's table reader treats it.
+    /// A parsed cell after one GFM-style unescape pass (each `\` escapes the
+    /// next character), i.e. the text a GFM renderer shows for it.
     fn unescape(cell: &str) -> String {
         let mut out = String::new();
         let mut chars = cell.chars();
