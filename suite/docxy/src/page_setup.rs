@@ -240,25 +240,30 @@ fn twips_of(text: &str) -> Option<i32> {
     Some((v * TWIPS_PER_INCH as f64).round() as i32)
 }
 
-/// Page Setup reacting to a change, as Word's does:
-/// - Orientation turns the page: Width and Height swap, and the margins
-///   rotate as [`SectionSetup::set_landscape`] does.
+/// Page Setup reacting to a change, as Word's does. `before` is the changed
+/// control's value before the change.
+/// - Orientation turns the page, by the rule [`SectionSetup::set_landscape`]
+///   uses on OK, so the section gets what the dialog shows: when the choice
+///   actually changes the margins always rotate, and Width and Height swap
+///   when their shape disagrees with the new orientation (a square page, or
+///   sides that do not parse, keep them as they are).
 /// - A named paper size fills in Width and Height.
 /// - Width or Height names the paper they match, else Custom.
-pub(crate) fn after_set(d: &mut Dialog, i: usize) {
+pub(crate) fn after_set(d: &mut Dialog, i: usize, before: &Value) {
     match d.controls[i].name {
         "orientation" => {
-            let landscape = chosen(d, "orientation") == Some(1);
-            let (Some(w), Some(h)) = (
-                twips_of(&text_of(d, "width")),
-                twips_of(&text_of(d, "height")),
-            ) else {
-                return;
-            };
-            if (w > h) == landscape || w == h {
+            if d.controls[i].value == *before {
                 return;
             }
-            permute(d, &["width", "height"], &["height", "width"]);
+            let landscape = chosen(d, "orientation") == Some(1);
+            let w = twips_of(&text_of(d, "width"));
+            let h = twips_of(&text_of(d, "height"));
+            if let (Some(w), Some(h)) = (w, h)
+                && w != h
+                && (w > h) != landscape
+            {
+                permute(d, &["width", "height"], &["height", "width"]);
+            }
             let sides = ["top", "right", "bottom", "left"];
             let from = if landscape {
                 ["left", "top", "right", "bottom"]

@@ -507,9 +507,10 @@ impl Dialog {
     /// Every change to a control's value comes here: its input handler, then
     /// the owner's reaction (Page Setup's paper size follows its width).
     fn set_at(&mut self, i: usize, args: &Json) -> Result<(), String> {
+        let before = self.controls[i].value.clone();
         self.controls[i].set(args)?;
         match self.owner {
-            DialogOwner::PageSetup => crate::page_setup::after_set(self, i),
+            DialogOwner::PageSetup => crate::page_setup::after_set(self, i, &before),
             DialogOwner::Columns => crate::page_setup::after_columns_set(self, i),
             _ => {}
         }

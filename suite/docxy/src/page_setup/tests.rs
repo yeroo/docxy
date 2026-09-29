@@ -184,6 +184,126 @@ fn a_typed_margin_turns_with_the_page() {
     }
 }
 
+/// A one-section document, the caret in it.
+fn one_section() -> DocTab {
+    let mut t = three_sections();
+    let ed = ed_mut(&mut t);
+    ed.doc.body.truncate(2);
+    if let Block::Paragraph(p) = &mut ed.doc.body[0] {
+        p.props.section_break = None;
+    }
+    t
+}
+
+/// The four margins the dialog shows, in twips.
+fn shown_margins(t: &DocTab) -> [i32; 4] {
+    ["top", "right", "bottom", "left"].map(|n| twips_of(&shown(t, n)).unwrap())
+}
+
+fn section_margins(t: &DocTab) -> [i32; 4] {
+    let m = setups(t)[0].margins;
+    [m.top, m.right, m.bottom, m.left]
+}
+
+/// Give the one section margins that differ on every side.
+fn lopsided(t: &mut DocTab) {
+    ed_mut(t).edit_section_setups(&[0], |s| {
+        (
+            s.margins.top,
+            s.margins.right,
+            s.margins.bottom,
+            s.margins.left,
+        ) = (720, 1080, 1440, 1800)
+    });
+}
+
+/// r2 M1: OK writes the margins the dialog shows, however Orientation was
+/// reached: the dialog and `SectionSetup::set_landscape` turn the page by one
+/// rule (the choice changed), whatever the sides say.
+#[test]
+fn ok_writes_the_margins_the_dialog_shows_after_orientation() {
+    // Sides typed first, already landscape-shaped, then Landscape.
+    let mut t = one_section();
+    lopsided(&mut t);
+    open(&mut t, PageSetupTab::Paper);
+    set(&mut t, "width", s("11"));
+    set(&mut t, "height", s("8.5"));
+    t.dialogs.select_tab("Margins").unwrap();
+    set(&mut t, "orientation", s("Landscape"));
+    assert_eq!(
+        (shown(&t, "width"), shown(&t, "height")),
+        ("11".into(), "8.5".into())
+    );
+    let want = shown_margins(&t);
+    assert_eq!(want, [1800, 720, 1080, 1440], "the margins turned");
+    ok(&mut t).unwrap();
+    assert_eq!(section_margins(&t), want);
+    assert!(setups(&t)[0].page.landscape);
+    assert_eq!((setups(&t)[0].page.w, setups(&t)[0].page.h), (15840, 12240));
+
+    // A square page: no swap, the margins still turn.
+    let mut t = one_section();
+    lopsided(&mut t);
+    open(&mut t, PageSetupTab::Paper);
+    set(&mut t, "width", s("10"));
+    set(&mut t, "height", s("10"));
+    t.dialogs.select_tab("Margins").unwrap();
+    set(&mut t, "orientation", s("Landscape"));
+    let want = shown_margins(&t);
+    assert_eq!(want, [1800, 720, 1080, 1440]);
+    ok(&mut t).unwrap();
+    assert_eq!(section_margins(&t), want);
+
+    // Width emptied, then Landscape: the margins turn all the same, OK refuses
+    // the empty width, and with a width again writes what is shown.
+    let mut t = one_section();
+    lopsided(&mut t);
+    open(&mut t, PageSetupTab::Paper);
+    set(&mut t, "width", s(""));
+    t.dialogs.select_tab("Margins").unwrap();
+    set(&mut t, "orientation", s("Landscape"));
+    let want = shown_margins(&t);
+    assert_eq!(want, [1800, 720, 1080, 1440]);
+    assert_eq!(ok(&mut t).unwrap_err(), "Width: takes a number");
+    t.dialogs.select_tab("Paper").unwrap();
+    set(&mut t, "width", s("11"));
+    set(&mut t, "height", s("8.5"));
+    ok(&mut t).unwrap();
+    assert_eq!(section_margins(&t), want);
+
+    // A landscape-shaped pgSz without w:orient opens as Portrait; Landscape
+    // keeps its sides and turns its margins.
+    let mut t = one_section();
+    lopsided(&mut t);
+    ed_mut(&mut t).edit_section_setups(&[0], |s| (s.page.w, s.page.h) = (15840, 12240));
+    open(&mut t, PageSetupTab::Margins);
+    assert_eq!(shown(&t, "orientation"), "Portrait");
+    set(&mut t, "orientation", s("Landscape"));
+    assert_eq!(
+        (shown(&t, "width"), shown(&t, "height")),
+        ("11".into(), "8.5".into())
+    );
+    let want = shown_margins(&t);
+    assert_eq!(want, [1800, 720, 1080, 1440]);
+    ok(&mut t).unwrap();
+    assert_eq!(section_margins(&t), want);
+    assert_eq!((setups(&t)[0].page.w, setups(&t)[0].page.h), (15840, 12240));
+
+    // Choosing the orientation it already has turns nothing; there and back
+    // is where it started.
+    let mut t = one_section();
+    lopsided(&mut t);
+    open(&mut t, PageSetupTab::Margins);
+    set(&mut t, "orientation", s("Portrait"));
+    assert_eq!(shown_margins(&t), [720, 1080, 1440, 1800]);
+    set(&mut t, "orientation", s("Landscape"));
+    set(&mut t, "orientation", s("Portrait"));
+    assert_eq!(shown_margins(&t), [720, 1080, 1440, 1800]);
+    t.dirty = false;
+    ok(&mut t).unwrap();
+    assert!(!t.dirty, "nothing changed");
+}
+
 #[test]
 fn this_point_forward_starts_a_new_section_at_the_caret() {
     let mut t = three_sections();
