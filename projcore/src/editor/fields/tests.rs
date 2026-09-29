@@ -410,15 +410,62 @@ fn a_task_shows_its_durations_and_slack_in_its_own_unit() {
     assert_eq!(read(&ed, 1, "Duration").text, "4h");
     assert_eq!(read(&ed, 1, "Actual Duration").text, "2 hrs");
     assert_eq!(read(&ed, 1, "Total Slack").text, "0 hrs");
-    let elapsed = Task {
+    let mut elapsed = Task {
         duration_format: Some(8),
         remaining_duration_min: Some(2880),
         ..task(1, "Cure", 2880)
     };
+    elapsed.set_baseline_slot(Baseline {
+        number: 0,
+        start: Some(at(6, 8)),
+        ..Baseline::default()
+    });
     let ed = editor(vec![elapsed]);
     assert_eq!(read(&ed, 1, "Remaining Duration").text, "2 edays");
-    // Slack is working time, shown in the working form of the unit.
-    assert!(read(&ed, 1, "Total Slack").text.ends_with("days"));
+    // Slack and date variances are working time, shown in the working form
+    // of the unit.
+    assert_eq!(read(&ed, 1, "Total Slack").text, "0 days");
+    assert_eq!(
+        tv(&ed, 1, "Start Variance"),
+        (s("-1 day"), FieldValue::Minutes(-480))
+    );
+}
+
+#[test]
+fn a_baseline_duration_shows_in_its_own_format() {
+    let mut t = task(1, "A", 480);
+    t.set_baseline_slot(Baseline {
+        number: 0,
+        duration_min: Some(4800),
+        duration_format: Some(9),
+        ..Baseline::default()
+    });
+    t.set_baseline_slot(Baseline {
+        number: 2,
+        duration_min: Some(1440),
+        duration_format: Some(39),
+        ..Baseline::default()
+    });
+    t.set_baseline_slot(Baseline {
+        number: 4,
+        duration_min: Some(0),
+        duration_format: Some(19),
+        ..Baseline::default()
+    });
+    let ed = editor(vec![Task {
+        duration_format: Some(5),
+        ..t
+    }]);
+    assert_eq!(
+        tv(&ed, 1, "Baseline Duration"),
+        (s("2 wks"), FieldValue::Minutes(4800))
+    );
+    assert_eq!(
+        tv(&ed, 1, "Baseline2 Duration"),
+        (s("3 days?"), FieldValue::Minutes(1440))
+    );
+    // A format with no duration unit falls back to the task's.
+    assert_eq!(read(&ed, 1, "Baseline4 Duration").text, "0 hrs");
 }
 
 #[test]

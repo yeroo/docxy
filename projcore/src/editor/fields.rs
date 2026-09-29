@@ -19,10 +19,12 @@
 //! leaf is a milestone). A blank row reads only its ID and Unique ID; every
 //! other field is empty text and null.
 //!
-//! Units: a task's own durations (Actual, Remaining and Baseline Duration,
-//! Duration Variance) show in the unit its Duration was entered in, elapsed
-//! included; working-time measures (slack, Start and Finish Variance) show in
-//! that unit's working form. Work shows in hours. Values are signed minutes;
+//! Units: a task's own durations (Actual and Remaining Duration, Duration
+//! Variance) show in the unit its Duration was entered in, elapsed included;
+//! a Baseline Duration shows in the baseline's own `DurationFormat` when it
+//! has one (with `?` when that format is estimated), else in the task's
+//! unit; working-time measures (slack, Start and Finish Variance) show in
+//! the task unit's working form. Work shows in hours. Values are signed minutes;
 //! money is a decimal number of currency units (MSPDI stores hundredths).
 //!
 //! Variances are computed from the shown schedule, not the variances a file
