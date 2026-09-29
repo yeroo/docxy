@@ -799,7 +799,7 @@
       case 'rev':
         return atom(s, s.rev === 'del' ? 'rev-del' : 'rev-ins', esc(s.x || ''),
           ' title="' + esc((s.rev === 'del' ? 'Deleted' : 'Inserted') + (s.author ? ' by ' + s.author : '')) + '"');
-      case 'field': return atom(s, 'field', esc(s.x || ''));
+      case 'field': return atom(s, 'field', esc(s.x || ''), ' style="' + esc(segStyle(s)) + '"');
       case 'eq': return atom(s, 'eq', '<i>' + esc(s.x || '') + '</i>');
       case 'note': return atom(s, 'note', esc(s.x || ''));
       case 'comment': return atom(s, 'comment-mark', '', ' title="Comment"');

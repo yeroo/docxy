@@ -193,12 +193,15 @@ pub fn append(ed: &mut Editor, text: &str) {
 /// fresh document's body (headings, styled runs, links, lists, tables, …).
 /// Errors `"empty markdown"` when `text` has no non-whitespace content, so a
 /// caller can reject a would-be no-op splice before touching the editor at
-/// all: nothing spliced, no undo entry pushed.
+/// all: nothing spliced, no undo entry pushed. A field's stand-in
+/// ([`crate::editor::FIELD_CHAR`], from text an agent read back) is dropped:
+/// it is not a character to write into the document.
 pub fn parse_markdown_blocks(text: &str) -> Result<Vec<Block>, String> {
+    let text = crate::editor::without_field_chars(text);
     if text.trim().is_empty() {
         return Err("empty markdown".to_string());
     }
-    Ok(crate::markdown::from_markdown(text).body)
+    Ok(crate::markdown::from_markdown(&text).body)
 }
 
 /// The paragraph style ids (`w:pStyle` references) [`crate::markdown::from_markdown`]
@@ -1028,6 +1031,19 @@ mod tests {
 
         assert_eq!(paras(&a.doc), vec!["A", "B", "C", "D"]);
         assert_eq!(paras(&a.doc), paras(&b.doc));
+    }
+
+    #[test]
+    fn markdown_splices_never_write_the_field_character_642() {
+        let blocks = parse_markdown_blocks("Page \u{FFFC} of **\u{FFFC}3**").unwrap();
+        match &blocks[0] {
+            Block::Paragraph(p) => assert_eq!(p.plain_text(), "Page  of 3"),
+            other => panic!("expected a paragraph, got {other:?}"),
+        }
+        assert_eq!(
+            parse_markdown_blocks("\u{FFFC}\n").unwrap_err(),
+            "empty markdown"
+        );
     }
 
     #[test]

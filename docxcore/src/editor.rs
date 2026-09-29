@@ -94,7 +94,9 @@ impl Clip {
             let mut buf = String::new();
             for ch in line.chars() {
                 match ch {
-                    '\r' => {}
+                    // A field's stand-in (from editor or automation text) is
+                    // not text: pasting it back must not add a character.
+                    '\r' | FIELD_CHAR => {}
                     '\t' => {
                         if !buf.is_empty() {
                             inl.push(Inline::Run(Run {
@@ -413,6 +415,10 @@ impl Editor {
     }
 
     pub fn insert_char(&mut self, ch: char) {
+        // A field's stand-in is not text: typing it does nothing at all.
+        if ch == FIELD_CHAR {
+            return;
+        }
         if self.has_selection() {
             self.delete_selection();
         }
@@ -539,14 +545,41 @@ impl Editor {
         });
     }
 
+    /// If the character at editor offset `idx` of the caret's paragraph is a
+    /// field ([`is_field_unit`]), select it and return true: the first
+    /// Backspace or Delete next to a field selects the whole field, as in Word,
+    /// and the next press deletes it. Selecting is not an edit, so it pushes no
+    /// undo step. The caret keeps its side of the field.
+    fn select_field_unit(&mut self, idx: usize) -> bool {
+        let is_field = resolve_para(&self.doc.body, &self.caret.path)
+            .and_then(|p| inline_covering(&p.content, idx))
+            .is_some_and(is_field_unit);
+        if is_field {
+            let other = if self.caret.offset == idx {
+                idx + 1
+            } else {
+                idx
+            };
+            self.anchor = Some(Caret {
+                path: self.caret.path.clone(),
+                offset: other,
+            });
+            self.last = EditKind::None;
+        }
+        is_field
+    }
+
     pub fn backspace(&mut self) {
         if self.has_selection() {
             self.delete_selection();
             return;
         }
         if self.caret.offset > 0 {
-            self.checkpoint(EditKind::Delete);
             let off = self.caret.offset;
+            if self.select_field_unit(off - 1) {
+                return;
+            }
+            self.checkpoint(EditKind::Delete);
             if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
                 content_delete(&mut p.content, off - 1);
             }
@@ -595,6 +628,9 @@ impl Editor {
         }
         let off = self.caret.offset;
         if off < self.cur_len() {
+            if self.select_field_unit(off) {
+                return;
+            }
             self.checkpoint(EditKind::Delete);
             if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
                 content_delete(&mut p.content, off);
@@ -1413,18 +1449,13 @@ impl Editor {
 
     /// The plain text currently selected (empty if no selection). Selection
     /// offsets are editor offsets, so this slices [`editor_text`], not
-    /// `plain_text` (which also holds zero-width inlines' text).
+    /// `plain_text` (which also holds zero-width inlines' text), except that a
+    /// selected field gives its result text, not its [`FIELD_CHAR`].
     pub fn selection_text(&self) -> String {
         self.selection_spans()
             .iter()
             .filter_map(|(path, s, e)| {
-                resolve_para(&self.doc.body, path).map(|p| {
-                    editor_text(&p.content)
-                        .chars()
-                        .skip(*s)
-                        .take(e.saturating_sub(*s))
-                        .collect::<String>()
-                })
+                resolve_para(&self.doc.body, path).map(|p| display_text(&p.content, *s, *e))
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -1473,9 +1504,10 @@ impl Editor {
 ///
 /// It searches the text the editor can address ([`editor_text`]), so match
 /// offsets are editor offsets that selection and editing can use directly.
-/// Text the editor gives zero width (tracked changes, field results, footnote
-/// refs, …, including those inside a hyperlink) is drawn but not searched: a
-/// match there could be neither selected nor replaced. A hyperlink's plain
+/// Text the editor gives zero width (tracked changes, footnote refs, …,
+/// including those inside a hyperlink) is drawn but not searched: a match
+/// there could be neither selected nor replaced. Nor is a field's result: the
+/// field is one unit, [`FIELD_CHAR`] in the searched text. A hyperlink's plain
 /// runs are searched, whatever else the link holds.
 pub(crate) fn find_all_in_body(body: &[Block], query: &str, case_sensitive: bool) -> Vec<Match> {
     if query.is_empty() {
@@ -1560,6 +1592,7 @@ impl Editor {
         let Some((lo, hi)) = self.selection_range() else {
             return;
         };
+        let text = &without_field_chars(text);
         if lo.path == hi.path && !text.contains('\n') {
             self.checkpoint(EditKind::Structural);
             if let Some(p) = para_mut(&mut self.doc.body, &lo.path) {
@@ -2061,8 +2094,10 @@ fn collect_paths(body: &[Block], prefix: &mut Vec<usize>, out: &mut Vec<Vec<usiz
 // ---- content editing (operate on a paragraph's inline vector) ----
 
 /// How many caret offsets an inline occupies: its characters for a run, one
-/// for a tab or break, and zero for everything the editor treats as an opaque,
-/// uneditable anchor (fields, revisions, drawings, …). A hyperlink occupies its
+/// for a tab or break, one for a field that shows a result (edited as one unit,
+/// like Word), and zero for everything the editor treats
+/// as an opaque, uneditable anchor (revisions, drawings, a field with nothing
+/// to show, …). A hyperlink occupies its
 /// `runs` plus its `content` counted by these same rules, so the plain text of
 /// a link that also holds revisions, bookmarks or proofing marks is editable
 /// while those children stay zero-width.
@@ -2073,11 +2108,11 @@ pub fn inline_len(i: &Inline) -> usize {
         Inline::Run(r) => r.text.chars().count(),
         Inline::Hyperlink(h) => link_runs_len(h) + h.content.iter().map(inline_len).sum::<usize>(),
         Inline::Tab(_) | Inline::Break(_) => 1,
+        Inline::Field { text, .. } => usize::from(!text.is_empty()),
         // Zero-length, invisible in the editor (preserved for save only).
         Inline::SmartArt { .. }
         | Inline::Chart { .. }
         | Inline::Equation { .. }
-        | Inline::Field { .. }
         | Inline::TextBox { .. }
         | Inline::Revision { .. }
         | Inline::UnsupportedRevision { .. }
@@ -2089,7 +2124,7 @@ pub fn inline_len(i: &Inline) -> usize {
 /// A paragraph's text in editor offset space: one char per offset, matching
 /// [`inline_len`] inline by inline (zero-width inlines contribute nothing, a
 /// hyperlink contributes its `runs` and then its `content` by these same rules,
-/// a tab is `'\t'`, a break is `'\n'`).
+/// a tab is `'\t'`, a break is `'\n'`, a field is [`FIELD_CHAR`]).
 /// Unlike [`Paragraph::plain_text`], every char here is one the caret can
 /// reach, so offsets into it can be selected and edited.
 fn editor_text(content: &[Inline]) -> String {
@@ -2108,15 +2143,112 @@ fn push_editor_text(content: &[Inline], out: &mut String) {
             }
             Inline::Tab(_) => out.push('\t'),
             Inline::Break(_) => out.push('\n'),
+            Inline::Field { text, .. } => {
+                if !text.is_empty() {
+                    out.push(FIELD_CHAR);
+                }
+            }
             Inline::SmartArt { .. }
             | Inline::Chart { .. }
             | Inline::Equation { .. }
-            | Inline::Field { .. }
             | Inline::TextBox { .. }
             | Inline::Revision { .. }
             | Inline::UnsupportedRevision { .. }
             | Inline::FootnoteRef { .. }
             | Inline::Raw(_) => {}
+        }
+    }
+}
+
+/// The character a field stands for in editor text ([`editor_text`], and the
+/// automation text built from it): U+FFFC OBJECT REPLACEMENT CHARACTER. It is
+/// never inserted as text: typing, pasting, replacing or splicing Markdown
+/// (`agent::parse_markdown_blocks`) with it adds nothing.
+pub const FIELD_CHAR: char = '\u{FFFC}';
+
+/// Whether an inline is a field edited as one unit: Backspace or Delete next to
+/// it selects it first, and the next press deletes all of it (as Word does). A
+/// `w:sym` symbol run, which the loader also keeps as a [`Inline::Field`], is a
+/// plain character instead and is deleted at once.
+pub(crate) fn is_field_unit(inline: &Inline) -> bool {
+    match inline {
+        Inline::Field { raw, text } => {
+            let symbol = raw.contains("<w:sym")
+                && !raw.contains("<w:fldChar")
+                && !raw.trim_start().starts_with("<w:fldSimple");
+            !text.is_empty() && !symbol
+        }
+        _ => false,
+    }
+}
+
+/// `text` without [`FIELD_CHAR`]s, for the entry points that insert text: the
+/// stand-in adds nothing, so callers must count what is left.
+pub(crate) fn without_field_chars(text: &str) -> String {
+    text.chars().filter(|&c| c != FIELD_CHAR).collect()
+}
+
+/// The inline holding editor offset `idx` (the character at `[idx, idx + 1)`),
+/// looking inside a hyperlink's `content`.
+fn inline_covering(content: &[Inline], idx: usize) -> Option<&Inline> {
+    let mut acc = 0;
+    for inline in content {
+        let l = inline_len(inline);
+        if idx < acc + l {
+            let local = idx - acc;
+            return match inline {
+                Inline::Hyperlink(h) if local >= link_runs_len(h) => {
+                    inline_covering(&h.content, local - link_runs_len(h))
+                }
+                _ => Some(inline),
+            };
+        }
+        acc += l;
+    }
+    None
+}
+
+/// The text a user sees in editor offsets `[start, end)` of `content`: the
+/// editor text, with each field's result in place of its [`FIELD_CHAR`].
+fn display_text(content: &[Inline], start: usize, end: usize) -> String {
+    let mut out = String::new();
+    push_display_text(content, start, end, &mut 0, &mut out);
+    out
+}
+
+fn push_display_text(
+    content: &[Inline],
+    start: usize,
+    end: usize,
+    pos: &mut usize,
+    out: &mut String,
+) {
+    for inline in content {
+        let len = inline_len(inline);
+        let a = *pos;
+        match inline {
+            Inline::Hyperlink(h) => {
+                let runs: String = h.runs.iter().map(|r| r.text.as_str()).collect();
+                let (s, e) = (
+                    start.clamp(a, a + runs.chars().count()),
+                    end.clamp(a, a + runs.chars().count()),
+                );
+                out.extend(runs.chars().skip(s - a).take(e.saturating_sub(s)));
+                *pos = a + runs.chars().count();
+                push_display_text(&h.content, start, end, pos, out);
+            }
+            Inline::Field { text, .. } if len == 1 => {
+                if start <= a && a < end {
+                    out.push_str(text);
+                }
+                *pos += 1;
+            }
+            _ => {
+                let t = editor_text(std::slice::from_ref(inline));
+                let (s, e) = (start.clamp(a, a + len), end.clamp(a, a + len));
+                out.extend(t.chars().skip(s - a).take(e.saturating_sub(s)));
+                *pos += len;
+            }
         }
     }
 }
@@ -2127,14 +2259,15 @@ fn push_editor_text(content: &[Inline], out: &mut String) {
 /// the matched chars are deleted afterwards. `content_insert` at offset
 /// `start + 1` resolves to the inline holding the first matched char, because
 /// every earlier inline ends at or before `start`; so nothing is inserted on
-/// the far side of an adjacent zero-width inline (a field, a tracked change,
-/// …). When that inline is a run or hyperlink, the replacement lands in it and
-/// takes its formatting (as Word does), and it never goes empty mid-edit.
-/// When it is a tab or break (a match starting with `\t`/`\n`), there is no
+/// the far side of an adjacent zero-width inline (a tracked change, …). When
+/// that inline is a run or hyperlink, the replacement lands in it and takes its
+/// formatting (as Word does), and it never goes empty mid-edit. When it is a
+/// tab, break or field (a match starting with `\t`/`\n`/[`FIELD_CHAR`]), there is no
 /// run to take: the replacement takes the formatting typing there would (see
 /// [`typing_props`]: a tab's own), joining the following run only when that
 /// matches, right where the tab or break was.
 fn replace_range_in_content(content: &mut Vec<Inline>, start: usize, end: usize, with: &str) {
+    let with = &without_field_chars(with);
     if end <= start {
         for (k, ch) in with.chars().enumerate() {
             content_insert(content, start + k, ch);
@@ -2539,8 +2672,9 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
                     }
                     // A link with no editable text left goes, as in Word. Its
                     // bookmarks and proofing marks stay where it was; anything
-                    // still showing inside it (a tracked change, a field, a
-                    // picture) keeps the link, zero-width.
+                    // still showing inside it (a tracked change, a picture, an
+                    // empty field) keeps the link, zero-width. A field with a
+                    // result is editable, one offset, so its link is not empty.
                     if h.runs.is_empty() && h.content.iter().all(is_marker) {
                         let kept = std::mem::take(&mut h.content);
                         content.splice(i..=i, kept);
@@ -2646,11 +2780,11 @@ fn range_all_have_at(
                     return false;
                 }
             }
-            Inline::Break(_) => *pos += 1,
+            // Not formatted characters: a field keeps its own result formatting.
+            Inline::Break(_) | Inline::Field { .. } => *pos += inline_len(inline),
             Inline::SmartArt { .. }
             | Inline::Chart { .. }
             | Inline::Equation { .. }
-            | Inline::Field { .. }
             | Inline::TextBox { .. }
             | Inline::Revision { .. }
             | Inline::UnsupportedRevision { .. }
@@ -2763,8 +2897,12 @@ fn edit_run_range_at(
                 out.push(Inline::Break(k));
                 *pos += 1;
             }
-            // zero-length, unchanged
-            other => out.push(other),
+            // A field (one offset, its result formatting its own) or a
+            // zero-length inline: unchanged.
+            other => {
+                *pos += inline_len(&other);
+                out.push(other);
+            }
         }
     }
     *content = out;
@@ -4406,28 +4544,37 @@ mod tests {
 
     #[test]
     fn replace_range_after_a_field_stays_after_it_197() {
+        // The field is offset 0 (#642), so "end" is [1, 4).
         let mut content = vec![field("F"), run("end.", RunProps::default())];
-        replace_range_in_content(&mut content, 0, 3, "finish");
+        replace_range_in_content(&mut content, 1, 4, "finish");
         assert_eq!(
             content,
             vec![field("F"), run("finish.", RunProps::default())]
         );
         // The whole trailing run matched: it must not reappear before the field.
         let mut content = vec![field("F"), run("end", bold())];
-        replace_range_in_content(&mut content, 0, 3, "finish");
+        replace_range_in_content(&mut content, 1, 4, "finish");
         assert_eq!(content, vec![field("F"), run("finish", bold())]);
     }
 
     #[test]
-    fn replace_range_across_a_field_keeps_the_field_197() {
+    fn replace_range_up_to_a_field_keeps_the_field_197() {
         let mut content = vec![
             run("ab", RunProps::default()),
             field("F"),
             run("cd", RunProps::default()),
         ];
-        replace_range_in_content(&mut content, 0, 4, "X");
-        assert_eq!(editor_text(&content), "X");
+        replace_range_in_content(&mut content, 0, 2, "X");
+        assert_eq!(editor_text(&content), "X\u{FFFC}cd");
         assert!(content.contains(&field("F")));
+        // A field is one offset (#642): a range over it replaces it, as in Word.
+        let mut content = vec![
+            run("ab", RunProps::default()),
+            field("F"),
+            run("cd", RunProps::default()),
+        ];
+        replace_range_in_content(&mut content, 0, 5, "X");
+        assert_eq!(content, vec![run("X", RunProps::default())]);
     }
 
     #[test]
@@ -4500,7 +4647,7 @@ mod tests {
             field("F"),
         ];
         replace_range_in_content(&mut content, 1, 2, "X");
-        assert_eq!(editor_text(&content), "aX");
+        assert_eq!(editor_text(&content), "aX\u{FFFC}");
         assert_eq!(content.last(), Some(&field("F")));
     }
 
@@ -4600,7 +4747,7 @@ mod tests {
         ed.select_match(&ms[0]);
         ed.replace_current_with("finish");
         assert!(matches!(first_para(&ed).content[0], Inline::Field { .. }));
-        assert_eq!(etext(&ed), "finish.");
+        assert_eq!(etext(&ed), "\u{FFFC}finish.");
     }
 
     #[test]
@@ -4684,8 +4831,8 @@ mod tests {
                 content: vec![run("complex", RunProps::default())],
                 ..Default::default()
             }),
-            // #212: a link's plain runs, tabs and nested links count; its
-            // markers, revisions and fields don't.
+            // #212: a link's plain runs, tabs and nested links count, and a
+            // field is one unit (#642); its markers and revisions don't.
             Inline::Hyperlink(Hyperlink {
                 content: vec![
                     Inline::Raw(r#"<w:proofErr w:type="spellStart"/>"#.into()),
@@ -4773,7 +4920,7 @@ mod tests {
             editor_text(&all).chars().count(),
             all.iter().map(inline_len).sum::<usize>()
         );
-        assert_eq!(editor_text(&all[3..4]), "mixed\t\nnested");
+        assert_eq!(editor_text(&all[3..4]), "mixed\t\u{FFFC}\nnested");
     }
 
     #[test]
@@ -5097,5 +5244,267 @@ mod tests {
         let p = resolve_para(&ed.doc.body, &[1, 0, 1, 0]).unwrap();
         assert_eq!(p.plain_text(), "B");
         assert_eq!(ed.caret, Caret::at(vec![1, 0, 1, 0], 0));
+    }
+
+    // ---- #642: a field is one editing unit ----
+
+    /// A complex PAGE field whose cached result is `1`.
+    const PAGE_642: &str = "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+        <w:r><w:instrText xml:space=\"preserve\"> PAGE \\* MERGEFORMAT </w:instrText></w:r>\
+        <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+        <w:r><w:t>1</w:t></w:r>\
+        <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>";
+    const SIMPLE_PAGE_642: &str =
+        "<w:fldSimple w:instr=\" PAGE \"><w:r><w:t>1</w:t></w:r></w:fldSimple>";
+
+    fn body_then(field_xml: &str) -> Editor {
+        Editor::new(xml_doc(&format!("<w:r><w:t>Body</w:t></w:r>{field_xml}")))
+    }
+
+    fn inline_kinds(ed: &Editor) -> Vec<String> {
+        first_para(ed)
+            .content
+            .iter()
+            .map(|i| match i {
+                Inline::Run(r) => format!("Run {}", r.text),
+                Inline::Field { text, .. } => format!("Field {text}"),
+                _ => "Other".to_string(),
+            })
+            .collect()
+    }
+
+    fn saved(ed: &Editor) -> String {
+        crate::serialize::document_to_xml(&ed.doc)
+    }
+
+    #[test]
+    fn a_field_is_one_editor_offset_642() {
+        for xml in [PAGE_642, SIMPLE_PAGE_642] {
+            let ed = body_then(xml);
+            assert_eq!(inline_kinds(&ed), ["Run Body", "Field 1"]);
+            assert_eq!(etext(&ed), "Body\u{FFFC}");
+            assert_eq!(para_text_len(first_para(&ed)), 5);
+            let flat = flat::FlatDocument::new(&ed.doc);
+            assert_eq!(flat.main().text, "Body\u{FFFC}\n");
+        }
+    }
+
+    #[test]
+    fn backspace_after_a_field_selects_it_then_deletes_it_642() {
+        for xml in [PAGE_642, SIMPLE_PAGE_642] {
+            let mut ed = body_then(xml);
+            let before = ed.doc.clone();
+            ed.set_caret(Caret::at(vec![0], 5));
+            ed.backspace();
+            let (lo, hi) = ed.selection_range().expect("the field is selected");
+            assert_eq!((lo.offset, hi.offset), (4, 5));
+            assert_eq!(ed.doc, before, "selecting changes nothing");
+            assert!(!ed.undo(), "selecting is not an undo step");
+            ed.backspace();
+            assert_eq!(inline_kinds(&ed), ["Run Body"]);
+            assert_eq!(ed.caret.offset, 4);
+            let xml_out = saved(&ed);
+            for gone in ["fldChar", "instrText", "fldSimple", ">1<"] {
+                assert!(!xml_out.contains(gone), "{gone} left in {xml_out}");
+            }
+            ed.backspace();
+            assert_eq!(etext(&ed), "Bod", "the next Backspace deletes a character");
+            assert!(ed.undo() && ed.undo());
+            assert_eq!(ed.doc, before, "undo brings the whole field back");
+        }
+    }
+
+    #[test]
+    fn delete_before_a_field_selects_it_then_deletes_it_642() {
+        for xml in [PAGE_642, SIMPLE_PAGE_642] {
+            let mut ed = body_then(xml);
+            ed.set_caret(Caret::at(vec![0], 4));
+            ed.delete_forward();
+            let (lo, hi) = ed.selection_range().expect("the field is selected");
+            assert_eq!((lo.offset, hi.offset), (4, 5));
+            ed.delete_forward();
+            assert_eq!(inline_kinds(&ed), ["Run Body"]);
+            assert!(!saved(&ed).contains("fldChar"));
+        }
+    }
+
+    #[test]
+    fn backspace_selects_a_field_inside_a_link_642() {
+        let mut ed = Editor::new(xml_doc(&format!(
+            "<w:hyperlink w:anchor=\"_Toc1\"><w:r><w:t>Intro</w:t></w:r>{PAGE_642}</w:hyperlink>"
+        )));
+        assert_eq!(etext(&ed), "Intro\u{FFFC}");
+        ed.set_caret(Caret::at(vec![0], 6));
+        ed.backspace();
+        let (lo, hi) = ed.selection_range().expect("the field is selected");
+        assert_eq!((lo.offset, hi.offset), (5, 6));
+        ed.backspace();
+        assert_eq!(etext(&ed), "Intro");
+    }
+
+    #[test]
+    fn a_symbol_is_one_character_deleted_at_once_642() {
+        let mut ed = body_then("<w:r><w:sym w:font=\"Symbol\" w:char=\"F0B7\"/></w:r>");
+        assert!(matches!(first_para(&ed).content[1], Inline::Field { .. }));
+        assert_eq!(etext(&ed), "Body\u{FFFC}");
+        ed.set_caret(Caret::at(vec![0], 5));
+        ed.backspace();
+        assert!(!ed.has_selection());
+        assert_eq!(inline_kinds(&ed), ["Run Body"]);
+    }
+
+    #[test]
+    fn a_field_inserted_at_another_fields_left_edge_goes_before_it_642() {
+        let mut ed = body_then(PAGE_642);
+        ed.set_caret(Caret::at(vec![0], 4));
+        let new_field = Inline::Field {
+            raw: SIMPLE_PAGE_642.into(),
+            text: "1".into(),
+        };
+        ed.paste(&Clip {
+            paras: vec![vec![new_field]],
+        });
+        assert_eq!(inline_kinds(&ed), ["Run Body", "Field 1", "Field 1"]);
+        assert_eq!(ed.caret.offset, 5);
+        let xml_out = saved(&ed);
+        let simple = xml_out.find("<w:fldSimple").unwrap();
+        assert!(simple < xml_out.find("fldCharType=\"begin\"").unwrap());
+        assert!(xml_out.contains(PAGE_642), "the old field is untouched");
+    }
+
+    #[test]
+    fn typing_at_a_fields_edges_lands_outside_it_642() {
+        let mut ed = body_then(PAGE_642);
+        ed.set_caret(Caret::at(vec![0], 5));
+        ed.insert_char('x');
+        assert_eq!(inline_kinds(&ed), ["Run Body", "Field 1", "Run x"]);
+        let mut ed = body_then(PAGE_642);
+        ed.set_caret(Caret::at(vec![0], 4));
+        ed.insert_char('x');
+        assert_eq!(inline_kinds(&ed), ["Run Bodyx", "Field 1"]);
+        // A field first in the paragraph: typing before it stays before it.
+        let mut ed = Editor::new(xml_doc(PAGE_642));
+        ed.set_caret(Caret::at(vec![0], 0));
+        ed.insert_char('x');
+        assert_eq!(inline_kinds(&ed), ["Run x", "Field 1"]);
+    }
+
+    #[test]
+    fn a_field_with_no_result_stays_zero_width_642() {
+        let xe = "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+            <w:r><w:instrText> XE \"term\" </w:instrText></w:r>\
+            <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>";
+        let empty = "<w:fldSimple w:instr=\" AUTHOR \"/>";
+        for xml in [xe, empty] {
+            let mut ed = Editor::new(xml_doc(&format!("<w:r><w:t>term</w:t></w:r>{xml}")));
+            assert_eq!(etext(&ed), "term");
+            ed.set_caret(Caret::at(vec![0], 4));
+            ed.insert_char('s');
+            ed.backspace();
+            ed.backspace();
+            assert_eq!(etext(&ed), "ter");
+            assert!(saved(&ed).contains(xml), "{xml} survives");
+        }
+    }
+
+    #[test]
+    fn typing_over_a_selection_holding_a_field_replaces_it_642() {
+        let mut ed = Editor::new(xml_doc(&format!(
+            "<w:r><w:t>Body</w:t></w:r>{PAGE_642}<w:r><w:t>xy</w:t></w:r>"
+        )));
+        ed.set_caret(Caret::at(vec![0], 4));
+        ed.extend_selection(true);
+        ed.set_caret(Caret::at(vec![0], 6));
+        ed.insert_char('Z');
+        assert_eq!(etext(&ed), "BodyZy");
+        assert!(!saved(&ed).contains("fldChar"));
+        // Replace (find/replace's path) of a range starting at the field.
+        let mut content = first_para(&body_then(PAGE_642)).content.clone();
+        content.push(run("xy", RunProps::default()));
+        replace_range_in_content(&mut content, 4, 6, "Z");
+        assert_eq!(editor_text(&content), "BodyZy");
+    }
+
+    #[test]
+    fn the_field_character_is_never_inserted_as_text_642() {
+        let mut ed = body_then(PAGE_642);
+        ed.set_caret(Caret::at(vec![0], 5));
+        ed.insert_char(FIELD_CHAR);
+        assert_eq!(inline_kinds(&ed), ["Run Body", "Field 1"]);
+        ed.paste(&Clip::from_text("a\u{FFFC}b"));
+        assert_eq!(etext(&ed), "Body\u{FFFC}ab");
+        // An automation rewrite that sends the paragraph's text back: the
+        // stand-in adds nothing, and the undo contract is unchanged.
+        let mut ed = body_then(PAGE_642);
+        let (n, steps) = crate::agent::replace_range(&mut ed, 0, 0, "Body text\u{FFFC}").unwrap();
+        assert_eq!((n, steps), (1, 2));
+        assert_eq!(etext(&ed), "Body text");
+    }
+
+    #[test]
+    fn the_field_character_never_shifts_the_caret_or_a_replace_642() {
+        // Typed in the middle of a paragraph: nothing, not even a caret step.
+        let mut ed = Editor::new(xml_doc("<w:r><w:t>XY</w:t></w:r>"));
+        ed.set_caret(Caret::at(vec![0], 1));
+        ed.insert_str("a\u{FFFC}b");
+        assert_eq!(etext(&ed), "XabY");
+        assert_eq!(ed.caret.offset, 3);
+        // A replacement holding it: the rest is counted without it.
+        let mut content = vec![run("abcdef", RunProps::default())];
+        replace_range_in_content(&mut content, 0, 2, "X\u{FFFC}");
+        assert_eq!(editor_text(&content), "Xcdef");
+        let mut ed = Editor::new(xml_doc("<w:r><w:t>abcdef</w:t></w:r>"));
+        ed.select_match(&Match {
+            path: vec![0],
+            start: 1,
+            end: 3,
+        });
+        ed.replace_current_with("Z\u{FFFC}");
+        assert_eq!(etext(&ed), "aZdef");
+        assert_eq!(ed.caret.offset, 2);
+        assert_eq!(ed.replace_all("de", "\u{FFFC}Q", false), 1);
+        assert_eq!(etext(&ed), "aZQf");
+    }
+
+    #[test]
+    fn a_selected_field_copies_as_its_result_642() {
+        let mut ed = body_then(PAGE_642);
+        ed.set_caret(Caret::at(vec![0], 5));
+        ed.backspace();
+        assert_eq!(ed.selection_text(), "1");
+        let clip = ed.copy().expect("a clip");
+        ed.clear_selection();
+        ed.set_caret(Caret::at(vec![0], 5));
+        ed.paste(&clip);
+        assert_eq!(inline_kinds(&ed), ["Run Body", "Field 1", "Field 1"]);
+        assert_eq!(saved(&ed).matches(PAGE_642).count(), 2);
+        // Selecting across text and fields gives the visible text.
+        ed.set_caret(Caret::at(vec![0], 2));
+        ed.extend_selection(true);
+        ed.set_caret(Caret::at(vec![0], 6));
+        assert_eq!(ed.selection_text(), "dy11");
+    }
+
+    #[test]
+    fn find_never_matches_a_fields_result_642() {
+        let ed = body_then(PAGE_642);
+        assert!(ed.find_all("Body1", false).is_empty());
+        assert_eq!(ed.find_all("Body", false).len(), 1);
+    }
+
+    #[test]
+    fn bold_over_a_field_skips_it_and_keeps_offsets_642() {
+        let mut ed = Editor::new(xml_doc(&format!(
+            "<w:r><w:t>ab</w:t></w:r>{PAGE_642}<w:r><w:t>cd</w:t></w:r>"
+        )));
+        ed.set_caret(Caret::at(vec![0], 0));
+        ed.extend_selection(true);
+        ed.set_caret(Caret::at(vec![0], 4));
+        ed.toggle_bold();
+        let p = first_para(&ed);
+        assert!(matches!(&p.content[0], Inline::Run(r) if r.text == "ab" && r.props.bold));
+        assert!(matches!(&p.content[1], Inline::Field { .. }));
+        assert!(matches!(&p.content[2], Inline::Run(r) if r.text == "c" && r.props.bold));
+        assert!(matches!(&p.content[3], Inline::Run(r) if r.text == "d" && !r.props.bold));
     }
 }

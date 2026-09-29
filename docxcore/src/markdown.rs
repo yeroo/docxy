@@ -323,7 +323,9 @@ fn inlines_to_md(content: &[Inline]) -> String {
                 // Legacy Equation Editor object: fall back to its Unicode text.
                 None => s.push_str(&escape_inline(text)),
             },
-            Inline::Field { text, .. } => s.push_str(&escape_inline(text)),
+            Inline::Field { raw, text } => {
+                s.push_str(&run_to_md(text, &crate::load::field_result_props(raw)))
+            }
             Inline::SmartArt { text, .. } => s.push_str(&escape_inline(&text.join(" "))),
             // Tracked change: emit the inner text (deletions as ~~struck~~).
             Inline::Revision { kind, content, .. } => {
@@ -1036,6 +1038,20 @@ impl From<Paragraph> for Block {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fields_bold_result_is_bold_markdown_642() {
+        let doc = crate::load::parse_document_xml(
+            "<w:document><w:body><w:p><w:r><w:t xml:space=\"preserve\">Page </w:t></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+             <w:r><w:instrText> PAGE </w:instrText></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+             <w:r><w:rPr><w:b/></w:rPr><w:t>3</w:t></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"end\"/></w:r></w:p></w:body></w:document>",
+            &crate::load::Relationships::default(),
+        );
+        assert_eq!(to_markdown(&doc).trim_end(), "Page **3**");
+    }
 
     #[test]
     fn decode_markdown_accepts_utf8_and_bom_marked_utf16() {

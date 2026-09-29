@@ -298,12 +298,14 @@ Notes:
   `app.footers.default`.
 - **`doc.find` and `doc.replace-all` see only the text the editor can edit.**
   A paragraph's editable text is its runs, tabs and breaks, including those
-  inside hyperlinks. Text it only shows is not searched or replaced: tracked
-  changes (`w:ins`/`w:del`), field results, footnote/endnote references,
-  equations, SmartArt, chart titles and inline text boxes, including any of
-  these inside a hyperlink. A link's bookmarks and proofing marks
-  (`w:proofErr`) don't hide its text, and an edit keeps them in place. A match's
-  `start`/`end` count only editable text, while `text` is the paragraph's full
+  inside hyperlinks, plus one offset (U+FFFC) for each field that shows a
+  result: a field is edited as one unit, as in Word. Text it only shows is not
+  searched or replaced: tracked changes (`w:ins`/`w:del`), field results,
+  footnote/endnote references, equations, SmartArt, chart titles and inline
+  text boxes, including any of these inside a hyperlink. A link's bookmarks and
+  proofing marks (`w:proofErr`) don't hide its text, and an edit keeps them in
+  place. A match's `start`/`end` count only editable text (a field counting
+  one), while `text` is the paragraph's full
   plain text (the form `doc.replace-range` round-trips), which includes the
   rest. So `text[start..end]` is the match only when the paragraph holds
   nothing but editable text; otherwise don't splice `text` at those offsets.
