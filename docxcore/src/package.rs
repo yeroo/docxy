@@ -999,21 +999,6 @@ impl Package {
         Some(part_name)
     }
 
-    /// Whether the section has a distinct first-page header/footer (`<w:titlePg/>`).
-    pub fn has_title_pg(&self) -> bool {
-        crate::sect::has_flag(self.sect_pr(), "w:titlePg")
-    }
-
-    /// Toggle a distinct first-page header/footer (`<w:titlePg/>` in the section).
-    /// When turning it off, the "first" parts are left in place (as Word does).
-    pub fn set_title_pg(&mut self, on: bool) {
-        if on == self.has_title_pg() {
-            return;
-        }
-        let section = crate::sect::set_flag(self.sect_pr(), "w:titlePg", on);
-        self.set_current_sect_pr_raw(section);
-    }
-
     /// Whether the document uses distinct even/odd page headers/footers
     /// (`<w:evenAndOddHeaders/>` in `word/settings.xml`).
     pub fn has_even_odd(&self) -> bool {
@@ -1088,7 +1073,7 @@ impl Package {
             // because "the tag is already there" — which is what made the toggle
             // look dead until it was pressed twice.
             let xml = if cur.is_some() {
-                remove_element(&xml, elem)
+                crate::sect::remove_element(&xml, elem)
             } else {
                 xml
             };
@@ -1616,12 +1601,6 @@ pub(crate) fn settings_flag_of(xml: &str, elem: &str) -> Option<bool> {
         from = after;
     }
     None
-}
-
-fn remove_element(xml: &str, name: &str) -> String {
-    // Keeps scanning past a longer name that shares the prefix (`w:cols` when
-    // removing `w:col`) instead of giving up on it.
-    crate::sect::remove_element(xml, name)
 }
 
 /// Open a `.docx` from bytes, keeping all parts for a lossless-ish save.
@@ -2803,7 +2782,7 @@ mod tests {
         );
         pkg.set_columns(2);
         pkg.set_page_margins(720, 720, 720, 720);
-        pkg.set_title_pg(true);
+        pkg.set_sect_pr(crate::sect::set_flag(pkg.sect_pr(), "w:titlePg", true));
         let s = pkg.sect_pr();
         let at = |n: &str| s.find(n).unwrap_or_else(|| panic!("{n} missing: {s}"));
         assert!(at("<w:pgSz") < at("<w:pgMar"), "{s}");
@@ -2872,18 +2851,24 @@ mod tests {
             body: vec![Block::Paragraph(Paragraph::default())],
         });
         // First-page header/footer.
-        assert!(!pkg.has_title_pg());
-        pkg.set_title_pg(true);
-        assert!(pkg.has_title_pg() && pkg.sect_pr().contains("<w:titlePg/>"));
-        pkg.set_title_pg(true); // idempotent
+        assert!(!crate::sect::has_flag(pkg.sect_pr(), "w:titlePg"));
+        pkg.set_sect_pr(crate::sect::set_flag(pkg.sect_pr(), "w:titlePg", true));
+        assert!(
+            crate::sect::has_flag(pkg.sect_pr(), "w:titlePg")
+                && pkg.sect_pr().contains("<w:titlePg/>")
+        );
+        pkg.set_sect_pr(crate::sect::set_flag(pkg.sect_pr(), "w:titlePg", true)); // idempotent
         assert_eq!(pkg.sect_pr().matches("<w:titlePg").count(), 1);
         let first = pkg.create_hf(true, "first").expect("first header");
         assert!(pkg.sect_pr().contains("w:type=\"first\""));
         assert!(
             crate::load::header_footer_ref_rid(pkg.sect_pr(), "headerReference", "first").is_some()
         );
-        pkg.set_title_pg(false);
-        assert!(!pkg.has_title_pg() && !pkg.sect_pr().contains("titlePg"));
+        pkg.set_sect_pr(crate::sect::set_flag(pkg.sect_pr(), "w:titlePg", false));
+        assert!(
+            !crate::sect::has_flag(pkg.sect_pr(), "w:titlePg")
+                && !pkg.sect_pr().contains("titlePg")
+        );
         assert!(
             pkg.part(&first).is_some(),
             "first part kept when toggled off"

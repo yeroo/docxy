@@ -235,6 +235,15 @@ fn set_value(d: &mut Dialog, name: &str, value: Value) {
     }
 }
 
+/// A side's value as the dialog opened on it (kept in step as the page
+/// turns): the section's own.
+fn side_opened(d: &Dialog, name: &str) -> Option<i32> {
+    match d.opened.get(index(d, name)?) {
+        Some(Value::Text(t)) => twips_of(t),
+        _ => None,
+    }
+}
+
 fn twips_of(text: &str) -> Option<i32> {
     let v = text.trim().parse::<f64>().ok().filter(|v| v.is_finite())?;
     Some((v * TWIPS_PER_INCH as f64).round() as i32)
@@ -245,8 +254,9 @@ fn twips_of(text: &str) -> Option<i32> {
 /// - Orientation turns the page, by the rule [`SectionSetup::set_landscape`]
 ///   uses on OK, so the section gets what the dialog shows: when the choice
 ///   actually changes the margins always rotate, and Width and Height swap
-///   when their shape disagrees with the new orientation (a square page, or
-///   sides that do not parse, keep them as they are).
+///   when their shape disagrees with the new orientation. The shape is the
+///   shown sides', or the section's own when a side does not parse (the one
+///   set_landscape looks at); a square page keeps its sides.
 /// - A named paper size fills in Width and Height.
 /// - Width or Height names the paper they match, else Custom.
 pub(crate) fn after_set(d: &mut Dialog, i: usize, before: &Value) {
@@ -256,8 +266,16 @@ pub(crate) fn after_set(d: &mut Dialog, i: usize, before: &Value) {
                 return;
             }
             let landscape = chosen(d, "orientation") == Some(1);
-            let w = twips_of(&text_of(d, "width"));
-            let h = twips_of(&text_of(d, "height"));
+            // The shape the sides have: as shown when both parse, else as
+            // they opened (the section's own, which set_landscape looks at).
+            let shown = (
+                twips_of(&text_of(d, "width")),
+                twips_of(&text_of(d, "height")),
+            );
+            let (w, h) = match shown {
+                (Some(w), Some(h)) => (Some(w), Some(h)),
+                _ => (side_opened(d, "width"), side_opened(d, "height")),
+            };
             if let (Some(w), Some(h)) = (w, h)
                 && w != h
                 && (w > h) != landscape
@@ -385,7 +403,10 @@ pub(crate) fn apply_page_setup(
     // Check every section it would write before writing any.
     let sections = ed.sections();
     let targets = targets(ed, d);
-    let check: Vec<usize> = targets.clone().unwrap_or_else(|| vec![ed.caret_section()]);
+    let check: Vec<usize> = match &targets {
+        Some(k) => k.clone(),
+        None => vec![ed.break_section()?],
+    };
     for k in check {
         let mut s = SectionSetup::parse(&sections[k.min(sections.len() - 1)]);
         edit(&mut s);
@@ -647,7 +668,7 @@ pub(crate) fn columns_dialog(tab: &DocTab) -> Result<Dialog, String> {
 /// anything changed.
 pub(crate) fn apply_columns(
     ed: &mut Editor,
-    _pkg: &mut Package,
+    pkg: &mut Package,
     d: &Dialog,
 ) -> Result<bool, String> {
     let n: usize = text_of(d, "num")
@@ -672,7 +693,15 @@ pub(crate) fn apply_columns(
         .chain(WIDTH)
         .chain(SPACE)
         .any(|name| d.changed(name));
-    let tw = text_width_of(d);
+    // This point forward lays the columns out in the section the break lands
+    // in, which a selection can put before the caret's.
+    let tw = match targets(ed, d) {
+        Some(_) => text_width_of(d),
+        None => {
+            let k = ed.break_section()?;
+            SectionSetup::parse(&ed.sections()[k]).text_width(pkg.has_gutter_at_top())
+        }
+    };
     let total: i32 = if equal {
         widths[0] * n as i32 + spaces[0] * (n as i32 - 1)
     } else {

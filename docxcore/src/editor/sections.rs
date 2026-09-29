@@ -171,17 +171,7 @@ impl Editor {
         start: SectionStart,
         edit: impl FnOnce(&mut SectionSetup),
     ) -> Result<(), String> {
-        let at = match self.selection_range() {
-            Some((lo, _)) => lo,
-            None => self.caret.clone(),
-        };
-        let &[block] = at.path.as_slice() else {
-            return Err("A section break can only go in the body text, not here".into());
-        };
-        if !matches!(self.doc.body.get(block), Some(Block::Paragraph(_))) {
-            return Err("A section break needs the caret in a paragraph".into());
-        }
-        let k = self.section_of_block(block);
+        let (at, block, k) = self.break_point()?;
         let slot = self.section_slots()[k];
         let old = self.sect_raw(slot).to_string();
         let mut setup = SectionSetup::parse(&old);
@@ -216,22 +206,36 @@ impl Editor {
         Ok(())
     }
 
+    /// Where a section break goes: the selection's start, else the caret; its
+    /// body block; and the section it lands in, the one whose setup the
+    /// section after the break takes. Refused outside a body paragraph.
+    fn break_point(&self) -> Result<(Caret, usize, usize), String> {
+        let at = match self.selection_range() {
+            Some((lo, _)) => lo,
+            None => self.caret.clone(),
+        };
+        let &[block] = at.path.as_slice() else {
+            return Err("A section break can only go in the body text, not here".into());
+        };
+        if !matches!(self.doc.body.get(block), Some(Block::Paragraph(_))) {
+            return Err("A section break needs the caret in a paragraph".into());
+        }
+        let k = self.section_of_block(block);
+        Ok((at, block, k))
+    }
+
+    /// The section a break at this point lands in: the one
+    /// [`Editor::insert_section_break_with`] edits for the section after the
+    /// break. Page Setup's and Columns' This point forward check that one.
+    pub fn break_section(&self) -> Result<usize, String> {
+        self.break_point().map(|(_, _, k)| k)
+    }
+
     /// Insert a page, column or clearing line break at the caret.
     pub fn insert_break(&mut self, kind: BreakKind) {
         self.paste(&Clip {
             paras: vec![vec![Inline::Break(kind)]],
         });
-    }
-
-    /// The paragraphs a paragraph command acts on: the selected ones, else the
-    /// caret's.
-    fn target_paragraphs(&self) -> Vec<Vec<usize>> {
-        let spans = self.selection_spans();
-        if spans.is_empty() {
-            vec![self.caret.path.clone()]
-        } else {
-            spans.into_iter().map(|(p, _, _)| p).collect()
-        }
     }
 
     /// Whether the caret's paragraph suppresses line numbers
@@ -244,18 +248,14 @@ impl Editor {
     /// caret's), as one undo step: on unless the caret's paragraph has it.
     pub fn toggle_suppress_line_numbers(&mut self) {
         let on = !self.caret_suppresses_line_numbers();
-        let paths = self.target_paragraphs();
-        self.checkpoint(EditKind::Structural);
-        for path in paths {
-            if let Some(p) = para_mut(&mut self.doc.body, &path) {
-                p.props
-                    .raw_props
-                    .retain(|r| !is_element(r, "w:suppressLineNumbers"));
-                if on {
-                    p.props.raw_props.push("<w:suppressLineNumbers/>".into());
-                }
+        self.for_each_para(|props| {
+            props
+                .raw_props
+                .retain(|r| !is_element(r, "w:suppressLineNumbers"));
+            if on {
+                props.raw_props.push("<w:suppressLineNumbers/>".into());
             }
-        }
+        });
     }
 }
 
@@ -266,12 +266,10 @@ fn is_element(raw: &str, name: &str) -> bool {
 }
 
 fn suppresses_line_numbers(p: &Paragraph) -> bool {
-    p.props.raw_props.iter().any(|r| {
-        is_element(r, "w:suppressLineNumbers")
-            && !["\"0\"", "\"false\"", "\"off\""]
-                .iter()
-                .any(|v| r.contains(&format!("w:val={v}")))
-    })
+    p.props
+        .raw_props
+        .iter()
+        .any(|r| crate::sect::has_flag(r, "w:suppressLineNumbers"))
 }
 
 #[cfg(test)]
@@ -486,6 +484,46 @@ mod tests {
         assert!(p.content.contains(&Inline::Break(BreakKind::Clear(
             crate::model::ClearKind::All
         ))));
+    }
+
+    #[test]
+    fn an_off_suppress_line_numbers_reads_as_off() {
+        for (raw, on) in [
+            ("<w:suppressLineNumbers/>", true),
+            ("<w:suppressLineNumbers w:val=\"1\"/>", true),
+            ("<w:suppressLineNumbers w:val='0'/>", false),
+            ("<w:suppressLineNumbers w:val = \"false\"/>", false),
+            ("<w:suppressLineNumbers w:val=\"off\"/>", false),
+        ] {
+            let mut e = three();
+            e.caret = Caret::top(1, 0);
+            if let Block::Paragraph(p) = &mut e.doc.body[1] {
+                p.props.raw_props.push(raw.into());
+            }
+            assert_eq!(e.caret_suppresses_line_numbers(), on, "{raw}");
+            // Toggling from off turns it on, replacing the explicit off.
+            e.toggle_suppress_line_numbers();
+            assert_eq!(e.caret_suppresses_line_numbers(), !on, "{raw}");
+            let Block::Paragraph(p) = &e.doc.body[1] else {
+                panic!()
+            };
+            assert!(
+                p.props.raw_props.len() <= 1,
+                "{raw}: {:?}",
+                p.props.raw_props
+            );
+        }
+    }
+
+    #[test]
+    fn break_section_is_where_a_forward_selection_starts() {
+        let mut e = three();
+        e.anchor = Some(Caret::top(0, 1));
+        e.caret = Caret::top(3, 2);
+        assert_eq!(e.caret_section(), 2);
+        assert_eq!(e.break_section(), Ok(0));
+        e.insert_section_break(SectionStart::Continuous).unwrap();
+        assert_eq!(start_of(&e.sections()[1]), SectionStart::Continuous);
     }
 
     #[test]

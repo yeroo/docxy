@@ -254,8 +254,9 @@ fn ok_writes_the_margins_the_dialog_shows_after_orientation() {
     ok(&mut t).unwrap();
     assert_eq!(section_margins(&t), want);
 
-    // Width emptied, then Landscape: the margins turn all the same, OK refuses
-    // the empty width, and with a width again writes what is shown.
+    // Width emptied, then Landscape: the margins turn all the same, and the
+    // sides swap by the section's own shape, so the empty side is now the
+    // height. OK refuses it, and with sides again writes what is shown.
     let mut t = one_section();
     lopsided(&mut t);
     open(&mut t, PageSetupTab::Paper);
@@ -264,9 +265,12 @@ fn ok_writes_the_margins_the_dialog_shows_after_orientation() {
     set(&mut t, "orientation", s("Landscape"));
     let want = shown_margins(&t);
     assert_eq!(want, [1800, 720, 1080, 1440]);
-    assert_eq!(ok(&mut t).unwrap_err(), "Width: takes a number");
+    assert_eq!(
+        (shown(&t, "width"), shown(&t, "height")),
+        ("11".into(), "".into())
+    );
+    assert_eq!(ok(&mut t).unwrap_err(), "Height: takes a number");
     t.dialogs.select_tab("Paper").unwrap();
-    set(&mut t, "width", s("11"));
     set(&mut t, "height", s("8.5"));
     ok(&mut t).unwrap();
     assert_eq!(section_margins(&t), want);
@@ -302,6 +306,83 @@ fn ok_writes_the_margins_the_dialog_shows_after_orientation() {
     t.dirty = false;
     ok(&mut t).unwrap();
     assert!(!t.dirty, "nothing changed");
+}
+
+/// Section 0 a narrow 4" page, the caret in section 1 (Letter), and a
+/// forward selection from section 0 into it: This point forward breaks where
+/// the selection starts, in section 0.
+fn narrow_first_section_and_a_forward_selection() -> DocTab {
+    let mut t = three_sections();
+    ed_mut(&mut t).edit_section_setups(&[0], |s| s.page.set_custom(5760, 15840));
+    let ed = ed_mut(&mut t);
+    ed.anchor = Some(Caret::top(0, 1));
+    ed.caret = Caret::top(1, 1);
+    assert_eq!(ed.break_section(), Ok(0));
+    t
+}
+
+/// r3 M1: This point forward checks the section the break lands in, not the
+/// caret's.
+#[test]
+fn this_point_forward_checks_the_section_the_break_lands_in() {
+    let mut t = narrow_first_section_and_a_forward_selection();
+    let before = ed(&t).doc.clone();
+    open(&mut t, PageSetupTab::Margins);
+    // 3" + 2" fits the caret's 8.5" page, not section 0's 4" one.
+    set(&mut t, "left", s("3"));
+    set(&mut t, "right", s("2"));
+    set(&mut t, "apply", s("This point forward"));
+    assert_eq!(
+        ok(&mut t).unwrap_err(),
+        "The margins leave no room for text on the page"
+    );
+    assert!(t.dialogs.is_open());
+    assert_eq!(ed(&t).doc, before, "nothing changed");
+
+    let mut t = narrow_first_section_and_a_forward_selection();
+    let before = ed(&t).doc.clone();
+    open_columns(&mut t);
+    // Two equal columns across the caret section's 6.5" of text do not fit
+    // section 0's 2" of text.
+    set(&mut t, "Presets", s("Two"));
+    set(&mut t, "apply", s("This point forward"));
+    assert_eq!(
+        ok(&mut t).unwrap_err(),
+        "The columns take 6.5\" but the text is 2\" wide"
+    );
+    assert_eq!(ed(&t).doc, before, "nothing changed");
+}
+
+/// r3 m3: Height cleared, then Landscape, then the sides typed again: OK
+/// writes the sides the dialog shows.
+#[test]
+fn a_cleared_side_turns_with_the_page_by_the_sections_shape() {
+    let mut t = one_section();
+    open(&mut t, PageSetupTab::Paper);
+    set(&mut t, "height", s(""));
+    t.dialogs.select_tab("Margins").unwrap();
+    set(&mut t, "orientation", s("Landscape"));
+    // The section is portrait-shaped, so the sides swap as set_landscape
+    // will swap them: the empty side is now the width.
+    assert_eq!(
+        (shown(&t, "width"), shown(&t, "height")),
+        ("".into(), "8.5".into())
+    );
+    t.dialogs.select_tab("Paper").unwrap();
+    set(&mut t, "width", s("11"));
+    ok(&mut t).unwrap();
+    let p = setups(&t)[0].page;
+    assert_eq!((p.w, p.h, p.landscape), (15840, 12240, true));
+    // Retyping 11 into Height instead leaves the width empty: OK refuses
+    // rather than writing sides the dialog does not show.
+    let mut t = one_section();
+    open(&mut t, PageSetupTab::Paper);
+    set(&mut t, "height", s(""));
+    t.dialogs.select_tab("Margins").unwrap();
+    set(&mut t, "orientation", s("Landscape"));
+    t.dialogs.select_tab("Paper").unwrap();
+    set(&mut t, "height", s("11"));
+    assert_eq!(ok(&mut t).unwrap_err(), "Width: takes a number");
 }
 
 #[test]
