@@ -1308,7 +1308,8 @@ impl Session {
         if let Some(t) = target {
             if let Some(m) = self.maps.get(t) {
                 if let Some(seg) = m.nearest_seg(col) {
-                    self.editor.caret = Caret::at(seg.path.clone(), seg.offset_for_col(col));
+                    self.editor
+                        .set_caret(Caret::at(seg.path.clone(), seg.offset_for_col(col)));
                 }
             }
         }
@@ -1356,7 +1357,8 @@ impl Session {
         }
         if let Some(m) = self.maps.get(line) {
             if let Some(seg) = m.nearest_seg(col) {
-                self.editor.caret = Caret::at(seg.path.clone(), seg.offset_for_col(col));
+                self.editor
+                    .set_caret(Caret::at(seg.path.clone(), seg.offset_for_col(col)));
             }
         }
     }
@@ -2097,6 +2099,26 @@ mod tests {
         let v = s.view_json(None);
         assert!(v.contains("XHi"), "expected inserted text: {v}");
         assert!(v.contains("\"dirty\":true"));
+    }
+
+    #[test]
+    fn a_click_starts_a_new_undo_step_698() {
+        let bytes = sample_docx("");
+        let mut s = Session::open(&bytes).expect("open");
+        s.dispatch("insert\thello");
+        s.view_json(None); // lays out the lines a click addresses
+        let col = (0..200)
+            .find(|col| {
+                s.dispatch(&format!("click\t0\t{col}\t0"));
+                s.editor.caret.offset == 2
+            })
+            .expect("a column that lands on offset 2");
+        s.dispatch(&format!("click\t0\t{col}\t0"));
+        s.dispatch("insert\tab");
+        assert!(s.view_json(None).contains("heabllo"));
+        s.dispatch("undo");
+        let v = s.view_json(None);
+        assert!(v.contains("hello") && !v.contains("heabllo"), "{v}");
     }
 
     #[test]
