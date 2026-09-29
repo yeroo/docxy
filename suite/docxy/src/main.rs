@@ -5921,12 +5921,20 @@ impl Docxy {
         recover::due(self.autorecover_minutes, self.last_persist.get().elapsed())
     }
 
-    /// A clean exit (window close accepted, or the harness `quit`): persist,
-    /// then remove the run marker so the next launch does not report a crash.
+    /// The harness `quit`'s clean exit: persist, then [`Self::mark_clean_exit`].
+    /// An accepted window close has already persisted before asking, so it
+    /// calls `mark_clean_exit` alone.
     fn clean_exit(&self) {
-        let root = config_root();
-        self.persist_to(&root);
-        recover::clear_running(&root);
+        self.persist();
+        self.mark_clean_exit();
+    }
+
+    /// The last step of every clean exit (an accepted window close, or the
+    /// harness `quit` through [`Self::clean_exit`]): remove the run marker so
+    /// the next launch does not report a crash. It must come after the final
+    /// persist, or a kill in between would lose edits without being reported.
+    fn mark_clean_exit(&self) {
+        recover::clear_running(&config_root());
     }
 
     fn set_autorecover_minutes(&mut self, minutes: u32, cx: &mut Context<Self>) {
@@ -24293,10 +24301,10 @@ fn main() {
                         true
                     };
                     // Only an accepted close is a clean exit; a cancelled one
-                    // keeps running, marker and all. The persist above already
-                    // wrote everything, so only the marker is left to clear.
+                    // keeps running, marker and all. The persist above is the
+                    // final one, so only the marker is left.
                     if close {
-                        recover::clear_running(&config_root());
+                        this.mark_clean_exit();
                     }
                     close
                 })
