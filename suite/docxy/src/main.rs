@@ -24285,25 +24285,42 @@ fn main() {
             // something is unsaved. Re-reading the setting on each wake is
             // what makes a change apply without a restart. Ends when the view
             // is gone.
+            //
+            // ⚠️ Only `update_in`, never `read_with` / `update`. On Windows a
+            // foreground task runs from a window message, and rfd's dialogs
+            // (Open, Save As, the ask-on-close prompt) pump those messages in
+            // a modal loop while a gpui listener holds the App borrowed. The
+            // plain entity calls `borrow()` the App and panic there, aborting
+            // the process with the unsaved work this exists to keep;
+            // `update_in` goes through `try_borrow_mut` and fails instead.
+            // That failure means "busy, try again", not "stop" — breaking on
+            // it would end AutoRecover at the first dialog — so only a view
+            // that is really gone stops the loop (`recover::reach`).
             let ticker = view.downgrade();
             window
                 .spawn(cx, async move |cx: &mut AsyncWindowContext| {
                     loop {
-                        let Ok(wait) = ticker.read_with(cx, |this, _| {
+                        let wait = ticker.update_in(cx, |this, _, _| {
                             recover::wake_after(
                                 this.autorecover_minutes,
                                 this.last_persist.get().elapsed(),
                             )
-                        }) else {
-                            break;
+                        });
+                        let wait = match recover::reach(wait.ok(), || ticker.upgrade().is_some()) {
+                            recover::Reach::Done(wait) => wait,
+                            recover::Reach::Busy => recover::POLL,
+                            recover::Reach::Gone => break,
                         };
                         cx.background_executor().timer(wait).await;
-                        let ticked = ticker.update(cx, |this, cx| {
+                        let ticked = ticker.update_in(cx, |this, _, cx| {
                             if this.autorecover_due() && this.autorecover_tick() {
                                 cx.notify();
                             }
                         });
-                        if ticked.is_err() {
+                        // Busy: the next wake retries, since nothing reset the clock.
+                        if recover::reach(ticked.ok(), || ticker.upgrade().is_some())
+                            == recover::Reach::Gone
+                        {
                             break;
                         }
                     }

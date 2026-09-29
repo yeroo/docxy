@@ -85,6 +85,28 @@ pub(crate) fn wake_after(minutes: u32, since: Duration) -> Duration {
     left.clamp(Duration::from_secs(1), POLL)
 }
 
+/// What one attempt by the timer to reach the app came to.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Reach<T> {
+    /// It ran, with this result.
+    Done(T),
+    /// The app was borrowed (a native modal dialog is pumping messages, or
+    /// the app is quitting) but the view still exists: try again later.
+    Busy,
+    /// The view is gone: stop the timer.
+    Gone,
+}
+
+/// Classify an attempt: `attempt` is its result if it ran; `alive` is asked
+/// only when it did not, and says whether the view still exists.
+pub(crate) fn reach<T>(attempt: Option<T>, alive: impl FnOnce() -> bool) -> Reach<T> {
+    match attempt {
+        Some(v) => Reach::Done(v),
+        None if alive() => Reach::Busy,
+        None => Reach::Gone,
+    }
+}
+
 /// The status of a tab restored from an AutoRecover copy after a crash.
 ///
 /// The age is relative ("12 min ago") rather than a clock time: the suite has
@@ -167,6 +189,16 @@ mod tests {
             "due now: no zero-length spin"
         );
         assert_eq!(wake_after(1, secs(600)), secs(1));
+    }
+
+    #[test]
+    fn a_busy_app_is_retried_and_only_a_gone_view_stops_the_timer() {
+        assert_eq!(
+            reach(Some(3), || panic!("not asked on success")),
+            Reach::Done(3)
+        );
+        assert_eq!(reach(None::<u8>, || true), Reach::Busy, "a modal dialog");
+        assert_eq!(reach(None::<u8>, || false), Reach::Gone);
     }
 
     #[test]
