@@ -1,7 +1,10 @@
 //! Project tab: file/session policy and the Gantt view over the shared editor.
 use super::*;
 use gpui_component::scroll::{Scrollbar, ScrollbarHandle, ScrollbarShow};
-use projcore::editor::{Editor as ProjectEditor, duration_suffix, untitled_project};
+use projcore::editor::{
+    ENTRY_FIELDS, Editor as ProjectEditor, FieldReader, format_date_field as date, task_mode_name,
+    untitled_project,
+};
 use projcore::{LinkType, Project, Task, mspdi, yppx};
 use std::cell::Cell;
 use std::path::Path;
@@ -817,30 +820,6 @@ pub(super) fn restore_project_tab(t: &PersistTab) -> DocTab {
     project_tab(t.title.clone().into(), path, surface, false, status)
 }
 
-/// A leaf's Duration in the unit it was entered in (`1w`, `1.5w`), else days.
-fn leaf_duration(project: &Project, task: &Task) -> String {
-    task.duration_unit()
-        .and_then(|unit| project.format_in_unit(task.duration_min, unit, 1))
-        .unwrap_or_else(|| days(project, task.duration_min))
-}
-
-fn days(project: &Project, min: i64) -> String {
-    let d = project.minutes_to_days(min);
-    if (d.round() - d).abs() < 1e-9 {
-        format!("{d:.0}d")
-    } else {
-        format!("{d:.1}d")
-    }
-}
-
-fn date(dt: Option<projcore::DateTime>) -> String {
-    dt.map(|d| {
-        let p = d.parts();
-        format!("{:04}-{:02}-{:02}", p.year, p.month, p.day)
-    })
-    .unwrap_or_else(|| "—".into())
-}
-
 /// The status bar's `New Tasks: …` item.
 pub(crate) fn new_tasks_label(manual: bool) -> String {
     format!("New Tasks: {}", task_mode_name(manual))
@@ -863,46 +842,11 @@ pub(crate) fn status_items(tab: &DocTab) -> Vec<(&'static str, String)> {
     items
 }
 
-/// A task's mode as Project's Task Mode column shows it.
-pub(crate) fn task_mode_name(manual: bool) -> &'static str {
-    if manual {
-        "Manually Scheduled"
-    } else {
-        "Auto Scheduled"
-    }
-}
-
+/// A row's Entry cells, read through the task field registry so a cell and
+/// `task.get`'s field of the same name cannot disagree.
 pub(crate) fn project_row(ed: &ProjectEditor, task: &Task) -> [String; COLUMN_COUNT] {
-    // A blank row (#80) is not a task: Project shows only its ID.
-    if task.is_null {
-        let mut row = <[String; COLUMN_COUNT]>::default();
-        row[COL_ID] = task.id.to_string();
-        return row;
-    }
-    let project = ed.project();
-    let predecessors = projcore::editor::format_predecessors(task, project);
-    let resources = projcore::editor::format_resource_names(project, task.uid);
-    [
-        task.id.to_string(),
-        task_mode_name(task.manual).into(),
-        task.name.clone(),
-        // Summaries first: their stored duration is stale (and may be 0, which
-        // `is_milestone` would misread), so derive it from the shown dates.
-        if task.summary {
-            ed.disp_duration_min(task.uid).map_or_else(
-                || "?".into(),
-                |min| days(project, min) + duration_suffix(project, task.uid),
-            )
-        } else if task.is_milestone() {
-            "—".into()
-        } else {
-            leaf_duration(project, task) + duration_suffix(project, task.uid)
-        },
-        date(ed.disp_start(task.uid)),
-        date(ed.disp_finish(task.uid)),
-        predecessors,
-        resources,
-    ]
+    let reader = FieldReader::new(ed);
+    ENTRY_FIELDS.map(|field| reader.read(task, field).text)
 }
 
 const ROW_H: f32 = 28.;
