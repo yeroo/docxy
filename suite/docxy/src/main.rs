@@ -1128,7 +1128,12 @@ impl SheetView {
         let buf = self.editing.as_deref().unwrap_or("");
         buf.starts_with('=')
             || (buf.starts_with(['+', '-', '@'])
-                && gridcore::edit::parse_input(buf).formula.is_some())
+                && gridcore::entry::parse_entry(
+                    buf,
+                    &gridcore::sheet::Xf::default(),
+                    &gridcore::entry::EntryCtx::default(),
+                )
+                .is_ok_and(|e| e.cell.formula.is_some()))
     }
 
     /// Type `s` at the caret, over the next character in overtype mode.

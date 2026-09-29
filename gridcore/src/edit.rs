@@ -14,20 +14,58 @@ use std::collections::BTreeMap;
 
 use crate::entry::EntryCtx;
 use crate::formula::{
-    EditShift, adjust_formula_for_edit, rename_sheet_in_formula, translate_formula,
+    EditShift, ExcelError, adjust_formula_for_edit, rename_sheet_in_formula, translate_formula,
 };
 use crate::sheet::{Cell, CellValue, MAX_COLS, MAX_ROWS, Sheet, Styles, Workbook, Xf};
 
-/// Interpret typed input as Excel would, value only: [`crate::entry::parse_entry`]
-/// for a General cell in the 1900 date system with no clock. Typed entry into
-/// a real cell goes through [`crate::entry::entry_cell`], which also honours
-/// the cell's format and sets the style the entry asks for; this is for the
-/// callers that only need the value (pasted fields, previews). Text over the
-/// cell limit stays text here.
+/// Read pasted text as a value: formulas, plain numbers (incl. percent),
+/// booleans, error constants, text. Deliberately narrower than typed entry
+/// ([`crate::entry::entry_cell`]), which also recognises currency, dates and
+/// the like and gives them a number format: without that format a pasted date
+/// would show as its bare serial, so paste keeps these shapes as text until it
+/// goes through the entry rules too.
 pub fn parse_input(text: &str) -> Cell {
-    crate::entry::parse_entry(text, &Xf::default(), &EntryCtx::default())
-        .map(|e| e.cell)
-        .unwrap_or_else(|_| Cell::text(text))
+    if let Some(body) = text.strip_prefix('=') {
+        if !body.is_empty() {
+            return Cell::formula(body);
+        }
+    }
+    if text.is_empty() {
+        return Cell::default();
+    }
+    let t = text.trim();
+    if let Ok(n) = t.parse::<f64>() {
+        if n.is_finite() {
+            return Cell::number(n);
+        }
+    }
+    if let Some(pct) = t.strip_suffix('%') {
+        if let Ok(n) = pct.trim().parse::<f64>() {
+            let v = n / 100.0;
+            if v.is_finite() {
+                return Cell::number(v);
+            }
+        }
+    }
+    if t.eq_ignore_ascii_case("TRUE") {
+        return Cell {
+            value: CellValue::Bool(true),
+            ..Cell::default()
+        };
+    }
+    if t.eq_ignore_ascii_case("FALSE") {
+        return Cell {
+            value: CellValue::Bool(false),
+            ..Cell::default()
+        };
+    }
+    if ExcelError::from_code(t).is_some() {
+        return Cell {
+            value: CellValue::Error(t.to_ascii_uppercase()),
+            ..Cell::default()
+        };
+    }
+    Cell::text(text)
 }
 
 /// The text a cell would show in the formula bar (`=formula`, or the value
@@ -2084,6 +2122,16 @@ mod tests {
         assert!(
             replace_all_in_sheet(&sheet, &mut styles, &EntryCtx::default(), "zzz", "y").is_empty()
         );
+    }
+
+    #[test]
+    fn pasted_text_keeps_shapes_that_would_need_a_format() {
+        // Paste reads values only: a date or currency without its number
+        // format would show as a bare number, so those stay text here.
+        for text in ["1/15/2024", "$5", "1,234", "-L1", "9:30 PM"] {
+            assert_eq!(parse_input(text), Cell::text(text), "{text}");
+        }
+        assert_eq!(parse_input("50%").value, CellValue::Number(0.5));
     }
 
     #[test]
