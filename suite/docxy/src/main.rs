@@ -11340,7 +11340,9 @@ fn toggle_title_pg_tab(tab: &mut DocTab) -> bool {
     };
     let last = ed.sections().len() - 1;
     let on = !docxcore::sect::has_flag(&ed.sections()[last], "w:titlePg");
-    ed.edit_sections(&[last], |raw| docxcore::sect::set_flag(raw, "w:titlePg", on));
+    ed.edit_sections(&[last], |raw| {
+        docxcore::sect::set_flag(raw, "w:titlePg", on)
+    });
     tab.dirty = true;
     on
 }

@@ -285,6 +285,14 @@ fn settings_and_the_layout_tab_are_written() {
     assert_eq!(sec.margins.gutter, 720);
     assert_eq!(sec.start, SectionStart::OddPage);
     assert_eq!(sec.margins.header, 432);
+    // An OK that changes nothing leaves the tab clean.
+    t.dirty = false;
+    open(&mut t, PageSetupTab::Margins);
+    ok(&mut t).unwrap();
+    assert!(!t.dirty, "an untouched Page Setup changed nothing");
+    open_columns(&mut t);
+    ok(&mut t).unwrap();
+    assert!(!t.dirty, "an untouched Columns changed nothing");
     // Cancel changes nothing.
     let before = ed(&t).doc.clone();
     open(&mut t, PageSetupTab::Margins);

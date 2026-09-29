@@ -309,12 +309,12 @@ fn targets(ed: &Editor, d: &Dialog) -> Option<Vec<usize>> {
 }
 
 /// Apply an accepted Page Setup to the document: one undo step on the body
-/// editor, plus the settings it changed.
+/// editor, plus the settings it changed. Whether anything changed.
 pub(crate) fn apply_page_setup(
     ed: &mut Editor,
     pkg: &mut Package,
     d: &Dialog,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let [
         top,
         bottom,
@@ -386,19 +386,22 @@ pub(crate) fn apply_page_setup(
         edit(&mut s);
         check_setup(&s, gutter_at_top)?;
     }
-    match targets {
-        Some(k) => {
-            ed.edit_section_setups(&k, edit);
+    let mut any = match targets {
+        Some(k) => ed.edit_section_setups(&k, edit),
+        None => {
+            ed.insert_section_break_with(SectionStart::NextPage, edit)?;
+            true
         }
-        None => ed.insert_section_break_with(SectionStart::NextPage, edit)?,
-    }
+    };
     if changed("gutter_pos") {
         pkg.set_gutter_at_top(gutter_at_top);
+        any = true;
     }
     if changed("multiple") {
         pkg.set_mirror_margins(chosen(d, "multiple") == Some(1));
+        any = true;
     }
-    Ok(())
+    Ok(any)
 }
 
 /// Refuse a page Word would not lay out.
@@ -635,8 +638,13 @@ pub(crate) fn columns_dialog(tab: &DocTab) -> Result<Dialog, String> {
 }
 
 /// Apply an accepted Columns dialog: one undo step on the body editor. This
-/// point forward starts the new section with a Continuous break.
-pub(crate) fn apply_columns(ed: &mut Editor, _pkg: &mut Package, d: &Dialog) -> Result<(), String> {
+/// point forward starts the new section with a Continuous break. Whether
+/// anything changed.
+pub(crate) fn apply_columns(
+    ed: &mut Editor,
+    _pkg: &mut Package,
+    d: &Dialog,
+) -> Result<bool, String> {
     let n: usize = text_of(d, "num")
         .trim()
         .parse()
@@ -702,13 +710,13 @@ pub(crate) fn apply_columns(ed: &mut Editor, _pkg: &mut Package, d: &Dialog) -> 
             s.columns.sep = sep;
         }
     };
-    match targets(ed, d) {
-        Some(k) => {
-            ed.edit_section_setups(&k, edit);
+    Ok(match targets(ed, d) {
+        Some(k) => ed.edit_section_setups(&k, edit),
+        None => {
+            ed.insert_section_break_with(SectionStart::Continuous, edit)?;
+            true
         }
-        None => ed.insert_section_break_with(SectionStart::Continuous, edit)?,
-    }
-    Ok(())
+    })
 }
 
 #[cfg(test)]

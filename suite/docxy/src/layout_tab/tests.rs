@@ -112,6 +112,30 @@ fn each_section_command_changes_only_the_caret_section() {
     }
 }
 
+/// A command that changes nothing (the current orientation, Normal margins
+/// on Normal margins, hyphenation already off) leaves a clean tab clean.
+#[test]
+fn a_command_that_changes_nothing_leaves_the_tab_clean() {
+    use LayoutAct as L;
+    for act in [
+        L::Orient(false),
+        L::Margins(MarginPreset::Normal),
+        // Not Letter here: the fixture's pgSz has no w:code, and choosing
+        // Letter writes one.
+        L::Columns(ColumnsPreset::One),
+        L::LineNumbers(LnChoice::None),
+        L::Hyphen(false),
+    ] {
+        let mut t = three_sections();
+        t.dirty = false;
+        let before = ed(&t).doc.clone();
+        apply(&mut t, act);
+        assert!(!t.dirty, "{act:?} changed nothing");
+        assert_eq!(ed(&t).doc, before, "{act:?}");
+        assert!(!ed_mut(&mut t).undo(), "{act:?} recorded no undo step");
+    }
+}
+
 #[test]
 fn a_selection_over_two_sections_changes_both() {
     let mut t = three_sections();

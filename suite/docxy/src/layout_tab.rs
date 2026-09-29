@@ -395,14 +395,15 @@ pub(crate) fn layout_checked(tab: &DocTab, act: LayoutAct) -> bool {
 
 /// Run a Layout command that edits the document (every one but the menus and
 /// dialogs) on a tab. The status line says what happened; an error says why
-/// nothing did.
+/// nothing did. The tab turns dirty only when something changed: choosing the
+/// current orientation, say, leaves a clean document clean.
 pub(crate) fn layout_apply(tab: &mut DocTab, act: LayoutAct) -> Result<(), String> {
-    let status: String = match act {
+    let (changed, status): (bool, String) = match act {
         LayoutAct::Margins(p) => {
             let (ed, pkg) = body(tab)?;
             let (top, bottom, left, right) = p.values();
             let k = ed.target_sections();
-            ed.edit_section_setups(&k, |s| {
+            let sections = ed.edit_section_setups(&k, |s| {
                 (
                     s.margins.top,
                     s.margins.bottom,
@@ -410,31 +411,33 @@ pub(crate) fn layout_apply(tab: &mut DocTab, act: LayoutAct) -> Result<(), Strin
                     s.margins.right,
                 ) = (top, bottom, left, right);
             });
-            pkg.set_mirror_margins(p == MarginPreset::Mirrored);
-            format!("Margins: {p:?}")
+            let mirror = p == MarginPreset::Mirrored;
+            let settings = pkg.has_mirror_margins() != mirror;
+            pkg.set_mirror_margins(mirror);
+            (sections || settings, format!("Margins: {p:?}"))
         }
         LayoutAct::Orient(landscape) => {
             let (ed, _) = body(tab)?;
             let k = ed.target_sections();
-            ed.edit_section_setups(&k, |s| s.set_landscape(landscape));
-            if landscape {
+            let changed = ed.edit_section_setups(&k, |s| s.set_landscape(landscape));
+            let status = if landscape {
                 "Orientation: Landscape"
             } else {
                 "Orientation: Portrait"
-            }
-            .into()
+            };
+            (changed, status.into())
         }
         LayoutAct::Paper(p) => {
             let (ed, _) = body(tab)?;
             let k = ed.target_sections();
-            ed.edit_section_setups(&k, |s| s.page.set_paper(p));
-            format!("Size: {}", p.label())
+            let changed = ed.edit_section_setups(&k, |s| s.page.set_paper(p));
+            (changed, format!("Size: {}", p.label()))
         }
         LayoutAct::Columns(c) => {
             let (ed, pkg) = body(tab)?;
             let gutter_at_top = pkg.has_gutter_at_top();
             let k = ed.target_sections();
-            ed.edit_section_setups(&k, |s| {
+            let changed = ed.edit_section_setups(&k, |s| {
                 s.columns = match c {
                     ColumnsPreset::One => s.columns.equal(1, 720),
                     ColumnsPreset::Two => s.columns.equal(2, 720),
@@ -445,12 +448,12 @@ pub(crate) fn layout_apply(tab: &mut DocTab, act: LayoutAct) -> Result<(), Strin
                     }
                 }
             });
-            format!("Columns: {c:?}")
+            (changed, format!("Columns: {c:?}"))
         }
         LayoutAct::LineNumbers(c) => {
             let (ed, _) = body(tab)?;
             let k = ed.target_sections();
-            ed.edit_section_setups(&k, |s| {
+            let changed = ed.edit_section_setups(&k, |s| {
                 let restart = match c {
                     LnChoice::None => {
                         s.line_numbers = None;
@@ -468,21 +471,23 @@ pub(crate) fn layout_apply(tab: &mut DocTab, act: LayoutAct) -> Result<(), Strin
                     restart,
                 });
             });
-            format!("Line numbers: {c:?}")
+            (changed, format!("Line numbers: {c:?}"))
         }
         LayoutAct::SuppressLineNumbers => {
             let (ed, _) = body(tab)?;
             ed.toggle_suppress_line_numbers();
-            "Suppress line numbers toggled".into()
+            (true, "Suppress line numbers toggled".into())
         }
         LayoutAct::Hyphen(on) => {
             let (_, pkg) = body(tab)?;
+            let changed = pkg.has_auto_hyphenation() != on;
             pkg.set_auto_hyphenation(on);
-            if on {
-                "Automatic hyphenation: on".into()
+            let status = if on {
+                "Automatic hyphenation: on"
             } else {
-                "Automatic hyphenation: off".into()
-            }
+                "Automatic hyphenation: off"
+            };
+            (changed, status.into())
         }
         LayoutAct::Break(BreakChoice::Section(start)) => {
             if tab.hf_edit.is_some() {
@@ -490,7 +495,7 @@ pub(crate) fn layout_apply(tab: &mut DocTab, act: LayoutAct) -> Result<(), Strin
             }
             let (ed, _) = body(tab)?;
             ed.insert_section_break(start)?;
-            format!("Section break ({})", start.val())
+            (true, format!("Section break ({})", start.val()))
         }
         LayoutAct::Break(choice) => {
             let kind = match choice {
@@ -504,14 +509,14 @@ pub(crate) fn layout_apply(tab: &mut DocTab, act: LayoutAct) -> Result<(), Strin
                 Some(hf) => hf.editor.insert_break(kind),
                 None => body(tab)?.0.insert_break(kind),
             }
-            format!("{choice:?} break")
+            (true, format!("{choice:?} break"))
         }
         LayoutAct::Menu(_)
         | LayoutAct::PageSetup(_)
         | LayoutAct::MoreColumns
         | LayoutAct::Unavailable => return Ok(()),
     };
-    tab.dirty = true;
+    tab.dirty |= changed;
     tab.status = status.into();
     Ok(())
 }

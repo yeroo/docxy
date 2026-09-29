@@ -7,7 +7,7 @@ use crate::dialog::{self, ControlKind, Dialog, DialogOwner, DialogStack, NONE_OP
 
 /// Apply an accepted dialog to what it belongs to. An error refuses the
 /// press and leaves the dialog open. `Ok(true)` when it changed a document
-/// (a Project tracks its own changes).
+/// (a Project tracks its own changes); an untouched OK changes nothing.
 fn apply_dialog(
     surface: &mut Surface,
     pkg: Option<&mut Package>,
@@ -26,10 +26,9 @@ fn apply_dialog(
                 return Err("this dialog belongs to a .docx document".into());
             };
             match dialog.owner {
-                DialogOwner::PageSetup => crate::page_setup::apply_page_setup(ed, pkg, dialog)?,
-                _ => crate::page_setup::apply_columns(ed, pkg, dialog)?,
+                DialogOwner::PageSetup => crate::page_setup::apply_page_setup(ed, pkg, dialog),
+                _ => crate::page_setup::apply_columns(ed, pkg, dialog),
             }
-            Ok(true)
         }
         #[cfg(test)]
         DialogOwner::Test => Ok(false),
