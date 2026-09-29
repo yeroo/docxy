@@ -55,7 +55,7 @@ test document state follows keys, selections, ribbon commands and backstage
   key ctrl+f1
   call ribbon-click {"tab":"Home","command":"Bold"}
 
-test typing after an empty-range selection-set leaves a collapsed caret (#698)
+test typing after an empty-range selection-set leaves a collapsed caret
   open copy:../fixtures/basic.docx
   type hello
   call selection-set {"start":2,"end":2}
