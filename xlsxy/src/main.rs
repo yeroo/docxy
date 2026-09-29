@@ -2101,7 +2101,8 @@ impl App {
 
     /// Yes to [`ConfirmAction::SaveWithoutMacros`]: once the file is written
     /// without them, the open workbook drops its macros too, so a later Save
-    /// neither asks again nor writes them back.
+    /// As neither asks again nor writes them back into an `.xlsm`. A failed
+    /// write keeps them.
     fn save_as_without_macros(&mut self, path: String) {
         if self.save_as(path) {
             self.pkg.remove_vba_project();
@@ -6549,10 +6550,30 @@ mod tests {
         assert!(!app.modified);
         assert!(!app.pkg.has_vba_project());
 
+        app.commit_save_as(dir.clone(), "again.xlsx".into());
+        assert!(app.confirm.is_none(), "a later Save As does not ask again");
+        assert!(dir.join("again.xlsx").exists());
+        app.commit_save_as(dir.clone(), "back.xlsm".into());
+        assert!(app.confirm.is_none());
+        let back = load_xlsx(&std::fs::read(dir.join("back.xlsm")).unwrap()).unwrap();
+        assert!(!back.has_vba_project(), "the dropped macros stay dropped");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Yes, but the write fails: nothing changes, the macros included.
+    #[test]
+    fn a_failed_save_without_macros_keeps_them() {
+        let dir = macro_dir("macros-fail");
+        let source = dir.join("in.xlsm");
+        let mut app = App::new(xlsm_pkg(), source.to_str().unwrap());
         app.modified = true;
-        app.save();
-        assert!(app.confirm.is_none(), "a later Save does not ask again");
-        assert!(!app.modified);
+        app.commit_save_as(dir.join("missing-parent"), "out.xlsx".into());
+        assert!(app.confirm.is_some());
+        assert!(!app.confirm_key(KeyEvent::from(KeyCode::Char('y'))));
+        assert!(app.status.as_deref().unwrap().contains("save failed"));
+        assert!(app.pkg.has_vba_project());
+        assert_eq!(Path::new(&app.path), source);
+        assert!(app.modified);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
