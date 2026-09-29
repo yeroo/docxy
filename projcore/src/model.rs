@@ -1643,6 +1643,44 @@ impl Default for Project {
     }
 }
 
+/// Outline numbers (`1`, `1.1`, `2`) in row order; blank rows get none, and
+/// level 0 (the project summary) is `0`. The number has one component per
+/// ancestor, not per level: a row more than one level deeper than the row
+/// above it is numbered one level deeper, as Project would, and a later row
+/// that returns to that slot (at the same level, or at any level between the
+/// parent's and its own) is the next sibling there, so 1, 3, 3 and 1, 3, 2
+/// both number 1, 1.1, 1.2. An MSPDI save writes them as `OutlineNumber`;
+/// the Outline Number and WBS fields read them.
+pub fn outline_numbers(tasks: &[Task]) -> Vec<Option<String>> {
+    // One (outline level, counter) per component of the current number.
+    let mut path: Vec<(u32, u32)> = Vec::new();
+    tasks
+        .iter()
+        .map(|t| {
+            if t.is_null {
+                return None;
+            }
+            let level = t.outline_level;
+            if level == 0 {
+                return Some("0".into());
+            }
+            // Leave every slot at this level or deeper; the shallowest one left
+            // is the slot this row takes, as that slot's next sibling.
+            let mut previous = 0;
+            while path.last().is_some_and(|&(l, _)| l >= level) {
+                previous = path.pop().expect("checked non-empty").1;
+            }
+            path.push((level, previous + 1));
+            Some(
+                path.iter()
+                    .map(|(_, n)| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            )
+        })
+        .collect()
+}
+
 /// Whether a row has outline children in a task list. Blank rows are outside
 /// the outline, so only the next non-blank row can make it a summary.
 pub(crate) fn is_outline_summary_in(tasks: &[Task], index: usize) -> bool {

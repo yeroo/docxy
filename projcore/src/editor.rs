@@ -19,9 +19,15 @@ pub const DURATION_HINT: &str = "try 3d, 4h, 2w, 1mo";
 mod batch;
 mod cells;
 mod effort;
+mod fields;
 pub use cells::{
     day_finish, format_duration_exact, format_predecessors, format_resource_names, parse_cell_date,
     parse_lag, parse_task_predecessors, split_resource_names,
+};
+pub use fields::{
+    BaselinePart, DurationUnit, ENTRY_FIELDS, Field, FieldRead, FieldReader, FieldValue,
+    field_names, format_date_field, format_duration_field, format_money, format_work, read_field,
+    task_mode_name,
 };
 // Re-entering a task's cell goes through `parse_task_predecessors`, which
 // keeps links shown in a fallback unit; the plain parser stays internal.
