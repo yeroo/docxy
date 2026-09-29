@@ -167,7 +167,8 @@ impl PageSize {
         (self.w, self.h) = if self.landscape { (h, w) } else { (w, h) };
         self.code = Some(paper.code());
     }
-    /// Set a custom size: the paper code no longer describes it, so it goes.
+    /// Set the sides as typed. The paper code follows them: a named size's
+    /// code when the sides match one (in either orientation), else none.
     pub fn set_custom(&mut self, w: i32, h: i32) {
         self.w = w;
         self.h = h;
@@ -439,7 +440,7 @@ impl SectionSetup {
             sect.to_string()
         };
         if self.start != old.start {
-            s = remove_element(&s, "w:type");
+            s = remove_own(&s, "w:type");
             if self.start != SectionStart::NextPage {
                 let el = format!("<w:type w:val=\"{}\"/>", self.start.val());
                 s = insert_ordered(&s, "w:type", &el);
@@ -477,7 +478,7 @@ impl SectionSetup {
             );
         }
         if self.line_numbers != old.line_numbers {
-            s = remove_element(&s, "w:lnNumType");
+            s = remove_own(&s, "w:lnNumType");
             if let Some(ln) = self.line_numbers {
                 let mut el = format!("<w:lnNumType w:countBy=\"{}\"", ln.count_by);
                 if let Some(v) = ln.start {
@@ -491,7 +492,7 @@ impl SectionSetup {
             }
         }
         if self.columns != old.columns {
-            s = remove_element(&s, "w:cols");
+            s = remove_own(&s, "w:cols");
             s = insert_ordered(&s, "w:cols", &cols_xml(&self.columns));
         }
         s
@@ -630,17 +631,59 @@ fn edit_attrs(sect: &str, name: &str, attrs: &[(&str, Option<String>)]) -> Strin
     format!("{}<{tag}{close}{}", &sect[..a], &sect[gt + 1..])
 }
 
+/// Remove an attribute from a start tag (without `<` and `>`), with the
+/// whitespace before it, whatever whitespace that is: the same boundary rule
+/// as [`attr`]. Every copy goes, so an edit never leaves a duplicate.
 fn remove_attr(tag: &str, name: &str) -> String {
-    let pat = format!(" {name}=");
-    let Some(at) = tag.find(&pat) else {
-        return tag.to_string();
-    };
-    let rest = &tag[at + pat.len()..];
-    let Some(q @ ('"' | '\'')) = rest.chars().next() else {
-        return tag.to_string();
-    };
-    let end = rest[1..].find(q).map_or(rest.len(), |e| e + 2);
-    format!("{}{}", &tag[..at], &rest[end..])
+    let mut out = tag.to_string();
+    let mut from = 0;
+    while let Some(rel) = out[from..].find(name) {
+        let at = from + rel;
+        let ws = out[..at].trim_end_matches(char::is_whitespace).len();
+        let after = &out[at + name.len()..];
+        let value = after
+            .trim_start()
+            .strip_prefix('=')
+            .map(str::trim_start)
+            .filter(|v| v.starts_with(['"', '\'']));
+        match value {
+            Some(value) if ws < at => {
+                let q = value.chars().next().unwrap_or('"');
+                let body = &value[1..];
+                let end = out.len() - body.len() + body.find(q).map_or(body.len(), |e| e + 1);
+                out = format!("{}{}", &out[..ws], &out[end..]);
+                from = ws;
+            }
+            _ => from = at + name.len(),
+        }
+    }
+    out
+}
+
+/// Remove the first `name` element among the section's own children, never
+/// one inside a tracked `w:sectPrChange`.
+pub fn remove_own(sect: &str, name: &str) -> String {
+    match find_element(own_children(sect), name) {
+        Some((a, b)) => format!("{}{}", &sect[..a], &sect[b..]),
+        None => sect.to_string(),
+    }
+}
+
+/// Whether an on/off child (`w:titlePg`) is on among the section's own
+/// children: present, and not `w:val="0"`/`"false"`/`"off"`.
+pub fn has_flag(sect: &str, name: &str) -> bool {
+    start_tag(own_children(sect), name).is_some_and(|t| attr(t, "w:val").is_none_or(|v| on(&v)))
+}
+
+/// Turn an empty on/off child (`w:titlePg`) on or off among the section's
+/// own children, placed in schema order.
+pub fn set_flag(sect: &str, name: &str, on: bool) -> String {
+    let off = remove_own(sect, name);
+    if on {
+        insert_ordered(&off, name, &format!("<{name}/>"))
+    } else {
+        off
+    }
 }
 
 /// Insert `child` (a `name` element) into `sect` at its `CT_SectPr` schema
@@ -874,16 +917,68 @@ mod tests {
     }
 
     #[test]
+    fn attributes_after_any_whitespace_are_replaced_not_repeated() {
+        let sect = "<w:sectPr><w:pgMar\n  w:top=\"1440\"\n\tw:right = '1440'\n  w:bottom=\"1440\"\n  w:left=\"1440\" w:gutter=\"0\"/></w:sectPr>";
+        let mut s = SectionSetup::parse(sect);
+        s.margins.top = 720;
+        s.margins.right = 360;
+        let out = s.apply(sect);
+        for a in ["w:top", "w:right", "w:bottom", "w:left", "w:gutter"] {
+            assert_eq!(out.matches(a).count(), 1, "{a} once: {out}");
+        }
+        assert_eq!(SectionSetup::parse(&out), s);
+        assert!(out.starts_with("<w:sectPr><w:pgMar"), "{out}");
+        assert!(
+            out.contains("w:top=\"720\"") && out.contains("w:right=\"360\""),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn a_tracked_previous_section_is_not_edited() {
-        let sect = "<w:sectPr><w:pgMar w:top=\"1440\"/><w:sectPrChange w:id=\"1\">\
-            <w:sectPr><w:pgSz w:w=\"1\" w:h=\"2\"/></w:sectPr></w:sectPrChange></w:sectPr>";
+        let sect = "<w:sectPr><w:pgMar w:top=\"1440\"/><w:sectPrChange w:id=\"1\"><w:sectPr><w:pgSz w:w=\"1\" w:h=\"2\"/><w:type w:val=\"oddPage\"/><w:lnNumType w:countBy=\"2\"/><w:cols w:num=\"3\"/><w:titlePg/></w:sectPr></w:sectPrChange></w:sectPr>";
         let s = SectionSetup::parse(sect);
-        assert_eq!(s.page, PageSize::default());
+        assert_eq!(s, SectionSetup::default());
         let mut t = s.clone();
         t.page.set_paper(Paper::A4);
         let out = t.apply(sect);
         assert!(out.contains("<w:pgSz w:w=\"1\" w:h=\"2\"/>"), "{out}");
         let (a, _) = find_element(&out, "w:pgSz").unwrap();
         assert!(a < out.find("w:sectPrChange").unwrap(), "{out}");
+        // Setting and then clearing the current ones leaves the tracked ones.
+        let mut u = t.clone();
+        u.start = SectionStart::Continuous;
+        u.line_numbers = Some(LineNumbering {
+            count_by: 1,
+            start: None,
+            distance: None,
+            restart: LnRestart::Continuous,
+        });
+        u.columns = u.columns.equal(2, 720);
+        let out = u.apply(&out);
+        let mut v = u.clone();
+        v.start = SectionStart::NextPage;
+        v.line_numbers = None;
+        v.columns = Columns::default();
+        let out = v.apply(&out);
+        let old = &out[out.find("<w:sectPrChange").unwrap()..];
+        for kept in ["oddPage", "w:countBy=\"2\"", "w:num=\"3\"", "<w:titlePg/>"] {
+            assert!(old.contains(kept), "{kept}: {out}");
+        }
+        assert_eq!(SectionSetup::parse(&out), v);
+        assert!(
+            !has_flag(&out, "w:titlePg"),
+            "the tracked one is not current"
+        );
+        let off = set_flag(&out, "w:titlePg", false);
+        assert_eq!(off, out, "the only titlePg is the tracked one");
+        let on = set_flag(&off, "w:titlePg", true);
+        assert!(on.find("<w:titlePg/>").unwrap() < on.find("<w:sectPrChange").unwrap());
+        assert!(has_flag(&on, "w:titlePg"));
+        assert!(!has_flag(
+            "<w:sectPr><w:titlePg w:val=\"0\"/></w:sectPr>",
+            "w:titlePg"
+        ));
+        assert_eq!(set_flag(&on, "w:titlePg", false), off);
     }
 }

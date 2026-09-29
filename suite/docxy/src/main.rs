@@ -11339,15 +11339,8 @@ fn toggle_title_pg_tab(tab: &mut DocTab) -> bool {
         return false;
     };
     let last = ed.sections().len() - 1;
-    let on = !ed.sections()[last].contains("<w:titlePg");
-    ed.edit_sections(&[last], |raw| {
-        let raw = docxcore::sect::remove_element(raw, "w:titlePg");
-        if on {
-            docxcore::sect::insert_ordered(&raw, "w:titlePg", "<w:titlePg/>")
-        } else {
-            raw
-        }
-    });
+    let on = !docxcore::sect::has_flag(&ed.sections()[last], "w:titlePg");
+    ed.edit_sections(&[last], |raw| docxcore::sect::set_flag(raw, "w:titlePg", on));
     tab.dirty = true;
     on
 }

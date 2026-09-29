@@ -1001,7 +1001,7 @@ impl Package {
 
     /// Whether the section has a distinct first-page header/footer (`<w:titlePg/>`).
     pub fn has_title_pg(&self) -> bool {
-        self.sect_pr().contains("<w:titlePg")
+        crate::sect::has_flag(self.sect_pr(), "w:titlePg")
     }
 
     /// Toggle a distinct first-page header/footer (`<w:titlePg/>` in the section).
@@ -1010,14 +1010,8 @@ impl Package {
         if on == self.has_title_pg() {
             return;
         }
-        if on {
-            // titlePg sits between noEndnote and textDirection in CT_SectPr.
-            let section = crate::sect::insert_ordered(self.sect_pr(), "w:titlePg", "<w:titlePg/>");
-            self.set_current_sect_pr_raw(section);
-        } else {
-            let section = remove_element(self.sect_pr(), "w:titlePg");
-            self.set_current_sect_pr_raw(section);
-        }
+        let section = crate::sect::set_flag(self.sect_pr(), "w:titlePg", on);
+        self.set_current_sect_pr_raw(section);
     }
 
     /// Whether the document uses distinct even/odd page headers/footers
