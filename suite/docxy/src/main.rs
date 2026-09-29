@@ -2968,7 +2968,7 @@ fn is_markdown_path(path: &std::path::Path) -> bool {
 fn load_bytes(bytes: &[u8]) -> Loaded {
     match docxcore::package::load_package(bytes) {
         Ok(pkg) => Loaded {
-            doc: pkg.document.clone(),
+            doc: with_final_section(pkg.document.clone(), &pkg),
             comments: docxcore::comments::parse_comments(&pkg),
             notes: docxcore::notes::parse_notes(&pkg),
             pkg: Some(pkg),
@@ -15985,12 +15985,23 @@ const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main
 const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const M_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/math";
 
+/// Give a loaded body document a final `SectionProperties` when it has none
+/// (its package's captured one, else an empty `<w:sectPr></w:sectPr>`), as
+/// terminal docxy does, so every undo snapshot carries the final section it was
+/// taken with and undoing a section command never falls back to the package's
+/// edited copy.
+fn with_final_section(mut doc: Document, pkg: &Package) -> Document {
+    if doc.trailing_section_properties().is_none() {
+        doc.set_trailing_section_properties(pkg.final_section());
+    }
+    doc
+}
+
 /// The final section's `w:sectPr` a tab's page view, header lookup and save all
 /// agree on: the body editor's trailing section properties (undo, redo and
-/// tracked-change rejection move only that copy). A body without one has never
-/// had a section command run on it (`edit_final_sect_pr` seeds the editor
-/// first), so the package's captured one is still current and is what Save
-/// appends. `None` for a package-less (Markdown) tab.
+/// tracked-change rejection move only that copy). Every body loaded with a
+/// package has one (`with_final_section`); the package's is a fallback only.
+/// `None` for a package-less (Markdown) tab.
 fn final_sect_pr(tab: &DocTab) -> Option<&str> {
     let pkg = tab.pkg.as_ref()?;
     if let Surface::Doc(ed) = &tab.surface {
@@ -16014,9 +16025,9 @@ fn final_page_geom(tab: &DocTab) -> docxcore::model::PageGeom {
 /// document with it). Always the body editor in `tab.surface`, even while a
 /// header/footer is open: that one is a separate `Editor`. `undoable` makes the
 /// mirror its own undo step; otherwise it rides on an earlier checkpoint.
-/// A body without its own trailing section is first given the package's, with
-/// no checkpoint, so undo restores it explicitly: otherwise undo would drop the
-/// section and reads and Save would fall back to the package's edited copy.
+/// A body without its own trailing section (loading seeds one, so only a tab
+/// built some other way) is first given the package's, with no checkpoint, so
+/// at least the undo of this edit restores it explicitly.
 /// `None` for a package-less tab.
 fn edit_final_sect_pr<R>(
     tab: &mut DocTab,

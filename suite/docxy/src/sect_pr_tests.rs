@@ -182,14 +182,34 @@ fn reads_follow_the_editor_after_undoing_a_header_creation() {
     assert!(saved.sect_pr().contains("headerReference"));
 }
 
-/// A clean tab on a .docx whose body has no `w:sectPr` at all.
+/// A clean tab on a .docx whose body has no `w:sectPr` at all. Loading gives
+/// the body editor an explicit (empty) final section, so every undo snapshot
+/// has one.
 fn tab_without_sect_pr() -> DocTab {
     let t = tab_from_path(
         &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures/basic.docx"),
     );
-    assert!(editor(&t).doc.trailing_section_properties().is_none());
-    assert!(!t.pkg.as_ref().unwrap().sect_pr().contains("w:cols w:num"));
+    let pkg = t.pkg.as_ref().unwrap();
+    assert!(pkg.document.trailing_section_properties().is_none());
+    assert_eq!(pkg.sect_pr(), "");
+    assert_eq!(editor_sect(&t), "<w:sectPr></w:sectPr>");
     t
+}
+
+#[test]
+fn undoing_columns_past_an_earlier_edit_is_undone_for_reads_and_save() {
+    let mut t = tab_without_sect_pr();
+    editor_mut(&mut t).insert_str("x");
+    cycle_columns_tab(&mut t);
+    assert_eq!(final_page_geom(&t).cols, 2);
+    assert!(editor_mut(&mut t).undo());
+    assert!(editor_mut(&mut t).undo());
+    let sect = final_sect_pr(&t).unwrap();
+    assert!(!sect.contains("w:num"), "{sect}");
+    let saved = save_and_reload(&mut t);
+    assert_eq!(saved.columns(), 1, "{}", saved.sect_pr());
+    cycle_columns_tab(&mut t);
+    assert_eq!(t.status.as_ref(), "Columns: 2");
 }
 
 #[test]
