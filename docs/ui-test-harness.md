@@ -99,6 +99,13 @@ environment. `--ctl DIR` names the control directory outright.
 `DOCXY_HARNESS=1` is equivalent to `--harness`, for a launcher that cannot add
 an argument.
 
+A harness instance takes nothing from the agwinterm pane it was started from
+(#697). The runner removes every `AGWINTERM*` variable from the child's
+environment, and the suite ignores them anyway in harness mode, for launchers
+that pass the whole environment through: a harness instance is always named
+`suite-<pid>`, never `suite-<pane id>`, and never runs `agwintermctl` to signal
+activity. A normal suite in a pane keeps both.
+
 ## Writing a case
 
 A script (`*.uit`) is plain text. `#` starts a comment, with two exceptions:

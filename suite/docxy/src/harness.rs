@@ -276,15 +276,30 @@ pub fn content_origin(win_origin: (f32, f32), scale: f32) -> (i32, i32) {
 pub const CAPTURE_UNAVAILABLE: &str = "this build cannot capture offscreen: rebuild the suite \
      with `--features harness-capture` (macOS only) to take pictures of a harness window";
 
-/// This instance's control name — `suite-<AGWINTERM_SESSION_ID|pid>`, the same
-/// convention the terminal editors use.
-pub fn instance_name() -> String {
-    ctlcore::instance_name(CTL_APP)
+/// This instance's control name. A normal instance is
+/// `suite-<AGWINTERM_SESSION_ID|pid>`, the convention the terminal editors use,
+/// so an agent can address the suite in its pane. A harness instance is always
+/// `suite-<pid>` (#697): it inherits the pane id of whatever terminal launched
+/// it, so every instance started from one pane would share one name, and a
+/// launcher that knows only the pid it started could never find it.
+pub fn instance_name(harness: bool) -> String {
+    let session = std::env::var("AGWINTERM_SESSION_ID").ok();
+    instance_name_for(harness, session.as_deref(), std::process::id())
 }
 
-/// Start the control server for a sandbox rooted at `root`.
-pub fn start(root: &Path) -> std::io::Result<(ctlcore::Server, Receiver<ctlcore::Request>)> {
-    ctlcore::serve(&control_dir(root), &instance_name())
+/// [`instance_name`] with the environment passed in.
+fn instance_name_for(harness: bool, session_id: Option<&str>, pid: u32) -> String {
+    let session_id = if harness { None } else { session_id };
+    ctlcore::instance_name_from(CTL_APP, session_id, pid)
+}
+
+/// Start the control server for a config root at `root`, named for the mode
+/// it serves (see [`instance_name`]).
+pub fn start(
+    root: &Path,
+    harness: bool,
+) -> std::io::Result<(ctlcore::Server, Receiver<ctlcore::Request>)> {
+    ctlcore::serve(&control_dir(root), &instance_name(harness))
 }
 
 /// Bring the harness up on `view`: drain requests on the window's foreground
@@ -2137,7 +2152,7 @@ pub fn dispatch(
             Done::ok(state(app, window))
         }
         "ping" => Done::ok(Json::obj(vec![
-            ("instance", Json::Str(instance_name())),
+            ("instance", Json::Str(instance_name(true))),
             ("pid", Json::Num(std::process::id() as f64)),
             (
                 "config_root",
@@ -2552,6 +2567,16 @@ mod tests {
                 })],
             })],
         })
+    }
+
+    /// #697: a harness instance ignores the pane it was launched from and is
+    /// named by its pid; a normal instance keeps the pane id agents address.
+    #[test]
+    fn a_harness_instance_is_named_by_pid_whatever_pane_launched_it() {
+        assert_eq!(instance_name_for(true, Some("pane-1"), 42), "suite-42");
+        assert_eq!(instance_name_for(true, None, 42), "suite-42");
+        assert_eq!(instance_name_for(false, Some("pane-1"), 42), "suite-pane-1");
+        assert_eq!(instance_name_for(false, None, 42), "suite-42");
     }
 
     /// `tab-list` over one tab of every kind: a blank plan has no path, an

@@ -897,3 +897,16 @@ fn an_agent_assignment_routes_to_its_project_tab_and_reads_back() {
     let units = read.get("fields").unwrap().get("Units").unwrap();
     assert_eq!(units.get_str("text"), Some("50%"));
 }
+
+/// #697: a harness instance never signals agwinterm activity, even for an
+/// edit that would in a normal instance.
+#[test]
+fn a_harness_instance_never_signals_activity() {
+    let edit = Effect {
+        activity: true,
+        ..Effect::default()
+    };
+    assert!(edit.signals_activity(false));
+    assert!(!edit.signals_activity(true));
+    assert!(!Effect::default().signals_activity(false));
+}

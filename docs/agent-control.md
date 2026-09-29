@@ -27,7 +27,8 @@ Discovery is `<config root>/suite/ctl/suite-<id>.json`, with `<id>` taken from
 when set and non-empty, otherwise the OS config directory (normally
 `%APPDATA%` on Windows). The override moves both control discovery and session
 state. In `--harness` mode only the isolated harness server runs; it also
-accepts the Project verbs. Normal control does not expose harness operations
+accepts the Project verbs. A harness instance ignores `AGWINTERM_SESSION_ID`
+and is always `suite-<pid>` (#697). Normal control does not expose harness operations
 such as `open`, `key`, `type`, or `quit`.
 
 Every verb except `proj.open` and `proj.new` accepts optional `tab`: an absolute zero-based
