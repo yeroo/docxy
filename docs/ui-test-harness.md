@@ -370,7 +370,13 @@ Predecessors, or Resource Names cell; on Task Mode, Duration, Start, or Finish
 it reports `<column> can't be cleared`. On the ID column Delete deletes the task
 (a summary asks first: Enter deletes it with its subtasks, Esc cancels, and
 typed text is ignored while that prompt is open; the state's `prompt` reads
-`delete:`). Alt+Shift+Right/Left indent/outdent, Alt+Right/Left pan the Gantt,
+`delete:`). Ctrl+Delete clears or resets the cell as one undo step: Name,
+Predecessors and Resource Names clear as with Delete, Duration becomes 1 day
+(`1d?` unless the plan's `NewTasksEstimated` is off; an auto summary's is
+refused), and Task Mode becomes the plan's mode for new tasks. On ID, Start and
+Finish it reports `<column> can't be cleared` and never deletes the task; on a
+blank row or the entry row it does nothing. Alt+Shift+Right/Left
+indent/outdent, Alt+Right/Left pan the Gantt,
 Alt+Home moves it back to the project start, and Ctrl+Shift+L toggles leveling.
 Ctrl+F2 opens the Predecessor prompt (Task › Schedule › Link Tasks, screentip
 Link the Selected Tasks) and Ctrl+Shift+F2 removes the selected task's links

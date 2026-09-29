@@ -712,6 +712,17 @@ fn keys_and_whole_route_enforce_modifiers() {
         ),
         Some(Level)
     );
+    assert_eq!(key_act("delete", ctrl()), Some(ResetCell));
+    for m in [
+        ctrl_shift(),
+        ctrl_alt(),
+        Modifiers {
+            platform: true,
+            ..ctrl()
+        },
+    ] {
+        assert_eq!(key_act("delete", m), None, "{m:?}");
+    }
     let mut t = tab();
     vm(&mut t).ed.rename(1, "Changed").unwrap();
     let before = v(&t).ed.project().clone();
@@ -2352,4 +2363,202 @@ fn ribbon_link_hints_name_the_chords_the_keys_run() {
         assert_eq!(c.tip.shortcut, hint);
         assert_eq!(key_act("f2", m), Some(act), "{id}");
     }
+}
+
+/// The Duration cell as the table shows it.
+fn duration_text(t: &DocTab, i: usize) -> String {
+    let ed = &v(t).ed;
+    project_row(ed, &ed.project().tasks[i])[COL_DURATION].clone()
+}
+
+#[test]
+fn ctrl_delete_on_duration_resets_it_to_a_new_tasks_day_as_one_undo_step() {
+    let mut t = tab();
+    vm(&mut t).ed.mark_saved();
+    vm(&mut t).col = COL_DURATION;
+    let before = v(&t).ed.project().clone();
+    assert_eq!(duration_text(&t, 1), "2d");
+    chord(&mut t, "delete", ctrl());
+    let after = v(&t).ed.project().clone();
+    assert_eq!(after.tasks.len(), 2);
+    assert_eq!(after.tasks[1].duration_min, 480);
+    assert_eq!(duration_text(&t, 1), "1d?");
+    assert_eq!(after.tasks[1].name, before.tasks[1].name);
+    assert_eq!(after.tasks[0], before.tasks[0]);
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    assert!(t.dirty);
+    // Already the default: no second undo step.
+    chord(&mut t, "delete", ctrl());
+    assert_eq!(v(&t).ed.project(), &after);
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    chord(&mut t, "z", ctrl());
+    assert_eq!(v(&t).ed.project(), &before);
+    assert_eq!(duration_text(&t, 1), "2d");
+}
+
+#[test]
+fn ctrl_delete_on_duration_follows_the_plans_day_and_estimate() {
+    let mut t = tab();
+    let mut p = v(&t).ed.project().clone();
+    p.hours_per_day = 7.0;
+    p.new_tasks_estimated = Some(false);
+    t.surface = Surface::Project(ProjectView::new(p, false));
+    vm(&mut t).ed.set_duration(2, "2d?").unwrap();
+    vm(&mut t).ed.select(1);
+    vm(&mut t).col = COL_DURATION;
+    assert_eq!(duration_text(&t, 1), "2d?");
+    chord(&mut t, "delete", ctrl());
+    assert_eq!(v(&t).ed.project().tasks[1].duration_min, 420);
+    assert_eq!(duration_text(&t, 1), "1d");
+}
+
+#[test]
+fn ctrl_delete_on_a_milestones_duration_makes_it_a_one_day_task() {
+    let mut t = tab();
+    vm(&mut t).ed.toggle_milestone(2).unwrap();
+    assert!(v(&t).ed.project().tasks[1].milestone);
+    vm(&mut t).col = COL_DURATION;
+    chord(&mut t, "delete", ctrl());
+    let task = &v(&t).ed.project().tasks[1];
+    assert_eq!(task.duration_min, 480);
+    assert!(!task.milestone);
+    assert_eq!(duration_text(&t, 1), "1d?");
+}
+
+#[test]
+fn ctrl_delete_on_a_summarys_duration_refuses_unless_it_is_manual() {
+    let mut t = summary_tab();
+    vm(&mut t).col = COL_DURATION;
+    let before = v(&t).ed.project().clone();
+    let depth = v(&t).ed.undo_depth();
+    chord(&mut t, "delete", ctrl());
+    assert_eq!(v(&t).ed.project(), &before);
+    assert_eq!(v(&t).ed.undo_depth(), depth);
+    assert_eq!(
+        t.status.as_ref(),
+        "Summary dates and duration are read-only"
+    );
+
+    vm(&mut t).ed.set_manual(1, true).unwrap();
+    vm(&mut t).ed.set_duration_min(1, 1440, false).unwrap();
+    let depth = v(&t).ed.undo_depth();
+    chord(&mut t, "delete", ctrl());
+    assert_eq!(v(&t).ed.disp_duration_min(1), Some(480));
+    // A summary takes no estimate.
+    assert_eq!(duration_text(&t, 0), "1d");
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+}
+
+#[test]
+fn ctrl_delete_on_name_predecessors_and_resources_clears_as_delete_does() {
+    for col in [COL_NAME, COL_PREDECESSORS, COL_RESOURCES] {
+        let setup = || {
+            let mut t = tab();
+            vm(&mut t)
+                .ed
+                .add_predecessor(2, 1, LinkType::FinishStart, 0)
+                .unwrap();
+            vm(&mut t).ed.assign_resource(2, "Alice").unwrap();
+            vm(&mut t).ed.mark_saved();
+            vm(&mut t).col = col;
+            t
+        };
+        let mut cleared = setup();
+        press(&mut cleared, "delete");
+        let mut t = setup();
+        let before = v(&t).ed.project().clone();
+        let depth = v(&t).ed.undo_depth();
+        chord(&mut t, "delete", ctrl());
+        assert_eq!(v(&t).ed.project(), v(&cleared).ed.project(), "{col}");
+        assert_ne!(v(&t).ed.project(), &before, "{col}");
+        assert_eq!(v(&t).ed.undo_depth(), depth + 1, "{col}");
+        chord(&mut t, "z", ctrl());
+        assert_eq!(v(&t).ed.project(), &before, "{col}");
+    }
+}
+
+#[test]
+fn ctrl_delete_on_task_mode_resets_it_to_the_mode_for_new_tasks() {
+    for new_manual in [false, true] {
+        let mut t = tab();
+        vm(&mut t).ed.set_new_tasks_manual(new_manual);
+        vm(&mut t).ed.set_manual(2, !new_manual).unwrap();
+        vm(&mut t).col = COL_MODE;
+        let before = v(&t).ed.project().clone();
+        let depth = v(&t).ed.undo_depth();
+        chord(&mut t, "delete", ctrl());
+        let after = v(&t).ed.project().clone();
+        assert_eq!(after.tasks[1].manual, new_manual);
+        assert_eq!(after.tasks[0], before.tasks[0]);
+        assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+        // Already the default: no second undo step.
+        chord(&mut t, "delete", ctrl());
+        assert_eq!(v(&t).ed.project(), &after);
+        assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+        chord(&mut t, "z", ctrl());
+        assert_eq!(v(&t).ed.project(), &before);
+    }
+}
+
+#[test]
+fn ctrl_delete_on_id_start_and_finish_changes_nothing_and_keeps_the_task() {
+    for col in [COL_ID, COL_START, COL_FINISH] {
+        let mut t = tab();
+        vm(&mut t).ed.mark_saved();
+        vm(&mut t).col = col;
+        let before = v(&t).ed.project().clone();
+        chord(&mut t, "delete", ctrl());
+        assert_eq!(v(&t).ed.project(), &before);
+        assert_eq!(v(&t).ed.undo_depth(), 0);
+        assert!(v(&t).prompt.is_none());
+        assert!(!t.dirty);
+        assert_eq!(
+            t.status.as_ref(),
+            format!("{} can't be cleared", COLUMNS[col])
+        );
+    }
+    let mut t = summary_tab();
+    vm(&mut t).col = COL_ID;
+    chord(&mut t, "delete", ctrl());
+    assert!(
+        v(&t).prompt.is_none(),
+        "a summary is not offered for deletion"
+    );
+    assert_eq!(v(&t).ed.project().tasks.len(), 2);
+}
+
+#[test]
+fn ctrl_delete_on_a_blank_row_or_the_entry_row_is_a_no_op() {
+    let mut t = tab();
+    vm(&mut t).ed.insert_blank_row(Some(2)).unwrap();
+    vm(&mut t).ed.mark_saved();
+    vm(&mut t).ed.select(1);
+    let before = v(&t).ed.project().clone();
+    let depth = v(&t).ed.undo_depth();
+    for col in 0..COLUMN_COUNT {
+        vm(&mut t).col = col;
+        chord(&mut t, "delete", ctrl());
+        assert_eq!(v(&t).ed.project(), &before, "{col}");
+        assert!(v(&t).ed.project().tasks[1].is_null, "{col}");
+        assert_eq!(v(&t).ed.undo_depth(), depth, "{col}");
+        assert!(!t.dirty, "{col}");
+    }
+    for col in [COL_NAME, COL_DURATION, COL_MODE, COL_ID] {
+        project_entry_click(&mut t, Some(col), false);
+        chord(&mut t, "delete", ctrl());
+        assert_eq!(v(&t).ed.project(), &before, "{col}");
+        assert_eq!(v(&t).ed.undo_depth(), depth, "{col}");
+    }
+}
+
+#[test]
+fn ctrl_delete_inside_an_open_cell_edit_stays_in_the_editor() {
+    let mut t = tab();
+    vm(&mut t).col = COL_DURATION;
+    let before = v(&t).ed.project().clone();
+    vm(&mut t).open_cell(None).unwrap();
+    chord(&mut t, "delete", ctrl());
+    assert!(v(&t).cell.is_some());
+    assert_eq!(v(&t).ed.project(), &before);
+    assert_eq!(v(&t).ed.undo_depth(), 0);
 }
