@@ -197,7 +197,7 @@ pub fn launch(exe: &Path, sandbox: &Path) -> Result<Launched, String> {
 }
 
 /// [`launch`] with the environment the child is built from spelled out, for a
-/// test that puts agwinterm variables in it and checks they never arrive.
+/// test that starts the suite as if from an agwinterm pane.
 pub fn launch_with_env(
     exe: &Path,
     sandbox: &Path,
@@ -235,9 +235,8 @@ pub fn is_terminal_integration_var(name: &std::ffi::OsStr) -> bool {
 
 /// The command [`launch`] spawns. The child's environment is built from
 /// `parent` (what [`launch`] passes is its own), not inherited, so what the
-/// child gets is exactly what this function lets through — a unit test, and a
-/// variable a test adds to `parent` really reaches the child if the filter
-/// ever stops removing it.
+/// child gets is exactly what this function lets through, and the unit test
+/// below can check it without depending on the terminal the tests ran from.
 ///
 /// Everything is passed on except the agwinterm variables (#697): a harness
 /// instance started from an agwinterm pane is not *in* that pane, and must not

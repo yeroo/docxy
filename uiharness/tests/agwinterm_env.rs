@@ -4,10 +4,15 @@
 //!
 //! ⚠️ Readiness alone is not the regression: with `AGWINTERM_PIPE` pointing at
 //! a pipe that is not there, the suite before #697 came up and answered too.
-//! What fails without the fix is the instance name (it was the pane id, not
+//! What fails without the fix is the name the instance publishes itself under
+//! (its discovery file, and `ping`'s answer: it was the pane id, not
 //! `suite-<pid>`) and the `agwintermctl` child every edit spawned. The child
 //! check is best-effort — a CLI that fails fast on a missing pipe may exit
 //! between two polls — so the name is the deterministic assertion.
+//!
+//! These check the suite's side. The launcher's stripping is covered by the
+//! unit test in `launch.rs`: a harness instance ignores the variables anyway,
+//! so a launcher that stopped stripping them would still pass here.
 #![cfg(windows)]
 
 use ctlcore::json::Json;
@@ -131,6 +136,13 @@ fn exercise(app: Launched, how: &str) {
     let pid = app.pid();
     let driver = Driver::connect(&app.ctl_dir(), None)
         .unwrap_or_else(|e| panic!("{how}: the suite never became ready: {e}"));
+    // The name it published (what a launcher finds it by), and the one it
+    // answers with: `ping` recomputes it rather than reading it back.
+    assert_eq!(
+        driver.instance().instance,
+        format!("suite-{pid}"),
+        "{how}: published under the wrong name"
+    );
     let ping = call(&driver, "ping", vec![]);
     assert_eq!(
         ping.get_str("instance"),
@@ -160,8 +172,8 @@ fn exercise(app: Launched, how: &str) {
 }
 
 /// Through the launcher, from this process's environment plus the fakes — as
-/// in a pane. The child's environment is built from exactly that, so a fake
-/// the launcher failed to strip would reach the suite and fail the name check.
+/// in a pane: the launcher path end to end. Whether it strips them is the
+/// `launch.rs` unit test's to show; here the suite's own guard is the backstop.
 #[test]
 #[ignore = "requires a built suite and an interactive desktop"]
 fn a_launched_instance_ignores_the_pane_it_was_started_from() {
