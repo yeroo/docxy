@@ -2554,6 +2554,8 @@ mod tests {
                 task(4, "Hours", 1, 240, Some(5)),
                 task(5, "Days", 1, 240, None),
                 task(6, "Mile", 1, 0, Some(9)),
+                // 60 min of slack is 0.025w: days, not a false `0.0w`.
+                task(7, "Tiny", 1, 3540, Some(9)),
             ],
             ..Project::default()
         };
@@ -2581,6 +2583,7 @@ mod tests {
         assert_eq!(row(3), ["4h", "56h"]);
         assert_eq!(row(4), ["0.5d", "7d"]);
         assert_eq!(row(5), ["—", "1.5w"]);
+        assert_eq!(row(6), ["1.5w", "0.1d"]);
     }
 
     #[test]

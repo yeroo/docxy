@@ -540,6 +540,72 @@ fn only_a_typed_duration_changes_the_unit() {
 }
 
 #[test]
+fn a_retyped_estimate_keeps_the_estimated_format_only_with_a_question_mark() {
+    let with_format = |format: u8| {
+        let mut ed = editor();
+        let mut p = ed.project().clone();
+        p.tasks[0].duration_format = Some(format);
+        p.tasks[0].estimated = Some(true);
+        ed = Editor::new(p);
+        ed
+    };
+    let format = |ed: &Editor| ed.project().task(10).unwrap().duration_format;
+    for (stored, text, expected) in [
+        (41, "3w?", Some(41)),
+        (41, "3w", Some(9)),
+        (41, "3d?", None),
+        (9, "3w?", Some(9)),
+        (39, "1d?", Some(39)),
+        (39, "1d", None),
+    ] {
+        let mut ed = with_format(stored);
+        ed.set_duration(10, text).unwrap();
+        assert_eq!(format(&ed), expected, "{stored} {text}");
+    }
+    // Ctrl+Delete's reset (a day, estimated as new tasks are) follows it too.
+    let mut ed = with_format(39);
+    ed.set_duration_typed(10, 480, true, LagUnit::Day).unwrap();
+    assert_eq!(format(&ed), Some(39));
+    ed.set_duration_typed(10, 480, false, LagUnit::Day).unwrap();
+    assert_eq!(format(&ed), None);
+}
+
+#[test]
+fn summaries_external_leaves_and_unspellable_formats_keep_their_format() {
+    let mut ed = editor();
+    ed.indent(20, 1).unwrap();
+    ed.set_manual(10, true).unwrap();
+    let mut p = ed.project().clone();
+    p.tasks[0].duration_format = Some(9);
+    p.tasks[2].duration_format = Some(8);
+    let mut ed = Editor::new(p);
+    let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
+    let before = ed.project().clone();
+    // A manual summary's shown span, retyped in days, is no edit.
+    let span = ed.disp_duration_min(10).unwrap();
+    ed.set_duration_typed(10, span, false, LagUnit::Day)
+        .unwrap();
+    // An elapsed-days leaf re-entered as its cell spells it.
+    ed.set_duration_typed(30, 480, false, LagUnit::Day).unwrap();
+    unchanged(&ed, &before, history);
+    // A new duration on it is typed in days, which it now is.
+    ed.set_duration(30, "2d").unwrap();
+    assert_eq!(ed.project().task(30).unwrap().duration_format, None);
+    // A manual summary's new span keeps its format.
+    ed.set_duration(10, "3w").unwrap();
+    assert_eq!(ed.project().task(10).unwrap().duration_format, Some(9));
+    // An external leaf re-entered in another unit is still no edit.
+    let mut p = editor().project().clone();
+    p.tasks[0].external_task = Some(true);
+    p.tasks[0].duration_format = Some(8);
+    let mut ed = Editor::new(p);
+    let before = ed.project().clone();
+    let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
+    ed.set_duration(10, "8h").unwrap();
+    unchanged(&ed, &before, history);
+}
+
+#[test]
 fn exact_duration_text_prefers_the_task_s_unit() {
     let p = untitled_project();
     for (min, unit, expected) in [
@@ -552,12 +618,13 @@ fn exact_duration_text_prefers_the_task_s_unit() {
         (90, Some(LagUnit::Minute), "90m"),
         (4800, Some(LagUnit::Month), "0.5mo"),
         (-1200, Some(LagUnit::Week), "-0.5w"),
-        // Not exact in the unit (two decimals): whole days or hours, else
-        // minutes.
-        (2401, Some(LagUnit::Week), "2401m"),
-        (800, Some(LagUnit::Week), "800m"),
+        // The fewest decimals that read back exactly.
+        (2401, Some(LagUnit::Week), "1.0004w"),
+        (800, Some(LagUnit::Week), "0.3333w"),
         (2880, Some(LagUnit::Week), "1.2w"),
-        (60, Some(LagUnit::Week), "1h"),
+        (60, Some(LagUnit::Week), "0.025w"),
+        (100, Some(LagUnit::Day), "0.208d"),
+        (1, Some(LagUnit::Month), "0.0001mo"),
         // No unit: the old choice.
         (240, None, "4h"),
         (2400, None, "5d"),

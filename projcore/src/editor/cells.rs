@@ -628,16 +628,19 @@ fn cell_text(r: &Resource, a: &Assignment) -> String {
 }
 
 /// A duration as a cell edit reopens it, reading back to exactly `min`: in
-/// the task's own `unit` when that is exact (at most two decimals, `0.5d`,
-/// `1.5w`), else whole days, whole hours, or minutes. `None` (a summary, or a
-/// task with no working unit) goes straight to that fallback.
+/// the task's own `unit` with the fewest decimals (up to eight) that are exact
+/// (`0.5d`, `1.5w`, `0.333333w`), else whole days, whole hours, or minutes.
+/// `None` (a summary, or a task with no working unit) goes straight to that
+/// fallback.
 pub fn format_duration_exact(min: i64, proj: &Project, unit: Option<LagUnit>) -> String {
-    if let Some(unit) = unit {
-        if let Some(per) = proj.working_unit_min(unit) {
-            let shown = format!("{:.2}", min as f64 / per)
-                .trim_end_matches('0')
-                .trim_end_matches('.')
-                .to_string();
+    if let Some((unit, per)) = unit.and_then(|u| Some((u, proj.working_unit_min(u)?))) {
+        for decimals in 0..=8 {
+            let shown = format!("{:.decimals$}", min as f64 / per);
+            let shown = if shown.contains('.') {
+                shown.trim_end_matches('0').trim_end_matches('.')
+            } else {
+                &shown
+            };
             let text = format!("{shown}{}", unit.suffix());
             if parse_duration(&text, proj) == Some(min) {
                 return text;

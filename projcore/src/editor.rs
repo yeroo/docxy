@@ -63,10 +63,12 @@ pub struct TaskPatch {
     /// flag stays unset), even when the minutes are unchanged. `None` keeps
     /// the old rule: a changed duration commits an estimate.
     pub estimated: Option<bool>,
-    /// The `DurationFormat` a typed duration's unit gives (see
-    /// [`parse_task_duration_unit`]); only with `duration_min`. A task whose
-    /// stored format has the same unit keeps it, estimated bit included.
-    /// `None` keeps the stored format.
+    /// The plain `DurationFormat` a typed duration's unit gives (see
+    /// [`parse_task_duration_unit`]); only with `duration_min`. It becomes
+    /// the task's format, except that a stored estimated variant of the same
+    /// unit stays when `estimated` is `Some(true)`. Summaries, external
+    /// leaves, and re-entering the same minutes on a task whose format has no
+    /// working unit keep their format. `None` keeps the stored format.
     pub duration_format: Option<u8>,
 }
 
@@ -682,8 +684,10 @@ impl Editor {
         )
     }
 
-    /// Set a duration as typed, estimated (`1d?`) or not. As in Project,
-    /// typing it without `?` commits an estimated duration, even the same one.
+    /// Set a duration's minutes, estimated (`1d?`) or not; the task keeps its
+    /// `DurationFormat`. As in Project, setting it without `?` commits an
+    /// estimated duration, even the same one. A duration typed with a unit
+    /// goes through [`Self::set_duration`] or [`Self::set_duration_typed`].
     pub fn set_duration_min(&mut self, uid: i32, min: i64, estimated: bool) -> Result<(), String> {
         self.update_task(
             uid,
@@ -782,13 +786,18 @@ impl Editor {
             && patch
                 .estimated
                 .is_some_and(|e| estimate_after(t.estimated, e) != t.estimated);
+        // A summary's duration shows in days, and an external leaf's dates
+        // are not ours: neither takes a typed unit. Nor does re-entering the
+        // same minutes on a task whose format has no working unit (elapsed,
+        // null), which its cells cannot spell.
+        let unspellable = t.duration_format.is_some() && t.duration_unit().is_none();
         let format = patch
             .duration_format
-            .map(|code| format_after(t.duration_format, code));
+            .filter(|_| !t.summary && !t.is_external_leaf())
+            .filter(|_| !(unspellable && patch.duration_min == Some(current)))
+            .map(|code| format_after(t.duration_format, code, patch.estimated == Some(true)));
         let format_changed = format.is_some_and(|f| f != t.duration_format);
-        if t.is_external_leaf()
-            && (duration_changed || mode_changed || estimate_changed || format_changed)
-        {
+        if t.is_external_leaf() && (duration_changed || mode_changed || estimate_changed) {
             return Err(EXTERNAL_TASK_DATES.into());
         }
         if t.is_external_leaf() {
@@ -829,19 +838,16 @@ impl Editor {
                 t.manual_finish = finish.filter(|_| manual);
                 t.manual_duration_min = manual.then(|| duration.unwrap_or(t.duration_min));
             }
+            if let Some(format) = format {
+                t.duration_format = format;
+            }
             if let Some(min) = patch.duration_min.filter(|_| t.summary && t.manual) {
                 // A manual summary's own span: its start stays and its
                 // finish follows. Its stored duration, milestone flag and
                 // work belong to the rollup and are left alone.
                 t.manual_duration_min = Some(min);
                 t.manual_finish = None;
-                if let Some(format) = format {
-                    t.duration_format = format;
-                }
             } else if let Some(min) = patch.duration_min {
-                if let Some(format) = format {
-                    t.duration_format = format;
-                }
                 // Against the row as materialized: a blank row's default
                 // `1 day?` (and a manual plan's ManualDuration) is replaced.
                 let changed = was_blank || min != t.duration_min;
@@ -1724,13 +1730,15 @@ pub fn duration_format_code(unit: LagUnit) -> Option<u8> {
     LagFormat::new(unit, false, false).and_then(|f| u8::try_from(f.code()).ok())
 }
 
-/// A task's `DurationFormat` after typing a duration with format `code`: the
-/// stored one when it has the same unit (so its estimated bit stays), else
-/// `code`, with days as no format (see [`Task::duration_format`]).
-fn format_after(stored: Option<u8>, code: u8) -> Option<u8> {
-    match stored {
-        Some(s) if s & !32 == code => Some(s),
-        _ => Some(code).filter(|&c| c != 7),
+/// A task's `DurationFormat` after typing a duration with plain format
+/// `code`: the stored estimated variant of that unit when the duration was
+/// typed with `?` too, else `code` itself, with days as no format (see
+/// [`Task::duration_format`]).
+fn format_after(stored: Option<u8>, code: u8, estimated: bool) -> Option<u8> {
+    if estimated && stored == Some(code | 32) {
+        stored
+    } else {
+        Some(code).filter(|&c| c != 7)
     }
 }
 

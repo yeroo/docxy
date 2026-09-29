@@ -373,8 +373,9 @@ pub struct Task {
     /// its Duration and slack show in (see [`Task::duration_unit`]). `None`
     /// is days (7), the default: a save writes 7 and a read of a plain 7
     /// stores `None`. Any other code is kept as read, estimated bit (32)
-    /// included; typing a duration sets the plain unit code and leaves the
-    /// estimate to `estimated`.
+    /// included. Typing a duration sets its unit's plain code (see
+    /// `TaskPatch::duration_format`); only a stored estimated code of the
+    /// same unit, retyped with `?`, keeps its bit.
     pub duration_format: Option<u8>,
     /// Levelling priority, 0..=1000.
     pub priority: Option<i32>,
@@ -1812,15 +1813,16 @@ impl Project {
 
     /// Working minutes in `unit`, a whole value bare (`1w`) and a fraction
     /// with `decimals` places (`0.50w`). `None` when the unit has no working
-    /// length.
+    /// length, or when a non-zero time would print as zero (`0.0w`).
     pub fn format_in_unit(&self, min: i64, unit: LagUnit, decimals: usize) -> Option<String> {
         let value = min as f64 / self.working_unit_min(unit)?;
         let suffix = unit.suffix();
-        Some(if (value.round() - value).abs() < 1e-9 {
-            format!("{}{suffix}", value.round() as i64)
-        } else {
-            format!("{value:.decimals$}{suffix}")
-        })
+        if (value.round() - value).abs() < 1e-9 {
+            return Some(format!("{}{suffix}", value.round() as i64));
+        }
+        let shown = format!("{value:.decimals$}");
+        let zero = shown.parse::<f64>().is_ok_and(|v| v == 0.0);
+        (!zero).then(|| format!("{shown}{suffix}"))
     }
 
     pub fn task(&self, uid: i32) -> Option<&Task> {
@@ -1882,6 +1884,23 @@ impl Project {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_in_unit_never_prints_a_non_zero_time_as_zero() {
+        let p = Project::default();
+        assert_eq!(p.format_in_unit(60, LagUnit::Week, 1), None);
+        assert_eq!(p.format_in_unit(-60, LagUnit::Week, 1), None);
+        assert_eq!(p.format_in_unit(5, LagUnit::Week, 2), None);
+        assert_eq!(p.format_in_unit(0, LagUnit::Week, 1).as_deref(), Some("0w"));
+        assert_eq!(
+            p.format_in_unit(120, LagUnit::Week, 1).as_deref(),
+            Some("0.1w")
+        );
+        assert_eq!(
+            p.format_in_unit(-1200, LagUnit::Week, 2).as_deref(),
+            Some("-0.50w")
+        );
+    }
 
     #[test]
     fn days_per_month_uses_positive_finite_option_or_project_default() {
