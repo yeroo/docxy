@@ -1797,26 +1797,36 @@ pub fn dispatch(
         // A click on a cell: press, click, release — the three events the
         // pointer delivers, in that order.
         "click-cell" => {
-            let cell = cell_arg(args, "cell")?;
             let (shift, dbl) = (arg_flag(args, "shift")?, arg_flag(args, "double")?);
             if app.active_is_project() {
                 let tab = &mut app.tabs[app.active];
                 let crate::Surface::Project(v) = &tab.surface else {
                     return Err("Project is not loaded".into());
                 };
-                // The row just below the last task is the entry row.
-                let count = v.ed.project().tasks.len();
-                if cell.0 as usize > count || cell.1 as usize >= crate::COLUMN_COUNT {
+                // Rows are drawn rows; the one just below the last is the entry row.
+                let target = crate::project_cell_target(args, &v.ed)?;
+                if target.col >= crate::COLUMN_COUNT {
                     return Err("Project cell is outside the entry table".into());
                 }
-                if (cell.0 as usize) < count {
-                    crate::project_cell_click(tab, cell.0 as usize, Some(cell.1 as usize), dbl);
-                } else {
-                    crate::project_entry_click(tab, Some(cell.1 as usize), dbl);
+                if target.row.is_none() {
+                    return Err(
+                        "that task is hidden under a collapsed summary; expand it to click it"
+                            .into(),
+                    );
+                }
+                match target.at {
+                    Some(crate::ShownRow::Task(i)) => {
+                        crate::project_cell_click(tab, i, Some(target.col), dbl)
+                    }
+                    Some(crate::ShownRow::Entry) => {
+                        crate::project_entry_click(tab, Some(target.col), dbl)
+                    }
+                    None => return Err("Project cell is outside the entry table".into()),
                 }
                 app.refocus(window, cx);
                 return Done::ok(state(app, window));
             }
+            let cell = cell_arg(args, "cell")?;
             sheet(app)?;
             app.grid_press_cell(cell, cx);
             app.cell_click(cell.0, cell.1, shift, dbl, window, cx);
@@ -1914,26 +1924,41 @@ pub fn dispatch(
         // Read one cell: what it shows, and what re-editing it would put in the
         // editor (the formula, or the unformatted literal).
         "cell" => {
-            let (r, c) = cell_arg(args, "cell")?;
             if let Some(crate::Surface::Project(v)) = app.tabs.get(app.active).map(|t| &t.surface) {
-                let task =
-                    v.ed.project()
-                        .tasks
-                        .get(r as usize)
-                        .ok_or("No task at this row")?;
-                let values = crate::project_row(&v.ed, task);
-                let text = values
-                    .get(c as usize)
-                    .ok_or("No Project column at this index")?;
-                return Done::ok(Json::obj(vec![
-                    ("cell", Json::Str(a1((r, c)))),
-                    ("row", Json::Num(r as f64)),
+                // Rows are drawn rows; `{uid, column}` reaches a hidden task too.
+                let target = crate::project_cell_target(args, &v.ed)?;
+                let c = target.col;
+                if c >= crate::COLUMN_COUNT {
+                    return Err("No Project column at this index".into());
+                }
+                let task = match target.at.ok_or("No task at this row")? {
+                    crate::ShownRow::Task(i) => Some(&v.ed.project().tasks[i]),
+                    crate::ShownRow::Entry => None,
+                };
+                let text = task
+                    .map(|t| crate::project_row(&v.ed, t)[c].clone())
+                    .unwrap_or_default();
+                // A task a collapsed summary hides has no drawn row to name.
+                let row = target.row;
+                let mut out = vec![
+                    (
+                        "cell",
+                        row.map_or(Json::Null, |r| Json::Str(a1((r as u32, c as u32)))),
+                    ),
+                    ("row", row.map_or(Json::Null, |r| Json::Num(r as f64))),
                     ("col", Json::Num(c as f64)),
                     ("text", Json::Str(text.clone())),
                     ("value", Json::Str(text.clone())),
                     ("empty", Json::Bool(text.is_empty())),
-                ]));
+                    ("entry", Json::Bool(task.is_none())),
+                ];
+                if let Some(t) = task {
+                    out.push(("id", Json::Num(f64::from(t.id))));
+                    out.push(("uid", Json::Num(f64::from(t.uid))));
+                }
+                return Done::ok(Json::obj(out));
             }
+            let (r, c) = cell_arg(args, "cell")?;
             let v = sheet(app)?;
             let raw = v.edit_string(r, c);
             Done::ok(Json::obj(vec![
@@ -2005,6 +2030,16 @@ pub fn dispatch(
         // State assertions include tab metadata for every surface; spreadsheet
         // selection fields are added by state() only when a sheet is active.
         "selection" => Done::ok(state(app, window)),
+
+        // The rows a Project's entry table draws, top to bottom, without the
+        // entry row. Reads only: a `tab` other than the active one stays behind.
+        "rows" => {
+            let i = crate::control::resolve_project_tab(&app.tabs, app.active, args.get("tab"))?;
+            let crate::Surface::Project(v) = &app.tabs[i].surface else {
+                return Err("Project is not loaded".into());
+            };
+            Done::ok(crate::rows_json(&v.ed))
+        }
 
         // Persist and go. The reply is written first (see the pump).
         "quit" => {

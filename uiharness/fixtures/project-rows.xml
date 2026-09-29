@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Project xmlns="http://schemas.microsoft.com/project">
+<Name>Project rows</Name><StartDate>2026-01-05T08:00:00</StartDate>
+<MinutesPerDay>480</MinutesPerDay><MinutesPerWeek>2400</MinutesPerWeek>
+<Tasks>
+<Task><UID>1</UID><ID>1</ID><Name>Outer</Name><OutlineLevel>1</OutlineLevel><Duration>PT16H0M0S</Duration></Task>
+<Task><UID>2</UID><ID>2</ID><Name>Inner</Name><OutlineLevel>2</OutlineLevel><Duration>PT8H0M0S</Duration></Task>
+<Task><UID>3</UID><ID>3</ID><Name>Deep</Name><OutlineLevel>3</OutlineLevel><Duration>PT8H0M0S</Duration></Task>
+<Task><UID>4</UID><ID>4</ID><Name>Sibling</Name><OutlineLevel>2</OutlineLevel><Duration>PT16H0M0S</Duration></Task>
+<Task><UID>5</UID><ID>5</ID><IsNull>1</IsNull></Task>
+<Task><UID>6</UID><ID>6</ID><Name>After</Name><OutlineLevel>1</OutlineLevel><Duration>PT8H0M0S</Duration></Task>
+</Tasks>
+</Project>
