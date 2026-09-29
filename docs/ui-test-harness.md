@@ -345,8 +345,9 @@ footer editor; `selection-set` refuses while it is open.
 | `window-zoom {}` | call GPUI's zoom action; on Windows it maximizes, while the native caption Max button uses the OS control area. Use a fresh harness window for restored geometry on Windows |
 
 `ribbon-read` and `ribbon-click` work on document, Project and sheet tabs. Each
-command's `enabled` is the predicate its button draws with (every ribbon
-command is enabled today), and a command inside a split button's menu carries
+command's `enabled` is the predicate its button draws with (every document and
+Project ribbon command is enabled today; sheet placeholders, drawn but doing
+nothing yet, report `enabled: false`, see below), and a command inside a split button's menu carries
 `menu`, the split's id (Set Baseline's `Set Baseline...` and `Clear
 Baseline...` read `menu: "pr-baseline"`). Each command carries a `label` and a
 screentip `tip.title`; on the Project ribbon they are Microsoft Project 2024's,
@@ -554,9 +555,9 @@ and the tab unchanged:
 - a write that fails: the reply is the tab's status (`save failed: …`), and
   the tab stays bound where it was.
 
-`key ctrl+s` on a never-saved tab still refuses in a harness instance, now
-ending with `use the harness save-as verb`; the Backstage's Save As… item is
-a pointer-only control no verb reaches. `save-as.uit` covers each kind and
+`key ctrl+s` on a never-saved tab and the Backstage's Save As… (a
+pointer-only control no verb reaches) still refuse in a harness instance, now
+ending with `use the harness save-as verb`. `save-as.uit` covers each kind and
 refusal.
 
 **`clipboard`.** A harness instance never touches the OS clipboard: the app's
@@ -566,9 +567,11 @@ overwrites what the person at the machine copied. `read` replies `{text, app}`:
 `text` is that clipboard's text (`null` when empty) and `app` is what the
 active tab's paste would take besides it: `{kind: "doc", text}` (a document's
 in-app clip), `{kind: "grid", text, rows, cols}` (the sheet's copied cells,
-kept while the clipboard still holds the text that copy wrote), or
-`{kind: "none"}`, when a sheet or Project paste takes `text`. `write` needs
-`text` and replies the same. Copy, cut and paste are the app's own keys and
+kept while the clipboard still holds the text that copy wrote, or holds no item
+at all), or `{kind: "none"}`, when a sheet or Project paste takes `text`. A
+copy with no text in it (an image, an empty copy) is newer than the grid clip
+too: `text` is `null`, `app` is `none`, and a sheet paste does nothing.
+`write` needs `text` (an empty one is such a copy) and replies the same. Copy, cut and paste are the app's own keys and
 buttons (`key ctrl+c`, `ribbon-click {"tab":"Home","command":"Copy"}`), not
 actions of this verb, which refuses them and `paste-special` (`paste special is
 not implemented in this app`). A document never reads the clipboard's text,
@@ -587,8 +590,14 @@ the source. Refused:
 
 - while the handle is not drawn: `the fill handle is not shown: a cell is being
   edited`, `… a reference is being pointed at`, `… a chart is selected`
-  (`fill_handle_hidden`, the grid's own condition). A handle hidden under a
-  chart card is decided by layout and is not modelled;
+  (`fill_handle_hidden`, the grid's own condition), or `… File (backstage) is
+  open`; or while `the fill handle is covered: the more-tabs list is open`. An
+  edit, a pointing reference and a cover are refused before `from` is clicked,
+  so a refused verb changes nothing (a click would land in the edit or the
+  reference); a selected chart is refused only if the handle is still hidden
+  after `from`'s click, which takes the selection back as the pointer's would.
+  A handle hidden under a chart card is decided by layout and is not
+  modelled;
 - when the press does not arm a fill: `the fill did not arm: the sheet is
   protected` (a protected sheet refuses a fill from the pointer too), or
   `… another gesture is in flight`;

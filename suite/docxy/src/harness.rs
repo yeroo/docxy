@@ -444,6 +444,12 @@ fn save_as_target(
     if raw.is_empty() {
         return Err("save-as needs a non-empty 'path'".into());
     }
+    // Formats are named like extensions, in any case.
+    let format = format.map(|f| f.trim().to_ascii_lowercase());
+    if format.as_deref() == Some("") {
+        return Err("'format' must not be empty; leave it out to go by the extension".into());
+    }
+    let format = format.as_deref();
     let given = PathBuf::from(raw);
     let mut path = if given.is_absolute() {
         given
@@ -461,11 +467,12 @@ fn save_as_target(
     };
     if let Some(f) = format {
         if !kind_formats.contains(&f) {
-            // The refusal the kind's own rule gives that extension.
-            let probe = Path::new("x").with_extension(f);
+            // The kind's own refusal, in its own rule's words: the rule is
+            // asked about an extension no kind saves, so it always refuses.
+            let foreign = Path::new("x.not-a-format");
             return Err(match kind {
-                Kind::Xlsx => crate::sheet_save_target(&probe).err(),
-                Kind::Project => projcore::yppx::save_target(&probe).err(),
+                Kind::Xlsx => crate::sheet_save_target(foreign).err(),
+                Kind::Project => projcore::yppx::save_target(foreign).err(),
                 _ => None,
             }
             .unwrap_or_else(|| DOC_SAVE_FORMATS.into()));
@@ -1848,7 +1855,6 @@ fn resolve_commands(
     }
 }
 
-/// The active spreadsheet, or the refusal every cell verb needs.
 /// What the active tab's paste would take besides the clipboard's text: the
 /// document's in-app clip, or the grid clip while the clipboard still holds
 /// what it put there (`grid_paste_uses_clip`); otherwise `none`, and a paste
@@ -1857,7 +1863,7 @@ fn clipboard_app_json(
     surface: Option<&crate::Surface>,
     doc: Option<&docxcore::editor::Clip>,
     grid: Option<&crate::GridClip>,
-    now: Option<&str>,
+    now: &crate::ClipRead,
 ) -> Json {
     match surface {
         Some(crate::Surface::Doc(_)) => {
@@ -1891,15 +1897,14 @@ fn clipboard_app_json(
 fn clipboard_json(app: &crate::Docxy, cx: &App) -> Json {
     let now = app.clipboard_read(cx);
     let surface = app.tabs.get(app.active).map(|t| &t.surface);
-    let used = clipboard_app_json(
-        surface,
-        app.clip.as_ref(),
-        app.grid_clip.as_ref(),
-        now.as_deref(),
-    );
-    Json::obj(vec![("text", str_or_null(now)), ("app", used)])
+    let used = clipboard_app_json(surface, app.clip.as_ref(), app.grid_clip.as_ref(), &now);
+    Json::obj(vec![
+        ("text", str_or_null(now.text().map(str::to_string))),
+        ("app", used),
+    ])
 }
 
+/// The active spreadsheet, or the refusal every cell verb needs.
 fn sheet(app: &crate::Docxy) -> Result<&SheetView, String> {
     app.active_sheet()
         .ok_or_else(|| "the active tab is not a spreadsheet".to_string())
@@ -2594,15 +2599,26 @@ pub fn dispatch(
                 None => None,
             };
             sheet(app)?;
+            // Refuse before `from` moves anything: a click would land in an
+            // open edit or a pointing reference rather than select cells.
+            fill_press_refusal(
+                app.backstage,
+                app.tab_more_open,
+                app.fill_handle_hidden_reason(),
+                from.is_some(),
+            )?;
             if let Some((start, end)) = from {
                 click_cell(app, start, false, false, window, cx);
                 if end != start {
                     click_cell(app, end, true, false, window, cx);
                 }
             }
-            if let Some(why) = app.fill_handle_hidden_reason() {
-                return Err(format!("the fill handle is not shown: {why}"));
-            }
+            fill_press_refusal(
+                app.backstage,
+                app.tab_more_open,
+                app.fill_handle_hidden_reason(),
+                false,
+            )?;
             let src = sheet(app)?.range();
             app.sheet_fill_start(cx);
             if app.sheet_fill.is_none() {
@@ -2920,6 +2936,32 @@ fn is_action_key(stroke: &Keystroke) -> bool {
             .any(|(key, shift)| *key == stroke.key && *shift == m.shift)
 }
 
+/// Why `fill-drag` cannot press the fill handle, or `Ok` when it can. The
+/// handle is not there to press while File (backstage) covers the sheet or the
+/// more-tabs list covers the window, or while the grid does not draw it
+/// (`hidden`). With `selecting_from`, the verb is about to click `from`, so a
+/// reason such a click clears (a selected chart) is left to the check after
+/// it; the others refuse first, so a refused verb has changed nothing.
+fn fill_press_refusal(
+    backstage: bool,
+    tab_more_open: bool,
+    hidden: Option<crate::HandleHidden>,
+    selecting_from: bool,
+) -> Result<(), String> {
+    if backstage {
+        return Err("the fill handle is not shown: File (backstage) is open".into());
+    }
+    if tab_more_open {
+        return Err("the fill handle is covered: the more-tabs list is open".into());
+    }
+    match hidden {
+        Some(h) if !(selecting_from && h.cleared_by_a_click()) => {
+            Err(format!("the fill handle is not shown: {}", h.why()))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// A click on a sheet cell, as the pointer makes it: press, the cell's click
 /// handler, release.
 fn click_cell(
@@ -3021,6 +3063,7 @@ mod tests {
     /// clipboard still holds its text, and nothing on other surfaces.
     #[test]
     fn clipboard_reports_the_clip_the_next_paste_would_use() {
+        use crate::ClipRead;
         let doc = crate::Surface::Doc(editor(ParProps::default(), RunProps::default()));
         let sheet = crate::new_sheet_surface();
         let clip = docxcore::editor::Clip::from_text("one\ntwo");
@@ -3029,22 +3072,30 @@ mod tests {
             text: "a\tb\tc\nd\te\tf\n".into(),
         };
         let kind = |j: Json| j.get_str("kind").unwrap().to_string();
+        let nothing = ClipRead::Nothing;
+        let text = |t: &str| ClipRead::Text(t.into());
 
-        let on_doc = clipboard_app_json(Some(&doc), Some(&clip), Some(&grid), None);
+        let on_doc = clipboard_app_json(Some(&doc), Some(&clip), Some(&grid), &nothing);
         assert_eq!(kind(on_doc.clone()), "doc");
         assert_eq!(on_doc.get_str("text"), Some("one\ntwo"));
-        let bare = clipboard_app_json(Some(&doc), None, Some(&grid), None);
+        let bare = clipboard_app_json(Some(&doc), None, Some(&grid), &nothing);
         assert_eq!(kind(bare), "none");
 
-        let ours = clipboard_app_json(Some(&sheet), Some(&clip), Some(&grid), Some(&grid.text));
+        let ours = clipboard_app_json(Some(&sheet), Some(&clip), Some(&grid), &text(&grid.text));
         assert_eq!(kind(ours.clone()), "grid");
         assert_eq!(ours.get("rows"), Some(&Json::Num(2.)));
         assert_eq!(ours.get("cols"), Some(&Json::Num(3.)));
-        let crlf = grid.text.replace('\n', "\r\n");
-        let echoed = clipboard_app_json(Some(&sheet), None, Some(&grid), Some(&crlf));
+        let crlf = text(&grid.text.replace('\n', "\r\n"));
+        let echoed = clipboard_app_json(Some(&sheet), None, Some(&grid), &crlf);
         assert_eq!(kind(echoed), "grid");
-        let replaced = clipboard_app_json(Some(&sheet), None, Some(&grid), Some("x\ty"));
+        let replaced = clipboard_app_json(Some(&sheet), None, Some(&grid), &text("x\ty"));
         assert_eq!(kind(replaced), "none");
+        // An image copied since is newer than the grid clip; a clipboard with
+        // no item at all cannot say it changed.
+        let image = clipboard_app_json(Some(&sheet), None, Some(&grid), &ClipRead::NotText);
+        assert_eq!(kind(image), "none");
+        let unread = clipboard_app_json(Some(&sheet), None, Some(&grid), &nothing);
+        assert_eq!(kind(unread), "grid");
 
         let placeholder = crate::Surface::Placeholder;
         assert_eq!(
@@ -3052,11 +3103,11 @@ mod tests {
                 Some(&placeholder),
                 Some(&clip),
                 Some(&grid),
-                None
+                &nothing
             )),
             "none"
         );
-        assert_eq!(kind(clipboard_app_json(None, None, None, None)), "none");
+        assert_eq!(kind(clipboard_app_json(None, None, None, &nothing)), "none");
     }
 
     /// #697: a harness instance ignores the pane it was launched from and is
@@ -4280,7 +4331,6 @@ mod tests {
         assert_eq!(drag_args(&obj(&[("range", s("B2"))])), Ok(((1, 1), (1, 1))));
     }
 
-    /// A malformed range, and a half-given pair.
     /// #699: `save-as` resolves the path the dialog would have answered with,
     /// by the app's own extension rules, and refuses what the dialog would
     /// not produce.
@@ -4346,6 +4396,28 @@ mod tests {
             ok(Kind::Xlsx, "book", Some("docx")),
             Err("Workbooks can only be saved as .xlsx".into())
         );
+        // A format is named in any case; an empty one is refused, not taken
+        // as a document format on a workbook.
+        assert_eq!(
+            ok(Kind::Xlsx, "book", Some("XLSX")),
+            Ok((at("book.xlsx"), "xlsx"))
+        );
+        assert_eq!(
+            ok(Kind::Docx, "out", Some(" Md ")),
+            Ok((at("out.md"), "md"))
+        );
+        for kind in [Kind::Xlsx, Kind::Docx, Kind::Project] {
+            assert!(
+                ok(kind, "book", Some(""))
+                    .unwrap_err()
+                    .contains("'format' must not be empty")
+            );
+        }
+        assert!(
+            ok(Kind::Project, "plan", Some("xlsx"))
+                .unwrap_err()
+                .contains("can only be saved as .yppx or .xml")
+        );
 
         assert_eq!(
             ok(Kind::Project, "plan", None),
@@ -4389,6 +4461,43 @@ mod tests {
         );
     }
 
+    /// #699: `fill-drag` refuses before `from` is clicked when a click could
+    /// not bring the handle back (an edit, a pointing reference, a cover), so
+    /// a refusal changes nothing; a selected chart is left for the click to
+    /// clear and refused only if the handle is still hidden after it.
+    #[test]
+    fn fill_drag_refuses_before_selecting_when_a_click_cannot_help() {
+        use crate::HandleHidden::*;
+        assert_eq!(fill_press_refusal(false, false, None, true), Ok(()));
+        assert_eq!(fill_press_refusal(false, false, None, false), Ok(()));
+        for selecting in [true, false] {
+            assert_eq!(
+                fill_press_refusal(false, false, Some(Editing), selecting),
+                Err("the fill handle is not shown: a cell is being edited".into())
+            );
+            assert_eq!(
+                fill_press_refusal(false, false, Some(Pointing), selecting),
+                Err("the fill handle is not shown: a reference is being pointed at".into())
+            );
+            assert_eq!(
+                fill_press_refusal(false, true, None, selecting),
+                Err("the fill handle is covered: the more-tabs list is open".into())
+            );
+            assert_eq!(
+                fill_press_refusal(true, false, None, selecting),
+                Err("the fill handle is not shown: File (backstage) is open".into())
+            );
+        }
+        assert_eq!(
+            fill_press_refusal(false, false, Some(ChartSelected), true),
+            Ok(())
+        );
+        assert_eq!(
+            fill_press_refusal(false, false, Some(ChartSelected), false),
+            Err("the fill handle is not shown: a chart is selected".into())
+        );
+    }
+
     /// #699: `fill-drag`'s `from` takes a cell or a range.
     #[test]
     fn range_arg_takes_a_cell_or_a_range() {
@@ -4403,6 +4512,7 @@ mod tests {
         assert!(range_arg(&obj(&[]), "from").is_err());
     }
 
+    /// A malformed range, and a half-given pair.
     #[test]
     fn drag_args_refuses_a_malformed_range() {
         for bad in ["A1:", ":C5", "A1:C0", "A1-C5", "everything"] {

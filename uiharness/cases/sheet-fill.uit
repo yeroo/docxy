@@ -33,9 +33,20 @@ test fill-drag refuses while the handle is not drawn
   click D1
   type 5
   call-error fill-drag {"to":"D4"} => the fill handle is not shown: a cell is being edited
+  # Refused before `from` is clicked: the edit and the selection are untouched.
+  call-error fill-drag {"from":"B2:B3","to":"B6"} => the fill handle is not shown: a cell is being edited
+  assert editing is true
+  assert edit is 5
+  assert sel is D1
+  assert range is D1
+  assert cell B6 is nothing
   key escape
   select chart 0
   call-error fill-drag {"to":"D4"} => the fill handle is not shown: a chart is selected
+  # A click on `from` takes the selection back from the chart, as the pointer's would.
+  call fill-drag {"from":"B4:B5","to":"B6"}
+  assert reply.filled is B4:B6
+  assert cell B6 is 50
 
 test fill-drag refuses a protected sheet and AutoFill Options
   open ../fixtures/basic.xlsx

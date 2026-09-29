@@ -608,8 +608,9 @@ fn bar_target(act: SheetAct) -> Option<RefTarget> {
 /// Almost everything here targets cells, including the ones that only look
 /// sheet-wide: Freeze Panes freezes AT the selected cell, the comment steps
 /// move the selection, and the colour pickers paint it. The exceptions are the
-/// three that never touch it — protection and outlining are properties of the
-/// whole sheet, and `Todo` does nothing at all.
+/// four that never touch it — protection and outlining are properties of the
+/// whole sheet, the Number format combo only opens or closes its strip (a
+/// format picked there is what acts on cells), and `Todo` does nothing at all.
 fn act_targets_cells(act: SheetAct) -> bool {
     !matches!(
         act,
@@ -842,6 +843,34 @@ fn fill_handle_pointing(range_field: bool, formula_pick: bool) -> bool {
     range_field || formula_pick
 }
 
+/// Why the fill handle is not drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandleHidden {
+    /// A cell edit is open.
+    Editing,
+    /// A reference field or a formula is pointing at cells.
+    Pointing,
+    /// A chart holds the selection.
+    ChartSelected,
+}
+
+impl HandleHidden {
+    fn why(self) -> &'static str {
+        match self {
+            HandleHidden::Editing => "a cell is being edited",
+            HandleHidden::Pointing => "a reference is being pointed at",
+            HandleHidden::ChartSelected => "a chart is selected",
+        }
+    }
+
+    /// Whether a plain click on a cell ends it. A click takes the selection
+    /// back from a chart; while a cell is being edited or a reference is being
+    /// pointed at, a click lands in that edit or reference instead.
+    fn cleared_by_a_click(self) -> bool {
+        matches!(self, HandleHidden::ChartSelected)
+    }
+}
+
 /// Why the fill handle is not drawn, or `None` when it is — the grid's own
 /// condition (`editing`, `handle_hidden`, `sel_hidden`), stated once so the
 /// harness's `fill-drag` refuses exactly when there is no handle to press
@@ -852,13 +881,13 @@ fn fill_handle_hidden(
     range_field: bool,
     formula_pick: bool,
     chart_sel: Option<usize>,
-) -> Option<&'static str> {
+) -> Option<HandleHidden> {
     if editing {
-        Some("a cell is being edited")
+        Some(HandleHidden::Editing)
     } else if fill_handle_pointing(range_field, formula_pick) {
-        Some("a reference is being pointed at")
+        Some(HandleHidden::Pointing)
     } else if !cell_selection_shown(chart_sel) {
-        Some("a chart is selected")
+        Some(HandleHidden::ChartSelected)
     } else {
         None
     }
@@ -889,20 +918,58 @@ struct GridClip {
     text: String,
 }
 
+/// What a read of the clipboard found (#699).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ClipRead {
+    /// No item at all: nothing was ever copied, or the clipboard could not be
+    /// read. Nothing says another copy happened.
+    Nothing,
+    /// An item with no text in it: an image, or an empty copy (gpui's
+    /// `ClipboardItem::text` is `None` for both). Something was copied.
+    NotText,
+    Text(String),
+}
+
+impl ClipRead {
+    /// From the OS read: the item, if any, and its text.
+    fn from_item(item: Option<Option<String>>) -> Self {
+        match item {
+            None => ClipRead::Nothing,
+            Some(None) => ClipRead::NotText,
+            Some(Some(text)) if text.is_empty() => ClipRead::NotText,
+            Some(Some(text)) => ClipRead::Text(text),
+        }
+    }
+
+    fn text(&self) -> Option<&str> {
+        match self {
+            ClipRead::Text(text) => Some(text),
+            _ => None,
+        }
+    }
+}
+
 /// Whether a sheet paste uses the grid clip recorded as `recorded` rather than
-/// the clipboard text `now` (#699). The grid clip is ours only while the
+/// what the clipboard holds `now` (#699). The grid clip is ours only while the
 /// clipboard still holds the text we put there: another app's copy replaces
-/// it, and pasting our older cells then would paste the wrong thing. An
-/// unreadable clipboard (`None`) cannot say it changed, so the clip stands.
-/// Line endings are compared loosely because the OS may hand CRLF back.
-fn grid_paste_uses_clip(recorded: &str, now: Option<&str>) -> bool {
-    now.is_none_or(|now| now.replace("\r\n", "\n") == recorded.replace("\r\n", "\n"))
+/// it, and pasting our older cells then would paste the wrong thing, whether
+/// that copy was text or an image. Only a clipboard with no item at all
+/// (`Nothing`: never copied to, or unreadable) cannot say it changed, so the
+/// clip stands. Line endings are compared loosely because the OS may hand CRLF
+/// back.
+fn grid_paste_uses_clip(recorded: &str, now: &ClipRead) -> bool {
+    match now {
+        ClipRead::Nothing => true,
+        ClipRead::NotText => false,
+        ClipRead::Text(now) => now.replace("\r\n", "\n") == recorded.replace("\r\n", "\n"),
+    }
 }
 
 /// The text clipboard the app reads and writes (#699). A normal instance uses
 /// the OS clipboard; a harness instance keeps a private one, so a UI test can
 /// neither read nor overwrite what the person at the machine copied, and
-/// starts from an empty clipboard whatever they have on theirs.
+/// starts from an empty clipboard whatever they have on theirs. The private one
+/// reads as the OS one does: an empty write is an item with no text.
 #[derive(Default)]
 struct ClipboardStore {
     private: Option<String>,
@@ -917,8 +984,14 @@ impl ClipboardStore {
         }
     }
 
-    fn read(&self, harness: bool, os: impl FnOnce() -> Option<String>) -> Option<String> {
-        if harness { self.private.clone() } else { os() }
+    /// `os` reads the OS clipboard: `None` without an item, else the item's
+    /// text (`None` when it has none).
+    fn read(&self, harness: bool, os: impl FnOnce() -> Option<Option<String>>) -> ClipRead {
+        ClipRead::from_item(if harness {
+            self.private.clone().map(Some)
+        } else {
+            os()
+        })
     }
 }
 
@@ -6260,7 +6333,7 @@ impl Docxy {
 
     /// Why the active sheet draws no fill handle, or `None` when it draws one
     /// (see [`fill_handle_hidden`]).
-    fn fill_handle_hidden_reason(&self) -> Option<&'static str> {
+    fn fill_handle_hidden_reason(&self) -> Option<HandleHidden> {
         let editing = self.active_sheet().is_some_and(|v| v.editing.is_some());
         fill_handle_hidden(
             editing,
@@ -8687,10 +8760,10 @@ impl Docxy {
         });
     }
 
-    /// The clipboard's text: the OS one, or the private one in a harness.
-    fn clipboard_read(&self, cx: &App) -> Option<String> {
+    /// What the clipboard holds: the OS one, or the private one in a harness.
+    fn clipboard_read(&self, cx: &App) -> ClipRead {
         self.clipboard.read(self.harness.is_some(), || {
-            cx.read_from_clipboard().and_then(|item| item.text())
+            cx.read_from_clipboard().map(|item| item.text())
         })
     }
 
@@ -8736,10 +8809,10 @@ impl Docxy {
         let block: Vec<Vec<gridcore::sheet::Cell>> = if let Some(clip) = self
             .grid_clip
             .as_ref()
-            .filter(|clip| grid_paste_uses_clip(&clip.text, now.as_deref()))
+            .filter(|clip| grid_paste_uses_clip(&clip.text, &now))
         {
             clip.cells.clone()
-        } else if let Some(text) = now {
+        } else if let ClipRead::Text(text) = now {
             text.replace("\r\n", "\n")
                 .trim_end_matches('\n')
                 .split('\n')
@@ -11967,6 +12040,14 @@ impl Docxy {
         if self.active_is_sheet() {
             return self.save_sheet(true, window, cx);
         }
+        // ⚠️ Never in a harness instance: `rfd` runs its own modal loop on
+        // this thread and stops the control pump dead (see `save_sheet_tab`).
+        // The Backstage's Save As… is pointer-only, but a dead pump is the
+        // worst way a harness run can fail, so it refuses in words.
+        if doc_save_as_target(self.harness.is_some()) == DocSaveTarget::RefuseHarness {
+            self.set_status(DOC_SAVE_AS_HARNESS);
+            return self.refocus(window, cx);
+        }
         match self.pick_doc_save_target() {
             Some(target) => self.save_doc(Some(target), window, cx),
             None => self.refocus(window, cx),
@@ -14204,6 +14285,19 @@ impl Docxy {
     }
 }
 
+/// What a harness instance says when asked to Save As a document.
+const DOC_SAVE_AS_HARNESS: &str = "This document needs Save As, and a harness instance cannot open the Save As dialog; use the harness save-as verb";
+
+/// Where a document Save As goes: always the dialog, which a harness instance
+/// must not open.
+fn doc_save_as_target(harness: bool) -> DocSaveTarget {
+    if harness {
+        DocSaveTarget::RefuseHarness
+    } else {
+        DocSaveTarget::NeedsDialog
+    }
+}
+
 /// What a harness instance says when asked to save a never-saved document.
 const DOC_NEVER_SAVED_HARNESS: &str = "this document has never been saved, and a harness instance cannot open the Save As dialog; use the harness save-as verb";
 
@@ -14361,19 +14455,24 @@ fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) -> bool
 
 #[cfg(test)]
 mod clipboard_tests {
-    use super::{ClipboardStore, grid_paste_uses_clip};
+    use super::{ClipRead, ClipboardStore, grid_paste_uses_clip};
 
     /// #699: a harness instance never reads or writes the OS clipboard, and
     /// starts from an empty private one.
     #[test]
     fn a_harness_clipboard_is_private_and_starts_empty() {
         let mut store = ClipboardStore::default();
-        let os_read = || -> Option<String> { panic!("a harness read the OS clipboard") };
-        assert_eq!(store.read(true, os_read), None);
+        let os_read = || -> Option<Option<String>> { panic!("a harness read the OS clipboard") };
+        assert_eq!(store.read(true, os_read), ClipRead::Nothing);
         store.write(true, "cells".into(), |_| {
             panic!("a harness wrote the OS clipboard")
         });
-        assert_eq!(store.read(true, os_read), Some("cells".into()));
+        assert_eq!(store.read(true, os_read), ClipRead::Text("cells".into()));
+        // An empty copy reads as the OS clipboard reads one: an item, no text.
+        store.write(true, String::new(), |_| {
+            panic!("a harness wrote the OS clipboard")
+        });
+        assert_eq!(store.read(true, os_read), ClipRead::NotText);
     }
 
     #[test]
@@ -14382,28 +14481,46 @@ mod clipboard_tests {
         let mut written = None;
         store.write(false, "tsv".into(), |t| written = Some(t));
         assert_eq!(written.as_deref(), Some("tsv"));
-        assert_eq!(store.read(false, || Some("os".into())), Some("os".into()));
-        assert_eq!(store.read(false, || None), None);
+        assert_eq!(
+            store.read(false, || Some(Some("os".into()))),
+            ClipRead::Text("os".into())
+        );
+        assert_eq!(store.read(false, || Some(None)), ClipRead::NotText);
+        assert_eq!(store.read(false, || None), ClipRead::Nothing);
     }
 
-    /// #699: after another app copies, a sheet paste takes that text rather
-    /// than the older grid clip; while the clipboard still holds our TSV (the
-    /// OS may hand it back with CRLF) the grid clip keeps formats and formulas.
+    /// #699: after another app copies, a sheet paste takes that copy rather
+    /// than the older grid clip, text or not; while the clipboard still holds
+    /// our TSV (the OS may hand it back with CRLF) the grid clip keeps formats
+    /// and formulas; and a clipboard with no item cannot say it changed.
     #[test]
     fn a_grid_clip_is_pasted_only_while_the_clipboard_still_holds_it() {
         let ours = "a\tb\n1\t2\n";
-        assert!(grid_paste_uses_clip(ours, Some(ours)));
-        assert!(grid_paste_uses_clip(ours, Some("a\tb\r\n1\t2\r\n")));
-        assert!(grid_paste_uses_clip(ours, None));
-        assert!(!grid_paste_uses_clip(ours, Some("from another app")));
-        assert!(!grid_paste_uses_clip(ours, Some("")));
+        let text = |t: &str| ClipRead::Text(t.into());
+        assert!(grid_paste_uses_clip(ours, &text(ours)));
+        assert!(grid_paste_uses_clip(ours, &text("a\tb\r\n1\t2\r\n")));
+        assert!(grid_paste_uses_clip(ours, &ClipRead::Nothing));
+        assert!(!grid_paste_uses_clip(ours, &text("from another app")));
+        assert!(
+            !grid_paste_uses_clip(ours, &ClipRead::NotText),
+            "an image copied since is newer than our cells"
+        );
     }
 }
 
 #[cfg(test)]
 mod doc_save_target_tests {
-    use super::{DocSaveTarget, doc_save_target};
+    use super::{DOC_SAVE_AS_HARNESS, DocSaveTarget, doc_save_as_target, doc_save_target};
     use std::path::Path;
+
+    /// #699: the Backstage's Save As… asks with the dialog, except in a
+    /// harness instance, which refuses in words and points at `save-as`.
+    #[test]
+    fn a_document_save_as_asks_or_refuses_in_a_harness() {
+        assert_eq!(doc_save_as_target(false), DocSaveTarget::NeedsDialog);
+        assert_eq!(doc_save_as_target(true), DocSaveTarget::RefuseHarness);
+        assert!(DOC_SAVE_AS_HARNESS.ends_with("use the harness save-as verb"));
+    }
 
     #[test]
     fn a_saved_document_saves_in_place_harness_or_not() {
@@ -24752,23 +24869,25 @@ mod grid_geom_tests {
     /// and no chart holding the selection; each says why it is not.
     #[test]
     fn the_fill_handle_says_why_it_is_hidden() {
+        use super::HandleHidden::*;
         assert_eq!(fill_handle_hidden(false, false, false, None), None);
-        assert_eq!(
-            fill_handle_hidden(true, false, false, None),
-            Some("a cell is being edited")
-        );
-        assert_eq!(
-            fill_handle_hidden(false, true, false, None),
-            Some("a reference is being pointed at")
-        );
-        assert_eq!(
-            fill_handle_hidden(false, false, true, None),
-            Some("a reference is being pointed at")
-        );
+        assert_eq!(fill_handle_hidden(true, false, false, None), Some(Editing));
+        assert_eq!(fill_handle_hidden(false, true, false, None), Some(Pointing));
+        assert_eq!(fill_handle_hidden(false, false, true, None), Some(Pointing));
         assert_eq!(
             fill_handle_hidden(false, false, false, Some(0)),
-            Some("a chart is selected")
+            Some(ChartSelected)
         );
+        // An edit outranks the rest: it is what a click would land in.
+        assert_eq!(
+            fill_handle_hidden(true, true, false, Some(0)),
+            Some(Editing)
+        );
+        assert_eq!(Editing.why(), "a cell is being edited");
+        assert_eq!(Pointing.why(), "a reference is being pointed at");
+        assert_eq!(ChartSelected.why(), "a chart is selected");
+        assert!(ChartSelected.cleared_by_a_click());
+        assert!(!Editing.cleared_by_a_click() && !Pointing.cleared_by_a_click());
     }
 
     fn names(list: &[&str]) -> Vec<String> {

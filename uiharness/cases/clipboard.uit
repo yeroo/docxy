@@ -36,6 +36,19 @@ test text another app copied wins over the older grid clip
   assert cell D9 is 9
   assert cell E9 is 10
 
+test a copy with no text in it is newer than the grid clip
+  # An empty write reads as an image or empty copy does: an item, no text.
+  open ../fixtures/basic.xlsx
+  click A1
+  key ctrl+c
+  call clipboard {"action":"write","text":""}
+  assert reply.text is nothing
+  assert reply.app.kind is none
+  click D8
+  key ctrl+v
+  assert cell D8 is nothing
+  assert dirty is false
+
 test the clipboard verb refuses what it does not do
   open ../fixtures/basic.xlsx
   call-error clipboard {"action":"paste-special"} => paste special is not implemented in this app

@@ -1479,9 +1479,9 @@ impl Docxy {
     /// Copy/Cut write the cursor cell to the system clipboard; Paste reads it.
     fn project_clipboard(&mut self, act: ProjectAct, cx: &mut Context<Self>) {
         if act == ProjectAct::Paste {
-            let text = self.clipboard_read(cx);
-            if let (Some(tab), Some(text)) = (self.tabs.get_mut(self.active), text) {
-                paste_project_text(tab, &text);
+            let now = self.clipboard_read(cx);
+            if let (Some(tab), Some(text)) = (self.tabs.get_mut(self.active), now.text()) {
+                paste_project_text(tab, text);
             }
             return;
         }
