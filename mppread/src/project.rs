@@ -403,9 +403,12 @@ fn import_tasks(
             task.manual_start = date(&t.manual_start, "manual start")?;
             task.manual_finish = date(&t.manual_finish, "manual finish")?;
             task.manual_duration_min = t.manual_duration_min;
-            // The unit the duration shows (and saves) in; a code past `u8`
-            // is not an MSPDI format.
-            task.duration_format = t.duration_format.and_then(|f| u8::try_from(f).ok());
+            // The unit the duration shows (and saves) in, as the MSPDI reader
+            // keeps it: days is no format, and a code past `u8` is none.
+            task.duration_format = t
+                .duration_format
+                .and_then(|f| u8::try_from(f).ok())
+                .filter(|&f| f != 7);
             if let Some(p) = &t.progress {
                 task.percent_complete = Some(p.percent_complete);
                 task.percent_work_complete = Some(p.percent_work_complete);
@@ -569,6 +572,28 @@ mod tests {
             lag_format: 8,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_task_keeps_its_decoded_duration_format() {
+        let rows: Vec<_> = [Some(9), Some(41), Some(8), Some(7), None, Some(300)]
+            .into_iter()
+            .enumerate()
+            .map(|(i, format)| {
+                let i = i as u32 + 1;
+                let mut row = current(i, i, "T", 1);
+                row.duration_format = format;
+                row.duration_min = Some(2400);
+                row
+            })
+            .collect();
+        let formats: Vec<_> = import_current(rows)
+            .unwrap()
+            .iter()
+            .map(|t| t.duration_format)
+            .collect();
+        // Days is no format, as the MSPDI reader keeps it.
+        assert_eq!(formats, [Some(9), Some(41), Some(8), None, None, None]);
     }
 
     #[test]

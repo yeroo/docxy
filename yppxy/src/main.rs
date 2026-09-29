@@ -2532,6 +2532,58 @@ mod tests {
     }
 
     #[test]
+    fn task_grid_shows_duration_and_slack_in_each_task_s_unit() {
+        use ratatui::backend::TestBackend;
+        let task = |uid: i32, name: &str, level: u32, min: i64, format: Option<u8>| Task {
+            uid,
+            id: uid,
+            name: name.into(),
+            outline_level: level,
+            duration_min: min,
+            duration_format: format,
+            ..Task::default()
+        };
+        let mut summary = task(1, "Sum", 1, 0, Some(9));
+        summary.summary = true;
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![
+                summary,
+                task(2, "Weeks", 2, 3600, Some(9)),
+                task(3, "Half", 1, 1200, Some(9)),
+                task(4, "Hours", 1, 240, Some(5)),
+                task(5, "Days", 1, 240, None),
+                task(6, "Mile", 1, 0, Some(9)),
+            ],
+            ..Project::default()
+        };
+        let mut app = App::new(proj, None, false);
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| draw_body(f, f.area(), &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let row = |y: u16| -> Vec<String> {
+            let text: String = (1..45)
+                .map(|x| buf.cell((x, app.list_y0 + y)).unwrap().symbol())
+                .collect();
+            text.split_whitespace()
+                .rev()
+                .take(2)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect()
+        };
+        // A summary keeps days; a milestone keeps its dash, slack in its unit.
+        assert_eq!(row(0), ["7.5d", "0d"]);
+        assert_eq!(row(1), ["1.5w", "0w"]);
+        assert_eq!(row(2), ["0.5w", "1w"]);
+        assert_eq!(row(3), ["4h", "56h"]);
+        assert_eq!(row(4), ["0.5d", "7d"]);
+        assert_eq!(row(5), ["—", "1.5w"]);
+    }
+
+    #[test]
     fn task_grid_marks_a_missed_deadline_at_the_row_end() {
         use ratatui::backend::TestBackend;
         let proj =

@@ -2580,6 +2580,41 @@ fn fmt_f(x: f64) -> String {
     }
 }
 
+/// Issue #385's plan: two tasks entered in weeks (`DurationFormat` 9), one in
+/// hours (5), the rest in days (7), on the default Standard calendar.
+#[cfg(test)]
+pub(crate) const DURATION_FORMATS_PLAN: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Project xmlns="http://schemas.microsoft.com/project">
+  <Name>formats</Name>
+  <MinutesPerDay>480</MinutesPerDay>
+  <MinutesPerWeek>2400</MinutesPerWeek>
+  <StartDate>2026-03-02T08:00:00</StartDate>
+  <Tasks>
+    <Task><UID>1</UID><ID>1</ID><Name>S</Name><OutlineLevel>1</OutlineLevel>
+      <Duration>PT8H0M0S</Duration><DurationFormat>7</DurationFormat></Task>
+    <Task><UID>2</UID><ID>2</ID><Name>Half</Name><OutlineLevel>1</OutlineLevel>
+      <Duration>PT4H0M0S</Duration><DurationFormat>5</DurationFormat>
+      <PredecessorLink><PredecessorUID>1</PredecessorUID><Type>1</Type></PredecessorLink></Task>
+    <Task><UID>3</UID><ID>3</ID><Name>Full</Name><OutlineLevel>1</OutlineLevel>
+      <Duration>PT8H0M0S</Duration><DurationFormat>7</DurationFormat>
+      <PredecessorLink><PredecessorUID>1</PredecessorUID><Type>1</Type></PredecessorLink></Task>
+    <Task><UID>4</UID><ID>4</ID><Name>Merge</Name><OutlineLevel>1</OutlineLevel>
+      <Duration>PT8H0M0S</Duration><DurationFormat>7</DurationFormat>
+      <PredecessorLink><PredecessorUID>2</PredecessorUID><Type>1</Type></PredecessorLink>
+      <PredecessorLink><PredecessorUID>3</PredecessorUID><Type>1</Type></PredecessorLink></Task>
+    <Task><UID>5</UID><ID>5</ID><Name>WkShort</Name><OutlineLevel>1</OutlineLevel>
+      <Duration>PT40H0M0S</Duration><DurationFormat>9</DurationFormat>
+      <PredecessorLink><PredecessorUID>4</PredecessorUID><Type>1</Type></PredecessorLink></Task>
+    <Task><UID>6</UID><ID>6</ID><Name>WkLong</Name><OutlineLevel>1</OutlineLevel>
+      <Duration>PT60H0M0S</Duration><DurationFormat>9</DurationFormat>
+      <PredecessorLink><PredecessorUID>4</PredecessorUID><Type>1</Type></PredecessorLink></Task>
+    <Task><UID>7</UID><ID>7</ID><Name>End</Name><OutlineLevel>1</OutlineLevel>
+      <Duration>PT8H0M0S</Duration><DurationFormat>7</DurationFormat>
+      <PredecessorLink><PredecessorUID>5</PredecessorUID><Type>1</Type></PredecessorLink>
+      <PredecessorLink><PredecessorUID>6</PredecessorUID><Type>1</Type></PredecessorLink></Task>
+  </Tasks>
+</Project>"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4482,6 +4517,80 @@ mod tests {
     /// The `<Tasks>` section of a written file.
     fn task_xml(xml: &str) -> &str {
         &xml[xml.find("<Tasks>").unwrap()..xml.find("</Tasks>").unwrap()]
+    }
+
+    #[test]
+    fn task_duration_format_is_read_and_written_back() {
+        let proj = read_mspdi(DURATION_FORMATS_PLAN).unwrap();
+        let formats = |proj: &Project| {
+            proj.tasks
+                .iter()
+                .map(|t| (t.name.clone(), t.duration_format))
+                .collect::<Vec<_>>()
+        };
+        // Days, the default, is no format.
+        let expected = [
+            ("S", None),
+            ("Half", Some(5)),
+            ("Full", None),
+            ("Merge", None),
+            ("WkShort", Some(9)),
+            ("WkLong", Some(9)),
+            ("End", None),
+        ]
+        .map(|(name, format)| (name.to_string(), format));
+        assert_eq!(formats(&proj), expected);
+        let xml = write_mspdi(&proj);
+        // Each task's own format, in task order.
+        let written: Vec<&str> = task_xml(&xml)
+            .split("<Task>")
+            .skip(1)
+            .map(|task| {
+                let from = task.find("<DurationFormat>").unwrap() + "<DurationFormat>".len();
+                &task[from..from + task[from..].find('<').unwrap()]
+            })
+            .collect();
+        assert_eq!(written, ["7", "5", "7", "7", "9", "9", "7"]);
+        assert_eq!(formats(&read_mspdi(&xml).unwrap()), expected);
+    }
+
+    #[test]
+    fn task_duration_format_keeps_codes_and_drops_invalid_ones() {
+        for (text, read, written) in [
+            ("9", Some(9), "9"),
+            ("41", Some(41), "41"),
+            ("39", Some(39), "39"),
+            ("8", Some(8), "8"),
+            ("53", Some(53), "53"),
+            ("7", None, "7"),
+            ("", None, "7"),
+            ("x", None, "7"),
+            ("256", None, "7"),
+            ("-1", None, "7"),
+        ] {
+            let proj = task_project(&format!(
+                "<Task><UID>1</UID><ID>1</ID><Name>A</Name><Duration>PT8H0M0S</Duration>\
+                 <DurationFormat>{text}</DurationFormat></Task>"
+            ));
+            assert_eq!(proj.tasks[0].duration_format, read, "{text:?}");
+            assert!(
+                task_xml(&write_mspdi(&proj))
+                    .contains(&format!("<DurationFormat>{written}</DurationFormat>")),
+                "{text:?}"
+            );
+        }
+        // A task without one still saves days; a blank row saves none.
+        let proj = task_project(
+            "<Task><UID>1</UID><ID>1</ID><Name>A</Name><Duration>PT8H0M0S</Duration></Task>\
+             <Task><UID>2</UID><ID>2</ID><IsNull>1</IsNull></Task>",
+        );
+        let xml = write_mspdi(&proj);
+        assert_eq!(
+            task_xml(&xml)
+                .matches("<DurationFormat>7</DurationFormat>")
+                .count(),
+            1
+        );
     }
 
     #[test]

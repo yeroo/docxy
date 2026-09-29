@@ -471,6 +471,107 @@ fn constraint_abbreviations_match_all_constraint_codes_and_hints() {
 }
 
 #[test]
+fn a_typed_duration_records_its_unit_and_undo_restores_it() {
+    let mut ed = editor();
+    let format = |ed: &Editor| ed.project().task(10).unwrap().duration_format;
+    for (text, minutes, expected) in [
+        ("2w", 4800, Some(9)),
+        ("4h", 240, Some(5)),
+        ("90m", 90, Some(3)),
+        ("1mo", 9600, Some(11)),
+        ("1.5 weeks", 3600, Some(9)),
+        // Days, and a bare number, are the default: no format.
+        ("3", 1440, None),
+        ("2d", 960, None),
+    ] {
+        ed.set_duration(10, "1w").unwrap();
+        let depth = ed.undo_depth();
+        ed.set_duration(10, text).unwrap();
+        assert_eq!(
+            ed.project().task(10).unwrap().duration_min,
+            minutes,
+            "{text}"
+        );
+        assert_eq!(format(&ed), expected, "{text}");
+        assert_eq!(ed.undo_depth(), depth + 1, "{text}");
+        ed.undo();
+        assert_eq!(format(&ed), Some(9), "{text}");
+    }
+    // The same minutes in another unit is still an edit: it changes the unit.
+    ed.set_duration(10, "1w").unwrap();
+    let depth = ed.undo_depth();
+    ed.set_duration(10, "5d").unwrap();
+    assert_eq!((format(&ed), ed.undo_depth()), (None, depth + 1));
+    // Re-entering the unit it has is not.
+    ed.set_duration(10, "5d").unwrap();
+    assert_eq!(ed.undo_depth(), depth + 1);
+}
+
+#[test]
+fn only_a_typed_duration_changes_the_unit() {
+    let mut ed = editor();
+    ed.set_duration(10, "2w?").unwrap();
+    let task = ed.project().task(10).unwrap();
+    // The estimate lives on `estimated`; the format is the plain unit.
+    assert_eq!(
+        (task.duration_format, task.estimated),
+        (Some(9), Some(true))
+    );
+    // A duration set without a unit keeps it.
+    ed.set_duration_min(10, 2400, false).unwrap();
+    assert_eq!(ed.project().task(10).unwrap().duration_format, Some(9));
+    // So does moving a manual task's finish, which changes its duration.
+    ed.set_manual(10, true).unwrap();
+    let start = ed.disp_start(10).unwrap();
+    ed.set_finish(10, start.add_days(9)).unwrap();
+    let task = ed.project().task(10).unwrap();
+    assert_ne!(task.manual_duration_min, Some(2400));
+    assert_eq!(task.duration_format, Some(9));
+    // A stored estimated format (41, weeks?) keeps its bit when weeks are
+    // typed again, and loses it for another unit.
+    let mut p = ed.project().clone();
+    p.tasks[0].duration_format = Some(41);
+    p.tasks[0].manual = false;
+    let mut ed = Editor::new(p);
+    ed.set_duration(10, "3w?").unwrap();
+    assert_eq!(ed.project().task(10).unwrap().duration_format, Some(41));
+    ed.set_duration(10, "3d").unwrap();
+    assert_eq!(ed.project().task(10).unwrap().duration_format, None);
+}
+
+#[test]
+fn exact_duration_text_prefers_the_task_s_unit() {
+    let p = untitled_project();
+    for (min, unit, expected) in [
+        (240, Some(LagUnit::Day), "0.5d"),
+        (480, Some(LagUnit::Day), "1d"),
+        (480, Some(LagUnit::Hour), "8h"),
+        (2400, Some(LagUnit::Week), "1w"),
+        (3600, Some(LagUnit::Week), "1.5w"),
+        (1200, Some(LagUnit::Week), "0.5w"),
+        (90, Some(LagUnit::Minute), "90m"),
+        (4800, Some(LagUnit::Month), "0.5mo"),
+        (-1200, Some(LagUnit::Week), "-0.5w"),
+        // Not exact in the unit (two decimals): whole days or hours, else
+        // minutes.
+        (2401, Some(LagUnit::Week), "2401m"),
+        (800, Some(LagUnit::Week), "800m"),
+        (2880, Some(LagUnit::Week), "1.2w"),
+        (60, Some(LagUnit::Week), "1h"),
+        // No unit: the old choice.
+        (240, None, "4h"),
+        (2400, None, "5d"),
+    ] {
+        assert_eq!(
+            format_duration_exact(min, &p, unit),
+            expected,
+            "{min} {unit:?}"
+        );
+        assert_eq!(parse_duration(expected, &p), Some(min), "{expected}");
+    }
+}
+
+#[test]
 fn exact_duration_format_preserves_minutes_beyond_float_integer_precision() {
     let p = untitled_project();
     let units = [

@@ -669,6 +669,32 @@ mod tests {
     }
 
     #[test]
+    fn a_duration_s_unit_is_kept_and_saved() {
+        let mut ed = app();
+        let depth = ed.undo_depth();
+        let set = Json::parse(r#"{"uid":1,"duration":"1.5w"}"#).unwrap();
+        dispatch_editor(&mut ed, "task.set", &set).unwrap().unwrap();
+        let add = Json::parse(r#"{"name":"Hours","duration":"4h?"}"#).unwrap();
+        let added = dispatch_editor(&mut ed, "task.add", &add).unwrap().unwrap();
+        let uid = added.get_usize("uid").unwrap() as i32;
+        // The task and its unit are one step.
+        assert_eq!(ed.undo_depth(), depth + 2);
+        let task = ed.project().task(uid).unwrap();
+        assert_eq!(
+            (task.duration_min, task.estimated, task.duration_format),
+            (240, Some(true), Some(5))
+        );
+        let saved =
+            projcore::mspdi::read_mspdi(&projcore::mspdi::write_mspdi(ed.project())).unwrap();
+        assert_eq!(saved.task(1).unwrap().duration_format, Some(9));
+        assert_eq!(saved.task(1).unwrap().duration_min, 3600);
+        assert_eq!(saved.task(uid).unwrap().duration_format, Some(5));
+        ed.undo();
+        assert!(ed.project().task(uid).is_none());
+        assert_eq!(ed.project().task(1).unwrap().duration_format, Some(9));
+    }
+
+    #[test]
     fn task_add_rejects_negative_duration_without_changing_editor_state() {
         let mut ed = app();
         ed.rename(1, "temporary").unwrap();
