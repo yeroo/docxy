@@ -106,7 +106,9 @@ delay?}` needs at least one of them; units are a number or `"50%"`, work and
 delay a number of hours or a duration (`"40h"`, `"5d"`), the rate table `"A"` to
 `"E"`. The task is rescheduled by its type, as in Project: on a Fixed Units task
 a units edit keeps the work and moves the duration, on Fixed Duration the work
-follows the units; a work edit clears the assignment's overtime. `assign.del
+follows the units (and units given together with work are recomputed from the
+work); a work edit clears the assignment's overtime. A bare number of work or
+delay, even as a string (`"8"`), is hours. `assign.del
 {uid}` replies `{deleted, task}`; an effort-driven task keeps its work across
 the assignments left. Each edit is one undo step, a value the assignment
 already has records none, and every argument is checked first, so a rejected

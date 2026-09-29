@@ -8,6 +8,7 @@
 use super::effort::task_type;
 use super::*;
 use crate::assign::contoured;
+use crate::schedule::HORIZON_DAYS;
 
 /// The resource an added assignment is for.
 #[derive(Clone, Copy, Debug)]
@@ -46,11 +47,19 @@ fn positive_units(units: f64) -> Result<f64, String> {
     }
 }
 
-fn non_negative(what: &str, min: i64) -> Result<i64, String> {
-    if min >= 0 {
-        Ok(min)
-    } else {
+/// The most work or delay an agent may give: the scheduling horizon, so
+/// `work / units + delay` and the stored tenths stay representable.
+const MAX_MINUTES: i64 = 2 * HORIZON_DAYS * 1440;
+
+/// Work or a delay must be a non-negative number of minutes within the
+/// scheduling horizon.
+fn checked_minutes(what: &str, min: i64) -> Result<i64, String> {
+    if min < 0 {
         Err(format!("{what} must not be negative"))
+    } else if min > MAX_MINUTES {
+        Err(format!("{what} is beyond the scheduling range"))
+    } else {
+        Ok(min)
     }
 }
 
@@ -87,8 +96,21 @@ impl Editor {
         work_min: Option<i64>,
     ) -> Result<i32, String> {
         let units = units.map(positive_units).transpose()?;
+        // Refuse units or work an existing resource does not take before
+        // anything is staged; a new name is a work resource.
+        let existing = match resource {
+            ResourceRef::Uid(rid) => self.proj.resources.iter().find(|r| r.uid == rid),
+            ResourceRef::Name(name) => self
+                .proj
+                .resources
+                .iter()
+                .find(|r| r.name.eq_ignore_ascii_case(name.trim())),
+        };
+        if let Some(r) = existing {
+            check_kind(r, units.is_some(), work_min.is_some())?;
+        }
         if let Some(work) = work_min {
-            non_negative("work", work)?;
+            checked_minutes("work", work)?;
             let add = |ed: &mut Editor| {
                 let uid = ed.add_assignment(task_uid, resource, units, None)?;
                 ed.set_assignment(
@@ -119,6 +141,12 @@ impl Editor {
                 let name = name.trim();
                 if name.is_empty() {
                     return Err("the resource name is empty".into());
+                }
+                // A new name must survive the Resource Names cell, which
+                // splits its text at commas; an existing one still matches.
+                let known = resources.iter().any(|r| r.name.eq_ignore_ascii_case(name));
+                if !known && name.contains(',') {
+                    return Err(format!("Resource name '{name}' cannot contain a comma"));
                 }
                 find_or_stage_resource(&mut resources, name)?
             }
@@ -160,8 +188,10 @@ impl Editor {
     /// `effort::same_resources`). The changes apply in that order: the delay,
     /// then the units (a work resource works them from its delay to the task
     /// finish), then the work, so given work is what it keeps, then the rate
-    /// table. A work edit clears the overtime. Values it already has are no
-    /// change, and a patch that changes nothing records no undo step.
+    /// table. So on a Fixed Duration task, units given together with work
+    /// are recomputed from the work. A work edit clears the overtime. Values
+    /// it already has are no change (given work only when no units edit
+    /// restages it), and a patch that changes nothing records no undo step.
     pub fn set_assignment(&mut self, uid: i32, patch: AssignmentPatch) -> Result<(), String> {
         let a = self
             .proj
@@ -176,11 +206,11 @@ impl Editor {
         let units = patch.units.map(positive_units).transpose()?;
         let work = patch
             .work_min
-            .map(|w| non_negative("work", w))
+            .map(|w| checked_minutes("work", w))
             .transpose()?;
         let delay = patch
             .delay_min
-            .map(|d| non_negative("delay", d))
+            .map(|d| checked_minutes("delay", d))
             .transpose()?;
         if let Some(table) = patch.rate_table
             && table > 4
@@ -195,26 +225,13 @@ impl Editor {
         // Only what differs from the assignment is an edit.
         let delay = delay.filter(|&d| d * 10 != a.delay.unwrap_or(0).max(0));
         let units = units.filter(|&u| !same_shown_units(kind, u, a.units));
-        let work = work.filter(|&w| w != a.work_min);
+        // A units edit restages the work, so given work is then an edit.
+        let work = work.filter(|&w| units.is_some() || w != a.work_min);
         let table = patch
             .rate_table
             .filter(|&t| t != a.cost_rate_table.unwrap_or(0));
         if (delay, units, work, table) == (None, None, None, None) {
             return Ok(());
-        }
-        // A fixed-duration task works new work over the span from the
-        // delay to its finish, which must be there.
-        let task = self.row_as_edited(i);
-        let delay_after = delay.unwrap_or_else(|| a.delay_min());
-        if work.is_some_and(|w| w > 0)
-            && task_type(&task) == TaskType::FixedDuration
-            && !self.proj.is_outline_summary(i)
-            && task.duration_min > 0
-            && kind.is_none_or(|k| k == ResourceType::Work)
-            && !contoured(a)
-            && task.duration_min - delay_after <= 0
-        {
-            return Err("delay must be shorter than the task".into());
         }
         let edit = |ed: &mut Editor| {
             let stage = |ed: &mut Editor, change: &dyn Fn(&mut Assignment, i64)| {
@@ -242,6 +259,22 @@ impl Editor {
                 })?;
             }
             if let Some(w) = work {
+                // A fixed-duration task works new work over the span from
+                // the delay to its finish, as the stages before left them,
+                // which must be there. The batch undoes those stages.
+                let task = ed.row_as_edited(i);
+                let a = ed.proj.assignments.iter().find(|a| a.uid == uid);
+                let a = a.expect("checked");
+                if w > 0
+                    && task_type(&task) == TaskType::FixedDuration
+                    && !ed.proj.is_outline_summary(i)
+                    && task.duration_min > 0
+                    && kind.is_none_or(|k| k == ResourceType::Work)
+                    && !contoured(a)
+                    && task.duration_min - a.delay_min() <= 0
+                {
+                    return Err("delay must be shorter than the task".into());
+                }
                 stage(ed, &|a, _| a.set_work(w))?;
             }
             if let Some(t) = table {

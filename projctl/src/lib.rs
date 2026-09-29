@@ -58,7 +58,8 @@
 //! number of hours or a duration (`"40h"`, `"5d"`); `rate_table` `"A"`..`"E"`.
 //! The task is rescheduled by its type, as in Project: a units edit on a
 //! Fixed Units task keeps the work and moves the duration; on Fixed Duration
-//! the work follows the units. Every argument is checked before the edit, so
+//! the work follows the units, and units given together with work are
+//! recomputed from the work. Every argument is checked before the edit, so
 //! a rejected call leaves the editor untouched.
 //!
 //! `path_info` provides the common `proj.path` fields. File verbs (`proj.save`,
@@ -651,12 +652,18 @@ fn hours_arg(ed: &Editor, args: &Json, key: &str) -> Result<Option<i64>, String>
     let Some(v) = args.get(key) else {
         return Ok(None);
     };
-    let min = match v.as_str() {
-        Some(text) => parse_duration(text, ed.project()),
-        None => v
-            .as_f64()
+    // A bare number, even as a string, is hours; a duration needs its unit
+    // (`parse_duration` would read a bare number as days).
+    let hours = match v.as_str() {
+        Some(text) => text.trim().parse::<f64>().ok(),
+        None => v.as_f64(),
+    };
+    let min = match (hours, v.as_str()) {
+        (Some(h), _) => Some(h)
             .filter(|h| h.is_finite())
             .map(|h| (h * 60.0).round() as i64),
+        (None, Some(text)) => parse_duration(text, ed.project()),
+        (None, None) => None,
     };
     min.map(Some)
         .ok_or_else(|| format!("couldn't read '{key}' (hours, or a duration such as 40h or 5d)"))
@@ -1917,6 +1924,44 @@ mod tests {
             panic!()
         };
         assert_eq!(read.len(), listed.len());
+    }
+
+    #[test]
+    fn a_bare_number_of_work_or_delay_is_hours_even_as_a_string() {
+        use projcore::model::TaskType;
+        for (work, delay, hours) in [
+            ("8", "8", 8.0),
+            ("8.5", "2", 8.5),
+            ("\"8\"", "\"8\"", 8.0),
+            ("\" 12 \"", "\"4\"", 12.0),
+            ("\"1d\"", "\"1d\"", 8.0),
+            ("\"6h\"", "\"6h\"", 6.0),
+        ] {
+            let mut ed = staffed(TaskType::FixedUnits, false);
+            let ann = run(&mut ed, "assign.add", r#"{"task":1,"resource":1}"#).unwrap();
+            let uid = num(&ann, "uid");
+            let set = format!(r#"{{"uid":{uid},"work":{work},"delay":{delay}}}"#);
+            let ann = run(&mut ed, "assign.set", &set).unwrap();
+            assert_eq!(num(&ann, "work_hours"), hours, "{work}");
+            let expect = match delay {
+                "8" | "\"8\"" | "\"1d\"" => 8.0,
+                "2" => 2.0,
+                "\"4\"" => 4.0,
+                _ => 6.0,
+            };
+            assert_eq!(num(&ann, "delay_hours"), expect, "{delay}");
+        }
+        // Far beyond the scheduling horizon.
+        let mut ed = staffed(TaskType::FixedUnits, false);
+        let ann = run(&mut ed, "assign.add", r#"{"task":1,"resource":1}"#).unwrap();
+        let uid = num(&ann, "uid");
+        let before = (ed.project().clone(), ed.undo_depth());
+        for key in ["work", "delay"] {
+            let set = format!(r#"{{"uid":{uid},"{key}":1e17}}"#);
+            let err = run(&mut ed, "assign.set", &set).unwrap_err();
+            assert_eq!(err, format!("{key} is beyond the scheduling range"));
+            assert_eq!((ed.project().clone(), ed.undo_depth()), before);
+        }
     }
 
     #[test]

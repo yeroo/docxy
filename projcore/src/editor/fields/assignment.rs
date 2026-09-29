@@ -83,17 +83,19 @@ impl AssignmentField {
     /// case; the error names it as given.
     pub fn parse(name: &str) -> Result<AssignmentField, String> {
         let wanted = name.trim();
-        NAMES
-            .iter()
-            .find(|(_, n)| n.eq_ignore_ascii_case(wanted))
-            .map(|&(f, _)| f)
+        AssignmentField::all()
+            .into_iter()
+            .find(|f| f.name().eq_ignore_ascii_case(wanted))
             .ok_or_else(|| format!("unknown assignment field '{name}'"))
     }
 }
 
 /// Every readable assignment field name, in registry order.
 pub fn assignment_field_names() -> Vec<String> {
-    NAMES.iter().map(|(_, n)| (*n).to_string()).collect()
+    AssignmentField::all()
+        .into_iter()
+        .map(|f| f.name().to_string())
+        .collect()
 }
 
 /// A cost rate table's letter, `A` for 0 (and for an absent table).
@@ -176,13 +178,7 @@ pub fn read_assignment_field(ed: &Editor, a: &Assignment, field: AssignmentField
         AssignmentField::PercentWorkComplete => percent(a.percent_work_complete),
         AssignmentField::Start => date(assignment_dates(ed, a).map(|(s, _)| s)),
         AssignmentField::Finish => date(assignment_dates(ed, a).map(|(_, f)| f)),
-        AssignmentField::Delay => {
-            let min = a.delay_min();
-            FieldRead::new(
-                format_duration_field(proj, min, DurationUnit::DAYS, false),
-                FieldValue::Minutes(min),
-            )
-        }
+        AssignmentField::Delay => duration(proj, Some(a.delay_min()), DurationUnit::DAYS),
         AssignmentField::CostRateTable => text(rate_table_letter(a.cost_rate_table).to_string()),
         AssignmentField::WorkContour => text(work_contour_name(a.work_contour)),
         AssignmentField::Peak => {

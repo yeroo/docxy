@@ -1340,7 +1340,7 @@ fn validate_duration(minutes: i64) -> Result<(), String> {
     Ok(())
 }
 
-/// Both assignment entry points stage resources before taking an undo snapshot.
+/// Every assignment entry point stages resources before taking an undo snapshot.
 fn find_or_stage_resource(resources: &mut Vec<Resource>, name: &str) -> Result<i32, String> {
     if let Some(resource) = resources.iter().find(|r| r.name.eq_ignore_ascii_case(name)) {
         return Ok(resource.uid);

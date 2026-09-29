@@ -342,7 +342,61 @@ fn rejected_edits_leave_the_editor_untouched() {
     ] {
         assert_untouched(&mut ed, edit);
     }
-    // Fixed Duration: new work needs a span after the delay.
+    // Work and delays beyond the scheduling horizon.
+    for patch in [work(MAX_MINUTES + 1), delay(MAX_MINUTES + 1)] {
+        let err = ed.set_assignment(1, patch.clone()).unwrap_err();
+        assert!(err.ends_with("is beyond the scheduling range"), "{err}");
+        assert_untouched(&mut ed, |ed| ed.set_assignment(1, patch));
+    }
+    assert_untouched(&mut ed, |ed| {
+        ed.add_assignment(1, ResourceRef::Uid(2), None, Some(MAX_MINUTES + 1))
+            .map(drop)
+    });
+    // A material takes no work, refused before the add is staged.
+    assert_eq!(
+        ed.add_assignment(2, ResourceRef::Name("steel"), None, Some(60))
+            .unwrap_err(),
+        "'Steel' is a material resource; set its units"
+    );
+    assert_untouched(&mut ed, |ed| ed.delete_assignment(99).map(drop));
+    assert_eq!(
+        ed.set_assignment(1, AssignmentPatch::default())
+            .unwrap_err(),
+        "nothing to set: give units, work, rate_table or delay"
+    );
+}
+
+#[test]
+fn fixed_duration_work_needs_a_span_after_the_delay_the_patch_leaves() {
+    // A delay that grows the task leaves room for the work: one patch
+    // agrees with the two edits made one after the other.
+    let patch = AssignmentPatch {
+        delay_min: Some(6 * DAY),
+        work_min: Some(8 * 60),
+        ..AssignmentPatch::default()
+    };
+    let mut one = plan(
+        Some(TaskType::FixedDuration),
+        false,
+        vec![assignment(1, 1, 1.0, 5 * DAY)],
+    );
+    assert_one_step(&mut one, |ed| ed.set_assignment(1, patch).unwrap());
+    let mut two = plan(
+        Some(TaskType::FixedDuration),
+        false,
+        vec![assignment(1, 1, 1.0, 5 * DAY)],
+    );
+    two.set_assignment(1, delay(6 * DAY)).unwrap();
+    two.set_assignment(1, work(8 * 60)).unwrap();
+    assert_eq!(one.proj, two.proj);
+    assert_eq!(duration(&one), 11 * DAY);
+    // An assignment without work does not grow the task, so its delay can
+    // leave no span for new work.
+    let mut ed = plan(
+        Some(TaskType::FixedDuration),
+        false,
+        vec![assignment(1, 1, 1.0, 0)],
+    );
     let too_late = AssignmentPatch {
         delay_min: Some(5 * DAY),
         work_min: Some(DAY),
@@ -351,12 +405,51 @@ fn rejected_edits_leave_the_editor_untouched() {
     let err = ed.set_assignment(1, too_late.clone()).unwrap_err();
     assert_eq!(err, "delay must be shorter than the task");
     assert_untouched(&mut ed, |ed| ed.set_assignment(1, too_late));
-    assert_untouched(&mut ed, |ed| ed.delete_assignment(99).map(drop));
-    assert_eq!(
-        ed.set_assignment(1, AssignmentPatch::default())
-            .unwrap_err(),
-        "nothing to set: give units, work, rate_table or delay"
-    );
+}
+
+#[test]
+fn given_work_survives_a_units_edit_even_when_it_equals_the_stored_work() {
+    let both = |u: f64, w: i64| AssignmentPatch {
+        units: Some(u),
+        work_min: Some(w),
+        ..AssignmentPatch::default()
+    };
+    // Fixed Duration: units given with work are recomputed from the work.
+    for (w, units) in [(40 * 60, 1.0), (39 * 60, 0.975), (8 * 60, 0.2)] {
+        let mut ed = plan(
+            Some(TaskType::FixedDuration),
+            false,
+            vec![assignment(1, 1, 1.0, 5 * DAY)],
+        );
+        ed.set_assignment(1, both(0.5, w)).unwrap();
+        assert_eq!((get(&ed, 1).units, get(&ed, 1).work_min), (units, w));
+        assert_eq!(duration(&ed), 5 * DAY);
+    }
+    // Fixed Units keeps both and moves the duration.
+    let mut ed = plan(None, false, vec![assignment(1, 1, 1.0, 5 * DAY)]);
+    ed.set_assignment(1, both(0.5, 5 * DAY)).unwrap();
+    assert_eq!((get(&ed, 1).units, get(&ed, 1).work_min), (0.5, 5 * DAY));
+    assert_eq!(duration(&ed), 10 * DAY);
+}
+
+#[test]
+fn a_new_resource_name_with_a_comma_is_refused_an_existing_one_matches() {
+    let mut ed = plan(None, false, vec![]);
+    assert_untouched(&mut ed, |ed| {
+        let err = ed
+            .add_assignment(1, ResourceRef::Name("Smith, J"), None, None)
+            .unwrap_err();
+        assert_eq!(err, "Resource name 'Smith, J' cannot contain a comma");
+        Err(err)
+    });
+    let mut p = ed.proj.clone();
+    p.resources
+        .push(resource(5, "Smith, J", ResourceType::Work, "40"));
+    let mut ed = Editor::new(p);
+    let uid = ed
+        .add_assignment(1, ResourceRef::Name("smith, j"), None, None)
+        .unwrap();
+    assert_eq!(get(&ed, uid).resource_uid, 5);
 }
 
 #[test]

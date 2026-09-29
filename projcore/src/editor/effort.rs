@@ -211,7 +211,7 @@ fn same_resources(
         .iter()
         .map(|&k| &assignments[k])
         .filter(|a| a.units > 0.0 && a.work_min > 0)
-        .map(|a| (a.work_min as f64 / a.units).round() as i64 + a.delay_min())
+        .map(|a| ((a.work_min as f64 / a.units).round() as i64).saturating_add(a.delay_min()))
         .max()
         .filter(|&d| d > 0)?;
     Some(if fixed_duration {
