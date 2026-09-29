@@ -182,10 +182,12 @@ pub enum Inline {
         raw: String,
         blocks: Vec<Block>,
     },
-    /// A field (`<w:fldSimple>`, e.g. CREATEDATE/PAGE/REF). `raw` is the original
-    /// XML (preserved verbatim for lossless save); `text` is the field's cached
-    /// result, rendered as inline body text so the value (a date, a number, …) is
-    /// visible instead of vanishing.
+    /// A field, e.g. CREATEDATE/PAGE/REF: a `<w:fldSimple>`, or a complex field
+    /// (`w:fldChar` begin … end) whose runs all sit in one inline container, or a
+    /// `w:sym` symbol run. `raw` is the original XML (preserved verbatim for
+    /// lossless save; for a complex field, every run from begin to end); `text`
+    /// is the field's cached result, rendered as inline body text so the value
+    /// (a date, a number, …) is visible instead of vanishing.
     Field {
         raw: String,
         text: String,

@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::field::{FieldEvent, field_events};
 use crate::load::{Relationships, xml_attr_value};
 use crate::model::*;
 use crate::package::{HeaderVariant, Package, SectionParts, section_header_parts};
@@ -1282,49 +1283,6 @@ fn same_style(a: &PCell, b: &PCell) -> bool {
         && a.field.map(|f| f.0) == b.field.map(|f| f.0)
 }
 
-/// A complex field's markers inside a preserved raw run, in document order.
-enum FieldEvent {
-    Begin,
-    Instr(String),
-    Separate,
-    End,
-}
-
-fn field_events(raw: &str) -> Vec<FieldEvent> {
-    let mut events: Vec<(usize, FieldEvent)> = Vec::new();
-    let mut from = 0;
-    while let Some(off) = raw[from..].find("<w:fldChar") {
-        let start = from + off;
-        let el = start_tag(&raw[start..], "w:fldChar").unwrap_or("");
-        from = start + el.len().max(1);
-        match xml_attr_value(el, "w:fldCharType").as_deref() {
-            Some("begin") => events.push((start, FieldEvent::Begin)),
-            Some("separate") => events.push((start, FieldEvent::Separate)),
-            Some("end") => events.push((start, FieldEvent::End)),
-            _ => {}
-        }
-    }
-    let mut from = 0;
-    while let Some(off) = raw[from..].find("<w:instrText") {
-        let start = from + off;
-        let el = start_tag(&raw[start..], "w:instrText").unwrap_or("");
-        let body_start = start + el.len().max(1);
-        from = body_start;
-        if el.ends_with("/>") {
-            continue;
-        }
-        let body_end = raw[body_start..]
-            .find("</w:instrText>")
-            .map_or(raw.len(), |e| body_start + e);
-        events.push((
-            start,
-            FieldEvent::Instr(raw[body_start..body_end].to_string()),
-        ));
-    }
-    events.sort_by_key(|(pos, _)| *pos);
-    events.into_iter().map(|(_, e)| e).collect()
-}
-
 /// An open complex field while its paragraph is flattened.
 struct OpenField {
     instr: String,
@@ -2496,6 +2454,33 @@ mod tests {
                 .filter(|t| t.chars().all(|c| c.is_ascii_digit()))
                 .collect();
             assert_eq!(values, vec![(i + 1).to_string().as_str(), "3"]);
+        }
+    }
+
+    #[test]
+    fn loaded_complex_page_field_in_a_footer_counts_pages_642() {
+        // The loader collapses a complex field into one `Inline::Field`; its
+        // page number must still be substituted per page, not print the cache.
+        let footer = crate::load::parse_header_footer(
+            r#"<w:ftr><w:p><w:r><w:t xml:space="preserve">Page </w:t></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> PAGE \* MERGEFORMAT </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>1</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p></w:ftr>"#,
+            &crate::load::Relationships::default(),
+        );
+        assert!(matches!(
+            &footer[0],
+            Block::Paragraph(p) if matches!(p.content[1], Inline::Field { .. })
+        ));
+        let opts = with_parts(&[("rF", "footer1.xml", footer)]);
+        let d =
+            three_pages(r#"<w:sectPr><w:footerReference w:type="default" r:id="rF"/></w:sectPr>"#);
+        let pages = pages_of(&d, &opts);
+        assert_eq!(pages.len(), 3);
+        for (i, page) in pages.iter().enumerate() {
+            assert!(
+                page.exact(&(i + 1).to_string()),
+                "page {}: {:?}",
+                i + 1,
+                page.texts
+            );
         }
     }
 

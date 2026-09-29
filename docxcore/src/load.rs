@@ -750,53 +750,58 @@ fn parse_blocks_until_end(p: &mut XmlParser, rels: &Relationships) -> Vec<Block>
 
 fn parse_paragraph(p: &mut XmlParser, rels: &Relationships) -> Paragraph {
     let mut para = Paragraph::default();
+    let mut fields = FieldCollapse::default();
     loop {
         match p.next() {
-            Event::Start => match p.name() {
-                "w:pPr" => parse_ppr(p, &mut para.props),
-                "w:r" => {
-                    let start = p.start_pos();
-                    let mut tmp = Vec::new();
-                    if parse_run(p, &mut tmp) {
-                        // Run held a drawing/field/etc. SmartArt becomes a text box;
-                        // anything else is preserved verbatim.
-                        let raw = p.raw_slice(start, p.pos()).to_string();
-                        para.content.push(drawing_inline(raw, rels));
-                    } else {
-                        para.content.extend(tmp);
+            Event::Start => {
+                let (name, start, n) = (p.name(), p.start_pos(), para.content.len());
+                match name {
+                    "w:pPr" => parse_ppr(p, &mut para.props),
+                    "w:r" => {
+                        let start = p.start_pos();
+                        let mut tmp = Vec::new();
+                        if parse_run(p, &mut tmp) {
+                            // Run held a drawing/field/etc. SmartArt becomes a text box;
+                            // anything else is preserved verbatim.
+                            let raw = p.raw_slice(start, p.pos()).to_string();
+                            para.content.push(drawing_inline(raw, rels));
+                        } else {
+                            para.content.extend(tmp);
+                        }
                     }
+                    "w:hyperlink" => parse_hyperlink_into(p, rels, &mut para.content),
+                    // Tracked change: show the inserted/deleted text (instead of
+                    // hiding it as opaque raw) while preserving the revision markup.
+                    "w:ins" => para
+                        .content
+                        .push(parse_revision(p, rels, RevisionKind::Insert)),
+                    "w:del" => para
+                        .content
+                        .push(parse_revision(p, rels, RevisionKind::Delete)),
+                    // A simple field: keep its XML verbatim (lossless save) but surface
+                    // its cached result text so the value is visible.
+                    "w:fldSimple" => parse_fld_simple(p, rels, &mut para.content),
+                    // A smart tag wraps runs in (deprecated) metadata; unwrap to its
+                    // inner content so the text isn't lost.
+                    "w:smartTag" => parse_inlines_into(p, rels, &mut para.content),
+                    // Inline content control (content placeholder, etc.): unwrap it.
+                    "w:sdt" => parse_inline_sdt(p, rels, &mut para.content),
+                    // OMML math: render it to a text equation (lossless raw kept).
+                    "m:oMath" | "m:oMathPara" => {
+                        let start = p.start_pos();
+                        p.skip_element();
+                        let raw = p.raw_slice(start, p.pos()).to_string();
+                        let text = crate::omath::render_omath(&raw);
+                        para.content.push(Inline::Equation {
+                            raw,
+                            text,
+                            latex: None,
+                        });
+                    }
+                    _ => parse_raw_or_unsupported_revision(p, &mut para.content),
                 }
-                "w:hyperlink" => parse_hyperlink_into(p, rels, &mut para.content),
-                // Tracked change: show the inserted/deleted text (instead of
-                // hiding it as opaque raw) while preserving the revision markup.
-                "w:ins" => para
-                    .content
-                    .push(parse_revision(p, rels, RevisionKind::Insert)),
-                "w:del" => para
-                    .content
-                    .push(parse_revision(p, rels, RevisionKind::Delete)),
-                // A simple field: keep its XML verbatim (lossless save) but surface
-                // its cached result text so the value is visible.
-                "w:fldSimple" => parse_fld_simple(p, rels, &mut para.content),
-                // A smart tag wraps runs in (deprecated) metadata; unwrap to its
-                // inner content so the text isn't lost.
-                "w:smartTag" => parse_inlines_into(p, rels, &mut para.content),
-                // Inline content control (content placeholder, etc.): unwrap it.
-                "w:sdt" => parse_inline_sdt(p, rels, &mut para.content),
-                // OMML math: render it to a text equation (lossless raw kept).
-                "m:oMath" | "m:oMathPara" => {
-                    let start = p.start_pos();
-                    p.skip_element();
-                    let raw = p.raw_slice(start, p.pos()).to_string();
-                    let text = crate::omath::render_omath(&raw);
-                    para.content.push(Inline::Equation {
-                        raw,
-                        text,
-                        latex: None,
-                    });
-                }
-                _ => parse_raw_or_unsupported_revision(p, &mut para.content),
-            },
+                fields.after_child(p, &mut para.content, n, start, name == "w:r");
+            }
             Event::End | Event::Eof => break,
             Event::Text => {}
         }
@@ -807,6 +812,140 @@ fn parse_paragraph(p: &mut XmlParser, rels: &Relationships) -> Paragraph {
         }
     }
     para
+}
+
+/// Collapses a complex field (`w:fldChar` begin, instruction, separate, cached
+/// result, end) into one [`Inline::Field`], so the editor treats it as a single
+/// unit instead of editable result text between invisible markers (#642).
+///
+/// One instance runs per inline loop, and only runs parsed *directly* by that
+/// loop open or close a field, so `raw` (the source slice from the begin run's
+/// `<w:r>` to the end run's `</w:r>`) is always well-formed: any element between
+/// them is inside it whole. A field is left as loose markers, exactly as before,
+/// when its end is never seen by the same loop (it spans paragraphs, or sits in
+/// another container), or when a child parsed between begin and end brought
+/// field markers of its own (an unwrapped smart tag or content control holding
+/// half of a field), since those can't be paired reliably.
+#[derive(Default)]
+struct FieldCollapse {
+    open: Option<OpenFieldSpan>,
+}
+
+struct OpenFieldSpan {
+    /// Nesting depth of `begin`s seen so far.
+    depth: usize,
+    /// Index in the loop's output of the begin run's inline.
+    idx: usize,
+    /// Source position of the begin run's `<w:r>`.
+    start: usize,
+    /// Set when a nested container brought field markers of its own.
+    broken: bool,
+}
+
+impl FieldCollapse {
+    /// Account for one child element the loop just parsed: it began at source
+    /// position `start` and pushed `out[n..]`.
+    fn after_child(
+        &mut self,
+        p: &XmlParser,
+        out: &mut Vec<Inline>,
+        n: usize,
+        start: usize,
+        is_run: bool,
+    ) {
+        use crate::field::FieldEvent;
+        if !is_run || out.len() != n + 1 {
+            if let Some(open) = self.open.as_mut() {
+                if out[n.min(out.len())..].iter().any(has_field_marker) {
+                    open.broken = true;
+                }
+            }
+            return;
+        }
+        let run = p.raw_slice(start, p.pos());
+        if !run.contains("<w:fldChar") {
+            return;
+        }
+        let events = crate::field::field_events(run);
+        for (k, event) in events.iter().enumerate() {
+            match event {
+                FieldEvent::Begin => match self.open.as_mut() {
+                    Some(open) => open.depth += 1,
+                    None => {
+                        self.open = Some(OpenFieldSpan {
+                            depth: 1,
+                            idx: n,
+                            start,
+                            broken: false,
+                        })
+                    }
+                },
+                FieldEvent::End => {
+                    let Some(open) = self.open.as_mut() else {
+                        continue;
+                    };
+                    open.depth -= 1;
+                    if open.depth > 0 {
+                        continue;
+                    }
+                    let open = self.open.take().expect("open field");
+                    // A new field starting later in this same run would be
+                    // swallowed by the slice; leave both as they are.
+                    let reopens = events[k + 1..]
+                        .iter()
+                        .any(|e| matches!(e, FieldEvent::Begin));
+                    if !open.broken && !reopens {
+                        collapse_field(out, open.idx, p.raw_slice(open.start, p.pos()));
+                    }
+                }
+                FieldEvent::Instr(_) | FieldEvent::Separate => {}
+            }
+        }
+    }
+}
+
+/// Whether an inline (or anything inside it) holds loose complex-field markers.
+fn has_field_marker(inline: &Inline) -> bool {
+    match inline {
+        Inline::Raw(raw) => raw.contains("<w:fldChar"),
+        Inline::Hyperlink(h) => h.content.iter().any(has_field_marker),
+        Inline::Revision { content, .. } => content.iter().any(has_field_marker),
+        _ => false,
+    }
+}
+
+/// Replace `out[idx..]` (a complex field's runs, begin to end) with one
+/// [`Inline::Field`] whose `raw` is their verbatim source and whose `text` is
+/// the outermost field's cached result, or its computed value (as for a
+/// `w:fldSimple`) when the instruction is one we evaluate.
+fn collapse_field(out: &mut Vec<Inline>, idx: usize, raw: &str) {
+    use crate::field::FieldEvent;
+    let mut depth = 0usize;
+    let mut separated = false;
+    let mut cached = String::new();
+    for inline in out.drain(idx..) {
+        match &inline {
+            Inline::Raw(r) if r.contains("<w:fldChar") => {
+                for event in crate::field::field_events(r) {
+                    match event {
+                        FieldEvent::Begin => depth += 1,
+                        FieldEvent::Separate if depth == 1 => separated = true,
+                        FieldEvent::End => depth = depth.saturating_sub(1),
+                        _ => {}
+                    }
+                }
+            }
+            _ if separated && depth >= 1 => cached.push_str(&inline.text()),
+            _ => {}
+        }
+    }
+    let text = crate::field::instr_of(raw)
+        .and_then(|instr| crate::field::eval_field(&instr))
+        .unwrap_or(cached);
+    out.push(Inline::Field {
+        raw: raw.to_string(),
+        text,
+    });
 }
 
 /// Parse a `<w:fldSimple>` field. Its inner runs hold the field's last-computed
@@ -864,27 +1003,32 @@ fn parse_inline_sdt(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inlin
 /// Parse inline content (runs, hyperlinks, nested content controls) up to the
 /// enclosing End, pushing into `out`.
 fn parse_inlines_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inline>) {
+    let mut fields = FieldCollapse::default();
     loop {
         match p.next() {
-            Event::Start => match p.name() {
-                "w:r" => {
-                    let start = p.start_pos();
-                    let mut tmp = Vec::new();
-                    if parse_run(p, &mut tmp) {
-                        let raw = p.raw_slice(start, p.pos()).to_string();
-                        out.push(drawing_inline(raw, rels));
-                    } else {
-                        out.extend(tmp);
+            Event::Start => {
+                let (name, start, n) = (p.name(), p.start_pos(), out.len());
+                match name {
+                    "w:r" => {
+                        let start = p.start_pos();
+                        let mut tmp = Vec::new();
+                        if parse_run(p, &mut tmp) {
+                            let raw = p.raw_slice(start, p.pos()).to_string();
+                            out.push(drawing_inline(raw, rels));
+                        } else {
+                            out.extend(tmp);
+                        }
                     }
+                    "w:hyperlink" => parse_hyperlink_into(p, rels, out),
+                    "w:ins" => out.push(parse_revision(p, rels, RevisionKind::Insert)),
+                    "w:del" => out.push(parse_revision(p, rels, RevisionKind::Delete)),
+                    "w:fldSimple" => parse_fld_simple(p, rels, out),
+                    "w:smartTag" => parse_inlines_into(p, rels, out),
+                    "w:sdt" => parse_inline_sdt(p, rels, out),
+                    _ => parse_raw_or_unsupported_revision(p, out),
                 }
-                "w:hyperlink" => parse_hyperlink_into(p, rels, out),
-                "w:ins" => out.push(parse_revision(p, rels, RevisionKind::Insert)),
-                "w:del" => out.push(parse_revision(p, rels, RevisionKind::Delete)),
-                "w:fldSimple" => parse_fld_simple(p, rels, out),
-                "w:smartTag" => parse_inlines_into(p, rels, out),
-                "w:sdt" => parse_inline_sdt(p, rels, out),
-                _ => parse_raw_or_unsupported_revision(p, out),
-            },
+                fields.after_child(p, out, n, start, name == "w:r");
+            }
             Event::End | Event::Eof => break,
             Event::Text => {}
         }
@@ -2508,6 +2652,191 @@ mod tests {
         // the field markers survive verbatim for a lossless save
         let out = crate::serialize::document_to_xml(&d);
         assert!(out.contains("PAGE") && out.contains("fldCharType=\"begin\""));
+    }
+
+    /// The five runs of a complex PAGE field whose cached result is `1`.
+    const PAGE_FIELD: &str = "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+        <w:r><w:instrText xml:space=\"preserve\"> PAGE \\* MERGEFORMAT </w:instrText></w:r>\
+        <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+        <w:r><w:rPr><w:noProof/></w:rPr><w:t>1</w:t></w:r>\
+        <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>";
+
+    fn para_doc(inner: &str) -> Document {
+        doc(&format!(
+            "<w:document><w:body><w:p>{inner}</w:p></w:body></w:document>"
+        ))
+    }
+
+    fn kinds(content: &[Inline]) -> Vec<&'static str> {
+        content
+            .iter()
+            .map(|i| match i {
+                Inline::Run(_) => "Run",
+                Inline::Field { .. } => "Field",
+                Inline::Raw(_) => "Raw",
+                Inline::Hyperlink(_) => "Hyperlink",
+                Inline::Revision { .. } => "Revision",
+                _ => "Other",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn complex_field_collapses_to_one_field_and_saves_verbatim_642() {
+        let d = para_doc(&format!("<w:r><w:t>Body</w:t></w:r>{PAGE_FIELD}"));
+        let p = first_para(&d);
+        assert_eq!(kinds(&p.content), ["Run", "Field"]);
+        match &p.content[1] {
+            Inline::Field { raw, text } => {
+                assert_eq!(raw, PAGE_FIELD, "raw is the begin..end source slice");
+                assert_eq!(text, "1");
+            }
+            other => panic!("expected a field, got {other:?}"),
+        }
+        let out = crate::serialize::document_to_xml(&d);
+        assert!(
+            out.contains(PAGE_FIELD),
+            "the five runs are saved byte for byte"
+        );
+        let again = doc(&out);
+        assert_eq!(kinds(&first_para(&again).content), ["Run", "Field"]);
+    }
+
+    #[test]
+    fn nested_complex_fields_collapse_into_the_outermost_642() {
+        // IF { PAGE } = 1 "first" "other" -> cached "first"
+        let inner = "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+            <w:r><w:instrText> IF </w:instrText></w:r>\
+            <w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+            <w:r><w:instrText> PAGE </w:instrText></w:r>\
+            <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+            <w:r><w:t>1</w:t></w:r>\
+            <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>\
+            <w:r><w:instrText> = 1 \"first\" \"other\" </w:instrText></w:r>\
+            <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+            <w:r><w:t>first</w:t></w:r>\
+            <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>";
+        let d = para_doc(&format!("<w:r><w:t>a</w:t></w:r>{inner}"));
+        let p = first_para(&d);
+        assert_eq!(kinds(&p.content), ["Run", "Field"]);
+        assert!(
+            matches!(&p.content[1], Inline::Field { raw, text } if raw == inner && text == "first")
+        );
+    }
+
+    #[test]
+    fn a_complex_formula_field_is_computed_like_its_simple_twin_642() {
+        let d = para_doc(
+            "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+             <w:r><w:instrText> = 2*(3+4) </w:instrText></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+             <w:r><w:t>0</w:t></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>",
+        );
+        assert!(matches!(&first_para(&d).content[0], Inline::Field { text, .. } if text == "14"));
+        // A field nested in the instruction is part of it: keep the cache.
+        let d = para_doc(
+            "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+             <w:r><w:instrText> = </w:instrText></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+             <w:r><w:instrText> PAGE </w:instrText></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+             <w:r><w:t>2</w:t></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>\
+             <w:r><w:instrText> + 1 </w:instrText></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+             <w:r><w:t>3</w:t></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>",
+        );
+        assert!(matches!(&first_para(&d).content[0], Inline::Field { text, .. } if text == "3"));
+    }
+
+    #[test]
+    fn a_field_without_result_collapses_with_empty_text_642() {
+        // An index entry: begin / instruction / end, no separate.
+        let xe = "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+            <w:r><w:instrText> XE \"term\" </w:instrText></w:r>\
+            <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>";
+        let d = para_doc(&format!("<w:r><w:t>term</w:t></w:r>{xe}"));
+        let p = first_para(&d);
+        assert_eq!(kinds(&p.content), ["Run", "Field"]);
+        assert!(
+            matches!(&p.content[1], Inline::Field { raw, text } if raw == xe && text.is_empty())
+        );
+        assert!(crate::serialize::document_to_xml(&d).contains(xe));
+    }
+
+    #[test]
+    fn fields_that_cannot_collapse_stay_loose_markers_642() {
+        let begin = "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+            <w:r><w:instrText> TOC \\o </w:instrText></w:r>\
+            <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>";
+        let end = "<w:r><w:fldChar w:fldCharType=\"end\"/></w:r>";
+        // Begin and end in different paragraphs (a TOC).
+        let d = doc(&format!(
+            "<w:document><w:body><w:p>{begin}<w:r><w:t>One</w:t></w:r></w:p>\
+             <w:p><w:r><w:t>Two</w:t></w:r>{end}</w:p></w:body></w:document>"
+        ));
+        let paras: Vec<_> = d
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => Some(kinds(&p.content)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            paras,
+            [vec!["Raw", "Raw", "Raw", "Run"], vec!["Run", "Raw"]]
+        );
+        // No end at all.
+        let d = para_doc(&format!("{begin}<w:r><w:t>x</w:t></w:r>"));
+        assert_eq!(kinds(&first_para(&d).content), ["Raw", "Raw", "Raw", "Run"]);
+        // Begin outside a hyperlink, end inside it.
+        let d = para_doc(&format!(
+            "{begin}<w:hyperlink w:anchor=\"a\"><w:r><w:t>x</w:t></w:r>{end}</w:hyperlink>"
+        ));
+        assert!(
+            !first_para(&d)
+                .content
+                .iter()
+                .any(|i| matches!(i, Inline::Field { .. }))
+        );
+        // Begin at paragraph level, end inside an (unwrapped) smart tag: not
+        // collapsed, and the saved XML still closes every element it opens.
+        let d = para_doc(&format!(
+            "{begin}<w:r><w:t>x</w:t></w:r><w:smartTag w:element=\"place\">{end}</w:smartTag>\
+             <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>"
+        ));
+        assert!(
+            !first_para(&d)
+                .content
+                .iter()
+                .any(|i| matches!(i, Inline::Field { .. }))
+        );
+        let out = crate::serialize::document_to_xml(&d);
+        assert_eq!(
+            out.matches("<w:smartTag").count(),
+            out.matches("</w:smartTag>").count()
+        );
+    }
+
+    #[test]
+    fn a_whole_field_inside_a_tracked_change_or_link_collapses_there_642() {
+        let d = para_doc(&format!(
+            "<w:ins w:id=\"1\" w:author=\"A\">{PAGE_FIELD}</w:ins>\
+             <w:hyperlink w:anchor=\"_Toc1\"><w:r><w:t>Intro</w:t></w:r>{PAGE_FIELD}</w:hyperlink>"
+        ));
+        let p = first_para(&d);
+        assert_eq!(kinds(&p.content), ["Revision", "Hyperlink"]);
+        match &p.content[0] {
+            Inline::Revision { content, .. } => assert_eq!(kinds(content), ["Field"]),
+            _ => unreachable!(),
+        }
+        match &p.content[1] {
+            Inline::Hyperlink(h) => assert_eq!(kinds(&h.content), ["Run", "Field"]),
+            _ => unreachable!(),
+        }
     }
 
     #[test]

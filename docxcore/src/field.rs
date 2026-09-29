@@ -872,12 +872,91 @@ fn xml_unescape(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
-/// Extract the `w:instr` value (entity-decoded) from a `<w:fldSimple>`'s raw XML.
+/// A complex field's markers (`w:fldChar` / `w:instrText`) in raw run XML.
+pub(crate) enum FieldEvent {
+    Begin,
+    /// An instruction fragment, verbatim (not entity-decoded).
+    Instr(String),
+    Separate,
+    End,
+}
+
+/// The complex-field markers in `raw`, in document order.
+pub(crate) fn field_events(raw: &str) -> Vec<FieldEvent> {
+    let mut events: Vec<(usize, FieldEvent)> = Vec::new();
+    for (start, el) in start_tags(raw, "w:fldChar") {
+        let kind = el.find("w:fldCharType=\"").map(|i| {
+            let v = &el[i + "w:fldCharType=\"".len()..];
+            &v[..v.find('"').unwrap_or(v.len())]
+        });
+        match kind {
+            Some("begin") => events.push((start, FieldEvent::Begin)),
+            Some("separate") => events.push((start, FieldEvent::Separate)),
+            Some("end") => events.push((start, FieldEvent::End)),
+            _ => {}
+        }
+    }
+    for (start, el) in start_tags(raw, "w:instrText") {
+        if el.ends_with("/>") {
+            continue;
+        }
+        let body_start = start + el.len();
+        let body_end = raw[body_start..]
+            .find("</w:instrText>")
+            .map_or(raw.len(), |e| body_start + e);
+        events.push((
+            start,
+            FieldEvent::Instr(raw[body_start..body_end].to_string()),
+        ));
+    }
+    events.sort_by_key(|(pos, _)| *pos);
+    events.into_iter().map(|(_, e)| e).collect()
+}
+
+/// Every `<tag …>` start tag in `xml`, with its byte offset.
+fn start_tags<'a>(xml: &'a str, tag: &str) -> Vec<(usize, &'a str)> {
+    let needle = format!("<{tag}");
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(off) = xml[from..].find(&needle) {
+        let start = from + off;
+        let after = start + needle.len();
+        from = after;
+        if xml[after..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_whitespace() || c == '/' || c == '>')
+        {
+            let end = xml[start..].find('>').map_or(xml.len(), |e| start + e + 1);
+            out.push((start, &xml[start..end]));
+        }
+    }
+    out
+}
+
+/// Extract a field's instruction (entity-decoded) from its raw XML: the
+/// `w:instr` of a `<w:fldSimple>`, or, for a complex field (`fldChar` begin …
+/// end), the outermost field's `w:instrText` up to its `separate`. `None` when
+/// a field is nested in that instruction (`= { PAGE } + 1`): its value is part
+/// of the instruction, so the instruction text alone can't be evaluated.
 pub(crate) fn instr_of(raw: &str) -> Option<String> {
-    let k = "w:instr=\"";
-    let s = raw.find(k)? + k.len();
-    let e = raw[s..].find('"')? + s;
-    Some(xml_unescape(&raw[s..e]))
+    if raw.trim_start().starts_with("<w:fldSimple") {
+        let k = "w:instr=\"";
+        let s = raw.find(k)? + k.len();
+        let e = raw[s..].find('"')? + s;
+        return Some(xml_unescape(&raw[s..e]));
+    }
+    let mut instr: Option<String> = None;
+    for event in field_events(raw) {
+        match (event, instr.as_mut()) {
+            (FieldEvent::Begin, None) => instr = Some(String::new()),
+            (FieldEvent::Begin, Some(_)) => return None,
+            (FieldEvent::Instr(text), Some(i)) => i.push_str(&text),
+            (FieldEvent::Separate | FieldEvent::End, Some(_)) => break,
+            _ => {}
+        }
+    }
+    instr.map(|i| xml_unescape(&i))
 }
 
 /// Recompute every simple field in the document against `ctx`, replacing its
@@ -967,6 +1046,39 @@ mod tests {
         assert_eq!(ev("= 4 \\* roman").as_deref(), Some("IV"));
         assert_eq!(ev("= 3 \\* ordinal").as_deref(), Some("3rd"));
         assert_eq!(ev("= 27 \\* alphabetic").as_deref(), Some("AA"));
+    }
+
+    #[test]
+    fn instr_of_reads_simple_and_complex_fields_642() {
+        assert_eq!(
+            instr_of("<w:fldSimple w:instr=\" DATE \\@ &quot;M/d&quot; \"/>").as_deref(),
+            Some(" DATE \\@ \"M/d\" ")
+        );
+        let complex = "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+            <w:r><w:instrText xml:space=\"preserve\"> PAGE </w:instrText></w:r>\
+            <w:r><w:instrText>\\* roman </w:instrText></w:r>\
+            <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+            <w:r><w:t>iv</w:t></w:r>\
+            <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>";
+        assert_eq!(instr_of(complex).as_deref(), Some(" PAGE \\* roman "));
+        // No separate (an index entry): the instruction runs to the end.
+        let xe = "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+            <w:r><w:instrText> XE &quot;a&quot; </w:instrText></w:r>\
+            <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>";
+        assert_eq!(instr_of(xe).as_deref(), Some(" XE \"a\" "));
+        // A field nested in the instruction makes it unevaluable.
+        let nested = "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+            <w:r><w:instrText> = </w:instrText></w:r>\
+            <w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+            <w:r><w:instrText> PAGE </w:instrText></w:r>\
+            <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>\
+            <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>";
+        assert_eq!(instr_of(nested), None);
+        // A symbol run is not a field.
+        assert_eq!(
+            instr_of("<w:r><w:sym w:font=\"Symbol\" w:char=\"F0B7\"/></w:r>"),
+            None
+        );
     }
 
     #[test]
