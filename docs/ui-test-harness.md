@@ -588,6 +588,8 @@ no menu, `"document"` on a Project, and the targets without a menu yet
 (`cell`, `bar`, `column`, the ribbon's own right-click); `menu-click` with no
 menu open, on a disabled item, an unknown or ambiguous label, a heading, or an
 item that opens a submenu; `menu-click` and `menu-close` under a dialog;
+`menu-open` and `menu-click` while File (the backstage) or the more-tabs list
+is open, since the window draws no menu then;
 `menu-close` with no menu open. `menu-click` also refuses when the menu no
 longer fits its target: a row menu whose task is no longer the selected one,
 or the document menu on a Project.
@@ -597,7 +599,8 @@ another tab, the backstage, a command run from anywhere, a control-pipe verb
 that edits, reloads, saves or focuses the plan, and every harness verb that
 stands for a press outside the menu (`click-cell`, `drag`, `select-chart`,
 `focus-field`, `ribbon-click`, `title-tab`, `close-tab`, `selection-set`,
-`open`, `backstage`, `backstage-close`, `theme-set`, `ask-on-close` and the
+`open`, `backstage` open and close (not `read`), `backstage-close`,
+`theme-set`, `ask-on-close` and the
 `dialog-*` drivers), which closes it first and then goes on, as the press
 would. Reads leave it open.
 

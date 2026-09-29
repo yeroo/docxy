@@ -155,3 +155,50 @@ test a press outside a menu, another tab or a command closes it first
   assert menu is nothing
   call-error menu-click {"label":"Bold"} => no menu is open
   call-error menu-close {} => no menu is open
+
+test a key under an open menu closes it and goes no further
+  open copy:../fixtures/basic.docx
+  type hello
+  call menu-open {"target":"document"}
+  # The first key closes the menu and is swallowed: no x is typed.
+  type x
+  assert menu is nothing
+  assert text is hello
+  open copy:../fixtures/gantt-summary.xml
+  click C2
+  assert cell is Name
+  call menu-open {"target":{"row":3}}
+  assert cell is Name
+  # Tab would move the cursor a column; under the menu it only closes it.
+  key tab
+  assert menu is nothing
+  assert cell is Name
+  assert selected_name is Task 3
+
+test no menu opens or runs while File or the more-tabs list covers the tab
+  open copy:../fixtures/gantt-summary.xml
+  call backstage {"action":"open"}
+  call-error menu-open {"target":{"row":3}} => File (backstage) is open
+  assert selected_name is Task 1
+  assert tasks is 3
+  call backstage {"action":"close"}
+  call menu-open {"target":{"row":3}}
+  # Reading the backstage is a read: the menu stays.
+  call backstage {"action":"read"}
+  assert menu.target.row is 3
+  call backstage {"action":"open"}
+  assert menu is nothing
+  call-error menu-click {"label":"Delete Task"} => File (backstage) is open
+  assert tasks is 3
+
+test a control-pipe edit closes an open menu without the harness's press rule
+  open copy:../fixtures/gantt-summary.xml
+  call menu-open {"target":{"row":3}}
+  # A read over the pipe leaves it open.
+  call task.list {}
+  assert menu.target.row is 3
+  # An edit over the pipe drops the menu, as it drops the tab's dialogs.
+  call task.set {"uid":2,"duration":"3d"}
+  assert menu is nothing
+  call-error menu-click {"label":"Delete Task"} => no menu is open
+  assert tasks is 3
