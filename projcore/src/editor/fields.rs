@@ -589,21 +589,22 @@ fn grid_days(proj: &Project, min: i64) -> String {
 }
 
 /// Start or Finish Variance: working minutes from the Baseline date to the
-/// shown one on the task's calendar, negative when the shown date is earlier.
+/// scheduled one on the task's calendar, negative when the scheduled date is
+/// earlier.
 fn date_variance(
     proj: &Project,
     task: &Task,
-    shown: Option<DateTime>,
+    scheduled: Option<DateTime>,
     baseline: Option<DateTime>,
     unit: DurationUnit,
 ) -> FieldRead {
-    let min = match (shown, baseline) {
+    let min = match (scheduled, baseline) {
         (_, None) => Some(0),
         (None, Some(_)) => None,
-        (Some(shown), Some(base)) => Some(if shown >= base {
-            working_minutes_between_on(proj, task.calendar_uid, base, shown)
+        (Some(scheduled), Some(base)) => Some(if scheduled >= base {
+            working_minutes_between_on(proj, task.calendar_uid, base, scheduled)
         } else {
-            -working_minutes_between_on(proj, task.calendar_uid, shown, base)
+            -working_minutes_between_on(proj, task.calendar_uid, scheduled, base)
         }),
     };
     duration(proj, min, unit)

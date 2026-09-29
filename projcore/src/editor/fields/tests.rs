@@ -598,7 +598,23 @@ fn wbs_is_the_stored_code_else_the_live_outline_number() {
 
 #[test]
 fn a_baseline_set_while_leveled_records_the_saved_schedule() {
-    let mut ed = editor(vec![task(1, "A", 960), task(2, "B", 480)]);
+    // Under a summary, whose Duration is its span: leveling stretches the
+    // shown span, but the variance measures the scheduled one.
+    let phase = Task {
+        summary: true,
+        id: 3,
+        ..task(10, "Phase", 0)
+    };
+    let under = |t: Task| Task {
+        outline_level: 2,
+        ..t
+    };
+    let mut ed = editor(vec![
+        phase,
+        under(task(1, "A", 960)),
+        under(task(2, "B", 480)),
+    ]);
+    assert_eq!(read(&ed, 10, "Summary").text, "Yes");
     ed.assign_resource(1, "Alice").unwrap();
     ed.assign_resource(2, "Alice").unwrap();
     ed.toggle_level();
@@ -607,6 +623,11 @@ fn a_baseline_set_while_leveled_records_the_saved_schedule() {
         .into_iter()
         .find(|&uid| ed.disp_start(uid) != Some(early(&ed, uid)))
         .expect("leveling delays one of the two");
+    assert_ne!(
+        ed.disp_duration_min(10),
+        crate::schedule::task_duration_min(ed.project(), ed.schedule(), &ed.project().tasks[0]),
+        "leveling stretches the summary's shown span"
+    );
     ed.set_baseline();
     // Leveling is a view: the baseline is the CPM schedule a save writes,
     // and the variances measure that schedule too.
@@ -619,7 +640,7 @@ fn a_baseline_set_while_leveled_records_the_saved_schedule() {
         read(&ed, delayed, "Baseline Start").value
     );
     let variances = |ed: &Editor| {
-        for uid in [1, 2] {
+        for uid in [10, 1, 2] {
             for name in ["Start Variance", "Finish Variance", "Duration Variance"] {
                 assert_eq!(
                     tv(ed, uid, name),
