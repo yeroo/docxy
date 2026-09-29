@@ -52,6 +52,14 @@ pub(super) struct ProjectView {
     /// The table pane width the user dragged the split bar to; `None` is the
     /// default. Window view state, never saved.
     pub split: Option<f32>,
+    /// A resource-levelling pass that has been asked for but not yet run:
+    /// its token and the leveled state it sets. The status bar says `Busy`
+    /// while it is here; see [`request_level_pass`].
+    pub busy: Option<(u64, bool)>,
+    /// The token of the pending pass whose frame callback render has already
+    /// registered, so it registers once. A callback whose token no longer
+    /// matches `busy` does nothing.
+    pub scheduled: Option<u64>,
 }
 
 impl ProjectView {
@@ -79,6 +87,8 @@ impl ProjectView {
             show_critical: true,
             show_baseline: true,
             split: None,
+            busy: None,
+            scheduled: None,
         }
     }
 
@@ -689,6 +699,10 @@ pub(super) fn save_decision(tab: &DocTab, harness: bool, explicit_save_as: bool)
 }
 
 pub(super) fn apply_save(tab: &mut DocTab, target: &Path) -> Result<usize, String> {
+    // Levelling changes only the displayed dates, not what is written, but a
+    // pass asked for runs first so the save's message is the last word and
+    // the tab it reports on is settled.
+    flush_level_pass(tab);
     if !commit_project_cell(tab) {
         return Err(tab.status.to_string());
     }
@@ -818,6 +832,28 @@ fn date(dt: Option<projcore::DateTime>) -> String {
         format!("{:04}-{:02}-{:02}", p.year, p.month, p.day)
     })
     .unwrap_or_else(|| "—".into())
+}
+
+/// The status bar's `New Tasks: …` item.
+pub(crate) fn new_tasks_label(manual: bool) -> String {
+    format!("New Tasks: {}", task_mode_name(manual))
+}
+
+/// The status bar's items as `status-read` reports them, left to right, each
+/// with a stable id: on a Project tab the state, the new-tasks mode and the
+/// last message; on any other tab the message alone. Render draws the same
+/// texts from the same functions, so the two cannot drift.
+pub(crate) fn status_items(tab: &DocTab) -> Vec<(&'static str, String)> {
+    let mut items = Vec::new();
+    if let Surface::Project(v) = &tab.surface {
+        items.push(("state", project_app_state(v).label().to_string()));
+        items.push((
+            "new-tasks",
+            new_tasks_label(v.ed.project().new_tasks_are_manual),
+        ));
+    }
+    items.push(("message", tab.status.to_string()));
+    items
 }
 
 /// A task's mode as Project's Task Mode column shows it.

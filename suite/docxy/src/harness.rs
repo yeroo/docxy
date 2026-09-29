@@ -1080,11 +1080,21 @@ fn ribbon_surface(app: &crate::Docxy) -> Result<(), String> {
     }
 }
 
-/// One live status-line item in the order the app draws it.
-fn status_json(status: &str) -> Json {
+/// The live status-line items in the order the app draws them.
+fn status_json(items: &[(&str, String)]) -> Json {
     Json::obj(vec![(
         "items",
-        Json::Arr(vec![Json::obj(vec![("text", Json::Str(status.into()))])]),
+        Json::Arr(
+            items
+                .iter()
+                .map(|(id, text)| {
+                    Json::obj(vec![
+                        ("id", Json::Str((*id).into())),
+                        ("text", Json::Str(text.clone())),
+                    ])
+                })
+                .collect(),
+        ),
     )])
 }
 
@@ -1450,6 +1460,16 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
             ),
         ),
         ("sheet_tab", Json::Bool(app.active_is_sheet())),
+        // The Project status bar's Ready / Edit / Busy; null off a Project.
+        (
+            "app_state",
+            match app.tabs.get(app.active).map(|t| &t.surface) {
+                Some(crate::Surface::Project(v)) => {
+                    Json::Str(crate::project_app_state(v).label().into())
+                }
+                _ => Json::Null,
+            },
+        ),
     ];
     if let Some(v) = app.active_sheet() {
         out.extend([
@@ -1526,6 +1546,11 @@ pub fn dispatch(
     window: &mut Window,
     cx: &mut Context<crate::Docxy>,
 ) -> Result<Done, String> {
+    // A levelling pass asked for by an earlier verb runs before this one
+    // reads or changes anything, so every reply sees a settled plan whether
+    // or not a frame ran in between. The verb that asks for one replies
+    // before it runs, with `app_state` "Busy".
+    app.flush_project_passes(cx);
     match verb {
         "window-zoom" => {
             window.zoom_window();
@@ -1656,7 +1681,7 @@ pub fn dispatch(
         }
         "status-read" => {
             let tab = app.tabs.get(app.active).ok_or("there is no active tab")?;
-            Done::ok(status_json(&tab.status))
+            Done::ok(status_json(&crate::status_items(tab)))
         }
         "backstage" => {
             match arg_str(args, "action")? {
@@ -2634,24 +2659,13 @@ mod tests {
         let err = resolve_commands(&commands, "Home", "Same").err().unwrap();
         assert!(err.contains("one, two"));
         assert!(resolve_commands(&commands, "Home", "one").is_ok());
-        assert_eq!(
-            status_json("saved")
-                .get("items")
-                .unwrap()
-                .as_array()
-                .unwrap()[0]
-                .get_str("text"),
-            Some("saved")
-        );
-        assert_eq!(
-            status_json("changed")
-                .get("items")
-                .unwrap()
-                .as_array()
-                .unwrap()[0]
-                .get_str("text"),
-            Some("changed")
-        );
+        let json = status_json(&[("state", "Ready".into()), ("message", "saved".into())]);
+        let items = json.get("items").unwrap().as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].get_str("id"), Some("state"));
+        assert_eq!(items[0].get_str("text"), Some("Ready"));
+        assert_eq!(items[1].get_str("id"), Some("message"));
+        assert_eq!(items[1].get_str("text"), Some("saved"));
     }
 
     fn args(list: &[&str]) -> Vec<OsString> {

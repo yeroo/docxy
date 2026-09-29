@@ -10987,6 +10987,7 @@ impl Docxy {
     }
 
     fn select_tab(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_project_passes(cx);
         self.project_prompt_cancel();
         if i < self.tabs.len() {
             self.active = i;
@@ -19365,6 +19366,7 @@ impl Render for Docxy {
         // entries cannot survive — a chart that was deleted simply does not
         // record itself again.
         self.frame = self.frame.wrapping_add(1);
+        self.schedule_project_passes(window, cx);
         {
             let mut p = self.probes.borrow_mut();
             p.last = std::mem::take(&mut p.next);
@@ -20246,8 +20248,12 @@ impl Render for Docxy {
             };
         // Project's status bar names the plan's mode for new tasks; a click
         // switches it.
+        // Its leftmost item is the application state, as in Project.
         let new_tasks = match self.tabs.get(self.active).map(|t| &t.surface) {
-            Some(Surface::Project(v)) => Some(v.ed.project().new_tasks_are_manual),
+            Some(Surface::Project(v)) => Some((
+                project_app_state(v).label(),
+                v.ed.project().new_tasks_are_manual,
+            )),
             _ => None,
         };
         let status = h_flex()
@@ -20258,16 +20264,17 @@ impl Render for Docxy {
             .bg(panel)
             .text_size(px(11.))
             .text_color(dim)
-            .when_some(new_tasks, |d, manual| {
-                d.child(
+            .when_some(new_tasks, |d, (state, manual)| {
+                // Wide enough for the longest label, so the row does not
+                // shift as the state changes.
+                d.child(div().id("app-state").min_w(px(30.)).child(state))
+                    .child(div().child("·"))
+                    .child(
                     div()
                         .id("new-tasks-mode")
                         .cursor_pointer()
                         .hover(|d| d.text_color(fg))
-                        .child(SharedString::from(format!(
-                            "New Tasks: {}",
-                            task_mode_name(manual)
-                        )))
+                        .child(SharedString::from(new_tasks_label(manual)))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.project_act(ProjectAct::NewTasksMode, window, cx)
                         })),

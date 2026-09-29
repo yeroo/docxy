@@ -35,6 +35,7 @@ fn commit_pending_for_close(tab: &mut DocTab) -> Result<(), String> {
 /// header/footer mode.
 pub(crate) fn commit_pending_for_exit(tabs: &mut [DocTab]) {
     for tab in tabs {
+        flush_level_pass(tab);
         let _ = commit_project_cell(tab);
         commit_changed_cell(tab);
         flush_hf_tab(tab);
@@ -110,6 +111,7 @@ impl Docxy {
         if i >= self.tabs.len() {
             return;
         }
+        self.flush_project_passes(cx);
         self.project_prompt_cancel();
         let previous_active = self.active;
         let harness = self.harness.is_some();

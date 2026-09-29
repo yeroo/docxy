@@ -2606,3 +2606,166 @@ fn ctrl_delete_inside_an_open_cell_edit_stays_in_the_editor() {
     assert_eq!(v(&t).ed.project(), &before);
     assert_eq!(v(&t).ed.undo_depth(), 0);
 }
+
+#[test]
+fn app_state_is_busy_over_edit_over_ready() {
+    let mut t = tab();
+    assert_eq!(project_app_state(v(&t)), AppState::Ready);
+    press(&mut t, "f2");
+    assert_eq!(project_app_state(v(&t)), AppState::Edit, "cell editor");
+    press(&mut t, "escape");
+    assert_eq!(project_app_state(v(&t)), AppState::Ready);
+    apply_project_act(&mut t, ProjectAct::Find);
+    assert_eq!(project_app_state(v(&t)), AppState::Edit, "prompt");
+    press(&mut t, "escape");
+    assert_eq!(project_app_state(v(&t)), AppState::Ready);
+    // Not reachable through the UI (asking for a pass commits the cell, and
+    // input runs a pending pass before it opens one), but defined.
+    press(&mut t, "f2");
+    vm(&mut t).busy = Some((0, true));
+    assert_eq!(project_app_state(v(&t)), AppState::Busy);
+    assert_eq!(
+        [AppState::Ready, AppState::Edit, AppState::Busy].map(AppState::label),
+        ["Ready", "Edit", "Busy"]
+    );
+}
+
+#[test]
+fn a_level_pass_is_asked_for_then_run_by_a_flush() {
+    let mut t = tab();
+    t.status = "before".into();
+    request_level_pass(&mut t, ProjectAct::LevelAll).unwrap();
+    // Asked for, not run: the plan and the message are as they were.
+    assert_eq!(project_app_state(v(&t)), AppState::Busy);
+    assert!(!v(&t).ed.leveled());
+    assert_eq!(t.status.as_ref(), "before");
+    assert!(flush_level_pass(&mut t));
+    assert_eq!(project_app_state(v(&t)), AppState::Ready);
+    assert!(v(&t).ed.leveled());
+    assert_eq!(
+        t.status.as_ref(),
+        "Resource leveling ON — bars delayed to fit resource capacity"
+    );
+    assert!(!flush_level_pass(&mut t), "nothing left to run");
+    request_level_pass(&mut t, ProjectAct::ClearLeveling).unwrap();
+    assert!(flush_level_passes(std::slice::from_mut(&mut t)));
+    assert!(!v(&t).ed.leveled());
+    assert_eq!(t.status.as_ref(), "Resource leveling OFF");
+}
+
+#[test]
+fn level_twice_is_a_round_trip() {
+    let mut t = tab();
+    for leveled in [true, false] {
+        request_level_pass(&mut t, ProjectAct::Level).unwrap();
+        flush_level_pass(&mut t);
+        assert_eq!(v(&t).ed.leveled(), leveled);
+    }
+    // A second request runs the first before it resolves its own target.
+    request_level_pass(&mut t, ProjectAct::LevelAll).unwrap();
+    request_level_pass(&mut t, ProjectAct::Level).unwrap();
+    assert!(v(&t).ed.leveled(), "the Level All ran first");
+    flush_level_pass(&mut t);
+    assert!(!v(&t).ed.leveled(), "then Level turned it off");
+}
+
+#[test]
+fn keys_clicks_and_prompts_run_a_pending_pass_before_they_reach_the_plan() {
+    let busy = || {
+        let mut t = tab();
+        request_level_pass(&mut t, ProjectAct::LevelAll).unwrap();
+        t
+    };
+    let settled = |t: &DocTab, how: &str| {
+        assert!(v(t).busy.is_none(), "{how}");
+        assert!(v(t).ed.leveled(), "{how}");
+    };
+    // A key that opens the cell editor: the pass runs first, so the editor
+    // is open over a settled plan (Edit, never Busy with an editor).
+    let mut t = busy();
+    assert_eq!(
+        project_input(&mut t, "f2", None, Modifiers::default()),
+        None
+    );
+    settled(&t, "F2");
+    assert_eq!(project_app_state(v(&t)), AppState::Edit);
+    // A typed edit lands after the pass, so Undo takes back the edit and
+    // leaves the levelling the user asked for first.
+    let mut t = busy();
+    project_input(&mut t, "x", Some("x"), Modifiers::default());
+    settled(&t, "typing");
+    project_input(&mut t, "enter", None, Modifiers::default());
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert!(
+        v(&t).ed.leveled(),
+        "Undo reverts the edit, not the levelling"
+    );
+    let mut t = busy();
+    project_cell_click(&mut t, 0, Some(COL_NAME), true);
+    settled(&t, "double-click");
+    let mut t = busy();
+    project_entry_click(&mut t, Some(COL_NAME), false);
+    settled(&t, "entry row click");
+    let mut t = busy();
+    project_below_click(&mut t);
+    settled(&t, "click below the rows");
+    let mut t = busy();
+    toggle_project_collapse(&mut t, 1);
+    settled(&t, "outline toggle");
+    let mut t = busy();
+    vm(&mut t).open_prompt(PromptKind::Find);
+    let p = vm(&mut t).prompt.take().unwrap();
+    commit_prompt(&mut t, p);
+    settled(&t, "prompt commit");
+}
+
+#[test]
+fn a_frame_callback_runs_only_its_own_pass() {
+    let mut t = tab();
+    let stale = request_level_pass(&mut t, ProjectAct::LevelAll).unwrap();
+    vm(&mut t).scheduled = Some(stale);
+    // A harness verb flushed it, and a new pass was asked for before the
+    // stale callback fired: that callback must not run the new pass early.
+    flush_level_pass(&mut t);
+    assert_eq!(v(&t).scheduled, None);
+    let fresh = request_level_pass(&mut t, ProjectAct::ClearLeveling).unwrap();
+    assert_ne!(stale, fresh);
+    assert!(!finish_level_pass(&mut t, stale));
+    assert_eq!(project_app_state(v(&t)), AppState::Busy);
+    assert!(v(&t).ed.leveled());
+    assert!(finish_level_pass(&mut t, fresh));
+    assert!(!v(&t).ed.leveled());
+    assert_eq!(project_app_state(v(&t)), AppState::Ready);
+}
+
+#[test]
+fn asking_for_a_pass_commits_the_cell_and_closes_the_prompt() {
+    let mut t = tab();
+    press(&mut t, "f2");
+    request_level_pass(&mut t, ProjectAct::LevelAll).unwrap();
+    assert!(v(&t).cell.is_none());
+    apply_project_act(&mut t, ProjectAct::Find);
+    request_level_pass(&mut t, ProjectAct::Level).unwrap();
+    assert!(v(&t).prompt.is_none());
+}
+
+#[test]
+fn status_items_are_the_state_the_mode_and_the_message_in_order() {
+    let mut t = tab();
+    t.status = "loaded — 2 tasks".into();
+    let items = |t: &DocTab| status_items(t);
+    assert_eq!(
+        items(&t),
+        [
+            ("state", "Ready".to_string()),
+            ("new-tasks", "New Tasks: Auto Scheduled".to_string()),
+            ("message", "loaded — 2 tasks".to_string()),
+        ]
+    );
+    request_level_pass(&mut t, ProjectAct::LevelAll).unwrap();
+    assert_eq!(items(&t)[0], ("state", "Busy".to_string()));
+    // Any other surface has only the message.
+    t.surface = Surface::Placeholder;
+    t.status = "saved".into();
+    assert_eq!(items(&t), [("message", "saved".to_string())]);
+}
