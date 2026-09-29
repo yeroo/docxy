@@ -917,16 +917,17 @@ impl Editor {
                 rescale_work(proj, i, old, new);
             }
         })?;
-        // Only a date change restamps: a rename or a level change keeps the
-        // Finish Project wrote, which our schedule can still differ from
-        // (recurring calendar exceptions are not scheduled). A blank row's
-        // new dates are stamped by edit_row; a newly pinned task's here.
+        // Only a date change restamps a manual task. An auto task's stored
+        // dates never reach a save (it writes the schedule's), so a rename or
+        // a level change need not touch them. A blank row's new dates are
+        // stamped by edit_row; a newly pinned task's here.
         if duration_changed || (mode_changed && patch.manual == Some(true)) {
             self.stamp_pinned_dates(uid);
         }
-        // A summary made automatic saves the span it now rolls up to, not
-        // the manual dates stamped on it.
-        if mode_changed && patch.manual == Some(false) && self.proj.tasks[i].summary {
+        // A task made automatic moves to where it is now scheduled, as in
+        // Project: its stored dates drop the manual ones stamped on it, which
+        // would otherwise still anchor or stretch the timeline (#343).
+        if mode_changed && patch.manual == Some(false) {
             self.stamp_dates(i);
         }
         Ok(())
@@ -4788,6 +4789,57 @@ mod tests {
             assert_edit(&mut ed, |e| e.set_manual(2, false).unwrap());
             assert_eq!(mode(&ed, 2), (false, None, None, None));
             assert_eq!(ed.disp_start(2), linked, "placed by its link again");
+        }
+    }
+
+    /// Issue #343: manual tasks typed at 3/11 and 3/14, switched to auto,
+    /// move to where they are scheduled and save those dates, not the typed
+    /// ones.
+    #[test]
+    fn a_task_switched_to_auto_saves_its_scheduled_dates() {
+        let at = |day, hour| DateTime::from_ymd_hm(2026, 3, day, hour, 0);
+        let pinned = |uid, start: DateTime, finish: DateTime| Task {
+            uid,
+            id: uid,
+            name: format!("Task {uid}"),
+            outline_level: 1,
+            duration_min: 960,
+            manual: true,
+            manual_start: Some(start),
+            manual_finish: Some(finish),
+            manual_duration_min: Some(960),
+            stored_start: Some(start),
+            stored_finish: Some(finish),
+            ..Task::default()
+        };
+        let mut ed = Editor::new(Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![
+                pinned(1, at(11, 8), at(12, 17)),
+                pinned(2, at(14, 8), at(16, 17)),
+            ],
+            ..Project::default()
+        });
+        for uid in [1, 2] {
+            assert_edit(&mut ed, |e| e.set_manual(uid, false).unwrap());
+        }
+        let xml = crate::mspdi::write_mspdi(ed.project());
+        for uid in [1, 2] {
+            assert_eq!(saved(&ed, uid), (Some(at(2, 8)), Some(at(3, 17))));
+            let r = ed.schedule().get(uid).unwrap();
+            assert_eq!((r.early_start, r.early_finish), (at(2, 8), at(3, 17)));
+            let from = xml.find(&format!("<UID>{uid}</UID>")).unwrap();
+            let task = &xml[from..from + xml[from..].find("</Task>").unwrap()];
+            for tag in [
+                "<Manual>0</Manual>",
+                "<Start>2026-03-02T08:00:00</Start>",
+                "<Finish>2026-03-03T17:00:00</Finish>",
+                "<EarlyStart>2026-03-02T08:00:00</EarlyStart>",
+                "<EarlyFinish>2026-03-03T17:00:00</EarlyFinish>",
+            ] {
+                assert!(task.contains(tag), "{tag} in {task}");
+            }
+            assert!(!task.contains("<ManualStart>"), "{task}");
         }
     }
 
