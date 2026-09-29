@@ -182,3 +182,38 @@ fn a_cell_is_addressed_by_drawn_row_or_by_uid_and_column() {
     assert!(refused(r#"{"uid":1,"column":8}"#).contains("No Project column"));
     assert!(refused(r#"{"uid":"1","column":0}"#).contains("'uid'"));
 }
+
+#[test]
+fn an_external_task_reads_external_even_as_a_summary_but_a_blank_stays_blank() {
+    let task = |uid: i32, level: u32, summary: bool, is_null: bool| Task {
+        uid,
+        id: uid,
+        name: if is_null {
+            String::new()
+        } else {
+            format!("Task {uid}")
+        },
+        outline_level: level,
+        summary,
+        is_null,
+        external_task: Some(true),
+        ..Task::default()
+    };
+    let mut p = Project::default();
+    p.tasks = vec![
+        task(1, 1, false, false),
+        task(2, 1, true, false),
+        task(3, 2, false, false),
+        task(4, 1, false, true),
+    ];
+    let reply = listed(&ProjectEditor::new(p));
+    let kinds: Vec<_> = (0..4)
+        .map(|n| row(&reply, n).get_str("kind").unwrap().to_string())
+        .collect();
+    assert_eq!(kinds, ["external", "external", "external", "blank"]);
+    // Still a summary for `summary`, whatever its kind.
+    assert_eq!(
+        row(&reply, 1).get("summary").and_then(Json::as_bool),
+        Some(true)
+    );
+}
