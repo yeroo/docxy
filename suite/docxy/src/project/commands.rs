@@ -57,6 +57,8 @@ pub(crate) enum ProjectAct {
     Copy,
     Cut,
     Paste,
+    /// F11: a new, empty project in its own tab, as Backstage › New › Project.
+    NewProject,
 }
 
 impl ProjectAct {
@@ -596,6 +598,8 @@ pub(crate) fn key_act(key: &str, m: Modifiers) -> Option<ProjectAct> {
         "insert" => Some(InsertBlankRow),
         "delete" => Some(ClearCell),
         "f3" => Some(FindNext),
+        // Shift+F11 is Project's New Window; it stays unbound.
+        "f11" if !m.shift => Some(NewProject),
         _ => None,
     }
 }
@@ -613,6 +617,9 @@ pub(crate) fn project_input(
     if v.cell.is_some() {
         if m.control && !m.alt && !m.platform && key == "s" {
             return commit_project_cell(tab).then_some(ProjectAct::Save);
+        }
+        if key_act(key, m) == Some(ProjectAct::NewProject) {
+            return commit_project_cell(tab).then_some(ProjectAct::NewProject);
         }
         project_cell_input(tab, key, text, m);
         return None;
@@ -972,8 +979,9 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             Timeline => v.timeline = !v.timeline,
             CriticalTasks => v.show_critical = !v.show_critical,
             BaselineBars => v.show_baseline = !v.show_baseline,
-            // Window-dependent host actions: the file dialog, the clipboard.
-            Save | ExportGantt | Copy | Cut | Paste => {}
+            // Window-dependent host actions: the file dialog, the clipboard,
+            // a new tab.
+            Save | ExportGantt | Copy | Cut | Paste | NewProject => {}
         }
         Ok(())
     })();
@@ -1171,6 +1179,7 @@ impl Docxy {
         self.project_prompt_cancel();
         match act {
             ProjectAct::Save => return self.save_project(false, window, cx),
+            ProjectAct::NewProject => return self.add_tab(Kind::Project, window, cx),
             ProjectAct::Copy | ProjectAct::Cut | ProjectAct::Paste => {
                 self.project_clipboard(act, cx)
             }
