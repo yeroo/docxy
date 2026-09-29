@@ -66,7 +66,9 @@ read, so a test can tell "not supported" from "empty":
 Each task then carries `fields: {"<name as asked>": {"text": …, "value": …}}`.
 Names match ignoring ASCII case and surrounding space. An unknown name, or a
 `fields` that is not a list of strings, fails the whole call
-(`unknown task field 'Status'`). The fields are the Entry columns (ID, Task
+(`unknown task field 'Status'`). The verbs that reply with a task (`task.set`,
+`task.add`, `link.add`, `link.del`) take `fields` too and check it before they
+edit anything, so a bad list leaves the plan and its undo history unchanged. The fields are the Entry columns (ID, Task
 Mode, Name, Duration, Start, Finish, Predecessors, Resource Names), % Complete,
 % Work Complete, Physical % Complete, Actual Start/Finish/Duration/Work/Cost,
 Remaining Duration/Work/Cost, Work, Cost, Fixed Cost, Fixed Cost Accrual,
@@ -856,8 +858,8 @@ Skill: `xlsxy install skill`.
 `find {query}`, `proj.save {path?}`, `proj.reload`, `proj.open {path}`. Edits
 reschedule the plan (CPM) live. MCP: `claude mcp add yppxy -- yppxy --mcp` →
 `yppxy_list`, `yppxy_status`, `yppxy_tasks`, `yppxy_get`, `yppxy_set`,
-`yppxy_add`, `yppxy_del`, `yppxy_link`, `yppxy_unlink`, `yppxy_find`,
-`yppxy_save`. Skill: `yppxy install skill`.
+`yppxy_fields`, `yppxy_add`, `yppxy_del`, `yppxy_link`, `yppxy_unlink`,
+`yppxy_find`, `yppxy_save` (the task tools take `fields`). Skill: `yppxy install skill`.
 
 Everything else — discovery, the wire protocol, tokens, `target`
 disambiguation, the status-dot flash on agent edits — works identically across

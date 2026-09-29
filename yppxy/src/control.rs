@@ -15,17 +15,21 @@
 //! | Verb | Args | Result |
 //! |---|---|---|
 //! | `proj.path` | — | `{path, modified, name, tasks, start, finish}` |
-//! | `task.list` | — | `{count, tasks:[{uid, name, level, manual, duration, start, finish, critical, …}]}` |
-//! | `task.get` | `{uid}` | one task |
-//! | `task.set` | `{uid, name?, duration?, level?, manual?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled) |
-//! | `task.add` | `{after?, name?, duration?}` | the new task (without `duration`, 1 day, estimated unless the plan's `NewTasksEstimated` is off; inserted `after` a task that a finish-to-start link joins to the next, it is linked into that chain, A->B becoming A->N->B, while the plan's `Autolink` is on, the default) |
+//! | `task.list` | `{fields?}` | `{count, tasks:[{uid, id, outline_number, name, level, manual, duration, start, finish, critical, …}]}` |
+//! | `task.get` | `{uid, fields?}` | one task |
+//! | `task.fields` | — | `{count, fields:[name…]}`: the field names `fields` can read |
+//! | `task.set` | `{uid, name?, duration?, level?, manual?, fields?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled) |
+//! | `task.add` | `{after?, name?, duration?, fields?}` | the new task (without `duration`, 1 day, estimated unless the plan's `NewTasksEstimated` is off; inserted `after` a task that a finish-to-start link joins to the next, it is linked into that chain, A->B becoming A->N->B, while the plan's `Autolink` is on, the default) |
 //! | `task.del` | `{uid}` | `{deleted, removed:[uid…]}` (a summary takes its subtree) |
-//! | `link.add` | `{uid, pred, type?, lag?}` | the updated task |
-//! | `link.del` | `{uid, pred}` | the updated task |
-//! | `find` | `{query}` | `{count, tasks:[…]}` |
+//! | `link.add` | `{uid, pred, type?, lag?, fields?}` | the updated task |
+//! | `link.del` | `{uid, pred, fields?}` | the updated task |
+//! | `find` | `{query, fields?}` | `{count, tasks:[…]}` |
 //! | `proj.save` | `{path?}` (.yppx/.xml only; extensionless adds .yppx) | `{path, …}` with the actual saved path |
 //! | `proj.reload` | — | `{path, …}` |
 //! | `proj.open` | `{path}` | `{path, …}` |
+//!
+//! `fields` reads Project fields by name as `{text, value}`; it is checked
+//! before an edit, so a bad list changes nothing. See `projctl`.
 
 use crate::App;
 use ctlcore::json::Json;
