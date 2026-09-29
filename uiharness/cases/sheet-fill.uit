@@ -1,0 +1,46 @@
+# The fill handle through fill-drag (#699): the handle's own press, a move
+# per cell crossed, the release. `drag` presses the grid instead and only
+# sweeps a selection (sheet-selection.uit).
+
+test fill-drag extends a numeric series from the handle
+  open ../fixtures/basic.xlsx
+  call fill-drag {"from":"B4:B5","to":"B8"}
+  assert reply.filled is B4:B8
+  assert range is B4:B8
+  assert cell B6 is 50
+  assert cell B8 is 70
+  assert cell C6 is nothing
+  assert dirty is true
+  assert no fill preview
+
+test fill-drag without from fills from the current selection
+  open ../fixtures/basic.xlsx
+  click C2
+  click C3 shift
+  call fill-drag {"to":"C6"}
+  assert reply.filled is C2:C6
+  assert cell C4 is 34
+  assert cell C6 is 54
+
+test fill-drag released on the source fills nothing
+  open ../fixtures/basic.xlsx
+  call fill-drag {"from":"B2","to":"B2"}
+  assert reply.filled is nothing
+  assert dirty is false
+
+test fill-drag refuses while the handle is not drawn
+  open ../fixtures/basic.xlsx
+  click D1
+  type 5
+  call-error fill-drag {"to":"D4"} => the fill handle is not shown: a cell is being edited
+  key escape
+  select chart 0
+  call-error fill-drag {"to":"D4"} => the fill handle is not shown: a chart is selected
+
+test fill-drag refuses a protected sheet and AutoFill Options
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Review","command":"Protect Sheet"}
+  call-error fill-drag {"from":"B2:B3","to":"B6"} => the fill did not arm: the sheet is protected
+  assert cell B6 is nothing
+  assert filling is false
+  call-error fill-drag {"to":"B6","option":"copy"} => AutoFill Options are not implemented in this app

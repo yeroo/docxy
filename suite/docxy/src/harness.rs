@@ -386,6 +386,17 @@ pub fn drag_args(args: &Json) -> Result<DragEnds, String> {
     Ok((cell_arg(args, "from")?, cell_arg(args, "to")?))
 }
 
+/// A cell or range argument (`"A1"` or `"A1:C5"`), as its two corners.
+pub fn range_arg(args: &Json, key: &str) -> Result<DragEnds, String> {
+    let text = arg_str(args, key)?.trim();
+    if let Some((r0, c0, r1, c1)) = parse_range_name(text) {
+        return Ok(((r0, c0), (r1, c1)));
+    }
+    let cell = parse_cell(text)
+        .map_err(|_| format!("'{text}' is not a cell or a range (expected A1 or A1:C5)"))?;
+    Ok((cell, cell))
+}
+
 /// The cells a pointer dragged from `from` to `to` would cross, in order,
 /// starting with `from` itself — a real drag always moves inside its origin
 /// cell before it crosses a boundary, and that first move is what plants the
@@ -2395,10 +2406,53 @@ pub fn dispatch(
             }
             let cell = cell_arg(args, "cell")?;
             sheet(app)?;
-            app.grid_press_cell(cell, cx);
-            app.cell_click(cell.0, cell.1, shift, dbl, window, cx);
-            app.grid_release(cx);
+            click_cell(app, cell, shift, dbl, window, cx);
             Done::ok(state(app, window))
+        }
+
+        // The fill handle (#699): the handle's own press, one move per cell
+        // crossed, the release — what a pointer dragging the handle does. The
+        // `drag` verb presses the grid instead, so it sweeps a selection.
+        "fill-drag" => {
+            app.refuse_under_dialog()?;
+            if args.get("option").is_some() {
+                return Err("AutoFill Options are not implemented in this app".into());
+            }
+            let to = cell_arg(args, "to")?;
+            let from = match args.get("from") {
+                Some(_) => Some(range_arg(args, "from")?),
+                None => None,
+            };
+            sheet(app)?;
+            if let Some((start, end)) = from {
+                click_cell(app, start, false, false, window, cx);
+                if end != start {
+                    click_cell(app, end, true, false, window, cx);
+                }
+            }
+            if let Some(why) = app.fill_handle_hidden_reason() {
+                return Err(format!("the fill handle is not shown: {why}"));
+            }
+            let src = sheet(app)?.range();
+            app.sheet_fill_start(cx);
+            if app.sheet_fill.is_none() {
+                return Err(if app.sheet_protected() {
+                    "the fill did not arm: the sheet is protected".into()
+                } else {
+                    "the fill did not arm: another gesture is in flight".into()
+                });
+            }
+            for (r, c) in drag_path((src.2, src.3), to) {
+                app.grid_drag_over(r, c, cx);
+            }
+            app.grid_release(cx);
+            let after = sheet(app)?.range();
+            let mut reply = state(app, window);
+            if let Json::Obj(fields) = &mut reply {
+                let filled = (after != src).then(|| a1_range(after));
+                fields.push(("filled".into(), str_or_null(filled)));
+            }
+            Done::ok(reply)
         }
 
         // The clipboard (#699). A harness instance has a private one (it starts
@@ -2694,6 +2748,21 @@ fn is_action_key(stroke: &Keystroke) -> bool {
         && ACTION_KEYS
             .iter()
             .any(|(key, shift)| *key == stroke.key && *shift == m.shift)
+}
+
+/// A click on a sheet cell, as the pointer makes it: press, the cell's click
+/// handler, release.
+fn click_cell(
+    app: &mut crate::Docxy,
+    cell: (u32, u32),
+    shift: bool,
+    double: bool,
+    window: &mut Window,
+    cx: &mut Context<crate::Docxy>,
+) {
+    app.grid_press_cell(cell, cx);
+    app.cell_click(cell.0, cell.1, shift, double, window, cx);
+    app.grid_release(cx);
 }
 
 /// Deliver one keystroke the way the platform would: through the bound action
@@ -4039,6 +4108,20 @@ mod tests {
     }
 
     /// A malformed range, and a half-given pair.
+    /// #699: `fill-drag`'s `from` takes a cell or a range.
+    #[test]
+    fn range_arg_takes_a_cell_or_a_range() {
+        let a = |text: &str| obj(&[("from", s(text))]);
+        assert_eq!(range_arg(&a("B4:B5"), "from"), Ok(((3, 1), (4, 1))));
+        assert_eq!(range_arg(&a(" C2 "), "from"), Ok(((1, 2), (1, 2))));
+        assert!(
+            range_arg(&a("B4:"), "from")
+                .unwrap_err()
+                .contains("is not a cell or a range")
+        );
+        assert!(range_arg(&obj(&[]), "from").is_err());
+    }
+
     #[test]
     fn drag_args_refuses_a_malformed_range() {
         for bad in ["A1:", ":C5", "A1:C0", "A1-C5", "everything"] {

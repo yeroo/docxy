@@ -815,13 +815,17 @@ fn may_arm_fill(already_filling: bool, gesture_in_flight: bool) -> bool {
 /// the state-changing path used by [`Docxy::sheet_fill_start`], kept free of a
 /// gpui context so the regression test can observe the same transition the
 /// production handler uses.
+///
+/// A protected sheet refuses too (#699): the fill writes cells, and every other
+/// cell-writing command (`sheet_clear`, `sheet_paste`, …) already refuses there.
 fn arm_fill(
     fill: &mut Option<FillDrag>,
     src: Option<(u32, u32, u32, u32)>,
     gesture_in_flight: bool,
     tab_more_open: bool,
+    protected: bool,
 ) -> bool {
-    if tab_more_open || !may_arm_fill(fill.is_some(), gesture_in_flight) {
+    if tab_more_open || protected || !may_arm_fill(fill.is_some(), gesture_in_flight) {
         return false;
     }
     let Some(src) = src else { return false };
@@ -830,6 +834,34 @@ fn arm_fill(
         to: (src.2, src.3),
     });
     true
+}
+
+/// Whether pointing (a reference field or a formula picking cells) hides the
+/// fill handle: in point mode a drag off the selection's corner sweeps a range.
+fn fill_handle_pointing(range_field: bool, formula_pick: bool) -> bool {
+    range_field || formula_pick
+}
+
+/// Why the fill handle is not drawn, or `None` when it is — the grid's own
+/// condition (`editing`, `handle_hidden`, `sel_hidden`), stated once so the
+/// harness's `fill-drag` refuses exactly when there is no handle to press
+/// (#699). A handle whose corner sits under a chart card is hidden by layout,
+/// which only the render pass knows; that case is not modelled here.
+fn fill_handle_hidden(
+    editing: bool,
+    range_field: bool,
+    formula_pick: bool,
+    chart_sel: Option<usize>,
+) -> Option<&'static str> {
+    if editing {
+        Some("a cell is being edited")
+    } else if fill_handle_pointing(range_field, formula_pick) {
+        Some("a reference is being pointed at")
+    } else if !cell_selection_shown(chart_sel) {
+        Some("a chart is selected")
+    } else {
+        None
+    }
 }
 
 /// The dominant-axis fill box for `src` dragged to `to`: extend rows (down) or
@@ -6214,14 +6246,28 @@ impl Docxy {
     fn sheet_fill_start(&mut self, cx: &mut Context<Self>) {
         let gesture_in_flight = self.grid_gesture_in_flight();
         let src = self.active_sheet().map(|v| v.range());
+        let protected = self.sheet_protected();
         if arm_fill(
             &mut self.sheet_fill,
             src,
             gesture_in_flight,
             self.tab_more_open,
+            protected,
         ) {
             cx.notify();
         }
+    }
+
+    /// Why the active sheet draws no fill handle, or `None` when it draws one
+    /// (see [`fill_handle_hidden`]).
+    fn fill_handle_hidden_reason(&self) -> Option<&'static str> {
+        let editing = self.active_sheet().is_some_and(|v| v.editing.is_some());
+        fill_handle_hidden(
+            editing,
+            self.range_field_active(),
+            self.formula_pick_active(),
+            self.chart_sel,
+        )
     }
 
     /// Update the auto-fill target as the handle is dragged. Nothing is
@@ -8011,7 +8057,10 @@ impl Docxy {
             // range", not "auto-fill". The handle's own guard only covers an
             // in-cell edit, so without this a drag that starts on those few
             // pixels writes cells instead of picking them.
-            handle_hidden: self.range_field_active() || self.formula_pick_active(),
+            handle_hidden: fill_handle_pointing(
+                self.range_field_active(),
+                self.formula_pick_active(),
+            ),
             // The border's range and the cap on its dashes both need the
             // visible-row list and the column window, which only `sheet_el`
             // has.
@@ -24436,13 +24485,14 @@ mod grid_geom_tests {
         chart_card_layout, chart_category_label_plan, chart_column_layout, chart_line_path,
         chart_line_points, chart_panel_after, chart_panel_shown, chart_pie_geometry,
         chart_pie_slice_path, chart_ref_of, chart_render_path, chart_scale, chart_slot_color,
-        chart_source_areas, col_at_x, col_px, dash_fit, edit_runs, fill_box, formula_ref_tokens,
-        gesture_in_flight, last_visible_col, may_arm_fill, parse_ref_text, press_selection,
-        preview_range, range_a1, range_border_cell_count, range_border_dashed, range_border_plan,
-        range_edges_at, range_text, ref_a1, ref_color, ref_index_at, ref_pick_text, ref_token_at,
-        replace_ref, resize_axis, row_height_px, scroll_col0_for_sel, selected_header_range,
-        series_move, series_name_shown, series_remove, series_resolved_preview, sheet_index_of,
-        shift_col, shift_row, shown_sel, snap_range_rows, source_ref_text,
+        chart_source_areas, col_at_x, col_px, dash_fit, edit_runs, fill_box, fill_handle_hidden,
+        formula_ref_tokens, gesture_in_flight, last_visible_col, may_arm_fill, parse_ref_text,
+        press_selection, preview_range, range_a1, range_border_cell_count, range_border_dashed,
+        range_border_plan, range_edges_at, range_text, ref_a1, ref_color, ref_index_at,
+        ref_pick_text, ref_token_at, replace_ref, resize_axis, row_height_px, scroll_col0_for_sel,
+        selected_header_range, series_move, series_name_shown, series_remove,
+        series_resolved_preview, sheet_index_of, shift_col, shift_row, shown_sel, snap_range_rows,
+        source_ref_text,
     };
     use gpui::{point, px};
 
@@ -24500,7 +24550,7 @@ mod grid_geom_tests {
         assert!(!gesture_in_flight(false, false, false, false));
         assert!(may_arm_fill(false, false));
         let mut fill = None;
-        assert!(arm_fill(&mut fill, Some(src), false, false));
+        assert!(arm_fill(&mut fill, Some(src), false, false, false));
         let armed = fill.expect("the source range becomes a fill drag");
         assert_eq!(armed.src, src);
         assert_eq!(armed.to, (src.2, src.3));
@@ -24526,6 +24576,7 @@ mod grid_geom_tests {
                 &mut fill,
                 Some(src),
                 gesture_in_flight(drag, dragging, range, formula),
+                false,
                 false
             ));
             assert!(fill.is_none(), "a grid gesture must leave the fill unarmed");
@@ -24535,14 +24586,52 @@ mod grid_geom_tests {
         assert!(!may_arm_fill(true, false));
         assert!(!may_arm_fill(true, true));
         let mut fill = Some(armed);
-        assert!(!arm_fill(&mut fill, Some((9, 9, 9, 9)), false, false));
+        assert!(!arm_fill(
+            &mut fill,
+            Some((9, 9, 9, 9)),
+            false,
+            false,
+            false
+        ));
         assert_eq!(fill.expect("the first fill stays armed").src, src);
 
         // The priority-1 more-tabs backdrop prevents presses on the deferred
         // handle. Keep the guard as defence in depth if that order changes.
         let mut fill = None;
-        assert!(!arm_fill(&mut fill, Some(src), false, true));
+        assert!(!arm_fill(&mut fill, Some(src), false, true, false));
         assert!(fill.is_none());
+    }
+
+    /// #699: a protected sheet never arms a fill, so neither the pointer nor
+    /// the harness's `fill-drag` can write its cells through the handle.
+    #[test]
+    fn a_protected_sheet_cannot_arm_a_fill() {
+        let mut fill = None;
+        assert!(!arm_fill(&mut fill, Some((0, 0, 1, 0)), false, false, true));
+        assert!(fill.is_none());
+    }
+
+    /// #699: the handle is drawn only with no cell edit open, nothing pointing
+    /// and no chart holding the selection; each says why it is not.
+    #[test]
+    fn the_fill_handle_says_why_it_is_hidden() {
+        assert_eq!(fill_handle_hidden(false, false, false, None), None);
+        assert_eq!(
+            fill_handle_hidden(true, false, false, None),
+            Some("a cell is being edited")
+        );
+        assert_eq!(
+            fill_handle_hidden(false, true, false, None),
+            Some("a reference is being pointed at")
+        );
+        assert_eq!(
+            fill_handle_hidden(false, false, true, None),
+            Some("a reference is being pointed at")
+        );
+        assert_eq!(
+            fill_handle_hidden(false, false, false, Some(0)),
+            Some("a chart is selected")
+        );
     }
 
     fn names(list: &[&str]) -> Vec<String> {
