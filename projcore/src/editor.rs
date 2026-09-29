@@ -16,13 +16,19 @@ const UNDO_CAP: usize = 100;
 const EXTERNAL_TASK_DATES: &str = "External task: its dates come from its own project";
 pub const DURATION_HINT: &str = "try 3d, 4h, 2w, 1mo";
 
+mod assignments;
 mod batch;
 mod cells;
 mod effort;
 mod fields;
+pub use assignments::{AssignmentPatch, ResourceRef};
 pub use cells::{
     day_finish, format_duration_exact, format_predecessors, format_resource_names, parse_cell_date,
     parse_lag, parse_task_predecessors, split_resource_names,
+};
+pub use fields::assignment::{
+    AssignmentField, assignment_dates, assignment_field_names, rate_table_letter,
+    read_assignment_field, work_contour_name,
 };
 pub use fields::{
     BaselinePart, ENTRY_FIELDS, Field, FieldRead, FieldReader, FieldValue, field_names,
@@ -1334,7 +1340,7 @@ fn validate_duration(minutes: i64) -> Result<(), String> {
     Ok(())
 }
 
-/// Both assignment entry points stage resources before taking an undo snapshot.
+/// Every assignment entry point stages resources before taking an undo snapshot.
 fn find_or_stage_resource(resources: &mut Vec<Resource>, name: &str) -> Result<i32, String> {
     if let Some(resource) = resources.iter().find(|r| r.name.eq_ignore_ascii_case(name)) {
         return Ok(resource.uid);

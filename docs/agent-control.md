@@ -38,8 +38,10 @@ Explicit targets do not activate that tab. Task/link arguments use stable
 **UIDs**, as reported by `task.list`, not the table's displayed IDs.
 
 Supported verbs are `proj.path`, `task.list`, `task.get`, `task.fields`, `task.set`,
-`task.add`, `task.del`, `link.add`, `link.del`, `find`, `proj.save`, `proj.reload`,
-`proj.open` and `proj.new`, with the yppxy argument/result shapes. `proj.path` additionally
+`task.add`, `task.del`, `link.add`, `link.del`, `find`, `assign.list`,
+`assign.get`, `assign.fields`, `assign.add`, `assign.set`, `assign.del`,
+`proj.save`, `proj.reload`, `proj.open` and `proj.new`, with the yppxy
+argument/result shapes. `proj.path` additionally
 reports `tab`, `imported`, `cell` (active column name), `cell_row` (zero-based row),
 and `cell_edit` (pending cell buffer, or `null` when closed). Reads and rejected
 edits leave selection, prompts, pending cell edits, history and scroll unchanged.
@@ -100,6 +102,46 @@ Status and custom fields are not readable yet.
   Baseline date to the scheduled one (0 without a baseline), and Duration, Work and Cost Variance are the
   current value less the Baseline one (an absent Baseline value counts as 0).
   Slack comes from the schedule, and total slack can be negative.
+
+Assignments are addressed by their own UID. `assign.list {uid?, resource?}`
+lists every assignment, or those of task `uid` and/or of `resource` (a uid, or
+a name matched ignoring ASCII case; an unknown one is an error, `no resource
+named 'Nobody'`). `assign.get {uid}` reads one. Each reports `uid, task,
+resource, resource_name, units, work_hours, regular_work_hours,
+overtime_work_hours, cost, rate_table, baseline_work_hours, baseline_cost,
+actual_work_hours, remaining_work_hours, actual_cost, remaining_cost,
+percent_work_complete, start, finish, delay_hours, contour`: units a fraction
+(1.0 = 100%; a material's quantity), work in hours, money in currency units,
+`null` for a value the plan does not store, `rate_table` a letter (`A` when
+unset), `start`/`finish` the assignment's own dates.
+
+```json
+{"verb": "assign.add", "args": {"task": 3, "resource": "Ann", "units": "50%"}}
+{"verb": "assign.set", "args": {"uid": 7, "units": 1, "rate_table": "B"}}
+{"verb": "assign.del", "args": {"uid": 7}}
+```
+
+`assign.add {task, resource, units?, work?}` takes a resource uid or name (a new
+name is staged as a work resource; a new name that is a number or contains a
+comma is refused, so pass a uid as a number) and refuses a resource already on
+the task. `assign.set {uid, units?, work?, rate_table?,
+delay?}` needs at least one of them; units are a number or `"50%"`, work and
+delay a number of hours or a duration (`"40h"`, `"5d"`), the rate table `"A"` to
+`"E"`. The task is rescheduled by its type, as in Project: on a Fixed Units task
+a units edit keeps the work and moves the duration, on Fixed Duration the work
+follows the units (and units given together with work are recomputed from the
+work); a work edit clears the assignment's overtime. A bare number of work or
+delay, even as a string (`"8"`), is hours. `assign.del
+{uid}` replies `{deleted, task}`; an effort-driven task keeps its work across
+the assignments left. Each edit is one undo step, a value the assignment
+already has records none, and every argument is checked first, so a rejected
+call leaves the plan untouched. The assign verbs take `fields` with Project's
+assignment field names (`assign.fields` lists them: Unique ID, Task ID, Task
+Name, Resource Name, Units, Work, Regular, Overtime, Actual, Remaining and
+Baseline Work, Cost, Actual, Remaining and Baseline Cost, % Work Complete,
+Start, Finish, Delay, Cost Rate Table, Work Contour, Peak, Budget Work and
+Budget Cost); `{"Work": {"text": "40 hrs", "value": 2400}, "Units": {"text":
+"100%", "value": 1}}`. Peak and the budget fields read what the plan stores.
 
 File handling differs from the TUI:
 
@@ -863,7 +905,9 @@ Skill: `xlsxy install skill`.
 `proj.path`, `task.list` (scheduled dates, critical path, slack, links),
 `task.get/set/add/del`, `task.fields` (`task.list`/`task.get`/`find` take
 `fields: [...]` to read any listed field by Project's name), `link.add {uid, pred, type?, lag?}` / `link.del`,
-`find {query}`, `proj.save {path?}`, `proj.reload`, `proj.open {path}`. Edits
+`find {query}`, `assign.list/get/add/set/del` and `assign.fields` (a task's
+resource assignments, by assignment UID), `proj.save {path?}`, `proj.reload`,
+`proj.open {path}`. Edits
 reschedule the plan (CPM) live. MCP: `claude mcp add yppxy -- yppxy --mcp` →
 `yppxy_list`, `yppxy_status`, `yppxy_tasks`, `yppxy_get`, `yppxy_set`,
 `yppxy_fields`, `yppxy_add`, `yppxy_del`, `yppxy_link`, `yppxy_unlink`,

@@ -77,7 +77,19 @@ where instance is `yppxy-<AGWINTERM_SESSION_ID>` — the pane id shown by
 ```
 
 Verbs: `proj.path`, `task.list`, `task.get`, `task.fields`, `task.set`, `task.add`,
-`task.del`, `link.add`, `link.del`, `find`, `proj.save`, `proj.reload`, `proj.open`.
+`task.del`, `link.add`, `link.del`, `find`, `assign.list`, `assign.get`,
+`assign.fields`, `assign.add`, `assign.set`, `assign.del`, `proj.save`,
+`proj.reload`, `proj.open`.
+
+Assignments are addressed by their own UID, as `assign.list {uid?, resource?}`
+reports it. `assign.add {task, resource, units?, work?}` takes a resource uid or
+name (a new name becomes a work resource; one that is a number or contains a
+comma is refused, so pass a uid as a number); `assign.set {uid, units?, work?,
+rate_table?, delay?}` takes units as `0.5` or `"50%"`, work and delay as hours or
+`"40h"`/`"5d"`, the rate table as `"A"`..`"E"`, and reschedules the task by its
+type. Each assignment reports `units`, `work_hours`, `cost`, `rate_table`,
+overtime, actual, remaining and baseline values, and its own `start`/`finish`;
+`fields` reads Project's assignment fields (`assign.fields` lists them).
 
 ## Two panes in one agwinterm session
 `agwintermctl split on`, then launch `yppxy <file>` in the new pane (or press
@@ -114,6 +126,8 @@ mod tests {
             "yppxy_fields",
             "task.fields",
             "outline_number",
+            "assign.set",
+            "assign.fields",
         ] {
             assert!(SKILL_MD.contains(needle), "skill missing {needle}");
         }

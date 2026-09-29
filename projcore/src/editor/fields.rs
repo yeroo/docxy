@@ -254,6 +254,8 @@ pub enum FieldValue {
     Minutes(i64),
     /// Currency units (not hundredths).
     Money(f64),
+    /// A plain number: assignment units (1.0 = 100%) or a material's quantity.
+    Number(f64),
     Date(DateTime),
     Text(String),
 }
@@ -746,6 +748,8 @@ pub fn format_date_field(dt: Option<DateTime>) -> String {
         },
     )
 }
+
+pub(super) mod assignment;
 
 #[cfg(test)]
 mod tests;

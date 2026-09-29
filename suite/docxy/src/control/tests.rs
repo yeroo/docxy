@@ -1,6 +1,7 @@
 use super::*;
 use core::prelude::v1::test;
 use projcore::LinkType;
+use projcore::editor::ResourceRef;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn args(text: &str) -> Json {
@@ -298,6 +299,8 @@ fn new_project_reply_is_the_apps_blank_plan() {
 #[test]
 fn reads_and_rejected_edits_preserve_prompt_selection_history_and_scroll() {
     let mut tabs = vec![tab()];
+    let (ed, name) = (&mut vm(&mut tabs[0]).ed, ResourceRef::Name("Ann"));
+    let assigned = ed.add_assignment(1, name, None, None).unwrap();
     vm(&mut tabs[0]).ed.rename(1, "Change").unwrap();
     vm(&mut tabs[0]).ed.undo();
     vm(&mut tabs[0]).ed.mark_saved();
@@ -310,6 +313,9 @@ fn reads_and_rejected_edits_preserve_prompt_selection_history_and_scroll() {
         ("task.list", Json::Null),
         ("task.get", args(r#"{"uid":1}"#)),
         ("find", args(r#"{"query":"Task"}"#)),
+        ("assign.list", Json::Null),
+        ("assign.get", args(&format!(r#"{{"uid":{assigned}}}"#))),
+        ("assign.fields", Json::Null),
     ] {
         let (_, effect) = call(&mut tabs, 0, verb, a).unwrap();
         assert_eq!(effect, Effect::default());
@@ -322,6 +328,9 @@ fn reads_and_rejected_edits_preserve_prompt_selection_history_and_scroll() {
         ),
         ("task.del", args(r#"{"uid":999}"#)),
         ("link.add", args(r#"{"uid":1,"pred":999}"#)),
+        ("assign.add", args(r#"{"task":1,"resource":999}"#)),
+        ("assign.set", args(r#"{"uid":999,"units":1}"#)),
+        ("assign.del", args(r#"{"uid":999}"#)),
     ] {
         assert!(call(&mut tabs, 0, verb, a).is_err());
         assert_eq!(snapshot(&tabs[0]), before);
@@ -357,6 +366,9 @@ fn each_agent_edit_is_undoable_and_changes_only_its_inactive_target() {
         ("task.del", r#"{"tab":1,"uid":1}"#),
         ("link.add", r#"{"tab":1,"uid":2,"pred":1}"#),
         ("link.del", r#"{"tab":1,"uid":2,"pred":1}"#),
+        ("assign.add", r#"{"tab":1,"task":1,"resource":"Agent"}"#),
+        ("assign.set", r#"{"tab":1,"uid":1,"units":0.5}"#),
+        ("assign.del", r#"{"tab":1,"uid":1}"#),
     ] {
         let mut tabs = vec![tab(), tab()];
         if verb == "link.del" {
@@ -364,6 +376,12 @@ fn each_agent_edit_is_undoable_and_changes_only_its_inactive_target() {
                 .ed
                 .add_predecessor(2, 1, LinkType::FinishStart, 0)
                 .unwrap();
+        }
+        if matches!(verb, "assign.set" | "assign.del") {
+            let (ed, name) = (&mut vm(&mut tabs[1]).ed, ResourceRef::Name("Ann"));
+            assert_eq!(ed.add_assignment(1, name, None, None), Ok(1));
+            ed.mark_saved();
+            tabs[1].dirty = false;
         }
         vm(&mut tabs[0]).open_prompt(PromptKind::Move);
         vm(&mut tabs[1]).open_prompt(PromptKind::Move);
@@ -857,4 +875,25 @@ fn set_baseline_then_a_duration_edit_shows_in_finish_variance() {
     assert_eq!(variance, ("2 days".to_string(), Json::Num(960.0)));
     let (fields, _) = call(&mut tabs, 0, "task.fields", Json::Null).unwrap();
     assert!(fields.get("count").and_then(Json::as_usize).unwrap() > 100);
+}
+
+#[test]
+fn an_agent_assignment_routes_to_its_project_tab_and_reads_back() {
+    let mut tabs = vec![word(), tab()];
+    let (added, effect) = call(
+        &mut tabs,
+        0,
+        "assign.add",
+        args(r#"{"tab":1,"task":1,"resource":"Ann","units":"50%"}"#),
+    )
+    .unwrap();
+    assert!(effect.repaint && effect.activity);
+    assert!(tabs[1].dirty);
+    let uid = added.get("uid").unwrap().as_f64().unwrap();
+    let get = format!(r#"{{"tab":1,"uid":{uid},"fields":["Units"]}}"#);
+    let (read, effect) = call(&mut tabs, 0, "assign.get", args(&get)).unwrap();
+    assert_eq!(effect, Effect::default());
+    assert_eq!(read.get_str("resource_name"), Some("Ann"));
+    let units = read.get("fields").unwrap().get("Units").unwrap();
+    assert_eq!(units.get_str("text"), Some("50%"));
 }

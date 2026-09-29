@@ -512,14 +512,14 @@ pub(super) fn bracket_units(
 }
 
 /// A number as the cell shows it: two decimals, trailing zeros trimmed (`5`, `0.33`).
-fn format_quantity(n: f64) -> String {
+pub(super) fn format_quantity(n: f64) -> String {
     let text = format!("{n:.2}");
     let text = text.trim_end_matches('0').trim_end_matches('.');
     if text == "-0" { "0" } else { text }.to_owned()
 }
 
 /// Assignment units as percent text: two decimals, trailing zeros trimmed (`50%`, `33.33%`).
-fn format_units(units: f64) -> String {
+pub(super) fn format_units(units: f64) -> String {
     format!("{}%", format_quantity(units * 100.))
 }
 
@@ -549,7 +549,7 @@ fn units_bracket(units: f64) -> Option<String> {
 }
 
 /// A material's label as the cell shows it: trimmed, `None` when blank.
-fn shown_label(r: &Resource) -> Option<&str> {
+pub(super) fn shown_label(r: &Resource) -> Option<&str> {
     r.material_label
         .as_deref()
         .map(str::trim)
