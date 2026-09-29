@@ -21,26 +21,17 @@ pub enum Act {
     InsertBlankRow,
     Milestone,
     Constraint,
-    Rename,
-    Duration,
     Find,
-    DeleteTask,
     // Resource
     Assign,
-    ClearResources,
     LevelAll,
     ClearLeveling,
-    // Report
-    ExportGantt,
     // Project
     CalculateProject,
     Baseline,
     // View
     ShowSubtasks,
     HideSubtasks,
-    ScrollLeft,
-    ScrollRight,
-    GoToStart,
 }
 
 type Group = ribboncore::Group<Act>;
@@ -88,9 +79,12 @@ impl std::ops::DerefMut for Ribbon {
 
 // ---- tab definitions --------------------------------------------------------
 //
-// Microsoft Project's tabs, groups and command names, matching the suite's
+// Microsoft Project's tabs, groups and command labels, matching the suite's
 // `project_ribbon()` (suite/docxy/src/project/commands.rs), so written Project
 // instructions ("Project › Schedule › Set Baseline") work in both front ends.
+// Each hint starts with Project's screentip ("Indent Task — …"). Only
+// Project's commands are here: yppxy's own (rename, duration, delete, export,
+// scrolling) stay on their keys (Enter, d, x, Ctrl+E, h/l, Alt+Home).
 // Save / Save As live in the File backstage (and Ctrl+S); Theme is the
 // tab-strip button (and `T`), like the suite's title-bar button.
 
@@ -100,7 +94,9 @@ fn tabs() -> Vec<(&'static str, Vec<Group>)> {
         ("File", Vec::new()), // File → backstage
         ("Task", task_groups()),
         ("Resource", resource_groups()),
-        ("Report", report_groups()),
+        // Project's Report groups are not implemented; the tab stays so the
+        // tab set is Project's, and shows an empty body.
+        ("Report", Vec::new()),
         ("Project", project_groups()),
         ("View", view_groups()),
     ]
@@ -111,17 +107,21 @@ fn task_groups() -> Vec<Group> {
     vec![
         Group {
             title: "Schedule",
-            width: 29,
+            width: 19,
             rows: [
                 vec![
-                    btn("→ Indent Task", Indent, "Indent — make a subtask (Tab)"),
+                    btn("→ Indent", Indent, "Indent Task — make a subtask (Tab)"),
                     Seg::Gap("  "),
-                    btn("← Outdent Task", Outdent, "Outdent (Shift+Tab)"),
+                    btn(
+                        "← Outdent",
+                        Outdent,
+                        "Outdent Task — move it up a level (Shift+Tab)",
+                    ),
                 ],
                 vec![btn(
-                    "🔗 Link the Selected Tasks",
+                    "🔗 Link Tasks",
                     AddLink,
-                    "Add a predecessor by task ID (p)",
+                    "Link the Selected Tasks — add a predecessor by task ID (p)",
                 )],
             ],
         },
@@ -132,12 +132,12 @@ fn task_groups() -> Vec<Group> {
                 vec![btn(
                     "📌 Manually Schedule",
                     ManuallySchedule,
-                    "Pin the task at its current dates (m toggles)",
+                    "Manually Schedule — pin the task at its current dates (m toggles)",
                 )],
                 vec![btn(
                     "⟳ Auto Schedule",
                     AutoSchedule,
-                    "Let the scheduler place the task by its links (m toggles)",
+                    "Auto Schedule — let the scheduler place the task by its links (m toggles)",
                 )],
             ],
         },
@@ -146,47 +146,43 @@ fn task_groups() -> Vec<Group> {
             width: 20,
             rows: [
                 vec![
-                    btn("＋ Task", AddTask, "Add a task below (n)"),
+                    btn("＋ Task", AddTask, "Task — add a task below (n)"),
                     Seg::Gap("  "),
                     btn(
                         "▭ Blank Row",
                         InsertBlankRow,
-                        "Insert a blank row above (N)",
+                        "Insert Blank Row — a blank row above (N)",
                     ),
                 ],
                 vec![btn(
                     "◆ Milestone",
                     Milestone,
-                    "Toggle milestone (0-day) on the task",
+                    "Insert Milestone — toggle milestone (0-day) on the task",
                 )],
             ],
         },
         Group {
             title: "Properties",
-            width: 20,
+            width: 16,
             rows: [
                 vec![btn(
-                    "ⓘ Information",
+                    "ⓘ Information...",
                     Constraint,
-                    "Set a date constraint — SNET/MSO/… (c)",
+                    "View Task Information — set a date constraint, SNET/MSO/… (c)",
                 )],
-                vec![
-                    btn("✎ Rename", Rename, "Rename the task (Enter)"),
-                    Seg::Gap("  "),
-                    btn("⏱ Duration", Duration, "Set duration — 3d / 4h / 2w (d)"),
-                ],
+                Vec::new(),
             ],
         },
         Group {
             title: "Editing",
-            width: 13,
+            width: 9,
             rows: [
                 vec![btn(
-                    "⌕ Find",
+                    "⌕ Find...",
                     Find,
-                    "Find a task by name (Ctrl+F / F3 next)",
+                    "Find... — a task by name (Ctrl+F / F3 next)",
                 )],
-                vec![btn("✗ Delete Task", DeleteTask, "Delete the task (x)")],
+                Vec::new(),
             ],
         },
     ]
@@ -197,18 +193,14 @@ fn resource_groups() -> Vec<Group> {
     vec![
         Group {
             title: "Assignments",
-            width: 19,
+            width: 22,
             rows: [
                 vec![btn(
-                    "👤 Assign Resources",
+                    "👤 Assign Resources...",
                     Assign,
-                    "Assign a resource to the task (a)",
+                    "Assign Resources... — assign a resource to the task; empty clears (a)",
                 )],
-                vec![btn(
-                    "✗ Clear Resources",
-                    ClearResources,
-                    "Remove the task's resources",
-                )],
+                Vec::new(),
             ],
         },
         Group {
@@ -218,32 +210,16 @@ fn resource_groups() -> Vec<Group> {
                 vec![btn(
                     "⚖ Level All",
                     LevelAll,
-                    "Delay bars to fit resource capacity (L toggles)",
+                    "Level All — delay bars to fit resource capacity (L toggles)",
                 )],
                 vec![btn(
                     "✗ Clear Leveling",
                     ClearLeveling,
-                    "Turn resource leveling off (L toggles)",
+                    "Clear Leveling — turn resource leveling off (L toggles)",
                 )],
             ],
         },
     ]
-}
-
-fn report_groups() -> Vec<Group> {
-    use Act::*;
-    vec![Group {
-        title: "Export",
-        width: 14,
-        rows: [
-            vec![btn(
-                "⭳ Export Gantt",
-                ExportGantt,
-                "Export a Markdown/Mermaid Gantt (Ctrl+E)",
-            )],
-            Vec::new(),
-        ],
-    }]
 }
 
 fn project_groups() -> Vec<Group> {
@@ -255,12 +231,12 @@ fn project_groups() -> Vec<Group> {
             vec![btn(
                 "⟳ Calculate Project",
                 CalculateProject,
-                "Recompute the schedule (automatic on every edit)",
+                "Calculate Project — recompute the schedule (automatic on every edit)",
             )],
             vec![btn(
                 "⚑ Set Baseline",
                 Baseline,
-                "Snapshot the current plan as the baseline (b)",
+                "Set Baseline — snapshot the current plan as the baseline (b)",
             )],
         ],
     }]
@@ -268,44 +244,22 @@ fn project_groups() -> Vec<Group> {
 
 fn view_groups() -> Vec<Group> {
     use Act::*;
-    vec![
-        Group {
-            title: "Data",
-            width: 16,
-            rows: [
-                vec![btn(
-                    "▾ Show Subtasks",
-                    ShowSubtasks,
-                    "Show the selected summary's subtasks (+)",
-                )],
-                vec![btn(
-                    "▸ Hide Subtasks",
-                    HideSubtasks,
-                    "Hide the selected summary's subtasks (-)",
-                )],
-            ],
-        },
-        Group {
-            title: "Zoom",
-            width: 29,
-            rows: [
-                vec![
-                    btn("◀ Scroll Left", ScrollLeft, "Scroll the timeline left (h)"),
-                    Seg::Gap("  "),
-                    btn(
-                        "▶ Scroll Right",
-                        ScrollRight,
-                        "Scroll the timeline right (l)",
-                    ),
-                ],
-                vec![btn(
-                    "⇤ Go to Start",
-                    GoToStart,
-                    "Scroll to the earliest task or project start",
-                )],
-            ],
-        },
-    ]
+    vec![Group {
+        title: "Data",
+        width: 16,
+        rows: [
+            vec![btn(
+                "▾ Show Subtasks",
+                ShowSubtasks,
+                "Show Subtasks — the selected summary's subtasks (+)",
+            )],
+            vec![btn(
+                "▸ Hide Subtasks",
+                HideSubtasks,
+                "Hide Subtasks — the selected summary's subtasks (-)",
+            )],
+        ],
+    }]
 }
 
 #[cfg(test)]
@@ -344,46 +298,110 @@ mod tests {
     #[test]
     fn project_instruction_paths_exist() {
         use Act::*;
-        // (tab, group, command name, act) — the suite's `project_ribbon()`.
+        // (tab, group, Project's label, Project's screentip, act) — the
+        // suite's `project_ribbon()`.
         let paths = [
-            ("Task", "Schedule", "Indent Task", Indent),
-            ("Task", "Schedule", "Outdent Task", Outdent),
-            ("Task", "Schedule", "Link the Selected Tasks", AddLink),
-            ("Task", "Tasks", "Manually Schedule", ManuallySchedule),
-            ("Task", "Tasks", "Auto Schedule", AutoSchedule),
-            ("Task", "Insert", "Task", AddTask),
-            ("Task", "Insert", "Blank Row", InsertBlankRow),
-            ("Task", "Insert", "Milestone", Milestone),
-            ("Task", "Properties", "Information", Constraint),
-            ("Task", "Properties", "Rename", Rename),
-            ("Task", "Properties", "Duration", Duration),
-            ("Task", "Editing", "Find", Find),
-            ("Task", "Editing", "Delete Task", DeleteTask),
-            ("Resource", "Assignments", "Assign Resources", Assign),
-            ("Resource", "Assignments", "Clear Resources", ClearResources),
-            ("Resource", "Level", "Level All", LevelAll),
-            ("Resource", "Level", "Clear Leveling", ClearLeveling),
-            ("Report", "Export", "Export Gantt", ExportGantt),
-            ("Project", "Schedule", "Calculate Project", CalculateProject),
-            ("Project", "Schedule", "Set Baseline", Baseline),
-            ("View", "Data", "Show Subtasks", ShowSubtasks),
-            ("View", "Data", "Hide Subtasks", HideSubtasks),
-            ("View", "Zoom", "Scroll Left", ScrollLeft),
-            ("View", "Zoom", "Scroll Right", ScrollRight),
-            ("View", "Zoom", "Go to Start", GoToStart),
+            ("Task", "Schedule", "Indent", "Indent Task", Indent),
+            ("Task", "Schedule", "Outdent", "Outdent Task", Outdent),
+            (
+                "Task",
+                "Schedule",
+                "Link Tasks",
+                "Link the Selected Tasks",
+                AddLink,
+            ),
+            (
+                "Task",
+                "Tasks",
+                "Manually Schedule",
+                "Manually Schedule",
+                ManuallySchedule,
+            ),
+            (
+                "Task",
+                "Tasks",
+                "Auto Schedule",
+                "Auto Schedule",
+                AutoSchedule,
+            ),
+            ("Task", "Insert", "Task", "Task", AddTask),
+            (
+                "Task",
+                "Insert",
+                "Blank Row",
+                "Insert Blank Row",
+                InsertBlankRow,
+            ),
+            ("Task", "Insert", "Milestone", "Insert Milestone", Milestone),
+            (
+                "Task",
+                "Properties",
+                "Information...",
+                "View Task Information",
+                Constraint,
+            ),
+            ("Task", "Editing", "Find...", "Find...", Find),
+            (
+                "Resource",
+                "Assignments",
+                "Assign Resources...",
+                "Assign Resources...",
+                Assign,
+            ),
+            ("Resource", "Level", "Level All", "Level All", LevelAll),
+            (
+                "Resource",
+                "Level",
+                "Clear Leveling",
+                "Clear Leveling",
+                ClearLeveling,
+            ),
+            (
+                "Project",
+                "Schedule",
+                "Calculate Project",
+                "Calculate Project",
+                CalculateProject,
+            ),
+            (
+                "Project",
+                "Schedule",
+                "Set Baseline",
+                "Set Baseline",
+                Baseline,
+            ),
+            (
+                "View",
+                "Data",
+                "Show Subtasks",
+                "Show Subtasks",
+                ShowSubtasks,
+            ),
+            (
+                "View",
+                "Data",
+                "Hide Subtasks",
+                "Hide Subtasks",
+                HideSubtasks,
+            ),
         ];
         let tabs = tabs();
-        for (tab, group, name, act) in paths {
+        for (tab, group, name, tip, act) in paths {
             let groups = &tabs.iter().find(|(t, _)| *t == tab).unwrap().1;
             let g = groups
                 .iter()
                 .find(|g| g.title == group)
                 .unwrap_or_else(|| panic!("no group {tab} › {group}"));
-            let found = g.rows.iter().flatten().any(|s| match s {
-                Seg::Btn(b) => b.glyph.ends_with(&format!(" {name}")) && b.act == act,
-                Seg::Gap(_) => false,
+            let found = g.rows.iter().flatten().find_map(|s| match s {
+                Seg::Btn(b) if b.glyph.ends_with(&format!(" {name}")) && b.act == act => Some(b),
+                _ => None,
             });
-            assert!(found, "no {tab} › {group} › {name} → {act:?}");
+            let b = found.unwrap_or_else(|| panic!("no {tab} › {group} › {name} → {act:?}"));
+            assert!(
+                b.hint == tip || b.hint.starts_with(&format!("{tip} — ")),
+                "{tab} › {group} › {name}: hint {:?} does not start with {tip:?}",
+                b.hint
+            );
         }
         // Nothing else: exactly these groups per tab, and no stray buttons.
         for (tab, groups) in &tabs {
@@ -408,12 +426,20 @@ mod tests {
             let rows = paths.iter().filter(|p| p.0 == *tab).count();
             assert_eq!(buttons, rows, "buttons on {tab}");
         }
+        // Project's Report groups are not implemented; the tab stays, empty.
+        assert!(tabs.iter().any(|(t, g)| *t == "Report" && g.is_empty()));
     }
 
     #[test]
     fn every_group_is_wide_enough_for_its_content() {
         for (_, groups) in tabs() {
             for g in &groups {
+                assert!(
+                    g.width >= g.title.chars().count(),
+                    "group {:?} width {} < its title",
+                    g.title,
+                    g.width
+                );
                 for row in &g.rows {
                     assert!(
                         g.width >= content_w(row),

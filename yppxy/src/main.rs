@@ -665,28 +665,11 @@ impl App {
         match act {
             Act::AddTask => self.add_task(),
             Act::InsertBlankRow => self.insert_blank_row(),
-            Act::DeleteTask => self.delete_task(),
             Act::Milestone => self.toggle_milestone(),
             Act::ManuallySchedule => self.set_manual(true),
             Act::AutoSchedule => self.set_manual(false),
             Act::Indent => self.indent(1),
             Act::Outdent => self.indent(-1),
-            Act::Rename => {
-                if let Some(t) = self.ed.project().tasks.get(self.ed.sel()) {
-                    self.prompt = Some(Prompt {
-                        kind: PromptKind::Rename,
-                        label: "Rename".into(),
-                        buf: t.name.clone(),
-                    });
-                }
-            }
-            Act::Duration => {
-                self.prompt = Some(Prompt {
-                    kind: PromptKind::Duration,
-                    label: "Duration".into(),
-                    buf: String::new(),
-                });
-            }
             Act::AddLink => {
                 self.prompt = Some(Prompt {
                     kind: PromptKind::AddPredecessor,
@@ -720,15 +703,10 @@ impl App {
             Act::Assign => {
                 self.prompt = Some(Prompt {
                     kind: PromptKind::Assign,
-                    label: "Assign resource".into(),
+                    label: "Assign resource (empty clears)".into(),
                     buf: String::new(),
                 });
             }
-            Act::ClearResources => self.assign_resource(""),
-            Act::ExportGantt => self.export_md(),
-            Act::ScrollLeft => self.hscroll -= 1,
-            Act::ScrollRight => self.hscroll += 1,
-            Act::GoToStart => self.hscroll = 0,
             Act::ShowSubtasks => self.show_subtasks(),
             Act::HideSubtasks => self.hide_subtasks(),
         }
@@ -1035,7 +1013,7 @@ impl App {
             match self.ribbon.hit(x, 0, false) {
                 ribbon::Hit::Tab(i) if !self.ribbon.tab_is_file(i) => {
                     self.backstage = None;
-                    self.ribbon.set_active(i);
+                    self.ribbon.show_tab(i);
                     self.rfocus = ribbon::Focus::Tab(i);
                 }
                 _ => self.backstage = None,
@@ -1341,7 +1319,7 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
                         if app.ribbon.tab_is_file(i) {
                             app.open_backstage();
                         } else {
-                            app.ribbon.set_active(i);
+                            app.ribbon.show_tab(i);
                             app.rfocus = ribbon::Focus::Tab(i);
                         }
                     }
@@ -1447,6 +1425,12 @@ fn on_key(app: &mut App, k: KeyEvent) {
         app.open_backstage();
         return;
     }
+    // Project's Alt+Home: the timescale back to the project start. Before
+    // the plain Home arm, which selects the first task.
+    if alt && k.code == KeyCode::Home {
+        app.hscroll = 0;
+        return;
+    }
 
     // Ctrl combinations first, so plain-letter shortcuts don't shadow them.
     if ctrl {
@@ -1524,7 +1508,7 @@ fn on_key(app: &mut App, k: KeyEvent) {
         KeyCode::Char('a') => {
             app.prompt = Some(Prompt {
                 kind: PromptKind::Assign,
-                label: "Assign resource".into(),
+                label: "Assign resource (empty clears)".into(),
                 buf: String::new(),
             });
         }
@@ -1579,7 +1563,7 @@ fn ribbon_key(app: &mut App, k: KeyEvent) {
                 if app.ribbon.tab_is_file(t) {
                     app.open_backstage();
                 } else {
-                    app.ribbon.set_active(t);
+                    app.ribbon.show_tab(t);
                     app.rfocus = app.ribbon.enter_body();
                 }
             }
@@ -1600,7 +1584,7 @@ fn step_ribbon(app: &mut App, dir: ribbon::Dir) {
     let nf = app.ribbon.nav(app.rfocus, dir);
     if let ribbon::Focus::Tab(t) = nf {
         if !app.ribbon.tab_is_file(t) {
-            app.ribbon.set_active(t);
+            app.ribbon.show_tab(t);
         }
     }
     app.rfocus = nf;
@@ -3072,6 +3056,67 @@ mod tests {
         assert!(s.contains("Gantt"), "gantt pane missing");
     }
 
+    /// Project's Alt+Home replaces the ribbon's Go to Start (#370): the
+    /// timescale goes back to the start and the selection stays. Plain Home
+    /// still selects the first task.
+    #[test]
+    fn alt_home_goes_to_start() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        app.add_task();
+        app.hscroll = 5;
+        let sel = app.ed.sel();
+        assert_ne!(sel, 0);
+        on_key(&mut app, KeyEvent::new(KeyCode::Home, KeyModifiers::ALT));
+        assert_eq!(app.hscroll, 0);
+        assert_eq!(app.ed.sel(), sel, "the selection stays");
+        app.hscroll = 5;
+        on_key(&mut app, KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.ed.sel(), 0);
+        assert_eq!(app.hscroll, 5, "plain Home leaves the timescale");
+    }
+
+    /// Report has no groups (#370) but is still a tab you can select: Enter
+    /// and the arrow keys make it active, and it draws an empty body.
+    #[test]
+    fn the_empty_report_tab_can_be_selected() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        let report = (0..)
+            .map_while(|i| app.ribbon.tab_label(i).map(|l| (i, l)))
+            .find(|(_, l)| *l == "Report")
+            .unwrap()
+            .0;
+        app.rfocus = ribbon::Focus::Tab(report);
+        on_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.ribbon.active_tab(), report);
+        assert_eq!(app.rfocus, ribbon::Focus::Tab(report), "nothing to enter");
+        let s = buffer_text(&mut app, 110, 24);
+        assert!(s.contains("Report"));
+        assert!(!s.contains("Milestone"), "the Task body is gone");
+        // Arrowing off and back on selects it too.
+        app.rfocus = ribbon::Focus::Tab(report);
+        on_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.ribbon.active_tab(), report - 1);
+        on_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.ribbon.active_tab(), report);
+    }
+
+    /// Clear Resources left the ribbon (#370); Assign with an empty name is
+    /// its route.
+    #[test]
+    fn assign_with_an_empty_name_clears_the_resources() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        app.assign_resource("Alice");
+        assert_eq!(app.ed.project().assignments.len(), 1);
+        on_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        );
+        assert!(app.prompt.as_ref().unwrap().label.contains("empty clears"));
+        on_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.ed.project().assignments.is_empty());
+        assert_eq!(app.status, "Cleared the task's resources");
+    }
+
     #[test]
     fn backstage_and_start_render() {
         // start screen
@@ -3464,9 +3509,9 @@ mod tests {
         app.ed.select(0);
         let before = app.ed.project().clone();
         // Ribbon clicks reach `apply_act` while a text prompt is open.
-        app.apply_act(Act::Rename);
+        app.apply_act(Act::Constraint);
         assert!(app.prompt.is_some());
-        app.apply_act(Act::DeleteTask);
+        app.delete_task();
         assert!(
             app.prompt.is_none(),
             "the prompt would take the modal's keys"
@@ -3476,7 +3521,7 @@ mod tests {
         assert_eq!(app.ed.project(), &before);
 
         // File ▸ Exit over a prompt is the same case.
-        app.apply_act(Act::Rename);
+        app.apply_act(Act::Constraint);
         app.request_exit();
         assert!(app.prompt.is_none());
     }
