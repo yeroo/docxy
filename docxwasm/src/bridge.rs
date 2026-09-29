@@ -1216,14 +1216,11 @@ impl Session {
     /// it, and produces the terminal-shaped `{path}` reply on the wire.
     /// Doesn't touch `self.editor`, so it neither dirties the session nor is
     /// part of the undo stack — mirrors docxy control.rs's `export_pdf`
-    /// (`PdfOptions`/`styles` construction is identical).
+    /// (page layout, headers and footers from the package).
     fn ctl_export_pdf(&self) -> String {
         let pdf = to_pdf(
             &self.editor.doc,
-            &PdfOptions {
-                styles: self.styles.clone(),
-                ..PdfOptions::default()
-            },
+            &PdfOptions::from_package(&self.pkg, self.styles.clone()),
         );
         let mut out = String::from("{\"pdfBase64\":");
         json::push_str(&mut out, &json::to_base64(&pdf));

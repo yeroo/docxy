@@ -364,10 +364,7 @@ fn convert_headless(
                 .unwrap_or_default();
             to_pdf(
                 &pkg.document,
-                &PdfOptions {
-                    styles: Rc::new(styles),
-                    ..PdfOptions::default()
-                },
+                &PdfOptions::from_package(pkg, Rc::new(styles)),
             )
         }
         HeadlessFormat::Markdown => {
@@ -2206,16 +2203,25 @@ impl App {
         self.write_pdf(out);
     }
 
+    /// PDF layout inputs from the package, with the default header/footer the
+    /// page view shows standing in for their parts.
+    fn pdf_options(&self) -> PdfOptions {
+        let mut opts = PdfOptions::from_package(&self.pkg, self.styles.clone());
+        for (part, blocks) in [
+            (&self.header_part, &self.headers.default),
+            (&self.footer_part, &self.footers.default),
+        ] {
+            if let Some(part) = part {
+                opts.header_footer.insert(part.clone(), blocks.clone());
+            }
+        }
+        opts
+    }
+
     /// Render the document to a PDF at `out` and report the result in the status
     /// line. Callers handle any overwrite confirmation first.
     fn write_pdf(&mut self, out: std::path::PathBuf) {
-        let pdf = to_pdf(
-            &self.editor.doc,
-            &PdfOptions {
-                styles: self.styles.clone(),
-                ..PdfOptions::default()
-            },
-        );
+        let pdf = to_pdf(&self.editor.doc, &self.pdf_options());
         self.status = match export_atomic(Some(Path::new(&self.path)), &out, &pdf) {
             Ok(()) => Some(format!("exported {}", out.display())),
             Err(e) => Some(format!("export failed: {e}")),
@@ -8948,6 +8954,33 @@ mod tests {
         allowed.on_key(key(KeyCode::F(6)));
         assert!(!allowed.modified);
         assert_eq!(allowed.pkg.part(&part).unwrap(), before);
+    }
+
+    #[test]
+    fn pdf_export_prints_the_header_the_page_view_shows() {
+        let mut app = app_with(&["body"]);
+        app.run_act(ribbon::Act::EditHeader);
+        app.on_key(key(KeyCode::Char('H')));
+        app.on_key(key(KeyCode::F(6)));
+        assert!(app.hf_edit.is_none());
+        let pdf =
+            String::from_utf8_lossy(&to_pdf(&app.editor.doc, &app.pdf_options())).into_owned();
+        assert!(
+            pdf.contains("(H) Tj"),
+            "committed header missing from the PDF"
+        );
+
+        // The page view's copy stands in for the part.
+        app.headers.default = Rc::new(vec![Block::Paragraph(MPara {
+            props: ParProps::default(),
+            content: vec![Inline::Run(Run {
+                text: "Live".to_string(),
+                props: RunProps::default(),
+            })],
+        })]);
+        let pdf =
+            String::from_utf8_lossy(&to_pdf(&app.editor.doc, &app.pdf_options())).into_owned();
+        assert!(pdf.contains("(Live) Tj") && !pdf.contains("(H) Tj"));
     }
 
     #[test]
