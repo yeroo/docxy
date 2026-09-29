@@ -265,6 +265,7 @@ State keys, as the app reports them after every driving verb:
 | `app_state` | a Project tab's status-bar state, `Ready`, `Edit` (a cell editor, prompt or dialog is open) or `Busy` (a levelling pass is pending); `null` on other tabs |
 | `dialog` | the active tab's top dialog's id, or `none`, on every surface; `dialog-click`'s reply carries the `dialog-read` object under this key instead |
 | `tabs`, `ask_on_close` | open tab count and whether window close asks about unsaved changes |
+| `autorecover_minutes` | minutes between AutoRecover writes while a tab is unsaved; `0` is off |
 | `menu` | the open menu's `{target}`, or null; `menu-read` has its items |
 | `sheet`, `sel`, `anchor`, `range` | the sheet and its selection |
 | `editing`, `edit` | whether a cell edit is open, and its text |
@@ -364,6 +365,17 @@ An optional `index` targets an inactive tab; it defaults to the active tab.
 `call backstage-close {}` calls the Backstage Close handler without supplying
 an answer. `call ask-on-close {"on":true}` uses the same setting handler as
 Settings; closing a dirty single tab always asks regardless of this window setting.
+
+`call autorecover {"minutes":N}` sets the Settings AutoRecover interval (`0`
+turns it off). `call autorecover-now {}` runs one AutoRecover tick at once, as
+the timer would when the interval is up, and replies `{"wrote":bool}`: whether
+anything was unsaved and so written to the hot-exit sidecars and
+`session.json`. It flushes an open header/footer but leaves sheet and Project
+cell editors open. A run leaves `<config>/docxy/running` behind until a clean
+exit (window close or `quit`) removes it; a relaunch that finds it labels its
+dirty restored tabs `recovered — AutoRecover copy …`. The ignored desktop test
+`uiharness/tests/autorecover.rs` kills an instance after a tick and checks the
+relaunch.
 
 `project-tabs.uit` drives several plans at once: a blank one from `proj.new`
 that takes tasks without a fixture, two opened plans switched between by title
@@ -626,7 +638,7 @@ that edits, reloads, saves or focuses the plan, and every harness verb that
 stands for a press outside the menu (`click-cell`, `drag`, `select-chart`,
 `focus-field`, `ribbon-click`, `title-tab`, `close-tab`, `selection-set`,
 `open`, `backstage` open and close (not `read`), `backstage-close`,
-`theme-set`, `ask-on-close` and the
+`theme-set`, `ask-on-close`, `autorecover` and the
 `dialog-*` drivers), which closes it first and then goes on, as the press
 would. Reads leave it open.
 
