@@ -919,9 +919,9 @@ impl Editor {
         })?;
         // Only a date change restamps a manual task. A save writes most auto
         // tasks' scheduled dates, not their stored ones; it keeps the stored
-        // dates only where the schedule does not reproduce Project (leveled
-        // plans, plans scheduled from the finish; see mspdi's
-        // scheduled_dates), which a rename or a level change must not
+        // dates only where the schedule does not reproduce Project (e.g. a
+        // leveled plan; see mspdi's schedule_reproduces), which a rename or a
+        // level change must not
         // overwrite either. A blank row's new dates are stamped by edit_row; a
         // newly pinned task's here.
         if duration_changed || (mode_changed && patch.manual == Some(true)) {
