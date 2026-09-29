@@ -8,7 +8,9 @@
 //! tasks becoming chart sections. The block excludes the project calendar's
 //! non-working weekdays and holiday dates, and includes working exception
 //! dates on otherwise excluded weekdays.
-//! The accompanying table includes bold summary rows with rolled-up dates (a
+//! The accompanying table names each task as stored (line breaks flattened,
+//! `\` and `|` escaped); only the chart strips `:,;#` from names. It
+//! includes bold summary rows with rolled-up dates (a
 //! manually scheduled summary's own dates) and working durations, each task's
 //! Deadline (marked `⚠` when the row's Finish is after it), signed total slack,
 //! and the scheduler's free slack. A task's Duration and slack show in the
@@ -46,7 +48,7 @@ pub fn to_mermaid(proj: &Project, sched: &Schedule) -> String {
             // the enclosing section.
             if task.outline_level <= 1 {
                 section = sanitize(&task.name)
-                    .or_else(|| summary_fallback(proj, task))
+                    .or_else(|| summary_fallback(proj, task, sanitize))
                     .or(Some("Section".into()));
             }
             continue;
@@ -85,7 +87,8 @@ pub fn to_mermaid(proj: &Project, sched: &Schedule) -> String {
 
 /// Render a full Markdown document: a heading, the fenced Mermaid chart, and a
 /// task table (start, finish, deadline, duration, total/free slack, critical) as a text
-/// fallback for viewers that don't render Mermaid. Summary names are bold and
+/// fallback for viewers that don't render Mermaid. Task names show as stored,
+/// with line breaks flattened and `\` and `|` escaped. Summary names are bold and
 /// their durations are the working time between their scheduled dates (rolled
 /// up, or a manual summary's own), measured
 /// as [`crate::schedule::task_duration_min`] measures them: on the project's
@@ -110,10 +113,9 @@ pub fn to_markdown(proj: &Project, sched: &Schedule) -> String {
         let Some(r) = sched.get(task.uid) else {
             continue;
         };
-        let name = sanitize(&task.name)
-            .or_else(|| summary_fallback(proj, task))
+        let name = table_cell(&task.name)
+            .or_else(|| summary_fallback(proj, task, table_cell))
             .unwrap_or_else(|| format!("Task {}", task.uid));
-        let name = name.replace('|', "\\|");
         let name = if task.summary {
             format!("**{name}**")
         } else {
@@ -264,10 +266,25 @@ fn sanitize(s: &str) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
-/// A pathless project can still name its UID 0 row from project metadata.
-fn summary_fallback(proj: &Project, task: &Task) -> Option<String> {
+/// A name as a Markdown table cell: line breaks and tabs flattened to one
+/// space each, ends trimmed, then `\` and `|` backslash-escaped so the row
+/// keeps its cells. Everything else is kept as stored. Returns `None` for an
+/// empty result.
+fn table_cell(s: &str) -> Option<String> {
+    let flat = s.replace("\r\n", " ").replace(['\r', '\n', '\t'], " ");
+    let out = flat.trim().replace('\\', "\\\\").replace('|', "\\|");
+    (!out.is_empty()).then_some(out)
+}
+
+/// A pathless project can still name its UID 0 row from project metadata,
+/// formatted by `fmt` for where it is written.
+fn summary_fallback(
+    proj: &Project,
+    task: &Task,
+    fmt: fn(&str) -> Option<String>,
+) -> Option<String> {
     (task.is_project_summary() && task.name.trim().is_empty())
-        .then(|| sanitize(&proj.title).or_else(|| sanitize(&proj.name)))
+        .then(|| fmt(&proj.title).or_else(|| fmt(&proj.name)))
         .flatten()
 }
 
@@ -862,6 +879,99 @@ mod tests {
         let m = to_mermaid(&proj, &s);
         // colon/comma removed from the name so the task line stays parseable.
         assert!(m.contains("Design phase one :"), "got:\n{m}");
+    }
+
+    /// A parsed cell as a Markdown reader shows it: each `\` escapes the
+    /// next character, the way docxy's table reader treats it.
+    fn unescape(cell: &str) -> String {
+        let mut out = String::new();
+        let mut chars = cell.chars();
+        while let Some(c) = chars.next() {
+            out.push(if c == '\\' {
+                chars.next().unwrap_or(c)
+            } else {
+                c
+            });
+        }
+        out
+    }
+
+    /// The Markdown and Mermaid output of a project with one 1d task per name.
+    fn name_rows(names: &[&str]) -> (String, String) {
+        let tasks = names
+            .iter()
+            .zip(1..)
+            .map(|(name, uid)| task(uid, name, 480))
+            .collect();
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks,
+            ..Project::default()
+        };
+        let sched = schedule(&proj);
+        (to_markdown(&proj, &sched), to_mermaid(&proj, &sched))
+    }
+
+    #[test]
+    fn table_keeps_punctuation_in_task_names() {
+        let names = [
+            "Dig foundation, east wing: phase 2; lot #7",
+            "Coordinate the structural, mechanical and electrical inspections for the east wing",
+        ];
+        let (md, mermaid) = name_rows(&names);
+        let rows = table_rows(&md);
+        assert_eq!(rows.len(), 3, "{md}");
+        for (row, name) in rows[1..].iter().zip(names) {
+            assert_eq!(row[0], name, "{md}");
+        }
+        assert!(
+            mermaid.contains("    Dig foundation east wing phase 2 lot 7 :"),
+            "{mermaid}"
+        );
+        assert!(md.contains("    Dig foundation east wing phase 2 lot 7 :"));
+    }
+
+    #[test]
+    fn table_escapes_pipes_backslashes_and_flattens_line_breaks() {
+        let names = ["in\\|out", "a | b", "dir\\", "C:\\temp"];
+        let (md, _) = name_rows(&names);
+        let rows = table_rows(&md);
+        assert_eq!(rows.len(), 1 + names.len(), "{md}");
+        for (row, name) in rows[1..].iter().zip(names) {
+            assert_eq!(row.len(), 8, "{md}");
+            assert_eq!(unescape(row[0]), name, "{md}");
+        }
+        assert!(md.contains("| a \\| b |"), "{md}");
+        assert!(md.contains("| dir\\\\ |"), "{md}");
+
+        let (md, _) = name_rows(&["one\r\ntwo", "one\ntwo", "one\rtwo", "one\ttwo"]);
+        let rows = table_rows(&md);
+        assert_eq!(rows.len(), 5, "{md}");
+        for row in &rows[1..] {
+            assert_eq!(row.len(), 8, "{md}");
+            assert_eq!(row[0], "one two", "{md}");
+        }
+
+        let mut summary = task(1, "A | b, c", 0);
+        summary.summary = true;
+        let mut leaf = task(2, "Leaf", 480);
+        leaf.outline_level = 2;
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![summary, leaf],
+            ..Project::default()
+        };
+        let md = to_markdown(&proj, &schedule(&proj));
+        let rows = table_rows(&md);
+        assert_eq!(rows[1].len(), 8, "{md}");
+        assert_eq!(rows[1][0], "**A \\| b, c**", "{md}");
+    }
+
+    #[test]
+    fn table_break_only_names_fall_back() {
+        let (md, _) = name_rows(&["\r\n", "\t", ""]);
+        let cells: Vec<_> = table_rows(&md)[1..].iter().map(|row| row[0]).collect();
+        assert_eq!(cells, ["Task 1", "Task 2", "Task 3"], "{md}");
     }
 
     #[test]
