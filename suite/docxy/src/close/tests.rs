@@ -309,8 +309,13 @@ fn window_close_does_not_stop_at_an_invalid_project_buffer() {
 /// opened on it the way `enter_hf` opens it and nothing typed.
 fn untouched_existing_header(name: &str, is_header: bool) -> (DocTab, String, Vec<u8>) {
     let mut source = tab(Kind::Docx);
+    // Through the body editor, whose final section Save writes.
+    let part_name = edit_final_sect_pr(&mut source, false, |pkg| {
+        pkg.create_hf(is_header, "default")
+    })
+    .flatten()
+    .unwrap();
     let pkg = source.pkg.as_mut().unwrap();
-    let part_name = pkg.create_hf(is_header, "default").unwrap();
     let word_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n\
         <w:hdr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
         xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" \
