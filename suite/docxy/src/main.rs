@@ -35,6 +35,7 @@ mod recover;
 mod ribbon_export;
 #[cfg(test)]
 mod sect_pr_tests;
+mod sheet_ribbon;
 mod style_gallery;
 mod tabstrip;
 use project::*;
@@ -612,7 +613,7 @@ fn bar_target(act: SheetAct) -> Option<RefTarget> {
 fn act_targets_cells(act: SheetAct) -> bool {
     !matches!(
         act,
-        SheetAct::ProtectSheet | SheetAct::Outline | SheetAct::Todo
+        SheetAct::ProtectSheet | SheetAct::Outline | SheetAct::NumberFormatMenu | SheetAct::Todo
     )
 }
 
@@ -856,7 +857,7 @@ struct GridClip {
 /// Mirrors Excel's Home tab; `Todo` is an inert placeholder for commands whose
 /// engine support isn't wired yet (they render but do nothing), like Word's
 /// dialog-launcher stubs.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SheetAct {
     Cut,
     Copy,
@@ -902,6 +903,8 @@ enum SheetAct {
     ProtectSheet,
     Subtotal,
     Outline,
+    /// The Number group's format combo: opens or closes the format strip.
+    NumberFormatMenu,
     Todo,
 }
 
@@ -10945,6 +10948,10 @@ impl Docxy {
                 self.sheet_ttc_edit = Some(String::new());
                 cx.notify();
             }
+            SheetAct::NumberFormatMenu => {
+                self.sheet_numfmt_open = !self.sheet_numfmt_open;
+                cx.notify();
+            }
             SheetAct::Todo => {}
         }
         self.refocus(window, cx);
@@ -17554,11 +17561,12 @@ impl Docxy {
             .into_any_element()
     }
 
-    /// A combo-box display (font name/size, number format) — inert for now.
+    /// A combo-box display (font name/size) — inert for now.
     fn sheet_combo(
         &self,
         value: &'static str,
         wide: bool,
+        act: SheetAct,
         pal: Pal,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -17590,9 +17598,7 @@ impl Docxy {
                     .text_color(pal.dim)
                     .child("\u{25BE}"),
             )
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.run_sheet_act(SheetAct::Todo, window, cx)
-            }))
+            .on_click(cx.listener(move |this, _, window, cx| this.run_sheet_act(act, window, cx)))
             .into_any_element()
     }
 
@@ -17628,9 +17634,8 @@ impl Docxy {
                     .text_color(pal.dim)
                     .child("\u{25BE}"),
             )
-            .on_click(cx.listener(|this, _, _w, cx| {
-                this.sheet_numfmt_open = !this.sheet_numfmt_open;
-                cx.notify();
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.run_sheet_act(SheetAct::NumberFormatMenu, window, cx)
             }))
             .into_any_element()
     }
@@ -18709,468 +18714,139 @@ impl Docxy {
             .into_any_element()
     }
 
-    /// The spreadsheet ribbon body — the Home tab, or the Insert tab (Tables).
+    /// The spreadsheet ribbon body for the selected tab, drawn from the
+    /// `sheet_ribbon` table (Home for a tab without its own entry). The table
+    /// is also what `ribbon-read` reports, so the two cannot disagree.
     fn sheet_ribbon_body(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        match self.ribbon_tab {
-            RibbonTab::Insert => self.sheet_insert_ribbon(pal, cx),
-            RibbonTab::Review => self.sheet_review_ribbon(pal, cx),
-            RibbonTab::View => self.sheet_view_ribbon(pal, cx),
-            _ => self.sheet_home_ribbon(pal, cx),
+        let tab = sheet_ribbon::tab_def(self.ribbon_tab);
+        let xf = self.active_xf();
+        h_flex()
+            .id("sheet-ribbon")
+            .w_full()
+            .h(px(100.))
+            .items_stretch()
+            .px_1()
+            .bg(pal.panel)
+            .border_b_1()
+            .border_color(pal.border)
+            .overflow_x_scroll()
+            .children(
+                tab.groups
+                    .iter()
+                    .map(|g| self.sheet_group(g, tab.titles, &xf, pal, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// Whether a sheet command's state is on, for the commands whose label
+    /// reads differently then (Unfreeze Panes, Unprotect Sheet).
+    fn sheet_act_toggled(&self, act: SheetAct) -> bool {
+        match act {
+            SheetAct::FreezePanes => self
+                .active_sheet()
+                .is_some_and(|v| v.sheet().freeze != (0, 0)),
+            SheetAct::ProtectSheet => self.sheet_protected(),
+            _ => false,
         }
     }
 
-    /// The Insert tab: a Tables group (PivotTable, Table) like Excel.
-    fn sheet_insert_ribbon(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let group = |title: &str, body: AnyElement| -> AnyElement {
-            v_flex()
-                .h(px(94.))
-                .px_1p5()
-                .py(px(3.))
-                .justify_between()
-                .border_r_1()
-                .border_color(pal.border)
-                .child(div().flex_1().flex().items_center().child(body))
-                .child(
-                    div()
-                        .w_full()
-                        .text_size(px(10.))
-                        .text_color(pal.dim)
-                        .text_center()
-                        .child(title.to_string()),
-                )
-                .into_any_element()
+    /// One sheet ribbon group: content on top, a centered label (+ optional
+    /// dialog launcher) at the bottom, and a right divider — exactly like the
+    /// doc ribbon.
+    fn sheet_group(
+        &self,
+        g: &sheet_ribbon::Group,
+        titles: sheet_ribbon::Titles,
+        xf: &gridcore::sheet::Xf,
+        pal: Pal,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use sheet_ribbon::{Body, Item};
+        let gap = |d: Div, g: sheet_ribbon::Gap| match g {
+            sheet_ribbon::Gap::Px(v) => d.gap(px(v)),
+            sheet_ribbon::Gap::Rem(v) => d.gap(rems(v)),
         };
-        h_flex()
-            .id("sheet-ribbon")
-            .w_full()
-            .h(px(100.))
-            .items_stretch()
-            .px_1()
-            .bg(pal.panel)
-            .border_b_1()
-            .border_color(pal.border)
-            .overflow_x_scroll()
-            .child(group(
-                "Tables",
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_1()
-                    .child(self.sheet_lb(
-                        Some("table"),
-                        "PivotTable",
-                        SheetAct::InsertPivot,
-                        pal,
-                        cx,
-                    ))
-                    .child(self.sheet_lb(Some("table"), "Table", SheetAct::FormatAsTable, pal, cx))
-                    .child(self.sheet_lb(
-                        None,
-                        "Data Validation",
-                        SheetAct::DataValidation,
-                        pal,
-                        cx,
-                    ))
-                    .child(self.sheet_lb(None, "Text to Columns", SheetAct::TextToColumns, pal, cx))
-                    .into_any_element(),
-            ))
-            .child(group(
-                "Outline",
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_1()
-                    .child(self.sheet_lb(None, "Subtotal", SheetAct::Subtotal, pal, cx))
-                    .child(self.sheet_lb(None, "Group / Ungroup", SheetAct::Outline, pal, cx))
-                    .into_any_element(),
-            ))
-            .child(group(
-                "Charts",
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_1()
-                    .child(self.sheet_lb(None, "Column", SheetAct::InsertChart("column"), pal, cx))
-                    .child(self.sheet_lb(None, "Bar", SheetAct::InsertChart("bar"), pal, cx))
-                    .child(self.sheet_lb(None, "Line", SheetAct::InsertChart("line"), pal, cx))
-                    .child(self.sheet_lb(None, "Pie", SheetAct::InsertChart("pie"), pal, cx))
-                    .into_any_element(),
-            ))
-            .into_any_element()
-    }
-
-    /// The Review tab, laid out like Excel: Proofing, Comments, Protect. These
-    /// aren't modeled for sheets yet (no cell-comment model), so the buttons are
-    /// inert placeholders — the point is a distinct, Excel-faithful tab identity
-    /// (it used to fall through to the Home ribbon).
-    fn sheet_review_ribbon(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let group = |title: &str, body: AnyElement| -> AnyElement {
-            v_flex()
-                .h(px(94.))
-                .px_1p5()
-                .py(px(3.))
-                .justify_between()
-                .border_r_1()
-                .border_color(pal.border)
-                .child(div().flex_1().flex().items_center().child(body))
-                .child(
-                    div()
-                        .w_full()
-                        .text_size(px(10.))
-                        .text_color(pal.dim)
-                        .text_center()
-                        .child(title.to_string()),
-                )
-                .into_any_element()
-        };
-        h_flex()
-            .id("sheet-ribbon")
-            .w_full()
-            .h(px(100.))
-            .items_stretch()
-            .px_1()
-            .bg(pal.panel)
-            .border_b_1()
-            .border_color(pal.border)
-            .overflow_x_scroll()
-            .child(group(
-                "Proofing",
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_1()
-                    .child(self.sheet_lb(None, "Spelling", SheetAct::Todo, pal, cx))
-                    .into_any_element(),
-            ))
-            .child(group(
-                "Comments",
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_1()
-                    .child(self.sheet_lb(None, "New Comment", SheetAct::NewComment, pal, cx))
-                    .child(self.sheet_lb(None, "Delete", SheetAct::DeleteComment, pal, cx))
-                    .child(self.sheet_lb(None, "Previous", SheetAct::PrevComment, pal, cx))
-                    .child(self.sheet_lb(None, "Next", SheetAct::NextComment, pal, cx))
-                    .into_any_element(),
-            ))
-            .child(group(
-                "Protect",
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_1()
-                    .child(self.sheet_lb(
-                        Some("lock"),
-                        if self.sheet_protected() {
-                            "Unprotect Sheet"
-                        } else {
-                            "Protect Sheet"
-                        },
-                        SheetAct::ProtectSheet,
-                        pal,
-                        cx,
-                    ))
-                    .child(self.sheet_lb(None, "Protect Workbook", SheetAct::Todo, pal, cx))
-                    .into_any_element(),
-            ))
-            .into_any_element()
-    }
-
-    /// The View tab: a Window group with Freeze Panes, like Excel.
-    fn sheet_view_ribbon(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let frozen = self
-            .active_sheet()
-            .is_some_and(|v| v.sheet().freeze != (0, 0));
-        let group = |title: &str, body: AnyElement| -> AnyElement {
-            v_flex()
-                .h(px(94.))
-                .px_1p5()
-                .py(px(3.))
-                .justify_between()
-                .border_r_1()
-                .border_color(pal.border)
-                .child(div().flex_1().flex().items_center().child(body))
-                .child(
-                    div()
-                        .w_full()
-                        .text_size(px(10.))
-                        .text_color(pal.dim)
-                        .text_center()
-                        .child(title.to_string()),
-                )
-                .into_any_element()
-        };
-        h_flex()
-            .id("sheet-ribbon")
-            .w_full()
-            .h(px(100.))
-            .items_stretch()
-            .px_1()
-            .bg(pal.panel)
-            .border_b_1()
-            .border_color(pal.border)
-            .overflow_x_scroll()
-            .child(group(
-                "Window",
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_1()
-                    .child(self.sheet_lb(
-                        None,
-                        if frozen {
-                            "Unfreeze Panes"
-                        } else {
-                            "Freeze Panes"
-                        },
-                        SheetAct::FreezePanes,
-                        pal,
-                        cx,
-                    ))
-                    .into_any_element(),
-            ))
-            .into_any_element()
-    }
-
-    /// The spreadsheet Home tab, laid out like Excel: Clipboard, Font, Alignment,
-    /// Number, Styles, Cells, Editing.
-    fn sheet_home_ribbon(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let xf = self.active_xf();
-        // A group frame: content on top, a centered label (+ optional dialog
-        // launcher) at the bottom, and a right divider — exactly like the doc ribbon.
-        let group = |title: &str, launcher: bool, body: AnyElement| -> AnyElement {
-            v_flex()
-                .h(px(94.))
-                .px_1p5()
-                .py(px(3.))
-                .justify_between()
-                .border_r_1()
-                .border_color(pal.border)
-                .child(div().flex_1().flex().items_center().child(body))
-                .child(
+        let body = match &g.body {
+            Body::Strip {
+                gap: strip_gap,
+                items,
+            } => {
+                let mut strip = gap(h_flex().h_full().items_center(), *strip_gap);
+                for item in *items {
+                    strip = strip.child(match item {
+                        Item::One(c) => self.sheet_cmd_el(c, xf, pal, cx),
+                        Item::Col { gap: col_gap, cmds } => gap(v_flex(), *col_gap)
+                            .children(cmds.iter().map(|c| self.sheet_cmd_el(c, xf, pal, cx)))
+                            .into_any_element(),
+                    });
+                }
+                strip.into_any_element()
+            }
+            Body::Rows(rows) => v_flex()
+                .gap(px(1.))
+                .children(rows.iter().map(|r| {
                     h_flex()
-                        .w_full()
                         .items_center()
-                        .justify_center()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_size(px(10.))
-                                .text_color(pal.dim)
-                                .child(title.to_string()),
-                        )
-                        .when(launcher, |d| {
-                            d.child(
-                                div()
-                                    .text_size(px(9.))
-                                    .text_color(pal.dim)
-                                    .child("\u{2921}"),
-                            )
-                        }),
-                )
-                .into_any_element()
+                        .gap(px(2.))
+                        .children(r.iter().map(|c| self.sheet_cmd_el(c, xf, pal, cx)))
+                }))
+                .into_any_element(),
         };
-        let row = |kids: Vec<AnyElement>| {
-            h_flex()
-                .items_center()
-                .gap(px(2.))
-                .children(kids)
-                .into_any_element()
-        };
-        let col = |kids: Vec<AnyElement>| v_flex().gap(px(1.)).children(kids).into_any_element();
-
-        h_flex()
-            .id("sheet-ribbon")
-            .w_full()
-            .h(px(100.))
-            .items_stretch()
-            .px_1()
-            .bg(pal.panel)
-            .border_b_1()
+        v_flex()
+            .h(px(94.))
+            .px_1p5()
+            .py(px(3.))
+            .justify_between()
+            .border_r_1()
             .border_color(pal.border)
-            .overflow_x_scroll()
-            // Clipboard: big Paste + a Cut/Copy/Format-Painter column.
-            .child(group(
-                "Clipboard",
-                true,
-                h_flex()
-                    .h_full()
+            .child(div().flex_1().flex().items_center().child(body))
+            .child(match titles {
+                sheet_ribbon::Titles::WithLaunchers => h_flex()
+                    .w_full()
                     .items_center()
+                    .justify_center()
                     .gap_1()
-                    .child(self.sheet_lb(Some("paste"), "Paste", SheetAct::Paste, pal, cx))
-                    .child(col(vec![
-                        self.sheet_rb(Some("cut"), "Cut", SheetAct::Cut, pal, cx),
-                        self.sheet_rb(Some("copy"), "Copy", SheetAct::Copy, pal, cx),
-                        self.sheet_rb(None, "Format Painter", SheetAct::Todo, pal, cx),
-                    ]))
+                    .child(div().text_size(px(10.)).text_color(pal.dim).child(g.title))
+                    .when(g.launcher, |d| {
+                        d.child(
+                            div()
+                                .text_size(px(9.))
+                                .text_color(pal.dim)
+                                .child("\u{2921}"),
+                        )
+                    })
                     .into_any_element(),
-            ))
-            // Font: name/size combos + grow/shrink; then B/I/U, borders, fill, colour.
-            .child(group(
-                "Font",
-                true,
-                col(vec![
-                    row(vec![
-                        self.sheet_combo("Calibri", true, pal, cx),
-                        self.sheet_combo("11", false, pal, cx),
-                        self.sheet_ib("font-increase", SheetAct::GrowFont, false, pal, cx),
-                        self.sheet_ib("font-decrease", SheetAct::ShrinkFont, false, pal, cx),
-                    ]),
-                    row(vec![
-                        self.sheet_ib("bold", SheetAct::Bold, xf.bold, pal, cx),
-                        self.sheet_ib("italic", SheetAct::Italic, xf.italic, pal, cx),
-                        self.sheet_ib("underline", SheetAct::Todo, false, pal, cx),
-                        self.sheet_ib("border-bottom", SheetAct::ToggleBorder, xf.border, pal, cx),
-                        self.sheet_ib("highlight", SheetAct::FillColor, false, pal, cx),
-                        self.sheet_ib("text-color", SheetAct::FontColor, false, pal, cx),
-                    ]),
-                ]),
-            ))
-            // Alignment: top/mid/bottom + wrap; then left/center/right, indent, merge.
-            .child(group(
-                "Alignment",
-                true,
-                col(vec![
-                    row(vec![
-                        self.sheet_gb("\u{2580}", SheetAct::Todo, pal, cx),
-                        self.sheet_gb("\u{25AC}", SheetAct::Todo, pal, cx),
-                        self.sheet_gb("\u{2584}", SheetAct::Todo, pal, cx),
-                        self.sheet_rb(None, "Wrap Text", SheetAct::WrapText, pal, cx),
-                    ]),
-                    row(vec![
-                        self.sheet_ib(
-                            "align-left",
-                            SheetAct::AlignL,
-                            matches!(xf.align, gridcore::sheet::Align::Left),
-                            pal,
-                            cx,
-                        ),
-                        self.sheet_ib(
-                            "align-center",
-                            SheetAct::AlignC,
-                            matches!(xf.align, gridcore::sheet::Align::Center),
-                            pal,
-                            cx,
-                        ),
-                        self.sheet_ib(
-                            "align-right",
-                            SheetAct::AlignR,
-                            matches!(xf.align, gridcore::sheet::Align::Right),
-                            pal,
-                            cx,
-                        ),
-                        self.sheet_ib("indent-decrease", SheetAct::Todo, false, pal, cx),
-                        self.sheet_rb(None, "Row Height", SheetAct::RowHeight, pal, cx),
-                        self.sheet_rb(None, "Merge", SheetAct::Merge, pal, cx),
-                    ]),
-                ]),
-            ))
-            // Number: format combo; then currency/percent/comma + decimals.
-            .child(group(
-                "Number",
-                true,
-                col(vec![
-                    row(vec![self.sheet_numfmt_combo(pal, cx)]),
-                    row(vec![
-                        self.sheet_gb("$", SheetAct::Currency, pal, cx),
-                        self.sheet_gb("%", SheetAct::Percent, pal, cx),
-                        self.sheet_gb(",", SheetAct::Comma, pal, cx),
-                        self.sheet_gb("\u{2192}.0", SheetAct::Todo, pal, cx),
-                        self.sheet_gb(".00\u{2190}", SheetAct::Todo, pal, cx),
-                    ]),
-                ]),
-            ))
-            // Styles: Conditional Formatting, Format as Table, Cell Styles.
-            .child(group(
-                "Styles",
-                false,
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_0p5()
-                    .child(self.sheet_lb(
-                        None,
-                        "Conditional Formatting",
-                        SheetAct::CondFormat,
-                        pal,
-                        cx,
-                    ))
-                    .child(self.sheet_lb(
-                        Some("table"),
-                        "Format as Table",
-                        SheetAct::FormatAsTable,
-                        pal,
-                        cx,
-                    ))
-                    .child(self.sheet_lb(None, "Cell Styles", SheetAct::Todo, pal, cx))
+                sheet_ribbon::Titles::Plain => div()
+                    .w_full()
+                    .text_size(px(10.))
+                    .text_color(pal.dim)
+                    .text_center()
+                    .child(g.title)
                     .into_any_element(),
-            ))
-            // Cells: Insert, Delete, Format.
-            .child(group(
-                "Cells",
-                false,
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        v_flex()
-                            .gap_0p5()
-                            .child(self.sheet_rb(None, "Insert Row", SheetAct::InsertRow, pal, cx))
-                            .child(self.sheet_rb(None, "Insert Col", SheetAct::InsertCol, pal, cx)),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_0p5()
-                            .child(self.sheet_rb(None, "Delete Row", SheetAct::DeleteRow, pal, cx))
-                            .child(self.sheet_rb(None, "Delete Col", SheetAct::DeleteCol, pal, cx)),
-                    )
-                    .child(self.sheet_lb(None, "Format", SheetAct::FormatCells, pal, cx))
-                    .into_any_element(),
-            ))
-            // Editing: AutoSum/Fill/Clear column + Sort & Filter, Find & Select.
-            .child(group(
-                "Editing",
-                false,
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_1()
-                    .child(col(vec![
-                        self.sheet_rb(None, "\u{03A3} AutoSum", SheetAct::AutoSum, pal, cx),
-                        self.sheet_rb(None, "Fill", SheetAct::Todo, pal, cx),
-                        self.sheet_rb(Some("clear-format"), "Clear", SheetAct::Todo, pal, cx),
-                    ]))
-                    .child(col(vec![
-                        self.sheet_rb(
-                            Some("sort"),
-                            "Sort A \u{2192} Z",
-                            SheetAct::SortAsc,
-                            pal,
-                            cx,
-                        ),
-                        self.sheet_rb(
-                            Some("sort"),
-                            "Sort Z \u{2192} A",
-                            SheetAct::SortDesc,
-                            pal,
-                            cx,
-                        ),
-                        self.sheet_rb(
-                            Some("sort"),
-                            "Custom Sort\u{2026}",
-                            SheetAct::CustomSort,
-                            pal,
-                            cx,
-                        ),
-                        self.sheet_rb(None, "Filter", SheetAct::Filter, pal, cx),
-                        self.sheet_rb(None, "Remove Dup", SheetAct::RemoveDuplicates, pal, cx),
-                    ]))
-                    .child(self.sheet_lb(Some("find"), "Find & Select", SheetAct::Todo, pal, cx))
-                    .into_any_element(),
-            ))
+            })
             .into_any_element()
+    }
+
+    /// One sheet ribbon command, drawn in its shape.
+    fn sheet_cmd_el(
+        &self,
+        c: &sheet_ribbon::SheetCmd,
+        xf: &gridcore::sheet::Xf,
+        pal: Pal,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use sheet_ribbon::Shape;
+        let text = c.text(self.sheet_act_toggled(c.act));
+        match c.shape {
+            Shape::Large(icon) => self.sheet_lb(icon, text, c.act, pal, cx),
+            Shape::Row(icon) => self.sheet_rb(icon, text, c.act, pal, cx),
+            Shape::Icon(icon) => {
+                self.sheet_ib(icon, c.act, sheet_ribbon::act_on(c.act, xf), pal, cx)
+            }
+            Shape::Glyph(glyph) => self.sheet_gb(glyph, c.act, pal, cx),
+            Shape::Combo { value, wide } => self.sheet_combo(value, wide, c.act, pal, cx),
+            Shape::NumFmt => self.sheet_numfmt_combo(pal, cx),
+        }
     }
 
     fn render_group(
