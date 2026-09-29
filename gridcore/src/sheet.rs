@@ -128,6 +128,24 @@ pub struct Cell {
     /// load). The spilled cells themselves are plain values owned by this
     /// anchor. `None` = no spill (scalar result).
     pub spill: Option<(u32, u32)>,
+    /// `<c>` metadata attributes kept from the file (`cm`, `vm`, `ph`);
+    /// boxed because almost no cell has any.
+    pub meta: Option<Box<CellMeta>>,
+}
+
+/// The `<c>` attributes we don't interpret but must write back: Excel marks a
+/// dynamic-array anchor with `cm` (without it the spill reopens as a legacy
+/// Ctrl+Shift+Enter array), and a rich value (image, data type, `#SPILL!`
+/// details) with `vm`. Both are opaque indices into `xl/metadata.xml`.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct CellMeta {
+    /// Cell-metadata index; written only on an array `<f>`.
+    pub cm: Option<String>,
+    /// Value-metadata index and the value it was loaded with: it describes
+    /// that value, so it is written only while the cell still holds it.
+    pub vm: Option<(String, CellValue)>,
+    /// `ph="1"`: show phonetic text.
+    pub ph: bool,
 }
 
 impl Cell {

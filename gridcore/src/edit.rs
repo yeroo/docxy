@@ -411,7 +411,12 @@ pub fn autofill(
 /// same `ref`/`si` out from several cells is what makes Excel offer to repair
 /// the file. Dropped, the copy is an ordinary formula computing the same thing
 /// — which is also what makes it safe to shift.
+///
+/// Nor does it inherit `<c>` metadata: `vm` describes the source's value, and
+/// `cm` could not reach the file anyway (the copy is re-indexed as a legacy
+/// formula and written as a plain `<f>`), so the copy starts without any.
 fn rebase(cell: &mut Cell, dr: i64, dc: i64) {
+    cell.meta = None;
     if cell.f_attrs.take().is_some() && cell.formula.as_deref() == Some("") {
         // A shared-group follower whose master wouldn't parse carries no text of
         // its own; without the group marker there is no formula left to write.
