@@ -1948,6 +1948,12 @@ pub fn rewrite_defined_name(src: &str, f: impl Fn(&Expr) -> Expr) -> Option<Stri
     let mut out = Vec::with_capacity(pieces.len());
     let mut changed = false;
     for piece in pieces {
+        // An area an earlier delete removed (`Sheet!#REF!`, as written above)
+        // doesn't parse and has nothing left to move; it mustn't pin the rest.
+        if is_deleted_area(piece) {
+            out.push(piece.to_string());
+            continue;
+        }
         let ast = parse(piece).ok()?;
         let next = f(&ast);
         if to_string(&next) == to_string(&ast) {
@@ -1958,6 +1964,12 @@ pub fn rewrite_defined_name(src: &str, f: impl Fn(&Expr) -> Expr) -> Option<Stri
         }
     }
     changed.then(|| out.join(","))
+}
+
+/// `#REF!` or `Sheet!#REF!` (quoted sheet names included).
+fn is_deleted_area(piece: &str) -> bool {
+    let t = piece.trim();
+    t == "#REF!" || t.ends_with("!#REF!")
 }
 
 /// `src` split on the commas that separate a union's areas: outside quotes,
@@ -11193,8 +11205,33 @@ mod tests {
             Some("C!$A$1,C!$3:$3")
         );
         assert_eq!(
-            rewrite_defined_name("SUM(Report!$A$1,Report!$A$2)", rows(0, 1)).as_deref(),
-            Some("SUM(Report!$A$2,Report!$A$3)")
+            rewrite_defined_name("Report!$A$9,INDEX(Report!$A:$A,1)", rows(0, 1)).as_deref(),
+            Some("Report!$A$10,INDEX(Report!$A:$A,1)")
+        );
+        assert_eq!(
+            rewrite_defined_name("INDEX(Report!$A$1:$A$5,2),Report!$3:$3", rows(0, 1)).as_deref(),
+            Some("INDEX(Report!$A$2:$A$6,2),Report!$4:$4")
+        );
+        // An area a delete already removed passes through; the rest still move.
+        let cols = |e: &Expr| {
+            adjust_for_edit(
+                e,
+                false,
+                "Report",
+                &EditShift {
+                    rows: false,
+                    at: 0,
+                    delta: 1,
+                },
+            )
+        };
+        assert_eq!(
+            rewrite_defined_name("Report!$A:$A,Report!#REF!", cols).as_deref(),
+            Some("Report!$B:$B,Report!#REF!")
+        );
+        assert_eq!(
+            rewrite_defined_name("'My Report'!#REF!,Report!$A:$A", cols).as_deref(),
+            Some("'My Report'!#REF!,Report!$B:$B")
         );
         // Nothing moved: no rewrite, whatever the printer would spell.
         assert_eq!(rewrite_defined_name("'Other'!$A$1", rows(0, 1)), None);
