@@ -961,6 +961,19 @@ impl<'a> Parser<'a> {
                         self.bump()?;
                         return self.three_d(id, id2);
                     }
+                    // `$1:$3` — whole rows whose first row is anchored (the
+                    // lexer reads `$1` as an identifier, not a number).
+                    if let (Some((r1, abs1)), Some((r2, abs2))) =
+                        (parse_row_text(&id), parse_row_text(&id2))
+                    {
+                        return Ok(Expr::RowRange {
+                            sheet,
+                            r1,
+                            r2,
+                            abs1,
+                            abs2,
+                        });
+                    }
                     let (Some((c1, abs1)), Some((c2, abs2))) =
                         (parse_col_text(&id), parse_col_text(&id2))
                     else {
@@ -970,6 +983,19 @@ impl<'a> Parser<'a> {
                         sheet,
                         c1,
                         c2,
+                        abs1,
+                        abs2,
+                    });
+                }
+                // `$1:3` — the same with a plain end row.
+                Tok::Num(n) if parse_row_text(&id).is_some() => {
+                    self.bump()?;
+                    let (r1, abs1) = parse_row_text(&id).ok_or("bad row reference")?;
+                    let (r2, abs2) = row_from_num(n).ok_or("bad row range end")?;
+                    return Ok(Expr::RowRange {
+                        sheet,
+                        r1,
+                        r2,
                         abs1,
                         abs2,
                     });
@@ -1807,6 +1833,12 @@ pub fn adjust_formula_for_edit(
 /// Rewrite sheet qualifiers after a sheet rename (Excel updates formulas on
 /// rename). Returns the new text, or `None` if the source doesn't parse.
 pub fn rename_sheet_in_formula(src: &str, old: &str, new: &str) -> Option<String> {
+    let ast = parse(src).ok()?;
+    Some(to_string(&rename_sheet_in_expr(&ast, old, new)))
+}
+
+/// [`rename_sheet_in_formula`] on a parsed formula.
+pub fn rename_sheet_in_expr(e: &Expr, old: &str, new: &str) -> Expr {
     fn walk(e: &Expr, old: &str, new: &str) -> Expr {
         let fix = |s: &Option<String>| -> Option<String> {
             match s {
@@ -1892,8 +1924,81 @@ pub fn rename_sheet_in_formula(src: &str, old: &str, new: &str) -> Option<String
             other => other.clone(),
         }
     }
-    let ast = parse(src).ok()?;
-    Some(to_string(&walk(&ast, old, new)))
+    walk(e, old, new)
+}
+
+/// Run a defined name's definition through `f` (a structural edit or a sheet
+/// rename) and return the new text, or `None` when nothing changed or the
+/// text can't be read. Unlike cell formulas, a name may be a union of areas
+/// (`Report!$A:$A,Report!$1:$2`, as print titles are), which the parser has no
+/// operator for: such a definition is rewritten one comma-separated area at a
+/// time, and left alone entirely if any area fails to parse. Areas the edit
+/// didn't reach keep their original spelling, and an area that was deleted
+/// outright reads `Sheet!#REF!`, as Excel writes it.
+pub fn rewrite_defined_name(src: &str, f: impl Fn(&Expr) -> Expr) -> Option<String> {
+    let pieces = if parse(src).is_ok() {
+        vec![src]
+    } else {
+        let pieces = split_top_level_commas(src);
+        if pieces.len() < 2 {
+            return None;
+        }
+        pieces
+    };
+    let mut out = Vec::with_capacity(pieces.len());
+    let mut changed = false;
+    for piece in pieces {
+        let ast = parse(piece).ok()?;
+        let next = f(&ast);
+        if to_string(&next) == to_string(&ast) {
+            out.push(piece.to_string());
+        } else {
+            changed = true;
+            out.push(name_area_to_string(&next));
+        }
+    }
+    changed.then(|| out.join(","))
+}
+
+/// `src` split on the commas that separate a union's areas: outside quotes,
+/// parentheses, braces and brackets.
+fn split_top_level_commas(src: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut start = 0;
+    for (i, ch) in src.char_indices() {
+        match quote {
+            // A doubled quote closes and reopens, which toggling handles.
+            Some(q) if ch == q => quote = None,
+            Some(_) => {}
+            None => match ch {
+                '"' | '\'' => quote = Some(ch),
+                '(' | '{' | '[' => depth += 1,
+                ')' | '}' | ']' => depth -= 1,
+                ',' if depth == 0 => {
+                    out.push(&src[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            },
+        }
+    }
+    out.push(&src[start..]);
+    out
+}
+
+/// One area of a defined name as text. A range with a deleted end prints as
+/// `Sheet!#REF!` rather than the cell printer's `Sheet!#REF!:#REF!`.
+fn name_area_to_string(e: &Expr) -> String {
+    match e {
+        Expr::Range(a, b) if a.row < 0 || a.col < 0 || b.row < 0 || b.col < 0 => {
+            let mut s = a.sheet.as_deref().map(sheet_prefix).unwrap_or_default();
+            s.push_str("#REF!");
+            s
+        }
+        other => to_string(other),
+    }
 }
 
 /// Collect every reference in a formula (for dependency-graph edges).
@@ -11033,6 +11138,95 @@ mod tests {
         assert_eq!(translate_formula("SUM(A:A)", 0, 1).unwrap(), "SUM(B:B)");
         assert_eq!(translate_formula("SUM($A:$A)", 0, 5).unwrap(), "SUM($A:$A)");
         assert_eq!(translate_formula("SUM(2:3)", 1, 0).unwrap(), "SUM(3:4)");
+    }
+
+    #[test]
+    fn anchored_whole_row_ranges_parse() {
+        for (src, printed) in [
+            ("$1:$3", "$1:$3"),
+            ("$1:3", "$1:3"),
+            ("Report!$1:$2", "Report!$1:$2"),
+            ("SUM('My Sheet'!$2:$4)", "SUM('My Sheet'!$2:$4)"),
+        ] {
+            let e = parse(src).unwrap_or_else(|err| panic!("{src}: {err}"));
+            assert_eq!(to_string(&e), printed);
+        }
+        assert!(matches!(
+            parse("$1:$3").unwrap(),
+            Expr::RowRange {
+                r1: 0,
+                r2: 2,
+                abs1: true,
+                abs2: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn defined_name_rewrite_handles_unions_and_keeps_untouched_text() {
+        let rows = |at: u32, delta: i64| {
+            move |e: &Expr| {
+                adjust_for_edit(
+                    e,
+                    false,
+                    "Report",
+                    &EditShift {
+                        rows: true,
+                        at,
+                        delta,
+                    },
+                )
+            }
+        };
+        // A union moves area by area.
+        assert_eq!(
+            rewrite_defined_name("Report!$A:$A,Report!$1:$2", rows(0, 1)).as_deref(),
+            Some("Report!$A:$A,Report!$2:$3")
+        );
+        // Commas inside a quoted sheet name or a call don't split.
+        assert_eq!(
+            rewrite_defined_name("'a,b'!$A$1,'a,b'!$3:$3", |e| rename_sheet_in_expr(
+                e, "a,b", "C"
+            ))
+            .as_deref(),
+            Some("C!$A$1,C!$3:$3")
+        );
+        assert_eq!(
+            rewrite_defined_name("SUM(Report!$A$1,Report!$A$2)", rows(0, 1)).as_deref(),
+            Some("SUM(Report!$A$2,Report!$A$3)")
+        );
+        // Nothing moved: no rewrite, whatever the printer would spell.
+        assert_eq!(rewrite_defined_name("'Other'!$A$1", rows(0, 1)), None);
+        assert_eq!(
+            rewrite_defined_name("'Report'!$A$1,Other!$1:$1", rows(5, 1)),
+            None
+        );
+        // Only the areas that moved are respelled.
+        assert_eq!(
+            rewrite_defined_name("'Other'!$A$1 , Report!$A$9", rows(0, 1)).as_deref(),
+            Some("'Other'!$A$1 ,Report!$A$10")
+        );
+        // An area that won't parse leaves the whole name alone.
+        assert_eq!(
+            rewrite_defined_name("Report!$A$9,Report!!", rows(0, 1)),
+            None
+        );
+        // A deleted area is `Sheet!#REF!`, as Excel writes it.
+        assert_eq!(
+            rewrite_defined_name("'My Report'!$A$1:$B$2", |e| adjust_for_edit(
+                e,
+                false,
+                "My Report",
+                &EditShift {
+                    rows: true,
+                    at: 0,
+                    delta: -2
+                }
+            ))
+            .as_deref(),
+            Some("'My Report'!#REF!")
+        );
     }
 
     #[test]
