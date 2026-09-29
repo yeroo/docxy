@@ -1081,8 +1081,17 @@ fn active_doc(app: &crate::Docxy) -> Result<&Editor, String> {
     }
 }
 
-/// Ribbon verbs address only surfaces that render this ribbon model.
-fn ribbon_surface(app: &crate::Docxy) -> Result<(), String> {
+/// Which ribbon the active tab draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RibbonSurface {
+    /// The declarative document/Project ribbon (`ribbon_for`).
+    Model,
+    /// The spreadsheet ribbon (`sheet_ribbon::SHEET_RIBBON`).
+    Sheet,
+}
+
+/// Ribbon verbs address only a ribbon the window is drawing.
+fn ribbon_surface(app: &crate::Docxy) -> Result<RibbonSurface, String> {
     if app.backstage {
         return Err("the ribbon is hidden while File (backstage) is open".into());
     }
@@ -1090,9 +1099,87 @@ fn ribbon_surface(app: &crate::Docxy) -> Result<(), String> {
         return Err("the ribbon is collapsed".into());
     }
     match app.tabs.get(app.active).map(|t| &t.surface) {
-        Some(crate::Surface::Doc(_) | crate::Surface::Project(_)) => Ok(()),
-        _ => Err("the active tab has no document or Project ribbon".into()),
+        Some(crate::Surface::Doc(_) | crate::Surface::Project(_)) => Ok(RibbonSurface::Model),
+        Some(crate::Surface::Sheet(_)) => Ok(RibbonSurface::Sheet),
+        _ => Err("the active tab has no ribbon".into()),
     }
+}
+
+/// One sheet ribbon command, in the document ribbon's reply shape. A sheet
+/// button has no screentip or KeyTip, so the tip title is the label.
+fn sheet_command_json(app: &crate::Docxy, cmd: &crate::sheet_ribbon::SheetCmd) -> Json {
+    let label = cmd.label(app.sheet_act_toggled(cmd.act));
+    Json::obj(vec![
+        ("id", Json::Str(cmd.id.into())),
+        ("label", Json::Str(label.into())),
+        (
+            "tip",
+            Json::obj(vec![
+                ("title", Json::Str(label.into())),
+                ("body", Json::Str(String::new())),
+            ]),
+        ),
+        ("key_tip", Json::Str(String::new())),
+        (
+            "checked",
+            Json::Bool(crate::sheet_ribbon::act_on(cmd.act, &app.active_xf())),
+        ),
+        ("enabled", Json::Bool(cmd.enabled())),
+    ])
+}
+
+/// The spreadsheet ribbon as `ribbon-read` reports it: File, then every tab
+/// the sheet strip offers with the groups `sheet_ribbon_body` draws for it.
+fn sheet_ribbon_json(app: &crate::Docxy) -> Json {
+    let kind = crate::Kind::Xlsx;
+    let mut tabs = vec![file_tab_json(kind)];
+    for (tab, name, key_tip) in crate::ribbon_tab_set(kind) {
+        let Some(tab) = tab else { continue };
+        let def = crate::sheet_ribbon::tab_def(*tab);
+        let groups = def
+            .groups
+            .iter()
+            .map(|g| {
+                Json::obj(vec![
+                    ("title", Json::Str(g.title.into())),
+                    ("launcher", Json::Bool(g.launcher)),
+                    (
+                        "commands",
+                        Json::Arr(
+                            g.commands()
+                                .into_iter()
+                                .map(|c| sheet_command_json(app, c))
+                                .collect(),
+                        ),
+                    ),
+                    ("galleries", Json::Arr(Vec::new())),
+                ])
+            })
+            .collect();
+        tabs.push(Json::obj(vec![
+            ("name", Json::Str((*name).into())),
+            ("key_tip", Json::Str((*key_tip).into())),
+            ("kind", Json::Str("ribbon".into())),
+            ("groups", Json::Arr(groups)),
+        ]));
+    }
+    ribbon_reply(tabs)
+}
+
+/// Find a command on the sheet ribbon tab `tab_name`, as drawn now.
+fn resolve_sheet_command(
+    app: &crate::Docxy,
+    tab_name: &str,
+    query: &str,
+) -> Result<(crate::RibbonTab, crate::SheetAct), String> {
+    if tab_name == "File" {
+        return Err("File is backstage; use the backstage verb".into());
+    }
+    let tab = ribbon_tab_by_name(crate::Kind::Xlsx, tab_name)?;
+    let commands = crate::sheet_ribbon::tab_def(tab).commands();
+    let cmd =
+        crate::sheet_ribbon::resolve(&commands, tab_name, query, |act| app.sheet_act_toggled(act))?;
+    Ok((tab, cmd.act))
 }
 
 /// The live status-line items in the order the app draws them.
@@ -1280,13 +1367,7 @@ fn ribbon_json_for(
     checked: impl Fn(&RibbonCommand) -> bool,
 ) -> Json {
     let ribbon = crate::ribbon_for(kind);
-    let (_, file_name, file_tip) = crate::ribbon_tab_set(kind)[0];
-    let mut tabs = vec![Json::obj(vec![
-        ("name", Json::Str(file_name.into())),
-        ("key_tip", Json::Str(file_tip.into())),
-        ("kind", Json::Str("backstage".into())),
-        ("groups", Json::Arr(Vec::new())),
-    ])];
+    let mut tabs = vec![file_tab_json(kind)];
     tabs.extend(ribbon.tabs.iter().map(|t| tab_json(t, &checked)));
     if kind == crate::Kind::Docx && in_table {
         tabs.push(tab_json(&crate::table_tab(), &checked));
@@ -1294,6 +1375,22 @@ fn ribbon_json_for(
     if kind == crate::Kind::Project && in_gantt {
         tabs.push(tab_json(&crate::gantt_format_tab(), &checked));
     }
+    ribbon_reply(tabs)
+}
+
+/// The File tab entry every ribbon reply starts with.
+fn file_tab_json(kind: crate::Kind) -> Json {
+    let (_, file_name, file_tip) = crate::ribbon_tab_set(kind)[0];
+    Json::obj(vec![
+        ("name", Json::Str(file_name.into())),
+        ("key_tip", Json::Str(file_tip.into())),
+        ("kind", Json::Str("backstage".into())),
+        ("groups", Json::Arr(Vec::new())),
+    ])
+}
+
+/// A ribbon reply: the tabs, their count and the Quick Access Toolbar.
+fn ribbon_reply(tabs: Vec<Json>) -> Json {
     let tab_count = tabs.len();
     let qat = crate::QAT_ITEMS
         .iter()
@@ -1509,7 +1606,9 @@ fn menu_open(
                 let [tab, group, label] = path.as_slice() else {
                     return Err("'ribbon' must be [tab, group, command]".into());
                 };
-                ribbon_surface(app)?;
+                if ribbon_surface(app)? == RibbonSurface::Sheet {
+                    return Err("the sheet ribbon has no split buttons".into());
+                }
                 let def = ribbon_tab_def(app, tab)?;
                 let id = split_primary(&def, group, label)?;
                 app.select_ribbon_tab(ribbon_tab_by_name(app.ribbon_kind(), tab)?, window, cx);
@@ -2080,15 +2179,22 @@ pub fn dispatch(
                 ),
             ]))
         }
-        "ribbon-read" => {
-            ribbon_surface(app)?;
-            Done::ok(ribbon_json(app))
-        }
+        "ribbon-read" => match ribbon_surface(app)? {
+            RibbonSurface::Model => Done::ok(ribbon_json(app)),
+            RibbonSurface::Sheet => Done::ok(sheet_ribbon_json(app)),
+        },
         "ribbon-click" => {
             app.refuse_under_dialog()?;
-            ribbon_surface(app)?;
+            let surface = ribbon_surface(app)?;
             let tab = arg_str(args, "tab")?.to_string();
             let command = arg_str(args, "command")?.to_string();
+            if surface == RibbonSurface::Sheet {
+                // The button's own click: select its tab, then run its act.
+                let (ribbon_tab, act) = resolve_sheet_command(app, &tab, &command)?;
+                app.select_ribbon_tab(ribbon_tab, window, cx);
+                app.run_sheet_act(act, window, cx);
+                return Done::ok(state(app, window));
+            }
             let act = resolve_ribbon_command(app, &tab, &command)?;
             app.select_ribbon_tab(ribbon_tab_by_name(app.ribbon_kind(), &tab)?, window, cx);
             app.dispatch(act, window, cx);

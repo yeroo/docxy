@@ -1,0 +1,47 @@
+# The sheet ribbon through ribbon-read / ribbon-click (#699). The ribbon is
+# drawn from sheet_ribbon::SHEET_RIBBON, the table these verbs read, so what
+# they report is what the window shows.
+
+test sheet ribbon read lists the drawn Home tab
+  open ../fixtures/basic.xlsx
+  call ribbon-read {}
+  assert reply.tabs.0.name is File
+  assert reply.tabs.1.name is Home
+  assert reply.tabs.4.name is View
+  assert reply.tab_count is 5
+  assert reply.tabs.1.groups.0.title is Clipboard
+  assert reply.tabs.1.groups.0.commands.0.id is paste
+  assert reply.tabs.1.groups.1.commands.4.id is bold
+  assert reply.tabs.1.groups.1.commands.4.checked is false
+  assert reply.tabs.1.groups.1.commands.4.enabled is true
+  assert reply.tabs.1.groups.1.commands.6.id is underline
+  assert reply.tabs.1.groups.1.commands.6.enabled is false
+
+test sheet ribbon click runs the button's own command
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Home","command":"Bold"}
+  assert dirty is true
+  call ribbon-read {}
+  assert reply.tabs.1.groups.1.commands.4.checked is true
+  call ribbon-click {"tab":"Home","command":"bold"}
+  call ribbon-read {}
+  assert reply.tabs.1.groups.1.commands.4.checked is false
+
+test sheet ribbon click selects the tab and reads a toggle's current label
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"View","command":"Freeze Panes"}
+  assert ribbon_tab is View
+  call ribbon-read {}
+  assert reply.tabs.4.groups.0.commands.0.label is Unfreeze Panes
+  call ribbon-click {"tab":"View","command":"Unfreeze Panes"}
+  call ribbon-read {}
+  assert reply.tabs.4.groups.0.commands.0.label is Freeze Panes
+
+test sheet ribbon refuses a placeholder, a missing command and a split menu
+  open ../fixtures/basic.xlsx
+  call-error ribbon-click {"tab":"Review","command":"Spelling"} => 'Spelling' is not implemented
+  call-error ribbon-click {"tab":"Home","command":"Spelling"} => command 'Spelling' is not on tab 'Home'
+  call-error ribbon-click {"tab":"Table","command":"Bold"} => 'Table' is not a ribbon tab
+  call-error menu-open {"target":{"ribbon":["Home","Clipboard","Paste"]}} => the sheet ribbon has no split buttons
