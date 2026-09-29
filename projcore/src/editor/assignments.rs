@@ -165,6 +165,13 @@ impl Editor {
                 if !known && name.contains(',') {
                     return Err(format!("Resource name '{name}' cannot contain a comma"));
                 }
+                // A number is a uid spelled as text; staging it as a new
+                // resource would hide the caller's mistake.
+                if !known && name.parse::<i64>().is_ok() {
+                    return Err(format!(
+                        "no resource named '{name}'; pass a resource uid as a number"
+                    ));
+                }
                 find_or_stage_resource(&mut resources, name)?
             }
         };
@@ -254,18 +261,17 @@ impl Editor {
             return Ok(());
         }
         let edit = |ed: &mut Editor| {
-            let stage = |ed: &mut Editor, change: &dyn Fn(&mut Assignment, i64)| {
-                let duration = ed.row_as_edited(i).duration_min;
+            let stage = |ed: &mut Editor, change: &dyn Fn(&mut Assignment)| {
                 let mut assignments = ed.proj.assignments.clone();
                 let a = assignments
                     .iter_mut()
                     .find(|a| a.uid == uid)
                     .expect("checked");
-                change(a, duration);
+                change(a);
                 ed.commit_assignments(i, ed.proj.resources.clone(), assignments)
             };
             if let Some(d) = delay {
-                stage(ed, &|a, _| a.delay = Some(d * 10))?;
+                stage(ed, &|a| a.delay = Some(d * 10))?;
             }
             if let Some(u) = units {
                 // A work resource works them from its delay (as the delay
@@ -273,7 +279,7 @@ impl Editor {
                 let duration = ed.row_as_edited(i).duration_min;
                 let a = ed.proj.assignments.iter().find(|a| a.uid == uid);
                 let work = units_work(kind, duration - a.expect("checked").delay_min(), u)?;
-                stage(ed, &|a, _| a.set_units(u, work))?;
+                stage(ed, &|a| a.set_units(u, work))?;
             }
             if let Some(w) = work {
                 // A fixed-duration task works new work over the span from
@@ -292,10 +298,10 @@ impl Editor {
                 {
                     return Err("delay must be shorter than the task".into());
                 }
-                stage(ed, &|a, _| a.set_work(w))?;
+                stage(ed, &|a| a.set_work(w))?;
             }
             if let Some(t) = table {
-                stage(ed, &|a, _| a.cost_rate_table = Some(t))?;
+                stage(ed, &|a| a.cost_rate_table = Some(t))?;
             }
             Ok(())
         };

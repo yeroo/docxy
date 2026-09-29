@@ -1965,6 +1965,21 @@ mod tests {
     }
 
     #[test]
+    fn a_resource_uid_spelled_as_a_string_is_refused_not_staged() {
+        use projcore::model::TaskType;
+        let mut ed = staffed(TaskType::FixedUnits, false);
+        let before = (ed.project().clone(), ed.undo_depth(), ed.dirty());
+        let err = run(&mut ed, "assign.add", r#"{"task":1,"resource":"2"}"#).unwrap_err();
+        assert_eq!(
+            err,
+            "no resource named '2'; pass a resource uid as a number"
+        );
+        assert_eq!((ed.project().clone(), ed.undo_depth(), ed.dirty()), before);
+        let bob = run(&mut ed, "assign.add", r#"{"task":1,"resource":2}"#).unwrap();
+        assert_eq!(bob.get_str("resource_name"), Some("Bob"));
+    }
+
+    #[test]
     fn assignments_filter_by_task_and_resource() {
         use projcore::model::TaskType;
         let mut ed = staffed(TaskType::FixedUnits, false);

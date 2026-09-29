@@ -475,6 +475,28 @@ fn a_new_resource_name_with_a_comma_is_refused_an_existing_one_matches() {
 }
 
 #[test]
+fn a_new_resource_name_that_is_a_number_is_refused_an_existing_one_matches() {
+    let mut ed = plan(None, false, vec![]);
+    assert_untouched(&mut ed, |ed| {
+        let err = ed
+            .add_assignment(1, ResourceRef::Name(" 2 "), None, None)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            "no resource named '2'; pass a resource uid as a number"
+        );
+        Err(err)
+    });
+    let mut p = ed.proj.clone();
+    p.resources.push(resource(5, "2", ResourceType::Work, "40"));
+    let mut ed = Editor::new(p);
+    let uid = ed
+        .add_assignment(1, ResourceRef::Name("2"), None, None)
+        .unwrap();
+    assert_eq!(get(&ed, uid).resource_uid, 5);
+}
+
+#[test]
 fn a_material_takes_units_and_a_cost_resource_neither() {
     let mut ed = plan(None, false, vec![]);
     let steel = ed
