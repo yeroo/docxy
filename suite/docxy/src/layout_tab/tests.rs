@@ -184,12 +184,13 @@ fn presets_write_words_values() {
     assert_eq!(c.cols.iter().map(|c| c.w).collect::<Vec<_>>(), [2640, 6000]);
     // Line numbers keep w:start and w:distance, and write countBy 1.
     let mut t = three_sections();
-    ed_mut(&mut t).edit_sections(&[1], |raw| {
-        docxcore::sect::insert_ordered(
-            raw,
-            "w:lnNumType",
-            "<w:lnNumType w:countBy=\"5\" w:start=\"3\" w:distance=\"400\"/>",
-        )
+    ed_mut(&mut t).edit_section_setups(&[1], |s| {
+        s.line_numbers = Some(docxcore::sect::LineNumbering {
+            count_by: 5,
+            start: Some(3),
+            distance: Some(400),
+            restart: LnRestart::NewPage,
+        })
     });
     apply(&mut t, LayoutAct::LineNumbers(LnChoice::RestartEachSection));
     let ln = setups(&t)[1].line_numbers.unwrap();

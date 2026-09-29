@@ -564,7 +564,7 @@ pub(crate) fn find_element(xml: &str, name: &str) -> Option<(usize, usize)> {
 }
 
 /// Remove the first `name` element (see [`find_element`]).
-pub fn remove_element(xml: &str, name: &str) -> String {
+pub(crate) fn remove_element(xml: &str, name: &str) -> String {
     match find_element(xml, name) {
         Some((a, b)) => format!("{}{}", &xml[..a], &xml[b..]),
         None => xml.to_string(),
@@ -578,24 +578,37 @@ fn start_tag<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
     Some(xml[a + 1..gt].trim_end_matches('/'))
 }
 
-/// An attribute's value in a start tag, either quote style.
-fn attr(tag: &str, name: &str) -> Option<String> {
-    let pat = format!("{name}=");
-    let mut from = 0;
-    while let Some(rel) = tag[from..].find(&pat) {
+/// One attribute in a start tag: `S name S? = S? "value"`, either quote
+/// style. The byte ranges of the whole attribute with the whitespace before
+/// it, and of its value (without the quotes). Found from byte `from` on.
+fn attr_span(tag: &str, name: &str, from: usize) -> Option<(usize, usize, usize, usize)> {
+    let mut from = from;
+    while let Some(rel) = tag[from..].find(name) {
         let at = from + rel;
-        let bounded = tag[..at]
-            .chars()
-            .next_back()
-            .is_some_and(char::is_whitespace);
-        let rest = &tag[at + pat.len()..];
-        if let (true, Some(q @ ('"' | '\''))) = (bounded, rest.chars().next()) {
-            let body = &rest[1..];
-            return body.find(q).map(|e| body[..e].to_string());
+        from = at + name.len();
+        let ws = tag[..at].trim_end_matches(char::is_whitespace).len();
+        if ws == at {
+            continue; // not after whitespace: the tail of a longer name
         }
-        from = at + pat.len();
+        let after = &tag[at + name.len()..];
+        let Some(eq) = after.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let value = eq.trim_start();
+        let Some(q @ ('"' | '\'')) = value.chars().next() else {
+            continue;
+        };
+        let start = tag.len() - value.len() + 1;
+        let end = start + tag[start..].find(q)?;
+        return Some((ws, start, end, end + 1));
     }
     None
+}
+
+/// An attribute's value in a start tag, either quote style, with or without
+/// whitespace around its `=`.
+fn attr(tag: &str, name: &str) -> Option<String> {
+    attr_span(tag, name, 0).map(|(_, a, b, _)| tag[a..b].to_string())
 }
 
 fn num(tag: &str, name: &str) -> Option<i32> {
@@ -632,37 +645,21 @@ fn edit_attrs(sect: &str, name: &str, attrs: &[(&str, Option<String>)]) -> Strin
 }
 
 /// Remove an attribute from a start tag (without `<` and `>`), with the
-/// whitespace before it, whatever whitespace that is: the same boundary rule
-/// as [`attr`]. Every copy goes, so an edit never leaves a duplicate.
+/// whitespace before it: the same rule as [`attr`]. Every copy goes, so an
+/// edit never leaves a duplicate.
 fn remove_attr(tag: &str, name: &str) -> String {
     let mut out = tag.to_string();
     let mut from = 0;
-    while let Some(rel) = out[from..].find(name) {
-        let at = from + rel;
-        let ws = out[..at].trim_end_matches(char::is_whitespace).len();
-        let after = &out[at + name.len()..];
-        let value = after
-            .trim_start()
-            .strip_prefix('=')
-            .map(str::trim_start)
-            .filter(|v| v.starts_with(['"', '\'']));
-        match value {
-            Some(value) if ws < at => {
-                let q = value.chars().next().unwrap_or('"');
-                let body = &value[1..];
-                let end = out.len() - body.len() + body.find(q).map_or(body.len(), |e| e + 1);
-                out = format!("{}{}", &out[..ws], &out[end..]);
-                from = ws;
-            }
-            _ => from = at + name.len(),
-        }
+    while let Some((ws, _, _, end)) = attr_span(&out, name, from) {
+        out.replace_range(ws..end, "");
+        from = ws;
     }
     out
 }
 
 /// Remove the first `name` element among the section's own children, never
 /// one inside a tracked `w:sectPrChange`.
-pub fn remove_own(sect: &str, name: &str) -> String {
+pub(crate) fn remove_own(sect: &str, name: &str) -> String {
     match find_element(own_children(sect), name) {
         Some((a, b)) => format!("{}{}", &sect[..a], &sect[b..]),
         None => sect.to_string(),
@@ -689,7 +686,7 @@ pub fn set_flag(sect: &str, name: &str, on: bool) -> String {
 /// Insert `child` (a `name` element) into `sect` at its `CT_SectPr` schema
 /// position: before the first existing child that comes after it, else at the
 /// end. Expands a self-closing `<w:sectPr/>`.
-pub fn insert_ordered(sect: &str, name: &str, child: &str) -> String {
+pub(crate) fn insert_ordered(sect: &str, name: &str, child: &str) -> String {
     let sect = if sect.trim().is_empty() {
         "<w:sectPr></w:sectPr>"
     } else {
@@ -931,6 +928,24 @@ mod tests {
         assert!(
             out.contains("w:top=\"720\"") && out.contains("w:right=\"360\""),
             "{out}"
+        );
+    }
+
+    #[test]
+    fn spaces_around_the_equals_sign_are_read_and_kept() {
+        let sect =
+            "<w:sectPr><w:pgMar w:top=\"1440\" w:right = \"2000\" w:left =\t'1800'/></w:sectPr>";
+        let s = SectionSetup::parse(sect);
+        assert_eq!((s.margins.right, s.margins.left), (2000, 1800));
+        let mut t = s.clone();
+        t.margins.top = 720;
+        let out = t.apply(sect);
+        assert_eq!(SectionSetup::parse(&out).margins.right, 2000, "{out}");
+        assert_eq!(SectionSetup::parse(&out).margins.left, 1800, "{out}");
+        assert_eq!(out.matches("w:right").count(), 1, "{out}");
+        assert_eq!(
+            attr("w:x w:vals=\"1\" w:val = \"2\"", "w:val").as_deref(),
+            Some("2")
         );
     }
 

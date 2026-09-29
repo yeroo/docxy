@@ -11578,7 +11578,7 @@ impl Docxy {
             .unwrap_or((true, "default"));
         let title_pg = tab
             .and_then(final_sect_pr)
-            .is_some_and(|sect| sect.contains("<w:titlePg"));
+            .is_some_and(|sect| docxcore::sect::has_flag(sect, "w:titlePg"));
         let even_odd = tab
             .and_then(|t| t.pkg.as_ref())
             .is_some_and(|p| p.has_even_odd());
@@ -20622,7 +20622,7 @@ impl Render for Docxy {
                         // so an undone header or titlePg shows as undone.
                         let pkg = tab.pkg.as_ref();
                         let sect = final_sect_pr(tab).unwrap_or_default();
-                        let title_pg = sect.contains("<w:titlePg");
+                        let title_pg = docxcore::sect::has_flag(sect, "w:titlePg");
                         let even_odd = pkg.is_some_and(|p| p.has_even_odd());
                         let refp = |kind: &str, wt: &str| {
                             docxcore::load::header_footer_ref_rid(sect, kind, wt).is_some()
