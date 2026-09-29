@@ -345,9 +345,23 @@ Task › Schedule › Indent / Outdent / Link Tasks show the screentips Indent
 Task, Outdent Task and Link the Selected Tasks; Information... is View Task
 Information; Move, Milestone and Blank Row are Move Task, Insert Milestone and
 Insert Blank Row; View › Timeline is Timeline View. The harness's
-`ribbon-click` finds a command by either name. docxy's extras have no ribbon
+`ribbon-click` finds a command by either name. Project › Schedule › Set
+Baseline is a split button (#397): its upper half sets the baseline at once
+(Alt, P, B), and its lower half opens Set Baseline... and Clear Baseline...
+(Alt, P, L). Project 2024 draws a menu button there, with no one-press half;
+the one press is kept.
+
+Right-clicking a task row's table cells selects the row and opens Project's
+row menu, in Project's order (#397): Cut, Copy, Paste, Scroll to Task, Insert
+Task (a blank row above), Delete Task (the task whatever column the cursor is
+on; a summary asks first), Inactivate Task, Manually / Auto Schedule, Assign
+Resources... and Information... run their commands; Paste Special..., Text
+Styles..., Font..., Fill Down, Clear Contents, Notes..., Add to Timeline and
+Hyperlink... are drawn greyed until they exist. A bar, a column header and
+the ribbon have no menu yet, and the document's Bold / Italic menu never opens
+on a Project. docxy's extras have no ribbon
 button: rename and set durations in the cells (yppxy: Enter/F2 and `d`),
-delete a task with Delete on its ID (yppxy `x`), clear resources with Delete
+delete a task with Delete on its ID or the row menu's Delete Task (yppxy `x`), clear resources with Delete
 on Resource Names (yppxy: Assign with an empty name), export with Ctrl+E or
 File › Export, and scroll the Gantt with Alt+Left/Right and Alt+Home (yppxy
 h/l and Alt+Home). The Report tab stays, with no groups yet.
