@@ -1140,8 +1140,9 @@ impl Editor {
         Ok(AssignOutcome::Assigned)
     }
 
-    /// Project › Schedule › Set Baseline: record the plan as it is scheduled
-    /// now in the Baseline (slot 0) of every scheduled task, with its stored
+    /// Project › Schedule › Set Baseline: record the plan as it is shown now
+    /// (leveled while leveling is on) in the Baseline (slot 0) of every
+    /// scheduled task, with its stored
     /// work and cost (absent ones stay absent), and of the
     /// assignments and resources (see `baseline_assignments`), as one undo
     /// step. Baseline1..10 stay.
@@ -1153,18 +1154,18 @@ impl Editor {
             .iter()
             .enumerate()
             .filter_map(|(i, t)| {
-                let r = self.sched.get(t.uid)?;
+                // The dates the grid shows, leveled when leveling is on, so
+                // a fresh baseline reads no variance.
+                let start = self.disp_start(t.uid)?;
+                let finish = self.disp_finish(t.uid)?;
                 Some((
                     i,
                     Baseline {
                         number: 0,
-                        start: Some(r.early_start),
-                        finish: Some(r.early_finish),
+                        start: Some(start),
+                        finish: Some(finish),
                         duration_min: Some(crate::schedule::summary_or_leaf_min(
-                            &self.proj,
-                            t,
-                            r.early_start,
-                            r.early_finish,
+                            &self.proj, t, start, finish,
                         )),
                         work_min: t.work_min,
                         cost: t.cost.clone(),
