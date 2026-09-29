@@ -214,6 +214,9 @@ mod win {
         pkg: SheetPackage,
         engine: Engine,
         path: Option<String>,
+        /// The file type chosen at the last SaveAs, which a later Save keeps
+        /// (Excel's does); `None` goes by the path's extension.
+        kind: Option<SpreadsheetKind>,
         saved: bool,
         dirty: bool,
     }
@@ -226,6 +229,7 @@ mod win {
                 pkg,
                 engine,
                 path: None,
+                kind: None,
                 saved: false,
                 dirty: true,
             }
@@ -240,6 +244,7 @@ mod win {
                 pkg,
                 engine,
                 path: Some(path.to_string()),
+                kind: None,
                 saved: true,
                 dirty: false,
             })
@@ -303,8 +308,22 @@ mod win {
             };
             std::fs::write(path, bytes)?;
             self.path = Some(path.to_string());
+            self.kind = kind;
+            // Written without macros: the open workbook drops them too, so a
+            // later SaveAs to a macro type cannot bring them back.
+            if kind.is_some_and(|k| !k.allows_macros()) {
+                self.pkg.remove_vba_project();
+            }
             self.saved = true;
             Ok(())
+        }
+
+        /// `Workbook.Save`: the current path, in the type the last SaveAs
+        /// chose, else its extension's. `None` when there is no path yet.
+        fn save(&mut self) -> Option<std::io::Result<()>> {
+            let path = self.path.clone()?;
+            let kind = self.kind.or_else(|| SpreadsheetKind::from_path(&path));
+            Some(self.save_as(&path, kind))
         }
     }
 
@@ -596,14 +615,7 @@ mod win {
             log("SaveAs(early): missing Filename");
             return E_FAIL;
         };
-        let fmt = (unsafe { fmt.as_ref() }).and_then(|v| {
-            let vt = unsafe { vt_of(v) };
-            if vt == VT_EMPTY || vt == VT_ERROR {
-                None
-            } else {
-                i32::try_from(v).ok()
-            }
-        });
+        let fmt = vi32(fmt);
         log(&format!("SaveAs(early) '{path}' fmt={fmt:?}"));
         let book = t.book;
         let kind = kind_for(fmt, &path);
@@ -1206,16 +1218,8 @@ mod win {
                     }
                     283 => {
                         // Save to the existing path.
-                        let res = reg(|r| {
-                            let path = r.books.get(book).and_then(|b| b.path.clone());
-                            match path {
-                                Some(p) => {
-                                    let kind = SpreadsheetKind::from_path(&p);
-                                    r.books.get_mut(book).map(|b| b.save_as(&p, kind))
-                                }
-                                None => Some(Ok(())), // no path yet — no-op
-                            }
-                        });
+                        // No path yet — no-op.
+                        let res = reg(|r| r.books.get_mut(book).and_then(Book::save));
                         if let Some(Err(e)) = res {
                             log(&format!("Save failed: {e}"));
                             return Err(E_FAIL.into());
@@ -2442,8 +2446,8 @@ mod win {
 
         /// #601: `SaveAs "x.xlsx", 51` on a macro workbook writes a real
         /// `.xlsx`: no macro type, no VBA project.
-        #[test]
-        fn save_as_xlsx_drops_the_vba_project() {
+        /// A macro workbook with a VBA project, as Excel writes one.
+        fn macro_pkg() -> SheetPackage {
             let mut pkg =
                 load_xlsx(&save_xlsx_as(&new_xlsx(), SpreadsheetKind::MacroWorkbook)).unwrap();
             let rels = String::from_utf8_lossy(pkg.part("xl/_rels/workbook.xml.rels").unwrap())
@@ -2453,8 +2457,13 @@ mod win {
                 );
             pkg.set_part("xl/_rels/workbook.xml.rels", rels.into_bytes());
             pkg.set_part("xl/vbaProject.bin", b"VBA".to_vec());
+            pkg
+        }
+
+        #[test]
+        fn save_as_xlsx_drops_the_vba_project() {
             let mut book = Book::new();
-            book.pkg = pkg;
+            book.pkg = macro_pkg();
             let path =
                 std::env::temp_dir().join(format!("xlcomshim-601-{}.xlsx", std::process::id()));
             let path = path.to_str().unwrap();
@@ -2467,6 +2476,47 @@ mod win {
                 String::from_utf8_lossy(saved.part("[Content_Types].xml").unwrap()).into_owned();
             assert!(ct.contains("spreadsheetml.sheet.main+xml"), "{ct}");
             assert!(!ct.contains("macroEnabled"), "{ct}");
+        }
+
+        /// Save keeps the type the last SaveAs chose: `SaveAs "out", 51` then
+        /// `Save` stays a macro-free workbook, and `SaveAs "x.xlsx", 52` then
+        /// `Save` stays macro-enabled.
+        #[test]
+        fn save_keeps_the_type_chosen_at_save_as() {
+            let dir =
+                std::env::temp_dir().join(format!("xlcomshim-601-save-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let saved = |path: &std::path::Path| load_xlsx(&std::fs::read(path).unwrap()).unwrap();
+
+            let mut book = Book::new();
+            book.pkg = macro_pkg();
+            let out = dir.join("out");
+            let p = out.to_str().unwrap();
+            book.save_as(p, kind_for(Some(51), p)).unwrap();
+            book.save().unwrap().unwrap();
+            let pkg = saved(&out);
+            assert!(!pkg.has_vba_project());
+            assert!(pkg.part("xl/vbaProject.bin").is_none());
+            assert!(
+                !book.pkg.has_vba_project(),
+                "the open workbook dropped them too"
+            );
+            let ct = String::from_utf8_lossy(pkg.part("[Content_Types].xml").unwrap()).into_owned();
+            assert!(
+                ct.contains("spreadsheetml.sheet.main+xml"),
+                "Save kept fmt 51: {ct}"
+            );
+            assert!(!ct.contains("macroEnabled"), "{ct}");
+
+            let mut book = Book::new();
+            book.pkg = macro_pkg();
+            let odd = dir.join("odd.xlsx");
+            let p = odd.to_str().unwrap();
+            book.save_as(p, kind_for(Some(52), p)).unwrap();
+            book.save().unwrap().unwrap();
+            assert!(saved(&odd).has_vba_project());
+
+            std::fs::remove_dir_all(dir).unwrap();
         }
     }
 }
