@@ -473,6 +473,17 @@ impl Dialog {
         c.page.is_none_or(|p| p == self.tab)
     }
 
+    /// The indexes of the controls drawn on the current tab: on it, and
+    /// visible.
+    pub fn shown_indices(&self) -> Vec<usize> {
+        (0..self.controls.len())
+            .filter(|&i| {
+                let c = &self.controls[i];
+                c.visible && self.on_page(c)
+            })
+            .collect()
+    }
+
     pub fn page_controls(&self) -> impl Iterator<Item = &Control> {
         self.controls.iter().filter(|c| self.on_page(c))
     }
@@ -537,9 +548,10 @@ impl Dialog {
         Ok(())
     }
 
-    /// Whether a control's value differs from the one the dialog opened on
-    /// (as kept in step by the owner's reactions): the values OK writes when
-    /// it applies to several targets at once.
+    /// Whether a control's value differs from the one the dialog opened on.
+    /// Page Setup and Columns use it for the fields OK writes only when they
+    /// changed (section start, gutter position, multiple pages, the column
+    /// layout); Page Setup's page part has its own rule, in `page_setup`.
     pub fn changed(&self, name: &str) -> bool {
         let Some(i) = self.controls.iter().position(|c| c.name == name) else {
             return false;

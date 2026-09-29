@@ -359,8 +359,7 @@ pub(crate) fn layout_checked(tab: &DocTab, act: LayoutAct) -> bool {
     let (Surface::Doc(ed), Some(pkg)) = (&tab.surface, tab.pkg.as_ref()) else {
         return false;
     };
-    let sections = ed.sections();
-    let setup = SectionSetup::parse(&sections[ed.caret_section().min(sections.len() - 1)]);
+    let setup = SectionSetup::parse(&crate::page_setup::caret_raw(ed));
     let m = setup.margins;
     match act {
         LayoutAct::Margins(p) => {

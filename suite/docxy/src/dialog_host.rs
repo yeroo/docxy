@@ -293,11 +293,9 @@ impl Docxy {
                         )
                 }))
         });
-        let controls: Vec<AnyElement> = (0..d.controls.len())
-            .filter(|&i| {
-                let c = &d.controls[i];
-                c.visible && d.page_controls().any(|p| std::ptr::eq(p, c))
-            })
+        let controls: Vec<AnyElement> = d
+            .shown_indices()
+            .into_iter()
             .map(|i| self.dialog_widget(d, i, pal, cx))
             .collect();
         let buttons = d.buttons.iter().enumerate().map(|(i, b)| {

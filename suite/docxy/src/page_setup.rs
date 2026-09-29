@@ -84,8 +84,7 @@ fn body_of(tab: &DocTab) -> Result<(&Editor, &Package), String> {
 
 /// The caret section's setup.
 fn caret_setup(ed: &Editor) -> SectionSetup {
-    let sections = ed.sections();
-    SectionSetup::parse(&sections[ed.caret_section().min(sections.len() - 1)])
+    SectionSetup::parse(&caret_raw(ed))
 }
 
 /// "Apply to"'s choices: Word's, with Selected sections in place of This
@@ -206,8 +205,8 @@ fn hidden(name: &'static str, value: String) -> Control {
     c
 }
 
-/// The caret section's sectPr, as the dialog opened on it.
-fn caret_raw(ed: &Editor) -> String {
+/// The caret section's sectPr.
+pub(crate) fn caret_raw(ed: &Editor) -> String {
     let sections = ed.sections();
     sections[ed.caret_section().min(sections.len() - 1)].clone()
 }
@@ -311,10 +310,17 @@ fn person_changed(d: &Dialog, auto: &SectionSetup, name: &str) -> bool {
 }
 
 /// Show step 1's result in every field the person has not changed, after
-/// step 1 itself changed from `old` to `new`. A turned page moves every
-/// margin, the person's too, and swaps the sides together when step 1 swaps
-/// them; a picked paper fills in both sides.
-fn follow(d: &mut Dialog, old: &SectionSetup, new: &SectionSetup, turned: bool, pick: bool) {
+/// step 1 itself changed from `old` to `new`, and name the paper the sides
+/// then show.
+/// - `turned`: the page turned. Every margin moves, the person's too. The
+///   sides swap together: by their own shown shape once the person has typed
+///   one and both parse (as Word turns typed sides), else when step 1 swaps
+///   them (by the section's own shape).
+/// - `fill`: a paper was picked (or the opened one picked again). Both sides
+///   show step 1's, whatever was typed.
+/// - Otherwise each side, and the gutter and distances, that still shows
+///   `old`'s value shows `new`'s.
+fn follow(d: &mut Dialog, old: &SectionSetup, new: &SectionSetup, turned: bool, fill: bool) {
     if turned {
         let sides = ["top", "right", "bottom", "left"];
         let from = if new.page.landscape {
@@ -344,7 +350,7 @@ fn follow(d: &mut Dialog, old: &SectionSetup, new: &SectionSetup, turned: bool, 
         (true, (Some(w), Some(h))) => w != h && (w > h) != new.page.landscape,
         _ => auto_swapped,
     };
-    if pick {
+    if fill {
         set_value(d, "width", Value::Text(inches(new.page.w)));
         set_value(d, "height", Value::Text(inches(new.page.h)));
     } else if swapped {
@@ -370,13 +376,18 @@ fn follow(d: &mut Dialog, old: &SectionSetup, new: &SectionSetup, turned: bool, 
 
 /// The Paper size dropdown shows the named paper the shown sides match, else
 /// Custom. It is the dialog's reading of the sides, never the person's pick.
+/// The sides are matched as shown, to 0.01": A4's 8.27" stands for its
+/// 11906 twips though it reads back as 11909.
 fn show_paper(d: &mut Dialog) {
-    let at = match (
-        twips_of(&text_of(d, "width")),
-        twips_of(&text_of(d, "height")),
-    ) {
-        (Some(w), Some(h)) => Paper::matching(w, h)
-            .and_then(|p| Paper::ALL.iter().position(|q| *q == p))
+    let shown = |n: &str| twips_of(&text_of(d, n)).map(inches);
+    let at = match (shown("width"), shown("height")) {
+        (Some(w), Some(h)) => Paper::ALL
+            .iter()
+            .position(|p| {
+                let (a, b) = p.size();
+                let (a, b) = (inches(a), inches(b));
+                (a == w && b == h) || (a == h && b == w)
+            })
             .unwrap_or(Paper::ALL.len()),
         _ => Paper::ALL.len(),
     };
@@ -400,16 +411,28 @@ pub(crate) fn after_set(d: &mut Dialog, i: usize, before: &Value) {
             follow(d, &old, &new, true, false);
         }
         "paper" => {
-            let Some(p) = chosen(d, "paper").and_then(|k| Paper::ALL.get(k).copied()) else {
-                // Custom: the sides stay as they are, to be typed.
-                show_paper(d);
-                return;
-            };
             let now = chosen(d, "orientation") == Some(1);
             let old = automatic(d, now, picked(d));
-            set_value(d, "paper_pick", Value::Text(p.label().into()));
-            let new = automatic(d, now, Some(p));
-            follow(d, &old, &new, false, true);
+            let opened = index(d, "paper").and_then(|k| d.opened.get(k)).cloned();
+            match chosen(d, "paper").and_then(|k| Paper::ALL.get(k).copied()) {
+                // Custom: no named paper any more. The sides stay as shown, to
+                // be typed, so the ones step 1 no longer gives are the
+                // person's; the dropdown keeps Custom, and the next click on
+                // it wraps round to the first paper.
+                None => set_value(d, "paper_pick", Value::Text(String::new())),
+                // The paper the dialog opened on: no pick, the section's own
+                // sides again.
+                Some(_) if Some(&d.controls[i].value) == opened.as_ref() => {
+                    set_value(d, "paper_pick", Value::Text(String::new()));
+                    let new = automatic(d, now, None);
+                    follow(d, &old, &new, false, true);
+                }
+                Some(p) => {
+                    set_value(d, "paper_pick", Value::Text(p.label().into()));
+                    let new = automatic(d, now, Some(p));
+                    follow(d, &old, &new, false, true);
+                }
+            }
         }
         "width" | "height" => show_paper(d),
         _ => {}
@@ -438,48 +461,28 @@ pub(crate) fn apply_page_setup(
     pkg: &mut Package,
     d: &Dialog,
 ) -> Result<bool, String> {
-    let [
-        top,
-        bottom,
-        left,
-        right,
-        gutter,
-        width,
-        height,
-        header,
-        footer,
-    ] = [
-        "top", "bottom", "left", "right", "gutter", "width", "height", "header", "footer",
-    ]
-    .map(|n| field(d, n));
-    let (top, bottom, left, right, gutter) = (top?, bottom?, left?, right?, gutter?);
-    let (width, height, header, footer) = (width?, height?, header?, footer?);
-    for (v, what) in [
-        (top, "Top"),
-        (bottom, "Bottom"),
-        (left, "Left"),
-        (right, "Right"),
-        (gutter, "Gutter"),
-        (header, "Header"),
-        (footer, "Footer"),
-    ] {
-        if v < 0 {
-            return Err(format!("{what} cannot be negative"));
+    // Every field must be a number. Top and bottom are signed in OOXML (a
+    // negative one is an exact margin that text may not push), so only the
+    // others refuse a negative value.
+    let mut values = Vec::with_capacity(FIELDS.len());
+    for f in &FIELDS {
+        let v = field(d, f.0)?;
+        if v < 0 && !matches!(f.0, "top" | "bottom") {
+            let label = &d.controls[index(d, f.0).unwrap_or_default()].label;
+            let what = label.replace('&', "");
+            return Err(format!("{} cannot be negative", what.trim_end_matches(':')));
         }
+        values.push((f, v));
     }
     let changed = |n: &str| d.changed(n);
     let landscape = chosen(d, "orientation") == Some(1);
     let turn = landscape != opened_landscape(d);
     let pick = picked(d);
     let auto = automatic(d, landscape, pick);
-    let shown = [
-        top, right, bottom, left, gutter, header, footer, width, height,
-    ];
-    let mine: Vec<(Setter, i32)> = FIELDS
+    let mine: Vec<(Setter, i32)> = values
         .iter()
-        .zip(shown)
         .filter(|(f, _)| person_changed(d, &auto, f.0))
-        .map(|(f, v)| (f.2, v))
+        .map(|(f, v)| (f.2, *v))
         .collect();
     let sides_mine = ["width", "height"]
         .iter()
@@ -695,13 +698,6 @@ pub(crate) fn columns_dialog(tab: &DocTab) -> Result<Dialog, String> {
         DialogOwner::Columns,
     );
     d.text = None;
-    let mut hidden = Control::new(
-        "text_width",
-        "Text width",
-        ControlKind::Label,
-        Value::Text(tw.to_string()),
-    );
-    hidden.visible = false;
     d.controls = vec![
         choice(
             "preset",
@@ -751,7 +747,7 @@ pub(crate) fn columns_dialog(tab: &DocTab) -> Result<Dialog, String> {
             Value::Bool(c.sep),
         ),
         apply_to(ed),
-        hidden,
+        hidden("text_width", tw.to_string()),
     ]);
     show_rows(&mut d);
     let p = matching_preset(&d);
@@ -807,10 +803,12 @@ pub(crate) fn apply_columns(
     // Each value is shown to 0.01", so it may be up to half of that off the
     // twips it stands for: allow that on top of the 0.01" slack.
     let slack = FIT_SLACK + ROUNDING * (2 * n as i32 - 1);
-    for &k in &check {
-        if !layout_changed || n < 2 {
-            break;
-        }
+    let checked = if layout_changed && n > 1 {
+        check.as_slice()
+    } else {
+        &[]
+    };
+    for &k in checked {
         let tw = SectionSetup::parse(&sections[k.min(sections.len() - 1)])
             .text_width(pkg.has_gutter_at_top());
         let named = |e: String| {

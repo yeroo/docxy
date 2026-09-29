@@ -415,7 +415,7 @@ fn this_point_forward_starts_a_new_section_at_the_caret() {
 #[test]
 fn out_of_range_values_refuse_ok_and_keep_the_dialog() {
     let cases: [(&str, &str, &str); 5] = [
-        ("top", "-0.5", "Top cannot be negative"),
+        ("left", "-0.5", "Left cannot be negative"),
         (
             "left",
             "4",
@@ -694,6 +694,21 @@ fn whole_document_with_only_line_between_keeps_each_sections_columns() {
 
 // ---- r4: the page invariant, over every short edit sequence ------------------
 
+/// The paper a sequence has picked when OK is pressed: the last pick,
+/// unless it was the paper the dialog opened on or Custom, which leave none.
+fn effective_pick(seq: &[Step], opened: Paper) -> Option<Paper> {
+    let mut pick = None;
+    for st in seq {
+        if let Step::Pick(p) = st {
+            pick = Paper::ALL
+                .into_iter()
+                .find(|q| q.label() == *p)
+                .filter(|q| *q != opened);
+        }
+    }
+    pick
+}
+
 /// One edit a person makes in Page Setup.
 #[derive(Clone, Copy, Debug)]
 enum Step {
@@ -704,9 +719,11 @@ enum Step {
     Top(&'static str),
 }
 
-/// Type Width and Height, clear a side, retype a side's old value, pick each
-/// kind of paper, turn the page both ways, type a margin.
-const STEPS: [Step; 12] = [
+/// Type Width and Height, clear a side, retype a side's old value, pick a
+/// paper, pick the one the dialog opened on (Letter in the one-section sweep,
+/// A4 in the three-section one), pick Custom, turn the page both ways, type a
+/// margin.
+const STEPS: [Step; 13] = [
     Step::Width("7"),
     Step::Width("11"),
     Step::Width(""),
@@ -715,6 +732,7 @@ const STEPS: [Step; 12] = [
     Step::Height("14"),
     Step::Pick("A4"),
     Step::Pick("Legal"),
+    Step::Pick("Letter"),
     Step::Pick("Custom"),
     Step::Orient("Landscape"),
     Step::Orient("Portrait"),
@@ -821,7 +839,7 @@ fn ok_writes_the_page_the_dialog_shows_for_every_short_sequence() {
         }
     }
     assert!(
-        checked > 15_000 && refused > 1_000,
+        checked > 20_000 && refused > 1_000,
         "{checked} checked, {refused} refused"
     );
 }
@@ -854,10 +872,7 @@ fn whole_document_adds_only_the_persons_fields_to_each_section() {
                 continue;
             }
             // The expected result, from the steps and SectionSetup alone.
-            let pick = seq.iter().rev().find_map(|st| match st {
-                Step::Pick(p) => Paper::ALL.into_iter().find(|q| q.label() == *p),
-                _ => None,
-            });
+            let pick = effective_pick(&seq, Paper::A4);
             let turn = landscape != before[1].page.landscape;
             let automatic = |s: &SectionSetup| {
                 let mut s = s.clone();
@@ -923,4 +938,210 @@ fn unequal_columns_on_several_sections_fit_each_one() {
     set(&mut t, "Presets", s("Two"));
     ok(&mut t).unwrap();
     assert!(setups(&t).iter().all(|s| s.columns.count() == 2));
+}
+
+// ---- r5 ---------------------------------------------------------------------
+
+/// r5 M1: picking the paper the dialog opened on again undoes a pick. The
+/// other sections keep their paper, and a single section is left as it was.
+#[test]
+fn picking_the_opened_paper_again_is_no_pick() {
+    let mut t = three_sections();
+    seed(&mut t, 0, (12240, 15840, false, 1), [720, 1080, 1440, 1800]);
+    seed(
+        &mut t,
+        1,
+        (11906, 16838, false, 9),
+        [1000, 1100, 1200, 1300],
+    );
+    seed(&mut t, 2, (12240, 20160, false, 5), [500, 600, 700, 800]);
+    let before = setups(&t);
+    open(&mut t, PageSetupTab::Paper);
+    set(&mut t, "paper", s("Legal"));
+    set(&mut t, "paper", s("A4"));
+    assert_eq!(
+        (shown(&t, "width"), shown(&t, "height")),
+        ("8.27".into(), "11.69".into())
+    );
+    set(&mut t, "apply", s("Whole document"));
+    t.dirty = false;
+    ok(&mut t).unwrap();
+    assert_eq!(setups(&t), before, "no section's paper changed");
+    assert!(!t.dirty);
+
+    // One section, no w:code: Legal then Letter writes nothing, not a code.
+    let mut t = one_section();
+    let before = ed(&t).doc.clone();
+    t.dirty = false;
+    open(&mut t, PageSetupTab::Paper);
+    set(&mut t, "paper", s("Legal"));
+    set(&mut t, "paper", s("Letter"));
+    ok(&mut t).unwrap();
+    assert_eq!(ed(&t).doc, before);
+    assert!(!t.dirty, "the tab stays clean");
+    // Down then Up in the dropdown is the same.
+    let mut t = one_section();
+    let before = ed(&t).doc.clone();
+    open(&mut t, PageSetupTab::Paper);
+    let d = t.dialogs.top_dialog_mut().unwrap();
+    d.focus = d.controls.iter().position(|c| c.name == "paper");
+    d.step_focused(true).unwrap();
+    d.step_focused(false).unwrap();
+    ok(&mut t).unwrap();
+    assert_eq!(ed(&t).doc, before);
+}
+
+/// r5 m1: top and bottom are signed; only the other fields refuse a negative.
+#[test]
+fn a_negative_top_or_bottom_is_kept() {
+    let mut t = one_section();
+    ed_mut(&mut t).edit_section_setups(&[0], |s| s.margins.top = -1440);
+    open(&mut t, PageSetupTab::Margins);
+    assert_eq!(shown(&t, "top"), "-1");
+    set(&mut t, "left", s("1.5"));
+    ok(&mut t).unwrap();
+    let m = setups(&t)[0].margins;
+    assert_eq!(
+        (m.top, m.left),
+        (-1440, 2160),
+        "the untouched negative top stays"
+    );
+    open(&mut t, PageSetupTab::Margins);
+    set(&mut t, "bottom", s("-0.5"));
+    ok(&mut t).unwrap();
+    assert_eq!(setups(&t)[0].margins.bottom, -720);
+    for name in ["left", "right", "gutter"] {
+        open(&mut t, PageSetupTab::Margins);
+        set(&mut t, name, s("-0.5"));
+        assert!(
+            ok(&mut t).unwrap_err().ends_with("cannot be negative"),
+            "{name}"
+        );
+        crate::dialog_host::dialog_click(&mut t, "Cancel").unwrap();
+    }
+}
+
+/// r5 m2: clicks on the Paper dropdown step through every paper and Custom,
+/// then wrap round to Letter.
+#[test]
+fn paper_clicks_wrap_round() {
+    let mut t = one_section();
+    open(&mut t, PageSetupTab::Paper);
+    let i = t
+        .dialogs
+        .top()
+        .unwrap()
+        .controls
+        .iter()
+        .position(|c| c.name == "paper")
+        .unwrap();
+    let mut seen = Vec::new();
+    for _ in 0..8 {
+        t.dialogs
+            .top_dialog_mut()
+            .unwrap()
+            .click_control(i, None)
+            .unwrap();
+        seen.push(shown(&t, "paper"));
+    }
+    assert_eq!(
+        seen,
+        [
+            "Legal",
+            "Executive",
+            "A4",
+            "A5",
+            "B5 (JIS)",
+            "Tabloid",
+            "Custom",
+            "Letter"
+        ]
+    );
+    assert_eq!(
+        (shown(&t, "width"), shown(&t, "height")),
+        ("8.5".into(), "11".into())
+    );
+    let before = ed(&t).doc.clone();
+    ok(&mut t).unwrap();
+    assert_eq!(ed(&t).doc, before, "back where it started");
+}
+
+/// r5 m6: an oracle that does not mirror the implementation. Turning the
+/// page and picking papers changes no field of the person's, so every
+/// section, the caret's included, is just its own page turned and given the
+/// picked paper. And the dialog shows that: Landscape then Legal is 14 x 8.5.
+#[test]
+fn turning_and_picking_alone_are_the_automatic_part() {
+    let moves = [
+        Step::Orient("Landscape"),
+        Step::Orient("Portrait"),
+        Step::Pick("Legal"),
+        Step::Pick("Letter"),
+        Step::Pick("A4"),
+    ];
+    let mut t = three_sections();
+    seed(&mut t, 0, (12240, 15840, false, 1), [720, 1080, 1440, 1800]);
+    seed(&mut t, 1, (16838, 11906, true, 9), [1000, 1100, 1200, 1300]);
+    seed(&mut t, 2, (12240, 20160, false, 5), [500, 600, 700, 800]);
+    let start = ed(&t).doc.clone();
+    let mut seqs = vec![Vec::new()];
+    for _ in 0..3 {
+        let next: Vec<Vec<Step>> = seqs
+            .iter()
+            .flat_map(|q: &Vec<Step>| {
+                moves.iter().map(move |&m| {
+                    let mut q = q.clone();
+                    q.push(m);
+                    q
+                })
+            })
+            .collect();
+        seqs.extend(next);
+    }
+    seqs.sort_by_key(|q| q.len());
+    seqs.dedup_by(|a, b| format!("{a:?}") == format!("{b:?}"));
+    for seq in seqs {
+        *ed_mut(&mut t) = Editor::new(start.clone());
+        ed_mut(&mut t).caret = Caret::top(1, 0);
+        let before = setups(&t);
+        t.dialogs.clear();
+        open(&mut t, PageSetupTab::Margins);
+        for &st in &seq {
+            step(&mut t, st);
+        }
+        set(&mut t, "apply", s("Whole document"));
+        let landscape = shown(&t, "orientation") == "Landscape";
+        ok(&mut t).unwrap();
+        let pick = effective_pick(&seq, Paper::A4);
+        let turn = landscape != before[1].page.landscape;
+        for (k, own) in before.iter().enumerate() {
+            let mut want = own.clone();
+            if turn {
+                want.set_landscape(landscape);
+            }
+            if let Some(p) = pick {
+                want.page.set_paper(p);
+            }
+            if turn || pick.is_some() {
+                want.page.code = Paper::matching(want.page.w, want.page.h).map(Paper::code);
+            }
+            assert_eq!(setups(&t)[k], want, "section {k}: {seq:?}");
+        }
+    }
+
+    let mut t = one_section();
+    open(&mut t, PageSetupTab::Margins);
+    set(&mut t, "orientation", s("Landscape"));
+    t.dialogs.select_tab("Paper").unwrap();
+    set(&mut t, "paper", s("Legal"));
+    assert_eq!(
+        (shown(&t, "width"), shown(&t, "height")),
+        ("14".into(), "8.5".into())
+    );
+    ok(&mut t).unwrap();
+    let p = setups(&t)[0].page;
+    assert_eq!(
+        (p.w, p.h, p.landscape, p.code),
+        (20160, 12240, true, Some(5))
+    );
 }
