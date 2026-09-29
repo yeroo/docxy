@@ -160,13 +160,6 @@ pub(crate) fn read_json(menu: Option<&Menu>) -> Json {
     )
 }
 
-/// A key while a menu is open closes it and goes no further, so Esc (or any
-/// other key, until menus take arrows and Enter) never reaches the document
-/// or cell under the menu. `false` when no menu was open.
-pub(crate) fn close_on_key(menu: &mut Option<Menu>) -> bool {
-    menu.take().is_some()
-}
-
 /// Whether an open menu still fits what it was opened on, before an item
 /// runs: a row menu's task must still be the one selected on the active
 /// Project, and the document menu is never run on a Project. `project` is
@@ -474,17 +467,10 @@ mod tests {
             read_json(open.as_ref()).get("open"),
             Some(&Json::Bool(true))
         );
-        assert!(
-            close_on_key(&mut open),
-            "a key closes an open menu and stops there"
-        );
-        assert!(open.is_none());
+        // `Docxy::close_menu` is this take.
+        assert!(open.take().is_some(), "an open menu closes");
         let closed = read_json(open.as_ref());
         assert_eq!(closed, Json::obj(vec![("open", Json::Bool(false))]));
-        assert!(
-            !close_on_key(&mut open),
-            "with no menu open the key goes on"
-        );
     }
 
     #[test]

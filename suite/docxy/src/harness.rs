@@ -1494,11 +1494,27 @@ fn menu_open(
     }
 }
 
+/// Refuse a menu verb while the window draws no menu: the backstage covers
+/// the tab, and the more-tabs list hides an open menu.
+fn refuse_under_cover(app: &crate::Docxy) -> Result<(), String> {
+    if app.backstage {
+        return Err("File (backstage) is open; no menu shows".into());
+    }
+    if app.tab_more_open {
+        return Err("the more-tabs list is open; no menu shows".into());
+    }
+    Ok(())
+}
+
 /// Whether `verb` stands for a press outside an open menu, which closes it
 /// (#397). Reads leave it open, `key` and `type` reach the menu's own key
 /// gate, the `menu-*` verbs act on it, and a control-pipe verb closes it
 /// when it changes the plan or the focus (`dispatch_project`).
-fn closes_menu(verb: &str) -> bool {
+fn closes_menu(verb: &str, args: &Json) -> bool {
+    // Reading the backstage is a read; opening or closing it is a press.
+    if verb == "backstage" {
+        return args.get_str("action") != Some("read");
+    }
     matches!(
         verb,
         "click-cell"
@@ -1510,7 +1526,6 @@ fn closes_menu(verb: &str) -> bool {
             | "close-tab"
             | "selection-set"
             | "open"
-            | "backstage"
             | "backstage-close"
             | "theme-set"
             | "ask-on-close"
@@ -1774,7 +1789,7 @@ pub fn dispatch(
     app.flush_project_passes(cx);
     // A verb that stands for a press outside an open menu closes it first,
     // as that press would (the backdrop closes it, then the press goes on).
-    if closes_menu(verb) && app.close_menu() {
+    if closes_menu(verb, args) && app.close_menu() {
         cx.notify();
     }
     match verb {
@@ -2008,6 +2023,7 @@ pub fn dispatch(
         // split button's arrow calls, clicked through the item's own handler.
         "menu-open" => {
             refuse_under_dialog(app)?;
+            refuse_under_cover(app)?;
             let target = args.get("target").ok_or("menu-open needs a 'target'")?;
             menu_open(app, target, window, cx)?;
             Done::ok(crate::menu::read_json(app.menu.as_ref()))
@@ -2015,6 +2031,7 @@ pub fn dispatch(
         "menu-read" => Done::ok(crate::menu::read_json(app.menu.as_ref())),
         "menu-click" => {
             refuse_under_dialog(app)?;
+            refuse_under_cover(app)?;
             let labels = menu_path(args)?;
             let menu = app.menu.as_ref().ok_or("no menu is open")?;
             let path = crate::menu::resolve(&menu.items, &labels)?;
@@ -3098,11 +3115,10 @@ mod tests {
             "close-tab",
             "selection-set",
             "open",
-            "backstage",
             "select-chart",
             "focus-field",
         ] {
-            assert!(closes_menu(verb), "{verb}");
+            assert!(closes_menu(verb, &Json::obj(vec![])), "{verb}");
         }
         for verb in [
             "menu-open",
@@ -3123,8 +3139,12 @@ mod tests {
             "ping",
             "task.set",
         ] {
-            assert!(!closes_menu(verb), "{verb}");
+            assert!(!closes_menu(verb, &Json::obj(vec![])), "{verb}");
         }
+        let action = |a: &str| Json::obj(vec![("action", Json::Str(a.into()))]);
+        assert!(closes_menu("backstage", &action("open")));
+        assert!(closes_menu("backstage", &action("close")));
+        assert!(!closes_menu("backstage", &action("read")), "a read");
     }
 
     /// #397: `menu-click` takes a label or a path of labels, not both.

@@ -16564,7 +16564,7 @@ impl Docxy {
     /// (another tab, the backstage, a command run, a pointer verb) closes it,
     /// so an item is never clicked against a state it was not built for.
     pub(crate) fn close_menu(&mut self) -> bool {
-        menu::close_on_key(&mut self.menu)
+        self.menu.take().is_some()
     }
 
     /// The active tab's selected task (`Some(None)` on the entry row), or
