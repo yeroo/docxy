@@ -717,6 +717,26 @@ impl Package {
         self.sect_pr = xml;
     }
 
+    /// The final section as split section properties: the document's own
+    /// trailing sectPr, else the captured one (an empty
+    /// `<w:sectPr></w:sectPr>` when the package has none).
+    pub fn final_section(&self) -> SectionProperties {
+        if let Some(section) = self.document.trailing_section_properties() {
+            return section.clone();
+        }
+        let xml = if self.sect_pr.trim().is_empty() {
+            "<w:sectPr></w:sectPr>"
+        } else {
+            &self.sect_pr
+        };
+        let (raw, property_change) =
+            crate::load::split_property_change_container(xml, PropertyScope::Section);
+        SectionProperties {
+            raw,
+            property_change,
+        }
+    }
+
     /// Replace the trailing section properties with an already-split section
     /// (an editor's copy, tracked change included).
     pub fn set_trailing_section(&mut self, section: SectionProperties) {

@@ -965,7 +965,7 @@ fn export_pdf(app: &App, args: &Json) -> Result<Json, String> {
     if let Some(parent) = abs.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create failed: {e}"))?;
     }
-    let pdf = to_pdf(&app.editor.doc, &app.pdf_options());
+    let pdf = to_pdf(app.pdf_document(), &app.pdf_options());
     // Publish a synced PDF with exclusive-create semantics. Filesystems without
     // hard links fall back to exclusive creation and copying (which can leave a
     // partial new file on an I/O failure, as the original export did).

@@ -627,7 +627,7 @@ struct Page {
     min_base: f32,
     regions: usize,
     multi_col: bool,
-    /// Every section with a column set on the page.
+    /// The owning section plus every section with a line on the page.
     members: Vec<usize>,
     /// Formatted PAGE, NUMPAGES and SECTIONPAGES values.
     values: [String; 3],
@@ -882,6 +882,8 @@ struct Region {
     low: f32,
     /// Each column's left x and width.
     xs: Vec<(f32, f32)>,
+    /// A line has landed in it on the current page.
+    placed: bool,
 }
 
 /// The paginated body.
@@ -914,6 +916,7 @@ impl<'a> Pager<'a> {
                 col: 0,
                 low: 0.0,
                 xs: Vec::new(),
+                placed: false,
             },
             y: 0.0,
         };
@@ -1035,7 +1038,7 @@ impl<'a> Pager<'a> {
             min_base: f32::INFINITY,
             regions: 0,
             multi_col: false,
-            members: Vec::new(),
+            members: vec![sect],
             values: Default::default(),
         });
         self.start_region(sect, body_top);
@@ -1052,17 +1055,13 @@ impl<'a> Pager<'a> {
             xs.push((x, w));
             x += w + space;
         }
-        page.regions += 1;
-        page.multi_col |= xs.len() > 1;
-        if !page.members.contains(&sect) {
-            page.members.push(sect);
-        }
         self.region = Region {
             sect,
             top,
             col: 0,
             low: top,
             xs,
+            placed: false,
         };
         self.y = top;
     }
@@ -1233,6 +1232,16 @@ impl Flow for Pager<'_> {
         let (x, w) = self.region.xs[self.region.col];
         let page = self.pages.last_mut().expect("a page exists");
         page.min_base = page.min_base.min(self.y);
+        // Count the column set, and its section, only once a line lands, so a
+        // continuous section that overflows at once doesn't claim this page.
+        if !self.region.placed {
+            self.region.placed = true;
+            page.regions += 1;
+            page.multi_col |= self.region.xs.len() > 1;
+            if !page.members.contains(&self.region.sect) {
+                page.members.push(self.region.sect);
+            }
+        }
         (x, w, self.y)
     }
     fn push(&mut self, mut frag: Frag, link: Option<Link>) {
@@ -2823,5 +2832,22 @@ mod tests {
             pages[0].has("DEF") && !pages[0].has("FIRST"),
             "titlePg was removed"
         );
+    }
+
+    #[test]
+    fn a_continuous_section_that_overflows_at_once_owns_only_the_next_page() {
+        let mut blocks: Vec<Block> = (0..32).map(|i| text_para(&format!("l{i}"))).collect();
+        blocks.push(sect_para("l32", BLANK_SECT));
+        blocks.push(para(vec![
+            run("count=", RunProps::default()),
+            fld_simple("SECTIONPAGES", "0"),
+        ]));
+        blocks.push(trailing(
+            r#"<w:sectPr><w:type w:val="continuous"/></w:sectPr>"#,
+        ));
+        let pages = pages_of(&doc(blocks), &PdfOptions::default());
+        assert_eq!(pages.len(), 2);
+        assert!(pages[1].has("count="));
+        assert!(pages[1].exact("1"), "{:?}", pages[1].texts);
     }
 }

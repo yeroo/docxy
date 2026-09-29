@@ -1099,6 +1099,9 @@ struct App {
     even_odd: bool,
     /// Part names of the default header/footer (for editing/saving), if present.
     header_part: Option<String>,
+    /// The body's final sectPr that `headers`/`footers`/`title_page` and the
+    /// part names were derived from ([`App::sync_page_parts`]).
+    page_parts_sect: String,
     footer_part: Option<String>,
     /// Active header/footer focus-edit, if any.
     hf_edit: Option<HfEdit>,
@@ -1145,17 +1148,7 @@ impl App {
             .part("word/_rels/document.xml.rels")
             .map(|b| parse_rels_xml(std::str::from_utf8(b).unwrap_or("")))
             .unwrap_or_default();
-        let parts = |kind: &str| PageParts {
-            default: Rc::new(load_hdr_ftr(&pkg, &rels, kind, "default")),
-            first: Rc::new(load_hdr_ftr(&pkg, &rels, kind, "first")),
-            even: Rc::new(load_hdr_ftr(&pkg, &rels, kind, "even")),
-        };
-        let headers = parts("headerReference");
-        let footers = parts("footerReference");
-        let title_page = flag_on(pkg.sect_pr(), "titlePg");
         let even_odd = pkg.has_even_odd();
-        let header_part = hf_part_name(&pkg, &rels, "headerReference");
-        let footer_part = hf_part_name(&pkg, &rels, "footerReference");
         let comments = docxcore::comments::parse_comments(&pkg);
         let notes = docxcore::notes::parse_notes(&pkg);
         let doc_protection = pkg.protection();
@@ -1179,6 +1172,8 @@ impl App {
         if protection::authorize(&doc_protection, protection::MutationKind::Content).is_ok() {
             docxcore::field::recompute(&mut doc, &field_ctx);
         }
+        with_final_section(&mut doc, &pkg);
+        let page_parts = PageState::derive(&pkg, &doc);
         let watermark_state = watermark::State::from_package(&pkg);
         let doc_page_borders = pkg.has_page_borders();
         App {
@@ -1273,12 +1268,13 @@ impl App {
             clip_text: None,
             styles: Rc::new(styles),
             numbering: Rc::new(numbering),
-            headers,
-            footers,
-            title_page,
+            headers: page_parts.headers,
+            footers: page_parts.footers,
+            title_page: page_parts.title_page,
             even_odd,
-            header_part,
-            footer_part,
+            header_part: page_parts.header_part,
+            footer_part: page_parts.footer_part,
+            page_parts_sect: page_parts.sect,
             hf_edit: None,
             vim: if vim { Some(VimState::new()) } else { None },
             pending_link: None,
@@ -2218,13 +2214,24 @@ impl App {
                 opts.header_footer.insert(part.clone(), blocks.clone());
             }
         }
+        // A header/footer being edited prints its live content.
+        if let Some(hf) = &self.hf_edit {
+            opts.header_footer
+                .insert(hf.part.clone(), Rc::new(self.editor.doc.body.clone()));
+        }
         opts
+    }
+
+    /// The document PDF export prints: the body, even while a header or footer
+    /// is being edited.
+    fn pdf_document(&self) -> &Document {
+        &self.body_editor().doc
     }
 
     /// Render the document to a PDF at `out` and report the result in the status
     /// line. Callers handle any overwrite confirmation first.
     fn write_pdf(&mut self, out: std::path::PathBuf) {
-        let pdf = to_pdf(&self.editor.doc, &self.pdf_options());
+        let pdf = to_pdf(self.pdf_document(), &self.pdf_options());
         self.status = match export_atomic(Some(Path::new(&self.path)), &out, &pdf) {
             Ok(()) => Some(format!("exported {}", out.display())),
             Err(e) => Some(format!("export failed: {e}")),
@@ -2245,17 +2252,7 @@ impl App {
             .part("word/_rels/document.xml.rels")
             .map(|b| parse_rels_xml(std::str::from_utf8(b).unwrap_or("")))
             .unwrap_or_default();
-        let parts = |kind: &str| PageParts {
-            default: Rc::new(load_hdr_ftr(&pkg, &rels, kind, "default")),
-            first: Rc::new(load_hdr_ftr(&pkg, &rels, kind, "first")),
-            even: Rc::new(load_hdr_ftr(&pkg, &rels, kind, "even")),
-        };
-        self.headers = parts("headerReference");
-        self.footers = parts("footerReference");
-        self.title_page = flag_on(pkg.sect_pr(), "titlePg");
         self.even_odd = pkg.has_even_odd();
-        self.header_part = hf_part_name(&pkg, &rels, "headerReference");
-        self.footer_part = hf_part_name(&pkg, &rels, "footerReference");
         self.comments = docxcore::comments::parse_comments(&pkg);
         self.notes = docxcore::notes::parse_notes(&pkg);
         self.notes_scroll = 0;
@@ -2265,7 +2262,15 @@ impl App {
         self.doc_protection = pkg.protection();
         self.watermark_state = watermark::State::from_package(&pkg);
         self.doc_page_borders = pkg.has_page_borders();
-        let doc = std::mem::take(&mut pkg.document);
+        let mut doc = std::mem::take(&mut pkg.document);
+        with_final_section(&mut doc, &pkg);
+        let page_parts = PageState::derive(&pkg, &doc);
+        self.headers = page_parts.headers;
+        self.footers = page_parts.footers;
+        self.title_page = page_parts.title_page;
+        self.header_part = page_parts.header_part;
+        self.footer_part = page_parts.footer_part;
+        self.page_parts_sect = page_parts.sect;
         self.pkg = pkg;
         self.editor = Editor::new(doc);
         self.styles = Rc::new(styles);
@@ -2295,7 +2300,34 @@ impl App {
         self.watermark_state = watermark::State::from_package(&live);
     }
 
+    /// The editor holding the document body (parked while a header or footer
+    /// is being edited).
+    fn body_editor(&self) -> &Editor {
+        self.hf_edit.as_ref().map_or(&self.editor, |hf| &hf.body)
+    }
+
+    /// Re-derive the header/footer parts, their content and titlePg from the
+    /// body's final sectPr whenever it changed: undo and redo restore that
+    /// sectPr, so the view, save and PDF follow them.
+    fn sync_page_parts(&mut self) {
+        let doc = &self.body_editor().doc;
+        let current = doc
+            .trailing_section_properties()
+            .map_or("", |section| section.raw.as_str());
+        if current == self.page_parts_sect {
+            return;
+        }
+        let page_parts = PageState::derive(&self.pkg, doc);
+        self.headers = page_parts.headers;
+        self.footers = page_parts.footers;
+        self.title_page = page_parts.title_page;
+        self.header_part = page_parts.header_part;
+        self.footer_part = page_parts.footer_part;
+        self.page_parts_sect = page_parts.sect;
+    }
+
     fn refresh_watermark_state_if_needed(&mut self) {
+        self.sync_page_parts();
         if !self
             .watermark_state
             .matches_document_sections(&self.editor.doc)
@@ -3108,6 +3140,7 @@ impl App {
         if self.hf_edit.is_some() {
             self.exit_hf_edit(true);
         }
+        self.sync_page_parts();
         let what = if is_header { "header" } else { "footer" };
         // Resolve the part, creating one from scratch if the document has none.
         let existing = if is_header {
@@ -3222,6 +3255,7 @@ impl App {
                 editor.doc.set_trailing_section_properties(section);
             }
         }
+        self.sync_page_parts();
         out
     }
 
@@ -6717,11 +6751,66 @@ fn doc_line_to_ratatui(line: &DocLine) -> RLine<'static> {
 
 /// Load the default header/footer block content referenced by the section's
 /// `<w:{kind}>` (kind = "headerReference" or "footerReference"). Empty if none.
-/// Thin wrapper over `docxcore::load::resolve_header_footer` (shared with
-/// docxwasm's `docx_ctl`, which needs the identical sectPr -> rels -> part ->
-/// parse resolution for its `doc.header`/`doc.footer` verbs).
-fn load_hdr_ftr(pkg: &Package, rels: &Relationships, kind: &str, wtype: &str) -> Vec<Block> {
-    docxcore::load::resolve_header_footer(pkg, rels, kind, wtype)
+/// Give a body document a final `SectionProperties` when it has none (a New
+/// document, or a package whose sectPr lives outside the body), so every undo
+/// snapshot carries the final section it was taken with.
+fn with_final_section(doc: &mut Document, pkg: &Package) {
+    if doc.trailing_section_properties().is_none() {
+        doc.set_trailing_section_properties(pkg.final_section());
+    }
+}
+
+/// Header/footer state derived from a body document's final sectPr.
+struct PageState {
+    headers: PageParts,
+    footers: PageParts,
+    title_page: bool,
+    header_part: Option<String>,
+    footer_part: Option<String>,
+    sect: String,
+}
+
+impl PageState {
+    /// Resolve the final section's header/footer references through the
+    /// package's current relationships (a header created since load has a new
+    /// one) to parts, and parse their content.
+    fn derive(pkg: &Package, doc: &Document) -> PageState {
+        let sect = doc
+            .trailing_section_properties()
+            .map(|section| section.raw.clone())
+            .unwrap_or_default();
+        let rels = pkg
+            .part("word/_rels/document.xml.rels")
+            .map(|b| parse_rels_xml(std::str::from_utf8(b).unwrap_or("")))
+            .unwrap_or_default();
+        let part = |kind: &str, wtype: &str| hf_part_name(&sect, &rels, kind, wtype);
+        let blocks = |kind: &str, wtype: &str| {
+            Rc::new(
+                part(kind, wtype)
+                    .and_then(|name| pkg.part(&name))
+                    .map(|b| {
+                        docxcore::load::parse_header_footer(
+                            std::str::from_utf8(b).unwrap_or(""),
+                            &rels,
+                        )
+                    })
+                    .unwrap_or_default(),
+            )
+        };
+        let parts = |kind: &str| PageParts {
+            default: blocks(kind, "default"),
+            first: blocks(kind, "first"),
+            even: blocks(kind, "even"),
+        };
+        PageState {
+            headers: parts("headerReference"),
+            footers: parts("footerReference"),
+            title_page: flag_on(&sect, "titlePg"),
+            header_part: part("headerReference", "default"),
+            footer_part: part("footerReference", "default"),
+            sect,
+        }
+    }
 }
 
 /// Whether an on/off OOXML element (`<w:tag/>` / `<w:tag w:val="…"/>`) is present
@@ -6761,9 +6850,9 @@ fn orient_sectpr(sect: &str, landscape: bool) -> String {
     sect.replacen("</w:sectPr>", &format!("{pgsz}</w:sectPr>"), 1)
 }
 
-/// The package part name of the default header/footer (for editing/saving).
-fn hf_part_name(pkg: &Package, rels: &Relationships, kind: &str) -> Option<String> {
-    let rid = docxcore::load::header_footer_ref_rid(pkg.sect_pr(), kind, "default")?;
+/// The package part name of a section's header/footer of type `wtype`.
+fn hf_part_name(sect: &str, rels: &Relationships, kind: &str, wtype: &str) -> Option<String> {
+    let rid = docxcore::load::header_footer_ref_rid(sect, kind, wtype)?;
     let target = rels.target(&rid)?;
     Some(match target.strip_prefix('/') {
         Some(r) => r.to_string(),
@@ -8730,7 +8819,11 @@ mod tests {
         let mut protected = ProtectionFixture::ReadOnly.package();
         protected.document = field_document.clone();
         let protected_app = App::new(protected, "protected.docx", false);
-        assert_eq!(protected_app.editor.doc, field_document);
+        let doc = &protected_app.editor.doc;
+        assert_eq!(
+            doc.body[..doc.content_block_count()],
+            field_document.body[..]
+        );
 
         let mut unrestricted = ProtectionFixture::Unrestricted.package();
         unrestricted.document = field_document;
@@ -8819,10 +8912,8 @@ mod tests {
 
         app.run_act(ribbon::Act::Sort);
 
-        let paragraphs = app
-            .editor
-            .doc
-            .body
+        let doc = &app.editor.doc;
+        let paragraphs = doc.body[..doc.content_block_count()]
             .iter()
             .map(Block::plain_text)
             .collect::<Vec<_>>();
@@ -8837,7 +8928,7 @@ mod tests {
         protect(&mut app, ProtectionEditMode::Unrestricted, true);
 
         app.on_key(key(KeyCode::Enter));
-        assert_eq!(app.editor.doc.body.len(), 2);
+        assert_eq!(app.editor.doc.content_block_count(), 2);
         assert_eq!(first_line(&app), "---");
         assert!(
             matches!(&app.editor.doc.body[0], Block::Paragraph(p) if p.props.borders.bottom.is_none())
@@ -9103,6 +9194,134 @@ mod tests {
             app.editor.doc.trailing_section_properties().cloned(),
             before
         );
+    }
+
+    /// Save `app` to a temp file and load the result back.
+    fn save_and_reload(app: &mut App, tag: &str) -> Package {
+        let dir = std::env::temp_dir().join(format!("docxy-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        app.path = dir.join("t.docx").to_string_lossy().into_owned();
+        app.modified = true;
+        app.save();
+        let bytes = std::fs::read(dir.join("t.docx")).expect("saved");
+        let _ = std::fs::remove_dir_all(&dir);
+        docxcore::package::load_package(&bytes).unwrap()
+    }
+
+    fn app_pdf(app: &App) -> String {
+        String::from_utf8_lossy(&to_pdf(app.pdf_document(), &app.pdf_options())).into_owned()
+    }
+
+    fn final_sect(app: &App) -> String {
+        app.editor
+            .doc
+            .trailing_section_properties()
+            .map(|s| s.raw.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn undoing_header_creation_removes_the_header_everywhere_and_redo_restores_it() {
+        let mut app = app_with_trailing_sect_pr();
+        app.run_act(ribbon::Act::EditHeader);
+        app.on_key(key(KeyCode::Char('H')));
+        app.on_key(key(KeyCode::F(6)));
+        assert!(app.headers.default.iter().any(|b| b.plain_text() == "H"));
+
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert!(!final_sect(&app).contains("headerReference"));
+        assert!(app.headers.default.is_empty(), "the view drops the header");
+        assert!(app.header_part.is_none());
+        assert!(!app_pdf(&app).contains("(H) Tj"));
+        let saved = save_and_reload(&mut app, "hf-undo");
+        assert!(!saved.sect_pr().contains("headerReference"));
+
+        app.on_key(ctrl(KeyCode::Char('y')));
+        assert!(app.headers.default.iter().any(|b| b.plain_text() == "H"));
+        assert!(app.header_part.is_some());
+        assert!(app_pdf(&app).contains("(H) Tj"));
+        let saved = save_and_reload(&mut app, "hf-redo");
+        assert!(saved.sect_pr().contains("headerReference"));
+    }
+
+    #[test]
+    fn a_header_can_be_created_again_after_undoing_its_creation() {
+        let mut app = app_with_trailing_sect_pr();
+        app.run_act(ribbon::Act::EditHeader);
+        app.on_key(key(KeyCode::Char('H')));
+        app.on_key(key(KeyCode::F(6)));
+        let first_part = app.header_part.clone().unwrap();
+        app.on_key(ctrl(KeyCode::Char('z')));
+
+        app.run_act(ribbon::Act::EditHeader);
+        app.on_key(key(KeyCode::Char('J')));
+        app.on_key(key(KeyCode::F(6)));
+        let part = app.header_part.clone().expect("linked again");
+        assert_ne!(
+            part, first_part,
+            "a fresh part; the undone one stays orphaned"
+        );
+        assert!(final_sect(&app).contains("headerReference"));
+        assert!(app_pdf(&app).contains("(J) Tj"));
+        let saved = save_and_reload(&mut app, "hf-again");
+        assert!(saved.sect_pr().contains("headerReference"));
+    }
+
+    #[test]
+    fn undoing_columns_on_a_document_without_its_own_sect_pr() {
+        let paras: Vec<String> = (0..60).map(|i| format!("l{i}")).collect();
+        let refs: Vec<&str> = paras.iter().map(String::as_str).collect();
+        let mut app = app_with(&refs);
+        let count = |pdf: &str| pdf.matches("/Type /Page /Parent").count();
+        assert_eq!(count(&app_pdf(&app)), 2, "one column needs two pages");
+        app.run_act(ribbon::Act::Columns);
+        assert_eq!(count(&app_pdf(&app)), 1, "two columns fit one page");
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert!(!final_sect(&app).contains(r#"w:num="2""#));
+        assert_eq!(count(&app_pdf(&app)), 2, "single column again");
+        let saved = save_and_reload(&mut app, "cols-undo");
+        assert!(
+            !saved.sect_pr().contains(r#"w:num="2""#),
+            "{}",
+            saved.sect_pr()
+        );
+        app.run_act(ribbon::Act::Columns);
+        assert!(
+            final_sect(&app).contains(r#"w:num="2""#),
+            "{}",
+            final_sect(&app)
+        );
+    }
+
+    #[test]
+    fn undoing_a_section_insert_on_a_document_without_its_own_sect_pr() {
+        let mut app = app_with(&["first", "second"]);
+        app.insert_section(true);
+        assert!(app_pdf(&app).contains("/MediaBox [0 0 792.00 612.00]"));
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert!(!final_sect(&app).contains("landscape"));
+        let pdf = app_pdf(&app);
+        assert!(!pdf.contains("792.00 612.00"), "portrait only");
+        let saved = save_and_reload(&mut app, "sect-undo");
+        assert!(
+            !saved.sect_pr().contains("landscape"),
+            "{}",
+            saved.sect_pr()
+        );
+    }
+
+    #[test]
+    fn pdf_export_while_editing_a_header_prints_the_body_and_the_live_header() {
+        let mut app = app_with(&["body"]);
+        app.run_act(ribbon::Act::EditHeader);
+        for c in "Live".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        assert!(app.hf_edit.is_some());
+        let pdf = app_pdf(&app);
+        assert!(pdf.contains("(body) Tj"), "the body is printed");
+        assert!(pdf.contains("(Live) Tj"), "with the header being edited");
     }
 
     #[test]
@@ -10534,10 +10753,10 @@ mod tests {
         let mut app = app_with(&["abcd"]);
         app.editor.caret.offset = 2;
         app.on_key(key(KeyCode::Enter));
-        assert_eq!(app.editor.doc.body.len(), 2);
+        assert_eq!(app.editor.doc.content_block_count(), 2);
         // backspace at start of the new paragraph merges back
         app.on_key(key(KeyCode::Backspace));
-        assert_eq!(app.editor.doc.body.len(), 1);
+        assert_eq!(app.editor.doc.content_block_count(), 1);
         assert_eq!(first_line(&app), "abcd");
     }
 
