@@ -1494,6 +1494,32 @@ fn menu_open(
     }
 }
 
+/// Whether `verb` stands for a press outside an open menu, which closes it
+/// (#397). Reads leave it open, `key` and `type` reach the menu's own key
+/// gate, the `menu-*` verbs act on it, and a control-pipe verb closes it
+/// when it changes the plan or the focus (`dispatch_project`).
+fn closes_menu(verb: &str) -> bool {
+    matches!(
+        verb,
+        "click-cell"
+            | "drag"
+            | "select-chart"
+            | "focus-field"
+            | "ribbon-click"
+            | "title-tab"
+            | "close-tab"
+            | "selection-set"
+            | "open"
+            | "backstage"
+            | "backstage-close"
+            | "theme-set"
+            | "ask-on-close"
+            | "dialog-set"
+            | "dialog-tab"
+            | "dialog-click"
+    )
+}
+
 /// `menu-click`'s `{label}` or `{path}`, as the labels to walk.
 fn menu_path(args: &Json) -> Result<Vec<&str>, String> {
     match (args.get("label"), args.get("path")) {
@@ -1746,6 +1772,11 @@ pub fn dispatch(
     // or not a frame ran in between. The verb that asks for one replies
     // before it runs, with `app_state` "Busy".
     app.flush_project_passes(cx);
+    // A verb that stands for a press outside an open menu closes it first,
+    // as that press would (the backdrop closes it, then the press goes on).
+    if closes_menu(verb) && app.close_menu() {
+        cx.notify();
+    }
     match verb {
         "window-zoom" => {
             window.zoom_window();
@@ -1983,6 +2014,7 @@ pub fn dispatch(
         }
         "menu-read" => Done::ok(crate::menu::read_json(app.menu.as_ref())),
         "menu-click" => {
+            refuse_under_dialog(app)?;
             let labels = menu_path(args)?;
             let menu = app.menu.as_ref().ok_or("no menu is open")?;
             let path = crate::menu::resolve(&menu.items, &labels)?;
@@ -1990,7 +2022,8 @@ pub fn dispatch(
             Done::ok(state(app, window))
         }
         "menu-close" => {
-            if !crate::menu::close_on_key(&mut app.menu) {
+            refuse_under_dialog(app)?;
+            if !app.close_menu() {
                 return Err("no menu is open".into());
             }
             cx.notify();
@@ -3051,6 +3084,47 @@ mod tests {
             split_primary(project, "Nope", "Set Baseline"),
             Err("no group 'Nope' on tab 'Project'".into())
         );
+    }
+
+    /// #397: the verbs that stand for a press close an open menu; reads,
+    /// keys and the menu verbs do not.
+    #[test]
+    fn pointer_verbs_close_an_open_menu_and_reads_do_not() {
+        for verb in [
+            "click-cell",
+            "drag",
+            "ribbon-click",
+            "title-tab",
+            "close-tab",
+            "selection-set",
+            "open",
+            "backstage",
+            "select-chart",
+            "focus-field",
+        ] {
+            assert!(closes_menu(verb), "{verb}");
+        }
+        for verb in [
+            "menu-open",
+            "menu-read",
+            "menu-click",
+            "menu-close",
+            "key",
+            "type",
+            "ribbon-read",
+            "dialog-read",
+            "status-read",
+            "doc",
+            "rows",
+            "cell",
+            "selection",
+            "capture",
+            "rect",
+            "ping",
+            "task.set",
+        ] {
+            assert!(!closes_menu(verb), "{verb}");
+        }
     }
 
     /// #397: `menu-click` takes a label or a path of labels, not both.

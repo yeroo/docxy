@@ -5751,6 +5751,7 @@ impl Docxy {
 
     fn open_backstage(&mut self, cx: &mut Context<Self>) {
         self.project_prompt_cancel();
+        self.close_menu();
         self.backstage = true;
         self.bs_new = false;
         cx.notify();
@@ -11002,6 +11003,8 @@ impl Docxy {
     fn select_tab(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.flush_project_passes(cx);
         self.project_prompt_cancel();
+        // A menu belongs to the tab it opened on.
+        self.close_menu();
         if i < self.tabs.len() {
             self.active = i;
             self.tab_more_open = false;
@@ -11698,7 +11701,7 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) {
         self.mini_bar = None;
-        self.menu = None;
+        self.close_menu();
         if let Some(ed) = self.edit_target() {
             if extend {
                 ed.extend_selection(true); // anchor at the current caret if none
@@ -13471,7 +13474,7 @@ impl Docxy {
             return;
         }
         // An open menu takes Tab as it takes every key; see `on_key`.
-        if menu::close_on_key(&mut self.menu) {
+        if self.close_menu() {
             cx.notify();
             return;
         }
@@ -13482,7 +13485,6 @@ impl Docxy {
         if self.active_is_project() {
             if self.keytips == KeyTip::Off && !self.backstage {
                 self.mini_bar = None;
-                self.menu = None;
                 self.project_tab_key(false, window, cx);
             }
             return;
@@ -13501,7 +13503,6 @@ impl Docxy {
             return;
         }
         self.mini_bar = None;
-        self.menu = None;
         // On a sheet, Tab commits the edit and advances one cell to the right.
         if self.active_is_sheet() {
             // A Chart-panel range field swallows Tab the same way it swallows
@@ -13543,7 +13544,7 @@ impl Docxy {
             return;
         }
         // An open menu takes Tab as it takes every key; see `on_key`.
-        if menu::close_on_key(&mut self.menu) {
+        if self.close_menu() {
             cx.notify();
             return;
         }
@@ -13554,7 +13555,6 @@ impl Docxy {
         if self.active_is_project() {
             if self.keytips == KeyTip::Off && !self.backstage {
                 self.mini_bar = None;
-                self.menu = None;
                 self.project_tab_key(true, window, cx);
             }
             return;
@@ -13563,7 +13563,6 @@ impl Docxy {
             return;
         }
         self.mini_bar = None;
-        self.menu = None;
         // On a sheet, Shift+Tab commits and moves one cell to the left.
         if self.active_is_sheet() {
             // Same as Tab above: the field has the keyboard first, then
@@ -13594,7 +13593,7 @@ impl Docxy {
         // An open menu takes the key: Esc closes it, and so, until menus
         // take arrows and Enter, does any other key; none reaches the
         // document or cell under it (#397).
-        if menu::close_on_key(&mut self.menu) {
+        if self.close_menu() {
             cx.notify();
             return;
         }
@@ -13640,9 +13639,9 @@ impl Docxy {
             }
             return; // swallow other keys while KeyTips are up
         }
-        // Any key dismisses the floating mini toolbar / context menu.
+        // Any key dismisses the floating mini toolbar (an open menu took the
+        // key above).
         self.mini_bar = None;
-        self.menu = None;
         // Spreadsheet surface: the grid has its own key handling (navigation,
         // cell editing, recalc) — nothing routes to a text editor.
         if self.active_is_sheet() {
@@ -16560,6 +16559,23 @@ impl Docxy {
         cx.notify();
     }
 
+    /// Close the open menu, as a press outside it or a key does; `false`
+    /// when none was open. Anything that moves on from the menu's moment
+    /// (another tab, the backstage, a command run, a pointer verb) closes it,
+    /// so an item is never clicked against a state it was not built for.
+    pub(crate) fn close_menu(&mut self) -> bool {
+        menu::close_on_key(&mut self.menu)
+    }
+
+    /// The active tab's selected task (`Some(None)` on the entry row), or
+    /// `None` off a Project, for checking a menu still fits its target.
+    fn project_selection(&self) -> Option<Option<i32>> {
+        match self.tabs.get(self.active).map(|t| &t.surface) {
+            Some(Surface::Project(v)) => Some(v.selected_uid()),
+            _ => None,
+        }
+    }
+
     /// The document body's right-click, and `menu-open "document"`.
     pub(crate) fn open_document_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
         self.open_menu(menu::MenuTarget::Document, at, menu::document_menu(), cx);
@@ -16657,6 +16673,7 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         let menu = self.menu.as_ref().ok_or("no menu is open")?;
+        menu::target_stands(&menu.target, self.project_selection())?;
         let entry = menu::entry_at(&menu.items, path).ok_or("no such menu item")?;
         if !entry.enabled {
             return Err(format!("menu item '{}' is disabled", entry.label));
@@ -16665,7 +16682,7 @@ impl Docxy {
             return Err(format!("menu item '{}' opens a submenu", entry.label));
         }
         let act = entry.act;
-        self.menu = None;
+        self.close_menu();
         match act {
             Some(act) => self.dispatch(act, window, cx),
             None => self.refocus(window, cx),
@@ -16754,14 +16771,14 @@ impl Docxy {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _w, cx| {
-                    this.menu = None;
+                    this.close_menu();
                     cx.notify();
                 }),
             )
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, _, _w, cx| {
-                    this.menu = None;
+                    this.close_menu();
                     cx.notify();
                 }),
             )
@@ -16869,6 +16886,8 @@ impl Docxy {
 
     fn dispatch(&mut self, act: Act, window: &mut Window, cx: &mut Context<Self>) {
         use Act::*;
+        // A command run from anywhere ends an open menu's moment (#397).
+        self.close_menu();
         match act {
             Project(p) => self.project_act(p, window, cx),
             Cut => self.do_copy(true, window, cx),
@@ -19553,7 +19572,7 @@ impl Docxy {
             } else {
                 self.sheet_fill = None;
                 self.grid_release(cx);
-                self.menu = None;
+                self.close_menu();
                 self.mini_bar = None;
                 self.tab_more_open = true;
                 cx.notify();

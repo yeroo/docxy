@@ -167,6 +167,26 @@ pub(crate) fn close_on_key(menu: &mut Option<Menu>) -> bool {
     menu.take().is_some()
 }
 
+/// Whether an open menu still fits what it was opened on, before an item
+/// runs: a row menu's task must still be the one selected on the active
+/// Project, and the document menu is never run on a Project. `project` is
+/// the active tab's selected task (`Some(None)` on the entry row), or `None`
+/// off a Project. Whatever moves on from a menu closes it; this is the
+/// check that an item never runs against a state it was not built for.
+pub(crate) fn target_stands(
+    target: &MenuTarget,
+    project: Option<Option<i32>>,
+) -> Result<(), String> {
+    match (target, project) {
+        (MenuTarget::Row(uid), Some(selected)) if selected == *uid => Ok(()),
+        (MenuTarget::Row(_), _) => Err("the row menu's task is no longer the selected one".into()),
+        (MenuTarget::Document, Some(_)) => {
+            Err("the document menu does not run on a Project tab".into())
+        }
+        (MenuTarget::Document | MenuTarget::Ribbon { .. }, _) => Ok(()),
+    }
+}
+
 /// The item a `menu-click` names: `{label}` among the top-level items, or
 /// `{path}` of labels through submenus. Returns the index path of an item
 /// that can be clicked, or why not.
@@ -465,6 +485,31 @@ mod tests {
             !close_on_key(&mut open),
             "with no menu open the key goes on"
         );
+    }
+
+    #[test]
+    fn an_item_runs_only_against_the_target_its_menu_was_built_for() {
+        let row = MenuTarget::Row(Some(3));
+        assert_eq!(target_stands(&row, Some(Some(3))), Ok(()));
+        for moved in [Some(Some(5)), Some(None), None] {
+            assert!(
+                target_stands(&row, moved)
+                    .unwrap_err()
+                    .contains("no longer the selected one")
+            );
+        }
+        let entry = MenuTarget::Row(None);
+        assert_eq!(target_stands(&entry, Some(None)), Ok(()));
+        assert!(target_stands(&entry, Some(Some(1))).is_err());
+        assert_eq!(target_stands(&MenuTarget::Document, None), Ok(()));
+        assert!(target_stands(&MenuTarget::Document, Some(None)).is_err());
+        let ribbon = MenuTarget::Ribbon {
+            tab: "Project".into(),
+            group: "Schedule".into(),
+            label: "Set Baseline".into(),
+        };
+        assert_eq!(target_stands(&ribbon, Some(Some(1))), Ok(()));
+        assert_eq!(target_stands(&ribbon, None), Ok(()));
     }
 
     #[test]
