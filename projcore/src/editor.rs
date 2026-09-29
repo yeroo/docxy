@@ -3775,7 +3775,17 @@ mod tests {
             DateTime::from_ymd_hm(2026, 3, 5, 8, 0)
         );
         let back = crate::mspdi::read_mspdi(&crate::mspdi::write_mspdi(ed.project())).unwrap();
-        assert_eq!(back.tasks, ed.project().tasks);
+        // The lag moved Pour and its summary: the save writes each auto
+        // task's dates where the schedule puts them now (#343), everything
+        // else as the model holds it.
+        let mut expected = ed.project().tasks.clone();
+        for t in expected.iter_mut().filter(|t| !t.manual && !t.is_null) {
+            let r = ed.schedule().get(t.uid).unwrap();
+            t.stored_start = t.stored_start.and(Some(r.early_start));
+            t.stored_finish = t.stored_finish.and(Some(r.early_finish));
+        }
+        assert_ne!(expected, ed.project().tasks, "the lag moved a stored date");
+        assert_eq!(back.tasks, expected);
         // A new link to the blank row is still refused.
         let mut added = ed.project().task(2).unwrap().predecessors.clone();
         added.push(links[1].clone());

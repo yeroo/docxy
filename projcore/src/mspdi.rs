@@ -1501,10 +1501,13 @@ fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 /// [`PROJECT_HEADER`] order, then any others in read order. Outline code
 /// definitions, WBS masks and extended attribute definitions follow in schema
 /// order. Other elements outside the model (views, etc.) are not preserved:
-/// this is a model-faithful writer, not a byte-faithful one. Each task's stored
-/// `Start`/`Finish` are written when present (e.g. after scheduling and
-/// stamping them back), so a scheduled project exports with dates Project can
-/// display without recalculating.
+/// this is a model-faithful writer, not a byte-faithful one. An auto-scheduled
+/// task's stored `Start`/`Finish` are written as the dates docxy schedules it
+/// to (its `EarlyStart`/`EarlyFinish`), not the ones it was read with (one it
+/// was read without stays absent), so a scheduled
+/// project exports with dates Project can display without recalculating. Manual
+/// tasks, blank rows, external placeholders and tasks the schedule skips keep
+/// their stored dates, written when present; see `scheduled_dates`.
 ///
 /// The header always says `<ProjectExternallyEdited>0</ProjectExternallyEdited>`,
 /// whatever the source said: the saved `<Duration>`s are docxy's own and
@@ -1515,7 +1518,7 @@ fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 /// values read from a file. That schedule honours each calendar's daily
 /// (`Type 1`) exceptions. Known limit: recurring exceptions (`Type` 2-8, or a
 /// `Period` above 1) are written back but not scheduled, so on a plan with one
-/// these fields can differ from Project's and from the stored `Start`/`Finish`.
+/// these fields, and an auto task's `Start`/`Finish`, can differ from Project's.
 ///
 /// Assignment and resource values are written as the model holds them, never
 /// recomputed here: Project trusts them, and an unedited file keeps its own.
@@ -1564,6 +1567,7 @@ pub fn write_mspdi(proj: &Project) -> String {
         let computed = Computed {
             outline_number: number.as_deref(),
             result: sched.get(t.uid).filter(|_| !t.is_null),
+            dates: scheduled_dates(t, &sched),
         };
         write_task(&mut s, t, &computed);
     }
@@ -1707,6 +1711,27 @@ fn header_text(proj: &Project, name: &str) -> Option<String> {
 struct Computed<'a> {
     outline_number: Option<&'a str>,
     result: Option<&'a TaskResult>,
+    /// The `Start`/`Finish` the schedule places the task at, written in place
+    /// of its stored dates; `None` keeps the stored ones.
+    dates: Option<(DateTime, DateTime)>,
+}
+
+/// Where the schedule puts an auto-scheduled task, which a save writes as its
+/// `Start`/`Finish`: Project trusts those, and the ones the task was read with
+/// are stale once anything it depends on moved (#343). `None` keeps the stored
+/// dates: a blank row's and an external placeholder's are not ours, a manual
+/// task's are what it is pinned to (and a TBD one's absent Start is what keeps
+/// it TBD on reload), a task the schedule skips has none, and an auto summary
+/// with nothing scheduled below it spans its own stored dates, so writing its
+/// project-start fallback would pin it there.
+fn scheduled_dates(t: &Task, sched: &crate::schedule::Schedule) -> Option<(DateTime, DateTime)> {
+    if t.is_null || t.is_external_leaf() || t.manual {
+        return None;
+    }
+    if t.summary && sched.rolled_up(t.uid).is_none() {
+        return None;
+    }
+    sched.get(t.uid).map(|r| (r.early_start, r.early_finish))
 }
 
 fn flag(value: bool) -> &'static str {
@@ -1774,8 +1799,16 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     opt_text(s, "OutlineNumber", computed.outline_number);
     tag(s, 3, "OutlineLevel", &t.outline_level.to_string());
     opt_text(s, "Priority", t.priority);
-    opt_date(s, "Start", t.stored_start);
-    opt_date(s, "Finish", t.stored_finish);
+    // A scheduled date replaces a stored one; an absent one stays absent.
+    let (start, finish) = match computed.dates {
+        Some((start, finish)) => (
+            t.stored_start.and(Some(start)),
+            t.stored_finish.and(Some(finish)),
+        ),
+        None => (t.stored_start, t.stored_finish),
+    };
+    opt_date(s, "Start", start);
+    opt_date(s, "Finish", finish);
     if task || t.duration_min != 0 {
         tag(s, 3, "Duration", &min_to_iso(t.duration_min));
     }
@@ -4547,6 +4580,91 @@ mod tests {
         &xml[xml.find("<Tasks>").unwrap()..xml.find("</Tasks>").unwrap()]
     }
 
+    /// The written `<Task>` element of task `uid`.
+    fn one_task_xml(xml: &str, uid: i32) -> &str {
+        let at = xml.find(&format!("<UID>{uid}</UID>")).unwrap();
+        &xml[at..at + xml[at..].find("</Task>").unwrap()]
+    }
+
+    /// Issue #343: an auto task read with stale Start/Finish saves the dates
+    /// it is scheduled to, the same as its EarlyStart/EarlyFinish.
+    #[test]
+    fn auto_task_saves_its_scheduled_dates_not_the_stale_stored_ones() {
+        let source = include_str!("../../corpus/mspdi/02-link-fs.xml").replacen(
+            "<Start>2026-03-04T08:00:00</Start><Finish>2026-03-05T17:00:00</Finish>",
+            "<Start>2026-03-11T08:00:00</Start><Finish>2026-03-12T17:00:00</Finish>",
+            1,
+        );
+        let proj = read_mspdi(&source).unwrap();
+        assert_eq!(
+            proj.task(2).unwrap().stored_start,
+            Some(DateTime::from_ymd_hm(2026, 3, 11, 8, 0))
+        );
+        let xml = write_mspdi(&proj);
+        let b = one_task_xml(&xml, 2);
+        assert!(b.contains("<Manual>0</Manual>"), "{b}");
+        for tag in [
+            "<Start>2026-03-04T08:00:00</Start>",
+            "<Finish>2026-03-05T17:00:00</Finish>",
+            "<EarlyStart>2026-03-04T08:00:00</EarlyStart>",
+            "<EarlyFinish>2026-03-05T17:00:00</EarlyFinish>",
+        ] {
+            assert!(b.contains(tag), "{tag} in {b}");
+        }
+    }
+
+    /// A manual task saves the dates it stores even where the schedule puts
+    /// it elsewhere: Project does not reschedule it.
+    #[test]
+    fn manual_task_keeps_its_stored_dates() {
+        let mut proj = task_project("<Task><UID>1</UID><Duration>PT8H0M0S</Duration></Task>");
+        let t = &mut proj.tasks[0];
+        t.manual = true;
+        t.manual_start = Some(DateTime::from_ymd_hm(2026, 3, 11, 8, 0));
+        t.stored_start = Some(DateTime::from_ymd_hm(2026, 3, 9, 8, 0));
+        t.stored_finish = Some(DateTime::from_ymd_hm(2026, 3, 9, 17, 0));
+        let early = crate::schedule::schedule(&proj).get(1).unwrap().early_start;
+        assert_eq!(early, DateTime::from_ymd_hm(2026, 3, 11, 8, 0));
+        let xml = write_mspdi(&proj);
+        let t = one_task_xml(&xml, 1);
+        assert!(t.contains("<Start>2026-03-09T08:00:00</Start>"), "{t}");
+        assert!(t.contains("<Finish>2026-03-09T17:00:00</Finish>"), "{t}");
+    }
+
+    /// A manual task with no start (TBD) gains no Start on save, which would
+    /// pin it there on reload.
+    #[test]
+    fn tbd_manual_task_stays_tbd_through_a_save() {
+        let mut proj = task_project("<Task><UID>1</UID><Duration>PT8H0M0S</Duration></Task>");
+        proj.tasks[0].manual = true;
+        assert!(proj.tasks[0].pinned_dates().is_none());
+        assert!(crate::schedule::schedule(&proj).get(1).is_some());
+        let xml = write_mspdi(&proj);
+        assert!(!one_task_xml(&xml, 1).contains("<Start>"), "{xml}");
+        let back = read_mspdi(&xml).unwrap();
+        assert!(back.tasks[0].manual && back.tasks[0].pinned_dates().is_none());
+    }
+
+    /// An auto summary with nothing scheduled below it spans its own stored
+    /// dates, from the project start when it has none. Saving that fallback
+    /// would pin it there; a blank row keeps what it stores.
+    #[test]
+    fn empty_auto_summary_and_blank_row_keep_their_stored_dates() {
+        let mut proj = task_project(
+            "<Task><UID>1</UID><OutlineLevel>1</OutlineLevel><Summary>1</Summary></Task>             <Task><UID>2</UID><OutlineLevel>2</OutlineLevel><IsNull>1</IsNull></Task>",
+        );
+        proj.tasks[1].stored_start = Some(DateTime::from_ymd_hm(2026, 3, 11, 8, 0));
+        let sched = crate::schedule::schedule(&proj);
+        assert!(proj.tasks[0].summary && proj.tasks[1].is_null);
+        assert!(sched.get(1).is_some() && sched.rolled_up(1).is_none());
+        let xml = write_mspdi(&proj);
+        assert!(!one_task_xml(&xml, 1).contains("<Start>"), "{xml}");
+        assert!(
+            one_task_xml(&xml, 2).contains("<Start>2026-03-11T08:00:00</Start>"),
+            "{xml}"
+        );
+    }
+
     #[test]
     fn task_duration_format_is_read_and_written_back() {
         let proj = read_mspdi(DURATION_FORMATS_PLAN).unwrap();
@@ -4840,6 +4958,7 @@ mod tests {
             &Computed {
                 outline_number: Some("2"),
                 result: sched.get(1),
+                dates: None,
             },
         );
         assert_eq!(
@@ -4978,6 +5097,7 @@ mod tests {
             &Computed {
                 outline_number: Some("2"),
                 result: sched.get(1),
+                dates: None,
             },
         );
         let external_flag = external_xml.find("<ExternalTask>1</ExternalTask>").unwrap();
@@ -4999,6 +5119,7 @@ mod tests {
             &Computed {
                 outline_number: None,
                 result: None,
+                dates: None,
             },
         );
         assert_eq!(
