@@ -1140,12 +1140,13 @@ impl Editor {
         Ok(AssignOutcome::Assigned)
     }
 
-    /// Project › Schedule › Set Baseline: record the plan as it is shown now
-    /// (leveled while leveling is on) in the Baseline (slot 0) of every
-    /// scheduled task, with its stored
-    /// work and cost (absent ones stay absent), and of the
-    /// assignments and resources (see `baseline_assignments`), as one undo
-    /// step. Baseline1..10 stay.
+    /// Project › Schedule › Set Baseline: record the plan as it is scheduled
+    /// now (CPM, the dates a save writes) in the Baseline (slot 0) of every
+    /// scheduled task, with its stored work and cost (absent ones stay
+    /// absent), and of the assignments and resources (see
+    /// `baseline_assignments`), as one undo step. Baseline1..10 stay.
+    /// Leveling is a view a save does not write, so a leveled view is not
+    /// what it records.
     pub fn set_baseline(&mut self) {
         self.snapshot();
         let baselines: Vec<_> = self
@@ -1154,18 +1155,18 @@ impl Editor {
             .iter()
             .enumerate()
             .filter_map(|(i, t)| {
-                // The dates the grid shows, leveled when leveling is on, so
-                // a fresh baseline reads no variance.
-                let start = self.disp_start(t.uid)?;
-                let finish = self.disp_finish(t.uid)?;
+                let r = self.sched.get(t.uid)?;
                 Some((
                     i,
                     Baseline {
                         number: 0,
-                        start: Some(start),
-                        finish: Some(finish),
+                        start: Some(r.early_start),
+                        finish: Some(r.early_finish),
                         duration_min: Some(crate::schedule::summary_or_leaf_min(
-                            &self.proj, t, start, finish,
+                            &self.proj,
+                            t,
+                            r.early_start,
+                            r.early_finish,
                         )),
                         work_min: t.work_min,
                         cost: t.cost.clone(),

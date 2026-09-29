@@ -28,12 +28,14 @@
 //! the task unit's working form. Work shows in hours. Values are signed minutes;
 //! money is a decimal number of currency units (MSPDI stores hundredths).
 //!
-//! Variances are computed from the shown schedule, not the variances a file
-//! stores, which go stale on every edit: Start and Finish Variance are the
-//! working minutes, on the task's calendar, from the Baseline date to the
-//! shown one (negative when early; 0 without a Baseline date), and Duration,
-//! Work and Cost Variance are the current value less the Baseline one, an
-//! absent Baseline value counting as 0.
+//! Variances are computed from the live schedule, not the variances a file
+//! stores, which go stale on every edit. They measure the scheduled (CPM,
+//! unleveled) dates, which a save writes and Set Baseline records; while
+//! leveling is on, the grid's Start and Finish can differ from them. Start
+//! and Finish Variance are the working minutes, on the task's calendar, from
+//! the Baseline date to the scheduled one (negative when early; 0 without a
+//! Baseline date), and Duration, Work and Cost Variance are the current value
+//! less the Baseline one, an absent Baseline value counting as 0.
 
 use super::*;
 use crate::model::{AccrueAt, Rate, outline_numbers};
@@ -365,22 +367,31 @@ impl<'a> FieldReader<'a> {
                     BaselinePart::Cost => money(b.and_then(|b| b.cost.as_ref())),
                 }
             }
+            // Variances measure the schedule a save writes (and Set Baseline
+            // records), not the leveled view; a task without a schedule
+            // result falls back to what the grid shows.
             Field::StartVariance => date_variance(
                 proj,
                 task,
-                ed.disp_start(task.uid),
+                result
+                    .map(|r| r.early_start)
+                    .or_else(|| ed.disp_start(task.uid)),
                 baseline.and_then(|b| b.start),
                 working,
             ),
             Field::FinishVariance => date_variance(
                 proj,
                 task,
-                ed.disp_finish(task.uid),
+                result
+                    .map(|r| r.early_finish)
+                    .or_else(|| ed.disp_finish(task.uid)),
                 baseline.and_then(|b| b.finish),
                 working,
             ),
             Field::DurationVariance => {
-                let current = ed.disp_duration_min(task.uid).unwrap_or(task.duration_min);
+                let current = crate::schedule::task_duration_min(proj, ed.schedule(), task)
+                    .or_else(|| ed.disp_duration_min(task.uid))
+                    .unwrap_or(task.duration_min);
                 let min = current - baseline.and_then(|b| b.duration_min).unwrap_or(0);
                 duration(proj, Some(min), own)
             }

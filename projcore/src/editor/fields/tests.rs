@@ -597,27 +597,52 @@ fn wbs_is_the_stored_code_else_the_live_outline_number() {
 }
 
 #[test]
-fn set_baseline_records_the_leveled_dates_so_variances_start_at_zero() {
+fn a_baseline_set_while_leveled_records_the_saved_schedule() {
     let mut ed = editor(vec![task(1, "A", 960), task(2, "B", 480)]);
     ed.assign_resource(1, "Alice").unwrap();
     ed.assign_resource(2, "Alice").unwrap();
     ed.toggle_level();
+    let early = |ed: &Editor, uid| ed.schedule().get(uid).unwrap().early_start;
     let delayed = [1, 2]
         .into_iter()
-        .find(|&uid| ed.disp_start(uid) != ed.schedule().get(uid).map(|r| r.early_start))
+        .find(|&uid| ed.disp_start(uid) != Some(early(&ed, uid)))
         .expect("leveling delays one of the two");
     ed.set_baseline();
+    // Leveling is a view: the baseline is the CPM schedule a save writes,
+    // and the variances measure that schedule too.
     assert_eq!(
         read(&ed, delayed, "Baseline Start").value,
-        FieldValue::Date(ed.disp_start(delayed).unwrap())
+        FieldValue::Date(early(&ed, delayed))
     );
-    for uid in [1, 2] {
-        for name in ["Start Variance", "Finish Variance", "Duration Variance"] {
-            assert_eq!(
-                tv(&ed, uid, name),
-                (s("0 days"), FieldValue::Minutes(0)),
-                "uid {uid} {name}"
-            );
+    assert_ne!(
+        read(&ed, delayed, "Start").value,
+        read(&ed, delayed, "Baseline Start").value
+    );
+    let variances = |ed: &Editor| {
+        for uid in [1, 2] {
+            for name in ["Start Variance", "Finish Variance", "Duration Variance"] {
+                assert_eq!(
+                    tv(ed, uid, name),
+                    (s("0 days"), FieldValue::Minutes(0)),
+                    "uid {uid} {name}"
+                );
+            }
         }
-    }
+    };
+    variances(&ed);
+    // Saved and reopened, the plan keeps that baseline and still reads no
+    // variance, with or without leveling.
+    let baselines = |ed: &Editor| -> Vec<_> {
+        ed.project()
+            .tasks
+            .iter()
+            .map(|t| t.baseline(0).map(|b| (b.start, b.finish, b.duration_min)))
+            .collect()
+    };
+    let xml = crate::mspdi::write_mspdi(ed.project());
+    let mut reopened = Editor::new(crate::mspdi::read_mspdi(&xml).unwrap());
+    assert_eq!(baselines(&reopened), baselines(&ed));
+    variances(&reopened);
+    reopened.toggle_level();
+    variances(&reopened);
 }

@@ -93,9 +93,11 @@ Status and custom fields are not readable yet.
   Complete reads `"0%"` and `null`; a stored 0 reads `"0%"` and `0`). Fields
   with a Project default read the default: Active Yes, Priority 500, Type and
   Effort Driven the plan's new-task defaults, Fixed Cost Accrual Prorated.
-- Variances follow the live schedule, not the values a file stores: Start and
-  Finish Variance are working minutes from the Baseline date to the shown
-  one (0 without a baseline), and Duration, Work and Cost Variance are the
+- Variances follow the live schedule, not the values a file stores. They
+  measure the scheduled (unleveled) dates, which a save writes and Set
+  Baseline records; while leveling is on, the grid's Start and Finish can
+  differ from them. Start and Finish Variance are working minutes from the
+  Baseline date to the scheduled one (0 without a baseline), and Duration, Work and Cost Variance are the
   current value less the Baseline one (an absent Baseline value counts as 0).
   Slack comes from the schedule, and total slack can be negative.
 
