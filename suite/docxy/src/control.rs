@@ -358,6 +358,8 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Result<Json, String>> {
+        // A control client reads and saves the plan: never half-leveled.
+        self.flush_project_passes(cx);
         let outcome = project_verb(&mut self.tabs, self.active, verb, args)?;
         Some(outcome.map(|(result, effect)| {
             if let Some(i) = effect.focus {

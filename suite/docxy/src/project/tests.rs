@@ -781,3 +781,13 @@ fn the_task_mode_column_names_each_tasks_mode_and_is_blank_on_a_blank_row() {
         ""
     );
 }
+
+#[test]
+fn save_runs_a_pending_level_pass_first() {
+    let dir = Scratch::new();
+    let mut tab = edited_tab();
+    request_level_pass(&mut tab, ProjectAct::LevelAll).unwrap();
+    apply_save(&mut tab, &dir.path("leveled.xml")).unwrap();
+    assert!(view(&tab).busy.is_none());
+    assert!(view(&tab).ed.leveled());
+}

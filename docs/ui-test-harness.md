@@ -250,6 +250,7 @@ State keys, as the app reports them after every driving verb:
 | Key | |
 |---|---|
 | `tab`, `title`, `dirty`, `status`, `sheet_tab` | the active tab |
+| `app_state` | a Project tab's status-bar state, `Ready`, `Edit` (a cell editor or prompt is open) or `Busy` (a levelling pass is pending); `null` on other tabs |
 | `tabs`, `ask_on_close` | open tab count and whether window close asks about unsaved changes |
 | `sheet`, `sel`, `anchor`, `range` | the sheet and its selection |
 | `editing`, `edit` | whether a cell edit is open, and its text |
@@ -312,7 +313,7 @@ footer editor; `selection-set` refuses while it is open.
 | `selection-set {"start":5,"end":1}` | set main-story anchor and caret through `Editor`; backward selections keep the larger anchor; both offsets are validated before either changes |
 | `ribbon-read {}` | list File, ribbon tabs and the contextual tabs — Table while the caret is in a table, Gantt Chart Format while a Project's Gantt shows — with groups, commands, galleries and Quick Access Toolbar |
 | `ribbon-click {"tab":"Home","command":"Bold"}` | resolve a command on a valid tab, contextual tabs included, by id, else by unique label, else by unique screentip title, and invoke the same action handler as its button |
-| `status-read {}` | read the tab's status line as an ordered `items` array |
+| `status-read {}` | read the tab's status line as an ordered `items` array of `{id, text}`: on a Project tab `state` (Ready/Edit/Busy), `new-tasks` (`New Tasks: …`) and `message`; on other tabs only `message` (a document's word-count stats are not reported) |
 | `backstage {"action":"open"}` | enter File; `read` reports its open state and rail items; `close` returns to the tab |
 | `theme-set {"theme":"dark"}` | set the window theme as the title bar's theme button does (`light`, `dark` or `auto`); replies with the preference and the mode it resolved to |
 | `title-bar {}` | read the measured title content, active chip, tab strip, theme button and drag space; reports tab count, active/first/visible indices, layout mode, `overflow`, `controls_clear`, `active_visible`, `active_dirty_visible` (the active tab is dirty and its bullet lies inside the chip), `theme_visible`, `drag_w`, `drag_ok`, and logical-pixel right edges. `caption_left` comes from a separate probe of Root's inner box minus the pinned caption-control width (102 px on Windows/Linux, zero on macOS) |
@@ -328,6 +329,13 @@ and they differ for icon-only commands (Indent is `Indent Task`, Link Tasks is
 The Project ribbon holds only Project's commands, and its Report tab has no
 groups yet (`groups: []`). Extend Selection mode, native prompts,
 and backstage pages are not represented by these verbs.
+
+Levelling (Level, Level All, Clear Leveling, Ctrl+Shift+L) is asked for, not
+run, so the Project status bar can draw `Busy`; render schedules the pass for
+the frame after. Every harness verb first runs a pass still pending, so the
+verb that asked for it replies `app_state: "Busy"` and every later verb, and
+every plain `assert <key>`, sees `Ready` and the levelled plan. Assert Busy
+with `assert reply.app_state is Busy` on that verb's own reply.
 
 Close a dirty tab with `call close-tab {"answer":"save"}` (`discard` and
 `cancel` are the other answers; omitting the answer refuses a dirty close).

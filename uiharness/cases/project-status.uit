@@ -1,0 +1,38 @@
+test project status bar reports Ready, Edit and Busy
+  open copy:../../corpus/mspdi/11-resource-assignment.xml
+  call status-read {}
+  assert reply.items.0.id is state
+  assert reply.items.0.text is Ready
+  assert reply.items.1.id is new-tasks
+  assert reply.items.1.text is New Tasks: Auto Scheduled
+  assert reply.items.2.id is message
+  assert reply.items.2.text is loaded — 1 tasks
+  assert app_state is Ready
+  # A cell editor has the keyboard: Edit, until Enter commits it.
+  click H1 double
+  assert cell is Resource Names
+  assert cell_edit is Alice
+  call status-read {}
+  assert reply.items.0.text is Edit
+  assert app_state is Edit
+  key enter
+  call status-read {}
+  assert reply.items.0.text is Ready
+  # A prompt has it too, until Escape cancels it.
+  key ctrl+f
+  assert prompt is not none
+  assert app_state is Edit
+  key escape
+  assert prompt is none
+  assert app_state is Ready
+  # Levelling is asked for, and the reply is built before it runs: Busy.
+  # The next verb runs it first, so it reads Ready and the result.
+  call ribbon-click {"tab":"Resource","command":"Level All"}
+  assert reply.app_state is Busy
+  call status-read {}
+  assert reply.items.0.text is Ready
+  assert reply.items.2.text is Resource leveling ON — bars delayed to fit resource capacity
+  key ctrl+shift+l
+  assert reply.app_state is Busy
+  assert status is Resource leveling OFF
+  assert app_state is Ready

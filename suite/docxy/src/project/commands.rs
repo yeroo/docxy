@@ -795,6 +795,118 @@ fn delete_selected_task(v: &mut ProjectView) -> Result<(), String> {
     Ok(())
 }
 
+/// The leveled state a levelling command asks for, given the state it acts
+/// on: Level toggles it, Level All and Clear Leveling set it.
+fn level_target(act: ProjectAct, leveled: bool) -> bool {
+    match act {
+        ProjectAct::LevelAll => true,
+        ProjectAct::ClearLeveling => false,
+        _ => !leveled,
+    }
+}
+
+/// Run the levelling pass: bring the plan to `want` and name the result for
+/// the status bar. Idempotent, so a pass that runs after other edits still
+/// leaves the plan exactly as asked.
+fn level_to(v: &mut ProjectView, want: bool) -> &'static str {
+    if v.ed.leveled() != want {
+        v.ed.toggle_level();
+    }
+    if v.ed.leveled() {
+        "Resource leveling ON — bars delayed to fit resource capacity"
+    } else {
+        "Resource leveling OFF"
+    }
+}
+
+/// What the status bar's leftmost item says, as in Project.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AppState {
+    Ready,
+    Edit,
+    Busy,
+}
+
+impl AppState {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "Ready",
+            Self::Edit => "Edit",
+            Self::Busy => "Busy",
+        }
+    }
+}
+
+/// `Busy` while a levelling pass is pending, `Edit` while a cell editor or a
+/// prompt has the keyboard, otherwise `Ready`.
+pub(crate) fn project_app_state(v: &ProjectView) -> AppState {
+    if v.busy.is_some() {
+        AppState::Busy
+    } else if v.cell.is_some() || v.prompt.is_some() {
+        AppState::Edit
+    } else {
+        AppState::Ready
+    }
+}
+
+/// A fresh token for a levelling pass, unique for the process, so a frame
+/// callback can tell its own pass from a later one and find it on whichever
+/// tab it is now.
+fn next_pass_token() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Ask for a levelling pass instead of running it, so the frame that says
+/// `Busy` is drawn first; render schedules it and [`finish_level_pass`] or
+/// [`flush_level_pass`] runs it. The target is resolved now, against the
+/// pass already pending if there is one, so Level twice in a row is a round
+/// trip. Returns the pass's token.
+pub(crate) fn request_level_pass(tab: &mut DocTab, act: ProjectAct) -> Option<u64> {
+    if !commit_project_cell(tab) {
+        return None;
+    }
+    let Surface::Project(v) = &mut tab.surface else {
+        return None;
+    };
+    v.cancel_prompt();
+    let leveled = v.busy.map_or(v.ed.leveled(), |(_, want)| want);
+    let token = next_pass_token();
+    v.busy = Some((token, level_target(act, leveled)));
+    v.scheduled = None;
+    Some(token)
+}
+
+/// Run `tab`'s pending levelling pass if its token is `token`. A callback for
+/// a pass that was flushed or replaced finds nothing and does nothing.
+pub(crate) fn finish_level_pass(tab: &mut DocTab, token: u64) -> bool {
+    match &tab.surface {
+        Surface::Project(v) if v.busy.is_some_and(|(t, _)| t == token) => flush_level_pass(tab),
+        _ => false,
+    }
+}
+
+/// Run `tab`'s pending levelling pass now, if it has one. Called wherever
+/// the plan is read out or saved, so nothing sees a pass half-asked-for.
+pub(crate) fn flush_level_pass(tab: &mut DocTab) -> bool {
+    let Surface::Project(v) = &mut tab.surface else {
+        return false;
+    };
+    v.scheduled = None;
+    let Some((_, want)) = v.busy.take() else {
+        return false;
+    };
+    tab.status = level_to(v, want).into();
+    complete_project(tab, false);
+    true
+}
+
+/// [`flush_level_pass`] on every tab; whether any pass ran.
+pub(crate) fn flush_level_passes(tabs: &mut [DocTab]) -> bool {
+    tabs.iter_mut()
+        .fold(false, |ran, tab| flush_level_pass(tab) | ran)
+}
+
 pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
     if !commit_project_cell(tab) {
         return;
@@ -911,22 +1023,7 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                 );
             }
             Level | LevelAll | ClearLeveling => {
-                let want = match act {
-                    LevelAll => true,
-                    ClearLeveling => false,
-                    _ => !v.ed.leveled(),
-                };
-                if v.ed.leveled() != want {
-                    v.ed.toggle_level();
-                }
-                status = Some(
-                    if v.ed.leveled() {
-                        "Resource leveling ON — bars delayed to fit resource capacity"
-                    } else {
-                        "Resource leveling OFF"
-                    }
-                    .into(),
-                );
+                status = Some(level_to(v, level_target(act, v.ed.leveled())).into());
             }
             Recalc => status = Some("Rescheduled (automatic on every edit)".into()),
             Undo => {
@@ -1164,6 +1261,9 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A pass already asked for runs first, so this act, and a second
+        // levelling command above all, sees the plan it left.
+        self.flush_project_passes(cx);
         if !self.commit_active_project_cell() {
             self.refocus(window, cx);
             return;
@@ -1171,6 +1271,12 @@ impl Docxy {
         self.project_prompt_cancel();
         match act {
             ProjectAct::Save => return self.save_project(false, window, cx),
+            // Deferred so the status bar can say Busy: render schedules it.
+            ProjectAct::Level | ProjectAct::LevelAll | ProjectAct::ClearLeveling => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    request_level_pass(tab, act);
+                }
+            }
             ProjectAct::Copy | ProjectAct::Cut | ProjectAct::Paste => {
                 self.project_clipboard(act, cx)
             }
@@ -1196,6 +1302,39 @@ impl Docxy {
             }
         }
         self.refocus(window, cx);
+    }
+    /// Run every tab's pending levelling pass now, for a reader or writer of
+    /// the plan that must not see it half-asked-for.
+    pub(crate) fn flush_project_passes(&mut self, cx: &mut Context<Self>) {
+        if flush_level_passes(&mut self.tabs) {
+            cx.notify();
+        }
+    }
+    /// Called from render: give each pending levelling pass a callback for
+    /// the next frame. The frame being built draws `Busy`; gpui runs the
+    /// callback before drawing the next one, which then draws the result.
+    /// Scheduling from the command itself would run the pass before the
+    /// `Busy` frame was ever drawn.
+    pub(crate) fn schedule_project_passes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for tab in &mut self.tabs {
+            let Surface::Project(v) = &mut tab.surface else {
+                continue;
+            };
+            let Some((token, _)) = v.busy else {
+                continue;
+            };
+            if v.scheduled == Some(token) {
+                continue;
+            }
+            v.scheduled = Some(token);
+            cx.on_next_frame(window, move |this, _, cx| {
+                // Found by token, not index: a tab may close or move first.
+                if this.tabs.iter_mut().any(|t| finish_level_pass(t, token)) {
+                    cx.notify();
+                }
+            });
+            window.request_animation_frame();
+        }
     }
     /// Copy/Cut write the cursor cell to the system clipboard; Paste reads it.
     fn project_clipboard(&mut self, act: ProjectAct, cx: &mut Context<Self>) {
