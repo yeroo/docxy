@@ -6515,7 +6515,7 @@ mod tests {
 
     /// #601: Save As `.xlsx` from a macro workbook asks first; Yes writes a
     /// real `.xlsx` and the open workbook drops its macros too, so a later
-    /// Save neither asks again nor writes them back.
+    /// Save As neither asks again nor writes them back.
     #[test]
     fn save_as_xlsx_from_a_macro_workbook_asks_and_yes_drops_the_macros() {
         let dir = macro_dir("macros-yes");
