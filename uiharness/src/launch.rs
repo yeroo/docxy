@@ -13,6 +13,7 @@
 //! damage. This side sets the variable and then trusts the refusal — a check
 //! here as well would be a second opinion that can drift from the first.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
@@ -189,20 +190,7 @@ pub fn launch(exe: &Path, sandbox: &Path) -> Result<Launched, String> {
     // rather than `canonicalize`, which returns a `\\?\` verbatim path.
     let sandbox =
         std::path::absolute(sandbox).map_err(|e| format!("{}: {e}", sandbox.display()))?;
-    let child = Command::new(exe)
-        .arg(HARNESS_FLAG)
-        .env(CONFIG_DIR_ENV, &sandbox)
-        // The sandbox is also the child's working directory, as a defensive
-        // default: no save path falls back to `current_dir()` any more (a
-        // never-saved document or workbook refuses in a harness), but anything
-        // that ever writes relative to the cwd lands here rather than in the
-        // repository the harness was run from.
-        .current_dir(&sandbox)
-        // Inherited, so a refusal from the isolation gate is visible rather
-        // than swallowed — it is written to stderr and is the one message a
-        // caller most needs to see.
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+    let child = command(exe, &sandbox, std::env::vars_os())
         .spawn()
         .map_err(|e| format!("{}: {e}", exe.display()))?;
     Ok(Launched {
@@ -211,6 +199,51 @@ pub fn launch(exe: &Path, sandbox: &Path) -> Result<Launched, String> {
         exe: exe.to_path_buf(),
         detached: false,
     })
+}
+
+/// Whether `name` is one of the variables agwinterm sets in its panes
+/// (`AGWINTERM_SESSION_ID`, `AGWINTERM_PIPE`, …, and bare `AGWINTERM`). A
+/// prefix rather than a list: agwinterm keeps adding them. ASCII
+/// case-insensitive, as Windows environment names are.
+pub fn is_terminal_integration_var(name: &std::ffi::OsStr) -> bool {
+    const PREFIX: &[u8] = b"AGWINTERM";
+    let name = name.as_encoded_bytes();
+    name.len() >= PREFIX.len() && name[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
+}
+
+/// The command [`launch`] spawns, given the environment it would inherit
+/// (`parent`) — passed in so the stripping is a unit test that does not depend
+/// on the terminal the tests ran from.
+///
+/// The agwinterm variables are removed (#697): a harness instance started from
+/// an agwinterm pane is not *in* that pane, and must not name itself after it
+/// or talk to its control pipe. Only those — not `env_clear`, which would take
+/// `SystemRoot`, `PATH` and `TEMP` with them.
+pub fn command(
+    exe: &Path,
+    sandbox: &Path,
+    parent: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Command {
+    let mut cmd = Command::new(exe);
+    for (name, _) in parent {
+        if is_terminal_integration_var(&name) {
+            cmd.env_remove(name);
+        }
+    }
+    cmd.arg(HARNESS_FLAG)
+        .env(CONFIG_DIR_ENV, sandbox)
+        // The sandbox is also the child's working directory, as a defensive
+        // default: no save path falls back to `current_dir()` any more (a
+        // never-saved document or workbook refuses in a harness), but anything
+        // that ever writes relative to the cwd lands here rather than in the
+        // repository the harness was run from.
+        .current_dir(sandbox)
+        // Inherited, so a refusal from the isolation gate is visible rather
+        // than swallowed — it is written to stderr and is the one message a
+        // caller most needs to see.
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    cmd
 }
 
 #[cfg(test)]
@@ -252,6 +285,45 @@ mod tests {
             ),
             "{c:?}"
         );
+    }
+
+    /// #697: every agwinterm variable the child would inherit is removed, in
+    /// any case, and nothing else is.
+    #[test]
+    fn the_agwinterm_variables_are_removed_from_the_child_and_nothing_else() {
+        let parent = [
+            "AGWINTERM_PIPE",
+            "agwinterm_session_id",
+            "AGWINTERM",
+            "AGWINTERMX",
+            "PATH",
+            "XAGWINTERM_Y",
+            "AGWINTER",
+        ]
+        .map(|k| (OsString::from(k), OsString::from("v")));
+        let cmd = command(Path::new("suite.exe"), Path::new("sandbox"), parent);
+        let mut removed: Vec<String> = cmd
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().to_ascii_uppercase())
+            .collect();
+        removed.sort();
+        assert_eq!(
+            removed,
+            [
+                "AGWINTERM",
+                "AGWINTERMX",
+                "AGWINTERM_PIPE",
+                "AGWINTERM_SESSION_ID"
+            ]
+        );
+        let set: Vec<_> = cmd
+            .get_envs()
+            .filter(|(_, v)| v.is_some())
+            .map(|(k, _)| k.to_os_string())
+            .collect();
+        assert_eq!(set, [OsString::from(CONFIG_DIR_ENV)]);
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), [HARNESS_FLAG]);
     }
 
     #[test]
