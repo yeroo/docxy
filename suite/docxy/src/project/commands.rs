@@ -536,6 +536,14 @@ impl ProjectView {
     }
 }
 
+/// Whether an Alt chord is one of Project's own keys (Alt+Left/Right,
+/// Alt+Home, Alt+Shift+arrows and ±). Those reach the Project surface even
+/// while KeyTips are up: pressing Alt starts KeyTips, and none of these keys
+/// is a KeyTip letter, so the overlay would otherwise swallow them.
+pub(crate) fn project_alt_key(key: &str, m: Modifiers) -> bool {
+    m.alt && !m.control && !m.platform && key_act(key, m).is_some()
+}
+
 pub(crate) fn key_act(key: &str, m: Modifiers) -> Option<ProjectAct> {
     use ProjectAct::*;
     if m.platform {

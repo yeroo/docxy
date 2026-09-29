@@ -13558,7 +13558,7 @@ impl Docxy {
         let ctrl = m.control || m.platform;
         let shift = m.shift;
         let key = ev.keystroke.key.clone();
-        if self.active_is_project() && m.alt && !ctrl && matches!(key.as_str(), "left" | "right") {
+        if self.active_is_project() && project_alt_key(&key, *m) {
             self.keytips = KeyTip::Off;
             return self.project_key(ev, window, cx);
         }

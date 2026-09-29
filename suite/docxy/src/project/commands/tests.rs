@@ -1052,6 +1052,42 @@ fn alt_home_goes_to_start() {
     assert!(v(&t).gantt_x.get() > 0., "plain Home leaves the timescale");
 }
 
+/// Project's Alt keys get past the KeyTips overlay (pressing Alt starts it),
+/// so Alt+Home works after F10 as Alt+Left/Right do; KeyTip letters and
+/// digits never do.
+#[test]
+fn project_alt_keys_bypass_keytips_but_letters_do_not() {
+    let alt = Modifiers {
+        alt: true,
+        ..Modifiers::default()
+    };
+    let alt_shift = Modifiers { shift: true, ..alt };
+    for (key, m) in [
+        ("left", alt),
+        ("right", alt),
+        ("home", alt),
+        ("right", alt_shift),
+        ("left", alt_shift),
+        ("-", alt_shift),
+        ("=", alt_shift),
+    ] {
+        assert!(project_alt_key(key, m), "{key} {m:?}");
+    }
+    let ctrl_alt = Modifiers {
+        control: true,
+        ..alt
+    };
+    assert!(!project_alt_key("home", ctrl_alt));
+    assert!(!project_alt_key("home", Modifiers::default()));
+    assert!(!project_alt_key("alt", alt));
+    for c in ('a'..='z').chain('0'..='9') {
+        let key = c.to_string();
+        for m in [alt, alt_shift] {
+            assert!(!project_alt_key(&key, m), "KeyTip {key} {m:?}");
+        }
+    }
+}
+
 #[test]
 fn export_decisions_and_io_preserve_the_project_binding_and_history() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/project-export-test");
