@@ -1813,10 +1813,17 @@ fn resource_calendar_differs(proj: &Project, a: &Assignment) -> bool {
     if resource.kind != ResourceType::Work || task.ignore_resource_calendar == Some(true) {
         return false;
     }
+    // No resource calendar (none, or a UID such as -1 that names none) has
+    // nothing to differ by: nothing else in docxy resolves one either.
     let Some(mut uid) = resource.calendar_uid else {
         return false;
     };
-    let task_uid = task.calendar_uid.unwrap_or(proj.default_calendar_uid);
+    // The task's calendar as the scheduler resolves it: a UID naming no
+    // calendar (Project writes -1 for "none") is the project's.
+    let task_uid = task
+        .calendar_uid
+        .filter(|&uid| proj.calendar(uid).is_some())
+        .unwrap_or(proj.default_calendar_uid);
     // Follow calendars that state nothing of their own to the one they take
     // their time from.
     for _ in 0..proj.calendars.len() {
@@ -4813,11 +4820,23 @@ mod tests {
                 ALICE_OFF_MONDAYS,
                 false,
             ),
+            // Project writes -1 for a task with no calendar of its own: like a
+            // UID naming no calendar, it is the project's, which Alice's
+            // derives from unchanged.
+            ("<CalendarUID>-1</CalendarUID>", "", "", false),
+            ("<CalendarUID>99</CalendarUID>", "", "", false),
+            ("<CalendarUID>-1</CalendarUID>", "", ALICE_OFF_MONDAYS, true),
         ];
         let standard = include_str!("../../corpus/mspdi/02-link-fs.xml");
         let standard = &standard[standard.find("<Calendar>").unwrap()
             ..standard.find("</Calendar>").unwrap() + "</Calendar>".len()];
-        for (task_extra, assignment_extra, alice_calendar, kept) in cases {
+        // A resource CalendarUID naming no calendar (-1, or a missing UID)
+        // gives it none to differ by, whatever Alice's calendar states.
+        let cases = cases
+            .into_iter()
+            .map(|case| (case, "2"))
+            .chain(["-1", "99"].map(|alice_uid| (("", "", ALICE_OFF_MONDAYS, false), alice_uid)));
+        for ((task_extra, assignment_extra, alice_calendar, kept), alice_uid) in cases {
             let xml = format!(
                 "<Project><StartDate>2026-03-02T08:00:00</StartDate><CalendarUID>1</CalendarUID>
                 <Tasks>
@@ -4831,7 +4850,7 @@ mod tests {
                   </PredecessorLink></Task>
                 </Tasks>
                 <Resources><Resource><UID>1</UID><Name>Alice</Name><Type>1</Type>
-                  <CalendarUID>2</CalendarUID></Resource></Resources>
+                  <CalendarUID>{alice_uid}</CalendarUID></Resource></Resources>
                 <Assignments>
                 <Assignment><UID>1</UID><TaskUID>2</TaskUID>
                   <ResourceUID>1</ResourceUID>{assignment_extra}</Assignment>
@@ -4848,7 +4867,7 @@ mod tests {
             assert_eq!(
                 (early(1), early(2)),
                 ("2026-03-02T08:00:00".into(), "2026-03-03T08:00:00".into()),
-                "{task_extra} {assignment_extra} {alice_calendar}"
+                "{task_extra} {assignment_extra} {alice_calendar} {alice_uid}"
             );
             let saved = write_mspdi(&proj);
             let start = |uid| {
@@ -4864,7 +4883,7 @@ mod tests {
             assert_eq!(
                 (start(1).as_str(), start(2).as_str()),
                 expected,
-                "{task_extra} {assignment_extra} {alice_calendar}"
+                "{task_extra} {assignment_extra} {alice_calendar} {alice_uid}"
             );
         }
     }
