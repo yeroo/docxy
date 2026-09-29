@@ -437,16 +437,6 @@ impl<'a> FieldReader<'a> {
     }
 }
 
-/// Read one field of task `uid` by name.
-pub fn read_field(ed: &Editor, uid: i32, name: &str) -> Result<FieldRead, String> {
-    let field = Field::parse(name)?;
-    let task = ed
-        .project()
-        .task(uid)
-        .ok_or(format!("no task with uid {uid}"))?;
-    Ok(FieldReader::new(ed).read(task, field))
-}
-
 /// A task's mode as Project's Task Mode column shows it.
 pub fn task_mode_name(manual: bool) -> &'static str {
     if manual {
@@ -603,13 +593,13 @@ fn date_variance(
 
 /// The unit a duration shows in: a working unit, or an elapsed one (`edays`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct DurationUnit {
-    pub unit: LagUnit,
-    pub elapsed: bool,
+struct DurationUnit {
+    unit: LagUnit,
+    elapsed: bool,
 }
 
 impl DurationUnit {
-    pub const DAYS: DurationUnit = DurationUnit {
+    const DAYS: DurationUnit = DurationUnit {
         unit: LagUnit::Day,
         elapsed: false,
     };
@@ -620,7 +610,7 @@ impl DurationUnit {
 
     /// The unit of an MSPDI duration format code; `None` for a percent, null
     /// or unknown code.
-    pub fn of_code(code: u8) -> Option<DurationUnit> {
+    fn of_code(code: u8) -> Option<DurationUnit> {
         let format = LagFormat::from_code(i64::from(code))?;
         match format.kind() {
             LagKind::Working => Some(DurationUnit {
@@ -636,14 +626,14 @@ impl DurationUnit {
     }
 
     /// The unit a task's Duration was entered in, days by default.
-    pub fn of_task(task: &Task) -> DurationUnit {
+    fn of_task(task: &Task) -> DurationUnit {
         task.duration_format
             .and_then(DurationUnit::of_code)
             .unwrap_or(DurationUnit::DAYS)
     }
 
     /// The same unit counting working time.
-    pub fn working(self) -> DurationUnit {
+    fn working(self) -> DurationUnit {
         DurationUnit {
             elapsed: false,
             ..self
@@ -698,12 +688,7 @@ fn two_decimals(value: f64) -> (String, bool) {
 
 /// A duration as Project shows it: `0 days`, `1 day`, `-1 day`, `1.25 days`,
 /// `12 days?`, `4 hrs`, `2 wks`, `2 edays`.
-pub fn format_duration_field(
-    proj: &Project,
-    min: i64,
-    unit: DurationUnit,
-    estimated: bool,
-) -> String {
+fn format_duration_field(proj: &Project, min: i64, unit: DurationUnit, estimated: bool) -> String {
     let (number, one) = two_decimals(min as f64 / unit.minutes(proj));
     let (singular, plural) = unit.words();
     let word = if one { singular } else { plural };
@@ -712,14 +697,14 @@ pub fn format_duration_field(
 }
 
 /// Work in hours, as Project shows it: `0 hrs`, `1 hr`, `1.5 hrs`.
-pub fn format_work(min: i64) -> String {
+fn format_work(min: i64) -> String {
     let (number, one) = two_decimals(min as f64 / 60.0);
     format!("{number} {}", if one { "hr" } else { "hrs" })
 }
 
 /// Money as Project shows it in US currency: `$1,400.00`, `($40,000.00)`,
 /// `$0.00`.
-pub fn format_money(units: f64) -> String {
+fn format_money(units: f64) -> String {
     let cents = (units * 100.0).round() as i128;
     let abs = cents.unsigned_abs();
     let whole = (abs / 100).to_string();

@@ -25,9 +25,8 @@ pub use cells::{
     parse_lag, parse_task_predecessors, split_resource_names,
 };
 pub use fields::{
-    BaselinePart, DurationUnit, ENTRY_FIELDS, Field, FieldRead, FieldReader, FieldValue,
-    field_names, format_date_field, format_duration_field, format_money, format_work, read_field,
-    task_mode_name,
+    BaselinePart, ENTRY_FIELDS, Field, FieldRead, FieldReader, FieldValue, field_names,
+    format_date_field, task_mode_name,
 };
 // Re-entering a task's cell goes through `parse_task_predecessors`, which
 // keeps links shown in a fallback unit; the plain parser stays internal.

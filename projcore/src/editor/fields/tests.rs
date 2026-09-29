@@ -26,6 +26,16 @@ fn editor(tasks: Vec<Task>) -> Editor {
     Editor::new(p)
 }
 
+/// Read one field of task `uid` by name.
+fn read_field(ed: &Editor, uid: i32, name: &str) -> Result<FieldRead, String> {
+    let field = Field::parse(name)?;
+    let task = ed
+        .project()
+        .task(uid)
+        .ok_or(format!("no task with uid {uid}"))?;
+    Ok(FieldReader::new(ed).read(task, field))
+}
+
 fn read(ed: &Editor, uid: i32, name: &str) -> FieldRead {
     read_field(ed, uid, name).unwrap()
 }
