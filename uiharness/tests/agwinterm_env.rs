@@ -11,12 +11,13 @@
 #![cfg(windows)]
 
 use ctlcore::json::Json;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use uiharness::{Driver, Run, launch};
+use uiharness::launch::{self, Launched};
+use uiharness::{Driver, Run};
 
 /// What an agwinterm pane puts in the environment, pointed nowhere.
 const FAKES: [(&str, &str); 5] = [
@@ -80,10 +81,11 @@ fn children(pid: u32) -> Vec<String> {
     out
 }
 
-/// Watch `pid`'s children until dropped, remembering any `agwintermctl`.
+/// Watch `pid`'s children until finished or dropped, remembering any
+/// `agwintermctl`. Dropped by a failing assertion, it still stops.
 struct ChildWatch {
     stop: Arc<AtomicBool>,
-    seen: std::thread::JoinHandle<Vec<String>>,
+    seen: Option<std::thread::JoinHandle<Vec<String>>>,
 }
 
 impl ChildWatch {
@@ -104,26 +106,31 @@ impl ChildWatch {
             }
             seen
         });
-        ChildWatch { stop, seen }
+        ChildWatch {
+            stop,
+            seen: Some(seen),
+        }
     }
 
-    fn finish(self) -> Vec<String> {
+    fn finish(mut self) -> Vec<String> {
         self.stop.store(true, Ordering::Relaxed);
-        self.seen.join().unwrap()
+        self.seen.take().unwrap().join().unwrap()
+    }
+}
+
+impl Drop for ChildWatch {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
 }
 
 /// Connect, check the name, edit a plan while watching for `agwintermctl`, and
-/// quit.
-fn exercise(mut child: Child, sandbox: &Path, how: &str) {
-    let pid = child.id();
-    let driver = match Driver::connect(&uiharness::driver::control_dir(sandbox), None) {
-        Ok(d) => d,
-        Err(e) => {
-            let _ = child.kill();
-            panic!("{how}: the suite never became ready: {e}");
-        }
-    };
+/// quit. `app` kills the suite on drop, so a failed assertion does not leave
+/// it running.
+fn exercise(app: Launched, how: &str) {
+    let pid = app.pid();
+    let driver = Driver::connect(&app.ctl_dir(), None)
+        .unwrap_or_else(|e| panic!("{how}: the suite never became ready: {e}"));
     let ping = call(&driver, "ping", vec![]);
     assert_eq!(
         ping.get_str("instance"),
@@ -149,28 +156,20 @@ fn exercise(mut child: Child, sandbox: &Path, how: &str) {
         seen.is_empty(),
         "{how}: the harness instance spawned {seen:?}"
     );
-    let _ = driver.call("quit", Json::obj(vec![]));
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let _ = child.kill();
-    let _ = child.wait();
+    app.shutdown(Some(&driver));
 }
 
-/// Through the launcher: this process's environment plus the fakes, as the
-/// launcher would see it in a pane — every agwinterm variable removed.
+/// Through the launcher, from this process's environment plus the fakes — as
+/// in a pane. The child's environment is built from exactly that, so a fake
+/// the launcher failed to strip would reach the suite and fail the name check.
 #[test]
 #[ignore = "requires a built suite and an interactive desktop"]
 fn a_launched_instance_ignores_the_pane_it_was_started_from() {
     let exe = launch::find_suite(None).unwrap();
     let sandbox = sandbox("launched");
     let parent = std::env::vars_os().chain(FAKES.map(|(k, v)| (k.into(), v.into())));
-    let child = launch::command(&exe, &sandbox, parent).spawn().unwrap();
-    exercise(child, &sandbox, "launched");
+    let app = launch::launch_with_env(&exe, &sandbox, parent).unwrap();
+    exercise(app, "launched");
 }
 
 /// Not through the launcher (the spec repos' `desk_launch.ps1` inherits the
@@ -189,5 +188,5 @@ fn an_instance_that_inherits_the_pane_variables_ignores_them() {
         .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
-    exercise(child, &sandbox, "inherited");
+    exercise(Launched::adopt(child, &exe, &sandbox), "inherited");
 }
