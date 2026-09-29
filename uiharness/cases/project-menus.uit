@@ -130,3 +130,28 @@ test the document menu opens on a document through the right-click's opener
   key escape
   assert menu is nothing
   assert text is hello
+
+test a press outside a menu, another tab or a command closes it first
+  open copy:../fixtures/gantt-summary.xml
+  call menu-open {"target":{"row":3}}
+  assert selected_name is Task 3
+  # The click goes on after closing the menu, as the backdrop lets it.
+  click C2
+  call menu-read {}
+  assert reply.open is false
+  assert menu is nothing
+  assert selected_name is Task 2
+  call-error menu-click {"label":"Delete Task"} => no menu is open
+  assert tasks is 3
+  call menu-open {"target":{"row":3}}
+  call ribbon-click {"tab":"Project","command":"Calculate Project"}
+  assert menu is nothing
+  # A second tab: the menu belongs to the tab it opened on.
+  open copy:../fixtures/basic.docx
+  call menu-open {"target":"document"}
+  assert menu.target is document
+  call title-tab {"action":"prev"}
+  assert title is gantt-summary.xml
+  assert menu is nothing
+  call-error menu-click {"label":"Bold"} => no menu is open
+  call-error menu-close {} => no menu is open

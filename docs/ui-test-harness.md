@@ -255,6 +255,7 @@ State keys, as the app reports them after every driving verb:
 | `app_state` | a Project tab's status-bar state, `Ready`, `Edit` (a cell editor, prompt or dialog is open) or `Busy` (a levelling pass is pending); `null` on other tabs |
 | `dialog` | the active tab's top dialog's id, or `none`, on every surface; `dialog-click`'s reply carries the `dialog-read` object under this key instead |
 | `tabs`, `ask_on_close` | open tab count and whether window close asks about unsaved changes |
+| `menu` | the open menu's `{target}`, or null; `menu-read` has its items |
 | `sheet`, `sel`, `anchor`, `range` | the sheet and its selection |
 | `editing`, `edit` | whether a cell edit is open, and its text |
 | `chart_sel`, `panel_chart`, `charts` | chart selection and the panel |
@@ -586,7 +587,19 @@ collapsed summary (there is no row to right-click), a ribbon command that has
 no menu, `"document"` on a Project, and the targets without a menu yet
 (`cell`, `bar`, `column`, the ribbon's own right-click); `menu-click` with no
 menu open, on a disabled item, an unknown or ambiguous label, a heading, or an
-item that opens a submenu; `menu-close` with no menu open.
+item that opens a submenu; `menu-click` and `menu-close` under a dialog;
+`menu-close` with no menu open. `menu-click` also refuses when the menu no
+longer fits its target: a row menu whose task is no longer the selected one,
+or the document menu on a Project.
+
+A menu belongs to the moment it opened in. What moves on from it closes it:
+another tab, the backstage, a command run from anywhere, a control-pipe verb
+that edits, reloads, saves or focuses the plan, and every harness verb that
+stands for a press outside the menu (`click-cell`, `drag`, `select-chart`,
+`focus-field`, `ribbon-click`, `title-tab`, `close-tab`, `selection-set`,
+`open`, `backstage`, `backstage-close`, `theme-set`, `ask-on-close` and the
+`dialog-*` drivers), which closes it first and then goes on, as the press
+would. Reads leave it open.
 
 While a menu is open it takes every key: Esc closes it, and so, until menus
 take arrows and Enter, does any other key, Tab included. None reaches the
