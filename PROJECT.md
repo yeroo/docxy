@@ -317,7 +317,13 @@ and last task, keeping the column, and Ctrl+Home/End to the first task's first
 field and the last task's last field. Insert inserts a blank row above the
 current row, keeping the column. Delete clears the active Name, Predecessors, or
 Resource Names cell; on the ID column, it deletes the task (a summary asks
-first: Enter deletes it with its subtasks, Esc cancels). Task › Editing › Delete
+first: Enter deletes it with its subtasks, Esc cancels). Ctrl+Delete clears the
+cell or resets it to its default, as one undo step: Name, Predecessors and
+Resource Names are cleared as Delete does, Duration becomes 1 day (estimated
+unless the plan's `NewTasksEstimated` is off; an auto summary's is refused), and
+Task Mode becomes the plan's mode for new tasks. On ID, Start and Finish it
+reports `<column> can't be cleared` and never deletes the task, and it leaves a
+blank row and the entry row alone. Task › Editing › Delete
 Task deletes the selected task from any column. A task added with Task › Insert
 › Task (keytip Alt, T, N; here, in yppxy and through projctl's `task.add`) is 1
 day, estimated unless the plan's `NewTasksEstimated` is off, and with the plan's
