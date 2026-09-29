@@ -393,7 +393,7 @@ impl Docxy {
             return Some((|| {
                 check_new_project_args(args)?;
                 self.refuse_under_dialog()?;
-                // The Backstage › New › Project card's and F11's handler.
+                // The Backstage › New › Project card's handler.
                 self.add_tab(Kind::Project, window, cx);
                 Ok(new_project_reply(&self.tabs, self.active))
             })());

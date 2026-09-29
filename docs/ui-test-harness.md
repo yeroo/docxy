@@ -214,7 +214,8 @@ or dragging a selection. `window-size` and `window-zoom` are setup exceptions
 that call GPUI window APIs. `title-tab` calls the same handler methods as the
 title-bar arrows and dropdown items, and `tab-select` calls `select_tab`, the
 tab chip's click handler. `proj.new` calls `add_tab(Kind::Project)`, the
-handler behind Backstage › New › Project and F11.
+Backstage › New › Project card's handler; F11 also commits the active plan's
+pending cell edit first, and `proj.new` does not.
 
 ⚠️ **"The same entry point" means the handler, not the hitbox.** A verb calls
 the method a handler calls; it does not synthesize a pointer at a coordinate and
@@ -350,7 +351,8 @@ Close a dirty tab with `call close-tab {"answer":"save"}` (`discard` and
 `cancel` are the other answers; omitting the answer refuses a dirty close).
 An optional `index` targets an inactive tab; it defaults to the active tab.
 `call backstage-close {}` calls the Backstage Close handler without supplying
-an answer.
+an answer. `call ask-on-close {"on":true}` uses the same setting handler as
+Settings; closing a dirty single tab always asks regardless of this window setting.
 
 `project-tabs.uit` drives several plans at once: a blank one from `proj.new`
 that takes tasks without a fixture, two opened plans switched between by title
@@ -359,8 +361,7 @@ with a dotted path, e.g. `assert reply.tabs.2.dirty is true`. What a relaunch
 restores is checked by the ignored desktop test
 `uiharness/tests/tab_restart.rs`: it quits with two plans and a blank one, one
 dirty and another active, relaunches the same sandbox and requires the same
-`tab-list` reply back. A relaunch is not a script step. `call ask-on-close {"on":true}` uses the same setting handler as
-Settings; closing a dirty single tab always asks regardless of this window setting.
+`tab-list` reply back. A relaunch is not a script step.
 
 Project `bar_<id>` values are `<kind> <start>-<end>` in inclusive day offsets
 from the Gantt chart's scale origin, or `none` when the task has no schedule result.
