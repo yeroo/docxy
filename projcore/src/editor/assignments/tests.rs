@@ -352,12 +352,34 @@ fn rejected_edits_leave_the_editor_untouched() {
         ed.add_assignment(1, ResourceRef::Uid(2), None, Some(MAX_MINUTES + 1))
             .map(drop)
     });
-    // A material takes no work, refused before the add is staged.
-    assert_eq!(
-        ed.add_assignment(2, ResourceRef::Name("steel"), None, Some(60))
-            .unwrap_err(),
-        "'Steel' is a material resource; set its units"
-    );
+    // A material takes no work, refused before the add is staged: inside a
+    // caller's batch, which would keep an add staged first, nothing is added.
+    ed.batch(|ed| {
+        let err = ed
+            .add_assignment(2, ResourceRef::Name("steel"), None, Some(60))
+            .unwrap_err();
+        assert_eq!(err, "'Steel' is a material resource; set its units");
+        assert!(ed.proj.assignments.iter().all(|a| a.task_uid != 2));
+        Ok(())
+    })
+    .unwrap();
+    assert!(ed.proj.assignments.iter().all(|a| a.task_uid != 2));
+    // Units whose work would pass the scheduling horizon.
+    let huge = 1e300;
+    let add = |task, rid| {
+        move |ed: &mut Editor| {
+            ed.add_assignment(task, ResourceRef::Uid(rid), Some(huge), None)
+                .map(drop)
+        }
+    };
+    for edit in [add(2, 2), add(2, 3)] {
+        assert_untouched(&mut ed, edit);
+    }
+    for uid in [1, 3] {
+        let err = ed.set_assignment(uid, units(huge)).unwrap_err();
+        assert_eq!(err, "units are beyond the scheduling range");
+        assert_untouched(&mut ed, |ed| ed.set_assignment(uid, units(huge)));
+    }
     assert_untouched(&mut ed, |ed| ed.delete_assignment(99).map(drop));
     assert_eq!(
         ed.set_assignment(1, AssignmentPatch::default())

@@ -161,7 +161,8 @@ fn redistribute(
 ///   longest duration its assignments need, as for units. A Fixed Duration
 ///   task keeps its duration and the units follow, work over the span from
 ///   the delay to the task finish, as [`fixed_work_units`] does; without a
-///   span left they stay (the agent edit refuses that case before staging).
+///   span left they stay (the agent edit refuses that case before staging
+///   the work).
 /// - Delay, on an assignment with work: its work and units stay. A Fixed
 ///   Units or Fixed Work task takes the longest `work / units + delay` its
 ///   assignments need, so removing a delay can shorten it; a Fixed Duration

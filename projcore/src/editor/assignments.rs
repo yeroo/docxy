@@ -3,8 +3,11 @@
 //! assignments and commits them through [`Editor::commit_assignments`], so
 //! the task type and effort-driven rules, the horizon check, the undo step
 //! and the refresh of cost, dates and totals are the ones the Resource Names
-//! cell uses. Every argument is checked before anything is staged, so a
-//! rejected edit leaves the editor untouched.
+//! cell uses. Arguments are checked before anything is staged. The checks
+//! that need an earlier stage's result (the Fixed Duration span for new
+//! work, the work new units give) run inside the edit's batch, which
+//! restores the editor on a rejection. Either way a rejected edit leaves
+//! the editor untouched.
 use super::effort::task_type;
 use super::*;
 use crate::assign::contoured;
@@ -60,6 +63,22 @@ fn checked_minutes(what: &str, min: i64) -> Result<i64, String> {
         Err(format!("{what} is beyond the scheduling range"))
     } else {
         Ok(min)
+    }
+}
+
+/// Refuse units whose work would pass the scheduling horizon: a work
+/// resource works them over `span` minutes, a material's work is its
+/// quantity in hours, and a cost resource has none.
+fn check_units_work(kind: Option<ResourceType>, span: i64, units: f64) -> Result<(), String> {
+    let work = match kind {
+        Some(ResourceType::Material) => units * 60.0,
+        Some(ResourceType::Cost) => 0.0,
+        Some(ResourceType::Work) | None => span.max(0) as f64 * units,
+    };
+    if work.round() > MAX_MINUTES as f64 {
+        Err("units are beyond the scheduling range".into())
+    } else {
+        Ok(())
     }
 }
 
@@ -168,6 +187,7 @@ impl Editor {
         let kind = Some(r.kind);
         // A blank row is assigned as the task the edit makes it.
         let duration = self.row_as_edited(i).duration_min;
+        check_units_work(kind, duration, units)?;
         let mut next_aid = self
             .proj
             .assignments
@@ -248,6 +268,10 @@ impl Editor {
                 stage(ed, &|a, _| a.delay = Some(d * 10))?;
             }
             if let Some(u) = units {
+                // The work the units give, over the span the delay stage left.
+                let duration = ed.row_as_edited(i).duration_min;
+                let a = ed.proj.assignments.iter().find(|a| a.uid == uid);
+                check_units_work(kind, duration - a.expect("checked").delay_min(), u)?;
                 stage(ed, &|a, duration| {
                     let work = match kind {
                         Some(ResourceType::Work) | None => {
