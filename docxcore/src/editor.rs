@@ -506,6 +506,9 @@ impl Editor {
             },
             None => return false,
         };
+        // Before the caret moves to 0, or `insert_newline` would no longer
+        // see the anchor as collapsed.
+        self.drop_collapsed_anchor();
         self.checkpoint(EditKind::Structural);
         if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
             p.content.clear();
@@ -523,6 +526,8 @@ impl Editor {
     /// Insert a horizontal line at the caret (Insert ▸ Horizontal Line): give the
     /// current paragraph a bottom border, then drop to a fresh paragraph below.
     pub fn insert_hrule(&mut self) {
+        // Before `move_end` moves the caret off a click's anchor.
+        self.drop_collapsed_anchor();
         self.checkpoint(EditKind::Structural);
         if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
             p.props.borders.bottom = Some(BorderKind::Single);
@@ -870,7 +875,10 @@ impl Editor {
     /// caret and would leave it behind, turning what was just typed (or the
     /// paragraph mark Enter made) into a selection the next key replaces.
     /// Every edit that moves the caret through content calls this first,
-    /// before its undo checkpoint, so undo restores a plain caret.
+    /// before its undo checkpoint and before it moves the caret (so undo
+    /// restores a plain caret), including the ones that reach
+    /// `insert_newline` only after moving it (`insert_hrule`,
+    /// `hrule_autoformat`).
     fn drop_collapsed_anchor(&mut self) {
         if self.anchor.as_ref() == Some(&self.caret) {
             self.anchor = None;
@@ -3767,6 +3775,28 @@ mod tests {
         // would merge the paragraphs back together.
         ed.insert_char('z');
         assert_eq!(top_text(&ed), vec!["x", "zy"]);
+    }
+
+    #[test]
+    fn horizontal_line_after_a_click_leaves_no_selection_698() {
+        let mut ed = clicked_at_1();
+        ed.insert_hrule();
+        assert_eq!(ed.anchor, None);
+        // A stale anchor at (0, 1) would select "y" and the new paragraph
+        // mark, and this key would replace them.
+        ed.insert_char('z');
+        assert_eq!(top_text(&ed), vec!["xy", "z"]);
+    }
+
+    #[test]
+    fn rule_autoformat_after_a_click_leaves_no_selection_698() {
+        let mut ed = Editor::new(doc(&["---"]));
+        ed.set_caret(Caret::top(0, 3));
+        ed.extend_selection(true);
+        assert!(ed.hrule_autoformat());
+        assert_eq!(ed.anchor, None);
+        ed.insert_char('z');
+        assert_eq!(top_text(&ed), vec!["", "z"]);
     }
 
     #[test]
