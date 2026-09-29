@@ -214,6 +214,20 @@ fn a_delay_edit_is_stored_in_tenths() {
 }
 
 #[test]
+fn units_below_the_cell_s_precision_are_an_edit() {
+    // Both pairs read the same in the cell (`0%`, `2`).
+    let mut steel = assignment(2, 3, 2.0, 120);
+    steel.uid = 2;
+    let mut ed = plan(None, false, vec![assignment(1, 1, 0.00001, 5), steel]);
+    for (uid, u) in [(1, 0.00004), (2, 2.004)] {
+        let depth = ed.undo_depth();
+        ed.set_assignment(uid, units(u)).unwrap();
+        assert_eq!(get(&ed, uid).units, u);
+        assert_eq!(ed.undo_depth(), depth + 1);
+    }
+}
+
+#[test]
 fn values_the_assignment_already_has_record_nothing() {
     let mut ed = plan(None, false, vec![assignment(1, 1, 1.0, 5 * DAY)]);
     ed.rename(1, "Undone").unwrap();
@@ -427,6 +441,27 @@ fn fixed_duration_work_needs_a_span_after_the_delay_the_patch_leaves() {
     let err = ed.set_assignment(1, too_late.clone()).unwrap_err();
     assert_eq!(err, "delay must be shorter than the task");
     assert_untouched(&mut ed, |ed| ed.set_assignment(1, too_late));
+}
+
+#[test]
+fn a_contoured_or_external_task_keeps_work_and_needs_no_span() {
+    // Ann has no work and a delay to the finish, which leaves no span; but
+    // Bob's contour keeps the plain rule, so her work is only stored.
+    let mut ann = assignment(1, 1, 1.0, 0);
+    ann.delay = Some(5 * DAY * 10);
+    let mut bob = assignment(2, 2, 1.0, 5 * DAY);
+    bob.work_contour = Some(6);
+    let mut ed = plan(Some(TaskType::FixedDuration), false, vec![ann.clone(), bob]);
+    assert_one_step(&mut ed, |ed| ed.set_assignment(1, work(8 * 60)).unwrap());
+    assert_eq!((get(&ed, 1).units, get(&ed, 1).work_min), (1.0, 8 * 60));
+    assert_eq!(duration(&ed), 5 * DAY);
+    // An external leaf never enters the recalculation either.
+    let mut ed = plan(Some(TaskType::FixedDuration), false, vec![ann]);
+    let mut p = ed.proj.clone();
+    p.tasks[0].external_task = Some(true);
+    ed = Editor::new(p);
+    ed.set_assignment(1, work(8 * 60)).unwrap();
+    assert_eq!((get(&ed, 1).units, get(&ed, 1).work_min), (1.0, 8 * 60));
 }
 
 #[test]

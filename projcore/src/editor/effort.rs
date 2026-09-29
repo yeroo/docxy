@@ -26,11 +26,9 @@ impl Editor {
     ) -> Result<(), String> {
         let task = self.row_as_edited(i);
         let summary = self.proj.is_outline_summary(i);
-        let duration = if task.is_external_leaf() {
-            None
-        } else {
-            recalculate(&self.proj, &task, summary, &resources, &mut assignments)
-        };
+        let duration = recalculates(&task, summary)
+            .then(|| recalculate(&self.proj, &task, &resources, &mut assignments))
+            .flatten();
         if duration.is_some() {
             self.validate_cell_horizon(task.uid, duration, None)?;
         }
@@ -49,8 +47,38 @@ impl Editor {
     }
 }
 
+/// Whether an assignment edit recalculates `task` by its type at all: a
+/// summary, a milestone and an external leaf keep the plain rule.
+fn recalculates(task: &Task, summary: bool) -> bool {
+    !task.is_external_leaf() && !summary && task.duration_min > 0
+}
+
+/// Whether any of task `uid`'s work assignments follows a contour, which
+/// keeps the plain rule for the whole task.
+fn any_contoured(resources: &[Resource], assignments: &[Assignment], uid: i32) -> bool {
+    assignments
+        .iter()
+        .any(|a| a.task_uid == uid && is_work(resources, a) && contoured(a))
+}
+
+/// Whether a work edit of `a` on row `i` (as `task`) makes [`recalculate`]
+/// derive its units from the work, over the span from its delay to the task
+/// finish ([`same_resources`]): a Fixed Duration task it recalculates, with
+/// no contoured work assignment, and a work resource's assignment.
+pub(super) fn work_edit_rescales_units(
+    proj: &Project,
+    i: usize,
+    task: &Task,
+    a: &Assignment,
+) -> bool {
+    recalculates(task, proj.is_outline_summary(i))
+        && task_type(task) == TaskType::FixedDuration
+        && is_work(&proj.resources, a)
+        && !any_contoured(&proj.resources, &proj.assignments, task.uid)
+}
+
 /// Project's default: a task without a `Type` is Fixed Units.
-pub(super) fn task_type(t: &Task) -> TaskType {
+fn task_type(t: &Task) -> TaskType {
     t.task_type.unwrap_or(TaskType::FixedUnits)
 }
 
@@ -74,12 +102,13 @@ fn effort_driven(t: &Task) -> bool {
 fn recalculate(
     proj: &Project,
     task: &Task,
-    summary: bool,
     resources: &[Resource],
     assignments: &mut [Assignment],
 ) -> Option<i64> {
     let uid = task.uid;
-    if summary || task.duration_min <= 0 {
+    if any_contoured(&proj.resources, &proj.assignments, uid)
+        || any_contoured(resources, assignments, uid)
+    {
         return None;
     }
     let before: Vec<&Assignment> = proj
@@ -90,9 +119,6 @@ fn recalculate(
     let after: Vec<usize> = (0..assignments.len())
         .filter(|&k| assignments[k].task_uid == uid && is_work(resources, &assignments[k]))
         .collect();
-    if before.iter().any(|a| contoured(a)) || after.iter().any(|&k| contoured(&assignments[k])) {
-        return None;
-    }
     let set = |rids: &mut dyn Iterator<Item = i32>| rids.collect::<std::collections::BTreeSet<_>>();
     let set_changed = set(&mut before.iter().map(|a| a.resource_uid))
         != set(&mut after.iter().map(|&k| assignments[k].resource_uid));

@@ -10,9 +10,8 @@
 //! untouched; inside a caller's [`Editor::batch`], stages made before such a
 //! rejection stay until that batch fails, as `batch` documents for its
 //! closure.
-use super::effort::task_type;
+use super::effort::work_edit_rescales_units;
 use super::*;
-use crate::assign::contoured;
 use crate::schedule::HORIZON_DAYS;
 
 /// The resource an added assignment is for.
@@ -21,7 +20,8 @@ pub enum ResourceRef<'a> {
     /// An existing resource.
     Uid(i32),
     /// A resource by name, ignoring ASCII case; a new name is staged as a
-    /// work resource, as the Resource Names cell does.
+    /// work resource. A new name that is a number or contains a comma is
+    /// refused (pass a uid as a number).
     Name(&'a str),
 }
 
@@ -251,7 +251,8 @@ impl Editor {
         let kind = r.map(|r| r.kind);
         // Only what differs from the assignment is an edit.
         let delay = delay.filter(|&d| d * 10 != a.delay.unwrap_or(0).max(0));
-        let units = units.filter(|&u| !same_shown_units(kind, u, a.units));
+        // Exactly: an agent's units are not rounded to what the cell shows.
+        let units = units.filter(|&u| u != a.units);
         // A units edit restages the work, so given work is then an edit.
         let work = work.filter(|&w| units.is_some() || w != a.work_min);
         let table = patch
@@ -289,11 +290,7 @@ impl Editor {
                 let a = ed.proj.assignments.iter().find(|a| a.uid == uid);
                 let a = a.expect("checked");
                 if w > 0
-                    && task_type(&task) == TaskType::FixedDuration
-                    && !ed.proj.is_outline_summary(i)
-                    && task.duration_min > 0
-                    && kind.is_none_or(|k| k == ResourceType::Work)
-                    && !contoured(a)
+                    && work_edit_rescales_units(&ed.proj, i, &task, a)
                     && task.duration_min - a.delay_min() <= 0
                 {
                     return Err("delay must be shorter than the task".into());

@@ -122,8 +122,9 @@ unset), `start`/`finish` the assignment's own dates.
 ```
 
 `assign.add {task, resource, units?, work?}` takes a resource uid or name (a new
-name is staged as a work resource, as the Resource Names cell does) and refuses
-a resource already on the task. `assign.set {uid, units?, work?, rate_table?,
+name is staged as a work resource; a new name that is a number or contains a
+comma is refused, so pass a uid as a number) and refuses a resource already on
+the task. `assign.set {uid, units?, work?, rate_table?,
 delay?}` needs at least one of them; units are a number or `"50%"`, work and
 delay a number of hours or a duration (`"40h"`, `"5d"`), the rate table `"A"` to
 `"E"`. The task is rescheduled by its type, as in Project: on a Fixed Units task

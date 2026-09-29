@@ -27,7 +27,7 @@
 //! | `assign.list` | `{uid?, resource?, fields?}` | `{count, assignments:[…]}`: every assignment, or those of task `uid` and/or of `resource` (a resource uid, or a name matched ignoring ASCII case) |
 //! | `assign.get` | `{uid, fields?}` | one assignment (by its own uid) |
 //! | `assign.fields` | — | `{count, fields:[name…]}`: the assignment field names `fields` can read |
-//! | `assign.add` | `{task, resource, units?, work?, fields?}` | the new assignment (`resource` a uid, or a name; a new name is staged as a work resource, as the Resource Names cell does) |
+//! | `assign.add` | `{task, resource, units?, work?, fields?}` | the new assignment (`resource` a uid, or a name; a new name is staged as a work resource; a new name that is a number or contains a comma is refused: pass a uid as a number) |
 //! | `assign.set` | `{uid, units?, work?, rate_table?, delay?, fields?}` | the updated assignment, after its task is rescheduled |
 //! | `assign.del` | `{uid}` | `{deleted, task}` |
 //!
