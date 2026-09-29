@@ -336,6 +336,8 @@ Ctrl+Shift+F2 removes its links, as Project does. Ctrl+F, F3, Ctrl+Z/Y/S/E
 retain find, repeat find,
 undo/redo, save, and export. The former bare-letter commands are available on
 the ribbon; letters now start cell edits.
+F11 opens a new, empty project in its own tab, as Backstage › New ›
+Project does (#372).
 
 The ribbon (suite and yppxy) holds only Microsoft Project's commands, each with
 Project 2024's label and screentip, which differ for icon-only commands:
