@@ -508,6 +508,17 @@ mod tests {
                     "0d",
                     "✓"
                 ],
+                // Nothing below it: a zero-length row at the project start.
+                [
+                    "**Empty**",
+                    "2026-03-05 08:00:00",
+                    "2026-03-05 08:00:00",
+                    "",
+                    "0d",
+                    "0d",
+                    "0d",
+                    "✓"
+                ],
             ]
         );
     }

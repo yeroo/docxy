@@ -1954,6 +1954,27 @@ impl<'a> Scheduler<'a> {
                 }
                 None => {
                     let (Some(es_min), Some(ef_max)) = span else {
+                        // Nothing scheduled below: its own stored dates, else
+                        // the project start (see `place_empty_summaries`).
+                        // With no child to inherit criticality from, it
+                        // follows the leaf rule at zero slack.
+                        let (start, finish) =
+                            empty_summary_span(t, DateTime::from_minutes(self.anchor));
+                        results.insert(
+                            t.uid,
+                            TaskResult {
+                                uid: t.uid,
+                                early_start: start,
+                                early_finish: finish,
+                                late_start: start,
+                                late_finish: finish,
+                                total_slack_min: 0,
+                                free_slack_min: 0,
+                                start_slack_min: 0,
+                                finish_slack_min: 0,
+                                critical: 0 <= critical_limit,
+                            },
+                        );
                         continue;
                     };
                     let ls_min = nodes.iter().map(|n| n.late_start).min().unwrap();
@@ -2865,6 +2886,12 @@ fn schedule_local(proj: &Project) -> Schedule {
     if dormant_bounds {
         main.project_start = other.project_start;
         main.project_finish = other.project_finish;
+        for (uid, start, finish) in place_empty_summaries(&active, &main, other.project_start) {
+            if let Some(r) = main.results.get_mut(&uid) {
+                (r.early_start, r.early_finish) = (start, finish);
+                (r.late_start, r.late_finish) = (start, finish);
+            }
+        }
     }
     for uid in &dormant {
         if let Some(mut result) = other.results.get(uid).cloned() {
@@ -2955,6 +2982,39 @@ fn dormant_uids(proj: &Project) -> std::collections::HashSet<i32> {
         active_suffix[i] = active_suffix[i + 1] + usize::from(!dormant.contains(&task.uid));
     }
     dormant
+}
+
+/// Where the auto summaries with nothing scheduled below them and no stored
+/// start go when the project starts at `project_start`: `run` places them at
+/// its own anchor, which dormant bounds replace. Each keeps its stored finish
+/// when that is later.
+fn place_empty_summaries(
+    proj: &Project,
+    sched: &Schedule,
+    project_start: DateTime,
+) -> Vec<(i32, DateTime, DateTime)> {
+    proj.tasks
+        .iter()
+        .filter(|t| {
+            t.summary
+                && t.stored_start.is_none()
+                && t.manual_summary_dates().is_none()
+                && sched.results.contains_key(&t.uid)
+                && !sched.rollups.contains_key(&t.uid)
+        })
+        .map(|t| {
+            let (start, finish) = empty_summary_span(t, project_start);
+            (t.uid, start, finish)
+        })
+        .collect()
+}
+
+/// An auto summary with nothing scheduled below it spans its own stored
+/// dates, from `fallback` when it has no stored start, never finishing
+/// before it starts.
+fn empty_summary_span(t: &Task, fallback: DateTime) -> (DateTime, DateTime) {
+    let start = t.stored_start.unwrap_or(fallback);
+    (start, t.stored_finish.map_or(start, |f| f.max(start)))
 }
 
 fn without_tasks(proj: &Project, removed: &std::collections::HashSet<i32>) -> Project {
@@ -3165,6 +3225,12 @@ fn level_local(proj: &Project) -> Leveled {
     let (other, dormant_bounds) = dormant_pass(proj, &dormant, &active_scheduler, &active_result);
     if dormant_bounds {
         main.project_finish = other.project_finish;
+        for (uid, start, finish) in
+            place_empty_summaries(&active, &active_result, other.project_start)
+        {
+            main.start.insert(uid, start);
+            main.finish.insert(uid, finish);
+        }
     }
     for uid in &dormant {
         if let Some(result) = other.get(*uid) {
@@ -3679,7 +3745,10 @@ impl Scheduler<'_> {
             }
             let own = match self.manual_spans.get(&t.uid) {
                 Some(_) => base.get(t.uid).map(|r| (r.early_start, r.early_finish)),
-                None => cs.zip(cf),
+                // Nothing below it: the dates `run` gave it.
+                None => cs
+                    .zip(cf)
+                    .or_else(|| base.get(t.uid).map(|r| (r.early_start, r.early_finish))),
             };
             if let Some((s, f)) = own {
                 start.insert(t.uid, s);
@@ -3910,9 +3979,21 @@ mod tests {
         let sched = schedule(&proj);
         assert_eq!(sched.project_start, DateTime::from_ymd_hm(2026, 3, 2, 8, 0));
         assert_eq!(sched.project_finish, sched.get(2).unwrap().early_finish);
+        // The empty summary sits at the project start the dormant dates set,
+        // not at the active pass's own anchor.
+        let start = sched.project_start;
+        let r = sched.get(1).unwrap();
+        assert_eq!(
+            (r.early_start, r.early_finish, r.late_start, r.late_finish),
+            (start, start, start, start)
+        );
         let leveled = level(&proj);
         assert_eq!(leveled.start(2), Some(sched.get(2).unwrap().early_start));
         assert_eq!(leveled.project_finish, sched.project_finish);
+        assert_eq!(
+            (leveled.start(1), leveled.finish(1)),
+            (Some(start), Some(start))
+        );
     }
 
     #[test]
@@ -6227,7 +6308,14 @@ mod tests {
                 ..Project::default()
             };
             let sched = schedule(&proj);
-            assert_eq!(sched.results().count(), 0);
+            // Only a childless summary has a result: its zero-length span at
+            // the project start.
+            let summary = proj.tasks.iter().any(|t| t.summary);
+            assert_eq!(sched.results().count(), usize::from(summary));
+            if summary {
+                let r = sched.get(1).unwrap();
+                assert_eq!((r.early_start, r.early_finish), (anchor, anchor));
+            }
             assert_eq!(sched.project_start, anchor);
             assert_eq!(sched.project_finish, anchor);
             assert_eq!(level(&proj).project_finish, anchor);
@@ -8155,6 +8243,151 @@ mod tests {
             summary: true,
             ..task(uid, "Phase", 0)
         }
+    }
+
+    type SpanAndSlack = (DateTime, DateTime, DateTime, DateTime, [i64; 4], bool);
+
+    /// Its early and late dates, its four slacks and its critical flag.
+    fn span_and_slack(s: &Schedule, uid: i32) -> SpanAndSlack {
+        let r = s.get(uid).unwrap();
+        (
+            r.early_start,
+            r.early_finish,
+            r.late_start,
+            r.late_finish,
+            [
+                r.total_slack_min,
+                r.free_slack_min,
+                r.start_slack_min,
+                r.finish_slack_min,
+            ],
+            r.critical,
+        )
+    }
+
+    /// Zero slack and critical, from `start` to `finish`, early and late.
+    fn fixed_span(start: DateTime, finish: DateTime) -> SpanAndSlack {
+        (start, finish, start, finish, [0; 4], true)
+    }
+
+    fn early(s: &Schedule, uid: i32) -> (DateTime, DateTime) {
+        let r = s.get(uid).unwrap();
+        (r.early_start, r.early_finish)
+    }
+
+    fn leveled_span(proj: &Project, uid: i32) -> (Option<DateTime>, Option<DateTime>) {
+        let leveled = level(proj);
+        (leveled.start(uid), leveled.finish(uid))
+    }
+
+    /// A summary with nothing under it, stored from `start` to `finish`.
+    fn empty_phase(uid: i32, start: Option<DateTime>, finish: Option<DateTime>) -> Task {
+        Task {
+            stored_start: start,
+            stored_finish: finish,
+            ..phase(uid)
+        }
+    }
+
+    #[test]
+    fn childless_auto_summary_spans_its_stored_dates() {
+        // The issue's file: stored Start = Finish, zero duration.
+        let proj = march2(vec![empty_phase(1, Some(at(2, 8)), Some(at(2, 8)))]);
+        let s = schedule(&proj);
+        assert_eq!(span_and_slack(&s, 1), fixed_span(at(2, 8), at(2, 8)));
+        assert_eq!(task_duration_min(&proj, &s, &proj.tasks[0]), Some(0));
+        assert_eq!(s.rolled_up(1), None);
+        assert_eq!(leveled_span(&proj, 1), (Some(at(2, 8)), Some(at(2, 8))));
+
+        // A later stored finish is kept, and measured as its duration.
+        let proj = march2(vec![empty_phase(1, Some(at(2, 8)), Some(at(4, 17)))]);
+        let s = schedule(&proj);
+        assert_eq!(span_and_slack(&s, 1), fixed_span(at(2, 8), at(4, 17)));
+        assert_eq!(task_duration_min(&proj, &s, &proj.tasks[0]), Some(3 * 480));
+        assert_eq!(leveled_span(&proj, 1), (Some(at(2, 8)), Some(at(4, 17))));
+
+        // A finish before the start never gives a negative span.
+        let proj = march2(vec![empty_phase(1, Some(at(4, 8)), Some(at(2, 8)))]);
+        assert_eq!(early(&schedule(&proj), 1), (at(4, 8), at(4, 8)));
+    }
+
+    #[test]
+    fn childless_auto_summary_without_a_stored_start_sits_at_the_project_start() {
+        let proj = march2(vec![empty_phase(1, None, None), task(2, "Work", 480)]);
+        let s = schedule(&proj);
+        assert_eq!(span_and_slack(&s, 1), fixed_span(at(2, 8), at(2, 8)));
+        // It moves nothing else.
+        let without = schedule(&march2(vec![task(2, "Work", 480)]));
+        assert_eq!(s.get(2), without.get(2));
+        assert_eq!(
+            (s.project_start, s.project_finish),
+            (without.project_start, without.project_finish)
+        );
+        // With only a stored finish, that finish still ends it.
+        let proj = march2(vec![empty_phase(1, None, Some(at(3, 17)))]);
+        assert_eq!(early(&schedule(&proj), 1), (at(2, 8), at(3, 17)));
+    }
+
+    #[test]
+    fn childless_auto_summary_is_critical_by_the_critical_slack_limit() {
+        let mut proj = march2(vec![empty_phase(1, Some(at(2, 8)), Some(at(2, 8)))]);
+        proj.critical_slack_limit_days = Some(-1);
+        assert!(!schedule(&proj).get(1).unwrap().critical);
+        proj.critical_slack_limit_days = Some(2);
+        assert!(schedule(&proj).get(1).unwrap().critical);
+    }
+
+    #[test]
+    fn childless_project_summary_gets_a_result() {
+        let project_summary = |start| Task {
+            uid: 0,
+            id: 0,
+            outline_level: 0,
+            stored_start: start,
+            ..phase(0)
+        };
+        let s = schedule(&march2(vec![project_summary(Some(at(3, 8)))]));
+        assert_eq!(span_and_slack(&s, 0), fixed_span(at(3, 8), at(3, 8)));
+        let s = schedule(&march2(vec![project_summary(None)]));
+        assert_eq!(early(&s, 0), (at(2, 8), at(2, 8)));
+        assert_eq!((s.project_start, s.project_finish), (at(2, 8), at(2, 8)));
+    }
+
+    #[test]
+    fn summary_over_only_dropped_leaves_keeps_its_stored_dates() {
+        // Its only subtask sits on a calendar with no working time.
+        let mut dropped = task(2, "Closed", 480);
+        dropped.outline_level = 2;
+        dropped.calendar_uid = Some(3);
+        let mut proj = march2(vec![
+            empty_phase(1, Some(at(3, 8)), Some(at(3, 8))),
+            dropped,
+            task(4, "Work", 960),
+        ]);
+        proj.calendars = vec![Calendar::standard(1), closed_calendar(3)];
+        let s = schedule(&proj);
+        assert!(s.get(2).is_none());
+        assert_eq!(span_and_slack(&s, 1), fixed_span(at(3, 8), at(3, 8)));
+        assert_eq!(s.rolled_up(1), None);
+        assert_eq!((s.project_start, s.project_finish), (at(2, 8), at(3, 17)));
+        assert_eq!(leveled_span(&proj, 1), (Some(at(3, 8)), Some(at(3, 8))));
+    }
+
+    #[test]
+    fn nested_empty_auto_summaries_each_keep_their_stored_dates() {
+        // An auto summary is looked through, so the outer one has nothing to
+        // roll up either: neither stretches the other.
+        let outer = empty_phase(1, Some(at(3, 8)), Some(at(3, 8)));
+        let inner = Task {
+            outline_level: 2,
+            ..empty_phase(2, Some(at(4, 8)), Some(at(5, 17)))
+        };
+        let proj = march2(vec![outer, inner]);
+        let s = schedule(&proj);
+        assert_eq!(span_and_slack(&s, 1), fixed_span(at(3, 8), at(3, 8)));
+        assert_eq!(span_and_slack(&s, 2), fixed_span(at(4, 8), at(5, 17)));
+        assert_eq!(leveled_span(&proj, 1), (Some(at(3, 8)), Some(at(3, 8))));
+        assert_eq!(leveled_span(&proj, 2), (Some(at(4, 8)), Some(at(5, 17))));
     }
 
     #[test]

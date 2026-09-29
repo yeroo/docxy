@@ -4373,6 +4373,71 @@ mod tests {
         );
     }
 
+    /// Issue #386: the single task replaced by a summary with nothing under it.
+    fn childless_summary_file() -> String {
+        let source = include_str!("../../corpus/mspdi/01-single-task.xml");
+        let xml = source
+            .replace("<Name>Dig foundation</Name>", "<Name>Phase</Name>")
+            .replace("<Summary>0</Summary>", "<Summary>1</Summary>")
+            .replace(
+                "<Duration>PT16H0M0S</Duration>",
+                "<Duration>PT0H0M0S</Duration>",
+            )
+            .replace(
+                "<Finish>2026-03-03T17:00:00</Finish>",
+                "<Finish>2026-03-02T08:00:00</Finish>",
+            );
+        assert_eq!(xml.matches("Phase").count(), 1);
+        assert!(xml.contains("<Summary>1</Summary>"));
+        assert!(xml.contains("<Duration>PT0H0M0S</Duration>"));
+        xml
+    }
+
+    #[test]
+    fn childless_summary_is_scheduled_listed_and_saved_with_its_slack() {
+        let proj = read_mspdi(&childless_summary_file()).unwrap();
+        let task = &proj.tasks[0];
+        assert!(task.summary);
+        let sched = crate::schedule::schedule(&proj);
+        let at = DateTime::from_ymd_hm(2026, 3, 2, 8, 0);
+        let r = sched.get(1).unwrap();
+        assert_eq!(
+            (r.early_start, r.early_finish, r.late_start, r.late_finish),
+            (at, at, at, at)
+        );
+        assert_eq!(
+            crate::schedule::task_duration_min(&proj, &sched, task),
+            Some(0)
+        );
+
+        let md = crate::gantt::to_markdown(&proj, &sched);
+        assert!(
+            md.contains(
+                "| **Phase** | 2026-03-02 08:00:00 | 2026-03-02 08:00:00 |  | 0d | 0d | 0d | ✓ |"
+            ),
+            "{md}"
+        );
+
+        let saved = write_mspdi(&proj);
+        let task_xml = saved.split("<Task>").nth(1).unwrap();
+        for element in [
+            "<Start>2026-03-02T08:00:00</Start>",
+            "<Finish>2026-03-02T08:00:00</Finish>",
+            "<Duration>PT0H0M0S</Duration>",
+            "<Critical>1</Critical>",
+            "<EarlyStart>2026-03-02T08:00:00</EarlyStart>",
+            "<EarlyFinish>2026-03-02T08:00:00</EarlyFinish>",
+            "<LateStart>2026-03-02T08:00:00</LateStart>",
+            "<LateFinish>2026-03-02T08:00:00</LateFinish>",
+            "<FreeSlack>0</FreeSlack>",
+            "<TotalSlack>0</TotalSlack>",
+            "<StartSlack>0</StartSlack>",
+            "<FinishSlack>0</FinishSlack>",
+        ] {
+            assert!(task_xml.contains(element), "missing {element}:\n{task_xml}");
+        }
+    }
+
     #[test]
     fn task_hyperlink_survives_save() {
         let source = include_str!("../../corpus/mspdi/01-single-task.xml");
