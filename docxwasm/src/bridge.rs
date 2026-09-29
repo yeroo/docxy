@@ -908,8 +908,7 @@ impl Session {
     /// `{}` -> `{blocks:[{index,kind,text}]}` (empty when the document has
     /// none) — the DEFAULT section header/footer only, resolved via
     /// [`header_footer_blocks`](Self::header_footer_blocks). `kind` is
-    /// `"headerReference"`/`"footerReference"`, matching docxy main.rs's
-    /// `load_hdr_ftr`/`parts` convention.
+    /// `"headerReference"`/`"footerReference"` (the sectPr element names).
     fn ctl_header_footer(&self, kind: &str) -> String {
         let blocks = self.header_footer_blocks(kind);
         let mut out = String::from("{\"blocks\":[");
@@ -931,9 +930,9 @@ impl Session {
 
     /// Resolve the DEFAULT section header/footer's block content from `kind`
     /// (`"headerReference"`/`"footerReference"`), empty when the document has
-    /// none. Thin wrapper over `docxcore::load::resolve_header_footer` —
-    /// shared with docxy main.rs's `load_hdr_ftr`, so the sectPr -> rels ->
-    /// part -> parse resolution lives in exactly one place.
+    /// none. Thin wrapper over `docxcore::load::resolve_header_footer`, the
+    /// sectPr -> rels -> part -> parse resolution. (docxy resolves from its
+    /// live body sectPr in `PageState::derive`.)
     fn header_footer_blocks(&self, kind: &str) -> Vec<Block> {
         docxcore::load::resolve_header_footer(&self.pkg, &self.rels, kind, "default")
     }
@@ -2819,9 +2818,8 @@ mod tests {
     fn ctl_header_resolves_the_default_section_header_content() {
         // A real header part wired through sectPr -> document.xml.rels ->
         // word/header1.xml, proving `header_footer_blocks`'s call into the
-        // shared `docxcore::load::resolve_header_footer` (also used by docxy
-        // main.rs's `load_hdr_ftr`) actually resolves content, not just that
-        // it degrades to the empty-shape default.
+        // shared `docxcore::load::resolve_header_footer` actually resolves
+        // content, not just that it degrades to the empty-shape default.
         let document_xml = r#"<?xml version="1.0"?><w:document xmlns:w="x"><w:body>
             <w:p><w:r><w:t>body text</w:t></w:r></w:p>
             <w:sectPr><w:headerReference w:type="default" r:id="rId2"/></w:sectPr>

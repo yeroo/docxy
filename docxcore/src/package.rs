@@ -496,6 +496,12 @@ fn parse_protection(xml: &str) -> Protection {
     protection
 }
 
+/// `word/header1.xml` -> `word/_rels/header1.xml.rels`.
+fn part_rels_name(part: &str) -> Option<String> {
+    let (dir, file) = part.rsplit_once('/')?;
+    Some(format!("{dir}/_rels/{file}.rels"))
+}
+
 pub(crate) fn resolve_document_relationship_target(target: &str) -> Option<String> {
     if target.contains('\\') || target.contains("://") {
         return None;
@@ -895,6 +901,19 @@ impl Package {
         self.parts
             .get(self.doc_index)
             .map(|(_, bytes)| bytes.as_slice())
+    }
+
+    /// A header or footer part's blocks, with its relationships (hyperlinks,
+    /// images) resolved through the part's own `_rels`, not the document's.
+    /// `None` when the part is missing or unreadable.
+    pub fn header_footer_blocks(&self, part: &str) -> Option<Vec<Block>> {
+        let xml = self.part(part).and_then(decode_xml_part)?;
+        let rels = part_rels_name(part)
+            .and_then(|name| self.part(&name))
+            .and_then(decode_xml_part)
+            .map(|xml| parse_rels_xml(&xml))
+            .unwrap_or_default();
+        Some(crate::load::parse_header_footer(&xml, &rels))
     }
 
     /// The raw bytes of a part by name.

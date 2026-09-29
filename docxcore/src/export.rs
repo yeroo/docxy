@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::load::{Relationships, parse_header_footer, parse_rels_xml, xml_attr_value};
+use crate::load::{Relationships, xml_attr_value};
 use crate::model::*;
 use crate::package::{HeaderVariant, Package, SectionParts, section_header_parts};
 use crate::styles::StyleSheet;
@@ -94,12 +94,9 @@ impl PdfOptions {
             if !(xml.contains("<w:hdr") || xml.contains("<w:ftr")) {
                 continue;
             }
-            let part_rels = part_rels_name(&name)
-                .and_then(|rels_name| pkg.part(&rels_name))
-                .and_then(crate::package::decode_xml_part)
-                .map(|x| parse_rels_xml(&x))
-                .unwrap_or_default();
-            header_footer.insert(name, Rc::new(parse_header_footer(&xml, &part_rels)));
+            if let Some(blocks) = pkg.header_footer_blocks(&name) {
+                header_footer.insert(name, Rc::new(blocks));
+            }
         }
         let background = pkg
             .document_part()
@@ -120,12 +117,6 @@ impl PdfOptions {
             ..PdfOptions::default()
         }
     }
-}
-
-/// `word/header1.xml` -> `word/_rels/header1.xml.rels`.
-fn part_rels_name(part: &str) -> Option<String> {
-    let (dir, file) = part.rsplit_once('/')?;
-    Some(format!("{dir}/_rels/{file}.rels"))
 }
 
 /// Render a document to PDF bytes.

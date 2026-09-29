@@ -2202,19 +2202,11 @@ impl App {
         self.write_pdf(out);
     }
 
-    /// PDF layout inputs from the package, with the default header/footer the
-    /// page view shows standing in for their parts.
+    /// PDF layout inputs from the package.
     fn pdf_options(&self) -> PdfOptions {
         let mut opts = PdfOptions::from_package(&self.pkg, self.styles.clone());
-        for (part, blocks) in [
-            (&self.header_part, &self.headers.default),
-            (&self.footer_part, &self.footers.default),
-        ] {
-            if let Some(part) = part {
-                opts.header_footer.insert(part.clone(), blocks.clone());
-            }
-        }
-        // A header/footer being edited prints its live content.
+        // Committed header/footer edits are already in their parts; one being
+        // edited prints its live content.
         if let Some(hf) = &self.hf_edit {
             opts.header_footer
                 .insert(hf.part.clone(), Rc::new(self.editor.doc.body.clone()));
@@ -3270,11 +3262,7 @@ impl App {
             return;
         }
         let current = self.edit_final_sect_pr(false, |pkg| pkg.sect_pr().to_string());
-        let break_sect = if current.is_empty() {
-            "<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr>".to_string()
-        } else {
-            current.clone()
-        };
+        let break_sect = with_page_size(&current);
         if !self.editor.set_caret_section_break(Some(break_sect)) {
             self.status = Some("Can't insert a section break here.".to_string());
             self.dirty = true;
@@ -6749,8 +6737,6 @@ fn doc_line_to_ratatui(line: &DocLine) -> RLine<'static> {
     RLine::from(spans)
 }
 
-/// Load the default header/footer block content referenced by the section's
-/// `<w:{kind}>` (kind = "headerReference" or "footerReference"). Empty if none.
 /// Give a body document a final `SectionProperties` when it has none (a New
 /// document, or a package whose sectPr lives outside the body), so every undo
 /// snapshot carries the final section it was taken with.
@@ -6773,7 +6759,7 @@ struct PageState {
 impl PageState {
     /// Resolve the final section's header/footer references through the
     /// package's current relationships (a header created since load has a new
-    /// one) to parts, and parse their content.
+    /// one) to parts, and parse their content with each part's own rels.
     fn derive(pkg: &Package, doc: &Document) -> PageState {
         let sect = doc
             .trailing_section_properties()
@@ -6787,13 +6773,7 @@ impl PageState {
         let blocks = |kind: &str, wtype: &str| {
             Rc::new(
                 part(kind, wtype)
-                    .and_then(|name| pkg.part(&name))
-                    .map(|b| {
-                        docxcore::load::parse_header_footer(
-                            std::str::from_utf8(b).unwrap_or(""),
-                            &rels,
-                        )
-                    })
+                    .and_then(|name| pkg.header_footer_blocks(&name))
                     .unwrap_or_default(),
             )
         };
@@ -6827,6 +6807,19 @@ fn flag_on(xml: &str, tag: &str) -> bool {
     )
 }
 
+/// A section break's sectPr copied from `sect`, given an explicit US Letter
+/// page size when `sect` names none (a New document's empty final section).
+fn with_page_size(sect: &str) -> String {
+    const LETTER: &str = "<w:pgSz w:w=\"12240\" w:h=\"15840\"/>";
+    if sect.contains("<w:pgSz") {
+        sect.to_string()
+    } else if sect.contains("</w:sectPr>") {
+        sect.replacen("</w:sectPr>", &format!("{LETTER}</w:sectPr>"), 1)
+    } else {
+        format!("<w:sectPr>{LETTER}</w:sectPr>")
+    }
+}
+
 /// Rewrite a `<w:sectPr>` so its page size is landscape (w>h) or portrait (h>w),
 /// setting `w:orient`. Other section properties (margins, header refs) are kept.
 fn orient_sectpr(sect: &str, landscape: bool) -> String {
@@ -6839,7 +6832,8 @@ fn orient_sectpr(sect: &str, landscape: bool) -> String {
     };
     let orient = if landscape { "landscape" } else { "portrait" };
     let pgsz = format!("<w:pgSz w:w=\"{nw}\" w:h=\"{nh}\" w:orient=\"{orient}\"/>");
-    if sect.is_empty() {
+    // Empty, or a self-closing `<w:sectPr/>`: nothing to splice into.
+    if !sect.contains("</w:sectPr>") {
         return format!("<w:sectPr>{pgsz}</w:sectPr>");
     }
     if let Some(s) = sect.find("<w:pgSz") {
@@ -9096,18 +9090,6 @@ mod tests {
             pdf.contains("(H) Tj"),
             "committed header missing from the PDF"
         );
-
-        // The page view's copy stands in for the part.
-        app.headers.default = Rc::new(vec![Block::Paragraph(MPara {
-            props: ParProps::default(),
-            content: vec![Inline::Run(Run {
-                text: "Live".to_string(),
-                props: RunProps::default(),
-            })],
-        })]);
-        let pdf =
-            String::from_utf8_lossy(&to_pdf(&app.editor.doc, &app.pdf_options())).into_owned();
-        assert!(pdf.contains("(Live) Tj") && !pdf.contains("(H) Tj"));
     }
 
     /// An app on a Word-style document: the body ends with its own `w:sectPr`.
@@ -9322,6 +9304,83 @@ mod tests {
         let pdf = app_pdf(&app);
         assert!(pdf.contains("(body) Tj"), "the body is printed");
         assert!(pdf.contains("(Live) Tj"), "with the header being edited");
+    }
+
+    #[test]
+    fn header_hyperlinks_resolve_through_the_headers_own_relationships() {
+        const REL: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+        let content_types = r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/></Types>"#;
+        let root_rels = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{REL}/officeDocument" Target="word/document.xml"/></Relationships>"#
+        );
+        // rId1 means one thing to the document and another to the header.
+        let document_rels = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{REL}/hyperlink" Target="https://wrong.example/" TargetMode="External"/><Relationship Id="rIdH" Type="{REL}/header" Target="header1.xml"/></Relationships>"#
+        );
+        let header_rels = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{REL}/hyperlink" Target="https://example.com/" TargetMode="External"/></Relationships>"#
+        );
+        let document = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="{W}" xmlns:r="{REL}"><w:body><w:p><w:r><w:t>body</w:t></w:r></w:p><w:sectPr><w:headerReference w:type="default" r:id="rIdH"/></w:sectPr></w:body></w:document>"#
+        );
+        let header = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><w:hdr xmlns:w="{W}" xmlns:r="{REL}"><w:p><w:hyperlink r:id="rId1"><w:r><w:t>site</w:t></w:r></w:hyperlink></w:p></w:hdr>"#
+        );
+        let bytes = docxcore::zipwrite::write_zip(&[
+            (
+                "[Content_Types].xml".to_string(),
+                content_types.as_bytes().to_vec(),
+            ),
+            ("_rels/.rels".to_string(), root_rels.into_bytes()),
+            ("word/document.xml".to_string(), document.into_bytes()),
+            (
+                "word/_rels/document.xml.rels".to_string(),
+                document_rels.into_bytes(),
+            ),
+            ("word/header1.xml".to_string(), header.into_bytes()),
+            (
+                "word/_rels/header1.xml.rels".to_string(),
+                header_rels.into_bytes(),
+            ),
+        ]);
+        let app = App::new(load_package(&bytes).unwrap(), "links.docx", false);
+        let pdf = app_pdf(&app);
+        assert!(
+            pdf.contains("/URI (https://example.com/)"),
+            "PDF link target"
+        );
+        assert!(!pdf.contains("wrong.example"));
+        // The page view's copy resolves the same way.
+        let Some(Block::Paragraph(p)) = app.headers.default.first() else {
+            panic!("header paragraph");
+        };
+        let Some(Inline::Hyperlink(h)) = p.content.first() else {
+            panic!("header hyperlink: {:?}", p.content);
+        };
+        assert_eq!(h.target.as_deref(), Some("https://example.com/"));
+    }
+
+    #[test]
+    fn a_section_break_on_a_new_document_names_its_page_size() {
+        let mut app = app_with(&["first", "second"]);
+        app.insert_section(true);
+        let Some(Block::Paragraph(p)) = app.editor.doc.body.first() else {
+            panic!("first paragraph");
+        };
+        let sect = p.props.section_break.as_deref().expect("a section break");
+        assert!(
+            sect.contains(r#"<w:pgSz w:w="12240" w:h="15840"/>"#),
+            "{sect}"
+        );
+        assert_eq!(
+            with_page_size("<w:sectPr/>"),
+            format!(
+                "<w:sectPr>{}</w:sectPr>",
+                r#"<w:pgSz w:w="12240" w:h="15840"/>"#
+            )
+        );
+        assert!(orient_sectpr("<w:sectPr/>", true).contains(r#"w:orient="landscape""#));
     }
 
     #[test]

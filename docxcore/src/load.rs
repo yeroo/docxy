@@ -585,10 +585,9 @@ pub fn parse_header_footer(xml: &str, rels: &Relationships) -> Vec<Block> {
 /// so callers can render "no header/footer" as a zero-content result.
 ///
 /// `kind` is `"headerReference"`/`"footerReference"` (the section-property
-/// element name). Shared by every control surface that needs a section
-/// header/footer's live content: docxy's terminal app (all three variants,
-/// for its own editing UI) and docxwasm's `docx_ctl` (the `doc.header`/
+/// element name). Used by docxwasm's `docx_ctl` (the `doc.header`/
 /// `doc.footer` verbs, default variant only per their documented contract).
+/// docxy resolves from its live body sectPr instead (`PageState::derive`).
 pub fn resolve_header_footer(
     pkg: &crate::package::Package,
     rels: &Relationships,
