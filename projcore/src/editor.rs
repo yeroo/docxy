@@ -920,7 +920,7 @@ impl Editor {
         // Only a date change restamps a manual task. A save writes most auto
         // tasks' scheduled dates, not their stored ones; it keeps the stored
         // dates only where the schedule does not reproduce Project (leveled
-        // tasks, plans scheduled from the finish; see mspdi's
+        // plans, plans scheduled from the finish; see mspdi's
         // scheduled_dates), which a rename or a level change must not
         // overwrite either. A blank row's new dates are stamped by edit_row; a
         // newly pinned task's here.
@@ -3780,7 +3780,7 @@ mod tests {
         );
         let back = crate::mspdi::read_mspdi(&crate::mspdi::write_mspdi(ed.project())).unwrap();
         // Pour is leveled (LevelingDelay 4800), which the schedule does not
-        // model: it and its summary save the dates Project wrote (#343).
+        // model: the plan saves the dates Project wrote (#343).
         assert_eq!(back.tasks, ed.project().tasks);
         // A new link to the blank row is still refused.
         let mut added = ed.project().task(2).unwrap().predecessors.clone();

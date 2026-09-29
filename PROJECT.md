@@ -52,9 +52,9 @@ not its stored dates, which go stale once anything the task depends on moves.
 It keeps the stored dates where they are not docxy's to compute (manual tasks,
 blank rows, external placeholders, tasks the schedule skips, auto summaries with
 nothing scheduled below them) and where docxy's schedule is known not to
-reproduce Project: every task of a plan scheduled from its finish, and a task
-Project's leveling delayed (its own or an assignment's `LevelingDelay`) with
-the summaries above it. The editor rewrites the stored dates for a manual task
+reproduce Project: every task of a plan scheduled from its finish or leveled
+by Project (any non-zero task or assignment `LevelingDelay`, whose delay the
+unleveled schedule ignores and which reaches every task downstream). The editor rewrites the stored dates for a manual task
 whose dates it edits, so a save's `Start`/`Finish` agree with its
 `ManualStart`/`ManualDuration` (Project does not reschedule manual tasks on
 open). A manual summary saves its own dates there too, as Project does; a task

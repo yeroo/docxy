@@ -1509,11 +1509,10 @@ fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 /// exports with dates Project can display without recalculating. The stored
 /// dates are kept, written when present, for manual tasks, blank rows,
 /// external placeholders, tasks the schedule skips and auto summaries with
-/// nothing scheduled below them, and where the schedule is known not to
-/// reproduce Project: every task of a plan scheduled from its finish
-/// (`ScheduleFromStart` 0), a task Project's leveling delayed (its own or an
-/// assignment's `LevelingDelay`) and the summaries above it. See
-/// `scheduled_dates`.
+/// nothing scheduled below them, and for every task of a plan the schedule is
+/// known not to reproduce: one scheduled from its finish (`ScheduleFromStart`
+/// 0) and one Project leveled (any non-zero task or assignment
+/// `LevelingDelay`). See `scheduled_dates`.
 ///
 /// The header always says `<ProjectExternallyEdited>0</ProjectExternallyEdited>`,
 /// whatever the source said: the saved `<Duration>`s are docxy's own and
@@ -1735,55 +1734,27 @@ struct Computed<'a> {
 /// - a task the schedule skips has none;
 /// - an auto summary with nothing scheduled below it spans its own stored
 ///   dates, which the schedule only clamps;
-/// - where the schedule is known not to reproduce Project, Project's dates are
-///   the better ones: a plan scheduled from its finish (docxy schedules
-///   forward), a task Project's leveling delayed (the task's or an
-///   assignment's `LevelingDelay`, which the unleveled schedule ignores), and
-///   an auto summary over such a task, whose rollup would not contain the
-///   dates its subtask keeps.
+/// - every task of a plan the schedule is known not to reproduce, where
+///   Project's dates are the better ones: one scheduled from its finish
+///   (docxy schedules forward), and one Project leveled (a task's or an
+///   assignment's `LevelingDelay`, which the unleveled schedule ignores, and
+///   whose effect reaches every successor, summary and resource-sharing task
+///   downstream).
 fn scheduled_dates(
     proj: &Project,
     sched: &crate::schedule::Schedule,
 ) -> Vec<Option<(DateTime, DateTime)>> {
-    if proj.option("ScheduleFromStart").and_then(parse_bool) == Some(false) {
-        return vec![None; proj.tasks.len()];
-    }
     let delayed = |delay: Option<i64>| delay.is_some_and(|d| d != 0);
-    let leveled: std::collections::HashSet<i32> = proj
-        .assignments
-        .iter()
-        .filter(|a| delayed(a.leveling_delay))
-        .map(|a| a.task_uid)
-        .chain(
-            proj.tasks
-                .iter()
-                .filter(|t| delayed(t.leveling_delay))
-                .map(|t| t.uid),
-        )
-        .collect();
-    // Rows kept because a subtask is leveled: every outline ancestor of one.
-    let mut kept = vec![false; proj.tasks.len()];
-    let mut ancestors: Vec<usize> = Vec::new();
-    for (i, t) in proj.tasks.iter().enumerate().filter(|(_, t)| !t.is_null) {
-        while ancestors
-            .last()
-            .is_some_and(|&k| proj.tasks[k].outline_level >= t.outline_level)
-        {
-            ancestors.pop();
-        }
-        if !t.summary && leveled.contains(&t.uid) {
-            kept[i] = true;
-            for &k in &ancestors {
-                kept[k] = true;
-            }
-        }
-        ancestors.push(i);
+    let from_finish = proj.option("ScheduleFromStart").and_then(parse_bool) == Some(false);
+    let leveled = proj.tasks.iter().any(|t| delayed(t.leveling_delay))
+        || proj.assignments.iter().any(|a| delayed(a.leveling_delay));
+    if from_finish || leveled {
+        return vec![None; proj.tasks.len()];
     }
     proj.tasks
         .iter()
-        .zip(kept)
-        .map(|(t, kept)| {
-            if kept || t.is_null || t.is_external_leaf() || t.manual {
+        .map(|t| {
+            if t.is_null || t.is_external_leaf() || t.manual {
                 return None;
             }
             if t.summary && sched.rolled_up(t.uid).is_none() {
@@ -4735,32 +4706,43 @@ mod tests {
         );
     }
 
-    /// Project's leveling delays a task in a way the unleveled schedule does
-    /// not model: a task delayed by its own or an assignment's LevelingDelay,
-    /// and the summary above it, save the dates Project wrote. Another auto
-    /// task in the plan still saves its scheduled dates.
+    /// Project's leveling delays tasks in a way the unleveled schedule does
+    /// not model, and the delay reaches their successors: a leveled plan
+    /// (a task's or an assignment's LevelingDelay) saves every task's dates
+    /// as Project wrote them. A (delayed a day) runs 3/3, so B, FS after it,
+    /// runs 3/4, where the schedule has them at 3/2 and 3/3.
     #[test]
-    fn leveled_tasks_and_their_summary_keep_their_stored_dates() {
-        let xml = "<Project><StartDate>2026-03-02T08:00:00</StartDate><Tasks>            <Task><UID>1</UID><OutlineLevel>1</OutlineLevel><Summary>1</Summary>              <Start>2026-03-05T08:00:00</Start><Finish>2026-03-06T17:00:00</Finish></Task>            <Task><UID>2</UID><OutlineLevel>2</OutlineLevel><Duration>PT16H0M0S</Duration>              <Start>2026-03-05T08:00:00</Start><Finish>2026-03-06T17:00:00</Finish>              <LevelingDelay>4800</LevelingDelay><LevelingDelayFormat>7</LevelingDelayFormat>              <PreLeveledStart>2026-03-04T08:00:00</PreLeveledStart></Task>            <Task><UID>3</UID><OutlineLevel>1</OutlineLevel><Duration>PT8H0M0S</Duration>              <Start>2026-03-11T08:00:00</Start><Finish>2026-03-11T17:00:00</Finish></Task>            <Task><UID>4</UID><OutlineLevel>1</OutlineLevel><Duration>PT8H0M0S</Duration>              <Start>2026-03-12T08:00:00</Start><Finish>2026-03-12T17:00:00</Finish></Task>            </Tasks><Assignments><Assignment><UID>1</UID><TaskUID>4</TaskUID>              <ResourceUID>-65535</ResourceUID><LevelingDelay>4800</LevelingDelay>            </Assignment></Assignments></Project>";
-        let proj = read_mspdi(xml).unwrap();
-        let sched = crate::schedule::schedule(&proj);
-        let march2 = DateTime::from_ymd_hm(2026, 3, 2, 8, 0);
-        for uid in [1, 2, 3, 4] {
-            assert_eq!(sched.get(uid).unwrap().early_start, march2, "UID {uid}");
-        }
-        let saved = write_mspdi(&proj);
-        for (uid, start) in [
-            (1, "2026-03-05"),
-            (2, "2026-03-05"),
-            (3, "2026-03-02"),
-            (4, "2026-03-12"),
-        ] {
-            let task = one_task_xml(&saved, uid);
-            assert!(
-                task.contains(&format!("<Start>{start}T08:00:00</Start>")),
-                "{task}"
+    fn a_leveled_plan_keeps_its_stored_dates() {
+        let plan = |a_delay: &str, assignment_delay: &str| {
+            format!(
+                "<Project><StartDate>2026-03-02T08:00:00</StartDate><Tasks>                <Task><UID>1</UID><Name>A</Name><OutlineLevel>1</OutlineLevel>                  <Duration>PT8H0M0S</Duration>                  <Start>2026-03-03T08:00:00</Start><Finish>2026-03-03T17:00:00</Finish>                  <LevelingDelay>{a_delay}</LevelingDelay><LevelingDelayFormat>7</LevelingDelayFormat>                  <PreLeveledStart>2026-03-02T08:00:00</PreLeveledStart></Task>                <Task><UID>2</UID><Name>B</Name><OutlineLevel>1</OutlineLevel>                  <Duration>PT8H0M0S</Duration>                  <Start>2026-03-04T08:00:00</Start><Finish>2026-03-04T17:00:00</Finish>                  <PredecessorLink><PredecessorUID>1</PredecessorUID><Type>1</Type>                  </PredecessorLink></Task>                </Tasks><Assignments><Assignment><UID>1</UID><TaskUID>2</TaskUID>                  <ResourceUID>-65535</ResourceUID><LevelingDelay>{assignment_delay}</LevelingDelay>                </Assignment></Assignments></Project>"
+            )
+        };
+        let start = |xml: &str, uid| {
+            let task = one_task_xml(xml, uid);
+            let at = task.find("<Start>").unwrap() + "<Start>".len();
+            task[at..at + 10].to_string()
+        };
+        for (a_delay, assignment_delay) in [("4800", "0"), ("0", "4800")] {
+            let proj = read_mspdi(&plan(a_delay, assignment_delay)).unwrap();
+            let sched = crate::schedule::schedule(&proj);
+            assert_eq!(
+                sched.get(2).unwrap().early_start,
+                DateTime::from_ymd_hm(2026, 3, 3, 8, 0)
+            );
+            let xml = write_mspdi(&proj);
+            assert_eq!(
+                (start(&xml, 1), start(&xml, 2)),
+                ("2026-03-03".into(), "2026-03-04".into()),
+                "delays {a_delay}, {assignment_delay}"
             );
         }
+        // Unleveled, the same plan saves where the schedule puts it.
+        let xml = write_mspdi(&read_mspdi(&plan("0", "0")).unwrap());
+        assert_eq!(
+            (start(&xml, 1), start(&xml, 2)),
+            ("2026-03-02".into(), "2026-03-03".into())
+        );
     }
 
     /// docxy schedules forward even when a plan is scheduled from its
