@@ -1011,8 +1011,8 @@ impl Package {
             return;
         }
         if on {
-            // titlePg belongs near the end of CT_SectPr, so append before the close.
-            let section = append_sect_child(self.sect_pr(), "<w:titlePg/>");
+            // titlePg sits between noEndnote and textDirection in CT_SectPr.
+            let section = crate::sect::insert_ordered(self.sect_pr(), "w:titlePg", "<w:titlePg/>");
             self.set_current_sect_pr_raw(section);
         } else {
             let section = remove_element(self.sect_pr(), "w:titlePg");
@@ -1043,6 +1043,26 @@ impl Package {
         let b = self.part(&name)?;
         let xml = decode_xml_part(b)?;
         settings_flag_of(&xml, elem)
+    }
+
+    /// Whether even pages mirror the side margins (`<w:mirrorMargins/>`).
+    pub fn has_mirror_margins(&self) -> bool {
+        self.settings_flag("w:mirrorMargins").unwrap_or(false)
+    }
+
+    /// Turn mirrored margins on or off (`<w:mirrorMargins/>` in settings).
+    pub fn set_mirror_margins(&mut self, on: bool) {
+        self.set_settings_flag("w:mirrorMargins", on);
+    }
+
+    /// Whether the gutter sits at the top of the page (`<w:gutterAtTop/>`).
+    pub fn has_gutter_at_top(&self) -> bool {
+        self.settings_flag("w:gutterAtTop").unwrap_or(false)
+    }
+
+    /// Put the gutter at the top or the left (`<w:gutterAtTop/>` in settings).
+    pub fn set_gutter_at_top(&mut self, on: bool) {
+        self.set_settings_flag("w:gutterAtTop", on);
     }
 
     /// Toggle automatic hyphenation for the document (`<w:autoHyphenation/>`).
@@ -1148,17 +1168,10 @@ impl Package {
     /// with an equal gap. docxy still renders a single column on screen, but the
     /// column layout round-trips and Word lays it out in columns.
     pub fn set_columns(&mut self, num: i32) {
-        let num = num.max(1);
-        let mut s = self.sect_pr().to_string();
-        s = remove_element(&s, "w:cols");
-        let child = if num <= 1 {
-            "<w:cols w:space=\"720\"/>".to_string()
-        } else {
-            format!("<w:cols w:num=\"{num}\" w:space=\"720\" w:equalWidth=\"1\"/>")
-        };
-        // `w:cols` follows `w:pgMar` in CT_SectPr; place it just after when present.
-        s = insert_after_element(&s, "w:pgMar", &child);
-        self.set_current_sect_pr_raw(s);
+        let sect = self.sect_pr().to_string();
+        let mut setup = crate::sect::SectionSetup::parse(&sect);
+        setup.columns = setup.columns.equal(num, 720);
+        self.set_current_sect_pr_raw(setup.apply(&sect));
     }
 
     /// Add a new `word/media/imageN.<ext>` part (e.g. a mermaid-rendered PNG/SVG),
@@ -1239,23 +1252,15 @@ impl Package {
     /// Set the page margins (twips) in the body section's `w:pgMar`, preserving
     /// any header/footer/gutter attributes. Creates the element if absent.
     pub fn set_page_margins(&mut self, top: i32, right: i32, bottom: i32, left: i32) {
-        let mut s = self.sect_pr().to_string();
-        if !s.contains("<w:pgMar") {
-            let mar = format!(
-                "<w:pgMar w:top=\"{top}\" w:right=\"{right}\" w:bottom=\"{bottom}\" w:left=\"{left}\" w:header=\"720\" w:footer=\"720\" w:gutter=\"0\"/>"
-            );
-            s = inject_sect_child(&s, &mar);
-        } else {
-            for (k, v) in [
-                ("w:top", top),
-                ("w:right", right),
-                ("w:bottom", bottom),
-                ("w:left", left),
-            ] {
-                s = set_pgmar_attr(&s, k, v);
-            }
-        }
-        self.set_current_sect_pr_raw(s);
+        let sect = self.sect_pr().to_string();
+        let mut setup = crate::sect::SectionSetup::parse(&sect);
+        (
+            setup.margins.top,
+            setup.margins.right,
+            setup.margins.bottom,
+            setup.margins.left,
+        ) = (top, right, bottom, left);
+        self.set_current_sect_pr_raw(setup.apply(&sect));
     }
 
     /// Add a `<w:comment>` to `comments.xml`, creating the part + relationship +
@@ -1553,33 +1558,6 @@ fn next_rid(rels: &str) -> String {
 
 /// Insert a child element as the first child of `<w:sectPr>` (creating/expanding
 /// the element as needed). References must precede other section properties.
-/// Replace (or add) a numeric attribute on the section's `<w:pgMar>` element.
-fn set_pgmar_attr(sect: &str, key: &str, val: i32) -> String {
-    let Some(ts) = sect.find("<w:pgMar") else {
-        return sect.to_string();
-    };
-    let Some(rel) = sect[ts..].find('>') else {
-        return sect.to_string();
-    };
-    let end = ts + rel; // index of '>'
-    let el = &sect[ts..end]; // element without the closing '>'
-    let k = format!("{key}=\"");
-    let new_el = if let Some(ks) = el.find(&k) {
-        let vs = ks + k.len();
-        let ve = el[vs..].find('"').map(|e| vs + e).unwrap_or(vs);
-        format!("{}{}{}", &el[..vs], val, &el[ve..])
-    } else {
-        let trimmed = el.trim_end_matches('/').trim_end();
-        let slash = if el.trim_end().ends_with('/') {
-            "/"
-        } else {
-            ""
-        };
-        format!("{trimmed} {key}=\"{val}\"{slash}")
-    };
-    format!("{}{}{}", &sect[..ts], new_el, &sect[end..])
-}
-
 fn inject_sect_child(sect: &str, child: &str) -> String {
     if sect.is_empty() {
         return format!("<w:sectPr>{child}</w:sectPr>");
@@ -1593,47 +1571,6 @@ fn inject_sect_child(sect: &str, child: &str) -> String {
     }
     let (head, tail) = sect.split_at(gt + 1);
     format!("{head}{child}{tail}")
-}
-
-/// Append a child just before `</w:sectPr>` (for elements like `<w:titlePg/>`
-/// that belong near the end of `CT_SectPr`). Expands a self-closing sectPr.
-fn append_sect_child(sect: &str, child: &str) -> String {
-    if sect.is_empty() {
-        return format!("<w:sectPr>{child}</w:sectPr>");
-    }
-    if let Some(gt) = sect.find('>') {
-        if sect[..gt].ends_with('/') {
-            return format!("{}>{child}</w:sectPr>", &sect[..gt - 1]);
-        }
-    }
-    match sect.rfind("</w:sectPr>") {
-        Some(i) => format!("{}{child}{}", &sect[..i], &sect[i..]),
-        None => format!("{sect}{child}"),
-    }
-}
-
-/// Insert `child` immediately after the `after` element (self-closing or with a
-/// close tag). Falls back to appending before `</w:sectPr>` when `after` is
-/// absent, keeping the child in a valid `CT_SectPr` position.
-fn insert_after_element(sect: &str, after: &str, child: &str) -> String {
-    let open = format!("<{after}");
-    let Some(start) = sect.find(&open) else {
-        return append_sect_child(sect, child);
-    };
-    let Some(rel_gt) = sect[start..].find('>') else {
-        return append_sect_child(sect, child);
-    };
-    let gt = start + rel_gt;
-    let end = if sect[..gt].ends_with('/') {
-        gt + 1 // self-closing <after/>
-    } else {
-        let close = format!("</{after}>");
-        match sect[gt..].find(&close) {
-            Some(c) => gt + c + close.len(),
-            None => gt + 1,
-        }
-    };
-    format!("{}{child}{}", &sect[..end], &sect[end..])
 }
 
 /// Remove the first `<name/>`, `<name .../>`, or `<name ...>…</name>` element.
@@ -1688,32 +1625,9 @@ pub(crate) fn settings_flag_of(xml: &str, elem: &str) -> Option<bool> {
 }
 
 fn remove_element(xml: &str, name: &str) -> String {
-    let open = format!("<{name}");
-    let Some(start) = xml.find(&open) else {
-        return xml.to_string();
-    };
-    // Boundary check: the char after the name must end the tag name.
-    let after = &xml[start + open.len()..];
-    if !after.starts_with([' ', '/', '>', '\t', '\n', '\r']) {
-        return xml.to_string();
-    }
-    let Some(rel_gt) = after.find('>') else {
-        return xml.to_string();
-    };
-    let gt = start + open.len() + rel_gt;
-    let end = if xml[..gt].ends_with('/') {
-        gt + 1 // self-closing <name/>
-    } else {
-        let close = format!("</{name}>");
-        match xml[gt..].find(&close) {
-            Some(c) => gt + c + close.len(),
-            None => gt + 1,
-        }
-    };
-    let mut out = String::with_capacity(xml.len());
-    out.push_str(&xml[..start]);
-    out.push_str(&xml[end..]);
-    out
+    // Keeps scanning past a longer name that shares the prefix (`w:cols` when
+    // removing `w:col`) instead of giving up on it.
+    crate::sect::remove_element(xml, name)
 }
 
 /// Open a `.docx` from bytes, keeping all parts for a lossless-ish save.
@@ -2881,6 +2795,51 @@ mod tests {
         let name2 = pkg2.create_hf(false, "default").expect("created footer");
         assert_eq!(name2, "word/footer1.xml");
         assert!(pkg2.sect_pr().contains("footerReference"));
+    }
+
+    #[test]
+    fn section_setters_keep_schema_order() {
+        use crate::model::{Block, Document, Paragraph};
+        let mut pkg = new_package(Document {
+            body: vec![Block::Paragraph(Paragraph::default())],
+        });
+        pkg.set_sect_pr(
+            "<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/><w:pgNumType w:start=\"1\"/>             <w:docGrid w:linePitch=\"360\"/></w:sectPr>"
+                .into(),
+        );
+        pkg.set_columns(2);
+        pkg.set_page_margins(720, 720, 720, 720);
+        pkg.set_title_pg(true);
+        let s = pkg.sect_pr();
+        let at = |n: &str| s.find(n).unwrap_or_else(|| panic!("{n} missing: {s}"));
+        assert!(at("<w:pgSz") < at("<w:pgMar"), "{s}");
+        assert!(at("<w:pgNumType") < at("<w:cols"), "{s}");
+        assert!(at("<w:cols") < at("<w:titlePg"), "{s}");
+        assert!(at("<w:titlePg") < at("<w:docGrid"), "{s}");
+        assert_eq!(pkg.page_geom().ml, 720);
+
+        assert!(!pkg.has_mirror_margins());
+        pkg.set_mirror_margins(true);
+        pkg.set_gutter_at_top(true);
+        assert!(pkg.has_mirror_margins() && pkg.has_gutter_at_top());
+        pkg.set_mirror_margins(false);
+        assert!(!pkg.has_mirror_margins() && pkg.has_gutter_at_top());
+    }
+
+    #[test]
+    fn set_columns_keeps_the_line_between() {
+        use crate::model::{Block, Document, Paragraph};
+        let mut pkg = new_package(Document {
+            body: vec![Block::Paragraph(Paragraph::default())],
+        });
+        pkg.set_sect_pr(
+            "<w:sectPr><w:cols w:num=\"2\" w:sep=\"1\" w:space=\"720\" w:equalWidth=\"0\">             <w:col w:w=\"3000\" w:space=\"720\"/><w:col w:w=\"5640\"/></w:cols></w:sectPr>"
+                .into(),
+        );
+        pkg.set_columns(3);
+        assert!(pkg.sect_pr().contains("w:sep=\"1\""), "{}", pkg.sect_pr());
+        assert!(!pkg.sect_pr().contains("<w:col "), "{}", pkg.sect_pr());
+        assert_eq!(pkg.columns(), 3);
     }
 
     #[test]
