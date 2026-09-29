@@ -1,0 +1,118 @@
+# #649: Word's page Layout tab. Its Page Setup group's seven menus act on the
+# caret's section; Custom Margins... and More Columns... open the Page Setup
+# and Columns dialogs, whose controls take typed keys.
+
+test the Layout tab sits between Insert and Review
+  open copy:../fixtures/basic.docx
+  call ribbon-read {}
+  assert reply.tabs.0.name is File
+  assert reply.tabs.1.name is Home
+  assert reply.tabs.2.name is Insert
+  assert reply.tabs.3.name is Layout
+  assert reply.tabs.3.key_tip is P
+  assert reply.tabs.4.name is Review
+  assert reply.tabs.5.name is View
+  key alt p escape escape
+  assert ribbon_tab is Layout
+
+test Alt P O opens Orientation and Landscape is checked after it runs
+  open copy:../fixtures/basic.docx
+  key alt p o
+  assert menu.target.ribbon.0 is Layout
+  assert menu.target.ribbon.1 is Page Setup
+  assert menu.target.ribbon.2 is Orientation
+  shot window
+  call menu-read {}
+  assert reply.items.0.label is Portrait
+  assert reply.items.0.checked is true
+  assert reply.items.1.label is Landscape
+  assert reply.items.1.checked is false
+  call menu-click {"label":"Landscape"}
+  assert menu is nothing
+  assert status is Orientation: Landscape
+  assert dirty is true
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Orientation"]}}
+  assert reply.items.1.checked is true
+  assert reply.items.0.checked is false
+  call menu-close {}
+  key ctrl+z
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Orientation"]}}
+  assert reply.items.0.checked is true
+  call menu-close {}
+
+test two-letter KeyTips wait for their second letter
+  open copy:../fixtures/basic.docx
+  key alt p s
+  assert menu is nothing
+  key z
+  assert menu.target.ribbon.2 is Size
+  call menu-read {}
+  assert reply.items.0.label is Letter
+  assert reply.items.0.checked is true
+  assert reply.items.7.separator is true
+  assert reply.items.8.label is More Paper Sizes...
+  call menu-click {"label":"A4"}
+  assert status is Size: A4
+  key alt p l n
+  assert menu.target.ribbon.2 is Line Numbers
+  call menu-click {"label":"Restart Each Section"}
+  assert status is Line numbers: RestartEachSection
+
+test the Breaks menu has Word's headings and a section break splits the section
+  open copy:../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Breaks"]}}
+  assert reply.items.0.heading is Page Breaks
+  assert reply.items.4.heading is Section Breaks
+  call menu-click {"label":"Continuous"}
+  assert status is Section break (continuous)
+  assert dirty is true
+
+test Custom Margins opens Page Setup, which takes typed keys
+  open copy:../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Margins"]}}
+  call menu-click {"label":"Custom Margins..."}
+  assert dialog is page-setup
+  call dialog-read {}
+  assert reply.title is Page Setup
+  assert reply.tab is Margins
+  assert reply.tabs.1 is Paper
+  assert reply.controls.0.name is top
+  assert reply.controls.0.value is 1
+  shot window
+  # Tab focuses Top; Backspace and typing edit it through the widget.
+  key tab
+  key backspace
+  type 1.5
+  call dialog-read {}
+  assert reply.controls.0.value is 1.5
+  call-error dialog-set {"control":"Top","value":"wide"} => 'Top:' takes a number
+  call dialog-set {"control":"Left","value":-1}
+  call-error dialog-click {"button":"OK"} => Left cannot be negative
+  assert dialog is page-setup
+  call dialog-set {"control":"Left","value":0.75}
+  call dialog-tab {"tab":"Paper"}
+  call dialog-set {"control":"Paper size","value":"Legal"}
+  call dialog-read {}
+  assert reply.controls.1.name is width
+  assert reply.controls.2.value is 14
+  call dialog-click {"button":"OK"}
+  assert dialog is none
+  assert dirty is true
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Size"]}}
+  assert reply.items.1.label is Legal
+  assert reply.items.1.checked is true
+  call menu-close {}
+
+test More Columns opens the Columns dialog
+  open copy:../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Columns"]}}
+  call menu-click {"label":"More Columns..."}
+  assert dialog is columns
+  call dialog-set {"control":"Presets","value":"Two"}
+  call dialog-set {"control":"Line between","value":true}
+  call dialog-click {"button":"OK"}
+  assert dialog is none
+  call menu-open {"target":{"ribbon":["Layout","Page Setup","Columns"]}}
+  assert reply.items.1.label is Two
+  assert reply.items.1.checked is true
+  call menu-close {}
