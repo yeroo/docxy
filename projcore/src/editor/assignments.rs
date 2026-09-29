@@ -6,8 +6,10 @@
 //! cell uses. Arguments are checked before anything is staged. The checks
 //! that need an earlier stage's result (the Fixed Duration span for new
 //! work, the work new units give) run inside the edit's batch, which
-//! restores the editor on a rejection. Either way a rejected edit leaves
-//! the editor untouched.
+//! restores the editor on a rejection. So a rejected edit leaves the editor
+//! untouched; inside a caller's [`Editor::batch`], stages made before such a
+//! rejection stay until that batch fails, as `batch` documents for its
+//! closure.
 use super::effort::task_type;
 use super::*;
 use crate::assign::contoured;
@@ -66,19 +68,15 @@ fn checked_minutes(what: &str, min: i64) -> Result<i64, String> {
     }
 }
 
-/// Refuse units whose work would pass the scheduling horizon: a work
-/// resource works them over `span` minutes, a material's work is its
-/// quantity in hours, and a cost resource has none.
-fn check_units_work(kind: Option<ResourceType>, span: i64, units: f64) -> Result<(), String> {
-    let work = match kind {
-        Some(ResourceType::Material) => units * 60.0,
-        Some(ResourceType::Cost) => 0.0,
-        Some(ResourceType::Work) | None => span.max(0) as f64 * units,
-    };
-    if work.round() > MAX_MINUTES as f64 {
+/// The work `units` give over `span` minutes ([`assigned_work`]), refused
+/// when it would pass the scheduling horizon. The work saturates, so huge
+/// units are refused too.
+fn units_work(kind: Option<ResourceType>, span: i64, units: f64) -> Result<i64, String> {
+    let work = assigned_work(kind, span.max(0), units);
+    if work > MAX_MINUTES {
         Err("units are beyond the scheduling range".into())
     } else {
-        Ok(())
+        Ok(work)
     }
 }
 
@@ -171,7 +169,6 @@ impl Editor {
             }
         };
         let r = resources.iter().find(|r| r.uid == rid).expect("staged");
-        check_kind(r, units.is_some(), false)?;
         if self
             .proj
             .assignments
@@ -187,7 +184,7 @@ impl Editor {
         let kind = Some(r.kind);
         // A blank row is assigned as the task the edit makes it.
         let duration = self.row_as_edited(i).duration_min;
-        check_units_work(kind, duration, units)?;
+        units_work(kind, duration, units)?;
         let mut next_aid = self
             .proj
             .assignments
@@ -212,6 +209,9 @@ impl Editor {
     /// are recomputed from the work. A work edit clears the overtime. Values
     /// it already has are no change (given work only when no units edit
     /// restages it), and a patch that changes nothing records no undo step.
+    /// A rejected edit leaves the editor untouched, except inside a caller's
+    /// [`Self::batch`], where stages made before a rejection that needs
+    /// their result stay until that batch fails.
     pub fn set_assignment(&mut self, uid: i32, patch: AssignmentPatch) -> Result<(), String> {
         let a = self
             .proj
@@ -268,19 +268,12 @@ impl Editor {
                 stage(ed, &|a, _| a.delay = Some(d * 10))?;
             }
             if let Some(u) = units {
-                // The work the units give, over the span the delay stage left.
+                // A work resource works them from its delay (as the delay
+                // stage left it) to the task finish.
                 let duration = ed.row_as_edited(i).duration_min;
                 let a = ed.proj.assignments.iter().find(|a| a.uid == uid);
-                check_units_work(kind, duration - a.expect("checked").delay_min(), u)?;
-                stage(ed, &|a, duration| {
-                    let work = match kind {
-                        Some(ResourceType::Work) | None => {
-                            work_for((duration - a.delay_min()).max(0), u)
-                        }
-                        _ => assigned_work(kind, duration, u),
-                    };
-                    a.set_units(u, work);
-                })?;
+                let work = units_work(kind, duration - a.expect("checked").delay_min(), u)?;
+                stage(ed, &|a, _| a.set_units(u, work))?;
             }
             if let Some(w) = work {
                 // A fixed-duration task works new work over the span from

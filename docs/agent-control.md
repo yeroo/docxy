@@ -81,6 +81,28 @@ Active, Outline Number, Outline Level, WBS, Leveling Delay, Type, Effort Driven,
 Priority, Notes, Milestone, Summary, Estimated and Unique ID. Earned-value,
 Status and custom fields are not readable yet.
 
+- `text` is what the sheet shows. The Entry columns use the grid's own text,
+  which the harness `cell` verb also returns (`2d`, `2026-03-02`); the other
+  fields use Project's spellings: `0 days`, `1 day`, `-1 day`, `1.25 days`,
+  `2 wks`, `2 edays`, `4 hrs` (work is always hours), `$1,400.00`,
+  `($40,000.00)`, `50%`, `Yes`/`No`. Dates show `YYYY-MM-DD`, or `NA` when
+  unset, so Duration `2d` can sit next to Actual Duration `2 days`.
+- `value` is what lies underneath: dates `YYYY-MM-DD HH:MM`; durations, work
+  and slack signed minutes; money a number of currency units; percents
+  integers; flags booleans; enums (Task Mode, Constraint Type, Type, Fixed
+  Cost Accrual) their display names; text strings. It is `null` only for a date
+  that shows `NA` and for a stored quantity the plan does not have (unset %
+  Complete reads `"0%"` and `null`; a stored 0 reads `"0%"` and `0`). Fields
+  with a Project default read the default: Active Yes, Priority 500, Type and
+  Effort Driven the plan's new-task defaults, Fixed Cost Accrual Prorated.
+- Variances follow the live schedule, not the values a file stores. They
+  measure the scheduled (unleveled) dates, which a save writes and Set
+  Baseline records; while leveling is on, the grid's Start and Finish can
+  differ from them. Start and Finish Variance are working minutes from the
+  Baseline date to the scheduled one (0 without a baseline), and Duration, Work and Cost Variance are the
+  current value less the Baseline one (an absent Baseline value counts as 0).
+  Slack comes from the schedule, and total slack can be negative.
+
 Assignments are addressed by their own UID. `assign.list {uid?, resource?}`
 lists every assignment, or those of task `uid` and/or of `resource` (a uid, or
 a name matched ignoring ASCII case; an unknown one is an error, `no resource
@@ -119,28 +141,6 @@ Baseline Work, Cost, Actual, Remaining and Baseline Cost, % Work Complete,
 Start, Finish, Delay, Cost Rate Table, Work Contour, Peak, Budget Work and
 Budget Cost); `{"Work": {"text": "40 hrs", "value": 2400}, "Units": {"text":
 "100%", "value": 1}}`. Peak and the budget fields read what the plan stores.
-
-- `text` is what the sheet shows. The Entry columns use the grid's own text,
-  which the harness `cell` verb also returns (`2d`, `2026-03-02`); the other
-  fields use Project's spellings: `0 days`, `1 day`, `-1 day`, `1.25 days`,
-  `2 wks`, `2 edays`, `4 hrs` (work is always hours), `$1,400.00`,
-  `($40,000.00)`, `50%`, `Yes`/`No`. Dates show `YYYY-MM-DD`, or `NA` when
-  unset, so Duration `2d` can sit next to Actual Duration `2 days`.
-- `value` is what lies underneath: dates `YYYY-MM-DD HH:MM`; durations, work
-  and slack signed minutes; money a number of currency units; percents
-  integers; flags booleans; enums (Task Mode, Constraint Type, Type, Fixed
-  Cost Accrual) their display names; text strings. It is `null` only for a date
-  that shows `NA` and for a stored quantity the plan does not have (unset %
-  Complete reads `"0%"` and `null`; a stored 0 reads `"0%"` and `0`). Fields
-  with a Project default read the default: Active Yes, Priority 500, Type and
-  Effort Driven the plan's new-task defaults, Fixed Cost Accrual Prorated.
-- Variances follow the live schedule, not the values a file stores. They
-  measure the scheduled (unleveled) dates, which a save writes and Set
-  Baseline records; while leveling is on, the grid's Start and Finish can
-  differ from them. Start and Finish Variance are working minutes from the
-  Baseline date to the scheduled one (0 without a baseline), and Duration, Work and Cost Variance are the
-  current value less the Baseline one (an absent Baseline value counts as 0).
-  Slack comes from the schedule, and total slack can be negative.
 
 File handling differs from the TUI:
 
