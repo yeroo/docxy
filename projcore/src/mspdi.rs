@@ -1501,10 +1501,19 @@ fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 /// [`PROJECT_HEADER`] order, then any others in read order. Outline code
 /// definitions, WBS masks and extended attribute definitions follow in schema
 /// order. Other elements outside the model (views, etc.) are not preserved:
-/// this is a model-faithful writer, not a byte-faithful one. Each task's stored
-/// `Start`/`Finish` are written when present (e.g. after scheduling and
-/// stamping them back), so a scheduled project exports with dates Project can
-/// display without recalculating.
+/// this is a model-faithful writer, not a byte-faithful one.
+///
+/// An auto-scheduled task's stored `Start`/`Finish` are written as the dates
+/// docxy schedules it to (its `EarlyStart`/`EarlyFinish`), not the ones it was
+/// read with (one it was read without stays absent), so a scheduled project
+/// exports with dates Project can display without recalculating. The stored
+/// dates are kept, written when present, for manual tasks, blank rows,
+/// external placeholders, tasks the schedule skips and auto summaries with
+/// nothing scheduled below them, and for every task of a plan with an input
+/// Project schedules by and docxy's schedule ignores: `ScheduleFromStart` 0,
+/// a non-zero task or assignment `LevelingDelay`, an
+/// elapsed task `DurationFormat`, or a work resource whose calendar differs
+/// from its task's. See `scheduled_dates` and `schedule_reproduces`.
 ///
 /// The header always says `<ProjectExternallyEdited>0</ProjectExternallyEdited>`,
 /// whatever the source said: the saved `<Duration>`s are docxy's own and
@@ -1513,9 +1522,16 @@ fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 /// The computed task fields (`OutlineNumber`, early/late dates, the four
 /// slacks, `Critical`) come from [`crate::schedule::schedule`], never from
 /// values read from a file. That schedule honours each calendar's daily
-/// (`Type 1`) exceptions. Known limit: recurring exceptions (`Type` 2-8, or a
-/// `Period` above 1) are written back but not scheduled, so on a plan with one
-/// these fields can differ from Project's and from the stored `Start`/`Finish`.
+/// (`Type 1`) exceptions. Known limits, which no cheap check detects, so a
+/// plan with one still saves the schedule's dates: recurring exceptions
+/// (`Type` 2-8, or a `Period` above 1) are written back but not scheduled, and
+/// an untracked split (a gap in a task's work that is not a recorded
+/// Stop/Resume) is not modelled. A `.mpp` import decodes neither assignment
+/// `LevelingDelay` nor `ScheduleFromStart`, so the check cannot see them there:
+/// a plan leveled only through its assignments, or scheduled from its finish,
+/// passes it. On such a plan these fields and an auto
+/// task's `Start`/`Finish` can differ from Project's, and the difference
+/// spreads through links, rollups and late dates to other tasks.
 ///
 /// Assignment and resource values are written as the model holds them, never
 /// recomputed here: Project trusts them, and an unedited file keeps its own.
@@ -1560,10 +1576,12 @@ pub fn write_mspdi(proj: &Project) -> String {
     s.push_str("  <Tasks>\n");
     let sched = crate::schedule::schedule(proj);
     let numbers = outline_numbers(&proj.tasks);
-    for (t, number) in proj.tasks.iter().zip(&numbers) {
+    let dates = scheduled_dates(proj, &sched);
+    for ((t, number), &dates) in proj.tasks.iter().zip(&numbers).zip(&dates) {
         let computed = Computed {
             outline_number: number.as_deref(),
             result: sched.get(t.uid).filter(|_| !t.is_null),
+            dates,
         };
         write_task(&mut s, t, &computed);
     }
@@ -1707,6 +1725,131 @@ fn header_text(proj: &Project, name: &str) -> Option<String> {
 struct Computed<'a> {
     outline_number: Option<&'a str>,
     result: Option<&'a TaskResult>,
+    /// The `Start`/`Finish` the schedule places the task at, written in place
+    /// of its stored dates; `None` keeps the stored ones.
+    dates: Option<(DateTime, DateTime)>,
+}
+
+/// Where the schedule puts each task, which a save writes as its
+/// `Start`/`Finish` (by row): Project trusts those, and the ones an auto task
+/// was read with are stale once anything it depends on moved (#343). `None`
+/// keeps the stored dates:
+///
+/// - a blank row's and an external placeholder's are not ours;
+/// - a manual task's are what it is pinned to (and a TBD one's absent Start is
+///   what keeps it TBD on reload);
+/// - a task the schedule skips has none;
+/// - an auto summary with nothing scheduled below it spans its own stored
+///   dates, which the schedule only clamps;
+/// - every task of a plan the schedule is known not to reproduce, where
+///   Project's dates are the better ones; see [`schedule_reproduces`].
+fn scheduled_dates(
+    proj: &Project,
+    sched: &crate::schedule::Schedule,
+) -> Vec<Option<(DateTime, DateTime)>> {
+    if !schedule_reproduces(proj) {
+        return vec![None; proj.tasks.len()];
+    }
+    proj.tasks
+        .iter()
+        .map(|t| {
+            if t.is_null || t.is_external_leaf() || t.manual {
+                return None;
+            }
+            if t.summary && sched.rolled_up(t.uid).is_none() {
+                return None;
+            }
+            sched.get(t.uid).map(|r| (r.early_start, r.early_finish))
+        })
+        .collect()
+}
+
+/// Whether nothing in the plan is an input Project schedules by and docxy's
+/// schedule ignores. Each such input moves its task, and through links,
+/// rollups and shared resources others, so a plan with one keeps every task's
+/// stored dates. The inputs checked, each cheap and objective:
+///
+/// - `ScheduleFromStart` 0: docxy schedules forward;
+/// - a non-zero task or assignment `LevelingDelay`: Project's leveling result,
+///   which the unleveled schedule ignores;
+/// - an elapsed `DurationFormat` on a task: the schedule counts every duration
+///   in working time;
+/// - a work assignment whose resource's calendar has other working time than
+///   its task's calendar (resource calendars are not scheduled), unless the
+///   task ignores resource calendars. A resource calendar that states nothing
+///   of its own and derives from the task's calendar, as Project makes one for
+///   each resource, has the same working time.
+///
+/// An assignment `Delay` is not one: it moves the assignment within its task,
+/// whose duration already includes it, not the task.
+///
+/// Known limits, not checked: recurring calendar exceptions and untracked
+/// splits, and on a `.mpp` import an assignment `LevelingDelay` and
+/// `ScheduleFromStart`, neither of which the importer decodes; see
+/// [`write_mspdi`].
+fn schedule_reproduces(proj: &Project) -> bool {
+    let nonzero = |value: Option<i64>| value.is_some_and(|v| v != 0);
+    if proj.option("ScheduleFromStart").and_then(parse_bool) == Some(false) {
+        return false;
+    }
+    let elapsed = |t: &Task| {
+        t.duration_format
+            .and_then(|code| LagFormat::from_code(i64::from(code)))
+            .is_some_and(|f| f.kind() == LagKind::Elapsed)
+    };
+    if proj
+        .tasks
+        .iter()
+        .any(|t| nonzero(t.leveling_delay) || (!t.is_null && !t.summary && elapsed(t)))
+    {
+        return false;
+    }
+    !proj
+        .assignments
+        .iter()
+        .any(|a| nonzero(a.leveling_delay) || resource_calendar_differs(proj, a))
+}
+
+/// Whether `a`'s work resource works on a calendar other than its task's.
+fn resource_calendar_differs(proj: &Project, a: &Assignment) -> bool {
+    let Some(task) = proj.task(a.task_uid) else {
+        return false;
+    };
+    let Some(resource) = proj.resources.iter().find(|r| r.uid == a.resource_uid) else {
+        return false;
+    };
+    if resource.kind != ResourceType::Work || task.ignore_resource_calendar == Some(true) {
+        return false;
+    }
+    // No resource calendar (none, or a UID such as -1 that names none) has
+    // nothing to differ by: nothing else in docxy resolves one either.
+    let Some(mut uid) = resource.calendar_uid else {
+        return false;
+    };
+    // The task's calendar as the scheduler resolves it: a UID naming no
+    // calendar (Project writes -1 for "none") is the project's.
+    let task_uid = task
+        .calendar_uid
+        .filter(|&uid| proj.calendar(uid).is_some())
+        .unwrap_or(proj.default_calendar_uid);
+    // Follow calendars that state nothing of their own to the one they take
+    // their time from.
+    for _ in 0..proj.calendars.len() {
+        let Some(cal) = proj.calendar(uid) else {
+            return false;
+        };
+        if uid == task_uid {
+            return false;
+        }
+        let own = cal.week.iter().any(Option::is_some)
+            || !cal.exceptions.is_empty()
+            || !cal.work_weeks.is_empty();
+        match cal.base_calendar_uid {
+            Some(base) if !own => uid = base,
+            _ => return true,
+        }
+    }
+    true
 }
 
 fn flag(value: bool) -> &'static str {
@@ -1774,8 +1917,16 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     opt_text(s, "OutlineNumber", computed.outline_number);
     tag(s, 3, "OutlineLevel", &t.outline_level.to_string());
     opt_text(s, "Priority", t.priority);
-    opt_date(s, "Start", t.stored_start);
-    opt_date(s, "Finish", t.stored_finish);
+    // A scheduled date replaces a stored one; an absent one stays absent.
+    let (start, finish) = match computed.dates {
+        Some((start, finish)) => (
+            t.stored_start.and(Some(start)),
+            t.stored_finish.and(Some(finish)),
+        ),
+        None => (t.stored_start, t.stored_finish),
+    };
+    opt_date(s, "Start", start);
+    opt_date(s, "Finish", finish);
     if task || t.duration_min != 0 {
         tag(s, 3, "Duration", &min_to_iso(t.duration_min));
     }
@@ -4547,6 +4698,251 @@ mod tests {
         &xml[xml.find("<Tasks>").unwrap()..xml.find("</Tasks>").unwrap()]
     }
 
+    /// The written `<Task>` element of task `uid`.
+    fn one_task_xml(xml: &str, uid: i32) -> &str {
+        let at = xml.find(&format!("<UID>{uid}</UID>")).unwrap();
+        &xml[at..at + xml[at..].find("</Task>").unwrap()]
+    }
+
+    /// Issue #343: an auto task read with stale Start/Finish saves the dates
+    /// it is scheduled to, the same as its EarlyStart/EarlyFinish.
+    #[test]
+    fn auto_task_saves_its_scheduled_dates_not_the_stale_stored_ones() {
+        let source = include_str!("../../corpus/mspdi/02-link-fs.xml").replacen(
+            "<Start>2026-03-04T08:00:00</Start><Finish>2026-03-05T17:00:00</Finish>",
+            "<Start>2026-03-11T08:00:00</Start><Finish>2026-03-12T17:00:00</Finish>",
+            1,
+        );
+        let proj = read_mspdi(&source).unwrap();
+        assert_eq!(
+            proj.task(2).unwrap().stored_start,
+            Some(DateTime::from_ymd_hm(2026, 3, 11, 8, 0))
+        );
+        let xml = write_mspdi(&proj);
+        let b = one_task_xml(&xml, 2);
+        assert!(b.contains("<Manual>0</Manual>"), "{b}");
+        for tag in [
+            "<Start>2026-03-04T08:00:00</Start>",
+            "<Finish>2026-03-05T17:00:00</Finish>",
+            "<EarlyStart>2026-03-04T08:00:00</EarlyStart>",
+            "<EarlyFinish>2026-03-05T17:00:00</EarlyFinish>",
+        ] {
+            assert!(b.contains(tag), "{tag} in {b}");
+        }
+    }
+
+    /// A manual task saves the dates it stores even where the schedule puts
+    /// it elsewhere: Project does not reschedule it.
+    #[test]
+    fn manual_task_keeps_its_stored_dates() {
+        let mut proj = task_project("<Task><UID>1</UID><Duration>PT8H0M0S</Duration></Task>");
+        let t = &mut proj.tasks[0];
+        t.manual = true;
+        t.manual_start = Some(DateTime::from_ymd_hm(2026, 3, 11, 8, 0));
+        t.stored_start = Some(DateTime::from_ymd_hm(2026, 3, 9, 8, 0));
+        t.stored_finish = Some(DateTime::from_ymd_hm(2026, 3, 9, 17, 0));
+        let early = crate::schedule::schedule(&proj).get(1).unwrap().early_start;
+        assert_eq!(early, DateTime::from_ymd_hm(2026, 3, 11, 8, 0));
+        let xml = write_mspdi(&proj);
+        let t = one_task_xml(&xml, 1);
+        assert!(t.contains("<Start>2026-03-09T08:00:00</Start>"), "{t}");
+        assert!(t.contains("<Finish>2026-03-09T17:00:00</Finish>"), "{t}");
+    }
+
+    /// A manual task with no start (TBD) gains no Start on save, which would
+    /// pin it there on reload.
+    #[test]
+    fn tbd_manual_task_stays_tbd_through_a_save() {
+        let mut proj = task_project("<Task><UID>1</UID><Duration>PT8H0M0S</Duration></Task>");
+        proj.tasks[0].manual = true;
+        assert!(proj.tasks[0].pinned_dates().is_none());
+        assert!(crate::schedule::schedule(&proj).get(1).is_some());
+        let xml = write_mspdi(&proj);
+        assert!(!one_task_xml(&xml, 1).contains("<Start>"), "{xml}");
+        let back = read_mspdi(&xml).unwrap();
+        assert!(back.tasks[0].manual && back.tasks[0].pinned_dates().is_none());
+    }
+
+    /// An auto summary with nothing scheduled below it spans its own stored
+    /// dates, which the schedule clamps (a Finish before the Start becomes
+    /// the Start): it saves them as read. A blank row keeps what it stores.
+    #[test]
+    fn empty_auto_summary_and_blank_row_keep_their_stored_dates() {
+        let mut proj = task_project(
+            "<Task><UID>1</UID><OutlineLevel>1</OutlineLevel><Summary>1</Summary>             <Start>2026-03-10T08:00:00</Start><Finish>2026-03-05T17:00:00</Finish></Task>             <Task><UID>2</UID><OutlineLevel>2</OutlineLevel><IsNull>1</IsNull></Task>",
+        );
+        proj.tasks[1].stored_start = Some(DateTime::from_ymd_hm(2026, 3, 11, 8, 0));
+        let sched = crate::schedule::schedule(&proj);
+        assert!(proj.tasks[0].summary && proj.tasks[1].is_null);
+        assert!(sched.rolled_up(1).is_none());
+        let r = sched.get(1).unwrap();
+        assert_eq!(r.early_finish, DateTime::from_ymd_hm(2026, 3, 10, 8, 0));
+        let xml = write_mspdi(&proj);
+        let summary = one_task_xml(&xml, 1);
+        assert!(
+            summary.contains("<Start>2026-03-10T08:00:00</Start>"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("<Finish>2026-03-05T17:00:00</Finish>"),
+            "{summary}"
+        );
+        assert!(
+            one_task_xml(&xml, 2).contains("<Start>2026-03-11T08:00:00</Start>"),
+            "{xml}"
+        );
+    }
+
+    /// A resource calendar with Mondays off, unlike Standard.
+    const ALICE_OFF_MONDAYS: &str =
+        "<WeekDays><WeekDay><DayType>2</DayType><DayWorking>0</DayWorking></WeekDay></WeekDays>";
+
+    /// An input Project schedules by and docxy's schedule ignores moves its
+    /// task and, through links, others: a plan with one saves every task's
+    /// dates as Project wrote them. A runs 3/3 and B, FS after it, 3/4, where
+    /// the schedule has them at 3/2 and 3/3. Without such an input the same
+    /// plan saves the schedule's dates.
+    #[test]
+    fn a_plan_with_an_input_the_schedule_ignores_keeps_its_stored_dates() {
+        // (each task's extra elements, B's assignment's extra elements, Alice's
+        // calendar's own elements, whether the plan keeps its dates)
+        let cases = [
+            ("", "", "", false),
+            ("<LevelingDelay>4800</LevelingDelay>", "", "", true),
+            ("", "<LevelingDelay>4800</LevelingDelay>", "", true),
+            ("<LevelingDelay>0</LevelingDelay>", "", "", false),
+            ("<DurationFormat>8</DurationFormat>", "", "", true),
+            ("<DurationFormat>7</DurationFormat>", "", "", false),
+            ("<DurationFormat>39</DurationFormat>", "", "", false),
+            ("<DurationFormat>40</DurationFormat>", "", "", true),
+            ("", "", ALICE_OFF_MONDAYS, true),
+            (
+                "<IgnoreResourceCalendar>1</IgnoreResourceCalendar>",
+                "",
+                ALICE_OFF_MONDAYS,
+                false,
+            ),
+            // Project writes -1 for a task with no calendar of its own: like a
+            // UID naming no calendar, it is the project's, which Alice's
+            // derives from unchanged.
+            ("<CalendarUID>-1</CalendarUID>", "", "", false),
+            ("<CalendarUID>99</CalendarUID>", "", "", false),
+            ("<CalendarUID>-1</CalendarUID>", "", ALICE_OFF_MONDAYS, true),
+        ];
+        let standard = include_str!("../../corpus/mspdi/02-link-fs.xml");
+        let standard = &standard[standard.find("<Calendar>").unwrap()
+            ..standard.find("</Calendar>").unwrap() + "</Calendar>".len()];
+        // A resource CalendarUID naming no calendar (-1, or a missing UID)
+        // gives it none to differ by, whatever Alice's calendar states.
+        let cases = cases
+            .into_iter()
+            .map(|case| (case, "2"))
+            .chain(["-1", "99"].map(|alice_uid| (("", "", ALICE_OFF_MONDAYS, false), alice_uid)));
+        for ((task_extra, assignment_extra, alice_calendar, kept), alice_uid) in cases {
+            let xml = format!(
+                "<Project><StartDate>2026-03-02T08:00:00</StartDate><CalendarUID>1</CalendarUID>
+                <Tasks>
+                <Task><UID>1</UID><Name>A</Name><OutlineLevel>1</OutlineLevel>
+                  <Duration>PT8H0M0S</Duration>{task_extra}
+                  <Start>2026-03-03T08:00:00</Start><Finish>2026-03-03T17:00:00</Finish></Task>
+                <Task><UID>2</UID><Name>B</Name><OutlineLevel>1</OutlineLevel>
+                  <Duration>PT8H0M0S</Duration>{task_extra}
+                  <Start>2026-03-04T08:00:00</Start><Finish>2026-03-04T17:00:00</Finish>
+                  <PredecessorLink><PredecessorUID>1</PredecessorUID><Type>1</Type>
+                  </PredecessorLink></Task>
+                </Tasks>
+                <Resources><Resource><UID>1</UID><Name>Alice</Name><Type>1</Type>
+                  <CalendarUID>{alice_uid}</CalendarUID></Resource></Resources>
+                <Assignments>
+                <Assignment><UID>1</UID><TaskUID>2</TaskUID>
+                  <ResourceUID>1</ResourceUID>{assignment_extra}</Assignment>
+                <Assignment><UID>2</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID>
+                </Assignment></Assignments>
+                <Calendars>{standard}
+                <Calendar><UID>2</UID><Name>Alice</Name><IsBaseCalendar>0</IsBaseCalendar>
+                  <BaseCalendarUID>1</BaseCalendarUID>{alice_calendar}</Calendar></Calendars>
+                </Project>"
+            );
+            let proj = read_mspdi(&xml).unwrap();
+            let sched = crate::schedule::schedule(&proj);
+            let early = |uid| sched.get(uid).unwrap().early_start.to_mspdi();
+            assert_eq!(
+                (early(1), early(2)),
+                ("2026-03-02T08:00:00".into(), "2026-03-03T08:00:00".into()),
+                "{task_extra} {assignment_extra} {alice_calendar} {alice_uid}"
+            );
+            let saved = write_mspdi(&proj);
+            let start = |uid| {
+                let task = one_task_xml(&saved, uid);
+                let at = task.find("<Start>").unwrap() + "<Start>".len();
+                task[at..at + 10].to_string()
+            };
+            let expected = if kept {
+                ("2026-03-03", "2026-03-04")
+            } else {
+                ("2026-03-02", "2026-03-03")
+            };
+            assert_eq!(
+                (start(1).as_str(), start(2).as_str()),
+                expected,
+                "{task_extra} {assignment_extra} {alice_calendar} {alice_uid}"
+            );
+        }
+    }
+
+    /// An assignment Delay moves the assignment within its task, whose
+    /// duration already includes it: the schedule reproduces the task, so a
+    /// stale stored date is still replaced. B runs two days after A, with its
+    /// assignment starting a day late.
+    #[test]
+    fn an_assignment_delay_keeps_the_scheduled_dates() {
+        let source = include_str!("../../corpus/mspdi/02-link-fs.xml")
+            .replacen(
+                "<Start>2026-03-04T08:00:00</Start><Finish>2026-03-05T17:00:00</Finish>",
+                "<Start>2026-03-11T08:00:00</Start><Finish>2026-03-12T17:00:00</Finish>",
+                1,
+            )
+            .replacen(
+                "</Tasks>",
+                "</Tasks><Resources><Resource><UID>1</UID><Name>Alice</Name><Type>1</Type>                 </Resource></Resources><Assignments><Assignment><UID>1</UID>                 <TaskUID>2</TaskUID><ResourceUID>1</ResourceUID><Work>PT8H0M0S</Work>                 <Delay>4800</Delay></Assignment></Assignments>",
+                1,
+            );
+        let proj = read_mspdi(&source).unwrap();
+        assert_eq!(proj.assignments[0].delay, Some(4800));
+        let b = proj.task(2).unwrap();
+        assert_eq!(b.duration_min, 960, "B's duration spans the delay");
+        let xml = write_mspdi(&proj);
+        let b = one_task_xml(&xml, 2);
+        assert!(b.contains("<Start>2026-03-04T08:00:00</Start>"), "{b}");
+        assert!(b.contains("<Finish>2026-03-05T17:00:00</Finish>"), "{b}");
+    }
+
+    /// docxy schedules forward even when a plan is scheduled from its
+    /// finish, so such a plan saves every task's dates as Project wrote them.
+    #[test]
+    fn a_plan_scheduled_from_its_finish_keeps_its_stored_dates() {
+        let source = include_str!("../../corpus/mspdi/02-link-fs.xml")
+            .replacen(
+                "<Start>2026-03-04T08:00:00</Start><Finish>2026-03-05T17:00:00</Finish>",
+                "<Start>2026-03-11T08:00:00</Start><Finish>2026-03-12T17:00:00</Finish>",
+                1,
+            )
+            .replacen(
+                "<Name>link-fs</Name>",
+                "<Name>link-fs</Name><ScheduleFromStart>0</ScheduleFromStart>",
+                1,
+            );
+        let proj = read_mspdi(&source).unwrap();
+        assert_eq!(proj.option("ScheduleFromStart"), Some("0"));
+        let xml = write_mspdi(&proj);
+        let b = one_task_xml(&xml, 2);
+        assert!(b.contains("<Start>2026-03-11T08:00:00</Start>"), "{b}");
+        assert!(
+            b.contains("<EarlyStart>2026-03-04T08:00:00</EarlyStart>"),
+            "{b}"
+        );
+    }
+
     #[test]
     fn task_duration_format_is_read_and_written_back() {
         let proj = read_mspdi(DURATION_FORMATS_PLAN).unwrap();
@@ -4840,6 +5236,7 @@ mod tests {
             &Computed {
                 outline_number: Some("2"),
                 result: sched.get(1),
+                dates: None,
             },
         );
         assert_eq!(
@@ -4978,6 +5375,7 @@ mod tests {
             &Computed {
                 outline_number: Some("2"),
                 result: sched.get(1),
+                dates: None,
             },
         );
         let external_flag = external_xml.find("<ExternalTask>1</ExternalTask>").unwrap();
@@ -4999,6 +5397,7 @@ mod tests {
             &Computed {
                 outline_number: None,
                 result: None,
+                dates: None,
             },
         );
         assert_eq!(
