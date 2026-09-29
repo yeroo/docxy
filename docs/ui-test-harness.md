@@ -598,7 +598,19 @@ Menus open today:
 - **Set Baseline's split menu**: the lower half of Project › Schedule › Set
   Baseline (`Set Baseline...`, `Clear Baseline...`);
 - **the document menu** (Cut, Copy, Paste, Bold, Italic, Underline, New
-  Comment): right-click a document or sheet body. It never opens on a Project.
+  Comment): right-click a document or sheet body. It never opens on a Project;
+- **the Layout tab's drop-downs** on a document (#649): Layout › Page Setup's
+  Margins, Orientation, Size, Columns, Breaks, Line Numbers and Hyphenation. A
+  press anywhere on the button opens its menu, and so does its KeyTip (Alt, P,
+  O opens Orientation; Size is `SZ` and Line Numbers `LN`, which wait for their
+  second letter). `menu-open {"ribbon": ["Layout", "Page Setup", "Margins"]}`
+  opens one. The items follow Word, with its separators and the Breaks menu's
+  `Page Breaks` / `Section Breaks` headings; the current choice is `checked`
+  (the caret section's margins, orientation, size, columns and line numbers,
+  and the document's hyphenation). Line Numbering Options..., Manual and
+  Hyphenation Options... read `enabled: false`. Custom Margins... and More
+  Paper Sizes... open the `page-setup` dialog, and More Columns... the
+  `columns` one.
 
 | Verb | Args | Reply |
 |---|---|---|
@@ -620,8 +632,8 @@ is the ribbon's pressed state (Inactivate Task, the task's mode). Delete Task
 deletes the selected task whatever column the cursor is on; a summary asks
 first, in the `delete-summary` dialog.
 
-A press on a split button's arrow while its own menu is open shuts the menu,
-as in Office; the harness's `menu-open` always opens.
+A press on a split button's arrow or a drop-down button while its own menu is
+open shuts the menu, as in Office; the harness's `menu-open` always opens.
 
 `state` has `menu`: null, or `{target}`. The menu opens at the target's drawn
 position when the last frame drew it, else in the middle of the window; either
