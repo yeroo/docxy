@@ -30,7 +30,7 @@ state. In `--harness` mode only the isolated harness server runs; it also
 accepts the Project verbs. Normal control does not expose harness operations
 such as `open`, `key`, `type`, or `quit`.
 
-Every verb except `proj.open` accepts optional `tab`: an absolute zero-based
+Every verb except `proj.open` and `proj.new` accepts optional `tab`: an absolute zero-based
 index among **all** tabs, or a case-insensitive substring of a Project tab's
 title/path. Omit it to use the active tab. Ambiguous strings, empty strings,
 invalid indices, non-Project targets, and failed-load placeholders are errors.
@@ -40,8 +40,8 @@ Explicit targets do not activate that tab. Task/link arguments use stable
 Supported verbs are `proj.path`, `task.list`, `task.get`, `task.fields`, `task.set`,
 `task.add`, `task.del`, `link.add`, `link.del`, `find`, `assign.list`,
 `assign.get`, `assign.fields`, `assign.add`, `assign.set`, `assign.del`,
-`proj.save`, `proj.reload`, and `proj.open`, with the yppxy argument/result
-shapes. `proj.path` additionally
+`proj.save`, `proj.reload`, `proj.open` and `proj.new`, with the yppxy
+argument/result shapes. `proj.path` additionally
 reports `tab`, `imported`, `cell` (active column name), `cell_row` (zero-based row),
 and `cell_edit` (pending cell buffer, or `null` when closed). Reads and rejected
 edits leave selection, prompts, pending cell edits, history and scroll unchanged.
@@ -163,6 +163,12 @@ File handling differs from the TUI:
   file before changing anything, focuses a loaded same-path tab without
   replacing unsaved content, recovers a same-path placeholder when loading now
   succeeds, or appends a new tab. Activation uses the normal tab lifecycle.
+- `proj.new {}` appends a blank Project tab and activates it through the same
+  handler as the Backstage › New › Project card, so the plan is the app's
+  blank one: `Untitled.yppx`, named `Untitled`, no tasks, no path. It replies
+  with `proj.path` for the new tab. It takes neither `tab` nor `name`; save the
+  plan with `proj.save {"path":"..."}` to give it a file. It is refused while a
+  dialog is open on the active tab.
 
 For example, the repository's CLI sends raw control requests (PowerShell;
 use your explicit config root in place of `$env:APPDATA` when overridden):

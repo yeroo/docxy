@@ -222,6 +222,80 @@ fn selector_distinguishes_indices_paths_ambiguity_and_failed_projects() {
     assert!(resolve_project_tab(&[], 0, None).is_err());
 }
 
+/// `tab-select`'s rule: the same matcher over every tab, with its own noun,
+/// and no "loaded" check — the Inbox and a failed load are clickable chips.
+#[test]
+fn tab_matcher_spans_every_kind_and_selects_placeholders() {
+    let mut tabs = vec![word(), tab(), tab(), new_project_tab(), word()];
+    tabs[1].path = Some(PathBuf::from("alpha/first.xml"));
+    tabs[1].title = "Same.xml".into();
+    tabs[2].path = Some(PathBuf::from("beta/second.xml"));
+    tabs[2].title = "Same.xml".into();
+    tabs[3].surface = Surface::Placeholder;
+    tabs[3].title = "Broken.xml".into();
+    tabs[4].kind = Kind::Look;
+    tabs[4].surface = Surface::Placeholder;
+    tabs[4].title = "Inbox".into();
+    let m = |text: &str| match_tab(&tabs, &args(text), false);
+    assert_eq!(m("0"), Ok(0));
+    assert_eq!(m("\"word\""), Ok(0));
+    assert_eq!(m("\"ALPHA\""), Ok(1));
+    assert_eq!(m("\"second\""), Ok(2));
+    assert_eq!(m("\"broken\""), Ok(3));
+    assert_eq!(m("3"), Ok(3));
+    assert_eq!(m("\"inbox\""), Ok(4));
+    assert_eq!(
+        m("\"same\"").unwrap_err(),
+        "several tabs match 'same' (1, 2)"
+    );
+    assert_eq!(m("\"absent\"").unwrap_err(), "no tab matches 'absent'");
+    assert_eq!(m("9").unwrap_err(), "no tab at index 9");
+    for text in ["-1", "1.5", "null", "true", "[]", "{}", "\"\""] {
+        assert_eq!(
+            m(text).unwrap_err(),
+            "'tab' must be a tab index or a title/path substring",
+            "{text}"
+        );
+    }
+}
+
+/// `proj.new` takes no arguments and replies `proj.path` of a plan built
+/// from the app's defaults (the Backstage › New › Project tab).
+#[test]
+fn new_project_reply_is_the_apps_blank_plan() {
+    assert_eq!(check_new_project_args(&Json::Null), Ok(()));
+    assert_eq!(check_new_project_args(&args("{}")), Ok(()));
+    assert_eq!(
+        check_new_project_args(&args(r#"{"tab":0}"#)).unwrap_err(),
+        "proj.new does not take 'tab'"
+    );
+    assert_eq!(
+        check_new_project_args(&args(r#"{"name":"Plan"}"#)).unwrap_err(),
+        "proj.new does not take 'name'; name the plan with proj.save {\"path\"}"
+    );
+    let tabs = vec![word(), new_project_tab()];
+    assert_eq!(tabs[1].title.as_ref(), "Untitled.yppx");
+    assert!(!tabs[1].dirty);
+    let reply = new_project_reply(&tabs, 1);
+    assert_eq!(reply.get("tab"), Some(&Json::Num(1.)));
+    assert_eq!(reply.get("path"), Some(&Json::Null));
+    assert_eq!(reply.get_str("name"), Some("Untitled"));
+    assert_eq!(reply.get("tasks"), Some(&Json::Num(0.)));
+    assert_eq!(reply.get("modified"), Some(&Json::Bool(false)));
+    assert_eq!(reply.get("imported"), Some(&Json::Bool(false)));
+    let a = projcore::editor::default_anchor().parts();
+    assert_eq!(
+        reply.get_str("start"),
+        Some(
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}",
+                a.year, a.month, a.day, a.hour, a.minute
+            )
+            .as_str()
+        )
+    );
+}
+
 #[test]
 fn reads_and_rejected_edits_preserve_prompt_selection_history_and_scroll() {
     let mut tabs = vec![tab()];

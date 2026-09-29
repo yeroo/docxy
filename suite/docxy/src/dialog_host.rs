@@ -59,6 +59,16 @@ impl Docxy {
             .filter(|d| d.is_open())
     }
 
+    /// Refuse a verb a person could not reach while the active tab has a
+    /// dialog open: its backdrop covers the whole window, title bar and
+    /// ribbon included. Shared by the harness and the Project control server.
+    pub(crate) fn refuse_under_dialog(&self) -> Result<(), String> {
+        match self.active_dialogs().and_then(|d| d.top()) {
+            Some(d) => Err(format!("a dialog is open: {}", d.title)),
+            None => Ok(()),
+        }
+    }
+
     /// Press a button on the active tab's top dialog.
     pub(crate) fn dialog_press(&mut self, button: &str) -> Result<(), String> {
         let tab = self.tabs.get_mut(self.active).ok_or(NONE_OPEN)?;

@@ -12,20 +12,14 @@ pub(crate) struct Effect {
     pub focus: Option<usize>,
 }
 
-pub(crate) fn resolve_project_tab(
-    tabs: &[DocTab],
-    active: usize,
-    arg: Option<&Json>,
-) -> Result<usize, String> {
-    let invalid = || "'tab' must be a tab index or a title/path substring".to_string();
-    let index = match arg {
-        None => {
-            if !tabs.get(active).is_some_and(|t| t.kind == Kind::Project) {
-                return Err("the active tab is not a Project".into());
-            }
-            active
-        }
-        Some(Json::Num(n))
+/// Match a `tab` argument (an index, or a case-insensitive title/path
+/// substring) against the open tabs, Projects only when `project_only`. The
+/// one rule `proj.*` and the harness's `tab-select` share.
+pub(crate) fn match_tab(tabs: &[DocTab], arg: &Json, project_only: bool) -> Result<usize, String> {
+    let noun = if project_only { "Project tab" } else { "tab" };
+    let wanted = |t: &DocTab| !project_only || t.kind == Kind::Project;
+    match arg {
+        Json::Num(n)
             if n.is_finite()
                 && n.fract() == 0.
                 && *n >= 0.
@@ -33,18 +27,18 @@ pub(crate) fn resolve_project_tab(
         {
             let i = *n as usize;
             let tab = tabs.get(i).ok_or_else(|| format!("no tab at index {i}"))?;
-            if tab.kind != Kind::Project {
+            if !wanted(tab) {
                 return Err(format!("tab {i} is not a Project"));
             }
-            i
+            Ok(i)
         }
-        Some(Json::Str(text)) if !text.is_empty() => {
+        Json::Str(text) if !text.is_empty() => {
             let needle = text.to_lowercase();
             let hits: Vec<usize> = tabs
                 .iter()
                 .enumerate()
                 .filter(|(_, t)| {
-                    t.kind == Kind::Project
+                    wanted(t)
                         && (t.title.to_lowercase().contains(&needle)
                             || t.path.as_ref().is_some_and(|p| {
                                 p.to_string_lossy().to_lowercase().contains(&needle)
@@ -53,20 +47,34 @@ pub(crate) fn resolve_project_tab(
                 .map(|(i, _)| i)
                 .collect();
             match hits.as_slice() {
-                [] => return Err(format!("no Project tab matches '{text}'")),
-                [i] => *i,
-                _ => {
-                    return Err(format!(
-                        "several Project tabs match '{text}' ({})",
-                        hits.iter()
-                            .map(usize::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
-                }
+                [] => Err(format!("no {noun} matches '{text}'")),
+                [i] => Ok(*i),
+                _ => Err(format!(
+                    "several {noun}s match '{text}' ({})",
+                    hits.iter()
+                        .map(usize::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
             }
         }
-        _ => return Err(invalid()),
+        _ => Err("'tab' must be a tab index or a title/path substring".into()),
+    }
+}
+
+pub(crate) fn resolve_project_tab(
+    tabs: &[DocTab],
+    active: usize,
+    arg: Option<&Json>,
+) -> Result<usize, String> {
+    let index = match arg {
+        None => {
+            if !tabs.get(active).is_some_and(|t| t.kind == Kind::Project) {
+                return Err("the active tab is not a Project".into());
+            }
+            active
+        }
+        Some(arg) => match_tab(tabs, arg, true)?,
     };
     if !matches!(tabs[index].surface, Surface::Project(_)) {
         return Err("that tab could not be loaded".into());
@@ -86,6 +94,25 @@ fn path_info(tab: &DocTab, index: usize) -> Json {
     fields.push(("imported".into(), Json::Bool(is_imported(tab))));
     fields.extend(project_cell_state(v));
     Json::Obj(fields)
+}
+
+/// `proj.new`'s arguments: none. The blank plan is the app's (Backstage ›
+/// New › Project), so the verb takes nothing that would make it the verb's.
+pub(crate) fn check_new_project_args(args: &Json) -> Result<(), String> {
+    if args.get("tab").is_some() {
+        return Err("proj.new does not take 'tab'".into());
+    }
+    if args.get("name").is_some() {
+        return Err(
+            "proj.new does not take 'name'; name the plan with proj.save {\"path\"}".into(),
+        );
+    }
+    Ok(())
+}
+
+/// `proj.new`'s reply: `proj.path` for the tab it made.
+pub(crate) fn new_project_reply(tabs: &[DocTab], index: usize) -> Json {
+    path_info(&tabs[index], index)
 }
 
 fn loaded_project(path: &Path) -> Result<DocTab, String> {
@@ -362,6 +389,15 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Result<Json, String>> {
+        if verb == "proj.new" {
+            return Some((|| {
+                check_new_project_args(args)?;
+                self.refuse_under_dialog()?;
+                // The Backstage › New › Project card's handler.
+                self.add_tab(Kind::Project, window, cx);
+                Ok(new_project_reply(&self.tabs, self.active))
+            })());
+        }
         // A control client reads and saves the plan: never half-leveled.
         self.flush_project_passes(cx);
         let outcome = project_verb(&mut self.tabs, self.active, verb, args)?;
