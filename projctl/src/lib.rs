@@ -26,7 +26,9 @@
 //! | `find` | `{query, fields?}` | `{count, tasks:[…]}` |
 //!
 //! `fields` is a list of Project field names (`["% Complete", "Baseline1
-//! Finish"]`, matched ignoring ASCII case and surrounding space). Each task
+//! Finish"]`, matched ignoring ASCII case and surrounding space). The verbs
+//! that reply with a task (`task.set`, `task.add`, `link.add`, `link.del`)
+//! take it too, and check it before they edit anything. Each task
 //! then carries `fields: {"<name as asked>": {text, value}}`: `text` as the
 //! sheet shows it (`1 day`, `4 hrs`, `$1,400.00`, `NA`; the Entry columns in
 //! the grid's own spellings, `2d`), `value` underneath: dates
@@ -309,18 +311,25 @@ fn task_index(ed: &Editor, uid: i32) -> Result<usize, String> {
 fn task_get(ed: &Editor, args: &Json) -> Result<Json, String> {
     let uid = uid_arg(args, "uid")?;
     let asked = fields_arg(args)?;
+    task_reply(ed, uid, asked.as_deref())
+}
+
+/// Task `uid` as a read or an edit replies with it, with the fields asked
+/// for. An edit resolves `fields` before it changes anything, so a bad list
+/// is rejected with the editor untouched.
+fn task_reply(ed: &Editor, uid: i32, asked: Option<&[(String, Field)]>) -> Result<Json, String> {
     let i = task_index(ed, uid)?;
-    let reader = FieldReader::new(ed);
     Ok(task_json(
         ed,
-        &reader,
+        &FieldReader::new(ed),
         &ed.project().tasks[i],
-        asked.as_deref(),
+        asked,
     ))
 }
 
 fn task_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
     let uid = uid_arg(args, "uid")?;
+    let asked = fields_arg(args)?;
     let duration = args
         .get_str("duration")
         .map(|d| {
@@ -351,7 +360,7 @@ fn task_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
             duration_format: duration.and_then(|d| duration_format_code(d.2)),
         },
     )?;
-    task_get(ed, args)
+    task_reply(ed, uid, asked.as_deref())
 }
 
 fn task_add(ed: &mut Editor, args: &Json) -> Result<Json, String> {
@@ -359,6 +368,7 @@ fn task_add(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         .get("after")
         .map(|_| uid_arg(args, "after"))
         .transpose()?;
+    let asked = fields_arg(args)?;
     let (duration_min, estimated, unit) = match args.get_str("duration") {
         Some(d) => parse_task_duration_unit(d, ed.project())
             .ok_or_else(|| format!("Couldn't read duration '{d}' ({DURATION_HINT})"))?,
@@ -373,12 +383,7 @@ fn task_add(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         ed.set_duration_typed(uid, duration_min, estimated, unit)?;
         Ok(at)
     })?;
-    Ok(task_json(
-        ed,
-        &FieldReader::new(ed),
-        &ed.project().tasks[at],
-        None,
-    ))
+    task_reply(ed, ed.project().tasks[at].uid, asked.as_deref())
 }
 
 fn task_del(ed: &mut Editor, args: &Json) -> Result<Json, String> {
@@ -396,6 +401,7 @@ fn task_del(ed: &mut Editor, args: &Json) -> Result<Json, String> {
 fn link_add(ed: &mut Editor, args: &Json) -> Result<Json, String> {
     let uid = uid_arg(args, "uid")?;
     let pred = uid_arg(args, "pred")?;
+    let asked = fields_arg(args)?;
     let link = match args.get_str("type") {
         Some(t) => parse_link_name(t).ok_or("'type' must be FS, SS, FF, or SF")?,
         None => LinkType::FinishStart,
@@ -418,12 +424,14 @@ fn link_add(ed: &mut Editor, args: &Json) -> Result<Json, String> {
             ..Predecessor::fs(pred)
         },
     )?;
-    task_get(ed, args)
+    task_reply(ed, uid, asked.as_deref())
 }
 
 fn link_del(ed: &mut Editor, args: &Json) -> Result<Json, String> {
-    ed.remove_predecessor(uid_arg(args, "uid")?, uid_arg(args, "pred")?)?;
-    task_get(ed, args)
+    let uid = uid_arg(args, "uid")?;
+    let asked = fields_arg(args)?;
+    ed.remove_predecessor(uid, uid_arg(args, "pred")?)?;
+    task_reply(ed, uid, asked.as_deref())
 }
 
 #[cfg(test)]
@@ -1079,6 +1087,66 @@ mod tests {
             other => panic!("{other:?}"),
         };
         assert_eq!(read, listed.len());
+    }
+
+    #[test]
+    fn a_bad_field_list_rejects_an_edit_before_it_changes_anything() {
+        let mut ed = app();
+        let second = add(&mut ed, "Second", "1d");
+        let third = add(&mut ed, "Third", "1d");
+        ed.add_predecessor(second as i32, 1, LinkType::FinishStart, 0)
+            .unwrap();
+        ed.rename(1, "Change").unwrap();
+        ed.undo();
+        ed.mark_saved();
+        let before = ed.project().clone();
+        let edits = [
+            (
+                "task.set",
+                vec![("uid", Json::Num(1.0)), ("name", Json::Str("X".into()))],
+            ),
+            ("task.add", vec![("name", Json::Str("Y".into()))]),
+            (
+                "link.add",
+                vec![("uid", Json::Num(third as f64)), ("pred", Json::Num(1.0))],
+            ),
+            (
+                "link.del",
+                vec![("uid", Json::Num(second as f64)), ("pred", Json::Num(1.0))],
+            ),
+        ];
+        for (verb, extra) in edits {
+            for bad in [names(&["Name", "Status"]), Json::Str("x".into())] {
+                let mut args = extra.clone();
+                args.push(("fields", bad));
+                assert!(call(&mut ed, verb, args).is_err(), "{verb}");
+                assert_eq!(ed.project(), &before, "{verb}");
+                assert_eq!((ed.undo_depth(), ed.redo_depth()), (3, 1), "{verb}");
+                assert!(!ed.dirty(), "{verb}");
+            }
+        }
+        // A good list comes back on the edit's reply.
+        let r = call(
+            &mut ed,
+            "task.add",
+            vec![
+                ("name", Json::Str("Z".into())),
+                ("fields", names(&["Name", "Outline Number"])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(field(&r, "Name"), ("Z", &Json::Str("Z".into())));
+        let r = call(
+            &mut ed,
+            "link.add",
+            vec![
+                ("uid", Json::Num(third as f64)),
+                ("pred", Json::Num(1.0)),
+                ("fields", names(&["Predecessors"])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(field(&r, "Predecessors").0, "1");
     }
 
     #[test]
