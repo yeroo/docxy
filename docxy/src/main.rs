@@ -3226,6 +3226,10 @@ impl App {
         };
         if commit && changed {
             let tag = if hf.is_header { "w:hdr" } else { "w:ftr" };
+            // Links need relationships in the part's own rels; they are
+            // computed first (the ids go into the XML) but written only with it.
+            let mut blocks = blocks;
+            let rels = self.pkg.link_part_hyperlinks(&hf.part, &mut blocks);
             // Decode the part as the loader does (it may be UTF-16), and write
             // it back in its own encoding; a part whose wrapper can't be found
             // is left alone rather than overwritten.
@@ -3236,6 +3240,9 @@ impl App {
             match spliced {
                 Some(new_xml) => {
                     self.pkg.set_part_text(&hf.part, &new_xml);
+                    if let Some(rels) = rels {
+                        self.pkg.apply_part_rels(rels);
+                    }
                     let rc = Rc::new(blocks);
                     if hf.is_header {
                         self.headers.default = rc;
@@ -9240,6 +9247,72 @@ mod tests {
             status.contains("Couldn't write the header edit"),
             "{status}"
         );
+    }
+
+    #[test]
+    fn header_edit_links_get_header_relationships() {
+        use docxcore::model::Hyperlink;
+        let hl = |url: &str, rel_id: Option<&str>, raw: Option<String>| {
+            Inline::Hyperlink(Hyperlink {
+                target: Some(url.to_string()),
+                rel_id: rel_id.map(str::to_string),
+                runs: vec![Run {
+                    text: url.to_string(),
+                    props: RunProps::default(),
+                }],
+                raw,
+                ..Hyperlink::default()
+            })
+        };
+        let mut app = app_with(&["body"]);
+        app.run_act(ribbon::Act::EditHeader);
+        let part = app.header_part.clone().expect("header part created");
+        // Paste Special > Hyperlink (no id) and a Keep Source paste of a body
+        // link (the body's id, with its preserved markup).
+        let pasted = r#"<w:hyperlink r:id="rId42" w:tooltip="tip"><w:r><w:t>https://b.example/</w:t></w:r></w:hyperlink>"#;
+        app.editor.doc.body = vec![Block::Paragraph(MPara {
+            props: ParProps::default(),
+            content: vec![
+                hl("https://a.example/", None, None),
+                hl(
+                    "https://b.example/",
+                    Some("rId42"),
+                    Some(pasted.to_string()),
+                ),
+            ],
+        })];
+        app.on_key(key(KeyCode::F(6)));
+        assert!(app.hf_edit.is_none());
+
+        let rels_name = part.replace("word/", "word/_rels/") + ".rels";
+        let rels = parse_rels_xml(&app.pkg.part_text(&rels_name).expect("header rels"));
+        let xml = app.pkg.part_text(&part).unwrap();
+        assert!(!xml.contains("rId42"), "{xml}");
+        assert!(xml.contains(r#"w:tooltip="tip""#), "{xml}");
+
+        // Saved and reopened, both links keep their URLs, and print as links.
+        let saved = load_package(&save_package(&app.pkg)).expect("reload");
+        let blocks = saved.header_footer_blocks(&part).expect("header blocks");
+        let Block::Paragraph(p) = &blocks[0] else {
+            panic!("{blocks:?}")
+        };
+        let targets: Vec<_> = p
+            .content
+            .iter()
+            .filter_map(|inl| match inl {
+                Inline::Hyperlink(h) => {
+                    let id = h.rel_id.as_deref().expect("an id");
+                    assert_eq!(rels.target(id), h.target.as_deref());
+                    h.target.clone()
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(targets, ["https://a.example/", "https://b.example/"]);
+        let opts = PdfOptions::from_package(&saved, app.styles.clone());
+        let pdf = String::from_utf8_lossy(&to_pdf(&saved.document, &opts)).into_owned();
+        assert!(pdf.contains("/URI (https://a.example/)"), "{pdf}");
+        assert!(pdf.contains("/URI (https://b.example/)"));
     }
 
     #[test]

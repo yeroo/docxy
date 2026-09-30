@@ -11,7 +11,9 @@
 //! section breaks, comments anchors — is not reconstructed by the serializer and
 //! is dropped on save. Full raw-node preservation is a later refinement.
 
-use crate::load::{LoadError, Relationships, parse_document_xml, parse_rels_xml};
+use crate::load::{
+    LoadError, Relationships, parse_document_xml, parse_rels_xml, start_tags, xml_attr_value,
+};
 use crate::model::{Block, Document, PropertyScope, SectionProperties};
 use crate::serialize::document_to_xml;
 use crate::xml::{Event, XmlParser};
@@ -212,6 +214,18 @@ pub struct TextWatermark {
     /// The text path's `font-size` in points; `None` when absent or `1pt`,
     /// which is how Word writes "Auto".
     pub font_size_pt: Option<f32>,
+}
+
+/// The relationship changes an edited header or footer part needs for its
+/// hyperlinks, computed by [`Package::link_part_hyperlinks`] and written by
+/// [`Package::apply_part_rels`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartRelsUpdate {
+    rels_name: String,
+    rels: Vec<u8>,
+    /// `[Content_Types].xml` with a `rels` Default added, when it lacked one
+    /// and the rels part is new.
+    content_types: Option<Vec<u8>>,
 }
 
 /// Relationship and section metadata describing where a watermark applies.
@@ -1124,6 +1138,114 @@ impl Package {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Give every external hyperlink in `blocks`, the new content of header or
+    /// footer `part`, a relationship in the part's own `_rels`: links created
+    /// in the editor have none, and a link pasted from the body keeps the
+    /// body's id, which means nothing (or something else) in the part's rels.
+    /// A link whose id already names an external relationship to its target
+    /// is left as is. Each other link gets a fresh `rIdN`, set as its
+    /// `rel_id` and written into its preserved opening tag, so its other
+    /// attributes (tooltip, target frame) survive.
+    ///
+    /// The package isn't changed: the returned update, `None` when no link
+    /// needed one, is written with [`Package::apply_part_rels`] once the part
+    /// itself has been written.
+    pub fn link_part_hyperlinks(
+        &self,
+        part: &str,
+        blocks: &mut [crate::model::Block],
+    ) -> Option<PartRelsUpdate> {
+        let rels_name = part_rels_name(part)?;
+        let existing = self.part(&rels_name);
+        let text = match existing {
+            Some(bytes) => decode_xml_part(bytes)?.into_owned(),
+            None => format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"{PKG_RELS_NS}\"></Relationships>"
+            ),
+        };
+        let rels = parse_rels_xml(&text);
+        let mut links = Vec::new();
+        collect_external_links(blocks, &mut links);
+        let mut next = next_rid_num(&text);
+        let mut added = String::new();
+        for h in links {
+            let target = h.target.clone().unwrap_or_default();
+            let linked = h.rel_id.as_deref().is_some_and(|id| {
+                rels.iter()
+                    .any(|(rid, t, external)| rid == id && t == target && external)
+            });
+            if linked {
+                continue;
+            }
+            let rid = format!("rId{next}");
+            next += 1;
+            added.push_str(&format!(
+                "<Relationship Id=\"{rid}\" Type=\"{HYPERLINK_REL}\" Target=\"{}\" TargetMode=\"External\"/>",
+                esc_xml_attr(&target)
+            ));
+            if let Some(raw) = &mut h.raw {
+                *raw = with_opener_rel_id(raw, &rid);
+            }
+            h.rel_id = Some(rid);
+        }
+        if added.is_empty() {
+            return None;
+        }
+        let updated = append_relationships(&text, &added)?;
+        let rels = match existing {
+            Some(bytes) => encode_like(bytes, &updated),
+            None => updated.into_bytes(),
+        };
+        let content_types = if existing.is_none() {
+            self.content_types_with_rels_default()
+        } else {
+            None
+        };
+        Some(PartRelsUpdate {
+            rels_name,
+            rels,
+            content_types,
+        })
+    }
+
+    /// `[Content_Types].xml` with a `rels` Default added, or `None` when it
+    /// already has one (or can't be read).
+    fn content_types_with_rels_default(&self) -> Option<Vec<u8>> {
+        let bytes = self.part("[Content_Types].xml")?;
+        let xml = decode_xml_part(bytes)?;
+        let has_default = start_tags(&xml, "Default").into_iter().any(|(_, el)| {
+            xml_attr_value(el, "Extension").is_some_and(|ext| ext.eq_ignore_ascii_case("rels"))
+        });
+        if has_default {
+            return None;
+        }
+        let default = "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>";
+        let (start, el) = start_tags(&xml, "Types").into_iter().next()?;
+        let at = start + el.len();
+        let updated = if el.ends_with("/>") {
+            format!("{}>{default}</Types>{}", &xml[..at - 2], &xml[at..])
+        } else {
+            format!("{}{default}{}", &xml[..at], &xml[at..])
+        };
+        Some(encode_like(bytes, &updated))
+    }
+
+    /// Write a [`Package::link_part_hyperlinks`] update: the part's rels
+    /// (created when new) and the content types.
+    pub fn apply_part_rels(&mut self, update: PartRelsUpdate) {
+        let PartRelsUpdate {
+            rels_name,
+            rels,
+            content_types,
+        } = update;
+        if !self.set_part(&rels_name, rels.clone()) {
+            self.parts.push((rels_name, rels));
+        }
+        if let Some(ct) = content_types {
+            self.set_part("[Content_Types].xml", ct);
         }
     }
 
@@ -2352,6 +2474,76 @@ fn next_rid_num(rels: &str) -> u32 {
         i = s;
     }
     max + 1
+}
+
+const PKG_RELS_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+const HYPERLINK_REL: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink";
+
+/// `rels` (a Relationships part's text) with `added` relationships appended to
+/// its root, or `None` without a `Relationships` root.
+fn append_relationships(rels: &str, added: &str) -> Option<String> {
+    if let Some(close) = rels.rfind("</Relationships>") {
+        return Some(format!("{}{added}{}", &rels[..close], &rels[close..]));
+    }
+    let (start, el) = start_tags(rels, "Relationships").into_iter().next()?;
+    let at = start + el.len();
+    el.ends_with("/>")
+        .then(|| format!("{}>{added}</Relationships>{}", &rels[..at - 2], &rels[at..]))
+}
+
+/// A preserved `<w:hyperlink …>` element with its opening tag's `r:id` set to
+/// `rid` (added when it had none); its children are untouched.
+fn with_opener_rel_id(raw: &str, rid: &str) -> String {
+    let mut parser = XmlParser::new(raw);
+    if parser.next() != Event::Start || parser.name() != "w:hyperlink" {
+        return raw.to_string();
+    }
+    let end = parser.pos();
+    let opener = &raw[..end];
+    let value_at = [" r:id=\"", " r:id='"].iter().find_map(|key| {
+        opener
+            .find(key)
+            .map(|i| (i + key.len(), &key[key.len() - 1..]))
+    });
+    let opener = match value_at {
+        Some((start, quote)) => {
+            let len = opener[start..].find(quote).unwrap_or(0);
+            format!("{}{rid}{}", &opener[..start], &opener[start + len..])
+        }
+        None => opener.replacen("<w:hyperlink", &format!("<w:hyperlink r:id=\"{rid}\""), 1),
+    };
+    format!("{opener}{}", &raw[end..])
+}
+
+/// Collect `&mut` references to every external hyperlink (`target` set),
+/// walking paragraphs and table cells recursively.
+fn collect_external_links<'a>(
+    blocks: &'a mut [crate::model::Block],
+    out: &mut Vec<&'a mut crate::model::Hyperlink>,
+) {
+    use crate::model::{Block, Inline};
+    for b in blocks {
+        match b {
+            Block::Paragraph(p) => {
+                for inl in &mut p.content {
+                    if let Inline::Hyperlink(h) = inl
+                        && h.target.is_some()
+                    {
+                        out.push(h);
+                    }
+                }
+            }
+            Block::Table(t) => {
+                for row in &mut t.rows {
+                    for cell in &mut row.cells {
+                        collect_external_links(&mut cell.blocks, out);
+                    }
+                }
+            }
+            Block::SectionProperties(_) | Block::Raw(_) => {}
+        }
+    }
 }
 
 /// Collect `&mut` references to every external hyperlink (`target` set) that has
@@ -4137,5 +4329,175 @@ mod tests {
         );
         assert!(!pkg.set_part_text("word/missing.xml", "x"));
         assert_eq!(pkg.part_text("word/missing.xml"), None);
+    }
+
+    fn link(target: Option<&str>, rel_id: Option<&str>, raw: Option<&str>) -> crate::model::Inline {
+        crate::model::Inline::Hyperlink(crate::model::Hyperlink {
+            target: target.map(str::to_string),
+            anchor: target.is_none().then(|| "bm".to_string()),
+            rel_id: rel_id.map(str::to_string),
+            runs: vec![crate::model::Run {
+                text: "link".to_string(),
+                props: Default::default(),
+            }],
+            raw: raw.map(str::to_string),
+            ..Default::default()
+        })
+    }
+
+    fn link_blocks(links: Vec<crate::model::Inline>) -> Vec<Block> {
+        vec![Block::Paragraph(crate::model::Paragraph {
+            props: Default::default(),
+            content: links,
+        })]
+    }
+
+    fn rel_ids(blocks: &[Block]) -> Vec<Option<String>> {
+        let Block::Paragraph(p) = &blocks[0] else {
+            panic!()
+        };
+        p.content
+            .iter()
+            .map(|inl| match inl {
+                crate::model::Inline::Hyperlink(h) => h.rel_id.clone(),
+                _ => panic!(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn link_part_hyperlinks_mints_rels_and_creates_part() {
+        let mut pkg = new_package(Document::default());
+        pkg.parts
+            .push(("word/header1.xml".to_string(), b"<w:hdr/>".to_vec()));
+        let mut blocks = link_blocks(vec![
+            link(Some("https://a.example/?x=1&y=2"), None, None),
+            link(None, None, None),
+        ]);
+        let before = pkg.clone();
+        let update = pkg
+            .link_part_hyperlinks("word/header1.xml", &mut blocks)
+            .expect("a link needs a relationship");
+        assert_eq!(pkg.parts, before.parts, "computing changes nothing");
+        assert_eq!(rel_ids(&blocks), [Some("rId1".to_string()), None]);
+        assert_eq!(
+            update.content_types, None,
+            "new packages have the rels Default"
+        );
+        pkg.apply_part_rels(update);
+        let rels = pkg
+            .part_text("word/_rels/header1.xml.rels")
+            .expect("rels created");
+        assert!(
+            rels.starts_with("<?xml") && rels.contains(PKG_RELS_NS),
+            "{rels}"
+        );
+        assert!(
+            rels.contains(r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://a.example/?x=1&amp;y=2" TargetMode="External"/>"#),
+            "{rels}"
+        );
+        assert_eq!(
+            parse_rels_xml(&rels).target("rId1"),
+            Some("https://a.example/?x=1&y=2")
+        );
+        // Nothing left to link: no update.
+        assert_eq!(
+            pkg.link_part_hyperlinks("word/header1.xml", &mut blocks),
+            None
+        );
+    }
+
+    #[test]
+    fn link_part_hyperlinks_remints_foreign_rel_id() {
+        let mut pkg = new_package(Document::default());
+        let rels = r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId3" Type="h" Target="https://b.example/" TargetMode="External"/><Relationship Id="rId7" Type="i" Target="media/image1.png"/></Relationships>"#;
+        let mut utf16 = vec![0xff, 0xfe];
+        for unit in rels.encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        pkg.parts
+            .push(("word/_rels/header1.xml.rels".to_string(), utf16));
+        let pasted = r#"<w:hyperlink r:id="rId5" w:tooltip="t" w:history="1"><w:r><w:t>link</w:t></w:r></w:hyperlink>"#;
+        let mut blocks = link_blocks(vec![
+            // Already linked to its target in this part: kept.
+            link(Some("https://b.example/"), Some("rId3"), None),
+            // A body id that means nothing here, with preserved markup.
+            link(Some("https://c.example/"), Some("rId5"), Some(pasted)),
+            // An id naming something else here.
+            link(Some("https://d.example/"), Some("rId7"), None),
+        ]);
+        let update = pkg
+            .link_part_hyperlinks("word/header1.xml", &mut blocks)
+            .unwrap();
+        pkg.apply_part_rels(update);
+        assert_eq!(
+            rel_ids(&blocks),
+            [
+                Some("rId3".to_string()),
+                Some("rId8".to_string()),
+                Some("rId9".to_string())
+            ]
+        );
+        let bytes = pkg.part("word/_rels/header1.xml.rels").unwrap();
+        assert!(
+            bytes.starts_with(&[0xff, 0xfe]),
+            "the rels part keeps its encoding"
+        );
+        let parsed = parse_rels_xml(&pkg.part_text("word/_rels/header1.xml.rels").unwrap());
+        assert_eq!(parsed.target("rId8"), Some("https://c.example/"));
+        assert_eq!(parsed.target("rId9"), Some("https://d.example/"));
+        assert_eq!(parsed.target("rId7"), Some("media/image1.png"));
+        let xml = crate::serialize::blocks_to_xml(&blocks);
+        assert!(
+            xml.contains(r#"<w:hyperlink r:id="rId8" w:tooltip="t" w:history="1">"#),
+            "{xml}"
+        );
+        assert!(
+            !xml.contains("rId5") && xml.contains(r#"r:id="rId9""#),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn with_opener_rel_id_sets_or_adds_the_id() {
+        assert_eq!(
+            with_opener_rel_id(
+                r#"<w:hyperlink w:anchor="a" r:id='x'><w:r/></w:hyperlink>"#,
+                "rId2"
+            ),
+            r#"<w:hyperlink w:anchor="a" r:id='rId2'><w:r/></w:hyperlink>"#
+        );
+        assert_eq!(
+            with_opener_rel_id(
+                r#"<w:hyperlink w:tooltip="t"><w:r r:id="keep"/></w:hyperlink>"#,
+                "rId2"
+            ),
+            r#"<w:hyperlink r:id="rId2" w:tooltip="t"><w:r r:id="keep"/></w:hyperlink>"#
+        );
+    }
+
+    #[test]
+    fn a_header_rels_part_adds_the_rels_default_when_missing() {
+        let bytes = make_metadata_docx(BODY, None, None, &[("header1.xml", "<w:hdr/>")]);
+        let mut pkg = load_package(&bytes).unwrap();
+        let mut blocks = link_blocks(vec![link(Some("https://a.example/"), None, None)]);
+        let update = pkg
+            .link_part_hyperlinks("word/header1.xml", &mut blocks)
+            .unwrap();
+        assert!(update.content_types.is_some());
+        pkg.apply_part_rels(update);
+        let ct = pkg.part_text("[Content_Types].xml").unwrap();
+        assert!(
+            ct.contains(r#"<Types><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/></Types>"#),
+            "{ct}"
+        );
+        // Once there, it isn't added again.
+        pkg.parts
+            .retain(|(n, _)| n != "word/_rels/header1.xml.rels");
+        let mut blocks = link_blocks(vec![link(Some("https://a.example/"), None, None)]);
+        let update = pkg
+            .link_part_hyperlinks("word/header1.xml", &mut blocks)
+            .unwrap();
+        assert_eq!(update.content_types, None);
     }
 }
