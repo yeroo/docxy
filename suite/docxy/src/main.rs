@@ -41,6 +41,7 @@ mod sect_pr_tests;
 mod sheet_entry_tests;
 mod sheet_ribbon;
 mod style_gallery;
+mod table_view;
 mod tabstrip;
 use project::*;
 
@@ -1993,6 +1994,9 @@ struct Docxy {
     page_view: bool,
     // Horizontal ruler with margin/indent/tab markers (View ▸ Ruler).
     show_ruler: bool,
+    /// Table > View Gridlines: dashed guides on borderless table edges. A view
+    /// setting, never saved into the document (on by default, as in Word).
+    view_gridlines: bool,
     // In-progress drag of a ruler marker.
     ruler_drag: Option<RulerDrag>,
     // The tab-stop type placed when clicking the ruler (cycled via the corner box).
@@ -3487,6 +3491,41 @@ struct RenderCtx<'a> {
     /// Content width (px) when rendering header/footer paragraphs, enabling the
     /// implicit centre/right tab stops. `None` for body paragraphs.
     hf_width: Option<f32>,
+    /// Table styles and view settings for drawing tables.
+    tbl: &'a TableCtx<'a>,
+    /// The story's cell-range selection, highlighted cell by cell.
+    cell_range: Option<&'a docxcore::editor::CellRange>,
+}
+
+/// What drawing a table needs beyond the table: the package's styles part
+/// (table styles resolve from it, then from docxcore's built-in set), each
+/// style parsed once per frame, and whether borderless edges show gridlines.
+struct TableCtx<'a> {
+    styles_xml: Option<&'a str>,
+    cache: std::cell::RefCell<
+        std::collections::HashMap<String, Option<docxcore::table_styles::TableStyle>>,
+    >,
+    gridlines: bool,
+}
+
+impl<'a> TableCtx<'a> {
+    fn new(pkg: Option<&'a Package>, gridlines: bool) -> Self {
+        TableCtx {
+            styles_xml: pkg
+                .and_then(|p| p.part("word/styles.xml"))
+                .and_then(|b| std::str::from_utf8(b).ok()),
+            cache: Default::default(),
+            gridlines,
+        }
+    }
+
+    fn style(&self, id: &str) -> Option<docxcore::table_styles::TableStyle> {
+        self.cache
+            .borrow_mut()
+            .entry(id.to_string())
+            .or_insert_with(|| docxcore::table_styles::lookup_style(self.styles_xml, id))
+            .clone()
+    }
 }
 
 /// Colours the document renderer needs, pulled from the active theme.
@@ -6554,6 +6593,7 @@ impl Docxy {
             show_notes: false,
             page_view: false,
             show_ruler: false,
+            view_gridlines: true,
             ruler_drag: None,
             ruler_tab: docxcore::model::TabAlign::Left,
             ruler_probe: std::rc::Rc::new(std::cell::RefCell::new(RulerProbe::default())),
@@ -13314,6 +13354,43 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
+    /// A click on a table's selection zones: select the cell, the row or the
+    /// column in the edited story (see `table_el`).
+    fn table_click(
+        &mut self,
+        table: &[usize],
+        what: TableClick,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ed) = self.edit_target() else {
+            return;
+        };
+        match what {
+            TableClick::Cell(r, c) => {
+                ed.select_cell_content(table, r, c);
+            }
+            TableClick::Row(r) => {
+                if ed.select_cell_content(table, r, 0) {
+                    let _ = ed.select_row();
+                }
+            }
+            TableClick::Column(col) => {
+                let first = ed.table(table).and_then(|t| {
+                    let map = docxcore::table::GridMap::of(t);
+                    (0..t.rows.len()).find_map(|r| map.rows[r].cell_at(col).map(|c| (r, c)))
+                });
+                if let Some((r, c)) = first {
+                    if ed.select_cell_content(table, r, c) {
+                        let _ = ed.select_column();
+                    }
+                }
+            }
+        }
+        self.refocus(window, cx);
+        cx.notify();
+    }
+
     /// Insert a `rows`×`cols` table at the caret of the edited story as one
     /// undo step (docxcore's Insert Table), and move the caret into its first
     /// cell.
@@ -17819,35 +17896,207 @@ fn paragraph_el(
         .into_any_element()
 }
 
+/// Where a click on a table's selection zones selects (#647).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TableClick {
+    /// A cell's left edge: that cell.
+    Cell(usize, usize),
+    /// Left of a row: the row.
+    Row(usize),
+    /// Above a column: the grid column.
+    Column(usize),
+}
+
+/// Draw a table: cells sized from the grid, spans and vertical merges laid
+/// out, fills, borders (per side and colour), diagonals and vertical
+/// alignment from `table_view::layout`, the selected cells highlighted, and
+/// dashed gridlines on borderless edges when View Gridlines is on. The left
+/// edge of a cell, the strip left of a row and the strip above the first row
+/// select a cell, row or column.
 fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
+    use docxcore::table_props::VAlign;
+    let style = docxcore::table::table_props(t)
+        .attr("w:tblStyle", "w:val")
+        .and_then(|id| ctx.tbl.style(&id));
+    let boxes = table_view::layout(t, style.as_ref());
+    let selected: Vec<(usize, usize)> = ctx
+        .cell_range
+        .filter(|r| r.table.as_slice() == path)
+        .map(|r| r.cells(&docxcore::table::GridMap::of(t)))
+        .unwrap_or_default();
+    let zoom = ctx.zoom;
+    let w = |tw: u32| px(tw_px(tw as i32, zoom));
+    let fg = ctx.pal.fg;
+    let grid_color = hsla_u(0x9fb8e0);
+    let click = |what: TableClick| {
+        let ent = ctx.ent.clone();
+        let path = path.to_vec();
+        move |_: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+            cx.stop_propagation();
+            ent.update(cx, |this, cx| this.table_click(&path, what, window, cx));
+        }
+    };
     let mut rows = Vec::new();
-    for (ri, row) in t.rows.iter().enumerate() {
-        let mut cells = Vec::new();
-        for (ci, cell) in row.cells.iter().enumerate() {
-            let inner: Vec<AnyElement> = cell
-                .blocks
-                .iter()
-                .enumerate()
-                .map(|(k, b)| {
-                    let mut cp = path.to_vec();
-                    cp.extend_from_slice(&[ri, ci, k]);
-                    block_el(b, cp, None, ctx)
+    for (ri, rb) in boxes.iter().enumerate() {
+        let row = &t.rows[ri];
+        let mut cells: Vec<AnyElement> = Vec::new();
+        if rb.before > 0 {
+            cells.push(div().flex_none().w(w(rb.before)).into_any_element());
+        }
+        for cb in &rb.cells {
+            let cell = &row.cells[cb.cell];
+            let inner: Vec<AnyElement> = if cb.continues {
+                Vec::new()
+            } else {
+                cell.blocks
+                    .iter()
+                    .enumerate()
+                    .map(|(k, b)| {
+                        let mut cp = path.to_vec();
+                        cp.extend_from_slice(&[ri, cb.cell, k]);
+                        block_el(b, cp, None, ctx)
+                    })
+                    .collect()
+            };
+            // One absolutely placed line per side, so each side keeps its own
+            // colour and thickness.
+            let side = |which: u8, l: Option<table_view::Line>| -> Option<AnyElement> {
+                let placed = |d: Div, thick: Pixels| match which {
+                    0 => d.top_0().left_0().right_0().h(thick),
+                    1 => d.bottom_0().left_0().right_0().h(thick),
+                    2 => d.top_0().bottom_0().left_0().w(thick),
+                    _ => d.top_0().bottom_0().right_0().w(thick),
+                };
+                match l {
+                    Some(l) => Some(
+                        placed(div().absolute(), px((l.width * zoom).max(1.0)))
+                            .bg(l.color.map_or(fg, hsla_u))
+                            .into_any_element(),
+                    ),
+                    None if ctx.tbl.gridlines => {
+                        let d = placed(div().absolute(), px(0.))
+                            .border_dashed()
+                            .border_color(grid_color);
+                        let d = match which {
+                            0 => d.border_t_1(),
+                            1 => d.border_b_1(),
+                            2 => d.border_l_1(),
+                            _ => d.border_r_1(),
+                        };
+                        Some(d.into_any_element())
+                    }
+                    None => None,
+                }
+            };
+            let edges: Vec<AnyElement> = [
+                side(0, cb.top),
+                side(1, cb.bottom),
+                side(2, cb.left),
+                side(3, cb.right),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let diagonals = (cb.diag_down.is_some() || cb.diag_up.is_some()).then(|| {
+                let (down, up) = (cb.diag_down, cb.diag_up);
+                canvas(
+                    |_, _, _| {},
+                    move |b, _, window, _| {
+                        let o = b.origin;
+                        let (x1, y1) = (o.x + b.size.width, o.y + b.size.height);
+                        for (l, from, to) in [
+                            (down, o, point(x1, y1)),
+                            (up, point(x1, o.y), point(o.x, y1)),
+                        ] {
+                            let Some(l) = l else { continue };
+                            let mut pb = PathBuilder::stroke(px((l.width * zoom).max(1.0)));
+                            pb.move_to(from);
+                            pb.line_to(to);
+                            if let Ok(path) = pb.build() {
+                                window.paint_path(path, l.color.map_or(fg, hsla_u));
+                            }
+                        }
+                    },
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .into_any_element()
+            });
+            let is_selected = selected.contains(&(ri, cb.cell));
+            let sel_bg = Hsla {
+                a: 0.25,
+                ..ctx.pal.sel
+            };
+            let mut el = v_flex()
+                .relative()
+                .flex_none()
+                .w(w(cb.width))
+                .px(px(7.2 * zoom))
+                .py_0p5()
+                .when_some(cb.fill, |d, f| d.bg(hsla_u(f)))
+                .map(|d| match cb.valign {
+                    VAlign::Top => d.justify_start(),
+                    VAlign::Center => d.justify_center(),
+                    VAlign::Bottom => d.justify_end(),
                 })
-                .collect();
-            cells.push(
-                v_flex()
-                    .flex_1()
-                    .px_2()
-                    .py_1()
-                    .border_1()
-                    .border_color(ctx.pal.border)
-                    .children(inner)
-                    .into_any_element(),
+                .children(inner)
+                .children(edges)
+                .children(diagonals)
+                .when(is_selected, |d| {
+                    d.child(div().absolute().size_full().top_0().left_0().bg(sel_bg))
+                });
+            if ctx.active {
+                // The cell's left edge selects the cell.
+                el = el.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left_0()
+                        .w(px(4.))
+                        .cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, click(TableClick::Cell(ri, cb.cell))),
+                );
+                // The strip above the first row selects the column.
+                if ri == 0 {
+                    el = el.child(
+                        div()
+                            .absolute()
+                            .top(px(-6.))
+                            .left_0()
+                            .right_0()
+                            .h(px(6.))
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, click(TableClick::Column(cb.start))),
+                    );
+                }
+            }
+            cells.push(el.into_any_element());
+        }
+        let mut row_el = div()
+            .relative()
+            .flex()
+            .flex_row()
+            .items_stretch()
+            .children(cells);
+        if ctx.active {
+            // The selection bar left of the row selects the row.
+            row_el = row_el.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(-12.))
+                    .w(px(12.))
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, click(TableClick::Row(ri))),
             );
         }
-        rows.push(h_flex().w_full().children(cells).into_any_element());
+        rows.push(row_el.into_any_element());
     }
-    v_flex().w_full().my_2().children(rows).into_any_element()
+    v_flex().my_2().children(rows).into_any_element()
 }
 
 /// Render one block at absolute `path`, wiring caret/selection/click from `ctx`.
@@ -21341,6 +21590,8 @@ impl Render for Docxy {
                     // While a header/footer is being edited the body is inactive
                     // (no caret, clicks inert) so it visually recedes.
                     let hf = tab.hf_edit.as_ref();
+                    let tbl = TableCtx::new(tab.pkg.as_ref(), self.view_gridlines);
+                    let body_range = editor.cell_range();
                     let ctx = RenderCtx {
                         caret_path: &editor.caret.path,
                         caret_off: editor.caret.offset,
@@ -21352,6 +21603,8 @@ impl Render for Docxy {
                         active: hf.is_none(),
                         meas: &measurer,
                         hf_width: None,
+                        tbl: &tbl,
+                        cell_range: body_range.as_ref(),
                     };
                     let body = &editor.doc.body;
                     if self.page_view {
@@ -21453,6 +21706,7 @@ impl Render for Docxy {
                         // Header/footer text-area width, for the implicit centre/right tab stops.
                         let hf_w = self.zoom * (geom.w - geom.ml - geom.mr).max(0) as f32 / 15.0;
                         let hf_spans = hf.map(|h| h.editor.selection_spans()).unwrap_or_default();
+                        let hf_range = hf.and_then(|h| h.editor.cell_range());
                         let hf_ctx = hf.map(|h| RenderCtx {
                             caret_path: &h.editor.caret.path,
                             caret_off: h.editor.caret.offset,
@@ -21464,6 +21718,8 @@ impl Render for Docxy {
                             active: true,
                             meas: &measurer,
                             hf_width: Some(hf_w),
+                            tbl: &tbl,
+                            cell_range: hf_range.as_ref(),
                         });
                         // The first page whose region+variant matches the one being
                         // edited is the editable page (fallback page 0, so the surface
