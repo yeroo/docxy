@@ -1440,7 +1440,8 @@ fn parse_range(s: &str) -> Result<(u32, u32, u32, u32), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gridcore::xlsx::new_xlsx;
+    use crate::backup_path;
+    use gridcore::xlsx::{load_xlsx, new_xlsx, save_xlsx};
 
     fn app() -> App {
         let mut a = App::new(new_xlsx(), "ctl-test.xlsx");
@@ -3871,6 +3872,143 @@ mod tests {
         assert_eq!(r.get("modified").unwrap().as_bool(), Some(false));
         assert!(book.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The corpus workbook with its `backupFile` attribute rewritten; the
+    /// bytes are a loadable .xlsx with the flag on or off.
+    fn backup_fixture(flag: &str) -> Vec<u8> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../corpus/xlsx/calc-3d.xlsx");
+        let bytes = std::fs::read(path).expect("corpus/xlsx/calc-3d.xlsx exists");
+        let mut pkg = load_xlsx(&bytes).expect("corpus loads");
+        let wb = pkg
+            .part("xl/workbook.xml")
+            .expect("workbook part is xl/workbook.xml");
+        let xml = String::from_utf8_lossy(wb)
+            .replace("backupFile=\"false\"", &format!("backupFile=\"{flag}\""));
+        pkg.set_part("xl/workbook.xml", xml.into_bytes());
+        save_xlsx(&pkg)
+    }
+
+    /// Excel's *Always create backup*: wb.save over an existing file keeps
+    /// the previous bytes as `Backup of <stem>.xlk` beside it, and each
+    /// later save refreshes the backup from the file it replaces.
+    #[test]
+    fn wb_save_keeps_backup_of_previous_file() {
+        let dir =
+            std::env::temp_dir().join(format!("xlsxy-608-backup-keeps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = dir.join("book.xlsx");
+        std::fs::write(&book, backup_fixture("1")).unwrap();
+        let before = std::fs::read(&book).unwrap();
+        let mut a = App::new(load_xlsx(&before).unwrap(), book.to_str().unwrap());
+        a.os_clip = None;
+        set(&mut a, "A1", "changed");
+        dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+
+        let backup = dir.join("Backup of book.xlk");
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            before,
+            "backup holds the pre-save bytes"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            2,
+            "book.xlsx and its backup only"
+        );
+        let re = load_xlsx(&std::fs::read(&book).unwrap()).unwrap();
+        assert_eq!(
+            re.workbook.sheets[0].cell(0, 0).unwrap().value,
+            CellValue::Text("changed".into())
+        );
+
+        // The next save replaces the backup with the first save's file.
+        let after1 = std::fs::read(&book).unwrap();
+        set(&mut a, "A1", "again");
+        dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), after1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without the flag nothing extra appears in the folder.
+    #[test]
+    fn wb_save_without_backup_flag_keeps_no_backup() {
+        let dir = std::env::temp_dir().join(format!("xlsxy-608-backup-off-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = dir.join("book.xlsx");
+        std::fs::write(&book, backup_fixture("false")).unwrap();
+        let before = std::fs::read(&book).unwrap();
+        let mut a = App::new(load_xlsx(&before).unwrap(), book.to_str().unwrap());
+        a.os_clip = None;
+        set(&mut a, "A1", "changed");
+        dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "book.xlsx only"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A first save to a not-yet-existing path has no previous version to
+    /// keep: the save succeeds and makes no backup.
+    #[test]
+    fn wb_save_first_save_with_backup_flag_makes_no_backup() {
+        let dir =
+            std::env::temp_dir().join(format!("xlsxy-608-backup-first-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = dir.join("new.xlsx");
+        let mut a = App::new(
+            load_xlsx(&backup_fixture("1")).unwrap(),
+            book.to_str().unwrap(),
+        );
+        a.os_clip = None;
+        set(&mut a, "A1", "changed");
+        dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+        assert!(book.exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "new.xlsx only");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A backup that cannot be written aborts the save before the workbook
+    /// file is touched, and the workbook stays modified.
+    #[test]
+    fn wb_save_fails_when_backup_cannot_be_written() {
+        let dir =
+            std::env::temp_dir().join(format!("xlsxy-608-backup-fails-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = dir.join("book.xlsx");
+        std::fs::write(&book, backup_fixture("1")).unwrap();
+        let before = std::fs::read(&book).unwrap();
+        // A directory in the backup's name blocks the write.
+        std::fs::create_dir(dir.join("Backup of book.xlk")).unwrap();
+        let mut a = App::new(load_xlsx(&before).unwrap(), book.to_str().unwrap());
+        a.os_clip = None;
+        set(&mut a, "A1", "changed");
+        let err = dispatch(&mut a, "wb.save", &Json::Null).unwrap_err();
+        assert!(err.starts_with("save failed: "), "{err}");
+        assert_eq!(a.status.as_deref(), Some(err.as_str()));
+        assert!(a.modified, "a failed save must leave the workbook modified");
+        assert_eq!(std::fs::read(&book).unwrap(), before, "book.xlsx untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Backup of <stem>.xlk` lives beside the file; the stem keeps any
+    /// dots in the name.
+    #[test]
+    fn backup_path_names_the_xlk_beside_the_file() {
+        assert_eq!(
+            backup_path(std::path::Path::new("d/book.xlsx")),
+            std::path::Path::new("d/Backup of book.xlk")
+        );
+        assert_eq!(
+            backup_path(std::path::Path::new("d/my.book.xlsm")),
+            std::path::Path::new("d/Backup of my.book.xlk")
+        );
     }
 
     /// The issue's repro: another program holds the file open with no

@@ -11,7 +11,7 @@
 //! range selection, ref-translating copy/paste) and a dependency-graph
 //! recalculation on every edit.
 
-use opccore::fsio::export_atomic;
+use opccore::fsio::{export_atomic, write_atomic};
 use std::path::Path;
 
 use std::io;
@@ -94,6 +94,27 @@ fn export_csv_bytes(
         .filter(|import| opccore::fsio::same_file(Path::new(import), Path::new(out)))
         .unwrap_or(source);
     export_atomic(Some(Path::new(source)), Path::new(out), bytes)
+}
+
+/// Where *Always create backup* keeps the previous version: beside the file,
+/// as `Backup of <stem>.xlk` (dots in the stem are kept).
+fn backup_path(dest: &Path) -> std::path::PathBuf {
+    let stem = dest
+        .file_stem()
+        .map(|s| s.to_string_lossy())
+        .unwrap_or_default();
+    dest.with_file_name(format!("Backup of {stem}.xlk"))
+}
+
+/// Honour the package's *Always create backup* flag: keep the bytes the save
+/// is about to replace. A missing destination means no previous version;
+/// any other failure aborts the save before the file is touched.
+fn keep_backup(dest: &Path) -> io::Result<()> {
+    match std::fs::read(dest) {
+        Ok(bytes) => write_atomic(&backup_path(dest), &bytes),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 fn is_delimited(path: &str) -> bool {
@@ -2511,6 +2532,17 @@ impl App {
             return self.save_text(t);
         }
         let bytes = self.package_bytes();
+        if self.pkg.always_create_backup()
+            && self.import_source.as_deref().is_none_or(|source| {
+                !opccore::fsio::same_file(Path::new(source), Path::new(&self.path))
+            })
+        {
+            if let Err(e) = keep_backup(Path::new(&self.path)) {
+                let msg = format!("save failed: {e}");
+                self.status = Some(msg.clone());
+                return Err(msg);
+            }
+        }
         match export_atomic(
             self.import_source.as_deref().map(Path::new),
             Path::new(&self.path),
