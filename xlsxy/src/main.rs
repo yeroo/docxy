@@ -7599,6 +7599,32 @@ mod tests {
     }
 
     #[test]
+    fn verify_compares_database_functions() {
+        // #677: D-functions always recalculate but are deterministic, so
+        // --verify compares them instead of skipping them as volatile.
+        let mut pkg = new_xlsx();
+        {
+            let sh = &mut pkg.workbook.sheets[0];
+            sh.set_cell(0, 0, Cell::text("Amount"));
+            sh.set_cell(1, 0, Cell::number(5.0));
+            sh.set_cell(2, 0, Cell::number(7.0));
+            sh.set_cell(0, 2, Cell::text("Amount"));
+            sh.set_cell(1, 2, Cell::text(">6"));
+            sh.set_cell(
+                0,
+                4,
+                Cell {
+                    value: CellValue::Number(7.0),
+                    ..Cell::formula("DSUM(A1:A3,\"Amount\",C1:C2)")
+                },
+            );
+        }
+        let (_, stats) = verify_report(&pkg, "d.xlsx");
+        assert_eq!(stats.volatile, 0);
+        assert_eq!((stats.total, stats.compared, stats.matched), (1, 1, 1));
+    }
+
+    #[test]
     fn merged_cells_render_spanned() {
         use gridcore::sheet::Cell;
         use ratatui::Terminal;

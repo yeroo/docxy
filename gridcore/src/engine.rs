@@ -18,7 +18,8 @@ use std::cell::Cell as StdCell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::formula::{
-    self, DynResult, Eval, ExcelError, Expr, Resolver, Value, collect_refs, is_volatile,
+    self, DynResult, Eval, ExcelError, Expr, Resolver, Value, always_recalc, collect_refs,
+    contains_db_fn,
 };
 use crate::sheet::{Cell, CellValue, Sheet, Workbook, is_array_f};
 
@@ -30,7 +31,11 @@ type Rect = (usize, u32, u32, u32, u32);
 
 struct FormulaInfo {
     ast: Expr,
+    /// Re-evaluated on every recalculation ([`formula::always_recalc`]).
     volatile: bool,
+    /// Calls a D-function: evaluated after every other ready cell (see
+    /// [`Engine::evaluate`]).
+    db: bool,
     /// A legacy formula (loaded, not saved as a dynamic array): a multi-cell
     /// range result implicit-intersects to the cell's row/column rather than
     /// spilling. User-entered formulas are modern (spill).
@@ -139,7 +144,8 @@ impl Engine {
                 self.formulas.insert(
                     key,
                     FormulaInfo {
-                        volatile: is_volatile(&ast),
+                        volatile: always_recalc(&ast),
+                        db: contains_db_fn(&ast),
                         legacy,
                         spillref: !spills.is_empty(),
                         ast,
@@ -366,14 +372,31 @@ impl Engine {
             }
         }
 
-        let mut queue: VecDeque<Key> = indeg
+        // A D-function's computed criteria read helper cells it has no edge
+        // to (it is always recalculated instead), so a ready D-function
+        // waits until no other ready cell is left: helpers it reads are
+        // evaluated first. A helper that itself reads a D-function has a real
+        // edge and still waits for it. Two D-functions whose criteria read
+        // each other's results stay in arbitrary order.
+        let is_db = |k: &Key| self.formulas.get(k).is_some_and(|i| i.db);
+        let mut queue: VecDeque<Key> = VecDeque::new();
+        let mut deferred: VecDeque<Key> = VecDeque::new();
+        let mut ready: Vec<Key> = indeg
             .iter()
             .filter(|&(_, &d)| d == 0)
             .map(|(&k, _)| k)
             .collect();
+        ready.sort_unstable();
+        for k in ready {
+            if is_db(&k) {
+                deferred.push_back(k);
+            } else {
+                queue.push_back(k);
+            }
+        }
         let mut done: HashSet<Key> = HashSet::new();
         let mut spilled: Vec<Key> = Vec::new();
-        while let Some(k) = queue.pop_front() {
+        while let Some(k) = queue.pop_front().or_else(|| deferred.pop_front()) {
             done.insert(k);
             spilled.extend(self.eval_one(wb, k));
             if let Some(dependents) = edges.get(&k).cloned() {
@@ -381,7 +404,11 @@ impl Engine {
                     let e = indeg.get_mut(&d).unwrap();
                     *e -= 1;
                     if *e == 0 {
-                        queue.push_back(d);
+                        if self.formulas.get(&d).is_some_and(|i| i.db) {
+                            deferred.push_back(d);
+                        } else {
+                            queue.push_back(d);
+                        }
                     }
                 }
             }
@@ -1705,6 +1732,60 @@ mod tests {
         assert_eq!(value_at(&wb, "K1"), CellValue::Number(20.0));
         set(&mut eng, &mut wb, "E5", Cell::number(1.0));
         assert_eq!(value_at(&wb, "K1"), CellValue::Number(70.0));
+    }
+
+    #[test]
+    fn database_functions_wait_for_the_helpers_their_criteria_read() {
+        // #677: helper formulas in E (E2:E8 = B*2) feed the computed
+        // criterion AA2 = E2>100, with no edge from them to the D-functions.
+        // Many DSUMs make an order that evaluated any of them before the
+        // edited helper fail almost surely, whatever the HashMap order.
+        let mut cells: Vec<(String, Cell)> = vec![
+            ("A1".into(), Cell::text("Rep")),
+            ("B1".into(), Cell::text("Units")),
+            ("C1".into(), Cell::text("Amount")),
+            ("AA2".into(), Cell::formula("E2>100")),
+        ];
+        for r in 2..=8 {
+            cells.push((format!("A{r}"), Cell::text(&format!("R{r}"))));
+            cells.push((format!("B{r}"), Cell::number(10.0)));
+            cells.push((format!("C{r}"), Cell::number(r as f64)));
+            cells.push((format!("E{r}"), Cell::formula(&format!("B{r}*2"))));
+        }
+        for k in 1..=30 {
+            cells.push((
+                format!("K{k}"),
+                Cell::formula("DSUM(A1:C8,\"Amount\",AA1:AA2)"),
+            ));
+        }
+        let refs: Vec<(&str, Cell)> = cells.iter().map(|(k, c)| (k.as_str(), c.clone())).collect();
+        // recalc_all over helpers with no cached values.
+        let mut wb = wb_one_sheet(&refs);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        for k in 1..=30 {
+            assert_eq!(value_at(&wb, &format!("K{k}")), CellValue::Number(0.0));
+        }
+        // Edit helper inputs, one at a time.
+        let mut want = 0.0;
+        for r in [5u32, 2, 8, 3] {
+            set(&mut eng, &mut wb, &format!("B{r}"), Cell::number(60.0));
+            want += r as f64;
+            for k in 1..=30 {
+                assert_eq!(
+                    value_at(&wb, &format!("K{k}")),
+                    CellValue::Number(want),
+                    "K{k} after B{r}"
+                );
+            }
+        }
+        let mut wb2 = wb.clone();
+        let mut eng2 = Engine::new(&wb2);
+        for r in 2..=8 {
+            wb2.sheets[0].cells.get_mut(&(r - 1, 4)).unwrap().value = CellValue::Empty;
+        }
+        eng2.recalc_all(&mut wb2);
+        assert_eq!(value_at(&wb2, "K30"), CellValue::Number(want));
     }
 
     #[test]

@@ -2285,14 +2285,7 @@ pub fn is_volatile(e: &Expr) -> bool {
                     | "OFFSET"
                     | "CELL"
                     | "INFO"
-            )
-                // A D-function's computed criteria are evaluated per record
-                // with their relative references shifted, so what they read
-                // depends on the criteria cells' current formulas and the
-                // database's extent: no static edge set can say it, and
-                // widened edges would invent circles. Recalculate always.
-                || is_db_fn(name)
-                || args.iter().any(is_volatile)
+            ) || args.iter().any(is_volatile)
         }
         Expr::ArrayLit(rows) => rows.iter().flatten().any(is_volatile),
         Expr::Call(callee, args) => is_volatile(callee) || args.iter().any(is_volatile),
@@ -2300,6 +2293,30 @@ pub fn is_volatile(e: &Expr) -> bool {
         Expr::Bin(_, l, r) => is_volatile(l) || is_volatile(r),
         _ => false,
     }
+}
+
+/// Does the formula call a D-function (`DSUM`, `DCOUNT`, …)?
+pub fn contains_db_fn(e: &Expr) -> bool {
+    match e {
+        Expr::Func(name, args) => is_db_fn(name) || args.iter().any(contains_db_fn),
+        Expr::ArrayLit(rows) => rows.iter().flatten().any(contains_db_fn),
+        Expr::Call(callee, args) => contains_db_fn(callee) || args.iter().any(contains_db_fn),
+        Expr::Un(_, x) => contains_db_fn(x),
+        Expr::Bin(_, l, r) => contains_db_fn(l) || contains_db_fn(r),
+        _ => false,
+    }
+}
+
+/// Must the engine re-evaluate this formula on every recalculation? The
+/// volatile functions ([`is_volatile`]: time, randomness, reference-returning
+/// INDIRECT/OFFSET), plus the D-functions: a computed criterion is evaluated
+/// per record with its relative references shifted, so what it reads depends
+/// on the criteria cell's current formula and the database's extent, which no
+/// static edge set can say (widened edges would invent circles). Unlike the
+/// volatile ones, D-functions are deterministic, so `--verify` still compares
+/// them.
+pub fn always_recalc(e: &Expr) -> bool {
+    is_volatile(e) || contains_db_fn(e)
 }
 
 // ---------------------------------------------------------------------------
@@ -11489,6 +11506,13 @@ mod tests {
         assert!(is_volatile(&parse("NOW()").unwrap()));
         assert!(is_volatile(&parse("1+RAND()").unwrap()));
         assert!(!is_volatile(&parse("SUM(A1:B2)").unwrap()));
+        // #677: D-functions always recalculate but are deterministic, not
+        // volatile (`--verify` compares them).
+        let dsum = parse("1+DSUM(A1:C8,\"Amount\",F1:F2)").unwrap();
+        assert!(!is_volatile(&dsum));
+        assert!(always_recalc(&dsum) && contains_db_fn(&dsum));
+        assert!(always_recalc(&parse("NOW()").unwrap()));
+        assert!(!always_recalc(&parse("SUM(A1:B2)").unwrap()));
     }
 
     #[test]
