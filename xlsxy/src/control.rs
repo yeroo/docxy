@@ -3990,6 +3990,7 @@ mod tests {
         set(&mut a, "A1", "changed");
         let err = dispatch(&mut a, "wb.save", &Json::Null).unwrap_err();
         assert!(err.starts_with("save failed: "), "{err}");
+        assert!(err.contains("Backup of book.xlk"), "{err}");
         assert_eq!(a.status.as_deref(), Some(err.as_str()));
         assert!(a.modified, "a failed save must leave the workbook modified");
         assert_eq!(std::fs::read(&book).unwrap(), before, "book.xlsx untouched");
@@ -4023,6 +4024,39 @@ mod tests {
             0o600,
             "backup mirrors the source's permissions"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A read-only book must not produce a read-only backup: the save of
+    /// the read-only book fails, but once the book is writable again the
+    /// next save must be able to replace the backup.
+    #[cfg(unix)]
+    #[test]
+    fn wb_save_backup_of_readonly_book_stays_replaceable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("xlsxy-608-backup-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = dir.join("book.xlsx");
+        std::fs::write(&book, backup_fixture("1")).unwrap();
+        std::fs::set_permissions(&book, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let mut a = App::new(
+            load_xlsx(&std::fs::read(&book).unwrap()).unwrap(),
+            book.to_str().unwrap(),
+        );
+        a.os_clip = None;
+        set(&mut a, "A1", "changed");
+        // The read-only book cannot be replaced, so the save fails — but
+        // the backup is still kept, and it must be owner-writable.
+        dispatch(&mut a, "wb.save", &Json::Null).unwrap_err();
+        let backup = dir.join("Backup of book.xlk");
+        let mode = std::fs::metadata(&backup).unwrap().permissions().mode();
+        assert_ne!(mode & 0o200, 0, "backup stays owner-writable, got {mode:o}");
+        // Once the book is writable, saving replaces the backup again.
+        std::fs::set_permissions(&book, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let before_second = std::fs::read(&book).unwrap();
+        dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), before_second);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

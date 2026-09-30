@@ -112,12 +112,19 @@ fn backup_path(dest: &Path) -> std::path::PathBuf {
 fn keep_backup(dest: &Path) -> io::Result<()> {
     match std::fs::read(dest) {
         Ok(bytes) => {
-            // A new backup would default to world-readable; mirror the
-            // file's own permissions so a private workbook stays private.
-            // Windows only mirrors the readonly bit, which would make the
-            // next save unable to replace the backup, so this is Unix-only.
+            // Mirror the file's permissions so a private workbook stays
+            // private — but always keep the backup owner-writable, or the
+            // next save could not replace it (a 0444 book would give a 0444
+            // backup that write_atomic then refuses to open). Windows skips
+            // the mirroring: its only permission bit is readonly, which
+            // would brick the backup the same way.
             #[cfg(unix)]
-            let perms = std::fs::metadata(dest)?.permissions();
+            let mut perms = std::fs::metadata(dest)?.permissions();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                perms.set_mode(perms.mode() | 0o200);
+            }
             write_atomic(&backup_path(dest), &bytes)?;
             #[cfg(unix)]
             std::fs::set_permissions(&backup_path(dest), perms)?;
@@ -2545,7 +2552,10 @@ impl App {
         let bytes = self.package_bytes();
         if self.pkg.always_create_backup() {
             if let Err(e) = keep_backup(Path::new(&self.path)) {
-                let msg = format!("save failed: {e}");
+                let msg = format!(
+                    "save failed: cannot write backup {}: {e}",
+                    backup_path(Path::new(&self.path)).display()
+                );
                 self.status = Some(msg.clone());
                 return Err(msg);
             }
