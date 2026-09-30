@@ -234,24 +234,179 @@ fn f2_while_typing_keeps_the_text_and_word_keys_edit_it() {
 }
 
 #[test]
-fn enter_mode_arrows_commit_except_while_a_formula_is_typed() {
+fn enter_mode_arrows_commit_except_where_a_formula_points() {
+    // Enter mode: the arrows never move the caret. Where a formula wants a
+    // reference next they point at a cell; anywhere else they commit and move.
     let mut v = view();
     type_fresh(&mut v, "abc");
     assert!(!v.edit_arrows_move_caret());
-    for formula in ["=A1+", "-L1", "+A99", "@SUM(1"] {
-        v.editing = Some(formula.into());
-        let want = formula != "@SUM(1";
-        assert_eq!(v.edit_arrows_move_caret(), want, "{formula}");
+    assert!(!v.edit_point(0, 1, false), "text never points");
+    for formula in ["=A1+", "-L1-", "+A99*", "=SUM(", "=A1:"] {
+        type_fresh(&mut v, formula);
+        assert!(!v.edit_arrows_move_caret(), "{formula}");
+        assert!(v.edit_point(0, 1, false), "{formula} points");
     }
-    v.editing = Some("-5".into());
-    assert!(!v.edit_arrows_move_caret(), "a number is not a formula");
+    // A formula whose caret sits after a value, not an operator, doesn't.
+    for formula in ["=A1", "=5", "-L1", "=SUM(A1)"] {
+        type_fresh(&mut v, formula);
+        assert!(!v.edit_point(0, 1, false), "{formula} commits");
+        assert_eq!(v.editing.as_deref(), Some(formula), "left alone");
+    }
+    // `-5` is a number, which is exactly why it has nothing to point after.
+    type_fresh(&mut v, "-5");
+    assert!(!v.edit_is_formula(), "a number is not a formula");
+    assert!(!v.edit_point(0, 1, false));
+    // Edit mode: the arrows move the caret and never point.
     v.edit_mode = EditMode::Edit;
-    v.editing = Some("abc".into());
+    v.editing = Some("=A1+".into());
     assert!(v.edit_arrows_move_caret());
+    assert!(!v.edit_point(0, 1, false));
     // F2 / a double-click / the fx bar open in Edit mode.
     v.end_cell_edit();
     v.begin_cell_edit(None);
     assert_eq!(v.edit_mode, EditMode::Edit);
+}
+
+// ---- #757: pointing at cells with the arrows, and F4's anchoring ------------
+
+#[test]
+fn arrows_point_at_cells_from_the_edited_cell() {
+    // From A1: `=`, Down, Right → B2 (each arrow moves the pointed cell, the
+    // caret staying after it); Shift+Right grows it into a range.
+    let mut v = view();
+    type_fresh(&mut v, "=");
+    assert!(v.edit_point(1, 0, false));
+    assert_eq!(v.editing.as_deref(), Some("=A2"));
+    assert!(v.edit_point(0, 1, false));
+    assert_eq!(v.editing.as_deref(), Some("=B2"));
+    assert_eq!(v.edit_caret, 3);
+    assert!(v.edit_point(0, 1, true));
+    assert_eq!(v.editing.as_deref(), Some("=B2:C2"));
+    assert!(v.edit_point(1, 0, true));
+    assert_eq!(v.editing.as_deref(), Some("=B2:C3"));
+    // A plain arrow after a Shift one collapses back to one moving cell.
+    assert!(v.edit_point(0, 1, false));
+    assert_eq!(v.editing.as_deref(), Some("=D3"));
+    // Nothing moved the selection or closed the editor.
+    assert_eq!(v.sel, (0, 0));
+    assert_eq!(v.edit_origin, Some((0, 0, 0)));
+}
+
+#[test]
+fn arrows_point_after_an_operator_or_a_bracket() {
+    let mut v = view();
+    type_fresh(&mut v, "=SUM(");
+    assert!(v.edit_point(1, 0, false));
+    assert_eq!(v.editing.as_deref(), Some("=SUM(A2"));
+    // Typing ends the pointing: `)` then an arrow commits, it doesn't point.
+    v.edit_point = None; // what `sheet_key` does on any other key
+    v.edit_type(")");
+    assert!(!v.edit_point(1, 0, false));
+
+    let mut v = view();
+    type_fresh(&mut v, "=A1+");
+    assert!(v.edit_point(0, 1, false));
+    assert_eq!(v.editing.as_deref(), Some("=A1+B1"));
+
+    // Text after the caret stays where it was.
+    let mut v = view();
+    type_fresh(&mut v, "=SUM()");
+    v.edit_caret = 5;
+    assert!(v.edit_point(0, 2, false));
+    assert_eq!(v.editing.as_deref(), Some("=SUM(C1)"));
+    assert_eq!(v.edit_caret, 7);
+
+    // Moving the caret by hand ends the pointing too.
+    let mut v = view();
+    type_fresh(&mut v, "=1+");
+    assert!(v.edit_point(0, 1, false));
+    v.edit_caret = 2;
+    assert!(!v.edit_point(0, 1, false), "after `1`, nothing is pointed");
+    assert_eq!(v.editing.as_deref(), Some("=1+B1"));
+}
+
+#[test]
+fn pointing_after_a_colon_moves_the_second_end() {
+    // From C1, `=SUM(A1:` then Down twice: A1 stays, the second end walks.
+    let mut v = view();
+    select(&mut v, 0, 2);
+    type_fresh(&mut v, "=SUM(A1:");
+    assert!(v.edit_point(1, 0, false));
+    assert_eq!(v.editing.as_deref(), Some("=SUM(A1:C2"));
+    assert!(v.edit_point(1, 0, false));
+    assert_eq!(v.editing.as_deref(), Some("=SUM(A1:C3"));
+    // Shift there has no range of its own to grow: it moves that end too.
+    assert!(v.edit_point(0, 1, true));
+    assert_eq!(v.editing.as_deref(), Some("=SUM(A1:D3"));
+}
+
+#[test]
+fn pointing_stops_at_the_sheet_edge() {
+    let mut v = view();
+    type_fresh(&mut v, "=");
+    assert!(v.edit_point(-1, 0, false));
+    assert_eq!(v.editing.as_deref(), Some("=A1"));
+    assert!(v.edit_point(0, -1, false));
+    assert_eq!(v.editing.as_deref(), Some("=A1"));
+}
+
+#[test]
+fn an_arrow_after_a_finished_formula_commits_and_moves() {
+    // `=5` then Right: no reference is wanted there, so the arrow does what
+    // it does after any entry — commit and move (`sheet_key`'s fallback).
+    let mut v = view();
+    type_fresh(&mut v, "=5");
+    assert!(!v.edit_point(0, 1, false));
+    assert_eq!(v.commit_and_move(0, 1), Some(true));
+    assert!(v.editing.is_none());
+    assert_eq!(value(&v, 0, 0), CellValue::Number(5.0));
+    assert_eq!(v.sel, (0, 1));
+}
+
+#[test]
+fn edit_mode_arrows_move_the_caret() {
+    let mut v = view();
+    put(
+        &mut v,
+        0,
+        0,
+        Cell {
+            formula: Some("B1+".into()),
+            ..Cell::default()
+        },
+    );
+    v.begin_cell_edit(None);
+    v.edit_caret_to_end();
+    assert_eq!(v.editing.as_deref(), Some("=B1+"));
+    assert!(v.edit_arrows_move_caret());
+    assert!(!v.edit_point(0, -1, false));
+    v.edit_move(-1);
+    assert_eq!(v.edit_caret, 3);
+    assert_eq!(v.editing.as_deref(), Some("=B1+"));
+}
+
+#[test]
+fn f4_cycles_the_reference_at_the_caret_only_in_a_formula() {
+    let mut v = view();
+    type_fresh(&mut v, "=A1");
+    for want in ["=$A$1", "=A$1", "=$A1", "=A1"] {
+        assert!(v.edit_cycle_ref());
+        assert_eq!(v.editing.as_deref(), Some(want));
+        assert_eq!(v.edit_caret, want.chars().count());
+    }
+    // Not on a reference: nothing happens.
+    type_fresh(&mut v, "=SUM(");
+    assert!(!v.edit_cycle_ref());
+    assert_eq!(v.editing.as_deref(), Some("=SUM("));
+    // Not a formula: nothing happens, even to text that reads like a cell.
+    type_fresh(&mut v, "A1");
+    assert!(!v.edit_cycle_ref());
+    assert_eq!(v.editing.as_deref(), Some("A1"));
+    // A pointed reference can be anchored straight away.
+    type_fresh(&mut v, "=");
+    assert!(v.edit_point(1, 1, false));
+    assert!(v.edit_cycle_ref());
+    assert_eq!(v.editing.as_deref(), Some("=$B$2"));
 }
 
 #[test]

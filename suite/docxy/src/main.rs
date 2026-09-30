@@ -446,6 +446,9 @@ struct SheetView {
     edit_mode: EditMode,
     /// Insert toggled overtype for this editor session.
     edit_overtype: bool,
+    /// A cell the arrow keys are pointing at while a formula is typed in Enter
+    /// mode. `None` whenever the last key wasn't a pointing arrow.
+    edit_point: Option<EditPoint>,
     /// The buffer as the editor opened — Ctrl+Z while editing returns to it.
     edit_start: String,
     /// The last formatting change, for F4 (repeat). A resolved setter
@@ -498,6 +501,23 @@ enum EditMode {
     Enter,
     /// Opened with F2, a double-click or the fx bar: Left/Right move the caret.
     Edit,
+}
+
+/// Excel's point mode from the keyboard: the reference the arrow keys are
+/// writing into a formula. Each arrow re-splices between `prefix` and `suffix`
+/// — the buffer either side of where the first arrow wrote — so moving the
+/// pointed cell rewrites one reference instead of appending another.
+#[derive(Clone, Debug)]
+struct EditPoint {
+    prefix: String,
+    suffix: String,
+    /// The fixed corner (Shift+arrow grows a range from it) and the moving one.
+    anchor: (u32, u32),
+    cell: (u32, u32),
+    /// The buffer and caret as the last point left them. Pointing carries on
+    /// only while they are untouched; a keystroke, a click in the text, a
+    /// pick with the mouse all change one of them and so end it.
+    wrote: (String, usize),
 }
 
 /// The setter a number-format choice applies: `code`, or General for "".
@@ -1201,6 +1221,7 @@ impl SheetView {
         self.edit_seed = None;
         self.edit_origin = None;
         self.edit_overtype = false;
+        self.edit_point = None;
     }
 
     /// Open the editor on the selected cell. `Some(buf)` starts a fresh entry
@@ -1221,6 +1242,7 @@ impl SheetView {
         self.edit_origin = Some((self.active, r, c));
         self.edit_mode = mode;
         self.edit_overtype = false;
+        self.edit_point = None;
     }
 
     fn edit_untouched(&self) -> bool {
@@ -1306,14 +1328,17 @@ impl SheetView {
         };
     }
 
-    /// Do Left/Right move the caret (rather than commit and move)? In Edit
-    /// mode always; in Enter mode only while a formula is being typed, whose
-    /// arrow keys are Excel's pointing keys (not modeled) and must not commit
-    /// a half-typed formula.
+    /// Do Left/Right move the caret (rather than commit and move)? Only in
+    /// Edit mode. In Enter mode they point at cells where a formula expects a
+    /// reference (`edit_point`) and otherwise commit and move, formula or not
+    /// — Excel's rule, so `=5` then Right enters 5 like any other entry.
     fn edit_arrows_move_caret(&self) -> bool {
-        if self.edit_mode == EditMode::Edit {
-            return true;
-        }
+        self.edit_mode == EditMode::Edit
+    }
+
+    /// Is the editor holding a formula: `=…`, or `+`/`-`/`@` that parses as
+    /// one (`-L1`, not the number `-5`)?
+    fn edit_is_formula(&self) -> bool {
         let buf = self.editing.as_deref().unwrap_or("");
         buf.starts_with('=')
             || (buf.starts_with(['+', '-', '@'])
@@ -1323,6 +1348,94 @@ impl SheetView {
                     &gridcore::entry::EntryCtx::default(),
                 )
                 .is_ok_and(|e| e.cell.formula.is_some()))
+    }
+
+    /// F4 while editing a formula: cycle the anchoring (`$`) of the reference
+    /// at the caret. False, changing nothing, when the editor holds no formula
+    /// or the caret isn't on a reference.
+    fn edit_cycle_ref(&mut self) -> bool {
+        if !self.edit_is_formula() {
+            return false;
+        }
+        let Some((buf, caret)) = self
+            .editing
+            .as_deref()
+            .and_then(|b| cycle_ref_at(b, self.edit_caret))
+        else {
+            return false;
+        };
+        self.editing = Some(buf);
+        self.edit_caret = caret;
+        true
+    }
+
+    /// An arrow key while typing a formula in Enter mode: point at a cell and
+    /// write its reference at the caret, as Excel does. True when it pointed;
+    /// false when the arrow should do what it does anywhere else (commit and
+    /// move, or move the caret in Edit mode).
+    ///
+    /// It points where a formula wants a reference next — right after `=`, an
+    /// operator, `(`, `,` or `:` — and, once pointing, on every further arrow,
+    /// which moves the pointed cell rather than the caret. The first arrow
+    /// starts from the cell being edited. Shift+arrow grows a range from where
+    /// the pointing started; a plain arrow after it collapses back to one cell.
+    /// Right after `A1:` the arrows write the range's second end, keeping A1.
+    fn edit_point(&mut self, dr: i32, dc: i32, extend: bool) -> bool {
+        let point = self.edit_point.take();
+        let Some(buf) = self.editing.clone() else {
+            return false;
+        };
+        // A bare leading `+`, `-` or `@` doesn't parse as a formula yet, but it
+        // is how one starts, so it points just as `=` does.
+        let formula = self.edit_is_formula() || buf.starts_with(['+', '-', '@']);
+        if self.edit_mode != EditMode::Enter || !formula {
+            return false;
+        }
+        let caret = self.edit_caret;
+        let (prefix, suffix, from, anchor) = match point {
+            Some(p) if p.wrote == (buf.clone(), caret) => (p.prefix, p.suffix, p.cell, p.anchor),
+            _ => {
+                let at = char_to_byte(&buf, caret);
+                let before = buf[..at].chars().next_back();
+                let at_operator = before.is_some_and(|c| "=(,+-*/^&<>:@".contains(c));
+                if !at_operator {
+                    return false;
+                }
+                let (_, r, c) = self
+                    .edit_origin
+                    .unwrap_or((self.active, self.sel.0, self.sel.1));
+                (buf[..at].to_string(), buf[at..].to_string(), (r, c), (r, c))
+            }
+        };
+        let step = |v: u32, d: i32, max: u32| (v as i64 + d as i64).clamp(0, max as i64 - 1) as u32;
+        let cell = (
+            step(from.0, dr, gridcore::sheet::MAX_ROWS),
+            step(from.1, dc, gridcore::sheet::MAX_COLS),
+        );
+        // After `A1:` the pointed cell is the range's second end already, so a
+        // Shift there has no range of its own to grow: it moves that end.
+        let anchor = if extend && !prefix.ends_with(':') {
+            anchor
+        } else {
+            cell
+        };
+        let text = if anchor == cell {
+            gridcore::sheet::cell_name(cell.0, cell.1)
+        } else {
+            range_text(anchor, cell)
+        };
+        let next = format!("{prefix}{text}{suffix}");
+        let next_caret = prefix.chars().count() + text.chars().count();
+        self.edit_point = Some(EditPoint {
+            prefix,
+            suffix,
+            anchor,
+            cell,
+            wrote: (next.clone(), next_caret),
+        });
+        self.editing = Some(next);
+        self.edit_caret = next_caret;
+        true
     }
 
     /// Type `s` at the caret, over the next character in overtype mode.
@@ -5247,6 +5360,148 @@ fn replace_ref(buf: &str, caret_chars: usize, text: &str) -> (String, usize) {
     (out, caret)
 }
 
+/// One end of a reference F4 can re-anchor: its column letters and row digits
+/// (either may be missing — `A:A` names no rows, `1:1` no columns), each with
+/// whether it carries a `$`.
+#[derive(Clone, Copy)]
+struct RefEnd<'a> {
+    col: Option<(bool, &'a str)>,
+    row: Option<(bool, &'a str)>,
+}
+
+impl<'a> RefEnd<'a> {
+    /// Split `$A$1`, `A`, `$1` and the like into their parts. `None` for
+    /// anything that isn't column letters then row digits, or that names a
+    /// column or row past the sheet's edge. (`parse_range_name` can't do this:
+    /// it takes neither a whole column nor a whole row.)
+    fn parse(s: &'a str) -> Option<Self> {
+        let (lead_abs, s) = s.strip_prefix('$').map_or((false, s), |t| (true, t));
+        let letters = s.bytes().take_while(u8::is_ascii_alphabetic).count();
+        let (letters, rest) = s.split_at(letters);
+        let (row_abs, digits) = rest.strip_prefix('$').map_or((false, rest), |t| (true, t));
+        if !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let cell = |col: &str, row: &str| gridcore::sheet::parse_cell_name(&format!("{col}{row}"));
+        match (letters.is_empty(), digits.is_empty()) {
+            (false, false) => cell(letters, digits).map(|_| RefEnd {
+                col: Some((lead_abs, letters)),
+                row: Some((row_abs, digits)),
+            }),
+            // `$A` alone: the leading `$` is the column's; a second one would
+            // have no row to anchor.
+            (false, true) if !row_abs => cell(letters, "1").map(|_| RefEnd {
+                col: Some((lead_abs, letters)),
+                row: None,
+            }),
+            // `$1` alone: the only `$` anchors the row.
+            (true, false) if !row_abs => cell("A", digits).map(|_| RefEnd {
+                col: None,
+                row: Some((lead_abs, digits)),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The end written with the given anchoring.
+    fn write(&self, col_abs: bool, row_abs: bool) -> String {
+        let mut out = String::new();
+        if let Some((_, letters)) = self.col {
+            if col_abs {
+                out.push('$');
+            }
+            out.push_str(letters);
+        }
+        if let Some((_, digits)) = self.row {
+            if row_abs {
+                out.push('$');
+            }
+            out.push_str(digits);
+        }
+        out
+    }
+}
+
+/// F4 while typing a formula: re-anchor the reference under (or just before)
+/// the caret one step round Excel's cycle — `A1`, `$A$1`, `A$1`, `$A1`, back to
+/// `A1`. A range moves both ends together, taking the next step from its first
+/// end, so a mixed `$A1:B$2` comes out uniform; a whole column (`A:A`) or row
+/// (`1:1`) only toggles between relative and absolute. Returns the new buffer
+/// and the caret, right after the rewritten reference (or after the colon of a
+/// half-typed `A1:`); `None` when the caret
+/// isn't on a reference.
+///
+/// Unlike `ref_token_at`, this takes the cell half of another sheet's
+/// reference (`Sheet2!A1`, `'My Sheet'!A1`): re-anchoring it can't repoint it
+/// at another sheet, and the sheet name in front is left exactly as typed. What
+/// it still refuses is text that only looks like a reference — a function name
+/// (`LOG10(`), a string literal, a quoted sheet name, and the sheet half of
+/// `Q1!B2`.
+fn cycle_ref_at(buf: &str, caret_chars: usize) -> Option<(String, usize)> {
+    let caret = char_to_byte(buf, caret_chars);
+    let is_ref_char = |c: char| c.is_ascii_alphanumeric() || c == '$' || c == ':';
+    let start = buf[..caret]
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| is_ref_char(*c))
+        .map(|(i, _)| i)
+        .last()
+        .unwrap_or(caret);
+    let mut end = buf[caret..]
+        .char_indices()
+        .take_while(|(_, c)| is_ref_char(*c))
+        .map(|(i, c)| caret + i + c.len_utf8())
+        .last()
+        .unwrap_or(caret);
+    if buf[end..].starts_with(['(', '[', '!']) || quoted_at(buf, start) {
+        // A function name, a structured reference's table, a sheet name, or
+        // text inside quotes — see `ref_token_at` for why each reads like a
+        // cell and isn't one.
+        return None;
+    }
+    // `A1:` is a range still being typed: its first end is the reference. The
+    // caret stays after the colon when it was there, ready for the second end.
+    let mut past_colon = 0;
+    if buf[start..end].ends_with(':') {
+        end -= 1;
+        past_colon = usize::from(caret > end);
+    }
+    let ends: Vec<RefEnd> = buf[start..end]
+        .split(':')
+        .map(RefEnd::parse)
+        .collect::<Option<_>>()?;
+    let kind = |e: &RefEnd| (e.col.is_some(), e.row.is_some());
+    // A lone end must be a cell (`1` alone is a number, `A` a name); the two
+    // ends of a range must be the same kind: `A1:B2`, `A:C` or `1:3`.
+    let first = match ends.as_slice() {
+        [one] if kind(one) == (true, true) => *one,
+        [a, b] if kind(a) == kind(b) => *a,
+        _ => return None,
+    };
+    let (col_abs, row_abs) = match (first.col, first.row) {
+        (Some((c, _)), Some((r, _))) => match (c, r) {
+            (false, false) => (true, true),
+            (true, true) => (false, true),
+            (false, true) => (true, false),
+            (true, false) => (false, false),
+        },
+        (Some((c, _)), None) => (!c, false),
+        (None, Some((r, _))) => (false, !r),
+        (None, None) => return None,
+    };
+    let text = ends
+        .iter()
+        .map(|e| e.write(col_abs, row_abs))
+        .collect::<Vec<_>>()
+        .join(":");
+    let mut out = String::with_capacity(buf.len() + 4);
+    out.push_str(&buf[..start]);
+    out.push_str(&text);
+    out.push_str(&buf[end..]);
+    let caret = out[..start + text.len() + past_colon].chars().count();
+    Some((out, caret))
+}
+
 /// One reference inside a formula: the byte span it occupies in the text, and
 /// the cells `(r1, c1, r2, c2)` it names.
 type RefToken = (std::ops::Range<usize>, (u32, u32, u32, u32));
@@ -6051,6 +6306,7 @@ fn new_sheet_surface() -> Surface {
         edit_caret: 0,
         edit_mode: EditMode::Enter,
         edit_overtype: false,
+        edit_point: None,
         edit_start: String::new(),
         last_format: None,
         entry_error: None,
@@ -6099,6 +6355,7 @@ fn sheet_from_path(path: &PathBuf) -> (Surface, SharedString) {
                     edit_caret: 0,
                     edit_mode: EditMode::Enter,
                     edit_overtype: false,
+                    edit_point: None,
                     edit_start: String::new(),
                     last_format: None,
                     entry_error: None,
@@ -8385,9 +8642,24 @@ impl Docxy {
             range_text(anchor, (row, col))
         };
         let (next, next_caret) = replace_ref(&buf, caret, &text);
+        // Leave the keyboard pointing at the picked cell, so an arrow key
+        // carries on from it the way Excel's does. The splice points are the
+        // ones `replace_ref` just wrote between.
+        let span = ref_token_at(&buf, caret).unwrap_or_else(|| {
+            let at = char_to_byte(&buf, caret);
+            at..at
+        });
+        let point = EditPoint {
+            prefix: buf[..span.start].to_string(),
+            suffix: buf[span.end..].to_string(),
+            anchor,
+            cell: (row, col),
+            wrote: (next.clone(), next_caret),
+        };
         if let Some(v) = self.active_sheet_mut() {
             v.editing = Some(next);
             v.edit_caret = next_caret;
+            v.edit_point = Some(point);
         }
         cx.notify();
     }
@@ -11867,6 +12139,23 @@ impl Docxy {
             && self
                 .active_sheet()
                 .is_some_and(SheetView::edit_arrows_move_caret);
+        // Point mode lasts only while the arrows keep coming: any other key
+        // ends it, so an arrow after typing asks afresh whether the formula
+        // wants a reference there. A modifier pressed on its own (the Shift of
+        // a Shift+arrow) is not "another key".
+        let arrow = match key {
+            "left" => Some((0, -1)),
+            "right" => Some((0, 1)),
+            "up" => Some((-1, 0)),
+            "down" => Some((1, 0)),
+            _ => None,
+        };
+        let modifier = matches!(key, "shift" | "control" | "alt" | "platform" | "function");
+        if editing && arrow.is_none() && !modifier {
+            if let Some(v) = self.active_sheet_mut() {
+                v.edit_point = None;
+            }
+        }
         // Same as the bar fields above: a focused Chart-panel field owns Ctrl+A.
         // Without this it falls through to the sheet's select-all below, and the
         // field's own handler is dead code.
@@ -12023,6 +12312,17 @@ impl Docxy {
                 _ => {}
             }
         }
+        // An arrow while typing a formula in Enter mode may point at a cell
+        // instead (`SheetView::edit_point` decides); when it doesn't, it falls
+        // through to the caret / commit-and-move arms below.
+        if let Some((dr, dc)) = arrow.filter(|_| editing)
+            && self
+                .active_sheet_mut()
+                .is_some_and(|v| v.edit_point(dr, dc, shift))
+        {
+            cx.notify();
+            return;
+        }
         match key {
             "escape" => {
                 self.sheet_pick = None;
@@ -12057,6 +12357,15 @@ impl Docxy {
             "f9" if editing => {
                 if let Some(v) = self.active_sheet_mut() {
                     v.edit_eval_formula();
+                }
+                cx.notify();
+            }
+            // F4 while editing a formula cycles the anchoring of the reference
+            // at the caret (A1, $A$1, A$1, $A1); anywhere else in the editor it
+            // does nothing.
+            "f4" if editing => {
+                if let Some(v) = self.active_sheet_mut() {
+                    v.edit_cycle_ref();
                 }
                 cx.notify();
             }
@@ -12101,7 +12410,7 @@ impl Docxy {
                 }
             }
             // While editing, Left/Right move the caret WITHIN the cell in Edit
-            // mode (and while a formula is typed); in Enter mode they commit
+            // mode; in Enter mode (when they didn't point, above) they commit
             // and move. Home/End always move the caret.
             "left" if caret_keys => {
                 if let Some(v) = self.active_sheet_mut() {
@@ -27909,6 +28218,55 @@ mod grid_geom_tests {
         assert_eq!(buf, "=\"café\"&C3");
         // 10 CHARS, not the 11 bytes é costs — the caret is counted in chars.
         assert_eq!(caret, 10);
+    }
+
+    #[test]
+    fn cycle_ref_at_steps_a_reference_round_its_anchoring() {
+        let cycle = |buf: &str, caret: usize| super::cycle_ref_at(buf, caret);
+        let own = |s: &str, caret: usize| Some((s.to_string(), caret));
+        // A1 → $A$1 → A$1 → $A1 → A1, the caret after the rewritten ref.
+        assert_eq!(cycle("=A1", 3), own("=$A$1", 5));
+        assert_eq!(cycle("=$A$1", 5), own("=A$1", 4));
+        assert_eq!(cycle("=A$1", 4), own("=$A1", 4));
+        assert_eq!(cycle("=$A1", 4), own("=A1", 3));
+        // The caret inside the reference, or at its start, finds it too, and
+        // what follows the reference is kept.
+        assert_eq!(cycle("=A1+B2", 2), own("=$A$1+B2", 5));
+        assert_eq!(cycle("=A1+B2", 1), own("=$A$1+B2", 5));
+        assert_eq!(cycle("=A1+B2", 6), own("=A1+$B$2", 8));
+        // A range moves both ends together; a mixed one takes its step from
+        // the first end ($A1 → A1) and comes out uniform.
+        assert_eq!(cycle("=SUM(A1:B2)", 10), own("=SUM($A$1:$B$2)", 14));
+        assert_eq!(cycle("=SUM($A$1:$B$2)", 14), own("=SUM(A$1:B$2)", 12));
+        assert_eq!(cycle("=$A1:B$2", 8), own("=A1:B2", 6));
+        // A range still being typed cycles its first end and keeps the colon.
+        assert_eq!(cycle("=SUM(A1:", 8), own("=SUM($A$1:", 10));
+        // A whole column or row has two states.
+        assert_eq!(cycle("=SUM(A:A)", 8), own("=SUM($A:$A)", 10));
+        assert_eq!(cycle("=SUM($A:$A)", 10), own("=SUM(A:A)", 8));
+        assert_eq!(cycle("=SUM(1:1)", 8), own("=SUM($1:$1)", 10));
+        assert_eq!(cycle("=SUM($1:$1)", 10), own("=SUM(1:1)", 8));
+        assert_eq!(cycle("=SUM(B:D)", 8), own("=SUM($B:$D)", 10));
+        // Another sheet's reference cycles its cell part; the sheet stays.
+        assert_eq!(cycle("=Sheet1!A1", 10), own("=Sheet1!$A$1", 12));
+        assert_eq!(cycle("='My Sheet'!A1", 14), own("='My Sheet'!$A$1", 16));
+        assert_eq!(cycle("=Q1!B2", 6), own("=Q1!$B$2", 8));
+        // Nothing to cycle: after an operator, a function name, a sheet name,
+        // a string literal, a number, or text that names no cell.
+        assert_eq!(cycle("=SUM(", 5), None);
+        assert_eq!(cycle("=A1+", 4), None);
+        assert_eq!(cycle("=LOG10(A1)", 6), None);
+        assert_eq!(cycle("=Q1!B2", 3), None, "the sheet half");
+        assert_eq!(cycle("='Q1'!A1", 4), None, "inside the quoted name");
+        assert_eq!(cycle("=\"A1\"", 4), None);
+        assert_eq!(cycle("=\"A1\"", 5), None);
+        assert_eq!(cycle("=5", 2), None);
+        assert_eq!(cycle("=total", 6), None);
+        assert_eq!(cycle("=A1:1", 5), None, "a cell and a row");
+        assert_eq!(cycle("", 0), None);
+        // The caret is a char index: multibyte text before the ref counts
+        // once per character.
+        assert_eq!(cycle("=\"café\"&B2", 10), own("=\"café\"&$B$2", 12));
     }
 
     #[test]
