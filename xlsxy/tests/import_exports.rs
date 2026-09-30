@@ -287,3 +287,23 @@ fn csv_export_is_excels_csv_utf8_of_the_active_sheet() {
     want.extend_from_slice("Name,Note\r\nZ\u{fc}rich,\"line1\nline2\"\r\n".as_bytes());
     assert_eq!(std::fs::read(&out).unwrap(), want);
 }
+
+/// #607: headless runs import a .txt with the Text Import Wizard's defaults
+/// (tab-delimited, fields converted) rather than failing to read it as XLSX.
+#[test]
+fn a_text_file_converts_headlessly_with_the_wizard_defaults() {
+    let dir = Dir::new("txt-headless");
+    let source = dir.0.join("in.txt");
+    std::fs::write(&source, "name\tqty\r\nPen\t4\r\n").unwrap();
+    let out = dir.0.join("out.csv");
+    let result = run(&source, "--csv", &out);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        b"\xEF\xBB\xBFname,qty\r\nPen,4\r\n"
+    );
+}

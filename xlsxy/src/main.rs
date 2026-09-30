@@ -23,6 +23,7 @@ mod control;
 mod mcp;
 mod ribbon;
 mod skill;
+mod textdlg;
 
 // Bring the trait's methods (`extensions`, `default_save_name`, …) into scope
 // for the `impl backstage::BackstageHost for App` call sites below.
@@ -98,6 +99,12 @@ fn export_csv_bytes(
 fn is_delimited(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     lower.ends_with(".csv") || lower.ends_with(".tsv")
+}
+
+/// A `.txt` or `.prn`: opened through the Text Import Wizard.
+fn is_text_import(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".txt") || lower.ends_with(".prn")
 }
 
 fn main() -> ExitCode {
@@ -195,13 +202,22 @@ fn main() -> ExitCode {
         // CSV/TSV imports as a one-sheet workbook (Ctrl-S then writes
         // .xlsx — the path is rebound so a spreadsheet never lands in a
         // text file). The delimiter is sniffed.
-        Some(input) if is_delimited(input) => match load_workbook(input, &TextOpen::from_prefs()) {
-            Ok(loaded) => loaded,
-            Err(e) => {
-                eprintln!("error: cannot read {input}: {e}");
-                return ExitCode::FAILURE;
+        // A .txt/.prn in the editor opens the Text Import Wizard over a new
+        // workbook; headless runs import it with the wizard's defaults.
+        Some(input)
+            if is_text_import(input) && parsed.recalc_out.is_none() && parsed.csv_out.is_none() =>
+        {
+            (new_xlsx(), "untitled.xlsx".to_string(), None)
+        }
+        Some(input) if is_delimited(input) || is_text_import(input) => {
+            match load_workbook(input, &TextOpen::from_prefs()) {
+                Ok(loaded) => loaded,
+                Err(e) => {
+                    eprintln!("error: cannot read {input}: {e}");
+                    return ExitCode::FAILURE;
+                }
             }
-        },
+        }
         Some(input) => match std::fs::read(input) {
             Ok(data) => match load_xlsx(&data) {
                 Ok(pkg) => (pkg, input.clone(), None),
@@ -281,7 +297,8 @@ fn main() -> ExitCode {
     }
 
     let welcome = parsed.inputs.is_empty();
-    match run_tui(pkg, &path, import_source, welcome, parsed.vim) {
+    let wizard = parsed.inputs.first().filter(|i| is_text_import(i)).cloned();
+    match run_tui(pkg, &path, import_source, welcome, parsed.vim, wizard) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
@@ -336,14 +353,20 @@ fn load_workbook(
     path: &str,
     open: &TextOpen,
 ) -> Result<(SheetPackage, String, Option<String>), String> {
+    if is_text_import(path) {
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        let text = gridcore::textio::decode(&bytes, gridcore::textio::Origin::Auto);
+        return Ok((
+            text_to_pkg(&text, &file_stem(path), &TextParse::default(), open),
+            format!("{}.xlsx", &path[..path.len() - 4]),
+            Some(path.to_string()),
+        ));
+    }
     if is_delimited(path) {
         let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
         let text = gridcore::textio::decode(&bytes, gridcore::textio::Origin::Auto);
         let tab = path.to_ascii_lowercase().ends_with(".tsv");
-        let stem = std::path::Path::new(path)
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "import".to_string());
+        let stem = file_stem(path);
         let base = &path[..path.len() - 4];
         Ok((
             csv_to_pkg(&text, &stem, tab, open),
@@ -391,12 +414,27 @@ fn parse_table_col(s: &str) -> Option<(String, String)> {
 /// `sep=` first line names the delimiter (else a `.tsv` is tab-delimited and
 /// a `.csv` sniffed), and every field converts as if typed into its cell.
 fn csv_to_pkg(text: &str, sheet_name: &str, tab: bool, open: &TextOpen) -> SheetPackage {
+    let (opts, body) = csv_parse(text, tab);
+    text_to_pkg(body, sheet_name, &opts, open)
+}
+
+/// The file name without its extension (a new sheet's name).
+fn file_stem(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "import".to_string())
+}
+
+/// Delimited or fixed-width text as a fresh one-sheet workbook, read under
+/// `opts` (the Text Import Wizard's choices).
+fn text_to_pkg(text: &str, sheet_name: &str, opts: &TextParse, open: &TextOpen) -> SheetPackage {
     let mut pkg = new_xlsx();
     let wb = &mut pkg.workbook;
     if !sheet_name.is_empty() {
         wb.sheets[0].name = sheet_name.chars().take(31).collect();
     }
-    import_csv_text(&mut wb.sheets[0], &mut wb.styles, text, tab, open);
+    import_text(&mut wb.sheets[0], &mut wb.styles, text, opts, open);
     // A text file carries no cached values: work out its formulas now.
     let mut engine = Engine::new(&pkg.workbook);
     engine.clock = open.today;
@@ -404,15 +442,10 @@ fn csv_to_pkg(text: &str, sheet_name: &str, tab: bool, open: &TextOpen) -> Sheet
     pkg
 }
 
-/// CSV text converted into `sheet` from A1 (shared by opening a `.csv` and
-/// the `sheet.import-csv` verb).
-fn import_csv_text(
-    sheet: &mut gridcore::sheet::Sheet,
-    styles: &mut gridcore::sheet::Styles,
-    text: &str,
-    tab: bool,
-    open: &TextOpen,
-) {
+/// How a CSV reads: a `sep=` first line names the delimiter (and is
+/// dropped), else a `.tsv` is tab-delimited and a `.csv` sniffed. Returns
+/// the options and the text after any directive.
+fn csv_parse(text: &str, tab: bool) -> (TextParse, &str) {
     let (directive, body) = gridcore::textio::csv_directive(text);
     let delim = directive.unwrap_or_else(|| {
         if tab {
@@ -421,13 +454,23 @@ fn import_csv_text(
             gridcore::frame::sniff_delimiter(body)
         }
     });
-    let opts = TextParse::csv(delim);
-    let records = gridcore::textio::split_text(body, &opts);
+    (TextParse::csv(delim), body)
+}
+
+/// Text converted into `sheet` from A1 under `opts`. Returns (rows, cols).
+fn import_text(
+    sheet: &mut gridcore::sheet::Sheet,
+    styles: &mut gridcore::sheet::Styles,
+    text: &str,
+    opts: &TextParse,
+    open: &TextOpen,
+) -> (u32, u32) {
+    let records = gridcore::textio::split_text(text, opts);
     let ctx = gridcore::entry::EntryCtx {
         date1904: false,
         today: open.today,
     };
-    gridcore::textio::import_records(sheet, styles, 0, 0, &records, &opts, &open.auto, &ctx);
+    gridcore::textio::import_records(sheet, styles, 0, 0, &records, opts, &open.auto, &ctx)
 }
 
 struct Parsed {
@@ -488,6 +531,7 @@ fn print_usage() {
            xlsxy                            new blank workbook\n  \
            xlsxy <file.xlsx>                open a workbook\n  \
            xlsxy <file.csv|.tsv>            import CSV/TSV as a new workbook\n  \
+           xlsxy <file.txt|.prn>            import text through the Text Import Wizard\n  \
            xlsxy <in> --recalc <out.xlsx>   recalculate all formulas, save, exit\n  \
            xlsxy <in> --csv <out.csv>       export the active sheet as CSV UTF-8, exit\n  \
            xlsxy <in> --verify              conformance scoreboard: recalculate\n  \
@@ -828,8 +872,6 @@ enum PromptKind {
     DataValidation,
     /// AutoFilter: a criteria on the current column ("=Laptop", ">500", "clear").
     Filter,
-    /// Text to Columns: a delimiter to split the selected column by.
-    TextToColumns,
     /// Multi-level sort: a spec like "B asc, C desc" over the current region.
     SortKeys,
     /// Row height in points for the selected rows ("auto" clears it).
@@ -983,6 +1025,8 @@ enum ConfirmAction {
     DeleteSheet,
     /// Save As to a macro-free type (`.xlsx`/`.xltx`) drops the VBA project.
     SaveWithoutMacros(String),
+    /// Text to Columns over cells that hold data.
+    TextToColumns(gridcore::edit::TtcSource, TextParse),
 }
 
 // The Yes/No modal itself lives in `backstage::Confirm<ConfirmAction>` (shared
@@ -1034,6 +1078,8 @@ struct App {
     // The formatting popup (number format / font & fill color).
     format_picker: Option<FormatPicker>,
     format_dialog: Option<FormatDialog>,
+    /// The Text Import Wizard or Convert Text to Columns Wizard.
+    text_dialog: Option<textdlg::TextDialog>,
     // View preferences (persisted to a config file).
     formula_view: bool,
     light_theme: bool,
@@ -1144,6 +1190,7 @@ impl App {
             ),
             format_picker: None,
             format_dialog: None,
+            text_dialog: None,
             formula_view: false,
             light_theme: false,
             auto_hide_ribbon: false,
@@ -3028,7 +3075,7 @@ impl App {
             DataValidation => self.open_prompt(PromptKind::DataValidation),
             Filter => self.open_prompt(PromptKind::Filter),
             RemoveDuplicates => self.remove_duplicates(),
-            TextToColumns => self.open_prompt(PromptKind::TextToColumns),
+            TextToColumns => self.open_text_to_columns(),
             FormatAsTable => self.format_as_table(),
             Subtotal => self.subtotal(),
             Outline => self.toggle_outline(),
@@ -3095,14 +3142,34 @@ impl App {
         }
     }
 
-    /// Replace the whole editing session with a freshly loaded workbook.
+    /// Replace the whole editing session with a freshly loaded workbook. A
+    /// `.txt`/`.prn` opens the Text Import Wizard first.
     fn open_workbook(&mut self, path: &str) {
+        if is_text_import(path) {
+            match std::fs::read(path) {
+                Ok(bytes) => {
+                    self.text_dialog = Some(textdlg::TextDialog::import(path.to_string(), bytes));
+                    self.backstage = None;
+                    self.start_screen = false;
+                }
+                Err(e) => self.status = Some(format!("Open failed: {e}")),
+            }
+            return;
+        }
         let open = TextOpen {
             auto: self.auto_convert,
             today: now_serial(),
         };
         match load_workbook(path, &open) {
-            Ok((pkg, p, import_source)) => {
+            Ok((pkg, p, import_source)) => self.install_workbook(pkg, p, import_source),
+            Err(e) => self.status = Some(format!("Open failed: {e}")),
+        }
+    }
+
+    /// Make `pkg` (loaded from, and to be saved to, `p`) the open workbook.
+    fn install_workbook(&mut self, pkg: SheetPackage, p: String, import_source: Option<String>) {
+        {
+            {
                 let (rels, meas) = pkg
                     .part(MODEL_PART)
                     .map(|b| parse_model_part(&String::from_utf8_lossy(b)))
@@ -3129,7 +3196,6 @@ impl App {
                     format!("Opened {}. {CIRCULAR_WARNING}", self.path)
                 });
             }
-            Err(e) => self.status = Some(format!("Open failed: {e}")),
         }
     }
 
@@ -3281,6 +3347,10 @@ impl App {
                     }
                     ConfirmAction::SaveWithoutMacros(path) => {
                         self.save_as_without_macros(path);
+                        false
+                    }
+                    ConfirmAction::TextToColumns(src, opts) => {
+                        self.apply_text_to_columns(&src, &opts);
                         false
                     }
                 }
@@ -3621,17 +3691,9 @@ impl App {
         });
     }
 
-    /// Split the selected column's rows by a delimiter into the columns to the
-    /// right (Text to Columns).
-    fn commit_text_to_columns(&mut self, text: &str) {
-        let delim = match text.trim().to_lowercase().as_str() {
-            "" | "comma" => ',',
-            "tab" => '\t',
-            "space" => ' ',
-            "semicolon" => ';',
-            "pipe" => '|',
-            other => other.chars().next().unwrap_or(','),
-        };
+    /// Data › Text to Columns: the Convert Text to Columns Wizard over the
+    /// selected column. More than one column is refused, as Excel does.
+    fn open_text_to_columns(&mut self) {
         let src = match gridcore::edit::TtcSource::new(self.sheet, self.selection()) {
             Ok(src) => src,
             Err(msg) => {
@@ -3639,22 +3701,93 @@ impl App {
                 return;
             }
         };
-        let opts = TextParse {
-            kind: gridcore::textio::SplitKind::Delimited {
-                delims: gridcore::textio::Delimiters::only(delim),
-                consecutive: false,
-            },
-            ..TextParse::default()
+        let wb = &self.pkg.workbook;
+        let sheet = &wb.sheets[self.sheet];
+        let last = sheet.used_size().0.saturating_sub(1).min(src.r2);
+        let sample: Vec<String> = (src.r1..=last)
+            .filter_map(|r| sheet.cell(r, src.col))
+            .map(|c| format_with(&wb.styles.xf(c.style), &c.value, wb.date1904))
+            .filter(|t| !t.is_empty())
+            .take(8)
+            .collect();
+        let dest = cell_name(src.dest.0, src.dest.1);
+        self.text_dialog = Some(textdlg::TextDialog::columns(src, sample, dest));
+    }
+
+    /// A key for the wizard.
+    fn text_dialog_key(&mut self, code: KeyCode) {
+        let Some(d) = self.text_dialog.as_mut() else {
+            return;
         };
-        let mut n = 0;
+        match d.key(code) {
+            textdlg::Outcome::Pending => {}
+            textdlg::Outcome::Cancel => {
+                self.text_dialog = None;
+                self.status = Some("Cancelled".to_string());
+            }
+            textdlg::Outcome::Finish => self.finish_text_dialog(),
+        }
+    }
+
+    /// Finish: import the text file, or convert the column (asking first
+    /// when that overwrites data).
+    fn finish_text_dialog(&mut self) {
+        let Some(d) = self.text_dialog.take() else {
+            return;
+        };
+        let opts = d.parse();
+        match &d.purpose {
+            textdlg::Purpose::Import { path, .. } => {
+                let open = TextOpen {
+                    auto: self.auto_convert,
+                    today: now_serial(),
+                };
+                let pkg = text_to_pkg(d.text(), &file_stem(path), &opts, &open);
+                let save_path = format!("{}.xlsx", &path[..path.len() - 4]);
+                self.install_workbook(pkg, save_path, Some(path.clone()));
+            }
+            textdlg::Purpose::Columns { src, .. } => {
+                let Some(dest) = parse_a1(&d.dest) else {
+                    self.status = Some("The destination must be a cell, such as B1".to_string());
+                    self.text_dialog = Some(d);
+                    return;
+                };
+                let src = gridcore::edit::TtcSource { dest, ..*src };
+                self.request_text_to_columns(src, opts);
+            }
+        }
+    }
+
+    /// Convert, asking Excel's question first when a destination cell other
+    /// than the source column holds data.
+    fn request_text_to_columns(&mut self, src: gridcore::edit::TtcSource, opts: TextParse) {
+        if gridcore::edit::ttc_would_overwrite(&self.pkg.workbook, &src, &opts) {
+            self.confirm = Some(backstage::Confirm::new(
+                gridcore::edit::TTC_REPLACE,
+                ConfirmAction::TextToColumns(src, opts),
+                Color::Green,
+            ));
+        } else {
+            self.apply_text_to_columns(&src, &opts);
+        }
+    }
+
+    /// Text to Columns, as one undoable edit. Returns the rows converted.
+    fn apply_text_to_columns(
+        &mut self,
+        src: &gridcore::edit::TtcSource,
+        opts: &TextParse,
+    ) -> usize {
         let today = now_serial();
+        let mut n = 0;
         self.structural(|wb| {
-            n = gridcore::edit::text_to_columns(wb, &src, &opts, today);
+            n = gridcore::edit::text_to_columns(wb, src, opts, today);
         });
         self.status = Some(format!(
-            "Text to Columns: split {n} row{}",
+            "Text to Columns: converted {n} row{}",
             if n == 1 { "" } else { "s" }
         ));
+        n
     }
 
     /// Remove duplicate rows in the contiguous region around the cursor
@@ -4418,9 +4551,6 @@ impl App {
                 "Filter this column (=Laptop, >500, <>0, 'clear'): ",
                 String::new(),
             ),
-            PromptKind::TextToColumns => {
-                ("Split column by (comma, tab, space, ;): ", String::new())
-            }
             PromptKind::SortKeys => ("Sort by (e.g. B asc, C desc): ", String::new()),
             PromptKind::RowHeight => ("Row height in points (or 'auto'): ", String::new()),
         };
@@ -4461,7 +4591,6 @@ impl App {
             PromptKind::CondFormat => self.commit_cond_format(&text),
             PromptKind::DataValidation => self.commit_data_validation(&text),
             PromptKind::Filter => self.commit_filter(&text),
-            PromptKind::TextToColumns => self.commit_text_to_columns(&text),
             PromptKind::SortKeys => self.commit_sort(&text),
             PromptKind::RowHeight => self.commit_row_height(&text),
             PromptKind::SaveAs => {
@@ -4641,7 +4770,7 @@ impl App {
 /// (green).
 impl backstage::BackstageHost for App {
     fn extensions(&self) -> &'static [&'static str] {
-        &["xlsx", "xlsm", "xltx", "xltm", "csv", "tsv"]
+        &["xlsx", "xlsm", "xltx", "xltm", "csv", "tsv", "txt", "prn"]
     }
 
     fn default_save_name(&self) -> String {
@@ -5086,6 +5215,9 @@ fn draw(app: &mut App, f: &mut Frame) {
     }
     if let Some(d) = &app.format_dialog {
         draw_format_dialog(app, d, f, grid);
+    }
+    if let Some(d) = &app.text_dialog {
+        d.draw(f, grid);
     }
 
     // --- sheet picker -----------------------------------------------------------
@@ -6024,6 +6156,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         || app.edit.is_some()
         || app.format_picker.is_some()
         || app.format_dialog.is_some()
+        || app.text_dialog.is_some()
         || app.sheet_picker.is_some()
         || app.dv_picker.is_some();
     // Plain F9 engages the ribbon (docxy parity); Shift/Ctrl+F9 stays recalc.
@@ -6047,6 +6180,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     }
     if app.format_dialog.is_some() {
         app.format_dialog_key(key.code);
+        return false;
+    }
+    if app.text_dialog.is_some() {
+        app.text_dialog_key(key.code);
         return false;
     }
 
@@ -6528,6 +6665,7 @@ fn run_tui(
     import_source: Option<String>,
     welcome: bool,
     vim: bool,
+    wizard: Option<String>,
 ) -> io::Result<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -6553,6 +6691,9 @@ fn run_tui(
         });
     }
     app.start_screen = welcome;
+    if let Some(text_file) = wizard {
+        app.open_workbook(&text_file);
+    }
     // Detect the terminal's graphics capability (kitty/iTerm2/Sixel); fall back to
     // a half-block renderer so embedded pictures still show something.
     app.picker =
@@ -7421,20 +7562,143 @@ mod tests {
         assert!(gridcore::cf::cell_dxf(&re.workbook, 0, 0, 0).is_none());
     }
 
-    #[test]
-    fn commit_text_to_columns_splits_column() {
-        use gridcore::sheet::{Cell, CellValue};
+    fn ttc_app(cells: &[(u32, u32, &str)]) -> App {
+        use gridcore::sheet::Cell;
         let mut app = App::new(new_xlsx(), "t.xlsx");
         app.os_clip = None;
-        app.pkg.workbook.sheets[0].set_cell(0, 0, Cell::text("Dock,2,179"));
+        for (r, c, t) in cells {
+            app.pkg.workbook.sheets[0].set_cell(*r, *c, Cell::text(t));
+        }
         app.rebuild_engine();
+        app
+    }
+
+    /// #692: Data › Text to Columns opens the wizard; Finish converts.
+    #[test]
+    fn text_to_columns_runs_through_the_wizard() {
+        use gridcore::sheet::CellValue;
+        let mut app = ttc_app(&[(0, 0, "Pen,4,\"Blue, fine\",0012")]);
         app.cur = (0, 0);
         app.anchor = None;
-        app.commit_text_to_columns(",");
+        app.ribbon_act(ribbon::Act::TextToColumns);
+        let d = app.text_dialog.as_mut().expect("wizard open");
+        assert!(!d.is_import());
+        d.goto_step(1);
+        d.key(KeyCode::Char(' ')); // untick Tab
+        d.key(KeyCode::Down);
+        d.key(KeyCode::Down);
+        d.key(KeyCode::Char(' ')); // Comma
+        d.goto_step(2);
+        d.key(KeyCode::Right);
+        d.key(KeyCode::Right);
+        d.key(KeyCode::Right); // column 4
+        d.key(KeyCode::Char('t'));
+        app.text_dialog_key(KeyCode::Enter);
+        assert!(app.text_dialog.is_none());
         let sh = app.sheet();
-        assert_eq!(sh.cell(0, 0).unwrap().value, CellValue::Text("Dock".into()));
-        assert_eq!(sh.cell(0, 1).unwrap().value, CellValue::Number(2.0));
-        assert_eq!(sh.cell(0, 2).unwrap().value, CellValue::Number(179.0));
+        assert_eq!(sh.cell(0, 0).unwrap().value, CellValue::Text("Pen".into()));
+        assert_eq!(sh.cell(0, 1).unwrap().value, CellValue::Number(4.0));
+        assert_eq!(
+            sh.cell(0, 2).unwrap().value,
+            CellValue::Text("Blue, fine".into())
+        );
+        assert_eq!(sh.cell(0, 3).unwrap().value, CellValue::Text("0012".into()));
+        // One undo restores the column.
+        app.undo();
+        assert_eq!(
+            app.sheet().cell(0, 0).unwrap().value,
+            CellValue::Text("Pen,4,\"Blue, fine\",0012".into())
+        );
+    }
+
+    /// #692: data in the way asks first; No changes nothing, Yes converts.
+    #[test]
+    fn text_to_columns_asks_before_replacing_data() {
+        use gridcore::sheet::CellValue;
+        let cells = [(0, 0, "a\tb"), (0, 1, "keep")];
+        for (answer, b1) in [(KeyCode::Char('n'), "keep"), (KeyCode::Char('y'), "b")] {
+            let mut app = ttc_app(&cells);
+            app.cur = (0, 0);
+            app.ribbon_act(ribbon::Act::TextToColumns);
+            app.text_dialog_key(KeyCode::Enter);
+            let c = app.confirm.as_ref().expect("asks first");
+            assert_eq!(c.prompt(), gridcore::edit::TTC_REPLACE);
+            app.confirm_key(KeyEvent::new(answer, KeyModifiers::NONE));
+            assert!(app.confirm.is_none());
+            assert_eq!(
+                app.sheet().cell(0, 1).unwrap().value,
+                CellValue::Text(b1.into())
+            );
+        }
+    }
+
+    /// #692: more than one column is refused with Excel's message.
+    #[test]
+    fn text_to_columns_refuses_two_columns() {
+        let mut app = ttc_app(&[(0, 0, "a,b"), (0, 1, "c")]);
+        app.cur = (0, 1);
+        app.anchor = Some((0, 0));
+        app.ribbon_act(ribbon::Act::TextToColumns);
+        assert!(app.text_dialog.is_none());
+        assert_eq!(app.status.as_deref(), Some(gridcore::edit::TTC_ONE_COLUMN));
+    }
+
+    /// #607: opening a .txt shows the wizard; Finish imports it with the
+    /// chosen formats; Esc leaves the workbook as it was.
+    #[test]
+    fn opening_a_text_file_runs_the_import_wizard() {
+        use gridcore::sheet::CellValue;
+        let dir = std::env::temp_dir().join(format!("xlsxy-wizard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("parts.txt");
+        std::fs::write(&path, "02134\t03/04/2024\t1.234,5-\tx\r\n").unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.open_workbook(path.to_str().unwrap());
+        assert!(app.text_dialog.as_ref().is_some_and(|d| d.is_import()));
+        app.text_dialog_key(KeyCode::Esc);
+        assert!(app.text_dialog.is_none());
+        assert_eq!(app.path, "untitled.xlsx");
+
+        app.open_workbook(path.to_str().unwrap());
+        let d = app.text_dialog.as_mut().unwrap();
+        d.goto_step(2);
+        d.columns = vec![
+            gridcore::textio::ColFormat::Text,
+            gridcore::textio::ColFormat::Date(gridcore::textio::DateOrder::Dmy),
+            gridcore::textio::ColFormat::General,
+            gridcore::textio::ColFormat::Skip,
+        ];
+        d.decimal = ',';
+        d.thousands = '.';
+        app.text_dialog_key(KeyCode::Enter);
+        assert!(app.text_dialog.is_none());
+        assert_eq!(Path::new(&app.path), path.with_extension("xlsx"));
+        assert_eq!(app.import_source.as_deref(), path.to_str());
+        let sh = app.sheet();
+        assert_eq!(
+            sh.cell(0, 0).unwrap().value,
+            CellValue::Text("02134".into())
+        );
+        let apr3 = gridcore::sheet::parts_to_serial(2024, 4, 3, 0, false);
+        assert_eq!(sh.cell(0, 1).unwrap().value, CellValue::Number(apr3));
+        assert_eq!(sh.cell(0, 2).unwrap().value, CellValue::Number(-1234.5));
+        assert!(sh.cell(0, 3).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_wizard_draws_over_the_grid() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = ttc_app(&[(0, 0, "a,b")]);
+        app.ribbon_act(ribbon::Act::TextToColumns);
+        let mut term = Terminal::new(TestBackend::new(100, 34)).unwrap();
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        let text = format!("{:?}", term.backend().buffer());
+        assert!(
+            text.contains("Convert Text to Columns Wizard"),
+            "title missing"
+        );
     }
 
     #[test]

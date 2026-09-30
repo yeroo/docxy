@@ -768,7 +768,7 @@ name and defaults to the active sheet):
 | `wb.reload` | — | `{path, …}` (re-reads the file, dropping unsaved edits) |
 | `wb.open` | `{path}` | `{path, …}` |
 | `comment.list` | — | `{comments:[{sheet,ref,author,text}]}` (threads flattened in reply order) |
-| `wb.export-csv` | `{sheet?}` | `{sheet, csv}` — display-formatted RFC-4180, the **live buffer** |
+| `wb.export-csv` | `{sheet?}` | `{sheet, csv}` — display-formatted, Excel's CSV text (CR LF records, LF inside a quoted field; a file adds the UTF-8 BOM), the **live buffer** |
 | `sheet.pivot` | `{range,rows:[col],cols?:[col],values:[{col,agg}],sheet?}` | `{table:[[string]]}` — **ad-hoc and read-only**, no workbook mutation |
 | `pivot.create` | `{range,rows:[col],cols?:[col],values:[{col,agg}],name?,sheet?}` | `{sheet,name}` — builds a REAL, persistent workbook pivot on a NEW sheet |
 | `formula.eval` | `{formula,ref?,sheet?}` | `{value,text}` — side-effect-free preview, writes nowhere |
@@ -778,7 +778,9 @@ name and defaults to the active sheet):
 | `comment.add` | `{ref,text,author?,sheet?}` | `{sheet,ref}` |
 | `comment.remove` | `{ref,sheet?}` | `{removed:bool}` |
 | `range.set` | `{start,rows:[[string]],sheet?}` | `{set:N}` — each string typed like `cell.set`; **atomic**: every formula and length validated first, any invalid (a bad formula, or an entry over 32,767 characters) → an error naming the cell and nothing applied; one undo group |
-| `sheet.import-csv` | `{text,name?}` | `{sheet,name,rows,cols}` — always a **new** sheet, never overwrites |
+| `sheet.import-csv` | `{text,name?}` | `{sheet,name,rows,cols}` — always a **new** sheet, never overwrites ; fields convert as opening a `.csv` does (a `sep=` first line, typed-entry dates/percentages/formulas, 15 digits, File › Options › Data) |
+| `sheet.import-text` | `{text\|path,options?,name?}` | `{sheet,name,rows,cols}` — the Text Import Wizard without the dialog, into a **new** sheet. `options`: `kind` (`delimited`/`fixed`), `delimiters` (`tab`, `semicolon`, `comma`, `space` or a character), `consecutive`, `qualifier` (`"`, `'`, `none`), `breaks`, `start_row`, `origin` (`auto`, `utf-8`, `utf-16le`, `windows-1252`), `columns` (`general`, `text`, `date:dmy`…, `skip`), `decimal`, `thousands`, `trailing_minus` |
+| `range.text-to-columns` | `{range,options?,dest?,replace?,sheet?}` | `{rows}` — Data › Text to Columns on **one** column with the same `options`; refuses with "Do you want to replace the contents of the destination cells?" unless `replace:true`; one undo step |
 | `wb.replace-all` | `{query,text}` | `{replaced}` — spans **all sheets**, one undo group; the match runs on each cell's own input text (never on the `'` a quote prefix adds, which is kept on the result), and the replaced text is re-read with the entry rules of `cell.set`, except that a percent cell's number constant is not divided again; a result over the cell limit leaves that cell as it was |
 | `sheet.add` | `{name?}` | `{sheet,name}` — deduplicates a taken name, never errors |
 | `sheet.remove` | `{sheet}` | `{removed:true}` (errors on the last sheet; `sheet` is required, no active-sheet default) |

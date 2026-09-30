@@ -33,7 +33,9 @@
 //! | `comment.add` | `{ref,text,author?,sheet?}` | `{sheet,ref}` |
 //! | `comment.remove` | `{ref,sheet?}` | `{removed:bool}` |
 //! | `range.set` | `{start,rows:[[string]],sheet?}` | `{set}` — atomic, one undo group |
-//! | `sheet.import-csv` | `{text,name?}` | `{sheet,name,rows,cols}` — always a new sheet |
+//! | `sheet.import-csv` | `{text,name?}` | `{sheet,name,rows,cols}` — always a new sheet; fields convert as a `.csv` open does (`sep=`, typed-entry rules, File › Options › Data) |
+//! | `sheet.import-text` | `{text\|path,options?,name?}` | `{sheet,name,rows,cols}` — the Text Import Wizard's options (see `text_options`) into a new sheet |
+//! | `range.text-to-columns` | `{range,options?,dest?,replace?,sheet?}` | `{rows}` — one column; refuses with "Do you want to replace the contents of the destination cells?" unless `replace:true`; one undo step |
 //! | `wb.replace-all` | `{query,text}` | `{replaced}` — every sheet, one undo group |
 //! | `sheet.add` | `{name?}` | `{sheet,name}` |
 //! | `sheet.remove` | `{sheet}` | `{removed:true}` (last-sheet error) |
@@ -97,6 +99,8 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         "comment.remove" => comment_remove(app, args),
         "range.set" => range_set(app, args),
         "sheet.import-csv" => sheet_import_csv(app, args),
+        "sheet.import-text" => sheet_import_text(app, args),
+        "range.text-to-columns" => range_text_to_columns(app, args),
         "wb.replace-all" => wb_replace_all(app, args),
         "sheet.add" => sheet_add(app, args),
         "sheet.remove" => sheet_remove(app, args),
@@ -125,7 +129,18 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
                 .get_str("path")
                 .ok_or("wb.open needs a 'path' string")?
                 .to_string();
-            app.open_workbook(&p);
+            if super::is_text_import(&p) {
+                // No wizard for an agent: the wizard's defaults (or use
+                // sheet.import-text for other options).
+                let open = super::TextOpen {
+                    auto: app.auto_convert,
+                    today: now_serial(),
+                };
+                let (pkg, save, source) = super::load_workbook(&p, &open)?;
+                app.install_workbook(pkg, save, source);
+            } else {
+                app.open_workbook(&p);
+            }
             Ok(path_info(app))
         }
         other => Err(format!("unknown verb '{other}'")),
@@ -140,6 +155,8 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
                 | "comment.add"
                 | "range.set"
                 | "sheet.import-csv"
+                | "sheet.import-text"
+                | "range.text-to-columns"
                 | "wb.replace-all"
                 | "sheet.add"
                 | "sheet.remove"
@@ -851,6 +868,192 @@ fn unique_sheet_name(wb: &gridcore::sheet::Workbook, base: &str) -> String {
     }
 }
 
+/// The Text Import Wizard / Text to Columns options of a verb's `options`
+/// object, and the file origin. Every key is optional; the defaults are the
+/// wizard's (delimited by Tab, `"` qualifier, row 1, General columns).
+///
+/// `kind` (`delimited`|`fixed`), `delimiters` (an array of `tab`,
+/// `semicolon`, `comma`, `space` or any single character), `consecutive`,
+/// `qualifier` (`"`, `'` or `none`), `breaks` (fixed-width positions),
+/// `start_row` (1-based), `origin` (`auto`, `utf-8`, `utf-16le`,
+/// `windows-1252`), `columns` (`general`, `text`, `date:dmy`…, `skip`),
+/// `decimal`, `thousands` (one character each) and `trailing_minus`.
+fn text_options(
+    args: &Json,
+) -> Result<(gridcore::textio::TextParse, gridcore::textio::Origin), String> {
+    use gridcore::textio::{ColFormat, Delimiters, Origin, SplitKind, TextParse};
+    let mut opts = TextParse::default();
+    let mut origin = Origin::Auto;
+    let o = match args.get("options") {
+        None | Some(Json::Null) => return Ok((opts, origin)),
+        Some(o @ Json::Obj(_)) => o,
+        Some(_) => return Err("'options' must be an object".into()),
+    };
+    let one_char = |key: &str| -> Result<Option<char>, String> {
+        match o.get_str(key) {
+            None => Ok(None),
+            Some(v) => {
+                let mut cs = v.chars();
+                match (cs.next(), cs.next()) {
+                    (Some(c), None) => Ok(Some(c)),
+                    _ => Err(format!("'{key}' must be one character")),
+                }
+            }
+        }
+    };
+    let flag = |key: &str| o.get(key).and_then(Json::as_bool);
+    let fixed = match o.get_str("kind") {
+        None => o.get("breaks").is_some(),
+        Some("delimited") => false,
+        Some("fixed") => true,
+        Some(k) => return Err(format!("unknown kind '{k}' (delimited or fixed)")),
+    };
+    if fixed {
+        let breaks = match o.get("breaks") {
+            None => Vec::new(),
+            Some(b) => b
+                .as_array()
+                .ok_or("'breaks' must be an array of positions")?
+                .iter()
+                .map(|v| v.as_usize().ok_or("'breaks' must be an array of positions"))
+                .collect::<Result<_, _>>()?,
+        };
+        opts.kind = SplitKind::Fixed { breaks };
+    } else {
+        let mut delims = Delimiters::only('\t');
+        if let Some(list) = o.get("delimiters") {
+            delims = Delimiters::default();
+            let list = list.as_array().ok_or("'delimiters' must be an array")?;
+            for d in list {
+                let d = d.as_str().ok_or("'delimiters' must be strings")?;
+                match d.to_ascii_lowercase().as_str() {
+                    "tab" | "\t" => delims.tab = true,
+                    "semicolon" | ";" => delims.semicolon = true,
+                    "comma" | "," => delims.comma = true,
+                    "space" | " " => delims.space = true,
+                    _ => {
+                        let mut cs = d.chars();
+                        match (cs.next(), cs.next()) {
+                            (Some(c), None) => delims.other = Some(c),
+                            _ => return Err(format!("unknown delimiter '{d}'")),
+                        }
+                    }
+                }
+            }
+        }
+        opts.kind = SplitKind::Delimited {
+            delims,
+            consecutive: flag("consecutive").unwrap_or(false),
+        };
+    }
+    if let Some(q) = o.get_str("qualifier") {
+        opts.qualifier = match q {
+            "none" | "" => None,
+            "\"" | "'" => q.chars().next(),
+            _ => return Err(format!("unknown qualifier '{q}' (\", ' or none)")),
+        };
+    }
+    if let Some(v) = o.get("start_row") {
+        opts.start_row = v
+            .as_usize()
+            .filter(|n| *n >= 1)
+            .ok_or("'start_row' must be a row number from 1")?;
+    }
+    if let Some(v) = o.get_str("origin") {
+        origin = Origin::parse(v).ok_or_else(|| format!("unknown origin '{v}'"))?;
+    }
+    if let Some(cols) = o.get("columns") {
+        opts.columns = cols
+            .as_array()
+            .ok_or("'columns' must be an array")?
+            .iter()
+            .map(|c| {
+                c.as_str()
+                    .and_then(ColFormat::parse)
+                    .ok_or_else(|| format!("unknown column format {c:?}"))
+            })
+            .collect::<Result<_, _>>()?;
+    }
+    if let Some(c) = one_char("decimal")? {
+        opts.decimal = c;
+    }
+    if let Some(c) = one_char("thousands")? {
+        opts.thousands = c;
+    }
+    if opts.decimal == opts.thousands {
+        return Err("the decimal and thousands separators must differ".into());
+    }
+    if let Some(b) = flag("trailing_minus") {
+        opts.trailing_minus = b;
+    }
+    Ok((opts, origin))
+}
+
+/// The Text Import Wizard without the dialog: `text` (or the file at
+/// `path`) read under `options` into a brand-new sheet, as `sheet.import-csv`
+/// adds one.
+fn sheet_import_text(app: &mut App, args: &Json) -> Result<Json, String> {
+    let (opts, origin) = text_options(args)?;
+    let text = match (args.get_str("text"), args.get_str("path")) {
+        (Some(t), _) => t.to_string(),
+        (None, Some(p)) => {
+            let bytes = std::fs::read(p).map_err(|e| format!("cannot read {p}: {e}"))?;
+            gridcore::textio::decode(&bytes, origin)
+        }
+        (None, None) => return Err("sheet.import-text needs 'text' or 'path'".into()),
+    };
+    let requested = args.get_str("name").unwrap_or("Sheet");
+    let name = unique_sheet_name(&app.pkg.workbook, requested);
+    let idx = app.pkg.add_sheet(&name);
+    let open = super::TextOpen {
+        auto: app.auto_convert,
+        today: now_serial(),
+    };
+    let wb = &mut app.pkg.workbook;
+    super::import_text(&mut wb.sheets[idx], &mut wb.styles, &text, &opts, &open);
+    let (rows, cols) = app.pkg.workbook.sheets[idx].used_size();
+    // A new sheet does not fit the cell-level undo model (see import-csv).
+    app.undo.clear();
+    app.redo.clear();
+    app.rebuild_engine();
+    app.modified = true;
+    Ok(Json::obj(vec![
+        ("sheet", Json::Num(idx as f64)),
+        ("name", Json::Str(name)),
+        ("rows", Json::Num(rows as f64)),
+        ("cols", Json::Num(cols as f64)),
+    ]))
+}
+
+/// Data › Text to Columns on one column: `range` converted under `options`
+/// into `dest` (default: the range's first cell). When that overwrites cells
+/// holding data the verb refuses with Excel's question unless `replace` is
+/// true. One undo step.
+fn range_text_to_columns(app: &mut App, args: &Json) -> Result<Json, String> {
+    let si = sheet_arg(app, args)?;
+    let rg = args
+        .get_str("range")
+        .ok_or("range.text-to-columns needs a 'range'")?;
+    let range = parse_range_name(rg.trim()).ok_or_else(|| format!("bad range '{rg}'"))?;
+    let mut src = gridcore::edit::TtcSource::new(si, range).map_err(str::to_string)?;
+    if let Some(d) = args.get_str("dest") {
+        src.dest = parse_cell_name(d.trim()).ok_or_else(|| format!("bad cell ref '{d}'"))?;
+    }
+    let (opts, _) = text_options(args)?;
+    let replace = args.get("replace").and_then(Json::as_bool).unwrap_or(false);
+    if !replace && gridcore::edit::ttc_would_overwrite(&app.pkg.workbook, &src, &opts) {
+        return Err(format!(
+            "{} (pass replace:true to overwrite)",
+            gridcore::edit::TTC_REPLACE
+        ));
+    }
+    if app.sheet != si {
+        app.sheet = si;
+    }
+    let rows = app.apply_text_to_columns(&src, &opts);
+    Ok(Json::obj(vec![("rows", Json::Num(rows as f64))]))
+}
+
 /// Import CSV text as a brand-new sheet (never overwrites an existing one —
 /// name collisions are deduplicated), converted exactly as opening a `.csv`
 /// converts it (`csv_to_pkg`), but into a sheet of the *live* workbook.
@@ -865,8 +1068,9 @@ fn sheet_import_csv(app: &mut App, args: &Json) -> Result<Json, String> {
         auto: app.auto_convert,
         today: now_serial(),
     };
+    let (opts, body) = super::csv_parse(text, false);
     let wb = &mut app.pkg.workbook;
-    super::import_csv_text(&mut wb.sheets[idx], &mut wb.styles, text, false, &open);
+    super::import_text(&mut wb.sheets[idx], &mut wb.styles, body, &opts, &open);
     let (rows, cols) = app.pkg.workbook.sheets[idx].used_size();
     // New package parts (worksheet/relationship/workbook.xml wiring) don't
     // fit the cell-level undo model — same as the TUI's own AddSheet flow,
@@ -2121,6 +2325,157 @@ mod tests {
         assert_eq!(sh.cell(1, 0).unwrap().value, CellValue::Number(0.12));
         assert_eq!(sh.cell(1, 1).unwrap().value, CellValue::Number(2.0));
         assert_eq!(r.get_usize("rows"), Some(2));
+    }
+
+    fn get_value(a: &App, r: &str) -> CellValue {
+        let (row, col) = parse_cell_name(r).unwrap();
+        a.pkg.workbook.sheets[a.sheet]
+            .cell(row, col)
+            .map(|c| c.value.clone())
+            .unwrap_or_default()
+    }
+
+    fn opts(pairs: Vec<(&str, Json)>) -> Json {
+        Json::obj(pairs)
+    }
+
+    fn strs(v: &[&str]) -> Json {
+        Json::Arr(v.iter().map(|s| Json::Str(s.to_string())).collect())
+    }
+
+    /// #607: the Text Import Wizard's example through the control surface.
+    #[test]
+    fn sheet_import_text_applies_the_wizard_options() {
+        let mut a = app();
+        let r = dispatch(
+            &mut a,
+            "sheet.import-text",
+            &Json::obj(vec![
+                (
+                    "text",
+                    Json::Str("02134\t03/04/2024\t1.234,5-\tx\r\n".into()),
+                ),
+                (
+                    "options",
+                    opts(vec![
+                        ("columns", strs(&["text", "date:dmy", "general", "skip"])),
+                        ("decimal", Json::Str(",".into())),
+                        ("thousands", Json::Str(".".into())),
+                        ("trailing_minus", Json::Bool(true)),
+                    ]),
+                ),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            (r.get_usize("rows"), r.get_usize("cols")),
+            (Some(1), Some(3))
+        );
+        let sh = &a.pkg.workbook.sheets[r.get_usize("sheet").unwrap()];
+        assert_eq!(
+            sh.cell(0, 0).unwrap().value,
+            CellValue::Text("02134".into())
+        );
+        let apr3 = gridcore::sheet::parts_to_serial(2024, 4, 3, 0, false);
+        assert_eq!(sh.cell(0, 1).unwrap().value, CellValue::Number(apr3));
+        let b1 = a.pkg.workbook.styles.xf(sh.cell(0, 1).unwrap().style);
+        assert_eq!(b1.numfmt, gridcore::sheet::NumFmt::Date);
+        assert_eq!(sh.cell(0, 2).unwrap().value, CellValue::Number(-1234.5));
+        assert!(sh.cell(0, 3).is_none());
+    }
+
+    #[test]
+    fn sheet_import_text_reads_fixed_width_start_row_and_origin() {
+        let dir = std::env::temp_dir().join(format!("xlsxy-import-text-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fixed.prn");
+        std::fs::write(&path, b"skip me\r\nZ\xFCr  12\r\n").unwrap();
+        let mut a = app();
+        let r = dispatch(
+            &mut a,
+            "sheet.import-text",
+            &Json::obj(vec![
+                ("path", Json::Str(path.to_str().unwrap().into())),
+                (
+                    "options",
+                    opts(vec![
+                        ("kind", Json::Str("fixed".into())),
+                        ("breaks", Json::Arr(vec![Json::Num(5.0)])),
+                        ("start_row", Json::Num(2.0)),
+                        ("origin", Json::Str("windows-1252".into())),
+                    ]),
+                ),
+            ]),
+        )
+        .unwrap();
+        let sh = &a.pkg.workbook.sheets[r.get_usize("sheet").unwrap()];
+        assert_eq!(
+            sh.cell(0, 0).unwrap().value,
+            CellValue::Text("Z\u{fc}r".into())
+        );
+        assert_eq!(sh.cell(0, 1).unwrap().value, CellValue::Number(12.0));
+        let bad = dispatch(
+            &mut a,
+            "sheet.import-text",
+            &Json::obj(vec![
+                ("text", Json::Str("a".into())),
+                ("options", opts(vec![("columns", strs(&["bogus"]))])),
+            ]),
+        );
+        assert!(bad.unwrap_err().contains("unknown column format"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #692: the verb converts one column, refusing to overwrite data unless
+    /// told to, as one undo step.
+    #[test]
+    fn range_text_to_columns_asks_before_replacing() {
+        let mut a = app();
+        set(&mut a, "A1", "Ink,,Red,7");
+        set(&mut a, "D1", "keep");
+        let args = |replace: Option<bool>| {
+            let mut v = vec![
+                ("range", Json::Str("A1".into())),
+                ("options", opts(vec![("delimiters", strs(&["comma"]))])),
+            ];
+            if let Some(b) = replace {
+                v.push(("replace", Json::Bool(b)));
+            }
+            Json::obj(v)
+        };
+        let err = dispatch(&mut a, "range.text-to-columns", &args(None)).unwrap_err();
+        assert!(err.contains(gridcore::edit::TTC_REPLACE), "{err}");
+        assert_eq!(get_value(&a, "A1"), CellValue::Text("Ink,,Red,7".into()));
+        let r = dispatch(&mut a, "range.text-to-columns", &args(Some(true))).unwrap();
+        assert_eq!(r.get_usize("rows"), Some(1));
+        assert_eq!(get_value(&a, "A1"), CellValue::Text("Ink".into()));
+        assert_eq!(get_value(&a, "B1"), CellValue::Empty);
+        assert_eq!(get_value(&a, "C1"), CellValue::Text("Red".into()));
+        assert_eq!(get_value(&a, "D1"), CellValue::Number(7.0));
+        a.undo();
+        assert_eq!(get_value(&a, "D1"), CellValue::Text("keep".into()));
+        let two = Json::obj(vec![("range", Json::Str("A1:B2".into()))]);
+        let err = dispatch(&mut a, "range.text-to-columns", &two).unwrap_err();
+        assert_eq!(err, gridcore::edit::TTC_ONE_COLUMN);
+    }
+
+    #[test]
+    fn wb_open_of_a_text_file_imports_it_with_the_wizard_defaults() {
+        let dir = std::env::temp_dir().join(format!("xlsxy-open-txt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tabs.txt");
+        std::fs::write(&path, "a\t1\n").unwrap();
+        let mut a = app();
+        dispatch(
+            &mut a,
+            "wb.open",
+            &Json::obj(vec![("path", Json::Str(path.to_str().unwrap().into()))]),
+        )
+        .unwrap();
+        assert!(a.text_dialog.is_none());
+        assert_eq!(get_value(&a, "B1"), CellValue::Number(1.0));
+        assert_eq!(std::path::Path::new(&a.path), path.with_extension("xlsx"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

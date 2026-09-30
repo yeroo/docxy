@@ -152,7 +152,7 @@ pub enum SplitKind {
 }
 
 /// Everything the Text Import Wizard and Text to Columns ask for.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextParse {
     pub kind: SplitKind,
     /// The text qualifier (`"`, `'` or none). Delimited only.
