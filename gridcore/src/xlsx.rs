@@ -161,6 +161,7 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
 
     // Workbook: sheet list + date system + defined names.
     let (sheet_meta, date1904, iterate, raw_names) = parse_workbook_xml(&wb_xml);
+    let active_tab = parse_active_tab(&wb_xml).min(sheet_meta.len().saturating_sub(1));
 
     // Shared strings + styles (relative to the workbook dir). Keep the resolved
     // shared-strings part name so save can append to it in place.
@@ -369,6 +370,7 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
             pivots,
             date1904,
             iterate,
+            active_tab,
         },
     })
 }
@@ -752,6 +754,20 @@ fn parse_workbook_xml(
     (sheets, date1904, iterate, names)
 }
 
+/// `<workbookView activeTab>` of the first workbook view; 0 when absent.
+fn parse_active_tab(xml: &str) -> usize {
+    let mut p = XmlParser::new(xml);
+    loop {
+        match p.next() {
+            Event::Start if local(p.name()) == "workbookView" => {
+                return p.attr("activeTab").parse().unwrap_or(0);
+            }
+            Event::Eof => return 0,
+            _ => {}
+        }
+    }
+}
+
 /// Plain text of each `<si>` (rich-text runs concatenated).
 fn parse_shared_strings(xml: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -1050,10 +1066,46 @@ fn cell_xf_elements(xml: &str) -> Vec<&str> {
 
 /// An attribute's raw value in one open tag.
 fn tag_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
-    let key = format!(" {name}=\"");
-    let s = tag.find(&key)? + key.len();
-    let e = s + tag[s..].find('"')?;
+    let (_, s, e, _) = attr_span(tag, name)?;
     Some(&tag[s..e])
+}
+
+/// Where attribute `name` sits in one open tag: the whitespace before it,
+/// its value's start and end, and the end past the closing quote. Any
+/// whitespace may surround the `=`, and the value may be in either quote.
+fn attr_span(tag: &str, name: &str) -> Option<(usize, usize, usize, usize)> {
+    let b = tag.as_bytes();
+    let mut from = 0;
+    while let Some(off) = tag[from..].find(name) {
+        let at = from + off;
+        from = at + name.len();
+        let before = at.checked_sub(1).map(|i| b[i]);
+        if !before.is_some_and(|c| c.is_ascii_whitespace()) {
+            continue;
+        }
+        let mut i = at + name.len();
+        while b.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        if b.get(i) != Some(&b'=') {
+            continue;
+        }
+        i += 1;
+        while b.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        let Some(&q) = b.get(i).filter(|c| matches!(c, b'"' | b'\'')) else {
+            continue;
+        };
+        let start = i + 1;
+        let len = tag[start..].find(q as char)?;
+        let mut ws = at;
+        while ws > 0 && b[ws - 1].is_ascii_whitespace() {
+            ws -= 1;
+        }
+        return Some((ws, start, start + len, start + len + 1));
+    }
+    None
 }
 
 /// Every `name="value"` of one open tag, raw, in order.
@@ -2204,6 +2256,13 @@ fn set_content_type_override(parts: &mut [(String, Vec<u8>)], part_name: &str, c
 fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
     let mut parts = pkg.parts.clone();
     let wb = &pkg.workbook;
+    let active_tab = wb.active_tab.min(wb.sheets.len().saturating_sub(1));
+    // Tab selection is kept in step with the active tab only in a file that
+    // marks one (Excel's always do); a file that marks none stays as it is.
+    let tabs_selected = pkg.sheet_parts.iter().any(|name| {
+        pkg.part(name)
+            .is_some_and(|b| tab_is_selected(&String::from_utf8_lossy(b)))
+    });
 
     // --- shared strings: existing entries stay, new text appends ----------
     let mut string_index: BTreeMap<&str, usize> = BTreeMap::new();
@@ -2234,6 +2293,11 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
             .unwrap_or_default();
         let sheet_data = sheet_data_xml(sheet, &mut index_of, &mut any_formulas);
         let updated = splice_worksheet(&source, sheet, &sheet_data);
+        let updated = if tabs_selected {
+            set_tab_selected(&updated, idx == active_tab)
+        } else {
+            updated
+        };
         if let Some(p) = parts.iter_mut().find(|(n, _)| n == part_name) {
             p.1 = updated.into_bytes();
         }
@@ -2395,6 +2459,7 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
     if let Some(p) = parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
         let xml = String::from_utf8_lossy(&p.1).into_owned();
         let xml = patch_sheet_names(&xml, &wb.sheets);
+        let xml = set_active_tab(&xml, active_tab);
         // Same for defined names: a structural edit or a rename moves them in
         // the model (print area and titles included).
         p.1 = patch_defined_names(&xml, &wb.defined_names, wb.sheets.len()).into_bytes();
@@ -2939,6 +3004,113 @@ fn set_freeze_pane(xml: &str, freeze: (u32, u32)) -> String {
         out.insert_str(pos, &block);
     }
     out
+}
+
+/// The start tag beginning at `start`: its end (just past `>`).
+fn tag_end(xml: &str, start: usize) -> usize {
+    xml[start..].find('>').map_or(xml.len(), |i| start + i + 1)
+}
+
+/// The value of `attr` on the start tag beginning at `start`.
+fn attr_at<'a>(xml: &'a str, start: usize, attr: &str) -> Option<&'a str> {
+    tag_attr(&xml[start..tag_end(xml, start)], attr)
+}
+
+/// The start tag beginning at `start` with `attr` set to `value`, or removed
+/// when `value` is `None`. A new attribute follows the element name.
+fn set_tag_attr(xml: &str, start: usize, attr: &str, value: Option<&str>) -> String {
+    let end = tag_end(xml, start);
+    let mut tag = xml[start..end].to_string();
+    // Every spelling of it goes (`a="1"`, `a = '1'`), so none is duplicated.
+    while let Some((ws, _, _, after)) = attr_span(&tag, attr) {
+        tag.replace_range(ws..after, "");
+    }
+    if let Some(v) = value {
+        let name_end = tag
+            .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
+            .unwrap_or(tag.len());
+        tag.insert_str(name_end, &format!(" {attr}=\"{v}\""));
+    }
+    format!("{}{tag}{}", &xml[..start], &xml[end..])
+}
+
+/// The first element named `local` in any namespace prefix (`workbookView`
+/// or `x:workbookView`): its start and its `prefix:` (empty when none).
+fn find_local_element<'a>(xml: &'a str, local: &str) -> Option<(usize, &'a str)> {
+    let mut from = 0;
+    while let Some(off) = xml[from..].find('<') {
+        let at = from + off;
+        from = at + 1;
+        let rest = &xml[at + 1..];
+        if rest.starts_with(['/', '?', '!']) {
+            continue;
+        }
+        let name_len = rest
+            .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
+            .unwrap_or(rest.len());
+        let name = &rest[..name_len];
+        let (prefix, bare) = match name.rfind(':') {
+            Some(i) => (&rest[..i + 1], &name[i + 1..]),
+            None => ("", name),
+        };
+        if bare == local {
+            return Some((at, prefix));
+        }
+    }
+    None
+}
+
+/// Sync `<workbookView activeTab>` with the model's active sheet, adding
+/// `<bookViews>` (before `<sheets>`, in its namespace prefix) only when a
+/// sheet other than the first is active.
+fn set_active_tab(xml: &str, active: usize) -> String {
+    if let Some((i, _)) = find_local_element(xml, "workbookView") {
+        let current = attr_at(xml, i, "activeTab").and_then(|v| v.parse().ok());
+        if current.unwrap_or(0) == active {
+            return xml.to_string();
+        }
+        let out = set_tag_attr(xml, i, "activeTab", Some(&active.to_string()));
+        // A first visible tab past the active one would hide it.
+        let first = attr_at(&out, i, "firstSheet").and_then(|v| v.parse::<usize>().ok());
+        if first.is_some_and(|f| f > active) {
+            return set_tag_attr(&out, i, "firstSheet", None);
+        }
+        return out;
+    }
+    if active == 0 {
+        return xml.to_string();
+    }
+    match find_local_element(xml, "sheets") {
+        Some((i, p)) => {
+            let mut out = xml.to_string();
+            out.insert_str(
+                i,
+                &format!("<{p}bookViews><{p}workbookView activeTab=\"{active}\"/></{p}bookViews>"),
+            );
+            out
+        }
+        None => xml.to_string(),
+    }
+}
+
+/// Does the worksheet's first `<sheetView>` (in any prefix) say
+/// `tabSelected="1"`, however it is spelled?
+fn tab_is_selected(xml: &str) -> bool {
+    find_local_element(xml, "sheetView")
+        .is_some_and(|(i, _)| matches!(attr_at(xml, i, "tabSelected"), Some("1" | "true")))
+}
+
+/// Mark the first `<sheetView>` selected (`tabSelected="1"`) or not. Excel
+/// opens every selected tab as a group, so only the active sheet may carry
+/// it. A sheet without a `<sheetView>` is left alone.
+fn set_tab_selected(xml: &str, selected: bool) -> String {
+    let Some((i, _)) = find_local_element(xml, "sheetView") else {
+        return xml.to_string();
+    };
+    if tab_is_selected(xml) == selected {
+        return xml.to_string();
+    }
+    set_tag_attr(xml, i, "tabSelected", selected.then_some("1"))
 }
 
 /// Rewrite the `name` attribute of each `<sheet …>` element (in document
@@ -4627,6 +4799,10 @@ impl SheetPackage {
         }
         let part_name = self.sheet_parts.remove(idx);
         self.workbook.sheets.remove(idx);
+        let active = &mut self.workbook.active_tab;
+        if *active > idx || *active >= self.workbook.sheets.len() {
+            *active = active.saturating_sub(1);
+        }
         self.parts.retain(|(n, _)| *n != part_name);
         // Content-type override for the removed part.
         if let Some(p) = self
@@ -4800,6 +4976,7 @@ pub fn new_xlsx() -> SheetPackage {
             pivots: Vec::new(),
             date1904: false,
             iterate: None,
+            active_tab: 0,
         },
     }
 }
@@ -6170,6 +6347,144 @@ mod tests {
             ("xl/sharedStrings.xml".into(), sst.into()),
             ("xl/calcChain.xml".into(), calc_chain.into()),
         ])
+    }
+
+    /// The #604 workbook as openpyxl writes it on Windows: two sheets, the
+    /// second active, and a CR LF written literally inside a `<t>`.
+    fn active_second_sheet_xlsx() -> Vec<u8> {
+        let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        let rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        let sheet1 = format!(
+            r#"<worksheet xmlns="{ns}"><sheetViews><sheetView workbookViewId="0"><selection activeCell="A1" sqref="A1"/></sheetView></sheetViews><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>wrong sheet</t></is></c></row></sheetData></worksheet>"#
+        );
+        let sheet2 = format!(
+            "<worksheet xmlns=\"{ns}\"><sheetViews><sheetView tabSelected=\"1\" workbookViewId=\"0\"/></sheetViews><sheetData>\
+             <row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>Name</t></is></c><c r=\"B1\" t=\"inlineStr\"><is><t>Note</t></is></c></row>\
+             <row r=\"2\"><c r=\"A2\" t=\"inlineStr\"><is><t>Z\u{fc}rich</t></is></c><c r=\"B2\" t=\"inlineStr\"><is><t>line1\r\nline2</t></is></c></row>\
+             </sheetData></worksheet>"
+        );
+        let workbook = format!(
+            r#"<workbook xmlns="{ns}" xmlns:r="{rel}"><workbookPr/><bookViews><workbookView visibility="visible" minimized="0" showHorizontalScroll="1" showVerticalScroll="1" showSheetTabs="1" tabRatio="600" firstSheet="0" activeTab="1" autoFilterDateGrouping="1"/></bookViews><sheets><sheet name="First" sheetId="1" r:id="rId1"/><sheet name="Data" sheetId="2" r:id="rId2"/></sheets></workbook>"#
+        );
+        let wb_rels = format!(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{rel}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="{rel}/worksheet" Target="worksheets/sheet2.xml"/></Relationships>"#
+        );
+        let root_rels = format!(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{rel}/officeDocument" Target="xl/workbook.xml"/></Relationships>"#
+        );
+        let content_types = r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#;
+        write_zip(&[
+            ("[Content_Types].xml".into(), content_types.into()),
+            ("_rels/.rels".into(), root_rels.into_bytes()),
+            ("xl/workbook.xml".into(), workbook.into_bytes()),
+            ("xl/_rels/workbook.xml.rels".into(), wb_rels.into_bytes()),
+            ("xl/worksheets/sheet1.xml".into(), sheet1.into_bytes()),
+            ("xl/worksheets/sheet2.xml".into(), sheet2.into_bytes()),
+        ])
+    }
+
+    fn part_text(pkg: &SheetPackage, name: &str) -> String {
+        String::from_utf8_lossy(pkg.part(name).unwrap()).into_owned()
+    }
+
+    #[test]
+    fn the_active_tab_loads_and_its_csv_is_excels() {
+        let pkg = load_xlsx(&active_second_sheet_xlsx()).unwrap();
+        let wb = &pkg.workbook;
+        assert_eq!(wb.active_tab, 1);
+        let csv = crate::sheet::sheet_to_csv(&wb.sheets[wb.active_tab], &wb.styles, false);
+        assert_eq!(csv, "Name,Note\r\nZ\u{fc}rich,\"line1\nline2\"\r\n");
+    }
+
+    #[test]
+    fn saving_moves_the_active_tab_and_its_selection_together() {
+        let mut pkg = load_xlsx(&active_second_sheet_xlsx()).unwrap();
+        pkg.workbook.active_tab = 0;
+        let pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(pkg.workbook.active_tab, 0);
+        assert!(part_text(&pkg, "xl/workbook.xml").contains("activeTab=\"0\""));
+        // Only the active sheet is selected: two would open grouped.
+        assert!(part_text(&pkg, "xl/worksheets/sheet1.xml").contains("tabSelected=\"1\""));
+        assert!(!part_text(&pkg, "xl/worksheets/sheet2.xml").contains("tabSelected"));
+        // An unchanged active tab leaves workbook.xml as it was.
+        let again = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(
+            part_text(&again, "xl/workbook.xml"),
+            part_text(&pkg, "xl/workbook.xml")
+        );
+    }
+
+    /// The rewrite follows a namespace prefix (`x:workbookView`), and an
+    /// attribute however it is spelled, so none is added twice.
+    #[test]
+    fn the_active_tab_rewrite_handles_prefixes_and_attribute_spelling() {
+        let wb = r#"<x:workbook xmlns:x="ns"><x:bookViews><x:workbookView activeTab = '1'/></x:bookViews><x:sheets/></x:workbook>"#;
+        let out = set_active_tab(wb, 2);
+        assert_eq!(out.matches("activeTab").count(), 1, "{out}");
+        assert!(out.contains(r#"<x:workbookView activeTab="2"/>"#), "{out}");
+        assert_eq!(parse_active_tab(&out), 2);
+        let bare = r#"<x:workbook xmlns:x="ns"><x:sheets/></x:workbook>"#;
+        let out = set_active_tab(bare, 1);
+        assert!(
+            out.contains(
+                r#"<x:bookViews><x:workbookView activeTab="1"/></x:bookViews><x:sheets/>"#
+            ),
+            "{out}"
+        );
+        let ws = "<x:worksheet><x:sheetViews><x:sheetView\ttabSelected=\"1\" workbookViewId=\"0\"/></x:sheetViews></x:worksheet>";
+        let out = set_tab_selected(ws, false);
+        assert!(!out.contains("tabSelected"), "{out}");
+        let out = set_tab_selected(&out, true);
+        assert_eq!(out.matches("tabSelected").count(), 1, "{out}");
+        // A lookalike name inside another attribute is not the attribute.
+        assert_eq!(
+            tag_attr(r#"<a xtabSelected="0" tabSelected="1">"#, "tabSelected"),
+            Some("1")
+        );
+    }
+
+    /// A file that marks its tab `tabSelected='1'` (single quotes) still has
+    /// the mark moved with the active tab.
+    #[test]
+    fn a_single_quoted_tab_selection_moves_with_the_active_tab() {
+        let mut pkg = load_xlsx(&active_second_sheet_xlsx()).unwrap();
+        let sheet2 = part_text(&pkg, "xl/worksheets/sheet2.xml")
+            .replace("tabSelected=\"1\"", "tabSelected='1'");
+        pkg.set_part("xl/worksheets/sheet2.xml", sheet2.into_bytes());
+        pkg.workbook.active_tab = 0;
+        let saved = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert!(part_text(&saved, "xl/worksheets/sheet1.xml").contains("tabSelected=\"1\""));
+        assert!(!part_text(&saved, "xl/worksheets/sheet2.xml").contains("tabSelected"));
+    }
+
+    #[test]
+    fn a_workbook_without_book_views_gains_one_for_a_later_active_tab() {
+        let mut pkg = new_xlsx();
+        // The first sheet starts selected, as Excel saves it.
+        let sheet1 = part_text(&pkg, "xl/worksheets/sheet1.xml")
+            .replace("<sheetView ", "<sheetView tabSelected=\"1\" ");
+        assert!(sheet1.contains("tabSelected=\"1\""));
+        pkg.set_part("xl/worksheets/sheet1.xml", sheet1.into_bytes());
+        pkg.add_sheet("Two");
+        pkg.workbook.active_tab = 1;
+        let saved = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(saved.workbook.active_tab, 1);
+        let xml = part_text(&saved, "xl/workbook.xml");
+        let views = xml.find("<bookViews><workbookView activeTab=\"1\"/></bookViews>");
+        assert!(
+            views.is_some_and(|v| v < xml.find("<sheets").unwrap()),
+            "{xml}"
+        );
+        // The first sheet is no longer selected.
+        assert!(!part_text(&saved, "xl/worksheets/sheet1.xml").contains("tabSelected=\"1\""));
+        // Removing a sheet before the active one keeps the same sheet active.
+        let mut three = saved;
+        three.add_sheet("Three");
+        three.workbook.active_tab = 2;
+        assert!(three.remove_sheet(0));
+        assert_eq!(three.workbook.active_tab, 1);
+        assert!(three.remove_sheet(1));
+        assert_eq!(three.workbook.active_tab, 0);
     }
 
     #[test]

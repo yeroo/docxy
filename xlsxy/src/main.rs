@@ -4,7 +4,7 @@
 //!   xlsxy                               open a new blank workbook
 //!   xlsxy <file.xlsx>                   open in the editor
 //!   xlsxy <in.xlsx> --recalc <out>      headless: recalculate and save
-//!   xlsxy <in.xlsx> --csv <out.csv>     headless: export the first sheet as CSV
+//!   xlsxy <in.xlsx> --csv <out.csv>     headless: export the active sheet as CSV UTF-8
 //!
 //! The engine lives in the pure `gridcore` crate; this binary is the TUI
 //! shell: a cell grid with Excel muscle memory (formula bar, A1 navigation,
@@ -23,6 +23,7 @@ mod control;
 mod mcp;
 mod ribbon;
 mod skill;
+mod textdlg;
 
 // Bring the trait's methods (`extensions`, `default_save_name`, …) into scope
 // for the `impl backstage::BackstageHost for App` call sites below.
@@ -41,6 +42,7 @@ use gridcore::sheet::{
     Align, Cell, CellValue, MAX_COLS, MAX_ROWS, NumFmt, Sheet, Xf, cell_name, col_name,
     date_unrepresentable, format_with, sheet_to_csv,
 };
+use gridcore::textio::{AutoConvert, TextParse};
 use gridcore::xlsx::{SheetPackage, SpreadsheetKind, load_xlsx, new_xlsx, save_xlsx_for_path};
 
 use ratatui::backend::CrosstermBackend;
@@ -67,13 +69,17 @@ fn export_csv_headless(
     import_source: Option<&str>,
     out: &str,
 ) -> io::Result<usize> {
-    let csv = sheet_to_csv(
-        &pkg.workbook.sheets[0],
-        &pkg.workbook.styles,
-        pkg.workbook.date1904,
-    );
-    export_csv_bytes(source, import_source, out, csv.as_bytes())?;
-    Ok(csv.len())
+    let wb = &pkg.workbook;
+    let bytes = csv_utf8_bytes(&wb.sheets[wb.active_tab.min(wb.sheets.len() - 1)], wb);
+    export_csv_bytes(source, import_source, out, &bytes)?;
+    Ok(bytes.len())
+}
+
+/// A sheet as Excel's *CSV UTF-8 (Comma delimited)* file: a byte-order mark,
+/// then CR LF records.
+fn csv_utf8_bytes(sheet: &gridcore::sheet::Sheet, wb: &gridcore::sheet::Workbook) -> Vec<u8> {
+    let csv = sheet_to_csv(sheet, &wb.styles, wb.date1904);
+    gridcore::textio::encode(&csv, gridcore::textio::Encoding::Utf8Bom)
 }
 
 /// An imported text file stays protected independently of the rebound .xlsx
@@ -93,6 +99,206 @@ fn export_csv_bytes(
 fn is_delimited(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     lower.ends_with(".csv") || lower.ends_with(".tsv")
+}
+
+/// Excel's *Save as type* list, in Excel's order.
+const SAVE_TYPES: [backstage::SaveType; 29] = [
+    backstage::SaveType {
+        label: "Excel Workbook",
+        ext: "xlsx",
+    },
+    backstage::SaveType {
+        label: "Excel Macro-Enabled Workbook",
+        ext: "xlsm",
+    },
+    backstage::SaveType {
+        label: "Excel Binary Workbook",
+        ext: "xlsb",
+    },
+    backstage::SaveType {
+        label: "Excel 97-2003 Workbook",
+        ext: "xls",
+    },
+    backstage::SaveType {
+        label: "CSV UTF-8 (Comma delimited)",
+        ext: "csv",
+    },
+    backstage::SaveType {
+        label: "XML Data",
+        ext: "xml",
+    },
+    backstage::SaveType {
+        label: "Single File Web Page",
+        ext: "mht",
+    },
+    backstage::SaveType {
+        label: "Web Page",
+        ext: "htm",
+    },
+    backstage::SaveType {
+        label: "Excel Template",
+        ext: "xltx",
+    },
+    backstage::SaveType {
+        label: "Excel Macro-Enabled Template",
+        ext: "xltm",
+    },
+    backstage::SaveType {
+        label: "Excel 97-2003 Template",
+        ext: "xlt",
+    },
+    backstage::SaveType {
+        label: "Text (Tab delimited)",
+        ext: "txt",
+    },
+    backstage::SaveType {
+        label: "Unicode Text",
+        ext: "txt",
+    },
+    backstage::SaveType {
+        label: "XML Spreadsheet 2003",
+        ext: "xml",
+    },
+    backstage::SaveType {
+        label: "Microsoft Excel 5.0/95 Workbook",
+        ext: "xls",
+    },
+    backstage::SaveType {
+        label: "CSV (Comma delimited)",
+        ext: "csv",
+    },
+    backstage::SaveType {
+        label: "Formatted Text (Space delimited)",
+        ext: "prn",
+    },
+    backstage::SaveType {
+        label: "Text (Macintosh)",
+        ext: "txt",
+    },
+    backstage::SaveType {
+        label: "Text (MS-DOS)",
+        ext: "txt",
+    },
+    backstage::SaveType {
+        label: "CSV (Macintosh)",
+        ext: "csv",
+    },
+    backstage::SaveType {
+        label: "CSV (MS-DOS)",
+        ext: "csv",
+    },
+    backstage::SaveType {
+        label: "DIF (Data Interchange Format)",
+        ext: "dif",
+    },
+    backstage::SaveType {
+        label: "SYLK (Symbolic Link)",
+        ext: "slk",
+    },
+    backstage::SaveType {
+        label: "Excel Add-in",
+        ext: "xlam",
+    },
+    backstage::SaveType {
+        label: "Excel 97-2003 Add-in",
+        ext: "xla",
+    },
+    backstage::SaveType {
+        label: "PDF",
+        ext: "pdf",
+    },
+    backstage::SaveType {
+        label: "XPS Document",
+        ext: "xps",
+    },
+    backstage::SaveType {
+        label: "Strict Open XML Spreadsheet",
+        ext: "xlsx",
+    },
+    backstage::SaveType {
+        label: "OpenDocument Spreadsheet",
+        ext: "ods",
+    },
+];
+
+/// How a Save As type is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SaveKind {
+    /// The workbook package (`.xlsx`, `.xlsm`, `.xltx`, `.xltm`).
+    Package,
+    /// The active sheet as delimited text.
+    Text {
+        delim: char,
+        encoding: gridcore::textio::Encoding,
+    },
+    /// Formatted Text (Space delimited).
+    Prn,
+    /// Web Page: `.htm` plus a `_files` folder.
+    WebPage,
+    /// XML Data: needs the workbook's XML maps.
+    XmlData,
+    /// Listed as Excel lists it, but not written.
+    Unsupported,
+}
+
+fn save_kind(t: &backstage::SaveType) -> SaveKind {
+    use gridcore::textio::Encoding;
+    match t.label {
+        "Excel Workbook"
+        | "Excel Macro-Enabled Workbook"
+        | "Excel Template"
+        | "Excel Macro-Enabled Template" => SaveKind::Package,
+        "CSV UTF-8 (Comma delimited)" => SaveKind::Text {
+            delim: ',',
+            encoding: Encoding::Utf8Bom,
+        },
+        "CSV (Comma delimited)" => SaveKind::Text {
+            delim: ',',
+            encoding: Encoding::Windows1252,
+        },
+        "Text (Tab delimited)" => SaveKind::Text {
+            delim: '\t',
+            encoding: Encoding::Windows1252,
+        },
+        "Unicode Text" => SaveKind::Text {
+            delim: '\t',
+            encoding: Encoding::Utf16LeBom,
+        },
+        "Formatted Text (Space delimited)" => SaveKind::Prn,
+        "Web Page" => SaveKind::WebPage,
+        "XML Data" => SaveKind::XmlData,
+        _ => SaveKind::Unsupported,
+    }
+}
+
+/// The Save As type a typed file name's extension picks (the first type
+/// with it, as the list is ordered): `.csv` is CSV UTF-8, `.txt` Text (Tab
+/// delimited). `None` for an extension no type has.
+fn type_for_path(path: &str) -> Option<usize> {
+    let ext = type_ext(path)?;
+    SAVE_TYPES.iter().position(|t| t.ext == ext)
+}
+
+/// `path`'s extension as the type list spells it: lower case, with `.html`
+/// and `.mhtml` the Web Page types' `.htm` and `.mht`.
+fn type_ext(path: &str) -> Option<String> {
+    let ext = Path::new(path).extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "html" => "htm".to_string(),
+        "mhtml" => "mht".to_string(),
+        _ => ext,
+    })
+}
+
+/// Does `path` carry type `t`'s extension (or its alias)?
+fn has_type_ext(path: &str, t: usize) -> bool {
+    type_ext(path).as_deref() == SAVE_TYPES.get(t).map(|ty| ty.ext)
+}
+
+/// A `.txt` or `.prn`: opened through the Text Import Wizard.
+fn is_text_import(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".txt") || lower.ends_with(".prn")
 }
 
 fn main() -> ExitCode {
@@ -187,16 +393,26 @@ fn main() -> ExitCode {
     }
 
     let (pkg, path, import_source) = match parsed.inputs.first() {
-        // CSV/TSV imports as a one-sheet workbook (Ctrl-S then writes
-        // .xlsx — the path is rebound so a spreadsheet never lands in a
-        // text file). The delimiter is sniffed.
-        Some(input) if is_delimited(input) => match load_workbook(input) {
-            Ok(loaded) => loaded,
-            Err(e) => {
-                eprintln!("error: cannot read {input}: {e}");
-                return ExitCode::FAILURE;
+        // A .txt/.prn in the editor opens the Text Import Wizard over a new
+        // workbook (`run_tui` gets it as `wizard`).
+        Some(input)
+            if is_text_import(input) && parsed.recalc_out.is_none() && parsed.csv_out.is_none() =>
+        {
+            (new_xlsx(), "untitled.xlsx".to_string(), None)
+        }
+        // CSV/TSV, and a .txt/.prn in a headless run (the wizard's
+        // defaults), import as a one-sheet workbook. Ctrl-S then writes
+        // .xlsx: the path is rebound so a spreadsheet never lands in a text
+        // file.
+        Some(input) if is_delimited(input) || is_text_import(input) => {
+            match load_workbook(input, &TextOpen::from_prefs()) {
+                Ok(loaded) => loaded,
+                Err(e) => {
+                    eprintln!("error: cannot read {input}: {e}");
+                    return ExitCode::FAILURE;
+                }
             }
-        },
+        }
         Some(input) => match std::fs::read(input) {
             Ok(data) => match load_xlsx(&data) {
                 Ok(pkg) => (pkg, input.clone(), None),
@@ -276,7 +492,8 @@ fn main() -> ExitCode {
     }
 
     let welcome = parsed.inputs.is_empty();
-    match run_tui(pkg, &path, import_source, welcome, parsed.vim) {
+    let wizard = parsed.inputs.first().filter(|i| is_text_import(i)).cloned();
+    match run_tui(pkg, &path, import_source, welcome, parsed.vim, wizard) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
@@ -285,18 +502,73 @@ fn main() -> ExitCode {
     }
 }
 
-/// Load a workbook from disk (`.xlsx`, or `.csv`/`.tsv` imported as one sheet),
-/// returning the package, its save path, and any original CSV/TSV import path.
-fn load_workbook(path: &str) -> Result<(SheetPackage, String, Option<String>), String> {
+/// How a text file opens: File › Options › Data's Automatic Data Conversion,
+/// and the clock that gives a yearless date such as `1/2` its year.
+#[derive(Clone, Copy, Debug)]
+struct TextOpen {
+    auto: AutoConvert,
+    today: Option<f64>,
+}
+
+impl TextOpen {
+    /// The persisted options (headless runs read them too) and now.
+    fn from_prefs() -> TextOpen {
+        let text = view_prefs_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default();
+        TextOpen {
+            auto: auto_convert_from_prefs(&text),
+            today: now_serial(),
+        }
+    }
+}
+
+/// The Automatic Data Conversion switches from the preferences file's text;
+/// a missing key keeps Excel's default (on).
+fn auto_convert_from_prefs(text: &str) -> AutoConvert {
+    let mut auto = AutoConvert::default();
+    for line in text.lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            let on = v.trim() == "1";
+            match k.trim() {
+                "convert_leading_zeros" => auto.remove_leading_zeros = on,
+                "convert_long_numbers" => auto.keep_15_digits = on,
+                "convert_e_notation" => auto.e_notation = on,
+                "convert_dates" => auto.dates = on,
+                _ => {}
+            }
+        }
+    }
+    auto
+}
+
+/// Load a workbook from disk, returning the package, its save path, and the
+/// imported text file's path if it was one. An `.xlsx` (or other package)
+/// loads as it is; a `.csv`/`.tsv` imports as one sheet as Excel opens it
+/// (`sep=`, typed-entry conversion); a `.txt`/`.prn` imports with the Text
+/// Import Wizard's defaults (the editor shows the wizard instead, see
+/// `App::open_workbook`). A text import is saved to `<name>.xlsx`.
+fn load_workbook(
+    path: &str,
+    open: &TextOpen,
+) -> Result<(SheetPackage, String, Option<String>), String> {
+    if is_text_import(path) {
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        let text = gridcore::textio::decode(&bytes, gridcore::textio::Origin::Auto);
+        return Ok((
+            text_to_pkg(&text, &file_stem(path), &TextParse::default(), open),
+            format!("{}.xlsx", &path[..path.len() - 4]),
+            Some(path.to_string()),
+        ));
+    }
     if is_delimited(path) {
-        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let stem = std::path::Path::new(path)
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "import".to_string());
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        let text = gridcore::textio::decode(&bytes, gridcore::textio::Origin::Auto);
+        let tab = path.to_ascii_lowercase().ends_with(".tsv");
+        let stem = file_stem(path);
         let base = &path[..path.len() - 4];
         Ok((
-            csv_to_pkg(&text, &stem),
+            csv_to_pkg(&text, &stem, tab, open),
             format!("{base}.xlsx"),
             Some(path.to_string()),
         ))
@@ -337,16 +609,69 @@ fn parse_table_col(s: &str) -> Option<(String, String)> {
     ))
 }
 
-/// Import CSV text as a fresh one-sheet workbook.
-fn csv_to_pkg(text: &str, sheet_name: &str) -> SheetPackage {
-    let frame = gridcore::frame::Frame::from_csv(text);
+/// Import CSV text as a fresh one-sheet workbook, as Excel opens a `.csv`: a
+/// `sep=` first line names the delimiter (else a `.tsv` is tab-delimited and
+/// a `.csv` sniffed), and every field converts as if typed into its cell.
+fn csv_to_pkg(text: &str, sheet_name: &str, tab: bool, open: &TextOpen) -> SheetPackage {
+    let (opts, body) = csv_parse(text, tab);
+    text_to_pkg(body, sheet_name, &opts, open)
+}
+
+/// The file name without its extension (a new sheet's name).
+fn file_stem(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "import".to_string())
+}
+
+/// Delimited or fixed-width text as a fresh one-sheet workbook, read under
+/// `opts` (the Text Import Wizard's choices).
+fn text_to_pkg(text: &str, sheet_name: &str, opts: &TextParse, open: &TextOpen) -> SheetPackage {
     let mut pkg = new_xlsx();
-    let sh = &mut pkg.workbook.sheets[0];
+    let wb = &mut pkg.workbook;
     if !sheet_name.is_empty() {
-        sh.name = sheet_name.chars().take(31).collect();
+        wb.sheets[0].name = sheet_name.chars().take(31).collect();
     }
-    frame.write_to_sheet(sh);
+    import_text(&mut wb.sheets[0], &mut wb.styles, text, opts, open, false);
+    // A text file carries no cached values: work out its formulas now.
+    let mut engine = Engine::new(&pkg.workbook);
+    engine.clock = open.today;
+    engine.recalc_all(&mut pkg.workbook);
     pkg
+}
+
+/// How a CSV reads: a `sep=` first line names the delimiter (and is
+/// dropped), else a `.tsv` is tab-delimited and a `.csv` sniffed. Returns
+/// the options and the text after any directive.
+fn csv_parse(text: &str, tab: bool) -> (TextParse, &str) {
+    let (directive, body) = gridcore::textio::csv_directive(text);
+    let delim = directive.unwrap_or_else(|| {
+        if tab {
+            '\t'
+        } else {
+            gridcore::frame::sniff_delimiter(body)
+        }
+    });
+    (TextParse::csv(delim), body)
+}
+
+/// Text converted into `sheet` (of a workbook in the 1904 date system when
+/// `date1904`) from A1 under `opts`. Returns (rows, cols).
+fn import_text(
+    sheet: &mut gridcore::sheet::Sheet,
+    styles: &mut gridcore::sheet::Styles,
+    text: &str,
+    opts: &TextParse,
+    open: &TextOpen,
+    date1904: bool,
+) -> (u32, u32) {
+    let records = gridcore::textio::split_text(text, opts);
+    let ctx = gridcore::entry::EntryCtx {
+        date1904,
+        today: open.today,
+    };
+    gridcore::textio::import_records(sheet, styles, 0, 0, &records, opts, &open.auto, &ctx)
 }
 
 struct Parsed {
@@ -407,8 +732,9 @@ fn print_usage() {
            xlsxy                            new blank workbook\n  \
            xlsxy <file.xlsx>                open a workbook\n  \
            xlsxy <file.csv|.tsv>            import CSV/TSV as a new workbook\n  \
+           xlsxy <file.txt|.prn>            import text through the Text Import Wizard\n  \
            xlsxy <in> --recalc <out.xlsx>   recalculate all formulas, save, exit\n  \
-           xlsxy <in> --csv <out.csv>       export the first sheet as CSV, exit\n  \
+           xlsxy <in> --csv <out.csv>       export the active sheet as CSV UTF-8, exit\n  \
            xlsxy <in> --verify              conformance scoreboard: recalculate\n  \
                                             and diff against Excel's cached values\n  \
            xlsxy <file> --vim               modal (vim) navigation: hjkl, v, dd, :w :q\n  \
@@ -462,7 +788,7 @@ fn iso_now() -> String {
 /// Render the first sheet of a workbook (or a CSV) as preview text lines,
 /// bounded so a huge file can't stall the browser.
 fn preview_lines(path: &str, width: usize) -> Vec<String> {
-    let (pkg, _, _) = match load_workbook(path) {
+    let (pkg, _, _) = match load_workbook(path, &TextOpen::from_prefs()) {
         Ok(x) => x,
         Err(e) => return vec![format!("(cannot preview: {e})")],
     };
@@ -747,8 +1073,6 @@ enum PromptKind {
     DataValidation,
     /// AutoFilter: a criteria on the current column ("=Laptop", ">500", "clear").
     Filter,
-    /// Text to Columns: a delimiter to split the selected column by.
-    TextToColumns,
     /// Multi-level sort: a spec like "B asc, C desc" over the current region.
     SortKeys,
     /// Row height in points for the selected rows ("auto" clears it).
@@ -902,6 +1226,8 @@ enum ConfirmAction {
     DeleteSheet,
     /// Save As to a macro-free type (`.xlsx`/`.xltx`) drops the VBA project.
     SaveWithoutMacros(String),
+    /// Text to Columns over cells that hold data.
+    TextToColumns(gridcore::edit::TtcSource, TextParse),
 }
 
 // The Yes/No modal itself lives in `backstage::Confirm<ConfirmAction>` (shared
@@ -942,6 +1268,8 @@ struct App {
     ribbon_focus: ribbon::Focus,
     comments: Vec<Comment>,
     show_comments: bool,
+    /// File › Options › Data › Automatic Data Conversion (persisted).
+    auto_convert: AutoConvert,
     comment_sel: usize,
     // The File backstage (folder browser / preview / info / save-as).
     backstage: Option<backstage::Backstage>,
@@ -951,6 +1279,11 @@ struct App {
     // The formatting popup (number format / font & fill color).
     format_picker: Option<FormatPicker>,
     format_dialog: Option<FormatDialog>,
+    /// The Text Import Wizard or Convert Text to Columns Wizard.
+    text_dialog: Option<textdlg::TextDialog>,
+    /// The text Save As type (index into [`SAVE_TYPES`]) the workbook was
+    /// last saved as; Ctrl+S keeps writing it while the path has its extension.
+    text_type: Option<usize>,
     // View preferences (persisted to a config file).
     formula_view: bool,
     light_theme: bool,
@@ -1001,12 +1334,17 @@ impl App {
         // (not when iterative calculation is on: the circles are intended).
         let status = (pkg.workbook.iterate.is_none() && !engine.circular_refs().is_empty())
             .then(|| CIRCULAR_WARNING.to_string());
+        // A workbook opens on the sheet it was saved on.
+        let pkg_active_tab = pkg
+            .workbook
+            .active_tab
+            .min(pkg.workbook.sheets.len().saturating_sub(1));
         App {
             pkg,
             engine,
             path: path.to_string(),
             import_source: None,
-            sheet: 0,
+            sheet: pkg_active_tab,
             cur: (0, 0),
             anchor: None,
             top: 0,
@@ -1032,6 +1370,7 @@ impl App {
             ribbon_focus: ribbon::Focus::None,
             comments,
             show_comments: false,
+            auto_convert: AutoConvert::default(),
             comment_sel: 0,
             backstage: None,
             start_screen: false,
@@ -1055,6 +1394,8 @@ impl App {
             ),
             format_picker: None,
             format_dialog: None,
+            text_dialog: None,
+            text_type: None,
             formula_view: false,
             light_theme: false,
             auto_hide_ribbon: false,
@@ -2130,6 +2471,8 @@ impl App {
     /// Serialize the package, persisting model definitions in the custom
     /// part (removed again when the model is empty).
     fn package_bytes(&mut self) -> Vec<u8> {
+        // The workbook reopens on the sheet it is saved on.
+        self.pkg.workbook.active_tab = self.sheet;
         self.pkg.remove_part(MODEL_PART);
         if !self.model_rels.is_empty() || !self.model_measures.is_empty() {
             let xml = model_part_xml(&self.model_rels, &self.model_measures);
@@ -2147,6 +2490,9 @@ impl App {
     /// status line and the `Err`, so a caller that reports it (the control
     /// surface's `wb.save`) says exactly what the status bar says.
     fn save_current(&mut self) -> Result<(), String> {
+        if let Some(t) = self.bound_text_type() {
+            return self.save_text(t);
+        }
         let bytes = self.package_bytes();
         match export_atomic(
             self.import_source.as_deref().map(Path::new),
@@ -2155,6 +2501,7 @@ impl App {
         ) {
             Ok(()) => {
                 self.modified = false;
+                self.text_type = None;
                 self.status = Some(format!("Saved {} ({} bytes)", self.path, bytes.len()));
                 Ok(())
             }
@@ -2178,9 +2525,142 @@ impl App {
         }
     }
 
-    /// Save As, first asking (as Excel does) before a macro-free type drops
-    /// the workbook's VBA project.
+    /// The text type Ctrl+S writes: the one last saved as, while the path
+    /// still has its extension.
+    fn bound_text_type(&self) -> Option<usize> {
+        let t = self.text_type?;
+        let text = matches!(
+            save_kind(SAVE_TYPES.get(t)?),
+            SaveKind::Text { .. } | SaveKind::Prn | SaveKind::WebPage
+        );
+        (text && has_type_ext(&self.path, t)).then_some(t)
+    }
+
+    /// Write the active sheet to `self.path` as text type `t`. Only that sheet
+    /// is kept, so the workbook stays modified: closing still asks to save,
+    /// as Excel does after saving as CSV.
+    fn save_text(&mut self, t: usize) -> Result<(), String> {
+        let ty = SAVE_TYPES[t];
+        let wb = &self.pkg.workbook;
+        let sheet = &wb.sheets[self.sheet.min(wb.sheets.len() - 1)];
+        let mut extra: Vec<(std::path::PathBuf, String)> = Vec::new();
+        let bytes = match save_kind(&ty) {
+            SaveKind::Text { delim, encoding } => gridcore::textio::encode(
+                &gridcore::textio::sheet_text(sheet, &wb.styles, wb.date1904, delim),
+                encoding,
+            ),
+            SaveKind::Prn => gridcore::textio::encode(
+                &gridcore::textio::sheet_prn(sheet, &wb.styles, wb.date1904),
+                gridcore::textio::Encoding::Windows1252,
+            ),
+            SaveKind::WebPage => {
+                let stem = file_stem(&self.path);
+                let file_name = Path::new(&self.path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| format!("{stem}.htm"));
+                let page = gridcore::textio::web_page(sheet, &wb.styles, wb.date1904, &file_name);
+                let folder = Path::new(&self.path).with_file_name(format!("{stem}_files"));
+                extra = page
+                    .files
+                    .into_iter()
+                    .map(|(name, body)| (folder.join(name), body))
+                    .collect();
+                page.htm.into_bytes()
+            }
+            _ => return Err(format!("{} is not a text type", ty.label)),
+        };
+        let sheet_name = sheet.name.clone();
+        let many = wb.sheets.len() > 1;
+        let written = export_atomic(
+            self.import_source.as_deref().map(Path::new),
+            Path::new(&self.path),
+            &bytes,
+        )
+        .and_then(|()| {
+            for (p, body) in &extra {
+                if let Some(dir) = p.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                std::fs::write(p, body)?;
+            }
+            Ok(())
+        });
+        match written {
+            Ok(()) => {
+                self.modified = true;
+                self.status = Some(if many {
+                    format!(
+                        "Saved only the active sheet \"{sheet_name}\" to {} as {}: the selected \
+                         file type does not support workbooks that contain multiple sheets \
+                         (possible data loss).",
+                        self.path, ty.label
+                    )
+                } else {
+                    format!(
+                        "Saved {} as {}. Some features in your workbook might be lost in this \
+                         file type (possible data loss).",
+                        self.path, ty.label
+                    )
+                });
+                Ok(())
+            }
+            Err(e) => {
+                let msg = format!("save failed: {e}");
+                self.status = Some(msg.clone());
+                Err(msg)
+            }
+        }
+    }
+
+    /// Save As type `t` (an index into [`SAVE_TYPES`]) to `path`: the
+    /// workbook package, the active sheet as text, or Excel's refusal for a
+    /// type nothing here writes.
+    fn save_as_type(&mut self, path: String, t: usize) {
+        let ty = SAVE_TYPES[t];
+        match save_kind(&ty) {
+            SaveKind::Package => self.request_save_as_package(path),
+            SaveKind::Text { .. } | SaveKind::Prn | SaveKind::WebPage => {
+                let previous = self.text_type.replace(t);
+                if !self.save_as(path) {
+                    self.text_type = previous;
+                }
+            }
+            SaveKind::XmlData if self.pkg.part("xl/xmlMaps.xml").is_none() => {
+                self.status = Some(
+                    "Cannot save XML data because the workbook does not contain any XML \
+                     mappings."
+                        .to_string(),
+                );
+            }
+            SaveKind::XmlData | SaveKind::Unsupported => {
+                self.status = Some(format!(
+                    "xlsxy cannot save as {} (*.{}) yet; nothing was written. Choose another \
+                     type.",
+                    ty.label, ty.ext
+                ));
+            }
+        }
+    }
+
+    /// Save As to a typed path: the type the workbook is bound to while the
+    /// name keeps that type's extension, else the type its extension names
+    /// (`out.csv` is CSV UTF-8, never a workbook under a `.csv` name); an
+    /// extension no type has keeps the workbook package.
     fn request_save_as(&mut self, path: String) {
+        // The type the workbook is bound to wins while the name keeps its
+        // extension: Unicode Text or CSV (Comma delimited) saved again stays
+        // that type, not the first type with the extension.
+        let bound = self.bound_text_type().filter(|&t| has_type_ext(&path, t));
+        match bound.or_else(|| type_for_path(&path)) {
+            Some(t) => self.save_as_type(path, t),
+            None => self.request_save_as_package(path),
+        }
+    }
+
+    /// Save the package As, first asking (as Excel does) before a macro-free
+    /// type drops the workbook's VBA project.
+    fn request_save_as_package(&mut self, path: String) {
         let drops_macros = SpreadsheetKind::from_path(&path).is_some_and(|k| !k.allows_macros());
         if drops_macros && self.pkg.has_vba_project() {
             self.confirm = Some(
@@ -2847,6 +3327,12 @@ impl App {
         let Ok(text) = std::fs::read_to_string(&p) else {
             return;
         };
+        self.apply_view_prefs(&text);
+    }
+
+    /// Apply the preferences file's text.
+    fn apply_view_prefs(&mut self, text: &str) {
+        self.auto_convert = auto_convert_from_prefs(text);
         for line in text.lines() {
             if let Some((k, v)) = line.split_once('=') {
                 let on = v.trim() == "1";
@@ -2867,14 +3353,25 @@ impl App {
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let body = format!(
-            "formula_view={}\nlight_theme={}\nauto_hide_ribbon={}\nshow_comments={}\n",
+        let _ = std::fs::write(&p, self.view_prefs_text());
+    }
+
+    /// The preferences file's text.
+    fn view_prefs_text(&self) -> String {
+        let auto = self.auto_convert;
+        format!(
+            "formula_view={}\nlight_theme={}\nauto_hide_ribbon={}\nshow_comments={}\n\
+             convert_leading_zeros={}\nconvert_long_numbers={}\nconvert_e_notation={}\n\
+             convert_dates={}\n",
             self.formula_view as u8,
             self.light_theme as u8,
             self.auto_hide_ribbon as u8,
             self.show_comments as u8,
-        );
-        let _ = std::fs::write(&p, body);
+            auto.remove_leading_zeros as u8,
+            auto.keep_15_digits as u8,
+            auto.e_notation as u8,
+            auto.dates as u8,
+        )
     }
 
     /// Dispatch a ribbon command to the matching editor operation.
@@ -2920,7 +3417,7 @@ impl App {
             DataValidation => self.open_prompt(PromptKind::DataValidation),
             Filter => self.open_prompt(PromptKind::Filter),
             RemoveDuplicates => self.remove_duplicates(),
-            TextToColumns => self.open_prompt(PromptKind::TextToColumns),
+            TextToColumns => self.open_text_to_columns(),
             FormatAsTable => self.format_as_table(),
             Subtotal => self.subtotal(),
             Outline => self.toggle_outline(),
@@ -2970,8 +3467,53 @@ impl App {
             .filter(|p| !p.as_os_str().is_empty())
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
-        self.backstage = Some(backstage::Backstage::open(dir, self.extensions()));
+        let auto = self.auto_convert;
+        let options = [
+            (
+                "Remove leading zeros and convert to number",
+                auto.remove_leading_zeros,
+            ),
+            (
+                "Keep first 15 digits of long numbers and display in scientific notation if needed",
+                auto.keep_15_digits,
+            ),
+            (
+                "Convert digits surrounding the letter \"E\" to a number in scientific notation",
+                auto.e_notation,
+            ),
+            (
+                "Convert continuous letters and numbers to a date",
+                auto.dates,
+            ),
+        ];
+        self.backstage = Some(
+            backstage::Backstage::open(dir, self.extensions())
+                .with_options(
+                    "Data › Automatic Data Conversion (opening .csv and text files)",
+                    options.map(|(l, on)| (l.to_string(), on)).to_vec(),
+                )
+                .with_save_types(
+                    &SAVE_TYPES,
+                    "Export the current sheet as CSV UTF-8 next to the workbook",
+                ),
+        );
         self.ribbon_focus = ribbon::Focus::None;
+    }
+
+    /// Take File › Options › Data's checkboxes into the app (they are saved
+    /// with the other preferences).
+    fn sync_backstage_options(&mut self) {
+        let Some(b) = &self.backstage else {
+            return;
+        };
+        if let [a, b, c, d] = b.options.as_slice() {
+            self.auto_convert = AutoConvert {
+                remove_leading_zeros: a.1,
+                keep_15_digits: b.1,
+                e_notation: c.1,
+                dates: d.1,
+            };
+        }
     }
 
     /// Leave the File backstage via a click on the ribbon tab strip. Clicking
@@ -2987,37 +3529,110 @@ impl App {
         }
     }
 
-    /// Replace the whole editing session with a freshly loaded workbook.
+    /// Replace the whole editing session with a freshly loaded workbook. A
+    /// `.txt`/`.prn` opens the Text Import Wizard first.
     fn open_workbook(&mut self, path: &str) {
-        match load_workbook(path) {
-            Ok((pkg, p, import_source)) => {
-                let (rels, meas) = pkg
-                    .part(MODEL_PART)
-                    .map(|b| parse_model_part(&String::from_utf8_lossy(b)))
-                    .unwrap_or_default();
-                let comments = pkg.comments();
-                let mut engine = Engine::new(&pkg.workbook);
-                engine.clock = now_serial();
-                engine.seed = entropy_seed();
-                self.engine = engine;
-                self.pkg = pkg;
-                self.forget_clip();
-                self.path = p;
-                self.import_source = import_source;
-                self.model_rels = rels;
-                self.model_measures = meas;
-                self.comments = comments;
-                self.reset_view();
-                self.modified = false;
-                self.backstage = None;
-                self.start_screen = false;
-                self.status = Some(if !self.circles_shown() {
-                    format!("Opened {}", self.path)
-                } else {
-                    format!("Opened {}. {CIRCULAR_WARNING}", self.path)
-                });
+        if is_text_import(path) {
+            match std::fs::read(path) {
+                Ok(bytes) => {
+                    self.text_dialog = Some(textdlg::TextDialog::import(path.to_string(), bytes));
+                    self.backstage = None;
+                    self.start_screen = false;
+                }
+                Err(e) => self.status = Some(format!("Open failed: {e}")),
             }
+            return;
+        }
+        match load_workbook(path, &self.text_open()) {
+            Ok((pkg, p, import_source)) => self.install_workbook(pkg, p, import_source),
             Err(e) => self.status = Some(format!("Open failed: {e}")),
+        }
+    }
+
+    /// Make `pkg` (loaded from, and to be saved to, `p`) the open workbook.
+    fn install_workbook(&mut self, pkg: SheetPackage, p: String, import_source: Option<String>) {
+        let (rels, meas) = pkg
+            .part(MODEL_PART)
+            .map(|b| parse_model_part(&String::from_utf8_lossy(b)))
+            .unwrap_or_default();
+        let comments = pkg.comments();
+        let mut engine = Engine::new(&pkg.workbook);
+        engine.clock = now_serial();
+        engine.seed = entropy_seed();
+        self.engine = engine;
+        self.pkg = pkg;
+        self.forget_clip();
+        self.path = p;
+        self.import_source = import_source;
+        self.model_rels = rels;
+        self.model_measures = meas;
+        self.comments = comments;
+        self.reset_view();
+        self.modified = false;
+        self.backstage = None;
+        self.start_screen = false;
+        self.status = Some(if !self.circles_shown() {
+            format!("Opened {}", self.path)
+        } else {
+            format!("Opened {}. {CIRCULAR_WARNING}", self.path)
+        });
+    }
+
+    /// Open `path` without a dialog, as the control surface does: a
+    /// `.txt`/`.prn` is imported with the Text Import Wizard's defaults
+    /// (`sheet.import-text` takes other options) instead of showing it.
+    /// A load that fails is the error (the verb reports it).
+    fn open_without_wizard(&mut self, path: &str) -> Result<(), String> {
+        let (pkg, save, source) = load_workbook(path, &self.text_open())?;
+        self.install_workbook(pkg, save, source);
+        Ok(())
+    }
+
+    /// Re-read the file the workbook is bound to, dropping unsaved edits. A
+    /// workbook saved as CSV, Text (Tab delimited) or Unicode Text stays bound
+    /// to that file and type (it is re-imported from it), so a later save
+    /// writes the text file again rather than a `<name>.xlsx` beside it.
+    /// Formatted Text and Web Page cannot be read back, so reload refuses
+    /// them and changes nothing.
+    fn reload(&mut self) -> Result<(), String> {
+        let path = self.path.clone();
+        let Some(t) = self.bound_text_type() else {
+            return self.open_without_wizard(&path);
+        };
+        let SaveKind::Text { delim, encoding } = save_kind(&SAVE_TYPES[t]) else {
+            return Err(format!(
+                "{} cannot be read back; reload is not available for this file",
+                SAVE_TYPES[t].label
+            ));
+        };
+        // Read back with the delimiter it was written with, never a sniffed
+        // one: a first row with as many `;` as `,` must not re-split.
+        // And in the encoding it was written in: a 1252 `é` must not be
+        // read as UTF-8.
+        let origin = match encoding {
+            gridcore::textio::Encoding::Windows1252 => gridcore::textio::Origin::Windows1252,
+            gridcore::textio::Encoding::Utf8Bom => gridcore::textio::Origin::Utf8,
+            gridcore::textio::Encoding::Utf16LeBom => gridcore::textio::Origin::Utf16Le,
+        };
+        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+        let text = gridcore::textio::decode(&bytes, origin);
+        let pkg = text_to_pkg(
+            &text,
+            &file_stem(&path),
+            &TextParse::csv(delim),
+            &self.text_open(),
+        );
+        // The text file is the save target itself, not a source to guard.
+        self.install_workbook(pkg, path, None);
+        self.text_type = Some(t);
+        Ok(())
+    }
+
+    /// How a text file opens now: File › Options › Data and the clock.
+    fn text_open(&self) -> TextOpen {
+        TextOpen {
+            auto: self.auto_convert,
+            today: now_serial(),
         }
     }
 
@@ -3052,7 +3667,9 @@ impl App {
     }
 
     fn reset_view(&mut self) {
-        self.sheet = 0;
+        // A workbook opens on the sheet it was saved on.
+        let wb = &self.pkg.workbook;
+        self.sheet = wb.active_tab.min(wb.sheets.len().saturating_sub(1));
         self.cur = (0, 0);
         self.top = 0;
         self.left = 0;
@@ -3063,23 +3680,14 @@ impl App {
         self.comment_sel = 0;
     }
 
-    /// Export the current sheet to a `.csv` next to the workbook.
+    /// Export the current sheet to a `.csv` (CSV UTF-8) next to the workbook.
     fn export_csv(&mut self) {
-        let csv = sheet_to_csv(
-            self.sheet(),
-            &self.pkg.workbook.styles,
-            self.pkg.workbook.date1904,
-        );
+        let csv = csv_utf8_bytes(self.sheet(), &self.pkg.workbook);
         let out = match self.path.rsplit_once('.') {
             Some((base, _)) => format!("{base}.csv"),
             None => format!("{}.csv", self.path),
         };
-        match export_csv_bytes(
-            &self.path,
-            self.import_source.as_deref(),
-            &out,
-            csv.as_bytes(),
-        ) {
+        match export_csv_bytes(&self.path, self.import_source.as_deref(), &out, &csv) {
             Ok(()) => self.status = Some(format!("Exported {out} ({} bytes)", csv.len())),
             Err(e) => self.status = Some(format!("Export failed: {e}")),
         }
@@ -3178,6 +3786,10 @@ impl App {
                         self.save_as_without_macros(path);
                         false
                     }
+                    ConfirmAction::TextToColumns(src, opts) => {
+                        self.apply_text_to_columns(&src, &opts);
+                        false
+                    }
                 }
             }
         }
@@ -3209,6 +3821,7 @@ impl App {
             .map(|b| b.key(key, self))
             .unwrap_or(backstage::BackstageEvent::None);
         self.backstage = bs;
+        self.sync_backstage_options();
         self.apply_backstage_event(ev)
     }
 
@@ -3230,6 +3843,7 @@ impl App {
             .map(|b| b.mouse(x, y, self))
             .unwrap_or(backstage::BackstageEvent::None);
         self.backstage = bs;
+        self.sync_backstage_options();
         self.apply_backstage_event(ev)
     }
 
@@ -3241,14 +3855,24 @@ impl App {
             self.status = Some("Save As — type a file name first.".to_string());
             return;
         }
-        let fname = if name.contains('.') {
-            name
-        } else {
-            format!("{name}.xlsx")
+        // A type picked in the list, else the type the workbook is bound to
+        // while the name still has its extension, else the name decides.
+        let chosen = self.backstage.as_ref().and_then(|b| {
+            b.chosen_type()
+                .or_else(|| b.preset_type().filter(|&t| has_type_ext(&name, t)))
+        });
+        let fname = match chosen {
+            Some(t) if has_type_ext(&name, t) => name,
+            Some(t) => format!("{name}.{}", SAVE_TYPES[t].ext),
+            None if name.contains('.') => name,
+            None => format!("{name}.xlsx"),
         };
-        let path = dir.join(&fname);
+        let path = dir.join(&fname).to_string_lossy().into_owned();
         self.backstage = None;
-        self.request_save_as(path.to_string_lossy().into_owned());
+        match chosen {
+            Some(t) => self.save_as_type(path, t),
+            None => self.request_save_as(path),
+        }
     }
 
     // --- welcome / start screen ----------------------------------------------
@@ -3516,27 +4140,104 @@ impl App {
         });
     }
 
-    /// Split the selected column's rows by a delimiter into the columns to the
-    /// right (Text to Columns).
-    fn commit_text_to_columns(&mut self, text: &str) {
-        let delim = match text.trim().to_lowercase().as_str() {
-            "" | "comma" => ',',
-            "tab" => '\t',
-            "space" => ' ',
-            "semicolon" => ';',
-            "pipe" => '|',
-            other => other.chars().next().unwrap_or(','),
+    /// Data › Text to Columns: the Convert Text to Columns Wizard over the
+    /// selected column. More than one column is refused, as Excel does.
+    fn open_text_to_columns(&mut self) {
+        let src = match gridcore::edit::TtcSource::new(self.sheet, self.selection()) {
+            Ok(src) => src,
+            Err(msg) => {
+                self.status = Some(msg.to_string());
+                return;
+            }
         };
-        let (r1, c1, r2, _) = self.selection();
-        let s = self.sheet;
+        let wb = &self.pkg.workbook;
+        let sheet = &wb.sheets[self.sheet];
+        let last = sheet.used_size().0.saturating_sub(1).min(src.r2);
+        let sample: Vec<String> = (src.r1..=last)
+            .filter_map(|r| sheet.cell(r, src.col))
+            .map(|c| format_with(&wb.styles.xf(c.style), &c.value, wb.date1904))
+            .filter(|t| !t.is_empty())
+            .take(8)
+            .collect();
+        let dest = cell_name(src.dest.0, src.dest.1);
+        self.text_dialog = Some(textdlg::TextDialog::columns(src, sample, dest));
+    }
+
+    /// A key for the wizard.
+    fn text_dialog_key(&mut self, code: KeyCode) {
+        let Some(d) = self.text_dialog.as_mut() else {
+            return;
+        };
+        match d.key(code) {
+            textdlg::Outcome::Pending => {}
+            textdlg::Outcome::Cancel => {
+                self.text_dialog = None;
+                self.status = Some("Cancelled".to_string());
+            }
+            textdlg::Outcome::Finish => self.finish_text_dialog(),
+        }
+    }
+
+    /// Finish: import the text file, or convert the column (asking first
+    /// when that overwrites data).
+    fn finish_text_dialog(&mut self) {
+        let Some(d) = self.text_dialog.take() else {
+            return;
+        };
+        let opts = d.parse();
+        if opts.decimal == opts.thousands {
+            self.status = Some("The decimal and thousands separators must differ".to_string());
+            self.text_dialog = Some(d);
+            return;
+        }
+        match &d.purpose {
+            textdlg::Purpose::Import { path, .. } => {
+                let pkg = text_to_pkg(d.text(), &file_stem(path), &opts, &self.text_open());
+                let save_path = format!("{}.xlsx", &path[..path.len() - 4]);
+                self.install_workbook(pkg, save_path, Some(path.clone()));
+            }
+            textdlg::Purpose::Columns { src, .. } => {
+                let Some(dest) = parse_a1(&d.dest) else {
+                    self.status = Some("The destination must be a cell, such as B1".to_string());
+                    self.text_dialog = Some(d);
+                    return;
+                };
+                let src = gridcore::edit::TtcSource { dest, ..*src };
+                self.request_text_to_columns(src, opts);
+            }
+        }
+    }
+
+    /// Convert, asking Excel's question first when a destination cell other
+    /// than the source column holds data.
+    fn request_text_to_columns(&mut self, src: gridcore::edit::TtcSource, opts: TextParse) {
+        if gridcore::edit::ttc_would_overwrite(&self.pkg.workbook, &src, &opts) {
+            self.confirm = Some(backstage::Confirm::new(
+                gridcore::edit::TTC_REPLACE,
+                ConfirmAction::TextToColumns(src, opts),
+                Color::Green,
+            ));
+        } else {
+            self.apply_text_to_columns(&src, &opts);
+        }
+    }
+
+    /// Text to Columns, as one undoable edit. Returns the rows converted.
+    fn apply_text_to_columns(
+        &mut self,
+        src: &gridcore::edit::TtcSource,
+        opts: &TextParse,
+    ) -> usize {
+        let today = now_serial();
         let mut n = 0;
         self.structural(|wb| {
-            n = gridcore::edit::text_to_columns(wb, s, c1, r1, r2, delim);
+            n = gridcore::edit::text_to_columns(wb, src, opts, today);
         });
         self.status = Some(format!(
-            "Text to Columns: split {n} row{}",
+            "Text to Columns: converted {n} row{}",
             if n == 1 { "" } else { "s" }
         ));
+        n
     }
 
     /// Remove duplicate rows in the contiguous region around the cursor
@@ -4247,9 +4948,24 @@ impl App {
                 self.save();
                 false
             }
-            // Quit only when the save landed: a failed save keeps the
-            // editor open with its edits and the failure on the status line.
-            "wq" | "x" => self.save_current().is_ok(),
+            // Quit only when the save landed and kept everything: a failed
+            // save, or one to a text type that holds only the active sheet
+            // (the workbook stays modified), keeps the editor open with the
+            // reason on the status line.
+            "wq" | "x" => {
+                if self.save_current().is_err() {
+                    return false;
+                }
+                if self.modified {
+                    let saved = self.status.take().unwrap_or_default();
+                    self.status = Some(format!(
+                        "{saved} Not quitting: the workbook is not saved in full \
+                         (Save As a workbook, or :q! to discard)."
+                    ));
+                    return false;
+                }
+                true
+            }
             "q" => {
                 if self.modified {
                     self.status = Some("Unsaved changes (use :q! to discard)".to_string());
@@ -4300,9 +5016,6 @@ impl App {
                 "Filter this column (=Laptop, >500, <>0, 'clear'): ",
                 String::new(),
             ),
-            PromptKind::TextToColumns => {
-                ("Split column by (comma, tab, space, ;): ", String::new())
-            }
             PromptKind::SortKeys => ("Sort by (e.g. B asc, C desc): ", String::new()),
             PromptKind::RowHeight => ("Row height in points (or 'auto'): ", String::new()),
         };
@@ -4343,7 +5056,6 @@ impl App {
             PromptKind::CondFormat => self.commit_cond_format(&text),
             PromptKind::DataValidation => self.commit_data_validation(&text),
             PromptKind::Filter => self.commit_filter(&text),
-            PromptKind::TextToColumns => self.commit_text_to_columns(&text),
             PromptKind::SortKeys => self.commit_sort(&text),
             PromptKind::RowHeight => self.commit_row_height(&text),
             PromptKind::SaveAs => {
@@ -4523,7 +5235,11 @@ impl App {
 /// (green).
 impl backstage::BackstageHost for App {
     fn extensions(&self) -> &'static [&'static str] {
-        &["xlsx", "xlsm", "xltx", "xltm", "csv", "tsv"]
+        &["xlsx", "xlsm", "xltx", "xltm", "csv", "tsv", "txt", "prn"]
+    }
+
+    fn default_save_type(&self) -> Option<usize> {
+        self.bound_text_type().or_else(|| type_for_path(&self.path))
     }
 
     fn default_save_name(&self) -> String {
@@ -4968,6 +5684,9 @@ fn draw(app: &mut App, f: &mut Frame) {
     }
     if let Some(d) = &app.format_dialog {
         draw_format_dialog(app, d, f, grid);
+    }
+    if let Some(d) = &app.text_dialog {
+        d.draw(f, grid);
     }
 
     // --- sheet picker -----------------------------------------------------------
@@ -5906,6 +6625,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         || app.edit.is_some()
         || app.format_picker.is_some()
         || app.format_dialog.is_some()
+        || app.text_dialog.is_some()
         || app.sheet_picker.is_some()
         || app.dv_picker.is_some();
     // Plain F9 engages the ribbon (docxy parity); Shift/Ctrl+F9 stays recalc.
@@ -5929,6 +6649,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     }
     if app.format_dialog.is_some() {
         app.format_dialog_key(key.code);
+        return false;
+    }
+    if app.text_dialog.is_some() {
+        app.text_dialog_key(key.code);
         return false;
     }
 
@@ -6410,6 +7134,7 @@ fn run_tui(
     import_source: Option<String>,
     welcome: bool,
     vim: bool,
+    wizard: Option<String>,
 ) -> io::Result<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -6435,6 +7160,9 @@ fn run_tui(
         });
     }
     app.start_screen = welcome;
+    if let Some(text_file) = wizard {
+        app.open_workbook(&text_file);
+    }
     // Detect the terminal's graphics capability (kitty/iTerm2/Sixel); fall back to
     // a half-block renderer so embedded pictures still show something.
     app.picker =
@@ -6546,6 +7274,516 @@ mod tests {
     use super::*;
     use gridcore::edit::parse_input;
     use gridcore::xlsx::save_xlsx;
+
+    /// #604: a workbook opens on the sheet it was saved on, and saving
+    /// records the sheet the user is on.
+    #[test]
+    fn a_workbook_opens_on_its_active_sheet_and_saves_the_current_one() {
+        let dir = std::env::temp_dir().join(format!("xlsxy-active-tab-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("active.xlsx");
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Two");
+        pkg.workbook.active_tab = 1;
+        std::fs::write(&path, save_xlsx(&pkg)).unwrap();
+        let loaded = load_xlsx(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(App::new(loaded, path.to_str().unwrap()).sheet, 1);
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.open_workbook(path.to_str().unwrap());
+        assert_eq!(app.sheet, 1);
+        app.sheet = 0;
+        app.save();
+        let saved = load_xlsx(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.workbook.active_tab, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #615: the *Save as type* list is Excel's, in Excel's order.
+    #[test]
+    fn save_as_offers_excels_types_in_excels_order() {
+        let labels: Vec<&str> = SAVE_TYPES.iter().map(|t| t.label).collect();
+        assert_eq!(
+            labels[..8],
+            [
+                "Excel Workbook",
+                "Excel Macro-Enabled Workbook",
+                "Excel Binary Workbook",
+                "Excel 97-2003 Workbook",
+                "CSV UTF-8 (Comma delimited)",
+                "XML Data",
+                "Single File Web Page",
+                "Web Page",
+            ]
+        );
+        let at = |l: &str| labels.iter().position(|x| *x == l).unwrap();
+        assert!(at("Text (Tab delimited)") < at("Unicode Text"));
+        assert!(at("Unicode Text") < at("CSV (Comma delimited)"));
+        assert!(at("CSV (Comma delimited)") < at("Formatted Text (Space delimited)"));
+        assert_eq!(labels.last(), Some(&"OpenDocument Spreadsheet"));
+        assert_eq!(type_for_path("a/out.CSV"), Some(4));
+        assert_eq!(
+            type_for_path("x.txt").map(|t| SAVE_TYPES[t].label),
+            Some("Text (Tab delimited)")
+        );
+        assert_eq!(
+            type_for_path("x.html").map(|t| SAVE_TYPES[t].label),
+            Some("Web Page")
+        );
+        assert_eq!(type_for_path("x.dat"), None);
+    }
+
+    fn two_sheet_app(dir: &Path) -> App {
+        use gridcore::sheet::Cell;
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].set_cell(0, 0, Cell::text("first sheet"));
+        let data = pkg.add_sheet("Data");
+        let sh = &mut pkg.workbook.sheets[data];
+        sh.set_cell(0, 0, Cell::text("Name"));
+        sh.set_cell(0, 1, Cell::text("Note"));
+        sh.set_cell(1, 0, Cell::text("Z\u{fc}rich"));
+        sh.set_cell(1, 1, Cell::text("line1\nline2"));
+        let mut app = App::new(pkg, dir.join("book.xlsx").to_str().unwrap());
+        app.os_clip = None;
+        app.sheet = data;
+        app
+    }
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("xlsxy-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// #615: Save As CSV UTF-8 from the list writes only the active sheet,
+    /// keeps every sheet open, says so, and closing still asks to save.
+    #[test]
+    fn save_as_csv_utf8_writes_the_active_sheet_and_keeps_the_rest() {
+        let dir = tmp("save-csv");
+        let mut app = two_sheet_app(&dir);
+        app.open_backstage();
+        let b = app.backstage.as_mut().unwrap();
+        b.begin_save_as("book.xlsx".into(), None);
+        b.pick_type(4);
+        assert_eq!(b.name_input, "book.csv");
+        let name = b.name_input.clone();
+        app.commit_save_as(dir.clone(), name);
+        let out = dir.join("book.csv");
+        let mut want = b"\xEF\xBB\xBF".to_vec();
+        want.extend_from_slice("Name,Note\r\nZ\u{fc}rich,\"line1\nline2\"\r\n".as_bytes());
+        assert_eq!(std::fs::read(&out).unwrap(), want);
+        assert_eq!(Path::new(&app.path), out);
+        assert_eq!(app.pkg.workbook.sheets.len(), 2);
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap()
+                .contains("possible data loss")
+        );
+        assert!(app.status.as_deref().unwrap().contains("multiple sheets"));
+        assert!(app.modified, "closing after a CSV save still asks");
+        app.request_exit();
+        assert!(app.confirm.as_ref().unwrap().prompt().contains("Unsaved"));
+        app.confirm = None;
+        // Ctrl+S keeps writing CSV to the CSV path.
+        std::fs::remove_file(&out).unwrap();
+        app.save();
+        assert_eq!(std::fs::read(&out).unwrap(), want);
+        // Saving As a workbook again writes the package and is clean.
+        app.commit_save_as(dir.clone(), "again.xlsx".into());
+        assert!(
+            std::fs::read(dir.join("again.xlsx"))
+                .unwrap()
+                .starts_with(b"PK")
+        );
+        assert!(!app.modified);
+        assert_eq!(app.text_type, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #615's repro: F12, `out.csv`, Enter no longer writes a ZIP.
+    #[test]
+    fn save_as_prompt_out_csv_is_a_csv_not_a_zip() {
+        let dir = tmp("f12-csv");
+        let mut app = two_sheet_app(&dir);
+        app.request_save_as(dir.join("out.csv").to_string_lossy().into_owned());
+        let bytes = std::fs::read(dir.join("out.csv")).unwrap();
+        assert!(!bytes.starts_with(b"PK"));
+        assert!(bytes.starts_with(b"\xEF\xBB\xBFName,Note\r\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #615: each text type is written as Excel writes it.
+    #[test]
+    fn save_as_text_types_write_excels_bytes() {
+        let dir = tmp("text-types");
+        let at = |l: &str| SAVE_TYPES.iter().position(|t| t.label == l).unwrap();
+        let cases: [(&str, &str, &[u8]); 4] = [
+            (
+                "CSV (Comma delimited)",
+                "c.csv",
+                b"Name,Note\r\nZ\xFCrich,\"line1\nline2\"\r\n",
+            ),
+            (
+                "Text (Tab delimited)",
+                "t.txt",
+                b"Name\tNote\r\nZ\xFCrich\t\"line1\nline2\"\r\n",
+            ),
+            (
+                "Unicode Text",
+                "u.txt",
+                b"\xFF\xFEN\x00a\x00m\x00e\x00\t\x00",
+            ),
+            (
+                "Formatted Text (Space delimited)",
+                "f.prn",
+                b"Name    Note\r\n",
+            ),
+        ];
+        for (label, file, prefix) in cases {
+            let mut app = two_sheet_app(&dir);
+            app.save_as_type(dir.join(file).to_string_lossy().into_owned(), at(label));
+            let bytes = std::fs::read(dir.join(file)).unwrap();
+            assert!(bytes.starts_with(prefix), "{label}: {bytes:?}");
+        }
+        // Web Page: the .htm and its _files folder.
+        let mut app = two_sheet_app(&dir);
+        app.save_as_type(
+            dir.join("page.htm").to_string_lossy().into_owned(),
+            at("Web Page"),
+        );
+        let htm = std::fs::read_to_string(dir.join("page.htm")).unwrap();
+        assert!(htm.contains("page_files/filelist.xml"), "{htm}");
+        assert!(htm.contains("Z\u{fc}rich"));
+        assert!(dir.join("page_files").join("filelist.xml").is_file());
+        assert!(dir.join("page_files").join("stylesheet.css").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #615: `.html` is Web Page's other spelling: Save As and Ctrl+S write
+    /// the page, never the workbook package.
+    #[test]
+    fn save_as_html_writes_a_web_page_and_ctrl_s_keeps_it() {
+        let dir = tmp("html");
+        let mut app = two_sheet_app(&dir);
+        let page = dir.join("page.html");
+        app.request_save_as(page.to_string_lossy().into_owned());
+        let bytes = std::fs::read(&page).unwrap();
+        assert!(!bytes.starts_with(b"PK"));
+        let htm = String::from_utf8(bytes).unwrap();
+        assert!(htm.contains("page_files/filelist.xml"), "{htm}");
+        let list = std::fs::read_to_string(dir.join("page_files").join("filelist.xml")).unwrap();
+        assert!(list.contains("HRef=\"../page.html\""), "{list}");
+        std::fs::remove_file(&page).unwrap();
+        app.save();
+        assert!(!std::fs::read(&page).unwrap().starts_with(b"PK"));
+        // Picked from the list, a typed .html name is kept as it is.
+        app.open_backstage();
+        let web = SAVE_TYPES
+            .iter()
+            .position(|t| t.label == "Web Page")
+            .unwrap();
+        let b = app.backstage.as_mut().unwrap();
+        b.begin_save_as("other.xlsx".into(), None);
+        b.pick_type(web);
+        b.name_input = "other.html".into();
+        app.commit_save_as(dir.clone(), "other.html".into());
+        assert!(dir.join("other.html").is_file());
+        assert!(!dir.join("other.html.htm").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Save As opens on the type the workbook is bound to: Unicode Text
+    /// saved again (Save As, Enter) stays UTF-16, not Text (Tab) 1252.
+    #[test]
+    fn save_as_again_keeps_the_bound_unicode_text_type() {
+        let dir = tmp("unicode-again");
+        let mut app = two_sheet_app(&dir);
+        let unicode = SAVE_TYPES
+            .iter()
+            .position(|t| t.label == "Unicode Text")
+            .unwrap();
+        let path = dir.join("u.txt");
+        app.save_as_type(path.to_string_lossy().into_owned(), unicode);
+        std::fs::remove_file(&path).unwrap();
+        app.open_backstage();
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        while app.backstage.as_ref().unwrap().item != backstage::Item::SaveAs {
+            app.backstage_key(key(KeyCode::Down));
+        }
+        app.backstage_key(key(KeyCode::Enter));
+        assert_eq!(app.backstage.as_ref().unwrap().type_sel, unicode);
+        let b = app.backstage.as_mut().unwrap();
+        b.dir = dir.clone();
+        app.backstage_key(key(KeyCode::Enter));
+        assert!(std::fs::read(&path).unwrap().starts_with(b"\xFF\xFE"));
+        // A .html workbook's Save As shows Web Page, not Excel Workbook.
+        let web = SAVE_TYPES
+            .iter()
+            .position(|t| t.label == "Web Page")
+            .unwrap();
+        app.save_as_type(dir.join("p.html").to_string_lossy().into_owned(), web);
+        app.open_backstage();
+        while app.backstage.as_ref().unwrap().item != backstage::Item::SaveAs {
+            app.backstage_key(key(KeyCode::Down));
+        }
+        app.backstage_key(key(KeyCode::Enter));
+        assert_eq!(app.backstage.as_ref().unwrap().type_sel, web);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Save As prompt (F12) keeps the bound type: Unicode Text saved
+    /// again is still UTF-16, CSV (Comma delimited) is still Windows-1252.
+    #[test]
+    fn the_save_as_prompt_keeps_the_bound_text_type() {
+        let dir = tmp("prompt-bound");
+        let at = |l: &str| SAVE_TYPES.iter().position(|t| t.label == l).unwrap();
+        for (label, file, head) in [
+            ("Unicode Text", "u.txt", &b"\xFF\xFE"[..]),
+            ("CSV (Comma delimited)", "c.csv", &b"Name,Note"[..]),
+        ] {
+            let mut app = two_sheet_app(&dir);
+            let path = dir.join(file);
+            app.save_as_type(path.to_string_lossy().into_owned(), at(label));
+            std::fs::remove_file(&path).unwrap();
+            app.open_prompt(PromptKind::SaveAs);
+            app.prompt.as_mut().unwrap().text = path.to_string_lossy().into_owned();
+            app.commit_prompt();
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(bytes.starts_with(head), "{label}: {bytes:?}");
+            assert_eq!(app.text_type, Some(at(label)));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `:wq` after saving as CSV (only the active sheet was written) stays
+    /// open instead of quitting with the other sheets unsaved.
+    #[test]
+    fn vim_wq_after_a_csv_save_as_does_not_quit() {
+        let dir = tmp("wq-csv");
+        let mut app = two_sheet_app(&dir);
+        app.request_save_as(dir.join("book.csv").to_string_lossy().into_owned());
+        assert!(app.modified);
+        for cmd in ["wq", "x"] {
+            assert!(!app.vim_run_command(cmd), ":{cmd} quit");
+            assert!(app.status.as_deref().unwrap().contains("Not quitting"));
+        }
+        // Saved as a workbook, :wq quits.
+        app.request_save_as(dir.join("book.xlsx").to_string_lossy().into_owned());
+        assert!(app.vim_run_command("wq"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #615: XML Data needs XML maps; other unwritten types are refused and
+    /// nothing is written under their name.
+    #[test]
+    fn save_as_refuses_types_it_cannot_write() {
+        let dir = tmp("refused");
+        let at = |l: &str| SAVE_TYPES.iter().position(|t| t.label == l).unwrap();
+        let mut app = two_sheet_app(&dir);
+        app.save_as_type(
+            dir.join("x.xml").to_string_lossy().into_owned(),
+            at("XML Data"),
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Cannot save XML data because the workbook does not contain any XML mappings.")
+        );
+        for (label, file) in [
+            ("Excel Binary Workbook", "b.xlsb"),
+            ("Excel 97-2003 Workbook", "o.xls"),
+            ("OpenDocument Spreadsheet", "o.ods"),
+            ("Single File Web Page", "s.mht"),
+        ] {
+            app.save_as_type(dir.join(file).to_string_lossy().into_owned(), at(label));
+            assert!(
+                app.status.as_deref().unwrap().contains("cannot save as"),
+                "{label}"
+            );
+            assert!(!dir.join(file).exists(), "{label}");
+        }
+        assert!(app.path.ends_with("book.xlsx"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #615: File › Export › Change File Type opens Save As with that type.
+    #[test]
+    fn export_change_file_type_opens_save_as_with_the_type() {
+        let mut app = App::new(new_xlsx(), "book.xlsx");
+        app.open_backstage();
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        while app.backstage.as_ref().unwrap().item != backstage::Item::Export {
+            app.backstage_key(key(KeyCode::Down));
+        }
+        app.backstage_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.backstage.as_ref().unwrap().pane,
+            backstage::Pane::Export
+        );
+        let tab = SAVE_TYPES
+            .iter()
+            .position(|t| t.label == "Text (Tab delimited)")
+            .unwrap();
+        for _ in 0..=tab {
+            app.backstage_key(key(KeyCode::Down));
+        }
+        app.backstage_key(key(KeyCode::Enter));
+        let b = app.backstage.as_ref().unwrap();
+        assert_eq!(b.pane, backstage::Pane::SaveAs);
+        assert_eq!(b.name_input, "book.txt");
+        assert_eq!(b.chosen_type(), Some(tab));
+    }
+
+    /// 2024-09-30, the clock the CSV tests open with.
+    const CSV_TODAY: f64 = 45_565.0;
+
+    fn csv_open(auto: AutoConvert) -> TextOpen {
+        TextOpen {
+            auto,
+            today: Some(CSV_TODAY),
+        }
+    }
+
+    fn value(pkg: &SheetPackage, a1: &str) -> gridcore::sheet::CellValue {
+        let (r, c) = parse_a1(a1).unwrap();
+        pkg.workbook.sheets[0]
+            .cell(r, c)
+            .map(|c| c.value.clone())
+            .unwrap_or_default()
+    }
+
+    fn code(pkg: &SheetPackage, a1: &str) -> Option<String> {
+        let (r, c) = parse_a1(a1).unwrap();
+        let style = pkg.workbook.sheets[0].cell(r, c).unwrap().style;
+        pkg.workbook.styles.xf(style).code
+    }
+
+    /// #605: a CSV's fields convert as typed entry does, with 15 digits.
+    #[test]
+    fn opening_a_csv_converts_every_field_as_typed() {
+        use gridcore::sheet::CellValue::{Bool, Number, Text};
+        let bytes = b"\xEF\xBB\xBFcode,when,pct,flag,sci,long,calc,text,quoted\r\n\
+                      007,1/2,12%,TRUE,1E5,1234567890123456789,=1+1,apple,\"a,b\"\r\n";
+        let text = gridcore::textio::decode(bytes, gridcore::textio::Origin::Auto);
+        let pkg = csv_to_pkg(&text, "in", false, &csv_open(AutoConvert::default()));
+        // The header row stays plain text.
+        assert_eq!(value(&pkg, "A1"), Text("code".into()));
+        assert_eq!(value(&pkg, "I1"), Text("quoted".into()));
+        assert_eq!(value(&pkg, "A2"), Number(7.0));
+        let jan2 = gridcore::sheet::parts_to_serial(2024, 1, 2, 0, false);
+        assert_eq!(value(&pkg, "B2"), Number(jan2));
+        let date = gridcore::sheet::classify_format_code(&code(&pkg, "B2").unwrap());
+        assert_eq!(date, gridcore::sheet::NumFmt::Date);
+        assert_eq!(value(&pkg, "C2"), Number(0.12));
+        assert_eq!(code(&pkg, "C2").as_deref(), Some("0%"));
+        assert_eq!(value(&pkg, "D2"), Bool(true));
+        assert_eq!(value(&pkg, "E2"), Number(100_000.0));
+        assert_eq!(value(&pkg, "F2"), Number(1.23456789012346e18));
+        let g2 = pkg.workbook.sheets[0].cell(1, 6).unwrap();
+        assert_eq!(g2.formula.as_deref(), Some("1+1"));
+        assert_eq!(g2.value, Number(2.0));
+        assert_eq!(value(&pkg, "H2"), Text("apple".into()));
+        assert_eq!(value(&pkg, "I2"), Text("a,b".into()));
+    }
+
+    /// #606: a `sep=` first line names the delimiter and is not imported;
+    /// a blank header stays blank.
+    #[test]
+    fn a_sep_line_sets_the_delimiter_and_blank_headers_stay_blank() {
+        use gridcore::sheet::CellValue::{Empty, Number, Text};
+        let open = csv_open(AutoConvert::default());
+        let pkg = csv_to_pkg("sep=;\r\na;b\r\n1;2\r\n", "sep", false, &open);
+        assert_eq!(value(&pkg, "A1"), Text("a".into()));
+        assert_eq!(value(&pkg, "B1"), Text("b".into()));
+        assert_eq!(value(&pkg, "A2"), Number(1.0));
+        assert_eq!(value(&pkg, "B2"), Number(2.0));
+        assert_eq!(pkg.workbook.sheets[0].used_size(), (2, 2));
+        let pkg = csv_to_pkg("a,,c\n1,2,3\n", "blank", false, &open);
+        assert_eq!(value(&pkg, "B1"), Empty);
+        assert_eq!(value(&pkg, "B2"), Number(2.0));
+    }
+
+    /// #607: with Automatic Data Conversion off those fields open as text.
+    #[test]
+    fn automatic_data_conversion_off_keeps_fields_as_text() {
+        use gridcore::sheet::CellValue::{Number, Text};
+        let csv = "007,1/2,1E5,1234567890123456789\n";
+        let all_off = AutoConvert {
+            remove_leading_zeros: false,
+            keep_15_digits: false,
+            e_notation: false,
+            dates: false,
+        };
+        let off = csv_to_pkg(csv, "off", false, &csv_open(all_off));
+        for (a1, text) in [
+            ("A1", "007"),
+            ("B1", "1/2"),
+            ("C1", "1E5"),
+            ("D1", "1234567890123456789"),
+        ] {
+            assert_eq!(value(&off, a1), Text(text.into()), "{a1}");
+        }
+        let on = csv_to_pkg(csv, "on", false, &csv_open(AutoConvert::default()));
+        assert_eq!(value(&on, "A1"), Number(7.0));
+        assert_eq!(value(&on, "C1"), Number(100_000.0));
+        assert_eq!(value(&on, "D1"), Number(1.23456789012346e18));
+    }
+
+    /// #607: File › Options › Data shows the four switches and changes them.
+    #[test]
+    fn file_options_data_changes_the_conversion_switches() {
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.open_backstage();
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        // Walk the menu down to Options and enter it.
+        while app.backstage.as_ref().unwrap().item != backstage::Item::Options {
+            app.backstage_key(key(KeyCode::Down));
+        }
+        app.backstage_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.backstage.as_ref().unwrap().pane,
+            backstage::Pane::Options
+        );
+        app.backstage_key(key(KeyCode::Char(' ')));
+        app.backstage_key(key(KeyCode::Down));
+        app.backstage_key(key(KeyCode::Down));
+        app.backstage_key(key(KeyCode::Down));
+        app.backstage_key(key(KeyCode::Char(' ')));
+        assert_eq!(
+            app.auto_convert,
+            AutoConvert {
+                remove_leading_zeros: false,
+                dates: false,
+                ..AutoConvert::default()
+            }
+        );
+        // Reopened, the page shows the current switches.
+        app.backstage = None;
+        app.open_backstage();
+        let opts = &app.backstage.as_ref().unwrap().options;
+        assert_eq!(
+            opts.iter().map(|o| o.1).collect::<Vec<_>>(),
+            [false, true, true, false]
+        );
+        assert!(opts[0].0.starts_with("Remove leading zeros"));
+    }
+
+    /// #607: the four switches persist in the preferences file.
+    #[test]
+    fn the_conversion_options_round_trip_through_the_preferences() {
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        assert_eq!(app.auto_convert, AutoConvert::default());
+        app.auto_convert.remove_leading_zeros = false;
+        app.auto_convert.dates = false;
+        let text = app.view_prefs_text();
+        assert!(text.contains("convert_leading_zeros=0"), "{text}");
+        let mut again = App::new(new_xlsx(), "untitled.xlsx");
+        again.apply_view_prefs(&text);
+        assert_eq!(again.auto_convert, app.auto_convert);
+        // An older file without the keys keeps Excel's defaults.
+        again.apply_view_prefs("formula_view=0\n");
+        assert_eq!(again.auto_convert, AutoConvert::default());
+    }
 
     #[test]
     fn imported_csv_stays_protected_until_successful_save_as_or_new() {
@@ -7174,20 +8412,162 @@ mod tests {
         assert!(gridcore::cf::cell_dxf(&re.workbook, 0, 0, 0).is_none());
     }
 
-    #[test]
-    fn commit_text_to_columns_splits_column() {
-        use gridcore::sheet::{Cell, CellValue};
+    fn ttc_app(cells: &[(u32, u32, &str)]) -> App {
+        use gridcore::sheet::Cell;
         let mut app = App::new(new_xlsx(), "t.xlsx");
         app.os_clip = None;
-        app.pkg.workbook.sheets[0].set_cell(0, 0, Cell::text("Dock,2,179"));
+        for (r, c, t) in cells {
+            app.pkg.workbook.sheets[0].set_cell(*r, *c, Cell::text(t));
+        }
         app.rebuild_engine();
+        app
+    }
+
+    /// #692: Data › Text to Columns opens the wizard; Finish converts.
+    #[test]
+    fn text_to_columns_runs_through_the_wizard() {
+        use gridcore::sheet::CellValue;
+        let mut app = ttc_app(&[(0, 0, "Pen,4,\"Blue, fine\",0012")]);
         app.cur = (0, 0);
         app.anchor = None;
-        app.commit_text_to_columns(",");
+        app.ribbon_act(ribbon::Act::TextToColumns);
+        let d = app.text_dialog.as_mut().expect("wizard open");
+        assert!(!d.is_import());
+        d.goto_step(1);
+        d.key(KeyCode::Char(' ')); // untick Tab
+        d.key(KeyCode::Down);
+        d.key(KeyCode::Down);
+        d.key(KeyCode::Char(' ')); // Comma
+        d.goto_step(2);
+        d.key(KeyCode::Right);
+        d.key(KeyCode::Right);
+        d.key(KeyCode::Right); // column 4
+        d.key(KeyCode::Char('t'));
+        app.text_dialog_key(KeyCode::Enter);
+        assert!(app.text_dialog.is_none());
         let sh = app.sheet();
-        assert_eq!(sh.cell(0, 0).unwrap().value, CellValue::Text("Dock".into()));
-        assert_eq!(sh.cell(0, 1).unwrap().value, CellValue::Number(2.0));
-        assert_eq!(sh.cell(0, 2).unwrap().value, CellValue::Number(179.0));
+        assert_eq!(sh.cell(0, 0).unwrap().value, CellValue::Text("Pen".into()));
+        assert_eq!(sh.cell(0, 1).unwrap().value, CellValue::Number(4.0));
+        assert_eq!(
+            sh.cell(0, 2).unwrap().value,
+            CellValue::Text("Blue, fine".into())
+        );
+        assert_eq!(sh.cell(0, 3).unwrap().value, CellValue::Text("0012".into()));
+        // One undo restores the column.
+        app.undo();
+        assert_eq!(
+            app.sheet().cell(0, 0).unwrap().value,
+            CellValue::Text("Pen,4,\"Blue, fine\",0012".into())
+        );
+    }
+
+    /// #692: data in the way asks first; No changes nothing, Yes converts.
+    #[test]
+    fn text_to_columns_asks_before_replacing_data() {
+        use gridcore::sheet::CellValue;
+        let cells = [(0, 0, "a\tb"), (0, 1, "keep")];
+        for (answer, b1) in [(KeyCode::Char('n'), "keep"), (KeyCode::Char('y'), "b")] {
+            let mut app = ttc_app(&cells);
+            app.cur = (0, 0);
+            app.ribbon_act(ribbon::Act::TextToColumns);
+            app.text_dialog_key(KeyCode::Enter);
+            let c = app.confirm.as_ref().expect("asks first");
+            assert_eq!(c.prompt(), gridcore::edit::TTC_REPLACE);
+            app.confirm_key(KeyEvent::new(answer, KeyModifiers::NONE));
+            assert!(app.confirm.is_none());
+            assert_eq!(
+                app.sheet().cell(0, 1).unwrap().value,
+                CellValue::Text(b1.into())
+            );
+        }
+    }
+
+    /// The wizard refuses Finish while the decimal and thousands separators
+    /// are the same character, and stays open.
+    #[test]
+    fn the_wizard_refuses_equal_separators() {
+        let mut app = ttc_app(&[(0, 0, "1.5")]);
+        app.ribbon_act(ribbon::Act::TextToColumns);
+        app.text_dialog.as_mut().unwrap().thousands = '.';
+        app.text_dialog_key(KeyCode::Enter);
+        assert!(app.text_dialog.is_some());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("The decimal and thousands separators must differ")
+        );
+        assert_eq!(
+            app.sheet().cell(0, 0).unwrap().value,
+            gridcore::sheet::CellValue::Text("1.5".into())
+        );
+    }
+
+    /// #692: more than one column is refused with Excel's message.
+    #[test]
+    fn text_to_columns_refuses_two_columns() {
+        let mut app = ttc_app(&[(0, 0, "a,b"), (0, 1, "c")]);
+        app.cur = (0, 1);
+        app.anchor = Some((0, 0));
+        app.ribbon_act(ribbon::Act::TextToColumns);
+        assert!(app.text_dialog.is_none());
+        assert_eq!(app.status.as_deref(), Some(gridcore::edit::TTC_ONE_COLUMN));
+    }
+
+    /// #607: opening a .txt shows the wizard; Finish imports it with the
+    /// chosen formats; Esc leaves the workbook as it was.
+    #[test]
+    fn opening_a_text_file_runs_the_import_wizard() {
+        use gridcore::sheet::CellValue;
+        let dir = std::env::temp_dir().join(format!("xlsxy-wizard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("parts.txt");
+        std::fs::write(&path, "02134\t03/04/2024\t1.234,5-\tx\r\n").unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.open_workbook(path.to_str().unwrap());
+        assert!(app.text_dialog.as_ref().is_some_and(|d| d.is_import()));
+        app.text_dialog_key(KeyCode::Esc);
+        assert!(app.text_dialog.is_none());
+        assert_eq!(app.path, "untitled.xlsx");
+
+        app.open_workbook(path.to_str().unwrap());
+        let d = app.text_dialog.as_mut().unwrap();
+        d.goto_step(2);
+        d.columns = vec![
+            gridcore::textio::ColFormat::Text,
+            gridcore::textio::ColFormat::Date(gridcore::textio::DateOrder::Dmy),
+            gridcore::textio::ColFormat::General,
+            gridcore::textio::ColFormat::Skip,
+        ];
+        d.decimal = ',';
+        d.thousands = '.';
+        app.text_dialog_key(KeyCode::Enter);
+        assert!(app.text_dialog.is_none());
+        assert_eq!(Path::new(&app.path), path.with_extension("xlsx"));
+        assert_eq!(app.import_source.as_deref(), path.to_str());
+        let sh = app.sheet();
+        assert_eq!(
+            sh.cell(0, 0).unwrap().value,
+            CellValue::Text("02134".into())
+        );
+        let apr3 = gridcore::sheet::parts_to_serial(2024, 4, 3, 0, false);
+        assert_eq!(sh.cell(0, 1).unwrap().value, CellValue::Number(apr3));
+        assert_eq!(sh.cell(0, 2).unwrap().value, CellValue::Number(-1234.5));
+        assert!(sh.cell(0, 3).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_wizard_draws_over_the_grid() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = ttc_app(&[(0, 0, "a,b")]);
+        app.ribbon_act(ribbon::Act::TextToColumns);
+        let mut term = Terminal::new(TestBackend::new(100, 34)).unwrap();
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        let text = format!("{:?}", term.backend().buffer());
+        assert!(
+            text.contains("Convert Text to Columns Wizard"),
+            "title missing"
+        );
     }
 
     #[test]
@@ -7853,15 +9233,20 @@ mod tests {
 
     #[test]
     fn single_click_exit_opens_confirm_and_new_stays_guarded() {
-        // Exit is index 7 in the menu, drawn at screen row 1 + idx. One click
-        // goes straight to the shared confirm modal — no second click.
-        let exit_row = 1 + backstage::ITEMS
-            .iter()
-            .position(|i| *i == backstage::Item::Exit)
-            .unwrap() as u16;
+        // Exit is the last menu item (after xlsxy's Options), drawn at screen
+        // row 1 + idx. One click goes straight to the shared confirm modal —
+        // no second click.
         let mut app = App::new(new_xlsx(), "doc.xlsx");
         app.os_clip = None;
         app.open_backstage();
+        let exit_row = 1 + app
+            .backstage
+            .as_ref()
+            .unwrap()
+            .items()
+            .iter()
+            .position(|i| *i == backstage::Item::Exit)
+            .unwrap() as u16;
         app.bs_mouse(3, exit_row);
         assert!(app.backstage.is_none(), "Exit closes the backstage");
         assert!(app.confirm.is_some(), "Exit raises the confirm dialog");
@@ -8559,7 +9944,13 @@ mod tests {
 
     #[test]
     fn csv_imports_as_workbook() {
-        let pkg = csv_to_pkg("Region,Sales\nEast,10\n\"West, far\",20.5\n", "sales");
+        let open = csv_open(AutoConvert::default());
+        let pkg = csv_to_pkg(
+            "Region,Sales\nEast,10\n\"West, far\",20.5\n",
+            "sales",
+            false,
+            &open,
+        );
         let sh = &pkg.workbook.sheets[0];
         assert_eq!(sh.name, "sales");
         assert_eq!(

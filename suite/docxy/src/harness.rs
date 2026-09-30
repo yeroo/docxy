@@ -946,10 +946,9 @@ pub fn parse_field(name: &str) -> Result<RefTarget, String> {
         "cond-format" => Ok(RefTarget::CondFormat),
         "validation" => Ok(RefTarget::Validation),
         "sort" => Ok(RefTarget::Sort),
-        "text-to-columns" => Ok(RefTarget::TextToColumns),
         other => Err(format!(
             "unknown field '{other}' (chart-range, chart-title, categories, \
-             series-name:N, series-values:N, cond-format, validation, sort, text-to-columns)"
+             series-name:N, series-values:N, cond-format, validation, sort)"
         )),
     }
 }
@@ -966,7 +965,6 @@ pub fn field_name(target: RefTarget) -> String {
         RefTarget::CondFormat => "cond-format".into(),
         RefTarget::Validation => "validation".into(),
         RefTarget::Sort => "sort".into(),
-        RefTarget::TextToColumns => "text-to-columns".into(),
     }
 }
 
@@ -4794,7 +4792,6 @@ mod tests {
             RefTarget::CondFormat,
             RefTarget::Validation,
             RefTarget::Sort,
-            RefTarget::TextToColumns,
         ] {
             assert_eq!(parse_field(&field_name(t)), Ok(t));
         }

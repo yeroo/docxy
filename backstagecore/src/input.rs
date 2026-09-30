@@ -2,7 +2,7 @@
 //! docxy's `main.rs` `backstage_key`/`bs_mouse`/`bs_menu_activate`/
 //! `save_as_key`/`save_as_name_key`/`save_as_browser_key`/`bs_scroll_preview`.
 
-use crate::{Backstage, BackstageEvent, BackstageHost, ITEMS, Item, Pane};
+use crate::{Backstage, BackstageEvent, BackstageHost, Item, Pane};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Position;
 
@@ -102,6 +102,30 @@ impl Backstage {
                     _ => BackstageEvent::None,
                 }
             }
+            Pane::Export => {
+                let last = self.save_types.len();
+                match key.code {
+                    KeyCode::Up => self.export_sel = self.export_sel.saturating_sub(1),
+                    KeyCode::Down => self.export_sel = (self.export_sel + 1).min(last),
+                    KeyCode::Enter => return self.export_activate(host),
+                    KeyCode::Left => self.pane = Pane::Menu,
+                    _ => {}
+                }
+                BackstageEvent::None
+            }
+            Pane::Options => {
+                match key.code {
+                    KeyCode::Up => self.option_sel = self.option_sel.saturating_sub(1),
+                    KeyCode::Down => {
+                        self.option_sel =
+                            (self.option_sel + 1).min(self.options.len().saturating_sub(1))
+                    }
+                    KeyCode::Char(' ') | KeyCode::Enter => self.toggle_option(),
+                    KeyCode::Left => self.pane = Pane::Menu,
+                    _ => {}
+                }
+                BackstageEvent::None
+            }
             // Handled above by save_as_key; here only to keep the match total.
             Pane::SaveAs => BackstageEvent::None,
         }
@@ -119,23 +143,46 @@ impl Backstage {
             Item::Info => BackstageEvent::None,
             Item::Save => BackstageEvent::Save,
             Item::SaveAs => {
-                // Prefill the current file's name with the caret at its end.
-                let name = host.default_save_name();
-                self.name_cursor = name.chars().count();
-                self.name_input = name;
-                self.name_focus = true;
-                self.pane = Pane::SaveAs;
+                // Prefill the current file's name with the caret at its end,
+                // and the type the host bound it to.
+                self.begin_save_as(host.default_save_name(), None);
+                if let Some(t) = host.default_save_type() {
+                    self.preset(t);
+                }
                 BackstageEvent::None
             }
             Item::New => BackstageEvent::New,
+            // With a type list, Export is a page: the host's quick export,
+            // then Change File Type.
+            Item::Export if !self.save_types.is_empty() => {
+                self.pane = Pane::Export;
+                BackstageEvent::None
+            }
             Item::Export => BackstageEvent::Export,
+            Item::Options => {
+                self.pane = Pane::Options;
+                BackstageEvent::None
+            }
             Item::Exit => BackstageEvent::Exit,
         }
     }
 
-    /// Keys for the Save As dialog. Tab moves focus between the file-name field
-    /// and the folder browser; each piece only reacts when it's focused. Enter
-    /// commits the Save As (Esc, handled by the caller, cancels).
+    /// Run Export's highlighted row: the quick export, or Change File Type
+    /// (Save As with that type picked).
+    fn export_activate(&mut self, host: &dyn BackstageHost) -> BackstageEvent {
+        match self.export_sel.checked_sub(1) {
+            None => BackstageEvent::Export,
+            Some(i) => {
+                self.begin_save_as(host.default_save_name(), Some(i));
+                BackstageEvent::None
+            }
+        }
+    }
+
+    /// Keys for the Save As dialog. Tab moves focus between the file-name field,
+    /// the *Save as type* box (when the host has one) and the folder browser;
+    /// each piece only reacts when it's focused. Enter commits the Save As
+    /// (Esc, handled by the caller, cancels).
     fn save_as_key(&mut self, key: KeyEvent) -> BackstageEvent {
         match key.code {
             KeyCode::Enter => {
@@ -144,11 +191,37 @@ impl Backstage {
                     name: self.name_input.trim().to_string(),
                 };
             }
-            KeyCode::Tab | KeyCode::BackTab => {
+            KeyCode::Tab | KeyCode::BackTab if self.save_types.is_empty() => {
                 self.name_focus = !self.name_focus;
                 return BackstageEvent::None;
             }
+            KeyCode::Tab | KeyCode::BackTab => {
+                // name → type → folders → name (reversed with Shift+Tab).
+                let at = if self.name_focus {
+                    0
+                } else if self.type_focus {
+                    1
+                } else {
+                    2
+                };
+                let next = if key.code == KeyCode::Tab {
+                    (at + 1) % 3
+                } else {
+                    (at + 2) % 3
+                };
+                self.name_focus = next == 0;
+                self.type_focus = next == 1;
+                return BackstageEvent::None;
+            }
             _ => {}
+        }
+        if self.type_focus {
+            match key.code {
+                KeyCode::Up => self.pick_type(self.type_sel.saturating_sub(1)),
+                KeyCode::Down => self.pick_type((self.type_sel + 1).min(self.save_types.len() - 1)),
+                _ => {}
+            }
+            return BackstageEvent::None;
         }
         if self.name_focus {
             self.save_as_name_key(key);
@@ -223,8 +296,8 @@ impl Backstage {
         if x < 14 {
             if y >= 1 {
                 let idx = (y - 1) as usize;
-                if idx < ITEMS.len() {
-                    let it = ITEMS[idx];
+                if idx < self.items().len() {
+                    let it = self.items()[idx];
                     let cur = self.item;
                     let guarded = matches!(it, Item::New);
                     self.item = it;
@@ -240,8 +313,9 @@ impl Backstage {
             }
             return BackstageEvent::None;
         }
-        // The Save As dialog has two pieces; clicking one focuses it and
-        // deactivates the other.
+        // The Save As dialog has three pieces (the folder list, the name box
+        // and, when the host has types, the type box); clicking one focuses
+        // it and deactivates the others.
         if self.pane == Pane::SaveAs {
             // The Save button (a clickable Enter).
             if self.layout.save_btn.contains(Position { x, y }) {
@@ -250,10 +324,17 @@ impl Backstage {
                     name: self.name_input.trim().to_string(),
                 };
             }
+            // Click in the type box: focus it (↑↓ then change the type).
+            if !self.save_types.is_empty() && y >= self.layout.type_top {
+                self.name_focus = false;
+                self.type_focus = true;
+                return BackstageEvent::None;
+            }
             // Click inside the name box: focus the field and drop the caret at
             // the clicked character.
             if y >= self.layout.name_top {
                 self.name_focus = true;
+                self.type_focus = false;
                 let off = x.saturating_sub(self.layout.name_x0) as usize;
                 self.name_cursor = off.min(self.name_input.chars().count());
                 return BackstageEvent::None;
@@ -268,6 +349,7 @@ impl Backstage {
             if idx < self.entries.len() {
                 let was_sel = idx == self.sel;
                 self.name_focus = false;
+                self.type_focus = false;
                 self.sel = idx;
                 let is_dir = self.entries[idx].is_dir;
                 if is_dir && was_sel {
@@ -276,6 +358,37 @@ impl Backstage {
                     self.name_input = self.entries[idx].name.clone();
                     self.name_cursor = self.name_input.chars().count();
                 }
+            }
+            return BackstageEvent::None;
+        }
+        // Export's rows: the quick export at y 3, the types from y 6 (see
+        // `draw_export`). A click selects; a click on the selection runs it.
+        if self.item == Item::Export && !self.save_types.is_empty() {
+            let row = match y {
+                3 => Some(0),
+                y if y >= 6 => Some(self.layout.list_start + (y - 6) as usize + 1)
+                    .filter(|&r| r <= self.save_types.len()),
+                _ => None,
+            };
+            if let Some(r) = row {
+                let again = self.pane == Pane::Export && r == self.export_sel;
+                self.pane = Pane::Export;
+                self.export_sel = r;
+                if again {
+                    return self.export_activate(host);
+                }
+            }
+            return BackstageEvent::None;
+        }
+        // An option row (below the heading and a blank line) flips it.
+        if self.item == Item::Options {
+            if let Some(i) = (y as usize)
+                .checked_sub(3)
+                .filter(|&i| i < self.options.len())
+            {
+                self.option_sel = i;
+                self.pane = Pane::Options;
+                self.toggle_option();
             }
             return BackstageEvent::None;
         }
