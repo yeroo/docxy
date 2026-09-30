@@ -30,6 +30,10 @@ fn apply_dialog(
                 _ => crate::page_setup::apply_columns(ed, pkg, dialog),
             }
         }
+        // Their presses are handled in `ttc_dialog::click`, before this.
+        DialogOwner::TextToColumns { .. } | DialogOwner::TextToColumnsReplace => {
+            Err("Text to Columns applies through its own wizard".into())
+        }
         #[cfg(test)]
         DialogOwner::Test => Ok(false),
     }
@@ -39,6 +43,10 @@ fn apply_dialog(
 pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Result<(), String> {
     // A levelling pass asked for first runs first, as before any edit.
     flush_level_pass(tab);
+    // Text to Columns asks its own question before it applies.
+    if let Some(done) = crate::ttc_dialog::click(tab, button) {
+        return done;
+    }
     let DocTab {
         dialogs,
         surface,

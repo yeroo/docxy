@@ -163,8 +163,9 @@ gets re-routed, and a test fails if it drifts from what `cx.bind_keys`
 registers.
 
 Reference fields, for `focus`: `chart-range`, `chart-title`, `categories`,
-`series-name:N`, `series-values:N`, `cond-format`, `validation`, `sort`,
-`text-to-columns`.
+`series-name:N`, `series-values:N`, `cond-format`, `validation`, `sort`.
+Data › Text to Columns is a dialog (`text-to-columns`), driven with the
+`dialog-*` verbs like the others.
 
 **`open` always loads the file from disk.** The cases in a script share one
 instance — a process per case would multiply a two-second launch by however
