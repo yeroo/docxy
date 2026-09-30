@@ -1197,6 +1197,29 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
         None => false,
     });
 
+    // The sheet's autoFilter moves like the area its `_xlnm._FilterDatabase`
+    // name holds, so the two keep naming the same cells. Each filter column
+    // stays on its data column, or goes with it.
+    if let Some(af) = &mut sheet.auto_filter {
+        let (r1, c1, r2, c2) = af.range;
+        let moved = if shift.rows {
+            span(r1, r2, &shift).map(|(lo, hi)| (lo, c1, hi, c2))
+        } else {
+            span(c1, c2, &shift).map(|(lo, hi)| (r1, lo, r2, hi))
+        };
+        match moved {
+            Some(range) => {
+                af.range = range;
+                if !shift.rows {
+                    for c in &mut af.columns {
+                        *c = c.and_then(|v| point(v, &shift));
+                    }
+                }
+            }
+            None => sheet.auto_filter = None,
+        }
+    }
+
     // Chart refs follow the grid too. They are WRITTEN back out as `<c:f>` now,
     // so a stale one doesn't just mis-draw our card: Excel re-reads it and plots
     // whatever moved into those cells. A delete is the worse half — the ref can
@@ -2363,6 +2386,32 @@ mod tests {
         let f1 = w.sheets[1].cell(1, 0).unwrap().formula.clone().unwrap();
         assert_eq!(f0, "Data!A5*2"); // followed the shift on Data
         assert_eq!(f1, "A1+1"); // untouched: Calc didn't move
+    }
+
+    #[test]
+    fn a_sheet_auto_filter_moves_and_its_columns_follow_their_data() {
+        let mut w = wb(&[("A1", Cell::number(1.0))]);
+        // B2:D9, filtering B and D.
+        w.sheets[0].auto_filter = Some(crate::sheet::SheetAutoFilter {
+            range: (1, 1, 8, 3),
+            columns: vec![Some(1), Some(3)],
+        });
+        let af = |w: &Workbook| {
+            w.sheets[0]
+                .auto_filter
+                .clone()
+                .map(|a| (a.range, a.columns))
+        };
+        insert_rows(&mut w, 0, 0, 2);
+        assert_eq!(af(&w), Some(((3, 1, 10, 3), vec![Some(1), Some(3)])));
+        insert_cols(&mut w, 0, 2, 1); // inside, between the filtered columns
+        assert_eq!(af(&w), Some(((3, 1, 10, 4), vec![Some(1), Some(4)])));
+        delete_cols(&mut w, 0, 1, 1); // the first filtered column
+        assert_eq!(af(&w), Some(((3, 1, 10, 3), vec![None, Some(3)])));
+        insert_rows(&mut w, 0, 20, 5); // below: nothing moves
+        assert_eq!(af(&w), Some(((3, 1, 10, 3), vec![None, Some(3)])));
+        delete_rows(&mut w, 0, 3, 8); // every row it had
+        assert_eq!(af(&w), None);
     }
 
     #[test]
