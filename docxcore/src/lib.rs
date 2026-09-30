@@ -28,6 +28,7 @@ pub mod editor;
 pub mod equation;
 pub mod export;
 pub mod field;
+pub mod hf;
 pub mod latex;
 pub mod load;
 pub mod markdown;

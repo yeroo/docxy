@@ -499,6 +499,111 @@ impl SectionSetup {
     }
 }
 
+/// `w:pgNumType`: how a section's page numbers look and where they start
+/// (the Page Number Format dialog). `None` fields are absent attributes:
+/// decimal, continuing from the previous section, no chapter number.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PageNumberFormat {
+    /// `w:fmt` (`lowerRoman`, `upperLetter`, `numberInDash`, …).
+    pub fmt: Option<String>,
+    /// `w:start`: restart numbering at this value.
+    pub start: Option<i32>,
+    /// `w:chapStyle`: the heading level (1-9) whose number prefixes the page.
+    pub chap_style: Option<i32>,
+    /// `w:chapSep` (`hyphen`, `period`, `colon`, `emDash`, `enDash`).
+    pub chap_sep: Option<String>,
+}
+
+impl PageNumberFormat {
+    pub fn parse(sect: &str) -> PageNumberFormat {
+        let Some(t) = start_tag(own_children(sect), "w:pgNumType") else {
+            return PageNumberFormat::default();
+        };
+        PageNumberFormat {
+            fmt: attr(t, "w:fmt").filter(|v| v != "decimal"),
+            start: num(t, "w:start"),
+            chap_style: num(t, "w:chapStyle"),
+            chap_sep: attr(t, "w:chapSep"),
+        }
+    }
+
+    /// Write this format into `sect`: unchanged when it already holds it, the
+    /// element rewritten in schema order otherwise, and removed when every
+    /// value is back at its default.
+    pub fn apply(&self, sect: &str) -> String {
+        if PageNumberFormat::parse(sect) == *self {
+            return sect.to_string();
+        }
+        let s = remove_own(sect, "w:pgNumType");
+        if *self == PageNumberFormat::default() {
+            return s;
+        }
+        let mut el = "<w:pgNumType".to_string();
+        if let Some(v) = &self.fmt {
+            el.push_str(&format!(" w:fmt=\"{v}\""));
+        }
+        if let Some(v) = self.start {
+            el.push_str(&format!(" w:start=\"{v}\""));
+        }
+        if let Some(v) = self.chap_style {
+            el.push_str(&format!(" w:chapStyle=\"{v}\""));
+        }
+        if let Some(v) = &self.chap_sep {
+            el.push_str(&format!(" w:chapSep=\"{v}\""));
+        }
+        el.push_str("/>");
+        insert_ordered(&s, "w:pgNumType", &el)
+    }
+}
+
+/// The relationship id of the section's own header (`is_header`) or footer
+/// reference of `variant` (`default`, `first`, `even`; a reference with no
+/// `w:type` is the default one). `None` when the section links to the
+/// previous one for that variant.
+pub fn hf_reference(sect: &str, is_header: bool, variant: &str) -> Option<String> {
+    hf_reference_span(sect, is_header, variant).map(|(_, _, rid)| rid)
+}
+
+fn hf_reference_span(sect: &str, is_header: bool, variant: &str) -> Option<(usize, usize, String)> {
+    let name = if is_header {
+        "w:headerReference"
+    } else {
+        "w:footerReference"
+    };
+    let own = own_children(sect);
+    let mut from = 0;
+    while let Some((a, b)) = find_element(&own[from..], name) {
+        let (a, b) = (from + a, from + b);
+        let tag = start_tag(&own[a..b], name).unwrap_or_default();
+        if attr(tag, "w:type").as_deref().unwrap_or("default") == variant {
+            return Some((a, b, attr(tag, "r:id").unwrap_or_default()));
+        }
+        from = b;
+    }
+    None
+}
+
+/// Point the section's header (`is_header`) or footer reference of `variant`
+/// at relationship `rid`, or remove it with `None` (the section then links
+/// to the previous one). Other references and children stay byte for byte;
+/// a new reference goes in `CT_SectPr` order.
+pub fn set_hf_reference(sect: &str, is_header: bool, variant: &str, rid: Option<&str>) -> String {
+    let mut s = sect.to_string();
+    while let Some((a, b, _)) = hf_reference_span(&s, is_header, variant) {
+        s.replace_range(a..b, "");
+    }
+    let Some(rid) = rid else {
+        return s;
+    };
+    let name = if is_header {
+        "w:headerReference"
+    } else {
+        "w:footerReference"
+    };
+    let el = format!("<{name} w:type=\"{variant}\" r:id=\"{rid}\"/>");
+    insert_ordered(&s, name, &el)
+}
+
 fn cols_xml(c: &Columns) -> String {
     let sep = if c.sep { " w:sep=\"1\"" } else { "" };
     if c.cols.is_empty() {
@@ -995,5 +1100,87 @@ mod tests {
             "w:titlePg"
         ));
         assert_eq!(set_flag(&on, "w:titlePg", false), off);
+    }
+
+    #[test]
+    fn hf_references_are_set_replaced_and_removed_per_kind_and_variant() {
+        let sect = "<w:sectPr><w:headerReference w:type=\"default\" r:id=\"rId1\"/>\
+            <w:footerReference w:type=\"default\" r:id=\"rId2\"/><w:pgSz w:w=\"12240\" w:h=\"15840\"/>\
+            <w:titlePg/></w:sectPr>";
+        assert_eq!(hf_reference(sect, true, "default").as_deref(), Some("rId1"));
+        assert_eq!(
+            hf_reference(sect, false, "default").as_deref(),
+            Some("rId2")
+        );
+        assert_eq!(hf_reference(sect, true, "first"), None);
+        // A new header reference goes after the header references, before the footers.
+        let first = set_hf_reference(sect, true, "first", Some("rId7"));
+        assert!(
+            first.contains(
+                "r:id=\"rId1\"/><w:headerReference w:type=\"first\" r:id=\"rId7\"/><w:footerReference"
+            ),
+            "{first}"
+        );
+        // Replacing keeps one reference of that variant.
+        let again = set_hf_reference(&first, true, "first", Some("rId8"));
+        assert_eq!(again.matches("w:type=\"first\"").count(), 1);
+        assert_eq!(hf_reference(&again, true, "first").as_deref(), Some("rId8"));
+        // Removing touches only that kind and variant.
+        let gone = set_hf_reference(&first, true, "first", None);
+        assert_eq!(gone, sect);
+        let no_footer = set_hf_reference(sect, false, "default", None);
+        assert_eq!(
+            hf_reference(&no_footer, true, "default").as_deref(),
+            Some("rId1")
+        );
+        assert_eq!(hf_reference(&no_footer, false, "default"), None);
+        // A footer reference into a sectPr with none goes first among the rest.
+        let bare = "<w:sectPr><w:pgSz w:w=\"1\"/></w:sectPr>";
+        assert_eq!(
+            set_hf_reference(bare, false, "even", Some("rId3")),
+            "<w:sectPr><w:footerReference w:type=\"even\" r:id=\"rId3\"/><w:pgSz w:w=\"1\"/></w:sectPr>"
+        );
+        // A reference without w:type is the default one.
+        let untyped = "<w:sectPr><w:headerReference r:id=\"rId4\"/></w:sectPr>";
+        assert_eq!(
+            hf_reference(untyped, true, "default").as_deref(),
+            Some("rId4")
+        );
+        assert_eq!(
+            set_hf_reference(untyped, true, "default", None),
+            "<w:sectPr></w:sectPr>"
+        );
+    }
+
+    #[test]
+    fn page_number_format_parses_and_applies_in_schema_order() {
+        let sect =
+            "<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/><w:cols w:space=\"720\"/></w:sectPr>";
+        assert_eq!(PageNumberFormat::parse(sect), PageNumberFormat::default());
+        let f = PageNumberFormat {
+            fmt: Some("lowerRoman".into()),
+            start: Some(5),
+            ..Default::default()
+        };
+        let out = f.apply(sect);
+        assert!(
+            out.contains(
+                "<w:pgSz w:w=\"12240\" w:h=\"15840\"/><w:pgNumType w:fmt=\"lowerRoman\" w:start=\"5\"/><w:cols"
+            ),
+            "{out}"
+        );
+        assert_eq!(PageNumberFormat::parse(&out), f);
+        // Unchanged stays byte for byte; all-default removes the element.
+        assert_eq!(f.apply(&out), out);
+        assert_eq!(PageNumberFormat::default().apply(&out), sect);
+        // Chapter numbers round-trip; "decimal" reads as the default format.
+        let ch = PageNumberFormat {
+            chap_style: Some(1),
+            chap_sep: Some("hyphen".into()),
+            ..Default::default()
+        };
+        assert_eq!(PageNumberFormat::parse(&ch.apply(sect)), ch);
+        let dec = "<w:sectPr><w:pgNumType w:fmt=\"decimal\"/></w:sectPr>";
+        assert_eq!(PageNumberFormat::parse(dec), PageNumberFormat::default());
     }
 }

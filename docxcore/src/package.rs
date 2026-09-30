@@ -166,7 +166,11 @@ pub enum HeaderVariant {
 }
 
 impl HeaderVariant {
-    fn as_ooxml(self) -> &'static str {
+    /// Every variant, in [`HeaderVariant::index`] order.
+    pub const ALL: [HeaderVariant; 3] = [Self::Default, Self::First, Self::Even];
+
+    /// The `w:type` of a `w:headerReference`/`w:footerReference`.
+    pub fn as_ooxml(self) -> &'static str {
         match self {
             Self::Default => "default",
             Self::First => "first",
@@ -174,7 +178,17 @@ impl HeaderVariant {
         }
     }
 
-    pub(crate) fn index(self) -> usize {
+    /// The variant a `w:type` names; anything unknown is the default one.
+    pub fn from_ooxml(val: &str) -> Self {
+        match val {
+            "first" => Self::First,
+            "even" => Self::Even,
+            _ => Self::Default,
+        }
+    }
+
+    /// The slot of this variant in [`SectionParts`].
+    pub fn index(self) -> usize {
         match self {
             Self::Default => 0,
             Self::First => 1,
@@ -212,12 +226,15 @@ pub struct Watermark {
 
 /// The header or footer part a section applies for one variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AppliedPart {
+pub struct AppliedPart {
     pub relationship_id: String,
     pub part_name: String,
     /// True when this section inherits the reference from an earlier one
     /// (Word's "Link to Previous").
     pub inherited: bool,
+    /// The section whose own reference is applied: this section's index when
+    /// not `inherited`, else the earlier section it links back to.
+    pub from_section: usize,
 }
 
 /// The header and footer parts one section applies, indexed by
@@ -225,24 +242,40 @@ pub(crate) struct AppliedPart {
 /// inheritance. Whether a first/even variant is shown depends on `w:titlePg`
 /// and `w:evenAndOddHeaders`, which the caller checks.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct SectionParts {
+pub struct SectionParts {
     pub headers: [Option<AppliedPart>; 3],
     pub footers: [Option<AppliedPart>; 3],
+}
+
+impl SectionParts {
+    /// The header (`is_header`) or footer part applied for `variant`.
+    pub fn get(&self, is_header: bool, variant: HeaderVariant) -> Option<&AppliedPart> {
+        let slots = if is_header {
+            &self.headers
+        } else {
+            &self.footers
+        };
+        slots[variant.index()].as_ref()
+    }
 }
 
 /// Resolve every section's header/footer parts. `sect_prs` holds each section's
 /// `w:sectPr` XML in document order (the trailing body sectPr last). A section
 /// without a reference of some variant inherits the previous section's; a
 /// reference that doesn't resolve through `rels` clears the variant.
-pub(crate) fn section_header_parts(sect_prs: &[&str], rels: &Relationships) -> Vec<SectionParts> {
-    const VARIANTS: [HeaderVariant; 3] = [
-        HeaderVariant::Default,
-        HeaderVariant::First,
-        HeaderVariant::Even,
-    ];
+///
+/// Callers editing a document pass the sectPrs they are editing (an editor's
+/// [`crate::editor::Editor::sections`]), not the package's saved ones, so an
+/// unsaved link change resolves as it will save.
+pub fn section_header_parts<S: AsRef<str>>(
+    sect_prs: &[S],
+    rels: &Relationships,
+) -> Vec<SectionParts> {
+    const VARIANTS: [HeaderVariant; 3] = HeaderVariant::ALL;
     let mut current = SectionParts::default();
     let mut out = Vec::with_capacity(sect_prs.len());
-    for sect_pr in sect_prs {
+    for (section, sect_pr) in sect_prs.iter().enumerate() {
+        let sect_pr = sect_pr.as_ref();
         for (kind, slots) in [
             ("headerReference", &mut current.headers),
             ("footerReference", &mut current.footers),
@@ -257,6 +290,7 @@ pub(crate) fn section_header_parts(sect_prs: &[&str], rels: &Relationships) -> V
                             relationship_id,
                             part_name: resolve_document_relationship_target(target)?,
                             inherited: false,
+                            from_section: section,
                         })
                     });
                 } else if let Some(part) = slot {
@@ -502,7 +536,10 @@ fn part_rels_name(part: &str) -> Option<String> {
     Some(format!("{dir}/_rels/{file}.rels"))
 }
 
-pub(crate) fn resolve_document_relationship_target(target: &str) -> Option<String> {
+/// The package part name a `word/_rels/document.xml.rels` target names
+/// (`header1.xml` -> `word/header1.xml`), or `None` for an external or
+/// malformed target.
+pub fn resolve_document_relationship_target(target: &str) -> Option<String> {
     if target.contains('\\') || target.contains("://") {
         return None;
     }
@@ -821,7 +858,7 @@ impl Package {
     }
 
     /// The main document relationships (`word/_rels/document.xml.rels`).
-    pub(crate) fn document_rels(&self) -> Relationships {
+    pub fn document_rels(&self) -> Relationships {
         self.part("word/_rels/document.xml.rels")
             .and_then(decode_xml_part)
             .map(|xml| parse_rels_xml(&xml))
@@ -942,21 +979,65 @@ impl Package {
     /// `document.xml.rels`, and a `<w:headerReference>`/`<w:footerReference>` of
     /// that type in the section properties. Returns the new part name.
     pub fn create_hf(&mut self, is_header: bool, hf_type: &str) -> Option<String> {
+        let (rid, part_name) = self.create_hf_part(is_header, "<w:p/>")?;
+        let section = crate::sect::set_hf_reference(self.sect_pr(), is_header, hf_type, Some(&rid));
+        self.set_current_sect_pr_raw(section);
+        Some(part_name)
+    }
+
+    /// Add a header (`is_header`) or footer part holding `content_xml` (the
+    /// block XML inside `w:hdr`/`w:ftr`), with its `[Content_Types].xml`
+    /// override and a `document.xml.rels` relationship, but no section
+    /// reference: the caller decides which section references it (see
+    /// [`crate::sect::set_hf_reference`]). The relationship id and part name.
+    pub fn create_hf_part(
+        &mut self,
+        is_header: bool,
+        content_xml: &str,
+    ) -> Option<(String, String)> {
         const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
         const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-        let (kind, tag, ct, reltype) = if is_header {
+        let tag = if is_header { "w:hdr" } else { "w:ftr" };
+        let body = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
+<{tag} xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\">{content_xml}</{tag}>"
+        );
+        self.add_hf_part(is_header, body.into_bytes(), None)
+    }
+
+    /// Copy an existing header or footer part into a new one (Link to
+    /// Previous turned off): the bytes as they are, and its own `_rels` part
+    /// when it has one, so the copy's pictures and links resolve through the
+    /// same relationship ids. The kind follows the source's root element. The
+    /// new relationship id and part name; `None` when `src` is missing.
+    pub fn copy_hf_part(&mut self, src: &str) -> Option<(String, String)> {
+        let bytes = self.part(src)?.to_vec();
+        let is_header = decode_xml_part(&bytes)
+            .map(|xml| !xml.contains("<w:ftr"))
+            .unwrap_or(true);
+        let rels = part_rels_name(src).and_then(|name| self.part(&name).map(<[u8]>::to_vec));
+        self.add_hf_part(is_header, bytes, rels)
+    }
+
+    /// Store a header/footer part under a fresh `word/{header|footer}N.xml`
+    /// name, with its optional own `_rels`, a content-type override and a
+    /// document relationship.
+    fn add_hf_part(
+        &mut self,
+        is_header: bool,
+        bytes: Vec<u8>,
+        own_rels: Option<Vec<u8>>,
+    ) -> Option<(String, String)> {
+        const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        let (kind, ct) = if is_header {
             (
                 "header",
-                "w:hdr",
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml",
-                "header",
             )
         } else {
             (
                 "footer",
-                "w:ftr",
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml",
-                "footer",
             )
         };
         // Unused part name word/{kind}{n}.xml.
@@ -972,15 +1053,15 @@ impl Package {
         let rels_xml = String::from_utf8_lossy(self.part(rels_name)?).into_owned();
         let rid = next_rid(&rels_xml);
 
-        // The part itself (one empty paragraph).
-        let body = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<{tag} xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\"><w:p/></{tag}>"
-        );
-        self.parts.push((part_name.clone(), body.into_bytes()));
+        self.parts.push((part_name.clone(), bytes));
+        if let (Some(rels), Some(name)) = (own_rels, part_rels_name(&part_name)) {
+            self.parts.retain(|(n, _)| *n != name);
+            self.parts.push((name, rels));
+        }
 
         // Relationship.
         let rel =
-            format!("<Relationship Id=\"{rid}\" Type=\"{R_NS}/{reltype}\" Target=\"{target}\"/>");
+            format!("<Relationship Id=\"{rid}\" Type=\"{R_NS}/{kind}\" Target=\"{target}\"/>");
         let new_rels = rels_xml.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1);
         self.set_part(rels_name, new_rels.into_bytes());
 
@@ -991,12 +1072,7 @@ impl Package {
             let new_ct = ct_xml.replacen("</Types>", &format!("{ov}</Types>"), 1);
             self.set_part("[Content_Types].xml", new_ct.into_bytes());
         }
-
-        // Section reference (must be among the first children of sectPr).
-        let reference = format!("<w:{kind}Reference w:type=\"{hf_type}\" r:id=\"{rid}\"/>");
-        let section = inject_sect_child(self.sect_pr(), &reference);
-        self.set_current_sect_pr_raw(section);
-        Some(part_name)
+        Some((rid, part_name))
     }
 
     /// Whether the document uses distinct even/odd page headers/footers
@@ -1406,7 +1482,8 @@ impl Package {
     /// Ensure `styles.xml` defines each style id in `ids` that Markdown-sourced
     /// content might reference (`HeadingN` for `N` in `1..=6`, `Quote`,
     /// `SourceCode`, `Code` — the exact set [`markdown_styles_xml`] defines for
-    /// a fresh markdown package; any other id is silently ignored). Strictly
+    /// a fresh markdown package — plus Word's `Header` and `Footer`, which new
+    /// header/footer parts use; any other id is silently ignored). Strictly
     /// additive, mirroring [`Package::ensure_list`]'s idiom: a style id already
     /// defined in the package — e.g. a third-party document's own `Heading1` —
     /// is left byte-untouched; only ids genuinely ABSENT from `styles.xml` get
@@ -1457,8 +1534,8 @@ impl Package {
 }
 
 /// The `<w:style>` XML definition for one of the styles Markdown maps onto
-/// (`HeadingN` for `N` in `1..=6`, `Quote`, `SourceCode`, `Code`), or `None`
-/// for any other id. Shared by [`markdown_styles_xml`] (which defines the full
+/// (`HeadingN` for `N` in `1..=6`, `Quote`, `SourceCode`, `Code`) or of Word's
+/// `Header`/`Footer`, or `None` for any other id. Shared by [`markdown_styles_xml`] (which defines the full
 /// set for a fresh markdown package) and [`Package::ensure_styles`] (which
 /// defines only the ids actually referenced, for an existing package), so the
 /// two can never drift apart.
@@ -1502,6 +1579,13 @@ fn markdown_style_def(id: &str) -> Option<String> {
              <w:rPr><w:rFonts w:ascii=\"Consolas\" w:hAnsi=\"Consolas\"/></w:rPr></w:style>"
                 .to_string(),
         ),
+        // Word's built-in Header and Footer styles: a centre tab at the middle
+        // and a right tab at the right margin of a Letter page with 1" margins
+        // (3.25" and 6.5"), no space after.
+        "Header" | "Footer" => Some(format!(
+            "<w:style w:type=\"paragraph\" w:styleId=\"{id}\">             <w:name w:val=\"{name}\"/><w:basedOn w:val=\"Normal\"/>             <w:uiPriority w:val=\"99\"/><w:unhideWhenUsed/>             <w:pPr><w:tabs><w:tab w:val=\"center\" w:pos=\"4680\"/>             <w:tab w:val=\"right\" w:pos=\"9360\"/></w:tabs>             <w:spacing w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/></w:pPr></w:style>",
+            name = id.to_ascii_lowercase()
+        )),
         _ => None,
     }
 }
@@ -1533,23 +1617,6 @@ fn markdown_list_levels(bullet: bool) -> String {
 /// The next free relationship id (`rId{max+1}`) for a `.rels` part.
 fn next_rid(rels: &str) -> String {
     format!("rId{}", next_rid_num(rels))
-}
-
-/// Insert a child element as the first child of `<w:sectPr>` (creating/expanding
-/// the element as needed). References must precede other section properties.
-fn inject_sect_child(sect: &str, child: &str) -> String {
-    if sect.is_empty() {
-        return format!("<w:sectPr>{child}</w:sectPr>");
-    }
-    let Some(gt) = sect.find('>') else {
-        return sect.to_string();
-    };
-    if sect[..gt].ends_with('/') {
-        // Self-closing <w:sectPr .../> — expand it.
-        return format!("{}>{child}</w:sectPr>", &sect[..gt - 1]);
-    }
-    let (head, tail) = sect.split_at(gt + 1);
-    format!("{head}{child}{tail}")
 }
 
 /// Remove the first `<name/>`, `<name .../>`, or `<name ...>…</name>` element.
@@ -3511,5 +3578,105 @@ mod tests {
             name(&parts[2].headers[0]),
             Some(("word/header2.xml".into(), true))
         );
+        // `from_section` names the section whose reference applies.
+        let from = |p: &Option<AppliedPart>| p.as_ref().map(|p| p.from_section);
+        assert_eq!(from(&parts[0].headers[0]), Some(0));
+        assert_eq!(from(&parts[1].headers[0]), Some(1));
+        assert_eq!(from(&parts[2].headers[0]), Some(1));
+        assert_eq!(from(&parts[1].footers[0]), Some(0));
+    }
+
+    /// A fresh package with a document rels part (`new_package` has one).
+    fn hf_pkg() -> Package {
+        new_package(Document {
+            body: vec![Block::Paragraph(crate::model::Paragraph::default())],
+        })
+    }
+
+    #[test]
+    fn create_hf_part_adds_part_rel_and_content_type_but_no_reference() {
+        let mut pkg = hf_pkg();
+        let sect = pkg.sect_pr().to_string();
+        let (rid, name) = pkg
+            .create_hf_part(true, "<w:p><w:r><w:t>H</w:t></w:r></w:p>")
+            .unwrap();
+        assert_eq!(pkg.sect_pr(), sect, "no section reference");
+        let xml = String::from_utf8_lossy(pkg.part(&name).unwrap()).into_owned();
+        assert!(
+            xml.contains("<w:hdr") && xml.contains("<w:t>H</w:t>"),
+            "{xml}"
+        );
+        let rels = pkg.document_rels();
+        let target = rels.target(&rid).unwrap();
+        assert_eq!(
+            resolve_document_relationship_target(target).as_deref(),
+            Some(name.as_str())
+        );
+        let ct = String::from_utf8_lossy(pkg.part("[Content_Types].xml").unwrap()).into_owned();
+        assert!(ct.contains(&format!("PartName=\"/{name}\"")), "{ct}");
+        // A second one gets a fresh name and id.
+        let (rid2, name2) = pkg.create_hf_part(false, "<w:p/>").unwrap();
+        assert_ne!(rid, rid2);
+        assert!(name2.starts_with("word/footer"));
+    }
+
+    #[test]
+    fn copy_hf_part_copies_bytes_and_own_rels_so_picture_ids_resolve() {
+        let mut pkg = hf_pkg();
+        let (_, src) = pkg
+            .create_hf_part(
+                true,
+                "<w:p><w:r><w:drawing><a:blip r:embed=\"rId9\"/></w:drawing></w:r></w:p>",
+            )
+            .unwrap();
+        let src_rels = part_rels_name(&src).unwrap();
+        let rels_xml = "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+            <Relationship Id=\"rId9\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"media/image1.png\"/></Relationships>";
+        pkg.parts.push((src_rels, rels_xml.as_bytes().to_vec()));
+        let (rid, copy) = pkg.copy_hf_part(&src).unwrap();
+        assert_ne!(copy, src);
+        assert!(copy.starts_with("word/header"));
+        assert_eq!(pkg.part(&copy), pkg.part(&src));
+        let copy_rels = pkg.part(&part_rels_name(&copy).unwrap()).unwrap();
+        let rels = parse_rels_xml(&String::from_utf8_lossy(copy_rels));
+        assert_eq!(rels.target("rId9"), Some("media/image1.png"));
+        assert!(pkg.document_rels().target(&rid).is_some());
+        let ct = String::from_utf8_lossy(pkg.part("[Content_Types].xml").unwrap()).into_owned();
+        assert!(ct.contains(&format!("PartName=\"/{copy}\"")));
+        // A footer copies as a footer.
+        let (_, f) = pkg.create_hf_part(false, "<w:p/>").unwrap();
+        assert!(pkg.copy_hf_part(&f).unwrap().1.starts_with("word/footer"));
+        assert_eq!(pkg.copy_hf_part("word/missing.xml"), None);
+    }
+
+    #[test]
+    fn create_hf_still_references_the_trailing_section() {
+        let mut pkg = hf_pkg();
+        let name = pkg.create_hf(false, "first").unwrap();
+        let rid = crate::sect::hf_reference(pkg.sect_pr(), false, "first").unwrap();
+        let target = pkg.document_rels().target(&rid).map(str::to_owned).unwrap();
+        assert_eq!(resolve_document_relationship_target(&target), Some(name));
+    }
+
+    #[test]
+    fn ensure_styles_adds_word_header_and_footer_styles_with_their_tabs() {
+        use crate::model::TabAlign;
+        let mut pkg = hf_pkg();
+        pkg.ensure_styles(&["Header", "Footer"]);
+        let xml = String::from_utf8_lossy(pkg.part("word/styles.xml").unwrap()).into_owned();
+        let sheet = crate::styles::parse_styles_xml(&xml);
+        for id in ["Header", "Footer"] {
+            let tabs = sheet.effective_tabs(Some(id));
+            let got: Vec<(i32, TabAlign)> = tabs.iter().map(|t| (t.pos, t.align)).collect();
+            assert_eq!(
+                got,
+                vec![(4680, TabAlign::Center), (9360, TabAlign::Right)],
+                "{id}"
+            );
+        }
+        // An existing definition is left alone.
+        let before = pkg.part("word/styles.xml").unwrap().to_vec();
+        pkg.ensure_styles(&["Header"]);
+        assert_eq!(pkg.part("word/styles.xml").unwrap(), before.as_slice());
     }
 }
