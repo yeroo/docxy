@@ -16,7 +16,9 @@
 //! 8. Anything else is text.
 //!
 //! A recognised shape carries Excel's matching number format, applied only
-//! when the cell's format is General. A plain number typed into a percent
+//! when the cell's format is General — except a date or time, which also
+//! replaces a number format that is not a date format itself (Excel's rule:
+//! `1/15/2024` typed into a `0.00` cell shows as a date). A plain number typed into a percent
 //! cell is divided by 100 when its magnitude is at least 1 (Excel's
 //! automatic percent entry).
 
@@ -112,6 +114,15 @@ pub fn is_percent(xf: &Xf) -> bool {
     matches!(class, NumFmt::Percent { .. })
 }
 
+/// The cell's format is a date, time or date-time format.
+pub fn is_date(xf: &Xf) -> bool {
+    let class = match xf.code.as_deref() {
+        Some(c) => classify_format_code(c),
+        None => xf.numfmt,
+    };
+    matches!(class, NumFmt::Date | NumFmt::Time | NumFmt::DateTime)
+}
+
 /// Parse typed `text` as an entry into a cell formatted `xf`.
 pub fn parse_entry(text: &str, xf: &Xf, ctx: &EntryCtx) -> Result<Entry, EntryError> {
     check_len(text)?;
@@ -168,11 +179,17 @@ pub fn parse_entry(text: &str, xf: &Xf, ctx: &EntryCtx) -> Result<Entry, EntryEr
     Ok(entry(Cell::text(text), None))
 }
 
-/// The xf a committed entry leaves on a cell formatted `base`.
+/// The xf a committed entry leaves on a cell formatted `base`. A recognised
+/// format lands on a General cell; a recognised date or time also replaces a
+/// number format that is not a date format (Excel switches `0.00` or a
+/// currency cell to the date it was given), while a date/time cell keeps its
+/// own format (#654) and a Text cell never recognises anything.
 pub fn entry_xf(base: &Xf, e: &Entry) -> Xf {
     let mut xf = base.clone();
     if let Some(code) = e.format {
-        if is_general(base) {
+        let dated = classify_format_code(code);
+        let date_entry = matches!(dated, NumFmt::Date | NumFmt::Time | NumFmt::DateTime);
+        if is_general(base) || (date_entry && !is_date(base) && !is_text(base)) {
             xf.set_code(Some(code.to_string()));
         }
     }
@@ -1137,6 +1154,39 @@ mod tests {
         assert_eq!(entry_xf(&dated, &e), dated);
         let fixed = fmt_xf("0.00");
         assert_eq!(entry_xf(&fixed, &general("50%")), fixed);
+    }
+
+    #[test]
+    fn a_typed_date_switches_a_number_format_to_the_date_format() {
+        let code = |base: &Xf, text: &str| {
+            let e = parse_entry(text, base, &ctx()).unwrap();
+            entry_xf(base, &e).code
+        };
+        let fixed = fmt_xf("0.00");
+        let cents = fmt_xf("$#,##0.00_);($#,##0.00)");
+        assert_eq!(code(&fixed, "1/15/2024").as_deref(), Some("m/d/yyyy"));
+        assert_eq!(code(&cents, "1/15/2024").as_deref(), Some("m/d/yyyy"));
+        assert_eq!(code(&fixed, "9:30").as_deref(), Some("h:mm"));
+        assert_eq!(
+            code(&fmt_xf("0%"), "1/15/2024").as_deref(),
+            Some("m/d/yyyy")
+        );
+        // A date or time format stays: the entry is shown in the cell's own.
+        assert_eq!(code(&fmt_xf("h:mm"), "1/15/2024").as_deref(), Some("h:mm"));
+        assert_eq!(
+            code(&fmt_xf("d-mmm"), "9:30").as_deref(),
+            Some("d-mmm"),
+            "a date cell keeps its format for a time too"
+        );
+        // Only dates switch a number format; other shapes still need General.
+        assert_eq!(code(&fixed, "$5").as_deref(), Some("0.00"));
+        assert_eq!(code(&fixed, "1 1/4").as_deref(), Some("0.00"));
+        assert!(is_date(&fmt_xf("m/d/yyyy")) && is_date(&fmt_xf("[h]:mm")));
+        assert!(is_date(&Xf {
+            numfmt: NumFmt::DateTime,
+            ..Xf::default()
+        }));
+        assert!(!is_date(&fixed) && !is_date(&Xf::default()) && !is_date(&fmt_xf("@")));
     }
 
     #[test]
