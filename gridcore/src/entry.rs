@@ -513,7 +513,7 @@ fn parse_number(t: &str) -> Option<(f64, NumShape)> {
         src.push('e');
         src.push_str(e);
     }
-    let mut n: f64 = src.parse().ok()?;
+    let mut n: f64 = round15(src.parse().ok()?);
     if shape.percent {
         n /= 100.0;
     }
@@ -521,6 +521,15 @@ fn parse_number(t: &str) -> Option<(f64, NumShape)> {
         n = -n;
     }
     n.is_finite().then_some((n, shape))
+}
+
+/// `n` kept to Excel's 15 significant digits: a typed or imported
+/// `1234567890123456789` is stored as 1.23456789012346E+18.
+pub fn round15(n: f64) -> f64 {
+    if n == 0.0 || !n.is_finite() {
+        return n;
+    }
+    format!("{n:.14e}").parse().unwrap_or(n)
 }
 
 /// `[-]W N/D` — a whole number, a space and a proper fraction.
@@ -550,7 +559,7 @@ fn parse_fraction(t: &str) -> Option<(f64, &'static str)> {
 // ---------------------------------------------------------------------------
 
 /// A month from its full English name or three-letter abbreviation.
-fn month_name(s: &str) -> Option<u32> {
+pub(crate) fn month_name(s: &str) -> Option<u32> {
     const M: [&str; 12] = [
         "january",
         "february",
@@ -571,7 +580,7 @@ fn month_name(s: &str) -> Option<u32> {
         .map(|i| i as u32 + 1)
 }
 
-fn num(s: &str) -> Option<i64> {
+pub(crate) fn num(s: &str) -> Option<i64> {
     if s.is_empty() || s.len() > 4 || !s.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -580,7 +589,7 @@ fn num(s: &str) -> Option<i64> {
 
 /// A year as typed: four digits as is, one or two by Excel's 00–29/30–99
 /// rule; three digits are not a year.
-fn year(s: &str) -> Option<i64> {
+pub(crate) fn year(s: &str) -> Option<i64> {
     let y = num(s)?;
     match s.len() {
         1 | 2 => Some(norm_year(y)),
@@ -1128,6 +1137,19 @@ mod tests {
         assert_eq!(entry_xf(&dated, &e), dated);
         let fixed = fmt_xf("0.00");
         assert_eq!(entry_xf(&fixed, &general("50%")), fixed);
+    }
+
+    #[test]
+    fn a_long_number_keeps_fifteen_significant_digits() {
+        let n = |t: &str| match parse_entry(t, &Xf::default(), &ctx()).unwrap().cell.value {
+            CellValue::Number(n) => n,
+            v => panic!("{t}: {v:?}"),
+        };
+        assert_eq!(n("1234567890123456789"), 1.23456789012346e18);
+        assert_eq!(n("0.1234567890123456789"), 0.123456789012346);
+        assert_eq!(n("123456789012345"), 123_456_789_012_345.0);
+        assert_eq!(round15(0.1 + 0.2), 0.3);
+        assert_eq!(round15(0.0), 0.0);
     }
 
     #[test]
