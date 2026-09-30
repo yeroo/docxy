@@ -1542,6 +1542,11 @@ fn parse_worksheet(
     // same names; those are the view's, not the sheet's, and stay verbatim.
     let mut in_breaks: Option<bool> = None;
     let mut in_custom_views = false;
+    // The sheet's freeze is its first top-level `<sheetView>`'s `<pane>`, the
+    // one the writer (`first_sheet_view`) rewrites. A second view (another
+    // workbook window) or a custom view keeps a pane of its own.
+    let mut sheet_views_seen = 0u32;
+    let mut in_first_view = false;
 
     loop {
         match p.next() {
@@ -1631,7 +1636,11 @@ fn parse_worksheet(
                     }
                 }
                 // A frozen pane: the leading `ySplit` rows / `xSplit` cols stay put.
-                "pane" => {
+                "sheetView" if !in_custom_views => {
+                    in_first_view = sheet_views_seen == 0;
+                    sheet_views_seen += 1;
+                }
+                "pane" if in_first_view && !in_custom_views => {
                     if matches!(p.attr("state"), "frozen" | "frozenSplit") {
                         let cols = p.attr("xSplit").parse::<u32>().unwrap_or(0);
                         let rows = p.attr("ySplit").parse::<u32>().unwrap_or(0);
@@ -1763,6 +1772,7 @@ fn parse_worksheet(
                 "row" => cur_row += 1,
                 "rowBreaks" | "colBreaks" => in_breaks = None,
                 "customSheetViews" => in_custom_views = false,
+                "sheetView" => in_first_view = false,
                 "formula" if in_cf_formula => {
                     in_cf_formula = false;
                     cf_formulas.push(std::mem::take(&mut cf_formula_buf));
@@ -12532,6 +12542,59 @@ mod print_setup_tests {
             )),
             "{ws}"
         );
+    }
+
+    const DATA: &str = r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#;
+    const FROZEN: &str =
+        r#"<pane xSplit="1" ySplit="2" topLeftCell="B3" activePane="bottomRight" state="frozen"/>"#;
+
+    /// Load `body` as the one sheet, check its freeze, and check a plain save
+    /// leaves its `<sheetViews>` and `<customSheetViews>` as they were.
+    fn freeze_of_and_kept(body: &str, views: &[&str]) -> (u32, u32) {
+        let pkg = load_xlsx(&book("", &[("Report", Some(body))])).unwrap();
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        for v in views {
+            assert!(ws.contains(v), "{ws}");
+        }
+        pkg.workbook.sheets[0].freeze
+    }
+
+    #[test]
+    fn a_custom_views_pane_is_not_the_sheets_freeze() {
+        // The sheet's own view is unfrozen; a custom view freezes two rows
+        // and a column. Read as the sheet's, a save would freeze the sheet.
+        let own = r#"<sheetViews><sheetView workbookViewId="0"/></sheetViews>"#;
+        let custom = format!(
+            r#"<customSheetViews><customSheetView guid="{{00000000-0000-0000-0000-000000000001}}">{FROZEN}</customSheetView></customSheetViews>"#
+        );
+        let body = format!("{own}{DATA}{custom}");
+        assert_eq!(freeze_of_and_kept(&body, &[own, &custom]), (0, 0));
+    }
+
+    #[test]
+    fn a_second_sheet_views_pane_is_not_the_sheets_freeze() {
+        // A second `<sheetView>` is another workbook window's view.
+        let views = format!(
+            r#"<sheetViews><sheetView workbookViewId="0"></sheetView><sheetView workbookViewId="1">{FROZEN}</sheetView></sheetViews>"#
+        );
+        let body = format!("{views}{DATA}");
+        assert_eq!(freeze_of_and_kept(&body, &[&views]), (0, 0));
+
+        // The first view frozen, the second split differently: the first's.
+        let views = format!(
+            r#"<sheetViews><sheetView workbookViewId="0">{FROZEN}</sheetView><sheetView workbookViewId="1"><pane ySplit="5" topLeftCell="A6" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>"#
+        );
+        let body = format!("{views}{DATA}");
+        assert_eq!(freeze_of_and_kept(&body, &[&views]), (2, 1));
+    }
+
+    #[test]
+    fn a_self_closing_first_sheet_view_does_not_take_the_second_views_pane() {
+        let views = format!(
+            r#"<sheetViews><sheetView workbookViewId="0"/><sheetView workbookViewId="1">{FROZEN}</sheetView></sheetViews>"#
+        );
+        let body = format!("{views}{DATA}");
+        assert_eq!(freeze_of_and_kept(&body, &[&views]), (0, 0));
     }
 
     #[test]
