@@ -27,12 +27,7 @@ pub fn utc_now_serial() -> Option<f64> {
 
 /// Now, in local time, as a 1900-system serial.
 pub fn local_now_serial() -> Option<f64> {
-    let secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    let utc = unix_secs_to_serial(secs as f64);
-    Some(shift_serial(utc, local_offset_minutes(secs as i64)))
+    Some(shift_serial(utc_now_serial()?, local_offset_minutes()))
 }
 
 fn unix_secs_to_serial(secs: f64) -> f64 {
@@ -40,14 +35,14 @@ fn unix_secs_to_serial(secs: f64) -> f64 {
 }
 
 /// `serial` (UTC) seen from a zone `offset_minutes` ahead of UTC.
-pub fn shift_serial(serial: f64, offset_minutes: i64) -> f64 {
+fn shift_serial(serial: f64, offset_minutes: i64) -> f64 {
     serial + offset_minutes as f64 / 1_440.0
 }
 
-/// Minutes the local zone is ahead of UTC (local = UTC + this) at
-/// `unix_secs`. The daylight bias applies while daylight time is in effect.
+/// Minutes the local zone is ahead of UTC (local = UTC + this) now: the
+/// daylight bias applies while daylight time is in effect.
 #[cfg(windows)]
-fn local_offset_minutes(_unix_secs: i64) -> i64 {
+fn local_offset_minutes() -> i64 {
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct SystemTime16 {
@@ -96,10 +91,10 @@ fn local_offset_minutes(_unix_secs: i64) -> i64 {
     -(bias as i64)
 }
 
-/// Minutes the local zone is ahead of UTC at `unix_secs`, from the C
-/// library's `localtime_r` (which honours `TZ` and the zone database).
+/// Minutes the local zone is ahead of UTC now, from the C library's
+/// `localtime_r` (which honours `TZ` and the zone database).
 #[cfg(all(unix, target_pointer_width = "64"))]
-fn local_offset_minutes(unix_secs: i64) -> i64 {
+fn local_offset_minutes() -> i64 {
     // The leading fields of `struct tm` as glibc, musl, macOS and the BSDs
     // lay them out: nine `int`s, then `tm_gmtoff` and `tm_zone`. The
     // trailing padding covers any extra fields a libc adds after those.
@@ -123,7 +118,10 @@ fn local_offset_minutes(unix_secs: i64) -> i64 {
         fn localtime_r(time: *const i64, result: *mut Tm) -> *mut Tm;
     }
 
-    let t: i64 = unix_secs;
+    let Ok(now) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) else {
+        return 0;
+    };
+    let t = now.as_secs() as i64;
     // SAFETY: `Tm` mirrors the leading fields of the platform's `struct tm`
     // (with spare room after them), all-zero bytes are a valid value of it,
     // and `localtime_r` only writes into the `result` it is given and reads
@@ -135,7 +133,7 @@ fn local_offset_minutes(unix_secs: i64) -> i64 {
 }
 
 #[cfg(not(any(windows, all(unix, target_pointer_width = "64"))))]
-fn local_offset_minutes(_unix_secs: i64) -> i64 {
+fn local_offset_minutes() -> i64 {
     0
 }
 
@@ -170,7 +168,7 @@ mod tests {
 
     #[test]
     fn the_offset_is_whole_minutes_within_the_zones_that_exist() {
-        let m = local_offset_minutes(1_700_000_000);
+        let m = local_offset_minutes();
         assert!((-12 * 60..=14 * 60).contains(&m), "{m}");
     }
 }
