@@ -2665,7 +2665,7 @@ impl<'a> Eval<'a> {
     /// range or computed array becomes an [`DynResult::Array`] for the engine
     /// to spill; everything else stays scalar.
     pub fn eval_dynamic(&mut self, e: &Expr) -> DynResult {
-        self.eval_dynamic_as(e, true)
+        self.eval_dynamic_shaped(e, true).0
     }
 
     /// As [`Self::eval_dynamic`], but `spill = false` for a **legacy** formula
@@ -2673,14 +2673,11 @@ impl<'a> Eval<'a> {
     /// produces (e.g. from `INDIRECT`, `OFFSET`, or a table column) is reduced by
     /// **implicit intersection** to the value on the formula's own row/column,
     /// exactly as pre-dynamic-array Excel does, instead of spilling.
-    pub fn eval_dynamic_as(&mut self, e: &Expr, spill: bool) -> DynResult {
-        self.eval_dynamic_shaped(e, spill).0
-    }
-
-    /// As [`Self::eval_dynamic_as`], also telling whether the result was
-    /// array-shaped: a multi-cell range or any computed array, even a 1x1 one
-    /// (`SEQUENCE(1)`, a one-match `FILTER`), but not a single-cell range
-    /// (`=A1`). Such a typed formula is a dynamic array in Excel's sense.
+    ///
+    /// Also tells whether the result was array-shaped: a multi-cell range or
+    /// any computed array, even a 1x1 one (`SEQUENCE(1)`, a one-match
+    /// `FILTER`), but not a single-cell range (`=A1`). Such a typed formula is
+    /// a dynamic array in Excel's sense.
     pub fn eval_dynamic_shaped(&mut self, e: &Expr, spill: bool) -> (DynResult, bool) {
         let root = self.eval_root(e);
         let shaped = match &root {
@@ -11041,7 +11038,7 @@ mod tests {
         // IF(TRUE, A1:A3, …) returns the array branch (spills), not a collapse.
         let ast = parse("IF(TRUE, A1:A3, A1:A1)").unwrap();
         let mut ev = Eval::new(&g, 0, (10, 0));
-        match ev.eval_dynamic_as(&ast, true) {
+        match ev.eval_dynamic(&ast) {
             DynResult::Array(m) => {
                 assert_eq!(m.len(), 3);
                 assert_eq!(m[0][0], Value::Num(2.0));
@@ -11051,7 +11048,7 @@ mod tests {
         // The false branch is chosen likewise.
         let ast = parse("IF(FALSE, A1:A1, A1:A3)").unwrap();
         let mut ev = Eval::new(&g, 0, (10, 0));
-        assert!(matches!(ev.eval_dynamic_as(&ast, true), DynResult::Array(m) if m.len() == 3));
+        assert!(matches!(ev.eval_dynamic(&ast), DynResult::Array(m) if m.len() == 3));
     }
 
     #[test]
@@ -13147,7 +13144,7 @@ mod tests {
         let top = |src: &str| {
             let ast = parse(src).unwrap();
             let mut ev = Eval::new(&g, 0, (0, 0));
-            match ev.eval_dynamic_as(&ast, true) {
+            match ev.eval_dynamic(&ast) {
                 DynResult::Scalar(Value::Num(x)) => x,
                 DynResult::Scalar(v) => panic!("{src} → {v:?}"),
                 DynResult::Array(_) => panic!("{src} → array"),

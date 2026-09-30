@@ -2584,11 +2584,13 @@ fn xldapr_dynamic_bk(ns: &str) -> String {
 }
 
 /// The `cm` index (1-based `cellMetadata` `bk`) that marks a dynamic array in
-/// this package, adding what is missing: the whole `xl/metadata.xml` (with
-/// its content-type override and workbook relationship) when there is none,
-/// otherwise only the absent entries, appended so every index already in use
-/// keeps its meaning. None when the existing part is beyond us to extend:
-/// the formula is then written as it was before `cm` existed.
+/// this package, adding what is missing: the metadata part beside the
+/// workbook when there is none, otherwise only the absent entries, appended
+/// so every index already in use keeps its meaning; and either way the
+/// workbook's sheetMetadata relationship and the content-type override. None
+/// when the existing part cannot be extended or the workbook cannot be made
+/// to reference it: the formula is then written as it was before `cm`
+/// existed.
 fn ensure_dynamic_cm(parts: &mut Vec<(String, Vec<u8>)>) -> Option<String> {
     let (name, has_rel) = sheet_metadata_part(parts);
     // Work out the edit first: a part we cannot extend changes nothing.
@@ -8756,7 +8758,8 @@ b",
         );
         let (_, ws) = resaved(&pkg);
         assert!(
-            !ws.contains(r#"ref="D1"><f"#) && !ws.contains(r#"<c r="F1"><f t="array""#),
+            !ws.contains(r#"<c r="F1"><f t="array" ref="D1">"#)
+                && !ws.contains(r#"<c r="F1"><f t="array""#),
             "{ws}"
         );
         assert!(
