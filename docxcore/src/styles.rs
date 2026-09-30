@@ -798,17 +798,26 @@ mod tests {
     }
 
     #[test]
-    fn normal_style_page_break_before_applies() {
+    fn default_paragraph_style_applies_without_pstyle() {
         let ss = parse_styles_xml(
             r#"<w:styles>
-            <w:style w:type="character" w:default="1" w:styleId="DefaultParagraphFont"/>
-            <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:pPr><w:suppressLineNumbers/></w:pPr></w:style>
+            <w:style w:type="character" w:default="1" w:styleId="DefaultParagraphFont"><w:pPr><w:pageBreakBefore/></w:pPr></w:style>
+            <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:pPr><w:suppressLineNumbers/><w:pageBreakBefore/></w:pPr></w:style>
             <w:style w:type="paragraph" w:styleId="Other"/>
         </w:styles>"#,
         );
         let (_, props) = par(None, &[]);
+        // Normal, the default paragraph style (not the default character
+        // style), applies to a paragraph that names no style.
+        assert!(ss.effective_ppr_flag(None, &props, PprFlag::PageBreakBefore));
         assert!(ss.effective_ppr_flag(None, &props, PprFlag::SuppressLineNumbers));
+        // A named style replaces it rather than inheriting from it.
+        assert!(!ss.effective_ppr_flag(Some("Other"), &props, PprFlag::PageBreakBefore));
         assert!(!ss.effective_ppr_flag(Some("Other"), &props, PprFlag::SuppressLineNumbers));
-        assert!(!ss.effective_ppr_flag(None, &props, PprFlag::PageBreakBefore));
+        // No default paragraph style: off.
+        let none = parse_styles_xml(
+            r#"<w:styles><w:style w:type="paragraph" w:styleId="Normal"><w:pPr><w:pageBreakBefore/></w:pPr></w:style></w:styles>"#,
+        );
+        assert!(!none.effective_ppr_flag(None, &props, PprFlag::PageBreakBefore));
     }
 }
