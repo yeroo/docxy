@@ -400,15 +400,19 @@ pub fn input_text_styled(cell: &Cell, xf: &Xf) -> String {
     copy_field(cell, xf, crate::edit::input_text_of(cell))
 }
 
-/// The text a cell editor opens on (and the formula bar shows): what
-/// re-entering it would read back as the same cell. A number is written in
-/// full, not rounded to General's 15 digits (so an edit never loses
-/// `0.30000000000000004`'s last digit), in E notation outside `1e-10..1e21`
-/// where plain digits would run to hundreds of characters; in a percent cell
-/// it is shown as the percent it reads as (`150%` for 1.5), since a plain
-/// `1.5` typed back into that cell would be divided by 100. Anything else is
-/// [`input_text_styled`]: a formula's `=` source, and text with the `'` its
-/// re-entry needs.
+/// The text a cell editor opens on (and the formula bar shows). A number is
+/// written in full, not rounded to General's 15 digits, in E notation outside
+/// `1e-10..1e21` where plain digits would run to hundreds of characters; in
+/// a percent cell it is shown as the percent it reads as (`150%` for 1.5),
+/// since a plain `1.5` typed back into that cell would be divided by 100.
+/// Anything else is [`input_text_styled`]: a formula's `=` source, and text
+/// with the `'` its re-entry needs.
+///
+/// Re-entering the seed gives back the same cell except for a number with
+/// more than 15 significant digits: typed entry keeps 15, as Excel does, so
+/// `0.30000000000000004` re-entered is 0.3. What keeps that last digit is
+/// the host leaving an unchanged seed uncommitted (xlsxy and the suite do;
+/// gridwasm re-commits it).
 pub fn seed_text(cell: &Cell, xf: &Xf) -> String {
     match &cell.value {
         CellValue::Number(n) if cell.formula.is_none() => {
@@ -1579,8 +1583,8 @@ mod tests {
         assert_eq!(seed(1e20), "100000000000000000000");
         assert_eq!(seed(1e300), "1E300");
         assert_eq!(seed(-1.5e-300), "-1.5E-300");
-        // Each reads back through typed entry (15 significant digits, as
-        // Excel keeps) to the number it shows.
+        // Each of these (15 significant digits or fewer) reads back through
+        // typed entry to the number it shows.
         for n in [1e300, -1.5e-300, 1e21, 123.25] {
             let e = parse_entry(&seed(n), &Xf::default(), &ctx()).unwrap();
             assert_eq!(e.cell.value, CellValue::Number(n), "{n}");
@@ -1612,8 +1616,9 @@ mod tests {
             let back = parse_entry(&text, &pct, &ctx()).unwrap().cell.value;
             assert_eq!(back, CellValue::Number(n), "{n} seeds {text}");
         }
-        // A value no 15-digit entry can give back is shown in full; the
-        // hosts leave an unedited seed uncommitted, so it is never re-read.
+        // A value no 15-digit entry can give back is shown in full. Only a
+        // host that leaves an unedited seed uncommitted (xlsxy, the suite)
+        // keeps it exactly; re-entered, it rounds to 15 digits.
         assert_eq!(seed(2.0 / 3.0), "66.66666666666666%");
         // Edited, it reads as typed there: 160% is 1.6, not 0.016.
         let back = parse_entry("160%", &pct, &ctx()).unwrap().cell.value;

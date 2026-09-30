@@ -1904,9 +1904,10 @@ impl SheetView {
     /// `commit_edit` preserves the stored cell when this seed is left
     /// untouched, even if reparsing would change it.
     fn edit_string(&self, row: u32, col: u32) -> String {
-        // The text that re-enters as the same cell, as xlsxy and gridwasm
-        // seed theirs: every digit of a number, a percent cell's `150%`, a
-        // quote prefix's `'`.
+        // gridcore's seed, as xlsxy and gridwasm use: every digit of a
+        // number, a percent cell's `150%`, a quote prefix's `'`. An unchanged
+        // seed is not committed (`edit_untouched`), which is what keeps a
+        // 17-digit number exact.
         self.sheet()
             .cell(row, col)
             .map(|c| gridcore::entry::seed_text(c, &self.pkg.workbook.styles.xf(c.style)))

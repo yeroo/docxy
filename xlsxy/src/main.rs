@@ -1627,9 +1627,9 @@ impl App {
     }
 
     /// What editing an existing cell starts from: the formula with `=`, or
-    /// the value as it would be re-entered ([`gridcore::entry::seed_text`]:
-    /// every digit of a number, a percent cell's `150%`, a quote prefix's
-    /// `'`), as gridwasm and the suite seed theirs.
+    /// the value as [`gridcore::entry::seed_text`] writes it (every digit of
+    /// a number, a percent cell's `150%`, a quote prefix's `'`), as gridwasm
+    /// and the suite seed theirs.
     fn current_input_text(&self) -> String {
         let (r, c) = self.cur;
         let styles = &self.pkg.workbook.styles;
