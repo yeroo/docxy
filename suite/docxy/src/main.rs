@@ -1616,15 +1616,9 @@ impl SheetView {
             Some(c) if c.formula.is_some() => format!("={}", c.formula.as_deref().unwrap_or("")),
             Some(c) => match &c.value {
                 CellValue::Number(n) => n.to_string(),
-                CellValue::Text(s)
-                    if gridcore::entry::needs_apostrophe(
-                        c,
-                        &self.pkg.workbook.styles.xf(c.style),
-                    ) =>
-                {
-                    format!("'{s}")
+                CellValue::Text(s) => {
+                    gridcore::entry::copy_field(c, &self.pkg.workbook.styles.xf(c.style), s.clone())
                 }
-                CellValue::Text(s) => s.clone(),
                 CellValue::Bool(b) => {
                     if *b {
                         "TRUE".into()

@@ -86,14 +86,15 @@ pub fn input_text_of(cell: &Cell) -> String {
 }
 
 /// The literal find/replace algorithm shared by the TUI's Find & Replace and
-/// the `wb.replace-all` control verb: every cell whose *input text* (its
-/// `=formula` source, or the value as it would be re-entered, with a quote
-/// prefix's apostrophe) contains `find` gets `find` replaced with `with`,
-/// then re-read as a typed entry into that cell ([`crate::entry`]): a Text
-/// cell keeps text, a quote-prefixed cell stays text, a recognised shape in a
-/// General cell takes its format (interned into `styles`). The percent-cell
-/// rule is not applied: the input text of a percent cell is its plain value,
-/// so re-reading it must not divide it again. A result over the cell limit
+/// the `wb.replace-all` control verb: every cell whose own *input text* (its
+/// `=formula` source, or the value as it would be re-entered — without the
+/// `'` a quote prefix adds, which is never matched) contains `find` gets
+/// `find` replaced with `with`, then re-read as a typed entry into that cell
+/// ([`crate::entry::replaced_entry`], [`crate::entry::reenter_cell`]): a
+/// Text cell keeps text, a quote-prefixed cell stays text, a recognised shape
+/// in a General cell takes its format (interned into `styles`). A percent
+/// cell's number constant is not divided again (its input text is the plain
+/// value); anything else in a percent cell reads as typed there. A result over the cell limit
 /// leaves that cell as it was. Returns the `(row, col, new_cell)` changes for
 /// one sheet; callers decide how to apply them (one sheet under one undo
 /// group, or every sheet under one structural snapshot).
@@ -2161,6 +2162,7 @@ mod tests {
     #[test]
     fn replace_all_never_matches_the_reentry_apostrophe() {
         let mut styles = Styles::default();
+        styles.intern(Xf::default()); // style 0: General
         let quoted = styles.intern(Xf {
             quote_prefix: true,
             ..Xf::default()
@@ -2186,6 +2188,44 @@ mod tests {
         let changes = replace_all_in_sheet(&sheet, &mut styles, &ctx, "'", "x");
         assert_eq!(changes[0].2.value, CellValue::Text("xabc".into()));
         assert!(replace_all_in_sheet(&sheet, &mut styles, &ctx, "''", "q").is_empty());
+        assert!(
+            !styles.xf(changes[0].2.style).quote_prefix,
+            "xabc gains no prefix"
+        );
+    }
+
+    #[test]
+    fn replace_all_decides_the_apostrophe_from_the_result() {
+        let mut styles = Styles::default();
+        styles.intern(Xf::default()); // style 0: General
+        let quoted = styles.intern(Xf {
+            quote_prefix: true,
+            ..Xf::default()
+        });
+        let mut sheet = Sheet::default();
+        sheet.set_cell(0, 0, Cell::text("'5"));
+        sheet.set_cell(1, 0, Cell::text("x'abc"));
+        sheet.set_cell(
+            2,
+            0,
+            Cell {
+                style: quoted,
+                ..Cell::text("zz")
+            },
+        );
+        let ctx = EntryCtx::default();
+        let at = |ch: &[(u32, u32, Cell)], r: u32| ch.iter().find(|c| c.0 == r).unwrap().2.clone();
+        // A loaded '5 with its ' removed is the number 5, no prefix.
+        let ch = replace_all_in_sheet(&sheet, &mut styles, &ctx, "'", "");
+        let five = at(&ch, 0);
+        assert_eq!(five.value, CellValue::Number(5.0));
+        assert!(!styles.xf(five.style).quote_prefix);
+        // x'abc with x removed keeps its own ' (as text 'abc).
+        let ch = replace_all_in_sheet(&sheet, &mut styles, &ctx, "x", "");
+        assert_eq!(at(&ch, 1).value, CellValue::Text("'abc".into()));
+        // Replacing all of a quote-prefixed text clears the cell.
+        let ch = replace_all_in_sheet(&sheet, &mut styles, &ctx, "zz", "");
+        assert_eq!(at(&ch, 2).value, CellValue::Empty);
     }
 
     #[test]

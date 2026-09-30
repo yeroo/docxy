@@ -581,6 +581,17 @@ fn replace_keeps_a_quote_prefixed_entry_text() {
     assert_eq!(v.find_match("''", false), None);
     assert!(v.replace_in_cell(5, 0, "'", "x"));
     assert_eq!(value(&v, 5, 0), CellValue::Text("xabc".into()));
+    assert!(!xf(&v, 5, 0).quote_prefix, "the result has no ' of its own");
+    // The apostrophe is decided from the result.
+    put(&mut v, 6, 0, Cell::text("'5"));
+    assert!(v.replace_in_cell(6, 0, "'", ""));
+    assert_eq!(value(&v, 6, 0), CellValue::Number(5.0));
+    assert!(!xf(&v, 6, 0).quote_prefix);
+    put(&mut v, 7, 0, Cell::text("x'abc"));
+    assert!(v.replace_in_cell(7, 0, "x", ""));
+    assert_eq!(value(&v, 7, 0), CellValue::Text("'abc".into()));
+    assert!(v.replace_in_cell(0, 0, "117", ""));
+    assert_eq!(value(&v, 0, 0), CellValue::Empty, "an emptied text clears");
     // Any case, as the Find bar matches.
     put(&mut v, 2, 0, Cell::text("Alpha"));
     assert!(v.replace_in_cell(2, 0, "ALPHA", "Beta"));

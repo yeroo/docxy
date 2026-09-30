@@ -527,10 +527,8 @@ impl Session {
         let src = self.cell_src(row, col);
         let styles = &self.pkg.workbook.styles;
         match self.pkg.workbook.sheets[self.active].cell(row, col) {
-            Some(cell) if gridcore::entry::needs_apostrophe(cell, &styles.xf(cell.style)) => {
-                format!("'{src}")
-            }
-            _ => src,
+            Some(cell) => gridcore::entry::copy_field(cell, &styles.xf(cell.style), src),
+            None => src,
         }
     }
 

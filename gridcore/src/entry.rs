@@ -255,9 +255,11 @@ pub fn entry_range(
 
 /// Re-read `new` as the entry of an existing `cell` whose text `old` was
 /// edited in place (Find & Replace), under the cell's own rules — with one
-/// exception for a percent cell. When `old` had no `%` it was the plain value
-/// (an input text such as `1.5` for 150%), so `new` is read as General
-/// rather than divided by 100 again. When `old` showed the `%` (display
+/// exception for a percent cell holding a number constant. When `old` had no
+/// `%` it was that number's plain value (an input text such as `1.5` for
+/// 150%), so `new` is read as General rather than divided by 100 again. A
+/// text or formula in a percent cell is always read under the cell's rules
+/// (`TBD` replaced by `5` is 5%). When `old` showed the `%` (display
 /// text such as `150%`), `new` is read as typed into the cell: `160%` is 1.6,
 /// and `150` with the `%` removed is divided like any number typed there.
 /// The style is resolved into `styles`.
@@ -362,23 +364,27 @@ pub fn copy_field(cell: &Cell, xf: &Xf, shown: String) -> String {
     }
 }
 
-/// Find & Replace's rewrite of one cell's `base` text (its text without the
-/// `'` re-entry would add), for [`reenter_cell`]: `replaced` with that `'`
-/// put back when [`needs_apostrophe`] holds, so a quote-prefixed `007` stays
-/// text and an apostrophe of the cell's own is never matched twice.
+/// Find & Replace's entry for one text cell, from `replaced` — its own text
+/// (without the `'` re-entry would add) after the replacement — for
+/// [`reenter_cell`]. The `'` is decided from the result: added for a
+/// non-formula text in a non-Text cell that is quote-prefixed (`007` stays
+/// text) or whose new text begins with `'` (kept as its own character),
+/// never for an empty result (the cell clears). So a loaded `'5` with `'`
+/// removed becomes the number 5.
 pub fn replaced_entry(cell: &Cell, xf: &Xf, replaced: String) -> String {
-    copy_field(cell, xf, replaced)
+    let text_cell = cell.formula.is_none() && matches!(cell.value, CellValue::Text(_));
+    let marker = xf.quote_prefix || replaced.starts_with('\'');
+    if !replaced.is_empty() && text_cell && !is_text(xf) && marker {
+        format!("'{replaced}")
+    } else {
+        replaced
+    }
 }
 
 /// The text the editor and formula bar show for a cell: [`crate::edit::input_text_of`]
 /// with a leading `'` where [`needs_apostrophe`] says re-entering needs one.
 pub fn input_text_styled(cell: &Cell, xf: &Xf) -> String {
-    let text = crate::edit::input_text_of(cell);
-    if needs_apostrophe(cell, xf) {
-        format!("'{text}")
-    } else {
-        text
-    }
+    copy_field(cell, xf, crate::edit::input_text_of(cell))
 }
 
 fn value_cell(value: CellValue) -> Cell {
@@ -1261,6 +1267,28 @@ mod tests {
         // An empty field clears, in a Text cell as anywhere.
         assert_eq!(paste_cell(&mut styles, text_q, "").value, CellValue::Empty);
         assert_eq!(paste_cell(&mut styles, general, "").value, CellValue::Empty);
+    }
+
+    #[test]
+    fn a_replaced_entry_decides_its_apostrophe_from_the_result() {
+        let q = Xf {
+            quote_prefix: true,
+            ..Xf::default()
+        };
+        let g = Xf::default();
+        let text = |s: &str| Cell::text(s);
+        assert_eq!(replaced_entry(&text("117"), &q, "117".into()), "'117");
+        assert_eq!(replaced_entry(&text("'5"), &g, "5".into()), "5");
+        assert_eq!(replaced_entry(&text("'abc"), &g, "xabc".into()), "xabc");
+        assert_eq!(replaced_entry(&text("x'abc"), &g, "'abc".into()), "''abc");
+        assert_eq!(replaced_entry(&text("007"), &q, String::new()), "");
+        let text_fmt = Xf {
+            numfmt: NumFmt::Text,
+            code: Some("@".into()),
+            ..Xf::default()
+        };
+        assert_eq!(replaced_entry(&text("x"), &text_fmt, "'y".into()), "'y");
+        assert_eq!(replaced_entry(&Cell::number(5.0), &g, "'5".into()), "'5");
     }
 
     #[test]
