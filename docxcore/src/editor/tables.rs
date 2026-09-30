@@ -24,15 +24,6 @@ pub struct TablePos {
     pub cell: usize,
 }
 
-impl TablePos {
-    /// The path prefix of the cell's blocks.
-    pub fn cell_path(&self) -> Vec<usize> {
-        let mut p = self.table.clone();
-        p.extend([self.row, self.cell]);
-        p
-    }
-}
-
 /// A rectangle of grid cells in one table: rows `top..=bottom`, grid columns
 /// `left..=right`, grown so no spanned or merged cell is cut.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +70,17 @@ impl CellRange {
             }
         }
     }
+}
+
+/// Where Tab or Shift+Tab takes the caret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabTarget {
+    /// Select this cell's content.
+    Cell((usize, usize)),
+    /// Past the last cell: add a row.
+    AddRow,
+    /// Nowhere (Shift+Tab in the first cell).
+    Stay,
 }
 
 /// Every table a path passes through, outermost first.
@@ -349,71 +351,81 @@ impl Editor {
         out
     }
 
+    /// Where Tab (`back`: Shift+Tab) goes from the caret's cell. The single
+    /// rule behind [`Editor::table_next_cell`], [`Editor::table_prev_cell`]
+    /// and [`Editor::table_tab_adds_row`], so a host that asks first and then
+    /// moves can never be told one thing and see another.
+    fn tab_target(&self, back: bool) -> Option<(TablePos, TabTarget)> {
+        let pos = self.table_at_caret()?;
+        let t = self.table(&pos.table)?;
+        let stops = Self::tab_stops(t);
+        let here = GridMap::of(t).owner(t, pos.row, pos.cell);
+        let target = match stops.iter().position(|&s| s == here) {
+            Some(i) if back => i
+                .checked_sub(1)
+                .map_or(TabTarget::Stay, |i| TabTarget::Cell(stops[i])),
+            Some(i) => stops
+                .get(i + 1)
+                .map_or(TabTarget::AddRow, |&s| TabTarget::Cell(s)),
+            // Not a stop (an orphaned merge continuation): the nearest stop in
+            // reading order that way, else nowhere. Only the last stop adds a
+            // row.
+            None if back => stops
+                .iter()
+                .rev()
+                .find(|&&s| s < here)
+                .map_or(TabTarget::Stay, |&s| TabTarget::Cell(s)),
+            None => stops
+                .iter()
+                .find(|&&s| s > here)
+                .map_or(TabTarget::Stay, |&s| TabTarget::Cell(s)),
+        };
+        Some((pos, target))
+    }
+
     /// Whether Tab would add a row (the caret is in the table's last cell), so
     /// a host can check edit permission first.
     pub fn table_tab_adds_row(&self) -> bool {
-        let Some(pos) = self.table_at_caret() else {
-            return false;
-        };
-        let Some(t) = self.table(&pos.table) else {
-            return false;
-        };
-        let here = GridMap::of(t).owner(t, pos.row, pos.cell);
-        Self::tab_stops(t).last() == Some(&here)
+        matches!(self.tab_target(false), Some((_, TabTarget::AddRow)))
     }
 
     /// Tab in a table: select the next cell's content; in the last cell, add a
     /// row like the last one (one undo step) and move into its first cell.
     /// `false` when the caret is not in a table.
     pub fn table_next_cell(&mut self) -> bool {
-        let Some(pos) = self.table_at_caret() else {
+        let Some((pos, target)) = self.tab_target(false) else {
             return false;
         };
-        let Some(t) = self.table(&pos.table) else {
-            return false;
-        };
-        let stops = Self::tab_stops(t);
-        let here = GridMap::of(t).owner(t, pos.row, pos.cell);
-        let next = stops
-            .iter()
-            .position(|&s| s == here)
-            .and_then(|i| stops.get(i + 1))
-            .copied();
-        if let Some((r, c)) = next {
-            return self.select_cell_content(&pos.table, r, c);
+        match target {
+            TabTarget::Cell((r, c)) => {
+                self.select_cell_content(&pos.table, r, c);
+            }
+            TabTarget::Stay => {}
+            TabTarget::AddRow => {
+                self.checkpoint(EditKind::Structural);
+                let Some(t) = table_at_mut(&mut self.doc.body, &pos.table) else {
+                    return false;
+                };
+                let Some(last) = t.rows.last() else {
+                    return false;
+                };
+                let row = template_row(last);
+                let at = t.rows.len();
+                t.insert_row(at, row);
+                self.select_cell_content(&pos.table, at, 0);
+                self.last = EditKind::Structural;
+            }
         }
-        self.checkpoint(EditKind::Structural);
-        let Some(t) = table_at_mut(&mut self.doc.body, &pos.table) else {
-            return false;
-        };
-        let Some(last) = t.rows.last() else {
-            return false;
-        };
-        let row = template_row(last);
-        let at = t.rows.len();
-        t.insert_row(at, row);
-        self.select_cell_content(&pos.table, at, 0);
-        self.last = EditKind::Structural;
         true
     }
 
     /// Shift+Tab in a table: select the previous cell's content (nothing in
     /// the first cell). `false` when the caret is not in a table.
     pub fn table_prev_cell(&mut self) -> bool {
-        let Some(pos) = self.table_at_caret() else {
+        let Some((pos, target)) = self.tab_target(true) else {
             return false;
         };
-        let Some(t) = self.table(&pos.table) else {
-            return false;
-        };
-        let stops = Self::tab_stops(t);
-        let here = GridMap::of(t).owner(t, pos.row, pos.cell);
-        let prev = stops
-            .iter()
-            .position(|&s| s == here)
-            .and_then(|i| i.checked_sub(1))
-            .map(|i| stops[i]);
-        if let Some((r, c)) = prev {
+        if let TabTarget::Cell((r, c)) = target {
             self.select_cell_content(&pos.table, r, c);
         }
         true
@@ -617,6 +629,32 @@ pub(crate) mod tests {
             ed.table(&[0]).unwrap().rows[2].cells[1].v_merge,
             VMerge::None
         );
+    }
+
+    #[test]
+    fn tab_from_an_orphaned_merge_continuation_agrees_with_tab_adds_row() {
+        // Row 1's first cell claims to continue a merge with nothing above it.
+        let mut ed = Editor::new(grid_doc(2, 2));
+        {
+            let Block::Table(t) = &mut ed.doc.body[0] else {
+                panic!()
+            };
+            t.rows[0].cells[0].v_merge = VMerge::Continue;
+        }
+        ed.caret = Caret::at(vec![0, 0, 0, 0], 0);
+        assert!(!ed.table_tab_adds_row());
+        assert!(ed.table_next_cell());
+        assert_eq!(ed.table(&[0]).unwrap().rows.len(), 2, "no row added");
+        assert_eq!(ed.caret.path, vec![0, 0, 1, 0]);
+        // Shift+Tab from it has nowhere to go.
+        ed.caret = Caret::at(vec![0, 0, 0, 0], 0);
+        assert!(ed.table_prev_cell());
+        assert_eq!(ed.caret.path, vec![0, 0, 0, 0]);
+        // From the last cell the two agree the other way.
+        ed.caret = Caret::at(vec![0, 1, 1, 0], 0);
+        assert!(ed.table_tab_adds_row());
+        assert!(ed.table_next_cell());
+        assert_eq!(ed.table(&[0]).unwrap().rows.len(), 3);
     }
 
     #[test]
