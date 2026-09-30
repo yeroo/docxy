@@ -5698,16 +5698,14 @@ impl SheetPackage {
         if *active > idx || *active >= self.workbook.sheets.len() {
             *active = active.saturating_sub(1);
         }
-        self.parts.retain(|(n, _)| *n != part_name);
-        // Content-type override for the removed part.
-        if let Some(p) = self
-            .parts
-            .iter_mut()
-            .find(|(n, _)| n == "[Content_Types].xml")
-        {
-            let xml = String::from_utf8_lossy(&p.1).into_owned();
-            p.1 =
-                remove_element_containing(&xml, "<Override", &format!("/{part_name}")).into_bytes();
+        // The part, its rels, and what only it named (comments, drawings,
+        // tables, printer settings), each with its content-type Override.
+        drop_parts_cascading(&mut self.parts, &part_name);
+        self.workbook.tables.retain(|t| t.sheet != idx);
+        for t in &mut self.workbook.tables {
+            if t.sheet > idx {
+                t.sheet -= 1;
+            }
         }
         // Relationship (by target) — capture its rId first.
         let target = part_name.trim_start_matches("xl/").to_string();
@@ -5751,6 +5749,65 @@ impl SheetPackage {
         }
         true
     }
+}
+
+/// Remove `part`, its own rels part, and, following those relationships, each
+/// part that no remaining rels part names any more, with the content-type
+/// Override of every part removed. A part still named elsewhere (an image
+/// two drawings share) stays, and so does everything it names.
+fn drop_parts_cascading(parts: &mut Vec<(String, Vec<u8>)>, part: &str) {
+    let mut doomed = vec![part.to_string()];
+    let mut removed: Vec<String> = Vec::new();
+    while let Some(name) = doomed.pop() {
+        if removed.contains(&name) {
+            continue;
+        }
+        let own_rels = rels_part_name(&name);
+        let dir = name.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let targets: Vec<String> = parts
+            .iter()
+            .find(|(n, _)| *n == own_rels)
+            .map(|(_, xml)| {
+                parse_rels(&String::from_utf8_lossy(xml))
+                    .into_iter()
+                    .map(|(_, _, t)| resolve_relative(dir, &t))
+                    .collect()
+            })
+            .unwrap_or_default();
+        parts.retain(|(n, _)| *n != name && *n != own_rels);
+        removed.push(name);
+        removed.push(own_rels);
+        for t in targets {
+            if parts.iter().any(|(n, _)| *n == t) && !part_is_named(parts, &t) {
+                doomed.push(t);
+            }
+        }
+    }
+    if let Some(p) = parts.iter_mut().find(|(n, _)| n == "[Content_Types].xml") {
+        let mut xml = String::from_utf8_lossy(&p.1).into_owned();
+        for name in &removed {
+            while let Some(el) = override_element(&xml, &format!("/{name}")) {
+                xml.replace_range(el.start..el.end, "");
+            }
+        }
+        p.1 = xml.into_bytes();
+    }
+}
+
+/// Whether any rels part in `parts` has a relationship targeting `part`.
+fn part_is_named(parts: &[(String, Vec<u8>)], part: &str) -> bool {
+    parts.iter().any(|(n, xml)| {
+        let Some((rels_dir, file)) = n.rsplit_once("_rels/") else {
+            return false;
+        };
+        if !file.ends_with(".rels") {
+            return false;
+        }
+        let dir = rels_dir.trim_end_matches('/');
+        parse_rels(&String::from_utf8_lossy(xml))
+            .iter()
+            .any(|(_, _, t)| resolve_relative(dir, t) == part)
+    })
 }
 
 /// Drop `<definedName localSheetId="removed">…</definedName>` elements and
@@ -8287,6 +8344,91 @@ b",
         let reloaded = load_xlsx(&bytes).expect("reload after cascaded removal");
         assert!(reloaded.workbook.pivots.is_empty());
         assert_eq!(reloaded.workbook.sheets.len(), 1);
+    }
+
+    #[test]
+    fn remove_sheet_drops_its_rels_and_unshared_targets() {
+        let rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Two");
+        assert_eq!(pkg.sheet_parts[1], "xl/worksheets/sheet2.xml");
+        // Sheet 1 has comments with their VML, and printer settings it shares
+        // with sheet 2.
+        pkg.set_part(
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            format!(
+                "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+                 <Relationship Id=\"rId1\" Type=\"{rel}/comments\" Target=\"../comments1.xml\"/>\
+                 <Relationship Id=\"rId2\" Type=\"{rel}/vmlDrawing\" Target=\"../drawings/vmlDrawing1.vml\"/>\
+                 <Relationship Id=\"rId3\" Type=\"{rel}/printerSettings\" Target=\"../printerSettings/printerSettings1.bin\"/>\
+                 </Relationships>"
+            )
+            .into_bytes(),
+        );
+        pkg.set_part(
+            "xl/worksheets/_rels/sheet2.xml.rels",
+            format!(
+                "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+                 <Relationship Id=\"rId1\" Type=\"{rel}/printerSettings\" Target=\"../printerSettings/printerSettings1.bin\"/>\
+                 </Relationships>"
+            )
+            .into_bytes(),
+        );
+        pkg.set_part("xl/comments1.xml", b"<comments/>".to_vec());
+        pkg.set_part("xl/drawings/vmlDrawing1.vml", b"<xml/>".to_vec());
+        pkg.set_part("xl/printerSettings/printerSettings1.bin", vec![0; 4]);
+        let ct = part_text(&pkg, "[Content_Types].xml").replace(
+            "</Types>",
+            "<Override PartName=\"/xl/comments1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml\"/></Types>",
+        );
+        pkg.set_part("[Content_Types].xml", ct.into_bytes());
+
+        assert!(pkg.remove_sheet(0));
+        for gone in [
+            "xl/worksheets/sheet1.xml",
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            "xl/comments1.xml",
+            "xl/drawings/vmlDrawing1.vml",
+        ] {
+            assert!(pkg.part(gone).is_none(), "{gone} survived");
+        }
+        assert!(
+            pkg.part("xl/printerSettings/printerSettings1.bin")
+                .is_some()
+        );
+        let ct = part_text(&pkg, "[Content_Types].xml");
+        assert!(
+            !ct.contains("comments1") && !ct.contains("sheet1.xml"),
+            "{ct}"
+        );
+        assert!(ct.contains("/xl/worksheets/sheet2.xml"), "{ct}");
+        let saved = load_xlsx(&save_xlsx(&pkg)).expect("reload");
+        assert_eq!(saved.workbook.sheets.len(), 1);
+        assert_eq!(saved.workbook.sheets[0].name, "Two");
+    }
+
+    #[test]
+    fn remove_sheet_drops_its_tables_and_shifts_later_ones() {
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Two");
+        let t1 = pkg.add_table(0, (0, 0, 2, 1), true, "TableStyleLight1");
+        let t2 = pkg.add_table(1, (0, 0, 2, 1), true, "TableStyleLight1");
+        let (t1, t2) = (t1.unwrap(), t2.unwrap());
+        let (p1, p2) = (
+            pkg.workbook.tables[t1].part.clone(),
+            pkg.workbook.tables[t2].part.clone(),
+        );
+        assert!(pkg.remove_sheet(0));
+        assert_eq!(pkg.workbook.tables.len(), 1);
+        assert_eq!(pkg.workbook.tables[0].sheet, 0);
+        assert!(
+            pkg.part(&p1).is_none(),
+            "the removed sheet's table part stays"
+        );
+        assert!(pkg.part(&p2).is_some());
+        let saved = load_xlsx(&save_xlsx(&pkg)).expect("reload");
+        assert_eq!(saved.workbook.tables.len(), 1);
+        assert_eq!(saved.workbook.tables[0].sheet, 0);
     }
 
     #[test]
