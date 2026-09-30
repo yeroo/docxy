@@ -980,6 +980,10 @@ struct App {
     vis_subline: Vec<u8>,           // which wrapped sub-line of that row (parallel to vis_rows)
     tab_spans: Vec<(usize, u16, u16)>,
     ribbon_rows: u16,
+    /// A structural edit made a new circle: its warning is added to whatever
+    /// status the edit's caller sets, once the action is done
+    /// ([`App::flush_circle_warning`]).
+    circle_warning_pending: bool,
 }
 
 impl App {
@@ -992,8 +996,10 @@ impl App {
             .map(|b| parse_model_part(&String::from_utf8_lossy(b)))
             .unwrap_or_default();
         let comments = pkg.comments();
-        // Excel warns about a workbook's circular references when it opens.
-        let status = (!engine.circular_refs().is_empty()).then(|| CIRCULAR_WARNING.to_string());
+        // Excel warns about a workbook's circular references when it opens
+        // (not when iterative calculation is on: the circles are intended).
+        let status = (pkg.workbook.iterate.is_none() && !engine.circular_refs().is_empty())
+            .then(|| CIRCULAR_WARNING.to_string());
         App {
             pkg,
             engine,
@@ -1007,6 +1013,7 @@ impl App {
             edit: None,
             modified: false,
             status,
+            circle_warning_pending: false,
             undo: Vec::new(),
             redo: Vec::new(),
             clip: None,
@@ -1212,9 +1219,28 @@ impl App {
     /// cell on a circle that was not on one before.
     fn warn_new_circles(&mut self, before: &[(usize, u32, u32)]) {
         let now = self.engine.circular_refs();
-        if now.iter().any(|k| !before.contains(k)) {
+        if self.circles_shown() && now.iter().any(|k| !before.contains(k)) {
             self.status = Some(CIRCULAR_WARNING.into());
         }
+    }
+
+    /// Whether circles are surfaced (warning, footer): not when the workbook
+    /// enables iterative calculation, where Excel treats them as intended.
+    /// `wb.path.circular` lists them either way.
+    fn circles_shown(&self) -> bool {
+        self.pkg.workbook.iterate.is_none() && !self.engine.circular_refs().is_empty()
+    }
+
+    /// Add a structural edit's pending circle warning to the status its
+    /// caller set ("Inserted 1 row. There are one or more circular …").
+    fn flush_circle_warning(&mut self) {
+        if !std::mem::take(&mut self.circle_warning_pending) {
+            return;
+        }
+        self.status = Some(match self.status.take() {
+            Some(s) if !s.is_empty() && s != CIRCULAR_WARNING => format!("{s}. {CIRCULAR_WARNING}"),
+            _ => CIRCULAR_WARNING.into(),
+        });
     }
 
     /// The cells on circular references as A1 refs: bare on the active
@@ -1255,8 +1281,8 @@ impl App {
         let circles_before = self.engine.circular_refs().len();
         op(&mut self.pkg.workbook);
         self.rebuild_engine();
-        if self.engine.circular_refs().len() > circles_before {
-            self.status = Some(CIRCULAR_WARNING.into());
+        if self.circles_shown() && self.engine.circular_refs().len() > circles_before {
+            self.circle_warning_pending = true;
         }
         let after = WbSnapshot {
             sheets: self.pkg.workbook.sheets.clone(),
@@ -2968,7 +2994,7 @@ impl App {
                 self.modified = false;
                 self.backstage = None;
                 self.start_screen = false;
-                self.status = Some(if self.engine.circular_refs().is_empty() {
+                self.status = Some(if !self.circles_shown() {
                     format!("Opened {}", self.path)
                 } else {
                     format!("Opened {}. {CIRCULAR_WARNING}", self.path)
@@ -4999,8 +5025,9 @@ fn draw(app: &mut App, f: &mut Frame) {
         tab_spans_ui.push(RSpan::raw(" "));
         x += w + 1;
     }
-    // Excel's persistent status-bar note while any circle exists.
-    if let Some(first) = app.circular_refs().first() {
+    // Excel's persistent status-bar note while any circle exists (none with
+    // iterative calculation on).
+    if let Some(first) = app.circular_refs().first().filter(|_| app.circles_shown()) {
         tab_spans_ui.push(RSpan::styled(
             format!(" Circular References: {first} "),
             Style::new().fg(Color::Black).bg(Color::Yellow),
@@ -5822,12 +5849,14 @@ fn draw_comments_panel(app: &App, f: &mut Frame, area: Rect) {
 
 /// Returns true when the app should exit.
 fn handle_event(app: &mut App, ev: Event) -> bool {
-    match ev {
+    let quit = match ev {
         Event::Key(key) => handle_key(app, key),
         Event::Mouse(m) => handle_mouse(app, m),
         Event::Resize(_, _) => false,
         _ => false,
-    }
+    };
+    app.flush_circle_warning();
+    quit
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) -> bool {
@@ -6478,10 +6507,13 @@ fn run_tui(
                         quit = true;
                     }
                 }
-                Msg::Ctl(req) => match control::dispatch(&mut app, &req.verb, &req.args) {
-                    Ok(result) => req.reply_ok(result),
-                    Err(e) => req.reply_err(e),
-                },
+                Msg::Ctl(req) => {
+                    match control::dispatch(&mut app, &req.verb, &req.args) {
+                        Ok(result) => req.reply_ok(result),
+                        Err(e) => req.reply_err(e),
+                    }
+                    app.flush_circle_warning();
+                }
             }
             if quit {
                 break;
@@ -7514,8 +7546,56 @@ mod tests {
         app.cur = (0, 0);
         app.anchor = None;
         app.row_op(true);
-        assert_ne!(app.status.as_deref(), Some(CIRCULAR_WARNING));
+        app.flush_circle_warning();
+        assert_eq!(app.status.as_deref(), Some("Inserted 1 row"));
         assert_eq!(app.circular_refs(), vec!["E2".to_string()]);
+    }
+
+    #[test]
+    fn a_structural_edit_that_makes_a_circle_warns_after_its_own_status() {
+        // #660: renaming a sheet can close a circle (Sheet1!A1 = Budget!A1,
+        // and the sheet renamed to Budget reads Sheet1!A1). The warning joins
+        // the rename's own status instead of being overwritten by it.
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.apply_on(0, vec![(0, 0, parse_input("=Budget!A1"))]);
+        app.open_prompt(PromptKind::AddSheet);
+        app.prompt.as_mut().unwrap().text = "Data".to_string();
+        app.commit_prompt();
+        let data = app.sheet;
+        app.apply_on(data, vec![(0, 0, parse_input("=Sheet1!A1"))]);
+        assert!(app.circular_refs().is_empty());
+        app.status = None;
+        app.open_prompt(PromptKind::RenameSheet);
+        app.prompt.as_mut().unwrap().text = "Budget".to_string();
+        app.commit_prompt();
+        app.flush_circle_warning();
+        assert_eq!(
+            app.status.as_deref(),
+            Some(format!("Renamed sheet to Budget. {CIRCULAR_WARNING}").as_str())
+        );
+        assert_eq!(app.circular_refs().len(), 2);
+    }
+
+    #[test]
+    fn iterative_workbooks_do_not_surface_their_circles() {
+        // #660: with iterative calculation on, Excel shows neither the
+        // warning nor the status-bar note; the engine still knows the circle.
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut pkg = new_xlsx();
+        pkg.workbook.iterate = Some((100, 0.001));
+        pkg.workbook.sheets[0].set_cell(0, 3, Cell::formula("D1/2+5"));
+        let mut app = App::new(pkg, "iter.xlsx");
+        app.os_clip = None;
+        assert_eq!(app.status, None);
+        assert_eq!(app.circular_refs(), vec!["D1".to_string()]);
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        let text = format!("{:?}", term.backend().buffer());
+        assert!(!text.contains("Circular References"), "{text}");
+        // A new circle by a cell edit does not warn either.
+        app.apply_on(0, vec![(0, 4, parse_input("=E1+1"))]);
+        assert_eq!(app.status, None);
     }
 
     #[test]
