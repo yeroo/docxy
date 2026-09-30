@@ -6,10 +6,10 @@
 //! [`crate::table_styles::with_table_styles`]), so undo stays a document
 //! edit.
 
-use super::{EditKind, Editor};
+use super::Editor;
 use crate::model::{Table, VMerge};
 use crate::table::{GridMap, cell_props, edit_cell_props, edit_table_props, table_props};
-use crate::table_props::{BorderLine, Edge, TblLook, border_of, shd_fill, with_border};
+use crate::table_props::{BorderLine, Edge, TblLook, shd_fill, with_border};
 
 use super::tables::CellRange;
 
@@ -188,32 +188,14 @@ fn facing(t: &Table, map: &GridMap, r: &CellRange, edge: RangeEdge) -> Vec<Side>
     out
 }
 
-/// A side's line as drawn without the table style: the cell's own
-/// `tcBorders`, else the table's `tblBorders` (outer or inside).
-fn effective(t: &Table, map: &GridMap, (ri, ci, e): Side) -> Option<BorderLine> {
-    let cell = &t.rows[ri].cells[ci];
-    if let Some(l) = border_of(cell_props(cell).get("w:tcBorders"), e) {
-        return Some(l);
-    }
-    let (s, n) = map.rows[ri].cells[ci];
-    let width = map.width(t);
-    let last_row = if cell.v_merge == VMerge::Restart {
-        map.merge_end(t, ri, ci)
-    } else {
-        ri
-    };
-    let table_edge = match e {
-        Edge::Top if ri == 0 => Edge::Top,
-        Edge::Top => Edge::InsideH,
-        Edge::Bottom if last_row + 1 == t.rows.len() => Edge::Bottom,
-        Edge::Bottom => Edge::InsideH,
-        Edge::Left if s == 0 => Edge::Left,
-        Edge::Left => Edge::InsideV,
-        Edge::Right if s + n == width => Edge::Right,
-        Edge::Right => Edge::InsideV,
-        _ => return None,
-    };
-    border_of(table_props(t).get("w:tblBorders"), table_edge)
+/// Every cell's resolved sides: its own `tcBorders`, the table's
+/// `tblBorders`, then the table style when it is one of the built-ins (the
+/// editor has no `styles.xml`; a document's own style is not seen here).
+fn looks(t: &Table) -> Vec<Vec<crate::table_styles::CellLook>> {
+    let style = table_props(t)
+        .attr("w:tblStyle", "w:val")
+        .and_then(|id| crate::table_styles::lookup_style(None, &id));
+    crate::table_styles::resolve(t, style.as_ref())
 }
 
 fn set_side(t: &mut Table, (ri, ci, e): Side, line: Option<&BorderLine>) {
@@ -247,6 +229,9 @@ impl Editor {
         self.edit_table_props_at(&r.table, |t| {
             edit_table_props(t, |p| {
                 p.set(&format!("<w:tblStyle w:val=\"{id}\"/>"));
+                // Word's gallery click clears table-level borders, so the
+                // style's own borders show.
+                p.remove("w:tblBorders");
                 if p.get("w:tblLook").is_none() {
                     p.set(&TblLook::default().to_xml());
                 }
@@ -328,10 +313,11 @@ impl Editor {
             .iter()
             .flat_map(|&e| sides(t, &map, &r, e))
             .collect();
+        let looks = looks(t);
         !all.is_empty()
             && all
                 .iter()
-                .all(|&s| effective(t, &map, s).is_some_and(|l| l.visible()))
+                .all(|&(ri, ci, e)| looks[ri][ci].visible(e).is_some())
     }
 
     /// The Borders menu: toggle the command's sides on the selected cells as
@@ -374,27 +360,18 @@ impl Editor {
         })
     }
 
-    /// Edit the table at `path` in place as one undo step (none when nothing
-    /// changed). The cells do not move, so the caret and selection stay.
+    /// Edit the table at `path` in place (the cells do not move, so the caret
+    /// and selection stay) through [`Editor::edit_table`]: one undo step, none
+    /// when nothing changed.
     fn edit_table_props_at(
         &mut self,
         path: &[usize],
         edit: impl FnOnce(&mut Table),
     ) -> Result<(), String> {
-        let mut t = self
-            .table(path)
-            .ok_or("the caret is not in a table")?
-            .clone();
-        edit(&mut t);
-        if Some(&t) == self.table(path) {
-            return Ok(());
-        }
-        self.checkpoint(EditKind::Structural);
-        if let Some(slot) = super::tables::table_at_mut(&mut self.doc.body, path) {
-            *slot = t;
-        }
-        self.last = EditKind::Structural;
-        Ok(())
+        self.edit_table(path, |t| {
+            edit(t);
+            Ok(super::table_layout::After::Stay)
+        })
     }
 }
 
@@ -440,6 +417,39 @@ mod tests {
         assert!(ed.undo());
         assert_eq!(ed.table_look(), Some(TblLook::default()));
         assert!(ed.set_table_style("bad\"id").is_err());
+    }
+
+    #[test]
+    fn a_new_table_is_table_grid_and_a_gallery_style_clears_direct_borders() {
+        let mut ed = Editor::new(grid_doc(2, 2));
+        assert_eq!(ed.table_style().as_deref(), Some("TableGrid"));
+        assert!(
+            ed.border_state(BorderCmd::All),
+            "Table Grid draws every border"
+        );
+        // Direct borders from an older document go when a style is picked.
+        crate::table::edit_table_props(
+            super::super::tables::table_at_mut(&mut ed.doc.body, &[0]).unwrap(),
+            |p| {
+                p.set("<w:tblBorders><w:top w:val=\"single\" w:sz=\"4\" w:color=\"auto\"/></w:tblBorders>")
+            },
+        );
+        ed.set_table_style("PlainTable4").unwrap();
+        let p = t(&ed).raw_tblpr.clone().unwrap();
+        assert!(!p.contains("w:tblBorders"), "{p}");
+        assert!(
+            !ed.border_state(BorderCmd::Top),
+            "Plain Table 4 has no borders"
+        );
+        // A fresh package defines Table Grid when saved.
+        let mut ed = Editor::new(crate::model::Document {
+            body: vec![Block::Paragraph(Default::default())],
+        });
+        ed.insert_table(2, 2, crate::table::AutoFit::Default)
+            .unwrap();
+        let pkg = load_package(&save_package(&new_package(ed.doc.clone()))).unwrap();
+        let styles = String::from_utf8_lossy(pkg.part("word/styles.xml").unwrap()).into_owned();
+        assert!(styles.contains("w:styleId=\"TableGrid\""));
     }
 
     #[test]
@@ -562,7 +572,7 @@ mod tests {
         let mut ed = Editor::new(outer);
         ed.caret = Caret::at(vec![0, 0, 0, 0, 0, 1, 0], 0);
         ed.set_cell_shading(Some("00FF00")).unwrap();
-        ed.set_table_style("TableGrid").unwrap();
+        ed.set_table_style("PlainTable1").unwrap();
         let inner = ed.table(&[0, 0, 0, 0]).unwrap();
         assert!(
             inner.rows[0].cells[1]
@@ -571,7 +581,7 @@ mod tests {
                 .unwrap()
                 .contains("00FF00")
         );
-        assert!(inner.raw_tblpr.as_deref().unwrap().contains("TableGrid"));
-        assert!(!t(&ed).raw_tblpr.as_deref().unwrap().contains("TableGrid"));
+        assert!(inner.raw_tblpr.as_deref().unwrap().contains("PlainTable1"));
+        assert!(!t(&ed).raw_tblpr.as_deref().unwrap().contains("PlainTable1"));
     }
 }

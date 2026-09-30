@@ -29,17 +29,10 @@ impl Line {
             width = width.max(3.0);
         }
         Some(Line {
-            color: parse_hex(&l.color),
+            color: crate::hex_rgb(&l.color),
             width,
         })
     }
-}
-
-/// `RRGGBB` → `0xRRGGBB`; `auto` and anything else → `None`.
-pub fn parse_hex(s: &str) -> Option<u32> {
-    (s.len() == 6)
-        .then(|| u32::from_str_radix(s, 16).ok())
-        .flatten()
 }
 
 /// One cell's box.
@@ -124,7 +117,7 @@ pub fn layout(t: &Table, style: Option<&TableStyle>) -> Vec<RowBox> {
                         span: n,
                         width: span_w(s, n),
                         continues,
-                        fill: look.fill.as_deref().and_then(parse_hex),
+                        fill: look.fill.as_deref().and_then(crate::hex_rgb),
                         top: if continues { None } else { line(&look.top) },
                         left: line(&look.left),
                         bottom: if continued_below {
@@ -188,7 +181,8 @@ mod tests {
         let mut t = new_table(2, 1, 9000, AutoFit::Default);
         t.rows[0].cells[0].v_merge = VMerge::Restart;
         t.rows[1].cells[0].v_merge = VMerge::Continue;
-        let rows = layout(&t, None);
+        let grid = lookup_style(None, "TableGrid");
+        let rows = layout(&t, grid.as_ref());
         assert!(rows[0].cells[0].top.is_some());
         assert!(rows[0].cells[0].bottom.is_none());
         assert!(rows[1].cells[0].top.is_none());
@@ -237,15 +231,8 @@ mod tests {
         edit_cell_props(&mut t.rows[0].cells[0], |p| {
             p.set("<w:tcBorders><w:top w:val=\"nil\"/></w:tcBorders>")
         });
-        let rows = layout(&t, None);
+        let rows = layout(&t, lookup_style(None, "TableGrid").as_ref());
         assert!(rows[0].cells[0].top.is_none());
         assert!(rows[0].cells[0].left.is_some());
-    }
-
-    #[test]
-    fn hex_colours() {
-        assert_eq!(parse_hex("4472C4"), Some(0x4472C4));
-        assert_eq!(parse_hex("auto"), None);
-        assert_eq!(parse_hex("12345"), None);
     }
 }

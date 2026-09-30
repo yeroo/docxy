@@ -22,16 +22,6 @@ pub enum AutoFit {
     Default,
 }
 
-/// The border set every new table gets (single, auto colour).
-const TBL_BORDERS: &str = "<w:tblBorders>\
-<w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-<w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-<w:bottom w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-<w:right w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-<w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-<w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-</w:tblBorders>";
-
 /// Word's text width for a Letter page with 1" margins, in twips.
 pub const DEFAULT_TEXT_WIDTH: u32 = 9360;
 
@@ -43,8 +33,11 @@ pub fn empty_cell() -> Cell {
     }
 }
 
-/// A new `rows`×`cols` table with single borders and equal columns spanning
-/// `text_width` twips — the one definition behind Insert Table everywhere.
+/// A new `rows`×`cols` table in Word's Table Grid style (single borders,
+/// through the style rather than direct `w:tblBorders`, as Word writes it)
+/// with equal columns spanning `text_width` twips — the one definition behind
+/// Insert Table everywhere. The style's definition goes into `styles.xml` at
+/// save.
 pub fn new_table(rows: usize, cols: usize, text_width: u32, fit: AutoFit) -> Table {
     let rows = rows.max(1);
     let cols = cols.max(1);
@@ -53,11 +46,12 @@ pub fn new_table(rows: usize, cols: usize, text_width: u32, fit: AutoFit) -> Tab
         _ => text_width.max(cols as u32) / cols as u32,
     };
     let mut tblpr = PropsXml::new("w:tblPr", TBLPR_ORDER);
+    tblpr.set("<w:tblStyle w:val=\"TableGrid\"/>");
+    tblpr.set(&crate::table_props::TblLook::default().to_xml());
     tblpr.set(match fit {
         AutoFit::Window => "<w:tblW w:w=\"5000\" w:type=\"pct\"/>",
         _ => "<w:tblW w:w=\"0\" w:type=\"auto\"/>",
     });
-    tblpr.set(TBL_BORDERS);
     if let AutoFit::Fixed(Some(_)) = fit {
         tblpr.set("<w:tblLayout w:type=\"fixed\"/>");
     }
@@ -365,12 +359,8 @@ pub fn normalize_vmerge(table: &mut Table) {
 /// re-spanning every cell so nothing moves. Returns, for each old grid column
 /// boundary index `0..=len`, its new index.
 pub fn refine_grid(table: &mut Table, cuts: &[u32]) -> Vec<usize> {
-    let mut xs: Vec<u32> = vec![0];
-    let mut acc = 0u32;
-    for w in &table.grid {
-        acc += w;
-        xs.push(acc);
-    }
+    let xs = grid_xs(table);
+    let acc = xs.last().copied().unwrap_or(0);
     let mut all = xs.clone();
     for &c in cuts {
         if c > 0 && c < acc {
@@ -431,7 +421,10 @@ mod tests {
         assert_eq!(t.rows.len(), 2);
         assert!(t.rows.iter().all(|r| r.cells.len() == 3));
         let tblpr = t.raw_tblpr.unwrap();
-        assert!(tblpr.starts_with("<w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/><w:tblBorders>"));
+        assert!(tblpr.starts_with(
+            "<w:tblPr><w:tblStyle w:val=\"TableGrid\"/><w:tblW w:w=\"0\" w:type=\"auto\"/><w:tblLook "
+        ));
+        assert!(!tblpr.contains("w:tblBorders"));
         assert!(t.rows[0].cells[0].raw_tcpr.is_none());
     }
 

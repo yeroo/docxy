@@ -67,7 +67,7 @@ pub enum CellSep {
 }
 
 /// Where the caret goes after a table edit.
-enum After {
+pub(super) enum After {
     /// Keep the caret and selection (the cells did not move).
     Stay,
     /// The start of cell `(row, cell)`.
@@ -78,7 +78,7 @@ impl Editor {
     /// Run `edit` on a copy of the table at `path`. A refusal changes nothing
     /// and records no undo step; an edit that changes nothing records none
     /// either.
-    fn edit_table(
+    pub(super) fn edit_table(
         &mut self,
         path: &[usize],
         edit: impl FnOnce(&mut Table) -> Result<After, String>,

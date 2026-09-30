@@ -1002,9 +1002,14 @@ mod tests {
         assert_eq!(l[0][0].fill.as_deref(), Some("00FF00"));
         assert_eq!(l[0][0].diag_down.as_ref().unwrap().color, "FF0000");
         // No style: the table's own borders still draw.
-        let t = new_table(1, 1, 9000, AutoFit::Default);
+        let mut t = new_table(1, 1, 9000, AutoFit::Default);
+        edit_table_props(&mut t, |p| {
+            p.remove("w:tblStyle");
+            p.set("<w:tblBorders><w:top w:val=\"single\" w:sz=\"4\" w:color=\"auto\"/></w:tblBorders>");
+        });
         let l = resolve(&t, None);
         assert!(l[0][0].visible(Edge::Top).is_some());
+        assert!(l[0][0].visible(Edge::Left).is_none());
     }
 
     #[test]

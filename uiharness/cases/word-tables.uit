@@ -165,6 +165,10 @@ test design tab styles, options, shading and borders (648)
   assert table.look is 0080
   key ctrl+z
   assert table.look is 00A0
+  # Into a body row: Grid Table 4's header row has no inside vertical border,
+  # so there All Borders is rightly off.
+  key tab tab tab
+  assert table.row is 1
   call ribbon-click {"tab":"Table Design","command":"shade-yellow"}
   assert table.shading is FFFF00
   call ribbon-click {"tab":"Table Design","command":"shade-none"}
