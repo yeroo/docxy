@@ -9849,6 +9849,89 @@ b",
         assert_eq!(re.part("xl/metadata.xml").unwrap(), b"<metadata>");
     }
 
+    /// A1:A3 = 1, 2, 3 and a legacy CSE array (no `cm`) anchored at C1 over
+    /// `block`, with no stored values for the rest of the block.
+    fn cse_book(block: &str, src: &str) -> SheetPackage {
+        let rows = format!(
+            r#"<row r="1"><c r="A1"><v>1</v></c><c r="C1"><f t="array" ref="{block}">{src}</f><v>0</v></c></row><row r="2"><c r="A2"><v>2</v></c></row><row r="3"><c r="A3"><v>3</v></c></row>"#
+        );
+        let mut pkg = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
+        rebuild(&mut pkg);
+        pkg
+    }
+
+    fn val(pkg: &SheetPackage, name: &str) -> CellValue {
+        let (r, c) = crate::sheet::parse_cell_name(name).unwrap();
+        pkg.workbook.sheets[0]
+            .cell(r, c)
+            .map(|c| c.value.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn cse_block_repeats_a_scalar_result() {
+        let pkg = cse_book("C1:C3", "A1");
+        for n in ["C1", "C2", "C3"] {
+            assert_eq!(val(&pkg, n), CellValue::Number(1.0), "{n}");
+        }
+        let (re, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<c r="C1"><f t="array" ref="C1:C3">A1</f><v>1</v></c>"#),
+            "{ws}"
+        );
+        assert!(!ws.contains("cm="), "{ws}");
+        assert!(!re.workbook.sheets[0].cell(0, 2).unwrap().has_cm());
+    }
+
+    #[test]
+    fn cse_block_truncates_a_larger_result() {
+        let pkg = cse_book("C1:C2", "A1:A3");
+        assert_eq!(val(&pkg, "C2"), CellValue::Number(2.0));
+        assert_eq!(val(&pkg, "C3"), CellValue::Empty);
+    }
+
+    #[test]
+    fn cse_block_pads_a_smaller_result_with_na() {
+        let pkg = cse_book("C1:D3", "A1:A2*10");
+        assert_eq!(val(&pkg, "C2"), CellValue::Number(20.0));
+        assert_eq!(val(&pkg, "D2"), CellValue::Number(20.0));
+        assert_eq!(val(&pkg, "C3"), CellValue::Error("#N/A".into()));
+        assert_eq!(val(&pkg, "D3"), CellValue::Error("#N/A".into()));
+    }
+
+    #[test]
+    fn cse_block_refills_and_feeds_dependents_after_an_edit() {
+        let mut pkg = cse_book("C1:C3", "A1");
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 4, 0), Cell::formula("C3+1"));
+        assert_eq!(val(&pkg, "A5"), CellValue::Number(2.0));
+        eng.set_cell(&mut pkg.workbook, (0, 0, 0), Cell::number(10.0));
+        assert_eq!(val(&pkg, "C3"), CellValue::Number(10.0));
+        assert_eq!(val(&pkg, "A5"), CellValue::Number(11.0));
+    }
+
+    #[test]
+    fn typing_into_a_cse_block_keeps_the_typed_value() {
+        let mut pkg = cse_book("C1:C3", "A1");
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 1, 2), Cell::number(99.0));
+        assert_eq!(val(&pkg, "C2"), CellValue::Number(99.0));
+        eng.set_cell(&mut pkg.workbook, (0, 1, 2), Cell::default());
+        assert_eq!(val(&pkg, "C2"), CellValue::Number(1.0));
+        assert_eq!(val(&pkg, "C3"), CellValue::Number(1.0));
+    }
+
+    #[test]
+    fn one_cell_cse_block_truncates_and_keeps_its_ref() {
+        let pkg = cse_book("C1", "A1:A3");
+        assert_eq!(val(&pkg, "C1"), CellValue::Number(1.0));
+        assert_eq!(val(&pkg, "C2"), CellValue::Empty);
+        let ws = saved_sheet1(&pkg);
+        assert!(ws.contains(r#"<f t="array" ref="C1">A1:A3</f>"#), "{ws}");
+    }
+
     #[test]
     fn legacy_cse_array_gets_no_cm_on_save() {
         // #724 AC6: a loaded Ctrl+Shift+Enter array (`t="array"`, no `cm`) is
@@ -10361,8 +10444,10 @@ b",
     fn an_array_cell_moved_without_set_cell_is_written_covering_its_anchor() {
         // Moved as a sort moves cells (Sheet::set_cell, no engine): the ref
         // it carries names D1:D3, which the writer must not claim from D4.
-        let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SUM_BLOCK))).unwrap();
-        rebuild(&mut pkg); // a 1x1 result: no spill extent left to write from
+        // A one-cell block: no extent beyond its anchor to write from.
+        let anchor = r#"<c r="D1"><f t="array" ref="D1">SUM(A1:A5*A1:A5)</f><v>165</v></c>"#;
+        let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, anchor))).unwrap();
+        rebuild(&mut pkg);
         let sheet = &mut pkg.workbook.sheets[0];
         let cell = sheet.cells.remove(&(0, 3)).unwrap();
         assert_eq!(cell.spill, None);
