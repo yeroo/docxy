@@ -5644,7 +5644,13 @@ impl SheetPackage {
     /// It can't foresee the later refusal of a drawing-rels part too broken
     /// to take the chart's relationship; that one needs the write.
     pub fn can_add_chart(&self, sheet: usize) -> bool {
-        if sheet >= self.workbook.sheets.len() || !self.sheet_takes(sheet, "drawing", true) {
+        // add_chart names the sheet's part: a sheet the model has but the
+        // package lists no part for (an undo that brought back a removed
+        // sheet restores the model only) can't take one.
+        if sheet >= self.workbook.sheets.len()
+            || sheet >= self.sheet_parts.len()
+            || !self.sheet_takes(sheet, "drawing", true)
+        {
             return false;
         }
         // A host part with neither a `</wsDr>` nor a self-closed root to open
@@ -13890,6 +13896,17 @@ mod ct_worksheet_order_tests {
         assert!(pkg.add_chart(0, (0, 3), (10, 8), &chart()));
         // A second chart joins the drawing part the first made.
         assert!(pkg.can_add_chart(0));
+    }
+
+    #[test]
+    fn a_sheet_with_no_part_entry_takes_no_chart() {
+        // The model has the sheet, the package no part name for it.
+        let mut pkg = loaded(&format!("{ROWS}{MARGINS}"));
+        pkg.sheet_parts.pop();
+        let parts = pkg.parts.clone();
+        assert!(!pkg.can_add_chart(0));
+        assert!(!pkg.add_chart(0, (0, 3), (10, 8), &chart()));
+        assert_eq!(pkg.parts, parts);
     }
 
     #[test]
