@@ -108,31 +108,67 @@ fn backup_path(dest: &Path) -> std::path::PathBuf {
 
 /// Honour the package's *Always create backup* flag: keep the bytes the save
 /// is about to replace. A missing destination means no previous version;
-/// any other failure aborts the save before the file is touched.
+/// any other failure aborts the save before the file is touched. Read
+/// failures are reported against the workbook, write failures against the
+/// backup, so the status line names the real culprit.
 fn keep_backup(dest: &Path) -> io::Result<()> {
-    match std::fs::read(dest) {
-        Ok(bytes) => {
-            // Mirror the file's permissions so a private workbook stays
-            // private — but always keep the backup owner-writable, or the
-            // next save could not replace it (a 0444 book would give a 0444
-            // backup that write_atomic then refuses to open). Windows skips
-            // the mirroring: its only permission bit is readonly, which
-            // would brick the backup the same way.
-            #[cfg(unix)]
-            let mut perms = std::fs::metadata(dest)?.permissions();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                perms.set_mode(perms.mode() | 0o200);
-            }
-            write_atomic(&backup_path(dest), &bytes)?;
-            #[cfg(unix)]
-            std::fs::set_permissions(&backup_path(dest), perms)?;
-            Ok(())
+    let bytes = match std::fs::read(dest) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("cannot read {}: {e}", dest.display()),
+            ));
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+    };
+    let backup = backup_path(dest);
+    let write_ctx = |e: io::Error| {
+        io::Error::new(
+            e.kind(),
+            format!("cannot write backup {}: {e}", backup.display()),
+        )
+    };
+    // Mirror the file's permissions so a private workbook stays private —
+    // but always keep the backup owner-writable, or the next save could not
+    // replace it (a 0444 book would give a 0444 backup that write_atomic then
+    // refuses to open). Windows skips the mirroring: its only permission bit
+    // is readonly, which would brick the backup the same way.
+    #[cfg(unix)]
+    let mut perms = match std::fs::metadata(dest) {
+        Ok(meta) => meta.permissions(),
+        Err(e) => {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("cannot read {}: {e}", dest.display()),
+            ));
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        perms.set_mode(perms.mode() | 0o200);
+        // Create the first backup already chmodded: a brand-new destination
+        // would be umask-default until write_atomic's rename lands, briefly
+        // world-readable. The empty file sends write_atomic down its
+        // replacement path, which preserves this mode.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(perms.mode())
+            .open(&backup)
+        {
+            Ok(_) => {}
+            // An existing backup gets its mode mirrored below; write_atomic
+            // replaces it on the permission-preserving path.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(write_ctx(e)),
+        }
     }
+    write_atomic(&backup, &bytes).map_err(write_ctx)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&backup, perms).map_err(write_ctx)?;
+    Ok(())
 }
 
 fn is_delimited(path: &str) -> bool {
@@ -2552,10 +2588,7 @@ impl App {
         let bytes = self.package_bytes();
         if self.pkg.always_create_backup() {
             if let Err(e) = keep_backup(Path::new(&self.path)) {
-                let msg = format!(
-                    "save failed: cannot write backup {}: {e}",
-                    backup_path(Path::new(&self.path)).display()
-                );
+                let msg = format!("save failed: {e}");
                 self.status = Some(msg.clone());
                 return Err(msg);
             }

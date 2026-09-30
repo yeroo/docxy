@@ -4094,4 +4094,36 @@ mod tests {
         assert_ne!(std::fs::read(&book).unwrap(), before);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A book locked by another process fails in keep_backup's read, so the
+    /// error names the book, not the backup that was never touched.
+    #[cfg(windows)]
+    #[test]
+    fn wb_save_with_backup_flag_reports_locked_book() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("xlsxy-608-save-locked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = dir.join("book.xlsx");
+        std::fs::write(&book, backup_fixture("1")).unwrap();
+        let mut a = App::new(
+            load_xlsx(&std::fs::read(&book).unwrap()).unwrap(),
+            book.to_str().unwrap(),
+        );
+        a.os_clip = None;
+        set(&mut a, "A1", "changed");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&book)
+            .unwrap();
+        let err = dispatch(&mut a, "wb.save", &Json::Null).unwrap_err();
+        assert!(err.starts_with("save failed: cannot read"), "{err}");
+        assert!(!err.contains("Backup of"), "{err}");
+        assert!(!dir.join("Backup of book.xlk").exists());
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
