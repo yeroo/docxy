@@ -545,6 +545,11 @@ fn sheet_engine(wb: &gridcore::sheet::Workbook) -> gridcore::engine::Engine {
     engine
 }
 
+/// The status of an edit the workbook's file refused: its worksheet XML is
+/// damaged where the edit would go.
+const DAMAGED_SHEET_STATUS: &str =
+    "Can't add that here: this sheet's XML is damaged where it would go (nothing changed)";
+
 /// A UI-authored chart: which sheet it floats over, its cell anchor (for save),
 /// and its (cached) data.
 #[derive(Clone)]
@@ -1288,6 +1293,22 @@ impl SheetView {
     /// Snapshot before a mutation; share the history limit across all edits.
     fn push_undo(&mut self) {
         self.push_undo_snapshot(self.snapshot());
+    }
+
+    /// Add a chart the user inserted, with its undo step. It is written only
+    /// at save (`sheet_bytes`), so a sheet whose XML is damaged where the
+    /// chart would go refuses it now, changing nothing, rather than losing it
+    /// from the saved file without a word.
+    fn insert_ui_chart(&mut self, chart: ChartView) -> bool {
+        if !self.pkg.can_add_chart(chart.sheet) {
+            return false;
+        }
+        // UI-authored charts live in the snapshot alongside the workbook, so
+        // without this Ctrl+Z would undo the edit BEFORE the insert and leave
+        // the chart standing.
+        self.push_undo();
+        self.charts.push(chart);
+        true
     }
 
     /// Record `snap`, taken before an edit that has now landed.
@@ -3947,6 +3968,10 @@ fn sheet_bytes(v: &SheetView, target: Option<&std::path::Path>) -> Vec<u8> {
     } else {
         let mut pkg = v.pkg.clone();
         for cv in &v.charts {
+            // The insert asked `can_add_chart` (`insert_ui_chart`), so a
+            // damaged worksheet or drawing part was refused then. Only a
+            // drawing-rels part too broken to take the chart's relationship
+            // can still refuse here, and that isn't reported.
             pkg.add_chart(cv.sheet, cv.from, cv.to, &cv.data);
         }
         write(&pkg)
@@ -9727,9 +9752,7 @@ impl Docxy {
         };
         let snap = undoable.then(|| v.snapshot());
         if !edit(v) {
-            self.set_status(
-                "Can't add that here: this sheet's XML is damaged where it would go (nothing changed)",
-            );
+            self.set_status(DAMAGED_SHEET_STATUS);
             return false;
         }
         if let Some(snap) = snap {
@@ -11306,30 +11329,31 @@ impl Docxy {
         // Insert ▸ Pie over several numeric columns reads as a series each, and
         // that is inserted as-is: the writer keeps every one of them, and the
         // panel says the pie draws the first (`chart_unplotted_note`).
-        //
-        // UI-authored charts live in the snapshot alongside the workbook, so
-        // without this Ctrl+Z would undo the edit BEFORE the insert and leave
-        // the chart standing.
-        self.sheet_snapshot();
+        let Some(v) = self.active_sheet_mut() else {
+            return;
+        };
+        let s = v.active;
+        // Anchor the saved chart just right of the selected range. The span
+        // is the card's size now, so pick one that reads well and let the
+        // user drag it from there.
+        let (r0, _, _, c1) = range;
+        let chart = ChartView {
+            sheet: s,
+            from: (r0, c1 + 2),
+            to: (r0 + 10, c1 + 8),
+            data,
+        };
+        if !v.insert_ui_chart(chart) {
+            self.set_status(DAMAGED_SHEET_STATUS);
+            cx.notify();
+            return;
+        }
         // A UI-authored chart goes in FRONT of the file's drawings in
         // `chart_locate`'s order, so pushing one shifts every drawing-backed
         // index by one. A selection or a focused panel field left over from
         // before would then name — and, on the next pick, repoint — a different
         // chart than the one on screen.
         self.chart_drop_selection();
-        if let Some(v) = self.active_sheet_mut() {
-            let s = v.active;
-            // Anchor the saved chart just right of the selected range. The span
-            // is the card's size now, so pick one that reads well and let the
-            // user drag it from there.
-            let (r0, _, _, c1) = range;
-            v.charts.push(ChartView {
-                sheet: s,
-                from: (r0, c1 + 2),
-                to: (r0 + 10, c1 + 8),
-                data,
-            });
-        }
         self.mark_sheet_dirty();
         cx.notify();
     }
@@ -26039,6 +26063,80 @@ fn main() {
         })
         .expect("failed to open docxy window");
     });
+}
+
+#[cfg(test)]
+mod ui_chart_insert_tests {
+    use super::{ChartView, SheetView, Surface, new_sheet_surface, sheet_bytes, sheet_engine};
+
+    const SHEET: &str = "xl/worksheets/sheet1.xml";
+
+    /// A spreadsheet view on a new workbook with numbers in A1:B3, its
+    /// worksheet part cut after `</sheetData>` and ending in `<pageMargins/>`
+    /// then `tail`.
+    fn view(tail: &str) -> SheetView {
+        let mut pkg = gridcore::xlsx::new_xlsx();
+        for r in 0..3 {
+            pkg.workbook.sheets[0].set_cell(r, 0, gridcore::sheet::Cell::number(r as f64));
+            pkg.workbook.sheets[0].set_cell(r, 1, gridcore::sheet::Cell::number(2.0 * r as f64));
+        }
+        let saved = gridcore::xlsx::save_xlsx(&pkg);
+        let zip = opccore::zip::ZipArchive::open(&saved).unwrap();
+        let parts: Vec<(String, Vec<u8>)> = zip
+            .entries()
+            .iter()
+            .map(|e| {
+                let bytes = zip.extract(e).unwrap();
+                if e.name == SHEET {
+                    let xml = String::from_utf8(bytes).unwrap();
+                    let end = xml.find("</sheetData>").expect("sheetData") + "</sheetData>".len();
+                    let margins = r#"<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>"#;
+                    (e.name.clone(), format!("{}{margins}{tail}", &xml[..end]).into_bytes())
+                } else {
+                    (e.name.clone(), bytes)
+                }
+            })
+            .collect();
+        let pkg = gridcore::xlsx::load_xlsx(&opccore::zipwrite::write_zip(&parts)).unwrap();
+        let Surface::Sheet(mut v) = new_sheet_surface() else {
+            unreachable!()
+        };
+        v.engine = sheet_engine(&pkg.workbook);
+        v.pkg = pkg;
+        v
+    }
+
+    fn chart(v: &SheetView) -> ChartView {
+        let sh = &v.pkg.workbook.sheets[0];
+        let data = gridcore::sheet::chart_from_range(sh, &sh.name, (0, 0, 2, 1), "column", false)
+            .expect("chart data");
+        ChartView {
+            sheet: 0,
+            from: (0, 3),
+            to: (10, 9),
+            data,
+        }
+    }
+
+    #[test]
+    fn a_chart_insert_on_a_damaged_sheet_is_refused_up_front() {
+        // #711's damaged part: truncated inside headerFooter, so there is no
+        // known place for the <drawing> the saved chart would need.
+        let mut v = view("<headerFooter><oddHeader>x</OddHeader>");
+        let c = chart(&v);
+        assert!(!v.insert_ui_chart(c));
+        assert!(v.charts.is_empty());
+        assert!(v.undo.is_empty(), "a refused insert leaves no undo step");
+
+        let mut v = view("</worksheet>");
+        let c = chart(&v);
+        assert!(v.insert_ui_chart(c));
+        assert_eq!(v.charts.len(), 1);
+        assert_eq!(v.undo.len(), 1);
+        let bytes = sheet_bytes(&v, None);
+        let zip = opccore::zip::ZipArchive::open(&bytes).unwrap();
+        assert!(zip.find("xl/charts/chart1.xml").is_some());
+    }
 }
 
 #[cfg(test)]
