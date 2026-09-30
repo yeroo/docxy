@@ -279,11 +279,7 @@ impl Editor {
                         for (k, w) in widths.iter().enumerate() {
                             let mut cell = template_cell(&row.cells[src]);
                             cell.grid_span = 1;
-                            edit_cell_props(&mut cell, |p| {
-                                if width_of(p.get("w:tcW")).is_some_and(|(_, t)| t == "dxa") {
-                                    p.set(&format!("<w:tcW w:w=\"{w}\" w:type=\"dxa\"/>"));
-                                }
-                            });
+                            set_dxa_width(&mut cell, *w);
                             row.cells.insert(at + k, cell);
                         }
                     }
@@ -515,9 +511,9 @@ impl Editor {
         if at > 0 {
             first.rows.truncate(at);
             second.rows.drain(..at);
-            first.row_boundaries.clear();
+            let boundaries = std::mem::take(&mut first.row_boundaries);
             second.row_boundaries.clear();
-            for b in &t_boundaries(&r, self)? {
+            for b in &boundaries {
                 use std::cmp::Ordering::*;
                 match b.at.cmp(&at) {
                     Less => first.row_boundaries.push(b.clone()),
@@ -655,11 +651,7 @@ impl Editor {
             for (ri, rm) in map.rows.iter().enumerate() {
                 for (ci, &(s, span)) in rm.cells.iter().enumerate() {
                     let w = xs[(s + span).min(xs.len() - 1)] - xs[s.min(xs.len() - 1)];
-                    edit_cell_props(&mut t.rows[ri].cells[ci], |p| {
-                        if width_of(p.get("w:tcW")).is_some_and(|(_, ty)| ty == "dxa") {
-                            p.set(&format!("<w:tcW w:w=\"{w}\" w:type=\"dxa\"/>"));
-                        }
-                    });
+                    set_dxa_width(&mut t.rows[ri].cells[ci], w);
                 }
             }
             Ok(After::Stay)
@@ -952,11 +944,6 @@ impl Editor {
     }
 }
 
-/// The boundaries of the range's table.
-fn t_boundaries(r: &CellRange, ed: &Editor) -> Result<Vec<crate::model::TableRowBoundary>, String> {
-    Ok(ed.table(&r.table).ok_or("no table")?.row_boundaries.clone())
-}
-
 fn shifted(b: &crate::model::TableRowBoundary, by: usize) -> crate::model::TableRowBoundary {
     let mut b = b.clone();
     b.at -= by;
@@ -996,6 +983,16 @@ fn remove_grid_columns(t: &mut Table, left: usize, right: usize) {
         t.grid.drain(left..end);
     }
     normalize_vmerge(t);
+}
+
+/// Rewrite a cell's `w:tcW` to `width` twips when it is a fixed (`dxa`) one;
+/// an auto or percentage width is left to the layout.
+fn set_dxa_width(cell: &mut crate::model::Cell, width: u32) {
+    edit_cell_props(cell, |p| {
+        if width_of(p.get("w:tcW")).is_some_and(|(_, ty)| ty == "dxa") {
+            p.set(&format!("<w:tcW w:w=\"{width}\" w:type=\"dxa\"/>"));
+        }
+    });
 }
 
 /// Merge the cells of `r` into one (see [`Editor::merge_cells`]).
@@ -1058,24 +1055,21 @@ fn merge_range(t: &mut Table, r: &CellRange) -> Result<(), String> {
         };
         edit_cell_props(cell, |p| {
             p.remove("w:hMerge");
-            if width_of(p.get("w:tcW")).is_some_and(|(_, ty)| ty == "dxa") {
-                p.set(&format!("<w:tcW w:w=\"{width}\" w:type=\"dxa\"/>"));
-            }
         });
+        set_dxa_width(cell, width);
     }
     Ok(())
 }
 
 fn is_empty_cell(blocks: &[Block]) -> bool {
+    // Only plain runs with no text count as nothing: anything else (a
+    // picture, a field, a link, a note reference...) is content to keep.
     match blocks {
         [] => true,
-        [Block::Paragraph(p)] => {
-            p.content.iter().all(|i| i.text().is_empty())
-                && !p
-                    .content
-                    .iter()
-                    .any(|i| matches!(i, Inline::TextBox { .. } | Inline::Raw(_)))
-        }
+        [Block::Paragraph(p)] => p
+            .content
+            .iter()
+            .all(|i| matches!(i, Inline::Run(r) if r.text.is_empty())),
         _ => false,
     }
 }
@@ -1090,7 +1084,10 @@ fn split_one(t: &mut Table, row: usize, x: u32, cols: usize, rows: usize) -> Res
         let ci = map.rows[row].cell_starting(col).ok_or("the cell moved")?;
         Ok((col, ci, map.rows[row].cells[ci].1))
     };
-    let (_, ci, _) = locate(t)?;
+    let (col0, ci, n0) = locate(t)?;
+    // The cell's right edge: after the column split, the new cells lie
+    // between the two edges, however many grid columns that takes.
+    let x_end = grid_xs(t)[col0 + n0];
     let m = GridMap::of(t).merge_end(t, row, ci) - row + 1;
     if rows > 1 && m > 1 && !m.is_multiple_of(rows) {
         return Err(format!(
@@ -1137,12 +1134,7 @@ fn split_one(t: &mut Table, row: usize, x: u32, cols: usize, rows: usize) -> Res
                     c
                 };
                 cell.grid_span = (w[1] - w[0]) as u32;
-                let width = xs[w[1]] - xs[w[0]];
-                edit_cell_props(&mut cell, |p| {
-                    if width_of(p.get("w:tcW")).is_some_and(|(_, ty)| ty == "dxa") {
-                        p.set(&format!("<w:tcW w:w=\"{width}\" w:type=\"dxa\"/>"));
-                    }
-                });
+                set_dxa_width(&mut cell, xs[w[1]] - xs[w[0]]);
                 pieces.push(cell);
             }
             t.rows[rr].cells.splice(ci..=ci, pieces);
@@ -1151,8 +1143,9 @@ fn split_one(t: &mut Table, row: usize, x: u32, cols: usize, rows: usize) -> Res
     if rows <= 1 {
         return Ok(());
     }
-    let (col, _, n) = locate(t)?;
-    let (a, b) = (col, col + n);
+    let xs = grid_xs(t);
+    let edge = |x: u32| xs.iter().position(|&v| v == x).ok_or("the cell moved");
+    let (a, b) = (edge(x)?, edge(x_end)?);
     let inside = |s: usize| s >= a && s < b;
     if m > 1 {
         // Regroup the merged rows into `rows` groups of m/rows.
@@ -1650,6 +1643,106 @@ mod tests {
         assert_eq!(spans.iter().sum::<u32>(), 3);
         assert!(ed.undo());
         assert_eq!(texts(&ed)[0].len(), 3, "merge-and-split is one undo step");
+    }
+
+    /// The visible cells of each row: the ones that are not the continuation
+    /// of a vertical merge.
+    fn visible(ed: &Editor) -> Vec<usize> {
+        t(ed)
+            .rows
+            .iter()
+            .map(|r| {
+                r.cells
+                    .iter()
+                    .filter(|c| c.v_merge != VMerge::Continue)
+                    .count()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn split_into_columns_and_rows_at_once() {
+        // 1×1 → 2×2: four cells, none merged.
+        let mut ed = Editor::new(grid_doc(1, 1));
+        ed.split_cells(2, 2, false).unwrap();
+        assert_eq!(visible(&ed), [2, 2]);
+        assert!(
+            t(&ed)
+                .rows
+                .iter()
+                .flat_map(|r| &r.cells)
+                .all(|c| c.v_merge == VMerge::None)
+        );
+        // The second cell of a 1×2 table → 3×2: the first cell spans both rows.
+        let mut ed = Editor::new(grid_doc(1, 2));
+        ed.caret = at(0, 1);
+        ed.split_cells(3, 2, false).unwrap();
+        let tb = t(&ed);
+        assert_eq!(tb.rows[0].cells.len(), 4);
+        assert_eq!(tb.rows[1].cells.len(), 4);
+        assert_eq!(tb.rows[0].cells[0].v_merge, VMerge::Restart);
+        assert_eq!(tb.rows[1].cells[0].v_merge, VMerge::Continue);
+        assert!(
+            tb.rows[1].cells[1..]
+                .iter()
+                .all(|c| c.v_merge == VMerge::None)
+        );
+        assert_eq!(visible(&ed), [4, 3]);
+    }
+
+    #[test]
+    fn split_a_merged_cell_into_columns_and_rows() {
+        // m = 2 → 2×2: each row gets two unmerged cells.
+        let mut ed = Editor::new(grid_doc(2, 1));
+        select(&mut ed, (0, 0), (1, 0));
+        ed.merge_cells().unwrap();
+        ed.anchor = None;
+        ed.caret = at(0, 0);
+        ed.split_cells(2, 2, false).unwrap();
+        assert_eq!(visible(&ed), [2, 2]);
+        // m = 4 → 2×2: two pairs of merged rows, two cells wide.
+        let mut ed = Editor::new(grid_doc(4, 1));
+        select(&mut ed, (0, 0), (3, 0));
+        ed.merge_cells().unwrap();
+        ed.anchor = None;
+        ed.caret = at(0, 0);
+        ed.split_cells(2, 2, false).unwrap();
+        assert_eq!(visible(&ed), [2, 0, 2, 0]);
+        let v: Vec<VMerge> = t(&ed).rows.iter().map(|r| r.cells[1].v_merge).collect();
+        assert_eq!(
+            v,
+            [
+                VMerge::Restart,
+                VMerge::Continue,
+                VMerge::Restart,
+                VMerge::Continue
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_keeps_a_cell_whose_only_content_is_a_linked_picture() {
+        let mut ed = Editor::new(grid_doc(1, 2));
+        {
+            let Block::Table(tb) = &mut ed.doc.body[0] else {
+                panic!()
+            };
+            tb.rows[0].cells[1].blocks = vec![Block::Paragraph(Paragraph {
+                content: vec![Inline::Hyperlink(crate::model::Hyperlink {
+                    content: vec![Inline::Raw("<w:r><w:drawing/></w:r>".into())],
+                    ..Default::default()
+                })],
+                ..Paragraph::default()
+            })];
+        }
+        select(&mut ed, (0, 0), (0, 1));
+        ed.merge_cells().unwrap();
+        let cell = &t(&ed).rows[0].cells[0];
+        assert_eq!(
+            cell.blocks.len(),
+            2,
+            "the linked picture's paragraph is kept"
+        );
     }
 
     #[test]
