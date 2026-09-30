@@ -110,7 +110,8 @@ pub fn replace_all_in_sheet(
         if !text.contains(find) {
             continue;
         }
-        if let Ok(new) = crate::entry::reenter_cell(cell, styles, ctx, &text.replace(find, with)) {
+        let new_text = text.replace(find, with);
+        if let Ok(new) = crate::entry::reenter_cell(cell, styles, ctx, &text, &new_text) {
             out.push((r, c, new));
         }
     }

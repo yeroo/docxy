@@ -1309,18 +1309,29 @@ impl SheetView {
     }
 
     /// The text Find matches and Replace rewrites — one text, so whatever
-    /// Find selects Replace can change. Excel's default "Look in: Formulas":
-    /// a formula cell is its `=source`; a constant is what the cell shows
-    /// (a date as `1/15/2024`, a percent as `50%`), with a quote prefix's
-    /// `'` put back so replacing inside `'007` keeps it text. Empty for a
-    /// blank cell.
+    /// Find selects Replace can change. A formula cell is searched as its
+    /// `=source` (as Excel's default "Look in: Formulas" does); a constant as
+    /// its displayed text (a date as `1/15/2024`, a percent as `50%`), with
+    /// the leading `'` re-entering it needs put back (`'007` stays text).
+    /// Empty — so neither Find nor Replace touches it — for a blank cell and
+    /// for a constant that shows `########` (a date it cannot display): the
+    /// hashes are not its text.
     fn search_text(&self, r: u32, c: u32) -> String {
         match self.sheet().cell(r, c) {
             Some(cell) if cell.formula.is_some() => {
                 format!("={}", cell.formula.as_deref().unwrap_or_default())
             }
             Some(cell)
-                if gridcore::entry::shows_quote_prefix(
+                if gridcore::sheet::date_unrepresentable(
+                    &self.pkg.workbook.styles.xf(cell.style),
+                    &cell.value,
+                    self.pkg.workbook.date1904,
+                ) =>
+            {
+                String::new()
+            }
+            Some(cell)
+                if gridcore::entry::needs_apostrophe(
                     cell,
                     &self.pkg.workbook.styles.xf(cell.style),
                 ) =>
@@ -1372,7 +1383,7 @@ impl SheetView {
         let new = ci_replace(&text, q, rep);
         let ctx = gridcore::entry::entry_ctx(&self.pkg.workbook, self.engine.clock);
         let styles = &mut self.pkg.workbook.styles;
-        match gridcore::entry::reenter_cell(&cell, styles, &ctx, &new) {
+        match gridcore::entry::reenter_cell(&cell, styles, &ctx, &text, &new) {
             Ok(new_cell) => {
                 let s = self.active;
                 self.engine
@@ -1610,7 +1621,7 @@ impl SheetView {
             Some(c) => match &c.value {
                 CellValue::Number(n) => n.to_string(),
                 CellValue::Text(s)
-                    if gridcore::entry::shows_quote_prefix(
+                    if gridcore::entry::needs_apostrophe(
                         c,
                         &self.pkg.workbook.styles.xf(c.style),
                     ) =>
@@ -9221,18 +9232,25 @@ impl Docxy {
             let Some(v) = self.active_sheet_mut() else {
                 return;
             };
-            // A leading `'` pastes as quote-prefixed text (paste_cell).
-            let styles = &mut v.pkg.workbook.styles;
+            // A leading `'` pastes as quote-prefixed text (paste_cell), each
+            // field on the style its target cell has, as xlsxy's and
+            // gridwasm's pastes do.
+            let (br, bc, s) = (v.sel.0, v.sel.1, v.active);
+            let wb = &mut v.pkg.workbook;
             let mut rows = Vec::new();
-            for line in text
+            for (dr, line) in text
                 .replace("\r\n", "\n")
                 .trim_end_matches('\n')
                 .split('\n')
+                .enumerate()
             {
-                let row = line
-                    .split('\t')
-                    .map(|f| gridcore::entry::paste_cell(styles, 0, f))
-                    .collect();
+                let mut row = Vec::new();
+                for (dc, f) in line.split('\t').enumerate() {
+                    let style = wb.sheets[s]
+                        .cell(br + dr as u32, bc + dc as u32)
+                        .map_or(0, |cl| cl.style);
+                    row.push(gridcore::entry::paste_cell(&mut wb.styles, style, f));
+                }
                 rows.push(row);
             }
             rows
@@ -10319,8 +10337,9 @@ impl Docxy {
         cx.notify();
     }
 
-    /// Select the next (or previous) cell whose display text contains the query,
-    /// wrapping around, scanning row-major from the current selection.
+    /// Select the next (or previous) cell whose [`SheetView::search_text`]
+    /// contains the query (any case) — the text Replace rewrites — wrapping
+    /// around, scanning row-major from the current selection.
     fn sheet_find_next(&mut self, back: bool, cx: &mut Context<Self>) {
         let q = self.find_query.to_lowercase();
         if q.is_empty() {

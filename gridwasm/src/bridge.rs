@@ -527,7 +527,7 @@ impl Session {
         let src = self.cell_src(row, col);
         let styles = &self.pkg.workbook.styles;
         match self.pkg.workbook.sheets[self.active].cell(row, col) {
-            Some(cell) if gridcore::entry::shows_quote_prefix(cell, &styles.xf(cell.style)) => {
+            Some(cell) if gridcore::entry::needs_apostrophe(cell, &styles.xf(cell.style)) => {
                 format!("'{src}")
             }
             _ => src,
@@ -3386,6 +3386,50 @@ mod tests {
     }
 
     #[test]
+    fn a_text_beginning_with_an_apostrophe_survives_copy_and_paste() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let a = s.active;
+        // A loaded shared string 'abc with no quote prefix (General).
+        s.pkg.workbook.sheets[a].set_cell(40, 0, Cell::text("'abc"));
+        assert_eq!(s.cell_seed(40, 0), "''abc");
+        s.cur = (40, 0);
+        s.anchor = None;
+        let tsv = s.dispatch("copy").expect("copy returns the TSV");
+        s.dispatch(&format!("paste\t41\t0\t{tsv}"));
+        let pasted = s.pkg.workbook.sheets[a].cell(41, 0).unwrap().clone();
+        assert_eq!(pasted.value, CellValue::Text("'abc".into()));
+        // A Text-formatted cell holding 'abc, copied into another Text cell.
+        let text = s.pkg.workbook.styles.intern(gridcore::sheet::Xf {
+            numfmt: gridcore::sheet::NumFmt::Text,
+            code: Some("@".into()),
+            ..Default::default()
+        });
+        for r in [42, 43] {
+            s.pkg.workbook.sheets[a].set_cell(
+                r,
+                0,
+                Cell {
+                    style: text,
+                    ..Cell::default()
+                },
+            );
+        }
+        s.dispatch("set\t42\t0\t'abc");
+        assert_eq!(
+            s.cell_src(42, 0),
+            "'abc",
+            "a Text cell keeps the entry as typed"
+        );
+        assert_eq!(s.cell_seed(42, 0), "'abc");
+        s.cur = (42, 0);
+        let tsv = s.dispatch("copy").expect("copy returns the TSV");
+        s.dispatch(&format!("paste\t43\t0\t{tsv}"));
+        let pasted = s.pkg.workbook.sheets[a].cell(43, 0).unwrap().clone();
+        assert_eq!(pasted.value, CellValue::Text("'abc".into()));
+        assert!(!s.pkg.workbook.styles.xf(pasted.style).quote_prefix);
+    }
+
+    #[test]
     fn a_text_cell_takes_a_broken_formula_as_text() {
         let mut s = Session::open(&sample_xlsx()).expect("open");
         let text = s.pkg.workbook.styles.intern(gridcore::sheet::Xf {
@@ -3420,7 +3464,7 @@ mod tests {
         s.anchor = None;
         let tsv = s.dispatch("copy").expect("copy returns the TSV");
         assert_eq!(tsv.trim_end(), "'007");
-        s.dispatch(&format!("paste	22	0	{tsv}"));
+        s.dispatch(&format!("paste\t22\t0\t{tsv}"));
         let pasted = s.pkg.workbook.sheets[s.active].cell(22, 0).unwrap().clone();
         assert_eq!(pasted.value, CellValue::Text("007".into()));
         assert!(s.pkg.workbook.styles.xf(pasted.style).quote_prefix);

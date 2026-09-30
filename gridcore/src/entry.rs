@@ -253,18 +253,29 @@ pub fn entry_range(
     Ok(out)
 }
 
-/// Re-read `text` as the new entry of an existing `cell` whose input text was
-/// edited in place (Find & Replace): the cell's own rules, except that a
-/// percent cell is read as General — its input text is the plain value, so
-/// dividing it again would be wrong. The style is resolved into `styles`.
+/// Re-read `new` as the entry of an existing `cell` whose text `old` was
+/// edited in place (Find & Replace), under the cell's own rules — with one
+/// exception for a percent cell. When `old` had no `%` it was the plain value
+/// (an input text such as `1.5` for 150%), so `new` is read as General
+/// rather than divided by 100 again. When `old` showed the `%` (display
+/// text such as `150%`), `new` is read as typed into the cell: `160%` is 1.6,
+/// and `150` with the `%` removed is divided like any number typed there.
+/// The style is resolved into `styles`.
 pub fn reenter_cell(
     cell: &Cell,
     styles: &mut Styles,
     ctx: &EntryCtx,
-    text: &str,
+    old: &str,
+    new: &str,
 ) -> Result<Cell, EntryError> {
+    let text = new;
     let xf = styles.xf(cell.style);
-    let read_as = if is_percent(&xf) { Xf::default() } else { xf };
+    let plain_value = !old.contains('%');
+    let read_as = if is_percent(&xf) && plain_value {
+        Xf::default()
+    } else {
+        xf
+    };
     let e = parse_entry(text, &read_as, ctx)?;
     let style = entry_style(styles, cell.style, &e);
     Ok(Cell { style, ..e.cell })
@@ -292,13 +303,20 @@ pub fn typed_formula<'a>(
 
 /// A pasted field as a cell of style `style`: the value reading of
 /// [`crate::edit::parse_input`] (paste conversions are not the typed-entry
-/// rules yet), except that a leading `'` is Excel's text marker — the rest is
-/// text and the xf gets `quotePrefix` — and a plain field clears a quote
-/// prefix it lands on. So a copied `'007` pastes back as the text `007`.
+/// rules yet), except for two typed-entry rules. A Text-formatted target
+/// takes the field exactly as it is; elsewhere a leading `'` is Excel's text
+/// marker — the rest is text and the xf gets `quotePrefix` — and a plain
+/// field clears a quote prefix it lands on. So a copied `'007` pastes back as
+/// the text `007`, and `''abc` (how a text beginning with `'` is copied) as
+/// `'abc`.
 pub fn paste_cell(styles: &mut Styles, style: u32, text: &str) -> Cell {
-    let (cell, quote_prefix) = match text.strip_prefix('\'') {
-        Some(rest) => (Cell::text(rest), true),
-        None => (crate::edit::parse_input(text), false),
+    let (cell, quote_prefix) = if is_text(&styles.xf(style)) {
+        (Cell::text(text), false)
+    } else {
+        match text.strip_prefix('\'') {
+            Some(rest) => (Cell::text(rest), true),
+            None => (crate::edit::parse_input(text), false),
+        }
     };
     let e = Entry {
         cell,
@@ -310,16 +328,24 @@ pub fn paste_cell(styles: &mut Styles, style: u32, text: &str) -> Cell {
     Cell { style, ..e.cell }
 }
 
-/// Does the editor show this cell's text with its entry apostrophe?
-pub fn shows_quote_prefix(cell: &Cell, xf: &Xf) -> bool {
-    xf.quote_prefix && cell.formula.is_none() && matches!(cell.value, CellValue::Text(_))
+/// Does the text the editor starts from (and a copy carries) need a leading
+/// `'` so that entering it again gives back the same cell? For a
+/// quote-prefixed text, and for a text that itself begins with `'` in a cell
+/// that is not Text-formatted — entered bare, its own `'` would be taken as
+/// the marker and dropped. A Text cell takes an entry as typed, so it never
+/// needs one.
+pub fn needs_apostrophe(cell: &Cell, xf: &Xf) -> bool {
+    let CellValue::Text(s) = &cell.value else {
+        return false;
+    };
+    cell.formula.is_none() && (xf.quote_prefix || (s.starts_with('\'') && !is_text(xf)))
 }
 
 /// The text the editor and formula bar show for a cell: [`crate::edit::input_text_of`]
-/// with the apostrophe of a quote-prefixed text put back.
+/// with a leading `'` where [`needs_apostrophe`] says re-entering needs one.
 pub fn input_text_styled(cell: &Cell, xf: &Xf) -> String {
     let text = crate::edit::input_text_of(cell);
-    if shows_quote_prefix(cell, xf) {
+    if needs_apostrophe(cell, xf) {
         format!("'{text}")
     } else {
         text
@@ -1140,6 +1166,74 @@ mod tests {
             let cells = entry_range(wb, 0, (0, 3, 1, 3), (0, 3), text, None).unwrap();
             assert_eq!(cells[1].2.formula.as_deref(), Some(want), "{text}");
         }
+    }
+
+    #[test]
+    fn a_text_starting_with_an_apostrophe_survives_seed_copy_and_paste() {
+        let mut styles = Styles::default();
+        let general = styles.intern(Xf::default());
+        let text_fmt = styles.intern(Xf {
+            numfmt: NumFmt::Text,
+            code: Some("@".into()),
+            ..Xf::default()
+        });
+        let loaded = Cell::text("'abc");
+        // General, no prefix: the seed escapes it, and both re-entry and
+        // paste give back 'abc.
+        let seed = input_text_styled(&loaded, &Xf::default());
+        assert_eq!(seed, "''abc");
+        let typed = parse_entry(&seed, &Xf::default(), &ctx()).unwrap();
+        assert_eq!(typed.cell.value, CellValue::Text("'abc".into()));
+        assert_eq!(
+            paste_cell(&mut styles, general, &seed).value,
+            CellValue::Text("'abc".into())
+        );
+        // A Text cell needs no escape, and a paste into one is as typed.
+        let in_text = Cell {
+            style: text_fmt,
+            ..loaded.clone()
+        };
+        let seed = input_text_styled(&in_text, &styles.xf(text_fmt));
+        assert_eq!(seed, "'abc");
+        let pasted = paste_cell(&mut styles, text_fmt, &seed);
+        assert_eq!(pasted.value, CellValue::Text("'abc".into()));
+        assert!(!styles.xf(pasted.style).quote_prefix);
+        assert_eq!(
+            paste_cell(&mut styles, text_fmt, "007").value,
+            CellValue::Text("007".into())
+        );
+    }
+
+    #[test]
+    fn reentry_divides_a_percent_only_when_the_edited_text_showed_it() {
+        let mut styles = Styles::default();
+        let pct = styles.intern(Xf {
+            numfmt: NumFmt::Percent { decimals: 0 },
+            code: Some("0%".into()),
+            ..Xf::default()
+        });
+        let cell = Cell {
+            style: pct,
+            ..Cell::number(1.5)
+        };
+        let n = |old: &str, new: &str, styles: &mut Styles| match reenter_cell(
+            &cell,
+            styles,
+            &ctx(),
+            old,
+            new,
+        )
+        .unwrap()
+        .value
+        {
+            CellValue::Number(n) => n,
+            other => panic!("{other:?}"),
+        };
+        // Input text (xlsxy / wb.replace-all): the plain value.
+        assert!(close(n("1.5", "1.6", &mut styles), 1.6));
+        // Display text (the suite): with and without its %.
+        assert!(close(n("150%", "160%", &mut styles), 1.6));
+        assert!(close(n("150%", "150", &mut styles), 1.5));
     }
 
     #[test]

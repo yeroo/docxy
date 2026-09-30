@@ -583,6 +583,37 @@ fn replace_keeps_a_quote_prefixed_entry_text() {
     v.commit_edit();
     assert!(v.replace_in_cell(3, 0, "5", "6"));
     assert_eq!(value(&v, 3, 0), CellValue::Number(1.6));
+    // Removing the % reads 160 as typed into a percent cell: 160%, not 16000%.
+    assert!(v.replace_in_cell(3, 0, "%", ""));
+    assert_eq!(value(&v, 3, 0), CellValue::Number(1.6));
+    // A text beginning with ' (no prefix) keeps its apostrophe.
+    put(&mut v, 4, 0, Cell::text("'abc"));
+    assert!(v.replace_in_cell(4, 0, "abc", "xyz"));
+    assert_eq!(value(&v, 4, 0), CellValue::Text("'xyz".into()));
+}
+
+#[test]
+fn a_date_showing_hashes_is_not_found_or_replaced() {
+    let mut v = view();
+    let date = v.pkg.workbook.styles.intern(Xf {
+        numfmt: gridcore::sheet::NumFmt::Date,
+        code: Some("m/d/yyyy".into()),
+        ..Xf::default()
+    });
+    put(
+        &mut v,
+        0,
+        0,
+        Cell {
+            style: date,
+            ..Cell::number(-1.0)
+        },
+    );
+    assert_eq!(v.cell_text(0, 0), "########");
+    assert_eq!(v.search_text(0, 0), "");
+    assert_eq!(v.find_match("#", false), None);
+    assert!(!v.replace_in_cell(0, 0, "#", ""));
+    assert_eq!(value(&v, 0, 0), CellValue::Number(-1.0));
 }
 
 #[test]
@@ -611,10 +642,12 @@ fn find_and_replace_search_the_same_text() {
     ] {
         assert_eq!(v.find_match(q, false), Some(cell), "{q}");
     }
-    // A formula's result is not its search text (Look in: Formulas).
+    // A formula's result is not its search text: from row 3 the scan passes
+    // =1+1 (whose result is 2) and wraps round to the date's 2024.
+    select(&mut v, 2, 0);
     assert_eq!(
-        v.find_match("2", false).map(|m| m.0),
-        Some(0),
+        v.find_match("2", false),
+        Some((0, 0)),
         "the date's 2024, not =1+1's 2"
     );
     // Replace inside the display of a date and a percent keeps working.
