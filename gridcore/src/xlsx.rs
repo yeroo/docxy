@@ -1182,75 +1182,29 @@ fn cell_xf_elements(xml: &str) -> Vec<&str> {
 }
 
 /// The raw `<font>` elements of `<fonts>`, in order (a `<dxf>`'s `<font>`
-/// lives outside `<fonts>` and is not one of them).
+/// lives outside `<fonts>` and is not one of them). Read with the loader's
+/// parser ([`element_children`]), so comments and prefixes are no trouble.
 fn font_elements(xml: &str) -> Vec<&str> {
-    let Some(start) = xml.find("<fonts") else {
+    let Some(start) = xml
+        .find("<fonts")
+        .filter(|&s| xml[s + 6..].starts_with([' ', '>', '/', '\t', '\r', '\n']))
+    else {
         return Vec::new();
     };
-    let open_end = xml[start..].find('>').map_or(xml.len(), |e| start + e + 1);
-    if xml[..open_end].ends_with("/>") {
-        return Vec::new();
-    }
-    let end = xml[open_end..]
-        .find("</fonts>")
-        .map_or(xml.len(), |e| open_end + e);
-    let body = &xml[open_end..end];
-    let mut out = Vec::new();
-    let mut i = 0;
-    while let Some(p) = body[i..].find("<font") {
-        let s = i + p;
-        if !body[s + 5..].starts_with([' ', '/', '>', '\t', '\r', '\n']) {
-            i = s + 5;
-            continue;
-        }
-        let Some(tag_end) = body[s..].find('>').map(|e| s + e + 1) else {
-            break;
-        };
-        let e = if body[..tag_end].ends_with("/>") {
-            tag_end
-        } else {
-            body[tag_end..]
-                .find("</font>")
-                .map_or(body.len(), |x| tag_end + x + 7)
-        };
-        out.push(&body[s..e]);
-        i = e;
-    }
-    out
+    let fonts = &xml[start..];
+    element_children(fonts)
+        .into_iter()
+        .filter(|(name, _, _)| name == "font")
+        .map(|(_, s, e)| &fonts[s..e])
+        .collect()
 }
 
 /// The child elements of one raw element, as (local name, raw element).
 fn child_elements(raw: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let open_end = raw.find('>').map_or(raw.len(), |e| e + 1);
-    if raw[..open_end].ends_with("/>") {
-        return out;
-    }
-    let body_end = raw.rfind("</").unwrap_or(raw.len()).max(open_end);
-    let body = &raw[open_end..body_end];
-    let mut i = 0;
-    while let Some(p) = body[i..].find('<') {
-        let s = i + p;
-        let Some(tag_end) = body[s..].find('>').map(|e| s + e + 1) else {
-            break;
-        };
-        let qname: String = body[s + 1..]
-            .chars()
-            .take_while(|c| !c.is_whitespace() && *c != '/' && *c != '>')
-            .collect();
-        let e = if body[..tag_end].ends_with("/>") {
-            tag_end
-        } else {
-            let close = format!("</{qname}>");
-            body[tag_end..]
-                .find(&close)
-                .map_or(body.len(), |x| tag_end + x + close.len())
-        };
-        let name = qname.rsplit(':').next().unwrap_or(&qname).to_string();
-        out.push((name, body[s..e].to_string()));
-        i = e;
-    }
-    out
+    element_children(raw)
+        .into_iter()
+        .map(|(name, s, e)| (name, raw[s..e].to_string()))
+        .collect()
 }
 
 /// A loaded `<font>` with only the children an edit changed rewritten: its
@@ -8530,6 +8484,34 @@ b",
         assert_eq!(attr(i, "borderId"), Some(nb.to_string()));
         assert!(saved.workbook.styles.xf(i as u32).bold);
         assert!(xfs[i].contains("vertical=\"top\""));
+    }
+
+    #[test]
+    fn a_font_edit_reads_fonts_with_comments_in_them() {
+        // A commented-out font among the `<fonts>`, and a comment inside the
+        // edited one that looks like its end tag.
+        let styles = concat!(
+            "<styleSheet><fonts count=\"2\"><!-- <font><b/></font> -->",
+            "<font><sz val=\"11\"/></font>",
+            "<font><!-- </font> --><u/><sz val=\"11\"/><name val=\"Calibri\"/></font>",
+            "</fonts></styleSheet>"
+        );
+        let fonts = font_elements(styles);
+        assert_eq!(fonts.len(), 2);
+        let names: Vec<String> = child_elements(fonts[1])
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, ["u", "sz", "name"]);
+        let to = Xf {
+            bold: true,
+            ..Xf::default()
+        };
+        let out = edit_font(fonts[1], &Xf::default(), &to, |s| format!("{s}"));
+        assert_eq!(
+            out,
+            "<font><b/><u/><sz val=\"11\"/><name val=\"Calibri\"/></font>"
+        );
     }
 
     #[test]
