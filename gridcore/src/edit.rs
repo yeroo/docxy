@@ -1200,9 +1200,14 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
     // The sheet's autoFilter moves like the area its `_xlnm._FilterDatabase`
     // name holds, so the two keep naming the same cells. Each filter column
     // stays on its data column, or goes with it.
+    // An insert that pushes its far edge off the sheet turns the name into
+    // `#REF!`, so the filter goes too rather than being clamped.
     if let Some(af) = &mut sheet.auto_filter {
         let (r1, c1, r2, c2) = af.range;
-        let moved = if shift.rows {
+        let far = if shift.rows { r2 } else { c2 };
+        let moved = if shift.delta > 0 && point(far, &shift).is_none() {
+            None
+        } else if shift.rows {
             span(r1, r2, &shift).map(|(lo, hi)| (lo, c1, hi, c2))
         } else {
             span(c1, c2, &shift).map(|(lo, hi)| (r1, lo, r2, hi))

@@ -2269,13 +2269,20 @@ impl SheetPackage {
         let refers = |formula: &str| names.iter().any(|s| formula_refers_to_sheet(formula, s));
         if let Some(p) = self.parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
+            // A `localSheetId` that names no model sheet was loaded as a
+            // global name; that model entry goes with its element too, or the
+            // save would write it back (as a plain name) for having none.
+            let sheet_count = self.workbook.sheets.len();
+            let aligned = xml.matches("<sheet ").count() == sheet_count;
+            let demoted = |s: Option<usize>| s.is_some_and(|k| !aligned || k >= sheet_count);
             let (xml, gone) = remove_macro_names(&xml, &refers);
             p.1 = xml.into_bytes();
             self.workbook.defined_names.retain(|d| {
                 !refers(&d.formula)
-                    && !gone
-                        .iter()
-                        .any(|(n, s)| *s == d.scope && n.eq_ignore_ascii_case(&d.name))
+                    && !gone.iter().any(|(n, s)| {
+                        (*s == d.scope || (d.scope.is_none() && demoted(*s)))
+                            && n.eq_ignore_ascii_case(&d.name)
+                    })
             });
         }
         for &i in doomed.iter().rev() {
@@ -3336,8 +3343,7 @@ fn element_children(xml: &str) -> Vec<(String, usize, usize)> {
             Event::Start => {
                 depth += 1;
                 if depth == 2 {
-                    let start = xml[..p.pos()].rfind('<').unwrap_or(0);
-                    open = Some((local(p.name()).to_string(), start));
+                    open = Some((local(p.name()).to_string(), p.start_pos()));
                 }
             }
             Event::End => {
@@ -4396,8 +4402,7 @@ fn patch_defined_names(xml: &str, names: &[DefinedName], sheet_count: usize) -> 
                     (2, "definedNames") => {
                         let end = p.pos();
                         if xml[..end].ends_with("/>") {
-                            let start = xml[..end].rfind('<').unwrap_or(end);
-                            names_close = Some((start, end, prefix, true));
+                            names_close = Some((p.start_pos(), end, prefix, true));
                         }
                     }
                     (_, "definedName") => {
@@ -12940,6 +12945,36 @@ mod print_setup_tests {
             names_el(&wb),
             format!("<definedNames>{PRINT_NAMES}</definedNames>")
         );
+    }
+
+    #[test]
+    fn an_insert_pushing_the_auto_filter_off_the_sheet_drops_it_with_its_name() {
+        type Edit = fn(&mut Workbook);
+        // (filter ref, name, edit): the far edge is the sheet's last row/column.
+        let cases: [(&str, &str, Edit); 2] = [
+            ("A2:C1048576", "Report!$A$2:$C$1048576", |w| {
+                insert_rows(w, 0, 0, 1)
+            }),
+            ("A2:XFD9", "Report!$A$2:$XFD$9", |w| insert_cols(w, 0, 0, 1)),
+        ];
+        for (r, name, edit) in cases {
+            let names = format!(
+                r#"<definedName name="_xlnm._FilterDatabase" localSheetId="0" hidden="1">{name}</definedName>"#
+            );
+            let (ws, wb) = edited(&names, &format!(r#"<autoFilter ref="{r}"/>"#), edit);
+            assert!(!ws.contains("autoFilter"), "{r}: {ws}");
+            assert_eq!(filter_db(&wb), "Report!#REF!", "{r}");
+        }
+    }
+
+    #[test]
+    fn a_stripped_macro_name_with_a_stray_scope_stays_out_of_a_macro_free_save() {
+        let names = r#"<definedName name="Fn" xlm="1" localSheetId="5">Report!$A$1</definedName>"#;
+        let pkg = report(names, "");
+        let re = load_xlsx(&save_xlsx_as(&pkg, SpreadsheetKind::Workbook)).unwrap();
+        let wb = String::from_utf8_lossy(re.part("xl/workbook.xml").unwrap()).into_owned();
+        assert!(!wb.contains(r#"name="Fn""#), "{wb}");
+        assert!(re.workbook.defined_names.is_empty());
     }
 }
 

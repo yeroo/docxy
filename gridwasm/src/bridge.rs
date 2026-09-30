@@ -2174,12 +2174,12 @@ impl Session {
     /// scoped to the removed sheet — all captured by `ctl_sheet_remove`
     /// just before deletion. Defined names are re-inserted with `scope`
     /// re-pointed at the restored sheet's NEW index (their old index may no
-    /// longer even exist). This restores the LIVE, in-memory session
-    /// correctly; whether a defined-name write survives a subsequent
-    /// `save`/reload round trip is a separate, pre-existing concern (the
-    /// xlsx byte-preservation gap list already flags named-range writes as
-    /// unverified repo-wide — this restore doesn't newly introduce that
-    /// gap, just inherits it). The stash is single-slot — a second
+    /// longer even exist). They also survive a `save`: gridcore writes a
+    /// model name that has no `<definedName>` element (the restored ones lost
+    /// theirs to `remove_sheet`). The restored sheet's autoFilter and its
+    /// `_xlnm._FilterDatabase` are not recreated, though: the sheet gets a
+    /// fresh part with no `<autoFilter>`, and a save never adds one or the
+    /// name that backs it. The stash is single-slot — a second
     /// `sheet.remove` overwrites it, and a successful restore takes
     /// (clears) it via `Option::take` — so calling this with nothing
     /// stashed errors (`"nothing to restore"`).
