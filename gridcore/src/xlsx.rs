@@ -7772,6 +7772,18 @@ mod tests {
             "{xml}"
         );
     }
+
+    #[test]
+    fn loaded_numbers_keep_every_digit() {
+        // #655: only typed entry truncates to 15 digits; a number read from a
+        // file keeps its full double.
+        let rows = r#"<row r="1"><c r="A1"><v>1234567890123456789</v></c></row>"#;
+        let pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(0, 0).unwrap().value,
+            crate::sheet::CellValue::Number(1234567890123456789.0)
+        );
+    }
 }
 
 #[cfg(test)]

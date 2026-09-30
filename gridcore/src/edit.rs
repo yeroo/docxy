@@ -27,17 +27,17 @@ pub fn parse_input(text: &str) -> Cell {
         return Cell::default();
     }
     let t = text.trim();
-    if let Ok(n) = t.parse::<f64>() {
-        if n.is_finite() {
-            return Cell::number(n);
-        }
+    if let Some(n) = entry_number(t) {
+        return match n {
+            Some(n) => Cell::number(n),
+            None => Cell::text(text),
+        };
     }
     if let Some(pct) = t.strip_suffix('%') {
-        if let Ok(n) = pct.trim().parse::<f64>() {
-            let v = n / 100.0;
-            if v.is_finite() {
-                return Cell::number(v);
-            }
+        match entry_number(pct.trim()) {
+            Some(Some(n)) => return Cell::number(n / 100.0),
+            Some(None) => return Cell::text(text),
+            None => {}
         }
     }
     if t.eq_ignore_ascii_case("TRUE") {
@@ -59,6 +59,28 @@ pub fn parse_input(text: &str) -> Cell {
         };
     }
     Cell::text(text)
+}
+
+/// A typed number the way Excel keeps it: `None` when `t` is not a number at
+/// all, `Some(None)` when it is one Excel cannot store (beyond
+/// 9.99999999999999E+307, or non-zero below 2.2250738585072E-308) and keeps
+/// as text, else the value with digits past the fifteenth significant one
+/// zeroed.
+fn entry_number(t: &str) -> Option<Option<f64>> {
+    // `f64::from_str` also takes "inf" and "NaN"; a typed number has digits.
+    if t.parse::<f64>().is_err() || !t.bytes().any(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: f64 = crate::formula::truncate_15(t).parse().ok()?;
+    let nonzero_digits = t
+        .split(['e', 'E'])
+        .next()
+        .is_some_and(|m| m.bytes().any(|b| (b'1'..=b'9').contains(&b)));
+    let a = n.abs();
+    if !n.is_finite() || a > 9.99999999999999e307 || (nonzero_digits && a < 2.2250738585072e-308) {
+        return Some(None);
+    }
+    Some(Some(n))
 }
 
 /// The text a cell would show in the formula bar (`=formula`, or the value
@@ -2052,5 +2074,33 @@ mod tests {
         };
         sheet.set_cell(0, 0, Cell::text("nothing to see"));
         assert!(replace_all_in_sheet(&sheet, "zzz", "y").is_empty());
+    }
+
+    #[test]
+    fn typed_numbers_keep_fifteen_digits_and_excel_limits() {
+        // #655: Excel truncates a typed number past 15 significant digits and
+        // keeps out-of-range numbers as text.
+        let num = |t: &str| match parse_input(t).value {
+            CellValue::Number(n) => n,
+            v => panic!("{t} → {v:?}"),
+        };
+        assert_eq!(num("1234567890123456789"), 1234567890123450000.0);
+        assert_eq!(num("1234567890123456"), 1234567890123450.0);
+        assert_eq!(num("12345678901234567"), 12345678901234500.0);
+        assert_eq!(num("-1234567890123456789"), -1234567890123450000.0);
+        assert_eq!(num("0.1234567890123456789"), 0.123456789012345);
+        assert_eq!(num("0.000123456789012345678"), 0.000123456789012345);
+        assert_eq!(num("1.23456789012345678E+20"), 1.23456789012345e20);
+        assert_eq!(num("12345678901234567%"), 123456789012345.0);
+        assert_eq!(num("9.99999999999999E+307"), 9.99999999999999e307);
+        assert_eq!(num("0"), 0.0);
+        assert_eq!(num("0E+5"), 0.0);
+        assert_eq!(num("  42 "), 42.0);
+        for t in ["1E+308", "1E-400", "-1E+308", "1E-310"] {
+            assert_eq!(parse_input(t).value, CellValue::Text(t.into()), "{t}");
+        }
+        // Not numbers at all: unchanged.
+        assert_eq!(parse_input("inf").value, CellValue::Text("inf".into()));
+        assert_eq!(parse_input("NaN").value, CellValue::Text("NaN".into()));
     }
 }

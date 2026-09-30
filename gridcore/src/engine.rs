@@ -820,7 +820,7 @@ pub fn eval_formula_at(wb: &Workbook, sheet: usize, row: u32, col: u32, src: &st
                 has_rand: false,
             };
             let mut ev = Eval::new(&resolver, sheet, (row, col));
-            ev.eval(&ast)
+            ev.eval_formula(&ast)
         }
         Err(_) => Value::Err(ExcelError::Name),
     }

@@ -680,6 +680,34 @@ fn render_date(sect: &Section, serial: f64, date1904: bool) -> String {
     out
 }
 
+/// The integer and fraction digits of `x.abs()` rounded to 15 significant
+/// digits, as exact decimal strings: 1234567890123450112 gives
+/// ("1234567890123450000", ""), 0.1 gives ("0", "1"). The integer part never
+/// saturates, however large `x` is.
+fn sig15_digits(x: f64) -> (String, String) {
+    let x = x.abs();
+    if x == 0.0 || !x.is_finite() {
+        return ("0".into(), String::new());
+    }
+    let sci = format!("{x:.14e}");
+    let (mant, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    let digits: String = mant.chars().filter(char::is_ascii_digit).collect();
+    let digits = digits.trim_end_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    if exp >= 0 {
+        let int_len = exp as usize + 1;
+        if digits.len() <= int_len {
+            (format!("{digits:0<int_len$}"), String::new())
+        } else {
+            (digits[..int_len].to_string(), digits[int_len..].to_string())
+        }
+    } else {
+        let zeros = (-exp - 1) as usize;
+        ("0".into(), format!("{}{digits}", "0".repeat(zeros)))
+    }
+}
+
 fn render_number(sect: &Section, x: f64, explicit_sign: bool) -> String {
     let mut v = x;
     if sect.has_percent {
@@ -705,8 +733,8 @@ fn render_number(sect: &Section, x: f64, explicit_sign: bool) -> String {
         let f = 10f64.powi(sect.dec_digits as i32);
         (v.abs() * f).round() / f
     };
-    let int_part = rounded.trunc() as u64;
-    let frac = rounded.fract();
+    // Excel shows at most 15 significant digits; the rest print as zeros.
+    let (int_digits, frac_all) = sig15_digits(rounded);
 
     // Integer digits, distributed right-to-left over placeholders. With a
     // zero integer part, only a forcing placeholder (0 or ?) prints anything:
@@ -715,10 +743,10 @@ fn render_number(sect: &Section, x: f64, explicit_sign: bool) -> String {
     let int_forced = sect.toks.iter().enumerate().any(|(i, t)| {
         matches!(t, Tok::Digit('0') | Tok::Digit('?')) && point_pos.map(|p| i < p).unwrap_or(true)
     });
-    let int_str = if int_part == 0 && !int_forced {
+    let int_str = if int_digits == "0" && !int_forced {
         String::new()
     } else {
-        int_part.to_string()
+        int_digits
     };
     let grouped = |s: &str| -> String {
         if !sect.grouping {
@@ -738,9 +766,11 @@ fn render_number(sect: &Section, x: f64, explicit_sign: bool) -> String {
     // Fraction digits, left-to-right.
     let mut frac_digits = Vec::new();
     if sect.dec_digits > 0 {
-        let scaled = (frac * 10f64.powi(sect.dec_digits as i32)).round() as u64;
-        let s = format!("{:0>width$}", scaled, width = sect.dec_digits);
-        frac_digits = s.chars().collect();
+        frac_digits = frac_all
+            .chars()
+            .chain(std::iter::repeat('0'))
+            .take(sect.dec_digits)
+            .collect();
     }
 
     // Walk tokens, emitting digits into placeholders.

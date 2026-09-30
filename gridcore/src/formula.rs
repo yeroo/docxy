@@ -440,7 +440,7 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 let text = std::str::from_utf8(&self.src[start..self.pos]).unwrap_or("");
-                match text.parse::<f64>() {
+                match truncate_15(text).parse::<f64>() {
                     Ok(n) => Tok::Num(n),
                     Err(_) => return Err(format!("bad number {text}")),
                 }
@@ -2521,7 +2521,55 @@ impl<'a> Eval<'a> {
     }
 
     pub fn eval(&mut self, e: &Expr) -> Value {
-        match self.eval_arg(e) {
+        let arg = self.eval_arg(e);
+        self.arg_value(arg)
+    }
+
+    /// Evaluate a whole formula to a scalar: [`Self::eval`] plus Excel's
+    /// near-zero snap of a final addition or subtraction (see
+    /// [`Self::eval_root`]).
+    pub fn eval_formula(&mut self, e: &Expr) -> Value {
+        let arg = self.eval_root(e);
+        self.arg_value(arg)
+    }
+
+    /// Evaluate a formula's root expression. When the root operation is `+`
+    /// or `-` on two scalars and the result is within 2^-50 of the larger
+    /// operand's magnitude, it is exactly 0, as in Excel: `=0.1+0.2-0.3` is
+    /// 0, while `=1*(0.1+0.2-0.3)` keeps the binary residue. Parentheses
+    /// leave no node, so `=(0.1+0.2-0.3)` snaps too.
+    fn eval_root(&mut self, e: &Expr) -> Arg {
+        let Expr::Bin(op @ (BinOp::Add | BinOp::Sub), l, r) = e else {
+            return self.eval_arg(e);
+        };
+        let lv = self.eval_arg(l);
+        let rv = self.eval_arg(r);
+        let operands = self.scalar_num(&lv).zip(self.scalar_num(&rv));
+        let out = self.broadcast_bin(*op, lv, rv);
+        match (operands, &out) {
+            (Some((a, b)), Arg::Scalar(Value::Num(x)))
+                if *x != 0.0 && x.abs() < a.abs().max(b.abs()) * 2f64.powi(-50) =>
+            {
+                Arg::Scalar(Value::Num(0.0))
+            }
+            _ => out,
+        }
+    }
+
+    /// The number a scalar argument (or a single-cell range) coerces to.
+    fn scalar_num(&self, a: &Arg) -> Option<f64> {
+        match a {
+            Arg::Scalar(v) => to_num(v).ok(),
+            Arg::Range(s, r1, c1, r2, c2) if r1 == r2 && c1 == c2 => {
+                to_num(&self.res.value(*s, *r1, *c1)).ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// An evaluated argument in scalar context.
+    fn arg_value(&mut self, arg: Arg) -> Value {
+        match arg {
             Arg::Scalar(v) => v,
             // A bare range in scalar context (legacy implicit intersection):
             // a 1×1 range collapses; anything else is #VALUE!.
@@ -2557,7 +2605,7 @@ impl<'a> Eval<'a> {
     /// **implicit intersection** to the value on the formula's own row/column,
     /// exactly as pre-dynamic-array Excel does, instead of spilling.
     pub fn eval_dynamic_as(&mut self, e: &Expr, spill: bool) -> DynResult {
-        match self.eval_arg(e) {
+        match self.eval_root(e) {
             Arg::Scalar(v) => DynResult::Scalar(v),
             Arg::Range(s, r1, c1, r2, c2) => {
                 let (r1, c1, r2, c2) = self.clamp_huge(s, r1, c1, r2, c2);
@@ -4637,6 +4685,60 @@ pub fn to_bool(v: &Value) -> Result<bool, ExcelError> {
 
 /// Excel's comparison: case-insensitive text; cross-type ordering
 /// Number < Text < Logical; empty coerces to the other side's zero value.
+/// Compare two numbers the way Excel does: equal when they agree to 15
+/// significant digits (`0.1+0.2` equals `0.3`), ordered by value otherwise.
+/// The formatting round-trip only runs for numbers already within 1e-14 of
+/// each other, so sorts and lookups stay cheap.
+pub(crate) fn cmp_15(x: f64, y: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if x == y {
+        return Ordering::Equal;
+    }
+    let ord = x.partial_cmp(&y).unwrap_or(Ordering::Equal);
+    if (x - y).abs() > x.abs().max(y.abs()) * 1e-14 {
+        return ord;
+    }
+    if round_15(x) == round_15(y) {
+        Ordering::Equal
+    } else {
+        ord
+    }
+}
+
+/// `x` rounded to 15 significant decimal digits.
+pub(crate) fn round_15(x: f64) -> f64 {
+    if x == 0.0 || !x.is_finite() {
+        return x;
+    }
+    format!("{x:.14e}").parse().unwrap_or(x)
+}
+
+/// A numeric literal (`123`, `-1.5e+20`) with every significant digit past the
+/// fifteenth replaced by 0, as Excel keeps typed numbers: truncation, not
+/// rounding. Text that is not a plain decimal literal is returned unchanged.
+pub fn truncate_15(text: &str) -> String {
+    let (mant, exp) = match text.find(['e', 'E']) {
+        Some(i) => text.split_at(i),
+        None => (text, ""),
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut sig = 0usize;
+    for ch in mant.chars() {
+        if ch.is_ascii_digit() {
+            if sig == 0 && ch == '0' {
+                out.push(ch);
+            } else {
+                sig += 1;
+                out.push(if sig > 15 { '0' } else { ch });
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push_str(exp);
+    out
+}
+
 pub(crate) fn compare(a: &Value, b: &Value) -> Result<std::cmp::Ordering, ExcelError> {
     use std::cmp::Ordering;
     if let Value::Err(e) = a {
@@ -4660,7 +4762,7 @@ pub(crate) fn compare(a: &Value, b: &Value) -> Result<std::cmp::Ordering, ExcelE
         _ => (a.clone(), b.clone()),
     };
     Ok(match (&a2, &b2) {
-        (Value::Num(x), Value::Num(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Value::Num(x), Value::Num(y)) => cmp_15(*x, *y),
         (Value::Str(x), Value::Str(y)) => {
             let xl = x.to_lowercase();
             let yl = y.to_lowercase();
@@ -12739,5 +12841,91 @@ mod tests {
         assert_eq!(n("COLUMNS(A:C)", &g), 3.0);
         assert_eq!(n("ROWS(A:A)", &g), crate::sheet::MAX_ROWS as f64);
         assert_eq!(eval_str("ROWS(1/0)", &g), Value::Err(ExcelError::Div0));
+    }
+
+    #[test]
+    fn fifteen_digit_compare_and_root_snap() {
+        // #655: numbers compare equal at 15 significant digits, and a final
+        // + or - that cancels to binary noise is 0.
+        let g = empty();
+        assert_eq!(eval_str("0.1+0.2=0.3", &g), Value::Bool(true));
+        assert_eq!(eval_str("0.03=(1.05-1.02)", &g), Value::Bool(true));
+        assert_eq!(eval_str("0.1+0.2<>0.3", &g), Value::Bool(false));
+        assert_eq!(eval_str("0.1+0.2>0.3", &g), Value::Bool(false));
+        // Different in the 15th significant digit: not equal.
+        assert_eq!(
+            eval_str("1.23456789012345=1.23456789012346", &g),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            eval_str("1.23456789012345<1.23456789012346", &g),
+            Value::Bool(true)
+        );
+        // A literal keeps 15 significant digits, as typed entry does.
+        assert_eq!(
+            eval_str("12345678901234567=12345678901234500", &g),
+            Value::Bool(true)
+        );
+        assert_eq!(n("1234567890123456789", &g), 1234567890123450000.0);
+
+        let top = |src: &str| {
+            let ast = parse(src).unwrap();
+            let mut ev = Eval::new(&g, 0, (0, 0));
+            match ev.eval_dynamic_as(&ast, true) {
+                DynResult::Scalar(Value::Num(x)) => x,
+                DynResult::Scalar(v) => panic!("{src} → {v:?}"),
+                DynResult::Array(_) => panic!("{src} → array"),
+            }
+        };
+        assert_eq!(top("0.7-0.6-0.1"), 0.0);
+        assert_eq!(top("0.1+0.2-0.3"), 0.0);
+        assert_eq!(top("(0.1+0.2-0.3)"), 0.0);
+        // Only the root operation snaps: 1*(…) keeps the residue.
+        let residue = top("1*(0.7-0.6-0.1)");
+        assert!(
+            residue != 0.0 && (residue + 2.78e-17).abs() < 1e-18,
+            "{residue}"
+        );
+        // A genuine difference far above the noise is kept.
+        assert_eq!(top("1E15+1-1E15"), 1.0);
+        assert_eq!(top("3-1"), 2.0);
+        // formula.eval's path (eval_formula) snaps too; plain eval does not.
+        let ast = parse("0.1+0.2-0.3").unwrap();
+        assert_eq!(Eval::new(&g, 0, (0, 0)).eval_formula(&ast), Value::Num(0.0));
+        assert_ne!(Eval::new(&g, 0, (0, 0)).eval(&ast), Value::Num(0.0));
+        // A single-cell reference operand counts as a scalar.
+        let g2 = Grid::new(&[("A1", Value::Num(0.3))]);
+        let ast = parse("0.1+0.2-A1").unwrap();
+        assert_eq!(
+            Eval::new(&g2, 0, (5, 5)).eval_formula(&ast),
+            Value::Num(0.0)
+        );
+    }
+
+    #[test]
+    fn text_shows_fifteen_significant_digits() {
+        // #655: TEXT prints at most 15 significant digits and does not
+        // saturate large integer parts.
+        let g = Grid::new(&[("M1", Value::Num(1234567890123450000.0))]);
+        let t = |src: &str| match eval_str(src, &g) {
+            Value::Str(s) => s,
+            v => panic!("{src} → {v:?}"),
+        };
+        assert_eq!(t("TEXT(M1,\"0\")"), "1234567890123450000");
+        assert_eq!(t("TEXT(1234567890123456789,\"0\")"), "1234567890123450000");
+        assert_eq!(t("TEXT(1.23456789012345E+18,\"0\")"), "1234567890123450000");
+        assert_eq!(t("TEXT(1E+25,\"0\")"), "10000000000000000000000000");
+        assert_eq!(
+            t("TEXT(1E+25,\"#,##0\")"),
+            "10,000,000,000,000,000,000,000,000"
+        );
+        assert_eq!(
+            t("TEXT(0.1+0.2,\"0.00000000000000000\")"),
+            "0.30000000000000000"
+        );
+        assert_eq!(t("TEXT(1234.5,\"#,##0.00\")"), "1,234.50");
+        assert_eq!(t("TEXT(0.5,\"0.0\")"), "0.5");
+        assert_eq!(t("TEXT(0.5,\"#.#\")"), ".5");
+        assert_eq!(t("TEXT(-2.25,\"0.0\")"), "-2.3");
     }
 }
