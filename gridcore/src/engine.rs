@@ -1189,6 +1189,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rows_and_columns_of_randarray() {
+        // #661: ROWS/COLUMNS of a computed (random) array.
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::formula("ROWS(RANDARRAY(3,2))")),
+            ("A2", Cell::formula("COLUMNS(RANDARRAY(3,2))")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.seed = Some(7);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "A1"), CellValue::Number(3.0));
+        assert_eq!(value_at(&wb, "A2"), CellValue::Number(2.0));
+    }
+
     // ---- dynamic arrays / spilling ------------------------------------
 
     #[test]

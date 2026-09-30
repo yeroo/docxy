@@ -6692,6 +6692,7 @@ impl<'a> Eval<'a> {
                 [Expr::Ref(_)] => Value::Num(1.0),
                 [Expr::ColRange { .. }] => Value::Num(crate::sheet::MAX_ROWS as f64),
                 [Expr::RowRange { r1, r2, .. }] => Value::Num((r1 - r2).abs() as f64 + 1.0),
+                [e] => self.extent_of(e, true),
                 _ => Value::Err(ExcelError::Value),
             },
             "COLUMNS" => match args {
@@ -6699,6 +6700,7 @@ impl<'a> Eval<'a> {
                 [Expr::Ref(_)] => Value::Num(1.0),
                 [Expr::RowRange { .. }] => Value::Num(crate::sheet::MAX_COLS as f64),
                 [Expr::ColRange { c1, c2, .. }] => Value::Num((c1 - c2).abs() as f64 + 1.0),
+                [e] => self.extent_of(e, false),
                 _ => Value::Err(ExcelError::Value),
             },
             "VLOOKUP" | "HLOOKUP" => {
@@ -9646,6 +9648,27 @@ impl<'a> Eval<'a> {
     /// Shared core of the D-functions: the `field` column's values over every
     /// database row that satisfies the criteria range.
     /// `args` = [database, field, criteria].
+    /// ROWS/COLUMNS of anything that is not a literal reference form: a
+    /// name, table or spill reference gives its extent, a computed array its
+    /// dimensions, and a scalar 1.
+    fn extent_of(&mut self, e: &Expr, rows: bool) -> Value {
+        match self.eval_arg(e) {
+            Arg::Range(_, r1, c1, r2, c2) => Value::Num(if rows {
+                (r2 - r1 + 1) as f64
+            } else {
+                (c2 - c1 + 1) as f64
+            }),
+            Arg::Matrix(m) => Value::Num(if rows {
+                m.len() as f64
+            } else {
+                m.first().map_or(0, |r| r.len()) as f64
+            }),
+            Arg::Scalar(Value::Err(e)) => Value::Err(e),
+            Arg::Scalar(_) => Value::Num(1.0),
+            Arg::Lambda(_) => Value::Err(ExcelError::Calc),
+        }
+    }
+
     fn db_query(&mut self, args: &[Expr]) -> Result<Vec<Value>, Value> {
         if args.len() != 3 {
             return Err(Value::Err(ExcelError::Value));
@@ -12675,5 +12698,26 @@ mod tests {
         assert_eq!(eval_str("0^0", &g), Value::Err(ExcelError::Num));
         assert_eq!(n("(-8)^2", &g), 64.0);
         assert_eq!(n("(-2)^3", &g), -8.0);
+    }
+
+    #[test]
+    fn rows_and_columns_of_arrays() {
+        // #661: ROWS/COLUMNS take computed arrays, names and scalars, not only
+        // literal references.
+        let g = Grid::new(&[("A1", Value::Num(1.0))]).with_name("Blk", "Sheet1!$B$2:$D$6");
+        assert_eq!(n("ROWS(SEQUENCE(3))", &g), 3.0);
+        assert_eq!(n("COLUMNS(SEQUENCE(3))", &g), 1.0);
+        // RANDARRAY needs a random source: see the engine's
+        // `rows_and_columns_of_randarray`.
+        assert_eq!(n("ROWS({1,2;3,4})", &g), 2.0);
+        assert_eq!(n("COLUMNS({1,2,3})", &g), 3.0);
+        assert_eq!(n("ROWS(5)", &g), 1.0);
+        assert_eq!(n("ROWS(Blk)", &g), 5.0);
+        assert_eq!(n("COLUMNS(Blk)", &g), 3.0);
+        // The literal reference forms are unchanged.
+        assert_eq!(n("ROWS(A1:A4)", &g), 4.0);
+        assert_eq!(n("COLUMNS(A:C)", &g), 3.0);
+        assert_eq!(n("ROWS(A:A)", &g), crate::sheet::MAX_ROWS as f64);
+        assert_eq!(eval_str("ROWS(1/0)", &g), Value::Err(ExcelError::Div0));
     }
 }
