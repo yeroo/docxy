@@ -623,14 +623,12 @@ impl Editor {
                     Block::Paragraph(p) => para_text_len(p),
                     _ => 0,
                 };
-                let this = match &mut cont[idx] {
-                    Block::Paragraph(p) => std::mem::take(&mut p.content),
-                    _ => Vec::new(),
-                };
-                if let Block::Paragraph(prev) = &mut cont[idx - 1] {
-                    prev.content.extend(this);
+                let gone = cont.remove(idx);
+                if let (Block::Paragraph(prev), Block::Paragraph(gone)) = (&mut cont[idx - 1], gone)
+                {
+                    prev.content.extend(gone.content);
+                    keep_section_mark(&mut prev.props, gone.props);
                 }
-                cont.remove(idx);
                 Some((idx - 1, prev_len))
             }
         };
@@ -671,14 +669,11 @@ impl Editor {
             if idx + 1 >= cont.len() || !matches!(cont.get(idx + 1), Some(Block::Paragraph(_))) {
                 false
             } else {
-                let next = match &mut cont[idx + 1] {
-                    Block::Paragraph(p) => std::mem::take(&mut p.content),
-                    _ => Vec::new(),
-                };
-                if let Block::Paragraph(p) = &mut cont[idx] {
-                    p.content.extend(next);
+                let gone = cont.remove(idx + 1);
+                if let (Block::Paragraph(p), Block::Paragraph(gone)) = (&mut cont[idx], gone) {
+                    p.content.extend(gone.content);
+                    keep_section_mark(&mut p.props, gone.props);
                 }
-                cont.remove(idx + 1);
                 true
             }
         };
@@ -1004,14 +999,18 @@ impl Editor {
                     content_delete(&mut p.content, lo.offset);
                 }
             }
-            // Take the remainder of the last paragraph (after hi.offset).
-            let remainder = if let Some(Block::Paragraph(p)) = cont.get_mut(hii) {
+            // Take the remainder of the last paragraph (after hi.offset),
+            // and its props for the section mark it may carry.
+            let (remainder, last_props) = if let Some(Block::Paragraph(p)) = cont.get_mut(hii) {
                 for _ in 0..hi.offset {
                     content_delete(&mut p.content, 0);
                 }
-                std::mem::take(&mut p.content)
+                (
+                    std::mem::take(&mut p.content),
+                    Some(std::mem::take(&mut p.props)),
+                )
             } else {
-                Vec::new()
+                (Vec::new(), None)
             };
             // Remove everything strictly between (and the now-empty last).
             let removed = (hii + 1).min(cont.len()).saturating_sub(li + 1);
@@ -1023,6 +1022,9 @@ impl Editor {
             // Merge the remainder onto the first paragraph.
             if let Some(Block::Paragraph(p)) = cont.get_mut(li) {
                 p.content.extend(remainder);
+                if let Some(gone) = last_props {
+                    keep_section_mark(&mut p.props, gone);
+                }
             }
             // Then the partners, from the back; those after the range moved
             // up by what it held. The caret's paragraph moves up by the ones
@@ -2774,6 +2776,17 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
             return;
         }
         acc += l;
+    }
+}
+
+/// A merge that removes the paragraph `gone` into `kept`: when `gone` closes
+/// a section, its section mark (the break and its tracked change) ends the
+/// merged paragraph, as in Word, replacing any `kept` had (#748). Otherwise
+/// `kept`'s props stay as they are.
+fn keep_section_mark(kept: &mut ParProps, gone: ParProps) {
+    if gone.section_break.is_some() || gone.section_property_change.is_some() {
+        kept.section_break = gone.section_break;
+        kept.section_property_change = gone.section_property_change;
     }
 }
 
