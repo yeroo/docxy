@@ -9816,6 +9816,50 @@ mod tests {
     }
 
     #[test]
+    fn a_copy_pasted_between_text_and_general_cells_is_the_same_cells() {
+        use gridcore::sheet::Xf;
+        let mut pkg = new_xlsx();
+        let styles = &mut pkg.workbook.styles;
+        let quoted = styles.intern(Xf {
+            quote_prefix: true,
+            ..Xf::default()
+        });
+        let mut text_xf = Xf::default();
+        text_xf.set_code(Some("@".into()));
+        let text_fmt = styles.intern(text_xf);
+        let q007 = Cell {
+            style: quoted,
+            ..Cell::text("007")
+        };
+        let tabc = Cell {
+            style: text_fmt,
+            ..Cell::text("'abc")
+        };
+        let sh = &mut pkg.workbook.sheets[0];
+        sh.set_cell(0, 0, q007.clone());
+        sh.set_cell(0, 1, tabc.clone());
+        sh.set_cell(
+            2,
+            0,
+            Cell {
+                style: text_fmt,
+                ..Cell::default()
+            },
+        );
+        sh.set_cell(2, 1, Cell::text("x"));
+        let mut app = App::new(pkg, "t.xlsx");
+        app.os_clip = None; // the internal clip, as when the OS text is ours
+        app.cur = (0, 0);
+        app.anchor = Some((0, 1));
+        app.copy(false);
+        app.anchor = None;
+        app.cur = (2, 0);
+        app.paste();
+        assert_eq!(app.sheet().cell(2, 0), Some(&q007));
+        assert_eq!(app.sheet().cell(2, 1), Some(&tabc));
+    }
+
+    #[test]
     fn merged_cells_render_spanned() {
         use gridcore::sheet::Cell;
         use ratatui::Terminal;

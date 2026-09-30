@@ -123,6 +123,24 @@ pub struct Session {
     /// verb-name regex that couldn't tell a no-op `autosum`/`cut`/`paste`
     /// (nothing actually changed) from one that mutated.
     edits: u64,
+    /// What this session's last `copy`/`cut` put on the clipboard.
+    clip: Option<GridClip>,
+}
+
+/// A `copy`/`cut`'s cells as they were (formats, formulas, quote prefixes
+/// intact), where they came from, and the TSV handed to the host. A `paste`
+/// of exactly that text pastes these cells, as xlsxy's and the suite's own
+/// clipboards do: the TSV carries no formats, so reading it back as typed
+/// would add or drop an apostrophe between a Text and a General cell. Any
+/// other text is read as typed.
+#[derive(Clone, Debug)]
+struct GridClip {
+    cells: Vec<Vec<Option<Cell>>>,
+    from: (u32, u32),
+    /// A cut: its source is already cleared, and its formulas keep their
+    /// references when pasted (once; later pastes are copies, as in xlsxy).
+    cut: bool,
+    text: String,
 }
 
 impl Session {
@@ -143,6 +161,7 @@ impl Session {
             redo: Vec::new(),
             removed_sheet_stash: None,
             edits: 0,
+            clip: None,
         })
     }
 
@@ -237,9 +256,10 @@ impl Session {
                     self.apply(changes);
                 }
             }
-            "copy" => return Some(self.selection_tsv()),
+            "copy" => return Some(self.record_clip(false)),
             "cut" => {
-                let tsv = self.selection_tsv();
+                // The cells are recorded before the clear below empties them.
+                let tsv = self.record_clip(true);
                 let (ar, ac) = self.anchor.unwrap_or(self.cur);
                 let (r1, r2) = (self.cur.0.min(ar), self.cur.0.max(ar));
                 let (c1, c2) = (self.cur.1.min(ac), self.cur.1.max(ac));
@@ -254,6 +274,9 @@ impl Session {
                 if p.len() == 3 {
                     let (r0, c0): (u32, u32) =
                         (p[0].parse().unwrap_or(0), p[1].parse().unwrap_or(0));
+                    if self.paste_own_clip(r0, c0, p[2]) {
+                        return None;
+                    }
                     // Cap the paste so a hostile/huge clipboard can't lock the
                     // UI in per-cell recalcs (mirrors the TUI's external-paste
                     // guard in xlsxy::main::paste).
@@ -556,6 +579,71 @@ impl Session {
 
     /// The selection as TSV of raw cell sources (formulas as `=...`), rows by
     /// `\n`, cells by `\t` — round-trips through `paste`.
+    /// Record the selection as this session's clip and return its TSV.
+    fn record_clip(&mut self, cut: bool) -> String {
+        let text = self.selection_tsv();
+        let (ar, ac) = self.anchor.unwrap_or(self.cur);
+        let (r1, r2) = (self.cur.0.min(ar), self.cur.0.max(ar));
+        let (c1, c2) = (self.cur.1.min(ac), self.cur.1.max(ac));
+        let sheet = &self.pkg.workbook.sheets[self.active];
+        let cells = (r1..=r2)
+            .map(|r| (c1..=c2).map(|c| sheet.cell(r, c).cloned()).collect())
+            .collect();
+        self.clip = Some(GridClip {
+            cells,
+            from: (r1, c1),
+            cut,
+            text: text.clone(),
+        });
+        text
+    }
+
+    /// Paste this session's own clip at `(r0, c0)` when `text` is what it
+    /// put on the clipboard (the host may hand back CRLF and a trailing line
+    /// break). A copy's formulas move their relative references with the
+    /// paste; a cut's keep them. False when `text` is someone else's.
+    fn paste_own_clip(&mut self, r0: u32, c0: u32, text: &str) -> bool {
+        let text = text.replace("\r\n", "\n");
+        let Some(clip) = self
+            .clip
+            .clone()
+            .filter(|c| c.text == text.trim_end_matches('\n'))
+        else {
+            return false;
+        };
+        let (dr_all, dc_all) = (
+            r0 as i64 - clip.from.0 as i64,
+            c0 as i64 - clip.from.1 as i64,
+        );
+        let mut changes = Vec::new();
+        for (dr, row) in clip.cells.iter().enumerate() {
+            for (dc, cell) in row.iter().enumerate() {
+                let (r, c) = (r0 + dr as u32, c0 + dc as u32);
+                if r >= MAX_ROWS || c >= MAX_COLS {
+                    continue;
+                }
+                let mut cell = cell.clone().unwrap_or_default();
+                if !clip.cut && (dr_all, dc_all) != (0, 0) {
+                    if let Some(f) = &cell.formula {
+                        if let Some(t) = gridcore::formula::translate_formula(f, dr_all, dc_all) {
+                            cell.formula = Some(t);
+                        }
+                    }
+                }
+                let current = self.pkg.workbook.sheets[self.active].cell(r, c);
+                gridcore::sheet::anchor_pasted_array_ref(&mut cell, current, r, c);
+                changes.push((r, c, cell));
+            }
+        }
+        self.apply(changes);
+        if clip.cut {
+            if let Some(c) = self.clip.as_mut() {
+                c.cut = false;
+            }
+        }
+        true
+    }
+
     fn selection_tsv(&self) -> String {
         let (ar, ac) = self.anchor.unwrap_or(self.cur);
         let (r1, r2) = (self.cur.0.min(ar), self.cur.0.max(ar));
@@ -2981,6 +3069,74 @@ mod tests {
         s.dispatch("select\t3\t1");
         let tsv = s.dispatch("copy").expect("copy");
         assert_eq!(tsv, "=SUM(B1:B3)");
+    }
+
+    #[test]
+    fn a_copy_pasted_back_is_the_same_cells_between_text_and_general() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let styles = &mut s.pkg.workbook.styles;
+        let quoted = styles.intern(gridcore::sheet::Xf {
+            quote_prefix: true,
+            ..gridcore::sheet::Xf::default()
+        });
+        let mut text_xf = gridcore::sheet::Xf::default();
+        text_xf.set_code(Some("@".into()));
+        let text_fmt = styles.intern(text_xf);
+        let sh = &mut s.pkg.workbook.sheets[0];
+        let q007 = Cell {
+            style: quoted,
+            ..Cell::text("007")
+        };
+        let tabc = Cell {
+            style: text_fmt,
+            ..Cell::text("'abc")
+        };
+        sh.set_cell(10, 0, q007.clone());
+        sh.set_cell(10, 1, tabc.clone());
+        // Targets of the other kind.
+        sh.set_cell(
+            12,
+            0,
+            Cell {
+                style: text_fmt,
+                ..Cell::default()
+            },
+        );
+        sh.set_cell(12, 1, Cell::text("x"));
+        s.dispatch("select\t10\t0\t10\t1");
+        let tsv = s.dispatch("copy").unwrap();
+        // The host hands the text back with CRLF and a trailing line break.
+        s.dispatch(&format!("paste\t12\t0\t{}\r\n", tsv.replace('\n', "\r\n")));
+        let at = |s: &Session, r, c| s.pkg.workbook.sheets[0].cell(r, c).cloned().unwrap();
+        assert_eq!(at(&s, 12, 0), q007);
+        assert_eq!(at(&s, 12, 1), tabc);
+        // Text from elsewhere is still read as typed into the target.
+        s.dispatch("paste\t13\t0\t'abc");
+        assert_eq!(at(&s, 13, 0).value, CellValue::Text("abc".into()));
+    }
+
+    #[test]
+    fn a_pasted_copy_moves_its_references_and_a_cut_keeps_them() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let f = |s: &Session, r, c| {
+            s.pkg.workbook.sheets[0]
+                .cell(r, c)
+                .and_then(|c| c.formula.clone())
+        };
+        s.dispatch("select\t3\t1"); // =SUM(B1:B3)
+        let tsv = s.dispatch("copy").unwrap();
+        s.dispatch(&format!("paste\t3\t2\t{tsv}"));
+        assert_eq!(f(&s, 3, 2).as_deref(), Some("SUM(C1:C3)"));
+        // A cut records the cells before clearing them, and pastes them
+        // unchanged without clearing the source again.
+        s.dispatch("select\t3\t1");
+        let tsv = s.dispatch("cut").unwrap();
+        assert_eq!(f(&s, 3, 1), None, "the cut cleared its source");
+        s.dispatch(&format!("paste\t5\t3\t{tsv}"));
+        assert_eq!(f(&s, 5, 3).as_deref(), Some("SUM(B1:B3)"));
+        // Pasted again, it is a copy: its references move.
+        s.dispatch(&format!("paste\t5\t4\t{tsv}"));
+        assert_eq!(f(&s, 5, 4).as_deref(), Some("SUM(E3:E5)"));
     }
 
     #[test]

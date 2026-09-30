@@ -183,6 +183,40 @@ fn a_general_number_is_fitted_to_its_cell() {
 }
 
 #[test]
+fn a_grid_clip_pastes_the_same_cells_between_text_and_general() {
+    // The grid clip carries the cells, so a quote-prefixed General `007`
+    // onto a Text cell, and a Text cell's `'abc` onto a General one, land as
+    // they were: no apostrophe added or dropped.
+    let mut v = view();
+    let quoted = v.pkg.workbook.styles.intern(Xf {
+        quote_prefix: true,
+        ..Xf::default()
+    });
+    let text_fmt = v.pkg.workbook.styles.intern({
+        let mut xf = Xf::default();
+        xf.set_code(Some("@".into()));
+        xf
+    });
+    let q007 = Cell {
+        style: quoted,
+        ..Cell::text("007")
+    };
+    let tabc = Cell {
+        style: text_fmt,
+        ..Cell::text("'abc")
+    };
+    put(&mut v, 0, 0, q007.clone());
+    put(&mut v, 0, 1, tabc.clone());
+    put(&mut v, 2, 0, Cell { style: text_fmt, ..Cell::default() });
+    put(&mut v, 2, 1, Cell::text("x"));
+    let block = vec![vec![q007.clone(), tabc.clone()]];
+    let s = v.active;
+    paste_grid_block(&mut v.engine, &mut v.pkg.workbook, s, (2, 0), &block);
+    assert_eq!(v.sheet().cell(2, 0), Some(&q007));
+    assert_eq!(v.sheet().cell(2, 1), Some(&tabc));
+}
+
+#[test]
 fn an_apostrophe_is_a_quote_prefix_and_an_untouched_reedit_is_a_no_op() {
     let mut v = view();
     type_fresh(&mut v, "'007");
