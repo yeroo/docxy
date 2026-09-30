@@ -1,4 +1,5 @@
-# The harness's private clipboard and the `clipboard` verb (#699).
+# The harness's private clipboard and the `clipboard` verb (#699), and the
+# document copy/paste that goes through it (#755).
 
 # Keep this case first: it is the instance's clipboard before anything is
 # copied. It only tells a private clipboard from the OS one when the real
@@ -47,6 +48,65 @@ test a copy with no text in it is newer than the grid clip
   click D8
   key ctrl+v
   assert cell D8 is nothing
+  assert dirty is false
+
+test a document copy puts its text on the clipboard
+  open copy:../fixtures/basic.docx
+  type hello world
+  call selection-set {"start":0,"end":5}
+  key ctrl+c
+  call clipboard {"action":"read"}
+  assert reply.text is hello
+  assert reply.app.kind is doc
+  assert reply.app.text is hello
+
+test a document copy pastes back with its formatting
+  open copy:../fixtures/basic.docx
+  type hello
+  call selection-set {"start":0,"end":5}
+  call ribbon-click {"tab":"Home","command":"Bold"}
+  key ctrl+c
+  key end
+  key ctrl+v
+  assert text is hellohello
+  call selection-set {"start":7,"end":7}
+  assert run.bold is true
+
+test text another app copied wins over the older document clip
+  open copy:../fixtures/basic.docx
+  type hello
+  call selection-set {"start":0,"end":5}
+  key ctrl+c
+  call clipboard {"action":"write","text":"-other"}
+  assert reply.app.kind is none
+  key end
+  key ctrl+v
+  assert text is hello-other
+
+test text another app copied pastes into a freshly opened document
+  open copy:../fixtures/basic.docx
+  call clipboard {"action":"write","text":"pasted"}
+  key ctrl+v
+  assert text is pasted
+  assert dirty is true
+
+test a copy with no text in it is newer than the document clip
+  open copy:../fixtures/basic.docx
+  type hello
+  call selection-set {"start":0,"end":5}
+  key ctrl+c
+  key ctrl+s
+  assert dirty is false
+  call clipboard {"action":"write","text":""}
+  assert reply.app.kind is none
+  key end
+  key ctrl+v
+  assert text is hello
+  assert dirty is false
+
+test a document cut with nothing selected leaves the document clean
+  open copy:../fixtures/basic.docx
+  key ctrl+x
   assert dirty is false
 
 test the clipboard verb refuses what it does not do

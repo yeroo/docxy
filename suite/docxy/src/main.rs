@@ -985,6 +985,16 @@ struct GridClip {
     text: String,
 }
 
+/// The document clipboard: the rich clip copied from a document and the plain
+/// text that copy put on the clipboard (#755). While the clipboard still holds
+/// `text`, a paste uses `clip` (run formatting intact); once something else
+/// has been copied, the clipboard's text wins.
+#[derive(Clone)]
+struct DocClip {
+    clip: Clip,
+    text: String,
+}
+
 /// What a read of the clipboard found (#699).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ClipRead {
@@ -1038,18 +1048,21 @@ fn paste_grid_block(
     }
 }
 
-/// Whether a sheet paste uses the grid clip recorded as `recorded` rather than
-/// what the clipboard holds `now` (#699). The grid clip is ours only while the
-/// clipboard still holds the text we put there: another app's copy replaces
-/// it, and pasting our older cells then would paste the wrong thing, whether
-/// that copy was text or an image. Only a clipboard with no item at all
-/// (`Nothing`: never copied to, or unreadable) cannot say it changed, so the
-/// clip stands. Line endings are compared loosely because the OS may hand CRLF
-/// back.
-fn grid_paste_uses_clip(recorded: &str, now: &ClipRead) -> bool {
+/// Whether a paste uses the in-app clip (a sheet's grid clip or a document's
+/// rich clip) recorded as `recorded` rather than what the clipboard holds `now`
+/// (#699, #755). The clip is ours only while the clipboard still holds the text
+/// we put there: another app's copy replaces it, and pasting our older clip
+/// then would paste the wrong thing, whether that copy was text or an image.
+/// Only a clipboard with no item at all (`Nothing`: never copied to, or
+/// unreadable) cannot say it changed, so the clip stands. A clip whose text is
+/// empty (a document copy of only an image) reads back as `NotText`, so that
+/// is still ours; the cost is that another app's non-text copy after it pastes
+/// our clip. Grid TSV is never empty. Line endings are compared loosely because
+/// the OS may hand CRLF back.
+fn clip_still_ours(recorded: &str, now: &ClipRead) -> bool {
     match now {
         ClipRead::Nothing => true,
-        ClipRead::NotText => false,
+        ClipRead::NotText => recorded.is_empty(),
         ClipRead::Text(now) => now.replace("\r\n", "\n") == recorded.replace("\r\n", "\n"),
     }
 }
@@ -1996,7 +2009,7 @@ struct Docxy {
     ribbon_min: bool,
     backstage: bool,
     bs_new: bool,
-    clip: Option<Clip>,
+    clip: Option<DocClip>,
     theme_pref: ThemePref,
     /// When set, closing the window with unsaved tabs shows a confirm dialog.
     /// Off by default: work is hot-persisted and restored regardless, so closing
@@ -9533,7 +9546,7 @@ impl Docxy {
         let block: Vec<Vec<gridcore::sheet::Cell>> = if let Some(clip) = self
             .grid_clip
             .as_ref()
-            .filter(|clip| grid_paste_uses_clip(&clip.text, &now))
+            .filter(|clip| clip_still_ours(&clip.text, &now))
         {
             clip.cells.clone()
         } else if let ClipRead::Text(text) = now {
@@ -12844,29 +12857,37 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
+    /// Copy (or cut) the selection into the document clip and, as plain text,
+    /// the system clipboard (#755).
     fn do_copy(&mut self, cut: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let mut dirty = false;
-        if let Some(ed) = self.edit_target() {
-            let c = if cut {
-                dirty = true;
-                ed.cut()
-            } else {
-                ed.copy()
-            };
-            if c.is_some() {
-                self.clip = c;
-            }
-        }
-        if dirty {
-            if let Some(t) = self.tabs.get_mut(self.active) {
-                t.dirty = true;
+        let clip = self
+            .edit_target()
+            .and_then(|ed| if cut { ed.cut() } else { ed.copy() });
+        if let Some(clip) = clip {
+            let text = clip.to_text();
+            self.clip = Some(DocClip {
+                clip,
+                text: text.clone(),
+            });
+            self.clipboard_write(text, cx);
+            if cut {
+                if let Some(t) = self.tabs.get_mut(self.active) {
+                    t.dirty = true;
+                }
             }
         }
         self.refocus(window, cx);
     }
 
+    /// Paste at the caret: the document clip while it is still what the
+    /// clipboard holds (formatting intact), else the clipboard's text.
     fn do_paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(clip) = self.clip.clone() {
+        let now = self.clipboard_read(cx);
+        let clip = match self.clip.as_ref() {
+            Some(ours) if clip_still_ours(&ours.text, &now) => Some(ours.clip.clone()),
+            _ => now.text().map(Clip::from_text),
+        };
+        if let Some(clip) = clip {
             self.with_editor(window, cx, |e| e.paste(&clip));
         } else {
             self.refocus(window, cx);
@@ -14921,7 +14942,7 @@ fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) -> bool
 
 #[cfg(test)]
 mod clipboard_tests {
-    use super::{ClipRead, ClipboardStore, grid_paste_uses_clip, paste_grid_block};
+    use super::{ClipRead, ClipboardStore, clip_still_ours, paste_grid_block};
     use gridcore::engine::Engine;
     use gridcore::sheet::{Cell, CellValue, Sheet, Workbook};
 
@@ -15002,14 +15023,24 @@ mod clipboard_tests {
     fn a_grid_clip_is_pasted_only_while_the_clipboard_still_holds_it() {
         let ours = "a\tb\n1\t2\n";
         let text = |t: &str| ClipRead::Text(t.into());
-        assert!(grid_paste_uses_clip(ours, &text(ours)));
-        assert!(grid_paste_uses_clip(ours, &text("a\tb\r\n1\t2\r\n")));
-        assert!(grid_paste_uses_clip(ours, &ClipRead::Nothing));
-        assert!(!grid_paste_uses_clip(ours, &text("from another app")));
+        assert!(clip_still_ours(ours, &text(ours)));
+        assert!(clip_still_ours(ours, &text("a\tb\r\n1\t2\r\n")));
+        assert!(clip_still_ours(ours, &ClipRead::Nothing));
+        assert!(!clip_still_ours(ours, &text("from another app")));
         assert!(
-            !grid_paste_uses_clip(ours, &ClipRead::NotText),
+            !clip_still_ours(ours, &ClipRead::NotText),
             "an image copied since is newer than our cells"
         );
+    }
+
+    /// #755: a document copy of only an image puts empty text on the
+    /// clipboard, which reads back as an item with no text; that is still
+    /// ours, so the image pastes rather than the text copied before it.
+    #[test]
+    fn an_empty_text_clip_is_ours_while_the_clipboard_holds_no_text() {
+        assert!(clip_still_ours("", &ClipRead::NotText));
+        assert!(clip_still_ours("", &ClipRead::Nothing));
+        assert!(!clip_still_ours("", &ClipRead::Text("older".into())));
     }
 }
 
