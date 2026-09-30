@@ -2486,6 +2486,23 @@ pub struct Eval<'a> {
 /// and rectangular.
 pub type Matrix = Vec<Vec<Value>>;
 
+/// A grid of values and, when it came from a range, (sheet, top row, left
+/// column).
+type GridAt = (Matrix, Option<(usize, u32, u32)>);
+
+/// One criteria cell of a D-function, resolved against the database.
+enum DbCrit {
+    /// Blank: no condition.
+    Skip,
+    /// A condition on database column `usize`.
+    Field(usize, Criteria, bool),
+    /// A computed criterion: the criteria cell's formula, evaluated once per
+    /// record (relative references shifted to the record's row).
+    Computed(Expr, (usize, u32, u32)),
+    /// A header that names no field over a plain value: matches nothing.
+    Never,
+}
+
 /// Ceiling on materialized array size (cells). Excel errors with `#NUM!`
 /// when an array result won't fit; we draw the line well before memory pain.
 const MAX_ARRAY_CELLS: u64 = 2_000_000;
@@ -5146,6 +5163,30 @@ fn wildcard_match(pat: &str, text: &str) -> bool {
         pi += 1;
     }
     pi == p.len()
+}
+
+/// Whether a database criterion is plain text with no operator, which Excel's
+/// D-functions treat as "begins with" (`C` matches Cara and Carl). Only a
+/// typed operator (`="=Ann"` gives the text `=Ann`) asks for an exact match.
+fn db_begins_with(v: &Value) -> bool {
+    match v {
+        Value::Str(s) => {
+            !s.starts_with(['=', '<', '>'])
+                && matches!(parse_criteria(v).val, Value::Str(ref t) if !t.is_empty())
+        }
+        _ => false,
+    }
+}
+
+/// [`criteria_match`] for the D-functions: a plain-text criterion matches a
+/// text cell that begins with it (wildcards still apply).
+fn db_criteria_match(c: &Criteria, begins_with: bool, v: &Value) -> bool {
+    match (&c.val, v) {
+        (Value::Str(pat), Value::Str(text)) if begins_with => {
+            wildcard_match(&format!("{pat}*"), text)
+        }
+        _ => criteria_match(c, v),
+    }
 }
 
 fn criteria_match(c: &Criteria, v: &Value) -> bool {
@@ -9762,25 +9803,24 @@ impl<'a> Eval<'a> {
     }
 
     /// A 2-D dense grid of an argument (row-major), clamped to the used range.
-    /// Scalars become a 1×1 grid; the shape database functions want.
-    fn flat_grid(&mut self, e: &Expr) -> Result<Vec<Vec<Value>>, Value> {
+    /// Scalars become a 1×1 grid; the shape database functions want. A range
+    /// also reports its sheet and top-left cell.
+    fn flat_grid_at(&mut self, e: &Expr) -> Result<GridAt, Value> {
         match self.eval_arg(e) {
             Arg::Scalar(Value::Err(er)) => Err(Value::Err(er)),
-            Arg::Scalar(v) => Ok(vec![vec![v]]),
+            Arg::Scalar(v) => Ok((vec![vec![v]], None)),
             Arg::Range(s, r1, c1, r2, c2) => {
                 let (a, b, c, d) = self.clamp(s, r1, c1, r2, c2);
-                Ok((a..=c)
+                let grid = (a..=c)
                     .map(|r| (b..=d).map(|col| self.res.value(s, r, col)).collect())
-                    .collect())
+                    .collect();
+                Ok((grid, Some((s, a, b))))
             }
-            Arg::Matrix(m) => Ok(m),
+            Arg::Matrix(m) => Ok((m, None)),
             Arg::Lambda(_) => Err(Value::Err(ExcelError::Calc)),
         }
     }
 
-    /// Shared core of the D-functions: the `field` column's values over every
-    /// database row that satisfies the criteria range.
-    /// `args` = [database, field, criteria].
     /// ROWS/COLUMNS of anything that is not a literal reference form: a
     /// name, table or spill reference gives its extent, a computed array its
     /// dimensions, and a scalar 1.
@@ -9802,13 +9842,16 @@ impl<'a> Eval<'a> {
         }
     }
 
+    /// Shared core of the D-functions: the `field` column's values over every
+    /// database row that satisfies the criteria range.
+    /// `args` = [database, field, criteria].
     fn db_query(&mut self, args: &[Expr]) -> Result<Vec<Value>, Value> {
         if args.len() != 3 {
             return Err(Value::Err(ExcelError::Value));
         }
-        let db = self.flat_grid(&args[0])?;
+        let (db, db_at) = self.flat_grid_at(&args[0])?;
         let field = self.eval(&args[1]);
-        let crit = self.flat_grid(&args[2])?;
+        let (crit, crit_at) = self.flat_grid_at(&args[2])?;
         if db.len() < 2 || db[0].is_empty() || crit.is_empty() {
             return Err(Value::Err(ExcelError::Value));
         }
@@ -9846,22 +9889,72 @@ impl<'a> Eval<'a> {
                     .and_then(|s| headers.iter().position(|h| text_eq(h, &s)))
             })
             .collect();
+        let blank_header: Vec<bool> = crit_headers
+            .iter()
+            .map(|ch| to_text(ch).map_or(true, |s| s.is_empty()))
+            .collect();
+        // Resolve every criteria cell once. A formula under a blank header, or
+        // under one that names no field, is a computed criterion (Excel's
+        // "criteria created as the result of a formula"); it needs both the
+        // criteria cell's and the database's position.
+        let crit_rows: Vec<Vec<DbCrit>> = crit[1..]
+            .iter()
+            .enumerate()
+            .map(|(ri, cr)| {
+                (0..crit_cols.len())
+                    .map(|ci| {
+                        let cval = cr.get(ci).cloned().unwrap_or(Value::Empty);
+                        let formula = match (crit_cols[ci], crit_at, db_at) {
+                            (None, Some((cs, r0, c0)), Some(_)) => {
+                                let at = (cs, r0 + 1 + ri as u32, c0 + ci as u32);
+                                self.res
+                                    .cell_formula(at.0, at.1, at.2)
+                                    .and_then(|f| parse(&f).ok())
+                                    .map(|ast| (ast, at))
+                            }
+                            _ => None,
+                        };
+                        match (crit_cols[ci], formula) {
+                            (None, Some((ast, at))) => DbCrit::Computed(ast, at),
+                            _ if matches!(cval, Value::Empty) => DbCrit::Skip,
+                            (Some(col), _) => {
+                                let prefix = db_begins_with(&cval);
+                                DbCrit::Field(col, parse_criteria(&cval), prefix)
+                            }
+                            (None, None) if blank_header[ci] => DbCrit::Skip,
+                            (None, None) => DbCrit::Never,
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
 
         let mut out = Vec::new();
-        for row in &db[1..] {
+        for (ri, row) in db[1..].iter().enumerate() {
             // Criteria rows are OR'd; cells within a row are AND'd.
-            let mut matched = crit.len() <= 1; // no criteria rows → all match
-            for cr in &crit[1..] {
+            let mut matched = crit_rows.is_empty(); // no criteria rows → all match
+            for cr in &crit_rows {
                 let mut row_ok = true;
-                for (ci, dbcol) in crit_cols.iter().enumerate() {
-                    let Some(dbcol) = dbcol else { continue };
-                    let cval = cr.get(ci).cloned().unwrap_or(Value::Empty);
-                    if matches!(cval, Value::Empty) {
-                        continue;
-                    }
-                    let c = parse_criteria(&cval);
-                    let cell = row.get(*dbcol).cloned().unwrap_or(Value::Empty);
-                    if !criteria_match(&c, &cell) {
+                for c in cr {
+                    let ok = match c {
+                        DbCrit::Skip => true,
+                        DbCrit::Never => false,
+                        DbCrit::Field(dbcol, crit, prefix) => {
+                            let cell = row.get(*dbcol).cloned().unwrap_or(Value::Empty);
+                            db_criteria_match(crit, *prefix, &cell)
+                        }
+                        DbCrit::Computed(ast, (cs, cr0, cc0)) => {
+                            // Record `ri` sits `ri` rows below the first
+                            // data row, which the formula's relative refs
+                            // point at: shift them (and the formula) by that.
+                            let shifted = translate(ast, ri as i64, 0);
+                            let mut child = Eval::new(self.res, *cs, (cr0 + ri as u32, *cc0));
+                            let v = child.eval(&shifted);
+                            self.unsupported |= child.unsupported;
+                            matches!(v, Value::Bool(true)) || matches!(v, Value::Num(n) if n != 0.0)
+                        }
+                    };
+                    if !ok {
                         row_ok = false;
                         break;
                     }

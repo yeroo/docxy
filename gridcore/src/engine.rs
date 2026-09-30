@@ -1284,6 +1284,77 @@ mod tests {
         assert!(matches!(ast, Expr::Func(ref f, _) if f == "ISFORMULA"));
     }
 
+    #[test]
+    fn database_criteria_begin_with_and_compute() {
+        // #677: the issue's table, all nine rows, plus the exact form.
+        let t = |s: &str| Cell::text(s);
+        let n = Cell::number;
+        let f = Cell::formula;
+        let mut cells = vec![
+            ("F1", t("Rep")),
+            ("F2", t("C")),
+            ("P1", t("Rep")),
+            ("P2", t("an")),
+            ("Y1", t("Big")),
+            ("Y2", f("C2>100")),
+            ("AA2", f("AND(C2>=80,B2=\"East\")")),
+            ("AB1", t("Over")),
+            ("AB2", f("C2>$AD$1")),
+            ("AD1", n(100.0)),
+            ("AC1", t("Zone")),
+            ("AC2", t("East")),
+            ("H1", t("Rep")),
+            ("H2", f("\"=an\"")),
+            ("K1", f("DCOUNTA(A1:C8,\"Rep\",F1:F2)")),
+            ("K2", f("DSUM(A1:C8,\"Amount\",F1:F2)")),
+            ("K3", f("DCOUNTA(A1:C8,\"Rep\",P1:P2)")),
+            ("K4", f("DCOUNTA(A1:C8,\"Rep\",Y1:Y2)")),
+            ("K5", f("DSUM(A1:C8,\"Amount\",Y1:Y2)")),
+            ("K6", f("DCOUNTA(A1:C8,\"Rep\",AA1:AA2)")),
+            ("K7", f("DSUM(A1:C8,\"Amount\",AA1:AA2)")),
+            ("K8", f("DCOUNTA(A1:C8,\"Rep\",AB1:AB2)")),
+            ("K9", f("DCOUNTA(A1:C8,\"Rep\",AC1:AC2)")),
+            ("K10", f("DCOUNTA(A1:C8,\"Rep\",H1:H2)")),
+            // COUNTIF keeps exact text matching.
+            ("K11", f("COUNTIF(A2:A8,\"C\")")),
+        ];
+        let reps = ["Rep", "Ann", "Bob", "Cara", "ann", "Dee", "Carl", "Eve"];
+        let regions = ["Region", "East", "West", "East", "North", "West", "East"];
+        let amounts = [120.0, 80.0, 200.0, 50.0, 300.0, 90.0, 60.0];
+        let names: Vec<(String, Cell)> = reps
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (format!("A{}", i + 1), t(r)))
+            .chain(
+                regions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| (format!("B{}", i + 1), t(r))),
+            )
+            .chain(std::iter::once(("C1".to_string(), t("Amount"))))
+            .chain(
+                amounts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| (format!("C{}", i + 2), n(*a))),
+            )
+            .collect();
+        for (k, c) in &names {
+            cells.push((k.as_str(), c.clone()));
+        }
+        let mut wb = wb_one_sheet(&cells);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        let want = [2.0, 290.0, 2.0, 3.0, 620.0, 3.0, 410.0, 3.0, 0.0, 0.0, 0.0];
+        for (i, w) in want.iter().enumerate() {
+            let k = format!("K{}", i + 1);
+            assert_eq!(value_at(&wb, &k), CellValue::Number(*w), "{k}");
+        }
+        // The computed criterion follows its absolute input.
+        eng.set_cell(&mut wb, (0, 0, 29), n(250.0));
+        assert_eq!(value_at(&wb, "K8"), CellValue::Number(1.0));
+    }
+
     // ---- dynamic arrays / spilling ------------------------------------
 
     #[test]
