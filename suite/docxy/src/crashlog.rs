@@ -14,7 +14,6 @@
 //!
 //! Everything here takes the config root as a parameter, like `recover`, and
 //! nothing here may fail start-up: every I/O error is ignored.
-use std::cell::Cell;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -134,44 +133,32 @@ pub(crate) fn startup(root: &Path, message: &str) {
     );
 }
 
-thread_local! {
-    /// Set while this thread's hook is writing, so a panic raised by the write
-    /// itself goes straight to the previous hook instead of back in here.
-    /// Cleared afterwards: a later panic on the same thread (on Windows, the
-    /// "cannot unwind" panic that follows one raised in a window callback) is
-    /// evidence too, and must be logged.
-    static WRITING: Cell<bool> = const { Cell::new(false) };
-}
-
 /// Chain a panic hook that appends every panic, on any thread, to the log
 /// under `root`, then runs the hook that was installed before it — so console
 /// and debug behaviour is unchanged. `main` calls this first.
+///
+/// No re-entry guard: std aborts on a panic inside a panic hook, so the hook
+/// cannot recurse, and a panic while writing the log ends the process without
+/// running the previous hook.
 pub(crate) fn install(root: PathBuf) {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // `try_with`: a panic during thread-local teardown has no flag to set;
-        // skip the write rather than panic in the hook.
-        let _ = WRITING.try_with(|writing| {
-            if !writing.replace(true) {
-                let location = info
-                    .location()
-                    .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
-                let message = info.payload_as_str().unwrap_or("<non-string payload>");
-                let backtrace = std::backtrace::Backtrace::force_capture().to_string();
-                let body = panic_body(message, location.as_deref(), &backtrace);
-                append(
-                    &root,
-                    &format_entry(
-                        "panic",
-                        now_secs(),
-                        std::process::id(),
-                        &thread_name(),
-                        &body,
-                    ),
-                );
-                writing.set(false);
-            }
-        });
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
+        let message = info.payload_as_str().unwrap_or("<non-string payload>");
+        let backtrace = std::backtrace::Backtrace::force_capture().to_string();
+        let body = panic_body(message, location.as_deref(), &backtrace);
+        append(
+            &root,
+            &format_entry(
+                "panic",
+                now_secs(),
+                std::process::id(),
+                &thread_name(),
+                &body,
+            ),
+        );
         previous(info);
     }));
 }
@@ -303,8 +290,8 @@ mod tests {
 
     /// The child half of [`a_panic_is_written_to_the_crash_log`]. It installs
     /// the hook exactly as `main` does — the hook is process-global, so this
-    /// must never run in the parent — then panics on a named thread and on its
-    /// own thread. The second message carries its line so the parent can check
+    /// must never run in the parent — then panics twice on a named thread and
+    /// once on its own thread. The second message carries its line so the parent can check
     /// the logged location.
     #[test]
     fn crash_child() {
@@ -314,7 +301,13 @@ mod tests {
         install(crate::config_root());
         let probe = std::thread::Builder::new()
             .name("crash-probe".into())
-            .spawn(|| panic!("#733 probe thread panic"))
+            .spawn(|| {
+                // Two panics on one thread, the second after the first hook
+                // has returned: on Windows, the "cannot unwind" panic that
+                // follows one raised in a window callback. Both are logged.
+                let _ = std::panic::catch_unwind(|| panic!("#733 probe first"));
+                panic!("#733 probe second")
+            })
             .unwrap();
         assert!(probe.join().is_err());
         panic!("#733 test thread panic at line {}", line!());
@@ -344,20 +337,41 @@ mod tests {
 
         let log = std::fs::read_to_string(log_path(&root.0)).unwrap_or_default();
         let entries: Vec<&str> = log.split("=== ").filter(|e| !e.is_empty()).collect();
-        assert_eq!(entries.len(), 2, "one entry per panic:\n{log}");
-
-        let probe = entries[0];
-        assert!(probe.starts_with("panic "), "{probe}");
-        assert!(probe.contains(&format!(" pid {pid} ")), "{probe}");
-        assert!(probe.contains(" thread crash-probe\n"), "{probe}");
-        assert!(probe.contains("#733 probe thread panic"), "{probe}");
-        assert!(
-            probe.contains(&format!("panicked at {}:", file!())),
-            "{probe}"
+        assert_eq!(
+            entries.len(),
+            3,
+            "one entry per panic:
+{log}"
         );
-        assert!(probe.contains("backtrace:\n"), "{probe}");
 
-        let main = entries[1];
+        for (probe, message) in entries[..2]
+            .iter()
+            .zip(["#733 probe first", "#733 probe second"])
+        {
+            assert!(probe.starts_with("panic "), "{probe}");
+            assert!(probe.contains(&format!(" pid {pid} ")), "{probe}");
+            assert!(
+                probe.contains(
+                    " thread crash-probe
+"
+                ),
+                "{probe}"
+            );
+            assert!(probe.contains(message), "{probe}");
+            assert!(
+                probe.contains(&format!("panicked at {}:", file!())),
+                "{probe}"
+            );
+            assert!(
+                probe.contains(
+                    "backtrace:
+"
+                ),
+                "{probe}"
+            );
+        }
+
+        let main = entries[2];
         assert!(main.contains(&format!(" pid {pid} ")), "{main}");
         let line: u32 = main
             .split("#733 test thread panic at line ")
