@@ -251,7 +251,7 @@ Every range field **shows** a reference the way Excel writes one:
 `=Budget!$A$1:$D$5` — a leading `=`, `$` anchors, and the sheet qualifier — so a
 ref can be copied between this app and Excel's own dialogs and mean the same
 thing in both. That is `ref_a1`, and every reference a field displays goes through it:
-the chart panel's four slots, the four entry bars' seeds, and the text a drag
+the chart panel's four slots, the three entry bars' seeds, and the text a drag
 writes while it is in progress (`ref_pick_text`). The one thing a field shows
 that isn't a reference is a series name that came from none — that is a literal,
 and shows as itself (`series_name_shown`).
@@ -398,7 +398,7 @@ but not yet Entered still counts. After a pick with the mouse the field keeps
 the keyboard, so the next thing typed goes into the *range* — Enter or Escape
 hands it back to the bar's own buffer.
 
-⚠️ The four bars share **one** `bar_field`/`bar_range` pair, so only one may be
+⚠️ The three bars share **one** `bar_field`/`bar_range` pair, so only one may be
 open at a time: `bar_open` closes the others (and `bar_close` closes the bars,
 not just their fields). Two on screen would aim the first at cells pinned for
 the second — `sheet_key` routes to whichever opened first, while `bar_seed` and
@@ -416,7 +416,7 @@ asks the bars *before* a field that isn't one of theirs, so focusing a panel
 field would draw a focused border and a caret while every keystroke went to the
 bar — and a drag on the grid still rewrote and committed the chart's field. So
 `ref_field`'s focus handler calls `typing_bars_close` for any non-bar target:
-whatever swallows typing (the four bars, the comment/filter/row-height bars, the
+whatever swallows typing (the three bars, the comment/filter/row-height bars, the
 find bar) loses it to the field the user just clicked.
 
 ## Pointing while typing a formula

@@ -2599,6 +2599,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A workbook bound to CSV (Comma delimited) reloads in Windows-1252:
+    /// an é (C3 A9 as 1252 bytes: Ã©) comes back as it was, byte for byte.
+    #[test]
+    fn wb_reload_keeps_the_bound_encoding() {
+        let dir = std::env::temp_dir().join(format!("xlsxy-reload-1252-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("latin.csv");
+        let mut a = app();
+        set(&mut a, "A1", "Ã©");
+        let t = super::super::SAVE_TYPES
+            .iter()
+            .position(|t| t.label == "CSV (Comma delimited)")
+            .unwrap();
+        a.save_as_type(path.to_string_lossy().into_owned(), t);
+        let first = std::fs::read(&path).unwrap();
+        assert_eq!(first, b"\xC3\xA9\r\n");
+        dispatch(&mut a, "wb.reload", &Json::Null).unwrap();
+        assert_eq!(get_value(&a, "A1"), CellValue::Text("Ã©".into()));
+        dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Text to Columns on another sheet leaves the current sheet as it is,
     /// and its undo and redo restore that other sheet.
     #[test]

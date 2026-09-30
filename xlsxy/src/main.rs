@@ -3599,7 +3599,7 @@ impl App {
         let Some(t) = self.bound_text_type() else {
             return self.open_without_wizard(&path);
         };
-        let SaveKind::Text { delim, .. } = save_kind(&SAVE_TYPES[t]) else {
+        let SaveKind::Text { delim, encoding } = save_kind(&SAVE_TYPES[t]) else {
             return Err(format!(
                 "{} cannot be read back; reload is not available for this file",
                 SAVE_TYPES[t].label
@@ -3607,8 +3607,15 @@ impl App {
         };
         // Read back with the delimiter it was written with, never a sniffed
         // one: a first row with as many `;` as `,` must not re-split.
+        // And in the encoding it was written in: a 1252 `é` must not be
+        // read as UTF-8.
+        let origin = match encoding {
+            gridcore::textio::Encoding::Windows1252 => gridcore::textio::Origin::Windows1252,
+            gridcore::textio::Encoding::Utf8Bom => gridcore::textio::Origin::Utf8,
+            gridcore::textio::Encoding::Utf16LeBom => gridcore::textio::Origin::Utf16Le,
+        };
         let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-        let text = gridcore::textio::decode(&bytes, gridcore::textio::Origin::Auto);
+        let text = gridcore::textio::decode(&bytes, origin);
         let pkg = text_to_pkg(
             &text,
             &file_stem(&path),
@@ -4178,6 +4185,11 @@ impl App {
             return;
         };
         let opts = d.parse();
+        if opts.decimal == opts.thousands {
+            self.status = Some("The decimal and thousands separators must differ".to_string());
+            self.text_dialog = Some(d);
+            return;
+        }
         match &d.purpose {
             textdlg::Purpose::Import { path, .. } => {
                 let pkg = text_to_pkg(d.text(), &file_stem(path), &opts, &self.text_open());
@@ -8468,6 +8480,25 @@ mod tests {
                 CellValue::Text(b1.into())
             );
         }
+    }
+
+    /// The wizard refuses Finish while the decimal and thousands separators
+    /// are the same character, and stays open.
+    #[test]
+    fn the_wizard_refuses_equal_separators() {
+        let mut app = ttc_app(&[(0, 0, "1.5")]);
+        app.ribbon_act(ribbon::Act::TextToColumns);
+        app.text_dialog.as_mut().unwrap().thousands = '.';
+        app.text_dialog_key(KeyCode::Enter);
+        assert!(app.text_dialog.is_some());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("The decimal and thousands separators must differ")
+        );
+        assert_eq!(
+            app.sheet().cell(0, 0).unwrap().value,
+            gridcore::sheet::CellValue::Text("1.5".into())
+        );
     }
 
     /// #692: more than one column is refused with Excel's message.

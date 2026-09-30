@@ -711,7 +711,7 @@ fn normalize_number(t: &str, opts: &TextParse) -> Option<String> {
 
 /// [`parse_ordered_date`], optionally followed by a space and a time
 /// (`03/04/2024 10:30`): the serial and the format Excel gives it.
-pub fn parse_ordered_date_time(
+pub(crate) fn parse_ordered_date_time(
     t: &str,
     order: DateOrder,
     ctx: &EntryCtx,
@@ -735,7 +735,7 @@ pub fn parse_ordered_date_time(
 
 /// A date whose parts come in `order`: `03/04/2024`, `3.4.24`, `03042024`,
 /// `3-Apr-2024` or, without the year, `03/04` in the current year.
-pub fn parse_ordered_date(t: &str, order: DateOrder, ctx: &EntryCtx) -> Option<f64> {
+pub(crate) fn parse_ordered_date(t: &str, order: DateOrder, ctx: &EntryCtx) -> Option<f64> {
     let mut parts: Vec<&str> = t
         .split(['/', '-', '.', ' ', ','])
         .filter(|p| !p.is_empty())

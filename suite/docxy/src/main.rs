@@ -5529,7 +5529,7 @@ fn chart_panel_shown(shown: Option<usize>, n_charts: usize) -> Option<usize> {
 ///
 /// The panel is not the only thing that can hold a live field, though.
 /// `run_sheet_act` hands the chart back WITHOUT shutting the panel, so a bar
-/// field — Data Validation, Sort, Text to Columns — can be pointing at the grid
+/// field — Conditional Formatting, Data Validation, Sort — can be pointing at the grid
 /// with a chart panel open behind it. That field belongs to the sheet. Letting
 /// it keep the keyboard while the card takes the selection is exactly the
 /// two-things-selected split this plan set out to remove, so only the panel's
@@ -7562,10 +7562,10 @@ impl Docxy {
     /// Open a bar's range field. It starts unpinned, so until the user types a
     /// range or points at one the bar still acts on the selection.
     fn bar_open(&mut self, target: RefTarget) {
-        // The four bars share ONE `bar_field`/`bar_range`, and `sheet_key`
+        // The three bars share ONE `bar_field`/`bar_range`, and `sheet_key`
         // routes to whichever is open first. Leaving a second one on screen
-        // therefore aims the first at cells pinned for the other — Text to
-        // Columns splitting the Sort bar's whole region, say. Only one at a
+        // therefore aims the first at cells pinned for the other — a
+        // conditional format painting the Sort bar's whole region, say. Only one at a
         // time, which is also what the keyboard already assumed.
         self.bar_close();
         // `bar_close` only drops a field belonging to a bar. A Chart panel field
