@@ -100,6 +100,29 @@ impl SheetPackage {
         self.parts.retain(|(n, _)| n != name);
     }
 
+    /// Excel's *Always create backup* (`<workbookPr backupFile>`,
+    /// Save As › Tools › General Options): true when the attribute is "1"
+    /// or "true" (corpus/xlsx spells the boolean "false"/"true"). Anything
+    /// else — another value, no attribute, no element — means off. The flag
+    /// is read from the package because it only matters at save time.
+    pub fn always_create_backup(&self) -> bool {
+        let name = workbook_part_name(&self.parts);
+        let Some(bytes) = self.part(&name) else {
+            return false;
+        };
+        let xml = String::from_utf8_lossy(bytes);
+        let mut p = XmlParser::new(&xml);
+        loop {
+            match p.next() {
+                Event::Start if local(p.name()) == "workbookPr" => {
+                    return matches!(p.attr("backupFile"), "1" | "true");
+                }
+                Event::Eof => return false,
+                _ => {}
+            }
+        }
+    }
+
     /// The raw bytes of a part by name.
     pub fn part(&self, name: &str) -> Option<&[u8]> {
         self.parts
@@ -7858,6 +7881,46 @@ mod tests {
         let saved = load_xlsx(&save_xlsx(&pkg)).unwrap();
         assert!(part_text(&saved, "xl/worksheets/sheet1.xml").contains("tabSelected=\"1\""));
         assert!(!part_text(&saved, "xl/worksheets/sheet2.xml").contains("tabSelected"));
+    }
+
+    /// Excel's *Always create backup* (`<workbookPr backupFile>`): the save
+    /// path honours it (xlsxy), so it is read from the package, not the
+    /// model. Only "1"/"true" turn it on; anything else (or no attribute,
+    /// no element, no part) means off.
+    #[test]
+    fn always_create_backup_reads_workbook_pr() {
+        let pkg_with = |wb_pr: &str| {
+            let mut pkg = new_xlsx();
+            pkg.set_part(
+                "xl/workbook.xml",
+                format!("<workbook>{wb_pr}</workbook>").into_bytes(),
+            );
+            pkg
+        };
+        assert!(pkg_with(r#"<workbookPr backupFile="1"/>"#).always_create_backup());
+        assert!(pkg_with(r#"<workbookPr backupFile="true"/>"#).always_create_backup());
+        assert!(!pkg_with(r#"<workbookPr backupFile="0"/>"#).always_create_backup());
+        assert!(!pkg_with(r#"<workbookPr backupFile="false"/>"#).always_create_backup());
+        assert!(!pkg_with("<workbookPr/>").always_create_backup());
+        assert!(!pkg_with("").always_create_backup());
+        assert!(!new_xlsx().always_create_backup());
+    }
+
+    /// The corpus spells the boolean the LibreOffice way
+    /// (`backupFile="false"`, corpus/xlsx/calc-3d.xlsx); flipping just the
+    /// attribute turns the flag on.
+    #[test]
+    fn always_create_backup_reads_the_corpus_attribute() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../corpus/xlsx/calc-3d.xlsx");
+        let bytes = std::fs::read(path).expect("corpus/xlsx/calc-3d.xlsx exists");
+        let mut pkg = load_xlsx(&bytes).expect("corpus loads");
+        let wb = pkg
+            .part("xl/workbook.xml")
+            .expect("workbook part is xl/workbook.xml");
+        assert!(!pkg.always_create_backup());
+        let xml = String::from_utf8_lossy(wb).replace("backupFile=\"false\"", "backupFile=\"1\"");
+        pkg.set_part("xl/workbook.xml", xml.into_bytes());
+        assert!(pkg.always_create_backup());
     }
 
     #[test]

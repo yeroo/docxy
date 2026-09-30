@@ -1440,7 +1440,7 @@ fn parse_range(s: &str) -> Result<(u32, u32, u32, u32), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gridcore::xlsx::new_xlsx;
+    use gridcore::xlsx::{load_xlsx, new_xlsx, save_xlsx};
 
     fn app() -> App {
         let mut a = App::new(new_xlsx(), "ctl-test.xlsx");
@@ -3873,6 +3873,193 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The corpus workbook with its `backupFile` attribute rewritten; the
+    /// bytes are a loadable .xlsx with the flag on or off.
+    fn backup_fixture(flag: &str) -> Vec<u8> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../corpus/xlsx/calc-3d.xlsx");
+        let bytes = std::fs::read(path).expect("corpus/xlsx/calc-3d.xlsx exists");
+        let mut pkg = load_xlsx(&bytes).expect("corpus loads");
+        let wb = pkg
+            .part("xl/workbook.xml")
+            .expect("workbook part is xl/workbook.xml");
+        let xml = String::from_utf8_lossy(wb)
+            .replace("backupFile=\"false\"", &format!("backupFile=\"{flag}\""));
+        pkg.set_part("xl/workbook.xml", xml.into_bytes());
+        save_xlsx(&pkg)
+    }
+
+    /// Excel's *Always create backup*: wb.save over an existing file keeps
+    /// the previous bytes as `Backup of <stem>.xlk` beside it, and each
+    /// later save refreshes the backup from the file it replaces.
+    #[test]
+    fn wb_save_keeps_backup_of_previous_file() {
+        let dir =
+            std::env::temp_dir().join(format!("xlsxy-608-backup-keeps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = dir.join("book.xlsx");
+        std::fs::write(&book, backup_fixture("1")).unwrap();
+        let before = std::fs::read(&book).unwrap();
+        let mut a = App::new(load_xlsx(&before).unwrap(), book.to_str().unwrap());
+        a.os_clip = None;
+        set(&mut a, "A1", "changed");
+        dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+
+        let backup = dir.join("Backup of book.xlk");
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            before,
+            "backup holds the pre-save bytes"
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            2,
+            "book.xlsx and its backup only"
+        );
+        let re = load_xlsx(&std::fs::read(&book).unwrap()).unwrap();
+        assert_eq!(
+            re.workbook.sheets[0].cell(0, 0).unwrap().value,
+            CellValue::Text("changed".into())
+        );
+
+        // The next save replaces the backup with the first save's file.
+        let after1 = std::fs::read(&book).unwrap();
+        set(&mut a, "A1", "again");
+        dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), after1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without the flag nothing extra appears in the folder.
+    #[test]
+    fn wb_save_without_backup_flag_keeps_no_backup() {
+        let dir = std::env::temp_dir().join(format!("xlsxy-608-backup-off-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = dir.join("book.xlsx");
+        std::fs::write(&book, backup_fixture("false")).unwrap();
+        let before = std::fs::read(&book).unwrap();
+        let mut a = App::new(load_xlsx(&before).unwrap(), book.to_str().unwrap());
+        a.os_clip = None;
+        set(&mut a, "A1", "changed");
+        dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "book.xlsx only"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A first save to a not-yet-existing path has no previous version to
+    /// keep: the save succeeds and makes no backup.
+    #[test]
+    fn wb_save_first_save_with_backup_flag_makes_no_backup() {
+        let dir =
+            std::env::temp_dir().join(format!("xlsxy-608-backup-first-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = dir.join("new.xlsx");
+        let mut a = App::new(
+            load_xlsx(&backup_fixture("1")).unwrap(),
+            book.to_str().unwrap(),
+        );
+        a.os_clip = None;
+        set(&mut a, "A1", "changed");
+        dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+        assert!(book.exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "new.xlsx only");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A backup that cannot be written aborts the save before the workbook
+    /// file is touched, and the workbook stays modified.
+    #[test]
+    fn wb_save_fails_when_backup_cannot_be_written() {
+        let dir =
+            std::env::temp_dir().join(format!("xlsxy-608-backup-fails-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = dir.join("book.xlsx");
+        std::fs::write(&book, backup_fixture("1")).unwrap();
+        let before = std::fs::read(&book).unwrap();
+        // A directory in the backup's name blocks the write.
+        std::fs::create_dir(dir.join("Backup of book.xlk")).unwrap();
+        let mut a = App::new(load_xlsx(&before).unwrap(), book.to_str().unwrap());
+        a.os_clip = None;
+        set(&mut a, "A1", "changed");
+        let err = dispatch(&mut a, "wb.save", &Json::Null).unwrap_err();
+        assert!(err.starts_with("save failed: "), "{err}");
+        assert!(err.contains("Backup of book.xlk"), "{err}");
+        assert_eq!(a.status.as_deref(), Some(err.as_str()));
+        assert!(a.modified, "a failed save must leave the workbook modified");
+        assert_eq!(std::fs::read(&book).unwrap(), before, "book.xlsx untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A backup of a private workbook must not become world-readable:
+    /// keep_backup mirrors the file's own permissions.
+    #[cfg(unix)]
+    #[test]
+    fn wb_save_backup_keeps_source_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("xlsxy-608-backup-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = dir.join("book.xlsx");
+        std::fs::write(&book, backup_fixture("1")).unwrap();
+        std::fs::set_permissions(&book, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut a = App::new(
+            load_xlsx(&std::fs::read(&book).unwrap()).unwrap(),
+            book.to_str().unwrap(),
+        );
+        a.os_clip = None;
+        set(&mut a, "A1", "changed");
+        dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+        let backup = dir.join("Backup of book.xlk");
+        let mode = std::fs::metadata(&backup).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "backup mirrors the source's permissions"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A read-only book must not produce a read-only backup: the save of
+    /// the read-only book fails, but once the book is writable again the
+    /// next save must be able to replace the backup.
+    #[cfg(unix)]
+    #[test]
+    fn wb_save_backup_of_readonly_book_stays_replaceable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("xlsxy-608-backup-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = dir.join("book.xlsx");
+        std::fs::write(&book, backup_fixture("1")).unwrap();
+        std::fs::set_permissions(&book, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let mut a = App::new(
+            load_xlsx(&std::fs::read(&book).unwrap()).unwrap(),
+            book.to_str().unwrap(),
+        );
+        a.os_clip = None;
+        set(&mut a, "A1", "changed");
+        // The read-only book cannot be replaced, so the save fails — but
+        // the backup is still kept, and it must be owner-writable.
+        dispatch(&mut a, "wb.save", &Json::Null).unwrap_err();
+        let backup = dir.join("Backup of book.xlk");
+        let mode = std::fs::metadata(&backup).unwrap().permissions().mode();
+        assert_ne!(mode & 0o200, 0, "backup stays owner-writable, got {mode:o}");
+        // Once the book is writable, saving replaces the backup again.
+        std::fs::set_permissions(&book, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let before_second = std::fs::read(&book).unwrap();
+        dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), before_second);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The issue's repro: another program holds the file open with no
     /// sharing, so the atomic replace fails.
     #[cfg(windows)]
@@ -3905,6 +4092,38 @@ mod tests {
         let r = dispatch(&mut a, "wb.save", &Json::Null).unwrap();
         assert_eq!(r.get("modified").unwrap().as_bool(), Some(false));
         assert_ne!(std::fs::read(&book).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A book locked by another process fails in keep_backup's read, so the
+    /// error names the book, not the backup that was never touched.
+    #[cfg(windows)]
+    #[test]
+    fn wb_save_with_backup_flag_reports_locked_book() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("xlsxy-608-save-locked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = dir.join("book.xlsx");
+        std::fs::write(&book, backup_fixture("1")).unwrap();
+        let mut a = App::new(
+            load_xlsx(&std::fs::read(&book).unwrap()).unwrap(),
+            book.to_str().unwrap(),
+        );
+        a.os_clip = None;
+        set(&mut a, "A1", "changed");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&book)
+            .unwrap();
+        let err = dispatch(&mut a, "wb.save", &Json::Null).unwrap_err();
+        assert!(err.starts_with("save failed: cannot read"), "{err}");
+        assert!(!err.contains("Backup of"), "{err}");
+        assert!(!dir.join("Backup of book.xlk").exists());
+        drop(lock);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

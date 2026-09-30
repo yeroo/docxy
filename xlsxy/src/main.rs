@@ -11,7 +11,7 @@
 //! range selection, ref-translating copy/paste) and a dependency-graph
 //! recalculation on every edit.
 
-use opccore::fsio::export_atomic;
+use opccore::fsio::{export_atomic, write_atomic};
 use std::path::Path;
 
 use std::io;
@@ -94,6 +94,81 @@ fn export_csv_bytes(
         .filter(|import| opccore::fsio::same_file(Path::new(import), Path::new(out)))
         .unwrap_or(source);
     export_atomic(Some(Path::new(source)), Path::new(out), bytes)
+}
+
+/// Where *Always create backup* keeps the previous version: beside the file,
+/// as `Backup of <stem>.xlk` (dots in the stem are kept).
+fn backup_path(dest: &Path) -> std::path::PathBuf {
+    let stem = dest
+        .file_stem()
+        .map(|s| s.to_string_lossy())
+        .unwrap_or_default();
+    dest.with_file_name(format!("Backup of {stem}.xlk"))
+}
+
+/// Honour the package's *Always create backup* flag: keep the bytes the save
+/// is about to replace. A missing destination means no previous version;
+/// any other failure aborts the save before the file is touched. Read
+/// failures are reported against the workbook, write failures against the
+/// backup, so the status line names the real culprit.
+fn keep_backup(dest: &Path) -> io::Result<()> {
+    let bytes = match std::fs::read(dest) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("cannot read {}: {e}", dest.display()),
+            ));
+        }
+    };
+    let backup = backup_path(dest);
+    let write_ctx = |e: io::Error| {
+        io::Error::new(
+            e.kind(),
+            format!("cannot write backup {}: {e}", backup.display()),
+        )
+    };
+    // Mirror the file's permissions so a private workbook stays private —
+    // but always keep the backup owner-writable, or the next save could not
+    // replace it (a 0444 book would give a 0444 backup that write_atomic then
+    // refuses to open). Windows skips the mirroring: its only permission bit
+    // is readonly, which would brick the backup the same way.
+    #[cfg(unix)]
+    let mut perms = match std::fs::metadata(dest) {
+        Ok(meta) => meta.permissions(),
+        Err(e) => {
+            return Err(io::Error::new(
+                e.kind(),
+                format!("cannot read {}: {e}", dest.display()),
+            ));
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        perms.set_mode(perms.mode() | 0o200);
+        // Create the first backup already chmodded: a brand-new destination
+        // would be umask-default until write_atomic's rename lands, briefly
+        // world-readable. The empty file sends write_atomic down its
+        // replacement path, which preserves this mode.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(perms.mode())
+            .open(&backup)
+        {
+            Ok(_) => {}
+            // An existing backup gets its mode mirrored below; write_atomic
+            // replaces it on the permission-preserving path.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(write_ctx(e)),
+        }
+    }
+    write_atomic(&backup, &bytes).map_err(write_ctx)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&backup, perms).map_err(write_ctx)?;
+    Ok(())
 }
 
 fn is_delimited(path: &str) -> bool {
@@ -2581,6 +2656,13 @@ impl App {
             _ => None,
         };
         let bytes = self.package_bytes();
+        if self.pkg.always_create_backup() {
+            if let Err(e) = keep_backup(Path::new(&self.path)) {
+                let msg = format!("save failed: {e}");
+                self.status = Some(msg.clone());
+                return Err(msg);
+            }
+        }
         match export_atomic(
             self.import_source.as_deref().map(Path::new),
             Path::new(&self.path),
@@ -7434,6 +7516,20 @@ mod tests {
     use super::*;
     use gridcore::edit::parse_input;
     use gridcore::xlsx::save_xlsx;
+
+    /// `Backup of <stem>.xlk` lives beside the file; the stem keeps any
+    /// dots in the name.
+    #[test]
+    fn backup_path_names_the_xlk_beside_the_file() {
+        assert_eq!(
+            backup_path(Path::new("d/book.xlsx")),
+            Path::new("d/Backup of book.xlk")
+        );
+        assert_eq!(
+            backup_path(Path::new("d/my.book.xlsm")),
+            Path::new("d/Backup of my.book.xlk")
+        );
+    }
 
     /// #604: a workbook opens on the sheet it was saved on, and saving
     /// records the sheet the user is on.
