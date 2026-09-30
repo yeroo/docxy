@@ -27,6 +27,7 @@ mod control;
 mod dialog;
 mod dialog_host;
 mod harness;
+mod hf;
 mod html_bundle;
 mod layout_tab;
 mod menu;
@@ -52,7 +53,7 @@ use docxcore::editor::{Caret, Clip, Editor};
 use docxcore::model::{
     Align, Block, BorderKind, Document, Inline, ParBorders, Paragraph, RunProps, Table, VertAlign,
 };
-use docxcore::package::Package;
+use docxcore::package::{HeaderVariant, Package};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
@@ -1933,8 +1934,11 @@ struct HfEdit {
     editor: Editor,
     part_name: String,
     is_header: bool,
-    /// Which reference type is being edited: `"default"`, `"first"`, or `"even"`.
-    variant: &'static str,
+    /// The section whose header/footer is being edited (0-based). When that
+    /// section links to a previous one, `part_name` is the inherited part.
+    section: usize,
+    /// Which reference type is being edited: default, first page or even pages.
+    variant: HeaderVariant,
 }
 
 struct Docxy {
@@ -12077,7 +12081,7 @@ impl Docxy {
     fn enter_hf(
         &mut self,
         is_header: bool,
-        variant: &'static str,
+        variant: HeaderVariant,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -12096,9 +12100,9 @@ impl Docxy {
         if let Some(t) = self.tabs.get_mut(idx) {
             let region = if is_header { "header" } else { "footer" };
             let vlabel = match variant {
-                "first" => "first-page ",
-                "even" => "even-page ",
-                _ => "",
+                HeaderVariant::First => "first-page ",
+                HeaderVariant::Even => "even-page ",
+                HeaderVariant::Default => "",
             };
             t.status =
                 format!("Editing {vlabel}{region} — press Esc to return to the document").into();
@@ -12107,55 +12111,37 @@ impl Docxy {
     }
 }
 
-/// Open a document tab's header (or footer) `variant` for editing: resolve the
-/// part the final section references, or create one. Creating it adds a
-/// reference to the section, mirrored into the body editor as one undo step
-/// so Save keeps it. False (with the reason in the status) when the tab has
-/// no package or the part could not be created.
-fn open_hf_tab(tab: &mut DocTab, is_header: bool, variant: &'static str) -> bool {
-    let Some(pkg) = tab.pkg.as_ref() else {
-        tab.status = "Headers/footers need a .docx (not a Markdown document)".into();
-        return false;
-    };
-    let existing =
-        final_sect_pr(tab).and_then(|sect| hf_part_name_typed(pkg, sect, is_header, variant));
-    let part_name = match existing {
-        Some(n) => n,
-        None => match edit_final_sect_pr(tab, true, |pkg| pkg.create_hf(is_header, variant)) {
-            Some(Some(n)) => {
-                tab.dirty = true;
-                n
-            }
-            _ => {
-                tab.status = "Could not create the header/footer part".into();
-                return false;
-            }
-        },
-    };
-    let Some(pkg) = tab.pkg.as_ref() else {
-        return false;
-    };
-    let blocks = parse_hf_part(pkg, &part_name);
-    let doc = docxcore::model::Document { body: blocks };
-    tab.hf_edit = Some(HfEdit {
-        editor: Editor::new(doc),
-        part_name,
-        is_header,
-        variant,
-    });
-    true
+/// Open a document tab's header (or footer) `variant` for editing, in the
+/// section already being edited, else the section holding the body caret
+/// (#640). See [`hf::open`] for how the part is resolved or created.
+fn open_hf_tab(tab: &mut DocTab, is_header: bool, variant: HeaderVariant) -> bool {
+    let section = hf_section(tab);
+    hf::open(tab, section, is_header, variant)
 }
 
-/// Toggle "Different First Page" (`<w:titlePg/>`) in a tab's final section,
-/// the one the header/footer commands edit, as one body-editor undo step. The
-/// new state; false for a package-less tab.
+/// The section the header/footer commands act on: the one being edited, else
+/// the body caret's.
+fn hf_section(tab: &DocTab) -> usize {
+    match (&tab.hf_edit, &tab.surface) {
+        (Some(h), _) => h.section,
+        (None, Surface::Doc(ed)) => ed.caret_section(),
+        _ => 0,
+    }
+}
+
+/// Toggle "Different First Page" (`<w:titlePg/>`) in the section the
+/// header/footer commands act on ([`hf_section`]), as one body-editor undo
+/// step. The new state; false for a package-less tab.
 fn toggle_title_pg_tab(tab: &mut DocTab) -> bool {
+    let section = hf_section(tab);
     let (Some(_), Surface::Doc(ed)) = (tab.pkg.as_ref(), &mut tab.surface) else {
         return false;
     };
-    let last = ed.sections().len() - 1;
-    let on = !docxcore::sect::has_flag(&ed.sections()[last], "w:titlePg");
-    ed.edit_sections(&[last], |raw| {
+    let Some(sect) = ed.sections().get(section).cloned() else {
+        return false;
+    };
+    let on = !docxcore::sect::has_flag(&sect, "w:titlePg");
+    ed.edit_sections(&[section], |raw| {
         docxcore::sect::set_flag(raw, "w:titlePg", on)
     });
     tab.dirty = true;
@@ -12344,13 +12330,13 @@ impl Docxy {
         let idx = self.active;
         let on = self.tabs.get_mut(idx).is_some_and(toggle_title_pg_tab);
         if !on {
-            if let Some((is_h, "first")) = self
+            if let Some((is_h, HeaderVariant::First)) = self
                 .tabs
                 .get(idx)
                 .and_then(|t| t.hf_edit.as_ref())
                 .map(|h| (h.is_header, h.variant))
             {
-                return self.enter_hf(is_h, "default", window, cx);
+                return self.enter_hf(is_h, HeaderVariant::Default, window, cx);
             }
         }
         self.refocus(window, cx);
@@ -12370,13 +12356,13 @@ impl Docxy {
             }
         }
         if !on {
-            if let Some((is_h, "even")) = self
+            if let Some((is_h, HeaderVariant::Even)) = self
                 .tabs
                 .get(idx)
                 .and_then(|t| t.hf_edit.as_ref())
                 .map(|h| (h.is_header, h.variant))
             {
-                return self.enter_hf(is_h, "default", window, cx);
+                return self.enter_hf(is_h, HeaderVariant::Default, window, cx);
             }
         }
         self.refocus(window, cx);
@@ -12390,10 +12376,14 @@ impl Docxy {
         let hf = tab.and_then(|t| t.hf_edit.as_ref());
         let (is_header, variant) = hf
             .map(|h| (h.is_header, h.variant))
-            .unwrap_or((true, "default"));
-        let title_pg = tab
-            .and_then(final_sect_pr)
-            .is_some_and(|sect| docxcore::sect::has_flag(sect, "w:titlePg"));
+            .unwrap_or((true, HeaderVariant::Default));
+        let title_pg = tab.is_some_and(|t| match &t.surface {
+            Surface::Doc(ed) => ed
+                .sections()
+                .get(hf_section(t))
+                .is_some_and(|sect| docxcore::sect::has_flag(sect, "w:titlePg")),
+            _ => false,
+        });
         let even_odd = tab
             .and_then(|t| t.pkg.as_ref())
             .is_some_and(|p| p.has_even_odd());
@@ -12477,21 +12467,33 @@ impl Docxy {
             )
             .child(sep())
             .child(
-                pill("hf-def", "Default".into(), variant == "default").on_click(
-                    cx.listener(move |t, _, w, c| t.enter_hf(is_header, "default", w, c)),
-                ),
+                pill(
+                    "hf-def",
+                    "Default".into(),
+                    variant == HeaderVariant::Default,
+                )
+                .on_click(cx.listener(move |t, _, w, c| {
+                    t.enter_hf(is_header, HeaderVariant::Default, w, c)
+                })),
             )
             .when(title_pg, |d| {
                 d.child(
-                    pill("hf-first", "First page".into(), variant == "first").on_click(
-                        cx.listener(move |t, _, w, c| t.enter_hf(is_header, "first", w, c)),
-                    ),
+                    pill(
+                        "hf-first",
+                        "First page".into(),
+                        variant == HeaderVariant::First,
+                    )
+                    .on_click(cx.listener(move |t, _, w, c| {
+                        t.enter_hf(is_header, HeaderVariant::First, w, c)
+                    })),
                 )
             })
             .when(even_odd, |d| {
                 d.child(
-                    pill("hf-even", "Even".into(), variant == "even").on_click(
-                        cx.listener(move |t, _, w, c| t.enter_hf(is_header, "even", w, c)),
+                    pill("hf-even", "Even".into(), variant == HeaderVariant::Even).on_click(
+                        cx.listener(move |t, _, w, c| {
+                            t.enter_hf(is_header, HeaderVariant::Even, w, c)
+                        }),
                     ),
                 )
             })
@@ -17114,23 +17116,17 @@ fn edit_final_sect_pr<R>(
     Some(out)
 }
 
-/// Resolve the package part name (e.g. `word/header1.xml`) backing a specific
-/// header/footer reference type (`"default"`, `"first"`, `"even"`) in `sect`
-/// (the final section's `w:sectPr`, see [`final_sect_pr`]).
+/// The part a section's own header (`is_header`) or footer reference of type
+/// `wtype` names, if it has one (tests read saved sectPrs with it).
+#[cfg(test)]
 fn hf_part_name_typed(pkg: &Package, sect: &str, is_header: bool, wtype: &str) -> Option<String> {
-    let kind = if is_header {
-        "headerReference"
-    } else {
-        "footerReference"
-    };
-    let rid = docxcore::load::header_footer_ref_rid(sect, kind, wtype)?;
-    let rels_bytes = pkg.part("word/_rels/document.xml.rels")?;
-    let rels = docxcore::load::parse_rels_xml(&String::from_utf8_lossy(rels_bytes));
-    let target = rels.target(&rid)?;
-    Some(format!("word/{}", target.trim_start_matches('/')))
+    let rid = docxcore::sect::hf_reference(sect, is_header, wtype)?;
+    let rels = pkg.document_rels();
+    docxcore::package::resolve_document_relationship_target(rels.target(&rid)?)
 }
 
-/// Blocks of a specific header/footer variant, or empty if that ref is absent.
+/// Blocks of a section's own header/footer reference, or empty if absent.
+#[cfg(test)]
 fn header_footer_blocks_typed(
     pkg: &Package,
     sect: &str,
@@ -17217,9 +17213,11 @@ fn has_page_break(b: &Block) -> bool {
     matches!(b, Block::Paragraph(p) if p.content.iter().any(|i| matches!(i, Inline::Break(docxcore::model::BreakKind::Page))))
 }
 
-/// Group top-level block indices into pages by accumulated estimated height and
-/// hard page breaks. Returns `[start, end)` block ranges, one per page.
+/// Group top-level block indices into pages by accumulated estimated height,
+/// hard page breaks and section breaks that start a new page. Returns
+/// `[start, end)` block ranges, one per page.
 fn paginate(blocks: &[Block], content_h: f32, content_w: f32) -> Vec<(usize, usize)> {
+    let section_ends = hf::section_page_ends(blocks);
     let mut pages = Vec::new();
     let mut start = 0usize;
     let mut acc = 0.0_f32;
@@ -17231,7 +17229,7 @@ fn paginate(blocks: &[Block], content_h: f32, content_w: f32) -> Vec<(usize, usi
             acc = 0.0;
         }
         acc += bh;
-        if has_page_break(b) {
+        if has_page_break(b) || section_ends[i] {
             pages.push((start, i + 1));
             start = i + 1;
             acc = 0.0;
@@ -17255,6 +17253,7 @@ fn paginate_cols(
     col_w: f32,
     ncols: usize,
 ) -> Vec<Vec<(usize, usize)>> {
+    let section_ends = hf::section_page_ends(blocks);
     let mut pages: Vec<Vec<(usize, usize)>> = Vec::new();
     let mut page: Vec<(usize, usize)> = Vec::new();
     let mut start = 0usize;
@@ -17276,7 +17275,7 @@ fn paginate_cols(
             acc = 0.0;
         }
         acc += bh;
-        if has_page_break(b) {
+        if has_page_break(b) || section_ends[i] {
             flush_col(&mut page, &mut pages, start, i + 1);
             // A hard break ends the current column *and* the page.
             if !page.is_empty() {
@@ -18367,8 +18366,8 @@ impl Docxy {
             InsertSymbol => self.toggle_picker(PickKind::Symbol, window, cx),
             InsertEquation => self.toggle_picker(PickKind::Equation, window, cx),
             LineSpacing => self.toggle_picker(PickKind::LineSpacing, window, cx),
-            EditHeader => self.enter_hf(true, "default", window, cx),
-            EditFooter => self.enter_hf(false, "default", window, cx),
+            EditHeader => self.enter_hf(true, HeaderVariant::Default, window, cx),
+            EditFooter => self.enter_hf(false, HeaderVariant::Default, window, cx),
             PageNumber => self.insert_field("PAGE", "1", window, cx),
             Layout(act) => self.layout_act(act, window, cx),
             RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable => {
@@ -21251,63 +21250,47 @@ impl Render for Docxy {
                             probe.draft = false;
                             probe.painted = None;
                         }
-                        // Per-page header/footer. A section can carry distinct
-                        // first-page (w:titlePg) and even-page (evenAndOddHeaders)
-                        // variants; every other page uses the "default" one.
-                        // The section is the body editor's (see `final_sect_pr`),
-                        // so an undone header or titlePg shows as undone.
+                        // Per-page header/footer: each page shows the parts its own
+                        // section applies (Link to Previous resolved by docxcore) for
+                        // the variant that page takes (#640). Resolution reads the
+                        // body editor's sectPrs, so an undone header or titlePg
+                        // shows as undone.
                         let pkg = tab.pkg.as_ref();
-                        let sect = final_sect_pr(tab).unwrap_or_default();
-                        let title_pg = docxcore::sect::has_flag(sect, "w:titlePg");
+                        let sections = editor.sections();
                         let even_odd = pkg.is_some_and(|p| p.has_even_odd());
-                        let refp = |kind: &str, wt: &str| {
-                            docxcore::load::header_footer_ref_rid(sect, kind, wt).is_some()
-                        };
-                        let (h_first_ref, h_even_ref) = (
-                            refp("headerReference", "first"),
-                            refp("headerReference", "even"),
-                        );
-                        let (f_first_ref, f_even_ref) = (
-                            refp("footerReference", "first"),
-                            refp("footerReference", "even"),
-                        );
-                        let parse = |is_h: bool, wt: &str| {
-                            pkg.map(|p| header_footer_blocks_typed(p, sect, is_h, wt))
-                                .unwrap_or_default()
-                        };
-                        let (hdef, hfirst, heven) = (
-                            parse(true, "default"),
-                            parse(true, "first"),
-                            parse(true, "even"),
-                        );
-                        let (fdef, ffirst, feven) = (
-                            parse(false, "default"),
-                            parse(false, "first"),
-                            parse(false, "even"),
-                        );
-                        let variant_for = |page1: usize, is_h: bool| -> &'static str {
-                            let (fr, ev) = if is_h {
-                                (h_first_ref, h_even_ref)
-                            } else {
-                                (f_first_ref, f_even_ref)
-                            };
-                            if page1 == 1 && title_pg && fr {
-                                "first"
-                            } else if page1.is_multiple_of(2) && even_odd && ev {
-                                "even"
-                            } else {
-                                "default"
+                        let hf_parts = pkg.map(|p| hf::resolve(editor, p)).unwrap_or_default();
+                        let first_blocks: Vec<usize> = pages
+                            .iter()
+                            .map(|cols| cols.first().map_or(0, |c| c.0))
+                            .collect();
+                        let slots = hf::page_slots(editor, &first_blocks, even_odd);
+                        let mut part_blocks: std::collections::HashMap<&str, Vec<Block>> =
+                            std::collections::HashMap::new();
+                        if let Some(p) = pkg {
+                            for parts in &hf_parts {
+                                for a in parts.headers.iter().chain(&parts.footers).flatten() {
+                                    part_blocks
+                                        .entry(a.part_name.as_str())
+                                        .or_insert_with(|| parse_hf_part(p, &a.part_name));
+                                }
                             }
+                        }
+                        let page_part = |pi: usize, is_h: bool| -> Option<&str> {
+                            slots
+                                .get(pi)
+                                .and_then(|s| hf::slot_part(&hf_parts, *s, is_h))
                         };
-                        let pick = |is_h: bool, wt: &str| -> &[Block] {
-                            match (is_h, wt) {
-                                (true, "first") => &hfirst,
-                                (true, "even") => &heven,
-                                (true, _) => &hdef,
-                                (false, "first") => &ffirst,
-                                (false, "even") => &feven,
-                                (false, _) => &fdef,
-                            }
+                        let page_blocks = |pi: usize, is_h: bool| -> &[Block] {
+                            page_part(pi, is_h)
+                                .and_then(|n| part_blocks.get(n))
+                                .map_or(&[], Vec::as_slice)
+                        };
+                        // The header/footer distance of each page's section.
+                        let page_dist = |pi: usize, is_h: bool| -> i32 {
+                            slots
+                                .get(pi)
+                                .and_then(|s| sections.get(s.section))
+                                .map_or(720, |sect| hf::distance(sect, is_h))
                         };
                         // Header/footer text-area width, for the implicit centre/right tab stops.
                         let hf_w = self.zoom * (geom.w - geom.ml - geom.mr).max(0) as f32 / 15.0;
@@ -21324,22 +21307,14 @@ impl Render for Docxy {
                             meas: &measurer,
                             hf_width: Some(hf_w),
                         });
-                        // The first page whose region+variant matches the one being
-                        // edited is the editable page (fallback page 0, so the surface
-                        // is always visible even for a not-yet-shown variant).
-                        let edit_page = hf.map(|h| {
-                            (0..pages.len())
-                                .find(|&i| variant_for(i + 1, h.is_header) == h.variant)
-                                .unwrap_or(0)
-                        });
-                        let has_hf = [&hdef, &hfirst, &heven, &fdef, &ffirst, &feven]
-                            .iter()
-                            .any(|v| !v.is_empty())
-                            || hf.is_some();
+                        // The first page showing the edited section and variant is the
+                        // editable page (see `hf::edit_page`).
+                        let edit_page = hf.map(|h| hf::edit_page(&slots, h.section, h.variant));
+                        let has_hf = part_blocks.values().any(|v| !v.is_empty()) || hf.is_some();
                         // One region's margin content for a given page: the live editor
-                        // blocks (editable on the edit page), else the read-only variant.
+                        // blocks (editable on the edit page, read-only on every other
+                        // page showing the edited part), else the page's own part.
                         let region_children = |pi: usize, is_h: bool| -> Vec<AnyElement> {
-                            let dv = variant_for(pi + 1, is_h);
                             if let (Some(h), Some(ep)) = (hf, edit_page) {
                                 if h.is_header == is_h {
                                     if pi == ep {
@@ -21354,15 +21329,17 @@ impl Render for Docxy {
                                             })
                                             .collect();
                                     }
-                                    let blocks: &[Block] = if dv == h.variant {
-                                        &h.editor.doc.body
-                                    } else {
-                                        pick(is_h, dv)
-                                    };
-                                    return hf_els(blocks, doc_pal, &measurer, hf_w);
+                                    if page_part(pi, is_h) == Some(h.part_name.as_str()) {
+                                        return hf_els(
+                                            &h.editor.doc.body,
+                                            doc_pal,
+                                            &measurer,
+                                            hf_w,
+                                        );
+                                    }
                                 }
                             }
-                            hf_els(pick(is_h, dv), doc_pal, &measurer, hf_w)
+                            hf_els(page_blocks(pi, is_h), doc_pal, &measurer, hf_w)
                         };
                         // The middle content of a page: a single flow, or an N-column
                         // row (each column its own block range) when in columns mode.
@@ -21470,7 +21447,7 @@ impl Render for Docxy {
                                         .child(
                                             div()
                                                 .min_h(tw(geom.mt))
-                                                .pt(tw(geom.mt / 2))
+                                                .pt(tw(page_dist(pi, true)))
                                                 .pl(tw(geom.ml))
                                                 .pr(tw(geom.mr))
                                                 .bg(hdr_bg)
@@ -21478,8 +21455,10 @@ impl Render for Docxy {
                                         )
                                         .child(mid)
                                         .child(
-                                            div()
+                                            v_flex()
                                                 .min_h(tw(geom.mb))
+                                                .justify_end()
+                                                .pb(tw(page_dist(pi, false)))
                                                 .pl(tw(geom.ml))
                                                 .pr(tw(geom.mr))
                                                 .bg(ftr_bg)
