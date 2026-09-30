@@ -1026,6 +1026,7 @@ fn bracket_items(section: &str) -> Vec<String> {
     out
 }
 
+/// A format colour item: `[Red]`, `[Blue]`, …, or `[Color12]`.
 fn is_color_name(item: &str) -> bool {
     let l = item.to_ascii_lowercase();
     matches!(
@@ -1034,6 +1035,7 @@ fn is_color_name(item: &str) -> bool {
     ) || l.starts_with("color")
 }
 
+/// A currency symbol that makes a number format a currency (CELL's `C`).
 fn is_currency_char(c: char) -> bool {
     matches!(c, '$' | '€' | '£' | '¥' | '¢' | '₩' | '₹' | '₽')
 }

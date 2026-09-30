@@ -980,8 +980,8 @@ struct App {
     vis_subline: Vec<u8>,           // which wrapped sub-line of that row (parallel to vis_rows)
     tab_spans: Vec<(usize, u16, u16)>,
     ribbon_rows: u16,
-    /// A structural edit made a new circle: its warning is added to whatever
-    /// status the edit's caller sets, once the action is done
+    /// A cell or structural edit made a new circle: its warning is added to
+    /// whatever status the edit's caller sets, once the action is done
     /// ([`App::flush_circle_warning`]).
     circle_warning_pending: bool,
 }
@@ -1233,8 +1233,8 @@ impl App {
         self.pkg.workbook.iterate.is_none() && !self.engine.circular_refs().is_empty()
     }
 
-    /// Add a structural edit's pending circle warning to the status its
-    /// caller set ("Inserted 1 row. There are one or more circular …").
+    /// Add a cell or structural edit's pending circle warning to the status
+    /// its caller set ("Pasted. There are one or more circular …").
     fn flush_circle_warning(&mut self) {
         if !std::mem::take(&mut self.circle_warning_pending) {
             return;
@@ -5849,7 +5849,6 @@ fn draw_comments_panel(app: &App, f: &mut Frame, area: Rect) {
 // Events
 // ---------------------------------------------------------------------------
 
-/// Returns true when the app should exit.
 /// Run one control verb. A circle it made is announced on its own, or
 /// after the status the verb set, never appended to an earlier action's
 /// leftover status; a verb that says nothing leaves that status alone.
@@ -5867,6 +5866,7 @@ fn run_control(
     result
 }
 
+/// Returns true when the app should exit.
 fn handle_event(app: &mut App, ev: Event) -> bool {
     let quit = match ev {
         Event::Key(key) => handle_key(app, key),

@@ -6841,18 +6841,20 @@ mod tests {
         ])
     }
 
-    /// A workbook with Excel 2024's rich-error parts: A1..A5 are
-    /// `<v>#VALUE!</v>` with vm 1..5, standing for #SPILL!, #CALC!,
-    /// #GETTING_DATA, a plain #VALUE! and (vm 5, an XLDAPR entry) nothing.
-    /// The `_error` structure puts `errorType` second, so it must be found by
-    /// name.
+    /// Excel 2024's rich-error metadata: value-metadata entries 1..4 point at
+    /// rich values 0..3; entry 5 is an XLDAPR entry, not a rich value.
     const RICH_METADATA: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <metadata xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:xlrd="http://schemas.microsoft.com/office/spreadsheetml/2017/richdata"><metadataTypes count="2"><metadataType name="XLDAPR" minSupportedVersion="120000"/><metadataType name="XLRICHVALUE" minSupportedVersion="120000" copy="1" pasteAll="1" pasteValues="1" merge="1" splitFirst="1" rowColShift="1" clearFormats="1" clearComments="1" assign="1" coerce="1"/></metadataTypes><futureMetadata name="XLRICHVALUE" count="4"><bk><extLst><ext uri="{3e2802c4-a4d2-4d8b-9148-e3be6c30e623}"><xlrd:rvb i="0"/></ext></extLst></bk><bk><extLst><ext uri="{3e2802c4-a4d2-4d8b-9148-e3be6c30e623}"><xlrd:rvb i="1"/></ext></extLst></bk><bk><extLst><ext uri="{3e2802c4-a4d2-4d8b-9148-e3be6c30e623}"><xlrd:rvb i="2"/></ext></extLst></bk><bk><extLst><ext uri="{3e2802c4-a4d2-4d8b-9148-e3be6c30e623}"><xlrd:rvb i="3"/></ext></extLst></bk></futureMetadata><valueMetadata count="5"><bk><rc t="2" v="0"/></bk><bk><rc t="2" v="1"/></bk><bk><rc t="2" v="2"/></bk><bk><rc t="2" v="3"/></bk><bk><rc t="1" v="0"/></bk></valueMetadata></metadata>"#;
+    /// Rich `_error` values: #SPILL! (8), #CALC! (13), #GETTING_DATA (7) and
+    /// a plain #VALUE! (2).
     const RICH_VALUES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <rvData xmlns="http://schemas.microsoft.com/office/spreadsheetml/2017/richdata" count="4"><rv s="0"><v>0</v><v>8</v></rv><rv s="0"><v>0</v><v>13</v></rv><rv s="0"><v>0</v><v>7</v></rv><rv s="0"><v>0</v><v>2</v></rv></rvData>"#;
+    /// The `_error` structure, with `errorType` second so it must be found
+    /// by name.
     const RICH_STRUCTURES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <rvStructures xmlns="http://schemas.microsoft.com/office/spreadsheetml/2017/richdata" count="1"><s t="_error"><k n="propagated" t="b"/><k n="errorType" t="i"/></s></rvStructures>"#;
 
+    /// A one-sheet workbook with `rows` and the rich-error parts above.
     fn rich_error_fixture(rows: &str) -> Vec<u8> {
         let sheet = format!(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -6881,6 +6883,9 @@ mod tests {
         ])
     }
 
+    /// A1..A5 are `<v>#VALUE!</v>` with vm 1..5, standing for #SPILL!,
+    /// #CALC!, #GETTING_DATA, a plain #VALUE! and nothing; B1..B3 take
+    /// ERROR.TYPE of A1..A3.
     const RICH_ROWS: &str = r#"<row r="1"><c r="A1" t="e" vm="1"><v>#VALUE!</v></c><c r="B1"><f>ERROR.TYPE(A1)</f><v>3</v></c></row><row r="2"><c r="A2" t="e" vm="2"><v>#VALUE!</v></c><c r="B2"><f>ERROR.TYPE(A2)</f><v>3</v></c></row><row r="3"><c r="A3" t="e" vm="3"><v>#VALUE!</v></c><c r="B3"><f>ERROR.TYPE(A3)</f><v>3</v></c></row><row r="4"><c r="A4" t="e" vm="4"><v>#VALUE!</v></c></row><row r="5"><c r="A5" t="e" vm="5"><v>#VALUE!</v></c></row>"#;
 
     #[test]
@@ -7051,8 +7056,10 @@ mod tests {
         write_zip(&parts)
     }
 
+    /// The #678 filter: Region = East.
     const EAST_FILTER: &str = r#"<autoFilter ref="A1:C9"><filterColumn colId="0"><filters><filter val="East"/></filters></filterColumn></autoFilter>"#;
 
+    /// Recalculate the workbook and read `cells` on sheet `sheet`.
     fn recalc_values(pkg: &mut SheetPackage, sheet: usize, cells: &[&str]) -> Vec<CellValue> {
         let mut eng = crate::engine::Engine::new(&pkg.workbook);
         eng.recalc_all(&mut pkg.workbook);
