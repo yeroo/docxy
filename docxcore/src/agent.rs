@@ -407,6 +407,21 @@ pub fn append_blocks(ed: &mut Editor, blocks: Vec<Block>) {
     ed.paste(&Clip {
         paras: vec![Vec::new(); count + 1],
     });
+    // The paste moved a section mark on the last paragraph to its last
+    // placeholder (#748), which `overwrite_blocks` replaces: put it back on
+    // the paragraph, so the blocks land after it, in the final section.
+    if start > 0
+        && let Some(Block::Paragraph(p)) = ed.doc.body.get_mut(start + count - 1)
+    {
+        let brk = p.props.section_break.take();
+        let change = p.props.section_property_change.take();
+        if (brk.is_some() || change.is_some())
+            && let Some(Block::Paragraph(last)) = ed.doc.body.get_mut(start - 1)
+        {
+            last.props.section_break = brk;
+            last.props.section_property_change = change;
+        }
+    }
     overwrite_blocks(ed, start, blocks);
 }
 
@@ -1099,6 +1114,71 @@ mod tests {
         assert!(ed.undo());
         assert_eq!(paras(&ed.doc), vec!["existing"]);
         assert!(!ed.undo());
+    }
+
+    #[test]
+    fn append_blocks_after_a_section_closing_paragraph_keeps_the_section_748() {
+        use crate::model::{PropertyChange, PropertyScope, PropertySnapshot, PropertyState};
+        let brk = "<w:sectPr><w:type w:val=\"nextPage\"/></w:sectPr>".to_string();
+        let change = PropertyChange {
+            scope: PropertyScope::Section,
+            metadata: Default::default(),
+            raw: format!("<w:sectPrChange w:id=\"7\">{brk}</w:sectPrChange>"),
+            previous: PropertySnapshot::Present(PropertyState::Section(brk.clone())),
+        };
+        let mark = |ed: &Editor, i: usize| match &ed.doc.body[i] {
+            Block::Paragraph(p) => (
+                p.props.section_break.clone(),
+                p.props
+                    .section_property_change
+                    .as_ref()
+                    .map(|c| c.raw.clone()),
+            ),
+            _ => (None, None),
+        };
+        let sect_prs = |ed: &Editor| {
+            crate::serialize::document_to_xml(&ed.doc)
+                .matches("<w:sectPr")
+                .count()
+        };
+        let tables = "| a | b |\n| - | - |\n| 1 | 2 |";
+        for md in ["## Heading", "one\n\ntwo", &format!("one\n\n{tables}")] {
+            // "A" closes the first section; the final one is empty.
+            let mut doc = doc_with(&["A"]);
+            if let Block::Paragraph(p) = &mut doc.body[0] {
+                p.props.section_break = Some(brk.clone());
+                p.props.section_property_change = Some(change.clone());
+            }
+            doc.body.push(Block::SectionProperties(SectionProperties {
+                raw: "<w:sectPr/>".into(),
+                property_change: None,
+            }));
+            let mut ed = Editor::new(doc);
+            let before = ed.doc.clone();
+            let sections = ed.sections().len();
+            let saved = sect_prs(&ed);
+            let blocks = parse_markdown_blocks(md).unwrap();
+            let count = blocks.len();
+            assert_eq!(
+                md.contains('|'),
+                blocks.iter().any(|b| matches!(b, Block::Table(_))),
+                "{md}"
+            );
+            append_blocks(&mut ed, blocks);
+            assert_eq!(ed.doc.content_block_count(), 1 + count, "{md}");
+            assert_eq!(ed.sections().len(), sections, "{md}");
+            assert_eq!(sect_prs(&ed), saved, "{md}");
+            assert_eq!(
+                mark(&ed, 0),
+                (Some(brk.clone()), Some(change.raw.clone())),
+                "{md}"
+            );
+            for i in 1..=count {
+                assert_eq!(mark(&ed, i), (None, None), "{md}: block {i}");
+            }
+            assert!(ed.undo());
+            assert_eq!(ed.doc, before, "{md}");
+        }
     }
 
     #[test]
