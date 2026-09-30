@@ -11,9 +11,25 @@ use crate::dialog::{self, ControlKind, Dialog, DialogOwner, DialogStack, NONE_OP
 fn apply_dialog(
     surface: &mut Surface,
     pkg: Option<&mut Package>,
+    hf: Option<&mut Editor>,
     dialog: &Dialog,
 ) -> Result<bool, String> {
     match dialog.owner {
+        DialogOwner::InsertTable
+        | DialogOwner::DeleteCells
+        | DialogOwner::SplitCells
+        | DialogOwner::SortTable
+        | DialogOwner::TableToText
+        | DialogOwner::TextToTable => {
+            // A table dialog acts where the caret is typing: the open header
+            // or footer, else the body.
+            let ed = match (hf, surface) {
+                (Some(ed), _) => ed,
+                (None, Surface::Doc(ed)) => ed,
+                _ => return Err("this dialog belongs to a document".into()),
+            };
+            crate::table_dialogs::apply_table_dialog(ed, dialog)
+        }
         DialogOwner::DeleteSummary { uid } => {
             let Surface::Project(v) = surface else {
                 return Err("this dialog belongs to a Project".into());
@@ -43,11 +59,17 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Result<(), String>
         dialogs,
         surface,
         pkg,
+        hf_edit,
         ..
     } = tab;
     let mut changed = false;
     dialogs.click(button, |d| {
-        changed = apply_dialog(surface, pkg.as_mut(), d)?;
+        changed = apply_dialog(
+            surface,
+            pkg.as_mut(),
+            hf_edit.as_mut().map(|h| &mut h.editor),
+            d,
+        )?;
         Ok(())
     })?;
     if changed {

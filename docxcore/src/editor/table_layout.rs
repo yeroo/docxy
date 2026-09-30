@@ -1673,6 +1673,45 @@ mod tests {
         );
     }
 
+    /// Ported from the suite's old Table Tools test: inserting at a content
+    /// control's first row joins that control; inserting after its last row
+    /// stays outside; deleting keeps the remaining ownership.
+    #[test]
+    fn row_commands_keep_content_control_ownership() {
+        let adjacent = || {
+            let mut doc = grid_doc(2, 1);
+            let Block::Table(tb) = &mut doc.body[0] else {
+                panic!()
+            };
+            tb.row_boundaries = vec![
+                TableRowBoundary::sdt_open(0, "<w:sdt><w:sdtContent>"),
+                TableRowBoundary::sdt_close(1, "</w:sdtContent></w:sdt>"),
+                TableRowBoundary::sdt_open(1, "<w:sdt><w:sdtContent>"),
+                TableRowBoundary::sdt_close(2, "</w:sdtContent></w:sdt>"),
+            ];
+            Editor::new(doc)
+        };
+        for (above, row) in [(true, 1), (false, 0)] {
+            let mut ed = adjacent();
+            ed.caret = at(row, 0);
+            ed.insert_rows(above).unwrap();
+            assert_eq!(ed.caret.path[1], 1);
+            assert_eq!(
+                t(&ed).row_control_owners(),
+                Ok(vec![vec![0], vec![2], vec![2]])
+            );
+        }
+        let mut ed = adjacent();
+        ed.caret = at(0, 0);
+        ed.delete_rows().unwrap();
+        assert_eq!(t(&ed).row_control_owners(), Ok(vec![vec![2]]));
+        let back = roundtrip(&ed);
+        let Block::Table(bt) = &back.body[0] else {
+            panic!()
+        };
+        assert_eq!(bt.row_control_owners(), Ok(vec![vec![2]]));
+    }
+
     #[test]
     fn split_table_moves_rows_to_a_new_table_after_a_paragraph() {
         let mut ed = Editor::new(grid_doc(3, 2));

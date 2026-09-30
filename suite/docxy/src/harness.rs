@@ -1006,6 +1006,7 @@ struct ViewFlags {
     notes: bool,
     zoom: f32,
     dark: bool,
+    gridlines: bool,
 }
 
 impl ViewFlags {
@@ -1020,6 +1021,7 @@ impl ViewFlags {
             notes: app.show_notes,
             zoom: app.zoom,
             dark: app.theme_pref.resolve(window.appearance()) == gpui_component::ThemeMode::Dark,
+            gridlines: app.view_gridlines,
         }
     }
 }
@@ -1129,6 +1131,7 @@ fn doc_state(editor: &Editor, flags: &ViewFlags) -> Json {
             "theme",
             Json::Str(if flags.dark { "dark" } else { "light" }.into()),
         ),
+        ("gridlines", Json::Bool(flags.gridlines)),
     ]);
     Json::obj(vec![
         ("text", Json::Str(flat.main().text.clone())),
@@ -1158,6 +1161,55 @@ fn doc_state(editor: &Editor, flags: &ViewFlags) -> Json {
         ("para", para),
         ("run", run),
         ("view", view),
+        ("table", table_state(editor)),
+    ])
+}
+
+/// The caret's innermost table (#705), or null: its row count, the caret's
+/// row and cell, its style, the cell-range selection, and each cell's
+/// paragraphs as text (a tab shows as `⇥`, as the issues write it, so a
+/// script can name it).
+fn table_state(editor: &Editor) -> Json {
+    let Some(pos) = editor.table_at_caret() else {
+        return Json::Null;
+    };
+    let Some(t) = editor.table(&pos.table) else {
+        return Json::Null;
+    };
+    let cells = t
+        .rows
+        .iter()
+        .map(|row| {
+            Json::Arr(
+                row.cells
+                    .iter()
+                    .map(|cell| {
+                        Json::Arr(
+                            cell.blocks
+                                .iter()
+                                .map(|b| Json::Str(b.plain_text().replace('\t', "⇥")))
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    let range = editor.cell_range().map_or(Json::Null, |r| {
+        Json::obj(vec![
+            ("top", Json::Num(r.top as f64)),
+            ("bottom", Json::Num(r.bottom as f64)),
+            ("left", Json::Num(r.left as f64)),
+            ("right", Json::Num(r.right as f64)),
+        ])
+    });
+    Json::obj(vec![
+        ("rows", Json::Num(t.rows.len() as f64)),
+        ("row", Json::Num(pos.row as f64)),
+        ("cell", Json::Num(pos.cell as f64)),
+        ("style", str_or_null(editor.table_style())),
+        ("range", range),
+        ("cells", Json::Arr(cells)),
     ])
 }
 
@@ -1381,7 +1433,11 @@ impl RibbonCommand {
             ..Self::from_cmd(cmd)
         }
     }
-    fn json(&self, checked: &impl Fn(&RibbonCommand) -> bool) -> Json {
+    fn json(
+        &self,
+        checked: &impl Fn(&RibbonCommand) -> bool,
+        enabled: &impl Fn(crate::Act) -> bool,
+    ) -> Json {
         let mut fields = vec![
             ("id", Json::Str(self.id.clone())),
             ("label", Json::Str(self.label.clone())),
@@ -1395,7 +1451,7 @@ impl RibbonCommand {
             ("key_tip", Json::Str(self.key_tip.clone())),
             ("checked", Json::Bool(checked(self))),
             // The predicate the button draws with (#397).
-            ("enabled", Json::Bool(crate::act_enabled(self.act))),
+            ("enabled", Json::Bool(enabled(self.act))),
         ];
         if let Some(menu) = &self.menu {
             fields.push(("menu", Json::Str(menu.clone())));
@@ -1453,7 +1509,11 @@ fn tab_commands(tab: &crate::rs::Tab<crate::Act>) -> Vec<RibbonCommand> {
 }
 
 /// Groups and controls as the renderer presents one tab.
-fn tab_json(tab: &crate::rs::Tab<crate::Act>, checked: &impl Fn(&RibbonCommand) -> bool) -> Json {
+fn tab_json(
+    tab: &crate::rs::Tab<crate::Act>,
+    checked: &impl Fn(&RibbonCommand) -> bool,
+    enabled: &impl Fn(crate::Act) -> bool,
+) -> Json {
     let groups = tab
         .groups
         .iter()
@@ -1477,7 +1537,7 @@ fn tab_json(tab: &crate::rs::Tab<crate::Act>, checked: &impl Fn(&RibbonCommand) 
                 ("launcher", Json::Bool(group.launcher.is_some())),
                 (
                     "commands",
-                    Json::Arr(commands.iter().map(|c| c.json(checked)).collect()),
+                    Json::Arr(commands.iter().map(|c| c.json(checked, enabled)).collect()),
                 ),
                 ("galleries", Json::Arr(galleries)),
             ])
@@ -1492,20 +1552,41 @@ fn tab_json(tab: &crate::rs::Tab<crate::Act>, checked: &impl Fn(&RibbonCommand) 
 }
 
 /// Pure ribbon snapshot for a tab kind and its table and Gantt contexts.
+#[cfg(test)]
 fn ribbon_json_for(
     kind: crate::Kind,
     in_table: bool,
     in_gantt: bool,
     checked: impl Fn(&RibbonCommand) -> bool,
 ) -> Json {
+    ribbon_json_with(kind, in_table, in_gantt, checked, crate::act_enabled)
+}
+
+/// [`ribbon_json_for`] with the enabled predicate the buttons draw with.
+fn ribbon_json_with(
+    kind: crate::Kind,
+    in_table: bool,
+    in_gantt: bool,
+    checked: impl Fn(&RibbonCommand) -> bool,
+    enabled: impl Fn(crate::Act) -> bool,
+) -> Json {
     let ribbon = crate::ribbon_for(kind);
     let mut tabs = vec![file_tab_json(kind)];
-    tabs.extend(ribbon.tabs.iter().map(|t| tab_json(t, &checked)));
+    tabs.extend(ribbon.tabs.iter().map(|t| tab_json(t, &checked, &enabled)));
     if kind == crate::Kind::Docx && in_table {
-        tabs.push(tab_json(&crate::table_tab(), &checked));
+        tabs.push(tab_json(
+            &crate::table_tab::table_design_tab(),
+            &checked,
+            &enabled,
+        ));
+        tabs.push(tab_json(
+            &crate::table_tab::table_layout_tab(),
+            &checked,
+            &enabled,
+        ));
     }
     if kind == crate::Kind::Project && in_gantt {
-        tabs.push(tab_json(&crate::gantt_format_tab(), &checked));
+        tabs.push(tab_json(&crate::gantt_format_tab(), &checked, &enabled));
     }
     ribbon_reply(tabs)
 }
@@ -1551,14 +1632,20 @@ fn ribbon_reply(tabs: Vec<Json>) -> Json {
 
 /// Ribbon snapshot using the active tab and live checked states.
 fn ribbon_json(app: &crate::Docxy) -> Json {
-    let (kind, in_table) = (app.ribbon_kind(), app.caret_table().is_some());
-    ribbon_json_for(kind, in_table, app.project_gantt_showing(), |command| {
-        if command.gallery {
-            app.gallery_item_selected(command.act)
-        } else {
-            app.act_active(command.act)
-        }
-    })
+    let (kind, in_table) = (app.ribbon_kind(), app.caret_in_table());
+    ribbon_json_with(
+        kind,
+        in_table,
+        app.project_gantt_showing(),
+        |command| {
+            if command.gallery && !matches!(command.act, crate::Act::Table(_)) {
+                app.gallery_item_selected(command.act)
+            } else {
+                app.act_active(command.act)
+            }
+        },
+        |act| app.act_enabled_now(act),
+    )
 }
 
 /// Resolve a currently valid tab name before a synthetic ribbon click.
@@ -1566,8 +1653,14 @@ fn ribbon_tab_by_name(kind: crate::Kind, name: &str) -> Result<crate::RibbonTab,
     crate::ribbon_tab_set(kind)
         .iter()
         .find_map(|(tab, label, _)| (*label == name).then_some(*tab).flatten())
-        .or_else(|| {
-            (kind == crate::Kind::Docx && name == "Table").then_some(crate::RibbonTab::Table)
+        .or_else(|| match name {
+            crate::table_tab::DESIGN_TAB if kind == crate::Kind::Docx => {
+                Some(crate::RibbonTab::TableDesign)
+            }
+            crate::table_tab::LAYOUT_TAB if kind == crate::Kind::Docx => {
+                Some(crate::RibbonTab::TableLayout)
+            }
+            _ => None,
         })
         .or_else(|| {
             (kind == crate::Kind::Project
@@ -1599,12 +1692,18 @@ fn ribbon_tab_def(
 ) -> Result<crate::rs::Tab<crate::Act>, String> {
     let kind = app.ribbon_kind();
     ribbon_tab_by_name(kind, tab_name)?;
-    let in_table = app.caret_table().is_some();
-    let tab = if tab_name == "Table" {
+    let in_table = app.caret_in_table();
+    let tab = if tab_name == crate::table_tab::DESIGN_TAB
+        || tab_name == crate::table_tab::LAYOUT_TAB
+    {
         if !in_table {
-            return Err("Table tab is not active outside a table".into());
+            return Err(format!("{tab_name} tab is not active outside a table"));
         }
-        crate::table_tab()
+        if tab_name == crate::table_tab::DESIGN_TAB {
+            crate::table_tab::table_design_tab()
+        } else {
+            crate::table_tab::table_layout_tab()
+        }
     } else if tab_name == crate::ribbon_tab_name(crate::RibbonTab::GanttFormat) {
         if !app.project_gantt_showing() {
             return Err("Gantt Chart Format tab is not active without a Gantt view".into());
@@ -1954,7 +2053,7 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
                 crate::ribbon_tab_name(crate::valid_ribbon_tab(
                     app.ribbon_kind(),
                     app.ribbon_tab,
-                    app.caret_table().is_some(),
+                    app.caret_in_table(),
                     app.project_gantt_showing(),
                 ))
                 .into(),
@@ -2396,6 +2495,27 @@ pub fn dispatch(
             Done::ok(crate::menu::read_json(app.menu.as_ref()))
         }
         "menu-read" => Done::ok(crate::menu::read_json(app.menu.as_ref())),
+        // Insert > Table's hover grid (#646): `{cols, rows}` moves the pointer
+        // over that cell (`{}` off the grid), `click: true` clicks it. The
+        // same handlers the drawn cells call; the reply carries the header.
+        "table-grid" => {
+            app.refuse_under_dialog()?;
+            let at = match (args.get("cols"), args.get("rows")) {
+                (None, None) => None,
+                _ => Some((arg_usize(args, "cols")?, arg_usize(args, "rows")?)),
+            };
+            let click = matches!(args.get("click"), Some(Json::Bool(true)));
+            let header = crate::table_tab::grid_header(at);
+            match (at, click) {
+                (Some((c, r)), true) => app.table_grid_click(c, r, window, cx)?,
+                (None, true) => return Err("a click names 'cols' and 'rows'".into()),
+                (at, false) => app.table_grid_hover(at, cx)?,
+            }
+            Done::ok(Json::obj(vec![
+                ("header", Json::Str(header)),
+                ("state", state(app, window)),
+            ]))
+        }
         "menu-click" => {
             app.refuse_under_dialog()?;
             refuse_under_cover(app)?;
@@ -3282,6 +3402,7 @@ mod tests {
             notes: true,
             zoom: 1.5,
             dark: true,
+            gridlines: true,
         };
         let state = doc_state(&editor(props, run), &flags);
         assert_eq!(state.get_str("text"), Some("abc\n"));
@@ -3358,6 +3479,7 @@ mod tests {
                 notes: false,
                 zoom: 1.0,
                 dark: false,
+                gridlines: true,
             },
         );
         assert_ne!(state.get("para"), defaults.get("para"));
@@ -3454,6 +3576,7 @@ mod tests {
                 notes: false,
                 zoom: 1.0,
                 dark: false,
+                gridlines: true,
             },
         );
         assert_eq!(state.get("cross_story"), Some(&Json::Bool(true)));
@@ -3488,7 +3611,9 @@ mod tests {
             vec!["File", "Home", "Insert", "Layout", "Review", "View"]
         );
         let tabs_on = on.get("tabs").unwrap().as_array().unwrap();
-        assert_eq!(tabs_on.last().unwrap().get_str("name"), Some("Table"));
+        let n = tabs_on.len();
+        assert_eq!(tabs_on[n - 2].get_str("name"), Some("Table Design"));
+        assert_eq!(tabs_on[n - 1].get_str("name"), Some("Table Layout"));
         let groups = tabs_on[1].get("groups").unwrap().as_array().unwrap();
         let commands: Vec<&Json> = groups
             .iter()
@@ -3704,7 +3829,8 @@ mod tests {
             let ribbon = crate::ribbon_for(kind);
             let mut defs: Vec<RibbonCommand> = ribbon.tabs.iter().flat_map(tab_commands).collect();
             if kind == crate::Kind::Docx {
-                defs.extend(tab_commands(&crate::table_tab()));
+                defs.extend(tab_commands(&crate::table_tab::table_design_tab()));
+                defs.extend(tab_commands(&crate::table_tab::table_layout_tab()));
             } else {
                 defs.extend(tab_commands(&crate::gantt_format_tab()));
             }

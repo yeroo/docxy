@@ -82,15 +82,18 @@ test style gallery selects one paragraph style
   assert reply.tabs.1.groups.3.commands.1.checked is false
   assert reply.tabs.1.groups.3.commands.2.checked is true
 
-test table context follows the caret and exposes Table ribbon
+test table context follows the caret and exposes the table tabs
   open ../fixtures/doc-table.docx
   call selection-set {"start":7,"end":7}
   assert para.index is 1
   call ribbon-read {}
-  assert reply.tab_count is 7
-  assert reply.tabs.6.name is Table
+  assert reply.tab_count is 8
+  assert reply.tabs.6.name is Table Design
+  assert reply.tabs.7.name is Table Layout
   key alt t escape escape
-  assert ribbon_tab is Table
+  assert ribbon_tab is Table Design
+  key alt j escape escape
+  assert ribbon_tab is Table Layout
   call selection-set {"start":0,"end":0}
   assert ribbon_tab is Home
   call ribbon-read {}
