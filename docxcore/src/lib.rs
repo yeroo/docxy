@@ -46,3 +46,5 @@ pub mod review;
 pub mod sect;
 pub mod serialize;
 pub mod styles;
+pub mod table;
+pub mod table_props;

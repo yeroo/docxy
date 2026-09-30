@@ -1172,13 +1172,54 @@ fn write_row(s: &mut String, row: &Row) {
     s.push_str("</w:tr>");
 }
 
+/// `raw` (a cell's verbatim tcPr) with `w:gridSpan`/`w:vMerge` set from the
+/// model when they disagree with it; `raw` unchanged otherwise.
+fn tcpr_with_model_merge<'a>(raw: &'a str, cell: &Cell) -> std::borrow::Cow<'a, str> {
+    use crate::table_props::{PropsXml, TCPR_ORDER};
+    let mut props = PropsXml::parse(raw, "w:tcPr", TCPR_ORDER);
+    let span = props
+        .attr("w:gridSpan", "w:val")
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let merge = match props.get("w:vMerge") {
+        None => VMerge::None,
+        Some(_) if props.attr("w:vMerge", "w:val").as_deref() == Some("restart") => VMerge::Restart,
+        Some(_) => VMerge::Continue,
+    };
+    let want_span = cell.grid_span.max(1);
+    if span == want_span && merge == cell.v_merge {
+        return std::borrow::Cow::Borrowed(raw);
+    }
+    if span != want_span {
+        if want_span > 1 {
+            props.set(&format!("<w:gridSpan w:val=\"{want_span}\"/>"));
+        } else {
+            props.remove("w:gridSpan");
+        }
+    }
+    if merge != cell.v_merge {
+        match cell.v_merge {
+            VMerge::None => {
+                props.remove("w:vMerge");
+            }
+            VMerge::Restart => props.set("<w:vMerge w:val=\"restart\"/>"),
+            VMerge::Continue => props.set("<w:vMerge/>"),
+        }
+    }
+    std::borrow::Cow::Owned(props.to_xml())
+}
+
 fn write_cell(s: &mut String, cell: &Cell) {
     s.push_str("<w:tc>");
     if let Some(raw) = &cell.raw_tcpr {
-        // The original tcPr (already carries gridSpan/vMerge) — re-emit as-is so
-        // borders/shading/width/vAlign survive.
+        // The original tcPr, re-emitted as-is so borders/shading/width/vAlign
+        // survive. The model's gridSpan/vMerge win: they are rewritten inside
+        // it only when a table edit changed them, so untouched cells stay
+        // byte-identical.
+        let raw = tcpr_with_model_merge(raw, cell);
         s.push_str(&with_property_change(
-            raw,
+            &raw,
             "w:tcPr",
             cell.property_change.as_ref(),
         ));
@@ -1229,6 +1270,52 @@ mod tests {
     }
     fn para(props: ParProps, content: Vec<Inline>) -> Block {
         Block::Paragraph(Paragraph { props, content })
+    }
+
+    #[test]
+    fn raw_tcpr_takes_merge_fields_from_the_model_only_when_they_changed() {
+        let raw = "<w:tcPr><w:tcW w:w=\"2000\" w:type=\"dxa\"/><w:gridSpan w:val=\"2\"/>\
+                   <w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"FF0000\"/></w:tcPr>";
+        let mut cell = Cell {
+            grid_span: 2,
+            raw_tcpr: Some(raw.to_string()),
+            blocks: vec![para(ParProps::default(), vec![])],
+            ..Cell::default()
+        };
+        let mut out = String::new();
+        write_cell(&mut out, &cell);
+        assert!(
+            out.contains(raw),
+            "an unchanged cell stays byte-identical: {out}"
+        );
+
+        cell.grid_span = 1;
+        cell.v_merge = VMerge::Restart;
+        let mut out = String::new();
+        write_cell(&mut out, &cell);
+        assert!(
+            out.contains(
+                "<w:tcPr><w:tcW w:w=\"2000\" w:type=\"dxa\"/><w:vMerge w:val=\"restart\"/>\
+                 <w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"FF0000\"/></w:tcPr>"
+            ),
+            "{out}"
+        );
+        let doc = Document {
+            body: vec![Block::Table(Table {
+                grid: vec![2000],
+                rows: vec![Row {
+                    cells: vec![cell],
+                    ..Row::default()
+                }],
+                ..Table::default()
+            })],
+        };
+        let back = roundtrip(&doc, &Relationships::default());
+        let Block::Table(t) = &back.body[0] else {
+            panic!("table")
+        };
+        assert_eq!(t.rows[0].cells[0].grid_span, 1);
+        assert_eq!(t.rows[0].cells[0].v_merge, VMerge::Restart);
     }
 
     #[test]
