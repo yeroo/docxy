@@ -1067,6 +1067,23 @@ fn clip_still_ours(recorded: &str, now: &ClipRead) -> bool {
     }
 }
 
+/// The text to record for a copy that wrote `wrote`, given what the clipboard
+/// holds `now`, read back after the write. A write can fail without a word
+/// (another process holds the OS clipboard), leaving someone else's older
+/// copy there; recording `wrote` would then make the next paste take that
+/// older copy instead of ours. So record what the clipboard holds: our clip
+/// stays ours until the clipboard changes again. A text-less item records
+/// `""`, which [`clip_still_ours`] counts as ours while no text appears; an
+/// unreadable clipboard cannot say the write failed.
+fn recorded_after_write(wrote: String, now: &ClipRead) -> String {
+    match now {
+        ClipRead::Nothing => wrote,
+        ClipRead::NotText => String::new(),
+        ClipRead::Text(_) if clip_still_ours(&wrote, now) => wrote,
+        ClipRead::Text(held) => held.clone(),
+    }
+}
+
 /// The text clipboard the app reads and writes (#699). A normal instance uses
 /// the OS clipboard; a harness instance keeps a private one, so a UI test can
 /// neither read nor overwrite what the person at the machine copied, and
@@ -9493,6 +9510,13 @@ impl Docxy {
         });
     }
 
+    /// Write `text` to the clipboard and return the text a copy should record
+    /// for it: `text`, unless the write did not take ([`recorded_after_write`]).
+    fn clipboard_write_recorded(&mut self, text: String, cx: &mut App) -> String {
+        self.clipboard_write(text.clone(), cx);
+        recorded_after_write(text, &self.clipboard_read(cx))
+    }
+
     /// What the clipboard holds: the OS one, or the private one in a harness.
     fn clipboard_read(&self, cx: &App) -> ClipRead {
         self.clipboard.read(self.harness.is_some(), || {
@@ -9523,11 +9547,8 @@ impl Docxy {
             cells.push(row);
             tsv.push('\n');
         }
-        self.grid_clip = Some(GridClip {
-            cells,
-            text: tsv.clone(),
-        });
-        self.clipboard_write(tsv, cx);
+        let text = self.clipboard_write_recorded(tsv, cx);
+        self.grid_clip = Some(GridClip { cells, text });
         if cut {
             self.sheet_clear(cx); // snapshots, clears the range, marks dirty
         } else {
@@ -12864,12 +12885,8 @@ impl Docxy {
             .edit_target()
             .and_then(|ed| if cut { ed.cut() } else { ed.copy() });
         if let Some(clip) = clip {
-            let text = clip.to_text();
-            self.clip = Some(DocClip {
-                clip,
-                text: text.clone(),
-            });
-            self.clipboard_write(text, cx);
+            let text = self.clipboard_write_recorded(clip.to_text(), cx);
+            self.clip = Some(DocClip { clip, text });
             if cut {
                 if let Some(t) = self.tabs.get_mut(self.active) {
                     t.dirty = true;
@@ -14942,7 +14959,9 @@ fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) -> bool
 
 #[cfg(test)]
 mod clipboard_tests {
-    use super::{ClipRead, ClipboardStore, clip_still_ours, paste_grid_block};
+    use super::{
+        ClipRead, ClipboardStore, clip_still_ours, paste_grid_block, recorded_after_write,
+    };
     use gridcore::engine::Engine;
     use gridcore::sheet::{Cell, CellValue, Sheet, Workbook};
 
@@ -15041,6 +15060,28 @@ mod clipboard_tests {
         assert!(clip_still_ours("", &ClipRead::NotText));
         assert!(clip_still_ours("", &ClipRead::Nothing));
         assert!(!clip_still_ours("", &ClipRead::Text("older".into())));
+    }
+
+    /// #755: a copy records what the clipboard holds after its write. When the
+    /// write took (the OS may hand CRLF back) that is our text; when it failed
+    /// silently, the older copy left there, so the next paste still takes our
+    /// clip rather than that older copy.
+    #[test]
+    fn a_copy_records_what_the_clipboard_holds_after_its_write() {
+        let ours = "a\tb\n1\t2\n".to_string();
+        let text = |t: &str| ClipRead::Text(t.into());
+        assert_eq!(recorded_after_write(ours.clone(), &text(&ours)), ours);
+        let crlf = text("a\tb\r\n1\t2\r\n");
+        assert_eq!(recorded_after_write(ours.clone(), &crlf), ours);
+        let older = text("older");
+        let recorded = recorded_after_write(ours.clone(), &older);
+        assert_eq!(recorded, "older");
+        assert!(clip_still_ours(&recorded, &older));
+        let recorded = recorded_after_write(ours.clone(), &ClipRead::NotText);
+        assert_eq!(recorded, "");
+        assert!(clip_still_ours(&recorded, &ClipRead::NotText));
+        assert!(!clip_still_ours(&recorded, &text("newer")));
+        assert_eq!(recorded_after_write(ours.clone(), &ClipRead::Nothing), ours);
     }
 }
 
