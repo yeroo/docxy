@@ -68,7 +68,7 @@ fn tab_close_driver_preserves_work_and_persists_removals() {
     for (kind, fixture, cell) in [
         ("docx", "basic.docx", None),
         ("xlsx", "basic.xlsx", Some("A1")),
-        ("project", "gantt-summary.xml", Some("B2")),
+        ("project", "gantt-summary.xml", Some("C2")),
     ] {
         for on in [true, false] {
             // These are the copies written by the .uit Save cases. Verify
