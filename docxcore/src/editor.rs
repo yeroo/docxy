@@ -14,9 +14,11 @@ use crate::review::{RevisionAction, RevisionOutcome};
 
 mod flat;
 mod sections;
+mod table_design;
 mod table_layout;
 mod tables;
 pub use flat::{FlatDocument, FlatStory, StoryOffset};
+pub use table_design::BorderCmd;
 pub use table_layout::{AutoFitKind, CellSep, DeleteShift, SortKey, SortKind, SortSpec};
 pub use tables::{CellRange, TablePos};
 

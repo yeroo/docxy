@@ -1456,6 +1456,24 @@ impl Package {
     }
 }
 
+/// Define in `styles.xml` every built-in table style the document's tables
+/// reference but the part lacks (#648): picking a gallery style writes only
+/// `w:tblStyle`, so the definition is added here, at save, strictly
+/// additively. A package without a styles part is left alone.
+fn add_referenced_table_styles(parts: &mut [(String, Vec<u8>)], document: &Document) {
+    let ids = crate::table_styles::referenced_table_styles(document);
+    if ids.is_empty() {
+        return;
+    }
+    let Some((_, bytes)) = parts.iter_mut().find(|(n, _)| n == "word/styles.xml") else {
+        return;
+    };
+    let xml = String::from_utf8_lossy(bytes).into_owned();
+    if let Some(updated) = crate::table_styles::with_table_styles(&xml, &ids) {
+        *bytes = updated.into_bytes();
+    }
+}
+
 /// The `<w:style>` XML definition for one of the styles Markdown maps onto
 /// (`HeadingN` for `N` in `1..=6`, `Quote`, `SourceCode`, `Code`), or `None`
 /// for any other id. Shared by [`markdown_styles_xml`] (which defines the full
@@ -1798,6 +1816,7 @@ pub fn save_package(pkg: &Package) -> Vec<u8> {
     // a relationship for each before serializing so the URL survives the save.
     let mut document = pkg.document.clone();
     let mut parts = pkg.parts.clone();
+    add_referenced_table_styles(&mut parts, &document);
     let rels_name = "word/_rels/document.xml.rels";
     if let Some((_, rels_bytes)) = parts.iter().find(|(n, _)| n == rels_name) {
         let mut new_rels = String::new();
