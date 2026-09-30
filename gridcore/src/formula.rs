@@ -2382,6 +2382,23 @@ pub trait Resolver {
         let _ = (sheet, row);
         false
     }
+    /// Whether a worksheet row is hidden by a filter (not by hand). Used by
+    /// `SUBTOTAL(1..11)`, which skips filtered rows but counts hand-hidden
+    /// ones.
+    fn row_filtered(&self, sheet: usize, row: u32) -> bool {
+        let _ = (sheet, row);
+        false
+    }
+}
+
+/// Which hidden rows SUBTOTAL/AGGREGATE leave out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SkipRows {
+    None,
+    /// Rows a filter hid (SUBTOTAL 1–11).
+    Filtered,
+    /// Every hidden row (SUBTOTAL 101–111, AGGREGATE's hidden options).
+    Hidden,
 }
 
 /// A table's geometry, as the evaluator needs it.
@@ -5111,7 +5128,7 @@ fn parse_criteria(v: &Value) -> Criteria {
 /// it runs in O(pattern × text) rather than the exponential time a naive
 /// recursive `*`-backtracker would take on adversarial patterns like
 /// `a*a*a*…z` (both pattern and text come from untrusted workbooks).
-fn wildcard_match(pat: &str, text: &str) -> bool {
+pub(crate) fn wildcard_match(pat: &str, text: &str) -> bool {
     let p: Vec<char> = pat.to_lowercase().chars().collect();
     let t: Vec<char> = text.to_lowercase().chars().collect();
 
@@ -5845,12 +5862,15 @@ impl<'a> Eval<'a> {
                     101..=111 => code - 100,
                     _ => return Value::Err(ExcelError::Value),
                 };
-                // Excel: codes 1–11 already exclude *filter*-hidden rows (the
-                // common case); 101–111 additionally exclude *manually*-hidden
-                // rows. We can't always tell the two apart, and SUBTOTAL is
-                // almost always used over filtered data, so we exclude hidden
-                // rows for both — matching Excel-with-filter and our oracle.
-                match self.collect_subtotal(&args[1..], true, false) {
+                // Excel: codes 1–11 exclude rows a filter hid but count rows
+                // hidden by hand; 101–111 exclude both. Nested subtotals are
+                // always left out.
+                let skip = if code > 100 {
+                    SkipRows::Hidden
+                } else {
+                    SkipRows::Filtered
+                };
+                match self.collect_subtotal(&args[1..], skip, false, true) {
                     Ok((nums, counta)) => self.apply_agg(base, &nums, counta),
                     Err(e) => Value::Err(e),
                 }
@@ -5865,10 +5885,17 @@ impl<'a> Eval<'a> {
                 if !(1..=19).contains(&func) || !(0..=7).contains(&opts) {
                     return Value::Err(ExcelError::Value);
                 }
-                let ignore_hidden = matches!(opts, 1 | 3 | 5 | 7);
+                let skip = if matches!(opts, 1 | 3 | 5 | 7) {
+                    SkipRows::Hidden
+                } else {
+                    SkipRows::None
+                };
                 let ignore_errors = matches!(opts, 2 | 3 | 6 | 7);
+                // Options 0–3 leave nested SUBTOTAL/AGGREGATE cells out; 4–7
+                // count them (4 is "ignore nothing").
+                let skip_nested = opts <= 3;
                 if func <= 13 {
-                    match self.collect_subtotal(&args[2..], ignore_hidden, ignore_errors) {
+                    match self.collect_subtotal(&args[2..], skip, ignore_errors, skip_nested) {
                         Ok((nums, counta)) => self.apply_agg(func, &nums, counta),
                         Err(e) => Value::Err(e),
                     }
@@ -5876,11 +5903,15 @@ impl<'a> Eval<'a> {
                     // 14–19 take exactly one array plus a k argument.
                     Value::Err(ExcelError::Value)
                 } else {
-                    let nums =
-                        match self.collect_subtotal(&args[2..3], ignore_hidden, ignore_errors) {
-                            Ok((nums, _)) => nums,
-                            Err(e) => return Value::Err(e),
-                        };
+                    let nums = match self.collect_subtotal(
+                        &args[2..3],
+                        skip,
+                        ignore_errors,
+                        skip_nested,
+                    ) {
+                        Ok((nums, _)) => nums,
+                        Err(e) => return Value::Err(e),
+                    };
                     let k = try_num!(self.eval(&args[3]));
                     self.apply_agg_k(func, &nums, k)
                 }
@@ -9399,14 +9430,15 @@ impl<'a> Eval<'a> {
     }
 
     /// Collect numeric values (and a COUNTA count of non-empty entries) for
-    /// SUBTOTAL/AGGREGATE: skip cells that are themselves nested
-    /// SUBTOTAL/AGGREGATE, optionally skip hidden rows, and either propagate or
-    /// ignore error values.
+    /// SUBTOTAL/AGGREGATE: optionally skip cells that are themselves nested
+    /// SUBTOTAL/AGGREGATE, skip the hidden rows `skip` names, and either
+    /// propagate or ignore error values.
     fn collect_subtotal(
         &mut self,
         args: &[Expr],
-        ignore_hidden: bool,
+        skip: SkipRows,
         ignore_errors: bool,
+        skip_nested: bool,
     ) -> Result<(Vec<f64>, usize), ExcelError> {
         let mut nums = Vec::new();
         let mut counta = 0usize;
@@ -9426,10 +9458,12 @@ impl<'a> Eval<'a> {
                 }
                 Arg::Range(s, r1, c1, r2, c2) => {
                     for ((r, c), v) in self.res.cells_in(s, r1, c1, r2, c2) {
-                        if ignore_hidden && self.res.row_hidden(s, r) {
-                            continue;
-                        }
-                        if self.is_nested_subtotal(s, r, c) {
+                        let hidden = match skip {
+                            SkipRows::None => false,
+                            SkipRows::Filtered => self.res.row_filtered(s, r),
+                            SkipRows::Hidden => self.res.row_hidden(s, r),
+                        };
+                        if hidden || (skip_nested && self.is_nested_subtotal(s, r, c)) {
                             continue;
                         }
                         match v {
@@ -10732,6 +10766,7 @@ mod tests {
         table: Option<TableInfo>,
         formulas: HashMap<(u32, u32), String>,
         hidden: std::collections::HashSet<u32>,
+        filtered: std::collections::HashSet<u32>,
     }
 
     impl Grid {
@@ -10747,6 +10782,7 @@ mod tests {
                 table: None,
                 formulas: HashMap::new(),
                 hidden: std::collections::HashSet::new(),
+                filtered: std::collections::HashSet::new(),
             }
         }
         fn with_name(mut self, name: &str, def: &str) -> Grid {
@@ -10767,6 +10803,11 @@ mod tests {
         fn with_hidden(mut self, row_1based: u32) -> Grid {
             self.hidden.insert(row_1based - 1);
             self
+        }
+        /// Mark a 1-based worksheet row hidden by a filter.
+        fn with_filtered(mut self, row_1based: u32) -> Grid {
+            self.filtered.insert(row_1based - 1);
+            self.with_hidden(row_1based)
         }
     }
 
@@ -10828,6 +10869,9 @@ mod tests {
         }
         fn row_hidden(&self, _sheet: usize, row: u32) -> bool {
             self.hidden.contains(&row)
+        }
+        fn row_filtered(&self, _sheet: usize, row: u32) -> bool {
+            self.filtered.contains(&row) && self.hidden.contains(&row)
         }
     }
 
@@ -11077,16 +11121,49 @@ mod tests {
         .with_formula("A3", "SUBTOTAL(9,A1:A2)");
         assert_eq!(n("SUBTOTAL(9,A1:A4)", &g2), 7.0); // 1+2+4, A3 skipped
 
-        // Hidden rows are excluded (filter-hidden is the common case).
+        // 1–11 exclude filter-hidden rows only; 101–111 every hidden row
+        // (#678). Row 2 is filtered out, row 4 hidden by hand.
         let g3 = Grid::new(&[
             ("A1", Value::Num(1.0)),
             ("A2", Value::Num(2.0)),
             ("A3", Value::Num(3.0)),
             ("A4", Value::Num(4.0)),
         ])
-        .with_hidden(2)
+        .with_filtered(2)
         .with_hidden(4);
-        assert_eq!(n("SUBTOTAL(9,A1:A4)", &g3), 4.0); // 1+3
+        assert_eq!(n("SUBTOTAL(9,A1:A4)", &g3), 8.0); // 1+3+4
+        assert_eq!(n("SUBTOTAL(109,A1:A4)", &g3), 4.0); // 1+3
+        assert_eq!(n("SUBTOTAL(3,A1:A4)", &g3), 3.0);
+        assert_eq!(n("SUBTOTAL(103,A1:A4)", &g3), 2.0);
+        // AGGREGATE's hidden options skip every hidden row; the others none.
+        assert_eq!(n("AGGREGATE(9,5,A1:A4)", &g3), 4.0);
+        assert_eq!(n("AGGREGATE(9,6,A1:A4)", &g3), 10.0);
+    }
+
+    #[test]
+    fn aggregate_option_4_counts_nested_subtotals() {
+        // #678: options 4–7 ignore nothing nested; 0–3 skip nested
+        // SUBTOTAL/AGGREGATE cells.
+        let g = Grid::new(&[
+            ("C2", Value::Num(10.0)),
+            ("C3", Value::Num(20.0)),
+            ("C4", Value::Num(30.0)),
+            ("C5", Value::Num(5.0)),
+            ("C6", Value::Num(7.0)),
+            ("C7", Value::Num(12.0)),
+        ])
+        .with_formula("C4", "SUBTOTAL(9,C2:C3)")
+        .with_formula("C7", "SUBTOTAL(9,C5:C6)");
+        assert_eq!(n("AGGREGATE(9,4,C2:C7)", &g), 84.0);
+        assert_eq!(n("AGGREGATE(9,5,C2:C7)", &g), 84.0);
+        assert_eq!(n("AGGREGATE(9,6,C2:C7)", &g), 84.0);
+        assert_eq!(n("AGGREGATE(9,7,C2:C7)", &g), 84.0);
+        assert_eq!(n("AGGREGATE(9,0,C2:C7)", &g), 42.0);
+        assert_eq!(n("AGGREGATE(9,3,C2:C7)", &g), 42.0);
+        assert_eq!(n("SUBTOTAL(9,C2:C7)", &g), 42.0);
+        assert_eq!(n("AGGREGATE(14,4,C2:C7,1)", &g), 30.0);
+        assert_eq!(n("AGGREGATE(14,6,C2:C7,1)", &g), 30.0);
+        assert_eq!(n("AGGREGATE(14,2,C2:C7,1)", &g), 20.0);
     }
 
     #[test]

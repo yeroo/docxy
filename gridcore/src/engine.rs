@@ -772,6 +772,13 @@ impl Resolver for WbResolver<'_> {
         self.wb.sheets.get(sheet).is_some_and(|s| s.row_hidden(row))
     }
 
+    fn row_filtered(&self, sheet: usize, row: u32) -> bool {
+        self.wb
+            .sheets
+            .get(sheet)
+            .is_some_and(|s| s.row_filtered(row))
+    }
+
     fn num_format(&self, sheet: usize, row: u32, col: u32) -> Option<String> {
         let style = self.wb.sheets.get(sheet)?.cell(row, col)?.style;
         let xf = self.wb.styles.xfs.get(style as usize)?;

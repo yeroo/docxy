@@ -185,6 +185,9 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
     let mut sheet_parts = Vec::new();
     let mut tables: Vec<Table> = Vec::new();
     let mut pending_pivots: Vec<(usize, String)> = Vec::new();
+    // Each sheet's and table's `<autoFilter>`, resolved once styles and
+    // values are all loaded.
+    let mut auto_filters: Vec<(usize, crate::filter::AutoFilter)> = Vec::new();
     // localSheetId counts workbook.xml order; map it to model indices in
     // case a sheet part is missing and gets skipped.
     let mut orig_to_model: Vec<Option<usize>> = Vec::new();
@@ -218,6 +221,9 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
         let mut sheet = parse_worksheet(&xml, &shared, &hlink_targets);
         sheet.name = name;
         let sheet_idx = sheets.len();
+        if let Some(af) = crate::filter::parse_auto_filter(&xml) {
+            auto_filters.push((sheet_idx, af));
+        }
         orig_to_model.push(Some(sheet_idx));
 
         // A worksheet names exactly ONE drawing part, through the `r:id` on its
@@ -232,6 +238,9 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
                 if let Some(txml) = get_str(&table_part) {
                     if let Some(t) = parse_table_xml(&txml, sheet_idx, &table_part) {
                         tables.push(t);
+                    }
+                    if let Some(af) = crate::filter::parse_auto_filter(&txml) {
+                        auto_filters.push((sheet_idx, af));
                     }
                 }
             } else if ty.ends_with("/pivotTable") {
@@ -264,6 +273,11 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
     }
     if sheets.is_empty() {
         return Err(XlsxError::MissingWorkbook);
+    }
+    // Tell filter-hidden rows from hand-hidden ones (both are `hidden="1"`).
+    for (i, af) in &auto_filters {
+        let rows = crate::filter::filtered_rows(&sheets[*i], &styles, date1904, af);
+        sheets[*i].filtered_rows.extend(rows);
     }
     // Rich errors: Excel writes a typed `#SPILL!`/`#CALC!` (and
     // `#GETTING_DATA`) as `<v>#VALUE!</v>` with a `vm` pointing at the real
@@ -6965,6 +6979,194 @@ mod tests {
             crate::edit::parse_input("#GETTING_DATA").value,
             CellValue::Error("#GETTING_DATA".into())
         );
+    }
+
+    /// The #678 list on Sheet1 (A1:C9: Region, Rep, Amount), rows 3, 5, 6,
+    /// 7 and 9 hidden, plus `filter` after `</sheetData>`, and `sheet2` as
+    /// Sheet2's rows. With `table`, Sheet1 also carries a table part
+    /// `Sales` over A1:C9 holding that autoFilter instead.
+    fn filter_fixture(filter: &str, sheet2: &str, table: bool) -> Vec<u8> {
+        let recs = [
+            ("East", "Ann", 10),
+            ("West", "Bob", 20),
+            ("East", "Cy", 40),
+            ("North", "Di", 80),
+            ("East", "Ed", 160),
+            ("West", "Fa", 320),
+            ("East", "Gu", 640),
+            ("South", "Hu", 1280),
+        ];
+        let is = |r: &str, t: &str| format!(r#"<c r="{r}" t="inlineStr"><is><t>{t}</t></is></c>"#);
+        let mut rows = format!(
+            "<row r=\"1\">{}{}{}</row>",
+            is("A1", "Region"),
+            is("B1", "Rep"),
+            is("C1", "Amount")
+        );
+        for (i, (region, rep, amt)) in recs.iter().enumerate() {
+            let r = i + 2;
+            let hidden = if [3, 5, 6, 7, 9].contains(&r) {
+                r#" hidden="1""#
+            } else {
+                ""
+            };
+            rows.push_str(&format!(
+                r#"<row r="{r}"{hidden}>{}{}<c r="C{r}"><v>{amt}</v></c></row>"#,
+                is(&format!("A{r}"), region),
+                is(&format!("B{r}"), rep)
+            ));
+        }
+        let parts_tag = if table {
+            r#"<tableParts count="1"><tablePart r:id="rId1"/></tableParts>"#
+        } else {
+            ""
+        };
+        let sheet1 = format!(
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData>{rows}</sheetData>{}{parts_tag}</worksheet>"#,
+            if table { "" } else { filter }
+        );
+        let sheet2 = format!(
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>{sheet2}</sheetData></worksheet>"#
+        );
+        let table_xml = format!(
+            r#"<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="Sales" displayName="Sales" ref="A1:C9">{filter}<tableColumns count="3"><tableColumn id="1" name="Region"/><tableColumn id="2" name="Rep"/><tableColumn id="3" name="Amount"/></tableColumns></table>"#
+        );
+        let workbook = r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/><sheet name="Sheet2" sheetId="2" r:id="rId2"/></sheets></workbook>"#;
+        let wb_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>"#;
+        let ws_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/></Relationships>"#;
+        let root_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#;
+        let content_types = r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#;
+        let mut parts: Vec<(String, Vec<u8>)> = vec![
+            ("[Content_Types].xml".into(), content_types.into()),
+            ("_rels/.rels".into(), root_rels.into()),
+            ("xl/workbook.xml".into(), workbook.into()),
+            ("xl/_rels/workbook.xml.rels".into(), wb_rels.into()),
+            ("xl/worksheets/sheet1.xml".into(), sheet1.into_bytes()),
+            ("xl/worksheets/sheet2.xml".into(), sheet2.into_bytes()),
+        ];
+        if table {
+            parts.push(("xl/worksheets/_rels/sheet1.xml.rels".into(), ws_rels.into()));
+            parts.push(("xl/tables/table1.xml".into(), table_xml.into_bytes()));
+        }
+        write_zip(&parts)
+    }
+
+    const EAST_FILTER: &str = r#"<autoFilter ref="A1:C9"><filterColumn colId="0"><filters><filter val="East"/></filters></filterColumn></autoFilter>"#;
+
+    fn recalc_values(pkg: &mut SheetPackage, sheet: usize, cells: &[&str]) -> Vec<CellValue> {
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        cells
+            .iter()
+            .map(|c| {
+                let (r, col) = parse_cell_name(c).unwrap();
+                pkg.workbook.sheets[sheet]
+                    .cell(r, col)
+                    .unwrap()
+                    .value
+                    .clone()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn subtotal_counts_hand_hidden_rows_under_a_filter() {
+        // #678: the issue's workbook. Region = East filters out rows 3, 5, 7
+        // and 9; row 6 (Ed, East) is hidden by hand.
+        let formulas = r#"<row r="1"><c r="A1"><f>SUBTOTAL(9,Sheet1!C2:C9)</f><v>0</v></c><c r="B1"><f>SUBTOTAL(3,Sheet1!A2:A9)</f><v>0</v></c><c r="C1"><f>SUBTOTAL(1,Sheet1!C2:C9)</f><v>0</v></c><c r="D1"><f>SUBTOTAL(109,Sheet1!C2:C9)</f><v>0</v></c><c r="E1"><f>SUBTOTAL(103,Sheet1!A2:A9)</f><v>0</v></c><c r="F1"><f>AGGREGATE(9,5,Sheet1!C2:C9)</f><v>0</v></c></row>"#;
+        let mut pkg = load_xlsx(&filter_fixture(EAST_FILTER, formulas, false)).unwrap();
+        let s1 = &pkg.workbook.sheets[0];
+        assert_eq!(
+            s1.filtered_rows.iter().copied().collect::<Vec<_>>(),
+            vec![2, 4, 6, 8]
+        );
+        assert!(!s1.row_filtered(5) && s1.row_hidden(5));
+        let got = recalc_values(&mut pkg, 1, &["A1", "B1", "C1", "D1", "E1", "F1"]);
+        let n = CellValue::Number;
+        assert_eq!(
+            got,
+            vec![n(850.0), n(4.0), n(212.5), n(690.0), n(3.0), n(690.0)]
+        );
+    }
+
+    #[test]
+    fn subtotal_over_a_filtered_table_counts_hand_hidden_rows() {
+        // #678: the same list as a table whose own autoFilter did the
+        // filtering.
+        let formulas = r#"<row r="1"><c r="A1"><f>SUBTOTAL(9,Sales[Amount])</f><v>0</v></c><c r="B1"><f>SUBTOTAL(109,Sales[Amount])</f><v>0</v></c></row>"#;
+        let mut pkg = load_xlsx(&filter_fixture(EAST_FILTER, formulas, true)).unwrap();
+        let got = recalc_values(&mut pkg, 1, &["A1", "B1"]);
+        assert_eq!(
+            got,
+            vec![CellValue::Number(850.0), CellValue::Number(690.0)]
+        );
+    }
+
+    #[test]
+    fn filtered_rows_from_custom_and_unsupported_filters() {
+        // Amount >= 100 AND < 1000 keeps rows 6 (160) and 8 (640) of the
+        // hidden ones visible-worthy: hidden 3/5/7/9 fail or pass by value.
+        let custom = r#"<autoFilter ref="A1:C9"><filterColumn colId="2"><customFilters and="1"><customFilter operator="greaterThanOrEqual" val="100"/><customFilter operator="lessThan" val="1000"/></customFilters></filterColumn></autoFilter>"#;
+        let pkg = load_xlsx(&filter_fixture(custom, "", false)).unwrap();
+        // Hidden rows 3 (20), 5 (80), 6 (160), 7 (320), 9 (1280): 160 and 320
+        // pass, so rows 6 and 7 were hidden by hand.
+        assert_eq!(
+            pkg.workbook.sheets[0]
+                .filtered_rows
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![2, 4, 8]
+        );
+        // Wildcards in a custom equal filter.
+        let wild = r#"<autoFilter ref="A1:C9"><filterColumn colId="1"><customFilters><customFilter val="F*"/><customFilter val="E?"/></customFilters></filterColumn></autoFilter>"#;
+        let pkg = load_xlsx(&filter_fixture(wild, "", false)).unwrap();
+        // Rows 6 (Ed) and 7 (Fa) pass.
+        assert_eq!(
+            pkg.workbook.sheets[0]
+                .filtered_rows
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![2, 4, 8]
+        );
+        // A filter we cannot re-evaluate: every hidden row counts as filtered.
+        let top = r#"<autoFilter ref="A1:C9"><filterColumn colId="2"><top10 val="3"/></filterColumn></autoFilter>"#;
+        let pkg = load_xlsx(&filter_fixture(top, "", false)).unwrap();
+        assert_eq!(
+            pkg.workbook.sheets[0]
+                .filtered_rows
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![2, 4, 5, 6, 8]
+        );
+        // No autoFilter: every hidden row was hidden by hand.
+        let pkg = load_xlsx(&filter_fixture("", "", false)).unwrap();
+        assert!(pkg.workbook.sheets[0].filtered_rows.is_empty());
+    }
+
+    #[test]
+    fn filtered_rows_follow_row_edits_and_unhide() {
+        // #678: inserting a row above the list moves the filtered rows with
+        // it, and a filtered row unhidden by hand counts again.
+        let formulas = r#"<row r="1"><c r="A1"><f>SUBTOTAL(9,Sheet1!C2:C10)</f><v>0</v></c></row>"#;
+        let mut pkg = load_xlsx(&filter_fixture(EAST_FILTER, formulas, false)).unwrap();
+        crate::edit::insert_rows(&mut pkg.workbook, 0, 1, 1);
+        assert_eq!(
+            pkg.workbook.sheets[0]
+                .filtered_rows
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![3, 5, 7, 9]
+        );
+        let got = recalc_values(&mut pkg, 1, &["A1"]);
+        assert_eq!(got, vec![CellValue::Number(850.0)]);
+        // Unhide Bob (row 3, now 4): he counts in SUBTOTAL(9) again.
+        pkg.workbook.sheets[0].set_row_hidden(3, false);
+        let got = recalc_values(&mut pkg, 1, &["A1"]);
+        assert_eq!(got, vec![CellValue::Number(870.0)]);
     }
 
     /// Rows 1..=n with A holding 3, 9, 1, 7, 5, 2, 8 (the first `n`), and

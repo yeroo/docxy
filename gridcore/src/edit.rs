@@ -1095,6 +1095,11 @@ fn shift_grid(sheet: &mut Sheet, shift: &EditShift) {
             .into_iter()
             .filter_map(|(r, a)| point(r, shift).map(|nr| (nr, a)))
             .collect::<BTreeMap<_, _>>();
+        let filtered = std::mem::take(&mut sheet.filtered_rows);
+        sheet.filtered_rows = filtered
+            .into_iter()
+            .filter_map(|r| point(r, shift))
+            .collect();
     } else {
         // Column definitions move with their columns (only for column edits).
         let defs = std::mem::take(&mut sheet.col_defs);

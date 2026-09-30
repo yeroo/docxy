@@ -3670,8 +3670,10 @@ impl App {
         };
         if text.trim().eq_ignore_ascii_case("clear") {
             for r in top..=bottom {
-                self.pkg.workbook.sheets[s].set_row_hidden(r, false);
+                self.pkg.workbook.sheets[s].set_row_filtered(r, false);
             }
+            // SUBTOTAL(1..11) counts rows by whether a filter hid them.
+            self.engine.recalc_all(&mut self.pkg.workbook);
             self.clamp_cursor();
             self.modified = true;
             self.status = Some("Filter cleared".into());
@@ -3694,8 +3696,9 @@ impl App {
             if hide {
                 hidden += 1;
             }
-            self.pkg.workbook.sheets[s].set_row_hidden(r, hide);
+            self.pkg.workbook.sheets[s].set_row_filtered(r, hide);
         }
+        self.engine.recalc_all(&mut self.pkg.workbook);
         self.clamp_cursor();
         self.modified = true;
         self.status = Some(format!("Filtered by column: {hidden} rows hidden"));
@@ -7270,11 +7273,25 @@ mod tests {
         assert!(!sh.row_hidden(1)); // 300
         assert!(sh.row_hidden(2)); // 50 hidden
         assert!(!sh.row_hidden(3)); // 900
+        // #678: the filter's rows are filter-hidden, so SUBTOTAL(9) leaves
+        // them out while a row hidden by hand still counts.
+        assert!(sh.row_filtered(2));
+        app.pkg.workbook.sheets[0].set_row_hidden(3, true);
+        app.pkg.workbook.sheets[0].set_cell(5, 1, Cell::formula("SUBTOTAL(9,B2:B4)"));
+        app.pkg.workbook.sheets[0].set_cell(6, 1, Cell::formula("SUBTOTAL(109,B2:B4)"));
+        app.rebuild_engine();
+        let v = |app: &App, r: u32| app.sheet().cell(r, 1).unwrap().value.clone();
+        use gridcore::sheet::CellValue;
+        assert_eq!(v(&app, 5), CellValue::Number(1200.0));
+        assert_eq!(v(&app, 6), CellValue::Number(300.0));
+        app.pkg.workbook.sheets[0].set_row_hidden(3, false);
 
-        // Clear unhides everything.
+        // Clear unhides everything, and the rows are no longer filtered.
         app.commit_filter("clear");
         let sh = app.sheet();
         assert!(!sh.row_hidden(2));
+        assert!(sh.filtered_rows.is_empty());
+        assert_eq!(v(&app, 5), CellValue::Number(1250.0));
 
         // Text equals filter on the Item column.
         app.cur = (1, 0);

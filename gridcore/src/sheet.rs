@@ -283,6 +283,11 @@ pub struct Sheet {
     /// didn't have.
     pub row_breaks: Vec<PageBreak>,
     pub col_breaks: Vec<PageBreak>,
+    /// Rows an applied filter hid, as opposed to rows hidden by hand: derived
+    /// at load from the `<autoFilter>` criteria, and kept by the editor's own
+    /// filter. In memory only. `SUBTOTAL(1..11)` skips these rows but counts
+    /// hand-hidden ones. See [`Sheet::row_filtered`].
+    pub filtered_rows: std::collections::BTreeSet<u32>,
 }
 
 /// One `<brk>`: `id` is the 0-based first row (column) of the page that starts
@@ -1027,6 +1032,23 @@ impl Sheet {
     /// applied auto-filter (Excel persists all three as `hidden="1"`).
     pub fn row_hidden(&self, row: u32) -> bool {
         self.row_attrs.get(&row).is_some_and(|a| attr_hidden(a))
+    }
+
+    /// Whether a row is hidden by a filter: hidden, and marked filtered. A
+    /// filtered row the user unhid is not.
+    pub fn row_filtered(&self, row: u32) -> bool {
+        self.filtered_rows.contains(&row) && self.row_hidden(row)
+    }
+
+    /// Hide or unhide a row as a filter does: hiding marks it filter-hidden,
+    /// unhiding clears the mark.
+    pub fn set_row_filtered(&mut self, row: u32, hidden: bool) {
+        self.set_row_hidden(row, hidden);
+        if hidden {
+            self.filtered_rows.insert(row);
+        } else {
+            self.filtered_rows.remove(&row);
+        }
     }
 
     /// Hide or unhide a row, preserving its other `<row>` attributes (e.g. `ht`).
