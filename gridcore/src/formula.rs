@@ -2360,6 +2360,12 @@ pub trait Resolver {
         let _ = (sheet, row, col);
         None
     }
+    /// The number format code of a cell (`General`, `0.00`, …), for
+    /// `CELL("format")`. `None` = General.
+    fn num_format(&self, sheet: usize, row: u32, col: u32) -> Option<String> {
+        let _ = (sheet, row, col);
+        None
+    }
     /// Whether a worksheet row is hidden (manually or by a filter). Used by the
     /// `10x` `SUBTOTAL` codes and the hidden-ignoring `AGGREGATE` options.
     fn row_hidden(&self, sheet: usize, row: u32) -> bool {
@@ -5740,6 +5746,17 @@ impl<'a> Eval<'a> {
                         None => Value::Err(ExcelError::NA),
                     },
                     None => Value::Err(ExcelError::NA),
+                }
+            }
+            // ISFORMULA(ref): whether the reference's top-left cell holds a
+            // formula. Anything but a reference is #VALUE!.
+            "ISFORMULA" => {
+                if args.len() != 1 {
+                    return Value::Err(ExcelError::Value);
+                }
+                match self.ref_coords(&args[0]) {
+                    Some((s, r, c)) => Value::Bool(self.res.cell_formula(s, r, c).is_some()),
+                    None => Value::Err(ExcelError::Value),
                 }
             }
             "CELL" => self.cell_info(args),
@@ -9520,6 +9537,9 @@ impl<'a> Eval<'a> {
                 .to_string(),
             ),
             "prefix" => Value::Str(String::new()),
+            "format" => Value::Str(crate::numfmt::cell_format_code(
+                self.res.num_format(s, r, c).as_deref().unwrap_or("General"),
+            )),
             _ => {
                 self.unsupported = true;
                 Value::Err(ExcelError::NA)

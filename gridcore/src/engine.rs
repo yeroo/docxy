@@ -771,6 +771,39 @@ impl Resolver for WbResolver<'_> {
     fn row_hidden(&self, sheet: usize, row: u32) -> bool {
         self.wb.sheets.get(sheet).is_some_and(|s| s.row_hidden(row))
     }
+
+    fn num_format(&self, sheet: usize, row: u32, col: u32) -> Option<String> {
+        let style = self.wb.sheets.get(sheet)?.cell(row, col)?.style;
+        let xf = self.wb.styles.xfs.get(style as usize)?;
+        xf.code.clone().or_else(|| numfmt_code(xf.numfmt))
+    }
+}
+
+/// A format code for a classified format that carries no code of its own
+/// (formatting authored in the editor), so `CELL("format")` sees what the grid
+/// shows.
+fn numfmt_code(nf: crate::sheet::NumFmt) -> Option<String> {
+    use crate::sheet::NumFmt;
+    let dec = |d: u8| {
+        if d == 0 {
+            String::new()
+        } else {
+            format!(".{}", "0".repeat(d as usize))
+        }
+    };
+    Some(match nf {
+        NumFmt::General => return None,
+        NumFmt::Number {
+            decimals,
+            thousands,
+        } => format!("{}0{}", if thousands { "#,##" } else { "" }, dec(decimals)),
+        NumFmt::Percent { decimals } => format!("0{}%", dec(decimals)),
+        NumFmt::Scientific => "0.00E+00".into(),
+        NumFmt::Date => "m/d/yyyy".into(),
+        NumFmt::Time => "h:mm:ss".into(),
+        NumFmt::DateTime => "m/d/yyyy h:mm".into(),
+        NumFmt::Text => "@".into(),
+    })
 }
 
 /// Evaluate a formula string in the context of cell (sheet, row, col) over the
@@ -1201,6 +1234,54 @@ mod tests {
         eng.recalc_all(&mut wb);
         assert_eq!(value_at(&wb, "A1"), CellValue::Number(3.0));
         assert_eq!(value_at(&wb, "A2"), CellValue::Number(2.0));
+    }
+
+    #[test]
+    fn cell_format_and_isformula() {
+        // #656: CELL("format") reads the cell's number format; ISFORMULA
+        // whether it holds a formula.
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1234.0)),
+            ("A2", Cell::number(0.5)),
+            ("A3", Cell::number(45306.0)),
+            ("A4", Cell::formula("A1*2")),
+            ("B1", Cell::formula("CELL(\"format\",A1)")),
+            ("B2", Cell::formula("CELL(\"format\",A2)")),
+            ("B3", Cell::formula("CELL(\"format\",A3)")),
+            ("B4", Cell::formula("CELL(\"format\",A5)")),
+            ("C1", Cell::formula("ISFORMULA(A1)")),
+            ("C4", Cell::formula("ISFORMULA(A4)")),
+            ("C5", Cell::formula("ISFORMULA(5)")),
+        ]);
+        let xf = |code: &str| crate::sheet::Xf {
+            code: Some(code.to_string()),
+            ..Default::default()
+        };
+        if wb.styles.xfs.is_empty() {
+            wb.styles.xfs.push(Default::default());
+        }
+        let s1 = wb.styles.intern(xf("$#,##0_);[Red]($#,##0)"));
+        let s2 = wb.styles.intern(crate::sheet::Xf {
+            numfmt: crate::sheet::NumFmt::Percent { decimals: 2 },
+            ..Default::default()
+        });
+        let s3 = wb.styles.intern(xf("d-mmm-yy"));
+        for (r, st) in [(0, s1), (1, s2), (2, s3)] {
+            wb.sheets[0].cells.get_mut(&(r, 0)).unwrap().style = st;
+        }
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        let t = |s: &str| CellValue::Text(s.into());
+        assert_eq!(value_at(&wb, "B1"), t("C0-"));
+        assert_eq!(value_at(&wb, "B2"), t("P2"));
+        assert_eq!(value_at(&wb, "B3"), t("D1"));
+        assert_eq!(value_at(&wb, "B4"), t("G"));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Bool(false));
+        assert_eq!(value_at(&wb, "C4"), CellValue::Bool(true));
+        assert_eq!(value_at(&wb, "C5"), CellValue::Error("#VALUE!".into()));
+        // `_xlfn.ISFORMULA` from a file parses to the same function.
+        let ast = formula::parse("_xlfn.ISFORMULA(A4)").unwrap();
+        assert!(matches!(ast, Expr::Func(ref f, _) if f == "ISFORMULA"));
     }
 
     // ---- dynamic arrays / spilling ------------------------------------
