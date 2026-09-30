@@ -63,6 +63,9 @@ pub struct Engine {
     pub seed: Option<u64>,
     /// Formula cells on a circular reference, sorted.
     circular: BTreeSet<Key>,
+    /// The post-circle D-function rerun already ran in this top-level
+    /// recalculation (see [`Engine::evaluate`]); it runs at most once.
+    db_rerun_done: bool,
 }
 
 /// Spill chains (an anchor whose array feeds another anchor's spill cells)
@@ -351,6 +354,11 @@ impl Engine {
 
     /// Kahn's algorithm over the dirty subgraph, then evaluation in order.
     fn evaluate(&mut self, wb: &mut Workbook, dirty: HashSet<Key>, depth: u32) {
+        // Depth 0 is a top-level recalculation (an edit, recalc_all); nested
+        // passes (spills, the D-function rerun) have depth ≥ 1.
+        if depth == 0 {
+            self.db_rerun_done = false;
+        }
         // Only supported formulas actually evaluate; unsupported ones keep
         // their cached values but still satisfy dependents.
         let dirty: Vec<Key> = dirty
@@ -439,6 +447,9 @@ impl Engine {
             let circle =
                 comp.len() > 1 || edges.get(&comp[0]).is_some_and(|ds| ds.contains(&comp[0]));
             if !circle {
+                if self.formulas.get(&comp[0]).is_some_and(|i| i.db) {
+                    db_done.push(comp[0]);
+                }
                 spilled.extend(self.eval_one(wb, comp[0]));
                 continue;
             }
@@ -464,13 +475,36 @@ impl Engine {
         self.circular.extend(found);
         // A D-function evaluated above may read (through a computed
         // criterion, with no edge) a helper that sits on or below a circle,
-        // which only got its value just now. Run those D-functions, and what
-        // depends on them, once more. Bounded like the spill passes; a
-        // circle member re-run this way is 0 again, or gets one more sweep
-        // that the rollback rule keeps put once converged.
-        if !rest.is_empty() && !db_done.is_empty() && depth < MAX_SPILL_PASSES {
-            db_done.sort_unstable();
-            self.recalc_from_depth(wb, &db_done, depth + 1);
+        // or that the circle phase evaluated after it. Evaluate those
+        // D-functions once more, in the order they ran; only when one's value
+        // changed do its dependents run again (a circle among them gets one
+        // more sweep, which the rollback rule keeps put once converged). This
+        // happens at most once per top-level recalculation, and never re-seeds
+        // the volatile cells, so an unrelated circle gets no extra sweep.
+        // Circle members are not rerun: evaluating one alone would bypass
+        // the circle rules.
+        if !rest.is_empty() && !db_done.is_empty() && !self.db_rerun_done {
+            self.db_rerun_done = true;
+            let value_of = |wb: &Workbook, k: Key| {
+                wb.sheets[k.0]
+                    .cell(k.1, k.2)
+                    .map(|c| c.value.clone())
+                    .unwrap_or_default()
+            };
+            let mut changed: Vec<Key> = Vec::new();
+            for &k in &db_done {
+                let before = value_of(wb, k);
+                spilled.extend(self.eval_one(wb, k));
+                if value_of(wb, k) != before {
+                    changed.push(k);
+                }
+            }
+            if !changed.is_empty() {
+                let dependents = self.dependents_of(&changed);
+                if !dependents.is_empty() {
+                    self.evaluate(wb, dependents, depth + 1);
+                }
+            }
         }
         // Spill writes change plain-value cells whose dependents the dirty
         // walk couldn't see (only the anchor is a formula). One more pass
@@ -480,6 +514,28 @@ impl Engine {
             spilled.dedup();
             self.recalc_from_depth(wb, &spilled, depth + 1);
         }
+    }
+
+    /// The formulas that depend on `seeds`, directly or transitively (the
+    /// seeds themselves excluded unless one depends on another).
+    fn dependents_of(&self, seeds: &[Key]) -> HashSet<Key> {
+        let all: Vec<Key> = self.formulas.keys().copied().collect();
+        let mut rev: HashMap<Key, Vec<Key>> = HashMap::new();
+        for (f, srcs) in self.dependency_edges(&all) {
+            for g in srcs {
+                rev.entry(g).or_default().push(f);
+            }
+        }
+        let mut out: HashSet<Key> = HashSet::new();
+        let mut frontier: VecDeque<Key> = seeds.iter().copied().collect();
+        while let Some(src) = frontier.pop_front() {
+            for &f in rev.get(&src).map(Vec::as_slice).unwrap_or_default() {
+                if out.insert(f) {
+                    frontier.push_back(f);
+                }
+            }
+        }
+        out
     }
 
     /// Iterative calculation of one circle (Excel's File > Options >
@@ -1895,6 +1951,67 @@ mod tests {
         assert_eq!(value_at(&wb, "K1"), CellValue::Number(5.0));
         eng.recalc_all(&mut wb);
         assert_eq!(value_at(&wb, "K1"), CellValue::Number(5.0));
+    }
+
+    #[test]
+    fn a_circle_reading_a_database_function_advances_once_per_recalc() {
+        // #677/#660: Z1 = Z1+K1 with one iteration per recalculation and K1 a
+        // DSUM (5). An unrelated edit recalculates K1 (it always does) and so
+        // Z1 once: Z1 advances by exactly 5. The D-function rerun must not
+        // add sweeps (it used to re-arm itself at every nested pass).
+        let mut wb = db_helper_book(
+            "DSUM(A1:C8,\"Amount\",AA1:AA2)",
+            "B5*2",
+            &[("B5", Cell::number(60.0)), ("Z1", Cell::formula("Z1+K1"))],
+        );
+        wb.iterate = Some((1, 0.001));
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(5.0));
+        let z = |wb: &Workbook| match value_at(wb, "Z1") {
+            CellValue::Number(z) => z,
+            v => panic!("{v:?}"),
+        };
+        let z0 = z(&wb);
+        set(&mut eng, &mut wb, "Y9", Cell::number(1.0));
+        assert_eq!(z(&wb) - z0, 5.0);
+        set(&mut eng, &mut wb, "Y9", Cell::number(2.0));
+        assert_eq!(z(&wb) - z0, 10.0);
+    }
+
+    #[test]
+    fn database_functions_downstream_of_a_circle_see_every_helper() {
+        // #677/#660: the whole helper column E sits below the iterating
+        // circle Z1, and so does the DSUM (through AA2 = E2>100). The circle
+        // phase may run the DSUM before E3..E8; the rerun fixes it.
+        let mut cells: Vec<(String, Cell)> = vec![
+            ("A1".into(), Cell::text("Rep")),
+            ("C1".into(), Cell::text("Amount")),
+            ("AA2".into(), Cell::formula("E2>100")),
+            ("Z1".into(), Cell::formula("Z1/2+B1")),
+            ("B1".into(), Cell::number(10.0)),
+            (
+                "K21".into(),
+                Cell::formula("DSUM(A1:C8,\"Amount\",AA1:AA2)"),
+            ),
+        ];
+        for r in 2..=8 {
+            cells.push((format!("A{r}"), Cell::text(&format!("R{r}"))));
+            cells.push((format!("C{r}"), Cell::number(r as f64)));
+            cells.push((format!("E{r}"), Cell::formula(&format!("C{r}*Z1"))));
+        }
+        let refs: Vec<(&str, Cell)> = cells.iter().map(|(k, c)| (k.as_str(), c.clone())).collect();
+        let mut wb = wb_one_sheet(&refs);
+        wb.iterate = Some((100, 0.001));
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        // Z1 → 20: E6..E8 (120, 140, 160) pass.
+        assert_eq!(value_at(&wb, "K21"), CellValue::Number(21.0));
+        set(&mut eng, &mut wb, "B1", Cell::number(30.0));
+        // Z1 → 60: E2..E8 pass.
+        assert_eq!(value_at(&wb, "K21"), CellValue::Number(35.0));
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "K21"), CellValue::Number(35.0));
     }
 
     #[test]
