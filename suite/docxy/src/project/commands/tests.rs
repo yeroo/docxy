@@ -254,7 +254,12 @@ fn ribbon_context_survives_valid_switches_only() {
     assert_eq!(ribbon_tab_index(RibbonTab::View, Kind::Project), 4);
     assert_eq!(ribbon_tab_index(RibbonTab::Project, Kind::Project), 3);
     assert_eq!(ribbon_tab_name(RibbonTab::Project), "Project");
-    assert_eq!(ribbon_tab_index(RibbonTab::View, Kind::Docx), 3);
+    // Documents have the page Layout tab before Review and View (#649);
+    // workbooks do not.
+    assert_eq!(ribbon_tab_index(RibbonTab::View, Kind::Docx), 4);
+    assert_eq!(ribbon_tab_index(RibbonTab::View, Kind::Xlsx), 3);
+    assert!(valid_ribbon_tab(Kind::Docx, RibbonTab::Layout, false, false) == RibbonTab::Layout);
+    assert!(valid_ribbon_tab(Kind::Xlsx, RibbonTab::Layout, false, false) == RibbonTab::Home);
 }
 
 /// The owner's bar for #72: a Microsoft Project instruction written as a ribbon
@@ -1213,7 +1218,7 @@ fn summary_tab() -> DocTab {
 /// A key as the window delivers it: an open dialog takes it first, as
 /// `on_key` does, and only then does the Project see it.
 fn key(t: &mut DocTab, key: &str, text: Option<&str>, m: Modifiers) {
-    if dialog_key(t, key, m) {
+    if dialog_key(t, key, text, m) {
         return;
     }
     if let Some(act) = project_input(t, key, text, m) {

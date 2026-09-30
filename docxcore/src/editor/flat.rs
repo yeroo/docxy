@@ -163,7 +163,7 @@ fn inline_chars(inline: &Inline) -> String {
             out
         }
         Inline::Tab(_) => "\t".into(),
-        Inline::Break(BreakKind::Line) => "\u{000b}".into(),
+        Inline::Break(BreakKind::Line | BreakKind::Clear(_)) => "\u{000b}".into(),
         Inline::Break(BreakKind::Page) => "\u{000c}".into(),
         Inline::Break(BreakKind::Column) => "\u{000e}".into(),
         // A field showing a result is one caret unit, edited as a whole.

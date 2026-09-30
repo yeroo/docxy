@@ -87,14 +87,14 @@ test table context follows the caret and exposes Table ribbon
   call selection-set {"start":7,"end":7}
   assert para.index is 1
   call ribbon-read {}
-  assert reply.tab_count is 6
-  assert reply.tabs.5.name is Table
+  assert reply.tab_count is 7
+  assert reply.tabs.6.name is Table
   key alt t escape escape
   assert ribbon_tab is Table
   call selection-set {"start":0,"end":0}
   assert ribbon_tab is Home
   call ribbon-read {}
-  assert reply.tab_count is 5
+  assert reply.tab_count is 6
 
 test header editing is reported separately from the body
   open copy:../fixtures/basic.docx

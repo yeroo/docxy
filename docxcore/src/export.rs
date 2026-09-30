@@ -1237,7 +1237,7 @@ impl Flow for Pager<'_> {
         match kind {
             BreakKind::Page => self.new_page(self.region.sect, false, false),
             BreakKind::Column => self.advance_column(),
-            BreakKind::Line => {}
+            BreakKind::Line | BreakKind::Clear(_) => {}
         }
     }
     fn at_top(&self) -> bool {

@@ -509,6 +509,9 @@ fn write_inline_with_text_kind(s: &mut String, item: &Inline, text_kind: RunText
             BreakKind::Line => s.push_str("<w:r><w:br/></w:r>"),
             BreakKind::Page => s.push_str("<w:r><w:br w:type=\"page\"/></w:r>"),
             BreakKind::Column => s.push_str("<w:r><w:br w:type=\"column\"/></w:r>"),
+            BreakKind::Clear(clear) => {
+                s.push_str(&format!("<w:r><w:br w:clear=\"{}\"/></w:r>", clear.val()))
+            }
         },
         Inline::Hyperlink(h) => {
             if let Some(raw) = &h.raw
@@ -1721,6 +1724,9 @@ mod tests {
                     run("b", RunProps::default()),
                     Inline::Break(BreakKind::Line),
                     Inline::Break(BreakKind::Page),
+                    Inline::Break(BreakKind::Clear(ClearKind::All)),
+                    Inline::Break(BreakKind::Clear(ClearKind::Left)),
+                    Inline::Break(BreakKind::Clear(ClearKind::Right)),
                 ],
             )],
         };

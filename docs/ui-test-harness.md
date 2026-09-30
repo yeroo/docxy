@@ -346,9 +346,11 @@ footer editor; `selection-set` refuses while it is open.
 
 `ribbon-read` and `ribbon-click` work on document, Project and sheet tabs. Each
 command's `enabled` is the predicate its button draws with (every document and
-Project ribbon command is enabled today; sheet placeholders, drawn but doing
-nothing yet, report `enabled: false`, see below), and a command inside a split button's menu carries
-`menu`, the split's id (Set Baseline's `Set Baseline...` and `Clear
+Project ribbon command is enabled today except the document Layout tab's
+placeholders, `LayoutAct::Unavailable`: Line Numbering Options..., Manual and
+Hyphenation Options...; sheet placeholders, drawn but doing nothing yet, report
+`enabled: false`, see below), and a command inside a split button's or a
+drop-down's menu carries `menu`, its button's id (Set Baseline's `Set Baseline...` and `Clear
 Baseline...` read `menu: "pr-baseline"`). Each command carries a `label` and a
 screentip `tip.title`; on the Project ribbon they are Microsoft Project 2024's,
 and they differ for icon-only commands (Indent is `Indent Task`, Link Tasks is
@@ -654,16 +656,19 @@ The rules for addressing:
 - An unknown control, button or tab is refused, and the refusal lists what
   exists.
 
-`dialog-set` goes through the control's input handler, the one a form's
-editable widget will call. The overlay draws controls **read-only** today, so a
-green `dialog-set` says the model accepted the value, not that a drawn widget
-works. (The drawn buttons, Enter/Escape and `dialog-click` do share one press
-handler.) It refuses a disabled or hidden control, a control on another tab, a
-label, and a value of the wrong shape: a checkbox takes a bool, a number
-a finite number, and an item control one of its items. Dates and durations
-are staged as text: the owner checks them on OK, and an OK the owner refuses
-leaves the dialog open with its staged values. A disabled button refuses
-`dialog-click`.
+`dialog-set` goes through the control's input handler, the one the overlay's
+editable widgets call too (#649). A click on a text, number, date or duration
+field focuses it; a click toggles a checkbox, picks a radio item, or steps a
+dropdown to its next item; the tab strip switches tabs. Lists and grids are
+still drawn read-only, so only `dialog-set` edits them. (The drawn buttons,
+Enter/Escape and `dialog-click` share one press handler.) `dialog-set`
+refuses a disabled or hidden control, a control on another tab, a label, and a
+value of the wrong shape: a checkbox takes a bool, a number a finite number,
+and an item control one of its items. A number field also takes the start of
+a number while it is typed (empty, a sign, a trailing point); the owner
+parses it on OK. Dates and durations are staged as text: the owner checks them
+on OK, and an OK the owner refuses leaves the dialog open with its staged
+values. A disabled button refuses `dialog-click`.
 
 Staged values stay in the dialog until an accept button (OK, Yes) hands them to
 its owner, which applies them as one undo step. Cancel and No drop the dialog,
@@ -673,8 +678,12 @@ While a dialog is open on the active tab:
 
 - **Keys go to the dialog first**, before the tab list, KeyTips and every
   Project key path. Enter presses the default button and Escape the cancel
-  button. Every other key does nothing, including Tab, Ctrl chords, Alt and
-  typed text.
+  button. Tab and Shift+Tab move the focus through the editable widgets on
+  the current tab. The focused widget takes the rest: typed characters and
+  Backspace edit a field (a character a number field refuses changes nothing
+  and says why in `status`), Space toggles a checkbox, and Up and Down step a
+  radio group or dropdown. Ctrl and Alt chords are swallowed and edit nothing,
+  so `key` and `type` drive the widgets the way a person does.
 - **Pointer verbs are refused** with `a dialog is open: <title>`: `click-cell`,
   `drag`, `fill-drag`, `save-as`, `ribbon-click`, `select-chart`, `focus-field`, `title-tab`,
   `tab-select`, `proj.new`, `backstage {open}`, `backstage-close`, `close-tab`
@@ -697,7 +706,19 @@ Menus open today:
 - **Set Baseline's split menu**: the lower half of Project › Schedule › Set
   Baseline (`Set Baseline...`, `Clear Baseline...`);
 - **the document menu** (Cut, Copy, Paste, Bold, Italic, Underline, New
-  Comment): right-click a document or sheet body. It never opens on a Project.
+  Comment): right-click a document or sheet body. It never opens on a Project;
+- **the Layout tab's drop-downs** on a document (#649): Layout › Page Setup's
+  Margins, Orientation, Size, Columns, Breaks, Line Numbers and Hyphenation. A
+  press anywhere on the button opens its menu, and so does its KeyTip (Alt, P,
+  O opens Orientation; Size is `SZ` and Line Numbers `LN`, which wait for their
+  second letter). `menu-open {"ribbon": ["Layout", "Page Setup", "Margins"]}`
+  opens one. The items follow Word, with its separators and the Breaks menu's
+  `Page Breaks` / `Section Breaks` headings; the current choice is `checked`
+  (the caret section's margins, orientation, size, columns and line numbers,
+  and the document's hyphenation). Line Numbering Options..., Manual and
+  Hyphenation Options... read `enabled: false`. Custom Margins... and More
+  Paper Sizes... open the `page-setup` dialog, and More Columns... the
+  `columns` one.
 
 | Verb | Args | Reply |
 |---|---|---|
@@ -719,8 +740,8 @@ is the ribbon's pressed state (Inactivate Task, the task's mode). Delete Task
 deletes the selected task whatever column the cursor is on; a summary asks
 first, in the `delete-summary` dialog.
 
-A press on a split button's arrow while its own menu is open shuts the menu,
-as in Office; the harness's `menu-open` always opens.
+A press on a split button's arrow or a drop-down button while its own menu is
+open shuts the menu, as in Office; the harness's `menu-open` always opens.
 
 `state` has `menu`: null, or `{target}`. The menu opens at the target's drawn
 position when the last frame drew it, else in the middle of the window; either

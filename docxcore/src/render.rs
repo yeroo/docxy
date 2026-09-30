@@ -1568,7 +1568,7 @@ fn flatten_para(
             }
             Inline::Break(kind) => {
                 match kind {
-                    BreakKind::Line => {
+                    BreakKind::Line | BreakKind::Clear(_) => {
                         if inv {
                             segs.last_mut().unwrap().glyphs.push(Glyph {
                                 ch: '↵',
@@ -1797,7 +1797,7 @@ fn break_separator(kind: BreakKind, width: usize, inv: bool) -> Line {
     let label = match kind {
         BreakKind::Page => "Page Break",
         BreakKind::Column => "Column Break",
-        BreakKind::Line => "",
+        BreakKind::Line | BreakKind::Clear(_) => "",
     };
     let mid = if inv && !label.is_empty() {
         format!(" {label} ")

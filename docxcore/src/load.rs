@@ -1659,9 +1659,18 @@ fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
                     p.skip_element();
                 }
                 "w:br" => {
-                    let kind = match p.attr("w:type") {
-                        "page" => BreakKind::Page,
-                        "column" => BreakKind::Column,
+                    // `w:clear` only matters on a line break (a plain `w:br`
+                    // is `w:type="textWrapping"`): Word's Text Wrapping break.
+                    let clear = match p.attr("w:clear") {
+                        "left" => Some(ClearKind::Left),
+                        "right" => Some(ClearKind::Right),
+                        "all" => Some(ClearKind::All),
+                        _ => None,
+                    };
+                    let kind = match (p.attr("w:type"), clear) {
+                        ("page", _) => BreakKind::Page,
+                        ("column", _) => BreakKind::Column,
+                        (_, Some(clear)) => BreakKind::Clear(clear),
                         _ => BreakKind::Line,
                     };
                     out.push(Inline::Break(kind));
@@ -3487,6 +3496,18 @@ mod tests {
         assert!(matches!(c[3], Inline::Break(BreakKind::Line))); // plain w:br
         assert!(matches!(c[4], Inline::Break(BreakKind::Line))); // w:cr
         assert!(matches!(c[5], Inline::Break(BreakKind::Column)));
+    }
+
+    #[test]
+    fn clearing_breaks_keep_their_side() {
+        let xml = "<w:document><w:body><w:p><w:r>                   <w:br w:clear=\"all\"/><w:br w:type=\"textWrapping\" w:clear=\"left\"/>                   <w:br w:type=\"textWrapping\"/><w:br w:clear=\"none\"/><w:br w:type=\"page\" w:clear=\"all\"/>                   </w:r></w:p></w:body></w:document>";
+        let d = doc(xml);
+        let c = &first_para(&d).content;
+        assert_eq!(c[0], Inline::Break(BreakKind::Clear(ClearKind::All)));
+        assert_eq!(c[1], Inline::Break(BreakKind::Clear(ClearKind::Left)));
+        assert_eq!(c[2], Inline::Break(BreakKind::Line));
+        assert_eq!(c[3], Inline::Break(BreakKind::Line));
+        assert_eq!(c[4], Inline::Break(BreakKind::Page));
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! Section-property commands on a document whose body ends in its own
 //! `w:sectPr` (every file Word writes) survive Save: the body editor's copy is
-//! the one `doc_to_docx` writes, so each command mirrors into it (#639).
+//! the one `doc_to_docx` writes (#639). The Layout tab's commands edit that
+//! copy directly (#649); header creation and ruler drags edit the package's
+//! and mirror it into the editor.
 
 use super::*;
 use core::prelude::v1::test;
@@ -42,6 +44,12 @@ fn tab_with_sect_pr(name: &str) -> DocTab {
     t
 }
 
+/// Layout > Columns > Two on the caret's section (the final one here).
+fn two_columns(t: &mut DocTab) {
+    use crate::layout_tab::{ColumnsPreset, LayoutAct, layout_apply};
+    layout_apply(t, LayoutAct::Columns(ColumnsPreset::Two)).unwrap();
+}
+
 fn editor(t: &DocTab) -> &Editor {
     let Surface::Doc(ed) = &t.surface else {
         panic!()
@@ -76,8 +84,8 @@ fn editor_sect(t: &DocTab) -> String {
 #[test]
 fn columns_survive_save_on_a_document_with_its_own_sect_pr() {
     let mut t = tab_with_sect_pr("columns");
-    cycle_columns_tab(&mut t);
-    assert_eq!(t.status.as_ref(), "Columns: 2");
+    two_columns(&mut t);
+    assert_eq!(t.status.as_ref(), "Columns: Two");
     assert!(t.dirty);
     let saved = save_and_reload(&mut t);
     assert!(
@@ -127,16 +135,20 @@ fn different_first_page_survives_save_both_ways() {
 }
 
 #[test]
-fn a_columns_change_is_one_undo_step_and_the_next_cycle_starts_from_the_editor() {
+fn a_columns_change_is_one_undo_step_and_reads_follow_the_editor() {
     let mut t = tab_with_sect_pr("columns-undo");
-    cycle_columns_tab(&mut t);
+    two_columns(&mut t);
     assert!(editor_sect(&t).contains("w:num=\"2\""));
+    // Give the package a stale two-column copy, as an older path left it:
+    // reads must follow the editor's, not the package's.
+    let stale = editor_sect(&t);
+    t.pkg.as_mut().unwrap().set_sect_pr(stale);
     assert!(editor_mut(&mut t).undo());
     assert_eq!(editor_sect(&t), SECT);
-    // The package still holds the undone value; the editor's copy wins.
-    assert_eq!(final_page_geom(&t).cols, 1);
-    cycle_columns_tab(&mut t);
-    assert_eq!(t.status.as_ref(), "Columns: 2");
+    assert_eq!(t.pkg.as_ref().unwrap().columns(), 2, "the package is stale");
+    assert_eq!(final_page_geom(&t).cols, 1, "the editor's copy wins");
+    two_columns(&mut t);
+    assert_eq!(t.status.as_ref(), "Columns: Two");
     assert!(editor_sect(&t).contains("w:num=\"2\""));
     let saved = save_and_reload(&mut t);
     assert_eq!(saved.columns(), 2);
@@ -200,7 +212,7 @@ fn tab_without_sect_pr() -> DocTab {
 fn undoing_columns_past_an_earlier_edit_is_undone_for_reads_and_save() {
     let mut t = tab_without_sect_pr();
     editor_mut(&mut t).insert_str("x");
-    cycle_columns_tab(&mut t);
+    two_columns(&mut t);
     assert_eq!(final_page_geom(&t).cols, 2);
     assert!(editor_mut(&mut t).undo());
     assert!(editor_mut(&mut t).undo());
@@ -208,14 +220,14 @@ fn undoing_columns_past_an_earlier_edit_is_undone_for_reads_and_save() {
     assert!(!sect.contains("w:num"), "{sect}");
     let saved = save_and_reload(&mut t);
     assert_eq!(saved.columns(), 1, "{}", saved.sect_pr());
-    cycle_columns_tab(&mut t);
-    assert_eq!(t.status.as_ref(), "Columns: 2");
+    two_columns(&mut t);
+    assert_eq!(t.status.as_ref(), "Columns: Two");
 }
 
 #[test]
 fn undoing_columns_on_a_document_without_a_sect_pr_is_undone_for_reads_and_save() {
     let mut t = tab_without_sect_pr();
-    cycle_columns_tab(&mut t);
+    two_columns(&mut t);
     assert_eq!(final_page_geom(&t).cols, 2);
     assert!(editor_mut(&mut t).undo());
     let sect = final_sect_pr(&t).unwrap();
@@ -223,8 +235,8 @@ fn undoing_columns_on_a_document_without_a_sect_pr_is_undone_for_reads_and_save(
     assert_eq!(final_page_geom(&t).cols, 1);
     let saved = save_and_reload(&mut t);
     assert_eq!(saved.columns(), 1, "{}", saved.sect_pr());
-    cycle_columns_tab(&mut t);
-    assert_eq!(t.status.as_ref(), "Columns: 2");
+    two_columns(&mut t);
+    assert_eq!(t.status.as_ref(), "Columns: Two");
 }
 
 #[test]

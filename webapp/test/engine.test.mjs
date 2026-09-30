@@ -116,6 +116,7 @@ function snapshotActs() {
       (c.menu || []).forEach(cmd);
       (c.rows || []).forEach((row) => row.forEach((cell) => cmd(cell.cmd)));
       if (c.kind === 'gallery') c.items.forEach((it) => acts.add(it.act));
+      if (c.kind === 'dropdown') c.items.forEach(cmd);
     });
   });
   snapshot.tabs.filter((t) => t.kind === 'ribbon').forEach(groups);

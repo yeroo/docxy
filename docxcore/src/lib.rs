@@ -43,5 +43,6 @@ pub mod package;
 pub mod protection;
 pub mod render;
 pub mod review;
+pub mod sect;
 pub mod serialize;
 pub mod styles;

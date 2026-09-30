@@ -143,6 +143,27 @@ pub enum BreakKind {
     Line,
     Page,
     Column,
+    /// A line break that also clears floating objects (`w:br w:clear`): Word's
+    /// Text Wrapping break. Laid out as a line break.
+    Clear(ClearKind),
+}
+
+/// Which side a clearing line break clears (`w:br w:clear`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClearKind {
+    Left,
+    Right,
+    All,
+}
+
+impl ClearKind {
+    pub fn val(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::All => "all",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

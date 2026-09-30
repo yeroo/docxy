@@ -106,6 +106,9 @@ fn form() -> Dialog {
             },
         ],
         owner: DialogOwner::Test,
+        focus: None,
+        opened: Vec::new(),
+        react: None,
     };
     d.controls = d.controls.into_iter().map(general).collect();
     preds.page = Some(1);
@@ -520,4 +523,124 @@ fn a_message_box_defaults_to_its_first_button() {
     assert_eq!(s.key_button("escape", true).as_deref(), Some("No"));
     s.clear();
     assert!(!s.is_open());
+}
+
+fn focused_name(s: &DialogStack) -> Option<&'static str> {
+    s.top().unwrap().focused().map(|c| c.name)
+}
+
+fn index(s: &DialogStack, name: &str) -> usize {
+    s.top()
+        .unwrap()
+        .controls
+        .iter()
+        .position(|c| c.name == name)
+        .unwrap()
+}
+
+/// Tab and Shift+Tab walk the editable widgets on the current page, skipping
+/// labels, lists, grids, and disabled or hidden controls (#649).
+#[test]
+fn tab_steps_through_the_editable_widgets_and_wraps() {
+    let mut s = stack();
+    assert_eq!(focused_name(&s), None);
+    let mut order = Vec::new();
+    for _ in 0..8 {
+        s.top_dialog_mut().unwrap().focus_step(false);
+        order.push(focused_name(&s).unwrap());
+    }
+    assert_eq!(
+        order,
+        [
+            "name",
+            "percent",
+            "start",
+            "duration",
+            "milestone",
+            "calendar",
+            "kind",
+            "name"
+        ]
+    );
+    s.top_dialog_mut().unwrap().focus_step(true);
+    assert_eq!(focused_name(&s), Some("kind"));
+    // Another tab has none of these: the focus goes with the page.
+    s.select_tab("Predecessors").unwrap();
+    assert_eq!(focused_name(&s), None);
+}
+
+/// Typing edits the focused field through `Control::set`: a number field
+/// takes the start of a number and refuses a letter, changing nothing.
+#[test]
+fn typing_and_backspace_edit_the_focused_field() {
+    let mut s = stack();
+    let d = s.top_dialog_mut().unwrap();
+    d.type_char('x').unwrap();
+    assert_eq!(text(&s, "name"), "Design", "nothing focused, nothing typed");
+    let d = s.top_dialog_mut().unwrap();
+    d.focus = Some(1); // Percent complete
+    d.backspace().unwrap();
+    assert_eq!(text(&s, "percent"), "", "a number field can be emptied");
+    let d = s.top_dialog_mut().unwrap();
+    for c in "-1.5".chars() {
+        d.type_char(c).unwrap();
+    }
+    assert_eq!(text(&s, "percent"), "-1.5");
+    let d = s.top_dialog_mut().unwrap();
+    assert_eq!(
+        d.type_char('e').unwrap_err(),
+        "'Percent complete:' takes a number"
+    );
+    assert_eq!(
+        d.type_char('.').unwrap_err(),
+        "'Percent complete:' takes a number"
+    );
+    assert_eq!(text(&s, "percent"), "-1.5");
+    let d = s.top_dialog_mut().unwrap();
+    d.focus = Some(0);
+    d.backspace().unwrap();
+    d.space().unwrap();
+    d.type_char('!').unwrap();
+    assert_eq!(text(&s, "name"), "Desig !");
+}
+
+/// A click on a widget goes through the same `set`: a checkbox toggles, a
+/// radio picks the item clicked, a dropdown steps to its next item; a
+/// disabled field refuses and takes no focus.
+#[test]
+fn clicks_toggle_pick_and_step_through_set() {
+    let mut s = stack();
+    let (milestone, kind, calendar, locked) = (
+        index(&s, "milestone"),
+        index(&s, "kind"),
+        index(&s, "calendar"),
+        index(&s, "locked"),
+    );
+    let d = s.top_dialog_mut().unwrap();
+    d.click_control(milestone, None).unwrap();
+    assert_eq!(d.value("milestone"), Some(&Value::Bool(true)));
+    assert_eq!(focused_name(&s), Some("milestone"));
+    let d = s.top_dialog_mut().unwrap();
+    d.space().unwrap();
+    assert_eq!(d.value("milestone"), Some(&Value::Bool(false)));
+    d.click_control(kind, Some(1)).unwrap();
+    assert_eq!(d.value("kind"), Some(&Value::Choice(Some(1))));
+    d.step_focused(false).unwrap();
+    assert_eq!(d.value("kind"), Some(&Value::Choice(Some(0))));
+    d.click_control(calendar, None).unwrap();
+    assert_eq!(d.value("calendar"), Some(&Value::Choice(Some(1))));
+    d.click_control(calendar, None).unwrap();
+    d.click_control(calendar, None).unwrap();
+    assert_eq!(
+        d.value("calendar"),
+        Some(&Value::Choice(Some(0))),
+        "it wraps"
+    );
+    d.step_focused(true).unwrap();
+    assert_eq!(d.value("calendar"), Some(&Value::Choice(Some(1))));
+    assert_eq!(
+        d.click_control(locked, None).unwrap_err(),
+        "'Locked:' cannot be edited"
+    );
+    assert_eq!(focused_name(&s), Some("calendar"));
 }
