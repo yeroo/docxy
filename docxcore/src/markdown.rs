@@ -293,8 +293,11 @@ fn cell_to_md(c: &Cell) -> String {
 /// Escape the pipes in already-escaped cell text: `escape_inline` emits `\|`
 /// for a literal pipe, so here only a *bare* pipe (from a code span, a link
 /// URL or an equation, which bypass `escape_inline`) needs a backslash. A
-/// `\` copies itself and its pair character unchanged; a lone `\` at the
-/// very end (a code span ending in a backslash) is copied alone.
+/// `\` copies itself and its pair character unchanged; the trailing-lone-`\`
+/// arm is a defensive guard, as no writer path produces one (a code span
+/// always closes with a backtick fence). Known limitation: a literal
+/// backslash inside a code span, URL or equation is paired with the
+/// character after it, so a code run `a\|b` reads back as `a|b`.
 fn escape_cell_pipes(s: &str) -> String {
     let mut out = String::new();
     let mut chars = s.chars();
@@ -653,7 +656,7 @@ fn atx_heading(t: &str) -> Option<(usize, &str)> {
     let hashes = t.chars().take_while(|&c| c == '#').count();
     if (1..=6).contains(&hashes) {
         let rest = &t[hashes..];
-        if rest.starts_with(' ') || rest.is_empty() {
+        if rest.starts_with([' ', '\t']) || rest.is_empty() {
             let body = rest.trim();
             // A closing `#` run counts only when a space or tab precedes it
             // (or it is the whole content), per CommonMark.
@@ -1049,7 +1052,19 @@ fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
         return None;
     }
     let url_end = (close + 2..chars.len()).find(|&j| chars[j] == ')')?;
-    let label: String = chars[start + 1..close].iter().collect();
+    // Unescape the label: a `\` drops itself and keeps the next char (a
+    // trailing lone `\` is kept), matching the inline pass.
+    let mut label = String::new();
+    let mut i = start + 1;
+    while i < close {
+        if chars[i] == '\\' && i + 1 < close {
+            label.push(chars[i + 1]);
+            i += 2;
+        } else {
+            label.push(chars[i]);
+            i += 1;
+        }
+    }
     let url: String = chars[close + 2..url_end].iter().collect();
     Some((label, url, url_end + 1 - start))
 }
@@ -1185,6 +1200,20 @@ mod tests {
     }
 
     #[test]
+    fn atx_opener_accepts_a_tab() {
+        // CommonMark allows a tab (not just a space) after the opening `#` run.
+        let doc = from_markdown("#\tfoo");
+        assert_eq!(doc.body.len(), 1);
+        match &doc.body[0] {
+            Block::Paragraph(p) => {
+                assert_eq!(p.props.heading_level, Some(1));
+                assert_eq!(p.plain_text(), "foo");
+            }
+            other => panic!("expected a heading, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn emphasis_parses_and_serializes() {
         let doc = from_markdown("This is **bold** and *italic*.");
         let p = match &doc.body[0] {
@@ -1239,6 +1268,26 @@ mod tests {
         assert_eq!(link.target.as_deref(), Some("https://example.com/x"));
         assert_eq!(link.runs[0].text, "docs");
         assert!(to_markdown(&doc).contains("[docs](https://example.com/x)"));
+    }
+
+    #[test]
+    fn paragraph_link_label_unescapes() {
+        // A `\x` pair in a link label is one escape, in a paragraph and in a
+        // table cell alike.
+        let doc = from_markdown(r"[a\*b](http://x)");
+        let p = match &doc.body[0] {
+            Block::Paragraph(p) => p,
+            _ => panic!(),
+        };
+        let link = p
+            .content
+            .iter()
+            .find_map(|i| match i {
+                Inline::Hyperlink(h) => Some(h),
+                _ => None,
+            })
+            .expect("a link");
+        assert_eq!(link.runs[0].text, "a*b");
     }
 
     #[test]
@@ -1452,6 +1501,35 @@ mod tests {
         );
         let out = to_markdown(&doc);
         assert!(out.contains("`x\\|y`"), "{out}");
+    }
+
+    #[test]
+    fn table_cell_link_label_round_trips() {
+        // The splitter keeps `\x` pairs for the inline pass, so the label
+        // must unescape them — `a\*b C:\dir`, not `a\*b C:\\dir`.
+        let doc = from_markdown("| A |\n| --- |\n| [a\\*b C:\\\\dir](http://x) |");
+        let cell = &table_of(&doc).rows[1].cells[0];
+        let Block::Paragraph(p) = &cell.blocks[0] else {
+            panic!("expected a paragraph");
+        };
+        assert_eq!(p.content.len(), 1, "{:?}", p.content);
+        match &p.content[0] {
+            Inline::Hyperlink(h) => {
+                assert_eq!(h.target.as_deref(), Some("http://x"));
+                assert_eq!(h.runs[0].text, "a*b C:\\dir");
+            }
+            other => panic!("expected a hyperlink, got {other:?}"),
+        }
+        let out = to_markdown(&doc);
+        let back = from_markdown(&out);
+        let cell = &table_of(&back).rows[1].cells[0];
+        let Block::Paragraph(p) = &cell.blocks[0] else {
+            panic!("expected a paragraph");
+        };
+        match &p.content[0] {
+            Inline::Hyperlink(h) => assert_eq!(h.runs[0].text, "a*b C:\\dir"),
+            other => panic!("expected a hyperlink, got {other:?}"),
+        }
     }
 
     #[test]
