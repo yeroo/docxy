@@ -24,8 +24,8 @@ part, and adding a comment is Comment even though it also adds body anchors.
 
 | Surface | Routes | Class |
 |---|---|---|
-| Body keys | printable characters, non-breaking space, Tab | Content |
-| Body keys | Enter, Backspace, Delete | Structure |
+| Body keys | printable characters, non-breaking space, Tab outside a table, Ctrl+Tab in a table cell | Content |
+| Body keys | Enter, Backspace, Delete, Tab in a table's last cell (adds a row) | Structure |
 | Clipboard | Cut | Structure |
 | Clipboard | Plain/merge paste | Content |
 | Clipboard | Rich paste / Paste Special Keep Source Formatting | Content and Formatting |
@@ -46,7 +46,8 @@ part, and adding a comment is Comment even though it also adds body anchors.
 | Vim normal/visual mode | `x`, `d`, `c`, `D`, `dd`, paste, `o`/`O`, undo, redo | Content or Structure as above |
 | File backstage | cross-format Save As that replaces the live DOCX editing context | Package metadata |
 
-Selection, navigation, copy, find/search, comment navigation, view preferences,
+Tab and Shift+Tab between table cells (#643) only select a cell's content and
+are outside the gate, like the other navigation keys. Selection, navigation, copy, find/search, comment navigation, view preferences,
 inspection, same-format save, PDF/text/Markdown export, opening/reloading another
 file, and creating a new document do not mutate the protected document and are
 outside the authorization gate. Saving persists changes that were authorized at

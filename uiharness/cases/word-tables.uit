@@ -1,0 +1,187 @@
+# Word tables (#705): Tab navigation (#643), Insert > Table (#646), the table
+# Layout tab (#647) and the Table Design tab (#648). The document state's
+# `table` object is the caret's innermost table: `cells.<row>.<cell>` lists a
+# cell's paragraphs, with a tab shown as ⇥.
+
+test tab moves between cells and adds a row, ctrl+tab types a tab (643)
+  open copy:../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call table-grid {"cols":2,"rows":2,"click":true}
+  assert table.rows is 2
+  assert table.columns is 2
+  type a
+  key enter
+  type b
+  key ctrl+tab
+  type c
+  key tab
+  type d
+  key tab
+  type e
+  key tab
+  type f
+  key tab
+  type g
+  key shift+tab
+  type h
+  assert table.rows is 3
+  assert table.cells.0.0.0 is a
+  assert table.cells.0.0.1 is b⇥c
+  assert table.cells.0.1.0 is d
+  assert table.cells.1.0.0 is e
+  assert table.cells.1.1.0 is h
+  assert table.cells.2.0.0 is g
+  shot window
+  key ctrl+s
+  assert dirty is false
+  # Shift+Tab in the first cell stays there.
+  key ctrl+home
+  key shift+tab
+  assert table.row is 0
+  assert table.cell is 0
+
+test insert table grid reads columns by rows and inserts that table (646)
+  open copy:../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-read {}
+  assert reply.items.0.table_grid.columns is 10
+  assert reply.items.0.table_grid.rows is 8
+  assert reply.items.2.label is Insert Table...
+  assert reply.items.3.label is Draw Table
+  assert reply.items.3.enabled is false
+  assert reply.items.4.label is Convert Text to Table...
+  assert reply.items.4.enabled is false
+  call table-grid {"cols":4,"rows":3}
+  assert reply.header is 4x3 Table
+  call table-grid {}
+  assert reply.header is Insert Table
+  call table-grid {"cols":4,"rows":3,"click":true}
+  assert menu is null
+  assert table.columns is 4
+  assert table.rows is 3
+  shot window
+  key ctrl+z
+  assert table is null
+
+test insert table dialog defaults and convert text to table (646)
+  open copy:../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  assert dialog is insert-table
+  call dialog-read {}
+  assert reply.controls.0.value is 5
+  assert reply.controls.1.value is 2
+  assert reply.controls.2.value is Fixed column width
+  call dialog-set {"control":"Number of columns","value":3}
+  call dialog-click {"button":"OK"}
+  assert table.columns is 3
+  assert table.rows is 2
+  key ctrl+z
+  type one	two
+  key home shift+end
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-read {}
+  assert reply.items.4.enabled is true
+  call menu-click {"label":"Convert Text to Table..."}
+  assert dialog is convert-text-to-table
+  call dialog-read {}
+  assert reply.controls.0.value is 2
+  call dialog-click {"button":"OK"}
+  assert table.cells.0.0.0 is one
+  assert table.cells.0.1.0 is two
+
+test layout tab selects, merges, splits, aligns, sorts and converts (647)
+  open copy:../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call table-grid {"cols":3,"rows":3,"click":true}
+  type 3
+  key tab
+  type c
+  key tab
+  key tab
+  type 1
+  key tab
+  type a
+  key tab
+  key tab
+  type 2
+  key tab
+  type b
+  assert ribbon_tab is Insert
+  call ribbon-click {"tab":"Table Layout","command":"select-column"}
+  assert table.range.top is 0
+  assert table.range.bottom is 2
+  assert table.range.left is 1
+  assert table.range.right is 1
+  call ribbon-click {"tab":"Table Layout","command":"merge-cells"}
+  assert table.cells.0.1.0 is c
+  assert table.cells.0.1.1 is a
+  assert table.cells.0.1.2 is b
+  key ctrl+z
+  assert table.cells.1.1.0 is a
+  call ribbon-click {"tab":"Table Layout","command":"split-cells"}
+  assert dialog is split-cells
+  call dialog-click {"button":"OK"}
+  assert table.columns is 4
+  key ctrl+z
+  key escape
+  call ribbon-click {"tab":"Table Layout","command":"align-bottom-right"}
+  assert para.alignment is right
+  call ribbon-click {"tab":"Table Layout","command":"text-direction"}
+  assert table.text_direction is tbRl
+  call ribbon-click {"tab":"Table Layout","command":"insert-below"}
+  assert table.rows is 4
+  key ctrl+z
+  # Home > Sort in a table opens the table's Sort dialog.
+  call ribbon-click {"tab":"Home","command":"sort"}
+  assert dialog is sort
+  call dialog-set {"control":"type1","value":"Number"}
+  call dialog-click {"button":"OK"}
+  assert table.cells.0.0.0 is 1
+  assert table.cells.1.0.0 is 2
+  assert table.cells.2.0.0 is 3
+  assert table.cells.2.1.0 is c
+  call ribbon-click {"tab":"Table Layout","command":"gridlines"}
+  assert view.gridlines is false
+  call ribbon-click {"tab":"Table Layout","command":"gridlines"}
+  assert view.gridlines is true
+  shot window
+  call ribbon-click {"tab":"Table Layout","command":"convert-to-text"}
+  assert dialog is convert-to-text
+  call dialog-click {"button":"OK"}
+  assert table is null
+  assert ribbon_tab is Home
+
+test design tab styles, options, shading and borders (648)
+  open copy:../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call table-grid {"cols":3,"rows":4,"click":true}
+  call ribbon-click {"tab":"Table Design","command":"tablestyles:Grid Table 4 Accent 1"}
+  assert table.style is GridTable4-Accent1
+  assert table.look is 04A0
+  call ribbon-click {"tab":"Table Design","command":"banded-columns"}
+  assert table.look is 00A0
+  call ribbon-click {"tab":"Table Design","command":"header-row"}
+  assert table.look is 0080
+  key ctrl+z
+  assert table.look is 00A0
+  call ribbon-click {"tab":"Table Design","command":"shade-yellow"}
+  assert table.shading is FFFF00
+  call ribbon-click {"tab":"Table Design","command":"shade-none"}
+  assert table.shading is null
+  call ribbon-read {}
+  assert reply.tabs.6.name is Table Design
+  assert reply.tabs.6.groups.2.commands.6.id is border-all
+  assert reply.tabs.6.groups.2.commands.6.checked is true
+  assert reply.tabs.6.groups.2.commands.11.id is border-diag-down
+  assert reply.tabs.6.groups.2.commands.11.enabled is true
+  call ribbon-click {"tab":"Table Design","command":"border-all"}
+  call ribbon-read {}
+  assert reply.tabs.6.groups.2.commands.6.checked is false
+  call ribbon-click {"tab":"Table Design","command":"border-diag-down"}
+  call ribbon-read {}
+  assert reply.tabs.6.groups.2.commands.11.checked is true
+  shot window
+  key ctrl+z ctrl+z
+  call ribbon-read {}
+  assert reply.tabs.6.groups.2.commands.6.checked is true

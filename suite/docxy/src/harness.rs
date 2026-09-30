@@ -1203,11 +1203,19 @@ fn table_state(editor: &Editor) -> Json {
             ("right", Json::Num(r.right as f64)),
         ])
     });
+    let map = docxcore::table::GridMap::of(t);
     Json::obj(vec![
         ("rows", Json::Num(t.rows.len() as f64)),
+        ("columns", Json::Num(map.width(t) as f64)),
         ("row", Json::Num(pos.row as f64)),
         ("cell", Json::Num(pos.cell as f64)),
         ("style", str_or_null(editor.table_style())),
+        (
+            "look",
+            str_or_null(editor.table_look().map(|l| format!("{:04X}", l.bits()))),
+        ),
+        ("shading", str_or_null(editor.cell_shading())),
+        ("text_direction", str_or_null(editor.cell_text_direction())),
         ("range", range),
         ("cells", Json::Arr(cells)),
     ])
