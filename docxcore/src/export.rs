@@ -144,6 +144,8 @@ enum PageVAlign {
     Top,
     Center,
     Bottom,
+    /// Justified: the paragraphs spread to fill the page.
+    Both,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,7 +342,7 @@ impl SectionLayout {
         {
             Some("center") => PageVAlign::Center,
             Some("bottom") => PageVAlign::Bottom,
-            // `both` (justified) is laid out as top.
+            Some("both") => PageVAlign::Both,
             _ => PageVAlign::Top,
         };
         let num_type = start_tag(sect, "w:pgNumType");
@@ -629,6 +631,8 @@ struct Page {
     hf_frags: Vec<Frag>,
     hf_links: Vec<Link>,
     rules: Vec<Rule>,
+    /// Every body line, in layout order (vertical alignment, column balancing).
+    lines: Vec<LineRec>,
     /// Lowest body baseline on the page (vertical alignment).
     min_base: f32,
     regions: usize,
@@ -637,6 +641,48 @@ struct Page {
     members: Vec<usize>,
     /// Formatted PAGE, NUMPAGES and SECTIONPAGES values.
     values: [String; 3],
+}
+
+/// One body line on a page: where it sits, and the first of its frags and
+/// links (the line owns them up to the next line's first, or the page's end).
+#[derive(Debug, Clone, Copy)]
+struct LineRec {
+    y: f32,
+    /// The column set ([`Region::id`]) and paragraph it belongs to.
+    region: u32,
+    para: u32,
+    frags: usize,
+    links: usize,
+    /// Paragraph spacing laid out after the line.
+    gap_after: f32,
+}
+
+impl Page {
+    /// The frags and links of line `i`.
+    fn line_items(&self, i: usize) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+        let line = &self.lines[i];
+        let next = self.lines.get(i + 1);
+        (
+            line.frags..next.map_or(self.frags.len(), |n| n.frags),
+            line.links..next.map_or(self.links.len(), |n| n.links),
+        )
+    }
+
+    /// Move line `i` (its frags and links) by `(dx, dy)`.
+    fn shift_line(&mut self, i: usize, dx: f32, dy: f32) {
+        let (frags, links) = self.line_items(i);
+        for f in &mut self.frags[frags] {
+            f.x += dx;
+            f.y += dy;
+        }
+        for (rect, _) in &mut self.links[links] {
+            rect.0 += dx;
+            rect.2 += dx;
+            rect.1 += dy;
+            rect.3 += dy;
+        }
+        self.lines[i].y += dy;
+    }
 }
 
 /// What a flow knows about the paragraph whose lines come next.
@@ -902,6 +948,8 @@ impl Flow for BandFlow {
 
 /// A column set on one page, belonging to one section.
 struct Region {
+    /// Unique per column set per page, tying [`LineRec`]s to it.
+    id: u32,
     sect: usize,
     top: f32,
     col: usize,
@@ -921,6 +969,7 @@ struct Pager<'a> {
     pages: Vec<Page>,
     next_number: u32,
     region: Region,
+    next_region: u32,
     y: f32,
     /// The current paragraph's ordinal, and whether its lines are numbered.
     para: u32,
@@ -950,6 +999,7 @@ impl<'a> Pager<'a> {
             pages: Vec::new(),
             next_number: 1,
             region: Region {
+                id: 0,
                 sect: 0,
                 top: 0.0,
                 col: 0,
@@ -957,6 +1007,7 @@ impl<'a> Pager<'a> {
                 xs: Vec::new(),
                 placed: false,
             },
+            next_region: 0,
             y: 0.0,
             para: 0,
             numbered: false,
@@ -1077,6 +1128,7 @@ impl<'a> Pager<'a> {
             hf_frags,
             hf_links,
             rules: Vec::new(),
+            lines: Vec::new(),
             min_base: f32::INFINITY,
             regions: 0,
             multi_col: false,
@@ -1097,7 +1149,9 @@ impl<'a> Pager<'a> {
             xs.push((x, w));
             x += w + space;
         }
+        self.next_region += 1;
         self.region = Region {
+            id: self.next_region,
             sect,
             top,
             col: 0,
@@ -1190,17 +1244,21 @@ impl<'a> Pager<'a> {
                 && s.valign != PageVAlign::Top
             {
                 let free = (page.min_base - page.body_bottom).max(0.0);
-                let shift = if s.valign == PageVAlign::Center {
-                    free / 2.0
+                if s.valign == PageVAlign::Both {
+                    justify_page(page, free);
                 } else {
-                    free
-                };
-                for f in &mut page.frags {
-                    f.y -= shift;
-                }
-                for (rect, _) in &mut page.links {
-                    rect.1 -= shift;
-                    rect.3 -= shift;
+                    let shift = if s.valign == PageVAlign::Center {
+                        free / 2.0
+                    } else {
+                        free
+                    };
+                    for f in &mut page.frags {
+                        f.y -= shift;
+                    }
+                    for (rect, _) in &mut page.links {
+                        rect.1 -= shift;
+                        rect.3 -= shift;
+                    }
                 }
             }
             let show_borders = match s.borders.display {
@@ -1228,6 +1286,29 @@ impl<'a> Pager<'a> {
             }
         }
         self.pages
+    }
+}
+
+/// `w:vAlign="both"`: spread the page's paragraphs evenly over its `free`
+/// space, the first staying at the top and the last ending on the body's
+/// bottom. A page with one paragraph stays top-aligned.
+fn justify_page(page: &mut Page, free: f32) {
+    let mut ordinals = Vec::with_capacity(page.lines.len());
+    let mut n = 0usize;
+    let mut last = None;
+    for line in &page.lines {
+        if last != Some(line.para) {
+            last = Some(line.para);
+            n += 1;
+        }
+        ordinals.push(n - 1);
+    }
+    if n < 2 {
+        return;
+    }
+    let step = free / (n - 1) as f32;
+    for (i, k) in ordinals.into_iter().enumerate() {
+        page.shift_line(i, 0.0, -(k as f32) * step);
     }
 }
 
@@ -1303,6 +1384,14 @@ impl Flow for Pager<'_> {
         let number = self.count_line();
         let page = self.pages.last_mut().expect("a page exists");
         page.min_base = page.min_base.min(self.y);
+        page.lines.push(LineRec {
+            y: self.y,
+            region: self.region.id,
+            para: self.para,
+            frags: page.frags.len(),
+            links: page.links.len(),
+            gap_after: 0.0,
+        });
         if let Some((n, distance)) = number {
             let text = n.to_string();
             let size = self.opts.base_font_size;
@@ -1342,6 +1431,15 @@ impl Flow for Pager<'_> {
     fn gap(&mut self, dy: f32) {
         self.y -= dy;
         self.mark_low();
+        let region = self.region.id;
+        if let Some(line) = self
+            .pages
+            .last_mut()
+            .and_then(|p| p.lines.last_mut())
+            .filter(|l| l.region == region)
+        {
+            line.gap_after += dy;
+        }
     }
     fn hard_break(&mut self, kind: BreakKind) {
         match kind {
@@ -2447,7 +2545,7 @@ mod tests {
         let (_, y) = pages_of(&d("bottom"), &PdfOptions::default())[0].at("x");
         assert!(close(y, 72.0), "y = {y}");
         let (_, y) = pages_of(&d("both"), &PdfOptions::default())[0].at("x");
-        assert!(close(y, first), "both is laid out as top");
+        assert!(close(y, first), "one paragraph stays at the top");
     }
 
     /// Options with header/footer parts: `(rid, part file, blocks)`.
@@ -3187,5 +3285,100 @@ mod tests {
         let (rx, ry) = pages[0].at("right");
         assert!(close(rx, 324.0));
         assert!(close(nums[1].1 + 6.6, 324.0 - 18.0) && close(nums[1].2, ry));
+    }
+
+    // ---- vAlign both (#737) ----
+
+    fn link_para(text: &str, url: &str) -> Block {
+        para(vec![Inline::Hyperlink(Hyperlink {
+            target: Some(url.to_string()),
+            runs: vec![Run {
+                text: text.to_string(),
+                props: RunProps::default(),
+            }],
+            ..Hyperlink::default()
+        })])
+    }
+
+    /// Every link annotation's rectangle in the PDF.
+    fn link_rects(pdf: &[u8]) -> Vec<[f32; 4]> {
+        s(pdf)
+            .split("/Subtype /Link /Rect [")
+            .skip(1)
+            .map(|rest| {
+                let nums: Vec<f32> = rest[..rest.find(']').unwrap()]
+                    .split(' ')
+                    .map(|n| n.parse().unwrap())
+                    .collect();
+                [nums[0], nums[1], nums[2], nums[3]]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn valign_both_spreads_paragraphs() {
+        let long = "word ".repeat(20); // two lines at 70 characters a line
+        let d = doc(vec![
+            text_para("a"),
+            text_para(long.trim_end()),
+            link_para("c", "https://example.org/"),
+            trailing(&ln_sect(
+                r#"w:restart="newPage""#,
+                r#"<w:vAlign w:val="both"/>"#,
+            )),
+        ]);
+        let pdf = to_pdf(&d, &PdfOptions::default());
+        let pages = parse_pages(&pdf);
+        assert_eq!(pages.len(), 1);
+        let page = &pages[0];
+        let gap = 11.0 * 0.4;
+        // Top-aligned layout: a, the two lines of b, then c.
+        let a = 720.0 - LH;
+        let b1 = a - gap - LH;
+        let c = b1 - 2.0 * LH - gap;
+        let free = c - 72.0;
+        assert!(close(page.at("a").1, a), "the first paragraph stays");
+        assert!(close(page.at("c").1, 72.0), "the last ends on the bottom");
+        let b_lines: Vec<f32> = page
+            .texts
+            .iter()
+            .filter(|(_, _, t)| t.starts_with("word"))
+            .map(|(_, y, _)| *y)
+            .collect();
+        assert_eq!(b_lines.len(), 2);
+        assert!(close(b_lines[0], b1 - free / 2.0), "{b_lines:?}");
+        assert!(
+            close(b_lines[0] - b_lines[1], LH),
+            "a paragraph moves whole"
+        );
+        // The link and the line numbers move with their lines.
+        let rect = link_rects(&pdf)[0];
+        assert!(close(rect[1], 72.0 - 2.0), "{rect:?}");
+        let nums = numbers(page);
+        assert_eq!(nums.len(), 4);
+        assert!(close(nums[1].2, b_lines[0]) && close(nums[3].2, 72.0));
+    }
+
+    #[test]
+    fn valign_both_single_paragraph_or_columns_stay_at_the_top() {
+        let long = "word ".repeat(20);
+        let d = doc(vec![
+            text_para(long.trim_end()),
+            trailing(r#"<w:sectPr><w:vAlign w:val="both"/></w:sectPr>"#),
+        ]);
+        let pages = pages_of(&d, &PdfOptions::default());
+        assert!(close(pages[0].texts[0].1, 720.0 - LH));
+        assert!(close(pages[0].texts[1].1, 720.0 - 2.0 * LH));
+
+        // A multi-column page isn't justified (as for center and bottom).
+        let d = doc(vec![
+            text_para("a"),
+            text_para("b"),
+            trailing(
+                &two_col_sect("").replace("</w:sectPr>", r#"<w:vAlign w:val="both"/></w:sectPr>"#),
+            ),
+        ]);
+        let pages = pages_of(&d, &PdfOptions::default());
+        assert!(close(pages[0].at("b").1, 720.0 - 2.0 * LH - 4.4));
     }
 }
