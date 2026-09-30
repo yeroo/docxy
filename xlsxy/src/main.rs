@@ -415,7 +415,12 @@ fn main() -> ExitCode {
         }
         Some(input) => match std::fs::read(input) {
             Ok(data) => match load_xlsx(&data) {
-                Ok(pkg) => (pkg, input.clone(), None),
+                // A template opens as a new workbook from it.
+                Ok(pkg) => (
+                    pkg,
+                    template_binding(input).unwrap_or_else(|| input.clone()),
+                    None,
+                ),
                 Err(e) => {
                     eprintln!("error: {input}: {e}");
                     return ExitCode::FAILURE;
@@ -495,7 +500,21 @@ fn main() -> ExitCode {
 
     let welcome = parsed.inputs.is_empty();
     let wizard = parsed.inputs.first().filter(|i| is_text_import(i)).cloned();
-    match run_tui(pkg, &path, import_source, welcome, parsed.vim, wizard) {
+    // The template a new workbook was started from, when the input was one.
+    let template = parsed
+        .inputs
+        .first()
+        .filter(|input| is_template(input) && **input != path)
+        .cloned();
+    match run_tui(
+        pkg,
+        &path,
+        import_source,
+        template,
+        welcome,
+        parsed.vim,
+        wizard,
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
@@ -549,7 +568,10 @@ fn auto_convert_from_prefs(text: &str) -> AutoConvert {
 /// loads as it is; a `.csv`/`.tsv` imports as one sheet as Excel opens it
 /// (`sep=`, typed-entry conversion); a `.txt`/`.prn` imports with the Text
 /// Import Wizard's defaults (the editor shows the wizard instead, see
-/// `App::open_workbook`). A text import is saved to `<name>.xlsx`.
+/// `App::open_workbook`). A text import is saved to `<name>.xlsx`. A
+/// template (`.xltx`, `.xltm`) opens as a new workbook from it, as Excel
+/// starts one: bound to [`template_binding`], so a save never writes the
+/// template itself.
 fn load_workbook(
     path: &str,
     open: &TextOpen,
@@ -577,8 +599,34 @@ fn load_workbook(
     } else {
         let data = std::fs::read(path).map_err(|e| e.to_string())?;
         let pkg = load_xlsx(&data).map_err(|e| e.to_string())?;
-        Ok((pkg, path.to_string(), None))
+        let save = template_binding(path).unwrap_or_else(|| path.to_string());
+        Ok((pkg, save, None))
     }
+}
+
+/// Whether `path` names a template (`.xltx`, `.xltm`).
+fn is_template(path: &str) -> bool {
+    matches!(
+        SpreadsheetKind::from_path(path),
+        Some(SpreadsheetKind::Template | SpreadsheetKind::MacroTemplate)
+    )
+}
+
+/// The path a new workbook started from template `path` is bound to, as
+/// Excel names it: `Budget.xltx` gives `Budget1.xlsx` beside it, or
+/// `Budget2.xlsx` when that exists, and so on; an `.xltm` gives an `.xlsm`.
+/// `None` when `path` is not a template.
+fn template_binding(path: &str) -> Option<String> {
+    let ext = match SpreadsheetKind::from_path(path)? {
+        SpreadsheetKind::Template => "xlsx",
+        SpreadsheetKind::MacroTemplate => "xlsm",
+        _ => return None,
+    };
+    // The extension is `.xltx`/`.xltm`, five ASCII bytes.
+    let base = &path[..path.len() - 5];
+    (1u32..)
+        .map(|n| format!("{base}{n}.{ext}"))
+        .find(|p| !Path::new(p).exists())
 }
 
 /// What a macro-free file (`.xlsx`, `.xltx`) written from `pkg` loses, in
@@ -1258,6 +1306,9 @@ struct App {
     engine: Engine,
     path: String,
     import_source: Option<String>,
+    /// The template this workbook was started from, while it is bound to a
+    /// new file (`Budget1.xlsx` from `Budget.xltx`).
+    template: Option<String>,
     sheet: usize,
     cur: (u32, u32),
     anchor: Option<(u32, u32)>,
@@ -1364,6 +1415,7 @@ impl App {
             engine,
             path: path.to_string(),
             import_source: None,
+            template: None,
             sheet: pkg_active_tab,
             cur: (0, 0),
             anchor: None,
@@ -3579,8 +3631,20 @@ impl App {
             return;
         }
         match load_workbook(path, &self.text_open()) {
-            Ok((pkg, p, import_source)) => self.install_workbook(pkg, p, import_source),
+            Ok((pkg, p, import_source)) => {
+                self.install_workbook(pkg, p, import_source);
+                self.note_template(path);
+            }
             Err(e) => self.status = Some(format!("Open failed: {e}")),
+        }
+    }
+
+    /// After opening `opened`: when it was a template, the workbook is a new
+    /// one started from it, and the status line says so.
+    fn note_template(&mut self, opened: &str) {
+        if is_template(opened) && self.path != opened {
+            self.template = Some(opened.to_string());
+            self.status = Some(format!("New workbook {} from template {opened}", self.path));
         }
     }
 
@@ -3599,6 +3663,7 @@ impl App {
         self.forget_clip();
         self.path = p;
         self.import_source = import_source;
+        self.template = None;
         self.model_rels = rels;
         self.model_measures = meas;
         self.comments = comments;
@@ -3620,6 +3685,7 @@ impl App {
     fn open_without_wizard(&mut self, path: &str) -> Result<(), String> {
         let (pkg, save, source) = load_workbook(path, &self.text_open())?;
         self.install_workbook(pkg, save, source);
+        self.note_template(path);
         Ok(())
     }
 
@@ -3631,6 +3697,12 @@ impl App {
     /// them and changes nothing.
     fn reload(&mut self) -> Result<(), String> {
         let path = self.path.clone();
+        // A workbook started from a template has no file of its own yet.
+        if self.template.is_some() && !Path::new(&path).exists() {
+            let msg = "nothing to revert: not saved yet".to_string();
+            self.status = Some(msg.clone());
+            return Err(msg);
+        }
         let Some(t) = self.bound_text_type() else {
             return self.open_without_wizard(&path);
         };
@@ -7185,6 +7257,7 @@ fn run_tui(
     pkg: SheetPackage,
     path: &str,
     import_source: Option<String>,
+    template: Option<String>,
     welcome: bool,
     vim: bool,
     wizard: Option<String>,
@@ -7204,6 +7277,9 @@ fn run_tui(
 
     let mut app = App::new(pkg, path);
     app.import_source = import_source;
+    if let Some(template) = template {
+        app.note_template(&template);
+    }
     app.load_view_prefs();
     if vim {
         app.vim = Some(VimState {
@@ -8050,6 +8126,100 @@ mod tests {
             prompt.contains("workbooks: VB project, Excel 4.0 macro sheets. Save"),
             "{prompt}"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #727: a template's new workbook is `<stem>N` beside it, with the
+    /// template's macro-ness: `.xltx` gives `.xlsx`, `.xltm` gives `.xlsm`.
+    #[test]
+    fn a_template_binds_the_first_free_numbered_workbook() {
+        let dir = macro_dir("tmpl-names");
+        let t = dir.join("Budget.xltx");
+        let t = t.to_str().unwrap();
+        let first = dir.join("Budget1.xlsx");
+        assert_eq!(template_binding(t).as_deref(), first.to_str());
+        std::fs::write(&first, b"taken").unwrap();
+        assert_eq!(
+            template_binding(t).as_deref(),
+            dir.join("Budget2.xlsx").to_str()
+        );
+        let m = dir.join("Macros.XLTM");
+        assert_eq!(
+            template_binding(m.to_str().unwrap()).as_deref(),
+            dir.join("Macros1.xlsm").to_str()
+        );
+        assert_eq!(template_binding(dir.join("a.xlsx").to_str().unwrap()), None);
+        assert_eq!(template_binding(dir.join("a.xlsm").to_str().unwrap()), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #727: opening a template starts a new workbook from it, as Excel does.
+    /// Save writes `Budget1.xlsx` as a workbook and leaves the template
+    /// byte for byte; revert before the first save has nothing to go back to.
+    #[test]
+    fn opening_a_template_starts_a_new_workbook() {
+        let dir = macro_dir("tmpl-open");
+        let template = dir.join("Budget.xltx");
+        let bytes = gridcore::xlsx::save_xlsx_as(&new_xlsx(), SpreadsheetKind::Template);
+        std::fs::write(&template, &bytes).unwrap();
+        let t = template.to_str().unwrap();
+        let new_book = dir.join("Budget1.xlsx");
+
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.open_workbook(t);
+        assert_eq!(Path::new(&app.path), new_book);
+        let status = app.status.clone().unwrap();
+        assert!(
+            status.contains("New workbook") && status.contains("from template"),
+            "{status}"
+        );
+        assert_eq!(
+            app.reload(),
+            Err("nothing to revert: not saved yet".to_string())
+        );
+        assert_eq!(Path::new(&app.path), new_book);
+
+        app.pkg.workbook.sheets[0].set_cell(0, 0, gridcore::sheet::Cell::number(7.0));
+        app.modified = true;
+        app.save_current().unwrap();
+        assert_eq!(
+            std::fs::read(&template).unwrap(),
+            bytes,
+            "the template is untouched"
+        );
+        let ct = saved_content_types(&new_book);
+        assert!(
+            ct.contains("spreadsheetml.sheet.main+xml") && !ct.contains("template"),
+            "{ct}"
+        );
+        // Once saved, revert reads the new workbook back.
+        assert!(app.reload().is_ok());
+        assert_eq!(Path::new(&app.path), new_book);
+
+        // The control surface's open does the same; the next number is free.
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.open_without_wizard(t).unwrap();
+        assert_eq!(Path::new(&app.path), dir.join("Budget2.xlsx"));
+        assert!(app.status.as_deref().unwrap().contains("from template"));
+
+        // A macro template gives a macro workbook.
+        let xltm = dir.join("Macros.xltm");
+        std::fs::write(
+            &xltm,
+            gridcore::xlsx::save_xlsx_as(&new_xlsx(), SpreadsheetKind::MacroTemplate),
+        )
+        .unwrap();
+        app.open_workbook(xltm.to_str().unwrap());
+        assert_eq!(Path::new(&app.path), dir.join("Macros1.xlsm"));
+        app.save_current().unwrap();
+        assert!(
+            saved_content_types(&dir.join("Macros1.xlsm")).contains("sheet.macroEnabled.main+xml")
+        );
+
+        // A workbook opened afterwards is not "from a template".
+        app.open_workbook(new_book.to_str().unwrap());
+        assert_eq!(Path::new(&app.path), new_book);
+        assert!(app.template.is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
