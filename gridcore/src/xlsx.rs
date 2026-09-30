@@ -483,7 +483,6 @@ fn parse_table_xml(xml: &str, sheet_idx: usize, part: &str) -> Option<Table> {
     })
 }
 
-/// Parse a `.rels` stream into (id, type, target) triples.
 /// Replace a loaded `#VALUE!` whose `vm` names a rich error with the real
 /// error, remembering the body so save writes the file's form back.
 fn decode_rich_error(cell: &mut Cell, rich: &HashMap<u32, &'static str>) {
@@ -656,6 +655,7 @@ fn rich_error_code(error_type: u32) -> Option<&'static str> {
     })
 }
 
+/// Parse a `.rels` stream into (id, type, target) triples.
 pub(crate) fn parse_rels(xml: &str) -> Vec<(String, String, String)> {
     let mut out = Vec::new();
     let mut p = XmlParser::new(xml);
@@ -7140,6 +7140,18 @@ mod tests {
                 .copied()
                 .collect::<Vec<_>>(),
             vec![2, 4, 5, 6, 8]
+        );
+        // A column with no criteria (a hidden button) filters nothing; the
+        // East column still decides.
+        let buttons = r#"<autoFilter ref="A1:C9"><filterColumn colId="1" hiddenButton="1"/><filterColumn colId="2" showButton="0"/><filterColumn colId="0"><filters><filter val="East"/></filters></filterColumn></autoFilter>"#;
+        let pkg = load_xlsx(&filter_fixture(buttons, "", false)).unwrap();
+        assert_eq!(
+            pkg.workbook.sheets[0]
+                .filtered_rows
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![2, 4, 6, 8]
         );
         // No autoFilter: every hidden row was hidden by hand.
         let pkg = load_xlsx(&filter_fixture("", "", false)).unwrap();

@@ -4728,8 +4728,6 @@ pub fn to_bool(v: &Value) -> Result<bool, ExcelError> {
     }
 }
 
-/// Excel's comparison: case-insensitive text; cross-type ordering
-/// Number < Text < Logical; empty coerces to the other side's zero value.
 /// Compare two numbers the way Excel does: equal when they agree to 15
 /// significant digits (`0.1+0.2` equals `0.3`), ordered by value otherwise.
 /// The formatting round-trip only runs for numbers already within 1e-14 of
@@ -4784,6 +4782,9 @@ pub fn truncate_15(text: &str) -> String {
     out
 }
 
+/// Excel's comparison: case-insensitive text; cross-type ordering
+/// Number < Text < Logical; empty coerces to the other side's zero value;
+/// numbers equal at 15 significant digits (see [`cmp_15`]).
 pub(crate) fn compare(a: &Value, b: &Value) -> Result<std::cmp::Ordering, ExcelError> {
     use std::cmp::Ordering;
     if let Value::Err(e) = a {
@@ -9504,8 +9505,9 @@ impl<'a> Eval<'a> {
         Ok((nums, counta))
     }
 
-    /// Does the cell hold a SUBTOTAL/AGGREGATE formula (which an enclosing
-    /// SUBTOTAL/AGGREGATE must skip)?
+    /// Does the cell hold a SUBTOTAL/AGGREGATE formula? An enclosing
+    /// SUBTOTAL, or AGGREGATE with options 0–3, skips such cells; AGGREGATE
+    /// options 4–7 count them.
     fn is_nested_subtotal(&self, sheet: usize, row: u32, col: u32) -> bool {
         match self.res.cell_formula(sheet, row, col) {
             Some(f) => {
