@@ -73,6 +73,9 @@ pub struct SheetPackage {
     /// this exact part instead of assuming the standard path — otherwise an
     /// unconventional original would be left orphaned beside a fresh duplicate.
     shared_part: Option<String>,
+    /// The workbook is Strict Open XML: parts and relationships the writer
+    /// creates use the Strict namespaces, as its own parts do.
+    strict: bool,
     /// The editable workbook. Mutate it, then [`save_xlsx`].
     pub workbook: Workbook,
 }
@@ -103,6 +106,68 @@ impl SheetPackage {
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, b)| b.as_slice())
+    }
+
+    /// The namespaces for anything the writer creates in this package.
+    pub(crate) fn ns(&self) -> &'static OoxmlNs {
+        if self.strict { &STRICT } else { &TRANSITIONAL }
+    }
+}
+
+/// The namespace URIs the writer mints, per conformance class. Strict Open
+/// XML (ECMA-376 Part 1, Strict) moves them to `purl.oclc.org/ooxml`; the OPC
+/// package namespaces and the content types are the same in both.
+pub(crate) struct OoxmlNs {
+    pub(crate) sml: &'static str,
+    /// The `r:` namespace, which is also the prefix of every relationship type.
+    pub(crate) rels: &'static str,
+    pub(crate) dml: &'static str,
+    pub(crate) chart: &'static str,
+    pub(crate) xdr: &'static str,
+}
+
+impl OoxmlNs {
+    /// The relationship type `kind` (`worksheet`, `sharedStrings`, …).
+    pub(crate) fn rel(&self, kind: &str) -> String {
+        format!("{}/{kind}", self.rels)
+    }
+}
+
+pub(crate) const TRANSITIONAL: OoxmlNs = OoxmlNs {
+    sml: "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+    rels: "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    dml: "http://schemas.openxmlformats.org/drawingml/2006/main",
+    chart: "http://schemas.openxmlformats.org/drawingml/2006/chart",
+    xdr: "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
+};
+
+pub(crate) const STRICT: OoxmlNs = OoxmlNs {
+    sml: "http://purl.oclc.org/ooxml/spreadsheetml/main",
+    rels: "http://purl.oclc.org/ooxml/officeDocument/relationships",
+    dml: "http://purl.oclc.org/ooxml/drawingml/main",
+    chart: "http://purl.oclc.org/ooxml/drawingml/chart",
+    xdr: "http://purl.oclc.org/ooxml/drawingml/spreadsheetDrawing",
+};
+
+/// Is the workbook part's root element in the Strict SpreadsheetML namespace?
+fn is_strict_workbook(wb_xml: &str) -> bool {
+    let mut p = XmlParser::new(wb_xml);
+    loop {
+        match p.next() {
+            Event::Start => {
+                let decl = match p.name().split_once(':') {
+                    Some((prefix, _)) => format!("xmlns:{prefix}"),
+                    None => "xmlns".to_string(),
+                };
+                return p
+                    .attrs()
+                    .iter()
+                    .chain(p.namespace_attrs())
+                    .any(|a| a.name == decl && a.value == STRICT.sml);
+            }
+            Event::Eof => return false,
+            _ => {}
+        }
     }
 }
 
@@ -357,11 +422,13 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
         pivots.push(piv);
     }
 
+    let strict = is_strict_workbook(&wb_xml);
     Ok(SheetPackage {
         parts,
         sheet_parts,
         shared,
         shared_part,
+        strict,
         workbook: Workbook {
             sheets,
             styles,
@@ -2311,7 +2378,7 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
                     (cd.edited, chart_is_writable(cd), cd.part.as_deref())
                 {
                     if let Some(p) = parts.iter_mut().find(|(n, _)| n == cpart) {
-                        p.1 = chart_space_xml(cd).into_bytes();
+                        p.1 = chart_space_xml_in(cd, pkg.ns()).into_bytes();
                     }
                 }
             }
@@ -2390,7 +2457,8 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
             }
             None => {
                 let xml = format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"{total}\" uniqueCount=\"{total}\">{additions}</sst>"
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<sst xmlns=\"{}\" count=\"{total}\" uniqueCount=\"{total}\">{additions}</sst>",
+                    pkg.ns().sml
                 );
                 parts.push((sst_name.to_string(), xml.into_bytes()));
                 add_content_type_override(
@@ -2400,7 +2468,7 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
                 );
                 add_workbook_rel(
                     &mut parts,
-                    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings",
+                    &pkg.ns().rel("sharedStrings"),
                     "sharedStrings.xml",
                 );
             }
@@ -3432,14 +3500,20 @@ pub fn chart_is_writable(cd: &crate::sheet::ChartData) -> bool {
     chart_kind_is_writable(&cd.kind) && !cd.complex
 }
 
-/// A self-contained `chartSpace` for the kinds `chart_kind_is_writable`
-/// accepts (bar, column, line, pie). Each series and the categories are written
-/// as a `strRef`/`numRef` naming the cells they read plus a cache of what those
-/// cells said, so the chart stays live in Excel; a series with no reference
-/// falls back to literals (`strLit`/`numLit`) and renders without a source
-/// range. `pub(crate)` so sibling modules' tests can round-trip parse → write →
-/// parse.
+/// [`chart_space_xml_in`] in the transitional namespaces. `pub(crate)` so
+/// sibling modules' tests can round-trip parse → write → parse.
+#[cfg(test)]
 pub(crate) fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
+    chart_space_xml_in(data, &TRANSITIONAL)
+}
+
+/// A self-contained `chartSpace` for the kinds `chart_kind_is_writable`
+/// accepts (bar, column, line, pie), in the namespaces of `ns`'s conformance
+/// class. Each series and the categories are written as a `strRef`/`numRef`
+/// naming the cells they read plus a cache of what those cells said, so the
+/// chart stays live in Excel; a series with no reference falls back to
+/// literals (`strLit`/`numLit`) and renders without a source range.
+fn chart_space_xml_in(data: &crate::sheet::ChartData, ns: &OoxmlNs) -> String {
     // Each cache is sized from ITS OWN slot, never from a chart-wide maximum:
     // series can be re-pointed one at a time, so a 3-cell `<c:f>` beside a
     // 9-point cache is both invalid and self-contradicting — and `parse_chart`
@@ -3630,11 +3704,14 @@ pub(crate) fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
 
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
-<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
+<c:chartSpace xmlns:c=\"{}\" xmlns:a=\"{}\" xmlns:r=\"{}\">\
 <c:chart><c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>{}</a:t></a:r></a:p></c:rich></c:tx><c:overlay val=\"0\"/></c:title>\
 <c:autoTitleDeleted val=\"0\"/><c:plotArea><c:layout/>\
 {plot_body}{axes}\
 </c:plotArea><c:legend><c:legendPos val=\"b\"/><c:overlay val=\"0\"/></c:legend><c:plotVisOnly val=\"1\"/><c:dispBlanksAs val=\"gap\"/></c:chart></c:chartSpace>",
+        ns.chart,
+        ns.dml,
+        ns.rels,
         esc_attr(&data.title)
     )
 }
@@ -3936,8 +4013,10 @@ impl SheetPackage {
             n += 1;
         }
         let part_name = format!("xl/worksheets/sheet{n}.xml");
+        let ns = self.ns();
         let body = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<worksheet xmlns=\"{SPREADSHEET_NS}\"><dimension ref=\"A1\"/><sheetData/></worksheet>"
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<worksheet xmlns=\"{}\"><dimension ref=\"A1\"/><sheetData/></worksheet>",
+            ns.sml
         );
         self.parts.push((part_name.clone(), body.into_bytes()));
         add_content_type_override(
@@ -3947,7 +4026,7 @@ impl SheetPackage {
         );
         let rid = add_workbook_rel(
             &mut self.parts,
-            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet",
+            &ns.rel("worksheet"),
             &format!("worksheets/sheet{n}.xml"),
         );
         // workbook.xml <sheets> entry with the next free sheetId.
@@ -4192,8 +4271,10 @@ impl SheetPackage {
         } else {
             " headerRowCount=\"0\""
         };
+        let ns = self.ns();
         let table_xml = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<table xmlns=\"{SPREADSHEET_NS}\" id=\"{tn}\" name=\"{name}\" displayName=\"{name}\" ref=\"{sqref}\"{header_attr} totalsRowShown=\"0\"><autoFilter ref=\"{sqref}\"/><tableColumns count=\"{}\">{cols_xml}</tableColumns><tableStyleInfo name=\"{style}\" showFirstColumn=\"0\" showLastColumn=\"0\" showRowStripes=\"1\" showColumnStripes=\"0\"/></table>",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<table xmlns=\"{}\" id=\"{tn}\" name=\"{name}\" displayName=\"{name}\" ref=\"{sqref}\"{header_attr} totalsRowShown=\"0\"><autoFilter ref=\"{sqref}\"/><tableColumns count=\"{}\">{cols_xml}</tableColumns><tableStyleInfo name=\"{style}\" showFirstColumn=\"0\" showLastColumn=\"0\" showRowStripes=\"1\" showColumnStripes=\"0\"/></table>",
+            ns.sml,
             names.len()
         );
         let part = format!("xl/tables/table{tn}.xml");
@@ -4213,14 +4294,18 @@ impl SheetPackage {
         let rid = add_rel(
             &mut self.parts,
             &rels_part,
-            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/table",
+            &ns.rel("table"),
             &format!("../tables/table{tn}.xml"),
         );
         if !rid.is_empty() {
             if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
                 let mut xml = String::from_utf8_lossy(&p.1).into_owned();
                 if !xml.contains("xmlns:r=") {
-                    xml = xml.replacen("<worksheet ", "<worksheet xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" ", 1);
+                    xml = xml.replacen(
+                        "<worksheet ",
+                        &format!("<worksheet xmlns:r=\"{}\" ", ns.rels),
+                        1,
+                    );
                 }
                 let entry = format!("<tablePart r:id=\"{rid}\"/>");
                 if let Some(s) = xml.find("<tableParts") {
@@ -4288,6 +4373,7 @@ impl SheetPackage {
         if sheet >= self.workbook.sheets.len() {
             return;
         }
+        let ns = self.ns();
         let mut cn = 1;
         while self.part(&format!("xl/charts/chart{cn}.xml")).is_some() {
             cn += 1;
@@ -4320,12 +4406,7 @@ impl SheetPackage {
         // orphan behind.
         let d_rels = format!("{d_dir}/_rels/{d_file}.rels");
         let c_target = relative_target(&d_dir, &chart_part);
-        let c_rid = match add_rel(
-            &mut self.parts,
-            &d_rels,
-            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart",
-            &c_target,
-        ) {
+        let c_rid = match add_rel(&mut self.parts, &d_rels, &ns.rel("chart"), &c_target) {
             // "" means the rel was already there — a dangling one naming a chart
             // part the zip doesn't hold, so `cn` picked its name. Reuse its id;
             // an anchor written with `r:id=""` makes Excel call the whole
@@ -4338,8 +4419,10 @@ impl SheetPackage {
         }
 
         // 3) chart part + content type.
-        self.parts
-            .push((chart_part.clone(), chart_space_xml(data).into_bytes()));
+        self.parts.push((
+            chart_part.clone(),
+            chart_space_xml_in(data, ns).into_bytes(),
+        ));
         add_content_type_override(
             &mut self.parts,
             &format!("/{chart_part}"),
@@ -4388,14 +4471,17 @@ impl SheetPackage {
         let (fr, fc) = from;
         let (tr, tc) = to;
         let anchor = format!(
-            "<{px}twoCellAnchor xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
+            "<{px}twoCellAnchor xmlns:a=\"{dml}\" xmlns:r=\"{rels}\">\
 <{px}from><{px}col>{fc}</{px}col><{px}colOff>0</{px}colOff><{px}row>{fr}</{px}row><{px}rowOff>0</{px}rowOff></{px}from>\
 <{px}to><{px}col>{tc}</{px}col><{px}colOff>0</{px}colOff><{px}row>{tr}</{px}row><{px}rowOff>0</{px}rowOff></{px}to>\
 <{px}graphicFrame macro=\"\"><{px}nvGraphicFramePr><{px}cNvPr id=\"{id}\" name=\"Chart {cn}\"/><{px}cNvGraphicFramePr/></{px}nvGraphicFramePr>\
 <{px}xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></{px}xfrm>\
-<a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" r:id=\"{c_rid}\"/></a:graphicData></a:graphic></{px}graphicFrame>\
+<a:graphic><a:graphicData uri=\"{chart}\"><c:chart xmlns:c=\"{chart}\" r:id=\"{c_rid}\"/></a:graphicData></a:graphic></{px}graphicFrame>\
 <{px}clientData/></{px}twoCellAnchor>",
-            id = shape_id
+            id = shape_id,
+            dml = ns.dml,
+            rels = ns.rels,
+            chart = ns.chart,
         );
         // Where this anchor will land: it is spliced at the end, so it takes the
         // next free index in whichever part hosts it. Knowing it is what lets a
@@ -4436,8 +4522,9 @@ impl SheetPackage {
             None => {
                 let drawing_xml = format!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
-<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
-{anchor}</xdr:wsDr>"
+<xdr:wsDr xmlns:xdr=\"{}\" xmlns:a=\"{}\" xmlns:r=\"{}\">\
+{anchor}</xdr:wsDr>",
+                    ns.xdr, ns.dml, ns.rels
                 );
                 self.parts
                     .push((drawing_part.clone(), drawing_xml.into_bytes()));
@@ -4461,12 +4548,7 @@ impl SheetPackage {
             .unwrap_or(("", sheet_part.as_str()));
         let rels_part = format!("{ws_dir}/_rels/{ws_file}.rels");
         let target = relative_target(ws_dir, &drawing_part);
-        let rid = match add_rel(
-            &mut self.parts,
-            &rels_part,
-            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing",
-            &target,
-        ) {
+        let rid = match add_rel(&mut self.parts, &rels_part, &ns.rel("drawing"), &target) {
             // "" means the rel was already there; reuse its id.
             id if id.is_empty() => rel_id_for(&self.parts, &rels_part, &target).unwrap_or_default(),
             id => id,
@@ -4475,7 +4557,11 @@ impl SheetPackage {
             if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
                 let mut xml = String::from_utf8_lossy(&p.1).into_owned();
                 if !xml.contains("xmlns:r=") {
-                    xml = xml.replacen("<worksheet ", "<worksheet xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" ", 1);
+                    xml = xml.replacen(
+                        "<worksheet ",
+                        &format!("<worksheet xmlns:r=\"{}\" ", ns.rels),
+                        1,
+                    );
                 }
                 if !xml.contains("<drawing ") {
                     // CT_Worksheet is a SEQUENCE: `drawing` comes before
@@ -4597,8 +4683,10 @@ impl SheetPackage {
                 format!("<worksheetSource name=\"{}\"/>", esc_attr(name))
             }
         };
+        let ns = self.ns();
         let mut cache_xml = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<pivotCacheDefinition xmlns=\"{SPREADSHEET_NS}\" refreshOnLoad=\"1\" recordCount=\"0\"><cacheSource type=\"worksheet\">{source_xml}</cacheSource><cacheFields count=\"{}\">",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<pivotCacheDefinition xmlns=\"{}\" refreshOnLoad=\"1\" recordCount=\"0\"><cacheSource type=\"worksheet\">{source_xml}</cacheSource><cacheFields count=\"{}\">",
+            ns.sml,
             fields.len()
         );
         for f in &fields {
@@ -4617,7 +4705,7 @@ impl SheetPackage {
         );
         let cache_rid = add_workbook_rel(
             &mut self.parts,
-            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition",
+            &ns.rel("pivotCacheDefinition"),
             &format!("pivotCache/pivotCacheDefinition{m}.xml"),
         );
 
@@ -4646,7 +4734,8 @@ impl SheetPackage {
         let (lr, lc) = location;
         let loc_ref = format!("{}:{}", cell_name(lr, lc), cell_name(lr + 1, lc + 1));
         let mut table_xml = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<pivotTableDefinition xmlns=\"{SPREADSHEET_NS}\" name=\"PivotTable{n}\" cacheId=\"{cache_id}\" dataCaption=\"Values\" useAutoFormatting=\"1\" indent=\"0\" outline=\"1\" outlineData=\"1\"><location ref=\"{loc_ref}\" firstHeaderRow=\"1\" firstDataRow=\"1\" firstDataCol=\"1\"/><pivotFields count=\"{}\">",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<pivotTableDefinition xmlns=\"{}\" name=\"PivotTable{n}\" cacheId=\"{cache_id}\" dataCaption=\"Values\" useAutoFormatting=\"1\" indent=\"0\" outline=\"1\" outlineData=\"1\"><location ref=\"{loc_ref}\" firstHeaderRow=\"1\" firstDataRow=\"1\" firstDataCol=\"1\"/><pivotFields count=\"{}\">",
+            ns.sml,
             fields.len()
         );
         for (i, _) in fields.iter().enumerate() {
@@ -4680,7 +4769,7 @@ impl SheetPackage {
         add_rel(
             &mut self.parts,
             &rels_part,
-            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable",
+            &ns.rel("pivotTable"),
             &format!("../pivotTables/pivotTable{n}.xml"),
         );
 
@@ -5070,6 +5159,7 @@ pub fn new_xlsx() -> SheetPackage {
         sheet_parts: vec!["xl/worksheets/sheet1.xml".to_string()],
         shared: Vec::new(),
         shared_part: Some("xl/sharedStrings.xml".to_string()),
+        strict: false,
         workbook: Workbook {
             sheets: vec![Sheet {
                 name: "Sheet1".to_string(),
@@ -10273,5 +10363,246 @@ mod ct_worksheet_order_tests {
             }
         }
         assert!(checked > 0, "no corpus sheets checked");
+    }
+}
+
+/// #602: a Strict Open XML workbook stays strict. What the writer creates uses
+/// the Strict namespaces; what it doesn't touch keeps its bytes.
+#[cfg(test)]
+mod strict_tests {
+    use super::*;
+    use crate::sheet::{Cell, CellValue};
+
+    const T_SML: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const T_RELS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const TRANSITIONAL_URIS: &[&str] = &[
+        T_SML,
+        T_RELS,
+        "http://schemas.openxmlformats.org/drawingml/2006/main",
+        "http://schemas.openxmlformats.org/drawingml/2006/chart",
+        "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
+    ];
+    const APP_REL: &str = r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>"#;
+    const APP_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>Microsoft Excel</Application></Properties>"#;
+
+    /// A Strict workbook as openpyxl-then-retagged writes it: strict parts and
+    /// relationship types, inline strings, no shared-strings part. Like
+    /// Excel's own Strict files, its docProps relationship stays transitional.
+    fn strict_xlsx() -> Vec<u8> {
+        let base = new_xlsx();
+        let strict = |s: &str| s.replace(T_SML, STRICT.sml).replace(T_RELS, STRICT.rels);
+        let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
+        for (name, bytes) in &base.parts {
+            let text = String::from_utf8(bytes.clone()).unwrap();
+            let text = match name.as_str() {
+                "xl/sharedStrings.xml" => continue,
+                "[Content_Types].xml" => text.replace(
+                    r#"<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>"#,
+                    "",
+                ),
+                "xl/_rels/workbook.xml.rels" => strict(&text).replace(
+                    &format!(
+                        r#"<Relationship Id="rId3" Type="{}/sharedStrings" Target="sharedStrings.xml"/>"#,
+                        STRICT.rels
+                    ),
+                    "",
+                ),
+                "_rels/.rels" => strict(&text).replace(
+                    "</Relationships>",
+                    &format!("{APP_REL}</Relationships>"),
+                ),
+                "xl/worksheets/sheet1.xml" => strict(&text).replace(
+                    "<sheetData/>",
+                    r#"<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>hello</t></is></c></row></sheetData>"#,
+                ),
+                _ => strict(&text),
+            };
+            parts.push((name.clone(), text.into_bytes()));
+        }
+        parts.push(("docProps/app.xml".into(), APP_XML.as_bytes().to_vec()));
+        write_zip(&parts)
+    }
+
+    fn text(pkg: &SheetPackage, name: &str) -> String {
+        String::from_utf8_lossy(pkg.part(name).unwrap_or_else(|| panic!("{name} missing")))
+            .into_owned()
+    }
+
+    /// Every part the writer created or changed, i.e. all but the docProps
+    /// part and relationship the fixture deliberately keeps transitional.
+    fn assert_strict_throughout(pkg: &SheetPackage) {
+        for (name, bytes) in &pkg.parts {
+            if name == "docProps/app.xml" {
+                continue;
+            }
+            let xml = String::from_utf8_lossy(bytes).replace(APP_REL, "");
+            for uri in TRANSITIONAL_URIS {
+                assert!(!xml.contains(uri), "{name} has {uri}: {xml}");
+            }
+        }
+    }
+
+    fn cell_text(pkg: &SheetPackage, sheet: usize, row: u32, col: u32) -> String {
+        match pkg.workbook.sheets[sheet].cell(row, col).map(|c| &c.value) {
+            Some(CellValue::Text(s)) => s.clone(),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_strict_workbook_is_detected_and_a_transitional_one_is_not() {
+        assert!(load_xlsx(&strict_xlsx()).unwrap().strict);
+        assert!(!load_xlsx(&save_xlsx(&new_xlsx())).unwrap().strict);
+    }
+
+    #[test]
+    fn a_new_shared_strings_part_is_strict_and_keeps_user_text() {
+        // The #602 repro: inline strings only, so save has to create the
+        // shared-strings part. One cell's text IS the transitional URI.
+        let mut pkg = load_xlsx(&strict_xlsx()).unwrap();
+        pkg.workbook.sheets[0].set_cell(0, 1, Cell::text(T_SML));
+        let out = load_xlsx(&save_xlsx(&pkg)).unwrap();
+
+        let sst = text(&out, "xl/sharedStrings.xml");
+        assert!(
+            sst.contains(&format!(r#"<sst xmlns="{}""#, STRICT.sml)),
+            "{sst}"
+        );
+        let rels = text(&out, "xl/_rels/workbook.xml.rels");
+        assert!(
+            rels.contains(&format!(r#"Type="{}/sharedStrings""#, STRICT.rels)),
+            "{rels}"
+        );
+        // The user's text is data, not a namespace: it is kept as typed.
+        assert_eq!(cell_text(&out, 0, 0, 0), "hello");
+        assert_eq!(cell_text(&out, 0, 0, 1), T_SML);
+        assert_eq!(sst.matches(T_SML).count(), 1, "{sst}");
+        let without_text = {
+            let mut o = out.clone();
+            o.set_part("xl/sharedStrings.xml", sst.replace(T_SML, "").into_bytes());
+            o
+        };
+        assert_strict_throughout(&without_text);
+    }
+
+    #[test]
+    fn every_part_the_writer_mints_in_a_strict_workbook_is_strict() {
+        let mut pkg = load_xlsx(&strict_xlsx()).unwrap();
+        let rows: [[&str; 2]; 3] = [["Region", "Sales"], ["East", "10"], ["West", "30"]];
+        for (r, row) in rows.iter().enumerate() {
+            for (c, v) in row.iter().enumerate() {
+                let cell = match v.parse::<f64>() {
+                    Ok(n) => Cell::number(n),
+                    Err(_) => Cell::text(v),
+                };
+                pkg.workbook.sheets[0].set_cell(r as u32, c as u32, cell);
+            }
+        }
+        pkg.add_table(0, (0, 0, 2, 1), true, "TableStyleMedium2")
+            .expect("table");
+        pkg.add_chart(
+            0,
+            (0, 3),
+            (10, 8),
+            &crate::sheet::ChartData {
+                title: "Sales".into(),
+                kind: "column".into(),
+                categories: vec!["East".into(), "West".into()],
+                series: vec![crate::sheet::ChartSeries {
+                    name: "Sales".into(),
+                    values: vec![10.0, 30.0],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        pkg.set_comment(0, 1, 1, "Reviewer", "check");
+        // add_sheet and add_pivot, the way the app creates a pivot.
+        let frame = crate::frame::Frame::from_range(&pkg.workbook, 0, (0, 0, 2, 1));
+        let spec = crate::frame::pivot_spec_from_names(
+            &frame,
+            &["Region".to_string()],
+            &[],
+            &[("Sales".to_string(), crate::frame::Agg::Sum)],
+        )
+        .expect("spec");
+        pkg.create_pivot(
+            crate::pivot::PivotSource::Range {
+                sheet: "Sheet1".into(),
+                rect: (0, 0, 2, 1),
+            },
+            &frame,
+            &spec,
+            "Pivot1",
+        )
+        .expect("pivot");
+        let mut out = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_strict_throughout(&out);
+        assert!(out.strict);
+        assert_eq!(out.workbook.tables.len(), 1);
+        assert_eq!(out.workbook.pivots.len(), 1);
+        assert_eq!(out.workbook.sheets.len(), 2);
+        assert_eq!(out.comments().len(), 1);
+
+        // An edited chart is regenerated from the model: still strict.
+        let chart_part = {
+            let dw = out.workbook.sheets[0]
+                .drawings
+                .iter_mut()
+                .find(|d| matches!(d.kind, crate::sheet::DrawingKind::Chart(_)))
+                .expect("the chart reloads");
+            let crate::sheet::DrawingKind::Chart(cd) = &mut dw.kind else {
+                unreachable!()
+            };
+            cd.title = "Edited".into();
+            cd.edited = true;
+            cd.part.clone().expect("chart part")
+        };
+        let again = load_xlsx(&save_xlsx(&out)).unwrap();
+        let chart = text(&again, &chart_part);
+        assert!(chart.contains("Edited"), "the edit was written: {chart}");
+        assert!(chart.contains(STRICT.chart), "{chart}");
+        assert_strict_throughout(&again);
+    }
+
+    #[test]
+    fn a_strict_workbooks_untouched_transitional_parts_keep_their_bytes() {
+        let input = load_xlsx(&strict_xlsx()).unwrap();
+        let out = load_xlsx(&save_xlsx(&input)).unwrap();
+        for name in ["_rels/.rels", "docProps/app.xml", "xl/styles.xml"] {
+            assert_eq!(out.part(name), input.part(name), "{name} changed");
+        }
+        assert!(text(&out, "_rels/.rels").contains(APP_REL));
+    }
+
+    #[test]
+    fn a_transitional_save_mints_nothing_strict() {
+        let mut pkg = load_xlsx(&save_xlsx(&new_xlsx())).unwrap();
+        pkg.workbook.sheets[0].set_cell(0, 0, Cell::text("a"));
+        pkg.workbook.sheets[0].set_cell(1, 0, Cell::number(1.0));
+        pkg.add_table(0, (0, 0, 1, 0), true, "TableStyleMedium2")
+            .expect("table");
+        pkg.add_chart(
+            0,
+            (0, 3),
+            (10, 8),
+            &crate::sheet::ChartData {
+                kind: "column".into(),
+                categories: vec!["a".into()],
+                series: vec![crate::sheet::ChartSeries {
+                    name: "s".into(),
+                    values: vec![1.0],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        pkg.set_comment(0, 0, 0, "A", "note");
+        let out = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        for (name, bytes) in &out.parts {
+            let xml = String::from_utf8_lossy(bytes);
+            assert!(!xml.contains("purl.oclc.org"), "{name}: {xml}");
+        }
     }
 }

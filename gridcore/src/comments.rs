@@ -13,13 +13,8 @@ use crate::xlsx::{
     resolve_relative, worksheet_insert_pos,
 };
 
-const SS_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const COMMENTS_CT: &str =
     "application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml";
-const COMMENTS_REL: &str =
-    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments";
-const VML_REL: &str =
-    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing";
 const VML_CT: &str = "application/vnd.openxmlformats-officedocument.vmlDrawing";
 
 // Modern threaded comments (Excel 2019+ / 365).
@@ -392,16 +387,25 @@ impl SheetPackage {
         }
 
         // comments part
-        self.set_part(&comments_part, serialize_comments(notes).into_bytes());
+        let ns = self.ns();
+        self.set_part(
+            &comments_part,
+            serialize_comments(notes, ns.sml).into_bytes(),
+        );
         add_content_type_override(&mut self.parts, &format!("/{comments_part}"), COMMENTS_CT);
         let ct_target = rel_target(dir, &comments_part);
-        add_rel(&mut self.parts, &rels_name, COMMENTS_REL, &ct_target);
+        add_rel(&mut self.parts, &rels_name, &ns.rel("comments"), &ct_target);
 
         // VML drawing part
         self.set_part(&vml_part, serialize_vml(notes).into_bytes());
         self.ensure_vml_default();
         let vml_target = rel_target(dir, &vml_part);
-        let vml_rid = add_rel(&mut self.parts, &rels_name, VML_REL, &vml_target);
+        let vml_rid = add_rel(
+            &mut self.parts,
+            &rels_name,
+            &ns.rel("vmlDrawing"),
+            &vml_target,
+        );
         // add_rel returns "" when the target already existed; find the rId then.
         let vml_rid = if vml_rid.is_empty() {
             self.find_rid(&rels_name, &vml_target)
@@ -655,7 +659,7 @@ fn rel_target(ws_dir: &str, part: &str) -> String {
     part.strip_prefix(&ws_prefix).unwrap_or(part).to_string()
 }
 
-fn serialize_comments(notes: &[Note]) -> String {
+fn serialize_comments(notes: &[Note], sml_ns: &str) -> String {
     use crate::xlsx::esc_text;
     let mut authors: Vec<&str> = Vec::new();
     for n in notes {
@@ -664,7 +668,7 @@ fn serialize_comments(notes: &[Note]) -> String {
         }
     }
     let mut s = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
-    s.push_str(&format!("<comments xmlns=\"{SS_NS}\"><authors>"));
+    s.push_str(&format!("<comments xmlns=\"{sml_ns}\"><authors>"));
     for a in &authors {
         s.push_str(&format!("<author>{}</author>", esc_text(a)));
     }
@@ -772,10 +776,7 @@ impl SheetPackage {
             if let Some(g) = xml.find("<worksheet") {
                 if let Some(rel) = xml[g..].find('>') {
                     let at = g + rel;
-                    xml.insert_str(
-                        at,
-                        " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"",
-                    );
+                    xml.insert_str(at, &format!(" xmlns:r=\"{}\"", self.ns().rels));
                 }
             }
         }
