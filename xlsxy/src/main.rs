@@ -111,7 +111,18 @@ fn backup_path(dest: &Path) -> std::path::PathBuf {
 /// any other failure aborts the save before the file is touched.
 fn keep_backup(dest: &Path) -> io::Result<()> {
     match std::fs::read(dest) {
-        Ok(bytes) => write_atomic(&backup_path(dest), &bytes),
+        Ok(bytes) => {
+            // A new backup would default to world-readable; mirror the
+            // file's own permissions so a private workbook stays private.
+            // Windows only mirrors the readonly bit, which would make the
+            // next save unable to replace the backup, so this is Unix-only.
+            #[cfg(unix)]
+            let perms = std::fs::metadata(dest)?.permissions();
+            write_atomic(&backup_path(dest), &bytes)?;
+            #[cfg(unix)]
+            std::fs::set_permissions(&backup_path(dest), perms)?;
+            Ok(())
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
@@ -2532,11 +2543,7 @@ impl App {
             return self.save_text(t);
         }
         let bytes = self.package_bytes();
-        if self.pkg.always_create_backup()
-            && self.import_source.as_deref().is_none_or(|source| {
-                !opccore::fsio::same_file(Path::new(source), Path::new(&self.path))
-            })
-        {
+        if self.pkg.always_create_backup() {
             if let Err(e) = keep_backup(Path::new(&self.path)) {
                 let msg = format!("save failed: {e}");
                 self.status = Some(msg.clone());
@@ -7349,6 +7356,20 @@ mod tests {
     use super::*;
     use gridcore::edit::parse_input;
     use gridcore::xlsx::save_xlsx;
+
+    /// `Backup of <stem>.xlk` lives beside the file; the stem keeps any
+    /// dots in the name.
+    #[test]
+    fn backup_path_names_the_xlk_beside_the_file() {
+        assert_eq!(
+            backup_path(Path::new("d/book.xlsx")),
+            Path::new("d/Backup of book.xlk")
+        );
+        assert_eq!(
+            backup_path(Path::new("d/my.book.xlsm")),
+            Path::new("d/Backup of my.book.xlk")
+        );
+    }
 
     /// #604: a workbook opens on the sheet it was saved on, and saving
     /// records the sheet the user is on.

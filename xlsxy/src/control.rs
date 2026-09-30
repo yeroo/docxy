@@ -1440,7 +1440,6 @@ fn parse_range(s: &str) -> Result<(u32, u32, u32, u32), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backup_path;
     use gridcore::xlsx::{load_xlsx, new_xlsx, save_xlsx};
 
     fn app() -> App {
@@ -3997,18 +3996,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `Backup of <stem>.xlk` lives beside the file; the stem keeps any
-    /// dots in the name.
+    /// A backup of a private workbook must not become world-readable:
+    /// keep_backup mirrors the file's own permissions.
+    #[cfg(unix)]
     #[test]
-    fn backup_path_names_the_xlk_beside_the_file() {
-        assert_eq!(
-            backup_path(std::path::Path::new("d/book.xlsx")),
-            std::path::Path::new("d/Backup of book.xlk")
+    fn wb_save_backup_keeps_source_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("xlsxy-608-backup-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = dir.join("book.xlsx");
+        std::fs::write(&book, backup_fixture("1")).unwrap();
+        std::fs::set_permissions(&book, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut a = App::new(
+            load_xlsx(&std::fs::read(&book).unwrap()).unwrap(),
+            book.to_str().unwrap(),
         );
+        a.os_clip = None;
+        set(&mut a, "A1", "changed");
+        dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+        let backup = dir.join("Backup of book.xlk");
+        let mode = std::fs::metadata(&backup).unwrap().permissions().mode();
         assert_eq!(
-            backup_path(std::path::Path::new("d/my.book.xlsm")),
-            std::path::Path::new("d/Backup of my.book.xlk")
+            mode & 0o777,
+            0o600,
+            "backup mirrors the source's permissions"
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The issue's repro: another program holds the file open with no
