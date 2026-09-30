@@ -2224,8 +2224,10 @@ impl App {
                             continue;
                         }
                         let mut new_cell = cell.clone().unwrap_or_default();
-                        if !clip.cut {
-                            // Copies translate relative refs; cuts keep them.
+                        // Copies translate relative refs; cuts keep them, and
+                        // so does a copy pasted where it came from (translating
+                        // reprints the text, even by zero).
+                        if !clip.cut && (dr_all, dc_all) != (0, 0) {
                             if let Some(f) = &new_cell.formula {
                                 if let Some(t) = translate_formula(f, dr_all, dc_all) {
                                     new_cell.formula = Some(t);
@@ -8315,21 +8317,28 @@ mod tests {
     #[test]
     fn pasting_a_cse_block_in_place_keeps_the_block() {
         // Copy or cut D1 and paste it straight back: it lands on its own
-        // block, which stays D1:D3.
+        // block, which stays D1:D3, and its loaded text is not reprinted
+        // (spaces and `_xlfn.` prefixes survive).
         for cut in [false, true] {
-            let mut pkg = new_xlsx();
-            pkg.workbook.sheets[0].set_cell(0, 3, cse_sum_block());
-            let mut app = App::new(pkg, "t.xlsx");
-            app.os_clip = None;
-            app.cur = (0, 3);
-            app.anchor = None;
-            app.copy(cut);
-            app.paste();
-            assert_eq!(
-                f_attrs_at(&app, 0, 0, 3).as_deref(),
-                Some(" t=\"array\" ref=\"D1:D3\""),
-                "cut: {cut}"
-            );
+            for src in ["SUM(A1:A3)", "SUM(A1:A3) * 2", "_xlfn.SINGLE(A1:A3)"] {
+                let mut pkg = new_xlsx();
+                let mut block = cse_sum_block();
+                block.formula = Some(src.into());
+                pkg.workbook.sheets[0].set_cell(0, 3, block);
+                let mut app = App::new(pkg, "t.xlsx");
+                app.os_clip = None;
+                app.cur = (0, 3);
+                app.anchor = None;
+                app.copy(cut);
+                app.paste();
+                let d1 = app.sheet().cell(0, 3).unwrap();
+                assert_eq!(
+                    d1.f_attrs.as_deref(),
+                    Some(" t=\"array\" ref=\"D1:D3\""),
+                    "cut: {cut}, {src}"
+                );
+                assert_eq!(d1.formula.as_deref(), Some(src), "cut: {cut}");
+            }
         }
     }
 
