@@ -2285,7 +2285,14 @@ pub fn is_volatile(e: &Expr) -> bool {
                     | "OFFSET"
                     | "CELL"
                     | "INFO"
-            ) || args.iter().any(is_volatile)
+            )
+                // A D-function's computed criteria are evaluated per record
+                // with their relative references shifted, so what they read
+                // depends on the criteria cells' current formulas and the
+                // database's extent: no static edge set can say it, and
+                // widened edges would invent circles. Recalculate always.
+                || is_db_fn(name)
+                || args.iter().any(is_volatile)
         }
         Expr::ArrayLit(rows) => rows.iter().flatten().any(is_volatile),
         Expr::Call(callee, args) => is_volatile(callee) || args.iter().any(is_volatile),
@@ -4898,42 +4905,6 @@ pub fn is_db_fn(name: &str) -> bool {
             | "DSTDEV"
             | "DSTDEVP"
     )
-}
-
-/// The (database, criteria) ranges of every D-function call written with
-/// literal ranges, e.g. `DSUM(A1:C8,"Amount",F1:F2)`. A computed criterion in
-/// that criteria range reads cells relative to each record, so the engine
-/// widens its references over the database's rows.
-pub fn collect_db_ranges(e: &Expr, out: &mut Vec<(Expr, Expr)>) {
-    match e {
-        Expr::Func(name, args) => {
-            if is_db_fn(name) {
-                if let [db @ Expr::Range(..), _, crit @ Expr::Range(..)] = args.as_slice() {
-                    out.push((db.clone(), crit.clone()));
-                }
-            }
-            for a in args {
-                collect_db_ranges(a, out);
-            }
-        }
-        Expr::Call(callee, args) => {
-            collect_db_ranges(callee, out);
-            for a in args {
-                collect_db_ranges(a, out);
-            }
-        }
-        Expr::ArrayLit(rows) => {
-            for x in rows.iter().flatten() {
-                collect_db_ranges(x, out);
-            }
-        }
-        Expr::Un(_, x) => collect_db_ranges(x, out),
-        Expr::Bin(_, l, r) => {
-            collect_db_ranges(l, out);
-            collect_db_ranges(r, out);
-        }
-        _ => {}
-    }
 }
 
 /// Is this one of the dynamic-array functions resolved in `eval_arg` (they

@@ -1312,7 +1312,7 @@ mod tests {
 
     #[test]
     fn wb_path_lists_an_opened_workbooks_circles() {
-        // r1 M2: a saved circle is listed straight after opening.
+        // #660: a saved circle is listed straight after opening.
         use gridcore::sheet::Cell;
         use gridcore::xlsx::{load_xlsx, save_xlsx};
         let mut pkg = new_xlsx();

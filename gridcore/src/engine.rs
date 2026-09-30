@@ -693,57 +693,6 @@ fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth:
     if depth >= 8 {
         return;
     }
-    // A computed D-function criterion is evaluated once per database record
-    // with its relative references shifted down to that record, so it reads
-    // its references' rows over the whole database: depend on all of them.
-    let mut db_ranges = Vec::new();
-    formula::collect_db_ranges(ast, &mut db_ranges);
-    for (db, crit) in db_ranges {
-        let (Expr::Range(da, db_end), Expr::Range(ca, cb)) = (&db, &crit) else {
-            continue;
-        };
-        // Rows below the database's header: one per record.
-        let records = (da.row - db_end.row).unsigned_abs() as u32;
-        let cs = match &ca.sheet {
-            None => Some(sheet),
-            Some(name) => wb.sheet_index(name),
-        };
-        let Some(sh) = cs.and_then(|s| wb.sheets.get(s)) else {
-            continue;
-        };
-        let (r1, r2) = (ca.row.min(cb.row), ca.row.max(cb.row));
-        let (c1, c2) = (ca.col.min(cb.col), ca.col.max(cb.col));
-        if r1 < 0 || c1 < 0 {
-            continue;
-        }
-        for r in (r1 + 1)..=r2 {
-            for c in c1..=c2 {
-                let (r, c) = (r as u32, c as u32);
-                let Some(src) = sh.cell(r, c).and_then(|cl| cl.formula.as_deref()) else {
-                    continue;
-                };
-                let Ok(crit_ast) = formula::parse(src) else {
-                    continue;
-                };
-                let mut rects = Vec::new();
-                collect_deps(
-                    wb,
-                    (cs.unwrap_or(sheet), r, c),
-                    &crit_ast,
-                    &mut rects,
-                    depth + 1,
-                );
-                // Record k (0-based) shifts the formula down k rows; there
-                // are `records` records below the database's header.
-                let span = records.saturating_sub(1);
-                out.extend(
-                    rects
-                        .into_iter()
-                        .map(|(s, a, b, c2, d)| (s, a, b, c2.saturating_add(span), d)),
-                );
-            }
-        }
-    }
     let mut names = Vec::new();
     formula::collect_names(ast, &mut names);
     // Function-call names too: `f(3)` may be a defined-name LAMBDA whose
@@ -1648,7 +1597,7 @@ mod tests {
 
     #[test]
     fn computed_criteria_that_reenter_themselves_terminate() {
-        // r1 M1: a computed criterion reading a D-function over its own
+        // #677: a computed criterion reading a D-function over its own
         // criteria range (directly, or through another criteria range) is a
         // circle; it matches nothing rather than recursing forever.
         let mut cells: Vec<(String, Cell)> = vec![
@@ -1684,7 +1633,7 @@ mod tests {
 
     #[test]
     fn circles_are_known_before_any_recalc() {
-        // r1 M2: building the engine over an opened workbook finds its
+        // #660: building the engine over an opened workbook finds its
         // circles without touching the cached values.
         let cached = |f: &str, v: f64| Cell {
             value: CellValue::Number(v),
@@ -1708,9 +1657,9 @@ mod tests {
 
     #[test]
     fn computed_criteria_follow_cells_outside_the_database() {
-        // r1 m5: AA2 = E2>0 reads helper column E beside the database; the
-        // DSUM depends on E over every record's row, so editing E5 updates
-        // it.
+        // #677: AA2 = E2>0 reads helper column E beside the database, one
+        // row per record. D-functions are volatile, so editing any of E (or
+        // a column the criterion is changed to read) updates the DSUM.
         let mut cells: Vec<(String, Cell)> = vec![
             ("A1".into(), Cell::text("Rep")),
             ("C1".into(), Cell::text("Amount")),
@@ -1732,6 +1681,66 @@ mod tests {
         assert_eq!(value_at(&wb, "K1"), CellValue::Number(70.0));
         set(&mut eng, &mut wb, "E8", Cell::number(2.0));
         assert_eq!(value_at(&wb, "K1"), CellValue::Number(150.0));
+        // The criteria formula changes to read another column: edits there
+        // count too.
+        for r in 2..=8 {
+            set(&mut eng, &mut wb, &format!("F{r}"), Cell::number(0.0));
+        }
+        set(&mut eng, &mut wb, "AA2", Cell::formula("F2>0"));
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(0.0));
+        set(&mut eng, &mut wb, "F5", Cell::number(1.0));
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(50.0));
+
+        // Natural order: the DSUM first, then its criterion, then the edit.
+        let mut wb = wb_one_sheet(&refs[..refs.len() - 2]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        set(
+            &mut eng,
+            &mut wb,
+            "K1",
+            Cell::formula("DSUM(A1:C8,\"Amount\",AA1:AA2)"),
+        );
+        set(&mut eng, &mut wb, "AA2", Cell::formula("E2>0"));
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(20.0));
+        set(&mut eng, &mut wb, "E5", Cell::number(1.0));
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(70.0));
+    }
+
+    #[test]
+    fn database_functions_below_their_inputs_are_not_circles() {
+        // #677: a D-function under its criteria's inputs (H3 below H1, or a
+        // total at C10 under an AVERAGE($C$2:$C$8) criterion) is no circle.
+        let amounts = [120.0, 80.0, 200.0, 50.0, 300.0, 90.0, 60.0];
+        let mut cells: Vec<(String, Cell)> = vec![
+            ("A1".into(), Cell::text("Rep")),
+            ("C1".into(), Cell::text("Amount")),
+            ("F1".into(), Cell::text("Amount")),
+            ("F2".into(), Cell::formula("\">\"&H1")),
+            ("H1".into(), Cell::number(100.0)),
+            ("H3".into(), Cell::formula("DSUM(A1:C8,\"Amount\",F1:F2)")),
+            ("AB1".into(), Cell::text("Over")),
+            ("AB2".into(), Cell::formula("C2>AVERAGE($C$2:$C$8)")),
+            (
+                "C10".into(),
+                Cell::formula("DSUM(A1:C8,\"Amount\",AB1:AB2)"),
+            ),
+        ];
+        for (i, a) in amounts.iter().enumerate() {
+            cells.push((format!("A{}", i + 2), Cell::text(&format!("R{i}"))));
+            cells.push((format!("C{}", i + 2), Cell::number(*a)));
+        }
+        let refs: Vec<(&str, Cell)> = cells.iter().map(|(k, c)| (k.as_str(), c.clone())).collect();
+        let mut wb = wb_one_sheet(&refs);
+        let mut eng = Engine::new(&wb);
+        assert!(eng.circular_refs().is_empty());
+        eng.recalc_all(&mut wb);
+        assert!(eng.circular_refs().is_empty());
+        assert_eq!(value_at(&wb, "H3"), CellValue::Number(620.0));
+        assert_eq!(value_at(&wb, "C10"), CellValue::Number(500.0));
+        set(&mut eng, &mut wb, "H1", Cell::number(250.0));
+        assert_eq!(value_at(&wb, "H3"), CellValue::Number(300.0));
+        assert!(eng.circular_refs().is_empty());
     }
 
     // ---- dynamic arrays / spilling ------------------------------------

@@ -7480,7 +7480,7 @@ mod tests {
 
     #[test]
     fn opening_a_workbook_with_a_circle_reports_it() {
-        // r1 M2/m6: an opened file's circle is known at once (footer,
+        // #660: an opened file's circle is known at once (footer,
         // wb.path, the open warning) without recalculating it, and moving it
         // by a structural edit does not warn again.
         use gridcore::xlsx::{load_xlsx, save_xlsx};
