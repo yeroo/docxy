@@ -485,6 +485,12 @@ impl Editor {
             };
             let right = split_content(&mut p.content, off);
             let props = p.props.clone();
+            // A section break ends the section after the split, so it (and
+            // its tracked change, which Save also writes as a sectPr) moves
+            // with the paragraph's second half; Word keeps the section mark
+            // last (#748).
+            p.props.section_break = None;
+            p.props.section_property_change = None;
             cont.insert(
                 idx + 1,
                 Block::Paragraph(Paragraph {
@@ -1112,14 +1118,19 @@ impl Editor {
             let Some(Block::Paragraph(p)) = cont.get_mut(idx) else {
                 return;
             };
+            // Only the last paragraph, which gets the tail, keeps a section
+            // break and its tracked change: the section still ends there (#748).
             let props = p.props.clone();
+            p.props.section_break = None;
+            p.props.section_property_change = None;
+            let inner = p.props.clone();
             let tail = split_content(&mut p.content, off);
             p.content.extend(clip.paras[0].clone());
 
             let mut news: Vec<Block> = Vec::new();
             for mid in &clip.paras[1..n - 1] {
                 news.push(Block::Paragraph(Paragraph {
-                    props: props.clone(),
+                    props: inner.clone(),
                     content: mid.clone(),
                 }));
             }
@@ -1128,7 +1139,7 @@ impl Editor {
             let mut last_content = last_pasted;
             last_content.extend(tail);
             news.push(Block::Paragraph(Paragraph {
-                props: props.clone(),
+                props,
                 content: last_content,
             }));
 

@@ -460,9 +460,10 @@ impl Editor {
             };
             let right = split_content(&mut p.content, off);
             let mut props = p.props.clone();
-            // The section break ends the section after the split, so it moves
-            // with the paragraph's second half.
+            // The section break ends the section after the split, so it (and
+            // its tracked change) moves with the paragraph's second half.
             p.props.section_break = None;
+            p.props.section_property_change = None;
             props.property_change = None;
             cont.insert(
                 idx + 1,
