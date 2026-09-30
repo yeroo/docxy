@@ -127,6 +127,16 @@ pub struct Session {
     clip: Option<GridClip>,
 }
 
+/// A clipboard text as [`GridClip::text`] keeps it and a `paste` compares it:
+/// CRLF read as LF and trailing line breaks dropped, the same on both sides.
+/// A copy whose last row is empty ends in `\n`, and the host may hand the
+/// text back with or without it.
+fn clip_key(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .trim_end_matches('\n')
+        .to_string()
+}
+
 /// A `copy`/`cut`'s cells as they were (formats, formulas, quote prefixes
 /// intact), where they came from, and the TSV handed to the host. A `paste`
 /// of exactly that text pastes these cells, as xlsxy's and the suite's own
@@ -577,8 +587,6 @@ impl Session {
         out
     }
 
-    /// The selection as TSV of raw cell sources (formulas as `=...`), rows by
-    /// `\n`, cells by `\t` — round-trips through `paste`.
     /// Record the selection as this session's clip and return its TSV.
     fn record_clip(&mut self, cut: bool) -> String {
         let text = self.selection_tsv();
@@ -593,7 +601,7 @@ impl Session {
             cells,
             from: (r1, c1),
             cut,
-            text: text.clone(),
+            text: clip_key(&text),
         });
         text
     }
@@ -603,12 +611,8 @@ impl Session {
     /// break). A copy's formulas move their relative references with the
     /// paste; a cut's keep them. False when `text` is someone else's.
     fn paste_own_clip(&mut self, r0: u32, c0: u32, text: &str) -> bool {
-        let text = text.replace("\r\n", "\n");
-        let Some(clip) = self
-            .clip
-            .clone()
-            .filter(|c| c.text == text.trim_end_matches('\n'))
-        else {
+        let text = clip_key(text);
+        let Some(clip) = self.clip.clone().filter(|c| c.text == text) else {
             return false;
         };
         let (dr_all, dc_all) = (
@@ -644,6 +648,9 @@ impl Session {
         true
     }
 
+    /// The selection as TSV of each cell's editor seed
+    /// ([`Session::cell_seed`]: formulas as `=...`, a quote prefix's `'`),
+    /// rows by `\n`, cells by `\t` — round-trips through `paste`.
     fn selection_tsv(&self) -> String {
         let (ar, ac) = self.anchor.unwrap_or(self.cur);
         let (r1, r2) = (self.cur.0.min(ar), self.cur.0.max(ar));
@@ -3113,6 +3120,33 @@ mod tests {
         // Text from elsewhere is still read as typed into the target.
         s.dispatch("paste\t13\t0\t'abc");
         assert_eq!(at(&s, 13, 0).value, CellValue::Text("abc".into()));
+    }
+
+    #[test]
+    fn a_copy_ending_in_an_empty_row_still_pastes_as_cells() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let sh = &mut s.pkg.workbook.sheets[0];
+        sh.set_cell(20, 0, Cell::formula("B21"));
+        sh.set_cell(25, 2, Cell::text("gone"));
+        s.dispatch("select\t20\t0\t21\t0");
+        let tsv = s.dispatch("copy").unwrap();
+        assert!(tsv.ends_with('\n'), "{tsv:?}");
+        for pasted in [
+            tsv.clone(),
+            tsv.trim_end().to_string(),
+            tsv.replace('\n', "\r\n"),
+        ] {
+            s.dispatch(&format!("paste\t24\t2\t{pasted}"));
+            let at = |r| {
+                s.pkg.workbook.sheets[0]
+                    .cell(r, 2)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            assert_eq!(at(24).formula.as_deref(), Some("D25"), "{pasted:?}");
+            assert!(at(25).is_blank(), "{pasted:?}: the empty row pastes too");
+            s.pkg.workbook.sheets[0].set_cell(25, 2, Cell::text("gone"));
+        }
     }
 
     #[test]
