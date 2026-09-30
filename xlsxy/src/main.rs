@@ -4,7 +4,7 @@
 //!   xlsxy                               open a new blank workbook
 //!   xlsxy <file.xlsx>                   open in the editor
 //!   xlsxy <in.xlsx> --recalc <out>      headless: recalculate and save
-//!   xlsxy <in.xlsx> --csv <out.csv>     headless: export the first sheet as CSV
+//!   xlsxy <in.xlsx> --csv <out.csv>     headless: export the active sheet as CSV UTF-8
 //!
 //! The engine lives in the pure `gridcore` crate; this binary is the TUI
 //! shell: a cell grid with Excel muscle memory (formula bar, A1 navigation,
@@ -2647,7 +2647,11 @@ impl App {
     /// CSV UTF-8, never a workbook under a `.csv` name); an extension no type
     /// has keeps the workbook package.
     fn request_save_as(&mut self, path: String) {
-        match type_for_path(&path) {
+        // The type the workbook is bound to wins while the name keeps its
+        // extension: Unicode Text or CSV (Comma delimited) saved again stays
+        // that type, not the first type with the extension.
+        let bound = self.bound_text_type().filter(|&t| has_type_ext(&path, t));
+        match bound.or_else(|| type_for_path(&path)) {
             Some(t) => self.save_as_type(path, t),
             None => self.request_save_as_package(path),
         }
@@ -3584,12 +3588,22 @@ impl App {
     }
 
     /// Re-read the file the workbook is bound to, dropping unsaved edits. A
-    /// workbook saved as a text type stays bound to that file and type (it
-    /// is re-imported from it), so a later save writes the text file again
-    /// rather than a `<name>.xlsx` beside it.
+    /// workbook saved as CSV, Text (Tab delimited) or Unicode Text stays bound
+    /// to that file and type (it is re-imported from it), so a later save
+    /// writes the text file again rather than a `<name>.xlsx` beside it.
+    /// Formatted Text and Web Page cannot be read back, so reload refuses
+    /// them and changes nothing.
     fn reload(&mut self) -> Result<(), String> {
         let path = self.path.clone();
         let bound = self.bound_text_type();
+        if let Some(t) = bound {
+            if !matches!(save_kind(&SAVE_TYPES[t]), SaveKind::Text { .. }) {
+                return Err(format!(
+                    "{} cannot be read back; reload is not available for this file",
+                    SAVE_TYPES[t].label
+                ));
+            }
+        }
         self.open_without_wizard(&path)?;
         if let Some(t) = bound {
             self.path = path;
@@ -3827,7 +3841,6 @@ impl App {
             self.status = Some("Save As — type a file name first.".to_string());
             return;
         }
-        // A type picked in the list wins; else the name's extension decides.
         // A type picked in the list, else the type the workbook is bound to
         // while the name still has its extension, else the name decides.
         let chosen = self.backstage.as_ref().and_then(|b| {
@@ -7497,6 +7510,30 @@ mod tests {
         }
         app.backstage_key(key(KeyCode::Enter));
         assert_eq!(app.backstage.as_ref().unwrap().type_sel, web);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Save As prompt (F12) keeps the bound type: Unicode Text saved
+    /// again is still UTF-16, CSV (Comma delimited) is still Windows-1252.
+    #[test]
+    fn the_save_as_prompt_keeps_the_bound_text_type() {
+        let dir = tmp("prompt-bound");
+        let at = |l: &str| SAVE_TYPES.iter().position(|t| t.label == l).unwrap();
+        for (label, file, head) in [
+            ("Unicode Text", "u.txt", &b"\xFF\xFE"[..]),
+            ("CSV (Comma delimited)", "c.csv", &b"Name,Note"[..]),
+        ] {
+            let mut app = two_sheet_app(&dir);
+            let path = dir.join(file);
+            app.save_as_type(path.to_string_lossy().into_owned(), at(label));
+            std::fs::remove_file(&path).unwrap();
+            app.open_prompt(PromptKind::SaveAs);
+            app.prompt.as_mut().unwrap().text = path.to_string_lossy().into_owned();
+            app.commit_prompt();
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(bytes.starts_with(head), "{label}: {bytes:?}");
+            assert_eq!(app.text_type, Some(at(label)));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

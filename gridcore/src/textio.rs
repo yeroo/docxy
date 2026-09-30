@@ -917,7 +917,9 @@ pub fn sheet_text(sheet: &Sheet, styles: &Styles, date1904: bool, delim: char) -
 
 /// Formatted Text (Space delimited): each column padded to its width in
 /// characters, numbers right-aligned and text left-aligned. Text longer than
-/// its column is clipped; a number too wide for it is `#`s, never clipped.
+/// its column is clipped; a General number too wide for it is written as the
+/// grid would show it at that width (`0.333333`, `1.23E+08`); any other
+/// number too wide is `#`s. A number is never clipped.
 pub fn sheet_prn(sheet: &Sheet, styles: &Styles, date1904: bool) -> String {
     let (rows, cols) = sheet.used_size();
     let mut out = String::new();
@@ -932,15 +934,25 @@ pub fn sheet_prn(sheet: &Sheet, styles: &Styles, date1904: bool) -> String {
                 ),
                 None => (String::new(), false),
             };
-            // Every row stays fixed-width. Text is clipped to its column; a
-            // number that does not fit shows `#`s, as the grid does, since a
-            // clipped number would read as another value.
+            // Every row stays fixed-width, and a number is never clipped into
+            // another value. Text is clipped to its column; a General number
+            // that does not fit is written as that width shows it (fewer
+            // decimals, then scientific); any other number that does not
+            // fit, a date say, is `#`s.
             let text: String = if !right {
                 text.chars().take(width).collect()
-            } else if text.chars().count() > width {
-                "#".repeat(width)
-            } else {
+            } else if text.chars().count() <= width {
                 text
+            } else {
+                let cell = sheet.cell(r, c);
+                let general = cell.is_some_and(|cl| entry::is_general(&styles.xf(cl.style)));
+                match cell.map(|cl| &cl.value) {
+                    Some(CellValue::Number(n)) if general => {
+                        crate::sheet::fmt_general_fit(*n, width)
+                            .unwrap_or_else(|| "#".repeat(width))
+                    }
+                    _ => "#".repeat(width),
+                }
             };
             let pad = " ".repeat(width.saturating_sub(text.chars().count()));
             if right {
@@ -1429,9 +1441,15 @@ mod tests {
         s.set_cell(1, 1, Cell::number(42.0));
         s.set_cell(2, 0, Cell::text("a long piece of text"));
         s.set_cell(2, 1, Cell::text("x"));
+        s.set_cell(3, 0, Cell::number(1.0 / 3.0));
+        s.set_cell(3, 1, Cell::text("y"));
         let prn = sheet_prn(&s, &styles, false);
-        // B starts at its column offset (8) on every row.
-        assert_eq!(prn, "########Smith\r\n########      42\r\na long px\r\n");
+        // B starts at its column offset (8) on every row. A date that does
+        // not fit is #s; a General number is shown as the width allows.
+        assert_eq!(
+            prn,
+            "########Smith\r\n1.23E+08      42\r\na long px\r\n0.333333y\r\n"
+        );
     }
 
     #[test]

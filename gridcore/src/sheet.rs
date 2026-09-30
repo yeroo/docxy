@@ -1729,6 +1729,60 @@ pub fn fmt_general(n: f64) -> String {
     }
 }
 
+/// A General number as a cell `width` characters wide shows it: in full
+/// when it fits, else with fewer decimals (`0.333333`), else in scientific
+/// notation with as many mantissa digits as fit (`1.23E+08`). `None` when
+/// not even that fits (the cell shows `#`s).
+pub fn fmt_general_fit(n: f64, width: usize) -> Option<String> {
+    let full = fmt_general(n);
+    if full.chars().count() <= width {
+        return Some(full);
+    }
+    if !n.is_finite() {
+        return None;
+    }
+    // Fewer decimals, while the integer part fits and something is left of
+    // the value (0.0000001 must not round to 0).
+    let int_len = format!("{}", n.trunc().abs() as u128).len() + usize::from(n < 0.0);
+    if int_len <= width && n.abs() >= 1e-10 {
+        let decimals = width.saturating_sub(int_len + 1);
+        let mut s = format!("{n:.decimals$}");
+        if s.contains('.') {
+            while s.ends_with('0') {
+                s.pop();
+            }
+            if s.ends_with('.') {
+                s.pop();
+            }
+        }
+        let lost = s
+            .trim_start_matches('-')
+            .chars()
+            .all(|c| c == '0' || c == '.');
+        if s.chars().count() <= width && !lost {
+            return Some(s);
+        }
+    }
+    // Scientific, trailing mantissa zeros dropped as General does.
+    // Excel writes at least two exponent digits (E+08).
+    for decimals in (0..width).rev() {
+        let raw = format!("{n:.decimals$e}");
+        let (mant, exp) = raw.split_once('e')?;
+        let exp: i32 = exp.parse().ok()?;
+        let mant = if mant.contains('.') {
+            mant.trim_end_matches('0').trim_end_matches('.')
+        } else {
+            mant
+        };
+        let sign = if exp < 0 { '-' } else { '+' };
+        let s = format!("{mant}E{sign}{:02}", exp.abs());
+        if s.chars().count() <= width {
+            return Some(s);
+        }
+    }
+    None
+}
+
 /// Excel-style scientific notation: 1.5E+21, 2.00E-05.
 fn fmt_scientific(n: f64, decimals: usize) -> String {
     let s = format!("{:.*E}", decimals, n);
@@ -2418,6 +2472,27 @@ mod tests {
             "#DIV/0!"
         );
         assert_eq!(add_thousands("-1234567.89"), "-1,234,567.89");
+    }
+
+    #[test]
+    fn general_fits_its_width_as_the_grid_shows_it() {
+        assert_eq!(fmt_general_fit(1.0 / 3.0, 8).as_deref(), Some("0.333333"));
+        assert_eq!(fmt_general_fit(12.345678, 8).as_deref(), Some("12.34568"));
+        assert_eq!(
+            fmt_general_fit(123_456_789.0, 8).as_deref(),
+            Some("1.23E+08")
+        );
+        assert_eq!(
+            fmt_general_fit(-123_456_789.0, 8).as_deref(),
+            Some("-1.2E+08")
+        );
+        assert_eq!(fmt_general_fit(1e11, 8).as_deref(), Some("1E+11"));
+        assert_eq!(
+            fmt_general_fit(0.000_000_123, 8).as_deref(),
+            Some("1.23E-07")
+        );
+        assert_eq!(fmt_general_fit(42.0, 8).as_deref(), Some("42"));
+        assert_eq!(fmt_general_fit(123_456_789.0, 3), None);
     }
 
     #[test]

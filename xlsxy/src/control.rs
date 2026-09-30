@@ -2552,6 +2552,34 @@ mod tests {
     }
 
     /// A failed load is the verb's error, not a quiet success.
+    /// Formatted Text and Web Page cannot be read back: reload refuses and
+    /// changes nothing.
+    #[test]
+    fn wb_reload_refuses_a_workbook_bound_to_prn_or_a_web_page() {
+        let dir = std::env::temp_dir().join(format!("xlsxy-reload-prn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (file, label) in [
+            ("saved.prn", "Formatted Text (Space delimited)"),
+            ("page.htm", "Web Page"),
+        ] {
+            let path = dir.join(file);
+            let mut a = app();
+            set(&mut a, "A1", "a");
+            set(&mut a, "B1", "1");
+            a.request_save_as(path.to_string_lossy().into_owned());
+            let before = std::fs::read(&path).unwrap();
+            let err = dispatch(&mut a, "wb.reload", &Json::Null).unwrap_err();
+            assert_eq!(
+                err,
+                format!("{label} cannot be read back; reload is not available for this file")
+            );
+            assert_eq!(std::path::Path::new(&a.path), path);
+            assert_eq!(get_value(&a, "B1"), CellValue::Number(1.0));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn wb_open_of_a_missing_workbook_is_an_error() {
         let mut a = app();
