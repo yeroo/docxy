@@ -1358,37 +1358,44 @@ impl<'a> Pager<'a> {
             .iter()
             .position(|l| l.region == region.id)
             .unwrap_or(page.lines.len());
-        let heights: Vec<f32> = page.lines[first..]
+        let lines: Vec<(f32, f32)> = page.lines[first..]
             .iter()
-            .map(|l| l.lh + l.gap_after)
+            .map(|l| (l.lh, l.gap_after))
             .collect();
-        if heights.is_empty() {
+        if lines.is_empty() {
             return;
         }
         let cols = region.xs.len();
-        // Greedy pour at a column height `h`: each line's column, or None when
-        // the lines need more columns than there are.
+        // A line fits a column while its baseline stays on the body, whatever
+        // the gap after it.
+        let room = region.top - page.body_bottom + 0.001;
+        // Greedy pour at a column height `h` (lines and their gaps): each
+        // line's column, or None when the lines need more columns than there
+        // are.
         let pour = |h: f32| -> Option<Vec<usize>> {
             let (mut col, mut used) = (0, 0.0);
-            let mut out = Vec::with_capacity(heights.len());
-            for &lh in &heights {
-                if used > 0.0 && used + lh > h + 0.001 {
+            let mut out = Vec::with_capacity(lines.len());
+            for &(lh, gap) in &lines {
+                if used > 0.0 && (used + lh + gap > h + 0.001 || used + lh > room) {
                     col += 1;
                     used = 0.0;
                 }
                 if col >= cols {
                     return None;
                 }
-                used += lh;
+                used += lh + gap;
                 out.push(col);
             }
             Some(out)
         };
         // The pour is monotone in `h`: bisect for the smallest that fits.
         let (mut lo, mut hi) = (
-            heights.iter().copied().fold(0.0, f32::max),
-            heights.iter().sum::<f32>(),
+            lines.iter().map(|&(lh, gap)| lh + gap).fold(0.0, f32::max),
+            lines.iter().map(|&(lh, gap)| lh + gap).sum::<f32>(),
         );
+        if pour(hi).is_none() {
+            return;
+        }
         for _ in 0..40 {
             let mid = (lo + hi) / 2.0;
             if pour(mid).is_some() {
@@ -1400,18 +1407,28 @@ impl<'a> Pager<'a> {
         let Some(assign) = pour(hi) else {
             return;
         };
+        // Where each line goes; keep the layout unless it gets shorter.
         let mut cursor = vec![region.top; cols];
+        let mut moves = Vec::with_capacity(assign.len());
         for (k, col) in assign.into_iter().enumerate() {
+            let line = &page.lines[first + k];
+            let y = cursor[col] - line.lh;
+            moves.push((col, y));
+            cursor[col] = y - line.gap_after;
+        }
+        let low = cursor.into_iter().fold(region.top, f32::min);
+        if low <= region.low + 0.001 {
+            return;
+        }
+        for (k, (col, y)) in moves.into_iter().enumerate() {
             let i = first + k;
             let line = page.lines[i];
-            let y = cursor[col] - line.lh;
             let dx = region.xs[col].0 - region.xs[line.col].0;
             page.shift_line(i, dx, y - line.y);
             page.lines[i].col = col;
-            cursor[col] = y - line.gap_after;
         }
         page.min_base = page.lines.iter().map(|l| l.y).fold(f32::INFINITY, f32::min);
-        self.region.low = cursor.into_iter().fold(self.region.top, f32::min);
+        self.region.low = low;
     }
 
     /// Count a body line just placed for line numbering (`w:lnNumType`): the
@@ -3948,5 +3965,46 @@ mod tests {
         // A section without a watermarked header draws none.
         let d = three_pages(BLANK_SECT);
         assert!(pages_of(&d, &opts).iter().all(|p| !p.has("DRAFT")));
+    }
+
+    #[test]
+    fn balancing_a_full_page_keeps_every_line_above_the_bottom() {
+        // Two full columns of one-line (1) and two-line (2) paragraphs and
+        // headings (H): their trailing gaps differ (0, 4.4, 7.92), so the
+        // shortest balanced height can exceed what a column holds; a pour at
+        // it put a line's baseline 0.45pt into the bottom margin.
+        let pattern = "12122H11122H22H2112H12222222112221112121112HH";
+        let mut blocks: Vec<Block> = pattern
+            .chars()
+            .enumerate()
+            .map(|(i, kind)| {
+                let (text, heading_level) = match kind {
+                    '1' => (format!("l{i}"), None),
+                    '2' => (format!("l{i}{}", "x".repeat(36)), None),
+                    _ => (format!("l{i}"), Some(1)),
+                };
+                Block::Paragraph(Paragraph {
+                    props: ParProps {
+                        heading_level,
+                        ..ParProps::default()
+                    },
+                    content: vec![run(&text, RunProps::default())],
+                })
+            })
+            .collect();
+        if let Some(Block::Paragraph(last)) = blocks.last_mut() {
+            last.props.section_break = Some(two_col_sect(""));
+        }
+        blocks.push(text_para("next"));
+        blocks.push(trailing(CONTINUOUS));
+        let pages = pages_of(&doc(blocks), &PdfOptions::default());
+        let last = format!("l{}", pattern.len() - 1);
+        assert!(
+            pages[0].has("l0") && pages[0].has(&last),
+            "one page of columns"
+        );
+        for (_, y, t) in &pages[0].texts {
+            assert!(*y >= 72.0 - 0.01, "{t} at {y}");
+        }
     }
 }
