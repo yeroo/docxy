@@ -151,6 +151,15 @@ pub struct CellMeta {
     pub vm_body: Option<String>,
     /// `ph="1"`: show phonetic text.
     pub ph: bool,
+    /// Typed or edited through [`crate::engine::Engine::set_cell`]: evaluated
+    /// with spill semantics (not implicit intersection), also after the engine
+    /// is rebuilt. Never written to the file.
+    pub modern: bool,
+    /// The engine evaluated this typed formula as an array (a multi-cell range
+    /// or any computed array, even 1x1), so it is a dynamic array: the writer
+    /// gives it a `cm` naming an `fDynamic` entry in `xl/metadata.xml`. Sticky,
+    /// like a loaded `cm`: a later scalar result (`FILTER` → `#CALC!`) keeps it.
+    pub dynamic: bool,
 }
 
 /// Do preserved `<f>` attributes (see [`Cell::f_attrs`]) mark an array
@@ -183,14 +192,25 @@ impl Cell {
         self.value.is_empty() && self.formula.is_none()
     }
     /// Is the formula an array one, evaluated by the dynamic-array engine: a
-    /// `t="array"` `<f>`, or a cell Excel marked dynamic with `cm` whose
+    /// `t="array"` `<f>`, or a dynamic array ([`Cell::is_dynamic`]) whose
     /// `f_attrs` an edit dropped ([`crate::engine::Engine::set_cell`])?
     pub fn is_array_formula(&self) -> bool {
-        self.f_attrs.as_deref().is_some_and(is_array_f) || self.has_cm()
+        self.f_attrs.as_deref().is_some_and(is_array_f) || self.is_dynamic()
     }
     /// Did Excel mark this cell a dynamic array (`cm`)?
     pub fn has_cm(&self) -> bool {
         self.meta.as_ref().is_some_and(|m| m.cm.is_some())
+    }
+    /// Is this a dynamic array: marked by Excel (`cm`), or a typed formula the
+    /// engine evaluated as an array ([`CellMeta::dynamic`])?
+    pub fn is_dynamic(&self) -> bool {
+        self.meta
+            .as_ref()
+            .is_some_and(|m| m.cm.is_some() || m.dynamic)
+    }
+    /// Was the formula typed or edited here ([`CellMeta::modern`])?
+    pub fn is_modern(&self) -> bool {
+        self.meta.as_ref().is_some_and(|m| m.modern)
     }
 }
 

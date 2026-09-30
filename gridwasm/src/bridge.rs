@@ -435,7 +435,7 @@ impl Session {
                 for &(r, c, ref before, _) in group.changes.iter().rev() {
                     let cell = before.clone().unwrap_or_default();
                     self.engine
-                        .set_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
+                        .restore_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
                 }
                 self.redo.push(UndoAction::Cells(group));
                 self.dirty = true;
@@ -464,7 +464,7 @@ impl Session {
                 for &(r, c, _, ref after) in group.changes.iter() {
                     let cell = after.clone().unwrap_or_default();
                     self.engine
-                        .set_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
+                        .restore_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
                 }
                 self.undo.push(UndoAction::Cells(group));
                 self.dirty = true;
@@ -2824,6 +2824,22 @@ mod tests {
         s.dispatch("redo");
         let v = s.view_json(None);
         assert!(v.contains("12.5"), "redo must reapply: {v}");
+    }
+
+    #[test]
+    fn undo_restores_a_legacy_formula_as_it_was() {
+        // #724: undo puts the snapshot back as it was (restore_cell), not as a
+        // typed formula — a loaded legacy formula must not come back as a
+        // dynamic array that saves with a `cm`.
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.pkg.workbook.sheets[0].set_cell(9, 5, Cell::formula("B2:B4*2"));
+        s.rebuild_engine();
+        let before = s.pkg.workbook.sheets[0].cell(9, 5).cloned().unwrap();
+        s.dispatch("set	9	5	7");
+        s.dispatch("undo");
+        let f10 = s.pkg.workbook.sheets[0].cell(9, 5).unwrap();
+        assert_eq!(f10, &before);
+        assert!(!f10.is_modern() && !f10.is_dynamic() && f10.spill.is_none());
     }
 
     #[test]

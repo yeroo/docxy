@@ -2674,7 +2674,21 @@ impl<'a> Eval<'a> {
     /// **implicit intersection** to the value on the formula's own row/column,
     /// exactly as pre-dynamic-array Excel does, instead of spilling.
     pub fn eval_dynamic_as(&mut self, e: &Expr, spill: bool) -> DynResult {
-        match self.eval_root(e) {
+        self.eval_dynamic_shaped(e, spill).0
+    }
+
+    /// As [`Self::eval_dynamic_as`], also telling whether the result was
+    /// array-shaped: a multi-cell range or any computed array, even a 1x1 one
+    /// (`SEQUENCE(1)`, a one-match `FILTER`), but not a single-cell range
+    /// (`=A1`). Such a typed formula is a dynamic array in Excel's sense.
+    pub fn eval_dynamic_shaped(&mut self, e: &Expr, spill: bool) -> (DynResult, bool) {
+        let root = self.eval_root(e);
+        let shaped = match &root {
+            Arg::Range(_, r1, c1, r2, c2) => r1 != r2 || c1 != c2,
+            Arg::Matrix(_) => true,
+            Arg::Scalar(_) | Arg::Lambda(_) => false,
+        };
+        let result = match root {
             Arg::Scalar(v) => DynResult::Scalar(v),
             Arg::Range(s, r1, c1, r2, c2) => {
                 let (r1, c1, r2, c2) = self.clamp_huge(s, r1, c1, r2, c2);
@@ -2700,7 +2714,8 @@ impl<'a> Eval<'a> {
                 }
             }
             Arg::Lambda(_) => DynResult::Scalar(Value::Err(ExcelError::Calc)),
-        }
+        };
+        (result, shaped)
     }
 
     /// Implicit intersection of a range against the formula's cell: a single

@@ -2098,7 +2098,7 @@ impl App {
                 for &(r, c, ref before, _) in group.changes.iter().rev() {
                     let cell = before.clone().unwrap_or_default();
                     self.engine
-                        .set_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
+                        .restore_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
                 }
                 if let Some(&(r, c, _, _)) = group.changes.first() {
                     self.cur = (r, c);
@@ -2124,7 +2124,7 @@ impl App {
                 for &(r, c, _, ref after) in group.changes.iter() {
                     let cell = after.clone().unwrap_or_default();
                     self.engine
-                        .set_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
+                        .restore_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
                 }
                 if let Some(&(r, c, _, _)) = group.changes.first() {
                     self.cur = (r, c);
@@ -10369,5 +10369,118 @@ mod tests {
         );
         assert!(parse_args(&["-".into()]).is_err());
         assert!(parse_args(&["a.xlsx".into(), "--recalc".into(), "o.xlsx".into()]).is_ok());
+    }
+
+    /// #724: a new workbook with 1, 2, 3 in A1:A3 (and `extra` cells set
+    /// as they would load), its engine built and recalculated.
+    fn app_with_numbers(extra: &[((u32, u32), gridcore::sheet::Cell)]) -> App {
+        use gridcore::sheet::Cell;
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        for r in 0..3 {
+            app.pkg.workbook.sheets[0].set_cell(r, 0, Cell::number(r as f64 + 1.0));
+        }
+        for ((r, c), cell) in extra {
+            app.pkg.workbook.sheets[0].set_cell(*r, *c, cell.clone());
+        }
+        app.rebuild_engine();
+        app
+    }
+
+    fn saved_sheet1(app: &App) -> (SheetPackage, String) {
+        let re = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
+        let ws = String::from_utf8_lossy(re.part("xl/worksheets/sheet1.xml").unwrap()).into_owned();
+        (re, ws)
+    }
+
+    #[test]
+    fn typed_spill_survives_rebuild_engine() {
+        // #724: inserting a row rebuilds the engine; the typed dynamic array
+        // still spills (it used to collapse to one value).
+        use gridcore::sheet::Cell;
+        let mut app = app_with_numbers(&[]);
+        app.apply(vec![(0, 2, Cell::formula("SEQUENCE(3)"))]);
+        app.cur = (0, 2);
+        app.anchor = None;
+        app.row_op(true);
+        assert_eq!(app.sheet().cell(1, 2).unwrap().spill, Some((3, 1)));
+        assert_eq!(
+            app.sheet().cell(3, 2).unwrap().value,
+            gridcore::sheet::CellValue::Number(3.0)
+        );
+    }
+
+    #[test]
+    fn typed_scalar_filter_spills_after_rebuild() {
+        // A typed FILTER with no match yet is still a modern formula after a
+        // rebuild: once rows match, it spills.
+        use gridcore::sheet::Cell;
+        let mut app = app_with_numbers(&[]);
+        app.apply(vec![(0, 2, Cell::formula("FILTER(A1:A3,A1:A3>5)"))]);
+        app.rebuild_engine();
+        app.apply(vec![
+            (0, 0, Cell::number(6.0)),
+            (1, 0, Cell::number(7.0)),
+            (2, 0, Cell::number(8.0)),
+        ]);
+        assert_eq!(app.sheet().cell(0, 2).unwrap().spill, Some((3, 1)));
+    }
+
+    #[test]
+    fn typed_spill_survives_structural_undo() {
+        use gridcore::sheet::Cell;
+        let mut app = app_with_numbers(&[]);
+        app.apply(vec![(0, 2, Cell::formula("SEQUENCE(3)"))]);
+        app.cur = (0, 2);
+        app.anchor = None;
+        app.row_op(true);
+        app.undo();
+        assert_eq!(app.sheet().cell(0, 2).unwrap().spill, Some((3, 1)));
+    }
+
+    #[test]
+    fn undo_restores_legacy_formula_unmarked() {
+        // Undo is not typing: a loaded legacy formula typed over and undone
+        // does not come back as a dynamic array.
+        use gridcore::sheet::Cell;
+        let mut app = app_with_numbers(&[((1, 1), Cell::formula("A1:A3*2"))]);
+        app.apply(vec![(1, 1, Cell::number(5.0))]);
+        app.undo();
+        assert_eq!(app.sheet().cell(1, 1).unwrap().spill, None);
+        let (re, ws) = saved_sheet1(&app);
+        assert!(
+            ws.contains(r#"<c r="B2"><f>A1:A3*2</f><v>2</v></c>"#),
+            "{ws}"
+        );
+        assert!(!ws.contains("cm="), "{ws}");
+        assert!(re.part("xl/metadata.xml").is_none());
+    }
+
+    #[test]
+    fn redo_restores_typed_dynamic() {
+        use gridcore::sheet::Cell;
+        let mut app = app_with_numbers(&[]);
+        app.apply(vec![(0, 2, Cell::formula("SEQUENCE(3)"))]);
+        app.undo();
+        app.redo();
+        assert_eq!(app.sheet().cell(0, 2).unwrap().spill, Some((3, 1)));
+        let (_, ws) = saved_sheet1(&app);
+        assert!(
+            ws.contains(r#"<c r="C1" cm="1"><f t="array" ref="C1:C3">SEQUENCE(3)</f>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn undo_restores_cse_f_attrs() {
+        use gridcore::sheet::Cell;
+        let mut cse = Cell::formula("A1:A3*2");
+        cse.f_attrs = Some(r#" t="array" ref="B1:B3""#.into());
+        let mut app = app_with_numbers(&[((0, 1), cse)]);
+        app.apply(vec![(0, 1, Cell::number(5.0))]);
+        app.undo();
+        let b1 = app.sheet().cell(0, 1).unwrap();
+        assert_eq!(b1.f_attrs.as_deref(), Some(r#" t="array" ref="B1:B3""#));
+        assert!(!b1.is_dynamic());
     }
 }
