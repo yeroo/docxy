@@ -4999,6 +4999,73 @@ fn is_xml_name_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':') || b >= 0x80
 }
 
+/// CT_Workbook's children, in the order the schema requires them.
+const CT_WORKBOOK_ORDER: [&str; 19] = [
+    "fileVersion",
+    "fileSharing",
+    "workbookPr",
+    "workbookProtection",
+    "bookViews",
+    "sheets",
+    "functionGroups",
+    "externalReferences",
+    "definedNames",
+    "calcPr",
+    "oleSize",
+    "customWorkbookViews",
+    "pivotCaches",
+    "smartTagPr",
+    "smartTagTypes",
+    "webPublishing",
+    "fileRecoveryPr",
+    "webPublishObjects",
+    "extLst",
+];
+
+/// Where a new top-level `<tag>` goes in workbook.xml, with the root's
+/// namespace prefix (`"x:"`, or `""`): before the first child the schema
+/// ranks after `tag`, else before the root's end tag. Children the schema
+/// doesn't name (`mc:AlternateContent`, …) are not anchors. `None` when the
+/// part has no root end tag to fall back on (truncated, or a self-closing
+/// root).
+fn workbook_insert_pos(xml: &str, tag: &str) -> Option<(usize, String)> {
+    let rank_of = |name: &str| CT_WORKBOOK_ORDER.iter().position(|&t| t == name);
+    let rank = rank_of(tag).unwrap_or(CT_WORKBOOK_ORDER.len());
+    let mut p = XmlParser::new(xml);
+    // The root start tag.
+    loop {
+        match p.next() {
+            Event::Start => break,
+            Event::Text => {}
+            Event::End | Event::Eof => return None,
+        }
+    }
+    let prefix = match p.name().rsplit_once(':') {
+        Some((pfx, _)) => format!("{pfx}:"),
+        None => String::new(),
+    };
+    loop {
+        match p.next() {
+            Event::Start => {
+                if rank_of(local(p.name())).is_some_and(|r| r > rank) {
+                    return Some((p.start_pos(), prefix));
+                }
+                if !p.skip_element_complete() {
+                    return None;
+                }
+            }
+            Event::End => {
+                // The root's end tag (a self-closing root has no `</`).
+                let end = p.pos();
+                let at = xml[..end].rfind("</")?;
+                return Some((at, prefix));
+            }
+            Event::Text => {}
+            Event::Eof => return None,
+        }
+    }
+}
+
 /// Guarantee `<calcPr … fullCalcOnLoad="1"/>` in workbook.xml.
 fn ensure_full_calc(xml: &str) -> String {
     if let Some(i) = xml.find("<calcPr") {
@@ -5010,6 +5077,15 @@ fn ensure_full_calc(xml: &str) -> String {
         }
         let mut out = xml.to_string();
         out.insert_str(i + "<calcPr".len(), " fullCalcOnLoad=\"1\"");
+        out
+    } else if let Some((at, px)) = workbook_insert_pos(xml, "calcPr") {
+        // At its schema position: after definedNames, before pivotCaches
+        // and extLst, which a bare append would put it behind.
+        let mut out = xml.to_string();
+        out.insert_str(
+            at,
+            &format!("<{px}calcPr calcId=\"0\" fullCalcOnLoad=\"1\"/>"),
+        );
         out
     } else {
         xml.replacen(
@@ -5895,13 +5971,23 @@ impl SheetPackage {
             .find(|(pn, _)| pn == "xl/workbook.xml")
         {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
-            let entry = format!("<pivotCache cacheId=\"{cache_id}\" r:id=\"{cache_rid}\"/>");
+            let entry =
+                |px: &str| format!("<{px}pivotCache cacheId=\"{cache_id}\" r:id=\"{cache_rid}\"/>");
             p.1 = if xml.contains("</pivotCaches>") {
-                xml.replacen("</pivotCaches>", &format!("{entry}</pivotCaches>"), 1)
+                xml.replacen("</pivotCaches>", &format!("{}</pivotCaches>", entry("")), 1)
+            } else if let Some((at, px)) = workbook_insert_pos(&xml, "pivotCaches") {
+                // At its CT_Workbook position (after definedNames, calcPr,
+                // …), not right after `</sheets>`, which Excel repairs.
+                let mut out = xml.clone();
+                out.insert_str(
+                    at,
+                    &format!("<{px}pivotCaches>{}</{px}pivotCaches>", entry(&px)),
+                );
+                out
             } else {
                 xml.replacen(
                     "</sheets>",
-                    &format!("</sheets><pivotCaches>{entry}</pivotCaches>"),
+                    &format!("</sheets><pivotCaches>{}</pivotCaches>", entry("")),
                     1,
                 )
             }
@@ -14193,5 +14279,172 @@ mod strict_tests {
             let xml = String::from_utf8_lossy(bytes);
             assert!(!xml.contains("purl.oclc.org"), "{name}: {xml}");
         }
+    }
+}
+
+/// Children the writer adds to workbook.xml land at their CT_Workbook
+/// position, so Excel opens the file without a repair (#773).
+#[cfg(test)]
+mod ct_workbook_order_tests {
+    use super::*;
+
+    const NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const WB: &str = "xl/workbook.xml";
+
+    /// A new workbook with a Region/Sales range on Sheet1, and its
+    /// workbook.xml replaced by `workbook` when given.
+    fn with_data(workbook: Option<String>) -> SheetPackage {
+        let mut pkg = new_xlsx();
+        if let Some(wb) = workbook {
+            pkg.set_part(WB, wb.into_bytes());
+        }
+        let rows = [("Region", None), ("East", Some(10.0)), ("West", Some(30.0))];
+        for (r, (region, sales)) in rows.iter().enumerate() {
+            let r = r as u32;
+            pkg.workbook.sheets[0].set_cell(r, 0, Cell::text(region));
+            let sales = sales.map_or_else(|| Cell::text("Sales"), Cell::number);
+            pkg.workbook.sheets[0].set_cell(r, 1, sales);
+        }
+        pkg
+    }
+
+    fn pivot(pkg: &mut SheetPackage) {
+        let measure = crate::pivot::DataField {
+            name: "Sum of Sales".into(),
+            field: 1,
+            agg: crate::frame::Agg::Sum,
+        };
+        pkg.add_pivot(
+            crate::pivot::PivotSource::Range {
+                sheet: "Sheet1".into(),
+                rect: (0, 0, 2, 1),
+            },
+            vec!["Region".into(), "Sales".into()],
+            measure,
+            0,
+            (5, 0),
+        )
+        .expect("add_pivot");
+    }
+
+    fn part(pkg: &SheetPackage, name: &str) -> String {
+        String::from_utf8(pkg.part(name).unwrap().to_vec()).unwrap()
+    }
+
+    /// `a` stands before `b` in `xml`.
+    fn before(xml: &str, a: &str, b: &str) -> bool {
+        match (xml.find(a), xml.find(b)) {
+            (Some(i), Some(j)) => i < j,
+            _ => false,
+        }
+    }
+
+    fn workbook(inner: &str) -> String {
+        format!(r#"<?xml version="1.0"?><workbook xmlns="{NS}" xmlns:r="{R}">{inner}</workbook>"#)
+    }
+
+    const SHEETS: &str = r#"<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>"#;
+
+    #[test]
+    fn add_pivot_puts_pivot_caches_after_defined_names_and_calc_pr() {
+        let names =
+            r#"<definedNames><definedName name="Total">Sheet1!$B$2</definedName></definedNames>"#;
+        let calc = r#"<calcPr calcId="191029"/>"#;
+        let mut pkg = with_data(Some(workbook(&format!("{SHEETS}{names}{calc}"))));
+        pivot(&mut pkg);
+        let wb = part(&pkg, WB);
+        assert!(
+            wb.contains(&format!("{calc}<pivotCaches><pivotCache cacheId=")),
+            "{wb}"
+        );
+        assert!(before(&wb, "</pivotCaches>", "</workbook>"), "{wb}");
+    }
+
+    #[test]
+    fn add_pivot_puts_pivot_caches_between_custom_workbook_views_and_ext_lst() {
+        let views = r#"<customWorkbookViews><customWorkbookView name="Mine" guid="{00000000-0000-0000-0000-000000000001}" windowWidth="800" windowHeight="600" activeSheetId="1"/></customWorkbookViews>"#;
+        // An unknown child (x15ac:absPath's wrapper) is not an anchor.
+        let alt = r#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><mc:Choice Requires="x15"/></mc:AlternateContent>"#;
+        let tail = r#"<fileRecoveryPr repairLoad="1"/><extLst><ext uri="{x}"/></extLst>"#;
+        let mut pkg = with_data(Some(workbook(&format!(
+            r#"{alt}{SHEETS}<calcPr calcId="1"/>{views}{tail}"#
+        ))));
+        pivot(&mut pkg);
+        let wb = part(&pkg, WB);
+        assert!(wb.contains(&format!("{views}<pivotCaches>")), "{wb}");
+        assert!(wb.contains(&format!("</pivotCaches>{tail}")), "{wb}");
+    }
+
+    #[test]
+    fn add_pivot_prefixes_pivot_caches_on_a_prefixed_root() {
+        let wb = format!(
+            r#"<?xml version="1.0"?><x:workbook xmlns:x="{NS}" xmlns:r="{R}"><x:sheets><x:sheet name="Sheet1" sheetId="1" r:id="rId1"/></x:sheets><x:calcPr calcId="1"/><x:extLst/></x:workbook>"#
+        );
+        let mut pkg = with_data(Some(wb));
+        pivot(&mut pkg);
+        let wb = part(&pkg, WB);
+        assert!(
+            wb.contains(r#"<x:calcPr calcId="1"/><x:pivotCaches><x:pivotCache cacheId="#),
+            "{wb}"
+        );
+        assert!(wb.contains("</x:pivotCaches><x:extLst/>"), "{wb}");
+        assert!(!wb.contains("<pivotCache"), "{wb}");
+    }
+
+    #[test]
+    fn add_pivot_appends_to_an_existing_pivot_caches() {
+        let caches = r#"<pivotCaches><pivotCache cacheId="7" r:id="rId9"/></pivotCaches>"#;
+        let mut pkg = with_data(Some(workbook(&format!("{SHEETS}{caches}"))));
+        pivot(&mut pkg);
+        let wb = part(&pkg, WB);
+        assert_eq!(wb.matches("<pivotCaches>").count(), 1, "{wb}");
+        assert!(
+            wb.contains(r#"<pivotCaches><pivotCache cacheId="7" r:id="rId9"/><pivotCache "#),
+            "{wb}"
+        );
+    }
+
+    #[test]
+    fn a_new_workbooks_pivot_and_formula_save_calc_pr_before_pivot_caches() {
+        // A new workbook has no <calcPr>: save adds one for the formula,
+        // and it must not land after the pivot's <pivotCaches>.
+        let mut pkg = with_data(None);
+        pkg.workbook.sheets[0].set_cell(3, 1, Cell::formula("SUM(B2:B3)"));
+        pivot(&mut pkg);
+        let saved = load_xlsx(&save_xlsx(&pkg)).expect("reload");
+        let wb = part(&saved, WB);
+        assert!(before(&wb, "<calcPr", "<pivotCaches>"), "{wb}");
+        assert_eq!(saved.workbook.pivots.len(), 1);
+    }
+
+    #[test]
+    fn ensure_full_calc_puts_calc_pr_before_ext_lst() {
+        let names =
+            r#"<definedNames><definedName name="T">Sheet1!$A$1</definedName></definedNames>"#;
+        let out = ensure_full_calc(&workbook(&format!("{SHEETS}{names}<extLst/>")));
+        assert!(
+            out.contains(&format!(
+                r#"{names}<calcPr calcId="0" fullCalcOnLoad="1"/><extLst/>"#
+            )),
+            "{out}"
+        );
+
+        let prefixed =
+            format!(r#"<x:workbook xmlns:x="{NS}"><x:sheets/><x:pivotCaches/></x:workbook>"#);
+        let out = ensure_full_calc(&prefixed);
+        assert!(
+            out.contains(r#"<x:sheets/><x:calcPr calcId="0" fullCalcOnLoad="1"/><x:pivotCaches/>"#),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn workbook_insert_pos_has_no_position_in_a_truncated_part() {
+        assert_eq!(workbook_insert_pos(r#"<workbook><sheets>"#, "calcPr"), None);
+        assert_eq!(workbook_insert_pos(r#"<workbook/>"#, "calcPr"), None);
+        // With no root end tag, the calcPr append has nothing to go before.
+        let out = ensure_full_calc("<workbook><sheets/>");
+        assert_eq!(out, "<workbook><sheets/>");
     }
 }
