@@ -5917,19 +5917,25 @@ mod tests {
         let m = schedule(&proj).get(2).copied().unwrap();
         assert_eq!(m.late_start, monday_noon);
         assert_eq!(m.late_finish, monday_noon);
-        // A successor bound on the same index still caps an SNLT milestone.
+        // A successor's FNLT on the same index still caps an SNLT milestone:
+        // C holds M to Friday evening even though M's own date is Monday.
         let friday = DateTime::from_ymd_hm(2026, 3, 6, 17, 0);
-        let proj = finish_constrained_milestone(
+        let mut proj = finish_constrained_milestone(
             2400,
             ConstraintType::StartNoLaterThan,
             monday,
             true,
-            true,
+            false,
         );
+        let mut c = task(3, "C", 0);
+        c.predecessors.push(fs(2));
+        c.constraint = ConstraintType::FinishNoLaterThan;
+        c.constraint_date = Some(friday);
+        proj.tasks.push(c);
         let m = schedule(&proj).get(2).copied().unwrap();
+        assert_eq!(m.early_start, DateTime::from_ymd_hm(2026, 3, 2, 8, 0));
         assert_eq!(m.late_start, friday);
         assert_eq!(m.late_finish, friday);
-        assert_eq!(m.total_slack_min, 0);
     }
 
     #[test]
@@ -7254,6 +7260,23 @@ mod tests {
                     assert_eq!(phase.late_start, late, "{case}");
                 }
             }
+        }
+        // An SNLT never moves the milestone past its successor's own instant:
+        // a linked milestone due Friday evening holds the Monday morning back.
+        for honor in [true, false] {
+            let mut proj =
+                unlinked_deadline(ConstraintType::StartNoLaterThan, monday_morning, honor);
+            proj.tasks[1].duration_min = 0;
+            let mut c = task(3, "C", 0);
+            c.predecessors.push(fs(2));
+            c.constraint = ConstraintType::FinishNoLaterThan;
+            c.constraint_date = Some(DateTime::from_ymd_hm(2026, 2, 13, 17, 0));
+            proj.tasks.push(c);
+            let r = *schedule(&proj).get(2).unwrap();
+            let friday_evening = DateTime::from_ymd_hm(2026, 2, 13, 17, 0);
+            assert_eq!(r.late_start, friday_evening, "honor={honor}");
+            assert_eq!(r.late_finish, friday_evening, "honor={honor}");
+            assert_eq!(r.total_slack_min, -10 * 480, "honor={honor}");
         }
     }
 
