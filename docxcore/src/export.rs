@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::field::{FieldEvent, field_events};
 use crate::load::{Relationships, xml_attr_value};
 use crate::model::*;
 use crate::package::{HeaderVariant, Package, SectionParts, section_header_parts};
@@ -207,24 +208,9 @@ fn start_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
 }
 
 fn start_tags<'a>(xml: &'a str, tag: &str) -> impl Iterator<Item = &'a str> + use<'a> {
-    let needle = format!("<{tag}");
-    let mut from = 0;
-    std::iter::from_fn(move || {
-        while let Some(off) = xml[from..].find(&needle) {
-            let start = from + off;
-            let after = start + needle.len();
-            from = after;
-            if xml[after..]
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_whitespace() || c == '/' || c == '>')
-            {
-                let end = xml[start..].find('>').map_or(xml.len(), |e| start + e + 1);
-                return Some(&xml[start..end]);
-            }
-        }
-        None
-    })
+    crate::load::start_tags(xml, tag)
+        .into_iter()
+        .map(|(_, el)| el)
 }
 
 /// A numeric attribute (twips etc.) as f32; `inf`/`NaN` count as absent.
@@ -1282,49 +1268,6 @@ fn same_style(a: &PCell, b: &PCell) -> bool {
         && a.field.map(|f| f.0) == b.field.map(|f| f.0)
 }
 
-/// A complex field's markers inside a preserved raw run, in document order.
-enum FieldEvent {
-    Begin,
-    Instr(String),
-    Separate,
-    End,
-}
-
-fn field_events(raw: &str) -> Vec<FieldEvent> {
-    let mut events: Vec<(usize, FieldEvent)> = Vec::new();
-    let mut from = 0;
-    while let Some(off) = raw[from..].find("<w:fldChar") {
-        let start = from + off;
-        let el = start_tag(&raw[start..], "w:fldChar").unwrap_or("");
-        from = start + el.len().max(1);
-        match xml_attr_value(el, "w:fldCharType").as_deref() {
-            Some("begin") => events.push((start, FieldEvent::Begin)),
-            Some("separate") => events.push((start, FieldEvent::Separate)),
-            Some("end") => events.push((start, FieldEvent::End)),
-            _ => {}
-        }
-    }
-    let mut from = 0;
-    while let Some(off) = raw[from..].find("<w:instrText") {
-        let start = from + off;
-        let el = start_tag(&raw[start..], "w:instrText").unwrap_or("");
-        let body_start = start + el.len().max(1);
-        from = body_start;
-        if el.ends_with("/>") {
-            continue;
-        }
-        let body_end = raw[body_start..]
-            .find("</w:instrText>")
-            .map_or(raw.len(), |e| body_start + e);
-        events.push((
-            start,
-            FieldEvent::Instr(raw[body_start..body_end].to_string()),
-        ));
-    }
-    events.sort_by_key(|(pos, _)| *pos);
-    events.into_iter().map(|(_, e)| e).collect()
-}
-
 /// An open complex field while its paragraph is flattened.
 struct OpenField {
     instr: String,
@@ -1383,11 +1326,10 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Se
                     .or_else(|| h.anchor.as_ref().map(|a| format!("#{a}")))
                     .unwrap_or_default();
                 let rc: Rc<str> = Rc::from(target.as_str());
-                for run in h.visible_runs() {
-                    let eff =
-                        styles.effective_run(pstyle, run.props.style_id.as_deref(), &run.props);
-                    let font = font_index(eff.bold || heading, eff.italic);
-                    for ch in run.text.chars() {
+                for (text, props) in h.visible_pieces() {
+                    let eff = styles.effective_run(pstyle, props.style_id.as_deref(), &props);
+                    let (font, strike) = (font_index(eff.bold || heading, eff.italic), eff.strike);
+                    for ch in text.chars() {
                         push(
                             &mut segs,
                             PCell {
@@ -1395,7 +1337,7 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Se
                                 font,
                                 color: (0.0, 0.0, 0.55),
                                 underline: true,
-                                strike: eff.strike,
+                                strike,
                                 link: Some(rc.clone()),
                                 field: None,
                             },
@@ -1433,8 +1375,9 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Se
                     segs.push(Seg::default());
                 }
             }
-            // A simple field: PAGE/NUMPAGES/SECTIONPAGES get the page's value when
-            // written; any other field keeps its cached result.
+            // A field (a `w:fldSimple`, a complex field loaded as one unit, or a
+            // `w:sym` symbol): PAGE/NUMPAGES/SECTIONPAGES get the page's value
+            // when written; any other field keeps its cached result.
             Inline::Field { raw, text } => {
                 let kind = crate::field::instr_of(raw)
                     .as_deref()
@@ -1444,8 +1387,16 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Se
                 } else {
                     text.as_str()
                 };
+                // The result's own formatting (#642: a complex field's result
+                // runs are inside the Field).
+                let props = crate::load::field_result_props(raw);
+                let eff = styles.effective_run(pstyle, props.style_id.as_deref(), &props);
                 for (i, ch) in text.chars().enumerate() {
                     let mut cell = plain_cell(ch);
+                    cell.font = font_index(eff.bold || heading, eff.italic);
+                    cell.color = run_color(&eff);
+                    cell.underline = eff.underline;
+                    cell.strike = eff.strike;
                     cell.field = kind.map(|k| (k, i == 0));
                     push(&mut segs, cell);
                 }
@@ -1815,6 +1766,24 @@ mod tests {
         let text = s(&to_pdf(&d, &PdfOptions::default()));
         // bold = font index 1 = /F1
         assert!(text.contains("/F1"));
+    }
+
+    #[test]
+    fn a_fields_bold_result_uses_the_bold_font_642() {
+        let d = crate::load::parse_document_xml(
+            "<w:document><w:body><w:p><w:r><w:fldChar w:fldCharType=\"begin\"/></w:r><w:r><w:instrText> PAGE </w:instrText></w:r><w:r><w:fldChar w:fldCharType=\"separate\"/></w:r><w:r><w:rPr><w:b/></w:rPr><w:t>1</w:t></w:r><w:r><w:fldChar w:fldCharType=\"end\"/></w:r></w:p></w:body></w:document>",
+            &crate::load::Relationships::default(),
+        );
+        assert!(
+            matches!(&d.body[0], Block::Paragraph(p) if matches!(p.content[0], Inline::Field { .. }))
+        );
+        let text = s(&to_pdf(&d, &PdfOptions::default()));
+        let shown = text
+            .find("(1) Tj")
+            .or_else(|| text.find("(1)"))
+            .expect("the result is drawn");
+        let font = text[..shown].rfind("BT /F").expect("a font is set");
+        assert_eq!(&text[font..font + 6], "BT /F1", "the result is bold");
     }
 
     #[test]
@@ -2497,6 +2466,54 @@ mod tests {
                 .collect();
             assert_eq!(values, vec![(i + 1).to_string().as_str(), "3"]);
         }
+    }
+
+    #[test]
+    fn loaded_complex_page_field_in_a_footer_counts_pages_642() {
+        // The loader collapses a complex field into one `Inline::Field`; its
+        // page number must still be substituted per page, not print the cache.
+        let footer = crate::load::parse_header_footer(
+            r#"<w:ftr><w:p><w:r><w:t xml:space="preserve">Page </w:t></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> PAGE \* MERGEFORMAT </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>1</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p></w:ftr>"#,
+            &crate::load::Relationships::default(),
+        );
+        assert!(matches!(
+            &footer[0],
+            Block::Paragraph(p) if matches!(p.content[1], Inline::Field { .. })
+        ));
+        let opts = with_parts(&[("rF", "footer1.xml", footer)]);
+        let d =
+            three_pages(r#"<w:sectPr><w:footerReference w:type="default" r:id="rF"/></w:sectPr>"#);
+        let pages = pages_of(&d, &opts);
+        assert_eq!(pages.len(), 3);
+        for (i, page) in pages.iter().enumerate() {
+            assert!(
+                page.exact(&(i + 1).to_string()),
+                "page {}: {:?}",
+                i + 1,
+                page.texts
+            );
+        }
+    }
+
+    #[test]
+    fn a_toc_entrys_page_number_field_is_exported_inside_its_link_642() {
+        // A `TOC \h` entry: the PAGEREF field (collapsed into one Field on
+        // load) sits inside the entry's link.
+        let body = crate::load::parse_document_xml(
+            r#"<w:document><w:body><w:p><w:hyperlink w:anchor="_Toc1"><w:r><w:t>Intro</w:t></w:r><w:r><w:tab/></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> PAGEREF _Toc1 \h </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>7</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:hyperlink></w:p></w:body></w:document>"#,
+            &crate::load::Relationships::default(),
+        );
+        assert!(matches!(
+            &body.body[0],
+            Block::Paragraph(p) if matches!(&p.content[0], Inline::Hyperlink(h) if h.content.iter().any(|i| matches!(i, Inline::Field { .. })))
+        ));
+        let pages = pages_of(&body, &PdfOptions::default());
+        assert!(pages[0].has("Intro"), "{:?}", pages[0].texts);
+        assert!(
+            pages[0].has("7"),
+            "the page number is exported: {:?}",
+            pages[0].texts
+        );
     }
 
     #[test]

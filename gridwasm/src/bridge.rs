@@ -2,7 +2,6 @@
 //! written as plain Rust so it can be unit-tested natively
 //! (`cargo test -p gridwasm`). Mirrors `docxwasm::bridge` in shape.
 
-use gridcore::edit::parse_input;
 use gridcore::engine::{Engine, cell_to_value, eval_formula_at};
 use gridcore::format::{FormatPatch, FormatValue, apply_patch_to_xf, xf_format_fields};
 use gridcore::formula::Value;
@@ -195,21 +194,24 @@ impl Session {
                         return None;
                     }
                     let text = p[2];
-                    if let Some(body) = text.strip_prefix('=') {
-                        if !body.is_empty() {
-                            if let Err(e) = Engine::validate(body) {
-                                self.err = Some(format!("formula error: {e}"));
-                                return None;
-                            }
+                    let wb = &self.pkg.workbook;
+                    // A Text cell stores `=…` as text: nothing to validate.
+                    if let Some(body) = gridcore::entry::typed_formula(wb, self.active, r, c, text)
+                    {
+                        if let Err(e) = Engine::validate(body) {
+                            self.err = Some(format!("formula error: {e}"));
+                            return None;
                         }
                     }
-                    let style = self.pkg.workbook.sheets[self.active]
-                        .cell(r, c)
-                        .map(|x| x.style)
-                        .unwrap_or(0);
-                    let mut cell = parse_input(text);
-                    cell.style = style;
-                    self.apply(vec![(r, c, cell)]);
+                    let today = self.engine.clock;
+                    let wb = &mut self.pkg.workbook;
+                    match gridcore::entry::entry_cell(wb, self.active, r, c, text, today) {
+                        Ok(cell) => self.apply(vec![(r, c, cell)]),
+                        Err(e) => {
+                            self.err = Some(e.to_string());
+                            return None;
+                        }
+                    }
                 }
             }
             "clear" => {
@@ -277,7 +279,10 @@ impl Session {
                                 .cell(r, c)
                                 .map(|x| x.style)
                                 .unwrap_or(0);
-                            let mut cell = parse_input(text);
+                            // A leading `'` pastes as quote-prefixed text
+                            // (what copy writes for one).
+                            let styles = &mut self.pkg.workbook.styles;
+                            let mut cell = gridcore::entry::paste_cell(styles, style, text);
                             // A pasted `=…` that doesn't parse would freeze as
                             // an unsupported cell (never evaluates, renders
                             // blank); demote it to literal text instead, same
@@ -286,12 +291,11 @@ impl Session {
                                 if Engine::validate(f).is_err() {
                                     cell = Cell {
                                         value: CellValue::Text(text.to_string()),
-                                        style,
+                                        style: cell.style,
                                         ..Cell::default()
                                     };
                                 }
                             }
-                            cell.style = style;
                             changes.push((r, c, cell));
                         }
                     }
@@ -517,7 +521,20 @@ impl Session {
         self.engine = engine;
     }
 
-    /// The raw editable source of a cell: `=FORMULA` or the raw value text.
+    /// What the editor and formula bar start from: [`Session::cell_src`] with
+    /// a quote prefix's apostrophe put back, so re-committing keeps it text.
+    fn cell_seed(&self, row: u32, col: u32) -> String {
+        let src = self.cell_src(row, col);
+        let styles = &self.pkg.workbook.styles;
+        match self.pkg.workbook.sheets[self.active].cell(row, col) {
+            Some(cell) => gridcore::entry::copy_field(cell, &styles.xf(cell.style), src),
+            None => src,
+        }
+    }
+
+    /// The raw source of a cell, as copied: `=FORMULA` or the raw value text.
+    /// (The number keeps Rust's shortest round-trip text rather than
+    /// General's 15-digit rounding, so a copy or an edit never loses digits.)
     fn cell_src(&self, row: u32, col: u32) -> String {
         let Some(cell) = self.pkg.workbook.sheets[self.active].cell(row, col) else {
             return String::new();
@@ -555,7 +572,9 @@ impl Session {
         for r in r1..=r2 {
             let mut cells = Vec::new();
             for c in c1..=c2 {
-                cells.push(self.cell_src(r, c));
+                // The editor's text: a quote-prefixed `'007` copies with its
+                // apostrophe, so paste gives back text, not the number 7.
+                cells.push(self.cell_seed(r, c));
             }
             rows.push(cells.join("\t"));
         }
@@ -810,7 +829,7 @@ impl Session {
         out.push_str("},\"cur\":{\"ref\":");
         json::push_str(&mut out, &cell_name(self.cur.0, self.cur.1));
         out.push_str(",\"src\":");
-        let src = self.cell_src(self.cur.0, self.cur.1);
+        let src = self.cell_seed(self.cur.0, self.cur.1);
         json::push_str(&mut out, &src);
         // The active cell's format, so the toolbar can show pressed state
         // (bold/italic buttons, the align group) without a separate round
@@ -1824,10 +1843,11 @@ impl Session {
         Ok(out)
     }
 
-    /// `{start,rows:[[string]],sheet?}` -> `{set,undoSteps}` — ATOMIC: every
-    /// formula in the batch is validated *before* anything is applied, so a
-    /// bad formula anywhere leaves the sheet (and the undo stack) completely
-    /// untouched. The whole block lands as one [`Session::apply`] call, i.e.
+    /// `{start,rows:[[string]],sheet?}` -> `{set,undoSteps}`, each string
+    /// typed the way `set` types it (gridcore::entry) — ATOMIC: every formula
+    /// and every length in the batch is checked *before* anything is applied,
+    /// so a bad formula or an over-long entry anywhere leaves the sheet (and
+    /// the undo stack) completely untouched. The whole block lands as one [`Session::apply`] call, i.e.
     /// one true wasm-undo-stack group (`undoSteps:1`; `0` only for a
     /// genuinely empty `rows` batch, which `apply` no-ops on). Mirrors xlsxy
     /// control.rs's `range_set`.
@@ -1854,33 +1874,31 @@ impl Session {
             }
         }
 
-        // Pass 1: validate every formula before touching anything.
+        // Pass 1: validate every formula and length before touching anything.
         for (r, c, text) in &entries {
-            if let Some(body) = text.strip_prefix('=') {
-                if !body.is_empty() {
-                    Engine::validate(body).map_err(|e| {
-                        format!("range.set: formula error at {}: {e}", cell_name(*r, *c))
-                    })?;
-                }
+            let wb = &self.pkg.workbook;
+            if let Some(body) = gridcore::entry::typed_formula(wb, si, *r, *c, text) {
+                Engine::validate(body).map_err(|e| {
+                    format!("range.set: formula error at {}: {e}", cell_name(*r, *c))
+                })?;
             }
+            gridcore::entry::check_len(text)
+                .map_err(|e| format!("range.set: {e} at {}", cell_name(*r, *c)))?;
         }
 
         // Pass 2: every entry validated — build the changes and apply as one
         // undo group, on the target sheet (temporarily swapping `active`,
         // same trick `ctl_cell_set` already uses, since `apply` targets
         // `self.active`).
+        let today = self.engine.clock;
+        let mut changes: Vec<(u32, u32, Cell)> = Vec::with_capacity(entries.len());
+        for (r, c, text) in entries {
+            let cell = gridcore::entry::entry_cell(&mut self.pkg.workbook, si, r, c, &text, today)
+                .map_err(|e| format!("range.set: {e} at {}", cell_name(r, c)))?;
+            changes.push((r, c, cell));
+        }
         let prev_active = self.active;
         self.active = si;
-        let sheet = &self.pkg.workbook.sheets[si];
-        let changes: Vec<(u32, u32, Cell)> = entries
-            .into_iter()
-            .map(|(r, c, text)| {
-                let style = sheet.cell(r, c).map(|x| x.style).unwrap_or(0);
-                let mut cell = parse_input(&text);
-                cell.style = style;
-                (r, c, cell)
-            })
-            .collect();
         let n = changes.len();
         let undo_steps = if changes.is_empty() { 0 } else { 1 };
         self.apply(changes);
@@ -2401,9 +2419,12 @@ impl Session {
         }
         let text = args.get_str("text").ok_or("wb.replace-all needs 'text'")?;
         let mut replaced = 0usize;
+        let today = self.engine.clock;
         self.structural(|wb| {
+            let ctx = gridcore::entry::entry_ctx(wb, today);
             for sheet in &mut wb.sheets {
-                let changes = gridcore::edit::replace_all_in_sheet(sheet, query, text);
+                let changes =
+                    gridcore::edit::replace_all_in_sheet(sheet, &mut wb.styles, &ctx, query, text);
                 replaced += changes.len();
                 for (r, c, nc) in changes {
                     sheet.set_cell(r, c, nc);
@@ -3344,6 +3365,112 @@ mod tests {
         );
         let out = s.ctl(r#"{"verb":"cell.get","args":{"ref":"B4"}}"#);
         assert!(out.contains("SUM(B1:B3)"), "{out}");
+    }
+
+    #[test]
+    fn set_refuses_an_entry_over_the_cell_limit_658() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("set\t0\t0\told");
+        s.err = None;
+        s.dispatch(&format!("set\t0\t0\t{}", "y".repeat(32_768)));
+        let err = s.err.clone().expect("an error");
+        assert!(err.contains("32767"), "{err}");
+        assert_eq!(s.cell_src(0, 0), "old");
+        let r = s.ctl(&format!(
+            r#"{{"verb":"cell.set","args":{{"ref":"A1","text":"{}"}}}}"#,
+            "y".repeat(32_768)
+        ));
+        assert!(r.contains("32767"), "{r}");
+    }
+
+    #[test]
+    fn a_text_beginning_with_an_apostrophe_survives_copy_and_paste() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let a = s.active;
+        // A loaded shared string 'abc with no quote prefix (General).
+        s.pkg.workbook.sheets[a].set_cell(40, 0, Cell::text("'abc"));
+        assert_eq!(s.cell_seed(40, 0), "''abc");
+        s.cur = (40, 0);
+        s.anchor = None;
+        let tsv = s.dispatch("copy").expect("copy returns the TSV");
+        s.dispatch(&format!("paste\t41\t0\t{tsv}"));
+        let pasted = s.pkg.workbook.sheets[a].cell(41, 0).unwrap().clone();
+        assert_eq!(pasted.value, CellValue::Text("'abc".into()));
+        // A Text-formatted cell holding 'abc, copied into another Text cell.
+        let text = s.pkg.workbook.styles.intern(gridcore::sheet::Xf {
+            numfmt: gridcore::sheet::NumFmt::Text,
+            code: Some("@".into()),
+            ..Default::default()
+        });
+        for r in [42, 43] {
+            s.pkg.workbook.sheets[a].set_cell(
+                r,
+                0,
+                Cell {
+                    style: text,
+                    ..Cell::default()
+                },
+            );
+        }
+        s.dispatch("set\t42\t0\t'abc");
+        assert_eq!(
+            s.cell_src(42, 0),
+            "'abc",
+            "a Text cell keeps the entry as typed"
+        );
+        assert_eq!(s.cell_seed(42, 0), "'abc");
+        s.cur = (42, 0);
+        let tsv = s.dispatch("copy").expect("copy returns the TSV");
+        s.dispatch(&format!("paste\t43\t0\t{tsv}"));
+        let pasted = s.pkg.workbook.sheets[a].cell(43, 0).unwrap().clone();
+        assert_eq!(pasted.value, CellValue::Text("'abc".into()));
+        assert!(!s.pkg.workbook.styles.xf(pasted.style).quote_prefix);
+    }
+
+    #[test]
+    fn a_text_cell_takes_a_broken_formula_as_text() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let text = s.pkg.workbook.styles.intern(gridcore::sheet::Xf {
+            numfmt: gridcore::sheet::NumFmt::Text,
+            code: Some("@".into()),
+            ..Default::default()
+        });
+        let a = s.active;
+        s.pkg.workbook.sheets[a].set_cell(
+            30,
+            0,
+            Cell {
+                style: text,
+                ..Cell::default()
+            },
+        );
+        s.err = None;
+        s.dispatch("set\t30\t0\t=SUM(");
+        assert_eq!(s.err, None);
+        assert_eq!(s.cell_src(30, 0), "=SUM(");
+        s.dispatch("set\t31\t0\t=SUM(");
+        assert!(s.err.is_some(), "a General cell still refuses it");
+    }
+
+    #[test]
+    fn set_reads_entries_the_way_excel_does() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("set\t20\t0\t'007");
+        assert_eq!(s.cell_seed(20, 0), "'007");
+        // Copy then paste gives back quote-prefixed text, not the number 7.
+        s.cur = (20, 0);
+        s.anchor = None;
+        let tsv = s.dispatch("copy").expect("copy returns the TSV");
+        assert_eq!(tsv.trim_end(), "'007");
+        s.dispatch(&format!("paste\t22\t0\t{tsv}"));
+        let pasted = s.pkg.workbook.sheets[s.active].cell(22, 0).unwrap().clone();
+        assert_eq!(pasted.value, CellValue::Text("007".into()));
+        assert!(s.pkg.workbook.styles.xf(pasted.style).quote_prefix);
+        let cell = s.pkg.workbook.sheets[s.active].cell(20, 0).unwrap().clone();
+        assert_eq!(cell.value, CellValue::Text("007".into()));
+        s.dispatch("set\t21\t0\t$1,234.56");
+        let cell = s.pkg.workbook.sheets[s.active].cell(21, 0).unwrap().clone();
+        assert_eq!(cell.value, CellValue::Number(1234.56));
     }
 
     #[test]

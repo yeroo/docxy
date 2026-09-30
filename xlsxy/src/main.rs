@@ -29,8 +29,9 @@ mod skill;
 use backstage::BackstageHost as _;
 
 use gridcore::comments::Comment;
-use gridcore::edit::{input_text_of, parse_input, replace_all_in_sheet};
+use gridcore::edit::{fill_changes, replace_all_in_sheet};
 use gridcore::engine::Engine;
+use gridcore::entry::{entry_cell, entry_ctx, input_text_styled};
 use gridcore::formula::translate_formula;
 use gridcore::frame::Agg;
 use gridcore::model::{
@@ -38,7 +39,7 @@ use gridcore::model::{
 };
 use gridcore::sheet::{
     Align, Cell, CellValue, MAX_COLS, MAX_ROWS, NumFmt, Sheet, Xf, cell_name, col_name,
-    format_with, sheet_to_csv,
+    date_unrepresentable, format_with, sheet_to_csv,
 };
 use gridcore::xlsx::{SheetPackage, SpreadsheetKind, load_xlsx, new_xlsx, save_xlsx_for_path};
 
@@ -798,6 +799,9 @@ struct FormatDialog {
     sel: usize,
 }
 
+/// Excel's warning when an edit creates a circular reference.
+const CIRCULAR_WARNING: &str = "There are one or more circular references where a formula refers to its own cell either directly or indirectly. This might cause them to calculate incorrectly.";
+
 /// The Format Cells section tabs.
 const FMT_SECTIONS: &[&str] = &["Number", "Font", "Fill", "Align", "Border"];
 
@@ -977,6 +981,10 @@ struct App {
     vis_subline: Vec<u8>,           // which wrapped sub-line of that row (parallel to vis_rows)
     tab_spans: Vec<(usize, u16, u16)>,
     ribbon_rows: u16,
+    /// A cell or structural edit made a new circle: its warning is added to
+    /// whatever status the edit's caller sets, once the action is done
+    /// ([`App::flush_circle_warning`]).
+    circle_warning_pending: bool,
 }
 
 impl App {
@@ -989,6 +997,10 @@ impl App {
             .map(|b| parse_model_part(&String::from_utf8_lossy(b)))
             .unwrap_or_default();
         let comments = pkg.comments();
+        // Excel warns about a workbook's circular references when it opens
+        // (not when iterative calculation is on: the circles are intended).
+        let status = (pkg.workbook.iterate.is_none() && !engine.circular_refs().is_empty())
+            .then(|| CIRCULAR_WARNING.to_string());
         App {
             pkg,
             engine,
@@ -1001,7 +1013,8 @@ impl App {
             left: 0,
             edit: None,
             modified: false,
-            status: None,
+            status,
+            circle_warning_pending: false,
             undo: Vec::new(),
             redo: Vec::new(),
             clip: None,
@@ -1131,39 +1144,56 @@ impl App {
     }
 
     /// What editing an existing cell starts from: the formula with `=`, or
-    /// the value as it would be re-entered.
+    /// the value as it would be re-entered (a quote prefix's `'` included).
     fn current_input_text(&self) -> String {
         let (r, c) = self.cur;
+        let styles = &self.pkg.workbook.styles;
         self.sheet()
             .cell(r, c)
-            .map(input_text_of)
+            .map(|cl| input_text_styled(cl, &styles.xf(cl.style)))
             .unwrap_or_default()
     }
 
-    /// Commit the editor text into the current cell. Returns false (and
-    /// stays in edit mode) when a formula doesn't parse.
+    /// Commit the editor text into the current cell as a typed entry
+    /// (gridcore::entry). Returns false (and stays in edit mode) when a
+    /// formula doesn't parse or the entry is over the 32,767-character cell
+    /// limit.
     fn commit_edit(&mut self) -> bool {
         let Some(edit) = self.edit.take() else {
             return true;
         };
         let text = edit.text;
-        if let Some(body) = text.strip_prefix('=') {
-            if !body.is_empty() {
-                if let Err(e) = Engine::validate(body) {
-                    self.status = Some(format!("formula error: {e}"));
-                    self.edit = Some(EditState {
-                        cursor: text.chars().count(),
-                        text,
-                        replace: false,
-                    });
-                    return false;
-                }
-            }
-        }
         let (r, c) = self.cur;
-        let style = self.sheet().cell(r, c).map(|x| x.style).unwrap_or(0);
-        let mut cell = parse_input(&text);
-        cell.style = style;
+        let formula = gridcore::entry::typed_formula(&self.pkg.workbook, self.sheet, r, c, &text);
+        if let Some(Err(e)) = formula.map(Engine::validate) {
+            self.status = Some(format!("formula error: {e}"));
+            self.edit = Some(EditState {
+                cursor: text.chars().count(),
+                text,
+                replace: false,
+            });
+            return false;
+        }
+        let cell = match entry_cell(
+            &mut self.pkg.workbook,
+            self.sheet,
+            r,
+            c,
+            &text,
+            now_serial(),
+        ) {
+            Ok(cell) => cell,
+            Err(e) => {
+                // Refused (too long): keep the editor open with the text.
+                self.status = Some(e.to_string());
+                self.edit = Some(EditState {
+                    cursor: text.chars().count(),
+                    text,
+                    replace: false,
+                });
+                return false;
+            }
+        };
         self.apply(vec![(r, c, cell)]);
         true
     }
@@ -1184,6 +1214,7 @@ impl App {
         if changes.is_empty() {
             return;
         }
+        let circles_before = self.engine.circular_refs();
         self.engine.clock = now_serial();
         let mut group = UndoGroup {
             sheet: sheet_idx,
@@ -1199,6 +1230,63 @@ impl App {
         self.undo.push(UndoAction::Cells(group));
         self.redo.clear();
         self.modified = true;
+        self.warn_new_circles(&circles_before);
+    }
+
+    /// Excel's circular-reference warning, once, when a cell edit put a
+    /// cell on a circle that was not on one before. Like a structural edit's,
+    /// it is added to the caller's own status ("Pasted", "Filled", …) by
+    /// [`App::flush_circle_warning`].
+    fn warn_new_circles(&mut self, before: &[(usize, u32, u32)]) {
+        let now = self.engine.circular_refs();
+        if self.circles_shown() && now.iter().any(|k| !before.contains(k)) {
+            self.circle_warning_pending = true;
+        }
+    }
+
+    /// Whether circles are surfaced (warning, footer): not when the workbook
+    /// enables iterative calculation, where Excel treats them as intended.
+    /// `wb.path.circular` lists them either way.
+    fn circles_shown(&self) -> bool {
+        self.pkg.workbook.iterate.is_none() && !self.engine.circular_refs().is_empty()
+    }
+
+    /// Add a cell or structural edit's pending circle warning to the status
+    /// its caller set ("Pasted. There are one or more circular …").
+    fn flush_circle_warning(&mut self) {
+        if !std::mem::take(&mut self.circle_warning_pending) {
+            return;
+        }
+        self.status = Some(match self.status.take() {
+            Some(s) if !s.is_empty() && s != CIRCULAR_WARNING => format!("{s}. {CIRCULAR_WARNING}"),
+            _ => CIRCULAR_WARNING.into(),
+        });
+    }
+
+    /// The cells on circular references as A1 refs: bare on the active
+    /// sheet, `Sheet!A1` elsewhere. Active-sheet cells come first.
+    pub(crate) fn circular_refs(&self) -> Vec<String> {
+        let refs = self.engine.circular_refs();
+        let name = |&(s, r, c): &(usize, u32, u32)| {
+            if s == self.sheet {
+                cell_name(r, c)
+            } else {
+                let sheet = self
+                    .pkg
+                    .workbook
+                    .sheets
+                    .get(s)
+                    .map(|sh| sh.name.as_str())
+                    .unwrap_or_default();
+                format!(
+                    "{}!{}",
+                    gridcore::sheet::quote_sheet_name(sheet),
+                    cell_name(r, c)
+                )
+            }
+        };
+        let (here, elsewhere): (Vec<_>, Vec<_>) = refs.iter().partition(|k| k.0 == self.sheet);
+        here.iter().chain(elsewhere.iter()).map(name).collect()
     }
 
     /// Snapshot-run-snapshot for structural edits (row/col ops, renames):
@@ -1208,8 +1296,14 @@ impl App {
             sheets: self.pkg.workbook.sheets.clone(),
             names: self.pkg.workbook.defined_names.clone(),
         };
+        // A structural edit moves cells, so compare how many cells sit on
+        // circles rather than where: a circle that merely moved is not new.
+        let circles_before = self.engine.circular_refs().len();
         op(&mut self.pkg.workbook);
         self.rebuild_engine();
+        if self.circles_shown() && self.engine.circular_refs().len() > circles_before {
+            self.circle_warning_pending = true;
+        }
         let after = WbSnapshot {
             sheets: self.pkg.workbook.sheets.clone(),
             names: self.pkg.workbook.defined_names.clone(),
@@ -1723,11 +1817,10 @@ impl App {
                 }
                 let cell = sheet.cell(r, c).cloned();
                 if let Some(cl) = &cell {
-                    tsv.push_str(&format_with(
-                        &self.pkg.workbook.styles.xf(cl.style),
-                        &cl.value,
-                        self.pkg.workbook.date1904,
-                    ));
+                    // With the `'` a paste needs to read the text back.
+                    let xf = self.pkg.workbook.styles.xf(cl.style);
+                    let shown = format_with(&xf, &cl.value, self.pkg.workbook.date1904);
+                    tsv.push_str(&gridcore::entry::copy_field(cl, &xf, shown));
                 }
                 row.push(cell);
             }
@@ -1820,7 +1913,9 @@ impl App {
                         continue;
                     }
                     let style = self.sheet().cell(r, c).map(|x| x.style).unwrap_or(0);
-                    let mut cell = parse_input(field);
+                    // A leading `'` pastes as quote-prefixed text.
+                    let mut cell =
+                        gridcore::entry::paste_cell(&mut self.pkg.workbook.styles, style, field);
                     // A pasted `=…` that doesn't parse would freeze as an
                     // unsupported cell; demote it to literal text instead
                     // (entry-time editing rejects such input outright).
@@ -1828,12 +1923,11 @@ impl App {
                         if Engine::validate(f).is_err() {
                             cell = Cell {
                                 value: CellValue::Text(field.to_string()),
-                                style,
+                                style: cell.style,
                                 ..Cell::default()
                             };
                         }
                     }
-                    cell.style = style;
                     changes.push((r, c, cell));
                 }
             }
@@ -2426,13 +2520,7 @@ impl App {
             PickKind::NumberFormat => {
                 let (label, code) = NUMFMT_OPTIONS[p.sel];
                 let code = code.map(str::to_string);
-                self.apply_format(move |x| {
-                    x.code = code.clone();
-                    x.numfmt = code
-                        .as_deref()
-                        .map(gridcore::sheet::classify_format_code)
-                        .unwrap_or(NumFmt::General);
-                });
+                self.apply_format(move |x| x.set_code(code.clone()));
                 self.status = Some(format!("Number format: {label}"));
             }
             PickKind::FontColor => {
@@ -2502,13 +2590,7 @@ impl App {
             0 => {
                 let (label, code) = NUMFMT_OPTIONS[sel];
                 let code = code.map(str::to_string);
-                self.apply_format(move |x| {
-                    x.code = code.clone();
-                    x.numfmt = code
-                        .as_deref()
-                        .map(gridcore::sheet::classify_format_code)
-                        .unwrap_or(NumFmt::General);
-                });
+                self.apply_format(move |x| x.set_code(code.clone()));
                 self.status = Some(format!("Number format: {label}"));
             }
             1 => match sel {
@@ -2728,11 +2810,20 @@ impl App {
                 let value = p.values[p.sel].clone();
                 self.dv_picker = None;
                 let (r, c) = self.cur;
-                let style = self.sheet().cell(r, c).map(|x| x.style).unwrap_or(0);
-                let mut cell = parse_input(&value);
-                cell.style = style;
-                self.apply(vec![(r, c, cell)]);
-                self.status = Some(format!("Set {} = {value}", cell_name(r, c)));
+                match entry_cell(
+                    &mut self.pkg.workbook,
+                    self.sheet,
+                    r,
+                    c,
+                    &value,
+                    now_serial(),
+                ) {
+                    Ok(cell) => {
+                        self.apply(vec![(r, c, cell)]);
+                        self.status = Some(format!("Set {} = {value}", cell_name(r, c)));
+                    }
+                    Err(e) => self.status = Some(e.to_string()),
+                }
             }
             _ => {}
         }
@@ -2920,7 +3011,11 @@ impl App {
                 self.modified = false;
                 self.backstage = None;
                 self.start_screen = false;
-                self.status = Some(format!("Opened {}", self.path));
+                self.status = Some(if !self.circles_shown() {
+                    format!("Opened {}", self.path)
+                } else {
+                    format!("Opened {}. {CIRCULAR_WARNING}", self.path)
+                });
             }
             Err(e) => self.status = Some(format!("Open failed: {e}")),
         }
@@ -3670,8 +3765,10 @@ impl App {
         };
         if text.trim().eq_ignore_ascii_case("clear") {
             for r in top..=bottom {
-                self.pkg.workbook.sheets[s].set_row_hidden(r, false);
+                self.pkg.workbook.sheets[s].set_row_filtered(r, false);
             }
+            // SUBTOTAL(1..11) counts rows by whether a filter hid them.
+            self.engine.recalc_all(&mut self.pkg.workbook);
             self.clamp_cursor();
             self.modified = true;
             self.status = Some("Filter cleared".into());
@@ -3694,8 +3791,9 @@ impl App {
             if hide {
                 hidden += 1;
             }
-            self.pkg.workbook.sheets[s].set_row_hidden(r, hide);
+            self.pkg.workbook.sheets[s].set_row_filtered(r, hide);
         }
+        self.engine.recalc_all(&mut self.pkg.workbook);
         self.clamp_cursor();
         self.modified = true;
         self.status = Some(format!("Filtered by column: {hidden} rows hidden"));
@@ -3817,45 +3915,11 @@ impl App {
     }
 
     /// Ctrl-D / Ctrl-R: fill the selection from its first row/column,
-    /// translating relative refs — or, on a single cell, pull from the
-    /// neighbor above/left.
+    /// translating relative refs — or, when the selection is one row high
+    /// (Ctrl-D) or one column wide (Ctrl-R), a single cell included, pull
+    /// each cell from the row above / the column to the left.
     fn fill(&mut self, down: bool) {
-        let (r1, c1, r2, c2) = self.selection();
-        let single = r1 == r2 && c1 == c2;
-        let mut changes = Vec::new();
-        let copy_from = |sr: u32, sc: u32, tr: u32, tc: u32, changes: &mut Vec<_>| {
-            let mut cell = self.pkg.workbook.sheets[self.sheet]
-                .cell(sr, sc)
-                .cloned()
-                .unwrap_or_default();
-            if let Some(f) = &cell.formula {
-                if let Some(t) = translate_formula(f, tr as i64 - sr as i64, tc as i64 - sc as i64)
-                {
-                    cell.formula = Some(t);
-                }
-            }
-            changes.push((tr, tc, cell));
-        };
-        if single {
-            let (r, c) = self.cur;
-            if down && r > 0 {
-                copy_from(r - 1, c, r, c, &mut changes);
-            } else if !down && c > 0 {
-                copy_from(r, c - 1, r, c, &mut changes);
-            }
-        } else if down {
-            for c in c1..=c2 {
-                for r in r1 + 1..=r2 {
-                    copy_from(r1, c, r, c, &mut changes);
-                }
-            }
-        } else {
-            for r in r1..=r2 {
-                for c in c1 + 1..=c2 {
-                    copy_from(r, c1, r, c, &mut changes);
-                }
-            }
-        }
+        let changes = fill_changes(self.sheet(), self.selection(), down);
         if changes.is_empty() {
             return;
         }
@@ -3914,7 +3978,10 @@ impl App {
             self.status = Some("Nothing to find".to_string());
             return;
         }
-        let changes = replace_all_in_sheet(self.sheet(), find, with);
+        let wb = &mut self.pkg.workbook;
+        let ctx = entry_ctx(wb, now_serial());
+        let changes =
+            replace_all_in_sheet(&wb.sheets[self.sheet], &mut wb.styles, &ctx, find, with);
         let n = changes.len();
         if n == 0 {
             self.status = Some(format!("Not found: {find}"));
@@ -4792,6 +4859,10 @@ fn draw(app: &mut App, f: &mut Frame) {
                     Some(cl) if formula_view && cl.formula.is_some() => {
                         format!("={}", cl.formula.as_ref().unwrap())
                     }
+                    // A date/time it cannot show fills the cell with `#`.
+                    Some(cl) if date_unrepresentable(&xf, &cl.value, date1904) => {
+                        "#".repeat(w as usize)
+                    }
                     Some(cl) => format_with(&xf, &cl.value, date1904),
                     None => String::new(),
                 }
@@ -4943,6 +5014,14 @@ fn draw(app: &mut App, f: &mut Frame) {
         tab_spans_ui.push(RSpan::styled(label, style));
         tab_spans_ui.push(RSpan::raw(" "));
         x += w + 1;
+    }
+    // Excel's persistent status-bar note while any circle exists (none with
+    // iterative calculation on).
+    if let Some(first) = app.circular_refs().first().filter(|_| app.circles_shown()) {
+        tab_spans_ui.push(RSpan::styled(
+            format!(" Circular References: {first} "),
+            Style::new().fg(Color::Black).bg(Color::Yellow),
+        ));
     }
     let mut tabs_line_ui = RLine::from(tab_spans_ui);
     if let Some(stats) = app.selection_stats() {
@@ -5758,14 +5837,33 @@ fn draw_comments_panel(app: &App, f: &mut Frame, area: Rect) {
 // Events
 // ---------------------------------------------------------------------------
 
+/// Run one control verb. A circle it made is announced on its own, or
+/// after the status the verb set, never appended to an earlier action's
+/// leftover status; a verb that says nothing leaves that status alone.
+fn run_control(
+    app: &mut App,
+    verb: &str,
+    args: &ctlcore::json::Json,
+) -> Result<ctlcore::json::Json, String> {
+    let before = app.status.take();
+    let result = control::dispatch(app, verb, args);
+    if app.status.is_none() && !app.circle_warning_pending {
+        app.status = before;
+    }
+    app.flush_circle_warning();
+    result
+}
+
 /// Returns true when the app should exit.
 fn handle_event(app: &mut App, ev: Event) -> bool {
-    match ev {
+    let quit = match ev {
         Event::Key(key) => handle_key(app, key),
         Event::Mouse(m) => handle_mouse(app, m),
         Event::Resize(_, _) => false,
         _ => false,
-    }
+    };
+    app.flush_circle_warning();
+    quit
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) -> bool {
@@ -6416,7 +6514,7 @@ fn run_tui(
                         quit = true;
                     }
                 }
-                Msg::Ctl(req) => match control::dispatch(&mut app, &req.verb, &req.args) {
+                Msg::Ctl(req) => match run_control(&mut app, &req.verb, &req.args) {
                     Ok(result) => req.reply_ok(result),
                     Err(e) => req.reply_err(e),
                 },
@@ -6446,6 +6544,7 @@ fn run_tui(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gridcore::edit::parse_input;
     use gridcore::xlsx::save_xlsx;
 
     #[test]
@@ -7270,11 +7369,25 @@ mod tests {
         assert!(!sh.row_hidden(1)); // 300
         assert!(sh.row_hidden(2)); // 50 hidden
         assert!(!sh.row_hidden(3)); // 900
+        // #678: the filter's rows are filter-hidden, so SUBTOTAL(9) leaves
+        // them out while a row hidden by hand still counts.
+        assert!(sh.row_filtered(2));
+        app.pkg.workbook.sheets[0].set_row_hidden(3, true);
+        app.pkg.workbook.sheets[0].set_cell(5, 1, Cell::formula("SUBTOTAL(9,B2:B4)"));
+        app.pkg.workbook.sheets[0].set_cell(6, 1, Cell::formula("SUBTOTAL(109,B2:B4)"));
+        app.rebuild_engine();
+        let v = |app: &App, r: u32| app.sheet().cell(r, 1).unwrap().value.clone();
+        use gridcore::sheet::CellValue;
+        assert_eq!(v(&app, 5), CellValue::Number(1200.0));
+        assert_eq!(v(&app, 6), CellValue::Number(300.0));
+        app.pkg.workbook.sheets[0].set_row_hidden(3, false);
 
-        // Clear unhides everything.
+        // Clear unhides everything, and the rows are no longer filtered.
         app.commit_filter("clear");
         let sh = app.sheet();
         assert!(!sh.row_hidden(2));
+        assert!(sh.filtered_rows.is_empty());
+        assert_eq!(v(&app, 5), CellValue::Number(1250.0));
 
         // Text equals filter on the Item column.
         app.cur = (1, 0);
@@ -7350,6 +7463,221 @@ mod tests {
         app.anchor = None;
         app.merge_toggle();
         assert!(app.pkg.workbook.sheets[0].merges.is_empty());
+    }
+
+    #[test]
+    fn circular_reference_warns_once_and_shows_in_the_footer() {
+        // #660: a new circle warns once (Excel's message); while any circle
+        // exists the footer names one, on the active sheet first.
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.apply_on(0, vec![(0, 4, parse_input("=E1+1"))]);
+        app.flush_circle_warning();
+        assert_eq!(app.status.as_deref(), Some(CIRCULAR_WARNING));
+        assert_eq!(
+            app.sheet().cell(0, 4).unwrap().value,
+            CellValue::Number(0.0)
+        );
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        let text = format!("{:?}", term.backend().buffer());
+        assert!(text.contains("Circular References: E1"), "{text}");
+
+        // An edit that makes no new circle does not warn again.
+        app.status = None;
+        app.apply_on(0, vec![(3, 0, parse_input("7"))]);
+        app.apply_on(0, vec![(0, 7, parse_input("=E1+5"))]);
+        app.flush_circle_warning();
+        assert_eq!(app.status, None);
+        assert_eq!(app.circular_refs(), vec!["E1".to_string()]);
+
+        // A circle on another sheet is named with its sheet, after the
+        // active sheet's.
+        app.pkg.workbook.sheets.push(Sheet {
+            name: "My Data".into(),
+            ..Sheet::default()
+        });
+        app.rebuild_engine();
+        app.apply_on(1, vec![(0, 0, parse_input("=A1*2"))]);
+        app.flush_circle_warning();
+        assert_eq!(app.status.as_deref(), Some(CIRCULAR_WARNING));
+        assert_eq!(
+            app.circular_refs(),
+            vec!["E1".to_string(), "'My Data'!A1".to_string()]
+        );
+        // Breaking E1's circle leaves the other sheet's in the footer.
+        app.apply_on(0, vec![(0, 4, parse_input("1"))]);
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        let text = format!("{:?}", term.backend().buffer());
+        assert!(text.contains("Circular References: 'My Data'!A1"), "{text}");
+        app.apply_on(1, vec![(0, 0, parse_input("2"))]);
+        assert!(app.circular_refs().is_empty());
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        let text = format!("{:?}", term.backend().buffer());
+        assert!(!text.contains("Circular References"), "{text}");
+    }
+
+    #[test]
+    fn opening_a_workbook_with_a_circle_reports_it() {
+        // #660: an opened file's circle is known at once (footer,
+        // wb.path, the open warning) without recalculating it, and moving it
+        // by a structural edit does not warn again.
+        use gridcore::xlsx::{load_xlsx, save_xlsx};
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].set_cell(
+            0,
+            4,
+            Cell {
+                value: CellValue::Number(7.0),
+                ..Cell::formula("E1+1")
+            },
+        );
+        let pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let mut app = App::new(pkg, "circle.xlsx");
+        app.os_clip = None;
+        assert_eq!(app.status.as_deref(), Some(CIRCULAR_WARNING));
+        assert_eq!(app.circular_refs(), vec!["E1".to_string()]);
+        // Cached, not recalculated.
+        assert_eq!(
+            app.sheet().cell(0, 4).unwrap().value,
+            CellValue::Number(7.0)
+        );
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        let text = format!("{:?}", term.backend().buffer());
+        assert!(text.contains("Circular References: E1"), "{text}");
+
+        // Insert a row above the circle: it moves to E2, no new warning.
+        app.status = None;
+        app.cur = (0, 0);
+        app.anchor = None;
+        app.row_op(true);
+        app.flush_circle_warning();
+        assert_eq!(app.status.as_deref(), Some("Inserted 1 row"));
+        assert_eq!(app.circular_refs(), vec!["E2".to_string()]);
+    }
+
+    #[test]
+    fn a_structural_edit_that_makes_a_circle_warns_after_its_own_status() {
+        // #660: renaming a sheet can close a circle (Sheet1!A1 = Budget!A1,
+        // and the sheet renamed to Budget reads Sheet1!A1). The warning joins
+        // the rename's own status instead of being overwritten by it.
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.apply_on(0, vec![(0, 0, parse_input("=Budget!A1"))]);
+        app.open_prompt(PromptKind::AddSheet);
+        app.prompt.as_mut().unwrap().text = "Data".to_string();
+        app.commit_prompt();
+        let data = app.sheet;
+        app.apply_on(data, vec![(0, 0, parse_input("=Sheet1!A1"))]);
+        assert!(app.circular_refs().is_empty());
+        app.status = None;
+        app.open_prompt(PromptKind::RenameSheet);
+        app.prompt.as_mut().unwrap().text = "Budget".to_string();
+        app.commit_prompt();
+        app.flush_circle_warning();
+        assert_eq!(
+            app.status.as_deref(),
+            Some(format!("Renamed sheet to Budget. {CIRCULAR_WARNING}").as_str())
+        );
+        assert_eq!(app.circular_refs().len(), 2);
+    }
+
+    #[test]
+    fn a_paste_that_makes_a_circle_warns_after_pasted() {
+        // #660: cutting A1 (=B1) and pasting it into B1 makes B1 read
+        // itself; the warning follows the paste's own status.
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.apply_on(0, vec![(0, 0, parse_input("=B1"))]);
+        app.flush_circle_warning();
+        app.cur = (0, 0);
+        app.anchor = None;
+        app.copy(true);
+        app.cur = (0, 1);
+        app.paste();
+        app.flush_circle_warning();
+        assert_eq!(app.circular_refs(), vec!["B1".to_string()]);
+        assert_eq!(
+            app.status.as_deref(),
+            Some(format!("Pasted. {CIRCULAR_WARNING}").as_str())
+        );
+    }
+
+    #[test]
+    fn a_control_verbs_circle_warning_ignores_stale_status() {
+        // #660: a verb that makes a circle shows the warning alone, not
+        // appended to an earlier action's status; a verb that says nothing
+        // leaves that status as it was.
+        use ctlcore::json::Json;
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        let set = |app: &mut App, r: &str, t: &str| {
+            run_control(
+                app,
+                "cell.set",
+                &Json::obj(vec![
+                    ("ref", Json::Str(r.into())),
+                    ("text", Json::Str(t.into())),
+                ]),
+            )
+            .unwrap();
+        };
+        app.status = Some("Saved report.xlsx".into());
+        set(&mut app, "A1", "5");
+        assert_eq!(app.status.as_deref(), Some("Saved report.xlsx"));
+        set(&mut app, "E1", "=E1+1");
+        assert_eq!(app.status.as_deref(), Some(CIRCULAR_WARNING));
+    }
+
+    #[test]
+    fn iterative_workbooks_do_not_surface_their_circles() {
+        // #660: with iterative calculation on, Excel shows neither the
+        // warning nor the status-bar note; the engine still knows the circle.
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut pkg = new_xlsx();
+        pkg.workbook.iterate = Some((100, 0.001));
+        pkg.workbook.sheets[0].set_cell(0, 3, Cell::formula("D1/2+5"));
+        let mut app = App::new(pkg, "iter.xlsx");
+        app.os_clip = None;
+        assert_eq!(app.status, None);
+        assert_eq!(app.circular_refs(), vec!["D1".to_string()]);
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        let text = format!("{:?}", term.backend().buffer());
+        assert!(!text.contains("Circular References"), "{text}");
+        // A new circle by a cell edit does not warn either.
+        app.apply_on(0, vec![(0, 4, parse_input("=E1+1"))]);
+        app.flush_circle_warning();
+        assert_eq!(app.status, None);
+    }
+
+    #[test]
+    fn verify_compares_database_functions() {
+        // #677: D-functions always recalculate but are deterministic, so
+        // --verify compares them instead of skipping them as volatile.
+        let mut pkg = new_xlsx();
+        {
+            let sh = &mut pkg.workbook.sheets[0];
+            sh.set_cell(0, 0, Cell::text("Amount"));
+            sh.set_cell(1, 0, Cell::number(5.0));
+            sh.set_cell(2, 0, Cell::number(7.0));
+            sh.set_cell(0, 2, Cell::text("Amount"));
+            sh.set_cell(1, 2, Cell::text(">6"));
+            sh.set_cell(
+                0,
+                4,
+                Cell {
+                    value: CellValue::Number(7.0),
+                    ..Cell::formula("DSUM(A1:A3,\"Amount\",C1:C2)")
+                },
+            );
+        }
+        let (_, stats) = verify_report(&pkg, "d.xlsx");
+        assert_eq!(stats.volatile, 0);
+        assert_eq!((stats.total, stats.compared, stats.matched), (1, 1, 1));
     }
 
     #[test]

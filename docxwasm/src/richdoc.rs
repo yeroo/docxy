@@ -10,8 +10,9 @@
 //!   page converts between the browser's UTF-16 offsets and these scalar
 //!   offsets;
 //! - everything else is **atomic** (`contenteditable=false` on the page) with
-//!   the width the editor gives it — one for a tab or break, zero for fields,
-//!   tracked changes, drawings and other anchors the editor cannot enter.
+//!   the width the editor gives it — one for a tab, a break or a field that
+//!   shows a result (a field is edited as one unit), zero for tracked changes,
+//!   drawings, an empty field and other anchors the editor cannot enter.
 //!
 //! Widths come from [`docxcore::editor::inline_len`] (and paragraph lengths
 //! from `para_text_len`), the editor's own functions, so the page and the
@@ -325,7 +326,18 @@ impl SegWriter<'_, '_> {
                 }
                 self.atom("rev", width, &text, &extra);
             }
-            Inline::Field { text, .. } => self.atom("field", width, text, ""),
+            // Drawn in its result's formatting (the same keys a text run has).
+            Inline::Field { raw, text } => {
+                let direct = docxcore::load::field_result_props(raw);
+                let eff = self.ctx.styles.effective_run(
+                    self.para_style,
+                    direct.style_id.as_deref(),
+                    &direct,
+                );
+                let mut props = String::new();
+                push_props(&mut props, &eff, &direct);
+                self.atom("field", width, text, &props);
+            }
             Inline::Equation { text, .. } => self.atom("eq", width, text, ""),
             Inline::SmartArt { text, .. } => self.atom("art", width, &text.join(" · "), ""),
             Inline::Chart { chart, .. } => {

@@ -95,8 +95,9 @@ pub struct Hyperlink {
     pub runs: Vec<Run>,
     /// Full child sequence for hyperlinks that contain revisions or other
     /// non-run markup (`runs` is then empty). Its plain runs, tabs and breaks
-    /// are editable like those of a simple link's `runs`; its other children
-    /// stay zero-width anchors.
+    /// are editable like those of a simple link's `runs`, a field that shows a
+    /// result takes one offset (it is edited as one unit), and its other
+    /// children stay zero-width anchors.
     pub content: Vec<Inline>,
     /// Original complete hyperlink XML for byte-faithful untouched saves.
     pub raw: Option<String>,
@@ -108,25 +109,30 @@ pub struct Hyperlink {
 }
 
 impl Hyperlink {
-    /// Visible runs in source order, including runs nested in revision wrappers.
-    pub fn visible_runs(&self) -> Vec<&Run> {
-        fn collect<'a>(content: &'a [Inline], out: &mut Vec<&'a Run>) {
+    /// The link's visible text in source order, each piece with its run
+    /// formatting: its runs, then its content's runs, nested links, runs in
+    /// revision wrappers, and fields' results (a TOC entry's PAGEREF page
+    /// number is a field in the link), whose formatting is their result's
+    /// (see [`crate::load::field_result_props`]).
+    pub fn visible_pieces(&self) -> Vec<(&str, RunProps)> {
+        fn collect<'a>(runs: &'a [Run], content: &'a [Inline], out: &mut Vec<(&'a str, RunProps)>) {
+            out.extend(runs.iter().map(|r| (r.text.as_str(), r.props.clone())));
             for inline in content {
                 match inline {
-                    Inline::Run(run) => out.push(run),
-                    Inline::Hyperlink(link) => {
-                        out.extend(link.runs.iter());
-                        collect(&link.content, out);
+                    Inline::Run(run) => out.push((run.text.as_str(), run.props.clone())),
+                    Inline::Hyperlink(link) => collect(&link.runs, &link.content, out),
+                    Inline::Revision { content, .. } => collect(&[], content, out),
+                    Inline::Field { raw, text } => {
+                        out.push((text.as_str(), crate::load::field_result_props(raw)))
                     }
-                    Inline::Revision { content, .. } => collect(content, out),
                     _ => {}
                 }
             }
         }
 
-        let mut runs = self.runs.iter().collect::<Vec<_>>();
-        collect(&self.content, &mut runs);
-        runs
+        let mut out = Vec::new();
+        collect(&self.runs, &self.content, &mut out);
+        out
     }
 }
 
@@ -203,10 +209,12 @@ pub enum Inline {
         raw: String,
         blocks: Vec<Block>,
     },
-    /// A field (`<w:fldSimple>`, e.g. CREATEDATE/PAGE/REF). `raw` is the original
-    /// XML (preserved verbatim for lossless save); `text` is the field's cached
-    /// result, rendered as inline body text so the value (a date, a number, …) is
-    /// visible instead of vanishing.
+    /// A field, e.g. CREATEDATE/PAGE/REF: a `<w:fldSimple>`, or a complex field
+    /// (`w:fldChar` begin … end) whose runs all sit in one inline container, or a
+    /// `w:sym` symbol run. `raw` is the original XML (preserved verbatim for
+    /// lossless save; for a complex field, every run from begin to end); `text`
+    /// is the field's cached result, rendered as inline body text so the value
+    /// (a date, a number, …) is visible instead of vanishing.
     Field {
         raw: String,
         text: String,

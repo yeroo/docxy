@@ -37,6 +37,9 @@ mod recover;
 mod ribbon_export;
 #[cfg(test)]
 mod sect_pr_tests;
+#[cfg(test)]
+mod sheet_entry_tests;
+mod sheet_ribbon;
 mod style_gallery;
 mod tabstrip;
 use project::*;
@@ -423,6 +426,16 @@ struct SheetView {
     /// Caret position within `editing`, as a char index (0..=len). Only
     /// meaningful while `editing` is `Some`.
     edit_caret: usize,
+    /// Excel's Enter mode (typing over a cell: the arrows commit and move) or
+    /// Edit mode (F2, a double-click, the fx bar: the arrows move the caret).
+    edit_mode: EditMode,
+    /// Insert toggled overtype for this editor session.
+    edit_overtype: bool,
+    /// The buffer as the editor opened — Ctrl+Z while editing returns to it.
+    edit_start: String,
+    /// The last formatting change, for F4 (repeat). A resolved setter
+    /// (bold ON), so repeating applies it rather than flipping it.
+    last_format: Option<FormatFn>,
     /// The recalc engine, indexed over the workbook's formulas, so an edit
     /// re-evaluates only the affected cells.
     engine: gridcore::engine::Engine,
@@ -442,6 +455,9 @@ struct SheetView {
     /// count each render; visible rows are re-measured every layout, so height
     /// changes take effect without an explicit reset.
     vlist: ListState,
+    /// Why the last commit was refused (an entry over the cell limit); the
+    /// host shows it in the status bar.
+    entry_error: Option<String>,
     /// Leftmost visible column (horizontal scroll offset). Columns virtualize by
     /// offset — rendered `col0..=cend` — so columns past the viewport are
     /// reachable (raw gpui can't wrap the virtualized row list in an h-scroller).
@@ -454,6 +470,45 @@ struct SheetView {
     /// next render. Only the render pass knows how wide the grid is, so
     /// `reveal_range` can't work out a rightwards scroll itself.
     reveal_col: Option<u32>,
+}
+
+/// A formatting change to one cell's `Xf`, kept for F4 to repeat.
+type FormatFn = std::rc::Rc<dyn Fn(&mut gridcore::sheet::Xf)>;
+
+/// Which of Excel's two cell-editor modes an editor is in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum EditMode {
+    /// Opened by typing: Left/Right commit and move (unless it's a formula).
+    #[default]
+    Enter,
+    /// Opened with F2, a double-click or the fx bar: Left/Right move the caret.
+    Edit,
+}
+
+/// The setter a number-format choice applies: `code`, or General for "".
+/// Through `Xf::set_code`, so the classification the entry rules and the
+/// `####` check read moves with the code.
+fn numfmt_setter(code: &str) -> FormatFn {
+    let code = (!code.is_empty()).then(|| code.to_string());
+    std::rc::Rc::new(move |xf: &mut gridcore::sheet::Xf| xf.set_code(code.clone()))
+}
+
+/// The suite's clock as a 1900-system serial (UTC, like xlsxy's): what
+/// `TODAY()`/`NOW()` read and what a yearless typed date (`3/4`) takes its
+/// year from.
+fn now_serial() -> Option<f64> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .ok()?
+        .as_secs_f64();
+    Some(secs / 86_400.0 + 25_569.0)
+}
+
+/// The recalc engine for a workbook, with the suite's clock.
+fn sheet_engine(wb: &gridcore::sheet::Workbook) -> gridcore::engine::Engine {
+    let mut engine = gridcore::engine::Engine::new(wb);
+    engine.clock = now_serial();
+    engine
 }
 
 /// A UI-authored chart: which sheet it floats over, its cell anchor (for save),
@@ -611,12 +666,13 @@ fn bar_target(act: SheetAct) -> Option<RefTarget> {
 /// Almost everything here targets cells, including the ones that only look
 /// sheet-wide: Freeze Panes freezes AT the selected cell, the comment steps
 /// move the selection, and the colour pickers paint it. The exceptions are the
-/// three that never touch it — protection and outlining are properties of the
-/// whole sheet, and `Todo` does nothing at all.
+/// four that never touch it — protection and outlining are properties of the
+/// whole sheet, the Number format combo only opens or closes its strip (a
+/// format picked there is what acts on cells), and `Todo` does nothing at all.
 fn act_targets_cells(act: SheetAct) -> bool {
     !matches!(
         act,
-        SheetAct::ProtectSheet | SheetAct::Outline | SheetAct::Todo
+        SheetAct::ProtectSheet | SheetAct::Outline | SheetAct::NumberFormatMenu | SheetAct::Todo
     )
 }
 
@@ -818,13 +874,17 @@ fn may_arm_fill(already_filling: bool, gesture_in_flight: bool) -> bool {
 /// the state-changing path used by [`Docxy::sheet_fill_start`], kept free of a
 /// gpui context so the regression test can observe the same transition the
 /// production handler uses.
+///
+/// A protected sheet refuses too (#699): the fill writes cells, and every other
+/// cell-writing command (`sheet_clear`, `sheet_paste`, …) already refuses there.
 fn arm_fill(
     fill: &mut Option<FillDrag>,
     src: Option<(u32, u32, u32, u32)>,
     gesture_in_flight: bool,
     tab_more_open: bool,
+    protected: bool,
 ) -> bool {
-    if tab_more_open || !may_arm_fill(fill.is_some(), gesture_in_flight) {
+    if tab_more_open || protected || !may_arm_fill(fill.is_some(), gesture_in_flight) {
         return false;
     }
     let Some(src) = src else { return false };
@@ -833,6 +893,62 @@ fn arm_fill(
         to: (src.2, src.3),
     });
     true
+}
+
+/// Whether pointing (a reference field or a formula picking cells) hides the
+/// fill handle: in point mode a drag off the selection's corner sweeps a range.
+fn fill_handle_pointing(range_field: bool, formula_pick: bool) -> bool {
+    range_field || formula_pick
+}
+
+/// Why the fill handle is not drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandleHidden {
+    /// A cell edit is open.
+    Editing,
+    /// A reference field or a formula is pointing at cells.
+    Pointing,
+    /// A chart holds the selection.
+    ChartSelected,
+}
+
+impl HandleHidden {
+    fn why(self) -> &'static str {
+        match self {
+            HandleHidden::Editing => "a cell is being edited",
+            HandleHidden::Pointing => "a reference is being pointed at",
+            HandleHidden::ChartSelected => "a chart is selected",
+        }
+    }
+
+    /// Whether a plain click on a cell ends it. A click takes the selection
+    /// back from a chart; while a cell is being edited or a reference is being
+    /// pointed at, a click lands in that edit or reference instead.
+    fn cleared_by_a_click(self) -> bool {
+        matches!(self, HandleHidden::ChartSelected)
+    }
+}
+
+/// Why the fill handle is not drawn, or `None` when it is — the grid's own
+/// condition (`editing`, `handle_hidden`, `sel_hidden`), stated once so the
+/// harness's `fill-drag` refuses exactly when there is no handle to press
+/// (#699). A handle whose corner sits under a chart card is hidden by layout,
+/// which only the render pass knows; that case is not modelled here.
+fn fill_handle_hidden(
+    editing: bool,
+    range_field: bool,
+    formula_pick: bool,
+    chart_sel: Option<usize>,
+) -> Option<HandleHidden> {
+    if editing {
+        Some(HandleHidden::Editing)
+    } else if fill_handle_pointing(range_field, formula_pick) {
+        Some(HandleHidden::Pointing)
+    } else if !cell_selection_shown(chart_sel) {
+        Some(HandleHidden::ChartSelected)
+    } else {
+        None
+    }
 }
 
 /// The dominant-axis fill box for `src` dragged to `to`: extend rows (down) or
@@ -854,13 +970,94 @@ fn fill_box(src: (u32, u32, u32, u32), to: (u32, u32)) -> (u32, u32, u32, u32) {
 #[derive(Clone)]
 struct GridClip {
     cells: Vec<Vec<gridcore::sheet::Cell>>,
+    /// The TSV this copy put on the clipboard. While the clipboard still holds
+    /// it, a paste uses `cells` (formats and formulas intact); once something
+    /// else has been copied, the clipboard's text wins.
+    text: String,
+}
+
+/// What a read of the clipboard found (#699).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ClipRead {
+    /// No item at all: nothing was ever copied, or the clipboard could not be
+    /// read. Nothing says another copy happened.
+    Nothing,
+    /// An item with no text in it: an image, or an empty copy (gpui's
+    /// `ClipboardItem::text` is `None` for both). Something was copied.
+    NotText,
+    Text(String),
+}
+
+impl ClipRead {
+    /// From the OS read: the item, if any, and its text.
+    fn from_item(item: Option<Option<String>>) -> Self {
+        match item {
+            None => ClipRead::Nothing,
+            Some(None) => ClipRead::NotText,
+            Some(Some(text)) if text.is_empty() => ClipRead::NotText,
+            Some(Some(text)) => ClipRead::Text(text),
+        }
+    }
+
+    fn text(&self) -> Option<&str> {
+        match self {
+            ClipRead::Text(text) => Some(text),
+            _ => None,
+        }
+    }
+}
+
+/// Whether a sheet paste uses the grid clip recorded as `recorded` rather than
+/// what the clipboard holds `now` (#699). The grid clip is ours only while the
+/// clipboard still holds the text we put there: another app's copy replaces
+/// it, and pasting our older cells then would paste the wrong thing, whether
+/// that copy was text or an image. Only a clipboard with no item at all
+/// (`Nothing`: never copied to, or unreadable) cannot say it changed, so the
+/// clip stands. Line endings are compared loosely because the OS may hand CRLF
+/// back.
+fn grid_paste_uses_clip(recorded: &str, now: &ClipRead) -> bool {
+    match now {
+        ClipRead::Nothing => true,
+        ClipRead::NotText => false,
+        ClipRead::Text(now) => now.replace("\r\n", "\n") == recorded.replace("\r\n", "\n"),
+    }
+}
+
+/// The text clipboard the app reads and writes (#699). A normal instance uses
+/// the OS clipboard; a harness instance keeps a private one, so a UI test can
+/// neither read nor overwrite what the person at the machine copied, and
+/// starts from an empty clipboard whatever they have on theirs. The private one
+/// reads as the OS one does: an empty write is an item with no text.
+#[derive(Default)]
+struct ClipboardStore {
+    private: Option<String>,
+}
+
+impl ClipboardStore {
+    fn write(&mut self, harness: bool, text: String, os: impl FnOnce(String)) {
+        if harness {
+            self.private = Some(text);
+        } else {
+            os(text);
+        }
+    }
+
+    /// `os` reads the OS clipboard: `None` without an item, else the item's
+    /// text (`None` when it has none).
+    fn read(&self, harness: bool, os: impl FnOnce() -> Option<Option<String>>) -> ClipRead {
+        ClipRead::from_item(if harness {
+            self.private.clone().map(Some)
+        } else {
+            os()
+        })
+    }
 }
 
 /// A spreadsheet ribbon command (the sheet counterpart to the document `Act`).
 /// Mirrors Excel's Home tab; `Todo` is an inert placeholder for commands whose
 /// engine support isn't wired yet (they render but do nothing), like Word's
 /// dialog-launcher stubs.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SheetAct {
     Cut,
     Copy,
@@ -906,6 +1103,8 @@ enum SheetAct {
     ProtectSheet,
     Subtotal,
     Outline,
+    /// The Number group's format combo: opens or closes the format strip.
+    NumberFormatMenu,
     Todo,
 }
 
@@ -974,20 +1173,27 @@ impl SheetView {
         self.editing = None;
         self.edit_seed = None;
         self.edit_origin = None;
+        self.edit_overtype = false;
     }
 
+    /// Open the editor on the selected cell. `Some(buf)` starts a fresh entry
+    /// in Enter mode (typing, Backspace); `None` edits the cell's content in
+    /// Edit mode (F2, double-click, the fx bar).
     fn begin_cell_edit(&mut self, initial: Option<String>) {
         let (r, c) = self.sel;
-        let (buf, seed) = match initial {
-            Some(buf) => (buf, None),
+        let (buf, seed, mode) = match initial {
+            Some(buf) => (buf, None, EditMode::Enter),
             None => {
                 let seed = self.edit_string(r, c);
-                (seed.clone(), Some(seed))
+                (seed.clone(), Some(seed), EditMode::Edit)
             }
         };
+        self.edit_start = buf.clone();
         self.editing = Some(buf);
         self.edit_seed = seed;
         self.edit_origin = Some((self.active, r, c));
+        self.edit_mode = mode;
+        self.edit_overtype = false;
     }
 
     fn edit_untouched(&self) -> bool {
@@ -1007,10 +1213,13 @@ impl SheetView {
     }
 
     /// Commit the cell buffer without moving the selection, including undo/recalc.
+    /// An entry the cell cannot hold (over 32,767 characters) is refused: the
+    /// editor stays open with its text and [`SheetView::entry_error`] says why.
     fn commit_edit(&mut self) -> bool {
+        self.entry_error = None;
         let untouched = self.edit_untouched();
         debug_assert!(self.editing.is_none() || self.edit_origin.is_some());
-        let Some(buf) = self.editing.take() else {
+        let Some(buf) = self.editing.as_deref() else {
             return false;
         };
         // Every production editor is opened by `begin_cell_edit`. Keep a safe
@@ -1018,26 +1227,430 @@ impl SheetView {
         let origin = self
             .edit_origin
             .unwrap_or((self.active, self.sel.0, self.sel.1));
-        self.end_cell_edit();
         // A seeded editor left unchanged must not reparse text such as "007".
         if untouched {
+            self.end_cell_edit();
+            return false;
+        }
+        if let Err(e) = gridcore::entry::check_len(buf) {
+            self.entry_error = Some(e.to_string());
+            return false;
+        }
+        let buf = self.editing.take().unwrap_or_default();
+        self.end_cell_edit();
+        self.push_undo();
+        let (s, r, c) = origin;
+        let today = self.engine.clock;
+        if let Ok(cell) = gridcore::entry::entry_cell(&mut self.pkg.workbook, s, r, c, &buf, today)
+        {
+            self.engine.set_cell(&mut self.pkg.workbook, origin, cell);
+        }
+        true
+    }
+
+    /// Type `text` as an entry into (row, col) of the active sheet, the way a
+    /// committed editor would, without touching the undo stack (the caller
+    /// snapshots). False when the cell cannot hold it.
+    fn enter_text_at(&mut self, row: u32, col: u32, text: &str) -> bool {
+        let s = self.active;
+        let today = self.engine.clock;
+        match gridcore::entry::entry_cell(&mut self.pkg.workbook, s, row, col, text, today) {
+            Ok(cell) => {
+                self.engine
+                    .set_cell(&mut self.pkg.workbook, (s, row, col), cell);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    // ---- Excel's editor keys (#662) and entry shortcuts (#663) ----
+
+    /// F2 while editing: switch between Enter and Edit mode, keeping the text.
+    fn edit_toggle_mode(&mut self) {
+        self.edit_mode = match self.edit_mode {
+            EditMode::Enter => EditMode::Edit,
+            EditMode::Edit => EditMode::Enter,
+        };
+    }
+
+    /// Do Left/Right move the caret (rather than commit and move)? In Edit
+    /// mode always; in Enter mode only while a formula is being typed, whose
+    /// arrow keys are Excel's pointing keys (not modeled) and must not commit
+    /// a half-typed formula.
+    fn edit_arrows_move_caret(&self) -> bool {
+        if self.edit_mode == EditMode::Edit {
+            return true;
+        }
+        let buf = self.editing.as_deref().unwrap_or("");
+        buf.starts_with('=')
+            || (buf.starts_with(['+', '-', '@'])
+                && gridcore::entry::parse_entry(
+                    buf,
+                    &gridcore::sheet::Xf::default(),
+                    &gridcore::entry::EntryCtx::default(),
+                )
+                .is_ok_and(|e| e.cell.formula.is_some()))
+    }
+
+    /// Type `s` at the caret, over the next character in overtype mode.
+    fn edit_type(&mut self, s: &str) {
+        if self.edit_overtype {
+            for _ in s.chars() {
+                self.edit_delete();
+            }
+        }
+        self.edit_insert(s);
+    }
+
+    /// Ctrl+Left / Ctrl+Right: to the start of the previous / next word.
+    fn edit_word_move(&mut self, forward: bool) {
+        let chars: Vec<char> = self.editing.as_deref().unwrap_or("").chars().collect();
+        let word = |c: char| c.is_alphanumeric() || c == '_';
+        let mut i = self.edit_caret.min(chars.len());
+        if forward {
+            while i < chars.len() && word(chars[i]) {
+                i += 1;
+            }
+            while i < chars.len() && !word(chars[i]) {
+                i += 1;
+            }
+        } else {
+            while i > 0 && !word(chars[i - 1]) {
+                i -= 1;
+            }
+            while i > 0 && word(chars[i - 1]) {
+                i -= 1;
+            }
+        }
+        self.edit_caret = i;
+    }
+
+    /// Ctrl+Delete: delete from the caret to the end of the text.
+    fn edit_delete_to_end(&mut self) {
+        let caret = self.edit_caret;
+        if let Some(buf) = self.editing.as_mut() {
+            let at = char_to_byte(buf, caret);
+            buf.truncate(at);
+        }
+    }
+
+    /// Ctrl+Z while editing: undo the typing, back to the text the editor
+    /// opened with; the editor stays open and the workbook's undo is untouched.
+    fn edit_revert(&mut self) {
+        if self.editing.is_some() {
+            self.editing = Some(self.edit_start.clone());
+            self.edit_caret_to_end();
+        }
+    }
+
+    /// The entry chords (#663) on an open editor: Ctrl+' / Ctrl+Shift+" (the
+    /// harness spells the latter `"`) and Ctrl+; / Ctrl+Shift+; (or `:`).
+    /// `opened` says the key handler has just opened the editor for the
+    /// chord (through `sheet_begin_edit`, which gives up bars and fields and
+    /// honours protection): Ctrl+' then edits in Edit mode, as F2 would.
+    fn entry_chord(&mut self, key: &str, shift: bool, now: f64, opened: bool) {
+        if self.editing.is_none() {
+            return;
+        }
+        match key {
+            "'" | "\"" => {
+                if opened {
+                    self.edit_mode = EditMode::Edit;
+                }
+                self.edit_copy_from_above(key == "\"" || shift);
+            }
+            ";" | ":" => self.edit_insert_now(key == ":" || shift, now),
+            _ => {}
+        }
+    }
+
+    /// Does an entry chord have anything to put into the editor? Ctrl+' in
+    /// row 1 has no cell above, so it opens nothing.
+    fn entry_chord_applies(&self, key: &str) -> bool {
+        !matches!(key, "'" | "\"") || self.sel.0 > 0
+    }
+
+    /// Ctrl+' (the cell above's formula, unadjusted, or its input text) and
+    /// Ctrl+Shift+" (the cell above's value) into the open editor.
+    fn edit_copy_from_above(&mut self, value: bool) {
+        let (r, c) = self.sel;
+        if r == 0 || self.editing.is_none() {
+            return;
+        }
+        let above = self.sheet().cell(r - 1, c).cloned().unwrap_or_default();
+        let text = if value {
+            gridcore::edit::input_text_of(&gridcore::sheet::Cell {
+                formula: None,
+                ..above
+            })
+        } else {
+            self.edit_string(r - 1, c)
+        };
+        self.edit_insert(&text);
+    }
+
+    /// Ctrl+; (today as m/d/yyyy) and Ctrl+Shift+; (now as h:mm AM/PM) into
+    /// the editor, as text that commits through the entry parser.
+    fn edit_insert_now(&mut self, time: bool, now: f64) {
+        let Some(p) = gridcore::sheet::serial_to_parts(now, false) else {
+            return;
+        };
+        if self.editing.is_none() {
+            return;
+        }
+        let text = if time {
+            let h12 = match p.hour % 12 {
+                0 => 12,
+                h => h,
+            };
+            let ampm = if p.hour < 12 { "AM" } else { "PM" };
+            format!("{h12}:{:02} {ampm}", p.minute)
+        } else {
+            format!("{}/{}/{}", p.month, p.day, p.year)
+        };
+        self.edit_insert(&text);
+    }
+
+    /// F9 while editing a formula: replace the text with the formula's value,
+    /// evaluated at the cell being edited.
+    fn edit_eval_formula(&mut self) {
+        use gridcore::formula::Value;
+        let Some(body) = self.editing.as_deref().and_then(|b| b.strip_prefix('=')) else {
+            return;
+        };
+        if body.is_empty() || gridcore::engine::Engine::validate(body).is_err() {
+            return;
+        }
+        let (s, r, c) = self
+            .edit_origin
+            .unwrap_or((self.active, self.sel.0, self.sel.1));
+        let text = match gridcore::engine::eval_formula_at(&self.pkg.workbook, s, r, c, body) {
+            Value::Empty => String::new(),
+            Value::Num(n) => gridcore::sheet::fmt_general(n),
+            Value::Str(t) => t,
+            Value::Bool(b) => if b { "TRUE" } else { "FALSE" }.to_string(),
+            Value::Err(e) => e.code().to_string(),
+        };
+        self.editing = Some(text);
+        self.edit_caret_to_end();
+    }
+
+    /// Move the active cell by (dr, dc), clamped at the origin, collapsing the
+    /// range and dropping any editor.
+    fn move_sel(&mut self, dr: i32, dc: i32) {
+        let (r, c) = self.sel;
+        self.sel = ((r as i32 + dr).max(0) as u32, (c as i32 + dc).max(0) as u32);
+        self.anchor = self.sel;
+        self.end_cell_edit();
+    }
+
+    /// Commit the editor, then move by (dr, dc) — unless the entry was
+    /// refused: then the editor stays open, nothing moves, `entry_error` says
+    /// why and this is `None`. `Some(committed)` otherwise.
+    fn commit_and_move(&mut self, dr: i32, dc: i32) -> Option<bool> {
+        let committed = self.commit_edit();
+        if self.entry_error.is_some() {
+            return None;
+        }
+        self.move_sel(dr, dc);
+        Some(committed)
+    }
+
+    /// The text Find matches and Replace rewrites — one text, so whatever
+    /// Find selects Replace can change. A formula cell is searched as its
+    /// `=source` (as Excel's default "Look in: Formulas" does); a constant as
+    /// its displayed text (a date as `1/15/2024`, a percent as `50%`). The
+    /// `'` a re-entry would need is not part of it — Replace puts it back on
+    /// the result, so `'007` stays text and a cell's own `'` matches once.
+    /// Empty — so neither Find nor Replace touches it — for a blank cell and
+    /// for a constant that shows `########` (a date it cannot display): the
+    /// hashes are not its text.
+    fn search_text(&self, r: u32, c: u32) -> String {
+        match self.sheet().cell(r, c) {
+            Some(cell) if cell.formula.is_some() => {
+                format!("={}", cell.formula.as_deref().unwrap_or_default())
+            }
+            Some(cell)
+                if gridcore::sheet::date_unrepresentable(
+                    &self.pkg.workbook.styles.xf(cell.style),
+                    &cell.value,
+                    self.pkg.workbook.date1904,
+                ) =>
+            {
+                String::new()
+            }
+            _ => self.cell_text(r, c),
+        }
+    }
+
+    /// Find's next match of `q` (any case) in [`Self::search_text`], in
+    /// row-major order from the active cell, wrapping; `back` searches
+    /// backwards. `None` when nothing matches.
+    fn find_match(&self, q: &str, back: bool) -> Option<(u32, u32)> {
+        let q = q.to_lowercase();
+        if q.is_empty() {
+            return None;
+        }
+        let (mr, mc) = self.extent();
+        let ncols = mc as i64 + 1;
+        let total = (mr as i64 + 1) * ncols;
+        let (sr, sc) = self.sel;
+        let start = sr as i64 * ncols + sc as i64;
+        (1..=total).find_map(|step| {
+            let idx = if back {
+                (start - step).rem_euclid(total)
+            } else {
+                (start + step).rem_euclid(total)
+            };
+            let (r, c) = ((idx / ncols) as u32, (idx % ncols) as u32);
+            let t = self.search_text(r, c).to_lowercase();
+            (!t.is_empty() && t.contains(&q)).then_some((r, c))
+        })
+    }
+
+    /// Find & Replace on one cell: `q`, any case, replaced by `rep` in the
+    /// cell's [`Self::search_text`], the `'` re-entry needs put back
+    /// (`gridcore::entry::replaced_entry`), then re-read the way every host
+    /// re-reads a replaced entry (`gridcore::entry::reenter_cell`: the cell's
+    /// own rules; a percent cell's number is divided only when the text being
+    /// edited no longer shows its `%`). False when the cell had no match or
+    /// cannot hold the result.
+    fn replace_in_cell(&mut self, r: u32, c: u32, q: &str, rep: &str) -> bool {
+        let Some(cell) = self.sheet().cell(r, c).cloned() else {
+            return false;
+        };
+        let text = self.search_text(r, c);
+        if q.is_empty() || !text.to_lowercase().contains(&q.to_lowercase()) {
+            return false;
+        }
+        let xf = self.pkg.workbook.styles.xf(cell.style);
+        let new = gridcore::entry::replaced_entry(&cell, &xf, ci_replace(&text, q, rep));
+        let ctx = gridcore::entry::entry_ctx(&self.pkg.workbook, self.engine.clock);
+        let styles = &mut self.pkg.workbook.styles;
+        match gridcore::entry::reenter_cell(&cell, styles, &ctx, &text, &new) {
+            Ok(new_cell) => {
+                let s = self.active;
+                self.engine
+                    .set_cell(&mut self.pkg.workbook, (s, r, c), new_cell);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Apply a formatting change to the selection and keep it for F4.
+    fn apply_format(&mut self, f: FormatFn) {
+        self.format_selection(&*f);
+        self.last_format = Some(f);
+    }
+
+    /// A toggle resolved against the active cell (bold ON when it is not
+    /// bold): the setter the ribbon applies and F4 repeats as is.
+    fn toggle_setter(
+        &self,
+        get: fn(&gridcore::sheet::Xf) -> bool,
+        set: fn(&mut gridcore::sheet::Xf, bool),
+    ) -> FormatFn {
+        let (r, c) = self.sel;
+        let style = self.sheet().cell(r, c).map_or(0, |cl| cl.style);
+        let on = !get(&self.pkg.workbook.styles.xf(style));
+        std::rc::Rc::new(move |xf| set(xf, on))
+    }
+
+    /// Ctrl+Enter: the editor's entry into every cell of the selection, a
+    /// formula's references moving with each cell; one undo step, the
+    /// selection kept. False when nothing was entered (no editor, or refused).
+    fn commit_edit_to_selection(&mut self) -> bool {
+        self.entry_error = None;
+        let Some(buf) = self.editing.clone() else {
+            return false;
+        };
+        let (s, r, c) = self
+            .edit_origin
+            .unwrap_or((self.active, self.sel.0, self.sel.1));
+        let range = self.range();
+        let inside = (range.0..=range.2).contains(&r) && (range.1..=range.3).contains(&c);
+        if !self.has_range() || s != self.active || !inside {
+            return self.commit_edit();
+        }
+        if let Err(e) = gridcore::entry::check_len(&buf) {
+            self.entry_error = Some(e.to_string());
+            return false;
+        }
+        self.end_cell_edit();
+        self.push_undo();
+        let today = self.engine.clock;
+        let wb = &mut self.pkg.workbook;
+        if let Ok(cells) = gridcore::entry::entry_range(wb, s, range, (r, c), &buf, today) {
+            for (rr, cc, cell) in cells {
+                self.engine
+                    .set_cell(&mut self.pkg.workbook, (s, rr, cc), cell);
+            }
+        }
+        true
+    }
+
+    /// Ctrl+D / Ctrl+R over the selection (one undo step). False when there
+    /// was nothing to fill.
+    fn fill_selection(&mut self, down: bool) -> bool {
+        let changes = gridcore::edit::fill_changes(self.sheet(), self.range(), down);
+        if changes.is_empty() {
             return false;
         }
         self.push_undo();
-        let style = self.pkg.workbook.sheets[origin.0]
-            .cell(origin.1, origin.2)
-            .map(|cl| cl.style)
-            .unwrap_or(0);
-        let cell = parse_cell_input(&buf, style);
-        self.engine.set_cell(&mut self.pkg.workbook, origin, cell);
+        let s = self.active;
+        for (r, c, cell) in changes {
+            self.engine
+                .set_cell(&mut self.pkg.workbook, (s, r, c), cell);
+        }
+        true
+    }
+
+    /// Apply a formatting change to every cell in the selection: mutate a copy
+    /// of each cell's `Xf`, intern it (dedup), and re-point the cell's style.
+    /// Values and formulas are untouched, so no recalc is needed.
+    fn format_selection(&mut self, apply: &dyn Fn(&mut gridcore::sheet::Xf)) {
+        let (r0, c0, r1, c1) = self.range();
+        let s = self.active;
+        for r in r0..=r1 {
+            for c in c0..=c1 {
+                let cur = self.sheet().cell(r, c).cloned();
+                let mut xf = self
+                    .pkg
+                    .workbook
+                    .styles
+                    .xf(cur.as_ref().map(|cl| cl.style).unwrap_or(0));
+                apply(&mut xf);
+                let idx = self.pkg.workbook.styles.intern(xf);
+                let mut cell = cur.unwrap_or_default();
+                cell.style = idx;
+                self.pkg.workbook.sheets[s].set_cell(r, c, cell);
+            }
+        }
+    }
+
+    /// F4 outside the editor: repeat the last formatting change on the
+    /// selection (one undo step). False when there is nothing to repeat.
+    fn repeat_format(&mut self) -> bool {
+        let Some(f) = self.last_format.clone() else {
+            return false;
+        };
+        self.push_undo();
+        self.format_selection(&*f);
         true
     }
 
     /// Commit an open editor before moving rows or columns under its origin.
-    fn structural_edit(&mut self, op: StructOp) {
+    /// False when a refused commit left the editor open: its absolute origin
+    /// would point at a shifted cell, so nothing moves.
+    fn structural_edit(&mut self, op: StructOp) -> bool {
         use gridcore::edit;
 
         self.commit_edit();
+        if self.editing.is_some() {
+            return false;
+        }
         self.push_undo();
         let s = self.active;
         let (r, c) = self.sel;
@@ -1076,7 +1689,8 @@ impl SheetView {
         for ch in self.charts.iter_mut() {
             edit::shift_chart_refs(&mut ch.data, &name, ch.sheet == s, &shift);
         }
-        self.engine = gridcore::engine::Engine::new(&self.pkg.workbook);
+        self.engine = sheet_engine(&self.pkg.workbook);
+        true
     }
 
     /// The contiguous region around the selection to sort, as `(start, bottom)`
@@ -1123,12 +1737,15 @@ impl SheetView {
         keys: &[(u32, bool)],
     ) -> (bool, bool) {
         let committed = self.commit_edit();
+        if self.editing.is_some() {
+            return (false, false); // refused: sorting would move its origin
+        }
         let Some((start, bottom)) = sort_rows_from(field, self.sort_bounds()) else {
             return (committed, false);
         };
         self.push_undo();
         gridcore::edit::sort_rows(&mut self.pkg.workbook, self.active, start, bottom, keys);
-        self.engine = gridcore::engine::Engine::new(&self.pkg.workbook);
+        self.engine = sheet_engine(&self.pkg.workbook);
         (committed, true)
     }
 
@@ -1138,8 +1755,9 @@ impl SheetView {
             .min(self.pkg.workbook.sheets.len().saturating_sub(1))]
     }
     /// The text to seed the editor with when re-editing a cell: `=formula` for a
-    /// formula, the raw literal otherwise. `commit_edit` preserves the stored
-    /// cell when this seed is left untouched, even if reparsing would change it.
+    /// formula, the raw literal otherwise (a quote prefix's `'` put back).
+    /// `commit_edit` preserves the stored cell when this seed is left
+    /// untouched, even if reparsing would change it.
     fn edit_string(&self, row: u32, col: u32) -> String {
         use gridcore::sheet::CellValue;
         let sh = self.sheet();
@@ -1147,7 +1765,9 @@ impl SheetView {
             Some(c) if c.formula.is_some() => format!("={}", c.formula.as_deref().unwrap_or("")),
             Some(c) => match &c.value {
                 CellValue::Number(n) => n.to_string(),
-                CellValue::Text(s) => s.clone(),
+                CellValue::Text(s) => {
+                    gridcore::entry::copy_field(c, &self.pkg.workbook.styles.xf(c.style), s.clone())
+                }
                 CellValue::Bool(b) => {
                     if *b {
                         "TRUE".into()
@@ -1228,7 +1848,7 @@ impl SheetView {
         self.pkg.workbook = snap.wb;
         self.charts = snap.charts;
         self.pivot_views = snap.pivots;
-        self.engine = gridcore::engine::Engine::new(&self.pkg.workbook);
+        self.engine = sheet_engine(&self.pkg.workbook);
         self.active = snap
             .active
             .min(self.pkg.workbook.sheets.len().saturating_sub(1));
@@ -1434,6 +2054,8 @@ struct Docxy {
     // The spreadsheet clipboard: a rectangular block of cells from the last grid
     // copy/cut, pasted at the selection on Ctrl+V.
     grid_clip: Option<GridClip>,
+    /// The text clipboard: the OS one, or a private one in a harness.
+    clipboard: ClipboardStore,
     // Open sheet colour-swatch picker (fill or font), None = closed.
     sheet_pick: Option<SheetPick>,
     // Inline sheet-tab rename in progress: (tab index, edit buffer). None = idle.
@@ -2908,6 +3530,63 @@ const GANTT_WARNING: u32 = 0xDC322F;
 const BRAND: u32 = 0x2AA79B; // teal wordmark/accent (reads on light + dark)
 const LINK: u32 = 0x2f6fdb;
 const FILE_FG: u32 = 0xffffff;
+
+/// Put the caret where a click landed. With `extend` (Shift) the click keeps
+/// the anchor, or starts one at the old caret; otherwise it collapses any
+/// selection, and `plant` (a press that may start a drag) leaves the anchor on
+/// the new caret so the drag extends from it. Goes through
+/// `Editor::set_caret`, so typing after the click is its own undo step instead
+/// of coalescing with the typing before it.
+fn place_click_caret(ed: &mut Editor, caret: Caret, extend: bool, plant: bool) {
+    if extend {
+        ed.extend_selection(true);
+    } else {
+        ed.clear_selection();
+    }
+    ed.set_caret(caret);
+    if plant && !extend {
+        ed.extend_selection(true);
+    }
+}
+
+#[cfg(test)]
+mod click_caret_tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    fn typed_hello() -> Editor {
+        let mut ed = Editor::new(docxcore::markdown::from_markdown("x\n"));
+        ed.set_caret(Caret::at(vec![0], 0));
+        ed.delete_forward();
+        ed.insert_str("hello");
+        ed
+    }
+
+    #[test]
+    fn a_click_starts_a_new_undo_step_698() {
+        for plant in [false, true] {
+            let mut ed = typed_hello();
+            place_click_caret(&mut ed, Caret::at(vec![0], 2), false, plant);
+            ed.insert_str("ab");
+            assert_eq!(ed.doc.body[0].plain_text(), "heabllo");
+            assert!(!ed.has_selection());
+            assert!(ed.undo());
+            assert_eq!(ed.doc.body[0].plain_text(), "hello", "plant {plant}");
+        }
+    }
+
+    #[test]
+    fn a_press_plants_the_anchor_and_shift_click_extends_698() {
+        let mut ed = typed_hello();
+        place_click_caret(&mut ed, Caret::at(vec![0], 2), false, true);
+        assert_eq!(ed.anchor, Some(Caret::at(vec![0], 2)));
+        place_click_caret(&mut ed, Caret::at(vec![0], 4), true, true);
+        assert_eq!(ed.anchor, Some(Caret::at(vec![0], 2)));
+        assert_eq!(ed.caret, Caret::at(vec![0], 4));
+        place_click_caret(&mut ed, Caret::at(vec![0], 1), false, false);
+        assert_eq!(ed.anchor, None);
+    }
+}
 
 fn empty_doc() -> Document {
     docxcore::markdown::from_markdown("# Untitled\n\n")
@@ -5273,7 +5952,7 @@ fn ref_field_row(f: &RangeEdit, ent: &Entity<Docxy>) -> AnyElement {
 /// (a real editable grid, not a placeholder).
 fn new_sheet_surface() -> Surface {
     let pkg = gridcore::xlsx::new_xlsx();
-    let engine = gridcore::engine::Engine::new(&pkg.workbook);
+    let engine = sheet_engine(&pkg.workbook);
     Surface::Sheet(SheetView {
         pkg,
         active: 0,
@@ -5283,6 +5962,11 @@ fn new_sheet_surface() -> Surface {
         edit_seed: None,
         edit_origin: None,
         edit_caret: 0,
+        edit_mode: EditMode::Enter,
+        edit_overtype: false,
+        edit_start: String::new(),
+        last_format: None,
+        entry_error: None,
         engine,
         undo: vec![],
         redo: vec![],
@@ -5296,12 +5980,27 @@ fn new_sheet_surface() -> Surface {
     })
 }
 
+/// Does any formula cell lack a value (none was cached in the file)?
+fn has_uncached_formula(wb: &gridcore::sheet::Workbook) -> bool {
+    wb.sheets.iter().any(|sh| {
+        sh.cells
+            .values()
+            .any(|c| c.formula.is_some() && c.value.is_empty())
+    })
+}
+
 fn sheet_from_path(path: &PathBuf) -> (Surface, SharedString) {
     match std::fs::read(path) {
         Ok(bytes) => match gridcore::xlsx::load_xlsx(&bytes) {
-            Ok(pkg) => {
+            Ok(mut pkg) => {
                 let n = pkg.workbook.sheets.len();
-                let engine = gridcore::engine::Engine::new(&pkg.workbook);
+                let mut engine = sheet_engine(&pkg.workbook);
+                // A formula saved without its cached `<v>` (openpyxl writes
+                // none) would show blank until something recalculated it;
+                // Excel computes such cells on open (#673).
+                if has_uncached_formula(&pkg.workbook) {
+                    engine.recalc_all(&mut pkg.workbook);
+                }
                 let view = SheetView {
                     pkg,
                     active: 0,
@@ -5311,6 +6010,11 @@ fn sheet_from_path(path: &PathBuf) -> (Surface, SharedString) {
                     edit_seed: None,
                     edit_origin: None,
                     edit_caret: 0,
+                    edit_mode: EditMode::Enter,
+                    edit_overtype: false,
+                    edit_start: String::new(),
+                    last_format: None,
+                    entry_error: None,
                     engine,
                     undo: vec![],
                     redo: vec![],
@@ -5872,6 +6576,7 @@ impl Docxy {
             zoom: 1.0,
             ruler_guide: None,
             grid_clip: None,
+            clipboard: ClipboardStore::default(),
             sheet_pick: None,
             sheet_rename: None,
             sheet_grid_w: 1000.0,
@@ -6178,14 +6883,28 @@ impl Docxy {
     fn sheet_fill_start(&mut self, cx: &mut Context<Self>) {
         let gesture_in_flight = self.grid_gesture_in_flight();
         let src = self.active_sheet().map(|v| v.range());
+        let protected = self.sheet_protected();
         if arm_fill(
             &mut self.sheet_fill,
             src,
             gesture_in_flight,
             self.tab_more_open,
+            protected,
         ) {
             cx.notify();
         }
+    }
+
+    /// Why the active sheet draws no fill handle, or `None` when it draws one
+    /// (see [`fill_handle_hidden`]).
+    fn fill_handle_hidden_reason(&self) -> Option<HandleHidden> {
+        let editing = self.active_sheet().is_some_and(|v| v.editing.is_some());
+        fill_handle_hidden(
+            editing,
+            self.range_field_active(),
+            self.formula_pick_active(),
+            self.chart_sel,
+        )
     }
 
     /// Update the auto-fill target as the handle is dragged. Nothing is
@@ -7975,7 +8694,10 @@ impl Docxy {
             // range", not "auto-fill". The handle's own guard only covers an
             // in-cell edit, so without this a drag that starts on those few
             // pixels writes cells instead of picking them.
-            handle_hidden: self.range_field_active() || self.formula_pick_active(),
+            handle_hidden: fill_handle_pointing(
+                self.range_field_active(),
+                self.formula_pick_active(),
+            ),
             // The border's range and the cap on its dashes both need the
             // visible-row list and the column window, which only `sheet_el`
             // has.
@@ -8019,7 +8741,7 @@ impl Docxy {
             v.sel = (br1, bc1);
             gridcore::edit::autofill(&mut v.pkg.workbook, s, f.src, f.to);
             // Filled formulas were re-based, so their copied results are stale.
-            v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+            v.engine = sheet_engine(&v.pkg.workbook);
             v.engine.recalc_all(&mut v.pkg.workbook);
         }
         self.mark_sheet_dirty();
@@ -8201,7 +8923,7 @@ impl Docxy {
             v.sel = (0, 0);
             v.anchor = (0, 0);
             v.end_cell_edit();
-            v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+            v.engine = sheet_engine(&v.pkg.workbook);
         }
         // We just switched sheets, same as `select_sheet`.
         self.drop_grid_state();
@@ -8252,7 +8974,7 @@ impl Docxy {
             v.sel = (0, 0);
             v.anchor = (0, 0);
             v.end_cell_edit();
-            v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+            v.engine = sheet_engine(&v.pkg.workbook);
         }
         // The chart list was just re-indexed and the view may have moved.
         self.drop_grid_state();
@@ -8527,28 +9249,65 @@ impl Docxy {
     /// Commit the in-progress edit (if any) into the workbook, recalc, and move
     /// the selection by (dr, dc).
     fn sheet_commit(&mut self, dr: i32, dc: i32, cx: &mut Context<Self>) {
-        if self.active_sheet_mut().is_some_and(SheetView::commit_edit) {
+        self.sheet_commit_move(dr, dc, cx);
+    }
+
+    /// Commit and move; false (the editor left open, the status saying why)
+    /// when the entry was refused.
+    fn sheet_commit_move(&mut self, dr: i32, dc: i32, cx: &mut Context<Self>) -> bool {
+        let res = self.active_sheet_mut().map(|v| v.commit_and_move(dr, dc));
+        cx.notify();
+        match res {
+            Some(Some(committed)) => {
+                if committed {
+                    self.mark_sheet_dirty();
+                }
+                true
+            }
+            Some(None) => !self.sheet_entry_refused(cx),
+            None => false,
+        }
+    }
+
+    /// Ctrl+Enter: commit the entry into every selected cell and keep the
+    /// selection.
+    fn sheet_commit_to_selection(&mut self, cx: &mut Context<Self>) {
+        if self
+            .active_sheet_mut()
+            .is_some_and(SheetView::commit_edit_to_selection)
+        {
             self.mark_sheet_dirty();
         }
-        self.sheet_move(dr, dc, cx);
+        self.sheet_entry_refused(cx);
+        cx.notify();
+    }
+
+    /// After a commit: when the entry was refused (too long), say why in the
+    /// status bar and report it, so the caller leaves the editor open.
+    fn sheet_entry_refused(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(err) = self.active_sheet_mut().and_then(|v| v.entry_error.take()) else {
+            return false;
+        };
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            t.status = err.into();
+        }
+        cx.notify();
+        true
     }
 
     /// Move the selection by (dr, dc), clamped at the top-left origin, collapsing
     /// the range and discarding any in-progress edit.
     fn sheet_move(&mut self, dr: i32, dc: i32, cx: &mut Context<Self>) {
         if let Some(v) = self.active_sheet_mut() {
-            let (r, c) = v.sel;
-            v.sel = ((r as i32 + dr).max(0) as u32, (c as i32 + dc).max(0) as u32);
-            v.anchor = v.sel;
-            v.end_cell_edit();
+            v.move_sel(dr, dc);
         }
         cx.notify();
     }
 
     /// Extend the selection by (dr, dc), keeping the anchor (Shift+arrow).
     fn sheet_extend(&mut self, dr: i32, dc: i32, editing: bool, cx: &mut Context<Self>) {
-        if editing {
-            self.sheet_commit(0, 0, cx);
+        if editing && !self.sheet_commit_move(0, 0, cx) {
+            return; // refused: the editor stays
         }
         if let Some(v) = self.active_sheet_mut() {
             let (r, c) = v.sel;
@@ -8561,9 +9320,10 @@ impl Docxy {
     /// Arrow-key navigation: commit an open edit first, then move.
     fn sheet_nav(&mut self, dr: i32, dc: i32, editing: bool, cx: &mut Context<Self>) {
         if editing {
-            self.sheet_commit(0, 0, cx);
+            self.sheet_commit_move(dr, dc, cx);
+        } else {
+            self.sheet_move(dr, dc, cx);
         }
-        self.sheet_move(dr, dc, cx);
     }
 
     /// Clear the whole selected range's content (Delete / Backspace), keeping
@@ -8594,6 +9354,21 @@ impl Docxy {
         cx.notify();
     }
 
+    /// Put `text` on the clipboard: the OS one, or the private one in a harness.
+    fn clipboard_write(&mut self, text: String, cx: &mut App) {
+        let harness = self.harness.is_some();
+        self.clipboard.write(harness, text, |text| {
+            cx.write_to_clipboard(ClipboardItem::new_string(text))
+        });
+    }
+
+    /// What the clipboard holds: the OS one, or the private one in a harness.
+    fn clipboard_read(&self, cx: &App) -> ClipRead {
+        self.clipboard.read(self.harness.is_some(), || {
+            cx.read_from_clipboard().map(|item| item.text())
+        })
+    }
+
     /// Copy (or cut) the selected range into the grid clipboard and, as TSV, the
     /// system clipboard.
     fn sheet_copy(&mut self, cut: bool, cx: &mut Context<Self>) {
@@ -8607,14 +9382,21 @@ impl Docxy {
                 if c > c0 {
                     tsv.push('\t');
                 }
-                tsv.push_str(&v.cell_text(r, c));
+                // With the `'` a paste needs to read the text back.
+                if let Some(cell) = v.sheet().cell(r, c) {
+                    let xf = v.pkg.workbook.styles.xf(cell.style);
+                    tsv.push_str(&gridcore::entry::copy_field(cell, &xf, v.cell_text(r, c)));
+                }
                 row.push(v.sheet().cell(r, c).cloned().unwrap_or_default());
             }
             cells.push(row);
             tsv.push('\n');
         }
-        self.grid_clip = Some(GridClip { cells });
-        cx.write_to_clipboard(ClipboardItem::new_string(tsv));
+        self.grid_clip = Some(GridClip {
+            cells,
+            text: tsv.clone(),
+        });
+        self.clipboard_write(tsv, cx);
         if cut {
             self.sheet_clear(cx); // snapshots, clears the range, marks dirty
         } else {
@@ -8622,20 +9404,46 @@ impl Docxy {
         }
     }
 
-    /// Paste at the selection: the grid clipboard when present (full-fidelity
-    /// cells), else the system clipboard parsed as TSV.
+    /// Paste at the selection: the grid clipboard while it is still what the
+    /// clipboard holds (full-fidelity cells), else the clipboard text parsed as
+    /// TSV.
     fn sheet_paste(&mut self, cx: &mut Context<Self>) {
         if self.sheet_protected() {
             return;
         }
-        let block: Vec<Vec<gridcore::sheet::Cell>> = if let Some(clip) = &self.grid_clip {
+        let now = self.clipboard_read(cx);
+        let block: Vec<Vec<gridcore::sheet::Cell>> = if let Some(clip) = self
+            .grid_clip
+            .as_ref()
+            .filter(|clip| grid_paste_uses_clip(&clip.text, &now))
+        {
             clip.cells.clone()
-        } else if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
-            text.replace("\r\n", "\n")
+        } else if let ClipRead::Text(text) = now {
+            let Some(v) = self.active_sheet_mut() else {
+                return;
+            };
+            // A leading `'` pastes as quote-prefixed text (paste_cell), each
+            // field on the style its target cell has, as xlsxy's and
+            // gridwasm's pastes do.
+            let (br, bc, s) = (v.sel.0, v.sel.1, v.active);
+            let wb = &mut v.pkg.workbook;
+            let mut rows = Vec::new();
+            for (dr, line) in text
+                .replace("\r\n", "\n")
                 .trim_end_matches('\n')
                 .split('\n')
-                .map(|line| line.split('\t').map(|f| parse_cell_input(f, 0)).collect())
-                .collect()
+                .enumerate()
+            {
+                let mut row = Vec::new();
+                for (dc, f) in line.split('\t').enumerate() {
+                    let style = wb.sheets[s]
+                        .cell(br + dr as u32, bc + dc as u32)
+                        .map_or(0, |cl| cl.style);
+                    row.push(gridcore::entry::paste_cell(&mut wb.styles, style, f));
+                }
+                rows.push(row);
+            }
+            rows
         } else {
             return;
         };
@@ -8710,7 +9518,17 @@ impl Docxy {
     /// Apply a formatting change to every cell in the selection: mutate a copy of
     /// each cell's `Xf`, intern it (dedup), and re-point the cell's style. Values
     /// and formulas are untouched, so no recalc is needed.
-    fn sheet_format(&mut self, apply: impl Fn(&mut gridcore::sheet::Xf), cx: &mut Context<Self>) {
+    fn sheet_format(
+        &mut self,
+        apply: impl Fn(&mut gridcore::sheet::Xf) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.sheet_format_rc(std::rc::Rc::new(apply), cx);
+    }
+
+    /// [`Self::sheet_format`] for a setter already shared (a toggle resolved
+    /// by `SheetView::toggle_setter`).
+    fn sheet_format_rc(&mut self, apply: FormatFn, cx: &mut Context<Self>) {
         // This writes to `v.range()`, so the selection it acts on has to be the
         // one the grid is DRAWING. `run_sheet_act` hands the selection back for
         // the ribbon commands, but not every formatting writer arrives that way
@@ -8721,23 +9539,9 @@ impl Docxy {
         self.chart_hand_back(cx);
         self.sheet_snapshot();
         if let Some(v) = self.active_sheet_mut() {
-            let (r0, c0, r1, c1) = v.range();
-            let s = v.active;
-            for r in r0..=r1 {
-                for c in c0..=c1 {
-                    let cur = v.sheet().cell(r, c).cloned();
-                    let mut xf = v
-                        .pkg
-                        .workbook
-                        .styles
-                        .xf(cur.as_ref().map(|cl| cl.style).unwrap_or(0));
-                    apply(&mut xf);
-                    let idx = v.pkg.workbook.styles.intern(xf);
-                    let mut cell = cur.unwrap_or_default();
-                    cell.style = idx;
-                    v.pkg.workbook.sheets[s].set_cell(r, c, cell);
-                }
-            }
+            // F4 repeats it. Toggles arrive here already resolved (bold ON),
+            // so a repeat applies rather than flips.
+            v.apply_format(apply);
         }
         self.mark_sheet_dirty();
         cx.notify();
@@ -8804,7 +9608,7 @@ impl Docxy {
                     if let Some(v) = self.active_sheet_mut() {
                         let s = v.active;
                         v.pkg.clear_conditional_formats(s);
-                        v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+                        v.engine = sheet_engine(&v.pkg.workbook);
                     }
                     self.mark_sheet_dirty();
                 } else if let Some(((op, val, val2), cells)) = parse_cf_input(&buf).zip(cells) {
@@ -8819,7 +9623,7 @@ impl Docxy {
                             val2.as_deref(),
                             cf_preset_dxf(),
                         );
-                        v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+                        v.engine = sheet_engine(&v.pkg.workbook);
                     }
                     self.mark_sheet_dirty();
                 }
@@ -8867,9 +9671,11 @@ impl Docxy {
             }
             let header = matches!(sh.cell(top, sc).map(|c| &c.value), Some(CellValue::Text(_)));
             let start = if header { top + 1 } else { top };
+            // Rows are marked filter-hidden (not hidden by hand) so SUBTOTAL
+            // 1-11 skips them and still counts hand-hidden rows.
             if text.trim().eq_ignore_ascii_case("clear") {
                 for r in top..=bottom {
-                    v.pkg.workbook.sheets[s].set_row_hidden(r, false);
+                    v.pkg.workbook.sheets[s].set_row_filtered(r, false);
                 }
             } else if let Some((op, operand)) = gridcore::filter::parse(text) {
                 let keep: Vec<bool> = (start..=bottom)
@@ -8881,7 +9687,7 @@ impl Docxy {
                     })
                     .collect();
                 for (i, r) in (start..=bottom).enumerate() {
-                    v.pkg.workbook.sheets[s].set_row_hidden(r, !keep[i]);
+                    v.pkg.workbook.sheets[s].set_row_filtered(r, !keep[i]);
                 }
             }
         }
@@ -8907,7 +9713,7 @@ impl Docxy {
                     if let Some(v) = self.active_sheet_mut() {
                         let s = v.active;
                         gridcore::edit::text_to_columns(&mut v.pkg.workbook, s, c0, r0, r1, delim);
-                        v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+                        v.engine = sheet_engine(&v.pkg.workbook);
                     }
                     self.mark_sheet_dirty();
                 }
@@ -9215,7 +10021,7 @@ impl Docxy {
                 let idx = wb.styles.intern(xf);
                 wb.sheets[s].cells.entry((r0, c0)).or_default().style = idx;
             }
-            v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+            v.engine = sheet_engine(&v.pkg.workbook);
         }
         self.mark_sheet_dirty();
         cx.notify();
@@ -9288,7 +10094,7 @@ impl Docxy {
             }
             let header = matches!(sh.cell(top, sc).map(|c| &c.value), Some(CellValue::Text(_)));
             gridcore::edit::dedupe_rows(&mut v.pkg.workbook, s, top, bottom, header);
-            v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+            v.engine = sheet_engine(&v.pkg.workbook);
         }
         self.mark_sheet_dirty();
         cx.notify();
@@ -9321,7 +10127,7 @@ impl Docxy {
             }
             let header = matches!(sh.cell(top, sc).map(|c| &c.value), Some(CellValue::Text(_)));
             gridcore::edit::subtotal(&mut v.pkg.workbook, s, top, bottom, sc, &[], header);
-            v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+            v.engine = sheet_engine(&v.pkg.workbook);
         }
         self.mark_sheet_dirty();
         cx.notify();
@@ -9422,6 +10228,7 @@ impl Docxy {
         if committed || sorted {
             self.mark_sheet_dirty();
         }
+        self.sheet_entry_refused(cx);
         cx.notify();
     }
 
@@ -9445,16 +10252,20 @@ impl Docxy {
         if committed || sorted {
             self.mark_sheet_dirty();
         }
+        self.sheet_entry_refused(cx);
         cx.notify();
     }
 
     /// Insert/delete a whole row or column at the selection (Home ▸ Cells), then
     /// rebuild the recalc engine so shifted formulas re-evaluate.
     fn sheet_structural(&mut self, op: StructOp, cx: &mut Context<Self>) {
-        if let Some(v) = self.active_sheet_mut() {
-            v.structural_edit(op);
+        if self
+            .active_sheet_mut()
+            .is_some_and(|v| v.structural_edit(op))
+        {
+            self.mark_sheet_dirty();
         }
-        self.mark_sheet_dirty();
+        self.sheet_entry_refused(cx);
         cx.notify();
     }
 
@@ -9563,26 +10374,32 @@ impl Docxy {
         self.sheet_snapshot();
         if let Some(v) = self.active_sheet_mut() {
             let (r, c) = v.sel;
-            let s = v.active;
-            let style = v.sheet().cell(r, c).map(|x| x.style).unwrap_or(0);
-            v.engine.set_cell(
-                &mut v.pkg.workbook,
-                (s, r, c),
-                parse_cell_input(&value, style),
-            );
+            v.enter_text_at(r, c, &value);
         }
         self.sheet_dv_open = false;
         self.mark_sheet_dirty();
         cx.notify();
     }
 
+    /// A toggle resolved against the active cell, applied to the selection.
+    /// The chart hands the selection back first so the toggle reads the
+    /// cell the grid is drawing.
+    fn sheet_toggle(
+        &mut self,
+        get: fn(&gridcore::sheet::Xf) -> bool,
+        set: fn(&mut gridcore::sheet::Xf, bool),
+        cx: &mut Context<Self>,
+    ) {
+        self.chart_hand_back(cx);
+        if let Some(f) = self.active_sheet().map(|v| v.toggle_setter(get, set)) {
+            self.sheet_format_rc(f, cx);
+        }
+    }
     fn sheet_toggle_bold(&mut self, cx: &mut Context<Self>) {
-        let on = !self.active_xf().bold;
-        self.sheet_format(move |xf| xf.bold = on, cx);
+        self.sheet_toggle(|x| x.bold, |x, on| x.bold = on, cx);
     }
     fn sheet_toggle_italic(&mut self, cx: &mut Context<Self>) {
-        let on = !self.active_xf().italic;
-        self.sheet_format(move |xf| xf.italic = on, cx);
+        self.sheet_toggle(|x| x.italic, |x, on| x.italic = on, cx);
     }
     fn sheet_align(&mut self, a: gridcore::sheet::Align, cx: &mut Context<Self>) {
         self.sheet_format(move |xf| xf.align = a, cx);
@@ -9590,8 +10407,7 @@ impl Docxy {
     /// Toggle Wrap Text on the selection. Wrapped cells render across multiple
     /// lines and grow their row (the grid uses a variable-height gpui `list`).
     fn sheet_toggle_wrap(&mut self, cx: &mut Context<Self>) {
-        let on = !self.active_xf().wrap;
-        self.sheet_format(move |xf| xf.wrap = on, cx);
+        self.sheet_toggle(|x| x.wrap, |x, on| x.wrap = on, cx);
     }
     /// Set an explicit height (points) on every selected row, or clear it back
     /// to auto-fit when `pts` is `None`.
@@ -9619,22 +10435,12 @@ impl Docxy {
     }
     /// Apply a number format code to the selection (Excel's %, currency, comma).
     fn sheet_numfmt(&mut self, code: &'static str, cx: &mut Context<Self>) {
-        self.sheet_format(move |xf| xf.code = Some(code.to_string()), cx);
+        self.sheet_format_rc(numfmt_setter(code), cx);
     }
 
     /// Apply a number format from the Number dropdown ("" = General/clear) + close.
     fn sheet_apply_numfmt(&mut self, code: &str, cx: &mut Context<Self>) {
-        let code = code.to_string();
-        self.sheet_format(
-            move |xf| {
-                xf.code = if code.is_empty() {
-                    None
-                } else {
-                    Some(code.clone())
-                }
-            },
-            cx,
-        );
+        self.sheet_format_rc(numfmt_setter(code), cx);
         self.sheet_numfmt_open = false;
     }
 
@@ -9670,8 +10476,7 @@ impl Docxy {
     }
     /// Toggle a thin box border on the selected cells.
     fn sheet_toggle_border(&mut self, cx: &mut Context<Self>) {
-        let on = !self.active_xf().border;
-        self.sheet_format(move |xf| xf.border = on, cx);
+        self.sheet_toggle(|x| x.border, |x, on| x.border = on, cx);
     }
     /// Freeze panes at the selected cell (toggles off if already frozen). Rows
     /// above and columns left of the selection stay pinned while scrolling.
@@ -9724,8 +10529,9 @@ impl Docxy {
         cx.notify();
     }
 
-    /// Select the next (or previous) cell whose display text contains the query,
-    /// wrapping around, scanning row-major from the current selection.
+    /// Select the next (or previous) cell whose [`SheetView::search_text`]
+    /// contains the query (any case) — the text Replace rewrites — wrapping
+    /// around, scanning row-major from the current selection.
     fn sheet_find_next(&mut self, back: bool, cx: &mut Context<Self>) {
         let q = self.find_query.to_lowercase();
         if q.is_empty() {
@@ -9740,26 +10546,10 @@ impl Docxy {
         // Without this the ring lands on a cell `sel_hidden` is not drawing.
         self.chart_hand_back(cx);
         if let Some(v) = self.active_sheet_mut() {
-            let (mr, mc) = v.extent();
-            let ncols = mc as i64 + 1;
-            let total = (mr as i64 + 1) * ncols;
-            let (sr, sc) = v.sel;
-            let start = sr as i64 * ncols + sc as i64;
-            for step in 1..=total {
-                let idx = if back {
-                    (start - step).rem_euclid(total)
-                } else {
-                    (start + step).rem_euclid(total)
-                };
-                let r = (idx / ncols) as u32;
-                let c = (idx % ncols) as u32;
-                let t = v.cell_text(r, c).to_lowercase();
-                if !t.is_empty() && t.contains(&q) {
-                    v.sel = (r, c);
-                    v.anchor = (r, c);
-                    v.vlist.scroll_to_reveal_item(v.row_list_index(r));
-                    break;
-                }
+            if let Some((r, c)) = v.find_match(&q, back) {
+                v.sel = (r, c);
+                v.anchor = (r, c);
+                v.vlist.scroll_to_reveal_item(v.row_list_index(r));
             }
         }
         cx.notify();
@@ -9780,17 +10570,7 @@ impl Docxy {
         self.sheet_snapshot();
         if let Some(v) = self.active_sheet_mut() {
             let (r, c) = v.sel;
-            let s = v.active;
-            let text = v.cell_text(r, c);
-            if text.to_lowercase().contains(&q.to_lowercase()) {
-                let new = ci_replace(&text, &q, &rep);
-                let style = v.sheet().cell(r, c).map(|cl| cl.style).unwrap_or(0);
-                v.engine.set_cell(
-                    &mut v.pkg.workbook,
-                    (s, r, c),
-                    parse_cell_input(&new, style),
-                );
-            }
+            v.replace_in_cell(r, c, &q, &rep);
         }
         self.mark_sheet_dirty();
         self.sheet_find_next(false, cx);
@@ -9806,22 +10586,10 @@ impl Docxy {
         self.sheet_snapshot();
         let mut n = 0u32;
         if let Some(v) = self.active_sheet_mut() {
-            let (mr, mc) = v.extent();
-            let s = v.active;
-            let ql = q.to_lowercase();
-            for r in 0..=mr {
-                for c in 0..=mc {
-                    let text = v.cell_text(r, c);
-                    if !text.is_empty() && text.to_lowercase().contains(&ql) {
-                        let new = ci_replace(&text, &q, &rep);
-                        let style = v.sheet().cell(r, c).map(|cl| cl.style).unwrap_or(0);
-                        v.engine.set_cell(
-                            &mut v.pkg.workbook,
-                            (s, r, c),
-                            parse_cell_input(&new, style),
-                        );
-                        n += 1;
-                    }
+            let cells: Vec<(u32, u32)> = v.sheet().cells.keys().copied().collect();
+            for (r, c) in cells {
+                if v.replace_in_cell(r, c, &q, &rep) {
+                    n += 1;
                 }
             }
         }
@@ -9979,7 +10747,7 @@ impl Docxy {
                         }
                     }
                 }
-                v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+                v.engine = sheet_engine(&v.pkg.workbook);
             }
         }
     }
@@ -10952,6 +11720,10 @@ impl Docxy {
                 self.sheet_ttc_edit = Some(String::new());
                 cx.notify();
             }
+            SheetAct::NumberFormatMenu => {
+                self.sheet_numfmt_open = !self.sheet_numfmt_open;
+                cx.notify();
+            }
             SheetAct::Todo => {}
         }
         self.refocus(window, cx);
@@ -10959,11 +11731,13 @@ impl Docxy {
 
     /// Route a keystroke to the spreadsheet grid (called from `on_key` when the
     /// active surface is a sheet).
+    #[allow(clippy::too_many_arguments)]
     fn sheet_key(
         &mut self,
         ev: &KeyDownEvent,
         ctrl: bool,
         shift: bool,
+        alt: bool,
         key: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -11023,6 +11797,10 @@ impl Docxy {
             return self.sheet_find_key(ev, shift, key, cx);
         }
         let editing = self.active_sheet().is_some_and(|v| v.editing.is_some());
+        let caret_keys = editing
+            && self
+                .active_sheet()
+                .is_some_and(SheetView::edit_arrows_move_caret);
         // Same as the bar fields above: a focused Chart-panel field owns Ctrl+A.
         // Without this it falls through to the sheet's select-all below, and the
         // field's own handler is dead code.
@@ -11030,6 +11808,65 @@ impl Docxy {
             return self.range_edit_key(ev, ctrl, shift, key, cx);
         }
         if ctrl {
+            // While editing, these chords act on the editor's text, never on
+            // the workbook: Ctrl+Z undoes only the typing (#662).
+            if editing {
+                let handled = self.active_sheet_mut().is_some_and(|v| {
+                    match key {
+                        "left" => v.edit_word_move(false),
+                        "right" => v.edit_word_move(true),
+                        "delete" => v.edit_delete_to_end(),
+                        "z" => v.edit_revert(),
+                        _ => return false,
+                    }
+                    true
+                });
+                if handled {
+                    cx.notify();
+                    return;
+                }
+            }
+            // Excel's entry shortcuts (#663). The harness spells Ctrl+Shift+"
+            // and Ctrl+Shift+; by the shifted character, the platform by the
+            // key with Shift held: take both.
+            let protected = self.sheet_protected();
+            let now = now_serial();
+            match key {
+                "enter" => return self.sheet_commit_to_selection(cx),
+                "'" | "\"" | ";" | ":" => {
+                    let applies = self
+                        .active_sheet()
+                        .is_some_and(|v| v.entry_chord_applies(key));
+                    if let Some(now) = now.filter(|_| !protected && applies) {
+                        self.chart_hand_back(cx);
+                        // No editor yet: open one the way F2 and typing do, so
+                        // the bars and a focused range field give the keyboard
+                        // up (and protection is honoured) before text lands.
+                        if !editing {
+                            self.sheet_begin_edit(Some(String::new()), cx);
+                        }
+                        if let Some(v) = self.active_sheet_mut() {
+                            v.entry_chord(key, shift, now, !editing);
+                        }
+                    }
+                    cx.notify();
+                    return;
+                }
+                "d" | "r" if !editing => {
+                    if !protected {
+                        self.chart_hand_back(cx);
+                        if self
+                            .active_sheet_mut()
+                            .is_some_and(|v| v.fill_selection(key == "d"))
+                        {
+                            self.mark_sheet_dirty();
+                        }
+                    }
+                    cx.notify();
+                    return;
+                }
+                _ => {}
+            }
             // The Ctrl keys that act on the CELLS take the selection back
             // first, for the same reason the arrows do — see `chart_hand_back`.
             // Undo and redo are absent because they drop the chart selection
@@ -11133,8 +11970,48 @@ impl Docxy {
                 }
                 cx.notify();
             }
+            // Alt+Enter: a line feed in the entry; the editor stays open and
+            // the commit turns on Wrap Text (#662).
+            "enter" if alt && editing => {
+                if let Some(v) = self.active_sheet_mut() {
+                    v.edit_type("\n");
+                }
+                cx.notify();
+            }
             "enter" => self.sheet_commit(if shift { -1 } else { 1 }, 0, cx),
+            // F2 while editing switches Enter/Edit mode and keeps the text.
+            "f2" if editing => {
+                if let Some(v) = self.active_sheet_mut() {
+                    v.edit_toggle_mode();
+                }
+                cx.notify();
+            }
             "f2" => self.sheet_begin_edit(None, cx),
+            // F9 while editing a formula: its value replaces the text.
+            "f9" if editing => {
+                if let Some(v) = self.active_sheet_mut() {
+                    v.edit_eval_formula();
+                }
+                cx.notify();
+            }
+            // F4 outside the editor repeats the last formatting change.
+            "f4" if !editing => {
+                if !self.sheet_protected()
+                    && self
+                        .active_sheet_mut()
+                        .is_some_and(SheetView::repeat_format)
+                {
+                    self.mark_sheet_dirty();
+                }
+                cx.notify();
+            }
+            // Insert toggles overtype for this editor session.
+            "insert" if editing => {
+                if let Some(v) = self.active_sheet_mut() {
+                    v.edit_overtype = !v.edit_overtype;
+                }
+                cx.notify();
+            }
             "backspace" => {
                 if editing {
                     if let Some(v) = self.active_sheet_mut() {
@@ -11142,7 +12019,9 @@ impl Docxy {
                     }
                     cx.notify();
                 } else {
-                    self.sheet_clear(cx);
+                    // Excel opens an empty editor over the cell: nothing is
+                    // written until Enter, and Esc gives the content back.
+                    self.sheet_begin_edit(Some(String::new()), cx);
                 }
             }
             "delete" => {
@@ -11155,15 +12034,16 @@ impl Docxy {
                     self.sheet_clear(cx);
                 }
             }
-            // While editing, Left/Right/Home/End move the caret WITHIN the cell
-            // (Excel's edit mode) instead of switching cells.
-            "left" if editing => {
+            // While editing, Left/Right move the caret WITHIN the cell in Edit
+            // mode (and while a formula is typed); in Enter mode they commit
+            // and move. Home/End always move the caret.
+            "left" if caret_keys => {
                 if let Some(v) = self.active_sheet_mut() {
                     v.edit_move(-1);
                 }
                 cx.notify();
             }
-            "right" if editing => {
+            "right" if caret_keys => {
                 if let Some(v) = self.active_sheet_mut() {
                     v.edit_move(1);
                 }
@@ -11197,7 +12077,7 @@ impl Docxy {
                         let protected = self.sheet_protected();
                         if let Some(v) = self.active_sheet_mut() {
                             if v.editing.is_some() {
-                                v.edit_insert(c);
+                                v.edit_type(c);
                             } else if !protected {
                                 // Start a fresh edit with the typed char.
                                 v.begin_cell_edit(Some(String::new()));
@@ -11710,12 +12590,24 @@ impl Docxy {
     /// Save the active document tab to `target` (Save As, or the first save of
     /// an untitled document to a picked path) or to its own file (`None`).
     fn save_doc(&mut self, target: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_doc_to(target, window, cx);
+    }
+
+    /// [`save_doc`](Self::save_doc), reporting whether the file was written:
+    /// the harness's `save-as` passes the dialog's answer here and judges the
+    /// save by this rather than by the tab afterwards.
+    fn save_doc_to(
+        &mut self,
+        target: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         self.flush_hf(); // commit any open header/footer edits into the package first
         let Some(tab) = self.tabs.get(self.active) else {
-            return;
+            return false;
         };
         if !matches!(tab.surface, Surface::Doc(_)) {
-            return;
+            return false;
         }
         // A never-saved document asks where to go, like a never-saved
         // workbook, instead of writing `<cwd>/<title>` over whatever is there.
@@ -11729,22 +12621,25 @@ impl Docxy {
                 // this thread and stops the control pump dead (see `save_sheet_tab`).
                 DocSaveTarget::RefuseHarness => {
                     self.tabs[self.active].status = DOC_NEVER_SAVED_HARNESS.into();
-                    return self.refocus(window, cx);
+                    self.refocus(window, cx);
+                    return false;
                 }
                 DocSaveTarget::NeedsDialog => match self.pick_doc_save_target() {
                     Some(picked) => Some(picked),
                     None => {
                         self.tabs[self.active].status = "save cancelled".into();
-                        return self.refocus(window, cx);
+                        self.refocus(window, cx);
+                        return false;
                     }
                 },
             },
         };
-        save_doc_tab(&mut self.tabs[self.active], target);
+        let saved = save_doc_tab(&mut self.tabs[self.active], target);
         self.backstage = false;
         self.bs_new = false;
         self.persist();
         self.refocus(window, cx);
+        saved
     }
 
     /// Serialize the active spreadsheet back to `.xlsx` (lossless — save_xlsx
@@ -11769,6 +12664,47 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
+    /// Save the active workbook as `target`, as the Save As dialog's answer
+    /// does. Returns whether the file was written; the tab's status says why
+    /// not.
+    fn save_sheet_as(
+        &mut self,
+        target: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return false;
+        };
+        let saved = save_sheet_to(tab, target);
+        self.backstage = false;
+        self.bs_new = false;
+        self.persist();
+        self.refocus(window, cx);
+        saved
+    }
+
+    /// Save the active Project as `target`, as the Save As dialog's answer
+    /// does (`finish_project_save` is that answer's path, through the same
+    /// `apply_save`).
+    fn save_project_to(
+        &mut self,
+        target: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<usize, String> {
+        if !self.commit_active_project_cell() {
+            self.refocus(window, cx);
+            return Err(self.tabs[self.active].status.to_string());
+        }
+        let result = apply_save(&mut self.tabs[self.active], target);
+        self.backstage = false;
+        self.bs_new = false;
+        self.persist();
+        self.refocus(window, cx);
+        result
+    }
+
     fn save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_is_project() {
             return self.save_project(true, window, cx);
@@ -11777,6 +12713,14 @@ impl Docxy {
         // dialog (#206).
         if self.active_is_sheet() {
             return self.save_sheet(true, window, cx);
+        }
+        // ⚠️ Never in a harness instance: `rfd` runs its own modal loop on
+        // this thread and stops the control pump dead (see `save_sheet_tab`).
+        // The Backstage's Save As… is pointer-only, but a dead pump is the
+        // worst way a harness run can fail, so it refuses in words.
+        if doc_save_as_target(self.harness.is_some()) == DocSaveTarget::RefuseHarness {
+            self.set_status(DOC_SAVE_AS_HARNESS);
+            return self.refocus(window, cx);
         }
         match self.pick_doc_save_target() {
             Some(target) => self.save_doc(Some(target), window, cx),
@@ -11798,11 +12742,11 @@ impl Docxy {
             .add_filter("Markdown", &["md", "markdown"]);
         // An open bundle can always be saved as one (it rewraps itself); a new
         // one needs the engine this build may not carry.
-        let from_bundle = self
+        if self
             .tabs
             .get(self.active)
-            .is_some_and(|t| t.bundle_html.is_some());
-        if from_bundle || html_bundle::can_export() {
+            .is_some_and(doc_html_save_allowed)
+        {
             dialog = dialog.add_filter("Editable HTML (*.docx.html)", &["html"]);
         }
         // The name is written as picked (the dialog already asked about
@@ -11935,13 +12879,7 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) {
         if let Some(ed) = self.edit_target() {
-            if extend {
-                ed.extend_selection(true); // anchor at the current caret if none, else keep it
-            } else {
-                ed.clear_selection();
-            }
-            ed.caret = Caret::at(path, offset);
-            ed.clamp();
+            place_click_caret(ed, Caret::at(path, offset), extend, false);
         }
         self.focus.focus(window, cx);
         self.focused = true;
@@ -11961,16 +12899,7 @@ impl Docxy {
         self.mini_bar = None;
         self.close_menu();
         if let Some(ed) = self.edit_target() {
-            if extend {
-                ed.extend_selection(true); // anchor at the current caret if none
-            } else {
-                ed.clear_selection();
-            }
-            ed.caret = Caret::at(path, offset);
-            if !extend {
-                ed.extend_selection(true); // plant the anchor here so a drag extends from it
-            }
-            ed.clamp();
+            place_click_caret(ed, Caret::at(path, offset), extend, true);
         }
         self.selecting = true;
         self.focus.focus(window, cx);
@@ -13870,7 +14799,7 @@ impl Docxy {
         // Spreadsheet surface: the grid has its own key handling (navigation,
         // cell editing, recalc) — nothing routes to a text editor.
         if self.active_is_sheet() {
-            return self.sheet_key(ev, ctrl, shift, key.as_str(), window, cx);
+            return self.sheet_key(ev, ctrl, shift, m.alt, key.as_str(), window, cx);
         }
         if self.active_is_project() {
             return self.project_key(ev, window, cx);
@@ -13991,9 +14920,29 @@ impl Docxy {
     }
 }
 
+/// What a harness instance says when asked to Save As a document.
+const DOC_SAVE_AS_HARNESS: &str = "This document needs Save As, and a harness instance cannot open the Save As dialog; use the harness save-as verb";
+
+/// Where a document Save As goes: always the dialog, which a harness instance
+/// must not open.
+fn doc_save_as_target(harness: bool) -> DocSaveTarget {
+    if harness {
+        DocSaveTarget::RefuseHarness
+    } else {
+        DocSaveTarget::NeedsDialog
+    }
+}
+
 /// What a harness instance says when asked to save a never-saved document.
-const DOC_NEVER_SAVED_HARNESS: &str =
-    "this document has never been saved, and a harness instance cannot open the Save As dialog";
+const DOC_NEVER_SAVED_HARNESS: &str = "this document has never been saved, and a harness instance cannot open the Save As dialog; use the harness save-as verb";
+
+/// Whether a document tab may be saved as an editable-HTML page: an open
+/// bundle can always be (it rewraps itself), a new one needs the engine this
+/// build may not carry. The Save As dialog offers the HTML filter on this, and
+/// the harness's `save-as` accepts `.html` on it.
+fn doc_html_save_allowed(tab: &DocTab) -> bool {
+    tab.bundle_html.is_some() || html_bundle::can_export()
+}
 
 /// Where a document Save goes, decided before anything is written.
 #[derive(Debug, PartialEq, Eq)]
@@ -14015,11 +14964,9 @@ fn doc_save_target(path: Option<&std::path::Path>, harness: bool) -> DocSaveTarg
 }
 
 /// What a harness instance says when asked to save a never-saved workbook.
-const SHEET_NEVER_SAVED_HARNESS: &str =
-    "this workbook has never been saved, and a harness instance cannot open the Save As dialog";
+const SHEET_NEVER_SAVED_HARNESS: &str = "this workbook has never been saved, and a harness instance cannot open the Save As dialog; use the harness save-as verb";
 /// What a harness instance says when asked to Save As a workbook.
-const SHEET_SAVE_AS_HARNESS: &str =
-    "This workbook needs Save As, and a harness instance cannot open the Save As dialog";
+const SHEET_SAVE_AS_HARNESS: &str = "This workbook needs Save As, and a harness instance cannot open the Save As dialog; use the harness save-as verb";
 
 /// Where a workbook Save goes, decided before any dialog opens.
 #[derive(Debug, PartialEq, Eq)]
@@ -14066,7 +15013,9 @@ fn save_sheet_tab(
     // Commit before choosing a target so the decision and write see the edit.
     close::prepare_sheet_save(tab);
     match sheet_save_decision(tab.path.as_deref(), &tab.title, harness, explicit_save_as) {
-        SheetSaveDecision::InPlace(path) => finish_sheet_save(tab, Some(&path)),
+        SheetSaveDecision::InPlace(path) => {
+            finish_sheet_save(tab, Some(&path));
+        }
         // A never-saved workbook or Save As asks where to go, Excel-style.
         SheetSaveDecision::Dialog { suggested } => {
             let target = pick(suggested);
@@ -14095,24 +15044,32 @@ fn sheet_save_target(path: &std::path::Path) -> Result<PathBuf, String> {
     }
 }
 
+/// Save As a workbook tab to `target` without a dialog: the commit a Save
+/// makes first, then the write the dialog's answer feeds. Returns whether the
+/// file was written.
+fn save_sheet_to(tab: &mut DocTab, target: &std::path::Path) -> bool {
+    close::prepare_sheet_save(tab);
+    finish_sheet_save(tab, Some(target))
+}
+
 /// Write the workbook tab to `target` (`None` is a cancelled dialog). The tab
 /// is rebound (title, path, clean) only after a successful write; either way
-/// its status says what happened. The Markdown flag is a document's and is
-/// never touched here.
-fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) {
+/// its status says what happened, and the result is whether it was written.
+/// The Markdown flag is a document's and is never touched here.
+fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) -> bool {
     let Some(target) = target else {
         tab.status = "save cancelled".into();
-        return;
+        return false;
     };
     let Surface::Sheet(v) = &tab.surface else {
         tab.status = "this tab is not a workbook and cannot be saved as one".into();
-        return;
+        return false;
     };
     let path = match sheet_save_target(target) {
         Ok(path) => path,
         Err(e) => {
             tab.status = e.into();
-            return;
+            return false;
         }
     };
     let bytes = sheet_bytes(v);
@@ -14122,15 +15079,83 @@ fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) {
             tab.status = format!("saved {} bytes → {}", bytes.len(), path.display()).into();
             tab.path = Some(path);
             tab.dirty = false;
+            true
         }
-        Err(e) => tab.status = format!("save failed: {e}").into(),
+        Err(e) => {
+            tab.status = format!("save failed: {e}").into();
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::{ClipRead, ClipboardStore, grid_paste_uses_clip};
+
+    /// #699: a harness instance never reads or writes the OS clipboard, and
+    /// starts from an empty private one.
+    #[test]
+    fn a_harness_clipboard_is_private_and_starts_empty() {
+        let mut store = ClipboardStore::default();
+        let os_read = || -> Option<Option<String>> { panic!("a harness read the OS clipboard") };
+        assert_eq!(store.read(true, os_read), ClipRead::Nothing);
+        store.write(true, "cells".into(), |_| {
+            panic!("a harness wrote the OS clipboard")
+        });
+        assert_eq!(store.read(true, os_read), ClipRead::Text("cells".into()));
+        // An empty copy reads as the OS clipboard reads one: an item, no text.
+        store.write(true, String::new(), |_| {
+            panic!("a harness wrote the OS clipboard")
+        });
+        assert_eq!(store.read(true, os_read), ClipRead::NotText);
+    }
+
+    #[test]
+    fn a_normal_instance_uses_the_os_clipboard_only() {
+        let mut store = ClipboardStore::default();
+        let mut written = None;
+        store.write(false, "tsv".into(), |t| written = Some(t));
+        assert_eq!(written.as_deref(), Some("tsv"));
+        assert_eq!(
+            store.read(false, || Some(Some("os".into()))),
+            ClipRead::Text("os".into())
+        );
+        assert_eq!(store.read(false, || Some(None)), ClipRead::NotText);
+        assert_eq!(store.read(false, || None), ClipRead::Nothing);
+    }
+
+    /// #699: after another app copies, a sheet paste takes that copy rather
+    /// than the older grid clip, text or not; while the clipboard still holds
+    /// our TSV (the OS may hand it back with CRLF) the grid clip keeps formats
+    /// and formulas; and a clipboard with no item cannot say it changed.
+    #[test]
+    fn a_grid_clip_is_pasted_only_while_the_clipboard_still_holds_it() {
+        let ours = "a\tb\n1\t2\n";
+        let text = |t: &str| ClipRead::Text(t.into());
+        assert!(grid_paste_uses_clip(ours, &text(ours)));
+        assert!(grid_paste_uses_clip(ours, &text("a\tb\r\n1\t2\r\n")));
+        assert!(grid_paste_uses_clip(ours, &ClipRead::Nothing));
+        assert!(!grid_paste_uses_clip(ours, &text("from another app")));
+        assert!(
+            !grid_paste_uses_clip(ours, &ClipRead::NotText),
+            "an image copied since is newer than our cells"
+        );
     }
 }
 
 #[cfg(test)]
 mod doc_save_target_tests {
-    use super::{DocSaveTarget, doc_save_target};
+    use super::{DOC_SAVE_AS_HARNESS, DocSaveTarget, doc_save_as_target, doc_save_target};
     use std::path::Path;
+
+    /// #699: the Backstage's Save As… asks with the dialog, except in a
+    /// harness instance, which refuses in words and points at `save-as`.
+    #[test]
+    fn a_document_save_as_asks_or_refuses_in_a_harness() {
+        assert_eq!(doc_save_as_target(false), DocSaveTarget::NeedsDialog);
+        assert_eq!(doc_save_as_target(true), DocSaveTarget::RefuseHarness);
+        assert!(DOC_SAVE_AS_HARNESS.ends_with("use the harness save-as verb"));
+    }
 
     #[test]
     fn a_saved_document_saves_in_place_harness_or_not() {
@@ -14199,6 +15224,34 @@ mod load_failed_save_tests {
         assert_eq!(tab.path.as_deref(), Some(path));
         assert_eq!(std::fs::read(path).ok(), before, "{}", path.display());
         tab
+    }
+
+    /// #699: a Save As to `.md` (what the harness's `save-as` feeds) rebinds
+    /// the tab as Markdown, so the next plain Save writes Markdown too, and
+    /// a Save As back to `.docx` writes a Word package again.
+    #[test]
+    fn a_markdown_save_as_makes_later_saves_markdown() {
+        let dir = temp("md-save-as");
+        let source = dir.join("basic.docx");
+        std::fs::write(&source, basic_docx()).unwrap();
+        let mut tab = tab_from_path(&source);
+        let md = dir.join("notes.md");
+        assert!(save_doc_tab(&mut tab, Some(md.clone())));
+        assert!(tab.markdown);
+        assert_eq!(tab.path.as_deref(), Some(md.as_path()));
+        tab.dirty = true;
+        std::fs::write(&md, b"stale").unwrap();
+        assert!(save_doc_tab(&mut tab, None));
+        let written = std::fs::read(&md).unwrap();
+        assert!(
+            !written.starts_with(b"PK"),
+            "a plain save wrote a Word package"
+        );
+        assert_ne!(written, b"stale");
+        let docx = dir.join("back.docx");
+        assert!(save_doc_tab(&mut tab, Some(docx.clone())));
+        assert!(!tab.markdown);
+        assert!(std::fs::read(&docx).unwrap().starts_with(b"PK"));
     }
 
     fn utf16_bom(text: &str, little_endian: bool) -> Vec<u8> {
@@ -14456,7 +15509,8 @@ mod load_failed_save_tests {
 mod sheet_save_tests {
     use super::{
         DocTab, Kind, SHEET_NEVER_SAVED_HARNESS, SHEET_SAVE_AS_HARNESS, SheetSaveDecision, Surface,
-        finish_sheet_save, new_sheet_surface, sheet_bytes, sheet_save_decision, sheet_save_target,
+        finish_sheet_save, new_sheet_surface, save_sheet_to, sheet_bytes, sheet_save_decision,
+        sheet_save_target,
     };
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14541,7 +15595,7 @@ mod sheet_save_tests {
         }
         assert_eq!(
             SHEET_SAVE_AS_HARNESS,
-            "This workbook needs Save As, and a harness instance cannot open the Save As dialog"
+            "This workbook needs Save As, and a harness instance cannot open the Save As dialog; use the harness save-as verb"
         );
     }
 
@@ -14564,7 +15618,7 @@ mod sheet_save_tests {
         );
         assert_eq!(
             SHEET_NEVER_SAVED_HARNESS,
-            "this workbook has never been saved, and a harness instance cannot open the Save As dialog"
+            "this workbook has never been saved, and a harness instance cannot open the Save As dialog; use the harness save-as verb"
         );
     }
 
@@ -14610,6 +15664,39 @@ mod sheet_save_tests {
             tab.status.as_ref(),
             format!("saved {} bytes → {}", expected.len(), target.display())
         );
+    }
+
+    /// #699: the harness's `save-as` writes a workbook through this, and
+    /// judges the save by what it returns, not by the tab afterwards: a failed
+    /// write onto the tab's own clean path would otherwise look like success.
+    #[test]
+    fn save_sheet_to_reports_whether_it_wrote() {
+        let dir = Scratch::new();
+        let target = dir.path("copy.xlsx");
+        let mut tab = sheet_tab(None, "Untitled.xlsx");
+        assert!(save_sheet_to(&mut tab, &target));
+        assert!(target.is_file());
+        assert_eq!(tab.path.as_deref(), Some(target.as_path()));
+        assert!(!tab.dirty);
+
+        // A clean tab whose write fails stays bound and clean, so only the
+        // result says it failed: here the target is a directory.
+        let folder = dir.path("folder.xlsx");
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut clean = sheet_tab(Some(folder.clone()), "folder.xlsx");
+        clean.dirty = false;
+        assert!(!save_sheet_to(&mut clean, &folder));
+        assert!(clean.status.starts_with("save failed"), "{}", clean.status);
+        assert_eq!(clean.path.as_deref(), Some(folder.as_path()));
+        assert!(!clean.dirty);
+
+        let mut other = sheet_tab(None, "Untitled.xlsx");
+        assert!(!save_sheet_to(&mut other, &dir.path("copy.csv")));
+        assert_eq!(
+            other.status.as_ref(),
+            "Workbooks can only be saved as .xlsx"
+        );
+        assert!(other.path.is_none());
     }
 
     #[test]
@@ -14754,32 +15841,6 @@ fn ci_replace(hay: &str, needle: &str, rep: &str) -> String {
     }
     out.push_str(&hay[i..]);
     out
-}
-
-fn parse_cell_input(raw: &str, style: u32) -> gridcore::sheet::Cell {
-    use gridcore::sheet::{Cell, CellValue};
-    let t = raw.trim();
-    let mut cell = if t.is_empty() {
-        Cell::default()
-    } else if let Some(f) = t.strip_prefix('=') {
-        Cell::formula(f)
-    } else if let Ok(n) = t.parse::<f64>() {
-        Cell::number(n)
-    } else if t.eq_ignore_ascii_case("true") {
-        Cell {
-            value: CellValue::Bool(true),
-            ..Cell::default()
-        }
-    } else if t.eq_ignore_ascii_case("false") {
-        Cell {
-            value: CellValue::Bool(false),
-            ..Cell::default()
-        }
-    } else {
-        Cell::text(raw)
-    };
-    cell.style = style;
-    cell
 }
 
 fn yes(mut f: impl FnMut()) -> bool {
@@ -15955,6 +17016,19 @@ fn emit_run(
     *idx = end;
 }
 
+/// How far one piece from `flat_inlines` advances `paragraph_el`'s caret offset
+/// (`idx`): a run's characters, one for a tab, a break or a field showing a
+/// result (#642), none for anything else (links are already opened up). This
+/// is the engine's `inline_len` for those pieces; `paragraph_el` asserts it.
+fn caret_advance(inline: &Inline) -> usize {
+    match inline {
+        Inline::Run(_) | Inline::Tab(_) | Inline::Break(_) | Inline::Field { .. } => {
+            docxcore::editor::inline_len(inline)
+        }
+        _ => 0,
+    }
+}
+
 /// A tab is ONE char in the engine; render it as a fixed-width spacer that
 /// advances to its tab stop (`width` px, computed by the caller). Keeps `idx` in
 /// sync and participates in caret/selection like any other char.
@@ -16482,6 +17556,7 @@ fn paragraph_el(
     }
     for i in 0..items.len() {
         let (inline, in_link) = (&*items[i].0, items[i].1);
+        let idx_before = idx;
         match inline {
             Inline::Run(r) => {
                 emit_run(
@@ -16532,22 +17607,47 @@ fn paragraph_el(
             }
             Inline::Field { text, .. } => {
                 // Show the field's cached value with a subtle shade so it reads as a
-                // field, not plain text.
+                // field, not plain text. A field showing a result is ONE char in the
+                // engine (#642), edited as a unit: it takes the caret before it, a
+                // click, and the selection highlight like a tab does. An empty one
+                // takes no offset.
                 let shown = if text.is_empty() {
                     "[field]".to_string()
                 } else {
                     text.clone()
                 };
+                let width = caret_advance(inline);
+                let pos = idx;
+                if width == 1 && caret == Some(pos) {
+                    spans.push(caret_bar());
+                    caret = None;
+                }
+                let selected = width == 1 && sel.is_some_and(|(s, e)| s < e && s <= pos && pos < e);
                 spans.push(
                     div()
                         .px(px(2.))
                         .rounded_sm()
-                        .bg(pal.panel)
+                        .bg(if selected { pal.sel } else { pal.panel })
                         .text_size(px(base))
                         .text_color(pal.fg)
                         .child(SharedString::from(shown))
+                        .when_some(click.filter(|_| width == 1), |d, c| {
+                            let ent = c.ent.clone();
+                            let path = c.path.to_vec();
+                            d.cursor_text().on_mouse_down(
+                                MouseButton::Left,
+                                move |ev, window, cx| {
+                                    cx.stop_propagation();
+                                    let extend = ev.modifiers.shift;
+                                    ent.update(cx, |this, cx| {
+                                        this.set_caret(path.clone(), pos, extend, window, cx)
+                                    });
+                                },
+                            )
+                        })
                         .into_any_element(),
                 );
+                idx += width;
                 x += inline_w(inline);
             }
             Inline::FootnoteRef { id, .. } => {
@@ -16643,6 +17743,11 @@ fn paragraph_el(
                 );
             }
         }
+        debug_assert_eq!(
+            idx - idx_before,
+            caret_advance(inline),
+            "paragraph_el and the engine disagree on {inline:?}'s offsets"
+        );
     }
     if caret.is_some() {
         spans.push(caret_bar());
@@ -17573,11 +18678,12 @@ impl Docxy {
             .into_any_element()
     }
 
-    /// A combo-box display (font name/size, number format) — inert for now.
+    /// A combo-box display (font name/size) — inert for now.
     fn sheet_combo(
         &self,
         value: &'static str,
         wide: bool,
+        act: SheetAct,
         pal: Pal,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -17609,9 +18715,7 @@ impl Docxy {
                     .text_color(pal.dim)
                     .child("\u{25BE}"),
             )
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.run_sheet_act(SheetAct::Todo, window, cx)
-            }))
+            .on_click(cx.listener(move |this, _, window, cx| this.run_sheet_act(act, window, cx)))
             .into_any_element()
     }
 
@@ -17647,9 +18751,8 @@ impl Docxy {
                     .text_color(pal.dim)
                     .child("\u{25BE}"),
             )
-            .on_click(cx.listener(|this, _, _w, cx| {
-                this.sheet_numfmt_open = !this.sheet_numfmt_open;
-                cx.notify();
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.run_sheet_act(SheetAct::NumberFormatMenu, window, cx)
             }))
             .into_any_element()
     }
@@ -18526,7 +19629,7 @@ impl Docxy {
             if let Some(v) = self.active_sheet_mut() {
                 let s = v.active;
                 v.pkg.clear_conditional_formats(s);
-                v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+                v.engine = sheet_engine(&v.pkg.workbook);
             }
             self.mark_sheet_dirty();
         } else if let Some(((op, val, val2), cells)) = parse_cf_input(&buf).zip(cells) {
@@ -18535,7 +19638,7 @@ impl Docxy {
                 let s = v.active;
                 v.pkg
                     .add_conditional_format(s, cells, op, &val, val2.as_deref(), cf_preset_dxf());
-                v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+                v.engine = sheet_engine(&v.pkg.workbook);
             }
             self.mark_sheet_dirty();
         }
@@ -18728,468 +19831,139 @@ impl Docxy {
             .into_any_element()
     }
 
-    /// The spreadsheet ribbon body — the Home tab, or the Insert tab (Tables).
+    /// The spreadsheet ribbon body for the selected tab, drawn from the
+    /// `sheet_ribbon` table (Home for a tab without its own entry). The table
+    /// is also what `ribbon-read` reports, so the two cannot disagree.
     fn sheet_ribbon_body(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        match self.ribbon_tab {
-            RibbonTab::Insert => self.sheet_insert_ribbon(pal, cx),
-            RibbonTab::Review => self.sheet_review_ribbon(pal, cx),
-            RibbonTab::View => self.sheet_view_ribbon(pal, cx),
-            _ => self.sheet_home_ribbon(pal, cx),
+        let tab = sheet_ribbon::tab_def(self.ribbon_tab);
+        let xf = self.active_xf();
+        h_flex()
+            .id("sheet-ribbon")
+            .w_full()
+            .h(px(100.))
+            .items_stretch()
+            .px_1()
+            .bg(pal.panel)
+            .border_b_1()
+            .border_color(pal.border)
+            .overflow_x_scroll()
+            .children(
+                tab.groups
+                    .iter()
+                    .map(|g| self.sheet_group(g, tab.titles, &xf, pal, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// Whether a sheet command's state is on, for the commands whose label
+    /// reads differently then (Unfreeze Panes, Unprotect Sheet).
+    fn sheet_act_toggled(&self, act: SheetAct) -> bool {
+        match act {
+            SheetAct::FreezePanes => self
+                .active_sheet()
+                .is_some_and(|v| v.sheet().freeze != (0, 0)),
+            SheetAct::ProtectSheet => self.sheet_protected(),
+            _ => false,
         }
     }
 
-    /// The Insert tab: a Tables group (PivotTable, Table) like Excel.
-    fn sheet_insert_ribbon(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let group = |title: &str, body: AnyElement| -> AnyElement {
-            v_flex()
-                .h(px(94.))
-                .px_1p5()
-                .py(px(3.))
-                .justify_between()
-                .border_r_1()
-                .border_color(pal.border)
-                .child(div().flex_1().flex().items_center().child(body))
-                .child(
-                    div()
-                        .w_full()
-                        .text_size(px(10.))
-                        .text_color(pal.dim)
-                        .text_center()
-                        .child(title.to_string()),
-                )
-                .into_any_element()
+    /// One sheet ribbon group: content on top, a centered label (+ optional
+    /// dialog launcher) at the bottom, and a right divider — exactly like the
+    /// doc ribbon.
+    fn sheet_group(
+        &self,
+        g: &sheet_ribbon::Group,
+        titles: sheet_ribbon::Titles,
+        xf: &gridcore::sheet::Xf,
+        pal: Pal,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use sheet_ribbon::{Body, Item};
+        let gap = |d: Div, g: sheet_ribbon::Gap| match g {
+            sheet_ribbon::Gap::Px(v) => d.gap(px(v)),
+            sheet_ribbon::Gap::Rem(v) => d.gap(rems(v)),
         };
-        h_flex()
-            .id("sheet-ribbon")
-            .w_full()
-            .h(px(100.))
-            .items_stretch()
-            .px_1()
-            .bg(pal.panel)
-            .border_b_1()
-            .border_color(pal.border)
-            .overflow_x_scroll()
-            .child(group(
-                "Tables",
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_1()
-                    .child(self.sheet_lb(
-                        Some("table"),
-                        "PivotTable",
-                        SheetAct::InsertPivot,
-                        pal,
-                        cx,
-                    ))
-                    .child(self.sheet_lb(Some("table"), "Table", SheetAct::FormatAsTable, pal, cx))
-                    .child(self.sheet_lb(
-                        None,
-                        "Data Validation",
-                        SheetAct::DataValidation,
-                        pal,
-                        cx,
-                    ))
-                    .child(self.sheet_lb(None, "Text to Columns", SheetAct::TextToColumns, pal, cx))
-                    .into_any_element(),
-            ))
-            .child(group(
-                "Outline",
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_1()
-                    .child(self.sheet_lb(None, "Subtotal", SheetAct::Subtotal, pal, cx))
-                    .child(self.sheet_lb(None, "Group / Ungroup", SheetAct::Outline, pal, cx))
-                    .into_any_element(),
-            ))
-            .child(group(
-                "Charts",
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_1()
-                    .child(self.sheet_lb(None, "Column", SheetAct::InsertChart("column"), pal, cx))
-                    .child(self.sheet_lb(None, "Bar", SheetAct::InsertChart("bar"), pal, cx))
-                    .child(self.sheet_lb(None, "Line", SheetAct::InsertChart("line"), pal, cx))
-                    .child(self.sheet_lb(None, "Pie", SheetAct::InsertChart("pie"), pal, cx))
-                    .into_any_element(),
-            ))
-            .into_any_element()
-    }
-
-    /// The Review tab, laid out like Excel: Proofing, Comments, Protect. These
-    /// aren't modeled for sheets yet (no cell-comment model), so the buttons are
-    /// inert placeholders — the point is a distinct, Excel-faithful tab identity
-    /// (it used to fall through to the Home ribbon).
-    fn sheet_review_ribbon(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let group = |title: &str, body: AnyElement| -> AnyElement {
-            v_flex()
-                .h(px(94.))
-                .px_1p5()
-                .py(px(3.))
-                .justify_between()
-                .border_r_1()
-                .border_color(pal.border)
-                .child(div().flex_1().flex().items_center().child(body))
-                .child(
-                    div()
-                        .w_full()
-                        .text_size(px(10.))
-                        .text_color(pal.dim)
-                        .text_center()
-                        .child(title.to_string()),
-                )
-                .into_any_element()
-        };
-        h_flex()
-            .id("sheet-ribbon")
-            .w_full()
-            .h(px(100.))
-            .items_stretch()
-            .px_1()
-            .bg(pal.panel)
-            .border_b_1()
-            .border_color(pal.border)
-            .overflow_x_scroll()
-            .child(group(
-                "Proofing",
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_1()
-                    .child(self.sheet_lb(None, "Spelling", SheetAct::Todo, pal, cx))
-                    .into_any_element(),
-            ))
-            .child(group(
-                "Comments",
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_1()
-                    .child(self.sheet_lb(None, "New Comment", SheetAct::NewComment, pal, cx))
-                    .child(self.sheet_lb(None, "Delete", SheetAct::DeleteComment, pal, cx))
-                    .child(self.sheet_lb(None, "Previous", SheetAct::PrevComment, pal, cx))
-                    .child(self.sheet_lb(None, "Next", SheetAct::NextComment, pal, cx))
-                    .into_any_element(),
-            ))
-            .child(group(
-                "Protect",
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_1()
-                    .child(self.sheet_lb(
-                        Some("lock"),
-                        if self.sheet_protected() {
-                            "Unprotect Sheet"
-                        } else {
-                            "Protect Sheet"
-                        },
-                        SheetAct::ProtectSheet,
-                        pal,
-                        cx,
-                    ))
-                    .child(self.sheet_lb(None, "Protect Workbook", SheetAct::Todo, pal, cx))
-                    .into_any_element(),
-            ))
-            .into_any_element()
-    }
-
-    /// The View tab: a Window group with Freeze Panes, like Excel.
-    fn sheet_view_ribbon(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let frozen = self
-            .active_sheet()
-            .is_some_and(|v| v.sheet().freeze != (0, 0));
-        let group = |title: &str, body: AnyElement| -> AnyElement {
-            v_flex()
-                .h(px(94.))
-                .px_1p5()
-                .py(px(3.))
-                .justify_between()
-                .border_r_1()
-                .border_color(pal.border)
-                .child(div().flex_1().flex().items_center().child(body))
-                .child(
-                    div()
-                        .w_full()
-                        .text_size(px(10.))
-                        .text_color(pal.dim)
-                        .text_center()
-                        .child(title.to_string()),
-                )
-                .into_any_element()
-        };
-        h_flex()
-            .id("sheet-ribbon")
-            .w_full()
-            .h(px(100.))
-            .items_stretch()
-            .px_1()
-            .bg(pal.panel)
-            .border_b_1()
-            .border_color(pal.border)
-            .overflow_x_scroll()
-            .child(group(
-                "Window",
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_1()
-                    .child(self.sheet_lb(
-                        None,
-                        if frozen {
-                            "Unfreeze Panes"
-                        } else {
-                            "Freeze Panes"
-                        },
-                        SheetAct::FreezePanes,
-                        pal,
-                        cx,
-                    ))
-                    .into_any_element(),
-            ))
-            .into_any_element()
-    }
-
-    /// The spreadsheet Home tab, laid out like Excel: Clipboard, Font, Alignment,
-    /// Number, Styles, Cells, Editing.
-    fn sheet_home_ribbon(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let xf = self.active_xf();
-        // A group frame: content on top, a centered label (+ optional dialog
-        // launcher) at the bottom, and a right divider — exactly like the doc ribbon.
-        let group = |title: &str, launcher: bool, body: AnyElement| -> AnyElement {
-            v_flex()
-                .h(px(94.))
-                .px_1p5()
-                .py(px(3.))
-                .justify_between()
-                .border_r_1()
-                .border_color(pal.border)
-                .child(div().flex_1().flex().items_center().child(body))
-                .child(
+        let body = match &g.body {
+            Body::Strip {
+                gap: strip_gap,
+                items,
+            } => {
+                let mut strip = gap(h_flex().h_full().items_center(), *strip_gap);
+                for item in *items {
+                    strip = strip.child(match item {
+                        Item::One(c) => self.sheet_cmd_el(c, xf, pal, cx),
+                        Item::Col { gap: col_gap, cmds } => gap(v_flex(), *col_gap)
+                            .children(cmds.iter().map(|c| self.sheet_cmd_el(c, xf, pal, cx)))
+                            .into_any_element(),
+                    });
+                }
+                strip.into_any_element()
+            }
+            Body::Rows(rows) => v_flex()
+                .gap(px(1.))
+                .children(rows.iter().map(|r| {
                     h_flex()
-                        .w_full()
                         .items_center()
-                        .justify_center()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_size(px(10.))
-                                .text_color(pal.dim)
-                                .child(title.to_string()),
-                        )
-                        .when(launcher, |d| {
-                            d.child(
-                                div()
-                                    .text_size(px(9.))
-                                    .text_color(pal.dim)
-                                    .child("\u{2921}"),
-                            )
-                        }),
-                )
-                .into_any_element()
+                        .gap(px(2.))
+                        .children(r.iter().map(|c| self.sheet_cmd_el(c, xf, pal, cx)))
+                }))
+                .into_any_element(),
         };
-        let row = |kids: Vec<AnyElement>| {
-            h_flex()
-                .items_center()
-                .gap(px(2.))
-                .children(kids)
-                .into_any_element()
-        };
-        let col = |kids: Vec<AnyElement>| v_flex().gap(px(1.)).children(kids).into_any_element();
-
-        h_flex()
-            .id("sheet-ribbon")
-            .w_full()
-            .h(px(100.))
-            .items_stretch()
-            .px_1()
-            .bg(pal.panel)
-            .border_b_1()
+        v_flex()
+            .h(px(94.))
+            .px_1p5()
+            .py(px(3.))
+            .justify_between()
+            .border_r_1()
             .border_color(pal.border)
-            .overflow_x_scroll()
-            // Clipboard: big Paste + a Cut/Copy/Format-Painter column.
-            .child(group(
-                "Clipboard",
-                true,
-                h_flex()
-                    .h_full()
+            .child(div().flex_1().flex().items_center().child(body))
+            .child(match titles {
+                sheet_ribbon::Titles::WithLaunchers => h_flex()
+                    .w_full()
                     .items_center()
+                    .justify_center()
                     .gap_1()
-                    .child(self.sheet_lb(Some("paste"), "Paste", SheetAct::Paste, pal, cx))
-                    .child(col(vec![
-                        self.sheet_rb(Some("cut"), "Cut", SheetAct::Cut, pal, cx),
-                        self.sheet_rb(Some("copy"), "Copy", SheetAct::Copy, pal, cx),
-                        self.sheet_rb(None, "Format Painter", SheetAct::Todo, pal, cx),
-                    ]))
+                    .child(div().text_size(px(10.)).text_color(pal.dim).child(g.title))
+                    .when(g.launcher, |d| {
+                        d.child(
+                            div()
+                                .text_size(px(9.))
+                                .text_color(pal.dim)
+                                .child("\u{2921}"),
+                        )
+                    })
                     .into_any_element(),
-            ))
-            // Font: name/size combos + grow/shrink; then B/I/U, borders, fill, colour.
-            .child(group(
-                "Font",
-                true,
-                col(vec![
-                    row(vec![
-                        self.sheet_combo("Calibri", true, pal, cx),
-                        self.sheet_combo("11", false, pal, cx),
-                        self.sheet_ib("font-increase", SheetAct::GrowFont, false, pal, cx),
-                        self.sheet_ib("font-decrease", SheetAct::ShrinkFont, false, pal, cx),
-                    ]),
-                    row(vec![
-                        self.sheet_ib("bold", SheetAct::Bold, xf.bold, pal, cx),
-                        self.sheet_ib("italic", SheetAct::Italic, xf.italic, pal, cx),
-                        self.sheet_ib("underline", SheetAct::Todo, false, pal, cx),
-                        self.sheet_ib("border-bottom", SheetAct::ToggleBorder, xf.border, pal, cx),
-                        self.sheet_ib("highlight", SheetAct::FillColor, false, pal, cx),
-                        self.sheet_ib("text-color", SheetAct::FontColor, false, pal, cx),
-                    ]),
-                ]),
-            ))
-            // Alignment: top/mid/bottom + wrap; then left/center/right, indent, merge.
-            .child(group(
-                "Alignment",
-                true,
-                col(vec![
-                    row(vec![
-                        self.sheet_gb("\u{2580}", SheetAct::Todo, pal, cx),
-                        self.sheet_gb("\u{25AC}", SheetAct::Todo, pal, cx),
-                        self.sheet_gb("\u{2584}", SheetAct::Todo, pal, cx),
-                        self.sheet_rb(None, "Wrap Text", SheetAct::WrapText, pal, cx),
-                    ]),
-                    row(vec![
-                        self.sheet_ib(
-                            "align-left",
-                            SheetAct::AlignL,
-                            matches!(xf.align, gridcore::sheet::Align::Left),
-                            pal,
-                            cx,
-                        ),
-                        self.sheet_ib(
-                            "align-center",
-                            SheetAct::AlignC,
-                            matches!(xf.align, gridcore::sheet::Align::Center),
-                            pal,
-                            cx,
-                        ),
-                        self.sheet_ib(
-                            "align-right",
-                            SheetAct::AlignR,
-                            matches!(xf.align, gridcore::sheet::Align::Right),
-                            pal,
-                            cx,
-                        ),
-                        self.sheet_ib("indent-decrease", SheetAct::Todo, false, pal, cx),
-                        self.sheet_rb(None, "Row Height", SheetAct::RowHeight, pal, cx),
-                        self.sheet_rb(None, "Merge", SheetAct::Merge, pal, cx),
-                    ]),
-                ]),
-            ))
-            // Number: format combo; then currency/percent/comma + decimals.
-            .child(group(
-                "Number",
-                true,
-                col(vec![
-                    row(vec![self.sheet_numfmt_combo(pal, cx)]),
-                    row(vec![
-                        self.sheet_gb("$", SheetAct::Currency, pal, cx),
-                        self.sheet_gb("%", SheetAct::Percent, pal, cx),
-                        self.sheet_gb(",", SheetAct::Comma, pal, cx),
-                        self.sheet_gb("\u{2192}.0", SheetAct::Todo, pal, cx),
-                        self.sheet_gb(".00\u{2190}", SheetAct::Todo, pal, cx),
-                    ]),
-                ]),
-            ))
-            // Styles: Conditional Formatting, Format as Table, Cell Styles.
-            .child(group(
-                "Styles",
-                false,
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_0p5()
-                    .child(self.sheet_lb(
-                        None,
-                        "Conditional Formatting",
-                        SheetAct::CondFormat,
-                        pal,
-                        cx,
-                    ))
-                    .child(self.sheet_lb(
-                        Some("table"),
-                        "Format as Table",
-                        SheetAct::FormatAsTable,
-                        pal,
-                        cx,
-                    ))
-                    .child(self.sheet_lb(None, "Cell Styles", SheetAct::Todo, pal, cx))
+                sheet_ribbon::Titles::Plain => div()
+                    .w_full()
+                    .text_size(px(10.))
+                    .text_color(pal.dim)
+                    .text_center()
+                    .child(g.title)
                     .into_any_element(),
-            ))
-            // Cells: Insert, Delete, Format.
-            .child(group(
-                "Cells",
-                false,
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        v_flex()
-                            .gap_0p5()
-                            .child(self.sheet_rb(None, "Insert Row", SheetAct::InsertRow, pal, cx))
-                            .child(self.sheet_rb(None, "Insert Col", SheetAct::InsertCol, pal, cx)),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_0p5()
-                            .child(self.sheet_rb(None, "Delete Row", SheetAct::DeleteRow, pal, cx))
-                            .child(self.sheet_rb(None, "Delete Col", SheetAct::DeleteCol, pal, cx)),
-                    )
-                    .child(self.sheet_lb(None, "Format", SheetAct::FormatCells, pal, cx))
-                    .into_any_element(),
-            ))
-            // Editing: AutoSum/Fill/Clear column + Sort & Filter, Find & Select.
-            .child(group(
-                "Editing",
-                false,
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_1()
-                    .child(col(vec![
-                        self.sheet_rb(None, "\u{03A3} AutoSum", SheetAct::AutoSum, pal, cx),
-                        self.sheet_rb(None, "Fill", SheetAct::Todo, pal, cx),
-                        self.sheet_rb(Some("clear-format"), "Clear", SheetAct::Todo, pal, cx),
-                    ]))
-                    .child(col(vec![
-                        self.sheet_rb(
-                            Some("sort"),
-                            "Sort A \u{2192} Z",
-                            SheetAct::SortAsc,
-                            pal,
-                            cx,
-                        ),
-                        self.sheet_rb(
-                            Some("sort"),
-                            "Sort Z \u{2192} A",
-                            SheetAct::SortDesc,
-                            pal,
-                            cx,
-                        ),
-                        self.sheet_rb(
-                            Some("sort"),
-                            "Custom Sort\u{2026}",
-                            SheetAct::CustomSort,
-                            pal,
-                            cx,
-                        ),
-                        self.sheet_rb(None, "Filter", SheetAct::Filter, pal, cx),
-                        self.sheet_rb(None, "Remove Dup", SheetAct::RemoveDuplicates, pal, cx),
-                    ]))
-                    .child(self.sheet_lb(Some("find"), "Find & Select", SheetAct::Todo, pal, cx))
-                    .into_any_element(),
-            ))
+            })
             .into_any_element()
+    }
+
+    /// One sheet ribbon command, drawn in its shape.
+    fn sheet_cmd_el(
+        &self,
+        c: &sheet_ribbon::SheetCmd,
+        xf: &gridcore::sheet::Xf,
+        pal: Pal,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use sheet_ribbon::Shape;
+        let text = c.text(self.sheet_act_toggled(c.act));
+        match c.shape {
+            Shape::Large(icon) => self.sheet_lb(icon, text, c.act, pal, cx),
+            Shape::Row(icon) => self.sheet_rb(icon, text, c.act, pal, cx),
+            Shape::Icon(icon) => {
+                self.sheet_ib(icon, c.act, sheet_ribbon::act_on(c.act, xf), pal, cx)
+            }
+            Shape::Glyph(glyph) => self.sheet_gb(glyph, c.act, pal, cx),
+            Shape::Combo { value, wide } => self.sheet_combo(value, wide, c.act, pal, cx),
+            Shape::NumFmt => self.sheet_numfmt_combo(pal, cx),
+        }
     }
 
     fn render_group(
@@ -21912,7 +22686,12 @@ fn sheet_row(
             Some(cl) if !cl.is_blank() => {
                 let xf = styles.xf(cl.style);
                 (
-                    gridcore::sheet::format_with(&xf, &cl.value, d1904),
+                    if gridcore::sheet::date_unrepresentable(&xf, &cl.value, d1904) {
+                        // A date/time it cannot show: `#` across the cell (#673).
+                        "#".repeat((((cell_w - 6.0) / 7.0).floor() as usize).max(1))
+                    } else {
+                        gridcore::sheet::format_with(&xf, &cl.value, d1904)
+                    },
                     Some(xf),
                     matches!(cl.value, CellValue::Number(_)),
                 )
@@ -24673,13 +25452,14 @@ mod grid_geom_tests {
         chart_card_layout, chart_category_label_plan, chart_column_layout, chart_line_path,
         chart_line_points, chart_panel_after, chart_panel_shown, chart_pie_geometry,
         chart_pie_slice_path, chart_ref_of, chart_render_path, chart_scale, chart_slot_color,
-        chart_source_areas, col_at_x, col_px, dash_fit, edit_runs, fill_box, formula_ref_tokens,
-        gesture_in_flight, last_visible_col, may_arm_fill, parse_ref_text, press_selection,
-        preview_range, range_a1, range_border_cell_count, range_border_dashed, range_border_plan,
-        range_edges_at, range_text, ref_a1, ref_color, ref_index_at, ref_pick_text, ref_token_at,
-        replace_ref, resize_axis, row_height_px, scroll_col0_for_sel, selected_header_range,
-        series_move, series_name_shown, series_remove, series_resolved_preview, sheet_index_of,
-        shift_col, shift_row, shown_sel, snap_range_rows, source_ref_text,
+        chart_source_areas, col_at_x, col_px, dash_fit, edit_runs, fill_box, fill_handle_hidden,
+        formula_ref_tokens, gesture_in_flight, last_visible_col, may_arm_fill, parse_ref_text,
+        press_selection, preview_range, range_a1, range_border_cell_count, range_border_dashed,
+        range_border_plan, range_edges_at, range_text, ref_a1, ref_color, ref_index_at,
+        ref_pick_text, ref_token_at, replace_ref, resize_axis, row_height_px, scroll_col0_for_sel,
+        selected_header_range, series_move, series_name_shown, series_remove,
+        series_resolved_preview, sheet_index_of, shift_col, shift_row, shown_sel, snap_range_rows,
+        source_ref_text,
     };
     use gpui::{point, px};
 
@@ -24737,7 +25517,7 @@ mod grid_geom_tests {
         assert!(!gesture_in_flight(false, false, false, false));
         assert!(may_arm_fill(false, false));
         let mut fill = None;
-        assert!(arm_fill(&mut fill, Some(src), false, false));
+        assert!(arm_fill(&mut fill, Some(src), false, false, false));
         let armed = fill.expect("the source range becomes a fill drag");
         assert_eq!(armed.src, src);
         assert_eq!(armed.to, (src.2, src.3));
@@ -24763,6 +25543,7 @@ mod grid_geom_tests {
                 &mut fill,
                 Some(src),
                 gesture_in_flight(drag, dragging, range, formula),
+                false,
                 false
             ));
             assert!(fill.is_none(), "a grid gesture must leave the fill unarmed");
@@ -24772,14 +25553,54 @@ mod grid_geom_tests {
         assert!(!may_arm_fill(true, false));
         assert!(!may_arm_fill(true, true));
         let mut fill = Some(armed);
-        assert!(!arm_fill(&mut fill, Some((9, 9, 9, 9)), false, false));
+        assert!(!arm_fill(
+            &mut fill,
+            Some((9, 9, 9, 9)),
+            false,
+            false,
+            false
+        ));
         assert_eq!(fill.expect("the first fill stays armed").src, src);
 
         // The priority-1 more-tabs backdrop prevents presses on the deferred
         // handle. Keep the guard as defence in depth if that order changes.
         let mut fill = None;
-        assert!(!arm_fill(&mut fill, Some(src), false, true));
+        assert!(!arm_fill(&mut fill, Some(src), false, true, false));
         assert!(fill.is_none());
+    }
+
+    /// #699: a protected sheet never arms a fill, so neither the pointer nor
+    /// the harness's `fill-drag` can write its cells through the handle.
+    #[test]
+    fn a_protected_sheet_cannot_arm_a_fill() {
+        let mut fill = None;
+        assert!(!arm_fill(&mut fill, Some((0, 0, 1, 0)), false, false, true));
+        assert!(fill.is_none());
+    }
+
+    /// #699: the handle is drawn only with no cell edit open, nothing pointing
+    /// and no chart holding the selection; each says why it is not.
+    #[test]
+    fn the_fill_handle_says_why_it_is_hidden() {
+        use super::HandleHidden::*;
+        assert_eq!(fill_handle_hidden(false, false, false, None), None);
+        assert_eq!(fill_handle_hidden(true, false, false, None), Some(Editing));
+        assert_eq!(fill_handle_hidden(false, true, false, None), Some(Pointing));
+        assert_eq!(fill_handle_hidden(false, false, true, None), Some(Pointing));
+        assert_eq!(
+            fill_handle_hidden(false, false, false, Some(0)),
+            Some(ChartSelected)
+        );
+        // An edit outranks the rest: it is what a click would land in.
+        assert_eq!(
+            fill_handle_hidden(true, true, false, Some(0)),
+            Some(Editing)
+        );
+        assert_eq!(Editing.why(), "a cell is being edited");
+        assert_eq!(Pointing.why(), "a reference is being pointed at");
+        assert_eq!(ChartSelected.why(), "a chart is selected");
+        assert!(ChartSelected.cleared_by_a_click());
+        assert!(!Editing.cleared_by_a_click() && !Pointing.cleared_by_a_click());
     }
 
     fn names(list: &[&str]) -> Vec<String> {
@@ -29748,7 +30569,7 @@ mod ribbon_fit_tests {
 
 #[cfg(test)]
 mod flat_inlines_tests {
-    use super::{Inline, flat_inlines};
+    use super::{Inline, caret_advance, flat_inlines};
     use docxcore::model::{BreakKind, Hyperlink, Run, RunProps};
 
     fn run(text: &str) -> Inline {
@@ -29758,17 +30579,10 @@ mod flat_inlines_tests {
         })
     }
 
-    /// The caret offsets `paragraph_el` hands out for these pieces: what
-    /// `emit_run`, `emit_tab` and `emit_break` advance `idx` by.
+    /// The caret offsets `paragraph_el` hands out for these pieces: the
+    /// `caret_advance` it asserts for each.
     fn offsets(items: &[(std::borrow::Cow<'_, Inline>, bool)]) -> usize {
-        items
-            .iter()
-            .map(|(i, _)| match &**i {
-                Inline::Run(r) => r.text.chars().count(),
-                Inline::Tab(_) | Inline::Break(_) => 1,
-                _ => 0,
-            })
-            .sum()
+        items.iter().map(|(i, _)| caret_advance(i)).sum()
     }
 
     /// #212: text after a complex link (one holding proofing marks, a tracked
@@ -29805,6 +30619,7 @@ mod flat_inlines_tests {
         let linked: Vec<bool> = items.iter().map(|(_, l)| *l).collect();
         assert_eq!(linked, [false, true, true, true, true, true, true, false]);
         let before_cd = offsets(&items[..items.len() - 1]);
-        assert_eq!(before_cd, 11, "`cd` starts at the engine's offset 11");
+        // The field is one offset (#642).
+        assert_eq!(before_cd, 12, "`cd` starts at the engine's offset 12");
     }
 }

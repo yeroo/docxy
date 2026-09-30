@@ -660,12 +660,12 @@ impl Session {
             // Top-level paragraph matches carry a direct block index + full
             // text, which a client can feed straight back to replace-range.
             // `start`/`end` count only editor-editable text (runs, tabs and
-            // breaks, including those inside hyperlinks), while `text` is
-            // `plain_text()`, which also holds the text of zero-width inlines
-            // (tracked changes, fields, footnote refs, equations, SmartArt,
-            // chart titles, text boxes, and tracked changes or fields inside a
-            // hyperlink): when the paragraph has any, `text[start..end]` need
-            // not be the match.
+            // breaks, including those inside hyperlinks, and one offset per
+            // field), while `text` is `plain_text()`, which holds a field's
+            // whole result and also the text of zero-width inlines (tracked
+            // changes, footnote refs, equations, SmartArt, chart titles, text
+            // boxes, and tracked changes inside a hyperlink): when the
+            // paragraph has any, `text[start..end]` need not be the match.
             if m.path.len() == 1 {
                 out.push_str(",\"block\":");
                 out.push_str(&m.path[0].to_string());
@@ -1308,7 +1308,8 @@ impl Session {
         if let Some(t) = target {
             if let Some(m) = self.maps.get(t) {
                 if let Some(seg) = m.nearest_seg(col) {
-                    self.editor.caret = Caret::at(seg.path.clone(), seg.offset_for_col(col));
+                    self.editor
+                        .set_caret(Caret::at(seg.path.clone(), seg.offset_for_col(col)));
                 }
             }
         }
@@ -1356,7 +1357,8 @@ impl Session {
         }
         if let Some(m) = self.maps.get(line) {
             if let Some(seg) = m.nearest_seg(col) {
-                self.editor.caret = Caret::at(seg.path.clone(), seg.offset_for_col(col));
+                self.editor
+                    .set_caret(Caret::at(seg.path.clone(), seg.offset_for_col(col)));
             }
         }
     }
@@ -2040,6 +2042,44 @@ mod tests {
     }
 
     #[test]
+    fn backspace_after_a_field_selects_its_one_offset_atom_642() {
+        let xml = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:body><w:p><w:r><w:t>Body</w:t></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> PAGE </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>1</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p></w:body></w:document>"#;
+        let doc = docxcore::load::parse_document_xml(xml, &Default::default());
+        let mut s = Session::open(&save_package(&new_package(doc))).expect("open");
+        // The page draws the field as an atom spanning one editor offset.
+        let d = s.doc_json();
+        assert!(
+            d.contains(r#"{"k":"field","o":4,"w":1,"#),
+            "field atom: {d}"
+        );
+        // In its result's formatting, like a text run.
+        let doc = docxcore::load::parse_document_xml(
+            &xml.replace(
+                "<w:r><w:t>1</w:t></w:r>",
+                "<w:r><w:rPr><w:b/></w:rPr><w:t>1</w:t></w:r>",
+            ),
+            &Default::default(),
+        );
+        let bold = Session::open(&save_package(&new_package(doc))).expect("open");
+        assert!(
+            bold.doc_json()
+                .contains(r#"{"k":"field","o":4,"w":1,"x":"1","b":true"#),
+            "{}",
+            bold.doc_json()
+        );
+        s.exec_json("select\t0\t5\t0\t5");
+        let r = s.exec_json("backspace");
+        assert!(
+            r.contains(r#""caret":{"p":"0","o":5},"anchor":{"p":"0","o":4}"#),
+            "the first Backspace selects the field: {r}"
+        );
+        s.exec_json("backspace");
+        assert!(!s.editor.doc.plain_text().contains('1'));
+        assert_eq!(s.editor.doc.plain_text().trim_end(), "Body");
+    }
+
+    #[test]
     fn opens_and_renders_text() {
         let bytes = sample_docx("Hello world");
         let mut s = Session::open(&bytes).expect("open");
@@ -2059,6 +2099,26 @@ mod tests {
         let v = s.view_json(None);
         assert!(v.contains("XHi"), "expected inserted text: {v}");
         assert!(v.contains("\"dirty\":true"));
+    }
+
+    #[test]
+    fn a_click_starts_a_new_undo_step_698() {
+        let bytes = sample_docx("");
+        let mut s = Session::open(&bytes).expect("open");
+        s.dispatch("insert\thello");
+        s.view_json(None); // lays out the lines a click addresses
+        let col = (0..200)
+            .find(|col| {
+                s.dispatch(&format!("click\t0\t{col}\t0"));
+                s.editor.caret.offset == 2
+            })
+            .expect("a column that lands on offset 2");
+        s.dispatch(&format!("click\t0\t{col}\t0"));
+        s.dispatch("insert\tab");
+        assert!(s.view_json(None).contains("heabllo"));
+        s.dispatch("undo");
+        let v = s.view_json(None);
+        assert!(v.contains("hello") && !v.contains("heabllo"), "{v}");
     }
 
     #[test]

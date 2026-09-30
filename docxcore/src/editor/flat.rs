@@ -5,8 +5,9 @@
 //! Offsets count Unicode scalar values, like `Editor::Caret::offset`. Word uses
 //! UTF-16 code units, so an astral character takes one offset here and two in
 //! Word. External comparisons must convert before comparing such text.
-//! Cached text inside fields, revisions and other zero-length wrappers is
-//! omitted: the editor cannot place a caret inside it. Hyperlink text is
+//! A field that shows a result is one U+FFFC character (it is edited as one
+//! unit). Cached text inside fields, revisions and other zero-length wrappers
+//! is omitted: the editor cannot place a caret inside it. Hyperlink text is
 //! included because it does have editor offsets: a link's runs, and the plain
 //! runs, tabs and breaks among its other children.
 
@@ -165,8 +166,10 @@ fn inline_chars(inline: &Inline) -> String {
         Inline::Break(BreakKind::Line | BreakKind::Clear(_)) => "\u{000b}".into(),
         Inline::Break(BreakKind::Page) => "\u{000c}".into(),
         Inline::Break(BreakKind::Column) => "\u{000e}".into(),
-        // The editor assigns zero caret units to fields, revision wrappers and
-        // other preserved inline payloads, even when they cache visible text.
+        // A field showing a result is one caret unit, edited as a whole.
+        Inline::Field { text, .. } if !text.is_empty() => super::FIELD_CHAR.into(),
+        // The editor assigns zero caret units to revision wrappers and other
+        // preserved inline payloads, even when they cache visible text.
         _ => String::new(),
     }
 }
@@ -205,7 +208,7 @@ mod tests {
                 Inline::Tab(RunProps::default()),
                 Inline::Field {
                     raw: String::new(),
-                    text: "hidden".into(),
+                    text: "shown".into(),
                 },
                 run("toso"),
             ],
@@ -215,7 +218,8 @@ mod tests {
             body: vec![para(vec![run("ab"), link, run("cd")])],
         };
         let flat = FlatDocument::new(&doc);
-        assert_eq!(flat.main().text, "abCon\ttosocd\n");
+        // The field is one caret unit (#642).
+        assert_eq!(flat.main().text, "abCon\t\u{FFFC}tosocd\n");
         assert_eq!(
             flat.main().caret(6),
             Some(Caret::at(vec![0], 6)),
@@ -242,7 +246,11 @@ mod tests {
                     Inline::Break(BreakKind::Column),
                     Inline::Field {
                         raw: String::new(),
-                        text: "invisible".into(),
+                        text: "shown".into(),
+                    },
+                    Inline::Field {
+                        raw: String::new(),
+                        text: String::new(),
                     },
                 ]),
                 Block::Table(Table {
@@ -267,7 +275,7 @@ mod tests {
         let flat = FlatDocument::new(&doc);
         assert_eq!(
             flat.main().text,
-            "a😀\t\u{000b}\u{000c}\u{000e}\nfirst\nnested\n\nhost\n"
+            "a😀\t\u{000b}\u{000c}\u{000e}\u{FFFC}\nfirst\nnested\n\nhost\n"
         );
         assert_eq!(flat.stories[1].id, "textbox:2/1");
         assert_eq!(flat.stories[1].text, "box\n");

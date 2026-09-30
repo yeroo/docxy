@@ -144,6 +144,11 @@ pub struct CellMeta {
     /// Value-metadata index and the value it was loaded with: it describes
     /// that value, so it is written only while the cell still holds it.
     pub vm: Option<(String, CellValue)>,
+    /// The `<v>` text the file wrote for a rich error whose real value was
+    /// decoded from the value metadata (`#VALUE!` standing in for `#SPILL!`,
+    /// `#CALC!` or `#GETTING_DATA`). Written back instead of the value while
+    /// `vm` is.
+    pub vm_body: Option<String>,
     /// `ph="1"`: show phonetic text.
     pub ph: bool,
 }
@@ -278,6 +283,11 @@ pub struct Sheet {
     /// didn't have.
     pub row_breaks: Vec<PageBreak>,
     pub col_breaks: Vec<PageBreak>,
+    /// Rows an applied filter hid, as opposed to rows hidden by hand: derived
+    /// at load from the `<autoFilter>` criteria, and kept by the editor's own
+    /// filter. In memory only. `SUBTOTAL(1..11)` skips these rows but counts
+    /// hand-hidden ones. See [`Sheet::row_filtered`].
+    pub filtered_rows: std::collections::BTreeSet<u32>,
 }
 
 /// One `<brk>`: `id` is the 0-based first row (column) of the page that starts
@@ -1024,6 +1034,23 @@ impl Sheet {
         self.row_attrs.get(&row).is_some_and(|a| attr_hidden(a))
     }
 
+    /// Whether a row is hidden by a filter: hidden, and marked filtered. A
+    /// filtered row the user unhid is not.
+    pub fn row_filtered(&self, row: u32) -> bool {
+        self.filtered_rows.contains(&row) && self.row_hidden(row)
+    }
+
+    /// Hide or unhide a row as a filter does: hiding marks it filter-hidden,
+    /// unhiding clears the mark.
+    pub fn set_row_filtered(&mut self, row: u32, hidden: bool) {
+        self.set_row_hidden(row, hidden);
+        if hidden {
+            self.filtered_rows.insert(row);
+        } else {
+            self.filtered_rows.remove(&row);
+        }
+    }
+
     /// Hide or unhide a row, preserving its other `<row>` attributes (e.g. `ht`).
     pub fn set_row_hidden(&mut self, row: u32, hidden: bool) {
         let cur = self.row_attrs.get(&row).cloned().unwrap_or_default();
@@ -1379,6 +1406,32 @@ pub struct Xf {
     /// Wrap long text onto multiple lines within the cell (`<alignment
     /// wrapText="1">`). Rendered as wrapped lines; drives auto-fit row height.
     pub wrap: bool,
+    /// The cell's text was entered with a leading apostrophe (`quotePrefix="1"`):
+    /// the value is text even where it reads as a number, and the editor shows
+    /// the apostrophe again.
+    pub quote_prefix: bool,
+    /// The `<cellXfs>` index this xf was loaded from, kept by every copy an
+    /// edit derives from it. Save writes a derived xf by reusing that source
+    /// element's font, fill, border, number format, alignment and protection
+    /// wherever the modeled fields still match it, so what the model does not
+    /// carry (underline, real borders, pattern fills, vertical alignment,
+    /// indent, protection) survives an edit. `None` for an xf built from
+    /// scratch.
+    pub loaded_from: Option<u32>,
+}
+
+impl Xf {
+    /// Set the number-format code, keeping the [`NumFmt`] classification in
+    /// step with it (`None` is General). Code that reads either half — the
+    /// entry rules, the `####` check, the classified display fallback —
+    /// then agrees.
+    pub fn set_code(&mut self, code: Option<String>) {
+        self.numfmt = code
+            .as_deref()
+            .map(classify_format_code)
+            .unwrap_or(NumFmt::General);
+        self.code = code;
+    }
 }
 
 /// A differential format (`<dxf>`) referenced by a conditional-formatting rule.
@@ -1757,10 +1810,38 @@ pub fn format_value(value: &CellValue, fmt: NumFmt, date1904: bool) -> String {
     }
 }
 
+/// What a cell shows for a date or time it cannot display. The grids widen
+/// it to fill the column, as Excel does.
+pub const UNREPRESENTABLE: &str = "########";
+
+/// Is `value` a number shown through a date/time format that cannot display
+/// it (negative, or past 9999-12-31)? Excel fills such a cell with `#`.
+pub fn date_unrepresentable(xf: &Xf, value: &CellValue, date1904: bool) -> bool {
+    let CellValue::Number(n) = value else {
+        return false;
+    };
+    if !n.is_finite() || serial_to_parts(*n, date1904).is_some() {
+        return false;
+    }
+    // The code decides when there is one; the classification only stands in
+    // for a code-less xf, so a stale pair cannot mis-drive the check.
+    let class = match xf.code.as_deref() {
+        Some(code) => match crate::numfmt::parse_format(code) {
+            Some(fmt) => return fmt.is_date_for(*n),
+            None => classify_format_code(code),
+        },
+        None => xf.numfmt,
+    };
+    matches!(class, NumFmt::Date | NumFmt::Time | NumFmt::DateTime)
+}
+
 /// Render a cell value through its full style: the real format-code runtime
 /// when the code is known and renderable, the classified approximation
-/// otherwise.
+/// otherwise. A date or time that cannot be shown is [`UNREPRESENTABLE`].
 pub fn format_with(xf: &Xf, value: &CellValue, date1904: bool) -> String {
+    if date_unrepresentable(xf, value, date1904) {
+        return UNREPRESENTABLE.to_string();
+    }
     if let Some(code) = &xf.code {
         if let Some(fmt) = crate::numfmt::parse_format(code) {
             match value {
@@ -1806,6 +1887,48 @@ pub fn sheet_to_csv(sheet: &Sheet, styles: &Styles, date1904: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_undisplayable_date_or_time_is_a_hash_run() {
+        let coded = |code: &str| Xf {
+            numfmt: classify_format_code(code),
+            code: Some(code.to_string()),
+            ..Xf::default()
+        };
+        let neg = CellValue::Number(-1.0);
+        for code in ["yyyy-mm-dd", "m/d/yyyy", "h:mm", "[h]:mm", "m/d/yyyy h:mm"] {
+            assert_eq!(
+                format_with(&coded(code), &neg, false),
+                UNREPRESENTABLE,
+                "{code}"
+            );
+        }
+        // Past 9999-12-31 too.
+        let huge = CellValue::Number(3_000_000.0);
+        assert_eq!(
+            format_with(&coded("m/d/yyyy"), &huge, false),
+            UNREPRESENTABLE
+        );
+        // A classified date with no renderable code.
+        let classified = Xf {
+            numfmt: NumFmt::Date,
+            ..Xf::default()
+        };
+        assert!(date_unrepresentable(&classified, &neg, false));
+        // General still shows -1, a representable date still renders, and a
+        // format whose negative section is not a date shows the number.
+        assert_eq!(format_with(&Xf::default(), &neg, false), "-1");
+        assert_eq!(
+            format_with(&coded("yyyy-mm-dd"), &CellValue::Number(45306.0), false),
+            "2024-01-15"
+        );
+        assert_eq!(format_with(&coded("yyyy-mm-dd;0"), &neg, false), "1");
+        assert!(!date_unrepresentable(
+            &coded("yyyy-mm-dd"),
+            &CellValue::Text("x".into()),
+            false
+        ));
+    }
 
     #[test]
     fn range_readers_take_a_column_of_cells_as_numbers_or_labels() {
@@ -2326,5 +2449,23 @@ mod tests {
         assert!(serial_to_parts(2_958_466.0, false).is_none()); // past 9999-12-31
         assert!(serial_to_parts(-1.0, false).is_none());
         assert!(serial_to_parts(45306.0, false).is_some()); // 2024-01-15 ok
+    }
+
+    #[test]
+    fn set_row_filtered_marks_and_clears() {
+        // #678: a filter's hide marks the row filter-hidden; unhiding clears
+        // the mark; a hand hide is never filtered.
+        let mut s = Sheet::default();
+        s.set_row_filtered(2, true);
+        assert!(s.row_hidden(2) && s.row_filtered(2));
+        s.set_row_filtered(2, false);
+        assert!(!s.row_hidden(2) && !s.row_filtered(2));
+        assert!(s.filtered_rows.is_empty());
+        s.set_row_hidden(3, true);
+        assert!(s.row_hidden(3) && !s.row_filtered(3));
+        // A marked row unhidden by hand is no longer filtered.
+        s.set_row_filtered(4, true);
+        s.set_row_hidden(4, false);
+        assert!(!s.row_filtered(4));
     }
 }

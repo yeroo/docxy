@@ -32,9 +32,9 @@ pub enum ExcelError {
     Value,
     Spill,
     Calc,
-    /// Not a real Excel error: our marker for circular references (Excel
-    /// shows a dialog and writes 0; we are honest instead).
-    Cycle,
+    /// `#GETTING_DATA`: a value still being fetched (Excel's asynchronous
+    /// functions, cube and data-type lookups).
+    GettingData,
 }
 
 impl ExcelError {
@@ -49,7 +49,7 @@ impl ExcelError {
             ExcelError::Value => "#VALUE!",
             ExcelError::Spill => "#SPILL!",
             ExcelError::Calc => "#CALC!",
-            ExcelError::Cycle => "#CYCLE!",
+            ExcelError::GettingData => "#GETTING_DATA",
         }
     }
 
@@ -64,7 +64,7 @@ impl ExcelError {
             "#VALUE!" => ExcelError::Value,
             "#SPILL!" => ExcelError::Spill,
             "#CALC!" => ExcelError::Calc,
-            "#CYCLE!" => ExcelError::Cycle,
+            "#GETTING_DATA" => ExcelError::GettingData,
             _ => return None,
         })
     }
@@ -399,13 +399,18 @@ impl<'a> Lexer<'a> {
                     if b == b'!' || b == b'?' {
                         break;
                     }
-                    if !(b.is_ascii_alphanumeric() || b == b'/') {
+                    if !(b.is_ascii_alphanumeric() || b == b'/' || b == b'_') {
                         self.pos -= 1;
                         break;
                     }
                 }
                 let lit = std::str::from_utf8(&self.src[start..self.pos]).unwrap_or("");
                 match ExcelError::from_code(lit) {
+                    // Excel refuses these as formula constants (like
+                    // `#FIELD!`); they only arise as results.
+                    Some(ExcelError::Spill | ExcelError::Calc) => {
+                        return Err(format!("{lit} is not a formula constant"));
+                    }
                     Some(e) => Tok::Err(e),
                     // A bare `#` (nothing error-like after it) is the postfix
                     // spill-reference operator: `A1#`.
@@ -440,7 +445,7 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 let text = std::str::from_utf8(&self.src[start..self.pos]).unwrap_or("");
-                match text.parse::<f64>() {
+                match truncate_15(text).parse::<f64>() {
                     Ok(n) => Tok::Num(n),
                     Err(_) => return Err(format!("bad number {text}")),
                 }
@@ -2290,6 +2295,30 @@ pub fn is_volatile(e: &Expr) -> bool {
     }
 }
 
+/// Does the formula call a D-function (`DSUM`, `DCOUNT`, …)?
+pub fn contains_db_fn(e: &Expr) -> bool {
+    match e {
+        Expr::Func(name, args) => is_db_fn(name) || args.iter().any(contains_db_fn),
+        Expr::ArrayLit(rows) => rows.iter().flatten().any(contains_db_fn),
+        Expr::Call(callee, args) => contains_db_fn(callee) || args.iter().any(contains_db_fn),
+        Expr::Un(_, x) => contains_db_fn(x),
+        Expr::Bin(_, l, r) => contains_db_fn(l) || contains_db_fn(r),
+        _ => false,
+    }
+}
+
+/// Must the engine re-evaluate this formula on every recalculation? The
+/// volatile functions ([`is_volatile`]: time, randomness, reference-returning
+/// INDIRECT/OFFSET), plus the D-functions: a computed criterion is evaluated
+/// per record with its relative references shifted, so what it reads depends
+/// on the criteria cell's current formula and the database's extent, which no
+/// static edge set can say (widened edges would invent circles). Unlike the
+/// volatile ones, D-functions are deterministic, so `--verify` still compares
+/// them.
+pub fn always_recalc(e: &Expr) -> bool {
+    is_volatile(e) || contains_db_fn(e)
+}
+
 // ---------------------------------------------------------------------------
 // Evaluation
 // ---------------------------------------------------------------------------
@@ -2360,12 +2389,35 @@ pub trait Resolver {
         let _ = (sheet, row, col);
         None
     }
+    /// The number format code of a cell (`General`, `0.00`, …), for
+    /// `CELL("format")`. `None` = General.
+    fn num_format(&self, sheet: usize, row: u32, col: u32) -> Option<String> {
+        let _ = (sheet, row, col);
+        None
+    }
     /// Whether a worksheet row is hidden (manually or by a filter). Used by the
     /// `10x` `SUBTOTAL` codes and the hidden-ignoring `AGGREGATE` options.
     fn row_hidden(&self, sheet: usize, row: u32) -> bool {
         let _ = (sheet, row);
         false
     }
+    /// Whether a worksheet row is hidden by a filter (not by hand). Used by
+    /// `SUBTOTAL(1..11)`, which skips filtered rows but counts hand-hidden
+    /// ones.
+    fn row_filtered(&self, sheet: usize, row: u32) -> bool {
+        let _ = (sheet, row);
+        false
+    }
+}
+
+/// Which hidden rows SUBTOTAL/AGGREGATE leave out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SkipRows {
+    None,
+    /// Rows a filter hid (SUBTOTAL 1–11).
+    Filtered,
+    /// Every hidden row (SUBTOTAL 101–111, AGGREGATE's hidden options).
+    Hidden,
 }
 
 /// A table's geometry, as the evaluator needs it.
@@ -2464,11 +2516,33 @@ pub struct Eval<'a> {
     lets: Vec<(String, Arg)>,
     /// Lambda parameters omitted at the current call site (`ISOMITTED`).
     omitted: Vec<String>,
+    /// Computed D-function criteria cells being evaluated by an enclosing
+    /// evaluation. A criterion that re-enters itself (through a D-function
+    /// over its own criteria range) is a circular reference and matches
+    /// nothing, instead of recursing without end.
+    db_crit_stack: Vec<(usize, u32, u32)>,
 }
 
 /// A matrix of computed values (a dynamic-array result). Always non-empty
 /// and rectangular.
 pub type Matrix = Vec<Vec<Value>>;
+
+/// A grid of values and, when it came from a range, (sheet, top row, left
+/// column).
+type GridAt = (Matrix, Option<(usize, u32, u32)>);
+
+/// One criteria cell of a D-function, resolved against the database.
+enum DbCrit {
+    /// Blank: no condition.
+    Skip,
+    /// A condition on database column `usize`.
+    Field(usize, Criteria, bool),
+    /// A computed criterion: the criteria cell's formula, evaluated once per
+    /// record (relative references shifted to the record's row).
+    Computed(Expr, (usize, u32, u32)),
+    /// A header that names no field over a plain value: matches nothing.
+    Never,
+}
 
 /// Ceiling on materialized array size (cells). Excel errors with `#NUM!`
 /// when an array result won't fit; we draw the line well before memory pain.
@@ -2511,11 +2585,60 @@ impl<'a> Eval<'a> {
             depth: 0,
             lets: Vec::new(),
             omitted: Vec::new(),
+            db_crit_stack: Vec::new(),
         }
     }
 
     pub fn eval(&mut self, e: &Expr) -> Value {
-        match self.eval_arg(e) {
+        let arg = self.eval_arg(e);
+        self.arg_value(arg)
+    }
+
+    /// Evaluate a whole formula to a scalar: [`Self::eval`] plus Excel's
+    /// near-zero snap of a final addition or subtraction (see
+    /// [`Self::eval_root`]).
+    pub fn eval_formula(&mut self, e: &Expr) -> Value {
+        let arg = self.eval_root(e);
+        self.arg_value(arg)
+    }
+
+    /// Evaluate a formula's root expression. When the root operation is `+`
+    /// or `-` on two scalars and the result is within 2^-50 of the larger
+    /// operand's magnitude, it is exactly 0, as in Excel: `=0.1+0.2-0.3` is
+    /// 0, while `=1*(0.1+0.2-0.3)` keeps the binary residue. Parentheses
+    /// leave no node, so `=(0.1+0.2-0.3)` snaps too.
+    fn eval_root(&mut self, e: &Expr) -> Arg {
+        let Expr::Bin(op @ (BinOp::Add | BinOp::Sub), l, r) = e else {
+            return self.eval_arg(e);
+        };
+        let lv = self.eval_arg(l);
+        let rv = self.eval_arg(r);
+        let operands = self.scalar_num(&lv).zip(self.scalar_num(&rv));
+        let out = self.broadcast_bin(*op, lv, rv);
+        match (operands, &out) {
+            (Some((a, b)), Arg::Scalar(Value::Num(x)))
+                if *x != 0.0 && x.abs() < a.abs().max(b.abs()) * 2f64.powi(-50) =>
+            {
+                Arg::Scalar(Value::Num(0.0))
+            }
+            _ => out,
+        }
+    }
+
+    /// The number a scalar argument (or a single-cell range) coerces to.
+    fn scalar_num(&self, a: &Arg) -> Option<f64> {
+        match a {
+            Arg::Scalar(v) => to_num(v).ok(),
+            Arg::Range(s, r1, c1, r2, c2) if r1 == r2 && c1 == c2 => {
+                to_num(&self.res.value(*s, *r1, *c1)).ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// An evaluated argument in scalar context.
+    fn arg_value(&mut self, arg: Arg) -> Value {
+        match arg {
             Arg::Scalar(v) => v,
             // A bare range in scalar context (legacy implicit intersection):
             // a 1×1 range collapses; anything else is #VALUE!.
@@ -2551,7 +2674,7 @@ impl<'a> Eval<'a> {
     /// **implicit intersection** to the value on the formula's own row/column,
     /// exactly as pre-dynamic-array Excel does, instead of spilling.
     pub fn eval_dynamic_as(&mut self, e: &Expr, spill: bool) -> DynResult {
-        match self.eval_arg(e) {
+        match self.eval_root(e) {
             Arg::Scalar(v) => DynResult::Scalar(v),
             Arg::Range(s, r1, c1, r2, c2) => {
                 let (r1, c1, r2, c2) = self.clamp_huge(s, r1, c1, r2, c2);
@@ -4629,8 +4752,63 @@ pub fn to_bool(v: &Value) -> Result<bool, ExcelError> {
     }
 }
 
+/// Compare two numbers the way Excel does: equal when they agree to 15
+/// significant digits (`0.1+0.2` equals `0.3`), ordered by value otherwise.
+/// The formatting round-trip only runs for numbers already within 1e-14 of
+/// each other, so sorts and lookups stay cheap.
+pub(crate) fn cmp_15(x: f64, y: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if x == y {
+        return Ordering::Equal;
+    }
+    let ord = x.partial_cmp(&y).unwrap_or(Ordering::Equal);
+    if (x - y).abs() > x.abs().max(y.abs()) * 1e-14 {
+        return ord;
+    }
+    if round_15(x) == round_15(y) {
+        Ordering::Equal
+    } else {
+        ord
+    }
+}
+
+/// `x` rounded to 15 significant decimal digits.
+pub(crate) fn round_15(x: f64) -> f64 {
+    if x == 0.0 || !x.is_finite() {
+        return x;
+    }
+    format!("{x:.14e}").parse().unwrap_or(x)
+}
+
+/// A numeric literal (`123`, `-1.5e+20`) with every significant digit past the
+/// fifteenth replaced by 0, as Excel keeps typed numbers: truncation, not
+/// rounding. Text that is not a plain decimal literal is returned unchanged.
+pub fn truncate_15(text: &str) -> String {
+    let (mant, exp) = match text.find(['e', 'E']) {
+        Some(i) => text.split_at(i),
+        None => (text, ""),
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut sig = 0usize;
+    for ch in mant.chars() {
+        if ch.is_ascii_digit() {
+            if sig == 0 && ch == '0' {
+                out.push(ch);
+            } else {
+                sig += 1;
+                out.push(if sig > 15 { '0' } else { ch });
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push_str(exp);
+    out
+}
+
 /// Excel's comparison: case-insensitive text; cross-type ordering
-/// Number < Text < Logical; empty coerces to the other side's zero value.
+/// Number < Text < Logical; empty coerces to the other side's zero value;
+/// numbers equal at 15 significant digits (see [`cmp_15`]).
 pub(crate) fn compare(a: &Value, b: &Value) -> Result<std::cmp::Ordering, ExcelError> {
     use std::cmp::Ordering;
     if let Value::Err(e) = a {
@@ -4654,7 +4832,7 @@ pub(crate) fn compare(a: &Value, b: &Value) -> Result<std::cmp::Ordering, ExcelE
         _ => (a.clone(), b.clone()),
     };
     Ok(match (&a2, &b2) {
-        (Value::Num(x), Value::Num(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Value::Num(x), Value::Num(y)) => cmp_15(*x, *y),
         (Value::Str(x), Value::Str(y)) => {
             let xl = x.to_lowercase();
             let yl = y.to_lowercase();
@@ -4725,6 +4903,25 @@ pub fn collect_iterated_tables(e: &Expr, out: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+/// Is this a database function (`DSUM(database, field, criteria)` and kin)?
+pub fn is_db_fn(name: &str) -> bool {
+    matches!(
+        name,
+        "DSUM"
+            | "DAVERAGE"
+            | "DMAX"
+            | "DMIN"
+            | "DPRODUCT"
+            | "DCOUNT"
+            | "DCOUNTA"
+            | "DGET"
+            | "DVAR"
+            | "DVARP"
+            | "DSTDEV"
+            | "DSTDEVP"
+    )
 }
 
 /// Is this one of the dynamic-array functions resolved in `eval_arg` (they
@@ -4851,6 +5048,26 @@ fn zero_of(v: &Value) -> Value {
     }
 }
 
+/// Excel's `^` and `POWER`: `0^0` is `#NUM!` and zero to a negative power is
+/// `#DIV/0!`. A negative base to the reciprocal of an odd integer (`1/3`,
+/// `1/5`, …) takes the real odd root, where `powf` gives NaN.
+fn xl_pow(a: f64, b: f64) -> Value {
+    if a == 0.0 && b == 0.0 {
+        return Value::Err(ExcelError::Num);
+    }
+    if a == 0.0 && b < 0.0 {
+        return Value::Err(ExcelError::Div0);
+    }
+    if a < 0.0 && b.fract() != 0.0 {
+        let inv = 1.0 / b;
+        let odd = inv.round();
+        if (inv - odd).abs() < 1e-10 && odd % 2.0 != 0.0 {
+            return num(-(a.abs().powf(b)));
+        }
+    }
+    num(a.powf(b))
+}
+
 fn bin_op(op: BinOp, l: &Value, r: &Value) -> Value {
     use std::cmp::Ordering;
     match op {
@@ -4874,13 +5091,7 @@ fn bin_op(op: BinOp, l: &Value, r: &Value) -> Value {
                         num(a / b)
                     }
                 }
-                BinOp::Pow => {
-                    if a == 0.0 && b == 0.0 {
-                        Value::Err(ExcelError::Num)
-                    } else {
-                        num(a.powf(b))
-                    }
-                }
+                BinOp::Pow => xl_pow(a, b),
                 _ => unreachable!(),
             }
         }
@@ -4962,7 +5173,7 @@ fn parse_criteria(v: &Value) -> Criteria {
 /// it runs in O(pattern × text) rather than the exponential time a naive
 /// recursive `*`-backtracker would take on adversarial patterns like
 /// `a*a*a*…z` (both pattern and text come from untrusted workbooks).
-fn wildcard_match(pat: &str, text: &str) -> bool {
+pub(crate) fn wildcard_match(pat: &str, text: &str) -> bool {
     let p: Vec<char> = pat.to_lowercase().chars().collect();
     let t: Vec<char> = text.to_lowercase().chars().collect();
 
@@ -5014,6 +5225,30 @@ fn wildcard_match(pat: &str, text: &str) -> bool {
         pi += 1;
     }
     pi == p.len()
+}
+
+/// Whether a database criterion is plain text with no operator, which Excel's
+/// D-functions treat as "begins with" (`C` matches Cara and Carl). Only a
+/// typed operator (`="=Ann"` gives the text `=Ann`) asks for an exact match.
+fn db_begins_with(v: &Value) -> bool {
+    match v {
+        Value::Str(s) => {
+            !s.starts_with(['=', '<', '>'])
+                && matches!(parse_criteria(v).val, Value::Str(ref t) if !t.is_empty())
+        }
+        _ => false,
+    }
+}
+
+/// [`criteria_match`] for the D-functions: a plain-text criterion matches a
+/// text cell that begins with it (wildcards still apply).
+fn db_criteria_match(c: &Criteria, begins_with: bool, v: &Value) -> bool {
+    match (&c.val, v) {
+        (Value::Str(pat), Value::Str(text)) if begins_with => {
+            wildcard_match(&format!("{pat}*"), text)
+        }
+        _ => criteria_match(c, v),
+    }
 }
 
 fn criteria_match(c: &Criteria, v: &Value) -> bool {
@@ -5496,13 +5731,7 @@ impl<'a> Eval<'a> {
                     num(n.log(base))
                 }
             }
-            "POWER" => self.two_num(args, |a, b| {
-                if a == 0.0 && b == 0.0 {
-                    Value::Err(ExcelError::Num)
-                } else {
-                    num(a.powf(b))
-                }
-            }),
+            "POWER" => self.two_num(args, xl_pow),
             "MOD" => self.two_num(args, |a, b| {
                 if b == 0.0 {
                     Value::Err(ExcelError::Div0)
@@ -5678,12 +5907,15 @@ impl<'a> Eval<'a> {
                     101..=111 => code - 100,
                     _ => return Value::Err(ExcelError::Value),
                 };
-                // Excel: codes 1–11 already exclude *filter*-hidden rows (the
-                // common case); 101–111 additionally exclude *manually*-hidden
-                // rows. We can't always tell the two apart, and SUBTOTAL is
-                // almost always used over filtered data, so we exclude hidden
-                // rows for both — matching Excel-with-filter and our oracle.
-                match self.collect_subtotal(&args[1..], true, false) {
+                // Excel: codes 1–11 exclude rows a filter hid but count rows
+                // hidden by hand; 101–111 exclude both. Nested subtotals are
+                // always left out.
+                let skip = if code > 100 {
+                    SkipRows::Hidden
+                } else {
+                    SkipRows::Filtered
+                };
+                match self.collect_subtotal(&args[1..], skip, false, true) {
                     Ok((nums, counta)) => self.apply_agg(base, &nums, counta),
                     Err(e) => Value::Err(e),
                 }
@@ -5698,10 +5930,17 @@ impl<'a> Eval<'a> {
                 if !(1..=19).contains(&func) || !(0..=7).contains(&opts) {
                     return Value::Err(ExcelError::Value);
                 }
-                let ignore_hidden = matches!(opts, 1 | 3 | 5 | 7);
+                let skip = if matches!(opts, 1 | 3 | 5 | 7) {
+                    SkipRows::Hidden
+                } else {
+                    SkipRows::None
+                };
                 let ignore_errors = matches!(opts, 2 | 3 | 6 | 7);
+                // Options 0–3 leave nested SUBTOTAL/AGGREGATE cells out; 4–7
+                // count them (4 is "ignore nothing").
+                let skip_nested = opts <= 3;
                 if func <= 13 {
-                    match self.collect_subtotal(&args[2..], ignore_hidden, ignore_errors) {
+                    match self.collect_subtotal(&args[2..], skip, ignore_errors, skip_nested) {
                         Ok((nums, counta)) => self.apply_agg(func, &nums, counta),
                         Err(e) => Value::Err(e),
                     }
@@ -5709,11 +5948,15 @@ impl<'a> Eval<'a> {
                     // 14–19 take exactly one array plus a k argument.
                     Value::Err(ExcelError::Value)
                 } else {
-                    let nums =
-                        match self.collect_subtotal(&args[2..3], ignore_hidden, ignore_errors) {
-                            Ok((nums, _)) => nums,
-                            Err(e) => return Value::Err(e),
-                        };
+                    let nums = match self.collect_subtotal(
+                        &args[2..3],
+                        skip,
+                        ignore_errors,
+                        skip_nested,
+                    ) {
+                        Ok((nums, _)) => nums,
+                        Err(e) => return Value::Err(e),
+                    };
                     let k = try_num!(self.eval(&args[3]));
                     self.apply_agg_k(func, &nums, k)
                 }
@@ -5732,6 +5975,17 @@ impl<'a> Eval<'a> {
                         None => Value::Err(ExcelError::NA),
                     },
                     None => Value::Err(ExcelError::NA),
+                }
+            }
+            // ISFORMULA(ref): whether the reference's top-left cell holds a
+            // formula. Anything but a reference is #VALUE!.
+            "ISFORMULA" => {
+                if args.len() != 1 {
+                    return Value::Err(ExcelError::Value);
+                }
+                match self.ref_coords(&args[0]) {
+                    Some((s, r, c)) => Value::Bool(self.res.cell_formula(s, r, c).is_some()),
+                    None => Value::Err(ExcelError::Value),
                 }
             }
             "CELL" => self.cell_info(args),
@@ -6684,6 +6938,7 @@ impl<'a> Eval<'a> {
                 [Expr::Ref(_)] => Value::Num(1.0),
                 [Expr::ColRange { .. }] => Value::Num(crate::sheet::MAX_ROWS as f64),
                 [Expr::RowRange { r1, r2, .. }] => Value::Num((r1 - r2).abs() as f64 + 1.0),
+                [e] => self.extent_of(e, true),
                 _ => Value::Err(ExcelError::Value),
             },
             "COLUMNS" => match args {
@@ -6691,6 +6946,7 @@ impl<'a> Eval<'a> {
                 [Expr::Ref(_)] => Value::Num(1.0),
                 [Expr::RowRange { .. }] => Value::Num(crate::sheet::MAX_COLS as f64),
                 [Expr::ColRange { c1, c2, .. }] => Value::Num((c1 - c2).abs() as f64 + 1.0),
+                [e] => self.extent_of(e, false),
                 _ => Value::Err(ExcelError::Value),
             },
             "VLOOKUP" | "HLOOKUP" => {
@@ -7773,8 +8029,7 @@ impl<'a> Eval<'a> {
             }
 
             // ---- database functions --------------------------------------------
-            "DSUM" | "DAVERAGE" | "DMAX" | "DMIN" | "DPRODUCT" | "DCOUNT" | "DCOUNTA" | "DGET"
-            | "DVAR" | "DVARP" | "DSTDEV" | "DSTDEVP" => {
+            name if is_db_fn(name) => {
                 let cells = match self.db_query(args) {
                     Ok(c) => c,
                     Err(v) => return v,
@@ -8571,8 +8826,8 @@ impl<'a> Eval<'a> {
                         ExcelError::Num => 6.0,
                         ExcelError::NA => 7.0,
                         ExcelError::Spill => 9.0,
+                        ExcelError::GettingData => 8.0,
                         ExcelError::Calc => 14.0,
-                        ExcelError::Cycle => 5.0,
                     }),
                     _ => Value::Err(ExcelError::NA),
                 }
@@ -9218,14 +9473,15 @@ impl<'a> Eval<'a> {
     }
 
     /// Collect numeric values (and a COUNTA count of non-empty entries) for
-    /// SUBTOTAL/AGGREGATE: skip cells that are themselves nested
-    /// SUBTOTAL/AGGREGATE, optionally skip hidden rows, and either propagate or
-    /// ignore error values.
+    /// SUBTOTAL/AGGREGATE: optionally skip cells that are themselves nested
+    /// SUBTOTAL/AGGREGATE, skip the hidden rows `skip` names, and either
+    /// propagate or ignore error values.
     fn collect_subtotal(
         &mut self,
         args: &[Expr],
-        ignore_hidden: bool,
+        skip: SkipRows,
         ignore_errors: bool,
+        skip_nested: bool,
     ) -> Result<(Vec<f64>, usize), ExcelError> {
         let mut nums = Vec::new();
         let mut counta = 0usize;
@@ -9245,10 +9501,12 @@ impl<'a> Eval<'a> {
                 }
                 Arg::Range(s, r1, c1, r2, c2) => {
                     for ((r, c), v) in self.res.cells_in(s, r1, c1, r2, c2) {
-                        if ignore_hidden && self.res.row_hidden(s, r) {
-                            continue;
-                        }
-                        if self.is_nested_subtotal(s, r, c) {
+                        let hidden = match skip {
+                            SkipRows::None => false,
+                            SkipRows::Filtered => self.res.row_filtered(s, r),
+                            SkipRows::Hidden => self.res.row_hidden(s, r),
+                        };
+                        if hidden || (skip_nested && self.is_nested_subtotal(s, r, c)) {
                             continue;
                         }
                         match v {
@@ -9289,8 +9547,9 @@ impl<'a> Eval<'a> {
         Ok((nums, counta))
     }
 
-    /// Does the cell hold a SUBTOTAL/AGGREGATE formula (which an enclosing
-    /// SUBTOTAL/AGGREGATE must skip)?
+    /// Does the cell hold a SUBTOTAL/AGGREGATE formula? An enclosing
+    /// SUBTOTAL, or AGGREGATE with options 0–3, skips such cells; AGGREGATE
+    /// options 4–7 count them.
     fn is_nested_subtotal(&self, sheet: usize, row: u32, col: u32) -> bool {
         match self.res.cell_formula(sheet, row, col) {
             Some(f) => {
@@ -9510,6 +9769,9 @@ impl<'a> Eval<'a> {
                 .to_string(),
             ),
             "prefix" => Value::Str(String::new()),
+            "format" => Value::Str(crate::numfmt::cell_format_code(
+                self.res.num_format(s, r, c).as_deref().unwrap_or("General"),
+            )),
             _ => {
                 self.unsupported = true;
                 Value::Err(ExcelError::NA)
@@ -9619,19 +9881,42 @@ impl<'a> Eval<'a> {
     }
 
     /// A 2-D dense grid of an argument (row-major), clamped to the used range.
-    /// Scalars become a 1×1 grid; the shape database functions want.
-    fn flat_grid(&mut self, e: &Expr) -> Result<Vec<Vec<Value>>, Value> {
+    /// Scalars become a 1×1 grid; the shape database functions want. A range
+    /// also reports its sheet and top-left cell.
+    fn flat_grid_at(&mut self, e: &Expr) -> Result<GridAt, Value> {
         match self.eval_arg(e) {
             Arg::Scalar(Value::Err(er)) => Err(Value::Err(er)),
-            Arg::Scalar(v) => Ok(vec![vec![v]]),
+            Arg::Scalar(v) => Ok((vec![vec![v]], None)),
             Arg::Range(s, r1, c1, r2, c2) => {
                 let (a, b, c, d) = self.clamp(s, r1, c1, r2, c2);
-                Ok((a..=c)
+                let grid = (a..=c)
                     .map(|r| (b..=d).map(|col| self.res.value(s, r, col)).collect())
-                    .collect())
+                    .collect();
+                Ok((grid, Some((s, a, b))))
             }
-            Arg::Matrix(m) => Ok(m),
+            Arg::Matrix(m) => Ok((m, None)),
             Arg::Lambda(_) => Err(Value::Err(ExcelError::Calc)),
+        }
+    }
+
+    /// ROWS/COLUMNS of anything that is not a literal reference form: a
+    /// name, table or spill reference gives its extent, a computed array its
+    /// dimensions, and a scalar 1.
+    fn extent_of(&mut self, e: &Expr, rows: bool) -> Value {
+        match self.eval_arg(e) {
+            Arg::Range(_, r1, c1, r2, c2) => Value::Num(if rows {
+                (r2 - r1 + 1) as f64
+            } else {
+                (c2 - c1 + 1) as f64
+            }),
+            Arg::Matrix(m) => Value::Num(if rows {
+                m.len() as f64
+            } else {
+                m.first().map_or(0, |r| r.len()) as f64
+            }),
+            Arg::Scalar(Value::Err(e)) => Value::Err(e),
+            Arg::Scalar(_) => Value::Num(1.0),
+            Arg::Lambda(_) => Value::Err(ExcelError::Calc),
         }
     }
 
@@ -9642,9 +9927,9 @@ impl<'a> Eval<'a> {
         if args.len() != 3 {
             return Err(Value::Err(ExcelError::Value));
         }
-        let db = self.flat_grid(&args[0])?;
+        let (db, db_at) = self.flat_grid_at(&args[0])?;
         let field = self.eval(&args[1]);
-        let crit = self.flat_grid(&args[2])?;
+        let (crit, crit_at) = self.flat_grid_at(&args[2])?;
         if db.len() < 2 || db[0].is_empty() || crit.is_empty() {
             return Err(Value::Err(ExcelError::Value));
         }
@@ -9682,22 +9967,75 @@ impl<'a> Eval<'a> {
                     .and_then(|s| headers.iter().position(|h| text_eq(h, &s)))
             })
             .collect();
+        let blank_header: Vec<bool> = crit_headers
+            .iter()
+            .map(|ch| to_text(ch).map_or(true, |s| s.is_empty()))
+            .collect();
+        // Resolve every criteria cell once. A formula under a blank header, or
+        // under one that names no field, is a computed criterion (Excel's
+        // "criteria created as the result of a formula"); it needs both the
+        // criteria cell's and the database's position.
+        let crit_rows: Vec<Vec<DbCrit>> = crit[1..]
+            .iter()
+            .enumerate()
+            .map(|(ri, cr)| {
+                (0..crit_cols.len())
+                    .map(|ci| {
+                        let cval = cr.get(ci).cloned().unwrap_or(Value::Empty);
+                        let formula = match (crit_cols[ci], crit_at, db_at) {
+                            (None, Some((cs, r0, c0)), Some(_)) => {
+                                let at = (cs, r0 + 1 + ri as u32, c0 + ci as u32);
+                                self.res
+                                    .cell_formula(at.0, at.1, at.2)
+                                    .and_then(|f| parse(&f).ok())
+                                    .map(|ast| (ast, at))
+                            }
+                            _ => None,
+                        };
+                        match (crit_cols[ci], formula) {
+                            (None, Some((ast, at))) => DbCrit::Computed(ast, at),
+                            _ if matches!(cval, Value::Empty) => DbCrit::Skip,
+                            (Some(col), _) => {
+                                let prefix = db_begins_with(&cval);
+                                DbCrit::Field(col, parse_criteria(&cval), prefix)
+                            }
+                            (None, None) if blank_header[ci] => DbCrit::Skip,
+                            (None, None) => DbCrit::Never,
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
 
         let mut out = Vec::new();
-        for row in &db[1..] {
+        for (ri, row) in db[1..].iter().enumerate() {
             // Criteria rows are OR'd; cells within a row are AND'd.
-            let mut matched = crit.len() <= 1; // no criteria rows → all match
-            for cr in &crit[1..] {
+            let mut matched = crit_rows.is_empty(); // no criteria rows → all match
+            for cr in &crit_rows {
                 let mut row_ok = true;
-                for (ci, dbcol) in crit_cols.iter().enumerate() {
-                    let Some(dbcol) = dbcol else { continue };
-                    let cval = cr.get(ci).cloned().unwrap_or(Value::Empty);
-                    if matches!(cval, Value::Empty) {
-                        continue;
-                    }
-                    let c = parse_criteria(&cval);
-                    let cell = row.get(*dbcol).cloned().unwrap_or(Value::Empty);
-                    if !criteria_match(&c, &cell) {
+                for c in cr {
+                    let ok = match c {
+                        DbCrit::Skip => true,
+                        DbCrit::Never => false,
+                        DbCrit::Field(dbcol, crit, prefix) => {
+                            let cell = row.get(*dbcol).cloned().unwrap_or(Value::Empty);
+                            db_criteria_match(crit, *prefix, &cell)
+                        }
+                        DbCrit::Computed(_, at) if self.db_crit_stack.contains(at) => false,
+                        DbCrit::Computed(ast, at @ (cs, cr0, cc0)) => {
+                            // Record `ri` sits `ri` rows below the first
+                            // data row, which the formula's relative refs
+                            // point at: shift them (and the formula) by that.
+                            let shifted = translate(ast, ri as i64, 0);
+                            let mut child = Eval::new(self.res, *cs, (cr0 + ri as u32, *cc0));
+                            child.db_crit_stack = self.db_crit_stack.clone();
+                            child.db_crit_stack.push(*at);
+                            let v = child.eval(&shifted);
+                            self.unsupported |= child.unsupported;
+                            matches!(v, Value::Bool(true)) || matches!(v, Value::Num(n) if n != 0.0)
+                        }
+                    };
+                    if !ok {
                         row_ok = false;
                         break;
                     }
@@ -9971,7 +10309,7 @@ fn month_num(s: &str) -> Option<u32> {
 }
 
 /// Two-digit year → four-digit, Excel's 0-29 → 2000s, 30-99 → 1900s rule.
-fn norm_year(y: i64) -> i64 {
+pub(crate) fn norm_year(y: i64) -> i64 {
     if y < 30 {
         2000 + y
     } else if y < 100 {
@@ -10243,7 +10581,7 @@ fn matrix_inverse(a: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
     Some(m.iter().map(|row| row[n..].to_vec()).collect())
 }
 
-fn days_in_month(year: i64, month: u32) -> u32 {
+pub(crate) fn days_in_month(year: i64, month: u32) -> u32 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
@@ -10475,6 +10813,7 @@ mod tests {
         table: Option<TableInfo>,
         formulas: HashMap<(u32, u32), String>,
         hidden: std::collections::HashSet<u32>,
+        filtered: std::collections::HashSet<u32>,
     }
 
     impl Grid {
@@ -10490,6 +10829,7 @@ mod tests {
                 table: None,
                 formulas: HashMap::new(),
                 hidden: std::collections::HashSet::new(),
+                filtered: std::collections::HashSet::new(),
             }
         }
         fn with_name(mut self, name: &str, def: &str) -> Grid {
@@ -10510,6 +10850,11 @@ mod tests {
         fn with_hidden(mut self, row_1based: u32) -> Grid {
             self.hidden.insert(row_1based - 1);
             self
+        }
+        /// Mark a 1-based worksheet row hidden by a filter.
+        fn with_filtered(mut self, row_1based: u32) -> Grid {
+            self.filtered.insert(row_1based - 1);
+            self.with_hidden(row_1based)
         }
     }
 
@@ -10571,6 +10916,9 @@ mod tests {
         }
         fn row_hidden(&self, _sheet: usize, row: u32) -> bool {
             self.hidden.contains(&row)
+        }
+        fn row_filtered(&self, _sheet: usize, row: u32) -> bool {
+            self.filtered.contains(&row) && self.hidden.contains(&row)
         }
     }
 
@@ -10820,16 +11168,49 @@ mod tests {
         .with_formula("A3", "SUBTOTAL(9,A1:A2)");
         assert_eq!(n("SUBTOTAL(9,A1:A4)", &g2), 7.0); // 1+2+4, A3 skipped
 
-        // Hidden rows are excluded (filter-hidden is the common case).
+        // 1–11 exclude filter-hidden rows only; 101–111 every hidden row
+        // (#678). Row 2 is filtered out, row 4 hidden by hand.
         let g3 = Grid::new(&[
             ("A1", Value::Num(1.0)),
             ("A2", Value::Num(2.0)),
             ("A3", Value::Num(3.0)),
             ("A4", Value::Num(4.0)),
         ])
-        .with_hidden(2)
+        .with_filtered(2)
         .with_hidden(4);
-        assert_eq!(n("SUBTOTAL(9,A1:A4)", &g3), 4.0); // 1+3
+        assert_eq!(n("SUBTOTAL(9,A1:A4)", &g3), 8.0); // 1+3+4
+        assert_eq!(n("SUBTOTAL(109,A1:A4)", &g3), 4.0); // 1+3
+        assert_eq!(n("SUBTOTAL(3,A1:A4)", &g3), 3.0);
+        assert_eq!(n("SUBTOTAL(103,A1:A4)", &g3), 2.0);
+        // AGGREGATE's hidden options skip every hidden row; the others none.
+        assert_eq!(n("AGGREGATE(9,5,A1:A4)", &g3), 4.0);
+        assert_eq!(n("AGGREGATE(9,6,A1:A4)", &g3), 10.0);
+    }
+
+    #[test]
+    fn aggregate_option_4_counts_nested_subtotals() {
+        // #678: options 4–7 ignore nothing nested; 0–3 skip nested
+        // SUBTOTAL/AGGREGATE cells.
+        let g = Grid::new(&[
+            ("C2", Value::Num(10.0)),
+            ("C3", Value::Num(20.0)),
+            ("C4", Value::Num(30.0)),
+            ("C5", Value::Num(5.0)),
+            ("C6", Value::Num(7.0)),
+            ("C7", Value::Num(12.0)),
+        ])
+        .with_formula("C4", "SUBTOTAL(9,C2:C3)")
+        .with_formula("C7", "SUBTOTAL(9,C5:C6)");
+        assert_eq!(n("AGGREGATE(9,4,C2:C7)", &g), 84.0);
+        assert_eq!(n("AGGREGATE(9,5,C2:C7)", &g), 84.0);
+        assert_eq!(n("AGGREGATE(9,6,C2:C7)", &g), 84.0);
+        assert_eq!(n("AGGREGATE(9,7,C2:C7)", &g), 84.0);
+        assert_eq!(n("AGGREGATE(9,0,C2:C7)", &g), 42.0);
+        assert_eq!(n("AGGREGATE(9,3,C2:C7)", &g), 42.0);
+        assert_eq!(n("SUBTOTAL(9,C2:C7)", &g), 42.0);
+        assert_eq!(n("AGGREGATE(14,4,C2:C7,1)", &g), 30.0);
+        assert_eq!(n("AGGREGATE(14,6,C2:C7,1)", &g), 30.0);
+        assert_eq!(n("AGGREGATE(14,2,C2:C7,1)", &g), 20.0);
     }
 
     #[test]
@@ -11125,6 +11506,13 @@ mod tests {
         assert!(is_volatile(&parse("NOW()").unwrap()));
         assert!(is_volatile(&parse("1+RAND()").unwrap()));
         assert!(!is_volatile(&parse("SUM(A1:B2)").unwrap()));
+        // #677: D-functions always recalculate but are deterministic, not
+        // volatile (`--verify` compares them).
+        let dsum = parse("1+DSUM(A1:C8,\"Amount\",F1:F2)").unwrap();
+        assert!(!is_volatile(&dsum));
+        assert!(always_recalc(&dsum) && contains_db_fn(&dsum));
+        assert!(always_recalc(&parse("NOW()").unwrap()));
+        assert!(!always_recalc(&parse("SUM(A1:B2)").unwrap()));
     }
 
     #[test]
@@ -11511,6 +11899,12 @@ mod tests {
             eval_str("TEXT(45306,\"yyyy-mm-dd\")", &g),
             Value::Str("2024-01-15".into())
         );
+        // A date TEXT cannot show keeps today's General fallback: the cell
+        // display's `####` (#673) is a display rule, not a TEXT() one.
+        assert_eq!(
+            eval_str("TEXT(-1,\"yyyy-mm-dd\")", &g),
+            Value::Str("-1".into())
+        );
         // The runtime renders sections, conditions, and literal codes…
         assert_eq!(
             eval_str("TEXT(-1234,\"$#,##0;[Red]($#,##0)\")", &g),
@@ -11524,8 +11918,13 @@ mod tests {
             eval_str("TEXT(45306.25,\"dddd h:mm AM/PM\")", &g),
             Value::Str("Monday 6:00 AM".into())
         );
-        // …and refuses what it can't honestly do (fractions).
-        let ast = parse("TEXT(1234,\"# ?/?\")").unwrap();
+        // Fractions of the `# ?/?` family render…
+        assert_eq!(
+            eval_str("TEXT(1.25,\"# ?/?\")", &g),
+            Value::Str("1 1/4".into())
+        );
+        // …and it refuses what it can't honestly do (other fraction shapes).
+        let ast = parse("TEXT(1234,\"0 ?/? x\")").unwrap();
         let mut ev = Eval::new(&g, 0, (0, 0));
         let _ = ev.eval(&ast);
         assert!(ev.unsupported);
@@ -12647,5 +13046,132 @@ mod tests {
             nums(&eval_array("MMULT(A1:B2,A1:A2)", &g)),
             vec![vec![7.0], vec![15.0]]
         );
+    }
+
+    #[test]
+    fn power_zero_to_negative_and_odd_roots() {
+        // #659: zero to a negative power divides by zero; a negative base to
+        // the reciprocal of an odd integer takes the real odd root.
+        let g = empty();
+        assert_eq!(eval_str("0^-1", &g), Value::Err(ExcelError::Div0));
+        assert_eq!(eval_str("POWER(0,-1)", &g), Value::Err(ExcelError::Div0));
+        assert_eq!(eval_str("0^-0.5", &g), Value::Err(ExcelError::Div0));
+        assert!((n("(-8)^(1/3)", &g) + 2.0).abs() < 1e-12);
+        // Unary minus binds tighter than ^: -8^(1/3) is (-8)^(1/3).
+        assert!((n("-8^(1/3)", &g) + 2.0).abs() < 1e-12);
+        assert!((n("(-32)^(1/5)", &g) + 2.0).abs() < 1e-12);
+        assert!((n("POWER(-8,1/3)", &g) + 2.0).abs() < 1e-12);
+        // Unchanged: an even root of a negative, 0^0, integer powers.
+        assert_eq!(eval_str("(-8)^(1/2)", &g), Value::Err(ExcelError::Num));
+        assert_eq!(eval_str("0^0", &g), Value::Err(ExcelError::Num));
+        assert_eq!(n("(-8)^2", &g), 64.0);
+        assert_eq!(n("(-2)^3", &g), -8.0);
+    }
+
+    #[test]
+    fn rows_and_columns_of_arrays() {
+        // #661: ROWS/COLUMNS take computed arrays, names and scalars, not only
+        // literal references.
+        let g = Grid::new(&[("A1", Value::Num(1.0))]).with_name("Blk", "Sheet1!$B$2:$D$6");
+        assert_eq!(n("ROWS(SEQUENCE(3))", &g), 3.0);
+        assert_eq!(n("COLUMNS(SEQUENCE(3))", &g), 1.0);
+        // RANDARRAY needs a random source: see the engine's
+        // `rows_and_columns_of_randarray`.
+        assert_eq!(n("ROWS({1,2;3,4})", &g), 2.0);
+        assert_eq!(n("COLUMNS({1,2,3})", &g), 3.0);
+        assert_eq!(n("ROWS(5)", &g), 1.0);
+        assert_eq!(n("ROWS(Blk)", &g), 5.0);
+        assert_eq!(n("COLUMNS(Blk)", &g), 3.0);
+        // The literal reference forms are unchanged.
+        assert_eq!(n("ROWS(A1:A4)", &g), 4.0);
+        assert_eq!(n("COLUMNS(A:C)", &g), 3.0);
+        assert_eq!(n("ROWS(A:A)", &g), crate::sheet::MAX_ROWS as f64);
+        assert_eq!(eval_str("ROWS(1/0)", &g), Value::Err(ExcelError::Div0));
+    }
+
+    #[test]
+    fn fifteen_digit_compare_and_root_snap() {
+        // #655: numbers compare equal at 15 significant digits, and a final
+        // + or - that cancels to binary noise is 0.
+        let g = empty();
+        assert_eq!(eval_str("0.1+0.2=0.3", &g), Value::Bool(true));
+        assert_eq!(eval_str("0.03=(1.05-1.02)", &g), Value::Bool(true));
+        assert_eq!(eval_str("0.1+0.2<>0.3", &g), Value::Bool(false));
+        assert_eq!(eval_str("0.1+0.2>0.3", &g), Value::Bool(false));
+        // Different in the 15th significant digit: not equal.
+        assert_eq!(
+            eval_str("1.23456789012345=1.23456789012346", &g),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            eval_str("1.23456789012345<1.23456789012346", &g),
+            Value::Bool(true)
+        );
+        // A literal keeps 15 significant digits, as typed entry does.
+        assert_eq!(
+            eval_str("12345678901234567=12345678901234500", &g),
+            Value::Bool(true)
+        );
+        assert_eq!(n("1234567890123456789", &g), 1234567890123450000.0);
+
+        let top = |src: &str| {
+            let ast = parse(src).unwrap();
+            let mut ev = Eval::new(&g, 0, (0, 0));
+            match ev.eval_dynamic_as(&ast, true) {
+                DynResult::Scalar(Value::Num(x)) => x,
+                DynResult::Scalar(v) => panic!("{src} → {v:?}"),
+                DynResult::Array(_) => panic!("{src} → array"),
+            }
+        };
+        assert_eq!(top("0.7-0.6-0.1"), 0.0);
+        assert_eq!(top("0.1+0.2-0.3"), 0.0);
+        assert_eq!(top("(0.1+0.2-0.3)"), 0.0);
+        // Only the root operation snaps: 1*(…) keeps the residue.
+        let residue = top("1*(0.7-0.6-0.1)");
+        assert!(
+            residue != 0.0 && (residue + 2.78e-17).abs() < 1e-18,
+            "{residue}"
+        );
+        // A genuine difference far above the noise is kept.
+        assert_eq!(top("1E15+1-1E15"), 1.0);
+        assert_eq!(top("3-1"), 2.0);
+        // formula.eval's path (eval_formula) snaps too; plain eval does not.
+        let ast = parse("0.1+0.2-0.3").unwrap();
+        assert_eq!(Eval::new(&g, 0, (0, 0)).eval_formula(&ast), Value::Num(0.0));
+        assert_ne!(Eval::new(&g, 0, (0, 0)).eval(&ast), Value::Num(0.0));
+        // A single-cell reference operand counts as a scalar.
+        let g2 = Grid::new(&[("A1", Value::Num(0.3))]);
+        let ast = parse("0.1+0.2-A1").unwrap();
+        assert_eq!(
+            Eval::new(&g2, 0, (5, 5)).eval_formula(&ast),
+            Value::Num(0.0)
+        );
+    }
+
+    #[test]
+    fn text_shows_fifteen_significant_digits() {
+        // #655: TEXT prints at most 15 significant digits and does not
+        // saturate large integer parts.
+        let g = Grid::new(&[("M1", Value::Num(1234567890123450000.0))]);
+        let t = |src: &str| match eval_str(src, &g) {
+            Value::Str(s) => s,
+            v => panic!("{src} → {v:?}"),
+        };
+        assert_eq!(t("TEXT(M1,\"0\")"), "1234567890123450000");
+        assert_eq!(t("TEXT(1234567890123456789,\"0\")"), "1234567890123450000");
+        assert_eq!(t("TEXT(1.23456789012345E+18,\"0\")"), "1234567890123450000");
+        assert_eq!(t("TEXT(1E+25,\"0\")"), "10000000000000000000000000");
+        assert_eq!(
+            t("TEXT(1E+25,\"#,##0\")"),
+            "10,000,000,000,000,000,000,000,000"
+        );
+        assert_eq!(
+            t("TEXT(0.1+0.2,\"0.00000000000000000\")"),
+            "0.30000000000000000"
+        );
+        assert_eq!(t("TEXT(1234.5,\"#,##0.00\")"), "1,234.50");
+        assert_eq!(t("TEXT(0.5,\"0.0\")"), "0.5");
+        assert_eq!(t("TEXT(0.5,\"#.#\")"), ".5");
+        assert_eq!(t("TEXT(-2.25,\"0.0\")"), "-2.3");
     }
 }

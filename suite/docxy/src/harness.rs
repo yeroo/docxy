@@ -386,6 +386,138 @@ pub fn drag_args(args: &Json) -> Result<DragEnds, String> {
     Ok((cell_arg(args, "from")?, cell_arg(args, "to")?))
 }
 
+/// What a document refuses to be saved as.
+const DOC_SAVE_FORMATS: &str = "Documents can be saved as .docx, .md or .html";
+
+/// The extension `save-as` gives a path that has none, for a `format`.
+fn format_extension(format: &str) -> Option<&'static str> {
+    Some(match format {
+        "docx" => ".docx",
+        "md" => ".md",
+        "html" => ".docx.html",
+        "xlsx" => ".xlsx",
+        "yppx" => ".yppx",
+        "xml" => ".xml",
+        _ => return None,
+    })
+}
+
+/// The format a document path saves as, by the app's own rules
+/// (`is_markdown_path`, `htmlbundle::is_html_path`), or the refusal. Any other
+/// extension is refused: `save_doc_tab` would write a Word package under it.
+fn doc_save_format(path: &Path, html_ok: bool) -> Result<&'static str, String> {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase());
+    if crate::is_markdown_path(path) {
+        Ok("md")
+    } else if htmlbundle::is_html_path(&path.to_string_lossy()) {
+        if html_ok {
+            Ok("html")
+        } else {
+            Err("this build cannot write editable HTML (.html)".into())
+        }
+    } else if ext.as_deref() == Some("docx") {
+        Ok("docx")
+    } else {
+        Err(DOC_SAVE_FORMATS.into())
+    }
+}
+
+/// Resolve a `save-as` request to the file the dialog would have answered
+/// with and the format it writes (#699). `raw` is the path as given: a
+/// relative one resolves against `base`, the active file's directory, where
+/// the dialog opens; a path with no extension takes `format`'s, or the tab
+/// kind's default (the Save As dialog's first filter). The extension rules
+/// are the app's own: `sheet_save_target`, `yppx::save_target`, and
+/// [`doc_save_format`]. `format`, when given, must be one the tab kind saves
+/// and must agree with an explicit extension.
+fn save_as_target(
+    kind: crate::Kind,
+    base: Option<&Path>,
+    raw: &str,
+    format: Option<&str>,
+    html_ok: bool,
+) -> Result<(PathBuf, &'static str), String> {
+    use crate::Kind;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("save-as needs a non-empty 'path'".into());
+    }
+    // Formats are named like extensions, in any case.
+    let format = format.map(|f| f.trim().to_ascii_lowercase());
+    if format.as_deref() == Some("") {
+        return Err("'format' must not be empty; leave it out to go by the extension".into());
+    }
+    let format = format.as_deref();
+    let given = PathBuf::from(raw);
+    let mut path = if given.is_absolute() {
+        given
+    } else {
+        base.ok_or(
+            "this tab has never been saved, so a relative 'path' has no folder: give an absolute path",
+        )?
+        .join(given)
+    };
+    let kind_formats: &[&str] = match kind {
+        Kind::Docx => &["docx", "md", "html"],
+        Kind::Xlsx => &["xlsx"],
+        Kind::Project => &["yppx", "xml"],
+        Kind::Look => return Err("this tab cannot be saved as a file".into()),
+    };
+    if let Some(f) = format {
+        if !kind_formats.contains(&f) {
+            // The kind's own refusal, in its own rule's words: the rule is
+            // asked about an extension no kind saves, so it always refuses.
+            let foreign = Path::new("x.not-a-format");
+            return Err(match kind {
+                Kind::Xlsx => crate::sheet_save_target(foreign).err(),
+                Kind::Project => projcore::yppx::save_target(foreign).err(),
+                _ => None,
+            }
+            .unwrap_or_else(|| DOC_SAVE_FORMATS.into()));
+        }
+    }
+    if path.extension().is_none() {
+        let ext = format_extension(format.unwrap_or(kind_formats[0])).unwrap_or_default();
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(ext);
+        path.set_file_name(name);
+    }
+    let (path, written) = match kind {
+        Kind::Xlsx => (crate::sheet_save_target(&path)?, "xlsx"),
+        Kind::Project => {
+            let path = projcore::yppx::save_target(&path)?;
+            let yppx = path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("yppx"));
+            (path, if yppx { "yppx" } else { "xml" })
+        }
+        _ => {
+            let written = doc_save_format(&path, html_ok)?;
+            (path, written)
+        }
+    };
+    if let Some(f) = format.filter(|f| *f != written) {
+        return Err(format!(
+            "'format' {f} does not match {}, which saves as {written}",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+    }
+    Ok((path, written))
+}
+
+/// A cell or range argument (`"A1"` or `"A1:C5"`), as its two corners.
+pub fn range_arg(args: &Json, key: &str) -> Result<DragEnds, String> {
+    let text = arg_str(args, key)?.trim();
+    if let Some((r0, c0, r1, c1)) = parse_range_name(text) {
+        return Ok(((r0, c0), (r1, c1)));
+    }
+    let cell = parse_cell(text)
+        .map_err(|_| format!("'{text}' is not a cell or a range (expected A1 or A1:C5)"))?;
+    Ok((cell, cell))
+}
+
 /// The cells a pointer dragged from `from` to `to` would cross, in order,
 /// starting with `from` itself — a real drag always moves inside its origin
 /// cell before it crosses a boundary, and that first move is what plants the
@@ -1081,8 +1213,17 @@ fn active_doc(app: &crate::Docxy) -> Result<&Editor, String> {
     }
 }
 
-/// Ribbon verbs address only surfaces that render this ribbon model.
-fn ribbon_surface(app: &crate::Docxy) -> Result<(), String> {
+/// Which ribbon the active tab draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RibbonSurface {
+    /// The declarative document/Project ribbon (`ribbon_for`).
+    Model,
+    /// The spreadsheet ribbon (`sheet_ribbon::SHEET_RIBBON`).
+    Sheet,
+}
+
+/// Ribbon verbs address only a ribbon the window is drawing.
+fn ribbon_surface(app: &crate::Docxy) -> Result<RibbonSurface, String> {
     if app.backstage {
         return Err("the ribbon is hidden while File (backstage) is open".into());
     }
@@ -1090,9 +1231,87 @@ fn ribbon_surface(app: &crate::Docxy) -> Result<(), String> {
         return Err("the ribbon is collapsed".into());
     }
     match app.tabs.get(app.active).map(|t| &t.surface) {
-        Some(crate::Surface::Doc(_) | crate::Surface::Project(_)) => Ok(()),
-        _ => Err("the active tab has no document or Project ribbon".into()),
+        Some(crate::Surface::Doc(_) | crate::Surface::Project(_)) => Ok(RibbonSurface::Model),
+        Some(crate::Surface::Sheet(_)) => Ok(RibbonSurface::Sheet),
+        _ => Err("the active tab has no ribbon".into()),
     }
+}
+
+/// One sheet ribbon command, in the document ribbon's reply shape. A sheet
+/// button has no screentip or KeyTip, so the tip title is the label.
+fn sheet_command_json(app: &crate::Docxy, cmd: &crate::sheet_ribbon::SheetCmd) -> Json {
+    let label = cmd.label(app.sheet_act_toggled(cmd.act));
+    Json::obj(vec![
+        ("id", Json::Str(cmd.id.into())),
+        ("label", Json::Str(label.into())),
+        (
+            "tip",
+            Json::obj(vec![
+                ("title", Json::Str(label.into())),
+                ("body", Json::Str(String::new())),
+            ]),
+        ),
+        ("key_tip", Json::Str(String::new())),
+        (
+            "checked",
+            Json::Bool(crate::sheet_ribbon::act_on(cmd.act, &app.active_xf())),
+        ),
+        ("enabled", Json::Bool(cmd.enabled())),
+    ])
+}
+
+/// The spreadsheet ribbon as `ribbon-read` reports it: File, then every tab
+/// the sheet strip offers with the groups `sheet_ribbon_body` draws for it.
+fn sheet_ribbon_json(app: &crate::Docxy) -> Json {
+    let kind = crate::Kind::Xlsx;
+    let mut tabs = vec![file_tab_json(kind)];
+    for (tab, name, key_tip) in crate::ribbon_tab_set(kind) {
+        let Some(tab) = tab else { continue };
+        let def = crate::sheet_ribbon::tab_def(*tab);
+        let groups = def
+            .groups
+            .iter()
+            .map(|g| {
+                Json::obj(vec![
+                    ("title", Json::Str(g.title.into())),
+                    ("launcher", Json::Bool(g.launcher)),
+                    (
+                        "commands",
+                        Json::Arr(
+                            g.commands()
+                                .into_iter()
+                                .map(|c| sheet_command_json(app, c))
+                                .collect(),
+                        ),
+                    ),
+                    ("galleries", Json::Arr(Vec::new())),
+                ])
+            })
+            .collect();
+        tabs.push(Json::obj(vec![
+            ("name", Json::Str((*name).into())),
+            ("key_tip", Json::Str((*key_tip).into())),
+            ("kind", Json::Str("ribbon".into())),
+            ("groups", Json::Arr(groups)),
+        ]));
+    }
+    ribbon_reply(tabs)
+}
+
+/// Find a command on the sheet ribbon tab `tab_name`, as drawn now.
+fn resolve_sheet_command(
+    app: &crate::Docxy,
+    tab_name: &str,
+    query: &str,
+) -> Result<(crate::RibbonTab, crate::SheetAct), String> {
+    if tab_name == "File" {
+        return Err("File is backstage; use the backstage verb".into());
+    }
+    let tab = ribbon_tab_by_name(crate::Kind::Xlsx, tab_name)?;
+    let commands = crate::sheet_ribbon::tab_def(tab).commands();
+    let cmd =
+        crate::sheet_ribbon::resolve(&commands, tab_name, query, |act| app.sheet_act_toggled(act))?;
+    Ok((tab, cmd.act))
 }
 
 /// The live status-line items in the order the app draws them.
@@ -1280,13 +1499,7 @@ fn ribbon_json_for(
     checked: impl Fn(&RibbonCommand) -> bool,
 ) -> Json {
     let ribbon = crate::ribbon_for(kind);
-    let (_, file_name, file_tip) = crate::ribbon_tab_set(kind)[0];
-    let mut tabs = vec![Json::obj(vec![
-        ("name", Json::Str(file_name.into())),
-        ("key_tip", Json::Str(file_tip.into())),
-        ("kind", Json::Str("backstage".into())),
-        ("groups", Json::Arr(Vec::new())),
-    ])];
+    let mut tabs = vec![file_tab_json(kind)];
     tabs.extend(ribbon.tabs.iter().map(|t| tab_json(t, &checked)));
     if kind == crate::Kind::Docx && in_table {
         tabs.push(tab_json(&crate::table_tab(), &checked));
@@ -1294,6 +1507,22 @@ fn ribbon_json_for(
     if kind == crate::Kind::Project && in_gantt {
         tabs.push(tab_json(&crate::gantt_format_tab(), &checked));
     }
+    ribbon_reply(tabs)
+}
+
+/// The File tab entry every ribbon reply starts with.
+fn file_tab_json(kind: crate::Kind) -> Json {
+    let (_, file_name, file_tip) = crate::ribbon_tab_set(kind)[0];
+    Json::obj(vec![
+        ("name", Json::Str(file_name.into())),
+        ("key_tip", Json::Str(file_tip.into())),
+        ("kind", Json::Str("backstage".into())),
+        ("groups", Json::Arr(Vec::new())),
+    ])
+}
+
+/// A ribbon reply: the tabs, their count and the Quick Access Toolbar.
+fn ribbon_reply(tabs: Vec<Json>) -> Json {
     let tab_count = tabs.len();
     let qat = crate::QAT_ITEMS
         .iter()
@@ -1512,7 +1741,9 @@ fn menu_open(
                 let [tab, group, label] = path.as_slice() else {
                     return Err("'ribbon' must be [tab, group, command]".into());
                 };
-                ribbon_surface(app)?;
+                if ribbon_surface(app)? == RibbonSurface::Sheet {
+                    return Err("the sheet ribbon has no split buttons".into());
+                }
                 let def = ribbon_tab_def(app, tab)?;
                 let id = split_primary(&def, group, label)?;
                 app.select_ribbon_tab(ribbon_tab_by_name(app.ribbon_kind(), tab)?, window, cx);
@@ -1558,6 +1789,8 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
         verb,
         "click-cell"
             | "drag"
+            | "fill-drag"
+            | "save-as"
             | "select-chart"
             | "focus-field"
             | "ribbon-click"
@@ -1623,6 +1856,55 @@ fn resolve_commands(
                 .join(", ")
         )),
     }
+}
+
+/// What the active tab's paste would take besides the clipboard's text: the
+/// document's in-app clip, or the grid clip while the clipboard still holds
+/// what it put there (`grid_paste_uses_clip`); otherwise `none`, and a paste
+/// takes `text` (a document never reads it: see the stale-clip follow-up).
+fn clipboard_app_json(
+    surface: Option<&crate::Surface>,
+    doc: Option<&docxcore::editor::Clip>,
+    grid: Option<&crate::GridClip>,
+    now: &crate::ClipRead,
+) -> Json {
+    match surface {
+        Some(crate::Surface::Doc(_)) => {
+            if let Some(clip) = doc {
+                return Json::obj(vec![
+                    ("kind", Json::Str("doc".into())),
+                    ("text", Json::Str(clip.to_text())),
+                ]);
+            }
+        }
+        Some(crate::Surface::Sheet(_)) => {
+            if let Some(clip) = grid.filter(|c| crate::grid_paste_uses_clip(&c.text, now)) {
+                return Json::obj(vec![
+                    ("kind", Json::Str("grid".into())),
+                    ("text", Json::Str(clip.text.clone())),
+                    ("rows", Json::Num(clip.cells.len() as f64)),
+                    (
+                        "cols",
+                        Json::Num(clip.cells.first().map_or(0, Vec::len) as f64),
+                    ),
+                ]);
+            }
+        }
+        _ => {}
+    }
+    Json::obj(vec![("kind", Json::Str("none".into()))])
+}
+
+/// The `clipboard` reply: the clipboard's text (the harness's private one)
+/// and what the active tab's paste would use.
+fn clipboard_json(app: &crate::Docxy, cx: &App) -> Json {
+    let now = app.clipboard_read(cx);
+    let surface = app.tabs.get(app.active).map(|t| &t.surface);
+    let used = clipboard_app_json(surface, app.clip.as_ref(), app.grid_clip.as_ref(), &now);
+    Json::obj(vec![
+        ("text", str_or_null(now.text().map(str::to_string))),
+        ("app", used),
+    ])
 }
 
 /// The active spreadsheet, or the refusal every cell verb needs.
@@ -2083,15 +2365,22 @@ pub fn dispatch(
                 ),
             ]))
         }
-        "ribbon-read" => {
-            ribbon_surface(app)?;
-            Done::ok(ribbon_json(app))
-        }
+        "ribbon-read" => match ribbon_surface(app)? {
+            RibbonSurface::Model => Done::ok(ribbon_json(app)),
+            RibbonSurface::Sheet => Done::ok(sheet_ribbon_json(app)),
+        },
         "ribbon-click" => {
             app.refuse_under_dialog()?;
-            ribbon_surface(app)?;
+            let surface = ribbon_surface(app)?;
             let tab = arg_str(args, "tab")?.to_string();
             let command = arg_str(args, "command")?.to_string();
+            if surface == RibbonSurface::Sheet {
+                // The button's own click: select its tab, then run its act.
+                let (ribbon_tab, act) = resolve_sheet_command(app, &tab, &command)?;
+                app.select_ribbon_tab(ribbon_tab, window, cx);
+                app.run_sheet_act(act, window, cx);
+                return Done::ok(state(app, window));
+            }
             let act = resolve_ribbon_command(app, &tab, &command)?;
             app.select_ribbon_tab(ribbon_tab_by_name(app.ribbon_kind(), &tab)?, window, cx);
             app.dispatch(act, window, cx);
@@ -2241,10 +2530,146 @@ pub fn dispatch(
             }
             let cell = cell_arg(args, "cell")?;
             sheet(app)?;
-            app.grid_press_cell(cell, cx);
-            app.cell_click(cell.0, cell.1, shift, dbl, window, cx);
-            app.grid_release(cx);
+            click_cell(app, cell, shift, dbl, window, cx);
             Done::ok(state(app, window))
+        }
+
+        // Save As without the native dialog (#699), which a harness instance
+        // must never open (its modal loop stops the control pump). The target
+        // the dialog would have answered with goes to the same save functions
+        // its answer feeds; success is what they return.
+        "save-as" => {
+            app.refuse_under_dialog()?;
+            let raw = match args.get("path") {
+                Some(Json::Str(path)) => path.as_str(),
+                Some(_) => return Err("'path' must be a string".into()),
+                None => return Err("save-as needs a 'path'".into()),
+            };
+            let format = match args.get("format") {
+                None => None,
+                Some(Json::Str(f)) => Some(f.as_str()),
+                Some(_) => return Err("'format' must be a string".into()),
+            };
+            let overwrite = arg_flag(args, "overwrite")?;
+            let tab = app.tabs.get(app.active).ok_or("no tab is open")?;
+            let base = tab.path.as_deref().and_then(Path::parent);
+            let (target, written) = save_as_target(
+                tab.kind,
+                base,
+                raw,
+                format,
+                crate::doc_html_save_allowed(tab),
+            )?;
+            // The dialog asks before replacing a file; a case says so up front.
+            if target.exists() && !overwrite {
+                return Err(format!(
+                    "{} already exists; pass \"overwrite\": true to replace it",
+                    target.display()
+                ));
+            }
+            let saved = match tab.kind {
+                crate::Kind::Xlsx => app.save_sheet_as(&target, window, cx),
+                crate::Kind::Project => app.save_project_to(&target, window, cx).is_ok(),
+                _ => app.save_doc_to(Some(target.clone()), window, cx),
+            };
+            let tab = &app.tabs[app.active];
+            if !saved {
+                return Err(tab.status.to_string());
+            }
+            Done::ok(Json::obj(vec![
+                (
+                    "path",
+                    str_or_null(tab.path.as_ref().map(|p| p.display().to_string())),
+                ),
+                ("format", Json::Str(written.into())),
+                ("title", Json::Str(tab.title.to_string())),
+                ("dirty", Json::Bool(tab.dirty)),
+                ("status", Json::Str(tab.status.to_string())),
+            ]))
+        }
+
+        // The fill handle (#699): the handle's own press, one move per cell
+        // crossed, the release — what a pointer dragging the handle does. The
+        // `drag` verb presses the grid instead, so it sweeps a selection.
+        "fill-drag" => {
+            app.refuse_under_dialog()?;
+            if args.get("option").is_some() {
+                return Err("AutoFill Options are not implemented in this app".into());
+            }
+            let to = cell_arg(args, "to")?;
+            let from = match args.get("from") {
+                Some(_) => Some(range_arg(args, "from")?),
+                None => None,
+            };
+            sheet(app)?;
+            // Refuse before `from` moves anything: a click would land in an
+            // open edit or a pointing reference rather than select cells.
+            fill_press_refusal(
+                app.backstage,
+                app.tab_more_open,
+                app.fill_handle_hidden_reason(),
+                from.is_some(),
+            )?;
+            if let Some((start, end)) = from {
+                click_cell(app, start, false, false, window, cx);
+                if end != start {
+                    click_cell(app, end, true, false, window, cx);
+                }
+            }
+            fill_press_refusal(
+                app.backstage,
+                app.tab_more_open,
+                app.fill_handle_hidden_reason(),
+                false,
+            )?;
+            let src = sheet(app)?.range();
+            app.sheet_fill_start(cx);
+            if app.sheet_fill.is_none() {
+                return Err(if app.sheet_protected() {
+                    "the fill did not arm: the sheet is protected".into()
+                } else {
+                    "the fill did not arm: another gesture is in flight".into()
+                });
+            }
+            for (r, c) in drag_path((src.2, src.3), to) {
+                app.grid_drag_over(r, c, cx);
+            }
+            app.grid_release(cx);
+            let after = sheet(app)?.range();
+            let mut reply = state(app, window);
+            if let Json::Obj(fields) = &mut reply {
+                let filled = (after != src).then(|| a1_range(after));
+                fields.push(("filled".into(), str_or_null(filled)));
+            }
+            Done::ok(reply)
+        }
+
+        // The clipboard (#699). A harness instance has a private one (it starts
+        // empty and never touches the OS clipboard); `write` puts text on it
+        // as another app's copy would. Copy, cut and paste are the app's own
+        // keys and buttons (`key ctrl+c`, `ribbon-click`), not a second route.
+        "clipboard" => {
+            match arg_str(args, "action")? {
+                "read" => {}
+                "write" => {
+                    let text = arg_str(args, "text")?.to_string();
+                    app.clipboard_write(text, cx);
+                }
+                "paste-special" => {
+                    return Err("paste special is not implemented in this app".into());
+                }
+                action @ ("copy" | "cut" | "paste") => {
+                    return Err(format!(
+                        "clipboard does not {action}: press the app's own key (key ctrl+c, ctrl+x, ctrl+v) or ribbon-click its button"
+                    ));
+                }
+                other => {
+                    return Err(format!(
+                        "unknown clipboard action '{other}' (read, write, paste-special)"
+                    ));
+                }
+            }
+            Done::ok(clipboard_json(app, cx))
         }
 
         // A drag: the press plants the anchor, each cell crossed is a move, the
@@ -2514,6 +2939,47 @@ fn is_action_key(stroke: &Keystroke) -> bool {
             .any(|(key, shift)| *key == stroke.key && *shift == m.shift)
 }
 
+/// Why `fill-drag` cannot press the fill handle, or `Ok` when it can. The
+/// handle is not there to press while File (backstage) covers the sheet or the
+/// more-tabs list covers the window, or while the grid does not draw it
+/// (`hidden`). With `selecting_from`, the verb is about to click `from`, so a
+/// reason such a click clears (a selected chart) is left to the check after
+/// it; the others refuse first, so a refused verb has changed nothing.
+fn fill_press_refusal(
+    backstage: bool,
+    tab_more_open: bool,
+    hidden: Option<crate::HandleHidden>,
+    selecting_from: bool,
+) -> Result<(), String> {
+    if backstage {
+        return Err("the fill handle is not shown: File (backstage) is open".into());
+    }
+    if tab_more_open {
+        return Err("the fill handle is covered: the more-tabs list is open".into());
+    }
+    match hidden {
+        Some(h) if !(selecting_from && h.cleared_by_a_click()) => {
+            Err(format!("the fill handle is not shown: {}", h.why()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// A click on a sheet cell, as the pointer makes it: press, the cell's click
+/// handler, release.
+fn click_cell(
+    app: &mut crate::Docxy,
+    cell: (u32, u32),
+    shift: bool,
+    double: bool,
+    window: &mut Window,
+    cx: &mut Context<crate::Docxy>,
+) {
+    app.grid_press_cell(cell, cx);
+    app.cell_click(cell.0, cell.1, shift, double, window, cx);
+    app.grid_release(cx);
+}
+
 /// Deliver one keystroke the way the platform would: through the bound action
 /// if gpui would match a binding first, otherwise through `on_key`.
 fn press(
@@ -2593,6 +3059,58 @@ mod tests {
                 })],
             })],
         })
+    }
+
+    /// #699: `clipboard` reports what the active tab's paste would take: the
+    /// document clip on a document, the grid clip on a sheet only while the
+    /// clipboard still holds its text, and nothing on other surfaces.
+    #[test]
+    fn clipboard_reports_the_clip_the_next_paste_would_use() {
+        use crate::ClipRead;
+        let doc = crate::Surface::Doc(editor(ParProps::default(), RunProps::default()));
+        let sheet = crate::new_sheet_surface();
+        let clip = docxcore::editor::Clip::from_text("one\ntwo");
+        let grid = crate::GridClip {
+            cells: vec![vec![Default::default(); 3]; 2],
+            text: "a\tb\tc\nd\te\tf\n".into(),
+        };
+        let kind = |j: Json| j.get_str("kind").unwrap().to_string();
+        let nothing = ClipRead::Nothing;
+        let text = |t: &str| ClipRead::Text(t.into());
+
+        let on_doc = clipboard_app_json(Some(&doc), Some(&clip), Some(&grid), &nothing);
+        assert_eq!(kind(on_doc.clone()), "doc");
+        assert_eq!(on_doc.get_str("text"), Some("one\ntwo"));
+        let bare = clipboard_app_json(Some(&doc), None, Some(&grid), &nothing);
+        assert_eq!(kind(bare), "none");
+
+        let ours = clipboard_app_json(Some(&sheet), Some(&clip), Some(&grid), &text(&grid.text));
+        assert_eq!(kind(ours.clone()), "grid");
+        assert_eq!(ours.get("rows"), Some(&Json::Num(2.)));
+        assert_eq!(ours.get("cols"), Some(&Json::Num(3.)));
+        let crlf = text(&grid.text.replace('\n', "\r\n"));
+        let echoed = clipboard_app_json(Some(&sheet), None, Some(&grid), &crlf);
+        assert_eq!(kind(echoed), "grid");
+        let replaced = clipboard_app_json(Some(&sheet), None, Some(&grid), &text("x\ty"));
+        assert_eq!(kind(replaced), "none");
+        // An image copied since is newer than the grid clip; a clipboard with
+        // no item at all cannot say it changed.
+        let image = clipboard_app_json(Some(&sheet), None, Some(&grid), &ClipRead::NotText);
+        assert_eq!(kind(image), "none");
+        let unread = clipboard_app_json(Some(&sheet), None, Some(&grid), &nothing);
+        assert_eq!(kind(unread), "grid");
+
+        let placeholder = crate::Surface::Placeholder;
+        assert_eq!(
+            kind(clipboard_app_json(
+                Some(&placeholder),
+                Some(&clip),
+                Some(&grid),
+                &nothing
+            )),
+            "none"
+        );
+        assert_eq!(kind(clipboard_app_json(None, None, None, &nothing)), "none");
     }
 
     /// #697: a harness instance ignores the pane it was launched from and is
@@ -3295,6 +3813,8 @@ mod tests {
         for verb in [
             "click-cell",
             "drag",
+            "fill-drag",
+            "save-as",
             "ribbon-click",
             "title-tab",
             "close-tab",
@@ -3313,6 +3833,7 @@ mod tests {
             "key",
             "type",
             "ribbon-read",
+            "clipboard",
             "dialog-read",
             "status-read",
             "doc",
@@ -3811,6 +4332,187 @@ mod tests {
         );
         // A one-cell range is a drag that goes nowhere, not an error.
         assert_eq!(drag_args(&obj(&[("range", s("B2"))])), Ok(((1, 1), (1, 1))));
+    }
+
+    /// #699: `save-as` resolves the path the dialog would have answered with,
+    /// by the app's own extension rules, and refuses what the dialog would
+    /// not produce.
+    #[test]
+    fn save_as_resolves_the_target_and_format_by_the_apps_rules() {
+        use crate::Kind;
+        let base = Path::new("/sandbox/case");
+        let ok = |kind, raw: &str, format: Option<&str>| {
+            save_as_target(kind, Some(base), raw, format, true)
+        };
+        let at = |name: &str| base.join(name);
+
+        assert_eq!(
+            ok(Kind::Docx, "out.docx", None),
+            Ok((at("out.docx"), "docx"))
+        );
+        assert_eq!(ok(Kind::Docx, "out.md", None), Ok((at("out.md"), "md")));
+        assert_eq!(
+            ok(Kind::Docx, "out.markdown", None),
+            Ok((at("out.markdown"), "md"))
+        );
+        assert_eq!(
+            ok(Kind::Docx, "out.html", None),
+            Ok((at("out.html"), "html"))
+        );
+        assert_eq!(ok(Kind::Docx, "out", None), Ok((at("out.docx"), "docx")));
+        assert_eq!(ok(Kind::Docx, "out", Some("md")), Ok((at("out.md"), "md")));
+        assert_eq!(
+            ok(Kind::Docx, "out", Some("html")),
+            Ok((at("out.docx.html"), "html"))
+        );
+        assert_eq!(
+            ok(Kind::Docx, "out.txt", None),
+            Err(DOC_SAVE_FORMATS.into())
+        );
+        assert_eq!(
+            ok(Kind::Docx, "out.xlsx", None),
+            Err(DOC_SAVE_FORMATS.into())
+        );
+        assert_eq!(
+            ok(Kind::Docx, "out", Some("pdf")),
+            Err(DOC_SAVE_FORMATS.into())
+        );
+        assert_eq!(
+            ok(Kind::Docx, "out.md", Some("docx")),
+            Err("'format' docx does not match out.md, which saves as md".into())
+        );
+        assert_eq!(
+            save_as_target(Kind::Docx, Some(base), "out.html", None, false),
+            Err("this build cannot write editable HTML (.html)".into())
+        );
+
+        assert_eq!(
+            ok(Kind::Xlsx, "book.xlsx", None),
+            Ok((at("book.xlsx"), "xlsx"))
+        );
+        assert_eq!(ok(Kind::Xlsx, "book", None), Ok((at("book.xlsx"), "xlsx")));
+        assert_eq!(
+            ok(Kind::Xlsx, "book.csv", None),
+            Err("Workbooks can only be saved as .xlsx".into())
+        );
+        assert_eq!(
+            ok(Kind::Xlsx, "book", Some("docx")),
+            Err("Workbooks can only be saved as .xlsx".into())
+        );
+        // A format is named in any case; an empty one is refused, not taken
+        // as a document format on a workbook.
+        assert_eq!(
+            ok(Kind::Xlsx, "book", Some("XLSX")),
+            Ok((at("book.xlsx"), "xlsx"))
+        );
+        assert_eq!(
+            ok(Kind::Docx, "out", Some(" Md ")),
+            Ok((at("out.md"), "md"))
+        );
+        for kind in [Kind::Xlsx, Kind::Docx, Kind::Project] {
+            assert!(
+                ok(kind, "book", Some(""))
+                    .unwrap_err()
+                    .contains("'format' must not be empty")
+            );
+        }
+        assert!(
+            ok(Kind::Project, "plan", Some("xlsx"))
+                .unwrap_err()
+                .contains("can only be saved as .yppx or .xml")
+        );
+
+        assert_eq!(
+            ok(Kind::Project, "plan", None),
+            Ok((at("plan.yppx"), "yppx"))
+        );
+        assert_eq!(
+            ok(Kind::Project, "plan.xml", None),
+            Ok((at("plan.xml"), "xml"))
+        );
+        assert_eq!(
+            ok(Kind::Project, "plan", Some("xml")),
+            Ok((at("plan.xml"), "xml"))
+        );
+        assert!(
+            ok(Kind::Project, "plan.mpp", None)
+                .unwrap_err()
+                .contains("can only be saved as .yppx or .xml")
+        );
+
+        let abs = if cfg!(windows) {
+            "C:/elsewhere/x.docx"
+        } else {
+            "/elsewhere/x.docx"
+        };
+        assert_eq!(
+            save_as_target(Kind::Docx, None, abs, None, true),
+            Ok((PathBuf::from(abs), "docx"))
+        );
+        assert!(
+            save_as_target(Kind::Docx, None, "x.docx", None, true)
+                .unwrap_err()
+                .contains("never been saved")
+        );
+        assert_eq!(
+            ok(Kind::Docx, "  ", None),
+            Err("save-as needs a non-empty 'path'".into())
+        );
+        assert_eq!(
+            ok(Kind::Look, "x.docx", None),
+            Err("this tab cannot be saved as a file".into())
+        );
+    }
+
+    /// #699: `fill-drag` refuses before `from` is clicked when a click could
+    /// not bring the handle back (an edit, a pointing reference, a cover), so
+    /// a refusal changes nothing; a selected chart is left for the click to
+    /// clear and refused only if the handle is still hidden after it.
+    #[test]
+    fn fill_drag_refuses_before_selecting_when_a_click_cannot_help() {
+        use crate::HandleHidden::*;
+        assert_eq!(fill_press_refusal(false, false, None, true), Ok(()));
+        assert_eq!(fill_press_refusal(false, false, None, false), Ok(()));
+        for selecting in [true, false] {
+            assert_eq!(
+                fill_press_refusal(false, false, Some(Editing), selecting),
+                Err("the fill handle is not shown: a cell is being edited".into())
+            );
+            assert_eq!(
+                fill_press_refusal(false, false, Some(Pointing), selecting),
+                Err("the fill handle is not shown: a reference is being pointed at".into())
+            );
+            assert_eq!(
+                fill_press_refusal(false, true, None, selecting),
+                Err("the fill handle is covered: the more-tabs list is open".into())
+            );
+            assert_eq!(
+                fill_press_refusal(true, false, None, selecting),
+                Err("the fill handle is not shown: File (backstage) is open".into())
+            );
+        }
+        assert_eq!(
+            fill_press_refusal(false, false, Some(ChartSelected), true),
+            Ok(())
+        );
+        assert_eq!(
+            fill_press_refusal(false, false, Some(ChartSelected), false),
+            Err("the fill handle is not shown: a chart is selected".into())
+        );
+    }
+
+    /// #699: `fill-drag`'s `from` takes a cell or a range.
+    #[test]
+    fn range_arg_takes_a_cell_or_a_range() {
+        let a = |text: &str| obj(&[("from", s(text))]);
+        assert_eq!(range_arg(&a("B4:B5"), "from"), Ok(((3, 1), (4, 1))));
+        assert_eq!(range_arg(&a(" C2 "), "from"), Ok(((1, 2), (1, 2))));
+        assert!(
+            range_arg(&a("B4:"), "from")
+                .unwrap_err()
+                .contains("is not a cell or a range")
+        );
+        assert!(range_arg(&obj(&[]), "from").is_err());
     }
 
     /// A malformed range, and a half-given pair.

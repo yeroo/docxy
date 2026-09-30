@@ -298,12 +298,14 @@ Notes:
   `app.footers.default`.
 - **`doc.find` and `doc.replace-all` see only the text the editor can edit.**
   A paragraph's editable text is its runs, tabs and breaks, including those
-  inside hyperlinks. Text it only shows is not searched or replaced: tracked
-  changes (`w:ins`/`w:del`), field results, footnote/endnote references,
-  equations, SmartArt, chart titles and inline text boxes, including any of
-  these inside a hyperlink. A link's bookmarks and proofing marks
-  (`w:proofErr`) don't hide its text, and an edit keeps them in place. A match's
-  `start`/`end` count only editable text, while `text` is the paragraph's full
+  inside hyperlinks, plus one offset (U+FFFC) for each field that shows a
+  result: a field is edited as one unit, as in Word. Text it only shows is not
+  searched or replaced: tracked changes (`w:ins`/`w:del`), field results,
+  footnote/endnote references, equations, SmartArt, chart titles and inline
+  text boxes, including any of these inside a hyperlink. A link's bookmarks and
+  proofing marks (`w:proofErr`) don't hide its text, and an edit keeps them in
+  place. A match's `start`/`end` count only editable text (a field counting
+  one), while `text` is the paragraph's full
   plain text (the form `doc.replace-range` round-trips), which includes the
   rest. So `text[start..end]` is the match only when the paragraph holds
   nothing but editable text; otherwise don't splice `text` at those offsets.
@@ -752,11 +754,11 @@ name and defaults to the active sheet):
 
 | Verb | Args | Result |
 |---|---|---|
-| `wb.path` | — | `{path, modified, sheets, active, active_name}` |
+| `wb.path` | — | `{path, modified, sheets, active, active_name, circular}` — `circular` lists the cells on circular references (active sheet first, bare `E1`; other sheets as `Sheet2!A1`), empty when there are none. It lists them whether or not the workbook enables iterative calculation (the TUI's warning and footer note appear only when it does not, as in Excel). Without iterative calculation those cells are 0, as in Excel |
 | `sheet.list` | — | `{active, sheets:[{index, name, rows, cols}]}` |
 | `sheet.read` | `{sheet?, range?}` | `{sheet, name, rows, cols, cells:[…], truncated}` |
 | `cell.get` | `{ref, sheet?}` | `{ref, row, col, value, formula?, text, format?}` — `format` is present only if the cell has non-default styling (see below) |
-| `cell.set` | `{ref, text, sheet?}` | `{ref, value, text, …}` — leading `=` is a formula, validated + recalculated |
+| `cell.set` | `{ref, text, sheet?}` | `{ref, value, text, …}` — typed the way the grid types it: leading `=` is a formula, validated + recalculated; numbers, currency, percents, fractions, dates and times are recognised (a General cell takes the matching number format); a Text-formatted cell keeps the text as typed; a leading `'` stores the rest as text with `quotePrefix`; more than 32,767 characters is refused and the cell is left as it was |
 | `range.clear` | `{range, sheet?}` | `{cleared}` |
 | `cell.format` | `{range, patch, sheet?}` | `{formatted}` — cell count; ONE undo group over every cell in `range` |
 | `col.width` | `{col, width, sheet?}` | `{col, width}` — `col` accepts a letter or a 0-based index; the reply always echoes the **numeric** index |
@@ -775,9 +777,9 @@ name and defaults to the active sheet):
 | `pivot.list` | — | `{pivots:[{sheet,rows,cols,values}]}` (persistent pivots, summarized) |
 | `comment.add` | `{ref,text,author?,sheet?}` | `{sheet,ref}` |
 | `comment.remove` | `{ref,sheet?}` | `{removed:bool}` |
-| `range.set` | `{start,rows:[[string]],sheet?}` | `{set:N}` — **atomic**: every formula validated first, any invalid → error and nothing applied; one undo group |
+| `range.set` | `{start,rows:[[string]],sheet?}` | `{set:N}` — each string typed like `cell.set`; **atomic**: every formula and length validated first, any invalid (a bad formula, or an entry over 32,767 characters) → an error naming the cell and nothing applied; one undo group |
 | `sheet.import-csv` | `{text,name?}` | `{sheet,name,rows,cols}` — always a **new** sheet, never overwrites |
-| `wb.replace-all` | `{query,text}` | `{replaced}` — spans **all sheets**, one undo group |
+| `wb.replace-all` | `{query,text}` | `{replaced}` — spans **all sheets**, one undo group; the match runs on each cell's own input text (never on the `'` a quote prefix adds, which is kept on the result), and the replaced text is re-read with the entry rules of `cell.set`, except that a percent cell's number constant is not divided again; a result over the cell limit leaves that cell as it was |
 | `sheet.add` | `{name?}` | `{sheet,name}` — deduplicates a taken name, never errors |
 | `sheet.remove` | `{sheet}` | `{removed:true}` (errors on the last sheet; `sheet` is required, no active-sheet default) |
 | `sheet.rename` | `{sheet,name}` | `{name}` — rewrites formula/defined-name references |

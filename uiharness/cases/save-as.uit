@@ -1,0 +1,60 @@
+# Save As without the native dialog, through the save-as verb (#699). Every
+# case opens a copy, so what it writes lands in the run's sandbox beside it
+# (a relative path resolves against the tab's own folder).
+
+test save-as writes a document as Markdown and rebinds the tab
+  open copy:../fixtures/basic.docx
+  type x
+  assert dirty is true
+  call save-as {"path":"notes.md"}
+  assert reply.format is md
+  assert reply.title is notes.md
+  assert reply.dirty is false
+  assert title is notes.md
+  assert dirty is false
+
+test save-as gives a path with no extension the format's
+  open copy:../fixtures/basic.docx
+  call save-as {"path":"report","format":"docx"}
+  assert reply.title is report.docx
+  assert reply.format is docx
+
+test save-as refuses what the dialog would not write and leaves the tab alone
+  open copy:../fixtures/basic.docx
+  call-error save-as {"path":"notes.txt"} => Documents can be saved as .docx, .md or .html
+  call-error save-as {"path":"notes.md","format":"docx"} => does not match notes.md
+  call-error save-as {"path":""} => non-empty 'path'
+  call-error save-as {"path":"basic.docx"} => already exists; pass "overwrite": true
+  assert title is basic.docx
+  call save-as {"path":"basic.docx","overwrite":true}
+  assert reply.title is basic.docx
+
+test a save-as that fails to write is an error
+  open copy:../fixtures/basic.docx
+  call-error save-as {"path":"no-such-folder/deeper/out.docx"} => save failed
+  assert title is basic.docx
+
+test save-as writes a workbook as xlsx only
+  open copy:../fixtures/basic.xlsx
+  click B2
+  type 99
+  key enter
+  call save-as {"path":"book2"}
+  assert reply.format is xlsx
+  assert reply.title is book2.xlsx
+  assert dirty is false
+  call-error save-as {"path":"book3.csv"} => Workbooks can only be saved as .xlsx
+  call-error save-as {"path":"book3","format":"md"} => Workbooks can only be saved as .xlsx
+
+test save-as writes a Project as yppx or MSPDI xml
+  open copy:../fixtures/schedule.xml
+  call save-as {"path":"plan","format":"yppx"}
+  assert reply.format is yppx
+  assert reply.title is plan.yppx
+  call save-as {"path":"plan-copy.xml"}
+  assert reply.format is xml
+  call-error save-as {"path":"plan.mpp"} => can only be saved as .yppx or .xml
+
+test save-as needs an absolute path for a never-saved tab
+  call proj.new {}
+  call-error save-as {"path":"plan.yppx"} => never been saved

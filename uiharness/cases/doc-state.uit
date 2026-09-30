@@ -55,6 +55,18 @@ test document state follows keys, selections, ribbon commands and backstage
   key ctrl+f1
   call ribbon-click {"tab":"Home","command":"Bold"}
 
+test typing after an empty-range selection-set leaves a collapsed caret
+  open copy:../fixtures/basic.docx
+  type hello
+  call selection-set {"start":2,"end":2}
+  type ab
+  assert text is heabllo
+  assert sel.start is 4
+  assert sel.end is 4
+  assert caret.offset is 4
+  type c
+  assert text is heabcllo
+
 test style gallery selects one paragraph style
   open copy:../fixtures/basic.docx
   call ribbon-read {}

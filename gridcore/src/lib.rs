@@ -30,6 +30,7 @@ pub mod comments;
 pub mod drawing;
 pub mod edit;
 pub mod engine;
+pub mod entry;
 pub mod filter;
 pub mod format;
 pub mod formula;
