@@ -14,6 +14,8 @@
 //! - Coordinates in the AST are 0-based `i64` so translation can go negative
 //!   and be caught (→ `#REF!`) instead of wrapping.
 
+use std::borrow::Cow;
+
 use crate::sheet::{col_name, fmt_general, parse_col, parts_to_serial, serial_to_parts};
 
 // ---------------------------------------------------------------------------
@@ -1382,131 +1384,267 @@ fn ref_to_string(r: &CellRef) -> String {
 
 /// Print an AST back to formula text (no leading `=`), with minimal parens.
 pub fn to_string(e: &Expr) -> String {
-    match e {
-        Expr::Num(n) => fmt_general(*n),
-        Expr::Str(s) => format!("\"{}\"", s.replace('"', "\"\"")),
-        Expr::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
-        Expr::Err(x) => x.code().to_string(),
-        Expr::Missing => String::new(),
-        Expr::Ref(r) => ref_to_string(r),
-        Expr::Range(a, b) => format!("{}:{}", ref_to_string(a), ref_to_string(b)),
-        Expr::ColRange {
-            sheet,
-            c1,
-            c2,
-            abs1,
-            abs2,
-        } => {
-            let mut s = sheet.as_deref().map(sheet_prefix).unwrap_or_default();
-            if *c1 < 0 || *c2 < 0 {
-                s.push_str("#REF!");
-                return s;
+    Printer::default().print(e)
+}
+
+/// The AST printer behind [`to_string`] (the spelling held in memory and shown
+/// to the user) and [`file_formula`] (the spelling Excel stores in a file).
+#[derive(Default)]
+struct Printer {
+    /// File spelling: future-function prefixes, `_xlfn.ANCHORARRAY(…)` for
+    /// `A1#`, `_xlfn.SINGLE(…)` for `@x`, `_xlpm.` on LET/LAMBDA names, and
+    /// numbers that read back exactly.
+    file: bool,
+    /// The LET/LAMBDA names bound around the expression being printed
+    /// (file spelling only), without their `_xlpm.` prefix.
+    scope: Vec<String>,
+}
+
+impl Printer {
+    fn print(&mut self, e: &Expr) -> String {
+        match e {
+            Expr::Num(n) => self.num(*n),
+            Expr::Str(s) => format!("\"{}\"", s.replace('"', "\"\"")),
+            Expr::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+            Expr::Err(x) => x.code().to_string(),
+            Expr::Missing => String::new(),
+            Expr::Ref(r) => ref_to_string(r),
+            Expr::Range(a, b) => format!("{}:{}", ref_to_string(a), ref_to_string(b)),
+            Expr::ColRange {
+                sheet,
+                c1,
+                c2,
+                abs1,
+                abs2,
+            } => {
+                let mut s = sheet.as_deref().map(sheet_prefix).unwrap_or_default();
+                if *c1 < 0 || *c2 < 0 {
+                    s.push_str("#REF!");
+                    return s;
+                }
+                s.push_str(&format!(
+                    "{}{}:{}{}",
+                    if *abs1 { "$" } else { "" },
+                    col_name(*c1 as u32),
+                    if *abs2 { "$" } else { "" },
+                    col_name(*c2 as u32)
+                ));
+                s
             }
-            s.push_str(&format!(
-                "{}{}:{}{}",
-                if *abs1 { "$" } else { "" },
-                col_name(*c1 as u32),
-                if *abs2 { "$" } else { "" },
-                col_name(*c2 as u32)
-            ));
-            s
-        }
-        Expr::RowRange {
-            sheet,
-            r1,
-            r2,
-            abs1,
-            abs2,
-        } => {
-            let mut s = sheet.as_deref().map(sheet_prefix).unwrap_or_default();
-            if *r1 < 0 || *r2 < 0 {
-                s.push_str("#REF!");
-                return s;
+            Expr::RowRange {
+                sheet,
+                r1,
+                r2,
+                abs1,
+                abs2,
+            } => {
+                let mut s = sheet.as_deref().map(sheet_prefix).unwrap_or_default();
+                if *r1 < 0 || *r2 < 0 {
+                    s.push_str("#REF!");
+                    return s;
+                }
+                s.push_str(&format!(
+                    "{}{}:{}{}",
+                    if *abs1 { "$" } else { "" },
+                    r1 + 1,
+                    if *abs2 { "$" } else { "" },
+                    r2 + 1
+                ));
+                s
             }
-            s.push_str(&format!(
-                "{}{}:{}{}",
-                if *abs1 { "$" } else { "" },
-                r1 + 1,
-                if *abs2 { "$" } else { "" },
-                r2 + 1
-            ));
-            s
-        }
-        Expr::Ref3D { first, last, a, b } => {
-            let f = sheet_prefix(first);
-            let f = f.trim_end_matches('!');
-            let l = sheet_prefix(last);
-            let l = l.trim_end_matches('!');
-            let head = format!("{f}:{l}!");
-            if a == b {
-                format!("{head}{}", ref_to_string(a))
-            } else {
-                format!("{head}{}:{}", ref_to_string(a), ref_to_string(b))
+            Expr::Ref3D { first, last, a, b } => {
+                let f = sheet_prefix(first);
+                let f = f.trim_end_matches('!');
+                let l = sheet_prefix(last);
+                let l = l.trim_end_matches('!');
+                let head = format!("{f}:{l}!");
+                if a == b {
+                    format!("{head}{}", ref_to_string(a))
+                } else {
+                    format!("{head}{}:{}", ref_to_string(a), ref_to_string(b))
+                }
+            }
+            Expr::Structured {
+                table,
+                item,
+                col1,
+                col2,
+            } => structured_to_string(table, *item, col1, col2),
+            Expr::Name(n) => match self.bound(n).filter(|_| self.file) {
+                Some(b) => param_name(b),
+                None => n.clone(),
+            },
+            Expr::SpillRef(r) if self.file => format!("_xlfn.ANCHORARRAY({})", ref_to_string(r)),
+            Expr::SpillRef(r) => format!("{}#", ref_to_string(r)),
+            Expr::ArrayLit(rows) => {
+                let body: Vec<String> = rows.iter().map(|row| self.list(row)).collect();
+                format!("{{{}}}", body.join(";"))
+            }
+            Expr::Func(name, args) => self.func(name, args),
+            Expr::Call(callee, args) => {
+                let head = match callee.as_ref() {
+                    Expr::Func(..) | Expr::Call(..) | Expr::Name(_) => self.print(callee),
+                    other => format!("({})", self.print(other)),
+                };
+                format!("{}({})", head, self.list(args))
+            }
+            Expr::Lit(v) => match v {
+                Value::Num(n) => self.num(*n),
+                Value::Str(s) => format!("\"{}\"", s.replace('"', "\"\"")),
+                Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+                Value::Err(x) => x.code().to_string(),
+                Value::Empty => String::new(),
+            },
+            Expr::Un(UnOp::Implicit, x) if self.file => format!("_xlfn.SINGLE({})", self.print(x)),
+            Expr::Un(op, x) => {
+                let inner = if prec(x) < prec(e) {
+                    format!("({})", self.print(x))
+                } else {
+                    self.print(x)
+                };
+                match op {
+                    UnOp::Neg => format!("-{inner}"),
+                    UnOp::Pos => format!("+{inner}"),
+                    UnOp::Percent => format!("{inner}%"),
+                    UnOp::Implicit => format!("@{inner}"),
+                }
+            }
+            Expr::Bin(op, l, r) => {
+                let lp = prec(l) < prec(e);
+                // Same-precedence right operands need parens for - / ^ etc.
+                let rp = prec(r) <= prec(e);
+                let ls = if lp {
+                    format!("({})", self.print(l))
+                } else {
+                    self.print(l)
+                };
+                let rs = if rp {
+                    format!("({})", self.print(r))
+                } else {
+                    self.print(r)
+                };
+                format!("{ls}{}{rs}", bin_symbol(*op))
             }
         }
-        Expr::Structured {
-            table,
-            item,
-            col1,
-            col2,
-        } => structured_to_string(table, *item, col1, col2),
-        Expr::Name(n) => n.clone(),
-        Expr::SpillRef(r) => format!("{}#", ref_to_string(r)),
-        Expr::ArrayLit(rows) => {
-            let body: Vec<String> = rows
-                .iter()
-                .map(|row| row.iter().map(to_string).collect::<Vec<_>>().join(","))
-                .collect();
-            format!("{{{}}}", body.join(";"))
+    }
+
+    fn list(&mut self, args: &[Expr]) -> String {
+        let parts: Vec<String> = args.iter().map(|a| self.print(a)).collect();
+        parts.join(",")
+    }
+
+    fn num(&self, n: f64) -> String {
+        if self.file {
+            file_num(n)
+        } else {
+            fmt_general(n)
         }
-        Expr::Func(name, args) => {
-            let list: Vec<String> = args.iter().map(to_string).collect();
-            format!("{}({})", name, list.join(","))
+    }
+
+    /// The LET/LAMBDA name `n` refers to around the current expression,
+    /// spelled as its binding spells it; `None` when nothing binds `n`.
+    fn bound(&self, n: &str) -> Option<&str> {
+        let n = bare_param(n);
+        self.scope
+            .iter()
+            .rev()
+            .find(|s| s.eq_ignore_ascii_case(n))
+            .map(String::as_str)
+    }
+
+    fn func(&mut self, name: &str, args: &[Expr]) -> String {
+        if !self.file {
+            return format!("{}({})", name, self.list(args));
         }
-        Expr::Call(callee, args) => {
-            let list: Vec<String> = args.iter().map(to_string).collect();
-            let head = match callee.as_ref() {
-                Expr::Func(..) | Expr::Call(..) | Expr::Name(_) => to_string(callee),
-                other => format!("({})", to_string(other)),
-            };
-            format!("{}({})", head, list.join(","))
+        // A bound name called as a function (`LET(f,LAMBDA(…),f(2))`) is the
+        // local lambda, never a builtin of the same name. (The parser
+        // uppercases a called name, so the binding gives the spelling.)
+        if let Some(b) = self.bound(name) {
+            let head = param_name(b);
+            return format!("{head}({})", self.list(args));
         }
-        Expr::Lit(v) => match v {
-            Value::Num(n) => fmt_general(*n),
-            Value::Str(s) => format!("\"{}\"", s.replace('"', "\"\"")),
-            Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
-            Value::Err(x) => x.code().to_string(),
-            Value::Empty => String::new(),
-        },
-        Expr::Un(op, x) => {
-            let inner = if prec(x) < prec(e) {
-                format!("({})", to_string(x))
-            } else {
-                to_string(x)
-            };
-            match op {
-                UnOp::Neg => format!("-{inner}"),
-                UnOp::Pos => format!("+{inner}"),
-                UnOp::Percent => format!("{inner}%"),
-                UnOp::Implicit => format!("@{inner}"),
+        let head = match future_prefix(name) {
+            Some(p) => format!("{p}{name}"),
+            None => name.to_string(),
+        };
+        let mark = self.scope.len();
+        let last = args.len().saturating_sub(1);
+        let mut parts = Vec::with_capacity(args.len());
+        if name.eq_ignore_ascii_case("LET") {
+            // `LET(n1, v1, …, body)`: each value sees the names bound before it.
+            let mut pending = None;
+            for (i, a) in args.iter().enumerate() {
+                match a {
+                    Expr::Name(n) if i < last && i % 2 == 0 => {
+                        parts.push(param_name(n));
+                        pending = Some(bare_param(n).to_string());
+                    }
+                    _ => {
+                        parts.push(self.print(a));
+                        if let Some(n) = pending.take() {
+                            self.scope.push(n);
+                        }
+                    }
+                }
             }
+        } else if name.eq_ignore_ascii_case("LAMBDA") {
+            // `LAMBDA(p1, [p2], …, body)`: the body sees every parameter.
+            for (i, a) in args.iter().enumerate() {
+                match a {
+                    Expr::Name(n) if i < last => {
+                        parts.push(param_name(n));
+                        self.scope.push(bare_param(n).to_string());
+                    }
+                    Expr::Structured {
+                        table: None,
+                        item: TableItem::Data,
+                        col1: Some(n),
+                        col2: None,
+                    } if i < last => {
+                        parts.push(format!("[{}]", escape_spec(&param_name(n))));
+                        self.scope.push(bare_param(n).to_string());
+                    }
+                    _ => parts.push(self.print(a)),
+                }
+            }
+        } else {
+            parts = args.iter().map(|a| self.print(a)).collect();
         }
-        Expr::Bin(op, l, r) => {
-            let lp = prec(l) < prec(e);
-            // Same-precedence right operands need parens for - / ^ etc.
-            let rp = prec(r) <= prec(e);
-            let ls = if lp {
-                format!("({})", to_string(l))
-            } else {
-                to_string(l)
-            };
-            let rs = if rp {
-                format!("({})", to_string(r))
-            } else {
-                to_string(r)
-            };
-            format!("{ls}{}{rs}", bin_symbol(*op))
+        self.scope.truncate(mark);
+        format!("{head}({})", parts.join(","))
+    }
+}
+
+/// `n` with a leading `_xlpm.` (Excel's LET/LAMBDA name prefix) removed.
+fn bare_param(n: &str) -> &str {
+    match n.get(..6) {
+        Some(p) if p.eq_ignore_ascii_case("_xlpm.") => &n[6..],
+        _ => n,
+    }
+}
+
+/// `n` as a LET/LAMBDA name is spelled in a file: `_xlpm.n`.
+fn param_name(n: &str) -> String {
+    format!("_xlpm.{}", bare_param(n))
+}
+
+/// A number as file formula text that reads back to the same `f64` (the
+/// display printer rounds to General's digits), in `E` notation when the
+/// plain form would be long.
+fn file_num(n: f64) -> String {
+    if !n.is_finite() {
+        return fmt_general(n);
+    }
+    let a = n.abs();
+    if a != 0.0 && !(1e-5..1e21).contains(&a) {
+        let s = format!("{n:E}");
+        // Excel spells a positive exponent with its sign: 1.5E+25.
+        match s.split_once('E') {
+            Some((m, x)) if !x.starts_with('-') => format!("{m}E+{x}"),
+            _ => s,
         }
+    } else {
+        format!("{n}")
     }
 }
 
@@ -2956,7 +3094,7 @@ impl<'a> Eval<'a> {
                 if let Some(i) = self
                     .lets
                     .iter()
-                    .rposition(|(name, _)| name.eq_ignore_ascii_case(n))
+                    .rposition(|(name, _)| name.eq_ignore_ascii_case(bare_param(n)))
                 {
                     return self.lets[i].1.clone();
                 }
@@ -3067,7 +3205,10 @@ impl<'a> Eval<'a> {
                     return Arg::Scalar(Value::Err(ExcelError::Value));
                 }
                 let hit = match &args[0] {
-                    Expr::Name(n) => self.omitted.iter().any(|o| o.eq_ignore_ascii_case(n)),
+                    Expr::Name(n) => self
+                        .omitted
+                        .iter()
+                        .any(|o| o.eq_ignore_ascii_case(bare_param(n))),
                     _ => false,
                 };
                 Arg::Scalar(Value::Bool(hit))
@@ -3124,7 +3265,7 @@ impl<'a> Eval<'a> {
                     if seen_optional {
                         return Arg::Scalar(Value::Err(ExcelError::Value));
                     }
-                    params.push((n.clone(), false));
+                    params.push((bare_param(n).to_string(), false));
                 }
                 // `[y]` — Excel's optional-parameter syntax (lexes as a
                 // bare structured reference).
@@ -3135,7 +3276,7 @@ impl<'a> Eval<'a> {
                     col2: None,
                 } => {
                     seen_optional = true;
-                    params.push((n.clone(), true));
+                    params.push((bare_param(n).to_string(), true));
                 }
                 _ => return Arg::Scalar(Value::Err(ExcelError::Value)),
             }
@@ -3186,10 +3327,9 @@ impl<'a> Eval<'a> {
     /// A `LET`-bound lambda used as a function — an explicit local override that
     /// wins even over a builtin of the same name.
     fn let_lambda(&self, name: &str) -> Option<Box<LambdaVal>> {
-        let i = self
-            .lets
-            .iter()
-            .rposition(|(n, v)| n.eq_ignore_ascii_case(name) && matches!(v, Arg::Lambda(_)))?;
+        let i = self.lets.iter().rposition(|(n, v)| {
+            n.eq_ignore_ascii_case(bare_param(name)) && matches!(v, Arg::Lambda(_))
+        })?;
         match &self.lets[i].1 {
             Arg::Lambda(l) => Some(l.clone()),
             _ => None,
@@ -3558,7 +3698,7 @@ impl<'a> Eval<'a> {
                 return Arg::Scalar(Value::Err(ExcelError::Value));
             };
             let v = self.eval_arg(&pair[1]);
-            self.lets.push((name.clone(), v));
+            self.lets.push((bare_param(name).to_string(), v));
         }
         let out = self.eval_arg(&args[args.len() - 1]);
         self.lets.truncate(mark);
@@ -4452,6 +4592,271 @@ fn match_key(v: &Value) -> Option<String> {
         Value::Bool(b) => Some(format!("b{}", *b as u8)),
         _ => None,
     }
+}
+
+/// Excel's "future functions": everything added after Excel 2007, which a file
+/// must spell `_xlfn.NAME` or Excel shows `#NAME?`. `SORT` and `FILTER` also
+/// take `_xlws.` (see [`future_prefix`]). Excel 2007's own functions (`IFERROR`,
+/// `SUMIFS`, `COUNTIFS`, `AVERAGEIFS`, …) are spelled bare.
+const FUTURE_FUNCTIONS: &[&str] = &[
+    // Excel 2010
+    "AGGREGATE",
+    "BETA.DIST",
+    "BETA.INV",
+    "BINOM.DIST",
+    "BINOM.INV",
+    "CEILING.PRECISE",
+    "CHISQ.DIST",
+    "CHISQ.DIST.RT",
+    "CHISQ.INV",
+    "CHISQ.INV.RT",
+    "CHISQ.TEST",
+    "CONFIDENCE.NORM",
+    "CONFIDENCE.T",
+    "COVARIANCE.P",
+    "COVARIANCE.S",
+    "ERF.PRECISE",
+    "ERFC.PRECISE",
+    "EXPON.DIST",
+    "F.DIST",
+    "F.DIST.RT",
+    "F.INV",
+    "F.INV.RT",
+    "F.TEST",
+    "FLOOR.PRECISE",
+    "GAMMA.DIST",
+    "GAMMA.INV",
+    "GAMMALN.PRECISE",
+    "HYPGEOM.DIST",
+    "ISO.CEILING",
+    "LOGNORM.DIST",
+    "LOGNORM.INV",
+    "MODE.MULT",
+    "MODE.SNGL",
+    "NEGBINOM.DIST",
+    "NETWORKDAYS.INTL",
+    "NORM.DIST",
+    "NORM.INV",
+    "NORM.S.DIST",
+    "NORM.S.INV",
+    "PERCENTILE.EXC",
+    "PERCENTILE.INC",
+    "PERCENTRANK.EXC",
+    "PERCENTRANK.INC",
+    "POISSON.DIST",
+    "QUARTILE.EXC",
+    "QUARTILE.INC",
+    "RANK.AVG",
+    "RANK.EQ",
+    "STDEV.P",
+    "STDEV.S",
+    "T.DIST",
+    "T.DIST.2T",
+    "T.DIST.RT",
+    "T.INV",
+    "T.INV.2T",
+    "T.TEST",
+    "VAR.P",
+    "VAR.S",
+    "WEIBULL.DIST",
+    "WORKDAY.INTL",
+    "Z.TEST",
+    // Excel 2013
+    "ACOT",
+    "ACOTH",
+    "ARABIC",
+    "BASE",
+    "BINOM.DIST.RANGE",
+    "BITAND",
+    "BITLSHIFT",
+    "BITOR",
+    "BITRSHIFT",
+    "BITXOR",
+    "CEILING.MATH",
+    "COMBINA",
+    "COT",
+    "COTH",
+    "CSC",
+    "CSCH",
+    "DAYS",
+    "DECIMAL",
+    "ENCODEURL",
+    "FILTERXML",
+    "FLOOR.MATH",
+    "FORMULATEXT",
+    "GAMMA",
+    "GAUSS",
+    "IFNA",
+    "IMCOSH",
+    "IMCOT",
+    "IMCSC",
+    "IMCSCH",
+    "IMSEC",
+    "IMSECH",
+    "IMSINH",
+    "IMTAN",
+    "ISFORMULA",
+    "ISOWEEKNUM",
+    "MUNIT",
+    "NUMBERVALUE",
+    "PDURATION",
+    "PERMUTATIONA",
+    "PHI",
+    "RRI",
+    "SEC",
+    "SECH",
+    "SHEET",
+    "SHEETS",
+    "SKEW.P",
+    "UNICHAR",
+    "UNICODE",
+    "WEBSERVICE",
+    "XOR",
+    // Excel 2016 / 2019
+    "CONCAT",
+    "FORECAST.ETS",
+    "FORECAST.ETS.CONFINT",
+    "FORECAST.ETS.SEASONALITY",
+    "FORECAST.ETS.STAT",
+    "FORECAST.LINEAR",
+    "IFS",
+    "MAXIFS",
+    "MINIFS",
+    "SWITCH",
+    "TEXTJOIN",
+    // Excel 2021 / 365: dynamic arrays, LET, LAMBDA and after
+    "ANCHORARRAY",
+    "ARRAYTOTEXT",
+    "BYCOL",
+    "BYROW",
+    "CHOOSECOLS",
+    "CHOOSEROWS",
+    "DROP",
+    "EXPAND",
+    "FIELDVALUE",
+    "FILTER",
+    "GROUPBY",
+    "HSTACK",
+    "IMAGE",
+    "ISOMITTED",
+    "LAMBDA",
+    "LET",
+    "MAKEARRAY",
+    "MAP",
+    "PERCENTOF",
+    "PIVOTBY",
+    "RANDARRAY",
+    "REDUCE",
+    "REGEXEXTRACT",
+    "REGEXREPLACE",
+    "REGEXTEST",
+    "SCAN",
+    "SEQUENCE",
+    "SINGLE",
+    "SORT",
+    "SORTBY",
+    "STOCKHISTORY",
+    "TAKE",
+    "TEXTAFTER",
+    "TEXTBEFORE",
+    "TEXTSPLIT",
+    "TOCOL",
+    "TOROW",
+    "TRIMRANGE",
+    "UNIQUE",
+    "VALUETOTEXT",
+    "VSTACK",
+    "WRAPCOLS",
+    "WRAPROWS",
+    "XLOOKUP",
+    "XMATCH",
+];
+
+/// The prefix a file spells function `name` with: `_xlfn.` for a future
+/// function, `_xlfn._xlws.` for the two worksheet ones, `None` for the rest.
+fn future_prefix(name: &str) -> Option<&'static str> {
+    if name.eq_ignore_ascii_case("SORT") || name.eq_ignore_ascii_case("FILTER") {
+        Some("_xlfn._xlws.")
+    } else if FUTURE_FUNCTIONS
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case(name))
+    {
+        Some("_xlfn.")
+    } else {
+        None
+    }
+}
+
+/// Turn formula text as held in memory (the user's spelling) into the text a
+/// file stores: the inverse of [`display_formula`]. Post-2007 functions get
+/// their `_xlfn.` prefix, `A1#` becomes `_xlfn.ANCHORARRAY(A1)`, `@x` becomes
+/// `_xlfn.SINGLE(x)`, and LET/LAMBDA names get `_xlpm.`.
+///
+/// Text that needs nothing, including text already in file spelling, comes
+/// back unchanged (borrowed). A formula that only needs function prefixes has
+/// them inserted in place (and those names uppercased), keeping the rest byte
+/// for byte; one with `#`, `@`,
+/// LET or LAMBDA is parsed and printed again (spacing is not kept, values
+/// are). Text that doesn't lex is returned as it is, and text that doesn't
+/// parse only gets its function prefixes.
+pub fn file_formula(src: &str) -> Cow<'_, str> {
+    let mut lex = Lexer::new(src);
+    let mut toks: Vec<(usize, Tok)> = Vec::new();
+    loop {
+        while lex.pos < lex.src.len() && (lex.src[lex.pos] as char).is_whitespace() {
+            lex.pos += 1;
+        }
+        let start = lex.pos;
+        match lex.next_tok() {
+            Ok(Tok::Eof) => break,
+            Ok(t) => toks.push((start, t)),
+            Err(_) => return Cow::Borrowed(src),
+        }
+    }
+    let mut reprint = false;
+    // (start, end, prefix) of each function name that needs a prefix.
+    let mut splices: Vec<(usize, usize, &str)> = Vec::new();
+    for (i, (start, t)) in toks.iter().enumerate() {
+        match t {
+            Tok::Hash | Tok::At => reprint = true,
+            Tok::Ident(id) if matches!(toks.get(i + 1), Some((_, Tok::LParen))) => {
+                // These change shape (`SINGLE(x)` is `@x`) or bind names,
+                // which only the AST can see.
+                if ["LET", "LAMBDA", "SINGLE", "ANCHORARRAY"]
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(id))
+                {
+                    reprint = true;
+                } else if let Some(p) = future_prefix(id) {
+                    splices.push((*start, start + id.len(), p));
+                }
+            }
+            _ => {}
+        }
+    }
+    if reprint {
+        if let Ok(e) = parse(src) {
+            let mut p = Printer {
+                file: true,
+                scope: Vec::new(),
+            };
+            return Cow::Owned(p.print(&e));
+        }
+    }
+    if splices.is_empty() {
+        return Cow::Borrowed(src);
+    }
+    let mut out = String::with_capacity(src.len() + 12 * splices.len());
+    let mut at = 0;
+    for (start, end, prefix) in splices {
+        out.push_str(&src[at..start]);
+        out.push_str(prefix);
+        // Table names are ASCII, so these are char boundaries.
+        out.push_str(&src[start..end].to_ascii_uppercase());
+        at = end;
+    }
+    out.push_str(&src[at..]);
+    Cow::Owned(out)
 }
 
 /// Turn a stored formula into the text Excel *shows*: strip the future-function
@@ -12523,6 +12928,241 @@ mod tests {
         let mut ev = Eval::new(&g, 0, (0, 0));
         assert_eq!(ev.eval(&ast), Value::Err(ExcelError::Name));
         assert!(ev.unsupported);
+    }
+
+    /// `file_formula(src)`, checking on the way that it is idempotent.
+    fn file(src: &str) -> String {
+        let once = file_formula(src).into_owned();
+        assert_eq!(file_formula(&once), once, "not idempotent for {src}");
+        once
+    }
+
+    #[test]
+    fn file_formula_prefixes_future_functions() {
+        assert_eq!(file("SEQUENCE(3)"), "_xlfn.SEQUENCE(3)");
+        assert_eq!(file("sequence(3)"), "_xlfn.SEQUENCE(3)");
+        assert_eq!(file("SORT(A1:A5)"), "_xlfn._xlws.SORT(A1:A5)");
+        assert_eq!(
+            file("FILTER(A1:A3,A1:A3>2)"),
+            "_xlfn._xlws.FILTER(A1:A3,A1:A3>2)"
+        );
+        for name in [
+            "XLOOKUP",
+            "UNIQUE",
+            "SORTBY",
+            "CONCAT",
+            "TEXTJOIN",
+            "IFS",
+            "STDEV.S",
+            "T.DIST.2T",
+            "XMATCH",
+            "GROUPBY",
+        ] {
+            assert_eq!(file(&format!("{name}(A1)")), format!("_xlfn.{name}(A1)"));
+        }
+        // Nested, and next to Excel 2007 functions that stay bare.
+        assert_eq!(
+            file("IFERROR(XLOOKUP(A1,B:B,C:C),SUMIFS(C:C,B:B,A1))"),
+            "IFERROR(_xlfn.XLOOKUP(A1,B:B,C:C),SUMIFS(C:C,B:B,A1))"
+        );
+        // Only the names change: spacing and number text are kept.
+        assert_eq!(
+            file("XLOOKUP( A1 , B:B , C:C )*1.50"),
+            "_xlfn.XLOOKUP( A1 , B:B , C:C )*1.50"
+        );
+        // A formula the parser refuses still gets its prefixes.
+        assert!(parse("XLOOKUP(Sheet1!MyName,B:B,C:C)").is_err());
+        assert_eq!(
+            file("XLOOKUP(Sheet1!MyName,B:B,C:C)"),
+            "_xlfn.XLOOKUP(Sheet1!MyName,B:B,C:C)"
+        );
+    }
+
+    #[test]
+    fn future_function_table_leaves_excel_2007_functions_bare() {
+        for src in [
+            "IFERROR(A1,0)",
+            "SUMIFS(C:C,B:B,A1)",
+            "COUNTIFS(B:B,A1)",
+            "AVERAGEIFS(C:C,B:B,A1)",
+            "CONCATENATE(\"a\",\"b\")",
+            "STDEV(A1:A3)",
+            "FORECAST(1,A1:A3,B1:B3)",
+            "RANK(A1,A1:A3)",
+            "NETWORKDAYS(A1,A2)",
+        ] {
+            assert!(matches!(file_formula(src), Cow::Borrowed(_)), "{src}");
+        }
+        for (i, f) in FUTURE_FUNCTIONS.iter().enumerate() {
+            assert_eq!(*f, f.to_ascii_uppercase());
+            assert!(!FUTURE_FUNCTIONS[..i].contains(f), "{f} listed twice");
+        }
+    }
+
+    #[test]
+    fn file_formula_spill_and_implicit_operators() {
+        assert_eq!(file("A1#"), "_xlfn.ANCHORARRAY(A1)");
+        assert_eq!(file("Sheet2!A1#"), "_xlfn.ANCHORARRAY(Sheet2!A1)");
+        assert_eq!(file("SUM(A1#)"), "SUM(_xlfn.ANCHORARRAY(A1))");
+        assert_eq!(file("SORT(A1#)"), "_xlfn._xlws.SORT(_xlfn.ANCHORARRAY(A1))");
+        assert_eq!(file("@A1:A3"), "_xlfn.SINGLE(A1:A3)");
+        assert_eq!(file("@INDEX(A1:A3,2)+1"), "_xlfn.SINGLE(INDEX(A1:A3,2))+1");
+        // The operators typed as their function spelling.
+        assert_eq!(file("SINGLE(A1:A3)"), "_xlfn.SINGLE(A1:A3)");
+        assert_eq!(file("ANCHORARRAY(B2)"), "_xlfn.ANCHORARRAY(B2)");
+        // A structured `@` is this-row, not the operator.
+        for src in [
+            "Sales[@Amount]*2",
+            "[@Amount]*2",
+            "Sales[[#This Row],[Amount]]",
+        ] {
+            assert!(matches!(file_formula(src), Cow::Borrowed(_)), "{src}");
+        }
+    }
+
+    #[test]
+    fn file_formula_let_lambda_params_get_xlpm() {
+        assert_eq!(file("LET(x,1,x+1)"), "_xlfn.LET(_xlpm.x,1,_xlpm.x+1)");
+        assert_eq!(
+            file("LAMBDA(a,b,a+b)(1,2)"),
+            "_xlfn.LAMBDA(_xlpm.a,_xlpm.b,_xlpm.a+_xlpm.b)(1,2)"
+        );
+        // Outside its LET, `x` is a defined name again.
+        assert_eq!(file("LET(x,1,x)+x"), "_xlfn.LET(_xlpm.x,1,_xlpm.x)+x");
+        // A value sees only the names bound before it.
+        assert_eq!(file("LET(x,x+1,x)"), "_xlfn.LET(_xlpm.x,x+1,_xlpm.x)");
+        assert_eq!(
+            file("LET(x,1,y,x+1,y*2)"),
+            "_xlfn.LET(_xlpm.x,1,_xlpm.y,_xlpm.x+1,_xlpm.y*2)"
+        );
+        assert_eq!(
+            file("LET(x,1,LAMBDA(y,x+y)(2))"),
+            "_xlfn.LET(_xlpm.x,1,_xlfn.LAMBDA(_xlpm.y,_xlpm.x+_xlpm.y)(2))"
+        );
+        // A bound lambda called by name, even one named like a builtin.
+        assert_eq!(
+            file("LET(f,LAMBDA(x,x*3),f(2))"),
+            "_xlfn.LET(_xlpm.f,_xlfn.LAMBDA(_xlpm.x,_xlpm.x*3),_xlpm.f(2))"
+        );
+        assert_eq!(
+            file("LET(sort,LAMBDA(x,x),sort(2))"),
+            "_xlfn.LET(_xlpm.sort,_xlfn.LAMBDA(_xlpm.x,_xlpm.x),_xlpm.sort(2))"
+        );
+        // Optional parameters.
+        assert_eq!(
+            file("LAMBDA(x,[y],IF(ISOMITTED(y),x,x+y))(1)"),
+            "_xlfn.LAMBDA(_xlpm.x,[_xlpm.y],IF(_xlfn.ISOMITTED(_xlpm.y),_xlpm.x,_xlpm.x+_xlpm.y))(1)"
+        );
+        // Future functions inside, and names already in file spelling.
+        assert_eq!(
+            file("LET(x,XLOOKUP(1,A1:A3,B1:B3),x*2)"),
+            "_xlfn.LET(_xlpm.x,_xlfn.XLOOKUP(1,A1:A3,B1:B3),_xlpm.x*2)"
+        );
+        assert_eq!(
+            file("LET(_xlpm.x,1,_xlpm.x+x)"),
+            "_xlfn.LET(_xlpm.x,1,_xlpm.x+_xlpm.x)"
+        );
+    }
+
+    #[test]
+    fn file_formula_leaves_plain_and_prefixed_text_alone() {
+        for src in [
+            "SUM(A1:A3)",
+            "A1 + 1",
+            "_xlfn._xlws.SORT(A1:A5,,-1)",
+            "_xlfn.LET(_xlpm.x,1,_xlpm.x+1)",
+            "SUM(_xlfn.ANCHORARRAY(A1))",
+            "_xlfn.SINGLE(A1:A3)",
+            // String literals are never rewritten.
+            "\"SEQUENCE(1)\"&\"A1#\"&\"@x\"&\"LET(x,1,x)\"",
+            // Text that doesn't lex.
+            "SEQUENCE(1)&\"open",
+        ] {
+            assert!(matches!(file_formula(src), Cow::Borrowed(_)), "{src}");
+        }
+        assert_eq!(file("CONCAT(\"A1#\",\"@\")"), "_xlfn.CONCAT(\"A1#\",\"@\")");
+        // A formula that needs reprinting but doesn't parse gets the prefixes
+        // only.
+        assert!(parse("SEQUENCE(A1#").is_err());
+        assert_eq!(file("SEQUENCE(A1#"), "_xlfn.SEQUENCE(A1#");
+    }
+
+    #[test]
+    fn file_formula_round_trips_through_display_formula() {
+        for src in [
+            "SEQUENCE(3)",
+            "SORT(A1:A5)",
+            "XLOOKUP( A1 , B:B , C:C )",
+            "A1#",
+            "Sheet2!A1#",
+            "SUM(A1#)",
+            "@A1:A3",
+            "LET(x,1,x+1)",
+            "LET(x,1,x)+x",
+            "LAMBDA(a,b,a+b)(1,2)",
+            "LET(x,1,LAMBDA(y,x+y)(2))",
+            "LET(f,LAMBDA(x,x*3),f(2))",
+            "LAMBDA(x,[y],IF(ISOMITTED(y),x,x+y))(1)",
+        ] {
+            assert_eq!(display_formula(&file_formula(src)), src);
+        }
+    }
+
+    #[test]
+    fn file_formula_reprints_numbers_exactly() {
+        // A reprinted formula keeps every digit of its numbers (the display
+        // printer would round 1.23456789E-12 to 1.23457E-12).
+        assert_eq!(
+            file("SUM(A1#)*1.23456789E-12"),
+            "SUM(_xlfn.ANCHORARRAY(A1))*1.23456789E-12"
+        );
+        assert_eq!(
+            file("LET(x,1.5E+25,x)"),
+            "_xlfn.LET(_xlpm.x,1.5E+25,_xlpm.x)"
+        );
+        for lit in [
+            "1.23456789E-12",
+            "1.5E+25",
+            "0.1",
+            "123456789012345",
+            "0.000123456789012345",
+            "98765.4321",
+            "0",
+        ] {
+            let typed = format!("LET(x,{lit},x)");
+            let saved = file(&typed);
+            assert_ne!(saved, typed);
+            let g = empty();
+            assert_eq!(
+                n(&typed, &g).to_bits(),
+                n(&saved, &g).to_bits(),
+                "{typed} saved as {saved}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_spelled_let_and_lambda_evaluate_like_typed() {
+        let g = empty();
+        for (typed, want) in [
+            ("LET(x,1,x+1)", 2.0),
+            ("LAMBDA(a,b,a+b)(1,2)", 3.0),
+            ("LET(x,1,LAMBDA(y,x+y)(2))", 3.0),
+            ("LET(f,LAMBDA(x,x*3),f(2))", 6.0),
+            ("LET(sort,LAMBDA(x,x*5),sort(2))", 10.0),
+            ("LAMBDA(x,[y],IF(ISOMITTED(y),x,x+y))(1)", 1.0),
+            ("LAMBDA(x,[y],IF(ISOMITTED(y),x,x+y))(1,2)", 3.0),
+        ] {
+            let saved = file_formula(typed).into_owned();
+            // What a reload holds: the file text as the parser reads it.
+            assert_eq!(n(typed, &g), want, "{typed}");
+            assert_eq!(n(&saved, &g), want, "{saved}");
+        }
+        // Mixed spellings (a partly reprinted formula) bind the same name.
+        assert_eq!(n("_xlfn.LET(_xlpm.x,1,x+1)", &g), 2.0);
+        assert_eq!(n("LET(x,1,_xlpm.x+1)", &g), 2.0);
+        assert_eq!(n("_xlfn.LAMBDA(_xlpm.x,x*2)(3)", &g), 6.0);
+        assert_eq!(n("LAMBDA(x,[_xlpm.y],IF(ISOMITTED(y),x,x+y))(4)", &g), 4.0);
     }
 
     #[test]
