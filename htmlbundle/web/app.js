@@ -321,14 +321,23 @@
     return b;
   }
 
+  // A combo or drop-down button follows the same rule as `cmdButton`: an act
+  // the browser cannot run yet is drawn dimmed, says why, and does nothing.
   function comboBox(cmd, wide) {
+    var unsupported = !actEnabled(cmd.act);
+    var reason = E.BROWSER_UNSUPPORTED[cmd.act];
     var b = h('button', {
-      class: 'combo' + (wide ? ' wide' : ''), id: 'rb-' + cmd.id,
-      'aria-label': cmd.label, dataset: { act: cmd.act, cmd: cmd.id, keytip: cmd.keyTip || '' },
+      class: 'combo' + (wide ? ' wide' : '') + (unsupported ? ' unsupported' : ''),
+      id: 'rb-' + cmd.id,
+      'aria-label': cmd.label,
+      'aria-disabled': unsupported ? 'true' : null,
+      dataset: { act: cmd.act, cmd: cmd.id, keytip: cmd.keyTip || '' },
       onmousedown: keepFocus,
-      onclick: function () { runAct(cmd.act, b); },
+      onclick: function () { if (!unsupported) runAct(cmd.act, b); },
     }, [h('span', { class: 'value' }), h('span', { class: 'caret', text: '\u25BE' })]);
-    b._tip = tipText(cmd.tip);
+    b._tip = unsupported
+      ? { title: cmd.label, body: reason || 'Not available in the browser', shortcut: '' }
+      : tipText(cmd.tip);
     return b;
   }
 

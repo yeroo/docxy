@@ -125,7 +125,7 @@ svg.icon * { fill: currentColor; }
 .rb:hover:not(:disabled) { background: var(--hover); }
 .rb:active:not(:disabled) { background: var(--pressed); }
 .rb.checked { background: var(--checked); border-color: var(--brand); }
-.rb:disabled, .rb.unsupported { opacity: 0.4; }
+.rb:disabled, .rb.unsupported, .combo.unsupported { opacity: 0.4; }
 .rb.large { flex-direction: column; justify-content: flex-start; width: 58px; height: 72px; padding: 4px 2px; gap: 4px; text-align: center; font-size: 11px; line-height: 1.15; }
 .rb.small { height: 22px; padding: 0 8px; }
 .rb.icon { width: 25px; height: 22px; justify-content: center; }
