@@ -21,9 +21,7 @@ use crate::formula::{
     self, DynResult, Eval, ExcelError, Expr, Resolver, Value, always_recalc, collect_refs,
     contains_db_fn,
 };
-use crate::sheet::{
-    Cell, CellValue, Sheet, Workbook, cell_name, is_array_f, ref_starts_at, with_ref,
-};
+use crate::sheet::{Cell, CellValue, Sheet, Workbook, is_array_f, own_array_ref};
 
 /// (sheet index, row, col) — the engine's cell address.
 pub type Key = (usize, u32, u32);
@@ -200,20 +198,16 @@ impl Engine {
             // marker is kept: a format edit, undo or redo re-submits the same
             // cell, and for a legacy CSE array (no `cm`) the marker is the only
             // one — without it the next Engine::new would implicit-intersect
-            // it. Paste and Fill Down/Right translate the formula and keep the
-            // marker too, re-anchored here (autofill's `rebase` drops it
-            // instead). Other preserved attributes (shared group, data table)
-            // name cells this formula no longer owns: dropped.
-            match cell.f_attrs.as_deref() {
-                Some(fa) if is_array_f(fa) => {
-                    // A clone at a new address still names its source's
-                    // block: it covers its own anchor instead.
-                    let anchor = cell_name(r, c);
-                    if !ref_starts_at(fa, &anchor) {
-                        cell.f_attrs = Some(with_ref(fa, &anchor));
-                    }
-                }
-                _ => cell.f_attrs = None,
+            // it. A clone whose ref starts elsewhere (Fill Down/Right) is
+            // re-anchored here; a clone at its source's own address can't be
+            // told from an undo, so a paste re-anchors its cells itself
+            // (`sheet::anchor_pasted_array_ref`). Autofill's `rebase` drops
+            // the marker instead. Other preserved attributes (shared group,
+            // data table) name cells this formula no longer owns: dropped.
+            if cell.f_attrs.as_deref().is_some_and(is_array_f) {
+                own_array_ref(&mut cell, r, c);
+            } else {
+                cell.f_attrs = None;
             }
             self.index_formula(wb, key, &src, false, false);
         }

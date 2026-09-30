@@ -2666,19 +2666,13 @@ fn cell_xml(
         ),
         (Some(src), None) => (format!("<f>{}</f>", esc_text(src)), false),
         (Some(src), Some(fa)) if src.is_empty() => (format!("<f{fa}/>"), is_array_f(fa)),
-        // A loaded dynamic array that does not spill now: the `ref` it was
-        // loaded with is stale (its cells were cleared), so it covers the
-        // anchor. A legacy CSE array (no `cm`) keeps its ref: Excel refills
-        // that block on load.
-        (Some(src), Some(fa)) if dynamic && is_array_f(fa) => (
-            format!("<f{}>{}</f>", with_ref(fa, &anchor), esc_text(src)),
-            true,
-        ),
-        // An array whose ref starts elsewhere belongs to a cell moved
-        // without set_cell (a sort, say) or loaded that way: that ref names
-        // another block, so it covers its anchor. set_cell and paste
-        // re-anchor themselves.
-        (Some(src), Some(fa)) if is_array_f(fa) && !ref_starts_at(fa, &anchor) => (
+        // A non-spilling array covers its anchor alone when its stored ref
+        // is stale: a dynamic array's cells were cleared since load, and a
+        // ref that starts elsewhere names another block (a cell moved
+        // without set_cell, a sort say, or loaded that way; set_cell and
+        // paste re-anchor themselves). A legacy CSE block (no `cm`) whose ref
+        // starts here keeps it: Excel refills that block on load.
+        (Some(src), Some(fa)) if is_array_f(fa) && (dynamic || !ref_starts_at(fa, &anchor)) => (
             format!("<f{}>{}</f>", with_ref(fa, &anchor), esc_text(src)),
             true,
         ),

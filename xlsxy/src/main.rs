@@ -2233,8 +2233,15 @@ impl App {
                             }
                         }
                         // A pasted array anchor covers its own cell, not the
-                        // block it was copied from — even at the same address.
-                        gridcore::sheet::anchor_array_ref(&mut new_cell, r, c);
+                        // block it was copied from — unless it lands on that
+                        // very block. `changes` isn't applied yet, so this
+                        // reads the cell as it is before a cut's clears.
+                        gridcore::sheet::anchor_pasted_array_ref(
+                            &mut new_cell,
+                            self.sheet().cell(r, c),
+                            r,
+                            c,
+                        );
                         // Overwrite position wins over source-clear on overlap.
                         changes.retain(|&(cr, cc, _)| (cr, cc) != (r, c));
                         changes.push((r, c, new_cell));
@@ -8303,6 +8310,27 @@ mod tests {
             f_attrs_at(&app, 0, 0, 3).as_deref(),
             Some(" t=\"array\" ref=\"D1\"")
         );
+    }
+
+    #[test]
+    fn pasting_a_cse_block_in_place_keeps_the_block() {
+        // Copy or cut D1 and paste it straight back: it lands on its own
+        // block, which stays D1:D3.
+        for cut in [false, true] {
+            let mut pkg = new_xlsx();
+            pkg.workbook.sheets[0].set_cell(0, 3, cse_sum_block());
+            let mut app = App::new(pkg, "t.xlsx");
+            app.os_clip = None;
+            app.cur = (0, 3);
+            app.anchor = None;
+            app.copy(cut);
+            app.paste();
+            assert_eq!(
+                f_attrs_at(&app, 0, 0, 3).as_deref(),
+                Some(" t=\"array\" ref=\"D1:D3\""),
+                "cut: {cut}"
+            );
+        }
     }
 
     #[test]

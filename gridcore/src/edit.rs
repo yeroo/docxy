@@ -18,8 +18,8 @@ use crate::formula::{
     rename_sheet_in_expr, rename_sheet_in_formula, to_string, translate_formula,
 };
 use crate::sheet::{
-    Cell, CellValue, MAX_COLS, MAX_ROWS, Sheet, Styles, Workbook, cell_name, f_ref, is_array_f,
-    ref_starts_at, with_ref,
+    Cell, CellValue, MAX_COLS, MAX_ROWS, Sheet, Styles, Workbook, f_ref, is_array_f, own_array_ref,
+    with_ref,
 };
 
 /// Read pasted text as a value: formulas, plain numbers (incl. percent),
@@ -1120,12 +1120,7 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
     // set_cell, say by a sort) names another block. Re-anchor it before the
     // shift: a clamped shift could otherwise make it look like this cell's.
     for (&(r, c), cell) in wb.sheets[idx].cells.iter_mut() {
-        if let Some(fa) = cell.f_attrs.as_deref().filter(|a| is_array_f(a)) {
-            let anchor = cell_name(r, c);
-            if !ref_starts_at(fa, &anchor) {
-                cell.f_attrs = Some(with_ref(fa, &anchor));
-            }
-        }
+        own_array_ref(cell, r, c);
     }
     shift_grid(&mut wb.sheets[idx], &shift);
 
@@ -1145,15 +1140,12 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
                 if let Some(m) = moved {
                     *fa = with_ref(fa, &m);
                 }
-                // A block's ref starts at its anchor and keeps doing so under
-                // a shift. One that doesn't (#REF!, or clamped away from a
-                // cell moved without set_cell, say by a sort) never belonged
-                // to this cell: it covers the anchor alone.
-                let anchor = cell_name(r, c);
-                if !ref_starts_at(fa, &anchor) {
-                    *fa = with_ref(fa, &anchor);
-                }
             }
+            // The pass above re-anchored every stale ref on the target sheet,
+            // so a block there still starts at its anchor. What's left is a
+            // stale ref on another sheet (its unqualified ref never shifts):
+            // it covers its anchor alone.
+            own_array_ref(cell, r, c);
             let Some(src) = &cell.formula else {
                 continue;
             };
