@@ -37,6 +37,7 @@ mod ribbon_export;
 mod sect_pr_tests;
 #[cfg(test)]
 mod sheet_entry_tests;
+mod sheet_ribbon;
 mod style_gallery;
 mod tabstrip;
 use project::*;
@@ -661,12 +662,13 @@ fn bar_target(act: SheetAct) -> Option<RefTarget> {
 /// Almost everything here targets cells, including the ones that only look
 /// sheet-wide: Freeze Panes freezes AT the selected cell, the comment steps
 /// move the selection, and the colour pickers paint it. The exceptions are the
-/// three that never touch it — protection and outlining are properties of the
-/// whole sheet, and `Todo` does nothing at all.
+/// four that never touch it — protection and outlining are properties of the
+/// whole sheet, the Number format combo only opens or closes its strip (a
+/// format picked there is what acts on cells), and `Todo` does nothing at all.
 fn act_targets_cells(act: SheetAct) -> bool {
     !matches!(
         act,
-        SheetAct::ProtectSheet | SheetAct::Outline | SheetAct::Todo
+        SheetAct::ProtectSheet | SheetAct::Outline | SheetAct::NumberFormatMenu | SheetAct::Todo
     )
 }
 
@@ -868,13 +870,17 @@ fn may_arm_fill(already_filling: bool, gesture_in_flight: bool) -> bool {
 /// the state-changing path used by [`Docxy::sheet_fill_start`], kept free of a
 /// gpui context so the regression test can observe the same transition the
 /// production handler uses.
+///
+/// A protected sheet refuses too (#699): the fill writes cells, and every other
+/// cell-writing command (`sheet_clear`, `sheet_paste`, …) already refuses there.
 fn arm_fill(
     fill: &mut Option<FillDrag>,
     src: Option<(u32, u32, u32, u32)>,
     gesture_in_flight: bool,
     tab_more_open: bool,
+    protected: bool,
 ) -> bool {
-    if tab_more_open || !may_arm_fill(fill.is_some(), gesture_in_flight) {
+    if tab_more_open || protected || !may_arm_fill(fill.is_some(), gesture_in_flight) {
         return false;
     }
     let Some(src) = src else { return false };
@@ -883,6 +889,62 @@ fn arm_fill(
         to: (src.2, src.3),
     });
     true
+}
+
+/// Whether pointing (a reference field or a formula picking cells) hides the
+/// fill handle: in point mode a drag off the selection's corner sweeps a range.
+fn fill_handle_pointing(range_field: bool, formula_pick: bool) -> bool {
+    range_field || formula_pick
+}
+
+/// Why the fill handle is not drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandleHidden {
+    /// A cell edit is open.
+    Editing,
+    /// A reference field or a formula is pointing at cells.
+    Pointing,
+    /// A chart holds the selection.
+    ChartSelected,
+}
+
+impl HandleHidden {
+    fn why(self) -> &'static str {
+        match self {
+            HandleHidden::Editing => "a cell is being edited",
+            HandleHidden::Pointing => "a reference is being pointed at",
+            HandleHidden::ChartSelected => "a chart is selected",
+        }
+    }
+
+    /// Whether a plain click on a cell ends it. A click takes the selection
+    /// back from a chart; while a cell is being edited or a reference is being
+    /// pointed at, a click lands in that edit or reference instead.
+    fn cleared_by_a_click(self) -> bool {
+        matches!(self, HandleHidden::ChartSelected)
+    }
+}
+
+/// Why the fill handle is not drawn, or `None` when it is — the grid's own
+/// condition (`editing`, `handle_hidden`, `sel_hidden`), stated once so the
+/// harness's `fill-drag` refuses exactly when there is no handle to press
+/// (#699). A handle whose corner sits under a chart card is hidden by layout,
+/// which only the render pass knows; that case is not modelled here.
+fn fill_handle_hidden(
+    editing: bool,
+    range_field: bool,
+    formula_pick: bool,
+    chart_sel: Option<usize>,
+) -> Option<HandleHidden> {
+    if editing {
+        Some(HandleHidden::Editing)
+    } else if fill_handle_pointing(range_field, formula_pick) {
+        Some(HandleHidden::Pointing)
+    } else if !cell_selection_shown(chart_sel) {
+        Some(HandleHidden::ChartSelected)
+    } else {
+        None
+    }
 }
 
 /// The dominant-axis fill box for `src` dragged to `to`: extend rows (down) or
@@ -904,13 +966,94 @@ fn fill_box(src: (u32, u32, u32, u32), to: (u32, u32)) -> (u32, u32, u32, u32) {
 #[derive(Clone)]
 struct GridClip {
     cells: Vec<Vec<gridcore::sheet::Cell>>,
+    /// The TSV this copy put on the clipboard. While the clipboard still holds
+    /// it, a paste uses `cells` (formats and formulas intact); once something
+    /// else has been copied, the clipboard's text wins.
+    text: String,
+}
+
+/// What a read of the clipboard found (#699).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ClipRead {
+    /// No item at all: nothing was ever copied, or the clipboard could not be
+    /// read. Nothing says another copy happened.
+    Nothing,
+    /// An item with no text in it: an image, or an empty copy (gpui's
+    /// `ClipboardItem::text` is `None` for both). Something was copied.
+    NotText,
+    Text(String),
+}
+
+impl ClipRead {
+    /// From the OS read: the item, if any, and its text.
+    fn from_item(item: Option<Option<String>>) -> Self {
+        match item {
+            None => ClipRead::Nothing,
+            Some(None) => ClipRead::NotText,
+            Some(Some(text)) if text.is_empty() => ClipRead::NotText,
+            Some(Some(text)) => ClipRead::Text(text),
+        }
+    }
+
+    fn text(&self) -> Option<&str> {
+        match self {
+            ClipRead::Text(text) => Some(text),
+            _ => None,
+        }
+    }
+}
+
+/// Whether a sheet paste uses the grid clip recorded as `recorded` rather than
+/// what the clipboard holds `now` (#699). The grid clip is ours only while the
+/// clipboard still holds the text we put there: another app's copy replaces
+/// it, and pasting our older cells then would paste the wrong thing, whether
+/// that copy was text or an image. Only a clipboard with no item at all
+/// (`Nothing`: never copied to, or unreadable) cannot say it changed, so the
+/// clip stands. Line endings are compared loosely because the OS may hand CRLF
+/// back.
+fn grid_paste_uses_clip(recorded: &str, now: &ClipRead) -> bool {
+    match now {
+        ClipRead::Nothing => true,
+        ClipRead::NotText => false,
+        ClipRead::Text(now) => now.replace("\r\n", "\n") == recorded.replace("\r\n", "\n"),
+    }
+}
+
+/// The text clipboard the app reads and writes (#699). A normal instance uses
+/// the OS clipboard; a harness instance keeps a private one, so a UI test can
+/// neither read nor overwrite what the person at the machine copied, and
+/// starts from an empty clipboard whatever they have on theirs. The private one
+/// reads as the OS one does: an empty write is an item with no text.
+#[derive(Default)]
+struct ClipboardStore {
+    private: Option<String>,
+}
+
+impl ClipboardStore {
+    fn write(&mut self, harness: bool, text: String, os: impl FnOnce(String)) {
+        if harness {
+            self.private = Some(text);
+        } else {
+            os(text);
+        }
+    }
+
+    /// `os` reads the OS clipboard: `None` without an item, else the item's
+    /// text (`None` when it has none).
+    fn read(&self, harness: bool, os: impl FnOnce() -> Option<Option<String>>) -> ClipRead {
+        ClipRead::from_item(if harness {
+            self.private.clone().map(Some)
+        } else {
+            os()
+        })
+    }
 }
 
 /// A spreadsheet ribbon command (the sheet counterpart to the document `Act`).
 /// Mirrors Excel's Home tab; `Todo` is an inert placeholder for commands whose
 /// engine support isn't wired yet (they render but do nothing), like Word's
 /// dialog-launcher stubs.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SheetAct {
     Cut,
     Copy,
@@ -956,6 +1099,8 @@ enum SheetAct {
     ProtectSheet,
     Subtotal,
     Outline,
+    /// The Number group's format combo: opens or closes the format strip.
+    NumberFormatMenu,
     Todo,
 }
 
@@ -1903,6 +2048,8 @@ struct Docxy {
     // The spreadsheet clipboard: a rectangular block of cells from the last grid
     // copy/cut, pasted at the selection on Ctrl+V.
     grid_clip: Option<GridClip>,
+    /// The text clipboard: the OS one, or a private one in a harness.
+    clipboard: ClipboardStore,
     // Open sheet colour-swatch picker (fill or font), None = closed.
     sheet_pick: Option<SheetPick>,
     // Inline sheet-tab rename in progress: (tab index, edit buffer). None = idle.
@@ -6422,6 +6569,7 @@ impl Docxy {
             zoom: 1.0,
             ruler_guide: None,
             grid_clip: None,
+            clipboard: ClipboardStore::default(),
             sheet_pick: None,
             sheet_rename: None,
             sheet_grid_w: 1000.0,
@@ -6728,14 +6876,28 @@ impl Docxy {
     fn sheet_fill_start(&mut self, cx: &mut Context<Self>) {
         let gesture_in_flight = self.grid_gesture_in_flight();
         let src = self.active_sheet().map(|v| v.range());
+        let protected = self.sheet_protected();
         if arm_fill(
             &mut self.sheet_fill,
             src,
             gesture_in_flight,
             self.tab_more_open,
+            protected,
         ) {
             cx.notify();
         }
+    }
+
+    /// Why the active sheet draws no fill handle, or `None` when it draws one
+    /// (see [`fill_handle_hidden`]).
+    fn fill_handle_hidden_reason(&self) -> Option<HandleHidden> {
+        let editing = self.active_sheet().is_some_and(|v| v.editing.is_some());
+        fill_handle_hidden(
+            editing,
+            self.range_field_active(),
+            self.formula_pick_active(),
+            self.chart_sel,
+        )
     }
 
     /// Update the auto-fill target as the handle is dragged. Nothing is
@@ -8525,7 +8687,10 @@ impl Docxy {
             // range", not "auto-fill". The handle's own guard only covers an
             // in-cell edit, so without this a drag that starts on those few
             // pixels writes cells instead of picking them.
-            handle_hidden: self.range_field_active() || self.formula_pick_active(),
+            handle_hidden: fill_handle_pointing(
+                self.range_field_active(),
+                self.formula_pick_active(),
+            ),
             // The border's range and the cap on its dashes both need the
             // visible-row list and the column window, which only `sheet_el`
             // has.
@@ -9182,6 +9347,21 @@ impl Docxy {
         cx.notify();
     }
 
+    /// Put `text` on the clipboard: the OS one, or the private one in a harness.
+    fn clipboard_write(&mut self, text: String, cx: &mut App) {
+        let harness = self.harness.is_some();
+        self.clipboard.write(harness, text, |text| {
+            cx.write_to_clipboard(ClipboardItem::new_string(text))
+        });
+    }
+
+    /// What the clipboard holds: the OS one, or the private one in a harness.
+    fn clipboard_read(&self, cx: &App) -> ClipRead {
+        self.clipboard.read(self.harness.is_some(), || {
+            cx.read_from_clipboard().map(|item| item.text())
+        })
+    }
+
     /// Copy (or cut) the selected range into the grid clipboard and, as TSV, the
     /// system clipboard.
     fn sheet_copy(&mut self, cut: bool, cx: &mut Context<Self>) {
@@ -9205,8 +9385,11 @@ impl Docxy {
             cells.push(row);
             tsv.push('\n');
         }
-        self.grid_clip = Some(GridClip { cells });
-        cx.write_to_clipboard(ClipboardItem::new_string(tsv));
+        self.grid_clip = Some(GridClip {
+            cells,
+            text: tsv.clone(),
+        });
+        self.clipboard_write(tsv, cx);
         if cut {
             self.sheet_clear(cx); // snapshots, clears the range, marks dirty
         } else {
@@ -9214,15 +9397,21 @@ impl Docxy {
         }
     }
 
-    /// Paste at the selection: the grid clipboard when present (full-fidelity
-    /// cells), else the system clipboard parsed as TSV.
+    /// Paste at the selection: the grid clipboard while it is still what the
+    /// clipboard holds (full-fidelity cells), else the clipboard text parsed as
+    /// TSV.
     fn sheet_paste(&mut self, cx: &mut Context<Self>) {
         if self.sheet_protected() {
             return;
         }
-        let block: Vec<Vec<gridcore::sheet::Cell>> = if let Some(clip) = &self.grid_clip {
+        let now = self.clipboard_read(cx);
+        let block: Vec<Vec<gridcore::sheet::Cell>> = if let Some(clip) = self
+            .grid_clip
+            .as_ref()
+            .filter(|clip| grid_paste_uses_clip(&clip.text, &now))
+        {
             clip.cells.clone()
-        } else if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+        } else if let ClipRead::Text(text) = now {
             let Some(v) = self.active_sheet_mut() else {
                 return;
             };
@@ -11522,6 +11711,10 @@ impl Docxy {
                 self.sheet_ttc_edit = Some(String::new());
                 cx.notify();
             }
+            SheetAct::NumberFormatMenu => {
+                self.sheet_numfmt_open = !self.sheet_numfmt_open;
+                cx.notify();
+            }
             SheetAct::Todo => {}
         }
         self.refocus(window, cx);
@@ -12408,12 +12601,24 @@ impl Docxy {
     /// Save the active document tab to `target` (Save As, or the first save of
     /// an untitled document to a picked path) or to its own file (`None`).
     fn save_doc(&mut self, target: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_doc_to(target, window, cx);
+    }
+
+    /// [`save_doc`](Self::save_doc), reporting whether the file was written:
+    /// the harness's `save-as` passes the dialog's answer here and judges the
+    /// save by this rather than by the tab afterwards.
+    fn save_doc_to(
+        &mut self,
+        target: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         self.flush_hf(); // commit any open header/footer edits into the package first
         let Some(tab) = self.tabs.get(self.active) else {
-            return;
+            return false;
         };
         if !matches!(tab.surface, Surface::Doc(_)) {
-            return;
+            return false;
         }
         // A never-saved document asks where to go, like a never-saved
         // workbook, instead of writing `<cwd>/<title>` over whatever is there.
@@ -12427,22 +12632,25 @@ impl Docxy {
                 // this thread and stops the control pump dead (see `save_sheet_tab`).
                 DocSaveTarget::RefuseHarness => {
                     self.tabs[self.active].status = DOC_NEVER_SAVED_HARNESS.into();
-                    return self.refocus(window, cx);
+                    self.refocus(window, cx);
+                    return false;
                 }
                 DocSaveTarget::NeedsDialog => match self.pick_doc_save_target() {
                     Some(picked) => Some(picked),
                     None => {
                         self.tabs[self.active].status = "save cancelled".into();
-                        return self.refocus(window, cx);
+                        self.refocus(window, cx);
+                        return false;
                     }
                 },
             },
         };
-        save_doc_tab(&mut self.tabs[self.active], target);
+        let saved = save_doc_tab(&mut self.tabs[self.active], target);
         self.backstage = false;
         self.bs_new = false;
         self.persist();
         self.refocus(window, cx);
+        saved
     }
 
     /// Serialize the active spreadsheet back to `.xlsx` (lossless — save_xlsx
@@ -12467,6 +12675,47 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
+    /// Save the active workbook as `target`, as the Save As dialog's answer
+    /// does. Returns whether the file was written; the tab's status says why
+    /// not.
+    fn save_sheet_as(
+        &mut self,
+        target: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return false;
+        };
+        let saved = save_sheet_to(tab, target);
+        self.backstage = false;
+        self.bs_new = false;
+        self.persist();
+        self.refocus(window, cx);
+        saved
+    }
+
+    /// Save the active Project as `target`, as the Save As dialog's answer
+    /// does (`finish_project_save` is that answer's path, through the same
+    /// `apply_save`).
+    fn save_project_to(
+        &mut self,
+        target: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<usize, String> {
+        if !self.commit_active_project_cell() {
+            self.refocus(window, cx);
+            return Err(self.tabs[self.active].status.to_string());
+        }
+        let result = apply_save(&mut self.tabs[self.active], target);
+        self.backstage = false;
+        self.bs_new = false;
+        self.persist();
+        self.refocus(window, cx);
+        result
+    }
+
     fn save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_is_project() {
             return self.save_project(true, window, cx);
@@ -12475,6 +12724,14 @@ impl Docxy {
         // dialog (#206).
         if self.active_is_sheet() {
             return self.save_sheet(true, window, cx);
+        }
+        // ⚠️ Never in a harness instance: `rfd` runs its own modal loop on
+        // this thread and stops the control pump dead (see `save_sheet_tab`).
+        // The Backstage's Save As… is pointer-only, but a dead pump is the
+        // worst way a harness run can fail, so it refuses in words.
+        if doc_save_as_target(self.harness.is_some()) == DocSaveTarget::RefuseHarness {
+            self.set_status(DOC_SAVE_AS_HARNESS);
+            return self.refocus(window, cx);
         }
         match self.pick_doc_save_target() {
             Some(target) => self.save_doc(Some(target), window, cx),
@@ -12496,11 +12753,11 @@ impl Docxy {
             .add_filter("Markdown", &["md", "markdown"]);
         // An open bundle can always be saved as one (it rewraps itself); a new
         // one needs the engine this build may not carry.
-        let from_bundle = self
+        if self
             .tabs
             .get(self.active)
-            .is_some_and(|t| t.bundle_html.is_some());
-        if from_bundle || html_bundle::can_export() {
+            .is_some_and(doc_html_save_allowed)
+        {
             dialog = dialog.add_filter("Editable HTML (*.docx.html)", &["html"]);
         }
         // The name is written as picked (the dialog already asked about
@@ -14698,9 +14955,29 @@ impl Docxy {
     }
 }
 
+/// What a harness instance says when asked to Save As a document.
+const DOC_SAVE_AS_HARNESS: &str = "This document needs Save As, and a harness instance cannot open the Save As dialog; use the harness save-as verb";
+
+/// Where a document Save As goes: always the dialog, which a harness instance
+/// must not open.
+fn doc_save_as_target(harness: bool) -> DocSaveTarget {
+    if harness {
+        DocSaveTarget::RefuseHarness
+    } else {
+        DocSaveTarget::NeedsDialog
+    }
+}
+
 /// What a harness instance says when asked to save a never-saved document.
-const DOC_NEVER_SAVED_HARNESS: &str =
-    "this document has never been saved, and a harness instance cannot open the Save As dialog";
+const DOC_NEVER_SAVED_HARNESS: &str = "this document has never been saved, and a harness instance cannot open the Save As dialog; use the harness save-as verb";
+
+/// Whether a document tab may be saved as an editable-HTML page: an open
+/// bundle can always be (it rewraps itself), a new one needs the engine this
+/// build may not carry. The Save As dialog offers the HTML filter on this, and
+/// the harness's `save-as` accepts `.html` on it.
+fn doc_html_save_allowed(tab: &DocTab) -> bool {
+    tab.bundle_html.is_some() || html_bundle::can_export()
+}
 
 /// Where a document Save goes, decided before anything is written.
 #[derive(Debug, PartialEq, Eq)]
@@ -14722,11 +14999,9 @@ fn doc_save_target(path: Option<&std::path::Path>, harness: bool) -> DocSaveTarg
 }
 
 /// What a harness instance says when asked to save a never-saved workbook.
-const SHEET_NEVER_SAVED_HARNESS: &str =
-    "this workbook has never been saved, and a harness instance cannot open the Save As dialog";
+const SHEET_NEVER_SAVED_HARNESS: &str = "this workbook has never been saved, and a harness instance cannot open the Save As dialog; use the harness save-as verb";
 /// What a harness instance says when asked to Save As a workbook.
-const SHEET_SAVE_AS_HARNESS: &str =
-    "This workbook needs Save As, and a harness instance cannot open the Save As dialog";
+const SHEET_SAVE_AS_HARNESS: &str = "This workbook needs Save As, and a harness instance cannot open the Save As dialog; use the harness save-as verb";
 
 /// Where a workbook Save goes, decided before any dialog opens.
 #[derive(Debug, PartialEq, Eq)]
@@ -14773,7 +15048,9 @@ fn save_sheet_tab(
     // Commit before choosing a target so the decision and write see the edit.
     close::prepare_sheet_save(tab);
     match sheet_save_decision(tab.path.as_deref(), &tab.title, harness, explicit_save_as) {
-        SheetSaveDecision::InPlace(path) => finish_sheet_save(tab, Some(&path)),
+        SheetSaveDecision::InPlace(path) => {
+            finish_sheet_save(tab, Some(&path));
+        }
         // A never-saved workbook or Save As asks where to go, Excel-style.
         SheetSaveDecision::Dialog { suggested } => {
             let target = pick(suggested);
@@ -14802,24 +15079,32 @@ fn sheet_save_target(path: &std::path::Path) -> Result<PathBuf, String> {
     }
 }
 
+/// Save As a workbook tab to `target` without a dialog: the commit a Save
+/// makes first, then the write the dialog's answer feeds. Returns whether the
+/// file was written.
+fn save_sheet_to(tab: &mut DocTab, target: &std::path::Path) -> bool {
+    close::prepare_sheet_save(tab);
+    finish_sheet_save(tab, Some(target))
+}
+
 /// Write the workbook tab to `target` (`None` is a cancelled dialog). The tab
 /// is rebound (title, path, clean) only after a successful write; either way
-/// its status says what happened. The Markdown flag is a document's and is
-/// never touched here.
-fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) {
+/// its status says what happened, and the result is whether it was written.
+/// The Markdown flag is a document's and is never touched here.
+fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) -> bool {
     let Some(target) = target else {
         tab.status = "save cancelled".into();
-        return;
+        return false;
     };
     let Surface::Sheet(v) = &tab.surface else {
         tab.status = "this tab is not a workbook and cannot be saved as one".into();
-        return;
+        return false;
     };
     let path = match sheet_save_target(target) {
         Ok(path) => path,
         Err(e) => {
             tab.status = e.into();
-            return;
+            return false;
         }
     };
     let bytes = sheet_bytes(v);
@@ -14829,15 +15114,83 @@ fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) {
             tab.status = format!("saved {} bytes → {}", bytes.len(), path.display()).into();
             tab.path = Some(path);
             tab.dirty = false;
+            true
         }
-        Err(e) => tab.status = format!("save failed: {e}").into(),
+        Err(e) => {
+            tab.status = format!("save failed: {e}").into();
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::{ClipRead, ClipboardStore, grid_paste_uses_clip};
+
+    /// #699: a harness instance never reads or writes the OS clipboard, and
+    /// starts from an empty private one.
+    #[test]
+    fn a_harness_clipboard_is_private_and_starts_empty() {
+        let mut store = ClipboardStore::default();
+        let os_read = || -> Option<Option<String>> { panic!("a harness read the OS clipboard") };
+        assert_eq!(store.read(true, os_read), ClipRead::Nothing);
+        store.write(true, "cells".into(), |_| {
+            panic!("a harness wrote the OS clipboard")
+        });
+        assert_eq!(store.read(true, os_read), ClipRead::Text("cells".into()));
+        // An empty copy reads as the OS clipboard reads one: an item, no text.
+        store.write(true, String::new(), |_| {
+            panic!("a harness wrote the OS clipboard")
+        });
+        assert_eq!(store.read(true, os_read), ClipRead::NotText);
+    }
+
+    #[test]
+    fn a_normal_instance_uses_the_os_clipboard_only() {
+        let mut store = ClipboardStore::default();
+        let mut written = None;
+        store.write(false, "tsv".into(), |t| written = Some(t));
+        assert_eq!(written.as_deref(), Some("tsv"));
+        assert_eq!(
+            store.read(false, || Some(Some("os".into()))),
+            ClipRead::Text("os".into())
+        );
+        assert_eq!(store.read(false, || Some(None)), ClipRead::NotText);
+        assert_eq!(store.read(false, || None), ClipRead::Nothing);
+    }
+
+    /// #699: after another app copies, a sheet paste takes that copy rather
+    /// than the older grid clip, text or not; while the clipboard still holds
+    /// our TSV (the OS may hand it back with CRLF) the grid clip keeps formats
+    /// and formulas; and a clipboard with no item cannot say it changed.
+    #[test]
+    fn a_grid_clip_is_pasted_only_while_the_clipboard_still_holds_it() {
+        let ours = "a\tb\n1\t2\n";
+        let text = |t: &str| ClipRead::Text(t.into());
+        assert!(grid_paste_uses_clip(ours, &text(ours)));
+        assert!(grid_paste_uses_clip(ours, &text("a\tb\r\n1\t2\r\n")));
+        assert!(grid_paste_uses_clip(ours, &ClipRead::Nothing));
+        assert!(!grid_paste_uses_clip(ours, &text("from another app")));
+        assert!(
+            !grid_paste_uses_clip(ours, &ClipRead::NotText),
+            "an image copied since is newer than our cells"
+        );
     }
 }
 
 #[cfg(test)]
 mod doc_save_target_tests {
-    use super::{DocSaveTarget, doc_save_target};
+    use super::{DOC_SAVE_AS_HARNESS, DocSaveTarget, doc_save_as_target, doc_save_target};
     use std::path::Path;
+
+    /// #699: the Backstage's Save As… asks with the dialog, except in a
+    /// harness instance, which refuses in words and points at `save-as`.
+    #[test]
+    fn a_document_save_as_asks_or_refuses_in_a_harness() {
+        assert_eq!(doc_save_as_target(false), DocSaveTarget::NeedsDialog);
+        assert_eq!(doc_save_as_target(true), DocSaveTarget::RefuseHarness);
+        assert!(DOC_SAVE_AS_HARNESS.ends_with("use the harness save-as verb"));
+    }
 
     #[test]
     fn a_saved_document_saves_in_place_harness_or_not() {
@@ -14906,6 +15259,34 @@ mod load_failed_save_tests {
         assert_eq!(tab.path.as_deref(), Some(path));
         assert_eq!(std::fs::read(path).ok(), before, "{}", path.display());
         tab
+    }
+
+    /// #699: a Save As to `.md` (what the harness's `save-as` feeds) rebinds
+    /// the tab as Markdown, so the next plain Save writes Markdown too, and
+    /// a Save As back to `.docx` writes a Word package again.
+    #[test]
+    fn a_markdown_save_as_makes_later_saves_markdown() {
+        let dir = temp("md-save-as");
+        let source = dir.join("basic.docx");
+        std::fs::write(&source, basic_docx()).unwrap();
+        let mut tab = tab_from_path(&source);
+        let md = dir.join("notes.md");
+        assert!(save_doc_tab(&mut tab, Some(md.clone())));
+        assert!(tab.markdown);
+        assert_eq!(tab.path.as_deref(), Some(md.as_path()));
+        tab.dirty = true;
+        std::fs::write(&md, b"stale").unwrap();
+        assert!(save_doc_tab(&mut tab, None));
+        let written = std::fs::read(&md).unwrap();
+        assert!(
+            !written.starts_with(b"PK"),
+            "a plain save wrote a Word package"
+        );
+        assert_ne!(written, b"stale");
+        let docx = dir.join("back.docx");
+        assert!(save_doc_tab(&mut tab, Some(docx.clone())));
+        assert!(!tab.markdown);
+        assert!(std::fs::read(&docx).unwrap().starts_with(b"PK"));
     }
 
     fn utf16_bom(text: &str, little_endian: bool) -> Vec<u8> {
@@ -15163,7 +15544,8 @@ mod load_failed_save_tests {
 mod sheet_save_tests {
     use super::{
         DocTab, Kind, SHEET_NEVER_SAVED_HARNESS, SHEET_SAVE_AS_HARNESS, SheetSaveDecision, Surface,
-        finish_sheet_save, new_sheet_surface, sheet_bytes, sheet_save_decision, sheet_save_target,
+        finish_sheet_save, new_sheet_surface, save_sheet_to, sheet_bytes, sheet_save_decision,
+        sheet_save_target,
     };
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15248,7 +15630,7 @@ mod sheet_save_tests {
         }
         assert_eq!(
             SHEET_SAVE_AS_HARNESS,
-            "This workbook needs Save As, and a harness instance cannot open the Save As dialog"
+            "This workbook needs Save As, and a harness instance cannot open the Save As dialog; use the harness save-as verb"
         );
     }
 
@@ -15271,7 +15653,7 @@ mod sheet_save_tests {
         );
         assert_eq!(
             SHEET_NEVER_SAVED_HARNESS,
-            "this workbook has never been saved, and a harness instance cannot open the Save As dialog"
+            "this workbook has never been saved, and a harness instance cannot open the Save As dialog; use the harness save-as verb"
         );
     }
 
@@ -15317,6 +15699,39 @@ mod sheet_save_tests {
             tab.status.as_ref(),
             format!("saved {} bytes → {}", expected.len(), target.display())
         );
+    }
+
+    /// #699: the harness's `save-as` writes a workbook through this, and
+    /// judges the save by what it returns, not by the tab afterwards: a failed
+    /// write onto the tab's own clean path would otherwise look like success.
+    #[test]
+    fn save_sheet_to_reports_whether_it_wrote() {
+        let dir = Scratch::new();
+        let target = dir.path("copy.xlsx");
+        let mut tab = sheet_tab(None, "Untitled.xlsx");
+        assert!(save_sheet_to(&mut tab, &target));
+        assert!(target.is_file());
+        assert_eq!(tab.path.as_deref(), Some(target.as_path()));
+        assert!(!tab.dirty);
+
+        // A clean tab whose write fails stays bound and clean, so only the
+        // result says it failed: here the target is a directory.
+        let folder = dir.path("folder.xlsx");
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut clean = sheet_tab(Some(folder.clone()), "folder.xlsx");
+        clean.dirty = false;
+        assert!(!save_sheet_to(&mut clean, &folder));
+        assert!(clean.status.starts_with("save failed"), "{}", clean.status);
+        assert_eq!(clean.path.as_deref(), Some(folder.as_path()));
+        assert!(!clean.dirty);
+
+        let mut other = sheet_tab(None, "Untitled.xlsx");
+        assert!(!save_sheet_to(&mut other, &dir.path("copy.csv")));
+        assert_eq!(
+            other.status.as_ref(),
+            "Workbooks can only be saved as .xlsx"
+        );
+        assert!(other.path.is_none());
     }
 
     #[test]
@@ -18198,11 +18613,12 @@ impl Docxy {
             .into_any_element()
     }
 
-    /// A combo-box display (font name/size, number format) — inert for now.
+    /// A combo-box display (font name/size) — inert for now.
     fn sheet_combo(
         &self,
         value: &'static str,
         wide: bool,
+        act: SheetAct,
         pal: Pal,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -18234,9 +18650,7 @@ impl Docxy {
                     .text_color(pal.dim)
                     .child("\u{25BE}"),
             )
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.run_sheet_act(SheetAct::Todo, window, cx)
-            }))
+            .on_click(cx.listener(move |this, _, window, cx| this.run_sheet_act(act, window, cx)))
             .into_any_element()
     }
 
@@ -18272,9 +18686,8 @@ impl Docxy {
                     .text_color(pal.dim)
                     .child("\u{25BE}"),
             )
-            .on_click(cx.listener(|this, _, _w, cx| {
-                this.sheet_numfmt_open = !this.sheet_numfmt_open;
-                cx.notify();
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.run_sheet_act(SheetAct::NumberFormatMenu, window, cx)
             }))
             .into_any_element()
     }
@@ -19353,468 +19766,139 @@ impl Docxy {
             .into_any_element()
     }
 
-    /// The spreadsheet ribbon body — the Home tab, or the Insert tab (Tables).
+    /// The spreadsheet ribbon body for the selected tab, drawn from the
+    /// `sheet_ribbon` table (Home for a tab without its own entry). The table
+    /// is also what `ribbon-read` reports, so the two cannot disagree.
     fn sheet_ribbon_body(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        match self.ribbon_tab {
-            RibbonTab::Insert => self.sheet_insert_ribbon(pal, cx),
-            RibbonTab::Review => self.sheet_review_ribbon(pal, cx),
-            RibbonTab::View => self.sheet_view_ribbon(pal, cx),
-            _ => self.sheet_home_ribbon(pal, cx),
+        let tab = sheet_ribbon::tab_def(self.ribbon_tab);
+        let xf = self.active_xf();
+        h_flex()
+            .id("sheet-ribbon")
+            .w_full()
+            .h(px(100.))
+            .items_stretch()
+            .px_1()
+            .bg(pal.panel)
+            .border_b_1()
+            .border_color(pal.border)
+            .overflow_x_scroll()
+            .children(
+                tab.groups
+                    .iter()
+                    .map(|g| self.sheet_group(g, tab.titles, &xf, pal, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// Whether a sheet command's state is on, for the commands whose label
+    /// reads differently then (Unfreeze Panes, Unprotect Sheet).
+    fn sheet_act_toggled(&self, act: SheetAct) -> bool {
+        match act {
+            SheetAct::FreezePanes => self
+                .active_sheet()
+                .is_some_and(|v| v.sheet().freeze != (0, 0)),
+            SheetAct::ProtectSheet => self.sheet_protected(),
+            _ => false,
         }
     }
 
-    /// The Insert tab: a Tables group (PivotTable, Table) like Excel.
-    fn sheet_insert_ribbon(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let group = |title: &str, body: AnyElement| -> AnyElement {
-            v_flex()
-                .h(px(94.))
-                .px_1p5()
-                .py(px(3.))
-                .justify_between()
-                .border_r_1()
-                .border_color(pal.border)
-                .child(div().flex_1().flex().items_center().child(body))
-                .child(
-                    div()
-                        .w_full()
-                        .text_size(px(10.))
-                        .text_color(pal.dim)
-                        .text_center()
-                        .child(title.to_string()),
-                )
-                .into_any_element()
+    /// One sheet ribbon group: content on top, a centered label (+ optional
+    /// dialog launcher) at the bottom, and a right divider — exactly like the
+    /// doc ribbon.
+    fn sheet_group(
+        &self,
+        g: &sheet_ribbon::Group,
+        titles: sheet_ribbon::Titles,
+        xf: &gridcore::sheet::Xf,
+        pal: Pal,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use sheet_ribbon::{Body, Item};
+        let gap = |d: Div, g: sheet_ribbon::Gap| match g {
+            sheet_ribbon::Gap::Px(v) => d.gap(px(v)),
+            sheet_ribbon::Gap::Rem(v) => d.gap(rems(v)),
         };
-        h_flex()
-            .id("sheet-ribbon")
-            .w_full()
-            .h(px(100.))
-            .items_stretch()
-            .px_1()
-            .bg(pal.panel)
-            .border_b_1()
-            .border_color(pal.border)
-            .overflow_x_scroll()
-            .child(group(
-                "Tables",
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_1()
-                    .child(self.sheet_lb(
-                        Some("table"),
-                        "PivotTable",
-                        SheetAct::InsertPivot,
-                        pal,
-                        cx,
-                    ))
-                    .child(self.sheet_lb(Some("table"), "Table", SheetAct::FormatAsTable, pal, cx))
-                    .child(self.sheet_lb(
-                        None,
-                        "Data Validation",
-                        SheetAct::DataValidation,
-                        pal,
-                        cx,
-                    ))
-                    .child(self.sheet_lb(None, "Text to Columns", SheetAct::TextToColumns, pal, cx))
-                    .into_any_element(),
-            ))
-            .child(group(
-                "Outline",
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_1()
-                    .child(self.sheet_lb(None, "Subtotal", SheetAct::Subtotal, pal, cx))
-                    .child(self.sheet_lb(None, "Group / Ungroup", SheetAct::Outline, pal, cx))
-                    .into_any_element(),
-            ))
-            .child(group(
-                "Charts",
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_1()
-                    .child(self.sheet_lb(None, "Column", SheetAct::InsertChart("column"), pal, cx))
-                    .child(self.sheet_lb(None, "Bar", SheetAct::InsertChart("bar"), pal, cx))
-                    .child(self.sheet_lb(None, "Line", SheetAct::InsertChart("line"), pal, cx))
-                    .child(self.sheet_lb(None, "Pie", SheetAct::InsertChart("pie"), pal, cx))
-                    .into_any_element(),
-            ))
-            .into_any_element()
-    }
-
-    /// The Review tab, laid out like Excel: Proofing, Comments, Protect. These
-    /// aren't modeled for sheets yet (no cell-comment model), so the buttons are
-    /// inert placeholders — the point is a distinct, Excel-faithful tab identity
-    /// (it used to fall through to the Home ribbon).
-    fn sheet_review_ribbon(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let group = |title: &str, body: AnyElement| -> AnyElement {
-            v_flex()
-                .h(px(94.))
-                .px_1p5()
-                .py(px(3.))
-                .justify_between()
-                .border_r_1()
-                .border_color(pal.border)
-                .child(div().flex_1().flex().items_center().child(body))
-                .child(
-                    div()
-                        .w_full()
-                        .text_size(px(10.))
-                        .text_color(pal.dim)
-                        .text_center()
-                        .child(title.to_string()),
-                )
-                .into_any_element()
-        };
-        h_flex()
-            .id("sheet-ribbon")
-            .w_full()
-            .h(px(100.))
-            .items_stretch()
-            .px_1()
-            .bg(pal.panel)
-            .border_b_1()
-            .border_color(pal.border)
-            .overflow_x_scroll()
-            .child(group(
-                "Proofing",
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_1()
-                    .child(self.sheet_lb(None, "Spelling", SheetAct::Todo, pal, cx))
-                    .into_any_element(),
-            ))
-            .child(group(
-                "Comments",
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_1()
-                    .child(self.sheet_lb(None, "New Comment", SheetAct::NewComment, pal, cx))
-                    .child(self.sheet_lb(None, "Delete", SheetAct::DeleteComment, pal, cx))
-                    .child(self.sheet_lb(None, "Previous", SheetAct::PrevComment, pal, cx))
-                    .child(self.sheet_lb(None, "Next", SheetAct::NextComment, pal, cx))
-                    .into_any_element(),
-            ))
-            .child(group(
-                "Protect",
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_1()
-                    .child(self.sheet_lb(
-                        Some("lock"),
-                        if self.sheet_protected() {
-                            "Unprotect Sheet"
-                        } else {
-                            "Protect Sheet"
-                        },
-                        SheetAct::ProtectSheet,
-                        pal,
-                        cx,
-                    ))
-                    .child(self.sheet_lb(None, "Protect Workbook", SheetAct::Todo, pal, cx))
-                    .into_any_element(),
-            ))
-            .into_any_element()
-    }
-
-    /// The View tab: a Window group with Freeze Panes, like Excel.
-    fn sheet_view_ribbon(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let frozen = self
-            .active_sheet()
-            .is_some_and(|v| v.sheet().freeze != (0, 0));
-        let group = |title: &str, body: AnyElement| -> AnyElement {
-            v_flex()
-                .h(px(94.))
-                .px_1p5()
-                .py(px(3.))
-                .justify_between()
-                .border_r_1()
-                .border_color(pal.border)
-                .child(div().flex_1().flex().items_center().child(body))
-                .child(
-                    div()
-                        .w_full()
-                        .text_size(px(10.))
-                        .text_color(pal.dim)
-                        .text_center()
-                        .child(title.to_string()),
-                )
-                .into_any_element()
-        };
-        h_flex()
-            .id("sheet-ribbon")
-            .w_full()
-            .h(px(100.))
-            .items_stretch()
-            .px_1()
-            .bg(pal.panel)
-            .border_b_1()
-            .border_color(pal.border)
-            .overflow_x_scroll()
-            .child(group(
-                "Window",
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_1()
-                    .child(self.sheet_lb(
-                        None,
-                        if frozen {
-                            "Unfreeze Panes"
-                        } else {
-                            "Freeze Panes"
-                        },
-                        SheetAct::FreezePanes,
-                        pal,
-                        cx,
-                    ))
-                    .into_any_element(),
-            ))
-            .into_any_element()
-    }
-
-    /// The spreadsheet Home tab, laid out like Excel: Clipboard, Font, Alignment,
-    /// Number, Styles, Cells, Editing.
-    fn sheet_home_ribbon(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let xf = self.active_xf();
-        // A group frame: content on top, a centered label (+ optional dialog
-        // launcher) at the bottom, and a right divider — exactly like the doc ribbon.
-        let group = |title: &str, launcher: bool, body: AnyElement| -> AnyElement {
-            v_flex()
-                .h(px(94.))
-                .px_1p5()
-                .py(px(3.))
-                .justify_between()
-                .border_r_1()
-                .border_color(pal.border)
-                .child(div().flex_1().flex().items_center().child(body))
-                .child(
+        let body = match &g.body {
+            Body::Strip {
+                gap: strip_gap,
+                items,
+            } => {
+                let mut strip = gap(h_flex().h_full().items_center(), *strip_gap);
+                for item in *items {
+                    strip = strip.child(match item {
+                        Item::One(c) => self.sheet_cmd_el(c, xf, pal, cx),
+                        Item::Col { gap: col_gap, cmds } => gap(v_flex(), *col_gap)
+                            .children(cmds.iter().map(|c| self.sheet_cmd_el(c, xf, pal, cx)))
+                            .into_any_element(),
+                    });
+                }
+                strip.into_any_element()
+            }
+            Body::Rows(rows) => v_flex()
+                .gap(px(1.))
+                .children(rows.iter().map(|r| {
                     h_flex()
-                        .w_full()
                         .items_center()
-                        .justify_center()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_size(px(10.))
-                                .text_color(pal.dim)
-                                .child(title.to_string()),
-                        )
-                        .when(launcher, |d| {
-                            d.child(
-                                div()
-                                    .text_size(px(9.))
-                                    .text_color(pal.dim)
-                                    .child("\u{2921}"),
-                            )
-                        }),
-                )
-                .into_any_element()
+                        .gap(px(2.))
+                        .children(r.iter().map(|c| self.sheet_cmd_el(c, xf, pal, cx)))
+                }))
+                .into_any_element(),
         };
-        let row = |kids: Vec<AnyElement>| {
-            h_flex()
-                .items_center()
-                .gap(px(2.))
-                .children(kids)
-                .into_any_element()
-        };
-        let col = |kids: Vec<AnyElement>| v_flex().gap(px(1.)).children(kids).into_any_element();
-
-        h_flex()
-            .id("sheet-ribbon")
-            .w_full()
-            .h(px(100.))
-            .items_stretch()
-            .px_1()
-            .bg(pal.panel)
-            .border_b_1()
+        v_flex()
+            .h(px(94.))
+            .px_1p5()
+            .py(px(3.))
+            .justify_between()
+            .border_r_1()
             .border_color(pal.border)
-            .overflow_x_scroll()
-            // Clipboard: big Paste + a Cut/Copy/Format-Painter column.
-            .child(group(
-                "Clipboard",
-                true,
-                h_flex()
-                    .h_full()
+            .child(div().flex_1().flex().items_center().child(body))
+            .child(match titles {
+                sheet_ribbon::Titles::WithLaunchers => h_flex()
+                    .w_full()
                     .items_center()
+                    .justify_center()
                     .gap_1()
-                    .child(self.sheet_lb(Some("paste"), "Paste", SheetAct::Paste, pal, cx))
-                    .child(col(vec![
-                        self.sheet_rb(Some("cut"), "Cut", SheetAct::Cut, pal, cx),
-                        self.sheet_rb(Some("copy"), "Copy", SheetAct::Copy, pal, cx),
-                        self.sheet_rb(None, "Format Painter", SheetAct::Todo, pal, cx),
-                    ]))
+                    .child(div().text_size(px(10.)).text_color(pal.dim).child(g.title))
+                    .when(g.launcher, |d| {
+                        d.child(
+                            div()
+                                .text_size(px(9.))
+                                .text_color(pal.dim)
+                                .child("\u{2921}"),
+                        )
+                    })
                     .into_any_element(),
-            ))
-            // Font: name/size combos + grow/shrink; then B/I/U, borders, fill, colour.
-            .child(group(
-                "Font",
-                true,
-                col(vec![
-                    row(vec![
-                        self.sheet_combo("Calibri", true, pal, cx),
-                        self.sheet_combo("11", false, pal, cx),
-                        self.sheet_ib("font-increase", SheetAct::GrowFont, false, pal, cx),
-                        self.sheet_ib("font-decrease", SheetAct::ShrinkFont, false, pal, cx),
-                    ]),
-                    row(vec![
-                        self.sheet_ib("bold", SheetAct::Bold, xf.bold, pal, cx),
-                        self.sheet_ib("italic", SheetAct::Italic, xf.italic, pal, cx),
-                        self.sheet_ib("underline", SheetAct::Todo, false, pal, cx),
-                        self.sheet_ib("border-bottom", SheetAct::ToggleBorder, xf.border, pal, cx),
-                        self.sheet_ib("highlight", SheetAct::FillColor, false, pal, cx),
-                        self.sheet_ib("text-color", SheetAct::FontColor, false, pal, cx),
-                    ]),
-                ]),
-            ))
-            // Alignment: top/mid/bottom + wrap; then left/center/right, indent, merge.
-            .child(group(
-                "Alignment",
-                true,
-                col(vec![
-                    row(vec![
-                        self.sheet_gb("\u{2580}", SheetAct::Todo, pal, cx),
-                        self.sheet_gb("\u{25AC}", SheetAct::Todo, pal, cx),
-                        self.sheet_gb("\u{2584}", SheetAct::Todo, pal, cx),
-                        self.sheet_rb(None, "Wrap Text", SheetAct::WrapText, pal, cx),
-                    ]),
-                    row(vec![
-                        self.sheet_ib(
-                            "align-left",
-                            SheetAct::AlignL,
-                            matches!(xf.align, gridcore::sheet::Align::Left),
-                            pal,
-                            cx,
-                        ),
-                        self.sheet_ib(
-                            "align-center",
-                            SheetAct::AlignC,
-                            matches!(xf.align, gridcore::sheet::Align::Center),
-                            pal,
-                            cx,
-                        ),
-                        self.sheet_ib(
-                            "align-right",
-                            SheetAct::AlignR,
-                            matches!(xf.align, gridcore::sheet::Align::Right),
-                            pal,
-                            cx,
-                        ),
-                        self.sheet_ib("indent-decrease", SheetAct::Todo, false, pal, cx),
-                        self.sheet_rb(None, "Row Height", SheetAct::RowHeight, pal, cx),
-                        self.sheet_rb(None, "Merge", SheetAct::Merge, pal, cx),
-                    ]),
-                ]),
-            ))
-            // Number: format combo; then currency/percent/comma + decimals.
-            .child(group(
-                "Number",
-                true,
-                col(vec![
-                    row(vec![self.sheet_numfmt_combo(pal, cx)]),
-                    row(vec![
-                        self.sheet_gb("$", SheetAct::Currency, pal, cx),
-                        self.sheet_gb("%", SheetAct::Percent, pal, cx),
-                        self.sheet_gb(",", SheetAct::Comma, pal, cx),
-                        self.sheet_gb("\u{2192}.0", SheetAct::Todo, pal, cx),
-                        self.sheet_gb(".00\u{2190}", SheetAct::Todo, pal, cx),
-                    ]),
-                ]),
-            ))
-            // Styles: Conditional Formatting, Format as Table, Cell Styles.
-            .child(group(
-                "Styles",
-                false,
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_0p5()
-                    .child(self.sheet_lb(
-                        None,
-                        "Conditional Formatting",
-                        SheetAct::CondFormat,
-                        pal,
-                        cx,
-                    ))
-                    .child(self.sheet_lb(
-                        Some("table"),
-                        "Format as Table",
-                        SheetAct::FormatAsTable,
-                        pal,
-                        cx,
-                    ))
-                    .child(self.sheet_lb(None, "Cell Styles", SheetAct::Todo, pal, cx))
+                sheet_ribbon::Titles::Plain => div()
+                    .w_full()
+                    .text_size(px(10.))
+                    .text_color(pal.dim)
+                    .text_center()
+                    .child(g.title)
                     .into_any_element(),
-            ))
-            // Cells: Insert, Delete, Format.
-            .child(group(
-                "Cells",
-                false,
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        v_flex()
-                            .gap_0p5()
-                            .child(self.sheet_rb(None, "Insert Row", SheetAct::InsertRow, pal, cx))
-                            .child(self.sheet_rb(None, "Insert Col", SheetAct::InsertCol, pal, cx)),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_0p5()
-                            .child(self.sheet_rb(None, "Delete Row", SheetAct::DeleteRow, pal, cx))
-                            .child(self.sheet_rb(None, "Delete Col", SheetAct::DeleteCol, pal, cx)),
-                    )
-                    .child(self.sheet_lb(None, "Format", SheetAct::FormatCells, pal, cx))
-                    .into_any_element(),
-            ))
-            // Editing: AutoSum/Fill/Clear column + Sort & Filter, Find & Select.
-            .child(group(
-                "Editing",
-                false,
-                h_flex()
-                    .h_full()
-                    .items_center()
-                    .gap_1()
-                    .child(col(vec![
-                        self.sheet_rb(None, "\u{03A3} AutoSum", SheetAct::AutoSum, pal, cx),
-                        self.sheet_rb(None, "Fill", SheetAct::Todo, pal, cx),
-                        self.sheet_rb(Some("clear-format"), "Clear", SheetAct::Todo, pal, cx),
-                    ]))
-                    .child(col(vec![
-                        self.sheet_rb(
-                            Some("sort"),
-                            "Sort A \u{2192} Z",
-                            SheetAct::SortAsc,
-                            pal,
-                            cx,
-                        ),
-                        self.sheet_rb(
-                            Some("sort"),
-                            "Sort Z \u{2192} A",
-                            SheetAct::SortDesc,
-                            pal,
-                            cx,
-                        ),
-                        self.sheet_rb(
-                            Some("sort"),
-                            "Custom Sort\u{2026}",
-                            SheetAct::CustomSort,
-                            pal,
-                            cx,
-                        ),
-                        self.sheet_rb(None, "Filter", SheetAct::Filter, pal, cx),
-                        self.sheet_rb(None, "Remove Dup", SheetAct::RemoveDuplicates, pal, cx),
-                    ]))
-                    .child(self.sheet_lb(Some("find"), "Find & Select", SheetAct::Todo, pal, cx))
-                    .into_any_element(),
-            ))
+            })
             .into_any_element()
+    }
+
+    /// One sheet ribbon command, drawn in its shape.
+    fn sheet_cmd_el(
+        &self,
+        c: &sheet_ribbon::SheetCmd,
+        xf: &gridcore::sheet::Xf,
+        pal: Pal,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use sheet_ribbon::Shape;
+        let text = c.text(self.sheet_act_toggled(c.act));
+        match c.shape {
+            Shape::Large(icon) => self.sheet_lb(icon, text, c.act, pal, cx),
+            Shape::Row(icon) => self.sheet_rb(icon, text, c.act, pal, cx),
+            Shape::Icon(icon) => {
+                self.sheet_ib(icon, c.act, sheet_ribbon::act_on(c.act, xf), pal, cx)
+            }
+            Shape::Glyph(glyph) => self.sheet_gb(glyph, c.act, pal, cx),
+            Shape::Combo { value, wide } => self.sheet_combo(value, wide, c.act, pal, cx),
+            Shape::NumFmt => self.sheet_numfmt_combo(pal, cx),
+        }
     }
 
     fn render_group(
@@ -25304,13 +25388,14 @@ mod grid_geom_tests {
         chart_card_layout, chart_category_label_plan, chart_column_layout, chart_line_path,
         chart_line_points, chart_panel_after, chart_panel_shown, chart_pie_geometry,
         chart_pie_slice_path, chart_ref_of, chart_render_path, chart_scale, chart_slot_color,
-        chart_source_areas, col_at_x, col_px, dash_fit, edit_runs, fill_box, formula_ref_tokens,
-        gesture_in_flight, last_visible_col, may_arm_fill, parse_ref_text, press_selection,
-        preview_range, range_a1, range_border_cell_count, range_border_dashed, range_border_plan,
-        range_edges_at, range_text, ref_a1, ref_color, ref_index_at, ref_pick_text, ref_token_at,
-        replace_ref, resize_axis, row_height_px, scroll_col0_for_sel, selected_header_range,
-        series_move, series_name_shown, series_remove, series_resolved_preview, sheet_index_of,
-        shift_col, shift_row, shown_sel, snap_range_rows, source_ref_text,
+        chart_source_areas, col_at_x, col_px, dash_fit, edit_runs, fill_box, fill_handle_hidden,
+        formula_ref_tokens, gesture_in_flight, last_visible_col, may_arm_fill, parse_ref_text,
+        press_selection, preview_range, range_a1, range_border_cell_count, range_border_dashed,
+        range_border_plan, range_edges_at, range_text, ref_a1, ref_color, ref_index_at,
+        ref_pick_text, ref_token_at, replace_ref, resize_axis, row_height_px, scroll_col0_for_sel,
+        selected_header_range, series_move, series_name_shown, series_remove,
+        series_resolved_preview, sheet_index_of, shift_col, shift_row, shown_sel, snap_range_rows,
+        source_ref_text,
     };
     use gpui::{point, px};
 
@@ -25368,7 +25453,7 @@ mod grid_geom_tests {
         assert!(!gesture_in_flight(false, false, false, false));
         assert!(may_arm_fill(false, false));
         let mut fill = None;
-        assert!(arm_fill(&mut fill, Some(src), false, false));
+        assert!(arm_fill(&mut fill, Some(src), false, false, false));
         let armed = fill.expect("the source range becomes a fill drag");
         assert_eq!(armed.src, src);
         assert_eq!(armed.to, (src.2, src.3));
@@ -25394,6 +25479,7 @@ mod grid_geom_tests {
                 &mut fill,
                 Some(src),
                 gesture_in_flight(drag, dragging, range, formula),
+                false,
                 false
             ));
             assert!(fill.is_none(), "a grid gesture must leave the fill unarmed");
@@ -25403,14 +25489,54 @@ mod grid_geom_tests {
         assert!(!may_arm_fill(true, false));
         assert!(!may_arm_fill(true, true));
         let mut fill = Some(armed);
-        assert!(!arm_fill(&mut fill, Some((9, 9, 9, 9)), false, false));
+        assert!(!arm_fill(
+            &mut fill,
+            Some((9, 9, 9, 9)),
+            false,
+            false,
+            false
+        ));
         assert_eq!(fill.expect("the first fill stays armed").src, src);
 
         // The priority-1 more-tabs backdrop prevents presses on the deferred
         // handle. Keep the guard as defence in depth if that order changes.
         let mut fill = None;
-        assert!(!arm_fill(&mut fill, Some(src), false, true));
+        assert!(!arm_fill(&mut fill, Some(src), false, true, false));
         assert!(fill.is_none());
+    }
+
+    /// #699: a protected sheet never arms a fill, so neither the pointer nor
+    /// the harness's `fill-drag` can write its cells through the handle.
+    #[test]
+    fn a_protected_sheet_cannot_arm_a_fill() {
+        let mut fill = None;
+        assert!(!arm_fill(&mut fill, Some((0, 0, 1, 0)), false, false, true));
+        assert!(fill.is_none());
+    }
+
+    /// #699: the handle is drawn only with no cell edit open, nothing pointing
+    /// and no chart holding the selection; each says why it is not.
+    #[test]
+    fn the_fill_handle_says_why_it_is_hidden() {
+        use super::HandleHidden::*;
+        assert_eq!(fill_handle_hidden(false, false, false, None), None);
+        assert_eq!(fill_handle_hidden(true, false, false, None), Some(Editing));
+        assert_eq!(fill_handle_hidden(false, true, false, None), Some(Pointing));
+        assert_eq!(fill_handle_hidden(false, false, true, None), Some(Pointing));
+        assert_eq!(
+            fill_handle_hidden(false, false, false, Some(0)),
+            Some(ChartSelected)
+        );
+        // An edit outranks the rest: it is what a click would land in.
+        assert_eq!(
+            fill_handle_hidden(true, true, false, Some(0)),
+            Some(Editing)
+        );
+        assert_eq!(Editing.why(), "a cell is being edited");
+        assert_eq!(Pointing.why(), "a reference is being pointed at");
+        assert_eq!(ChartSelected.why(), "a chart is selected");
+        assert!(ChartSelected.cleared_by_a_click());
+        assert!(!Editing.cleared_by_a_click() && !Pointing.cleared_by_a_click());
     }
 
     fn names(list: &[&str]) -> Vec<String> {
