@@ -339,11 +339,14 @@ pub fn decode(bytes: &[u8], origin: Origin) -> String {
 /// A CSV's `sep=<c>` first line: the delimiter it names and the text after
 /// it. Any other first line leaves the text as it is.
 pub fn csv_directive(text: &str) -> (Option<char>, &str) {
-    let (line, rest) = match text.find('\n') {
-        Some(i) => (&text[..i], &text[i + 1..]),
+    // The first line ends at CR LF, LF or a lone CR.
+    let (line, rest) = match text.find(['\r', '\n']) {
+        Some(i) => {
+            let skip = if text[i..].starts_with("\r\n") { 2 } else { 1 };
+            (&text[..i], &text[i + skip..])
+        }
         None => (text, ""),
     };
-    let line = line.strip_suffix('\r').unwrap_or(line);
     if line.len() > 4 && line.is_char_boundary(4) && line[..4].eq_ignore_ascii_case("sep=") {
         let mut chars = line[4..].chars();
         if let (Some(c), None) = (chars.next(), chars.next()) {
@@ -585,25 +588,30 @@ fn general(field: &str, opts: &TextParse, auto: &AutoConvert, ctx: &EntryCtx) ->
     if field.starts_with('\'') {
         return text_entry(field);
     }
-    if (!auto.remove_leading_zeros && leading_zero_number(t))
-        || (!auto.e_notation && e_notation(t))
-        || (!auto.keep_15_digits && long_number(t))
+    // The field as en-US entry would read it: rewritten from the Advanced
+    // separators and trailing minus when it is number-shaped under them.
+    let normal = normalize_number(t, opts);
+    let read = normal.as_deref().unwrap_or(t);
+    // Automatic Data Conversion looks at the number as it will be read, so
+    // `007,5` under a `,` decimal is a leading-zero number like `007.5`.
+    if (!auto.remove_leading_zeros && leading_zero_number(read))
+        || (!auto.e_notation && e_notation(read))
+        || (!auto.keep_15_digits && long_number(read))
     {
         return text_entry(field);
     }
-    // A number written with the Advanced separators is a number only if it
-    // reads as one there (groups of three included): `03.04.2024` under a
-    // `.` thousands separator stays text rather than becoming 3042024.
-    if let Some(n) = normalize_number(t, opts) {
-        return match entry::parse_entry(&n, &Xf::default(), ctx) {
-            Ok(e) if e.cell.formula.is_none() && matches!(e.cell.value, CellValue::Number(_)) => e,
-            _ => text_entry(field),
-        };
-    }
-    let e = match entry::parse_entry(field, &Xf::default(), ctx) {
+    let e = match entry::parse_entry(normal.as_deref().unwrap_or(field), &Xf::default(), ctx) {
         Ok(e) => e,
         Err(_) => return text_entry(field),
     };
+    // A number written with the Advanced separators is a number only if it
+    // reads as one there (groups of three included): `03.04.2024` under a
+    // `.` thousands separator stays text rather than becoming 3042024.
+    if normal.is_some()
+        && (e.cell.formula.is_some() || !matches!(e.cell.value, CellValue::Number(_)))
+    {
+        return text_entry(field);
+    }
     if !auto.dates && e.format.is_some_and(is_date_code) {
         return text_entry(field);
     }
@@ -659,7 +667,9 @@ fn long_number(t: &str) -> bool {
 /// A number written with the Advanced separators and trailing minus,
 /// rewritten the way en-US entry reads it (the decimal separator becomes `.`
 /// and the thousands separator `,`, so entry's own groups-of-three rule
-/// decides); `None` when nothing changes or the field is not number-shaped.
+/// decides). `None` when the separators are en-US's and there is no
+/// trailing minus (the field reads as it is), or when the field is not
+/// number-shaped under them.
 fn normalize_number(t: &str, opts: &TextParse) -> Option<String> {
     let mut core = t;
     let mut negative = false;
@@ -907,7 +917,7 @@ pub fn sheet_text(sheet: &Sheet, styles: &Styles, date1904: bool, delim: char) -
 
 /// Formatted Text (Space delimited): each column padded to its width in
 /// characters, numbers right-aligned and text left-aligned. Text longer than
-/// its column is clipped; a number never is.
+/// its column is clipped; a number too wide for it is `#`s, never clipped.
 pub fn sheet_prn(sheet: &Sheet, styles: &Styles, date1904: bool) -> String {
     let (rows, cols) = sheet.used_size();
     let mut out = String::new();
@@ -922,12 +932,15 @@ pub fn sheet_prn(sheet: &Sheet, styles: &Styles, date1904: bool) -> String {
                 ),
                 None => (String::new(), false),
             };
-            // A number is written whole, even past its column: clipping it
-            // would write another value. Text is clipped to the column.
-            let text: String = if right {
-                text
-            } else {
+            // Every row stays fixed-width. Text is clipped to its column; a
+            // number that does not fit shows `#`s, as the grid does, since a
+            // clipped number would read as another value.
+            let text: String = if !right {
                 text.chars().take(width).collect()
+            } else if text.chars().count() > width {
+                "#".repeat(width)
+            } else {
+                text
             };
             let pad = " ".repeat(width.saturating_sub(text.chars().count()));
             if right {
@@ -1186,6 +1199,11 @@ mod tests {
         assert_eq!(csv_directive("sep=\na"), (None, "sep=\na"));
         assert_eq!(csv_directive("sep=;;\na"), (None, "sep=;;\na"));
         assert_eq!(csv_directive("a,b\n"), (None, "a,b\n"));
+        // A lone CR ends the line too (classic Mac files).
+        assert_eq!(
+            csv_directive("sep=;\ra;b\r1;2\r"),
+            (Some(';'), "a;b\r1;2\r")
+        );
     }
 
     fn general_value(field: &str, auto: &AutoConvert) -> Entry {
@@ -1389,7 +1407,7 @@ mod tests {
     }
 
     #[test]
-    fn formatted_text_writes_a_number_whole_past_its_column() {
+    fn formatted_text_keeps_every_row_fixed_width() {
         let mut styles = Styles {
             xfs: vec![Xf::default()],
             ..Styles::default()
@@ -1406,10 +1424,14 @@ mod tests {
                 ..Cell::number(serial(2024, 1, 15))
             },
         );
+        s.set_cell(0, 1, Cell::text("Smith"));
         s.set_cell(1, 0, Cell::number(123_456_789.0));
+        s.set_cell(1, 1, Cell::number(42.0));
         s.set_cell(2, 0, Cell::text("a long piece of text"));
+        s.set_cell(2, 1, Cell::text("x"));
         let prn = sheet_prn(&s, &styles, false);
-        assert_eq!(prn, "1/15/2024\r\n123456789\r\na long p\r\n");
+        // B starts at its column offset (8) on every row.
+        assert_eq!(prn, "########Smith\r\n########      42\r\na long px\r\n");
     }
 
     #[test]
@@ -1440,6 +1462,32 @@ mod tests {
         // A field that is not number-shaped reads as typed: a date stays one.
         assert_eq!(v("1/2"), CellValue::Number(serial(2024, 1, 2)));
         assert_eq!(v("apple"), CellValue::Text("apple".into()));
+    }
+
+    /// Automatic Data Conversion applies after the Advanced separators too.
+    #[test]
+    fn conversion_switches_apply_to_numbers_read_with_other_separators() {
+        let opts = TextParse {
+            decimal: ',',
+            thousands: '.',
+            ..TextParse::default()
+        };
+        let v = |f: &str, auto: &AutoConvert| {
+            convert_field(f, ColFormat::General, &opts, auto, &ctx())
+                .unwrap()
+                .entry
+                .cell
+                .value
+        };
+        let off = AutoConvert::off();
+        for f in ["2024-01-15", "007,5", "1,5E3", "1234567890123456789"] {
+            assert_eq!(v(f, &off), CellValue::Text(f.into()), "{f}");
+        }
+        let on = AutoConvert::default();
+        assert_eq!(v("2024-01-15", &on), CellValue::Number(serial(2024, 1, 15)));
+        assert_eq!(v("007,5", &on), CellValue::Number(7.5));
+        assert_eq!(v("1,5E3", &on), CellValue::Number(1500.0));
+        assert_eq!(v("1,5", &off), CellValue::Number(1.5));
     }
 
     #[test]

@@ -2261,7 +2261,7 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
     // marks one (Excel's always do); a file that marks none stays as it is.
     let tabs_selected = pkg.sheet_parts.iter().any(|name| {
         pkg.part(name)
-            .is_some_and(|b| String::from_utf8_lossy(b).contains("tabSelected=\"1\""))
+            .is_some_and(|b| tab_is_selected(&String::from_utf8_lossy(b)))
     });
 
     // --- shared strings: existing entries stay, new text appends ----------
@@ -3093,6 +3093,13 @@ fn set_active_tab(xml: &str, active: usize) -> String {
     }
 }
 
+/// Does the worksheet's first `<sheetView>` (in any prefix) say
+/// `tabSelected="1"`, however it is spelled?
+fn tab_is_selected(xml: &str) -> bool {
+    find_local_element(xml, "sheetView")
+        .is_some_and(|(i, _)| matches!(attr_at(xml, i, "tabSelected"), Some("1" | "true")))
+}
+
 /// Mark the first `<sheetView>` selected (`tabSelected="1"`) or not. Excel
 /// opens every selected tab as a group, so only the active sheet may carry
 /// it. A sheet without a `<sheetView>` is left alone.
@@ -3100,9 +3107,7 @@ fn set_tab_selected(xml: &str, selected: bool) -> String {
     let Some((i, _)) = find_local_element(xml, "sheetView") else {
         return xml.to_string();
     };
-    let current = attr_at(xml, i, "tabSelected");
-    let is_selected = matches!(current, Some("1" | "true"));
-    if is_selected == selected {
+    if tab_is_selected(xml) == selected {
         return xml.to_string();
     }
     set_tag_attr(xml, i, "tabSelected", selected.then_some("1"))
@@ -6436,6 +6441,20 @@ mod tests {
             tag_attr(r#"<a xtabSelected="0" tabSelected="1">"#, "tabSelected"),
             Some("1")
         );
+    }
+
+    /// A file that marks its tab `tabSelected='1'` (single quotes) still has
+    /// the mark moved with the active tab.
+    #[test]
+    fn a_single_quoted_tab_selection_moves_with_the_active_tab() {
+        let mut pkg = load_xlsx(&active_second_sheet_xlsx()).unwrap();
+        let sheet2 = part_text(&pkg, "xl/worksheets/sheet2.xml")
+            .replace("tabSelected=\"1\"", "tabSelected='1'");
+        pkg.set_part("xl/worksheets/sheet2.xml", sheet2.into_bytes());
+        pkg.workbook.active_tab = 0;
+        let saved = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert!(part_text(&saved, "xl/worksheets/sheet1.xml").contains("tabSelected=\"1\""));
+        assert!(!part_text(&saved, "xl/worksheets/sheet2.xml").contains("tabSelected"));
     }
 
     #[test]
