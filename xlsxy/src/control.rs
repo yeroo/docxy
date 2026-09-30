@@ -1311,6 +1311,25 @@ mod tests {
     }
 
     #[test]
+    fn wb_path_lists_an_opened_workbooks_circles() {
+        // r1 M2: a saved circle is listed straight after opening.
+        use gridcore::sheet::Cell;
+        use gridcore::xlsx::{load_xlsx, save_xlsx};
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].set_cell(0, 4, Cell::formula("E1+1"));
+        let mut a = App::new(load_xlsx(&save_xlsx(&pkg)).unwrap(), "c.xlsx");
+        a.os_clip = None;
+        let r = dispatch(&mut a, "wb.path", &Json::Null).unwrap();
+        match r.get("circular") {
+            Some(Json::Arr(v)) => {
+                assert_eq!(v.len(), 1);
+                assert_eq!(v[0].as_str(), Some("E1"));
+            }
+            other => panic!("circular: {other:?}"),
+        }
+    }
+
+    #[test]
     fn spill_and_calc_constants_are_refused_as_formulas() {
         // #657: Excel refuses these as formulas (as it does #FIELD!), but a
         // plain typed #SPILL! is the error value and #GETTING_DATA is a

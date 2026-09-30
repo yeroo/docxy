@@ -992,6 +992,8 @@ impl App {
             .map(|b| parse_model_part(&String::from_utf8_lossy(b)))
             .unwrap_or_default();
         let comments = pkg.comments();
+        // Excel warns about a workbook's circular references when it opens.
+        let status = (!engine.circular_refs().is_empty()).then(|| CIRCULAR_WARNING.to_string());
         App {
             pkg,
             engine,
@@ -1004,7 +1006,7 @@ impl App {
             left: 0,
             edit: None,
             modified: false,
-            status: None,
+            status,
             undo: Vec::new(),
             redo: Vec::new(),
             clip: None,
@@ -1206,8 +1208,8 @@ impl App {
         self.warn_new_circles(&circles_before);
     }
 
-    /// Excel's circular-reference warning, once, when an edit made a circle
-    /// that was not there before.
+    /// Excel's circular-reference warning, once, when a cell edit put a
+    /// cell on a circle that was not on one before.
     fn warn_new_circles(&mut self, before: &[(usize, u32, u32)]) {
         let now = self.engine.circular_refs();
         if now.iter().any(|k| !before.contains(k)) {
@@ -1248,10 +1250,14 @@ impl App {
             sheets: self.pkg.workbook.sheets.clone(),
             names: self.pkg.workbook.defined_names.clone(),
         };
-        let circles_before = self.engine.circular_refs();
+        // A structural edit moves cells, so compare how many cells sit on
+        // circles rather than where: a circle that merely moved is not new.
+        let circles_before = self.engine.circular_refs().len();
         op(&mut self.pkg.workbook);
         self.rebuild_engine();
-        self.warn_new_circles(&circles_before);
+        if self.engine.circular_refs().len() > circles_before {
+            self.status = Some(CIRCULAR_WARNING.into());
+        }
         let after = WbSnapshot {
             sheets: self.pkg.workbook.sheets.clone(),
             names: self.pkg.workbook.defined_names.clone(),
@@ -2962,7 +2968,11 @@ impl App {
                 self.modified = false;
                 self.backstage = None;
                 self.start_screen = false;
-                self.status = Some(format!("Opened {}", self.path));
+                self.status = Some(if self.engine.circular_refs().is_empty() {
+                    format!("Opened {}", self.path)
+                } else {
+                    format!("Opened {}. {CIRCULAR_WARNING}", self.path)
+                });
             }
             Err(e) => self.status = Some(format!("Open failed: {e}")),
         }
@@ -7466,6 +7476,46 @@ mod tests {
         term.draw(|f| draw(&mut app, f)).unwrap();
         let text = format!("{:?}", term.backend().buffer());
         assert!(!text.contains("Circular References"), "{text}");
+    }
+
+    #[test]
+    fn opening_a_workbook_with_a_circle_reports_it() {
+        // r1 M2/m6: an opened file's circle is known at once (footer,
+        // wb.path, the open warning) without recalculating it, and moving it
+        // by a structural edit does not warn again.
+        use gridcore::xlsx::{load_xlsx, save_xlsx};
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].set_cell(
+            0,
+            4,
+            Cell {
+                value: CellValue::Number(7.0),
+                ..Cell::formula("E1+1")
+            },
+        );
+        let pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let mut app = App::new(pkg, "circle.xlsx");
+        app.os_clip = None;
+        assert_eq!(app.status.as_deref(), Some(CIRCULAR_WARNING));
+        assert_eq!(app.circular_refs(), vec!["E1".to_string()]);
+        // Cached, not recalculated.
+        assert_eq!(
+            app.sheet().cell(0, 4).unwrap().value,
+            CellValue::Number(7.0)
+        );
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        let text = format!("{:?}", term.backend().buffer());
+        assert!(text.contains("Circular References: E1"), "{text}");
+
+        // Insert a row above the circle: it moves to E2, no new warning.
+        app.status = None;
+        app.cur = (0, 0);
+        app.anchor = None;
+        app.row_op(true);
+        assert_ne!(app.status.as_deref(), Some(CIRCULAR_WARNING));
+        assert_eq!(app.circular_refs(), vec!["E2".to_string()]);
     }
 
     #[test]

@@ -83,7 +83,30 @@ impl Engine {
                 }
             }
         }
+        eng.find_circles();
         eng
+    }
+
+    /// Find every circle in the whole formula graph without evaluating
+    /// anything, so a workbook's circular references are known (and
+    /// reported) as soon as it is opened, before any recalculation.
+    fn find_circles(&mut self) {
+        let mut all: Vec<Key> = self.formulas.keys().copied().collect();
+        all.sort_unstable();
+        let mut edges: HashMap<Key, Vec<Key>> = HashMap::new();
+        for (f, srcs) in self.dependency_edges(&all) {
+            for g in srcs {
+                edges.entry(g).or_default().push(f);
+            }
+        }
+        self.circular.clear();
+        for comp in components_in_order(&all, &edges) {
+            let circle =
+                comp.len() > 1 || edges.get(&comp[0]).is_some_and(|ds| ds.contains(&comp[0]));
+            if circle {
+                self.circular.extend(comp);
+            }
+        }
     }
 
     /// The formula cells on a circular reference (a cycle of two or more
@@ -1606,6 +1629,30 @@ mod tests {
         eng.recalc_all(&mut wb);
         assert_eq!(value_at(&wb, "K1"), CellValue::Number(0.0));
         assert_eq!(value_at(&wb, "K2"), CellValue::Number(0.0));
+    }
+
+    #[test]
+    fn circles_are_known_before_any_recalc() {
+        // r1 M2: building the engine over an opened workbook finds its
+        // circles without touching the cached values.
+        let cached = |f: &str, v: f64| Cell {
+            value: CellValue::Number(v),
+            ..Cell::formula(f)
+        };
+        let wb = wb_one_sheet(&[
+            ("E1", cached("E1+1", 3.0)),
+            ("F1", cached("G1+1", 1.0)),
+            ("G1", cached("F1*2", 2.0)),
+            ("H1", cached("E1+5", 8.0)),
+        ]);
+        let eng = Engine::new(&wb);
+        assert_eq!(eng.circular_refs(), vec![(0, 0, 4), (0, 0, 5), (0, 0, 6)]);
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(3.0));
+        assert!(
+            Engine::new(&wb_one_sheet(&[("A1", Cell::formula("B1+1"))]))
+                .circular_refs()
+                .is_empty()
+        );
     }
 
     // ---- dynamic arrays / spilling ------------------------------------
