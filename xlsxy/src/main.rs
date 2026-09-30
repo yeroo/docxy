@@ -885,13 +885,10 @@ fn print_usage() {
     );
 }
 
-/// Current time as an Excel serial (UTC — std has no timezone database).
+/// Current local time as an Excel serial: Excel's `TODAY()`/`NOW()`, and
+/// the year a typed `3/4` takes, follow the local clock.
 fn now_serial() -> Option<f64> {
-    let secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()?
-        .as_secs_f64();
-    Some(secs / 86_400.0 + 25_569.0)
+    gridcore::clock::local_now_serial()
 }
 
 fn entropy_seed() -> Option<u64> {
@@ -904,7 +901,7 @@ fn entropy_seed() -> Option<u64> {
 /// Current UTC time as an ISO-8601 string for threaded-comment timestamps.
 /// Falls back to the Excel epoch if the clock is unavailable.
 fn iso_now() -> String {
-    let serial = now_serial().unwrap_or(1.0);
+    let serial = gridcore::clock::utc_now_serial().unwrap_or(1.0);
     match gridcore::sheet::serial_to_parts(serial, false) {
         Some(p) => format!(
             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",

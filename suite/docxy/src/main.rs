@@ -508,15 +508,11 @@ fn numfmt_setter(code: &str) -> FormatFn {
     std::rc::Rc::new(move |xf: &mut gridcore::sheet::Xf| xf.set_code(code.clone()))
 }
 
-/// The suite's clock as a 1900-system serial (UTC, like xlsxy's): what
-/// `TODAY()`/`NOW()` read and what a yearless typed date (`3/4`) takes its
-/// year from.
+/// The suite's clock as a 1900-system serial in local time, as Excel's:
+/// what `TODAY()`/`NOW()` read, what Ctrl+; and Ctrl+Shift+; enter, and what
+/// a yearless typed date (`3/4`) takes its year from.
 fn now_serial() -> Option<f64> {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .ok()?
-        .as_secs_f64();
-    Some(secs / 86_400.0 + 25_569.0)
+    gridcore::clock::local_now_serial()
 }
 
 /// The recalc engine for a workbook, with the suite's clock.
