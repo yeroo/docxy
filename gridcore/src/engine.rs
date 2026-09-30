@@ -21,7 +21,7 @@ use crate::formula::{
     self, DynResult, Eval, ExcelError, Expr, Resolver, Value, always_recalc, collect_refs,
     contains_db_fn,
 };
-use crate::sheet::{Cell, CellValue, Sheet, Workbook, is_array_f};
+use crate::sheet::{Cell, CellValue, Sheet, Workbook, cell_name, f_ref, is_array_f, with_ref};
 
 /// (sheet index, row, col) — the engine's cell address.
 pub type Key = (usize, u32, u32);
@@ -194,14 +194,27 @@ impl Engine {
             }
         }
         if let Some(src) = cell.formula.clone() {
-            // An edited formula is ours now — modern (spills). A clone
-            // re-submitted as-is (format edit, undo/redo, paste) keeps its
-            // array marker: for a legacy CSE array (no `cm`) it is the only
-            // one, and without it the next Engine::new would implicit-
-            // intersect it. Other preserved attributes (shared group, data
-            // table) name cells this formula no longer owns: dropped.
-            if !cell.f_attrs.as_deref().is_some_and(is_array_f) {
-                cell.f_attrs = None;
+            // An edited formula is ours now — modern (spills). An array
+            // marker is kept: a format edit, undo or redo re-submits the same
+            // cell, and for a legacy CSE array (no `cm`) the marker is the only
+            // one — without it the next Engine::new would implicit-intersect
+            // it. Paste and Fill Down/Right translate the formula and keep the
+            // marker too, re-anchored here (autofill's `rebase` drops it
+            // instead). Other preserved attributes (shared group, data table)
+            // name cells this formula no longer owns: dropped.
+            match cell.f_attrs.as_deref() {
+                Some(fa) if is_array_f(fa) => {
+                    // A clone at a new address still names its source's
+                    // block: it covers its own anchor instead.
+                    let anchor = cell_name(r, c);
+                    let own = f_ref(fa)
+                        .and_then(|rf| rf.split(':').next())
+                        .is_some_and(|tl| tl.eq_ignore_ascii_case(&anchor));
+                    if !own {
+                        cell.f_attrs = Some(with_ref(fa, &anchor));
+                    }
+                }
+                _ => cell.f_attrs = None,
             }
             self.index_formula(wb, key, &src, false, false);
         }

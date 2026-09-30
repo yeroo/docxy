@@ -8728,6 +8728,10 @@ b",
         eng.recalc_all(&mut pkg.workbook);
         let clone = pkg.workbook.sheets[0].cell(0, 3).cloned().unwrap();
         eng.set_cell(&mut pkg.workbook, (0, 4, 5), clone);
+        // Re-anchored on the cell itself, so a later structural edit moves
+        // the right ref; the writer's guard is only a backstop.
+        let f5 = pkg.workbook.sheets[0].cell(4, 5).unwrap();
+        assert_eq!(f5.f_attrs.as_deref(), Some(r#" t="array" ref="F5""#));
         let ws = saved_sheet1(&pkg);
         assert!(
             ws.contains(r#"<c r="F5"><f t="array" ref="F5">SUM(A1:A5*A1:A5)</f><v>165</v></c>"#),
@@ -8757,6 +8761,64 @@ b",
         let ws = saved_sheet1(&pkg);
         assert!(
             ws.contains(r#"<c r="F5" t="e"><f t="array" ref="F5">A1:A3*2</f><v>#SPILL!</v></c>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn an_edit_that_misses_a_loaded_array_keeps_its_text_verbatim() {
+        // An insert below everything it reads, and a rename of a sheet it
+        // doesn't name, leave its loaded text (prefixes and all) alone.
+        let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SORT_ANCHOR))).unwrap();
+        rebuild(&mut pkg);
+        crate::edit::insert_rows(&mut pkg.workbook, 0, 10, 1);
+        crate::edit::rename_sheet(&mut pkg.workbook, 0, "Main");
+        rebuild(&mut pkg);
+        let d1 = pkg.workbook.sheets[0].cell(0, 3).unwrap();
+        assert_eq!(d1.formula.as_deref(), Some("_xlfn._xlws.SORT(A1:A5,,-1)"));
+        let ws = saved_sheet1(&pkg);
+        assert!(ws.contains(SORT_ANCHOR), "{ws}");
+    }
+
+    /// A CSE block over D1:D3 with a 1x1 result, so nothing spills and the
+    /// writer keeps whatever `ref` the cell holds.
+    const SUM_BLOCK: &str =
+        r#"<c r="D1"><f t="array" ref="D1:D3">SUM(A1:A5*A1:A5)</f><v>165</v></c>"#;
+
+    /// Fill Down/Right from D1 into `target`, through set_cell as xlsxy does.
+    fn fill_from_d1(pkg: &mut SheetPackage, target: (u32, u32), down: bool) {
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        let sel = (target.0, target.1, target.0, target.1);
+        for (r, c, cell) in crate::edit::fill_changes(&pkg.workbook.sheets[0], sel, down) {
+            eng.set_cell(&mut pkg.workbook, (0, r, c), cell);
+        }
+    }
+
+    #[test]
+    fn a_filled_down_cse_clone_owns_only_its_anchor_after_a_row_delete() {
+        let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SUM_BLOCK))).unwrap();
+        fill_from_d1(&mut pkg, (1, 3), true);
+        let d2 = pkg.workbook.sheets[0].cell(1, 3).unwrap();
+        assert_eq!(d2.f_attrs.as_deref(), Some(r#" t="array" ref="D2""#));
+        crate::edit::delete_rows(&mut pkg.workbook, 0, 0, 1);
+        rebuild(&mut pkg);
+        let ws = saved_sheet1(&pkg);
+        assert!(
+            ws.contains(r#"<c r="D1"><f t="array" ref="D1">SUM(A1:A5*A1:A5)</f>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn a_filled_right_cse_clone_owns_only_its_anchor_after_a_column_delete() {
+        let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SUM_BLOCK))).unwrap();
+        fill_from_d1(&mut pkg, (0, 4), false);
+        crate::edit::delete_cols(&mut pkg.workbook, 0, 3, 1);
+        rebuild(&mut pkg);
+        let ws = saved_sheet1(&pkg);
+        assert!(
+            ws.contains(r#"<c r="D1"><f t="array" ref="D1">SUM(B1:B5*B1:B5)</f>"#),
             "{ws}"
         );
     }
@@ -8825,17 +8887,19 @@ b",
     #[test]
     fn insert_row_above_a_loaded_dynamic_array_shifts_its_text_and_ref() {
         // A `cm` array loaded with its `t="array"` `f_attrs` shifts the same
-        // way. (Its text is reprinted, as every shifted formula's is.)
+        // way. Its text is reprinted, which drops the `_xlfn._xlws.` prefix:
+        // the loss every shifted formula already has (a separate follow-up).
         let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SORT_ANCHOR))).unwrap();
         rebuild(&mut pkg);
         crate::edit::insert_rows(&mut pkg.workbook, 0, 0, 1);
         rebuild(&mut pkg);
         let ws = saved_sheet1(&pkg);
         assert!(
-            ws.contains(r#"<c r="D2" cm="1"><f t="array" ref="D2:D6">"#),
+            ws.contains(
+                r#"<c r="D2" cm="1"><f t="array" ref="D2:D6">SORT(A2:A6,,-1)</f><v>9</v></c>"#
+            ),
             "{ws}"
         );
-        assert!(ws.contains(r#"SORT(A2:A6,,-1)</f><v>9</v></c>"#), "{ws}");
     }
 
     #[test]

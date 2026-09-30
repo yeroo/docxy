@@ -14,10 +14,12 @@ use std::collections::BTreeMap;
 
 use crate::entry::EntryCtx;
 use crate::formula::{
-    EditShift, ExcelError, adjust_formula_for_edit, rename_sheet_in_formula, translate_formula,
+    EditShift, ExcelError, Expr, adjust_for_edit, adjust_formula_for_edit, parse,
+    rename_sheet_in_expr, rename_sheet_in_formula, to_string, translate_formula,
 };
 use crate::sheet::{
-    Cell, CellValue, MAX_COLS, MAX_ROWS, Sheet, Styles, Workbook, f_ref, is_array_f, with_ref,
+    Cell, CellValue, MAX_COLS, MAX_ROWS, Sheet, Styles, Workbook, cell_name, f_ref, is_array_f,
+    with_ref,
 };
 
 /// Read pasted text as a value: formulas, plain numbers (incl. percent),
@@ -853,13 +855,18 @@ pub fn rename_sheet(wb: &mut Workbook, idx: usize, new_name: &str) {
     }
     for sheet in &mut wb.sheets {
         for cell in sheet.cells.values_mut() {
-            if cell.f_attrs.as_deref().is_some_and(|a| !is_array_f(a)) {
-                continue; // preserved verbatim; an array formula is ours
-            }
-            if let Some(src) = &cell.formula {
-                if let Some(updated) = rename_sheet_in_formula(src, &old, new_name) {
-                    cell.formula = Some(updated);
-                }
+            let Some(src) = &cell.formula else {
+                continue;
+            };
+            let updated = match cell.f_attrs.as_deref() {
+                Some(a) if !is_array_f(a) => continue, // preserved verbatim
+                // An array formula is ours, but its loaded text is only
+                // reprinted when the rename really touches it.
+                Some(_) => rewrite_if_changed(src, |e| rename_sheet_in_expr(e, &old, new_name)),
+                None => rename_sheet_in_formula(src, &old, new_name),
+            };
+            if let Some(updated) = updated {
+                cell.formula = Some(updated);
             }
         }
     }
@@ -1090,6 +1097,15 @@ pub fn shift_chart_refs(
     changed
 }
 
+/// `src` rewritten by `f`, or `None` when it doesn't parse or `f` changes
+/// nothing: the text then stays byte-for-byte as loaded (reprinting drops
+/// spellings such as `_xlfn.` prefixes).
+fn rewrite_if_changed(src: &str, f: impl FnOnce(&Expr) -> Expr) -> Option<String> {
+    let ast = parse(src).ok()?;
+    let out = f(&ast);
+    (out != ast).then(|| to_string(&out))
+}
+
 /// The shared core: move the grid on the target sheet, then rewrite every
 /// formula and defined name in the workbook.
 fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
@@ -1104,26 +1120,39 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
 
     for (s, sheet) in wb.sheets.iter_mut().enumerate() {
         let home_is_target = s == idx;
-        for cell in sheet.cells.values_mut() {
+        for (&(r, c), cell) in sheet.cells.iter_mut() {
             if cell.f_attrs.as_deref().is_some_and(|a| !is_array_f(a)) {
                 continue; // preserved verbatim; stale is acceptable, corrupt is not
             }
             // An array formula is one the engine evaluates, so its text is
             // ours to rewrite; the block its `ref` names moves with the grid.
+            let array = cell.f_attrs.is_some();
             if let Some(fa) = cell.f_attrs.as_mut() {
-                let moved = f_ref(fa)
-                    .and_then(|r| adjust_formula_for_edit(r, home_is_target, &target_name, &shift))
-                    .filter(|r| !r.contains('#'));
-                if let Some(r) = moved {
-                    *fa = with_ref(fa, &r);
+                let moved = f_ref(fa).and_then(|rf| {
+                    adjust_formula_for_edit(rf, home_is_target, &target_name, &shift)
+                });
+                match moved {
+                    Some(m) if !m.contains('#') => *fa = with_ref(fa, &m),
+                    // A ref that lost its top-left never belonged to this
+                    // cell (a clone that kept its source's): it covers the
+                    // anchor alone.
+                    Some(_) => *fa = with_ref(fa, &cell_name(r, c)),
+                    None => {}
                 }
             }
-            if let Some(src) = &cell.formula {
-                if let Some(updated) =
-                    adjust_formula_for_edit(src, home_is_target, &target_name, &shift)
-                {
-                    cell.formula = Some(updated);
-                }
+            let Some(src) = &cell.formula else {
+                continue;
+            };
+            let adjust = |e: &Expr| adjust_for_edit(e, home_is_target, &target_name, &shift);
+            // An array formula's loaded text is only reprinted when the edit
+            // really moves one of its references.
+            let updated = if array {
+                rewrite_if_changed(src, adjust)
+            } else {
+                adjust_formula_for_edit(src, home_is_target, &target_name, &shift)
+            };
+            if let Some(updated) = updated {
+                cell.formula = Some(updated);
             }
         }
     }
@@ -2409,6 +2438,18 @@ mod tests {
             w.sheets[0].cell(2, 3).unwrap().value,
             CellValue::Number(6.0)
         );
+    }
+
+    #[test]
+    fn an_array_ref_that_loses_its_top_left_covers_its_own_anchor() {
+        // A clone at E1 still naming its source's block D1:D3 (one that never
+        // went through set_cell): deleting column D takes that block's
+        // top-left, so the ref falls back to the cell's own new address.
+        let mut w = wb(&[("E1", with_f_attrs("B1*2", " t=\"array\" ref=\"D1:D3\""))]);
+        delete_cols(&mut w, 0, 3, 1);
+        let d1 = w.sheets[0].cell(0, 3).unwrap();
+        assert_eq!(d1.f_attrs.as_deref(), Some(" t=\"array\" ref=\"D1\""));
+        assert_eq!(d1.formula.as_deref(), Some("B1*2"));
     }
 
     #[test]
