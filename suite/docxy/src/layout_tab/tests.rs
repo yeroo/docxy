@@ -326,6 +326,7 @@ fn menus_follow_word_with_headings_separators_and_placeholders() {
                 menu::MenuItem::Item(e) => e.label.clone(),
                 menu::MenuItem::Separator => "-".into(),
                 menu::MenuItem::Heading(h) => format!("# {h}"),
+                menu::MenuItem::TableGrid { .. } => "[grid]".into(),
             })
             .collect()
     };

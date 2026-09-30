@@ -72,17 +72,17 @@ test('every ribbon tab matches the suite snapshot: groups, acts and icons', asyn
   await guard.check();
 });
 
-test('the Table tab appears only with the caret in a table', async ({ page, guard }, testInfo) => {
+test('the table tabs appear only with the caret in a table', async ({ page, guard }, testInfo) => {
   await openBundle(page, bundleCopy(testInfo));
   await expect(page.locator('.rtab.contextual')).toHaveCount(0);
   await page.locator('p[data-p="17.1.0.0"]').click();
-  const tableTab = page.locator('.rtab.contextual');
-  await expect(tableTab).toHaveText('Table');
-  await tableTab.click();
-  const want = expected(snapshot.contextual[0]);
+  const tableTabs = page.locator('.rtab.contextual');
+  await expect(tableTabs).toHaveText(['Table Design', 'Table Layout']);
+  await tableTabs.nth(1).click();
+  const want = expected(snapshot.contextual[1]);
   expect((await rendered(page)).acts).toEqual(want.acts);
   // Table editing is not in the browser yet: drawn dimmed, saying so.
-  const row = page.locator('#rb-rowabove');
+  const row = page.locator('#rb-insert-above');
   await expect(row).toHaveClass(/unsupported/);
   await expect(row).toHaveAttribute('aria-disabled', 'true');
   // Leaving the table drops the tab and returns to Home.

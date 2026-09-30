@@ -722,7 +722,7 @@ mod tests {
             );
         }
         assert!(SHEET_RIBBON[0].tab == RibbonTab::Home);
-        assert!(tab_def(RibbonTab::Table).tab == RibbonTab::Home);
+        assert!(tab_def(RibbonTab::TableLayout).tab == RibbonTab::Home);
     }
 
     #[test]

@@ -26,11 +26,21 @@ use ctlcore::json::Json;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DialogOwner {
     /// Delete this summary task and its subtasks.
-    DeleteSummary { uid: i32 },
+    DeleteSummary {
+        uid: i32,
+    },
     /// Word's Page Setup, for the caret's sections (#649).
     PageSetup,
     /// Word's Columns, for the caret's sections (#649).
     Columns,
+    /// The table dialogs (#646, #647), for the edited story's caret or
+    /// selection.
+    InsertTable,
+    DeleteCells,
+    SplitCells,
+    SortTable,
+    TableToText,
+    TextToTable,
     /// Excel's Convert Text to Columns Wizard over one column (#692).
     TextToColumns {
         sheet: usize,

@@ -107,6 +107,14 @@ pub(crate) enum MenuItem {
     /// will).
     #[cfg_attr(not(test), allow(dead_code))]
     Heading(String),
+    /// Insert > Table's hover grid of `cols` × `rows` cells (#646): its
+    /// header reads "Insert Table", or "<c>x<r> Table" for the cell under the
+    /// pointer, and a click inserts that table. The `table-grid` verb hovers
+    /// and clicks it through the same handlers.
+    TableGrid {
+        cols: usize,
+        rows: usize,
+    },
 }
 
 /// An open menu: what it belongs to, where it is drawn (window coordinates)
@@ -136,6 +144,13 @@ fn items_json(items: &[MenuItem]) -> Json {
             .map(|item| match item {
                 MenuItem::Separator => Json::obj(vec![("separator", Json::Bool(true))]),
                 MenuItem::Heading(label) => Json::obj(vec![("heading", Json::Str(label.clone()))]),
+                MenuItem::TableGrid { cols, rows } => Json::obj(vec![(
+                    "table_grid",
+                    Json::obj(vec![
+                        ("columns", Json::Num(*cols as f64)),
+                        ("rows", Json::Num(*rows as f64)),
+                    ]),
+                )]),
                 MenuItem::Item(e) => Json::obj(vec![
                     ("id", Json::Str(e.id.clone())),
                     ("label", Json::Str(e.label.clone())),
@@ -348,6 +363,7 @@ mod tests {
                 MenuItem::Item(e) => e.label.clone(),
                 MenuItem::Separator => "-".into(),
                 MenuItem::Heading(h) => format!("[{h}]"),
+                MenuItem::TableGrid { .. } => "[grid]".into(),
             })
             .collect()
     }

@@ -234,13 +234,20 @@ pub(crate) fn docx_snapshot() -> Result<String, String> {
             }
         }
     }
-    let table = crate::table_tab();
-    let contextual = vec![json!({
-        "name": table.name,
-        "keyTip": table.key_tip,
-        "context": "table",
-        "groups": ex.groups(&table.groups),
-    })];
+    let contextual: Vec<Value> = [
+        crate::table_tab::table_design_tab(),
+        crate::table_tab::table_layout_tab(),
+    ]
+    .iter()
+    .map(|table| {
+        json!({
+            "name": table.name,
+            "keyTip": table.key_tip,
+            "context": "table",
+            "groups": ex.groups(&table.groups),
+        })
+    })
+    .collect();
     let qat: Vec<Value> = crate::QAT_ITEMS
         .iter()
         .map(|q| {
@@ -339,10 +346,15 @@ mod tests {
         assert!(text.contains("\"act\":\"Bold\""));
         assert!(text.contains("\"act\":\"H1\""), "gallery items carry acts");
         assert!(
-            text.contains("\"act\":\"RowAbove\""),
-            "the Table tab is exported"
+            text.contains("\"act\":\"Table(InsertAbove)\""),
+            "the table Layout tab is exported"
+        );
+        assert!(
+            text.contains("\"act\":\"Table(Borders(All))\""),
+            "the Table Design tab is exported"
         );
         assert_eq!(v["contextual"][0]["context"], "table");
+        assert_eq!(v["contextual"][1]["context"], "table");
         assert_eq!(v["tabs"][0]["kind"], "backstage");
         assert!(v["icons"]["bold"].as_str().unwrap().starts_with("<svg"));
         let gallery = &v["tabs"][1]["groups"]

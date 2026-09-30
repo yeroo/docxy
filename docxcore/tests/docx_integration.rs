@@ -324,9 +324,18 @@ fn row_content_control_package_roundtrip_preserves_wrappers_and_text() {
     let reloaded = load_package(&saved).expect("reload saved row-control fixture");
     assert_eq!(reloaded.document, package.document);
     assert_eq!(reloaded.document.plain_text(), original_text);
+    // The fixture's table uses the built-in TableGrid style but the package
+    // has no styles part, so saving adds one defining it (#705): otherwise
+    // Word would draw the table without its borders. Every other part is
+    // unchanged.
     let mut saved_parts = reloaded.part_names();
     saved_parts.sort_unstable();
-    assert_eq!(saved_parts, source_parts);
+    let mut expected_parts = source_parts.clone();
+    expected_parts.push("word/styles.xml");
+    expected_parts.sort_unstable();
+    assert_eq!(saved_parts, expected_parts);
+    let styles = String::from_utf8(reloaded.part("word/styles.xml").unwrap().to_vec()).unwrap();
+    assert!(styles.contains("w:styleId=\"TableGrid\""));
 }
 
 #[test]

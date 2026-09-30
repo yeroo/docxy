@@ -235,9 +235,11 @@ fn ribbon_context_survives_valid_switches_only() {
     );
     assert!(valid_ribbon_tab(Kind::Docx, RibbonTab::View, false, false) == RibbonTab::View);
     assert!(valid_ribbon_tab(Kind::Xlsx, RibbonTab::Task, false, false) == RibbonTab::Home);
-    assert!(valid_ribbon_tab(Kind::Docx, RibbonTab::Table, true, false) == RibbonTab::Table);
-    assert!(valid_ribbon_tab(Kind::Docx, RibbonTab::Table, false, false) == RibbonTab::Home);
-    assert!(valid_ribbon_tab(Kind::Project, RibbonTab::Table, true, true) == RibbonTab::Task);
+    for tab in [RibbonTab::TableDesign, RibbonTab::TableLayout] {
+        assert!(valid_ribbon_tab(Kind::Docx, tab, true, false) == tab);
+        assert!(valid_ribbon_tab(Kind::Docx, tab, false, false) == RibbonTab::Home);
+        assert!(valid_ribbon_tab(Kind::Project, tab, true, true) == RibbonTab::Task);
+    }
     for tab in [RibbonTab::Resource, RibbonTab::Report, RibbonTab::Project] {
         assert!(valid_ribbon_tab(Kind::Project, tab, false, false) == tab);
         assert!(valid_ribbon_tab(Kind::Docx, tab, false, false) == RibbonTab::Home);
@@ -2869,6 +2871,7 @@ fn row_menu(t: &DocTab) -> Vec<(String, bool, bool)> {
             MenuItem::Item(e) => (e.label, e.enabled, e.checked),
             MenuItem::Separator => ("-".into(), false, false),
             MenuItem::Heading(h) => (format!("[{h}]"), false, false),
+            MenuItem::TableGrid { .. } => ("[grid]".into(), false, false),
         })
         .collect()
 }
