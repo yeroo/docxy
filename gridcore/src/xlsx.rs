@@ -22,7 +22,7 @@ use opccore::xml::{Event, XmlParser};
 use opccore::zip::ZipArchive;
 use opccore::zipwrite::write_zip;
 
-use crate::formula::translate_formula;
+use crate::formula::{file_formula, translate_formula};
 use crate::sheet::{
     Cell, CellMeta, CellValue, ColDef, DefinedName, NumFmt, Sheet, Styles, Table, Workbook, Xf,
     cell_name, classify_builtin, classify_format_code, is_array_f, parse_cell_name,
@@ -3318,7 +3318,7 @@ fn cell_xml(
                 "<f t=\"array\" ref=\"{}:{}\">{}</f>",
                 cell_name(row, col),
                 cell_name(row + h - 1, col + w - 1),
-                esc_text(src)
+                esc_text(&file_formula(src))
             );
             (f, true)
         }
@@ -3327,10 +3327,13 @@ fn cell_xml(
         // `f_attrs`, or typed here: its `cm` says it is still one, covering
         // its anchor alone.
         (Some(src), None) if dynamic && !src.is_empty() => (
-            format!("<f t=\"array\" ref=\"{anchor}\">{}</f>", esc_text(src)),
+            format!(
+                "<f t=\"array\" ref=\"{anchor}\">{}</f>",
+                esc_text(&file_formula(src))
+            ),
             true,
         ),
-        (Some(src), None) => (format!("<f>{}</f>", esc_text(src)), false),
+        (Some(src), None) => (format!("<f>{}</f>", esc_text(&file_formula(src))), false),
         (Some(src), Some(fa)) if src.is_empty() => (format!("<f{fa}/>"), is_array_f(fa)),
         // A non-spilling array covers its anchor alone when its stored ref
         // is stale: a dynamic array's cells were cleared since load, and a
@@ -3339,10 +3342,17 @@ fn cell_xml(
         // paste re-anchor themselves). A legacy CSE block (no `cm`) whose ref
         // starts here keeps it: Excel refills that block on load.
         (Some(src), Some(fa)) if is_array_f(fa) && (dynamic || !ref_starts_at(fa, &anchor)) => (
-            format!("<f{}>{}</f>", with_ref(fa, &anchor), esc_text(src)),
+            format!(
+                "<f{}>{}</f>",
+                with_ref(fa, &anchor),
+                esc_text(&file_formula(src))
+            ),
             true,
         ),
-        (Some(src), Some(fa)) => (format!("<f{fa}>{}</f>", esc_text(src)), is_array_f(fa)),
+        (Some(src), Some(fa)) => (
+            format!("<f{fa}>{}</f>", esc_text(&file_formula(src))),
+            is_array_f(fa),
+        ),
         (None, _) => (String::new(), false),
     };
 
@@ -4626,7 +4636,7 @@ fn patch_defined_names(xml: &str, names: &[DefinedName], sheet_count: usize) -> 
                 block.push_str(&format!(
                     "<{pfx}definedName name=\"{}\"{scope}>{}</{pfx}definedName>",
                     esc_attr(&d.name),
-                    esc_text(&d.formula)
+                    esc_text(&file_formula(&d.formula))
                 ));
             }
             let (start, end, wrap) = match (names_close, names_slot) {
@@ -4686,8 +4696,13 @@ fn patch_defined_name(
             _ => None,
         }
     });
-    if let Some(d) = model.filter(|d| d.formula != text) {
-        edits.push((body_start, body_end, esc_text(&d.formula)));
+    // Compared in file spelling, so a loaded definition the model holds as it
+    // was read is left alone.
+    if let Some(f) = model
+        .map(|d| file_formula(&d.formula))
+        .filter(|f| *f != text)
+    {
+        edits.push((body_start, body_end, esc_text(&f)));
     }
     true
 }
@@ -5404,9 +5419,12 @@ impl SheetPackage {
         // after any existing ones.
         let (r1, c1, r2, c2) = range;
         let sqref = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
-        let mut fmls = format!("<formula>{}</formula>", esc_text(formula1));
+        let mut fmls = format!("<formula>{}</formula>", esc_text(&file_formula(formula1)));
         if let Some(f2) = formula2 {
-            fmls.push_str(&format!("<formula>{}</formula>", esc_text(f2)));
+            fmls.push_str(&format!(
+                "<formula>{}</formula>",
+                esc_text(&file_formula(f2))
+            ));
         }
         let cf_xml = format!(
             "<conditionalFormatting sqref=\"{sqref}\"><cfRule type=\"cellIs\" dxfId=\"{dxf_id}\" priority=\"{priority}\" operator=\"{op}\">{fmls}</cfRule></conditionalFormatting>"
@@ -5466,9 +5484,12 @@ impl SheetPackage {
         } else {
             format!(" operator=\"{operator}\"")
         };
-        let mut fmls = format!("<formula1>{}</formula1>", esc_text(formula1));
+        let mut fmls = format!("<formula1>{}</formula1>", esc_text(&file_formula(formula1)));
         if let Some(f2) = formula2 {
-            fmls.push_str(&format!("<formula2>{}</formula2>", esc_text(f2)));
+            fmls.push_str(&format!(
+                "<formula2>{}</formula2>",
+                esc_text(&file_formula(f2))
+            ));
         }
         let dv_xml = format!(
             "<dataValidation type=\"{kind}\"{op_attr} allowBlank=\"1\" showInputMessage=\"1\" showErrorMessage=\"1\" sqref=\"{sqref}\">{fmls}</dataValidation>"
@@ -9310,7 +9331,12 @@ b",
         let bytes = save_xlsx(&pkg);
         let pkg2 = load_xlsx(&bytes).unwrap();
         let anchor = pkg2.workbook.sheets[0].cell(0, 0).unwrap();
-        assert_eq!(anchor.formula.as_deref(), Some("SEQUENCE(3)"));
+        // Saved in file spelling (#776); shown as typed.
+        assert_eq!(anchor.formula.as_deref(), Some("_xlfn.SEQUENCE(3)"));
+        assert_eq!(
+            crate::formula::display_formula(anchor.formula.as_deref().unwrap()),
+            "SEQUENCE(3)"
+        );
         assert_eq!(anchor.spill, Some((3, 1)));
         assert!(anchor.f_attrs.as_deref().unwrap().contains("t=\"array\""));
         assert!(anchor.f_attrs.as_deref().unwrap().contains("ref=\"A1:A3\""));
@@ -9797,7 +9823,7 @@ b",
         let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
         let ws = String::from_utf8_lossy(re.part("xl/worksheets/sheet1.xml").unwrap()).into_owned();
         assert!(
-            ws.contains(r#"<c r="D1" cm="1"><f t="array" ref="D1:D2">SEQUENCE(2)</f>"#),
+            ws.contains(r#"<c r="D1" cm="1"><f t="array" ref="D1:D2">_xlfn.SEQUENCE(2)</f>"#),
             "{ws}"
         );
         assert_eq!(re.part("xl/metadata.xml").unwrap(), &before[..]);
@@ -9825,6 +9851,122 @@ b",
     }
 
     #[test]
+    fn typed_xlookup_saves_with_xlfn_prefix() {
+        // #776: a post-2007 function goes to the file with its prefix, or
+        // Excel shows #NAME?.
+        let (pkg, _) = typed_book(&[((0, 2), "XLOOKUP(2,A1:A3,A1:A3)")]);
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<c r="C1"><f>_xlfn.XLOOKUP(2,A1:A3,A1:A3)</f><v>2</v></c>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn typed_spill_ref_saves_as_anchorarray() {
+        let (pkg, _) = typed_book(&[((0, 2), "SEQUENCE(3)"), ((0, 3), "SUM(C1#)")]);
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<c r="D1"><f>SUM(_xlfn.ANCHORARRAY(C1))</f><v>6</v></c>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn saved_file_formulas_reload_to_the_typed_display_and_value() {
+        // #776 AC7: what the save adds, the load takes away again — the
+        // reloaded formula shows as typed and recalculates to the same value.
+        let srcs = [
+            "LET(x,A1,x+1)",
+            // Row 2: the implicit intersection picks A2.
+            "@A1:A3",
+            "LET(x,A1,x)+LET(x,A2,x*10)",
+            "LAMBDA(a,b,a+b)(A1,A2)",
+            "LET(x,1,LAMBDA(y,x+y)(2))",
+            "LET(f,LAMBDA(x,x*3),f(A2))",
+            "LAMBDA(x,[y],IF(ISOMITTED(y),x,x+y))(A3)",
+            "LAMBDA(x,[y],IF(ISOMITTED(y),x,x+y))(A3,A1)",
+            "SUM(E1#)",
+            "XLOOKUP(2,A1:A3,A1:A3)*1.5",
+            "LET(x,1.23456789E-12,x)*1000",
+        ];
+        let mut typed: Vec<((u32, u32), &str)> = srcs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| ((i as u32, 2), *s))
+            .collect();
+        typed.push(((0, 4), "SEQUENCE(3)"));
+        let (pkg, _) = typed_book(&typed);
+        let before: Vec<CellValue> = (0..srcs.len() as u32)
+            .map(|r| pkg.workbook.sheets[0].cell(r, 2).unwrap().value.clone())
+            .collect();
+        assert!(
+            before.iter().all(|v| matches!(v, CellValue::Number(_))),
+            "{before:?}"
+        );
+
+        let (mut re, _) = resaved(&pkg);
+        for (r, src) in srcs.iter().enumerate() {
+            let cell = re.workbook.sheets[0].cell(r as u32, 2).unwrap();
+            let stored = cell.formula.as_deref().unwrap();
+            assert_ne!(stored, *src, "saved without its file spelling");
+            assert_eq!(crate::formula::display_formula(stored), *src);
+        }
+        // Recalculate from nothing, so no cached value can stand in.
+        for r in 0..srcs.len() as u32 {
+            let mut cell = re.workbook.sheets[0].cell(r, 2).unwrap().clone();
+            cell.value = CellValue::Empty;
+            re.workbook.sheets[0].set_cell(r, 2, cell);
+        }
+        rebuild(&mut re);
+        for (r, src) in srcs.iter().enumerate() {
+            assert_eq!(
+                re.workbook.sheets[0].cell(r as u32, 2).unwrap().value,
+                before[r],
+                "{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn added_cf_and_dv_formulas_save_in_file_spelling() {
+        // #776: rule formulas gridcore writes get their prefixes too.
+        use crate::sheet::Dxf;
+        let mut pkg = new_xlsx();
+        let dxf = Dxf {
+            fill: Some((255, 0, 0)),
+            color: None,
+            bold: None,
+            italic: None,
+        };
+        pkg.add_conditional_format(
+            0,
+            (0, 0, 1, 0),
+            "greaterThan",
+            "XLOOKUP(1,B1:B2,C1:C2)",
+            None,
+            dxf,
+        );
+        pkg.add_data_validation(
+            0,
+            (0, 1, 1, 1),
+            "whole",
+            "between",
+            "1",
+            Some("MAXIFS(C1:C9,B1:B9,1)"),
+        );
+        let ws = saved_sheet1(&pkg);
+        assert!(
+            ws.contains("<formula>_xlfn.XLOOKUP(1,B1:B2,C1:C2)</formula>"),
+            "{ws}"
+        );
+        assert!(
+            ws.contains("<formula1>1</formula1><formula2>_xlfn.MAXIFS(C1:C9,B1:B9,1)</formula2>"),
+            "{ws}"
+        );
+    }
+
+    #[test]
     fn typed_spill_saves_with_cm_and_new_metadata_part() {
         // #724 AC1: no metadata.xml yet — save creates it, with its
         // content-type override and workbook relationship.
@@ -9832,7 +9974,7 @@ b",
         assert!(pkg.part("xl/metadata.xml").is_none());
         let (re, ws) = resaved(&pkg);
         assert!(
-            ws.contains(r#"<c r="C1" cm="1"><f t="array" ref="C1:C3">SEQUENCE(3)</f>"#),
+            ws.contains(r#"<c r="C1" cm="1"><f t="array" ref="C1:C3">_xlfn.SEQUENCE(3)</f>"#),
             "{ws}"
         );
         let meta = part_text(&re, "xl/metadata.xml");
@@ -9888,12 +10030,14 @@ b",
         let (pkg, _) = typed_book(&[((0, 1), "SEQUENCE(1)"), ((0, 2), "FILTER(A1:A3,A1:A3>2)")]);
         let (_, ws) = resaved(&pkg);
         assert!(
-            ws.contains(r#"<c r="B1" cm="1"><f t="array" ref="B1">SEQUENCE(1)</f><v>1</v></c>"#),
+            ws.contains(
+                r#"<c r="B1" cm="1"><f t="array" ref="B1">_xlfn.SEQUENCE(1)</f><v>1</v></c>"#
+            ),
             "{ws}"
         );
         assert!(
             ws.contains(
-                r#"<c r="C1" cm="1"><f t="array" ref="C1">FILTER(A1:A3,A1:A3&gt;2)</f><v>3</v></c>"#
+                r#"<c r="C1" cm="1"><f t="array" ref="C1">_xlfn._xlws.FILTER(A1:A3,A1:A3&gt;2)</f><v>3</v></c>"#
             ),
             "{ws}"
         );
@@ -9913,7 +10057,7 @@ b",
         );
         let (_, ws) = resaved(&pkg);
         assert!(
-            ws.contains(r#"<c r="C1" t="e" cm="1"><f t="array" ref="C1">SEQUENCE(3)</f>"#),
+            ws.contains(r#"<c r="C1" t="e" cm="1"><f t="array" ref="C1">_xlfn.SEQUENCE(3)</f>"#),
             "{ws}"
         );
     }
@@ -9943,7 +10087,11 @@ b",
         let (pkg, _) = typed_book(&typed);
         let (re, ws) = resaved(&pkg);
         for (i, src) in srcs.iter().enumerate() {
-            let f = format!(r#"<c r="C{}"><f>{}</f>"#, i + 1, esc_text(src));
+            let f = format!(
+                r#"<c r="C{}"><f>{}</f>"#,
+                i + 1,
+                esc_text(&file_formula(src))
+            );
             assert!(ws.contains(&f), "{f} in {ws}");
         }
         assert!(!ws.contains("cm="), "{ws}");
@@ -9989,7 +10137,7 @@ b",
         eng.set_cell(&mut pkg.workbook, (0, 0, 3), Cell::formula("SEQUENCE(2)"));
         let (re, ws) = resaved(&pkg);
         assert!(
-            ws.contains(r#"<c r="D1" cm="1"><f t="array" ref="D1:D2">SEQUENCE(2)</f>"#),
+            ws.contains(r#"<c r="D1" cm="1"><f t="array" ref="D1:D2">_xlfn.SEQUENCE(2)</f>"#),
             "{ws}"
         );
         // The rich errors still carry their `vm` and decode.
@@ -10151,7 +10299,7 @@ b",
         let mut eng = crate::engine::Engine::new(&pkg.workbook);
         eng.set_cell(&mut pkg.workbook, (0, 0, 0), Cell::formula("SEQUENCE(1)"));
         let (re, ws) = resaved(&pkg);
-        assert!(ws.contains(r#"<c r="A1"><f>SEQUENCE(1)</f>"#), "{ws}");
+        assert!(ws.contains(r#"<c r="A1"><f>_xlfn.SEQUENCE(1)</f>"#), "{ws}");
         assert_eq!(re.part("xl/metadata.xml").unwrap(), b"<metadata>");
     }
 
@@ -10770,8 +10918,8 @@ b",
     #[test]
     fn insert_row_above_a_loaded_dynamic_array_shifts_its_text_and_ref() {
         // A `cm` array loaded with its `t="array"` `f_attrs` shifts the same
-        // way. Its text is reprinted, which drops the `_xlfn._xlws.` prefix:
-        // the loss every shifted formula already has (a separate follow-up).
+        // way. Its text is reprinted without the `_xlfn._xlws.` prefix, and
+        // the save puts it back (#776).
         let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SORT_ANCHOR))).unwrap();
         rebuild(&mut pkg);
         crate::edit::insert_rows(&mut pkg.workbook, 0, 0, 1);
@@ -10779,7 +10927,7 @@ b",
         let ws = saved_sheet1(&pkg);
         assert!(
             ws.contains(
-                r#"<c r="D2" cm="1"><f t="array" ref="D2:D6">SORT(A2:A6,,-1)</f><v>9</v></c>"#
+                r#"<c r="D2" cm="1"><f t="array" ref="D2:D6">_xlfn._xlws.SORT(A2:A6,,-1)</f><v>9</v></c>"#
             ),
             "{ws}"
         );
@@ -13177,6 +13325,41 @@ mod print_setup_tests {
         // Saved again: already there, so not written twice.
         let (_, again) = saved(&re, "xl/workbook.xml");
         assert_eq!(names_el(&again), names_el(&wb));
+    }
+
+    #[test]
+    fn defined_names_save_in_file_spelling() {
+        // #776: a definition written from the model gets its prefixes; one
+        // loaded in file spelling is left as it was.
+        let names = concat!(
+            r#"<definedName name="Rate">Report!$A$5</definedName>"#,
+            r#"<definedName name="Top">_xlfn.SEQUENCE(2)</definedName>"#,
+        );
+        let mut pkg = report(names, "");
+        pkg.workbook
+            .defined_names
+            .iter_mut()
+            .find(|d| d.name == "Rate")
+            .unwrap()
+            .formula = "LAMBDA(x,x*2)".into();
+        pkg.workbook
+            .defined_names
+            .push(name("Seq", None, "SEQUENCE(3)"));
+        let (_, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(
+            wb.contains(
+                r#"<definedName name="Rate">_xlfn.LAMBDA(_xlpm.x,_xlpm.x*2)</definedName>"#
+            ),
+            "{wb}"
+        );
+        assert!(
+            wb.contains(r#"<definedName name="Top">_xlfn.SEQUENCE(2)</definedName>"#),
+            "{wb}"
+        );
+        assert!(
+            wb.contains(r#"<definedName name="Seq">_xlfn.SEQUENCE(3)</definedName>"#),
+            "{wb}"
+        );
     }
 
     #[test]
