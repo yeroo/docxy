@@ -506,6 +506,10 @@ fn the_rulers_indents_follow_the_open_header() {
     let body = eff_indent(&ed(&t).caret_para_props());
     assert_ne!(header, body);
     assert_eq!(ruler_para_of(&t).0, header);
+    // The drag starts from the same indents.
+    assert_eq!(ruler_drag_indent(&t), Some(header));
+    exit_hf_tab(&mut t);
+    assert_eq!(ruler_drag_indent(&t), Some(body));
 }
 
 /// The KeyTips one tab shows at once: its buttons', not its menus' items.

@@ -13496,11 +13496,8 @@ impl Docxy {
         let Some(g) = self.ruler_probe.borrow().painted.clone() else {
             return;
         };
-        // The indents the ruler draws, and the drag writes: the open header
-        // or footer's paragraph, else the body's.
-        let indent = match self.tabs.get(self.active) {
-            Some(t) if matches!(t.surface, Surface::Doc(_)) => ruler_para_of(t).0,
-            _ => return,
+        let Some(indent) = self.tabs.get(self.active).and_then(ruler_drag_indent) else {
+            return;
         };
         let geom = self
             .tabs
@@ -17091,6 +17088,13 @@ fn page_ranges_of(body: &[Block], geom: &docxcore::model::PageGeom) -> Vec<Vec<(
             .map(|r| vec![r])
             .collect()
     }
+}
+
+/// The indents a ruler drag starts from: the ones the ruler draws, and the
+/// drag writes (the open header or footer's paragraph, else the body's).
+/// `None` off a document.
+fn ruler_drag_indent(tab: &DocTab) -> Option<EffIndent> {
+    matches!(tab.surface, Surface::Doc(_)).then(|| ruler_para_of(tab).0)
 }
 
 /// The indents and tab stops the ruler shows for a tab (see
@@ -21604,17 +21608,15 @@ impl Render for Docxy {
         };
 
         // Word-style counts for the status bar's left cluster: total pages
-        // (estimated by the same paginator Print Layout uses) and word count.
+        // (Print Layout's own pages, columns and section breaks included) and
+        // word count.
         let doc_stats: Option<(usize, usize)> = is_doc
             .then(|| self.tabs.get(self.active))
             .flatten()
             .and_then(|tab| match &tab.surface {
                 Surface::Doc(ed) => {
                     let words = ed.doc.plain_text().split_whitespace().count();
-                    let geom = final_page_geom(tab);
-                    let ch = (geom.h - geom.mt - geom.mb).max(1) as f32 / 15.0;
-                    let cw = (geom.w - geom.ml - geom.mr).max(1) as f32 / 15.0;
-                    let pages = paginate(&ed.doc.body, ch, cw).len().max(1);
+                    let pages = page_ranges(tab).len().max(1);
                     Some((words, pages))
                 }
                 _ => None,
