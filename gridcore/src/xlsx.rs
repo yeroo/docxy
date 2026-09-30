@@ -2694,9 +2694,11 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
             format!("{}{}{}", &source[..start], sheet_data, &source[end..])
         }
         None => {
-            // Degenerate worksheet with no sheetData: put ours before the
-            // closing tag.
-            source.replacen("</worksheet>", &format!("{sheet_data}</worksheet>"), 1)
+            // Degenerate worksheet with no sheetData: put ours at its schema
+            // position.
+            let mut out = source.to_string();
+            out.insert_str(worksheet_insert_pos(source, "sheetData"), sheet_data);
+            out
         }
     };
 
@@ -2739,8 +2741,9 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
                 .or_else(|| out[start..].find("/>").map(|i| start + i + 2))
                 .unwrap_or(start);
             out.replace_range(start..end, &cols_xml);
-        } else if let Some(start) = find_element(&out, "sheetData") {
-            out.insert_str(start, &cols_xml);
+        } else {
+            let pos = worksheet_insert_pos(&out, "cols");
+            out.insert_str(pos, &cols_xml);
         }
     }
 
@@ -2825,44 +2828,193 @@ fn parse_page_breaks(fragment: &str) -> Vec<crate::sheet::PageBreak> {
     out
 }
 
+/// The children of `<worksheet>` in the order ECMA-376 `CT_Worksheet` (a
+/// SEQUENCE) requires them. Excel treats an out-of-order child as damage and
+/// offers to "repair" the file, which drops content.
+const CT_WORKSHEET_ORDER: &[&str] = &[
+    "sheetPr",
+    "dimension",
+    "sheetViews",
+    "sheetFormatPr",
+    "cols",
+    "sheetData",
+    "sheetCalcPr",
+    "sheetProtection",
+    "protectedRanges",
+    "scenarios",
+    "autoFilter",
+    "sortState",
+    "dataConsolidate",
+    "customSheetViews",
+    "mergeCells",
+    "phoneticPr",
+    "conditionalFormatting",
+    "dataValidations",
+    "hyperlinks",
+    "printOptions",
+    "pageMargins",
+    "pageSetup",
+    "headerFooter",
+    "rowBreaks",
+    "colBreaks",
+    "customProperties",
+    "cellWatches",
+    "ignoredErrors",
+    "smartTags",
+    "drawing",
+    "legacyDrawing",
+    "legacyDrawingHF",
+    "drawingHF",
+    "picture",
+    "oleObjects",
+    "controls",
+    "webPublishItems",
+    "tableParts",
+    "extLst",
+];
+
+/// A top-level child of `<worksheet>`: its local name, the name it ranks as
+/// (they differ for `mc:AlternateContent`), and its byte span.
+struct WorksheetChild<'a> {
+    local: &'a str,
+    rank_as: &'a str,
+    start: usize,
+    end: usize,
+}
+
+/// The top-level children of a worksheet, and where `</worksheet>` starts.
+/// Only depth-1 elements count (the `<autoFilter>` inside a
+/// `<customSheetView>` is not one), compared by local name so `x:mergeCells`
+/// is `mergeCells`. A top-level `mc:AlternateContent` ranks as the first
+/// element in its first `Choice`/`Fallback`: Excel wraps `controls`,
+/// `oleObjects` and `legacyDrawing` that way. The walk stops at a truncated
+/// child.
+fn worksheet_children(xml: &str) -> (Vec<WorksheetChild<'_>>, Option<usize>) {
+    let mut children = Vec::new();
+    let mut p = XmlParser::new(xml);
+    // Skip to the root's start tag.
+    loop {
+        match p.next() {
+            Event::Start => break,
+            Event::Eof => return (children, None),
+            _ => {}
+        }
+    }
+    // Offset of `p`'s input within `xml`: the walk restarts past sheetData.
+    let mut base = 0;
+    loop {
+        match p.next() {
+            Event::Start => {
+                let start = base + p.start_pos();
+                let qname = p.name();
+                let name = local(qname);
+                let self_closing = xml[..base + p.pos()].ends_with("/>");
+                let end = if name == "sheetData" && !self_closing {
+                    // The bulk of the part: jump to its end tag rather than
+                    // tokenise every cell (the writer calls this per save).
+                    let close = format!("</{qname}>");
+                    let Some(i) = xml[base + p.pos()..].find(&close) else {
+                        break;
+                    };
+                    let end = base + p.pos() + i + close.len();
+                    base = end;
+                    p = XmlParser::new(&xml[end..]);
+                    end
+                } else {
+                    if !p.skip_element_complete() {
+                        break;
+                    }
+                    base + p.pos()
+                };
+                let rank_as = match name {
+                    "AlternateContent" => alternate_content_rank(&xml[start..end]).unwrap_or(name),
+                    _ => name,
+                };
+                children.push(WorksheetChild {
+                    local: name,
+                    rank_as,
+                    start,
+                    end,
+                });
+            }
+            // `</worksheet>`: the end tag just consumed.
+            Event::End => return (children, xml[..base + p.pos()].rfind("</")),
+            Event::Eof => break,
+            Event::Text => {}
+        }
+    }
+    (children, None)
+}
+
+/// The local name of the first element inside the first `Choice` or
+/// `Fallback` of an `mc:AlternateContent` fragment.
+fn alternate_content_rank(fragment: &str) -> Option<&str> {
+    let mut p = XmlParser::new(fragment);
+    let mut in_branch = false;
+    loop {
+        match p.next() {
+            Event::Start if in_branch => return Some(local(p.name())),
+            Event::Start if matches!(local(p.name()), "Choice" | "Fallback") => in_branch = true,
+            Event::End if in_branch => return None,
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
+}
+
+fn ct_worksheet_rank(name: &str) -> Option<usize> {
+    CT_WORKSHEET_ORDER.iter().position(|n| *n == name)
+}
+
+/// Byte offset at which a new top-level `<tag>` belongs: before the first
+/// existing top-level child that ranks after `tag`, else before
+/// `</worksheet>`. Children the schema doesn't name are not anchors.
+pub(crate) fn worksheet_insert_pos(xml: &str, tag: &str) -> usize {
+    let rank = ct_worksheet_rank(tag).unwrap_or(CT_WORKSHEET_ORDER.len());
+    let (children, close) = worksheet_children(xml);
+    children
+        .iter()
+        .find(|c| ct_worksheet_rank(c.rank_as).is_some_and(|r| r > rank))
+        .map(|c| c.start)
+        .or(close)
+        .or_else(|| xml.rfind("</"))
+        .unwrap_or(xml.len())
+}
+
+/// The span of the first top-level `<tag>` (in any prefix), if there is one.
+fn worksheet_child_span(xml: &str, tag: &str) -> Option<(usize, usize)> {
+    worksheet_children(xml)
+        .0
+        .iter()
+        .find(|c| c.local == tag)
+        .map(|c| (c.start, c.end))
+}
+
+/// `xml` with its top-level `<tag>` (if any) removed.
+fn remove_worksheet_child(xml: &str, tag: &str) -> String {
+    match worksheet_child_span(xml, tag) {
+        Some((s, e)) => format!("{}{}", &xml[..s], &xml[e..]),
+        None => xml.to_string(),
+    }
+}
+
 /// Sync the `<sheetProtection>` element from the model: drop any existing one,
-/// then re-insert right after `</sheetData>` when the sheet is protected.
+/// then re-insert at its schema position when the sheet is protected.
 /// Idempotent.
 fn set_sheet_protection(xml: &str, attrs: Option<&str>) -> String {
-    // Drop any existing self-closing <sheetProtection .../> first.
-    let mut out = if let Some(s) = xml.find("<sheetProtection") {
-        let e = xml[s..].find("/>").map(|i| s + i + 2).unwrap_or(s);
-        format!("{}{}", &xml[..s], &xml[e..])
-    } else {
-        xml.to_string()
-    };
+    let mut out = remove_worksheet_child(xml, "sheetProtection");
     if let Some(attrs) = attrs {
         let block = format!("<sheetProtection {attrs}/>");
-        let pos = out
-            .find("</sheetData>")
-            .map(|i| i + "</sheetData>".len())
-            .or_else(|| out.find("</worksheet>"))
-            .unwrap_or(out.len());
+        let pos = worksheet_insert_pos(&out, "sheetProtection");
         out.insert_str(pos, &block);
     }
     out
 }
 
 /// Rewrite the `<mergeCells>` block from the model's merged regions (removing it
-/// when there are none). Placed right after `</sheetData>` (schema order).
-/// Idempotent.
+/// when there are none), at its schema position. Idempotent.
 fn set_merge_cells(xml: &str, merges: &[(u32, u32, u32, u32)]) -> String {
-    // Drop any existing <mergeCells>…</mergeCells> (or self-closing) first.
-    let mut out = if let Some(s) = xml.find("<mergeCells") {
-        let e = xml[s..]
-            .find("</mergeCells>")
-            .map(|i| s + i + "</mergeCells>".len())
-            .or_else(|| xml[s..].find("/>").map(|i| s + i + 2))
-            .unwrap_or(s);
-        format!("{}{}", &xml[..s], &xml[e..])
-    } else {
-        xml.to_string()
-    };
+    let mut out = remove_worksheet_child(xml, "mergeCells");
     if merges.is_empty() {
         return out;
     }
@@ -2880,12 +3032,8 @@ fn set_merge_cells(xml: &str, merges: &[(u32, u32, u32, u32)]) -> String {
         "<mergeCells count=\"{}\">{cells}</mergeCells>",
         merges.len()
     );
-    // After </sheetData>, else before </worksheet>.
-    if let Some(pos) = out.find("</sheetData>").map(|i| i + "</sheetData>".len()) {
-        out.insert_str(pos, &block);
-    } else {
-        out = out.replacen("</worksheet>", &format!("{block}</worksheet>"), 1);
-    }
+    let pos = worksheet_insert_pos(&out, "mergeCells");
+    out.insert_str(pos, &block);
     out
 }
 
@@ -2985,24 +3133,12 @@ fn set_freeze_pane(xml: &str, freeze: (u32, u32)) -> String {
             return out;
         }
     }
-    // No <sheetView>: insert a full block after <dimension …>, else after the
-    // <worksheet …> opening tag (both keep the schema's element order).
+    // No <sheetView>: insert a full block at its schema position (after
+    // sheetPr and dimension).
     let block =
         format!("<sheetViews><sheetView workbookViewId=\"0\">{pane}</sheetView></sheetViews>");
-    let anchor = find_element(&out, "dimension")
-        .and_then(|d| {
-            out[d..]
-                .find("/>")
-                .map(|i| d + i + 2)
-                .or_else(|| out[d..].find('>').map(|i| d + i + 1))
-        })
-        .or_else(|| {
-            out.find("<worksheet")
-                .and_then(|w| out[w..].find('>').map(|i| w + i + 1))
-        });
-    if let Some(pos) = anchor {
-        out.insert_str(pos, &block);
-    }
+    let pos = worksheet_insert_pos(&out, "sheetViews");
+    out.insert_str(pos, &block);
     out
 }
 
@@ -3892,8 +4028,8 @@ impl SheetPackage {
             .max()
             .unwrap_or(0)
             + 1;
-        // Worksheet: inject <conditionalFormatting> after </sheetData> (mergeCells,
-        // if any, is spliced in ahead of it at save time, keeping schema order).
+        // Worksheet: inject <conditionalFormatting> at its schema position,
+        // after any existing ones.
         let (r1, c1, r2, c2) = range;
         let sqref = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
         let mut fmls = format!("<formula>{}</formula>", esc_text(formula1));
@@ -3906,11 +4042,8 @@ impl SheetPackage {
         let sheet_part = self.sheet_parts[sheet].clone();
         if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
             let mut xml = String::from_utf8_lossy(&p.1).into_owned();
-            if let Some(pos) = xml.find("</sheetData>").map(|i| i + "</sheetData>".len()) {
-                xml.insert_str(pos, &cf_xml);
-            } else {
-                xml = xml.replacen("</worksheet>", &format!("{cf_xml}</worksheet>"), 1);
-            }
+            let pos = worksheet_insert_pos(&xml, "conditionalFormatting");
+            xml.insert_str(pos, &cf_xml);
             p.1 = xml.into_bytes();
         }
         // Model.
@@ -3982,16 +4115,8 @@ impl SheetPackage {
                 }
             } else {
                 let block = format!("<dataValidations count=\"1\">{dv_xml}</dataValidations>");
-                // dataValidations follows sheetData/mergeCells/conditionalFormatting;
-                // insert before the first following element (hyperlinks/pageMargins/…).
-                let anchor = ["<hyperlinks", "<pageMargins", "<drawing", "<legacyDrawing"]
-                    .iter()
-                    .filter_map(|t| xml.find(t))
-                    .min()
-                    .or_else(|| xml.find("</worksheet>"));
-                if let Some(pos) = anchor {
-                    xml.insert_str(pos, &block)
-                }
+                let pos = worksheet_insert_pos(&xml, "dataValidations");
+                xml.insert_str(pos, &block);
             }
             p.1 = xml.into_bytes();
         }
@@ -4112,9 +4237,7 @@ impl SheetPackage {
                     }
                 } else {
                     let block = format!("<tableParts count=\"1\">{entry}</tableParts>");
-                    let pos = xml
-                        .find("<extLst")
-                        .unwrap_or_else(|| xml.find("</worksheet>").unwrap_or(xml.len()));
+                    let pos = worksheet_insert_pos(&xml, "tableParts");
                     xml.insert_str(pos, &block);
                 }
                 p.1 = xml.into_bytes();
@@ -4361,22 +4484,7 @@ impl SheetPackage {
                     // puts it after any of those, and Excel treats an
                     // out-of-order child as unreadable content — it "repairs"
                     // the file by dropping the drawing or the table.
-                    let pos = [
-                        "<legacyDrawingHF",
-                        "<legacyDrawing",
-                        "<drawingHF",
-                        "<picture",
-                        "<oleObjects",
-                        "<controls",
-                        "<webPublishItems",
-                        "<tableParts",
-                        "<extLst",
-                        "</worksheet>",
-                    ]
-                    .iter()
-                    .filter_map(|t| xml.find(t))
-                    .min()
-                    .unwrap_or(xml.len());
+                    let pos = worksheet_insert_pos(&xml, "drawing");
                     xml.insert_str(pos, &format!("<drawing r:id=\"{rid}\"/>"));
                 } else if host.is_none() {
                     // The worksheet names a drawing the LOADER rejected — a rel
@@ -9881,5 +9989,289 @@ mod print_setup_tests {
         );
         let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
         assert!(ws.contains(r#"<brk id="14" max="16383" man="1"/>"#), "{ws}");
+    }
+}
+
+/// #597: every worksheet child the writer regenerates or inserts lands at its
+/// `CT_Worksheet` position.
+#[cfg(test)]
+mod ct_worksheet_order_tests {
+    use super::*;
+    use crate::sheet::Cell;
+
+    const NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const SHEET: &str = "xl/worksheets/sheet1.xml";
+    const ROWS: &str = r#"<sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>1</v></c></row><row r="2"><c r="A2"><v>2</v></c><c r="B2"><v>2</v></c></row></sheetData>"#;
+    const MARGINS: &str = r#"<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>"#;
+
+    /// A loaded workbook whose one worksheet is `<worksheet …>{body}</worksheet>`.
+    fn loaded(body: &str) -> SheetPackage {
+        let mut pkg = new_xlsx();
+        pkg.set_part(
+            SHEET,
+            format!(
+                r#"<?xml version="1.0"?><worksheet xmlns="{NS}" xmlns:r="{R}">{body}</worksheet>"#
+            )
+            .into_bytes(),
+        );
+        load_xlsx(&write_zip(&pkg.parts)).expect("load")
+    }
+
+    /// The worksheet as the next open sees it.
+    fn saved_sheet(pkg: &SheetPackage) -> String {
+        let re = load_xlsx(&save_xlsx(pkg)).expect("reload");
+        String::from_utf8(re.part(SHEET).unwrap().to_vec()).unwrap()
+    }
+
+    /// Every top-level child the schema names comes in `CT_Worksheet` order.
+    fn in_ct_worksheet_order(xml: &str) -> Result<(), String> {
+        let ranked: Vec<(&str, usize)> = worksheet_children(xml)
+            .0
+            .iter()
+            .filter_map(|c| ct_worksheet_rank(c.rank_as).map(|r| (c.rank_as, r)))
+            .collect();
+        match ranked.windows(2).find(|w| w[0].1 > w[1].1) {
+            Some(w) => Err(format!("<{}> follows <{}>", w[1].0, w[0].0)),
+            None => Ok(()),
+        }
+    }
+
+    fn assert_ct_worksheet_order(xml: &str) {
+        if let Err(e) = in_ct_worksheet_order(xml) {
+            panic!("{e}: {xml}");
+        }
+    }
+
+    fn at(xml: &str, needle: &str) -> usize {
+        xml.find(needle)
+            .unwrap_or_else(|| panic!("{needle} missing: {xml}"))
+    }
+
+    #[test]
+    fn a_plain_save_keeps_auto_filter_before_merge_cells() {
+        // The #597 repro, as openpyxl writes it.
+        let pkg = loaded(&format!(
+            r#"<dimension ref="A1:B2"/>{ROWS}<autoFilter ref="A1:B10"/><mergeCells count="1"><mergeCell ref="D1:E1"/></mergeCells>{MARGINS}"#
+        ));
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert!(at(&ws, "<autoFilter") < at(&ws, "<mergeCells"), "{ws}");
+        assert!(ws.contains(r#"<mergeCell ref="D1:E1"/>"#), "{ws}");
+    }
+
+    #[test]
+    fn merge_cells_follow_sort_state_consolidation_and_custom_views() {
+        // The custom view carries its own <autoFilter>; only the top-level
+        // children rank.
+        let mut pkg = loaded(&format!(
+            r#"{ROWS}<autoFilter ref="A1:B2"/><sortState ref="A2:B2"><sortCondition ref="A2:A2"/></sortState><dataConsolidate><dataRefs count="1"><dataRef ref="A1:B2"/></dataRefs></dataConsolidate><customSheetViews><customSheetView guid="{{00000000-0000-0000-0000-000000000001}}">{MARGINS}<autoFilter ref="A1:B2"/></customSheetView></customSheetViews>{MARGINS}"#
+        ));
+        pkg.workbook.sheets[0].merges.push((3, 0, 3, 1));
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert!(
+            at(&ws, "</customSheetViews>") < at(&ws, "<mergeCells"),
+            "{ws}"
+        );
+        assert!(
+            at(&ws, "<mergeCells") < ws.rfind("<pageMargins").unwrap(),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn sheet_protection_lands_after_sheet_calc_pr_and_before_protected_ranges() {
+        let mut pkg = loaded(&format!(
+            r#"{ROWS}<sheetCalcPr fullCalcOnLoad="1"/><protectedRanges><protectedRange sqref="A1" name="r"/></protectedRanges><autoFilter ref="A1:B2"/>"#
+        ));
+        pkg.workbook.sheets[0].set_protected(true);
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert!(
+            at(&ws, "<sheetCalcPr") < at(&ws, "<sheetProtection"),
+            "{ws}"
+        );
+        assert!(
+            at(&ws, "<sheetProtection") < at(&ws, "<protectedRanges"),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn a_new_conditional_format_follows_auto_filter_and_merges() {
+        let mut pkg = loaded(&format!(
+            r#"{ROWS}<autoFilter ref="A1:B2"/><mergeCells count="1"><mergeCell ref="D1:E1"/></mergeCells>{MARGINS}"#
+        ));
+        let dxf = crate::sheet::Dxf {
+            bold: Some(true),
+            ..Default::default()
+        };
+        pkg.add_conditional_format(0, (0, 0, 1, 0), "greaterThan", "1", None, dxf.clone());
+        pkg.add_conditional_format(0, (0, 1, 1, 1), "lessThan", "2", None, dxf);
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert!(
+            at(&ws, "</mergeCells>") < at(&ws, "<conditionalFormatting"),
+            "{ws}"
+        );
+        // The second one is appended after the first.
+        assert!(
+            at(&ws, r#"sqref="A1:A2""#) < at(&ws, r#"sqref="B1:B2""#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn a_new_data_validation_block_precedes_print_options() {
+        let mut pkg = loaded(&format!(r#"{ROWS}<printOptions gridLines="1"/>{MARGINS}"#));
+        pkg.add_data_validation(0, (0, 0, 1, 0), "whole", "between", "1", Some("9"));
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert!(
+            at(&ws, "<dataValidations") < at(&ws, "<printOptions"),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn table_parts_skip_an_ext_lst_nested_in_a_cf_rule() {
+        let mut pkg = loaded(&format!(
+            r#"{ROWS}<conditionalFormatting sqref="A1:A2"><cfRule type="dataBar" priority="1"><dataBar><cfvo type="min"/><cfvo type="max"/><color rgb="FF638EC6"/></dataBar><extLst><ext uri="{{B025F937-C7B1-47D3-B67F-A62EFF666E3E}}"/></extLst></cfRule></conditionalFormatting>{MARGINS}<extLst><ext uri="{{78C0D931-6437-407d-A8EE-F0AAD7539E65}}"/></extLst>"#
+        ));
+        pkg.add_table(0, (0, 0, 1, 1), true, "TableStyleMedium2")
+            .expect("table added");
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        let tp = at(&ws, "<tableParts");
+        assert!(at(&ws, "</conditionalFormatting>") < tp, "{ws}");
+        assert!(tp < ws.rfind("<extLst").unwrap(), "{ws}");
+    }
+
+    fn column_chart() -> crate::sheet::ChartData {
+        crate::sheet::ChartData {
+            kind: "column".into(),
+            categories: vec!["a".into()],
+            series: vec![crate::sheet::ChartSeries {
+                name: "s".into(),
+                values: vec![1.0],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_new_drawing_precedes_controls_wrapped_in_alternate_content() {
+        let mc = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+        let mut pkg = loaded(&format!(
+            r#"{ROWS}{MARGINS}<mc:AlternateContent xmlns:mc="{mc}"><mc:Choice Requires="x14"><controls><control shapeId="1025" r:id="rId9" name="Button 1"/></controls></mc:Choice></mc:AlternateContent>"#
+        ));
+        pkg.add_chart(0, (0, 3), (10, 8), &column_chart());
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert!(
+            at(&ws, "<drawing ") < at(&ws, "<mc:AlternateContent"),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn new_sheet_views_follow_sheet_pr_when_there_is_no_dimension() {
+        let mut pkg = loaded(&format!(
+            r#"<sheetPr><tabColor rgb="FFFF0000"/></sheetPr>{ROWS}"#
+        ));
+        pkg.workbook.sheets[0].freeze = (1, 0);
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert!(at(&ws, "</sheetPr>") < at(&ws, "<sheetViews>"), "{ws}");
+        assert!(ws.contains(r#"state="frozen""#), "{ws}");
+    }
+
+    #[test]
+    fn a_prefixed_merge_cells_block_is_replaced_not_duplicated() {
+        let mut pkg = new_xlsx();
+        pkg.set_part(
+            SHEET,
+            format!(
+                r#"<?xml version="1.0"?><x:worksheet xmlns="{NS}" xmlns:x="{NS}"><x:sheetData><x:row r="1"><x:c r="A1"><x:v>1</x:v></x:c></x:row></x:sheetData><x:mergeCells count="1"><x:mergeCell ref="D1:E1"/></x:mergeCells><x:pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/></x:worksheet>"#
+            )
+            .into_bytes(),
+        );
+        let pkg = load_xlsx(&write_zip(&pkg.parts)).expect("load");
+        assert_eq!(pkg.workbook.sheets[0].merges.len(), 1);
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert_eq!(ws.matches("mergeCells count=").count(), 1, "{ws}");
+        assert_eq!(ws.matches("D1:E1").count(), 1, "{ws}");
+    }
+
+    #[test]
+    fn a_missing_sheet_data_is_added_before_page_margins() {
+        let mut pkg = loaded(MARGINS);
+        pkg.workbook.sheets[0].set_cell(0, 0, Cell::number(7.0));
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert!(at(&ws, "<sheetData") < at(&ws, "<pageMargins"), "{ws}");
+    }
+
+    #[test]
+    fn a_new_legacy_drawing_precedes_table_parts() {
+        let mut pkg = loaded(ROWS);
+        pkg.add_table(0, (0, 0, 1, 1), true, "TableStyleMedium2")
+            .expect("table added");
+        pkg.set_comment(0, 0, 0, "A", "note");
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert!(at(&ws, "<legacyDrawing") < at(&ws, "<tableParts"), "{ws}");
+    }
+
+    #[test]
+    fn the_insert_position_ignores_nested_and_unknown_children() {
+        let xml = format!(
+            r#"<worksheet xmlns="{NS}"><sheetData/><customSheetViews><customSheetView guid="g"><autoFilter ref="A1"/></customSheetView></customSheetViews><foo/><pageMargins/></worksheet>"#
+        );
+        // autoFilter ranks before customSheetViews: it goes ahead of them,
+        // not next to the nested one.
+        assert_eq!(
+            worksheet_insert_pos(&xml, "autoFilter"),
+            at(&xml, "<customSheetViews")
+        );
+        assert_eq!(
+            worksheet_insert_pos(&xml, "mergeCells"),
+            at(&xml, "<pageMargins")
+        );
+        assert_eq!(
+            worksheet_insert_pos(&xml, "extLst"),
+            at(&xml, "</worksheet>")
+        );
+    }
+
+    /// A ratchet, not the #597 test: no corpus sheet that was in schema order
+    /// comes out of a load and save out of order.
+    #[test]
+    fn corpus_sheets_in_schema_order_stay_in_order() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../corpus/xlsx");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(dir).expect("corpus/xlsx exists") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("xlsx") {
+                continue;
+            }
+            let pkg = load_xlsx(&std::fs::read(&path).unwrap()).expect("corpus loads");
+            let re = load_xlsx(&save_xlsx(&pkg)).expect("corpus reloads");
+            for name in &pkg.sheet_parts {
+                let before = String::from_utf8_lossy(pkg.part(name).unwrap()).into_owned();
+                if in_ct_worksheet_order(&before).is_err() {
+                    continue;
+                }
+                let after = String::from_utf8_lossy(re.part(name).unwrap()).into_owned();
+                if let Err(e) = in_ct_worksheet_order(&after) {
+                    panic!("{}: {name}: {e}", path.display());
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no corpus sheets checked");
     }
 }

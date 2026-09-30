@@ -10,7 +10,7 @@
 use crate::sheet::{cell_name, parse_col};
 use crate::xlsx::{
     SheetPackage, add_content_type_override, add_rel, add_workbook_rel, parse_rels,
-    resolve_relative,
+    resolve_relative, worksheet_insert_pos,
 };
 
 const SS_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
@@ -780,23 +780,7 @@ impl SheetPackage {
             }
         }
         let tag = format!("<legacyDrawing r:id=\"{rid}\"/>");
-        // legacyDrawing must precede these trailing elements if present.
-        const AFTER: &[&str] = &[
-            "<legacyDrawingHF",
-            "<drawingHF",
-            "<picture",
-            "<oleObjects",
-            "<controls",
-            "<webPublishItems",
-            "<tableParts",
-            "<extLst",
-        ];
-        let insert_at = AFTER
-            .iter()
-            .filter_map(|t| xml.find(t))
-            .min()
-            .or_else(|| xml.rfind("</worksheet>"))
-            .unwrap_or(xml.len());
+        let insert_at = worksheet_insert_pos(&xml, "legacyDrawing");
         xml.insert_str(insert_at, &tag);
         self.set_part(ws_part, xml.into_bytes());
     }
