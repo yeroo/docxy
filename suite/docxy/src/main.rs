@@ -4047,6 +4047,73 @@ fn grid_cell_text(
     }
 }
 
+/// One line of an edit buffer: its runs (char offset in the whole buffer,
+/// text, reference colour) as [`edit_runs`] gives them.
+type EditLine = Vec<(usize, String, Option<usize>)>;
+
+/// [`edit_runs`] split into the buffer's lines at each line feed (Alt+Enter,
+/// #662), the line feeds themselves dropped, each line paired with whether
+/// the caret is on it. A caret right after a line feed is on the next line.
+/// Every line is present, an empty one as no runs, so the editor is as many
+/// lines tall as the text.
+fn edit_lines(buf: &str, caret_chars: usize) -> Vec<(EditLine, bool)> {
+    let caret = caret_chars.min(buf.chars().count());
+    let caret_line = buf.chars().take(caret).filter(|&ch| ch == '\n').count();
+    let mut lines: Vec<EditLine> = vec![Vec::new()];
+    for (off, s, ci) in edit_runs(buf, caret) {
+        let mut at = off;
+        for (i, piece) in s.split('\n').enumerate() {
+            if i > 0 {
+                at += 1; // the line feed
+                lines.push(Vec::new());
+            }
+            if !piece.is_empty() {
+                if let Some(line) = lines.last_mut() {
+                    line.push((at, piece.to_string(), ci));
+                }
+            }
+            at += piece.chars().count();
+        }
+    }
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, runs)| (runs, i == caret_line))
+        .collect()
+}
+
+/// The in-cell editor: one row per line of the buffer ([`edit_lines`]),
+/// the caret bar on its line, references coloured as in the formula bar.
+fn edit_caret_lines(text: &str, caret: usize, color: Hsla, caret_color: Hsla) -> AnyElement {
+    let cc = caret.min(text.chars().count());
+    let mut col = v_flex().items_start();
+    for (runs, has_caret) in edit_lines(text, cc) {
+        let bar = || div().w(px(1.5)).h(px(13.)).bg(caret_color).flex_none();
+        // Each line is at least a line tall, so an empty one still shows.
+        let mut row = h_flex().items_center().min_h(px(16.));
+        let mut placed = !has_caret;
+        for (off, s, ci) in runs {
+            if off == cc && !placed {
+                row = row.child(bar());
+                placed = true;
+            }
+            let c = ci.map(|i| hsla_u(ref_color(i))).unwrap_or(color);
+            row = row.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(c)
+                    .whitespace_nowrap()
+                    .child(SharedString::from(s)),
+            );
+        }
+        if !placed {
+            row = row.child(bar());
+        }
+        col = col.child(row);
+    }
+    col.into_any_element()
+}
+
 /// Render an in-progress edit buffer with a blinking-style caret bar at `caret`
 /// (a char index), each reference the formula mentions in its own colour.
 /// Shared by the in-cell editor and the formula bar.
@@ -4102,6 +4169,9 @@ fn fx_segment(s: String, base_off: usize, color: Option<u32>, ent: Entity<Docxy>
         .into_any_element()
 }
 
+/// How the one-line formula bar shows a cell's line feed.
+const LINE_FEED_GLYPH: &str = "\u{21b5}";
+
 /// The formula bar's editing content: one click-to-caret segment per run of
 /// `edit_runs` — so each reference is drawn in its grid colour — with the caret
 /// bar sitting between the runs it splits.
@@ -4115,6 +4185,10 @@ fn fx_edit_row(text: &str, caret: usize, ent: &Entity<Docxy>) -> AnyElement {
             row = row.child(bar());
             placed = true;
         }
+        // A line feed (Alt+Enter) shows as a return arrow: the bar is one
+        // line tall, and the arrow is one char as the feed is, so a click
+        // still maps to the right caret offset.
+        let s = s.replace('\n', LINE_FEED_GLYPH);
         row = row.child(fx_segment(s, off, ci.map(ref_color), ent.clone()));
     }
     if !placed {
@@ -23272,9 +23346,34 @@ fn sheet_row(
                 d.bg(Hsla { a: 0.38, ..brand })
             })
             .when(ring, |d| d.border_2().border_color(brand));
-        if cell_editing {
+        let edit_buf = editing.clone().unwrap_or_default();
+        if cell_editing && edit_buf.contains('\n') {
+            // Alt+Enter line breaks: the editor grows down over the cells
+            // below rather than resizing the row, so every fixed-height row
+            // helper (chart spans, row shifts…) keeps its geometry. `deferred`
+            // paints it after the later rows, which would otherwise cover it,
+            // and out of reach of this cell's overflow clip.
+            cell = cell.relative().child(deferred(
+                div()
+                    .absolute()
+                    .left(px(-1.))
+                    .top(px(-1.))
+                    .min_w(px(cell_w + 1.))
+                    .px(px(4.))
+                    .py(px(2.))
+                    .bg(hsla_u(0xffffff))
+                    .border_2()
+                    .border_color(brand)
+                    .child(edit_caret_lines(
+                        &edit_buf,
+                        view.edit_caret,
+                        hsla_u(0x1a1a1a),
+                        brand,
+                    )),
+            ));
+        } else if cell_editing {
             cell = cell.justify_start().child(edit_caret_row(
-                &editing.clone().unwrap_or_default(),
+                &edit_buf,
                 view.edit_caret,
                 hsla_u(0x1a1a1a),
                 brand,
@@ -24808,7 +24907,8 @@ fn sheet_el(
             }
             _ => view.cell_text(sr, sc),
         }
-    };
+    }
+    .replace('\n', LINE_FEED_GLYPH);
     let bar = h_flex()
         .w_full()
         .h(px(26.))

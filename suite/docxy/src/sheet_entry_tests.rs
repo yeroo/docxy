@@ -207,13 +207,60 @@ fn a_grid_clip_pastes_the_same_cells_between_text_and_general() {
     };
     put(&mut v, 0, 0, q007.clone());
     put(&mut v, 0, 1, tabc.clone());
-    put(&mut v, 2, 0, Cell { style: text_fmt, ..Cell::default() });
+    put(
+        &mut v,
+        2,
+        0,
+        Cell {
+            style: text_fmt,
+            ..Cell::default()
+        },
+    );
     put(&mut v, 2, 1, Cell::text("x"));
     let block = vec![vec![q007.clone(), tabc.clone()]];
     let s = v.active;
     paste_grid_block(&mut v.engine, &mut v.pkg.workbook, s, (2, 0), &block);
     assert_eq!(v.sheet().cell(2, 0), Some(&q007));
     assert_eq!(v.sheet().cell(2, 1), Some(&tabc));
+}
+
+#[test]
+fn the_editor_shows_one_line_per_line_feed_with_the_caret_on_its_line() {
+    let text = |line: &EditLine| line.iter().map(|(_, s, _)| s.as_str()).collect::<String>();
+    let offs = |line: &EditLine| line.iter().map(|(o, _, _)| *o).collect::<Vec<_>>();
+    // "ab\ncd": the caret (after `c`, char 4) is on the second line.
+    let lines = edit_lines("ab\ncd", 4);
+    assert_eq!(lines.len(), 2);
+    assert_eq!(text(&lines[0].0), "ab");
+    assert_eq!(text(&lines[1].0), "cd");
+    assert_eq!((lines[0].1, lines[1].1), (false, true));
+    // Offsets are into the whole buffer, split at the caret too.
+    assert_eq!(offs(&lines[1].0), vec![3, 4]);
+    // A caret right after a line feed is on the next line; right before it,
+    // on the line it ends.
+    assert!(edit_lines("ab\ncd", 3)[1].1);
+    assert!(edit_lines("ab\ncd", 2)[0].1);
+    // Empty lines are kept: a trailing Alt+Enter opens a line to type on.
+    let lines = edit_lines("a\n\n", 4);
+    assert_eq!(lines.len(), 3);
+    assert!(lines[1].0.is_empty() && lines[2].0.is_empty());
+    assert!(lines[2].1);
+    // One line without a feed; a formula keeps its reference colours.
+    let lines = edit_lines("=A1+\nB2", 0);
+    assert_eq!(lines.len(), 2);
+    assert!(
+        lines[0]
+            .0
+            .iter()
+            .any(|(_, s, ci)| s == "A1" && ci.is_some())
+    );
+    assert!(
+        lines[1]
+            .0
+            .iter()
+            .any(|(_, s, ci)| s == "B2" && ci.is_some())
+    );
+    assert_eq!(edit_lines("abc", 1).len(), 1);
 }
 
 #[test]
