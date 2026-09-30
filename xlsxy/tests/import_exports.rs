@@ -119,6 +119,49 @@ fn recalc_of_a_template_to_xlsx_writes_a_workbook() {
     assert!(!ct.contains("template"), "{ct}");
 }
 
+/// #727: `xlsxy in.xlsm --recalc out.xlsx` drops Excel 4.0 macro sheets,
+/// saying so; `--recalc out.xlsm` keeps them.
+#[test]
+fn recalc_of_a_workbook_with_macro_sheets_to_xlsx_drops_them() {
+    use gridcore::xlsx::{SpreadsheetKind, load_xlsx, new_xlsx, save_xlsx, save_xlsx_as};
+    let dir = Dir::new("xlm-to-xlsx");
+    let mut pkg = load_xlsx(&save_xlsx_as(&new_xlsx(), SpreadsheetKind::MacroWorkbook)).unwrap();
+    pkg.add_sheet("Macro1");
+    let rels = String::from_utf8_lossy(pkg.part("xl/_rels/workbook.xml.rels").unwrap())
+        .replace(
+            r#"relationships/worksheet" Target="worksheets/sheet2.xml""#,
+            r#"relationships/xlMacrosheet" Target="worksheets/sheet2.xml""#,
+        )
+        .replace(
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/xlMacrosheet",
+            "http://schemas.microsoft.com/office/2006/relationships/xlMacrosheet",
+        );
+    pkg.set_part("xl/_rels/workbook.xml.rels", rels.into_bytes());
+    assert!(pkg.has_macro_sheets());
+    let source = dir.0.join("in.xlsm");
+    std::fs::write(&source, save_xlsx(&pkg)).unwrap();
+
+    let out = dir.0.join("out.xlsx");
+    let result = run(&source, "--recalc", &out);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("note: Excel 4.0 macro sheets not saved in macro-free .xlsx workbook"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("VB project"), "{stderr}");
+    let saved = load_xlsx(&std::fs::read(&out).unwrap()).unwrap();
+    assert!(!saved.has_macro_sheets());
+    assert_eq!(saved.workbook.sheets.len(), 1);
+
+    let kept = dir.0.join("kept.xlsm");
+    let result = run(&source, "--recalc", &kept);
+    assert!(result.status.success());
+    assert!(!String::from_utf8_lossy(&result.stderr).contains("note:"));
+    let saved = load_xlsx(&std::fs::read(&kept).unwrap()).unwrap();
+    assert!(saved.has_macro_sheets());
+}
+
 /// #601: `xlsxy in.xlsm --recalc out.xlsx` drops the VBA project (saying so)
 /// and the macro type; `--recalc out.xlsm` keeps both.
 #[test]

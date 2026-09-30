@@ -2088,9 +2088,20 @@ pub fn save_xlsx(pkg: &SheetPackage) -> Vec<u8> {
 
 /// Serialize the package as `kind`: the workbook part's content type follows
 /// the target file type, and a macro-free target (`.xlsx`, `.xltx`) loses the
-/// VBA project. Excel refuses an `.xlsx` that says it is a template or
-/// carries macros. `pkg` itself is untouched.
+/// VBA project, the Excel 4.0 macro sheets and dialog sheets, and the Excel
+/// 4.0 names ([`SheetPackage::remove_macro_sheets`]). Excel refuses an
+/// `.xlsx` that says it is a template or carries macros. `pkg` itself is
+/// untouched.
 pub fn save_xlsx_as(pkg: &SheetPackage, kind: SpreadsheetKind) -> Vec<u8> {
+    let without_macro_sheets;
+    let pkg = if !kind.allows_macros() && pkg.has_macro_sheets() {
+        let mut copy = pkg.clone();
+        copy.remove_macro_sheets();
+        without_macro_sheets = copy;
+        &without_macro_sheets
+    } else {
+        pkg
+    };
     let mut parts = saved_parts(pkg);
     let wb_part = workbook_part_name(&parts);
     set_content_type_override(&mut parts, &format!("/{wb_part}"), kind.main_content_type());
@@ -2191,6 +2202,155 @@ impl SheetPackage {
     pub fn remove_vba_project(&mut self) -> bool {
         strip_vba_project(&mut self.parts)
     }
+
+    /// Whether the workbook has Excel 4.0 macro sheets or dialog sheets,
+    /// which a macro-free file (`.xlsx`, `.xltx`) cannot carry.
+    pub fn has_macro_sheets(&self) -> bool {
+        !self.macro_sheet_indices().is_empty()
+    }
+
+    /// Drop the Excel 4.0 macro sheets and dialog sheets, as [`save_xlsx_as`]
+    /// does (on a copy) for a macro-free kind. Each goes through
+    /// [`Self::remove_sheet`]. Excel 4.0 names go too: every defined name
+    /// marked `xlm`, `function` or `vbProcedure`, and every name whose formula
+    /// refers to a removed sheet (`Auto_Open=Macro1!$A$1`). A workbook of
+    /// nothing but macro sheets first gains a blank worksheet, so one
+    /// remains. Returns whether there was anything to drop.
+    ///
+    /// Removing sheets shifts sheet indices, so an editor calls this only on
+    /// a package nothing else indexes into.
+    pub fn remove_macro_sheets(&mut self) -> bool {
+        let doomed = self.macro_sheet_indices();
+        if doomed.is_empty() {
+            return false;
+        }
+        let names: Vec<String> = doomed
+            .iter()
+            .map(|&i| self.workbook.sheets[i].name.clone())
+            .collect();
+        if doomed.len() == self.workbook.sheets.len() {
+            let mut n = 1;
+            while self
+                .workbook
+                .sheets
+                .iter()
+                .any(|s| s.name.eq_ignore_ascii_case(&format!("Sheet{n}")))
+            {
+                n += 1;
+            }
+            self.add_sheet(&format!("Sheet{n}"));
+        }
+        let refers = |formula: &str| names.iter().any(|s| formula_refers_to_sheet(formula, s));
+        if let Some(p) = self.parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
+            let xml = String::from_utf8_lossy(&p.1).into_owned();
+            let (xml, gone) = remove_macro_names(&xml, &refers);
+            p.1 = xml.into_bytes();
+            self.workbook.defined_names.retain(|d| {
+                !refers(&d.formula)
+                    && !gone
+                        .iter()
+                        .any(|(n, s)| *s == d.scope && n.eq_ignore_ascii_case(&d.name))
+            });
+        }
+        for &i in doomed.iter().rev() {
+            self.remove_sheet(i);
+        }
+        true
+    }
+
+    /// Indices (ascending) of the sheets whose workbook relationship is an
+    /// Excel 4.0 macro sheet (`xlMacrosheet`, `xlIntlMacrosheet`) or a dialog
+    /// sheet.
+    fn macro_sheet_indices(&self) -> Vec<usize> {
+        let wb_part = workbook_part_name(&self.parts);
+        let wb_dir = wb_part.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let Some(rels) = self.part(&rels_part_name(&wb_part)) else {
+            return Vec::new();
+        };
+        let targets: Vec<String> = parse_rels(&String::from_utf8_lossy(rels))
+            .into_iter()
+            .filter(|(_, ty, _)| {
+                ["/xlMacrosheet", "/xlIntlMacrosheet", "/dialogsheet"]
+                    .iter()
+                    .any(|suffix| ty.ends_with(suffix))
+            })
+            .map(|(_, _, t)| resolve_relative(wb_dir, &t))
+            .collect();
+        (0..self.sheet_parts.len())
+            .filter(|&i| targets.contains(&self.sheet_parts[i]))
+            .collect()
+    }
+}
+
+/// Whether `formula` refers to sheet `sheet` by name: `Macro1!…` or
+/// `'Macro 1'!…`, case-insensitively, and not as the tail of a longer name.
+fn formula_refers_to_sheet(formula: &str, sheet: &str) -> bool {
+    let lower = formula.to_lowercase();
+    let quoted = format!("'{}'!", sheet.replace('\'', "''")).to_lowercase();
+    if lower.contains(&quoted) {
+        return true;
+    }
+    let bare = format!("{sheet}!").to_lowercase();
+    lower.match_indices(&bare).any(|(i, _)| {
+        !lower[..i]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '\''))
+    })
+}
+
+/// Remove from workbook.xml every `<definedName>` that is an Excel 4.0 name
+/// (`xlm`, `function` or `vbProcedure` set) or whose formula `refers` to a
+/// removed sheet, and a `<definedNames>` left empty. Returns the XML and each
+/// removed name with its `localSheetId` scope.
+fn remove_macro_names(
+    xml: &str,
+    refers: &impl Fn(&str) -> bool,
+) -> (String, Vec<(String, Option<usize>)>) {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut gone = Vec::new();
+    let mut p = XmlParser::new(xml);
+    loop {
+        match p.next() {
+            Event::Start if local(p.name()) == "definedName" => {
+                let start = p.start_pos();
+                let is_true = |v: &str| v == "1" || v.eq_ignore_ascii_case("true");
+                let macro_name = ["xlm", "function", "vbProcedure"]
+                    .iter()
+                    .any(|a| is_true(p.attr(a)));
+                let name = decode(p.attr("name"));
+                let scope = p.attr("localSheetId").parse::<usize>().ok();
+                let mut text = String::new();
+                let mut depth = 0usize;
+                let end = loop {
+                    match p.next() {
+                        Event::Text => XmlParser::append_decoded(p.text(), &mut text),
+                        Event::Start => depth += 1,
+                        Event::End if depth > 0 => depth -= 1,
+                        Event::End => break Some(p.pos()),
+                        Event::Eof => break None,
+                    }
+                };
+                let Some(end) = end else {
+                    break;
+                };
+                if macro_name || refers(&text) {
+                    spans.push((start, end));
+                    gone.push((name, scope));
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    let mut out = xml.to_string();
+    for (start, end) in spans.into_iter().rev() {
+        out.replace_range(start..end, "");
+    }
+    for empty in ["<definedNames></definedNames>", "<definedNames/>"] {
+        out = out.replace(empty, "");
+    }
+    (out, gone)
 }
 
 /// The workbook's VBA project relationships as (rels part, Id, resolved
@@ -10993,6 +11153,271 @@ mod kind_tests {
         assert_eq!(workbook_ct(&out), XLTX_CT);
         let out = load_xlsx(&save_xlsx_for_path(&xltx(), "out.XLSX")).unwrap();
         assert_eq!(workbook_ct(&out), XLSX_CT);
+    }
+
+    const MACROSHEET_CT: &str = "application/vnd.ms-excel.macrosheet+xml";
+    const DIALOGSHEET_CT: &str =
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.dialogsheet+xml";
+
+    /// An `.xlsm` with Excel 4.0 macro and dialog sheets between worksheets:
+    /// `Data`, `Macro1` (an XLM macro sheet, the first workbook relationship,
+    /// with printer settings), `Dialog1`, and `Report` (active). Names: a
+    /// global `Auto_Open` on the macro sheet, an `xlm` name, a plain `Total`,
+    /// and `Report`'s print area (`localSheetId` 3).
+    fn xlm_book(sheets: &[(&str, &str)]) -> SheetPackage {
+        let main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        let od = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        let ms = "http://schemas.microsoft.com/office/2006/relationships";
+        let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut sheet_els = String::new();
+        let mut rels = String::new();
+        let mut overrides = String::new();
+        let mut active = 0;
+        for (i, (name, kind)) in sheets.iter().enumerate() {
+            let n = i + 1;
+            let (ty, dir, ct, body) = match *kind {
+                "macro" => (
+                    format!("{ms}/xlMacrosheet"),
+                    "macrosheets",
+                    MACROSHEET_CT,
+                    format!(
+                        "<xm:macrosheet xmlns=\"{main}\" xmlns:xm=\"http://schemas.microsoft.com/office/excel/2006/main\"><sheetData><row r=\"1\"><c r=\"A1\"><f>ALERT(\"hi\")</f></c></row><row r=\"2\"><c r=\"A2\"><f>RETURN()</f></c></row></sheetData></xm:macrosheet>"
+                    ),
+                ),
+                "dialog" => (
+                    format!("{od}/dialogsheet"),
+                    "dialogsheets",
+                    DIALOGSHEET_CT,
+                    format!(
+                        "<dialogsheet xmlns=\"{main}\"><sheetViews><sheetView workbookViewId=\"0\"/></sheetViews></dialogsheet>"
+                    ),
+                ),
+                _ => (
+                    format!("{od}/worksheet"),
+                    "worksheets",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+                    format!(
+                        "<worksheet xmlns=\"{main}\"><sheetData><row r=\"1\"><c r=\"A1\"><v>{n}</v></c></row></sheetData></worksheet>"
+                    ),
+                ),
+            };
+            if *name == "Report" {
+                active = i;
+            }
+            sheet_els.push_str(&format!(
+                "<sheet name=\"{name}\" sheetId=\"{n}\" r:id=\"rId{n}\"/>"
+            ));
+            let rel = format!(
+                "<Relationship Id=\"rId{n}\" Type=\"{ty}\" Target=\"{dir}/sheet{n}.xml\"/>"
+            );
+            // Macro sheets lead the rels, so one is the first child.
+            if *kind == "macro" {
+                rels.insert_str(0, &rel);
+            } else {
+                rels.push_str(&rel);
+            }
+            overrides.push_str(&format!(
+                "<Override PartName=\"/xl/{dir}/sheet{n}.xml\" ContentType=\"{ct}\"/>"
+            ));
+            parts.push((format!("xl/{dir}/sheet{n}.xml"), body.into_bytes()));
+            if *kind == "macro" {
+                parts.push((
+                    format!("xl/{dir}/_rels/sheet{n}.xml.rels"),
+                    format!("<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"{od}/printerSettings\" Target=\"../printerSettings/printerSettings{n}.bin\"/></Relationships>").into_bytes(),
+                ));
+                parts.push((
+                    format!("xl/printerSettings/printerSettings{n}.bin"),
+                    b"DEVMODE".to_vec(),
+                ));
+                overrides.push_str(&format!("<Override PartName=\"/xl/printerSettings/printerSettings{n}.bin\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.printerSettings\"/>"));
+            }
+        }
+        let report = sheets.iter().position(|(n, _)| *n == "Report");
+        let print_area = report
+            .map(|i| format!("<definedName name=\"_xlnm.Print_Area\" localSheetId=\"{i}\">Report!$A$1:$B$2</definedName>"))
+            .unwrap_or_default();
+        let has_data = sheets.iter().any(|(n, _)| *n == "Data");
+        let total = if has_data {
+            "<definedName name=\"Total\">Data!$A$1</definedName>"
+        } else {
+            ""
+        };
+        let workbook = format!(
+            "<workbook xmlns=\"{main}\" xmlns:r=\"{od}\"><bookViews><workbookView activeTab=\"{active}\"/></bookViews><sheets>{sheet_els}</sheets><definedNames>\
+             <definedName name=\"Auto_Open\">Macro1!$A$1</definedName>\
+             <definedName name=\"CellColor\" xlm=\"1\">GET.CELL(63,INDIRECT(\"rc\",FALSE))</definedName>\
+             {total}{print_area}</definedNames></workbook>"
+        );
+        parts.push(("xl/workbook.xml".into(), workbook.into_bytes()));
+        parts.push((
+            "xl/_rels/workbook.xml.rels".into(),
+            format!("<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">{rels}</Relationships>").into_bytes(),
+        ));
+        parts.push((
+            "_rels/.rels".into(),
+            format!("<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"{od}/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>").into_bytes(),
+        ));
+        parts.push((
+            "[Content_Types].xml".into(),
+            format!("<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"{XLSM_CT}\"/>{overrides}</Types>").into_bytes(),
+        ));
+        load_xlsx(&write_zip(&parts)).expect("the XLM fixture loads")
+    }
+
+    fn mixed_xlm_book() -> SheetPackage {
+        xlm_book(&[
+            ("Data", "work"),
+            ("Macro1", "macro"),
+            ("Dialog1", "dialog"),
+            ("Report", "work"),
+        ])
+    }
+
+    fn part_names(pkg: &SheetPackage) -> Vec<String> {
+        pkg.parts.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    #[test]
+    fn macro_free_save_drops_macro_and_dialog_sheets() {
+        let pkg = mixed_xlm_book();
+        assert!(pkg.has_macro_sheets());
+        assert_eq!(pkg.workbook.sheets.len(), 4);
+        // Macro1 (rId2) is the first workbook relationship.
+        assert!(part_text(&pkg, "xl/_rels/workbook.xml.rels").contains(
+            "relationships\"><Relationship Id=\"rId2\" Type=\"http://schemas.microsoft.com/office/2006/relationships/xlMacrosheet\""
+        ));
+        for kind in [SpreadsheetKind::Workbook, SpreadsheetKind::Template] {
+            let out = roundtrip(&pkg, kind);
+            assert!(!out.has_macro_sheets());
+            let names: Vec<&str> = out
+                .workbook
+                .sheets
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect();
+            assert_eq!(names, ["Data", "Report"]);
+            assert_eq!(out.workbook.active_tab, 1, "Report stays active");
+            let parts = part_names(&out);
+            assert!(
+                !parts.iter().any(|n| n.contains("macrosheets")
+                    || n.contains("dialogsheets")
+                    || n.contains("printerSettings")),
+                "{parts:?}"
+            );
+            let ct = content_types(&out);
+            assert!(
+                !ct.contains(MACROSHEET_CT) && !ct.contains(DIALOGSHEET_CT),
+                "{ct}"
+            );
+            assert!(!ct.contains("printerSettings"), "{ct}");
+            let rels = part_text(&out, "xl/_rels/workbook.xml.rels");
+            assert!(rels.contains("<Relationships xmlns="), "{rels}");
+            assert!(!rels.contains("Macrosheet") && !rels.contains("dialogsheet"));
+            let wb = part_text(&out, "xl/workbook.xml");
+            assert!(
+                wb.contains("<definedName name=\"_xlnm.Print_Area\" localSheetId=\"1\">"),
+                "{wb}"
+            );
+        }
+    }
+
+    #[test]
+    fn macro_free_save_drops_xlm_and_macro_sheet_names() {
+        let out = roundtrip(&mixed_xlm_book(), SpreadsheetKind::Workbook);
+        let wb = part_text(&out, "xl/workbook.xml");
+        assert!(
+            !wb.contains("Auto_Open") && !wb.contains("CellColor"),
+            "{wb}"
+        );
+        assert!(
+            wb.contains("<definedName name=\"Total\">Data!$A$1</definedName>"),
+            "{wb}"
+        );
+        let names: Vec<&str> = out
+            .workbook
+            .defined_names
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert!(names.contains(&"Total"), "{names:?}");
+        assert!(!names.contains(&"Auto_Open") && !names.contains(&"CellColor"));
+
+        // The in-memory drop agrees with the file.
+        let mut pkg = mixed_xlm_book();
+        assert!(pkg.remove_macro_sheets());
+        assert!(!pkg.remove_macro_sheets());
+        assert!(
+            pkg.workbook
+                .defined_names
+                .iter()
+                .all(|d| d.name != "Auto_Open")
+        );
+    }
+
+    #[test]
+    fn macro_save_keeps_macro_sheets() {
+        let pkg = mixed_xlm_book();
+        for kind in [
+            SpreadsheetKind::MacroWorkbook,
+            SpreadsheetKind::MacroTemplate,
+        ] {
+            let bytes = save_xlsx_as(&pkg, kind);
+            let out = load_xlsx(&bytes).unwrap();
+            assert!(out.has_macro_sheets());
+            assert_eq!(out.workbook.sheets.len(), 4);
+            // The macro and dialog sheet parts are written as save_xlsx
+            // writes them.
+            let plain = load_xlsx(&save_xlsx(&pkg)).unwrap();
+            for part in ["xl/macrosheets/sheet2.xml", "xl/dialogsheets/sheet3.xml"] {
+                assert_eq!(out.part(part), plain.part(part), "{part}");
+            }
+            assert!(part_text(&out, "xl/workbook.xml").contains("Auto_Open"));
+        }
+    }
+
+    #[test]
+    fn save_xlsx_as_leaves_pkg_untouched_with_macro_sheets() {
+        let pkg = mixed_xlm_book();
+        let before = (
+            part_names(&pkg),
+            pkg.parts.clone(),
+            pkg.workbook.sheets.len(),
+        );
+        let _ = save_xlsx_as(&pkg, SpreadsheetKind::Workbook);
+        assert_eq!(
+            (
+                part_names(&pkg),
+                pkg.parts.clone(),
+                pkg.workbook.sheets.len()
+            ),
+            before
+        );
+        assert!(pkg.has_macro_sheets());
+    }
+
+    #[test]
+    fn only_macro_sheets_get_a_blank_worksheet() {
+        let pkg = xlm_book(&[("Macro1", "macro"), ("Dialog1", "dialog")]);
+        let out = roundtrip(&pkg, SpreadsheetKind::Workbook);
+        assert!(!out.has_macro_sheets());
+        assert_eq!(out.workbook.sheets.len(), 1);
+        assert_eq!(out.workbook.sheets[0].name, "Sheet1");
+        assert!(out.sheet_parts[0].starts_with("xl/worksheets/"));
+    }
+
+    fn part_text(pkg: &SheetPackage, name: &str) -> String {
+        String::from_utf8_lossy(pkg.part(name).unwrap()).into_owned()
+    }
+
+    #[test]
+    fn a_formula_refers_to_a_sheet_only_by_its_whole_name() {
+        assert!(formula_refers_to_sheet("Macro1!$A$1", "Macro1"));
+        assert!(formula_refers_to_sheet("SUM(macro1!A1:A2)", "Macro1"));
+        assert!(formula_refers_to_sheet("'My Macros'!$A$1", "My Macros"));
+        assert!(formula_refers_to_sheet("'O''Brien'!A1", "O'Brien"));
+        assert!(!formula_refers_to_sheet("XMacro1!$A$1", "Macro1"));
+        assert!(!formula_refers_to_sheet("'Old Macro1'!$A$1", "Macro1"));
+        assert!(!formula_refers_to_sheet("Data!$A$1", "Macro1"));
     }
 }
 

@@ -458,11 +458,13 @@ fn main() -> ExitCode {
         // The saved file's type follows `out`: a template or macro workbook
         // written as .xlsx must say it is a workbook, or Excel refuses it.
         if let Some(kind) = SpreadsheetKind::from_path(&out) {
-            if !kind.allows_macros() && pkg.has_vba_project() {
-                eprintln!(
-                    "note: VB project not saved in macro-free .{} workbook",
-                    kind.extension()
-                );
+            if !kind.allows_macros() {
+                for feature in macro_features(&pkg) {
+                    eprintln!(
+                        "note: {feature} not saved in macro-free .{} workbook",
+                        kind.extension()
+                    );
+                }
             }
         }
         let bytes = save_xlsx_for_path(&pkg, &out);
@@ -577,6 +579,19 @@ fn load_workbook(
         let pkg = load_xlsx(&data).map_err(|e| e.to_string())?;
         Ok((pkg, path.to_string(), None))
     }
+}
+
+/// What a macro-free file (`.xlsx`, `.xltx`) written from `pkg` loses, in
+/// Excel's words: its VB project and its Excel 4.0 macro (and dialog) sheets.
+fn macro_features(pkg: &SheetPackage) -> Vec<&'static str> {
+    let mut features = Vec::new();
+    if pkg.has_vba_project() {
+        features.push("VB project");
+    }
+    if pkg.has_macro_sheets() {
+        features.push("Excel 4.0 macro sheets");
+    }
+    features
 }
 
 /// Swap `items[sel]` with its neighbor. Returns false at the edges.
@@ -2664,14 +2679,18 @@ impl App {
     }
 
     /// Save the package As, first asking (as Excel does) before a macro-free
-    /// type drops the workbook's VBA project.
+    /// type drops the workbook's VBA project or Excel 4.0 macro sheets.
     fn request_save_as_package(&mut self, path: String) {
         let drops_macros = SpreadsheetKind::from_path(&path).is_some_and(|k| !k.allows_macros());
-        if drops_macros && self.pkg.has_vba_project() {
+        let features = macro_features(&self.pkg);
+        if drops_macros && !features.is_empty() {
             self.confirm = Some(
                 backstage::Confirm::new(
-                    "The following features cannot be saved in macro-free workbooks: \
-                     VB project. Save without them?",
+                    format!(
+                        "The following features cannot be saved in macro-free workbooks: \
+                         {}. Save without them?",
+                        features.join(", ")
+                    ),
                     ConfirmAction::SaveWithoutMacros(path),
                     Color::Green,
                 )
@@ -2683,9 +2702,12 @@ impl App {
     }
 
     /// Yes to [`ConfirmAction::SaveWithoutMacros`]: once the file is written
-    /// without them, the open workbook drops its macros too, so a later Save
-    /// As neither asks again nor writes them back into an `.xlsm`. A failed
-    /// write keeps them.
+    /// without them, the open workbook drops its VB project too, so a later
+    /// Save As neither asks again nor writes it back into an `.xlsm`. A failed
+    /// write keeps it. Excel 4.0 macro sheets stay in the open workbook, as
+    /// Excel keeps them: dropping them would shift the sheet indices the
+    /// engine, selection, comments and undo history hold. Only the file
+    /// written lacks them, and a later Save As to a macro-free type asks again.
     fn save_as_without_macros(&mut self, path: String) {
         if self.save_as(path) {
             self.pkg.remove_vba_project();
@@ -3783,7 +3805,7 @@ impl App {
                 if let Some(ConfirmAction::SaveWithoutMacros(_)) =
                     self.confirm.take().map(|c| c.action().clone())
                 {
-                    self.status = Some("Save As cancelled — the VB project is kept".into());
+                    self.status = Some("Save As cancelled — the macros are kept".into());
                 }
                 false
             }
@@ -7939,6 +7961,95 @@ mod tests {
         assert!(app.confirm.is_none());
         let back = load_xlsx(&std::fs::read(dir.join("back.xlsm")).unwrap()).unwrap();
         assert!(!back.has_vba_project(), "the dropped macros stay dropped");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A workbook with an Excel 4.0 macro sheet (`Macro1`, after `Sheet1`).
+    fn xlm_pkg() -> SheetPackage {
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Macro1");
+        let rels = String::from_utf8_lossy(pkg.part("xl/_rels/workbook.xml.rels").unwrap())
+            .replace(
+                r#"Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml""#,
+                r#"Type="http://schemas.microsoft.com/office/2006/relationships/xlMacrosheet" Target="worksheets/sheet2.xml""#,
+            );
+        pkg.set_part("xl/_rels/workbook.xml.rels", rels.into_bytes());
+        let bytes = gridcore::xlsx::save_xlsx_as(&pkg, SpreadsheetKind::MacroWorkbook);
+        let pkg = load_xlsx(&bytes).unwrap();
+        assert!(pkg.has_macro_sheets());
+        pkg
+    }
+
+    /// #727: Save As `.xlsx` asks before dropping Excel 4.0 macro sheets. The
+    /// file written has none; the open workbook keeps them (as Excel does),
+    /// so its sheets do not shift, and a later Save As asks again.
+    #[test]
+    fn save_as_xlsx_with_macro_sheets_asks_and_writes_none() {
+        let dir = macro_dir("xlm-yes");
+        let mut app = App::new(xlm_pkg(), dir.join("in.xlsm").to_str().unwrap());
+        app.sheet = 1;
+        app.commit_save_as(dir.clone(), "out.xlsx".into());
+        let c = app.confirm.as_ref().expect("Save As asks first");
+        assert!(
+            c.prompt().contains(
+                "cannot be saved in macro-free workbooks: Excel 4.0 macro sheets. Save without them?"
+            ),
+            "{}",
+            c.prompt()
+        );
+        assert!(!app.confirm_key(KeyEvent::from(KeyCode::Char('y'))));
+        let out = load_xlsx(&std::fs::read(dir.join("out.xlsx")).unwrap()).unwrap();
+        assert!(!out.has_macro_sheets());
+        assert_eq!(out.workbook.sheets.len(), 1);
+        assert_eq!(out.workbook.sheets[0].name, "Sheet1");
+        // The open workbook is unchanged.
+        assert!(app.pkg.has_macro_sheets());
+        assert_eq!(app.pkg.workbook.sheets.len(), 2);
+        assert_eq!(app.sheet, 1);
+
+        app.commit_save_as(dir.clone(), "again.xlsx".into());
+        assert!(app.confirm.is_some(), "a later Save As asks again");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Both features in one question, in Excel's order.
+    #[test]
+    fn one_question_lists_every_macro_feature() {
+        let mut pkg = xlsm_pkg();
+        let with_sheets = xlm_pkg();
+        pkg.set_part(
+            "xl/_rels/workbook.xml.rels",
+            with_sheets
+                .part("xl/_rels/workbook.xml.rels")
+                .map(|b| {
+                    String::from_utf8_lossy(b).replace(
+                        "</Relationships>",
+                        r#"<Relationship Id="rId9" Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" Target="vbaProject.bin"/></Relationships>"#,
+                    )
+                })
+                .unwrap()
+                .into_bytes(),
+        );
+        let pkg = {
+            let mut p = with_sheets;
+            for name in [
+                "xl/_rels/workbook.xml.rels",
+                "xl/vbaProject.bin",
+                "[Content_Types].xml",
+            ] {
+                p.set_part(name, pkg.part(name).unwrap().to_vec());
+            }
+            p
+        };
+        assert!(pkg.has_vba_project() && pkg.has_macro_sheets());
+        let dir = macro_dir("xlm-both");
+        let mut app = App::new(pkg, dir.join("in.xlsm").to_str().unwrap());
+        app.commit_save_as(dir.clone(), "out.xlsx".into());
+        let prompt = app.confirm.as_ref().unwrap().prompt().to_string();
+        assert!(
+            prompt.contains("workbooks: VB project, Excel 4.0 macro sheets. Save"),
+            "{prompt}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
