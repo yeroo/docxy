@@ -400,6 +400,56 @@ pub fn input_text_styled(cell: &Cell, xf: &Xf) -> String {
     copy_field(cell, xf, crate::edit::input_text_of(cell))
 }
 
+/// The text a cell editor opens on (and the formula bar shows): what
+/// re-entering it would read back as the same cell. A number is written in
+/// full, not rounded to General's 15 digits (so an edit never loses
+/// `0.30000000000000004`'s last digit), in E notation outside `1e-10..1e21`
+/// where plain digits would run to hundreds of characters; in a percent cell
+/// it is shown as the percent it reads as (`150%` for 1.5), since a plain
+/// `1.5` typed back into that cell would be divided by 100. Anything else is
+/// [`input_text_styled`]: a formula's `=` source, and text with the `'` its
+/// re-entry needs.
+pub fn seed_text(cell: &Cell, xf: &Xf) -> String {
+    match &cell.value {
+        CellValue::Number(n) if cell.formula.is_none() => {
+            if is_percent(xf) {
+                percent_seed(*n, xf)
+            } else {
+                full_number(*n)
+            }
+        }
+        _ => input_text_styled(cell, xf),
+    }
+}
+
+/// `n` in its shortest round-trip digits.
+fn full_number(n: f64) -> String {
+    if n == 0.0 || (1e-10..1e21).contains(&n.abs()) {
+        format!("{n}")
+    } else {
+        format!("{n:E}")
+    }
+}
+
+/// `n` as a percent that reads back as `n` in a percent cell `xf`: `n * 100`
+/// is rarely exact in binary (0.07 * 100 is 7.000000000000001), so take the
+/// fewest significant digits whose `%` text reads back as `n` exactly.
+fn percent_seed(n: f64, xf: &Xf) -> String {
+    let pct = n * 100.0;
+    let ctx = EntryCtx::default();
+    for digits in 1..=17 {
+        let Ok(r) = format!("{:.*e}", digits - 1, pct).parse::<f64>() else {
+            break;
+        };
+        let text = format!("{}%", full_number(r));
+        let back = parse_entry(&text, xf, &ctx).ok().map(|e| e.cell.value);
+        if back == Some(CellValue::Number(n)) {
+            return text;
+        }
+    }
+    format!("{}%", full_number(pct))
+}
+
 fn value_cell(value: CellValue) -> Cell {
     Cell {
         value,
@@ -1516,6 +1566,58 @@ mod tests {
         // Over the cell limit: kept as text, unread, on the target's style.
         let long = "1".repeat(MAX_CELL_CHARS + 1);
         assert_eq!(paste(general, &long), (CellValue::Text(long.clone()), None));
+    }
+
+    #[test]
+    fn a_seed_keeps_every_digit_of_a_number() {
+        let seed = |n: f64| seed_text(&Cell::number(n), &Xf::default());
+        assert_eq!(seed(0.1 + 0.2), "0.30000000000000004");
+        assert_eq!(seed(42.0), "42");
+        assert_eq!(seed(-1.5), "-1.5");
+        assert_eq!(seed(0.0), "0");
+        // Plain digits only where they stay short.
+        assert_eq!(seed(1e20), "100000000000000000000");
+        assert_eq!(seed(1e300), "1E300");
+        assert_eq!(seed(-1.5e-300), "-1.5E-300");
+        // Each reads back through typed entry (15 significant digits, as
+        // Excel keeps) to the number it shows.
+        for n in [1e300, -1.5e-300, 1e21, 123.25] {
+            let e = parse_entry(&seed(n), &Xf::default(), &ctx()).unwrap();
+            assert_eq!(e.cell.value, CellValue::Number(n), "{n}");
+        }
+        // Text keeps its re-entry apostrophe; a formula shows its source.
+        let quoted = Xf {
+            quote_prefix: true,
+            ..Xf::default()
+        };
+        assert_eq!(seed_text(&Cell::text("007"), &quoted), "'007");
+        let f = Cell {
+            value: CellValue::Number(3.0),
+            ..Cell::formula("1+2")
+        };
+        assert_eq!(seed_text(&f, &Xf::default()), "=1+2");
+    }
+
+    #[test]
+    fn a_percent_cell_seeds_the_percent_it_reads_back_as() {
+        let pct = fmt_xf("0%");
+        let seed = |n: f64| seed_text(&Cell::number(n), &pct);
+        assert_eq!(seed(1.5), "150%");
+        assert_eq!(seed(0.07), "7%");
+        assert_eq!(seed(0.5), "50%");
+        assert_eq!(seed(-0.125), "-12.5%");
+        assert_eq!(seed(0.0), "0%");
+        for n in [1.5, 0.07, 0.123456789, -0.125, 1e-12] {
+            let text = seed(n);
+            let back = parse_entry(&text, &pct, &ctx()).unwrap().cell.value;
+            assert_eq!(back, CellValue::Number(n), "{n} seeds {text}");
+        }
+        // A value no 15-digit entry can give back is shown in full; the
+        // hosts leave an unedited seed uncommitted, so it is never re-read.
+        assert_eq!(seed(2.0 / 3.0), "66.66666666666666%");
+        // Edited, it reads as typed there: 160% is 1.6, not 0.016.
+        let back = parse_entry("160%", &pct, &ctx()).unwrap().cell.value;
+        assert_eq!(back, CellValue::Number(1.6));
     }
 
     #[test]

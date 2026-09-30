@@ -523,36 +523,15 @@ impl Session {
         self.engine = engine;
     }
 
-    /// What the editor and formula bar start from: [`Session::cell_src`] with
-    /// a quote prefix's apostrophe put back, so re-committing keeps it text.
+    /// What the editor and formula bar start from (and a copy carries):
+    /// [`gridcore::entry::seed_text`], the text that re-enters as the same
+    /// cell — every digit of a number, a percent cell's `150%`, a quote
+    /// prefix's apostrophe — as xlsxy and the suite seed theirs.
     fn cell_seed(&self, row: u32, col: u32) -> String {
-        let src = self.cell_src(row, col);
         let styles = &self.pkg.workbook.styles;
         match self.pkg.workbook.sheets[self.active].cell(row, col) {
-            Some(cell) => gridcore::entry::copy_field(cell, &styles.xf(cell.style), src),
-            None => src,
-        }
-    }
-
-    /// The raw source of a cell, as copied: `=FORMULA` or the raw value text.
-    /// (The number keeps Rust's shortest round-trip text rather than
-    /// General's 15-digit rounding, so a copy or an edit never loses digits.)
-    fn cell_src(&self, row: u32, col: u32) -> String {
-        let Some(cell) = self.pkg.workbook.sheets[self.active].cell(row, col) else {
-            return String::new();
-        };
-        if let Some(f) = &cell.formula {
-            return format!("={f}");
-        }
-        match &cell.value {
-            CellValue::Empty => String::new(),
-            CellValue::Number(n) => {
-                // Shortest round-trip text (Rust's f64 Display is shortest).
-                format!("{n}")
-            }
-            CellValue::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
-            CellValue::Text(s) => s.clone(),
-            CellValue::Error(e) => e.clone(),
+            Some(cell) => gridcore::entry::seed_text(cell, &styles.xf(cell.style)),
+            None => String::new(),
         }
     }
 
@@ -2948,6 +2927,29 @@ mod tests {
     }
 
     #[test]
+    fn the_editor_seeds_every_digit_and_a_percent_cell_its_percent() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.pkg.workbook.sheets[0].set_cell(9, 0, Cell::number(0.1 + 0.2));
+        let mut xf = gridcore::sheet::Xf::default();
+        xf.set_code(Some("0%".into()));
+        let pct = s.pkg.workbook.styles.intern(xf);
+        s.pkg.workbook.sheets[0].set_cell(
+            9,
+            1,
+            Cell {
+                style: pct,
+                ..Cell::number(1.5)
+            },
+        );
+        assert_eq!(s.cell_seed(9, 0), "0.30000000000000004");
+        assert_eq!(s.cell_seed(9, 1), "150%");
+        // The seed re-enters as the same value.
+        s.dispatch("set\t9\t1\t150%");
+        let b10 = s.pkg.workbook.sheets[0].cell(9, 1).unwrap().value.clone();
+        assert_eq!(b10, CellValue::Number(1.5));
+    }
+
+    #[test]
     fn copy_preserves_formulas_as_source() {
         let mut s = Session::open(&sample_xlsx()).expect("open");
         s.dispatch("select\t3\t1");
@@ -2983,8 +2985,8 @@ mod tests {
             );
         }
         // Values are untouched by the format-only edit.
-        assert_eq!(s.cell_src(1, 0), "Apple");
-        assert_eq!(s.cell_src(1, 1), "1.25");
+        assert_eq!(s.cell_seed(1, 0), "Apple");
+        assert_eq!(s.cell_seed(1, 1), "1.25");
 
         s.dispatch("undo"); // ONE undo restores all four cells
         for (r, c) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
@@ -3109,7 +3111,7 @@ mod tests {
         s.dispatch("set\t2\t0\t30"); // A3
         s.dispatch("select\t3\t0"); // A4, active cell
         s.dispatch("autosum");
-        assert_eq!(s.cell_src(3, 0), "=SUM(A1:A3)");
+        assert_eq!(s.cell_seed(3, 0), "=SUM(A1:A3)");
         let v = s.view_json(None);
         assert!(v.contains("\"src\":\"=SUM(A1:A3)\""), "{v}");
         s.dispatch("select\t3\t0");
@@ -3124,7 +3126,7 @@ mod tests {
         s.dispatch("set\t0\t1\t15"); // B1
         s.dispatch("select\t0\t2"); // C1, active cell, nothing above (row 0)
         s.dispatch("autosum");
-        assert_eq!(s.cell_src(0, 2), "=SUM(A1:B1)");
+        assert_eq!(s.cell_seed(0, 2), "=SUM(A1:B1)");
     }
 
     #[test]
@@ -3138,7 +3140,7 @@ mod tests {
             undo_before,
             "no-op must not push an undo group"
         );
-        assert_eq!(s.cell_src(5, 5), "");
+        assert_eq!(s.cell_seed(5, 5), "");
         let v = s.view_json(None);
         assert!(
             v.contains("AutoSum: no numbers to sum"),
@@ -3422,7 +3424,7 @@ mod tests {
         s.dispatch(&format!("set\t0\t0\t{}", "y".repeat(32_768)));
         let err = s.err.clone().expect("an error");
         assert!(err.contains("32767"), "{err}");
-        assert_eq!(s.cell_src(0, 0), "old");
+        assert_eq!(s.cell_seed(0, 0), "old");
         let r = s.ctl(&format!(
             r#"{{"verb":"cell.set","args":{{"ref":"A1","text":"{}"}}}}"#,
             "y".repeat(32_768)
@@ -3461,7 +3463,7 @@ mod tests {
         }
         s.dispatch("set\t42\t0\t'abc");
         assert_eq!(
-            s.cell_src(42, 0),
+            s.cell_seed(42, 0),
             "'abc",
             "a Text cell keeps the entry as typed"
         );
@@ -3494,7 +3496,7 @@ mod tests {
         s.err = None;
         s.dispatch("set\t30\t0\t=SUM(");
         assert_eq!(s.err, None);
-        assert_eq!(s.cell_src(30, 0), "=SUM(");
+        assert_eq!(s.cell_seed(30, 0), "=SUM(");
         s.dispatch("set\t31\t0\t=SUM(");
         assert!(s.err.is_some(), "a General cell still refuses it");
     }

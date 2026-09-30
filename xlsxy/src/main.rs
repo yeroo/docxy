@@ -32,7 +32,7 @@ use backstage::BackstageHost as _;
 use gridcore::comments::Comment;
 use gridcore::edit::{fill_changes, replace_all_in_sheet};
 use gridcore::engine::Engine;
-use gridcore::entry::{entry_cell, entry_ctx, input_text_styled};
+use gridcore::entry::{entry_cell, entry_ctx, seed_text};
 use gridcore::formula::translate_formula;
 use gridcore::frame::Agg;
 use gridcore::model::{
@@ -1146,6 +1146,10 @@ struct EditState {
     text: String,
     cursor: usize, // char index
     replace: bool,
+    /// The cell's text the editor opened on (F2, Enter-to-edit), `None` when
+    /// typing replaced it. Committing it unchanged leaves the cell alone:
+    /// re-reading it would round a 17-digit number to Excel's 15.
+    seed: Option<String>,
 }
 
 /// One undoable action: cell states before/after, per address.
@@ -1614,6 +1618,7 @@ impl App {
         };
         let cursor = text.chars().count();
         self.edit = Some(EditState {
+            seed: initial.is_none().then(|| text.clone()),
             text,
             cursor,
             replace: initial.is_some(),
@@ -1622,13 +1627,15 @@ impl App {
     }
 
     /// What editing an existing cell starts from: the formula with `=`, or
-    /// the value as it would be re-entered (a quote prefix's `'` included).
+    /// the value as it would be re-entered ([`gridcore::entry::seed_text`]:
+    /// every digit of a number, a percent cell's `150%`, a quote prefix's
+    /// `'`), as gridwasm and the suite seed theirs.
     fn current_input_text(&self) -> String {
         let (r, c) = self.cur;
         let styles = &self.pkg.workbook.styles;
         self.sheet()
             .cell(r, c)
-            .map(|cl| input_text_styled(cl, &styles.xf(cl.style)))
+            .map(|cl| seed_text(cl, &styles.xf(cl.style)))
             .unwrap_or_default()
     }
 
@@ -1640,7 +1647,13 @@ impl App {
         let Some(edit) = self.edit.take() else {
             return true;
         };
-        let text = edit.text;
+        let (text, seed) = (edit.text, edit.seed);
+        // A seeded editor left unchanged must not re-read the cell: `007` in
+        // a quote-prefixed cell is fine either way, but a stored
+        // 0.30000000000000004 would come back as 0.3.
+        if seed.as_deref() == Some(text.as_str()) {
+            return true;
+        }
         let (r, c) = self.cur;
         let formula = gridcore::entry::typed_formula(&self.pkg.workbook, self.sheet, r, c, &text);
         if let Some(Err(e)) = formula.map(Engine::validate) {
@@ -1649,6 +1662,7 @@ impl App {
                 cursor: text.chars().count(),
                 text,
                 replace: false,
+                seed,
             });
             return false;
         }
@@ -1668,6 +1682,7 @@ impl App {
                     cursor: text.chars().count(),
                     text,
                     replace: false,
+                    seed,
                 });
                 return false;
             }
@@ -10476,6 +10491,65 @@ mod tests {
             "rename lost on reload: {names:?}"
         );
         assert!(!names.contains(&"Data"), "stale name survived: {names:?}");
+    }
+
+    #[test]
+    fn f2_enter_keeps_every_digit_and_typing_over_still_converts() {
+        let mut pkg = new_xlsx();
+        let noisy = 0.1 + 0.2;
+        pkg.workbook.sheets[0].set_cell(0, 0, Cell::number(noisy));
+        pkg.workbook.sheets[0].set_cell(1, 0, Cell::text("5"));
+        let mut app = App::new(pkg, "t.xlsx");
+        app.os_clip = None;
+        app.cur = (0, 0);
+        // The seed is the stored number in full, as gridwasm and the suite
+        // seed it, and committing it unchanged changes nothing.
+        assert_eq!(app.current_input_text(), "0.30000000000000004");
+        app.start_edit(None);
+        assert!(app.commit_edit());
+        let a1 = app.sheet().cell(0, 0).unwrap().value.clone();
+        assert_eq!(a1, CellValue::Number(noisy));
+        assert!(app.undo.is_empty(), "an unchanged edit adds no undo step");
+        // Typing over a text 5 with 5 is a fresh entry: it becomes a number.
+        app.cur = (1, 0);
+        app.start_edit(Some('5'));
+        assert!(app.commit_edit());
+        let a2 = app.sheet().cell(1, 0).unwrap().value.clone();
+        assert_eq!(a2, CellValue::Number(5.0));
+        // F2 on the same text 5 and Enter keeps it text.
+        app.pkg.workbook.sheets[0].set_cell(1, 0, Cell::text("5"));
+        app.start_edit(None);
+        assert!(app.commit_edit());
+        let a2 = app.sheet().cell(1, 0).unwrap().value.clone();
+        assert_eq!(a2, CellValue::Text("5".into()));
+    }
+
+    #[test]
+    fn a_percent_cell_seeds_its_percent() {
+        let mut pkg = new_xlsx();
+        let mut xf = gridcore::sheet::Xf::default();
+        xf.set_code(Some("0%".into()));
+        let style = pkg.workbook.styles.intern(xf);
+        pkg.workbook.sheets[0].set_cell(
+            0,
+            0,
+            Cell {
+                style,
+                ..Cell::number(1.5)
+            },
+        );
+        let mut app = App::new(pkg, "t.xlsx");
+        app.os_clip = None;
+        app.cur = (0, 0);
+        assert_eq!(app.current_input_text(), "150%");
+        // Edited to 160%, it is 1.6, not 0.016.
+        app.start_edit(None);
+        if let Some(e) = app.edit.as_mut() {
+            e.text = "160%".into();
+        }
+        assert!(app.commit_edit());
+        let a1 = app.sheet().cell(0, 0).unwrap().value.clone();
+        assert_eq!(a1, CellValue::Number(1.6));
     }
 
     #[test]

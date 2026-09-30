@@ -1904,27 +1904,13 @@ impl SheetView {
     /// `commit_edit` preserves the stored cell when this seed is left
     /// untouched, even if reparsing would change it.
     fn edit_string(&self, row: u32, col: u32) -> String {
-        use gridcore::sheet::CellValue;
-        let sh = self.sheet();
-        match sh.cell(row, col) {
-            Some(c) if c.formula.is_some() => format!("={}", c.formula.as_deref().unwrap_or("")),
-            Some(c) => match &c.value {
-                CellValue::Number(n) => n.to_string(),
-                CellValue::Text(s) => {
-                    gridcore::entry::copy_field(c, &self.pkg.workbook.styles.xf(c.style), s.clone())
-                }
-                CellValue::Bool(b) => {
-                    if *b {
-                        "TRUE".into()
-                    } else {
-                        "FALSE".into()
-                    }
-                }
-                CellValue::Error(e) => e.clone(),
-                CellValue::Empty => String::new(),
-            },
-            None => String::new(),
-        }
+        // The text that re-enters as the same cell, as xlsxy and gridwasm
+        // seed theirs: every digit of a number, a percent cell's `150%`, a
+        // quote prefix's `'`.
+        self.sheet()
+            .cell(row, col)
+            .map(|c| gridcore::entry::seed_text(c, &self.pkg.workbook.styles.xf(c.style)))
+            .unwrap_or_default()
     }
 
     // ---- in-cell edit caret (char-indexed into `editing`) ----

@@ -121,6 +121,39 @@ fn a_text_cell_keeps_the_entry_and_a_percent_cell_divides_it() {
 }
 
 #[test]
+fn the_editor_seeds_every_digit_and_a_percent_cell_its_percent() {
+    let mut v = view();
+    put(&mut v, 0, 0, Cell::number(0.1 + 0.2));
+    assert_eq!(v.edit_string(0, 0), "0.30000000000000004");
+    let pct = v.pkg.workbook.styles.intern({
+        let mut xf = Xf::default();
+        xf.set_code(Some("0%".into()));
+        xf
+    });
+    put(
+        &mut v,
+        1,
+        0,
+        Cell {
+            style: pct,
+            ..Cell::number(1.5)
+        },
+    );
+    assert_eq!(v.edit_string(1, 0), "150%");
+    // F2 then Enter unchanged leaves it; edited to 160% it is 1.6 (a plain
+    // `1.5` seed edited to `1.6` used to be divided again, to 0.016).
+    select(&mut v, 1, 0);
+    v.begin_cell_edit(None);
+    assert_eq!(v.editing.as_deref(), Some("150%"));
+    v.commit_edit();
+    assert_eq!(value(&v, 1, 0), CellValue::Number(1.5));
+    v.begin_cell_edit(None);
+    v.editing = Some("160%".into());
+    assert!(v.commit_edit());
+    assert_eq!(value(&v, 1, 0), CellValue::Number(1.6));
+}
+
+#[test]
 fn an_apostrophe_is_a_quote_prefix_and_an_untouched_reedit_is_a_no_op() {
     let mut v = view();
     type_fresh(&mut v, "'007");
