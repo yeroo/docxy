@@ -852,18 +852,21 @@ fn unique_sheet_name(wb: &gridcore::sheet::Workbook, base: &str) -> String {
 }
 
 /// Import CSV text as a brand-new sheet (never overwrites an existing one —
-/// name collisions are deduplicated). Mirrors the shape of the TUI's
-/// `csv_to_pkg`, but populates a sheet inside the *live* workbook instead of
-/// building a standalone package.
+/// name collisions are deduplicated), converted exactly as opening a `.csv`
+/// converts it (`csv_to_pkg`), but into a sheet of the *live* workbook.
 fn sheet_import_csv(app: &mut App, args: &Json) -> Result<Json, String> {
     let text = args
         .get_str("text")
         .ok_or("sheet.import-csv needs 'text'")?;
-    let frame = Frame::from_csv(text);
     let requested = args.get_str("name").unwrap_or("Sheet");
     let name = unique_sheet_name(&app.pkg.workbook, requested);
     let idx = app.pkg.add_sheet(&name);
-    frame.write_to_sheet(&mut app.pkg.workbook.sheets[idx]);
+    let open = super::TextOpen {
+        auto: app.auto_convert,
+        today: now_serial(),
+    };
+    let wb = &mut app.pkg.workbook;
+    super::import_csv_text(&mut wb.sheets[idx], &mut wb.styles, text, false, &open);
     let (rows, cols) = app.pkg.workbook.sheets[idx].used_size();
     // New package parts (worksheet/relationship/workbook.xml wiring) don't
     // fit the cell-level undo model — same as the TUI's own AddSheet flow,
@@ -2097,6 +2100,27 @@ mod tests {
         assert!(idx > 0); // never overwrites sheet 0
         let name = r.get_str("name").unwrap().to_string();
         assert_eq!(a.pkg.workbook.sheets[idx].name, name);
+    }
+
+    /// #605: the verb converts fields exactly as opening a `.csv` does.
+    #[test]
+    fn sheet_import_csv_converts_fields_as_typed() {
+        let mut a = app();
+        let r = dispatch(
+            &mut a,
+            "sheet.import-csv",
+            &Json::obj(vec![(
+                "text",
+                Json::Str("sep=;\npct;calc\n12%;=1+1\n".into()),
+            )]),
+        )
+        .unwrap();
+        let idx = r.get_usize("sheet").unwrap();
+        let sh = &a.pkg.workbook.sheets[idx];
+        assert_eq!(sh.cell(0, 0).unwrap().value, CellValue::Text("pct".into()));
+        assert_eq!(sh.cell(1, 0).unwrap().value, CellValue::Number(0.12));
+        assert_eq!(sh.cell(1, 1).unwrap().value, CellValue::Number(2.0));
+        assert_eq!(r.get_usize("rows"), Some(2));
     }
 
     #[test]

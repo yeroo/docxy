@@ -41,6 +41,7 @@ use gridcore::sheet::{
     Align, Cell, CellValue, MAX_COLS, MAX_ROWS, NumFmt, Sheet, Xf, cell_name, col_name,
     date_unrepresentable, format_with, sheet_to_csv,
 };
+use gridcore::textio::{AutoConvert, TextParse};
 use gridcore::xlsx::{SheetPackage, SpreadsheetKind, load_xlsx, new_xlsx, save_xlsx_for_path};
 
 use ratatui::backend::CrosstermBackend;
@@ -194,7 +195,7 @@ fn main() -> ExitCode {
         // CSV/TSV imports as a one-sheet workbook (Ctrl-S then writes
         // .xlsx — the path is rebound so a spreadsheet never lands in a
         // text file). The delimiter is sniffed.
-        Some(input) if is_delimited(input) => match load_workbook(input) {
+        Some(input) if is_delimited(input) => match load_workbook(input, &TextOpen::from_prefs()) {
             Ok(loaded) => loaded,
             Err(e) => {
                 eprintln!("error: cannot read {input}: {e}");
@@ -289,18 +290,63 @@ fn main() -> ExitCode {
     }
 }
 
+/// How a text file opens: File › Options › Data's Automatic Data Conversion,
+/// and the clock that gives a yearless date such as `1/2` its year.
+#[derive(Clone, Copy, Debug)]
+struct TextOpen {
+    auto: AutoConvert,
+    today: Option<f64>,
+}
+
+impl TextOpen {
+    /// The persisted options (headless runs read them too) and now.
+    fn from_prefs() -> TextOpen {
+        let text = view_prefs_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default();
+        TextOpen {
+            auto: auto_convert_from_prefs(&text),
+            today: now_serial(),
+        }
+    }
+}
+
+/// The Automatic Data Conversion switches from the preferences file's text;
+/// a missing key keeps Excel's default (on).
+fn auto_convert_from_prefs(text: &str) -> AutoConvert {
+    let mut auto = AutoConvert::default();
+    for line in text.lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            let on = v.trim() == "1";
+            match k.trim() {
+                "convert_leading_zeros" => auto.remove_leading_zeros = on,
+                "convert_long_numbers" => auto.keep_15_digits = on,
+                "convert_e_notation" => auto.e_notation = on,
+                "convert_dates" => auto.dates = on,
+                _ => {}
+            }
+        }
+    }
+    auto
+}
+
 /// Load a workbook from disk (`.xlsx`, or `.csv`/`.tsv` imported as one sheet),
 /// returning the package, its save path, and any original CSV/TSV import path.
-fn load_workbook(path: &str) -> Result<(SheetPackage, String, Option<String>), String> {
+fn load_workbook(
+    path: &str,
+    open: &TextOpen,
+) -> Result<(SheetPackage, String, Option<String>), String> {
     if is_delimited(path) {
-        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        let text = gridcore::textio::decode(&bytes, gridcore::textio::Origin::Auto);
+        let tab = path.to_ascii_lowercase().ends_with(".tsv");
         let stem = std::path::Path::new(path)
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "import".to_string());
         let base = &path[..path.len() - 4];
         Ok((
-            csv_to_pkg(&text, &stem),
+            csv_to_pkg(&text, &stem, tab, open),
             format!("{base}.xlsx"),
             Some(path.to_string()),
         ))
@@ -341,16 +387,47 @@ fn parse_table_col(s: &str) -> Option<(String, String)> {
     ))
 }
 
-/// Import CSV text as a fresh one-sheet workbook.
-fn csv_to_pkg(text: &str, sheet_name: &str) -> SheetPackage {
-    let frame = gridcore::frame::Frame::from_csv(text);
+/// Import CSV text as a fresh one-sheet workbook, as Excel opens a `.csv`: a
+/// `sep=` first line names the delimiter (else a `.tsv` is tab-delimited and
+/// a `.csv` sniffed), and every field converts as if typed into its cell.
+fn csv_to_pkg(text: &str, sheet_name: &str, tab: bool, open: &TextOpen) -> SheetPackage {
     let mut pkg = new_xlsx();
-    let sh = &mut pkg.workbook.sheets[0];
+    let wb = &mut pkg.workbook;
     if !sheet_name.is_empty() {
-        sh.name = sheet_name.chars().take(31).collect();
+        wb.sheets[0].name = sheet_name.chars().take(31).collect();
     }
-    frame.write_to_sheet(sh);
+    import_csv_text(&mut wb.sheets[0], &mut wb.styles, text, tab, open);
+    // A text file carries no cached values: work out its formulas now.
+    let mut engine = Engine::new(&pkg.workbook);
+    engine.clock = open.today;
+    engine.recalc_all(&mut pkg.workbook);
     pkg
+}
+
+/// CSV text converted into `sheet` from A1 (shared by opening a `.csv` and
+/// the `sheet.import-csv` verb).
+fn import_csv_text(
+    sheet: &mut gridcore::sheet::Sheet,
+    styles: &mut gridcore::sheet::Styles,
+    text: &str,
+    tab: bool,
+    open: &TextOpen,
+) {
+    let (directive, body) = gridcore::textio::csv_directive(text);
+    let delim = directive.unwrap_or_else(|| {
+        if tab {
+            '\t'
+        } else {
+            gridcore::frame::sniff_delimiter(body)
+        }
+    });
+    let opts = TextParse::csv(delim);
+    let records = gridcore::textio::split_text(body, &opts);
+    let ctx = gridcore::entry::EntryCtx {
+        date1904: false,
+        today: open.today,
+    };
+    gridcore::textio::import_records(sheet, styles, 0, 0, &records, &opts, &open.auto, &ctx);
 }
 
 struct Parsed {
@@ -466,7 +543,7 @@ fn iso_now() -> String {
 /// Render the first sheet of a workbook (or a CSV) as preview text lines,
 /// bounded so a huge file can't stall the browser.
 fn preview_lines(path: &str, width: usize) -> Vec<String> {
-    let (pkg, _, _) = match load_workbook(path) {
+    let (pkg, _, _) = match load_workbook(path, &TextOpen::from_prefs()) {
         Ok(x) => x,
         Err(e) => return vec![format!("(cannot preview: {e})")],
     };
@@ -946,6 +1023,8 @@ struct App {
     ribbon_focus: ribbon::Focus,
     comments: Vec<Comment>,
     show_comments: bool,
+    /// File › Options › Data › Automatic Data Conversion (persisted).
+    auto_convert: AutoConvert,
     comment_sel: usize,
     // The File backstage (folder browser / preview / info / save-as).
     backstage: Option<backstage::Backstage>,
@@ -1041,6 +1120,7 @@ impl App {
             ribbon_focus: ribbon::Focus::None,
             comments,
             show_comments: false,
+            auto_convert: AutoConvert::default(),
             comment_sel: 0,
             backstage: None,
             start_screen: false,
@@ -2858,6 +2938,12 @@ impl App {
         let Ok(text) = std::fs::read_to_string(&p) else {
             return;
         };
+        self.apply_view_prefs(&text);
+    }
+
+    /// Apply the preferences file's text.
+    fn apply_view_prefs(&mut self, text: &str) {
+        self.auto_convert = auto_convert_from_prefs(text);
         for line in text.lines() {
             if let Some((k, v)) = line.split_once('=') {
                 let on = v.trim() == "1";
@@ -2878,14 +2964,25 @@ impl App {
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let body = format!(
-            "formula_view={}\nlight_theme={}\nauto_hide_ribbon={}\nshow_comments={}\n",
+        let _ = std::fs::write(&p, self.view_prefs_text());
+    }
+
+    /// The preferences file's text.
+    fn view_prefs_text(&self) -> String {
+        let auto = self.auto_convert;
+        format!(
+            "formula_view={}\nlight_theme={}\nauto_hide_ribbon={}\nshow_comments={}\n\
+             convert_leading_zeros={}\nconvert_long_numbers={}\nconvert_e_notation={}\n\
+             convert_dates={}\n",
             self.formula_view as u8,
             self.light_theme as u8,
             self.auto_hide_ribbon as u8,
             self.show_comments as u8,
-        );
-        let _ = std::fs::write(&p, body);
+            auto.remove_leading_zeros as u8,
+            auto.keep_15_digits as u8,
+            auto.e_notation as u8,
+            auto.dates as u8,
+        )
     }
 
     /// Dispatch a ribbon command to the matching editor operation.
@@ -3000,7 +3097,11 @@ impl App {
 
     /// Replace the whole editing session with a freshly loaded workbook.
     fn open_workbook(&mut self, path: &str) {
-        match load_workbook(path) {
+        let open = TextOpen {
+            auto: self.auto_convert,
+            today: now_serial(),
+        };
+        match load_workbook(path, &open) {
             Ok((pkg, p, import_source)) => {
                 let (rels, meas) = pkg
                     .part(MODEL_PART)
@@ -6574,6 +6675,112 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 2024-09-30, the clock the CSV tests open with.
+    const CSV_TODAY: f64 = 45_565.0;
+
+    fn csv_open(auto: AutoConvert) -> TextOpen {
+        TextOpen {
+            auto,
+            today: Some(CSV_TODAY),
+        }
+    }
+
+    fn value(pkg: &SheetPackage, a1: &str) -> gridcore::sheet::CellValue {
+        let (r, c) = parse_a1(a1).unwrap();
+        pkg.workbook.sheets[0]
+            .cell(r, c)
+            .map(|c| c.value.clone())
+            .unwrap_or_default()
+    }
+
+    fn code(pkg: &SheetPackage, a1: &str) -> Option<String> {
+        let (r, c) = parse_a1(a1).unwrap();
+        let style = pkg.workbook.sheets[0].cell(r, c).unwrap().style;
+        pkg.workbook.styles.xf(style).code
+    }
+
+    /// #605: a CSV's fields convert as typed entry does, with 15 digits.
+    #[test]
+    fn opening_a_csv_converts_every_field_as_typed() {
+        use gridcore::sheet::CellValue::{Bool, Number, Text};
+        let bytes = b"\xEF\xBB\xBFcode,when,pct,flag,sci,long,calc,text,quoted\r\n\
+                      007,1/2,12%,TRUE,1E5,1234567890123456789,=1+1,apple,\"a,b\"\r\n";
+        let text = gridcore::textio::decode(bytes, gridcore::textio::Origin::Auto);
+        let pkg = csv_to_pkg(&text, "in", false, &csv_open(AutoConvert::default()));
+        // The header row stays plain text.
+        assert_eq!(value(&pkg, "A1"), Text("code".into()));
+        assert_eq!(value(&pkg, "I1"), Text("quoted".into()));
+        assert_eq!(value(&pkg, "A2"), Number(7.0));
+        let jan2 = gridcore::sheet::parts_to_serial(2024, 1, 2, 0, false);
+        assert_eq!(value(&pkg, "B2"), Number(jan2));
+        let date = gridcore::sheet::classify_format_code(&code(&pkg, "B2").unwrap());
+        assert_eq!(date, gridcore::sheet::NumFmt::Date);
+        assert_eq!(value(&pkg, "C2"), Number(0.12));
+        assert_eq!(code(&pkg, "C2").as_deref(), Some("0%"));
+        assert_eq!(value(&pkg, "D2"), Bool(true));
+        assert_eq!(value(&pkg, "E2"), Number(100_000.0));
+        assert_eq!(value(&pkg, "F2"), Number(1.23456789012346e18));
+        let g2 = pkg.workbook.sheets[0].cell(1, 6).unwrap();
+        assert_eq!(g2.formula.as_deref(), Some("1+1"));
+        assert_eq!(g2.value, Number(2.0));
+        assert_eq!(value(&pkg, "H2"), Text("apple".into()));
+        assert_eq!(value(&pkg, "I2"), Text("a,b".into()));
+    }
+
+    /// #606: a `sep=` first line names the delimiter and is not imported;
+    /// a blank header stays blank.
+    #[test]
+    fn a_sep_line_sets_the_delimiter_and_blank_headers_stay_blank() {
+        use gridcore::sheet::CellValue::{Empty, Number, Text};
+        let open = csv_open(AutoConvert::default());
+        let pkg = csv_to_pkg("sep=;\r\na;b\r\n1;2\r\n", "sep", false, &open);
+        assert_eq!(value(&pkg, "A1"), Text("a".into()));
+        assert_eq!(value(&pkg, "B1"), Text("b".into()));
+        assert_eq!(value(&pkg, "A2"), Number(1.0));
+        assert_eq!(value(&pkg, "B2"), Number(2.0));
+        assert_eq!(pkg.workbook.sheets[0].used_size(), (2, 2));
+        let pkg = csv_to_pkg("a,,c\n1,2,3\n", "blank", false, &open);
+        assert_eq!(value(&pkg, "B1"), Empty);
+        assert_eq!(value(&pkg, "B2"), Number(2.0));
+    }
+
+    /// #607: with Automatic Data Conversion off those fields open as text.
+    #[test]
+    fn automatic_data_conversion_off_keeps_fields_as_text() {
+        use gridcore::sheet::CellValue::{Number, Text};
+        let csv = "007,1/2,1E5,1234567890123456789\n";
+        let off = csv_to_pkg(csv, "off", false, &csv_open(AutoConvert::off()));
+        for (a1, text) in [
+            ("A1", "007"),
+            ("B1", "1/2"),
+            ("C1", "1E5"),
+            ("D1", "1234567890123456789"),
+        ] {
+            assert_eq!(value(&off, a1), Text(text.into()), "{a1}");
+        }
+        let on = csv_to_pkg(csv, "on", false, &csv_open(AutoConvert::default()));
+        assert_eq!(value(&on, "A1"), Number(7.0));
+        assert_eq!(value(&on, "C1"), Number(100_000.0));
+        assert_eq!(value(&on, "D1"), Number(1.23456789012346e18));
+    }
+
+    /// #607: the four switches persist in the preferences file.
+    #[test]
+    fn the_conversion_options_round_trip_through_the_preferences() {
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        assert_eq!(app.auto_convert, AutoConvert::default());
+        app.auto_convert.remove_leading_zeros = false;
+        app.auto_convert.dates = false;
+        let text = app.view_prefs_text();
+        assert!(text.contains("convert_leading_zeros=0"), "{text}");
+        let mut again = App::new(new_xlsx(), "untitled.xlsx");
+        again.apply_view_prefs(&text);
+        assert_eq!(again.auto_convert, app.auto_convert);
+        // An older file without the keys keeps Excel's defaults.
+        again.apply_view_prefs("formula_view=0\n");
+        assert_eq!(again.auto_convert, AutoConvert::default());
+    }
+
     #[test]
     fn imported_csv_stays_protected_until_successful_save_as_or_new() {
         let dir = std::env::temp_dir().join(format!("xlsxy-import-source-{}", std::process::id()));
@@ -8586,7 +8793,13 @@ mod tests {
 
     #[test]
     fn csv_imports_as_workbook() {
-        let pkg = csv_to_pkg("Region,Sales\nEast,10\n\"West, far\",20.5\n", "sales");
+        let open = csv_open(AutoConvert::default());
+        let pkg = csv_to_pkg(
+            "Region,Sales\nEast,10\n\"West, far\",20.5\n",
+            "sales",
+            false,
+            &open,
+        );
         let sh = &pkg.workbook.sheets[0];
         assert_eq!(sh.name, "sales");
         assert_eq!(
