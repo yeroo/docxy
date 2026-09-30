@@ -3844,8 +3844,10 @@ fn sheet_bytes(v: &SheetView, target: Option<&std::path::Path>) -> Vec<u8> {
     } else {
         let mut pkg = v.pkg.clone();
         for cv in &v.charts {
-            // A refusal can't be reported from here: the insert asked
-            // `can_add_chart` and was refused then (`insert_ui_chart`).
+            // The insert asked `can_add_chart` (`insert_ui_chart`), so a
+            // damaged worksheet or drawing part was refused then. Only a
+            // drawing-rels part too broken to take the chart's relationship
+            // can still refuse here, and that isn't reported.
             pkg.add_chart(cv.sheet, cv.from, cv.to, &cv.data);
         }
         write(&pkg)
