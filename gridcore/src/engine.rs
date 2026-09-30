@@ -1572,6 +1572,42 @@ mod tests {
         assert_eq!(value_at(&wb, "K8"), CellValue::Number(1.0));
     }
 
+    #[test]
+    fn computed_criteria_that_reenter_themselves_terminate() {
+        // r1 M1: a computed criterion reading a D-function over its own
+        // criteria range (directly, or through another criteria range) is a
+        // circle; it matches nothing rather than recursing forever.
+        let mut cells: Vec<(String, Cell)> = vec![
+            ("A1".into(), Cell::text("N")),
+            ("B1".into(), Cell::text("M")),
+            ("C1".into(), Cell::text("V")),
+        ];
+        for r in 2..=8 {
+            cells.push((format!("A{r}"), Cell::number(r as f64)));
+            cells.push((format!("C{r}"), Cell::number(10.0 * r as f64)));
+        }
+        cells.push((
+            "Y2".into(),
+            Cell::formula("DCOUNT($A$1:$C$8,\"V\",$Y$1:$Y$2)>0"),
+        ));
+        cells.push(("K1".into(), Cell::formula("DCOUNT(A1:C8,\"V\",Y1:Y2)")));
+        cells.push((
+            "P2".into(),
+            Cell::formula("DCOUNT($A$1:$C$8,\"V\",$Q$1:$Q$2)>0"),
+        ));
+        cells.push((
+            "Q2".into(),
+            Cell::formula("DCOUNT($A$1:$C$8,\"V\",$P$1:$P$2)>0"),
+        ));
+        cells.push(("K2".into(), Cell::formula("DCOUNT(A1:C8,\"V\",P1:P2)")));
+        let refs: Vec<(&str, Cell)> = cells.iter().map(|(k, c)| (k.as_str(), c.clone())).collect();
+        let mut wb = wb_one_sheet(&refs);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(0.0));
+        assert_eq!(value_at(&wb, "K2"), CellValue::Number(0.0));
+    }
+
     // ---- dynamic arrays / spilling ------------------------------------
 
     #[test]

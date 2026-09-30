@@ -2492,6 +2492,11 @@ pub struct Eval<'a> {
     lets: Vec<(String, Arg)>,
     /// Lambda parameters omitted at the current call site (`ISOMITTED`).
     omitted: Vec<String>,
+    /// Computed D-function criteria cells being evaluated by an enclosing
+    /// evaluation. A criterion that re-enters itself (through a D-function
+    /// over its own criteria range) is a circular reference and matches
+    /// nothing, instead of recursing without end.
+    db_crit_stack: Vec<(usize, u32, u32)>,
 }
 
 /// A matrix of computed values (a dynamic-array result). Always non-empty
@@ -2556,6 +2561,7 @@ impl<'a> Eval<'a> {
             depth: 0,
             lets: Vec::new(),
             omitted: Vec::new(),
+            db_crit_stack: Vec::new(),
         }
     }
 
@@ -9971,12 +9977,15 @@ impl<'a> Eval<'a> {
                             let cell = row.get(*dbcol).cloned().unwrap_or(Value::Empty);
                             db_criteria_match(crit, *prefix, &cell)
                         }
-                        DbCrit::Computed(ast, (cs, cr0, cc0)) => {
+                        DbCrit::Computed(_, at) if self.db_crit_stack.contains(at) => false,
+                        DbCrit::Computed(ast, at @ (cs, cr0, cc0)) => {
                             // Record `ri` sits `ri` rows below the first
                             // data row, which the formula's relative refs
                             // point at: shift them (and the formula) by that.
                             let shifted = translate(ast, ri as i64, 0);
                             let mut child = Eval::new(self.res, *cs, (cr0 + ri as u32, *cc0));
+                            child.db_crit_stack = self.db_crit_stack.clone();
+                            child.db_crit_stack.push(*at);
                             let v = child.eval(&shifted);
                             self.unsupported |= child.unsupported;
                             matches!(v, Value::Bool(true)) || matches!(v, Value::Num(n) if n != 0.0)
