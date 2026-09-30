@@ -52,7 +52,9 @@ mod win {
         SheetPackage, SpreadsheetKind, load_xlsx, new_xlsx, save_xlsx, save_xlsx_as,
     };
 
-    use windows::Win32::Foundation::{DISP_E_BADINDEX, E_FAIL, E_NOTIMPL, E_POINTER, S_OK};
+    use windows::Win32::Foundation::{
+        DISP_E_BADINDEX, DISP_E_TYPEMISMATCH, E_FAIL, E_NOTIMPL, E_POINTER, S_OK,
+    };
     use windows::Win32::System::Com::{
         DISPATCH_FLAGS, DISPPARAMS, EXCEPINFO, IDispatch, IDispatch_Impl, IDispatch_Vtbl,
     };
@@ -484,13 +486,15 @@ mod win {
         }
     }
 
-    /// What a Value / Formula / Item put assigns to each cell of its range.
+    /// What a Value / Formula / Item put or a clear assigns to each cell of
+    /// its range.
     #[derive(Clone, Debug, PartialEq)]
     enum Put {
-        /// Range.Clear: value and format go.
+        /// Range.Clear (111): value and format go.
         Clear,
-        /// A number, a boolean, or `Empty` (the contents cleared): the
-        /// constant lands on each cell's own format.
+        /// A number, a boolean, or `Empty` (the contents cleared, as a put of
+        /// nothing and Range.ClearContents (113) do): the constant lands on
+        /// each cell's own format.
         Value(CellValue),
         /// A string, entered as if typed into each cell ([`Book::assign`]).
         Text(String),
@@ -502,7 +506,7 @@ mod win {
     ///
     /// # Safety
     /// `params` must be null or a valid `DISPPARAMS`.
-    unsafe fn put_arg(params: *const DISPPARAMS) -> Put {
+    unsafe fn put_arg(params: *const DISPPARAMS) -> Option<Put> {
         unsafe {
             put_of(
                 params
@@ -516,17 +520,24 @@ mod win {
     /// Interpret a VARIANT the way Excel interprets a value assigned to a
     /// cell: a string as typed entry (`=…` a formula, `42` a number, `'…`
     /// text), bools as booleans, numbers as numbers; empty/omitted (or null)
-    /// clears the contents. App-specific (over gridcore).
-    fn put_of(v: Option<&VARIANT>) -> Put {
+    /// clears the contents. `None` for an array (`Range.Value = arr`), which
+    /// the shim cannot spread over cells: the put is refused
+    /// ([`DISP_E_TYPEMISMATCH`]) rather than read as nothing, which would
+    /// clear the range. App-specific (over gridcore).
+    fn put_of(v: Option<&VARIANT>) -> Option<Put> {
         let Some(v) = v else {
-            return Put::Value(CellValue::Empty);
+            return Some(Put::Value(CellValue::Empty));
         };
-        match unsafe { vt_of(v) } {
+        // `vt_of` masks the flags; VT_ARRAY is 0x2000 of the raw tag.
+        if unsafe { *(v as *const VARIANT as *const u16) } & 0x2000 != 0 {
+            return None;
+        }
+        Some(match unsafe { vt_of(v) } {
             VT_EMPTY | VT_ERROR => Put::Value(CellValue::Empty),
             VT_BSTR => Put::Text(BSTR::try_from(v).map(|b| b.to_string()).unwrap_or_default()),
             VT_BOOL => Put::Value(CellValue::Bool(bool::try_from(v).unwrap_or(false))),
             _ => Put::Value(f64::try_from(v).map_or(CellValue::Empty, CellValue::Number)),
-        }
+        })
     }
 
     fn cellvalue_to_variant(v: &CellValue) -> VARIANT {
@@ -825,7 +836,10 @@ mod win {
         unsafe { out_var(ret, cellvalue_to_variant(&val)) }
     }
     unsafe fn vt_rng_value_put(t: &Range_Impl, val: *const VARIANT) -> HRESULT {
-        t.write_fill(put_of(unsafe { val.as_ref() }));
+        let Some(put) = put_of(unsafe { val.as_ref() }) else {
+            return DISP_E_TYPEMISMATCH;
+        };
+        t.write_fill(put);
         S_OK
     }
     unsafe fn vt_rng_formula_get(t: &Range_Impl, ret: *mut VARIANT) -> HRESULT {
@@ -848,7 +862,10 @@ mod win {
     unsafe fn vt_rng_formula_put(t: &Range_Impl, val: *const VARIANT) -> HRESULT {
         // A formula put is a value put: `=…` enters as a formula, any other
         // string as the typed value it spells.
-        t.write_fill(put_of(unsafe { val.as_ref() }));
+        let Some(put) = put_of(unsafe { val.as_ref() }) else {
+            return DISP_E_TYPEMISMATCH;
+        };
+        t.write_fill(put);
         S_OK
     }
     unsafe fn vt_rng_item_put(
@@ -860,7 +877,9 @@ mod win {
         let rr = vi32(row).unwrap_or(1).max(1) as u32 - 1;
         let cc = vi32(col).unwrap_or(1).max(1) as u32 - 1;
         let (r, c) = (t.r1 + rr, t.c1 + cc);
-        let put = put_of(unsafe { val.as_ref() });
+        let Some(put) = put_of(unsafe { val.as_ref() }) else {
+            return DISP_E_TYPEMISMATCH;
+        };
         let (book, sheet) = (t.book, t.sheet);
         reg(|reg| {
             if let Some(b) = reg.books.get_mut(book) {
@@ -1560,7 +1579,7 @@ mod win {
                             c2,
                         };
                         if is_put(wflags) {
-                            rng.write_fill(put_arg(params));
+                            rng.write_fill(put_arg(params).ok_or(DISP_E_TYPEMISMATCH)?);
                         } else {
                             put_obj(result, rng);
                         }
@@ -1596,7 +1615,7 @@ mod win {
                                     c2,
                                 };
                                 if is_put(wflags) {
-                                    rng.write_fill(put_arg(params));
+                                    rng.write_fill(put_arg(params).ok_or(DISP_E_TYPEMISMATCH)?);
                                 } else {
                                     put_obj(result, rng);
                                 }
@@ -1722,7 +1741,8 @@ mod win {
             "row" => 257,
             "column" => 240,
             "count" => 118,
-            "clearcontents" => 111,
+            "clear" => 111,
+            "clearcontents" => 113,
             "select" => 235,
             "mergecells" | "merge" => 564,
             // Navigation — these commonly POSITION a subsequent write, so they
@@ -1777,7 +1797,7 @@ mod win {
                             let Some(v) = arg(params, 0) else {
                                 return Ok(());
                             };
-                            self.write_fill(put_of(Some(v)));
+                            self.write_fill(put_of(Some(v)).ok_or(DISP_E_TYPEMISMATCH)?);
                         } else {
                             let val = reg(|r| {
                                 r.books
@@ -1792,7 +1812,7 @@ mod win {
                     261 | 264 => {
                         if is_put(wflags) {
                             if let Some(v) = arg(params, 0) {
-                                self.write_fill(put_of(Some(v)));
+                                self.write_fill(put_of(Some(v)).ok_or(DISP_E_TYPEMISMATCH)?);
                             }
                         } else {
                             let f = reg(|r| {
@@ -1840,7 +1860,7 @@ mod win {
                             c2: c,
                         };
                         if is_put(wflags) {
-                            sub.write_fill(put_arg(params));
+                            sub.write_fill(put_arg(params).ok_or(DISP_E_TYPEMISMATCH)?);
                             return Ok(());
                         }
                         put_obj(
@@ -1969,7 +1989,10 @@ mod win {
                         let n = (r2 as u64 - r1 as u64 + 1) * (c2 as u64 - c1 as u64 + 1);
                         put(result, VARIANT::from(n.min(i32::MAX as u64) as i32))
                     }
+                    // Clear drops values and formats; ClearContents keeps
+                    // the formats (Excel's DISPIDs, tools/comshim/excel-pia.txt).
                     111 => self.write_fill(Put::Clear),
+                    113 => self.write_fill(Put::Value(CellValue::Empty)),
                     235 | 564 => {} // Select / Merge — no-op in P1
                     // Offset(RowOffset, ColumnOffset) — shift the whole range.
                     254 => {
@@ -2570,12 +2593,30 @@ mod win {
             assert_eq!(book.pkg.workbook.styles.xf(c.style), xf);
             book.assign(0, (0, 0, 0, 0), &Put::Clear);
             assert_eq!(cell(&book, 0, 0).style, 0);
+            // By name: ClearContents is 113 and empties the value (the
+            // format stays, above); Clear is 111 and resets the cell.
+            assert_eq!(range_id("ClearContents"), Some(113));
+            assert_eq!(range_id("Clear"), Some(111));
             // A number over quote-prefixed text is no longer quoted.
             let mut book = Book::new();
             book.assign(0, (0, 0, 0, 0), &text("'007"));
             book.assign(0, (0, 0, 0, 0), &Put::Value(CellValue::Number(7.0)));
             let c = cell(&book, 0, 0);
             assert!(!book.pkg.workbook.styles.xf(c.style).quote_prefix);
+        }
+
+        #[test]
+        fn an_array_put_is_refused_not_read_as_nothing() {
+            // VT_ARRAY | VT_VARIANT with no array behind it: only the tag is
+            // read, and the VARIANT is never dropped (there is nothing to free).
+            let mut v = std::mem::ManuallyDrop::new(VARIANT::default());
+            unsafe { *(&mut *v as *mut VARIANT as *mut u16) = 0x2000 | 12 };
+            assert_eq!(put_of(Some(&v)), None);
+            assert_eq!(put_of(None), Some(Put::Value(CellValue::Empty)));
+            let n = VARIANT::from(5.0);
+            assert_eq!(put_of(Some(&n)), Some(Put::Value(CellValue::Number(5.0))));
+            let s = VARIANT::from(BSTR::from("42"));
+            assert_eq!(put_of(Some(&s)), Some(Put::Text("42".into())));
         }
 
         #[test]
