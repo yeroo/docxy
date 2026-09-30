@@ -758,8 +758,12 @@ fn comment_add(app: &mut App, args: &Json) -> Result<Json, String> {
         .get_str("author")
         .map(str::to_string)
         .unwrap_or_else(comment_author);
-    app.pkg
-        .add_threaded_comment(si, r, c, &author, text, &iso_now());
+    if !app
+        .pkg
+        .add_threaded_comment(si, r, c, &author, text, &iso_now())
+    {
+        return Err("comment.add: this sheet's XML is damaged where the comment would go".into());
+    }
     app.modified = true;
     app.refresh_comments();
     Ok(Json::obj(vec![

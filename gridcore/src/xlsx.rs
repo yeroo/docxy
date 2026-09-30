@@ -73,6 +73,9 @@ pub struct SheetPackage {
     /// this exact part instead of assuming the standard path — otherwise an
     /// unconventional original would be left orphaned beside a fresh duplicate.
     shared_part: Option<String>,
+    /// The workbook is Strict Open XML: parts and relationships the writer
+    /// creates use the Strict namespaces, as its own parts do.
+    strict: bool,
     /// The editable workbook. Mutate it, then [`save_xlsx`].
     pub workbook: Workbook,
 }
@@ -103,6 +106,77 @@ impl SheetPackage {
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, b)| b.as_slice())
+    }
+
+    /// Does `sheet`'s worksheet part take a new `<tag>` ([`worksheet_takes`])?
+    /// A sheet with no part takes anything: the edit is the model's alone, as
+    /// it always was.
+    pub(crate) fn sheet_takes(&self, sheet: usize, tag: &str, join: bool) -> bool {
+        match self.sheet_parts.get(sheet).and_then(|n| self.part(n)) {
+            Some(b) => worksheet_takes(&String::from_utf8_lossy(b), tag, join),
+            None => true,
+        }
+    }
+
+    /// The namespaces for anything the writer creates in this package.
+    pub(crate) fn ns(&self) -> &'static OoxmlNs {
+        if self.strict { &STRICT } else { &TRANSITIONAL }
+    }
+}
+
+/// The namespace URIs the writer mints, per conformance class. Strict Open
+/// XML (ECMA-376 Part 1, Strict) moves them to `purl.oclc.org/ooxml`; the OPC
+/// package namespaces and the content types are the same in both.
+pub(crate) struct OoxmlNs {
+    pub(crate) sml: &'static str,
+    /// The `r:` namespace, which is also the prefix of every relationship type.
+    pub(crate) rels: &'static str,
+    pub(crate) dml: &'static str,
+    pub(crate) chart: &'static str,
+    pub(crate) xdr: &'static str,
+}
+
+impl OoxmlNs {
+    /// The relationship type `kind` (`worksheet`, `sharedStrings`, …).
+    pub(crate) fn rel(&self, kind: &str) -> String {
+        format!("{}/{kind}", self.rels)
+    }
+}
+
+pub(crate) const TRANSITIONAL: OoxmlNs = OoxmlNs {
+    sml: "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+    rels: "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    dml: "http://schemas.openxmlformats.org/drawingml/2006/main",
+    chart: "http://schemas.openxmlformats.org/drawingml/2006/chart",
+    xdr: "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
+};
+
+pub(crate) const STRICT: OoxmlNs = OoxmlNs {
+    sml: "http://purl.oclc.org/ooxml/spreadsheetml/main",
+    rels: "http://purl.oclc.org/ooxml/officeDocument/relationships",
+    dml: "http://purl.oclc.org/ooxml/drawingml/main",
+    chart: "http://purl.oclc.org/ooxml/drawingml/chart",
+    xdr: "http://purl.oclc.org/ooxml/drawingml/spreadsheetDrawing",
+};
+
+/// Is the workbook part's root element in the Strict SpreadsheetML namespace?
+fn is_strict_workbook(wb_xml: &str) -> bool {
+    let mut p = XmlParser::new(wb_xml);
+    loop {
+        match p.next() {
+            Event::Start => {
+                let decl = match p.name().split_once(':') {
+                    Some((prefix, _)) => format!("xmlns:{prefix}"),
+                    None => "xmlns".to_string(),
+                };
+                return p
+                    .namespace_attrs()
+                    .iter()
+                    .any(|a| a.name == decl && a.value == STRICT.sml);
+            }
+            Event::Eof => return false,
+            _ => {}
+        }
     }
 }
 
@@ -357,11 +431,13 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
         pivots.push(piv);
     }
 
+    let strict = is_strict_workbook(&wb_xml);
     Ok(SheetPackage {
         parts,
         sheet_parts,
         shared,
         shared_part,
+        strict,
         workbook: Workbook {
             sheets,
             styles,
@@ -2311,7 +2387,7 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
                     (cd.edited, chart_is_writable(cd), cd.part.as_deref())
                 {
                     if let Some(p) = parts.iter_mut().find(|(n, _)| n == cpart) {
-                        p.1 = chart_space_xml(cd).into_bytes();
+                        p.1 = chart_space_xml_in(cd, pkg.ns()).into_bytes();
                     }
                 }
             }
@@ -2390,7 +2466,8 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
             }
             None => {
                 let xml = format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" count=\"{total}\" uniqueCount=\"{total}\">{additions}</sst>"
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<sst xmlns=\"{}\" count=\"{total}\" uniqueCount=\"{total}\">{additions}</sst>",
+                    pkg.ns().sml
                 );
                 parts.push((sst_name.to_string(), xml.into_bytes()));
                 add_content_type_override(
@@ -2400,7 +2477,7 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
                 );
                 add_workbook_rel(
                     &mut parts,
-                    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings",
+                    &pkg.ns().rel("sharedStrings"),
                     "sharedStrings.xml",
                 );
             }
@@ -2635,68 +2712,33 @@ fn with_ref(fa: &str, r: &str) -> String {
     }
 }
 
-/// Byte offset of a real `<tag` element start in XML, skipping any occurrence
-/// inside a `<!-- … -->` comment and requiring the tag name to be followed by
-/// whitespace, `>`, or `/` (so `<sheetDataX` and a `<sheetData` literal buried
-/// in a comment don't misdirect the splice). `None` if not present.
-fn find_element(hay: &str, tag: &str) -> Option<usize> {
-    let needle = format!("<{tag}");
-    let bytes = hay.as_bytes();
-    let mut i = 0;
-    // Stepped a byte at a time, so compared as bytes: `i` can land inside a
-    // multi-byte character, where slicing the `str` would panic. A match
-    // starts at an ASCII `<`, which is always a char boundary.
-    while i < hay.len() {
-        // Skip over comments wholesale.
-        if bytes[i..].starts_with(b"<!--") {
-            // Unterminated comment: nothing usable after it.
-            let rel = hay[i..].find("-->")?;
-            i += rel + 3;
-            continue;
-        }
-        if bytes[i..].starts_with(needle.as_bytes()) {
-            let after = bytes.get(i + needle.len()).copied();
-            if matches!(
-                after,
-                None | Some(b'>')
-                    | Some(b'/')
-                    | Some(b' ')
-                    | Some(b'\t')
-                    | Some(b'\r')
-                    | Some(b'\n')
-            ) {
-                return Some(i);
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
 /// Replace `<sheetData>…</sheetData>` (or `<sheetData/>`) in the original
 /// worksheet XML, refresh `<dimension>`, and regenerate `<cols>`.
+///
+/// The cells always land when the part has a readable `<sheetData>`, and so
+/// do merges and protection ([`sync_worksheet_child`]). `<cols>` and a new
+/// `<sheetViews>` follow [`put_worksheet_child`]: on a malformed part with no
+/// known position for them they are left as they were.
 fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
-    let mut out = match find_element(source, "sheetData") {
-        Some(start) => {
-            let after = &source[start..];
-            let gt = after
-                .find('>')
-                .map(|i| start + i)
-                .unwrap_or(source.len() - 1);
-            let end = if source[..gt + 1].ends_with("/>") {
-                gt + 1
-            } else {
-                source[gt..]
-                    .find("</sheetData>")
-                    .map(|i| gt + i + "</sheetData>".len())
-                    .unwrap_or(source.len())
-            };
-            format!("{}{}{}", &source[..start], sheet_data, &source[end..])
-        }
-        None => {
-            // Degenerate worksheet with no sheetData: put ours before the
-            // closing tag.
-            source.replacen("</worksheet>", &format!("{sheet_data}</worksheet>"), 1)
+    // Found by local name, so `<x:sheetData>` is replaced, not joined by a
+    // second one. A worksheet that has none gets ours at its schema position.
+    let walk_found = worksheet_child_span(source, "sheetData").is_some();
+    let stopped = worksheet_children(source).close.is_none();
+    let mut out = if walk_found || !stopped {
+        put_worksheet_child(source, "sheetData", sheet_data, None, true)
+    } else {
+        match sheet_data_fallback_span(source) {
+            // The walk stopped before sheetData (a malformed child ahead of
+            // it): find it by its tags, so the edits are saved rather than
+            // silently dropped.
+            Some((s, e)) => {
+                let block = match worksheet_root(source) {
+                    Some(root) => in_worksheet_ns(&root, sheet_data),
+                    None => sheet_data.to_string(),
+                };
+                format!("{}{block}{}", &source[..s], &source[e..])
+            }
+            None => put_worksheet_child(source, "sheetData", sheet_data, None, true),
         }
     };
 
@@ -2707,12 +2749,9 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
     } else {
         format!("A1:{}", cell_name(rows - 1, cols.max(1) - 1))
     };
-    if let Some(i) = find_element(&out, "dimension") {
-        if let Some(rel) = out[i..].find("ref=\"") {
-            let vs = i + rel + 5;
-            if let Some(ve) = out[vs..].find('"') {
-                out.replace_range(vs..vs + ve, &dim);
-            }
+    if let Some((i, _)) = worksheet_child_span(&out, "dimension") {
+        if attr_at(&out, i, "ref").is_some() {
+            out = set_tag_attr(&out, i, "ref", Some(&dim));
         }
     }
 
@@ -2732,24 +2771,15 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
             ));
         }
         cols_xml.push_str("</cols>");
-        if let Some(start) = find_element(&out, "cols") {
-            let end = out[start..]
-                .find("</cols>")
-                .map(|i| start + i + "</cols>".len())
-                .or_else(|| out[start..].find("/>").map(|i| start + i + 2))
-                .unwrap_or(start);
-            out.replace_range(start..end, &cols_xml);
-        } else if let Some(start) = find_element(&out, "sheetData") {
-            out.insert_str(start, &cols_xml);
-        }
+        out = put_worksheet_child(&out, "cols", &cols_xml, None, true);
     }
 
     // Frozen panes: sync the first sheetView's <pane> from the model.
     let out = set_freeze_pane(&out, sheet.freeze);
     // Merged regions: regenerate <mergeCells> from the model.
     let out = set_merge_cells(&out, &sheet.merges);
-    // Sheet protection: <sheetProtection> right after </sheetData> (schema order
-    // puts it ahead of mergeCells/conditionalFormatting).
+    // Sheet protection: <sheetProtection> regenerated at its CT_Worksheet
+    // position.
     let out = set_sheet_protection(&out, sheet.protection.as_deref());
     // Page breaks (manual and automatic): rewritten only where a structural
     // edit moved them.
@@ -2780,35 +2810,25 @@ fn set_page_breaks(mut xml: String, tag: &str, breaks: &[crate::sheet::PageBreak
             block.push_str(&format!("<brk id=\"{}\"{}/>", b.id, b.attrs));
         }
         block.push_str(&format!("</{tag}>"));
-        block
+        match worksheet_root(&xml) {
+            Some(root) => in_worksheet_ns(&root, &block),
+            None => block,
+        }
     };
     xml.replace_range(start..end, &block);
     xml
 }
 
-/// Where the sheet's own `<rowBreaks>` / `<colBreaks>` element is, found with
-/// the loader's parser so a comment can't end it early. Custom views hold
-/// breaks under the same names inside `<customSheetViews>`; those are skipped.
+/// Where the sheet's own `<rowBreaks>` / `<colBreaks>` element is (in any
+/// prefix), found with the loader's parser so a comment can't end it early.
+/// Custom views hold breaks under the same names inside `<customSheetViews>`;
+/// only a top-level one counts.
 fn sheet_breaks_span(xml: &str, tag: &str) -> Option<(usize, usize)> {
-    // Most sheets have no breaks: don't parse the whole part to learn that.
-    find_element(xml, tag)?;
-    let mut p = XmlParser::new(xml);
-    let mut in_views = false;
-    loop {
-        match p.next() {
-            Event::Start => match local(p.name()) {
-                "customSheetViews" => in_views = true,
-                name if name == tag && !in_views => {
-                    let start = p.start_pos();
-                    return p.skip_element_complete().then(|| (start, p.pos()));
-                }
-                _ => {}
-            },
-            Event::End if local(p.name()) == "customSheetViews" => in_views = false,
-            Event::Eof => return None,
-            _ => {}
-        }
+    // Most sheets have no breaks: don't walk the part to learn that.
+    if !xml.contains(tag) {
+        return None;
     }
+    worksheet_child_span(xml, tag)
 }
 
 /// The `<brk>` children of one breaks element, read as the loader reads them.
@@ -2825,46 +2845,555 @@ fn parse_page_breaks(fragment: &str) -> Vec<crate::sheet::PageBreak> {
     out
 }
 
-/// Sync the `<sheetProtection>` element from the model: drop any existing one,
-/// then re-insert right after `</sheetData>` when the sheet is protected.
-/// Idempotent.
-fn set_sheet_protection(xml: &str, attrs: Option<&str>) -> String {
-    // Drop any existing self-closing <sheetProtection .../> first.
-    let mut out = if let Some(s) = xml.find("<sheetProtection") {
-        let e = xml[s..].find("/>").map(|i| s + i + 2).unwrap_or(s);
-        format!("{}{}", &xml[..s], &xml[e..])
-    } else {
-        xml.to_string()
+/// The children of `<worksheet>` in the order ECMA-376 `CT_Worksheet` (a
+/// SEQUENCE) requires them. Excel treats an out-of-order child as damage and
+/// offers to "repair" the file, which drops content.
+const CT_WORKSHEET_ORDER: &[&str] = &[
+    "sheetPr",
+    "dimension",
+    "sheetViews",
+    "sheetFormatPr",
+    "cols",
+    "sheetData",
+    "sheetCalcPr",
+    "sheetProtection",
+    "protectedRanges",
+    "scenarios",
+    "autoFilter",
+    "sortState",
+    "dataConsolidate",
+    "customSheetViews",
+    "mergeCells",
+    "phoneticPr",
+    "conditionalFormatting",
+    "dataValidations",
+    "hyperlinks",
+    "printOptions",
+    "pageMargins",
+    "pageSetup",
+    "headerFooter",
+    "rowBreaks",
+    "colBreaks",
+    "customProperties",
+    "cellWatches",
+    "ignoredErrors",
+    "smartTags",
+    "drawing",
+    "legacyDrawing",
+    "legacyDrawingHF",
+    "drawingHF",
+    "picture",
+    "oleObjects",
+    "controls",
+    "webPublishItems",
+    "tableParts",
+    "extLst",
+];
+
+/// A top-level child of `<worksheet>`: its local name, the name it ranks as
+/// (they differ for `mc:AlternateContent`), and its byte span.
+struct WorksheetChild<'a> {
+    local: &'a str,
+    rank_as: &'a str,
+    start: usize,
+    end: usize,
+}
+
+/// What a walk over a worksheet's top-level children found.
+struct WorksheetWalk<'a> {
+    /// The children, in order, each a complete element.
+    children: Vec<WorksheetChild<'a>>,
+    /// Where content after the last child goes: `</worksheet>`, or the end
+    /// of the last child when the part just stops there. `Some` only when
+    /// `children` is the whole list.
+    close: Option<usize>,
+    /// The child the walk could not read to its end: its start and local
+    /// name. Its start tag parsed, so its position is known even though its
+    /// body isn't; the walk saw nothing after it.
+    stopped: Option<(usize, &'a str)>,
+}
+
+/// The top-level children of a worksheet, and where `</worksheet>` starts.
+/// Only depth-1 elements count (the `<autoFilter>` inside a
+/// `<customSheetView>` is not one), compared by local name so `x:mergeCells`
+/// is `mergeCells`. A top-level `mc:AlternateContent` ranks as the first
+/// element in its first `Choice`/`Fallback`: Excel wraps `controls`,
+/// `oleObjects` and `legacyDrawing` that way.
+///
+/// A child the parser can't read to its end (a mismatched end tag inside
+/// it) is spanned by its own end tag when one follows and
+/// [`resync_is_safe`] vouches for it, and the walk goes on. Otherwise the
+/// walk stops there and records it in `stopped`. An end tag that isn't
+/// `</worksheet>` also stops the walk, with `stopped` left `None`. Either
+/// way `close` is `None`: the children before the stop are real, but the
+/// list is not known to be whole. `close` is `</worksheet>`'s start, or the
+/// end of the last child when the part ends without one.
+/// [`worksheet_insert_pos`] says where an insert is still safe; a
+/// self-closing root has nothing to walk at all.
+fn worksheet_children(xml: &str) -> WorksheetWalk<'_> {
+    let mut walk = WorksheetWalk {
+        children: Vec::new(),
+        close: None,
+        stopped: None,
     };
-    if let Some(attrs) = attrs {
-        let block = format!("<sheetProtection {attrs}/>");
-        let pos = out
-            .find("</sheetData>")
-            .map(|i| i + "</sheetData>".len())
-            .or_else(|| out.find("</worksheet>"))
-            .unwrap_or(out.len());
-        out.insert_str(pos, &block);
+    let mut p = XmlParser::new(xml);
+    // Skip to the root's start tag.
+    loop {
+        match p.next() {
+            Event::Start => break,
+            Event::Eof => return walk,
+            _ => {}
+        }
+    }
+    if xml[..p.pos()].ends_with("/>") {
+        return walk;
+    }
+    let root = p.name();
+    let root_end = p.pos();
+    // Offset of `p`'s input within `xml`: the walk restarts past a sheetData
+    // it skipped and past a child it had to span by its end tag.
+    let mut base = 0;
+    loop {
+        match p.next() {
+            Event::Start => {
+                let start = base + p.start_pos();
+                let qname = p.name();
+                let name = local(qname);
+                let body = base + p.pos();
+                let self_closing = xml[..body].ends_with("/>");
+                let skip_to = (name == "sheetData" && !self_closing)
+                    .then(|| sheet_data_end(xml, body, qname))
+                    .flatten();
+                let end = match skip_to {
+                    Some(end) => Some(end),
+                    None if p.skip_element_complete() => Some(base + p.pos()),
+                    // Broken inside: its own end tag, if one follows, still
+                    // bounds it, unless it could be someone else's.
+                    None => close_tag_end(xml, body, qname)
+                        .filter(|&end| resync_is_safe(&xml[body..end], name)),
+                };
+                let Some(end) = end else {
+                    walk.stopped = Some((start, name));
+                    return walk;
+                };
+                if skip_to.is_some() || base + p.pos() != end {
+                    // The bulk of the part, or a damaged child: resume past it
+                    // rather than tokenise the cells or trust the parser's
+                    // position.
+                    base = end;
+                    p = XmlParser::new(&xml[end..]);
+                }
+                let rank_as = match name {
+                    "AlternateContent" => alternate_content_rank(&xml[start..end]).unwrap_or(name),
+                    _ => name,
+                };
+                walk.children.push(WorksheetChild {
+                    local: name,
+                    rank_as,
+                    start,
+                    end,
+                });
+            }
+            // `</worksheet>`: the end tag just consumed. A stray end tag of
+            // another name means the structure is off: stop.
+            Event::End => {
+                if p.name() == root {
+                    walk.close = xml[..base + p.pos()].rfind("</");
+                }
+                return walk;
+            }
+            // No `</worksheet>`: every child was read, so the list is whole;
+            // new content goes after the last one.
+            Event::Eof => {
+                walk.close = Some(walk.children.last().map_or(root_end, |c| c.end));
+                return walk;
+            }
+            Event::Text => {}
+        }
+    }
+}
+
+/// The worksheet's `<sheetData>` (any prefix) for a part whose top-level
+/// walk stopped before it: read with the parser, or, when the parser can't
+/// finish it, spanned by its end tag as long as no comment, CDATA section or
+/// processing instruction could be hiding a literal one. `None` leaves the
+/// part as it was, which is what main did with a sheetData it couldn't find.
+fn sheet_data_fallback_span(xml: &str) -> Option<(usize, usize)> {
+    if let Some(span) = element_span_by_tags(xml, "sheetData") {
+        return Some(span);
+    }
+    let (start, prefix) = find_local_element(xml, "sheetData")?;
+    let gt = tag_end(xml, start);
+    if xml[..gt].ends_with("/>") {
+        return Some((start, gt));
+    }
+    Some((
+        start,
+        sheet_data_end(xml, gt, &format!("{prefix}sheetData"))?,
+    ))
+}
+
+/// Can the end tag that closes `span` be trusted to be its broken child's
+/// own? Not when a comment, CDATA section or processing instruction could
+/// hold a literal one, nor when an element of the same local name nests in
+/// it (a `<customSheetView>`'s `<autoFilter>` inside a broken top-level one):
+/// its end tag would close that instead.
+fn resync_is_safe(span: &str, name: &str) -> bool {
+    if span.contains("<!--") || span.contains("<![CDATA[") || span.contains("<?") {
+        return false;
+    }
+    let mut p = XmlParser::new(span);
+    loop {
+        match p.next() {
+            Event::Start if local(p.name()) == name => return false,
+            Event::Eof => return true,
+            _ => {}
+        }
+    }
+}
+
+/// Just past the first `</qname>` (any spacing before `>`) at or after `from`.
+fn close_tag_end(xml: &str, from: usize, qname: &str) -> Option<usize> {
+    let needle = format!("</{qname}");
+    let mut from = from;
+    loop {
+        let at = from + xml[from..].find(&needle)?;
+        let rest = &xml[at + needle.len()..];
+        let trimmed = rest.trim_start_matches([' ', '\t', '\r', '\n']);
+        if trimmed.starts_with('>') {
+            return Some(at + needle.len() + (rest.len() - trimmed.len()) + 1);
+        }
+        from = at + needle.len();
+    }
+}
+
+/// The first element whose local name is `tag`, anywhere in the part, read
+/// with the parser: for a worksheet whose top-level walk never reached it.
+/// sheetData, mergeCells and sheetProtection appear nowhere else, so the
+/// first one is the worksheet's own.
+fn element_span_by_tags(xml: &str, tag: &str) -> Option<(usize, usize)> {
+    let mut p = XmlParser::new(xml);
+    loop {
+        match p.next() {
+            Event::Start if local(p.name()) == tag => {
+                let start = p.start_pos();
+                return p.skip_element_complete().then(|| (start, p.pos()));
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
+}
+
+/// Just past the `</sheetData>` (any spacing before `>`) that closes the
+/// sheetData whose body starts at `body`, found without tokenising the cells.
+/// `None` sends the caller to the parser: no such tag, or a comment, CDATA
+/// section or processing instruction in the way that could hold a literal
+/// one.
+fn sheet_data_end(xml: &str, body: usize, qname: &str) -> Option<usize> {
+    let close = close_tag_end(xml, body, qname)?;
+    let span = &xml[body..close];
+    (!span.contains("<!--") && !span.contains("<![CDATA[") && !span.contains("<?")).then_some(close)
+}
+
+/// The local name of the first element inside the first `Choice` or
+/// `Fallback` of an `mc:AlternateContent` fragment.
+fn alternate_content_rank(fragment: &str) -> Option<&str> {
+    let mut p = XmlParser::new(fragment);
+    let mut in_branch = false;
+    loop {
+        match p.next() {
+            Event::Start if in_branch => return Some(local(p.name())),
+            Event::Start if matches!(local(p.name()), "Choice" | "Fallback") => in_branch = true,
+            Event::End if in_branch => return None,
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
+}
+
+fn ct_worksheet_rank(name: &str) -> Option<usize> {
+    CT_WORKSHEET_ORDER.iter().position(|n| *n == name)
+}
+
+/// Byte offset at which a new top-level `<tag>` belongs: before the first
+/// existing top-level child that ranks after `tag`, else at the walk's
+/// `close` (`</worksheet>`, or the end of the last child when the part has
+/// none). Children the schema doesn't name are not anchors.
+///
+/// After a walk that stopped, the position is still known when a found
+/// child ranks after `tag`, or when the child it stopped at does (its start
+/// tag parsed). Otherwise it is `None`: there is no safe place.
+///
+/// A `Some` also means `tag` was looked for everywhere it may stand: in a
+/// schema-ordered part an element ranking before the stopped child can't
+/// follow it. So a caller that didn't find a singleton may add it here
+/// without risking a second.
+fn worksheet_insert_pos(xml: &str, tag: &str) -> Option<usize> {
+    let rank = ct_worksheet_rank(tag).unwrap_or(CT_WORKSHEET_ORDER.len());
+    let after = |name: &str| ct_worksheet_rank(name).is_some_and(|r| r > rank);
+    let walk = worksheet_children(xml);
+    walk.children
+        .iter()
+        .find(|c| after(c.rank_as))
+        .map(|c| c.start)
+        .or(walk.close)
+        .or_else(|| walk.stopped.filter(|&(_, n)| after(n)).map(|(s, _)| s))
+}
+
+/// Can a `<tag>` be added to this worksheet: is its position known, or
+/// (with `join`) is there one to join or replace? The edit APIs ask first,
+/// so an edit that can't be written changes neither the part nor the model.
+fn worksheet_takes(xml: &str, tag: &str, join: bool) -> bool {
+    // A self-closing root is opened up by the insert.
+    worksheet_root(xml).is_some_and(|r| r.self_closing)
+        || (join && worksheet_child_span(xml, tag).is_some())
+        || worksheet_insert_pos(xml, tag).is_some()
+}
+
+/// The span of the first top-level `<tag>` (in any prefix) the walk found.
+/// `None` does not prove there is none when the walk stopped early; the
+/// insert paths check that for themselves.
+pub(crate) fn worksheet_child_span(xml: &str, tag: &str) -> Option<(usize, usize)> {
+    worksheet_children(xml)
+        .children
+        .iter()
+        .find(|c| c.local == tag)
+        .map(|c| (c.start, c.end))
+}
+
+/// `xml` with its top-level `<tag>` (if the walk found one) removed.
+pub(crate) fn remove_worksheet_child(xml: &str, tag: &str) -> String {
+    match worksheet_child_span(xml, tag) {
+        Some((s, e)) => format!("{}{}", &xml[..s], &xml[e..]),
+        None => xml.to_string(),
+    }
+}
+
+/// `xml` without its singleton top-level `<tag>`: the one the walk found, or,
+/// when the walk stopped where a `<tag>` could still follow, the first one
+/// found by its tags (what main did). The tag scan runs only in that case:
+/// the plain save of a sheet with no merges asks this on every save.
+pub(crate) fn remove_worksheet_singleton(xml: &str, tag: &str) -> String {
+    if worksheet_child_span(xml, tag).is_some() {
+        return remove_worksheet_child(xml, tag);
+    }
+    if worksheet_insert_pos(xml, tag).is_some() {
+        return xml.to_string();
+    }
+    match element_span_by_tags(xml, tag) {
+        Some((s, e)) => format!("{}{}", &xml[..s], &xml[e..]),
+        None => xml.to_string(),
+    }
+}
+
+/// Sync a singleton top-level `<tag>` with `block` (`None` drops it), at
+/// save time, where the model has to reach the part.
+///
+/// The old element (found by the walk) goes, and the new one lands at its
+/// schema position, which also repairs a misplaced one. Where
+/// [`worksheet_insert_pos`] has no position (the walk stopped at or before
+/// `tag`'s rank), it does what main did: the first `<tag>` anywhere is
+/// replaced, or the block goes right after `</sheetData>`. Never a second
+/// one, and never a model edit that the part doesn't carry.
+fn sync_worksheet_child(xml: &str, tag: &str, block: Option<&str>) -> String {
+    let Some(block) = block else {
+        return remove_worksheet_singleton(xml, tag);
+    };
+    let out = remove_worksheet_child(xml, tag);
+    if worksheet_insert_pos(&out, tag).is_some() {
+        return put_worksheet_child(&out, tag, block, None, false);
+    }
+    let block = match worksheet_root(xml) {
+        Some(root) => in_worksheet_ns(&root, block),
+        None => block.to_string(),
+    };
+    let (s, e) = match worksheet_child_span(xml, tag).or_else(|| element_span_by_tags(xml, tag)) {
+        Some(span) => span,
+        None => match element_span_by_tags(xml, "sheetData") {
+            Some((_, e)) => (e, e),
+            // Nowhere to anchor it at all: the part is too damaged to take it.
+            None => return xml.to_string(),
+        },
+    };
+    format!("{}{block}{}", &xml[..s], &xml[e..])
+}
+
+/// What a worksheet's root start tag binds. The writer writes its elements
+/// unprefixed and `r:id` with the `r` prefix; these say whether that is
+/// already right where they land.
+struct WorksheetRoot {
+    /// Offset of the root start tag's closing `>` (or `/>`).
+    tag_close: usize,
+    /// `<worksheet …/>`: no content, and no end tag to insert before.
+    self_closing: bool,
+    qname: String,
+    /// The namespace the root element itself is in.
+    ns: String,
+    /// The default namespace the root declares, if any.
+    default_ns: Option<String>,
+    /// What the root binds the `r` prefix to, if anything.
+    r_ns: Option<String>,
+}
+
+fn worksheet_root(xml: &str) -> Option<WorksheetRoot> {
+    let mut p = XmlParser::new(xml);
+    loop {
+        match p.next() {
+            Event::Start => break,
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
+    let bound = |decl: &str| {
+        p.namespace_attrs()
+            .iter()
+            .rev()
+            .find(|a| a.name == decl)
+            .map(|a| a.value.to_string())
+    };
+    let own = match p.name().split_once(':') {
+        Some((prefix, _)) => format!("xmlns:{prefix}"),
+        None => "xmlns".to_string(),
+    };
+    let end = p.pos();
+    let self_closing = xml[..end].ends_with("/>");
+    Some(WorksheetRoot {
+        tag_close: if self_closing { end - 2 } else { end - 1 },
+        self_closing,
+        qname: p.name().to_string(),
+        ns: bound(&own).unwrap_or_default(),
+        default_ns: bound("xmlns"),
+        r_ns: bound("xmlns:r"),
+    })
+}
+
+/// `block` with ` {decl}` added to its first start tag, after the name.
+fn with_decl(block: &str, decl: &str) -> String {
+    let name_end = block
+        .char_indices()
+        .skip(1)
+        .find(|&(_, c)| c.is_whitespace() || c == '/' || c == '>')
+        .map_or(block.len(), |(i, _)| i);
+    format!("{} {decl}{}", &block[..name_end], &block[name_end..])
+}
+
+/// `block` (written unprefixed) as it must be spelled inside this worksheet:
+/// where the default namespace isn't the worksheet's own (a sheet written as
+/// `<x:worksheet xmlns:x="…">`), the block declares it, so its unprefixed
+/// names stay in SpreadsheetML.
+fn in_worksheet_ns(root: &WorksheetRoot, block: &str) -> String {
+    if root.default_ns.as_deref() == Some(root.ns.as_str()) || root.ns.is_empty() {
+        block.to_string()
+    } else {
+        with_decl(block, &format!("xmlns=\"{}\"", root.ns))
+    }
+}
+
+/// Make `r:` mean `rels` for `block`: declared on the root when the root
+/// doesn't bind `r`, or on the block itself when the root binds it to
+/// something else.
+fn bind_r(xml: &mut String, root: &WorksheetRoot, block: String, rels: &str) -> String {
+    match root.r_ns.as_deref() {
+        Some(r) if r == rels => block,
+        None => {
+            xml.insert_str(root.tag_close, &format!(" xmlns:r=\"{rels}\""));
+            block
+        }
+        Some(_) => with_decl(&block, &format!("xmlns:r=\"{rels}\"")),
+    }
+}
+
+/// Put `block`, a top-level `<tag>` element written unprefixed, into the
+/// worksheet: in place of the existing `<tag>` (in any prefix) when
+/// `replace` is set and there is one, else at its `CT_Worksheet` position.
+/// With `rels`, the block's `r:id` is bound to that namespace. A replace
+/// works whenever the walk found the element; an insert needs a position
+/// [`worksheet_insert_pos`] vouches for, and otherwise the part is returned
+/// unchanged.
+pub(crate) fn put_worksheet_child(
+    xml: &str,
+    tag: &str,
+    block: &str,
+    rels: Option<&str>,
+    replace: bool,
+) -> String {
+    let mut out = xml.to_string();
+    let Some(root) = worksheet_root(xml) else {
+        return out;
+    };
+    if root.self_closing {
+        // `<worksheet …/>`: open it up, so the block goes inside the root
+        // rather than after the document element.
+        out.replace_range(
+            root.tag_close..root.tag_close + 2,
+            &format!("></{}>", root.qname),
+        );
+    }
+    let mut block = in_worksheet_ns(&root, block);
+    if let Some(rels) = rels {
+        block = bind_r(&mut out, &root, block, rels);
+    }
+    match worksheet_child_span(&out, tag).filter(|_| replace) {
+        Some((s, e)) => out.replace_range(s..e, &block),
+        None => match worksheet_insert_pos(&out, tag) {
+            Some(pos) => out.insert_str(pos, &block),
+            // No known position: the part is left as it is. The edit APIs
+            // ask `worksheet_takes` first, so they refuse instead.
+            None => return xml.to_string(),
+        },
     }
     out
 }
 
-/// Rewrite the `<mergeCells>` block from the model's merged regions (removing it
-/// when there are none). Placed right after `</sheetData>` (schema order).
-/// Idempotent.
-fn set_merge_cells(xml: &str, merges: &[(u32, u32, u32, u32)]) -> String {
-    // Drop any existing <mergeCells>…</mergeCells> (or self-closing) first.
-    let mut out = if let Some(s) = xml.find("<mergeCells") {
-        let e = xml[s..]
-            .find("</mergeCells>")
-            .map(|i| s + i + "</mergeCells>".len())
-            .or_else(|| xml[s..].find("/>").map(|i| s + i + 2))
-            .unwrap_or(s);
-        format!("{}{}", &xml[..s], &xml[e..])
+/// Append `item` inside the worksheet's existing top-level `<tag>` (in any
+/// prefix), bumping its `count`. `None` when there is no such element.
+pub(crate) fn append_to_worksheet_child(
+    xml: &str,
+    tag: &str,
+    item: &str,
+    rels: Option<&str>,
+) -> Option<String> {
+    worksheet_child_span(xml, tag)?;
+    let mut out = xml.to_string();
+    let root = worksheet_root(xml)?;
+    let mut item = in_worksheet_ns(&root, item);
+    if let Some(rels) = rels {
+        item = bind_r(&mut out, &root, item, rels);
+    }
+    let (s, _) = worksheet_child_span(&out, tag)?;
+    if let Some(n) = attr_at(&out, s, "count").and_then(|v| v.parse::<u32>().ok()) {
+        out = set_tag_attr(&out, s, "count", Some(&(n + 1).to_string()));
+    }
+    let (s, e) = worksheet_child_span(&out, tag)?;
+    if out[..e].ends_with("/>") {
+        // `<x:tableParts count="0"/>`: open it up.
+        let qname_end = out[s + 1..]
+            .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
+            .map_or(e, |i| s + 1 + i);
+        let qname = out[s + 1..qname_end].to_string();
+        out.replace_range(e - 2..e, &format!(">{item}</{qname}>"));
     } else {
-        xml.to_string()
-    };
+        let close = out[..e].rfind("</").unwrap_or(e);
+        out.insert_str(close, &item);
+    }
+    Some(out)
+}
+
+/// Sync the `<sheetProtection>` element from the model: the existing one
+/// goes, and the sheet's protection lands at its schema position, or where
+/// [`sync_worksheet_child`] can still put it on a malformed part. Idempotent.
+fn set_sheet_protection(xml: &str, attrs: Option<&str>) -> String {
+    let block = attrs.map(|a| format!("<sheetProtection {a}/>"));
+    sync_worksheet_child(xml, "sheetProtection", block.as_deref())
+}
+
+/// Rewrite the `<mergeCells>` block from the model's merged regions (removing it
+/// when there are none), at its schema position, or where
+/// [`sync_worksheet_child`] can still put it on a malformed part. Idempotent.
+fn set_merge_cells(xml: &str, merges: &[(u32, u32, u32, u32)]) -> String {
     if merges.is_empty() {
-        return out;
+        return sync_worksheet_child(xml, "mergeCells", None);
     }
     let cells: String = merges
         .iter()
@@ -2880,13 +3409,7 @@ fn set_merge_cells(xml: &str, merges: &[(u32, u32, u32, u32)]) -> String {
         "<mergeCells count=\"{}\">{cells}</mergeCells>",
         merges.len()
     );
-    // After </sheetData>, else before </worksheet>.
-    if let Some(pos) = out.find("</sheetData>").map(|i| i + "</sheetData>".len()) {
-        out.insert_str(pos, &block);
-    } else {
-        out = out.replacen("</worksheet>", &format!("{block}</worksheet>"), 1);
-    }
-    out
+    sync_worksheet_child(xml, "mergeCells", Some(&block))
 }
 
 /// A `<dxf>` (differential format) for conditional formatting.
@@ -2960,50 +3483,94 @@ fn set_freeze_pane(xml: &str, freeze: (u32, u32)) -> String {
             cell_name(fr, fc)
         )
     };
-    // Drop any existing <pane …/> first (idempotent; also handles unfreeze).
-    let mut out = if let Some(ps) = xml.find("<pane") {
-        let pe = xml[ps..]
-            .find("/>")
-            .map(|i| ps + i + 2)
-            .or_else(|| xml[ps..].find("</pane>").map(|i| ps + i + "</pane>".len()))
-            .unwrap_or(ps);
-        format!("{}{}", &xml[..ps], &xml[pe..])
-    } else {
-        xml.to_string()
+    let new_views =
+        || format!("<sheetViews><sheetView workbookViewId=\"0\">{pane}</sheetView></sheetViews>");
+    let Some(view) = first_sheet_view(xml) else {
+        // No <sheetView> (in any prefix): a full block at its schema position,
+        // in place of an empty <sheetViews/> if there is one.
+        return if pane.is_empty() {
+            xml.to_string()
+        } else {
+            put_worksheet_child(xml, "sheetViews", &new_views(), None, true)
+        };
     };
+    // Drop its existing <pane> first (idempotent; also handles unfreeze).
+    let mut out = xml.to_string();
+    if let Some((ps, pe)) = view.pane {
+        out.replace_range(ps..pe, "");
+    }
     if pane.is_empty() {
         return out;
     }
-    // Insert into the first <sheetView> (expanding a self-closing one).
-    if let Some(sv) = find_element(&out, "sheetView") {
-        if let Some(gt) = out[sv..].find('>').map(|i| sv + i) {
-            if out.as_bytes()[gt - 1] == b'/' {
-                out = format!("{}>{}</sheetView>{}", &out[..gt - 1], pane, &out[gt + 1..]);
-            } else {
-                out.insert_str(gt + 1, &pane);
-            }
-            return out;
-        }
-    }
-    // No <sheetView>: insert a full block after <dimension …>, else after the
-    // <worksheet …> opening tag (both keep the schema's element order).
-    let block =
-        format!("<sheetViews><sheetView workbookViewId=\"0\">{pane}</sheetView></sheetViews>");
-    let anchor = find_element(&out, "dimension")
-        .and_then(|d| {
-            out[d..]
-                .find("/>")
-                .map(|i| d + i + 2)
-                .or_else(|| out[d..].find('>').map(|i| d + i + 1))
-        })
-        .or_else(|| {
-            out.find("<worksheet")
-                .and_then(|w| out[w..].find('>').map(|i| w + i + 1))
-        });
-    if let Some(pos) = anchor {
-        out.insert_str(pos, &block);
+    let pane = match worksheet_root(&out) {
+        Some(root) => in_worksheet_ns(&root, &pane),
+        None => pane,
+    };
+    // A pane is the sheetView's first child: right after its start tag,
+    // expanding a self-closing one.
+    if view.self_closing {
+        let gt = view.tag_end - 2;
+        out.replace_range(gt..view.tag_end, &format!(">{pane}</{}>", view.qname));
+    } else {
+        out.insert_str(view.tag_end, &pane);
     }
     out
+}
+
+/// The worksheet's first `<sheetView>` (in any prefix, inside the top-level
+/// `<sheetViews>`, never one in `<customSheetViews>`) and its `<pane>`.
+struct SheetViewAt {
+    /// Just past its start tag.
+    tag_end: usize,
+    qname: String,
+    self_closing: bool,
+    pane: Option<(usize, usize)>,
+}
+
+fn first_sheet_view(xml: &str) -> Option<SheetViewAt> {
+    let (vs, ve) = worksheet_child_span(xml, "sheetViews")?;
+    let mut p = XmlParser::new(&xml[vs..ve]);
+    // The <sheetViews> start tag, then its first <sheetView> child.
+    matches!(p.next(), Event::Start).then_some(())?;
+    loop {
+        match p.next() {
+            Event::Start if local(p.name()) == "sheetView" => break,
+            Event::Start => {
+                p.skip_element_complete();
+            }
+            Event::End | Event::Eof => return None,
+            Event::Text => {}
+        }
+    }
+    let qname = p.name().to_string();
+    let tag_end = vs + p.pos();
+    let self_closing = xml[..tag_end].ends_with("/>");
+    let mut pane = None;
+    if !self_closing {
+        loop {
+            match p.next() {
+                Event::Start => {
+                    let start = vs + p.start_pos();
+                    let is_pane = local(p.name()) == "pane";
+                    if !p.skip_element_complete() {
+                        break;
+                    }
+                    if is_pane {
+                        pane = Some((start, vs + p.pos()));
+                        break;
+                    }
+                }
+                Event::End | Event::Eof => break,
+                Event::Text => {}
+            }
+        }
+    }
+    Some(SheetViewAt {
+        tag_end,
+        qname,
+        self_closing,
+        pane,
+    })
 }
 
 /// The start tag beginning at `start`: its end (just past `>`).
@@ -3296,14 +3863,20 @@ pub fn chart_is_writable(cd: &crate::sheet::ChartData) -> bool {
     chart_kind_is_writable(&cd.kind) && !cd.complex
 }
 
-/// A self-contained `chartSpace` for the kinds `chart_kind_is_writable`
-/// accepts (bar, column, line, pie). Each series and the categories are written
-/// as a `strRef`/`numRef` naming the cells they read plus a cache of what those
-/// cells said, so the chart stays live in Excel; a series with no reference
-/// falls back to literals (`strLit`/`numLit`) and renders without a source
-/// range. `pub(crate)` so sibling modules' tests can round-trip parse → write →
-/// parse.
+/// [`chart_space_xml_in`] in the transitional namespaces. `pub(crate)` so
+/// sibling modules' tests can round-trip parse → write → parse.
+#[cfg(test)]
 pub(crate) fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
+    chart_space_xml_in(data, &TRANSITIONAL)
+}
+
+/// A self-contained `chartSpace` for the kinds `chart_kind_is_writable`
+/// accepts (bar, column, line, pie), in the namespaces of `ns`'s conformance
+/// class. Each series and the categories are written as a `strRef`/`numRef`
+/// naming the cells they read plus a cache of what those cells said, so the
+/// chart stays live in Excel; a series with no reference falls back to
+/// literals (`strLit`/`numLit`) and renders without a source range.
+fn chart_space_xml_in(data: &crate::sheet::ChartData, ns: &OoxmlNs) -> String {
     // Each cache is sized from ITS OWN slot, never from a chart-wide maximum:
     // series can be re-pointed one at a time, so a 3-cell `<c:f>` beside a
     // 9-point cache is both invalid and self-contradicting — and `parse_chart`
@@ -3494,11 +4067,14 @@ pub(crate) fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
 
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
-<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
+<c:chartSpace xmlns:c=\"{}\" xmlns:a=\"{}\" xmlns:r=\"{}\">\
 <c:chart><c:title><c:tx><c:rich><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>{}</a:t></a:r></a:p></c:rich></c:tx><c:overlay val=\"0\"/></c:title>\
 <c:autoTitleDeleted val=\"0\"/><c:plotArea><c:layout/>\
 {plot_body}{axes}\
 </c:plotArea><c:legend><c:legendPos val=\"b\"/><c:overlay val=\"0\"/></c:legend><c:plotVisOnly val=\"1\"/><c:dispBlanksAs val=\"gap\"/></c:chart></c:chartSpace>",
+        ns.chart,
+        ns.dml,
+        ns.rels,
         esc_attr(&data.title)
     )
 }
@@ -3800,8 +4376,10 @@ impl SheetPackage {
             n += 1;
         }
         let part_name = format!("xl/worksheets/sheet{n}.xml");
+        let ns = self.ns();
         let body = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<worksheet xmlns=\"{SPREADSHEET_NS}\"><dimension ref=\"A1\"/><sheetData/></worksheet>"
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<worksheet xmlns=\"{}\"><dimension ref=\"A1\"/><sheetData/></worksheet>",
+            ns.sml
         );
         self.parts.push((part_name.clone(), body.into_bytes()));
         add_content_type_override(
@@ -3811,7 +4389,7 @@ impl SheetPackage {
         );
         let rid = add_workbook_rel(
             &mut self.parts,
-            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet",
+            &ns.rel("worksheet"),
             &format!("worksheets/sheet{n}.xml"),
         );
         // workbook.xml <sheets> entry with the next free sheetId.
@@ -3851,17 +4429,16 @@ impl SheetPackage {
         self.workbook.sheets.len() - 1
     }
 
-    /// Write a clustered column chart (cached literal data, self-contained) onto
-    /// `sheet`, anchored over the cell rect `from`..`to`, wiring the full OPC:
-    /// the chart part, a drawing part with a twoCellAnchor graphicFrame, both
-    /// rels, the content-type overrides, and the worksheet's `<drawing>` element.
-    /// Also registers it in the model so it round-trips on reload.
     /// Add a `cellIs` conditional-formatting rule (Excel's "Highlight Cells"):
     /// the differential format `dxf` applies to `range` when the cell value
     /// satisfies `op` (greaterThan / lessThan / between / equal / …) against
     /// `formula1` (and `formula2` for `between`). Wires the OPC (a `<dxf>` in
     /// styles.xml + a `<conditionalFormatting>` in the worksheet) and the model,
     /// so it renders via cf::cell_dxf and round-trips.
+    ///
+    /// `false`, with nothing changed, when the rule can't be written: the
+    /// sheet doesn't exist, or its worksheet part is malformed where the rule
+    /// would go.
     pub fn add_conditional_format(
         &mut self,
         sheet: usize,
@@ -3870,9 +4447,11 @@ impl SheetPackage {
         formula1: &str,
         formula2: Option<&str>,
         dxf: crate::sheet::Dxf,
-    ) {
-        if sheet >= self.workbook.sheets.len() {
-            return;
+    ) -> bool {
+        if sheet >= self.workbook.sheets.len()
+            || !self.sheet_takes(sheet, "conditionalFormatting", false)
+        {
+            return false;
         }
         let dxf_id = self.workbook.styles.dxfs.len();
         self.workbook.styles.dxfs.push(dxf);
@@ -3892,8 +4471,8 @@ impl SheetPackage {
             .max()
             .unwrap_or(0)
             + 1;
-        // Worksheet: inject <conditionalFormatting> after </sheetData> (mergeCells,
-        // if any, is spliced in ahead of it at save time, keeping schema order).
+        // Worksheet: inject <conditionalFormatting> at its schema position,
+        // after any existing ones.
         let (r1, c1, r2, c2) = range;
         let sqref = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
         let mut fmls = format!("<formula>{}</formula>", esc_text(formula1));
@@ -3905,13 +4484,9 @@ impl SheetPackage {
         );
         let sheet_part = self.sheet_parts[sheet].clone();
         if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
-            let mut xml = String::from_utf8_lossy(&p.1).into_owned();
-            if let Some(pos) = xml.find("</sheetData>").map(|i| i + "</sheetData>".len()) {
-                xml.insert_str(pos, &cf_xml);
-            } else {
-                xml = xml.replacen("</worksheet>", &format!("{cf_xml}</worksheet>"), 1);
-            }
-            p.1 = xml.into_bytes();
+            let xml = String::from_utf8_lossy(&p.1).into_owned();
+            p.1 = put_worksheet_child(&xml, "conditionalFormatting", &cf_xml, None, false)
+                .into_bytes();
         }
         // Model.
         let mut formulas = vec![formula1.to_string()];
@@ -3932,6 +4507,7 @@ impl SheetPackage {
                 ranges: vec![range],
                 rules: vec![rule],
             });
+        true
     }
 
     /// Add a data-validation rule to `sheet` over `range`. For a list, pass
@@ -3939,6 +4515,8 @@ impl SheetPackage {
     /// numeric/date kinds use an operator (between/greaterThan/…) + operand(s).
     /// Appends a `<dataValidation>` to the worksheet (preserving existing ones)
     /// and the model, so it round-trips and drives the dropdown / cell check.
+    /// `false`, with nothing changed, when it can't be written (see
+    /// [`SheetPackage::add_conditional_format`]).
     pub fn add_data_validation(
         &mut self,
         sheet: usize,
@@ -3947,9 +4525,10 @@ impl SheetPackage {
         operator: &str,
         formula1: &str,
         formula2: Option<&str>,
-    ) {
-        if sheet >= self.workbook.sheets.len() {
-            return;
+    ) -> bool {
+        if sheet >= self.workbook.sheets.len() || !self.sheet_takes(sheet, "dataValidations", true)
+        {
+            return false;
         }
         let (r1, c1, r2, c2) = range;
         let sqref = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
@@ -3967,32 +4546,14 @@ impl SheetPackage {
         );
         let sheet_part = self.sheet_parts[sheet].clone();
         if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
-            let mut xml = String::from_utf8_lossy(&p.1).into_owned();
-            if let Some(s) = xml.find("<dataValidations") {
-                // Bump the count attribute, then append before </dataValidations>.
-                if let Some(cs) = xml[s..].find("count=\"").map(|i| s + i + 7) {
-                    if let Some(ce) = xml[cs..].find('"').map(|i| cs + i) {
-                        if let Ok(n) = xml[cs..ce].parse::<u32>() {
-                            xml.replace_range(cs..ce, &(n + 1).to_string());
-                        }
-                    }
-                }
-                if let Some(e) = xml.find("</dataValidations>") {
-                    xml.insert_str(e, &dv_xml);
-                }
-            } else {
-                let block = format!("<dataValidations count=\"1\">{dv_xml}</dataValidations>");
-                // dataValidations follows sheetData/mergeCells/conditionalFormatting;
-                // insert before the first following element (hyperlinks/pageMargins/…).
-                let anchor = ["<hyperlinks", "<pageMargins", "<drawing", "<legacyDrawing"]
-                    .iter()
-                    .filter_map(|t| xml.find(t))
-                    .min()
-                    .or_else(|| xml.find("</worksheet>"));
-                if let Some(pos) = anchor {
-                    xml.insert_str(pos, &block)
-                }
-            }
+            let xml = String::from_utf8_lossy(&p.1).into_owned();
+            // Into the existing block (in any prefix), bumping its count, or a
+            // new block at its schema position.
+            let xml = append_to_worksheet_child(&xml, "dataValidations", &dv_xml, None)
+                .unwrap_or_else(|| {
+                    let block = format!("<dataValidations count=\"1\">{dv_xml}</dataValidations>");
+                    put_worksheet_child(&xml, "dataValidations", &block, None, false)
+                });
             p.1 = xml.into_bytes();
         }
         self.workbook.sheets[sheet]
@@ -4005,6 +4566,7 @@ impl SheetPackage {
                 formula2: formula2.unwrap_or("").to_string(),
                 prompt: None,
             });
+        true
     }
 
     /// Create an Excel Table ("Format as Table") over `range`. Column names come
@@ -4019,7 +4581,9 @@ impl SheetPackage {
         has_header: bool,
         style: &str,
     ) -> Option<usize> {
-        if sheet >= self.workbook.sheets.len() {
+        // Asked before any part, rel or content type is written, so a refusal
+        // leaves the package exactly as it was.
+        if sheet >= self.workbook.sheets.len() || !self.sheet_takes(sheet, "tableParts", true) {
             return None;
         }
         let (r1, c1, r2, c2) = range;
@@ -4067,8 +4631,10 @@ impl SheetPackage {
         } else {
             " headerRowCount=\"0\""
         };
+        let ns = self.ns();
         let table_xml = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<table xmlns=\"{SPREADSHEET_NS}\" id=\"{tn}\" name=\"{name}\" displayName=\"{name}\" ref=\"{sqref}\"{header_attr} totalsRowShown=\"0\"><autoFilter ref=\"{sqref}\"/><tableColumns count=\"{}\">{cols_xml}</tableColumns><tableStyleInfo name=\"{style}\" showFirstColumn=\"0\" showLastColumn=\"0\" showRowStripes=\"1\" showColumnStripes=\"0\"/></table>",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<table xmlns=\"{}\" id=\"{tn}\" name=\"{name}\" displayName=\"{name}\" ref=\"{sqref}\"{header_attr} totalsRowShown=\"0\"><autoFilter ref=\"{sqref}\"/><tableColumns count=\"{}\">{cols_xml}</tableColumns><tableStyleInfo name=\"{style}\" showFirstColumn=\"0\" showLastColumn=\"0\" showRowStripes=\"1\" showColumnStripes=\"0\"/></table>",
+            ns.sml,
             names.len()
         );
         let part = format!("xl/tables/table{tn}.xml");
@@ -4088,35 +4654,19 @@ impl SheetPackage {
         let rid = add_rel(
             &mut self.parts,
             &rels_part,
-            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/table",
+            &ns.rel("table"),
             &format!("../tables/table{tn}.xml"),
         );
         if !rid.is_empty() {
             if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
-                let mut xml = String::from_utf8_lossy(&p.1).into_owned();
-                if !xml.contains("xmlns:r=") {
-                    xml = xml.replacen("<worksheet ", "<worksheet xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" ", 1);
-                }
+                let xml = String::from_utf8_lossy(&p.1).into_owned();
                 let entry = format!("<tablePart r:id=\"{rid}\"/>");
-                if let Some(s) = xml.find("<tableParts") {
-                    // Bump count + append before </tableParts>.
-                    if let Some(cs) = xml[s..].find("count=\"").map(|i| s + i + 7) {
-                        if let Some(ce) = xml[cs..].find('"').map(|i| cs + i) {
-                            if let Ok(cnt) = xml[cs..ce].parse::<u32>() {
-                                xml.replace_range(cs..ce, &(cnt + 1).to_string());
-                            }
-                        }
-                    }
-                    if let Some(e) = xml.find("</tableParts>") {
-                        xml.insert_str(e, &entry);
-                    }
-                } else {
-                    let block = format!("<tableParts count=\"1\">{entry}</tableParts>");
-                    let pos = xml
-                        .find("<extLst")
-                        .unwrap_or_else(|| xml.find("</worksheet>").unwrap_or(xml.len()));
-                    xml.insert_str(pos, &block);
-                }
+                let rels = Some(ns.rels);
+                let xml = append_to_worksheet_child(&xml, "tableParts", &entry, rels)
+                    .unwrap_or_else(|| {
+                        let block = format!("<tableParts count=\"1\">{entry}</tableParts>");
+                        put_worksheet_child(&xml, "tableParts", &block, rels, false)
+                    });
                 p.1 = xml.into_bytes();
             }
         }
@@ -4135,36 +4685,62 @@ impl SheetPackage {
     /// Remove all conditional-formatting rules from `sheet` (model + the
     /// worksheet's `<conditionalFormatting>` elements). Orphaned `<dxf>`s are left
     /// in styles.xml — harmless and referenced by nothing.
-    pub fn clear_conditional_formats(&mut self, sheet: usize) {
+    ///
+    /// On a malformed worksheet part it clears only when the walk got past
+    /// every place a block may stand (it stopped at a child ranking after
+    /// `conditionalFormatting`). Otherwise it returns `false` and changes
+    /// neither the part nor the model, rather than claim a clear the file
+    /// doesn't carry.
+    pub fn clear_conditional_formats(&mut self, sheet: usize) -> bool {
         if sheet >= self.workbook.sheets.len() {
-            return;
+            return false;
         }
-        self.workbook.sheets[sheet].cond_formats.clear();
         let sheet_part = self.sheet_parts[sheet].clone();
         if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
-            let mut xml = String::from_utf8_lossy(&p.1).into_owned();
-            while let Some(s) = xml.find("<conditionalFormatting") {
-                let e = xml[s..]
-                    .find("</conditionalFormatting>")
-                    .map(|i| s + i + "</conditionalFormatting>".len())
-                    .or_else(|| xml[s..].find("/>").map(|i| s + i + 2))
-                    .unwrap_or(xml.len());
-                xml.replace_range(s..e, "");
+            let xml = String::from_utf8_lossy(&p.1).into_owned();
+            // Every top-level block, in any prefix; never an x14 one in extLst.
+            // A known position for a new block means the walk got past every
+            // place an existing one may stand.
+            if worksheet_insert_pos(&xml, "conditionalFormatting").is_none() {
+                return false;
             }
-            p.1 = xml.into_bytes();
+            let walk = worksheet_children(&xml);
+            let mut out = xml.clone();
+            for c in walk
+                .children
+                .iter()
+                .rev()
+                .filter(|c| c.local == "conditionalFormatting")
+            {
+                out.replace_range(c.start..c.end, "");
+            }
+            p.1 = out.into_bytes();
         }
+        self.workbook.sheets[sheet].cond_formats.clear();
+        true
     }
 
+    /// Write a clustered column chart (cached literal data, self-contained) onto
+    /// `sheet`, anchored over the cell rect `from`..`to`, wiring the full OPC:
+    /// the chart part, a drawing part with a twoCellAnchor graphicFrame, both
+    /// rels, the content-type overrides, and the worksheet's `<drawing>` element.
+    /// Also registers it in the model so it round-trips on reload.
+    ///
+    /// `false`, with nothing changed, when the chart can't be written: the
+    /// worksheet part (malformed where `<drawing>` would go) and the host
+    /// drawing part (no root to splice the anchor into) are asked before any
+    /// part, rel or content type is written.
     pub fn add_chart(
         &mut self,
         sheet: usize,
         from: (u32, u32),
         to: (u32, u32),
         data: &crate::sheet::ChartData,
-    ) {
-        if sheet >= self.workbook.sheets.len() {
-            return;
+    ) -> bool {
+        if sheet >= self.workbook.sheets.len() || !self.sheet_takes(sheet, "drawing", true) {
+            return false;
         }
+        let ns = self.ns();
         let mut cn = 1;
         while self.part(&format!("xl/charts/chart{cn}.xml")).is_some() {
             cn += 1;
@@ -4191,18 +4767,24 @@ impl SheetPackage {
             .rsplit_once('/')
             .unwrap_or(("", drawing_part.as_str()));
         let (d_dir, d_file) = (d_dir.to_string(), d_file.to_string());
+        // A host part with neither a `</wsDr>` nor a self-closed root to open
+        // is truncated or isn't a drawing: refuse before writing anything.
+        if let Some(xml) = host.as_deref().and_then(|p| self.part(p)) {
+            let xml = String::from_utf8_lossy(xml);
+            let px = wsdr_prefix(&xml);
+            let spliceable = xml.rfind(&format!("</{px}wsDr>")).is_some()
+                || open_self_closed_root(&xml, &format!("{px}wsDr")).is_some();
+            if !spliceable {
+                return false;
+            }
+        }
 
         // 2) drawing rels → chart (its rId names the chart from the anchor).
         // Minted BEFORE the chart part is written, so a failure here leaves no
         // orphan behind.
         let d_rels = format!("{d_dir}/_rels/{d_file}.rels");
         let c_target = relative_target(&d_dir, &chart_part);
-        let c_rid = match add_rel(
-            &mut self.parts,
-            &d_rels,
-            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart",
-            &c_target,
-        ) {
+        let c_rid = match add_rel(&mut self.parts, &d_rels, &ns.rel("chart"), &c_target) {
             // "" means the rel was already there — a dangling one naming a chart
             // part the zip doesn't hold, so `cn` picked its name. Reuse its id;
             // an anchor written with `r:id=""` makes Excel call the whole
@@ -4211,12 +4793,14 @@ impl SheetPackage {
             id => id,
         };
         if c_rid.is_empty() {
-            return; // no id to point the graphic frame at; leave the file alone
+            return false; // no id to point the graphic frame at; leave the file alone
         }
 
         // 3) chart part + content type.
-        self.parts
-            .push((chart_part.clone(), chart_space_xml(data).into_bytes()));
+        self.parts.push((
+            chart_part.clone(),
+            chart_space_xml_in(data, ns).into_bytes(),
+        ));
         add_content_type_override(
             &mut self.parts,
             &format!("/{chart_part}"),
@@ -4265,14 +4849,17 @@ impl SheetPackage {
         let (fr, fc) = from;
         let (tr, tc) = to;
         let anchor = format!(
-            "<{px}twoCellAnchor xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
+            "<{px}twoCellAnchor xmlns:a=\"{dml}\" xmlns:r=\"{rels}\">\
 <{px}from><{px}col>{fc}</{px}col><{px}colOff>0</{px}colOff><{px}row>{fr}</{px}row><{px}rowOff>0</{px}rowOff></{px}from>\
 <{px}to><{px}col>{tc}</{px}col><{px}colOff>0</{px}colOff><{px}row>{tr}</{px}row><{px}rowOff>0</{px}rowOff></{px}to>\
 <{px}graphicFrame macro=\"\"><{px}nvGraphicFramePr><{px}cNvPr id=\"{id}\" name=\"Chart {cn}\"/><{px}cNvGraphicFramePr/></{px}nvGraphicFramePr>\
 <{px}xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></{px}xfrm>\
-<a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" r:id=\"{c_rid}\"/></a:graphicData></a:graphic></{px}graphicFrame>\
+<a:graphic><a:graphicData uri=\"{chart}\"><c:chart xmlns:c=\"{chart}\" r:id=\"{c_rid}\"/></a:graphicData></a:graphic></{px}graphicFrame>\
 <{px}clientData/></{px}twoCellAnchor>",
-            id = shape_id
+            id = shape_id,
+            dml = ns.dml,
+            rels = ns.rels,
+            chart = ns.chart,
         );
         // Where this anchor will land: it is spliced at the end, so it takes the
         // next free index in whichever part hosts it. Knowing it is what lets a
@@ -4307,14 +4894,15 @@ impl SheetPackage {
                     // fragment with an undeclared prefix, so leave it be. The
                     // chart part written above is then simply unreferenced,
                     // which is valid OPC and which Excel ignores.
-                    None => return,
+                    None => return false,
                 }
             }
             None => {
                 let drawing_xml = format!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
-<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
-{anchor}</xdr:wsDr>"
+<xdr:wsDr xmlns:xdr=\"{}\" xmlns:a=\"{}\" xmlns:r=\"{}\">\
+{anchor}</xdr:wsDr>",
+                    ns.xdr, ns.dml, ns.rels
                 );
                 self.parts
                     .push((drawing_part.clone(), drawing_xml.into_bytes()));
@@ -4338,70 +4926,36 @@ impl SheetPackage {
             .unwrap_or(("", sheet_part.as_str()));
         let rels_part = format!("{ws_dir}/_rels/{ws_file}.rels");
         let target = relative_target(ws_dir, &drawing_part);
-        let rid = match add_rel(
-            &mut self.parts,
-            &rels_part,
-            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing",
-            &target,
-        ) {
+        let rid = match add_rel(&mut self.parts, &rels_part, &ns.rel("drawing"), &target) {
             // "" means the rel was already there; reuse its id.
             id if id.is_empty() => rel_id_for(&self.parts, &rels_part, &target).unwrap_or_default(),
             id => id,
         };
         if !rid.is_empty() {
             if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
-                let mut xml = String::from_utf8_lossy(&p.1).into_owned();
-                if !xml.contains("xmlns:r=") {
-                    xml = xml.replacen("<worksheet ", "<worksheet xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" ", 1);
+                let xml = String::from_utf8_lossy(&p.1).into_owned();
+                // CT_Worksheet is a SEQUENCE: `drawing` comes before
+                // `legacyDrawing`, `picture`, `oleObjects`, `controls`,
+                // `tableParts` and `extLst`. Appending at `</worksheet>`
+                // puts it after any of those, and Excel treats an
+                // out-of-order child as unreadable content — it "repairs"
+                // the file by dropping the drawing or the table.
+                //
+                // A worksheet that already names a drawing the LOADER rejected
+                // — a rel that resolves to nothing, or a part missing from the
+                // zip — had none in the model, so we just minted a fresh one. A
+                // worksheet may carry only one `<drawing>`, so leaving the
+                // stale element in place orphans the part we wrote: the chart
+                // the user inserted would be silently absent from the saved
+                // file. Point the element at the new part instead.
+                let has_drawing = worksheet_child_span(&xml, "drawing").is_some();
+                p.1 = if !has_drawing || host.is_none() {
+                    let block = format!("<drawing r:id=\"{rid}\"/>");
+                    put_worksheet_child(&xml, "drawing", &block, Some(ns.rels), true)
+                } else {
+                    xml
                 }
-                if !xml.contains("<drawing ") {
-                    // CT_Worksheet is a SEQUENCE: `drawing` comes before
-                    // `legacyDrawing`, `picture`, `oleObjects`, `controls`,
-                    // `tableParts` and `extLst`. Appending at `</worksheet>`
-                    // puts it after any of those, and Excel treats an
-                    // out-of-order child as unreadable content — it "repairs"
-                    // the file by dropping the drawing or the table.
-                    let pos = [
-                        "<legacyDrawingHF",
-                        "<legacyDrawing",
-                        "<drawingHF",
-                        "<picture",
-                        "<oleObjects",
-                        "<controls",
-                        "<webPublishItems",
-                        "<tableParts",
-                        "<extLst",
-                        "</worksheet>",
-                    ]
-                    .iter()
-                    .filter_map(|t| xml.find(t))
-                    .min()
-                    .unwrap_or(xml.len());
-                    xml.insert_str(pos, &format!("<drawing r:id=\"{rid}\"/>"));
-                } else if host.is_none() {
-                    // The worksheet names a drawing the LOADER rejected — a rel
-                    // that resolves to nothing, or a part missing from the zip —
-                    // so the model had none and we just minted a fresh one. A
-                    // worksheet may carry only one `<drawing>`, so leaving the
-                    // stale element in place orphans the part we wrote: the
-                    // chart the user inserted would be silently absent from the
-                    // saved file. Point the element at the new part instead.
-                    if let Some(at) = xml.find("<drawing ") {
-                        let gt = xml[at..].find('>').map(|i| at + i + 1).unwrap_or(xml.len());
-                        let end = if xml[at..gt].ends_with("/>") {
-                            gt
-                        } else {
-                            // `<drawing …></drawing>`: take the close tag too,
-                            // or it would be left dangling.
-                            xml[gt..]
-                                .find("</drawing>")
-                                .map(|i| gt + i + "</drawing>".len())
-                                .unwrap_or(gt)
-                        };
-                        xml.replace_range(at..end, &format!("<drawing r:id=\"{rid}\"/>"));
-                    }
-                }
-                p.1 = xml.into_bytes();
+                .into_bytes();
             }
         }
 
@@ -4420,6 +4974,7 @@ impl SheetPackage {
                 to,
                 kind: crate::sheet::DrawingKind::Chart(data),
             });
+        true
     }
 
     /// Create a pivot table from scratch: writes a pivotCacheDefinition and
@@ -4489,8 +5044,10 @@ impl SheetPackage {
                 format!("<worksheetSource name=\"{}\"/>", esc_attr(name))
             }
         };
+        let ns = self.ns();
         let mut cache_xml = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<pivotCacheDefinition xmlns=\"{SPREADSHEET_NS}\" refreshOnLoad=\"1\" recordCount=\"0\"><cacheSource type=\"worksheet\">{source_xml}</cacheSource><cacheFields count=\"{}\">",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<pivotCacheDefinition xmlns=\"{}\" refreshOnLoad=\"1\" recordCount=\"0\"><cacheSource type=\"worksheet\">{source_xml}</cacheSource><cacheFields count=\"{}\">",
+            ns.sml,
             fields.len()
         );
         for f in &fields {
@@ -4509,7 +5066,7 @@ impl SheetPackage {
         );
         let cache_rid = add_workbook_rel(
             &mut self.parts,
-            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheDefinition",
+            &ns.rel("pivotCacheDefinition"),
             &format!("pivotCache/pivotCacheDefinition{m}.xml"),
         );
 
@@ -4538,7 +5095,8 @@ impl SheetPackage {
         let (lr, lc) = location;
         let loc_ref = format!("{}:{}", cell_name(lr, lc), cell_name(lr + 1, lc + 1));
         let mut table_xml = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<pivotTableDefinition xmlns=\"{SPREADSHEET_NS}\" name=\"PivotTable{n}\" cacheId=\"{cache_id}\" dataCaption=\"Values\" useAutoFormatting=\"1\" indent=\"0\" outline=\"1\" outlineData=\"1\"><location ref=\"{loc_ref}\" firstHeaderRow=\"1\" firstDataRow=\"1\" firstDataCol=\"1\"/><pivotFields count=\"{}\">",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<pivotTableDefinition xmlns=\"{}\" name=\"PivotTable{n}\" cacheId=\"{cache_id}\" dataCaption=\"Values\" useAutoFormatting=\"1\" indent=\"0\" outline=\"1\" outlineData=\"1\"><location ref=\"{loc_ref}\" firstHeaderRow=\"1\" firstDataRow=\"1\" firstDataCol=\"1\"/><pivotFields count=\"{}\">",
+            ns.sml,
             fields.len()
         );
         for (i, _) in fields.iter().enumerate() {
@@ -4572,7 +5130,7 @@ impl SheetPackage {
         add_rel(
             &mut self.parts,
             &rels_part,
-            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable",
+            &ns.rel("pivotTable"),
             &format!("../pivotTables/pivotTable{n}.xml"),
         );
 
@@ -4962,6 +5520,7 @@ pub fn new_xlsx() -> SheetPackage {
         sheet_parts: vec!["xl/worksheets/sheet1.xml".to_string()],
         shared: Vec::new(),
         shared_part: Some("xl/sharedStrings.xml".to_string()),
+        strict: false,
         workbook: Workbook {
             sheets: vec![Sheet {
                 name: "Sheet1".to_string(),
@@ -9881,5 +10440,1097 @@ mod print_setup_tests {
         );
         let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
         assert!(ws.contains(r#"<brk id="14" max="16383" man="1"/>"#), "{ws}");
+    }
+}
+
+/// #597: every worksheet child the writer regenerates or inserts lands at its
+/// `CT_Worksheet` position.
+#[cfg(test)]
+mod ct_worksheet_order_tests {
+    use super::*;
+    use crate::sheet::Cell;
+
+    const NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const SHEET: &str = "xl/worksheets/sheet1.xml";
+    const ROWS: &str = r#"<sheetData><row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>1</v></c></row><row r="2"><c r="A2"><v>2</v></c><c r="B2"><v>2</v></c></row></sheetData>"#;
+    const MARGINS: &str = r#"<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>"#;
+
+    /// A loaded workbook whose one worksheet is `<worksheet …>{body}</worksheet>`.
+    fn loaded(body: &str) -> SheetPackage {
+        let mut pkg = new_xlsx();
+        pkg.set_part(
+            SHEET,
+            format!(
+                r#"<?xml version="1.0"?><worksheet xmlns="{NS}" xmlns:r="{R}">{body}</worksheet>"#
+            )
+            .into_bytes(),
+        );
+        load_xlsx(&write_zip(&pkg.parts)).expect("load")
+    }
+
+    /// The worksheet as the next open sees it.
+    fn saved_sheet(pkg: &SheetPackage) -> String {
+        let re = load_xlsx(&save_xlsx(pkg)).expect("reload");
+        String::from_utf8(re.part(SHEET).unwrap().to_vec()).unwrap()
+    }
+
+    /// Every top-level child the schema names comes in `CT_Worksheet` order.
+    fn in_ct_worksheet_order(xml: &str) -> Result<(), String> {
+        let walk = worksheet_children(xml);
+        walk.close.ok_or("the walk can't finish")?;
+        let ranked: Vec<(&str, usize)> = walk
+            .children
+            .iter()
+            .filter_map(|c| ct_worksheet_rank(c.rank_as).map(|r| (c.rank_as, r)))
+            .collect();
+        if let Some(w) = ranked.windows(2).find(|w| w[0].1 > w[1].1) {
+            return Err(format!("<{}> follows <{}>", w[1].0, w[0].0));
+        }
+        // Every CT_Worksheet child is maxOccurs=1 except conditionalFormatting.
+        match ranked
+            .windows(2)
+            .find(|w| w[0].0 == w[1].0 && w[0].0 != "conditionalFormatting")
+        {
+            Some(w) => Err(format!("<{}> twice", w[0].0)),
+            None => Ok(()),
+        }
+    }
+
+    /// Every element the writer spells unprefixed or with the root's `x:`
+    /// prefix resolves to SpreadsheetML, and every `r:id` to the rels
+    /// namespace: nothing it wrote landed in no namespace or unbound.
+    fn assert_names_bound(xml: &str) {
+        let mut p = XmlParser::new(xml);
+        loop {
+            match p.next() {
+                Event::Start => {
+                    let lookup = |decl: &str| {
+                        p.namespace_attrs()
+                            .iter()
+                            .rev()
+                            .find(|a| a.name == decl)
+                            .map(|a| a.value)
+                    };
+                    let decl = match p.name().split_once(':') {
+                        Some(("x", _)) => "xmlns:x",
+                        Some(_) => continue,
+                        None => "xmlns",
+                    };
+                    assert_eq!(lookup(decl), Some(NS), "<{}> unbound: {xml}", p.name());
+                    if p.attrs().iter().any(|a| a.name == "r:id") {
+                        assert_eq!(lookup("xmlns:r"), Some(R), "<{}> r:id: {xml}", p.name());
+                    }
+                }
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+    }
+
+    fn count_local(xml: &str, name: &str) -> usize {
+        let mut p = XmlParser::new(xml);
+        let mut n = 0;
+        loop {
+            match p.next() {
+                Event::Start if local(p.name()) == name => n += 1,
+                Event::Eof => return n,
+                _ => {}
+            }
+        }
+    }
+
+    /// A worksheet that binds SpreadsheetML only to `x:` (no default
+    /// namespace) and declares no `r:`.
+    fn loaded_prefixed(body: &str) -> SheetPackage {
+        let mut pkg = new_xlsx();
+        pkg.set_part(
+            SHEET,
+            format!(r#"<?xml version="1.0"?><x:worksheet xmlns:x="{NS}">{body}</x:worksheet>"#)
+                .into_bytes(),
+        );
+        load_xlsx(&write_zip(&pkg.parts)).expect("load")
+    }
+
+    const PREFIXED: &str = r#"<x:dimension ref="A1:B2"/><x:sheetViews><x:sheetView workbookViewId="0"><x:pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></x:sheetView></x:sheetViews><x:cols><x:col min="1" max="1" width="20" customWidth="1"/></x:cols><x:sheetData><x:row r="1"><x:c r="A1"><x:v>1</x:v></x:c><x:c r="B1"><x:v>2</x:v></x:c></x:row></x:sheetData><x:mergeCells count="1"><x:mergeCell ref="D1:E1"/></x:mergeCells><x:dataValidations count="1"><x:dataValidation type="whole" sqref="A1"><x:formula1>1</x:formula1></x:dataValidation></x:dataValidations><x:pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>"#;
+
+    #[test]
+    fn a_prefixed_worksheet_saves_without_duplicating_any_child() {
+        let pkg = loaded_prefixed(PREFIXED);
+        assert_eq!(pkg.workbook.sheets[0].merges.len(), 1);
+        assert_eq!(pkg.workbook.sheets[0].freeze, (1, 0));
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert_names_bound(&ws);
+        for name in [
+            "sheetData",
+            "cols",
+            "sheetViews",
+            "sheetView",
+            "pane",
+            "mergeCells",
+        ] {
+            assert_eq!(count_local(&ws, name), 1, "{name}: {ws}");
+        }
+        assert!(ws.contains("D1:E1"), "{ws}");
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(re.workbook.sheets[0].merges, pkg.workbook.sheets[0].merges);
+        assert_eq!(re.workbook.sheets[0].freeze, (1, 0));
+        assert_eq!(re.workbook.sheets[0].col_defs.len(), 1);
+    }
+
+    #[test]
+    fn edits_to_a_prefixed_worksheet_stay_in_its_namespace() {
+        let mut pkg = loaded_prefixed(PREFIXED);
+        let sheet = &mut pkg.workbook.sheets[0];
+        sheet.freeze = (0, 1);
+        sheet.merges.push((4, 0, 4, 1));
+        sheet.set_protected(true);
+        sheet.set_cell(1, 0, Cell::text("new"));
+        let dxf = crate::sheet::Dxf {
+            bold: Some(true),
+            ..Default::default()
+        };
+        pkg.add_conditional_format(0, (0, 0, 1, 0), "greaterThan", "1", None, dxf);
+        pkg.add_data_validation(0, (1, 1, 1, 1), "whole", "between", "1", Some("9"));
+        pkg.add_table(0, (0, 0, 1, 1), true, "TableStyleMedium2")
+            .expect("table");
+        pkg.add_chart(0, (0, 3), (10, 8), &column_chart());
+        pkg.set_comment(0, 0, 0, "A", "note");
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert_names_bound(&ws);
+        for name in [
+            "sheetViews",
+            "pane",
+            "mergeCells",
+            "dataValidations",
+            "tableParts",
+        ] {
+            assert_eq!(count_local(&ws, name), 1, "{name}: {ws}");
+        }
+        // The new rule joined the existing block.
+        assert_eq!(count_local(&ws, "dataValidation"), 2, "{ws}");
+        assert!(ws.contains(r#"<x:dataValidations count="2">"#), "{ws}");
+
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let s = &re.workbook.sheets[0];
+        assert_eq!(s.freeze, (0, 1));
+        assert_eq!(s.merges.len(), 2);
+        assert!(s.is_protected());
+        assert_eq!(s.validations.len(), 2);
+        assert_eq!(re.workbook.tables.len(), 1);
+        assert_eq!(re.comments().len(), 1);
+    }
+
+    #[test]
+    fn an_open_sheet_protection_element_is_replaced_whole() {
+        let mut pkg = loaded(&format!(
+            r#"{ROWS}<sheetProtection sheet="1" objects="1"></sheetProtection><protectedRanges><protectedRange sqref="A1" name="r"/></protectedRanges>"#
+        ));
+        assert!(pkg.workbook.sheets[0].is_protected());
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert_eq!(count_local(&ws, "sheetProtection"), 1, "{ws}");
+        assert!(!ws.contains("</sheetProtection>"), "{ws}");
+        assert!(
+            ws.contains(
+                r#"<protectedRanges><protectedRange sqref="A1" name="r"/></protectedRanges>"#
+            ),
+            "{ws}"
+        );
+        // Unprotecting removes it, and nothing else.
+        pkg.workbook.sheets[0].set_protected(false);
+        let ws = saved_sheet(&pkg);
+        assert_eq!(count_local(&ws, "sheetProtection"), 0, "{ws}");
+        assert!(ws.contains("<protectedRanges>"), "{ws}");
+    }
+
+    #[test]
+    fn a_prefixed_sheet_protection_is_replaced_not_duplicated() {
+        let pkg = loaded_prefixed(
+            r#"<x:sheetData/><x:sheetProtection sheet="1"/><x:protectedRanges><x:protectedRange sqref="A1" name="r"/></x:protectedRanges>"#,
+        );
+        assert!(pkg.workbook.sheets[0].is_protected());
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert_names_bound(&ws);
+        assert_eq!(count_local(&ws, "sheetProtection"), 1, "{ws}");
+    }
+
+    #[test]
+    fn r_is_bound_on_the_element_when_the_root_uses_it_for_something_else() {
+        let mut pkg = new_xlsx();
+        pkg.set_part(
+            SHEET,
+            format!(
+                r#"<?xml version="1.0"?><worksheet xmlns="{NS}" xmlns:r="urn:other">{ROWS}</worksheet>"#
+            )
+            .into_bytes(),
+        );
+        let mut pkg = load_xlsx(&write_zip(&pkg.parts)).unwrap();
+        pkg.add_table(0, (0, 0, 1, 1), true, "TableStyleMedium2")
+            .expect("table");
+        let ws = saved_sheet(&pkg);
+        assert!(
+            ws.contains(r#"xmlns:r="urn:other""#),
+            "the root is left alone: {ws}"
+        );
+        assert_names_bound(&ws);
+    }
+
+    fn assert_ct_worksheet_order(xml: &str) {
+        if let Err(e) = in_ct_worksheet_order(xml) {
+            panic!("{e}: {xml}");
+        }
+    }
+
+    fn at(xml: &str, needle: &str) -> usize {
+        xml.find(needle)
+            .unwrap_or_else(|| panic!("{needle} missing: {xml}"))
+    }
+
+    #[test]
+    fn a_plain_save_keeps_auto_filter_before_merge_cells() {
+        // The #597 repro, as openpyxl writes it.
+        let pkg = loaded(&format!(
+            r#"<dimension ref="A1:B2"/>{ROWS}<autoFilter ref="A1:B10"/><mergeCells count="1"><mergeCell ref="D1:E1"/></mergeCells>{MARGINS}"#
+        ));
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert!(at(&ws, "<autoFilter") < at(&ws, "<mergeCells"), "{ws}");
+        assert!(ws.contains(r#"<mergeCell ref="D1:E1"/>"#), "{ws}");
+    }
+
+    #[test]
+    fn merge_cells_follow_sort_state_consolidation_and_custom_views() {
+        // The custom view carries its own <autoFilter>; only the top-level
+        // children rank.
+        let mut pkg = loaded(&format!(
+            r#"{ROWS}<autoFilter ref="A1:B2"/><sortState ref="A2:B2"><sortCondition ref="A2:A2"/></sortState><dataConsolidate><dataRefs count="1"><dataRef ref="A1:B2"/></dataRefs></dataConsolidate><customSheetViews><customSheetView guid="{{00000000-0000-0000-0000-000000000001}}">{MARGINS}<autoFilter ref="A1:B2"/></customSheetView></customSheetViews>{MARGINS}"#
+        ));
+        pkg.workbook.sheets[0].merges.push((3, 0, 3, 1));
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert!(
+            at(&ws, "</customSheetViews>") < at(&ws, "<mergeCells"),
+            "{ws}"
+        );
+        assert!(
+            at(&ws, "<mergeCells") < ws.rfind("<pageMargins").unwrap(),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn sheet_protection_lands_after_sheet_calc_pr_and_before_protected_ranges() {
+        let mut pkg = loaded(&format!(
+            r#"{ROWS}<sheetCalcPr fullCalcOnLoad="1"/><protectedRanges><protectedRange sqref="A1" name="r"/></protectedRanges><autoFilter ref="A1:B2"/>"#
+        ));
+        pkg.workbook.sheets[0].set_protected(true);
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert!(
+            at(&ws, "<sheetCalcPr") < at(&ws, "<sheetProtection"),
+            "{ws}"
+        );
+        assert!(
+            at(&ws, "<sheetProtection") < at(&ws, "<protectedRanges"),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn a_new_conditional_format_follows_auto_filter_and_merges() {
+        let mut pkg = loaded(&format!(
+            r#"{ROWS}<autoFilter ref="A1:B2"/><mergeCells count="1"><mergeCell ref="D1:E1"/></mergeCells>{MARGINS}"#
+        ));
+        let dxf = crate::sheet::Dxf {
+            bold: Some(true),
+            ..Default::default()
+        };
+        pkg.add_conditional_format(0, (0, 0, 1, 0), "greaterThan", "1", None, dxf.clone());
+        pkg.add_conditional_format(0, (0, 1, 1, 1), "lessThan", "2", None, dxf);
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert!(
+            at(&ws, "</mergeCells>") < at(&ws, "<conditionalFormatting"),
+            "{ws}"
+        );
+        // The second one is appended after the first.
+        assert!(
+            at(&ws, r#"sqref="A1:A2""#) < at(&ws, r#"sqref="B1:B2""#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn a_new_data_validation_block_precedes_print_options() {
+        let mut pkg = loaded(&format!(r#"{ROWS}<printOptions gridLines="1"/>{MARGINS}"#));
+        pkg.add_data_validation(0, (0, 0, 1, 0), "whole", "between", "1", Some("9"));
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert!(
+            at(&ws, "<dataValidations") < at(&ws, "<printOptions"),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn table_parts_skip_an_ext_lst_nested_in_a_cf_rule() {
+        let mut pkg = loaded(&format!(
+            r#"{ROWS}<conditionalFormatting sqref="A1:A2"><cfRule type="dataBar" priority="1"><dataBar><cfvo type="min"/><cfvo type="max"/><color rgb="FF638EC6"/></dataBar><extLst><ext uri="{{B025F937-C7B1-47D3-B67F-A62EFF666E3E}}"/></extLst></cfRule></conditionalFormatting>{MARGINS}<extLst><ext uri="{{78C0D931-6437-407d-A8EE-F0AAD7539E65}}"/></extLst>"#
+        ));
+        pkg.add_table(0, (0, 0, 1, 1), true, "TableStyleMedium2")
+            .expect("table added");
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        let tp = at(&ws, "<tableParts");
+        assert!(at(&ws, "</conditionalFormatting>") < tp, "{ws}");
+        assert!(tp < ws.rfind("<extLst").unwrap(), "{ws}");
+    }
+
+    fn column_chart() -> crate::sheet::ChartData {
+        crate::sheet::ChartData {
+            kind: "column".into(),
+            categories: vec!["a".into()],
+            series: vec![crate::sheet::ChartSeries {
+                name: "s".into(),
+                values: vec![1.0],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_new_drawing_precedes_controls_wrapped_in_alternate_content() {
+        let mc = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+        let mut pkg = loaded(&format!(
+            r#"{ROWS}{MARGINS}<mc:AlternateContent xmlns:mc="{mc}"><mc:Choice Requires="x14"><controls><control shapeId="1025" r:id="rId9" name="Button 1"/></controls></mc:Choice></mc:AlternateContent>"#
+        ));
+        pkg.add_chart(0, (0, 3), (10, 8), &column_chart());
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert!(
+            at(&ws, "<drawing ") < at(&ws, "<mc:AlternateContent"),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn new_sheet_views_follow_sheet_pr_when_there_is_no_dimension() {
+        let mut pkg = loaded(&format!(
+            r#"<sheetPr><tabColor rgb="FFFF0000"/></sheetPr>{ROWS}"#
+        ));
+        pkg.workbook.sheets[0].freeze = (1, 0);
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert!(at(&ws, "</sheetPr>") < at(&ws, "<sheetViews>"), "{ws}");
+        assert!(ws.contains(r#"state="frozen""#), "{ws}");
+    }
+
+    #[test]
+    fn a_prefixed_merge_cells_block_is_replaced_not_duplicated() {
+        let mut pkg = new_xlsx();
+        pkg.set_part(
+            SHEET,
+            format!(
+                r#"<?xml version="1.0"?><x:worksheet xmlns="{NS}" xmlns:x="{NS}"><x:sheetData><x:row r="1"><x:c r="A1"><x:v>1</x:v></x:c></x:row></x:sheetData><x:mergeCells count="1"><x:mergeCell ref="D1:E1"/></x:mergeCells><x:pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/></x:worksheet>"#
+            )
+            .into_bytes(),
+        );
+        let pkg = load_xlsx(&write_zip(&pkg.parts)).expect("load");
+        assert_eq!(pkg.workbook.sheets[0].merges.len(), 1);
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert_eq!(ws.matches("mergeCells count=").count(), 1, "{ws}");
+        assert_eq!(ws.matches("D1:E1").count(), 1, "{ws}");
+    }
+
+    #[test]
+    fn a_missing_sheet_data_is_added_before_page_margins() {
+        let mut pkg = loaded(MARGINS);
+        pkg.workbook.sheets[0].set_cell(0, 0, Cell::number(7.0));
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert!(at(&ws, "<sheetData") < at(&ws, "<pageMargins"), "{ws}");
+    }
+
+    #[test]
+    fn a_new_legacy_drawing_precedes_table_parts() {
+        let mut pkg = loaded(ROWS);
+        pkg.add_table(0, (0, 0, 1, 1), true, "TableStyleMedium2")
+            .expect("table added");
+        pkg.set_comment(0, 0, 0, "A", "note");
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert!(at(&ws, "<legacyDrawing") < at(&ws, "<tableParts"), "{ws}");
+    }
+
+    #[test]
+    fn the_insert_position_ignores_nested_and_unknown_children() {
+        let xml = format!(
+            r#"<worksheet xmlns="{NS}"><sheetData/><customSheetViews><customSheetView guid="g"><autoFilter ref="A1"/></customSheetView></customSheetViews><foo/><pageMargins/></worksheet>"#
+        );
+        // autoFilter ranks before customSheetViews: it goes ahead of them,
+        // not next to the nested one.
+        assert_eq!(
+            worksheet_insert_pos(&xml, "autoFilter"),
+            Some(at(&xml, "<customSheetViews"))
+        );
+        assert_eq!(
+            worksheet_insert_pos(&xml, "mergeCells"),
+            Some(at(&xml, "<pageMargins"))
+        );
+        assert_eq!(
+            worksheet_insert_pos(&xml, "extLst"),
+            Some(at(&xml, "</worksheet>"))
+        );
+    }
+
+    #[test]
+    fn prefixed_row_breaks_follow_a_row_insert_and_stay_bound() {
+        let mut pkg = loaded_prefixed(&format!(
+            r#"{PREFIXED}<x:rowBreaks count="1" manualBreakCount="1"><x:brk id="3" max="16383" man="1"/></x:rowBreaks>"#
+        ));
+        crate::edit::insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert_names_bound(&ws);
+        assert_eq!(count_local(&ws, "rowBreaks"), 1, "{ws}");
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let ids: Vec<u32> = re.workbook.sheets[0]
+            .row_breaks
+            .iter()
+            .map(|b| b.id)
+            .collect();
+        assert_eq!(ids, vec![4]);
+    }
+
+    #[test]
+    fn the_walk_finds_sheet_data_however_its_close_tag_is_spelled() {
+        let tail = r#"<autoFilter ref="A1:B2"/><mergeCells count="1"><mergeCell ref="D1:E1"/></mergeCells>"#;
+        for sheet_data in [
+            r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData >"#,
+            r#"<sheetData><row r="1"><!-- </sheetData> --><c r="A1"><v>1</v></c></row></sheetData>"#,
+            r#"<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t><![CDATA[</sheetData>]]></t></is></c></row></sheetData>"#,
+            r#"<sheetData><row r="1"><?x </sheetData>?><c r="A1"><v>1</v></c></row></sheetData>"#,
+        ] {
+            let xml = format!(r#"<worksheet xmlns="{NS}">{sheet_data}{tail}</worksheet>"#);
+            let walk = worksheet_children(&xml);
+            let names: Vec<&str> = walk.children.iter().map(|c| c.local).collect();
+            assert_eq!(names, ["sheetData", "autoFilter", "mergeCells"], "{xml}");
+            assert_eq!(walk.close, Some(at(&xml, "</worksheet>")));
+            // And a save puts the merges after the filter, with one sheetData.
+            let pkg = loaded(&format!("{sheet_data}{tail}"));
+            let ws = saved_sheet(&pkg);
+            assert_ct_worksheet_order(&ws);
+            assert!(at(&ws, "<autoFilter") < at(&ws, "<mergeCells"), "{ws}");
+        }
+    }
+
+    #[test]
+    fn where_a_walk_stops_decides_what_may_be_inserted() {
+        // No </worksheet>, but every child read: the list is whole, and new
+        // content goes after the last child.
+        let truncated = format!(r#"<worksheet xmlns="{NS}"><sheetData/><pageMargins/>"#);
+        let walk = worksheet_children(&truncated);
+        assert_eq!(walk.close, Some(truncated.len()));
+        assert_eq!(
+            worksheet_insert_pos(&truncated, "mergeCells"),
+            Some(at(&truncated, "<pageMargins"))
+        );
+        assert_eq!(
+            worksheet_insert_pos(&truncated, "drawing"),
+            Some(truncated.len())
+        );
+        // A child cut off with no end tag at all: the walk stops at it. Its
+        // start is known, so what ranks before it may still go in; what
+        // ranks after it may not.
+        let cut_child = format!(r#"<worksheet xmlns="{NS}"><sheetData/><hyperlinks><hyperlink"#);
+        let walk = worksheet_children(&cut_child);
+        assert!(walk.close.is_none());
+        assert_eq!(walk.children.len(), 1);
+        assert_eq!(
+            walk.stopped,
+            Some((at(&cut_child, "<hyperlinks"), "hyperlinks"))
+        );
+        let before = worksheet_insert_pos(&cut_child, "mergeCells");
+        assert_eq!(before, Some(at(&cut_child, "<hyperlinks")));
+        assert_eq!(worksheet_insert_pos(&cut_child, "pageMargins"), None);
+        assert_eq!(
+            put_worksheet_child(&cut_child, "pageMargins", "<pageMargins/>", None, false),
+            cut_child
+        );
+        // A child broken inside but closed by its own end tag is spanned by
+        // it, and the walk goes on to the end.
+        let resync = format!(
+            r#"<worksheet xmlns="{NS}"><sheetData/>{BROKEN_TAIL}<drawing r:id="rId1"/></worksheet>"#
+        );
+        let walk = worksheet_children(&resync);
+        let names: Vec<&str> = walk.children.iter().map(|c| c.local).collect();
+        assert_eq!(names, ["sheetData", "headerFooter", "drawing"]);
+        assert_eq!(walk.close, Some(at(&resync, "</worksheet>")));
+        // A self-closing root has nothing to walk, whatever its prolog holds.
+        let empty = format!(r#"<?xml version="1.0"?><!-- </x> --><worksheet xmlns="{NS}"/>"#);
+        let walk = worksheet_children(&empty);
+        assert!(walk.children.is_empty() && walk.close.is_none());
+    }
+
+    /// A child the loader accepts but the parser can't read to its end:
+    /// `<oddHeader>` closed as `</OddHeader>`. Its own `</headerFooter>`
+    /// still bounds it, so the walk goes on past it.
+    const BROKEN_TAIL: &str = "<headerFooter><oddHeader>x</OddHeader></headerFooter>";
+
+    /// The same with no `</headerFooter>`: the walk stops at headerFooter.
+    const STOPPED_TAIL: &str = "<headerFooter><oddHeader>x</OddHeader>";
+
+    fn chart() -> crate::sheet::ChartData {
+        column_chart()
+    }
+
+    fn a3(pkg: &SheetPackage) -> Option<crate::sheet::CellValue> {
+        pkg.workbook.sheets[0].cell(2, 0).map(|c| c.value.clone())
+    }
+
+    #[test]
+    fn cell_edits_survive_a_malformed_child_after_sheet_data() {
+        let mut pkg = loaded(&format!(
+            r#"{ROWS}<mergeCells count="1"><mergeCell ref="D1:E1"/></mergeCells>{BROKEN_TAIL}"#
+        ));
+        pkg.workbook.sheets[0].set_cell(2, 0, Cell::number(9.0));
+        pkg.workbook.sheets[0].merges.push((5, 0, 5, 1));
+        pkg.workbook.sheets[0].set_protected(true);
+        let ws = saved_sheet(&pkg);
+        assert!(ws.contains(r#"<c r="A3""#), "the edit was dropped: {ws}");
+        assert_eq!(count_local(&ws, "sheetData"), 1, "{ws}");
+        assert_eq!(count_local(&ws, "mergeCells"), 1, "{ws}");
+        assert!(ws.contains("A6:B6"), "{ws}");
+        assert_eq!(count_local(&ws, "sheetProtection"), 1, "{ws}");
+        assert_ct_worksheet_order(&ws);
+        assert!(ws.contains(BROKEN_TAIL), "{ws}");
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(a3(&re), Some(crate::sheet::CellValue::Number(9.0)));
+        assert!(re.workbook.sheets[0].is_protected());
+    }
+
+    #[test]
+    fn a_stopped_walk_still_takes_what_ranks_before_the_stop() {
+        // The walk stops at headerFooter; merges, protection, CF and DV all
+        // rank before it, so their position is known and nothing past the
+        // stop can be one of them.
+        let mut pkg = loaded(&format!("{ROWS}{MARGINS}{STOPPED_TAIL}"));
+        let sheet = &mut pkg.workbook.sheets[0];
+        sheet.set_cell(2, 0, Cell::number(9.0));
+        sheet.merges.push((5, 0, 5, 1));
+        sheet.set_protected(true);
+        let dxf = crate::sheet::Dxf {
+            bold: Some(true),
+            ..Default::default()
+        };
+        assert!(pkg.add_conditional_format(0, (0, 0, 1, 0), "greaterThan", "1", None, dxf));
+        assert!(pkg.add_data_validation(0, (0, 1, 1, 1), "whole", "between", "1", Some("9")));
+        let ws = saved_sheet(&pkg);
+        for name in [
+            "sheetData",
+            "sheetProtection",
+            "mergeCells",
+            "conditionalFormatting",
+        ] {
+            assert_eq!(count_local(&ws, name), 1, "{name}: {ws}");
+        }
+        assert!(
+            at(&ws, "<dataValidations") < at(&ws, "<headerFooter"),
+            "{ws}"
+        );
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let s = &re.workbook.sheets[0];
+        assert_eq!(a3(&re), Some(crate::sheet::CellValue::Number(9.0)));
+        assert_eq!(s.merges.len(), 1);
+        assert!(s.is_protected());
+        assert_eq!(s.cond_formats.len(), 1);
+        assert_eq!(s.validations.len(), 1);
+    }
+
+    #[test]
+    fn every_add_persists_past_a_child_its_end_tag_still_bounds() {
+        let mut pkg = loaded(&format!("{ROWS}{MARGINS}{BROKEN_TAIL}"));
+        let dxf = crate::sheet::Dxf {
+            bold: Some(true),
+            ..Default::default()
+        };
+        assert!(pkg.add_conditional_format(0, (0, 0, 1, 0), "greaterThan", "1", None, dxf));
+        assert!(pkg.add_data_validation(0, (0, 1, 1, 1), "whole", "between", "1", Some("9")));
+        assert!(
+            pkg.add_table(0, (0, 0, 1, 1), true, "TableStyleMedium2")
+                .is_some()
+        );
+        assert!(pkg.add_chart(0, (0, 3), (10, 8), &chart()));
+        assert!(pkg.set_comment(0, 0, 0, "A", "note"));
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let s = &re.workbook.sheets[0];
+        assert_eq!(s.cond_formats.len(), 1);
+        assert_eq!(s.validations.len(), 1);
+        assert_eq!(re.workbook.tables.len(), 1);
+        assert_eq!(s.drawings.len(), 1);
+        assert_eq!(re.comments().len(), 1);
+    }
+
+    #[test]
+    fn an_add_with_no_known_position_is_refused_and_changes_nothing() {
+        // The walk stops at headerFooter; drawing, legacyDrawing and
+        // tableParts rank after it, where the part can't be read.
+        let mut pkg = loaded(&format!("{ROWS}{MARGINS}{STOPPED_TAIL}"));
+        let parts = pkg.parts.clone();
+        let workbook = pkg.workbook.clone();
+        assert!(
+            pkg.add_table(0, (0, 0, 1, 1), true, "TableStyleMedium2")
+                .is_none()
+        );
+        assert!(!pkg.add_chart(0, (0, 3), (10, 8), &chart()));
+        assert!(!pkg.set_comment(0, 0, 0, "A", "note"));
+        // A walk stopped before conditionalFormatting's rank has no place for
+        // a rule either, and can't vouch that a clear saw every block.
+        // It holds a rule, so a clear that touched only one side would show.
+        let mut early = loaded(&format!(
+            r#"{ROWS}<conditionalFormatting sqref="A1"><cfRule type="expression" priority="1"><formula>TRUE</formula></cfRule></conditionalFormatting><autoFilter ref="A1:B2"><filterColumn colId="0">{MARGINS}"#
+        ));
+        assert_eq!(early.workbook.sheets[0].cond_formats.len(), 1);
+        let early_parts = early.parts.clone();
+        let dxf = crate::sheet::Dxf {
+            bold: Some(true),
+            ..Default::default()
+        };
+        assert!(!early.add_conditional_format(0, (0, 0, 1, 0), "greaterThan", "1", None, dxf));
+        assert!(!early.clear_conditional_formats(0));
+        // Nothing was written anywhere, and the model says the same.
+        assert_eq!(pkg.parts, parts);
+        assert_eq!(pkg.workbook.tables.len(), workbook.tables.len());
+        assert_eq!(pkg.workbook.sheets[0].drawings.len(), 0);
+        assert!(pkg.comments().is_empty());
+        assert_eq!(early.parts, early_parts);
+        assert_eq!(early.workbook.sheets[0].cond_formats.len(), 1);
+        // A threaded comment needs the same <legacyDrawing> as a note.
+        assert!(!pkg.add_threaded_comment(0, 0, 0, "Ana", "Hi", "2024-01-02T03:04:05Z"));
+        assert_eq!(pkg.parts, parts);
+        assert!(pkg.comments().is_empty());
+    }
+
+    #[test]
+    fn a_chart_whose_host_drawing_cannot_take_an_anchor_writes_nothing() {
+        let mut pkg = loaded(ROWS);
+        assert!(pkg.add_chart(0, (0, 3), (10, 8), &chart()));
+        // Truncate the host drawing part: no </xdr:wsDr>, no self-closed root.
+        let host = pkg.workbook.sheets[0].drawing_part.clone().expect("host");
+        let xml = String::from_utf8_lossy(pkg.part(&host).unwrap()).into_owned();
+        let cut = &xml[..xml.rfind("</xdr:wsDr>").unwrap()];
+        pkg.set_part(&host, cut.as_bytes().to_vec());
+        let parts = pkg.parts.clone();
+        let drawings = pkg.workbook.sheets[0].drawings.len();
+        assert!(!pkg.add_chart(0, (12, 3), (20, 8), &chart()));
+        assert_eq!(pkg.parts, parts);
+        assert_eq!(pkg.workbook.sheets[0].drawings.len(), drawings);
+    }
+
+    #[test]
+    fn removing_the_last_note_strips_a_legacy_drawing_behind_a_stopped_walk() {
+        let mut pkg = loaded(&format!("{ROWS}{MARGINS}"));
+        assert!(pkg.set_comment(0, 0, 0, "A", "note"));
+        // Break the part so the walk stops at headerFooter, before the
+        // <legacyDrawing> that ranks after it.
+        let ws = String::from_utf8_lossy(pkg.part(SHEET).unwrap()).into_owned();
+        let at_ld = at(&ws, "<legacyDrawing");
+        let broken = format!("{}{STOPPED_TAIL}{}", &ws[..at_ld], &ws[at_ld..]);
+        pkg.set_part(SHEET, broken.into_bytes());
+        pkg.remove_comment(0, 0, 0);
+        let ws = String::from_utf8_lossy(pkg.part(SHEET).unwrap()).into_owned();
+        assert_eq!(count_local(&ws, "legacyDrawing"), 0, "{ws}");
+        // A sheet with no legacyDrawing is left alone.
+        let plain = format!(r#"<worksheet xmlns="{NS}"><sheetData/>{MARGINS}</worksheet>"#);
+        assert_eq!(remove_worksheet_singleton(&plain, "legacyDrawing"), plain);
+    }
+
+    #[test]
+    fn a_resync_is_refused_when_the_end_tag_could_be_someone_elses() {
+        // A comment holding a literal </headerFooter>.
+        let commented = format!(
+            r#"<worksheet xmlns="{NS}"><sheetData/><headerFooter><oddHeader>x</OddHeader><!-- </headerFooter> --></headerFooter><drawing r:id="rId1"/></worksheet>"#
+        );
+        let walk = worksheet_children(&commented);
+        assert_eq!(walk.stopped.map(|(_, n)| n), Some("headerFooter"));
+        assert!(walk.close.is_none());
+        // An unclosed top-level <autoFilter> ahead of a custom view with its
+        // own: the nested </autoFilter> must not end the broken one, or the
+        // walk would resume inside the custom view.
+        let nested = format!(
+            r#"<worksheet xmlns="{NS}"><sheetData/><autoFilter ref="A1:B2"><filterColumn colId="0"><customSheetViews><customSheetView guid="g"><autoFilter ref="A1"></autoFilter><extLst/></customSheetView></customSheetViews>{MARGINS}</worksheet>"#
+        );
+        let walk = worksheet_children(&nested);
+        assert_eq!(walk.stopped.map(|(_, n)| n), Some("autoFilter"));
+        assert_eq!(walk.children.len(), 1);
+        for tag in [
+            "conditionalFormatting",
+            "mergeCells",
+            "dataValidations",
+            "tableParts",
+        ] {
+            assert_eq!(worksheet_insert_pos(&nested, tag), None, "{tag}");
+        }
+    }
+
+    #[test]
+    fn cell_edits_survive_a_missing_worksheet_end_tag() {
+        let mut pkg = new_xlsx();
+        pkg.set_part(
+            SHEET,
+            format!(r#"<?xml version="1.0"?><worksheet xmlns="{NS}">{ROWS}{MARGINS}"#).into_bytes(),
+        );
+        let mut pkg = load_xlsx(&write_zip(&pkg.parts)).expect("load");
+        pkg.workbook.sheets[0].set_cell(2, 0, Cell::number(9.0));
+        let ws = saved_sheet(&pkg);
+        assert!(ws.contains(r#"<c r="A3""#), "the edit was dropped: {ws}");
+        assert_eq!(count_local(&ws, "sheetData"), 1, "{ws}");
+    }
+
+    #[test]
+    fn cell_edits_survive_a_malformed_child_before_sheet_data() {
+        // <sheetViews> never closes: the walk stops before sheetData, which is
+        // then found by its tags.
+        let mut pkg = loaded(&format!(
+            r#"<sheetViews><sheetView workbookViewId="0">{ROWS}{MARGINS}"#
+        ));
+        assert_eq!(
+            worksheet_children(&String::from_utf8_lossy(pkg.part(SHEET).unwrap()))
+                .stopped
+                .map(|(_, n)| n),
+            Some("sheetViews")
+        );
+        pkg.workbook.sheets[0].set_cell(2, 0, Cell::number(9.0));
+        let ws = saved_sheet(&pkg);
+        assert!(ws.contains(r#"<c r="A3""#), "the edit was dropped: {ws}");
+        assert_eq!(count_local(&ws, "sheetData"), 1, "{ws}");
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(a3(&re), Some(crate::sheet::CellValue::Number(9.0)));
+    }
+
+    #[test]
+    fn clearing_conditional_formats_past_a_stop_after_them_clears() {
+        // The walk stops at headerFooter, which ranks after every place a
+        // conditionalFormatting may stand: all of them were seen.
+        let mut pkg = loaded(&format!(
+            r#"{ROWS}<conditionalFormatting sqref="A1"><cfRule type="expression" priority="1"><formula>TRUE</formula></cfRule></conditionalFormatting>{STOPPED_TAIL}"#
+        ));
+        assert_eq!(pkg.workbook.sheets[0].cond_formats.len(), 1);
+        assert!(pkg.clear_conditional_formats(0));
+        let ws = saved_sheet(&pkg);
+        assert_eq!(count_local(&ws, "conditionalFormatting"), 0, "{ws}");
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert!(re.workbook.sheets[0].cond_formats.is_empty());
+    }
+
+    #[test]
+    fn a_self_closing_worksheet_is_opened_not_appended_to() {
+        let mut pkg = new_xlsx();
+        pkg.set_part(
+            SHEET,
+            format!(r#"<?xml version="1.0"?><worksheet xmlns="{NS}"/>"#).into_bytes(),
+        );
+        let mut pkg = load_xlsx(&write_zip(&pkg.parts)).expect("load");
+        pkg.workbook.sheets[0].set_cell(0, 0, Cell::number(5.0));
+        let ws = saved_sheet(&pkg);
+        assert!(ws.trim_end().ends_with("</worksheet>"), "{ws}");
+        assert_eq!(count_local(&ws, "sheetData"), 1, "{ws}");
+        assert_names_bound(&ws);
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(
+            re.workbook.sheets[0].cell(0, 0).map(|c| c.value.clone()),
+            Some(crate::sheet::CellValue::Number(5.0))
+        );
+    }
+
+    #[test]
+    fn clearing_conditional_formats_removes_prefixed_blocks() {
+        let mut pkg = loaded_prefixed(
+            r#"<x:sheetData/><x:conditionalFormatting sqref="A1"><x:cfRule type="expression" priority="1"><x:formula>TRUE</x:formula></x:cfRule></x:conditionalFormatting><x:conditionalFormatting sqref="B1"><x:cfRule type="expression" priority="2"><x:formula>TRUE</x:formula></x:cfRule></x:conditionalFormatting><x:pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>"#,
+        );
+        assert_eq!(pkg.workbook.sheets[0].cond_formats.len(), 2);
+        pkg.clear_conditional_formats(0);
+        let ws = saved_sheet(&pkg);
+        assert_eq!(count_local(&ws, "conditionalFormatting"), 0, "{ws}");
+        assert_eq!(count_local(&ws, "pageMargins"), 1, "{ws}");
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert!(re.workbook.sheets[0].cond_formats.is_empty());
+    }
+
+    /// A ratchet, not the #597 test: no corpus sheet that was in schema order
+    /// comes out of a load and save out of order.
+    #[test]
+    fn corpus_sheets_in_schema_order_stay_in_order() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../corpus/xlsx");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(dir).expect("corpus/xlsx exists") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("xlsx") {
+                continue;
+            }
+            let pkg = load_xlsx(&std::fs::read(&path).unwrap()).expect("corpus loads");
+            let re = load_xlsx(&save_xlsx(&pkg)).expect("corpus reloads");
+            for name in &pkg.sheet_parts {
+                let before = String::from_utf8_lossy(pkg.part(name).unwrap()).into_owned();
+                if in_ct_worksheet_order(&before).is_err() {
+                    continue;
+                }
+                let after = String::from_utf8_lossy(re.part(name).unwrap()).into_owned();
+                if let Err(e) = in_ct_worksheet_order(&after) {
+                    panic!("{}: {name}: {e}", path.display());
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no corpus sheets checked");
+    }
+}
+
+/// #602: a Strict Open XML workbook stays strict. What the writer creates uses
+/// the Strict namespaces; what it doesn't touch keeps its bytes.
+#[cfg(test)]
+mod strict_tests {
+    use super::*;
+    use crate::sheet::{Cell, CellValue};
+
+    const T_SML: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const T_RELS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const TRANSITIONAL_URIS: &[&str] = &[
+        T_SML,
+        T_RELS,
+        "http://schemas.openxmlformats.org/drawingml/2006/main",
+        "http://schemas.openxmlformats.org/drawingml/2006/chart",
+        "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
+    ];
+    const APP_REL: &str = r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>"#;
+    const APP_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>Microsoft Excel</Application></Properties>"#;
+
+    /// A Strict workbook as openpyxl-then-retagged writes it: strict parts and
+    /// relationship types, inline strings, no shared-strings part. Like
+    /// Excel's own Strict files, its docProps relationship stays transitional.
+    fn strict_xlsx() -> Vec<u8> {
+        let base = new_xlsx();
+        let strict = |s: &str| s.replace(T_SML, STRICT.sml).replace(T_RELS, STRICT.rels);
+        let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
+        for (name, bytes) in &base.parts {
+            let text = String::from_utf8(bytes.clone()).unwrap();
+            let text = match name.as_str() {
+                "xl/sharedStrings.xml" => continue,
+                "[Content_Types].xml" => text.replace(
+                    r#"<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>"#,
+                    "",
+                ),
+                "xl/_rels/workbook.xml.rels" => strict(&text).replace(
+                    &format!(
+                        r#"<Relationship Id="rId3" Type="{}/sharedStrings" Target="sharedStrings.xml"/>"#,
+                        STRICT.rels
+                    ),
+                    "",
+                ),
+                "_rels/.rels" => strict(&text).replace(
+                    "</Relationships>",
+                    &format!("{APP_REL}</Relationships>"),
+                ),
+                "xl/worksheets/sheet1.xml" => strict(&text).replace(
+                    "<sheetData/>",
+                    r#"<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>hello</t></is></c></row></sheetData>"#,
+                ),
+                _ => strict(&text),
+            };
+            parts.push((name.clone(), text.into_bytes()));
+        }
+        parts.push(("docProps/app.xml".into(), APP_XML.as_bytes().to_vec()));
+        write_zip(&parts)
+    }
+
+    fn text(pkg: &SheetPackage, name: &str) -> String {
+        String::from_utf8_lossy(pkg.part(name).unwrap_or_else(|| panic!("{name} missing")))
+            .into_owned()
+    }
+
+    /// Every part the writer created or changed, i.e. all but the docProps
+    /// part and relationship the fixture deliberately keeps transitional.
+    fn assert_strict_throughout(pkg: &SheetPackage) {
+        for (name, bytes) in &pkg.parts {
+            if name == "docProps/app.xml" {
+                continue;
+            }
+            let xml = String::from_utf8_lossy(bytes).replace(APP_REL, "");
+            for uri in TRANSITIONAL_URIS {
+                assert!(!xml.contains(uri), "{name} has {uri}: {xml}");
+            }
+        }
+    }
+
+    fn cell_text(pkg: &SheetPackage, sheet: usize, row: u32, col: u32) -> String {
+        match pkg.workbook.sheets[sheet].cell(row, col).map(|c| &c.value) {
+            Some(CellValue::Text(s)) => s.clone(),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_strict_workbook_is_detected_and_a_transitional_one_is_not() {
+        assert!(load_xlsx(&strict_xlsx()).unwrap().strict);
+        assert!(!load_xlsx(&save_xlsx(&new_xlsx())).unwrap().strict);
+    }
+
+    #[test]
+    fn a_new_shared_strings_part_is_strict_and_keeps_user_text() {
+        // The #602 repro: inline strings only, so save has to create the
+        // shared-strings part. One cell's text IS the transitional URI.
+        let mut pkg = load_xlsx(&strict_xlsx()).unwrap();
+        pkg.workbook.sheets[0].set_cell(0, 1, Cell::text(T_SML));
+        let out = load_xlsx(&save_xlsx(&pkg)).unwrap();
+
+        let sst = text(&out, "xl/sharedStrings.xml");
+        assert!(
+            sst.contains(&format!(r#"<sst xmlns="{}""#, STRICT.sml)),
+            "{sst}"
+        );
+        let rels = text(&out, "xl/_rels/workbook.xml.rels");
+        assert!(
+            rels.contains(&format!(r#"Type="{}/sharedStrings""#, STRICT.rels)),
+            "{rels}"
+        );
+        // The user's text is data, not a namespace: it is kept as typed.
+        assert_eq!(cell_text(&out, 0, 0, 0), "hello");
+        assert_eq!(cell_text(&out, 0, 0, 1), T_SML);
+        assert_eq!(sst.matches(T_SML).count(), 1, "{sst}");
+        let without_text = {
+            let mut o = out.clone();
+            o.set_part("xl/sharedStrings.xml", sst.replace(T_SML, "").into_bytes());
+            o
+        };
+        assert_strict_throughout(&without_text);
+    }
+
+    #[test]
+    fn every_part_the_writer_mints_in_a_strict_workbook_is_strict() {
+        let mut pkg = load_xlsx(&strict_xlsx()).unwrap();
+        let rows: [[&str; 2]; 3] = [["Region", "Sales"], ["East", "10"], ["West", "30"]];
+        for (r, row) in rows.iter().enumerate() {
+            for (c, v) in row.iter().enumerate() {
+                let cell = match v.parse::<f64>() {
+                    Ok(n) => Cell::number(n),
+                    Err(_) => Cell::text(v),
+                };
+                pkg.workbook.sheets[0].set_cell(r as u32, c as u32, cell);
+            }
+        }
+        pkg.add_table(0, (0, 0, 2, 1), true, "TableStyleMedium2")
+            .expect("table");
+        pkg.add_chart(
+            0,
+            (0, 3),
+            (10, 8),
+            &crate::sheet::ChartData {
+                title: "Sales".into(),
+                kind: "column".into(),
+                categories: vec!["East".into(), "West".into()],
+                series: vec![crate::sheet::ChartSeries {
+                    name: "Sales".into(),
+                    values: vec![10.0, 30.0],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        pkg.set_comment(0, 1, 1, "Reviewer", "check");
+        // add_sheet and add_pivot, the way the app creates a pivot.
+        let frame = crate::frame::Frame::from_range(&pkg.workbook, 0, (0, 0, 2, 1));
+        let spec = crate::frame::pivot_spec_from_names(
+            &frame,
+            &["Region".to_string()],
+            &[],
+            &[("Sales".to_string(), crate::frame::Agg::Sum)],
+        )
+        .expect("spec");
+        pkg.create_pivot(
+            crate::pivot::PivotSource::Range {
+                sheet: "Sheet1".into(),
+                rect: (0, 0, 2, 1),
+            },
+            &frame,
+            &spec,
+            "Pivot1",
+        )
+        .expect("pivot");
+        let mut out = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_strict_throughout(&out);
+        assert!(out.strict);
+        assert_eq!(out.workbook.tables.len(), 1);
+        assert_eq!(out.workbook.pivots.len(), 1);
+        assert_eq!(out.workbook.sheets.len(), 2);
+        assert_eq!(out.comments().len(), 1);
+
+        // An edited chart is regenerated from the model: still strict.
+        let chart_part = {
+            let dw = out.workbook.sheets[0]
+                .drawings
+                .iter_mut()
+                .find(|d| matches!(d.kind, crate::sheet::DrawingKind::Chart(_)))
+                .expect("the chart reloads");
+            let crate::sheet::DrawingKind::Chart(cd) = &mut dw.kind else {
+                unreachable!()
+            };
+            cd.title = "Edited".into();
+            cd.edited = true;
+            cd.part.clone().expect("chart part")
+        };
+        let again = load_xlsx(&save_xlsx(&out)).unwrap();
+        let chart = text(&again, &chart_part);
+        assert!(chart.contains("Edited"), "the edit was written: {chart}");
+        assert!(chart.contains(STRICT.chart), "{chart}");
+        assert_strict_throughout(&again);
+    }
+
+    #[test]
+    fn a_strict_workbooks_untouched_transitional_parts_keep_their_bytes() {
+        let input = load_xlsx(&strict_xlsx()).unwrap();
+        let out = load_xlsx(&save_xlsx(&input)).unwrap();
+        for name in ["_rels/.rels", "docProps/app.xml", "xl/styles.xml"] {
+            assert_eq!(out.part(name), input.part(name), "{name} changed");
+        }
+        assert!(text(&out, "_rels/.rels").contains(APP_REL));
+    }
+
+    #[test]
+    fn a_transitional_save_mints_nothing_strict() {
+        let mut pkg = load_xlsx(&save_xlsx(&new_xlsx())).unwrap();
+        pkg.workbook.sheets[0].set_cell(0, 0, Cell::text("a"));
+        pkg.workbook.sheets[0].set_cell(1, 0, Cell::number(1.0));
+        pkg.add_table(0, (0, 0, 1, 0), true, "TableStyleMedium2")
+            .expect("table");
+        pkg.add_chart(
+            0,
+            (0, 3),
+            (10, 8),
+            &crate::sheet::ChartData {
+                kind: "column".into(),
+                categories: vec!["a".into()],
+                series: vec![crate::sheet::ChartSeries {
+                    name: "s".into(),
+                    values: vec![1.0],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        pkg.set_comment(0, 0, 0, "A", "note");
+        let out = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        for (name, bytes) in &out.parts {
+            let xml = String::from_utf8_lossy(bytes);
+            assert!(!xml.contains("purl.oclc.org"), "{name}: {xml}");
+        }
     }
 }

@@ -10,16 +10,11 @@
 use crate::sheet::{cell_name, parse_col};
 use crate::xlsx::{
     SheetPackage, add_content_type_override, add_rel, add_workbook_rel, parse_rels,
-    resolve_relative,
+    put_worksheet_child, remove_worksheet_singleton, resolve_relative, worksheet_child_span,
 };
 
-const SS_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const COMMENTS_CT: &str =
     "application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml";
-const COMMENTS_REL: &str =
-    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments";
-const VML_REL: &str =
-    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing";
 const VML_CT: &str = "application/vnd.openxmlformats-officedocument.vmlDrawing";
 
 // Modern threaded comments (Excel 2019+ / 365).
@@ -275,10 +270,23 @@ fn parse_threaded(xml: &str, sheet: usize, persons: &[(String, String)], out: &m
 
 impl SheetPackage {
     /// Add or replace the legacy note on `(row, col)` of `sheet`.
-    pub fn set_comment(&mut self, sheet: usize, row: u32, col: u32, author: &str, text: &str) {
+    /// `false`, with nothing changed, when the note can't be written: no
+    /// such sheet, or a worksheet part malformed where its `<legacyDrawing>`
+    /// would go.
+    pub fn set_comment(
+        &mut self,
+        sheet: usize,
+        row: u32,
+        col: u32,
+        author: &str,
+        text: &str,
+    ) -> bool {
         let Some(ws_part) = self.sheet_parts.get(sheet).cloned() else {
-            return;
+            return false;
         };
+        if !self.sheet_takes(sheet, "legacyDrawing", true) {
+            return false;
+        }
         let mut notes = self.sheet_notes(sheet);
         notes.retain(|n| !(n.row == row && n.col == col));
         notes.push(Note {
@@ -289,6 +297,7 @@ impl SheetPackage {
         });
         notes.sort_by_key(|n| (n.row, n.col));
         self.write_notes(sheet, &ws_part, &notes);
+        true
     }
 
     /// Remove the comment on `(row, col)` of `sheet` — the threaded
@@ -392,16 +401,25 @@ impl SheetPackage {
         }
 
         // comments part
-        self.set_part(&comments_part, serialize_comments(notes).into_bytes());
+        let ns = self.ns();
+        self.set_part(
+            &comments_part,
+            serialize_comments(notes, ns.sml).into_bytes(),
+        );
         add_content_type_override(&mut self.parts, &format!("/{comments_part}"), COMMENTS_CT);
         let ct_target = rel_target(dir, &comments_part);
-        add_rel(&mut self.parts, &rels_name, COMMENTS_REL, &ct_target);
+        add_rel(&mut self.parts, &rels_name, &ns.rel("comments"), &ct_target);
 
         // VML drawing part
         self.set_part(&vml_part, serialize_vml(notes).into_bytes());
         self.ensure_vml_default();
         let vml_target = rel_target(dir, &vml_part);
-        let vml_rid = add_rel(&mut self.parts, &rels_name, VML_REL, &vml_target);
+        let vml_rid = add_rel(
+            &mut self.parts,
+            &rels_name,
+            &ns.rel("vmlDrawing"),
+            &vml_target,
+        );
         // add_rel returns "" when the target already existed; find the rId then.
         let vml_rid = if vml_rid.is_empty() {
             self.find_rid(&rels_name, &vml_target)
@@ -422,6 +440,10 @@ impl SheetPackage {
     /// (e.g. `2024-01-02T03:04:05Z`); the caller supplies it so the engine
     /// stays clock-free. Writes the persons + threadedComments parts, wires
     /// them, and keeps a legacy shadow note so every reader shows the thread.
+    ///
+    /// `false`, with nothing changed, when it can't be written (see
+    /// [`SheetPackage::set_comment`]): the shadow note needs its
+    /// `<legacyDrawing>`, so the worksheet is asked before any part is.
     pub fn add_threaded_comment(
         &mut self,
         sheet: usize,
@@ -430,11 +452,14 @@ impl SheetPackage {
         author: &str,
         text: &str,
         when: &str,
-    ) {
+    ) -> bool {
         use crate::xlsx::{esc_attr, esc_text};
         let Some(ws_part) = self.sheet_parts.get(sheet).cloned() else {
-            return;
+            return false;
         };
+        if !self.sheet_takes(sheet, "legacyDrawing", true) {
+            return false;
+        }
         let (dir, file) = split_part(&ws_part);
         let rels_name = format!("{dir}/_rels/{file}.rels");
 
@@ -495,6 +520,7 @@ impl SheetPackage {
         // Rebuild the legacy shadow so down-level readers see the thread too.
         let notes = self.sheet_notes(sheet);
         self.write_notes(sheet, &ws_part, &notes);
+        true
     }
 
     /// Ensure `persons_part` declares person `pid` with `display`.
@@ -655,7 +681,7 @@ fn rel_target(ws_dir: &str, part: &str) -> String {
     part.strip_prefix(&ws_prefix).unwrap_or(part).to_string()
 }
 
-fn serialize_comments(notes: &[Note]) -> String {
+fn serialize_comments(notes: &[Note], sml_ns: &str) -> String {
     use crate::xlsx::esc_text;
     let mut authors: Vec<&str> = Vec::new();
     for n in notes {
@@ -664,7 +690,7 @@ fn serialize_comments(notes: &[Note]) -> String {
         }
     }
     let mut s = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
-    s.push_str(&format!("<comments xmlns=\"{SS_NS}\"><authors>"));
+    s.push_str(&format!("<comments xmlns=\"{sml_ns}\"><authors>"));
     for a in &authors {
         s.push_str(&format!("<author>{}</author>", esc_text(a)));
     }
@@ -761,55 +787,24 @@ impl SheetPackage {
         if rid.is_empty() {
             return;
         }
-        let Some(mut xml) = self.part_str(ws_part) else {
+        let Some(xml) = self.part_str(ws_part) else {
             return;
         };
-        if xml.contains("<legacyDrawing ") {
+        if worksheet_child_span(&xml, "legacyDrawing").is_some() {
             return;
         }
-        // Declare xmlns:r on <worksheet …> if absent.
-        if !xml.contains("xmlns:r=") {
-            if let Some(g) = xml.find("<worksheet") {
-                if let Some(rel) = xml[g..].find('>') {
-                    let at = g + rel;
-                    xml.insert_str(
-                        at,
-                        " xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"",
-                    );
-                }
-            }
-        }
         let tag = format!("<legacyDrawing r:id=\"{rid}\"/>");
-        // legacyDrawing must precede these trailing elements if present.
-        const AFTER: &[&str] = &[
-            "<legacyDrawingHF",
-            "<drawingHF",
-            "<picture",
-            "<oleObjects",
-            "<controls",
-            "<webPublishItems",
-            "<tableParts",
-            "<extLst",
-        ];
-        let insert_at = AFTER
-            .iter()
-            .filter_map(|t| xml.find(t))
-            .min()
-            .or_else(|| xml.rfind("</worksheet>"))
-            .unwrap_or(xml.len());
-        xml.insert_str(insert_at, &tag);
+        let xml = put_worksheet_child(&xml, "legacyDrawing", &tag, Some(self.ns().rels), false);
         self.set_part(ws_part, xml.into_bytes());
     }
 
     fn strip_legacy_drawing(&mut self, ws_part: &str) {
-        let Some(mut xml) = self.part_str(ws_part) else {
+        let Some(xml) = self.part_str(ws_part) else {
             return;
         };
-        if let Some(s) = xml.find("<legacyDrawing ") {
-            if let Some(e) = xml[s..].find("/>") {
-                xml.replace_range(s..s + e + 2, "");
-                self.set_part(ws_part, xml.into_bytes());
-            }
+        let out = remove_worksheet_singleton(&xml, "legacyDrawing");
+        if out != xml {
+            self.set_part(ws_part, out.into_bytes());
         }
     }
 

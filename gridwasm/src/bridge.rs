@@ -1728,7 +1728,11 @@ impl Session {
         // it (empty = pure removal), rather than dropping the whole ref.
         let pre = self.ctl_comment_messages_at(si, r, c);
         let when = self.ctl_iso_now();
-        self.pkg.add_threaded_comment(si, r, c, author, text, &when);
+        if !self.pkg.add_threaded_comment(si, r, c, author, text, &when) {
+            return Err(
+                "comment.add: this sheet's XML is damaged where the comment would go".into(),
+            );
+        }
         self.dirty = true;
         let cref = cell_name(r, c);
         let mut out = String::from("{\"sheet\":");

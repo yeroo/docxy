@@ -1123,6 +1123,11 @@ struct FormatDialog {
     sel: usize,
 }
 
+/// Status for an edit the workbook's file can't take (a malformed worksheet
+/// part where the edit would go): nothing changed, so nothing to save or undo.
+const WRITE_REFUSED: &str =
+    "Can't add that here: this sheet's XML is damaged where it would go (nothing changed)";
+
 /// Excel's warning when an edit creates a circular reference.
 const CIRCULAR_WARNING: &str = "There are one or more circular references where a formula refers to its own cell either directly or indirectly. This might cause them to calculate incorrectly.";
 
@@ -2741,8 +2746,13 @@ impl App {
         }
         let author = comment_author();
         let reply = self.comment_at(r, c).is_some_and(|cm| cm.threaded);
-        self.pkg
-            .add_threaded_comment(self.sheet, r, c, &author, text, &iso_now());
+        if !self
+            .pkg
+            .add_threaded_comment(self.sheet, r, c, &author, text, &iso_now())
+        {
+            self.status = Some(WRITE_REFUSED.into());
+            return;
+        }
         self.modified = true;
         self.refresh_comments();
         self.status = Some(format!(
@@ -2765,7 +2775,10 @@ impl App {
             return;
         }
         let author = comment_author();
-        self.pkg.set_comment(self.sheet, r, c, &author, text);
+        if !self.pkg.set_comment(self.sheet, r, c, &author, text) {
+            self.status = Some(WRITE_REFUSED.into());
+            return;
+        }
         self.modified = true;
         self.refresh_comments();
         self.status = Some(format!("Note added on {}", cell_name(r, c)));
@@ -4515,8 +4528,13 @@ impl App {
         let f1 = format!("\"{}\"", items.join(","));
         let (r1, c1, r2, c2) = self.selection();
         let s = self.sheet;
-        self.pkg
-            .add_data_validation(s, (r1, c1, r2, c2), "list", "", &f1, None);
+        if !self
+            .pkg
+            .add_data_validation(s, (r1, c1, r2, c2), "list", "", &f1, None)
+        {
+            self.status = Some(WRITE_REFUSED.into());
+            return;
+        }
         self.undo.clear();
         self.redo.clear();
         self.modified = true;
@@ -4530,7 +4548,10 @@ impl App {
         let s = self.sheet;
         // "clear" removes all rules on the sheet.
         if text.trim().eq_ignore_ascii_case("clear") {
-            self.pkg.clear_conditional_formats(s);
+            if !self.pkg.clear_conditional_formats(s) {
+                self.status = Some(WRITE_REFUSED.into());
+                return;
+            }
             self.undo.clear();
             self.redo.clear();
             self.rebuild_engine();
@@ -4549,8 +4570,13 @@ impl App {
             bold: None,
             italic: None,
         };
-        self.pkg
-            .add_conditional_format(s, (r1, c1, r2, c2), op, &val, val2.as_deref(), dxf);
+        if !self
+            .pkg
+            .add_conditional_format(s, (r1, c1, r2, c2), op, &val, val2.as_deref(), dxf)
+        {
+            self.status = Some(WRITE_REFUSED.into());
+            return;
+        }
         // add_conditional_format rewrites package parts; drop stale undo snapshots.
         self.undo.clear();
         self.redo.clear();
@@ -4606,8 +4632,13 @@ impl App {
             return;
         };
         let sheet = self.sheet;
-        self.pkg
-            .add_chart(sheet, (r1, c2 + 2), (r1 + 16, c2 + 10), &data);
+        if !self
+            .pkg
+            .add_chart(sheet, (r1, c2 + 2), (r1 + 16, c2 + 10), &data)
+        {
+            self.status = Some(WRITE_REFUSED.into());
+            return;
+        }
         // add_chart rewrites package parts; existing undo snapshots no longer line up.
         self.undo.clear();
         self.redo.clear();
