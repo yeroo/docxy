@@ -224,13 +224,21 @@ fn one_char(d: &Dialog, name: &str, what: &str) -> Result<char, String> {
 /// The column formats as the "Column formats" field lists them
 /// (`general, text, date:dmy, skip`).
 fn formats(d: &Dialog) -> Result<Vec<ColFormat>, String> {
-    text_of(d, "formats")
-        .split(',')
-        .map(str::trim)
+    let text = text_of(d, "formats");
+    let mut entries: Vec<&str> = text.split(',').map(str::trim).collect();
+    // Trailing blanks say nothing; a blank in the middle is General, so the
+    // columns after it keep their places.
+    while entries.last().is_some_and(|s| s.is_empty()) {
+        entries.pop();
+    }
+    entries
+        .iter()
         .enumerate()
-        .filter(|(_, s)| !s.is_empty())
-        .map(|(i, s)| {
-            ColFormat::parse(s).ok_or_else(|| format!("Column {}: unknown format '{s}'", i + 1))
+        .map(|(i, s)| match *s {
+            "" => Ok(ColFormat::General),
+            s => {
+                ColFormat::parse(s).ok_or_else(|| format!("Column {}: unknown format '{s}'", i + 1))
+            }
         })
         .collect()
 }
@@ -667,6 +675,23 @@ mod tests {
         assert_eq!(cell(&t, 0, 0), CellValue::Text("a".into()));
         assert_eq!(cell(&t, 0, 1), CellValue::Text("b".into()));
         assert_eq!(cell(&t, 0, 2), CellValue::Text("c".into()));
+    }
+
+    /// A blank entry in the formats list is General; later columns keep
+    /// their places.
+    #[test]
+    fn a_blank_format_entry_is_general() {
+        let mut t = tab(&[(0, 0, "a\t0012\t0034")]);
+        open(&mut t, (0, 0, 0, 0));
+        set(
+            &mut t,
+            "Step 3: Column data format",
+            "formats",
+            Json::Str("general, , text,".into()),
+        );
+        press(&mut t, "Finish");
+        assert_eq!(cell(&t, 0, 1), CellValue::Number(12.0));
+        assert_eq!(cell(&t, 0, 2), CellValue::Text("0034".into()));
     }
 
     #[test]

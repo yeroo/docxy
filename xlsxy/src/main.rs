@@ -633,7 +633,7 @@ fn text_to_pkg(text: &str, sheet_name: &str, opts: &TextParse, open: &TextOpen) 
     if !sheet_name.is_empty() {
         wb.sheets[0].name = sheet_name.chars().take(31).collect();
     }
-    import_text(&mut wb.sheets[0], &mut wb.styles, text, opts, open);
+    import_text(&mut wb.sheets[0], &mut wb.styles, text, opts, open, false);
     // A text file carries no cached values: work out its formulas now.
     let mut engine = Engine::new(&pkg.workbook);
     engine.clock = open.today;
@@ -656,17 +656,19 @@ fn csv_parse(text: &str, tab: bool) -> (TextParse, &str) {
     (TextParse::csv(delim), body)
 }
 
-/// Text converted into `sheet` from A1 under `opts`. Returns (rows, cols).
+/// Text converted into `sheet` (of a workbook in the 1904 date system when
+/// `date1904`) from A1 under `opts`. Returns (rows, cols).
 fn import_text(
     sheet: &mut gridcore::sheet::Sheet,
     styles: &mut gridcore::sheet::Styles,
     text: &str,
     opts: &TextParse,
     open: &TextOpen,
+    date1904: bool,
 ) -> (u32, u32) {
     let records = gridcore::textio::split_text(text, opts);
     let ctx = gridcore::entry::EntryCtx {
-        date1904: false,
+        date1904,
         today: open.today,
     };
     gridcore::textio::import_records(sheet, styles, 0, 0, &records, opts, &open.auto, &ctx)
@@ -3574,13 +3576,27 @@ impl App {
     /// Open `path` without a dialog, as the control surface does: a
     /// `.txt`/`.prn` is imported with the Text Import Wizard's defaults
     /// (`sheet.import-text` takes other options) instead of showing it.
+    /// A load that fails is the error (the verb reports it).
     fn open_without_wizard(&mut self, path: &str) -> Result<(), String> {
-        if !is_text_import(path) {
-            self.open_workbook(path);
-            return Ok(());
-        }
         let (pkg, save, source) = load_workbook(path, &self.text_open())?;
         self.install_workbook(pkg, save, source);
+        Ok(())
+    }
+
+    /// Re-read the file the workbook is bound to, dropping unsaved edits. A
+    /// workbook saved as a text type stays bound to that file and type (it
+    /// is re-imported from it), so a later save writes the text file again
+    /// rather than a `<name>.xlsx` beside it.
+    fn reload(&mut self) -> Result<(), String> {
+        let path = self.path.clone();
+        let bound = self.bound_text_type();
+        self.open_without_wizard(&path)?;
+        if let Some(t) = bound {
+            self.path = path;
+            self.text_type = Some(t);
+            // The text file is the save target itself, not a source to guard.
+            self.import_source = None;
+        }
         Ok(())
     }
 
@@ -3812,7 +3828,12 @@ impl App {
             return;
         }
         // A type picked in the list wins; else the name's extension decides.
-        let chosen = self.backstage.as_ref().and_then(|b| b.chosen_type());
+        // A type picked in the list, else the type the workbook is bound to
+        // while the name still has its extension, else the name decides.
+        let chosen = self.backstage.as_ref().and_then(|b| {
+            b.chosen_type()
+                .or_else(|| b.preset_type().filter(|&t| has_type_ext(&name, t)))
+        });
         let fname = match chosen {
             Some(t) if has_type_ext(&name, t) => name,
             Some(t) => format!("{name}.{}", SAVE_TYPES[t].ext),
@@ -4895,9 +4916,24 @@ impl App {
                 self.save();
                 false
             }
-            // Quit only when the save landed: a failed save keeps the
-            // editor open with its edits and the failure on the status line.
-            "wq" | "x" => self.save_current().is_ok(),
+            // Quit only when the save landed and kept everything: a failed
+            // save, or one to a text type that holds only the active sheet
+            // (the workbook stays modified), keeps the editor open with the
+            // reason on the status line.
+            "wq" | "x" => {
+                if self.save_current().is_err() {
+                    return false;
+                }
+                if self.modified {
+                    let saved = self.status.take().unwrap_or_default();
+                    self.status = Some(format!(
+                        "{saved} Not quitting: the workbook is not saved in full \
+                         (Save As a workbook, or :q! to discard)."
+                    ));
+                    return false;
+                }
+                true
+            }
             "q" => {
                 if self.modified {
                     self.status = Some("Unsaved changes (use :q! to discard)".to_string());
@@ -5168,6 +5204,10 @@ impl App {
 impl backstage::BackstageHost for App {
     fn extensions(&self) -> &'static [&'static str] {
         &["xlsx", "xlsm", "xltx", "xltm", "csv", "tsv", "txt", "prn"]
+    }
+
+    fn default_save_type(&self) -> Option<usize> {
+        self.bound_text_type().or_else(|| type_for_path(&self.path))
     }
 
     fn default_save_name(&self) -> String {
@@ -7418,6 +7458,63 @@ mod tests {
         app.commit_save_as(dir.clone(), "other.html".into());
         assert!(dir.join("other.html").is_file());
         assert!(!dir.join("other.html.htm").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Save As opens on the type the workbook is bound to: Unicode Text
+    /// saved again (Save As, Enter) stays UTF-16, not Text (Tab) 1252.
+    #[test]
+    fn save_as_again_keeps_the_bound_unicode_text_type() {
+        let dir = tmp("unicode-again");
+        let mut app = two_sheet_app(&dir);
+        let unicode = SAVE_TYPES
+            .iter()
+            .position(|t| t.label == "Unicode Text")
+            .unwrap();
+        let path = dir.join("u.txt");
+        app.save_as_type(path.to_string_lossy().into_owned(), unicode);
+        std::fs::remove_file(&path).unwrap();
+        app.open_backstage();
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        while app.backstage.as_ref().unwrap().item != backstage::Item::SaveAs {
+            app.backstage_key(key(KeyCode::Down));
+        }
+        app.backstage_key(key(KeyCode::Enter));
+        assert_eq!(app.backstage.as_ref().unwrap().type_sel, unicode);
+        let b = app.backstage.as_mut().unwrap();
+        b.dir = dir.clone();
+        app.backstage_key(key(KeyCode::Enter));
+        assert!(std::fs::read(&path).unwrap().starts_with(b"\xFF\xFE"));
+        // A .html workbook's Save As shows Web Page, not Excel Workbook.
+        let web = SAVE_TYPES
+            .iter()
+            .position(|t| t.label == "Web Page")
+            .unwrap();
+        app.save_as_type(dir.join("p.html").to_string_lossy().into_owned(), web);
+        app.open_backstage();
+        while app.backstage.as_ref().unwrap().item != backstage::Item::SaveAs {
+            app.backstage_key(key(KeyCode::Down));
+        }
+        app.backstage_key(key(KeyCode::Enter));
+        assert_eq!(app.backstage.as_ref().unwrap().type_sel, web);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `:wq` after saving as CSV (only the active sheet was written) stays
+    /// open instead of quitting with the other sheets unsaved.
+    #[test]
+    fn vim_wq_after_a_csv_save_as_does_not_quit() {
+        let dir = tmp("wq-csv");
+        let mut app = two_sheet_app(&dir);
+        app.request_save_as(dir.join("book.csv").to_string_lossy().into_owned());
+        assert!(app.modified);
+        for cmd in ["wq", "x"] {
+            assert!(!app.vim_run_command(cmd), ":{cmd} quit");
+            assert!(app.status.as_deref().unwrap().contains("Not quitting"));
+        }
+        // Saved as a workbook, :wq quits.
+        app.request_save_as(dir.join("book.xlsx").to_string_lossy().into_owned());
+        assert!(app.vim_run_command("wq"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

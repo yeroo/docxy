@@ -765,8 +765,8 @@ name and defaults to the active sheet):
 | `find` | `{query, sheet?}` | `{query, count, matches:[…]}` |
 | `wb.recalc` | — | `{recalculated:true}` |
 | `wb.save` | — | `{path, …}`; a failed write answers `ok:false` with `save failed: …` (the status-bar text) and the workbook stays modified |
-| `wb.reload` | — | `{path, …}` (re-reads the file, dropping unsaved edits; a `.txt`/`.prn` is re-imported with the Text Import Wizard's defaults, no dialog) |
-| `wb.open` | `{path}` | `{path, …}`; a `.csv`/`.tsv` opens as Excel opens it, and a `.txt`/`.prn` is imported with the Text Import Wizard's defaults (tab-delimited, General columns) without showing the wizard — use `sheet.import-text` for other options |
+| `wb.reload` | — | `{path, …}` (re-reads the file, dropping unsaved edits; a `.txt`/`.prn` is re-imported with the Text Import Wizard's defaults, no dialog). A workbook last saved as a text type (CSV, Text, Unicode Text, `.prn`, Web Page) is re-imported from that file and stays bound to it and its type; any other text file rebinds as `wb.open` does |
+| `wb.open` | `{path}` | `{path, …}`; a `.csv`/`.tsv` opens as Excel opens it, and a `.txt`/`.prn` is imported with the Text Import Wizard's defaults (tab-delimited, General columns) without showing the wizard — use `sheet.import-text` for other options. An opened `.csv`/`.tsv`/`.txt`/`.prn` is **rebound to `<name>.xlsx`**: `wb.save` writes that workbook (replacing an existing `<name>.xlsx`) and never the text file. A load that fails is the verb's error |
 | `comment.list` | — | `{comments:[{sheet,ref,author,text}]}` (threads flattened in reply order) |
 | `wb.export-csv` | `{sheet?}` | `{sheet, csv}` — display-formatted, Excel's CSV text (CR LF records, LF inside a quoted field; a file adds the UTF-8 BOM), the **live buffer** |
 | `sheet.pivot` | `{range,rows:[col],cols?:[col],values:[{col,agg}],sheet?}` | `{table:[[string]]}` — **ad-hoc and read-only**, no workbook mutation |

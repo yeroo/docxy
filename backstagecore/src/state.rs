@@ -51,7 +51,7 @@ pub struct SaveType {
 }
 
 /// `name` with its extension replaced by (or, without one, given) `ext`.
-pub fn with_extension(name: &str, ext: &str) -> String {
+pub(crate) fn with_extension(name: &str, ext: &str) -> String {
     let stem = match name.rfind('.') {
         Some(i) if i > 0 => &name[..i],
         _ => name,
@@ -154,6 +154,9 @@ pub struct Backstage {
     pub type_sel: usize,
     /// The user picked the type (rather than it following the name).
     pub type_touched: bool,
+    /// The type shown is the one the host bound the document to
+    /// ([`crate::BackstageHost::default_save_type`]).
+    pub type_preset: bool,
     /// In Save As: the type box is focused.
     pub type_focus: bool,
     /// Export's highlighted row: 0 is the quick export, then each type.
@@ -191,6 +194,7 @@ impl Backstage {
             save_types: &[],
             type_sel: 0,
             type_touched: false,
+            type_preset: false,
             type_focus: false,
             export_sel: 0,
             export_quick: String::new(),
@@ -226,6 +230,21 @@ impl Backstage {
         (self.type_touched && self.type_sel < self.save_types.len()).then_some(self.type_sel)
     }
 
+    /// The host's preselected type, while the user has not picked another.
+    /// The host decides whether it still applies to the typed name.
+    pub fn preset_type(&self) -> Option<usize> {
+        (self.type_preset && !self.type_touched && self.type_sel < self.save_types.len())
+            .then_some(self.type_sel)
+    }
+
+    /// Show `t` as the host's preselected type.
+    pub fn preset(&mut self, t: usize) {
+        if t < self.save_types.len() {
+            self.type_sel = t;
+            self.type_preset = true;
+        }
+    }
+
     /// Pick a Save As type: the name's extension follows it.
     pub fn pick_type(&mut self, i: usize) {
         let Some(t) = self.save_types.get(i) else {
@@ -247,6 +266,7 @@ impl Backstage {
         self.item = Item::SaveAs;
         self.pane = Pane::SaveAs;
         self.type_touched = false;
+        self.type_preset = false;
         let ext = self
             .name_input
             .rsplit_once('.')
@@ -489,6 +509,15 @@ mod tests {
         bs.begin_save_as("data".into(), Some(1));
         assert_eq!(bs.name_input, "data.csv");
         assert_eq!(with_extension("a.b.c", "txt"), "a.b.txt");
+        // A host's preselected type shows, and counts until one is picked.
+        bs.begin_save_as("u.txt".into(), None);
+        bs.preset(1);
+        assert_eq!(
+            (bs.type_sel, bs.preset_type(), bs.chosen_type()),
+            (1, Some(1), None)
+        );
+        bs.pick_type(0);
+        assert_eq!((bs.preset_type(), bs.chosen_type()), (None, Some(0)));
         assert_eq!(with_extension(".hidden", "csv"), ".hidden.csv");
     }
 

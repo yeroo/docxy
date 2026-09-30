@@ -143,8 +143,12 @@ impl Backstage {
             Item::Info => BackstageEvent::None,
             Item::Save => BackstageEvent::Save,
             Item::SaveAs => {
-                // Prefill the current file's name with the caret at its end.
+                // Prefill the current file's name with the caret at its end,
+                // and the type the host bound it to.
                 self.begin_save_as(host.default_save_name(), None);
+                if let Some(t) = host.default_save_type() {
+                    self.preset(t);
+                }
                 BackstageEvent::None
             }
             Item::New => BackstageEvent::New,

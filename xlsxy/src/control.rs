@@ -122,8 +122,7 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
             Ok(path_info(app))
         }
         "wb.reload" => {
-            let p = app.path.clone();
-            app.open_without_wizard(&p)?;
+            app.reload()?;
             Ok(path_info(app))
         }
         "wb.open" => {
@@ -984,19 +983,32 @@ fn text_options(
 /// switches given, and return all four. They apply to the next `.csv`/text
 /// open and are saved with the app's preferences on exit.
 fn app_options(app: &mut App, args: &Json) -> Result<Json, String> {
+    const KEYS: [&str; 4] = [
+        "convert_leading_zeros",
+        "convert_long_numbers",
+        "convert_e_notation",
+        "convert_dates",
+    ];
+    // Every key is checked before any is set: a bad one changes nothing.
+    let mut given = [None; 4];
+    for (slot, key) in given.iter_mut().zip(KEYS) {
+        *slot = match args.get(key) {
+            None | Some(Json::Null) => None,
+            Some(Json::Bool(b)) => Some(*b),
+            Some(_) => return Err(format!("'{key}' must be true or false")),
+        };
+    }
     let auto = &mut app.auto_convert;
-    let fields: [(&str, &mut bool); 4] = [
-        ("convert_leading_zeros", &mut auto.remove_leading_zeros),
-        ("convert_long_numbers", &mut auto.keep_15_digits),
-        ("convert_e_notation", &mut auto.e_notation),
-        ("convert_dates", &mut auto.dates),
+    let fields: [&mut bool; 4] = [
+        &mut auto.remove_leading_zeros,
+        &mut auto.keep_15_digits,
+        &mut auto.e_notation,
+        &mut auto.dates,
     ];
     let mut out = Vec::new();
-    for (key, slot) in fields {
-        match args.get(key) {
-            None | Some(Json::Null) => {}
-            Some(Json::Bool(b)) => *slot = *b,
-            Some(_) => return Err(format!("'{key}' must be true or false")),
+    for ((key, slot), want) in KEYS.into_iter().zip(fields).zip(given) {
+        if let Some(b) = want {
+            *slot = b;
         }
         out.push((key, Json::Bool(*slot)));
     }
@@ -1073,7 +1085,15 @@ fn import_new_sheet(
     let idx = app.pkg.add_sheet(&name);
     let open = app.text_open();
     let wb = &mut app.pkg.workbook;
-    super::import_text(&mut wb.sheets[idx], &mut wb.styles, text, opts, &open);
+    let date1904 = wb.date1904;
+    super::import_text(
+        &mut wb.sheets[idx],
+        &mut wb.styles,
+        text,
+        opts,
+        &open,
+        date1904,
+    );
     let (rows, cols) = app.pkg.workbook.sheets[idx].used_size();
     // New package parts (worksheet/relationship/workbook.xml wiring) don't
     // fit the cell-level undo model — same as the TUI's own AddSheet flow,
@@ -2496,8 +2516,13 @@ mod tests {
                 CellValue::Text(t.to_string())
             );
         }
-        let bad = Json::obj(vec![("convert_dates", Json::Str("no".into()))]);
+        let bad = Json::obj(vec![
+            ("convert_leading_zeros", Json::Bool(true)),
+            ("convert_dates", Json::Str("no".into())),
+        ]);
         assert!(dispatch(&mut a, "app.options", &bad).is_err());
+        // The bad key refused the whole call: the good one was not applied.
+        assert!(!a.auto_convert.remove_leading_zeros);
     }
 
     /// A workbook saved as Text (Tab delimited) is bound to its .txt, so
@@ -2515,9 +2540,47 @@ mod tests {
         std::fs::write(&path, "b\t2\r\n").unwrap();
         dispatch(&mut a, "wb.reload", &Json::Null).unwrap();
         assert!(a.text_dialog.is_none());
+        // Still bound to the text file and its type: a save writes it, not a
+        // saved.xlsx beside it.
+        assert_eq!(std::path::Path::new(&a.path), path);
+        dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+        assert!(!dir.join("saved.xlsx").exists());
+        assert_eq!(std::fs::read(&path).unwrap(), b"b\t2\r\n");
         assert_eq!(get_value(&a, "A1"), CellValue::Text("b".into()));
         assert_eq!(get_value(&a, "B1"), CellValue::Number(2.0));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed load is the verb's error, not a quiet success.
+    #[test]
+    fn wb_open_of_a_missing_workbook_is_an_error() {
+        let mut a = app();
+        let missing = std::env::temp_dir()
+            .join("xlsxy-no-such-dir-704")
+            .join("x.xlsx");
+        let err = dispatch(
+            &mut a,
+            "wb.open",
+            &Json::obj(vec![("path", Json::Str(missing.to_string_lossy().into()))]),
+        );
+        assert!(err.is_err());
+    }
+
+    /// An import into a 1904-system workbook reads dates in that system.
+    #[test]
+    fn sheet_import_csv_follows_the_workbooks_date_system() {
+        let mut a = app();
+        a.pkg.workbook.date1904 = true;
+        let r = dispatch(
+            &mut a,
+            "sheet.import-csv",
+            &Json::obj(vec![("text", Json::Str("1/2/2024\n".into()))]),
+        )
+        .unwrap();
+        let wb = &a.pkg.workbook;
+        let cell = wb.sheets[r.get_usize("sheet").unwrap()].cell(0, 0).unwrap();
+        let shown = gridcore::sheet::format_with(&wb.styles.xf(cell.style), &cell.value, true);
+        assert_eq!(shown, "1/2/2024");
     }
 
     #[test]
