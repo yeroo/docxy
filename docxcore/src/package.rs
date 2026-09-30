@@ -1189,6 +1189,10 @@ impl Package {
             if linked {
                 continue;
             }
+            // `next_rid_num` only sees `Id="rIdN"`; skip ids spelled otherwise.
+            while rels.target(&format!("rId{next}")).is_some() {
+                next += 1;
+            }
             let rid = format!("rId{next}");
             next += 1;
             added.push_str(&format!(
@@ -4484,6 +4488,43 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(update.content_types, None);
+    }
+
+    #[test]
+    fn link_part_hyperlinks_skips_ids_however_they_are_quoted() {
+        let mut pkg = new_package(Document::default());
+        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id='rId1' Type="i" Target="media/image1.png"/><Relationship Id = "rId2" Type="i" Target="media/image2.png"/></Relationships>"#;
+        pkg.parts.push((
+            "word/_rels/header1.xml.rels".to_string(),
+            rels.as_bytes().to_vec(),
+        ));
+        let mut blocks = link_blocks(vec![link(Some("https://a.example/"), None, None)]);
+        let update = pkg
+            .link_part_hyperlinks("word/header1.xml", &mut blocks)
+            .unwrap()
+            .unwrap();
+        pkg.apply_part_rels(update);
+        assert_eq!(rel_ids(&blocks), [Some("rId3".to_string())]);
+        let text = pkg.part_text("word/_rels/header1.xml.rels").unwrap();
+        let mut ids = Vec::new();
+        let mut parser = XmlParser::new(&text);
+        loop {
+            match parser.next() {
+                Event::Start if parser.name() == "Relationship" => {
+                    ids.push(parser.attr("Id").to_string());
+                }
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            ids,
+            ["rId1", "rId2", "rId3"],
+            "one relationship per id: {text}"
+        );
+        let parsed = parse_rels_xml(&text);
+        assert_eq!(parsed.target("rId1"), Some("media/image1.png"));
+        assert_eq!(parsed.target("rId3"), Some("https://a.example/"));
     }
 
     #[test]
