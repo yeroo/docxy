@@ -606,22 +606,22 @@ ending with `use the harness save-as verb`. `save-as.uit` covers each kind and
 refusal.
 
 **`clipboard`.** A harness instance never touches the OS clipboard: the app's
-clipboard reads and writes (sheet copy and paste, Project copy and paste) go
+clipboard reads and writes (document, sheet and Project copy and paste) go
 through a private clipboard that starts empty, so a run neither reads nor
 overwrites what the person at the machine copied. `read` replies `{text, app}`:
 `text` is that clipboard's text (`null` when empty) and `app` is what the
 active tab's paste would take besides it: `{kind: "doc", text}` (a document's
-in-app clip), `{kind: "grid", text, rows, cols}` (the sheet's copied cells,
-kept while the clipboard still holds the text that copy wrote, or holds no item
-at all), or `{kind: "none"}`, when a sheet or Project paste takes `text`. A
-copy with no text in it (an image, an empty copy) is newer than the grid clip
-too: `text` is `null`, `app` is `none`, and a sheet paste does nothing.
+copied runs, formatting intact) or `{kind: "grid", text, rows, cols}` (the
+sheet's copied cells), each kept while the clipboard still holds the text that
+copy wrote, or holds no item at all; or `{kind: "none"}`, when a document,
+sheet or Project paste takes `text` (#755). A copy with no text in it (an
+image, an empty copy) is newer than either clip too: `text` is `null`, `app`
+is `none`, and a paste does nothing. The exception is a document copy of only
+an image, whose own text is empty: its clip stays ours.
 `write` needs `text` (an empty one is such a copy) and replies the same. Copy, cut and paste are the app's own keys and
 buttons (`key ctrl+c`, `ribbon-click {"tab":"Home","command":"Copy"}`), not
 actions of this verb, which refuses them and `paste-special` (`paste special is
-not implemented in this app`). A document never reads the clipboard's text,
-and its copy never writes it: a document paste uses only its own clip.
-`clipboard.uit` covers these.
+not implemented in this app`). `clipboard.uit` covers these.
 
 **`fill-drag`.** The `drag` verb presses the grid, so it only sweeps a
 selection; `fill-drag` does what a pointer on the fill handle does:
