@@ -264,6 +264,56 @@ fn the_editor_shows_one_line_per_line_feed_with_the_caret_on_its_line() {
 }
 
 #[test]
+fn an_unfinished_formula_is_refused_and_the_editor_stays() {
+    let mut v = view();
+    type_fresh(&mut v, "=SUM(A1");
+    // Right in Enter mode after a reference is a commit, not a point...
+    assert!(!v.edit_point(0, 1, false));
+    // ...and the commit is refused: nothing stored, nothing moved.
+    assert_eq!(v.commit_and_move(0, 1), None);
+    assert_eq!(v.editing.as_deref(), Some("=SUM(A1"));
+    assert!(
+        v.entry_error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("formula error"))
+    );
+    assert_eq!(v.sel, (0, 0));
+    assert!(v.sheet().cell(0, 0).is_none());
+    // Enter the same.
+    v.entry_error = None;
+    assert!(!v.commit_edit());
+    assert!(v.entry_error.is_some());
+    assert!(v.sheet().cell(0, 0).is_none());
+    // Finished, it commits.
+    v.editing = Some("=SUM(A1)".into());
+    v.entry_error = None;
+    assert!(v.commit_edit());
+    assert_eq!(
+        v.sheet().cell(0, 0).and_then(|c| c.formula.as_deref()),
+        Some("SUM(A1)")
+    );
+    // A Text cell stores `=SUM(A1` as text: nothing to refuse there.
+    let text_fmt = v.pkg.workbook.styles.intern({
+        let mut xf = Xf::default();
+        xf.set_code(Some("@".into()));
+        xf
+    });
+    put(
+        &mut v,
+        1,
+        0,
+        Cell {
+            style: text_fmt,
+            ..Cell::default()
+        },
+    );
+    select(&mut v, 1, 0);
+    type_fresh(&mut v, "=SUM(A1");
+    assert!(v.commit_edit());
+    assert_eq!(value(&v, 1, 0), CellValue::Text("=SUM(A1".into()));
+}
+
+#[test]
 fn an_apostrophe_is_a_quote_prefix_and_an_untouched_reedit_is_a_no_op() {
     let mut v = view();
     type_fresh(&mut v, "'007");

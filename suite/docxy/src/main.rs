@@ -515,8 +515,10 @@ struct EditPoint {
     anchor: (u32, u32),
     cell: (u32, u32),
     /// The buffer and caret as the last point left them. Pointing carries on
-    /// only while they are untouched; a keystroke, a click in the text, a
-    /// pick with the mouse all change one of them and so end it.
+    /// only while they are untouched: a keystroke or a click in the text
+    /// changes one of them and so ends it. A pick with the mouse instead
+    /// hands pointing to the picked cell (`formula_pick_to` writes a fresh
+    /// `EditPoint`), so the arrows carry on from there.
     wrote: (String, usize),
 }
 
@@ -1290,6 +1292,10 @@ impl SheetView {
             self.entry_error = Some(e.to_string());
             return false;
         }
+        if let Some(e) = self.formula_error(origin, buf) {
+            self.entry_error = Some(e);
+            return false;
+        }
         let buf = self.editing.take().unwrap_or_default();
         self.end_cell_edit();
         self.push_undo();
@@ -1300,6 +1306,18 @@ impl SheetView {
             self.engine.set_cell(&mut self.pkg.workbook, origin, cell);
         }
         true
+    }
+
+    /// Why `buf` cannot be committed into `(sheet, row, col)` as a formula
+    /// (`=SUM(A1` is unfinished), or `None` when it is no formula there or a
+    /// valid one. A refused formula keeps the editor open, as xlsxy's does,
+    /// rather than storing a cell that never evaluates — which matters now
+    /// that an Enter-mode arrow commits a half-typed formula.
+    fn formula_error(&self, (s, r, c): (usize, u32, u32), buf: &str) -> Option<String> {
+        let body = gridcore::entry::typed_formula(&self.pkg.workbook, s, r, c, buf)?;
+        gridcore::engine::Engine::validate(body)
+            .err()
+            .map(|e| format!("formula error: {e}"))
     }
 
     /// Type `text` as an entry into (row, col) of the active sheet, the way a
@@ -1387,7 +1405,7 @@ impl SheetView {
         };
         // A bare leading `+`, `-` or `@` doesn't parse as a formula yet, but it
         // is how one starts, so it points just as `=` does.
-        let formula = self.edit_is_formula() || buf.starts_with(['+', '-', '@']);
+        let formula = buf.starts_with(['=', '+', '-', '@']);
         if self.edit_mode != EditMode::Enter || !formula {
             return false;
         }
@@ -1721,6 +1739,10 @@ impl SheetView {
         }
         if let Err(e) = gridcore::entry::check_len(&buf) {
             self.entry_error = Some(e.to_string());
+            return false;
+        }
+        if let Some(e) = self.formula_error((s, r, c), &buf) {
+            self.entry_error = Some(e);
             return false;
         }
         self.end_cell_edit();
