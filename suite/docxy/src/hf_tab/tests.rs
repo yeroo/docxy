@@ -418,6 +418,7 @@ fn the_menus_list_the_gallery_then_edit_and_remove() {
                 menu::MenuItem::Item(e) => e.label.clone(),
                 menu::MenuItem::Separator => "-".into(),
                 menu::MenuItem::Heading(h) => format!("[{h}]"),
+                menu::MenuItem::TableGrid { .. } => "[grid]".into(),
             })
             .collect()
     };
@@ -550,7 +551,8 @@ fn every_tabs_key_tips_are_prefix_free() {
         tabs.extend(ribbon_for(kind).tabs);
     }
     tabs.push(hf_tab());
-    tabs.push(table_tab());
+    tabs.push(table_tab::table_design_tab());
+    tabs.push(table_tab::table_layout_tab());
     tabs.push(gantt_format_tab());
     for tab in &tabs {
         let tips = tab_key_tips(tab);

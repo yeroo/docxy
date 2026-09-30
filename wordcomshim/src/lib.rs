@@ -40,21 +40,9 @@ mod win {
     use comshimcore::*;
 
     use docxcore::model::{
-        Align, Block, BreakKind, Cell, Document, Inline, ParProps, Paragraph, Row, Run, RunProps,
-        Table, VMerge,
+        Align, Block, BreakKind, Document, Inline, ParProps, Paragraph, Run, RunProps, Table,
     };
     use docxcore::package::{Package, load_package, new_package, save_package};
-
-    /// A plain single-line bordered `w:tblPr` for tables the shim creates (Word's
-    /// `Tables.Add` makes a bordered table by default).
-    const TBLPR: &str = "<w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/><w:tblBorders>\
-<w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-<w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-<w:bottom w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-<w:right w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-<w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-<w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-</w:tblBorders></w:tblPr>";
 
     use windows::Win32::Foundation::{DISP_E_BADINDEX, E_FAIL, E_NOTIMPL, E_POINTER, S_OK};
     use windows::Win32::System::Com::{
@@ -460,30 +448,14 @@ mod win {
 
         /// Append a rows×cols bordered table; returns its 1-based table number.
         fn add_table(&mut self, rows: usize, cols: usize) -> usize {
-            let cols = cols.max(1);
-            let cell = || Cell {
-                grid_span: 1,
-                v_merge: VMerge::default(),
-                blocks: vec![Block::Paragraph(Paragraph::default())],
-                raw_tcpr: None,
-                property_change: None,
-                unsupported_revisions: vec![],
-            };
-            let table = Table {
-                grid: vec![0; cols],
-                rows: (0..rows.max(1))
-                    .map(|_| Row {
-                        cells: (0..cols).map(|_| cell()).collect(),
-                        raw_props: vec![],
-                        property_change: None,
-                    })
-                    .collect(),
-                namespace_declarations: vec![],
-                markup_compatibility_attributes: vec![],
-                row_boundaries: vec![],
-                raw_tblpr: Some(TBLPR.to_string()),
-                property_change: None,
-            };
+            // Word's `Tables.Add` makes a single-bordered table with equal
+            // columns; the builder is the one Insert Table uses everywhere.
+            let table = docxcore::table::new_table(
+                rows.max(1),
+                cols.max(1),
+                docxcore::table::DEFAULT_TEXT_WIDTH,
+                docxcore::table::AutoFit::Default,
+            );
             self.push_content_block(Block::Table(table));
             self.saved = false;
             self.table_count()

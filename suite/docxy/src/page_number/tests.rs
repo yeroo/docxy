@@ -20,6 +20,7 @@ fn labels(items: &[menu::MenuItem]) -> Vec<String> {
             menu::MenuItem::Item(e) => e.label.clone(),
             menu::MenuItem::Separator => "-".into(),
             menu::MenuItem::Heading(h) => format!("[{h}]"),
+            menu::MenuItem::TableGrid { .. } => "[grid]".into(),
         })
         .collect()
 }

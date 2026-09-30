@@ -210,7 +210,7 @@ living under the harness's own directory.
 `basic.docx` is a copy of the repository's blank Word template
 (`offxy-vscode/mcp/templates/blank.docx`) for the cross-kind ribbon smoke case.
 `doc-table.docx` has a paragraph before and after a two-cell table; the
-`doc-state.uit` case uses it to check Table's contextual visibility.
+`doc-state.uit` case uses it to check that the table tabs show only in a table.
 `rulers.docx` has contrasting page margins, first-line and hanging indents,
 and four pages of text. `doc-rulers.uit` checks the painted ruler at two zooms.
 
@@ -286,7 +286,7 @@ State keys, as the app reports them after every driving verb:
 | `timeline_view_start`, `timeline_view_finish` | Project: the first and last day the Gantt chart shows, which the Timeline's view box highlights, clamped to the Timeline's span (`Mon 3/2/26`) |
 | `nonworking` | Project: Timeline's inclusive, merged shaded day runs as `[[first, last], ...]` in Project date form (`Wed 3/4/26`). Empty when each day is narrower than 2 px or the project calendar has no weekly working time. Reported even while the Timeline is hidden |
 | `filler_rows` | Project: ruled empty rows visible below the last task, from the last drawn frame's `project-body` height (0 before the first layout). Unlike the other keys it trails a driving verb by a frame, so settle with a `shot` before asserting it |
-| `ribbon_tab` | current kind-aware ribbon tab name (`Task`, `Resource`, `View`, `Home`, etc.) |
+| `ribbon_tab` | current kind-aware ribbon tab name (`Task`, `Resource`, `View`, `Home`, etc.; the contextual table tabs are `Table Design` and `Table Layout`, though the strip draws the second as plain "Layout", as Word does) |
 
 Dotted keys traverse objects, and numeric components index arrays: `assert
 sel.start is 1`, `assert reply.tabs.0.name is File`. A later driving verb
@@ -303,6 +303,28 @@ A field that shows a result contributes one U+FFFC (it is edited as one unit);
 its cached result text, like revision text, has no editor caret and
 contributes no offset.
 Text boxes appear in `textboxes` as separate stories.
+
+`table` is the caret's innermost table, or `null` outside one (#705):
+`rows`, `columns` (grid columns), the caret's `row` and `cell`, the table's
+`style` id, its style options as the `w:tblLook` hex mask (`look`, `04A0` by
+default), the caret cell's `shading` (`RRGGBB`, `null` for none) and
+`text_direction`, the cell-range selection as `range` `{top, bottom, left,
+right}` (grid columns; `null` when the selection is not across cells), and
+`cells`: per row, per cell, the cell's paragraphs as text, with a tab shown as
+`⇥` so a script can name it (`assert table.cells.0.0.1 is b⇥c`). Every field
+describes that one table: a selection from an outer table's cell into a table
+nested in another cell reports the nested table, with `range` `null` (the
+range belongs to the outer table, which the table commands act on). `view`
+carries `gridlines`, the Table Layout tab's View Gridlines.
+
+Insert > Table's hover grid is a menu item (`menu-read` reports it as
+`{"table_grid": {"columns": 10, "rows": 8}}`) and is driven with `table-grid`,
+through the handlers the drawn cells call: `{"cols": c, "rows": r}` moves the
+pointer over that cell, `{}` moves it off the grid, and `{"cols": c, "rows": r,
+"click": true}` inserts a c-column, r-row table and closes the menu. The reply is
+`{header, state}`, where `header` reads `Insert Table` or `<c>x<r> Table`. It is
+refused unless the Insert > Table menu is open (`ribbon-click
+{"tab":"Insert","command":"table"}` opens it). `word-tables.uit` drives it.
 
 `ruler` reports the last painted ruler geometry in logical pixels rounded to
 0.1: `first_offset`, `left_offset`, and `right_offset` are marker distances from

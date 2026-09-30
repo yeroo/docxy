@@ -90,7 +90,7 @@ the status indicator but does not paint page overlays.
 
 | # | Gap | Corpus weight | Current | Target | Severity |
 |---|-----|--------------|---------|--------|----------|
-| **D1** | **Table / cell / paragraph *properties* dropped on save** — `tblPr`, `trPr`, most of `tcPr`, `w:shd`, `w:pBdr` sides, widths, `vAlign`, `w:spacing`, `outlineLvl` | tables **47** + shading **21** + ParaPr | MISSING (lost on save) | round-trip + render | **Critical** (silent data loss) |
+| **D1** | **Table / cell / paragraph *properties*** — `tblPr`, `trPr`, `tcPr`, `w:shd`, `w:pBdr` sides, widths, `vAlign`, `w:spacing`, `outlineLvl` | tables **47** + shading **21** + ParaPr | PRESERVED on save (verbatim `tblPr`/`trPr`/`tcPr`/`pPr` children); the suite edits and draws table styles, shading, borders, widths, merges and `vAlign` (#705) | terminal rendering of table fills and borders | Low |
 | **D2** | **Footnotes & endnotes** — `footnotes.xml`/`endnotes.xml` never read; reference run emitted empty → **anchor lost on save**, part orphaned | 9 + 5 = **14** | MISSING | load + render markers + panel | High |
 | **D3** | **Tracked changes** — imported inline and property revisions are modeled, rendered, navigable, and accept/reject review is undoable; unsupported records remain lossless and reportable. New edits are not automatically tracked | **22** | REVIEWABLE | authoring (deferred) | Low |
 | **D4** | **Content controls** — block, inline, and table-row `w:sdt` wrappers and arbitrary properties round-trip while their content remains visible/editable; authoring and form UX are not exposed | **27** | PRESERVED + editable payload | property/form UI (deferred) | Low |

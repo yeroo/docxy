@@ -44,6 +44,9 @@ mod sect_pr_tests;
 mod sheet_entry_tests;
 mod sheet_ribbon;
 mod style_gallery;
+mod table_dialogs;
+mod table_tab;
+mod table_view;
 mod tabstrip;
 mod ttc_dialog;
 use project::*;
@@ -291,8 +294,12 @@ enum RibbonTab {
     Layout,
     Review,
     View,
-    /// Contextual Table Tools tab — only reachable while the caret is in a table.
-    Table,
+    /// Word's contextual Table Design tab (#648) — only while the caret is
+    /// in a table.
+    TableDesign,
+    /// Word's contextual table Layout tab (#647) — only while the caret is in
+    /// a table.
+    TableLayout,
     /// Contextual Header & Footer tab (#641) — only while a header or footer
     /// is being edited.
     HeaderFooter,
@@ -2000,6 +2007,11 @@ struct Docxy {
     page_view: bool,
     // Horizontal ruler with margin/indent/tab markers (View ▸ Ruler).
     show_ruler: bool,
+    /// Table > View Gridlines: dashed guides on borderless table edges. A view
+    /// setting, never saved into the document (on by default, as in Word).
+    view_gridlines: bool,
+    /// The Insert > Table grid cell under the pointer: (columns, rows).
+    table_grid_hover: Option<(usize, usize)>,
     // In-progress drag of a ruler marker.
     ruler_drag: Option<RulerDrag>,
     // The tab-stop type placed when clicking the ruler (cycled via the corner box).
@@ -3398,21 +3410,10 @@ enum PickKind {
     FontName,
     FontSize,
     Field,
-    Table,
     Symbol,
     LineSpacing,
     Equation,
 }
-
-/// Table sizes offered by the Insert ▸ Table picker: (label, rows, cols).
-const TABLE_PRESETS: &[(&str, usize, usize)] = &[
-    ("2×2", 2, 2),
-    ("3×2", 3, 2),
-    ("3×3", 3, 3),
-    ("4×3", 4, 3),
-    ("5×3", 5, 3),
-    ("5×5", 5, 5),
-];
 
 /// The characters offered by the Insert ▸ Symbol picker — Word's common set:
 /// typographic punctuation, currency, arrows, and maths.
@@ -3479,6 +3480,41 @@ struct RenderCtx<'a> {
     /// Content width (px) when rendering header/footer paragraphs, enabling the
     /// implicit centre/right tab stops. `None` for body paragraphs.
     hf_width: Option<f32>,
+    /// Table styles and view settings for drawing tables.
+    tbl: &'a TableCtx<'a>,
+    /// The story's cell-range selection, highlighted cell by cell.
+    cell_range: Option<&'a docxcore::editor::CellRange>,
+}
+
+/// What drawing a table needs beyond the table: the package's styles part
+/// (table styles resolve from it, then from docxcore's built-in set), each
+/// style parsed once per frame, and whether borderless edges show gridlines.
+struct TableCtx<'a> {
+    styles_xml: Option<&'a str>,
+    cache: std::cell::RefCell<
+        std::collections::HashMap<String, Option<docxcore::table_styles::TableStyle>>,
+    >,
+    gridlines: bool,
+}
+
+impl<'a> TableCtx<'a> {
+    fn new(pkg: Option<&'a Package>, gridlines: bool) -> Self {
+        TableCtx {
+            styles_xml: pkg
+                .and_then(|p| p.part("word/styles.xml"))
+                .and_then(|b| std::str::from_utf8(b).ok()),
+            cache: Default::default(),
+            gridlines,
+        }
+    }
+
+    fn style(&self, id: &str) -> Option<docxcore::table_styles::TableStyle> {
+        self.cache
+            .borrow_mut()
+            .entry(id.to_string())
+            .or_insert_with(|| docxcore::table_styles::lookup_style(self.styles_xml, id))
+            .clone()
+    }
 }
 
 /// Colours the document renderer needs, pulled from the active theme.
@@ -6543,6 +6579,8 @@ impl Docxy {
             show_notes: false,
             page_view: false,
             show_ruler: false,
+            view_gridlines: true,
+            table_grid_hover: None,
             ruler_drag: None,
             ruler_tab: docxcore::model::TabAlign::Left,
             ruler_probe: std::rc::Rc::new(std::cell::RefCell::new(RulerProbe::default())),
@@ -6676,7 +6714,8 @@ impl Docxy {
     /// The definition of the selected ribbon tab, contextual tabs included.
     fn active_ribbon_tab_def(&self) -> rs::Tab<Act> {
         match self.ribbon_tab {
-            RibbonTab::Table => table_tab(),
+            RibbonTab::TableDesign => table_tab::table_design_tab(),
+            RibbonTab::TableLayout => table_tab::table_layout_tab(),
             RibbonTab::HeaderFooter => hf_tab::hf_tab(),
             RibbonTab::GanttFormat => gantt_format_tab(),
             tab => {
@@ -12968,199 +13007,66 @@ impl Docxy {
         });
     }
 
-    /// If the caret is inside a table, the (block index, row, cell).
-    fn caret_table(&self) -> Option<(usize, usize, usize)> {
-        match self.tabs.get(self.active).map(|t| &t.surface) {
-            Some(Surface::Doc(ed)) => {
-                let p = &ed.caret.path;
-                (p.len() >= 3 && matches!(ed.doc.body.get(p[0]), Some(Block::Table(_))))
-                    .then(|| (p[0], p[1], p[2]))
-            }
-            _ => None,
-        }
-    }
-
-    /// An empty table cell (one blank paragraph).
-    fn empty_cell() -> docxcore::model::Cell {
-        docxcore::model::Cell {
-            grid_span: 1,
-            v_merge: docxcore::model::VMerge::None,
-            blocks: vec![Block::Paragraph(Paragraph::default())],
-            raw_tcpr: None,
-            property_change: None,
-            unsupported_revisions: vec![],
-        }
-    }
-
-    /// Apply a row-only Table Tools command without GPUI state so boundary and
-    /// caret behavior can be covered at the command-wiring layer.
-    fn apply_table_row_op(
-        table: &mut Table,
-        table_index: usize,
-        row: usize,
-        col: usize,
-        ncols: usize,
-        act: Act,
-    ) -> Option<Caret> {
-        use Act::*;
-        match act {
-            RowAbove | RowBelow => {
-                let at = if matches!(act, RowAbove) {
-                    row
-                } else {
-                    row + 1
-                }
-                .min(table.rows.len());
-                let new = docxcore::model::Row {
-                    cells: (0..ncols).map(|_| Self::empty_cell()).collect(),
-                    raw_props: vec![],
-                    property_change: None,
-                };
-                let inserted = table.insert_row(at, new);
-                debug_assert!(inserted);
-                Some(Caret::at(
-                    vec![
-                        table_index,
-                        at.min(table.rows.len() - 1),
-                        col.min(ncols - 1),
-                        0,
-                    ],
-                    0,
-                ))
-            }
-            DelRow if table.rows.len() > 1 => {
-                let removed = table.remove_row(row);
-                debug_assert!(removed.is_some());
-                let nr = table.rows.len();
-                Some(Caret::at(
-                    vec![table_index, row.min(nr - 1), col.min(ncols - 1), 0],
-                    0,
-                ))
-            }
-            _ => None,
-        }
-    }
-
-    /// Run a Table Tools operation relative to the caret's cell.
-    fn table_op(&mut self, act: Act, window: &mut Window, cx: &mut Context<Self>) {
-        use Act::*;
-        let Some((tb, row, col)) = self.caret_table() else {
-            return self.refocus(window, cx);
+    /// A click on a table's selection zones: select the cell, the row or the
+    /// column in the edited story (see `table_el`).
+    fn table_click(
+        &mut self,
+        table: &[usize],
+        what: TableClick,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ed) = self.edit_target() else {
+            return;
         };
-        let idx = self.active;
-        if let Some(t) = self.tabs.get_mut(idx) {
-            if let Surface::Doc(ed) = &mut t.surface {
-                if let Some(Block::Table(table)) = ed.doc.body.get_mut(tb) {
-                    let ncols = table
-                        .grid
-                        .len()
-                        .max(table.rows.first().map_or(0, |r| r.cells.len()));
-                    match act {
-                        RowAbove | RowBelow | DelRow => {
-                            if let Some(caret) =
-                                Self::apply_table_row_op(table, tb, row, col, ncols, act)
-                            {
-                                ed.caret = caret;
-                            }
-                        }
-                        ColLeft | ColRight => {
-                            let at = if matches!(act, ColLeft) { col } else { col + 1 };
-                            for r in &mut table.rows {
-                                r.cells.insert(at.min(r.cells.len()), Self::empty_cell());
-                            }
-                            let w = table.grid.first().copied().unwrap_or(2340);
-                            table.grid.insert(at.min(table.grid.len()), w);
-                            ed.caret = Caret::at(vec![tb, row, at, 0], 0);
-                        }
-                        DelCol => {
-                            if ncols > 1 {
-                                for r in &mut table.rows {
-                                    if col < r.cells.len() {
-                                        r.cells.remove(col);
-                                    }
-                                }
-                                if col < table.grid.len() {
-                                    table.grid.remove(col);
-                                }
-                                ed.caret = Caret::at(vec![tb, row, col.min(ncols - 2), 0], 0);
-                            }
-                        }
-                        DelTable => {
-                            ed.doc.body.remove(tb);
-                            let at = tb.min(ed.doc.body.len().saturating_sub(1));
-                            ed.caret = Caret::at(vec![at], 0);
-                        }
-                        _ => {}
-                    }
-                    ed.clear_selection();
-                    ed.clamp();
+        match what {
+            TableClick::Cell(r, c) => {
+                ed.select_cell_content(table, r, c);
+            }
+            TableClick::Row(r) => {
+                if ed.select_cell_content(table, r, 0) {
+                    let _ = ed.select_row();
                 }
             }
-            t.dirty = true;
+            TableClick::Column(col) => {
+                let first = ed.table(table).and_then(|t| {
+                    let map = docxcore::table::GridMap::of(t);
+                    (0..t.rows.len()).find_map(|r| map.rows[r].cell_at(col).map(|c| (r, c)))
+                });
+                if let Some((r, c)) = first {
+                    if ed.select_cell_content(table, r, c) {
+                        let _ = ed.select_column();
+                    }
+                }
+            }
         }
         self.refocus(window, cx);
+        cx.notify();
     }
 
-    /// Insert an empty `rows`×`cols` bordered table after the caret's block, and
-    /// move the caret into its first cell.
+    /// Insert a `rows`×`cols` table at the caret of the edited story as one
+    /// undo step (docxcore's Insert Table), and move the caret into its first
+    /// cell.
     fn insert_table(
         &mut self,
         rows: usize,
         cols: usize,
+        fit: docxcore::table::AutoFit,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use docxcore::model::{Cell, Row, Table, VMerge};
         self.picker = None;
-        const TBLPR: &str = "<w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/><w:tblBorders>\
-<w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-<w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-<w:bottom w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-<w:right w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-<w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-<w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-</w:tblBorders></w:tblPr>";
-        let col_w = (9360 / cols.max(1)) as u32;
-        let mk_cell = || Cell {
-            grid_span: 1,
-            v_merge: VMerge::None,
-            blocks: vec![Block::Paragraph(Paragraph::default())],
-            raw_tcpr: None,
-            property_change: None,
-            unsupported_revisions: vec![],
-        };
-        let mk_row = || Row {
-            cells: (0..cols).map(|_| mk_cell()).collect(),
-            raw_props: vec![],
-            property_change: None,
-        };
-        let table = Table {
-            grid: vec![col_w; cols],
-            rows: (0..rows).map(|_| mk_row()).collect(),
-            namespace_declarations: vec![],
-            markup_compatibility_attributes: vec![],
-            row_boundaries: vec![],
-            raw_tblpr: Some(TBLPR.to_string()),
-            property_change: None,
-        };
-        let idx = self.active;
-        if let Some(t) = self.tabs.get_mut(idx) {
-            if let Surface::Doc(ed) = &mut t.surface {
-                let at = ed
-                    .caret
-                    .path
-                    .first()
-                    .copied()
-                    .unwrap_or(0)
-                    .min(ed.doc.body.len().saturating_sub(1));
-                let pos = (at + 1).min(ed.doc.body.len());
-                ed.doc.body.insert(pos, Block::Table(table));
-                ed.clear_selection();
-                ed.caret = Caret::at(vec![pos, 0, 0, 0], 0);
-                ed.clamp();
+        let result = self
+            .edit_target()
+            .map(|ed| ed.insert_table(rows, cols, fit));
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            match result {
+                Some(Ok(())) => t.dirty = true,
+                Some(Err(e)) => t.status = e.into(),
+                None => {}
             }
-            t.dirty = true;
         }
+        self.scroll_to_caret();
         self.refocus(window, cx);
     }
 
@@ -13197,7 +13103,6 @@ impl Docxy {
                     PickKind::FontName => "Font",
                     PickKind::FontSize => "Size",
                     PickKind::Field => "Field",
-                    PickKind::Table => "Table",
                     PickKind::Symbol => "Symbol",
                     PickKind::LineSpacing => "Line spacing",
                     PickKind::Equation => "Equation",
@@ -13299,13 +13204,6 @@ impl Docxy {
                     row = row.child(chip(i, label.into(), "fld").on_click(cx.listener(
                         move |this, _, window, cx| this.insert_field(instr, fallback, window, cx),
                     )));
-                }
-            }
-            PickKind::Table => {
-                for (i, &(label, r, c)) in TABLE_PRESETS.iter().enumerate() {
-                    row = row.child(chip(i, label.into(), "tbl").on_click(
-                        cx.listener(move |this, _, window, cx| this.insert_table(r, c, window, cx)),
-                    ));
                 }
             }
             PickKind::Symbol => {
@@ -14466,8 +14364,39 @@ impl Docxy {
             self.chart_hand_back(cx);
             return self.sheet_commit(0, 1, cx);
         }
+        if self.table_tab(false, window, cx) {
+            return;
+        }
         self.with_editor(window, cx, |e| e.insert_tab());
         self.scroll_to_caret();
+    }
+
+    /// Tab (`back`: Shift+Tab) with the caret in a table cell of the edited
+    /// story: select the next or previous cell's content, and in the last cell
+    /// add a row (Word). Moving is not an edit. `false` outside a table.
+    fn table_tab(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(ed) = self.edit_target() else {
+            return false;
+        };
+        if !ed.in_table() {
+            return false;
+        }
+        let edited = if back {
+            ed.table_prev_cell();
+            false
+        } else {
+            let adds = ed.table_tab_adds_row();
+            ed.table_next_cell();
+            adds
+        };
+        if edited {
+            if let Some(t) = self.tabs.get_mut(self.active) {
+                t.dirty = true;
+            }
+        }
+        self.scroll_to_caret();
+        self.refocus(window, cx);
+        true
     }
 
     /// Shift+Tab decreases the paragraph indent (Word's outdent).
@@ -14513,6 +14442,9 @@ impl Docxy {
             }
             self.chart_hand_back(cx);
             return self.sheet_commit(0, -1, cx);
+        }
+        if self.table_tab(true, window, cx) {
+            return;
         }
         self.with_editor(window, cx, |e| e.change_indent(-720));
     }
@@ -14667,6 +14599,10 @@ impl Docxy {
                     true
                 }
                 "a" => no(|| ed.select_all()),
+                // Ctrl+Tab types a tab inside a table cell, where Tab moves to
+                // the next cell (Word). gpui binds no action to it, so it
+                // arrives here.
+                "tab" if !shift && ed.in_table() => yes(|| ed.insert_tab()),
                 // Indent / outdent (Ctrl+M, Ctrl+Shift+M).
                 "m" if shift => yes(|| ed.change_indent(-720)),
                 "m" => yes(|| ed.change_indent(720)),
@@ -15539,71 +15475,6 @@ mod sheet_save_tests {
     }
 }
 
-#[cfg(test)]
-mod doc_table_row_tests {
-    use super::{Act, Block, Caret, Document, Docxy, Paragraph, Table};
-    use docxcore::load::{Relationships, parse_document_xml};
-    use docxcore::model::{Cell, Row, TableRowBoundary};
-    use docxcore::serialize::document_to_xml;
-
-    fn row() -> Row {
-        Row {
-            cells: vec![Cell {
-                blocks: vec![Block::Paragraph(Paragraph::default())],
-                ..Default::default()
-            }],
-            ..Default::default()
-        }
-    }
-
-    fn adjacent_table() -> Table {
-        Table {
-            rows: vec![row(), row()],
-            row_boundaries: vec![
-                TableRowBoundary::sdt_open(0, "<w:sdt><w:sdtContent>"),
-                TableRowBoundary::sdt_close(1, "</w:sdtContent></w:sdt>"),
-                TableRowBoundary::sdt_open(1, "<w:sdt><w:sdtContent>"),
-                TableRowBoundary::sdt_close(2, "</w:sdtContent></w:sdt>"),
-            ],
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn table_row_commands_preserve_control_ownership_and_caret() {
-        for act in [Act::RowAbove, Act::RowBelow] {
-            let mut table = adjacent_table();
-            let (row, expected_row) = if matches!(act, Act::RowAbove) {
-                (1, 1)
-            } else {
-                (0, 1)
-            };
-            let caret = Docxy::apply_table_row_op(&mut table, 3, row, 0, 1, act)
-                .expect("row insertion applies");
-            assert_eq!(caret, Caret::at(vec![3, expected_row, 0, 0], 0));
-            assert_eq!(
-                table.row_control_owners(),
-                Ok(vec![vec![0], vec![2], vec![2]])
-            );
-        }
-
-        let mut table = adjacent_table();
-        let caret = Docxy::apply_table_row_op(&mut table, 3, 0, 0, 1, Act::DelRow)
-            .expect("row deletion applies");
-        assert_eq!(caret, Caret::at(vec![3, 0, 0, 0], 0));
-        assert_eq!(table.row_control_owners(), Ok(vec![vec![2]]));
-
-        let xml = document_to_xml(&Document {
-            body: vec![Block::Table(table)],
-        });
-        let reparsed = parse_document_xml(&xml, &Relationships::default());
-        let Block::Table(table) = &reparsed.body[0] else {
-            panic!("expected table");
-        };
-        assert_eq!(table.row_control_owners(), Ok(vec![vec![2]]));
-    }
-}
-
 /// Parse a cell's edit buffer into a `Cell`, Excel-style: `=…` is a formula, a
 /// bare number is numeric, TRUE/FALSE is boolean, anything else is text. The
 /// existing style index is carried over so formatting survives the edit.
@@ -15702,13 +15573,9 @@ enum Act {
     /// A page Layout tab command (#649).
     Layout(layout_tab::LayoutAct),
     InsertEquation,
-    RowAbove,
-    RowBelow,
-    ColLeft,
-    ColRight,
-    DelRow,
-    DelCol,
-    DelTable,
+    /// A Table Design or table Layout command, or an Insert > Table item
+    /// (#646-#648).
+    Table(table_tab::TableAct),
     PrintLayout,
     ToggleRuler,
     // Dialog-box launchers (open advanced dialogs — placeholder until we have a
@@ -15973,9 +15840,10 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                 rs::group(
                     "Tables",
                     35,
-                    vec![Control::Large(
-                        cmdt("table", "table", "Table", InsertTable, "").key("T"),
-                    )],
+                    vec![Control::Dropdown {
+                        cmd: cmdt("table", "table", "Table", InsertTable, "").key("T"),
+                        items: Vec::new(),
+                    }],
                 ),
                 rs::group("Header & Footer", 34, hf_tab::hf_dropdowns()),
                 rs::group(
@@ -16146,7 +16014,9 @@ fn valid_ribbon_tab(
     in_hf: bool,
 ) -> RibbonTab {
     if ribbon_tab_set(kind).iter().any(|(t, _, _)| *t == Some(tab))
-        || (kind == Kind::Docx && tab == RibbonTab::Table && in_table)
+        || (kind == Kind::Docx
+            && matches!(tab, RibbonTab::TableDesign | RibbonTab::TableLayout)
+            && in_table)
         || (kind == Kind::Docx && tab == RibbonTab::HeaderFooter && in_hf)
         || (kind == Kind::Project && tab == RibbonTab::GanttFormat && in_gantt)
     {
@@ -16174,7 +16044,8 @@ fn ribbon_tab_name(tab: RibbonTab) -> &'static str {
         RibbonTab::Layout => "Layout",
         RibbonTab::Review => "Review",
         RibbonTab::View => "View",
-        RibbonTab::Table => "Table",
+        RibbonTab::TableDesign => table_tab::DESIGN_TAB,
+        RibbonTab::TableLayout => table_tab::LAYOUT_TAB,
         RibbonTab::HeaderFooter => "Header & Footer",
         RibbonTab::GanttFormat => "Gantt Chart Format",
         RibbonTab::Task => "Task",
@@ -16193,6 +16064,7 @@ fn ribbon_tab_name(tab: RibbonTab) -> &'static str {
 fn act_enabled(act: Act) -> bool {
     match act {
         Act::Layout(act) => layout_tab::layout_enabled(act),
+        Act::Table(act) => act != table_tab::TableAct::Unavailable,
         _ => true,
     }
 }
@@ -16313,74 +16185,6 @@ fn keytip_badge(text: &str) -> AnyElement {
                 .child(SharedString::from(text.to_string())),
         )
         .into_any_element()
-}
-
-/// The contextual Table Tools tab, shown only while the caret is in a table.
-fn table_tab() -> rs::Tab<Act> {
-    use Act::*;
-    rs::tab(
-        "Table",
-        "T",
-        vec![
-            rs::group(
-                "Rows & Columns",
-                40,
-                vec![rs::rows(vec![
-                    vec![
-                        rs::btn(cmdt(
-                            "rowabove",
-                            "table-insert-row",
-                            "Insert row above",
-                            RowAbove,
-                            "",
-                        )),
-                        rs::btn(cmdt(
-                            "colleft",
-                            "table-insert-column",
-                            "Insert column left",
-                            ColLeft,
-                            "",
-                        )),
-                        rs::btn(cmdt("delrow", "table-delete-row", "Delete row", DelRow, "")),
-                    ],
-                    vec![
-                        rs::btn(cmdt(
-                            "rowbelow",
-                            "table-insert-row",
-                            "Insert row below",
-                            RowBelow,
-                            "",
-                        )),
-                        rs::btn(cmdt(
-                            "colright",
-                            "table-insert-column",
-                            "Insert column right",
-                            ColRight,
-                            "",
-                        )),
-                        rs::btn(cmdt(
-                            "delcol",
-                            "table-delete-column",
-                            "Delete column",
-                            DelCol,
-                            "",
-                        )),
-                    ],
-                ])],
-            ),
-            rs::group(
-                "Table",
-                20,
-                vec![rs::column(vec![cmdt(
-                    "deltable",
-                    "table-dismiss",
-                    "Delete table",
-                    DelTable,
-                    "",
-                )])],
-            ),
-        ],
-    )
 }
 
 /// One icon button's share of a ribbon row, in px (see `group_est`).
@@ -17661,35 +17465,207 @@ fn paragraph_el(
         .into_any_element()
 }
 
+/// Where a click on a table's selection zones selects (#647).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TableClick {
+    /// A cell's left edge: that cell.
+    Cell(usize, usize),
+    /// Left of a row: the row.
+    Row(usize),
+    /// Above a column: the grid column.
+    Column(usize),
+}
+
+/// Draw a table: cells sized from the grid, spans and vertical merges laid
+/// out, fills, borders (per side and colour), diagonals and vertical
+/// alignment from `table_view::layout`, the selected cells highlighted, and
+/// dashed gridlines on borderless edges when View Gridlines is on. The left
+/// edge of a cell, the strip left of a row and the strip above the first row
+/// select a cell, row or column.
 fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
+    use docxcore::table_props::VAlign;
+    let style = docxcore::table::table_props(t)
+        .attr("w:tblStyle", "w:val")
+        .and_then(|id| ctx.tbl.style(&id));
+    let boxes = table_view::layout(t, style.as_ref());
+    let selected: Vec<(usize, usize)> = ctx
+        .cell_range
+        .filter(|r| r.table.as_slice() == path)
+        .map(|r| r.cells(&docxcore::table::GridMap::of(t)))
+        .unwrap_or_default();
+    let zoom = ctx.zoom;
+    let w = |tw: u32| px(tw_px(tw as i32, zoom));
+    let fg = ctx.pal.fg;
+    let grid_color = hsla_u(0x9fb8e0);
+    let click = |what: TableClick| {
+        let ent = ctx.ent.clone();
+        let path = path.to_vec();
+        move |_: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+            cx.stop_propagation();
+            ent.update(cx, |this, cx| this.table_click(&path, what, window, cx));
+        }
+    };
     let mut rows = Vec::new();
-    for (ri, row) in t.rows.iter().enumerate() {
-        let mut cells = Vec::new();
-        for (ci, cell) in row.cells.iter().enumerate() {
-            let inner: Vec<AnyElement> = cell
-                .blocks
-                .iter()
-                .enumerate()
-                .map(|(k, b)| {
-                    let mut cp = path.to_vec();
-                    cp.extend_from_slice(&[ri, ci, k]);
-                    block_el(b, cp, None, ctx)
+    for (ri, rb) in boxes.iter().enumerate() {
+        let row = &t.rows[ri];
+        let mut cells: Vec<AnyElement> = Vec::new();
+        if rb.before > 0 {
+            cells.push(div().flex_none().w(w(rb.before)).into_any_element());
+        }
+        for cb in &rb.cells {
+            let cell = &row.cells[cb.cell];
+            let inner: Vec<AnyElement> = if cb.continues {
+                Vec::new()
+            } else {
+                cell.blocks
+                    .iter()
+                    .enumerate()
+                    .map(|(k, b)| {
+                        let mut cp = path.to_vec();
+                        cp.extend_from_slice(&[ri, cb.cell, k]);
+                        block_el(b, cp, None, ctx)
+                    })
+                    .collect()
+            };
+            // One absolutely placed line per side, so each side keeps its own
+            // colour and thickness.
+            let side = |which: u8, l: Option<table_view::Line>| -> Option<AnyElement> {
+                let placed = |d: Div, thick: Pixels| match which {
+                    0 => d.top_0().left_0().right_0().h(thick),
+                    1 => d.bottom_0().left_0().right_0().h(thick),
+                    2 => d.top_0().bottom_0().left_0().w(thick),
+                    _ => d.top_0().bottom_0().right_0().w(thick),
+                };
+                match l {
+                    Some(l) => Some(
+                        placed(div().absolute(), px((l.width * zoom).max(1.0)))
+                            .bg(l.color.map_or(fg, hsla_u))
+                            .into_any_element(),
+                    ),
+                    None if ctx.tbl.gridlines => {
+                        let d = placed(div().absolute(), px(0.))
+                            .border_dashed()
+                            .border_color(grid_color);
+                        let d = match which {
+                            0 => d.border_t_1(),
+                            1 => d.border_b_1(),
+                            2 => d.border_l_1(),
+                            _ => d.border_r_1(),
+                        };
+                        Some(d.into_any_element())
+                    }
+                    None => None,
+                }
+            };
+            let edges: Vec<AnyElement> = [
+                side(0, cb.top),
+                side(1, cb.bottom),
+                side(2, cb.left),
+                side(3, cb.right),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let diagonals = (cb.diag_down.is_some() || cb.diag_up.is_some()).then(|| {
+                let (down, up) = (cb.diag_down, cb.diag_up);
+                canvas(
+                    |_, _, _| {},
+                    move |b, _, window, _| {
+                        let o = b.origin;
+                        let (x1, y1) = (o.x + b.size.width, o.y + b.size.height);
+                        for (l, from, to) in [
+                            (down, o, point(x1, y1)),
+                            (up, point(x1, o.y), point(o.x, y1)),
+                        ] {
+                            let Some(l) = l else { continue };
+                            let mut pb = PathBuilder::stroke(px((l.width * zoom).max(1.0)));
+                            pb.move_to(from);
+                            pb.line_to(to);
+                            if let Ok(path) = pb.build() {
+                                window.paint_path(path, l.color.map_or(fg, hsla_u));
+                            }
+                        }
+                    },
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .into_any_element()
+            });
+            let is_selected = selected.contains(&(ri, cb.cell));
+            let sel_bg = Hsla {
+                a: 0.25,
+                ..ctx.pal.sel
+            };
+            let mut el = v_flex()
+                .relative()
+                .flex_none()
+                .w(w(cb.width))
+                .px(px(7.2 * zoom))
+                .py_0p5()
+                .when_some(cb.fill, |d, f| d.bg(hsla_u(f)))
+                .map(|d| match cb.valign {
+                    VAlign::Top => d.justify_start(),
+                    VAlign::Center => d.justify_center(),
+                    VAlign::Bottom => d.justify_end(),
                 })
-                .collect();
-            cells.push(
-                v_flex()
-                    .flex_1()
-                    .px_2()
-                    .py_1()
-                    .border_1()
-                    .border_color(ctx.pal.border)
-                    .children(inner)
-                    .into_any_element(),
+                .children(inner)
+                .children(edges)
+                .children(diagonals)
+                .when(is_selected, |d| {
+                    d.child(div().absolute().size_full().top_0().left_0().bg(sel_bg))
+                });
+            if ctx.active {
+                // The cell's left edge selects the cell.
+                el = el.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left_0()
+                        .w(px(4.))
+                        .cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, click(TableClick::Cell(ri, cb.cell))),
+                );
+                // The strip above the first row selects the column.
+                if ri == 0 {
+                    el = el.child(
+                        div()
+                            .absolute()
+                            .top(px(-6.))
+                            .left_0()
+                            .right_0()
+                            .h(px(6.))
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, click(TableClick::Column(cb.start))),
+                    );
+                }
+            }
+            cells.push(el.into_any_element());
+        }
+        let mut row_el = div()
+            .relative()
+            .flex()
+            .flex_row()
+            .items_stretch()
+            .children(cells);
+        if ctx.active {
+            // The selection bar left of the row selects the row.
+            row_el = row_el.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(-12.))
+                    .w(px(12.))
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, click(TableClick::Row(ri))),
             );
         }
-        rows.push(h_flex().w_full().children(cells).into_any_element());
+        rows.push(row_el.into_any_element());
     }
-    v_flex().w_full().my_2().children(rows).into_any_element()
+    v_flex().my_2().children(rows).into_any_element()
 }
 
 /// Render one block at absolute `path`, wiring caret/selection/click from `ctx`.
@@ -17817,31 +17793,37 @@ impl Docxy {
                     })),
             );
         }
-        // Contextual Table Tools tab — only while the caret is in a table. It reads
-        // with a coloured accent (Word shows contextual tabs tinted).
-        if self.caret_table().is_some() {
-            let active = !self.backstage && self.ribbon_tab == RibbonTab::Table;
+        // Word's two contextual table tabs — only while the caret is in a
+        // table. They read with a coloured accent (Word tints contextual tabs);
+        // the table Layout tab is labelled plain "Layout", as in Word.
+        if self.caret_in_table() {
             let accent = hsla_u(0xC0_5B_2E); // a warm contextual accent
-            strip = strip.child(
-                div()
-                    .id(("rtab", 99usize))
-                    .px_3()
-                    .py_1()
-                    .cursor_pointer()
-                    .rounded_t_sm()
-                    .text_size(px(12.))
-                    .text_color(accent)
-                    .hover(|d| d.bg(Hsla { a: 0.10, ..accent }))
-                    .when(active, |d| {
-                        d.border_b_2()
-                            .border_color(accent)
-                            .font_weight(FontWeight::BOLD)
-                    })
-                    .child("Table")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.select_ribbon_tab(RibbonTab::Table, window, cx);
-                    })),
-            );
+            for (k, tab, label) in [
+                (99usize, RibbonTab::TableDesign, "Table Design"),
+                (97usize, RibbonTab::TableLayout, "Layout"),
+            ] {
+                let active = !self.backstage && self.ribbon_tab == tab;
+                strip = strip.child(
+                    div()
+                        .id(("rtab", k))
+                        .px_3()
+                        .py_1()
+                        .cursor_pointer()
+                        .rounded_t_sm()
+                        .text_size(px(12.))
+                        .text_color(accent)
+                        .hover(|d| d.bg(Hsla { a: 0.10, ..accent }))
+                        .when(active, |d| {
+                            d.border_b_2()
+                                .border_color(accent)
+                                .font_weight(FontWeight::BOLD)
+                        })
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.select_ribbon_tab(tab, window, cx);
+                        })),
+                );
+            }
         }
         // Contextual Gantt Chart Format tab — while a Project's Gantt pane shows.
         if self.project_gantt_showing() {
@@ -17930,6 +17912,8 @@ impl Docxy {
     /// (another tab, the backstage, a command run, a pointer verb) closes it,
     /// so an item is never clicked against a state it was not built for.
     pub(crate) fn close_menu(&mut self) -> bool {
+        // The Insert > Table grid forgets the pointer with its menu.
+        self.table_grid_hover = None;
         self.menu.take().is_some()
     }
 
@@ -18016,20 +18000,31 @@ impl Docxy {
                         group: group.title.into(),
                         label: primary.label.into(),
                     },
-                    menu::split_menu(menu, act_enabled, |a| self.act_active(a)),
+                    menu::split_menu(menu, |a| self.act_enabled_now(a), |a| self.act_active(a)),
                 )),
-                Control::Dropdown { cmd, .. } if cmd.id == primary_id => Some((
+                Control::Dropdown { cmd, items } if cmd.id == primary_id => Some((
                     menu::MenuTarget::Ribbon {
                         id: cmd.id.into(),
                         tab: tab.name.into(),
                         group: group.title.into(),
                         label: cmd.label.into(),
                     },
-                    match layout_tab::menu_of(cmd.id) {
-                        Some(m) => layout_tab::menu_items(m, |a| self.act_active(a)),
-                        None => {
+                    match (layout_tab::menu_of(cmd.id), cmd.act) {
+                        (_, Act::InsertTable) => table_tab::insert_table_menu(
+                            self.edit_target_ref()
+                                .is_some_and(|e| e.has_selection() && e.cell_range().is_none()),
+                        ),
+                        (Some(m), Act::Layout(_)) => {
+                            layout_tab::menu_items(m, |a| self.act_active(a))
+                        }
+                        (None, _) if hf_tab::menu_of(cmd.id).is_some() => {
                             hf_tab::menu_items(self.tabs.get(self.active), hf_tab::menu_of(cmd.id)?)
                         }
+                        _ => menu::split_menu(
+                            items,
+                            |a| self.act_enabled_now(a),
+                            |a| self.act_active(a),
+                        ),
                     },
                 )),
                 // The Header from Top / Footer from Bottom boxes open a menu.
@@ -18122,6 +18117,7 @@ impl Docxy {
                     .text_color(pal.dim)
                     .child(SharedString::from(label.clone()))
                     .into_any_element(),
+                MenuItem::TableGrid { cols, rows } => self.table_grid_el(*cols, *rows, pal, cx),
                 MenuItem::Item(e) => {
                     let color = if e.enabled { pal.fg } else { pal.dim };
                     let lead = if e.checked {
@@ -18268,8 +18264,11 @@ impl Docxy {
                         cx,
                     );
                     self.keytips = KeyTip::Commands;
-                } else if c.eq_ignore_ascii_case("T") && self.caret_table().is_some() {
-                    self.select_ribbon_tab(RibbonTab::Table, window, cx);
+                } else if c.eq_ignore_ascii_case("T") && self.caret_in_table() {
+                    self.select_ribbon_tab(RibbonTab::TableDesign, window, cx);
+                    self.keytips = KeyTip::Commands;
+                } else if c.eq_ignore_ascii_case("J") && self.caret_in_table() {
+                    self.select_ribbon_tab(RibbonTab::TableLayout, window, cx);
                     self.keytips = KeyTip::Commands;
                 } else if c.eq_ignore_ascii_case("J") && self.hf_active() {
                     self.select_ribbon_tab(RibbonTab::HeaderFooter, window, cx);
@@ -18341,15 +18340,22 @@ impl Docxy {
                 self.refocus(window, cx);
             }
             InsertField => self.toggle_picker(PickKind::Field, window, cx),
-            InsertTable => self.toggle_picker(PickKind::Table, window, cx),
+            InsertTable => {
+                let at = split_menu_anchor(&self.probes.borrow(), "table")
+                    .unwrap_or_else(|| point(px(120.), px(140.)));
+                if let Err(e) = self.open_split_menu("table", at, cx) {
+                    self.set_status(e);
+                }
+            }
             InsertSymbol => self.toggle_picker(PickKind::Symbol, window, cx),
             InsertEquation => self.toggle_picker(PickKind::Equation, window, cx),
             LineSpacing => self.toggle_picker(PickKind::LineSpacing, window, cx),
             Hf(act) => self.hf_act(act, window, cx),
             Layout(act) => self.layout_act(act, window, cx),
-            RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable => {
-                self.table_op(act, window, cx)
-            }
+            Table(act) => self.table_act(act, window, cx),
+            // Home > Sort with the caret in a table opens the table's Sort
+            // dialog (#647); elsewhere it sorts the selected paragraphs.
+            Sort if self.caret_in_table() => self.table_act(table_tab::TableAct::Sort, window, cx),
             PrintLayout => {
                 self.page_view = !self.page_view;
                 self.refocus(window, cx);
@@ -18417,8 +18423,7 @@ impl Docxy {
                 | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide
                 | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField
                 | PageBreak | ToggleNotes | InsertTable | InsertSymbol | InsertEquation
-                | LineSpacing | Hf(_) | Layout(_) | RowAbove | RowBelow | ColLeft | ColRight
-                | DelRow | DelCol | DelTable | PrintLayout | ToggleRuler => {}
+                | LineSpacing | Hf(_) | Layout(_) | Table(_) | PrintLayout | ToggleRuler => {}
             }),
         }
     }
@@ -19903,6 +19908,9 @@ impl Docxy {
                     .children(rendered)
                     .into_any_element()
             }
+            Control::Gallery(gal) if gal.id == "tablestyles" => {
+                self.table_style_gallery(gal, pal, cx)
+            }
             Control::Gallery(gal) => self.style_gallery(gal, pal, cx),
             Control::Separator => div()
                 .w(px(1.))
@@ -20105,7 +20113,7 @@ impl Docxy {
     fn large_btn(&self, cmd: &rs::Cmd<Act>, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let act = cmd.act;
         let on = self.act_active(act);
-        let enabled = act_enabled(act);
+        let enabled = self.act_enabled_now(act);
         let pal = Pal {
             fg: if enabled { pal.fg } else { pal.dim },
             ..pal
@@ -20157,7 +20165,7 @@ impl Docxy {
     /// the lower half (label and ▾) opens its menu, as in Office.
     fn split_btn(&self, cmd: &rs::Cmd<Act>, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let act = cmd.act;
-        let enabled = act_enabled(act);
+        let enabled = self.act_enabled_now(act);
         let fg = if enabled { pal.fg } else { pal.dim };
         let tip = cmd_tip_text(cmd);
         let keytip =
@@ -20206,7 +20214,7 @@ impl Docxy {
     /// and a drop-down mark; a press anywhere on it opens its menu, or shuts
     /// it when it is the one open.
     fn dropdown_btn(&self, cmd: &rs::Cmd<Act>, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let enabled = act_enabled(cmd.act);
+        let enabled = self.act_enabled_now(cmd.act);
         let fg = if enabled { pal.fg } else { pal.dim };
         let tip = cmd_tip_text(cmd);
         let keytip =
@@ -20234,6 +20242,17 @@ impl Docxy {
             .when_some(keytip, |d, k| d.child(keytip_badge(k)))
             .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
             .into_any_element()
+    }
+
+    /// Whether a ribbon command can run now: [`act_enabled`], and for a
+    /// table command, the edited story's state (Merge Cells needs a cell
+    /// range, Convert Text to Table a selection outside a table).
+    pub(crate) fn act_enabled_now(&self, act: Act) -> bool {
+        act_enabled(act)
+            && match act {
+                Act::Table(a) => table_tab::table_enabled(self.edit_target_ref(), a),
+                _ => true,
+            }
     }
 
     /// Whether a toggle command is currently "on" for the caret's formatting, so
@@ -20278,6 +20297,9 @@ impl Docxy {
                 .tabs
                 .get(self.active)
                 .is_some_and(|t| hf_tab::hf_checked(t, act)),
+            Table(act) => {
+                table_tab::table_checked(self.edit_target_ref(), self.view_gridlines, act)
+            }
             _ => false,
         }
     }
@@ -20291,7 +20313,7 @@ impl Docxy {
     ) -> AnyElement {
         let act = cmd.act;
         let on = self.act_active(act);
-        let enabled = act_enabled(act);
+        let enabled = self.act_enabled_now(act);
         let pal = Pal {
             fg: if enabled { pal.fg } else { pal.dim },
             ..pal
@@ -21099,7 +21121,7 @@ impl Render for Docxy {
         self.ribbon_tab = valid_ribbon_tab(
             self.ribbon_kind(),
             self.ribbon_tab,
-            self.caret_table().is_some(),
+            self.caret_in_table(),
             self.project_gantt_showing(),
             self.hf_active(),
         );
@@ -21186,6 +21208,8 @@ impl Render for Docxy {
                     // While a header/footer is being edited the body is inactive
                     // (no caret, clicks inert) so it visually recedes.
                     let hf = tab.hf_edit.as_ref();
+                    let tbl = TableCtx::new(tab.pkg.as_ref(), self.view_gridlines);
+                    let body_range = editor.cell_range();
                     let ctx = RenderCtx {
                         caret_path: &editor.caret.path,
                         caret_off: editor.caret.offset,
@@ -21197,6 +21221,8 @@ impl Render for Docxy {
                         active: hf.is_none(),
                         meas: &measurer,
                         hf_width: None,
+                        tbl: &tbl,
+                        cell_range: body_range.as_ref(),
                     };
                     let body = &editor.doc.body;
                     if self.page_view {
@@ -21268,6 +21294,7 @@ impl Render for Docxy {
                         // Header/footer text-area width, for the implicit centre/right tab stops.
                         let hf_w = self.zoom * (geom.w - geom.ml - geom.mr).max(0) as f32 / 15.0;
                         let hf_spans = hf.map(|h| h.editor.selection_spans()).unwrap_or_default();
+                        let hf_range = hf.and_then(|h| h.editor.cell_range());
                         let hf_ctx = hf.map(|h| RenderCtx {
                             caret_path: &h.editor.caret.path,
                             caret_off: h.editor.caret.offset,
@@ -21279,6 +21306,8 @@ impl Render for Docxy {
                             active: true,
                             meas: &measurer,
                             hf_width: Some(hf_w),
+                            tbl: &tbl,
+                            cell_range: hf_range.as_ref(),
                         });
                         // The first page showing the edited section and variant is the
                         // editable page (see `hf::edit_page`).
