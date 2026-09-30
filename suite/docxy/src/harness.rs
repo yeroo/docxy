@@ -396,6 +396,9 @@ fn format_extension(format: &str) -> Option<&'static str> {
         "md" => ".md",
         "html" => ".docx.html",
         "xlsx" => ".xlsx",
+        "xlsm" => ".xlsm",
+        "xltx" => ".xltx",
+        "xltm" => ".xltm",
         "yppx" => ".yppx",
         "xml" => ".xml",
         _ => return None,
@@ -461,7 +464,7 @@ fn save_as_target(
     };
     let kind_formats: &[&str] = match kind {
         Kind::Docx => &["docx", "md", "html"],
-        Kind::Xlsx => &["xlsx"],
+        Kind::Xlsx => &crate::SHEET_EXTENSIONS,
         Kind::Project => &["yppx", "xml"],
         Kind::Look => return Err("this tab cannot be saved as a file".into()),
     };
@@ -485,7 +488,13 @@ fn save_as_target(
         path.set_file_name(name);
     }
     let (path, written) = match kind {
-        Kind::Xlsx => (crate::sheet_save_target(&path)?, "xlsx"),
+        Kind::Xlsx => {
+            let path = crate::sheet_save_target(&path)?;
+            // The target keeps a workbook extension: its kind is the format.
+            let written =
+                gridcore::xlsx::SpreadsheetKind::from_path(&path).map_or("xlsx", |k| k.extension());
+            (path, written)
+        }
         Kind::Project => {
             let path = projcore::yppx::save_target(&path)?;
             let yppx = path
@@ -4644,13 +4653,26 @@ mod tests {
             Ok((at("book.xlsx"), "xlsx"))
         );
         assert_eq!(ok(Kind::Xlsx, "book", None), Ok((at("book.xlsx"), "xlsx")));
+        // #727: every workbook type, by extension or by format.
+        assert_eq!(
+            ok(Kind::Xlsx, "book.XLSM", None),
+            Ok((at("book.XLSM"), "xlsm"))
+        );
+        assert_eq!(
+            ok(Kind::Xlsx, "book", Some("xltx")),
+            Ok((at("book.xltx"), "xltx"))
+        );
+        assert_eq!(
+            ok(Kind::Xlsx, "book.xltm", Some("xlsx")),
+            Err("'format' xlsx does not match book.xltm, which saves as xltm".into())
+        );
         assert_eq!(
             ok(Kind::Xlsx, "book.csv", None),
-            Err("Workbooks can only be saved as .xlsx".into())
+            Err(crate::SHEET_SAVE_FORMATS.into())
         );
         assert_eq!(
             ok(Kind::Xlsx, "book", Some("docx")),
-            Err("Workbooks can only be saved as .xlsx".into())
+            Err(crate::SHEET_SAVE_FORMATS.into())
         );
         // A format is named in any case; an empty one is refused, not taken
         // as a document format on a workbook.

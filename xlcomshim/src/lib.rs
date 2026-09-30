@@ -2481,6 +2481,35 @@ mod win {
             assert!(!ct.contains("macroEnabled"), "{ct}");
         }
 
+        /// #727: `SaveAs "x.xlsx", 51` writes no Excel 4.0 macro sheet, but
+        /// the open workbook keeps it, so `Worksheets(i)` handles a client
+        /// already holds still address the same sheets.
+        #[test]
+        fn save_as_xlsx_writes_no_macro_sheet_and_keeps_the_live_ones() {
+            let mut pkg = new_xlsx();
+            pkg.add_sheet("Macro1");
+            let rels = String::from_utf8_lossy(pkg.part("xl/_rels/workbook.xml.rels").unwrap())
+                .replace(
+                    r#"Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml""#,
+                    r#"Type="http://schemas.microsoft.com/office/2006/relationships/xlMacrosheet" Target="worksheets/sheet2.xml""#,
+                );
+            pkg.set_part("xl/_rels/workbook.xml.rels", rels.into_bytes());
+            let mut book = Book::new();
+            book.pkg = load_xlsx(&save_xlsx_as(&pkg, SpreadsheetKind::MacroWorkbook)).unwrap();
+            assert!(book.pkg.has_macro_sheets());
+            let path =
+                std::env::temp_dir().join(format!("xlcomshim-727-{}.xlsx", std::process::id()));
+            let path = path.to_str().unwrap();
+            book.save_as(path, kind_for(Some(51), path)).unwrap();
+            let saved = load_xlsx(&std::fs::read(path).unwrap()).unwrap();
+            std::fs::remove_file(path).unwrap();
+            assert!(!saved.has_macro_sheets());
+            assert_eq!(saved.workbook.sheets.len(), 1);
+            assert!(book.pkg.has_macro_sheets());
+            assert_eq!(book.pkg.workbook.sheets.len(), 2, "the live sheet count");
+            assert_eq!(book.sheet_name(1), "Macro1");
+        }
+
         /// Save keeps the type the last SaveAs chose: `SaveAs "out", 51` then
         /// `Save` stays a macro-free workbook, and `SaveAs "x.xlsx", 52` then
         /// `Save` stays macro-enabled.

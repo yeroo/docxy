@@ -450,6 +450,14 @@ function registerMcpProvider(context: vscode.ExtensionContext): vscode.Disposabl
   });
 }
 
+/** gridwasm's `grid_save_as` code for the spreadsheet type of `target`'s
+ *  extension: 1 = .xlsx, 2 = .xlsm, 3 = .xltx, 4 = .xltm; 0 (keep the loaded
+ *  type) for anything else or no target. */
+function sheetKindCode(target?: vscode.Uri): number {
+  const ext = target?.path.split('.').pop()?.toLowerCase();
+  return ext ? ['xlsx', 'xlsm', 'xltx', 'xltm'].indexOf(ext) + 1 : 0;
+}
+
 /** A live binary document (`.docx`, and eventually other formats). The
  *  authoritative content lives in the webview's wasm session; this object
  *  just holds identity plus the on-disk bytes needed to (re)open, and
@@ -486,8 +494,10 @@ class BinaryDocument implements vscode.CustomDocument {
   }
 
   /** Ask the webview to serialize the current document and resolve with the
-   *  resulting bytes. */
-  requestBytes(): Promise<Uint8Array> {
+   *  resulting bytes. `target` is the file being written: a spreadsheet
+   *  webview writes that file's type (a template saved as `.xlsx` becomes a
+   *  workbook). Without one (a backup) the loaded type is kept. */
+  requestBytes(target?: vscode.Uri): Promise<Uint8Array> {
     const panel = this.panel;
     if (!panel) {
       // No live webview (e.g. hidden without retained context): fall back to the
@@ -497,7 +507,7 @@ class BinaryDocument implements vscode.CustomDocument {
     const requestId = ++this.reqSeq;
     return new Promise<Uint8Array>((resolve) => {
       this.pending.set(requestId, resolve);
-      panel.webview.postMessage({ type: 'getBytes', requestId });
+      panel.webview.postMessage({ type: 'getBytes', requestId, kind: sheetKindCode(target) });
     });
   }
 
@@ -1132,7 +1142,7 @@ class OffxyEditorProvider implements vscode.CustomEditorProvider<BinaryDocument>
   }
 
   private async saveAs(document: BinaryDocument, target: vscode.Uri): Promise<void> {
-    const bytes = await document.requestBytes();
+    const bytes = await document.requestBytes(target);
     await vscode.workspace.fs.writeFile(target, await this.toDisk(bytes));
   }
 

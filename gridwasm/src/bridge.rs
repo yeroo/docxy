@@ -10,7 +10,7 @@ use gridcore::sheet::{
     Align, Cell, CellValue, DefinedName, DrawingKind, MAX_COLS, MAX_ROWS, Sheet, Styles, cell_name,
     fmt_general, format_with, parse_cell_name, parse_col, parse_range_name, sheet_to_csv,
 };
-use gridcore::xlsx::{SheetPackage, load_xlsx, save_xlsx};
+use gridcore::xlsx::{SheetPackage, SpreadsheetKind, load_xlsx, save_xlsx, save_xlsx_as};
 
 use crate::json;
 
@@ -557,7 +557,18 @@ impl Session {
     /// Serialize the current workbook. Lossless: only modeled cell data is
     /// regenerated; every other part is preserved byte-for-byte.
     pub fn save(&mut self) -> Vec<u8> {
-        let out = save_xlsx(&self.pkg);
+        self.save_as(None)
+    }
+
+    /// [`Self::save`] as a file of `kind`: the workbook part's content type
+    /// follows it, and a macro-free kind leaves the VBA project and Excel 4.0
+    /// macro sheets out of the bytes (the open workbook keeps them). `None`
+    /// keeps the loaded type.
+    pub fn save_as(&mut self, kind: Option<SpreadsheetKind>) -> Vec<u8> {
+        let out = match kind {
+            Some(kind) => save_xlsx_as(&self.pkg, kind),
+            None => save_xlsx(&self.pkg),
+        };
         self.dirty = false;
         out
     }
