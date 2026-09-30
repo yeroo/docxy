@@ -173,6 +173,10 @@ fn path_info(app: &App) -> Json {
         ("sheets", Json::Num(wb.sheets.len() as f64)),
         ("active", Json::Num(app.sheet as f64)),
         ("active_name", Json::Str(wb.sheets[app.sheet].name.clone())),
+        (
+            "circular",
+            Json::Arr(app.circular_refs().into_iter().map(Json::Str).collect()),
+        ),
     ])
 }
 
@@ -1273,6 +1277,37 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("formula error"));
         assert!(!a.modified);
+    }
+
+    #[test]
+    fn wb_path_lists_circular_references() {
+        // #660: the circle's cells, active sheet first; none once broken.
+        let mut a = app();
+        let circular = |a: &mut App| {
+            let r = dispatch(a, "wb.path", &Json::Null).unwrap();
+            match r.get("circular") {
+                Some(Json::Arr(v)) => v
+                    .iter()
+                    .map(|j| j.as_str().unwrap_or_default().to_string())
+                    .collect::<Vec<_>>(),
+                other => panic!("circular: {other:?}"),
+            }
+        };
+        assert!(circular(&mut a).is_empty());
+        set(&mut a, "E1", "=E1+1");
+        set(&mut a, "F1", "=G1+1");
+        set(&mut a, "G1", "=F1*2");
+        assert_eq!(circular(&mut a), vec!["E1", "F1", "G1"]);
+        let e1 = dispatch(
+            &mut a,
+            "cell.get",
+            &Json::obj(vec![("ref", Json::Str("F1".into()))]),
+        )
+        .unwrap();
+        assert_eq!(e1.get("text").and_then(|t| t.as_str()), Some("0"));
+        set(&mut a, "E1", "1");
+        set(&mut a, "G1", "2");
+        assert!(circular(&mut a).is_empty());
     }
 
     #[test]

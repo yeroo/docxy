@@ -35,9 +35,6 @@ pub enum ExcelError {
     /// `#GETTING_DATA`: a value still being fetched (Excel's asynchronous
     /// functions, cube and data-type lookups).
     GettingData,
-    /// Not a real Excel error: our marker for circular references (Excel
-    /// shows a dialog and writes 0; we are honest instead).
-    Cycle,
 }
 
 impl ExcelError {
@@ -53,7 +50,6 @@ impl ExcelError {
             ExcelError::Spill => "#SPILL!",
             ExcelError::Calc => "#CALC!",
             ExcelError::GettingData => "#GETTING_DATA",
-            ExcelError::Cycle => "#CYCLE!",
         }
     }
 
@@ -69,7 +65,6 @@ impl ExcelError {
             "#SPILL!" => ExcelError::Spill,
             "#CALC!" => ExcelError::Calc,
             "#GETTING_DATA" => ExcelError::GettingData,
-            "#CYCLE!" => ExcelError::Cycle,
             _ => return None,
         })
     }
@@ -8784,7 +8779,6 @@ impl<'a> Eval<'a> {
                         ExcelError::Spill => 9.0,
                         ExcelError::GettingData => 8.0,
                         ExcelError::Calc => 14.0,
-                        ExcelError::Cycle => 5.0,
                     }),
                     _ => Value::Err(ExcelError::NA),
                 }

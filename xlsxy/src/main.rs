@@ -798,6 +798,9 @@ struct FormatDialog {
     sel: usize,
 }
 
+/// Excel's warning when an edit creates a circular reference.
+const CIRCULAR_WARNING: &str = "There are one or more circular references where a formula refers to its own cell either directly or indirectly. This might cause them to calculate incorrectly.";
+
 /// The Format Cells section tabs.
 const FMT_SECTIONS: &[&str] = &["Number", "Font", "Fill", "Align", "Border"];
 
@@ -1184,6 +1187,7 @@ impl App {
         if changes.is_empty() {
             return;
         }
+        let circles_before = self.engine.circular_refs();
         self.engine.clock = now_serial();
         let mut group = UndoGroup {
             sheet: sheet_idx,
@@ -1199,6 +1203,42 @@ impl App {
         self.undo.push(UndoAction::Cells(group));
         self.redo.clear();
         self.modified = true;
+        self.warn_new_circles(&circles_before);
+    }
+
+    /// Excel's circular-reference warning, once, when an edit made a circle
+    /// that was not there before.
+    fn warn_new_circles(&mut self, before: &[(usize, u32, u32)]) {
+        let now = self.engine.circular_refs();
+        if now.iter().any(|k| !before.contains(k)) {
+            self.status = Some(CIRCULAR_WARNING.into());
+        }
+    }
+
+    /// The cells on circular references as A1 refs: bare on the active
+    /// sheet, `Sheet!A1` elsewhere. Active-sheet cells come first.
+    pub(crate) fn circular_refs(&self) -> Vec<String> {
+        let refs = self.engine.circular_refs();
+        let name = |&(s, r, c): &(usize, u32, u32)| {
+            if s == self.sheet {
+                cell_name(r, c)
+            } else {
+                let sheet = self
+                    .pkg
+                    .workbook
+                    .sheets
+                    .get(s)
+                    .map(|sh| sh.name.as_str())
+                    .unwrap_or_default();
+                format!(
+                    "{}!{}",
+                    gridcore::sheet::quote_sheet_name(sheet),
+                    cell_name(r, c)
+                )
+            }
+        };
+        let (here, elsewhere): (Vec<_>, Vec<_>) = refs.iter().partition(|k| k.0 == self.sheet);
+        here.iter().chain(elsewhere.iter()).map(name).collect()
     }
 
     /// Snapshot-run-snapshot for structural edits (row/col ops, renames):
@@ -1208,8 +1248,10 @@ impl App {
             sheets: self.pkg.workbook.sheets.clone(),
             names: self.pkg.workbook.defined_names.clone(),
         };
+        let circles_before = self.engine.circular_refs();
         op(&mut self.pkg.workbook);
         self.rebuild_engine();
+        self.warn_new_circles(&circles_before);
         let after = WbSnapshot {
             sheets: self.pkg.workbook.sheets.clone(),
             names: self.pkg.workbook.defined_names.clone(),
@@ -4947,6 +4989,13 @@ fn draw(app: &mut App, f: &mut Frame) {
         tab_spans_ui.push(RSpan::raw(" "));
         x += w + 1;
     }
+    // Excel's persistent status-bar note while any circle exists.
+    if let Some(first) = app.circular_refs().first() {
+        tab_spans_ui.push(RSpan::styled(
+            format!(" Circular References: {first} "),
+            Style::new().fg(Color::Black).bg(Color::Yellow),
+        ));
+    }
     let mut tabs_line_ui = RLine::from(tab_spans_ui);
     if let Some(stats) = app.selection_stats() {
         let pad = (tabs_line.width as usize)
@@ -7367,6 +7416,56 @@ mod tests {
         app.anchor = None;
         app.merge_toggle();
         assert!(app.pkg.workbook.sheets[0].merges.is_empty());
+    }
+
+    #[test]
+    fn circular_reference_warns_once_and_shows_in_the_footer() {
+        // #660: a new circle warns once (Excel's message); while any circle
+        // exists the footer names one, on the active sheet first.
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.apply_on(0, vec![(0, 4, parse_input("=E1+1"))]);
+        assert_eq!(app.status.as_deref(), Some(CIRCULAR_WARNING));
+        assert_eq!(
+            app.sheet().cell(0, 4).unwrap().value,
+            CellValue::Number(0.0)
+        );
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        let text = format!("{:?}", term.backend().buffer());
+        assert!(text.contains("Circular References: E1"), "{text}");
+
+        // An edit that makes no new circle does not warn again.
+        app.status = None;
+        app.apply_on(0, vec![(3, 0, parse_input("7"))]);
+        app.apply_on(0, vec![(0, 7, parse_input("=E1+5"))]);
+        assert_eq!(app.status, None);
+        assert_eq!(app.circular_refs(), vec!["E1".to_string()]);
+
+        // A circle on another sheet is named with its sheet, after the
+        // active sheet's.
+        app.pkg.workbook.sheets.push(Sheet {
+            name: "My Data".into(),
+            ..Sheet::default()
+        });
+        app.rebuild_engine();
+        app.apply_on(1, vec![(0, 0, parse_input("=A1*2"))]);
+        assert_eq!(app.status.as_deref(), Some(CIRCULAR_WARNING));
+        assert_eq!(
+            app.circular_refs(),
+            vec!["E1".to_string(), "'My Data'!A1".to_string()]
+        );
+        // Breaking E1's circle leaves the other sheet's in the footer.
+        app.apply_on(0, vec![(0, 4, parse_input("1"))]);
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        let text = format!("{:?}", term.backend().buffer());
+        assert!(text.contains("Circular References: 'My Data'!A1"), "{text}");
+        app.apply_on(1, vec![(0, 0, parse_input("2"))]);
+        assert!(app.circular_refs().is_empty());
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        let text = format!("{:?}", term.backend().buffer());
+        assert!(!text.contains("Circular References"), "{text}");
     }
 
     #[test]

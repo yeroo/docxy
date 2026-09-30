@@ -2,8 +2,10 @@
 //!
 //! The engine parses every formula once, extracts its reference rectangles,
 //! and on each edit dirties only the transitive dependents — then evaluates
-//! them in topological order (Kahn). Cells on a cycle get `#CYCLE!` instead
-//! of hanging. Volatile formulas (`NOW`, `RAND`…) join every recalculation.
+//! them in topological order (Kahn). Cells on a circular reference are
+//! handled as Excel does: without iterative calculation they are 0 and the
+//! engine reports them ([`Engine::circular_refs`]); with it they iterate.
+//! Volatile formulas (`NOW`, `RAND`…) join every recalculation.
 //!
 //! **Graceful degradation:** a formula that fails to parse, carries preserved
 //! `<f>` attributes (array/data-table), or evaluates through something we
@@ -13,7 +15,7 @@
 //! never wrong-by-our-hand ones.
 
 use std::cell::Cell as StdCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::formula::{
     self, DynResult, Eval, ExcelError, Expr, Resolver, Value, collect_refs, is_volatile,
@@ -54,6 +56,8 @@ pub struct Engine {
     pub clock: Option<f64>,
     /// PRNG state for `RAND`; None = no randomness source.
     pub seed: Option<u64>,
+    /// Formula cells on a circular reference, sorted.
+    circular: BTreeSet<Key>,
 }
 
 /// Spill chains (an anchor whose array feeds another anchor's spill cells)
@@ -80,6 +84,15 @@ impl Engine {
             }
         }
         eng
+    }
+
+    /// The formula cells on a circular reference (a cycle of two or more
+    /// cells, or a cell that reads itself), sorted by (sheet, row, col). Cells
+    /// merely downstream of a circle are not included. Kept up to date across
+    /// partial recalculations: a circle is dropped only when one of its cells
+    /// is recalculated off it, or loses its formula.
+    pub fn circular_refs(&self) -> Vec<Key> {
+        self.circular.iter().copied().collect()
     }
 
     /// Is this cell's formula beyond the engine (kept on its cached value)?
@@ -128,6 +141,7 @@ impl Engine {
         let (s, r, c) = key;
         // Drop stale bookkeeping for this address.
         self.formulas.remove(&key);
+        self.circular.remove(&key);
         self.unsupported.remove(&key);
         self.spill_blocked.remove(&key);
         let mut changed = vec![key];
@@ -350,10 +364,13 @@ impl Engine {
             }
         }
 
-        // Whatever never reached in-degree 0 sits on a cycle. With the
-        // workbook's iterative-calculation opt-in, converge them the way
-        // Excel does; otherwise flag the circularity honestly.
-        let cycle: Vec<Key> = {
+        // Whatever never reached in-degree 0 sits on a circle or downstream
+        // of one. Split it into strongly connected components and take them
+        // in dependency order: a circle (two or more cells, or a cell that
+        // reads itself) is 0 without iterative calculation, or iterates with
+        // it; a cell merely downstream is evaluated normally from those
+        // values.
+        let rest: Vec<Key> = {
             let mut v: Vec<Key> = dirty
                 .iter()
                 .copied()
@@ -362,46 +379,34 @@ impl Engine {
             v.sort_unstable();
             v
         };
-        if !cycle.is_empty() {
+        let mut found: Vec<Key> = Vec::new();
+        for comp in components_in_order(&rest, &edges) {
+            let circle =
+                comp.len() > 1 || edges.get(&comp[0]).is_some_and(|ds| ds.contains(&comp[0]));
+            if !circle {
+                spilled.extend(self.eval_one(wb, comp[0]));
+                continue;
+            }
+            found.extend(comp.iter().copied());
             match wb.iterate {
                 Some((count, delta)) => {
-                    for _ in 0..count.max(1) {
-                        let mut max_change = 0.0f64;
-                        for &k in &cycle {
-                            let before = wb.sheets[k.0]
-                                .cell(k.1, k.2)
-                                .map(|c| c.value.clone())
-                                .unwrap_or_default();
-                            spilled.extend(self.eval_one(wb, k));
-                            let after = wb.sheets[k.0]
-                                .cell(k.1, k.2)
-                                .map(|c| c.value.clone())
-                                .unwrap_or_default();
-                            if let (CellValue::Number(x), CellValue::Number(y)) = (&before, &after)
-                            {
-                                max_change = max_change.max((x - y).abs());
-                            } else if before != after {
-                                max_change = f64::MAX;
-                            }
-                        }
-                        if max_change < delta {
-                            break;
-                        }
-                    }
+                    spilled.extend(self.iterate_circle(wb, &comp, count, delta));
                 }
                 None => {
-                    for &(s, r, c) in &cycle {
-                        if let Some(cell) = wb
-                            .sheets
-                            .get_mut(s)
-                            .and_then(|sh| sh.cells.get_mut(&(r, c)))
-                        {
-                            cell.value = CellValue::Error(ExcelError::Cycle.code().to_string());
+                    for &(s, r, c) in &comp {
+                        if let Some(sheet) = wb.sheets.get_mut(s) {
+                            sheet.cells.entry((r, c)).or_default().value = CellValue::Number(0.0);
                         }
                     }
                 }
             }
         }
+        // Circles found now replace whatever was known about the cells just
+        // recalculated; circles elsewhere stay as they were.
+        for k in &dirty {
+            self.circular.remove(k);
+        }
+        self.circular.extend(found);
         // Spill writes change plain-value cells whose dependents the dirty
         // walk couldn't see (only the anchor is a formula). One more pass
         // over those cells picks them up; chains converge quickly.
@@ -410,6 +415,51 @@ impl Engine {
             spilled.dedup();
             self.recalc_from_depth(wb, &spilled, depth + 1);
         }
+    }
+
+    /// Iterative calculation of one circle (Excel's File > Options >
+    /// Formulas > Enable iterative calculation): sweep its cells up to
+    /// `count` times. A sweep whose largest change is under `delta` means the
+    /// circle had already converged, so that sweep is rolled back rather than
+    /// applied: recalculating a converged circle leaves it where it was (and
+    /// a file Excel saved verifies), instead of creeping one step further.
+    fn iterate_circle(
+        &mut self,
+        wb: &mut Workbook,
+        comp: &[Key],
+        count: u32,
+        delta: f64,
+    ) -> Vec<Key> {
+        let mut spilled = Vec::new();
+        let value_of = |wb: &Workbook, k: Key| {
+            wb.sheets[k.0]
+                .cell(k.1, k.2)
+                .map(|c| c.value.clone())
+                .unwrap_or_default()
+        };
+        for _ in 0..count.max(1) {
+            let before: Vec<CellValue> = comp.iter().map(|&k| value_of(wb, k)).collect();
+            let mut max_change = 0.0f64;
+            for (i, &k) in comp.iter().enumerate() {
+                spilled.extend(self.eval_one(wb, k));
+                match (&before[i], &value_of(wb, k)) {
+                    (CellValue::Number(x), CellValue::Number(y)) => {
+                        max_change = max_change.max((x - y).abs());
+                    }
+                    (a, b) if a != b => max_change = f64::MAX,
+                    _ => {}
+                }
+            }
+            if max_change < delta {
+                for (&(s, r, c), v) in comp.iter().zip(before) {
+                    if let Some(sheet) = wb.sheets.get_mut(s) {
+                        sheet.cells.entry((r, c)).or_default().value = v;
+                    }
+                }
+                break;
+            }
+        }
+        spilled
     }
 
     /// Evaluate one formula and store its result. Returns the keys of cells
@@ -813,6 +863,85 @@ fn numfmt_code(nf: crate::sheet::NumFmt) -> Option<String> {
     })
 }
 
+/// The strongly connected components of the graph `edges` (precedent →
+/// dependents) restricted to `nodes`, in dependency order: every component
+/// comes after the ones it reads from. Tarjan's algorithm, iterative so a
+/// long chain cannot overflow the stack; it emits components dependents
+/// first, so the result is reversed.
+fn components_in_order(nodes: &[Key], edges: &HashMap<Key, Vec<Key>>) -> Vec<Vec<Key>> {
+    let in_set: HashSet<Key> = nodes.iter().copied().collect();
+    let succ = |k: Key| -> Vec<Key> {
+        edges
+            .get(&k)
+            .map(|ds| ds.iter().copied().filter(|d| in_set.contains(d)).collect())
+            .unwrap_or_default()
+    };
+    let mut index: HashMap<Key, usize> = HashMap::new();
+    let mut low: HashMap<Key, usize> = HashMap::new();
+    let mut on_stack: HashSet<Key> = HashSet::new();
+    let mut stack: Vec<Key> = Vec::new();
+    let mut out: Vec<Vec<Key>> = Vec::new();
+    let mut next = 0usize;
+    for &root in nodes {
+        if index.contains_key(&root) {
+            continue;
+        }
+        // (node, its successors, how many of them were visited)
+        let mut work: Vec<(Key, Vec<Key>, usize)> = Vec::new();
+        index.insert(root, next);
+        low.insert(root, next);
+        next += 1;
+        stack.push(root);
+        on_stack.insert(root);
+        work.push((root, succ(root), 0));
+        while let Some((v, succs, i)) = work.last_mut() {
+            let v = *v;
+            if *i < succs.len() {
+                let w = succs[*i];
+                *i += 1;
+                match index.entry(w) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(next);
+                        low.insert(w, next);
+                        next += 1;
+                        stack.push(w);
+                        on_stack.insert(w);
+                        let ws = succ(w);
+                        work.push((w, ws, 0));
+                    }
+                    std::collections::hash_map::Entry::Occupied(e) if on_stack.contains(&w) => {
+                        let lw = *e.get();
+                        let lv = low.get_mut(&v).unwrap();
+                        *lv = (*lv).min(lw);
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {}
+                }
+                continue;
+            }
+            work.pop();
+            if let Some((parent, _, _)) = work.last() {
+                let lv = low[&v];
+                let lp = low.get_mut(parent).unwrap();
+                *lp = (*lp).min(lv);
+            }
+            if low[&v] == index[&v] {
+                let mut comp = Vec::new();
+                while let Some(w) = stack.pop() {
+                    on_stack.remove(&w);
+                    comp.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                comp.sort_unstable();
+                out.push(comp);
+            }
+        }
+    }
+    out.reverse();
+    out
+}
+
 /// Evaluate a formula string in the context of cell (sheet, row, col) over the
 /// workbook — ad-hoc, for things like conditional-format rule conditions. Uses no
 /// clock/rand (CF conditions shouldn't be volatile). Returns the value, or
@@ -962,7 +1091,10 @@ mod tests {
     }
 
     #[test]
-    fn cycles_get_cycle_error() {
+    fn circular_references_are_zero_and_reported() {
+        // #660: without iterative calculation a circle is 0 (never
+        // #CYCLE!), cells downstream of it evaluate normally, and the engine
+        // names the circle's cells.
         let mut wb = wb_one_sheet(&[
             ("A1", Cell::formula("B1+1")),
             ("B1", Cell::formula("A1+1")),
@@ -970,8 +1102,86 @@ mod tests {
         ]);
         let mut eng = Engine::new(&wb);
         eng.recalc_all(&mut wb);
-        assert_eq!(value_at(&wb, "A1"), CellValue::Error("#CYCLE!".into()));
-        assert_eq!(value_at(&wb, "B1"), CellValue::Error("#CYCLE!".into()));
+        assert_eq!(value_at(&wb, "A1"), CellValue::Number(0.0));
+        assert_eq!(value_at(&wb, "B1"), CellValue::Number(0.0));
+        assert_eq!(eng.circular_refs(), vec![(0, 0, 0), (0, 0, 1)]);
+
+        // The issue's cells, typed one by one.
+        let mut wb = wb_one_sheet(&[]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "E1", Cell::formula("E1+1"));
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(0.0));
+        set(&mut eng, &mut wb, "F1", Cell::formula("G1+1"));
+        assert_eq!(value_at(&wb, "F1"), CellValue::Number(1.0));
+        set(&mut eng, &mut wb, "G1", Cell::formula("F1*2"));
+        assert_eq!(value_at(&wb, "F1"), CellValue::Number(0.0));
+        assert_eq!(value_at(&wb, "G1"), CellValue::Number(0.0));
+        set(&mut eng, &mut wb, "BD5", Cell::formula("SUM(BD:BD)"));
+        assert_eq!(value_at(&wb, "BD5"), CellValue::Number(0.0));
+        set(&mut eng, &mut wb, "H1", Cell::formula("E1+5"));
+        assert_eq!(value_at(&wb, "H1"), CellValue::Number(5.0));
+        let e1 = (0, 0, 4);
+        let (f1, g1) = ((0, 0, 5), (0, 0, 6));
+        let bd5 = (0, 4, 55);
+        assert_eq!(eng.circular_refs(), vec![e1, f1, g1, bd5]);
+
+        // An unrelated edit, and a volatile's recalculation, keep them.
+        eng.seed = Some(1);
+        set(&mut eng, &mut wb, "Z1", Cell::formula("RAND()"));
+        set(&mut eng, &mut wb, "Z2", Cell::number(3.0));
+        assert_eq!(eng.circular_refs(), vec![e1, f1, g1, bd5]);
+        // Breaking a circle drops it; replacing a formula drops that cell.
+        set(&mut eng, &mut wb, "G1", Cell::number(4.0));
+        assert_eq!(value_at(&wb, "F1"), CellValue::Number(5.0));
+        set(&mut eng, &mut wb, "E1", Cell::number(1.0));
+        assert_eq!(value_at(&wb, "H1"), CellValue::Number(6.0));
+        assert_eq!(eng.circular_refs(), vec![bd5]);
+        set(&mut eng, &mut wb, "BD5", Cell::default());
+        assert!(eng.circular_refs().is_empty());
+    }
+
+    #[test]
+    fn loaded_circle_values_survive_a_full_recalc() {
+        // #660: an Excel-saved circle (cached 0) verifies: recalc_all leaves
+        // it at 0 and writes no error.
+        let cached = |f: &str| Cell {
+            value: CellValue::Number(0.0),
+            ..Cell::formula(f)
+        };
+        let mut wb = wb_one_sheet(&[
+            ("E1", cached("E1+1")),
+            ("F1", cached("G1+1")),
+            ("G1", cached("F1*2")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        for c in ["E1", "F1", "G1"] {
+            assert_eq!(value_at(&wb, c), CellValue::Number(0.0), "{c}");
+        }
+    }
+
+    #[test]
+    fn converged_iteration_is_stable_under_recalc() {
+        // #660: with iterate="1" iterateCount="100" iterateDelta="0.001",
+        // Excel's cached D1 = D1/2+5 value survives a full recalculation.
+        let cached = 9.999998807907104;
+        let mut wb = wb_one_sheet(&[(
+            "D1",
+            Cell {
+                value: CellValue::Number(cached),
+                ..Cell::formula("D1/2+5")
+            },
+        )]);
+        wb.iterate = Some((100, 0.001));
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "D1"), CellValue::Number(cached));
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "D1"), CellValue::Number(cached));
+        assert_eq!(eng.circular_refs(), vec![(0, 0, 3)]);
+        // A cell downstream of the circle reads its settled value once.
+        set(&mut eng, &mut wb, "E1", Cell::formula("D1*2"));
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(cached * 2.0));
     }
 
     #[test]
@@ -1133,7 +1343,7 @@ mod tests {
         });
         let mut eng = Engine::new(&wb);
         eng.recalc_all(&mut wb);
-        // Calculated column evaluates (no #CYCLE! from self-deps) and the
+        // Calculated column evaluates (no circle from self-deps) and the
         // aggregation sees it in topological order.
         assert_eq!(value_at(&wb, "C2"), CellValue::Number(6.0));
         assert_eq!(value_at(&wb, "C3"), CellValue::Number(8.0));
@@ -1190,11 +1400,11 @@ mod tests {
 
     #[test]
     fn iterative_calculation_converges() {
-        // A1 = (A1+10)/2 → fixed point at 10. Without the opt-in: #CYCLE!.
+        // A1 = (A1+10)/2 → fixed point at 10. Without the opt-in: 0.
         let mut wb = wb_one_sheet(&[("A1", Cell::formula("(A1+10)/2"))]);
         let mut eng = Engine::new(&wb);
         eng.recalc_all(&mut wb);
-        assert_eq!(value_at(&wb, "A1"), CellValue::Error("#CYCLE!".into()));
+        assert_eq!(value_at(&wb, "A1"), CellValue::Number(0.0));
         // With iteration enabled it converges.
         let mut wb = wb_one_sheet(&[("A1", Cell::formula("(A1+10)/2"))]);
         wb.iterate = Some((100, 1e-9));
