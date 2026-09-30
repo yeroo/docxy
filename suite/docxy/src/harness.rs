@@ -1193,6 +1193,19 @@ fn ruler_state(app: &crate::Docxy) -> Json {
                 .unwrap_or(Json::Null),
         ));
     }
+    // The tab stops the ruler draws, in twips from the text's left edge.
+    let tabs = app
+        .ruler_para()
+        .1
+        .iter()
+        .map(|t| {
+            Json::obj(vec![
+                ("pos", Json::Num(t.pos as f64)),
+                ("align", Json::Str(format!("{:?}", t.align).to_lowercase())),
+            ])
+        })
+        .collect();
+    fields.push(("tabs", Json::Arr(tabs)));
     Json::obj(fields)
 }
 
@@ -1494,11 +1507,15 @@ fn ribbon_json_for(
     kind: crate::Kind,
     in_table: bool,
     in_gantt: bool,
+    in_hf: bool,
     checked: impl Fn(&RibbonCommand) -> bool,
 ) -> Json {
     let ribbon = crate::ribbon_for(kind);
     let mut tabs = vec![file_tab_json(kind)];
     tabs.extend(ribbon.tabs.iter().map(|t| tab_json(t, &checked)));
+    if kind == crate::Kind::Docx && in_hf {
+        tabs.push(tab_json(&crate::hf_tab::hf_tab(), &checked));
+    }
     if kind == crate::Kind::Docx && in_table {
         tabs.push(tab_json(&crate::table_tab(), &checked));
     }
@@ -1550,13 +1567,68 @@ fn ribbon_reply(tabs: Vec<Json>) -> Json {
 /// Ribbon snapshot using the active tab and live checked states.
 fn ribbon_json(app: &crate::Docxy) -> Json {
     let (kind, in_table) = (app.ribbon_kind(), app.caret_table().is_some());
-    ribbon_json_for(kind, in_table, app.project_gantt_showing(), |command| {
-        if command.gallery {
-            app.gallery_item_selected(command.act)
-        } else {
-            app.act_active(command.act)
+    let mut json = ribbon_json_for(
+        kind,
+        in_table,
+        app.project_gantt_showing(),
+        app.hf_active(),
+        |command| {
+            if command.gallery {
+                app.gallery_item_selected(command.act)
+            } else {
+                app.act_active(command.act)
+            }
+        },
+    );
+    add_combo_values(&mut json, app);
+    json
+}
+
+/// Give the Header from Top / Footer from Bottom boxes the value they show
+/// (inches, as drawn: `0.5"`).
+fn add_combo_values(json: &mut Json, app: &crate::Docxy) {
+    let Json::Obj(fields) = json else { return };
+    let Some((_, Json::Arr(tabs))) = fields.iter_mut().find(|(k, _)| k == "tabs") else {
+        return;
+    };
+    for tab in tabs {
+        let Json::Obj(tab) = tab else { continue };
+        let Some((_, Json::Arr(groups))) = tab.iter_mut().find(|(k, _)| k == "groups") else {
+            continue;
+        };
+        for group in groups {
+            let Json::Obj(group) = group else { continue };
+            let Some((_, Json::Arr(commands))) = group.iter_mut().find(|(k, _)| k == "commands")
+            else {
+                continue;
+            };
+            for command in commands {
+                let Json::Obj(command) = command else {
+                    continue;
+                };
+                let id = command.iter().find_map(|(k, v)| match (k.as_str(), v) {
+                    ("id", Json::Str(id)) => Some(id.clone()),
+                    _ => None,
+                });
+                let Some(menu) = id.as_deref().and_then(crate::hf_tab::menu_of) else {
+                    continue;
+                };
+                let is_header = match menu {
+                    crate::hf_tab::HfMenu::HeaderFromTop => true,
+                    crate::hf_tab::HfMenu::FooterFromBottom => false,
+                    _ => continue,
+                };
+                let value = app
+                    .tabs
+                    .get(app.active)
+                    .and_then(|t| crate::hf_tab::distance_of(t, is_header))
+                    .map_or(Json::Null, |t| {
+                        Json::Str(format!("{}\"", crate::page_setup::inches(t)))
+                    });
+                command.push(("value".into(), value));
+            }
         }
-    })
+    }
 }
 
 /// Resolve a currently valid tab name before a synthetic ribbon click.
@@ -1566,6 +1638,11 @@ fn ribbon_tab_by_name(kind: crate::Kind, name: &str) -> Result<crate::RibbonTab,
         .find_map(|(tab, label, _)| (*label == name).then_some(*tab).flatten())
         .or_else(|| {
             (kind == crate::Kind::Docx && name == "Table").then_some(crate::RibbonTab::Table)
+        })
+        .or_else(|| {
+            (kind == crate::Kind::Docx
+                && name == crate::ribbon_tab_name(crate::RibbonTab::HeaderFooter))
+            .then_some(crate::RibbonTab::HeaderFooter)
         })
         .or_else(|| {
             (kind == crate::Kind::Project
@@ -1603,6 +1680,11 @@ fn ribbon_tab_def(
             return Err("Table tab is not active outside a table".into());
         }
         crate::table_tab()
+    } else if tab_name == crate::ribbon_tab_name(crate::RibbonTab::HeaderFooter) {
+        if !app.hf_active() {
+            return Err("Header & Footer tab is not active outside a header or footer".into());
+        }
+        crate::hf_tab::hf_tab()
     } else if tab_name == crate::ribbon_tab_name(crate::RibbonTab::GanttFormat) {
         if !app.project_gantt_showing() {
             return Err("Gantt Chart Format tab is not active without a Gantt view".into());
@@ -1954,6 +2036,7 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
                     app.ribbon_tab,
                     app.caret_table().is_some(),
                     app.project_gantt_showing(),
+                    app.hf_active(),
                 ))
                 .into(),
             ),
@@ -2267,6 +2350,24 @@ pub fn dispatch(
             Done::ok(state(app, window))
         }
         "doc" => Done::ok(live_doc_state(app, window)?),
+        // Header/footer editing state (#641): which area of which section and
+        // variant, its labels, and the contextual tab's Options and Position.
+        "hf-state" => Done::ok(crate::hf_tab::hf_state(app.tabs.get(app.active))),
+        // A pointer double-click on a print-layout page's header, footer or
+        // body area (0-based `page`), through the handler the page draws.
+        "page-double-click" => {
+            app.refuse_under_dialog()?;
+            app.close_menu();
+            let page = arg_usize(args, "page")?;
+            let area = match arg_str(args, "area")? {
+                "header" => crate::PageArea::Header,
+                "footer" => crate::PageArea::Footer,
+                "body" => crate::PageArea::Body,
+                _ => return Err("'area' must be header, footer or body".into()),
+            };
+            app.page_double_click(page, area, window, cx)?;
+            Done::ok(crate::hf_tab::hf_state(app.tabs.get(app.active)))
+        }
         "selection-set" => {
             app.refuse_under_dialog()?;
             let (start, end) = (arg_usize(args, "start")?, arg_usize(args, "end")?);
@@ -3470,10 +3571,31 @@ mod tests {
         );
     }
 
+    /// The contextual Header & Footer tab is in `ribbon-read` only while a
+    /// header or footer is being edited (#641).
+    #[test]
+    fn ribbon_read_lists_the_header_and_footer_tab_only_while_editing() {
+        let names = |in_hf: bool| -> Vec<String> {
+            let json = ribbon_json_for(crate::Kind::Docx, false, false, in_hf, |_| false);
+            json.get("tabs")
+                .and_then(Json::as_array)
+                .unwrap()
+                .iter()
+                .map(|t| t.get("name").and_then(Json::as_str).unwrap().to_string())
+                .collect()
+        };
+        assert!(names(true).contains(&"Header & Footer".to_string()));
+        assert!(!names(false).contains(&"Header & Footer".to_string()));
+        assert!(
+            ribbon_tab_by_name(crate::Kind::Docx, "Header & Footer")
+                == Ok(crate::RibbonTab::HeaderFooter)
+        );
+    }
+
     #[test]
     fn ribbon_reflects_definition_and_checked_state() {
-        let off = ribbon_json_for(crate::Kind::Docx, false, false, |_| false);
-        let on = ribbon_json_for(crate::Kind::Docx, true, false, |c| {
+        let off = ribbon_json_for(crate::Kind::Docx, false, false, false, |_| false);
+        let on = ribbon_json_for(crate::Kind::Docx, true, false, false, |c| {
             matches!(c.act, crate::Act::Bold)
         });
         let tabs = off.get("tabs").unwrap().as_array().unwrap();
@@ -3520,7 +3642,7 @@ mod tests {
                 .map(|t| t.get_str("name").unwrap().to_string())
                 .collect::<Vec<_>>()
         };
-        let on = ribbon_json_for(crate::Kind::Project, false, true, |c| {
+        let on = ribbon_json_for(crate::Kind::Project, false, true, false, |c| {
             matches!(c.act, crate::Act::Project(crate::ProjectAct::CriticalTasks))
         });
         assert_eq!(
@@ -3554,9 +3676,9 @@ mod tests {
                 ("Baseline", Some(Json::Bool(false)))
             ]
         );
-        let off = ribbon_json_for(crate::Kind::Project, false, false, |_| false);
+        let off = ribbon_json_for(crate::Kind::Project, false, false, false, |_| false);
         assert!(!names(&off).iter().any(|n| n == "Gantt Chart Format"));
-        let docx = ribbon_json_for(crate::Kind::Docx, false, true, |_| false);
+        let docx = ribbon_json_for(crate::Kind::Docx, false, true, false, |_| false);
         assert!(!names(&docx).iter().any(|n| n == "Gantt Chart Format"));
         assert!(ribbon_tab_by_name(crate::Kind::Project, "Gantt Chart Format").is_ok());
         assert!(ribbon_tab_by_name(crate::Kind::Docx, "Gantt Chart Format").is_err());
@@ -3567,7 +3689,7 @@ mod tests {
         let mut props = ParProps::default();
         props.style_id = Some("Heading1".into());
         let editor = editor(props, RunProps::default());
-        let ribbon = ribbon_json_for(crate::Kind::Docx, false, false, |c| {
+        let ribbon = ribbon_json_for(crate::Kind::Docx, false, false, false, |c| {
             c.gallery && crate::gallery_style_selected(&editor.caret_para_props(), c.act)
         });
         let tabs = ribbon.get("tabs").unwrap().as_array().unwrap();
@@ -3593,7 +3715,7 @@ mod tests {
     #[test]
     fn normal_paragraph_selects_only_normal_gallery_item() {
         let mut editor = editor(ParProps::default(), RunProps::default());
-        let ribbon = ribbon_json_for(crate::Kind::Docx, false, false, |c| {
+        let ribbon = ribbon_json_for(crate::Kind::Docx, false, false, false, |c| {
             c.gallery && crate::gallery_style_selected(&editor.caret_para_props(), c.act)
         });
         let commands = ribbon.get("tabs").unwrap().as_array().unwrap()[1]
@@ -3678,7 +3800,7 @@ mod tests {
 
     #[test]
     fn project_report_tab_is_listed_with_no_groups() {
-        let json = ribbon_json_for(crate::Kind::Project, false, false, |_| false);
+        let json = ribbon_json_for(crate::Kind::Project, false, false, false, |_| false);
         let report = json
             .get("tabs")
             .unwrap()
@@ -3698,7 +3820,7 @@ mod tests {
     #[test]
     fn ribbon_read_reports_enabled_and_the_menu_a_command_sits_in() {
         for kind in [crate::Kind::Docx, crate::Kind::Project] {
-            let json = ribbon_json_for(kind, true, true, |_| false);
+            let json = ribbon_json_for(kind, true, true, false, |_| false);
             let ribbon = crate::ribbon_for(kind);
             let mut defs: Vec<RibbonCommand> = ribbon.tabs.iter().flat_map(tab_commands).collect();
             if kind == crate::Kind::Docx {
@@ -3726,7 +3848,7 @@ mod tests {
                 );
             }
         }
-        let json = ribbon_json_for(crate::Kind::Project, false, false, |_| false);
+        let json = ribbon_json_for(crate::Kind::Project, false, false, false, |_| false);
         let schedule = json
             .get("tabs")
             .unwrap()

@@ -147,6 +147,7 @@ fn header_and_footer_buffers_are_flushed_before_asking() {
             is_header,
             section: 0,
             variant: HeaderVariant::Default,
+            show_text: true,
         });
         t.status = "Editing header — press Esc to return to the document".into();
         assert_eq!(
@@ -242,6 +243,7 @@ fn open_hf(t: &mut DocTab, is_header: bool, text: &str) -> String {
         is_header,
         section: 0,
         variant: HeaderVariant::Default,
+        show_text: true,
     });
     // As the app leaves it: creating the part and typing both mark the tab dirty.
     t.dirty = true;
@@ -363,6 +365,7 @@ fn untouched_existing_header(name: &str, is_header: bool) -> (DocTab, String, Ve
         is_header,
         section: 0,
         variant: HeaderVariant::Default,
+        show_text: true,
     });
     (t, part_name, before)
 }

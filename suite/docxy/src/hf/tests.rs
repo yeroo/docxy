@@ -16,7 +16,7 @@ pub(crate) fn sect(refs: &str, extra: &str) -> String {
     format!("<w:sectPr>{refs}{MARGINS}{extra}</w:sectPr>")
 }
 
-fn para(text: &str, sect_pr: Option<&str>) -> String {
+pub(crate) fn para(text: &str, sect_pr: Option<&str>) -> String {
     let ppr = sect_pr
         .map(|s| format!("<w:pPr>{s}</w:pPr>"))
         .unwrap_or_default();
@@ -24,7 +24,7 @@ fn para(text: &str, sect_pr: Option<&str>) -> String {
 }
 
 /// Parse body XML (paragraphs and a trailing sectPr) into blocks.
-fn body_blocks(xml: &str) -> Vec<Block> {
+pub(crate) fn body_blocks(xml: &str) -> Vec<Block> {
     docxcore::load::parse_header_footer(
         &format!(
             "<w:hdr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">{xml}</w:hdr>"
@@ -33,7 +33,7 @@ fn body_blocks(xml: &str) -> Vec<Block> {
     )
 }
 
-fn tmp_dir(name: &str) -> PathBuf {
+pub(crate) fn tmp_dir(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../target/hf-tests")
         .join(format!("{}-{name}", std::process::id()));
@@ -81,7 +81,7 @@ pub(crate) fn three_sections_docx(headers: bool, styles: bool) -> Vec<u8> {
 }
 
 /// A tab on [`three_sections_docx`].
-fn three_sections(name: &str, headers: bool) -> DocTab {
+pub(crate) fn three_sections(name: &str, headers: bool) -> DocTab {
     let dir = tmp_dir(name);
     let path = dir.join("in.docx");
     std::fs::write(&path, three_sections_docx(headers, true)).unwrap();
@@ -92,14 +92,14 @@ fn three_sections(name: &str, headers: bool) -> DocTab {
     t
 }
 
-fn ed(t: &DocTab) -> &Editor {
+pub(crate) fn ed(t: &DocTab) -> &Editor {
     let Surface::Doc(ed) = &t.surface else {
         panic!("a document")
     };
     ed
 }
 
-fn ed_mut(t: &mut DocTab) -> &mut Editor {
+pub(crate) fn ed_mut(t: &mut DocTab) -> &mut Editor {
     let Surface::Doc(ed) = &mut t.surface else {
         panic!("a document")
     };
@@ -107,14 +107,14 @@ fn ed_mut(t: &mut DocTab) -> &mut Editor {
 }
 
 /// Put the body caret at the start of body block `i`.
-fn caret_in(t: &mut DocTab, i: usize) {
+pub(crate) fn caret_in(t: &mut DocTab, i: usize) {
     ed_mut(t).caret = docxcore::editor::Caret {
         path: vec![i],
         offset: 0,
     };
 }
 
-fn text_of(blocks: &[Block]) -> String {
+pub(crate) fn text_of(blocks: &[Block]) -> String {
     blocks
         .iter()
         .map(Block::plain_text)
@@ -122,25 +122,25 @@ fn text_of(blocks: &[Block]) -> String {
         .join("|")
 }
 
-fn part_text(pkg: &Package, part: &str) -> String {
+pub(crate) fn part_text(pkg: &Package, part: &str) -> String {
     text_of(&parse_hf_part(pkg, part))
 }
 
 /// What Save writes, reloaded (the open header/footer flushed first).
-fn saved(t: &mut DocTab) -> Package {
+pub(crate) fn saved(t: &mut DocTab) -> Package {
     flush_hf_tab(t);
     load_package(&doc_to_docx(&ed(t).doc, &t.comments, t.pkg.as_ref())).unwrap()
 }
 
 /// The saved package's sectPrs in document order.
-fn saved_sections(pkg: &Package) -> Vec<String> {
+pub(crate) fn saved_sections(pkg: &Package) -> Vec<String> {
     let mut ed = Editor::new(pkg.document.clone());
     ed.caret = docxcore::editor::Caret::default();
     ed.sections()
 }
 
 /// The text a saved section's resolved header (`is_header`) or footer shows.
-fn saved_hf(pkg: &Package, section: usize, is_header: bool) -> String {
+pub(crate) fn saved_hf(pkg: &Package, section: usize, is_header: bool) -> String {
     let parts = section_header_parts(&saved_sections(pkg), &pkg.document_rels());
     parts[section]
         .get(is_header, HeaderVariant::Default)
@@ -148,7 +148,7 @@ fn saved_hf(pkg: &Package, section: usize, is_header: bool) -> String {
         .unwrap_or_default()
 }
 
-fn edited_text(t: &DocTab) -> String {
+pub(crate) fn edited_text(t: &DocTab) -> String {
     text_of(&t.hf_edit.as_ref().unwrap().editor.doc.body)
 }
 
@@ -376,4 +376,36 @@ fn distances_default_to_half_an_inch() {
     assert_eq!(distance("<w:sectPr/>", true), 720);
     let s = r#"<w:sectPr><w:pgMar w:top="1440" w:header="360" w:footer="1080"/></w:sectPr>"#;
     assert_eq!((distance(s, true), distance(s, false)), (360, 1080));
+}
+
+/// `uiharness/fixtures/header-inherit.docx` (`word-header-footer.uit`) is
+/// this module's PAG-CASE-019 document. Regenerate it with
+/// `UPDATE_HF_FIXTURE=1 cargo test --manifest-path suite/Cargo.toml uiharness_fixture`.
+#[test]
+fn the_uiharness_fixture_is_the_pag_case_019_shape() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../uiharness/fixtures/header-inherit.docx");
+    if std::env::var_os("UPDATE_HF_FIXTURE").is_some() {
+        std::fs::write(&path, three_sections_docx(true, true)).unwrap();
+    }
+    let t = tab_from_path(&path);
+    assert!(!t.dirty, "{}", t.status);
+    let sections = ed(&t).sections();
+    assert_eq!(sections.len(), 3);
+    assert!(!sections[1].contains("headerReference"));
+    let pkg = t.pkg.as_ref().unwrap();
+    let parts = resolve(ed(&t), pkg);
+    let shown: Vec<String> = (0..3)
+        .map(|k| {
+            part_text(
+                pkg,
+                &parts[k]
+                    .get(true, HeaderVariant::Default)
+                    .unwrap()
+                    .part_name,
+            )
+        })
+        .collect();
+    assert_eq!(shown, ["Header A", "Header A", "Header C"]);
+    assert_eq!(text_of(&ed(&t).doc.body[..3]), "One|Two|Three");
 }

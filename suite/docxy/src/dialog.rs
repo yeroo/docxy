@@ -31,6 +31,11 @@ pub(crate) enum DialogOwner {
     PageSetup,
     /// Word's Columns, for the caret's sections (#649).
     Columns,
+    /// The Header & Footer tab's Header from Top (`is_header`) or Footer from
+    /// Bottom Custom... box, for one section (#641).
+    HfDistance { is_header: bool, section: usize },
+    /// Word's Page Number Format, for one section (#650).
+    PageNumberFormat { section: usize },
     /// Excel's Convert Text to Columns Wizard over one column (#692).
     TextToColumns {
         sheet: usize,

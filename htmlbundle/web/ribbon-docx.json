@@ -739,49 +739,295 @@
           "launcher": null,
           "items": [
             {
-              "kind": "large",
+              "kind": "dropdown",
               "cmd": {
-                "id": "header",
-                "label": "Edit Header",
+                "id": "hf-header",
+                "label": "Header",
                 "icon": "header",
-                "act": "EditHeader",
+                "act": "Hf(Menu(Header))",
                 "keyTip": "H",
                 "tip": {
-                  "title": "Edit Header",
-                  "body": "",
+                  "title": "Header",
+                  "body": "Add a header, or edit or remove this section's.",
                   "shortcut": ""
                 }
-              }
+              },
+              "items": [
+                {
+                  "id": "hdr-blank",
+                  "label": "Blank",
+                  "icon": "header",
+                  "act": "Hf(Design { is_header: true, index: 0 })",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "hdr-blank3",
+                  "label": "Blank (Three Columns)",
+                  "icon": "header",
+                  "act": "Hf(Design { is_header: true, index: 1 })",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "hdr-edit",
+                  "label": "Edit Header",
+                  "icon": "header",
+                  "act": "Hf(Edit(true))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "hdr-remove",
+                  "label": "Remove Header",
+                  "icon": "header",
+                  "act": "Hf(Remove(true))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                }
+              ]
             },
             {
-              "kind": "large",
+              "kind": "dropdown",
               "cmd": {
-                "id": "footer",
-                "label": "Edit Footer",
+                "id": "hf-footer",
+                "label": "Footer",
                 "icon": "footer",
-                "act": "EditFooter",
+                "act": "Hf(Menu(Footer))",
                 "keyTip": "O",
                 "tip": {
-                  "title": "Edit Footer",
-                  "body": "",
+                  "title": "Footer",
+                  "body": "Add a footer, or edit or remove this section's.",
                   "shortcut": ""
                 }
-              }
+              },
+              "items": [
+                {
+                  "id": "ftr-blank",
+                  "label": "Blank",
+                  "icon": "footer",
+                  "act": "Hf(Design { is_header: false, index: 0 })",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "ftr-blank3",
+                  "label": "Blank (Three Columns)",
+                  "icon": "footer",
+                  "act": "Hf(Design { is_header: false, index: 1 })",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "ftr-edit",
+                  "label": "Edit Footer",
+                  "icon": "footer",
+                  "act": "Hf(Edit(false))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "ftr-remove",
+                  "label": "Remove Footer",
+                  "icon": "footer",
+                  "act": "Hf(Remove(false))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                }
+              ]
             },
             {
-              "kind": "large",
+              "kind": "dropdown",
               "cmd": {
-                "id": "pagenum",
+                "id": "hf-pagenum",
                 "label": "Page Number",
                 "icon": "page-number",
-                "act": "PageNumber",
-                "keyTip": "G",
+                "act": "Hf(Menu(PageNumber))",
+                "keyTip": "NU",
                 "tip": {
-                  "title": "Page Number",
-                  "body": "",
+                  "title": "Add Page Numbers",
+                  "body": "Number the pages of the document.",
                   "shortcut": ""
                 }
-              }
+              },
+              "items": [
+                {
+                  "id": "pn-top-1",
+                  "label": "Top of Page: Plain Number 1",
+                  "icon": "page-number",
+                  "act": "Hf(PageNumber(Place { top: true, design: 0 }))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "pn-top-2",
+                  "label": "Top of Page: Plain Number 2",
+                  "icon": "page-number",
+                  "act": "Hf(PageNumber(Place { top: true, design: 1 }))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "pn-top-3",
+                  "label": "Top of Page: Plain Number 3",
+                  "icon": "page-number",
+                  "act": "Hf(PageNumber(Place { top: true, design: 2 }))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "pn-top-xy",
+                  "label": "Top of Page: Page X of Y",
+                  "icon": "page-number",
+                  "act": "Hf(PageNumber(Place { top: true, design: 3 }))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "pn-bottom-1",
+                  "label": "Bottom of Page: Plain Number 1",
+                  "icon": "page-number",
+                  "act": "Hf(PageNumber(Place { top: false, design: 0 }))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "pn-bottom-2",
+                  "label": "Bottom of Page: Plain Number 2",
+                  "icon": "page-number",
+                  "act": "Hf(PageNumber(Place { top: false, design: 1 }))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "pn-bottom-3",
+                  "label": "Bottom of Page: Plain Number 3",
+                  "icon": "page-number",
+                  "act": "Hf(PageNumber(Place { top: false, design: 2 }))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "pn-bottom-xy",
+                  "label": "Bottom of Page: Page X of Y",
+                  "icon": "page-number",
+                  "act": "Hf(PageNumber(Place { top: false, design: 3 }))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "pn-current-1",
+                  "label": "Current Position: Plain Number",
+                  "icon": "page-number",
+                  "act": "Hf(PageNumber(Current { design: 0 }))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "pn-current-xy",
+                  "label": "Current Position: Page X of Y",
+                  "icon": "page-number",
+                  "act": "Hf(PageNumber(Current { design: 1 }))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "pn-format",
+                  "label": "Format Page Numbers...",
+                  "icon": "page-number",
+                  "act": "Hf(PageNumber(Format))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "pn-remove",
+                  "label": "Remove Page Numbers",
+                  "icon": "page-number",
+                  "act": "Hf(PageNumber(Remove))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                }
+              ]
             }
           ]
         },

@@ -57,11 +57,7 @@ pub(crate) fn page_slots(ed: &Editor, first_blocks: &[usize], even_odd: bool) ->
 }
 
 /// The header (`is_header`) or footer part a page slot shows, if any.
-pub(crate) fn slot_part(
-    parts: &[SectionParts],
-    slot: PageSlot,
-    is_header: bool,
-) -> Option<&str> {
+pub(crate) fn slot_part(parts: &[SectionParts], slot: PageSlot, is_header: bool) -> Option<&str> {
     parts
         .get(slot.section)?
         .get(is_header, slot.variant)
@@ -175,7 +171,11 @@ pub(crate) fn open(
         is_header,
         section,
         variant,
+        show_text: true,
     });
+    if let Some(label) = crate::hf_tab::edit_label(tab) {
+        tab.status = format!("Editing {label} \u{2014} press Esc to return to the document").into();
+    }
     true
 }
 
@@ -219,4 +219,4 @@ pub(crate) fn distance(sect: &str, is_header: bool) -> i32 {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
