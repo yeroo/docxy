@@ -5022,16 +5022,24 @@ const CT_WORKBOOK_ORDER: [&str; 19] = [
     "extLst",
 ];
 
-/// Where a new top-level `<tag>` goes in workbook.xml, with the root's
-/// namespace prefix (`"x:"`, or `""`): before the first child the schema
-/// ranks after `tag`, else before the root's end tag. Children the schema
-/// doesn't name (`mc:AlternateContent`, …) are not anchors.
-///
-/// `None` when the workbook already has a `<tag>` in any prefix (a caller
-/// matching only the unprefixed name must not add a second), or when the
-/// walk can't see every child to be sure it hasn't: a truncated part, or a
-/// self-closing root.
-fn workbook_insert_pos(xml: &str, tag: &str) -> Option<(usize, String)> {
+/// Where a new top-level child goes in workbook.xml ([`workbook_slot`]).
+#[derive(Debug, PartialEq)]
+enum WorkbookSlot {
+    /// Here, in the root's namespace prefix (`"x:"`, or `""`).
+    At(usize, String),
+    /// The workbook already has one, in some prefix: a caller that looked
+    /// for it by one spelling only must not add a second.
+    Present,
+    /// The walk couldn't see every child (a truncated part, a self-closing
+    /// root), so it can vouch for neither.
+    Unknown,
+}
+
+/// Where a new top-level `<tag>` goes in workbook.xml: before the first
+/// child the schema ranks after `tag`, else before the root's end tag.
+/// Children the schema doesn't name (`mc:AlternateContent`, …) are not
+/// anchors.
+fn workbook_slot(xml: &str, tag: &str) -> WorkbookSlot {
     let rank_of = |name: &str| CT_WORKBOOK_ORDER.iter().position(|&t| t == name);
     let rank = rank_of(tag).unwrap_or(CT_WORKBOOK_ORDER.len());
     let mut p = XmlParser::new(xml);
@@ -5040,7 +5048,7 @@ fn workbook_insert_pos(xml: &str, tag: &str) -> Option<(usize, String)> {
         match p.next() {
             Event::Start => break,
             Event::Text => {}
-            Event::End | Event::Eof => return None,
+            Event::End | Event::Eof => return WorkbookSlot::Unknown,
         }
     }
     let prefix = match p.name().rsplit_once(':') {
@@ -5053,22 +5061,24 @@ fn workbook_insert_pos(xml: &str, tag: &str) -> Option<(usize, String)> {
             Event::Start => {
                 let name = local(p.name());
                 if name == tag {
-                    return None;
+                    return WorkbookSlot::Present;
                 }
                 if at.is_none() && rank_of(name).is_some_and(|r| r > rank) {
                     at = Some(p.start_pos());
                 }
                 if !p.skip_element_complete() {
-                    return None;
+                    return WorkbookSlot::Unknown;
                 }
             }
             Event::End => {
                 // The root's end tag (a self-closing root has no `</`).
-                let end = xml[..p.pos()].rfind("</")?;
-                return Some((at.unwrap_or(end), prefix));
+                return match xml[..p.pos()].rfind("</") {
+                    Some(end) => WorkbookSlot::At(at.unwrap_or(end), prefix),
+                    None => WorkbookSlot::Unknown,
+                };
             }
             Event::Text => {}
-            Event::Eof => return None,
+            Event::Eof => return WorkbookSlot::Unknown,
         }
     }
 }
@@ -5085,21 +5095,26 @@ fn ensure_full_calc(xml: &str) -> String {
         let mut out = xml.to_string();
         out.insert_str(i + "<calcPr".len(), " fullCalcOnLoad=\"1\"");
         out
-    } else if let Some((at, px)) = workbook_insert_pos(xml, "calcPr") {
-        // At its schema position: after definedNames, before pivotCaches
-        // and extLst, which a bare append would put it behind.
-        let mut out = xml.to_string();
-        out.insert_str(
-            at,
-            &format!("<{px}calcPr calcId=\"0\" fullCalcOnLoad=\"1\"/>"),
-        );
-        out
     } else {
-        xml.replacen(
-            "</workbook>",
-            "<calcPr calcId=\"0\" fullCalcOnLoad=\"1\"/></workbook>",
-            1,
-        )
+        match workbook_slot(xml, "calcPr") {
+            // At its schema position: after definedNames, before pivotCaches
+            // and extLst, which a bare append would put it behind.
+            WorkbookSlot::At(at, px) => {
+                let mut out = xml.to_string();
+                out.insert_str(
+                    at,
+                    &format!("<{px}calcPr calcId=\"0\" fullCalcOnLoad=\"1\"/>"),
+                );
+                out
+            }
+            // One in another prefix (`<x:calcPr>`): left as it is.
+            WorkbookSlot::Present => xml.to_string(),
+            WorkbookSlot::Unknown => xml.replacen(
+                "</workbook>",
+                "<calcPr calcId=\"0\" fullCalcOnLoad=\"1\"/></workbook>",
+                1,
+            ),
+        }
     }
 }
 
@@ -6000,21 +6015,29 @@ impl SheetPackage {
                 |px: &str| format!("<{px}pivotCache cacheId=\"{cache_id}\" r:id=\"{cache_rid}\"/>");
             p.1 = if xml.contains("</pivotCaches>") {
                 xml.replacen("</pivotCaches>", &format!("{}</pivotCaches>", entry("")), 1)
-            } else if let Some((at, px)) = workbook_insert_pos(&xml, "pivotCaches") {
-                // At its CT_Workbook position (after definedNames, calcPr,
-                // …), not right after `</sheets>`, which Excel repairs.
-                let mut out = xml.clone();
-                out.insert_str(
-                    at,
-                    &format!("<{px}pivotCaches>{}</{px}pivotCaches>", entry(&px)),
-                );
-                out
             } else {
-                xml.replacen(
-                    "</sheets>",
-                    &format!("</sheets><pivotCaches>{}</pivotCaches>", entry("")),
-                    1,
-                )
+                match workbook_slot(&xml, "pivotCaches") {
+                    // At its CT_Workbook position (after definedNames,
+                    // calcPr, …), not right after `</sheets>`, which Excel
+                    // repairs.
+                    WorkbookSlot::At(at, px) => {
+                        let mut out = xml.clone();
+                        out.insert_str(
+                            at,
+                            &format!("<{px}pivotCaches>{}</{px}pivotCaches>", entry(&px)),
+                        );
+                        out
+                    }
+                    // One this didn't match (`<x:pivotCaches>`, a
+                    // self-closing `<pivotCaches/>`): not registered, as
+                    // when no `</sheets>` matched before.
+                    WorkbookSlot::Present => xml,
+                    WorkbookSlot::Unknown => xml.replacen(
+                        "</sheets>",
+                        &format!("</sheets><pivotCaches>{}</pivotCaches>", entry("")),
+                        1,
+                    ),
+                }
             }
             .into_bytes();
         }
@@ -14520,19 +14543,46 @@ mod ct_workbook_order_tests {
     }
 
     #[test]
-    fn workbook_insert_pos_has_no_position_for_a_tag_already_there() {
+    fn workbook_slot_is_present_for_a_tag_already_there() {
         let wb = prefixed(r#"<x:calcPr calcId="1"/><x:extLst/>"#);
-        assert_eq!(workbook_insert_pos(&wb, "calcPr"), None);
+        assert_eq!(workbook_slot(&wb, "calcPr"), WorkbookSlot::Present);
         // Even out of order, past the place it would go.
         let wb = prefixed(r#"<x:extLst/><x:calcPr calcId="1"/>"#);
-        assert_eq!(workbook_insert_pos(&wb, "calcPr"), None);
-        assert!(workbook_insert_pos(&wb, "pivotCaches").is_some());
+        assert_eq!(workbook_slot(&wb, "calcPr"), WorkbookSlot::Present);
+        assert!(matches!(
+            workbook_slot(&wb, "pivotCaches"),
+            WorkbookSlot::At(_, _)
+        ));
     }
 
     #[test]
-    fn workbook_insert_pos_has_no_position_in_a_truncated_part() {
-        assert_eq!(workbook_insert_pos(r#"<workbook><sheets>"#, "calcPr"), None);
-        assert_eq!(workbook_insert_pos(r#"<workbook/>"#, "calcPr"), None);
+    fn a_prefixed_calc_pr_under_an_unprefixed_root_is_not_added_twice() {
+        let wb = workbook(&format!(r#"{SHEETS}<x:calcPr xmlns:x="{NS}" calcId="1"/>"#));
+        let mut pkg = with_data(Some(wb));
+        pkg.workbook.sheets[0].set_cell(3, 1, Cell::formula("SUM(B2:B3)"));
+        let saved = load_xlsx(&save_xlsx(&pkg)).expect("reload");
+        let wb = part(&saved, WB);
+        assert_eq!(count_local(&wb, "calcPr"), 1, "{wb}");
+    }
+
+    #[test]
+    fn add_pivot_does_not_add_a_second_self_closing_pivot_caches() {
+        let mut pkg = with_data(Some(workbook(&format!("{SHEETS}<pivotCaches/>"))));
+        pivot(&mut pkg);
+        let wb = part(&pkg, WB);
+        assert_eq!(count_local(&wb, "pivotCaches"), 1, "{wb}");
+    }
+
+    #[test]
+    fn workbook_slot_is_unknown_in_a_truncated_part() {
+        assert_eq!(
+            workbook_slot(r#"<workbook><sheets>"#, "calcPr"),
+            WorkbookSlot::Unknown
+        );
+        assert_eq!(
+            workbook_slot(r#"<workbook/>"#, "calcPr"),
+            WorkbookSlot::Unknown
+        );
         // With no root end tag, the calcPr append has nothing to go before.
         let out = ensure_full_calc("<workbook><sheets/>");
         assert_eq!(out, "<workbook><sheets/>");
