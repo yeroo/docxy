@@ -560,7 +560,9 @@ impl Session {
     /// [`gridcore::entry::seed_text`] — every digit of a number, a percent
     /// cell's `150%`, a quote prefix's apostrophe — as xlsxy and the suite
     /// seed theirs. grid.js commits the editor even when it is unchanged, so
-    /// a number past 15 significant digits comes back rounded to 15 here.
+    /// the cell is re-read: a number past 15 significant digits comes back
+    /// rounded to 15, and an E-notation seed (`1E300`) in a General cell
+    /// brings the scientific format `0.00E+00`.
     fn cell_seed(&self, row: u32, col: u32) -> String {
         let styles = &self.pkg.workbook.styles;
         match self.pkg.workbook.sheets[self.active].cell(row, col) {

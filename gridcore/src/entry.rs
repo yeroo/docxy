@@ -239,6 +239,23 @@ pub fn entry_cell(
     Ok(Cell { style, ..e.cell })
 }
 
+/// The formula body `text` makes in the first cell of the range
+/// `(r1, c1, r2, c2)` on `sheet` where it is a formula ([`typed_formula`]),
+/// for hosts that validate a Ctrl+Enter or a range put before
+/// [`entry_range`]: a Text cell takes `=…` as text, so the formula to check
+/// may be in any other cell, not only the active one. `None` when no cell of
+/// the range reads it as a formula.
+pub fn range_formula<'a>(
+    wb: &Workbook,
+    sheet: usize,
+    (r1, c1, r2, c2): (u32, u32, u32, u32),
+    text: &'a str,
+) -> Option<&'a str> {
+    (r1..=r2)
+        .flat_map(|r| (c1..=c2).map(move |c| (r, c)))
+        .find_map(|(r, c)| typed_formula(wb, sheet, r, c, text))
+}
+
 /// Ctrl+Enter: `text`, typed at `active`, entered into every cell of the
 /// range `(r1, c1, r2, c2)` on `sheet`. Each cell reads the entry under its
 /// own format rules; where that makes a formula (`=A1`, `+A1`, `@SUM(A1:A2)`)
@@ -409,11 +426,13 @@ fn input_text_styled(cell: &Cell, xf: &Xf) -> String {
 /// Anything else is [`input_text_styled`]: a formula's `=` source, and text
 /// with the `'` its re-entry needs.
 ///
-/// Re-entering the seed gives back the same cell except for a number with
+/// Re-entering the seed gives back the same value except for a number with
 /// more than 15 significant digits: typed entry keeps 15, as Excel does, so
-/// `0.30000000000000004` re-entered is 0.3. What keeps that last digit is
-/// the host leaving an unchanged seed uncommitted (xlsxy and the suite do;
-/// gridwasm re-commits it).
+/// `0.30000000000000004` re-entered is 0.3. The cell's format may change: an
+/// E-notation seed (`1E300`) re-entered into a General cell brings the
+/// scientific format `0.00E+00`, as any typed exponent does. What keeps the
+/// cell exactly as it was is the host leaving an unchanged seed uncommitted
+/// (xlsxy and the suite do; gridwasm re-commits it).
 pub fn seed_text(cell: &Cell, xf: &Xf) -> String {
     match &cell.value {
         CellValue::Number(n) if cell.formula.is_none() => {
@@ -1590,6 +1609,15 @@ mod tests {
             let e = parse_entry(&seed(n), &Xf::default(), &ctx()).unwrap();
             assert_eq!(e.cell.value, CellValue::Number(n), "{n}");
         }
+        // The value, not the format: an E-notation seed re-entered into a
+        // General cell brings the scientific format with it.
+        let e = parse_entry(&seed(1e300), &Xf::default(), &ctx()).unwrap();
+        assert_eq!(
+            entry_xf(&Xf::default(), &e).code.as_deref(),
+            Some("0.00E+00")
+        );
+        let e = parse_entry(&seed(123.25), &Xf::default(), &ctx()).unwrap();
+        assert!(is_general(&entry_xf(&Xf::default(), &e)));
         // Text keeps its re-entry apostrophe; a formula shows its source.
         let quoted = Xf {
             quote_prefix: true,

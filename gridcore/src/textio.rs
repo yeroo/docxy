@@ -917,9 +917,10 @@ pub fn sheet_text(sheet: &Sheet, styles: &Styles, date1904: bool, delim: char) -
 
 /// Formatted Text (Space delimited): each column padded to its width in
 /// characters, numbers right-aligned and text left-aligned. Text longer than
-/// its column is clipped; a General number too wide for it is written as
-/// Excel shows it in a column that wide (`0.333333`, `1.23E+08`); any other
-/// number too wide is `#`s. A number is never clipped.
+/// its column is clipped; a General number is written as the grid shows it,
+/// in at most 11 characters and with fewer decimals or in scientific notation
+/// when the column is narrower (`0.333333`, `1.23E+08`); any other number too
+/// wide is `#`s. A number is never clipped.
 pub fn sheet_prn(sheet: &Sheet, styles: &Styles, date1904: bool) -> String {
     let (rows, cols) = sheet.used_size();
     let mut out = String::new();

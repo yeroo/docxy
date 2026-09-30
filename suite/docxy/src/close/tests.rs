@@ -175,18 +175,30 @@ fn an_unfinished_formula_refuses_close_and_save_until_corrected() {
     };
     assert_eq!(v.editing.as_deref(), Some("=SUM(A1"));
     assert!(v.undo.is_empty());
-    // Corrected, it saves and then closes without asking.
+    // Corrected, it saves; the saved (clean) tab then closes without asking.
     v.editing = Some("=SUM(A1)".into());
     assert!(save_sheet_tab(&mut t, false, false, |_| panic!("asked")));
     assert!(path.is_file(), "{}", t.status);
     assert!(!t.dirty);
+    assert_eq!(close_step(&mut t, |_| panic!("asked")), CloseStep::Remove);
+    // Corrected in the editor and closed: the close commits it, so the tab
+    // is dirty with the formula in A1 when it asks; Discard removes it.
     let mut t = sheet_typing(&path, "=SUM(A1");
     let Surface::Sheet(v) = &mut t.surface else {
         panic!()
     };
     v.editing = Some("=SUM(A1)".into());
     assert_eq!(
-        close_step(&mut t, |_| Ok(CloseAnswer::Discard)),
+        close_step(&mut t, |t| {
+            assert!(t.dirty);
+            let Surface::Sheet(v) = &t.surface else {
+                panic!()
+            };
+            assert!(v.editing.is_none());
+            let a1 = v.sheet().cell(0, 0).and_then(|c| c.formula.clone());
+            assert_eq!(a1.as_deref(), Some("SUM(A1)"));
+            Ok(CloseAnswer::Discard)
+        }),
         CloseStep::Remove
     );
     let _ = std::fs::remove_dir_all(&dir);

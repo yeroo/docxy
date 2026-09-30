@@ -311,14 +311,12 @@ mod win {
                     let wb = &mut self.pkg.workbook;
                     // A Text cell takes `=…` as text; any other cell of the
                     // range would make it a formula, which must parse.
-                    let body = (r1..=r2)
-                        .flat_map(|r| (c1..=c2).map(move |c| (r, c)))
-                        .find_map(|(r, c)| gridcore::entry::typed_formula(wb, sheet, r, c, text));
+                    let rect = (r1, c1, r2, c2);
+                    let body = gridcore::entry::range_formula(wb, sheet, rect, text);
                     if let Some(Err(e)) = body.map(Engine::validate) {
                         log(&format!("put refused: formula error: {e}"));
                         return Err(E_FAIL);
                     }
-                    let rect = (r1, c1, r2, c2);
                     match gridcore::entry::entry_range(wb, sheet, rect, (r1, c1), text, today) {
                         Ok(cells) => {
                             for (r, c, cell) in cells {

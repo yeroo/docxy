@@ -264,6 +264,48 @@ fn the_editor_shows_one_line_per_line_feed_with_the_caret_on_its_line() {
 }
 
 #[test]
+fn ctrl_enter_checks_the_formula_in_every_cell_of_the_range() {
+    // A1 is Text (it would keep `=SUM(B1` as text), A2:A3 General: the
+    // formula they would get does not parse, so nothing is entered.
+    let mut v = view();
+    let text_fmt = v.pkg.workbook.styles.intern({
+        let mut xf = Xf::default();
+        xf.set_code(Some("@".into()));
+        xf
+    });
+    put(
+        &mut v,
+        0,
+        0,
+        Cell {
+            style: text_fmt,
+            ..Cell::default()
+        },
+    );
+    select(&mut v, 0, 0);
+    v.anchor = (2, 0);
+    type_fresh(&mut v, "=SUM(B1");
+    assert!(!v.commit_edit_to_selection());
+    assert!(
+        v.entry_error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("formula error"))
+    );
+    assert_eq!(v.editing.as_deref(), Some("=SUM(B1"));
+    for r in 0..3 {
+        assert!(v.sheet().cell(r, 0).is_none_or(|c| c.is_blank()), "row {r}");
+    }
+    // Finished, it commits: text in A1, formulas below.
+    v.editing = Some("=SUM(B1)".into());
+    v.entry_error = None;
+    assert!(v.commit_edit_to_selection());
+    assert_eq!(value(&v, 0, 0), CellValue::Text("=SUM(B1)".into()));
+    let f = |r| v.sheet().cell(r, 0).and_then(|c| c.formula.clone());
+    assert_eq!(f(1).as_deref(), Some("SUM(B2)"));
+    assert_eq!(f(2).as_deref(), Some("SUM(B3)"));
+}
+
+#[test]
 fn an_unfinished_formula_is_refused_and_the_editor_stays() {
     let mut v = view();
     type_fresh(&mut v, "=SUM(A1");

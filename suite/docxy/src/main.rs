@@ -473,8 +473,9 @@ struct SheetView {
     /// count each render; visible rows are re-measured every layout, so height
     /// changes take effect without an explicit reset.
     vlist: ListState,
-    /// Why the last commit was refused (an entry over the cell limit); the
-    /// host shows it in the status bar.
+    /// Why the last commit was refused (an entry over the cell limit, or a
+    /// formula that does not parse: `formula_error`); the host shows it in
+    /// the status bar.
     entry_error: Option<String>,
     /// Leftmost visible column (horizontal scroll offset). Columns virtualize by
     /// offset — rendered `col0..=cend` — so columns past the viewport are
@@ -1269,8 +1270,10 @@ impl SheetView {
     }
 
     /// Commit the cell buffer without moving the selection, including undo/recalc.
-    /// An entry the cell cannot hold (over 32,767 characters) is refused: the
-    /// editor stays open with its text and [`SheetView::entry_error`] says why.
+    /// An entry the cell cannot hold (over 32,767 characters) or a formula
+    /// that does not parse (`=SUM(A1`, [`SheetView::formula_error`]) is
+    /// refused: the editor stays open with its text and
+    /// [`SheetView::entry_error`] says why.
     fn commit_edit(&mut self) -> bool {
         self.entry_error = None;
         let untouched = self.edit_untouched();
@@ -1292,14 +1295,14 @@ impl SheetView {
             self.entry_error = Some(e.to_string());
             return false;
         }
-        if let Some(e) = self.formula_error(origin, buf) {
+        let (s, r, c) = origin;
+        if let Some(e) = self.formula_error(s, (r, c, r, c), buf) {
             self.entry_error = Some(e);
             return false;
         }
         let buf = self.editing.take().unwrap_or_default();
         self.end_cell_edit();
         self.push_undo();
-        let (s, r, c) = origin;
         let today = self.engine.clock;
         if let Ok(cell) = gridcore::entry::entry_cell(&mut self.pkg.workbook, s, r, c, &buf, today)
         {
@@ -1308,13 +1311,14 @@ impl SheetView {
         true
     }
 
-    /// Why `buf` cannot be committed into `(sheet, row, col)` as a formula
-    /// (`=SUM(A1` is unfinished), or `None` when it is no formula there or a
-    /// valid one. A refused formula keeps the editor open, as xlsxy's does,
+    /// Why `buf` cannot be committed into the cells `rect` of sheet `s` as a
+    /// formula (`=SUM(A1` is unfinished), or `None` when no cell of it reads
+    /// `buf` as a formula ([`gridcore::entry::range_formula`]: a Text cell
+    /// takes it as text) or the formula is valid. A refused formula keeps the editor open, as xlsxy's does,
     /// rather than storing a cell that never evaluates — which matters now
     /// that an Enter-mode arrow commits a half-typed formula.
-    fn formula_error(&self, (s, r, c): (usize, u32, u32), buf: &str) -> Option<String> {
-        let body = gridcore::entry::typed_formula(&self.pkg.workbook, s, r, c, buf)?;
+    fn formula_error(&self, s: usize, rect: (u32, u32, u32, u32), buf: &str) -> Option<String> {
+        let body = gridcore::entry::range_formula(&self.pkg.workbook, s, rect, buf)?;
         gridcore::engine::Engine::validate(body)
             .err()
             .map(|e| format!("formula error: {e}"))
@@ -1741,7 +1745,9 @@ impl SheetView {
             self.entry_error = Some(e.to_string());
             return false;
         }
-        if let Some(e) = self.formula_error((s, r, c), &buf) {
+        // Every cell of the range, not just the active one: a Text-formatted
+        // active cell takes `=SUM(B1` as text while the others would not.
+        if let Some(e) = self.formula_error(s, range, &buf) {
             self.entry_error = Some(e);
             return false;
         }
@@ -9775,8 +9781,9 @@ impl Docxy {
         cx.notify();
     }
 
-    /// After a commit: when the entry was refused (too long), say why in the
-    /// status bar and report it, so the caller leaves the editor open.
+    /// After a commit: when the entry was refused (over the cell limit, or a
+    /// formula that does not parse), say why in the status bar and report it,
+    /// so the caller leaves the editor open.
     fn sheet_entry_refused(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(err) = self.active_sheet_mut().and_then(|v| v.entry_error.take()) else {
             return false;
