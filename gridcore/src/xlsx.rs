@@ -25,8 +25,8 @@ use opccore::zipwrite::write_zip;
 use crate::formula::translate_formula;
 use crate::sheet::{
     Cell, CellMeta, CellValue, ColDef, DefinedName, NumFmt, Sheet, Styles, Table, Workbook, Xf,
-    cell_name, classify_builtin, classify_format_code, f_ref, is_array_f, parse_cell_name,
-    parse_range_name, with_ref,
+    cell_name, classify_builtin, classify_format_code, is_array_f, parse_cell_name,
+    parse_range_name, ref_starts_at, with_ref,
 };
 
 const OLE2: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
@@ -2674,20 +2674,14 @@ fn cell_xml(
             format!("<f{}>{}</f>", with_ref(fa, &anchor), esc_text(src)),
             true,
         ),
-        // An array whose ref starts elsewhere is a clone re-submitted at a
-        // new address (a paste): that ref names the source's block, not one
-        // this cell owns, so it covers its anchor.
-        (Some(src), Some(fa))
-            if is_array_f(fa)
-                && !f_ref(fa)
-                    .and_then(|r| r.split(':').next())
-                    .is_some_and(|tl| tl.eq_ignore_ascii_case(&anchor)) =>
-        {
-            (
-                format!("<f{}>{}</f>", with_ref(fa, &anchor), esc_text(src)),
-                true,
-            )
-        }
+        // An array whose ref starts elsewhere belongs to a cell moved
+        // without set_cell (a sort, say) or loaded that way: that ref names
+        // another block, so it covers its anchor. set_cell and paste
+        // re-anchor themselves.
+        (Some(src), Some(fa)) if is_array_f(fa) && !ref_starts_at(fa, &anchor) => (
+            format!("<f{}>{}</f>", with_ref(fa, &anchor), esc_text(src)),
+            true,
+        ),
         (Some(src), Some(fa)) => (format!("<f{fa}>{}</f>", esc_text(src)), is_array_f(fa)),
         (None, _) => (String::new(), false),
     };
@@ -8793,6 +8787,23 @@ b",
         for (r, c, cell) in crate::edit::fill_changes(&pkg.workbook.sheets[0], sel, down) {
             eng.set_cell(&mut pkg.workbook, (0, r, c), cell);
         }
+    }
+
+    #[test]
+    fn an_array_cell_moved_without_set_cell_is_written_covering_its_anchor() {
+        // Moved as a sort moves cells (Sheet::set_cell, no engine): the ref
+        // it carries names D1:D3, which the writer must not claim from D4.
+        let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SUM_BLOCK))).unwrap();
+        rebuild(&mut pkg); // a 1x1 result: no spill extent left to write from
+        let sheet = &mut pkg.workbook.sheets[0];
+        let cell = sheet.cells.remove(&(0, 3)).unwrap();
+        assert_eq!(cell.spill, None);
+        sheet.set_cell(5, 3, cell);
+        let ws = saved_sheet1(&pkg);
+        assert!(
+            ws.contains(r#"<c r="D6"><f t="array" ref="D6">SUM(A1:A5*A1:A5)</f><v>165</v></c>"#),
+            "{ws}"
+        );
     }
 
     #[test]

@@ -2232,6 +2232,9 @@ impl App {
                                 }
                             }
                         }
+                        // A pasted array anchor covers its own cell, not the
+                        // block it was copied from — even at the same address.
+                        gridcore::sheet::anchor_array_ref(&mut new_cell, r, c);
                         // Overwrite position wins over source-clear on overlap.
                         changes.retain(|&(cr, cc, _)| (cr, cc) != (r, c));
                         changes.push((r, c, new_cell));
@@ -8229,6 +8232,76 @@ mod tests {
                 r#"<c r="D2" s="{style}"><f t="array" ref="D2:D4">A2:A4*2</f><v>2</v></c>"#
             )),
             "{ws}"
+        );
+    }
+
+    /// A legacy CSE block over D1:D3 with a 1x1 result (nothing spills).
+    fn cse_sum_block() -> Cell {
+        Cell {
+            value: CellValue::Number(6.0),
+            formula: Some("SUM(A1:A3)".into()),
+            f_attrs: Some(" t=\"array\" ref=\"D1:D3\"".into()),
+            ..Cell::default()
+        }
+    }
+
+    fn f_attrs_at(app: &App, sheet: usize, r: u32, c: u32) -> Option<String> {
+        app.pkg.workbook.sheets[sheet].cell(r, c)?.f_attrs.clone()
+    }
+
+    #[test]
+    fn pasting_a_cse_block_onto_another_sheet_covers_only_its_cell() {
+        // The same address on another sheet: nothing moves, so only the
+        // paste itself can tell the source's block isn't this cell's.
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.open_prompt(PromptKind::AddSheet);
+        app.prompt.as_mut().unwrap().text = "Data".to_string();
+        app.commit_prompt();
+        app.pkg.workbook.sheets[1].set_cell(0, 3, cse_sum_block());
+        app.goto_sheet(1);
+        app.cur = (0, 3);
+        app.anchor = None;
+        app.copy(false);
+        app.goto_sheet(0);
+        app.cur = (0, 3);
+        app.paste();
+        assert_eq!(
+            f_attrs_at(&app, 0, 0, 3).as_deref(),
+            Some(" t=\"array\" ref=\"D1\"")
+        );
+        assert_eq!(
+            f_attrs_at(&app, 1, 0, 3).as_deref(),
+            Some(" t=\"array\" ref=\"D1:D3\"")
+        );
+        let saved = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
+        let ws = String::from_utf8_lossy(saved.part("xl/worksheets/sheet1.xml").unwrap());
+        assert!(
+            ws.contains(r#"<f t="array" ref="D1">SUM(A1:A3)</f>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn pasting_a_cse_block_back_after_it_moved_does_not_overlap_it() {
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].set_cell(0, 3, cse_sum_block());
+        let mut app = App::new(pkg, "t.xlsx");
+        app.os_clip = None;
+        app.cur = (0, 3);
+        app.anchor = None;
+        app.copy(false);
+        app.cur = (0, 0);
+        app.row_op(true); // the block moves to D2:D4
+        app.cur = (0, 3);
+        app.paste();
+        assert_eq!(
+            f_attrs_at(&app, 0, 1, 3).as_deref(),
+            Some(" t=\"array\" ref=\"D2:D4\"")
+        );
+        assert_eq!(
+            f_attrs_at(&app, 0, 0, 3).as_deref(),
+            Some(" t=\"array\" ref=\"D1\"")
         );
     }
 

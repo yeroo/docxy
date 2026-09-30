@@ -19,7 +19,7 @@ use crate::formula::{
 };
 use crate::sheet::{
     Cell, CellValue, MAX_COLS, MAX_ROWS, Sheet, Styles, Workbook, cell_name, f_ref, is_array_f,
-    with_ref,
+    ref_starts_at, with_ref,
 };
 
 /// Read pasted text as a value: formulas, plain numbers (incl. percent),
@@ -1116,6 +1116,17 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
         return;
     }
 
+    // An array ref that doesn't start at its own cell (one moved without
+    // set_cell, say by a sort) names another block. Re-anchor it before the
+    // shift: a clamped shift could otherwise make it look like this cell's.
+    for (&(r, c), cell) in wb.sheets[idx].cells.iter_mut() {
+        if let Some(fa) = cell.f_attrs.as_deref().filter(|a| is_array_f(a)) {
+            let anchor = cell_name(r, c);
+            if !ref_starts_at(fa, &anchor) {
+                cell.f_attrs = Some(with_ref(fa, &anchor));
+            }
+        }
+    }
     shift_grid(&mut wb.sheets[idx], &shift);
 
     for (s, sheet) in wb.sheets.iter_mut().enumerate() {
@@ -1131,13 +1142,16 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
                 let moved = f_ref(fa).and_then(|rf| {
                     adjust_formula_for_edit(rf, home_is_target, &target_name, &shift)
                 });
-                match moved {
-                    Some(m) if !m.contains('#') => *fa = with_ref(fa, &m),
-                    // A ref that lost its top-left never belonged to this
-                    // cell (a clone that kept its source's): it covers the
-                    // anchor alone.
-                    Some(_) => *fa = with_ref(fa, &cell_name(r, c)),
-                    None => {}
+                if let Some(m) = moved {
+                    *fa = with_ref(fa, &m);
+                }
+                // A block's ref starts at its anchor and keeps doing so under
+                // a shift. One that doesn't (#REF!, or clamped away from a
+                // cell moved without set_cell, say by a sort) never belonged
+                // to this cell: it covers the anchor alone.
+                let anchor = cell_name(r, c);
+                if !ref_starts_at(fa, &anchor) {
+                    *fa = with_ref(fa, &anchor);
                 }
             }
             let Some(src) = &cell.formula else {
@@ -2450,6 +2464,22 @@ mod tests {
         let d1 = w.sheets[0].cell(0, 3).unwrap();
         assert_eq!(d1.f_attrs.as_deref(), Some(" t=\"array\" ref=\"D1\""));
         assert_eq!(d1.formula.as_deref(), Some("B1*2"));
+    }
+
+    #[test]
+    fn a_stale_array_ref_clamped_by_a_row_delete_covers_its_own_anchor() {
+        // D2 holds a stale D1:D3 (moved without set_cell, say by a sort).
+        // Deleting row 1 clamps it to D1:D2 as D2 moves to D1: shifted, it
+        // would look like D1's own block.
+        let mut w = wb(&[("D2", with_f_attrs("A2*2", " t=\"array\" ref=\"D1:D3\""))]);
+        delete_rows(&mut w, 0, 0, 1);
+        let d1 = w.sheets[0].cell(0, 3).unwrap();
+        assert_eq!(d1.f_attrs.as_deref(), Some(" t=\"array\" ref=\"D1\""));
+        // A real block keeps its size through the same delete.
+        let mut w = wb(&[("D2", with_f_attrs("A2*2", " t=\"array\" ref=\"D2:D4\""))]);
+        delete_rows(&mut w, 0, 0, 1);
+        let d1 = w.sheets[0].cell(0, 3).unwrap();
+        assert_eq!(d1.f_attrs.as_deref(), Some(" t=\"array\" ref=\"D1:D3\""));
     }
 
     #[test]

@@ -178,6 +178,26 @@ pub(crate) fn with_ref(fa: &str, r: &str) -> String {
     }
 }
 
+/// Does the `ref` in preserved `<f>` attributes start at `anchor` (a cell
+/// name)? A block's ref always starts at the cell that holds it; one that
+/// starts elsewhere, or is missing, names a block this cell doesn't own.
+pub(crate) fn ref_starts_at(fa: &str, anchor: &str) -> bool {
+    f_ref(fa)
+        .and_then(|r| r.split(':').next())
+        .is_some_and(|tl| tl.eq_ignore_ascii_case(anchor))
+}
+
+/// Make an array formula copied into `(row, col)` cover that cell alone:
+/// its `ref` still names the source's block, which it does not own. A paste
+/// calls this for every pasted cell — even one landing at its source's own
+/// address, on another sheet or after the source moved. Other cells are
+/// left alone.
+pub fn anchor_array_ref(cell: &mut Cell, row: u32, col: u32) {
+    if let Some(fa) = cell.f_attrs.as_deref().filter(|a| is_array_f(a)) {
+        cell.f_attrs = Some(with_ref(fa, &cell_name(row, col)));
+    }
+}
+
 impl Cell {
     pub fn number(n: f64) -> Cell {
         Cell {

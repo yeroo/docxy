@@ -21,7 +21,9 @@ use crate::formula::{
     self, DynResult, Eval, ExcelError, Expr, Resolver, Value, always_recalc, collect_refs,
     contains_db_fn,
 };
-use crate::sheet::{Cell, CellValue, Sheet, Workbook, cell_name, f_ref, is_array_f, with_ref};
+use crate::sheet::{
+    Cell, CellValue, Sheet, Workbook, cell_name, is_array_f, ref_starts_at, with_ref,
+};
 
 /// (sheet index, row, col) — the engine's cell address.
 pub type Key = (usize, u32, u32);
@@ -207,10 +209,7 @@ impl Engine {
                     // A clone at a new address still names its source's
                     // block: it covers its own anchor instead.
                     let anchor = cell_name(r, c);
-                    let own = f_ref(fa)
-                        .and_then(|rf| rf.split(':').next())
-                        .is_some_and(|tl| tl.eq_ignore_ascii_case(&anchor));
-                    if !own {
+                    if !ref_starts_at(fa, &anchor) {
                         cell.f_attrs = Some(with_ref(fa, &anchor));
                     }
                 }
