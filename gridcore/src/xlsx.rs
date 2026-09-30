@@ -5025,9 +5025,12 @@ const CT_WORKBOOK_ORDER: [&str; 19] = [
 /// Where a new top-level `<tag>` goes in workbook.xml, with the root's
 /// namespace prefix (`"x:"`, or `""`): before the first child the schema
 /// ranks after `tag`, else before the root's end tag. Children the schema
-/// doesn't name (`mc:AlternateContent`, …) are not anchors. `None` when the
-/// part has no root end tag to fall back on (truncated, or a self-closing
-/// root).
+/// doesn't name (`mc:AlternateContent`, …) are not anchors.
+///
+/// `None` when the workbook already has a `<tag>` in any prefix (a caller
+/// matching only the unprefixed name must not add a second), or when the
+/// walk can't see every child to be sure it hasn't: a truncated part, or a
+/// self-closing root.
 fn workbook_insert_pos(xml: &str, tag: &str) -> Option<(usize, String)> {
     let rank_of = |name: &str| CT_WORKBOOK_ORDER.iter().position(|&t| t == name);
     let rank = rank_of(tag).unwrap_or(CT_WORKBOOK_ORDER.len());
@@ -5044,11 +5047,16 @@ fn workbook_insert_pos(xml: &str, tag: &str) -> Option<(usize, String)> {
         Some((pfx, _)) => format!("{pfx}:"),
         None => String::new(),
     };
+    let mut at = None;
     loop {
         match p.next() {
             Event::Start => {
-                if rank_of(local(p.name())).is_some_and(|r| r > rank) {
-                    return Some((p.start_pos(), prefix));
+                let name = local(p.name());
+                if name == tag {
+                    return None;
+                }
+                if at.is_none() && rank_of(name).is_some_and(|r| r > rank) {
+                    at = Some(p.start_pos());
                 }
                 if !p.skip_element_complete() {
                     return None;
@@ -5056,9 +5064,8 @@ fn workbook_insert_pos(xml: &str, tag: &str) -> Option<(usize, String)> {
             }
             Event::End => {
                 // The root's end tag (a self-closing root has no `</`).
-                let end = p.pos();
-                let at = xml[..end].rfind("</")?;
-                return Some((at, prefix));
+                let end = xml[..p.pos()].rfind("</")?;
+                return Some((at.unwrap_or(end), prefix));
             }
             Event::Text => {}
             Event::Eof => return None,
@@ -14473,6 +14480,53 @@ mod ct_workbook_order_tests {
             out.contains(r#"<x:sheets/><x:calcPr calcId="0" fullCalcOnLoad="1"/><x:pivotCaches/>"#),
             "{out}"
         );
+    }
+
+    /// Top-level `<…tag>` elements in `xml`, in any prefix.
+    fn count_local(xml: &str, tag: &str) -> usize {
+        let mut p = XmlParser::new(xml);
+        let mut n = 0;
+        loop {
+            match p.next() {
+                Event::Start if local(p.name()) == tag => n += 1,
+                Event::Eof => return n,
+                _ => {}
+            }
+        }
+    }
+
+    fn prefixed(inner: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?><x:workbook xmlns:x="{NS}" xmlns:r="{R}"><x:sheets><x:sheet name="Sheet1" sheetId="1" r:id="rId1"/></x:sheets>{inner}</x:workbook>"#
+        )
+    }
+
+    #[test]
+    fn a_prefixed_calc_pr_is_not_added_twice_at_save() {
+        let mut pkg = with_data(Some(prefixed(r#"<x:calcPr calcId="1"/>"#)));
+        pkg.workbook.sheets[0].set_cell(3, 1, Cell::formula("SUM(B2:B3)"));
+        let saved = load_xlsx(&save_xlsx(&pkg)).expect("reload");
+        let wb = part(&saved, WB);
+        assert_eq!(count_local(&wb, "calcPr"), 1, "{wb}");
+    }
+
+    #[test]
+    fn add_pivot_does_not_add_a_second_prefixed_pivot_caches() {
+        let caches = r#"<x:pivotCaches><x:pivotCache cacheId="7" r:id="rId9"/></x:pivotCaches>"#;
+        let mut pkg = with_data(Some(prefixed(caches)));
+        pivot(&mut pkg);
+        let wb = part(&pkg, WB);
+        assert_eq!(count_local(&wb, "pivotCaches"), 1, "{wb}");
+    }
+
+    #[test]
+    fn workbook_insert_pos_has_no_position_for_a_tag_already_there() {
+        let wb = prefixed(r#"<x:calcPr calcId="1"/><x:extLst/>"#);
+        assert_eq!(workbook_insert_pos(&wb, "calcPr"), None);
+        // Even out of order, past the place it would go.
+        let wb = prefixed(r#"<x:extLst/><x:calcPr calcId="1"/>"#);
+        assert_eq!(workbook_insert_pos(&wb, "calcPr"), None);
+        assert!(workbook_insert_pos(&wb, "pivotCaches").is_some());
     }
 
     #[test]
