@@ -207,7 +207,8 @@ mod tests {
         assert_eq!(
             e,
             format!(
-                "=== startup 1970-01-01T00:00:00Z pid 4242 docxy {} thread main\ncontrol unavailable\n\n",
+                "=== startup 1970-01-01T00:00:00Z pid 4242 docxy {} thread main\n\
+                 control unavailable\n\n",
                 env!("CARGO_PKG_VERSION")
             )
         );
@@ -291,8 +292,8 @@ mod tests {
     /// The child half of [`a_panic_is_written_to_the_crash_log`]. It installs
     /// the hook exactly as `main` does — the hook is process-global, so this
     /// must never run in the parent — then panics twice on a named thread and
-    /// once on its own thread. The second message carries its line so the parent can check
-    /// the logged location.
+    /// once on its own thread. That last message carries its line so the
+    /// parent can check the logged location.
     #[test]
     fn crash_child() {
         if std::env::var_os(CHILD_ENV).is_none() {
@@ -337,12 +338,7 @@ mod tests {
 
         let log = std::fs::read_to_string(log_path(&root.0)).unwrap_or_default();
         let entries: Vec<&str> = log.split("=== ").filter(|e| !e.is_empty()).collect();
-        assert_eq!(
-            entries.len(),
-            3,
-            "one entry per panic:
-{log}"
-        );
+        assert_eq!(entries.len(), 3, "one entry per panic:\n{log}");
 
         for (probe, message) in entries[..2]
             .iter()
@@ -350,25 +346,13 @@ mod tests {
         {
             assert!(probe.starts_with("panic "), "{probe}");
             assert!(probe.contains(&format!(" pid {pid} ")), "{probe}");
-            assert!(
-                probe.contains(
-                    " thread crash-probe
-"
-                ),
-                "{probe}"
-            );
+            assert!(probe.contains(" thread crash-probe\n"), "{probe}");
             assert!(probe.contains(message), "{probe}");
             assert!(
                 probe.contains(&format!("panicked at {}:", file!())),
                 "{probe}"
             );
-            assert!(
-                probe.contains(
-                    "backtrace:
-"
-                ),
-                "{probe}"
-            );
+            assert!(probe.contains("backtrace:\n"), "{probe}");
         }
 
         let main = entries[2];
