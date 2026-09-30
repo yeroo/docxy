@@ -4881,6 +4881,61 @@ pub fn collect_iterated_tables(e: &Expr, out: &mut Vec<String>) {
     }
 }
 
+/// Is this a database function (`DSUM(database, field, criteria)` and kin)?
+pub fn is_db_fn(name: &str) -> bool {
+    matches!(
+        name,
+        "DSUM"
+            | "DAVERAGE"
+            | "DMAX"
+            | "DMIN"
+            | "DPRODUCT"
+            | "DCOUNT"
+            | "DCOUNTA"
+            | "DGET"
+            | "DVAR"
+            | "DVARP"
+            | "DSTDEV"
+            | "DSTDEVP"
+    )
+}
+
+/// The (database, criteria) ranges of every D-function call written with
+/// literal ranges, e.g. `DSUM(A1:C8,"Amount",F1:F2)`. A computed criterion in
+/// that criteria range reads cells relative to each record, so the engine
+/// widens its references over the database's rows.
+pub fn collect_db_ranges(e: &Expr, out: &mut Vec<(Expr, Expr)>) {
+    match e {
+        Expr::Func(name, args) => {
+            if is_db_fn(name) {
+                if let [db @ Expr::Range(..), _, crit @ Expr::Range(..)] = args.as_slice() {
+                    out.push((db.clone(), crit.clone()));
+                }
+            }
+            for a in args {
+                collect_db_ranges(a, out);
+            }
+        }
+        Expr::Call(callee, args) => {
+            collect_db_ranges(callee, out);
+            for a in args {
+                collect_db_ranges(a, out);
+            }
+        }
+        Expr::ArrayLit(rows) => {
+            for x in rows.iter().flatten() {
+                collect_db_ranges(x, out);
+            }
+        }
+        Expr::Un(_, x) => collect_db_ranges(x, out),
+        Expr::Bin(_, l, r) => {
+            collect_db_ranges(l, out);
+            collect_db_ranges(r, out);
+        }
+        _ => {}
+    }
+}
+
 /// Is this one of the dynamic-array functions resolved in `eval_arg` (they
 /// can return matrices)?
 fn is_array_fn(name: &str) -> bool {
@@ -7986,8 +8041,7 @@ impl<'a> Eval<'a> {
             }
 
             // ---- database functions --------------------------------------------
-            "DSUM" | "DAVERAGE" | "DMAX" | "DMIN" | "DPRODUCT" | "DCOUNT" | "DCOUNTA" | "DGET"
-            | "DVAR" | "DVARP" | "DSTDEV" | "DSTDEVP" => {
+            name if is_db_fn(name) => {
                 let cells = match self.db_query(args) {
                     Ok(c) => c,
                     Err(v) => return v,

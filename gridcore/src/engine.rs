@@ -693,6 +693,57 @@ fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth:
     if depth >= 8 {
         return;
     }
+    // A computed D-function criterion is evaluated once per database record
+    // with its relative references shifted down to that record, so it reads
+    // its references' rows over the whole database: depend on all of them.
+    let mut db_ranges = Vec::new();
+    formula::collect_db_ranges(ast, &mut db_ranges);
+    for (db, crit) in db_ranges {
+        let (Expr::Range(da, db_end), Expr::Range(ca, cb)) = (&db, &crit) else {
+            continue;
+        };
+        // Rows below the database's header: one per record.
+        let records = (da.row - db_end.row).unsigned_abs() as u32;
+        let cs = match &ca.sheet {
+            None => Some(sheet),
+            Some(name) => wb.sheet_index(name),
+        };
+        let Some(sh) = cs.and_then(|s| wb.sheets.get(s)) else {
+            continue;
+        };
+        let (r1, r2) = (ca.row.min(cb.row), ca.row.max(cb.row));
+        let (c1, c2) = (ca.col.min(cb.col), ca.col.max(cb.col));
+        if r1 < 0 || c1 < 0 {
+            continue;
+        }
+        for r in (r1 + 1)..=r2 {
+            for c in c1..=c2 {
+                let (r, c) = (r as u32, c as u32);
+                let Some(src) = sh.cell(r, c).and_then(|cl| cl.formula.as_deref()) else {
+                    continue;
+                };
+                let Ok(crit_ast) = formula::parse(src) else {
+                    continue;
+                };
+                let mut rects = Vec::new();
+                collect_deps(
+                    wb,
+                    (cs.unwrap_or(sheet), r, c),
+                    &crit_ast,
+                    &mut rects,
+                    depth + 1,
+                );
+                // Record k (0-based) shifts the formula down k rows; there
+                // are `records` records below the database's header.
+                let span = records.saturating_sub(1);
+                out.extend(
+                    rects
+                        .into_iter()
+                        .map(|(s, a, b, c2, d)| (s, a, b, c2.saturating_add(span), d)),
+                );
+            }
+        }
+    }
     let mut names = Vec::new();
     formula::collect_names(ast, &mut names);
     // Function-call names too: `f(3)` may be a defined-name LAMBDA whose
@@ -1653,6 +1704,34 @@ mod tests {
                 .circular_refs()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn computed_criteria_follow_cells_outside_the_database() {
+        // r1 m5: AA2 = E2>0 reads helper column E beside the database; the
+        // DSUM depends on E over every record's row, so editing E5 updates
+        // it.
+        let mut cells: Vec<(String, Cell)> = vec![
+            ("A1".into(), Cell::text("Rep")),
+            ("C1".into(), Cell::text("Amount")),
+        ];
+        for r in 2..=8 {
+            cells.push((format!("A{r}"), Cell::text(&format!("R{r}"))));
+            cells.push((format!("C{r}"), Cell::number(10.0 * r as f64)));
+            cells.push((format!("E{r}"), Cell::number(0.0)));
+        }
+        cells.push(("E2".into(), Cell::number(1.0)));
+        cells.push(("AA2".into(), Cell::formula("E2>0")));
+        cells.push(("K1".into(), Cell::formula("DSUM(A1:C8,\"Amount\",AA1:AA2)")));
+        let refs: Vec<(&str, Cell)> = cells.iter().map(|(k, c)| (k.as_str(), c.clone())).collect();
+        let mut wb = wb_one_sheet(&refs);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(20.0));
+        set(&mut eng, &mut wb, "E5", Cell::number(1.0));
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(70.0));
+        set(&mut eng, &mut wb, "E8", Cell::number(2.0));
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(150.0));
     }
 
     // ---- dynamic arrays / spilling ------------------------------------
