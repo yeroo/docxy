@@ -15,7 +15,7 @@
 //!
 //! | Verb | Args | Result |
 //! |---|---|---|
-//! | `wb.path` | — | `{path, modified, sheets, active, active_name}` |
+//! | `wb.path` | — | `{path, modified, sheets, active, active_name, circular}` |
 //! | `sheet.list` | — | `{active, sheets:[{index, name, rows, cols}]}` |
 //! | `sheet.read` | `{sheet?, range?}` | `{sheet, name, rows, cols, cells:[…], truncated}` |
 //! | `cell.get` | `{ref, sheet?}` | `{ref, row, col, value, formula?, text}` |

@@ -1216,11 +1216,13 @@ impl App {
     }
 
     /// Excel's circular-reference warning, once, when a cell edit put a
-    /// cell on a circle that was not on one before.
+    /// cell on a circle that was not on one before. Like a structural edit's,
+    /// it is added to the caller's own status ("Pasted", "Filled", …) by
+    /// [`App::flush_circle_warning`].
     fn warn_new_circles(&mut self, before: &[(usize, u32, u32)]) {
         let now = self.engine.circular_refs();
         if self.circles_shown() && now.iter().any(|k| !before.contains(k)) {
-            self.status = Some(CIRCULAR_WARNING.into());
+            self.circle_warning_pending = true;
         }
     }
 
@@ -5848,6 +5850,23 @@ fn draw_comments_panel(app: &App, f: &mut Frame, area: Rect) {
 // ---------------------------------------------------------------------------
 
 /// Returns true when the app should exit.
+/// Run one control verb. A circle it made is announced on its own, or
+/// after the status the verb set, never appended to an earlier action's
+/// leftover status; a verb that says nothing leaves that status alone.
+fn run_control(
+    app: &mut App,
+    verb: &str,
+    args: &ctlcore::json::Json,
+) -> Result<ctlcore::json::Json, String> {
+    let before = app.status.take();
+    let result = control::dispatch(app, verb, args);
+    if app.status.is_none() && !app.circle_warning_pending {
+        app.status = before;
+    }
+    app.flush_circle_warning();
+    result
+}
+
 fn handle_event(app: &mut App, ev: Event) -> bool {
     let quit = match ev {
         Event::Key(key) => handle_key(app, key),
@@ -6507,13 +6526,10 @@ fn run_tui(
                         quit = true;
                     }
                 }
-                Msg::Ctl(req) => {
-                    match control::dispatch(&mut app, &req.verb, &req.args) {
-                        Ok(result) => req.reply_ok(result),
-                        Err(e) => req.reply_err(e),
-                    }
-                    app.flush_circle_warning();
-                }
+                Msg::Ctl(req) => match run_control(&mut app, &req.verb, &req.args) {
+                    Ok(result) => req.reply_ok(result),
+                    Err(e) => req.reply_err(e),
+                },
             }
             if quit {
                 break;
@@ -7468,6 +7484,7 @@ mod tests {
         let mut app = App::new(new_xlsx(), "t.xlsx");
         app.os_clip = None;
         app.apply_on(0, vec![(0, 4, parse_input("=E1+1"))]);
+        app.flush_circle_warning();
         assert_eq!(app.status.as_deref(), Some(CIRCULAR_WARNING));
         assert_eq!(
             app.sheet().cell(0, 4).unwrap().value,
@@ -7482,6 +7499,7 @@ mod tests {
         app.status = None;
         app.apply_on(0, vec![(3, 0, parse_input("7"))]);
         app.apply_on(0, vec![(0, 7, parse_input("=E1+5"))]);
+        app.flush_circle_warning();
         assert_eq!(app.status, None);
         assert_eq!(app.circular_refs(), vec!["E1".to_string()]);
 
@@ -7493,6 +7511,7 @@ mod tests {
         });
         app.rebuild_engine();
         app.apply_on(1, vec![(0, 0, parse_input("=A1*2"))]);
+        app.flush_circle_warning();
         assert_eq!(app.status.as_deref(), Some(CIRCULAR_WARNING));
         assert_eq!(
             app.circular_refs(),
@@ -7578,6 +7597,53 @@ mod tests {
     }
 
     #[test]
+    fn a_paste_that_makes_a_circle_warns_after_pasted() {
+        // #660: cutting A1 (=B1) and pasting it into B1 makes B1 read
+        // itself; the warning follows the paste's own status.
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.apply_on(0, vec![(0, 0, parse_input("=B1"))]);
+        app.flush_circle_warning();
+        app.cur = (0, 0);
+        app.anchor = None;
+        app.copy(true);
+        app.cur = (0, 1);
+        app.paste();
+        app.flush_circle_warning();
+        assert_eq!(app.circular_refs(), vec!["B1".to_string()]);
+        assert_eq!(
+            app.status.as_deref(),
+            Some(format!("Pasted. {CIRCULAR_WARNING}").as_str())
+        );
+    }
+
+    #[test]
+    fn a_control_verbs_circle_warning_ignores_stale_status() {
+        // #660: a verb that makes a circle shows the warning alone, not
+        // appended to an earlier action's status; a verb that says nothing
+        // leaves that status as it was.
+        use ctlcore::json::Json;
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        let set = |app: &mut App, r: &str, t: &str| {
+            run_control(
+                app,
+                "cell.set",
+                &Json::obj(vec![
+                    ("ref", Json::Str(r.into())),
+                    ("text", Json::Str(t.into())),
+                ]),
+            )
+            .unwrap();
+        };
+        app.status = Some("Saved report.xlsx".into());
+        set(&mut app, "A1", "5");
+        assert_eq!(app.status.as_deref(), Some("Saved report.xlsx"));
+        set(&mut app, "E1", "=E1+1");
+        assert_eq!(app.status.as_deref(), Some(CIRCULAR_WARNING));
+    }
+
+    #[test]
     fn iterative_workbooks_do_not_surface_their_circles() {
         // #660: with iterative calculation on, Excel shows neither the
         // warning nor the status-bar note; the engine still knows the circle.
@@ -7595,6 +7661,7 @@ mod tests {
         assert!(!text.contains("Circular References"), "{text}");
         // A new circle by a cell edit does not warn either.
         app.apply_on(0, vec![(0, 4, parse_input("=E1+1"))]);
+        app.flush_circle_warning();
         assert_eq!(app.status, None);
     }
 
