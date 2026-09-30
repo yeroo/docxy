@@ -15227,7 +15227,9 @@ fn sheet_save_decision(
 }
 
 /// Run the complete workbook Save sequence without a GPUI window. Returns
-/// false only when a harness cannot open the dialog needed to choose a target.
+/// false when the cell editor holds an entry the sheet refuses (nothing is
+/// written; the status says why) or a harness cannot open the dialog needed
+/// to choose a target.
 fn save_sheet_tab(
     tab: &mut DocTab,
     harness: bool,
@@ -15235,7 +15237,9 @@ fn save_sheet_tab(
     pick: impl FnOnce(String) -> Option<PathBuf>,
 ) -> bool {
     // Commit before choosing a target so the decision and write see the edit.
-    close::prepare_sheet_save(tab);
+    if close::prepare_sheet_save(tab).is_err() {
+        return false;
+    }
     match sheet_save_decision(tab.path.as_deref(), &tab.title, harness, explicit_save_as) {
         SheetSaveDecision::InPlace(path) => {
             finish_sheet_save(tab, Some(&path));
@@ -15276,8 +15280,7 @@ const SHEET_SAVE_FORMATS: &str = "Workbooks can only be saved as .xlsx, .xlsm, .
 /// makes first, then the write the dialog's answer feeds. Returns whether the
 /// file was written.
 fn save_sheet_to(tab: &mut DocTab, target: &std::path::Path) -> bool {
-    close::prepare_sheet_save(tab);
-    finish_sheet_save(tab, Some(target))
+    close::prepare_sheet_save(tab).is_ok() && finish_sheet_save(tab, Some(target))
 }
 
 /// Write the workbook tab to `target` (`None` is a cancelled dialog). The tab

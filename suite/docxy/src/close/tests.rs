@@ -134,6 +134,64 @@ fn invalid_project_buffer_refuses_even_discard_and_correction_clears_status() {
     assert!(t.dirty);
 }
 
+/// A workbook tab saved at `path` whose A1 editor holds `buffer`, typed.
+fn sheet_typing(path: &std::path::Path, buffer: &str) -> DocTab {
+    let mut t = tab(Kind::Xlsx);
+    t.path = Some(path.to_path_buf());
+    let Surface::Sheet(v) = &mut t.surface else {
+        panic!()
+    };
+    v.sel = (0, 0);
+    v.anchor = (0, 0);
+    v.begin_cell_edit(Some(buffer.into()));
+    t
+}
+
+#[test]
+fn an_unfinished_formula_refuses_close_and_save_until_corrected() {
+    let dir = close_test_dir("unfinished-formula");
+    let path = dir.join("book.xlsx");
+    let mut t = sheet_typing(&path, "=SUM(A1");
+    // Close refuses, with Discard as the answer too: the editor keeps it.
+    for answer in [CloseAnswer::Discard, CloseAnswer::Save] {
+        let step = close_step(&mut t, |_| Ok(answer));
+        let CloseStep::Refuse(message) = step else {
+            panic!("{answer:?}: {step:?}")
+        };
+        assert!(message.starts_with("formula error"), "{message}");
+        let Surface::Sheet(v) = &t.surface else {
+            panic!()
+        };
+        assert_eq!(v.editing.as_deref(), Some("=SUM(A1"));
+    }
+    // Save refuses before writing: no file, the tab as it was.
+    assert!(!save_sheet_tab(&mut t, false, false, |_| panic!("asked")));
+    assert!(!save_sheet_to(&mut t, &path));
+    assert!(!path.exists());
+    assert!(!t.dirty);
+    assert!(t.status.starts_with("formula error"), "{}", t.status);
+    let Surface::Sheet(v) = &mut t.surface else {
+        panic!()
+    };
+    assert_eq!(v.editing.as_deref(), Some("=SUM(A1"));
+    assert!(v.undo.is_empty());
+    // Corrected, it saves and then closes without asking.
+    v.editing = Some("=SUM(A1)".into());
+    assert!(save_sheet_tab(&mut t, false, false, |_| panic!("asked")));
+    assert!(path.is_file(), "{}", t.status);
+    assert!(!t.dirty);
+    let mut t = sheet_typing(&path, "=SUM(A1");
+    let Surface::Sheet(v) = &mut t.surface else {
+        panic!()
+    };
+    v.editing = Some("=SUM(A1)".into());
+    assert_eq!(
+        close_step(&mut t, |_| Ok(CloseAnswer::Discard)),
+        CloseStep::Remove
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn header_and_footer_buffers_are_flushed_before_asking() {
     for is_header in [true, false] {
@@ -927,7 +985,7 @@ fn preparing_a_changed_cell_for_save_marks_dirty_and_collapses_selection() {
     };
     v.anchor = (2, 2);
     v.begin_cell_edit(Some("abc".into()));
-    prepare_sheet_save(&mut t);
+    prepare_sheet_save(&mut t).unwrap();
     assert!(t.dirty);
     let Surface::Sheet(v) = &t.surface else {
         panic!()
