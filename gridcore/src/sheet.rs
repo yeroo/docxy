@@ -2354,4 +2354,22 @@ mod tests {
         assert!(serial_to_parts(-1.0, false).is_none());
         assert!(serial_to_parts(45306.0, false).is_some()); // 2024-01-15 ok
     }
+
+    #[test]
+    fn set_row_filtered_marks_and_clears() {
+        // #678: a filter's hide marks the row filter-hidden; unhiding clears
+        // the mark; a hand hide is never filtered.
+        let mut s = Sheet::default();
+        s.set_row_filtered(2, true);
+        assert!(s.row_hidden(2) && s.row_filtered(2));
+        s.set_row_filtered(2, false);
+        assert!(!s.row_hidden(2) && !s.row_filtered(2));
+        assert!(s.filtered_rows.is_empty());
+        s.set_row_hidden(3, true);
+        assert!(s.row_hidden(3) && !s.row_filtered(3));
+        // A marked row unhidden by hand is no longer filtered.
+        s.set_row_filtered(4, true);
+        s.set_row_hidden(4, false);
+        assert!(!s.row_filtered(4));
+    }
 }
