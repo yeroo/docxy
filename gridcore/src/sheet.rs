@@ -2475,7 +2475,7 @@ mod tests {
     }
 
     #[test]
-    fn general_fits_its_width_as_the_grid_shows_it() {
+    fn general_fits_its_width_as_excel_shows_it() {
         assert_eq!(fmt_general_fit(1.0 / 3.0, 8).as_deref(), Some("0.333333"));
         assert_eq!(fmt_general_fit(12.345678, 8).as_deref(), Some("12.34568"));
         assert_eq!(

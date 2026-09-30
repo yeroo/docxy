@@ -1053,9 +1053,6 @@ fn range_text_to_columns(app: &mut App, args: &Json) -> Result<Json, String> {
             gridcore::edit::TTC_REPLACE
         ));
     }
-    if app.sheet != si {
-        app.sheet = si;
-    }
     let rows = app.apply_text_to_columns(&src, &opts);
     Ok(Json::obj(vec![("rows", Json::Num(rows as f64))]))
 }
@@ -2551,7 +2548,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A failed load is the verb's error, not a quiet success.
     /// Formatted Text and Web Page cannot be read back: reload refuses and
     /// changes nothing.
     #[test]
@@ -2580,6 +2576,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A CSV-bound workbook reloads with the delimiter it was saved with:
+    /// a first row with as many `;` as `,` is not re-split, and saving again
+    /// writes the same bytes.
+    #[test]
+    fn wb_reload_of_a_csv_keeps_its_delimiter() {
+        let dir = std::env::temp_dir().join(format!("xlsxy-reload-csv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("book.csv");
+        let mut a = app();
+        set(&mut a, "A1", "Name;Alias");
+        set(&mut a, "B1", "x");
+        set(&mut a, "A2", "'1,5");
+        a.request_save_as(path.to_string_lossy().into_owned());
+        let first = std::fs::read(&path).unwrap();
+        dispatch(&mut a, "wb.reload", &Json::Null).unwrap();
+        assert_eq!(get_value(&a, "A1"), CellValue::Text("Name;Alias".into()));
+        assert_eq!(get_value(&a, "B1"), CellValue::Text("x".into()));
+        assert_eq!(get_value(&a, "A2"), CellValue::Text("1,5".into()));
+        dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Text to Columns on another sheet leaves the current sheet as it is,
+    /// and its undo and redo restore that other sheet.
+    #[test]
+    fn range_text_to_columns_on_another_sheet_keeps_the_current_one() {
+        let mut a = app();
+        dispatch(&mut a, "sheet.add", &Json::Null).unwrap();
+        a.sheet = 0;
+        let s1 = |a: &App, r: u32, c: u32| {
+            a.pkg.workbook.sheets[1]
+                .cell(r, c)
+                .map(|c| c.value.clone())
+                .unwrap_or_default()
+        };
+        a.pkg.workbook.sheets[1].set_cell(0, 0, gridcore::sheet::Cell::text("a\tb"));
+        a.rebuild_engine();
+        dispatch(
+            &mut a,
+            "range.text-to-columns",
+            &Json::obj(vec![
+                ("range", Json::Str("A1".into())),
+                ("sheet", Json::Num(1.0)),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(a.sheet, 0);
+        assert_eq!(s1(&a, 0, 1), CellValue::Text("b".into()));
+        a.undo();
+        assert_eq!(s1(&a, 0, 0), CellValue::Text("a\tb".into()));
+        assert_eq!(s1(&a, 0, 1), CellValue::Empty);
+        a.redo();
+        assert_eq!(s1(&a, 0, 1), CellValue::Text("b".into()));
+    }
+
+    /// A failed load is the verb's error, not a quiet success.
     #[test]
     fn wb_open_of_a_missing_workbook_is_an_error() {
         let mut a = app();

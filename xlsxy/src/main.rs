@@ -2643,9 +2643,10 @@ impl App {
         }
     }
 
-    /// Save As to a typed path: the type follows its extension (`out.csv` is
-    /// CSV UTF-8, never a workbook under a `.csv` name); an extension no type
-    /// has keeps the workbook package.
+    /// Save As to a typed path: the type the workbook is bound to while the
+    /// name keeps that type's extension, else the type its extension names
+    /// (`out.csv` is CSV UTF-8, never a workbook under a `.csv` name); an
+    /// extension no type has keeps the workbook package.
     fn request_save_as(&mut self, path: String) {
         // The type the workbook is bound to wins while the name keeps its
         // extension: Unicode Text or CSV (Comma delimited) saved again stays
@@ -3595,22 +3596,28 @@ impl App {
     /// them and changes nothing.
     fn reload(&mut self) -> Result<(), String> {
         let path = self.path.clone();
-        let bound = self.bound_text_type();
-        if let Some(t) = bound {
-            if !matches!(save_kind(&SAVE_TYPES[t]), SaveKind::Text { .. }) {
-                return Err(format!(
-                    "{} cannot be read back; reload is not available for this file",
-                    SAVE_TYPES[t].label
-                ));
-            }
-        }
-        self.open_without_wizard(&path)?;
-        if let Some(t) = bound {
-            self.path = path;
-            self.text_type = Some(t);
-            // The text file is the save target itself, not a source to guard.
-            self.import_source = None;
-        }
+        let Some(t) = self.bound_text_type() else {
+            return self.open_without_wizard(&path);
+        };
+        let SaveKind::Text { delim, .. } = save_kind(&SAVE_TYPES[t]) else {
+            return Err(format!(
+                "{} cannot be read back; reload is not available for this file",
+                SAVE_TYPES[t].label
+            ));
+        };
+        // Read back with the delimiter it was written with, never a sniffed
+        // one: a first row with as many `;` as `,` must not re-split.
+        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+        let text = gridcore::textio::decode(&bytes, gridcore::textio::Origin::Auto);
+        let pkg = text_to_pkg(
+            &text,
+            &file_stem(&path),
+            &TextParse::csv(delim),
+            &self.text_open(),
+        );
+        // The text file is the save target itself, not a source to guard.
+        self.install_workbook(pkg, path, None);
+        self.text_type = Some(t);
         Ok(())
     }
 
