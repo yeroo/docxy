@@ -164,13 +164,75 @@ enum BorderDisplay {
     NotFirstPage,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct BorderSide {
-    /// Line width in points (`w:sz` is in eighths of a point).
+    /// Line width in points (`w:sz` is in eighths of a point; in points for
+    /// an art border).
     width: f32,
     /// Distance from the text (or page edge), in points.
     space: f32,
     color: (f32, f32, f32),
+    style: BorderStyle,
+}
+
+/// How a border side is stroked (`w:val`, ECMA-376 §17.18.2).
+#[derive(Debug, Clone, PartialEq)]
+enum BorderStyle {
+    /// One solid line: `single`, `thick`, and the styles drawn as it for now
+    /// (`wave`, `doubleWave`, `dashDotStroked`, the 3-D styles).
+    Single,
+    /// Parallel solid lines, innermost first: whether each is thin (a third of
+    /// the side's width), and the gap between them in widths of the thin line
+    /// (or of the line, when none is thin).
+    Lines { thin: Vec<bool>, gap: f32 },
+    /// A dash array in multiples of the line width.
+    Dashes(Vec<f32>),
+    /// An art border (`apples`, `basicBlackDots`, …): a dashed band, since
+    /// the artwork isn't drawn.
+    Art,
+}
+
+impl BorderStyle {
+    /// The style for `w:val`; `None` for no border.
+    fn parse(val: &str) -> Option<BorderStyle> {
+        let lines = |thin: &[bool], gap: f32| BorderStyle::Lines {
+            thin: thin.to_vec(),
+            gap,
+        };
+        Some(match val {
+            "none" | "nil" => return None,
+            "single" | "thick" | "wave" | "doubleWave" | "dashDotStroked" | "threeDEmboss"
+            | "threeDEngrave" | "outset" | "inset" => BorderStyle::Single,
+            // Gaps of one line width.
+            "double" => lines(&[false, false], 1.0),
+            "triple" => lines(&[false, false, false], 1.0),
+            "dotted" => BorderStyle::Dashes(vec![1.0, 1.0]),
+            "dashed" => BorderStyle::Dashes(vec![3.0, 2.0]),
+            "dashSmallGap" => BorderStyle::Dashes(vec![3.0, 1.0]),
+            "dotDash" => BorderStyle::Dashes(vec![3.0, 2.0, 1.0, 2.0]),
+            "dotDotDash" => BorderStyle::Dashes(vec![3.0, 2.0, 1.0, 2.0, 1.0, 2.0]),
+            // Our convention: the first-named line is the inner one (nearer the
+            // text); the gap is 1, 2 or 3 thin widths.
+            _ => {
+                let (kind, gap) = if let Some(k) = val.strip_suffix("SmallGap") {
+                    (k, 1.0)
+                } else if let Some(k) = val.strip_suffix("MediumGap") {
+                    (k, 2.0)
+                } else if let Some(k) = val.strip_suffix("LargeGap") {
+                    (k, 3.0)
+                } else {
+                    return Some(BorderStyle::Art);
+                };
+                match kind {
+                    "thinThick" => lines(&[true, false], gap),
+                    "thickThin" => lines(&[false, true], gap),
+                    "thinThickThin" => lines(&[true, false, true], gap),
+                    "thickThinThick" => lines(&[false, true, false], gap),
+                    _ => BorderStyle::Art,
+                }
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -421,7 +483,7 @@ impl SectionLayout {
 
 fn parse_page_borders(sect: &str) -> PageBorders {
     let mut out = PageBorders {
-        sides: [None; 4],
+        sides: Default::default(),
         from_page: false,
         display: BorderDisplay::AllPages,
     };
@@ -445,19 +507,21 @@ fn parse_page_borders(sect: &str) -> PageBorders {
         let Some(el) = start_tag(block, tag) else {
             continue;
         };
-        if matches!(
-            xml_attr_value(el, "w:val").as_deref(),
-            None | Some("none" | "nil")
-        ) {
+        let Some(style) = xml_attr_value(el, "w:val")
+            .as_deref()
+            .and_then(BorderStyle::parse)
+        else {
             continue;
-        }
+        };
         let color = xml_attr_value(el, "w:color")
             .and_then(|c| parse_hex(&c))
             .map_or((0.0, 0.0, 0.0), rgb_f);
+        let eighths = if style == BorderStyle::Art { 1.0 } else { 8.0 };
         out.sides[i] = Some(BorderSide {
-            width: num_attr(el, "w:sz").map_or(0.5, |sz| (sz / 8.0).max(0.25)),
+            width: num_attr(el, "w:sz").map_or(0.5, |sz| (sz / eighths).max(0.25)),
             space: num_attr(el, "w:space").unwrap_or(0.0),
             color,
+            style,
         });
     }
     out
@@ -601,7 +665,7 @@ struct Frag {
 
 type Link = ((f32, f32, f32, f32), String);
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Rule {
     x1: f32,
     y1: f32,
@@ -609,6 +673,8 @@ struct Rule {
     y2: f32,
     width: f32,
     color: (f32, f32, f32),
+    /// A dash array in points; empty for a solid line.
+    dash: Vec<f32>,
 }
 
 struct Page {
@@ -1191,6 +1257,7 @@ impl<'a> Pager<'a> {
                 y2: low,
                 width: 0.5,
                 color: (0.0, 0.0, 0.0),
+                dash: Vec::new(),
             });
         }
     }
@@ -1410,7 +1477,7 @@ fn border_rules(
     right: f32,
 ) -> Vec<Rule> {
     let b = &s.borders;
-    let space = |i: usize| b.sides[i].map_or(0.0, |side| side.space);
+    let space = |i: usize| b.sides[i].as_ref().map_or(0.0, |side| side.space);
     let (top_y, left_x, bottom_y, right_x) = if b.from_page {
         (h - space(0), space(1), space(2), w - space(3))
     } else {
@@ -1427,21 +1494,58 @@ fn border_rules(
         (left_x, bottom_y, right_x, bottom_y),
         (right_x, bottom_y, right_x, top_y),
     ];
-    b.sides
-        .iter()
-        .zip(lines)
-        .filter_map(|(side, (x1, y1, x2, y2))| {
-            let side = side.as_ref()?;
-            Some(Rule {
-                x1,
-                y1,
-                x2,
-                y2,
-                width: side.width,
+    // Outward (away from the text) for each side.
+    let outward: [(f32, f32); 4] = [(0.0, 1.0), (-1.0, 0.0), (0.0, -1.0), (1.0, 0.0)];
+    let mut rules = Vec::new();
+    for ((side, (x1, y1, x2, y2)), (ox, oy)) in b.sides.iter().zip(lines).zip(outward) {
+        let Some(side) = side else {
+            continue;
+        };
+        let w = side.width;
+        // Each stroke's width and its distance outward from the frame line.
+        let (strokes, dash): (Vec<(f32, f32)>, Vec<f32>) = match &side.style {
+            BorderStyle::Single => (vec![(w, 0.0)], Vec::new()),
+            BorderStyle::Dashes(pattern) => {
+                (vec![(w, 0.0)], pattern.iter().map(|k| k * w).collect())
+            }
+            BorderStyle::Art => (vec![(w, 0.0)], vec![w, w]),
+            BorderStyle::Lines { thin, gap } => {
+                let thin_w = (w / 3.0).max(0.25);
+                let widths: Vec<f32> = thin.iter().map(|&t| if t { thin_w } else { w }).collect();
+                // Double and triple lines are spaced by their own width; the
+                // thin-thick families by thin widths.
+                let gap = if thin.iter().any(|&t| t) {
+                    gap * thin_w
+                } else {
+                    gap * w
+                };
+                let mut d = 0.0;
+                let mut out = Vec::new();
+                for (k, &sw) in widths.iter().enumerate() {
+                    if k > 0 {
+                        d += widths[k - 1] / 2.0 + gap + sw / 2.0;
+                    }
+                    out.push((sw, d));
+                }
+                (out, Vec::new())
+            }
+        };
+        for (width, d) in strokes {
+            // Along the frame inflated by `d`, so the corners stay closed: a
+            // horizontal side grows by `d` at both ends, a vertical one too.
+            let (ax, ay) = (oy.abs(), ox.abs());
+            rules.push(Rule {
+                x1: x1 + ox * d - ax * d,
+                y1: y1 + oy * d - ay * d,
+                x2: x2 + ox * d + ax * d,
+                y2: y2 + oy * d + ay * d,
+                width,
                 color: side.color,
-            })
-        })
-        .collect()
+                dash: dash.clone(),
+            });
+        }
+    }
+    rules
 }
 
 impl Flow for Pager<'_> {
@@ -1852,6 +1956,10 @@ fn build_content(page: &Page, opts: &PdfOptions) -> Vec<u8> {
         );
     }
     for rule in &page.rules {
+        if !rule.dash.is_empty() {
+            let dash: Vec<String> = rule.dash.iter().map(|d| format!("{d:.2}")).collect();
+            s.extend(format!("[{}] 0 d\n", dash.join(" ")).as_bytes());
+        }
         s.extend(
             format!(
                 "{:.3} {:.3} {:.3} RG {:.2} w {:.2} {:.2} m {:.2} {:.2} l S\n",
@@ -1866,6 +1974,9 @@ fn build_content(page: &Page, opts: &PdfOptions) -> Vec<u8> {
             )
             .as_bytes(),
         );
+        if !rule.dash.is_empty() {
+            s.extend(b"[] 0 d\n");
+        }
     }
     for f in page.hf_frags.iter().chain(&page.frags) {
         let text: &str = match f.field {
@@ -3573,5 +3684,80 @@ mod tests {
         let pages = pages_of(&d, &PdfOptions::default());
         assert!(close(pages[0].at("a").0, 72.0) && close(pages[0].at("b").0, 72.0));
         assert!(close(pages[0].at("c").0, 324.0));
+    }
+
+    // ---- border styles (#737) ----
+
+    /// Page content for a page border with a `top` side (offset from the page
+    /// edge by 24pt) and plain single left and right sides.
+    fn border_page(top: &str) -> String {
+        let sect = format!(
+            r#"<w:sectPr><w:pgBorders w:offsetFrom="page"><w:top {top} w:space="24"/><w:left w:val="single" w:sz="8" w:space="24"/><w:right w:val="single" w:sz="8" w:space="24"/></w:pgBorders></w:sectPr>"#
+        );
+        let d = doc(vec![text_para("x"), trailing(&sect)]);
+        pages_of(&d, &PdfOptions::default()).remove(0).content
+    }
+
+    #[test]
+    fn double_top_border_stroke_endpoints() {
+        let c = border_page(r#"w:val="double" w:sz="8""#);
+        // The frame line, then one stroke width of gap (centres 2pt apart) on
+        // the frame inflated outward, so it spans the inflated corners.
+        assert!(c.contains("1.00 w 24.00 768.00 m 588.00 768.00 l S"), "{c}");
+        assert!(c.contains("1.00 w 22.00 770.00 m 590.00 770.00 l S"), "{c}");
+        assert_eq!(
+            c.matches(" RG ").count(),
+            4,
+            "left and right are single: {c}"
+        );
+        assert!(!c.contains(" 0 d"), "solid rules set no dash: {c}");
+
+        let c = border_page(r#"w:val="triple" w:sz="8""#);
+        assert!(c.contains("1.00 w 20.00 772.00 m 592.00 772.00 l S"), "{c}");
+    }
+
+    #[test]
+    fn thin_thick_borders_put_the_first_named_line_inside() {
+        // sz 24 = 3pt, the thin line a third of it, a small gap one thin width.
+        let c = border_page(r#"w:val="thinThickSmallGap" w:sz="24""#);
+        assert!(c.contains("1.00 w 24.00 768.00 m 588.00 768.00 l S"), "{c}");
+        assert!(c.contains("3.00 w 21.00 771.00 m 591.00 771.00 l S"), "{c}");
+
+        let c = border_page(r#"w:val="thickThinLargeGap" w:sz="24""#);
+        assert!(c.contains("3.00 w 24.00 768.00 m 588.00 768.00 l S"), "{c}");
+        // 1.5 + 3 thin widths + 0.5 outward.
+        assert!(c.contains("1.00 w 19.00 773.00 m 593.00 773.00 l S"), "{c}");
+
+        let c = border_page(r#"w:val="thinThickThinMediumGap" w:sz="24""#);
+        assert_eq!(c.matches("1.00 w").count(), 2 + 2, "{c}");
+        // 0.5 + 2 thin widths + 1.5 outward.
+        assert!(c.contains("3.00 w 20.00 772.00 m 592.00 772.00 l S"), "{c}");
+    }
+
+    #[test]
+    fn dashed_page_borders_reset_the_dash_after_the_rule() {
+        let c = border_page(r#"w:val="dotted" w:sz="16""#);
+        assert!(
+            c.contains("[2.00 2.00] 0 d\n0.000 0.000 0.000 RG 2.00 w 24.00 768.00 m 588.00 768.00 l S\n[] 0 d\n"),
+            "{c}"
+        );
+        let c = border_page(r#"w:val="dashed" w:sz="8""#);
+        assert!(c.contains("[3.00 2.00] 0 d\n"), "{c}");
+        let c = border_page(r#"w:val="dotDotDash" w:sz="8""#);
+        assert!(c.contains("[3.00 2.00 1.00 2.00 1.00 2.00] 0 d\n"), "{c}");
+        // Only the dashed side sets a dash.
+        assert_eq!(c.matches("[] 0 d").count(), 1);
+    }
+
+    #[test]
+    fn art_border_uses_points_and_a_dash() {
+        let c = border_page(r#"w:val="apples" w:sz="12" w:color="00FF00""#);
+        assert!(
+            c.contains("[12.00 12.00] 0 d\n0.000 1.000 0.000 RG 12.00 w 24.00 768.00 m 588.00 768.00 l S\n[] 0 d\n"),
+            "{c}"
+        );
+        // A wave is drawn as a single line for now.
+        let c = border_page(r#"w:val="wave" w:sz="8""#);
+        assert!(c.contains("1.00 w 24.00 768.00 m 588.00 768.00 l S") && !c.contains(" 0 d"));
     }
 }
