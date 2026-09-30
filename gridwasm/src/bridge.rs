@@ -2,7 +2,6 @@
 //! written as plain Rust so it can be unit-tested natively
 //! (`cargo test -p gridwasm`). Mirrors `docxwasm::bridge` in shape.
 
-use gridcore::edit::parse_input;
 use gridcore::engine::{Engine, cell_to_value, eval_formula_at};
 use gridcore::format::{FormatPatch, FormatValue, apply_patch_to_xf, xf_format_fields};
 use gridcore::formula::Value;
@@ -280,7 +279,10 @@ impl Session {
                                 .cell(r, c)
                                 .map(|x| x.style)
                                 .unwrap_or(0);
-                            let mut cell = parse_input(text);
+                            // A leading `'` pastes as quote-prefixed text
+                            // (what copy writes for one).
+                            let styles = &mut self.pkg.workbook.styles;
+                            let mut cell = gridcore::entry::paste_cell(styles, style, text);
                             // A pasted `=…` that doesn't parse would freeze as
                             // an unsupported cell (never evaluates, renders
                             // blank); demote it to literal text instead, same
@@ -289,12 +291,11 @@ impl Session {
                                 if Engine::validate(f).is_err() {
                                     cell = Cell {
                                         value: CellValue::Text(text.to_string()),
-                                        style,
+                                        style: cell.style,
                                         ..Cell::default()
                                     };
                                 }
                             }
-                            cell.style = style;
                             changes.push((r, c, cell));
                         }
                     }
@@ -573,7 +574,9 @@ impl Session {
         for r in r1..=r2 {
             let mut cells = Vec::new();
             for c in c1..=c2 {
-                cells.push(self.cell_src(r, c));
+                // The editor's text: a quote-prefixed `'007` copies with its
+                // apostrophe, so paste gives back text, not the number 7.
+                cells.push(self.cell_seed(r, c));
             }
             rows.push(cells.join("\t"));
         }
@@ -3412,12 +3415,15 @@ mod tests {
         let mut s = Session::open(&sample_xlsx()).expect("open");
         s.dispatch("set\t20\t0\t'007");
         assert_eq!(s.cell_seed(20, 0), "'007");
-        // Copy carries the value; pasting it back gives the same text.
-        assert_eq!(s.cell_src(20, 0), "007");
+        // Copy then paste gives back quote-prefixed text, not the number 7.
         s.cur = (20, 0);
         s.anchor = None;
-        let tsv = s.selection_tsv();
-        assert_eq!(tsv.trim_end(), "007");
+        let tsv = s.dispatch("copy").expect("copy returns the TSV");
+        assert_eq!(tsv.trim_end(), "'007");
+        s.dispatch(&format!("paste	22	0	{tsv}"));
+        let pasted = s.pkg.workbook.sheets[s.active].cell(22, 0).unwrap().clone();
+        assert_eq!(pasted.value, CellValue::Text("007".into()));
+        assert!(s.pkg.workbook.styles.xf(pasted.style).quote_prefix);
         let cell = s.pkg.workbook.sheets[s.active].cell(20, 0).unwrap().clone();
         assert_eq!(cell.value, CellValue::Text("007".into()));
         s.dispatch("set\t21\t0\t$1,234.56");

@@ -29,7 +29,7 @@ mod skill;
 use backstage::BackstageHost as _;
 
 use gridcore::comments::Comment;
-use gridcore::edit::{fill_changes, parse_input, replace_all_in_sheet};
+use gridcore::edit::{fill_changes, replace_all_in_sheet};
 use gridcore::engine::Engine;
 use gridcore::entry::{entry_cell, entry_ctx, input_text_styled};
 use gridcore::formula::translate_formula;
@@ -1153,20 +1153,15 @@ impl App {
         let text = edit.text;
         let (r, c) = self.cur;
         let formula = gridcore::entry::typed_formula(&self.pkg.workbook, self.sheet, r, c, &text);
-        if let Some(body) = formula {
-            {
-                if let Err(e) = Engine::validate(body) {
-                    self.status = Some(format!("formula error: {e}"));
-                    self.edit = Some(EditState {
-                        cursor: text.chars().count(),
-                        text,
-                        replace: false,
-                    });
-                    return false;
-                }
-            }
+        if let Some(Err(e)) = formula.map(Engine::validate) {
+            self.status = Some(format!("formula error: {e}"));
+            self.edit = Some(EditState {
+                cursor: text.chars().count(),
+                text,
+                replace: false,
+            });
+            return false;
         }
-        let (r, c) = self.cur;
         let cell = match entry_cell(
             &mut self.pkg.workbook,
             self.sheet,
@@ -1843,7 +1838,9 @@ impl App {
                         continue;
                     }
                     let style = self.sheet().cell(r, c).map(|x| x.style).unwrap_or(0);
-                    let mut cell = parse_input(field);
+                    // A leading `'` pastes as quote-prefixed text.
+                    let mut cell =
+                        gridcore::entry::paste_cell(&mut self.pkg.workbook.styles, style, field);
                     // A pasted `=…` that doesn't parse would freeze as an
                     // unsupported cell; demote it to literal text instead
                     // (entry-time editing rejects such input outright).
@@ -1851,12 +1848,11 @@ impl App {
                         if Engine::validate(f).is_err() {
                             cell = Cell {
                                 value: CellValue::Text(field.to_string()),
-                                style,
+                                style: cell.style,
                                 ..Cell::default()
                             };
                         }
                     }
-                    cell.style = style;
                     changes.push((r, c, cell));
                 }
             }
@@ -2449,13 +2445,7 @@ impl App {
             PickKind::NumberFormat => {
                 let (label, code) = NUMFMT_OPTIONS[p.sel];
                 let code = code.map(str::to_string);
-                self.apply_format(move |x| {
-                    x.code = code.clone();
-                    x.numfmt = code
-                        .as_deref()
-                        .map(gridcore::sheet::classify_format_code)
-                        .unwrap_or(NumFmt::General);
-                });
+                self.apply_format(move |x| x.set_code(code.clone()));
                 self.status = Some(format!("Number format: {label}"));
             }
             PickKind::FontColor => {
@@ -2525,13 +2515,7 @@ impl App {
             0 => {
                 let (label, code) = NUMFMT_OPTIONS[sel];
                 let code = code.map(str::to_string);
-                self.apply_format(move |x| {
-                    x.code = code.clone();
-                    x.numfmt = code
-                        .as_deref()
-                        .map(gridcore::sheet::classify_format_code)
-                        .unwrap_or(NumFmt::General);
-                });
+                self.apply_format(move |x| x.set_code(code.clone()));
                 self.status = Some(format!("Number format: {label}"));
             }
             1 => match sel {
@@ -3849,8 +3833,9 @@ impl App {
     }
 
     /// Ctrl-D / Ctrl-R: fill the selection from its first row/column,
-    /// translating relative refs — or, on a single cell, pull from the
-    /// neighbor above/left.
+    /// translating relative refs — or, when the selection is one row high
+    /// (Ctrl-D) or one column wide (Ctrl-R), a single cell included, pull
+    /// each cell from the row above / the column to the left.
     fn fill(&mut self, down: bool) {
         let changes = fill_changes(self.sheet(), self.selection(), down);
         if changes.is_empty() {
@@ -6450,6 +6435,7 @@ fn run_tui(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gridcore::edit::parse_input;
     use gridcore::xlsx::save_xlsx;
 
     #[test]

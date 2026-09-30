@@ -374,10 +374,31 @@ fn ctrl_enter_fills_the_selection_and_keeps_it() {
 fn ctrl_quote_copies_the_formula_above_and_ctrl_shift_quote_its_value() {
     let mut v = abc_book();
     select(&mut v, 1, 1);
-    v.edit_copy_from_above(false);
+    // What the key handler does: `sheet_begin_edit` opens the editor (bars
+    // and fields give up the keyboard), then the chord fills it.
+    assert!(v.entry_chord_applies("'"));
+    v.begin_cell_edit(Some(String::new()));
+    v.entry_chord("'", false, 0.0, true);
     assert_eq!(v.editing.as_deref(), Some("=A1*2"), "unadjusted");
+    assert_eq!(v.edit_mode, EditMode::Edit);
     v.end_cell_edit();
-    v.edit_copy_from_above(true);
+    // Ctrl+Shift+" as the harness spells it, and as the platform does.
+    for (key, shift) in [("\"", false), ("'", true)] {
+        v.begin_cell_edit(Some(String::new()));
+        v.entry_chord(key, shift, 0.0, true);
+        assert_eq!(v.editing.as_deref(), Some("2"), "{key} {shift}");
+        v.end_cell_edit();
+    }
+    // Row 1 has nothing above: the handler opens no editor for it.
+    select(&mut v, 0, 1);
+    assert!(!v.entry_chord_applies("'"));
+    assert!(v.entry_chord_applies(";"));
+    // Without an open editor a chord does nothing.
+    select(&mut v, 1, 1);
+    v.entry_chord("'", false, 0.0, false);
+    assert!(v.editing.is_none());
+    v.begin_cell_edit(Some(String::new()));
+    v.entry_chord("\"", false, 0.0, true);
     assert_eq!(v.editing.as_deref(), Some("2"));
     assert!(v.commit_edit());
     assert_eq!(v.sheet().cell(1, 1).unwrap().formula, None);
@@ -428,15 +449,23 @@ fn ctrl_semicolon_enters_today_and_ctrl_shift_semicolon_the_time() {
     let mut v = view();
     // 2024-01-15 21:30.
     let now = 45306.0 + 21.5 / 24.0;
-    v.edit_insert_now(false, now);
+    v.begin_cell_edit(Some(String::new()));
+    v.entry_chord(";", false, now, true);
     assert_eq!(v.editing.as_deref(), Some("1/15/2024"));
     assert_eq!(v.edit_mode, EditMode::Enter);
     assert!(v.commit_edit());
     assert_eq!(value(&v, 0, 0), CellValue::Number(45306.0));
     assert_eq!(v.cell_text(0, 0), "1/15/2024");
     select(&mut v, 1, 0);
-    v.edit_insert_now(true, now);
+    v.begin_cell_edit(Some(String::new()));
+    v.entry_chord(":", false, now, true);
     assert_eq!(v.editing.as_deref(), Some("9:30 PM"));
+    // Into an editor already open, at the caret.
+    v.editing = Some("at ".into());
+    v.edit_caret_to_end();
+    v.entry_chord(";", true, now, false);
+    assert_eq!(v.editing.as_deref(), Some("at 9:30 PM"));
+    v.editing = Some("9:30 PM".into());
     v.commit_edit();
     assert_eq!(v.cell_text(1, 0), "9:30 PM");
 }
@@ -482,9 +511,15 @@ fn f4_repeats_the_ribbons_last_toggle_as_a_setter() {
 #[test]
 fn a_refused_entry_stays_open_and_nothing_moves() {
     let mut v = view();
+    // Sortable data in C1:C5 under the editor, so it is the guard, not an
+    // empty sheet, that stops the sort.
+    for (r, n) in [5.0, 3.0, 1.0, 4.0, 2.0].iter().enumerate() {
+        put(&mut v, r as u32, 2, Cell::number(*n));
+    }
     select(&mut v, 2, 2);
     v.begin_cell_edit(Some("y".repeat(32_768)));
-    let err = v.commit_and_move(1, 0).unwrap_err();
+    assert_eq!(v.commit_and_move(1, 0), None);
+    let err = v.entry_error.clone().unwrap_or_default();
     assert!(err.contains("32767"), "{err}");
     assert_eq!(v.sel, (2, 2), "Enter/arrows do not move");
     assert!(v.editing.is_some(), "the editor stays open");
@@ -493,9 +528,10 @@ fn a_refused_entry_stays_open_and_nothing_moves() {
     assert!(v.editing.is_some());
     assert_eq!(v.sort_with_pending_edit(None, &[(2, true)]), (false, false));
     assert!(v.undo.is_empty(), "nothing was done");
+    assert_eq!(value(&v, 0, 2), CellValue::Number(5.0), "not sorted");
     // Shortened, it commits and moves.
     v.editing = Some("ok".into());
-    assert_eq!(v.commit_and_move(1, 0), Ok(true));
+    assert_eq!(v.commit_and_move(1, 0), Some(true));
     assert_eq!(v.sel, (3, 2));
     assert_eq!(value(&v, 2, 2), CellValue::Text("ok".into()));
 }
@@ -541,10 +577,57 @@ fn replace_keeps_a_quote_prefixed_entry_text() {
     assert!(v.replace_in_cell(2, 0, "ALPHA", "Beta"));
     assert_eq!(value(&v, 2, 0), CellValue::Text("Beta".into()));
     assert!(!v.replace_in_cell(2, 0, "zzz", "q"));
-    // A percent cell is not divided again.
+    // A percent cell is not divided again: 150% with 5→6 is 160%.
     select(&mut v, 3, 0);
-    type_fresh(&mut v, "50%");
+    type_fresh(&mut v, "150%");
     v.commit_edit();
     assert!(v.replace_in_cell(3, 0, "5", "6"));
-    assert_eq!(value(&v, 3, 0), CellValue::Number(0.6));
+    assert_eq!(value(&v, 3, 0), CellValue::Number(1.6));
+}
+
+#[test]
+fn find_and_replace_search_the_same_text() {
+    let mut v = view();
+    for (r, text) in ["1/15/2024", "50%", "'007", "=1+1", "plain"]
+        .iter()
+        .enumerate()
+    {
+        select(&mut v, r as u32, 0);
+        type_fresh(&mut v, text);
+        v.commit_edit();
+    }
+    // What each cell is searched as.
+    assert_eq!(v.search_text(0, 0), "1/15/2024");
+    assert_eq!(v.search_text(1, 0), "50%");
+    assert_eq!(v.search_text(2, 0), "'007");
+    assert_eq!(v.search_text(3, 0), "=1+1");
+    // Find selects what Replace then changes.
+    select(&mut v, 4, 0);
+    for (q, cell) in [
+        ("2024", (0, 0)),
+        ("50%", (1, 0)),
+        ("'00", (2, 0)),
+        ("1+1", (3, 0)),
+    ] {
+        assert_eq!(v.find_match(q, false), Some(cell), "{q}");
+    }
+    // A formula's result is not its search text (Look in: Formulas).
+    assert_eq!(
+        v.find_match("2", false).map(|m| m.0),
+        Some(0),
+        "the date's 2024, not =1+1's 2"
+    );
+    // Replace inside the display of a date and a percent keeps working.
+    assert!(v.replace_in_cell(0, 0, "2024", "2025"));
+    assert_eq!(v.cell_text(0, 0), "1/15/2025");
+    assert!(v.replace_in_cell(1, 0, "50", "60"));
+    assert_eq!(value(&v, 1, 0), CellValue::Number(0.6));
+    assert_eq!(v.cell_text(1, 0), "60%");
+    // The formula's source is what is replaced.
+    assert!(v.replace_in_cell(3, 0, "1+1", "2+2"));
+    assert_eq!(
+        v.sheet().cell(3, 0).unwrap().formula.as_deref(),
+        Some("2+2")
+    );
+    assert_eq!(value(&v, 3, 0), CellValue::Number(4.0));
 }

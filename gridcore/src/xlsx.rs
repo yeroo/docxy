@@ -890,8 +890,13 @@ fn max_numfmt_id(xml: &str) -> u32 {
     max
 }
 
-/// Append the authored `xfs` (with fresh fonts/fills/numFmts) to the original
-/// `styles.xml`, leaving every existing style byte-for-byte intact.
+/// Append the authored `xfs` to the original `styles.xml`, leaving every
+/// existing style byte-for-byte intact. An xf derived from a loaded one
+/// (`Xf::loaded_from`) reuses that source `<xf>`'s font, fill, border and
+/// number format wherever the modeled fields still match it, and keeps its
+/// alignment attributes, protection and `xfId`; only what an edit changed is
+/// minted fresh (a font, a solid fill, a thin box border, a custom numFmt).
+/// An xf built from scratch mints all of its parts.
 fn splice_styles(orig: &str, authored: &[Xf]) -> String {
     if authored.is_empty() {
         return orig.to_string();
@@ -1041,18 +1046,29 @@ fn splice_styles(orig: &str, authored: &[Xf]) -> String {
             x.push_str(" quotePrefix=\"1\"");
         }
 
-        // Alignment: the source's attributes (vertical, indent, rotation…)
-        // with horizontal and wrapText as the xf now has them.
+        // Alignment: the source's attributes (vertical, indent, rotation, a
+        // horizontal the model has no name for such as centerContinuous…),
+        // with horizontal / wrapText rewritten only where the edit changed
+        // them.
         let mut align: Vec<(String, String)> = source
             .and_then(|(_, raw)| child_open_tag(raw, "alignment"))
             .map(|tag| tag_attrs(&tag))
             .unwrap_or_default();
-        align.retain(|(k, _)| k != "horizontal" && k != "wrapText");
-        if let Some(a) = xf.align.attr() {
-            align.push(("horizontal".into(), a.to_string()));
+        let (align_changed, wrap_changed) = match source {
+            Some((sx, _)) => (sx.align != xf.align, sx.wrap != xf.wrap),
+            None => (true, true),
+        };
+        if align_changed {
+            align.retain(|(k, _)| k != "horizontal");
+            if let Some(a) = xf.align.attr() {
+                align.push(("horizontal".into(), a.to_string()));
+            }
         }
-        if xf.wrap {
-            align.push(("wrapText".into(), "1".into()));
+        if wrap_changed {
+            align.retain(|(k, _)| k != "wrapText");
+            if xf.wrap {
+                align.push(("wrapText".into(), "1".into()));
+            }
         }
         let protection = source.and_then(|(_, raw)| child_open_tag(raw, "protection"));
         if protection.is_some() {
@@ -6271,6 +6287,58 @@ b",
         assert_eq!(attr(i, "borderId"), Some(nb.to_string()));
         assert!(saved.workbook.styles.xf(i as u32).bold);
         assert!(xfs[i].contains("vertical=\"top\""));
+    }
+
+    #[test]
+    fn an_alignment_the_model_cannot_name_survives_an_entry() {
+        let mut pkg = new_xlsx();
+        let xml = String::from_utf8(pkg.part("xl/styles.xml").unwrap().to_vec()).unwrap();
+        let mut xml = bump_count(&xml, "<cellXfs", 1);
+        xml = xml.replacen(
+            "</cellXfs>",
+            "<xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyAlignment=\"1\"><alignment horizontal=\"centerContinuous\" wrapText=\"1\"/></xf></cellXfs>",
+            1,
+        );
+        pkg.set_part("xl/styles.xml", xml.into_bytes());
+        let mut pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let src = pkg.workbook.styles.xfs.len() as u32 - 1;
+        pkg.workbook.sheets[0].set_cell(
+            0,
+            0,
+            crate::sheet::Cell {
+                style: src,
+                ..crate::sheet::Cell::default()
+            },
+        );
+        let cell = crate::entry::entry_cell(&mut pkg.workbook, 0, 0, 0, "'x", None).unwrap();
+        pkg.workbook.sheets[0].set_cell(0, 0, cell);
+        // Right-aligning it on purpose replaces the horizontal, keeps the wrap.
+        let mut right = pkg.workbook.styles.xf(src);
+        right.align = crate::sheet::Align::Right;
+        let r = pkg.workbook.styles.intern(right);
+        pkg.workbook.sheets[0].set_cell(
+            1,
+            0,
+            crate::sheet::Cell {
+                style: r,
+                ..crate::sheet::Cell::text("r")
+            },
+        );
+        let saved = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let styles = String::from_utf8(saved.part("xl/styles.xml").unwrap().to_vec()).unwrap();
+        let xfs = cell_xf_elements(&styles);
+        let x = xfs[saved.workbook.sheets[0].cell(0, 0).unwrap().style as usize];
+        assert!(x.contains("horizontal=\"centerContinuous\""), "{x}");
+        assert!(
+            x.contains("wrapText=\"1\"") && x.contains("quotePrefix=\"1\""),
+            "{x}"
+        );
+        let x = xfs[saved.workbook.sheets[0].cell(1, 0).unwrap().style as usize];
+        assert!(
+            x.contains("horizontal=\"right\"") && !x.contains("centerContinuous"),
+            "{x}"
+        );
+        assert!(x.contains("wrapText=\"1\""), "{x}");
     }
 
     #[test]

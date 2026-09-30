@@ -290,6 +290,26 @@ pub fn typed_formula<'a>(
     (!is_text(&wb.styles.xf(style))).then_some(body)
 }
 
+/// A pasted field as a cell of style `style`: the value reading of
+/// [`crate::edit::parse_input`] (paste conversions are not the typed-entry
+/// rules yet), except that a leading `'` is Excel's text marker — the rest is
+/// text and the xf gets `quotePrefix` — and a plain field clears a quote
+/// prefix it lands on. So a copied `'007` pastes back as the text `007`.
+pub fn paste_cell(styles: &mut Styles, style: u32, text: &str) -> Cell {
+    let (cell, quote_prefix) = match text.strip_prefix('\'') {
+        Some(rest) => (Cell::text(rest), true),
+        None => (crate::edit::parse_input(text), false),
+    };
+    let e = Entry {
+        cell,
+        format: None,
+        quote_prefix,
+        wrap: false,
+    };
+    let style = entry_style(styles, style, &e);
+    Cell { style, ..e.cell }
+}
+
 /// Does the editor show this cell's text with its entry apostrophe?
 pub fn shows_quote_prefix(cell: &Cell, xf: &Xf) -> bool {
     xf.quote_prefix && cell.formula.is_none() && matches!(cell.value, CellValue::Text(_))
@@ -1120,6 +1140,27 @@ mod tests {
             let cells = entry_range(wb, 0, (0, 3, 1, 3), (0, 3), text, None).unwrap();
             assert_eq!(cells[1].2.formula.as_deref(), Some(want), "{text}");
         }
+    }
+
+    #[test]
+    fn a_pasted_apostrophe_is_a_quote_prefix() {
+        let mut styles = Styles::default();
+        let bold = styles.intern(Xf {
+            bold: true,
+            ..Xf::default()
+        });
+        let c = paste_cell(&mut styles, bold, "'007");
+        assert_eq!(c.value, CellValue::Text("007".into()));
+        let xf = styles.xf(c.style);
+        assert!(xf.quote_prefix && xf.bold);
+        // A plain field keeps paste's value reading and clears the prefix.
+        let n = paste_cell(&mut styles, c.style, "007");
+        assert_eq!(n.value, CellValue::Number(7.0));
+        assert_eq!(n.style, bold);
+        assert_eq!(
+            paste_cell(&mut styles, 0, "1/15/2024").value,
+            CellValue::Text("1/15/2024".into())
+        );
     }
 
     #[test]
