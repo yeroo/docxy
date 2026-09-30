@@ -9,11 +9,14 @@
 //!
 //! Covered now: paragraphs, runs (bold/italic/underline/strike/color),
 //! headings, lists, hyperlink annotations, and Word's page layout: page and
-//! column breaks, sections (start type and odd/even parity, page size and
-//! orientation, margins with gutter and mirror margins, newspaper columns with
-//! separator rules, vertical alignment, page borders), the page colour, and
-//! headers/footers (default/first/even, linked to the previous section) with
-//! PAGE/NUMPAGES/SECTIONPAGES fields numbered per `w:pgNumType`. Tables are
+//! column breaks (and `pageBreakBefore`, direct or from the style), sections
+//! (start type and odd/even parity, page size and orientation, margins with
+//! gutter and mirror margins, newspaper columns with separator rules, balanced
+//! before a continuous break, vertical alignment including justified, page
+//! borders with their line styles, line numbers), the page colour, headers/
+//! footers (default/first/even, linked to the previous section) with
+//! PAGE/NUMPAGES/SECTIONPAGES fields numbered per `w:pgNumType`, and the
+//! headers' VML text watermarks. Tables are
 //! flattened to text rows; real bordered tables and images in PDF come in a
 //! later phase.
 
@@ -23,7 +26,7 @@ use std::rc::Rc;
 use crate::field::{FieldEvent, field_events};
 use crate::load::{Relationships, xml_attr_value};
 use crate::model::*;
-use crate::package::{HeaderVariant, Package, SectionParts, section_header_parts};
+use crate::package::{HeaderVariant, Package, SectionParts, TextWatermark, section_header_parts};
 use crate::sect::LnRestart;
 use crate::styles::{PprFlag, StyleSheet};
 
@@ -39,6 +42,9 @@ pub struct PdfOptions {
     pub styles: Rc<StyleSheet>,
     /// Parsed header/footer parts keyed by part name (`word/header1.xml`).
     pub header_footer: HashMap<String, Rc<Vec<Block>>>,
+    /// The text watermarks of each header part, keyed by part name; drawn
+    /// behind the body on every page that applies the header.
+    pub watermarks: HashMap<String, Vec<TextWatermark>>,
     /// Main document relationships, resolving each section's header/footer
     /// references to part names.
     pub rels: Relationships,
@@ -65,6 +71,7 @@ impl Default for PdfOptions {
             base_font_size: 11.0,
             styles: Rc::new(StyleSheet::default()),
             header_footer: HashMap::new(),
+            watermarks: HashMap::new(),
             rels: Relationships::default(),
             last_sect_pr: None,
             even_and_odd_headers: false,
@@ -83,6 +90,7 @@ impl PdfOptions {
     pub fn from_package(pkg: &Package, styles: Rc<StyleSheet>) -> PdfOptions {
         let rels = pkg.document_rels();
         let mut header_footer = HashMap::new();
+        let mut watermarks = HashMap::new();
         for (_, target, external) in rels.iter() {
             if external {
                 continue;
@@ -95,6 +103,12 @@ impl PdfOptions {
             };
             if !(xml.contains("<w:hdr") || xml.contains("<w:ftr")) {
                 continue;
+            }
+            if xml.contains("<w:hdr") {
+                let marks = crate::package::text_watermarks(&xml);
+                if !marks.is_empty() {
+                    watermarks.insert(name.clone(), marks);
+                }
             }
             if let Some(blocks) = pkg.header_footer_blocks(&name) {
                 header_footer.insert(name, Rc::new(blocks));
@@ -110,6 +124,7 @@ impl PdfOptions {
         PdfOptions {
             styles,
             header_footer,
+            watermarks,
             rels,
             last_sect_pr: Some(pkg.sect_pr().to_string()),
             even_and_odd_headers: pkg.has_even_odd(),
@@ -665,6 +680,42 @@ struct Frag {
 
 type Link = ((f32, f32, f32, f32), String);
 
+/// A text watermark placed on a page: centred on `(cx, cy)`, turned `angle`
+/// degrees counter-clockwise.
+#[derive(Debug, Clone)]
+struct WatermarkDraw {
+    text: String,
+    size: f32,
+    cx: f32,
+    cy: f32,
+    angle: f32,
+    color: (f32, f32, f32),
+}
+
+impl WatermarkDraw {
+    /// Place `mark` in the margin box `(left, bottom, right, top)`, Word's
+    /// default (`mso-position-*-relative:margin`, centred).
+    fn place(mark: &TextWatermark, (left, bottom, right, top): (f32, f32, f32, f32)) -> Self {
+        let chars = mark.text.chars().count().max(1) as f32;
+        // "Auto" size stretches the text to the shape's width; without one, to
+        // most of the text width. A set font size caps it.
+        let width = mark.width_pt.unwrap_or(0.8 * (right - left));
+        let mut size = width / (chars * 0.6);
+        if let Some(pt) = mark.font_size_pt {
+            size = size.min(pt);
+        }
+        WatermarkDraw {
+            text: mark.text.clone(),
+            size: size.max(1.0),
+            cx: (left + right) / 2.0,
+            cy: (bottom + top) / 2.0,
+            // VML turns clockwise (y down); PDF angles run counter-clockwise.
+            angle: -mark.rotation,
+            color: rgb_f(mark.fill.unwrap_or((0xc0, 0xc0, 0xc0))),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Rule {
     x1: f32,
@@ -696,6 +747,8 @@ struct Page {
     links: Vec<Link>,
     hf_frags: Vec<Frag>,
     hf_links: Vec<Link>,
+    /// Text watermarks from the page's header, drawn behind everything else.
+    watermarks: Vec<WatermarkDraw>,
     rules: Vec<Rule>,
     /// Every body line, in layout order (vertical alignment, column balancing).
     lines: Vec<LineRec>,
@@ -1155,6 +1208,15 @@ impl<'a> Pager<'a> {
         };
         let parts = self.parts.get(sect);
         let mut body_top = s.h - s.top_margin(opts);
+        // A header's watermark applies even when the header shows no text.
+        let margin_box = (left, s.bottom, s.w - right, body_top);
+        let watermarks: Vec<WatermarkDraw> = parts
+            .and_then(|p| p.headers[variant.index()].as_ref())
+            .and_then(|a| opts.watermarks.get(&a.part_name))
+            .into_iter()
+            .flatten()
+            .map(|mark| WatermarkDraw::place(mark, margin_box))
+            .collect();
         let mut body_bottom = s.bottom;
         let mut hf_frags = Vec::new();
         let mut hf_links = Vec::new();
@@ -1199,6 +1261,7 @@ impl<'a> Pager<'a> {
             links: Vec::new(),
             hf_frags,
             hf_links,
+            watermarks,
             rules: Vec::new(),
             lines: Vec::new(),
             min_base: f32::INFINITY,
@@ -1954,6 +2017,30 @@ fn build_content(page: &Page, opts: &PdfOptions) -> Vec<u8> {
             )
             .as_bytes(),
         );
+    }
+    for mark in &page.watermarks {
+        let (sin, cos) = mark.angle.to_radians().sin_cos();
+        let (r, g, b) = mark.color;
+        let width = mark.text.chars().count() as f32 * 0.6 * mark.size;
+        s.extend(
+            format!(
+                "q\n{r:.3} {g:.3} {b:.3} rg\n{cos:.4} {sin:.4} {:.4} {cos:.4} {:.2} {:.2} cm\n",
+                -sin, mark.cx, mark.cy
+            )
+            .as_bytes(),
+        );
+        // Centred on the origin: half the width left, a third of the size down.
+        s.extend(
+            format!(
+                "BT /F0 {:.2} Tf {:.2} {:.2} Td (",
+                mark.size,
+                -width / 2.0,
+                -mark.size * 0.3
+            )
+            .as_bytes(),
+        );
+        s.extend(pdf_string_body(&mark.text));
+        s.extend(b") Tj ET\nQ\n");
     }
     for rule in &page.rules {
         if !rule.dash.is_empty() {
@@ -3759,5 +3846,107 @@ mod tests {
         // A wave is drawn as a single line for now.
         let c = border_page(r#"w:val="wave" w:sz="8""#);
         assert!(c.contains("1.00 w 24.00 768.00 m 588.00 768.00 l S") && !c.contains(" 0 d"));
+    }
+
+    // ---- watermarks (#737) ----
+
+    fn draft(width_pt: Option<f32>, font_size_pt: Option<f32>) -> TextWatermark {
+        TextWatermark {
+            text: "DRAFT".to_string(),
+            rotation: 315.0,
+            fill: None,
+            width_pt,
+            font_size_pt,
+        }
+    }
+
+    /// Options with header parts and the given part's watermarks.
+    fn with_watermark(
+        parts: &[(&str, &str, Vec<Block>)],
+        part: &str,
+        mark: TextWatermark,
+    ) -> PdfOptions {
+        let mut opts = with_parts(parts);
+        opts.watermarks.insert(format!("word/{part}"), vec![mark]);
+        opts
+    }
+
+    #[test]
+    fn text_watermark_drawn_behind_body() {
+        let opts = with_watermark(
+            &[("rH", "header1.xml", vec![text_para("HDR")])],
+            "header1.xml",
+            draft(Some(468.0), None),
+        );
+        let d = doc(vec![
+            text_para("body"),
+            trailing(
+                r#"<w:sectPr><w:headerReference w:type="default" r:id="rH"/><w:pgBorders><w:top w:val="single" w:sz="8"/></w:pgBorders></w:sectPr>"#,
+            ),
+        ]);
+        let page = pages_of(&d, &opts).remove(0);
+        // Rotated 315 degrees clockwise in VML = 45 counter-clockwise, grey,
+        // centred on the margin box (72..540 x 72..720), stretched to the
+        // shape's 468pt: 156pt for five Courier characters.
+        let expected = "q\n0.753 0.753 0.753 rg\n0.7071 0.7071 -0.7071 0.7071 306.00 396.00 cm\nBT /F0 156.00 Tf -234.00 -46.80 Td (DRAFT) Tj ET\nQ\n";
+        assert!(page.content.starts_with(expected), "{}", page.content);
+        // Behind the rules and the text.
+        assert!(page.content.find("DRAFT").unwrap() < page.content.find(" l S").unwrap());
+        assert!(page.content.find("DRAFT").unwrap() < page.content.find("(HDR)").unwrap());
+        assert_eq!(page.content.matches("(DRAFT)").count(), 1);
+    }
+
+    #[test]
+    fn watermark_size_falls_back_to_the_text_width_and_caps_at_a_set_size() {
+        let place = |mark: &TextWatermark| WatermarkDraw::place(mark, (72.0, 72.0, 540.0, 720.0));
+        // 80% of 468pt over five characters.
+        assert!(close(place(&draft(None, None)).size, 0.8 * 468.0 / 3.0));
+        assert!(close(place(&draft(Some(468.0), Some(36.0))).size, 36.0));
+        assert!(close(place(&draft(Some(60.0), Some(36.0))).size, 20.0));
+        let red = TextWatermark {
+            fill: Some((255, 0, 0)),
+            rotation: 0.0,
+            ..draft(None, None)
+        };
+        let drawn = place(&red);
+        assert_eq!(drawn.color, (1.0, 0.0, 0.0));
+        assert!(close(drawn.angle, 0.0));
+    }
+
+    #[test]
+    fn watermark_only_header_draws_watermark() {
+        let opts = with_watermark(
+            &[("rH", "header1.xml", vec![])],
+            "header1.xml",
+            draft(None, None),
+        );
+        let d = doc(vec![
+            text_para("body"),
+            trailing(r#"<w:sectPr><w:headerReference w:type="default" r:id="rH"/></w:sectPr>"#),
+        ]);
+        assert!(pages_of(&d, &opts)[0].content.contains("(DRAFT) Tj"));
+    }
+
+    #[test]
+    fn watermark_follows_title_page_variant() {
+        let opts = with_watermark(
+            &[
+                ("rH", "header1.xml", vec![text_para("HDR")]),
+                ("rF", "header2.xml", vec![text_para("FIRST")]),
+            ],
+            "header1.xml",
+            draft(None, None),
+        );
+        let d = three_pages(
+            r#"<w:sectPr><w:headerReference w:type="default" r:id="rH"/><w:headerReference w:type="first" r:id="rF"/><w:titlePg/></w:sectPr>"#,
+        );
+        let pages = pages_of(&d, &opts);
+        assert_eq!(pages.len(), 3);
+        assert!(pages[0].has("FIRST") && !pages[0].has("DRAFT"));
+        assert!(pages[1].has("DRAFT") && pages[2].has("DRAFT"));
+
+        // A section without a watermarked header draws none.
+        let d = three_pages(BLANK_SECT);
+        assert!(pages_of(&d, &opts).iter().all(|p| !p.has("DRAFT")));
     }
 }
