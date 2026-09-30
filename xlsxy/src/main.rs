@@ -8184,6 +8184,55 @@ mod tests {
     }
 
     #[test]
+    fn bold_then_insert_row_above_keeps_a_cse_array() {
+        // #725: a legacy Ctrl+Shift+Enter array (no `cm`) over D1:D3. Bolding
+        // it goes through Engine::set_cell; inserting a row rebuilds the
+        // engine. It must come out the other side still an array.
+        let mut pkg = new_xlsx();
+        let sheet = &mut pkg.workbook.sheets[0];
+        for r in 0..3u32 {
+            sheet.set_cell(r, 0, Cell::number(f64::from(r + 1)));
+            sheet.set_cell(r, 3, Cell::number(f64::from(2 * (r + 1))));
+        }
+        sheet.set_cell(
+            0,
+            3,
+            Cell {
+                value: CellValue::Number(2.0),
+                formula: Some("A1:A3*2".into()),
+                f_attrs: Some(" t=\"array\" ref=\"D1:D3\"".into()),
+                spill: Some((3, 1)), // as load_xlsx reads it from the ref
+                ..Cell::default()
+            },
+        );
+        let mut app = App::new(pkg, "t.xlsx");
+        app.os_clip = None;
+        app.cur = (0, 3);
+        app.anchor = None;
+        app.toggle_bold();
+        app.cur = (0, 0);
+        app.row_op(true);
+
+        for r in 1..4u32 {
+            assert_eq!(
+                app.sheet().cell(r, 3).unwrap().value,
+                CellValue::Number(f64::from(2 * r)),
+                "row {r}"
+            );
+        }
+        let style = app.sheet().cell(1, 3).unwrap().style;
+        assert!(app.pkg.workbook.styles.xf(style).bold);
+        let saved = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
+        let ws = String::from_utf8_lossy(saved.part("xl/worksheets/sheet1.xml").unwrap());
+        assert!(
+            ws.contains(&format!(
+                r#"<c r="D2" s="{style}"><f t="array" ref="D2:D4">A2:A4*2</f><v>2</v></c>"#
+            )),
+            "{ws}"
+        );
+    }
+
+    #[test]
     fn cell_formatting_applies_and_round_trips() {
         let mut app = App::new(new_xlsx(), "t.xlsx");
         app.os_clip = None;
