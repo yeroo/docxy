@@ -19,7 +19,10 @@ pub fn draw(f: &mut Frame, area: Rect, bs: &mut Backstage, host: &dyn BackstageH
     // y == 0) so `mouse`'s absolute coordinates line up with these rects.
     let preview_w = (area.width as usize).saturating_sub(50).max(8);
     bs.layout.preview_h = (area.height as usize).saturating_sub(3).max(1);
-    bs.layout.name_top = area.height.saturating_sub(3);
+    // Save As's bottom band: the name box, plus the type box when there is one.
+    let band = if bs.save_types.is_empty() { 3 } else { 6 };
+    bs.layout.name_top = area.height.saturating_sub(band);
+    bs.layout.type_top = area.height.saturating_sub(3);
     bs.layout.name_x0 = 16;
     bs.layout.save_btn = Rect {
         x: area.width.saturating_sub(10),
@@ -28,10 +31,18 @@ pub fn draw(f: &mut Frame, area: Rect, bs: &mut Backstage, host: &dyn BackstageH
         height: 3,
     };
     let list_h = (area.height as usize).saturating_sub(3).max(1);
-    bs.layout.list_start = bs
-        .sel
-        .saturating_sub(list_h / 2)
-        .min(bs.entries.len().saturating_sub(list_h));
+    bs.layout.list_start = if bs.item == Item::Export {
+        // Export's type rows start 6 rows down; keep the selection in view.
+        let rows = (area.height as usize).saturating_sub(7).max(1);
+        bs.export_sel
+            .saturating_sub(1)
+            .saturating_sub(rows - 1)
+            .min(bs.save_types.len().saturating_sub(rows))
+    } else {
+        bs.sel
+            .saturating_sub(list_h / 2)
+            .min(bs.entries.len().saturating_sub(list_h))
+    };
     bs.refresh_preview(host, preview_w); // fill the preview cache at the pane width
 
     // Clear only the menu + content region (rows[1..]); row 0 holds the app's
@@ -61,6 +72,7 @@ pub fn draw(f: &mut Frame, area: Rect, bs: &mut Backstage, host: &dyn BackstageH
         Item::SaveAs => draw_save_as(f, cols[1], bs, host),
         Item::Info => draw_info(f, cols[1], host),
         Item::Options => draw_options(f, cols[1], bs, host),
+        Item::Export if !bs.save_types.is_empty() => draw_export(f, cols[1], bs, host),
         other => {
             // App-neutral: the same crate serves docxy (PDF), xlsxy (CSV) and
             // yppxy (Gantt), so avoid naming a format or the app.
@@ -186,8 +198,18 @@ fn draw_save_as(f: &mut Frame, area: Rect, bs: &Backstage, host: &dyn BackstageH
     } else {
         (focused, dim)
     };
-    // Folder list on top, the typed file name in a box below it.
-    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(area);
+    // Folder list on top, the typed file name in a box below it, and the
+    // Save as type box below that when the host has types.
+    let rows = if bs.save_types.is_empty() {
+        Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(area)
+    } else {
+        Layout::vertical([
+            Constraint::Min(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+        ])
+        .split(area)
+    };
 
     // folder list (only subfolders matter for choosing a destination)
     let title = format!(" {} ", bs.dir.display());
@@ -233,6 +255,18 @@ fn draw_save_as(f: &mut Frame, area: Rect, bs: &Backstage, host: &dyn BackstageH
         width: rows[1].width.saturating_sub(btn.width),
         ..rows[1]
     };
+    if let (Some(t), Some(&type_box)) = (bs.save_types.get(bs.type_sel), rows.get(2)) {
+        let border = if bs.type_focus { focused } else { dim };
+        f.render_widget(
+            Paragraph::new(RLine::raw(format!(" {} (*.{})", t.label, t.ext))).block(
+                RBlock::default()
+                    .borders(Borders::ALL)
+                    .border_style(border)
+                    .title(" Save as type  (↑↓ when focused) "),
+            ),
+            type_box,
+        );
+    }
     // file-name input — the text is plain; the caret is the real terminal
     // cursor (same as the main editor), placed via set_cursor_position only
     // while the field is focused.
@@ -262,6 +296,46 @@ fn draw_save_as(f: &mut Frame, area: Rect, bs: &Backstage, host: &dyn BackstageH
             y: name_box.y + 1,
         });
     }
+}
+
+/// Export with a type list: the host's quick export, then Change File Type.
+/// Rows sit at fixed offsets (see `mouse`): the quick export at 3, the types
+/// from 6, scrolled by `layout.list_start`.
+fn draw_export(f: &mut Frame, area: Rect, bs: &Backstage, host: &dyn BackstageHost) {
+    let focus = bs.pane == Pane::Export;
+    let accent = Style::default().fg(Color::Black).bg(host.accent());
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let row = |text: String, on: bool| {
+        RLine::styled(
+            text,
+            if focus && on {
+                accent
+            } else {
+                Style::default()
+            },
+        )
+    };
+    let mut lines = vec![
+        RLine::styled(" Export", bold),
+        RLine::raw(""),
+        row(format!(" {}", bs.export_quick), bs.export_sel == 0),
+        RLine::raw(""),
+        RLine::styled(" Change File Type", bold),
+    ];
+    let rows = (area.height as usize).saturating_sub(6).max(1);
+    for (i, t) in bs
+        .save_types
+        .iter()
+        .enumerate()
+        .skip(bs.layout.list_start)
+        .take(rows)
+    {
+        lines.push(row(
+            format!("   {} (*.{})", t.label, t.ext),
+            bs.export_sel == i + 1,
+        ));
+    }
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 /// The Options page: a heading and its checkboxes. Rows sit at fixed offsets
@@ -347,6 +421,72 @@ mod tests {
         fn accent(&self) -> Color {
             Color::Green
         }
+    }
+
+    const TYPES: &[crate::SaveType] = &[
+        crate::SaveType {
+            label: "Excel Workbook",
+            ext: "xlsx",
+        },
+        crate::SaveType {
+            label: "Text (Tab delimited)",
+            ext: "txt",
+        },
+    ];
+
+    fn screen(term: &Terminal<TestBackend>) -> String {
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn draws_save_as_with_a_type_box_and_export_with_change_file_type() {
+        let mut term = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        let mut bs = Backstage::open(std::env::temp_dir(), &["xlsx"])
+            .with_save_types(TYPES, "Export CSV next to the workbook");
+        bs.begin_save_as("book.xlsx".into(), None);
+        term.draw(|f| {
+            let a = f.area();
+            super::draw(f, a, &mut bs, &H);
+        })
+        .unwrap();
+        let text = screen(&term);
+        assert!(text.contains("Save as type"), "{text}");
+        assert!(text.contains("Excel Workbook (*.xlsx)"), "{text}");
+        assert_eq!(bs.layout.name_top, 18);
+        assert_eq!(bs.layout.type_top, 21);
+        bs.item = Item::Export;
+        bs.pane = crate::Pane::Export;
+        term.draw(|f| {
+            let a = f.area();
+            super::draw(f, a, &mut bs, &H);
+        })
+        .unwrap();
+        let text = screen(&term);
+        assert!(text.contains("Export CSV next to the workbook"), "{text}");
+        assert!(text.contains("Change File Type"), "{text}");
+        assert!(text.contains("Text (Tab delimited) (*.txt)"), "{text}");
+    }
+
+    #[test]
+    fn a_host_without_types_keeps_its_save_as_band() {
+        let mut term = Terminal::new(TestBackend::new(90, 24)).unwrap();
+        let mut bs = Backstage::open(std::env::temp_dir(), &["docx"]);
+        bs.begin_save_as("a.docx".into(), None);
+        term.draw(|f| {
+            let a = f.area();
+            super::draw(f, a, &mut bs, &H);
+        })
+        .unwrap();
+        assert_eq!(bs.layout.name_top, 21);
+        assert!(!screen(&term).contains("Save as type"));
     }
 
     #[test]

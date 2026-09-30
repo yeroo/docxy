@@ -14,4 +14,4 @@ pub use host::{BackstageEvent, BackstageHost};
 pub use menu::draw_menu_column;
 pub use render::draw;
 pub use start::{Start, StartEvent, StartItem};
-pub use state::{Backstage, BackstageLayout, Entry, ITEMS, Item, Pane};
+pub use state::{Backstage, BackstageLayout, Entry, ITEMS, Item, Pane, SaveType, with_extension};

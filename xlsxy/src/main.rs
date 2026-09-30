@@ -101,6 +101,189 @@ fn is_delimited(path: &str) -> bool {
     lower.ends_with(".csv") || lower.ends_with(".tsv")
 }
 
+/// Excel's *Save as type* list, in Excel's order.
+const SAVE_TYPES: [backstage::SaveType; 29] = [
+    backstage::SaveType {
+        label: "Excel Workbook",
+        ext: "xlsx",
+    },
+    backstage::SaveType {
+        label: "Excel Macro-Enabled Workbook",
+        ext: "xlsm",
+    },
+    backstage::SaveType {
+        label: "Excel Binary Workbook",
+        ext: "xlsb",
+    },
+    backstage::SaveType {
+        label: "Excel 97-2003 Workbook",
+        ext: "xls",
+    },
+    backstage::SaveType {
+        label: "CSV UTF-8 (Comma delimited)",
+        ext: "csv",
+    },
+    backstage::SaveType {
+        label: "XML Data",
+        ext: "xml",
+    },
+    backstage::SaveType {
+        label: "Single File Web Page",
+        ext: "mht",
+    },
+    backstage::SaveType {
+        label: "Web Page",
+        ext: "htm",
+    },
+    backstage::SaveType {
+        label: "Excel Template",
+        ext: "xltx",
+    },
+    backstage::SaveType {
+        label: "Excel Macro-Enabled Template",
+        ext: "xltm",
+    },
+    backstage::SaveType {
+        label: "Excel 97-2003 Template",
+        ext: "xlt",
+    },
+    backstage::SaveType {
+        label: "Text (Tab delimited)",
+        ext: "txt",
+    },
+    backstage::SaveType {
+        label: "Unicode Text",
+        ext: "txt",
+    },
+    backstage::SaveType {
+        label: "XML Spreadsheet 2003",
+        ext: "xml",
+    },
+    backstage::SaveType {
+        label: "Microsoft Excel 5.0/95 Workbook",
+        ext: "xls",
+    },
+    backstage::SaveType {
+        label: "CSV (Comma delimited)",
+        ext: "csv",
+    },
+    backstage::SaveType {
+        label: "Formatted Text (Space delimited)",
+        ext: "prn",
+    },
+    backstage::SaveType {
+        label: "Text (Macintosh)",
+        ext: "txt",
+    },
+    backstage::SaveType {
+        label: "Text (MS-DOS)",
+        ext: "txt",
+    },
+    backstage::SaveType {
+        label: "CSV (Macintosh)",
+        ext: "csv",
+    },
+    backstage::SaveType {
+        label: "CSV (MS-DOS)",
+        ext: "csv",
+    },
+    backstage::SaveType {
+        label: "DIF (Data Interchange Format)",
+        ext: "dif",
+    },
+    backstage::SaveType {
+        label: "SYLK (Symbolic Link)",
+        ext: "slk",
+    },
+    backstage::SaveType {
+        label: "Excel Add-in",
+        ext: "xlam",
+    },
+    backstage::SaveType {
+        label: "Excel 97-2003 Add-in",
+        ext: "xla",
+    },
+    backstage::SaveType {
+        label: "PDF",
+        ext: "pdf",
+    },
+    backstage::SaveType {
+        label: "XPS Document",
+        ext: "xps",
+    },
+    backstage::SaveType {
+        label: "Strict Open XML Spreadsheet",
+        ext: "xlsx",
+    },
+    backstage::SaveType {
+        label: "OpenDocument Spreadsheet",
+        ext: "ods",
+    },
+];
+
+/// How a Save As type is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SaveKind {
+    /// The workbook package (`.xlsx`, `.xlsm`, `.xltx`, `.xltm`).
+    Package,
+    /// The active sheet as delimited text.
+    Text {
+        delim: char,
+        encoding: gridcore::textio::Encoding,
+    },
+    /// Formatted Text (Space delimited).
+    Prn,
+    /// Web Page: `.htm` plus a `_files` folder.
+    WebPage,
+    /// XML Data: needs the workbook's XML maps.
+    XmlData,
+    /// Listed as Excel lists it, but not written.
+    Unsupported,
+}
+
+fn save_kind(t: &backstage::SaveType) -> SaveKind {
+    use gridcore::textio::Encoding;
+    match t.label {
+        "Excel Workbook"
+        | "Excel Macro-Enabled Workbook"
+        | "Excel Template"
+        | "Excel Macro-Enabled Template" => SaveKind::Package,
+        "CSV UTF-8 (Comma delimited)" => SaveKind::Text {
+            delim: ',',
+            encoding: Encoding::Utf8Bom,
+        },
+        "CSV (Comma delimited)" => SaveKind::Text {
+            delim: ',',
+            encoding: Encoding::Windows1252,
+        },
+        "Text (Tab delimited)" => SaveKind::Text {
+            delim: '\t',
+            encoding: Encoding::Windows1252,
+        },
+        "Unicode Text" => SaveKind::Text {
+            delim: '\t',
+            encoding: Encoding::Utf16LeBom,
+        },
+        "Formatted Text (Space delimited)" => SaveKind::Prn,
+        "Web Page" => SaveKind::WebPage,
+        "XML Data" => SaveKind::XmlData,
+        _ => SaveKind::Unsupported,
+    }
+}
+
+/// The Save As type a typed file name's extension picks (the first type
+/// with it, as the list is ordered): `.csv` is CSV UTF-8, `.txt` Text (Tab
+/// delimited). `None` for an extension no type has.
+fn type_for_path(path: &str) -> Option<usize> {
+    let ext = Path::new(path).extension()?.to_str()?.to_ascii_lowercase();
+    let ext = match ext.as_str() {
+        "html" => "htm",
+        "mhtml" => "mht",
+        e => e,
+    };
+    SAVE_TYPES.iter().position(|t| t.ext == ext)
+}
+
 /// A `.txt` or `.prn`: opened through the Text Import Wizard.
 fn is_text_import(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
@@ -1080,6 +1263,9 @@ struct App {
     format_dialog: Option<FormatDialog>,
     /// The Text Import Wizard or Convert Text to Columns Wizard.
     text_dialog: Option<textdlg::TextDialog>,
+    /// The text Save As type (index into [`SAVE_TYPES`]) the workbook was
+    /// last saved as; Ctrl+S keeps writing it while the path has its extension.
+    text_type: Option<usize>,
     // View preferences (persisted to a config file).
     formula_view: bool,
     light_theme: bool,
@@ -1191,6 +1377,7 @@ impl App {
             format_picker: None,
             format_dialog: None,
             text_dialog: None,
+            text_type: None,
             formula_view: false,
             light_theme: false,
             auto_hide_ribbon: false,
@@ -2285,6 +2472,9 @@ impl App {
     /// status line and the `Err`, so a caller that reports it (the control
     /// surface's `wb.save`) says exactly what the status bar says.
     fn save_current(&mut self) -> Result<(), String> {
+        if let Some(t) = self.bound_text_type() {
+            return self.save_text(t);
+        }
         let bytes = self.package_bytes();
         match export_atomic(
             self.import_source.as_deref().map(Path::new),
@@ -2293,6 +2483,7 @@ impl App {
         ) {
             Ok(()) => {
                 self.modified = false;
+                self.text_type = None;
                 self.status = Some(format!("Saved {} ({} bytes)", self.path, bytes.len()));
                 Ok(())
             }
@@ -2316,9 +2507,135 @@ impl App {
         }
     }
 
-    /// Save As, first asking (as Excel does) before a macro-free type drops
-    /// the workbook's VBA project.
+    /// The text type Ctrl+S writes: the one last saved as, while the path
+    /// still has its extension.
+    fn bound_text_type(&self) -> Option<usize> {
+        let t = self.text_type?;
+        let ty = SAVE_TYPES.get(t)?;
+        let ext = Path::new(&self.path).extension()?.to_str()?;
+        let text = matches!(
+            save_kind(ty),
+            SaveKind::Text { .. } | SaveKind::Prn | SaveKind::WebPage
+        );
+        (text && ext.eq_ignore_ascii_case(ty.ext)).then_some(t)
+    }
+
+    /// Write the active sheet to `self.path` as text type `t`. Only that sheet
+    /// is kept, so the workbook stays modified: closing still asks to save,
+    /// as Excel does after saving as CSV.
+    fn save_text(&mut self, t: usize) -> Result<(), String> {
+        let ty = SAVE_TYPES[t];
+        let wb = &self.pkg.workbook;
+        let sheet = &wb.sheets[self.sheet.min(wb.sheets.len() - 1)];
+        let mut extra: Vec<(std::path::PathBuf, String)> = Vec::new();
+        let bytes = match save_kind(&ty) {
+            SaveKind::Text { delim, encoding } => gridcore::textio::encode(
+                &gridcore::textio::sheet_text(sheet, &wb.styles, wb.date1904, delim),
+                encoding,
+            ),
+            SaveKind::Prn => gridcore::textio::encode(
+                &gridcore::textio::sheet_prn(sheet, &wb.styles, wb.date1904),
+                gridcore::textio::Encoding::Windows1252,
+            ),
+            SaveKind::WebPage => {
+                let stem = file_stem(&self.path);
+                let page = gridcore::textio::web_page(sheet, &wb.styles, wb.date1904, &stem);
+                let folder = Path::new(&self.path).with_file_name(format!("{stem}_files"));
+                extra = page
+                    .files
+                    .into_iter()
+                    .map(|(name, body)| (folder.join(name), body))
+                    .collect();
+                page.htm.into_bytes()
+            }
+            _ => return Err(format!("{} is not a text type", ty.label)),
+        };
+        let sheet_name = sheet.name.clone();
+        let many = wb.sheets.len() > 1;
+        let written = export_atomic(
+            self.import_source.as_deref().map(Path::new),
+            Path::new(&self.path),
+            &bytes,
+        )
+        .and_then(|()| {
+            for (p, body) in &extra {
+                if let Some(dir) = p.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                std::fs::write(p, body)?;
+            }
+            Ok(())
+        });
+        match written {
+            Ok(()) => {
+                self.modified = true;
+                self.status = Some(if many {
+                    format!(
+                        "Saved only the active sheet \"{sheet_name}\" to {} as {}: the selected \
+                         file type does not support workbooks that contain multiple sheets \
+                         (possible data loss).",
+                        self.path, ty.label
+                    )
+                } else {
+                    format!(
+                        "Saved {} as {}. Some features in your workbook might be lost in this \
+                         file type (possible data loss).",
+                        self.path, ty.label
+                    )
+                });
+                Ok(())
+            }
+            Err(e) => {
+                let msg = format!("save failed: {e}");
+                self.status = Some(msg.clone());
+                Err(msg)
+            }
+        }
+    }
+
+    /// Save As type `t` (an index into [`SAVE_TYPES`]) to `path`: the
+    /// workbook package, the active sheet as text, or Excel's refusal for a
+    /// type nothing here writes.
+    fn save_as_type(&mut self, path: String, t: usize) {
+        let ty = SAVE_TYPES[t];
+        match save_kind(&ty) {
+            SaveKind::Package => self.request_save_as_package(path),
+            SaveKind::Text { .. } | SaveKind::Prn | SaveKind::WebPage => {
+                let previous = self.text_type.replace(t);
+                if !self.save_as(path) {
+                    self.text_type = previous;
+                }
+            }
+            SaveKind::XmlData if self.pkg.part("xl/xmlMaps.xml").is_none() => {
+                self.status = Some(
+                    "Cannot save XML data because the workbook does not contain any XML \
+                     mappings."
+                        .to_string(),
+                );
+            }
+            SaveKind::XmlData | SaveKind::Unsupported => {
+                self.status = Some(format!(
+                    "xlsxy cannot save as {} (*.{}) yet; nothing was written. Choose another \
+                     type.",
+                    ty.label, ty.ext
+                ));
+            }
+        }
+    }
+
+    /// Save As to a typed path: the type follows its extension (`out.csv` is
+    /// CSV UTF-8, never a workbook under a `.csv` name); an extension no type
+    /// has keeps the workbook package.
     fn request_save_as(&mut self, path: String) {
+        match type_for_path(&path) {
+            Some(t) => self.save_as_type(path, t),
+            None => self.request_save_as_package(path),
+        }
+    }
+
+    /// Save the package As, first asking (as Excel does) before a macro-free
+    /// type drops the workbook's VBA project.
+    fn request_save_as_package(&mut self, path: String) {
         let drops_macros = SpreadsheetKind::from_path(&path).is_some_and(|k| !k.allows_macros());
         if drops_macros && self.pkg.has_vba_project() {
             self.confirm = Some(
@@ -3145,10 +3462,15 @@ impl App {
             ),
         ];
         self.backstage = Some(
-            backstage::Backstage::open(dir, self.extensions()).with_options(
-                "Data › Automatic Data Conversion (opening .csv and text files)",
-                options.map(|(l, on)| (l.to_string(), on)).to_vec(),
-            ),
+            backstage::Backstage::open(dir, self.extensions())
+                .with_options(
+                    "Data › Automatic Data Conversion (opening .csv and text files)",
+                    options.map(|(l, on)| (l.to_string(), on)).to_vec(),
+                )
+                .with_save_types(
+                    &SAVE_TYPES,
+                    "Export the current sheet as CSV UTF-8 next to the workbook",
+                ),
         );
         self.ribbon_focus = ribbon::Focus::None;
     }
@@ -3458,14 +3780,26 @@ impl App {
             self.status = Some("Save As — type a file name first.".to_string());
             return;
         }
-        let fname = if name.contains('.') {
-            name
-        } else {
-            format!("{name}.xlsx")
+        // A type picked in the list wins; else the name's extension decides.
+        let chosen = self.backstage.as_ref().and_then(|b| b.chosen_type());
+        let fname = match chosen {
+            Some(t) => {
+                let ext = SAVE_TYPES[t].ext;
+                let has = Path::new(&name)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case(ext));
+                if has { name } else { format!("{name}.{ext}") }
+            }
+            None if name.contains('.') => name,
+            None => format!("{name}.xlsx"),
         };
-        let path = dir.join(&fname);
+        let path = dir.join(&fname).to_string_lossy().into_owned();
         self.backstage = None;
-        self.request_save_as(path.to_string_lossy().into_owned());
+        match chosen {
+            Some(t) => self.save_as_type(path, t),
+            None => self.request_save_as(path),
+        }
     }
 
     // --- welcome / start screen ----------------------------------------------
@@ -6869,6 +7203,228 @@ mod tests {
         let saved = load_xlsx(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(saved.workbook.active_tab, 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #615: the *Save as type* list is Excel's, in Excel's order.
+    #[test]
+    fn save_as_offers_excels_types_in_excels_order() {
+        let labels: Vec<&str> = SAVE_TYPES.iter().map(|t| t.label).collect();
+        assert_eq!(
+            labels[..8],
+            [
+                "Excel Workbook",
+                "Excel Macro-Enabled Workbook",
+                "Excel Binary Workbook",
+                "Excel 97-2003 Workbook",
+                "CSV UTF-8 (Comma delimited)",
+                "XML Data",
+                "Single File Web Page",
+                "Web Page",
+            ]
+        );
+        let at = |l: &str| labels.iter().position(|x| *x == l).unwrap();
+        assert!(at("Text (Tab delimited)") < at("Unicode Text"));
+        assert!(at("Unicode Text") < at("CSV (Comma delimited)"));
+        assert!(at("CSV (Comma delimited)") < at("Formatted Text (Space delimited)"));
+        assert_eq!(labels.last(), Some(&"OpenDocument Spreadsheet"));
+        assert_eq!(type_for_path("a/out.CSV"), Some(4));
+        assert_eq!(
+            type_for_path("x.txt").map(|t| SAVE_TYPES[t].label),
+            Some("Text (Tab delimited)")
+        );
+        assert_eq!(
+            type_for_path("x.html").map(|t| SAVE_TYPES[t].label),
+            Some("Web Page")
+        );
+        assert_eq!(type_for_path("x.dat"), None);
+    }
+
+    fn two_sheet_app(dir: &Path) -> App {
+        use gridcore::sheet::Cell;
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].set_cell(0, 0, Cell::text("first sheet"));
+        let data = pkg.add_sheet("Data");
+        let sh = &mut pkg.workbook.sheets[data];
+        sh.set_cell(0, 0, Cell::text("Name"));
+        sh.set_cell(0, 1, Cell::text("Note"));
+        sh.set_cell(1, 0, Cell::text("Z\u{fc}rich"));
+        sh.set_cell(1, 1, Cell::text("line1\nline2"));
+        let mut app = App::new(pkg, dir.join("book.xlsx").to_str().unwrap());
+        app.os_clip = None;
+        app.sheet = data;
+        app
+    }
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("xlsxy-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// #615: Save As CSV UTF-8 from the list writes only the active sheet,
+    /// keeps every sheet open, says so, and closing still asks to save.
+    #[test]
+    fn save_as_csv_utf8_writes_the_active_sheet_and_keeps_the_rest() {
+        let dir = tmp("save-csv");
+        let mut app = two_sheet_app(&dir);
+        app.open_backstage();
+        let b = app.backstage.as_mut().unwrap();
+        b.begin_save_as("book.xlsx".into(), None);
+        b.pick_type(4);
+        assert_eq!(b.name_input, "book.csv");
+        let name = b.name_input.clone();
+        app.commit_save_as(dir.clone(), name);
+        let out = dir.join("book.csv");
+        let mut want = b"\xEF\xBB\xBF".to_vec();
+        want.extend_from_slice("Name,Note\r\nZ\u{fc}rich,\"line1\nline2\"\r\n".as_bytes());
+        assert_eq!(std::fs::read(&out).unwrap(), want);
+        assert_eq!(Path::new(&app.path), out);
+        assert_eq!(app.pkg.workbook.sheets.len(), 2);
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap()
+                .contains("possible data loss")
+        );
+        assert!(app.status.as_deref().unwrap().contains("multiple sheets"));
+        assert!(app.modified, "closing after a CSV save still asks");
+        app.request_exit();
+        assert!(app.confirm.as_ref().unwrap().prompt().contains("Unsaved"));
+        app.confirm = None;
+        // Ctrl+S keeps writing CSV to the CSV path.
+        std::fs::remove_file(&out).unwrap();
+        app.save();
+        assert_eq!(std::fs::read(&out).unwrap(), want);
+        // Saving As a workbook again writes the package and is clean.
+        app.commit_save_as(dir.clone(), "again.xlsx".into());
+        assert!(
+            std::fs::read(dir.join("again.xlsx"))
+                .unwrap()
+                .starts_with(b"PK")
+        );
+        assert!(!app.modified);
+        assert_eq!(app.text_type, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #615's repro: F12, `out.csv`, Enter no longer writes a ZIP.
+    #[test]
+    fn save_as_prompt_out_csv_is_a_csv_not_a_zip() {
+        let dir = tmp("f12-csv");
+        let mut app = two_sheet_app(&dir);
+        app.request_save_as(dir.join("out.csv").to_string_lossy().into_owned());
+        let bytes = std::fs::read(dir.join("out.csv")).unwrap();
+        assert!(!bytes.starts_with(b"PK"));
+        assert!(bytes.starts_with(b"\xEF\xBB\xBFName,Note\r\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #615: each text type is written as Excel writes it.
+    #[test]
+    fn save_as_text_types_write_excels_bytes() {
+        let dir = tmp("text-types");
+        let at = |l: &str| SAVE_TYPES.iter().position(|t| t.label == l).unwrap();
+        let cases: [(&str, &str, &[u8]); 4] = [
+            (
+                "CSV (Comma delimited)",
+                "c.csv",
+                b"Name,Note\r\nZ\xFCrich,\"line1\nline2\"\r\n",
+            ),
+            (
+                "Text (Tab delimited)",
+                "t.txt",
+                b"Name\tNote\r\nZ\xFCrich\t\"line1\nline2\"\r\n",
+            ),
+            (
+                "Unicode Text",
+                "u.txt",
+                b"\xFF\xFEN\x00a\x00m\x00e\x00\t\x00",
+            ),
+            (
+                "Formatted Text (Space delimited)",
+                "f.prn",
+                b"Name    Note\r\n",
+            ),
+        ];
+        for (label, file, prefix) in cases {
+            let mut app = two_sheet_app(&dir);
+            app.save_as_type(dir.join(file).to_string_lossy().into_owned(), at(label));
+            let bytes = std::fs::read(dir.join(file)).unwrap();
+            assert!(bytes.starts_with(prefix), "{label}: {bytes:?}");
+        }
+        // Web Page: the .htm and its _files folder.
+        let mut app = two_sheet_app(&dir);
+        app.save_as_type(
+            dir.join("page.htm").to_string_lossy().into_owned(),
+            at("Web Page"),
+        );
+        let htm = std::fs::read_to_string(dir.join("page.htm")).unwrap();
+        assert!(htm.contains("page_files/filelist.xml"), "{htm}");
+        assert!(htm.contains("Z\u{fc}rich"));
+        assert!(dir.join("page_files").join("filelist.xml").is_file());
+        assert!(dir.join("page_files").join("stylesheet.css").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #615: XML Data needs XML maps; other unwritten types are refused and
+    /// nothing is written under their name.
+    #[test]
+    fn save_as_refuses_types_it_cannot_write() {
+        let dir = tmp("refused");
+        let at = |l: &str| SAVE_TYPES.iter().position(|t| t.label == l).unwrap();
+        let mut app = two_sheet_app(&dir);
+        app.save_as_type(
+            dir.join("x.xml").to_string_lossy().into_owned(),
+            at("XML Data"),
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Cannot save XML data because the workbook does not contain any XML mappings.")
+        );
+        for (label, file) in [
+            ("Excel Binary Workbook", "b.xlsb"),
+            ("Excel 97-2003 Workbook", "o.xls"),
+            ("OpenDocument Spreadsheet", "o.ods"),
+            ("Single File Web Page", "s.mht"),
+        ] {
+            app.save_as_type(dir.join(file).to_string_lossy().into_owned(), at(label));
+            assert!(
+                app.status.as_deref().unwrap().contains("cannot save as"),
+                "{label}"
+            );
+            assert!(!dir.join(file).exists(), "{label}");
+        }
+        assert!(app.path.ends_with("book.xlsx"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #615: File › Export › Change File Type opens Save As with that type.
+    #[test]
+    fn export_change_file_type_opens_save_as_with_the_type() {
+        let mut app = App::new(new_xlsx(), "book.xlsx");
+        app.open_backstage();
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        while app.backstage.as_ref().unwrap().item != backstage::Item::Export {
+            app.backstage_key(key(KeyCode::Down));
+        }
+        app.backstage_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.backstage.as_ref().unwrap().pane,
+            backstage::Pane::Export
+        );
+        let tab = SAVE_TYPES
+            .iter()
+            .position(|t| t.label == "Text (Tab delimited)")
+            .unwrap();
+        for _ in 0..=tab {
+            app.backstage_key(key(KeyCode::Down));
+        }
+        app.backstage_key(key(KeyCode::Enter));
+        let b = app.backstage.as_ref().unwrap();
+        assert_eq!(b.pane, backstage::Pane::SaveAs);
+        assert_eq!(b.name_input, "book.txt");
+        assert_eq!(b.chosen_type(), Some(tab));
     }
 
     /// 2024-09-30, the clock the CSV tests open with.
