@@ -2447,15 +2447,27 @@ mod tests {
     }
 
     #[test]
-    fn an_array_ref_that_loses_its_top_left_covers_its_own_anchor() {
+    fn a_stale_array_ref_covers_its_own_anchor_after_a_column_delete() {
         // A clone at E1 still naming its source's block D1:D3 (one that never
-        // went through set_cell): deleting column D takes that block's
-        // top-left, so the ref falls back to the cell's own new address.
-        let mut w = wb(&[("E1", with_f_attrs("B1*2", " t=\"array\" ref=\"D1:D3\""))]);
+        // went through set_cell). On the edited sheet the pass before the
+        // shift re-anchors it to E1, which then moves to D1 (without that
+        // pass, deleting column D would leave #REF!).
+        let stale = || with_f_attrs("B1*2", " t=\"array\" ref=\"D1:D3\"");
+        let mut w = wb(&[("E1", stale())]);
         delete_cols(&mut w, 0, 3, 1);
         let d1 = w.sheets[0].cell(0, 3).unwrap();
         assert_eq!(d1.f_attrs.as_deref(), Some(" t=\"array\" ref=\"D1\""));
         assert_eq!(d1.formula.as_deref(), Some("B1*2"));
+        // On another sheet nothing moves; the check after the shift re-anchors it.
+        let mut other = Sheet {
+            name: "Other".to_string(),
+            ..Sheet::default()
+        };
+        other.set_cell(0, 4, stale());
+        w.sheets.push(other);
+        delete_cols(&mut w, 0, 0, 1);
+        let e1 = w.sheets[1].cell(0, 4).unwrap();
+        assert_eq!(e1.f_attrs.as_deref(), Some(" t=\"array\" ref=\"E1\""));
     }
 
     #[test]
