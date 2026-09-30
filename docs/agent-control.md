@@ -777,9 +777,9 @@ name and defaults to the active sheet):
 | `pivot.list` | — | `{pivots:[{sheet,rows,cols,values}]}` (persistent pivots, summarized) |
 | `comment.add` | `{ref,text,author?,sheet?}` | `{sheet,ref}` |
 | `comment.remove` | `{ref,sheet?}` | `{removed:bool}` |
-| `range.set` | `{start,rows:[[string]],sheet?}` | `{set:N}` — **atomic**: every formula validated first, any invalid → error and nothing applied; one undo group |
+| `range.set` | `{start,rows:[[string]],sheet?}` | `{set:N}` — each string typed like `cell.set`; **atomic**: every formula and length validated first, any invalid (a bad formula, or an entry over 32,767 characters) → an error naming the cell and nothing applied; one undo group |
 | `sheet.import-csv` | `{text,name?}` | `{sheet,name,rows,cols}` — always a **new** sheet, never overwrites |
-| `wb.replace-all` | `{query,text}` | `{replaced}` — spans **all sheets**, one undo group |
+| `wb.replace-all` | `{query,text}` | `{replaced}` — spans **all sheets**, one undo group; each cell's input text (a quote prefix's `'` included) is replaced and re-read with the entry rules of `cell.set`, except that a percent cell is not divided again; a result over the cell limit leaves that cell as it was |
 | `sheet.add` | `{name?}` | `{sheet,name}` — deduplicates a taken name, never errors |
 | `sheet.remove` | `{sheet}` | `{removed:true}` (errors on the last sheet; `sheet` is required, no active-sheet default) |
 | `sheet.rename` | `{sheet,name}` | `{name}` — rewrites formula/defined-name references |

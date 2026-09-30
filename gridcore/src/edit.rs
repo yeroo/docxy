@@ -16,7 +16,7 @@ use crate::entry::EntryCtx;
 use crate::formula::{
     EditShift, ExcelError, adjust_formula_for_edit, rename_sheet_in_formula, translate_formula,
 };
-use crate::sheet::{Cell, CellValue, MAX_COLS, MAX_ROWS, Sheet, Styles, Workbook, Xf};
+use crate::sheet::{Cell, CellValue, MAX_COLS, MAX_ROWS, Sheet, Styles, Workbook};
 
 /// Read pasted text as a value: formulas, plain numbers (incl. percent),
 /// booleans, error constants, text. Deliberately narrower than typed entry
@@ -106,34 +106,27 @@ pub fn replace_all_in_sheet(
 ) -> Vec<(u32, u32, Cell)> {
     let mut out = Vec::new();
     for (&(r, c), cell) in &sheet.cells {
-        let xf = styles.xf(cell.style);
-        let text = crate::entry::input_text_styled(cell, &xf);
+        let text = crate::entry::input_text_styled(cell, &styles.xf(cell.style));
         if !text.contains(find) {
             continue;
         }
-        let read_as = if crate::entry::is_percent(&xf) {
-            Xf::default()
-        } else {
-            xf
-        };
-        let Ok(e) = crate::entry::parse_entry(&text.replace(find, with), &read_as, ctx) else {
-            continue;
-        };
-        let style = crate::entry::entry_style(styles, cell.style, &e);
-        out.push((r, c, Cell { style, ..e.cell }));
+        if let Ok(new) = crate::entry::reenter_cell(cell, styles, ctx, &text.replace(find, with)) {
+            out.push((r, c, new));
+        }
     }
     out
 }
 
 /// Excel's Fill Down / Fill Right (Ctrl+D / Ctrl+R) over the selection
 /// `(r1, c1, r2, c2)`: a range copies its first row down (or first column
-/// right), a single cell at `cur` pulls from the cell above (or left).
+/// right); a selection one row high (for Fill Down) or one column wide (for
+/// Fill Right) — a single cell included — pulls from the row above (or the
+/// column to the left).
 /// Relative references move with the copy and the source's style comes
 /// along. Pure: returns the `(row, col, cell)` changes.
 pub fn fill_changes(
     sheet: &Sheet,
     (r1, c1, r2, c2): (u32, u32, u32, u32),
-    cur: (u32, u32),
     down: bool,
 ) -> Vec<(u32, u32, Cell)> {
     let mut changes = Vec::new();
@@ -146,12 +139,17 @@ pub fn fill_changes(
         }
         changes.push((tr, tc, cell));
     };
-    if r1 == r2 && c1 == c2 {
-        let (r, c) = cur;
-        if down && r > 0 {
-            copy_from(r - 1, c, r, c);
-        } else if !down && c > 0 {
-            copy_from(r, c - 1, r, c);
+    if down && r1 == r2 {
+        if r1 > 0 {
+            for c in c1..=c2 {
+                copy_from(r1 - 1, c, r1, c);
+            }
+        }
+    } else if !down && c1 == c2 {
+        if c1 > 0 {
+            for r in r1..=r2 {
+                copy_from(r, c1 - 1, r, c1);
+            }
         }
     } else if down {
         for c in c1..=c2 {
@@ -1173,7 +1171,7 @@ fn shift_grid(sheet: &mut Sheet, shift: &EditShift) {
 mod tests {
     use super::*;
     use crate::engine::Engine;
-    use crate::sheet::{Cell, CellValue, parse_cell_name};
+    use crate::sheet::{Cell, CellValue, Xf, parse_cell_name};
 
     fn wb(cells: &[(&str, Cell)]) -> Workbook {
         let mut sheet = Sheet {
@@ -2201,12 +2199,12 @@ mod tests {
             },
         );
         sheet.set_cell(0, 3, Cell::text("x"));
-        let down = fill_changes(&sheet, (0, 1, 3, 1), (0, 1), true);
+        let down = fill_changes(&sheet, (0, 1, 3, 1), true);
         assert_eq!(down.len(), 3);
         assert_eq!(down[2].0, 3);
         assert_eq!(down[2].2.formula.as_deref(), Some("A4*2"));
         assert_eq!(down[2].2.style, 3);
-        let right = fill_changes(&sheet, (0, 3, 0, 5), (0, 3), false);
+        let right = fill_changes(&sheet, (0, 3, 0, 5), false);
         assert_eq!(right.len(), 2);
         assert!(
             right
@@ -2214,8 +2212,17 @@ mod tests {
                 .all(|(_, _, c)| c.value == CellValue::Text("x".into()))
         );
         // A single cell pulls from above; nothing above row 0.
-        let one = fill_changes(&sheet, (1, 1, 1, 1), (1, 1), true);
+        let one = fill_changes(&sheet, (1, 1, 1, 1), true);
         assert_eq!(one[0].2.formula.as_deref(), Some("A2*2"));
-        assert!(fill_changes(&sheet, (0, 0, 0, 0), (0, 0), true).is_empty());
+        assert!(fill_changes(&sheet, (0, 0, 0, 0), true).is_empty());
+        // One row, several columns, Ctrl+D: each pulls from the row above.
+        let row = fill_changes(&sheet, (1, 1, 1, 3), true);
+        assert_eq!(row.len(), 3);
+        assert_eq!(row[0].2.formula.as_deref(), Some("A2*2"));
+        assert_eq!(row[2].2.value, CellValue::Text("x".into()));
+        // One column, several rows, Ctrl+R: each pulls from the column left.
+        let col = fill_changes(&sheet, (0, 2, 1, 2), false);
+        assert_eq!(col.len(), 2);
+        assert_eq!(col[0].2.formula.as_deref(), Some("B1*2"));
     }
 }

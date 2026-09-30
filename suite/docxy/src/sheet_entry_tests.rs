@@ -458,18 +458,93 @@ fn f9_while_editing_replaces_the_formula_with_its_value() {
 }
 
 #[test]
-fn f4_repeats_the_last_format_as_a_setter() {
+fn f4_repeats_the_ribbons_last_toggle_as_a_setter() {
     let mut v = view();
-    // What `sheet_format` records for Ctrl+B on a plain cell: bold ON.
-    let on = true;
-    v.last_format = Some(std::rc::Rc::new(move |xf: &mut Xf| xf.bold = on));
+    // Ctrl+B on A1 records what the ribbon's toggle resolved: bold ON.
+    let bold = v.toggle_setter(|x| x.bold, |x, on| x.bold = on);
+    v.apply_format(bold);
+    assert!(xf(&v, 0, 0).bold);
+    // F4 on E1, twice: it applies, never flips.
     select(&mut v, 0, 4);
     assert!(v.repeat_format());
     assert!(xf(&v, 0, 4).bold);
-    // Repeating again applies, it does not flip.
     assert!(v.repeat_format());
     assert!(xf(&v, 0, 4).bold);
-    assert_eq!(v.undo.len(), 2);
+    // The same toggle on a bold cell resolves to OFF.
+    select(&mut v, 0, 0);
+    let off = v.toggle_setter(|x| x.bold, |x, on| x.bold = on);
+    v.apply_format(off);
+    assert!(!xf(&v, 0, 0).bold);
     v.last_format = None;
     assert!(!v.repeat_format());
+}
+
+#[test]
+fn a_refused_entry_stays_open_and_nothing_moves() {
+    let mut v = view();
+    select(&mut v, 2, 2);
+    v.begin_cell_edit(Some("y".repeat(32_768)));
+    let err = v.commit_and_move(1, 0).unwrap_err();
+    assert!(err.contains("32767"), "{err}");
+    assert_eq!(v.sel, (2, 2), "Enter/arrows do not move");
+    assert!(v.editing.is_some(), "the editor stays open");
+    // Inserting a row or sorting under it would move its origin: refused too.
+    assert!(!v.structural_edit(StructOp::InsertRow));
+    assert!(v.editing.is_some());
+    assert_eq!(v.sort_with_pending_edit(None, &[(2, true)]), (false, false));
+    assert!(v.undo.is_empty(), "nothing was done");
+    // Shortened, it commits and moves.
+    v.editing = Some("ok".into());
+    assert_eq!(v.commit_and_move(1, 0), Ok(true));
+    assert_eq!(v.sel, (3, 2));
+    assert_eq!(value(&v, 2, 2), CellValue::Text("ok".into()));
+}
+
+#[test]
+fn a_number_format_choice_moves_the_classification_too() {
+    // #654 via the ribbon: 50% then Comma, then 5 is 5 (not 0.05).
+    let mut v = view();
+    type_fresh(&mut v, "50%");
+    v.commit_edit();
+    v.apply_format(numfmt_setter("#,##0"));
+    type_fresh(&mut v, "5");
+    v.commit_edit();
+    assert_eq!(value(&v, 0, 0), CellValue::Number(5.0));
+    // A date set back to General: -1 shows -1, and a later entry is formatted.
+    select(&mut v, 1, 0);
+    type_fresh(&mut v, "1/15/2024");
+    v.commit_edit();
+    v.apply_format(numfmt_setter(""));
+    type_fresh(&mut v, "-1");
+    v.commit_edit();
+    assert_eq!(v.cell_text(1, 0), "-1");
+    type_fresh(&mut v, "1,234");
+    v.commit_edit();
+    assert_eq!(v.cell_text(1, 0), "1,234");
+}
+
+#[test]
+fn replace_keeps_a_quote_prefixed_entry_text() {
+    let mut v = view();
+    for (r, text) in [(0, "'007"), (1, "'01234")] {
+        select(&mut v, r, 0);
+        type_fresh(&mut v, text);
+        v.commit_edit();
+    }
+    assert!(v.replace_in_cell(0, 0, "0", "1"));
+    assert_eq!(value(&v, 0, 0), CellValue::Text("117".into()));
+    assert!(xf(&v, 0, 0).quote_prefix);
+    assert!(v.replace_in_cell(1, 0, "4", "5"));
+    assert_eq!(value(&v, 1, 0), CellValue::Text("01235".into()));
+    // Any case, as the Find bar matches.
+    put(&mut v, 2, 0, Cell::text("Alpha"));
+    assert!(v.replace_in_cell(2, 0, "ALPHA", "Beta"));
+    assert_eq!(value(&v, 2, 0), CellValue::Text("Beta".into()));
+    assert!(!v.replace_in_cell(2, 0, "zzz", "q"));
+    // A percent cell is not divided again.
+    select(&mut v, 3, 0);
+    type_fresh(&mut v, "50%");
+    v.commit_edit();
+    assert!(v.replace_in_cell(3, 0, "5", "6"));
+    assert_eq!(value(&v, 3, 0), CellValue::Number(0.6));
 }

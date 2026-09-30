@@ -82,28 +82,34 @@ pub fn check_len(text: &str) -> Result<(), EntryError> {
     Ok(())
 }
 
+// The three predicates read the code when the xf has one and fall back to
+// the `NumFmt` classification only for a code-less xf: a writer that set one
+// half and not the other must not change how an entry is read.
+
 /// The cell's format is General: no code, or the `General` code the loader
 /// synthesizes for `numFmtId="0"`.
 pub fn is_general(xf: &Xf) -> bool {
-    xf.numfmt == NumFmt::General
-        && xf
-            .code
-            .as_deref()
-            .is_none_or(|c| c.is_empty() || c.eq_ignore_ascii_case("general"))
+    match xf.code.as_deref() {
+        Some(c) => c.is_empty() || c.eq_ignore_ascii_case("general"),
+        None => xf.numfmt == NumFmt::General,
+    }
 }
 
 /// The cell's format is Text (`@`, builtin 49).
 pub fn is_text(xf: &Xf) -> bool {
-    xf.numfmt == NumFmt::Text || xf.code.as_deref() == Some("@")
+    match xf.code.as_deref() {
+        Some(c) => c == "@",
+        None => xf.numfmt == NumFmt::Text,
+    }
 }
 
 /// The cell's format is a percent format.
 pub fn is_percent(xf: &Xf) -> bool {
-    matches!(xf.numfmt, NumFmt::Percent { .. })
-        || xf
-            .code
-            .as_deref()
-            .is_some_and(|c| matches!(classify_format_code(c), NumFmt::Percent { .. }))
+    let class = match xf.code.as_deref() {
+        Some(c) => classify_format_code(c),
+        None => xf.numfmt,
+    };
+    matches!(class, NumFmt::Percent { .. })
 }
 
 /// Parse typed `text` as an entry into a cell formatted `xf`.
@@ -167,8 +173,7 @@ pub fn entry_xf(base: &Xf, e: &Entry) -> Xf {
     let mut xf = base.clone();
     if let Some(code) = e.format {
         if is_general(base) {
-            xf.numfmt = classify_format_code(code);
-            xf.code = Some(code.to_string());
+            xf.set_code(Some(code.to_string()));
         }
     }
     xf.quote_prefix = e.quote_prefix;
@@ -218,9 +223,10 @@ pub fn entry_cell(
 }
 
 /// Ctrl+Enter: `text`, typed at `active`, entered into every cell of the
-/// range `(r1, c1, r2, c2)` on `sheet`. A formula moves its relative
-/// references with each cell, as a fill would; each cell's own format rules
-/// apply. All or nothing: a refused entry changes no style.
+/// range `(r1, c1, r2, c2)` on `sheet`. Each cell reads the entry under its
+/// own format rules; where that makes a formula (`=A1`, `+A1`, `@SUM(A1:A2)`)
+/// its relative references move with the cell, as a fill would. All or
+/// nothing: a refused entry changes no style.
 pub fn entry_range(
     wb: &mut Workbook,
     sheet: usize,
@@ -235,26 +241,65 @@ pub fn entry_range(
         for c in c1..=c2 {
             let dr = r as i64 - active.0 as i64;
             let dc = c as i64 - active.1 as i64;
-            let moved = text
-                .strip_prefix('=')
-                .filter(|body| !body.is_empty())
-                .and_then(|body| crate::formula::translate_formula(body, dr, dc))
-                .map(|body| format!("={body}"));
-            let cell = match moved {
-                Some(t) if check_len(&t).is_ok() => entry_cell(wb, sheet, r, c, &t, today)?,
-                _ => entry_cell(wb, sheet, r, c, text, today)?,
-            };
+            let mut cell = entry_cell(wb, sheet, r, c, text, today)?;
+            if let Some(src) = &cell.formula {
+                if let Some(moved) = crate::formula::translate_formula(src, dr, dc) {
+                    cell.formula = Some(moved);
+                }
+            }
             out.push((r, c, cell));
         }
     }
     Ok(out)
 }
 
+/// Re-read `text` as the new entry of an existing `cell` whose input text was
+/// edited in place (Find & Replace): the cell's own rules, except that a
+/// percent cell is read as General — its input text is the plain value, so
+/// dividing it again would be wrong. The style is resolved into `styles`.
+pub fn reenter_cell(
+    cell: &Cell,
+    styles: &mut Styles,
+    ctx: &EntryCtx,
+    text: &str,
+) -> Result<Cell, EntryError> {
+    let xf = styles.xf(cell.style);
+    let read_as = if is_percent(&xf) { Xf::default() } else { xf };
+    let e = parse_entry(text, &read_as, ctx)?;
+    let style = entry_style(styles, cell.style, &e);
+    Ok(Cell { style, ..e.cell })
+}
+
+/// The formula body `text` would commit into (sheet, row, col) — for hosts
+/// that validate a formula before committing. `None` when it is not a
+/// `=` formula there: a Text-formatted cell stores `=…` as text, so there is
+/// nothing to refuse.
+pub fn typed_formula<'a>(
+    wb: &Workbook,
+    sheet: usize,
+    row: u32,
+    col: u32,
+    text: &'a str,
+) -> Option<&'a str> {
+    let body = text.strip_prefix('=').filter(|b| !b.is_empty())?;
+    let style = wb
+        .sheets
+        .get(sheet)
+        .and_then(|s| s.cell(row, col))
+        .map_or(0, |c| c.style);
+    (!is_text(&wb.styles.xf(style))).then_some(body)
+}
+
+/// Does the editor show this cell's text with its entry apostrophe?
+pub fn shows_quote_prefix(cell: &Cell, xf: &Xf) -> bool {
+    xf.quote_prefix && cell.formula.is_none() && matches!(cell.value, CellValue::Text(_))
+}
+
 /// The text the editor and formula bar show for a cell: [`crate::edit::input_text_of`]
 /// with the apostrophe of a quote-prefixed text put back.
 pub fn input_text_styled(cell: &Cell, xf: &Xf) -> String {
     let text = crate::edit::input_text_of(cell);
-    if xf.quote_prefix && cell.formula.is_none() && matches!(cell.value, CellValue::Text(_)) {
+    if shows_quote_prefix(cell, xf) {
         format!("'{text}")
     } else {
         text
@@ -961,6 +1006,36 @@ mod tests {
     }
 
     #[test]
+    fn predicates_follow_the_code_over_a_stale_classification() {
+        // What the suite's format setters used to leave: code changed,
+        // numfmt not.
+        let stale = |code: &str, numfmt: NumFmt| Xf {
+            numfmt,
+            code: Some(code.to_string()),
+            ..Xf::default()
+        };
+        let comma_over_pct = stale("#,##0", NumFmt::Percent { decimals: 0 });
+        assert!(!is_percent(&comma_over_pct));
+        let e = parse_entry("5", &comma_over_pct, &ctx()).unwrap();
+        assert_eq!(e.cell.value, CellValue::Number(5.0));
+        let general_over_date = stale("General", NumFmt::Date);
+        assert!(is_general(&general_over_date));
+        assert!(!crate::sheet::date_unrepresentable(
+            &general_over_date,
+            &CellValue::Number(-1.0),
+            false
+        ));
+        assert!(!is_text(&stale("0", NumFmt::Text)));
+        assert!(is_text(&stale("@", NumFmt::General)));
+        // set_code keeps the pair in step.
+        let mut xf = Xf::default();
+        xf.set_code(Some("0%".into()));
+        assert_eq!(xf.numfmt, NumFmt::Percent { decimals: 0 });
+        xf.set_code(None);
+        assert_eq!((xf.numfmt, xf.code), (NumFmt::General, None));
+    }
+
+    #[test]
     fn a_recognised_format_lands_only_on_a_general_cell() {
         let e = general("1/15/2024");
         let on_general = entry_xf(&Xf::default(), &e);
@@ -1031,6 +1106,45 @@ mod tests {
         assert_eq!(e.cell.value, CellValue::Text("007".into()));
         let e = parse_entry("12.5", &pct_xf, &ctx()).unwrap();
         assert_eq!(e.cell.value, CellValue::Number(0.125));
+    }
+
+    #[test]
+    fn entry_range_moves_a_prefixed_formula_too() {
+        let mut pkg = crate::xlsx::new_xlsx();
+        let wb = &mut pkg.workbook;
+        for (text, want) in [
+            ("+A1", "+A2"),
+            ("-B1", "-B2"),
+            ("@SUM(A1:A2)", "SUM(A2:A3)"),
+        ] {
+            let cells = entry_range(wb, 0, (0, 3, 1, 3), (0, 3), text, None).unwrap();
+            assert_eq!(cells[1].2.formula.as_deref(), Some(want), "{text}");
+        }
+    }
+
+    #[test]
+    fn typed_formula_skips_a_text_cell() {
+        let mut pkg = crate::xlsx::new_xlsx();
+        let wb = &mut pkg.workbook;
+        assert_eq!(typed_formula(wb, 0, 0, 0, "=SUM("), Some("SUM("));
+        assert_eq!(typed_formula(wb, 0, 0, 0, "="), None);
+        assert_eq!(typed_formula(wb, 0, 0, 0, "abc"), None);
+        let text = wb.styles.intern(Xf {
+            numfmt: NumFmt::Text,
+            code: Some("@".into()),
+            ..Xf::default()
+        });
+        wb.sheets[0].set_cell(
+            0,
+            0,
+            Cell {
+                style: text,
+                ..Cell::default()
+            },
+        );
+        assert_eq!(typed_formula(wb, 0, 0, 0, "=SUM("), None);
+        let cell = entry_cell(wb, 0, 0, 0, "=SUM(", None).unwrap();
+        assert_eq!(cell.value, CellValue::Text("=SUM(".into()));
     }
 
     #[test]

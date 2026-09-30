@@ -480,6 +480,14 @@ enum EditMode {
     Edit,
 }
 
+/// The setter a number-format choice applies: `code`, or General for "".
+/// Through `Xf::set_code`, so the classification the entry rules and the
+/// `####` check read moves with the code.
+fn numfmt_setter(code: &str) -> FormatFn {
+    let code = (!code.is_empty()).then(|| code.to_string());
+    std::rc::Rc::new(move |xf: &mut gridcore::sheet::Xf| xf.set_code(code.clone()))
+}
+
 /// The suite's clock as a 1900-system serial (UTC, like xlsxy's): what
 /// `TODAY()`/`NOW()` read and what a yearless typed date (`3/4`) takes its
 /// year from.
@@ -1187,8 +1195,10 @@ impl SheetView {
         }
     }
 
-    /// Put `text` into the editor at the caret, opening an Enter-mode editor
-    /// on the selected cell first when none is open.
+    /// Put `text` into the editor at the caret, first opening an editor in
+    /// `mode` on the selected cell when none is open. The key handler opens it
+    /// through `sheet_begin_edit` (bars, fields, protection) before calling
+    /// this, so the open here only serves callers without a window.
     fn edit_insert_or_open(&mut self, text: &str, mode: EditMode) {
         if self.editing.is_none() {
             self.begin_cell_edit(Some(String::new()));
@@ -1260,6 +1270,73 @@ impl SheetView {
         self.edit_caret_to_end();
     }
 
+    /// Move the active cell by (dr, dc), clamped at the origin, collapsing the
+    /// range and dropping any editor.
+    fn move_sel(&mut self, dr: i32, dc: i32) {
+        let (r, c) = self.sel;
+        self.sel = ((r as i32 + dr).max(0) as u32, (c as i32 + dc).max(0) as u32);
+        self.anchor = self.sel;
+        self.end_cell_edit();
+    }
+
+    /// Commit the editor, then move by (dr, dc) — unless the entry was
+    /// refused, when the editor stays open, nothing moves and `Err` says why.
+    /// `Ok(committed)` otherwise.
+    fn commit_and_move(&mut self, dr: i32, dc: i32) -> Result<bool, String> {
+        let committed = self.commit_edit();
+        if let Some(e) = self.entry_error.take() {
+            return Err(e);
+        }
+        self.move_sel(dr, dc);
+        Ok(committed)
+    }
+
+    /// Find & Replace on one cell: `q`, any case, replaced by `rep` in the
+    /// cell's input text (a quote prefix's `'` included), then re-read the way
+    /// every host re-reads a replaced entry (`gridcore::entry::reenter_cell`).
+    /// False when the cell had no match or cannot hold the result.
+    fn replace_in_cell(&mut self, r: u32, c: u32, q: &str, rep: &str) -> bool {
+        let Some(cell) = self.sheet().cell(r, c).cloned() else {
+            return false;
+        };
+        let styles = &self.pkg.workbook.styles;
+        let text = gridcore::entry::input_text_styled(&cell, &styles.xf(cell.style));
+        if q.is_empty() || !text.to_lowercase().contains(&q.to_lowercase()) {
+            return false;
+        }
+        let new = ci_replace(&text, q, rep);
+        let ctx = gridcore::entry::entry_ctx(&self.pkg.workbook, self.engine.clock);
+        let styles = &mut self.pkg.workbook.styles;
+        match gridcore::entry::reenter_cell(&cell, styles, &ctx, &new) {
+            Ok(new_cell) => {
+                let s = self.active;
+                self.engine
+                    .set_cell(&mut self.pkg.workbook, (s, r, c), new_cell);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Apply a formatting change to the selection and keep it for F4.
+    fn apply_format(&mut self, f: FormatFn) {
+        self.format_selection(&*f);
+        self.last_format = Some(f);
+    }
+
+    /// A toggle resolved against the active cell (bold ON when it is not
+    /// bold): the setter the ribbon applies and F4 repeats as is.
+    fn toggle_setter(
+        &self,
+        get: fn(&gridcore::sheet::Xf) -> bool,
+        set: fn(&mut gridcore::sheet::Xf, bool),
+    ) -> FormatFn {
+        let (r, c) = self.sel;
+        let style = self.sheet().cell(r, c).map_or(0, |cl| cl.style);
+        let on = !get(&self.pkg.workbook.styles.xf(style));
+        std::rc::Rc::new(move |xf| set(xf, on))
+    }
+
     /// Ctrl+Enter: the editor's entry into every cell of the selection, a
     /// formula's references moving with each cell; one undo step, the
     /// selection kept. False when nothing was entered (no editor, or refused).
@@ -1296,7 +1373,7 @@ impl SheetView {
     /// Ctrl+D / Ctrl+R over the selection (one undo step). False when there
     /// was nothing to fill.
     fn fill_selection(&mut self, down: bool) -> bool {
-        let changes = gridcore::edit::fill_changes(self.sheet(), self.range(), self.sel, down);
+        let changes = gridcore::edit::fill_changes(self.sheet(), self.range(), down);
         if changes.is_empty() {
             return false;
         }
@@ -1344,10 +1421,15 @@ impl SheetView {
     }
 
     /// Commit an open editor before moving rows or columns under its origin.
-    fn structural_edit(&mut self, op: StructOp) {
+    /// False when a refused commit left the editor open: its absolute origin
+    /// would point at a shifted cell, so nothing moves.
+    fn structural_edit(&mut self, op: StructOp) -> bool {
         use gridcore::edit;
 
         self.commit_edit();
+        if self.editing.is_some() {
+            return false;
+        }
         self.push_undo();
         let s = self.active;
         let (r, c) = self.sel;
@@ -1387,6 +1469,7 @@ impl SheetView {
             edit::shift_chart_refs(&mut ch.data, &name, ch.sheet == s, &shift);
         }
         self.engine = sheet_engine(&self.pkg.workbook);
+        true
     }
 
     /// The contiguous region around the selection to sort, as `(start, bottom)`
@@ -1433,6 +1516,9 @@ impl SheetView {
         keys: &[(u32, bool)],
     ) -> (bool, bool) {
         let committed = self.commit_edit();
+        if self.editing.is_some() {
+            return (false, false); // refused: sorting would move its origin
+        }
         let Some((start, bottom)) = sort_rows_from(field, self.sort_bounds()) else {
             return (committed, false);
         };
@@ -1458,7 +1544,12 @@ impl SheetView {
             Some(c) if c.formula.is_some() => format!("={}", c.formula.as_deref().unwrap_or("")),
             Some(c) => match &c.value {
                 CellValue::Number(n) => n.to_string(),
-                CellValue::Text(s) if self.pkg.workbook.styles.xf(c.style).quote_prefix => {
+                CellValue::Text(s)
+                    if gridcore::entry::shows_quote_prefix(
+                        c,
+                        &self.pkg.workbook.styles.xf(c.style),
+                    ) =>
+                {
                     format!("'{s}")
                 }
                 CellValue::Text(s) => s.clone(),
@@ -8920,13 +9011,30 @@ impl Docxy {
     /// Commit the in-progress edit (if any) into the workbook, recalc, and move
     /// the selection by (dr, dc).
     fn sheet_commit(&mut self, dr: i32, dc: i32, cx: &mut Context<Self>) {
-        if self.active_sheet_mut().is_some_and(SheetView::commit_edit) {
-            self.mark_sheet_dirty();
+        self.sheet_commit_move(dr, dc, cx);
+    }
+
+    /// Commit and move; false (the editor left open, the status saying why)
+    /// when the entry was refused.
+    fn sheet_commit_move(&mut self, dr: i32, dc: i32, cx: &mut Context<Self>) -> bool {
+        let Some(res) = self.active_sheet_mut().map(|v| v.commit_and_move(dr, dc)) else {
+            return false;
+        };
+        cx.notify();
+        match res {
+            Ok(committed) => {
+                if committed {
+                    self.mark_sheet_dirty();
+                }
+                true
+            }
+            Err(err) => {
+                if let Some(t) = self.tabs.get_mut(self.active) {
+                    t.status = err.into();
+                }
+                false
+            }
         }
-        if self.sheet_entry_refused(cx) {
-            return;
-        }
-        self.sheet_move(dr, dc, cx);
     }
 
     /// Ctrl+Enter: commit the entry into every selected cell and keep the
@@ -8955,30 +9063,19 @@ impl Docxy {
         true
     }
 
-    /// Whether the active sheet still has an editor open.
-    fn sheet_editing(&self) -> bool {
-        self.active_sheet().is_some_and(|v| v.editing.is_some())
-    }
-
     /// Move the selection by (dr, dc), clamped at the top-left origin, collapsing
     /// the range and discarding any in-progress edit.
     fn sheet_move(&mut self, dr: i32, dc: i32, cx: &mut Context<Self>) {
         if let Some(v) = self.active_sheet_mut() {
-            let (r, c) = v.sel;
-            v.sel = ((r as i32 + dr).max(0) as u32, (c as i32 + dc).max(0) as u32);
-            v.anchor = v.sel;
-            v.end_cell_edit();
+            v.move_sel(dr, dc);
         }
         cx.notify();
     }
 
     /// Extend the selection by (dr, dc), keeping the anchor (Shift+arrow).
     fn sheet_extend(&mut self, dr: i32, dc: i32, editing: bool, cx: &mut Context<Self>) {
-        if editing {
-            self.sheet_commit(0, 0, cx);
-            if self.sheet_editing() {
-                return; // refused: the editor stays
-            }
+        if editing && !self.sheet_commit_move(0, 0, cx) {
+            return; // refused: the editor stays
         }
         if let Some(v) = self.active_sheet_mut() {
             let (r, c) = v.sel;
@@ -8991,12 +9088,10 @@ impl Docxy {
     /// Arrow-key navigation: commit an open edit first, then move.
     fn sheet_nav(&mut self, dr: i32, dc: i32, editing: bool, cx: &mut Context<Self>) {
         if editing {
-            self.sheet_commit(0, 0, cx);
-            if self.sheet_editing() {
-                return; // refused: the editor stays
-            }
+            self.sheet_commit_move(dr, dc, cx);
+        } else {
+            self.sheet_move(dr, dc, cx);
         }
-        self.sheet_move(dr, dc, cx);
     }
 
     /// Clear the whole selected range's content (Delete / Backspace), keeping
@@ -9155,14 +9250,18 @@ impl Docxy {
         // `sheet_apply_numfmt` directly, and the colour swatches call
         // `sheet_apply_color` directly. Asking here covers the lot: it returns
         // immediately when no chart is selected, so the common path is free.
+        self.sheet_format_rc(std::rc::Rc::new(apply), cx);
+    }
+
+    /// [`Self::sheet_format`] for a setter already shared (a toggle resolved
+    /// by `SheetView::toggle_setter`).
+    fn sheet_format_rc(&mut self, apply: FormatFn, cx: &mut Context<Self>) {
         self.chart_hand_back(cx);
         self.sheet_snapshot();
-        let apply: FormatFn = std::rc::Rc::new(apply);
         if let Some(v) = self.active_sheet_mut() {
-            v.format_selection(&*apply);
             // F4 repeats it. Toggles arrive here already resolved (bold ON),
             // so a repeat applies rather than flips.
-            v.last_format = Some(apply);
+            v.apply_format(apply);
         }
         self.mark_sheet_dirty();
         cx.notify();
@@ -9847,6 +9946,7 @@ impl Docxy {
         if committed || sorted {
             self.mark_sheet_dirty();
         }
+        self.sheet_entry_refused(cx);
         cx.notify();
     }
 
@@ -9870,16 +9970,20 @@ impl Docxy {
         if committed || sorted {
             self.mark_sheet_dirty();
         }
+        self.sheet_entry_refused(cx);
         cx.notify();
     }
 
     /// Insert/delete a whole row or column at the selection (Home ▸ Cells), then
     /// rebuild the recalc engine so shifted formulas re-evaluate.
     fn sheet_structural(&mut self, op: StructOp, cx: &mut Context<Self>) {
-        if let Some(v) = self.active_sheet_mut() {
-            v.structural_edit(op);
+        if self
+            .active_sheet_mut()
+            .is_some_and(|v| v.structural_edit(op))
+        {
+            self.mark_sheet_dirty();
         }
-        self.mark_sheet_dirty();
+        self.sheet_entry_refused(cx);
         cx.notify();
     }
 
@@ -9996,12 +10100,22 @@ impl Docxy {
     }
 
     fn sheet_toggle_bold(&mut self, cx: &mut Context<Self>) {
-        let on = !self.active_xf().bold;
-        self.sheet_format(move |xf| xf.bold = on, cx);
+        self.chart_hand_back(cx);
+        if let Some(f) = self
+            .active_sheet()
+            .map(|v| v.toggle_setter(|x| x.bold, |x, on| x.bold = on))
+        {
+            self.sheet_format_rc(f, cx);
+        }
     }
     fn sheet_toggle_italic(&mut self, cx: &mut Context<Self>) {
-        let on = !self.active_xf().italic;
-        self.sheet_format(move |xf| xf.italic = on, cx);
+        self.chart_hand_back(cx);
+        if let Some(f) = self
+            .active_sheet()
+            .map(|v| v.toggle_setter(|x| x.italic, |x, on| x.italic = on))
+        {
+            self.sheet_format_rc(f, cx);
+        }
     }
     fn sheet_align(&mut self, a: gridcore::sheet::Align, cx: &mut Context<Self>) {
         self.sheet_format(move |xf| xf.align = a, cx);
@@ -10038,22 +10152,12 @@ impl Docxy {
     }
     /// Apply a number format code to the selection (Excel's %, currency, comma).
     fn sheet_numfmt(&mut self, code: &'static str, cx: &mut Context<Self>) {
-        self.sheet_format(move |xf| xf.code = Some(code.to_string()), cx);
+        self.sheet_format_rc(numfmt_setter(code), cx);
     }
 
     /// Apply a number format from the Number dropdown ("" = General/clear) + close.
     fn sheet_apply_numfmt(&mut self, code: &str, cx: &mut Context<Self>) {
-        let code = code.to_string();
-        self.sheet_format(
-            move |xf| {
-                xf.code = if code.is_empty() {
-                    None
-                } else {
-                    Some(code.clone())
-                }
-            },
-            cx,
-        );
+        self.sheet_format_rc(numfmt_setter(code), cx);
         self.sheet_numfmt_open = false;
     }
 
@@ -10199,11 +10303,7 @@ impl Docxy {
         self.sheet_snapshot();
         if let Some(v) = self.active_sheet_mut() {
             let (r, c) = v.sel;
-            let text = v.cell_text(r, c);
-            if text.to_lowercase().contains(&q.to_lowercase()) {
-                let new = ci_replace(&text, &q, &rep);
-                v.enter_text_at(r, c, &new);
-            }
+            v.replace_in_cell(r, c, &q, &rep);
         }
         self.mark_sheet_dirty();
         self.sheet_find_next(false, cx);
@@ -10219,17 +10319,10 @@ impl Docxy {
         self.sheet_snapshot();
         let mut n = 0u32;
         if let Some(v) = self.active_sheet_mut() {
-            let (mr, mc) = v.extent();
-            let ql = q.to_lowercase();
-            for r in 0..=mr {
-                for c in 0..=mc {
-                    let text = v.cell_text(r, c);
-                    if !text.is_empty() && text.to_lowercase().contains(&ql) {
-                        let new = ci_replace(&text, &q, &rep);
-                        if v.enter_text_at(r, c, &new) {
-                            n += 1;
-                        }
-                    }
+            let cells: Vec<(u32, u32)> = v.sheet().cells.keys().copied().collect();
+            for (r, c) in cells {
+                if v.replace_in_cell(r, c, &q, &rep) {
+                    n += 1;
                 }
             }
         }
@@ -11479,9 +11572,22 @@ impl Docxy {
             match key {
                 "enter" => return self.sheet_commit_to_selection(cx),
                 "'" | "\"" | ";" | ":" => {
-                    if !protected && now.is_some() {
+                    let from_above = matches!(key, "'" | "\"");
+                    let top_row = self.active_sheet().is_some_and(|v| v.sel.0 == 0);
+                    if !protected && now.is_some() && !(from_above && top_row) {
                         self.chart_hand_back(cx);
-                        if let Some(v) = self.active_sheet_mut() {
+                        // No editor yet: open one the way F2 and typing do, so
+                        // the bars and a focused range field give the keyboard
+                        // up (and protection is honoured) before text lands.
+                        if !editing {
+                            self.sheet_begin_edit(Some(String::new()), cx);
+                            if from_above {
+                                if let Some(v) = self.active_sheet_mut() {
+                                    v.edit_mode = EditMode::Edit;
+                                }
+                            }
+                        }
+                        if let Some(v) = self.active_sheet_mut().filter(|v| v.editing.is_some()) {
                             entry(v);
                         }
                     }

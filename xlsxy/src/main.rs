@@ -1142,15 +1142,19 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// Commit the editor text into the current cell. Returns false (and
-    /// stays in edit mode) when a formula doesn't parse.
+    /// Commit the editor text into the current cell as a typed entry
+    /// (gridcore::entry). Returns false (and stays in edit mode) when a
+    /// formula doesn't parse or the entry is over the 32,767-character cell
+    /// limit.
     fn commit_edit(&mut self) -> bool {
         let Some(edit) = self.edit.take() else {
             return true;
         };
         let text = edit.text;
-        if let Some(body) = text.strip_prefix('=') {
-            if !body.is_empty() {
+        let (r, c) = self.cur;
+        let formula = gridcore::entry::typed_formula(&self.pkg.workbook, self.sheet, r, c, &text);
+        if let Some(body) = formula {
+            {
                 if let Err(e) = Engine::validate(body) {
                     self.status = Some(format!("formula error: {e}"));
                     self.edit = Some(EditState {
@@ -3848,7 +3852,7 @@ impl App {
     /// translating relative refs — or, on a single cell, pull from the
     /// neighbor above/left.
     fn fill(&mut self, down: bool) {
-        let changes = fill_changes(self.sheet(), self.selection(), self.cur, down);
+        let changes = fill_changes(self.sheet(), self.selection(), down);
         if changes.is_empty() {
             return;
         }

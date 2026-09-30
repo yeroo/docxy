@@ -709,6 +709,7 @@ fn parse_styles(xml: &str) -> Styles {
                         .cloned()
                         .or_else(|| crate::numfmt::builtin_code(numfmt_id).map(str::to_string));
                     let font = fonts.get(font_id).cloned().unwrap_or_default();
+                    let loaded_from = Some(xfs.len() as u32);
                     xfs.push(Xf {
                         numfmt,
                         code,
@@ -722,6 +723,7 @@ fn parse_styles(xml: &str) -> Styles {
                         border: false,
                         wrap: false,
                         quote_prefix: matches!(p.attr("quotePrefix"), "1" | "true"),
+                        loaded_from,
                     });
                 }
                 "alignment" if in_cellxfs => {
@@ -799,6 +801,80 @@ fn bump_count(xml: &str, prefix: &str, delta: u32) -> String {
     out
 }
 
+/// The raw `<xf>` elements of `<cellXfs>`, in order.
+fn cell_xf_elements(xml: &str) -> Vec<&str> {
+    let Some(start) = xml.find("<cellXfs") else {
+        return Vec::new();
+    };
+    let end = xml[start..]
+        .find("</cellXfs>")
+        .map_or(xml.len(), |e| start + e);
+    let body = &xml[start..end];
+    let mut out = Vec::new();
+    let mut i = body.find('>').map_or(body.len(), |e| e + 1);
+    while let Some(p) = body[i..].find("<xf") {
+        let s = i + p;
+        if !body[s + 3..].starts_with([' ', '/', '>', '\t', '\r', '\n']) {
+            i = s + 3;
+            continue;
+        }
+        let Some(tag_end) = body[s..].find('>').map(|e| s + e + 1) else {
+            break;
+        };
+        let e = if body[..tag_end].ends_with("/>") {
+            tag_end
+        } else {
+            body[tag_end..]
+                .find("</xf>")
+                .map_or(body.len(), |x| tag_end + x + 5)
+        };
+        out.push(&body[s..e]);
+        i = e;
+    }
+    out
+}
+
+/// An attribute's raw value in one open tag.
+fn tag_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let key = format!(" {name}=\"");
+    let s = tag.find(&key)? + key.len();
+    let e = s + tag[s..].find('"')?;
+    Some(&tag[s..e])
+}
+
+/// Every `name="value"` of one open tag, raw, in order.
+fn tag_attrs(tag: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = tag
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim_end_matches('/');
+    rest = rest.split_once(char::is_whitespace).map_or("", |(_, r)| r);
+    while let Some(eq) = rest.find("=\"") {
+        let name = rest[..eq].trim().to_string();
+        let v0 = eq + 2;
+        let Some(v1) = rest[v0..].find('"').map(|e| v0 + e) else {
+            break;
+        };
+        out.push((name, rest[v0..v1].to_string()));
+        rest = &rest[v1 + 1..];
+    }
+    out
+}
+
+/// A child element of an `<xf>` as written (self-closing or not), e.g. its
+/// `<alignment …/>` or `<protection …/>`.
+fn child_open_tag(xf: &str, name: &str) -> Option<String> {
+    let s = xf.find(&format!("<{name}"))?;
+    let tag_end = s + xf[s..].find('>')? + 1;
+    if xf[..tag_end].ends_with("/>") {
+        return Some(xf[s..tag_end].to_string());
+    }
+    let close = format!("</{name}>");
+    let e = tag_end + xf[tag_end..].find(&close)? + close.len();
+    Some(xf[s..e].to_string())
+}
+
 /// The largest `numFmtId` used anywhere (custom ids start at 164).
 fn max_numfmt_id(xml: &str) -> u32 {
     let mut max = 163u32;
@@ -844,92 +920,162 @@ fn splice_styles(orig: &str, authored: &[Xf]) -> String {
         }
     };
 
+    // The loaded `<xf>` elements, to derive from (see `Xf::loaded_from`).
+    // Only trusted when they line up one-to-one with what the parser read.
+    let src_parsed = parse_styles(orig).xfs;
+    let src_raw = cell_xf_elements(orig);
+    let sources_ok = src_raw.len() == src_parsed.len();
+
     for xf in authored {
-        // Font (always minted so the id is exact).
-        let mut font = String::from("<font>");
-        if xf.bold {
-            font.push_str("<b/>");
-        }
-        if xf.italic {
-            font.push_str("<i/>");
-        }
-        if let Some((r, g, b)) = xf.color {
-            font.push_str(&format!("<color rgb=\"FF{r:02X}{g:02X}{b:02X}\"/>"));
-        }
-        font.push_str(&format!(
-            "<sz val=\"{}\"/><name val=\"{}\"/></font>",
-            fmt_size(xf.font_size.unwrap_or(11.0)),
-            esc_attr(xf.font_name.as_deref().unwrap_or("Calibri"))
-        ));
-        let font_id = font_base + fonts_added;
-        new_fonts.push_str(&font);
-        fonts_added += 1;
-
-        // Fill (only when a background is set).
-        let (fill_id, apply_fill) = if let Some((r, g, b)) = xf.fill {
-            new_fills.push_str(&format!(
-                "<fill><patternFill patternType=\"solid\"><fgColor rgb=\"FF{r:02X}{g:02X}{b:02X}\"/><bgColor indexed=\"64\"/></patternFill></fill>"
-            ));
-            let id = fill_base + fills_added;
-            fills_added += 1;
-            (id, true)
-        } else {
-            (0, false)
+        let source = xf
+            .loaded_from
+            .filter(|_| sources_ok)
+            .and_then(|i| Some((src_parsed.get(i as usize)?, src_raw.get(i as usize)?)));
+        let open = |raw: &str| raw[..raw.find('>').map_or(raw.len(), |e| e + 1)].to_string();
+        let src_id = |attr: &str| -> Option<u32> {
+            source.and_then(|(_, raw)| tag_attr(&open(raw), attr)?.parse().ok())
         };
 
-        // Border (a thin box around the cell) when set.
-        let (border_id, apply_border) = if xf.border {
-            new_borders.push_str(
-                "<border><left style=\"thin\"/><right style=\"thin\"/><top style=\"thin\"/><bottom style=\"thin\"/><diagonal/></border>",
-            );
-            let id = border_base + borders_added;
-            borders_added += 1;
-            (id, true)
-        } else {
-            (0, false)
+        // Font: the source's while bold/italic/colour/size/name still match
+        // (its underline and the rest come along), else a fresh one.
+        let same_font = source.is_some_and(|(sx, _)| {
+            (sx.bold, sx.italic, sx.color, sx.font_size, &sx.font_name)
+                == (xf.bold, xf.italic, xf.color, xf.font_size, &xf.font_name)
+        });
+        let font_id = match src_id("fontId").filter(|_| same_font) {
+            Some(id) => id,
+            None => {
+                let mut font = String::from("<font>");
+                if xf.bold {
+                    font.push_str("<b/>");
+                }
+                if xf.italic {
+                    font.push_str("<i/>");
+                }
+                if let Some((r, g, b)) = xf.color {
+                    font.push_str(&format!("<color rgb=\"FF{r:02X}{g:02X}{b:02X}\"/>"));
+                }
+                font.push_str(&format!(
+                    "<sz val=\"{}\"/><name val=\"{}\"/></font>",
+                    fmt_size(xf.font_size.unwrap_or(11.0)),
+                    esc_attr(xf.font_name.as_deref().unwrap_or("Calibri"))
+                ));
+                let id = font_base + fonts_added;
+                new_fonts.push_str(&font);
+                fonts_added += 1;
+                id
+            }
         };
 
-        // Number format (custom code only).
-        let (num_id, apply_num) = if let Some(code) = &xf.code {
-            let id = next_numfmt;
-            next_numfmt += 1;
-            numfmts_added += 1;
-            new_numfmts.push_str(&format!(
-                "<numFmt numFmtId=\"{id}\" formatCode=\"{}\"/>",
-                esc_attr(code)
-            ));
-            (id, true)
-        } else {
-            (0, false)
+        // Fill: the source's while the solid colour still matches.
+        let same_fill = source.is_some_and(|(sx, _)| sx.fill == xf.fill);
+        let fill_id = match src_id("fillId").filter(|_| same_fill) {
+            Some(id) => id,
+            None => {
+                if let Some((r, g, b)) = xf.fill {
+                    new_fills.push_str(&format!(
+                        "<fill><patternFill patternType=\"solid\"><fgColor rgb=\"FF{r:02X}{g:02X}{b:02X}\"/><bgColor indexed=\"64\"/></patternFill></fill>"
+                    ));
+                    let id = fill_base + fills_added;
+                    fills_added += 1;
+                    id
+                } else {
+                    0
+                }
+            }
         };
+
+        // Border: the source's while the box flag still matches.
+        let same_border = source.is_some_and(|(sx, _)| sx.border == xf.border);
+        let border_id = match src_id("borderId").filter(|_| same_border) {
+            Some(id) => id,
+            None => {
+                if xf.border {
+                    new_borders.push_str(
+                        "<border><left style=\"thin\"/><right style=\"thin\"/><top style=\"thin\"/><bottom style=\"thin\"/><diagonal/></border>",
+                    );
+                    let id = border_base + borders_added;
+                    borders_added += 1;
+                    id
+                } else {
+                    0
+                }
+            }
+        };
+
+        // Number format: the source's id while the code still matches, else
+        // a custom one.
+        let same_num = source.is_some_and(|(sx, _)| sx.code == xf.code);
+        let num_id = match src_id("numFmtId").filter(|_| same_num) {
+            Some(id) => id,
+            None => {
+                if let Some(code) = &xf.code {
+                    let id = next_numfmt;
+                    next_numfmt += 1;
+                    numfmts_added += 1;
+                    new_numfmts.push_str(&format!(
+                        "<numFmt numFmtId=\"{id}\" formatCode=\"{}\"/>",
+                        esc_attr(code)
+                    ));
+                    id
+                } else {
+                    0
+                }
+            }
+        };
+        let xf_id = src_id("xfId").unwrap_or(0);
 
         let mut x = format!(
-            "<xf numFmtId=\"{num_id}\" fontId=\"{font_id}\" fillId=\"{fill_id}\" borderId=\"{border_id}\" xfId=\"0\" applyFont=\"1\""
+            "<xf numFmtId=\"{num_id}\" fontId=\"{font_id}\" fillId=\"{fill_id}\" borderId=\"{border_id}\" xfId=\"{xf_id}\" applyFont=\"1\""
         );
-        if apply_num {
+        if num_id != 0 {
             x.push_str(" applyNumberFormat=\"1\"");
         }
-        if apply_fill {
+        if fill_id != 0 {
             x.push_str(" applyFill=\"1\"");
         }
-        if apply_border {
+        if border_id != 0 {
             x.push_str(" applyBorder=\"1\"");
         }
         if xf.quote_prefix {
             x.push_str(" quotePrefix=\"1\"");
         }
-        let horiz = xf.align.attr();
-        if horiz.is_some() || xf.wrap {
-            x.push_str(" applyAlignment=\"1\"><alignment");
-            if let Some(a) = horiz {
-                x.push_str(&format!(" horizontal=\"{a}\""));
-            }
-            if xf.wrap {
-                x.push_str(" wrapText=\"1\"");
-            }
-            x.push_str("/></xf>");
-        } else {
+
+        // Alignment: the source's attributes (vertical, indent, rotation…)
+        // with horizontal and wrapText as the xf now has them.
+        let mut align: Vec<(String, String)> = source
+            .and_then(|(_, raw)| child_open_tag(raw, "alignment"))
+            .map(|tag| tag_attrs(&tag))
+            .unwrap_or_default();
+        align.retain(|(k, _)| k != "horizontal" && k != "wrapText");
+        if let Some(a) = xf.align.attr() {
+            align.push(("horizontal".into(), a.to_string()));
+        }
+        if xf.wrap {
+            align.push(("wrapText".into(), "1".into()));
+        }
+        let protection = source.and_then(|(_, raw)| child_open_tag(raw, "protection"));
+        if protection.is_some() {
+            x.push_str(" applyProtection=\"1\"");
+        }
+        if align.is_empty() && protection.is_none() {
             x.push_str("/>");
+        } else {
+            if !align.is_empty() {
+                x.push_str(" applyAlignment=\"1\"");
+            }
+            x.push('>');
+            if !align.is_empty() {
+                x.push_str("<alignment");
+                for (k, v) in &align {
+                    x.push_str(&format!(" {k}=\"{v}\""));
+                }
+                x.push_str("/>");
+            }
+            if let Some(p) = protection {
+                x.push_str(&p);
+            }
+            x.push_str("</xf>");
         }
         new_xfs.push_str(&x);
     }
@@ -6031,6 +6177,100 @@ mod tests {
         assert_eq!(xf2.fill, Some((0xAB, 0xCD, 0xEF)));
         assert_eq!(xf2.align, Align::Center);
         assert_eq!(xf2.code.as_deref(), Some("0.00"));
+    }
+
+    #[test]
+    fn a_typed_entry_keeps_what_the_model_does_not_carry_of_a_loaded_style() {
+        // A General xf with an underlined font, a real (dashed) border, a
+        // vertical alignment and protection: none of them in `Xf`.
+        let mut pkg = new_xlsx();
+        let xml = String::from_utf8(pkg.part("xl/styles.xml").unwrap().to_vec()).unwrap();
+        let nf = read_count(&xml, "<fonts");
+        let nb = read_count(&xml, "<borders");
+        let mut xml = bump_count(&xml, "<fonts", 1);
+        xml = xml.replacen(
+            "</fonts>",
+            "<font><u/><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts>",
+            1,
+        );
+        xml = bump_count(&xml, "<borders", 1);
+        xml = xml.replacen(
+            "</borders>",
+            "<border><left style=\"dashed\"/><right/><top/><bottom/><diagonal/></border></borders>",
+            1,
+        );
+        xml = bump_count(&xml, "<cellXfs", 1);
+        xml = xml.replacen(
+            "</cellXfs>",
+            &format!(
+                "<xf numFmtId=\"0\" fontId=\"{nf}\" fillId=\"0\" borderId=\"{nb}\" xfId=\"0\" applyFont=\"1\" applyBorder=\"1\"><alignment vertical=\"top\" indent=\"1\"/><protection locked=\"0\"/></xf></cellXfs>"
+            ),
+            1,
+        );
+        pkg.set_part("xl/styles.xml", xml.into_bytes());
+        let mut pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let src = pkg.workbook.styles.xfs.len() as u32 - 1;
+        for (c, text) in [
+            "1/15/2024",
+            "'x",
+            "a
+b",
+        ]
+        .iter()
+        .enumerate()
+        {
+            pkg.workbook.sheets[0].set_cell(
+                0,
+                c as u32,
+                crate::sheet::Cell {
+                    style: src,
+                    ..crate::sheet::Cell::default()
+                },
+            );
+            let cell =
+                crate::entry::entry_cell(&mut pkg.workbook, 0, 0, c as u32, text, None).unwrap();
+            assert_ne!(cell.style, src, "{text} derives a new xf");
+            pkg.workbook.sheets[0].set_cell(0, c as u32, cell);
+        }
+        // A format command on the same cell (bold): a new font, the rest kept.
+        let mut bold = pkg.workbook.styles.xf(src);
+        bold.bold = true;
+        let b = pkg.workbook.styles.intern(bold);
+        pkg.workbook.sheets[0].set_cell(
+            1,
+            0,
+            crate::sheet::Cell {
+                style: b,
+                ..crate::sheet::Cell::text("b")
+            },
+        );
+
+        let saved = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let styles = String::from_utf8(saved.part("xl/styles.xml").unwrap().to_vec()).unwrap();
+        let xfs = cell_xf_elements(&styles);
+        let style_of = |r: u32, c: u32| saved.workbook.sheets[0].cell(r, c).unwrap().style as usize;
+        let attr = |i: usize, a: &str| tag_attr(xfs[i], a).map(str::to_string);
+        for c in 0..3 {
+            let i = style_of(0, c);
+            assert_eq!(attr(i, "fontId"), Some(nf.to_string()), "{}", xfs[i]);
+            assert_eq!(attr(i, "borderId"), Some(nb.to_string()), "{}", xfs[i]);
+            assert!(xfs[i].contains("vertical=\"top\""), "{}", xfs[i]);
+            assert!(xfs[i].contains("indent=\"1\""), "{}", xfs[i]);
+            assert!(xfs[i].contains("<protection locked=\"0\"/>"), "{}", xfs[i]);
+        }
+        let date = style_of(0, 0);
+        assert_eq!(
+            saved.workbook.styles.xf(date as u32).code.as_deref(),
+            Some("m/d/yyyy")
+        );
+        assert!(xfs[style_of(0, 1)].contains("quotePrefix=\"1\""));
+        assert!(xfs[style_of(0, 2)].contains("wrapText=\"1\""));
+        // Bold minted its own font but kept the border and the alignment.
+        let i = style_of(1, 0);
+        assert_ne!(attr(i, "fontId"), Some(nf.to_string()));
+        assert_eq!(attr(i, "borderId"), Some(nb.to_string()));
+        assert!(saved.workbook.styles.xf(i as u32).bold);
+        assert!(xfs[i].contains("vertical=\"top\""));
     }
 
     #[test]

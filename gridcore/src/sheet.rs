@@ -1383,6 +1383,28 @@ pub struct Xf {
     /// the value is text even where it reads as a number, and the editor shows
     /// the apostrophe again.
     pub quote_prefix: bool,
+    /// The `<cellXfs>` index this xf was loaded from, kept by every copy an
+    /// edit derives from it. Save writes a derived xf by reusing that source
+    /// element's font, fill, border, number format, alignment and protection
+    /// wherever the modeled fields still match it, so what the model does not
+    /// carry (underline, real borders, pattern fills, vertical alignment,
+    /// indent, protection) survives an edit. `None` for an xf built from
+    /// scratch.
+    pub loaded_from: Option<u32>,
+}
+
+impl Xf {
+    /// Set the number-format code, keeping the [`NumFmt`] classification in
+    /// step with it (`None` is General). Code that reads either half — the
+    /// entry rules, the `####` check, the classified display fallback —
+    /// then agrees.
+    pub fn set_code(&mut self, code: Option<String>) {
+        self.numfmt = code
+            .as_deref()
+            .map(classify_format_code)
+            .unwrap_or(NumFmt::General);
+        self.code = code;
+    }
 }
 
 /// A differential format (`<dxf>`) referenced by a conditional-formatting rule.
@@ -1774,10 +1796,16 @@ pub fn date_unrepresentable(xf: &Xf, value: &CellValue, date1904: bool) -> bool 
     if !n.is_finite() || serial_to_parts(*n, date1904).is_some() {
         return false;
     }
-    if let Some(fmt) = xf.code.as_deref().and_then(crate::numfmt::parse_format) {
-        return fmt.is_date_for(*n);
-    }
-    matches!(xf.numfmt, NumFmt::Date | NumFmt::Time | NumFmt::DateTime)
+    // The code decides when there is one; the classification only stands in
+    // for a code-less xf, so a stale pair cannot mis-drive the check.
+    let class = match xf.code.as_deref() {
+        Some(code) => match crate::numfmt::parse_format(code) {
+            Some(fmt) => return fmt.is_date_for(*n),
+            None => classify_format_code(code),
+        },
+        None => xf.numfmt,
+    };
+    matches!(class, NumFmt::Date | NumFmt::Time | NumFmt::DateTime)
 }
 
 /// Render a cell value through its full style: the real format-code runtime

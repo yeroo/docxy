@@ -689,11 +689,9 @@ fn cell_set(app: &mut App, args: &Json) -> Result<Json, String> {
     let (r, c) = ref_arg(args)?;
     let text = args.get_str("text").ok_or("cell.set needs 'text'")?;
     // Same validation as the TUI's commit path: a bad formula is rejected
-    // before it touches the workbook.
-    if let Some(body) = text.strip_prefix('=') {
-        if !body.is_empty() {
-            Engine::validate(body).map_err(|e| format!("formula error: {e}"))?;
-        }
+    // before it touches the workbook (a Text cell stores `=…` as text).
+    if let Some(body) = gridcore::entry::typed_formula(&app.pkg.workbook, si, r, c, text) {
+        Engine::validate(body).map_err(|e| format!("formula error: {e}"))?;
     }
     // Typed the way the grid types it: the cell's format decides, a
     // recognised shape takes its format, and an over-long entry is refused.
@@ -779,11 +777,12 @@ fn comment_remove(app: &mut App, args: &Json) -> Result<Json, String> {
     Ok(Json::obj(vec![("removed", Json::Bool(existed))]))
 }
 
-/// Write a rectangular block of cells starting at `start`, atomically: every
-/// formula in the batch is validated *before* anything is applied, so a bad
-/// formula anywhere in the block leaves the sheet (and the undo stack)
-/// completely untouched. The whole block lands as one [`App::apply_on`]
-/// call, i.e. one undo group.
+/// Write a rectangular block of cells starting at `start`, each string typed
+/// the way `cell.set` types it (gridcore::entry), atomically: every formula
+/// and every length in the batch is checked *before* anything is applied, so
+/// a bad formula or an over-long entry anywhere in the block leaves the sheet
+/// (and the undo stack) completely untouched. The whole block lands as one
+/// [`App::apply_on`] call, i.e. one undo group.
 fn range_set(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg(app, args)?;
     let start = args.get_str("start").ok_or("range.set needs a 'start'")?;
@@ -812,12 +811,9 @@ fn range_set(app: &mut App, args: &Json) -> Result<Json, String> {
     for (r, c, text) in &entries {
         gridcore::entry::check_len(text)
             .map_err(|e| format!("range.set: {} at {}", e, cell_name(*r, *c)))?;
-        if let Some(body) = text.strip_prefix('=') {
-            if !body.is_empty() {
-                Engine::validate(body).map_err(|e| {
-                    format!("range.set: formula error at {}: {e}", cell_name(*r, *c))
-                })?;
-            }
+        if let Some(body) = gridcore::entry::typed_formula(&app.pkg.workbook, si, *r, *c, text) {
+            Engine::validate(body)
+                .map_err(|e| format!("range.set: formula error at {}: {e}", cell_name(*r, *c)))?;
         }
     }
 
@@ -1296,6 +1292,62 @@ mod tests {
             a.pkg.workbook.sheets[0].cell(0, 1).is_none(),
             "nothing applied"
         );
+    }
+
+    #[test]
+    fn a_text_cell_takes_a_broken_formula_as_text_654() {
+        let mut a = app();
+        use gridcore::sheet::{NumFmt, Xf};
+        let text = a.pkg.workbook.styles.intern(Xf {
+            numfmt: NumFmt::Text,
+            code: Some("@".into()),
+            ..Xf::default()
+        });
+        for c in 0..2 {
+            a.pkg.workbook.sheets[0].set_cell(
+                0,
+                c,
+                Cell {
+                    style: text,
+                    ..Cell::default()
+                },
+            );
+        }
+        set(&mut a, "A1", "=SUM(");
+        assert_eq!(get(&mut a, "A1").get_str("value"), Some("=SUM("));
+        dispatch(
+            &mut a,
+            "range.set",
+            &Json::obj(vec![
+                ("start", Json::Str("B1".into())),
+                (
+                    "rows",
+                    Json::Arr(vec![Json::Arr(vec![Json::Str("=1+".into())])]),
+                ),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(get(&mut a, "B1").get_str("value"), Some("=1+"));
+        // A General cell still refuses it.
+        assert!(
+            cell_set(
+                &mut a,
+                &Json::obj(vec![
+                    ("ref", Json::Str("C1".into())),
+                    ("text", Json::Str("=SUM(".into()))
+                ]),
+            )
+            .is_err()
+        );
+        // And the TUI's commit path.
+        a.cur = (0, 0);
+        a.edit = Some(crate::EditState {
+            text: "=1+".into(),
+            cursor: 3,
+            replace: false,
+        });
+        assert!(a.commit_edit());
+        assert_eq!(get(&mut a, "A1").get_str("value"), Some("=1+"));
     }
 
     #[test]

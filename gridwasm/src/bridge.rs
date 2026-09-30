@@ -195,12 +195,13 @@ impl Session {
                         return None;
                     }
                     let text = p[2];
-                    if let Some(body) = text.strip_prefix('=') {
-                        if !body.is_empty() {
-                            if let Err(e) = Engine::validate(body) {
-                                self.err = Some(format!("formula error: {e}"));
-                                return None;
-                            }
+                    let wb = &self.pkg.workbook;
+                    // A Text cell stores `=…` as text: nothing to validate.
+                    if let Some(body) = gridcore::entry::typed_formula(wb, self.active, r, c, text)
+                    {
+                        if let Err(e) = Engine::validate(body) {
+                            self.err = Some(format!("formula error: {e}"));
+                            return None;
                         }
                     }
                     let today = self.engine.clock;
@@ -519,8 +520,22 @@ impl Session {
         self.engine = engine;
     }
 
-    /// The raw editable source of a cell: `=FORMULA` or the raw value text,
-    /// with a quote prefix's apostrophe put back.
+    /// What the editor and formula bar start from: [`Session::cell_src`] with
+    /// a quote prefix's apostrophe put back, so re-committing keeps it text.
+    fn cell_seed(&self, row: u32, col: u32) -> String {
+        let src = self.cell_src(row, col);
+        let styles = &self.pkg.workbook.styles;
+        match self.pkg.workbook.sheets[self.active].cell(row, col) {
+            Some(cell) if gridcore::entry::shows_quote_prefix(cell, &styles.xf(cell.style)) => {
+                format!("'{src}")
+            }
+            _ => src,
+        }
+    }
+
+    /// The raw source of a cell, as copied: `=FORMULA` or the raw value text.
+    /// (The number keeps Rust's shortest round-trip text rather than
+    /// General's 15-digit rounding, so a copy or an edit never loses digits.)
     fn cell_src(&self, row: u32, col: u32) -> String {
         let Some(cell) = self.pkg.workbook.sheets[self.active].cell(row, col) else {
             return String::new();
@@ -529,9 +544,6 @@ impl Session {
             return format!("={f}");
         }
         match &cell.value {
-            CellValue::Text(s) if self.pkg.workbook.styles.xf(cell.style).quote_prefix => {
-                format!("'{s}")
-            }
             CellValue::Empty => String::new(),
             CellValue::Number(n) => {
                 // Shortest round-trip text (Rust's f64 Display is shortest).
@@ -816,7 +828,7 @@ impl Session {
         out.push_str("},\"cur\":{\"ref\":");
         json::push_str(&mut out, &cell_name(self.cur.0, self.cur.1));
         out.push_str(",\"src\":");
-        let src = self.cell_src(self.cur.0, self.cur.1);
+        let src = self.cell_seed(self.cur.0, self.cur.1);
         json::push_str(&mut out, &src);
         // The active cell's format, so the toolbar can show pressed state
         // (bold/italic buttons, the align group) without a separate round
@@ -1830,10 +1842,11 @@ impl Session {
         Ok(out)
     }
 
-    /// `{start,rows:[[string]],sheet?}` -> `{set,undoSteps}` — ATOMIC: every
-    /// formula in the batch is validated *before* anything is applied, so a
-    /// bad formula anywhere leaves the sheet (and the undo stack) completely
-    /// untouched. The whole block lands as one [`Session::apply`] call, i.e.
+    /// `{start,rows:[[string]],sheet?}` -> `{set,undoSteps}`, each string
+    /// typed the way `set` types it (gridcore::entry) — ATOMIC: every formula
+    /// and every length in the batch is checked *before* anything is applied,
+    /// so a bad formula or an over-long entry anywhere leaves the sheet (and
+    /// the undo stack) completely untouched. The whole block lands as one [`Session::apply`] call, i.e.
     /// one true wasm-undo-stack group (`undoSteps:1`; `0` only for a
     /// genuinely empty `rows` batch, which `apply` no-ops on). Mirrors xlsxy
     /// control.rs's `range_set`.
@@ -1860,14 +1873,13 @@ impl Session {
             }
         }
 
-        // Pass 1: validate every formula before touching anything.
+        // Pass 1: validate every formula and length before touching anything.
         for (r, c, text) in &entries {
-            if let Some(body) = text.strip_prefix('=') {
-                if !body.is_empty() {
-                    Engine::validate(body).map_err(|e| {
-                        format!("range.set: formula error at {}: {e}", cell_name(*r, *c))
-                    })?;
-                }
+            let wb = &self.pkg.workbook;
+            if let Some(body) = gridcore::entry::typed_formula(wb, si, *r, *c, text) {
+                Engine::validate(body).map_err(|e| {
+                    format!("range.set: formula error at {}: {e}", cell_name(*r, *c))
+                })?;
             }
             gridcore::entry::check_len(text)
                 .map_err(|e| format!("range.set: {e} at {}", cell_name(*r, *c)))?;
@@ -3357,9 +3369,9 @@ mod tests {
     #[test]
     fn set_refuses_an_entry_over_the_cell_limit_658() {
         let mut s = Session::open(&sample_xlsx()).expect("open");
-        s.dispatch("set	0	0	old");
+        s.dispatch("set\t0\t0\told");
         s.err = None;
-        s.dispatch(&format!("set	0	0	{}", "y".repeat(32_768)));
+        s.dispatch(&format!("set\t0\t0\t{}", "y".repeat(32_768)));
         let err = s.err.clone().expect("an error");
         assert!(err.contains("32767"), "{err}");
         assert_eq!(s.cell_src(0, 0), "old");
@@ -3371,13 +3383,44 @@ mod tests {
     }
 
     #[test]
+    fn a_text_cell_takes_a_broken_formula_as_text() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let text = s.pkg.workbook.styles.intern(gridcore::sheet::Xf {
+            numfmt: gridcore::sheet::NumFmt::Text,
+            code: Some("@".into()),
+            ..Default::default()
+        });
+        let a = s.active;
+        s.pkg.workbook.sheets[a].set_cell(
+            30,
+            0,
+            Cell {
+                style: text,
+                ..Cell::default()
+            },
+        );
+        s.err = None;
+        s.dispatch("set\t30\t0\t=SUM(");
+        assert_eq!(s.err, None);
+        assert_eq!(s.cell_src(30, 0), "=SUM(");
+        s.dispatch("set\t31\t0\t=SUM(");
+        assert!(s.err.is_some(), "a General cell still refuses it");
+    }
+
+    #[test]
     fn set_reads_entries_the_way_excel_does() {
         let mut s = Session::open(&sample_xlsx()).expect("open");
-        s.dispatch("set	20	0	'007");
-        assert_eq!(s.cell_src(20, 0), "'007");
+        s.dispatch("set\t20\t0\t'007");
+        assert_eq!(s.cell_seed(20, 0), "'007");
+        // Copy carries the value; pasting it back gives the same text.
+        assert_eq!(s.cell_src(20, 0), "007");
+        s.cur = (20, 0);
+        s.anchor = None;
+        let tsv = s.selection_tsv();
+        assert_eq!(tsv.trim_end(), "007");
         let cell = s.pkg.workbook.sheets[s.active].cell(20, 0).unwrap().clone();
         assert_eq!(cell.value, CellValue::Text("007".into()));
-        s.dispatch("set	21	0	$1,234.56");
+        s.dispatch("set\t21\t0\t$1,234.56");
         let cell = s.pkg.workbook.sheets[s.active].cell(21, 0).unwrap().clone();
         assert_eq!(cell.value, CellValue::Number(1234.56));
     }
