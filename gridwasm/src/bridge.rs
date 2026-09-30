@@ -3673,8 +3673,8 @@ mod tests {
         let mut s = Session::open(&sample_xlsx()).expect("open");
         let out = s.ctl(r#"{"verb":"wb.export-csv","args":{}}"#);
         assert!(out.contains("\"sheet\":0"), "{out}");
-        assert!(out.contains("Item,Price"), "{out}");
-        assert!(out.contains("Apple,1.25"), "{out}");
+        // Excel's CSV text: CR LF records, as xlsxy's verb returns.
+        assert!(out.contains(r"Item,Price\r\nApple,1.25"), "{out}");
         assert!(out.contains("3.75"), "{out}");
     }
 

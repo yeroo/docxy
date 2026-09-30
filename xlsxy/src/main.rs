@@ -67,13 +67,17 @@ fn export_csv_headless(
     import_source: Option<&str>,
     out: &str,
 ) -> io::Result<usize> {
-    let csv = sheet_to_csv(
-        &pkg.workbook.sheets[0],
-        &pkg.workbook.styles,
-        pkg.workbook.date1904,
-    );
-    export_csv_bytes(source, import_source, out, csv.as_bytes())?;
-    Ok(csv.len())
+    let wb = &pkg.workbook;
+    let bytes = csv_utf8_bytes(&wb.sheets[wb.active_tab.min(wb.sheets.len() - 1)], wb);
+    export_csv_bytes(source, import_source, out, &bytes)?;
+    Ok(bytes.len())
+}
+
+/// A sheet as Excel's *CSV UTF-8 (Comma delimited)* file: a byte-order mark,
+/// then CR LF records.
+fn csv_utf8_bytes(sheet: &gridcore::sheet::Sheet, wb: &gridcore::sheet::Workbook) -> Vec<u8> {
+    let csv = sheet_to_csv(sheet, &wb.styles, wb.date1904);
+    gridcore::textio::encode(&csv, gridcore::textio::Encoding::Utf8Bom)
 }
 
 /// An imported text file stays protected independently of the rebound .xlsx
@@ -408,7 +412,7 @@ fn print_usage() {
            xlsxy <file.xlsx>                open a workbook\n  \
            xlsxy <file.csv|.tsv>            import CSV/TSV as a new workbook\n  \
            xlsxy <in> --recalc <out.xlsx>   recalculate all formulas, save, exit\n  \
-           xlsxy <in> --csv <out.csv>       export the first sheet as CSV, exit\n  \
+           xlsxy <in> --csv <out.csv>       export the active sheet as CSV UTF-8, exit\n  \
            xlsxy <in> --verify              conformance scoreboard: recalculate\n  \
                                             and diff against Excel's cached values\n  \
            xlsxy <file> --vim               modal (vim) navigation: hjkl, v, dd, :w :q\n  \
@@ -1001,12 +1005,17 @@ impl App {
         // (not when iterative calculation is on: the circles are intended).
         let status = (pkg.workbook.iterate.is_none() && !engine.circular_refs().is_empty())
             .then(|| CIRCULAR_WARNING.to_string());
+        // A workbook opens on the sheet it was saved on.
+        let pkg_active_tab = pkg
+            .workbook
+            .active_tab
+            .min(pkg.workbook.sheets.len().saturating_sub(1));
         App {
             pkg,
             engine,
             path: path.to_string(),
             import_source: None,
-            sheet: 0,
+            sheet: pkg_active_tab,
             cur: (0, 0),
             anchor: None,
             top: 0,
@@ -2130,6 +2139,8 @@ impl App {
     /// Serialize the package, persisting model definitions in the custom
     /// part (removed again when the model is empty).
     fn package_bytes(&mut self) -> Vec<u8> {
+        // The workbook reopens on the sheet it is saved on.
+        self.pkg.workbook.active_tab = self.sheet;
         self.pkg.remove_part(MODEL_PART);
         if !self.model_rels.is_empty() || !self.model_measures.is_empty() {
             let xml = model_part_xml(&self.model_rels, &self.model_measures);
@@ -3052,7 +3063,9 @@ impl App {
     }
 
     fn reset_view(&mut self) {
-        self.sheet = 0;
+        // A workbook opens on the sheet it was saved on.
+        let wb = &self.pkg.workbook;
+        self.sheet = wb.active_tab.min(wb.sheets.len().saturating_sub(1));
         self.cur = (0, 0);
         self.top = 0;
         self.left = 0;
@@ -3063,23 +3076,14 @@ impl App {
         self.comment_sel = 0;
     }
 
-    /// Export the current sheet to a `.csv` next to the workbook.
+    /// Export the current sheet to a `.csv` (CSV UTF-8) next to the workbook.
     fn export_csv(&mut self) {
-        let csv = sheet_to_csv(
-            self.sheet(),
-            &self.pkg.workbook.styles,
-            self.pkg.workbook.date1904,
-        );
+        let csv = csv_utf8_bytes(self.sheet(), &self.pkg.workbook);
         let out = match self.path.rsplit_once('.') {
             Some((base, _)) => format!("{base}.csv"),
             None => format!("{}.csv", self.path),
         };
-        match export_csv_bytes(
-            &self.path,
-            self.import_source.as_deref(),
-            &out,
-            csv.as_bytes(),
-        ) {
+        match export_csv_bytes(&self.path, self.import_source.as_deref(), &out, &csv) {
             Ok(()) => self.status = Some(format!("Exported {out} ({} bytes)", csv.len())),
             Err(e) => self.status = Some(format!("Export failed: {e}")),
         }
@@ -6546,6 +6550,29 @@ mod tests {
     use super::*;
     use gridcore::edit::parse_input;
     use gridcore::xlsx::save_xlsx;
+
+    /// #604: a workbook opens on the sheet it was saved on, and saving
+    /// records the sheet the user is on.
+    #[test]
+    fn a_workbook_opens_on_its_active_sheet_and_saves_the_current_one() {
+        let dir = std::env::temp_dir().join(format!("xlsxy-active-tab-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("active.xlsx");
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Two");
+        pkg.workbook.active_tab = 1;
+        std::fs::write(&path, save_xlsx(&pkg)).unwrap();
+        let loaded = load_xlsx(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(App::new(loaded, path.to_str().unwrap()).sheet, 1);
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.open_workbook(path.to_str().unwrap());
+        assert_eq!(app.sheet, 1);
+        app.sheet = 0;
+        app.save();
+        let saved = load_xlsx(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.workbook.active_tab, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn imported_csv_stays_protected_until_successful_save_as_or_new() {

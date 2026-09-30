@@ -1642,7 +1642,8 @@ mod tests {
         set(&mut a, "B2", "30");
         let r = dispatch(&mut a, "wb.export-csv", &Json::Null).unwrap();
         assert_eq!(r.get_usize("sheet"), Some(0));
-        assert_eq!(r.get_str("csv"), Some("name,amount\nAlice,30\n"));
+        // Excel's CSV text: CR LF records (a file adds the BOM).
+        assert_eq!(r.get_str("csv"), Some("name,amount\r\nAlice,30\r\n"));
     }
 
     fn pivot_fixture(a: &mut App) {

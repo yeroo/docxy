@@ -1288,6 +1288,10 @@ pub struct Workbook {
     /// Iterative calculation opt-in from `<calcPr iterate="1">`:
     /// (max iterations, convergence delta). None = cycles are errors.
     pub iterate: Option<(u32, f64)>,
+    /// The active sheet (`<workbookView activeTab>`): the sheet the workbook
+    /// opens on and the one a CSV export writes. Saved back with
+    /// `tabSelected` on that sheet alone.
+    pub active_tab: usize,
 }
 
 impl Workbook {
@@ -1858,30 +1862,12 @@ pub fn format_with(xf: &Xf, value: &CellValue, date1904: bool) -> String {
     format_value(value, xf.numfmt, date1904)
 }
 
-/// Export one sheet as RFC-4180-ish CSV (display values, formulas evaluated
-/// to their cached results).
+/// Export one sheet as CSV text the way Excel writes it (display values,
+/// formulas as their cached results, CR LF after each record, LF inside a
+/// quoted field). The file's encoding (Excel's UTF-8 BOM) is the writer's:
+/// see [`crate::textio::encode`].
 pub fn sheet_to_csv(sheet: &Sheet, styles: &Styles, date1904: bool) -> String {
-    let (rows, cols) = sheet.used_size();
-    let mut out = String::new();
-    for r in 0..rows {
-        for c in 0..cols {
-            if c > 0 {
-                out.push(',');
-            }
-            if let Some(cell) = sheet.cell(r, c) {
-                let text = format_with(&styles.xf(cell.style), &cell.value, date1904);
-                if text.contains([',', '"', '\n', '\r']) {
-                    out.push('"');
-                    out.push_str(&text.replace('"', "\"\""));
-                    out.push('"');
-                } else {
-                    out.push_str(&text);
-                }
-            }
-        }
-        out.push('\n');
-    }
-    out
+    crate::textio::sheet_text(sheet, styles, date1904, ',')
 }
 
 #[cfg(test)]
@@ -2439,7 +2425,8 @@ mod tests {
         s.set_cell(0, 1, Cell::number(2.0));
         s.set_cell(1, 0, Cell::text("plain"));
         let csv = sheet_to_csv(&s, &Styles::default(), false);
-        assert_eq!(csv, "\"a,b\",2\nplain,\n");
+        // Excel's record end is CR LF.
+        assert_eq!(csv, "\"a,b\",2\r\nplain,\r\n");
     }
 
     #[test]
