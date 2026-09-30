@@ -4480,10 +4480,25 @@ fn patch_counts(xml: &str, total: usize) -> String {
 }
 
 /// Remove the first `prefix…/>` element whose text contains `needle`.
+///
+/// A `prefix` ending in a name character matches only the whole element
+/// name: `<Relationship` does not match the `<Relationships>` root, nor
+/// `<pivotCache` the `<pivotCaches>` wrapper, whose span up to the first
+/// child's `/>` would otherwise take the wrapper's open tag with it.
 fn remove_element_containing(xml: &str, prefix: &str, needle: &str) -> String {
+    let whole_name = prefix.bytes().last().is_some_and(is_xml_name_byte);
     let mut search_from = 0;
     while let Some(rel) = xml[search_from..].find(prefix) {
         let start = search_from + rel;
+        if whole_name
+            && xml
+                .as_bytes()
+                .get(start + prefix.len())
+                .is_some_and(|&b| is_xml_name_byte(b))
+        {
+            search_from = start + prefix.len();
+            continue;
+        }
         let end = match xml[start..].find("/>") {
             Some(i) => start + i + 2,
             None => break,
@@ -4494,6 +4509,12 @@ fn remove_element_containing(xml: &str, prefix: &str, needle: &str) -> String {
         search_from = end;
     }
     xml.to_string()
+}
+
+/// Whether `b` can continue an XML name (ASCII letters, digits, `-_.:`, and
+/// any byte of a non-ASCII character).
+fn is_xml_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':') || b >= 0x80
 }
 
 /// Guarantee `<calcPr … fullCalcOnLoad="1"/>` in workbook.xml.
@@ -5584,12 +5605,13 @@ impl SheetPackage {
         if !cache_rid.is_empty() {
             if let Some(p) = self.parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
                 let xml = String::from_utf8_lossy(&p.1).into_owned();
-                p.1 = remove_element_containing(
+                let xml = remove_element_containing(
                     &xml,
                     "<pivotCache",
                     &format!("r:id=\"{cache_rid}\""),
-                )
-                .into_bytes();
+                );
+                // The schema wants at least one <pivotCache> in the wrapper.
+                p.1 = xml.replace("<pivotCaches></pivotCaches>", "").into_bytes();
             }
         }
         // Destination sheet's rels: drop its relationship to the table part.
@@ -7447,6 +7469,74 @@ mod tests {
         assert_eq!(s.col_width(1), 20.0);
         assert!(s.row_attrs.get(&0).unwrap().contains("customHeight"));
         assert_eq!(s.merges, vec![(4, 0, 5, 1)]);
+    }
+
+    #[test]
+    fn calc_chain_first_relationship_keeps_rels_root() {
+        let mut pkg = load_xlsx(&fixture()).expect("load");
+        let rels = part_text(&pkg, "xl/_rels/workbook.xml.rels");
+        let calc = "<Relationship Id=\"rId4\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/calcChain\" Target=\"calcChain.xml\"/>";
+        let first =
+            rels.replace(calc, "")
+                .replacen("<Relationship ", &format!("{calc}<Relationship "), 1);
+        assert!(first.contains(&format!("relationships\">{calc}")));
+        pkg.set_part("xl/_rels/workbook.xml.rels", first.into_bytes());
+
+        let saved = load_xlsx(&save_xlsx(&pkg)).expect("reload");
+        let rels = part_text(&saved, "xl/_rels/workbook.xml.rels");
+        assert!(rels.contains("<Relationships xmlns="), "{rels}");
+        assert!(!rels.contains("calcChain"), "{rels}");
+        for target in ["worksheets/sheet1.xml", "styles.xml", "sharedStrings.xml"] {
+            assert!(rels.contains(&format!("Target=\"{target}\"")), "{rels}");
+        }
+    }
+
+    #[test]
+    fn remove_element_containing_skips_longer_name() {
+        let rels = "<Relationships xmlns=\"r\"><Relationship Id=\"rId1\" Target=\"a.xml\"/><Relationship Id=\"rId2\" Target=\"b.xml\"/></Relationships>";
+        assert_eq!(
+            remove_element_containing(rels, "<Relationship", "a.xml"),
+            "<Relationships xmlns=\"r\"><Relationship Id=\"rId2\" Target=\"b.xml\"/></Relationships>"
+        );
+        let caches = "<pivotCaches><pivotCache cacheId=\"1\" r:id=\"rId5\"/></pivotCaches>";
+        assert_eq!(
+            remove_element_containing(caches, "<pivotCache", "rId5"),
+            "<pivotCaches></pivotCaches>"
+        );
+        // A prefix that already ends the name (`<sheet `) is taken as given.
+        let sheets = "<sheets><sheet name=\"A\" r:id=\"rId1\"/></sheets>";
+        assert_eq!(
+            remove_element_containing(sheets, "<sheet ", "rId1"),
+            "<sheets></sheets>"
+        );
+    }
+
+    #[test]
+    fn removing_a_first_child_keeps_each_wrapper() {
+        // The pivot cache is the only child of <pivotCaches>, and the pivot
+        // table the first relationship of its sheet's rels.
+        let mut pkg = load_xlsx(&pivot_fixture()).unwrap();
+        assert!(pkg.remove_pivot(0));
+        let wb = part_text(&pkg, "xl/workbook.xml");
+        assert!(!wb.contains("pivotCache"), "{wb}");
+        assert!(wb.contains("</sheets></workbook>"), "{wb}");
+        let ws_rels = part_text(&pkg, "xl/worksheets/_rels/sheet2.xml.rels");
+        assert!(ws_rels.contains("<Relationships xmlns="), "{ws_rels}");
+        assert!(!ws_rels.contains("pivotTable"), "{ws_rels}");
+        let wb_rels = part_text(&pkg, "xl/_rels/workbook.xml.rels");
+        assert!(!wb_rels.contains("pivotCache"), "{wb_rels}");
+        assert!(load_xlsx(&save_xlsx(&pkg)).is_ok());
+
+        // The sheet-removal path: sheet 1's relationship is rId1, the first.
+        let mut pkg = load_xlsx(&pivot_fixture()).unwrap();
+        assert!(pkg.remove_sheet(0));
+        let wb_rels = part_text(&pkg, "xl/_rels/workbook.xml.rels");
+        assert!(wb_rels.contains("<Relationships xmlns="), "{wb_rels}");
+        assert!(!wb_rels.contains("worksheets/sheet1.xml"), "{wb_rels}");
+        assert!(wb_rels.contains("worksheets/sheet2.xml"), "{wb_rels}");
+        let saved = load_xlsx(&save_xlsx(&pkg)).expect("reload");
+        assert_eq!(saved.workbook.sheets.len(), 1);
+        assert_eq!(saved.workbook.sheets[0].name, "Report");
     }
 
     #[test]
