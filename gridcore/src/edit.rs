@@ -701,53 +701,142 @@ pub fn subtotal(
     added
 }
 
-/// Split each text cell in column `col` over rows `r1..=r2` at `delim`, writing
-/// the parts into `col`, `col+1`, … (overwriting adjacent cells, as Excel does).
-/// Numeric-looking parts become numbers. Rows without the delimiter are left
-/// alone. Returns how many rows were split.
-///
-/// `r2` is clamped to the last used row, so the `A1:A1048576` whole-column
-/// idiom walks the sheet rather than a million empty rows (see `sort_rows`).
-pub fn text_to_columns(
-    wb: &mut Workbook,
-    sheet: usize,
-    col: u32,
-    r1: u32,
-    r2: u32,
-    delim: char,
-) -> usize {
-    let Some(s) = wb.sheets.get_mut(sheet) else {
-        return 0;
+/// Excel's refusal when Text to Columns is given more than one column.
+pub const TTC_ONE_COLUMN: &str = "Microsoft Excel can convert only one column at a time. \
+The range can be many rows tall but no more than one column wide. Try again by selecting \
+cells in one column only.";
+
+/// Excel's question before Text to Columns overwrites cells that hold data.
+pub const TTC_REPLACE: &str = "Do you want to replace the contents of the destination cells?";
+
+/// What Text to Columns converts and where the result goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TtcSource {
+    pub sheet: usize,
+    pub col: u32,
+    pub r1: u32,
+    pub r2: u32,
+    /// The Destination cell for the first row's first field.
+    pub dest: (u32, u32),
+}
+
+impl TtcSource {
+    /// The selection `(r1, c1, r2, c2)` on `sheet`, converted in place. More
+    /// than one column is refused with [`TTC_ONE_COLUMN`].
+    pub fn new(sheet: usize, (r1, c1, r2, c2): (u32, u32, u32, u32)) -> Result<Self, &'static str> {
+        if c1 != c2 {
+            return Err(TTC_ONE_COLUMN);
+        }
+        Ok(TtcSource {
+            sheet,
+            col: c1,
+            r1: r1.min(r2),
+            r2: r1.max(r2),
+            dest: (r1.min(r2), c1),
+        })
+    }
+}
+
+/// Each non-empty source cell's row and its fields, and where they land:
+/// (row, field index, destination column) for every field not skipped.
+#[allow(clippy::type_complexity)]
+fn ttc_fields(
+    wb: &Workbook,
+    src: &TtcSource,
+    opts: &crate::textio::TextParse,
+) -> Vec<(u32, Vec<(String, usize, u32)>)> {
+    let Some(s) = wb.sheets.get(src.sheet) else {
+        return Vec::new();
     };
     let used_rows = s.used_size().0;
-    if used_rows == 0 {
-        return 0;
+    if used_rows == 0 || src.r1 >= used_rows {
+        return Vec::new();
     }
-    let r2 = r2.min(used_rows - 1);
-    let splits: Vec<(u32, Vec<String>)> = (r1..=r2)
-        .filter_map(|r| {
-            let cell = s.cell(r, col)?;
-            if let crate::sheet::CellValue::Text(t) = &cell.value {
-                let parts: Vec<String> = t.split(delim).map(|p| p.trim().to_string()).collect();
-                if parts.len() > 1 {
-                    return Some((r, parts));
-                }
+    // `r2` is clamped to the last used row, so the `A1:A1048576` whole-column
+    // idiom walks the sheet rather than a million empty rows (see `sort_rows`).
+    let r2 = src.r2.min(used_rows - 1);
+    let mut out = Vec::new();
+    for r in src.r1..=r2 {
+        let Some(cell) = s.cell(r, src.col) else {
+            continue;
+        };
+        if cell.formula.is_none() && matches!(cell.value, CellValue::Empty) {
+            continue;
+        }
+        // The text the wizard shows for the cell: numbers and dates as
+        // displayed, formulas as their results.
+        let text = crate::sheet::format_with(&wb.styles.xf(cell.style), &cell.value, wb.date1904);
+        let dest_row = src.dest.0 + (r - src.r1);
+        let mut placed = Vec::new();
+        let mut c = src.dest.1;
+        for (i, field) in crate::textio::split_value(&text, opts)
+            .into_iter()
+            .enumerate()
+        {
+            if opts.column(i) == crate::textio::ColFormat::Skip {
+                continue;
             }
-            None
+            placed.push((field, i, c));
+            c += 1;
+        }
+        out.push((dest_row, placed));
+    }
+    out
+}
+
+/// Would Text to Columns overwrite a cell holding data? The source column's
+/// own cells do not count: converting them in place is the point.
+pub fn ttc_would_overwrite(
+    wb: &Workbook,
+    src: &TtcSource,
+    opts: &crate::textio::TextParse,
+) -> bool {
+    let Some(s) = wb.sheets.get(src.sheet) else {
+        return false;
+    };
+    let in_source = |r: u32, c: u32| c == src.col && (src.r1..=src.r2).contains(&r);
+    ttc_fields(wb, src, opts).iter().any(|(r, fields)| {
+        fields.iter().any(|&(_, _, c)| {
+            !in_source(*r, c)
+                && s.cell(*r, c)
+                    .is_some_and(|cell| cell.formula.is_some() || cell.value != CellValue::Empty)
         })
-        .collect();
-    let n = splits.len();
-    for (r, parts) in splits {
-        for (i, part) in parts.into_iter().enumerate() {
-            let c = col + i as u32;
-            let cell = match part.parse::<f64>() {
-                Ok(num) if !part.is_empty() => crate::sheet::Cell::number(num),
-                _ => crate::sheet::Cell::text(&part),
-            };
-            s.set_cell(r, c, cell);
+    })
+}
+
+/// Text to Columns: split each non-empty cell of the source column under
+/// `opts` (delimiters and qualifier, or fixed width) and write the fields
+/// from the destination cell rightwards, each converted under its column's
+/// format (General, Text, Date, or skipped) and the Advanced separators.
+/// A cell that does not split still has its first field converted. Cells
+/// are overwritten as Excel does once the user has agreed (see
+/// [`ttc_would_overwrite`]). Returns how many rows were converted.
+pub fn text_to_columns(
+    wb: &mut Workbook,
+    src: &TtcSource,
+    opts: &crate::textio::TextParse,
+    today: Option<f64>,
+) -> usize {
+    let rows = ttc_fields(wb, src, opts);
+    let ctx = EntryCtx {
+        date1904: wb.date1904,
+        today,
+    };
+    let auto = crate::textio::AutoConvert::default();
+    let Workbook { sheets, styles, .. } = wb;
+    let Some(s) = sheets.get_mut(src.sheet) else {
+        return 0;
+    };
+    for (r, fields) in &rows {
+        for (field, i, c) in fields {
+            if let Some(conv) =
+                crate::textio::convert_field(field, opts.column(*i), opts, &auto, &ctx)
+            {
+                crate::textio::put(s, styles, *r, *c, conv);
+            }
         }
     }
-    n
+    rows.len()
 }
 
 /// Rename a sheet and rewrite every reference to it (formulas on all sheets
@@ -1271,17 +1360,40 @@ mod tests {
         assert_eq!(sort_rows(&mut wb(&[]), 0, 0, 100, &[(0, true)]), 0);
     }
 
+    fn comma() -> crate::textio::TextParse {
+        crate::textio::TextParse {
+            kind: crate::textio::SplitKind::Delimited {
+                delims: crate::textio::Delimiters::only(','),
+                consecutive: false,
+            },
+            ..crate::textio::TextParse::default()
+        }
+    }
+
+    /// Column A, rows `r1..=r2`, converted in place.
+    fn col_a(r1: u32, r2: u32) -> TtcSource {
+        TtcSource::new(0, (r1, 0, r2, 0)).unwrap()
+    }
+
     #[test]
     fn a_whole_column_text_to_columns_stops_at_the_last_used_row() {
         let mut w = wb(&[("A1", Cell::text("a,b")), ("A2", Cell::text("c,d"))]);
-        let n = text_to_columns(&mut w, 0, 0, 0, crate::sheet::MAX_ROWS - 1, ',');
+        let n = text_to_columns(
+            &mut w,
+            &col_a(0, crate::sheet::MAX_ROWS - 1),
+            &comma(),
+            None,
+        );
         assert_eq!(n, 2);
         let s = &w.sheets[0];
         assert_eq!(
             s.cell(0, 1).map(|c| c.value.clone()),
             Some(CellValue::Text("b".into()))
         );
-        assert_eq!(text_to_columns(&mut wb(&[]), 0, 0, 0, 100, ','), 0);
+        assert_eq!(
+            text_to_columns(&mut wb(&[]), &col_a(0, 100), &comma(), None),
+            0
+        );
     }
 
     #[test]
@@ -1573,16 +1685,159 @@ mod tests {
             ("A1", Cell::text("Laptop,2,1199")),
             ("A2", Cell::text("Dock,1,179")),
             ("A3", Cell::text("NoDelimiter")),
+            ("A4", Cell::text(" 7 ")),
         ]);
-        let n = text_to_columns(&mut w, 0, 0, 0, 2, ',');
-        assert_eq!(n, 2);
+        // Every non-empty cell is converted, split or not.
+        let n = text_to_columns(&mut w, &col_a(0, 3), &comma(), None);
+        assert_eq!(n, 4);
         assert_eq!(value_at(&w, "A1"), CellValue::Text("Laptop".into()));
         assert_eq!(value_at(&w, "B1"), CellValue::Number(2.0));
         assert_eq!(value_at(&w, "C1"), CellValue::Number(1199.0));
         assert_eq!(value_at(&w, "A2"), CellValue::Text("Dock".into()));
         assert_eq!(value_at(&w, "C2"), CellValue::Number(179.0));
-        // The row without the delimiter is untouched.
         assert_eq!(value_at(&w, "A3"), CellValue::Text("NoDelimiter".into()));
+        // A text that reads as a number becomes one.
+        assert_eq!(value_at(&w, "A4"), CellValue::Number(7.0));
+    }
+
+    /// #692: a qualifier keeps a delimiter inside a field, and a Text column
+    /// keeps leading zeros.
+    #[test]
+    fn text_to_columns_honours_the_qualifier_and_column_formats() {
+        use crate::textio::ColFormat;
+        let mut w = wb(&[("A1", Cell::text("Pen,4,\"Blue, fine\",0012"))]);
+        let opts = crate::textio::TextParse {
+            columns: vec![
+                ColFormat::General,
+                ColFormat::General,
+                ColFormat::General,
+                ColFormat::Text,
+            ],
+            ..comma()
+        };
+        text_to_columns(&mut w, &col_a(0, 0), &opts, None);
+        assert_eq!(value_at(&w, "A1"), CellValue::Text("Pen".into()));
+        assert_eq!(value_at(&w, "B1"), CellValue::Number(4.0));
+        assert_eq!(value_at(&w, "C1"), CellValue::Text("Blue, fine".into()));
+        assert_eq!(value_at(&w, "D1"), CellValue::Text("0012".into()));
+        let d1 = w.sheets[0].cell(0, 3).unwrap().style;
+        assert_eq!(w.styles.xf(d1).code.as_deref(), Some("@"));
+        // General turns 0012 into 12.
+        let mut w = wb(&[("A1", Cell::text("Pen,4,\"Blue, fine\",0012"))]);
+        text_to_columns(&mut w, &col_a(0, 0), &comma(), None);
+        assert_eq!(value_at(&w, "D1"), CellValue::Number(12.0));
+    }
+
+    /// #692: empty fields are kept unless consecutive delimiters are one.
+    #[test]
+    fn text_to_columns_keeps_or_collapses_empty_fields() {
+        let mut w = wb(&[("A1", Cell::text("Ink,,Red,7"))]);
+        text_to_columns(&mut w, &col_a(0, 0), &comma(), None);
+        assert_eq!(value_at(&w, "B1"), CellValue::Empty);
+        assert_eq!(value_at(&w, "C1"), CellValue::Text("Red".into()));
+        assert_eq!(value_at(&w, "D1"), CellValue::Number(7.0));
+        let one = crate::textio::TextParse {
+            kind: crate::textio::SplitKind::Delimited {
+                delims: crate::textio::Delimiters::only(','),
+                consecutive: true,
+            },
+            ..comma()
+        };
+        let mut w = wb(&[("A1", Cell::text("Ink,,Red,7"))]);
+        text_to_columns(&mut w, &col_a(0, 0), &one, None);
+        assert_eq!(value_at(&w, "B1"), CellValue::Text("Red".into()));
+        assert_eq!(value_at(&w, "C1"), CellValue::Number(7.0));
+    }
+
+    /// #692: Tab, Semicolon, Comma, Space and Other at once, and fixed width.
+    #[test]
+    fn text_to_columns_splits_on_several_delimiters_or_fixed_width() {
+        let all = crate::textio::TextParse {
+            kind: crate::textio::SplitKind::Delimited {
+                delims: crate::textio::Delimiters {
+                    tab: true,
+                    semicolon: true,
+                    comma: true,
+                    space: true,
+                    other: Some('|'),
+                },
+                consecutive: false,
+            },
+            ..comma()
+        };
+        let mut w = wb(&[("A1", Cell::text("a\tb;c,d e|f"))]);
+        text_to_columns(&mut w, &col_a(0, 0), &all, None);
+        let got: Vec<CellValue> = ["A1", "B1", "C1", "D1", "E1", "F1"]
+            .iter()
+            .map(|n| value_at(&w, n))
+            .collect();
+        let want: Vec<CellValue> = ["a", "b", "c", "d", "e", "f"]
+            .iter()
+            .map(|t| CellValue::Text(t.to_string()))
+            .collect();
+        assert_eq!(got, want);
+        let fixed = crate::textio::TextParse {
+            kind: crate::textio::SplitKind::Fixed { breaks: vec![3, 5] },
+            ..comma()
+        };
+        let mut w = wb(&[("A1", Cell::text("ABC12xyz"))]);
+        text_to_columns(&mut w, &col_a(0, 0), &fixed, None);
+        assert_eq!(value_at(&w, "A1"), CellValue::Text("ABC".into()));
+        assert_eq!(value_at(&w, "B1"), CellValue::Number(12.0));
+        assert_eq!(value_at(&w, "C1"), CellValue::Text("xyz".into()));
+    }
+
+    /// #692: Date columns in a given order, skipped columns, and the
+    /// Advanced separators with a trailing minus.
+    #[test]
+    fn text_to_columns_dates_skips_and_advanced_numbers() {
+        use crate::textio::{ColFormat, DateOrder};
+        let mut w = wb(&[("A1", Cell::text("03/04/2024;junk;1.234,5-"))]);
+        let opts = crate::textio::TextParse {
+            kind: crate::textio::SplitKind::Delimited {
+                delims: crate::textio::Delimiters::only(';'),
+                consecutive: false,
+            },
+            columns: vec![ColFormat::Date(DateOrder::Dmy), ColFormat::Skip],
+            decimal: ',',
+            thousands: '.',
+            trailing_minus: true,
+            ..comma()
+        };
+        text_to_columns(&mut w, &col_a(0, 0), &opts, None);
+        let apr3 = crate::sheet::parts_to_serial(2024, 4, 3, 0, false);
+        assert_eq!(value_at(&w, "A1"), CellValue::Number(apr3));
+        // The skipped field takes no column.
+        assert_eq!(value_at(&w, "B1"), CellValue::Number(-1234.5));
+        assert_eq!(value_at(&w, "C1"), CellValue::Empty);
+    }
+
+    /// #692: data in the destination (other than the source column) asks
+    /// first; more than one column is refused.
+    #[test]
+    fn text_to_columns_detects_overwrites_and_refuses_two_columns() {
+        let w = wb(&[
+            ("A1", Cell::text("a,b")),
+            ("A2", Cell::text("c")),
+            ("B1", Cell::text("x")),
+        ]);
+        assert!(ttc_would_overwrite(&w, &col_a(0, 1), &comma()));
+        // B2 is empty and A2 is the source itself.
+        assert!(!ttc_would_overwrite(&w, &col_a(1, 1), &comma()));
+        // Skipping the second field leaves B1 alone.
+        let skip = crate::textio::TextParse {
+            columns: vec![
+                crate::textio::ColFormat::General,
+                crate::textio::ColFormat::Skip,
+            ],
+            ..comma()
+        };
+        assert!(!ttc_would_overwrite(&w, &col_a(0, 1), &skip));
+        // A destination elsewhere counts its own cells.
+        let mut to_b = col_a(0, 0);
+        to_b.dest = (0, 1);
+        assert!(ttc_would_overwrite(&w, &to_b, &comma()));
+        assert_eq!(TtcSource::new(0, (0, 0, 3, 1)), Err(TTC_ONE_COLUMN));
     }
 
     fn formula_at(wb: &Workbook, name: &str) -> String {

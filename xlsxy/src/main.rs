@@ -3632,11 +3632,24 @@ impl App {
             "pipe" => '|',
             other => other.chars().next().unwrap_or(','),
         };
-        let (r1, c1, r2, _) = self.selection();
-        let s = self.sheet;
+        let src = match gridcore::edit::TtcSource::new(self.sheet, self.selection()) {
+            Ok(src) => src,
+            Err(msg) => {
+                self.status = Some(msg.to_string());
+                return;
+            }
+        };
+        let opts = TextParse {
+            kind: gridcore::textio::SplitKind::Delimited {
+                delims: gridcore::textio::Delimiters::only(delim),
+                consecutive: false,
+            },
+            ..TextParse::default()
+        };
         let mut n = 0;
+        let today = now_serial();
         self.structural(|wb| {
-            n = gridcore::edit::text_to_columns(wb, s, c1, r1, r2, delim);
+            n = gridcore::edit::text_to_columns(wb, &src, &opts, today);
         });
         self.status = Some(format!(
             "Text to Columns: split {n} row{}",

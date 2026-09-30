@@ -9711,8 +9711,16 @@ impl Docxy {
                 if let Some((r0, c0, r1, _)) = self.bar_cells() {
                     self.sheet_snapshot();
                     if let Some(v) = self.active_sheet_mut() {
-                        let s = v.active;
-                        gridcore::edit::text_to_columns(&mut v.pkg.workbook, s, c0, r0, r1, delim);
+                        let src = gridcore::edit::TtcSource::new(v.active, (r0, c0, r1, c0))
+                            .expect("one column");
+                        let opts = gridcore::textio::TextParse {
+                            kind: gridcore::textio::SplitKind::Delimited {
+                                delims: gridcore::textio::Delimiters::only(delim),
+                                consecutive: false,
+                            },
+                            ..gridcore::textio::TextParse::default()
+                        };
+                        gridcore::edit::text_to_columns(&mut v.pkg.workbook, &src, &opts, None);
                         v.engine = sheet_engine(&v.pkg.workbook);
                     }
                     self.mark_sheet_dirty();
