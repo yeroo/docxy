@@ -16,7 +16,9 @@ use crate::entry::EntryCtx;
 use crate::formula::{
     EditShift, ExcelError, adjust_formula_for_edit, rename_sheet_in_formula, translate_formula,
 };
-use crate::sheet::{Cell, CellValue, MAX_COLS, MAX_ROWS, Sheet, Styles, Workbook};
+use crate::sheet::{
+    Cell, CellValue, MAX_COLS, MAX_ROWS, Sheet, Styles, Workbook, f_ref, is_array_f, with_ref,
+};
 
 /// Read pasted text as a value: formulas, plain numbers (incl. percent),
 /// booleans, error constants, text. Deliberately narrower than typed entry
@@ -851,8 +853,8 @@ pub fn rename_sheet(wb: &mut Workbook, idx: usize, new_name: &str) {
     }
     for sheet in &mut wb.sheets {
         for cell in sheet.cells.values_mut() {
-            if cell.f_attrs.is_some() {
-                continue; // preserved verbatim
+            if cell.f_attrs.as_deref().is_some_and(|a| !is_array_f(a)) {
+                continue; // preserved verbatim; an array formula is ours
             }
             if let Some(src) = &cell.formula {
                 if let Some(updated) = rename_sheet_in_formula(src, &old, new_name) {
@@ -1103,8 +1105,18 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
     for (s, sheet) in wb.sheets.iter_mut().enumerate() {
         let home_is_target = s == idx;
         for cell in sheet.cells.values_mut() {
-            if cell.f_attrs.is_some() {
+            if cell.f_attrs.as_deref().is_some_and(|a| !is_array_f(a)) {
                 continue; // preserved verbatim; stale is acceptable, corrupt is not
+            }
+            // An array formula is one the engine evaluates, so its text is
+            // ours to rewrite; the block its `ref` names moves with the grid.
+            if let Some(fa) = cell.f_attrs.as_mut() {
+                let moved = f_ref(fa)
+                    .and_then(|r| adjust_formula_for_edit(r, home_is_target, &target_name, &shift))
+                    .filter(|r| !r.contains('#'));
+                if let Some(r) = moved {
+                    *fa = with_ref(fa, &r);
+                }
             }
             if let Some(src) = &cell.formula {
                 if let Some(updated) =
@@ -2355,6 +2367,69 @@ mod tests {
             w.sheets[1].cell(0, 0).unwrap().value,
             CellValue::Number(2.0)
         );
+    }
+
+    /// A formula cell carrying preserved `<f>` attributes `fa`.
+    fn with_f_attrs(src: &str, fa: &str) -> Cell {
+        let mut c = Cell::formula(src);
+        c.f_attrs = Some(fa.to_string());
+        c
+    }
+
+    #[test]
+    fn renaming_a_sheet_rewrites_a_cse_array_that_reads_it() {
+        // An array formula is one the engine evaluates, so its text is ours.
+        let mut calc = Sheet {
+            name: "Calc".to_string(),
+            ..Sheet::default()
+        };
+        calc.set_cell(
+            0,
+            3,
+            with_f_attrs("Data!A1:A3*2", " t=\"array\" ref=\"D1:D3\""),
+        );
+        let mut data = Sheet {
+            name: "Data".to_string(),
+            ..Sheet::default()
+        };
+        for r in 0..3 {
+            data.set_cell(r, 0, Cell::number(f64::from(r + 1)));
+        }
+        let mut w = Workbook {
+            sheets: vec![calc, data],
+            ..Workbook::default()
+        };
+        rename_sheet(&mut w, 1, "Numbers");
+        let d1 = w.sheets[0].cell(0, 3).unwrap();
+        assert_eq!(d1.formula.as_deref(), Some("Numbers!A1:A3*2"));
+        assert_eq!(d1.f_attrs.as_deref(), Some(" t=\"array\" ref=\"D1:D3\""));
+        let mut eng = Engine::new(&w);
+        eng.recalc_all(&mut w);
+        assert_eq!(
+            w.sheets[0].cell(2, 3).unwrap().value,
+            CellValue::Number(6.0)
+        );
+    }
+
+    #[test]
+    fn structural_edit_still_skips_a_shared_formula_marker() {
+        // A shared group's or a data table's `<f>` stays verbatim, through an
+        // insert and a rename alike.
+        let shared = " t=\"shared\" ref=\"B2:B3\" si=\"0\"";
+        let table = " t=\"dataTable\" ref=\"C2:C3\" dt2D=\"0\" dtr=\"0\" r1=\"A1\"";
+        let mut w = wb(&[
+            ("A1", Cell::number(1.0)),
+            ("B2", with_f_attrs("Sheet1!A1*2", shared)),
+            ("C2", with_f_attrs("A1*3", table)),
+        ]);
+        insert_rows(&mut w, 0, 0, 1);
+        rename_sheet(&mut w, 0, "Renamed");
+        let b = w.sheets[0].cell(2, 1).unwrap();
+        assert_eq!(b.formula.as_deref(), Some("Sheet1!A1*2"));
+        assert_eq!(b.f_attrs.as_deref(), Some(shared));
+        let c = w.sheets[0].cell(2, 2).unwrap();
+        assert_eq!(c.formula.as_deref(), Some("A1*3"));
+        assert_eq!(c.f_attrs.as_deref(), Some(table));
     }
 
     #[test]

@@ -159,6 +159,25 @@ pub fn is_array_f(attrs: &str) -> bool {
     attrs.contains("t=\"array\"")
 }
 
+/// The `ref` named by preserved `<f>` attributes, if any.
+pub(crate) fn f_ref(fa: &str) -> Option<&str> {
+    let start = fa.find(" ref=\"")? + " ref=\"".len();
+    let end = fa[start..].find('"').map_or(fa.len(), |e| start + e);
+    Some(&fa[start..end])
+}
+
+/// Preserved `<f>` attributes with `ref` set to `r` (added if absent).
+pub(crate) fn with_ref(fa: &str, r: &str) -> String {
+    match fa.find(" ref=\"") {
+        Some(i) => {
+            let start = i + " ref=\"".len();
+            let end = fa[start..].find('"').map_or(fa.len(), |e| start + e);
+            format!("{}{r}{}", &fa[..start], &fa[end..])
+        }
+        None => format!("{fa} ref=\"{r}\""),
+    }
+}
+
 impl Cell {
     pub fn number(n: f64) -> Cell {
         Cell {
@@ -183,8 +202,8 @@ impl Cell {
         self.value.is_empty() && self.formula.is_none()
     }
     /// Is the formula an array one, evaluated by the dynamic-array engine: a
-    /// `t="array"` `<f>`, or a cell Excel marked dynamic with `cm` whose
-    /// `f_attrs` an edit dropped ([`crate::engine::Engine::set_cell`])?
+    /// `t="array"` `<f>` (kept through [`crate::engine::Engine::set_cell`]),
+    /// or a cell Excel marked dynamic with `cm`?
     pub fn is_array_formula(&self) -> bool {
         self.f_attrs.as_deref().is_some_and(is_array_f) || self.has_cm()
     }
