@@ -3754,40 +3754,90 @@ fn sample_doc() -> Loaded {
     load_bytes(include_bytes!("../../../assets/sample.docx"))
 }
 
-/// Load a `.xlsx` into a spreadsheet surface (or a placeholder + error status).
-/// Serialize a live spreadsheet view to `.xlsx` bytes, folding in any
+/// Serialize a live spreadsheet view to workbook bytes, folding in any
 /// UI-authored charts via a throwaway package clone (so the live package isn't
 /// mutated / charts aren't re-added on each call). Shared by Save and hot-exit.
-fn sheet_bytes(v: &SheetView) -> Vec<u8> {
+/// A save names its `target`, whose extension sets the file type (a
+/// macro-free one leaves the macros out of the bytes only); hot-exit passes
+/// `None` and keeps the loaded type.
+fn sheet_bytes(v: &SheetView, target: Option<&std::path::Path>) -> Vec<u8> {
+    let write = |pkg: &gridcore::xlsx::SheetPackage| match target {
+        Some(target) => gridcore::xlsx::save_xlsx_for_path(pkg, target),
+        None => gridcore::xlsx::save_xlsx(pkg),
+    };
     if v.charts.is_empty() {
-        gridcore::xlsx::save_xlsx(&v.pkg)
+        write(&v.pkg)
     } else {
         let mut pkg = v.pkg.clone();
         for cv in &v.charts {
             pkg.add_chart(cv.sheet, cv.from, cv.to, &cv.data);
         }
-        gridcore::xlsx::save_xlsx(&pkg)
+        write(&pkg)
     }
 }
 
-/// Build a tab by loading `path` from disk — an .xlsx spreadsheet, a
+/// The extensions a workbook opens from and saves to.
+const SHEET_EXTENSIONS: [&str; 4] = ["xlsx", "xlsm", "xltx", "xltm"];
+
+/// Whether `path` is a workbook or template (`.xlsx`, `.xlsm`, `.xltx`,
+/// `.xltm`).
+fn is_sheet_path(path: &std::path::Path) -> bool {
+    gridcore::xlsx::SpreadsheetKind::from_path(path).is_some()
+}
+
+/// For a template (`.xltx`, `.xltm`), the title of the new workbook Excel
+/// starts from it: `Budget.xltx` gives `Budget1.xlsx`, or `Budget2.xlsx` when
+/// that exists beside it; an `.xltm` gives `.xlsm`. `None` for anything else.
+fn template_title(path: &std::path::Path) -> Option<String> {
+    use gridcore::xlsx::SpreadsheetKind;
+    let ext = match SpreadsheetKind::from_path(path)? {
+        SpreadsheetKind::Template => "xlsx",
+        SpreadsheetKind::MacroTemplate => "xlsm",
+        _ => return None,
+    };
+    let stem = path.file_stem()?.to_string_lossy();
+    (1u32..)
+        .map(|n| format!("{stem}{n}.{ext}"))
+        .find(|name| !path.with_file_name(name).exists())
+}
+
+/// What a macro-free file written from `pkg` loses, in Excel's words.
+fn macro_features(pkg: &gridcore::xlsx::SheetPackage) -> Vec<&'static str> {
+    let mut features = Vec::new();
+    if pkg.has_vba_project() {
+        features.push("VB project");
+    }
+    if pkg.has_macro_sheets() {
+        features.push("Excel 4.0 macro sheets");
+    }
+    features
+}
+
+/// Build a tab by loading `path` from disk — an .xlsx/.xlsm workbook, a
 /// Word/Markdown document, or a .yppx/.xml/.mpp project schedule, dispatched on
-/// the extension (.xml opens as Project). Shared by the Open dialog and
+/// the extension (.xml opens as Project). A template (.xltx/.xltm) opens as a
+/// new, never-saved workbook from it, as Excel starts one, so a save asks
+/// for a name and never writes the template. Shared by the Open dialog and
 /// command-line file arguments.
 fn tab_from_path(path: &PathBuf) -> DocTab {
     if is_project_path(path) {
         return project_tab_from_path(path);
     }
     let title: SharedString = file_name(path).into();
-    if path
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("xlsx"))
-    {
+    if is_sheet_path(path) {
         let (surface, status) = sheet_from_path(path);
+        let (title, path, status) = match template_title(path) {
+            Some(new_title) if matches!(surface, Surface::Sheet(_)) => (
+                new_title.into(),
+                None,
+                format!("new workbook from template {}", file_name(path)).into(),
+            ),
+            _ => (title, Some(path.clone()), status),
+        };
         DocTab {
             kind: Kind::Xlsx,
             title,
-            path: Some(path.clone()),
+            path,
             surface,
             dirty: false,
             status,
@@ -6413,7 +6463,7 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
         }
         Surface::Sheet(v) => {
             let p = hd.join(format!("tab-{i}.xlsx"));
-            opccore::fsio::write_atomic(&p, &sheet_bytes(v))
+            opccore::fsio::write_atomic(&p, &sheet_bytes(v, None))
                 .ok()
                 .map(|_| p.display().to_string())
         }
@@ -12507,7 +12557,7 @@ impl Docxy {
         };
         if !save_sheet_tab(tab, harness, explicit_save_as, |suggested| {
             rfd::FileDialog::new()
-                .add_filter("Excel workbook", &["xlsx"])
+                .add_filter("Excel workbook", &SHEET_EXTENSIONS)
                 .set_file_name(suggested)
                 .save_file()
         }) {
@@ -12615,13 +12665,14 @@ impl Docxy {
             .add_filter(
                 "All supported",
                 &[
-                    "docx", "md", "markdown", "html", "xlsx", "yppx", "xml", "mpp",
+                    "docx", "md", "markdown", "html", "xlsx", "xlsm", "xltx", "xltm", "yppx",
+                    "xml", "mpp",
                 ],
             )
             .add_filter("Project schedule", &["yppx", "xml", "mpp"])
             .add_filter("Word or Markdown", &["docx", "md", "markdown"])
             .add_filter("Editable HTML (*.docx.html)", &["html"])
-            .add_filter("Excel workbook", &["xlsx"])
+            .add_filter("Excel workbook", &SHEET_EXTENSIONS)
             .pick_file()
         {
             self.tabs.push(tab_from_path(&path));
@@ -14752,8 +14803,10 @@ fn sheet_save_decision(
     }
     let name = path.unwrap_or_else(|| std::path::Path::new(title));
     let stem = name.file_stem().unwrap_or_default().to_string_lossy();
+    // The workbook keeps its type (`Budget1.xlsm` from a macro template).
+    let ext = gridcore::xlsx::SpreadsheetKind::from_path(name).map_or("xlsx", |k| k.extension());
     SheetSaveDecision::Dialog {
-        suggested: format!("{stem}.xlsx"),
+        suggested: format!("{stem}.{ext}"),
     }
 }
 
@@ -14789,15 +14842,19 @@ fn save_sheet_tab(
 }
 
 /// The file a workbook is written to for a picked `path`: `.xlsx` is added
-/// when it has no extension, and any other extension is refused, so an xlsx
-/// package never lands under a name that opens as something else.
+/// when it has no extension, a workbook or template extension (`.xlsx`,
+/// `.xlsm`, `.xltx`, `.xltm`) is kept, and any other extension is refused, so
+/// a workbook package never lands under a name that opens as something else.
 fn sheet_save_target(path: &std::path::Path) -> Result<PathBuf, String> {
     match path.extension() {
         None => Ok(path.with_extension("xlsx")),
-        Some(ext) if ext.eq_ignore_ascii_case("xlsx") => Ok(path.to_path_buf()),
-        Some(_) => Err("Workbooks can only be saved as .xlsx".into()),
+        Some(_) if is_sheet_path(path) => Ok(path.to_path_buf()),
+        Some(_) => Err(SHEET_SAVE_FORMATS.into()),
     }
 }
+
+/// What a workbook refuses to be saved as.
+const SHEET_SAVE_FORMATS: &str = "Workbooks can only be saved as .xlsx, .xlsm, .xltx or .xltm";
 
 /// Save As a workbook tab to `target` without a dialog: the commit a Save
 /// makes first, then the write the dialog's answer feeds. Returns whether the
@@ -14827,11 +14884,27 @@ fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) -> bool
             return false;
         }
     };
-    let bytes = sheet_bytes(v);
+    let bytes = sheet_bytes(v, Some(&path));
+    // A macro-free type writes the file without the macros; the open
+    // workbook keeps them, as Excel does, and the status says what went.
+    let dropped = match gridcore::xlsx::SpreadsheetKind::from_path(&path) {
+        Some(kind) if !kind.allows_macros() => macro_features(&v.pkg),
+        _ => Vec::new(),
+    };
     match opccore::fsio::write_atomic(&path, &bytes) {
         Ok(()) => {
             tab.title = file_name(&path).into();
-            tab.status = format!("saved {} bytes → {}", bytes.len(), path.display()).into();
+            tab.status = if dropped.is_empty() {
+                format!("saved {} bytes → {}", bytes.len(), path.display())
+            } else {
+                format!(
+                    "saved {} bytes → {} without its {} (not saved in a macro-free workbook)",
+                    bytes.len(),
+                    path.display(),
+                    dropped.join(", ")
+                )
+            }
+            .into();
             tab.path = Some(path);
             tab.dirty = false;
             true
@@ -15263,9 +15336,9 @@ mod load_failed_save_tests {
 #[cfg(test)]
 mod sheet_save_tests {
     use super::{
-        DocTab, Kind, SHEET_NEVER_SAVED_HARNESS, SHEET_SAVE_AS_HARNESS, SheetSaveDecision, Surface,
-        finish_sheet_save, new_sheet_surface, save_sheet_to, sheet_bytes, sheet_save_decision,
-        sheet_save_target,
+        DocTab, Kind, SHEET_NEVER_SAVED_HARNESS, SHEET_SAVE_AS_HARNESS, SHEET_SAVE_FORMATS,
+        SheetSaveDecision, Surface, finish_sheet_save, new_sheet_surface, save_sheet_to,
+        sheet_bytes, sheet_save_decision, sheet_save_target, tab_from_path,
     };
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15383,7 +15456,7 @@ mod sheet_save_tests {
             sheet_save_target(Path::new("dir/book")).unwrap(),
             PathBuf::from("dir/book.xlsx")
         );
-        for name in ["x.xlsx", "x.XLSX"] {
+        for name in ["x.xlsx", "x.XLSX", "x.xlsm", "x.xltx", "x.XLTM"] {
             assert_eq!(
                 sheet_save_target(Path::new(name)).unwrap(),
                 PathBuf::from(name)
@@ -15392,7 +15465,7 @@ mod sheet_save_tests {
         for name in ["x.docx", "x.md", "x.", "x.xls"] {
             assert_eq!(
                 sheet_save_target(Path::new(name)).unwrap_err(),
-                "Workbooks can only be saved as .xlsx"
+                SHEET_SAVE_FORMATS
             );
         }
     }
@@ -15404,8 +15477,8 @@ mod sheet_save_tests {
         let Surface::Sheet(v) = &tab.surface else {
             unreachable!()
         };
-        let expected = sheet_bytes(v);
         let target = dir.path("report.xlsx");
+        let expected = sheet_bytes(v, Some(&target));
         finish_sheet_save(&mut tab, Some(&target));
         assert_eq!(std::fs::read(&target).unwrap(), expected);
         assert_eq!(tab.path.as_deref(), Some(target.as_path()));
@@ -15447,11 +15520,150 @@ mod sheet_save_tests {
 
         let mut other = sheet_tab(None, "Untitled.xlsx");
         assert!(!save_sheet_to(&mut other, &dir.path("copy.csv")));
-        assert_eq!(
-            other.status.as_ref(),
-            "Workbooks can only be saved as .xlsx"
-        );
+        assert_eq!(other.status.as_ref(), SHEET_SAVE_FORMATS);
         assert!(other.path.is_none());
+    }
+
+    /// A sheet tab over `pkg`, loaded from `path` as the Open dialog loads it.
+    fn loaded_sheet_tab(dir: &Scratch, name: &str, pkg: &gridcore::xlsx::SheetPackage) -> DocTab {
+        let path = dir.path(name);
+        std::fs::write(&path, gridcore::xlsx::save_xlsx(pkg)).unwrap();
+        tab_from_path(&path)
+    }
+
+    fn workbook_content_type(path: &Path) -> String {
+        let pkg = gridcore::xlsx::load_xlsx(&std::fs::read(path).unwrap()).unwrap();
+        String::from_utf8_lossy(pkg.part("[Content_Types].xml").unwrap()).into_owned()
+    }
+
+    /// A workbook with an Excel 4.0 macro sheet, typed as `kind`.
+    fn xlm_book(kind: gridcore::xlsx::SpreadsheetKind) -> gridcore::xlsx::SheetPackage {
+        let mut pkg = gridcore::xlsx::new_xlsx();
+        pkg.add_sheet("Macro1");
+        let rels = String::from_utf8_lossy(pkg.part("xl/_rels/workbook.xml.rels").unwrap())
+            .replace(
+                r#"Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml""#,
+                r#"Type="http://schemas.microsoft.com/office/2006/relationships/xlMacrosheet" Target="worksheets/sheet2.xml""#,
+            );
+        pkg.set_part("xl/_rels/workbook.xml.rels", rels.into_bytes());
+        let pkg = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx_as(&pkg, kind)).unwrap();
+        assert!(pkg.has_macro_sheets());
+        pkg
+    }
+
+    /// #727: the spreadsheet tab opens every workbook type, and a save
+    /// writes the type of the file it goes to.
+    #[test]
+    fn workbooks_of_every_type_open_and_save_as_their_target() {
+        use gridcore::xlsx::SpreadsheetKind;
+        let dir = Scratch::new();
+        let mut tab = loaded_sheet_tab(&dir, "in.xlsm", &xlm_book(SpreadsheetKind::MacroWorkbook));
+        assert!(matches!(tab.kind, Kind::Xlsx));
+        assert!(matches!(tab.surface, Surface::Sheet(_)));
+        assert_eq!(tab.path.as_deref(), Some(dir.path("in.xlsm").as_path()));
+
+        // Saving an .xlsm again keeps its macro sheet and type.
+        finish_sheet_save(&mut tab, Some(&dir.path("in.xlsm")));
+        let ct = workbook_content_type(&dir.path("in.xlsm"));
+        assert!(ct.contains("sheet.macroEnabled.main+xml"), "{ct}");
+        assert!(
+            ct.contains("macrosheet") || ct.contains("worksheet"),
+            "{ct}"
+        );
+
+        // Save As .xlsx writes a workbook without the macro sheet and says
+        // so; the open workbook keeps it.
+        let out = dir.path("out.xlsx");
+        assert!(finish_sheet_save(&mut tab, Some(&out)));
+        let ct = workbook_content_type(&out);
+        assert!(ct.contains("spreadsheetml.sheet.main+xml"), "{ct}");
+        let saved = gridcore::xlsx::load_xlsx(&std::fs::read(&out).unwrap()).unwrap();
+        assert!(!saved.has_macro_sheets());
+        assert_eq!(saved.workbook.sheets.len(), 1);
+        assert!(
+            tab.status.contains("without its Excel 4.0 macro sheets"),
+            "{}",
+            tab.status
+        );
+        let Surface::Sheet(v) = &tab.surface else {
+            unreachable!()
+        };
+        assert!(v.pkg.has_macro_sheets(), "the open workbook keeps them");
+
+        // A template-typed package written to .xlsx says it is a workbook.
+        let template = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx_as(
+            &gridcore::xlsx::new_xlsx(),
+            SpreadsheetKind::Template,
+        ))
+        .unwrap();
+        let mut tab = sheet_tab(None, "Untitled.xlsx");
+        if let Surface::Sheet(v) = &mut tab.surface {
+            v.pkg = template;
+        }
+        let book = dir.path("book.xlsx");
+        assert!(finish_sheet_save(&mut tab, Some(&book)));
+        let ct = workbook_content_type(&book);
+        assert!(
+            ct.contains("spreadsheetml.sheet.main+xml") && !ct.contains("template"),
+            "{ct}"
+        );
+        assert!(tab.status.starts_with("saved "), "{}", tab.status);
+        assert!(!tab.status.contains("without"), "{}", tab.status);
+    }
+
+    /// #727: a template opens as a new, never-saved workbook from it, as
+    /// Excel starts one: the first save asks for a name, suggested with the
+    /// template's macro-ness, and the template is never written.
+    #[test]
+    fn a_template_opens_as_a_new_untitled_workbook() {
+        use gridcore::xlsx::SpreadsheetKind;
+        let dir = Scratch::new();
+        let tab = loaded_sheet_tab(
+            &dir,
+            "Budget.xltx",
+            &gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx_as(
+                &gridcore::xlsx::new_xlsx(),
+                SpreadsheetKind::Template,
+            ))
+            .unwrap(),
+        );
+        assert!(matches!(tab.surface, Surface::Sheet(_)));
+        assert!(tab.path.is_none());
+        assert_eq!(tab.title.as_ref(), "Budget1.xlsx");
+        assert_eq!(
+            tab.status.as_ref(),
+            "new workbook from template Budget.xltx"
+        );
+        assert_eq!(
+            sheet_save_decision(None, &tab.title, false, false),
+            dialog("Budget1.xlsx")
+        );
+
+        // The next number is free when Budget1.xlsx exists.
+        std::fs::write(dir.path("Budget1.xlsx"), b"taken").unwrap();
+        assert_eq!(
+            tab_from_path(&dir.path("Budget.xltx")).title.as_ref(),
+            "Budget2.xlsx"
+        );
+
+        let tab = loaded_sheet_tab(
+            &dir,
+            "Macros.xltm",
+            &xlm_book(SpreadsheetKind::MacroTemplate),
+        );
+        assert!(tab.path.is_none());
+        assert_eq!(tab.title.as_ref(), "Macros1.xlsm");
+        assert_eq!(
+            sheet_save_decision(None, &tab.title, false, false),
+            dialog("Macros1.xlsm")
+        );
+
+        // A template that fails to load stays bound to its path, with the
+        // load error, like any other file.
+        std::fs::write(dir.path("broken.xltx"), b"not a zip").unwrap();
+        let tab = tab_from_path(&dir.path("broken.xltx"));
+        assert_eq!(tab.path.as_deref(), Some(dir.path("broken.xltx").as_path()));
+        assert!(tab.status.contains("load error"), "{}", tab.status);
     }
 
     #[test]
@@ -15473,14 +15685,8 @@ mod sheet_save_tests {
         let mut tab = sheet_tab(Some(original.clone()), "original.xlsx");
         let cases = [
             (None, "save cancelled"),
-            (
-                Some(dir.path("report.docx")),
-                "Workbooks can only be saved as .xlsx",
-            ),
-            (
-                Some(dir.path("notes.md")),
-                "Workbooks can only be saved as .xlsx",
-            ),
+            (Some(dir.path("report.docx")), SHEET_SAVE_FORMATS),
+            (Some(dir.path("notes.md")), SHEET_SAVE_FORMATS),
             (Some(dir.path("missing-dir/report.xlsx")), "save failed:"),
         ];
         for (target, status) in cases {
