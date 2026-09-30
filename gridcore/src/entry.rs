@@ -619,7 +619,7 @@ fn parse_date_time(t: &str, ctx: &EntryCtx) -> Option<(f64, &'static str)> {
 }
 
 /// `h:mm`, `h:mm:ss`, an optional `AM`/`PM`/`a`/`p`, or `h AM`.
-fn parse_time(t: &str) -> Option<(f64, &'static str)> {
+pub(crate) fn parse_time(t: &str) -> Option<(f64, &'static str)> {
     let lower = t.to_ascii_lowercase();
     let mut body = lower.as_str();
     let mut pm = None;

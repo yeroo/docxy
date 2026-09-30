@@ -136,8 +136,10 @@ pub struct Backstage {
     pub name_input: String,
     /// Caret position (char index) within `name_input`.
     pub name_cursor: usize,
-    /// In Save As: true when the file-name field is focused (accepting edits),
-    /// false when the folder browser is focused.
+    /// In Save As: true when the file-name field is focused (accepting edits).
+    /// Save As has three focus targets: this field, the *Save as type* box
+    /// ([`Backstage::type_focus`], when the host has types) and the folder
+    /// browser (neither flag set).
     pub name_focus: bool,
     /// The menu, in display order.
     items: Vec<Item>,

@@ -87,7 +87,14 @@ pub struct TextDialog {
     pub consecutive: bool,
     pub qualifier: Option<char>,
     pub breaks: Vec<usize>,
+    /// The start row as typed: 0 while the field is emptied; [`parse`] reads
+    /// it as at least 1.
+    ///
+    /// [`parse`]: TextDialog::parse
     pub start_row: usize,
+    /// A digit has been typed into the focused field since it took the
+    /// focus: the first digit replaces the value, later ones append.
+    typed: bool,
     pub origin: Origin,
     pub columns: Vec<ColFormat>,
     pub decimal: char,
@@ -138,6 +145,7 @@ impl TextDialog {
             qualifier: opts.qualifier,
             breaks,
             start_row: opts.start_row,
+            typed: false,
             origin: Origin::Auto,
             columns: opts.columns,
             decimal: opts.decimal,
@@ -168,7 +176,11 @@ impl TextDialog {
                 }
             },
             qualifier: self.qualifier,
-            start_row: if self.is_import() { self.start_row } else { 1 },
+            start_row: if self.is_import() {
+                self.start_row.max(1)
+            } else {
+                1
+            },
             columns: self.columns.clone(),
             decimal: self.decimal,
             thousands: self.thousands,
@@ -271,8 +283,14 @@ impl TextDialog {
             KeyCode::Enter => return Outcome::Finish,
             KeyCode::Tab => self.goto_step(self.step + 1),
             KeyCode::BackTab => self.goto_step(self.step.saturating_sub(1)),
-            KeyCode::Up => self.focus = self.focus.saturating_sub(1),
-            KeyCode::Down => self.focus = (self.focus + 1).min(self.fields().len() - 1),
+            KeyCode::Up => {
+                self.focus = self.focus.saturating_sub(1);
+                self.typed = false;
+            }
+            KeyCode::Down => {
+                self.focus = (self.focus + 1).min(self.fields().len() - 1);
+                self.typed = false;
+            }
             KeyCode::Left => self.change(-1),
             KeyCode::Right => self.change(1),
             KeyCode::Char(' ') => self.toggle(),
@@ -286,6 +304,7 @@ impl TextDialog {
     pub fn goto_step(&mut self, step: usize) {
         self.step = step.min(2);
         self.focus = 0;
+        self.typed = false;
         self.col = self.col.min(self.preview_width() - 1);
     }
 
@@ -295,6 +314,7 @@ impl TextDialog {
             Field::Kind => self.fixed = !self.fixed,
             Field::StartRow => {
                 self.start_row = (self.start_row as i64 + by as i64).max(1) as usize;
+                self.typed = false;
             }
             Field::Origin => {
                 let i = ORIGINS.iter().position(|o| *o == self.origin).unwrap_or(0);
@@ -389,8 +409,10 @@ impl TextDialog {
             Field::Destination => self.dest.push(c),
             Field::StartRow => {
                 if let Some(d) = c.to_digit(10) {
-                    let n = self.start_row.saturating_mul(10).saturating_add(d as usize);
-                    self.start_row = n.clamp(1, 1_048_576);
+                    let kept = if self.typed { self.start_row } else { 0 };
+                    let n = kept.saturating_mul(10).saturating_add(d as usize);
+                    self.start_row = n.min(1_048_576);
+                    self.typed = true;
                 }
             }
             Field::Format | Field::Column => match c.to_ascii_lowercase() {
@@ -410,7 +432,10 @@ impl TextDialog {
             Field::Destination => {
                 self.dest.pop();
             }
-            Field::StartRow => self.start_row = (self.start_row / 10).max(1),
+            Field::StartRow => {
+                self.start_row /= 10;
+                self.typed = true;
+            }
             _ => {}
         }
     }
@@ -427,7 +452,14 @@ impl TextDialog {
                 if self.fixed { " " } else { "o" },
                 if self.fixed { "o" } else { " " }
             ),
-            Field::StartRow => format!("Start import at row: {}", self.start_row),
+            Field::StartRow => format!(
+                "Start import at row: {}",
+                if self.start_row == 0 {
+                    String::new()
+                } else {
+                    self.start_row.to_string()
+                }
+            ),
             Field::Origin => format!("File origin: {}", self.origin.name()),
             Field::Tab => format!("{} Tab", check(self.delims.tab)),
             Field::Semicolon => format!("{} Semicolon", check(self.delims.semicolon)),
@@ -749,6 +781,30 @@ mod tests {
         d.key(KeyCode::Right);
         d.key(KeyCode::Right); // -> Windows-1252
         assert_eq!(d.preview(), [vec!["\u{fc}ber"]]);
+    }
+
+    /// The first digit typed replaces the start row; Backspace can empty it.
+    #[test]
+    fn typing_a_start_row_replaces_it() {
+        let mut d = wizard("a\nb\nc\nd\n");
+        d.key(KeyCode::Down); // Start import at row
+        d.key(KeyCode::Char('3'));
+        assert_eq!(d.parse().start_row, 3);
+        d.key(KeyCode::Char('1'));
+        assert_eq!(d.parse().start_row, 31);
+        d.key(KeyCode::Backspace);
+        d.key(KeyCode::Backspace);
+        assert_eq!(d.start_row, 0);
+        // An emptied field still imports from row 1.
+        assert_eq!(d.parse().start_row, 1);
+        d.key(KeyCode::Char('2'));
+        assert_eq!(d.parse().start_row, 2);
+        assert_eq!(d.preview(), [vec!["b"], vec!["c"], vec!["d"]]);
+        // Leaving and coming back: the next digit replaces again.
+        d.key(KeyCode::Up);
+        d.key(KeyCode::Down);
+        d.key(KeyCode::Char('4'));
+        assert_eq!(d.parse().start_row, 4);
     }
 
     #[test]

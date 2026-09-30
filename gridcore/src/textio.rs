@@ -133,10 +133,6 @@ impl Delimiters {
             || (self.space && c == ' ')
             || self.other == Some(c)
     }
-
-    pub fn is_empty(&self) -> bool {
-        !(self.tab || self.semicolon || self.comma || self.space || self.other.is_some())
-    }
 }
 
 /// Delimited or fixed width (the wizard's step 1 choice).
@@ -236,6 +232,7 @@ impl Default for AutoConvert {
 
 impl AutoConvert {
     /// All four switches off.
+    #[cfg(test)]
     pub fn off() -> AutoConvert {
         AutoConvert {
             remove_leading_zeros: false,
@@ -564,17 +561,19 @@ pub fn convert_field(
             },
             force_format: true,
         }),
-        ColFormat::Date(order) => match parse_ordered_date(field.trim(), order, ctx) {
-            Some(serial) => Some(Converted {
+        // A Date column reads its own order only: a field that is not a date
+        // in that order stays text, never re-read as another order.
+        ColFormat::Date(order) => match parse_ordered_date_time(field.trim(), order, ctx) {
+            Some((serial, format)) => Some(Converted {
                 entry: Entry {
                     cell: Cell::number(serial),
-                    format: Some("m/d/yyyy"),
+                    format: Some(format),
                     quote_prefix: false,
                     wrap: false,
                 },
                 force_format: true,
             }),
-            None => Some(plain(general(field, opts, auto, ctx))),
+            None => Some(plain(text_entry(field))),
         },
         ColFormat::General => Some(plain(general(field, opts, auto, ctx))),
     }
@@ -592,9 +591,16 @@ fn general(field: &str, opts: &TextParse, auto: &AutoConvert, ctx: &EntryCtx) ->
     {
         return text_entry(field);
     }
-    let normal = normalize_number(t, opts);
-    let source = normal.as_deref().unwrap_or(field);
-    let e = match entry::parse_entry(source, &Xf::default(), ctx) {
+    // A number written with the Advanced separators is a number only if it
+    // reads as one there (groups of three included): `03.04.2024` under a
+    // `.` thousands separator stays text rather than becoming 3042024.
+    if let Some(n) = normalize_number(t, opts) {
+        return match entry::parse_entry(&n, &Xf::default(), ctx) {
+            Ok(e) if e.cell.formula.is_none() && matches!(e.cell.value, CellValue::Number(_)) => e,
+            _ => text_entry(field),
+        };
+    }
+    let e = match entry::parse_entry(field, &Xf::default(), ctx) {
         Ok(e) => e,
         Err(_) => return text_entry(field),
     };
@@ -651,7 +657,9 @@ fn long_number(t: &str) -> bool {
 }
 
 /// A number written with the Advanced separators and trailing minus,
-/// rewritten the way en-US entry reads it; `None` when nothing changes.
+/// rewritten the way en-US entry reads it (the decimal separator becomes `.`
+/// and the thousands separator `,`, so entry's own groups-of-three rule
+/// decides); `None` when nothing changes or the field is not number-shaped.
 fn normalize_number(t: &str, opts: &TextParse) -> Option<String> {
     let mut core = t;
     let mut negative = false;
@@ -680,12 +688,39 @@ fn normalize_number(t: &str, opts: &TextParse) -> Option<String> {
         out.push('-');
     }
     for c in core.chars() {
-        if custom && c == opts.thousands && opts.thousands != opts.decimal {
-            continue;
-        }
-        out.push(if custom && c == opts.decimal { '.' } else { c });
+        out.push(if c == opts.decimal {
+            '.'
+        } else if c == opts.thousands {
+            ','
+        } else {
+            c
+        });
     }
     Some(out)
+}
+
+/// [`parse_ordered_date`], optionally followed by a space and a time
+/// (`03/04/2024 10:30`): the serial and the format Excel gives it.
+pub fn parse_ordered_date_time(
+    t: &str,
+    order: DateOrder,
+    ctx: &EntryCtx,
+) -> Option<(f64, &'static str)> {
+    if let Some(day) = parse_ordered_date(t, order, ctx) {
+        return Some((day, "m/d/yyyy"));
+    }
+    // A date, a space, then a time: try every split, rightmost first.
+    for (i, _) in t.match_indices(' ').collect::<Vec<_>>().into_iter().rev() {
+        let (d, tm) = (t[..i].trim_end(), t[i + 1..].trim_start());
+        if let (Some(day), Some((frac, _))) =
+            (parse_ordered_date(d, order, ctx), entry::parse_time(tm))
+        {
+            if frac < 1.0 {
+                return Some((day + frac, "m/d/yyyy h:mm"));
+            }
+        }
+    }
+    None
 }
 
 /// A date whose parts come in `order`: `03/04/2024`, `3.4.24`, `03042024`,
@@ -804,7 +839,6 @@ pub fn put(sheet: &mut Sheet, styles: &mut Styles, r: u32, c: u32, conv: Convert
 pub enum Encoding {
     /// CSV UTF-8: `EF BB BF`, then UTF-8.
     Utf8Bom,
-    Utf8,
     /// CSV, Text (Tab delimited), Formatted Text: a character outside the
     /// code page becomes `?`.
     Windows1252,
@@ -814,7 +848,6 @@ pub enum Encoding {
 
 pub fn encode(text: &str, encoding: Encoding) -> Vec<u8> {
     match encoding {
-        Encoding::Utf8 => text.as_bytes().to_vec(),
         Encoding::Utf8Bom => {
             let mut out = vec![0xEF, 0xBB, 0xBF];
             out.extend_from_slice(text.as_bytes());
@@ -873,7 +906,8 @@ pub fn sheet_text(sheet: &Sheet, styles: &Styles, date1904: bool, delim: char) -
 }
 
 /// Formatted Text (Space delimited): each column padded to its width in
-/// characters, numbers right-aligned and text left-aligned.
+/// characters, numbers right-aligned and text left-aligned. Text longer than
+/// its column is clipped; a number never is.
 pub fn sheet_prn(sheet: &Sheet, styles: &Styles, date1904: bool) -> String {
     let (rows, cols) = sheet.used_size();
     let mut out = String::new();
@@ -888,8 +922,14 @@ pub fn sheet_prn(sheet: &Sheet, styles: &Styles, date1904: bool) -> String {
                 ),
                 None => (String::new(), false),
             };
-            let text: String = text.chars().take(width).collect();
-            let pad = " ".repeat(width - text.chars().count());
+            // A number is written whole, even past its column: clipping it
+            // would write another value. Text is clipped to the column.
+            let text: String = if right {
+                text
+            } else {
+                text.chars().take(width).collect()
+            };
+            let pad = " ".repeat(width.saturating_sub(text.chars().count()));
             if right {
                 line.push_str(&pad);
                 line.push_str(&text);
@@ -927,9 +967,13 @@ fn html_escape(s: &str) -> String {
     out
 }
 
-/// A sheet as Excel's Web Page: `<stem>.htm` linking `<stem>_files/`
-/// `filelist.xml` and `stylesheet.css`.
-pub fn web_page(sheet: &Sheet, styles: &Styles, date1904: bool, stem: &str) -> WebPage {
+/// A sheet as Excel's Web Page saved as `file_name` (`out.htm`, `out.html`):
+/// the page, linking `<stem>_files/filelist.xml` and `stylesheet.css`.
+pub fn web_page(sheet: &Sheet, styles: &Styles, date1904: bool, file_name: &str) -> WebPage {
+    let stem = match file_name.rfind('.') {
+        Some(i) if i > 0 => &file_name[..i],
+        _ => file_name,
+    };
     let folder = format!("{stem}_files");
     let (rows, cols) = sheet.used_size();
     let mut table = String::new();
@@ -977,7 +1021,7 @@ pub fn web_page(sheet: &Sheet, styles: &Styles, date1904: bool, stem: &str) -> W
     );
     let filelist = format!(
         "<xml xmlns:o=\"urn:schemas-microsoft-com:office:office\">\r\n \
-         <o:MainFile HRef=\"../{stem}.htm\"/>\r\n \
+         <o:MainFile HRef=\"../{file_name}\"/>\r\n \
          <o:File HRef=\"stylesheet.css\"/>\r\n \
          <o:File HRef=\"filelist.xml\"/>\r\n\
          </xml>\r\n"
@@ -1333,7 +1377,6 @@ mod tests {
             encode("a\r\n", Encoding::Utf16LeBom),
             b"\xFF\xFEa\x00\r\x00\n\x00"
         );
-        assert_eq!(encode("a", Encoding::Utf8), b"a");
     }
 
     #[test]
@@ -1346,10 +1389,93 @@ mod tests {
     }
 
     #[test]
+    fn formatted_text_writes_a_number_whole_past_its_column() {
+        let mut styles = Styles {
+            xfs: vec![Xf::default()],
+            ..Styles::default()
+        };
+        let mut xf = Xf::default();
+        xf.set_code(Some("m/d/yyyy".into()));
+        let dated = styles.intern(xf);
+        let mut s = Sheet::default();
+        s.set_cell(
+            0,
+            0,
+            Cell {
+                style: dated,
+                ..Cell::number(serial(2024, 1, 15))
+            },
+        );
+        s.set_cell(1, 0, Cell::number(123_456_789.0));
+        s.set_cell(2, 0, Cell::text("a long piece of text"));
+        let prn = sheet_prn(&s, &styles, false);
+        assert_eq!(prn, "1/15/2024\r\n123456789\r\na long p\r\n");
+    }
+
+    #[test]
+    fn advanced_separators_keep_the_grouping_rule() {
+        let opts = TextParse {
+            decimal: ',',
+            thousands: '.',
+            ..TextParse::default()
+        };
+        let v = |f: &str| {
+            convert_field(
+                f,
+                ColFormat::General,
+                &opts,
+                &AutoConvert::default(),
+                &ctx(),
+            )
+            .unwrap()
+            .entry
+            .cell
+            .value
+        };
+        assert_eq!(v("03.04.2024"), CellValue::Text("03.04.2024".into()));
+        assert_eq!(v("1.2"), CellValue::Text("1.2".into()));
+        assert_eq!(v("1.234,5"), CellValue::Number(1234.5));
+        assert_eq!(v("1234,5"), CellValue::Number(1234.5));
+        assert_eq!(v("12,5%"), CellValue::Number(0.125));
+        // A field that is not number-shaped reads as typed: a date stays one.
+        assert_eq!(v("1/2"), CellValue::Number(serial(2024, 1, 2)));
+        assert_eq!(v("apple"), CellValue::Text("apple".into()));
+    }
+
+    #[test]
+    fn a_date_column_reads_only_its_order_and_a_trailing_time() {
+        let dmy = ColFormat::Date(DateOrder::Dmy);
+        let conv = |f: &str| {
+            convert_field(
+                f,
+                dmy,
+                &TextParse::default(),
+                &AutoConvert::default(),
+                &ctx(),
+            )
+            .unwrap()
+            .entry
+        };
+        let e = conv("03/04/2024 10:30");
+        assert_eq!(
+            e.cell.value,
+            CellValue::Number(serial(2024, 4, 3) + 10.5 / 24.0)
+        );
+        assert_eq!(e.format, Some("m/d/yyyy h:mm"));
+        // Not a DMY date: text, never re-read as MDY.
+        assert_eq!(
+            conv("04/13/2024").cell.value,
+            CellValue::Text("04/13/2024".into())
+        );
+        assert_eq!(conv("apple").cell.value, CellValue::Text("apple".into()));
+        assert_eq!(conv("03/04/2024").format, Some("m/d/yyyy"));
+    }
+
+    #[test]
     fn a_web_page_links_its_files_folder() {
         let mut s = sheet_of(&[&["<a>", "b"]]);
         s.name = "Data".into();
-        let page = web_page(&s, &Styles::default(), false, "out");
+        let page = web_page(&s, &Styles::default(), false, "out.htm");
         assert!(page.htm.contains("href=\"out_files/filelist.xml\""));
         assert!(page.htm.contains("href=\"out_files/stylesheet.css\""));
         assert!(page.htm.contains("<td>&lt;a&gt;</td>"));

@@ -147,9 +147,12 @@ One `RefTarget` variant per input, one `ref_commit` arm per variant:
 | `CondFormat` | Conditional Formatting bar | the cells the rule applies to |
 | `Validation` | Data Validation bar | the cells the list applies to |
 | `Sort` | Sort bar | the rows to sort |
-| `TextToColumns` | Text to Columns bar | the cells to split |
 
-The four bars *display* the current selection in their field until you pin a
+Data › Text to Columns used to be a fourth bar with a field here; it is now
+Excel's Convert Text to Columns Wizard, a form dialog (`ttc_dialog.rs`, #692)
+that converts the selected column, so it has no reference field.
+
+The three bars *display* the current selection in their field until you pin a
 range into it (`bar_target` → `bar_open` → `bar_seed`; see "The entry bars follow
 the selection until you pin them" below), so leaving the field alone does exactly
 what the bar did before it had one. Sort shows the *region it would find* —
@@ -301,7 +304,7 @@ field:
 |--------|---------------|-----|
 | `ChartRange`, `SeriesName`, `SeriesValues`, `Categories` | resolved | a chart plots numbers that needn't live on the sheet it floats over |
 | `Validation` | resolved | the rule is built while looking at the lookup sheet holding the list, and applies to the entry sheet holding the boxes |
-| `CondFormat`, `Sort`, `TextToColumns` | refused | each acts on the rows in front of you — a rule paints *these* cells, a sort reorders *these* rows, a split rewrites *these* columns |
+| `CondFormat`, `Sort` | refused | each acts on the rows in front of you — a rule paints *these* cells, a sort reorders *these* rows |
 | `ChartTitle` | n/a | not a range at all |
 
 The refusal is the pre-existing message, unchanged:
@@ -382,8 +385,8 @@ alone, wrapped as `Docxy::ref_sheet_index` for the view and reached from
 
 `bar_range` is `None` until you type a range into the field or point at one. Up
 to that moment the field *displays* the live selection (`bar_seed`) and the bar
-acts on it, which is exactly what Conditional Formatting, Data Validation,
-Custom Sort and Text-to-Columns did before they had a field at all. Seeding the
+acts on it, which is exactly what Conditional Formatting, Data Validation and
+Custom Sort did before they had a field at all. Seeding the
 field on open instead would freeze it: you would open the bar, drag out the
 cells you meant, and Apply would still use whatever was selected beforehand.
 

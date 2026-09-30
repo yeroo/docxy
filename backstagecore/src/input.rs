@@ -309,8 +309,9 @@ impl Backstage {
             }
             return BackstageEvent::None;
         }
-        // The Save As dialog has two pieces; clicking one focuses it and
-        // deactivates the other.
+        // The Save As dialog has three pieces (the folder list, the name box
+        // and, when the host has types, the type box); clicking one focuses
+        // it and deactivates the others.
         if self.pane == Pane::SaveAs {
             // The Save button (a clickable Enter).
             if self.layout.save_btn.contains(Position { x, y }) {

@@ -275,13 +275,24 @@ fn save_kind(t: &backstage::SaveType) -> SaveKind {
 /// with it, as the list is ordered): `.csv` is CSV UTF-8, `.txt` Text (Tab
 /// delimited). `None` for an extension no type has.
 fn type_for_path(path: &str) -> Option<usize> {
-    let ext = Path::new(path).extension()?.to_str()?.to_ascii_lowercase();
-    let ext = match ext.as_str() {
-        "html" => "htm",
-        "mhtml" => "mht",
-        e => e,
-    };
+    let ext = type_ext(path)?;
     SAVE_TYPES.iter().position(|t| t.ext == ext)
+}
+
+/// `path`'s extension as the type list spells it: lower case, with `.html`
+/// and `.mhtml` the Web Page types' `.htm` and `.mht`.
+fn type_ext(path: &str) -> Option<String> {
+    let ext = Path::new(path).extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "html" => "htm".to_string(),
+        "mhtml" => "mht".to_string(),
+        _ => ext,
+    })
+}
+
+/// Does `path` carry type `t`'s extension (or its alias)?
+fn has_type_ext(path: &str, t: usize) -> bool {
+    type_ext(path).as_deref() == SAVE_TYPES.get(t).map(|ty| ty.ext)
 }
 
 /// A `.txt` or `.prn`: opened through the Text Import Wizard.
@@ -382,16 +393,17 @@ fn main() -> ExitCode {
     }
 
     let (pkg, path, import_source) = match parsed.inputs.first() {
-        // CSV/TSV imports as a one-sheet workbook (Ctrl-S then writes
-        // .xlsx — the path is rebound so a spreadsheet never lands in a
-        // text file). The delimiter is sniffed.
         // A .txt/.prn in the editor opens the Text Import Wizard over a new
-        // workbook; headless runs import it with the wizard's defaults.
+        // workbook (`run_tui` gets it as `wizard`).
         Some(input)
             if is_text_import(input) && parsed.recalc_out.is_none() && parsed.csv_out.is_none() =>
         {
             (new_xlsx(), "untitled.xlsx".to_string(), None)
         }
+        // CSV/TSV, and a .txt/.prn in a headless run (the wizard's
+        // defaults), import as a one-sheet workbook. Ctrl-S then writes
+        // .xlsx: the path is rebound so a spreadsheet never lands in a text
+        // file.
         Some(input) if is_delimited(input) || is_text_import(input) => {
             match load_workbook(input, &TextOpen::from_prefs()) {
                 Ok(loaded) => loaded,
@@ -530,8 +542,12 @@ fn auto_convert_from_prefs(text: &str) -> AutoConvert {
     auto
 }
 
-/// Load a workbook from disk (`.xlsx`, or `.csv`/`.tsv` imported as one sheet),
-/// returning the package, its save path, and any original CSV/TSV import path.
+/// Load a workbook from disk, returning the package, its save path, and the
+/// imported text file's path if it was one. An `.xlsx` (or other package)
+/// loads as it is; a `.csv`/`.tsv` imports as one sheet as Excel opens it
+/// (`sep=`, typed-entry conversion); a `.txt`/`.prn` imports with the Text
+/// Import Wizard's defaults (the editor shows the wizard instead, see
+/// `App::open_workbook`). A text import is saved to `<name>.xlsx`.
 fn load_workbook(
     path: &str,
     open: &TextOpen,
@@ -2511,13 +2527,11 @@ impl App {
     /// still has its extension.
     fn bound_text_type(&self) -> Option<usize> {
         let t = self.text_type?;
-        let ty = SAVE_TYPES.get(t)?;
-        let ext = Path::new(&self.path).extension()?.to_str()?;
         let text = matches!(
-            save_kind(ty),
+            save_kind(SAVE_TYPES.get(t)?),
             SaveKind::Text { .. } | SaveKind::Prn | SaveKind::WebPage
         );
-        (text && ext.eq_ignore_ascii_case(ty.ext)).then_some(t)
+        (text && has_type_ext(&self.path, t)).then_some(t)
     }
 
     /// Write the active sheet to `self.path` as text type `t`. Only that sheet
@@ -2539,7 +2553,11 @@ impl App {
             ),
             SaveKind::WebPage => {
                 let stem = file_stem(&self.path);
-                let page = gridcore::textio::web_page(sheet, &wb.styles, wb.date1904, &stem);
+                let file_name = Path::new(&self.path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| format!("{stem}.htm"));
+                let page = gridcore::textio::web_page(sheet, &wb.styles, wb.date1904, &file_name);
                 let folder = Path::new(&self.path).with_file_name(format!("{stem}_files"));
                 extra = page
                     .files
@@ -3518,11 +3536,7 @@ impl App {
             }
             return;
         }
-        let open = TextOpen {
-            auto: self.auto_convert,
-            today: now_serial(),
-        };
-        match load_workbook(path, &open) {
+        match load_workbook(path, &self.text_open()) {
             Ok((pkg, p, import_source)) => self.install_workbook(pkg, p, import_source),
             Err(e) => self.status = Some(format!("Open failed: {e}")),
         }
@@ -3530,34 +3544,51 @@ impl App {
 
     /// Make `pkg` (loaded from, and to be saved to, `p`) the open workbook.
     fn install_workbook(&mut self, pkg: SheetPackage, p: String, import_source: Option<String>) {
-        {
-            {
-                let (rels, meas) = pkg
-                    .part(MODEL_PART)
-                    .map(|b| parse_model_part(&String::from_utf8_lossy(b)))
-                    .unwrap_or_default();
-                let comments = pkg.comments();
-                let mut engine = Engine::new(&pkg.workbook);
-                engine.clock = now_serial();
-                engine.seed = entropy_seed();
-                self.engine = engine;
-                self.pkg = pkg;
-                self.forget_clip();
-                self.path = p;
-                self.import_source = import_source;
-                self.model_rels = rels;
-                self.model_measures = meas;
-                self.comments = comments;
-                self.reset_view();
-                self.modified = false;
-                self.backstage = None;
-                self.start_screen = false;
-                self.status = Some(if !self.circles_shown() {
-                    format!("Opened {}", self.path)
-                } else {
-                    format!("Opened {}. {CIRCULAR_WARNING}", self.path)
-                });
-            }
+        let (rels, meas) = pkg
+            .part(MODEL_PART)
+            .map(|b| parse_model_part(&String::from_utf8_lossy(b)))
+            .unwrap_or_default();
+        let comments = pkg.comments();
+        let mut engine = Engine::new(&pkg.workbook);
+        engine.clock = now_serial();
+        engine.seed = entropy_seed();
+        self.engine = engine;
+        self.pkg = pkg;
+        self.forget_clip();
+        self.path = p;
+        self.import_source = import_source;
+        self.model_rels = rels;
+        self.model_measures = meas;
+        self.comments = comments;
+        self.reset_view();
+        self.modified = false;
+        self.backstage = None;
+        self.start_screen = false;
+        self.status = Some(if !self.circles_shown() {
+            format!("Opened {}", self.path)
+        } else {
+            format!("Opened {}. {CIRCULAR_WARNING}", self.path)
+        });
+    }
+
+    /// Open `path` without a dialog, as the control surface does: a
+    /// `.txt`/`.prn` is imported with the Text Import Wizard's defaults
+    /// (`sheet.import-text` takes other options) instead of showing it.
+    fn open_without_wizard(&mut self, path: &str) -> Result<(), String> {
+        if !is_text_import(path) {
+            self.open_workbook(path);
+            return Ok(());
+        }
+        let (pkg, save, source) = load_workbook(path, &self.text_open())?;
+        self.install_workbook(pkg, save, source);
+        Ok(())
+    }
+
+    /// How a text file opens now: File › Options › Data and the clock.
+    fn text_open(&self) -> TextOpen {
+        TextOpen {
+            auto: self.auto_convert,
+            today: now_serial(),
         }
     }
 
@@ -3783,14 +3814,8 @@ impl App {
         // A type picked in the list wins; else the name's extension decides.
         let chosen = self.backstage.as_ref().and_then(|b| b.chosen_type());
         let fname = match chosen {
-            Some(t) => {
-                let ext = SAVE_TYPES[t].ext;
-                let has = Path::new(&name)
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| e.eq_ignore_ascii_case(ext));
-                if has { name } else { format!("{name}.{ext}") }
-            }
+            Some(t) if has_type_ext(&name, t) => name,
+            Some(t) => format!("{name}.{}", SAVE_TYPES[t].ext),
             None if name.contains('.') => name,
             None => format!("{name}.xlsx"),
         };
@@ -4114,11 +4139,7 @@ impl App {
         let opts = d.parse();
         match &d.purpose {
             textdlg::Purpose::Import { path, .. } => {
-                let open = TextOpen {
-                    auto: self.auto_convert,
-                    today: now_serial(),
-                };
-                let pkg = text_to_pkg(d.text(), &file_stem(path), &opts, &open);
+                let pkg = text_to_pkg(d.text(), &file_stem(path), &opts, &self.text_open());
                 let save_path = format!("{}.xlsx", &path[..path.len() - 4]);
                 self.install_workbook(pkg, save_path, Some(path.clone()));
             }
@@ -7367,6 +7388,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #615: `.html` is Web Page's other spelling: Save As and Ctrl+S write
+    /// the page, never the workbook package.
+    #[test]
+    fn save_as_html_writes_a_web_page_and_ctrl_s_keeps_it() {
+        let dir = tmp("html");
+        let mut app = two_sheet_app(&dir);
+        let page = dir.join("page.html");
+        app.request_save_as(page.to_string_lossy().into_owned());
+        let bytes = std::fs::read(&page).unwrap();
+        assert!(!bytes.starts_with(b"PK"));
+        let htm = String::from_utf8(bytes).unwrap();
+        assert!(htm.contains("page_files/filelist.xml"), "{htm}");
+        let list = std::fs::read_to_string(dir.join("page_files").join("filelist.xml")).unwrap();
+        assert!(list.contains("HRef=\"../page.html\""), "{list}");
+        std::fs::remove_file(&page).unwrap();
+        app.save();
+        assert!(!std::fs::read(&page).unwrap().starts_with(b"PK"));
+        // Picked from the list, a typed .html name is kept as it is.
+        app.open_backstage();
+        let web = SAVE_TYPES
+            .iter()
+            .position(|t| t.label == "Web Page")
+            .unwrap();
+        let b = app.backstage.as_mut().unwrap();
+        b.begin_save_as("other.xlsx".into(), None);
+        b.pick_type(web);
+        b.name_input = "other.html".into();
+        app.commit_save_as(dir.clone(), "other.html".into());
+        assert!(dir.join("other.html").is_file());
+        assert!(!dir.join("other.html.htm").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #615: XML Data needs XML maps; other unwritten types are refused and
     /// nothing is written under their name.
     #[test]
@@ -7501,7 +7555,13 @@ mod tests {
     fn automatic_data_conversion_off_keeps_fields_as_text() {
         use gridcore::sheet::CellValue::{Number, Text};
         let csv = "007,1/2,1E5,1234567890123456789\n";
-        let off = csv_to_pkg(csv, "off", false, &csv_open(AutoConvert::off()));
+        let all_off = AutoConvert {
+            remove_leading_zeros: false,
+            keep_15_digits: false,
+            e_notation: false,
+            dates: false,
+        };
+        let off = csv_to_pkg(csv, "off", false, &csv_open(all_off));
         for (a1, text) in [
             ("A1", "007"),
             ("B1", "1/2"),

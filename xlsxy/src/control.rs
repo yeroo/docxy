@@ -123,7 +123,7 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         }
         "wb.reload" => {
             let p = app.path.clone();
-            app.open_workbook(&p);
+            app.open_without_wizard(&p)?;
             Ok(path_info(app))
         }
         "wb.open" => {
@@ -131,18 +131,7 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
                 .get_str("path")
                 .ok_or("wb.open needs a 'path' string")?
                 .to_string();
-            if super::is_text_import(&p) {
-                // No wizard for an agent: the wizard's defaults (or use
-                // sheet.import-text for other options).
-                let open = super::TextOpen {
-                    auto: app.auto_convert,
-                    today: now_serial(),
-                };
-                let (pkg, save, source) = super::load_workbook(&p, &open)?;
-                app.install_workbook(pkg, save, source);
-            } else {
-                app.open_workbook(&p);
-            }
+            app.open_without_wizard(&p)?;
             Ok(path_info(app))
         }
         other => Err(format!("unknown verb '{other}'")),
@@ -1027,27 +1016,7 @@ fn sheet_import_text(app: &mut App, args: &Json) -> Result<Json, String> {
         }
         (None, None) => return Err("sheet.import-text needs 'text' or 'path'".into()),
     };
-    let requested = args.get_str("name").unwrap_or("Sheet");
-    let name = unique_sheet_name(&app.pkg.workbook, requested);
-    let idx = app.pkg.add_sheet(&name);
-    let open = super::TextOpen {
-        auto: app.auto_convert,
-        today: now_serial(),
-    };
-    let wb = &mut app.pkg.workbook;
-    super::import_text(&mut wb.sheets[idx], &mut wb.styles, &text, &opts, &open);
-    let (rows, cols) = app.pkg.workbook.sheets[idx].used_size();
-    // A new sheet does not fit the cell-level undo model (see import-csv).
-    app.undo.clear();
-    app.redo.clear();
-    app.rebuild_engine();
-    app.modified = true;
-    Ok(Json::obj(vec![
-        ("sheet", Json::Num(idx as f64)),
-        ("name", Json::Str(name)),
-        ("rows", Json::Num(rows as f64)),
-        ("cols", Json::Num(cols as f64)),
-    ]))
+    import_new_sheet(app, args, &text, &opts)
 }
 
 /// Data › Text to Columns on one column: `range` converted under `options`
@@ -1086,16 +1055,25 @@ fn sheet_import_csv(app: &mut App, args: &Json) -> Result<Json, String> {
     let text = args
         .get_str("text")
         .ok_or("sheet.import-csv needs 'text'")?;
+    let (opts, body) = super::csv_parse(text, false);
+    import_new_sheet(app, args, body, &opts)
+}
+
+/// `text` read under `opts` into a brand-new sheet named by `args.name`
+/// (deduplicated), converted as opening a text file converts it. Shared by
+/// `sheet.import-csv` and `sheet.import-text`.
+fn import_new_sheet(
+    app: &mut App,
+    args: &Json,
+    text: &str,
+    opts: &gridcore::textio::TextParse,
+) -> Result<Json, String> {
     let requested = args.get_str("name").unwrap_or("Sheet");
     let name = unique_sheet_name(&app.pkg.workbook, requested);
     let idx = app.pkg.add_sheet(&name);
-    let open = super::TextOpen {
-        auto: app.auto_convert,
-        today: now_serial(),
-    };
-    let (opts, body) = super::csv_parse(text, false);
+    let open = app.text_open();
     let wb = &mut app.pkg.workbook;
-    super::import_text(&mut wb.sheets[idx], &mut wb.styles, body, &opts, &open);
+    super::import_text(&mut wb.sheets[idx], &mut wb.styles, text, opts, &open);
     let (rows, cols) = app.pkg.workbook.sheets[idx].used_size();
     // New package parts (worksheet/relationship/workbook.xml wiring) don't
     // fit the cell-level undo model — same as the TUI's own AddSheet flow,
@@ -2520,6 +2498,26 @@ mod tests {
         }
         let bad = Json::obj(vec![("convert_dates", Json::Str("no".into()))]);
         assert!(dispatch(&mut a, "app.options", &bad).is_err());
+    }
+
+    /// A workbook saved as Text (Tab delimited) is bound to its .txt, so
+    /// wb.reload re-imports that text rather than leaving a wizard open.
+    #[test]
+    fn wb_reload_of_a_text_file_reimports_it_without_the_wizard() {
+        let dir = std::env::temp_dir().join(format!("xlsxy-reload-txt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("saved.txt");
+        let mut a = app();
+        set(&mut a, "A1", "a");
+        set(&mut a, "B1", "1");
+        a.request_save_as(path.to_string_lossy().into_owned());
+        assert_eq!(std::path::Path::new(&a.path), path);
+        std::fs::write(&path, "b\t2\r\n").unwrap();
+        dispatch(&mut a, "wb.reload", &Json::Null).unwrap();
+        assert!(a.text_dialog.is_none());
+        assert_eq!(get_value(&a, "A1"), CellValue::Text("b".into()));
+        assert_eq!(get_value(&a, "B1"), CellValue::Number(2.0));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
