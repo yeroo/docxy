@@ -10,7 +10,7 @@
 use crate::sheet::{cell_name, parse_col};
 use crate::xlsx::{
     SheetPackage, add_content_type_override, add_rel, add_workbook_rel, parse_rels,
-    resolve_relative, worksheet_insert_pos,
+    put_worksheet_child, remove_worksheet_child, resolve_relative, worksheet_child_span,
 };
 
 const COMMENTS_CT: &str =
@@ -765,36 +765,24 @@ impl SheetPackage {
         if rid.is_empty() {
             return;
         }
-        let Some(mut xml) = self.part_str(ws_part) else {
+        let Some(xml) = self.part_str(ws_part) else {
             return;
         };
-        if xml.contains("<legacyDrawing ") {
+        if worksheet_child_span(&xml, "legacyDrawing").is_some() {
             return;
         }
-        // Declare xmlns:r on <worksheet …> if absent.
-        if !xml.contains("xmlns:r=") {
-            if let Some(g) = xml.find("<worksheet") {
-                if let Some(rel) = xml[g..].find('>') {
-                    let at = g + rel;
-                    xml.insert_str(at, &format!(" xmlns:r=\"{}\"", self.ns().rels));
-                }
-            }
-        }
         let tag = format!("<legacyDrawing r:id=\"{rid}\"/>");
-        let insert_at = worksheet_insert_pos(&xml, "legacyDrawing");
-        xml.insert_str(insert_at, &tag);
+        let xml = put_worksheet_child(&xml, "legacyDrawing", &tag, Some(self.ns().rels), false);
         self.set_part(ws_part, xml.into_bytes());
     }
 
     fn strip_legacy_drawing(&mut self, ws_part: &str) {
-        let Some(mut xml) = self.part_str(ws_part) else {
+        let Some(xml) = self.part_str(ws_part) else {
             return;
         };
-        if let Some(s) = xml.find("<legacyDrawing ") {
-            if let Some(e) = xml[s..].find("/>") {
-                xml.replace_range(s..s + e + 2, "");
-                self.set_part(ws_part, xml.into_bytes());
-            }
+        if worksheet_child_span(&xml, "legacyDrawing").is_some() {
+            let xml = remove_worksheet_child(&xml, "legacyDrawing");
+            self.set_part(ws_part, xml.into_bytes());
         }
     }
 
