@@ -176,10 +176,11 @@ pub fn parse_auto_filter(xml: &str) -> Option<AutoFilter> {
             }
             Event::End => {
                 let name = p.name().rsplit(':').next().unwrap_or("");
+                // A column with no criteria (only `hiddenButton` or
+                // `showButton`, say) filters nothing.
                 if in_af.is_some() && name == "filterColumn" {
-                    if let (Some((id, f)), Some(af)) = (col.take(), af.as_mut()) {
-                        af.columns
-                            .push((id, f.unwrap_or(ColumnFilter::Unsupported)));
+                    if let (Some((id, Some(f))), Some(af)) = (col.take(), af.as_mut()) {
+                        af.columns.push((id, f));
                     }
                 }
                 if in_af == Some(depth) {
