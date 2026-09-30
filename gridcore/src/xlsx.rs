@@ -2921,11 +2921,15 @@ struct WorksheetWalk<'a> {
 /// `oleObjects` and `legacyDrawing` that way.
 ///
 /// A child the parser can't read to its end (a mismatched end tag inside
-/// it) is spanned by its own end tag when one follows, and the walk goes on.
-/// Otherwise the walk stops there and records it in `stopped`, with `close`
-/// `None`: the children before the stop are real, but the list is not known
-/// to be whole. [`worksheet_insert_pos`] says where an insert is still safe;
-/// a self-closing root has nothing to walk at all.
+/// it) is spanned by its own end tag when one follows and
+/// [`resync_is_safe`] vouches for it, and the walk goes on. Otherwise the
+/// walk stops there and records it in `stopped`. An end tag that isn't
+/// `</worksheet>` also stops the walk, with `stopped` left `None`. Either
+/// way `close` is `None`: the children before the stop are real, but the
+/// list is not known to be whole. `close` is `</worksheet>`'s start, or the
+/// end of the last child when the part ends without one.
+/// [`worksheet_insert_pos`] says where an insert is still safe; a
+/// self-closing root has nothing to walk at all.
 fn worksheet_children(xml: &str) -> WorksheetWalk<'_> {
     let mut walk = WorksheetWalk {
         children: Vec::new(),
@@ -2964,8 +2968,9 @@ fn worksheet_children(xml: &str) -> WorksheetWalk<'_> {
                     Some(end) => Some(end),
                     None if p.skip_element_complete() => Some(base + p.pos()),
                     // Broken inside: its own end tag, if one follows, still
-                    // bounds it.
-                    None => close_tag_end(xml, body, qname),
+                    // bounds it, unless it could be someone else's.
+                    None => close_tag_end(xml, body, qname)
+                        .filter(|&end| resync_is_safe(&xml[body..end], name)),
                 };
                 let Some(end) = end else {
                     walk.stopped = Some((start, name));
@@ -3026,6 +3031,25 @@ fn sheet_data_fallback_span(xml: &str) -> Option<(usize, usize)> {
         start,
         sheet_data_end(xml, gt, &format!("{prefix}sheetData"))?,
     ))
+}
+
+/// Can the end tag that closes `span` be trusted to be its broken child's
+/// own? Not when a comment, CDATA section or processing instruction could
+/// hold a literal one, nor when an element of the same local name nests in
+/// it (a `<customSheetView>`'s `<autoFilter>` inside a broken top-level one):
+/// its end tag would close that instead.
+fn resync_is_safe(span: &str, name: &str) -> bool {
+    if span.contains("<!--") || span.contains("<![CDATA[") || span.contains("<?") {
+        return false;
+    }
+    let mut p = XmlParser::new(span);
+    loop {
+        match p.next() {
+            Event::Start if local(p.name()) == name => return false,
+            Event::Eof => return true,
+            _ => {}
+        }
+    }
 }
 
 /// Just past the first `</qname>` (any spacing before `>`) at or after `from`.
@@ -3093,8 +3117,9 @@ fn ct_worksheet_rank(name: &str) -> Option<usize> {
 }
 
 /// Byte offset at which a new top-level `<tag>` belongs: before the first
-/// existing top-level child that ranks after `tag`, else before
-/// `</worksheet>`. Children the schema doesn't name are not anchors.
+/// existing top-level child that ranks after `tag`, else at the walk's
+/// `close` (`</worksheet>`, or the end of the last child when the part has
+/// none). Children the schema doesn't name are not anchors.
 ///
 /// After a walk that stopped, the position is still known when a found
 /// child ranks after `tag`, or when the child it stopped at does (its start
@@ -3145,6 +3170,23 @@ pub(crate) fn remove_worksheet_child(xml: &str, tag: &str) -> String {
     }
 }
 
+/// `xml` without its singleton top-level `<tag>`: the one the walk found, or,
+/// when the walk stopped where a `<tag>` could still follow, the first one
+/// found by its tags (what main did). The tag scan runs only in that case:
+/// the plain save of a sheet with no merges asks this on every save.
+pub(crate) fn remove_worksheet_singleton(xml: &str, tag: &str) -> String {
+    if worksheet_child_span(xml, tag).is_some() {
+        return remove_worksheet_child(xml, tag);
+    }
+    if worksheet_insert_pos(xml, tag).is_some() {
+        return xml.to_string();
+    }
+    match element_span_by_tags(xml, tag) {
+        Some((s, e)) => format!("{}{}", &xml[..s], &xml[e..]),
+        None => xml.to_string(),
+    }
+}
+
 /// Sync a singleton top-level `<tag>` with `block` (`None` drops it), at
 /// save time, where the model has to reach the part.
 ///
@@ -3155,18 +3197,10 @@ pub(crate) fn remove_worksheet_child(xml: &str, tag: &str) -> String {
 /// replaced, or the block goes right after `</sheetData>`. Never a second
 /// one, and never a model edit that the part doesn't carry.
 fn sync_worksheet_child(xml: &str, tag: &str, block: Option<&str>) -> String {
-    let out = remove_worksheet_child(xml, tag);
     let Some(block) = block else {
-        return match worksheet_child_span(xml, tag) {
-            Some(_) => out,
-            None => match element_span_by_tags(xml, tag) {
-                Some((s, e)) if worksheet_insert_pos(xml, tag).is_none() => {
-                    format!("{}{}", &xml[..s], &xml[e..])
-                }
-                _ => out,
-            },
-        };
+        return remove_worksheet_singleton(xml, tag);
     };
+    let out = remove_worksheet_child(xml, tag);
     if worksheet_insert_pos(&out, tag).is_some() {
         return put_worksheet_child(&out, tag, block, None, false);
     }
@@ -4395,11 +4429,6 @@ impl SheetPackage {
         self.workbook.sheets.len() - 1
     }
 
-    /// Write a clustered column chart (cached literal data, self-contained) onto
-    /// `sheet`, anchored over the cell rect `from`..`to`, wiring the full OPC:
-    /// the chart part, a drawing part with a twoCellAnchor graphicFrame, both
-    /// rels, the content-type overrides, and the worksheet's `<drawing>` element.
-    /// Also registers it in the model so it round-trips on reload.
     /// Add a `cellIs` conditional-formatting rule (Excel's "Highlight Cells"):
     /// the differential format `dxf` applies to `range` when the cell value
     /// satisfies `op` (greaterThan / lessThan / between / equal / …) against
@@ -4670,15 +4699,12 @@ impl SheetPackage {
         if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
             // Every top-level block, in any prefix; never an x14 one in extLst.
-            let walk = worksheet_children(&xml);
-            let cf = ct_worksheet_rank("conditionalFormatting");
-            let past_cf = |name: &str| ct_worksheet_rank(name) > cf;
-            let seen_all = walk.close.is_some()
-                || walk.children.iter().any(|c| past_cf(c.rank_as))
-                || walk.stopped.is_some_and(|(_, n)| past_cf(n));
-            if !seen_all {
+            // A known position for a new block means the walk got past every
+            // place an existing one may stand.
+            if worksheet_insert_pos(&xml, "conditionalFormatting").is_none() {
                 return false;
             }
+            let walk = worksheet_children(&xml);
             let mut out = xml.clone();
             for c in walk
                 .children
@@ -4694,10 +4720,16 @@ impl SheetPackage {
         true
     }
 
+    /// Write a clustered column chart (cached literal data, self-contained) onto
+    /// `sheet`, anchored over the cell rect `from`..`to`, wiring the full OPC:
+    /// the chart part, a drawing part with a twoCellAnchor graphicFrame, both
+    /// rels, the content-type overrides, and the worksheet's `<drawing>` element.
+    /// Also registers it in the model so it round-trips on reload.
     ///
-    /// `false` when the chart can't be written. The worksheet part is asked
-    /// first, so a malformed one refuses before any part, rel or content type
-    /// exists.
+    /// `false`, with nothing changed, when the chart can't be written: the
+    /// worksheet part (malformed where `<drawing>` would go) and the host
+    /// drawing part (no root to splice the anchor into) are asked before any
+    /// part, rel or content type is written.
     pub fn add_chart(
         &mut self,
         sheet: usize,
@@ -4735,6 +4767,17 @@ impl SheetPackage {
             .rsplit_once('/')
             .unwrap_or(("", drawing_part.as_str()));
         let (d_dir, d_file) = (d_dir.to_string(), d_file.to_string());
+        // A host part with neither a `</wsDr>` nor a self-closed root to open
+        // is truncated or isn't a drawing: refuse before writing anything.
+        if let Some(xml) = host.as_deref().and_then(|p| self.part(p)) {
+            let xml = String::from_utf8_lossy(xml);
+            let px = wsdr_prefix(&xml);
+            let spliceable = xml.rfind(&format!("</{px}wsDr>")).is_some()
+                || open_self_closed_root(&xml, &format!("{px}wsDr")).is_some();
+            if !spliceable {
+                return false;
+            }
+        }
 
         // 2) drawing rels → chart (its rId names the chart from the anchor).
         // Minted BEFORE the chart part is written, so a failure here leaves no
@@ -11051,9 +11094,11 @@ mod ct_worksheet_order_tests {
         assert!(!pkg.set_comment(0, 0, 0, "A", "note"));
         // A walk stopped before conditionalFormatting's rank has no place for
         // a rule either, and can't vouch that a clear saw every block.
+        // It holds a rule, so a clear that touched only one side would show.
         let mut early = loaded(&format!(
-            r#"{ROWS}<autoFilter ref="A1:B2"><filterColumn colId="0">{MARGINS}"#
+            r#"{ROWS}<conditionalFormatting sqref="A1"><cfRule type="expression" priority="1"><formula>TRUE</formula></cfRule></conditionalFormatting><autoFilter ref="A1:B2"><filterColumn colId="0">{MARGINS}"#
         ));
+        assert_eq!(early.workbook.sheets[0].cond_formats.len(), 1);
         let early_parts = early.parts.clone();
         let dxf = crate::sheet::Dxf {
             bold: Some(true),
@@ -11067,7 +11112,73 @@ mod ct_worksheet_order_tests {
         assert_eq!(pkg.workbook.sheets[0].drawings.len(), 0);
         assert!(pkg.comments().is_empty());
         assert_eq!(early.parts, early_parts);
-        assert!(early.workbook.sheets[0].cond_formats.is_empty());
+        assert_eq!(early.workbook.sheets[0].cond_formats.len(), 1);
+        // A threaded comment needs the same <legacyDrawing> as a note.
+        assert!(!pkg.add_threaded_comment(0, 0, 0, "Ana", "Hi", "2024-01-02T03:04:05Z"));
+        assert_eq!(pkg.parts, parts);
+        assert!(pkg.comments().is_empty());
+    }
+
+    #[test]
+    fn a_chart_whose_host_drawing_cannot_take_an_anchor_writes_nothing() {
+        let mut pkg = loaded(ROWS);
+        assert!(pkg.add_chart(0, (0, 3), (10, 8), &chart()));
+        // Truncate the host drawing part: no </xdr:wsDr>, no self-closed root.
+        let host = pkg.workbook.sheets[0].drawing_part.clone().expect("host");
+        let xml = String::from_utf8_lossy(pkg.part(&host).unwrap()).into_owned();
+        let cut = &xml[..xml.rfind("</xdr:wsDr>").unwrap()];
+        pkg.set_part(&host, cut.as_bytes().to_vec());
+        let parts = pkg.parts.clone();
+        let drawings = pkg.workbook.sheets[0].drawings.len();
+        assert!(!pkg.add_chart(0, (12, 3), (20, 8), &chart()));
+        assert_eq!(pkg.parts, parts);
+        assert_eq!(pkg.workbook.sheets[0].drawings.len(), drawings);
+    }
+
+    #[test]
+    fn removing_the_last_note_strips_a_legacy_drawing_behind_a_stopped_walk() {
+        let mut pkg = loaded(&format!("{ROWS}{MARGINS}"));
+        assert!(pkg.set_comment(0, 0, 0, "A", "note"));
+        // Break the part so the walk stops at headerFooter, before the
+        // <legacyDrawing> that ranks after it.
+        let ws = String::from_utf8_lossy(pkg.part(SHEET).unwrap()).into_owned();
+        let at_ld = at(&ws, "<legacyDrawing");
+        let broken = format!("{}{STOPPED_TAIL}{}", &ws[..at_ld], &ws[at_ld..]);
+        pkg.set_part(SHEET, broken.into_bytes());
+        pkg.remove_comment(0, 0, 0);
+        let ws = String::from_utf8_lossy(pkg.part(SHEET).unwrap()).into_owned();
+        assert_eq!(count_local(&ws, "legacyDrawing"), 0, "{ws}");
+        // A sheet with no legacyDrawing is left alone.
+        let plain = format!(r#"<worksheet xmlns="{NS}"><sheetData/>{MARGINS}</worksheet>"#);
+        assert_eq!(remove_worksheet_singleton(&plain, "legacyDrawing"), plain);
+    }
+
+    #[test]
+    fn a_resync_is_refused_when_the_end_tag_could_be_someone_elses() {
+        // A comment holding a literal </headerFooter>.
+        let commented = format!(
+            r#"<worksheet xmlns="{NS}"><sheetData/><headerFooter><oddHeader>x</OddHeader><!-- </headerFooter> --></headerFooter><drawing r:id="rId1"/></worksheet>"#
+        );
+        let walk = worksheet_children(&commented);
+        assert_eq!(walk.stopped.map(|(_, n)| n), Some("headerFooter"));
+        assert!(walk.close.is_none());
+        // An unclosed top-level <autoFilter> ahead of a custom view with its
+        // own: the nested </autoFilter> must not end the broken one, or the
+        // walk would resume inside the custom view.
+        let nested = format!(
+            r#"<worksheet xmlns="{NS}"><sheetData/><autoFilter ref="A1:B2"><filterColumn colId="0"><customSheetViews><customSheetView guid="g"><autoFilter ref="A1"></autoFilter><extLst/></customSheetView></customSheetViews>{MARGINS}</worksheet>"#
+        );
+        let walk = worksheet_children(&nested);
+        assert_eq!(walk.stopped.map(|(_, n)| n), Some("autoFilter"));
+        assert_eq!(walk.children.len(), 1);
+        for tag in [
+            "conditionalFormatting",
+            "mergeCells",
+            "dataValidations",
+            "tableParts",
+        ] {
+            assert_eq!(worksheet_insert_pos(&nested, tag), None, "{tag}");
+        }
     }
 
     #[test]

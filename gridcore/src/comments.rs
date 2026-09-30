@@ -10,7 +10,7 @@
 use crate::sheet::{cell_name, parse_col};
 use crate::xlsx::{
     SheetPackage, add_content_type_override, add_rel, add_workbook_rel, parse_rels,
-    put_worksheet_child, remove_worksheet_child, resolve_relative, worksheet_child_span,
+    put_worksheet_child, remove_worksheet_singleton, resolve_relative, worksheet_child_span,
 };
 
 const COMMENTS_CT: &str =
@@ -440,6 +440,10 @@ impl SheetPackage {
     /// (e.g. `2024-01-02T03:04:05Z`); the caller supplies it so the engine
     /// stays clock-free. Writes the persons + threadedComments parts, wires
     /// them, and keeps a legacy shadow note so every reader shows the thread.
+    ///
+    /// `false`, with nothing changed, when it can't be written (see
+    /// [`SheetPackage::set_comment`]): the shadow note needs its
+    /// `<legacyDrawing>`, so the worksheet is asked before any part is.
     pub fn add_threaded_comment(
         &mut self,
         sheet: usize,
@@ -448,11 +452,14 @@ impl SheetPackage {
         author: &str,
         text: &str,
         when: &str,
-    ) {
+    ) -> bool {
         use crate::xlsx::{esc_attr, esc_text};
         let Some(ws_part) = self.sheet_parts.get(sheet).cloned() else {
-            return;
+            return false;
         };
+        if !self.sheet_takes(sheet, "legacyDrawing", true) {
+            return false;
+        }
         let (dir, file) = split_part(&ws_part);
         let rels_name = format!("{dir}/_rels/{file}.rels");
 
@@ -513,6 +520,7 @@ impl SheetPackage {
         // Rebuild the legacy shadow so down-level readers see the thread too.
         let notes = self.sheet_notes(sheet);
         self.write_notes(sheet, &ws_part, &notes);
+        true
     }
 
     /// Ensure `persons_part` declares person `pid` with `display`.
@@ -794,9 +802,9 @@ impl SheetPackage {
         let Some(xml) = self.part_str(ws_part) else {
             return;
         };
-        if worksheet_child_span(&xml, "legacyDrawing").is_some() {
-            let xml = remove_worksheet_child(&xml, "legacyDrawing");
-            self.set_part(ws_part, xml.into_bytes());
+        let out = remove_worksheet_singleton(&xml, "legacyDrawing");
+        if out != xml {
+            self.set_part(ws_part, out.into_bytes());
         }
     }
 

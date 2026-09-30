@@ -1123,12 +1123,12 @@ struct FormatDialog {
     sel: usize,
 }
 
-/// Excel's warning when an edit creates a circular reference.
 /// Status for an edit the workbook's file can't take (a malformed worksheet
 /// part where the edit would go): nothing changed, so nothing to save or undo.
 const WRITE_REFUSED: &str =
     "Can't add that here: this sheet's XML is damaged where it would go (nothing changed)";
 
+/// Excel's warning when an edit creates a circular reference.
 const CIRCULAR_WARNING: &str = "There are one or more circular references where a formula refers to its own cell either directly or indirectly. This might cause them to calculate incorrectly.";
 
 /// The Format Cells section tabs.
@@ -2746,8 +2746,13 @@ impl App {
         }
         let author = comment_author();
         let reply = self.comment_at(r, c).is_some_and(|cm| cm.threaded);
-        self.pkg
-            .add_threaded_comment(self.sheet, r, c, &author, text, &iso_now());
+        if !self
+            .pkg
+            .add_threaded_comment(self.sheet, r, c, &author, text, &iso_now())
+        {
+            self.status = Some(WRITE_REFUSED.into());
+            return;
+        }
         self.modified = true;
         self.refresh_comments();
         self.status = Some(format!(
