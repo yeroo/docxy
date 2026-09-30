@@ -113,7 +113,7 @@ test project unchanged edits preserve redo and cell border follows navigation
   key up right f2 enter
   assert redo_depth is 1
   key up
-  type 8h
+  type 1d
   key enter
   assert redo_depth is 1
   assert undo_depth is 0
