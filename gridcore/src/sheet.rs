@@ -1289,8 +1289,10 @@ pub struct Workbook {
     /// (max iterations, convergence delta). None = cycles are errors.
     pub iterate: Option<(u32, f64)>,
     /// The active sheet (`<workbookView activeTab>`): the sheet the workbook
-    /// opens on and the one a CSV export writes. Saved back with
-    /// `tabSelected` on that sheet alone.
+    /// opens on and the one a CSV export writes. Saved back to `activeTab`;
+    /// when the file marks a selected tab (`tabSelected`, as Excel's files
+    /// do), the mark moves to this sheet alone. A file that marks none is
+    /// left unmarked.
     pub active_tab: usize,
 }
 

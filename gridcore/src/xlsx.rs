@@ -1066,10 +1066,46 @@ fn cell_xf_elements(xml: &str) -> Vec<&str> {
 
 /// An attribute's raw value in one open tag.
 fn tag_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
-    let key = format!(" {name}=\"");
-    let s = tag.find(&key)? + key.len();
-    let e = s + tag[s..].find('"')?;
+    let (_, s, e, _) = attr_span(tag, name)?;
     Some(&tag[s..e])
+}
+
+/// Where attribute `name` sits in one open tag: the whitespace before it,
+/// its value's start and end, and the end past the closing quote. Any
+/// whitespace may surround the `=`, and the value may be in either quote.
+fn attr_span(tag: &str, name: &str) -> Option<(usize, usize, usize, usize)> {
+    let b = tag.as_bytes();
+    let mut from = 0;
+    while let Some(off) = tag[from..].find(name) {
+        let at = from + off;
+        from = at + name.len();
+        let before = at.checked_sub(1).map(|i| b[i]);
+        if !before.is_some_and(|c| c.is_ascii_whitespace()) {
+            continue;
+        }
+        let mut i = at + name.len();
+        while b.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        if b.get(i) != Some(&b'=') {
+            continue;
+        }
+        i += 1;
+        while b.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        let Some(&q) = b.get(i).filter(|c| matches!(c, b'"' | b'\'')) else {
+            continue;
+        };
+        let start = i + 1;
+        let len = tag[start..].find(q as char)?;
+        let mut ws = at;
+        while ws > 0 && b[ws - 1].is_ascii_whitespace() {
+            ws -= 1;
+        }
+        return Some((ws, start, start + len, start + len + 1));
+    }
+    None
 }
 
 /// Every `name="value"` of one open tag, raw, in order.
@@ -2985,11 +3021,9 @@ fn attr_at<'a>(xml: &'a str, start: usize, attr: &str) -> Option<&'a str> {
 fn set_tag_attr(xml: &str, start: usize, attr: &str, value: Option<&str>) -> String {
     let end = tag_end(xml, start);
     let mut tag = xml[start..end].to_string();
-    let needle = format!(" {attr}=\"");
-    if let Some(at) = tag.find(&needle) {
-        if let Some(len) = tag[at + needle.len()..].find('"') {
-            tag.replace_range(at..at + needle.len() + len + 1, "");
-        }
+    // Every spelling of it goes (`a="1"`, `a = '1'`), so none is duplicated.
+    while let Some((ws, _, _, after)) = attr_span(&tag, attr) {
+        tag.replace_range(ws..after, "");
     }
     if let Some(v) = value {
         let name_end = tag
@@ -3000,11 +3034,37 @@ fn set_tag_attr(xml: &str, start: usize, attr: &str, value: Option<&str>) -> Str
     format!("{}{tag}{}", &xml[..start], &xml[end..])
 }
 
+/// The first element named `local` in any namespace prefix (`workbookView`
+/// or `x:workbookView`): its start and its `prefix:` (empty when none).
+fn find_local_element<'a>(xml: &'a str, local: &str) -> Option<(usize, &'a str)> {
+    let mut from = 0;
+    while let Some(off) = xml[from..].find('<') {
+        let at = from + off;
+        from = at + 1;
+        let rest = &xml[at + 1..];
+        if rest.starts_with(['/', '?', '!']) {
+            continue;
+        }
+        let name_len = rest
+            .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
+            .unwrap_or(rest.len());
+        let name = &rest[..name_len];
+        let (prefix, bare) = match name.rfind(':') {
+            Some(i) => (&rest[..i + 1], &name[i + 1..]),
+            None => ("", name),
+        };
+        if bare == local {
+            return Some((at, prefix));
+        }
+    }
+    None
+}
+
 /// Sync `<workbookView activeTab>` with the model's active sheet, adding
-/// `<bookViews>` (before `<sheets>`) only when a sheet other than the first
-/// is active.
+/// `<bookViews>` (before `<sheets>`, in its namespace prefix) only when a
+/// sheet other than the first is active.
 fn set_active_tab(xml: &str, active: usize) -> String {
-    if let Some(i) = find_element(xml, "workbookView") {
+    if let Some((i, _)) = find_local_element(xml, "workbookView") {
         let current = attr_at(xml, i, "activeTab").and_then(|v| v.parse().ok());
         if current.unwrap_or(0) == active {
             return xml.to_string();
@@ -3020,12 +3080,12 @@ fn set_active_tab(xml: &str, active: usize) -> String {
     if active == 0 {
         return xml.to_string();
     }
-    match find_element(xml, "sheets") {
-        Some(i) => {
+    match find_local_element(xml, "sheets") {
+        Some((i, p)) => {
             let mut out = xml.to_string();
             out.insert_str(
                 i,
-                &format!("<bookViews><workbookView activeTab=\"{active}\"/></bookViews>"),
+                &format!("<{p}bookViews><{p}workbookView activeTab=\"{active}\"/></{p}bookViews>"),
             );
             out
         }
@@ -3037,7 +3097,7 @@ fn set_active_tab(xml: &str, active: usize) -> String {
 /// opens every selected tab as a group, so only the active sheet may carry
 /// it. A sheet without a `<sheetView>` is left alone.
 fn set_tab_selected(xml: &str, selected: bool) -> String {
-    let Some(i) = find_element(xml, "sheetView") else {
+    let Some((i, _)) = find_local_element(xml, "sheetView") else {
         return xml.to_string();
     };
     let current = attr_at(xml, i, "tabSelected");
@@ -6349,9 +6409,43 @@ mod tests {
         );
     }
 
+    /// The rewrite follows a namespace prefix (`x:workbookView`), and an
+    /// attribute however it is spelled, so none is added twice.
+    #[test]
+    fn the_active_tab_rewrite_handles_prefixes_and_attribute_spelling() {
+        let wb = r#"<x:workbook xmlns:x="ns"><x:bookViews><x:workbookView activeTab = '1'/></x:bookViews><x:sheets/></x:workbook>"#;
+        let out = set_active_tab(wb, 2);
+        assert_eq!(out.matches("activeTab").count(), 1, "{out}");
+        assert!(out.contains(r#"<x:workbookView activeTab="2"/>"#), "{out}");
+        assert_eq!(parse_active_tab(&out), 2);
+        let bare = r#"<x:workbook xmlns:x="ns"><x:sheets/></x:workbook>"#;
+        let out = set_active_tab(bare, 1);
+        assert!(
+            out.contains(
+                r#"<x:bookViews><x:workbookView activeTab="1"/></x:bookViews><x:sheets/>"#
+            ),
+            "{out}"
+        );
+        let ws = "<x:worksheet><x:sheetViews><x:sheetView\ttabSelected=\"1\" workbookViewId=\"0\"/></x:sheetViews></x:worksheet>";
+        let out = set_tab_selected(ws, false);
+        assert!(!out.contains("tabSelected"), "{out}");
+        let out = set_tab_selected(&out, true);
+        assert_eq!(out.matches("tabSelected").count(), 1, "{out}");
+        // A lookalike name inside another attribute is not the attribute.
+        assert_eq!(
+            tag_attr(r#"<a xtabSelected="0" tabSelected="1">"#, "tabSelected"),
+            Some("1")
+        );
+    }
+
     #[test]
     fn a_workbook_without_book_views_gains_one_for_a_later_active_tab() {
         let mut pkg = new_xlsx();
+        // The first sheet starts selected, as Excel saves it.
+        let sheet1 = part_text(&pkg, "xl/worksheets/sheet1.xml")
+            .replace("<sheetView ", "<sheetView tabSelected=\"1\" ");
+        assert!(sheet1.contains("tabSelected=\"1\""));
+        pkg.set_part("xl/worksheets/sheet1.xml", sheet1.into_bytes());
         pkg.add_sheet("Two");
         pkg.workbook.active_tab = 1;
         let saved = load_xlsx(&save_xlsx(&pkg)).unwrap();
