@@ -333,7 +333,10 @@ viewport; `text_inset`, `vtop_inset`, and `vbottom_inset` are the Print text box
 distances from the page edges. `tracked_page` is the zero-based page index and
 `frame` is the frame counter. The object is `null` when the ruler is hidden or
 has not painted. Draft reports `text_inset`, both vertical insets, and
-`tracked_page` as `null`; Print reports `column_inset` as `null`. Geometry
+`tracked_page` as `null`; Print reports `column_inset` as `null`. `tabs` lists
+the tab stops the ruler draws for the caret paragraph of the surface being
+typed into (the open header or footer, else the body), as `{pos, align}` in
+twips; a paragraph with none of its own shows its style's (#641). Geometry
 trails a driving verb by a frame, so settle with `shot window` before asserting
 it, as with `filler_rows`.
 
@@ -354,7 +357,7 @@ footer editor; `selection-set` refuses while it is open.
 | Call | Effect |
 |---|---|
 | `selection-set {"start":5,"end":1}` | set main-story anchor and caret through `Editor`; backward selections keep the larger anchor; an empty range leaves a collapsed caret, the state a click leaves; both offsets are validated before either changes |
-| `ribbon-read {}` | list File, ribbon tabs and the contextual tabs — Table while the caret is in a table, Gantt Chart Format while a Project's Gantt shows — with groups, commands, galleries and Quick Access Toolbar |
+| `ribbon-read {}` | list File, ribbon tabs and the contextual tabs — Header & Footer while a header or footer is being edited, Table while the caret is in a table, Gantt Chart Format while a Project's Gantt shows — with groups, commands, galleries and Quick Access Toolbar. The Header from Top and Footer from Bottom boxes carry the `value` they show (`0.5"`) |
 | `ribbon-click {"tab":"Home","command":"Bold"}` | resolve a command on a valid tab, contextual tabs included, by id, else by unique label, else by unique screentip title, and invoke the same action handler as its button |
 | `status-read {}` | read the tab's status line as an ordered `items` array of `{id, text}`: on a Project tab `state` (Ready/Edit/Busy), `new-tasks` (`New Tasks: …`) and `message`; on other tabs only `message` (a document's word-count stats are not reported) |
 | `backstage {"action":"open"}` | enter File; `read` reports its open state and rail items; `close` returns to the tab |
@@ -763,6 +766,17 @@ is the ribbon's pressed state (Inactivate Task, the task's mode). Delete Task
 deletes the selected task whatever column the cursor is on; a summary asks
 first, in the `delete-summary` dialog.
 
+- **the Header, Footer and Page Number drop-downs** (#641, #650), on Insert ›
+  Header & Footer and on the contextual Header & Footer tab. Header and Footer
+  list the `Built-in` designs (Blank, Blank (Three Columns)), then Edit and
+  Remove. Page Number lists Top of Page, Bottom of Page, Page Margins
+  (`enabled: false`) and Current Position, each available one opening a
+  submenu of designs (`menu-click {"path": ["Bottom of Page", "Plain Number
+  2"]}`; the pointer opens a submenu in the menu's place), then Format Page
+  Numbers... (the `page-number-format` dialog) and Remove Page Numbers. The contextual tab's
+  Header from Top and Footer from Bottom boxes open a menu of distances, the
+  current one `checked`, and Custom... (the `hf-distance` dialog).
+
 A press on a split button's arrow or a drop-down button while its own menu is
 open shuts the menu, as in Office; the harness's `menu-open` always opens.
 
@@ -798,6 +812,23 @@ While a menu is open it takes every key: Esc closes it, and so, until menus
 take arrows and Enter, does any other key, Tab included. None reaches the
 document or cell under it. A press outside the menu closes it too.
 `project-menus.uit` drives all three menus.
+
+### Headers and footers
+
+Header/footer editing (#640, #641) acts on a section: the one under the body
+caret when it starts, the one a double-clicked page belongs to, or the one
+Previous and Next move to. A section with no header of its own edits the one
+it inherits ("Same as Previous"); Link to Previous gives it its own copy.
+While a header or footer is open, the contextual **Header & Footer** tab shows
+(KeyTip `J`) and is selected; leaving selects Insert.
+
+| Verb | Args | Reply |
+|---|---|---|
+| `hf-state` | `{}` | `{editing}`, and while editing `kind` (`header`/`footer`), `section` (1-based), `variant` (`default`/`first`/`even`), `label` (Word's tab label: `Header -Section 2-`, `First Page Footer`, `Odd Page Header`, …), `same_as_previous`, `part`, `text` (its paragraphs, one per line), `show_document_text` and `page_numbers` (placed page numbers in it); always `different_first_page`, `different_odd_even`, `header_from_top` and `footer_from_bottom` (inches) for the target section |
+| `page-double-click` | `{page, area}`: 0-based print-layout page, `header`, `footer` or `body` | `hf-state` after the page's own double-click handler: a header or footer area edits that page's section and variant, the body leaves header/footer editing (a single click in the body no longer does) |
+
+`page-double-click` refuses under a dialog and for a page the document does not
+have. `word-header-footer.uit` drives these over a three-section document.
 
 ### Regions
 

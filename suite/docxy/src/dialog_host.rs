@@ -46,6 +46,18 @@ fn apply_dialog(
                 _ => crate::page_setup::apply_columns(ed, pkg, dialog),
             }
         }
+        DialogOwner::HfDistance { is_header, section } => {
+            let Surface::Doc(ed) = surface else {
+                return Err("this dialog belongs to a document".into());
+            };
+            crate::hf_tab::apply_distance(ed, dialog, is_header, section)
+        }
+        DialogOwner::PageNumberFormat { section } => {
+            let Surface::Doc(ed) = surface else {
+                return Err("this dialog belongs to a document".into());
+            };
+            crate::page_number::apply_format(ed, dialog, section)
+        }
         // Their presses are handled in `ttc_dialog::click`, before this.
         DialogOwner::TextToColumns { .. } | DialogOwner::TextToColumnsReplace => {
             Err("Text to Columns applies through its own wizard".into())

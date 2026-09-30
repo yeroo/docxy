@@ -728,8 +728,9 @@ fn parse_blocks_until_end(p: &mut XmlParser, rels: &Relationships) -> Vec<Block>
                 "w:p" => blocks.push(Block::Paragraph(parse_paragraph(p, rels))),
                 "w:tbl" => blocks.push(Block::Table(parse_table(p, rels))),
                 // A block-level structured-document-tag (content control: cover
-                // pages, TOC, …) — unwrap and parse its content so it's visible.
-                // The control wrapper itself is not reconstructed on save.
+                // pages, TOC, …): its content is parsed so it's visible, and
+                // the wrapper is kept as two Raw boundaries around it, which
+                // save writes back (see `parse_sdt_block`).
                 "w:sdt" => parse_sdt_block(p, rels, &mut blocks),
                 "w:sectPr" => {
                     let start = p.start_pos();

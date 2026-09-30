@@ -958,7 +958,7 @@ impl Editor {
         if let Some(range) = self.cell_range() {
             return self.clear_cells(&range);
         }
-        let Some((lo, hi)) = self.selection_range() else {
+        let Some((mut lo, hi)) = self.selection_range() else {
             return false;
         };
         self.anchor = None;
@@ -986,6 +986,11 @@ impl Editor {
         let li = *lo.path.last().unwrap();
         let hii = *hi.path.last().unwrap();
         if let Some((cont, _)) = container_mut(&mut self.doc.body, &lo.path) {
+            // A block content control (a placed page number, a cover page)
+            // that loses one boundary to this delete goes as a control; what
+            // is left of its content stays. Pair the boundaries now, before
+            // the range goes, so each drop is the removed one's own partner.
+            let partners = crate::hf::sdt_partners_outside(cont, li + 1, hii);
             // Truncate the first paragraph at lo.offset.
             if let Some(Block::Paragraph(p)) = cont.get_mut(li) {
                 let len: usize = p.content.iter().map(inline_len).sum();
@@ -1003,6 +1008,7 @@ impl Editor {
                 Vec::new()
             };
             // Remove everything strictly between (and the now-empty last).
+            let removed = (hii + 1).min(cont.len()).saturating_sub(li + 1);
             for _ in (li + 1)..=hii {
                 if li + 1 < cont.len() {
                     cont.remove(li + 1);
@@ -1011,6 +1017,19 @@ impl Editor {
             // Merge the remainder onto the first paragraph.
             if let Some(Block::Paragraph(p)) = cont.get_mut(li) {
                 p.content.extend(remainder);
+            }
+            // Then the partners, from the back; those after the range moved
+            // up by what it held. The caret's paragraph moves up by the ones
+            // before it.
+            for &i in partners.iter().rev() {
+                let at = if i > hii { i - removed } else { i };
+                if at < cont.len() {
+                    cont.remove(at);
+                }
+            }
+            let shift = partners.iter().filter(|&&i| i < li).count();
+            if let Some(last) = lo.path.last_mut() {
+                *last -= shift;
             }
         }
         self.caret = lo;

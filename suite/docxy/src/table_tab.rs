@@ -421,7 +421,7 @@ pub(crate) fn table_layout_tab() -> rs::Tab<Act> {
                             t(T::DistributeRows),
                             "",
                         )
-                        .key("DR"),
+                        .key("WR"),
                         cmdt(
                             "distribute-columns",
                             "table-distribute",
@@ -429,7 +429,7 @@ pub(crate) fn table_layout_tab() -> rs::Tab<Act> {
                             t(T::DistributeColumns),
                             "",
                         )
-                        .key("DC"),
+                        .key("WC"),
                     ]),
                 ],
             ),

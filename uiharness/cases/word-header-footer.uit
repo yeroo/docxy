@@ -1,0 +1,88 @@
+test header editing follows the caret section and Word's Link to Previous
+  open copy:../fixtures/header-inherit.docx
+  call hf-state {}
+  assert reply.editing is false
+  call ribbon-read {}
+  assert reply.tab_count is 6
+  call selection-set {"start":4,"end":4}
+  call ribbon-click {"tab":"Insert","command":"Edit Header"}
+  assert hf_edit is true
+  assert ribbon_tab is Header & Footer
+  call hf-state {}
+  assert reply.section is 2
+  assert reply.label is Header -Section 2-
+  assert reply.same_as_previous is true
+  assert reply.text is Header A
+  call ribbon-read {}
+  assert reply.tab_count is 7
+  assert reply.tabs.6.name is Header & Footer
+  assert reply.tabs.6.groups.0.title is Header & Footer
+  assert reply.tabs.6.groups.2.title is Navigation
+  assert reply.tabs.6.groups.5.title is Close
+  call ribbon-click {"tab":"Header & Footer","command":"Link to Previous"}
+  call hf-state {}
+  assert reply.same_as_previous is false
+  assert reply.text is Header A
+  assert reply.label is Header -Section 2-
+  call ribbon-click {"tab":"Header & Footer","command":"Next"}
+  call hf-state {}
+  assert reply.section is 3
+  assert reply.text is Header C
+  call ribbon-click {"tab":"Header & Footer","command":"Previous"}
+  call hf-state {}
+  assert reply.section is 2
+  assert reply.same_as_previous is false
+
+test page numbers go in the footer once and Remove Page Numbers takes only them
+  open copy:../fixtures/header-inherit.docx
+  call selection-set {"start":0,"end":0}
+  call ribbon-click {"tab":"Insert","command":"Bottom of Page: Plain Number 1"}
+  call hf-state {}
+  assert reply.kind is footer
+  assert reply.section is 1
+  assert reply.page_numbers is 1
+  call ribbon-click {"tab":"Header & Footer","command":"Bottom of Page: Plain Number 2"}
+  call hf-state {}
+  assert reply.page_numbers is 1
+  call ribbon-click {"tab":"Header & Footer","command":"Top of Page: Page X of Y"}
+  call hf-state {}
+  assert reply.kind is header
+  assert reply.page_numbers is 1
+  call ribbon-click {"tab":"Header & Footer","command":"Go to Footer"}
+  call hf-state {}
+  assert reply.page_numbers is 0
+  assert reply.text is Footer A
+  call ribbon-click {"tab":"Header & Footer","command":"Remove Page Numbers"}
+  call ribbon-click {"tab":"Header & Footer","command":"Go to Header"}
+  call hf-state {}
+  assert reply.page_numbers is 0
+  assert reply.text is Header A
+
+test double-clicking a page's header edits that page's section and the body leaves
+  open copy:../fixtures/header-inherit.docx
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  call page-double-click {"page":2,"area":"header"}
+  assert reply.editing is true
+  assert reply.section is 3
+  assert reply.text is Header C
+  assert ribbon_tab is Header & Footer
+  call page-double-click {"page":1,"area":"header"}
+  assert reply.section is 2
+  assert reply.same_as_previous is true
+  call ribbon-click {"tab":"View","command":"ruler"}
+  shot window
+  call doc {}
+  assert reply.ruler.tabs.0.pos is 4680
+  assert reply.ruler.tabs.0.align is center
+  assert reply.ruler.tabs.1.pos is 9360
+  assert reply.ruler.tabs.1.align is right
+  call page-double-click {"page":0,"area":"footer"}
+  assert reply.kind is footer
+  assert reply.section is 1
+  assert reply.label is Footer -Section 1-
+  shot window
+  call page-double-click {"page":0,"area":"body"}
+  assert reply.editing is false
+  assert ribbon_tab is Insert
+  call ribbon-read {}
+  assert reply.tab_count is 6

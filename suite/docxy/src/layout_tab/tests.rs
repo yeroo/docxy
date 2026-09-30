@@ -235,7 +235,7 @@ fn breaks_go_in_at_the_caret() {
 #[test]
 fn a_section_break_is_refused_in_a_header() {
     let mut t = three_sections();
-    assert!(open_hf_tab(&mut t, true, "default"));
+    assert!(open_hf_tab(&mut t, true, HeaderVariant::Default));
     let before = ed(&t).doc.clone();
     let err = layout_apply(
         &mut t,

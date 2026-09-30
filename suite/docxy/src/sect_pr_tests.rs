@@ -99,7 +99,7 @@ fn columns_survive_save_on_a_document_with_its_own_sect_pr() {
 #[test]
 fn a_new_header_survives_save_with_its_reference() {
     let mut t = tab_with_sect_pr("header");
-    assert!(open_hf_tab(&mut t, true, "default"));
+    assert!(open_hf_tab(&mut t, true, HeaderVariant::Default));
     assert!(t.dirty);
     t.hf_edit.as_mut().unwrap().editor.insert_str("HDR");
     exit_hf_tab(&mut t);
@@ -178,7 +178,7 @@ fn one_ruler_margin_drag_survives_save_and_undoes_in_one_step() {
 #[test]
 fn reads_follow_the_editor_after_undoing_a_header_creation() {
     let mut t = tab_with_sect_pr("header-undo");
-    assert!(open_hf_tab(&mut t, true, "default"));
+    assert!(open_hf_tab(&mut t, true, HeaderVariant::Default));
     exit_hf_tab(&mut t);
     assert!(final_sect_pr(&t).unwrap().contains("headerReference"));
     assert!(editor_mut(&mut t).undo());
@@ -188,7 +188,7 @@ fn reads_follow_the_editor_after_undoing_a_header_creation() {
     assert!(hf_part_name_typed(pkg, sect, true, "default").is_none());
     assert!(header_footer_blocks_typed(pkg, sect, true, "default").is_empty());
     // Opening the header again creates a reference the editor carries.
-    assert!(open_hf_tab(&mut t, true, "default"));
+    assert!(open_hf_tab(&mut t, true, HeaderVariant::Default));
     assert!(editor_sect(&t).contains("headerReference"));
     let saved = save_and_reload(&mut t);
     assert!(saved.sect_pr().contains("headerReference"));
@@ -256,7 +256,7 @@ fn undoing_a_ruler_drag_on_a_document_without_a_sect_pr_takes_one_step() {
 #[test]
 fn undoing_a_header_creation_on_a_document_without_a_sect_pr_leaves_no_reference() {
     let mut t = tab_without_sect_pr();
-    assert!(open_hf_tab(&mut t, true, "default"));
+    assert!(open_hf_tab(&mut t, true, HeaderVariant::Default));
     t.hf_edit.as_mut().unwrap().editor.insert_str("HDR");
     exit_hf_tab(&mut t);
     assert!(final_sect_pr(&t).unwrap().contains("headerReference"));

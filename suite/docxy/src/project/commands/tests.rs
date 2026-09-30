@@ -233,25 +233,27 @@ fn ribbon_context_survives_valid_switches_only() {
             .collect::<Vec<_>>(),
         ["F", "T", "U", "R", "P", "W"]
     );
-    assert!(valid_ribbon_tab(Kind::Docx, RibbonTab::View, false, false) == RibbonTab::View);
-    assert!(valid_ribbon_tab(Kind::Xlsx, RibbonTab::Task, false, false) == RibbonTab::Home);
+    assert!(valid_ribbon_tab(Kind::Docx, RibbonTab::View, false, false, false) == RibbonTab::View);
+    assert!(valid_ribbon_tab(Kind::Xlsx, RibbonTab::Task, false, false, false) == RibbonTab::Home);
     for tab in [RibbonTab::TableDesign, RibbonTab::TableLayout] {
-        assert!(valid_ribbon_tab(Kind::Docx, tab, true, false) == tab);
-        assert!(valid_ribbon_tab(Kind::Docx, tab, false, false) == RibbonTab::Home);
-        assert!(valid_ribbon_tab(Kind::Project, tab, true, true) == RibbonTab::Task);
+        assert!(valid_ribbon_tab(Kind::Docx, tab, true, false, false) == tab);
+        assert!(valid_ribbon_tab(Kind::Docx, tab, false, false, false) == RibbonTab::Home);
+        assert!(valid_ribbon_tab(Kind::Project, tab, true, true, false) == RibbonTab::Task);
     }
     for tab in [RibbonTab::Resource, RibbonTab::Report, RibbonTab::Project] {
-        assert!(valid_ribbon_tab(Kind::Project, tab, false, false) == tab);
-        assert!(valid_ribbon_tab(Kind::Docx, tab, false, false) == RibbonTab::Home);
-        assert!(valid_ribbon_tab(Kind::Xlsx, tab, false, false) == RibbonTab::Home);
+        assert!(valid_ribbon_tab(Kind::Project, tab, false, false, false) == tab);
+        assert!(valid_ribbon_tab(Kind::Docx, tab, false, false, false) == RibbonTab::Home);
+        assert!(valid_ribbon_tab(Kind::Xlsx, tab, false, false, false) == RibbonTab::Home);
     }
-    assert!(valid_ribbon_tab(Kind::Project, RibbonTab::Home, false, false) == RibbonTab::Task);
+    assert!(
+        valid_ribbon_tab(Kind::Project, RibbonTab::Home, false, false, false) == RibbonTab::Task
+    );
     // The contextual Gantt Chart Format tab: only a Project with its Gantt showing.
     let fmt = RibbonTab::GanttFormat;
-    assert!(valid_ribbon_tab(Kind::Project, fmt, false, true) == fmt);
-    assert!(valid_ribbon_tab(Kind::Project, fmt, false, false) == RibbonTab::Task);
-    assert!(valid_ribbon_tab(Kind::Docx, fmt, false, true) == RibbonTab::Home);
-    assert!(valid_ribbon_tab(Kind::Xlsx, fmt, false, true) == RibbonTab::Home);
+    assert!(valid_ribbon_tab(Kind::Project, fmt, false, true, false) == fmt);
+    assert!(valid_ribbon_tab(Kind::Project, fmt, false, false, false) == RibbonTab::Task);
+    assert!(valid_ribbon_tab(Kind::Docx, fmt, false, true, false) == RibbonTab::Home);
+    assert!(valid_ribbon_tab(Kind::Xlsx, fmt, false, true, false) == RibbonTab::Home);
     assert_eq!(ribbon_tab_name(fmt), "Gantt Chart Format");
     assert_eq!(ribbon_tab_index(RibbonTab::View, Kind::Project), 4);
     assert_eq!(ribbon_tab_index(RibbonTab::Project, Kind::Project), 3);
@@ -260,8 +262,12 @@ fn ribbon_context_survives_valid_switches_only() {
     // workbooks do not.
     assert_eq!(ribbon_tab_index(RibbonTab::View, Kind::Docx), 4);
     assert_eq!(ribbon_tab_index(RibbonTab::View, Kind::Xlsx), 3);
-    assert!(valid_ribbon_tab(Kind::Docx, RibbonTab::Layout, false, false) == RibbonTab::Layout);
-    assert!(valid_ribbon_tab(Kind::Xlsx, RibbonTab::Layout, false, false) == RibbonTab::Home);
+    assert!(
+        valid_ribbon_tab(Kind::Docx, RibbonTab::Layout, false, false, false) == RibbonTab::Layout
+    );
+    assert!(
+        valid_ribbon_tab(Kind::Xlsx, RibbonTab::Layout, false, false, false) == RibbonTab::Home
+    );
 }
 
 /// The owner's bar for #72: a Microsoft Project instruction written as a ribbon

@@ -49,7 +49,7 @@ fn number(name: &'static str, label: &str, twips: i32, page: Option<usize>) -> C
     c
 }
 
-fn choice(
+pub(crate) fn choice(
     name: &'static str,
     label: &str,
     kind: ControlKind,
@@ -63,7 +63,7 @@ fn choice(
     c
 }
 
-fn ok_cancel() -> Vec<Button> {
+pub(crate) fn ok_cancel() -> Vec<Button> {
     vec![
         Button {
             default: true,
@@ -215,11 +215,11 @@ fn index(d: &Dialog, name: &str) -> Option<usize> {
     d.controls.iter().position(|c| c.name == name)
 }
 
-fn text_of(d: &Dialog, name: &str) -> String {
+pub(crate) fn text_of(d: &Dialog, name: &str) -> String {
     index(d, name).map_or_else(String::new, |i| d.controls[i].text())
 }
 
-fn chosen(d: &Dialog, name: &str) -> Option<usize> {
+pub(crate) fn chosen(d: &Dialog, name: &str) -> Option<usize> {
     match d.value(name) {
         Some(Value::Choice(i)) => *i,
         _ => None,
@@ -233,7 +233,7 @@ fn set_value(d: &mut Dialog, name: &str, value: Value) {
     }
 }
 
-fn twips_of(text: &str) -> Option<i32> {
+pub(crate) fn twips_of(text: &str) -> Option<i32> {
     let v = text.trim().parse::<f64>().ok().filter(|v| v.is_finite())?;
     Some((v * TWIPS_PER_INCH as f64).round() as i32)
 }
