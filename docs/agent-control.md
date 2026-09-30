@@ -758,7 +758,7 @@ name and defaults to the active sheet):
 | `sheet.list` | — | `{active, sheets:[{index, name, rows, cols}]}` |
 | `sheet.read` | `{sheet?, range?}` | `{sheet, name, rows, cols, cells:[…], truncated}` |
 | `cell.get` | `{ref, sheet?}` | `{ref, row, col, value, formula?, text, format?}` — `format` is present only if the cell has non-default styling (see below) |
-| `cell.set` | `{ref, text, sheet?}` | `{ref, value, text, …}` — leading `=` is a formula, validated + recalculated |
+| `cell.set` | `{ref, text, sheet?}` | `{ref, value, text, …}` — typed the way the grid types it: leading `=` is a formula, validated + recalculated; numbers, currency, percents, fractions, dates and times are recognised (a General cell takes the matching number format); a Text-formatted cell keeps the text as typed; a leading `'` stores the rest as text with `quotePrefix`; more than 32,767 characters is refused and the cell is left as it was |
 | `range.clear` | `{range, sheet?}` | `{cleared}` |
 | `cell.format` | `{range, patch, sheet?}` | `{formatted}` — cell count; ONE undo group over every cell in `range` |
 | `col.width` | `{col, width, sheet?}` | `{col, width}` — `col` accepts a letter or a 0-based index; the reply always echoes the **numeric** index |
@@ -777,9 +777,9 @@ name and defaults to the active sheet):
 | `pivot.list` | — | `{pivots:[{sheet,rows,cols,values}]}` (persistent pivots, summarized) |
 | `comment.add` | `{ref,text,author?,sheet?}` | `{sheet,ref}` |
 | `comment.remove` | `{ref,sheet?}` | `{removed:bool}` |
-| `range.set` | `{start,rows:[[string]],sheet?}` | `{set:N}` — **atomic**: every formula validated first, any invalid → error and nothing applied; one undo group |
+| `range.set` | `{start,rows:[[string]],sheet?}` | `{set:N}` — each string typed like `cell.set`; **atomic**: every formula and length validated first, any invalid (a bad formula, or an entry over 32,767 characters) → an error naming the cell and nothing applied; one undo group |
 | `sheet.import-csv` | `{text,name?}` | `{sheet,name,rows,cols}` — always a **new** sheet, never overwrites |
-| `wb.replace-all` | `{query,text}` | `{replaced}` — spans **all sheets**, one undo group |
+| `wb.replace-all` | `{query,text}` | `{replaced}` — spans **all sheets**, one undo group; the match runs on each cell's own input text (never on the `'` a quote prefix adds, which is kept on the result), and the replaced text is re-read with the entry rules of `cell.set`, except that a percent cell's number constant is not divided again; a result over the cell limit leaves that cell as it was |
 | `sheet.add` | `{name?}` | `{sheet,name}` — deduplicates a taken name, never errors |
 | `sheet.remove` | `{sheet}` | `{removed:true}` (errors on the last sheet; `sheet` is required, no active-sheet default) |
 | `sheet.rename` | `{sheet,name}` | `{name}` — rewrites formula/defined-name references |

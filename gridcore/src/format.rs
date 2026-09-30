@@ -11,7 +11,7 @@
 //! ([`xf_format_fields`]) returns typed [`FormatValue`]s that a host
 //! serializes into its own JSON for `cell.get`-style read-back.
 
-use crate::sheet::{Align, NumFmt, Xf, classify_format_code};
+use crate::sheet::{Align, NumFmt, Xf};
 
 /// A `cell.format` patch: each field `Some` means the wire patch set that
 /// key; `None` means the key was absent from the patch, so that aspect of
@@ -150,13 +150,12 @@ fn parse_align(s: &str) -> Result<Align, String> {
 /// Apply `patch` over `base`, returning the resulting [`Xf`]; keys absent
 /// from the patch keep `base`'s value for that aspect. Mirrors the TUI's own
 /// `apply_format`/`apply_picker` mutation exactly: `numFmt` sets both `code`
-/// and the [`classify_format_code`] classification together, same as the
+/// and the [`crate::sheet::classify_format_code`] classification together, same as the
 /// number-format picker.
 pub fn apply_patch_to_xf(base: &Xf, patch: &FormatPatch) -> Xf {
     let mut xf = base.clone();
     if let Some(code) = &patch.num_fmt {
-        xf.numfmt = classify_format_code(code);
-        xf.code = Some(code.clone());
+        xf.set_code(Some(code.clone()));
     }
     if let Some(b) = patch.bold {
         xf.bold = b;
