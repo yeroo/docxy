@@ -84,7 +84,7 @@ pub fn check_len(text: &str) -> Result<(), EntryError> {
     Ok(())
 }
 
-// The three predicates read the code when the xf has one and fall back to
+// These predicates read the code when the xf has one and fall back to
 // the `NumFmt` classification only for a code-less xf: a writer that set one
 // half and not the other must not change how an entry is read.
 
@@ -394,9 +394,10 @@ pub fn replaced_entry(cell: &Cell, xf: &Xf, replaced: String) -> String {
     }
 }
 
-/// The text the editor and formula bar show for a cell: [`crate::edit::input_text_of`]
-/// with a leading `'` where [`needs_apostrophe`] says re-entering needs one.
-pub fn input_text_styled(cell: &Cell, xf: &Xf) -> String {
+/// [`seed_text`] for anything but a number constant: [`crate::edit::input_text_of`]
+/// (a formula's `=` source, a text, a boolean or an error) with a leading `'`
+/// where [`needs_apostrophe`] says re-entering needs one.
+fn input_text_styled(cell: &Cell, xf: &Xf) -> String {
     copy_field(cell, xf, crate::edit::input_text_of(cell))
 }
 
@@ -1337,7 +1338,7 @@ mod tests {
         let loaded = Cell::text("'abc");
         // General, no prefix: the seed escapes it, and both re-entry and
         // paste give back 'abc.
-        let seed = input_text_styled(&loaded, &Xf::default());
+        let seed = seed_text(&loaded, &Xf::default());
         assert_eq!(seed, "''abc");
         let typed = parse_entry(&seed, &Xf::default(), &ctx()).unwrap();
         assert_eq!(typed.cell.value, CellValue::Text("'abc".into()));
@@ -1350,7 +1351,7 @@ mod tests {
             style: text_fmt,
             ..loaded.clone()
         };
-        let seed = input_text_styled(&in_text, &styles.xf(text_fmt));
+        let seed = seed_text(&in_text, &styles.xf(text_fmt));
         assert_eq!(seed, "'abc");
         let pasted = paste_cell(&mut styles, text_fmt, &seed, &ctx());
         assert_eq!(pasted.value, CellValue::Text("'abc".into()));
@@ -1378,7 +1379,7 @@ mod tests {
         };
         let xf = styles.xf(text_q);
         assert!(!needs_apostrophe(&cell, &xf));
-        assert_eq!(input_text_styled(&cell, &xf), "007");
+        assert_eq!(seed_text(&cell, &xf), "007");
         let again = parse_entry("007", &xf, &ctx()).unwrap();
         assert_eq!(again.cell.value, CellValue::Text("007".into()));
         assert_eq!(copy_field(&cell, &xf, "007".into()), "007");
