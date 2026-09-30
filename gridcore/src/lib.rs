@@ -28,6 +28,7 @@
 //! - [`xlsx`] — `.xlsx` bytes ⇄ [`sheet::Workbook`] with part preservation.
 
 pub mod cf;
+pub mod clock;
 pub mod comments;
 pub mod drawing;
 pub mod edit;

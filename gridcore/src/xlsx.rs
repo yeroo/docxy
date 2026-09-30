@@ -1181,6 +1181,114 @@ fn cell_xf_elements(xml: &str) -> Vec<&str> {
     out
 }
 
+/// The raw `<font>` elements of `<fonts>`, in order (a `<dxf>`'s `<font>`
+/// lives outside `<fonts>` and is not one of them). Read with the loader's
+/// parser ([`element_children`]), so comments and prefixes are no trouble.
+fn font_elements(xml: &str) -> Vec<&str> {
+    let Some(start) = xml
+        .find("<fonts")
+        .filter(|&s| xml[s + 6..].starts_with([' ', '>', '/', '\t', '\r', '\n']))
+    else {
+        return Vec::new();
+    };
+    let fonts = &xml[start..];
+    element_children(fonts)
+        .into_iter()
+        .filter(|(name, _, _)| name == "font")
+        .map(|(_, s, e)| &fonts[s..e])
+        .collect()
+}
+
+/// The child elements of one raw element, as (local name, raw element).
+fn child_elements(raw: &str) -> Vec<(String, String)> {
+    element_children(raw)
+        .into_iter()
+        .map(|(name, s, e)| (name, raw[s..e].to_string()))
+        .collect()
+}
+
+/// A loaded `<font>` with only the children an edit changed rewritten: its
+/// underline, strike, theme colour, family, charset and the rest come along.
+fn edit_font(raw: &str, from: &Xf, to: &Xf, fmt_size: impl Fn(f64) -> String) -> String {
+    // The conventional CT_Font child order, for where a new child goes.
+    const ORDER: [&str; 15] = [
+        "b",
+        "i",
+        "strike",
+        "condense",
+        "extend",
+        "outline",
+        "shadow",
+        "u",
+        "vertAlign",
+        "sz",
+        "color",
+        "name",
+        "family",
+        "charset",
+        "scheme",
+    ];
+    let rank = |n: &str| ORDER.iter().position(|o| *o == n).unwrap_or(ORDER.len());
+    let mut kids = child_elements(raw);
+    // Drop every `name` child (so never two `<b>`), then add `new` if any.
+    let mut set = |name: &str, new: Option<String>| {
+        kids.retain(|(n, _)| n != name);
+        if let Some(el) = new {
+            let at = kids
+                .iter()
+                .position(|(n, _)| rank(n) > rank(name))
+                .unwrap_or(kids.len());
+            kids.insert(at, (name.to_string(), el));
+        }
+    };
+    if from.bold != to.bold {
+        set("b", to.bold.then(|| "<b/>".to_string()));
+    }
+    if from.italic != to.italic {
+        set("i", to.italic.then(|| "<i/>".to_string()));
+    }
+    // The model reads only an rgb colour, so a theme or indexed one reads
+    // as None: an unchanged colour keeps the source `<color>` (theme, tint
+    // and all). Known limit: setting Automatic on a theme-coloured font
+    // compares equal and so keeps the theme colour.
+    if from.color != to.color {
+        set(
+            "color",
+            to.color
+                .map(|(r, g, b)| format!("<color rgb=\"FF{r:02X}{g:02X}{b:02X}\"/>")),
+        );
+    }
+    if from.font_size != to.font_size {
+        set(
+            "sz",
+            Some(format!(
+                "<sz val=\"{}\"/>",
+                fmt_size(to.font_size.unwrap_or(11.0))
+            )),
+        );
+    }
+    if from.font_name != to.font_name {
+        set(
+            "name",
+            Some(format!(
+                "<name val=\"{}\"/>",
+                esc_attr(to.font_name.as_deref().unwrap_or("Calibri"))
+            )),
+        );
+        // The old font's family and scheme describe it, not the new name; a
+        // `<scheme val="minor"/>` would make Excel show the theme font
+        // instead of the name just set.
+        set("family", None);
+        set("scheme", None);
+    }
+    let mut font = String::from("<font>");
+    for (_, el) in &kids {
+        font.push_str(el);
+    }
+    font.push_str("</font>");
+    font
+}
+
 /// An attribute's raw value in one open tag.
 fn tag_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
     let (_, s, e, _) = attr_span(tag, name)?;
@@ -1313,6 +1421,7 @@ fn splice_styles(orig: &str, authored: &[Xf]) -> String {
     let src_parsed = parse_styles(orig).xfs;
     let src_raw = cell_xf_elements(orig);
     let sources_ok = src_raw.len() == src_parsed.len();
+    let src_fonts = font_elements(orig);
 
     for xf in authored {
         let source = xf
@@ -1325,14 +1434,26 @@ fn splice_styles(orig: &str, authored: &[Xf]) -> String {
         };
 
         // Font: the source's while bold/italic/colour/size/name still match
-        // (its underline and the rest come along), else a fresh one.
+        // (its underline and the rest come along), else a fresh one: the
+        // source font with only the changed children rewritten, or one built
+        // from scratch when there is no source font.
         let same_font = source.is_some_and(|(sx, _)| {
             (sx.bold, sx.italic, sx.color, sx.font_size, &sx.font_name)
                 == (xf.bold, xf.italic, xf.color, xf.font_size, &xf.font_name)
         });
-        let font_id = match src_id("fontId").filter(|_| same_font) {
-            Some(id) => id,
-            None => {
+        let src_font = source.and_then(|(sx, _)| {
+            let raw = src_fonts.get(src_id("fontId")? as usize)?;
+            Some((sx, *raw))
+        });
+        let font_id = match (src_id("fontId").filter(|_| same_font), src_font) {
+            (Some(id), _) => id,
+            (None, Some((sx, raw))) => {
+                new_fonts.push_str(&edit_font(raw, sx, xf, fmt_size));
+                let id = font_base + fonts_added;
+                fonts_added += 1;
+                id
+            }
+            (None, None) => {
                 let mut font = String::from("<font>");
                 if xf.bold {
                     font.push_str("<b/>");
@@ -8363,6 +8484,128 @@ b",
         assert_eq!(attr(i, "borderId"), Some(nb.to_string()));
         assert!(saved.workbook.styles.xf(i as u32).bold);
         assert!(xfs[i].contains("vertical=\"top\""));
+    }
+
+    #[test]
+    fn a_font_edit_reads_fonts_with_comments_in_them() {
+        // A commented-out font among the `<fonts>`, and a comment inside the
+        // edited one that looks like its end tag.
+        let styles = concat!(
+            "<styleSheet><fonts count=\"2\"><!-- <font><b/></font> -->",
+            "<font><sz val=\"11\"/></font>",
+            "<font><!-- </font> --><u/><sz val=\"11\"/><name val=\"Calibri\"/></font>",
+            "</fonts></styleSheet>"
+        );
+        let fonts = font_elements(styles);
+        assert_eq!(fonts.len(), 2);
+        let names: Vec<String> = child_elements(fonts[1])
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, ["u", "sz", "name"]);
+        let to = Xf {
+            bold: true,
+            ..Xf::default()
+        };
+        let out = edit_font(fonts[1], &Xf::default(), &to, |s| format!("{s}"));
+        assert_eq!(
+            out,
+            "<font><b/><u/><sz val=\"11\"/><name val=\"Calibri\"/></font>"
+        );
+    }
+
+    #[test]
+    fn a_font_edit_keeps_what_the_model_does_not_carry_of_a_loaded_font() {
+        // An underlined, theme-coloured minor-scheme font with an explicit
+        // `<b val="0"/>`, and a `<dxf>` font that is not one of `<fonts>`.
+        let mut pkg = new_xlsx();
+        let xml = String::from_utf8(pkg.part("xl/styles.xml").unwrap().to_vec()).unwrap();
+        let nf = read_count(&xml, "<fonts");
+        let mut xml = bump_count(&xml, "<fonts", 1);
+        xml = xml.replacen(
+            "</fonts>",
+            "<font><b val=\"0\"/><u/><sz val=\"11\"/><color theme=\"1\"/><name val=\"Calibri\"/><family val=\"2\"/><scheme val=\"minor\"/></font></fonts>",
+            1,
+        );
+        xml = bump_count(&xml, "<cellXfs", 1);
+        xml = xml.replacen(
+            "</cellXfs>",
+            &format!(
+                "<xf numFmtId=\"0\" fontId=\"{nf}\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"/></cellXfs>"
+            ),
+            1,
+        );
+        xml = xml.replacen(
+            "</cellStyles>",
+            "</cellStyles><dxfs count=\"1\"><dxf><font><i/><strike/></font></dxf></dxfs>",
+            1,
+        );
+        assert_eq!(font_elements(&xml).len(), nf as usize + 1);
+        pkg.set_part("xl/styles.xml", xml.into_bytes());
+        let mut pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let src = pkg.workbook.styles.xfs.len() as u32 - 1;
+        let base = pkg.workbook.styles.xf(src);
+        assert!(!base.bold);
+        assert_eq!(base.color, None);
+
+        let mut bold = base.clone();
+        bold.bold = true;
+        let mut red = base.clone();
+        red.color = Some((0xC0, 0x00, 0x00));
+        let mut named = base.clone();
+        named.font_name = Some("Arial".into());
+        for (c, xf) in [bold, red, named].into_iter().enumerate() {
+            let style = pkg.workbook.styles.intern(xf);
+            pkg.workbook.sheets[0].set_cell(
+                0,
+                c as u32,
+                crate::sheet::Cell {
+                    style,
+                    ..crate::sheet::Cell::text("x")
+                },
+            );
+        }
+
+        let saved = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let styles = String::from_utf8(saved.part("xl/styles.xml").unwrap().to_vec()).unwrap();
+        let xfs = cell_xf_elements(&styles);
+        let fonts = font_elements(&styles);
+        let font_of = |c: u32| {
+            let style = saved.workbook.sheets[0].cell(0, c).unwrap().style;
+            let id: usize = tag_attr(xfs[style as usize], "fontId")
+                .unwrap()
+                .parse()
+                .unwrap();
+            (saved.workbook.styles.xf(style), fonts[id])
+        };
+
+        // Bold: one `<b/>` replacing `<b val="0"/>`; underline, theme
+        // colour and scheme kept.
+        let (xf, font) = font_of(0);
+        assert!(xf.bold, "{font}");
+        assert_eq!(font.matches("<b").count(), 1, "{font}");
+        assert!(font.contains("<b/>"), "{font}");
+        assert!(font.contains("<u/>"), "{font}");
+        assert!(font.contains("<color theme=\"1\"/>"), "{font}");
+        assert!(font.contains("<scheme val=\"minor\"/>"), "{font}");
+        assert!(!font.contains("<strike"), "{font}");
+
+        // Colour: the theme colour replaced by the rgb one, underline kept.
+        let (xf, font) = font_of(1);
+        assert_eq!(xf.color, Some((0xC0, 0x00, 0x00)), "{font}");
+        assert!(!xf.bold, "{font}");
+        assert!(font.contains("<color rgb=\"FFC00000\"/>"), "{font}");
+        assert!(!font.contains("theme="), "{font}");
+        assert!(font.contains("<u/>"), "{font}");
+
+        // Name: the new name, the old family and scheme gone, the rest kept.
+        let (xf, font) = font_of(2);
+        assert_eq!(xf.font_name.as_deref(), Some("Arial"), "{font}");
+        assert!(font.contains("<name val=\"Arial\"/>"), "{font}");
+        assert!(!font.contains("<family"), "{font}");
+        assert!(!font.contains("<scheme"), "{font}");
+        assert!(font.contains("<u/>"), "{font}");
+        assert!(font.contains("<color theme=\"1\"/>"), "{font}");
     }
 
     #[test]

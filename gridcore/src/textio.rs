@@ -917,9 +917,10 @@ pub fn sheet_text(sheet: &Sheet, styles: &Styles, date1904: bool, delim: char) -
 
 /// Formatted Text (Space delimited): each column padded to its width in
 /// characters, numbers right-aligned and text left-aligned. Text longer than
-/// its column is clipped; a General number too wide for it is written as
-/// Excel shows it in a column that wide (`0.333333`, `1.23E+08`); any other
-/// number too wide is `#`s. A number is never clipped.
+/// its column is clipped; a General number is written as the grid shows it,
+/// in at most 11 characters and with fewer decimals or in scientific notation
+/// when the column is narrower (`0.333333`, `1.23E+08`); any other number too
+/// wide is `#`s. A number is never clipped.
 pub fn sheet_prn(sheet: &Sheet, styles: &Styles, date1904: bool) -> String {
     let (rows, cols) = sheet.used_size();
     let mut out = String::new();
@@ -936,23 +937,24 @@ pub fn sheet_prn(sheet: &Sheet, styles: &Styles, date1904: bool) -> String {
             };
             // Every row stays fixed-width, and a number is never clipped into
             // another value. Text is clipped to its column; a General number
-            // that does not fit is written as that width shows it (fewer
-            // decimals, then scientific); any other number that does not
-            // fit, a date say, is `#`s.
-            let text: String = if !right {
+            // is written as the grid shows it (at most 11 characters, fewer
+            // decimals or scientific when the column is narrower); any other
+            // number that does not fit, a date say, is `#`s.
+            let cell = sheet.cell(r, c);
+            let general_number = cell
+                .filter(|cl| entry::is_general(&styles.xf(cl.style)))
+                .and_then(|cl| match cl.value {
+                    CellValue::Number(n) => Some(n),
+                    _ => None,
+                });
+            let text: String = if let Some(n) = general_number {
+                crate::sheet::fmt_general_cell(n, width)
+            } else if !right {
                 text.chars().take(width).collect()
             } else if text.chars().count() <= width {
                 text
             } else {
-                let cell = sheet.cell(r, c);
-                let general = cell.is_some_and(|cl| entry::is_general(&styles.xf(cl.style)));
-                match cell.map(|cl| &cl.value) {
-                    Some(CellValue::Number(n)) if general => {
-                        crate::sheet::fmt_general_fit(*n, width)
-                            .unwrap_or_else(|| "#".repeat(width))
-                    }
-                    _ => "#".repeat(width),
-                }
+                "#".repeat(width)
             };
             let pad = " ".repeat(width.saturating_sub(text.chars().count()));
             if right {
@@ -1416,6 +1418,18 @@ mod tests {
         let prn = sheet_prn(&s, &Styles::default(), false);
         // Default width 8.43 → 8 characters; the number is right-aligned.
         assert_eq!(prn, "ab            42\r\n");
+    }
+
+    #[test]
+    fn formatted_text_shows_a_general_number_at_most_eleven_characters() {
+        let styles = Styles {
+            xfs: vec![Xf::default()],
+            ..Styles::default()
+        };
+        let mut s = Sheet::default();
+        s.set_cell(0, 0, Cell::number(123_456_789_012.0));
+        s.set_col_width(0, 20.0);
+        assert_eq!(sheet_prn(&s, &styles, false), "         1.23457E+11\r\n");
     }
 
     #[test]

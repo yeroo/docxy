@@ -16,7 +16,9 @@
 //! 8. Anything else is text.
 //!
 //! A recognised shape carries Excel's matching number format, applied only
-//! when the cell's format is General. A plain number typed into a percent
+//! when the cell's format is General — except a date or time, which also
+//! replaces a number format that is not a date format itself (Excel's rule:
+//! `1/15/2024` typed into a `0.00` cell shows as a date). A plain number typed into a percent
 //! cell is divided by 100 when its magnitude is at least 1 (Excel's
 //! automatic percent entry).
 
@@ -82,7 +84,7 @@ pub fn check_len(text: &str) -> Result<(), EntryError> {
     Ok(())
 }
 
-// The three predicates read the code when the xf has one and fall back to
+// These predicates read the code when the xf has one and fall back to
 // the `NumFmt` classification only for a code-less xf: a writer that set one
 // half and not the other must not change how an entry is read.
 
@@ -110,6 +112,15 @@ pub fn is_percent(xf: &Xf) -> bool {
         None => xf.numfmt,
     };
     matches!(class, NumFmt::Percent { .. })
+}
+
+/// The cell's format is a date, time or date-time format.
+pub fn is_date(xf: &Xf) -> bool {
+    let class = match xf.code.as_deref() {
+        Some(c) => classify_format_code(c),
+        None => xf.numfmt,
+    };
+    matches!(class, NumFmt::Date | NumFmt::Time | NumFmt::DateTime)
 }
 
 /// Parse typed `text` as an entry into a cell formatted `xf`.
@@ -168,11 +179,17 @@ pub fn parse_entry(text: &str, xf: &Xf, ctx: &EntryCtx) -> Result<Entry, EntryEr
     Ok(entry(Cell::text(text), None))
 }
 
-/// The xf a committed entry leaves on a cell formatted `base`.
+/// The xf a committed entry leaves on a cell formatted `base`. A recognised
+/// format lands on a General cell; a recognised date or time also replaces a
+/// number format that is not a date format (Excel switches `0.00` or a
+/// currency cell to the date it was given), while a date/time cell keeps its
+/// own format (#654) and a Text cell never recognises anything.
 pub fn entry_xf(base: &Xf, e: &Entry) -> Xf {
     let mut xf = base.clone();
     if let Some(code) = e.format {
-        if is_general(base) {
+        let dated = classify_format_code(code);
+        let date_entry = matches!(dated, NumFmt::Date | NumFmt::Time | NumFmt::DateTime);
+        if is_general(base) || (date_entry && !is_date(base) && !is_text(base)) {
             xf.set_code(Some(code.to_string()));
         }
     }
@@ -220,6 +237,23 @@ pub fn entry_cell(
     let e = parse_entry(text, &wb.styles.xf(base), &ctx)?;
     let style = entry_style(&mut wb.styles, base, &e);
     Ok(Cell { style, ..e.cell })
+}
+
+/// The formula body `text` makes in the first cell of the range
+/// `(r1, c1, r2, c2)` on `sheet` where it is a formula ([`typed_formula`]),
+/// for hosts that validate a Ctrl+Enter or a range put before
+/// [`entry_range`]: a Text cell takes `=…` as text, so the formula to check
+/// may be in any other cell, not only the active one. `None` when no cell of
+/// the range reads it as a formula.
+pub fn range_formula<'a>(
+    wb: &Workbook,
+    sheet: usize,
+    (r1, c1, r2, c2): (u32, u32, u32, u32),
+    text: &'a str,
+) -> Option<&'a str> {
+    (r1..=r2)
+        .flat_map(|r| (c1..=c2).map(move |c| (r, c)))
+        .find_map(|(r, c)| typed_formula(wb, sheet, r, c, text))
 }
 
 /// Ctrl+Enter: `text`, typed at `active`, entered into every cell of the
@@ -306,35 +340,31 @@ pub fn typed_formula<'a>(
     (!is_text(&wb.styles.xf(style))).then_some(body)
 }
 
-/// A pasted field as a cell of style `style`: the value reading of
-/// [`crate::edit::parse_input`] (paste conversions are not the typed-entry
-/// rules yet), except for two typed-entry rules. A Text-formatted target
-/// takes the field exactly as it is; elsewhere a leading `'` is Excel's text
-/// marker — the rest is text and the xf gets `quotePrefix` — and a plain
-/// field clears a quote prefix it lands on. So a copied `'007` pastes back as
-/// the text `007`, and `''abc` (how a text beginning with `'` is copied) as
-/// `'abc`. An empty field clears the cell.
+/// A pasted field as a cell of style `style`, read as Excel re-reads pasted
+/// text: by the typed-entry rules ([`parse_entry`]) under the target's
+/// format. A Text-formatted target takes the field exactly as it is;
+/// elsewhere a leading `'` is Excel's text marker (the rest is text and the
+/// xf gets `quotePrefix`) and a plain field clears a quote prefix it lands
+/// on; a date, currency or thousands shape brings its number format, and a
+/// percent target divides a plain number as typing does. So a copied `'007`
+/// pastes back as the text `007`, and `''abc` (how a text beginning with `'`
+/// is copied) as `'abc`. An empty field clears the cell. Paste never turns on
+/// Wrap Text. A field over the cell limit is kept as text, unread.
 ///
-/// A TSV clipboard carries no formats, so the apostrophe rule is only exact
-/// between cells of the same kind: a Text cell's `'abc` is copied bare and,
-/// pasted into a non-Text cell, reads as the marker (text `abc`, quote
-/// prefix); an escaped `''abc` pasted into a Text cell stays `''abc`.
-pub fn paste_cell(styles: &mut Styles, style: u32, text: &str) -> Cell {
-    let (cell, quote_prefix) = if text.is_empty() {
-        (Cell::default(), false)
-    } else if is_text(&styles.xf(style)) {
-        (Cell::text(text), false)
-    } else {
-        match text.strip_prefix('\'') {
-            Some(rest) => (Cell::text(rest), true),
-            None => (crate::edit::parse_input(text), false),
-        }
-    };
-    let e = Entry {
-        cell,
-        format: None,
-        quote_prefix,
-        wrap: false,
+/// A TSV clipboard carries no formats, so for text from outside the apostrophe
+/// rule is only exact between cells of the same kind: a Text cell's `'abc`
+/// is copied bare and, pasted into a non-Text cell, reads as the marker (text
+/// `abc`, quote prefix); an escaped `''abc` pasted into a Text cell stays
+/// `''abc`. A host's own copy carries the cells, and pastes those instead.
+pub fn paste_cell(styles: &mut Styles, style: u32, text: &str, ctx: &EntryCtx) -> Cell {
+    let e = match parse_entry(text, &styles.xf(style), ctx) {
+        Ok(e) => Entry { wrap: false, ..e },
+        Err(EntryError::TooLong { .. }) => Entry {
+            cell: Cell::text(text),
+            format: None,
+            quote_prefix: false,
+            wrap: false,
+        },
     };
     let style = entry_style(styles, style, &e);
     Cell { style, ..e.cell }
@@ -381,10 +411,67 @@ pub fn replaced_entry(cell: &Cell, xf: &Xf, replaced: String) -> String {
     }
 }
 
-/// The text the editor and formula bar show for a cell: [`crate::edit::input_text_of`]
-/// with a leading `'` where [`needs_apostrophe`] says re-entering needs one.
-pub fn input_text_styled(cell: &Cell, xf: &Xf) -> String {
+/// [`seed_text`] for anything but a number constant: [`crate::edit::input_text_of`]
+/// (a formula's `=` source, a text, a boolean or an error) with a leading `'`
+/// where [`needs_apostrophe`] says re-entering needs one.
+fn input_text_styled(cell: &Cell, xf: &Xf) -> String {
     copy_field(cell, xf, crate::edit::input_text_of(cell))
+}
+
+/// The text a cell editor opens on (and the formula bar shows). A number is
+/// written in full, not rounded to General's 15 digits, in E notation outside
+/// `1e-10..1e21` where plain digits would run to hundreds of characters; in
+/// a percent cell it is shown as the percent it reads as (`150%` for 1.5),
+/// since a plain `1.5` typed back into that cell would be divided by 100.
+/// Anything else is [`input_text_styled`]: a formula's `=` source, and text
+/// with the `'` its re-entry needs.
+///
+/// Re-entering the seed gives back the same value except for a number with
+/// more than 15 significant digits: typed entry keeps 15, as Excel does, so
+/// `0.30000000000000004` re-entered is 0.3. The cell's format may change: an
+/// E-notation seed (`1E300`) re-entered into a General cell brings the
+/// scientific format `0.00E+00`, as any typed exponent does. What keeps the
+/// cell exactly as it was is the host leaving an unchanged seed uncommitted
+/// (xlsxy and the suite do; gridwasm re-commits it).
+pub fn seed_text(cell: &Cell, xf: &Xf) -> String {
+    match &cell.value {
+        CellValue::Number(n) if cell.formula.is_none() => {
+            if is_percent(xf) {
+                percent_seed(*n, xf)
+            } else {
+                full_number(*n)
+            }
+        }
+        _ => input_text_styled(cell, xf),
+    }
+}
+
+/// `n` in its shortest round-trip digits.
+fn full_number(n: f64) -> String {
+    if n == 0.0 || (1e-10..1e21).contains(&n.abs()) {
+        format!("{n}")
+    } else {
+        format!("{n:E}")
+    }
+}
+
+/// `n` as a percent that reads back as `n` in a percent cell `xf`: `n * 100`
+/// is rarely exact in binary (0.07 * 100 is 7.000000000000001), so take the
+/// fewest significant digits whose `%` text reads back as `n` exactly.
+fn percent_seed(n: f64, xf: &Xf) -> String {
+    let pct = n * 100.0;
+    let ctx = EntryCtx::default();
+    for digits in 1..=17 {
+        let Ok(r) = format!("{:.*e}", digits - 1, pct).parse::<f64>() else {
+            break;
+        };
+        let text = format!("{}%", full_number(r));
+        let back = parse_entry(&text, xf, &ctx).ok().map(|e| e.cell.value);
+        if back == Some(CellValue::Number(n)) {
+            return text;
+        }
+    }
+    format!("{}%", full_number(pct))
 }
 
 fn value_cell(value: CellValue) -> Cell {
@@ -1140,6 +1227,39 @@ mod tests {
     }
 
     #[test]
+    fn a_typed_date_switches_a_number_format_to_the_date_format() {
+        let code = |base: &Xf, text: &str| {
+            let e = parse_entry(text, base, &ctx()).unwrap();
+            entry_xf(base, &e).code
+        };
+        let fixed = fmt_xf("0.00");
+        let cents = fmt_xf("$#,##0.00_);($#,##0.00)");
+        assert_eq!(code(&fixed, "1/15/2024").as_deref(), Some("m/d/yyyy"));
+        assert_eq!(code(&cents, "1/15/2024").as_deref(), Some("m/d/yyyy"));
+        assert_eq!(code(&fixed, "9:30").as_deref(), Some("h:mm"));
+        assert_eq!(
+            code(&fmt_xf("0%"), "1/15/2024").as_deref(),
+            Some("m/d/yyyy")
+        );
+        // A date or time format stays: the entry is shown in the cell's own.
+        assert_eq!(code(&fmt_xf("h:mm"), "1/15/2024").as_deref(), Some("h:mm"));
+        assert_eq!(
+            code(&fmt_xf("d-mmm"), "9:30").as_deref(),
+            Some("d-mmm"),
+            "a date cell keeps its format for a time too"
+        );
+        // Only dates switch a number format; other shapes still need General.
+        assert_eq!(code(&fixed, "$5").as_deref(), Some("0.00"));
+        assert_eq!(code(&fixed, "1 1/4").as_deref(), Some("0.00"));
+        assert!(is_date(&fmt_xf("m/d/yyyy")) && is_date(&fmt_xf("[h]:mm")));
+        assert!(is_date(&Xf {
+            numfmt: NumFmt::DateTime,
+            ..Xf::default()
+        }));
+        assert!(!is_date(&fixed) && !is_date(&Xf::default()) && !is_date(&fmt_xf("@")));
+    }
+
+    #[test]
     fn a_long_number_keeps_fifteen_significant_digits() {
         let n = |t: &str| match parse_entry(t, &Xf::default(), &ctx()).unwrap().cell.value {
             CellValue::Number(n) => n,
@@ -1237,12 +1357,12 @@ mod tests {
         let loaded = Cell::text("'abc");
         // General, no prefix: the seed escapes it, and both re-entry and
         // paste give back 'abc.
-        let seed = input_text_styled(&loaded, &Xf::default());
+        let seed = seed_text(&loaded, &Xf::default());
         assert_eq!(seed, "''abc");
         let typed = parse_entry(&seed, &Xf::default(), &ctx()).unwrap();
         assert_eq!(typed.cell.value, CellValue::Text("'abc".into()));
         assert_eq!(
-            paste_cell(&mut styles, general, &seed).value,
+            paste_cell(&mut styles, general, &seed, &ctx()).value,
             CellValue::Text("'abc".into())
         );
         // A Text cell needs no escape, and a paste into one is as typed.
@@ -1250,13 +1370,13 @@ mod tests {
             style: text_fmt,
             ..loaded.clone()
         };
-        let seed = input_text_styled(&in_text, &styles.xf(text_fmt));
+        let seed = seed_text(&in_text, &styles.xf(text_fmt));
         assert_eq!(seed, "'abc");
-        let pasted = paste_cell(&mut styles, text_fmt, &seed);
+        let pasted = paste_cell(&mut styles, text_fmt, &seed, &ctx());
         assert_eq!(pasted.value, CellValue::Text("'abc".into()));
         assert!(!styles.xf(pasted.style).quote_prefix);
         assert_eq!(
-            paste_cell(&mut styles, text_fmt, "007").value,
+            paste_cell(&mut styles, text_fmt, "007", &ctx()).value,
             CellValue::Text("007".into())
         );
     }
@@ -1278,17 +1398,18 @@ mod tests {
         };
         let xf = styles.xf(text_q);
         assert!(!needs_apostrophe(&cell, &xf));
-        assert_eq!(input_text_styled(&cell, &xf), "007");
+        assert_eq!(seed_text(&cell, &xf), "007");
         let again = parse_entry("007", &xf, &ctx()).unwrap();
         assert_eq!(again.cell.value, CellValue::Text("007".into()));
         assert_eq!(copy_field(&cell, &xf, "007".into()), "007");
         assert_eq!(
-            paste_cell(&mut styles, text_q, "007").value,
+            paste_cell(&mut styles, text_q, "007", &ctx()).value,
             CellValue::Text("007".into())
         );
         // An empty field clears, in a Text cell as anywhere.
-        assert_eq!(paste_cell(&mut styles, text_q, "").value, CellValue::Empty);
-        assert_eq!(paste_cell(&mut styles, general, "").value, CellValue::Empty);
+        let paste = |styles: &mut Styles, style, text| paste_cell(styles, style, text, &ctx());
+        assert_eq!(paste(&mut styles, text_q, "").value, CellValue::Empty);
+        assert_eq!(paste(&mut styles, general, "").value, CellValue::Empty);
     }
 
     #[test]
@@ -1315,7 +1436,9 @@ mod tests {
 
     #[test]
     fn cross_format_paste_is_lossy_for_apostrophes() {
-        // Pinned, not endorsed: a TSV carries no format (a follow-up).
+        // The rule for text from OUTSIDE the host: a TSV carries no format,
+        // so the field is read as typed into the target, as Excel reads
+        // pasted text. (A host's own copy pastes the cells themselves.)
         let mut styles = Styles::default();
         let general = styles.intern(Xf::default());
         let text = styles.intern(Xf {
@@ -1330,14 +1453,14 @@ mod tests {
         let field = copy_field(&from_text, &styles.xf(text), "'abc".into());
         assert_eq!(field, "'abc");
         assert_eq!(
-            paste_cell(&mut styles, general, &field).value,
+            paste_cell(&mut styles, general, &field, &ctx()).value,
             CellValue::Text("abc".into())
         );
         let from_general = Cell::text("'abc");
         let field = copy_field(&from_general, &Xf::default(), "'abc".into());
         assert_eq!(field, "''abc");
         assert_eq!(
-            paste_cell(&mut styles, text, &field).value,
+            paste_cell(&mut styles, text, &field, &ctx()).value,
             CellValue::Text("''abc".into())
         );
     }
@@ -1397,18 +1520,138 @@ mod tests {
             bold: true,
             ..Xf::default()
         });
-        let c = paste_cell(&mut styles, bold, "'007");
+        let c = paste_cell(&mut styles, bold, "'007", &ctx());
         assert_eq!(c.value, CellValue::Text("007".into()));
         let xf = styles.xf(c.style);
         assert!(xf.quote_prefix && xf.bold);
-        // A plain field keeps paste's value reading and clears the prefix.
-        let n = paste_cell(&mut styles, c.style, "007");
+        // A plain field is read as typed and clears the prefix.
+        let n = paste_cell(&mut styles, c.style, "007", &ctx());
         assert_eq!(n.value, CellValue::Number(7.0));
         assert_eq!(n.style, bold);
+    }
+
+    #[test]
+    fn pasted_text_is_read_like_typed_entry() {
+        let mut styles = Styles::default();
+        let general = styles.intern(Xf::default());
+        let mut paste = |style: u32, text: &str| {
+            let c = paste_cell(&mut styles, style, text, &ctx());
+            (c.value.clone(), styles.xf(c.style).code, c)
+        };
+        // Recognised shapes bring the format typing would give them (this
+        // was text while paste read values only).
+        let (v, code, _) = paste(general, "1/15/2024");
         assert_eq!(
-            paste_cell(&mut styles, 0, "1/15/2024").value,
-            CellValue::Text("1/15/2024".into())
+            (v, code.as_deref()),
+            (CellValue::Number(45_306.0), Some("m/d/yyyy"))
         );
+        let (v, code, _) = paste(general, "$5");
+        assert_eq!(v, CellValue::Number(5.0));
+        assert!(code.is_some_and(|c| c.contains('$')));
+        let (v, code, _) = paste(general, "1,234");
+        assert_eq!(
+            (v, code.as_deref()),
+            (CellValue::Number(1234.0), Some("#,##0"))
+        );
+        let (v, code, _) = paste(general, "50%");
+        assert_eq!((v, code.as_deref()), (CellValue::Number(0.5), Some("0%")));
+        // A yearless date takes the clock's year.
+        let (v, _, _) = paste(general, "3/4");
+        assert!(matches!(v, CellValue::Number(n) if n > 45_000.0), "{v:?}");
+        // A formula stays a formula (hosts demote one that does not parse).
+        let (_, _, c) = paste(general, "=A1+1");
+        assert_eq!(c.formula.as_deref(), Some("A1+1"));
+        let (_, _, c) = paste(general, "-B2");
+        assert_eq!(c.formula.as_deref(), Some("-B2"));
+        // Paste never turns on Wrap Text.
+        let (_, _, c) = paste(general, "a\nb");
+        assert!(!styles.xf(c.style).wrap);
+        let pct = styles.intern(Xf {
+            numfmt: NumFmt::Percent { decimals: 0 },
+            code: Some("0%".into()),
+            ..Xf::default()
+        });
+        let text_fmt = styles.intern(Xf {
+            numfmt: NumFmt::Text,
+            code: Some("@".into()),
+            ..Xf::default()
+        });
+        let mut paste = |style: u32, text: &str| {
+            let c = paste_cell(&mut styles, style, text, &ctx());
+            (c.value.clone(), styles.xf(c.style).code)
+        };
+        // A percent target divides a plain number as typing does.
+        assert_eq!(paste(pct, "50").0, CellValue::Number(0.5));
+        // A Text target keeps the field as it is.
+        assert_eq!(
+            paste(text_fmt, "1/15/2024"),
+            (CellValue::Text("1/15/2024".into()), Some("@".into()))
+        );
+        // Over the cell limit: kept as text, unread, on the target's style.
+        let long = "1".repeat(MAX_CELL_CHARS + 1);
+        assert_eq!(paste(general, &long), (CellValue::Text(long.clone()), None));
+    }
+
+    #[test]
+    fn a_seed_keeps_every_digit_of_a_number() {
+        let seed = |n: f64| seed_text(&Cell::number(n), &Xf::default());
+        assert_eq!(seed(0.1 + 0.2), "0.30000000000000004");
+        assert_eq!(seed(42.0), "42");
+        assert_eq!(seed(-1.5), "-1.5");
+        assert_eq!(seed(0.0), "0");
+        // Plain digits only where they stay short.
+        assert_eq!(seed(1e20), "100000000000000000000");
+        assert_eq!(seed(1e300), "1E300");
+        assert_eq!(seed(-1.5e-300), "-1.5E-300");
+        // Each of these (15 significant digits or fewer) reads back through
+        // typed entry to the number it shows.
+        for n in [1e300, -1.5e-300, 1e21, 123.25] {
+            let e = parse_entry(&seed(n), &Xf::default(), &ctx()).unwrap();
+            assert_eq!(e.cell.value, CellValue::Number(n), "{n}");
+        }
+        // The value, not the format: an E-notation seed re-entered into a
+        // General cell brings the scientific format with it.
+        let e = parse_entry(&seed(1e300), &Xf::default(), &ctx()).unwrap();
+        assert_eq!(
+            entry_xf(&Xf::default(), &e).code.as_deref(),
+            Some("0.00E+00")
+        );
+        let e = parse_entry(&seed(123.25), &Xf::default(), &ctx()).unwrap();
+        assert!(is_general(&entry_xf(&Xf::default(), &e)));
+        // Text keeps its re-entry apostrophe; a formula shows its source.
+        let quoted = Xf {
+            quote_prefix: true,
+            ..Xf::default()
+        };
+        assert_eq!(seed_text(&Cell::text("007"), &quoted), "'007");
+        let f = Cell {
+            value: CellValue::Number(3.0),
+            ..Cell::formula("1+2")
+        };
+        assert_eq!(seed_text(&f, &Xf::default()), "=1+2");
+    }
+
+    #[test]
+    fn a_percent_cell_seeds_the_percent_it_reads_back_as() {
+        let pct = fmt_xf("0%");
+        let seed = |n: f64| seed_text(&Cell::number(n), &pct);
+        assert_eq!(seed(1.5), "150%");
+        assert_eq!(seed(0.07), "7%");
+        assert_eq!(seed(0.5), "50%");
+        assert_eq!(seed(-0.125), "-12.5%");
+        assert_eq!(seed(0.0), "0%");
+        for n in [1.5, 0.07, 0.123456789, -0.125, 1e-12] {
+            let text = seed(n);
+            let back = parse_entry(&text, &pct, &ctx()).unwrap().cell.value;
+            assert_eq!(back, CellValue::Number(n), "{n} seeds {text}");
+        }
+        // A value no 15-digit entry can give back is shown in full. Only a
+        // host that leaves an unedited seed uncommitted (xlsxy, the suite)
+        // keeps it exactly; re-entered, it rounds to 15 digits.
+        assert_eq!(seed(2.0 / 3.0), "66.66666666666666%");
+        // Edited, it reads as typed there: 160% is 1.6, not 0.016.
+        let back = parse_entry("160%", &pct, &ctx()).unwrap().cell.value;
+        assert_eq!(back, CellValue::Number(1.6));
     }
 
     #[test]

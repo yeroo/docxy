@@ -121,6 +121,241 @@ fn a_text_cell_keeps_the_entry_and_a_percent_cell_divides_it() {
 }
 
 #[test]
+fn the_editor_seeds_every_digit_and_a_percent_cell_its_percent() {
+    let mut v = view();
+    put(&mut v, 0, 0, Cell::number(0.1 + 0.2));
+    assert_eq!(v.edit_string(0, 0), "0.30000000000000004");
+    let pct = v.pkg.workbook.styles.intern({
+        let mut xf = Xf::default();
+        xf.set_code(Some("0%".into()));
+        xf
+    });
+    put(
+        &mut v,
+        1,
+        0,
+        Cell {
+            style: pct,
+            ..Cell::number(1.5)
+        },
+    );
+    assert_eq!(v.edit_string(1, 0), "150%");
+    // F2 then Enter unchanged leaves it; edited to 160% it is 1.6 (a plain
+    // `1.5` seed edited to `1.6` used to be divided again, to 0.016).
+    select(&mut v, 1, 0);
+    v.begin_cell_edit(None);
+    assert_eq!(v.editing.as_deref(), Some("150%"));
+    v.commit_edit();
+    assert_eq!(value(&v, 1, 0), CellValue::Number(1.5));
+    v.begin_cell_edit(None);
+    v.editing = Some("160%".into());
+    assert!(v.commit_edit());
+    assert_eq!(value(&v, 1, 0), CellValue::Number(1.6));
+}
+
+#[test]
+fn a_general_number_is_fitted_to_its_cell() {
+    let general = Xf::default();
+    let big = CellValue::Number(123_456_789_012.0);
+    // A default column (col_px of 8.43) and a wide one: General stops at 11
+    // characters either way, shorter when the cell is narrower.
+    let default_w = col_px(8.43);
+    let chars = (((default_w - 6.0) / 7.0).floor() as usize).max(1);
+    assert_eq!(
+        grid_cell_text(&general, &big, false, default_w),
+        gridcore::sheet::fmt_general_cell(123_456_789_012.0, chars)
+    );
+    assert_ne!(
+        grid_cell_text(&general, &big, false, default_w),
+        "123456789012"
+    );
+    assert_eq!(grid_cell_text(&general, &big, false, 200.0), "1.23457E+11");
+    assert_eq!(
+        grid_cell_text(&general, &CellValue::Number(42.0), false, 64.0),
+        "42"
+    );
+    let mut fixed = Xf::default();
+    fixed.set_code(Some("0.00".into()));
+    assert_eq!(
+        grid_cell_text(&fixed, &CellValue::Number(1.5), false, 64.0),
+        "1.50"
+    );
+}
+
+#[test]
+fn a_grid_clip_pastes_the_same_cells_between_text_and_general() {
+    // The grid clip carries the cells, so a quote-prefixed General `007`
+    // onto a Text cell, and a Text cell's `'abc` onto a General one, land as
+    // they were: no apostrophe added or dropped.
+    let mut v = view();
+    let quoted = v.pkg.workbook.styles.intern(Xf {
+        quote_prefix: true,
+        ..Xf::default()
+    });
+    let text_fmt = v.pkg.workbook.styles.intern({
+        let mut xf = Xf::default();
+        xf.set_code(Some("@".into()));
+        xf
+    });
+    let q007 = Cell {
+        style: quoted,
+        ..Cell::text("007")
+    };
+    let tabc = Cell {
+        style: text_fmt,
+        ..Cell::text("'abc")
+    };
+    put(&mut v, 0, 0, q007.clone());
+    put(&mut v, 0, 1, tabc.clone());
+    put(
+        &mut v,
+        2,
+        0,
+        Cell {
+            style: text_fmt,
+            ..Cell::default()
+        },
+    );
+    put(&mut v, 2, 1, Cell::text("x"));
+    let block = vec![vec![q007.clone(), tabc.clone()]];
+    let s = v.active;
+    paste_grid_block(&mut v.engine, &mut v.pkg.workbook, s, (2, 0), &block);
+    assert_eq!(v.sheet().cell(2, 0), Some(&q007));
+    assert_eq!(v.sheet().cell(2, 1), Some(&tabc));
+}
+
+#[test]
+fn the_editor_shows_one_line_per_line_feed_with_the_caret_on_its_line() {
+    let text = |line: &EditLine| line.iter().map(|(_, s, _)| s.as_str()).collect::<String>();
+    let offs = |line: &EditLine| line.iter().map(|(o, _, _)| *o).collect::<Vec<_>>();
+    // "ab\ncd": the caret (after `c`, char 4) is on the second line.
+    let lines = edit_lines("ab\ncd", 4);
+    assert_eq!(lines.len(), 2);
+    assert_eq!(text(&lines[0].0), "ab");
+    assert_eq!(text(&lines[1].0), "cd");
+    assert_eq!((lines[0].1, lines[1].1), (false, true));
+    // Offsets are into the whole buffer, split at the caret too.
+    assert_eq!(offs(&lines[1].0), vec![3, 4]);
+    // A caret right after a line feed is on the next line; right before it,
+    // on the line it ends.
+    assert!(edit_lines("ab\ncd", 3)[1].1);
+    assert!(edit_lines("ab\ncd", 2)[0].1);
+    // Empty lines are kept: a trailing Alt+Enter opens a line to type on.
+    let lines = edit_lines("a\n\n", 4);
+    assert_eq!(lines.len(), 3);
+    assert!(lines[1].0.is_empty() && lines[2].0.is_empty());
+    assert!(lines[2].1);
+    // One line without a feed; a formula keeps its reference colours.
+    let lines = edit_lines("=A1+\nB2", 0);
+    assert_eq!(lines.len(), 2);
+    assert!(
+        lines[0]
+            .0
+            .iter()
+            .any(|(_, s, ci)| s == "A1" && ci.is_some())
+    );
+    assert!(
+        lines[1]
+            .0
+            .iter()
+            .any(|(_, s, ci)| s == "B2" && ci.is_some())
+    );
+    assert_eq!(edit_lines("abc", 1).len(), 1);
+}
+
+#[test]
+fn ctrl_enter_checks_the_formula_in_every_cell_of_the_range() {
+    // A1 is Text (it would keep `=SUM(B1` as text), A2:A3 General: the
+    // formula they would get does not parse, so nothing is entered.
+    let mut v = view();
+    let text_fmt = v.pkg.workbook.styles.intern({
+        let mut xf = Xf::default();
+        xf.set_code(Some("@".into()));
+        xf
+    });
+    put(
+        &mut v,
+        0,
+        0,
+        Cell {
+            style: text_fmt,
+            ..Cell::default()
+        },
+    );
+    select(&mut v, 0, 0);
+    v.anchor = (2, 0);
+    type_fresh(&mut v, "=SUM(B1");
+    assert!(!v.commit_edit_to_selection());
+    assert!(
+        v.entry_error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("formula error"))
+    );
+    assert_eq!(v.editing.as_deref(), Some("=SUM(B1"));
+    for r in 0..3 {
+        assert!(v.sheet().cell(r, 0).is_none_or(|c| c.is_blank()), "row {r}");
+    }
+    // Finished, it commits: text in A1, formulas below.
+    v.editing = Some("=SUM(B1)".into());
+    v.entry_error = None;
+    assert!(v.commit_edit_to_selection());
+    assert_eq!(value(&v, 0, 0), CellValue::Text("=SUM(B1)".into()));
+    let f = |r| v.sheet().cell(r, 0).and_then(|c| c.formula.clone());
+    assert_eq!(f(1).as_deref(), Some("SUM(B2)"));
+    assert_eq!(f(2).as_deref(), Some("SUM(B3)"));
+}
+
+#[test]
+fn an_unfinished_formula_is_refused_and_the_editor_stays() {
+    let mut v = view();
+    type_fresh(&mut v, "=SUM(A1");
+    // Right in Enter mode after a reference is a commit, not a point...
+    assert!(!v.edit_point(0, 1, false));
+    // ...and the commit is refused: nothing stored, nothing moved.
+    assert_eq!(v.commit_and_move(0, 1), None);
+    assert_eq!(v.editing.as_deref(), Some("=SUM(A1"));
+    assert!(
+        v.entry_error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("formula error"))
+    );
+    assert_eq!(v.sel, (0, 0));
+    assert!(v.sheet().cell(0, 0).is_none());
+    // Enter the same.
+    v.entry_error = None;
+    assert!(!v.commit_edit());
+    assert!(v.entry_error.is_some());
+    assert!(v.sheet().cell(0, 0).is_none());
+    // Finished, it commits.
+    v.editing = Some("=SUM(A1)".into());
+    v.entry_error = None;
+    assert!(v.commit_edit());
+    assert_eq!(
+        v.sheet().cell(0, 0).and_then(|c| c.formula.as_deref()),
+        Some("SUM(A1)")
+    );
+    // A Text cell stores `=SUM(A1` as text: nothing to refuse there.
+    let text_fmt = v.pkg.workbook.styles.intern({
+        let mut xf = Xf::default();
+        xf.set_code(Some("@".into()));
+        xf
+    });
+    put(
+        &mut v,
+        1,
+        0,
+        Cell {
+            style: text_fmt,
+            ..Cell::default()
+        },
+    );
+    select(&mut v, 1, 0);
+    type_fresh(&mut v, "=SUM(A1");
+    assert!(v.commit_edit());
+    assert_eq!(value(&v, 1, 0), CellValue::Text("=SUM(A1".into()));
+}
+
+#[test]
 fn an_apostrophe_is_a_quote_prefix_and_an_untouched_reedit_is_a_no_op() {
     let mut v = view();
     type_fresh(&mut v, "'007");
@@ -234,24 +469,179 @@ fn f2_while_typing_keeps_the_text_and_word_keys_edit_it() {
 }
 
 #[test]
-fn enter_mode_arrows_commit_except_while_a_formula_is_typed() {
+fn enter_mode_arrows_commit_except_where_a_formula_points() {
+    // Enter mode: the arrows never move the caret. Where a formula wants a
+    // reference next they point at a cell; anywhere else they commit and move.
     let mut v = view();
     type_fresh(&mut v, "abc");
     assert!(!v.edit_arrows_move_caret());
-    for formula in ["=A1+", "-L1", "+A99", "@SUM(1"] {
-        v.editing = Some(formula.into());
-        let want = formula != "@SUM(1";
-        assert_eq!(v.edit_arrows_move_caret(), want, "{formula}");
+    assert!(!v.edit_point(0, 1, false), "text never points");
+    for formula in ["=A1+", "-L1-", "+A99*", "=SUM(", "=A1:"] {
+        type_fresh(&mut v, formula);
+        assert!(!v.edit_arrows_move_caret(), "{formula}");
+        assert!(v.edit_point(0, 1, false), "{formula} points");
     }
-    v.editing = Some("-5".into());
-    assert!(!v.edit_arrows_move_caret(), "a number is not a formula");
+    // A formula whose caret sits after a value, not an operator, doesn't.
+    for formula in ["=A1", "=5", "-L1", "=SUM(A1)"] {
+        type_fresh(&mut v, formula);
+        assert!(!v.edit_point(0, 1, false), "{formula} commits");
+        assert_eq!(v.editing.as_deref(), Some(formula), "left alone");
+    }
+    // `-5` is a number, which is exactly why it has nothing to point after.
+    type_fresh(&mut v, "-5");
+    assert!(!v.edit_is_formula(), "a number is not a formula");
+    assert!(!v.edit_point(0, 1, false));
+    // Edit mode: the arrows move the caret and never point.
     v.edit_mode = EditMode::Edit;
-    v.editing = Some("abc".into());
+    v.editing = Some("=A1+".into());
     assert!(v.edit_arrows_move_caret());
+    assert!(!v.edit_point(0, 1, false));
     // F2 / a double-click / the fx bar open in Edit mode.
     v.end_cell_edit();
     v.begin_cell_edit(None);
     assert_eq!(v.edit_mode, EditMode::Edit);
+}
+
+// ---- #757: pointing at cells with the arrows, and F4's anchoring ------------
+
+#[test]
+fn arrows_point_at_cells_from_the_edited_cell() {
+    // From A1: `=`, Down, Right → B2 (each arrow moves the pointed cell, the
+    // caret staying after it); Shift+Right grows it into a range.
+    let mut v = view();
+    type_fresh(&mut v, "=");
+    assert!(v.edit_point(1, 0, false));
+    assert_eq!(v.editing.as_deref(), Some("=A2"));
+    assert!(v.edit_point(0, 1, false));
+    assert_eq!(v.editing.as_deref(), Some("=B2"));
+    assert_eq!(v.edit_caret, 3);
+    assert!(v.edit_point(0, 1, true));
+    assert_eq!(v.editing.as_deref(), Some("=B2:C2"));
+    assert!(v.edit_point(1, 0, true));
+    assert_eq!(v.editing.as_deref(), Some("=B2:C3"));
+    // A plain arrow after a Shift one collapses back to one moving cell.
+    assert!(v.edit_point(0, 1, false));
+    assert_eq!(v.editing.as_deref(), Some("=D3"));
+    // Nothing moved the selection or closed the editor.
+    assert_eq!(v.sel, (0, 0));
+    assert_eq!(v.edit_origin, Some((0, 0, 0)));
+}
+
+#[test]
+fn arrows_point_after_an_operator_or_a_bracket() {
+    let mut v = view();
+    type_fresh(&mut v, "=SUM(");
+    assert!(v.edit_point(1, 0, false));
+    assert_eq!(v.editing.as_deref(), Some("=SUM(A2"));
+    // Typing ends the pointing: `)` then an arrow commits, it doesn't point.
+    v.edit_point = None; // what `sheet_key` does on any other key
+    v.edit_type(")");
+    assert!(!v.edit_point(1, 0, false));
+
+    let mut v = view();
+    type_fresh(&mut v, "=A1+");
+    assert!(v.edit_point(0, 1, false));
+    assert_eq!(v.editing.as_deref(), Some("=A1+B1"));
+
+    // Text after the caret stays where it was.
+    let mut v = view();
+    type_fresh(&mut v, "=SUM()");
+    v.edit_caret = 5;
+    assert!(v.edit_point(0, 2, false));
+    assert_eq!(v.editing.as_deref(), Some("=SUM(C1)"));
+    assert_eq!(v.edit_caret, 7);
+
+    // Moving the caret by hand ends the pointing too.
+    let mut v = view();
+    type_fresh(&mut v, "=1+");
+    assert!(v.edit_point(0, 1, false));
+    v.edit_caret = 2;
+    assert!(!v.edit_point(0, 1, false), "after `1`, nothing is pointed");
+    assert_eq!(v.editing.as_deref(), Some("=1+B1"));
+}
+
+#[test]
+fn pointing_after_a_colon_moves_the_second_end() {
+    // From C1, `=SUM(A1:` then Down twice: A1 stays, the second end walks.
+    let mut v = view();
+    select(&mut v, 0, 2);
+    type_fresh(&mut v, "=SUM(A1:");
+    assert!(v.edit_point(1, 0, false));
+    assert_eq!(v.editing.as_deref(), Some("=SUM(A1:C2"));
+    assert!(v.edit_point(1, 0, false));
+    assert_eq!(v.editing.as_deref(), Some("=SUM(A1:C3"));
+    // Shift there has no range of its own to grow: it moves that end too.
+    assert!(v.edit_point(0, 1, true));
+    assert_eq!(v.editing.as_deref(), Some("=SUM(A1:D3"));
+}
+
+#[test]
+fn pointing_stops_at_the_sheet_edge() {
+    let mut v = view();
+    type_fresh(&mut v, "=");
+    assert!(v.edit_point(-1, 0, false));
+    assert_eq!(v.editing.as_deref(), Some("=A1"));
+    assert!(v.edit_point(0, -1, false));
+    assert_eq!(v.editing.as_deref(), Some("=A1"));
+}
+
+#[test]
+fn an_arrow_after_a_finished_formula_commits_and_moves() {
+    // `=5` then Right: no reference is wanted there, so the arrow does what
+    // it does after any entry — commit and move (`sheet_key`'s fallback).
+    let mut v = view();
+    type_fresh(&mut v, "=5");
+    assert!(!v.edit_point(0, 1, false));
+    assert_eq!(v.commit_and_move(0, 1), Some(true));
+    assert!(v.editing.is_none());
+    assert_eq!(value(&v, 0, 0), CellValue::Number(5.0));
+    assert_eq!(v.sel, (0, 1));
+}
+
+#[test]
+fn edit_mode_arrows_move_the_caret() {
+    let mut v = view();
+    put(
+        &mut v,
+        0,
+        0,
+        Cell {
+            formula: Some("B1+".into()),
+            ..Cell::default()
+        },
+    );
+    v.begin_cell_edit(None);
+    v.edit_caret_to_end();
+    assert_eq!(v.editing.as_deref(), Some("=B1+"));
+    assert!(v.edit_arrows_move_caret());
+    assert!(!v.edit_point(0, -1, false));
+    v.edit_move(-1);
+    assert_eq!(v.edit_caret, 3);
+    assert_eq!(v.editing.as_deref(), Some("=B1+"));
+}
+
+#[test]
+fn f4_cycles_the_reference_at_the_caret_only_in_a_formula() {
+    let mut v = view();
+    type_fresh(&mut v, "=A1");
+    for want in ["=$A$1", "=A$1", "=$A1", "=A1"] {
+        assert!(v.edit_cycle_ref());
+        assert_eq!(v.editing.as_deref(), Some(want));
+        assert_eq!(v.edit_caret, want.chars().count());
+    }
+    // Not on a reference: nothing happens.
+    type_fresh(&mut v, "=SUM(");
+    assert!(!v.edit_cycle_ref());
+    assert_eq!(v.editing.as_deref(), Some("=SUM("));
+    // Not a formula: nothing happens, even to text that reads like a cell.
+    type_fresh(&mut v, "A1");
+    assert!(!v.edit_cycle_ref());
+    assert_eq!(v.editing.as_deref(), Some("A1"));
+    // A pointed reference can be anchored straight away.
+    type_fresh(&mut v, "=");
+    assert!(v.edit_point(1, 1, false));
+    assert!(v.edit_cycle_ref());
+    assert_eq!(v.editing.as_deref(), Some("=$B$2"));
 }
 
 #[test]

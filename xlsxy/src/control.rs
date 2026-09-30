@@ -1580,6 +1580,7 @@ mod tests {
             text: "=1+".into(),
             cursor: 3,
             replace: false,
+            seed: None,
         });
         assert!(a.commit_edit());
         assert_eq!(get(&mut a, "A1").get_str("value"), Some("=1+"));

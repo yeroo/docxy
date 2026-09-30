@@ -52,7 +52,9 @@ mod win {
         SheetPackage, SpreadsheetKind, load_xlsx, new_xlsx, save_xlsx, save_xlsx_as,
     };
 
-    use windows::Win32::Foundation::{DISP_E_BADINDEX, E_FAIL, E_NOTIMPL, E_POINTER, S_OK};
+    use windows::Win32::Foundation::{
+        DISP_E_BADINDEX, DISP_E_TYPEMISMATCH, E_FAIL, E_NOTIMPL, E_POINTER, S_OK,
+    };
     use windows::Win32::System::Com::{
         DISPATCH_FLAGS, DISPPARAMS, EXCEPINFO, IDispatch, IDispatch_Impl, IDispatch_Vtbl,
     };
@@ -221,10 +223,18 @@ mod win {
         dirty: bool,
     }
 
+    /// The recalc engine for a workbook, on the local clock `TODAY()` and
+    /// `NOW()` read, as Excel's.
+    fn book_engine(pkg: &SheetPackage) -> Engine {
+        let mut engine = Engine::new(&pkg.workbook);
+        engine.clock = gridcore::clock::local_now_serial();
+        engine
+    }
+
     impl Book {
         fn new() -> Book {
             let pkg = new_xlsx();
-            let engine = Engine::new(&pkg.workbook);
+            let engine = book_engine(&pkg);
             Book {
                 pkg,
                 engine,
@@ -239,7 +249,7 @@ mod win {
         fn open(path: &str) -> Option<Book> {
             let bytes = std::fs::read(path).ok()?;
             let pkg = load_xlsx(&bytes).ok()?;
-            let engine = Engine::new(&pkg.workbook);
+            let engine = book_engine(&pkg);
             Some(Book {
                 pkg,
                 engine,
@@ -262,6 +272,88 @@ mod win {
                 .set_cell(&mut self.pkg.workbook, (sheet, r, c), cell);
             self.dirty = true;
             self.saved = false;
+        }
+
+        /// Assign `put` to every cell of the rect `(r1, c1, r2, c2)`, as
+        /// Excel's Range.Value / Formula puts do: a string is entered like
+        /// typed text into each cell under its own format (`"42"` a number,
+        /// `"1/15/2024"` a date, `"'007"` quote-prefixed text), a formula's
+        /// relative references moving per cell as a fill would; a number or
+        /// boolean keeps each cell's format; [`Put::Clear`] resets the cell,
+        /// format and all. A string the cells refuse — a formula that does
+        /// not parse (`=SUM(A1`), or one over the cell limit — writes nothing
+        /// and is `Err(E_FAIL)`, the shim's failed-put answer (Excel raises
+        /// run-time error 1004), rather than a cell that never evaluates.
+        fn assign(
+            &mut self,
+            sheet: usize,
+            (r1, c1, r2, c2): (u32, u32, u32, u32),
+            put: &Put,
+        ) -> std::result::Result<(), HRESULT> {
+            match put {
+                Put::Clear => {
+                    for r in r1..=r2 {
+                        for c in c1..=c2 {
+                            self.set(sheet, r, c, Cell::default());
+                        }
+                    }
+                }
+                Put::Value(value) => {
+                    for r in r1..=r2 {
+                        for c in c1..=c2 {
+                            let cell = self.value_cell(sheet, r, c, value.clone());
+                            self.set(sheet, r, c, cell);
+                        }
+                    }
+                }
+                Put::Text(text) => {
+                    let today = self.engine.clock;
+                    let wb = &mut self.pkg.workbook;
+                    // A Text cell takes `=…` as text; any other cell of the
+                    // range would make it a formula, which must parse.
+                    let rect = (r1, c1, r2, c2);
+                    let body = gridcore::entry::range_formula(wb, sheet, rect, text);
+                    if let Some(Err(e)) = body.map(Engine::validate) {
+                        log(&format!("put refused: formula error: {e}"));
+                        return Err(E_FAIL);
+                    }
+                    match gridcore::entry::entry_range(wb, sheet, rect, (r1, c1), text, today) {
+                        Ok(cells) => {
+                            for (r, c, cell) in cells {
+                                self.set(sheet, r, c, cell);
+                            }
+                        }
+                        Err(e) => {
+                            log(&format!("put refused: {e}"));
+                            return Err(E_FAIL);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        /// `value` as the constant of (sheet, r, c), on that cell's own style
+        /// with any quote prefix cleared (a number is not quoted text).
+        fn value_cell(&mut self, sheet: usize, r: u32, c: u32, value: CellValue) -> Cell {
+            let base = self
+                .pkg
+                .workbook
+                .sheets
+                .get(sheet)
+                .and_then(|s| s.cell(r, c))
+                .map_or(0, |c| c.style);
+            let e = gridcore::entry::Entry {
+                cell: Cell {
+                    value,
+                    ..Cell::default()
+                },
+                format: None,
+                quote_prefix: false,
+                wrap: false,
+            };
+            let style = gridcore::entry::entry_style(&mut self.pkg.workbook.styles, base, &e);
+            Cell { style, ..e.cell }
         }
 
         fn value(&mut self, sheet: usize, r: u32, c: u32) -> CellValue {
@@ -413,45 +505,57 @@ mod win {
         }
     }
 
-    /// The cell an indexed property put is assigning. COM puts the named
+    /// What a Value / Formula / Item put or a clear assigns to each cell of
+    /// its range.
+    #[derive(Clone, Debug, PartialEq)]
+    enum Put {
+        /// Range.Clear (111): value and format go.
+        Clear,
+        /// A number, a boolean, or `Empty` (the contents cleared, as a put of
+        /// nothing and Range.ClearContents (113) do): the constant lands on
+        /// each cell's own format.
+        Value(CellValue),
+        /// A string, entered as if typed into each cell ([`Book::assign`]).
+        Text(String),
+    }
+
+    /// What an indexed property put is assigning. COM puts the named
     /// `DISPID_PROPERTYPUT` argument FIRST in `rgvarg`; an empty/omitted value
-    /// clears the cell, which is what Excel does.
+    /// clears the cell's contents, which is what Excel does.
     ///
     /// # Safety
     /// `params` must be null or a valid `DISPPARAMS`.
-    unsafe fn put_cell(params: *const DISPPARAMS) -> Cell {
+    unsafe fn put_arg(params: *const DISPPARAMS) -> Option<Put> {
         unsafe {
-            params
-                .as_ref()
-                .filter(|dp| dp.cArgs > 0 && dp.cNamedArgs > 0)
-                .and_then(|dp| variant_to_cell(&*dp.rgvarg))
-                .unwrap_or_default()
+            put_of(
+                params
+                    .as_ref()
+                    .filter(|dp| dp.cArgs > 0 && dp.cNamedArgs > 0)
+                    .map(|dp| &*dp.rgvarg),
+            )
         }
     }
 
-    /// Interpret a VARIANT the way Excel interprets a value assigned to a cell:
-    /// `=…` is a formula, other strings are text, bools are booleans, numbers are
-    /// numbers. `None` = empty/omitted (clear). App-specific (over gridcore).
-    fn variant_to_cell(v: &VARIANT) -> Option<Cell> {
-        let vt = unsafe { vt_of(v) };
-        match vt {
-            VT_EMPTY | VT_ERROR => None,
-            VT_BSTR => {
-                let s = BSTR::try_from(v).map(|b| b.to_string()).unwrap_or_default();
-                Some(match s.strip_prefix('=') {
-                    Some(f) if !f.is_empty() => Cell::formula(f),
-                    _ => Cell::text(&s),
-                })
-            }
-            VT_BOOL => {
-                let b = bool::try_from(v).unwrap_or(false);
-                Some(Cell {
-                    value: CellValue::Bool(b),
-                    ..Cell::default()
-                })
-            }
-            _ => f64::try_from(v).ok().map(Cell::number),
+    /// Interpret a VARIANT the way Excel interprets a value assigned to a
+    /// cell: a string as typed entry (`=…` a formula, `42` a number, `'…`
+    /// text), bools as booleans, numbers as numbers; empty/omitted (or null)
+    /// clears the contents. `None` for an array (`Range.Value = arr`), which
+    /// the shim cannot spread over cells: the put is refused
+    /// ([`DISP_E_TYPEMISMATCH`]) rather than read as nothing, which would
+    /// clear the range. App-specific (over gridcore).
+    fn put_of(v: Option<&VARIANT>) -> Option<Put> {
+        let Some(v) = v else {
+            return Some(Put::Value(CellValue::Empty));
+        };
+        if unsafe { vt_is_array(v) } {
+            return None;
         }
+        Some(match unsafe { vt_of(v) } {
+            VT_EMPTY | VT_ERROR => Put::Value(CellValue::Empty),
+            VT_BSTR => Put::Text(BSTR::try_from(v).map(|b| b.to_string()).unwrap_or_default()),
+            VT_BOOL => Put::Value(CellValue::Bool(bool::try_from(v).unwrap_or(false))),
+            _ => Put::Value(f64::try_from(v).map_or(CellValue::Empty, CellValue::Number)),
+        })
     }
 
     fn cellvalue_to_variant(v: &CellValue) -> VARIANT {
@@ -750,11 +854,10 @@ mod win {
         unsafe { out_var(ret, cellvalue_to_variant(&val)) }
     }
     unsafe fn vt_rng_value_put(t: &Range_Impl, val: *const VARIANT) -> HRESULT {
-        let cell = (unsafe { val.as_ref() })
-            .and_then(variant_to_cell)
-            .unwrap_or_default();
-        t.write_fill(cell);
-        S_OK
+        let Some(put) = put_of(unsafe { val.as_ref() }) else {
+            return DISP_E_TYPEMISMATCH;
+        };
+        t.write_fill(put).err().unwrap_or(S_OK)
     }
     unsafe fn vt_rng_formula_get(t: &Range_Impl, ret: *mut VARIANT) -> HRESULT {
         let (book, sheet, r1, c1) = (t.book, t.sheet, t.r1, t.c1);
@@ -774,17 +877,12 @@ mod win {
         unsafe { out_var(ret, v) }
     }
     unsafe fn vt_rng_formula_put(t: &Range_Impl, val: *const VARIANT) -> HRESULT {
-        let cell = match (unsafe { val.as_ref() }).and_then(variant_to_string) {
-            Some(s) => match s.strip_prefix('=') {
-                Some(f) if !f.is_empty() => Cell::formula(f),
-                _ => (unsafe { val.as_ref() })
-                    .and_then(variant_to_cell)
-                    .unwrap_or_default(),
-            },
-            None => Cell::default(),
+        // A formula put is a value put: `=…` enters as a formula, any other
+        // string as the typed value it spells.
+        let Some(put) = put_of(unsafe { val.as_ref() }) else {
+            return DISP_E_TYPEMISMATCH;
         };
-        t.write_fill(cell);
-        S_OK
+        t.write_fill(put).err().unwrap_or(S_OK)
     }
     unsafe fn vt_rng_item_put(
         t: &Range_Impl,
@@ -795,16 +893,14 @@ mod win {
         let rr = vi32(row).unwrap_or(1).max(1) as u32 - 1;
         let cc = vi32(col).unwrap_or(1).max(1) as u32 - 1;
         let (r, c) = (t.r1 + rr, t.c1 + cc);
-        let cell = (unsafe { val.as_ref() })
-            .and_then(variant_to_cell)
-            .unwrap_or_default();
+        let Some(put) = put_of(unsafe { val.as_ref() }) else {
+            return DISP_E_TYPEMISMATCH;
+        };
         let (book, sheet) = (t.book, t.sheet);
-        reg(|reg| {
-            if let Some(b) = reg.books.get_mut(book) {
-                b.set(sheet, r, c, cell);
-            }
-        });
-        S_OK
+        reg(|reg| match reg.books.get_mut(book) {
+            Some(b) => b.assign(sheet, (r, c, r, c), &put).err().unwrap_or(S_OK),
+            None => S_OK,
+        })
     }
 
     /// Sheet selector variant used by the early-bound Sheets.Item handler
@@ -1497,7 +1593,7 @@ mod win {
                             c2,
                         };
                         if is_put(wflags) {
-                            rng.write_fill(put_cell(params));
+                            rng.write_fill(put_arg(params).ok_or(DISP_E_TYPEMISMATCH)?)?;
                         } else {
                             put_obj(result, rng);
                         }
@@ -1533,7 +1629,7 @@ mod win {
                                     c2,
                                 };
                                 if is_put(wflags) {
-                                    rng.write_fill(put_cell(params));
+                                    rng.write_fill(put_arg(params).ok_or(DISP_E_TYPEMISMATCH)?)?;
                                 } else {
                                     put_obj(result, rng);
                                 }
@@ -1659,7 +1755,8 @@ mod win {
             "row" => 257,
             "column" => 240,
             "count" => 118,
-            "clearcontents" => 111,
+            "clear" => 111,
+            "clearcontents" => 113,
             "select" => 235,
             "mergecells" | "merge" => 564,
             // Navigation — these commonly POSITION a subsequent write, so they
@@ -1714,12 +1811,7 @@ mod win {
                             let Some(v) = arg(params, 0) else {
                                 return Ok(());
                             };
-                            let Some(cell) = variant_to_cell(v) else {
-                                // clearing
-                                self.write_fill(Cell::default());
-                                return Ok(());
-                            };
-                            self.write_fill(cell);
+                            self.write_fill(put_of(Some(v)).ok_or(DISP_E_TYPEMISMATCH)?)?;
                         } else {
                             let val = reg(|r| {
                                 r.books
@@ -1733,14 +1825,8 @@ mod win {
                     // Formula
                     261 | 264 => {
                         if is_put(wflags) {
-                            if let Some(s) = arg_string(params, 0) {
-                                let cell = match s.strip_prefix('=') {
-                                    Some(f) if !f.is_empty() => Cell::formula(f),
-                                    _ => {
-                                        variant_to_cell(arg(params, 0).unwrap()).unwrap_or_default()
-                                    }
-                                };
-                                self.write_fill(cell);
+                            if let Some(v) = arg(params, 0) {
+                                self.write_fill(put_of(Some(v)).ok_or(DISP_E_TYPEMISMATCH)?)?;
                             }
                         } else {
                             let f = reg(|r| {
@@ -1788,7 +1874,7 @@ mod win {
                             c2: c,
                         };
                         if is_put(wflags) {
-                            sub.write_fill(put_cell(params));
+                            sub.write_fill(put_arg(params).ok_or(DISP_E_TYPEMISMATCH)?)?;
                             return Ok(());
                         }
                         put_obj(
@@ -1917,7 +2003,10 @@ mod win {
                         let n = (r2 as u64 - r1 as u64 + 1) * (c2 as u64 - c1 as u64 + 1);
                         put(result, VARIANT::from(n.min(i32::MAX as u64) as i32))
                     }
-                    111 => self.write_fill(Cell::default()),
+                    // Clear drops values and formats; ClearContents keeps
+                    // the formats (Excel's DISPIDs, tools/comshim/excel-pia.txt).
+                    111 => self.write_fill(Put::Clear)?,
+                    113 => self.write_fill(Put::Value(CellValue::Empty))?,
                     235 | 564 => {} // Select / Merge — no-op in P1
                     // Offset(RowOffset, ColumnOffset) — shift the whole range.
                     254 => {
@@ -2016,25 +2105,21 @@ mod win {
     }
 
     impl Range {
-        /// Write `cell` into every cell of the range (scalar fill), guarding
-        /// against an unbounded whole-sheet range.
-        fn write_fill(&self, cell: Cell) {
+        /// Assign `put` to every cell of the range (scalar fill), guarding
+        /// against an unbounded whole-sheet range. `Err` when the cells
+        /// refuse the put ([`Book::assign`]); nothing is written then.
+        fn write_fill(&self, put: Put) -> std::result::Result<(), HRESULT> {
             let (book, sheet) = (self.book, self.sheet);
             let (r1, c1, r2, c2) = (self.r1, self.c1, self.r2, self.c2);
             let cells = (r2 as u64 - r1 as u64 + 1) * (c2 as u64 - c1 as u64 + 1);
             if cells > 1_000_000 {
                 log(&format!("write_fill: refusing huge range ({cells} cells)"));
-                return;
+                return Ok(());
             }
-            reg(|reg| {
-                if let Some(b) = reg.books.get_mut(book) {
-                    for r in r1..=r2 {
-                        for c in c1..=c2 {
-                            b.set(sheet, r, c, cell.clone());
-                        }
-                    }
-                }
-            });
+            reg(|reg| match reg.books.get_mut(book) {
+                Some(b) => b.assign(sheet, (r1, c1, r2, c2), &put),
+                None => Ok(()),
+            })
         }
     }
 
@@ -2434,6 +2519,156 @@ mod win {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// A Book whose cell (0, r, c) has the xf `xf`.
+        fn formatted(r: u32, c: u32, xf: Xf) -> Book {
+            let mut book = Book::new();
+            let style = book.pkg.workbook.styles.intern(xf);
+            book.set(
+                0,
+                r,
+                c,
+                Cell {
+                    style,
+                    ..Cell::default()
+                },
+            );
+            book
+        }
+
+        fn code_xf(code: &str) -> Xf {
+            let mut xf = Xf::default();
+            xf.set_code(Some(code.to_string()));
+            xf
+        }
+
+        fn cell(book: &Book, r: u32, c: u32) -> Cell {
+            book.pkg.workbook.sheets[0]
+                .cell(r, c)
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        fn text(s: &str) -> Put {
+            Put::Text(s.to_string())
+        }
+
+        #[test]
+        fn a_string_put_converts_like_typed_entry() {
+            let mut book = Book::new();
+            book.assign(0, (0, 0, 0, 0), &text("42")).unwrap();
+            assert_eq!(cell(&book, 0, 0).value, CellValue::Number(42.0));
+            book.assign(0, (1, 0, 1, 0), &text("1/15/2024")).unwrap();
+            let date = cell(&book, 1, 0);
+            assert_eq!(date.value, CellValue::Number(45_306.0));
+            let styles = &book.pkg.workbook.styles;
+            assert_eq!(styles.xf(date.style).code.as_deref(), Some("m/d/yyyy"));
+            book.assign(0, (2, 0, 2, 0), &text("$5")).unwrap();
+            let cash = cell(&book, 2, 0);
+            assert_eq!(cash.value, CellValue::Number(5.0));
+            let styles = &book.pkg.workbook.styles;
+            assert!(styles.xf(cash.style).code.is_some_and(|c| c.contains('$')));
+            book.assign(0, (3, 0, 3, 0), &text("'007")).unwrap();
+            let quoted = cell(&book, 3, 0);
+            assert_eq!(quoted.value, CellValue::Text("007".into()));
+            assert!(book.pkg.workbook.styles.xf(quoted.style).quote_prefix);
+            book.assign(0, (4, 0, 4, 0), &text("=A1*2")).unwrap();
+            assert_eq!(cell(&book, 4, 0).formula.as_deref(), Some("A1*2"));
+            assert_eq!(book.value(0, 4, 0), CellValue::Number(84.0));
+        }
+
+        #[test]
+        fn a_string_put_into_a_text_cell_stays_text() {
+            let mut book = formatted(0, 0, code_xf("@"));
+            book.assign(0, (0, 0, 0, 0), &text("42")).unwrap();
+            let c = cell(&book, 0, 0);
+            assert_eq!(c.value, CellValue::Text("42".into()));
+            assert_eq!(
+                book.pkg.workbook.styles.xf(c.style).code.as_deref(),
+                Some("@")
+            );
+        }
+
+        #[test]
+        fn a_value_put_keeps_the_cells_format() {
+            let xf = Xf {
+                bold: true,
+                ..code_xf("#,##0.00")
+            };
+            let mut book = formatted(0, 0, xf.clone());
+            book.assign(0, (0, 0, 0, 0), &Put::Value(CellValue::Number(5.0)))
+                .unwrap();
+            let c = cell(&book, 0, 0);
+            assert_eq!(c.value, CellValue::Number(5.0));
+            assert_eq!(book.pkg.workbook.styles.xf(c.style), xf);
+            // Emptying the contents keeps the format too; Clear drops it.
+            book.assign(0, (0, 0, 0, 0), &Put::Value(CellValue::Empty))
+                .unwrap();
+            let c = cell(&book, 0, 0);
+            assert_eq!(c.value, CellValue::Empty);
+            assert_eq!(book.pkg.workbook.styles.xf(c.style), xf);
+            book.assign(0, (0, 0, 0, 0), &Put::Clear).unwrap();
+            assert_eq!(cell(&book, 0, 0).style, 0);
+            // By name: ClearContents is 113 and empties the value (the
+            // format stays, above); Clear is 111 and resets the cell.
+            assert_eq!(range_id("ClearContents"), Some(113));
+            assert_eq!(range_id("Clear"), Some(111));
+            // A number over quote-prefixed text is no longer quoted.
+            let mut book = Book::new();
+            book.assign(0, (0, 0, 0, 0), &text("'007")).unwrap();
+            book.assign(0, (0, 0, 0, 0), &Put::Value(CellValue::Number(7.0)))
+                .unwrap();
+            let c = cell(&book, 0, 0);
+            assert!(!book.pkg.workbook.styles.xf(c.style).quote_prefix);
+        }
+
+        #[test]
+        fn an_array_put_is_refused_not_read_as_nothing() {
+            // VT_ARRAY | VT_VARIANT with no array behind it: only the tag is
+            // read, and the VARIANT is never dropped (there is nothing to free).
+            let mut v = std::mem::ManuallyDrop::new(VARIANT::default());
+            unsafe { *(&mut *v as *mut VARIANT as *mut u16) = VT_ARRAY | VT_VARIANT };
+            assert_eq!(put_of(Some(&v)), None);
+            assert_eq!(put_of(None), Some(Put::Value(CellValue::Empty)));
+            let n = VARIANT::from(5.0);
+            assert_eq!(put_of(Some(&n)), Some(Put::Value(CellValue::Number(5.0))));
+            let s = VARIANT::from(BSTR::from("42"));
+            assert_eq!(put_of(Some(&s)), Some(Put::Text("42".into())));
+        }
+
+        #[test]
+        fn an_unfinished_formula_put_is_refused_and_writes_nothing() {
+            let mut book = Book::new();
+            book.assign(0, (0, 0, 0, 0), &text("keep")).unwrap();
+            // Formula = "=SUM(A1" over A1:B2: an error, and nothing changed.
+            assert_eq!(book.assign(0, (0, 0, 1, 1), &text("=SUM(A1")), Err(E_FAIL));
+            assert_eq!(cell(&book, 0, 0).value, CellValue::Text("keep".into()));
+            assert!(book.pkg.workbook.sheets[0].cell(1, 1).is_none());
+            // Over the cell limit, the same.
+            let long = "x".repeat(gridcore::entry::MAX_CELL_CHARS + 1);
+            assert_eq!(book.assign(0, (0, 0, 0, 0), &Put::Text(long)), Err(E_FAIL));
+            assert_eq!(cell(&book, 0, 0).value, CellValue::Text("keep".into()));
+            // A Text cell stores it as text: nothing to refuse there.
+            let mut book = formatted(0, 0, code_xf("@"));
+            book.assign(0, (0, 0, 0, 0), &text("=SUM(A1")).unwrap();
+            assert_eq!(cell(&book, 0, 0).value, CellValue::Text("=SUM(A1".into()));
+            // A finished one is fine.
+            book.assign(0, (1, 0, 1, 0), &text("=SUM(A1)")).unwrap();
+            assert_eq!(cell(&book, 1, 0).formula.as_deref(), Some("SUM(A1)"));
+        }
+
+        #[test]
+        fn a_formula_put_on_a_range_moves_its_relative_references() {
+            let mut book = Book::new();
+            book.assign(0, (0, 1, 2, 1), &text("=A1")).unwrap();
+            let f = |r| cell(&book, r, 1).formula;
+            assert_eq!(f(0).as_deref(), Some("A1"));
+            assert_eq!(f(1).as_deref(), Some("A2"));
+            assert_eq!(f(2).as_deref(), Some("A3"));
+            // An absolute one stays put.
+            book.assign(0, (0, 2, 1, 2), &text("=$A$1")).unwrap();
+            assert_eq!(cell(&book, 1, 2).formula.as_deref(), Some("$A$1"));
+        }
 
         #[test]
         fn file_format_picks_the_kind_before_the_extension() {

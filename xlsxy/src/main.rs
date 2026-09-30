@@ -32,7 +32,7 @@ use backstage::BackstageHost as _;
 use gridcore::comments::Comment;
 use gridcore::edit::{fill_changes, replace_all_in_sheet};
 use gridcore::engine::Engine;
-use gridcore::entry::{entry_cell, entry_ctx, input_text_styled};
+use gridcore::entry::{entry_cell, entry_ctx, seed_text};
 use gridcore::formula::translate_formula;
 use gridcore::frame::Agg;
 use gridcore::model::{
@@ -885,13 +885,10 @@ fn print_usage() {
     );
 }
 
-/// Current time as an Excel serial (UTC — std has no timezone database).
+/// Current local time as an Excel serial: Excel's `TODAY()`/`NOW()`, and
+/// the year a typed `3/4` takes, follow the local clock.
 fn now_serial() -> Option<f64> {
-    let secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()?
-        .as_secs_f64();
-    Some(secs / 86_400.0 + 25_569.0)
+    gridcore::clock::local_now_serial()
 }
 
 fn entropy_seed() -> Option<u64> {
@@ -904,7 +901,7 @@ fn entropy_seed() -> Option<u64> {
 /// Current UTC time as an ISO-8601 string for threaded-comment timestamps.
 /// Falls back to the Excel epoch if the clock is unavailable.
 fn iso_now() -> String {
-    let serial = now_serial().unwrap_or(1.0);
+    let serial = gridcore::clock::utc_now_serial().unwrap_or(1.0);
     match gridcore::sheet::serial_to_parts(serial, false) {
         Some(p) => format!(
             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
@@ -1149,6 +1146,10 @@ struct EditState {
     text: String,
     cursor: usize, // char index
     replace: bool,
+    /// The cell's text the editor opened on (F2, Enter-to-edit), `None` when
+    /// typing replaced it. Committing it unchanged leaves the cell alone:
+    /// re-reading it would round a 17-digit number to Excel's 15.
+    seed: Option<String>,
 }
 
 /// One undoable action: cell states before/after, per address.
@@ -1617,6 +1618,7 @@ impl App {
         };
         let cursor = text.chars().count();
         self.edit = Some(EditState {
+            seed: initial.is_none().then(|| text.clone()),
             text,
             cursor,
             replace: initial.is_some(),
@@ -1625,13 +1627,15 @@ impl App {
     }
 
     /// What editing an existing cell starts from: the formula with `=`, or
-    /// the value as it would be re-entered (a quote prefix's `'` included).
+    /// the value as [`gridcore::entry::seed_text`] writes it (every digit of
+    /// a number, a percent cell's `150%`, a quote prefix's `'`), as gridwasm
+    /// and the suite seed theirs.
     fn current_input_text(&self) -> String {
         let (r, c) = self.cur;
         let styles = &self.pkg.workbook.styles;
         self.sheet()
             .cell(r, c)
-            .map(|cl| input_text_styled(cl, &styles.xf(cl.style)))
+            .map(|cl| seed_text(cl, &styles.xf(cl.style)))
             .unwrap_or_default()
     }
 
@@ -1643,7 +1647,13 @@ impl App {
         let Some(edit) = self.edit.take() else {
             return true;
         };
-        let text = edit.text;
+        let (text, seed) = (edit.text, edit.seed);
+        // A seeded editor left unchanged must not re-read the cell: `007` in
+        // a quote-prefixed cell is fine either way, but a stored
+        // 0.30000000000000004 would come back as 0.3.
+        if seed.as_deref() == Some(text.as_str()) {
+            return true;
+        }
         let (r, c) = self.cur;
         let formula = gridcore::entry::typed_formula(&self.pkg.workbook, self.sheet, r, c, &text);
         if let Some(Err(e)) = formula.map(Engine::validate) {
@@ -1652,6 +1662,7 @@ impl App {
                 cursor: text.chars().count(),
                 text,
                 replace: false,
+                seed,
             });
             return false;
         }
@@ -1671,6 +1682,7 @@ impl App {
                     cursor: text.chars().count(),
                     text,
                     replace: false,
+                    seed,
                 });
                 return false;
             }
@@ -2395,6 +2407,7 @@ impl App {
             const MAX_PASTE_CELLS: usize = 100_000;
             let mut changes = Vec::new();
             let mut truncated = false;
+            let ctx = entry_ctx(&self.pkg.workbook, now_serial());
             'outer: for (dr, line) in text.trim_end_matches('\n').split('\n').enumerate() {
                 for (dc, field) in line.trim_end_matches('\r').split('\t').enumerate() {
                     if changes.len() >= MAX_PASTE_CELLS {
@@ -2406,9 +2419,10 @@ impl App {
                         continue;
                     }
                     let style = self.sheet().cell(r, c).map(|x| x.style).unwrap_or(0);
-                    // A leading `'` pastes as quote-prefixed text.
-                    let mut cell =
-                        gridcore::entry::paste_cell(&mut self.pkg.workbook.styles, style, field);
+                    // Read as typed into the target (a leading `'` is
+                    // quote-prefixed text, a date brings its format).
+                    let styles = &mut self.pkg.workbook.styles;
+                    let mut cell = gridcore::entry::paste_cell(styles, style, field, &ctx);
                     // A pasted `=…` that doesn't parse would freeze as an
                     // unsupported cell; demote it to literal text instead
                     // (entry-time editing rejects such input outright).
@@ -5813,11 +5827,7 @@ fn draw(app: &mut App, f: &mut Frame) {
                     Some(cl) if formula_view && cl.formula.is_some() => {
                         format!("={}", cl.formula.as_ref().unwrap())
                     }
-                    // A date/time it cannot show fills the cell with `#`.
-                    Some(cl) if date_unrepresentable(&xf, &cl.value, date1904) => {
-                        "#".repeat(w as usize)
-                    }
-                    Some(cl) => format_with(&xf, &cl.value, date1904),
+                    Some(cl) => grid_text(&xf, &cl.value, date1904, w),
                     None => String::new(),
                 }
             };
@@ -6107,6 +6117,23 @@ fn center(s: &str, w: usize) -> String {
     }
     let lead = (w - width) / 2;
     format!("{}{}{}", " ".repeat(lead), s, " ".repeat(w - width - lead))
+}
+
+/// What a grid cell `w` columns wide (a merge's whole span) shows for
+/// `value`: a date/time it cannot show fills it with `#`; a General number
+/// is fitted as Excel's General shows it (at most 11 characters, fewer
+/// decimals or scientific when narrower; `fit` keeps one column for the
+/// trailing space); anything else is its formatted text.
+fn grid_text(xf: &gridcore::sheet::Xf, value: &CellValue, date1904: bool, w: u16) -> String {
+    if date_unrepresentable(xf, value, date1904) {
+        return "#".repeat(w as usize);
+    }
+    match value {
+        CellValue::Number(n) if gridcore::entry::is_general(xf) => {
+            gridcore::sheet::fmt_general_cell(*n, (w as usize).saturating_sub(1))
+        }
+        _ => format_with(xf, value, date1904),
+    }
 }
 
 /// How many screen lines a row occupies: derived from an explicit row height
@@ -9759,6 +9786,80 @@ mod tests {
     }
 
     #[test]
+    fn a_general_number_is_fitted_to_its_column() {
+        let general = gridcore::sheet::Xf::default();
+        let big = CellValue::Number(123_456_789_012.0);
+        // A wide column still stops at General's 11 characters; a narrower
+        // one shortens further; the stored value keeps every digit.
+        assert_eq!(grid_text(&general, &big, false, 20), "1.23457E+11");
+        assert_eq!(grid_text(&general, &big, false, 9), "1.23E+11");
+        assert_eq!(grid_text(&general, &big, false, 3), "##");
+        assert_eq!(
+            grid_text(&general, &CellValue::Number(42.0), false, 9),
+            "42"
+        );
+        // A number format is not General: it keeps its own text.
+        let mut fixed = gridcore::sheet::Xf::default();
+        fixed.set_code(Some("0.00".into()));
+        assert_eq!(grid_text(&fixed, &CellValue::Number(1.5), false, 9), "1.50");
+        // Drawn: the default column shows the fitted text, not the digits.
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        // Off the cursor (A1), so the formula bar does not show its digits.
+        app.pkg.workbook.sheets[0].set_cell(2, 1, gridcore::sheet::Cell::number(123_456_789_012.0));
+        app.rebuild_engine();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        let text = format!("{:?}", term.backend().buffer());
+        assert!(!text.contains("123456789012"), "full digits drawn");
+        assert!(text.contains("E+11"), "fitted text missing");
+    }
+
+    #[test]
+    fn a_copy_pasted_between_text_and_general_cells_is_the_same_cells() {
+        use gridcore::sheet::Xf;
+        let mut pkg = new_xlsx();
+        let styles = &mut pkg.workbook.styles;
+        let quoted = styles.intern(Xf {
+            quote_prefix: true,
+            ..Xf::default()
+        });
+        let mut text_xf = Xf::default();
+        text_xf.set_code(Some("@".into()));
+        let text_fmt = styles.intern(text_xf);
+        let q007 = Cell {
+            style: quoted,
+            ..Cell::text("007")
+        };
+        let tabc = Cell {
+            style: text_fmt,
+            ..Cell::text("'abc")
+        };
+        let sh = &mut pkg.workbook.sheets[0];
+        sh.set_cell(0, 0, q007.clone());
+        sh.set_cell(0, 1, tabc.clone());
+        sh.set_cell(
+            2,
+            0,
+            Cell {
+                style: text_fmt,
+                ..Cell::default()
+            },
+        );
+        sh.set_cell(2, 1, Cell::text("x"));
+        let mut app = App::new(pkg, "t.xlsx");
+        app.os_clip = None; // the internal clip, as when the OS text is ours
+        app.cur = (0, 0);
+        app.anchor = Some((0, 1));
+        app.copy(false);
+        app.anchor = None;
+        app.cur = (2, 0);
+        app.paste();
+        assert_eq!(app.sheet().cell(2, 0), Some(&q007));
+        assert_eq!(app.sheet().cell(2, 1), Some(&tabc));
+    }
+
+    #[test]
     fn merged_cells_render_spanned() {
         use gridcore::sheet::Cell;
         use ratatui::Terminal;
@@ -10477,6 +10578,65 @@ mod tests {
             "rename lost on reload: {names:?}"
         );
         assert!(!names.contains(&"Data"), "stale name survived: {names:?}");
+    }
+
+    #[test]
+    fn f2_enter_keeps_every_digit_and_typing_over_still_converts() {
+        let mut pkg = new_xlsx();
+        let noisy = 0.1 + 0.2;
+        pkg.workbook.sheets[0].set_cell(0, 0, Cell::number(noisy));
+        pkg.workbook.sheets[0].set_cell(1, 0, Cell::text("5"));
+        let mut app = App::new(pkg, "t.xlsx");
+        app.os_clip = None;
+        app.cur = (0, 0);
+        // The seed is the stored number in full, as gridwasm and the suite
+        // seed it, and committing it unchanged changes nothing.
+        assert_eq!(app.current_input_text(), "0.30000000000000004");
+        app.start_edit(None);
+        assert!(app.commit_edit());
+        let a1 = app.sheet().cell(0, 0).unwrap().value.clone();
+        assert_eq!(a1, CellValue::Number(noisy));
+        assert!(app.undo.is_empty(), "an unchanged edit adds no undo step");
+        // Typing over a text 5 with 5 is a fresh entry: it becomes a number.
+        app.cur = (1, 0);
+        app.start_edit(Some('5'));
+        assert!(app.commit_edit());
+        let a2 = app.sheet().cell(1, 0).unwrap().value.clone();
+        assert_eq!(a2, CellValue::Number(5.0));
+        // F2 on the same text 5 and Enter keeps it text.
+        app.pkg.workbook.sheets[0].set_cell(1, 0, Cell::text("5"));
+        app.start_edit(None);
+        assert!(app.commit_edit());
+        let a2 = app.sheet().cell(1, 0).unwrap().value.clone();
+        assert_eq!(a2, CellValue::Text("5".into()));
+    }
+
+    #[test]
+    fn a_percent_cell_seeds_its_percent() {
+        let mut pkg = new_xlsx();
+        let mut xf = gridcore::sheet::Xf::default();
+        xf.set_code(Some("0%".into()));
+        let style = pkg.workbook.styles.intern(xf);
+        pkg.workbook.sheets[0].set_cell(
+            0,
+            0,
+            Cell {
+                style,
+                ..Cell::number(1.5)
+            },
+        );
+        let mut app = App::new(pkg, "t.xlsx");
+        app.os_clip = None;
+        app.cur = (0, 0);
+        assert_eq!(app.current_input_text(), "150%");
+        // Edited to 160%, it is 1.6, not 0.016.
+        app.start_edit(None);
+        if let Some(e) = app.edit.as_mut() {
+            e.text = "160%".into();
+        }
+        assert!(app.commit_edit());
+        let a1 = app.sheet().cell(0, 0).unwrap().value.clone();
+        assert_eq!(a1, CellValue::Number(1.6));
     }
 
     #[test]
