@@ -41,6 +41,15 @@ pub(crate) enum DialogOwner {
     SortTable,
     TableToText,
     TextToTable,
+    /// Excel's Convert Text to Columns Wizard over one column (#692).
+    TextToColumns {
+        sheet: usize,
+        col: u32,
+        r1: u32,
+        r2: u32,
+    },
+    /// Its "Do you want to replace the contents of the destination cells?".
+    TextToColumnsReplace,
     /// A dialog the model tests build; the app never applies one.
     #[cfg(test)]
     Test,
@@ -786,6 +795,14 @@ impl DialogStack {
     }
     pub fn push(&mut self, dialog: Dialog) {
         self.0.push(dialog);
+    }
+    /// The dialog under the top one (a message box's parent).
+    pub fn under_top(&self) -> Option<&Dialog> {
+        self.0.iter().rev().nth(1)
+    }
+    /// Close the top dialog: its owner has handled it.
+    pub fn pop(&mut self) {
+        self.0.pop();
     }
     /// Dismiss every dialog without applying any: the document under them
     /// changed some other way (an agent's edit, a reload).

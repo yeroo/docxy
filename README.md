@@ -212,7 +212,7 @@ evaluate yet keep Excel's cached results and are saved untouched.
 ```sh
 xlsxy book.xlsx                   # open a workbook (grid, formula bar, tabs)
 xlsxy in.xlsx --recalc out.xlsx   # headless: recalculate everything, save
-xlsxy in.xlsx --csv out.csv       # headless: export the first sheet as CSV
+xlsxy in.xlsx --csv out.csv       # headless: export the active sheet as CSV UTF-8
 xlsxy corpus/xlsx/*.xlsx --verify # conformance scoreboard: recalc + diff
                                   # against cached values (461/461 = 100%
                                   # on the LibreOffice-oracle corpus)

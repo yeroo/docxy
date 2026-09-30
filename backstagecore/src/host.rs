@@ -10,6 +10,12 @@ pub trait BackstageHost {
     fn preview_lines(&self, path: &Path, width: usize) -> Vec<String>;
     fn info_lines(&self) -> Vec<ratatui::text::Line<'static>>;
     fn accent(&self) -> ratatui::style::Color;
+    /// The *Save as type* Save As opens on (an index into the host's
+    /// types): the type the document is bound to. `None` lets the name's
+    /// extension pick it. Only hosts with a type list need it.
+    fn default_save_type(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// The app-level action requested by a `key`/`mouse` call on [`crate::Backstage`].

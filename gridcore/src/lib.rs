@@ -23,6 +23,8 @@
 //!   (powers `TEXT()` and cell display).
 //! - [`mod@format`] — `cell.format` patch parsing/application and its `Xf`
 //!   read-back mapping, shared by every host's agent-facing format verb.
+//! - [`textio`] — delimited/fixed-width text in and out (CSV open, the Text
+//!   Import Wizard, Text to Columns, Save As text types).
 //! - [`xlsx`] — `.xlsx` bytes ⇄ [`sheet::Workbook`] with part preservation.
 
 pub mod cf;
@@ -41,4 +43,5 @@ pub mod pivot;
 pub mod pivotcalc;
 pub mod sheet;
 pub mod stats;
+pub mod textio;
 pub mod xlsx;

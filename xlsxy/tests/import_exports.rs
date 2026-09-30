@@ -232,3 +232,78 @@ fn recalc_keeps_a_rich_spill_error() {
         "{ws}"
     );
 }
+
+/// #604's workbook as openpyxl writes it on Windows: the second sheet is
+/// active, and a line break inside a cell is a literal CR LF in the XML.
+fn active_second_sheet_xlsx() -> Vec<u8> {
+    let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    let rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    let sheet1 = format!(
+        r#"<worksheet xmlns="{ns}"><sheetViews><sheetView workbookViewId="0"/></sheetViews><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>wrong sheet</t></is></c></row></sheetData></worksheet>"#
+    );
+    let sheet2 = format!(
+        "<worksheet xmlns=\"{ns}\"><sheetViews><sheetView tabSelected=\"1\" workbookViewId=\"0\"/></sheetViews><sheetData>\
+         <row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>Name</t></is></c><c r=\"B1\" t=\"inlineStr\"><is><t>Note</t></is></c></row>\
+         <row r=\"2\"><c r=\"A2\" t=\"inlineStr\"><is><t>Z\u{fc}rich</t></is></c><c r=\"B2\" t=\"inlineStr\"><is><t>line1\r\nline2</t></is></c></row>\
+         </sheetData></worksheet>"
+    );
+    let workbook = format!(
+        r#"<workbook xmlns="{ns}" xmlns:r="{rel}"><bookViews><workbookView activeTab="1"/></bookViews><sheets><sheet name="First" sheetId="1" r:id="rId1"/><sheet name="Data" sheetId="2" r:id="rId2"/></sheets></workbook>"#
+    );
+    let wb_rels = format!(
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{rel}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="{rel}/worksheet" Target="worksheets/sheet2.xml"/></Relationships>"#
+    );
+    let root_rels = format!(
+        r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{rel}/officeDocument" Target="xl/workbook.xml"/></Relationships>"#
+    );
+    let content_types = r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#;
+    opccore::zipwrite::write_zip(&[
+        (
+            "[Content_Types].xml".into(),
+            content_types.as_bytes().to_vec(),
+        ),
+        ("_rels/.rels".into(), root_rels.into_bytes()),
+        ("xl/workbook.xml".into(), workbook.into_bytes()),
+        ("xl/_rels/workbook.xml.rels".into(), wb_rels.into_bytes()),
+        ("xl/worksheets/sheet1.xml".into(), sheet1.into_bytes()),
+        ("xl/worksheets/sheet2.xml".into(), sheet2.into_bytes()),
+    ])
+}
+
+/// #604: `--csv` writes Excel's CSV UTF-8 of the active sheet, byte for byte.
+#[test]
+fn csv_export_is_excels_csv_utf8_of_the_active_sheet() {
+    let dir = Dir::new("active-csv");
+    let source = dir.0.join("in.xlsx");
+    std::fs::write(&source, active_second_sheet_xlsx()).unwrap();
+    let out = dir.0.join("out.csv");
+    let result = run(&source, "--csv", &out);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let mut want = b"\xEF\xBB\xBF".to_vec();
+    want.extend_from_slice("Name,Note\r\nZ\u{fc}rich,\"line1\nline2\"\r\n".as_bytes());
+    assert_eq!(std::fs::read(&out).unwrap(), want);
+}
+
+/// #607: headless runs import a .txt with the Text Import Wizard's defaults
+/// (tab-delimited, fields converted) rather than failing to read it as XLSX.
+#[test]
+fn a_text_file_converts_headlessly_with_the_wizard_defaults() {
+    let dir = Dir::new("txt-headless");
+    let source = dir.0.join("in.txt");
+    std::fs::write(&source, "name\tqty\r\nPen\t4\r\n").unwrap();
+    let out = dir.0.join("out.csv");
+    let result = run(&source, "--csv", &out);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        b"\xEF\xBB\xBFname,qty\r\nPen,4\r\n"
+    );
+}

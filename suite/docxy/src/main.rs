@@ -45,6 +45,7 @@ mod table_dialogs;
 mod table_tab;
 mod table_view;
 mod tabstrip;
+mod ttc_dialog;
 use project::*;
 
 use std::path::PathBuf;
@@ -625,8 +626,6 @@ enum RefTarget {
     Validation,
     /// The rows a sort runs over.
     Sort,
-    /// The cells Text-to-Columns splits.
-    TextToColumns,
 }
 
 impl RefTarget {
@@ -642,10 +641,7 @@ impl RefTarget {
     fn is_bar(self) -> bool {
         matches!(
             self,
-            RefTarget::CondFormat
-                | RefTarget::Validation
-                | RefTarget::Sort
-                | RefTarget::TextToColumns
+            RefTarget::CondFormat | RefTarget::Validation | RefTarget::Sort
         )
     }
 }
@@ -656,7 +652,6 @@ fn bar_target(act: SheetAct) -> Option<RefTarget> {
         SheetAct::CondFormat => Some(RefTarget::CondFormat),
         SheetAct::DataValidation => Some(RefTarget::Validation),
         SheetAct::CustomSort => Some(RefTarget::Sort),
-        SheetAct::TextToColumns => Some(RefTarget::TextToColumns),
         _ => None,
     }
 }
@@ -2090,8 +2085,6 @@ struct Docxy {
     sheet_dv_edit: Option<String>,
     // In-progress AutoFilter criteria entry for the selected column.
     sheet_filter_edit: Option<String>,
-    // In-progress Text-to-Columns delimiter entry.
-    sheet_ttc_edit: Option<String>,
     // In-progress multi-level sort spec entry ("B asc, C desc").
     sheet_sort_edit: Option<String>,
     // In-progress row-height entry (points, or "auto").
@@ -2254,19 +2247,6 @@ fn probe_tracked(
         probe_with_reflow(cell, name, move |b| expected != Some(b))
     } else {
         probe(cell, name)
-    }
-}
-
-/// Parse a delimiter word/char: "tab" -> \t, "space" -> ' ', else the first
-/// character (default comma).
-fn parse_delim(s: &str) -> char {
-    match s.trim().to_lowercase().as_str() {
-        "" | "comma" => ',',
-        "tab" => '\t',
-        "space" => ' ',
-        "semicolon" => ';',
-        "pipe" => '|',
-        other => other.chars().next().unwrap_or(','),
     }
 }
 
@@ -5585,7 +5565,7 @@ fn chart_panel_shown(shown: Option<usize>, n_charts: usize) -> Option<usize> {
 ///
 /// The panel is not the only thing that can hold a live field, though.
 /// `run_sheet_act` hands the chart back WITHOUT shutting the panel, so a bar
-/// field — Data Validation, Sort, Text to Columns — can be pointing at the grid
+/// field — Conditional Formatting, Data Validation, Sort — can be pointing at the grid
 /// with a chart panel open behind it. That field belongs to the sheet. Letting
 /// it keep the keyboard while the card takes the selection is exactly the
 /// two-things-selected split this plan set out to remove, so only the panel's
@@ -5793,9 +5773,9 @@ fn bar_range_text(text: &str, sheet: &str) -> Result<String, String> {
 ///   validated are, and those are commonly on a different sheet from the one
 ///   the rule is built on (a lookup sheet holding the list, an entry sheet
 ///   holding the boxes).
-/// - `CondFormat`, `Sort` and `TextToColumns` refuse. Each acts on the rows in
-///   front of you: a rule paints these cells, a sort reorders these rows, a
-///   split rewrites these columns. A qualifier naming elsewhere is a mistake,
+/// - `CondFormat` and `Sort` refuse. Each acts on the rows in front of you: a
+///   rule paints these cells, a sort reorders these rows. A qualifier naming
+///   elsewhere is a mistake,
 ///   and the existing message says so rather than acting on the same-named
 ///   cells here.
 /// - `ChartTitle` isn't a range at all, so nothing resolves; it answers `false`
@@ -5807,10 +5787,7 @@ fn target_takes_foreign_sheet(target: RefTarget) -> bool {
         | RefTarget::SeriesValues(_)
         | RefTarget::Categories
         | RefTarget::Validation => true,
-        RefTarget::CondFormat
-        | RefTarget::Sort
-        | RefTarget::TextToColumns
-        | RefTarget::ChartTitle => false,
+        RefTarget::CondFormat | RefTarget::Sort | RefTarget::ChartTitle => false,
     }
 }
 
@@ -6625,7 +6602,6 @@ impl Docxy {
             sheet_cf_edit: None,
             sheet_dv_edit: None,
             sheet_filter_edit: None,
-            sheet_ttc_edit: None,
             sheet_sort_edit: None,
             sheet_rowh_edit: None,
             bar_field: None,
@@ -7556,10 +7532,9 @@ impl Docxy {
             RefTarget::SeriesValues(i) => self.series_apply_values(i, text, cx),
             RefTarget::SeriesName(i) => self.series_apply_name(i, text, cx),
             RefTarget::Categories => self.categories_apply(text, cx),
-            RefTarget::CondFormat
-            | RefTarget::Validation
-            | RefTarget::Sort
-            | RefTarget::TextToColumns => self.bar_range_apply(target, text, cx),
+            RefTarget::CondFormat | RefTarget::Validation | RefTarget::Sort => {
+                self.bar_range_apply(target, text, cx)
+            }
         }
     }
 
@@ -7626,10 +7601,10 @@ impl Docxy {
     /// Open a bar's range field. It starts unpinned, so until the user types a
     /// range or points at one the bar still acts on the selection.
     fn bar_open(&mut self, target: RefTarget) {
-        // The four bars share ONE `bar_field`/`bar_range`, and `sheet_key`
+        // The three bars share ONE `bar_field`/`bar_range`, and `sheet_key`
         // routes to whichever is open first. Leaving a second one on screen
-        // therefore aims the first at cells pinned for the other — Text to
-        // Columns splitting the Sort bar's whole region, say. Only one at a
+        // therefore aims the first at cells pinned for the other — a
+        // conditional format painting the Sort bar's whole region, say. Only one at a
         // time, which is also what the keyboard already assumed.
         self.bar_close();
         // `bar_close` only drops a field belonging to a bar. A Chart panel field
@@ -7739,7 +7714,6 @@ impl Docxy {
     fn bar_close(&mut self) {
         self.sheet_cf_edit = None;
         self.sheet_dv_edit = None;
-        self.sheet_ttc_edit = None;
         self.sheet_sort_edit = None;
         self.bar_field = None;
         self.bar_range = None;
@@ -9734,47 +9708,6 @@ impl Docxy {
         cx.notify();
     }
 
-    /// Route a keystroke into the Text-to-Columns delimiter bar. Enter splits the
-    /// selected column's rows by the delimiter into the columns to the right.
-    fn sheet_ttc_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
-        let Some(mut buf) = self.sheet_ttc_edit.clone() else {
-            return;
-        };
-        match key {
-            "escape" => {
-                self.sheet_ttc_edit = None;
-                self.bar_close();
-            }
-            "enter" => {
-                let delim = parse_delim(&buf);
-                if let Some((r0, c0, r1, _)) = self.bar_cells() {
-                    self.sheet_snapshot();
-                    if let Some(v) = self.active_sheet_mut() {
-                        let s = v.active;
-                        gridcore::edit::text_to_columns(&mut v.pkg.workbook, s, c0, r0, r1, delim);
-                        v.engine = sheet_engine(&v.pkg.workbook);
-                    }
-                    self.mark_sheet_dirty();
-                }
-                self.sheet_ttc_edit = None;
-                self.bar_close();
-            }
-            "backspace" => {
-                buf.pop();
-                self.sheet_ttc_edit = Some(buf);
-            }
-            _ => {
-                if let Some(c) = ev.keystroke.key_char.as_deref() {
-                    if !c.is_empty() && !c.chars().next().unwrap().is_control() {
-                        buf.push_str(c);
-                    }
-                }
-                self.sheet_ttc_edit = Some(buf);
-            }
-        }
-        cx.notify();
-    }
-
     /// Route a keystroke into the AutoFilter criteria bar (Enter applies, Esc cancels).
     fn sheet_filter_key(&mut self, ev: &KeyDownEvent, key: &str, cx: &mut Context<Self>) {
         let Some(mut buf) = self.sheet_filter_edit.clone() else {
@@ -11755,8 +11688,14 @@ impl Docxy {
             SheetAct::ProtectSheet => self.sheet_toggle_protection(cx),
             SheetAct::Subtotal => self.sheet_subtotal(cx),
             SheetAct::Outline => self.sheet_toggle_outline(cx),
+            // Excel's Convert Text to Columns Wizard, as a form dialog.
             SheetAct::TextToColumns => {
-                self.sheet_ttc_edit = Some(String::new());
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    match ttc_dialog::dialog(tab) {
+                        Ok(d) => tab.dialogs.push(d),
+                        Err(e) => tab.status = e.into(),
+                    }
+                }
                 cx.notify();
             }
             SheetAct::NumberFormatMenu => {
@@ -11813,10 +11752,6 @@ impl Docxy {
         // The AutoFilter criteria bar swallows typing too.
         if self.sheet_filter_edit.is_some() {
             return self.sheet_filter_key(ev, key, cx);
-        }
-        // The Text-to-Columns delimiter bar swallows typing too.
-        if to_bar(self.sheet_ttc_edit.is_some()) {
-            return self.sheet_ttc_key(ev, key, cx);
         }
         // The multi-level sort spec bar swallows typing too.
         if to_bar(self.sheet_sort_edit.is_some()) {
@@ -19275,75 +19210,6 @@ impl Docxy {
         self.ref_field(id, target, value, hint, "", cx)
     }
 
-    /// The Text-to-Columns delimiter bar.
-    fn sheet_ttc_bar(&self, buf: &str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let ent_cancel = cx.entity();
-        h_flex()
-            .w_full()
-            .min_h(px(30.))
-            .py(px(3.))
-            .items_center()
-            .gap_2()
-            .px_2()
-            .bg(pal.panel)
-            .border_b_1()
-            .border_color(pal.border)
-            .child(div().text_size(px(12.)).text_color(pal.dim).child("Split"))
-            .child(div().w(px(160.)).child(self.bar_range_field(
-                "ttc-range",
-                RefTarget::TextToColumns,
-                cx,
-            )))
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(pal.dim)
-                    .child("by delimiter:"),
-            )
-            .child(
-                div()
-                    .w(px(150.))
-                    .h(px(22.))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .rounded_sm()
-                    .bg(hsla_u(0xffffff))
-                    .border_1()
-                    .border_color(hsla_u(BRAND))
-                    .text_size(px(12.))
-                    .text_color(hsla_u(0x1a1a1a))
-                    .child(div().child(SharedString::from(if buf.is_empty() {
-                        "comma (or tab, space, ;)".to_string()
-                    } else {
-                        buf.to_string()
-                    })))
-                    .child(div().w(px(1.5)).h(px(13.)).ml(px(1.)).bg(hsla_u(BRAND))),
-            )
-            .child(
-                div()
-                    .id("ttc-cancel")
-                    .px_2()
-                    .py(px(2.))
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .text_size(px(12.))
-                    .bg(pal.panel)
-                    .text_color(pal.fg)
-                    .border_1()
-                    .border_color(pal.border)
-                    .child("Cancel")
-                    .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
-                        ent_cancel.update(cx, |this, cx| {
-                            this.sheet_ttc_edit = None;
-                            this.bar_close();
-                            cx.notify();
-                        });
-                    }),
-            )
-            .into_any_element()
-    }
-
     /// The AutoFilter criteria bar: type a comparison on the current column.
     fn sheet_filter_bar(&self, buf: &str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         use gridcore::sheet::col_name;
@@ -21318,10 +21184,6 @@ impl Render for Docxy {
             .sheet_filter_edit
             .clone()
             .map(|buf| self.sheet_filter_bar(&buf, pal, cx));
-        let sheet_ttc = self
-            .sheet_ttc_edit
-            .clone()
-            .map(|buf| self.sheet_ttc_bar(&buf, pal, cx));
         let sheet_sort = self
             .sheet_sort_edit
             .clone()
@@ -21998,7 +21860,6 @@ impl Render for Docxy {
             .when_some(sheet_cf, |d, c| d.child(c))
             .when_some(sheet_dv_bar, |d, c| d.child(c))
             .when_some(sheet_filter, |d, c| d.child(c))
-            .when_some(sheet_ttc, |d, c| d.child(c))
             .when_some(sheet_sort, |d, c| d.child(c))
             .when_some(sheet_rowh, |d, c| d.child(c))
             .when_some(project_prompt, |d, c| d.child(c))
@@ -28916,10 +28777,8 @@ mod grid_geom_tests {
             Some(RefTarget::Validation)
         );
         assert_eq!(bar_target(SheetAct::CustomSort), Some(RefTarget::Sort));
-        assert_eq!(
-            bar_target(SheetAct::TextToColumns),
-            Some(RefTarget::TextToColumns)
-        );
+        // Text to Columns opens a wizard dialog, not a bar (#692).
+        assert_eq!(bar_target(SheetAct::TextToColumns), None);
         // The bars without a range field — and everything else — get none.
         assert_eq!(bar_target(SheetAct::Filter), None);
         assert_eq!(bar_target(SheetAct::RowHeight), None);
@@ -28965,10 +28824,11 @@ mod grid_geom_tests {
             SheetAct::CondFormat,
             SheetAct::DataValidation,
             SheetAct::CustomSort,
-            SheetAct::TextToColumns,
         ] {
             assert!(super::bar_target(act).is_some() && act_targets_cells(act));
         }
+        // The Text to Columns wizard converts the selected column.
+        assert!(act_targets_cells(SheetAct::TextToColumns));
         // The three exceptions: two whole-sheet properties and the inert stub.
         assert!(!act_targets_cells(SheetAct::ProtectSheet));
         assert!(!act_targets_cells(SheetAct::Outline));
@@ -28982,7 +28842,6 @@ mod grid_geom_tests {
             RefTarget::CondFormat,
             RefTarget::Validation,
             RefTarget::Sort,
-            RefTarget::TextToColumns,
         ] {
             assert!(
                 t.is_bar(),
@@ -29114,10 +28973,9 @@ mod grid_geom_tests {
         // A dropdown is read where the boxes are, which is commonly not the
         // sheet the list was typed on.
         assert!(takes(Validation));
-        // A rule, a sort and a split act on the rows in front of you.
+        // A rule and a sort act on the rows in front of you.
         assert!(!takes(CondFormat));
         assert!(!takes(Sort));
-        assert!(!takes(TextToColumns));
         // Not a range at all — the question doesn't apply.
         assert!(!takes(ChartTitle));
     }
@@ -29180,11 +29038,7 @@ mod grid_geom_tests {
     fn a_rule_a_sort_and_a_split_still_refuse_another_sheet() {
         use super::{RefTarget, bar_ref_text};
         let wb: Vec<String> = ["Sheet1", "Lookup"].iter().map(|s| s.to_string()).collect();
-        for target in [
-            RefTarget::CondFormat,
-            RefTarget::Sort,
-            RefTarget::TextToColumns,
-        ] {
+        for target in [RefTarget::CondFormat, RefTarget::Sort] {
             // Refused even though the sheet EXISTS — the objection is that
             // these act on the rows in view, not that the name is unknown.
             assert_eq!(
@@ -29219,7 +29073,6 @@ mod grid_geom_tests {
             RefTarget::CondFormat,
             RefTarget::Validation,
             RefTarget::Sort,
-            RefTarget::TextToColumns,
         ] {
             for active in 0..wb.len() {
                 let seed = ref_a1(Some(wb[active].as_str()), (1, 1, 4, 3));
@@ -29704,7 +29557,6 @@ mod grid_geom_tests {
             RefTarget::CondFormat,
             RefTarget::Validation,
             RefTarget::Sort,
-            RefTarget::TextToColumns,
         ] {
             assert!(
                 !keeps_panel_field(Some(3), 3, Some(f)),

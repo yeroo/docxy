@@ -10,9 +10,13 @@ pub enum Item {
     Save,
     SaveAs,
     Export,
+    /// The host's options page (only hosts that ask for it, see
+    /// [`Backstage::with_options`]).
+    Options,
     Exit,
 }
 
+/// The items every host shows; [`Backstage::items`] adds any a host opted in to.
 pub const ITEMS: [Item; 7] = [
     Item::New,
     Item::Open,
@@ -32,9 +36,27 @@ impl Item {
             Item::Save => "Save",
             Item::SaveAs => "Save As",
             Item::Export => "Export",
+            Item::Options => "Options",
             Item::Exit => "Exit",
         }
     }
+}
+
+/// One entry of Save As's *Save as type* list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SaveType {
+    pub label: &'static str,
+    /// The extension the type gives the file name, without the dot.
+    pub ext: &'static str,
+}
+
+/// `name` with its extension replaced by (or, without one, given) `ext`.
+pub(crate) fn with_extension(name: &str, ext: &str) -> String {
+    let stem = match name.rfind('.') {
+        Some(i) if i > 0 => &name[..i],
+        _ => name,
+    };
+    format!("{stem}.{ext}")
 }
 
 /// One folder-browser row.
@@ -76,6 +98,10 @@ pub enum Pane {
     Preview,
     /// The Save As dialog (folder browser + typed file name).
     SaveAs,
+    /// The Options page's checkboxes.
+    Options,
+    /// Export's list: the host's quick export, then Change File Type.
+    Export,
 }
 
 /// Click rects and scroll offsets recorded by `draw` (Task 3) and read by
@@ -85,6 +111,8 @@ pub struct BackstageLayout {
     pub list_start: usize,
     pub save_btn: Rect,
     pub name_top: u16,
+    /// Top row of the Save As *Save as type* box (when the host has types).
+    pub type_top: u16,
     pub name_x0: u16,
     pub preview_h: usize,
 }
@@ -108,9 +136,33 @@ pub struct Backstage {
     pub name_input: String,
     /// Caret position (char index) within `name_input`.
     pub name_cursor: usize,
-    /// In Save As: true when the file-name field is focused (accepting edits),
-    /// false when the folder browser is focused.
+    /// In Save As: true when the file-name field is focused (accepting edits).
+    /// Save As has three focus targets: this field, the *Save as type* box
+    /// ([`Backstage::type_focus`], when the host has types) and the folder
+    /// browser (neither flag set).
     pub name_focus: bool,
+    /// The menu, in display order.
+    items: Vec<Item>,
+    /// The Options page: its heading and each checkbox (label, on).
+    pub options_title: String,
+    pub options: Vec<(String, bool)>,
+    /// The highlighted checkbox.
+    pub option_sel: usize,
+    /// Save As's *Save as type* list (empty: no list, as docxy has none).
+    pub save_types: &'static [SaveType],
+    /// The type shown in Save As.
+    pub type_sel: usize,
+    /// The user picked the type (rather than it following the name).
+    pub type_touched: bool,
+    /// The type shown is the one the host bound the document to
+    /// ([`crate::BackstageHost::default_save_type`]).
+    pub type_preset: bool,
+    /// In Save As: the type box is focused.
+    pub type_focus: bool,
+    /// Export's highlighted row: 0 is the quick export, then each type.
+    pub export_sel: usize,
+    /// The quick export's label on the Export page.
+    pub export_quick: String,
     // Filled by `draw` (Task 3) and read by `mouse` (Task 2, `input.rs`), a
     // sibling module — needs crate-wide visibility, not just within `state`.
     pub(crate) layout: BackstageLayout,
@@ -135,10 +187,110 @@ impl Backstage {
             name_input: String::new(),
             name_cursor: 0,
             name_focus: false,
+            items: ITEMS.to_vec(),
+            options_title: String::new(),
+            options: Vec::new(),
+            option_sel: 0,
+            save_types: &[],
+            type_sel: 0,
+            type_touched: false,
+            type_preset: false,
+            type_focus: false,
+            export_sel: 0,
+            export_quick: String::new(),
             layout: BackstageLayout::default(),
         };
         b.refresh();
         b
+    }
+
+    /// Add an Options page (before Exit) with `title` and these checkboxes.
+    /// The host reads [`Backstage::options`] back after each key or click.
+    pub fn with_options(mut self, title: &str, options: Vec<(String, bool)>) -> Backstage {
+        if !self.items.contains(&Item::Options) {
+            let at = self.items.len().saturating_sub(1);
+            self.items.insert(at, Item::Options);
+        }
+        self.options_title = title.to_string();
+        self.options = options;
+        self
+    }
+
+    /// Give Save As a *Save as type* list, and Export a page listing
+    /// `quick_export` (the host's own export) and then Change File Type.
+    pub fn with_save_types(mut self, types: &'static [SaveType], quick_export: &str) -> Backstage {
+        self.save_types = types;
+        self.export_quick = quick_export.to_string();
+        self
+    }
+
+    /// The type the user picked in Save As, if they picked one; otherwise
+    /// the host decides from the name.
+    pub fn chosen_type(&self) -> Option<usize> {
+        (self.type_touched && self.type_sel < self.save_types.len()).then_some(self.type_sel)
+    }
+
+    /// The host's preselected type, while the user has not picked another.
+    /// The host decides whether it still applies to the typed name.
+    pub fn preset_type(&self) -> Option<usize> {
+        (self.type_preset && !self.type_touched && self.type_sel < self.save_types.len())
+            .then_some(self.type_sel)
+    }
+
+    /// Show `t` as the host's preselected type.
+    pub fn preset(&mut self, t: usize) {
+        if t < self.save_types.len() {
+            self.type_sel = t;
+            self.type_preset = true;
+        }
+    }
+
+    /// Pick a Save As type: the name's extension follows it.
+    pub fn pick_type(&mut self, i: usize) {
+        let Some(t) = self.save_types.get(i) else {
+            return;
+        };
+        self.type_sel = i;
+        self.type_touched = true;
+        self.name_input = with_extension(&self.name_input, t.ext);
+        self.name_cursor = self.name_input.chars().count();
+    }
+
+    /// Open Save As on `name`, with type `ty` picked (or the one the name's
+    /// extension suggests).
+    pub fn begin_save_as(&mut self, name: String, ty: Option<usize>) {
+        self.name_cursor = name.chars().count();
+        self.name_input = name;
+        self.name_focus = true;
+        self.type_focus = false;
+        self.item = Item::SaveAs;
+        self.pane = Pane::SaveAs;
+        self.type_touched = false;
+        self.type_preset = false;
+        let ext = self
+            .name_input
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_ascii_lowercase());
+        self.type_sel = self
+            .save_types
+            .iter()
+            .position(|t| Some(t.ext) == ext.as_deref())
+            .unwrap_or(0);
+        if let Some(i) = ty {
+            self.pick_type(i);
+        }
+    }
+
+    /// The menu items, in display order.
+    pub fn items(&self) -> &[Item] {
+        &self.items
+    }
+
+    /// Flip the highlighted option.
+    pub fn toggle_option(&mut self) {
+        if let Some(o) = self.options.get_mut(self.option_sel) {
+            o.1 = !o.1;
+        }
     }
 
     /// Re-read the current directory: subfolders + matching files, folders first.
@@ -238,13 +390,13 @@ impl Backstage {
     }
 
     pub fn menu_move(&mut self, down: bool) {
-        let i = ITEMS.iter().position(|x| *x == self.item).unwrap_or(0);
+        let i = self.items.iter().position(|x| *x == self.item).unwrap_or(0);
         let ni = if down {
-            (i + 1).min(ITEMS.len() - 1)
+            (i + 1).min(self.items.len() - 1)
         } else {
             i.saturating_sub(1)
         };
-        self.item = ITEMS[ni];
+        self.item = self.items[ni];
     }
 }
 
@@ -314,6 +466,59 @@ mod tests {
         assert!(names.contains(&"b.csv"));
         assert!(!names.contains(&"c.docx")); // not in ext list
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn options_are_opt_in_and_sit_before_exit() {
+        let plain = Backstage::open(std::env::temp_dir(), &["docx"]);
+        // docxy, lookxy and yppxy keep their seven items.
+        assert_eq!(plain.items(), ITEMS);
+        let mut bs = Backstage::open(std::env::temp_dir(), &["xlsx"])
+            .with_options("Data", vec![("One".into(), true), ("Two".into(), false)]);
+        assert_eq!(bs.items().len(), 8);
+        assert_eq!(bs.items()[6], Item::Options);
+        assert_eq!(*bs.items().last().unwrap(), Item::Exit);
+        bs.item = Item::Export;
+        bs.menu_move(true);
+        assert_eq!(bs.item, Item::Options);
+        bs.option_sel = 1;
+        bs.toggle_option();
+        assert_eq!(bs.options[1], ("Two".to_string(), true));
+    }
+
+    const TYPES: &[SaveType] = &[
+        SaveType {
+            label: "Excel Workbook",
+            ext: "xlsx",
+        },
+        SaveType {
+            label: "CSV UTF-8 (Comma delimited)",
+            ext: "csv",
+        },
+    ];
+
+    #[test]
+    fn a_save_type_sets_the_extension() {
+        let mut bs = Backstage::open(std::env::temp_dir(), &["xlsx"]).with_save_types(TYPES, "Q");
+        bs.begin_save_as("book.xlsx".into(), None);
+        assert_eq!(bs.type_sel, 0);
+        assert_eq!(bs.chosen_type(), None);
+        bs.pick_type(1);
+        assert_eq!(bs.name_input, "book.csv");
+        assert_eq!(bs.chosen_type(), Some(1));
+        bs.begin_save_as("data".into(), Some(1));
+        assert_eq!(bs.name_input, "data.csv");
+        assert_eq!(with_extension("a.b.c", "txt"), "a.b.txt");
+        // A host's preselected type shows, and counts until one is picked.
+        bs.begin_save_as("u.txt".into(), None);
+        bs.preset(1);
+        assert_eq!(
+            (bs.type_sel, bs.preset_type(), bs.chosen_type()),
+            (1, Some(1), None)
+        );
+        bs.pick_type(0);
+        assert_eq!((bs.preset_type(), bs.chosen_type()), (None, Some(0)));
+        assert_eq!(with_extension(".hidden", "csv"), ".hidden.csv");
     }
 
     #[test]
