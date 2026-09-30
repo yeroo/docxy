@@ -2778,7 +2778,10 @@ fn set_page_breaks(mut xml: String, tag: &str, breaks: &[crate::sheet::PageBreak
             block.push_str(&format!("<brk id=\"{}\"{}/>", b.id, b.attrs));
         }
         block.push_str(&format!("</{tag}>"));
-        block
+        match worksheet_root(&xml) {
+            Some(root) => in_worksheet_ns(&root, &block),
+            None => block,
+        }
     };
     xml.replace_range(start..end, &block);
     xml
@@ -2869,16 +2872,18 @@ struct WorksheetChild<'a> {
 /// `<customSheetView>` is not one), compared by local name so `x:mergeCells`
 /// is `mergeCells`. A top-level `mc:AlternateContent` ranks as the first
 /// element in its first `Choice`/`Fallback`: Excel wraps `controls`,
-/// `oleObjects` and `legacyDrawing` that way. The walk stops at a truncated
-/// child.
-fn worksheet_children(xml: &str) -> (Vec<WorksheetChild<'_>>, Option<usize>) {
+/// `oleObjects` and `legacyDrawing` that way. `None` when the walk can't
+/// finish (a truncated child, no `</worksheet>`, a self-closing root): a
+/// partial list must never pass for the whole, so callers leave such a part
+/// alone.
+fn worksheet_children(xml: &str) -> Option<(Vec<WorksheetChild<'_>>, usize)> {
     let mut children = Vec::new();
     let mut p = XmlParser::new(xml);
     // Skip to the root's start tag.
     loop {
         match p.next() {
             Event::Start => break,
-            Event::Eof => return (children, None),
+            Event::Eof => return None,
             _ => {}
         }
     }
@@ -2890,23 +2895,25 @@ fn worksheet_children(xml: &str) -> (Vec<WorksheetChild<'_>>, Option<usize>) {
                 let start = base + p.start_pos();
                 let qname = p.name();
                 let name = local(qname);
-                let self_closing = xml[..base + p.pos()].ends_with("/>");
-                let end = if name == "sheetData" && !self_closing {
+                let body = base + p.pos();
+                let self_closing = xml[..body].ends_with("/>");
+                let skip_to = (name == "sheetData" && !self_closing)
+                    .then(|| sheet_data_end(xml, body, qname))
+                    .flatten();
+                let end = match skip_to {
                     // The bulk of the part: jump to its end tag rather than
                     // tokenise every cell (the writer calls this per save).
-                    let close = format!("</{qname}>");
-                    let Some(i) = xml[base + p.pos()..].find(&close) else {
-                        break;
-                    };
-                    let end = base + p.pos() + i + close.len();
-                    base = end;
-                    p = XmlParser::new(&xml[end..]);
-                    end
-                } else {
-                    if !p.skip_element_complete() {
-                        break;
+                    Some(end) => {
+                        base = end;
+                        p = XmlParser::new(&xml[end..]);
+                        end
                     }
-                    base + p.pos()
+                    None => {
+                        if !p.skip_element_complete() {
+                            return None;
+                        }
+                        base + p.pos()
+                    }
                 };
                 let rank_as = match name {
                     "AlternateContent" => alternate_content_rank(&xml[start..end]).unwrap_or(name),
@@ -2919,13 +2926,36 @@ fn worksheet_children(xml: &str) -> (Vec<WorksheetChild<'_>>, Option<usize>) {
                     end,
                 });
             }
-            // `</worksheet>`: the end tag just consumed.
-            Event::End => return (children, xml[..base + p.pos()].rfind("</")),
-            Event::Eof => break,
+            // `</worksheet>`: the end tag just consumed. A self-closing root
+            // ends here too, with nothing after its start tag to insert into.
+            Event::End => {
+                let close = xml[..base + p.pos()].rfind("</")?;
+                return (close >= base).then_some((children, close));
+            }
+            Event::Eof => return None,
             Event::Text => {}
         }
     }
-    (children, None)
+}
+
+/// Just past the `</sheetData>` (any spacing before `>`) that closes the
+/// sheetData whose body starts at `body`, found without tokenising the cells.
+/// `None` sends the caller to the parser: no such tag, or a comment or CDATA
+/// section in the way that could hold a literal one.
+fn sheet_data_end(xml: &str, body: usize, qname: &str) -> Option<usize> {
+    let needle = format!("</{qname}");
+    let mut from = body;
+    let close = loop {
+        let at = from + xml[from..].find(&needle)?;
+        let rest = &xml[at + needle.len()..];
+        let trimmed = rest.trim_start_matches([' ', '\t', '\r', '\n']);
+        if trimmed.starts_with('>') {
+            break at + needle.len() + (rest.len() - trimmed.len()) + 1;
+        }
+        from = at + needle.len();
+    };
+    let span = &xml[body..close];
+    (!span.contains("<!--") && !span.contains("<![CDATA[")).then_some(close)
 }
 
 /// The local name of the first element inside the first `Choice` or
@@ -2951,21 +2981,20 @@ fn ct_worksheet_rank(name: &str) -> Option<usize> {
 /// Byte offset at which a new top-level `<tag>` belongs: before the first
 /// existing top-level child that ranks after `tag`, else before
 /// `</worksheet>`. Children the schema doesn't name are not anchors.
-fn worksheet_insert_pos(xml: &str, tag: &str) -> usize {
+fn worksheet_insert_pos(xml: &str, tag: &str) -> Option<usize> {
     let rank = ct_worksheet_rank(tag).unwrap_or(CT_WORKSHEET_ORDER.len());
-    let (children, close) = worksheet_children(xml);
-    children
-        .iter()
-        .find(|c| ct_worksheet_rank(c.rank_as).is_some_and(|r| r > rank))
-        .map(|c| c.start)
-        .or(close)
-        .or_else(|| xml.rfind("</"))
-        .unwrap_or(xml.len())
+    let (children, close) = worksheet_children(xml)?;
+    Some(
+        children
+            .iter()
+            .find(|c| ct_worksheet_rank(c.rank_as).is_some_and(|r| r > rank))
+            .map_or(close, |c| c.start),
+    )
 }
 
 /// The span of the first top-level `<tag>` (in any prefix), if there is one.
 pub(crate) fn worksheet_child_span(xml: &str, tag: &str) -> Option<(usize, usize)> {
-    worksheet_children(xml)
+    worksheet_children(xml)?
         .0
         .iter()
         .find(|c| c.local == tag)
@@ -2986,6 +3015,9 @@ pub(crate) fn remove_worksheet_child(xml: &str, tag: &str) -> String {
 struct WorksheetRoot {
     /// Offset of the root start tag's closing `>` (or `/>`).
     tag_close: usize,
+    /// `<worksheet …/>`: no content, and no end tag to insert before.
+    self_closing: bool,
+    qname: String,
     /// The namespace the root element itself is in.
     ns: String,
     /// The default namespace the root declares, if any.
@@ -3015,12 +3047,11 @@ fn worksheet_root(xml: &str) -> Option<WorksheetRoot> {
         None => "xmlns".to_string(),
     };
     let end = p.pos();
+    let self_closing = xml[..end].ends_with("/>");
     Some(WorksheetRoot {
-        tag_close: if xml[..end].ends_with("/>") {
-            end - 2
-        } else {
-            end - 1
-        },
+        tag_close: if self_closing { end - 2 } else { end - 1 },
+        self_closing,
+        qname: p.name().to_string(),
         ns: bound(&own).unwrap_or_default(),
         default_ns: bound("xmlns"),
         r_ns: bound("xmlns:r"),
@@ -3078,16 +3109,25 @@ pub(crate) fn put_worksheet_child(
     let Some(root) = worksheet_root(xml) else {
         return out;
     };
+    if root.self_closing {
+        // `<worksheet …/>`: open it up, so the block goes inside the root
+        // rather than after the document element.
+        out.replace_range(
+            root.tag_close..root.tag_close + 2,
+            &format!("></{}>", root.qname),
+        );
+    }
     let mut block = in_worksheet_ns(&root, block);
     if let Some(rels) = rels {
         block = bind_r(&mut out, &root, block, rels);
     }
     match worksheet_child_span(&out, tag).filter(|_| replace) {
         Some((s, e)) => out.replace_range(s..e, &block),
-        None => {
-            let pos = worksheet_insert_pos(&out, tag);
-            out.insert_str(pos, &block);
-        }
+        None => match worksheet_insert_pos(&out, tag) {
+            Some(pos) => out.insert_str(pos, &block),
+            // A part the walk can't finish is left as it is.
+            None => return xml.to_string(),
+        },
     }
     out
 }
@@ -4439,16 +4479,19 @@ impl SheetPackage {
         self.workbook.sheets[sheet].cond_formats.clear();
         let sheet_part = self.sheet_parts[sheet].clone();
         if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
-            let mut xml = String::from_utf8_lossy(&p.1).into_owned();
-            while let Some(s) = xml.find("<conditionalFormatting") {
-                let e = xml[s..]
-                    .find("</conditionalFormatting>")
-                    .map(|i| s + i + "</conditionalFormatting>".len())
-                    .or_else(|| xml[s..].find("/>").map(|i| s + i + 2))
-                    .unwrap_or(xml.len());
-                xml.replace_range(s..e, "");
+            let xml = String::from_utf8_lossy(&p.1).into_owned();
+            // Every top-level block, in any prefix; never an x14 one in extLst.
+            if let Some((children, _)) = worksheet_children(&xml) {
+                let mut out = xml.clone();
+                for c in children
+                    .iter()
+                    .rev()
+                    .filter(|c| c.local == "conditionalFormatting")
+                {
+                    out.replace_range(c.start..c.end, "");
+                }
+                p.1 = out.into_bytes();
             }
-            p.1 = xml.into_bytes();
         }
     }
 
@@ -10188,6 +10231,7 @@ mod ct_worksheet_order_tests {
     /// Every top-level child the schema names comes in `CT_Worksheet` order.
     fn in_ct_worksheet_order(xml: &str) -> Result<(), String> {
         let ranked: Vec<(&str, usize)> = worksheet_children(xml)
+            .ok_or("the walk can't finish")?
             .0
             .iter()
             .filter_map(|c| ct_worksheet_rank(c.rank_as).map(|r| (c.rank_as, r)))
@@ -10585,16 +10629,103 @@ mod ct_worksheet_order_tests {
         // not next to the nested one.
         assert_eq!(
             worksheet_insert_pos(&xml, "autoFilter"),
-            at(&xml, "<customSheetViews")
+            Some(at(&xml, "<customSheetViews"))
         );
         assert_eq!(
             worksheet_insert_pos(&xml, "mergeCells"),
-            at(&xml, "<pageMargins")
+            Some(at(&xml, "<pageMargins"))
         );
         assert_eq!(
             worksheet_insert_pos(&xml, "extLst"),
-            at(&xml, "</worksheet>")
+            Some(at(&xml, "</worksheet>"))
         );
+    }
+
+    #[test]
+    fn prefixed_row_breaks_follow_a_row_insert_and_stay_bound() {
+        let mut pkg = loaded_prefixed(&format!(
+            r#"{PREFIXED}<x:rowBreaks count="1" manualBreakCount="1"><x:brk id="3" max="16383" man="1"/></x:rowBreaks>"#
+        ));
+        crate::edit::insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert_names_bound(&ws);
+        assert_eq!(count_local(&ws, "rowBreaks"), 1, "{ws}");
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let ids: Vec<u32> = re.workbook.sheets[0]
+            .row_breaks
+            .iter()
+            .map(|b| b.id)
+            .collect();
+        assert_eq!(ids, vec![4]);
+    }
+
+    #[test]
+    fn the_walk_finds_sheet_data_however_its_close_tag_is_spelled() {
+        let tail = r#"<autoFilter ref="A1:B2"/><mergeCells count="1"><mergeCell ref="D1:E1"/></mergeCells>"#;
+        for sheet_data in [
+            r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData >"#,
+            r#"<sheetData><row r="1"><!-- </sheetData> --><c r="A1"><v>1</v></c></row></sheetData>"#,
+            r#"<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t><![CDATA[</sheetData>]]></t></is></c></row></sheetData>"#,
+        ] {
+            let xml = format!(r#"<worksheet xmlns="{NS}">{sheet_data}{tail}</worksheet>"#);
+            let (children, close) = worksheet_children(&xml).expect("the walk finishes");
+            let names: Vec<&str> = children.iter().map(|c| c.local).collect();
+            assert_eq!(names, ["sheetData", "autoFilter", "mergeCells"], "{xml}");
+            assert_eq!(close, at(&xml, "</worksheet>"));
+            // And a save puts the merges after the filter, with one sheetData.
+            let pkg = loaded(&format!("{sheet_data}{tail}"));
+            let ws = saved_sheet(&pkg);
+            assert_ct_worksheet_order(&ws);
+            assert!(at(&ws, "<autoFilter") < at(&ws, "<mergeCells"), "{ws}");
+        }
+    }
+
+    #[test]
+    fn a_worksheet_the_walk_cannot_finish_is_left_alone() {
+        // No </worksheet>: nothing may be inserted at a guessed position.
+        let truncated = format!(r#"<worksheet xmlns="{NS}"><sheetData/><pageMargins/>"#);
+        assert!(worksheet_children(&truncated).is_none());
+        assert_eq!(
+            put_worksheet_child(&truncated, "mergeCells", "<mergeCells/>", None, false),
+            truncated
+        );
+        let cut_child = format!(r#"<worksheet xmlns="{NS}"><sheetData/><hyperlinks><hyperlink"#);
+        assert!(worksheet_children(&cut_child).is_none());
+    }
+
+    #[test]
+    fn a_self_closing_worksheet_is_opened_not_appended_to() {
+        let mut pkg = new_xlsx();
+        pkg.set_part(
+            SHEET,
+            format!(r#"<?xml version="1.0"?><worksheet xmlns="{NS}"/>"#).into_bytes(),
+        );
+        let mut pkg = load_xlsx(&write_zip(&pkg.parts)).expect("load");
+        pkg.workbook.sheets[0].set_cell(0, 0, Cell::number(5.0));
+        let ws = saved_sheet(&pkg);
+        assert!(ws.trim_end().ends_with("</worksheet>"), "{ws}");
+        assert_eq!(count_local(&ws, "sheetData"), 1, "{ws}");
+        assert_names_bound(&ws);
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(
+            re.workbook.sheets[0].cell(0, 0).map(|c| c.value.clone()),
+            Some(crate::sheet::CellValue::Number(5.0))
+        );
+    }
+
+    #[test]
+    fn clearing_conditional_formats_removes_prefixed_blocks() {
+        let mut pkg = loaded_prefixed(
+            r#"<x:sheetData/><x:conditionalFormatting sqref="A1"><x:cfRule type="expression" priority="1"><x:formula>TRUE</x:formula></x:cfRule></x:conditionalFormatting><x:conditionalFormatting sqref="B1"><x:cfRule type="expression" priority="2"><x:formula>TRUE</x:formula></x:cfRule></x:conditionalFormatting><x:pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>"#,
+        );
+        assert_eq!(pkg.workbook.sheets[0].cond_formats.len(), 2);
+        pkg.clear_conditional_formats(0);
+        let ws = saved_sheet(&pkg);
+        assert_eq!(count_local(&ws, "conditionalFormatting"), 0, "{ws}");
+        assert_eq!(count_local(&ws, "pageMargins"), 1, "{ws}");
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert!(re.workbook.sheets[0].cond_formats.is_empty());
     }
 
     /// A ratchet, not the #597 test: no corpus sheet that was in schema order
