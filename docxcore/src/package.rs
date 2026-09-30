@@ -11,7 +11,9 @@
 //! section breaks, comments anchors — is not reconstructed by the serializer and
 //! is dropped on save. Full raw-node preservation is a later refinement.
 
-use crate::load::{LoadError, Relationships, parse_document_xml, parse_rels_xml};
+use crate::load::{
+    LoadError, Relationships, parse_document_xml, parse_rels_xml, start_tags, xml_attr_value,
+};
 use crate::model::{Block, Document, PropertyScope, SectionProperties};
 use crate::serialize::document_to_xml;
 use crate::xml::{Event, XmlParser};
@@ -194,6 +196,36 @@ pub enum WatermarkKind {
     Text(String),
     Picture,
     Unknown,
+}
+
+/// A VML text watermark's text and how it is drawn, for renderers that draw
+/// it (PDF export).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextWatermark {
+    pub text: String,
+    /// Clockwise rotation in degrees (the shape style's `rotation`), 0 when
+    /// absent. Word's diagonal watermark is 315.
+    pub rotation: f32,
+    /// The shape's `fillcolor`, when it is a colour we know.
+    pub fill: Option<(u8, u8, u8)>,
+    /// The shape's width in points (its style's `width`), which Word stretches
+    /// an "Auto"-sized text to.
+    pub width_pt: Option<f32>,
+    /// The text path's `font-size` in points; `None` when absent or `1pt`,
+    /// which is how Word writes "Auto".
+    pub font_size_pt: Option<f32>,
+}
+
+/// The relationship changes an edited header or footer part needs for its
+/// hyperlinks, computed by [`Package::link_part_hyperlinks`] and written by
+/// [`Package::apply_part_rels`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartRelsUpdate {
+    rels_name: String,
+    rels: Vec<u8>,
+    /// `[Content_Types].xml` with a `rels` Default added, when it lacked one
+    /// and the rels part is new.
+    content_types: Option<Vec<u8>>,
 }
 
 /// Relationship and section metadata describing where a watermark applies.
@@ -623,11 +655,65 @@ fn marker_in_attrs(parser: &XmlParser<'_>) -> bool {
 }
 
 fn watermark_kinds(xml: &str) -> Vec<WatermarkKind> {
+    watermark_shapes(xml)
+        .into_iter()
+        .map(|shape| shape.kind)
+        .collect()
+}
+
+/// The VML text watermarks in a header part's XML, in document order.
+pub fn text_watermarks(xml: &str) -> Vec<TextWatermark> {
+    watermark_shapes(xml)
+        .into_iter()
+        .filter_map(|shape| {
+            let WatermarkKind::Text(text) = shape.kind else {
+                return None;
+            };
+            let look = shape.look.unwrap_or_default();
+            let style = look.style.as_deref().unwrap_or("");
+            Some(TextWatermark {
+                text,
+                rotation: css_prop(style, "rotation")
+                    .and_then(leading_number)
+                    .unwrap_or(0.0),
+                fill: look.fill.as_deref().and_then(vml_color),
+                width_pt: css_prop(style, "width").and_then(css_length_pt),
+                font_size_pt: look
+                    .text_style
+                    .as_deref()
+                    .and_then(|s| css_prop(s, "font-size"))
+                    .and_then(css_length_pt)
+                    .filter(|&pt| (pt - 1.0).abs() > 0.001),
+            })
+        })
+        .collect()
+}
+
+/// The raw look of a watermark shape: its `style` and `fillcolor`, and its
+/// text path's `style`.
+#[derive(Debug, Clone, Default)]
+struct ShapeLook {
+    style: Option<String>,
+    fill: Option<String>,
+    text_style: Option<String>,
+}
+
+/// A watermark found in a header part, with the look of the VML shape that
+/// holds it (`None` for a DrawingML picture).
+struct WatermarkShape {
+    kind: WatermarkKind,
+    look: Option<ShapeLook>,
+}
+
+/// One walk over a header part's watermark shapes, shared by
+/// [`watermark_kinds`] and [`text_watermarks`].
+fn watermark_shapes(xml: &str) -> Vec<WatermarkShape> {
     #[derive(Default)]
     struct Shape {
         marked: bool,
         texts: Vec<String>,
         picture: bool,
+        look: ShapeLook,
     }
 
     let mut parser = XmlParser::new(xml);
@@ -638,6 +724,11 @@ fn watermark_kinds(xml: &str) -> Vec<WatermarkKind> {
             Event::Start if local_name(parser.name()) == "shape" => {
                 shapes.push(Shape {
                     marked: marker_in_attrs(&parser),
+                    look: ShapeLook {
+                        style: decoded_attr_by_local(&parser, "style"),
+                        fill: decoded_attr_by_local(&parser, "fillcolor"),
+                        text_style: None,
+                    },
                     ..Shape::default()
                 });
             }
@@ -650,6 +741,9 @@ fn watermark_kinds(xml: &str) -> Vec<WatermarkKind> {
                 }
                 if let Some(shape) = shapes.last_mut() {
                     shape.texts.push(text);
+                    if shape.look.text_style.is_none() {
+                        shape.look.text_style = decoded_attr_by_local(&parser, "style");
+                    }
                 }
             }
             Event::Start if local_name(parser.name()) == "imagedata" => {
@@ -662,19 +756,32 @@ fn watermark_kinds(xml: &str) -> Vec<WatermarkKind> {
                 // DrawingML picture watermarks use a watermark-named docPr rather
                 // than VML's PowerPlusWaterMarkObject shape id.
                 if marker_in_attrs(&parser) {
-                    out.push(WatermarkKind::Picture);
+                    out.push(WatermarkShape {
+                        kind: WatermarkKind::Picture,
+                        look: None,
+                    });
                 }
             }
             Event::End if local_name(parser.name()) == "shape" => {
                 let Some(shape) = shapes.pop() else {
                     continue;
                 };
+                let look = Some(shape.look);
                 if shape.marked && !shape.texts.is_empty() {
-                    out.extend(shape.texts.into_iter().map(WatermarkKind::Text));
+                    out.extend(shape.texts.into_iter().map(|text| WatermarkShape {
+                        kind: WatermarkKind::Text(text),
+                        look: look.clone(),
+                    }));
                 } else if shape.marked && shape.picture {
-                    out.push(WatermarkKind::Picture);
+                    out.push(WatermarkShape {
+                        kind: WatermarkKind::Picture,
+                        look,
+                    });
                 } else if shape.marked {
-                    out.push(WatermarkKind::Unknown);
+                    out.push(WatermarkShape {
+                        kind: WatermarkKind::Unknown,
+                        look,
+                    });
                 }
             }
             Event::Eof => break,
@@ -682,6 +789,70 @@ fn watermark_kinds(xml: &str) -> Vec<WatermarkKind> {
         }
     }
     out
+}
+
+/// A CSS-style declaration's value in a VML `style` (`a:1;b:2`), by name.
+fn css_prop<'a>(style: &'a str, name: &str) -> Option<&'a str> {
+    style.split(';').find_map(|decl| {
+        let (key, value) = decl.split_once(':')?;
+        key.trim()
+            .eq_ignore_ascii_case(name)
+            .then_some(value.trim())
+    })
+}
+
+/// The number a value starts with (`315`, `-45.5fd`).
+fn leading_number(value: &str) -> Option<f32> {
+    let end = value
+        .char_indices()
+        .find(|&(i, c)| !(c.is_ascii_digit() || c == '.' || (i == 0 && matches!(c, '-' | '+'))))
+        .map_or(value.len(), |(i, _)| i);
+    value[..end].parse().ok().filter(|v: &f32| v.is_finite())
+}
+
+/// A CSS length in points: `pt`, `in`, `cm`, `mm` or `px`; anything else is
+/// unknown.
+fn css_length_pt(value: &str) -> Option<f32> {
+    let value = value.trim();
+    let n = leading_number(value)?;
+    let unit = value
+        .trim_start_matches(|c: char| c.is_ascii_digit() || matches!(c, '.' | '-' | '+'))
+        .trim();
+    let pt = match unit.to_ascii_lowercase().as_str() {
+        "pt" => n,
+        "in" => n * 72.0,
+        "cm" => n * 72.0 / 2.54,
+        "mm" => n * 72.0 / 25.4,
+        "px" => n * 0.75,
+        _ => return None,
+    };
+    Some(pt)
+}
+
+/// A VML colour: `#RRGGBB`, `#RGB` or one of the names Word writes, with any
+/// trailing ` [index]` ignored.
+fn vml_color(value: &str) -> Option<(u8, u8, u8)> {
+    let value = value.split_whitespace().next()?;
+    if let Some(hex) = value.strip_prefix('#') {
+        let hex = match hex.len() {
+            3 => hex.chars().flat_map(|c| [c, c]).collect(),
+            6 => hex.to_string(),
+            _ => return None,
+        };
+        let n = u32::from_str_radix(&hex, 16).ok()?;
+        return Some(((n >> 16) as u8, (n >> 8) as u8, n as u8));
+    }
+    Some(match value.to_ascii_lowercase().as_str() {
+        "silver" => (0xc0, 0xc0, 0xc0),
+        "gray" | "grey" => (0x80, 0x80, 0x80),
+        "black" => (0, 0, 0),
+        "white" => (0xff, 0xff, 0xff),
+        "red" => (0xff, 0, 0),
+        "green" => (0, 0x80, 0),
+        "blue" => (0, 0, 0xff),
+        "yellow" => (0xff, 0xff, 0),
+        _ => return None,
+    })
 }
 
 /// A loaded `.docx`: the editable [`Document`] plus all original parts so save
@@ -946,6 +1117,154 @@ impl Package {
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, b)| b.as_slice())
+    }
+
+    /// An XML part's text, decoded the way the loader reads it (UTF-8, or
+    /// UTF-16 with or without a byte-order mark). `None` when the part is
+    /// missing or isn't decodable XML text.
+    pub fn part_text(&self, name: &str) -> Option<String> {
+        self.part(name)
+            .and_then(decode_xml_part)
+            .map(Cow::into_owned)
+    }
+
+    /// Replace an existing XML part's text, encoded the way the part was: a
+    /// UTF-16 part stays UTF-16 (so its declaration stays true), a BOM stays.
+    /// Returns false if no such part exists.
+    pub fn set_part_text(&mut self, name: &str, text: &str) -> bool {
+        match self.parts.iter_mut().find(|(n, _)| n == name) {
+            Some(e) => {
+                e.1 = encode_like(&e.1, text);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Give every external hyperlink in `blocks`, the new content of header or
+    /// footer `part`, a relationship in the part's own `_rels`: links created
+    /// in the editor have none, and a link pasted from the body keeps the
+    /// body's id, which means nothing (or something else) in the part's rels.
+    /// A link whose id already names an external relationship to its target
+    /// is left as is. Each other link gets a fresh `rIdN`, set as its
+    /// `rel_id` and written into its preserved opening tag, so its other
+    /// attributes (tooltip, target frame) survive.
+    ///
+    /// The package isn't changed: the returned update, `None` when no link
+    /// needed one, is written with [`Package::apply_part_rels`] once the part
+    /// itself has been written. When a link needs a relationship but the
+    /// part's rels can't be read or extended, the error says why and neither
+    /// the links nor the package are touched.
+    pub fn link_part_hyperlinks(
+        &self,
+        part: &str,
+        blocks: &mut [crate::model::Block],
+    ) -> Result<Option<PartRelsUpdate>, &'static str> {
+        let mut links = Vec::new();
+        collect_external_links(blocks, &mut links);
+        if links.is_empty() {
+            return Ok(None);
+        }
+        let rels_name = part_rels_name(part).ok_or("the part has no relationships part name")?;
+        let existing = self.part(&rels_name);
+        let text = match existing {
+            Some(bytes) => decode_xml_part(bytes)
+                .ok_or("its relationships part isn't readable XML")?
+                .into_owned(),
+            None => format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"{PACKAGE_RELATIONSHIPS_NS}\"></Relationships>"
+            ),
+        };
+        let rels = parse_rels_xml(&text);
+        // Work out every new id first; the links change only once the rels do.
+        let mut next = next_rid_num(&text);
+        let mut added = String::new();
+        let mut minted = Vec::new();
+        for (i, h) in links.iter().enumerate() {
+            let target = h.target.as_deref().unwrap_or_default();
+            let linked = h.rel_id.as_deref().is_some_and(|id| {
+                rels.iter()
+                    .any(|(rid, t, external)| rid == id && t == target && external)
+            });
+            if linked {
+                continue;
+            }
+            // `next_rid_num` only sees `Id="rIdN"`; skip ids spelled otherwise.
+            while rels.target(&format!("rId{next}")).is_some() {
+                next += 1;
+            }
+            let rid = format!("rId{next}");
+            next += 1;
+            added.push_str(&format!(
+                "<Relationship Id=\"{rid}\" Type=\"{HYPERLINK_REL}\" Target=\"{}\" TargetMode=\"External\"/>",
+                esc_xml_attr(target)
+            ));
+            minted.push((i, rid));
+        }
+        if minted.is_empty() {
+            return Ok(None);
+        }
+        let updated = append_relationships(&text, &added)
+            .ok_or("its relationships part has no Relationships root")?;
+        for (i, rid) in minted {
+            let h = &mut links[i];
+            if let Some(raw) = &mut h.raw {
+                *raw = with_opener_rel_id(raw, &rid);
+            }
+            h.rel_id = Some(rid);
+        }
+        let rels = match existing {
+            Some(bytes) => encode_like(bytes, &updated),
+            None => updated.into_bytes(),
+        };
+        let content_types = if existing.is_none() {
+            self.content_types_with_rels_default()
+        } else {
+            None
+        };
+        Ok(Some(PartRelsUpdate {
+            rels_name,
+            rels,
+            content_types,
+        }))
+    }
+
+    /// `[Content_Types].xml` with a `rels` Default added, or `None` when it
+    /// already has one (or can't be read).
+    fn content_types_with_rels_default(&self) -> Option<Vec<u8>> {
+        let bytes = self.part("[Content_Types].xml")?;
+        let xml = decode_xml_part(bytes)?;
+        let has_default = start_tags(&xml, "Default").into_iter().any(|(_, el)| {
+            xml_attr_value(el, "Extension").is_some_and(|ext| ext.eq_ignore_ascii_case("rels"))
+        });
+        if has_default {
+            return None;
+        }
+        let default = "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>";
+        let (start, el) = start_tags(&xml, "Types").into_iter().next()?;
+        let at = start + el.len();
+        let updated = if el.ends_with("/>") {
+            format!("{}>{default}</Types>{}", &xml[..at - 2], &xml[at..])
+        } else {
+            format!("{}{default}{}", &xml[..at], &xml[at..])
+        };
+        Some(encode_like(bytes, &updated))
+    }
+
+    /// Write a [`Package::link_part_hyperlinks`] update: the part's rels
+    /// (created when new) and the content types.
+    pub fn apply_part_rels(&mut self, update: PartRelsUpdate) {
+        let PartRelsUpdate {
+            rels_name,
+            rels,
+            content_types,
+        } = update;
+        if !self.set_part(&rels_name, rels.clone()) {
+            self.parts.push((rels_name, rels));
+        }
+        if let Some(ct) = content_types {
+            self.set_part("[Content_Types].xml", ct);
+        }
     }
 
     /// Replace the bytes of an existing part (e.g. an edited header/footer).
@@ -1975,13 +2294,14 @@ pub fn save_package(pkg: &Package) -> Vec<u8> {
         let mut new_rels = String::new();
         let mut next = next_rid_num(&String::from_utf8_lossy(rels_bytes));
         let mut links = Vec::new();
-        collect_unlinked_externals(&mut document.body, &mut links);
+        collect_external_links(&mut document.body, &mut links);
+        links.retain(|h| h.rel_id.is_none());
         for h in links {
             let rid = format!("rId{next}");
             next += 1;
             let target = h.target.as_deref().unwrap_or_default();
             new_rels.push_str(&format!(
-                "<Relationship Id=\"{rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"{}\" TargetMode=\"External\"/>",
+                "<Relationship Id=\"{rid}\" Type=\"{HYPERLINK_REL}\" Target=\"{}\" TargetMode=\"External\"/>",
                 esc_xml_attr(target)
             ));
             h.rel_id = Some(rid);
@@ -2175,9 +2495,45 @@ fn next_rid_num(rels: &str) -> u32 {
     max + 1
 }
 
-/// Collect `&mut` references to every external hyperlink (`target` set) that has
-/// no relationship id yet, walking paragraphs and table cells recursively.
-fn collect_unlinked_externals<'a>(
+const HYPERLINK_REL: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink";
+
+/// `rels` (a Relationships part's text) with `added` relationships appended to
+/// its root, or `None` without a `Relationships` root.
+fn append_relationships(rels: &str, added: &str) -> Option<String> {
+    if let Some(close) = rels.rfind("</Relationships>") {
+        return Some(format!("{}{added}{}", &rels[..close], &rels[close..]));
+    }
+    let (start, el) = start_tags(rels, "Relationships").into_iter().next()?;
+    let at = start + el.len();
+    el.ends_with("/>")
+        .then(|| format!("{}>{added}</Relationships>{}", &rels[..at - 2], &rels[at..]))
+}
+
+/// A preserved `<w:hyperlink …>` element with its opening tag's `r:id` set to
+/// `rid` (added when it had none); its children are untouched.
+fn with_opener_rel_id(raw: &str, rid: &str) -> String {
+    let mut parser = XmlParser::new(raw);
+    if parser.next() != Event::Start || parser.name() != "w:hyperlink" {
+        return raw.to_string();
+    }
+    // The value's span in `raw`, from the parser's own view of the start tag,
+    // so any spacing around the attribute or its `=` is handled.
+    let Some(attr) = parser.attrs().iter().find(|attr| attr.name == "r:id") else {
+        return raw.replacen("<w:hyperlink", &format!("<w:hyperlink r:id=\"{rid}\""), 1);
+    };
+    // The parser's values are slices of `raw` (a valueless attribute isn't).
+    let start = (attr.value.as_ptr() as usize).wrapping_sub(raw.as_ptr() as usize);
+    let end = start.wrapping_add(attr.value.len());
+    if end > raw.len() || start > end || !raw.is_char_boundary(start) {
+        return raw.to_string();
+    }
+    format!("{}{rid}{}", &raw[..start], &raw[end..])
+}
+
+/// Collect `&mut` references to every external hyperlink (`target` set),
+/// walking paragraphs and table cells recursively.
+fn collect_external_links<'a>(
     blocks: &'a mut [crate::model::Block],
     out: &mut Vec<&'a mut crate::model::Hyperlink>,
 ) {
@@ -2186,17 +2542,17 @@ fn collect_unlinked_externals<'a>(
         match b {
             Block::Paragraph(p) => {
                 for inl in &mut p.content {
-                    if let Inline::Hyperlink(h) = inl {
-                        if h.target.is_some() && h.rel_id.is_none() {
-                            out.push(h);
-                        }
+                    if let Inline::Hyperlink(h) = inl
+                        && h.target.is_some()
+                    {
+                        out.push(h);
                     }
                 }
             }
             Block::Table(t) => {
                 for row in &mut t.rows {
                     for cell in &mut row.cells {
-                        collect_unlinked_externals(&mut cell.blocks, out);
+                        collect_external_links(&mut cell.blocks, out);
                     }
                 }
             }
@@ -3885,5 +4241,350 @@ mod tests {
         let before = pkg.part("word/styles.xml").unwrap().to_vec();
         pkg.ensure_styles(&["Header"]);
         assert_eq!(pkg.part("word/styles.xml").unwrap(), before.as_slice());
+    }
+
+    #[test]
+    fn text_watermarks_read_rotation_fill_and_size() {
+        let header = r##"<w:hdr xmlns:w="w" xmlns:v="v"><w:p><w:r><w:pict>
+            <v:shape id="PowerPlusWaterMarkObject357" style="position:absolute;margin-left:0;margin-top:0;width:468pt;height:117pt;rotation:315;z-index:-251655168;mso-position-horizontal:center" fillcolor="silver" stroked="f"><v:textpath style="font-family:&quot;Calibri&quot;;font-size:1pt" string="DRAFT"/></v:shape>
+            <v:shape id="PowerPlusWaterMarkObject358" style="width:6.5in;rotation:-30.5" fillcolor="#FF0000 [3204]"><v:textpath style="font-size:36pt" string="SECRET"/></v:shape>
+            <v:shape id="PowerPlusWaterMarkObject359" style="width:wide" fillcolor="#abc"><v:textpath string="ODD"/></v:shape>
+            <v:shape id="PowerPlusWaterMarkObject360"><v:imagedata r:id="rImg"/></v:shape>
+            <v:shape id="ordinary" style="rotation:90"><v:textpath string="NOT A WATERMARK"/></v:shape>
+            </w:pict></w:r></w:p></w:hdr>"##;
+        let marks = text_watermarks(header);
+        assert_eq!(
+            marks,
+            vec![
+                TextWatermark {
+                    text: "DRAFT".to_string(),
+                    rotation: 315.0,
+                    fill: Some((0xc0, 0xc0, 0xc0)),
+                    width_pt: Some(468.0),
+                    font_size_pt: None,
+                },
+                TextWatermark {
+                    text: "SECRET".to_string(),
+                    rotation: -30.5,
+                    fill: Some((0xff, 0, 0)),
+                    width_pt: Some(468.0),
+                    font_size_pt: Some(36.0),
+                },
+                TextWatermark {
+                    text: "ODD".to_string(),
+                    rotation: 0.0,
+                    fill: Some((0xaa, 0xbb, 0xcc)),
+                    width_pt: None,
+                    font_size_pt: None,
+                },
+            ]
+        );
+        // The kinds come from the same walk and are unchanged.
+        assert_eq!(
+            watermark_kinds(header),
+            vec![
+                WatermarkKind::Text("DRAFT".to_string()),
+                WatermarkKind::Text("SECRET".to_string()),
+                WatermarkKind::Text("ODD".to_string()),
+                WatermarkKind::Picture,
+            ]
+        );
+    }
+
+    #[test]
+    fn set_part_text_keeps_utf16() {
+        let mut pkg = new_package(Document::default());
+        let text = "<?xml version=\"1.0\" encoding=\"UTF-16\"?><w:hdr>é</w:hdr>";
+        let mut be = vec![0xfe, 0xff];
+        for unit in text.encode_utf16() {
+            be.extend_from_slice(&unit.to_be_bytes());
+        }
+        pkg.parts.push(("word/header1.xml".to_string(), be));
+        assert_eq!(pkg.part_text("word/header1.xml").as_deref(), Some(text));
+        let edited = text.replace('é', "ü");
+        assert!(pkg.set_part_text("word/header1.xml", &edited));
+        let bytes = pkg.part("word/header1.xml").unwrap();
+        assert!(
+            bytes.starts_with(&[0xfe, 0xff, 0, b'<']),
+            "UTF-16BE with its BOM"
+        );
+        assert_eq!(
+            pkg.part_text("word/header1.xml").as_deref(),
+            Some(edited.as_str())
+        );
+        assert!(!pkg.set_part_text("word/missing.xml", "x"));
+        assert_eq!(pkg.part_text("word/missing.xml"), None);
+    }
+
+    fn link(target: Option<&str>, rel_id: Option<&str>, raw: Option<&str>) -> crate::model::Inline {
+        crate::model::Inline::Hyperlink(crate::model::Hyperlink {
+            target: target.map(str::to_string),
+            anchor: target.is_none().then(|| "bm".to_string()),
+            rel_id: rel_id.map(str::to_string),
+            runs: vec![crate::model::Run {
+                text: "link".to_string(),
+                props: Default::default(),
+            }],
+            raw: raw.map(str::to_string),
+            ..Default::default()
+        })
+    }
+
+    fn link_blocks(links: Vec<crate::model::Inline>) -> Vec<Block> {
+        vec![Block::Paragraph(crate::model::Paragraph {
+            props: Default::default(),
+            content: links,
+        })]
+    }
+
+    fn rel_ids(blocks: &[Block]) -> Vec<Option<String>> {
+        let Block::Paragraph(p) = &blocks[0] else {
+            panic!()
+        };
+        p.content
+            .iter()
+            .map(|inl| match inl {
+                crate::model::Inline::Hyperlink(h) => h.rel_id.clone(),
+                _ => panic!(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn link_part_hyperlinks_mints_rels_and_creates_part() {
+        let mut pkg = new_package(Document::default());
+        pkg.parts
+            .push(("word/header1.xml".to_string(), b"<w:hdr/>".to_vec()));
+        let mut blocks = link_blocks(vec![
+            link(Some("https://a.example/?x=1&y=2"), None, None),
+            link(None, None, None),
+        ]);
+        let before = pkg.clone();
+        let update = pkg
+            .link_part_hyperlinks("word/header1.xml", &mut blocks)
+            .unwrap()
+            .expect("a link needs a relationship");
+        assert_eq!(pkg.parts, before.parts, "computing changes nothing");
+        assert_eq!(rel_ids(&blocks), [Some("rId1".to_string()), None]);
+        assert_eq!(
+            update.content_types, None,
+            "new packages have the rels Default"
+        );
+        pkg.apply_part_rels(update);
+        let rels = pkg
+            .part_text("word/_rels/header1.xml.rels")
+            .expect("rels created");
+        assert!(
+            rels.starts_with("<?xml") && rels.contains(PACKAGE_RELATIONSHIPS_NS),
+            "{rels}"
+        );
+        assert!(
+            rels.contains(r#"<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://a.example/?x=1&amp;y=2" TargetMode="External"/>"#),
+            "{rels}"
+        );
+        assert_eq!(
+            parse_rels_xml(&rels).target("rId1"),
+            Some("https://a.example/?x=1&y=2")
+        );
+        // Nothing left to link: no update.
+        assert_eq!(
+            pkg.link_part_hyperlinks("word/header1.xml", &mut blocks),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn link_part_hyperlinks_remints_foreign_rel_id() {
+        let mut pkg = new_package(Document::default());
+        let rels = r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId3" Type="h" Target="https://b.example/" TargetMode="External"/><Relationship Id="rId7" Type="i" Target="media/image1.png"/></Relationships>"#;
+        let mut utf16 = vec![0xff, 0xfe];
+        for unit in rels.encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        pkg.parts
+            .push(("word/_rels/header1.xml.rels".to_string(), utf16));
+        let pasted = r#"<w:hyperlink r:id="rId5" w:tooltip="t" w:history="1"><w:r><w:t>link</w:t></w:r></w:hyperlink>"#;
+        let mut blocks = link_blocks(vec![
+            // Already linked to its target in this part: kept.
+            link(Some("https://b.example/"), Some("rId3"), None),
+            // A body id that means nothing here, with preserved markup.
+            link(Some("https://c.example/"), Some("rId5"), Some(pasted)),
+            // An id naming something else here.
+            link(Some("https://d.example/"), Some("rId7"), None),
+        ]);
+        let update = pkg
+            .link_part_hyperlinks("word/header1.xml", &mut blocks)
+            .unwrap()
+            .unwrap();
+        pkg.apply_part_rels(update);
+        assert_eq!(
+            rel_ids(&blocks),
+            [
+                Some("rId3".to_string()),
+                Some("rId8".to_string()),
+                Some("rId9".to_string())
+            ]
+        );
+        let bytes = pkg.part("word/_rels/header1.xml.rels").unwrap();
+        assert!(
+            bytes.starts_with(&[0xff, 0xfe]),
+            "the rels part keeps its encoding"
+        );
+        let parsed = parse_rels_xml(&pkg.part_text("word/_rels/header1.xml.rels").unwrap());
+        assert_eq!(parsed.target("rId8"), Some("https://c.example/"));
+        assert_eq!(parsed.target("rId9"), Some("https://d.example/"));
+        assert_eq!(parsed.target("rId7"), Some("media/image1.png"));
+        let xml = crate::serialize::blocks_to_xml(&blocks);
+        assert!(
+            xml.contains(r#"<w:hyperlink r:id="rId8" w:tooltip="t" w:history="1">"#),
+            "{xml}"
+        );
+        assert!(
+            !xml.contains("rId5") && xml.contains(r#"r:id="rId9""#),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn with_opener_rel_id_sets_or_adds_the_id() {
+        assert_eq!(
+            with_opener_rel_id(
+                r#"<w:hyperlink w:anchor="a" r:id='x'><w:r/></w:hyperlink>"#,
+                "rId2"
+            ),
+            r#"<w:hyperlink w:anchor="a" r:id='rId2'><w:r/></w:hyperlink>"#
+        );
+        assert_eq!(
+            with_opener_rel_id(
+                r#"<w:hyperlink w:tooltip="t"><w:r r:id="keep"/></w:hyperlink>"#,
+                "rId2"
+            ),
+            r#"<w:hyperlink r:id="rId2" w:tooltip="t"><w:r r:id="keep"/></w:hyperlink>"#
+        );
+    }
+
+    #[test]
+    fn a_header_rels_part_adds_the_rels_default_when_missing() {
+        let bytes = make_metadata_docx(BODY, None, None, &[("header1.xml", "<w:hdr/>")]);
+        let mut pkg = load_package(&bytes).unwrap();
+        let mut blocks = link_blocks(vec![link(Some("https://a.example/"), None, None)]);
+        let update = pkg
+            .link_part_hyperlinks("word/header1.xml", &mut blocks)
+            .unwrap()
+            .unwrap();
+        assert!(update.content_types.is_some());
+        pkg.apply_part_rels(update);
+        let ct = pkg.part_text("[Content_Types].xml").unwrap();
+        assert!(
+            ct.contains(r#"<Types><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/></Types>"#),
+            "{ct}"
+        );
+        // Once there, it isn't added again.
+        pkg.parts
+            .retain(|(n, _)| n != "word/_rels/header1.xml.rels");
+        let mut blocks = link_blocks(vec![link(Some("https://a.example/"), None, None)]);
+        let update = pkg
+            .link_part_hyperlinks("word/header1.xml", &mut blocks)
+            .unwrap()
+            .unwrap();
+        assert_eq!(update.content_types, None);
+    }
+
+    #[test]
+    fn link_part_hyperlinks_skips_ids_however_they_are_quoted() {
+        let mut pkg = new_package(Document::default());
+        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id='rId1' Type="i" Target="media/image1.png"/><Relationship Id = "rId2" Type="i" Target="media/image2.png"/></Relationships>"#;
+        pkg.parts.push((
+            "word/_rels/header1.xml.rels".to_string(),
+            rels.as_bytes().to_vec(),
+        ));
+        let mut blocks = link_blocks(vec![link(Some("https://a.example/"), None, None)]);
+        let update = pkg
+            .link_part_hyperlinks("word/header1.xml", &mut blocks)
+            .unwrap()
+            .unwrap();
+        pkg.apply_part_rels(update);
+        assert_eq!(rel_ids(&blocks), [Some("rId3".to_string())]);
+        let text = pkg.part_text("word/_rels/header1.xml.rels").unwrap();
+        let mut ids = Vec::new();
+        let mut parser = XmlParser::new(&text);
+        loop {
+            match parser.next() {
+                Event::Start if parser.name() == "Relationship" => {
+                    ids.push(parser.attr("Id").to_string());
+                }
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            ids,
+            ["rId1", "rId2", "rId3"],
+            "one relationship per id: {text}"
+        );
+        let parsed = parse_rels_xml(&text);
+        assert_eq!(parsed.target("rId1"), Some("media/image1.png"));
+        assert_eq!(parsed.target("rId3"), Some("https://a.example/"));
+    }
+
+    #[test]
+    fn with_opener_rel_id_handles_any_attribute_spacing() {
+        let body = "<w:r><w:t>x</w:t></w:r></w:hyperlink>";
+        for opener in [
+            "<w:hyperlink w:history=\"1\"\tr:id=\"rId5\">",
+            "<w:hyperlink w:history=\"1\"\n  r:id=\"rId5\" w:tooltip=\"t\">",
+            "<w:hyperlink r:id = \"rId5\">",
+            "<w:hyperlink r:id\n=\n'rId5'>",
+            "<w:hyperlink\r\nr:id=\"rId5\"/>",
+        ] {
+            let raw = format!("{opener}{body}");
+            let out = with_opener_rel_id(&raw, "rId9");
+            let parsed_opener = {
+                let mut parser = XmlParser::new(&out);
+                assert_eq!(parser.next(), Event::Start, "{out}");
+                let ids: Vec<&str> = parser
+                    .attrs()
+                    .iter()
+                    .filter(|a| a.name == "r:id")
+                    .map(|a| a.value)
+                    .collect();
+                assert_eq!(ids, ["rId9"], "{out}");
+                out[..parser.pos()].to_string()
+            };
+            assert_eq!(parsed_opener.matches("r:id").count(), 1, "{out}");
+            assert!(!out.contains("rId5"), "{out}");
+            assert_eq!(out.len(), raw.len(), "only the value changed: {out}");
+        }
+    }
+
+    #[test]
+    fn link_part_hyperlinks_on_unreadable_rels_changes_no_link() {
+        for rels in [b"<Other/>".to_vec(), vec![0xff, 0xfe, b'<']] {
+            let mut pkg = new_package(Document::default());
+            pkg.parts
+                .push(("word/_rels/header1.xml.rels".to_string(), rels));
+            let pasted = r#"<w:hyperlink r:id="rId5"><w:r><w:t>link</w:t></w:r></w:hyperlink>"#;
+            let mut blocks = link_blocks(vec![
+                link(Some("https://a.example/"), None, None),
+                link(Some("https://b.example/"), Some("rId5"), Some(pasted)),
+            ]);
+            let before = blocks.clone();
+            assert!(
+                pkg.link_part_hyperlinks("word/header1.xml", &mut blocks)
+                    .is_err()
+            );
+            assert_eq!(blocks, before, "no link was changed");
+        }
+        // Without external links there's nothing to write, readable or not.
+        let mut pkg = new_package(Document::default());
+        pkg.parts.push((
+            "word/_rels/header1.xml.rels".to_string(),
+            b"<Other/>".to_vec(),
+        ));
+        let mut blocks = link_blocks(vec![link(None, None, None)]);
+        assert_eq!(
+            pkg.link_part_hyperlinks("word/header1.xml", &mut blocks),
+            Ok(None)
+        );
     }
 }

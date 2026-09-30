@@ -160,3 +160,70 @@ fn rejecting_a_tracked_orientation_change_prints_the_old_orientation() {
         "the editor's document, not the package's copy, is printed"
     );
 }
+
+#[test]
+fn watermark_and_line_numbers_end_to_end() {
+    // A UTF-16 header holding Word's VML "DRAFT" watermark (and no text), a
+    // numbered section of three lines.
+    let document = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="{W}" xmlns:r="{R}"><w:body><w:p><w:r><w:t>one</w:t></w:r></w:p><w:p><w:r><w:t>two</w:t></w:r></w:p><w:p><w:r><w:t>three</w:t></w:r></w:p><w:sectPr><w:headerReference w:type="default" r:id="rIdH"/><w:lnNumType w:countBy="1" w:restart="continuous"/><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720" w:gutter="0"/></w:sectPr></w:body></w:document>"#
+    );
+    let header = format!(
+        r##"<?xml version="1.0" encoding="UTF-16" standalone="yes"?>
+<w:hdr xmlns:w="{W}" xmlns:r="{R}" xmlns:v="urn:schemas-microsoft-com:vml"><w:p><w:r><w:pict><v:shape id="PowerPlusWaterMarkObject357" style="position:absolute;margin-left:0;margin-top:0;width:468pt;height:117pt;rotation:315;z-index:-251655168" fillcolor="#FF0000" stroked="f"><v:textpath style="font-family:&quot;Calibri&quot;;font-size:1pt" string="DRAFT"/></v:shape></w:pict></w:r></w:p></w:hdr>"##
+    );
+    let mut header_bytes = vec![0xff, 0xfe];
+    for unit in header.encode_utf16() {
+        header_bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/></Types>"#;
+    let root_rels = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{REL}/officeDocument" Target="word/document.xml"/></Relationships>"#
+    );
+    let document_rels = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdH" Type="{REL}/header" Target="header1.xml"/></Relationships>"#
+    );
+    let bytes = write_zip(&[
+        (
+            "[Content_Types].xml".to_string(),
+            content_types.as_bytes().to_vec(),
+        ),
+        ("_rels/.rels".to_string(), root_rels.into_bytes()),
+        ("word/document.xml".to_string(), document.into_bytes()),
+        (
+            "word/_rels/document.xml.rels".to_string(),
+            document_rels.into_bytes(),
+        ),
+        ("word/header1.xml".to_string(), header_bytes),
+    ]);
+    let pkg = load_package(&bytes).expect("load");
+    let opts = PdfOptions::from_package(&pkg, Rc::new(StyleSheet::default()));
+    let pages = pages(&to_pdf(&pkg.document, &opts));
+    assert_eq!(pages.len(), 1);
+    let content = &pages[0].1;
+    assert!(
+        content.starts_with(
+            "q\n1.000 0.000 0.000 rg\n0.7071 0.7071 -0.7071 0.7071 306.00 396.00 cm\nBT /F0 156.00 Tf"
+        ),
+        "{content}"
+    );
+    assert_eq!(content.matches("(DRAFT) Tj").count(), 1);
+    // 1, 2, 3 a quarter inch left of the text at 72pt, on each line.
+    let td = |text: &str| {
+        let line = content
+            .lines()
+            .find(|l| l.ends_with(&format!("({text}) Tj ET")))
+            .unwrap_or_else(|| panic!("{text}: {content}"));
+        let tok: Vec<&str> = line.split(' ').collect();
+        (tok[4].to_string(), tok[5].to_string())
+    };
+    for (n, word) in [("1", "one"), ("2", "two"), ("3", "three")] {
+        let (x, y) = td(n);
+        assert_eq!(x, "47.40");
+        assert_eq!(y, td(word).1);
+    }
+}

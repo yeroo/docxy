@@ -3225,20 +3225,51 @@ impl App {
             self.footers.default.as_ref() != &blocks
         };
         if commit && changed {
-            let rc = Rc::new(blocks.clone());
-            if hf.is_header {
-                self.headers.default = rc;
-            } else {
-                self.footers.default = rc;
-            }
             let tag = if hf.is_header { "w:hdr" } else { "w:ftr" };
-            if let Some(orig) = self.pkg.part(&hf.part) {
-                let orig = String::from_utf8_lossy(orig).into_owned();
-                let new_xml = splice_hf(&orig, &blocks, tag);
-                self.pkg.set_part(&hf.part, new_xml.into_bytes());
+            // Links need relationships in the part's own rels; they are
+            // computed first (the ids go into the XML) but written only with it.
+            let what = if hf.is_header { "header" } else { "footer" };
+            let mut blocks = blocks;
+            let written = self
+                .pkg
+                .link_part_hyperlinks(&hf.part, &mut blocks)
+                .and_then(|rels| {
+                    // Decode the part as the loader does (it may be UTF-16),
+                    // and write it back in its own encoding; a part whose
+                    // wrapper can't be found is left alone.
+                    let xml = self
+                        .pkg
+                        .part_text(&hf.part)
+                        .and_then(|orig| splice_hf(&orig, &blocks, tag))
+                        .ok_or(if hf.is_header {
+                            "the part isn't readable header XML"
+                        } else {
+                            "the part isn't readable footer XML"
+                        })?;
+                    Ok((xml, rels))
+                });
+            match written {
+                Ok((new_xml, rels)) => {
+                    self.pkg.set_part_text(&hf.part, &new_xml);
+                    if let Some(rels) = rels {
+                        self.pkg.apply_part_rels(rels);
+                    }
+                    let rc = Rc::new(blocks);
+                    if hf.is_header {
+                        self.headers.default = rc;
+                    } else {
+                        self.footers.default = rc;
+                    }
+                    self.refresh_watermark_state();
+                    self.modified = true;
+                }
+                Err(why) => {
+                    self.status = Some(format!(
+                        "Couldn't write the {what} edit to {}: {why}.",
+                        hf.part
+                    ));
+                }
             }
-            self.refresh_watermark_state();
-            self.modified = true;
         }
         self.page_view = hf.saved_page_view;
         self.dirty = true;
@@ -6868,23 +6899,21 @@ fn hf_part_name(sect: &str, rels: &Relationships, kind: &str, wtype: &str) -> Op
 
 /// Replace the inner content of a preserved header/footer part with serialized
 /// blocks, keeping the original `<w:hdr …>` wrapper (and its namespaces).
-fn splice_hf(original: &str, blocks: &[Block], tag: &str) -> String {
+/// `None` when the part has no such wrapper.
+fn splice_hf(original: &str, blocks: &[Block], tag: &str) -> Option<String> {
     let open = format!("<{tag}");
     let close = format!("</{tag}>");
-    let (Some(os), Some(ce)) = (original.find(&open), original.find(&close)) else {
-        return original.to_string();
-    };
-    let Some(inner_start) = original[os..].find('>').map(|e| os + e + 1) else {
-        return original.to_string();
-    };
+    let os = original.find(&open)?;
+    let ce = original.find(&close)?;
+    let inner_start = original[os..].find('>').map(|e| os + e + 1)?;
     if inner_start > ce {
-        return original.to_string();
+        return None;
     }
     let mut out = String::with_capacity(original.len() + 64);
     out.push_str(&original[..inner_start]);
     out.push_str(&blocks_to_xml(blocks));
     out.push_str(&original[ce..]);
-    out
+    Some(out)
 }
 
 /// Dispatch one terminal event. Returns true if the app should quit.
@@ -8420,7 +8449,7 @@ mod tests {
         .into_iter()
         .map(Block::Paragraph)
         .collect::<Vec<_>>();
-        let out = splice_hf(orig, &blocks, "w:hdr");
+        let out = splice_hf(orig, &blocks, "w:hdr").expect("wrapper found");
         assert!(out.starts_with("<?xml"));
         assert!(out.contains("xmlns:v=\"y\""), "namespaces lost: {out}");
         assert!(
@@ -9138,6 +9167,209 @@ mod tests {
         allowed.on_key(key(KeyCode::F(6)));
         assert!(!allowed.modified);
         assert_eq!(allowed.pkg.part(&part).unwrap(), before);
+    }
+
+    #[test]
+    fn splice_hf_without_the_wrapper_is_none() {
+        let blocks = vec![Block::Paragraph(MPara::default())];
+        assert_eq!(splice_hf("<w:ftr/>", &blocks, "w:hdr"), None);
+        assert_eq!(splice_hf("not xml", &blocks, "w:hdr"), None);
+        assert_eq!(splice_hf("</w:hdr><w:hdr>", &blocks, "w:hdr"), None);
+    }
+
+    /// An app whose header part (created by a first header edit typing
+    /// `first`) is then rewritten as `bytes`.
+    fn app_with_header_part(bytes: impl FnOnce(&str) -> Vec<u8>) -> (App, String) {
+        let mut app = app_with(&["body"]);
+        app.run_act(ribbon::Act::EditHeader);
+        for c in "first".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::F(6)));
+        let part = app.header_part.clone().expect("header part created");
+        let xml = app.pkg.part_text(&part).unwrap();
+        assert!(app.pkg.set_part(&part, bytes(&xml)));
+        (app, part)
+    }
+
+    fn utf16le_bom(text: &str) -> Vec<u8> {
+        let mut out = vec![0xff, 0xfe];
+        for unit in text.encode_utf16() {
+            out.extend_from_slice(&unit.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn header_edit_on_utf16_part_survives_commit_and_save() {
+        let (mut app, part) = app_with_header_part(|xml| {
+            utf16le_bom(&xml.replacen("encoding=\"UTF-8\"", "encoding=\"UTF-16\"", 1))
+        });
+        app.run_act(ribbon::Act::EditHeader);
+        app.editor.select_all();
+        for c in "second".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::F(6)));
+        assert!(app.hf_edit.is_none());
+
+        let bytes = app.pkg.part(&part).unwrap();
+        assert!(
+            bytes.starts_with(&[0xff, 0xfe, b'<', 0]),
+            "still UTF-16LE with a BOM"
+        );
+        let xml = app.pkg.part_text(&part).expect("decodes");
+        assert!(xml.contains("encoding=\"UTF-16\""), "{xml}");
+        assert!(
+            xml.contains("<w:hdr ") && xml.contains("xmlns:w="),
+            "wrapper kept: {xml}"
+        );
+        assert!(
+            xml.contains(">second<") && !xml.contains(">first<"),
+            "{xml}"
+        );
+
+        // The saved file reads back with the edit, and the PDF prints it.
+        let saved = load_package(&save_package(&app.pkg)).expect("reload");
+        let blocks = saved.header_footer_blocks(&part).expect("header blocks");
+        assert_eq!(blocks[0].plain_text(), "second");
+        let opts = PdfOptions::from_package(&saved, app.styles.clone());
+        let pdf = String::from_utf8_lossy(&to_pdf(&saved.document, &opts)).into_owned();
+        assert!(pdf.contains("(second) Tj"), "{pdf}");
+    }
+
+    #[test]
+    fn header_edit_with_missing_wrapper_reports_and_changes_nothing() {
+        let (mut app, part) = app_with_header_part(|_| b"<junk/>".to_vec());
+        let before = app.headers.default.clone();
+        app.run_act(ribbon::Act::EditHeader);
+        app.editor.select_all();
+        app.on_key(key(KeyCode::Char('x')));
+        app.on_key(key(KeyCode::F(6)));
+        assert!(app.hf_edit.is_none());
+        assert_eq!(app.pkg.part(&part).unwrap(), b"<junk/>", "part untouched");
+        assert_eq!(
+            app.headers.default, before,
+            "the page view keeps the old header"
+        );
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.contains("Couldn't write the header edit"),
+            "{status}"
+        );
+    }
+
+    #[test]
+    fn header_edit_links_get_header_relationships() {
+        use docxcore::model::Hyperlink;
+        let hl = |url: &str, rel_id: Option<&str>, raw: Option<String>| {
+            Inline::Hyperlink(Hyperlink {
+                target: Some(url.to_string()),
+                rel_id: rel_id.map(str::to_string),
+                runs: vec![Run {
+                    text: url.to_string(),
+                    props: RunProps::default(),
+                }],
+                raw,
+                ..Hyperlink::default()
+            })
+        };
+        let mut app = app_with(&["body"]);
+        app.run_act(ribbon::Act::EditHeader);
+        let part = app.header_part.clone().expect("header part created");
+        // Paste Special > Hyperlink (no id) and a Keep Source paste of a body
+        // link (the body's id, with its preserved markup).
+        let pasted = r#"<w:hyperlink r:id="rId42" w:tooltip="tip"><w:r><w:t>https://b.example/</w:t></w:r></w:hyperlink>"#;
+        app.editor.doc.body = vec![Block::Paragraph(MPara {
+            props: ParProps::default(),
+            content: vec![
+                hl("https://a.example/", None, None),
+                hl(
+                    "https://b.example/",
+                    Some("rId42"),
+                    Some(pasted.to_string()),
+                ),
+            ],
+        })];
+        app.on_key(key(KeyCode::F(6)));
+        assert!(app.hf_edit.is_none());
+
+        let rels_name = part.replace("word/", "word/_rels/") + ".rels";
+        let rels = parse_rels_xml(&app.pkg.part_text(&rels_name).expect("header rels"));
+        let xml = app.pkg.part_text(&part).unwrap();
+        assert!(!xml.contains("rId42"), "{xml}");
+        assert!(xml.contains(r#"w:tooltip="tip""#), "{xml}");
+
+        // Saved and reopened, both links keep their URLs, and print as links.
+        let saved = load_package(&save_package(&app.pkg)).expect("reload");
+        let blocks = saved.header_footer_blocks(&part).expect("header blocks");
+        let Block::Paragraph(p) = &blocks[0] else {
+            panic!("{blocks:?}")
+        };
+        let targets: Vec<_> = p
+            .content
+            .iter()
+            .filter_map(|inl| match inl {
+                Inline::Hyperlink(h) => {
+                    let id = h.rel_id.as_deref().expect("an id");
+                    assert_eq!(rels.target(id), h.target.as_deref());
+                    h.target.clone()
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(targets, ["https://a.example/", "https://b.example/"]);
+        let opts = PdfOptions::from_package(&saved, app.styles.clone());
+        let pdf = String::from_utf8_lossy(&to_pdf(&saved.document, &opts)).into_owned();
+        assert!(pdf.contains("/URI (https://a.example/)"), "{pdf}");
+        assert!(pdf.contains("/URI (https://b.example/)"));
+    }
+
+    #[test]
+    fn header_edit_link_with_unreadable_header_rels_writes_nothing() {
+        let link_body = |url: &str| {
+            vec![Block::Paragraph(MPara {
+                props: ParProps::default(),
+                content: vec![Inline::Hyperlink(docxcore::model::Hyperlink {
+                    target: Some(url.to_string()),
+                    runs: vec![Run {
+                        text: url.to_string(),
+                        props: RunProps::default(),
+                    }],
+                    ..docxcore::model::Hyperlink::default()
+                })],
+            })]
+        };
+        // A first link creates the header's rels, which then turn unreadable.
+        let mut app = app_with(&["body"]);
+        app.run_act(ribbon::Act::EditHeader);
+        let part = app.header_part.clone().expect("header part created");
+        app.editor.doc.body = link_body("https://a.example/");
+        app.on_key(key(KeyCode::F(6)));
+        let rels_name = part.replace("word/", "word/_rels/") + ".rels";
+        assert!(
+            app.pkg
+                .set_part(&rels_name, b"<NotRelationships/>".to_vec())
+        );
+        let header_before = app.pkg.part(&part).unwrap().to_vec();
+        let shown_before = app.headers.default.clone();
+        app.run_act(ribbon::Act::EditHeader);
+        app.editor.doc.body = link_body("https://b.example/");
+        app.on_key(key(KeyCode::F(6)));
+        assert!(app.hf_edit.is_none());
+        assert_eq!(
+            app.pkg.part(&part).unwrap(),
+            header_before,
+            "header untouched"
+        );
+        assert_eq!(app.pkg.part(&rels_name).unwrap(), b"<NotRelationships/>");
+        assert_eq!(app.headers.default, shown_before);
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.contains("Couldn't write the header edit")
+                && status.contains("Relationships root"),
+            "{status}"
+        );
     }
 
     #[test]
