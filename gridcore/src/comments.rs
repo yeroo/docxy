@@ -270,10 +270,23 @@ fn parse_threaded(xml: &str, sheet: usize, persons: &[(String, String)], out: &m
 
 impl SheetPackage {
     /// Add or replace the legacy note on `(row, col)` of `sheet`.
-    pub fn set_comment(&mut self, sheet: usize, row: u32, col: u32, author: &str, text: &str) {
+    /// `false`, with nothing changed, when the note can't be written: no
+    /// such sheet, or a worksheet part malformed where its `<legacyDrawing>`
+    /// would go.
+    pub fn set_comment(
+        &mut self,
+        sheet: usize,
+        row: u32,
+        col: u32,
+        author: &str,
+        text: &str,
+    ) -> bool {
         let Some(ws_part) = self.sheet_parts.get(sheet).cloned() else {
-            return;
+            return false;
         };
+        if !self.sheet_takes(sheet, "legacyDrawing", true) {
+            return false;
+        }
         let mut notes = self.sheet_notes(sheet);
         notes.retain(|n| !(n.row == row && n.col == col));
         notes.push(Note {
@@ -284,6 +297,7 @@ impl SheetPackage {
         });
         notes.sort_by_key(|n| (n.row, n.col));
         self.write_notes(sheet, &ws_part, &notes);
+        true
     }
 
     /// Remove the comment on `(row, col)` of `sheet` — the threaded

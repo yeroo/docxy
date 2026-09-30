@@ -1207,7 +1207,12 @@ impl SheetView {
 
     /// Snapshot before a mutation; share the history limit across all edits.
     fn push_undo(&mut self) {
-        self.undo.push(self.snapshot());
+        self.push_undo_snapshot(self.snapshot());
+    }
+
+    /// Record `snap`, taken before an edit that has now landed.
+    fn push_undo_snapshot(&mut self, snap: SheetSnapshot) {
+        self.undo.push(snap);
         if self.undo.len() > 100 {
             self.undo.remove(0);
         }
@@ -9223,6 +9228,32 @@ impl Docxy {
         }
     }
 
+    /// Run a package edit that the workbook's file can refuse (its worksheet
+    /// XML is damaged where the edit would go). Landed, it gets an undo step
+    /// (with `undoable`) and dirties the tab; refused, nothing changed, so
+    /// neither happens and the status says so.
+    fn sheet_try_edit(
+        &mut self,
+        undoable: bool,
+        edit: impl FnOnce(&mut SheetView) -> bool,
+    ) -> bool {
+        let Some(v) = self.active_sheet_mut() else {
+            return false;
+        };
+        let snap = undoable.then(|| v.snapshot());
+        if !edit(v) {
+            self.set_status(
+                "Can't add that here: this sheet's XML is damaged where it would go (nothing changed)",
+            );
+            return false;
+        }
+        if let Some(snap) = snap {
+            v.push_undo_snapshot(snap);
+        }
+        self.mark_sheet_dirty();
+        true
+    }
+
     fn sheet_undo(&mut self, cx: &mut Context<Self>) {
         let mut done = false;
         if let Some(v) = self.active_sheet_mut() {
@@ -9617,18 +9648,16 @@ impl Docxy {
             "enter" => {
                 let cells = self.bar_cells();
                 if buf.trim().eq_ignore_ascii_case("clear") {
-                    self.sheet_snapshot();
-                    if let Some(v) = self.active_sheet_mut() {
+                    self.sheet_try_edit(true, |v| {
                         let s = v.active;
-                        v.pkg.clear_conditional_formats(s);
+                        let done = v.pkg.clear_conditional_formats(s);
                         v.engine = sheet_engine(&v.pkg.workbook);
-                    }
-                    self.mark_sheet_dirty();
+                        done
+                    });
                 } else if let Some(((op, val, val2), cells)) = parse_cf_input(&buf).zip(cells) {
-                    self.sheet_snapshot();
-                    if let Some(v) = self.active_sheet_mut() {
+                    self.sheet_try_edit(true, |v| {
                         let s = v.active;
-                        v.pkg.add_conditional_format(
+                        let done = v.pkg.add_conditional_format(
                             s,
                             cells,
                             op,
@@ -9637,8 +9666,8 @@ impl Docxy {
                             cf_preset_dxf(),
                         );
                         v.engine = sheet_engine(&v.pkg.workbook);
-                    }
-                    self.mark_sheet_dirty();
+                        done
+                    });
                 }
                 self.sheet_cf_edit = None;
                 self.bar_close();
@@ -9841,11 +9870,9 @@ impl Docxy {
                     _ if items.is_empty() => {}
                     Some((cells, s)) => {
                         let f1 = format!("\"{}\"", items.join(","));
-                        self.sheet_snapshot();
-                        if let Some(v) = self.active_sheet_mut() {
-                            v.pkg.add_data_validation(s, cells, "list", "", &f1, None);
-                        }
-                        self.mark_sheet_dirty();
+                        self.sheet_try_edit(true, |v| {
+                            v.pkg.add_data_validation(s, cells, "list", "", &f1, None)
+                        });
                     }
                     // The pinned range no longer resolves — its sheet was
                     // renamed or removed while this bar sat open. The bar closes
@@ -9907,17 +9934,17 @@ impl Docxy {
             return;
         };
         let author = Self::comment_author();
-        if let Some(v) = self.active_sheet_mut() {
+        self.sheet_try_edit(false, |v| {
             let (r, c) = v.sel;
             let s = v.active;
             let t = text.trim();
             if t.is_empty() {
                 v.pkg.remove_comment(s, r, c);
+                true
             } else {
-                v.pkg.set_comment(s, r, c, &author, t);
+                v.pkg.set_comment(s, r, c, &author, t)
             }
-        }
-        self.mark_sheet_dirty();
+        });
         cx.notify();
     }
 
@@ -10135,8 +10162,7 @@ impl Docxy {
     /// text.
     fn sheet_format_as_table(&mut self, cx: &mut Context<Self>) {
         use gridcore::sheet::CellValue;
-        self.sheet_snapshot();
-        if let Some(v) = self.active_sheet_mut() {
+        self.sheet_try_edit(true, |v| {
             let s = v.active;
             let (max_r, max_c) = v.extent();
             let region = if v.has_range() {
@@ -10171,16 +10197,19 @@ impl Docxy {
                     Some((top, left, bottom, right))
                 }
             };
-            if let Some((r1, c1, r2, c2)) = region {
-                let sh = &v.pkg.workbook.sheets[s];
-                let has_header = (c1..=c2).all(|c| {
-                    matches!(sh.cell(r1, c).map(|cl| &cl.value), Some(CellValue::Text(_)))
-                });
-                v.pkg
-                    .add_table(s, (r1, c1, r2, c2), has_header, "TableStyleMedium2");
+            match region {
+                Some((r1, c1, r2, c2)) => {
+                    let sh = &v.pkg.workbook.sheets[s];
+                    let has_header = (c1..=c2).all(|c| {
+                        matches!(sh.cell(r1, c).map(|cl| &cl.value), Some(CellValue::Text(_)))
+                    });
+                    v.pkg
+                        .add_table(s, (r1, c1, r2, c2), has_header, "TableStyleMedium2")
+                        .is_some()
+                }
+                None => true,
             }
-        }
-        self.mark_sheet_dirty();
+        });
         cx.notify();
     }
 
@@ -19498,22 +19527,26 @@ impl Docxy {
         }
         let cells = self.bar_cells();
         if buf.trim().eq_ignore_ascii_case("clear") {
-            self.sheet_snapshot();
-            if let Some(v) = self.active_sheet_mut() {
+            self.sheet_try_edit(true, |v| {
                 let s = v.active;
-                v.pkg.clear_conditional_formats(s);
+                let done = v.pkg.clear_conditional_formats(s);
                 v.engine = sheet_engine(&v.pkg.workbook);
-            }
-            self.mark_sheet_dirty();
+                done
+            });
         } else if let Some(((op, val, val2), cells)) = parse_cf_input(&buf).zip(cells) {
-            self.sheet_snapshot();
-            if let Some(v) = self.active_sheet_mut() {
+            self.sheet_try_edit(true, |v| {
                 let s = v.active;
-                v.pkg
-                    .add_conditional_format(s, cells, op, &val, val2.as_deref(), cf_preset_dxf());
+                let done = v.pkg.add_conditional_format(
+                    s,
+                    cells,
+                    op,
+                    &val,
+                    val2.as_deref(),
+                    cf_preset_dxf(),
+                );
                 v.engine = sheet_engine(&v.pkg.workbook);
-            }
-            self.mark_sheet_dirty();
+                done
+            });
         }
         self.sheet_cf_edit = None;
         self.bar_close();
