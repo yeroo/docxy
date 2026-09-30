@@ -15554,7 +15554,8 @@ mod sheet_save_tests {
         finish_sheet_save(&mut tab, Some(&dir.path("in.xlsm")));
         let ct = workbook_content_type(&dir.path("in.xlsm"));
         assert!(ct.contains("sheet.macroEnabled.main+xml"), "{ct}");
-        let again = gridcore::xlsx::load_xlsx(&std::fs::read(dir.path("in.xlsm")).unwrap()).unwrap();
+        let again =
+            gridcore::xlsx::load_xlsx(&std::fs::read(dir.path("in.xlsm")).unwrap()).unwrap();
         assert!(again.has_macro_sheets());
         assert_eq!(again.workbook.sheets.len(), 2);
 
