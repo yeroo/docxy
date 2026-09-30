@@ -135,6 +135,42 @@ fn matching_close(blocks: &[Block], open: usize) -> Option<usize> {
     None
 }
 
+/// The partner of each block content-control boundary, by index: opening
+/// and closing boundaries paired the way the loader nested them.
+fn sdt_pairs(blocks: &[Block]) -> Vec<(usize, usize)> {
+    let mut open: Vec<usize> = Vec::new();
+    let mut pairs = Vec::new();
+    for (i, b) in blocks.iter().enumerate() {
+        let Block::Raw(raw) = b else { continue };
+        if is_sdt_open(raw) {
+            open.push(i);
+        } else if is_sdt_close(raw) {
+            if let Some(o) = open.pop() {
+                pairs.push((o, i));
+            }
+        }
+    }
+    pairs
+}
+
+/// For a deletion of `blocks[from..=to]`: the index of each boundary outside
+/// that range whose partner is inside it, ascending. Dropping those too
+/// removes exactly the controls the deletion cut, and leaves every other
+/// control (a neighbour, the one around them) with its own properties.
+pub(crate) fn sdt_partners_outside(blocks: &[Block], from: usize, to: usize) -> Vec<usize> {
+    let inside = |i: usize| (from..=to).contains(&i);
+    let mut out: Vec<usize> = sdt_pairs(blocks)
+        .into_iter()
+        .filter_map(|(o, c)| match (inside(o), inside(c)) {
+            (true, false) => Some(c),
+            (false, true) => Some(o),
+            _ => None,
+        })
+        .collect();
+    out.sort_unstable();
+    out
+}
+
 /// Drop every block content-control boundary in `blocks` that has no
 /// partner (an opening one never closed, a closing one never opened), so the
 /// blocks serialize to well-formed XML; the content between stays, as plain
@@ -321,6 +357,54 @@ mod tests {
             let at = ed.caret.path[0];
             assert!(matches!(ed.doc.body[at], Block::Paragraph(_)));
         }
+        // A cut across two neighbouring controls, and out of a nested one,
+        // drops the controls it cut and keeps the others' own properties.
+        let control = |name: &str, body: &str| {
+            format!(
+                "<w:sdt><w:sdtPr><w:alias w:val=\"{name}\"/></w:sdtPr><w:sdtContent>{body}</w:sdtContent></w:sdt>"
+            )
+        };
+        let p = |t: &str| format!("<w:p><w:r><w:t>{t}</w:t></w:r></w:p>");
+        let raws = |b: &[Block]| -> Vec<String> {
+            b.iter()
+                .filter_map(|b| match b {
+                    Block::Raw(r) => Some(r.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Neighbours: [openA, pA, closeA, openB, pB, closeB], from pA to pB.
+        let xml = format!("{}{}", control("A", &p("aa")), control("B", &p("bb")));
+        let mut ed = Editor::new(crate::model::Document { body: blocks(&xml) });
+        ed.anchor = Some(Caret {
+            path: vec![1],
+            offset: 1,
+        });
+        ed.caret = Caret {
+            path: vec![4],
+            offset: 1,
+        };
+        ed.delete_forward();
+        assert!(raws(&ed.doc.body).is_empty(), "{:?}", ed.doc.body);
+        assert_eq!(ed.doc.body[ed.caret.path[0]].plain_text(), "ab");
+        // Nested: [openO, openI, pI, closeI, pO, closeO], from pI into pO:
+        // the inner control goes, the outer keeps its own properties.
+        let xml = control("O", &format!("{}{}", control("I", &p("ii")), p("oo")));
+        let mut ed = Editor::new(crate::model::Document { body: blocks(&xml) });
+        ed.anchor = Some(Caret {
+            path: vec![2],
+            offset: 1,
+        });
+        ed.caret = Caret {
+            path: vec![4],
+            offset: 1,
+        };
+        ed.delete_forward();
+        let left = raws(&ed.doc.body);
+        assert_eq!(left.len(), 2, "{:?}", ed.doc.body);
+        assert!(left[0].contains("w:val=\"O\""), "{left:?}");
+        assert!(balanced(&ed.doc.body));
+        assert_eq!(ed.doc.body[ed.caret.path[0]].plain_text(), "io");
         // Select All + Delete over a number last or first in its part.
         let number = page_number_sdt_xml(&PAGE_NUMBER_DESIGNS[1], false, 2);
         for xml in [format!("{before}{number}"), format!("{number}{after}")] {

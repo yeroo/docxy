@@ -15,12 +15,14 @@
 //! removal, a copy made by unlinking) live in the package and are not undone;
 //! an unreferenced part left behind is harmless.
 use super::*;
-use crate::dialog::{
-    Button, ButtonRole, Control as Field, ControlKind, Dialog, DialogOwner, Value,
-};
+use crate::dialog::{Control as Field, ControlKind, Dialog, DialogOwner, Value};
 use crate::hf::PageSlot;
+use crate::page_setup::{ok_cancel, text_of, twips_of};
 use ctlcore::json::Json;
 use docxcore::sect::{TWIPS_PER_INCH, hf_reference, set_hf_reference};
+
+/// The namespaces header/footer content the editor writes uses.
+const HF_NAMESPACES: [(&str, &str); 3] = [("w", W_NS), ("r", R_NS), ("m", M_NS)];
 
 /// A Header & Footer command.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -516,17 +518,25 @@ fn root_of(xml: &str, is_header: bool) -> Option<(String, String)> {
     };
     let gt = start + xml[start..].find('>')?;
     let close = format!("</{tag}>");
-    if xml[..gt].ends_with('/') {
-        // `<w:hdr …/>`: an empty part; open it up.
-        return Some((format!("{}>", &xml[..gt - 1]), close));
+    // `<w:hdr …/>`, an empty part, opens up.
+    let end = if xml[..gt].ends_with('/') { gt - 1 } else { gt };
+    // Declare any namespace the editor's content uses that the root lacks.
+    let mut head = xml[..end].to_string();
+    let root = &xml[start..end];
+    for (prefix, ns) in HF_NAMESPACES {
+        if !root.contains(&format!("xmlns:{prefix}=")) {
+            head.push_str(&format!(" xmlns:{prefix}=\"{ns}\""));
+        }
     }
-    Some((xml[..=gt].to_string(), close))
+    head.push('>');
+    Some((head, close))
 }
 
 /// Replace an existing header/footer part's content with `inner` (block XML),
 /// keeping the part's own root start tag, so the namespaces its drawings,
-/// VML and markup-compatibility content use stay declared. A part without a
-/// readable root gets a fresh one ([`part_xml`]).
+/// VML and markup-compatibility content use stay declared, plus any of
+/// `w`/`r`/`m` it lacks (the editor's content may use them). A part without
+/// a readable root gets a fresh one ([`part_xml`]).
 pub(crate) fn rewrite_part(pkg: &mut Package, part: &str, is_header: bool, inner: &str) {
     let existing = pkg
         .part(part)
@@ -854,13 +864,7 @@ pub(crate) fn distance_dialog(tab: &DocTab, is_header: bool) -> Result<Dialog, S
         ControlKind::Number,
         Value::Text(crate::page_setup::inches(twips)),
     )];
-    d.buttons = vec![
-        Button {
-            default: true,
-            ..Button::new("OK", ButtonRole::Accept)
-        },
-        Button::new("Cancel", ButtonRole::Cancel),
-    ];
+    d.buttons = ok_cancel();
     d.mark_opened();
     Ok(d)
 }
@@ -872,19 +876,9 @@ pub(crate) fn apply_distance(
     is_header: bool,
     section: usize,
 ) -> Result<bool, String> {
-    let text = d
-        .controls
-        .iter()
-        .find(|c| c.name == "distance")
-        .map(|c| c.text())
-        .unwrap_or_default();
-    let v = text
-        .trim()
-        .parse::<f64>()
-        .ok()
-        .filter(|v| v.is_finite() && (0.0..=22.0).contains(v))
+    let twips = twips_of(&text_of(d, "distance"))
+        .filter(|t| (0..=22 * TWIPS_PER_INCH).contains(t))
         .ok_or("Enter a distance from 0\" to 22\"")?;
-    let twips = (v * TWIPS_PER_INCH as f64).round() as i32;
     Ok(ed.edit_section_setups(&[section], |s| {
         if is_header {
             s.margins.header = twips;

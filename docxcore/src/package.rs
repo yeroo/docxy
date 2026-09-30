@@ -167,7 +167,7 @@ pub enum HeaderVariant {
 
 impl HeaderVariant {
     /// Every variant, in [`HeaderVariant::index`] order.
-    pub const ALL: [HeaderVariant; 3] = [Self::Default, Self::First, Self::Even];
+    pub(crate) const ALL: [HeaderVariant; 3] = [Self::Default, Self::First, Self::Even];
 
     /// The `w:type` of a `w:headerReference`/`w:footerReference`.
     pub fn as_ooxml(self) -> &'static str {
@@ -179,7 +179,7 @@ impl HeaderVariant {
     }
 
     /// The slot of this variant in [`SectionParts`].
-    pub fn index(self) -> usize {
+    pub(crate) fn index(self) -> usize {
         match self {
             Self::Default => 0,
             Self::First => 1,
@@ -530,7 +530,7 @@ fn part_rels_name(part: &str) -> Option<String> {
 /// The package part name a `word/_rels/document.xml.rels` target names
 /// (`header1.xml` -> `word/header1.xml`), or `None` for an external or
 /// malformed target.
-pub fn resolve_document_relationship_target(target: &str) -> Option<String> {
+pub(crate) fn resolve_document_relationship_target(target: &str) -> Option<String> {
     if target.contains('\\') || target.contains("://") {
         return None;
     }
@@ -860,11 +860,7 @@ impl Package {
     /// relationships. Each inherited header is associated with every section in
     /// which it remains effective rather than merely scanning orphan header parts.
     pub fn watermarks(&self) -> Vec<Watermark> {
-        const VARIANTS: [HeaderVariant; 3] = [
-            HeaderVariant::Default,
-            HeaderVariant::First,
-            HeaderVariant::Even,
-        ];
+        const VARIANTS: [HeaderVariant; 3] = HeaderVariant::ALL;
 
         let even_and_odd = self.has_even_odd();
         let sections = self.section_sect_prs();
@@ -988,10 +984,11 @@ impl Package {
     ) -> Option<(String, String)> {
         const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
         const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        const M_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/math";
         let tag = if is_header { "w:hdr" } else { "w:ftr" };
         let body = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
-<{tag} xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\">{content_xml}</{tag}>"
+<{tag} xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\" xmlns:m=\"{M_NS}\">{content_xml}</{tag}>"
         );
         self.add_hf_part(is_header, body.into_bytes(), None)
     }

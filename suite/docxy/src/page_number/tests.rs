@@ -33,6 +33,17 @@ fn saved_blocks(pkg: &Package, section: usize, is_header: bool) -> Vec<Block> {
         .unwrap_or_default()
 }
 
+/// The saved bytes of a section's resolved header (`is_header`) or footer
+/// part, as written: no re-parse to smooth over malformed XML.
+fn saved_part_xml(pkg: &Package, section: usize, is_header: bool) -> String {
+    let parts = docxcore::package::section_header_parts(&saved_sections(pkg), &pkg.document_rels());
+    let part = &parts[section]
+        .get(is_header, HeaderVariant::Default)
+        .unwrap()
+        .part_name;
+    String::from_utf8_lossy(pkg.part(part).unwrap()).into_owned()
+}
+
 fn page_fields(blocks: &[Block]) -> usize {
     docxcore::serialize::blocks_to_xml(blocks)
         .matches(" PAGE ")
@@ -325,7 +336,14 @@ fn removing_page_numbers_keeps_the_parts_namespace_declarations() {
     assert!(remove_all(&mut t).unwrap());
     let pkg = saved(&mut t);
     let out = String::from_utf8_lossy(pkg.part(&part).unwrap()).into_owned();
-    assert!(out.contains(root), "the root stays: {out}");
+    // The root's own attributes stay as they were; `m`, which it lacked, joins them.
+    assert!(
+        out.contains(&format!(
+            "{} xmlns:m=\"http://schemas.openxmlformats.org/officeDocument/2006/math\">",
+            root.trim_end_matches('>')
+        )),
+        "the root stays: {out}"
+    );
     assert!(out.contains("<wp:inline>"), "{out}");
     assert!(!out.contains("w:sdt"), "{out}");
     assert!(out.trim_end().ends_with("</w:ftr>"));
@@ -351,8 +369,7 @@ fn select_all_delete_over_a_placed_number_saves_a_well_formed_part() {
         editor.select_all();
         editor.delete_forward();
         let pkg = saved(&mut t);
-        let blocks = saved_blocks(&pkg, 0, top);
-        let xml = docxcore::serialize::blocks_to_xml(&blocks);
+        let xml = saved_part_xml(&pkg, 0, top);
         assert_eq!(
             xml.matches("<w:sdt>").count(),
             xml.matches("</w:sdt>").count(),
@@ -372,7 +389,7 @@ fn flushing_drops_a_content_control_boundary_left_alone() {
     let open = body.iter().position(is_page_number_open).unwrap();
     body.remove(open);
     let pkg = saved(&mut t);
-    let xml = docxcore::serialize::blocks_to_xml(&saved_blocks(&pkg, 0, false));
+    let xml = saved_part_xml(&pkg, 0, false);
     assert!(!xml.contains("sdt"), "{xml}");
     assert!(xml.contains(" PAGE "), "the content stays: {xml}");
 }

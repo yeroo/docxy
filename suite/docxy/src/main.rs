@@ -2315,7 +2315,7 @@ impl ScreenRect {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct EffIndent {
     left: i32,
     first: i32,
@@ -13496,8 +13496,10 @@ impl Docxy {
         let Some(g) = self.ruler_probe.borrow().painted.clone() else {
             return;
         };
-        let indent = match self.tabs.get(self.active).map(|t| &t.surface) {
-            Some(Surface::Doc(ed)) => eff_indent(&ed.caret_para_props()),
+        // The indents the ruler draws, and the drag writes: the open header
+        // or footer's paragraph, else the body's.
+        let indent = match self.tabs.get(self.active) {
+            Some(t) if matches!(t.surface, Surface::Doc(_)) => ruler_para_of(t).0,
             _ => return,
         };
         let geom = self
@@ -16971,9 +16973,15 @@ fn edit_final_sect_pr<R>(
 /// `wtype` names, if it has one (tests read saved sectPrs with it).
 #[cfg(test)]
 fn hf_part_name_typed(pkg: &Package, sect: &str, is_header: bool, wtype: &str) -> Option<String> {
-    let rid = docxcore::sect::hf_reference(sect, is_header, wtype)?;
-    let rels = pkg.document_rels();
-    docxcore::package::resolve_document_relationship_target(rels.target(&rid)?)
+    docxcore::sect::hf_reference(sect, is_header, wtype)?;
+    let variant = match wtype {
+        "first" => HeaderVariant::First,
+        "even" => HeaderVariant::Even,
+        _ => HeaderVariant::Default,
+    };
+    docxcore::package::section_header_parts(&[sect], &pkg.document_rels())[0]
+        .get(is_header, variant)
+        .map(|a| a.part_name.clone())
 }
 
 /// Blocks of a section's own header/footer reference, or empty if absent.

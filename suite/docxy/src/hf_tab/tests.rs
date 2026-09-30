@@ -452,12 +452,60 @@ fn saved_links_survive_a_reload() {
     hf_apply(&mut t, HfAct::LinkToPrevious).unwrap();
     exit_hf_tab(&mut t);
     let pkg = saved(&mut t);
-    let rid = hf_reference(&saved_sections(&pkg)[1], true, "default").unwrap();
-    let part = docxcore::package::resolve_document_relationship_target(
-        pkg.document_rels().target(&rid).unwrap(),
-    )
-    .unwrap();
+    let part = hf_part_name_typed(&pkg, &saved_sections(&pkg)[1], true, "default").unwrap();
     assert_eq!(part_text(&pkg, &part), "Header A");
+}
+
+/// M1 (r2): a part whose root declares only some of the namespaces the
+/// header editor writes (`w`, `r`, `m`) gets the missing ones on rewrite;
+/// its other root attributes stay as they were.
+#[test]
+fn a_rewritten_part_declares_the_namespaces_its_content_uses() {
+    let mut pkg = docxcore::package::new_package(docxcore::model::Document {
+        body: vec![Block::Paragraph(Default::default())],
+    });
+    let (_, part) = pkg.create_hf_part(true, "<w:p/>").unwrap();
+    let w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+    let r = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    let root = format!("<w:hdr xmlns:w=\"{w}\" xmlns:r=\"{r}\" xmlns:x=\"urn:x\" x:keep=\"1\">");
+    pkg.set_part(
+        &part,
+        format!("<?xml version=\"1.0\"?>\n{root}<w:p/></w:hdr>").into_bytes(),
+    );
+    let math = "<w:p><m:oMathPara><m:oMath><m:r><m:t>x</m:t></m:r></m:oMath></m:oMathPara></w:p>";
+    rewrite_part(&mut pkg, &part, true, math);
+    let out = String::from_utf8_lossy(pkg.part(&part).unwrap()).into_owned();
+    let head = &out[..out.find(math).unwrap()];
+    assert!(
+        head.contains("xmlns:m=\"http://schemas.openxmlformats.org/officeDocument/2006/math\""),
+        "{out}"
+    );
+    for kept in [
+        format!("xmlns:w=\"{w}\""),
+        format!("xmlns:r=\"{r}\""),
+        "xmlns:x=\"urn:x\"".into(),
+        "x:keep=\"1\"".into(),
+    ] {
+        assert_eq!(head.matches(kept.as_str()).count(), 1, "{kept} in {out}");
+    }
+    assert!(out.ends_with(&format!("{math}</w:hdr>")));
+    // A part the app creates declares `m` from the start.
+    let (_, new) = pkg.create_hf_part(false, "<w:p/>").unwrap();
+    let xml = String::from_utf8_lossy(pkg.part(&new).unwrap()).into_owned();
+    assert!(xml.contains("xmlns:m="), "{xml}");
+}
+
+/// m3 (r2): the ruler's indents (which a drag starts from) are the open
+/// header's paragraph's, not the body's.
+#[test]
+fn the_rulers_indents_follow_the_open_header() {
+    let mut t = three_sections("ruler-indent", true);
+    edit_at(&mut t, 0, true);
+    t.hf_edit.as_mut().unwrap().editor.set_indent(720, 0);
+    let header = eff_indent(&t.hf_edit.as_ref().unwrap().editor.caret_para_props());
+    let body = eff_indent(&ed(&t).caret_para_props());
+    assert_ne!(header, body);
+    assert_eq!(ruler_para_of(&t).0, header);
 }
 
 /// The KeyTips one tab shows at once: its buttons', not its menus' items.

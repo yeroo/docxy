@@ -747,11 +747,11 @@ first, in the `delete-summary` dialog.
 - **the Header, Footer and Page Number drop-downs** (#641, #650), on Insert ›
   Header & Footer and on the contextual Header & Footer tab. Header and Footer
   list the `Built-in` designs (Blank, Blank (Three Columns)), then Edit and
-  Remove. Page Number lists Top of Page, Bottom of Page and Current Position,
-  each opening a submenu of designs (`menu-click {"path": ["Bottom of Page",
-  "Plain Number 2"]}`; the pointer opens a submenu in the menu's place), Page
-  Margins (`enabled: false`), then Format Page Numbers... (the
-  `page-number-format` dialog) and Remove Page Numbers. The contextual tab's
+  Remove. Page Number lists Top of Page, Bottom of Page, Page Margins
+  (`enabled: false`) and Current Position, each available one opening a
+  submenu of designs (`menu-click {"path": ["Bottom of Page", "Plain Number
+  2"]}`; the pointer opens a submenu in the menu's place), then Format Page
+  Numbers... (the `page-number-format` dialog) and Remove Page Numbers. The contextual tab's
   Header from Top and Footer from Bottom boxes open a menu of distances, the
   current one `checked`, and Custom... (the `hf-distance` dialog).
 
