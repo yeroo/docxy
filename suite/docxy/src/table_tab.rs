@@ -913,10 +913,9 @@ impl Docxy {
                 let act = it.act;
                 let selected = self.act_active(act);
                 let mut sample = new_table(4, 4, 4 * 240, AutoFit::Default);
+                // A new table already has Word's default style options.
                 edit_table_props(&mut sample, |p| {
-                    p.remove("w:tblBorders");
-                    p.set(&format!("<w:tblStyle w:val=\"{}\"/>", it.preview));
-                    p.set(&TblLook::default().to_xml());
+                    p.set(&format!("<w:tblStyle w:val=\"{}\"/>", it.preview))
                 });
                 let style = docxcore::table_styles::lookup_style(None, it.preview);
                 let boxes = crate::table_view::layout(&sample, style.as_ref());

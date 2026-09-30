@@ -295,8 +295,9 @@ impl Editor {
     }
 
     /// Whether every side a border command sets already shows a line (the
-    /// button is "on"). Only a cell's own borders and the table's are
-    /// considered, not the table style's.
+    /// button is "on"): the cell's own borders, the table's, then its table
+    /// style when that is a built-in one (the editor has no `styles.xml`, so a
+    /// document's own table style is not seen).
     pub fn border_state(&self, cmd: BorderCmd) -> bool {
         if cmd == BorderCmd::NoBorder {
             return false;

@@ -14,7 +14,8 @@ use crate::xml::{Event, XmlParser};
 /// Word's default table style, the base of every built-in one.
 pub const TABLE_NORMAL: &str = "TableNormal";
 
-/// One built-in table style: its id, its display name and `w:style` XML.
+/// One built-in table style: its id and display name. Its `w:style` XML
+/// comes from [`builtin_style_xml`].
 #[derive(Debug, Clone)]
 pub struct BuiltinStyle {
     pub id: &'static str,
