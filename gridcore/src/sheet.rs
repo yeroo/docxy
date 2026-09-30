@@ -128,15 +128,19 @@ pub struct Cell {
     /// load). The spilled cells themselves are plain values owned by this
     /// anchor. `None` = no spill (scalar result).
     pub spill: Option<(u32, u32)>,
-    /// `<c>` metadata attributes kept from the file (`cm`, `vm`, `ph`);
-    /// boxed because almost no cell has any.
+    /// `<c>` metadata attributes kept from the file (`cm`, `vm`, `ph`), and
+    /// what the engine knows about a formula typed here (`modern`,
+    /// `dynamic`); boxed because only formulas typed here and the few cells a
+    /// file marks have any.
     pub meta: Option<Box<CellMeta>>,
 }
 
-/// The `<c>` attributes we don't interpret but must write back: Excel marks a
-/// dynamic-array anchor with `cm` (without it the spill reopens as a legacy
-/// Ctrl+Shift+Enter array), and a rich value (image, data type, `#SPILL!`
-/// details) with `vm`. Both are opaque indices into `xl/metadata.xml`.
+/// A cell's metadata. From the file, the `<c>` attributes we write back: Excel
+/// marks a dynamic-array anchor with `cm` (without it the spill reopens as a
+/// legacy Ctrl+Shift+Enter array), and a rich value (image, data type,
+/// `#SPILL!` details) with `vm`, both indices into `xl/metadata.xml`. From the
+/// engine, in-session only: whether a formula was typed here (`modern`) and
+/// whether it is a dynamic array (`dynamic`), for which save resolves a `cm`.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct CellMeta {
     /// Cell-metadata index; written only on an array `<f>`.
@@ -151,6 +155,17 @@ pub struct CellMeta {
     pub vm_body: Option<String>,
     /// `ph="1"`: show phonetic text.
     pub ph: bool,
+    /// The formula was typed here: set when [`crate::engine::Engine::set_cell`]
+    /// gets new formula text (the same text keeps what the formula was), and
+    /// carried by copies ([`crate::edit`]'s rebase). Evaluated with spill
+    /// semantics (not implicit intersection), also after the engine is
+    /// rebuilt. Never written to the file.
+    pub modern: bool,
+    /// The engine evaluated this typed formula as an array (a multi-cell range
+    /// or any computed array, even 1x1), so it is a dynamic array: the writer
+    /// gives it a `cm` naming an `fDynamic` entry in `xl/metadata.xml`. Sticky,
+    /// like a loaded `cm`: a later scalar result (`FILTER` → `#CALC!`) keeps it.
+    pub dynamic: bool,
 }
 
 /// Do preserved `<f>` attributes (see [`Cell::f_attrs`]) mark an array
@@ -243,14 +258,25 @@ impl Cell {
         self.value.is_empty() && self.formula.is_none()
     }
     /// Is the formula an array one, evaluated by the dynamic-array engine: a
-    /// `t="array"` `<f>` (kept through [`crate::engine::Engine::set_cell`]),
-    /// or a cell Excel marked dynamic with `cm`?
+    /// `t="array"` `<f>`, or a dynamic array ([`Cell::is_dynamic`]) whose
+    /// `f_attrs` an edit dropped ([`crate::engine::Engine::set_cell`])?
     pub fn is_array_formula(&self) -> bool {
-        self.f_attrs.as_deref().is_some_and(is_array_f) || self.has_cm()
+        self.f_attrs.as_deref().is_some_and(is_array_f) || self.is_dynamic()
     }
     /// Did Excel mark this cell a dynamic array (`cm`)?
     pub fn has_cm(&self) -> bool {
         self.meta.as_ref().is_some_and(|m| m.cm.is_some())
+    }
+    /// Is this a dynamic array: marked by Excel (`cm`), or a typed formula the
+    /// engine evaluated as an array ([`CellMeta::dynamic`])?
+    pub fn is_dynamic(&self) -> bool {
+        self.meta
+            .as_ref()
+            .is_some_and(|m| m.cm.is_some() || m.dynamic)
+    }
+    /// Was the formula typed or edited here ([`CellMeta::modern`])?
+    pub fn is_modern(&self) -> bool {
+        self.meta.as_ref().is_some_and(|m| m.modern)
     }
 }
 

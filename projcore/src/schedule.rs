@@ -1427,8 +1427,16 @@ impl<'a> Scheduler<'a> {
                         start_abs = start_abs.max(bound);
                     }
                     ConstraintType::FinishNoEarlierThan => {
-                        start_abs = start_abs
-                            .max(tl.abs_start(tl.to_index(df) - t.duration_min).max(floor));
+                        // A milestone dated at the end of a working period (or
+                        // at a working start) occupies that instant, as an SNET
+                        // one does, not the next morning that shares its index.
+                        let bound = if t.duration_min == 0 && milestone == dates.raw.max(floor) {
+                            held_milestone = Some(milestone);
+                            milestone
+                        } else {
+                            tl.abs_start(tl.to_index(df) - t.duration_min).max(floor)
+                        };
+                        start_abs = start_abs.max(bound);
                     }
                     ConstraintType::MustFinishOn | ConstraintType::FinishNoLaterThan
                         if t.constraint == ConstraintType::MustFinishOn
@@ -1476,7 +1484,7 @@ impl<'a> Scheduler<'a> {
             }
             // A binding FS or ALAP milestone occupies its exact finish or
             // late-start instant, even in a nonworking gap. So do binding
-            // MFO/FNLT and period-end SNET milestones. Later start-type
+            // MFO/FNLT and period-end SNET/FNET milestones. Later start-type
             // links/constraints still snap.
             let s_abs =
                 if fs_milestone_start == Some(start_abs) || held_milestone == Some(start_abs) {
@@ -5799,6 +5807,71 @@ mod tests {
             assert_eq!(leveled.start(2), Some(expected), "{case}");
             assert_eq!(leveled.finish(2), Some(expected), "{case}");
         }
+    }
+
+    #[test]
+    fn fnet_milestone_at_a_working_period_end_stays_on_that_instant() {
+        let at = |day, hour| DateTime::from_ymd_hm(2026, 3, day, hour, 0);
+        // (A duration, linked, FNET, expected milestone instant)
+        for (duration, linked, fnet, expected) in [
+            // The evening the FNET names, not the next morning on its index.
+            (2400, true, at(6, 17), at(6, 17)),
+            (960, true, at(6, 17), at(6, 17)),
+            (2400, false, at(6, 17), at(6, 17)),
+            // A morning date stays on its morning.
+            (2400, false, at(9, 8), at(9, 8)),
+            // The end of the morning period, as for an SNET.
+            (480, false, at(4, 12), at(4, 12)),
+            // Not a period end: the next working start, as before.
+            (480, false, at(4, 19), at(5, 8)),
+            // A met FNET leaves the FS instant alone; a later FS link wins.
+            (2400, true, at(6, 12), at(6, 17)),
+            (2880, true, at(6, 17), at(9, 17)),
+        ] {
+            for honor in [false, true] {
+                let proj = finish_constrained_milestone(
+                    duration,
+                    ConstraintType::FinishNoEarlierThan,
+                    fnet,
+                    honor,
+                    linked,
+                );
+                let case = format!("{duration} linked={linked} honor={honor} {fnet:?}");
+                assert_milestone_at(&proj, expected, 0, &case);
+            }
+        }
+    }
+
+    #[test]
+    fn fnet_milestone_at_evening_keeps_its_successor_on_the_next_morning() {
+        let friday = DateTime::from_ymd_hm(2026, 3, 6, 17, 0);
+        let mut proj = finish_constrained_milestone(
+            2400,
+            ConstraintType::FinishNoEarlierThan,
+            friday,
+            true,
+            true,
+        );
+        let mut s = task(3, "Next", 480);
+        s.predecessors.push(fs(2));
+        proj.tasks.push(s);
+        let sched = schedule(&proj);
+        let m = sched.get(2).unwrap();
+        assert_eq!(m.early_start, friday);
+        assert_eq!(m.early_finish, friday);
+        assert_eq!(m.late_start, friday);
+        assert_eq!(m.late_finish, friday);
+        let next = sched.get(3).unwrap();
+        assert_eq!(next.early_start, DateTime::from_ymd_hm(2026, 3, 9, 8, 0));
+        assert_eq!(next.early_finish, DateTime::from_ymd_hm(2026, 3, 9, 17, 0));
+        assert_eq!(next.total_slack_min, 0);
+        let leveled = level(&proj);
+        assert_eq!(leveled.start(2), Some(friday));
+        assert_eq!(leveled.finish(2), Some(friday));
+        assert_eq!(
+            leveled.start(3),
+            Some(DateTime::from_ymd_hm(2026, 3, 9, 8, 0))
+        );
     }
 
     #[test]

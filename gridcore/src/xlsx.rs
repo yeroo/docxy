@@ -363,7 +363,7 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
             .map(|(_, _, t)| resolve(t))
             .unwrap_or_else(|| resolve(default))
     };
-    let rich = match get_str(&part_of("/sheetMetadata", "metadata.xml")) {
+    let rich = match get_str(&sheet_metadata_part(&parts).0) {
         Some(meta) => rich_error_codes(
             &meta,
             get_str(&part_of("/rdRichValue", "richData/rdrichvalue.xml")).as_deref(),
@@ -464,6 +464,28 @@ fn workbook_part_name(parts: &[(String, Vec<u8>)]) -> String {
                 .map(|(_, _, target)| target.trim_start_matches('/').to_string())
         })
         .unwrap_or_else(|| "xl/workbook.xml".to_string())
+}
+
+/// The workbook's cell/value metadata part (`xl/metadata.xml`, found through
+/// its `sheetMetadata` relationship), and whether that relationship exists.
+/// Load and save both go through this, so they agree on the part.
+fn sheet_metadata_part(parts: &[(String, Vec<u8>)]) -> (String, bool) {
+    let wb_part = workbook_part_name(parts);
+    let wb_dir = wb_part.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    let rels_name = rels_part_name(&wb_part);
+    let target = parts
+        .iter()
+        .find(|(n, _)| *n == rels_name)
+        .and_then(|(_, b)| {
+            parse_rels(&String::from_utf8_lossy(b))
+                .into_iter()
+                .find(|(_, ty, _)| ty.ends_with("/sheetMetadata"))
+                .map(|(_, _, t)| t)
+        });
+    match target {
+        Some(t) => (resolve_relative(wb_dir, &t), true),
+        None => (resolve_relative(wb_dir, "metadata.xml"), false),
+    }
 }
 
 /// The rels part that belongs to `part`: `xl/workbook.xml` →
@@ -1574,8 +1596,8 @@ fn parse_worksheet(
                     let meta = CellMeta {
                         cm: (!cm.is_empty() && array_f).then_some(cm),
                         vm: (!vm.is_empty()).then(|| (vm, cell.value.clone())),
-                        vm_body: None,
                         ph,
+                        ..CellMeta::default()
                     };
                     if meta != CellMeta::default() {
                         cell.meta = Some(Box::new(meta));
@@ -2357,6 +2379,17 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
         pkg.shared.len() + new_list.len() - 1
     };
 
+    // --- dynamic arrays typed here need a `cm` in xl/metadata.xml --------
+    let new_cm = if wb
+        .sheets
+        .iter()
+        .any(|sheet| sheet.cells.values().any(needs_new_cm))
+    {
+        ensure_dynamic_cm(&mut parts)
+    } else {
+        None
+    };
+
     // --- regenerate each worksheet's sheetData (and cols/dimension) -------
     let mut any_formulas = false;
     for (idx, sheet) in wb.sheets.iter().enumerate() {
@@ -2367,7 +2400,7 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
             .part(part_name)
             .map(|b| String::from_utf8_lossy(b).into_owned())
             .unwrap_or_default();
-        let sheet_data = sheet_data_xml(sheet, &mut index_of, &mut any_formulas);
+        let sheet_data = sheet_data_xml(sheet, &mut index_of, &mut any_formulas, new_cm.as_deref());
         let updated = splice_worksheet(&source, sheet, &sheet_data);
         let updated = if tabs_selected {
             set_tab_selected(&updated, idx == active_tab)
@@ -2571,6 +2604,7 @@ fn sheet_data_xml(
     sheet: &Sheet,
     index_of: &mut impl FnMut(&str) -> usize,
     any_formulas: &mut bool,
+    new_cm: Option<&str>,
 ) -> String {
     let mut out = String::from("<sheetData>");
     // Union of rows that have cells or preserved attributes.
@@ -2589,12 +2623,288 @@ fn sheet_data_xml(
         }
         out.push_str(&format!("<row r=\"{}\"{attrs}>", row + 1));
         for (&(r, c), cell) in cells {
-            out.push_str(&cell_xml(r, c, cell, index_of, any_formulas));
+            out.push_str(&cell_xml(r, c, cell, index_of, any_formulas, new_cm));
         }
         out.push_str("</row>");
     }
     out.push_str("</sheetData>");
     out
+}
+
+/// A dynamic array typed here ([`CellMeta::dynamic`]) that the file has no
+/// `cm` for yet, and that is written as an array `<f>`: save gives it the
+/// `cm` [`ensure_dynamic_cm`] resolves. One predicate for both, so the part
+/// is never extended for a `cm` no cell then carries.
+fn needs_new_cm(cell: &Cell) -> bool {
+    cell.meta
+        .as_ref()
+        .is_some_and(|m| m.dynamic && m.cm.is_none())
+        && cell.formula.as_deref().is_some_and(|f| !f.is_empty())
+        && cell.f_attrs.as_deref().is_none_or(is_array_f)
+}
+
+const SHEET_METADATA_CT: &str =
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheetMetadata+xml";
+const SHEET_METADATA_REL: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sheetMetadata";
+const DYNAMIC_ARRAY_NS: &str =
+    "http://schemas.microsoft.com/office/spreadsheetml/2017/dynamicarray";
+/// Excel's `XLDAPR` metadata type, as it writes it.
+const XLDAPR_TYPE: &str = r#"<metadataType name="XLDAPR" minSupportedVersion="120000" copy="1" pasteAll="1" pasteValues="1" merge="1" splitFirst="1" rowColShift="1" clearFormats="1" clearComments="1" assign="1" coerce="1" cellMeta="1"/>"#;
+
+/// An `XLDAPR` futureMetadata `bk` saying "dynamic array"; `ns` declares the
+/// `xda` prefix where the root does not.
+fn xldapr_dynamic_bk(ns: &str) -> String {
+    format!(
+        r#"<bk><extLst><ext uri="{{bdbb8cdc-fa1e-496e-a857-3c3f30c029c3}}"{ns}><xda:dynamicArrayProperties fDynamic="1" fCollapsed="0"/></ext></extLst></bk>"#
+    )
+}
+
+/// The `cm` index (1-based `cellMetadata` `bk`) that marks a dynamic array in
+/// this package, adding what is missing: the metadata part beside the
+/// workbook when there is none, otherwise only the absent entries, appended
+/// so every index already in use keeps its meaning; and either way the
+/// workbook's sheetMetadata relationship and the content-type override. None
+/// when the existing part cannot be extended or the workbook cannot be made
+/// to reference it: the formula is then written as it was before `cm`
+/// existed.
+fn ensure_dynamic_cm(parts: &mut Vec<(String, Vec<u8>)>) -> Option<String> {
+    let (name, has_rel) = sheet_metadata_part(parts);
+    // Work out the edit first: a part we cannot extend changes nothing.
+    let edit = match parts.iter().find(|(n, _)| *n == name) {
+        Some((_, bytes)) => Some(add_dynamic_cell_metadata(&String::from_utf8_lossy(bytes))?),
+        None => None,
+    };
+    // A `cm` means nothing unless the workbook reaches the part: make sure
+    // its relationship exists (in the workbook's own rels part), or give up.
+    if !has_rel {
+        let wb_part = workbook_part_name(parts);
+        let wb_dir = wb_part.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let target = relative_target(wb_dir, &name);
+        add_rel(
+            parts,
+            &rels_part_name(&wb_part),
+            SHEET_METADATA_REL,
+            &target,
+        );
+        if sheet_metadata_part(parts) != (name.clone(), true) {
+            return None;
+        }
+    }
+    add_content_type_override(parts, &format!("/{name}"), SHEET_METADATA_CT);
+    if let Some((updated, index)) = edit {
+        if let (Some(updated), Some(p)) = (updated, parts.iter_mut().find(|(n, _)| *n == name)) {
+            p.1 = updated.into_bytes();
+        }
+        return Some(index.to_string());
+    }
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<metadata xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:xda="{DYNAMIC_ARRAY_NS}"><metadataTypes count="1">{XLDAPR_TYPE}</metadataTypes><futureMetadata name="XLDAPR" count="1">{}</futureMetadata><cellMetadata count="1"><bk><rc t="1" v="0"/></bk></cellMetadata></metadata>"#,
+        xldapr_dynamic_bk("")
+    );
+    parts.push((name, xml.into_bytes()));
+    Some("1".to_string())
+}
+
+/// Find — or append — the `cellMetadata` entry marking a dynamic array in an
+/// existing metadata part: `<rc t="T" v="V"/>` alone in its `bk`, where T is
+/// the 1-based `XLDAPR` metadataType and V the 0-based `bk` of the `XLDAPR`
+/// futureMetadata saying `fDynamic="1"`. Returns the rewritten part (None
+/// when everything was already there) and the entry's 1-based index; None
+/// when the part is not one we can edit safely.
+fn add_dynamic_cell_metadata(xml: &str) -> Option<(Option<String>, usize)> {
+    #[derive(PartialEq)]
+    enum In {
+        Other,
+        Types,
+        Dapr,
+        Cells,
+    }
+    let mut p = XmlParser::new(xml);
+    let mut depth = 0usize;
+    let (mut root_open, mut root_close) = (None, None);
+    // The root child being read: what it is, where it starts, its name.
+    let mut child = (In::Other, 0usize, "");
+    let mut types: Vec<String> = Vec::new();
+    let mut types_span = None;
+    // End of the last element a new futureMetadata may follow.
+    let mut future_anchor = None;
+    let mut dapr: Option<(usize, usize)> = None;
+    let mut dapr_bks: Vec<bool> = Vec::new();
+    let mut cells: Option<(usize, usize)> = None;
+    let mut cell_bks: Vec<Vec<(String, String)>> = Vec::new();
+    // Start of the first element a new cellMetadata must precede.
+    let mut cells_anchor = None;
+    loop {
+        match p.next() {
+            Event::Start => {
+                depth += 1;
+                let name = local(p.name());
+                match depth {
+                    1 if p.name() == "metadata" => root_open = Some(p.pos()),
+                    1 => return None,
+                    2 => {
+                        let kind = match name {
+                            "metadataTypes" => In::Types,
+                            "futureMetadata" if dapr.is_none() && p.attr("name") == "XLDAPR" => {
+                                In::Dapr
+                            }
+                            "cellMetadata" if cells.is_none() => In::Cells,
+                            _ => In::Other,
+                        };
+                        if matches!(name, "valueMetadata" | "extLst") {
+                            cells_anchor.get_or_insert(p.start_pos());
+                        }
+                        child = (kind, p.start_pos(), name);
+                    }
+                    _ => match (&child.0, name) {
+                        (In::Types, "metadataType") if depth == 3 => {
+                            types.push(decode(p.attr("name")))
+                        }
+                        (In::Dapr, "bk") if depth == 3 => dapr_bks.push(false),
+                        (In::Dapr, "dynamicArrayProperties") => {
+                            if let Some(last) = dapr_bks.last_mut() {
+                                *last |= p.attr("fDynamic") == "1" && p.attr("fCollapsed") != "1";
+                            }
+                        }
+                        (In::Cells, "bk") if depth == 3 => cell_bks.push(Vec::new()),
+                        (In::Cells, "rc") if depth == 4 => {
+                            if let Some(last) = cell_bks.last_mut() {
+                                last.push((p.attr("t").to_string(), p.attr("v").to_string()));
+                            }
+                        }
+                        _ => {}
+                    },
+                }
+            }
+            Event::End => {
+                match depth {
+                    1 => root_close = xml[..p.pos()].rfind("</"),
+                    2 => {
+                        let span = (child.1, p.pos());
+                        match child.0 {
+                            In::Types => types_span = Some(span),
+                            In::Dapr => dapr = Some(span),
+                            In::Cells => cells = Some(span),
+                            In::Other => {}
+                        }
+                        if matches!(
+                            child.2,
+                            "metadataTypes" | "metadataStrings" | "mdxMetadata" | "futureMetadata"
+                        ) {
+                            future_anchor = Some(span.1);
+                        }
+                        child = (In::Other, 0, "");
+                    }
+                    _ => {}
+                }
+                depth = depth.saturating_sub(1);
+            }
+            Event::Eof => break,
+            Event::Text => {}
+        }
+    }
+    let (root_open, root_close) = (root_open?, root_close?);
+    if root_close < root_open {
+        return None;
+    }
+
+    // (start, end, replacement), applied back to front.
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let t = match types.iter().position(|n| n == "XLDAPR") {
+        Some(i) => i + 1,
+        None => {
+            let edit = match types_span {
+                Some((a, b)) => (a, b, append_child(&xml[a..b], XLDAPR_TYPE, types.len() + 1)),
+                None => (
+                    root_open,
+                    root_open,
+                    format!(r#"<metadataTypes count="1">{XLDAPR_TYPE}</metadataTypes>"#),
+                ),
+            };
+            edits.push(edit);
+            types.len() + 1
+        }
+    };
+    let bk = xldapr_dynamic_bk(&format!(r#" xmlns:xda="{DYNAMIC_ARRAY_NS}""#));
+    let v = match (dapr_bks.iter().position(|&d| d), dapr) {
+        (Some(i), _) => i,
+        (None, Some((a, b))) => {
+            edits.push((a, b, append_child(&xml[a..b], &bk, dapr_bks.len() + 1)));
+            dapr_bks.len()
+        }
+        (None, None) => {
+            let at = future_anchor.unwrap_or(root_open);
+            edits.push((
+                at,
+                at,
+                format!(r#"<futureMetadata name="XLDAPR" count="1">{bk}</futureMetadata>"#),
+            ));
+            0
+        }
+    };
+    let pair = (t.to_string(), v.to_string());
+    if edits.is_empty() {
+        if let Some(i) = cell_bks.iter().position(|b| b.len() == 1 && b[0] == pair) {
+            return Some((None, i + 1));
+        }
+    }
+    let entry = format!(r#"<bk><rc t="{t}" v="{v}"/></bk>"#);
+    let index = match cells {
+        Some((a, b)) => {
+            edits.push((a, b, append_child(&xml[a..b], &entry, cell_bks.len() + 1)));
+            cell_bks.len() + 1
+        }
+        None => {
+            let at = cells_anchor.unwrap_or(root_close);
+            edits.push((
+                at,
+                at,
+                format!(r#"<cellMetadata count="1">{entry}</cellMetadata>"#),
+            ));
+            1
+        }
+    };
+    // Back to front. Of two insertions at one spot, the one pushed first
+    // (metadataTypes before futureMetadata) ends up first.
+    edits.sort_by_key(|e| e.0);
+    let mut out = xml.to_string();
+    for (a, b, text) in edits.into_iter().rev() {
+        out.replace_range(a..b, &text);
+    }
+    Some((Some(out), index))
+}
+
+/// `el` (one whole element) with `child` appended as its last child and its
+/// `count` attribute set to `count`.
+fn append_child(el: &str, child: &str, count: usize) -> String {
+    let with_count = |head: &str| match head.find(" count=\"") {
+        Some(i) => {
+            let vs = i + " count=\"".len();
+            let ve = head[vs..].find('"').map_or(head.len(), |e| vs + e);
+            format!("{}{count}{}", &head[..vs], &head[ve..])
+        }
+        None => format!("{head} count=\"{count}\""),
+    };
+    if let Some(head) = el.strip_suffix("/>") {
+        let name_end = el[1..]
+            .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
+            .map_or(el.len(), |e| e + 1);
+        return format!(
+            "{}>{child}</{}>",
+            with_count(head.trim_end()),
+            &el[1..name_end]
+        );
+    }
+    let gt = el.find('>').unwrap_or(0);
+    let close = el.rfind("</").unwrap_or(el.len());
+    format!(
+        "{}{}{child}{}",
+        with_count(&el[..gt]),
+        &el[gt..close],
+        &el[close..]
+    )
 }
 
 fn cell_xml(
@@ -2603,6 +2913,7 @@ fn cell_xml(
     cell: &Cell,
     index_of: &mut impl FnMut(&str) -> usize,
     any_formulas: &mut bool,
+    new_cm: Option<&str>,
 ) -> String {
     let mut attrs = format!(" r=\"{}\"", cell_name(row, col));
     if cell.style != 0 {
@@ -2642,7 +2953,10 @@ fn cell_xml(
         }
     };
 
-    let dynamic = cell.has_cm();
+    // A dynamic array typed here gets the `cm` save resolved for it; without
+    // one (a metadata part we could not extend) it is written as before.
+    let new_cm = new_cm.filter(|_| needs_new_cm(cell));
+    let dynamic = cell.has_cm() || new_cm.is_some();
     let anchor = cell_name(row, col);
     let (f_xml, array_f) = match (&cell.formula, &cell.f_attrs) {
         // A spilling anchor writes fresh array attributes — its extent may
@@ -2658,8 +2972,9 @@ fn cell_xml(
             (f, true)
         }
         // A dynamic array that does not spill now (a 1x1 result, or
-        // #SPILL!) and has no `<f>` attributes (say, a `cm` cell loaded with
-        // a plain `<f>`): `cm` says it is still one, covering its anchor alone.
+        // #SPILL!) after an edit went through `Engine::set_cell`, which drops
+        // `f_attrs`, or typed here: its `cm` says it is still one, covering
+        // its anchor alone.
         (Some(src), None) if dynamic && !src.is_empty() => (
             format!("<f t=\"array\" ref=\"{anchor}\">{}</f>", esc_text(src)),
             true,
@@ -2684,7 +2999,7 @@ fn cell_xml(
     // only belongs on an array `<f>`; `vm` describes the loaded value.
     let mut tail = String::new();
     if let Some(m) = &cell.meta {
-        if let Some(cm) = m.cm.as_deref().filter(|_| array_f) {
+        if let Some(cm) = m.cm.as_deref().or(new_cm).filter(|_| array_f) {
             tail.push_str(&format!(" cm=\"{}\"", esc_raw_attr(cm)));
         }
         if let Some((vm, _)) = m.vm.as_ref().filter(|(_, v)| *v == cell.value) {
@@ -8473,28 +8788,587 @@ b",
     }
 
     #[test]
-    fn typed_formula_through_set_cell_has_no_cm() {
-        // A typed formula is a fresh Cell (parse_input): nothing to inherit.
+    fn typed_formula_reuses_existing_dynamic_cm() {
+        // #724: a typed formula the engine evaluates as an array is a dynamic
+        // array. This file already has the XLDAPR `fDynamic` entry (`cm="1"`):
+        // the typed formula uses it, and the part is left exactly as it was.
         let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SORT_ANCHOR))).unwrap();
+        let before = pkg.part("xl/metadata.xml").unwrap().to_vec();
         let mut eng = crate::engine::Engine::new(&pkg.workbook);
         eng.set_cell(&mut pkg.workbook, (0, 0, 3), Cell::formula("SEQUENCE(2)"));
-        let ws = saved_sheet1(&pkg);
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let ws = String::from_utf8_lossy(re.part("xl/worksheets/sheet1.xml").unwrap()).into_owned();
         assert!(
-            ws.contains(r#"<c r="D1"><f t="array" ref="D1:D2">SEQUENCE(2)</f>"#),
+            ws.contains(r#"<c r="D1" cm="1"><f t="array" ref="D1:D2">SEQUENCE(2)</f>"#),
+            "{ws}"
+        );
+        assert_eq!(re.part("xl/metadata.xml").unwrap(), &before[..]);
+    }
+
+    /// Save `pkg`, reload it, and return (package, sheet1 XML).
+    fn resaved(pkg: &SheetPackage) -> (SheetPackage, String) {
+        let re = load_xlsx(&save_xlsx(pkg)).unwrap();
+        let ws = String::from_utf8_lossy(re.part("xl/worksheets/sheet1.xml").unwrap()).into_owned();
+        (re, ws)
+    }
+
+    /// A new workbook with 1, 2, 3 in A1:A3, its engine, and `typed` entered
+    /// (as xlsxy commits a formula) at each (row, col).
+    fn typed_book(typed: &[((u32, u32), &str)]) -> (SheetPackage, crate::engine::Engine) {
+        let mut pkg = new_xlsx();
+        for r in 0..3 {
+            pkg.workbook.sheets[0].set_cell(r, 0, Cell::number(r as f64 + 1.0));
+        }
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        for &((r, c), src) in typed {
+            eng.set_cell(&mut pkg.workbook, (0, r, c), Cell::formula(src));
+        }
+        (pkg, eng)
+    }
+
+    #[test]
+    fn typed_spill_saves_with_cm_and_new_metadata_part() {
+        // #724 AC1: no metadata.xml yet — save creates it, with its
+        // content-type override and workbook relationship.
+        let (pkg, _) = typed_book(&[((0, 2), "SEQUENCE(3)")]);
+        assert!(pkg.part("xl/metadata.xml").is_none());
+        let (re, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<c r="C1" cm="1"><f t="array" ref="C1:C3">SEQUENCE(3)</f>"#),
+            "{ws}"
+        );
+        let meta = part_text(&re, "xl/metadata.xml");
+        assert!(meta.contains(XLDAPR_TYPE), "{meta}");
+        assert!(
+            meta.contains(r#"<futureMetadata name="XLDAPR" count="1"><bk><extLst><ext uri="{bdbb8cdc-fa1e-496e-a857-3c3f30c029c3}"><xda:dynamicArrayProperties fDynamic="1" fCollapsed="0"/>"#),
+            "{meta}"
+        );
+        assert!(
+            meta.contains(r#"<cellMetadata count="1"><bk><rc t="1" v="0"/></bk></cellMetadata>"#),
+            "{meta}"
+        );
+        assert!(meta.contains(&format!(r#"xmlns:xda="{DYNAMIC_ARRAY_NS}""#)));
+        let ct = part_text(&re, "[Content_Types].xml");
+        assert!(
+            ct.contains(&format!(
+                r#"<Override PartName="/xl/metadata.xml" ContentType="{SHEET_METADATA_CT}"/>"#
+            )),
+            "{ct}"
+        );
+        let rels = part_text(&re, "xl/_rels/workbook.xml.rels");
+        assert!(
+            rels.contains(&format!(
+                r#"Type="{SHEET_METADATA_REL}" Target="metadata.xml""#
+            )),
+            "{rels}"
+        );
+        // Reloaded, it is Excel's dynamic array: `cm`, and it spills after a
+        // fresh engine.
+        let mut re = re;
+        assert!(re.workbook.sheets[0].cell(0, 2).unwrap().has_cm());
+        let mut eng = crate::engine::Engine::new(&re.workbook);
+        eng.recalc_all(&mut re.workbook);
+        assert_eq!(
+            re.workbook.sheets[0].cell(0, 2).unwrap().spill,
+            Some((3, 1))
+        );
+        // Saving again reuses the entry: nothing is appended twice.
+        let (again, _) = resaved(&re);
+        assert_eq!(part_text(&again, "xl/metadata.xml"), meta);
+        assert_eq!(
+            part_text(&again, "xl/_rels/workbook.xml.rels")
+                .matches("sheetMetadata")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn typed_one_by_one_array_result_saves_as_dynamic() {
+        // #724 AC2: a 1x1 array result is still an array — `SEQUENCE(1)`, and a
+        // FILTER that matches one row.
+        let (pkg, _) = typed_book(&[((0, 1), "SEQUENCE(1)"), ((0, 2), "FILTER(A1:A3,A1:A3>2)")]);
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<c r="B1" cm="1"><f t="array" ref="B1">SEQUENCE(1)</f><v>1</v></c>"#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(
+                r#"<c r="C1" cm="1"><f t="array" ref="C1">FILTER(A1:A3,A1:A3&gt;2)</f><v>3</v></c>"#
+            ),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn typed_blocked_spill_saves_with_cm() {
+        // #724 AC2: an anchor whose spill is blocked shows #SPILL! but is
+        // still a dynamic array.
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].set_cell(1, 2, Cell::text("x"));
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 0, 2), Cell::formula("SEQUENCE(3)"));
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(0, 2).unwrap().value,
+            CellValue::Error("#SPILL!".into())
+        );
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<c r="C1" t="e" cm="1"><f t="array" ref="C1">SEQUENCE(3)</f>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn typed_scalar_formula_saves_plain_without_metadata() {
+        // #724 AC3: a formula that never produced an array is an ordinary
+        // formula, as Excel writes it: no `cm`, no metadata part.
+        let srcs = [
+            "A1+1",
+            "SUM(A1:A3)",
+            "A1",
+            "A1*A2",
+            "XLOOKUP(2,A1:A3,A1:A3)",
+            "INDEX(A1:A3,2)",
+            "IF(A1>1,1,2)",
+            // One-cell ranges from functions are single values too.
+            "OFFSET(A1,0,0)+1",
+            "INDIRECT(\"A2\")*2",
+            "-OFFSET(A1,1,0)",
+        ];
+        let typed: Vec<((u32, u32), &str)> = srcs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| ((i as u32, 2), *s))
+            .collect();
+        let (pkg, _) = typed_book(&typed);
+        let (re, ws) = resaved(&pkg);
+        for (i, src) in srcs.iter().enumerate() {
+            let f = format!(r#"<c r="C{}"><f>{}</f>"#, i + 1, esc_text(src));
+            assert!(ws.contains(&f), "{f} in {ws}");
+        }
+        assert!(!ws.contains("cm="), "{ws}");
+        assert!(re.part("xl/metadata.xml").is_none());
+        assert!(!part_text(&re, "[Content_Types].xml").contains("metadata"));
+    }
+
+    #[test]
+    fn retyped_scalar_over_dynamic_saves_plain() {
+        // Typing over a dynamic array replaces the formula: a fresh Cell, so
+        // the new scalar formula is not an array.
+        let (mut pkg, mut eng) = typed_book(&[((0, 2), "SEQUENCE(3)")]);
+        eng.set_cell(&mut pkg.workbook, (0, 0, 2), Cell::formula("A1+1"));
+        let (re, ws) = resaved(&pkg);
+        assert!(ws.contains(r#"<c r="C1"><f>A1+1</f><v>2</v></c>"#), "{ws}");
+        assert!(!ws.contains("cm="), "{ws}");
+        assert!(re.part("xl/metadata.xml").is_none());
+    }
+
+    #[test]
+    fn typed_dynamic_mark_is_sticky() {
+        // A FILTER that matched once stays a dynamic array when it later
+        // matches nothing (#CALC!), like a loaded `cm`.
+        let (mut pkg, mut eng) = typed_book(&[((0, 2), "FILTER(A1:A3,A1:A3>2)")]);
+        eng.set_cell(&mut pkg.workbook, (0, 2, 0), Cell::number(0.0));
+        let c1 = pkg.workbook.sheets[0].cell(0, 2).unwrap();
+        assert_eq!(c1.value, CellValue::Error("#CALC!".into()));
+        assert!(c1.is_dynamic());
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<c r="C1" t="e" cm="1"><f t="array" ref="C1">"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn typed_formula_extends_rich_only_metadata() {
+        // #724 AC5: a metadata part with rich values and an XLDAPR type but no
+        // XLDAPR futureMetadata or cellMetadata: the missing entries are
+        // appended, every index in use keeps its meaning.
+        let mut pkg = load_xlsx(&rich_error_fixture(RICH_ROWS)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 0, 3), Cell::formula("SEQUENCE(2)"));
+        let (re, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<c r="D1" cm="1"><f t="array" ref="D1:D2">SEQUENCE(2)</f>"#),
+            "{ws}"
+        );
+        // The rich errors still carry their `vm` and decode.
+        assert!(
+            ws.contains(r#"<c r="A1" t="e" vm="1"><v>#VALUE!</v></c>"#),
+            "{ws}"
+        );
+        let v = |r: u32| re.workbook.sheets[0].cell(r, 0).unwrap().value.clone();
+        assert_eq!(v(0), CellValue::Error("#SPILL!".into()));
+        assert_eq!(v(1), CellValue::Error("#CALC!".into()));
+        assert_eq!(v(2), CellValue::Error("#GETTING_DATA".into()));
+        assert!(re.workbook.sheets[0].cell(0, 3).unwrap().has_cm());
+        // XLDAPR is type 1 already; its futureMetadata follows the rich one,
+        // and cellMetadata comes before valueMetadata (schema order).
+        let expected = RICH_METADATA.replace(
+            "</futureMetadata><valueMetadata",
+            &format!(
+                r#"</futureMetadata><futureMetadata name="XLDAPR" count="1">{}</futureMetadata><cellMetadata count="1"><bk><rc t="1" v="0"/></bk></cellMetadata><valueMetadata"#,
+                xldapr_dynamic_bk(&format!(r#" xmlns:xda="{DYNAMIC_ARRAY_NS}""#))
+            ),
+        );
+        assert_eq!(part_text(&re, "xl/metadata.xml"), expected);
+    }
+
+    #[test]
+    fn dynamic_cell_metadata_appends_only_what_is_missing() {
+        const ROOT: &str =
+            r#"<metadata xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">"#;
+        let ns = format!(r#" xmlns:xda="{DYNAMIC_ARRAY_NS}""#);
+        let bk = xldapr_dynamic_bk(&ns);
+        // Rich values only: XLDAPR becomes type 2.
+        let rich = format!(
+            r#"{ROOT}<metadataTypes count="1"><metadataType name="XLRICHVALUE"/></metadataTypes><futureMetadata name="XLRICHVALUE" count="1"><bk/></futureMetadata><valueMetadata count="1"><bk><rc t="1" v="0"/></bk></valueMetadata></metadata>"#
+        );
+        assert_eq!(
+            add_dynamic_cell_metadata(&rich),
+            Some((
+                Some(format!(
+                    r#"{ROOT}<metadataTypes count="2"><metadataType name="XLRICHVALUE"/>{XLDAPR_TYPE}</metadataTypes><futureMetadata name="XLRICHVALUE" count="1"><bk/></futureMetadata><futureMetadata name="XLDAPR" count="1">{bk}</futureMetadata><cellMetadata count="1"><bk><rc t="2" v="0"/></bk></cellMetadata><valueMetadata count="1"><bk><rc t="1" v="0"/></bk></valueMetadata></metadata>"#
+                )),
+                1
+            ))
+        );
+        // An XLDAPR block whose only entry is collapsed, and an unrelated
+        // cellMetadata entry: a bk is appended to each.
+        let collapsed = format!(
+            r#"{ROOT}<metadataTypes count="1">{XLDAPR_TYPE}</metadataTypes><futureMetadata name="XLDAPR" count="1"><bk><extLst><ext uri="x"><xda:dynamicArrayProperties{ns} fDynamic="1" fCollapsed="1"/></ext></extLst></bk></futureMetadata><cellMetadata count="1"><bk><rc t="1" v="0"/></bk></cellMetadata></metadata>"#
+        );
+        let (out, index) = add_dynamic_cell_metadata(&collapsed).unwrap();
+        assert_eq!(index, 2);
+        let out = out.unwrap();
+        assert!(
+            out.contains(r#"<futureMetadata name="XLDAPR" count="2"><bk>"#),
+            "{out}"
+        );
+        assert!(out.contains(&format!("{bk}</futureMetadata>")), "{out}");
+        assert!(
+            out.contains(r#"<cellMetadata count="2"><bk><rc t="1" v="0"/></bk><bk><rc t="1" v="1"/></bk></cellMetadata>"#),
+            "{out}"
+        );
+        // Nothing yet at all (an empty root), and a self-closed cellMetadata.
+        let empty = format!(r#"{ROOT}<cellMetadata count="0"/></metadata>"#);
+        assert_eq!(
+            add_dynamic_cell_metadata(&empty),
+            Some((
+                Some(format!(
+                    r#"{ROOT}<metadataTypes count="1">{XLDAPR_TYPE}</metadataTypes><futureMetadata name="XLDAPR" count="1">{bk}</futureMetadata><cellMetadata count="1"><bk><rc t="1" v="0"/></bk></cellMetadata></metadata>"#
+                )),
+                1
+            ))
+        );
+        // Not a part we understand: left alone.
+        assert_eq!(
+            add_dynamic_cell_metadata("<x:metadata xmlns:x=\"u\"></x:metadata>"),
+            None
+        );
+        assert_eq!(add_dynamic_cell_metadata("<metadata>"), None);
+        assert_eq!(add_dynamic_cell_metadata(""), None);
+    }
+
+    #[test]
+    fn an_unreferenced_metadata_part_gets_its_relationship() {
+        // #724 r1: the part is there but the workbook does not reference it
+        // (no rel, no override): the `cm` only means something once it does.
+        let mut pkg = load_xlsx(&cell_meta_fixture("")).unwrap();
+        let rels = part_text(&pkg, "xl/_rels/workbook.xml.rels").replace(
+            r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sheetMetadata" Target="metadata.xml"/>"#,
+            "",
+        );
+        pkg.set_part("xl/_rels/workbook.xml.rels", rels.into_bytes());
+        let ct = part_text(&pkg, "[Content_Types].xml").replace(
+            &format!(
+                r#"<Override PartName="/xl/metadata.xml" ContentType="{SHEET_METADATA_CT}"/>"#
+            ),
+            "",
+        );
+        pkg.set_part("[Content_Types].xml", ct.into_bytes());
+        let before = pkg.part("xl/metadata.xml").unwrap().to_vec();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 0, 0), Cell::formula("SEQUENCE(2)"));
+        let (re, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<c r="A1" cm="1"><f t="array" ref="A1:A2">"#),
+            "{ws}"
+        );
+        assert_eq!(re.part("xl/metadata.xml").unwrap(), &before[..]);
+        assert!(
+            part_text(&re, "xl/_rels/workbook.xml.rels").contains(&format!(
+                r#"Type="{SHEET_METADATA_REL}" Target="metadata.xml""#
+            ))
+        );
+        assert!(part_text(&re, "[Content_Types].xml").contains(r#"PartName="/xl/metadata.xml""#));
+    }
+
+    #[test]
+    fn a_new_metadata_part_sits_beside_a_workbook_stored_elsewhere() {
+        // #724 r1: the workbook part is `wb/book.xml`; the new metadata part
+        // and its relationship go with it, not to the conventional xl/ paths.
+        let sheet = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData/></worksheet>"#;
+        let workbook = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        let wb_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="sheets/one.xml"/></Relationships>"#;
+        let root_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="wb/book.xml"/></Relationships>"#;
+        let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/wb/book.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#;
+        let bytes = write_zip(&[
+            ("[Content_Types].xml".into(), content_types.into()),
+            ("_rels/.rels".into(), root_rels.into()),
+            ("wb/book.xml".into(), workbook.into()),
+            ("wb/_rels/book.xml.rels".into(), wb_rels.into()),
+            ("wb/sheets/one.xml".into(), sheet.into()),
+        ]);
+        let mut pkg = load_xlsx(&bytes).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 0, 0), Cell::formula("SEQUENCE(2)"));
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let ws = part_text(&re, "wb/sheets/one.xml");
+        assert!(
+            ws.contains(r#"<c r="A1" cm="1"><f t="array" ref="A1:A2">"#),
+            "{ws}"
+        );
+        assert!(re.part("wb/metadata.xml").is_some() && re.part("xl/metadata.xml").is_none());
+        assert!(part_text(&re, "wb/_rels/book.xml.rels").contains(&format!(
+            r#"Type="{SHEET_METADATA_REL}" Target="metadata.xml""#
+        )));
+        assert!(part_text(&re, "[Content_Types].xml").contains(r#"PartName="/wb/metadata.xml""#));
+        assert!(re.workbook.sheets[0].cell(0, 0).unwrap().has_cm());
+    }
+
+    #[test]
+    fn unreadable_metadata_part_is_left_alone() {
+        // A metadata part we cannot extend: no `cm`, and the typed formula is
+        // written as before (a plain `<f>` for a 1x1 result).
+        let mut pkg = load_xlsx(&cell_meta_fixture("")).unwrap();
+        pkg.set_part("xl/metadata.xml", b"<metadata>".to_vec());
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 0, 0), Cell::formula("SEQUENCE(1)"));
+        let (re, ws) = resaved(&pkg);
+        assert!(ws.contains(r#"<c r="A1"><f>SEQUENCE(1)</f>"#), "{ws}");
+        assert_eq!(re.part("xl/metadata.xml").unwrap(), b"<metadata>");
+    }
+
+    #[test]
+    fn legacy_cse_array_gets_no_cm_on_save() {
+        // #724 AC6: a loaded Ctrl+Shift+Enter array (`t="array"`, no `cm`) is
+        // not turned into a dynamic array.
+        let rows = r#"<row r="1"><c r="A1"><v>1</v></c><c r="D1"><f t="array" ref="D1:D3">A1:A3*2</f><v>2</v></c></row><row r="2"><c r="A2"><v>2</v></c><c r="D2"><v>4</v></c></row><row r="3"><c r="A3"><v>3</v></c><c r="D3"><v>6</v></c></row>"#;
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        assert!(!pkg.workbook.sheets[0].cell(0, 3).unwrap().is_dynamic());
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<c r="D1"><f t="array" ref="D1:D3">A1:A3*2</f>"#),
+            "{ws}"
+        );
+        assert!(!ws.contains("cm="), "{ws}");
+    }
+
+    /// A1:A3 = 1, 2, 3 and a plain loaded (legacy) `A1:A3*2` in B2, which
+    /// reduces to one value (the engine's `@` fallback: the top-left, 2)
+    /// instead of spilling.
+    const LEGACY_ROWS: &str = r#"<row r="1"><c r="A1"><v>1</v></c></row><row r="2"><c r="A2"><v>2</v></c><c r="B2"><f>A1:A3*2</f><v>2</v></c></row><row r="3"><c r="A3"><v>3</v></c></row>"#;
+
+    #[test]
+    fn restyle_legacy_formula_stays_plain() {
+        // Formatting is not typing: a loaded legacy formula restyled through
+        // set_cell stays legacy — no spill, no `cm`, metadata untouched.
+        let mut pkg = load_xlsx(&cell_meta_fixture(LEGACY_ROWS)).unwrap();
+        let before = pkg.part("xl/metadata.xml").unwrap().to_vec();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        let mut cell = pkg.workbook.sheets[0].cell(1, 1).cloned().unwrap();
+        cell.style = 1;
+        eng.set_cell(&mut pkg.workbook, (0, 1, 1), cell);
+        let b2 = pkg.workbook.sheets[0].cell(1, 1).unwrap();
+        assert_eq!(
+            (b2.spill, b2.is_modern(), b2.is_dynamic()),
+            (None, false, false)
+        );
+        let (re, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<c r="B2" s="1"><f>A1:A3*2</f><v>2</v></c>"#),
+            "{ws}"
+        );
+        assert!(!ws.contains("cm="), "{ws}");
+        assert_eq!(re.part("xl/metadata.xml").unwrap(), &before[..]);
+    }
+
+    #[test]
+    fn restyle_cse_keeps_f_attrs() {
+        let rows = r#"<row r="1"><c r="A1"><v>1</v></c><c r="D1"><f t="array" ref="D1:D3">A1:A3*2</f><v>2</v></c></row><row r="2"><c r="A2"><v>2</v></c></row><row r="3"><c r="A3"><v>3</v></c></row>"#;
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        let mut cell = pkg.workbook.sheets[0].cell(0, 3).cloned().unwrap();
+        cell.style = 1;
+        eng.set_cell(&mut pkg.workbook, (0, 0, 3), cell);
+        let d1 = pkg.workbook.sheets[0].cell(0, 3).unwrap();
+        assert_eq!(d1.f_attrs.as_deref(), Some(r#" t="array" ref="D1:D3""#));
+        assert!(!d1.is_dynamic() && !d1.is_modern());
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<c r="D1" s="1"><f t="array" ref="D1:D3">"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn restore_cell_keeps_a_legacy_formula_legacy() {
+        // Undo puts the snapshot back with restore_cell: the loaded legacy
+        // formula is not stamped as typed, so it neither spills nor saves
+        // with a `cm`.
+        let mut pkg = load_xlsx(&cell_meta_fixture(LEGACY_ROWS)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        let before = pkg.workbook.sheets[0].cell(1, 1).cloned().unwrap();
+        eng.set_cell(&mut pkg.workbook, (0, 1, 1), Cell::number(7.0));
+        eng.restore_cell(&mut pkg.workbook, (0, 1, 1), before.clone());
+        let b2 = pkg.workbook.sheets[0].cell(1, 1).unwrap();
+        assert_eq!(b2, &before);
+        assert_eq!((b2.value.clone(), b2.spill), (CellValue::Number(2.0), None));
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<c r="B2"><f>A1:A3*2</f><v>2</v></c>"#),
             "{ws}"
         );
         assert!(!ws.contains("cm="), "{ws}");
     }
 
     #[test]
-    fn undoing_an_overwrite_through_set_cell_restores_cm() {
-        // xlsxy undoes by set_cell-ing the `before` clone back.
+    fn restore_cell_keeps_cse_f_attrs() {
+        let rows = r#"<row r="1"><c r="A1"><v>1</v></c><c r="D1"><f t="array" ref="D1:D3">A1:A3*2</f><v>2</v></c></row><row r="2"><c r="A2"><v>2</v></c></row><row r="3"><c r="A3"><v>3</v></c></row>"#;
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        let before = pkg.workbook.sheets[0].cell(0, 3).cloned().unwrap();
+        eng.set_cell(&mut pkg.workbook, (0, 0, 3), Cell::number(1.0));
+        eng.restore_cell(&mut pkg.workbook, (0, 0, 3), before);
+        let d1 = pkg.workbook.sheets[0].cell(0, 3).unwrap();
+        assert_eq!(d1.f_attrs.as_deref(), Some(r#" t="array" ref="D1:D3""#));
+        assert_eq!(d1.spill, Some((3, 1)));
+    }
+
+    #[test]
+    fn recommitting_an_unchanged_typed_formula_keeps_it_dynamic() {
+        // The editor builds a fresh Cell on Enter even when the text did not
+        // change: the formula stays what it was — a dynamic array here.
+        let (mut pkg, mut eng) = typed_book(&[((0, 2), "SEQUENCE(3)")]);
+        eng.set_cell(&mut pkg.workbook, (0, 0, 2), Cell::formula("SEQUENCE(3)"));
+        let c1 = pkg.workbook.sheets[0].cell(0, 2).unwrap();
+        assert!(c1.is_modern() && c1.is_dynamic());
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(0, 2).unwrap().spill,
+            Some((3, 1))
+        );
+    }
+
+    #[test]
+    fn pasting_a_clone_does_not_bring_the_sources_formula_kind() {
+        // #724 r1: paste sends a clone of the source cell to set_cell at
+        // another address. When the target already has the same text, the
+        // source's `<f>` attributes (a `ref` naming the source) and `cm` must
+        // not land on it.
+        let rows = r#"<row r="1"><c r="A1"><v>1</v></c><c r="D1"><f t="array" ref="D1">$A$1*2</f><v>2</v></c><c r="E1" cm="1"><f t="array" ref="E1:E3">$A$1:$A$3*2</f><v>2</v></c><c r="G1"><f>$A$1:$A$3*2</f><v>2</v></c></row><row r="2"><c r="A2"><v>2</v></c><c r="E2"><v>4</v></c></row><row r="3"><c r="A3"><v>3</v></c><c r="E3"><v>6</v></c></row>"#;
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        let sheet =
+            |pkg: &SheetPackage, c: u32| pkg.workbook.sheets[0].cell(0, c).cloned().unwrap();
+        // The single-cell CSE D1 pasted to F1 twice (the second time F1
+        // already has the same text).
+        let d1 = sheet(&pkg, 3);
+        eng.set_cell(&mut pkg.workbook, (0, 0, 5), d1.clone());
+        eng.set_cell(&mut pkg.workbook, (0, 0, 5), d1);
+        assert_eq!(sheet(&pkg, 5).f_attrs, None);
+        // The dynamic E1 pasted onto the legacy G1 with the same text: G1
+        // stays a legacy formula.
+        let e1 = sheet(&pkg, 4);
+        eng.set_cell(&mut pkg.workbook, (0, 0, 6), e1);
+        let g1 = sheet(&pkg, 6);
+        assert_eq!(
+            (
+                g1.f_attrs.clone(),
+                g1.is_dynamic(),
+                g1.is_modern(),
+                g1.spill
+            ),
+            (None, false, false, None)
+        );
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            !ws.contains(r#"<c r="F1"><f t="array" ref="D1">"#)
+                && !ws.contains(r#"<c r="F1"><f t="array""#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(r#"<c r="G1"><f>$A$1:$A$3*2</f><v>2</v></c>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn recommitting_a_cse_array_keeps_it_cse() {
+        // Enter on an unchanged CSE array (a fresh Cell, no `<f>` attributes)
+        // does not turn it into a dynamic array.
+        let rows = r#"<row r="1"><c r="A1"><v>1</v></c><c r="D1"><f t="array" ref="D1:D3">A1:A3*2</f><v>2</v></c></row><row r="2"><c r="A2"><v>2</v></c></row><row r="3"><c r="A3"><v>3</v></c></row>"#;
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 0, 3), Cell::formula("A1:A3*2"));
+        let d1 = pkg.workbook.sheets[0].cell(0, 3).unwrap();
+        assert_eq!(d1.f_attrs.as_deref(), Some(r#" t="array" ref="D1:D3""#));
+        assert!(!d1.is_dynamic());
+        let (_, ws) = resaved(&pkg);
+        assert!(!ws.contains("cm="), "{ws}");
+    }
+
+    #[test]
+    fn recommitting_a_loaded_dynamic_array_keeps_it_dynamic() {
+        // A fresh Cell with the same text as a loaded `cm` anchor: it stays a
+        // dynamic array with the file's own `cm`.
+        let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SORT_ANCHOR))).unwrap();
+        let src = pkg.workbook.sheets[0]
+            .cell(0, 3)
+            .unwrap()
+            .formula
+            .clone()
+            .unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 0, 3), Cell::formula(&src));
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(0, 3).unwrap().spill,
+            Some((5, 1))
+        );
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<c r="D1" cm="1"><f t="array" ref="D1:D5">"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn undoing_an_overwrite_through_restore_cell_restores_cm() {
+        // xlsxy and gridwasm undo by restore_cell-ing the `before` clone back:
+        // the anchor comes back exactly, `t="array"` attributes and `cm`.
         let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SORT_ANCHOR))).unwrap();
         let mut eng = crate::engine::Engine::new(&pkg.workbook);
         let before = pkg.workbook.sheets[0].cell(0, 3).cloned().unwrap();
         eng.set_cell(&mut pkg.workbook, (0, 0, 3), Cell::number(1.0));
         assert!(!saved_sheet1(&pkg).contains("cm="));
-        eng.set_cell(&mut pkg.workbook, (0, 0, 3), before);
+        eng.restore_cell(&mut pkg.workbook, (0, 0, 3), before.clone());
+        assert_eq!(pkg.workbook.sheets[0].cell(0, 3).unwrap(), &before);
         let ws = saved_sheet1(&pkg);
         assert!(
             ws.contains(r#"<c r="D1" cm="1"><f t="array" ref="D1:D5">"#),
@@ -8685,7 +9559,7 @@ b",
         eng.recalc_all(&mut pkg.workbook);
         let before = pkg.workbook.sheets[0].cell(0, 3).cloned().unwrap();
         eng.set_cell(&mut pkg.workbook, (0, 0, 3), Cell::number(1.0));
-        eng.set_cell(&mut pkg.workbook, (0, 0, 3), before);
+        eng.restore_cell(&mut pkg.workbook, (0, 0, 3), before);
         rebuild(&mut pkg);
         assert_eq!(
             pkg.workbook.sheets[0].cell(0, 3).unwrap().spill,
@@ -8706,25 +9580,31 @@ b",
         );
     }
 
+    /// The saved `<c r="{name}" …>…</c>` element.
+    fn saved_cell<'a>(ws: &'a str, name: &str) -> &'a str {
+        let start = ws
+            .find(&format!(r#"<c r="{name}""#))
+            .unwrap_or_else(|| panic!("{ws}"));
+        let end = start + ws[start..].find("</c>").unwrap() + "</c>".len();
+        &ws[start..end]
+    }
+
     #[test]
-    fn relocated_cse_clone_that_cannot_spill_writes_its_own_anchor_ref() {
+    fn relocated_cse_clone_that_cannot_spill_never_claims_its_source_block() {
         // A paste re-submits the clone, source `ref` and all, at F5. Here a
-        // CSE block over D1:D3 with a 1x1 result: F5 holds it alone.
+        // CSE block over D1:D3 with a 1x1 result. A clone at a new address is
+        // typing (#724): none of its source's `<f>` attributes come along.
         let anchor = r#"<c r="D1"><f t="array" ref="D1:D3">SUM(A1:A5*A1:A5)</f><v>165</v></c>"#;
         let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, anchor))).unwrap();
         let mut eng = crate::engine::Engine::new(&pkg.workbook);
         eng.recalc_all(&mut pkg.workbook);
         let clone = pkg.workbook.sheets[0].cell(0, 3).cloned().unwrap();
         eng.set_cell(&mut pkg.workbook, (0, 4, 5), clone);
-        // Re-anchored on the cell itself, so a later structural edit moves
-        // the right ref; the writer's guard is only a backstop.
-        let f5 = pkg.workbook.sheets[0].cell(4, 5).unwrap();
-        assert_eq!(f5.f_attrs.as_deref(), Some(r#" t="array" ref="F5""#));
+        assert_eq!(pkg.workbook.sheets[0].cell(4, 5).unwrap().f_attrs, None);
         let ws = saved_sheet1(&pkg);
-        assert!(
-            ws.contains(r#"<c r="F5"><f t="array" ref="F5">SUM(A1:A5*A1:A5)</f><v>165</v></c>"#),
-            "{ws}"
-        );
+        let f5 = saved_cell(&ws, "F5");
+        assert!(f5.contains("SUM(A1:A5*A1:A5)</f><v>165</v>"), "{f5}");
+        assert!(!f5.contains("D1:D3"), "{f5}");
         // The source block keeps its own ref.
         assert!(
             ws.contains(r#"<c r="D1"><f t="array" ref="D1:D3">SUM(A1:A5*A1:A5)</f>"#),
@@ -8734,6 +9614,7 @@ b",
 
     #[test]
     fn relocated_cse_clone_blocked_by_a_neighbour_writes_its_own_anchor_ref() {
+        // Typed at F5 (#724), its array result makes it a dynamic array.
         // The same for a 3x1 result blocked by F6 (#SPILL!). The clone is
         // taken with no spill extent of its own, so F6 counts as foreign.
         let rows = CSE_ROWS.replace(
@@ -8747,9 +9628,10 @@ b",
         clone.spill = None;
         eng.set_cell(&mut pkg.workbook, (0, 4, 5), clone);
         let ws = saved_sheet1(&pkg);
+        let f5 = saved_cell(&ws, "F5");
         assert!(
-            ws.contains(r#"<c r="F5" t="e"><f t="array" ref="F5">A1:A3*2</f><v>#SPILL!</v></c>"#),
-            "{ws}"
+            f5.contains(r#"<f t="array" ref="F5">A1:A3*2</f><v>#SPILL!</v>"#),
+            "{f5}"
         );
     }
 
@@ -8801,31 +9683,29 @@ b",
     }
 
     #[test]
-    fn a_filled_down_cse_clone_owns_only_its_anchor_after_a_row_delete() {
+    fn a_filled_down_cse_clone_never_claims_a_block_after_a_row_delete() {
+        // The filled copy is typed (#724): no source `ref` to shrink onto it.
         let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SUM_BLOCK))).unwrap();
         fill_from_d1(&mut pkg, (1, 3), true);
-        let d2 = pkg.workbook.sheets[0].cell(1, 3).unwrap();
-        assert_eq!(d2.f_attrs.as_deref(), Some(r#" t="array" ref="D2""#));
+        assert_eq!(pkg.workbook.sheets[0].cell(1, 3).unwrap().f_attrs, None);
         crate::edit::delete_rows(&mut pkg.workbook, 0, 0, 1);
         rebuild(&mut pkg);
         let ws = saved_sheet1(&pkg);
-        assert!(
-            ws.contains(r#"<c r="D1"><f t="array" ref="D1">SUM(A1:A5*A1:A5)</f>"#),
-            "{ws}"
-        );
+        let d1 = saved_cell(&ws, "D1");
+        assert!(d1.contains("SUM(A1:A5*A1:A5)</f>"), "{d1}");
+        assert!(!d1.contains(":D"), "{d1}");
     }
 
     #[test]
-    fn a_filled_right_cse_clone_owns_only_its_anchor_after_a_column_delete() {
+    fn a_filled_right_cse_clone_never_claims_a_block_after_a_column_delete() {
         let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SUM_BLOCK))).unwrap();
         fill_from_d1(&mut pkg, (0, 4), false);
         crate::edit::delete_cols(&mut pkg.workbook, 0, 3, 1);
         rebuild(&mut pkg);
         let ws = saved_sheet1(&pkg);
-        assert!(
-            ws.contains(r#"<c r="D1"><f t="array" ref="D1">SUM(B1:B5*B1:B5)</f>"#),
-            "{ws}"
-        );
+        let d1 = saved_cell(&ws, "D1");
+        assert!(d1.contains("SUM(B1:B5*B1:B5)</f>"), "{d1}");
+        assert!(!d1.contains(":D"), "{d1}");
     }
 
     #[test]
@@ -8910,12 +9790,12 @@ b",
     #[test]
     fn format_edited_dynamic_anchor_still_spills_after_an_engine_rebuild() {
         // xlsxy rebuilds the engine (Engine::new + recalc_all) after a
-        // structural edit; the format edit keeps the array `f_attrs`, and
-        // `cm` still says the anchor is a dynamic array.
+        // structural edit. A format edit is not typing: the anchor keeps its
+        // `t="array"` attributes and its `cm`.
         let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SORT_ANCHOR))).unwrap();
         format_d1(&mut pkg);
         let d1 = pkg.workbook.sheets[0].cell(0, 3).unwrap();
-        assert!(d1.f_attrs.as_deref().is_some_and(is_array_f));
+        assert!(d1.f_attrs.as_deref().is_some_and(is_array_f) && d1.has_cm());
         let mut eng = crate::engine::Engine::new(&pkg.workbook);
         eng.recalc_all(&mut pkg.workbook);
         assert_eq!(

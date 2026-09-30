@@ -14878,10 +14878,10 @@ mod clipboard_tests {
     }
 
     /// #725: a grid paste of an array anchor at its source's own address on
-    /// another sheet covers only its cell; pasted onto the block itself (in
-    /// place) it keeps the block.
+    /// another sheet never claims the source's block (it is typing there,
+    /// #724); pasted onto the block itself (in place) it keeps the block.
     #[test]
-    fn a_pasted_cse_block_covers_only_its_cell_unless_pasted_in_place() {
+    fn a_pasted_cse_block_never_claims_its_source_unless_pasted_in_place() {
         let sheet = |name: &str| Sheet {
             name: name.to_string(),
             ..Sheet::default()
@@ -14895,7 +14895,7 @@ mod clipboard_tests {
         engine.recalc_all(&mut wb);
         let block = vec![vec![wb.sheets[1].cell(0, 3).cloned().unwrap()]];
         paste_grid_block(&mut engine, &mut wb, 0, (0, 3), &block);
-        assert_eq!(f_attrs_at(&wb, 0), Some(" t=\"array\" ref=\"D1\""));
+        assert_eq!(f_attrs_at(&wb, 0), None);
         paste_grid_block(&mut engine, &mut wb, 1, (0, 3), &block);
         assert_eq!(f_attrs_at(&wb, 1), Some(" t=\"array\" ref=\"D1:D3\""));
     }
