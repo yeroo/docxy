@@ -3781,6 +3781,7 @@ impl App {
         self.forget_clip();
         self.path = "untitled.xlsx".to_string();
         self.import_source = None;
+        self.template = None;
         self.model_rels = Vec::new();
         self.model_measures = Vec::new();
         self.comments = Vec::new();
@@ -8327,6 +8328,35 @@ mod tests {
         assert_eq!(Path::new(&app.path), chosen);
         assert!(load_xlsx(&std::fs::read(&chosen).unwrap()).is_ok());
         assert!(app.template.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #727 r2: File > New after opening a template starts an ordinary
+    /// workbook: Ctrl-S writes `untitled.xlsx` where it is bound, and does
+    /// not move on to a `<template>N` name.
+    #[test]
+    fn a_new_workbook_after_a_template_is_not_template_born() {
+        let dir = macro_dir("tmpl-new");
+        let template = dir.join("Budget.xltx");
+        std::fs::write(
+            &template,
+            gridcore::xlsx::save_xlsx_as(&new_xlsx(), SpreadsheetKind::Template),
+        )
+        .unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.open_workbook(template.to_str().unwrap());
+        assert!(app.template.is_some());
+        app.new_workbook();
+        assert!(app.template.is_none());
+        // Bind it inside the scratch folder, where a file of that name exists.
+        let untitled = dir.join("untitled.xlsx");
+        std::fs::write(&untitled, b"old").unwrap();
+        app.path = untitled.to_str().unwrap().to_string();
+        app.save_current().unwrap();
+        assert_eq!(Path::new(&app.path), untitled);
+        assert!(load_xlsx(&std::fs::read(&untitled).unwrap()).is_ok());
+        assert!(!dir.join("Budget1.xlsx").exists());
+        assert!(app.reload().is_ok());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

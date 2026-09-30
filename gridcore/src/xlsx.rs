@@ -223,15 +223,9 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
     let rels = get_str(&wb_rels_name)
         .map(|xml| parse_rels(&xml))
         .unwrap_or_default();
-    let resolve = |target: &str| -> String {
-        if let Some(abs) = target.strip_prefix('/') {
-            abs.to_string()
-        } else if wb_dir.is_empty() {
-            target.to_string()
-        } else {
-            format!("{wb_dir}/{target}")
-        }
-    };
+    // Absolute, relative, `./` and `../` Targets alike, as every other
+    // relationship lookup resolves them.
+    let resolve = |target: &str| -> String { resolve_relative(wb_dir, target) };
 
     // Workbook: sheet list + date system + defined names.
     let (sheet_meta, date1904, iterate, raw_names) = parse_workbook_xml(&wb_xml);
@@ -2089,16 +2083,16 @@ pub fn save_xlsx(pkg: &SheetPackage) -> Vec<u8> {
 /// Serialize the package as `kind`: the workbook part's content type follows
 /// the target file type, and a macro-free target (`.xlsx`, `.xltx`) loses the
 /// VBA project, the Excel 4.0 macro sheets and dialog sheets, and the Excel
-/// 4.0 names ([`SheetPackage::remove_macro_sheets`]). Excel refuses an
+/// 4.0 names (see [`SheetPackage::macro_features`]). Excel refuses an
 /// `.xlsx` that says it is a template or carries macros. `pkg` itself is
 /// untouched.
 pub fn save_xlsx_as(pkg: &SheetPackage, kind: SpreadsheetKind) -> Vec<u8> {
-    let without_macro_sheets;
+    let without_excel4_macros;
     let pkg = if !kind.allows_macros() && (pkg.has_macro_sheets() || pkg.has_macro_names()) {
         let mut copy = pkg.clone();
-        copy.remove_macro_sheets();
-        without_macro_sheets = copy;
-        &without_macro_sheets
+        copy.remove_excel4_macros();
+        without_excel4_macros = copy;
+        &without_excel4_macros
     } else {
         pkg
     };
@@ -2238,7 +2232,7 @@ impl SheetPackage {
         features
     }
 
-    /// Drop the Excel 4.0 macro content, as [`save_xlsx_as`] does (on a copy)
+    /// Drop the Excel 4.0 macro content from the copy [`save_xlsx_as`] writes
     /// for a macro-free kind: the macro sheets and dialog sheets, each through
     /// [`Self::remove_sheet`], and the Excel 4.0 names, which go even when
     /// there is no macro sheet: every defined name marked `xlm`, `function`
@@ -2247,9 +2241,9 @@ impl SheetPackage {
     /// sheets first gains a blank worksheet, so one remains. Returns whether
     /// there was anything to drop.
     ///
-    /// Removing sheets shifts sheet indices, so an editor calls this only on
-    /// a package nothing else indexes into.
-    pub fn remove_macro_sheets(&mut self) -> bool {
+    /// Only that copy: an open workbook keeps its macros, as Excel keeps
+    /// them, and its sheet indices stay put.
+    fn remove_excel4_macros(&mut self) -> bool {
         let doomed = self.macro_sheet_indices();
         if doomed.is_empty() && !self.has_macro_names() {
             return false;
@@ -5911,25 +5905,26 @@ impl SheetPackage {
                 t.sheet -= 1;
             }
         }
-        // Relationship (by target) — capture its rId first.
-        let target = part_name.trim_start_matches("xl/").to_string();
+        // The workbook relationship whose target resolves to the part (a
+        // relative, `./` or absolute Target alike) — capture its rId, then
+        // remove it by that Id.
         let mut rid = String::new();
         if let Some(p) = self
             .parts
             .iter_mut()
             .find(|(n, _)| n == "xl/_rels/workbook.xml.rels")
         {
-            let xml = String::from_utf8_lossy(&p.1).into_owned();
-            if let Some(rel_pos) = xml.find(&format!("Target=\"{target}\"")) {
-                if let Some(id_pos) = xml[..rel_pos].rfind("Id=\"") {
-                    let s = id_pos + 4;
-                    if let Some(e) = xml[s..].find('\"') {
-                        rid = xml[s..s + e].to_string();
-                    }
+            let mut xml = String::from_utf8_lossy(&p.1).into_owned();
+            if let Some((id, _, _)) = parse_rels(&xml)
+                .into_iter()
+                .find(|(_, _, t)| resolve_relative("xl", t) == part_name)
+            {
+                if let Some(el) = find_element_by_attr(&xml, "Relationship", "Id", |v| v == id) {
+                    xml.replace_range(el.start..el.end, "");
                 }
+                rid = id;
             }
-            p.1 = remove_element_containing(&xml, "<Relationship", &format!("Target=\"{target}\""))
-                .into_bytes();
+            p.1 = xml.into_bytes();
         }
         // workbook.xml: drop the <sheet> element and fix defined-name scopes
         // (localSheetId counts sheets in document order).
@@ -11388,8 +11383,8 @@ mod kind_tests {
 
         // The in-memory drop agrees with the file.
         let mut pkg = mixed_xlm_book();
-        assert!(pkg.remove_macro_sheets());
-        assert!(!pkg.remove_macro_sheets());
+        assert!(pkg.remove_excel4_macros());
+        assert!(!pkg.remove_excel4_macros());
         assert!(
             pkg.workbook
                 .defined_names
@@ -11502,10 +11497,48 @@ mod kind_tests {
 
         // The in-memory drop does the same.
         let mut copy = pkg.clone();
-        assert!(copy.remove_macro_sheets());
+        assert!(copy.remove_excel4_macros());
         assert!(!copy.has_macro_names());
         assert_eq!(copy.workbook.sheets.len(), 2);
-        assert!(!copy.remove_macro_sheets());
+        assert!(!copy.remove_excel4_macros());
+    }
+
+    /// #727 r2: a macro sheet named by an absolute or `./` Target is removed
+    /// with its relationship and `<sheet>`, not left pointing at nothing.
+    #[test]
+    fn macro_sheets_with_absolute_or_dotted_targets_are_removed_whole() {
+        let mut pkg = mixed_xlm_book();
+        let rels = part_text(&pkg, "xl/_rels/workbook.xml.rels")
+            .replace(
+                "Target=\"macrosheets/sheet2.xml\"",
+                "Target=\"/xl/macrosheets/sheet2.xml\"",
+            )
+            .replace(
+                "Target=\"dialogsheets/sheet3.xml\"",
+                "Target=\"./dialogsheets/sheet3.xml\"",
+            );
+        assert!(rels.contains("/xl/macrosheets/") && rels.contains("./dialogsheets/"));
+        pkg.set_part("xl/_rels/workbook.xml.rels", rels.into_bytes());
+        let pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(pkg.workbook.sheets.len(), 4);
+        assert!(pkg.has_macro_sheets());
+
+        let out = roundtrip(&pkg, SpreadsheetKind::Workbook);
+        let names: Vec<&str> = out
+            .workbook
+            .sheets
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(names, ["Data", "Report"]);
+        let rels = part_text(&out, "xl/_rels/workbook.xml.rels");
+        assert!(
+            !rels.contains("macrosheets") && !rels.contains("dialogsheets"),
+            "{rels}"
+        );
+        let wb = part_text(&out, "xl/workbook.xml");
+        assert_eq!(wb.matches("<sheet ").count(), 2, "{wb}");
+        assert!(!wb.contains("Macro1") && !wb.contains("Dialog1"), "{wb}");
     }
 
     #[test]
