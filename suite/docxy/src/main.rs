@@ -1015,6 +1015,28 @@ impl ClipRead {
     }
 }
 
+/// Write a pasted `block` onto sheet `s` from `(br, bc)`, one cell at a time
+/// through the engine. A pasted array anchor covers its own cell, not the
+/// block it was copied from, unless it lands on that very block
+/// ([`gridcore::sheet::anchor_pasted_array_ref`]).
+fn paste_grid_block(
+    engine: &mut gridcore::engine::Engine,
+    wb: &mut gridcore::sheet::Workbook,
+    s: usize,
+    (br, bc): (u32, u32),
+    block: &[Vec<gridcore::sheet::Cell>],
+) {
+    for (dr, row) in block.iter().enumerate() {
+        for (dc, cell) in row.iter().enumerate() {
+            let (r, c) = (br + dr as u32, bc + dc as u32);
+            let mut cell = cell.clone();
+            let current = wb.sheets.get(s).and_then(|sh| sh.cell(r, c));
+            gridcore::sheet::anchor_pasted_array_ref(&mut cell, current, r, c);
+            engine.set_cell(wb, (s, r, c), cell);
+        }
+    }
+}
+
 /// Whether a sheet paste uses the grid clip recorded as `recorded` rather than
 /// what the clipboard holds `now` (#699). The grid clip is ours only while the
 /// clipboard still holds the text we put there: another app's copy replaces
@@ -9511,15 +9533,7 @@ impl Docxy {
         if let Some(v) = self.active_sheet_mut() {
             let (br, bc) = v.sel;
             let s = v.active;
-            for (dr, row) in block.iter().enumerate() {
-                for (dc, cell) in row.iter().enumerate() {
-                    v.engine.set_cell(
-                        &mut v.pkg.workbook,
-                        (s, br + dr as u32, bc + dc as u32),
-                        cell.clone(),
-                    );
-                }
-            }
+            paste_grid_block(&mut v.engine, &mut v.pkg.workbook, s, (br, bc), &block);
             let h = block.len() as u32;
             let w = block.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
             if h > 0 && w > 0 {
@@ -14845,7 +14859,46 @@ fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) -> bool
 
 #[cfg(test)]
 mod clipboard_tests {
-    use super::{ClipRead, ClipboardStore, grid_paste_uses_clip};
+    use super::{ClipRead, ClipboardStore, grid_paste_uses_clip, paste_grid_block};
+    use gridcore::engine::Engine;
+    use gridcore::sheet::{Cell, CellValue, Sheet, Workbook};
+
+    /// #725: a legacy CSE block over D1:D3 with a 1x1 result (no spill).
+    fn cse_sum_block() -> Cell {
+        Cell {
+            value: CellValue::Number(6.0),
+            formula: Some("SUM(A1:A3)".into()),
+            f_attrs: Some(" t=\"array\" ref=\"D1:D3\"".into()),
+            ..Cell::default()
+        }
+    }
+
+    fn f_attrs_at(wb: &Workbook, s: usize) -> Option<&str> {
+        wb.sheets[s].cell(0, 3)?.f_attrs.as_deref()
+    }
+
+    /// #725: a grid paste of an array anchor at its source's own address on
+    /// another sheet never claims the source's block (it is typing there,
+    /// #724); pasted onto the block itself (in place) it keeps the block.
+    #[test]
+    fn a_pasted_cse_block_never_claims_its_source_unless_pasted_in_place() {
+        let sheet = |name: &str| Sheet {
+            name: name.to_string(),
+            ..Sheet::default()
+        };
+        let mut wb = Workbook {
+            sheets: vec![sheet("Sheet1"), sheet("Data")],
+            ..Workbook::default()
+        };
+        wb.sheets[1].set_cell(0, 3, cse_sum_block());
+        let mut engine = Engine::new(&wb);
+        engine.recalc_all(&mut wb);
+        let block = vec![vec![wb.sheets[1].cell(0, 3).cloned().unwrap()]];
+        paste_grid_block(&mut engine, &mut wb, 0, (0, 3), &block);
+        assert_eq!(f_attrs_at(&wb, 0), None);
+        paste_grid_block(&mut engine, &mut wb, 1, (0, 3), &block);
+        assert_eq!(f_attrs_at(&wb, 1), Some(" t=\"array\" ref=\"D1:D3\""));
+    }
 
     /// #699: a harness instance never reads or writes the OS clipboard, and
     /// starts from an empty private one.

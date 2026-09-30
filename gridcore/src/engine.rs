@@ -21,7 +21,7 @@ use crate::formula::{
     self, DynResult, Eval, ExcelError, Expr, Resolver, Value, always_recalc, collect_refs,
     contains_db_fn,
 };
-use crate::sheet::{Cell, CellMeta, CellValue, Sheet, Workbook, is_array_f};
+use crate::sheet::{Cell, CellMeta, CellValue, Sheet, Workbook, is_array_f, own_array_ref};
 
 /// (sheet index, row, col) — the engine's cell address.
 pub type Key = (usize, u32, u32);
@@ -196,6 +196,7 @@ impl Engine {
             // address whose `ref`/`si`/`cm` are not this cell's.
             Some(p) => {
                 cell.f_attrs = p.f_attrs.clone();
+                own_array_ref(&mut cell, r, c);
                 let pm = p.meta.as_deref().cloned().unwrap_or_default();
                 let kind_of = |m: &CellMeta| (m.cm.clone(), m.modern, m.dynamic);
                 if cell.meta.as_deref().map(kind_of).unwrap_or_default() != kind_of(&pm) {
@@ -1215,6 +1216,48 @@ mod tests {
         let mut c = Cell::formula(src);
         c.f_attrs = Some("t=\"array\"".to_string());
         c
+    }
+
+    #[test]
+    fn set_cell_still_drops_a_shared_formula_marker() {
+        // Only an array marker survives set_cell; a shared group's or a data
+        // table's names cells this formula no longer owns.
+        let mut wb = wb_one_sheet(&[("A1", Cell::number(2.0))]);
+        let mut eng = Engine::new(&wb);
+        for (name, fa) in [
+            ("B1", " t=\"shared\" ref=\"B1:B3\" si=\"0\""),
+            (
+                "C1",
+                " t=\"dataTable\" ref=\"C1:C2\" dt2D=\"0\" dtr=\"0\" r1=\"A1\"",
+            ),
+        ] {
+            let mut cell = Cell::formula("A1*2");
+            cell.f_attrs = Some(fa.to_string());
+            set(&mut eng, &mut wb, name, cell);
+            let (r, c) = crate::sheet::parse_cell_name(name).unwrap();
+            assert!(wb.sheets[0].cell(r, c).unwrap().f_attrs.is_none(), "{name}");
+            assert_eq!(value_at(&wb, name), CellValue::Number(4.0), "{name}");
+        }
+        // A typed formula is a fresh Cell: nothing to keep.
+        set(&mut eng, &mut wb, "D1", Cell::formula("A1*3"));
+        assert!(wb.sheets[0].cell(0, 3).unwrap().f_attrs.is_none());
+        // An incoming array marker is dropped too (typing, #724); the same
+        // formula re-submitted keeps the one the cell already had.
+        let mut cell = Cell::formula("A1*4");
+        cell.f_attrs = Some(" t=\"array\" ref=\"E1\"".to_string());
+        set(&mut eng, &mut wb, "E1", cell);
+        assert!(wb.sheets[0].cell(0, 4).unwrap().f_attrs.is_none());
+        let mut cse = Cell::formula("A1*5");
+        cse.f_attrs = Some(" t=\"array\" ref=\"F1:F2\"".to_string());
+        wb.sheets[0].set_cell(0, 5, cse);
+        let mut restyled = wb.sheets[0].cell(0, 5).cloned().unwrap();
+        restyled.style = 1;
+        restyled.f_attrs = None;
+        set(&mut eng, &mut wb, "F1", restyled);
+        assert_eq!(
+            wb.sheets[0].cell(0, 5).unwrap().f_attrs.as_deref(),
+            Some(" t=\"array\" ref=\"F1:F2\"")
+        );
     }
 
     #[test]

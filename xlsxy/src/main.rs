@@ -2224,14 +2224,26 @@ impl App {
                             continue;
                         }
                         let mut new_cell = cell.clone().unwrap_or_default();
-                        if !clip.cut {
-                            // Copies translate relative refs; cuts keep them.
+                        // Copies translate relative refs; cuts keep them, and
+                        // so does a copy pasted where it came from (translating
+                        // reprints the text, even by zero).
+                        if !clip.cut && (dr_all, dc_all) != (0, 0) {
                             if let Some(f) = &new_cell.formula {
                                 if let Some(t) = translate_formula(f, dr_all, dc_all) {
                                     new_cell.formula = Some(t);
                                 }
                             }
                         }
+                        // A pasted array anchor covers its own cell, not the
+                        // block it was copied from — unless it lands on that
+                        // very block. `changes` isn't applied yet, so this
+                        // reads the cell as it is before a cut's clears.
+                        gridcore::sheet::anchor_pasted_array_ref(
+                            &mut new_cell,
+                            self.sheet().cell(r, c),
+                            r,
+                            c,
+                        );
                         // Overwrite position wins over source-clear on overlap.
                         changes.retain(|&(cr, cc, _)| (cr, cc) != (r, c));
                         changes.push((r, c, new_cell));
@@ -8181,6 +8193,147 @@ mod tests {
         app.toggle_show_hidden();
         app.move_cur(1, 0, false);
         assert_eq!(app.cur.0, 1);
+    }
+
+    #[test]
+    fn bold_then_insert_row_above_keeps_a_cse_array() {
+        // #725: a legacy Ctrl+Shift+Enter array (no `cm`) over D1:D3. Bolding
+        // it goes through Engine::set_cell; inserting a row rebuilds the
+        // engine. It must come out the other side still an array.
+        let mut pkg = new_xlsx();
+        let sheet = &mut pkg.workbook.sheets[0];
+        for r in 0..3u32 {
+            sheet.set_cell(r, 0, Cell::number(f64::from(r + 1)));
+            sheet.set_cell(r, 3, Cell::number(f64::from(2 * (r + 1))));
+        }
+        sheet.set_cell(
+            0,
+            3,
+            Cell {
+                value: CellValue::Number(2.0),
+                formula: Some("A1:A3*2".into()),
+                f_attrs: Some(" t=\"array\" ref=\"D1:D3\"".into()),
+                spill: Some((3, 1)), // as load_xlsx reads it from the ref
+                ..Cell::default()
+            },
+        );
+        let mut app = App::new(pkg, "t.xlsx");
+        app.os_clip = None;
+        app.cur = (0, 3);
+        app.anchor = None;
+        app.toggle_bold();
+        app.cur = (0, 0);
+        app.row_op(true);
+
+        for r in 1..4u32 {
+            assert_eq!(
+                app.sheet().cell(r, 3).unwrap().value,
+                CellValue::Number(f64::from(2 * r)),
+                "row {r}"
+            );
+        }
+        let style = app.sheet().cell(1, 3).unwrap().style;
+        assert!(app.pkg.workbook.styles.xf(style).bold);
+        let saved = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
+        let ws = String::from_utf8_lossy(saved.part("xl/worksheets/sheet1.xml").unwrap());
+        assert!(
+            ws.contains(&format!(
+                r#"<c r="D2" s="{style}"><f t="array" ref="D2:D4">A2:A4*2</f><v>2</v></c>"#
+            )),
+            "{ws}"
+        );
+    }
+
+    /// A legacy CSE block over D1:D3 with a 1x1 result (nothing spills).
+    fn cse_sum_block() -> Cell {
+        Cell {
+            value: CellValue::Number(6.0),
+            formula: Some("SUM(A1:A3)".into()),
+            f_attrs: Some(" t=\"array\" ref=\"D1:D3\"".into()),
+            ..Cell::default()
+        }
+    }
+
+    fn f_attrs_at(app: &App, sheet: usize, r: u32, c: u32) -> Option<String> {
+        app.pkg.workbook.sheets[sheet].cell(r, c)?.f_attrs.clone()
+    }
+
+    #[test]
+    fn pasting_a_cse_block_onto_another_sheet_covers_only_its_cell() {
+        // The same address on another sheet: nothing moves, but the cell
+        // there holds no such formula, so the paste is typing (#724) and
+        // brings none of the source's `<f>` attributes.
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.open_prompt(PromptKind::AddSheet);
+        app.prompt.as_mut().unwrap().text = "Data".to_string();
+        app.commit_prompt();
+        app.pkg.workbook.sheets[1].set_cell(0, 3, cse_sum_block());
+        app.goto_sheet(1);
+        app.cur = (0, 3);
+        app.anchor = None;
+        app.copy(false);
+        app.goto_sheet(0);
+        app.cur = (0, 3);
+        app.paste();
+        assert_eq!(f_attrs_at(&app, 0, 0, 3), None);
+        assert_eq!(
+            f_attrs_at(&app, 1, 0, 3).as_deref(),
+            Some(" t=\"array\" ref=\"D1:D3\"")
+        );
+        let saved = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
+        let ws = String::from_utf8_lossy(saved.part("xl/worksheets/sheet1.xml").unwrap());
+        assert!(ws.contains(r#"SUM(A1:A3)</f>"#), "{ws}");
+        assert!(!ws.contains("D1:D3"), "{ws}");
+    }
+
+    #[test]
+    fn pasting_a_cse_block_back_after_it_moved_does_not_overlap_it() {
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].set_cell(0, 3, cse_sum_block());
+        let mut app = App::new(pkg, "t.xlsx");
+        app.os_clip = None;
+        app.cur = (0, 3);
+        app.anchor = None;
+        app.copy(false);
+        app.cur = (0, 0);
+        app.row_op(true); // the block moves to D2:D4
+        app.cur = (0, 3);
+        app.paste();
+        assert_eq!(
+            f_attrs_at(&app, 0, 1, 3).as_deref(),
+            Some(" t=\"array\" ref=\"D2:D4\"")
+        );
+        // Typed at D1 (#724): no block of its own to overlap D2:D4 with.
+        assert_eq!(f_attrs_at(&app, 0, 0, 3), None);
+    }
+
+    #[test]
+    fn pasting_a_cse_block_in_place_keeps_the_block() {
+        // Copy or cut D1 and paste it straight back: it lands on its own
+        // block, which stays D1:D3, and its loaded text is not reprinted
+        // (spaces and `_xlfn.` prefixes survive).
+        for cut in [false, true] {
+            for src in ["SUM(A1:A3)", "SUM(A1:A3) * 2", "_xlfn.SINGLE(A1:A3)"] {
+                let mut pkg = new_xlsx();
+                let mut block = cse_sum_block();
+                block.formula = Some(src.into());
+                pkg.workbook.sheets[0].set_cell(0, 3, block);
+                let mut app = App::new(pkg, "t.xlsx");
+                app.os_clip = None;
+                app.cur = (0, 3);
+                app.anchor = None;
+                app.copy(cut);
+                app.paste();
+                let d1 = app.sheet().cell(0, 3).unwrap();
+                assert_eq!(
+                    d1.f_attrs.as_deref(),
+                    Some(" t=\"array\" ref=\"D1:D3\""),
+                    "cut: {cut}, {src}"
+                );
+                assert_eq!(d1.formula.as_deref(), Some(src), "cut: {cut}");
+            }
+        }
     }
 
     #[test]

@@ -174,6 +174,66 @@ pub fn is_array_f(attrs: &str) -> bool {
     attrs.contains("t=\"array\"")
 }
 
+/// The `ref` named by preserved `<f>` attributes, if any.
+pub(crate) fn f_ref(fa: &str) -> Option<&str> {
+    let start = fa.find(" ref=\"")? + " ref=\"".len();
+    let end = fa[start..].find('"').map_or(fa.len(), |e| start + e);
+    Some(&fa[start..end])
+}
+
+/// Preserved `<f>` attributes with `ref` set to `r` (added if absent).
+pub(crate) fn with_ref(fa: &str, r: &str) -> String {
+    match fa.find(" ref=\"") {
+        Some(i) => {
+            let start = i + " ref=\"".len();
+            let end = fa[start..].find('"').map_or(fa.len(), |e| start + e);
+            format!("{}{r}{}", &fa[..start], &fa[end..])
+        }
+        None => format!("{fa} ref=\"{r}\""),
+    }
+}
+
+/// Does the `ref` in preserved `<f>` attributes start at `anchor` (a cell
+/// name)? A block's ref always starts at the cell that holds it; one that
+/// starts elsewhere, or is missing, names a block this cell doesn't own.
+pub(crate) fn ref_starts_at(fa: &str, anchor: &str) -> bool {
+    f_ref(fa)
+        .and_then(|r| r.split(':').next())
+        .is_some_and(|tl| tl.eq_ignore_ascii_case(anchor))
+}
+
+/// An array formula at `(row, col)` whose `ref` doesn't start there names
+/// another block (a clone, or a cell moved without the engine): it covers
+/// its own cell instead. A ref that does start there is left as it is.
+pub(crate) fn own_array_ref(cell: &mut Cell, row: u32, col: u32) {
+    if let Some(fa) = cell.f_attrs.as_deref().filter(|a| is_array_f(a)) {
+        let anchor = cell_name(row, col);
+        if !ref_starts_at(fa, &anchor) {
+            cell.f_attrs = Some(with_ref(fa, &anchor));
+        }
+    }
+}
+
+/// Make an array formula pasted at `(row, col)` cover that cell alone: its
+/// `ref` still names the block it was copied from. A paste calls this for
+/// every pasted cell, before `Engine::set_cell` — which can't tell a paste
+/// at the source's own address (on another sheet, or after the source
+/// moved) from an undo. `current` is the cell being replaced: when it
+/// already holds this very array (same `<f>` attributes and formula), the
+/// block is that cell's and a paste in place keeps it.
+pub fn anchor_pasted_array_ref(cell: &mut Cell, current: Option<&Cell>, row: u32, col: u32) {
+    if !cell.f_attrs.as_deref().is_some_and(is_array_f) {
+        return;
+    }
+    let in_place =
+        current.is_some_and(|cur| cur.f_attrs == cell.f_attrs && cur.formula == cell.formula);
+    if !in_place {
+        if let Some(fa) = cell.f_attrs.as_deref() {
+            cell.f_attrs = Some(with_ref(fa, &cell_name(row, col)));
+        }
+    }
+}
+
 impl Cell {
     pub fn number(n: f64) -> Cell {
         Cell {
