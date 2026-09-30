@@ -9,7 +9,8 @@
 //! non-working weekdays and holiday dates, and includes working exception
 //! dates on otherwise excluded weekdays.
 //! The accompanying table names each task as stored (line breaks flattened,
-//! `\` and `|` escaped); only the chart strips `:,;#` from names. It
+//! inline Markdown metacharacters backslash-escaped); only the chart strips
+//! `:,;#` from names. It
 //! includes bold summary rows with rolled-up dates (a
 //! manually scheduled summary's own dates) and working durations, each task's
 //! Deadline (marked `⚠` when the row's Finish is after it), signed total slack,
@@ -88,15 +89,17 @@ pub fn to_mermaid(proj: &Project, sched: &Schedule) -> String {
 /// Render a full Markdown document: a heading, the fenced Mermaid chart, and a
 /// task table (start, finish, deadline, duration, total/free slack, critical) as a text
 /// fallback for viewers that don't render Mermaid. Task names show as stored,
-/// with line breaks flattened and `\` and `|` escaped. Summary names are bold and
+/// with line breaks flattened and the inline Markdown metacharacters
+/// (`\`, `|`, `*`, `_`, `` ` ``, `~`, `<`, `[`, `]`, `&`) backslash-escaped.
+/// Summary names are bold and
 /// their durations are the working time between their scheduled dates (rolled
 /// up, or a manual summary's own), measured
 /// as [`crate::schedule::task_duration_min`] measures them: on the project's
 /// default calendar, or on its leaves' calendars when the default has no
 /// working time.
 pub fn to_markdown(proj: &Project, sched: &Schedule) -> String {
-    let heading = sanitize(&proj.title)
-        .or_else(|| sanitize(&proj.name))
+    let heading = heading_text(&proj.title)
+        .or_else(|| heading_text(&proj.name))
         .unwrap_or_else(|| "Project schedule".into());
     let mut out = format!(
         "# {heading}\n\n```mermaid\n{}```\n\n",
@@ -267,13 +270,31 @@ fn sanitize(s: &str) -> Option<String> {
 }
 
 /// A name as a Markdown table cell: line breaks and tabs flattened to one
-/// space each, ends trimmed, then `\` and `|` backslash-escaped so the row
-/// keeps its cells. Everything else is kept as stored. Returns `None` for an
-/// empty result.
+/// space each, ends trimmed, then the inline Markdown metacharacters
+/// (`\`, `|`, `*`, `_`, `` ` ``, `~`, `<`, `[`, `]`, `&`) backslash-escaped
+/// so a renderer shows the stored name and the row keeps its cells.
+/// Everything else is kept as stored. Returns `None` for an empty result.
 fn table_cell(s: &str) -> Option<String> {
     let flat = s.replace("\r\n", " ").replace(['\r', '\n', '\t'], " ");
-    let out = flat.trim().replace('\\', "\\\\").replace('|', "\\|");
+    let mut out = String::new();
+    for c in flat.trim().chars() {
+        if matches!(
+            c,
+            '\\' | '|' | '*' | '_' | '`' | '~' | '<' | '[' | ']' | '&'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
     (!out.is_empty()).then_some(out)
+}
+
+/// A project title or name as the Markdown heading text: escaped like a
+/// table cell, with `#` also escaped so a title ending in ` #` is not read
+/// as an ATX closing sequence. `#` is not in the table-cell set, so the
+/// second pass never double-escapes.
+fn heading_text(s: &str) -> Option<String> {
+    table_cell(s).map(|t| t.replace('#', "\\#"))
 }
 
 /// A pathless project can still name its UID 0 row from project metadata,
@@ -446,6 +467,55 @@ mod tests {
         assert!(md.contains("```mermaid\ngantt"));
         assert!(md.contains("| Task | Start | Finish |"));
         assert!(md.contains("2026-03-02 08:00:00"));
+    }
+
+    #[test]
+    fn markdown_heading_keeps_title_punctuation() {
+        for (title, expected) in [
+            ("Plan: east, west; lot #7", r"# Plan: east, west; lot \#7"),
+            ("Release #", r"# Release \#"),
+            ("a*b|c\\d", r"# a\*b\|c\\d"),
+            ("one\ntwo", "# one two"),
+        ] {
+            let proj = Project {
+                title: title.into(),
+                start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+                tasks: vec![task(1, "A", 480)],
+                ..Project::default()
+            };
+            let md = to_markdown(&proj, &schedule(&proj));
+            assert_eq!(md.lines().next(), Some(expected), "{md}");
+        }
+        // The Mermaid title line is still sanitized.
+        let proj = Project {
+            title: "Plan: east, west; lot #7".into(),
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![task(1, "A", 480)],
+            ..Project::default()
+        };
+        let sched = schedule(&proj);
+        assert!(
+            to_mermaid(&proj, &sched).contains("    title Plan east west lot 7\n"),
+            "{}",
+            to_mermaid(&proj, &sched)
+        );
+    }
+
+    #[test]
+    fn markdown_heading_falls_back_to_name_then_default() {
+        for (title, name, expected) in
+            [("", "Site: B", "# Site: B"), ("", "", "# Project schedule")]
+        {
+            let proj = Project {
+                title: title.into(),
+                name: name.into(),
+                start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+                tasks: vec![task(1, "A", 480)],
+                ..Project::default()
+            };
+            let md = to_markdown(&proj, &schedule(&proj));
+            assert_eq!(md.lines().next(), Some(expected), "{md}");
+        }
     }
 
     fn table_rows(md: &str) -> Vec<Vec<&str>> {
@@ -976,6 +1046,58 @@ mod tests {
         let rows = table_rows(&md);
         assert_eq!(rows[1].len(), 8, "{md}");
         assert_eq!(rows[1][0], "**A \\| b, c**", "{md}");
+    }
+
+    #[test]
+    fn table_escapes_inline_markdown_in_task_names() {
+        let names = [
+            "**bold**",
+            "snake_case",
+            "`code`",
+            "<b>x</b>",
+            "[l](http://x)",
+            "~~s~~",
+            "R&D",
+        ];
+        let expected = [
+            r"\*\*bold\*\*",
+            r"snake\_case",
+            r"\`code\`",
+            r"\<b>x\</b>",
+            r"\[l\](http://x)",
+            r"\~\~s\~\~",
+            r"R\&D",
+        ];
+        let (md, _) = name_rows(&names);
+        let rows = table_rows(&md);
+        assert_eq!(rows.len(), 1 + names.len(), "{md}");
+        for (i, (row, name)) in rows[1..].iter().zip(names).enumerate() {
+            assert_eq!(row.len(), 8, "{md}");
+            assert_eq!(row[0], expected[i], "{md}");
+            assert_eq!(unescape(row[0]), name, "{md}");
+        }
+    }
+
+    #[test]
+    fn summary_name_with_bold_markers_stays_one_bold_cell() {
+        let mut summary = task(1, "a **b** c", 0);
+        summary.summary = true;
+        let mut leaf = task(2, "Leaf", 480);
+        leaf.outline_level = 2;
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![summary, leaf],
+            ..Project::default()
+        };
+        let sched = schedule(&proj);
+        let md = to_markdown(&proj, &sched);
+        assert_eq!(table_rows(&md)[1][0], r"**a \*\*b\*\* c**", "{md}");
+        // The Mermaid section line keeps the raw name.
+        assert!(
+            to_mermaid(&proj, &sched).contains("    section a **b** c\n"),
+            "{}",
+            to_mermaid(&proj, &sched)
+        );
     }
 
     #[test]
