@@ -15,7 +15,7 @@
 //!
 //! | Verb | Args | Result |
 //! |---|---|---|
-//! | `wb.path` | — | `{path, modified, sheets, active, active_name}` |
+//! | `wb.path` | — | `{path, modified, sheets, active, active_name, circular}` |
 //! | `sheet.list` | — | `{active, sheets:[{index, name, rows, cols}]}` |
 //! | `sheet.read` | `{sheet?, range?}` | `{sheet, name, rows, cols, cells:[…], truncated}` |
 //! | `cell.get` | `{ref, sheet?}` | `{ref, row, col, value, formula?, text}` |
@@ -173,6 +173,10 @@ fn path_info(app: &App) -> Json {
         ("sheets", Json::Num(wb.sheets.len() as f64)),
         ("active", Json::Num(app.sheet as f64)),
         ("active_name", Json::Str(wb.sheets[app.sheet].name.clone())),
+        (
+            "circular",
+            Json::Arr(app.circular_refs().into_iter().map(Json::Str).collect()),
+        ),
     ])
 }
 
@@ -1411,6 +1415,97 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("formula error"));
         assert!(!a.modified);
+    }
+
+    #[test]
+    fn wb_path_lists_circular_references() {
+        // #660: the circle's cells, active sheet first; none once broken.
+        let mut a = app();
+        let circular = |a: &mut App| {
+            let r = dispatch(a, "wb.path", &Json::Null).unwrap();
+            match r.get("circular") {
+                Some(Json::Arr(v)) => v
+                    .iter()
+                    .map(|j| j.as_str().unwrap_or_default().to_string())
+                    .collect::<Vec<_>>(),
+                other => panic!("circular: {other:?}"),
+            }
+        };
+        assert!(circular(&mut a).is_empty());
+        set(&mut a, "E1", "=E1+1");
+        set(&mut a, "F1", "=G1+1");
+        set(&mut a, "G1", "=F1*2");
+        assert_eq!(circular(&mut a), vec!["E1", "F1", "G1"]);
+        let e1 = dispatch(
+            &mut a,
+            "cell.get",
+            &Json::obj(vec![("ref", Json::Str("F1".into()))]),
+        )
+        .unwrap();
+        assert_eq!(e1.get("text").and_then(|t| t.as_str()), Some("0"));
+        set(&mut a, "E1", "1");
+        set(&mut a, "G1", "2");
+        assert!(circular(&mut a).is_empty());
+    }
+
+    #[test]
+    fn wb_path_lists_an_opened_workbooks_circles() {
+        // #660: a saved circle is listed straight after opening.
+        use gridcore::sheet::Cell;
+        use gridcore::xlsx::{load_xlsx, save_xlsx};
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].set_cell(0, 4, Cell::formula("E1+1"));
+        let mut a = App::new(load_xlsx(&save_xlsx(&pkg)).unwrap(), "c.xlsx");
+        a.os_clip = None;
+        let r = dispatch(&mut a, "wb.path", &Json::Null).unwrap();
+        match r.get("circular") {
+            Some(Json::Arr(v)) => {
+                assert_eq!(v.len(), 1);
+                assert_eq!(v[0].as_str(), Some("E1"));
+            }
+            other => panic!("circular: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spill_and_calc_constants_are_refused_as_formulas() {
+        // #657: Excel refuses these as formulas (as it does #FIELD!), but a
+        // plain typed #SPILL! is the error value and #GETTING_DATA is a
+        // formula constant.
+        let mut a = app();
+        for text in [
+            "=#SPILL!",
+            "=#CALC!",
+            "=ERROR.TYPE(#SPILL!)",
+            "=ERROR.TYPE(#CALC!)",
+            "=#FIELD!",
+        ] {
+            let err = cell_set(
+                &mut a,
+                &Json::obj(vec![
+                    ("ref", Json::Str("A1".into())),
+                    ("text", Json::Str(text.into())),
+                ]),
+            )
+            .unwrap_err();
+            assert!(err.contains("formula error"), "{text}: {err}");
+        }
+        assert!(!a.modified);
+        set(&mut a, "A2", "#SPILL!");
+        assert_eq!(
+            a.sheet().cell(1, 0).unwrap().value,
+            CellValue::Error("#SPILL!".into())
+        );
+        let r = dispatch(
+            &mut a,
+            "formula.eval",
+            &Json::obj(vec![(
+                "formula",
+                Json::Str("=ERROR.TYPE(#GETTING_DATA)".into()),
+            )]),
+        )
+        .unwrap();
+        assert_eq!(r.get("text").and_then(|t| t.as_str()), Some("8"));
     }
 
     #[test]

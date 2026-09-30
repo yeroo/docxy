@@ -790,6 +790,34 @@ fn render_date(sect: &Section, serial: f64, date1904: bool) -> String {
     out
 }
 
+/// The integer and fraction digits of `x.abs()` rounded to 15 significant
+/// digits, as exact decimal strings: 1234567890123450112 gives
+/// ("1234567890123450000", ""), 0.1 gives ("0", "1"). The integer part never
+/// saturates, however large `x` is.
+fn sig15_digits(x: f64) -> (String, String) {
+    let x = x.abs();
+    if x == 0.0 || !x.is_finite() {
+        return ("0".into(), String::new());
+    }
+    let sci = format!("{x:.14e}");
+    let (mant, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    let digits: String = mant.chars().filter(char::is_ascii_digit).collect();
+    let digits = digits.trim_end_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    if exp >= 0 {
+        let int_len = exp as usize + 1;
+        if digits.len() <= int_len {
+            (format!("{digits:0<int_len$}"), String::new())
+        } else {
+            (digits[..int_len].to_string(), digits[int_len..].to_string())
+        }
+    } else {
+        let zeros = (-exp - 1) as usize;
+        ("0".into(), format!("{}{digits}", "0".repeat(zeros)))
+    }
+}
+
 fn render_number(sect: &Section, x: f64, explicit_sign: bool) -> String {
     let mut v = x;
     if sect.has_percent {
@@ -815,8 +843,8 @@ fn render_number(sect: &Section, x: f64, explicit_sign: bool) -> String {
         let f = 10f64.powi(sect.dec_digits as i32);
         (v.abs() * f).round() / f
     };
-    let int_part = rounded.trunc() as u64;
-    let frac = rounded.fract();
+    // Excel shows at most 15 significant digits; the rest print as zeros.
+    let (int_digits, frac_all) = sig15_digits(rounded);
 
     // Integer digits, distributed right-to-left over placeholders. With a
     // zero integer part, only a forcing placeholder (0 or ?) prints anything:
@@ -825,10 +853,10 @@ fn render_number(sect: &Section, x: f64, explicit_sign: bool) -> String {
     let int_forced = sect.toks.iter().enumerate().any(|(i, t)| {
         matches!(t, Tok::Digit('0') | Tok::Digit('?')) && point_pos.map(|p| i < p).unwrap_or(true)
     });
-    let int_str = if int_part == 0 && !int_forced {
+    let int_str = if int_digits == "0" && !int_forced {
         String::new()
     } else {
-        int_part.to_string()
+        int_digits
     };
     let grouped = |s: &str| -> String {
         if !sect.grouping {
@@ -848,9 +876,11 @@ fn render_number(sect: &Section, x: f64, explicit_sign: bool) -> String {
     // Fraction digits, left-to-right.
     let mut frac_digits = Vec::new();
     if sect.dec_digits > 0 {
-        let scaled = (frac * 10f64.powi(sect.dec_digits as i32)).round() as u64;
-        let s = format!("{:0>width$}", scaled, width = sect.dec_digits);
-        frac_digits = s.chars().collect();
+        frac_digits = frac_all
+            .chars()
+            .chain(std::iter::repeat('0'))
+            .take(sect.dec_digits)
+            .collect();
     }
 
     // Walk tokens, emitting digits into placeholders.
@@ -996,6 +1026,158 @@ pub fn builtin_code(id: u32) -> Option<&'static str> {
     })
 }
 
+/// Excel's `CELL("format")` code for a number format: `G`, `F2`, `,0`, `C2`,
+/// `P0`, `S2`, `D1`…`D9`. `-` is appended when negatives are shown in colour,
+/// and `()` when positive values are shown in parentheses. Anything
+/// unrecognised (text, fractions, odd custom codes) is `G`.
+pub fn cell_format_code(code: &str) -> String {
+    let code = code.trim();
+    if code.is_empty() || code.eq_ignore_ascii_case("general") {
+        return "G".into();
+    }
+    let sections = split_sections(code);
+    let first = sections.first().map(String::as_str).unwrap_or("");
+    let neg_colored = sections
+        .get(1)
+        .is_some_and(|s| bracket_items(s).iter().any(|b| is_color_name(b)));
+    // The first section with literals, escapes, padding and brackets removed,
+    // and whether it shows a currency symbol or literal parentheses.
+    let mut plain = String::new();
+    let mut currency = false;
+    let mut parens = false;
+    let chars: Vec<char> = first.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '"' => {
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    currency |= is_currency_char(chars[i]);
+                    i += 1;
+                }
+            }
+            '\\' => {
+                match chars.get(i + 1) {
+                    Some(&c) if is_currency_char(c) => currency = true,
+                    Some('(' | ')') => parens = true,
+                    _ => {}
+                }
+                i += 1;
+            }
+            // `_x` pads by the width of x; `*x` repeats x: neither shows x.
+            '_' | '*' => i += 1,
+            '[' => {
+                let start = i + 1;
+                while i < chars.len() && chars[i] != ']' {
+                    i += 1;
+                }
+                let item: String = chars[start.min(i)..i].iter().collect();
+                if item.starts_with('$') {
+                    currency = true;
+                } else if matches!(
+                    item.to_ascii_lowercase().as_str(),
+                    "h" | "hh" | "m" | "mm" | "s" | "ss"
+                ) {
+                    // Elapsed time: `[h]:mm:ss`.
+                    plain.push_str(&item);
+                }
+            }
+            '(' | ')' => parens = true,
+            c if is_currency_char(c) => currency = true,
+            c => plain.push(c),
+        }
+        i += 1;
+    }
+    let suffix = format!(
+        "{}{}",
+        if neg_colored { "-" } else { "" },
+        if parens { "()" } else { "" }
+    );
+    let lower = plain.to_ascii_lowercase();
+    if let Some(d) = date_code(&lower) {
+        return format!("{d}{suffix}");
+    }
+    let fraction = lower.contains('/') && lower.contains('?');
+    let digits = lower.contains('0') || lower.contains('#') || lower.contains('?');
+    if lower.contains('@') || fraction || !digits {
+        return "G".into();
+    }
+    // Decimals: digit placeholders after the mantissa's decimal point.
+    let mantissa = lower.split('e').next().unwrap_or("");
+    let decimals = mantissa.split_once('.').map_or(0, |(_, frac)| {
+        frac.chars()
+            .take_while(|c| matches!(c, '0' | '#' | '?' | ','))
+            .filter(|c| *c != ',')
+            .count()
+    });
+    let kind = if lower.contains('%') {
+        "P"
+    } else if lower.contains("e+") || lower.contains("e-") {
+        "S"
+    } else if currency {
+        "C"
+    } else if mantissa.split('.').next().unwrap_or("").contains(',') {
+        ","
+    } else {
+        "F"
+    };
+    format!("{kind}{decimals}{suffix}")
+}
+
+/// The `[...]` items of a section (colours, conditions, locales).
+fn bracket_items(section: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = section;
+    while let Some(a) = rest.find('[') {
+        let Some(b) = rest[a..].find(']') else { break };
+        out.push(rest[a + 1..a + b].to_string());
+        rest = &rest[a + b + 1..];
+    }
+    out
+}
+
+/// A format colour item: `[Red]`, `[Blue]`, …, or `[Color12]`.
+fn is_color_name(item: &str) -> bool {
+    let l = item.to_ascii_lowercase();
+    matches!(
+        l.as_str(),
+        "black" | "blue" | "cyan" | "green" | "magenta" | "red" | "white" | "yellow"
+    ) || l.starts_with("color")
+}
+
+/// A currency symbol that makes a number format a currency (CELL's `C`).
+fn is_currency_char(c: char) -> bool {
+    matches!(c, '$' | '€' | '£' | '¥' | '¢' | '₩' | '₹' | '₽')
+}
+
+/// CELL's `D1`…`D9` for a date/time code (lower-cased, literals removed), or
+/// `None` when it has no date or time parts.
+fn date_code(lower: &str) -> Option<&'static str> {
+    let has = |c: char| lower.contains(c);
+    let (y, d, h, s) = (has('y'), has('d'), has('h'), has('s'));
+    let ampm = lower.contains("am/pm") || lower.contains("a/p");
+    let text_month = lower.contains("mmm");
+    if y || d {
+        return Some(match (y, d, text_month) {
+            (true, true, true) => "D1",
+            (false, true, true) => "D2",
+            (true, false, true) => "D3",
+            (false, true, false) => "D5",
+            _ => "D4",
+        });
+    }
+    if h || s || ampm {
+        return Some(match (ampm, s) {
+            (true, true) => "D6",
+            (true, false) => "D7",
+            (false, true) => "D8",
+            (false, false) => "D9",
+        });
+    }
+    // A month-name-only code (`mmmm`).
+    text_month.then_some("D3")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1123,5 +1305,51 @@ mod tests {
         }
         assert_eq!(fmt(builtin_code(4).unwrap(), 1234.5), "1,234.50");
         assert_eq!(fmt(builtin_code(14).unwrap(), 45306.0), "1/15/2024");
+    }
+
+    #[test]
+    fn cell_format_codes() {
+        // #656: Excel's CELL("format") table.
+        let cases = [
+            ("General", "G"),
+            ("0", "F0"),
+            ("0.00", "F2"),
+            ("#,##0", ",0"),
+            ("#,##0.00", ",2"),
+            ("$#,##0_);($#,##0)", "C0"),
+            ("$#,##0_);[Red]($#,##0)", "C0-"),
+            ("$#,##0.00_);($#,##0.00)", "C2"),
+            ("$#,##0.00_);[Red]($#,##0.00)", "C2-"),
+            ("[$€-407]#,##0.00", "C2"),
+            ("#,##0;[Red]#,##0", ",0-"),
+            ("(#,##0)", ",0()"),
+            ("0%", "P0"),
+            ("0.00%", "P2"),
+            ("0.00E+00", "S2"),
+            ("##0.0E+0", "S1"),
+            ("# ?/?", "G"),
+            ("# ??/??", "G"),
+            ("@", "G"),
+            ("m/d/yy", "D4"),
+            ("m/d/yyyy", "D4"),
+            ("m/d/yy h:mm", "D4"),
+            ("mm/dd/yy", "D4"),
+            ("d-mmm-yy", "D1"),
+            ("dd-mmm-yy", "D1"),
+            ("d-mmm", "D2"),
+            ("dd-mmm", "D2"),
+            ("mmm-yy", "D3"),
+            ("mm/dd", "D5"),
+            ("h:mm:ss AM/PM", "D6"),
+            ("h:mm AM/PM", "D7"),
+            ("h:mm:ss", "D8"),
+            ("h:mm", "D9"),
+            ("[h]:mm:ss", "D8"),
+            ("\"kg\" 0.0", "F1"),
+            ("", "G"),
+        ];
+        for (code, want) in cases {
+            assert_eq!(cell_format_code(code), want, "{code}");
+        }
     }
 }

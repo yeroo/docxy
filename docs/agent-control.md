@@ -754,7 +754,7 @@ name and defaults to the active sheet):
 
 | Verb | Args | Result |
 |---|---|---|
-| `wb.path` | — | `{path, modified, sheets, active, active_name}` |
+| `wb.path` | — | `{path, modified, sheets, active, active_name, circular}` — `circular` lists the cells on circular references (active sheet first, bare `E1`; other sheets as `Sheet2!A1`), empty when there are none. It lists them whether or not the workbook enables iterative calculation (the TUI's warning and footer note appear only when it does not, as in Excel). Without iterative calculation those cells are 0, as in Excel |
 | `sheet.list` | — | `{active, sheets:[{index, name, rows, cols}]}` |
 | `sheet.read` | `{sheet?, range?}` | `{sheet, name, rows, cols, cells:[…], truncated}` |
 | `cell.get` | `{ref, sheet?}` | `{ref, row, col, value, formula?, text, format?}` — `format` is present only if the cell has non-default styling (see below) |

@@ -286,8 +286,13 @@ placeholder would be painful to retrofit):
 - Parse each formula once; extract its reference set (cells + ranges).
 - Maintain forward/reverse dependency edges. Editing a cell dirties its
   dependents transitively; only dirty cells re-evaluate, in topological order.
-- **Cycles** → the affected cells evaluate to a cycle error rather than hanging
-  (Excel's iterative-calculation opt-in comes in phase B).
+- **Circular references** → as in Excel, without iterative calculation the
+  cells on a circle are 0 (cells downstream of it evaluate normally), and the
+  engine reports them (`Engine::circular_refs`, also at open); xlsxy shows
+  Excel's warning when an edit or an opened file brings a new circle, a
+  `Circular References: <ref>` footer segment, and `wb.path.circular`. When
+  the workbook enables iterative calculation (`calcPr iterate`), a circle
+  iterates up to its count, and a converged circle stays put on recalc.
 - **Graceful degradation, never corruption:** a formula the engine can't parse
   or evaluate (unknown function, unsupported construct) keeps Excel's cached
   value, is never re-evaluated, and is saved byte-faithful. With

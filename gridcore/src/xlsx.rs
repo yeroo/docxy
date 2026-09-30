@@ -16,7 +16,7 @@
 //! - Shared formulas are expanded to per-cell formulas at load (via reference
 //!   translation); groups whose master doesn't parse are preserved verbatim.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use opccore::xml::{Event, XmlParser};
 use opccore::zip::ZipArchive;
@@ -185,6 +185,9 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
     let mut sheet_parts = Vec::new();
     let mut tables: Vec<Table> = Vec::new();
     let mut pending_pivots: Vec<(usize, String)> = Vec::new();
+    // Each sheet's and table's `<autoFilter>`, resolved once styles and
+    // values are all loaded.
+    let mut auto_filters: Vec<(usize, crate::filter::AutoFilter)> = Vec::new();
     // localSheetId counts workbook.xml order; map it to model indices in
     // case a sheet part is missing and gets skipped.
     let mut orig_to_model: Vec<Option<usize>> = Vec::new();
@@ -218,6 +221,9 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
         let mut sheet = parse_worksheet(&xml, &shared, &hlink_targets);
         sheet.name = name;
         let sheet_idx = sheets.len();
+        if let Some(af) = crate::filter::parse_auto_filter(&xml) {
+            auto_filters.push((sheet_idx, af));
+        }
         orig_to_model.push(Some(sheet_idx));
 
         // A worksheet names exactly ONE drawing part, through the `r:id` on its
@@ -232,6 +238,9 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
                 if let Some(txml) = get_str(&table_part) {
                     if let Some(t) = parse_table_xml(&txml, sheet_idx, &table_part) {
                         tables.push(t);
+                    }
+                    if let Some(af) = crate::filter::parse_auto_filter(&txml) {
+                        auto_filters.push((sheet_idx, af));
                     }
                 }
             } else if ty.ends_with("/pivotTable") {
@@ -264,6 +273,39 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
     }
     if sheets.is_empty() {
         return Err(XlsxError::MissingWorkbook);
+    }
+    // Tell filter-hidden rows from hand-hidden ones (both are `hidden="1"`).
+    for (i, af) in &auto_filters {
+        let rows = crate::filter::filtered_rows(&sheets[*i], &styles, date1904, af);
+        sheets[*i].filtered_rows.extend(rows);
+    }
+    // Rich errors: Excel writes a typed `#SPILL!`/`#CALC!` (and
+    // `#GETTING_DATA`) as `<v>#VALUE!</v>` with a `vm` pointing at the real
+    // error in the rich-value parts.
+    let part_of = |suffix: &str, default: &str| {
+        rels.iter()
+            .find(|(_, ty, _)| ty.ends_with(suffix))
+            .map(|(_, _, t)| resolve(t))
+            .unwrap_or_else(|| resolve(default))
+    };
+    let rich = match get_str(&part_of("/sheetMetadata", "metadata.xml")) {
+        Some(meta) => rich_error_codes(
+            &meta,
+            get_str(&part_of("/rdRichValue", "richData/rdrichvalue.xml")).as_deref(),
+            get_str(&part_of(
+                "/rdRichValueStructure",
+                "richData/rdrichvaluestructure.xml",
+            ))
+            .as_deref(),
+        ),
+        None => HashMap::new(),
+    };
+    if !rich.is_empty() {
+        for sheet in &mut sheets {
+            for cell in sheet.cells.values_mut() {
+                decode_rich_error(cell, &rich);
+            }
+        }
     }
     let defined_names = raw_names
         .into_iter()
@@ -438,6 +480,178 @@ fn parse_table_xml(xml: &str, sheet_idx: usize, part: &str) -> Option<Table> {
         totals_rows,
         columns,
         part: part.to_string(),
+    })
+}
+
+/// Replace a loaded `#VALUE!` whose `vm` names a rich error with the real
+/// error, remembering the body so save writes the file's form back.
+fn decode_rich_error(cell: &mut Cell, rich: &HashMap<u32, &'static str>) {
+    if cell.value != CellValue::Error("#VALUE!".into()) {
+        return;
+    }
+    let Some(meta) = cell.meta.as_deref_mut() else {
+        return;
+    };
+    let Some((vm, snapshot)) = meta.vm.as_mut() else {
+        return;
+    };
+    let Some(code) = vm.parse::<u32>().ok().and_then(|i| rich.get(&i)) else {
+        return;
+    };
+    if *code == "#VALUE!" {
+        return;
+    }
+    cell.value = CellValue::Error((*code).to_string());
+    *snapshot = cell.value.clone();
+    meta.vm_body = Some("#VALUE!".into());
+}
+
+/// The error each `vm` index (1-based, as cells carry it) stands for, when
+/// it resolves to a rich `_error` value: `xl/metadata.xml` valueMetadata `bk`
+/// → `rc t` (1-based metadataType, which must be `XLRICHVALUE`) and `rc v`
+/// (0-based futureMetadata `bk`) → `xlrd:rvb i` (0-based `rv` in
+/// rdrichvalue.xml) → its structure's `errorType` key. Anything that does not
+/// resolve is left out.
+fn rich_error_codes(
+    metadata: &str,
+    rich_values: Option<&str>,
+    structures: Option<&str>,
+) -> HashMap<u32, &'static str> {
+    let mut out = HashMap::new();
+    let (Some(rich_values), Some(structures)) = (rich_values, structures) else {
+        return out;
+    };
+    // metadata.xml
+    let mut types: Vec<String> = Vec::new();
+    let mut rich_bks: Vec<Option<usize>> = Vec::new();
+    let mut value_bks: Vec<Option<(usize, usize)>> = Vec::new();
+    let (mut in_rich_future, mut in_value_meta) = (false, false);
+    let mut p = XmlParser::new(metadata);
+    loop {
+        match p.next() {
+            Event::Start => match local(p.name()) {
+                "metadataType" => types.push(decode(p.attr("name"))),
+                "futureMetadata" => in_rich_future = p.attr("name") == "XLRICHVALUE",
+                "valueMetadata" => in_value_meta = true,
+                "bk" if in_rich_future => rich_bks.push(None),
+                "bk" if in_value_meta => value_bks.push(None),
+                "rvb" if in_rich_future => {
+                    if let Some(last) = rich_bks.last_mut() {
+                        *last = p.attr("i").parse().ok();
+                    }
+                }
+                "rc" if in_value_meta => {
+                    if let (Some(last), Ok(t), Ok(v)) = (
+                        value_bks.last_mut(),
+                        p.attr("t").parse::<usize>(),
+                        p.attr("v").parse::<usize>(),
+                    ) {
+                        last.get_or_insert((t, v));
+                    }
+                }
+                _ => {}
+            },
+            Event::End => match local(p.name()) {
+                "futureMetadata" => in_rich_future = false,
+                "valueMetadata" => in_value_meta = false,
+                _ => {}
+            },
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    // rdrichvaluestructure.xml: each structure's type and key names.
+    let mut structs: Vec<(String, Vec<String>)> = Vec::new();
+    let mut p = XmlParser::new(structures);
+    loop {
+        match p.next() {
+            Event::Start => match local(p.name()) {
+                "s" => structs.push((decode(p.attr("t")), Vec::new())),
+                "k" => {
+                    if let Some(last) = structs.last_mut() {
+                        last.1.push(decode(p.attr("n")));
+                    }
+                }
+                _ => {}
+            },
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    // rdrichvalue.xml: each value's structure and positional values.
+    let mut values: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut in_v = false;
+    let mut p = XmlParser::new(rich_values);
+    loop {
+        match p.next() {
+            Event::Start => match local(p.name()) {
+                "rv" => values.push((p.attr("s").parse().unwrap_or(usize::MAX), Vec::new())),
+                "v" => {
+                    in_v = true;
+                    if let Some(last) = values.last_mut() {
+                        last.1.push(String::new());
+                    }
+                }
+                _ => {}
+            },
+            Event::Text if in_v => {
+                if let Some(v) = values.last_mut().and_then(|(_, vs)| vs.last_mut()) {
+                    XmlParser::append_decoded(p.text(), v);
+                }
+            }
+            Event::End if local(p.name()) == "v" => in_v = false,
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    for (i, bk) in value_bks.iter().enumerate() {
+        let Some((t, v)) = *bk else { continue };
+        if t == 0 || types.get(t - 1).map(String::as_str) != Some("XLRICHVALUE") {
+            continue;
+        }
+        let Some(Some(rv)) = rich_bks.get(v) else {
+            continue;
+        };
+        let Some((s, vals)) = values.get(*rv) else {
+            continue;
+        };
+        let Some((ty, keys)) = structs.get(*s) else {
+            continue;
+        };
+        if ty != "_error" {
+            continue;
+        }
+        let Some(k) = keys.iter().position(|k| k == "errorType") else {
+            continue;
+        };
+        let code = vals
+            .get(k)
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .and_then(rich_error_code);
+        if let Some(code) = code {
+            out.insert(i as u32 + 1, code);
+        }
+    }
+    out
+}
+
+/// A rich `_error` value's `errorType` ([MS-XLSX] 2.3.6.1): the classic
+/// errors 0-6, then `#GETTING_DATA` 7, `#SPILL!` 8, `#CONNECT!` 9,
+/// `#BLOCKED!` 10, `#UNKNOWN!` 11, `#FIELD!` 12, `#CALC!` 13. Only the ones
+/// the engine models are decoded.
+fn rich_error_code(error_type: u32) -> Option<&'static str> {
+    Some(match error_type {
+        0 => "#NULL!",
+        1 => "#DIV/0!",
+        2 => "#VALUE!",
+        3 => "#REF!",
+        4 => "#NAME?",
+        5 => "#NUM!",
+        6 => "#N/A",
+        7 => "#GETTING_DATA",
+        8 => "#SPILL!",
+        13 => "#CALC!",
+        _ => return None,
     })
 }
 
@@ -1232,6 +1446,7 @@ fn parse_worksheet(
                     let meta = CellMeta {
                         cm: (!cm.is_empty() && array_f).then_some(cm),
                         vm: (!vm.is_empty()).then(|| (vm, cell.value.clone())),
+                        vm_body: None,
                         ph,
                     };
                     if meta != CellMeta::default() {
@@ -2259,7 +2474,19 @@ fn cell_xml(
     // Type attribute + value body depend on the value kind. Formula cells
     // carry their cached value with t="str" for text; plain text cells go
     // through the shared-string table.
+    // A decoded rich error keeps the body the file had while its `vm` does.
+    let vm_body = cell
+        .meta
+        .as_deref()
+        .and_then(|m| match (&m.vm, &m.vm_body) {
+            (Some((_, snap)), Some(body)) if *snap == cell.value => Some(body.as_str()),
+            _ => None,
+        });
     let (t_attr, body) = match &cell.value {
+        CellValue::Error(_) if vm_body.is_some() => (
+            " t=\"e\"",
+            format!("<v>{}</v>", esc_text(vm_body.unwrap_or_default())),
+        ),
         CellValue::Empty => ("", String::new()),
         CellValue::Number(n) => ("", format!("<v>{}</v>", num_repr(*n))),
         CellValue::Bool(b) => (" t=\"b\"", format!("<v>{}</v>", u8::from(*b))),
@@ -6954,6 +7181,353 @@ b",
         ])
     }
 
+    /// Excel 2024's rich-error metadata: value-metadata entries 1..4 point at
+    /// rich values 0..3; entry 5 is an XLDAPR entry, not a rich value.
+    const RICH_METADATA: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<metadata xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:xlrd="http://schemas.microsoft.com/office/spreadsheetml/2017/richdata"><metadataTypes count="2"><metadataType name="XLDAPR" minSupportedVersion="120000"/><metadataType name="XLRICHVALUE" minSupportedVersion="120000" copy="1" pasteAll="1" pasteValues="1" merge="1" splitFirst="1" rowColShift="1" clearFormats="1" clearComments="1" assign="1" coerce="1"/></metadataTypes><futureMetadata name="XLRICHVALUE" count="4"><bk><extLst><ext uri="{3e2802c4-a4d2-4d8b-9148-e3be6c30e623}"><xlrd:rvb i="0"/></ext></extLst></bk><bk><extLst><ext uri="{3e2802c4-a4d2-4d8b-9148-e3be6c30e623}"><xlrd:rvb i="1"/></ext></extLst></bk><bk><extLst><ext uri="{3e2802c4-a4d2-4d8b-9148-e3be6c30e623}"><xlrd:rvb i="2"/></ext></extLst></bk><bk><extLst><ext uri="{3e2802c4-a4d2-4d8b-9148-e3be6c30e623}"><xlrd:rvb i="3"/></ext></extLst></bk></futureMetadata><valueMetadata count="5"><bk><rc t="2" v="0"/></bk><bk><rc t="2" v="1"/></bk><bk><rc t="2" v="2"/></bk><bk><rc t="2" v="3"/></bk><bk><rc t="1" v="0"/></bk></valueMetadata></metadata>"#;
+    /// Rich `_error` values: #SPILL! (8), #CALC! (13), #GETTING_DATA (7) and
+    /// a plain #VALUE! (2).
+    const RICH_VALUES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<rvData xmlns="http://schemas.microsoft.com/office/spreadsheetml/2017/richdata" count="4"><rv s="0"><v>0</v><v>8</v></rv><rv s="0"><v>0</v><v>13</v></rv><rv s="0"><v>0</v><v>7</v></rv><rv s="0"><v>0</v><v>2</v></rv></rvData>"#;
+    /// The `_error` structure, with `errorType` second so it must be found
+    /// by name.
+    const RICH_STRUCTURES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<rvStructures xmlns="http://schemas.microsoft.com/office/spreadsheetml/2017/richdata" count="1"><s t="_error"><k n="propagated" t="b"/><k n="errorType" t="i"/></s></rvStructures>"#;
+
+    /// A one-sheet workbook with `rows` and the rich-error parts above.
+    fn rich_error_fixture(rows: &str) -> Vec<u8> {
+        let sheet = format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>{rows}</sheetData></worksheet>"#
+        );
+        let workbook = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        let wb_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sheetMetadata" Target="metadata.xml"/><Relationship Id="rId3" Type="http://schemas.microsoft.com/office/2017/06/relationships/rdRichValue" Target="richData/rdrichvalue.xml"/><Relationship Id="rId4" Type="http://schemas.microsoft.com/office/2017/06/relationships/rdRichValueStructure" Target="richData/rdrichvaluestructure.xml"/></Relationships>"#;
+        let root_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#;
+        let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/metadata.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheetMetadata+xml"/></Types>"#;
+        write_zip(&[
+            ("[Content_Types].xml".into(), content_types.into()),
+            ("_rels/.rels".into(), root_rels.into()),
+            ("xl/workbook.xml".into(), workbook.into()),
+            ("xl/_rels/workbook.xml.rels".into(), wb_rels.into()),
+            ("xl/worksheets/sheet1.xml".into(), sheet.into_bytes()),
+            ("xl/metadata.xml".into(), RICH_METADATA.into()),
+            ("xl/richData/rdrichvalue.xml".into(), RICH_VALUES.into()),
+            (
+                "xl/richData/rdrichvaluestructure.xml".into(),
+                RICH_STRUCTURES.into(),
+            ),
+        ])
+    }
+
+    /// A1..A5 are `<v>#VALUE!</v>` with vm 1..5, standing for #SPILL!,
+    /// #CALC!, #GETTING_DATA, a plain #VALUE! and nothing; B1..B3 take
+    /// ERROR.TYPE of A1..A3.
+    const RICH_ROWS: &str = r#"<row r="1"><c r="A1" t="e" vm="1"><v>#VALUE!</v></c><c r="B1"><f>ERROR.TYPE(A1)</f><v>3</v></c></row><row r="2"><c r="A2" t="e" vm="2"><v>#VALUE!</v></c><c r="B2"><f>ERROR.TYPE(A2)</f><v>3</v></c></row><row r="3"><c r="A3" t="e" vm="3"><v>#VALUE!</v></c><c r="B3"><f>ERROR.TYPE(A3)</f><v>3</v></c></row><row r="4"><c r="A4" t="e" vm="4"><v>#VALUE!</v></c></row><row r="5"><c r="A5" t="e" vm="5"><v>#VALUE!</v></c></row>"#;
+
+    #[test]
+    fn rich_errors_decode_from_value_metadata() {
+        // #657 (a): the real error comes from the rich value, and ERROR.TYPE
+        // sees it.
+        let mut pkg = load_xlsx(&rich_error_fixture(RICH_ROWS)).unwrap();
+        let v =
+            |pkg: &SheetPackage, r: u32| pkg.workbook.sheets[0].cell(r, 0).unwrap().value.clone();
+        let err = |s: &str| CellValue::Error(s.into());
+        assert_eq!(v(&pkg, 0), err("#SPILL!"));
+        assert_eq!(v(&pkg, 1), err("#CALC!"));
+        assert_eq!(v(&pkg, 2), err("#GETTING_DATA"));
+        assert_eq!(v(&pkg, 3), err("#VALUE!"));
+        // vm 5 is not a rich value: left alone.
+        assert_eq!(v(&pkg, 4), err("#VALUE!"));
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        let b = |r: u32| pkg.workbook.sheets[0].cell(r, 1).unwrap().value.clone();
+        assert_eq!(b(0), CellValue::Number(9.0));
+        assert_eq!(b(1), CellValue::Number(14.0));
+        assert_eq!(b(2), CellValue::Number(8.0));
+    }
+
+    #[test]
+    fn rich_errors_save_in_the_files_form() {
+        // #657 (b): while the value is unchanged, save writes `vm` and the
+        // file's `#VALUE!` body, after a recalc too, and leaves the metadata
+        // parts alone.
+        let mut pkg = load_xlsx(&rich_error_fixture(RICH_ROWS)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        let ws = saved_sheet1(&pkg);
+        for (r, vm) in [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5)] {
+            let want = format!(r#"<c r="A{r}" t="e" vm="{vm}"><v>#VALUE!</v></c>"#);
+            assert!(ws.contains(&want), "{want} in {ws}");
+        }
+        let saved = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        for (part, body) in [
+            ("xl/metadata.xml", RICH_METADATA),
+            ("xl/richData/rdrichvalue.xml", RICH_VALUES),
+            ("xl/richData/rdrichvaluestructure.xml", RICH_STRUCTURES),
+        ] {
+            assert_eq!(saved.part(part), Some(body.as_bytes()), "{part}");
+        }
+        // Reloading decodes them again.
+        assert_eq!(
+            saved.workbook.sheets[0].cell(0, 0).unwrap().value,
+            CellValue::Error("#SPILL!".into())
+        );
+
+        // (c): a changed value drops `vm` and writes its own code.
+        for (r, code) in [(0, "#CALC!"), (1, "#N/A")] {
+            let mut cell = pkg.workbook.sheets[0].cell(r, 0).unwrap().clone();
+            cell.value = CellValue::Error(code.into());
+            pkg.workbook.sheets[0].set_cell(r, 0, cell);
+        }
+        let ws = saved_sheet1(&pkg);
+        assert!(ws.contains(r#"<c r="A1" t="e"><v>#CALC!</v></c>"#), "{ws}");
+        assert!(ws.contains(r#"<c r="A2" t="e"><v>#N/A</v></c>"#), "{ws}");
+        assert!(
+            ws.contains(r#"<c r="A3" t="e" vm="3"><v>#VALUE!</v></c>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn spill_and_calc_are_not_formula_constants() {
+        // #657: Excel refuses `=#SPILL!` and `=#CALC!` as formulas but takes
+        // `#GETTING_DATA`.
+        use crate::formula::parse;
+        for src in [
+            "#SPILL!",
+            "#CALC!",
+            "ERROR.TYPE(#SPILL!)",
+            "ERROR.TYPE(#CALC!)",
+        ] {
+            assert!(parse(src).is_err(), "{src}");
+        }
+        assert!(parse("ERROR.TYPE(#GETTING_DATA)").is_ok());
+        assert!(parse("ERROR.TYPE(#N/A)").is_ok());
+        let wb_err = crate::engine::eval_formula_at(
+            &load_xlsx(&rich_error_fixture("")).unwrap().workbook,
+            0,
+            9,
+            9,
+            "ERROR.TYPE(#GETTING_DATA)",
+        );
+        assert_eq!(wb_err, crate::formula::Value::Num(8.0));
+        // A typed constant is still the error value.
+        assert_eq!(
+            crate::edit::parse_input("#SPILL!").value,
+            CellValue::Error("#SPILL!".into())
+        );
+        assert_eq!(
+            crate::edit::parse_input("#GETTING_DATA").value,
+            CellValue::Error("#GETTING_DATA".into())
+        );
+    }
+
+    /// The #678 list on Sheet1 (A1:C9: Region, Rep, Amount), rows 3, 5, 6,
+    /// 7 and 9 hidden, plus `filter` after `</sheetData>`, and `sheet2` as
+    /// Sheet2's rows. With `table`, Sheet1 also carries a table part
+    /// `Sales` over A1:C9 holding that autoFilter instead.
+    fn filter_fixture(filter: &str, sheet2: &str, table: bool) -> Vec<u8> {
+        let recs = [
+            ("East", "Ann", 10),
+            ("West", "Bob", 20),
+            ("East", "Cy", 40),
+            ("North", "Di", 80),
+            ("East", "Ed", 160),
+            ("West", "Fa", 320),
+            ("East", "Gu", 640),
+            ("South", "Hu", 1280),
+        ];
+        let is = |r: &str, t: &str| format!(r#"<c r="{r}" t="inlineStr"><is><t>{t}</t></is></c>"#);
+        let mut rows = format!(
+            "<row r=\"1\">{}{}{}</row>",
+            is("A1", "Region"),
+            is("B1", "Rep"),
+            is("C1", "Amount")
+        );
+        for (i, (region, rep, amt)) in recs.iter().enumerate() {
+            let r = i + 2;
+            let hidden = if [3, 5, 6, 7, 9].contains(&r) {
+                r#" hidden="1""#
+            } else {
+                ""
+            };
+            rows.push_str(&format!(
+                r#"<row r="{r}"{hidden}>{}{}<c r="C{r}"><v>{amt}</v></c></row>"#,
+                is(&format!("A{r}"), region),
+                is(&format!("B{r}"), rep)
+            ));
+        }
+        let parts_tag = if table {
+            r#"<tableParts count="1"><tablePart r:id="rId1"/></tableParts>"#
+        } else {
+            ""
+        };
+        let sheet1 = format!(
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData>{rows}</sheetData>{}{parts_tag}</worksheet>"#,
+            if table { "" } else { filter }
+        );
+        let sheet2 = format!(
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>{sheet2}</sheetData></worksheet>"#
+        );
+        let table_xml = format!(
+            r#"<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="Sales" displayName="Sales" ref="A1:C9">{filter}<tableColumns count="3"><tableColumn id="1" name="Region"/><tableColumn id="2" name="Rep"/><tableColumn id="3" name="Amount"/></tableColumns></table>"#
+        );
+        let workbook = r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/><sheet name="Sheet2" sheetId="2" r:id="rId2"/></sheets></workbook>"#;
+        let wb_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/></Relationships>"#;
+        let ws_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table1.xml"/></Relationships>"#;
+        let root_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#;
+        let content_types = r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#;
+        let mut parts: Vec<(String, Vec<u8>)> = vec![
+            ("[Content_Types].xml".into(), content_types.into()),
+            ("_rels/.rels".into(), root_rels.into()),
+            ("xl/workbook.xml".into(), workbook.into()),
+            ("xl/_rels/workbook.xml.rels".into(), wb_rels.into()),
+            ("xl/worksheets/sheet1.xml".into(), sheet1.into_bytes()),
+            ("xl/worksheets/sheet2.xml".into(), sheet2.into_bytes()),
+        ];
+        if table {
+            parts.push(("xl/worksheets/_rels/sheet1.xml.rels".into(), ws_rels.into()));
+            parts.push(("xl/tables/table1.xml".into(), table_xml.into_bytes()));
+        }
+        write_zip(&parts)
+    }
+
+    /// The #678 filter: Region = East.
+    const EAST_FILTER: &str = r#"<autoFilter ref="A1:C9"><filterColumn colId="0"><filters><filter val="East"/></filters></filterColumn></autoFilter>"#;
+
+    /// Recalculate the workbook and read `cells` on sheet `sheet`.
+    fn recalc_values(pkg: &mut SheetPackage, sheet: usize, cells: &[&str]) -> Vec<CellValue> {
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        cells
+            .iter()
+            .map(|c| {
+                let (r, col) = parse_cell_name(c).unwrap();
+                pkg.workbook.sheets[sheet]
+                    .cell(r, col)
+                    .unwrap()
+                    .value
+                    .clone()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn subtotal_counts_hand_hidden_rows_under_a_filter() {
+        // #678: the issue's workbook. Region = East filters out rows 3, 5, 7
+        // and 9; row 6 (Ed, East) is hidden by hand.
+        let formulas = r#"<row r="1"><c r="A1"><f>SUBTOTAL(9,Sheet1!C2:C9)</f><v>0</v></c><c r="B1"><f>SUBTOTAL(3,Sheet1!A2:A9)</f><v>0</v></c><c r="C1"><f>SUBTOTAL(1,Sheet1!C2:C9)</f><v>0</v></c><c r="D1"><f>SUBTOTAL(109,Sheet1!C2:C9)</f><v>0</v></c><c r="E1"><f>SUBTOTAL(103,Sheet1!A2:A9)</f><v>0</v></c><c r="F1"><f>AGGREGATE(9,5,Sheet1!C2:C9)</f><v>0</v></c></row>"#;
+        let mut pkg = load_xlsx(&filter_fixture(EAST_FILTER, formulas, false)).unwrap();
+        let s1 = &pkg.workbook.sheets[0];
+        assert_eq!(
+            s1.filtered_rows.iter().copied().collect::<Vec<_>>(),
+            vec![2, 4, 6, 8]
+        );
+        assert!(!s1.row_filtered(5) && s1.row_hidden(5));
+        let got = recalc_values(&mut pkg, 1, &["A1", "B1", "C1", "D1", "E1", "F1"]);
+        let n = CellValue::Number;
+        assert_eq!(
+            got,
+            vec![n(850.0), n(4.0), n(212.5), n(690.0), n(3.0), n(690.0)]
+        );
+    }
+
+    #[test]
+    fn subtotal_over_a_filtered_table_counts_hand_hidden_rows() {
+        // #678: the same list as a table whose own autoFilter did the
+        // filtering.
+        let formulas = r#"<row r="1"><c r="A1"><f>SUBTOTAL(9,Sales[Amount])</f><v>0</v></c><c r="B1"><f>SUBTOTAL(109,Sales[Amount])</f><v>0</v></c></row>"#;
+        let mut pkg = load_xlsx(&filter_fixture(EAST_FILTER, formulas, true)).unwrap();
+        let got = recalc_values(&mut pkg, 1, &["A1", "B1"]);
+        assert_eq!(
+            got,
+            vec![CellValue::Number(850.0), CellValue::Number(690.0)]
+        );
+    }
+
+    #[test]
+    fn filtered_rows_from_custom_and_unsupported_filters() {
+        // Amount >= 100 AND < 1000 keeps rows 6 (160) and 8 (640) of the
+        // hidden ones visible-worthy: hidden 3/5/7/9 fail or pass by value.
+        let custom = r#"<autoFilter ref="A1:C9"><filterColumn colId="2"><customFilters and="1"><customFilter operator="greaterThanOrEqual" val="100"/><customFilter operator="lessThan" val="1000"/></customFilters></filterColumn></autoFilter>"#;
+        let pkg = load_xlsx(&filter_fixture(custom, "", false)).unwrap();
+        // Hidden rows 3 (20), 5 (80), 6 (160), 7 (320), 9 (1280): 160 and 320
+        // pass, so rows 6 and 7 were hidden by hand.
+        assert_eq!(
+            pkg.workbook.sheets[0]
+                .filtered_rows
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![2, 4, 8]
+        );
+        // Wildcards in a custom equal filter.
+        let wild = r#"<autoFilter ref="A1:C9"><filterColumn colId="1"><customFilters><customFilter val="F*"/><customFilter val="E?"/></customFilters></filterColumn></autoFilter>"#;
+        let pkg = load_xlsx(&filter_fixture(wild, "", false)).unwrap();
+        // Rows 6 (Ed) and 7 (Fa) pass.
+        assert_eq!(
+            pkg.workbook.sheets[0]
+                .filtered_rows
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![2, 4, 8]
+        );
+        // A filter we cannot re-evaluate: every hidden row counts as filtered.
+        let top = r#"<autoFilter ref="A1:C9"><filterColumn colId="2"><top10 val="3"/></filterColumn></autoFilter>"#;
+        let pkg = load_xlsx(&filter_fixture(top, "", false)).unwrap();
+        assert_eq!(
+            pkg.workbook.sheets[0]
+                .filtered_rows
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![2, 4, 5, 6, 8]
+        );
+        // A column with no criteria (a hidden button) filters nothing; the
+        // East column still decides.
+        let buttons = r#"<autoFilter ref="A1:C9"><filterColumn colId="1" hiddenButton="1"/><filterColumn colId="2" showButton="0"/><filterColumn colId="0"><filters><filter val="East"/></filters></filterColumn></autoFilter>"#;
+        let pkg = load_xlsx(&filter_fixture(buttons, "", false)).unwrap();
+        assert_eq!(
+            pkg.workbook.sheets[0]
+                .filtered_rows
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![2, 4, 6, 8]
+        );
+        // No autoFilter: every hidden row was hidden by hand.
+        let pkg = load_xlsx(&filter_fixture("", "", false)).unwrap();
+        assert!(pkg.workbook.sheets[0].filtered_rows.is_empty());
+    }
+
+    #[test]
+    fn filtered_rows_follow_row_edits_and_unhide() {
+        // #678: inserting a row above the list moves the filtered rows with
+        // it, and a filtered row unhidden by hand counts again.
+        let formulas = r#"<row r="1"><c r="A1"><f>SUBTOTAL(9,Sheet1!C2:C10)</f><v>0</v></c></row>"#;
+        let mut pkg = load_xlsx(&filter_fixture(EAST_FILTER, formulas, false)).unwrap();
+        crate::edit::insert_rows(&mut pkg.workbook, 0, 1, 1);
+        assert_eq!(
+            pkg.workbook.sheets[0]
+                .filtered_rows
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![3, 5, 7, 9]
+        );
+        let got = recalc_values(&mut pkg, 1, &["A1"]);
+        assert_eq!(got, vec![CellValue::Number(850.0)]);
+        // Unhide Bob (row 3, now 4): he counts in SUBTOTAL(9) again.
+        pkg.workbook.sheets[0].set_row_hidden(3, false);
+        let got = recalc_values(&mut pkg, 1, &["A1"]);
+        assert_eq!(got, vec![CellValue::Number(870.0)]);
+    }
+
     /// Rows 1..=n with A holding 3, 9, 1, 7, 5, 2, 8 (the first `n`), and
     /// `anchor` appended to row 1.
     fn sort_anchor_rows(n: usize, anchor: &str) -> String {
@@ -8110,6 +8684,18 @@ b",
         assert!(
             xml.contains("<c:cat><c:strRef><c:f>Data!$A$2:$A$4</c:f>"),
             "{xml}"
+        );
+    }
+
+    #[test]
+    fn loaded_numbers_keep_every_digit() {
+        // #655: only typed entry truncates to 15 digits; a number read from a
+        // file keeps its full double.
+        let rows = r#"<row r="1"><c r="A1"><v>1234567890123456789</v></c></row>"#;
+        let pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(0, 0).unwrap().value,
+            crate::sheet::CellValue::Number(1234567890123456789.0)
         );
     }
 }

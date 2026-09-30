@@ -2,8 +2,10 @@
 //!
 //! The engine parses every formula once, extracts its reference rectangles,
 //! and on each edit dirties only the transitive dependents — then evaluates
-//! them in topological order (Kahn). Cells on a cycle get `#CYCLE!` instead
-//! of hanging. Volatile formulas (`NOW`, `RAND`…) join every recalculation.
+//! them in topological order (Kahn). Cells on a circular reference are
+//! handled as Excel does: without iterative calculation they are 0 and the
+//! engine reports them ([`Engine::circular_refs`]); with it they iterate.
+//! Volatile formulas (`NOW`, `RAND`…) join every recalculation.
 //!
 //! **Graceful degradation:** a formula that fails to parse, carries preserved
 //! `<f>` attributes (array/data-table), or evaluates through something we
@@ -13,10 +15,11 @@
 //! never wrong-by-our-hand ones.
 
 use std::cell::Cell as StdCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::formula::{
-    self, DynResult, Eval, ExcelError, Expr, Resolver, Value, collect_refs, is_volatile,
+    self, DynResult, Eval, ExcelError, Expr, Resolver, Value, always_recalc, collect_refs,
+    contains_db_fn,
 };
 use crate::sheet::{Cell, CellValue, Sheet, Workbook, is_array_f};
 
@@ -28,7 +31,11 @@ type Rect = (usize, u32, u32, u32, u32);
 
 struct FormulaInfo {
     ast: Expr,
+    /// Re-evaluated on every recalculation ([`formula::always_recalc`]).
     volatile: bool,
+    /// Calls a D-function: evaluated after every other ready cell (see
+    /// [`Engine::evaluate`]).
+    db: bool,
     /// A legacy formula (loaded, not saved as a dynamic array): a multi-cell
     /// range result implicit-intersects to the cell's row/column rather than
     /// spilling. User-entered formulas are modern (spill).
@@ -54,6 +61,11 @@ pub struct Engine {
     pub clock: Option<f64>,
     /// PRNG state for `RAND`; None = no randomness source.
     pub seed: Option<u64>,
+    /// Formula cells on a circular reference, sorted.
+    circular: BTreeSet<Key>,
+    /// The post-circle D-function rerun already ran in this top-level
+    /// recalculation (see [`Engine::evaluate`]); it runs at most once.
+    db_rerun_done: bool,
 }
 
 /// Spill chains (an anchor whose array feeds another anchor's spill cells)
@@ -79,7 +91,39 @@ impl Engine {
                 }
             }
         }
+        eng.find_circles();
         eng
+    }
+
+    /// Find every circle in the whole formula graph without evaluating
+    /// anything, so a workbook's circular references are known (and
+    /// reported) as soon as it is opened, before any recalculation.
+    fn find_circles(&mut self) {
+        let mut all: Vec<Key> = self.formulas.keys().copied().collect();
+        all.sort_unstable();
+        let mut edges: HashMap<Key, Vec<Key>> = HashMap::new();
+        for (f, srcs) in self.dependency_edges(&all) {
+            for g in srcs {
+                edges.entry(g).or_default().push(f);
+            }
+        }
+        self.circular.clear();
+        for comp in components_in_order(&all, &edges) {
+            let circle =
+                comp.len() > 1 || edges.get(&comp[0]).is_some_and(|ds| ds.contains(&comp[0]));
+            if circle {
+                self.circular.extend(comp);
+            }
+        }
+    }
+
+    /// The formula cells on a circular reference (a cycle of two or more
+    /// cells, or a cell that reads itself), sorted by (sheet, row, col). Cells
+    /// merely downstream of a circle are not included. Kept up to date across
+    /// partial recalculations: a circle is dropped only when one of its cells
+    /// is recalculated off it, or loses its formula.
+    pub fn circular_refs(&self) -> Vec<Key> {
+        self.circular.iter().copied().collect()
     }
 
     /// Is this cell's formula beyond the engine (kept on its cached value)?
@@ -100,10 +144,12 @@ impl Engine {
                 collect_deps(wb, key, &ast, &mut deps, 0);
                 let mut spills = Vec::new();
                 formula::collect_spillrefs(&ast, &mut spills);
+                let (volatile, db) = recalc_flags(wb, key.0, &ast, 0);
                 self.formulas.insert(
                     key,
                     FormulaInfo {
-                        volatile: is_volatile(&ast),
+                        volatile,
+                        db,
                         legacy,
                         spillref: !spills.is_empty(),
                         ast,
@@ -128,6 +174,7 @@ impl Engine {
         let (s, r, c) = key;
         // Drop stale bookkeeping for this address.
         self.formulas.remove(&key);
+        self.circular.remove(&key);
         self.unsupported.remove(&key);
         self.spill_blocked.remove(&key);
         let mut changed = vec![key];
@@ -307,6 +354,11 @@ impl Engine {
 
     /// Kahn's algorithm over the dirty subgraph, then evaluation in order.
     fn evaluate(&mut self, wb: &mut Workbook, dirty: HashSet<Key>, depth: u32) {
+        // Depth 0 is a top-level recalculation (an edit, recalc_all); nested
+        // passes (spills, the D-function rerun) have depth ≥ 1.
+        if depth == 0 {
+            self.db_rerun_done = false;
+        }
         // Only supported formulas actually evaluate; unsupported ones keep
         // their cached values but still satisfy dependents.
         let dirty: Vec<Key> = dirty
@@ -329,31 +381,59 @@ impl Engine {
             }
         }
 
-        let mut queue: VecDeque<Key> = indeg
+        // A D-function's computed criteria read helper cells it has no edge
+        // to (it is always recalculated instead), so a ready D-function
+        // waits until no other ready cell is left: helpers it reads are
+        // evaluated first. A helper that itself reads a D-function has a real
+        // edge and still waits for it. Two D-functions whose criteria read
+        // each other's results stay in arbitrary order.
+        let is_db = |k: &Key| self.formulas.get(k).is_some_and(|i| i.db);
+        let mut queue: VecDeque<Key> = VecDeque::new();
+        let mut deferred: VecDeque<Key> = VecDeque::new();
+        let mut ready: Vec<Key> = indeg
             .iter()
             .filter(|&(_, &d)| d == 0)
             .map(|(&k, _)| k)
             .collect();
+        ready.sort_unstable();
+        for k in ready {
+            if is_db(&k) {
+                deferred.push_back(k);
+            } else {
+                queue.push_back(k);
+            }
+        }
         let mut done: HashSet<Key> = HashSet::new();
         let mut spilled: Vec<Key> = Vec::new();
-        while let Some(k) = queue.pop_front() {
+        let mut db_done: Vec<Key> = Vec::new();
+        while let Some(k) = queue.pop_front().or_else(|| deferred.pop_front()) {
             done.insert(k);
+            if self.formulas.get(&k).is_some_and(|i| i.db) {
+                db_done.push(k);
+            }
             spilled.extend(self.eval_one(wb, k));
             if let Some(dependents) = edges.get(&k).cloned() {
                 for d in dependents {
                     let e = indeg.get_mut(&d).unwrap();
                     *e -= 1;
                     if *e == 0 {
-                        queue.push_back(d);
+                        if self.formulas.get(&d).is_some_and(|i| i.db) {
+                            deferred.push_back(d);
+                        } else {
+                            queue.push_back(d);
+                        }
                     }
                 }
             }
         }
 
-        // Whatever never reached in-degree 0 sits on a cycle. With the
-        // workbook's iterative-calculation opt-in, converge them the way
-        // Excel does; otherwise flag the circularity honestly.
-        let cycle: Vec<Key> = {
+        // Whatever never reached in-degree 0 sits on a circle or downstream
+        // of one. Split it into strongly connected components and take them
+        // in dependency order: a circle (two or more cells, or a cell that
+        // reads itself) is 0 without iterative calculation, or iterates with
+        // it; a cell merely downstream is evaluated normally from those
+        // values.
+        let rest: Vec<Key> = {
             let mut v: Vec<Key> = dirty
                 .iter()
                 .copied()
@@ -362,43 +442,67 @@ impl Engine {
             v.sort_unstable();
             v
         };
-        if !cycle.is_empty() {
+        let mut found: Vec<Key> = Vec::new();
+        for comp in components_in_order(&rest, &edges) {
+            let circle =
+                comp.len() > 1 || edges.get(&comp[0]).is_some_and(|ds| ds.contains(&comp[0]));
+            if !circle {
+                if self.formulas.get(&comp[0]).is_some_and(|i| i.db) {
+                    db_done.push(comp[0]);
+                }
+                spilled.extend(self.eval_one(wb, comp[0]));
+                continue;
+            }
+            found.extend(comp.iter().copied());
             match wb.iterate {
                 Some((count, delta)) => {
-                    for _ in 0..count.max(1) {
-                        let mut max_change = 0.0f64;
-                        for &k in &cycle {
-                            let before = wb.sheets[k.0]
-                                .cell(k.1, k.2)
-                                .map(|c| c.value.clone())
-                                .unwrap_or_default();
-                            spilled.extend(self.eval_one(wb, k));
-                            let after = wb.sheets[k.0]
-                                .cell(k.1, k.2)
-                                .map(|c| c.value.clone())
-                                .unwrap_or_default();
-                            if let (CellValue::Number(x), CellValue::Number(y)) = (&before, &after)
-                            {
-                                max_change = max_change.max((x - y).abs());
-                            } else if before != after {
-                                max_change = f64::MAX;
-                            }
-                        }
-                        if max_change < delta {
-                            break;
+                    spilled.extend(self.iterate_circle(wb, &comp, count, delta));
+                }
+                None => {
+                    for &(s, r, c) in &comp {
+                        if let Some(sheet) = wb.sheets.get_mut(s) {
+                            sheet.cells.entry((r, c)).or_default().value = CellValue::Number(0.0);
                         }
                     }
                 }
-                None => {
-                    for &(s, r, c) in &cycle {
-                        if let Some(cell) = wb
-                            .sheets
-                            .get_mut(s)
-                            .and_then(|sh| sh.cells.get_mut(&(r, c)))
-                        {
-                            cell.value = CellValue::Error(ExcelError::Cycle.code().to_string());
-                        }
-                    }
+            }
+        }
+        // Circles found now replace whatever was known about the cells just
+        // recalculated; circles elsewhere stay as they were.
+        for k in &dirty {
+            self.circular.remove(k);
+        }
+        self.circular.extend(found);
+        // A D-function evaluated above may read (through a computed
+        // criterion, with no edge) a helper that sits on or below a circle,
+        // or that the circle phase evaluated after it. Evaluate those
+        // D-functions once more, in the order they ran; only when one's value
+        // changed do its dependents run again (a circle among them gets one
+        // more sweep, which the rollback rule keeps put once converged). This
+        // happens at most once per top-level recalculation, and never re-seeds
+        // the volatile cells, so an unrelated circle gets no extra sweep.
+        // Circle members are not rerun: evaluating one alone would bypass
+        // the circle rules.
+        if !rest.is_empty() && !db_done.is_empty() && !self.db_rerun_done {
+            self.db_rerun_done = true;
+            let value_of = |wb: &Workbook, k: Key| {
+                wb.sheets[k.0]
+                    .cell(k.1, k.2)
+                    .map(|c| c.value.clone())
+                    .unwrap_or_default()
+            };
+            let mut changed: Vec<Key> = Vec::new();
+            for &k in &db_done {
+                let before = value_of(wb, k);
+                spilled.extend(self.eval_one(wb, k));
+                if value_of(wb, k) != before {
+                    changed.push(k);
+                }
+            }
+            if !changed.is_empty() {
+                let dependents = self.dependents_of(&changed);
+                if !dependents.is_empty() {
+                    self.evaluate(wb, dependents, depth + 1);
                 }
             }
         }
@@ -410,6 +514,73 @@ impl Engine {
             spilled.dedup();
             self.recalc_from_depth(wb, &spilled, depth + 1);
         }
+    }
+
+    /// The formulas that depend on `seeds`, directly or transitively (the
+    /// seeds themselves excluded unless one depends on another).
+    fn dependents_of(&self, seeds: &[Key]) -> HashSet<Key> {
+        let all: Vec<Key> = self.formulas.keys().copied().collect();
+        let mut rev: HashMap<Key, Vec<Key>> = HashMap::new();
+        for (f, srcs) in self.dependency_edges(&all) {
+            for g in srcs {
+                rev.entry(g).or_default().push(f);
+            }
+        }
+        let mut out: HashSet<Key> = HashSet::new();
+        let mut frontier: VecDeque<Key> = seeds.iter().copied().collect();
+        while let Some(src) = frontier.pop_front() {
+            for &f in rev.get(&src).map(Vec::as_slice).unwrap_or_default() {
+                if out.insert(f) {
+                    frontier.push_back(f);
+                }
+            }
+        }
+        out
+    }
+
+    /// Iterative calculation of one circle (Excel's File > Options >
+    /// Formulas > Enable iterative calculation): sweep its cells up to
+    /// `count` times. A sweep whose largest change is under `delta` means the
+    /// circle had already converged, so that sweep is rolled back rather than
+    /// applied: recalculating a converged circle leaves it where it was (and
+    /// a file Excel saved verifies), instead of creeping one step further.
+    fn iterate_circle(
+        &mut self,
+        wb: &mut Workbook,
+        comp: &[Key],
+        count: u32,
+        delta: f64,
+    ) -> Vec<Key> {
+        let mut spilled = Vec::new();
+        let value_of = |wb: &Workbook, k: Key| {
+            wb.sheets[k.0]
+                .cell(k.1, k.2)
+                .map(|c| c.value.clone())
+                .unwrap_or_default()
+        };
+        for _ in 0..count.max(1) {
+            let before: Vec<CellValue> = comp.iter().map(|&k| value_of(wb, k)).collect();
+            let mut max_change = 0.0f64;
+            for (i, &k) in comp.iter().enumerate() {
+                spilled.extend(self.eval_one(wb, k));
+                match (&before[i], &value_of(wb, k)) {
+                    (CellValue::Number(x), CellValue::Number(y)) => {
+                        max_change = max_change.max((x - y).abs());
+                    }
+                    (a, b) if a != b => max_change = f64::MAX,
+                    _ => {}
+                }
+            }
+            if max_change < delta {
+                for (&(s, r, c), v) in comp.iter().zip(before) {
+                    if let Some(sheet) = wb.sheets.get_mut(s) {
+                        sheet.cells.entry((r, c)).or_default().value = v;
+                    }
+                }
+                break;
+            }
+        }
+        spilled
     }
 
     /// Evaluate one formula and store its result. Returns the keys of cells
@@ -635,6 +806,32 @@ fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth:
     }
 }
 
+/// (always recalculate, calls a D-function) for a formula, looking through
+/// the defined names it references or calls (`=Total` where Total is a DSUM
+/// or NOW()), resolved as [`collect_deps`] resolves them and to the same
+/// depth.
+fn recalc_flags(wb: &Workbook, sheet: usize, ast: &Expr, depth: u32) -> (bool, bool) {
+    let (mut volatile, mut db) = (always_recalc(ast), contains_db_fn(ast));
+    if (volatile && db) || depth >= 8 {
+        return (volatile, db);
+    }
+    let mut names = Vec::new();
+    formula::collect_names(ast, &mut names);
+    formula::collect_called_names(ast, &mut names);
+    for n in names {
+        let Some(def_ast) = wb
+            .defined_name(&n, sheet)
+            .and_then(|def| formula::parse(def).ok())
+        else {
+            continue;
+        };
+        let (v, d) = recalc_flags(wb, sheet, &def_ast, depth + 1);
+        volatile |= v;
+        db |= d;
+    }
+    (volatile, db)
+}
+
 fn to_table_info(t: &crate::sheet::Table) -> crate::formula::TableInfo {
     crate::formula::TableInfo {
         sheet: t.sheet,
@@ -771,6 +968,125 @@ impl Resolver for WbResolver<'_> {
     fn row_hidden(&self, sheet: usize, row: u32) -> bool {
         self.wb.sheets.get(sheet).is_some_and(|s| s.row_hidden(row))
     }
+
+    fn row_filtered(&self, sheet: usize, row: u32) -> bool {
+        self.wb
+            .sheets
+            .get(sheet)
+            .is_some_and(|s| s.row_filtered(row))
+    }
+
+    fn num_format(&self, sheet: usize, row: u32, col: u32) -> Option<String> {
+        let style = self.wb.sheets.get(sheet)?.cell(row, col)?.style;
+        let xf = self.wb.styles.xfs.get(style as usize)?;
+        xf.code.clone().or_else(|| numfmt_code(xf.numfmt))
+    }
+}
+
+/// A format code for a classified format that carries no code of its own
+/// (formatting authored in the editor), so `CELL("format")` sees what the grid
+/// shows.
+fn numfmt_code(nf: crate::sheet::NumFmt) -> Option<String> {
+    use crate::sheet::NumFmt;
+    let dec = |d: u8| {
+        if d == 0 {
+            String::new()
+        } else {
+            format!(".{}", "0".repeat(d as usize))
+        }
+    };
+    Some(match nf {
+        NumFmt::General => return None,
+        NumFmt::Number {
+            decimals,
+            thousands,
+        } => format!("{}0{}", if thousands { "#,##" } else { "" }, dec(decimals)),
+        NumFmt::Percent { decimals } => format!("0{}%", dec(decimals)),
+        NumFmt::Scientific => "0.00E+00".into(),
+        NumFmt::Date => "m/d/yyyy".into(),
+        NumFmt::Time => "h:mm:ss".into(),
+        NumFmt::DateTime => "m/d/yyyy h:mm".into(),
+        NumFmt::Text => "@".into(),
+    })
+}
+
+/// The strongly connected components of the graph `edges` (precedent →
+/// dependents) restricted to `nodes`, in dependency order: every component
+/// comes after the ones it reads from. Tarjan's algorithm, iterative so a
+/// long chain cannot overflow the stack; it emits components dependents
+/// first, so the result is reversed.
+fn components_in_order(nodes: &[Key], edges: &HashMap<Key, Vec<Key>>) -> Vec<Vec<Key>> {
+    let in_set: HashSet<Key> = nodes.iter().copied().collect();
+    let succ = |k: Key| -> Vec<Key> {
+        edges
+            .get(&k)
+            .map(|ds| ds.iter().copied().filter(|d| in_set.contains(d)).collect())
+            .unwrap_or_default()
+    };
+    let mut index: HashMap<Key, usize> = HashMap::new();
+    let mut low: HashMap<Key, usize> = HashMap::new();
+    let mut on_stack: HashSet<Key> = HashSet::new();
+    let mut stack: Vec<Key> = Vec::new();
+    let mut out: Vec<Vec<Key>> = Vec::new();
+    let mut next = 0usize;
+    for &root in nodes {
+        if index.contains_key(&root) {
+            continue;
+        }
+        // (node, its successors, how many of them were visited)
+        let mut work: Vec<(Key, Vec<Key>, usize)> = Vec::new();
+        index.insert(root, next);
+        low.insert(root, next);
+        next += 1;
+        stack.push(root);
+        on_stack.insert(root);
+        work.push((root, succ(root), 0));
+        while let Some((v, succs, i)) = work.last_mut() {
+            let v = *v;
+            if *i < succs.len() {
+                let w = succs[*i];
+                *i += 1;
+                match index.entry(w) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(next);
+                        low.insert(w, next);
+                        next += 1;
+                        stack.push(w);
+                        on_stack.insert(w);
+                        let ws = succ(w);
+                        work.push((w, ws, 0));
+                    }
+                    std::collections::hash_map::Entry::Occupied(e) if on_stack.contains(&w) => {
+                        let lw = *e.get();
+                        let lv = low.get_mut(&v).unwrap();
+                        *lv = (*lv).min(lw);
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {}
+                }
+                continue;
+            }
+            work.pop();
+            if let Some((parent, _, _)) = work.last() {
+                let lv = low[&v];
+                let lp = low.get_mut(parent).unwrap();
+                *lp = (*lp).min(lv);
+            }
+            if low[&v] == index[&v] {
+                let mut comp = Vec::new();
+                while let Some(w) = stack.pop() {
+                    on_stack.remove(&w);
+                    comp.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                comp.sort_unstable();
+                out.push(comp);
+            }
+        }
+    }
+    out.reverse();
+    out
 }
 
 /// Evaluate a formula string in the context of cell (sheet, row, col) over the
@@ -787,7 +1103,7 @@ pub fn eval_formula_at(wb: &Workbook, sheet: usize, row: u32, col: u32, src: &st
                 has_rand: false,
             };
             let mut ev = Eval::new(&resolver, sheet, (row, col));
-            ev.eval(&ast)
+            ev.eval_formula(&ast)
         }
         Err(_) => Value::Err(ExcelError::Name),
     }
@@ -922,7 +1238,10 @@ mod tests {
     }
 
     #[test]
-    fn cycles_get_cycle_error() {
+    fn circular_references_are_zero_and_reported() {
+        // #660: without iterative calculation a circle is 0 (never
+        // #CYCLE!), cells downstream of it evaluate normally, and the engine
+        // names the circle's cells.
         let mut wb = wb_one_sheet(&[
             ("A1", Cell::formula("B1+1")),
             ("B1", Cell::formula("A1+1")),
@@ -930,8 +1249,86 @@ mod tests {
         ]);
         let mut eng = Engine::new(&wb);
         eng.recalc_all(&mut wb);
-        assert_eq!(value_at(&wb, "A1"), CellValue::Error("#CYCLE!".into()));
-        assert_eq!(value_at(&wb, "B1"), CellValue::Error("#CYCLE!".into()));
+        assert_eq!(value_at(&wb, "A1"), CellValue::Number(0.0));
+        assert_eq!(value_at(&wb, "B1"), CellValue::Number(0.0));
+        assert_eq!(eng.circular_refs(), vec![(0, 0, 0), (0, 0, 1)]);
+
+        // The issue's cells, typed one by one.
+        let mut wb = wb_one_sheet(&[]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "E1", Cell::formula("E1+1"));
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(0.0));
+        set(&mut eng, &mut wb, "F1", Cell::formula("G1+1"));
+        assert_eq!(value_at(&wb, "F1"), CellValue::Number(1.0));
+        set(&mut eng, &mut wb, "G1", Cell::formula("F1*2"));
+        assert_eq!(value_at(&wb, "F1"), CellValue::Number(0.0));
+        assert_eq!(value_at(&wb, "G1"), CellValue::Number(0.0));
+        set(&mut eng, &mut wb, "BD5", Cell::formula("SUM(BD:BD)"));
+        assert_eq!(value_at(&wb, "BD5"), CellValue::Number(0.0));
+        set(&mut eng, &mut wb, "H1", Cell::formula("E1+5"));
+        assert_eq!(value_at(&wb, "H1"), CellValue::Number(5.0));
+        let e1 = (0, 0, 4);
+        let (f1, g1) = ((0, 0, 5), (0, 0, 6));
+        let bd5 = (0, 4, 55);
+        assert_eq!(eng.circular_refs(), vec![e1, f1, g1, bd5]);
+
+        // An unrelated edit, and a volatile's recalculation, keep them.
+        eng.seed = Some(1);
+        set(&mut eng, &mut wb, "Z1", Cell::formula("RAND()"));
+        set(&mut eng, &mut wb, "Z2", Cell::number(3.0));
+        assert_eq!(eng.circular_refs(), vec![e1, f1, g1, bd5]);
+        // Breaking a circle drops it; replacing a formula drops that cell.
+        set(&mut eng, &mut wb, "G1", Cell::number(4.0));
+        assert_eq!(value_at(&wb, "F1"), CellValue::Number(5.0));
+        set(&mut eng, &mut wb, "E1", Cell::number(1.0));
+        assert_eq!(value_at(&wb, "H1"), CellValue::Number(6.0));
+        assert_eq!(eng.circular_refs(), vec![bd5]);
+        set(&mut eng, &mut wb, "BD5", Cell::default());
+        assert!(eng.circular_refs().is_empty());
+    }
+
+    #[test]
+    fn loaded_circle_values_survive_a_full_recalc() {
+        // #660: an Excel-saved circle (cached 0) verifies: recalc_all leaves
+        // it at 0 and writes no error.
+        let cached = |f: &str| Cell {
+            value: CellValue::Number(0.0),
+            ..Cell::formula(f)
+        };
+        let mut wb = wb_one_sheet(&[
+            ("E1", cached("E1+1")),
+            ("F1", cached("G1+1")),
+            ("G1", cached("F1*2")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        for c in ["E1", "F1", "G1"] {
+            assert_eq!(value_at(&wb, c), CellValue::Number(0.0), "{c}");
+        }
+    }
+
+    #[test]
+    fn converged_iteration_is_stable_under_recalc() {
+        // #660: with iterate="1" iterateCount="100" iterateDelta="0.001",
+        // Excel's cached D1 = D1/2+5 value survives a full recalculation.
+        let cached = 9.999998807907104;
+        let mut wb = wb_one_sheet(&[(
+            "D1",
+            Cell {
+                value: CellValue::Number(cached),
+                ..Cell::formula("D1/2+5")
+            },
+        )]);
+        wb.iterate = Some((100, 0.001));
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "D1"), CellValue::Number(cached));
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "D1"), CellValue::Number(cached));
+        assert_eq!(eng.circular_refs(), vec![(0, 0, 3)]);
+        // A cell downstream of the circle reads its settled value once.
+        set(&mut eng, &mut wb, "E1", Cell::formula("D1*2"));
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(cached * 2.0));
     }
 
     #[test]
@@ -1093,7 +1490,7 @@ mod tests {
         });
         let mut eng = Engine::new(&wb);
         eng.recalc_all(&mut wb);
-        // Calculated column evaluates (no #CYCLE! from self-deps) and the
+        // Calculated column evaluates (no circle from self-deps) and the
         // aggregation sees it in topological order.
         assert_eq!(value_at(&wb, "C2"), CellValue::Number(6.0));
         assert_eq!(value_at(&wb, "C3"), CellValue::Number(8.0));
@@ -1150,11 +1547,11 @@ mod tests {
 
     #[test]
     fn iterative_calculation_converges() {
-        // A1 = (A1+10)/2 → fixed point at 10. Without the opt-in: #CYCLE!.
+        // A1 = (A1+10)/2 → fixed point at 10. Without the opt-in: 0.
         let mut wb = wb_one_sheet(&[("A1", Cell::formula("(A1+10)/2"))]);
         let mut eng = Engine::new(&wb);
         eng.recalc_all(&mut wb);
-        assert_eq!(value_at(&wb, "A1"), CellValue::Error("#CYCLE!".into()));
+        assert_eq!(value_at(&wb, "A1"), CellValue::Number(0.0));
         // With iteration enabled it converges.
         let mut wb = wb_one_sheet(&[("A1", Cell::formula("(A1+10)/2"))]);
         wb.iterate = Some((100, 1e-9));
@@ -1187,6 +1584,496 @@ mod tests {
             CellValue::Number(n) => assert!((0.0..1.0).contains(&n)),
             v => panic!("RAND gave {v:?}"),
         }
+    }
+
+    #[test]
+    fn rows_and_columns_of_randarray() {
+        // #661: ROWS/COLUMNS of a computed (random) array.
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::formula("ROWS(RANDARRAY(3,2))")),
+            ("A2", Cell::formula("COLUMNS(RANDARRAY(3,2))")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.seed = Some(7);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "A1"), CellValue::Number(3.0));
+        assert_eq!(value_at(&wb, "A2"), CellValue::Number(2.0));
+    }
+
+    #[test]
+    fn cell_format_and_isformula() {
+        // #656: CELL("format") reads the cell's number format; ISFORMULA
+        // whether it holds a formula.
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1234.0)),
+            ("A2", Cell::number(0.5)),
+            ("A3", Cell::number(45306.0)),
+            ("A4", Cell::formula("A1*2")),
+            ("B1", Cell::formula("CELL(\"format\",A1)")),
+            ("B2", Cell::formula("CELL(\"format\",A2)")),
+            ("B3", Cell::formula("CELL(\"format\",A3)")),
+            ("B4", Cell::formula("CELL(\"format\",A5)")),
+            ("C1", Cell::formula("ISFORMULA(A1)")),
+            ("C4", Cell::formula("ISFORMULA(A4)")),
+            ("C5", Cell::formula("ISFORMULA(5)")),
+        ]);
+        let xf = |code: &str| crate::sheet::Xf {
+            code: Some(code.to_string()),
+            ..Default::default()
+        };
+        if wb.styles.xfs.is_empty() {
+            wb.styles.xfs.push(Default::default());
+        }
+        let s1 = wb.styles.intern(xf("$#,##0_);[Red]($#,##0)"));
+        let s2 = wb.styles.intern(crate::sheet::Xf {
+            numfmt: crate::sheet::NumFmt::Percent { decimals: 2 },
+            ..Default::default()
+        });
+        let s3 = wb.styles.intern(xf("d-mmm-yy"));
+        for (r, st) in [(0, s1), (1, s2), (2, s3)] {
+            wb.sheets[0].cells.get_mut(&(r, 0)).unwrap().style = st;
+        }
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        let t = |s: &str| CellValue::Text(s.into());
+        assert_eq!(value_at(&wb, "B1"), t("C0-"));
+        assert_eq!(value_at(&wb, "B2"), t("P2"));
+        assert_eq!(value_at(&wb, "B3"), t("D1"));
+        assert_eq!(value_at(&wb, "B4"), t("G"));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Bool(false));
+        assert_eq!(value_at(&wb, "C4"), CellValue::Bool(true));
+        assert_eq!(value_at(&wb, "C5"), CellValue::Error("#VALUE!".into()));
+        // `_xlfn.ISFORMULA` from a file parses to the same function.
+        let ast = formula::parse("_xlfn.ISFORMULA(A4)").unwrap();
+        assert!(matches!(ast, Expr::Func(ref f, _) if f == "ISFORMULA"));
+    }
+
+    #[test]
+    fn database_criteria_begin_with_and_compute() {
+        // #677: the issue's table, all nine rows, plus the exact form.
+        let t = |s: &str| Cell::text(s);
+        let n = Cell::number;
+        let f = Cell::formula;
+        let mut cells = vec![
+            ("F1", t("Rep")),
+            ("F2", t("C")),
+            ("P1", t("Rep")),
+            ("P2", t("an")),
+            ("Y1", t("Big")),
+            ("Y2", f("C2>100")),
+            ("AA2", f("AND(C2>=80,B2=\"East\")")),
+            ("AB1", t("Over")),
+            ("AB2", f("C2>$AD$1")),
+            ("AD1", n(100.0)),
+            ("AC1", t("Zone")),
+            ("AC2", t("East")),
+            ("H1", t("Rep")),
+            ("H2", f("\"=an\"")),
+            ("K1", f("DCOUNTA(A1:C8,\"Rep\",F1:F2)")),
+            ("K2", f("DSUM(A1:C8,\"Amount\",F1:F2)")),
+            ("K3", f("DCOUNTA(A1:C8,\"Rep\",P1:P2)")),
+            ("K4", f("DCOUNTA(A1:C8,\"Rep\",Y1:Y2)")),
+            ("K5", f("DSUM(A1:C8,\"Amount\",Y1:Y2)")),
+            ("K6", f("DCOUNTA(A1:C8,\"Rep\",AA1:AA2)")),
+            ("K7", f("DSUM(A1:C8,\"Amount\",AA1:AA2)")),
+            ("K8", f("DCOUNTA(A1:C8,\"Rep\",AB1:AB2)")),
+            ("K9", f("DCOUNTA(A1:C8,\"Rep\",AC1:AC2)")),
+            ("K10", f("DCOUNTA(A1:C8,\"Rep\",H1:H2)")),
+            // COUNTIF keeps exact text matching.
+            ("K11", f("COUNTIF(A2:A8,\"C\")")),
+        ];
+        let reps = ["Rep", "Ann", "Bob", "Cara", "ann", "Dee", "Carl", "Eve"];
+        let regions = ["Region", "East", "West", "East", "North", "West", "East"];
+        let amounts = [120.0, 80.0, 200.0, 50.0, 300.0, 90.0, 60.0];
+        let names: Vec<(String, Cell)> = reps
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (format!("A{}", i + 1), t(r)))
+            .chain(
+                regions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| (format!("B{}", i + 1), t(r))),
+            )
+            .chain(std::iter::once(("C1".to_string(), t("Amount"))))
+            .chain(
+                amounts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| (format!("C{}", i + 2), n(*a))),
+            )
+            .collect();
+        for (k, c) in &names {
+            cells.push((k.as_str(), c.clone()));
+        }
+        let mut wb = wb_one_sheet(&cells);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        let want = [2.0, 290.0, 2.0, 3.0, 620.0, 3.0, 410.0, 3.0, 0.0, 0.0, 0.0];
+        for (i, w) in want.iter().enumerate() {
+            let k = format!("K{}", i + 1);
+            assert_eq!(value_at(&wb, &k), CellValue::Number(*w), "{k}");
+        }
+        // The computed criterion follows its absolute input.
+        eng.set_cell(&mut wb, (0, 0, 29), n(250.0));
+        assert_eq!(value_at(&wb, "K8"), CellValue::Number(1.0));
+    }
+
+    #[test]
+    fn computed_criteria_that_reenter_themselves_terminate() {
+        // #677: a computed criterion reading a D-function over its own
+        // criteria range (directly, or through another criteria range) is a
+        // circle; it matches nothing rather than recursing forever.
+        let mut cells: Vec<(String, Cell)> = vec![
+            ("A1".into(), Cell::text("N")),
+            ("B1".into(), Cell::text("M")),
+            ("C1".into(), Cell::text("V")),
+        ];
+        for r in 2..=8 {
+            cells.push((format!("A{r}"), Cell::number(r as f64)));
+            cells.push((format!("C{r}"), Cell::number(10.0 * r as f64)));
+        }
+        cells.push((
+            "Y2".into(),
+            Cell::formula("DCOUNT($A$1:$C$8,\"V\",$Y$1:$Y$2)>0"),
+        ));
+        cells.push(("K1".into(), Cell::formula("DCOUNT(A1:C8,\"V\",Y1:Y2)")));
+        cells.push((
+            "P2".into(),
+            Cell::formula("DCOUNT($A$1:$C$8,\"V\",$Q$1:$Q$2)>0"),
+        ));
+        cells.push((
+            "Q2".into(),
+            Cell::formula("DCOUNT($A$1:$C$8,\"V\",$P$1:$P$2)>0"),
+        ));
+        cells.push(("K2".into(), Cell::formula("DCOUNT(A1:C8,\"V\",P1:P2)")));
+        let refs: Vec<(&str, Cell)> = cells.iter().map(|(k, c)| (k.as_str(), c.clone())).collect();
+        let mut wb = wb_one_sheet(&refs);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(0.0));
+        assert_eq!(value_at(&wb, "K2"), CellValue::Number(0.0));
+    }
+
+    #[test]
+    fn circles_are_known_before_any_recalc() {
+        // #660: building the engine over an opened workbook finds its
+        // circles without touching the cached values.
+        let cached = |f: &str, v: f64| Cell {
+            value: CellValue::Number(v),
+            ..Cell::formula(f)
+        };
+        let wb = wb_one_sheet(&[
+            ("E1", cached("E1+1", 3.0)),
+            ("F1", cached("G1+1", 1.0)),
+            ("G1", cached("F1*2", 2.0)),
+            ("H1", cached("E1+5", 8.0)),
+        ]);
+        let eng = Engine::new(&wb);
+        assert_eq!(eng.circular_refs(), vec![(0, 0, 4), (0, 0, 5), (0, 0, 6)]);
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(3.0));
+        assert!(
+            Engine::new(&wb_one_sheet(&[("A1", Cell::formula("B1+1"))]))
+                .circular_refs()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn computed_criteria_follow_cells_outside_the_database() {
+        // #677: AA2 = E2>0 reads helper column E beside the database, one
+        // row per record. D-functions are volatile, so editing any of E (or
+        // a column the criterion is changed to read) updates the DSUM.
+        let mut cells: Vec<(String, Cell)> = vec![
+            ("A1".into(), Cell::text("Rep")),
+            ("C1".into(), Cell::text("Amount")),
+        ];
+        for r in 2..=8 {
+            cells.push((format!("A{r}"), Cell::text(&format!("R{r}"))));
+            cells.push((format!("C{r}"), Cell::number(10.0 * r as f64)));
+            cells.push((format!("E{r}"), Cell::number(0.0)));
+        }
+        cells.push(("E2".into(), Cell::number(1.0)));
+        cells.push(("AA2".into(), Cell::formula("E2>0")));
+        cells.push(("K1".into(), Cell::formula("DSUM(A1:C8,\"Amount\",AA1:AA2)")));
+        let refs: Vec<(&str, Cell)> = cells.iter().map(|(k, c)| (k.as_str(), c.clone())).collect();
+        let mut wb = wb_one_sheet(&refs);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(20.0));
+        set(&mut eng, &mut wb, "E5", Cell::number(1.0));
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(70.0));
+        set(&mut eng, &mut wb, "E8", Cell::number(2.0));
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(150.0));
+        // The criteria formula changes to read another column: edits there
+        // count too.
+        for r in 2..=8 {
+            set(&mut eng, &mut wb, &format!("F{r}"), Cell::number(0.0));
+        }
+        set(&mut eng, &mut wb, "AA2", Cell::formula("F2>0"));
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(0.0));
+        set(&mut eng, &mut wb, "F5", Cell::number(1.0));
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(50.0));
+
+        // Natural order: the DSUM first, then its criterion, then the edit.
+        let mut wb = wb_one_sheet(&refs[..refs.len() - 2]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        set(
+            &mut eng,
+            &mut wb,
+            "K1",
+            Cell::formula("DSUM(A1:C8,\"Amount\",AA1:AA2)"),
+        );
+        set(&mut eng, &mut wb, "AA2", Cell::formula("E2>0"));
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(20.0));
+        set(&mut eng, &mut wb, "E5", Cell::number(1.0));
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(70.0));
+    }
+
+    #[test]
+    fn database_functions_wait_for_the_helpers_their_criteria_read() {
+        // #677: helper formulas in E (E2:E8 = B*2) feed the computed
+        // criterion AA2 = E2>100, with no edge from them to the D-functions.
+        // Many DSUMs make an order that evaluated any of them before the
+        // edited helper fail almost surely, whatever the HashMap order.
+        let mut cells: Vec<(String, Cell)> = vec![
+            ("A1".into(), Cell::text("Rep")),
+            ("B1".into(), Cell::text("Units")),
+            ("C1".into(), Cell::text("Amount")),
+            ("AA2".into(), Cell::formula("E2>100")),
+        ];
+        for r in 2..=8 {
+            cells.push((format!("A{r}"), Cell::text(&format!("R{r}"))));
+            cells.push((format!("B{r}"), Cell::number(10.0)));
+            cells.push((format!("C{r}"), Cell::number(r as f64)));
+            cells.push((format!("E{r}"), Cell::formula(&format!("B{r}*2"))));
+        }
+        for k in 1..=30 {
+            cells.push((
+                format!("K{k}"),
+                Cell::formula("DSUM(A1:C8,\"Amount\",AA1:AA2)"),
+            ));
+        }
+        let refs: Vec<(&str, Cell)> = cells.iter().map(|(k, c)| (k.as_str(), c.clone())).collect();
+        // recalc_all over helpers with no cached values.
+        let mut wb = wb_one_sheet(&refs);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        for k in 1..=30 {
+            assert_eq!(value_at(&wb, &format!("K{k}")), CellValue::Number(0.0));
+        }
+        // Edit helper inputs, one at a time.
+        let mut want = 0.0;
+        for r in [5u32, 2, 8, 3] {
+            set(&mut eng, &mut wb, &format!("B{r}"), Cell::number(60.0));
+            want += r as f64;
+            for k in 1..=30 {
+                assert_eq!(
+                    value_at(&wb, &format!("K{k}")),
+                    CellValue::Number(want),
+                    "K{k} after B{r}"
+                );
+            }
+        }
+        let mut wb2 = wb.clone();
+        let mut eng2 = Engine::new(&wb2);
+        for r in 2..=8 {
+            wb2.sheets[0].cells.get_mut(&(r - 1, 4)).unwrap().value = CellValue::Empty;
+        }
+        eng2.recalc_all(&mut wb2);
+        assert_eq!(value_at(&wb2, "K30"), CellValue::Number(want));
+    }
+
+    /// The #677 helper layout: A1:C8 database (C = row number), E2:E8
+    /// helpers, AA2 = E2>100 as a computed criterion, K1 = `k1`, plus
+    /// `extra` cells.
+    fn db_helper_book(k1: &str, e5: &str, extra: &[(&str, Cell)]) -> Workbook {
+        let mut cells: Vec<(String, Cell)> = vec![
+            ("A1".into(), Cell::text("Rep")),
+            ("C1".into(), Cell::text("Amount")),
+            ("AA2".into(), Cell::formula("E2>100")),
+            ("K1".into(), Cell::formula(k1)),
+        ];
+        for r in 2..=8 {
+            cells.push((format!("A{r}"), Cell::text(&format!("R{r}"))));
+            cells.push((format!("C{r}"), Cell::number(r as f64)));
+            cells.push((format!("E{r}"), Cell::number(0.0)));
+        }
+        cells.push(("E5".into(), Cell::formula(e5)));
+        for (k, c) in extra {
+            cells.push((k.to_string(), c.clone()));
+        }
+        let refs: Vec<(&str, Cell)> = cells.iter().map(|(k, c)| (k.as_str(), c.clone())).collect();
+        wb_one_sheet(&refs)
+    }
+
+    #[test]
+    fn database_functions_see_helpers_below_an_iterating_circle() {
+        // #677/#660: E5 reads Z1, an iterating circle; the DSUM's computed
+        // criterion reads E5. The circle settles after the DSUM first ran,
+        // so the DSUM runs again.
+        let dsum = "DSUM(A1:C8,\"Amount\",AA1:AA2)";
+        let mut wb = db_helper_book(
+            dsum,
+            "Z1*2",
+            &[("Z1", Cell::formula("Z1/2+B1")), ("B1", Cell::number(30.0))],
+        );
+        wb.iterate = Some((100, 0.001));
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        // Z1 → 60, E5 → 120 > 100: record 5 matches.
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(5.0));
+        set(&mut eng, &mut wb, "B1", Cell::number(10.0));
+        // Z1 → 20, E5 → 40: nothing matches.
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(0.0));
+        set(&mut eng, &mut wb, "B1", Cell::number(40.0));
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(5.0));
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(5.0));
+    }
+
+    #[test]
+    fn database_functions_see_helpers_below_a_new_circle() {
+        // #677/#660: without iteration a new circle is 0, so a helper below
+        // it drops out of the criterion and the DSUM follows.
+        let dsum = "DSUM(A1:C8,\"Amount\",AA1:AA2)";
+        let mut wb = db_helper_book(dsum, "Z1*2+B1", &[("Z1", Cell::number(60.0))]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(5.0));
+        // Z1 becomes a circle: 0, so E5 = B1 = 0.
+        set(&mut eng, &mut wb, "Z1", Cell::formula("Z1+1"));
+        assert_eq!(value_at(&wb, "E5"), CellValue::Number(0.0));
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(0.0));
+        // An input below the circle moves E5 above 100 again.
+        set(&mut eng, &mut wb, "B1", Cell::number(150.0));
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(5.0));
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(5.0));
+    }
+
+    #[test]
+    fn a_circle_reading_a_database_function_advances_once_per_recalc() {
+        // #677/#660: Z1 = Z1+K1 with one iteration per recalculation and K1 a
+        // DSUM (5). An unrelated edit recalculates K1 (it always does) and so
+        // Z1 once: Z1 advances by exactly 5. The D-function rerun must not
+        // add sweeps (it used to re-arm itself at every nested pass).
+        let mut wb = db_helper_book(
+            "DSUM(A1:C8,\"Amount\",AA1:AA2)",
+            "B5*2",
+            &[("B5", Cell::number(60.0)), ("Z1", Cell::formula("Z1+K1"))],
+        );
+        wb.iterate = Some((1, 0.001));
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(5.0));
+        let z = |wb: &Workbook| match value_at(wb, "Z1") {
+            CellValue::Number(z) => z,
+            v => panic!("{v:?}"),
+        };
+        let z0 = z(&wb);
+        set(&mut eng, &mut wb, "Y9", Cell::number(1.0));
+        assert_eq!(z(&wb) - z0, 5.0);
+        set(&mut eng, &mut wb, "Y9", Cell::number(2.0));
+        assert_eq!(z(&wb) - z0, 10.0);
+    }
+
+    #[test]
+    fn database_functions_downstream_of_a_circle_see_every_helper() {
+        // #677/#660: the whole helper column E sits below the iterating
+        // circle Z1, and so does the DSUM (through AA2 = E2>100). The circle
+        // phase may run the DSUM before E3..E8; the rerun fixes it.
+        let mut cells: Vec<(String, Cell)> = vec![
+            ("A1".into(), Cell::text("Rep")),
+            ("C1".into(), Cell::text("Amount")),
+            ("AA2".into(), Cell::formula("E2>100")),
+            ("Z1".into(), Cell::formula("Z1/2+B1")),
+            ("B1".into(), Cell::number(10.0)),
+            (
+                "K21".into(),
+                Cell::formula("DSUM(A1:C8,\"Amount\",AA1:AA2)"),
+            ),
+        ];
+        for r in 2..=8 {
+            cells.push((format!("A{r}"), Cell::text(&format!("R{r}"))));
+            cells.push((format!("C{r}"), Cell::number(r as f64)));
+            cells.push((format!("E{r}"), Cell::formula(&format!("C{r}*Z1"))));
+        }
+        let refs: Vec<(&str, Cell)> = cells.iter().map(|(k, c)| (k.as_str(), c.clone())).collect();
+        let mut wb = wb_one_sheet(&refs);
+        wb.iterate = Some((100, 0.001));
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        // Z1 → 20: E6..E8 (120, 140, 160) pass.
+        assert_eq!(value_at(&wb, "K21"), CellValue::Number(21.0));
+        set(&mut eng, &mut wb, "B1", Cell::number(30.0));
+        // Z1 → 60: E2..E8 pass.
+        assert_eq!(value_at(&wb, "K21"), CellValue::Number(35.0));
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "K21"), CellValue::Number(35.0));
+    }
+
+    #[test]
+    fn database_functions_behind_a_defined_name_recalculate() {
+        // #677: K1 = Total, a defined name holding the DSUM. It is found
+        // behind the name, so it always recalculates and waits for helpers.
+        let mut wb = db_helper_book("Total", "B5*2", &[("B5", Cell::number(10.0))]);
+        wb.defined_names.push(crate::sheet::DefinedName {
+            name: "Total".into(),
+            scope: None,
+            formula: "DSUM(Sheet1!$A$1:$C$8,\"Amount\",Sheet1!$AA$1:$AA$2)".into(),
+        });
+        wb.defined_names.push(crate::sheet::DefinedName {
+            name: "Stamp".into(),
+            scope: None,
+            formula: "NOW()".into(),
+        });
+        wb.sheets[0].set_cell(0, 20, Cell::formula("Stamp+1"));
+        let mut eng = Engine::new(&wb);
+        assert!(eng.formulas[&(0, 0, 10)].volatile && eng.formulas[&(0, 0, 10)].db);
+        // NOW() behind a name is volatile too.
+        assert!(eng.formulas[&(0, 0, 20)].volatile && !eng.formulas[&(0, 0, 20)].db);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(0.0));
+        set(&mut eng, &mut wb, "B5", Cell::number(60.0));
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(5.0));
+    }
+
+    #[test]
+    fn database_functions_below_their_inputs_are_not_circles() {
+        // #677: a D-function under its criteria's inputs (H3 below H1, or a
+        // total at C10 under an AVERAGE($C$2:$C$8) criterion) is no circle.
+        let amounts = [120.0, 80.0, 200.0, 50.0, 300.0, 90.0, 60.0];
+        let mut cells: Vec<(String, Cell)> = vec![
+            ("A1".into(), Cell::text("Rep")),
+            ("C1".into(), Cell::text("Amount")),
+            ("F1".into(), Cell::text("Amount")),
+            ("F2".into(), Cell::formula("\">\"&H1")),
+            ("H1".into(), Cell::number(100.0)),
+            ("H3".into(), Cell::formula("DSUM(A1:C8,\"Amount\",F1:F2)")),
+            ("AB1".into(), Cell::text("Over")),
+            ("AB2".into(), Cell::formula("C2>AVERAGE($C$2:$C$8)")),
+            (
+                "C10".into(),
+                Cell::formula("DSUM(A1:C8,\"Amount\",AB1:AB2)"),
+            ),
+        ];
+        for (i, a) in amounts.iter().enumerate() {
+            cells.push((format!("A{}", i + 2), Cell::text(&format!("R{i}"))));
+            cells.push((format!("C{}", i + 2), Cell::number(*a)));
+        }
+        let refs: Vec<(&str, Cell)> = cells.iter().map(|(k, c)| (k.as_str(), c.clone())).collect();
+        let mut wb = wb_one_sheet(&refs);
+        let mut eng = Engine::new(&wb);
+        assert!(eng.circular_refs().is_empty());
+        eng.recalc_all(&mut wb);
+        assert!(eng.circular_refs().is_empty());
+        assert_eq!(value_at(&wb, "H3"), CellValue::Number(620.0));
+        assert_eq!(value_at(&wb, "C10"), CellValue::Number(500.0));
+        set(&mut eng, &mut wb, "H1", Cell::number(250.0));
+        assert_eq!(value_at(&wb, "H3"), CellValue::Number(300.0));
+        assert!(eng.circular_refs().is_empty());
     }
 
     // ---- dynamic arrays / spilling ------------------------------------

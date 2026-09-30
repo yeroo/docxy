@@ -144,6 +144,11 @@ pub struct CellMeta {
     /// Value-metadata index and the value it was loaded with: it describes
     /// that value, so it is written only while the cell still holds it.
     pub vm: Option<(String, CellValue)>,
+    /// The `<v>` text the file wrote for a rich error whose real value was
+    /// decoded from the value metadata (`#VALUE!` standing in for `#SPILL!`,
+    /// `#CALC!` or `#GETTING_DATA`). Written back instead of the value while
+    /// `vm` is.
+    pub vm_body: Option<String>,
     /// `ph="1"`: show phonetic text.
     pub ph: bool,
 }
@@ -278,6 +283,11 @@ pub struct Sheet {
     /// didn't have.
     pub row_breaks: Vec<PageBreak>,
     pub col_breaks: Vec<PageBreak>,
+    /// Rows an applied filter hid, as opposed to rows hidden by hand: derived
+    /// at load from the `<autoFilter>` criteria, and kept by the editor's own
+    /// filter. In memory only. `SUBTOTAL(1..11)` skips these rows but counts
+    /// hand-hidden ones. See [`Sheet::row_filtered`].
+    pub filtered_rows: std::collections::BTreeSet<u32>,
 }
 
 /// One `<brk>`: `id` is the 0-based first row (column) of the page that starts
@@ -1022,6 +1032,23 @@ impl Sheet {
     /// applied auto-filter (Excel persists all three as `hidden="1"`).
     pub fn row_hidden(&self, row: u32) -> bool {
         self.row_attrs.get(&row).is_some_and(|a| attr_hidden(a))
+    }
+
+    /// Whether a row is hidden by a filter: hidden, and marked filtered. A
+    /// filtered row the user unhid is not.
+    pub fn row_filtered(&self, row: u32) -> bool {
+        self.filtered_rows.contains(&row) && self.row_hidden(row)
+    }
+
+    /// Hide or unhide a row as a filter does: hiding marks it filter-hidden,
+    /// unhiding clears the mark.
+    pub fn set_row_filtered(&mut self, row: u32, hidden: bool) {
+        self.set_row_hidden(row, hidden);
+        if hidden {
+            self.filtered_rows.insert(row);
+        } else {
+            self.filtered_rows.remove(&row);
+        }
     }
 
     /// Hide or unhide a row, preserving its other `<row>` attributes (e.g. `ht`).
@@ -2422,5 +2449,23 @@ mod tests {
         assert!(serial_to_parts(2_958_466.0, false).is_none()); // past 9999-12-31
         assert!(serial_to_parts(-1.0, false).is_none());
         assert!(serial_to_parts(45306.0, false).is_some()); // 2024-01-15 ok
+    }
+
+    #[test]
+    fn set_row_filtered_marks_and_clears() {
+        // #678: a filter's hide marks the row filter-hidden; unhiding clears
+        // the mark; a hand hide is never filtered.
+        let mut s = Sheet::default();
+        s.set_row_filtered(2, true);
+        assert!(s.row_hidden(2) && s.row_filtered(2));
+        s.set_row_filtered(2, false);
+        assert!(!s.row_hidden(2) && !s.row_filtered(2));
+        assert!(s.filtered_rows.is_empty());
+        s.set_row_hidden(3, true);
+        assert!(s.row_hidden(3) && !s.row_filtered(3));
+        // A marked row unhidden by hand is no longer filtered.
+        s.set_row_filtered(4, true);
+        s.set_row_hidden(4, false);
+        assert!(!s.row_filtered(4));
     }
 }

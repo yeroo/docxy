@@ -9664,9 +9664,11 @@ impl Docxy {
             }
             let header = matches!(sh.cell(top, sc).map(|c| &c.value), Some(CellValue::Text(_)));
             let start = if header { top + 1 } else { top };
+            // Rows are marked filter-hidden (not hidden by hand) so SUBTOTAL
+            // 1-11 skips them and still counts hand-hidden rows.
             if text.trim().eq_ignore_ascii_case("clear") {
                 for r in top..=bottom {
-                    v.pkg.workbook.sheets[s].set_row_hidden(r, false);
+                    v.pkg.workbook.sheets[s].set_row_filtered(r, false);
                 }
             } else if let Some((op, operand)) = gridcore::filter::parse(text) {
                 let keep: Vec<bool> = (start..=bottom)
@@ -9678,7 +9680,7 @@ impl Docxy {
                     })
                     .collect();
                 for (i, r) in (start..=bottom).enumerate() {
-                    v.pkg.workbook.sheets[s].set_row_hidden(r, !keep[i]);
+                    v.pkg.workbook.sheets[s].set_row_filtered(r, !keep[i]);
                 }
             }
         }
