@@ -59,8 +59,9 @@ pub struct Engine {
     formulas: HashMap<Key, FormulaInfo>,
     /// Cells whose formulas we must not re-evaluate (see module docs).
     unsupported: HashSet<Key>,
-    /// Dynamic-array anchors currently showing `#SPILL!` — retried on every
-    /// recalculation so they recover the moment the blockage clears.
+    /// Anchors whose array result cannot be written — dynamic arrays showing
+    /// `#SPILL!`, blocked legacy CSE blocks — retried on every recalculation
+    /// so they recover the moment the blockage clears.
     spill_blocked: HashSet<Key>,
     /// Current moment as an Excel serial, supplied by the app (None = no
     /// clock → `TODAY`/`NOW` formulas stay on their cached values).
@@ -132,13 +133,14 @@ impl Engine {
     fn index_cell(&mut self, wb: &Workbook, key: Key, cell: &Cell) {
         if let Some(src) = &cell.formula {
             // Array formulas (`t="array"`, or a dynamic array after an edit
-            // dropped `f_attrs`) are ours to evaluate — the dynamic-array
-            // engine recomputes their spill. Other preserved `<f>` attributes
-            // stay frozen.
+            // dropped `f_attrs`) are ours to evaluate: a dynamic array's spill
+            // is recomputed, a legacy CSE block ([`cse_block`]) is refilled.
+            // Other preserved `<f>` attributes stay frozen.
             let is_array = cell.is_array_formula();
             let preserved = cell.f_attrs.as_deref().is_some_and(|a| !is_array_f(a));
             // A plain loaded formula is legacy (implicit intersection); an
-            // array one, or one typed here (`modern`), spills.
+            // array one, or one typed here (`modern`), is evaluated as an
+            // array: it spills, or fills its fixed block when it is a CSE one.
             let legacy = !(is_array || cell.is_modern());
             let cse = cse_block(cell, key.1, key.2);
             self.index_formula(wb, key, src, preserved, legacy, cse);
@@ -652,7 +654,7 @@ impl Engine {
             None => return Vec::new(),
         };
         // Legacy formulas implicit-intersect a range result; modern (user-entered
-        // or `t="array"`) ones spill.
+        // or `t="array"`) ones spill, except a CSE block, which fills its `ref`.
         let spill = !info.legacy;
         let cse = info.cse;
         let resolver = WbResolver {
@@ -749,10 +751,15 @@ impl Engine {
         changed
     }
 
-    /// Store a legacy CSE array's result over its fixed block ([`cse_fill`]).
-    /// A block cell holding content that is not this block's own (a value
-    /// typed into it, a formula) is left alone, and the anchor then shows
-    /// only its own value until the block is clear again.
+    /// Store a legacy CSE array's result over its fixed block ([`cse_at`]).
+    ///
+    /// While the anchor still owns its block (it has an extent: the block was
+    /// not broken by an edit into it), every plain value in the fixed block is
+    /// the block's own — also after an insert grew the `ref` past the stored
+    /// extent. Once an edit broke it, a plain value is the block's own only
+    /// when it equals what the block would put there (an undo restoring a
+    /// block cell); anything else (a value typed into it, a formula) is left
+    /// alone, and the anchor shows only its own value until the block is clear.
     fn fill_cse(
         &mut self,
         sheet: &mut Sheet,
@@ -762,7 +769,11 @@ impl Engine {
         result: DynResult,
     ) -> Vec<Key> {
         let (s, r, c) = key;
-        let block = cse_fill(result, h, w);
+        let m = match result {
+            DynResult::Scalar(v) => vec![vec![v]],
+            DynResult::Array(m) => m,
+        };
+        let owned = old != (1, 1);
         let off_grid = r + h > crate::sheet::MAX_ROWS || c + w > crate::sheet::MAX_COLS;
         let blocked = off_grid
             || (r..r + h).any(|rr| {
@@ -773,7 +784,10 @@ impl Engine {
                     let Some(cell) = sheet.cell(rr, cc) else {
                         return false;
                     };
-                    let ours = rr < r + old.0 && cc < c + old.1 && cell.formula.is_none();
+                    let ours = cell.formula.is_none()
+                        && (owned
+                            || cell.value
+                                == value_to_cell(cse_at(&m, (rr - r) as usize, (cc - c) as usize)));
                     !cell.is_blank() && !ours
                 })
             });
@@ -781,16 +795,15 @@ impl Engine {
         if blocked {
             changed.extend(clear_spill(sheet, s, (r, c), old, None));
             let entry = sheet.cells.entry((r, c)).or_default();
-            entry.value = value_to_cell(block[0][0].clone());
+            entry.value = value_to_cell(cse_at(&m, 0, 0));
             entry.spill = None;
             self.spill_blocked.insert(key);
             return changed;
         }
-        for (i, row) in block.into_iter().enumerate() {
-            for (j, v) in row.into_iter().enumerate() {
-                let (rr, cc) = (r + i as u32, c + j as u32);
+        for rr in r..r + h {
+            for cc in c..c + w {
+                let v = value_to_cell(cse_at(&m, (rr - r) as usize, (cc - c) as usize));
                 let entry = sheet.cells.entry((rr, cc)).or_default();
-                let v = value_to_cell(v);
                 if (rr, cc) != (r, c) && entry.value != v {
                     changed.push((s, rr, cc));
                 }
@@ -817,29 +830,20 @@ fn cse_block(cell: &Cell, row: u32, col: u32) -> Option<(u32, u32)> {
     ((r1, c1) == (row, col) && r2 >= r1 && c2 >= c1).then_some((r2 - r1 + 1, c2 - c1 + 1))
 }
 
-/// Excel's fill of a CSE block from an array result: a 1-row (1-column)
-/// result repeats down (across), a scalar over the whole block, and cells
-/// past a larger dimension are `#N/A`.
-fn cse_fill(result: DynResult, h: u32, w: u32) -> Vec<Vec<Value>> {
-    let m = match result {
-        DynResult::Scalar(v) => vec![vec![v]],
-        DynResult::Array(m) => m,
+/// Excel's fill of a CSE block from an array result, at block offset
+/// `(i, j)`: a 1-row (1-column) result repeats down (across), a scalar over
+/// the whole block, and cells past a larger dimension are `#N/A`.
+fn cse_at(m: &[Vec<Value>], i: usize, j: usize) -> Value {
+    let i = if m.len() == 1 { 0 } else { i };
+    let row = m.get(i);
+    let j = if row.is_some_and(|r| r.len() == 1) {
+        0
+    } else {
+        j
     };
-    let (mh, mw) = (m.len(), m.first().map_or(0, Vec::len));
-    (0..h as usize)
-        .map(|i| {
-            (0..w as usize)
-                .map(|j| {
-                    let ii = if mh == 1 { 0 } else { i };
-                    let jj = if mw == 1 { 0 } else { j };
-                    m.get(ii)
-                        .and_then(|row| row.get(jj))
-                        .cloned()
-                        .unwrap_or(Value::Err(ExcelError::NA))
-                })
-                .collect()
-        })
-        .collect()
+    row.and_then(|r| r.get(j))
+        .cloned()
+        .unwrap_or(Value::Err(ExcelError::NA))
 }
 
 /// Clear the plain-value cells of a spill (keeping styles) outside the

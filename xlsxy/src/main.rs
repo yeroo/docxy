@@ -8662,7 +8662,7 @@ mod tests {
         );
     }
 
-    /// A legacy CSE block over D1:D3 with a 1x1 result (nothing spills).
+    /// A legacy CSE block over D1:D3 with a 1x1 result (repeated over the block).
     fn cse_sum_block() -> Cell {
         Cell {
             value: CellValue::Number(6.0),

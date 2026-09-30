@@ -1972,8 +1972,9 @@ fn parse_cell_body(
         }
     };
 
-    // An array formula's `ref` records its spill extent (dynamic arrays and
-    // legacy CSE alike); the engine re-derives it on recalculation.
+    // An array formula's `ref` records its extent: a dynamic array's spill,
+    // which the engine re-derives on recalculation, or a legacy CSE block,
+    // which the engine refills.
     let spill = f_attrs.as_deref().and_then(|a| {
         if !is_array_f(a) {
             return None;
@@ -9918,9 +9919,55 @@ b",
         eng.recalc_all(&mut pkg.workbook);
         eng.set_cell(&mut pkg.workbook, (0, 1, 2), Cell::number(99.0));
         assert_eq!(val(&pkg, "C2"), CellValue::Number(99.0));
+        // Blocked: the anchor keeps its own value (never `#SPILL!`), and
+        // the rest of the block is cleared.
+        assert_eq!(val(&pkg, "C1"), CellValue::Number(1.0));
+        assert_eq!(val(&pkg, "C3"), CellValue::Empty);
+        // Still blocked on the next recalc: the typed value is not overwritten.
+        eng.set_cell(&mut pkg.workbook, (0, 0, 0), Cell::number(5.0));
+        assert_eq!(val(&pkg, "C2"), CellValue::Number(99.0));
+        assert_eq!(val(&pkg, "C1"), CellValue::Number(5.0));
         eng.set_cell(&mut pkg.workbook, (0, 1, 2), Cell::default());
-        assert_eq!(val(&pkg, "C2"), CellValue::Number(1.0));
-        assert_eq!(val(&pkg, "C3"), CellValue::Number(1.0));
+        assert_eq!(val(&pkg, "C2"), CellValue::Number(5.0));
+        assert_eq!(val(&pkg, "C3"), CellValue::Number(5.0));
+    }
+
+    #[test]
+    fn undoing_a_value_typed_into_a_cse_block_refills_it() {
+        // xlsxy's undo restores only the edited cell (`restore_cell`).
+        let mut pkg = cse_book("C1:C3", "A1");
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        let before = pkg.workbook.sheets[0].cell(1, 2).cloned().unwrap();
+        eng.set_cell(&mut pkg.workbook, (0, 1, 2), Cell::number(99.0));
+        eng.restore_cell(&mut pkg.workbook, (0, 1, 2), before);
+        for n in ["C1", "C2", "C3"] {
+            assert_eq!(val(&pkg, n), CellValue::Number(1.0), "{n}");
+        }
+        eng.set_cell(&mut pkg.workbook, (0, 0, 0), Cell::number(5.0));
+        for n in ["C1", "C2", "C3"] {
+            assert_eq!(val(&pkg, n), CellValue::Number(5.0), "{n}");
+        }
+        let ws = saved_sheet1(&pkg);
+        assert!(ws.contains(r#"<f t="array" ref="C1:C3">A1</f>"#), "{ws}");
+    }
+
+    #[test]
+    fn inserting_a_row_inside_a_cse_block_refills_the_grown_block() {
+        let mut pkg = cse_book("C1:C3", "A1");
+        crate::edit::insert_rows(&mut pkg.workbook, 0, 1, 1);
+        rebuild(&mut pkg);
+        for n in ["C1", "C2", "C3", "C4"] {
+            assert_eq!(val(&pkg, n), CellValue::Number(1.0), "{n}");
+        }
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 0, 0), Cell::number(5.0));
+        for n in ["C1", "C2", "C3", "C4"] {
+            assert_eq!(val(&pkg, n), CellValue::Number(5.0), "{n}");
+        }
+        let ws = saved_sheet1(&pkg);
+        assert!(ws.contains(r#"<f t="array" ref="C1:C4">A1</f>"#), "{ws}");
     }
 
     #[test]
@@ -10425,8 +10472,8 @@ b",
         assert!(ws.contains(SORT_ANCHOR), "{ws}");
     }
 
-    /// A CSE block over D1:D3 with a 1x1 result, so nothing spills and the
-    /// writer keeps whatever `ref` the cell holds.
+    /// A CSE block over D1:D3 with a 1x1 result, which the engine repeats
+    /// over the whole block (see `Engine::fill_cse`).
     const SUM_BLOCK: &str =
         r#"<c r="D1"><f t="array" ref="D1:D3">SUM(A1:A5*A1:A5)</f><v>165</v></c>"#;
 
@@ -10443,14 +10490,15 @@ b",
     #[test]
     fn an_array_cell_moved_without_set_cell_is_written_covering_its_anchor() {
         // Moved as a sort moves cells (Sheet::set_cell, no engine): the ref
-        // it carries names D1:D3, which the writer must not claim from D4.
-        // A one-cell block: no extent beyond its anchor to write from.
-        let anchor = r#"<c r="D1"><f t="array" ref="D1">SUM(A1:A5*A1:A5)</f><v>165</v></c>"#;
-        let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, anchor))).unwrap();
+        // it carries names D1:D3, which the writer must not claim from D6.
+        let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SUM_BLOCK))).unwrap();
         rebuild(&mut pkg);
         let sheet = &mut pkg.workbook.sheets[0];
-        let cell = sheet.cells.remove(&(0, 3)).unwrap();
-        assert_eq!(cell.spill, None);
+        let mut cell = sheet.cells.remove(&(0, 3)).unwrap();
+        // The block filled D1:D3; drop that extent so the writer has only the
+        // stale stored ref to go on (as for a block that could not fill).
+        assert_eq!(cell.spill, Some((3, 1)));
+        cell.spill = None;
         sheet.set_cell(5, 3, cell);
         let ws = saved_sheet1(&pkg);
         assert!(
@@ -10533,8 +10581,8 @@ b",
 
     #[test]
     fn insert_row_above_a_non_spilling_cse_block_shifts_its_stored_ref() {
-        // A 1x1 result: the writer keeps the stored ref (Excel refills the
-        // block), so the ref inside `f_attrs` itself must move.
+        // A 1x1 result the engine repeats over the block; the ref inside
+        // `f_attrs` itself must move with the insert.
         let anchor = r#"<c r="D1"><f t="array" ref="D1:D3">SUM(A1:A5*A1:A5)</f><v>165</v></c>"#;
         let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, anchor))).unwrap();
         crate::edit::insert_rows(&mut pkg.workbook, 0, 0, 1);

@@ -257,8 +257,8 @@ impl Cell {
     pub fn is_blank(&self) -> bool {
         self.value.is_empty() && self.formula.is_none()
     }
-    /// Is the formula an array one, evaluated by the dynamic-array engine: a
-    /// `t="array"` `<f>`, or a dynamic array ([`Cell::is_dynamic`]) whose
+    /// Is the formula an array one, evaluated as an array by the engine (a
+    /// spill, or a legacy CSE block's fill): a `t="array"` `<f>`, or a dynamic array ([`Cell::is_dynamic`]) whose
     /// `f_attrs` an edit dropped ([`crate::engine::Engine::set_cell`])?
     pub fn is_array_formula(&self) -> bool {
         self.f_attrs.as_deref().is_some_and(is_array_f) || self.is_dynamic()
