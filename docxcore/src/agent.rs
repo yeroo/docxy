@@ -175,13 +175,43 @@ pub fn insert(ed: &mut Editor, at: usize, text: &str) -> Result<(), String> {
 }
 
 /// Append `text` (newline-split into one or more paragraphs) after the
-/// document's last block.
+/// document's last block. When that block is a paragraph closing a section,
+/// the section mark stays on it and `text` lands in the final section, as
+/// with [`append_blocks`].
 pub fn append(ed: &mut Editor, text: &str) {
     // Paste `\ntext` at the document end: the leading newline starts a fresh
     // paragraph, so `text` lands as new paragraph(s) after the current last one.
+    let start = ed.doc.content_block_count();
     ed.anchor = None;
     ed.move_doc_end();
     ed.paste(&Clip::from_text(&format!("\n{text}")));
+    restore_last_section_mark(ed, start);
+}
+
+/// After an append pasted at the end of the last of the `start` content
+/// blocks, put back the section mark the paste moved onto the new last
+/// paragraph (#748): the old last paragraph still closes its section, and the
+/// appended content lands after it, in the final section.
+fn restore_last_section_mark(ed: &mut Editor, start: usize) {
+    let moved_to = ed.doc.content_block_count().saturating_sub(1);
+    if start == 0
+        || moved_to < start
+        || !matches!(ed.doc.body.get(start - 1), Some(Block::Paragraph(_)))
+    {
+        return;
+    }
+    let Some(Block::Paragraph(p)) = ed.doc.body.get_mut(moved_to) else {
+        return;
+    };
+    if p.props.section_break.is_none() && p.props.section_property_change.is_none() {
+        return;
+    }
+    let brk = p.props.section_break.take();
+    let change = p.props.section_property_change.take();
+    if let Some(Block::Paragraph(last)) = ed.doc.body.get_mut(start - 1) {
+        last.props.section_break = brk;
+        last.props.section_property_change = change;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -395,7 +425,9 @@ pub fn insert_blocks(ed: &mut Editor, at: usize, blocks: Vec<Block>) -> Result<(
 /// `"\n{text}"` trick does for plain text), then [`overwrite_blocks`] turns
 /// the opened slots into the real content. One [`Editor::paste`] call is made,
 /// so this is **one** undo checkpoint, matching `append`. A no-op (empty
-/// `blocks`) touches nothing and pushes no checkpoint.
+/// `blocks`) touches nothing and pushes no checkpoint. As with [`append`], a
+/// section mark on the last paragraph stays there and `blocks` land in the
+/// final section.
 pub fn append_blocks(ed: &mut Editor, blocks: Vec<Block>) {
     if blocks.is_empty() {
         return;
@@ -407,21 +439,8 @@ pub fn append_blocks(ed: &mut Editor, blocks: Vec<Block>) {
     ed.paste(&Clip {
         paras: vec![Vec::new(); count + 1],
     });
-    // The paste moved a section mark on the last paragraph to its last
-    // placeholder (#748), which `overwrite_blocks` replaces: put it back on
-    // the paragraph, so the blocks land after it, in the final section.
-    if start > 0
-        && let Some(Block::Paragraph(p)) = ed.doc.body.get_mut(start + count - 1)
-    {
-        let brk = p.props.section_break.take();
-        let change = p.props.section_property_change.take();
-        if (brk.is_some() || change.is_some())
-            && let Some(Block::Paragraph(last)) = ed.doc.body.get_mut(start - 1)
-        {
-            last.props.section_break = brk;
-            last.props.section_property_change = change;
-        }
-    }
+    // Before `overwrite_blocks` replaces the placeholder holding it.
+    restore_last_section_mark(ed, start);
     overwrite_blocks(ed, start, blocks);
 }
 
@@ -1116,8 +1135,15 @@ mod tests {
         assert!(!ed.undo());
     }
 
-    #[test]
-    fn append_blocks_after_a_section_closing_paragraph_keeps_the_section_748() {
+    /// Append after "A", which closes the first section (with a tracked sectPr
+    /// change) before an empty final one: the section and the saved sectPr
+    /// count survive, "A" keeps its mark, the `count` appended blocks have
+    /// none, and one undo restores the document (#748).
+    fn check_append_keeps_the_section_748(
+        what: &str,
+        count: usize,
+        append: impl FnOnce(&mut Editor),
+    ) {
         use crate::model::{PropertyChange, PropertyScope, PropertySnapshot, PropertyState};
         let brk = "<w:sectPr><w:type w:val=\"nextPage\"/></w:sectPr>".to_string();
         let change = PropertyChange {
@@ -1141,43 +1167,49 @@ mod tests {
                 .matches("<w:sectPr")
                 .count()
         };
+        let mut doc = doc_with(&["A"]);
+        if let Block::Paragraph(p) = &mut doc.body[0] {
+            p.props.section_break = Some(brk.clone());
+            p.props.section_property_change = Some(change.clone());
+        }
+        doc.body.push(Block::SectionProperties(SectionProperties {
+            raw: "<w:sectPr/>".into(),
+            property_change: None,
+        }));
+        let mut ed = Editor::new(doc);
+        let before = ed.doc.clone();
+        let sections = ed.sections().len();
+        let saved = sect_prs(&ed);
+        append(&mut ed);
+        assert_eq!(ed.doc.content_block_count(), 1 + count, "{what}");
+        assert_eq!(ed.sections().len(), sections, "{what}");
+        assert_eq!(sect_prs(&ed), saved, "{what}");
+        assert_eq!(mark(&ed, 0), (Some(brk), Some(change.raw)), "{what}");
+        for i in 1..=count {
+            assert_eq!(mark(&ed, i), (None, None), "{what}: block {i}");
+        }
+        assert!(ed.undo());
+        assert_eq!(ed.doc, before, "{what}");
+    }
+
+    #[test]
+    fn append_blocks_after_a_section_closing_paragraph_keeps_the_section_748() {
         let tables = "| a | b |\n| - | - |\n| 1 | 2 |";
         for md in ["## Heading", "one\n\ntwo", &format!("one\n\n{tables}")] {
-            // "A" closes the first section; the final one is empty.
-            let mut doc = doc_with(&["A"]);
-            if let Block::Paragraph(p) = &mut doc.body[0] {
-                p.props.section_break = Some(brk.clone());
-                p.props.section_property_change = Some(change.clone());
-            }
-            doc.body.push(Block::SectionProperties(SectionProperties {
-                raw: "<w:sectPr/>".into(),
-                property_change: None,
-            }));
-            let mut ed = Editor::new(doc);
-            let before = ed.doc.clone();
-            let sections = ed.sections().len();
-            let saved = sect_prs(&ed);
             let blocks = parse_markdown_blocks(md).unwrap();
-            let count = blocks.len();
             assert_eq!(
                 md.contains('|'),
                 blocks.iter().any(|b| matches!(b, Block::Table(_))),
                 "{md}"
             );
-            append_blocks(&mut ed, blocks);
-            assert_eq!(ed.doc.content_block_count(), 1 + count, "{md}");
-            assert_eq!(ed.sections().len(), sections, "{md}");
-            assert_eq!(sect_prs(&ed), saved, "{md}");
-            assert_eq!(
-                mark(&ed, 0),
-                (Some(brk.clone()), Some(change.raw.clone())),
-                "{md}"
-            );
-            for i in 1..=count {
-                assert_eq!(mark(&ed, i), (None, None), "{md}: block {i}");
-            }
-            assert!(ed.undo());
-            assert_eq!(ed.doc, before, "{md}");
+            check_append_keeps_the_section_748(md, blocks.len(), |ed| append_blocks(ed, blocks));
+        }
+    }
+
+    #[test]
+    fn append_after_a_section_closing_paragraph_keeps_the_section_748() {
+        for (text, count) in [("one", 1), ("one\ntwo", 2)] {
+            check_append_keeps_the_section_748(text, count, |ed| append(ed, text));
         }
     }
 
