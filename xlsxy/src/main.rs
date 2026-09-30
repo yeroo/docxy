@@ -2392,6 +2392,7 @@ impl App {
             const MAX_PASTE_CELLS: usize = 100_000;
             let mut changes = Vec::new();
             let mut truncated = false;
+            let ctx = entry_ctx(&self.pkg.workbook, now_serial());
             'outer: for (dr, line) in text.trim_end_matches('\n').split('\n').enumerate() {
                 for (dc, field) in line.trim_end_matches('\r').split('\t').enumerate() {
                     if changes.len() >= MAX_PASTE_CELLS {
@@ -2403,9 +2404,10 @@ impl App {
                         continue;
                     }
                     let style = self.sheet().cell(r, c).map(|x| x.style).unwrap_or(0);
-                    // A leading `'` pastes as quote-prefixed text.
-                    let mut cell =
-                        gridcore::entry::paste_cell(&mut self.pkg.workbook.styles, style, field);
+                    // Read as typed into the target (a leading `'` is
+                    // quote-prefixed text, a date brings its format).
+                    let styles = &mut self.pkg.workbook.styles;
+                    let mut cell = gridcore::entry::paste_cell(styles, style, field, &ctx);
                     // A pasted `=…` that doesn't parse would freeze as an
                     // unsupported cell; demote it to literal text instead
                     // (entry-time editing rejects such input outright).

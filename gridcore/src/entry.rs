@@ -323,35 +323,31 @@ pub fn typed_formula<'a>(
     (!is_text(&wb.styles.xf(style))).then_some(body)
 }
 
-/// A pasted field as a cell of style `style`: the value reading of
-/// [`crate::edit::parse_input`] (paste conversions are not the typed-entry
-/// rules yet), except for two typed-entry rules. A Text-formatted target
-/// takes the field exactly as it is; elsewhere a leading `'` is Excel's text
-/// marker — the rest is text and the xf gets `quotePrefix` — and a plain
-/// field clears a quote prefix it lands on. So a copied `'007` pastes back as
-/// the text `007`, and `''abc` (how a text beginning with `'` is copied) as
-/// `'abc`. An empty field clears the cell.
+/// A pasted field as a cell of style `style`, read as Excel re-reads pasted
+/// text: by the typed-entry rules ([`parse_entry`]) under the target's
+/// format. A Text-formatted target takes the field exactly as it is;
+/// elsewhere a leading `'` is Excel's text marker (the rest is text and the
+/// xf gets `quotePrefix`) and a plain field clears a quote prefix it lands
+/// on; a date, currency or thousands shape brings its number format, and a
+/// percent target divides a plain number as typing does. So a copied `'007`
+/// pastes back as the text `007`, and `''abc` (how a text beginning with `'`
+/// is copied) as `'abc`. An empty field clears the cell. Paste never turns on
+/// Wrap Text. A field over the cell limit is kept as text, unread.
 ///
-/// A TSV clipboard carries no formats, so the apostrophe rule is only exact
-/// between cells of the same kind: a Text cell's `'abc` is copied bare and,
-/// pasted into a non-Text cell, reads as the marker (text `abc`, quote
-/// prefix); an escaped `''abc` pasted into a Text cell stays `''abc`.
-pub fn paste_cell(styles: &mut Styles, style: u32, text: &str) -> Cell {
-    let (cell, quote_prefix) = if text.is_empty() {
-        (Cell::default(), false)
-    } else if is_text(&styles.xf(style)) {
-        (Cell::text(text), false)
-    } else {
-        match text.strip_prefix('\'') {
-            Some(rest) => (Cell::text(rest), true),
-            None => (crate::edit::parse_input(text), false),
-        }
-    };
-    let e = Entry {
-        cell,
-        format: None,
-        quote_prefix,
-        wrap: false,
+/// A TSV clipboard carries no formats, so for text from outside the apostrophe
+/// rule is only exact between cells of the same kind: a Text cell's `'abc`
+/// is copied bare and, pasted into a non-Text cell, reads as the marker (text
+/// `abc`, quote prefix); an escaped `''abc` pasted into a Text cell stays
+/// `''abc`. A host's own copy carries the cells, and pastes those instead.
+pub fn paste_cell(styles: &mut Styles, style: u32, text: &str, ctx: &EntryCtx) -> Cell {
+    let e = match parse_entry(text, &styles.xf(style), ctx) {
+        Ok(e) => Entry { wrap: false, ..e },
+        Err(EntryError::TooLong { .. }) => Entry {
+            cell: Cell::text(text),
+            format: None,
+            quote_prefix: false,
+            wrap: false,
+        },
     };
     let style = entry_style(styles, style, &e);
     Cell { style, ..e.cell }
@@ -1292,7 +1288,7 @@ mod tests {
         let typed = parse_entry(&seed, &Xf::default(), &ctx()).unwrap();
         assert_eq!(typed.cell.value, CellValue::Text("'abc".into()));
         assert_eq!(
-            paste_cell(&mut styles, general, &seed).value,
+            paste_cell(&mut styles, general, &seed, &ctx()).value,
             CellValue::Text("'abc".into())
         );
         // A Text cell needs no escape, and a paste into one is as typed.
@@ -1302,11 +1298,11 @@ mod tests {
         };
         let seed = input_text_styled(&in_text, &styles.xf(text_fmt));
         assert_eq!(seed, "'abc");
-        let pasted = paste_cell(&mut styles, text_fmt, &seed);
+        let pasted = paste_cell(&mut styles, text_fmt, &seed, &ctx());
         assert_eq!(pasted.value, CellValue::Text("'abc".into()));
         assert!(!styles.xf(pasted.style).quote_prefix);
         assert_eq!(
-            paste_cell(&mut styles, text_fmt, "007").value,
+            paste_cell(&mut styles, text_fmt, "007", &ctx()).value,
             CellValue::Text("007".into())
         );
     }
@@ -1333,12 +1329,13 @@ mod tests {
         assert_eq!(again.cell.value, CellValue::Text("007".into()));
         assert_eq!(copy_field(&cell, &xf, "007".into()), "007");
         assert_eq!(
-            paste_cell(&mut styles, text_q, "007").value,
+            paste_cell(&mut styles, text_q, "007", &ctx()).value,
             CellValue::Text("007".into())
         );
         // An empty field clears, in a Text cell as anywhere.
-        assert_eq!(paste_cell(&mut styles, text_q, "").value, CellValue::Empty);
-        assert_eq!(paste_cell(&mut styles, general, "").value, CellValue::Empty);
+        let paste = |styles: &mut Styles, style, text| paste_cell(styles, style, text, &ctx());
+        assert_eq!(paste(&mut styles, text_q, "").value, CellValue::Empty);
+        assert_eq!(paste(&mut styles, general, "").value, CellValue::Empty);
     }
 
     #[test]
@@ -1365,7 +1362,9 @@ mod tests {
 
     #[test]
     fn cross_format_paste_is_lossy_for_apostrophes() {
-        // Pinned, not endorsed: a TSV carries no format (a follow-up).
+        // The rule for text from OUTSIDE the host: a TSV carries no format,
+        // so the field is read as typed into the target, as Excel reads
+        // pasted text. (A host's own copy pastes the cells themselves.)
         let mut styles = Styles::default();
         let general = styles.intern(Xf::default());
         let text = styles.intern(Xf {
@@ -1380,14 +1379,14 @@ mod tests {
         let field = copy_field(&from_text, &styles.xf(text), "'abc".into());
         assert_eq!(field, "'abc");
         assert_eq!(
-            paste_cell(&mut styles, general, &field).value,
+            paste_cell(&mut styles, general, &field, &ctx()).value,
             CellValue::Text("abc".into())
         );
         let from_general = Cell::text("'abc");
         let field = copy_field(&from_general, &Xf::default(), "'abc".into());
         assert_eq!(field, "''abc");
         assert_eq!(
-            paste_cell(&mut styles, text, &field).value,
+            paste_cell(&mut styles, text, &field, &ctx()).value,
             CellValue::Text("''abc".into())
         );
     }
@@ -1447,18 +1446,76 @@ mod tests {
             bold: true,
             ..Xf::default()
         });
-        let c = paste_cell(&mut styles, bold, "'007");
+        let c = paste_cell(&mut styles, bold, "'007", &ctx());
         assert_eq!(c.value, CellValue::Text("007".into()));
         let xf = styles.xf(c.style);
         assert!(xf.quote_prefix && xf.bold);
-        // A plain field keeps paste's value reading and clears the prefix.
-        let n = paste_cell(&mut styles, c.style, "007");
+        // A plain field is read as typed and clears the prefix.
+        let n = paste_cell(&mut styles, c.style, "007", &ctx());
         assert_eq!(n.value, CellValue::Number(7.0));
         assert_eq!(n.style, bold);
+    }
+
+    #[test]
+    fn pasted_text_is_read_like_typed_entry() {
+        let mut styles = Styles::default();
+        let general = styles.intern(Xf::default());
+        let mut paste = |style: u32, text: &str| {
+            let c = paste_cell(&mut styles, style, text, &ctx());
+            (c.value.clone(), styles.xf(c.style).code, c)
+        };
+        // Recognised shapes bring the format typing would give them (this
+        // was text while paste read values only).
+        let (v, code, _) = paste(general, "1/15/2024");
         assert_eq!(
-            paste_cell(&mut styles, 0, "1/15/2024").value,
-            CellValue::Text("1/15/2024".into())
+            (v, code.as_deref()),
+            (CellValue::Number(45_306.0), Some("m/d/yyyy"))
         );
+        let (v, code, _) = paste(general, "$5");
+        assert_eq!(v, CellValue::Number(5.0));
+        assert!(code.is_some_and(|c| c.contains('$')));
+        let (v, code, _) = paste(general, "1,234");
+        assert_eq!(
+            (v, code.as_deref()),
+            (CellValue::Number(1234.0), Some("#,##0"))
+        );
+        let (v, code, _) = paste(general, "50%");
+        assert_eq!((v, code.as_deref()), (CellValue::Number(0.5), Some("0%")));
+        // A yearless date takes the clock's year.
+        let (v, _, _) = paste(general, "3/4");
+        assert!(matches!(v, CellValue::Number(n) if n > 45_000.0), "{v:?}");
+        // A formula stays a formula (hosts demote one that does not parse).
+        let (_, _, c) = paste(general, "=A1+1");
+        assert_eq!(c.formula.as_deref(), Some("A1+1"));
+        let (_, _, c) = paste(general, "-B2");
+        assert_eq!(c.formula.as_deref(), Some("-B2"));
+        // Paste never turns on Wrap Text.
+        let (_, _, c) = paste(general, "a\nb");
+        assert!(!styles.xf(c.style).wrap);
+        let pct = styles.intern(Xf {
+            numfmt: NumFmt::Percent { decimals: 0 },
+            code: Some("0%".into()),
+            ..Xf::default()
+        });
+        let text_fmt = styles.intern(Xf {
+            numfmt: NumFmt::Text,
+            code: Some("@".into()),
+            ..Xf::default()
+        });
+        let mut paste = |style: u32, text: &str| {
+            let c = paste_cell(&mut styles, style, text, &ctx());
+            (c.value.clone(), styles.xf(c.style).code)
+        };
+        // A percent target divides a plain number as typing does.
+        assert_eq!(paste(pct, "50").0, CellValue::Number(0.5));
+        // A Text target keeps the field as it is.
+        assert_eq!(
+            paste(text_fmt, "1/15/2024"),
+            (CellValue::Text("1/15/2024".into()), Some("@".into()))
+        );
+        // Over the cell limit: kept as text, unread, on the target's style.
+        let long = "1".repeat(MAX_CELL_CHARS + 1);
+        assert_eq!(paste(general, &long), (CellValue::Text(long.clone()), None));
     }
 
     #[test]

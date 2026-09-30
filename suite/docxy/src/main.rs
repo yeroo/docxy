@@ -9536,10 +9536,11 @@ impl Docxy {
             let Some(v) = self.active_sheet_mut() else {
                 return;
             };
-            // A leading `'` pastes as quote-prefixed text (paste_cell), each
-            // field on the style its target cell has, as xlsxy's and
-            // gridwasm's pastes do.
+            // Each field is read as typed into its target cell (paste_cell:
+            // a leading `'` is quote-prefixed text, a date brings its
+            // format), as xlsxy's and gridwasm's pastes do.
             let (br, bc, s) = (v.sel.0, v.sel.1, v.active);
+            let ctx = gridcore::entry::entry_ctx(&v.pkg.workbook, v.engine.clock);
             let wb = &mut v.pkg.workbook;
             let mut rows = Vec::new();
             for (dr, line) in text
@@ -9553,7 +9554,7 @@ impl Docxy {
                     let style = wb.sheets[s]
                         .cell(br + dr as u32, bc + dc as u32)
                         .map_or(0, |cl| cl.style);
-                    row.push(gridcore::entry::paste_cell(&mut wb.styles, style, f));
+                    row.push(gridcore::entry::paste_cell(&mut wb.styles, style, f, &ctx));
                 }
                 rows.push(row);
             }

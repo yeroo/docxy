@@ -260,6 +260,7 @@ impl Session {
                     const MAX_PASTE_CELLS: usize = 100_000;
                     let mut changes = Vec::new();
                     let mut truncated = false;
+                    let ctx = gridcore::entry::entry_ctx(&self.pkg.workbook, self.engine.clock);
                     // Excel-on-Windows clipboards are CRLF and end with a
                     // trailing newline; strip both so a naive split doesn't
                     // (a) leave a stray \r on the last field of every row and
@@ -279,10 +280,11 @@ impl Session {
                                 .cell(r, c)
                                 .map(|x| x.style)
                                 .unwrap_or(0);
-                            // A leading `'` pastes as quote-prefixed text
-                            // (what copy writes for one).
+                            // Read as typed into the target: a leading `'`
+                            // is quote-prefixed text (what copy writes for
+                            // one), a date brings its format.
                             let styles = &mut self.pkg.workbook.styles;
-                            let mut cell = gridcore::entry::paste_cell(styles, style, text);
+                            let mut cell = gridcore::entry::paste_cell(styles, style, text, &ctx);
                             // A pasted `=…` that doesn't parse would freeze as
                             // an unsupported cell (never evaluates, renders
                             // blank); demote it to literal text instead, same
@@ -2929,6 +2931,20 @@ mod tests {
         s.dispatch("select\t6\t1");
         let v = s.view_json(None);
         assert!(v.contains("\"src\":\"\""), "paste is one undo group: {v}");
+    }
+
+    #[test]
+    fn pasted_text_is_read_like_typed_entry() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("paste\t8\t0\t1/15/2024\t$5\t'007");
+        let wb = &s.pkg.workbook;
+        let at = |c: u32| wb.sheets[0].cell(8, c).cloned().unwrap();
+        let date = at(0);
+        assert_eq!(date.value, CellValue::Number(45_306.0));
+        assert_eq!(wb.styles.xf(date.style).code.as_deref(), Some("m/d/yyyy"));
+        assert_eq!(at(1).value, CellValue::Number(5.0));
+        assert_eq!(at(2).value, CellValue::Text("007".into()));
+        assert!(wb.styles.xf(at(2).style).quote_prefix);
     }
 
     #[test]

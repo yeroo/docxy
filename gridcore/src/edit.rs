@@ -22,12 +22,12 @@ use crate::sheet::{
     with_ref,
 };
 
-/// Read pasted text as a value: formulas, plain numbers (incl. percent),
+/// Read text as a bare value: formulas, plain numbers (incl. percent),
 /// booleans, error constants, text. Deliberately narrower than typed entry
 /// ([`crate::entry::entry_cell`]), which also recognises currency, dates and
-/// the like and gives them a number format: without that format a pasted date
-/// would show as its bare serial, so paste keeps these shapes as text until it
-/// goes through the entry rules too.
+/// the like and gives them a number format: this reading has no format to
+/// give, so a date would show as its bare serial, and it keeps those shapes
+/// as text. (Paste reads by the entry rules: [`crate::entry::paste_cell`].)
 pub fn parse_input(text: &str) -> Cell {
     if let Some(body) = text.strip_prefix('=') {
         if !body.is_empty() {
@@ -2622,8 +2622,8 @@ mod tests {
     }
 
     #[test]
-    fn pasted_text_keeps_shapes_that_would_need_a_format() {
-        // Paste reads values only: a date or currency without its number
+    fn parse_input_keeps_shapes_that_would_need_a_format() {
+        // A bare value reading: a date or currency without its number
         // format would show as a bare number, so those stay text here.
         for text in ["1/15/2024", "$5", "1,234", "-L1", "9:30 PM"] {
             assert_eq!(parse_input(text), Cell::text(text), "{text}");
