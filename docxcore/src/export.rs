@@ -24,6 +24,7 @@ use crate::field::{FieldEvent, field_events};
 use crate::load::{Relationships, xml_attr_value};
 use crate::model::*;
 use crate::package::{HeaderVariant, Package, SectionParts, section_header_parts};
+use crate::sect::LnRestart;
 use crate::styles::{PprFlag, StyleSheet};
 
 #[derive(Debug, Clone)]
@@ -199,6 +200,31 @@ struct SectionLayout {
     num_start: Option<u32>,
     borders: PageBorders,
     start: SectStart,
+    line_numbers: Option<LineNumbers>,
+}
+
+/// `w:lnNumType`, resolved to what the layout draws.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LineNumbers {
+    count_by: u32,
+    /// Word writes the dialog's "Start at" minus one ([MS-OI29500]; LibreOffice
+    /// adds one on import too), so the first line is numbered `start + 1`.
+    start: u32,
+    /// From the number's right edge to the text column, in points.
+    distance: f32,
+    restart: LnRestart,
+}
+
+impl LineNumbers {
+    fn from_setup(ln: crate::sect::LineNumbering) -> LineNumbers {
+        LineNumbers {
+            count_by: ln.count_by.max(1) as u32,
+            start: ln.start.unwrap_or(0).max(0) as u32,
+            // Absent or zero is Word's "Auto": a quarter inch.
+            distance: twips(ln.distance.filter(|&d| d > 0).unwrap_or(360) as f32),
+            restart: ln.restart,
+        }
+    }
 }
 
 /// The first start tag `<tag …>` in `xml` (not a longer tag name sharing the
@@ -361,6 +387,9 @@ impl SectionLayout {
             num_start,
             borders: parse_page_borders(sect),
             start,
+            line_numbers: crate::sect::SectionSetup::parse(sect)
+                .line_numbers
+                .map(LineNumbers::from_setup),
         }
     }
 
@@ -610,8 +639,18 @@ struct Page {
     values: [String; 3],
 }
 
+/// What a flow knows about the paragraph whose lines come next.
+#[derive(Debug, Clone, Copy)]
+struct ParaInfo {
+    /// Its lines are line-numbered (`w:suppressLineNumbers` is off; tables
+    /// are never numbered).
+    numbered: bool,
+}
+
 /// Where laid-out lines go: the paginated body, or a header/footer band.
 trait Flow {
+    /// A paragraph (or a flattened table) starts.
+    fn begin_paragraph(&mut self, _info: ParaInfo) {}
     /// Advance to the next line of height `lh`; returns the column's left x,
     /// the column's width and the line's baseline.
     fn next_line(&mut self, lh: f32) -> (f32, f32, f32);
@@ -686,6 +725,13 @@ fn emit_paragraph(flow: &mut dyn Flow, p: &Paragraph, opts: &PdfOptions) {
     if page_break_before(p, &opts.styles) && !flow.at_top() {
         flow.hard_break(BreakKind::Page);
     }
+    flow.begin_paragraph(ParaInfo {
+        numbered: !opts.styles.effective_ppr_flag(
+            p.props.style_id.as_deref(),
+            &p.props,
+            PprFlag::SuppressLineNumbers,
+        ),
+    });
     let size = heading_size(p, opts.base_font_size);
     let mut segs = flatten_segments(p, p.props.heading_level.is_some(), &opts.styles);
     if p.props.num_id.is_some() {
@@ -703,6 +749,8 @@ fn emit_paragraph(flow: &mut dyn Flow, p: &Paragraph, opts: &PdfOptions) {
 }
 
 fn emit_table(flow: &mut dyn Flow, t: &Table, opts: &PdfOptions) {
+    // Word doesn't number table lines.
+    flow.begin_paragraph(ParaInfo { numbered: false });
     // Phase 0: flatten each row to a text line (no borders).
     for row in &t.rows {
         let cols: Vec<String> = row
@@ -874,6 +922,18 @@ struct Pager<'a> {
     next_number: u32,
     region: Region,
     y: f32,
+    /// The current paragraph's ordinal, and whether its lines are numbered.
+    para: u32,
+    numbered: bool,
+    line_count: LineCount,
+}
+
+/// The line-number counter and where it last counted, for `w:restart`.
+#[derive(Default)]
+struct LineCount {
+    count: u32,
+    /// The page index and section of the last counted line.
+    last: Option<(usize, usize)>,
 }
 
 impl<'a> Pager<'a> {
@@ -898,6 +958,9 @@ impl<'a> Pager<'a> {
                 placed: false,
             },
             y: 0.0,
+            para: 0,
+            numbered: false,
+            line_count: LineCount::default(),
         };
         for (i, (range, _)) in sections.iter().enumerate() {
             pager.start_section(i);
@@ -1080,6 +1143,30 @@ impl<'a> Pager<'a> {
         }
     }
 
+    /// Count a body line just placed for line numbering (`w:lnNumType`): the
+    /// number to print left of it, if any, and its distance from the text.
+    fn count_line(&mut self) -> Option<(u32, f32)> {
+        let sect = self.region.sect;
+        let ln = self.sects[sect].line_numbers?;
+        if !self.numbered {
+            return None;
+        }
+        let page = self.pages.len() - 1;
+        let restart = match (self.line_count.last, ln.restart) {
+            (None, _) => true,
+            (Some((p, _)), LnRestart::NewPage) => p != page,
+            (Some((_, s)), LnRestart::NewSection) => s != sect,
+            (Some(_), LnRestart::Continuous) => false,
+        };
+        if restart {
+            self.line_count.count = ln.start;
+        }
+        self.line_count.count += 1;
+        self.line_count.last = Some((page, sect));
+        let n = self.line_count.count;
+        n.is_multiple_of(ln.count_by).then_some((n, ln.distance))
+    }
+
     fn mark_low(&mut self) {
         self.region.low = self.region.low.min(self.y);
     }
@@ -1190,6 +1277,10 @@ fn border_rules(
 }
 
 impl Flow for Pager<'_> {
+    fn begin_paragraph(&mut self, info: ParaInfo) {
+        self.para += 1;
+        self.numbered = info.numbered;
+    }
     fn next_line(&mut self, lh: f32) -> (f32, f32, f32) {
         self.y -= lh;
         // Move on until the line fits: a continuous column set that starts low
@@ -1209,8 +1300,25 @@ impl Flow for Pager<'_> {
         }
         self.mark_low();
         let (x, w) = self.region.xs[self.region.col];
+        let number = self.count_line();
         let page = self.pages.last_mut().expect("a page exists");
         page.min_base = page.min_base.min(self.y);
+        if let Some((n, distance)) = number {
+            let text = n.to_string();
+            let size = self.opts.base_font_size;
+            page.frags.push(Frag {
+                x: x - distance - text.len() as f32 * 0.6 * size,
+                y: self.y,
+                text,
+                size,
+                font: 0,
+                color: (0.0, 0.0, 0.0),
+                underline: false,
+                strike: false,
+                field: None,
+                sect: None,
+            });
+        }
         // Count the column set, and its section, only once a line lands, so a
         // continuous section that overflows at once doesn't claim this page.
         if !self.region.placed {
@@ -2891,5 +2999,193 @@ mod tests {
         assert_eq!(pages.len(), 2);
         assert!(pages[1].has("count="));
         assert!(pages[1].exact("1"), "{:?}", pages[1].texts);
+    }
+
+    // ---- line numbers (#737) ----
+
+    fn ln_sect(attrs: &str, extra: &str) -> String {
+        format!(r#"<w:sectPr><w:lnNumType {attrs}/>{extra}</w:sectPr>"#)
+    }
+
+    /// Paragraph texts `prefix0..prefixN`.
+    fn paras(prefix: &str, n: usize) -> Vec<Block> {
+        (0..n).map(|i| text_para(&format!("{prefix}{i}"))).collect()
+    }
+
+    fn with_raw(text: &str, raw: &str) -> Block {
+        Block::Paragraph(Paragraph {
+            props: ParProps {
+                raw_props: vec![raw.to_string()],
+                ..ParProps::default()
+            },
+            content: vec![run(text, RunProps::default())],
+        })
+    }
+
+    /// The line numbers drawn on a page, as (number, x, y), in drawing order.
+    fn numbers(page: &PdfPage) -> Vec<(u32, f32, f32)> {
+        page.texts
+            .iter()
+            .filter_map(|(x, y, t)| Some((t.parse().ok()?, *x, *y)))
+            .collect()
+    }
+
+    #[test]
+    fn line_numbers_count_by_start_and_restart() {
+        let mut blocks = paras("t", 3);
+        blocks.push(trailing(&ln_sect(r#"w:countBy="1""#, "")));
+        let pages = pages_of(&doc(blocks), &PdfOptions::default());
+        let nums = numbers(&pages[0]);
+        assert_eq!(
+            nums.iter().map(|n| n.0).collect::<Vec<_>>(),
+            [1, 2, 3],
+            "{:?}",
+            pages[0].texts
+        );
+        for (i, &(n, x, y)) in nums.iter().enumerate() {
+            let (tx, ty) = pages[0].at(&format!("t{i}"));
+            assert!(close(y, ty), "on the line's baseline");
+            // Right edge a quarter inch (Auto) left of the text column.
+            let right = x + n.to_string().len() as f32 * 6.6;
+            assert!(close(right, tx - 18.0), "{right} vs {tx}");
+        }
+
+        // countBy 5, start 4 (Word's "Start at: 5"), a set distance.
+        let mut blocks = paras("t", 12);
+        blocks.push(trailing(&ln_sect(
+            r#"w:countBy="5" w:start="4" w:distance="720""#,
+            "",
+        )));
+        let pages = pages_of(&doc(blocks), &PdfOptions::default());
+        let nums = numbers(&pages[0]);
+        // Lines are numbered 5..=16: 5 on t0, 10 on t5, 15 on t10.
+        assert_eq!(nums.iter().map(|n| n.0).collect::<Vec<_>>(), [5, 10, 15]);
+        assert!(close(nums[1].2, pages[0].at("t5").1));
+        assert!(close(nums[0].1 + 6.6, 72.0 - 36.0));
+
+        // newPage (the default) restarts on each page; continuous never does.
+        let two_pages = |attrs: &str| {
+            doc(vec![
+                text_para("a"),
+                with_raw("b", "<w:pageBreakBefore/>"),
+                trailing(&ln_sect(attrs, "")),
+            ])
+        };
+        let pages = pages_of(&two_pages(""), &PdfOptions::default());
+        assert_eq!(numbers(&pages[1])[0].0, 1);
+        let pages = pages_of(
+            &two_pages(r#"w:restart="continuous""#),
+            &PdfOptions::default(),
+        );
+        assert_eq!(numbers(&pages[1])[0].0, 2);
+    }
+
+    #[test]
+    fn line_numbers_restart_new_section_continuous_break() {
+        let sect = ln_sect(r#"w:restart="newSection""#, "");
+        let cont = ln_sect(
+            r#"w:restart="newSection""#,
+            r#"<w:type w:val="continuous"/>"#,
+        );
+        let d = doc(vec![
+            text_para("a0"),
+            sect_para("a1", &sect),
+            text_para("b0"),
+            trailing(&cont),
+        ]);
+        let pages = pages_of(&d, &PdfOptions::default());
+        assert_eq!(pages.len(), 1);
+        let nums = numbers(&pages[0]);
+        assert_eq!(nums.iter().map(|n| n.0).collect::<Vec<_>>(), [1, 2, 1]);
+        assert!(close(nums[2].2, pages[0].at("b0").1));
+
+        // A new page doesn't restart newSection numbering.
+        let d = doc(vec![
+            text_para("a0"),
+            with_raw("a1", "<w:pageBreakBefore/>"),
+            trailing(&sect),
+        ]);
+        let pages = pages_of(&d, &PdfOptions::default());
+        assert_eq!(numbers(&pages[1])[0].0, 2);
+    }
+
+    #[test]
+    fn suppressed_paragraphs_and_tables_are_not_numbered_or_counted() {
+        let ss = crate::styles::parse_styles_xml(
+            r#"<w:styles><w:style w:type="paragraph" w:styleId="NoNum"><w:pPr><w:suppressLineNumbers/></w:pPr></w:style></w:styles>"#,
+        );
+        let styled = Block::Paragraph(Paragraph {
+            props: ParProps {
+                style_id: Some("NoNum".to_string()),
+                ..ParProps::default()
+            },
+            content: vec![run("styled", RunProps::default())],
+        });
+        let table = Block::Table(Table {
+            rows: vec![Row {
+                cells: vec![Cell {
+                    blocks: vec![text_para("cell")],
+                    ..Cell::default()
+                }],
+                ..Row::default()
+            }],
+            ..Table::default()
+        });
+        let d = doc(vec![
+            text_para("one"),
+            with_raw("direct", "<w:suppressLineNumbers/>"),
+            styled,
+            table,
+            text_para("two"),
+            trailing(&ln_sect("", "")),
+        ]);
+        let opts = PdfOptions {
+            styles: Rc::new(ss),
+            ..PdfOptions::default()
+        };
+        let pages = pages_of(&d, &opts);
+        let nums = numbers(&pages[0]);
+        assert_eq!(nums.iter().map(|n| n.0).collect::<Vec<_>>(), [1, 2]);
+        assert!(close(nums[1].2, pages[0].at("two").1));
+    }
+
+    #[test]
+    fn no_line_numbers_without_ln_num_type_or_in_headers() {
+        let mut blocks = paras("t", 3);
+        blocks.push(trailing(BLANK_SECT));
+        let pages = pages_of(&doc(blocks), &PdfOptions::default());
+        assert!(numbers(&pages[0]).is_empty());
+
+        let opts = with_parts(&[("rH", "header1.xml", vec![text_para("HDR")])]);
+        let d = doc(vec![
+            text_para("body"),
+            trailing(&ln_sect(
+                "",
+                r#"<w:headerReference w:type="default" r:id="rH"/>"#,
+            )),
+        ]);
+        let pages = pages_of(&d, &opts);
+        assert!(pages[0].has("HDR"));
+        let nums = numbers(&pages[0]);
+        assert_eq!(nums.len(), 1, "only the body line: {:?}", pages[0].texts);
+        assert!(close(nums[0].2, pages[0].at("body").1));
+    }
+
+    #[test]
+    fn line_numbers_per_column() {
+        let d = doc(vec![
+            para(vec![
+                run("left", RunProps::default()),
+                col_break(),
+                run("right", RunProps::default()),
+            ]),
+            trailing(&ln_sect("", r#"<w:cols w:num="2" w:space="720"/>"#)),
+        ]);
+        let pages = pages_of(&d, &PdfOptions::default());
+        let nums = numbers(&pages[0]);
+        assert_eq!(nums.iter().map(|n| n.0).collect::<Vec<_>>(), [1, 2]);
+        let (rx, ry) = pages[0].at("right");
+        assert!(close(rx, 324.0));
+        assert!(close(nums[1].1 + 6.6, 324.0 - 18.0) && close(nums[1].2, ry));
     }
 }
