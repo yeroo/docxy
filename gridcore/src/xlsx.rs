@@ -289,6 +289,8 @@ pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
 
         let mut sheet = parse_worksheet(&xml, &shared, &hlink_targets);
         sheet.name = name;
+        sheet.auto_filter =
+            sheet_auto_filter_span(&xml).and_then(|(s, e)| auto_filter_position(&xml[s..e]));
         let sheet_idx = sheets.len();
         if let Some(af) = crate::filter::parse_auto_filter(&xml) {
             auto_filters.push((sheet_idx, af));
@@ -830,11 +832,11 @@ fn parse_workbook_xml(
             Event::End => {
                 if local(p.name()) == "definedName" {
                     if let Some(n) = cur_name.take() {
-                        // Excel's built-in names (print area and titles) load
-                        // like any other so they follow structural edits.
-                        // Not `_FilterDatabase`: it mirrors the sheet's
-                        // `<autoFilter ref>`, which nothing moves yet.
-                        if !n.0.eq_ignore_ascii_case("_xlnm._FilterDatabase") && !n.2.is_empty() {
+                        // Excel's built-in names (print area and titles, and
+                        // `_FilterDatabase`, which backs the sheet's
+                        // `<autoFilter>`) load like any other so they follow
+                        // structural edits.
+                        if !n.2.is_empty() {
                             names.push(n);
                         }
                     }
@@ -2267,13 +2269,20 @@ impl SheetPackage {
         let refers = |formula: &str| names.iter().any(|s| formula_refers_to_sheet(formula, s));
         if let Some(p) = self.parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
+            // A `localSheetId` that names no model sheet was loaded as a
+            // global name; that model entry goes with its element too, or the
+            // save would write it back (as a plain name) for having none.
+            let sheet_count = self.workbook.sheets.len();
+            let aligned = xml.matches("<sheet ").count() == sheet_count;
+            let demoted = |s: Option<usize>| s.is_some_and(|k| !aligned || k >= sheet_count);
             let (xml, gone) = remove_macro_names(&xml, &refers);
             p.1 = xml.into_bytes();
             self.workbook.defined_names.retain(|d| {
                 !refers(&d.formula)
-                    && !gone
-                        .iter()
-                        .any(|(n, s)| *s == d.scope && n.eq_ignore_ascii_case(&d.name))
+                    && !gone.iter().any(|(n, s)| {
+                        (*s == d.scope || (d.scope.is_none() && demoted(*s)))
+                            && n.eq_ignore_ascii_case(&d.name)
+                    })
             });
         }
         for &i in doomed.iter().rev() {
@@ -3287,7 +3296,131 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
     // Page breaks (manual and automatic): rewritten only where a structural
     // edit moved them.
     let out = set_page_breaks(out, "rowBreaks", &sheet.row_breaks);
-    set_page_breaks(out, "colBreaks", &sheet.col_breaks)
+    let out = set_page_breaks(out, "colBreaks", &sheet.col_breaks);
+    // The sheet's autoFilter: rewritten only where a structural edit moved it.
+    set_auto_filter(out, sheet.auto_filter.as_ref())
+}
+
+/// The span of the sheet's own `<autoFilter>`: a top-level one, not a custom
+/// view's.
+fn sheet_auto_filter_span(xml: &str) -> Option<(usize, usize)> {
+    // Most sheets have no filter: don't walk the part to learn that.
+    if !xml.contains("autoFilter") {
+        return None;
+    }
+    worksheet_child_span(xml, "autoFilter")
+}
+
+/// The position an `<autoFilter>` element (the whole element, from its start
+/// tag) holds; `None` when its `ref` is not a range.
+fn auto_filter_position(element: &str) -> Option<crate::sheet::SheetAutoFilter> {
+    let range = crate::sheet::parse_range_name(attr_at(element, 0, "ref")?)?;
+    let columns = element_children(element)
+        .into_iter()
+        .filter(|(name, _, _)| name == "filterColumn")
+        // `colId` defaults to 0 as the criteria reader reads it.
+        .map(|(_, s, _)| {
+            Some(
+                range.1
+                    + attr_at(element, s, "colId")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0),
+            )
+        })
+        .collect();
+    Some(crate::sheet::SheetAutoFilter { range, columns })
+}
+
+/// The direct children of the element that `xml` starts with, as (local
+/// name, start, end), found with the loader's parser.
+fn element_children(xml: &str) -> Vec<(String, usize, usize)> {
+    let mut out = Vec::new();
+    let mut p = XmlParser::new(xml);
+    let mut depth = 0usize;
+    let mut open: Option<(String, usize)> = None;
+    loop {
+        match p.next() {
+            Event::Start => {
+                depth += 1;
+                if depth == 2 {
+                    open = Some((local(p.name()).to_string(), p.start_pos()));
+                }
+            }
+            Event::End => {
+                if depth == 2 {
+                    if let Some((name, start)) = open.take() {
+                        out.push((name, start, p.pos()));
+                    }
+                }
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    break;
+                }
+            }
+            Event::Eof => break,
+            Event::Text => {}
+        }
+    }
+    out
+}
+
+/// Sync the sheet's `<autoFilter>` with the model. It is left byte-for-byte
+/// alone while it holds the model's position, dropped once a delete took its
+/// whole range, and otherwise rewritten in place: a new `ref`, each
+/// `<filterColumn>` renumbered to the column it filtered (or dropped with that
+/// column), everything else kept. Its nested `<sortState>` goes with a
+/// rewrite, since it would still name the old cells. Never created: the
+/// editor adds no filters, and a restored sheet's fresh part has none to move.
+/// One whose `ref` doesn't read as a range is left as it is.
+fn set_auto_filter(mut xml: String, model: Option<&crate::sheet::SheetAutoFilter>) -> String {
+    let Some((start, end)) = sheet_auto_filter_span(&xml) else {
+        return xml;
+    };
+    let element = &xml[start..end];
+    let Some(held) = auto_filter_position(element) else {
+        return xml;
+    };
+    if model == Some(&held) {
+        return xml;
+    }
+    let block = match model {
+        None => String::new(),
+        Some(af) => {
+            let mut block = element.to_string();
+            let mut column = 0;
+            let mut edits: Vec<(usize, usize, Option<String>)> = Vec::new();
+            for (name, s, e) in element_children(element) {
+                match name.as_str() {
+                    "filterColumn" => {
+                        match af.columns.get(column) {
+                            Some(None) => edits.push((s, e, None)),
+                            Some(Some(c)) => {
+                                let id = c.saturating_sub(af.range.1).to_string();
+                                if attr_at(element, s, "colId") != Some(&id) {
+                                    edits.push((s, e, Some(id)));
+                                }
+                            }
+                            None => {}
+                        }
+                        column += 1;
+                    }
+                    "sortState" => edits.push((s, e, None)),
+                    _ => {}
+                }
+            }
+            for (s, e, id) in edits.into_iter().rev() {
+                match id {
+                    Some(id) => block = set_tag_attr(&block, s, "colId", Some(&id)),
+                    None => block.replace_range(s..e, ""),
+                }
+            }
+            let (r1, c1, r2, c2) = af.range;
+            let r = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
+            set_tag_attr(&block, 0, "ref", Some(&r))
+        }
+    };
+    xml.replace_range(start..end, &block);
+    xml
 }
 
 /// Sync one `<rowBreaks>` / `<colBreaks>` element from the model. It is left
@@ -4232,59 +4365,187 @@ fn patch_sheet_names(xml: &str, sheets: &[Sheet]) -> String {
 /// shares: the loader demotes an unresolvable scope to global, and other
 /// writers repeat names, so which entry belongs to which element can't be
 /// told. An element with child elements is left alone too.
+///
+/// A model name with no element (a removed sheet's names, restored by undo)
+/// is written as a new one at the end of `<definedNames>`, which is created
+/// if the workbook has none. Never a second element for one name: a global
+/// name only when no element of that name exists in any scope (the loader
+/// makes an unresolvable scope global, so its element carries some other
+/// `localSheetId`), a scoped one only when the scopes line up and no element
+/// has that name and scope. `_xlnm._FilterDatabase` is never added, since a
+/// save never adds the `<autoFilter>` it backs.
 fn patch_defined_names(xml: &str, names: &[DefinedName], sheet_count: usize) -> String {
     let aligned = xml.matches("<sheet ").count() == sheet_count;
-    // (content start, content end, new content), in document order.
+    // (start, end, replacement): element contents, and where new names go.
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    // The (lowercased name, key) of every element; key `None` = scope unknown.
+    let mut seen: Vec<(String, Option<Option<usize>>)> = Vec::new();
+    // Where new elements go: before `</definedNames>` (with the element's
+    // prefix), or replacing a self-closing `<definedNames/>`.
+    let mut names_close: Option<(usize, usize, String, bool)> = None;
+    // Past the last `<sheets>` / `<functionGroups>` / `<externalReferences>`
+    // (with the root's prefix): where a missing `<definedNames>` goes.
+    let mut names_slot: Option<(usize, String)> = None;
+    let mut root_prefix = String::new();
+    let mut depth = 0usize;
     let mut p = XmlParser::new(xml);
     loop {
         match p.next() {
-            Event::Start if local(p.name()) == "definedName" => {
-                let body_start = p.pos();
-                if xml[..body_start].ends_with("/>") {
-                    continue;
-                }
-                let key = defined_name_key(&p, aligned);
-                let mut text = String::new();
-                let mut depth = 0usize;
-                let mut nested = false;
-                let body_end = loop {
-                    match p.next() {
-                        Event::Text => XmlParser::append_decoded(p.text(), &mut text),
-                        Event::Start => {
-                            depth += 1;
-                            nested = true;
+            Event::Start => {
+                depth += 1;
+                let prefix = match p.name().rsplit_once(':') {
+                    Some((pfx, _)) => format!("{pfx}:"),
+                    None => String::new(),
+                };
+                match (depth, local(p.name())) {
+                    (1, _) => root_prefix = prefix,
+                    (2, "definedNames") => {
+                        let end = p.pos();
+                        if xml[..end].ends_with("/>") {
+                            names_close = Some((p.start_pos(), end, prefix, true));
                         }
-                        Event::End if depth > 0 => depth -= 1,
-                        Event::End => break xml[..p.pos()].rfind("</"),
-                        Event::Eof => break None,
                     }
-                };
-                let Some(body_end) = body_end else {
-                    break;
-                };
-                let model = key.filter(|_| !nested).and_then(|(name, scope)| {
-                    let mut hits = names
-                        .iter()
-                        .filter(|d| d.scope == scope && d.name.eq_ignore_ascii_case(&name));
-                    match (hits.next(), hits.next()) {
-                        (Some(d), None) => Some(d),
-                        _ => None,
+                    (_, "definedName") => {
+                        let key = defined_name_key(&p, aligned);
+                        seen.push((
+                            decode(p.attr("name")).to_lowercase(),
+                            key.as_ref().map(|k| k.1),
+                        ));
+                        let body_start = p.pos();
+                        if xml[..body_start].ends_with("/>") {
+                            continue;
+                        }
+                        depth -= 1; // its end tag is consumed here
+                        if !patch_defined_name(xml, &mut p, key, names, &mut edits) {
+                            break;
+                        }
                     }
-                });
-                if let Some(d) = model.filter(|d| d.formula != text) {
-                    edits.push((body_start, body_end, esc_text(&d.formula)));
+                    _ => {}
                 }
             }
+            Event::End => {
+                let at = xml[..p.pos()].rfind("</").unwrap_or(p.pos());
+                match (depth, local(p.name())) {
+                    (2, "definedNames") if names_close.is_none() => {
+                        let prefix = match p.name().rsplit_once(':') {
+                            Some((pfx, _)) => format!("{pfx}:"),
+                            None => String::new(),
+                        };
+                        names_close = Some((at, at, prefix, false));
+                    }
+                    (2, "sheets" | "functionGroups" | "externalReferences") => {
+                        names_slot = Some((p.pos(), root_prefix.clone()));
+                    }
+                    _ => {}
+                }
+                depth = depth.saturating_sub(1);
+            }
             Event::Eof => break,
-            _ => {}
+            Event::Text => {}
         }
     }
+
+    // Model names no element accounts for, each (name, scope) once.
+    let mut added: Vec<&DefinedName> = Vec::new();
+    for d in names {
+        let lower = d.name.to_lowercase();
+        let named = |key: Option<Option<usize>>| {
+            seen.iter()
+                .any(|(n, k)| *n == lower && (key.is_none() || k.is_none() || *k == key))
+        };
+        let missing = match d.scope {
+            None => !named(None),
+            Some(i) => aligned && i < sheet_count && !named(Some(Some(i))),
+        };
+        if missing
+            && !d.formula.is_empty()
+            && !d.name.eq_ignore_ascii_case("_xlnm._FilterDatabase")
+            && !added
+                .iter()
+                .any(|a| a.scope == d.scope && a.name.eq_ignore_ascii_case(&d.name))
+        {
+            added.push(d);
+        }
+    }
+    if !added.is_empty() {
+        let element_prefix = names_close
+            .as_ref()
+            .map(|c| c.2.clone())
+            .or_else(|| names_slot.as_ref().map(|s| s.1.clone()));
+        if let Some(pfx) = element_prefix {
+            let mut block = String::new();
+            for d in &added {
+                let scope = d
+                    .scope
+                    .map(|i| format!(" localSheetId=\"{i}\""))
+                    .unwrap_or_default();
+                block.push_str(&format!(
+                    "<{pfx}definedName name=\"{}\"{scope}>{}</{pfx}definedName>",
+                    esc_attr(&d.name),
+                    esc_text(&d.formula)
+                ));
+            }
+            let (start, end, wrap) = match (names_close, names_slot) {
+                (Some((s, e, _, self_closing)), _) => (s, e, self_closing),
+                (None, Some((s, _))) => (s, s, true),
+                (None, None) => unreachable!("a prefix came from one of them"),
+            };
+            if wrap {
+                block = format!("<{pfx}definedNames>{block}</{pfx}definedNames>");
+            }
+            edits.push((start, end, block));
+        }
+    }
+    edits.sort_by_key(|e| e.0);
     let mut out = xml.to_string();
     for (start, end, text) in edits.into_iter().rev() {
         out.replace_range(start..end, &text);
     }
     out
+}
+
+/// Queue the new content of the `<definedName>` whose start tag the parser is
+/// on (not a self-closing one) where the model's definition differs, and
+/// leave the parser past its end tag. `false` when the part ends first.
+fn patch_defined_name(
+    xml: &str,
+    p: &mut XmlParser,
+    key: Option<(String, Option<usize>)>,
+    names: &[DefinedName],
+    edits: &mut Vec<(usize, usize, String)>,
+) -> bool {
+    let body_start = p.pos();
+    let mut text = String::new();
+    let mut depth = 0usize;
+    let mut nested = false;
+    let body_end = loop {
+        match p.next() {
+            Event::Text => XmlParser::append_decoded(p.text(), &mut text),
+            Event::Start => {
+                depth += 1;
+                nested = true;
+            }
+            Event::End if depth > 0 => depth -= 1,
+            Event::End => break xml[..p.pos()].rfind("</"),
+            Event::Eof => break None,
+        }
+    };
+    let Some(body_end) = body_end else {
+        return false;
+    };
+    let model = key.filter(|_| !nested).and_then(|(name, scope)| {
+        let mut hits = names
+            .iter()
+            .filter(|d| d.scope == scope && d.name.eq_ignore_ascii_case(&name));
+        match (hits.next(), hits.next()) {
+            (Some(d), None) => Some(d),
+            _ => None,
+        }
+    });
+    if let Some(d) = model.filter(|d| d.formula != text) {
+        edits.push((body_start, body_end, esc_text(&d.formula)));
+    }
+    true
 }
 
 /// The (name, model scope) of the `<definedName>` start tag the parser is on;
@@ -11831,7 +12092,7 @@ mod kind_tests {
 #[cfg(test)]
 mod print_setup_tests {
     use super::*;
-    use crate::edit::{delete_rows, insert_cols, insert_rows, rename_sheet};
+    use crate::edit::{delete_cols, delete_rows, insert_cols, insert_rows, rename_sheet};
 
     const NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 
@@ -12061,8 +12322,8 @@ mod print_setup_tests {
         let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
         assert!(ws.contains(breaks), "{ws}");
 
-        // An insert on Report moves its print area (and only that); the
-        // quoted name on Other and _FilterDatabase keep their exact text.
+        // An insert on Report moves its print area and _FilterDatabase (#731)
+        // (and only those); the quoted name on Other keeps its exact text.
         let mut pkg = load_xlsx(&file).unwrap();
         insert_rows(&mut pkg.workbook, 0, 0, 1);
         let (_, wb) = saved(&pkg, "xl/workbook.xml");
@@ -12070,7 +12331,7 @@ mod print_setup_tests {
             wb.contains(r#"localSheetId="0">Report!$A$2:$D$21</definedName>"#),
             "{wb}"
         );
-        assert!(wb.contains(r#"<definedName name="_xlnm._FilterDatabase" localSheetId="0" hidden="1">Report!$A$1:$A$20</definedName>"#), "{wb}");
+        assert!(wb.contains(r#"<definedName name="_xlnm._FilterDatabase" localSheetId="0" hidden="1">Report!$A$2:$A$21</definedName>"#), "{wb}");
         assert!(
             wb.contains(r#"<definedName name="Far">'Other'!$A$1</definedName>"#),
             "{wb}"
@@ -12376,6 +12637,344 @@ mod print_setup_tests {
         );
         let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
         assert!(ws.contains(r#"<brk id="14" max="16383" man="1"/>"#), "{ws}");
+    }
+
+    // --- #731: the sheet autoFilter and _FilterDatabase move together ------
+
+    const FILTER_DB: &str = r#"<definedName name="_xlnm._FilterDatabase" localSheetId="0" hidden="1">Report!$A$2:$C$9</definedName>"#;
+
+    /// The text of `_FilterDatabase` in a saved workbook.xml.
+    fn filter_db(wb: &str) -> &str {
+        let start = wb
+            .find(r#"name="_xlnm._FilterDatabase""#)
+            .expect("name kept");
+        let body = start + wb[start..].find('>').unwrap() + 1;
+        &wb[body..body + wb[body..].find("</definedName>").unwrap()]
+    }
+
+    /// The saved worksheet and workbook.xml after `edit` on a Report sheet
+    /// holding `after_data` after its data, with `names`.
+    fn edited(names: &str, after_data: &str, edit: fn(&mut Workbook)) -> (String, String) {
+        let mut pkg = report(names, after_data);
+        edit(&mut pkg.workbook);
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        let (_, wb) = saved(&pkg, "xl/workbook.xml");
+        (ws, wb)
+    }
+
+    #[test]
+    fn sheet_auto_filter_and_filter_database_follow_row_insert() {
+        let mut pkg = report(FILTER_DB, r#"<autoFilter ref="A2:C9"/>"#);
+        insert_rows(&mut pkg.workbook, 0, 0, 2);
+        let (re, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(ws.contains(r#"<autoFilter ref="A4:C11"/>"#), "{ws}");
+        let (_, wb) = saved(&pkg, "xl/workbook.xml");
+        assert_eq!(filter_db(&wb), "Report!$A$4:$C$11");
+        let af = re.workbook.sheets[0].auto_filter.as_ref().unwrap();
+        assert_eq!(af.range, (3, 0, 10, 2));
+    }
+
+    #[test]
+    fn sheet_auto_filter_stretches_shrinks_and_goes_with_its_rows() {
+        type Edit = fn(&mut Workbook);
+        // (edit, autoFilter ref, name); None: the element is gone.
+        let cases: [(Edit, Option<&str>, &str); 5] = [
+            (
+                |w| insert_rows(w, 0, 4, 1),
+                Some("A2:C10"),
+                "Report!$A$2:$C$10",
+            ),
+            (
+                |w| insert_rows(w, 0, 1, 1),
+                Some("A3:C10"),
+                "Report!$A$3:$C$10",
+            ),
+            (
+                |w| delete_rows(w, 0, 3, 2),
+                Some("A2:C7"),
+                "Report!$A$2:$C$7",
+            ),
+            (
+                |w| delete_rows(w, 0, 0, 3),
+                Some("A1:C6"),
+                "Report!$A$1:$C$6",
+            ),
+            (|w| delete_rows(w, 0, 1, 8), None, "Report!#REF!"),
+        ];
+        for (i, (edit, want, name)) in cases.into_iter().enumerate() {
+            let (ws, wb) = edited(FILTER_DB, r#"<autoFilter ref="A2:C9"/>"#, edit);
+            match want {
+                Some(r) => assert!(
+                    ws.contains(&format!(r#"<autoFilter ref="{r}"/>"#)),
+                    "case {i}: {ws}"
+                ),
+                None => assert!(!ws.contains("autoFilter"), "case {i}: {ws}"),
+            }
+            assert_eq!(filter_db(&wb), name, "case {i}");
+        }
+    }
+
+    #[test]
+    fn sheet_auto_filter_columns_renumber_and_drop_on_col_edits() {
+        // B2:D9: a button-only column on B, a value filter on D, and the sort
+        // Excel remembers for it.
+        let names = r#"<definedName name="_xlnm._FilterDatabase" localSheetId="0" hidden="1">Report!$B$2:$D$9</definedName>"#;
+        let filter = concat!(
+            r#"<autoFilter ref="B2:D9" xr:uid="{AF}" xmlns:xr="urn:xr">"#,
+            r#"<filterColumn colId="0" hiddenButton="1"/>"#,
+            r#"<filterColumn colId="2"><filters blank="1"><filter val="East"/></filters></filterColumn>"#,
+            r#"<sortState ref="B3:D9"><sortCondition ref="D3:D9"/></sortState>"#,
+            r#"</autoFilter>"#,
+        );
+
+        // Left of it: the ref moves, the columns keep their ids and bytes,
+        // the sort (naming the old cells) goes.
+        let (ws, wb) = edited(names, filter, |w| insert_cols(w, 0, 0, 1));
+        assert!(
+            ws.contains(concat!(
+                r#"<autoFilter ref="C2:E9" xr:uid="{AF}" xmlns:xr="urn:xr">"#,
+                r#"<filterColumn colId="0" hiddenButton="1"/>"#,
+                r#"<filterColumn colId="2"><filters blank="1"><filter val="East"/></filters></filterColumn>"#,
+                r#"</autoFilter>"#,
+            )),
+            "{ws}"
+        );
+        assert_eq!(filter_db(&wb), "Report!$C$2:$E$9");
+
+        // Inside it: the range stretches, D's filter is now colId 3.
+        let (ws, wb) = edited(names, filter, |w| insert_cols(w, 0, 2, 1));
+        assert!(
+            ws.contains(concat!(
+                r#"<autoFilter ref="B2:E9" xr:uid="{AF}" xmlns:xr="urn:xr">"#,
+                r#"<filterColumn colId="0" hiddenButton="1"/>"#,
+                r#"<filterColumn colId="3"><filters blank="1"><filter val="East"/></filters></filterColumn>"#,
+                r#"</autoFilter>"#,
+            )),
+            "{ws}"
+        );
+        assert_eq!(filter_db(&wb), "Report!$B$2:$E$9");
+
+        // Deleting B takes its filterColumn; D (now C) is colId 1.
+        let (ws, wb) = edited(names, filter, |w| delete_cols(w, 0, 1, 1));
+        assert!(
+            ws.contains(concat!(
+                r#"<autoFilter ref="B2:C9" xr:uid="{AF}" xmlns:xr="urn:xr">"#,
+                r#"<filterColumn colId="1"><filters blank="1"><filter val="East"/></filters></filterColumn>"#,
+                r#"</autoFilter>"#,
+            )),
+            "{ws}"
+        );
+        assert_eq!(filter_db(&wb), "Report!$B$2:$C$9");
+
+        // Right of it: nothing to rewrite, the sort stays.
+        let (ws, wb) = edited(names, filter, |w| delete_cols(w, 0, 6, 2));
+        assert!(ws.contains(filter), "{ws}");
+        assert_eq!(filter_db(&wb), "Report!$B$2:$D$9");
+    }
+
+    #[test]
+    fn untouched_auto_filter_keeps_its_bytes() {
+        let filter = concat!(
+            r#"<autoFilter ref="A2:C9" ><filterColumn colId="1" ><customFilters>"#,
+            r#"<customFilter operator="greaterThan" val="5"/></customFilters></filterColumn>"#,
+            r#"<sortState ref="A3:C9"><sortCondition ref="B3:B9"/></sortState></autoFilter>"#,
+        );
+        let body =
+            format!(r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>{filter}"#);
+        let file = book(
+            FILTER_DB,
+            &[("Report", Some(&body)), ("Other", Some("<sheetData/>"))],
+        );
+        let edits: [fn(&mut Workbook); 4] = [
+            |_| {},
+            |w| insert_rows(w, 1, 0, 3),  // another sheet
+            |w| insert_rows(w, 0, 20, 3), // below it
+            |w| delete_cols(w, 0, 5, 1),  // right of it
+        ];
+        for (i, edit) in edits.into_iter().enumerate() {
+            let mut pkg = load_xlsx(&file).unwrap();
+            edit(&mut pkg.workbook);
+            let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+            assert!(ws.contains(filter), "case {i}: {ws}");
+            let (_, wb) = saved(&pkg, "xl/workbook.xml");
+            assert_eq!(
+                names_el(&wb),
+                format!("<definedNames>{FILTER_DB}</definedNames>"),
+                "case {i}"
+            );
+        }
+    }
+
+    const VIEWS: &str = r#"<customSheetViews><customSheetView guid="{V}"><autoFilter ref="A2:C9"><filterColumn colId="2"/></autoFilter></customSheetView></customSheetViews>"#;
+
+    #[test]
+    fn custom_view_auto_filter_is_left_alone() {
+        // A sheet whose only autoFilter is a custom view's: nothing moves.
+        let (ws, _) = edited(FILTER_DB, VIEWS, |w| insert_cols(w, 0, 0, 1));
+        assert!(ws.contains(VIEWS), "{ws}");
+        // Beside a top-level one: that one moves, the view's doesn't.
+        let filter = format!(r#"<autoFilter ref="A2:C9"/>{VIEWS}"#);
+        let (ws, wb) = edited(FILTER_DB, &filter, |w| insert_rows(w, 0, 0, 1));
+        assert!(
+            ws.contains(&format!(r#"<autoFilter ref="A3:C10"/>{VIEWS}"#)),
+            "{ws}"
+        );
+        assert_eq!(filter_db(&wb), "Report!$A$3:$C$10");
+    }
+
+    #[test]
+    fn an_auto_filter_whose_ref_is_not_a_range_is_left_verbatim() {
+        let filter = r#"<autoFilter ref="bogus"><filterColumn colId="0"/></autoFilter>"#;
+        let (ws, _) = edited("", filter, |w| delete_rows(w, 0, 0, 20));
+        assert!(ws.contains(filter), "{ws}");
+    }
+
+    // --- #731: model names that have no element are written ---------------
+
+    fn name(name: &str, scope: Option<usize>, formula: &str) -> DefinedName {
+        DefinedName {
+            name: name.to_string(),
+            scope,
+            formula: formula.to_string(),
+        }
+    }
+
+    /// `pkg` with its workbook.xml's `<definedNames></definedNames>` replaced.
+    fn without_names_el(mut pkg: SheetPackage, with: &str) -> SheetPackage {
+        let part = pkg
+            .parts
+            .iter_mut()
+            .find(|(n, _)| n == "xl/workbook.xml")
+            .unwrap();
+        let xml = String::from_utf8_lossy(&part.1).replace("<definedNames></definedNames>", with);
+        part.1 = xml.into_bytes();
+        pkg
+    }
+
+    #[test]
+    fn a_model_name_without_an_element_is_written() {
+        let mut pkg = report(PRINT_NAMES, "");
+        let names = &mut pkg.workbook.defined_names;
+        names.push(name("Rate", Some(0), "Report!$B$1"));
+        names.push(name("Total", None, "SUM(Report!$A:$A)&\"<\""));
+        names.push(name("Rate", Some(0), "Report!$C$1")); // a repeat
+        let (re, wb) = saved(&pkg, "xl/workbook.xml");
+        assert_eq!(
+            names_el(&wb),
+            format!(
+                "<definedNames>{PRINT_NAMES}{}{}</definedNames>",
+                r#"<definedName name="Rate" localSheetId="0">Report!$B$1</definedName>"#,
+                r#"<definedName name="Total">SUM(Report!$A:$A)&amp;"&lt;"</definedName>"#,
+            )
+        );
+        assert_eq!(re.workbook.defined_names.len(), 4);
+        // Saved again: already there, so not written twice.
+        let (_, again) = saved(&re, "xl/workbook.xml");
+        assert_eq!(names_el(&again), names_el(&wb));
+    }
+
+    #[test]
+    fn a_missing_defined_names_element_is_created_in_schema_order() {
+        let mut pkg = without_names_el(report("", ""), r#"<calcPr calcId="191029"/>"#);
+        let print_area = name("_xlnm.Print_Area", Some(0), "Report!$A$1:$B$2");
+        pkg.workbook.defined_names.push(print_area.clone());
+        let (re, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(
+            wb.contains(concat!(
+                r#"</sheets><definedNames><definedName name="_xlnm.Print_Area" localSheetId="0">"#,
+                r#"Report!$A$1:$B$2</definedName></definedNames><calcPr calcId="191029"/>"#,
+            )),
+            "{wb}"
+        );
+        assert_eq!(re.workbook.defined_names, vec![print_area]);
+
+        // A self-closing <definedNames/> is opened up.
+        let mut pkg = without_names_el(report("", ""), "<definedNames/>");
+        pkg.workbook
+            .defined_names
+            .push(name("Rate", None, "Report!$B$1"));
+        let (_, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(
+            wb.contains(r#"<definedNames><definedName name="Rate">Report!$B$1</definedName></definedNames></workbook>"#),
+            "{wb}"
+        );
+    }
+
+    #[test]
+    fn names_are_not_duplicated_when_scopes_do_not_line_up() {
+        // Scoped to a sheet whose part is missing: the loader makes it global,
+        // and the <sheet> elements no longer line up with the model.
+        let names = concat!(
+            r#"<definedName name="Local" localSheetId="1">Report!$A$1</definedName>"#,
+            r#"<definedName name="Other" localSheetId="1">Report!$B$1</definedName>"#,
+        );
+        let file = book(names, &[("Report", Some("<sheetData/>")), ("Gone", None)]);
+        let pkg = load_xlsx(&file).unwrap();
+        assert_eq!(pkg.workbook.defined_names.len(), 2);
+        assert!(pkg.workbook.defined_names.iter().all(|d| d.scope.is_none()));
+        let (_, wb) = saved(&pkg, "xl/workbook.xml");
+        assert_eq!(
+            names_el(&wb),
+            format!("<definedNames>{names}</definedNames>")
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_local_sheet_id_is_not_duplicated() {
+        let names = r#"<definedName name="Stray" localSheetId="5">Report!$A$1</definedName>"#;
+        let pkg = report(names, "");
+        assert_eq!(
+            pkg.workbook.defined_names,
+            vec![name("Stray", None, "Report!$A$1")]
+        );
+        let (_, wb) = saved(&pkg, "xl/workbook.xml");
+        assert_eq!(
+            names_el(&wb),
+            format!("<definedNames>{names}</definedNames>")
+        );
+    }
+
+    #[test]
+    fn filter_database_is_never_appended() {
+        let mut pkg = report(PRINT_NAMES, "");
+        pkg.workbook
+            .defined_names
+            .push(name("_xlnm._FilterDatabase", Some(0), "Report!$A$1:$C$9"));
+        let (_, wb) = saved(&pkg, "xl/workbook.xml");
+        assert_eq!(
+            names_el(&wb),
+            format!("<definedNames>{PRINT_NAMES}</definedNames>")
+        );
+    }
+
+    #[test]
+    fn an_insert_pushing_the_auto_filter_off_the_sheet_drops_it_with_its_name() {
+        type Edit = fn(&mut Workbook);
+        // (filter ref, name, edit): the far edge is the sheet's last row/column.
+        let cases: [(&str, &str, Edit); 2] = [
+            ("A2:C1048576", "Report!$A$2:$C$1048576", |w| {
+                insert_rows(w, 0, 0, 1)
+            }),
+            ("A2:XFD9", "Report!$A$2:$XFD$9", |w| insert_cols(w, 0, 0, 1)),
+        ];
+        for (r, name, edit) in cases {
+            let names = format!(
+                r#"<definedName name="_xlnm._FilterDatabase" localSheetId="0" hidden="1">{name}</definedName>"#
+            );
+            let (ws, wb) = edited(&names, &format!(r#"<autoFilter ref="{r}"/>"#), edit);
+            assert!(!ws.contains("autoFilter"), "{r}: {ws}");
+            assert_eq!(filter_db(&wb), "Report!#REF!", "{r}");
+        }
+    }
+
+    #[test]
+    fn a_stripped_macro_name_with_a_stray_scope_stays_out_of_a_macro_free_save() {
+        let names = r#"<definedName name="Fn" xlm="1" localSheetId="5">Report!$A$1</definedName>"#;
+        let pkg = report(names, "");
+        let re = load_xlsx(&save_xlsx_as(&pkg, SpreadsheetKind::Workbook)).unwrap();
+        let wb = String::from_utf8_lossy(re.part("xl/workbook.xml").unwrap()).into_owned();
+        assert!(!wb.contains(r#"name="Fn""#), "{wb}");
+        assert!(re.workbook.defined_names.is_empty());
     }
 }
 

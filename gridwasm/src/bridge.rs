@@ -2174,12 +2174,12 @@ impl Session {
     /// scoped to the removed sheet — all captured by `ctl_sheet_remove`
     /// just before deletion. Defined names are re-inserted with `scope`
     /// re-pointed at the restored sheet's NEW index (their old index may no
-    /// longer even exist). This restores the LIVE, in-memory session
-    /// correctly; whether a defined-name write survives a subsequent
-    /// `save`/reload round trip is a separate, pre-existing concern (the
-    /// xlsx byte-preservation gap list already flags named-range writes as
-    /// unverified repo-wide — this restore doesn't newly introduce that
-    /// gap, just inherits it). The stash is single-slot — a second
+    /// longer even exist). They also survive a `save`: gridcore writes a
+    /// model name that has no `<definedName>` element (the restored ones lost
+    /// theirs to `remove_sheet`). The restored sheet's autoFilter and its
+    /// `_xlnm._FilterDatabase` are not recreated, though: the sheet gets a
+    /// fresh part with no `<autoFilter>`, and a save never adds one or the
+    /// name that backs it. The stash is single-slot — a second
     /// `sheet.remove` overwrites it, and a successful restore takes
     /// (clears) it via `Option::take` — so calling this with nothing
     /// stashed errors (`"nothing to restore"`).
@@ -4332,6 +4332,77 @@ mod tests {
             Some("A1:B2"),
             "the defined name must resolve again, scoped to the restored sheet's NEW index"
         );
+    }
+
+    #[test]
+    fn sheet_remove_restore_writes_the_restored_names_on_save() {
+        // #731: Sheet1, Report, Tail. Report has a print area, a scoped name
+        // and an autoFilter with its `_FilterDatabase`; Tail a name of its own.
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Report");
+        pkg.add_sheet("Tail");
+        let names = concat!(
+            r#"<definedNames>"#,
+            r#"<definedName name="_xlnm._FilterDatabase" localSheetId="1" hidden="1">Report!$A$1:$B$5</definedName>"#,
+            r#"<definedName name="_xlnm.Print_Area" localSheetId="1">Report!$A$1:$D$20</definedName>"#,
+            r#"<definedName name="Mine" localSheetId="1">Report!$B$2</definedName>"#,
+            r#"<definedName name="Mine" localSheetId="2">Tail!$C$3</definedName>"#,
+            r#"</definedNames>"#,
+        );
+        let wb = String::from_utf8_lossy(pkg.part("xl/workbook.xml").unwrap())
+            .replace("</sheets>", &format!("</sheets>{names}"));
+        pkg.set_part("xl/workbook.xml", wb.into_bytes());
+        let report_part = "xl/worksheets/sheet2.xml";
+        let ws = String::from_utf8_lossy(pkg.part(report_part).expect("Report's part"))
+            .replace("<sheetData/>", r#"<sheetData/><autoFilter ref="A1:B5"/>"#);
+        pkg.set_part(report_part, ws.into_bytes());
+        // What loading that part gives, so the save keeps the element.
+        pkg.workbook.sheets[1].auto_filter = Some(gridcore::sheet::SheetAutoFilter {
+            range: (0, 0, 4, 1),
+            columns: Vec::new(),
+        });
+        let mut s = Session::open(&save_xlsx(&pkg)).expect("open");
+        assert!(s.pkg.workbook.sheets[1].auto_filter.is_some());
+        assert_eq!(
+            s.pkg.workbook.defined_name("_xlnm._FilterDatabase", 1),
+            Some("Report!$A$1:$B$5")
+        );
+
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"Report"}}"#);
+        let out = s.ctl(r#"{"verb":"sheet.restore-removed","args":{}}"#);
+        assert!(out.contains("\"sheet\":2"), "restored at the end: {out}");
+
+        let re = load_xlsx(&s.save()).expect("saved file reloads");
+        let scoped = |i: usize| {
+            let mut v: Vec<(String, String)> = re
+                .workbook
+                .defined_names
+                .iter()
+                .filter(|d| d.scope == Some(i))
+                .map(|d| (d.name.clone(), d.formula.clone()))
+                .collect();
+            v.sort();
+            v
+        };
+        // The restored sheet's names, scoped to its new index; no
+        // `_FilterDatabase`, since its fresh part has no autoFilter to back.
+        assert_eq!(
+            scoped(2),
+            vec![
+                ("Mine".to_string(), "Report!$B$2".to_string()),
+                (
+                    "_xlnm.Print_Area".to_string(),
+                    "Report!$A$1:$D$20".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            scoped(1),
+            vec![("Mine".to_string(), "Tail!$C$3".to_string())]
+        );
+        let wb = String::from_utf8_lossy(re.part("xl/workbook.xml").unwrap()).into_owned();
+        assert!(!wb.contains("_FilterDatabase"), "{wb}");
+        assert_eq!(wb.matches("<definedName ").count(), 3, "{wb}");
     }
 
     #[test]
