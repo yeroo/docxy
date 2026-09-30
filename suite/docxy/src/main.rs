@@ -13314,66 +13314,29 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
-    /// Insert an empty `rows`×`cols` bordered table after the caret's block, and
-    /// move the caret into its first cell.
+    /// Insert a `rows`×`cols` table at the caret of the edited story as one
+    /// undo step (docxcore's Insert Table), and move the caret into its first
+    /// cell.
     fn insert_table(
         &mut self,
         rows: usize,
         cols: usize,
+        fit: docxcore::table::AutoFit,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use docxcore::model::{Cell, Row, Table, VMerge};
         self.picker = None;
-        const TBLPR: &str = "<w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/><w:tblBorders>\
-<w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-<w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-<w:bottom w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-<w:right w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-<w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-<w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-</w:tblBorders></w:tblPr>";
-        let col_w = (9360 / cols.max(1)) as u32;
-        let mk_cell = || Cell {
-            grid_span: 1,
-            v_merge: VMerge::None,
-            blocks: vec![Block::Paragraph(Paragraph::default())],
-            raw_tcpr: None,
-            property_change: None,
-            unsupported_revisions: vec![],
-        };
-        let mk_row = || Row {
-            cells: (0..cols).map(|_| mk_cell()).collect(),
-            raw_props: vec![],
-            property_change: None,
-        };
-        let table = Table {
-            grid: vec![col_w; cols],
-            rows: (0..rows).map(|_| mk_row()).collect(),
-            namespace_declarations: vec![],
-            markup_compatibility_attributes: vec![],
-            row_boundaries: vec![],
-            raw_tblpr: Some(TBLPR.to_string()),
-            property_change: None,
-        };
-        let idx = self.active;
-        if let Some(t) = self.tabs.get_mut(idx) {
-            if let Surface::Doc(ed) = &mut t.surface {
-                let at = ed
-                    .caret
-                    .path
-                    .first()
-                    .copied()
-                    .unwrap_or(0)
-                    .min(ed.doc.body.len().saturating_sub(1));
-                let pos = (at + 1).min(ed.doc.body.len());
-                ed.doc.body.insert(pos, Block::Table(table));
-                ed.clear_selection();
-                ed.caret = Caret::at(vec![pos, 0, 0, 0], 0);
-                ed.clamp();
+        let result = self
+            .edit_target()
+            .map(|ed| ed.insert_table(rows, cols, fit));
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            match result {
+                Some(Ok(())) => t.dirty = true,
+                Some(Err(e)) => t.status = e.into(),
+                None => {}
             }
-            t.dirty = true;
         }
+        self.scroll_to_caret();
         self.refocus(window, cx);
     }
 
@@ -13516,9 +13479,11 @@ impl Docxy {
             }
             PickKind::Table => {
                 for (i, &(label, r, c)) in TABLE_PRESETS.iter().enumerate() {
-                    row = row.child(chip(i, label.into(), "tbl").on_click(
-                        cx.listener(move |this, _, window, cx| this.insert_table(r, c, window, cx)),
-                    ));
+                    row = row.child(chip(i, label.into(), "tbl").on_click(cx.listener(
+                        move |this, _, window, cx| {
+                            this.insert_table(r, c, docxcore::table::AutoFit::Default, window, cx)
+                        },
+                    )));
                 }
             }
             PickKind::Symbol => {
@@ -14676,8 +14641,39 @@ impl Docxy {
             self.chart_hand_back(cx);
             return self.sheet_commit(0, 1, cx);
         }
+        if self.table_tab(false, window, cx) {
+            return;
+        }
         self.with_editor(window, cx, |e| e.insert_tab());
         self.scroll_to_caret();
+    }
+
+    /// Tab (`back`: Shift+Tab) with the caret in a table cell of the edited
+    /// story: select the next or previous cell's content, and in the last cell
+    /// add a row (Word). Moving is not an edit. `false` outside a table.
+    fn table_tab(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(ed) = self.edit_target() else {
+            return false;
+        };
+        if !ed.in_table() {
+            return false;
+        }
+        let edited = if back {
+            ed.table_prev_cell();
+            false
+        } else {
+            let adds = ed.table_tab_adds_row();
+            ed.table_next_cell();
+            adds
+        };
+        if edited {
+            if let Some(t) = self.tabs.get_mut(self.active) {
+                t.dirty = true;
+            }
+        }
+        self.scroll_to_caret();
+        self.refocus(window, cx);
+        true
     }
 
     /// Shift+Tab decreases the paragraph indent (Word's outdent).
@@ -14723,6 +14719,9 @@ impl Docxy {
             }
             self.chart_hand_back(cx);
             return self.sheet_commit(0, -1, cx);
+        }
+        if self.table_tab(true, window, cx) {
+            return;
         }
         self.with_editor(window, cx, |e| e.change_indent(-720));
     }
@@ -14877,6 +14876,10 @@ impl Docxy {
                     true
                 }
                 "a" => no(|| ed.select_all()),
+                // Ctrl+Tab types a tab inside a table cell, where Tab moves to
+                // the next cell (Word). gpui binds no action to it, so it
+                // arrives here.
+                "tab" if !shift && ed.in_table() => yes(|| ed.insert_tab()),
                 // Indent / outdent (Ctrl+M, Ctrl+Shift+M).
                 "m" if shift => yes(|| ed.change_indent(-720)),
                 "m" => yes(|| ed.change_indent(720)),

@@ -43,9 +43,8 @@ use docxcore::load::parse_header_footer;
 use docxcore::load::{Relationships, parse_rels_xml};
 use docxcore::markdown::{decode_markdown, from_markdown, to_markdown_with};
 use docxcore::model::{
-    Align, Block, BreakKind, Cell, Document, Hyperlink, Inline, PageGeom, PropertyScope,
-    RevisionAddress, RevisionCategory, RevisionKind, Row, Run, RunProps, Table,
-    UnsupportedRevisionKind, VMerge,
+    Align, Block, BreakKind, Document, Hyperlink, Inline, PageGeom, PropertyScope, RevisionAddress,
+    RevisionCategory, RevisionKind, Run, RunProps, UnsupportedRevisionKind,
 };
 use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
 use docxcore::package::{
@@ -3109,6 +3108,28 @@ impl App {
         }
     }
 
+    /// Tab (`back`: Shift+Tab) with the caret in a table: select the next or
+    /// previous cell's content. Tab in the last cell adds a row, which is an
+    /// edit and needs structure permission; moving is not.
+    fn table_tab_key(&mut self, back: bool) {
+        self.clear_visual_hint();
+        if back {
+            self.editor.table_prev_cell();
+            self.dirty = true;
+            return;
+        }
+        if self.editor.table_tab_adds_row() {
+            if !self.mutation_allowed(protection::MutationKind::Structure) {
+                return;
+            }
+            self.editor.table_next_cell();
+            self.after_edit();
+        } else {
+            self.editor.table_next_cell();
+            self.dirty = true;
+        }
+    }
+
     fn after_edit(&mut self) {
         self.modified = true;
         self.dirty = true;
@@ -3653,37 +3674,12 @@ impl App {
     /// Insert a bordered `rows`×`cols` table just after the caret's block, with
     /// the caret landing in the first cell.
     fn insert_table(&mut self, rows: usize, cols: usize) {
-        const TBLPR: &str = "<w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/><w:tblBorders>\
-<w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-<w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-<w:bottom w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-<w:right w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-<w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-<w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
-</w:tblBorders></w:tblPr>";
-        let col_w = (9360 / cols.max(1)) as u32;
-        let mk_cell = || Cell {
-            grid_span: 1,
-            v_merge: VMerge::None,
-            blocks: vec![Block::Paragraph(docxcore::model::Paragraph::default())],
-            raw_tcpr: None,
-            property_change: None,
-            unsupported_revisions: Vec::new(),
-        };
-        let mk_row = || Row {
-            cells: (0..cols).map(|_| mk_cell()).collect(),
-            raw_props: vec![],
-            property_change: None,
-        };
-        let table = Table {
-            grid: vec![col_w; cols],
-            rows: (0..rows).map(|_| mk_row()).collect(),
-            namespace_declarations: vec![],
-            markup_compatibility_attributes: vec![],
-            row_boundaries: vec![],
-            raw_tblpr: Some(TBLPR.to_string()),
-            property_change: None,
-        };
+        let table = docxcore::table::new_table(
+            rows,
+            cols,
+            docxcore::table::DEFAULT_TEXT_WIDTH,
+            docxcore::table::AutoFit::Default,
+        );
         let body = &mut self.editor.doc.body;
         let at = self
             .editor
@@ -5113,6 +5109,16 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // Tab/Shift+Tab in a table move between cells (Word); only Tab in the
+        // last cell edits, by adding a row.
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+            && !ctrl
+            && !alt
+            && self.editor.in_table()
+        {
+            self.table_tab_key(key.code == KeyCode::BackTab || shift);
+            return false;
+        }
         if let Some(mutation) = Self::body_key_mutation_kind(&key) {
             if !self.mutation_allowed(mutation) {
                 return false;
@@ -5247,6 +5253,12 @@ impl App {
             }
             KeyCode::Delete => {
                 self.editor.delete_forward();
+                self.after_edit();
+            }
+            // Ctrl+Tab types a tab inside a table cell (where the terminal
+            // reports it), as in Word.
+            KeyCode::Tab if ctrl && self.editor.in_table() => {
+                self.editor.insert_tab();
                 self.after_edit();
             }
             KeyCode::Tab => {
@@ -7064,6 +7076,7 @@ fn run_tui(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use docxcore::model::{Cell, Row, Table, VMerge};
 
     fn markdown_temp(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("docxy-markdown-{tag}-{}", std::process::id()));
@@ -11433,6 +11446,53 @@ mod tests {
         app.run_act(ribbon::Act::PageNumber);
         let has_page = app.editor.doc.body.iter().any(|b| matches!(b, Block::Paragraph(p) if p.content.iter().any(|i| matches!(i, Inline::Field { raw, .. } if raw.contains("PAGE")))));
         assert!(has_page, "no PAGE field inserted");
+    }
+
+    #[test]
+    fn tab_moves_between_table_cells_and_adds_a_row_in_the_last() {
+        let mut app = app_with(&["text"]);
+        app.run_act(ribbon::Act::InsertTable);
+        let table_path = app
+            .editor
+            .table_at_caret()
+            .expect("caret in the table")
+            .table;
+        app.modified = false;
+        app.on_key(key(KeyCode::Char('a')));
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Char('b')));
+        app.on_key(KeyCode::BackTab.into());
+        // Shift+Tab selected "a": typing replaces it.
+        app.on_key(key(KeyCode::Char('c')));
+        let text = |app: &App, r: usize, c: usize| {
+            app.editor.table(&table_path).unwrap().rows[r].cells[c].blocks[0].plain_text()
+        };
+        assert_eq!(text(&app, 0, 0), "c");
+        assert_eq!(text(&app, 0, 1), "b");
+        // To the last cell, then Tab adds a row.
+        for _ in 0..3 {
+            app.on_key(key(KeyCode::Tab));
+        }
+        assert_eq!(app.editor.table(&table_path).unwrap().rows.len(), 2);
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.editor.table(&table_path).unwrap().rows.len(), 3);
+        // Ctrl+Tab types a tab in the cell.
+        app.on_key(ctrl(KeyCode::Tab));
+        let t = app.editor.table(&table_path).unwrap();
+        let Block::Paragraph(p) = &t.rows[2].cells[0].blocks[0] else {
+            panic!("paragraph")
+        };
+        assert!(matches!(p.content.as_slice(), [Inline::Tab(_)]));
+    }
+
+    #[test]
+    fn tab_between_cells_is_not_an_edit() {
+        let mut app = app_with(&["text"]);
+        app.run_act(ribbon::Act::InsertTable);
+        app.modified = false;
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(KeyCode::BackTab.into());
+        assert!(!app.modified);
     }
 
     #[test]

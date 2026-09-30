@@ -14,7 +14,9 @@ use crate::review::{RevisionAction, RevisionOutcome};
 
 mod flat;
 mod sections;
+mod tables;
 pub use flat::{FlatDocument, FlatStory, StoryOffset};
+pub use tables::{CellRange, TablePos};
 
 /// A path into the document tree (to a paragraph) plus a character offset.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -915,7 +917,14 @@ impl Editor {
     }
 
     /// The selection split per paragraph: `(path, start_offset, end_offset)`.
+    ///
+    /// A selection across cells of one table (see [`Editor::cell_range`]) is
+    /// the rectangle of cells: every paragraph of each, whole, empty ones
+    /// included, and nothing from the cells between them in reading order.
     pub fn selection_spans(&self) -> Vec<(Vec<usize>, usize, usize)> {
+        if let Some(range) = self.cell_range() {
+            return self.cell_range_spans(&range);
+        }
         let Some((lo, hi)) = self.selection_range() else {
             return Vec::new();
         };
@@ -939,7 +948,12 @@ impl Editor {
     /// Delete the current selection. Handles a single paragraph and a range of
     /// sibling paragraphs (merging the ends). A selection spanning different
     /// containers (e.g. body into a table cell) just collapses to the start.
+    ///
+    /// Over a cell range it empties the selected cells, as Word's Delete does.
     pub fn delete_selection(&mut self) -> bool {
+        if let Some(range) = self.cell_range() {
+            return self.clear_cells(&range);
+        }
         let Some((lo, hi)) = self.selection_range() else {
             return false;
         };
