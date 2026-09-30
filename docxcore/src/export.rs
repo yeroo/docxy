@@ -648,6 +648,8 @@ struct Page {
 #[derive(Debug, Clone, Copy)]
 struct LineRec {
     y: f32,
+    lh: f32,
+    col: usize,
     /// The column set ([`Region::id`]) and paragraph it belongs to.
     region: u32,
     para: u32,
@@ -959,6 +961,8 @@ struct Region {
     xs: Vec<(f32, f32)>,
     /// A line has landed in it on the current page.
     placed: bool,
+    /// A column break moved it on (its columns aren't balanced).
+    column_break: bool,
 }
 
 /// The paginated body.
@@ -1006,6 +1010,7 @@ impl<'a> Pager<'a> {
                 low: 0.0,
                 xs: Vec::new(),
                 placed: false,
+                column_break: false,
             },
             next_region: 0,
             y: 0.0,
@@ -1034,6 +1039,7 @@ impl<'a> Pager<'a> {
                     // A different paper size can't share the page.
                     self.new_page(i, true, false);
                 } else {
+                    self.balance_region();
                     let top = self.region.low;
                     self.start_region(i, top);
                     // The page belongs to the section at its top, so a restart
@@ -1158,6 +1164,7 @@ impl<'a> Pager<'a> {
             low: top,
             xs,
             placed: false,
+            column_break: false,
         };
         self.y = top;
     }
@@ -1195,6 +1202,86 @@ impl<'a> Pager<'a> {
         } else {
             self.new_page(self.region.sect, false, false);
         }
+    }
+
+    /// Balance the ending column set's lines on this page before a continuous
+    /// section starts below it, as Word does: re-pour them in order into its
+    /// columns so the tallest column is as short as possible. Lines don't
+    /// re-wrap, so only equal-width columns are balanced, and not after a
+    /// column break (which placed the lines deliberately).
+    fn balance_region(&mut self) {
+        let region = &self.region;
+        let Some(&(_, w0)) = region.xs.first() else {
+            return;
+        };
+        if region.xs.len() < 2
+            || region.column_break
+            || region.xs.iter().any(|&(_, w)| (w - w0).abs() > 0.01)
+        {
+            return;
+        }
+        let Some(page) = self.pages.last_mut() else {
+            return;
+        };
+        let first = page
+            .lines
+            .iter()
+            .position(|l| l.region == region.id)
+            .unwrap_or(page.lines.len());
+        let heights: Vec<f32> = page.lines[first..]
+            .iter()
+            .map(|l| l.lh + l.gap_after)
+            .collect();
+        if heights.is_empty() {
+            return;
+        }
+        let cols = region.xs.len();
+        // Greedy pour at a column height `h`: each line's column, or None when
+        // the lines need more columns than there are.
+        let pour = |h: f32| -> Option<Vec<usize>> {
+            let (mut col, mut used) = (0, 0.0);
+            let mut out = Vec::with_capacity(heights.len());
+            for &lh in &heights {
+                if used > 0.0 && used + lh > h + 0.001 {
+                    col += 1;
+                    used = 0.0;
+                }
+                if col >= cols {
+                    return None;
+                }
+                used += lh;
+                out.push(col);
+            }
+            Some(out)
+        };
+        // The pour is monotone in `h`: bisect for the smallest that fits.
+        let (mut lo, mut hi) = (
+            heights.iter().copied().fold(0.0, f32::max),
+            heights.iter().sum::<f32>(),
+        );
+        for _ in 0..40 {
+            let mid = (lo + hi) / 2.0;
+            if pour(mid).is_some() {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        let Some(assign) = pour(hi) else {
+            return;
+        };
+        let mut cursor = vec![region.top; cols];
+        for (k, col) in assign.into_iter().enumerate() {
+            let i = first + k;
+            let line = page.lines[i];
+            let y = cursor[col] - line.lh;
+            let dx = region.xs[col].0 - region.xs[line.col].0;
+            page.shift_line(i, dx, y - line.y);
+            page.lines[i].col = col;
+            cursor[col] = y - line.gap_after;
+        }
+        page.min_base = page.lines.iter().map(|l| l.y).fold(f32::INFINITY, f32::min);
+        self.region.low = cursor.into_iter().fold(self.region.top, f32::min);
     }
 
     /// Count a body line just placed for line numbering (`w:lnNumType`): the
@@ -1386,6 +1473,8 @@ impl Flow for Pager<'_> {
         page.min_base = page.min_base.min(self.y);
         page.lines.push(LineRec {
             y: self.y,
+            lh,
+            col: self.region.col,
             region: self.region.id,
             para: self.para,
             frags: page.frags.len(),
@@ -1444,7 +1533,10 @@ impl Flow for Pager<'_> {
     fn hard_break(&mut self, kind: BreakKind) {
         match kind {
             BreakKind::Page => self.new_page(self.region.sect, false, false),
-            BreakKind::Column => self.advance_column(),
+            BreakKind::Column => {
+                self.region.column_break = true;
+                self.advance_column();
+            }
             BreakKind::Line | BreakKind::Clear(_) => {}
         }
     }
@@ -3380,5 +3472,106 @@ mod tests {
         ]);
         let pages = pages_of(&d, &PdfOptions::default());
         assert!(close(pages[0].at("b").1, 720.0 - 2.0 * LH - 4.4));
+    }
+
+    // ---- column balancing (#737) ----
+
+    const CONTINUOUS: &str = r#"<w:sectPr><w:type w:val="continuous"/></w:sectPr>"#;
+
+    /// `n` one-line paragraphs in a section `cols_sect`, then a continuous
+    /// single-column section holding "next".
+    fn balanced_doc(n: usize, cols_sect: &str) -> Document {
+        let mut blocks = paras("l", n - 1);
+        blocks.push(sect_para(&format!("l{}", n - 1), cols_sect));
+        blocks.push(text_para("next"));
+        blocks.push(trailing(CONTINUOUS));
+        doc(blocks)
+    }
+
+    #[test]
+    fn columns_balance_before_continuous_break() {
+        let pages = pages_of(
+            &balanced_doc(10, &two_col_sect(r#" w:sep="1""#)),
+            &PdfOptions::default(),
+        );
+        assert_eq!(pages.len(), 1);
+        let page = &pages[0];
+        for i in 0..5 {
+            let (left, right) = (page.at(&format!("l{i}")), page.at(&format!("l{}", i + 5)));
+            assert!(
+                close(left.0, 72.0) && close(right.0, 324.0),
+                "{:?}",
+                page.texts
+            );
+            assert!(close(left.1, right.1), "row {i}: {left:?} {right:?}");
+        }
+        // The next section starts just below the balanced columns, not below
+        // ten lines.
+        let step = LH + 4.4;
+        let low = 720.0 - 5.0 * step;
+        let next = page.at("next");
+        assert!(close(next.1, low - LH), "{next:?}");
+        assert!(close(next.0, 72.0));
+        // The separator runs down to the balanced height.
+        assert!(
+            page.content
+                .contains(&format!("306.00 720.00 m 306.00 {low:.2} l S")),
+            "{}",
+            page.content
+        );
+    }
+
+    #[test]
+    fn balancing_minimises_the_tallest_column_of_uneven_lines() {
+        // A tall heading line and six body lines: a line-count split (4 | 3)
+        // puts the heading and three lines in column one; by height the
+        // heading shares its column with two.
+        let heading = Block::Paragraph(Paragraph {
+            props: ParProps {
+                heading_level: Some(1),
+                ..ParProps::default()
+            },
+            content: vec![run("H", RunProps::default())],
+        });
+        let mut blocks = vec![heading];
+        blocks.extend(paras("l", 5));
+        blocks.push(sect_para("l5", &two_col_sect("")));
+        blocks.push(text_para("next"));
+        blocks.push(trailing(CONTINUOUS));
+        let pages = pages_of(&doc(blocks), &PdfOptions::default());
+        let page = &pages[0];
+        let heading_h = 11.0 * 1.8 * 1.35 + 11.0 * 1.8 * 0.4;
+        let step = LH + 4.4;
+        // Heights: the heading 34.65, each body line 19.25. Heading + 2 lines
+        // (73.15) | 4 lines (77.0) beats heading + 3 (92.4) | 3.
+        assert!(close(page.at("l1").0, 72.0) && close(page.at("l2").0, 324.0));
+        let low = 720.0 - (4.0 * step).max(heading_h + 2.0 * step);
+        assert!(close(page.at("next").1, low - LH), "{:?}", page.texts);
+    }
+
+    #[test]
+    fn columns_are_not_balanced_at_the_end_after_a_break_or_when_unequal() {
+        // At the end of the document: everything stays in column one.
+        let mut blocks = paras("l", 10);
+        blocks.push(trailing(&two_col_sect("")));
+        let pages = pages_of(&doc(blocks), &PdfOptions::default());
+        assert!(close(pages[0].at("l9").0, 72.0));
+
+        // Unequal explicit widths would need re-wrapping.
+        let unequal = r#"<w:sectPr><w:cols w:num="2" w:equalWidth="0"><w:col w:w="5000" w:space="720"/><w:col w:w="3000"/></w:cols></w:sectPr>"#;
+        let pages = pages_of(&balanced_doc(10, unequal), &PdfOptions::default());
+        assert!(close(pages[0].at("l9").0, 72.0), "{:?}", pages[0].texts);
+
+        // A column break placed the lines deliberately.
+        let d = doc(vec![
+            text_para("a"),
+            para(vec![run("b", RunProps::default()), col_break()]),
+            sect_para("c", &two_col_sect("")),
+            text_para("next"),
+            trailing(CONTINUOUS),
+        ]);
+        let pages = pages_of(&d, &PdfOptions::default());
+        assert!(close(pages[0].at("a").0, 72.0) && close(pages[0].at("b").0, 72.0));
+        assert!(close(pages[0].at("c").0, 324.0));
     }
 }
