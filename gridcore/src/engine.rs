@@ -753,13 +753,12 @@ impl Engine {
 
     /// Store a legacy CSE array's result over its fixed block ([`cse_at`]).
     ///
-    /// While the anchor still owns its block (it has an extent: the block was
-    /// not broken by an edit into it), every plain value in the fixed block is
-    /// the block's own — also after an insert grew the `ref` past the stored
-    /// extent. Once an edit broke it, a plain value is the block's own only
-    /// when it equals what the block would put there (an undo restoring a
-    /// block cell); anything else (a value typed into it, a formula) is left
-    /// alone, and the anchor shows only its own value until the block is clear.
+    /// The block owns every plain value in its `ref`, as in Excel, which
+    /// refuses to change part of an array: a value typed into a block cell is
+    /// refilled by the block, and so is one an undo restores or an insert
+    /// shifted into a grown `ref`. Only a formula in a block cell blocks it:
+    /// the anchor then shows its own value alone (never `#SPILL!`) until the
+    /// formula goes.
     fn fill_cse(
         &mut self,
         sheet: &mut Sheet,
@@ -773,22 +772,11 @@ impl Engine {
             DynResult::Scalar(v) => vec![vec![v]],
             DynResult::Array(m) => m,
         };
-        let owned = old != (1, 1);
         let off_grid = r + h > crate::sheet::MAX_ROWS || c + w > crate::sheet::MAX_COLS;
         let blocked = off_grid
             || (r..r + h).any(|rr| {
                 (c..c + w).any(|cc| {
-                    if (rr, cc) == (r, c) {
-                        return false;
-                    }
-                    let Some(cell) = sheet.cell(rr, cc) else {
-                        return false;
-                    };
-                    let ours = cell.formula.is_none()
-                        && (owned
-                            || cell.value
-                                == value_to_cell(cse_at(&m, (rr - r) as usize, (cc - c) as usize)));
-                    !cell.is_blank() && !ours
+                    (rr, cc) != (r, c) && sheet.cell(rr, cc).is_some_and(|cl| cl.formula.is_some())
                 })
             });
         let mut changed = Vec::new();

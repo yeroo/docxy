@@ -9913,23 +9913,66 @@ b",
     }
 
     #[test]
-    fn typing_into_a_cse_block_keeps_the_typed_value() {
+    fn a_value_typed_into_a_cse_block_is_refilled_by_the_block() {
+        // Excel refuses to change part of an array; the block owns its cells.
         let mut pkg = cse_book("C1:C3", "A1");
         let mut eng = crate::engine::Engine::new(&pkg.workbook);
         eng.recalc_all(&mut pkg.workbook);
-        eng.set_cell(&mut pkg.workbook, (0, 1, 2), Cell::number(99.0));
-        assert_eq!(val(&pkg, "C2"), CellValue::Number(99.0));
-        // Blocked: the anchor keeps its own value (never `#SPILL!`), and
-        // the rest of the block is cleared.
+        for typed in [99.0, 1.0] {
+            eng.set_cell(&mut pkg.workbook, (0, 1, 2), Cell::number(typed));
+            for n in ["C1", "C2", "C3"] {
+                assert_eq!(val(&pkg, n), CellValue::Number(1.0), "{typed} {n}");
+            }
+        }
+        // Still the block's: it follows its input.
+        eng.set_cell(&mut pkg.workbook, (0, 0, 0), Cell::number(5.0));
+        for n in ["C1", "C2", "C3"] {
+            assert_eq!(val(&pkg, n), CellValue::Number(5.0), "{n}");
+        }
+        let ws = saved_sheet1(&pkg);
+        assert!(
+            ws.contains(r#"<f t="array" ref="C1:C3">A1</f><v>5</v>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn a_formula_in_a_cse_block_blocks_it_until_it_goes() {
+        let mut pkg = cse_book("C1:C3", "A1");
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 1, 2), Cell::formula("A2*100"));
+        // The formula stays; the anchor keeps its own value (never `#SPILL!`)
+        // and the rest of the block is cleared.
+        assert_eq!(val(&pkg, "C2"), CellValue::Number(200.0));
         assert_eq!(val(&pkg, "C1"), CellValue::Number(1.0));
         assert_eq!(val(&pkg, "C3"), CellValue::Empty);
-        // Still blocked on the next recalc: the typed value is not overwritten.
         eng.set_cell(&mut pkg.workbook, (0, 0, 0), Cell::number(5.0));
-        assert_eq!(val(&pkg, "C2"), CellValue::Number(99.0));
         assert_eq!(val(&pkg, "C1"), CellValue::Number(5.0));
+        assert_eq!(val(&pkg, "C2"), CellValue::Number(200.0));
+        assert_eq!(val(&pkg, "C3"), CellValue::Empty);
         eng.set_cell(&mut pkg.workbook, (0, 1, 2), Cell::default());
-        assert_eq!(val(&pkg, "C2"), CellValue::Number(5.0));
-        assert_eq!(val(&pkg, "C3"), CellValue::Number(5.0));
+        for n in ["C1", "C2", "C3"] {
+            assert_eq!(val(&pkg, n), CellValue::Number(5.0), "{n}");
+        }
+    }
+
+    #[test]
+    fn pasting_values_over_a_whole_cse_block_freezes_it() {
+        // Anchor first, as a paste writes row-major: replacing the anchor
+        // ends the block, so the values pasted after it are plain constants.
+        let mut pkg = cse_book("C1:C3", "A1");
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        for r in 0..3 {
+            eng.set_cell(&mut pkg.workbook, (0, r, 2), Cell::number(1.0));
+        }
+        eng.set_cell(&mut pkg.workbook, (0, 0, 0), Cell::number(5.0));
+        for n in ["C1", "C2", "C3"] {
+            assert_eq!(val(&pkg, n), CellValue::Number(1.0), "{n}");
+        }
+        let ws = saved_sheet1(&pkg);
+        assert!(!ws.contains("t=\"array\""), "{ws}");
     }
 
     #[test]
