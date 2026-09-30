@@ -275,7 +275,10 @@ fn suppresses_line_numbers(p: &Paragraph) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Document, ParProps, Run, Table};
+    use crate::model::{
+        Document, ParProps, PropertyChange, PropertyScope, PropertySnapshot, PropertyState,
+        RevisionMetadata, Run, Table,
+    };
 
     fn para(text: &str, sect: Option<&str>) -> Block {
         Block::Paragraph(Paragraph {
@@ -546,5 +549,256 @@ mod tests {
             panic!()
         };
         assert!(p.props.raw_props.is_empty());
+    }
+
+    // ---- #748: splitting a section-closing paragraph keeps one break ----
+
+    fn props_of(e: &Editor, i: usize) -> &ParProps {
+        let Some(Block::Paragraph(p)) = e.doc.body.get(i) else {
+            panic!("block {i} is not a paragraph")
+        };
+        &p.props
+    }
+
+    fn text_of(e: &Editor, i: usize) -> String {
+        let Some(Block::Paragraph(p)) = e.doc.body.get(i) else {
+            panic!("block {i} is not a paragraph")
+        };
+        p.content.iter().map(Inline::text).collect()
+    }
+
+    /// Every `<w:sectPr` Save would write, the body's trailing one included.
+    fn saved_sect_prs(e: &Editor) -> usize {
+        crate::serialize::document_to_xml(&e.doc)
+            .matches("<w:sectPr")
+            .count()
+    }
+
+    fn sect_change_raw(e: &Editor, i: usize) -> Option<String> {
+        props_of(e, i)
+            .section_property_change
+            .as_ref()
+            .map(|c| c.raw.clone())
+    }
+
+    fn sect_change() -> PropertyChange {
+        let prior = sect("<w:type w:val=\"nextPage\"/>");
+        PropertyChange {
+            scope: PropertyScope::Section,
+            metadata: RevisionMetadata::default(),
+            raw: format!("<w:sectPrChange w:id=\"7\">{prior}</w:sectPrChange>"),
+            previous: PropertySnapshot::Present(PropertyState::Section(prior)),
+        }
+    }
+
+    /// `three()` with a tracked sectPr change on "one", the paragraph that
+    /// closes section 0.
+    fn three_with_a_sect_change() -> Editor {
+        let mut e = three();
+        if let Some(Block::Paragraph(p)) = e.doc.body.get_mut(0) {
+            p.props.section_property_change = Some(sect_change());
+        }
+        e
+    }
+
+    #[test]
+    fn enter_in_a_section_closing_paragraph_keeps_one_break_748() {
+        let mut e = three();
+        let before = e.doc.clone();
+        let saved = saved_sect_prs(&e);
+        let brk = props_of(&e, 0).section_break.clone();
+        e.caret = Caret::top(0, 2);
+        e.insert_newline();
+        assert_eq!(e.sections().len(), 3);
+        assert_eq!((text_of(&e, 0), text_of(&e, 1)), ("on".into(), "e".into()));
+        assert_eq!(props_of(&e, 0).section_break, None);
+        assert_eq!(props_of(&e, 0).section_property_change, None);
+        assert_eq!(props_of(&e, 1).section_break, brk);
+        assert_eq!(saved_sect_prs(&e), saved);
+        let after = e.doc.clone();
+        assert!(e.undo());
+        assert_eq!(e.doc, before);
+        assert!(e.redo());
+        assert_eq!(e.doc, after);
+    }
+
+    #[test]
+    fn enter_at_the_ends_of_a_section_closing_paragraph_748() {
+        for (off, texts) in [(0, ("", "one")), (3, ("one", ""))] {
+            let mut e = three();
+            let saved = saved_sect_prs(&e);
+            let brk = props_of(&e, 0).section_break.clone();
+            e.caret = Caret::top(0, off);
+            e.insert_newline();
+            assert_eq!(e.sections().len(), 3, "offset {off}");
+            assert_eq!(
+                (text_of(&e, 0), text_of(&e, 1)),
+                (texts.0.into(), texts.1.into()),
+                "offset {off}"
+            );
+            assert_eq!(props_of(&e, 0).section_break, None, "offset {off}");
+            assert_eq!(props_of(&e, 1).section_break, brk, "offset {off}");
+            assert_eq!(saved_sect_prs(&e), saved, "offset {off}");
+        }
+    }
+
+    #[test]
+    fn enter_moves_a_section_property_change_with_the_break_748() {
+        let mut e = three_with_a_sect_change();
+        let saved = saved_sect_prs(&e);
+        let brk = props_of(&e, 0).section_break.clone();
+        e.caret = Caret::top(0, 2);
+        e.insert_newline();
+        assert_eq!(props_of(&e, 0).section_break, None);
+        assert_eq!(props_of(&e, 0).section_property_change, None);
+        assert_eq!(props_of(&e, 1).section_break, brk);
+        assert_eq!(sect_change_raw(&e, 1), Some(sect_change().raw));
+        assert_eq!(saved_sect_prs(&e), saved);
+    }
+
+    #[test]
+    fn multi_paragraph_paste_into_a_section_closing_paragraph_748() {
+        let run = |t: &str| {
+            vec![Inline::Run(Run {
+                text: t.into(),
+                ..Run::default()
+            })]
+        };
+        for n in [2, 3] {
+            let mut e = three_with_a_sect_change();
+            let saved = saved_sect_prs(&e);
+            let brk = props_of(&e, 0).section_break.clone();
+            let clip = Clip {
+                paras: ["A", "B", "C"][..n].iter().map(|t| run(t)).collect(),
+            };
+            e.caret = Caret::top(0, 2);
+            e.paste(&clip);
+            assert_eq!(e.sections().len(), 3, "{n} paragraphs");
+            assert_eq!(saved_sect_prs(&e), saved, "{n} paragraphs");
+            let last = n - 1;
+            assert_eq!(text_of(&e, last), format!("{}e", ["A", "B", "C"][last]));
+            for i in 0..last {
+                assert_eq!(props_of(&e, i).section_break, None, "{n}: para {i}");
+                assert_eq!(props_of(&e, i).section_property_change, None, "{n}: {i}");
+            }
+            assert_eq!(props_of(&e, last).section_break, brk, "{n} paragraphs");
+            assert_eq!(
+                sect_change_raw(&e, last),
+                Some(sect_change().raw),
+                "{n} paragraphs"
+            );
+        }
+    }
+
+    #[test]
+    fn insert_table_in_a_section_closing_paragraph_moves_its_property_change_748() {
+        let mut e = three_with_a_sect_change();
+        let saved = saved_sect_prs(&e);
+        let brk = props_of(&e, 0).section_break.clone();
+        e.caret = Caret::top(0, 2);
+        e.insert_table(1, 1, crate::table::AutoFit::Default)
+            .unwrap();
+        assert!(matches!(e.doc.body[1], Block::Table(_)));
+        assert_eq!(props_of(&e, 0).section_break, None);
+        assert_eq!(props_of(&e, 0).section_property_change, None);
+        assert_eq!(props_of(&e, 2).section_break, brk);
+        assert_eq!(sect_change_raw(&e, 2), Some(sect_change().raw));
+        assert_eq!(e.sections().len(), 3);
+        assert_eq!(saved_sect_prs(&e), saved);
+    }
+
+    /// "one" still closes section 0 with its tracked change, and Save writes
+    /// as many sectPr as `saved`.
+    fn assert_section_0_kept(e: &Editor, brk: &Option<String>, saved: usize, what: &str) {
+        assert_eq!(text_of(e, 0), "one", "{what}");
+        assert_eq!(&props_of(e, 0).section_break, brk, "{what}");
+        assert_eq!(sect_change_raw(e, 0), Some(sect_change().raw), "{what}");
+        assert_eq!(e.doc.body.len(), three().doc.body.len(), "{what}");
+        assert_eq!(e.sections().len(), 3, "{what}");
+        assert_eq!(saved_sect_prs(e), saved, "{what}");
+    }
+
+    #[test]
+    fn enter_then_backspace_keeps_the_section_748() {
+        for off in [3, 0] {
+            let mut e = three_with_a_sect_change();
+            let saved = saved_sect_prs(&e);
+            let brk = props_of(&e, 0).section_break.clone();
+            e.caret = Caret::top(0, off);
+            e.insert_newline();
+            assert_eq!(e.caret, Caret::top(1, 0));
+            e.backspace();
+            assert_section_0_kept(&e, &brk, saved, &format!("offset {off}"));
+        }
+    }
+
+    #[test]
+    fn enter_then_delete_keeps_the_section_748() {
+        let mut e = three_with_a_sect_change();
+        let saved = saved_sect_prs(&e);
+        let brk = props_of(&e, 0).section_break.clone();
+        e.caret = Caret::top(0, 3);
+        e.insert_newline();
+        e.caret = Caret::top(0, 3);
+        e.delete_forward();
+        assert_section_0_kept(&e, &brk, saved, "delete");
+    }
+
+    #[test]
+    fn deleting_across_a_split_section_paragraph_keeps_the_section_748() {
+        let mut e = three_with_a_sect_change();
+        let saved = saved_sect_prs(&e);
+        let brk = props_of(&e, 0).section_break.clone();
+        e.caret = Caret::top(0, 3);
+        e.insert_str(" more");
+        e.caret = Caret::top(0, 4);
+        e.insert_newline();
+        assert_eq!(
+            (text_of(&e, 0), text_of(&e, 1)),
+            ("one ".into(), "more".into())
+        );
+        let before = e.doc.clone();
+        e.anchor = Some(Caret::top(0, 2));
+        e.caret = Caret::top(1, 2);
+        assert!(e.delete_selection());
+        assert_eq!(text_of(&e, 0), "onre");
+        assert_eq!(props_of(&e, 0).section_break, brk);
+        assert_eq!(sect_change_raw(&e, 0), Some(sect_change().raw));
+        assert_eq!(e.sections().len(), 3);
+        assert_eq!(saved_sect_prs(&e), saved);
+        assert!(e.undo());
+        assert_eq!(e.doc, before);
+    }
+
+    #[test]
+    fn backspace_into_a_plain_paragraph_is_unchanged_748() {
+        let mut e = three();
+        let brk = props_of(&e, 0).section_break.clone();
+        e.caret = Caret::top(1, 0);
+        e.backspace();
+        assert_eq!(text_of(&e, 0), "onetwo");
+        assert_eq!(props_of(&e, 0).section_break, brk);
+        assert_eq!(e.sections().len(), 3);
+    }
+
+    #[test]
+    fn merging_away_a_section_closing_paragraph_keeps_its_mark_748() {
+        // "two b" closes section 1: pulling it up into "two" deletes "two"'s
+        // paragraph mark, so "two b"'s section mark ends the merged paragraph.
+        let mut e = three();
+        let brk = props_of(&e, 2).section_break.clone();
+        e.caret = Caret::top(1, 3);
+        e.delete_forward();
+        assert_eq!(text_of(&e, 1), "twotwo b");
+        assert_eq!(props_of(&e, 1).section_break, brk);
+        assert_eq!(e.sections().len(), 3);
+        // Merging it into "one", which closes section 0, deletes that section's
+        // mark instead: the merged paragraph ends section 1, as in Word.
+        e.caret = Caret::top(1, 0);
+        e.backspace();
+        assert_eq!(text_of(&e, 0), "onetwotwo b");
+        assert_eq!(props_of(&e, 0).section_break, brk);
+        assert_eq!(e.sections().len(), 2);
+        assert_eq!(start_of(&e.sections()[0]), SectionStart::OddPage);
     }
 }
