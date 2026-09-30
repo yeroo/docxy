@@ -1166,9 +1166,11 @@ fn doc_state(editor: &Editor, flags: &ViewFlags) -> Json {
 }
 
 /// The caret's innermost table (#705), or null: its row count, the caret's
-/// row and cell, its style, the cell-range selection, and each cell's
-/// paragraphs as text (a tab shows as `⇥`, as the issues write it, so a
-/// script can name it).
+/// row and cell, its style and style options, the caret cell's shading and
+/// text direction, the cell-range selection when it lies in this table, and
+/// each cell's paragraphs as text (a tab shows as `⇥`, as the issues write
+/// it, so a script can name it). Every field describes this one table, even
+/// while a selection reaches out of it into an enclosing table.
 fn table_state(editor: &Editor) -> Json {
     let Some(pos) = editor.table_at_caret() else {
         return Json::Null;
@@ -1195,7 +1197,13 @@ fn table_state(editor: &Editor) -> Json {
             )
         })
         .collect();
-    let range = editor.cell_range().map_or(Json::Null, |r| {
+    let props = docxcore::table::table_props(t);
+    let look = props
+        .get("w:tblLook")
+        .map(docxcore::table_props::TblLook::parse)
+        .unwrap_or_default();
+    let range = editor.cell_range().filter(|r| r.table == pos.table);
+    let range = range.map_or(Json::Null, |r| {
         Json::obj(vec![
             ("top", Json::Num(r.top as f64)),
             ("bottom", Json::Num(r.bottom as f64)),
@@ -1209,11 +1217,8 @@ fn table_state(editor: &Editor) -> Json {
         ("columns", Json::Num(map.width(t) as f64)),
         ("row", Json::Num(pos.row as f64)),
         ("cell", Json::Num(pos.cell as f64)),
-        ("style", str_or_null(editor.table_style())),
-        (
-            "look",
-            str_or_null(editor.table_look().map(|l| format!("{:04X}", l.bits()))),
-        ),
+        ("style", str_or_null(props.attr("w:tblStyle", "w:val"))),
+        ("look", Json::Str(format!("{:04X}", look.bits()))),
         ("shading", str_or_null(editor.cell_shading())),
         ("text_direction", str_or_null(editor.cell_text_direction())),
         ("range", range),

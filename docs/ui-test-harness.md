@@ -310,7 +310,10 @@ default), the caret cell's `shading` (`RRGGBB`, `null` for none) and
 `text_direction`, the cell-range selection as `range` `{top, bottom, left,
 right}` (grid columns; `null` when the selection is not across cells), and
 `cells`: per row, per cell, the cell's paragraphs as text, with a tab shown as
-`⇥` so a script can name it (`assert table.cells.0.0.1 is b⇥c`). `view`
+`⇥` so a script can name it (`assert table.cells.0.0.1 is b⇥c`). Every field
+describes that one table: a selection from an outer table's cell into a table
+nested in another cell reports the nested table, with `range` `null` (the
+range belongs to the outer table, which the table commands act on). `view`
 carries `gridlines`, the Table Layout tab's View Gridlines.
 
 Insert > Table's hover grid is a menu item (`menu-read` reports it as

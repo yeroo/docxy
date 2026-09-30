@@ -254,9 +254,7 @@ impl Editor {
         self.edit_table(&path, |t| {
             repair_grid(t);
             let map = GridMap::of(t);
-            let widths: Vec<u32> = (r.left..=r.right)
-                .map(|c| t.grid.get(c).copied().unwrap_or(1440))
-                .collect();
+            let widths: Vec<u32> = (r.left..=r.right).map(|c| t.grid[c]).collect();
             for (ri, rm) in map.rows.iter().enumerate() {
                 let row = &mut t.rows[ri];
                 if let Some(ci) = rm
@@ -288,8 +286,7 @@ impl Editor {
                     _ => set_row_skips(row, rm.before, rm.after + n),
                 }
             }
-            let at = pos.min(t.grid.len());
-            t.grid.splice(at..at, widths);
+            t.grid.splice(pos..pos, widths);
             let c = GridMap::of(t).rows[caret_row].cell_at(pos).unwrap_or(0);
             Ok(After::Cell(caret_row, c))
         })
@@ -585,7 +582,7 @@ impl Editor {
             let map = GridMap::of(t);
             for (ri, rm) in map.rows.iter().enumerate() {
                 for (ci, &(s, n)) in rm.cells.iter().enumerate() {
-                    let w = xs[(s + n).min(xs.len() - 1)] - xs[s.min(xs.len() - 1)];
+                    let w = xs[s + n] - xs[s];
                     let tcw = match kind {
                         AutoFitKind::Contents => "<w:tcW w:w=\"0\" w:type=\"auto\"/>".to_string(),
                         AutoFitKind::Window => format!(
@@ -644,11 +641,11 @@ impl Editor {
         self.edit_table(&r.table, |t| {
             repair_grid(t);
             let (a, b) = if all {
-                (0, t.grid.len().saturating_sub(1))
+                (0, t.grid.len() - 1)
             } else {
-                (r.left, r.right.min(t.grid.len().saturating_sub(1)))
+                (r.left, r.right)
             };
-            if t.grid.is_empty() || a >= b {
+            if a >= b {
                 return Ok(After::Stay);
             }
             let n = (b - a + 1) as u32;
@@ -660,8 +657,7 @@ impl Editor {
             let map = GridMap::of(t);
             for (ri, rm) in map.rows.iter().enumerate() {
                 for (ci, &(s, span)) in rm.cells.iter().enumerate() {
-                    let w = xs[(s + span).min(xs.len() - 1)] - xs[s.min(xs.len() - 1)];
-                    set_dxa_width(&mut t.rows[ri].cells[ci], w);
+                    set_dxa_width(&mut t.rows[ri].cells[ci], xs[s + span] - xs[s]);
                 }
             }
             Ok(After::Stay)
@@ -1016,6 +1012,8 @@ fn set_dxa_width(cell: &mut crate::model::Cell, width: u32) {
 
 /// Merge the cells of `r` into one (see [`Editor::merge_cells`]).
 fn merge_range(t: &mut Table, r: &CellRange) -> Result<(), String> {
+    // The merged cell's width is summed from the grid.
+    repair_grid(t);
     let map = GridMap::of(t);
     if r.cells(&map).len() < 2 {
         return Err("select more than one cell to merge".into());
@@ -1851,6 +1849,29 @@ mod tests {
     }
 
     #[test]
+    fn merge_on_a_missing_short_or_zero_grid_gives_a_real_width() {
+        for (name, mut doc) in odd_grid_docs() {
+            let Block::Table(tb) = &mut doc.body[0] else {
+                panic!()
+            };
+            for cell in &mut tb.rows[0].cells {
+                crate::table::edit_cell_props(cell, |p| p.set("<w:tcW w:w=\"0\" w:type=\"dxa\"/>"));
+            }
+            let mut ed = Editor::new(doc);
+            select(&mut ed, (0, 0), (0, 2));
+            ed.merge_cells().unwrap_or_else(|e| panic!("{name}: {e}"));
+            let tb = t(&ed);
+            let total: u32 = tb.grid.iter().sum();
+            let w = crate::table_props::width_of(
+                crate::table::cell_props(&tb.rows[0].cells[0]).get("w:tcW"),
+            )
+            .unwrap()
+            .0;
+            assert!(w > 0 && w as u32 == total, "{name}: {w} of {total}");
+        }
+    }
+
+    #[test]
     fn a_caret_in_a_nested_table_does_not_steer_a_command_on_the_outer_one() {
         // Outer 1×2; its second cell holds a 3×1 table. The selection runs
         // from the outer first cell to the nested table's last row.
@@ -1877,14 +1898,24 @@ mod tests {
         let mut ed = setup();
         ed.select_table().unwrap();
         assert_eq!(ed.cell_range().unwrap().table, vec![0]);
+        // Text Direction steps from the outer range's first cell (tbRl →
+        // btLr), not from the nested caret cell (none → tbRl).
         let mut ed = setup();
+        {
+            let Block::Table(tb) = &mut ed.doc.body[0] else {
+                panic!()
+            };
+            crate::table::edit_cell_props(&mut tb.rows[0].cells[0], |p| {
+                p.set("<w:textDirection w:val=\"tbRl\"/>")
+            });
+        }
         ed.cycle_text_direction().unwrap();
         let first = &t(&ed).rows[0].cells[0];
         assert_eq!(
             crate::table::cell_props(first)
                 .attr("w:textDirection", "w:val")
                 .as_deref(),
-            Some("tbRl")
+            Some("btLr")
         );
     }
 

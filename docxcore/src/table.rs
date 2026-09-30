@@ -379,12 +379,9 @@ pub fn usable_grid(t: &Table) -> Vec<u32> {
 }
 
 /// Give the table a [`usable_grid`] before a command indexes it by grid
-/// column. Whether it changed.
-pub fn repair_grid(t: &mut Table) -> bool {
-    let grid = usable_grid(t);
-    let changed = grid != t.grid;
-    t.grid = grid;
-    changed
+/// column.
+pub fn repair_grid(t: &mut Table) {
+    t.grid = usable_grid(t);
 }
 
 /// Cut the grid at the given x positions (twips from the table's left edge),
