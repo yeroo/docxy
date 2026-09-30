@@ -144,6 +144,11 @@ pub struct CellMeta {
     /// Value-metadata index and the value it was loaded with: it describes
     /// that value, so it is written only while the cell still holds it.
     pub vm: Option<(String, CellValue)>,
+    /// The `<v>` text the file wrote for a rich error whose real value was
+    /// decoded from the value metadata (`#VALUE!` standing in for `#SPILL!`,
+    /// `#CALC!` or `#GETTING_DATA`). Written back instead of the value while
+    /// `vm` is.
+    pub vm_body: Option<String>,
     /// `ph="1"`: show phonetic text.
     pub ph: bool,
 }

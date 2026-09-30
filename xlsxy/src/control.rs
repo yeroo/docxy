@@ -1276,6 +1276,47 @@ mod tests {
     }
 
     #[test]
+    fn spill_and_calc_constants_are_refused_as_formulas() {
+        // #657: Excel refuses these as formulas (as it does #FIELD!), but a
+        // plain typed #SPILL! is the error value and #GETTING_DATA is a
+        // formula constant.
+        let mut a = app();
+        for text in [
+            "=#SPILL!",
+            "=#CALC!",
+            "=ERROR.TYPE(#SPILL!)",
+            "=ERROR.TYPE(#CALC!)",
+            "=#FIELD!",
+        ] {
+            let err = cell_set(
+                &mut a,
+                &Json::obj(vec![
+                    ("ref", Json::Str("A1".into())),
+                    ("text", Json::Str(text.into())),
+                ]),
+            )
+            .unwrap_err();
+            assert!(err.contains("formula error"), "{text}: {err}");
+        }
+        assert!(!a.modified);
+        set(&mut a, "A2", "#SPILL!");
+        assert_eq!(
+            a.sheet().cell(1, 0).unwrap().value,
+            CellValue::Error("#SPILL!".into())
+        );
+        let r = dispatch(
+            &mut a,
+            "formula.eval",
+            &Json::obj(vec![(
+                "formula",
+                Json::Str("=ERROR.TYPE(#GETTING_DATA)".into()),
+            )]),
+        )
+        .unwrap();
+        assert_eq!(r.get("text").and_then(|t| t.as_str()), Some("8"));
+    }
+
+    #[test]
     fn sheet_read_returns_window_and_respects_range() {
         let mut a = app();
         set(&mut a, "A1", "1");

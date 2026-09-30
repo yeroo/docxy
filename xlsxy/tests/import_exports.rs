@@ -169,3 +169,66 @@ fn recalc_of_a_macro_workbook_to_xlsx_drops_the_vba_project() {
     assert!(saved.has_vba_project());
     assert!(content_types(&kept).contains("sheet.macroEnabled.main+xml"));
 }
+
+/// #657: a typed `#SPILL!` Excel saved as a rich error (`<v>#VALUE!</v>` plus
+/// `vm`) survives `--recalc`: the cell keeps its `vm` and `#VALUE!` body, and
+/// ERROR.TYPE of it recalculates to 9, not 3.
+#[test]
+fn recalc_keeps_a_rich_spill_error() {
+    use gridcore::xlsx::{load_xlsx, new_xlsx, save_xlsx};
+    let dir = Dir::new("rich-error");
+    let mut pkg = load_xlsx(&save_xlsx(&new_xlsx())).unwrap();
+    let rels = String::from_utf8_lossy(pkg.part("xl/_rels/workbook.xml.rels").unwrap()).replace(
+        "</Relationships>",
+        r#"<Relationship Id="rId91" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sheetMetadata" Target="metadata.xml"/><Relationship Id="rId92" Type="http://schemas.microsoft.com/office/2017/06/relationships/rdRichValue" Target="richData/rdrichvalue.xml"/><Relationship Id="rId93" Type="http://schemas.microsoft.com/office/2017/06/relationships/rdRichValueStructure" Target="richData/rdrichvaluestructure.xml"/></Relationships>"#,
+    );
+    pkg.set_part("xl/_rels/workbook.xml.rels", rels.into_bytes());
+    pkg.set_part(
+        "xl/metadata.xml",
+        br#"<metadata xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:xlrd="http://schemas.microsoft.com/office/spreadsheetml/2017/richdata"><metadataTypes count="1"><metadataType name="XLRICHVALUE"/></metadataTypes><futureMetadata name="XLRICHVALUE" count="1"><bk><extLst><ext uri="{3e2802c4-a4d2-4d8b-9148-e3be6c30e623}"><xlrd:rvb i="0"/></ext></extLst></bk></futureMetadata><valueMetadata count="1"><bk><rc t="1" v="0"/></bk></valueMetadata></metadata>"#.to_vec(),
+    );
+    pkg.set_part(
+        "xl/richData/rdrichvalue.xml",
+        br#"<rvData xmlns="http://schemas.microsoft.com/office/spreadsheetml/2017/richdata" count="1"><rv s="0"><v>8</v></rv></rvData>"#.to_vec(),
+    );
+    pkg.set_part(
+        "xl/richData/rdrichvaluestructure.xml",
+        br#"<rvStructures xmlns="http://schemas.microsoft.com/office/spreadsheetml/2017/richdata" count="1"><s t="_error"><k n="errorType" t="i"/></s></rvStructures>"#.to_vec(),
+    );
+    // Save regenerates worksheets from the model, so the sheet goes into the
+    // zip afterwards, exactly as Excel wrote it.
+    let saved = save_xlsx(&pkg);
+    let zip = opccore::zip::ZipArchive::open(&saved).unwrap();
+    let entries: Vec<(String, Vec<u8>)> = zip
+        .entries()
+        .iter()
+        .map(|e| {
+            let bytes = if e.name == "xl/worksheets/sheet1.xml" {
+                br#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="e" vm="1"><v>#VALUE!</v></c><c r="B1"><f>ERROR.TYPE(A1)</f><v>3</v></c></row></sheetData></worksheet>"#.to_vec()
+            } else {
+                zip.extract(e).unwrap()
+            };
+            (e.name.clone(), bytes)
+        })
+        .collect();
+    let source = dir.0.join("rich.xlsx");
+    std::fs::write(&source, opccore::zipwrite::write_zip(&entries)).unwrap();
+
+    let out = dir.0.join("out.xlsx");
+    let result = run(&source, "--recalc", &out);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let saved = load_xlsx(&std::fs::read(&out).unwrap()).unwrap();
+    let ws = String::from_utf8_lossy(saved.part("xl/worksheets/sheet1.xml").unwrap()).into_owned();
+    assert!(
+        ws.contains(r#"<c r="A1" t="e" vm="1"><v>#VALUE!</v></c>"#),
+        "{ws}"
+    );
+    assert!(
+        ws.contains(r#"<c r="B1"><f>ERROR.TYPE(A1)</f><v>9</v></c>"#),
+        "{ws}"
+    );
+}
