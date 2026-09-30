@@ -5614,6 +5614,38 @@ impl SheetPackage {
         true
     }
 
+    /// Would [`add_chart`](Self::add_chart) on `sheet` get past its checks:
+    /// the sheet exists, its worksheet part has a known place for the
+    /// `<drawing>`, and a drawing part it already has can take an anchor?
+    /// A caller that keeps a chart to write later (docxy writes UI charts at
+    /// save) asks this when the chart is made, so a refusal is reported then.
+    /// It can't foresee the later refusal of a drawing-rels part too broken
+    /// to take the chart's relationship; that one needs the write.
+    pub fn can_add_chart(&self, sheet: usize) -> bool {
+        if sheet >= self.workbook.sheets.len() || !self.sheet_takes(sheet, "drawing", true) {
+            return false;
+        }
+        // A host part with neither a `</wsDr>` nor a self-closed root to open
+        // is truncated or isn't a drawing.
+        match self.chart_host(sheet).and_then(|p| self.part(&p)) {
+            Some(xml) => {
+                let xml = String::from_utf8_lossy(xml);
+                let px = wsdr_prefix(&xml);
+                xml.rfind(&format!("</{px}wsDr>")).is_some()
+                    || open_self_closed_root(&xml, &format!("{px}wsDr")).is_some()
+            }
+            None => true,
+        }
+    }
+
+    /// The drawing part `sheet` already has, which a new chart joins.
+    fn chart_host(&self, sheet: usize) -> Option<String> {
+        self.workbook.sheets[sheet]
+            .drawing_part
+            .clone()
+            .filter(|p| self.part(p).is_some())
+    }
+
     /// Write a clustered column chart (cached literal data, self-contained) onto
     /// `sheet`, anchored over the cell rect `from`..`to`, wiring the full OPC:
     /// the chart part, a drawing part with a twoCellAnchor graphicFrame, both
@@ -5623,7 +5655,7 @@ impl SheetPackage {
     /// `false`, with nothing changed, when the chart can't be written: the
     /// worksheet part (malformed where `<drawing>` would go) and the host
     /// drawing part (no root to splice the anchor into) are asked before any
-    /// part, rel or content type is written.
+    /// part, rel or content type is written ([`can_add_chart`](Self::can_add_chart)).
     pub fn add_chart(
         &mut self,
         sheet: usize,
@@ -5631,7 +5663,7 @@ impl SheetPackage {
         to: (u32, u32),
         data: &crate::sheet::ChartData,
     ) -> bool {
-        if sheet >= self.workbook.sheets.len() || !self.sheet_takes(sheet, "drawing", true) {
+        if !self.can_add_chart(sheet) {
             return false;
         }
         let ns = self.ns();
@@ -5646,10 +5678,7 @@ impl SheetPackage {
         // we'd still read it back, Excel would show only the part the worksheet
         // names. A second chart — or the first on a sheet that already holds a
         // picture — therefore joins the part that is already there.
-        let host = self.workbook.sheets[sheet]
-            .drawing_part
-            .clone()
-            .filter(|p| self.part(p).is_some());
+        let host = self.chart_host(sheet);
         let drawing_part = host.clone().unwrap_or_else(|| {
             let mut dn = 1;
             while self.part(&format!("xl/drawings/drawing{dn}.xml")).is_some() {
@@ -5661,17 +5690,6 @@ impl SheetPackage {
             .rsplit_once('/')
             .unwrap_or(("", drawing_part.as_str()));
         let (d_dir, d_file) = (d_dir.to_string(), d_file.to_string());
-        // A host part with neither a `</wsDr>` nor a self-closed root to open
-        // is truncated or isn't a drawing: refuse before writing anything.
-        if let Some(xml) = host.as_deref().and_then(|p| self.part(p)) {
-            let xml = String::from_utf8_lossy(xml);
-            let px = wsdr_prefix(&xml);
-            let spliceable = xml.rfind(&format!("</{px}wsDr>")).is_some()
-                || open_self_closed_root(&xml, &format!("{px}wsDr")).is_some();
-            if !spliceable {
-                return false;
-            }
-        }
 
         // 2) drawing rels → chart (its rId names the chart from the anchor).
         // Minted BEFORE the chart part is written, so a failure here leaves no
@@ -13824,6 +13842,24 @@ mod ct_worksheet_order_tests {
         assert_eq!(re.workbook.tables.len(), 1);
         assert_eq!(s.drawings.len(), 1);
         assert_eq!(re.comments().len(), 1);
+    }
+
+    #[test]
+    fn can_add_chart_refuses_a_part_damaged_where_drawing_goes() {
+        // Asked up front (docxy, when the user inserts a chart it writes at
+        // save), it answers as add_chart then does.
+        let mut pkg = loaded(&format!("{ROWS}{MARGINS}{STOPPED_TAIL}"));
+        let parts = pkg.parts.clone();
+        assert!(!pkg.can_add_chart(0));
+        assert!(!pkg.add_chart(0, (0, 3), (10, 8), &chart()));
+        assert_eq!(pkg.parts, parts);
+        assert!(!pkg.can_add_chart(1), "no such sheet");
+
+        let mut pkg = loaded(&format!("{ROWS}{MARGINS}"));
+        assert!(pkg.can_add_chart(0));
+        assert!(pkg.add_chart(0, (0, 3), (10, 8), &chart()));
+        // A second chart joins the drawing part the first made.
+        assert!(pkg.can_add_chart(0));
     }
 
     #[test]
