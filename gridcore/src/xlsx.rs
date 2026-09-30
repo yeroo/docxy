@@ -2704,11 +2704,32 @@ fn with_ref(fa: &str, r: &str) -> String {
 
 /// Replace `<sheetData>…</sheetData>` (or `<sheetData/>`) in the original
 /// worksheet XML, refresh `<dimension>`, and regenerate `<cols>`.
+///
+/// The cells always land. The other regenerated children follow the rules
+/// of [`put_worksheet_child`] and [`sync_worksheet_child`]: on a part whose
+/// walk stops early (a malformed child), what was found is replaced in place
+/// and nothing is inserted.
 fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
     // Found by local name, so `<x:sheetData>` is replaced, not joined by a
     // second one. A degenerate worksheet without one gets ours at its schema
     // position.
-    let mut out = put_worksheet_child(source, "sheetData", sheet_data, None, true);
+    let mut out = if worksheet_child_span(source, "sheetData").is_some() {
+        put_worksheet_child(source, "sheetData", sheet_data, None, true)
+    } else {
+        match sheet_data_fallback_span(source) {
+            // The walk stopped before sheetData (a malformed child ahead of
+            // it): find it the way the loader does, by its tags, so the
+            // edits are saved rather than silently dropped.
+            Some((s, e)) => {
+                let block = match worksheet_root(source) {
+                    Some(root) => in_worksheet_ns(&root, sheet_data),
+                    None => sheet_data.to_string(),
+                };
+                format!("{}{block}{}", &source[..s], &source[e..])
+            }
+            None => put_worksheet_child(source, "sheetData", sheet_data, None, true),
+        }
+    };
 
     // <dimension ref="…"/> → recomputed used range.
     let (rows, cols) = sheet.used_size();
@@ -2867,26 +2888,46 @@ struct WorksheetChild<'a> {
     end: usize,
 }
 
+/// What a walk over a worksheet's top-level children found.
+struct WorksheetWalk<'a> {
+    /// The children, in order. Each is a complete element, even when the
+    /// walk stopped after it.
+    children: Vec<WorksheetChild<'a>>,
+    /// Where `</worksheet>` starts: `Some` only when the walk reached it, so
+    /// `children` is the whole list.
+    close: Option<usize>,
+}
+
 /// The top-level children of a worksheet, and where `</worksheet>` starts.
 /// Only depth-1 elements count (the `<autoFilter>` inside a
 /// `<customSheetView>` is not one), compared by local name so `x:mergeCells`
 /// is `mergeCells`. A top-level `mc:AlternateContent` ranks as the first
 /// element in its first `Choice`/`Fallback`: Excel wraps `controls`,
-/// `oleObjects` and `legacyDrawing` that way. `None` when the walk can't
-/// finish (a truncated child, no `</worksheet>`, a self-closing root): a
-/// partial list must never pass for the whole, so callers leave such a part
-/// alone.
-fn worksheet_children(xml: &str) -> Option<(Vec<WorksheetChild<'_>>, usize)> {
-    let mut children = Vec::new();
+/// `oleObjects` and `legacyDrawing` that way.
+///
+/// The walk stops at a child it can't read to its end (a mismatched or
+/// missing end tag), and a self-closing root has nothing to walk. Then
+/// `close` is `None`: the children before the stop are real, but the list is
+/// not known to be whole, so a caller may replace or remove a child it found
+/// but must not insert, nor conclude that a child is absent.
+fn worksheet_children(xml: &str) -> WorksheetWalk<'_> {
+    let mut walk = WorksheetWalk {
+        children: Vec::new(),
+        close: None,
+    };
     let mut p = XmlParser::new(xml);
     // Skip to the root's start tag.
     loop {
         match p.next() {
             Event::Start => break,
-            Event::Eof => return None,
+            Event::Eof => return walk,
             _ => {}
         }
     }
+    if xml[..p.pos()].ends_with("/>") {
+        return walk;
+    }
+    let children = &mut walk.children;
     // Offset of `p`'s input within `xml`: the walk restarts past sheetData.
     let mut base = 0;
     loop {
@@ -2910,7 +2951,7 @@ fn worksheet_children(xml: &str) -> Option<(Vec<WorksheetChild<'_>>, usize)> {
                     }
                     None => {
                         if !p.skip_element_complete() {
-                            return None;
+                            return walk;
                         }
                         base + p.pos()
                     }
@@ -2926,22 +2967,43 @@ fn worksheet_children(xml: &str) -> Option<(Vec<WorksheetChild<'_>>, usize)> {
                     end,
                 });
             }
-            // `</worksheet>`: the end tag just consumed. A self-closing root
-            // ends here too, with nothing after its start tag to insert into.
+            // `</worksheet>`: the end tag just consumed.
             Event::End => {
-                let close = xml[..base + p.pos()].rfind("</")?;
-                return (close >= base).then_some((children, close));
+                walk.close = xml[..base + p.pos()].rfind("</");
+                return walk;
             }
-            Event::Eof => return None,
+            Event::Eof => return walk,
             Event::Text => {}
         }
     }
 }
 
+/// The first `<sheetData>` element in any prefix, found by its tags alone:
+/// for a worksheet whose top-level walk stops before reaching it.
+fn sheet_data_fallback_span(xml: &str) -> Option<(usize, usize)> {
+    let (start, prefix) = find_local_element(xml, "sheetData")?;
+    let gt = tag_end(xml, start);
+    if xml[..gt].ends_with("/>") {
+        return Some((start, gt));
+    }
+    let needle = format!("</{prefix}sheetData");
+    let mut from = gt;
+    loop {
+        let at = from + xml[from..].find(&needle)?;
+        let rest = &xml[at + needle.len()..];
+        let trimmed = rest.trim_start_matches([' ', '\t', '\r', '\n']);
+        if trimmed.starts_with('>') {
+            return Some((start, at + needle.len() + (rest.len() - trimmed.len()) + 1));
+        }
+        from = at + needle.len();
+    }
+}
+
 /// Just past the `</sheetData>` (any spacing before `>`) that closes the
 /// sheetData whose body starts at `body`, found without tokenising the cells.
-/// `None` sends the caller to the parser: no such tag, or a comment or CDATA
-/// section in the way that could hold a literal one.
+/// `None` sends the caller to the parser: no such tag, or a comment, CDATA
+/// section or processing instruction in the way that could hold a literal
+/// one.
 fn sheet_data_end(xml: &str, body: usize, qname: &str) -> Option<usize> {
     let needle = format!("</{qname}");
     let mut from = body;
@@ -2955,7 +3017,7 @@ fn sheet_data_end(xml: &str, body: usize, qname: &str) -> Option<usize> {
         from = at + needle.len();
     };
     let span = &xml[body..close];
-    (!span.contains("<!--") && !span.contains("<![CDATA[")).then_some(close)
+    (!span.contains("<!--") && !span.contains("<![CDATA[") && !span.contains("<?")).then_some(close)
 }
 
 /// The local name of the first element inside the first `Choice` or
@@ -2980,32 +3042,63 @@ fn ct_worksheet_rank(name: &str) -> Option<usize> {
 
 /// Byte offset at which a new top-level `<tag>` belongs: before the first
 /// existing top-level child that ranks after `tag`, else before
-/// `</worksheet>`. Children the schema doesn't name are not anchors.
+/// `</worksheet>`. Children the schema doesn't name are not anchors. `None`
+/// when the walk didn't finish: there is no safe place to insert.
 fn worksheet_insert_pos(xml: &str, tag: &str) -> Option<usize> {
     let rank = ct_worksheet_rank(tag).unwrap_or(CT_WORKSHEET_ORDER.len());
-    let (children, close) = worksheet_children(xml)?;
+    let walk = worksheet_children(xml);
+    let close = walk.close?;
     Some(
-        children
+        walk.children
             .iter()
             .find(|c| ct_worksheet_rank(c.rank_as).is_some_and(|r| r > rank))
             .map_or(close, |c| c.start),
     )
 }
 
-/// The span of the first top-level `<tag>` (in any prefix), if there is one.
+/// The span of the first top-level `<tag>` (in any prefix) the walk found.
+/// `None` does not prove there is none when the walk stopped early; the
+/// insert paths check that for themselves.
 pub(crate) fn worksheet_child_span(xml: &str, tag: &str) -> Option<(usize, usize)> {
-    worksheet_children(xml)?
-        .0
+    worksheet_children(xml)
+        .children
         .iter()
         .find(|c| c.local == tag)
         .map(|c| (c.start, c.end))
 }
 
-/// `xml` with its top-level `<tag>` (if any) removed.
+/// `xml` with its top-level `<tag>` (if the walk found one) removed.
 pub(crate) fn remove_worksheet_child(xml: &str, tag: &str) -> String {
     match worksheet_child_span(xml, tag) {
         Some((s, e)) => format!("{}{}", &xml[..s], &xml[e..]),
         None => xml.to_string(),
+    }
+}
+
+/// Sync a singleton top-level `<tag>` with `block` (`None` drops it). With
+/// the whole worksheet walked, the old element goes and the new one lands at
+/// its schema position, which also repairs a misplaced one. When the walk
+/// stopped early, a found element is replaced where it stands and an unfound
+/// one is left alone: it may exist past the stop, and a second would be a
+/// duplicate.
+fn sync_worksheet_child(xml: &str, tag: &str, block: Option<&str>) -> String {
+    if worksheet_children(xml).close.is_none() {
+        return match worksheet_child_span(xml, tag) {
+            Some((s, e)) => {
+                let block = match (block, worksheet_root(xml)) {
+                    (Some(b), Some(root)) => in_worksheet_ns(&root, b),
+                    (Some(b), None) => b.to_string(),
+                    (None, _) => String::new(),
+                };
+                format!("{}{block}{}", &xml[..s], &xml[e..])
+            }
+            None => xml.to_string(),
+        };
+    }
+    let out = remove_worksheet_child(xml, tag);
+    match block {
+        Some(block) => put_worksheet_child(&out, tag, block, None, false),
+        None => out,
     }
 }
 
@@ -3097,7 +3190,9 @@ fn bind_r(xml: &mut String, root: &WorksheetRoot, block: String, rels: &str) -> 
 /// Put `block`, a top-level `<tag>` element written unprefixed, into the
 /// worksheet: in place of the existing `<tag>` (in any prefix) when
 /// `replace` is set and there is one, else at its `CT_Worksheet` position.
-/// With `rels`, the block's `r:id` is bound to that namespace.
+/// With `rels`, the block's `r:id` is bound to that namespace. A replace
+/// works whenever the walk found the element; an insert needs the whole
+/// worksheet walked, and otherwise the part is returned unchanged.
 pub(crate) fn put_worksheet_child(
     xml: &str,
     tag: &str,
@@ -3170,25 +3265,15 @@ pub(crate) fn append_to_worksheet_child(
 /// then re-insert at its schema position when the sheet is protected.
 /// Idempotent.
 fn set_sheet_protection(xml: &str, attrs: Option<&str>) -> String {
-    let out = remove_worksheet_child(xml, "sheetProtection");
-    match attrs {
-        Some(attrs) => put_worksheet_child(
-            &out,
-            "sheetProtection",
-            &format!("<sheetProtection {attrs}/>"),
-            None,
-            false,
-        ),
-        None => out,
-    }
+    let block = attrs.map(|a| format!("<sheetProtection {a}/>"));
+    sync_worksheet_child(xml, "sheetProtection", block.as_deref())
 }
 
 /// Rewrite the `<mergeCells>` block from the model's merged regions (removing it
 /// when there are none), at its schema position. Idempotent.
 fn set_merge_cells(xml: &str, merges: &[(u32, u32, u32, u32)]) -> String {
-    let out = remove_worksheet_child(xml, "mergeCells");
     if merges.is_empty() {
-        return out;
+        return sync_worksheet_child(xml, "mergeCells", None);
     }
     let cells: String = merges
         .iter()
@@ -3204,7 +3289,7 @@ fn set_merge_cells(xml: &str, merges: &[(u32, u32, u32, u32)]) -> String {
         "<mergeCells count=\"{}\">{cells}</mergeCells>",
         merges.len()
     );
-    put_worksheet_child(&out, "mergeCells", &block, None, false)
+    sync_worksheet_child(xml, "mergeCells", Some(&block))
 }
 
 /// A `<dxf>` (differential format) for conditional formatting.
@@ -4476,23 +4561,29 @@ impl SheetPackage {
         if sheet >= self.workbook.sheets.len() {
             return;
         }
-        self.workbook.sheets[sheet].cond_formats.clear();
         let sheet_part = self.sheet_parts[sheet].clone();
         if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
             // Every top-level block, in any prefix; never an x14 one in extLst.
-            if let Some((children, _)) = worksheet_children(&xml) {
-                let mut out = xml.clone();
-                for c in children
-                    .iter()
-                    .rev()
-                    .filter(|c| c.local == "conditionalFormatting")
-                {
-                    out.replace_range(c.start..c.end, "");
-                }
-                p.1 = out.into_bytes();
+            let walk = worksheet_children(&xml);
+            if walk.close.is_none() {
+                // A malformed child hides whatever follows it: the part may
+                // keep blocks we can't see, so neither side changes rather
+                // than the model claiming a clear the file doesn't carry.
+                return;
             }
+            let mut out = xml.clone();
+            for c in walk
+                .children
+                .iter()
+                .rev()
+                .filter(|c| c.local == "conditionalFormatting")
+            {
+                out.replace_range(c.start..c.end, "");
+            }
+            p.1 = out.into_bytes();
         }
+        self.workbook.sheets[sheet].cond_formats.clear();
     }
 
     pub fn add_chart(
@@ -10230,9 +10321,10 @@ mod ct_worksheet_order_tests {
 
     /// Every top-level child the schema names comes in `CT_Worksheet` order.
     fn in_ct_worksheet_order(xml: &str) -> Result<(), String> {
-        let ranked: Vec<(&str, usize)> = worksheet_children(xml)
-            .ok_or("the walk can't finish")?
-            .0
+        let walk = worksheet_children(xml);
+        walk.close.ok_or("the walk can't finish")?;
+        let ranked: Vec<(&str, usize)> = walk
+            .children
             .iter()
             .filter_map(|c| ct_worksheet_rank(c.rank_as).map(|r| (c.rank_as, r)))
             .collect();
@@ -10667,12 +10759,13 @@ mod ct_worksheet_order_tests {
             r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData >"#,
             r#"<sheetData><row r="1"><!-- </sheetData> --><c r="A1"><v>1</v></c></row></sheetData>"#,
             r#"<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t><![CDATA[</sheetData>]]></t></is></c></row></sheetData>"#,
+            r#"<sheetData><row r="1"><?x </sheetData>?><c r="A1"><v>1</v></c></row></sheetData>"#,
         ] {
             let xml = format!(r#"<worksheet xmlns="{NS}">{sheet_data}{tail}</worksheet>"#);
-            let (children, close) = worksheet_children(&xml).expect("the walk finishes");
-            let names: Vec<&str> = children.iter().map(|c| c.local).collect();
+            let walk = worksheet_children(&xml);
+            let names: Vec<&str> = walk.children.iter().map(|c| c.local).collect();
             assert_eq!(names, ["sheetData", "autoFilter", "mergeCells"], "{xml}");
-            assert_eq!(close, at(&xml, "</worksheet>"));
+            assert_eq!(walk.close, Some(at(&xml, "</worksheet>")));
             // And a save puts the merges after the filter, with one sheetData.
             let pkg = loaded(&format!("{sheet_data}{tail}"));
             let ws = saved_sheet(&pkg);
@@ -10685,13 +10778,89 @@ mod ct_worksheet_order_tests {
     fn a_worksheet_the_walk_cannot_finish_is_left_alone() {
         // No </worksheet>: nothing may be inserted at a guessed position.
         let truncated = format!(r#"<worksheet xmlns="{NS}"><sheetData/><pageMargins/>"#);
-        assert!(worksheet_children(&truncated).is_none());
+        assert!(worksheet_children(&truncated).close.is_none());
         assert_eq!(
             put_worksheet_child(&truncated, "mergeCells", "<mergeCells/>", None, false),
             truncated
         );
         let cut_child = format!(r#"<worksheet xmlns="{NS}"><sheetData/><hyperlinks><hyperlink"#);
-        assert!(worksheet_children(&cut_child).is_none());
+        let walk = worksheet_children(&cut_child);
+        assert!(walk.close.is_none());
+        // What it did read is real: the sheetData before the stop.
+        assert_eq!(walk.children.len(), 1);
+        // A self-closing root has nothing to walk, whatever its prolog holds.
+        let empty = format!(r#"<?xml version="1.0"?><!-- </x> --><worksheet xmlns="{NS}"/>"#);
+        let walk = worksheet_children(&empty);
+        assert!(walk.children.is_empty() && walk.close.is_none());
+    }
+
+    /// A worksheet the loader accepts but whose walk stops at a malformed
+    /// child: `<oddHeader>` closed as `</OddHeader>`.
+    const BROKEN_TAIL: &str = "<headerFooter><oddHeader>x</OddHeader></headerFooter>";
+
+    fn a3(pkg: &SheetPackage) -> Option<crate::sheet::CellValue> {
+        pkg.workbook.sheets[0].cell(2, 0).map(|c| c.value.clone())
+    }
+
+    #[test]
+    fn cell_edits_survive_a_malformed_child_after_sheet_data() {
+        let mut pkg = loaded(&format!(
+            r#"{ROWS}<mergeCells count="1"><mergeCell ref="D1:E1"/></mergeCells>{BROKEN_TAIL}"#
+        ));
+        pkg.workbook.sheets[0].set_cell(2, 0, Cell::number(9.0));
+        pkg.workbook.sheets[0].merges.push((5, 0, 5, 1));
+        pkg.workbook.sheets[0].set_protected(true);
+        let ws = saved_sheet(&pkg);
+        assert!(ws.contains(r#"<c r="A3""#), "the edit was dropped: {ws}");
+        assert_eq!(count_local(&ws, "sheetData"), 1, "{ws}");
+        // The found mergeCells is rewritten where it stands; the unseen tail
+        // might hold a sheetProtection, so none is inserted.
+        assert_eq!(count_local(&ws, "mergeCells"), 1, "{ws}");
+        assert!(ws.contains("A6:B6"), "{ws}");
+        assert_eq!(count_local(&ws, "sheetProtection"), 0, "{ws}");
+        assert!(ws.contains(BROKEN_TAIL), "{ws}");
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(a3(&re), Some(crate::sheet::CellValue::Number(9.0)));
+    }
+
+    #[test]
+    fn cell_edits_survive_a_missing_worksheet_end_tag() {
+        let mut pkg = new_xlsx();
+        pkg.set_part(
+            SHEET,
+            format!(r#"<?xml version="1.0"?><worksheet xmlns="{NS}">{ROWS}{MARGINS}"#).into_bytes(),
+        );
+        let mut pkg = load_xlsx(&write_zip(&pkg.parts)).expect("load");
+        pkg.workbook.sheets[0].set_cell(2, 0, Cell::number(9.0));
+        let ws = saved_sheet(&pkg);
+        assert!(ws.contains(r#"<c r="A3""#), "the edit was dropped: {ws}");
+        assert_eq!(count_local(&ws, "sheetData"), 1, "{ws}");
+    }
+
+    #[test]
+    fn cell_edits_survive_a_malformed_child_before_sheet_data() {
+        let mut pkg = loaded(&format!(
+            r#"<sheetViews><sheetView workbookViewId="0"></SheetView></sheetViews>{ROWS}{MARGINS}"#
+        ));
+        pkg.workbook.sheets[0].set_cell(2, 0, Cell::number(9.0));
+        let ws = saved_sheet(&pkg);
+        assert!(ws.contains(r#"<c r="A3""#), "the edit was dropped: {ws}");
+        assert_eq!(count_local(&ws, "sheetData"), 1, "{ws}");
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(a3(&re), Some(crate::sheet::CellValue::Number(9.0)));
+    }
+
+    #[test]
+    fn clearing_conditional_formats_behind_a_malformed_child_changes_nothing() {
+        let mut pkg = loaded(&format!(
+            r#"{ROWS}<conditionalFormatting sqref="A1"><cfRule type="expression" priority="1"><formula>TRUE</formula></cfRule></conditionalFormatting>{BROKEN_TAIL}"#
+        ));
+        let before = pkg.part(SHEET).unwrap().to_vec();
+        let rules = pkg.workbook.sheets[0].cond_formats.len();
+        pkg.clear_conditional_formats(0);
+        // Neither side claims a clear the other doesn't carry.
+        assert_eq!(pkg.part(SHEET).unwrap(), before.as_slice());
+        assert_eq!(pkg.workbook.sheets[0].cond_formats.len(), rules);
     }
 
     #[test]
