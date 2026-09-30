@@ -24,6 +24,7 @@ compile_error!(
 
 mod close;
 mod control;
+mod crashlog;
 mod dialog;
 mod dialog_host;
 mod harness;
@@ -25352,6 +25353,9 @@ fn quit_mode() -> QuitMode {
 }
 
 fn main() {
+    // First, before anything can panic: the release build has no console, so
+    // a panic's only trace is the crash log (#733).
+    crashlog::install(config_root());
     // The command line: files to open (e.g. double-clicking a document in
     // Explorer, opened on top of the restored hot-exit session), plus the
     // opt-in `--harness` flag.
@@ -25375,6 +25379,8 @@ fn main() {
         ) {
             Ok(root) => root,
             Err(e) => {
+                // Not in the crash log: a refusal means the root is the real
+                // profile, and it is deliberate, not a silent crash.
                 eprintln!("docxy: {e}");
                 std::process::exit(2);
             }
@@ -25382,7 +25388,9 @@ fn main() {
         match harness::start(&root, true) {
             Ok(pair) => Some(pair),
             Err(e) => {
-                eprintln!("docxy: the harness could not start its control server: {e}");
+                let msg = format!("docxy: the harness could not start its control server: {e}");
+                eprintln!("{msg}");
+                crashlog::startup(&root, &msg);
                 std::process::exit(2);
             }
         }
@@ -25390,7 +25398,9 @@ fn main() {
         match harness::start(&config_root(), false) {
             Ok(pair) => Some(pair),
             Err(e) => {
-                eprintln!("docxy: Project control unavailable: {e}");
+                let msg = format!("docxy: Project control unavailable: {e}");
+                eprintln!("{msg}");
+                crashlog::startup(&config_root(), &msg);
                 None
             }
         }

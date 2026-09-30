@@ -77,6 +77,20 @@ write somewhere else. The number is the step's line in the script: two steps may
 look at the same region, and without it the later capture would overwrite the
 one the failure above it points at.
 
+### Crash log
+
+The suite (harness or not) appends every panic, on any thread, to
+`<config root>/docxy/crash.log`: the sandbox for a harness instance, otherwise
+`%APPDATA%\docxy\crash.log`. The same file gets the start-up failures `main`
+otherwise only prints: the harness control server failing to start and
+"Project control unavailable". The release build has no console, so this file
+is often the only place a panic shows up. An entry has a UTC timestamp, pid,
+version, thread, message, `file:line:col` and a backtrace. Past 256 KiB the log
+moves to `crash.log.1`. A stack overflow, a native or GPU access violation, an
+abort and `taskkill` never reach it, so for those the exit code is the only
+evidence. A release backtrace resolves function names only through `suite.pdb`
+next to the exe, and has no line numbers.
+
 ## Driving one by hand
 
 Working a case out interactively beats guessing at it. Start an instance
