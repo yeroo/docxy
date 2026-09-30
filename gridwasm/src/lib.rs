@@ -144,6 +144,27 @@ pub extern "C" fn grid_save(handle: u32) -> *mut u8 {
     with_session(handle, |s| s.save())
 }
 
+/// [`grid_save`] for a file of a given type, so a host writing `x.xlsx`
+/// gets a real workbook even from a template or macro workbook. `kind`:
+/// 1 = `.xlsx`, 2 = `.xlsm`, 3 = `.xltx`, 4 = `.xltm`; any other value keeps
+/// the loaded type, as [`grid_save`] does.
+#[unsafe(no_mangle)]
+pub extern "C" fn grid_save_as(handle: u32, kind: u32) -> *mut u8 {
+    with_session(handle, |s| s.save_as(kind_from_code(kind)))
+}
+
+/// The file type a host's `grid_save_as` code names.
+fn kind_from_code(code: u32) -> Option<gridcore::xlsx::SpreadsheetKind> {
+    use gridcore::xlsx::SpreadsheetKind::*;
+    match code {
+        1 => Some(Workbook),
+        2 => Some(MacroWorkbook),
+        3 => Some(Template),
+        4 => Some(MacroTemplate),
+        _ => None,
+    }
+}
+
 /// Bytes of a fresh empty workbook (the host's empty-file create flow).
 /// Stateless — no handle needed. Returns a length-prefixed buffer.
 #[unsafe(no_mangle)]
@@ -238,6 +259,76 @@ mod tests {
         );
 
         grid_close(handle);
+    }
+
+    /// Read back a length-prefixed result buffer as bytes and free it.
+    fn read_bytes(ptr: *mut u8) -> Vec<u8> {
+        // SAFETY: `ptr` is a live length-prefixed buffer from this module.
+        unsafe {
+            let len = u32::from_le_bytes([*ptr, *ptr.add(1), *ptr.add(2), *ptr.add(3)]) as usize;
+            let data = std::slice::from_raw_parts(ptr.add(4), len).to_vec();
+            grid_free(ptr, 4 + len);
+            data
+        }
+    }
+
+    /// #727: `grid_save_as` writes the content type of the file type it is
+    /// told; an unknown code keeps the loaded type, as `grid_save` does.
+    #[test]
+    fn grid_save_as_writes_the_named_file_type() {
+        use gridcore::xlsx::{SpreadsheetKind, load_xlsx, new_xlsx, save_xlsx_as};
+        let bytes = save_xlsx_as(&new_xlsx(), SpreadsheetKind::Template);
+        let doc_ptr = write_into_wasm(&bytes);
+        // SAFETY: `doc_ptr`/`bytes.len()` is the allocation just written.
+        let handle = unsafe { grid_open(doc_ptr, bytes.len()) };
+        unsafe { grid_free(doc_ptr, bytes.len()) };
+        assert_ne!(handle, 0);
+
+        let workbook_ct = |bytes: &[u8]| {
+            let pkg = load_xlsx(bytes).expect("saved bytes reload");
+            let ct = String::from_utf8_lossy(pkg.part("[Content_Types].xml").unwrap()).into_owned();
+            [
+                SpreadsheetKind::Workbook,
+                SpreadsheetKind::MacroWorkbook,
+                SpreadsheetKind::Template,
+                SpreadsheetKind::MacroTemplate,
+            ]
+            .into_iter()
+            .find(|k| {
+                ct.contains(&format!(
+                    "PartName=\"/xl/workbook.xml\" ContentType=\"{}\"",
+                    k.main_content_type()
+                ))
+            })
+        };
+        for (code, kind) in [
+            (1, SpreadsheetKind::Workbook),
+            (2, SpreadsheetKind::MacroWorkbook),
+            (3, SpreadsheetKind::Template),
+            (4, SpreadsheetKind::MacroTemplate),
+        ] {
+            assert_eq!(
+                workbook_ct(&read_bytes(grid_save_as(handle, code))),
+                Some(kind),
+                "code {code}"
+            );
+        }
+        for code in [0, 5, u32::MAX] {
+            assert_eq!(
+                workbook_ct(&read_bytes(grid_save_as(handle, code))),
+                Some(SpreadsheetKind::Template),
+                "code {code} keeps the loaded type"
+            );
+        }
+        assert_eq!(
+            workbook_ct(&read_bytes(grid_save(handle))),
+            Some(SpreadsheetKind::Template)
+        );
+        grid_close(handle);
+        assert!(
+            read_bytes(grid_save_as(handle, 1)).is_empty(),
+            "closed handle"
+        );
     }
 
     #[test]

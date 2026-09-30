@@ -132,4 +132,23 @@ class GridEngineTest {
             assertTrue("ctl sheet.list failed: $reply", reply["ok"] == true)
         }
     }
+
+    /** #727: the save writes the type of the file it goes to. */
+    @Test
+    fun saveAsWritesTheFileType() {
+        assertEquals(1L, GridEngine.kindCode("book.xlsx"))
+        assertEquals(2L, GridEngine.kindCode("Book.XLSM"))
+        assertEquals(3L, GridEngine.kindCode("t.xltx"))
+        assertEquals(4L, GridEngine.kindCode("t.xltm"))
+        assertEquals(0L, GridEngine.kindCode("notes.bak"))
+        assertEquals(0L, GridEngine.kindCode("noext"))
+        GridEngine().use { e ->
+            assertTrue(e.open(fixture("sample.xlsx")))
+            val template = String(e.saveAs("t.xltx"), Charsets.ISO_8859_1)
+            assertTrue(template.contains("spreadsheetml.template.main+xml"))
+            val book = e.saveAs("book.xlsx")
+            assertTrue(String(book, Charsets.ISO_8859_1).contains("spreadsheetml.sheet.main+xml"))
+            GridEngine().use { again -> assertTrue(again.open(book)) }
+        }
+    }
 }

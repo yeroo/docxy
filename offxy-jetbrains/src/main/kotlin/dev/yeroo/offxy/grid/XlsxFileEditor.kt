@@ -235,7 +235,8 @@ class XlsxFileEditor(
 
     fun saveNow() {
         if (grid == null || !modified) return
-        val bytes = engine.save()
+        // The file's own type: a template-typed package saved to .xlsx becomes a workbook.
+        val bytes = engine.saveAs(xlsxFile.name)
         savingToDisk = true
         try {
             WriteAction.run<RuntimeException> { xlsxFile.setBinaryContent(bytes) }

@@ -15,6 +15,7 @@ class GridEngine : WasmBinding("/gridwasm.wasm", "grid") {
     private val closeFn = instance.export("grid_close")
     private val cmdFn = instance.export("grid_cmd")
     private val saveFn = instance.export("grid_save")
+    private val saveAsFn = instance.export("grid_save_as")
     private val ctlFn = instance.export("grid_ctl")
 
     private var handle = 0L
@@ -37,6 +38,14 @@ class GridEngine : WasmBinding("/gridwasm.wasm", "grid") {
     /** Serialize back to `.xlsx` bytes, losslessly. */
     fun save(): ByteArray = readResult(saveFn.apply(handle)[0])
 
+    /**
+     * Serialize as a file of [fileName]'s type (`.xlsx`, `.xlsm`, `.xltx`,
+     * `.xltm`): a template or macro workbook written to `x.xlsx` becomes a
+     * real workbook. Any other name keeps the loaded type, as [save] does.
+     */
+    fun saveAs(fileName: String): ByteArray =
+        readResult(saveAsFn.apply(handle, kindCode(fileName))[0])
+
     /** Service one agent ctl request (`{"verb":…,"args":…}`). */
     fun ctl(requestJson: String): String =
         String(callWithHandle(ctlFn, handle, requestJson.toByteArray()))
@@ -49,6 +58,12 @@ class GridEngine : WasmBinding("/gridwasm.wasm", "grid") {
     }
 
     companion object {
+        /** `grid_save_as`'s code for [fileName]'s extension: 1 = xlsx, 2 = xlsm,
+         *  3 = xltx, 4 = xltm, 0 = keep the loaded type. */
+        fun kindCode(fileName: String): Long =
+            (listOf("xlsx", "xlsm", "xltx", "xltm")
+                .indexOf(fileName.substringAfterLast('.', "").lowercase()) + 1).toLong()
+
         /** Bytes of a fresh empty workbook (`grid_new`). Stateless. */
         fun newWorkbook(): ByteArray =
             GridEngine().use { it.readResult(it.instance.export("grid_new").apply()[0]) }

@@ -6,6 +6,8 @@
 //   grid_open(ptr,len)->handle, grid_close(handle)
 //   grid_cmd(handle,ptr,len)->resultPtr   (viewport JSON)
 //   grid_save(handle)->resultPtr          (xlsx bytes)
+//   grid_save_as(handle,kind)->resultPtr  (bytes of file type kind: 1 xlsx,
+//                                          2 xlsm, 3 xltx, 4 xltm, 0 loaded)
 // A "result" buffer is [u32 little-endian length][payload bytes].
 
 (function () {
@@ -617,7 +619,10 @@
         requestView();
         break;
       case 'getBytes': {
-        const bytes = readResult(ex.grid_save(handle));
+        // The type of the file being written; an older wasm without
+        // grid_save_as keeps the loaded type.
+        const bytes = readResult(
+          ex.grid_save_as ? ex.grid_save_as(handle, msg.kind || 0) : ex.grid_save(handle));
         vscode.postMessage({ type: 'bytes', requestId: msg.requestId, data: bytesToBase64(bytes) });
         break;
       }
