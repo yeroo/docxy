@@ -60,6 +60,43 @@ fn csv_and_recalc_refuse_the_actual_csv_or_tsv_input() {
     }
 }
 
+/// #727 r1: a headless `--csv` from a template never writes over the
+/// template, even through another spelling or a hard link. (The editor binds
+/// a template to a new `<stem>N.xlsx`; a headless run does not.)
+#[test]
+fn csv_export_of_a_template_refuses_the_template_itself() {
+    use gridcore::xlsx::{SpreadsheetKind, new_xlsx, save_xlsx_as};
+    let dir = Dir::new("template-guard");
+    let source = dir.0.join("Budget.xltx");
+    let bytes = save_xlsx_as(&new_xlsx(), SpreadsheetKind::Template);
+    std::fs::write(&source, &bytes).unwrap();
+    let hard_link = dir.0.join("alias.xltx");
+    std::fs::hard_link(&source, &hard_link).unwrap();
+    for target in [source.clone(), dir.0.join("./Budget.xltx"), hard_link] {
+        let result = run(&source, "--csv", &target);
+        assert!(
+            !result.status.success(),
+            "{target:?} unexpectedly succeeded"
+        );
+        assert!(
+            String::from_utf8_lossy(&result.stderr)
+                .contains("cannot overwrite the source document"),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), bytes);
+    }
+    let out = dir.0.join("out.csv");
+    let result = run(&source, "--csv", &out);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(out.is_file());
+    assert!(!dir.0.join("Budget1.xlsx").exists());
+}
+
 #[test]
 fn imported_export_protects_rebound_workbook_and_recalc_still_saves_xlsx_in_place() {
     let dir = Dir::new("rebound-guard");

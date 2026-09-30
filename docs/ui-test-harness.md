@@ -567,17 +567,20 @@ lands in the case's sandbox folder. A tab that was never saved needs an
 absolute path. The format follows the extension by the app's own rules:
 documents save as `.docx`, `.md` (`.markdown`) or an editable-HTML bundle
 (`.html`/`.htm`, only in a build that can make one or from a tab that is one);
-workbooks as `.xlsx`; Projects as `.yppx` or MSPDI `.xml`. A path with no
-extension takes `format`'s (`docx`, `md`, `html` → `.docx.html`, `xlsx`,
-`yppx`, `xml`) or the kind's first (`.docx`, `.xlsx`, `.yppx`). The reply is
+workbooks as `.xlsx`, `.xlsm`, `.xltx` or `.xltm`, each written as that file
+type (a macro-free one without the workbook's macros); Projects as `.yppx` or
+MSPDI `.xml`. A path with no extension takes `format`'s (`docx`, `md`, `html`
+→ `.docx.html`, `xlsx`, `xlsm`, `xltx`, `xltm`, `yppx`, `xml`) or the kind's
+first (`.docx`, `.xlsx`, `.yppx`). The reply is
 `{path, format, title, dirty, status}`. Refused in words, with nothing written
 and the tab unchanged:
 
 - a missing or empty `path`; a relative `path` on a never-saved tab;
 - a format the tab kind cannot save (`Documents can be saved as .docx, .md or
-  .html`, `Workbooks can only be saved as .xlsx`, `Project schedules can only
-  be saved as .yppx or .xml (MSPDI)`), including any other document extension,
-  which the save would otherwise write as a Word package under that name;
+  .html`, `Workbooks can only be saved as .xlsx, .xlsm, .xltx or .xltm`,
+  `Project schedules can only be saved as .yppx or .xml (MSPDI)`), including
+  any other document extension, which the save would otherwise write as a
+  Word package under that name;
 - a `format` that does not match the extension given;
 - an existing file, unless `"overwrite": true` (the dialog would ask);
 - a write that fails: the reply is the tab's status (`save failed: …`), and

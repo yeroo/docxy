@@ -34,7 +34,7 @@ test a save-as that fails to write is an error
   call-error save-as {"path":"no-such-folder/deeper/out.docx"} => save failed
   assert title is basic.docx
 
-test save-as writes a workbook as xlsx only
+test save-as writes a workbook as one of the four workbook types only
   open copy:../fixtures/basic.xlsx
   click B2
   type 99
@@ -43,8 +43,11 @@ test save-as writes a workbook as xlsx only
   assert reply.format is xlsx
   assert reply.title is book2.xlsx
   assert dirty is false
-  call-error save-as {"path":"book3.csv"} => Workbooks can only be saved as .xlsx
-  call-error save-as {"path":"book3","format":"md"} => Workbooks can only be saved as .xlsx
+  call save-as {"path":"book-template","format":"xltx"}
+  assert reply.format is xltx
+  assert reply.title is book-template.xltx
+  call-error save-as {"path":"book3.csv"} => Workbooks can only be saved as .xlsx, .xlsm, .xltx or .xltm
+  call-error save-as {"path":"book3","format":"md"} => Workbooks can only be saved as .xlsx, .xlsm, .xltx or .xltm
 
 test save-as writes a Project as yppx or MSPDI xml
   open copy:../fixtures/schedule.xml

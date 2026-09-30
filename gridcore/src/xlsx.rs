@@ -2094,7 +2094,7 @@ pub fn save_xlsx(pkg: &SheetPackage) -> Vec<u8> {
 /// untouched.
 pub fn save_xlsx_as(pkg: &SheetPackage, kind: SpreadsheetKind) -> Vec<u8> {
     let without_macro_sheets;
-    let pkg = if !kind.allows_macros() && pkg.has_macro_sheets() {
+    let pkg = if !kind.allows_macros() && (pkg.has_macro_sheets() || pkg.has_macro_names()) {
         let mut copy = pkg.clone();
         copy.remove_macro_sheets();
         without_macro_sheets = copy;
@@ -2209,26 +2209,56 @@ impl SheetPackage {
         !self.macro_sheet_indices().is_empty()
     }
 
-    /// Drop the Excel 4.0 macro sheets and dialog sheets, as [`save_xlsx_as`]
-    /// does (on a copy) for a macro-free kind. Each goes through
-    /// [`Self::remove_sheet`]. Excel 4.0 names go too: every defined name
-    /// marked `xlm`, `function` or `vbProcedure`, and every name whose formula
-    /// refers to a removed sheet (`Auto_Open=Macro1!$A$1`). A workbook of
-    /// nothing but macro sheets first gains a blank worksheet, so one
-    /// remains. Returns whether there was anything to drop.
+    /// Whether workbook.xml has an Excel 4.0 name: a defined name marked
+    /// `xlm`, `function` or `vbProcedure`, which a macro-free file cannot
+    /// carry either, with or without a macro sheet.
+    pub fn has_macro_names(&self) -> bool {
+        self.part("xl/workbook.xml").is_some_and(|b| {
+            !remove_macro_names(&String::from_utf8_lossy(b), &|_: &str| false)
+                .1
+                .is_empty()
+        })
+    }
+
+    /// What a macro-free file (`.xlsx`, `.xltx`) written from this package
+    /// loses, in the words of Excel's warning: its VB project, its Excel 4.0
+    /// macro (and dialog) sheets, and its Excel 4.0 names. Empty when it
+    /// loses nothing.
+    pub fn macro_features(&self) -> Vec<&'static str> {
+        let mut features = Vec::new();
+        if self.has_vba_project() {
+            features.push("VB project");
+        }
+        if self.has_macro_sheets() {
+            features.push("Excel 4.0 macro sheets");
+        }
+        if self.has_macro_names() {
+            features.push("Excel 4.0 function stored in defined names");
+        }
+        features
+    }
+
+    /// Drop the Excel 4.0 macro content, as [`save_xlsx_as`] does (on a copy)
+    /// for a macro-free kind: the macro sheets and dialog sheets, each through
+    /// [`Self::remove_sheet`], and the Excel 4.0 names, which go even when
+    /// there is no macro sheet: every defined name marked `xlm`, `function`
+    /// or `vbProcedure`, and every name whose formula refers to a removed
+    /// sheet (`Auto_Open=Macro1!$A$1`). A workbook of nothing but macro
+    /// sheets first gains a blank worksheet, so one remains. Returns whether
+    /// there was anything to drop.
     ///
     /// Removing sheets shifts sheet indices, so an editor calls this only on
     /// a package nothing else indexes into.
     pub fn remove_macro_sheets(&mut self) -> bool {
         let doomed = self.macro_sheet_indices();
-        if doomed.is_empty() {
+        if doomed.is_empty() && !self.has_macro_names() {
             return false;
         }
         let names: Vec<String> = doomed
             .iter()
             .map(|&i| self.workbook.sheets[i].name.clone())
             .collect();
-        if doomed.len() == self.workbook.sheets.len() {
+        if !doomed.is_empty() && doomed.len() == self.workbook.sheets.len() {
             let mut n = 1;
             while self
                 .workbook
@@ -2284,18 +2314,32 @@ impl SheetPackage {
 
 /// Whether `formula` refers to sheet `sheet` by name: `Macro1!…` or
 /// `'Macro 1'!…`, case-insensitively, and not as the tail of a longer name.
+///
+/// Not in another workbook (`[1]Macro1!…`) or inside a string literal
+/// (`"Macro1!A1"`) either.
 fn formula_refers_to_sheet(formula: &str, sheet: &str) -> bool {
     let lower = formula.to_lowercase();
+    // Which byte offsets lie inside a "…" literal. An escaped `""` leaves
+    // and re-enters it, so plain toggling is right.
+    let mut in_string = vec![false; lower.len()];
+    let mut inside = false;
+    for (i, c) in lower.char_indices() {
+        if c == '"' {
+            inside = !inside;
+        }
+        in_string[i] = inside;
+    }
     let quoted = format!("'{}'!", sheet.replace('\'', "''")).to_lowercase();
-    if lower.contains(&quoted) {
+    if lower.match_indices(&quoted).any(|(i, _)| !in_string[i]) {
         return true;
     }
     let bare = format!("{sheet}!").to_lowercase();
     lower.match_indices(&bare).any(|(i, _)| {
-        !lower[..i]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '\''))
+        !in_string[i]
+            && !lower[..i]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '\'' | ']'))
     })
 }
 
@@ -11418,6 +11462,63 @@ mod kind_tests {
         assert!(!formula_refers_to_sheet("XMacro1!$A$1", "Macro1"));
         assert!(!formula_refers_to_sheet("'Old Macro1'!$A$1", "Macro1"));
         assert!(!formula_refers_to_sheet("Data!$A$1", "Macro1"));
+        // Another workbook's sheet of the same name is not this one.
+        assert!(!formula_refers_to_sheet("[1]Macro1!$A$1", "Macro1"));
+        assert!(!formula_refers_to_sheet("'[1]My Macros'!$A$1", "My Macros"));
+        // Nor is text that only looks like a reference.
+        assert!(!formula_refers_to_sheet("\"Macro1!A1\"", "Macro1"));
+        assert!(!formula_refers_to_sheet("\"'My Macros'!A1\"", "My Macros"));
+        assert!(!formula_refers_to_sheet(
+            "\"say \"\"Macro1!\"\"\"",
+            "Macro1"
+        ));
+        assert!(formula_refers_to_sheet(
+            "IF(\"x\"=\"x\",Macro1!A1)",
+            "Macro1"
+        ));
+    }
+
+    /// #727 r1: an Excel 4.0 name goes from a macro-free file even when the
+    /// workbook has no macro sheet, and stays in a macro-enabled one.
+    #[test]
+    fn an_xlm_name_without_a_macro_sheet_is_dropped_from_a_macro_free_save() {
+        let pkg = xlm_book(&[("Data", "work"), ("Report", "work")]);
+        assert!(!pkg.has_macro_sheets());
+        assert!(pkg.has_macro_names());
+        assert_eq!(
+            pkg.macro_features(),
+            ["Excel 4.0 function stored in defined names"]
+        );
+        let out = roundtrip(&pkg, SpreadsheetKind::Workbook);
+        let wb = part_text(&out, "xl/workbook.xml");
+        assert!(!wb.contains("CellColor"), "{wb}");
+        assert!(wb.contains("name=\"Total\""), "{wb}");
+        assert!(!out.has_macro_names());
+        assert!(out.macro_features().is_empty());
+        assert_eq!(out.workbook.sheets.len(), 2);
+
+        let kept = roundtrip(&pkg, SpreadsheetKind::MacroWorkbook);
+        assert!(part_text(&kept, "xl/workbook.xml").contains("CellColor"));
+
+        // The in-memory drop does the same.
+        let mut copy = pkg.clone();
+        assert!(copy.remove_macro_sheets());
+        assert!(!copy.has_macro_names());
+        assert_eq!(copy.workbook.sheets.len(), 2);
+        assert!(!copy.remove_macro_sheets());
+    }
+
+    #[test]
+    fn macro_features_names_everything_a_macro_free_file_loses() {
+        assert!(new_xlsx().macro_features().is_empty());
+        assert_eq!(xlsm().macro_features(), ["VB project"]);
+        assert_eq!(
+            mixed_xlm_book().macro_features(),
+            [
+                "Excel 4.0 macro sheets",
+                "Excel 4.0 function stored in defined names"
+            ]
+        );
     }
 }
 

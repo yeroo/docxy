@@ -3801,18 +3801,6 @@ fn template_title(path: &std::path::Path) -> Option<String> {
         .find(|name| !path.with_file_name(name).exists())
 }
 
-/// What a macro-free file written from `pkg` loses, in Excel's words.
-fn macro_features(pkg: &gridcore::xlsx::SheetPackage) -> Vec<&'static str> {
-    let mut features = Vec::new();
-    if pkg.has_vba_project() {
-        features.push("VB project");
-    }
-    if pkg.has_macro_sheets() {
-        features.push("Excel 4.0 macro sheets");
-    }
-    features
-}
-
 /// Build a tab by loading `path` from disk — an .xlsx/.xlsm workbook, a
 /// Word/Markdown document, or a .yppx/.xml/.mpp project schedule, dispatched on
 /// the extension (.xml opens as Project). A template (.xltx/.xltm) opens as a
@@ -14888,7 +14876,7 @@ fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) -> bool
     // A macro-free type writes the file without the macros; the open
     // workbook keeps them, as Excel does, and the status says what went.
     let dropped = match gridcore::xlsx::SpreadsheetKind::from_path(&path) {
-        Some(kind) if !kind.allows_macros() => macro_features(&v.pkg),
+        Some(kind) if !kind.allows_macros() => v.pkg.macro_features(),
         _ => Vec::new(),
     };
     match opccore::fsio::write_atomic(&path, &bytes) {
@@ -15566,10 +15554,9 @@ mod sheet_save_tests {
         finish_sheet_save(&mut tab, Some(&dir.path("in.xlsm")));
         let ct = workbook_content_type(&dir.path("in.xlsm"));
         assert!(ct.contains("sheet.macroEnabled.main+xml"), "{ct}");
-        assert!(
-            ct.contains("macrosheet") || ct.contains("worksheet"),
-            "{ct}"
-        );
+        let again = gridcore::xlsx::load_xlsx(&std::fs::read(dir.path("in.xlsm")).unwrap()).unwrap();
+        assert!(again.has_macro_sheets());
+        assert_eq!(again.workbook.sheets.len(), 2);
 
         // Save As .xlsx writes a workbook without the macro sheet and says
         // so; the open workbook keeps it.

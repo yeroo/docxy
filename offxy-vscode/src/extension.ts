@@ -450,18 +450,18 @@ function registerMcpProvider(context: vscode.ExtensionContext): vscode.Disposabl
   });
 }
 
-/** A live binary document (`.docx`, and eventually other formats). The
- *  authoritative content lives in the webview's wasm session; this object
- *  just holds identity plus the on-disk bytes needed to (re)open, and
- *  coordinates request/response with its webview. */
 /** gridwasm's `grid_save_as` code for the spreadsheet type of `target`'s
  *  extension: 1 = .xlsx, 2 = .xlsm, 3 = .xltx, 4 = .xltm; 0 (keep the loaded
  *  type) for anything else or no target. */
-export function sheetKindCode(target?: vscode.Uri): number {
+function sheetKindCode(target?: vscode.Uri): number {
   const ext = target?.path.split('.').pop()?.toLowerCase();
   return ext ? ['xlsx', 'xlsm', 'xltx', 'xltm'].indexOf(ext) + 1 : 0;
 }
 
+/** A live binary document (`.docx`, and eventually other formats). The
+ *  authoritative content lives in the webview's wasm session; this object
+ *  just holds identity plus the on-disk bytes needed to (re)open, and
+ *  coordinates request/response with its webview. */
 class BinaryDocument implements vscode.CustomDocument {
   private readonly pending = new Map<number, (value: Uint8Array) => void>();
   private reqSeq = 0;
