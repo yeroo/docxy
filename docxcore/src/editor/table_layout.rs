@@ -11,7 +11,7 @@ use crate::model::{Align, Block, Inline, Paragraph, Run, RunProps, Table, TableR
 use crate::model::{Row, VMerge};
 use crate::table::{
     AutoFit, GridMap, edit_cell_props, edit_table_props, grid_xs, new_table, normalize_vmerge,
-    refine_grid, set_row_skips, template_cell, template_row,
+    refine_grid, repair_grid, set_row_skips, template_cell, template_row,
 };
 use crate::table_props::{VAlign, row_trpr, set_row_trpr, width_of};
 
@@ -148,6 +148,15 @@ impl Editor {
         self.last = EditKind::None;
     }
 
+    /// The caret's row when the caret is in the range's own table; the
+    /// range's top row when it is in a table nested inside it.
+    fn caret_row_in(&self, r: &CellRange) -> usize {
+        match self.table_at_caret() {
+            Some(p) if p.table == r.table => p.row,
+            _ => r.top,
+        }
+    }
+
     fn need_selection(&self) -> Result<CellRange, String> {
         self.table_selection()
             .ok_or_else(|| "the caret is not in a table".to_string())
@@ -189,20 +198,11 @@ impl Editor {
 
     /// Layout > Select > Table.
     pub fn select_table(&mut self) -> Result<(), String> {
-        let pos = self
-            .table_at_caret()
-            .or_else(|| {
-                self.cell_range().map(|r| super::TablePos {
-                    table: r.table,
-                    row: 0,
-                    cell: 0,
-                })
-            })
-            .ok_or("the caret is not in a table")?;
-        let t = self.table(&pos.table).ok_or("no table")?;
+        let table = self.need_selection()?.table;
+        let t = self.table(&table).ok_or("no table")?;
         let last_row = t.rows.len() - 1;
         let last_cell = t.rows[last_row].cells.len().saturating_sub(1);
-        self.select_cells(&pos.table, (0, 0), (last_row, last_cell));
+        self.select_cells(&table, (0, 0), (last_row, last_cell));
         Ok(())
     }
 
@@ -249,9 +249,10 @@ impl Editor {
         let r = self.need_selection()?;
         let n = r.right - r.left + 1;
         let pos = if left { r.left } else { r.right + 1 };
-        let caret_row = self.table_at_caret().map_or(r.top, |p| p.row);
+        let caret_row = self.caret_row_in(&r);
         let path = r.table.clone();
         self.edit_table(&path, |t| {
+            repair_grid(t);
             let map = GridMap::of(t);
             let widths: Vec<u32> = (r.left..=r.right)
                 .map(|c| t.grid.get(c).copied().unwrap_or(1440))
@@ -321,8 +322,9 @@ impl Editor {
             return self.delete_table();
         }
         let path = r.table.clone();
-        let caret_row = self.table_at_caret().map_or(r.top, |p| p.row);
+        let caret_row = self.caret_row_in(&r);
         self.edit_table(&path, |t| {
+            repair_grid(t);
             remove_grid_columns(t, r.left, r.right);
             let mut row = caret_row.min(t.rows.len().saturating_sub(1));
             if t.rows.is_empty() {
@@ -475,6 +477,7 @@ impl Editor {
         let r = self.need_selection()?;
         let path = r.table.clone();
         self.edit_table(&path, |t| {
+            repair_grid(t);
             let map = GridMap::of(t);
             let cells = r.cells(&map);
             let targets: Vec<(usize, u32)> = if merge_first && cells.len() > 1 {
@@ -562,6 +565,7 @@ impl Editor {
     pub fn autofit(&mut self, kind: AutoFitKind) -> Result<(), String> {
         let r = self.need_selection()?;
         self.edit_table(&r.table, |t| {
+            repair_grid(t);
             let total: u32 = t.grid.iter().sum();
             let xs = grid_xs(t);
             edit_table_props(t, |p| match kind {
@@ -620,7 +624,12 @@ impl Editor {
                 .ok_or("the rows have no set height to distribute")?;
             for i in rows {
                 let mut p = row_trpr(&t.rows[i].raw_props);
-                p.set(&format!("<w:trHeight w:val=\"{h}\"/>"));
+                // A row's height rule (exact or at least) is kept.
+                let rule = p
+                    .attr("w:trHeight", "w:hRule")
+                    .map(|r| format!(" w:hRule=\"{r}\""))
+                    .unwrap_or_default();
+                p.set(&format!("<w:trHeight w:val=\"{h}\"{rule}/>"));
                 set_row_trpr(&mut t.rows[i].raw_props, &p);
             }
             Ok(After::Stay)
@@ -633,6 +642,7 @@ impl Editor {
         let r = self.need_selection()?;
         let all = self.cell_range().is_none();
         self.edit_table(&r.table, |t| {
+            repair_grid(t);
             let (a, b) = if all {
                 (0, t.grid.len().saturating_sub(1))
             } else {
@@ -706,7 +716,16 @@ impl Editor {
     /// selected cell.
     pub fn cycle_text_direction(&mut self) -> Result<(), String> {
         let r = self.need_selection()?;
-        let current = self.cell_text_direction();
+        // The direction to step from: the caret cell's when the caret is in
+        // the table the command acts on, else the range's first cell's.
+        let current = match self.table_at_caret() {
+            Some(p) if p.table == r.table => self.cell_text_direction(),
+            _ => self.table(&r.table).and_then(|t| {
+                let map = GridMap::of(t);
+                let (ri, ci) = *r.cells(&map).first()?;
+                crate::table::cell_props(&t.rows[ri].cells[ci]).attr("w:textDirection", "w:val")
+            }),
+        };
         let next = match current.as_deref() {
             Some("tbRl") => Some("btLr"),
             Some("btLr") => None,
@@ -1096,7 +1115,7 @@ fn split_one(t: &mut Table, row: usize, x: u32, cols: usize, rows: usize) -> Res
     }
     // Columns: choose the grid boundaries the new cells start on.
     if cols > 1 {
-        let (col, _, n) = locate(t)?;
+        let (col, n) = (col0, n0);
         if n < cols {
             let xs = grid_xs(t);
             let (x0, x1) = (xs[col], xs[col + n]);
@@ -1743,6 +1762,152 @@ mod tests {
             2,
             "the linked picture's paragraph is kept"
         );
+    }
+
+    /// A 2×3 table whose grid is missing, too short, or all zero widths, as
+    /// some producers write it.
+    fn odd_grid_docs() -> Vec<(&'static str, Document)> {
+        [
+            ("no grid", vec![]),
+            ("short grid", vec![1000]),
+            ("zero grid", vec![0, 0, 0]),
+        ]
+        .into_iter()
+        .map(|(name, grid)| {
+            let mut doc = grid_doc(2, 3);
+            let Block::Table(tb) = &mut doc.body[0] else {
+                panic!()
+            };
+            tb.grid = grid;
+            (name, doc)
+        })
+        .collect()
+    }
+
+    #[test]
+    fn split_cells_on_a_missing_short_or_zero_grid() {
+        for (name, doc) in odd_grid_docs() {
+            for (cols, rows) in [(2, 1), (1, 2), (2, 2)] {
+                for cell in [0, 2] {
+                    let mut ed = Editor::new(doc.clone());
+                    ed.caret = at(0, cell);
+                    ed.split_cells(cols, rows, false)
+                        .unwrap_or_else(|e| panic!("{name} {cols}x{rows} cell {cell}: {e}"));
+                    let tb = t(&ed);
+                    assert_eq!(tb.rows.len(), 2 + rows - 1, "{name}");
+                    assert_eq!(
+                        tb.grid.len(),
+                        GridMap::of(tb).width(tb),
+                        "{name}: the grid covers every column"
+                    );
+                    assert!(tb.grid.iter().all(|&w| w > 0), "{name}");
+                    assert_eq!(
+                        visible(&ed)[0],
+                        3 + cols - 1,
+                        "{name} {cols}x{rows} cell {cell}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grid_commands_on_a_missing_short_or_zero_grid_do_not_panic() {
+        type Cmd = fn(&mut Editor) -> Result<(), String>;
+        let cmds: [(&str, Cmd); 11] = [
+            ("insert left", |e| e.insert_columns(true)),
+            ("insert right", |e| e.insert_columns(false)),
+            ("delete columns", |e| e.delete_columns()),
+            ("delete cells left", |e| {
+                e.delete_cells(DeleteShift::ShiftLeft)
+            }),
+            ("merge", |e| e.merge_cells()),
+            ("distribute columns", |e| e.distribute_columns()),
+            ("autofit fixed", |e| e.autofit(AutoFitKind::Fixed)),
+            ("autofit window", |e| e.autofit(AutoFitKind::Window)),
+            ("borders", |e| {
+                e.apply_borders(crate::editor::BorderCmd::All)
+            }),
+            ("sort", |e| {
+                e.sort_table(&SortSpec {
+                    header: false,
+                    keys: vec![SortKey {
+                        col: 2,
+                        kind: SortKind::Text,
+                        descending: true,
+                    }],
+                })
+            }),
+            ("select column", |e| e.select_column()),
+        ];
+        for (name, doc) in odd_grid_docs() {
+            for (label, cmd) in cmds {
+                let mut ed = Editor::new(doc.clone());
+                select(&mut ed, (0, 1), (1, 2));
+                cmd(&mut ed).unwrap_or_else(|e| panic!("{name}: {label}: {e}"));
+                assert!(ed.table(&[0]).is_some(), "{name}: {label}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_caret_in_a_nested_table_does_not_steer_a_command_on_the_outer_one() {
+        // Outer 1×2; its second cell holds a 3×1 table. The selection runs
+        // from the outer first cell to the nested table's last row.
+        let mut outer = grid_doc(1, 2);
+        let inner = grid_doc(3, 1);
+        let Block::Table(tb) = &mut outer.body[0] else {
+            panic!()
+        };
+        tb.rows[0].cells[1].blocks = vec![inner.body[0].clone(), para("")];
+        let setup = || {
+            let mut ed = Editor::new(outer.clone());
+            ed.anchor = Some(at(0, 0));
+            ed.caret = Caret::at(vec![0, 0, 1, 0, 2, 0, 0], 0);
+            assert_eq!(ed.cell_range().unwrap().table, vec![0]);
+            ed
+        };
+        let mut ed = setup();
+        ed.insert_columns(false).unwrap();
+        assert_eq!(t(&ed).grid.len(), 4, "two columns added to the outer table");
+        assert_eq!(ed.table(&[0, 0, 1, 0]).unwrap().grid.len(), 1);
+        let mut ed = setup();
+        ed.insert_columns(true).unwrap();
+        assert_eq!(t(&ed).grid.len(), 4);
+        let mut ed = setup();
+        ed.select_table().unwrap();
+        assert_eq!(ed.cell_range().unwrap().table, vec![0]);
+        let mut ed = setup();
+        ed.cycle_text_direction().unwrap();
+        let first = &t(&ed).rows[0].cells[0];
+        assert_eq!(
+            crate::table::cell_props(first)
+                .attr("w:textDirection", "w:val")
+                .as_deref(),
+            Some("tbRl")
+        );
+    }
+
+    #[test]
+    fn distribute_rows_keeps_each_rows_height_rule() {
+        let mut ed = Editor::new(grid_doc(2, 1));
+        {
+            let Block::Table(tb) = &mut ed.doc.body[0] else {
+                panic!()
+            };
+            tb.rows[0].raw_props =
+                vec!["<w:trPr><w:trHeight w:val=\"400\" w:hRule=\"exact\"/></w:trPr>".into()];
+            tb.rows[1].raw_props = vec!["<w:trPr><w:trHeight w:val=\"700\"/></w:trPr>".into()];
+        }
+        ed.distribute_rows().unwrap();
+        let h = |r: usize| {
+            row_trpr(&t(&ed).rows[r].raw_props)
+                .get("w:trHeight")
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(h(0), "<w:trHeight w:val=\"700\" w:hRule=\"exact\"/>");
+        assert_eq!(h(1), "<w:trHeight w:val=\"700\"/>");
     }
 
     #[test]

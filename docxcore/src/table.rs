@@ -355,10 +355,43 @@ pub fn normalize_vmerge(table: &mut Table) {
     }
 }
 
+/// The grid widths to work with: one per grid column the rows use (the
+/// table grid may be missing or shorter), none zero (some producers write
+/// `w:w="0"`). A missing or zero width takes the average of the known ones,
+/// else an equal share of the default text width.
+pub fn usable_grid(t: &Table) -> Vec<u32> {
+    let n = GridMap::of(t).width(t).max(1);
+    let known: Vec<u32> = t.grid.iter().copied().filter(|&w| w > 0).collect();
+    let fallback = if known.is_empty() {
+        (DEFAULT_TEXT_WIDTH / n as u32).max(1)
+    } else {
+        (known.iter().sum::<u32>() / known.len() as u32).max(1)
+    };
+    (0..n)
+        .map(|i| {
+            t.grid
+                .get(i)
+                .copied()
+                .filter(|&w| w > 0)
+                .unwrap_or(fallback)
+        })
+        .collect()
+}
+
+/// Give the table a [`usable_grid`] before a command indexes it by grid
+/// column. Whether it changed.
+pub fn repair_grid(t: &mut Table) -> bool {
+    let grid = usable_grid(t);
+    let changed = grid != t.grid;
+    t.grid = grid;
+    changed
+}
+
 /// Cut the grid at the given x positions (twips from the table's left edge),
-/// re-spanning every cell so nothing moves. Returns, for each old grid column
-/// boundary index `0..=len`, its new index.
-pub fn refine_grid(table: &mut Table, cuts: &[u32]) -> Vec<usize> {
+/// re-spanning every cell so nothing moves. The grid is repaired first
+/// ([`repair_grid`]), so every column boundary is distinct.
+pub fn refine_grid(table: &mut Table, cuts: &[u32]) {
+    repair_grid(table);
     let xs = grid_xs(table);
     let acc = xs.last().copied().unwrap_or(0);
     let mut all = xs.clone();
@@ -396,7 +429,6 @@ pub fn refine_grid(table: &mut Table, cuts: &[u32]) -> Vec<usize> {
             set_row_skips(row, new_before, new_after);
         }
     }
-    new_index
 }
 
 /// The x offset (twips) of each grid column boundary.
@@ -513,9 +545,8 @@ mod tests {
             rows: vec![row(&[1, 1], None), row(&[2], None)],
             ..Table::default()
         };
-        let idx = refine_grid(&mut t, &[500]);
+        refine_grid(&mut t, &[500]);
         assert_eq!(t.grid, vec![500, 500, 1000]);
-        assert_eq!(idx, vec![0, 2, 3]);
         assert_eq!(t.rows[0].cells[0].grid_span, 2);
         assert_eq!(t.rows[0].cells[1].grid_span, 1);
         assert_eq!(t.rows[1].cells[0].grid_span, 3);

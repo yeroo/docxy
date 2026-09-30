@@ -5,7 +5,7 @@
 //! `table_el` in main.rs turns it into elements.
 
 use docxcore::model::{Table, VMerge};
-use docxcore::table::{DEFAULT_TEXT_WIDTH, GridMap, cell_props};
+use docxcore::table::{GridMap, cell_props, usable_grid};
 use docxcore::table_props::{BorderLine, VAlign};
 use docxcore::table_styles::{CellLook, TableStyle, resolve};
 
@@ -65,31 +65,12 @@ pub struct RowBox {
     pub cells: Vec<CellBox>,
 }
 
-/// The grid widths to draw with: the table grid, filled out when it is
-/// missing or has zero-width columns.
-pub fn grid_widths(t: &Table, map: &GridMap) -> Vec<u32> {
-    let n = map.width(t).max(1);
-    let known: Vec<u32> = t.grid.iter().copied().filter(|&w| w > 0).collect();
-    let fallback = if known.is_empty() {
-        DEFAULT_TEXT_WIDTH / n as u32
-    } else {
-        known.iter().sum::<u32>() / known.len() as u32
-    };
-    (0..n)
-        .map(|i| {
-            t.grid
-                .get(i)
-                .copied()
-                .filter(|&w| w > 0)
-                .unwrap_or(fallback)
-        })
-        .collect()
-}
-
 /// Lay out `t` with its table style (if any).
 pub fn layout(t: &Table, style: Option<&TableStyle>) -> Vec<RowBox> {
     let map = GridMap::of(t);
-    let widths = grid_widths(t, &map);
+    // A missing, short or zero-width grid is filled out as the table
+    // commands repair it, so the view and the edits agree.
+    let widths = usable_grid(t);
     let span_w = |s: usize, n: usize| widths.iter().skip(s).take(n).sum::<u32>();
     let looks = resolve(t, style);
     map.rows
@@ -172,7 +153,7 @@ mod tests {
             rows[0]
                 .cells
                 .iter()
-                .all(|c| c.width == DEFAULT_TEXT_WIDTH / 3)
+                .all(|c| c.width == docxcore::table::DEFAULT_TEXT_WIDTH / 3)
         );
     }
 
