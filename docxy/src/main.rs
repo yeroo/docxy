@@ -3228,17 +3228,28 @@ impl App {
             let tag = if hf.is_header { "w:hdr" } else { "w:ftr" };
             // Links need relationships in the part's own rels; they are
             // computed first (the ids go into the XML) but written only with it.
+            let what = if hf.is_header { "header" } else { "footer" };
             let mut blocks = blocks;
-            let rels = self.pkg.link_part_hyperlinks(&hf.part, &mut blocks);
-            // Decode the part as the loader does (it may be UTF-16), and write
-            // it back in its own encoding; a part whose wrapper can't be found
-            // is left alone rather than overwritten.
-            let spliced = self
+            let written = self
                 .pkg
-                .part_text(&hf.part)
-                .and_then(|orig| splice_hf(&orig, &blocks, tag));
-            match spliced {
-                Some(new_xml) => {
+                .link_part_hyperlinks(&hf.part, &mut blocks)
+                .and_then(|rels| {
+                    // Decode the part as the loader does (it may be UTF-16),
+                    // and write it back in its own encoding; a part whose
+                    // wrapper can't be found is left alone.
+                    let xml = self
+                        .pkg
+                        .part_text(&hf.part)
+                        .and_then(|orig| splice_hf(&orig, &blocks, tag))
+                        .ok_or(if hf.is_header {
+                            "the part isn't readable header XML"
+                        } else {
+                            "the part isn't readable footer XML"
+                        })?;
+                    Ok((xml, rels))
+                });
+            match written {
+                Ok((new_xml, rels)) => {
                     self.pkg.set_part_text(&hf.part, &new_xml);
                     if let Some(rels) = rels {
                         self.pkg.apply_part_rels(rels);
@@ -3252,10 +3263,9 @@ impl App {
                     self.refresh_watermark_state();
                     self.modified = true;
                 }
-                None => {
-                    let what = if hf.is_header { "header" } else { "footer" };
+                Err(why) => {
                     self.status = Some(format!(
-                        "Couldn't write the {what} edit: {} isn't readable {what} XML.",
+                        "Couldn't write the {what} edit to {}: {why}.",
                         hf.part
                     ));
                 }
@@ -9313,6 +9323,53 @@ mod tests {
         let pdf = String::from_utf8_lossy(&to_pdf(&saved.document, &opts)).into_owned();
         assert!(pdf.contains("/URI (https://a.example/)"), "{pdf}");
         assert!(pdf.contains("/URI (https://b.example/)"));
+    }
+
+    #[test]
+    fn header_edit_link_with_unreadable_header_rels_writes_nothing() {
+        let link_body = |url: &str| {
+            vec![Block::Paragraph(MPara {
+                props: ParProps::default(),
+                content: vec![Inline::Hyperlink(docxcore::model::Hyperlink {
+                    target: Some(url.to_string()),
+                    runs: vec![Run {
+                        text: url.to_string(),
+                        props: RunProps::default(),
+                    }],
+                    ..docxcore::model::Hyperlink::default()
+                })],
+            })]
+        };
+        // A first link creates the header's rels, which then turn unreadable.
+        let mut app = app_with(&["body"]);
+        app.run_act(ribbon::Act::EditHeader);
+        let part = app.header_part.clone().expect("header part created");
+        app.editor.doc.body = link_body("https://a.example/");
+        app.on_key(key(KeyCode::F(6)));
+        let rels_name = part.replace("word/", "word/_rels/") + ".rels";
+        assert!(
+            app.pkg
+                .set_part(&rels_name, b"<NotRelationships/>".to_vec())
+        );
+        let header_before = app.pkg.part(&part).unwrap().to_vec();
+        let shown_before = app.headers.default.clone();
+        app.run_act(ribbon::Act::EditHeader);
+        app.editor.doc.body = link_body("https://b.example/");
+        app.on_key(key(KeyCode::F(6)));
+        assert!(app.hf_edit.is_none());
+        assert_eq!(
+            app.pkg.part(&part).unwrap(),
+            header_before,
+            "header untouched"
+        );
+        assert_eq!(app.pkg.part(&rels_name).unwrap(), b"<NotRelationships/>");
+        assert_eq!(app.headers.default, shown_before);
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.contains("Couldn't write the header edit")
+                && status.contains("Relationships root"),
+            "{status}"
+        );
     }
 
     #[test]
