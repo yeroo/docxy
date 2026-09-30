@@ -141,11 +141,12 @@ impl Engine {
                 collect_deps(wb, key, &ast, &mut deps, 0);
                 let mut spills = Vec::new();
                 formula::collect_spillrefs(&ast, &mut spills);
+                let (volatile, db) = recalc_flags(wb, key.0, &ast, 0);
                 self.formulas.insert(
                     key,
                     FormulaInfo {
-                        volatile: always_recalc(&ast),
-                        db: contains_db_fn(&ast),
+                        volatile,
+                        db,
                         legacy,
                         spillref: !spills.is_empty(),
                         ast,
@@ -396,8 +397,12 @@ impl Engine {
         }
         let mut done: HashSet<Key> = HashSet::new();
         let mut spilled: Vec<Key> = Vec::new();
+        let mut db_done: Vec<Key> = Vec::new();
         while let Some(k) = queue.pop_front().or_else(|| deferred.pop_front()) {
             done.insert(k);
+            if self.formulas.get(&k).is_some_and(|i| i.db) {
+                db_done.push(k);
+            }
             spilled.extend(self.eval_one(wb, k));
             if let Some(dependents) = edges.get(&k).cloned() {
                 for d in dependents {
@@ -457,6 +462,16 @@ impl Engine {
             self.circular.remove(k);
         }
         self.circular.extend(found);
+        // A D-function evaluated above may read (through a computed
+        // criterion, with no edge) a helper that sits on or below a circle,
+        // which only got its value just now. Run those D-functions, and what
+        // depends on them, once more. Bounded like the spill passes; a
+        // circle member re-run this way is 0 again, or gets one more sweep
+        // that the rollback rule keeps put once converged.
+        if !rest.is_empty() && !db_done.is_empty() && depth < MAX_SPILL_PASSES {
+            db_done.sort_unstable();
+            self.recalc_from_depth(wb, &db_done, depth + 1);
+        }
         // Spill writes change plain-value cells whose dependents the dirty
         // walk couldn't see (only the anchor is a formula). One more pass
         // over those cells picks them up; chains converge quickly.
@@ -733,6 +748,32 @@ fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth:
             }
         }
     }
+}
+
+/// (always recalculate, calls a D-function) for a formula, looking through
+/// the defined names it references or calls (`=Total` where Total is a DSUM
+/// or NOW()), resolved as [`collect_deps`] resolves them and to the same
+/// depth.
+fn recalc_flags(wb: &Workbook, sheet: usize, ast: &Expr, depth: u32) -> (bool, bool) {
+    let (mut volatile, mut db) = (always_recalc(ast), contains_db_fn(ast));
+    if (volatile && db) || depth >= 8 {
+        return (volatile, db);
+    }
+    let mut names = Vec::new();
+    formula::collect_names(ast, &mut names);
+    formula::collect_called_names(ast, &mut names);
+    for n in names {
+        let Some(def_ast) = wb
+            .defined_name(&n, sheet)
+            .and_then(|def| formula::parse(def).ok())
+        else {
+            continue;
+        };
+        let (v, d) = recalc_flags(wb, sheet, &def_ast, depth + 1);
+        volatile |= v;
+        db |= d;
+    }
+    (volatile, db)
 }
 
 fn to_table_info(t: &crate::sheet::Table) -> crate::formula::TableInfo {
@@ -1786,6 +1827,100 @@ mod tests {
         }
         eng2.recalc_all(&mut wb2);
         assert_eq!(value_at(&wb2, "K30"), CellValue::Number(want));
+    }
+
+    /// The #677 helper layout: A1:C8 database (C = row number), E2:E8
+    /// helpers, AA2 = E2>100 as a computed criterion, K1 = `k1`, plus
+    /// `extra` cells.
+    fn db_helper_book(k1: &str, e5: &str, extra: &[(&str, Cell)]) -> Workbook {
+        let mut cells: Vec<(String, Cell)> = vec![
+            ("A1".into(), Cell::text("Rep")),
+            ("C1".into(), Cell::text("Amount")),
+            ("AA2".into(), Cell::formula("E2>100")),
+            ("K1".into(), Cell::formula(k1)),
+        ];
+        for r in 2..=8 {
+            cells.push((format!("A{r}"), Cell::text(&format!("R{r}"))));
+            cells.push((format!("C{r}"), Cell::number(r as f64)));
+            cells.push((format!("E{r}"), Cell::number(0.0)));
+        }
+        cells.push(("E5".into(), Cell::formula(e5)));
+        for (k, c) in extra {
+            cells.push((k.to_string(), c.clone()));
+        }
+        let refs: Vec<(&str, Cell)> = cells.iter().map(|(k, c)| (k.as_str(), c.clone())).collect();
+        wb_one_sheet(&refs)
+    }
+
+    #[test]
+    fn database_functions_see_helpers_below_an_iterating_circle() {
+        // #677/#660: E5 reads Z1, an iterating circle; the DSUM's computed
+        // criterion reads E5. The circle settles after the DSUM first ran,
+        // so the DSUM runs again.
+        let dsum = "DSUM(A1:C8,\"Amount\",AA1:AA2)";
+        let mut wb = db_helper_book(
+            dsum,
+            "Z1*2",
+            &[("Z1", Cell::formula("Z1/2+B1")), ("B1", Cell::number(30.0))],
+        );
+        wb.iterate = Some((100, 0.001));
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        // Z1 → 60, E5 → 120 > 100: record 5 matches.
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(5.0));
+        set(&mut eng, &mut wb, "B1", Cell::number(10.0));
+        // Z1 → 20, E5 → 40: nothing matches.
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(0.0));
+        set(&mut eng, &mut wb, "B1", Cell::number(40.0));
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(5.0));
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(5.0));
+    }
+
+    #[test]
+    fn database_functions_see_helpers_below_a_new_circle() {
+        // #677/#660: without iteration a new circle is 0, so a helper below
+        // it drops out of the criterion and the DSUM follows.
+        let dsum = "DSUM(A1:C8,\"Amount\",AA1:AA2)";
+        let mut wb = db_helper_book(dsum, "Z1*2+B1", &[("Z1", Cell::number(60.0))]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(5.0));
+        // Z1 becomes a circle: 0, so E5 = B1 = 0.
+        set(&mut eng, &mut wb, "Z1", Cell::formula("Z1+1"));
+        assert_eq!(value_at(&wb, "E5"), CellValue::Number(0.0));
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(0.0));
+        // An input below the circle moves E5 above 100 again.
+        set(&mut eng, &mut wb, "B1", Cell::number(150.0));
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(5.0));
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(5.0));
+    }
+
+    #[test]
+    fn database_functions_behind_a_defined_name_recalculate() {
+        // #677: K1 = Total, a defined name holding the DSUM. It is found
+        // behind the name, so it always recalculates and waits for helpers.
+        let mut wb = db_helper_book("Total", "B5*2", &[("B5", Cell::number(10.0))]);
+        wb.defined_names.push(crate::sheet::DefinedName {
+            name: "Total".into(),
+            scope: None,
+            formula: "DSUM(Sheet1!$A$1:$C$8,\"Amount\",Sheet1!$AA$1:$AA$2)".into(),
+        });
+        wb.defined_names.push(crate::sheet::DefinedName {
+            name: "Stamp".into(),
+            scope: None,
+            formula: "NOW()".into(),
+        });
+        wb.sheets[0].set_cell(0, 20, Cell::formula("Stamp+1"));
+        let mut eng = Engine::new(&wb);
+        assert!(eng.formulas[&(0, 0, 10)].volatile && eng.formulas[&(0, 0, 10)].db);
+        // NOW() behind a name is volatile too.
+        assert!(eng.formulas[&(0, 0, 20)].volatile && !eng.formulas[&(0, 0, 20)].db);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(0.0));
+        set(&mut eng, &mut wb, "B5", Cell::number(60.0));
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(5.0));
     }
 
     #[test]
