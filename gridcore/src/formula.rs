@@ -4851,6 +4851,26 @@ fn zero_of(v: &Value) -> Value {
     }
 }
 
+/// Excel's `^` and `POWER`: `0^0` is `#NUM!` and zero to a negative power is
+/// `#DIV/0!`. A negative base to the reciprocal of an odd integer (`1/3`,
+/// `1/5`, …) takes the real odd root, where `powf` gives NaN.
+fn xl_pow(a: f64, b: f64) -> Value {
+    if a == 0.0 && b == 0.0 {
+        return Value::Err(ExcelError::Num);
+    }
+    if a == 0.0 && b < 0.0 {
+        return Value::Err(ExcelError::Div0);
+    }
+    if a < 0.0 && b.fract() != 0.0 {
+        let inv = 1.0 / b;
+        let odd = inv.round();
+        if (inv - odd).abs() < 1e-10 && odd % 2.0 != 0.0 {
+            return num(-(a.abs().powf(b)));
+        }
+    }
+    num(a.powf(b))
+}
+
 fn bin_op(op: BinOp, l: &Value, r: &Value) -> Value {
     use std::cmp::Ordering;
     match op {
@@ -4874,13 +4894,7 @@ fn bin_op(op: BinOp, l: &Value, r: &Value) -> Value {
                         num(a / b)
                     }
                 }
-                BinOp::Pow => {
-                    if a == 0.0 && b == 0.0 {
-                        Value::Err(ExcelError::Num)
-                    } else {
-                        num(a.powf(b))
-                    }
-                }
+                BinOp::Pow => xl_pow(a, b),
                 _ => unreachable!(),
             }
         }
@@ -5496,13 +5510,7 @@ impl<'a> Eval<'a> {
                     num(n.log(base))
                 }
             }
-            "POWER" => self.two_num(args, |a, b| {
-                if a == 0.0 && b == 0.0 {
-                    Value::Err(ExcelError::Num)
-                } else {
-                    num(a.powf(b))
-                }
-            }),
+            "POWER" => self.two_num(args, xl_pow),
             "MOD" => self.two_num(args, |a, b| {
                 if b == 0.0 {
                     Value::Err(ExcelError::Div0)
@@ -12647,5 +12655,25 @@ mod tests {
             nums(&eval_array("MMULT(A1:B2,A1:A2)", &g)),
             vec![vec![7.0], vec![15.0]]
         );
+    }
+
+    #[test]
+    fn power_zero_to_negative_and_odd_roots() {
+        // #659: zero to a negative power divides by zero; a negative base to
+        // the reciprocal of an odd integer takes the real odd root.
+        let g = empty();
+        assert_eq!(eval_str("0^-1", &g), Value::Err(ExcelError::Div0));
+        assert_eq!(eval_str("POWER(0,-1)", &g), Value::Err(ExcelError::Div0));
+        assert_eq!(eval_str("0^-0.5", &g), Value::Err(ExcelError::Div0));
+        assert!((n("(-8)^(1/3)", &g) + 2.0).abs() < 1e-12);
+        // Unary minus binds tighter than ^: -8^(1/3) is (-8)^(1/3).
+        assert!((n("-8^(1/3)", &g) + 2.0).abs() < 1e-12);
+        assert!((n("(-32)^(1/5)", &g) + 2.0).abs() < 1e-12);
+        assert!((n("POWER(-8,1/3)", &g) + 2.0).abs() < 1e-12);
+        // Unchanged: an even root of a negative, 0^0, integer powers.
+        assert_eq!(eval_str("(-8)^(1/2)", &g), Value::Err(ExcelError::Num));
+        assert_eq!(eval_str("0^0", &g), Value::Err(ExcelError::Num));
+        assert_eq!(n("(-8)^2", &g), 64.0);
+        assert_eq!(n("(-2)^3", &g), -8.0);
     }
 }
