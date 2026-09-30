@@ -1,7 +1,7 @@
 //! Rendering for [`crate::Backstage`], ported from docxy's `draw_backstage` /
 //! `draw_bs_open` / `draw_bs_save_as` / `draw_bs_info` (main.rs).
 
-use crate::{Backstage, BackstageHost, ITEMS, Item, Pane};
+use crate::{Backstage, BackstageHost, Item, Pane};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -43,8 +43,8 @@ pub fn draw(f: &mut Frame, area: Rect, bs: &mut Backstage, host: &dyn BackstageH
 
     // left menu
     let menu_focus = bs.pane == Pane::Menu;
-    let labels: Vec<&str> = ITEMS.iter().map(|it| it.label()).collect();
-    let sel_index = ITEMS.iter().position(|it| *it == bs.item).unwrap_or(0);
+    let labels: Vec<&str> = bs.items().iter().map(|it| it.label()).collect();
+    let sel_index = bs.items().iter().position(|it| *it == bs.item).unwrap_or(0);
     crate::draw_menu_column(
         f,
         cols[0],
@@ -60,6 +60,7 @@ pub fn draw(f: &mut Frame, area: Rect, bs: &mut Backstage, host: &dyn BackstageH
         Item::Open => draw_open(f, cols[1], bs, host),
         Item::SaveAs => draw_save_as(f, cols[1], bs, host),
         Item::Info => draw_info(f, cols[1], host),
+        Item::Options => draw_options(f, cols[1], bs, host),
         other => {
             // App-neutral: the same crate serves docxy (PDF), xlsxy (CSV) and
             // yppxy (Gantt), so avoid naming a format or the app.
@@ -263,6 +264,39 @@ fn draw_save_as(f: &mut Frame, area: Rect, bs: &Backstage, host: &dyn BackstageH
     }
 }
 
+/// The Options page: a heading and its checkboxes. Rows sit at fixed offsets
+/// (heading, blank, then one per option) so `mouse` can map a click.
+fn draw_options(f: &mut Frame, area: Rect, bs: &Backstage, host: &dyn BackstageHost) {
+    let focus = bs.pane == Pane::Options;
+    let accent = Style::default().fg(Color::Black).bg(host.accent());
+    let mut lines = vec![
+        RLine::styled(
+            format!(" {}", bs.options_title),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        RLine::raw(""),
+    ];
+    for (i, (label, on)) in bs.options.iter().enumerate() {
+        let text = format!(" [{}] {label}", if *on { "x" } else { " " });
+        let style = if focus && i == bs.option_sel {
+            accent
+        } else {
+            Style::default()
+        };
+        lines.push(RLine::styled(text, style));
+    }
+    lines.push(RLine::raw(""));
+    lines.push(RLine::styled(
+        if focus {
+            " ↑↓ choose · Space toggle · ← menu · Esc close"
+        } else {
+            " Enter to change these options · Esc to close"
+        },
+        Style::default().add_modifier(Modifier::DIM),
+    ));
+    f.render_widget(Paragraph::new(lines), area);
+}
+
 fn draw_info(f: &mut Frame, area: Rect, host: &dyn BackstageHost) {
     let dim = Style::default().add_modifier(Modifier::DIM);
     f.render_widget(
@@ -313,6 +347,28 @@ mod tests {
         fn accent(&self) -> Color {
             Color::Green
         }
+    }
+
+    #[test]
+    fn draws_the_options_page() {
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut bs = Backstage::open(std::env::temp_dir(), &["xlsx"]).with_options(
+            "Automatic Data Conversion",
+            vec![("Keep zeros".into(), true)],
+        );
+        bs.item = Item::Options;
+        term.draw(|f| {
+            let a = f.area();
+            super::draw(f, a, &mut bs, &H);
+        })
+        .unwrap();
+        let text = format!("{:?}", term.backend().buffer());
+        assert!(text.contains("Options"), "menu item missing");
+        assert!(
+            text.contains("Automatic Data Conversion"),
+            "heading missing"
+        );
+        assert!(text.contains("[x] Keep zeros"), "checkbox missing");
     }
 
     #[test]

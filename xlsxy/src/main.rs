@@ -3125,8 +3125,48 @@ impl App {
             .filter(|p| !p.as_os_str().is_empty())
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
-        self.backstage = Some(backstage::Backstage::open(dir, self.extensions()));
+        let auto = self.auto_convert;
+        let options = [
+            (
+                "Remove leading zeros and convert to number",
+                auto.remove_leading_zeros,
+            ),
+            (
+                "Keep first 15 digits of long numbers and display in scientific notation if needed",
+                auto.keep_15_digits,
+            ),
+            (
+                "Convert digits surrounding the letter \"E\" to a number in scientific notation",
+                auto.e_notation,
+            ),
+            (
+                "Convert continuous letters and numbers to a date",
+                auto.dates,
+            ),
+        ];
+        self.backstage = Some(
+            backstage::Backstage::open(dir, self.extensions()).with_options(
+                "Data › Automatic Data Conversion (opening .csv and text files)",
+                options.map(|(l, on)| (l.to_string(), on)).to_vec(),
+            ),
+        );
         self.ribbon_focus = ribbon::Focus::None;
+    }
+
+    /// Take File › Options › Data's checkboxes into the app (they are saved
+    /// with the other preferences).
+    fn sync_backstage_options(&mut self) {
+        let Some(b) = &self.backstage else {
+            return;
+        };
+        if let [a, b, c, d] = b.options.as_slice() {
+            self.auto_convert = AutoConvert {
+                remove_leading_zeros: a.1,
+                keep_15_digits: b.1,
+                e_notation: c.1,
+                dates: d.1,
+            };
+        }
     }
 
     /// Leave the File backstage via a click on the ribbon tab strip. Clicking
@@ -3384,6 +3424,7 @@ impl App {
             .map(|b| b.key(key, self))
             .unwrap_or(backstage::BackstageEvent::None);
         self.backstage = bs;
+        self.sync_backstage_options();
         self.apply_backstage_event(ev)
     }
 
@@ -3405,6 +3446,7 @@ impl App {
             .map(|b| b.mouse(x, y, self))
             .unwrap_or(backstage::BackstageEvent::None);
         self.backstage = bs;
+        self.sync_backstage_options();
         self.apply_backstage_event(ev)
     }
 
@@ -6918,6 +6960,45 @@ mod tests {
         assert_eq!(value(&on, "D1"), Number(1.23456789012346e18));
     }
 
+    /// #607: File › Options › Data shows the four switches and changes them.
+    #[test]
+    fn file_options_data_changes_the_conversion_switches() {
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.open_backstage();
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        // Walk the menu down to Options and enter it.
+        while app.backstage.as_ref().unwrap().item != backstage::Item::Options {
+            app.backstage_key(key(KeyCode::Down));
+        }
+        app.backstage_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.backstage.as_ref().unwrap().pane,
+            backstage::Pane::Options
+        );
+        app.backstage_key(key(KeyCode::Char(' ')));
+        app.backstage_key(key(KeyCode::Down));
+        app.backstage_key(key(KeyCode::Down));
+        app.backstage_key(key(KeyCode::Down));
+        app.backstage_key(key(KeyCode::Char(' ')));
+        assert_eq!(
+            app.auto_convert,
+            AutoConvert {
+                remove_leading_zeros: false,
+                dates: false,
+                ..AutoConvert::default()
+            }
+        );
+        // Reopened, the page shows the current switches.
+        app.backstage = None;
+        app.open_backstage();
+        let opts = &app.backstage.as_ref().unwrap().options;
+        assert_eq!(
+            opts.iter().map(|o| o.1).collect::<Vec<_>>(),
+            [false, true, true, false]
+        );
+        assert!(opts[0].0.starts_with("Remove leading zeros"));
+    }
+
     /// #607: the four switches persist in the preferences file.
     #[test]
     fn the_conversion_options_round_trip_through_the_preferences() {
@@ -8364,15 +8445,20 @@ mod tests {
 
     #[test]
     fn single_click_exit_opens_confirm_and_new_stays_guarded() {
-        // Exit is index 7 in the menu, drawn at screen row 1 + idx. One click
-        // goes straight to the shared confirm modal — no second click.
-        let exit_row = 1 + backstage::ITEMS
-            .iter()
-            .position(|i| *i == backstage::Item::Exit)
-            .unwrap() as u16;
+        // Exit is the last menu item (after xlsxy's Options), drawn at screen
+        // row 1 + idx. One click goes straight to the shared confirm modal —
+        // no second click.
         let mut app = App::new(new_xlsx(), "doc.xlsx");
         app.os_clip = None;
         app.open_backstage();
+        let exit_row = 1 + app
+            .backstage
+            .as_ref()
+            .unwrap()
+            .items()
+            .iter()
+            .position(|i| *i == backstage::Item::Exit)
+            .unwrap() as u16;
         app.bs_mouse(3, exit_row);
         assert!(app.backstage.is_none(), "Exit closes the backstage");
         assert!(app.confirm.is_some(), "Exit raises the confirm dialog");

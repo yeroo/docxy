@@ -2,7 +2,7 @@
 //! docxy's `main.rs` `backstage_key`/`bs_mouse`/`bs_menu_activate`/
 //! `save_as_key`/`save_as_name_key`/`save_as_browser_key`/`bs_scroll_preview`.
 
-use crate::{Backstage, BackstageEvent, BackstageHost, ITEMS, Item, Pane};
+use crate::{Backstage, BackstageEvent, BackstageHost, Item, Pane};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Position;
 
@@ -102,6 +102,19 @@ impl Backstage {
                     _ => BackstageEvent::None,
                 }
             }
+            Pane::Options => {
+                match key.code {
+                    KeyCode::Up => self.option_sel = self.option_sel.saturating_sub(1),
+                    KeyCode::Down => {
+                        self.option_sel =
+                            (self.option_sel + 1).min(self.options.len().saturating_sub(1))
+                    }
+                    KeyCode::Char(' ') | KeyCode::Enter => self.toggle_option(),
+                    KeyCode::Left => self.pane = Pane::Menu,
+                    _ => {}
+                }
+                BackstageEvent::None
+            }
             // Handled above by save_as_key; here only to keep the match total.
             Pane::SaveAs => BackstageEvent::None,
         }
@@ -129,6 +142,10 @@ impl Backstage {
             }
             Item::New => BackstageEvent::New,
             Item::Export => BackstageEvent::Export,
+            Item::Options => {
+                self.pane = Pane::Options;
+                BackstageEvent::None
+            }
             Item::Exit => BackstageEvent::Exit,
         }
     }
@@ -223,8 +240,8 @@ impl Backstage {
         if x < 14 {
             if y >= 1 {
                 let idx = (y - 1) as usize;
-                if idx < ITEMS.len() {
-                    let it = ITEMS[idx];
+                if idx < self.items().len() {
+                    let it = self.items()[idx];
                     let cur = self.item;
                     let guarded = matches!(it, Item::New);
                     self.item = it;
@@ -276,6 +293,18 @@ impl Backstage {
                     self.name_input = self.entries[idx].name.clone();
                     self.name_cursor = self.name_input.chars().count();
                 }
+            }
+            return BackstageEvent::None;
+        }
+        // An option row (below the heading and a blank line) flips it.
+        if self.item == Item::Options {
+            if let Some(i) = (y as usize)
+                .checked_sub(3)
+                .filter(|&i| i < self.options.len())
+            {
+                self.option_sel = i;
+                self.pane = Pane::Options;
+                self.toggle_option();
             }
             return BackstageEvent::None;
         }

@@ -35,6 +35,7 @@
 //! | `range.set` | `{start,rows:[[string]],sheet?}` | `{set}` — atomic, one undo group |
 //! | `sheet.import-csv` | `{text,name?}` | `{sheet,name,rows,cols}` — always a new sheet; fields convert as a `.csv` open does (`sep=`, typed-entry rules, File › Options › Data) |
 //! | `sheet.import-text` | `{text\|path,options?,name?}` | `{sheet,name,rows,cols}` — the Text Import Wizard's options (see `text_options`) into a new sheet |
+//! | `app.options` | `{convert_leading_zeros?,convert_long_numbers?,convert_e_notation?,convert_dates?}` | all four — File › Options › Data › Automatic Data Conversion; given keys are set first |
 //! | `range.text-to-columns` | `{range,options?,dest?,replace?,sheet?}` | `{rows}` — one column; refuses with "Do you want to replace the contents of the destination cells?" unless `replace:true`; one undo step |
 //! | `wb.replace-all` | `{query,text}` | `{replaced}` — every sheet, one undo group |
 //! | `sheet.add` | `{name?}` | `{sheet,name}` |
@@ -101,6 +102,7 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         "sheet.import-csv" => sheet_import_csv(app, args),
         "sheet.import-text" => sheet_import_text(app, args),
         "range.text-to-columns" => range_text_to_columns(app, args),
+        "app.options" => app_options(app, args),
         "wb.replace-all" => wb_replace_all(app, args),
         "sheet.add" => sheet_add(app, args),
         "sheet.remove" => sheet_remove(app, args),
@@ -987,6 +989,29 @@ fn text_options(
         opts.trailing_minus = b;
     }
     Ok((opts, origin))
+}
+
+/// File › Options › Data › Automatic Data Conversion: set any of the four
+/// switches given, and return all four. They apply to the next `.csv`/text
+/// open and are saved with the app's preferences on exit.
+fn app_options(app: &mut App, args: &Json) -> Result<Json, String> {
+    let auto = &mut app.auto_convert;
+    let fields: [(&str, &mut bool); 4] = [
+        ("convert_leading_zeros", &mut auto.remove_leading_zeros),
+        ("convert_long_numbers", &mut auto.keep_15_digits),
+        ("convert_e_notation", &mut auto.e_notation),
+        ("convert_dates", &mut auto.dates),
+    ];
+    let mut out = Vec::new();
+    for (key, slot) in fields {
+        match args.get(key) {
+            None | Some(Json::Null) => {}
+            Some(Json::Bool(b)) => *slot = *b,
+            Some(_) => return Err(format!("'{key}' must be true or false")),
+        }
+        out.push((key, Json::Bool(*slot)));
+    }
+    Ok(Json::obj(out))
 }
 
 /// The Text Import Wizard without the dialog: `text` (or the file at
@@ -2457,6 +2482,44 @@ mod tests {
         let two = Json::obj(vec![("range", Json::Str("A1:B2".into()))]);
         let err = dispatch(&mut a, "range.text-to-columns", &two).unwrap_err();
         assert_eq!(err, gridcore::edit::TTC_ONE_COLUMN);
+    }
+
+    /// #607: the options are readable and settable, and the next CSV import
+    /// honours them.
+    #[test]
+    fn app_options_switch_the_automatic_data_conversion() {
+        let mut a = app();
+        let all = dispatch(&mut a, "app.options", &Json::Null).unwrap();
+        assert_eq!(all.get("convert_dates"), Some(&Json::Bool(true)));
+        let off = Json::obj(vec![
+            ("convert_leading_zeros", Json::Bool(false)),
+            ("convert_long_numbers", Json::Bool(false)),
+            ("convert_e_notation", Json::Bool(false)),
+            ("convert_dates", Json::Bool(false)),
+        ]);
+        let r = dispatch(&mut a, "app.options", &off).unwrap();
+        assert_eq!(r.get("convert_leading_zeros"), Some(&Json::Bool(false)));
+        let r = dispatch(
+            &mut a,
+            "sheet.import-csv",
+            &Json::obj(vec![(
+                "text",
+                Json::Str("007,1/2,1E5,1234567890123456789\n".into()),
+            )]),
+        )
+        .unwrap();
+        let sh = &a.pkg.workbook.sheets[r.get_usize("sheet").unwrap()];
+        for (c, t) in ["007", "1/2", "1E5", "1234567890123456789"]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(
+                sh.cell(0, c as u32).unwrap().value,
+                CellValue::Text(t.to_string())
+            );
+        }
+        let bad = Json::obj(vec![("convert_dates", Json::Str("no".into()))]);
+        assert!(dispatch(&mut a, "app.options", &bad).is_err());
     }
 
     #[test]

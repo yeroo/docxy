@@ -10,9 +10,13 @@ pub enum Item {
     Save,
     SaveAs,
     Export,
+    /// The host's options page (only hosts that ask for it, see
+    /// [`Backstage::with_options`]).
+    Options,
     Exit,
 }
 
+/// The items every host shows; [`Backstage::items`] adds any a host opted in to.
 pub const ITEMS: [Item; 7] = [
     Item::New,
     Item::Open,
@@ -32,6 +36,7 @@ impl Item {
             Item::Save => "Save",
             Item::SaveAs => "Save As",
             Item::Export => "Export",
+            Item::Options => "Options",
             Item::Exit => "Exit",
         }
     }
@@ -76,6 +81,8 @@ pub enum Pane {
     Preview,
     /// The Save As dialog (folder browser + typed file name).
     SaveAs,
+    /// The Options page's checkboxes.
+    Options,
 }
 
 /// Click rects and scroll offsets recorded by `draw` (Task 3) and read by
@@ -111,6 +118,13 @@ pub struct Backstage {
     /// In Save As: true when the file-name field is focused (accepting edits),
     /// false when the folder browser is focused.
     pub name_focus: bool,
+    /// The menu, in display order.
+    items: Vec<Item>,
+    /// The Options page: its heading and each checkbox (label, on).
+    pub options_title: String,
+    pub options: Vec<(String, bool)>,
+    /// The highlighted checkbox.
+    pub option_sel: usize,
     // Filled by `draw` (Task 3) and read by `mouse` (Task 2, `input.rs`), a
     // sibling module — needs crate-wide visibility, not just within `state`.
     pub(crate) layout: BackstageLayout,
@@ -135,10 +149,38 @@ impl Backstage {
             name_input: String::new(),
             name_cursor: 0,
             name_focus: false,
+            items: ITEMS.to_vec(),
+            options_title: String::new(),
+            options: Vec::new(),
+            option_sel: 0,
             layout: BackstageLayout::default(),
         };
         b.refresh();
         b
+    }
+
+    /// Add an Options page (before Exit) with `title` and these checkboxes.
+    /// The host reads [`Backstage::options`] back after each key or click.
+    pub fn with_options(mut self, title: &str, options: Vec<(String, bool)>) -> Backstage {
+        if !self.items.contains(&Item::Options) {
+            let at = self.items.len().saturating_sub(1);
+            self.items.insert(at, Item::Options);
+        }
+        self.options_title = title.to_string();
+        self.options = options;
+        self
+    }
+
+    /// The menu items, in display order.
+    pub fn items(&self) -> &[Item] {
+        &self.items
+    }
+
+    /// Flip the highlighted option.
+    pub fn toggle_option(&mut self) {
+        if let Some(o) = self.options.get_mut(self.option_sel) {
+            o.1 = !o.1;
+        }
     }
 
     /// Re-read the current directory: subfolders + matching files, folders first.
@@ -238,13 +280,13 @@ impl Backstage {
     }
 
     pub fn menu_move(&mut self, down: bool) {
-        let i = ITEMS.iter().position(|x| *x == self.item).unwrap_or(0);
+        let i = self.items.iter().position(|x| *x == self.item).unwrap_or(0);
         let ni = if down {
-            (i + 1).min(ITEMS.len() - 1)
+            (i + 1).min(self.items.len() - 1)
         } else {
             i.saturating_sub(1)
         };
-        self.item = ITEMS[ni];
+        self.item = self.items[ni];
     }
 }
 
@@ -314,6 +356,24 @@ mod tests {
         assert!(names.contains(&"b.csv"));
         assert!(!names.contains(&"c.docx")); // not in ext list
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn options_are_opt_in_and_sit_before_exit() {
+        let plain = Backstage::open(std::env::temp_dir(), &["docx"]);
+        // docxy, lookxy and yppxy keep their seven items.
+        assert_eq!(plain.items(), ITEMS);
+        let mut bs = Backstage::open(std::env::temp_dir(), &["xlsx"])
+            .with_options("Data", vec![("One".into(), true), ("Two".into(), false)]);
+        assert_eq!(bs.items().len(), 8);
+        assert_eq!(bs.items()[6], Item::Options);
+        assert_eq!(*bs.items().last().unwrap(), Item::Exit);
+        bs.item = Item::Export;
+        bs.menu_move(true);
+        assert_eq!(bs.item, Item::Options);
+        bs.option_sel = 1;
+        bs.toggle_option();
+        assert_eq!(bs.options[1], ("Two".to_string(), true));
     }
 
     #[test]
