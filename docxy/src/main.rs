@@ -3225,20 +3225,34 @@ impl App {
             self.footers.default.as_ref() != &blocks
         };
         if commit && changed {
-            let rc = Rc::new(blocks.clone());
-            if hf.is_header {
-                self.headers.default = rc;
-            } else {
-                self.footers.default = rc;
-            }
             let tag = if hf.is_header { "w:hdr" } else { "w:ftr" };
-            if let Some(orig) = self.pkg.part(&hf.part) {
-                let orig = String::from_utf8_lossy(orig).into_owned();
-                let new_xml = splice_hf(&orig, &blocks, tag);
-                self.pkg.set_part(&hf.part, new_xml.into_bytes());
+            // Decode the part as the loader does (it may be UTF-16), and write
+            // it back in its own encoding; a part whose wrapper can't be found
+            // is left alone rather than overwritten.
+            let spliced = self
+                .pkg
+                .part_text(&hf.part)
+                .and_then(|orig| splice_hf(&orig, &blocks, tag));
+            match spliced {
+                Some(new_xml) => {
+                    self.pkg.set_part_text(&hf.part, &new_xml);
+                    let rc = Rc::new(blocks);
+                    if hf.is_header {
+                        self.headers.default = rc;
+                    } else {
+                        self.footers.default = rc;
+                    }
+                    self.refresh_watermark_state();
+                    self.modified = true;
+                }
+                None => {
+                    let what = if hf.is_header { "header" } else { "footer" };
+                    self.status = Some(format!(
+                        "Couldn't write the {what} edit: {} isn't readable {what} XML.",
+                        hf.part
+                    ));
+                }
             }
-            self.refresh_watermark_state();
-            self.modified = true;
         }
         self.page_view = hf.saved_page_view;
         self.dirty = true;
@@ -6868,23 +6882,21 @@ fn hf_part_name(sect: &str, rels: &Relationships, kind: &str, wtype: &str) -> Op
 
 /// Replace the inner content of a preserved header/footer part with serialized
 /// blocks, keeping the original `<w:hdr …>` wrapper (and its namespaces).
-fn splice_hf(original: &str, blocks: &[Block], tag: &str) -> String {
+/// `None` when the part has no such wrapper.
+fn splice_hf(original: &str, blocks: &[Block], tag: &str) -> Option<String> {
     let open = format!("<{tag}");
     let close = format!("</{tag}>");
-    let (Some(os), Some(ce)) = (original.find(&open), original.find(&close)) else {
-        return original.to_string();
-    };
-    let Some(inner_start) = original[os..].find('>').map(|e| os + e + 1) else {
-        return original.to_string();
-    };
+    let os = original.find(&open)?;
+    let ce = original.find(&close)?;
+    let inner_start = original[os..].find('>').map(|e| os + e + 1)?;
     if inner_start > ce {
-        return original.to_string();
+        return None;
     }
     let mut out = String::with_capacity(original.len() + 64);
     out.push_str(&original[..inner_start]);
     out.push_str(&blocks_to_xml(blocks));
     out.push_str(&original[ce..]);
-    out
+    Some(out)
 }
 
 /// Dispatch one terminal event. Returns true if the app should quit.
@@ -8420,7 +8432,7 @@ mod tests {
         .into_iter()
         .map(Block::Paragraph)
         .collect::<Vec<_>>();
-        let out = splice_hf(orig, &blocks, "w:hdr");
+        let out = splice_hf(orig, &blocks, "w:hdr").expect("wrapper found");
         assert!(out.starts_with("<?xml"));
         assert!(out.contains("xmlns:v=\"y\""), "namespaces lost: {out}");
         assert!(
@@ -9138,6 +9150,96 @@ mod tests {
         allowed.on_key(key(KeyCode::F(6)));
         assert!(!allowed.modified);
         assert_eq!(allowed.pkg.part(&part).unwrap(), before);
+    }
+
+    #[test]
+    fn splice_hf_without_the_wrapper_is_none() {
+        let blocks = vec![Block::Paragraph(MPara::default())];
+        assert_eq!(splice_hf("<w:ftr/>", &blocks, "w:hdr"), None);
+        assert_eq!(splice_hf("not xml", &blocks, "w:hdr"), None);
+        assert_eq!(splice_hf("</w:hdr><w:hdr>", &blocks, "w:hdr"), None);
+    }
+
+    /// An app whose header part (created by a first header edit typing
+    /// `first`) is then rewritten as `bytes`.
+    fn app_with_header_part(bytes: impl FnOnce(&str) -> Vec<u8>) -> (App, String) {
+        let mut app = app_with(&["body"]);
+        app.run_act(ribbon::Act::EditHeader);
+        for c in "first".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::F(6)));
+        let part = app.header_part.clone().expect("header part created");
+        let xml = app.pkg.part_text(&part).unwrap();
+        assert!(app.pkg.set_part(&part, bytes(&xml)));
+        (app, part)
+    }
+
+    fn utf16le_bom(text: &str) -> Vec<u8> {
+        let mut out = vec![0xff, 0xfe];
+        for unit in text.encode_utf16() {
+            out.extend_from_slice(&unit.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn header_edit_on_utf16_part_survives_commit_and_save() {
+        let (mut app, part) = app_with_header_part(|xml| {
+            utf16le_bom(&xml.replacen("encoding=\"UTF-8\"", "encoding=\"UTF-16\"", 1))
+        });
+        app.run_act(ribbon::Act::EditHeader);
+        app.editor.select_all();
+        for c in "second".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::F(6)));
+        assert!(app.hf_edit.is_none());
+
+        let bytes = app.pkg.part(&part).unwrap();
+        assert!(
+            bytes.starts_with(&[0xff, 0xfe, b'<', 0]),
+            "still UTF-16LE with a BOM"
+        );
+        let xml = app.pkg.part_text(&part).expect("decodes");
+        assert!(xml.contains("encoding=\"UTF-16\""), "{xml}");
+        assert!(
+            xml.contains("<w:hdr ") && xml.contains("xmlns:w="),
+            "wrapper kept: {xml}"
+        );
+        assert!(
+            xml.contains(">second<") && !xml.contains(">first<"),
+            "{xml}"
+        );
+
+        // The saved file reads back with the edit, and the PDF prints it.
+        let saved = load_package(&save_package(&app.pkg)).expect("reload");
+        let blocks = saved.header_footer_blocks(&part).expect("header blocks");
+        assert_eq!(blocks[0].plain_text(), "second");
+        let opts = PdfOptions::from_package(&saved, app.styles.clone());
+        let pdf = String::from_utf8_lossy(&to_pdf(&saved.document, &opts)).into_owned();
+        assert!(pdf.contains("(second) Tj"), "{pdf}");
+    }
+
+    #[test]
+    fn header_edit_with_missing_wrapper_reports_and_changes_nothing() {
+        let (mut app, part) = app_with_header_part(|_| b"<junk/>".to_vec());
+        let before = app.headers.default.clone();
+        app.run_act(ribbon::Act::EditHeader);
+        app.editor.select_all();
+        app.on_key(key(KeyCode::Char('x')));
+        app.on_key(key(KeyCode::F(6)));
+        assert!(app.hf_edit.is_none());
+        assert_eq!(app.pkg.part(&part).unwrap(), b"<junk/>", "part untouched");
+        assert_eq!(
+            app.headers.default, before,
+            "the page view keeps the old header"
+        );
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.contains("Couldn't write the header edit"),
+            "{status}"
+        );
     }
 
     #[test]

@@ -1105,6 +1105,28 @@ impl Package {
             .map(|(_, b)| b.as_slice())
     }
 
+    /// An XML part's text, decoded the way the loader reads it (UTF-8, or
+    /// UTF-16 with or without a byte-order mark). `None` when the part is
+    /// missing or isn't decodable XML text.
+    pub fn part_text(&self, name: &str) -> Option<String> {
+        self.part(name)
+            .and_then(decode_xml_part)
+            .map(Cow::into_owned)
+    }
+
+    /// Replace an existing XML part's text, encoded the way the part was: a
+    /// UTF-16 part stays UTF-16 (so its declaration stays true), a BOM stays.
+    /// Returns false if no such part exists.
+    pub fn set_part_text(&mut self, name: &str, text: &str) -> bool {
+        match self.parts.iter_mut().find(|(n, _)| n == name) {
+            Some(e) => {
+                e.1 = encode_like(&e.1, text);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Replace the bytes of an existing part (e.g. an edited header/footer).
     /// Returns false if no such part exists.
     pub fn set_part(&mut self, name: &str, bytes: Vec<u8>) -> bool {
@@ -4090,5 +4112,30 @@ mod tests {
                 WatermarkKind::Picture,
             ]
         );
+    }
+
+    #[test]
+    fn set_part_text_keeps_utf16() {
+        let mut pkg = new_package(Document::default());
+        let text = "<?xml version=\"1.0\" encoding=\"UTF-16\"?><w:hdr>é</w:hdr>";
+        let mut be = vec![0xfe, 0xff];
+        for unit in text.encode_utf16() {
+            be.extend_from_slice(&unit.to_be_bytes());
+        }
+        pkg.parts.push(("word/header1.xml".to_string(), be));
+        assert_eq!(pkg.part_text("word/header1.xml").as_deref(), Some(text));
+        let edited = text.replace('é', "ü");
+        assert!(pkg.set_part_text("word/header1.xml", &edited));
+        let bytes = pkg.part("word/header1.xml").unwrap();
+        assert!(
+            bytes.starts_with(&[0xfe, 0xff, 0, b'<']),
+            "UTF-16BE with its BOM"
+        );
+        assert_eq!(
+            pkg.part_text("word/header1.xml").as_deref(),
+            Some(edited.as_str())
+        );
+        assert!(!pkg.set_part_text("word/missing.xml", "x"));
+        assert_eq!(pkg.part_text("word/missing.xml"), None);
     }
 }
