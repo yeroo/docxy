@@ -432,12 +432,51 @@ pub fn with_table_styles(styles_xml: &str, ids: &[String]) -> Option<String> {
     if additions.is_empty() {
         return None;
     }
+    // Only a well-formed part gets additions: its closing tag, or a
+    // self-closing root that can be opened.
+    let close = styles_xml.rfind("</w:styles>");
+    let empty_root = close.is_none().then(|| {
+        let start = styles_xml.find("<w:styles")?;
+        let end = start + styles_xml[start..].find('>')?;
+        styles_xml[..=end].ends_with("/>").then_some(end - 1)
+    });
+    let empty_root = empty_root.flatten();
+    if close.is_none() && empty_root.is_none() {
+        return None;
+    }
     if !has(styles_xml, TABLE_NORMAL) {
         let has_default = styles_xml.contains("w:type=\"table\" w:default=\"1\"")
             || styles_xml.contains("w:default=\"1\" w:type=\"table\"");
         additions.insert_str(0, &table_normal_xml(!has_default));
     }
-    Some(styles_xml.replacen("</w:styles>", &format!("{additions}</w:styles>"), 1))
+    Some(match (close, empty_root) {
+        (Some(at), _) => format!("{}{additions}{}", &styles_xml[..at], &styles_xml[at..]),
+        // `<w:styles .../>` → `<w:styles ...>additions</w:styles>`.
+        (None, Some(slash)) => format!(
+            "{}>{additions}</w:styles>{}",
+            styles_xml[..slash].trim_end(),
+            &styles_xml[slash + 2..]
+        ),
+        (None, None) => unreachable!("refused above"),
+    })
+}
+
+/// The `w:tblStyle` ids an XML part's tables reference, each once.
+pub fn table_style_ids_in_xml(xml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut p = XmlParser::new(xml);
+    loop {
+        match p.next() {
+            Event::Start if p.name() == "w:tblStyle" => {
+                let id = p.attr("w:val").to_string();
+                if !id.is_empty() && !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+            Event::Eof => return out,
+            _ => {}
+        }
+    }
 }
 
 // ---- resolution ----

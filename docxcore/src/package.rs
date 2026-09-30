@@ -1456,21 +1456,73 @@ impl Package {
     }
 }
 
-/// Define in `styles.xml` every built-in table style the document's tables
+/// Define in `styles.xml` every built-in table style the package's tables
 /// reference but the part lacks (#648): picking a gallery style writes only
 /// `w:tblStyle`, so the definition is added here, at save, strictly
-/// additively. A package without a styles part is left alone.
+/// additively. Tables in the body and in header, footer and note parts count.
+/// The part keeps its encoding (UTF-8, with or without a BOM, or UTF-16); a
+/// package without a styles part, or one that cannot be decoded, is left
+/// alone.
 fn add_referenced_table_styles(parts: &mut [(String, Vec<u8>)], document: &Document) {
-    let ids = crate::table_styles::referenced_table_styles(document);
+    let mut ids = crate::table_styles::referenced_table_styles(document);
+    for (name, bytes) in parts.iter() {
+        let story = name.starts_with("word/header")
+            || name.starts_with("word/footer")
+            || name == "word/footnotes.xml"
+            || name == "word/endnotes.xml";
+        if !story {
+            continue;
+        }
+        if let Some(xml) = decode_xml_part(bytes) {
+            for id in crate::table_styles::table_style_ids_in_xml(&xml) {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+    }
     if ids.is_empty() {
         return;
     }
     let Some((_, bytes)) = parts.iter_mut().find(|(n, _)| n == "word/styles.xml") else {
         return;
     };
-    let xml = String::from_utf8_lossy(bytes).into_owned();
+    let Some(xml) = decode_xml_part(bytes) else {
+        return;
+    };
     if let Some(updated) = crate::table_styles::with_table_styles(&xml, &ids) {
-        *bytes = updated.into_bytes();
+        *bytes = encode_like(bytes, &updated);
+    }
+}
+
+/// `text` encoded the way `original`, an XML part [`decode_xml_part`]
+/// accepted, was: UTF-16LE/BE (keeping a byte-order mark if it had one), or
+/// UTF-8 (keeping a BOM if it had one).
+fn encode_like(original: &[u8], text: &str) -> Vec<u8> {
+    let utf16 = |le: bool, bom: bool| {
+        let mut out = Vec::with_capacity(text.len() * 2 + 2);
+        if bom {
+            out.extend_from_slice(if le { &[0xff, 0xfe] } else { &[0xfe, 0xff] });
+        }
+        for u in text.encode_utf16() {
+            out.extend_from_slice(&if le { u.to_le_bytes() } else { u.to_be_bytes() });
+        }
+        out
+    };
+    if original.starts_with(&[0xff, 0xfe]) {
+        utf16(true, true)
+    } else if original.starts_with(&[0xfe, 0xff]) {
+        utf16(false, true)
+    } else if original.starts_with(&[b'<', 0, b'?', 0]) {
+        utf16(true, false)
+    } else if original.starts_with(&[0, b'<', 0, b'?']) {
+        utf16(false, false)
+    } else if original.starts_with(&[0xef, 0xbb, 0xbf]) {
+        let mut out = vec![0xef, 0xbb, 0xbf];
+        out.extend_from_slice(text.as_bytes());
+        out
+    } else {
+        text.as_bytes().to_vec()
     }
 }
 
@@ -3088,6 +3140,74 @@ mod tests {
         );
         // Quote, genuinely absent, was appended.
         assert!(styles.contains("w:styleId=\"Quote\""), "{styles}");
+    }
+
+    fn styled_table_doc(style: Option<&str>) -> Document {
+        let mut t = crate::table::new_table(1, 1, 9000, crate::table::AutoFit::Default);
+        if let Some(id) = style {
+            crate::table::edit_table_props(&mut t, |p| {
+                p.set(&format!("<w:tblStyle w:val=\"{id}\"/>"))
+            });
+        }
+        Document {
+            body: vec![Block::Table(t), Block::Paragraph(Default::default())],
+        }
+    }
+
+    fn utf16le(text: &str) -> Vec<u8> {
+        let mut out = vec![0xff, 0xfe];
+        for u in text.encode_utf16() {
+            out.extend_from_slice(&u.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn table_styles_are_added_to_a_utf16_styles_part_in_its_encoding() {
+        let mut pkg = new_package(styled_table_doc(Some("GridTable4-Accent1")));
+        let styles = String::from_utf8(pkg.part("word/styles.xml").unwrap().to_vec()).unwrap();
+        let styles = styles.replace("encoding=\"UTF-8\"", "encoding=\"UTF-16\"");
+        assert!(pkg.set_part("word/styles.xml", utf16le(&styles)));
+        let saved = load_package(&save_package(&pkg)).unwrap();
+        let bytes = saved.part("word/styles.xml").unwrap();
+        assert_eq!(&bytes[..2], &[0xff, 0xfe], "still UTF-16LE with its BOM");
+        let xml = decode_xml_part(bytes).unwrap();
+        assert!(xml.contains("w:styleId=\"GridTable4-Accent1\""));
+        assert!(xml.trim_end().ends_with("</w:styles>"));
+        // Already defined: the part is left byte for byte.
+        let again = load_package(&save_package(&saved)).unwrap();
+        assert_eq!(again.part("word/styles.xml").unwrap(), bytes);
+    }
+
+    #[test]
+    fn a_styles_part_without_a_closing_tag_is_left_alone_and_a_self_closing_one_opens() {
+        let mut pkg = new_package(styled_table_doc(Some("PlainTable1")));
+        pkg.set_part("word/styles.xml", b"<w:styles xmlns:w=\"x\"".to_vec());
+        let saved = load_package(&save_package(&pkg)).unwrap();
+        assert_eq!(
+            saved.part("word/styles.xml").unwrap(),
+            b"<w:styles xmlns:w=\"x\""
+        );
+        pkg.set_part(
+            "word/styles.xml",
+            b"<?xml version=\"1.0\"?><w:styles xmlns:w=\"x\" />".to_vec(),
+        );
+        let saved = load_package(&save_package(&pkg)).unwrap();
+        let xml = String::from_utf8(saved.part("word/styles.xml").unwrap().to_vec()).unwrap();
+        assert!(xml.starts_with("<?xml version=\"1.0\"?><w:styles xmlns:w=\"x\"><w:style"));
+        assert!(xml.ends_with("</w:style></w:styles>"));
+        assert!(xml.contains("w:styleId=\"PlainTable1\""));
+    }
+
+    #[test]
+    fn a_table_style_used_only_in_a_header_is_defined_too() {
+        let mut pkg = new_package(styled_table_doc(None));
+        let header = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><w:hdr xmlns:w=\"x\">                      <w:tbl><w:tblPr><w:tblStyle w:val=\"ListTable3-Accent1\"/></w:tblPr></w:tbl></w:hdr>";
+        pkg.parts
+            .push(("word/header1.xml".into(), header.as_bytes().to_vec()));
+        let saved = load_package(&save_package(&pkg)).unwrap();
+        let xml = String::from_utf8(saved.part("word/styles.xml").unwrap().to_vec()).unwrap();
+        assert!(xml.contains("w:styleId=\"ListTable3-Accent1\""));
     }
 
     #[test]
