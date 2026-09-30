@@ -21,7 +21,7 @@ use crate::formula::{
     self, DynResult, Eval, ExcelError, Expr, Resolver, Value, always_recalc, collect_refs,
     contains_db_fn,
 };
-use crate::sheet::{Cell, CellValue, Sheet, Workbook, is_array_f};
+use crate::sheet::{Cell, CellMeta, CellValue, Sheet, Workbook, is_array_f};
 
 /// (sheet index, row, col) — the engine's cell address.
 pub type Key = (usize, u32, u32);
@@ -38,7 +38,9 @@ struct FormulaInfo {
     db: bool,
     /// A legacy formula (loaded, not saved as a dynamic array): a multi-cell
     /// range result implicit-intersects to the cell's row/column rather than
-    /// spilling. User-entered formulas are modern (spill).
+    /// spilling. Array formulas and formulas typed here
+    /// ([`crate::sheet::CellMeta::modern`]: new text through
+    /// [`Engine::set_cell`], or a copy of one) are modern (spill).
     legacy: bool,
     /// Contains a spill reference (`A1#`) — its dep rects must be refreshed
     /// whenever spill extents may have changed.
@@ -78,17 +80,7 @@ impl Engine {
         let mut eng = Engine::default();
         for (s, sheet) in wb.sheets.iter().enumerate() {
             for (&(r, c), cell) in &sheet.cells {
-                if let Some(src) = &cell.formula {
-                    // Array formulas (`t="array"`, or `cm` after an edit
-                    // dropped `f_attrs`) are ours to evaluate — the
-                    // dynamic-array engine recomputes their spill. Other
-                    // preserved `<f>` attributes stay frozen.
-                    let is_array = cell.is_array_formula();
-                    let preserved = cell.f_attrs.as_deref().is_some_and(|a| !is_array_f(a));
-                    // A plain loaded formula is legacy (implicit intersection);
-                    // a dynamic-array (`t="array"`) one spills.
-                    eng.index_formula(wb, (s, r, c), src, preserved, !is_array);
-                }
+                eng.index_cell(wb, (s, r, c), cell);
             }
         }
         eng.find_circles();
@@ -131,6 +123,23 @@ impl Engine {
         self.unsupported.contains(&key)
     }
 
+    /// Register a cell's formula (if any) as it stands, the way a freshly
+    /// built engine sees it.
+    fn index_cell(&mut self, wb: &Workbook, key: Key, cell: &Cell) {
+        if let Some(src) = &cell.formula {
+            // Array formulas (`t="array"`, or a dynamic array after an edit
+            // dropped `f_attrs`) are ours to evaluate — the dynamic-array
+            // engine recomputes their spill. Other preserved `<f>` attributes
+            // stay frozen.
+            let is_array = cell.is_array_formula();
+            let preserved = cell.f_attrs.as_deref().is_some_and(|a| !is_array_f(a));
+            // A plain loaded formula is legacy (implicit intersection); an
+            // array one, or one typed here (`modern`), spills.
+            let legacy = !(is_array || cell.is_modern());
+            self.index_formula(wb, key, src, preserved, legacy);
+        }
+    }
+
     /// Parse and register one formula; preserved-`<f>` cells and parse
     /// failures are marked unsupported.
     fn index_formula(&mut self, wb: &Workbook, key: Key, src: &str, preserved: bool, legacy: bool) {
@@ -170,7 +179,47 @@ impl Engine {
     }
 
     /// Apply one cell edit and recalculate everything affected.
+    ///
+    /// A formula whose text differs from the one in the cell is typed: it is
+    /// ours now, modern (it spills), and its preserved `<f>` attributes go. The
+    /// same text again (a restyle clones the cell; re-committing the editor
+    /// unchanged builds a fresh one) keeps what the formula was — a loaded
+    /// legacy formula stays legacy, a CSE array keeps its `<f>` attributes, a
+    /// dynamic array stays one.
     pub fn set_cell(&mut self, wb: &mut Workbook, key: Key, mut cell: Cell) {
+        let (s, r, c) = key;
+        let prev = wb.sheets.get(s).and_then(|sh| sh.cell(r, c));
+        match prev.filter(|p| cell.formula.is_some() && p.formula == cell.formula) {
+            // What kind of formula it is comes from the cell's own previous
+            // formula alone — not from the incoming cell, which may be a fresh
+            // one (Enter), a restyled clone, or a clone pasted from another
+            // address whose `ref`/`si`/`cm` are not this cell's.
+            Some(p) => {
+                cell.f_attrs = p.f_attrs.clone();
+                let pm = p.meta.as_deref().cloned().unwrap_or_default();
+                let kind_of = |m: &CellMeta| (m.cm.clone(), m.modern, m.dynamic);
+                if cell.meta.as_deref().map(kind_of).unwrap_or_default() != kind_of(&pm) {
+                    let m = cell.meta.get_or_insert_default();
+                    (m.cm, m.modern, m.dynamic) = kind_of(&pm);
+                }
+            }
+            None if cell.formula.is_some() => {
+                cell.f_attrs = None;
+                cell.meta.get_or_insert_default().modern = true;
+            }
+            None => {}
+        }
+        self.put_cell(wb, key, cell);
+    }
+
+    /// Put a cell back exactly as it was (undo/redo): its `<f>` attributes and
+    /// metadata stay, and its formula is indexed as [`Engine::new`] would.
+    /// Restoring a snapshot is not typing.
+    pub fn restore_cell(&mut self, wb: &mut Workbook, key: Key, cell: Cell) {
+        self.put_cell(wb, key, cell);
+    }
+
+    fn put_cell(&mut self, wb: &mut Workbook, key: Key, cell: Cell) {
         let (s, r, c) = key;
         // Drop stale bookkeeping for this address.
         self.formulas.remove(&key);
@@ -193,10 +242,7 @@ impl Engine {
                 changed.push((s, anchor.0, anchor.1));
             }
         }
-        if let Some(src) = cell.formula.clone() {
-            cell.f_attrs = None; // an edited formula is ours now — modern (spills)
-            self.index_formula(wb, key, &src, false, false);
-        }
+        self.index_cell(wb, key, &cell);
         if s < wb.sheets.len() {
             wb.sheets[s].set_cell(r, c, cell);
         }
@@ -600,7 +646,7 @@ impl Engine {
             has_rand: self.seed.is_some(),
         };
         let mut ev = Eval::new(&resolver, key.0, (key.1, key.2));
-        let result = ev.eval_dynamic_as(&info.ast, spill);
+        let (result, shaped) = ev.eval_dynamic_shaped(&info.ast, spill);
         let unsupported = ev.unsupported;
         if self.seed.is_some() {
             self.seed = Some(resolver.rand_state.get());
@@ -616,6 +662,16 @@ impl Engine {
             return Vec::new();
         };
         let old = sheet.cell(r, c).and_then(|cl| cl.spill).unwrap_or((1, 1));
+        // A modern formula of ours (not a loaded `t="array"` one, which keeps
+        // its `<f>` attributes) that produced an array is a dynamic array from
+        // now on, whatever it evaluates to later: it saves with a `cm`.
+        if shaped && spill {
+            if let Some(cell) = sheet.cells.get_mut(&(r, c)) {
+                if cell.f_attrs.is_none() && !cell.is_dynamic() {
+                    cell.meta.get_or_insert_default().dynamic = true;
+                }
+            }
+        }
         let mut changed = Vec::new();
         match result {
             DynResult::Scalar(v) => {
@@ -2333,5 +2389,108 @@ mod tests {
         // Editing a row inside the iterated table recalculates the SUMX.
         set(&mut eng, &mut wb, "B3", Cell::number(100.0));
         assert_eq!(value_at(&wb, "D1"), CellValue::Number(320.0));
+    }
+
+    #[test]
+    fn typed_dynamic_survives_engine_rebuild() {
+        // #724 AC4: a typed formula that spilled is marked a dynamic array, so
+        // a rebuilt engine (xlsxy's rebuild_engine) still spills it.
+        let mut wb = wb_one_sheet(&[]);
+        let mut eng = Engine::new(&wb);
+        eng.set_cell(&mut wb, (0, 0, 0), Cell::formula("SEQUENCE(3)"));
+        let a1 = wb.sheets[0].cell(0, 0).unwrap();
+        assert!(a1.is_modern() && a1.is_dynamic() && !a1.has_cm());
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(wb.sheets[0].cell(0, 0).unwrap().spill, Some((3, 1)));
+        assert_eq!(value_at(&wb, "A3"), CellValue::Number(3.0));
+    }
+
+    #[test]
+    fn typed_scalar_formula_stays_modern_after_rebuild() {
+        // A typed FILTER that matches nothing yet (#CALC!) is not an array,
+        // but it is ours: after a rebuild it still spills once rows match.
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("A2", Cell::number(2.0)),
+            ("A3", Cell::number(3.0)),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.set_cell(&mut wb, (0, 0, 2), Cell::formula("FILTER(A1:A3,A1:A3>5)"));
+        let c1 = wb.sheets[0].cell(0, 2).unwrap();
+        assert_eq!(c1.value, CellValue::Error("#CALC!".into()));
+        assert!(c1.is_modern() && !c1.is_dynamic());
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        for (r, v) in [6.0, 7.0, 8.0].into_iter().enumerate() {
+            eng.set_cell(&mut wb, (0, r as u32, 0), Cell::number(v));
+        }
+        assert_eq!(wb.sheets[0].cell(0, 2).unwrap().spill, Some((3, 1)));
+        assert_eq!(value_at(&wb, "C3"), CellValue::Number(8.0));
+        assert!(wb.sheets[0].cell(0, 2).unwrap().is_dynamic());
+    }
+
+    #[test]
+    fn typed_formulas_over_single_cells_are_not_dynamic() {
+        // #724 r1: an elementwise op over single cells that arrive as 1x1
+        // ranges (a table's this-row ref, OFFSET, INDIRECT) is a scalar
+        // formula, not a dynamic array; a real array stays one.
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::text("Qty")),
+            ("B1", Cell::text("Price")),
+            ("C1", Cell::text("Amount")),
+            ("A2", Cell::number(3.0)),
+            ("B2", Cell::number(2.5)),
+        ]);
+        wb.tables.push(crate::sheet::Table {
+            name: "Sales".to_string(),
+            sheet: 0,
+            range: (0, 0, 1, 2),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: vec!["Qty".into(), "Price".into(), "Amount".into()],
+            part: String::new(),
+        });
+        let mut eng = Engine::new(&wb);
+        let scalar = [
+            ("C2", "[@Qty]*[@Price]", CellValue::Number(7.5)),
+            ("E1", "OFFSET(A2,0,1)+1", CellValue::Number(3.5)),
+            ("E2", "INDIRECT(\"A2\")*2", CellValue::Number(6.0)),
+            ("E3", "-OFFSET(A2,0,0)", CellValue::Number(-3.0)),
+            ("E4", "OFFSET(A2,0,0)>1", CellValue::Bool(true)),
+            ("E5", "OFFSET(A2,0,0)&\"x\"", CellValue::Text("3x".into())),
+            ("E6", "ABS(OFFSET(A2,0,0))", CellValue::Number(3.0)),
+            ("E7", "IF(OFFSET(A2,0,0)>1,1,2)", CellValue::Number(1.0)),
+            (
+                "E8",
+                "OFFSET(A2,0,0)*OFFSET(A2,0,1)",
+                CellValue::Number(7.5),
+            ),
+        ];
+        let shaped = [
+            ("G1", "SEQUENCE(1)*2", CellValue::Number(2.0)),
+            ("G2", "{1}+0", CellValue::Number(1.0)),
+            ("G3", "-SEQUENCE(1)", CellValue::Number(-1.0)),
+        ];
+        for (name, src, _) in scalar.iter().chain(shaped.iter()) {
+            let (r, c) = crate::sheet::parse_cell_name(name).unwrap();
+            eng.set_cell(&mut wb, (0, r, c), Cell::formula(src));
+        }
+        for (name, src, want) in &scalar {
+            let (r, c) = crate::sheet::parse_cell_name(name).unwrap();
+            assert_eq!(&value_at(&wb, name), want, "{src}");
+            assert!(
+                !wb.sheets[0].cell(r, c).unwrap().is_dynamic(),
+                "{src} marked dynamic"
+            );
+        }
+        for (name, src, want) in &shaped {
+            let (r, c) = crate::sheet::parse_cell_name(name).unwrap();
+            assert_eq!(&value_at(&wb, name), want, "{src}");
+            assert!(
+                wb.sheets[0].cell(r, c).unwrap().is_dynamic(),
+                "{src} not dynamic"
+            );
+        }
     }
 }

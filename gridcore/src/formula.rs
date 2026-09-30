@@ -2665,7 +2665,7 @@ impl<'a> Eval<'a> {
     /// range or computed array becomes an [`DynResult::Array`] for the engine
     /// to spill; everything else stays scalar.
     pub fn eval_dynamic(&mut self, e: &Expr) -> DynResult {
-        self.eval_dynamic_as(e, true)
+        self.eval_dynamic_shaped(e, true).0
     }
 
     /// As [`Self::eval_dynamic`], but `spill = false` for a **legacy** formula
@@ -2673,8 +2673,19 @@ impl<'a> Eval<'a> {
     /// produces (e.g. from `INDIRECT`, `OFFSET`, or a table column) is reduced by
     /// **implicit intersection** to the value on the formula's own row/column,
     /// exactly as pre-dynamic-array Excel does, instead of spilling.
-    pub fn eval_dynamic_as(&mut self, e: &Expr, spill: bool) -> DynResult {
-        match self.eval_root(e) {
+    ///
+    /// Also tells whether the result was array-shaped: a multi-cell range or
+    /// any computed array, even a 1x1 one (`SEQUENCE(1)`, a one-match
+    /// `FILTER`), but not a single-cell range (`=A1`). Such a typed formula is
+    /// a dynamic array in Excel's sense.
+    pub fn eval_dynamic_shaped(&mut self, e: &Expr, spill: bool) -> (DynResult, bool) {
+        let root = self.eval_root(e);
+        let shaped = match &root {
+            Arg::Range(_, r1, c1, r2, c2) => r1 != r2 || c1 != c2,
+            Arg::Matrix(_) => true,
+            Arg::Scalar(_) | Arg::Lambda(_) => false,
+        };
+        let result = match root {
             Arg::Scalar(v) => DynResult::Scalar(v),
             Arg::Range(s, r1, c1, r2, c2) => {
                 let (r1, c1, r2, c2) = self.clamp_huge(s, r1, c1, r2, c2);
@@ -2700,7 +2711,8 @@ impl<'a> Eval<'a> {
                 }
             }
             Arg::Lambda(_) => DynResult::Scalar(Value::Err(ExcelError::Calc)),
-        }
+        };
+        (result, shaped)
     }
 
     /// Implicit intersection of a range against the formula's cell: a single
@@ -2754,11 +2766,26 @@ impl<'a> Eval<'a> {
         }
     }
 
+    /// A scalar, or the value of a one-cell range; None for anything that is
+    /// (or may be) an array — a computed matrix stays one even when 1x1.
+    fn single_value(&self, a: &Arg) -> Option<Value> {
+        match a {
+            Arg::Scalar(v) => Some(v.clone()),
+            Arg::Range(s, r1, c1, r2, c2) if r1 == r2 && c1 == c2 => {
+                Some(self.res.value(*s, *r1, *c1))
+            }
+            _ => None,
+        }
+    }
+
     /// Elementwise binary op with Excel's broadcast rules: a 1-sized axis
     /// stretches; positions outside a non-conforming operand get `#N/A`.
     fn broadcast_bin(&mut self, op: BinOp, l: Arg, r: Arg) -> Arg {
-        if let (Arg::Scalar(a), Arg::Scalar(b)) = (&l, &r) {
-            return Arg::Scalar(bin_op(op, a, b));
+        // Single values in, a single value out: a one-cell range (OFFSET,
+        // INDIRECT, a table's `[@Col]`) is the value it holds, as a plain
+        // reference is. Only a real array operand makes an array.
+        if let (Some(a), Some(b)) = (self.single_value(&l), self.single_value(&r)) {
+            return Arg::Scalar(bin_op(op, &a, &b));
         }
         let lm = match self.materialize(l) {
             Ok(m) => m,
@@ -2812,16 +2839,16 @@ impl<'a> Eval<'a> {
                 UnOp::Implicit => v.clone(),
             }
         };
-        match x {
-            Arg::Scalar(v) => Arg::Scalar(un(&v)),
-            other => match self.materialize(other) {
-                Ok(m) => Arg::Matrix(
-                    m.into_iter()
-                        .map(|row| row.iter().map(&un).collect())
-                        .collect(),
-                ),
-                Err(e) => Arg::Scalar(Value::Err(e)),
-            },
+        if let Some(v) = self.single_value(&x) {
+            return Arg::Scalar(un(&v));
+        }
+        match self.materialize(x) {
+            Ok(m) => Arg::Matrix(
+                m.into_iter()
+                    .map(|row| row.iter().map(&un).collect())
+                    .collect(),
+            ),
+            Err(e) => Arg::Scalar(Value::Err(e)),
         }
     }
 
@@ -11011,7 +11038,7 @@ mod tests {
         // IF(TRUE, A1:A3, …) returns the array branch (spills), not a collapse.
         let ast = parse("IF(TRUE, A1:A3, A1:A1)").unwrap();
         let mut ev = Eval::new(&g, 0, (10, 0));
-        match ev.eval_dynamic_as(&ast, true) {
+        match ev.eval_dynamic(&ast) {
             DynResult::Array(m) => {
                 assert_eq!(m.len(), 3);
                 assert_eq!(m[0][0], Value::Num(2.0));
@@ -11021,7 +11048,7 @@ mod tests {
         // The false branch is chosen likewise.
         let ast = parse("IF(FALSE, A1:A1, A1:A3)").unwrap();
         let mut ev = Eval::new(&g, 0, (10, 0));
-        assert!(matches!(ev.eval_dynamic_as(&ast, true), DynResult::Array(m) if m.len() == 3));
+        assert!(matches!(ev.eval_dynamic(&ast), DynResult::Array(m) if m.len() == 3));
     }
 
     #[test]
@@ -13117,7 +13144,7 @@ mod tests {
         let top = |src: &str| {
             let ast = parse(src).unwrap();
             let mut ev = Eval::new(&g, 0, (0, 0));
-            match ev.eval_dynamic_as(&ast, true) {
+            match ev.eval_dynamic(&ast) {
                 DynResult::Scalar(Value::Num(x)) => x,
                 DynResult::Scalar(v) => panic!("{src} → {v:?}"),
                 DynResult::Array(_) => panic!("{src} → array"),

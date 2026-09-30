@@ -503,11 +503,19 @@ pub fn autofill(
 /// the file. Dropped, the copy is an ordinary formula computing the same thing
 /// — which is also what makes it safe to shift.
 ///
-/// Nor does it inherit `<c>` metadata: `vm` describes the source's value, and
-/// a `cm` would make the copy a dynamic array (engine and writer both go by
-/// it) where this ordinary formula is meant, so the copy starts without any.
+/// Nor does it inherit the source's `<c>` metadata: `vm` describes the
+/// source's value, and a `cm` would make a copy of a loaded `t="array"` cell a
+/// dynamic array (engine and writer both go by it) where this ordinary formula
+/// is meant. What the engine learned about a formula typed here does carry
+/// over: a copy of a typed dynamic array is one too (`modern`, `dynamic`).
 fn rebase(cell: &mut Cell, dr: i64, dc: i64) {
-    cell.meta = None;
+    cell.meta = cell.meta.take().filter(|m| m.modern || m.dynamic).map(|m| {
+        Box::new(crate::sheet::CellMeta {
+            modern: m.modern,
+            dynamic: m.dynamic,
+            ..Default::default()
+        })
+    });
     if cell.f_attrs.take().is_some() && cell.formula.as_deref() == Some("") {
         // A shared-group follower whose master wouldn't parse carries no text of
         // its own; without the group marker there is no formula left to write.
@@ -2608,5 +2616,41 @@ mod tests {
         // Not numbers at all: unchanged.
         assert_eq!(parse_input("inf").value, CellValue::Text("inf".into()));
         assert_eq!(parse_input("NaN").value, CellValue::Text("NaN".into()));
+    }
+
+    #[test]
+    fn fill_copy_keeps_dynamic_mark() {
+        // A copy of a typed dynamic array is one too; the source's file
+        // indices (`cm`, `vm`) stay behind.
+        let mut wb = Workbook::default();
+        wb.sheets.push(Sheet::default());
+        let mut cell = Cell::formula("SEQUENCE(1)");
+        cell.meta = Some(Box::new(crate::sheet::CellMeta {
+            cm: Some("1".into()),
+            vm: Some(("2".into(), CellValue::Number(1.0))),
+            modern: true,
+            dynamic: true,
+            ..Default::default()
+        }));
+        wb.sheets[0].set_cell(0, 0, cell);
+        autofill(&mut wb, 0, (0, 0, 0, 0), (0, 1));
+        let copy = wb.sheets[0].cell(0, 1).unwrap();
+        assert_eq!(
+            copy.meta.as_deref(),
+            Some(&crate::sheet::CellMeta {
+                modern: true,
+                dynamic: true,
+                ..Default::default()
+            })
+        );
+        // Nothing learned, nothing kept: no metadata box at all.
+        let mut plain = Cell::formula("A1");
+        plain.meta = Some(Box::new(crate::sheet::CellMeta {
+            cm: Some("1".into()),
+            ..Default::default()
+        }));
+        wb.sheets[0].set_cell(1, 0, plain);
+        autofill(&mut wb, 0, (1, 0, 1, 0), (1, 1));
+        assert!(wb.sheets[0].cell(1, 1).unwrap().meta.is_none());
     }
 }
