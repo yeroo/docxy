@@ -106,11 +106,14 @@ pub fn replace_all_in_sheet(
 ) -> Vec<(u32, u32, Cell)> {
     let mut out = Vec::new();
     for (&(r, c), cell) in &sheet.cells {
-        let text = crate::entry::input_text_styled(cell, &styles.xf(cell.style));
+        // Match in the cell's own text, not the `'` re-entry adds; put that
+        // back on the result.
+        let text = input_text_of(cell);
         if !text.contains(find) {
             continue;
         }
-        let new_text = text.replace(find, with);
+        let xf = styles.xf(cell.style);
+        let new_text = crate::entry::replaced_entry(cell, &xf, text.replace(find, with));
         if let Ok(new) = crate::entry::reenter_cell(cell, styles, ctx, &text, &new_text) {
             out.push((r, c, new));
         }
@@ -2153,6 +2156,36 @@ mod tests {
         let (_, _, c) = &changes[0];
         assert_eq!(c.value, CellValue::Text("117".into()));
         assert_eq!(c.style, quoted);
+    }
+
+    #[test]
+    fn replace_all_never_matches_the_reentry_apostrophe() {
+        let mut styles = Styles::default();
+        let quoted = styles.intern(Xf {
+            quote_prefix: true,
+            ..Xf::default()
+        });
+        let mut sheet = Sheet::default();
+        sheet.set_cell(
+            0,
+            0,
+            Cell {
+                style: quoted,
+                ..Cell::text("007")
+            },
+        );
+        sheet.set_cell(1, 0, Cell::text("'abc"));
+        let ctx = EntryCtx::default();
+        // The prefix's `'` is not in the text: nothing to replace in 007.
+        let changes = replace_all_in_sheet(&sheet, &mut styles, &ctx, "'", "");
+        assert_eq!(changes.len(), 1);
+        let (r, _, c) = &changes[0];
+        assert_eq!(*r, 1);
+        assert_eq!(c.value, CellValue::Text("abc".into()));
+        // A loaded 'abc's own apostrophe is its text.
+        let changes = replace_all_in_sheet(&sheet, &mut styles, &ctx, "'", "x");
+        assert_eq!(changes[0].2.value, CellValue::Text("xabc".into()));
+        assert!(replace_all_in_sheet(&sheet, &mut styles, &ctx, "''", "q").is_empty());
     }
 
     #[test]

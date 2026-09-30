@@ -572,6 +572,15 @@ fn replace_keeps_a_quote_prefixed_entry_text() {
     assert!(xf(&v, 0, 0).quote_prefix);
     assert!(v.replace_in_cell(1, 0, "4", "5"));
     assert_eq!(value(&v, 1, 0), CellValue::Text("01235".into()));
+    // The prefix's `'` is not text: replacing `'` leaves 117 alone.
+    assert!(!v.replace_in_cell(0, 0, "'", ""));
+    assert_eq!(value(&v, 0, 0), CellValue::Text("117".into()));
+    // A loaded 'abc (General, no prefix): its own `'` is text, matched once.
+    put(&mut v, 5, 0, Cell::text("'abc"));
+    select(&mut v, 4, 0);
+    assert_eq!(v.find_match("''", false), None);
+    assert!(v.replace_in_cell(5, 0, "'", "x"));
+    assert_eq!(value(&v, 5, 0), CellValue::Text("xabc".into()));
     // Any case, as the Find bar matches.
     put(&mut v, 2, 0, Cell::text("Alpha"));
     assert!(v.replace_in_cell(2, 0, "ALPHA", "Beta"));
@@ -630,14 +639,14 @@ fn find_and_replace_search_the_same_text() {
     // What each cell is searched as.
     assert_eq!(v.search_text(0, 0), "1/15/2024");
     assert_eq!(v.search_text(1, 0), "50%");
-    assert_eq!(v.search_text(2, 0), "'007");
+    assert_eq!(v.search_text(2, 0), "007", "no synthetic apostrophe");
     assert_eq!(v.search_text(3, 0), "=1+1");
     // Find selects what Replace then changes.
     select(&mut v, 4, 0);
     for (q, cell) in [
         ("2024", (0, 0)),
         ("50%", (1, 0)),
-        ("'00", (2, 0)),
+        ("007", (2, 0)),
         ("1+1", (3, 0)),
     ] {
         assert_eq!(v.find_match(q, false), Some(cell), "{q}");

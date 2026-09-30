@@ -1311,8 +1311,9 @@ impl SheetView {
     /// The text Find matches and Replace rewrites — one text, so whatever
     /// Find selects Replace can change. A formula cell is searched as its
     /// `=source` (as Excel's default "Look in: Formulas" does); a constant as
-    /// its displayed text (a date as `1/15/2024`, a percent as `50%`), with
-    /// the leading `'` re-entering it needs put back (`'007` stays text).
+    /// its displayed text (a date as `1/15/2024`, a percent as `50%`). The
+    /// `'` a re-entry would need is not part of it — Replace puts it back on
+    /// the result, so `'007` stays text and a cell's own `'` matches once.
     /// Empty — so neither Find nor Replace touches it — for a blank cell and
     /// for a constant that shows `########` (a date it cannot display): the
     /// hashes are not its text.
@@ -1329,14 +1330,6 @@ impl SheetView {
                 ) =>
             {
                 String::new()
-            }
-            Some(cell)
-                if gridcore::entry::needs_apostrophe(
-                    cell,
-                    &self.pkg.workbook.styles.xf(cell.style),
-                ) =>
-            {
-                format!("'{}", self.cell_text(r, c))
             }
             _ => self.cell_text(r, c),
         }
@@ -1368,10 +1361,12 @@ impl SheetView {
     }
 
     /// Find & Replace on one cell: `q`, any case, replaced by `rep` in the
-    /// cell's [`Self::search_text`], then re-read the way every host re-reads
-    /// a replaced entry (`gridcore::entry::reenter_cell`: the cell's own
-    /// rules, a percent cell not divided again). False when the cell had no
-    /// match or cannot hold the result.
+    /// cell's [`Self::search_text`], the `'` re-entry needs put back
+    /// (`gridcore::entry::replaced_entry`), then re-read the way every host
+    /// re-reads a replaced entry (`gridcore::entry::reenter_cell`: the cell's
+    /// own rules; a percent cell's number is divided only when the text being
+    /// edited no longer shows its `%`). False when the cell had no match or
+    /// cannot hold the result.
     fn replace_in_cell(&mut self, r: u32, c: u32, q: &str, rep: &str) -> bool {
         let Some(cell) = self.sheet().cell(r, c).cloned() else {
             return false;
@@ -1380,7 +1375,8 @@ impl SheetView {
         if q.is_empty() || !text.to_lowercase().contains(&q.to_lowercase()) {
             return false;
         }
-        let new = ci_replace(&text, q, rep);
+        let xf = self.pkg.workbook.styles.xf(cell.style);
+        let new = gridcore::entry::replaced_entry(&cell, &xf, ci_replace(&text, q, rep));
         let ctx = gridcore::entry::entry_ctx(&self.pkg.workbook, self.engine.clock);
         let styles = &mut self.pkg.workbook.styles;
         match gridcore::entry::reenter_cell(&cell, styles, &ctx, &text, &new) {
@@ -9205,7 +9201,11 @@ impl Docxy {
                 if c > c0 {
                     tsv.push('\t');
                 }
-                tsv.push_str(&v.cell_text(r, c));
+                // With the `'` a paste needs to read the text back.
+                if let Some(cell) = v.sheet().cell(r, c) {
+                    let xf = v.pkg.workbook.styles.xf(cell.style);
+                    tsv.push_str(&gridcore::entry::copy_field(cell, &xf, v.cell_text(r, c)));
+                }
                 row.push(v.sheet().cell(r, c).cloned().unwrap_or_default());
             }
             cells.push(row);

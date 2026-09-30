@@ -270,7 +270,10 @@ pub fn reenter_cell(
 ) -> Result<Cell, EntryError> {
     let text = new;
     let xf = styles.xf(cell.style);
-    let plain_value = !old.contains('%');
+    // Only a number constant's input text is its plain value; a text such as
+    // `TBD` replaced by `5` is a fresh number typed into the percent cell.
+    let plain_value =
+        matches!(cell.value, CellValue::Number(_)) && cell.formula.is_none() && !old.contains('%');
     let read_as = if is_percent(&xf) && plain_value {
         Xf::default()
     } else {
@@ -308,9 +311,16 @@ pub fn typed_formula<'a>(
 /// marker — the rest is text and the xf gets `quotePrefix` — and a plain
 /// field clears a quote prefix it lands on. So a copied `'007` pastes back as
 /// the text `007`, and `''abc` (how a text beginning with `'` is copied) as
-/// `'abc`.
+/// `'abc`. An empty field clears the cell.
+///
+/// A TSV clipboard carries no formats, so the apostrophe rule is only exact
+/// between cells of the same kind: a Text cell's `'abc` is copied bare and,
+/// pasted into a non-Text cell, reads as the marker (text `abc`, quote
+/// prefix); an escaped `''abc` pasted into a Text cell stays `''abc`.
 pub fn paste_cell(styles: &mut Styles, style: u32, text: &str) -> Cell {
-    let (cell, quote_prefix) = if is_text(&styles.xf(style)) {
+    let (cell, quote_prefix) = if text.is_empty() {
+        (Cell::default(), false)
+    } else if is_text(&styles.xf(style)) {
         (Cell::text(text), false)
     } else {
         match text.strip_prefix('\'') {
@@ -333,12 +343,31 @@ pub fn paste_cell(styles: &mut Styles, style: u32, text: &str) -> Cell {
 /// quote-prefixed text, and for a text that itself begins with `'` in a cell
 /// that is not Text-formatted — entered bare, its own `'` would be taken as
 /// the marker and dropped. A Text cell takes an entry as typed, so it never
-/// needs one.
+/// needs one — not even with a quote prefix (a `'007` later formatted `@`).
 pub fn needs_apostrophe(cell: &Cell, xf: &Xf) -> bool {
     let CellValue::Text(s) = &cell.value else {
         return false;
     };
-    cell.formula.is_none() && (xf.quote_prefix || (s.starts_with('\'') && !is_text(xf)))
+    cell.formula.is_none() && !is_text(xf) && (xf.quote_prefix || s.starts_with('\''))
+}
+
+/// A cell's field on a copied TSV: its `shown` text, with the leading `'`
+/// [`needs_apostrophe`] asks for, so a paste ([`paste_cell`]) reads it back
+/// as the same text.
+pub fn copy_field(cell: &Cell, xf: &Xf, shown: String) -> String {
+    if needs_apostrophe(cell, xf) {
+        format!("'{shown}")
+    } else {
+        shown
+    }
+}
+
+/// Find & Replace's rewrite of one cell's `base` text (its text without the
+/// `'` re-entry would add), for [`reenter_cell`]: `replaced` with that `'`
+/// put back when [`needs_apostrophe`] holds, so a quote-prefixed `007` stays
+/// text and an apostrophe of the cell's own is never matched twice.
+pub fn replaced_entry(cell: &Cell, xf: &Xf, replaced: String) -> String {
+    copy_field(cell, xf, replaced)
 }
 
 /// The text the editor and formula bar show for a cell: [`crate::edit::input_text_of`]
@@ -1202,6 +1231,81 @@ mod tests {
             paste_cell(&mut styles, text_fmt, "007").value,
             CellValue::Text("007".into())
         );
+    }
+
+    #[test]
+    fn a_text_cell_never_takes_an_apostrophe_even_with_a_quote_prefix() {
+        // `'007` typed into General, then the cell formatted `@`.
+        let mut styles = Styles::default();
+        let general = styles.intern(Xf::default());
+        let text_q = styles.intern(Xf {
+            numfmt: NumFmt::Text,
+            code: Some("@".into()),
+            quote_prefix: true,
+            ..Xf::default()
+        });
+        let cell = Cell {
+            style: text_q,
+            ..Cell::text("007")
+        };
+        let xf = styles.xf(text_q);
+        assert!(!needs_apostrophe(&cell, &xf));
+        assert_eq!(input_text_styled(&cell, &xf), "007");
+        let again = parse_entry("007", &xf, &ctx()).unwrap();
+        assert_eq!(again.cell.value, CellValue::Text("007".into()));
+        assert_eq!(copy_field(&cell, &xf, "007".into()), "007");
+        assert_eq!(
+            paste_cell(&mut styles, text_q, "007").value,
+            CellValue::Text("007".into())
+        );
+        // An empty field clears, in a Text cell as anywhere.
+        assert_eq!(paste_cell(&mut styles, text_q, "").value, CellValue::Empty);
+        assert_eq!(paste_cell(&mut styles, general, "").value, CellValue::Empty);
+    }
+
+    #[test]
+    fn cross_format_paste_is_lossy_for_apostrophes() {
+        // Pinned, not endorsed: a TSV carries no format (a follow-up).
+        let mut styles = Styles::default();
+        let general = styles.intern(Xf::default());
+        let text = styles.intern(Xf {
+            numfmt: NumFmt::Text,
+            code: Some("@".into()),
+            ..Xf::default()
+        });
+        let from_text = Cell {
+            style: text,
+            ..Cell::text("'abc")
+        };
+        let field = copy_field(&from_text, &styles.xf(text), "'abc".into());
+        assert_eq!(field, "'abc");
+        assert_eq!(
+            paste_cell(&mut styles, general, &field).value,
+            CellValue::Text("abc".into())
+        );
+        let from_general = Cell::text("'abc");
+        let field = copy_field(&from_general, &Xf::default(), "'abc".into());
+        assert_eq!(field, "''abc");
+        assert_eq!(
+            paste_cell(&mut styles, text, &field).value,
+            CellValue::Text("''abc".into())
+        );
+    }
+
+    #[test]
+    fn reentry_reads_a_replaced_text_in_a_percent_cell_as_typed() {
+        let mut styles = Styles::default();
+        let pct = styles.intern(Xf {
+            numfmt: NumFmt::Percent { decimals: 0 },
+            code: Some("0%".into()),
+            ..Xf::default()
+        });
+        let tbd = Cell {
+            style: pct,
+            ..Cell::text("TBD")
+        };
+        let c = reenter_cell(&tbd, &mut styles, &ctx(), "TBD", "5").unwrap();
+        assert_eq!(c.value, CellValue::Number(0.05));
     }
 
     #[test]

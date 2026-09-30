@@ -1741,11 +1741,10 @@ impl App {
                 }
                 let cell = sheet.cell(r, c).cloned();
                 if let Some(cl) = &cell {
-                    tsv.push_str(&format_with(
-                        &self.pkg.workbook.styles.xf(cl.style),
-                        &cl.value,
-                        self.pkg.workbook.date1904,
-                    ));
+                    // With the `'` a paste needs to read the text back.
+                    let xf = self.pkg.workbook.styles.xf(cl.style);
+                    let shown = format_with(&xf, &cl.value, self.pkg.workbook.date1904);
+                    tsv.push_str(&gridcore::entry::copy_field(cl, &xf, shown));
                 }
                 row.push(cell);
             }
