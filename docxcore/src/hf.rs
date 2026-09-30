@@ -227,6 +227,54 @@ mod tests {
         assert_eq!(b, before);
     }
 
+    /// Backspace at the start of a placed number's paragraph, Delete at its
+    /// end, and Select All + Delete never leave one boundary of the control
+    /// without the other, so the saved part stays well formed. (A selection
+    /// that starts before the control and ends inside it still can: that is
+    /// the editor's handling of any block content control, a follow-up.)
+    #[test]
+    fn deleting_at_the_boundaries_keeps_the_control_balanced() {
+        use crate::editor::{Caret, Editor};
+        let balanced = |b: &[Block]| {
+            let raws: Vec<&String> = b
+                .iter()
+                .filter_map(|b| match b {
+                    Block::Raw(r) => Some(r),
+                    _ => None,
+                })
+                .collect();
+            raws.iter().filter(|r| is_sdt_open(r)).count()
+                == raws.iter().filter(|r| is_sdt_close(r)).count()
+        };
+        let before = "<w:p><w:r><w:t>Left</w:t></w:r></w:p>";
+        let after = "<w:p><w:r><w:t>Right</w:t></w:r></w:p>";
+        let xml = format!(
+            "{before}{}{after}",
+            page_number_sdt_xml(&PAGE_NUMBER_DESIGNS[0], false, 1)
+        );
+        let para = 2; // Left, open boundary, the number, close boundary, Right
+        let mut ed = Editor::new(crate::model::Document { body: blocks(&xml) });
+        ed.caret = Caret {
+            path: vec![para],
+            offset: 0,
+        };
+        ed.backspace();
+        ed.backspace();
+        assert!(balanced(&ed.doc.body), "{:?}", ed.doc.body);
+        let mut ed = Editor::new(crate::model::Document { body: blocks(&xml) });
+        ed.caret = Caret {
+            path: vec![para],
+            offset: ed.doc.body[para].plain_text().chars().count(),
+        };
+        ed.delete_forward();
+        ed.delete_forward();
+        assert!(balanced(&ed.doc.body), "{:?}", ed.doc.body);
+        let mut ed = Editor::new(crate::model::Document { body: blocks(&xml) });
+        ed.select_all();
+        ed.delete_forward();
+        assert!(balanced(&ed.doc.body), "{:?}", ed.doc.body);
+    }
+
     #[test]
     fn our_page_number_round_trips_through_the_loader() {
         let design = PAGE_NUMBER_DESIGNS[3];
