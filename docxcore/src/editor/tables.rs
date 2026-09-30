@@ -163,7 +163,12 @@ fn paragraph_ends(blocks: &[Block], prefix: &[usize]) -> Option<(Vec<usize>, Vec
 /// The text width available at a caret: the innermost cell's width, else the
 /// section's text width.
 fn width_at(ed: &Editor) -> u32 {
-    if let Some(pos) = table_steps(&ed.doc.body, &ed.caret.path).last() {
+    width_at_path(ed, &ed.caret.path)
+}
+
+/// [`width_at`] for a paragraph at `path`.
+pub(crate) fn width_at_path(ed: &Editor, path: &[usize]) -> u32 {
+    if let Some(pos) = table_steps(&ed.doc.body, path).last() {
         if let Some(t) = table_at(&ed.doc.body, &pos.table) {
             let map = GridMap::of(t);
             if let Some((s, n)) = map.span(pos.row, pos.cell) {
@@ -175,8 +180,9 @@ fn width_at(ed: &Editor) -> u32 {
         }
     }
     let sections = ed.sections();
+    let block = path.first().copied().unwrap_or(0);
     let raw = sections
-        .get(ed.caret_section())
+        .get(ed.section_of_block(block))
         .map(String::as_str)
         .unwrap_or("");
     let w = SectionSetup::parse(raw).text_width(false);
@@ -471,7 +477,7 @@ impl Editor {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::load::{Relationships, parse_document_xml};
     use crate::model::{Document, Run, RunProps, TableRowBoundary};

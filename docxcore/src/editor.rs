@@ -14,8 +14,10 @@ use crate::review::{RevisionAction, RevisionOutcome};
 
 mod flat;
 mod sections;
+mod table_layout;
 mod tables;
 pub use flat::{FlatDocument, FlatStory, StoryOffset};
+pub use table_layout::{AutoFitKind, CellSep, DeleteShift, SortKey, SortKind, SortSpec};
 pub use tables::{CellRange, TablePos};
 
 /// A path into the document tree (to a paragraph) plus a character offset.
