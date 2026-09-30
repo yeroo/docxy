@@ -50,6 +50,17 @@ test a copy with no text in it is newer than the grid clip
   assert cell D8 is nothing
   assert dirty is false
 
+# Keep this case before the document copies: the cases share one app, and it
+# is the only one that pastes with no document clip made yet.
+test text another app pastes into a document before any document copy
+  open copy:../fixtures/basic.docx
+  call clipboard {"action":"write","text":"pasted"}
+  call clipboard {"action":"read"}
+  assert reply.app.kind is none
+  key ctrl+v
+  assert text is pasted
+  assert dirty is true
+
 test a document copy puts its text on the clipboard
   open copy:../fixtures/basic.docx
   type hello world
@@ -82,13 +93,6 @@ test text another app copied wins over the older document clip
   key end
   key ctrl+v
   assert text is hello-other
-
-test text another app copied pastes into a freshly opened document
-  open copy:../fixtures/basic.docx
-  call clipboard {"action":"write","text":"pasted"}
-  key ctrl+v
-  assert text is pasted
-  assert dirty is true
 
 test a copy with no text in it is newer than the document clip
   open copy:../fixtures/basic.docx
