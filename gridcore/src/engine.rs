@@ -21,7 +21,7 @@ use crate::formula::{
     self, DynResult, Eval, ExcelError, Expr, Resolver, Value, always_recalc, collect_refs,
     contains_db_fn,
 };
-use crate::sheet::{Cell, CellValue, Sheet, Workbook, is_array_f};
+use crate::sheet::{Cell, CellMeta, CellValue, Sheet, Workbook, is_array_f};
 
 /// (sheet index, row, col) — the engine's cell address.
 pub type Key = (usize, u32, u32);
@@ -38,7 +38,9 @@ struct FormulaInfo {
     db: bool,
     /// A legacy formula (loaded, not saved as a dynamic array): a multi-cell
     /// range result implicit-intersects to the cell's row/column rather than
-    /// spilling. User-entered formulas are modern (spill).
+    /// spilling. Array formulas and formulas typed here
+    /// ([`crate::sheet::CellMeta::modern`]: new text through
+    /// [`Engine::set_cell`], or a copy of one) are modern (spill).
     legacy: bool,
     /// Contains a spill reference (`A1#`) — its dep rects must be refreshed
     /// whenever spill extents may have changed.
@@ -188,23 +190,17 @@ impl Engine {
         let (s, r, c) = key;
         let prev = wb.sheets.get(s).and_then(|sh| sh.cell(r, c));
         match prev.filter(|p| cell.formula.is_some() && p.formula == cell.formula) {
-            // What a fresh Cell lacks comes from the formula it re-enters (a
-            // restyled clone has it all already).
+            // What kind of formula it is comes from the cell's own previous
+            // formula alone — not from the incoming cell, which may be a fresh
+            // one (Enter), a restyled clone, or a clone pasted from another
+            // address whose `ref`/`si`/`cm` are not this cell's.
             Some(p) => {
-                if cell.f_attrs.is_none() {
-                    cell.f_attrs = p.f_attrs.clone();
-                }
-                if let Some(pm) = p
-                    .meta
-                    .as_deref()
-                    .filter(|m| m.cm.is_some() || m.modern || m.dynamic)
-                {
+                cell.f_attrs = p.f_attrs.clone();
+                let pm = p.meta.as_deref().cloned().unwrap_or_default();
+                let kind_of = |m: &CellMeta| (m.cm.clone(), m.modern, m.dynamic);
+                if cell.meta.as_deref().map(kind_of).unwrap_or_default() != kind_of(&pm) {
                     let m = cell.meta.get_or_insert_default();
-                    if m.cm.is_none() {
-                        m.cm = pm.cm.clone();
-                    }
-                    m.modern |= pm.modern;
-                    m.dynamic |= pm.dynamic;
+                    (m.cm, m.modern, m.dynamic) = kind_of(&pm);
                 }
             }
             None if cell.formula.is_some() => {
@@ -2432,5 +2428,69 @@ mod tests {
         assert_eq!(wb.sheets[0].cell(0, 2).unwrap().spill, Some((3, 1)));
         assert_eq!(value_at(&wb, "C3"), CellValue::Number(8.0));
         assert!(wb.sheets[0].cell(0, 2).unwrap().is_dynamic());
+    }
+
+    #[test]
+    fn typed_formulas_over_single_cells_are_not_dynamic() {
+        // #724 r1: an elementwise op over single cells that arrive as 1x1
+        // ranges (a table's this-row ref, OFFSET, INDIRECT) is a scalar
+        // formula, not a dynamic array; a real array stays one.
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::text("Qty")),
+            ("B1", Cell::text("Price")),
+            ("C1", Cell::text("Amount")),
+            ("A2", Cell::number(3.0)),
+            ("B2", Cell::number(2.5)),
+        ]);
+        wb.tables.push(crate::sheet::Table {
+            name: "Sales".to_string(),
+            sheet: 0,
+            range: (0, 0, 1, 2),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: vec!["Qty".into(), "Price".into(), "Amount".into()],
+            part: String::new(),
+        });
+        let mut eng = Engine::new(&wb);
+        let scalar = [
+            ("C2", "[@Qty]*[@Price]", CellValue::Number(7.5)),
+            ("E1", "OFFSET(A2,0,1)+1", CellValue::Number(3.5)),
+            ("E2", "INDIRECT(\"A2\")*2", CellValue::Number(6.0)),
+            ("E3", "-OFFSET(A2,0,0)", CellValue::Number(-3.0)),
+            ("E4", "OFFSET(A2,0,0)>1", CellValue::Bool(true)),
+            ("E5", "OFFSET(A2,0,0)&\"x\"", CellValue::Text("3x".into())),
+            ("E6", "ABS(OFFSET(A2,0,0))", CellValue::Number(3.0)),
+            ("E7", "IF(OFFSET(A2,0,0)>1,1,2)", CellValue::Number(1.0)),
+            (
+                "E8",
+                "OFFSET(A2,0,0)*OFFSET(A2,0,1)",
+                CellValue::Number(7.5),
+            ),
+        ];
+        let shaped = [
+            ("G1", "SEQUENCE(1)*2", CellValue::Number(2.0)),
+            ("G2", "{1}+0", CellValue::Number(1.0)),
+            ("G3", "-SEQUENCE(1)", CellValue::Number(-1.0)),
+        ];
+        for (name, src, _) in scalar.iter().chain(shaped.iter()) {
+            let (r, c) = crate::sheet::parse_cell_name(name).unwrap();
+            eng.set_cell(&mut wb, (0, r, c), Cell::formula(src));
+        }
+        for (name, src, want) in &scalar {
+            let (r, c) = crate::sheet::parse_cell_name(name).unwrap();
+            assert_eq!(&value_at(&wb, name), want, "{src}");
+            assert!(
+                !wb.sheets[0].cell(r, c).unwrap().is_dynamic(),
+                "{src} marked dynamic"
+            );
+        }
+        for (name, src, want) in &shaped {
+            let (r, c) = crate::sheet::parse_cell_name(name).unwrap();
+            assert_eq!(&value_at(&wb, name), want, "{src}");
+            assert!(
+                wb.sheets[0].cell(r, c).unwrap().is_dynamic(),
+                "{src} not dynamic"
+            );
+        }
     }
 }

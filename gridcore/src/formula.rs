@@ -2769,11 +2769,26 @@ impl<'a> Eval<'a> {
         }
     }
 
+    /// A scalar, or the value of a one-cell range; None for anything that is
+    /// (or may be) an array — a computed matrix stays one even when 1x1.
+    fn single_value(&self, a: &Arg) -> Option<Value> {
+        match a {
+            Arg::Scalar(v) => Some(v.clone()),
+            Arg::Range(s, r1, c1, r2, c2) if r1 == r2 && c1 == c2 => {
+                Some(self.res.value(*s, *r1, *c1))
+            }
+            _ => None,
+        }
+    }
+
     /// Elementwise binary op with Excel's broadcast rules: a 1-sized axis
     /// stretches; positions outside a non-conforming operand get `#N/A`.
     fn broadcast_bin(&mut self, op: BinOp, l: Arg, r: Arg) -> Arg {
-        if let (Arg::Scalar(a), Arg::Scalar(b)) = (&l, &r) {
-            return Arg::Scalar(bin_op(op, a, b));
+        // Single values in, a single value out: a one-cell range (OFFSET,
+        // INDIRECT, a table's `[@Col]`) is the value it holds, as a plain
+        // reference is. Only a real array operand makes an array.
+        if let (Some(a), Some(b)) = (self.single_value(&l), self.single_value(&r)) {
+            return Arg::Scalar(bin_op(op, &a, &b));
         }
         let lm = match self.materialize(l) {
             Ok(m) => m,
@@ -2827,16 +2842,16 @@ impl<'a> Eval<'a> {
                 UnOp::Implicit => v.clone(),
             }
         };
-        match x {
-            Arg::Scalar(v) => Arg::Scalar(un(&v)),
-            other => match self.materialize(other) {
-                Ok(m) => Arg::Matrix(
-                    m.into_iter()
-                        .map(|row| row.iter().map(&un).collect())
-                        .collect(),
-                ),
-                Err(e) => Arg::Scalar(Value::Err(e)),
-            },
+        if let Some(v) = self.single_value(&x) {
+            return Arg::Scalar(un(&v));
+        }
+        match self.materialize(x) {
+            Ok(m) => Arg::Matrix(
+                m.into_iter()
+                    .map(|row| row.iter().map(&un).collect())
+                    .collect(),
+            ),
+            Err(e) => Arg::Scalar(Value::Err(e)),
         }
     }
 

@@ -2591,10 +2591,30 @@ fn xldapr_dynamic_bk(ns: &str) -> String {
 /// the formula is then written as it was before `cm` existed.
 fn ensure_dynamic_cm(parts: &mut Vec<(String, Vec<u8>)>) -> Option<String> {
     let (name, has_rel) = sheet_metadata_part(parts);
-    if let Some(p) = parts.iter_mut().find(|(n, _)| *n == name) {
-        let xml = String::from_utf8_lossy(&p.1).into_owned();
-        let (updated, index) = add_dynamic_cell_metadata(&xml)?;
-        if let Some(updated) = updated {
+    // Work out the edit first: a part we cannot extend changes nothing.
+    let edit = match parts.iter().find(|(n, _)| *n == name) {
+        Some((_, bytes)) => Some(add_dynamic_cell_metadata(&String::from_utf8_lossy(bytes))?),
+        None => None,
+    };
+    // A `cm` means nothing unless the workbook reaches the part: make sure
+    // its relationship exists (in the workbook's own rels part), or give up.
+    if !has_rel {
+        let wb_part = workbook_part_name(parts);
+        let wb_dir = wb_part.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let target = relative_target(wb_dir, &name);
+        add_rel(
+            parts,
+            &rels_part_name(&wb_part),
+            SHEET_METADATA_REL,
+            &target,
+        );
+        if sheet_metadata_part(parts) != (name.clone(), true) {
+            return None;
+        }
+    }
+    add_content_type_override(parts, &format!("/{name}"), SHEET_METADATA_CT);
+    if let Some((updated, index)) = edit {
+        if let (Some(updated), Some(p)) = (updated, parts.iter_mut().find(|(n, _)| *n == name)) {
             p.1 = updated.into_bytes();
         }
         return Some(index.to_string());
@@ -2604,13 +2624,7 @@ fn ensure_dynamic_cm(parts: &mut Vec<(String, Vec<u8>)>) -> Option<String> {
 <metadata xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:xda="{DYNAMIC_ARRAY_NS}"><metadataTypes count="1">{XLDAPR_TYPE}</metadataTypes><futureMetadata name="XLDAPR" count="1">{}</futureMetadata><cellMetadata count="1"><bk><rc t="1" v="0"/></bk></cellMetadata></metadata>"#,
         xldapr_dynamic_bk("")
     );
-    parts.push((name.clone(), xml.into_bytes()));
-    add_content_type_override(parts, &format!("/{name}"), SHEET_METADATA_CT);
-    if !has_rel {
-        let wb_part = workbook_part_name(parts);
-        let wb_dir = wb_part.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-        add_workbook_rel(parts, SHEET_METADATA_REL, &relative_target(wb_dir, &name));
-    }
+    parts.push((name, xml.into_bytes()));
     Some("1".to_string())
 }
 
@@ -8367,6 +8381,10 @@ b",
             "XLOOKUP(2,A1:A3,A1:A3)",
             "INDEX(A1:A3,2)",
             "IF(A1>1,1,2)",
+            // One-cell ranges from functions are single values too.
+            "OFFSET(A1,0,0)+1",
+            "INDIRECT(\"A2\")*2",
+            "-OFFSET(A1,1,0)",
         ];
         let typed: Vec<((u32, u32), &str)> = srcs
             .iter()
@@ -8504,6 +8522,78 @@ b",
     }
 
     #[test]
+    fn an_unreferenced_metadata_part_gets_its_relationship() {
+        // #724 r1: the part is there but the workbook does not reference it
+        // (no rel, no override): the `cm` only means something once it does.
+        let mut pkg = load_xlsx(&cell_meta_fixture("")).unwrap();
+        let rels = part_text(&pkg, "xl/_rels/workbook.xml.rels").replace(
+            r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sheetMetadata" Target="metadata.xml"/>"#,
+            "",
+        );
+        pkg.set_part("xl/_rels/workbook.xml.rels", rels.into_bytes());
+        let ct = part_text(&pkg, "[Content_Types].xml").replace(
+            &format!(
+                r#"<Override PartName="/xl/metadata.xml" ContentType="{SHEET_METADATA_CT}"/>"#
+            ),
+            "",
+        );
+        pkg.set_part("[Content_Types].xml", ct.into_bytes());
+        let before = pkg.part("xl/metadata.xml").unwrap().to_vec();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 0, 0), Cell::formula("SEQUENCE(2)"));
+        let (re, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<c r="A1" cm="1"><f t="array" ref="A1:A2">"#),
+            "{ws}"
+        );
+        assert_eq!(re.part("xl/metadata.xml").unwrap(), &before[..]);
+        assert!(
+            part_text(&re, "xl/_rels/workbook.xml.rels").contains(&format!(
+                r#"Type="{SHEET_METADATA_REL}" Target="metadata.xml""#
+            ))
+        );
+        assert!(part_text(&re, "[Content_Types].xml").contains(r#"PartName="/xl/metadata.xml""#));
+    }
+
+    #[test]
+    fn a_new_metadata_part_sits_beside_a_workbook_stored_elsewhere() {
+        // #724 r1: the workbook part is `wb/book.xml`; the new metadata part
+        // and its relationship go with it, not to the conventional xl/ paths.
+        let sheet = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData/></worksheet>"#;
+        let workbook = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        let wb_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="sheets/one.xml"/></Relationships>"#;
+        let root_rels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="wb/book.xml"/></Relationships>"#;
+        let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/wb/book.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#;
+        let bytes = write_zip(&[
+            ("[Content_Types].xml".into(), content_types.into()),
+            ("_rels/.rels".into(), root_rels.into()),
+            ("wb/book.xml".into(), workbook.into()),
+            ("wb/_rels/book.xml.rels".into(), wb_rels.into()),
+            ("wb/sheets/one.xml".into(), sheet.into()),
+        ]);
+        let mut pkg = load_xlsx(&bytes).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 0, 0), Cell::formula("SEQUENCE(2)"));
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let ws = part_text(&re, "wb/sheets/one.xml");
+        assert!(
+            ws.contains(r#"<c r="A1" cm="1"><f t="array" ref="A1:A2">"#),
+            "{ws}"
+        );
+        assert!(re.part("wb/metadata.xml").is_some() && re.part("xl/metadata.xml").is_none());
+        assert!(part_text(&re, "wb/_rels/book.xml.rels").contains(&format!(
+            r#"Type="{SHEET_METADATA_REL}" Target="metadata.xml""#
+        )));
+        assert!(part_text(&re, "[Content_Types].xml").contains(r#"PartName="/wb/metadata.xml""#));
+        assert!(re.workbook.sheets[0].cell(0, 0).unwrap().has_cm());
+    }
+
+    #[test]
     fn unreadable_metadata_part_is_left_alone() {
         // A metadata part we cannot extend: no `cm`, and the typed formula is
         // written as before (a plain `<f>` for a 1x1 result).
@@ -8633,6 +8723,49 @@ b",
     }
 
     #[test]
+    fn pasting_a_clone_does_not_bring_the_sources_formula_kind() {
+        // #724 r1: paste sends a clone of the source cell to set_cell at
+        // another address. When the target already has the same text, the
+        // source's `<f>` attributes (a `ref` naming the source) and `cm` must
+        // not land on it.
+        let rows = r#"<row r="1"><c r="A1"><v>1</v></c><c r="D1"><f t="array" ref="D1">$A$1*2</f><v>2</v></c><c r="E1" cm="1"><f t="array" ref="E1:E3">$A$1:$A$3*2</f><v>2</v></c><c r="G1"><f>$A$1:$A$3*2</f><v>2</v></c></row><row r="2"><c r="A2"><v>2</v></c><c r="E2"><v>4</v></c></row><row r="3"><c r="A3"><v>3</v></c><c r="E3"><v>6</v></c></row>"#;
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        let sheet =
+            |pkg: &SheetPackage, c: u32| pkg.workbook.sheets[0].cell(0, c).cloned().unwrap();
+        // The single-cell CSE D1 pasted to F1 twice (the second time F1
+        // already has the same text).
+        let d1 = sheet(&pkg, 3);
+        eng.set_cell(&mut pkg.workbook, (0, 0, 5), d1.clone());
+        eng.set_cell(&mut pkg.workbook, (0, 0, 5), d1);
+        assert_eq!(sheet(&pkg, 5).f_attrs, None);
+        // The dynamic E1 pasted onto the legacy G1 with the same text: G1
+        // stays a legacy formula.
+        let e1 = sheet(&pkg, 4);
+        eng.set_cell(&mut pkg.workbook, (0, 0, 6), e1);
+        let g1 = sheet(&pkg, 6);
+        assert_eq!(
+            (
+                g1.f_attrs.clone(),
+                g1.is_dynamic(),
+                g1.is_modern(),
+                g1.spill
+            ),
+            (None, false, false, None)
+        );
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            !ws.contains(r#"ref="D1"><f"#) && !ws.contains(r#"<c r="F1"><f t="array""#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(r#"<c r="G1"><f>$A$1:$A$3*2</f><v>2</v></c>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
     fn recommitting_a_cse_array_keeps_it_cse() {
         // Enter on an unchanged CSE array (a fresh Cell, no `<f>` attributes)
         // does not turn it into a dynamic array.
@@ -8674,14 +8807,16 @@ b",
     }
 
     #[test]
-    fn undoing_an_overwrite_through_set_cell_restores_cm() {
-        // xlsxy undoes by set_cell-ing the `before` clone back.
+    fn undoing_an_overwrite_through_restore_cell_restores_cm() {
+        // xlsxy and gridwasm undo by restore_cell-ing the `before` clone back:
+        // the anchor comes back exactly, `t="array"` attributes and `cm`.
         let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SORT_ANCHOR))).unwrap();
         let mut eng = crate::engine::Engine::new(&pkg.workbook);
         let before = pkg.workbook.sheets[0].cell(0, 3).cloned().unwrap();
         eng.set_cell(&mut pkg.workbook, (0, 0, 3), Cell::number(1.0));
         assert!(!saved_sheet1(&pkg).contains("cm="));
-        eng.set_cell(&mut pkg.workbook, (0, 0, 3), before);
+        eng.restore_cell(&mut pkg.workbook, (0, 0, 3), before.clone());
+        assert_eq!(pkg.workbook.sheets[0].cell(0, 3).unwrap(), &before);
         let ws = saved_sheet1(&pkg);
         assert!(
             ws.contains(r#"<c r="D1" cm="1"><f t="array" ref="D1:D5">"#),
