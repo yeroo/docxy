@@ -65,6 +65,9 @@ struct StyleDef {
     rtl: Option<bool>,
     tabs: Vec<TabStop>,
     borders: ParBorders,
+    /// `w:pageBreakBefore` / `w:suppressLineNumbers` in the style's `w:pPr`.
+    page_break_before: Option<bool>,
+    suppress_line_numbers: Option<bool>,
     /// Display name (`w:name`), e.g. "heading 1".
     name: Option<String>,
     /// Whether this is a paragraph style (`w:type="paragraph"`), so the
@@ -77,6 +80,33 @@ struct StyleDef {
 pub struct StyleSheet {
     default_run: PartialRun,
     styles: HashMap<String, StyleDef>,
+    /// The default paragraph style (`w:type="paragraph" w:default="1"`), which
+    /// applies to a paragraph without a `w:pStyle`.
+    default_paragraph: Option<String>,
+}
+
+/// An on/off paragraph property a paragraph style can set, resolved by
+/// [`StyleSheet::effective_ppr_flag`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PprFlag {
+    PageBreakBefore,
+    SuppressLineNumbers,
+}
+
+impl PprFlag {
+    fn local_name(self) -> &'static str {
+        match self {
+            PprFlag::PageBreakBefore => "pageBreakBefore",
+            PprFlag::SuppressLineNumbers => "suppressLineNumbers",
+        }
+    }
+
+    fn of(self, def: &StyleDef) -> Option<bool> {
+        match self {
+            PprFlag::PageBreakBefore => def.page_break_before,
+            PprFlag::SuppressLineNumbers => def.suppress_line_numbers,
+        }
+    }
 }
 
 impl StyleSheet {
@@ -172,6 +202,36 @@ impl StyleSheet {
         None
     }
 
+    /// An on/off paragraph property: a direct `w:pPr` child (on, or explicitly
+    /// off with `w:val="0"`) wins; otherwise the paragraph style's chain, or the
+    /// default paragraph style's when the paragraph names none; else off.
+    pub fn effective_ppr_flag(
+        &self,
+        para_style: Option<&str>,
+        direct: &ParProps,
+        flag: PprFlag,
+    ) -> bool {
+        if let Some(on) = raw_toggle(&direct.raw_props, flag.local_name()) {
+            return on;
+        }
+        para_style
+            .or(self.default_paragraph.as_deref())
+            .and_then(|s| self.fold_ppr_flag(s, flag, &mut HashSet::new()))
+            .unwrap_or(false)
+    }
+
+    fn fold_ppr_flag(&self, id: &str, flag: PprFlag, seen: &mut HashSet<String>) -> Option<bool> {
+        if !seen.insert(id.to_string()) {
+            return None;
+        }
+        let def = self.styles.get(id)?;
+        flag.of(def).or_else(|| {
+            def.based_on
+                .as_ref()
+                .and_then(|b| self.fold_ppr_flag(b, flag, seen))
+        })
+    }
+
     fn fold(&self, agg: &mut PartialRun, id: &str, seen: &mut HashSet<String>) {
         if !seen.insert(id.to_string()) {
             return;
@@ -258,6 +318,11 @@ impl StyleSheet {
     }
 }
 
+/// An on/off attribute that is off when absent (`w:default`).
+fn toggle_attr(val: &str) -> bool {
+    !val.is_empty() && toggle(val)
+}
+
 fn toggle(val: &str) -> bool {
     !(val == "0" || val == "false" || val == "off" || val == "none")
 }
@@ -276,6 +341,16 @@ fn map_align(jc: &str) -> Option<Align> {
         "left" | "start" => Some(Align::Left),
         _ => None,
     }
+}
+
+/// The on/off value of the first `raw_props` element named `local` (any
+/// prefix): `w:val` absent is on.
+fn raw_toggle(raw_props: &[String], local: &str) -> Option<bool> {
+    raw_props.iter().find_map(|raw| {
+        let mut parser = XmlParser::new(raw);
+        (parser.next() == Event::Start && parser.name().rsplit(':').next() == Some(local))
+            .then(|| toggle(parser.attr("w:val")))
+    })
 }
 
 fn has_raw_child(raw_props: &[String], local: &str) -> bool {
@@ -303,8 +378,16 @@ pub fn parse_styles_xml(xml: &str) -> StyleSheet {
                     let ty = p.attr("w:type");
                     // w:type defaults to "paragraph" when omitted.
                     let is_paragraph = ty.is_empty() || ty == "paragraph";
+                    let is_default = toggle_attr(p.attr("w:default"));
                     let mut def = parse_style(&mut p);
                     def.is_paragraph = is_paragraph;
+                    if is_paragraph
+                        && is_default
+                        && !id.is_empty()
+                        && ss.default_paragraph.is_none()
+                    {
+                        ss.default_paragraph = Some(id.clone());
+                    }
                     if !id.is_empty() {
                         ss.styles.insert(id, def);
                     }
@@ -427,6 +510,14 @@ fn parse_style_ppr(p: &mut XmlParser, def: &mut StyleDef) {
                 }
                 "w:tabs" => parse_tabs(p, &mut def.tabs),
                 "w:pBdr" => def.borders = parse_pbdr(p),
+                "w:pageBreakBefore" => {
+                    def.page_break_before = Some(toggle(p.attr("w:val")));
+                    p.skip_element();
+                }
+                "w:suppressLineNumbers" => {
+                    def.suppress_line_numbers = Some(toggle(p.attr("w:val")));
+                    p.skip_element();
+                }
                 _ => p.skip_element(),
             },
             Event::End | Event::Eof => break,
@@ -667,5 +758,57 @@ mod tests {
             ..RunProps::default()
         };
         assert_eq!(ss.effective_run(Some("Nope"), None, &d), d);
+    }
+    fn par(style: Option<&str>, raw: &[&str]) -> (Option<String>, ParProps) {
+        let props = ParProps {
+            raw_props: raw.iter().map(|r| r.to_string()).collect(),
+            ..Default::default()
+        };
+        (style.map(str::to_string), props)
+    }
+
+    #[test]
+    fn page_break_before_inherits_through_based_on() {
+        let ss = parse_styles_xml(
+            r#"<w:styles>
+            <w:style w:type="paragraph" w:styleId="Base"><w:pPr><w:pageBreakBefore/></w:pPr></w:style>
+            <w:style w:type="paragraph" w:styleId="Child"><w:basedOn w:val="Base"/></w:style>
+            <w:style w:type="paragraph" w:styleId="Off"><w:basedOn w:val="Base"/><w:pPr><w:pageBreakBefore w:val="0"/></w:pPr></w:style>
+            <w:style w:type="paragraph" w:styleId="Plain"/>
+        </w:styles>"#,
+        );
+        let flag = |style: Option<&str>, raw: &[&str]| {
+            let (style, props) = par(style, raw);
+            ss.effective_ppr_flag(style.as_deref(), &props, PprFlag::PageBreakBefore)
+        };
+        assert!(flag(Some("Base"), &[]));
+        assert!(flag(Some("Child"), &[]), "inherited through basedOn");
+        assert!(!flag(Some("Off"), &[]), "a derived style turns it off");
+        assert!(!flag(Some("Plain"), &[]));
+        assert!(!flag(None, &[]));
+        // Direct properties win either way.
+        assert!(!flag(
+            Some("Child"),
+            &["<w:pageBreakBefore w:val=\"false\"/>"]
+        ));
+        assert!(flag(Some("Plain"), &["<w:pageBreakBefore/>"]));
+        // The other flag is independent.
+        let (style, props) = par(Some("Child"), &[]);
+        assert!(!ss.effective_ppr_flag(style.as_deref(), &props, PprFlag::SuppressLineNumbers));
+    }
+
+    #[test]
+    fn normal_style_page_break_before_applies() {
+        let ss = parse_styles_xml(
+            r#"<w:styles>
+            <w:style w:type="character" w:default="1" w:styleId="DefaultParagraphFont"/>
+            <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:pPr><w:suppressLineNumbers/></w:pPr></w:style>
+            <w:style w:type="paragraph" w:styleId="Other"/>
+        </w:styles>"#,
+        );
+        let (_, props) = par(None, &[]);
+        assert!(ss.effective_ppr_flag(None, &props, PprFlag::SuppressLineNumbers));
+        assert!(!ss.effective_ppr_flag(Some("Other"), &props, PprFlag::SuppressLineNumbers));
+        assert!(!ss.effective_ppr_flag(None, &props, PprFlag::PageBreakBefore));
     }
 }

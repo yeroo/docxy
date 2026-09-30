@@ -24,7 +24,7 @@ use crate::field::{FieldEvent, field_events};
 use crate::load::{Relationships, xml_attr_value};
 use crate::model::*;
 use crate::package::{HeaderVariant, Package, SectionParts, section_header_parts};
-use crate::styles::StyleSheet;
+use crate::styles::{PprFlag, StyleSheet};
 
 #[derive(Debug, Clone)]
 pub struct PdfOptions {
@@ -662,12 +662,14 @@ fn heading_size(p: &Paragraph, base: f32) -> f32 {
     }
 }
 
-/// Direct `w:pageBreakBefore` (kept verbatim in `raw_props`).
-fn page_break_before(p: &Paragraph) -> bool {
-    p.props
-        .raw_props
-        .iter()
-        .any(|raw| flag_on(raw, "w:pageBreakBefore"))
+/// `w:pageBreakBefore`: direct (kept verbatim in `raw_props`, on or off), else
+/// from the paragraph style.
+fn page_break_before(p: &Paragraph, styles: &StyleSheet) -> bool {
+    styles.effective_ppr_flag(
+        p.props.style_id.as_deref(),
+        &p.props,
+        PprFlag::PageBreakBefore,
+    )
 }
 
 fn emit_blocks(flow: &mut dyn Flow, blocks: &[Block], opts: &PdfOptions) {
@@ -681,7 +683,7 @@ fn emit_blocks(flow: &mut dyn Flow, blocks: &[Block], opts: &PdfOptions) {
 }
 
 fn emit_paragraph(flow: &mut dyn Flow, p: &Paragraph, opts: &PdfOptions) {
-    if page_break_before(p) && !flow.at_top() {
+    if page_break_before(p, &opts.styles) && !flow.at_top() {
         flow.hard_break(BreakKind::Page);
     }
     let size = heading_size(p, opts.base_font_size);
@@ -2102,6 +2104,38 @@ mod tests {
 
         let d = doc(vec![pbb("one", "<w:pageBreakBefore/>")]);
         assert_eq!(pages_of(&d, &PdfOptions::default()).len(), 1);
+    }
+
+    #[test]
+    fn a_paragraph_styles_page_break_before_starts_a_new_page() {
+        let ss = crate::styles::parse_styles_xml(
+            r#"<w:styles><w:style w:type="paragraph" w:styleId="Heading1"><w:pPr><w:pageBreakBefore/></w:pPr></w:style></w:styles>"#,
+        );
+        let opts = PdfOptions {
+            styles: Rc::new(ss),
+            ..PdfOptions::default()
+        };
+        let heading = |text: &str, raw: &[&str]| {
+            Block::Paragraph(Paragraph {
+                props: ParProps {
+                    style_id: Some("Heading1".to_string()),
+                    raw_props: raw.iter().map(|r| r.to_string()).collect(),
+                    ..ParProps::default()
+                },
+                content: vec![run(text, RunProps::default())],
+            })
+        };
+        let d = doc(vec![text_para("one"), heading("Title", &[])]);
+        let pages = pages_of(&d, &opts);
+        assert_eq!(pages.len(), 2);
+        assert!(pages[1].has("Title"));
+
+        // A direct explicit off overrides the style.
+        let d = doc(vec![
+            text_para("one"),
+            heading("Title", &[r#"<w:pageBreakBefore w:val="0"/>"#]),
+        ]);
+        assert_eq!(pages_of(&d, &opts).len(), 1);
     }
 
     #[test]
