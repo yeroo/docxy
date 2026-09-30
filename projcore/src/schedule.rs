@@ -388,8 +388,8 @@ struct ConstraintDates {
     /// An unlinked task's date fell before the project-start floor.
     clamped: bool,
     finish_bound: Option<i64>,
-    /// A milestone's finish-constraint instant: the date itself when it is a
-    /// working start instant (a morning deadline stays on its morning), else
+    /// A milestone's constraint instant: the date itself when it is a
+    /// working start instant (a morning date stays on its morning), else
     /// the evening that shares its index.
     milestone: i64,
 }
@@ -1641,9 +1641,9 @@ impl<'a> Scheduler<'a> {
             }
             // Hard constraints (backward-affecting).
             let mut hard_finish_bound = false;
-            // A milestone's MFO/FNLT/deadline instant, kept when the bound
-            // binds. An FNLT or deadline never moves it past what the
-            // successors allow on its own working index.
+            // A milestone's MFO/FNLT/MSO/SNLT/deadline instant, kept when the
+            // bound binds. An FNLT, SNLT or deadline never moves it past what
+            // the successors allow on its own working index.
             let mut milestone_late = None;
             let mut pre_start_window = None;
             if let Some(dates) = self
@@ -1696,20 +1696,23 @@ impl<'a> Scheduler<'a> {
                     if binds {
                         let (s_abs, f_abs) = if t.duration_min != 0 {
                             (pre.abs_start(finish_index - t.duration_min), f_abs)
-                        } else if finish_constraint {
-                            // As `milestone`, on the pre-start timeline: a
-                            // morning deadline stays on its morning.
+                        } else {
+                            // As `milestone`, on the pre-start timeline, for
+                            // start and finish constraints alike: a morning
+                            // constraint date stays on its morning.
                             let mut m = if pre.snap(dates.raw) == dates.raw {
                                 dates.raw
                             } else {
                                 f_abs
                             };
-                            if t.constraint == ConstraintType::FinishNoLaterThan {
+                            if matches!(
+                                t.constraint,
+                                ConstraintType::FinishNoLaterThan
+                                    | ConstraintType::StartNoLaterThan
+                            ) {
                                 m = m.min(bound_instant);
                             }
                             (m, m)
-                        } else {
-                            (f_abs, f_abs)
                         };
                         pre_start_window = Some((pre, s_abs, f_abs));
                     }
@@ -1732,11 +1735,14 @@ impl<'a> Scheduler<'a> {
                         if bound <= finish_abs {
                             finish_abs = bound;
                             hard_finish_bound = true;
+                            milestone_late =
+                                (span == 0).then(|| capped_milestone(tl, milestone, bound_instant));
                         }
                     }
                     ConstraintType::MustStartOn => {
                         finish_abs = tl.abs_finish(tl.to_index(ds) + t.duration_min);
                         hard_finish_bound = true;
+                        milestone_late = (span == 0).then_some(milestone);
                     }
                     _ => {}
                 }
@@ -1775,6 +1781,10 @@ impl<'a> Scheduler<'a> {
                     if bound < finish_abs {
                         finish_abs = bound;
                         hard_finish_bound = true;
+                        // The bound moved the finish to an earlier index, so
+                        // a constraint instant on the old index no longer
+                        // applies.
+                        milestone_late = None;
                     }
                 }
             }
@@ -1790,8 +1800,8 @@ impl<'a> Scheduler<'a> {
                 // reuse the early instants unless a hard date set that bound.
                 (es_abs[&t.uid], ef_abs[&t.uid])
             } else {
-                // A binding MFO/FNLT/deadline milestone keeps its own instant,
-                // capped by a successor on the same working index.
+                // A binding MFO/FNLT/MSO/SNLT/deadline milestone keeps its own
+                // instant, capped by a successor on the same working index.
                 if let Some(m) = milestone_late {
                     debug_assert_eq!(tl.to_index(m), finish_index);
                 }
@@ -5857,6 +5867,72 @@ mod tests {
     }
 
     #[test]
+    fn start_constrained_milestone_keeps_morning_constraint_instant() {
+        let monday = DateTime::from_ymd_hm(2026, 3, 9, 8, 0);
+        // A binding MSO keeps its own morning instant in the late dates,
+        // honored or not, instead of the evening of the date's index.
+        for honor in [true, false] {
+            let proj = finish_constrained_milestone(
+                2400,
+                ConstraintType::MustStartOn,
+                monday,
+                honor,
+                false,
+            );
+            let case = format!("MSO honor={honor}");
+            let m = schedule(&proj).get(2).copied().unwrap();
+            assert_eq!(m.early_start, monday, "{case}");
+            assert_eq!(m.early_finish, monday, "{case}");
+            assert_eq!(m.late_start, monday, "{case}");
+            assert_eq!(m.late_finish, monday, "{case}");
+            assert_eq!(m.total_slack_min, 0, "{case}");
+        }
+        // A binding SNLT keeps its morning instant too; slack is unchanged
+        // (both instants share one working index).
+        let anchor = DateTime::from_ymd_hm(2026, 3, 2, 8, 0);
+        let mut proj = finish_constrained_milestone(
+            2400,
+            ConstraintType::StartNoLaterThan,
+            monday,
+            true,
+            false,
+        );
+        proj.tasks.push(task(3, "C", 3000));
+        let m = schedule(&proj).get(2).copied().unwrap();
+        assert_eq!(m.early_start, anchor);
+        assert_eq!(m.early_finish, anchor);
+        assert_eq!(m.late_start, monday);
+        assert_eq!(m.late_finish, monday);
+        assert_eq!(m.total_slack_min, 2400);
+        // Guard: a date that is not a working start instant keeps the
+        // evening-side instant of its index.
+        let monday_noon = DateTime::from_ymd_hm(2026, 3, 9, 12, 0);
+        let proj = finish_constrained_milestone(
+            2400,
+            ConstraintType::MustStartOn,
+            monday_noon,
+            true,
+            false,
+        );
+        let m = schedule(&proj).get(2).copied().unwrap();
+        assert_eq!(m.late_start, monday_noon);
+        assert_eq!(m.late_finish, monday_noon);
+        // A successor bound on the same index still caps an SNLT milestone.
+        let friday = DateTime::from_ymd_hm(2026, 3, 6, 17, 0);
+        let proj = finish_constrained_milestone(
+            2400,
+            ConstraintType::StartNoLaterThan,
+            monday,
+            true,
+            true,
+        );
+        let m = schedule(&proj).get(2).copied().unwrap();
+        assert_eq!(m.late_start, friday);
+        assert_eq!(m.late_finish, friday);
+        assert_eq!(m.total_slack_min, 0);
+    }
+
+    #[test]
     fn fnlt_milestone_never_loosens_a_same_index_evening_bound() {
         // M finishes Wed; the project finish (C) is Fri 17:00. A Mon 08:00
         // FNLT shares that index but must not move LF past the Friday evening.
@@ -7149,17 +7225,13 @@ mod tests {
 
     #[test]
     fn unlinked_pre_start_start_milestone_reports_negative_slack() {
-        // An SNLT/MSO milestone takes the evening side of its date's index,
-        // as the shared timeline places a post-start one; only finish
-        // constraints keep a morning deadline on its morning (#89).
-        let friday_evening = DateTime::from_ymd_hm(2026, 2, 13, 17, 0);
+        // A start constraint keeps a morning date on its morning, as finish
+        // constraints do (#89); slack is unchanged, the instants share one
+        // working index.
+        let monday_morning = DateTime::from_ymd_hm(2026, 2, 16, 8, 0);
         let monday_noon = DateTime::from_ymd_hm(2026, 2, 16, 12, 0);
         for (date, late, slack) in [
-            (
-                DateTime::from_ymd_hm(2026, 2, 16, 8, 0),
-                friday_evening,
-                -10 * 480,
-            ),
+            (monday_morning, monday_morning, -10 * 480),
             (monday_noon, monday_noon, -9 * 480 - 240),
         ] {
             for constraint in [
@@ -7170,13 +7242,16 @@ mod tests {
                     let mut proj = unlinked_deadline(constraint, date, honor);
                     proj.tasks[1].duration_min = 0;
                     let case = format!("{constraint:?} {date:?} honor={honor}");
-                    let r = *schedule(&proj).get(2).unwrap();
+                    let sched = schedule(&proj);
+                    let r = *sched.get(2).unwrap();
                     assert_eq!(r.early_start, proj.start_date.unwrap(), "{case}");
                     assert_eq!(r.early_finish, proj.start_date.unwrap(), "{case}");
                     assert_eq!(r.late_start, late, "{case}");
                     assert_eq!(r.late_finish, late, "{case}");
                     assert_eq!(r.total_slack_min, slack, "{case}");
                     assert!(r.critical, "{case}");
+                    let phase = sched.get(1).unwrap();
+                    assert_eq!(phase.late_start, late, "{case}");
                 }
             }
         }
@@ -7229,6 +7304,26 @@ mod tests {
             assert_eq!(r.late_start, friday_evening, "honor={honor}");
             assert_eq!(r.late_finish, friday_evening, "honor={honor}");
             assert_eq!(r.total_slack_min, -10 * 480, "honor={honor}");
+        }
+    }
+
+    #[test]
+    fn milestone_under_earlier_summary_fnlt_takes_summary_bound() {
+        // A summary FNLT on an earlier index lowers the late finish past the
+        // milestone's own constraint instant, so the constraint's instant no
+        // longer applies and the debug assert on matching indexes holds.
+        let thursday = DateTime::from_ymd_hm(2026, 3, 5, 17, 0);
+        let monday = DateTime::from_ymd_hm(2026, 3, 9, 8, 0);
+        for constraint in [ConstraintType::MustStartOn, ConstraintType::MustFinishOn] {
+            let mut proj = unlinked_deadline(ConstraintType::FinishNoLaterThan, thursday, true);
+            proj.tasks[0].constraint = ConstraintType::FinishNoLaterThan;
+            proj.tasks[0].constraint_date = Some(thursday);
+            proj.tasks[1].duration_min = 0;
+            proj.tasks[1].constraint = constraint;
+            proj.tasks[1].constraint_date = Some(monday);
+            let r = *schedule(&proj).get(2).unwrap();
+            assert_eq!(r.late_start, thursday, "{constraint:?}");
+            assert_eq!(r.late_finish, thursday, "{constraint:?}");
         }
     }
 
