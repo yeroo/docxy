@@ -777,7 +777,16 @@ impl Session {
                 }
                 first = false;
                 let xf = wb.styles.xf(cell.style);
-                let text = format_with(&xf, &cell.value, wb.date1904);
+                // A General number is fitted to its column in characters, as
+                // Excel's General shows it (at most 11; the editor and a copy
+                // keep every digit).
+                let text = match cell.value {
+                    CellValue::Number(n) if gridcore::entry::is_general(&xf) => {
+                        let chars = sh.col_width(c).floor().max(1.0) as usize;
+                        gridcore::sheet::fmt_general_cell(n, chars)
+                    }
+                    _ => format_with(&xf, &cell.value, wb.date1904),
+                };
                 out.push_str("{\"r\":");
                 out.push_str(&r.to_string());
                 out.push_str(",\"c\":");
@@ -2947,6 +2956,23 @@ mod tests {
         s.dispatch("set\t9\t1\t150%");
         let b10 = s.pkg.workbook.sheets[0].cell(9, 1).unwrap().value.clone();
         assert_eq!(b10, CellValue::Number(1.5));
+    }
+
+    #[test]
+    fn a_general_number_is_fitted_to_its_column() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.pkg.workbook.sheets[0].set_cell(9, 0, Cell::number(123_456_789_012.0));
+        let chars = s.pkg.workbook.sheets[0].col_width(0).floor() as usize;
+        let want = gridcore::sheet::fmt_general_cell(123_456_789_012.0, chars);
+        let v = s.view_json(None);
+        assert!(v.contains(&format!("\"t\":\"{want}\"")), "{want}: {v}");
+        assert!(!v.contains("\"t\":\"123456789012\""), "{v}");
+        // A wide column still stops at General's 11 characters.
+        s.pkg.workbook.sheets[0].set_col_width(0, 30.0);
+        let v = s.view_json(None);
+        assert!(v.contains("\"t\":\"1.23457E+11\""), "{v}");
+        // The editor keeps every digit.
+        assert_eq!(s.cell_seed(9, 0), "123456789012");
     }
 
     #[test]

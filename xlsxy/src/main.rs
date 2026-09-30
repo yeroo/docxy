@@ -5827,11 +5827,7 @@ fn draw(app: &mut App, f: &mut Frame) {
                     Some(cl) if formula_view && cl.formula.is_some() => {
                         format!("={}", cl.formula.as_ref().unwrap())
                     }
-                    // A date/time it cannot show fills the cell with `#`.
-                    Some(cl) if date_unrepresentable(&xf, &cl.value, date1904) => {
-                        "#".repeat(w as usize)
-                    }
-                    Some(cl) => format_with(&xf, &cl.value, date1904),
+                    Some(cl) => grid_text(&xf, &cl.value, date1904, w),
                     None => String::new(),
                 }
             };
@@ -6121,6 +6117,23 @@ fn center(s: &str, w: usize) -> String {
     }
     let lead = (w - width) / 2;
     format!("{}{}{}", " ".repeat(lead), s, " ".repeat(w - width - lead))
+}
+
+/// What a grid cell `w` columns wide (a merge's whole span) shows for
+/// `value`: a date/time it cannot show fills it with `#`; a General number
+/// is fitted as Excel's General shows it (at most 11 characters, fewer
+/// decimals or scientific when narrower; `fit` keeps one column for the
+/// trailing space); anything else is its formatted text.
+fn grid_text(xf: &gridcore::sheet::Xf, value: &CellValue, date1904: bool, w: u16) -> String {
+    if date_unrepresentable(xf, value, date1904) {
+        return "#".repeat(w as usize);
+    }
+    match value {
+        CellValue::Number(n) if gridcore::entry::is_general(xf) => {
+            gridcore::sheet::fmt_general_cell(*n, (w as usize).saturating_sub(1))
+        }
+        _ => format_with(xf, value, date1904),
+    }
 }
 
 /// How many screen lines a row occupies: derived from an explicit row height
@@ -9770,6 +9783,36 @@ mod tests {
         let (_, stats) = verify_report(&pkg, "d.xlsx");
         assert_eq!(stats.volatile, 0);
         assert_eq!((stats.total, stats.compared, stats.matched), (1, 1, 1));
+    }
+
+    #[test]
+    fn a_general_number_is_fitted_to_its_column() {
+        let general = gridcore::sheet::Xf::default();
+        let big = CellValue::Number(123_456_789_012.0);
+        // A wide column still stops at General's 11 characters; a narrower
+        // one shortens further; the stored value keeps every digit.
+        assert_eq!(grid_text(&general, &big, false, 20), "1.23457E+11");
+        assert_eq!(grid_text(&general, &big, false, 9), "1.23E+11");
+        assert_eq!(grid_text(&general, &big, false, 3), "##");
+        assert_eq!(
+            grid_text(&general, &CellValue::Number(42.0), false, 9),
+            "42"
+        );
+        // A number format is not General: it keeps its own text.
+        let mut fixed = gridcore::sheet::Xf::default();
+        fixed.set_code(Some("0.00".into()));
+        assert_eq!(grid_text(&fixed, &CellValue::Number(1.5), false, 9), "1.50");
+        // Drawn: the default column shows the fitted text, not the digits.
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        // Off the cursor (A1), so the formula bar does not show its digits.
+        app.pkg.workbook.sheets[0].set_cell(2, 1, gridcore::sheet::Cell::number(123_456_789_012.0));
+        app.rebuild_engine();
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        let text = format!("{:?}", term.backend().buffer());
+        assert!(!text.contains("123456789012"), "full digits drawn");
+        assert!(text.contains("E+11"), "fitted text missing");
     }
 
     #[test]

@@ -154,6 +154,35 @@ fn the_editor_seeds_every_digit_and_a_percent_cell_its_percent() {
 }
 
 #[test]
+fn a_general_number_is_fitted_to_its_cell() {
+    let general = Xf::default();
+    let big = CellValue::Number(123_456_789_012.0);
+    // A default column (col_px of 8.43) and a wide one: General stops at 11
+    // characters either way, shorter when the cell is narrower.
+    let default_w = col_px(8.43);
+    let chars = (((default_w - 6.0) / 7.0).floor() as usize).max(1);
+    assert_eq!(
+        grid_cell_text(&general, &big, false, default_w),
+        gridcore::sheet::fmt_general_cell(123_456_789_012.0, chars)
+    );
+    assert_ne!(
+        grid_cell_text(&general, &big, false, default_w),
+        "123456789012"
+    );
+    assert_eq!(grid_cell_text(&general, &big, false, 200.0), "1.23457E+11");
+    assert_eq!(
+        grid_cell_text(&general, &CellValue::Number(42.0), false, 64.0),
+        "42"
+    );
+    let mut fixed = Xf::default();
+    fixed.set_code(Some("0.00".into()));
+    assert_eq!(
+        grid_cell_text(&fixed, &CellValue::Number(1.5), false, 64.0),
+        "1.50"
+    );
+}
+
+#[test]
 fn an_apostrophe_is_a_quote_prefix_and_an_untouched_reedit_is_a_no_op() {
     let mut v = view();
     type_fresh(&mut v, "'007");

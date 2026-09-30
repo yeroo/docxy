@@ -1833,6 +1833,20 @@ pub fn fmt_general(n: f64) -> String {
     }
 }
 
+/// The most characters Excel's General format shows a number in, however
+/// wide the column: 12345678901 is shown whole, 123456789012 as
+/// `1.23457E+11`, 0.123456789012345 as `0.123456789`.
+pub const GENERAL_MAX_CHARS: usize = 11;
+
+/// A General number as a grid cell `width` characters wide shows it:
+/// [`fmt_general_fit`] within General's own [`GENERAL_MAX_CHARS`], and `#`s
+/// across the cell when not even scientific notation fits. Display only:
+/// the editor, a copy and the saved value keep every digit.
+pub fn fmt_general_cell(n: f64, width: usize) -> String {
+    let width = width.max(1);
+    fmt_general_fit(n, width.min(GENERAL_MAX_CHARS)).unwrap_or_else(|| "#".repeat(width))
+}
+
 /// A General number as a cell `width` characters wide shows it: in full
 /// when it fits, else with fewer decimals (`0.333333`), else in scientific
 /// notation with as many mantissa digits as fit (`1.23E+08`). `None` when
@@ -2597,6 +2611,19 @@ mod tests {
         );
         assert_eq!(fmt_general_fit(42.0, 8).as_deref(), Some("42"));
         assert_eq!(fmt_general_fit(123_456_789.0, 3), None);
+    }
+
+    #[test]
+    fn a_general_cell_shows_at_most_eleven_characters() {
+        // However wide the column, General stops at 11 characters.
+        assert_eq!(fmt_general_cell(123_456_789_012.0, 20), "1.23457E+11");
+        assert_eq!(fmt_general_cell(0.123_456_789_012_345, 20), "0.123456789");
+        assert_eq!(fmt_general_cell(12_345_678_901.0, 20), "12345678901");
+        assert_eq!(fmt_general_cell(42.0, 20), "42");
+        // A narrower column shortens it further, down to `#`s.
+        assert_eq!(fmt_general_cell(123_456_789_012.0, 8), "1.23E+11");
+        assert_eq!(fmt_general_cell(123_456_789.0, 3), "###");
+        assert_eq!(fmt_general_cell(5.0, 0), "5");
     }
 
     #[test]

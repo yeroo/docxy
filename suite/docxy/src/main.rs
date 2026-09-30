@@ -4023,6 +4023,30 @@ fn edit_runs(buf: &str, caret_chars: usize) -> Vec<(usize, String, Option<usize>
         .collect()
 }
 
+/// What a grid cell `cell_w` pixels wide (a merge's whole span) shows for
+/// `value`. The width in characters is what fits at the grid's 12px text
+/// (about 7px a digit, less the padding). A date/time it cannot show is `#`
+/// across the cell (#673); a General number is fitted as Excel's General
+/// shows it (at most 11 characters, fewer decimals or scientific when
+/// narrower); anything else is its formatted text.
+fn grid_cell_text(
+    xf: &gridcore::sheet::Xf,
+    value: &gridcore::sheet::CellValue,
+    d1904: bool,
+    cell_w: f32,
+) -> String {
+    let chars = (((cell_w - 6.0) / 7.0).floor() as usize).max(1);
+    if gridcore::sheet::date_unrepresentable(xf, value, d1904) {
+        return "#".repeat(chars);
+    }
+    match value {
+        gridcore::sheet::CellValue::Number(n) if gridcore::entry::is_general(xf) => {
+            gridcore::sheet::fmt_general_cell(*n, chars)
+        }
+        _ => gridcore::sheet::format_with(xf, value, d1904),
+    }
+}
+
 /// Render an in-progress edit buffer with a blinking-style caret bar at `caret`
 /// (a char index), each reference the formula mentions in its own colour.
 /// Shared by the in-cell editor and the formula bar.
@@ -23148,12 +23172,7 @@ fn sheet_row(
             Some(cl) if !cl.is_blank() => {
                 let xf = styles.xf(cl.style);
                 (
-                    if gridcore::sheet::date_unrepresentable(&xf, &cl.value, d1904) {
-                        // A date/time it cannot show: `#` across the cell (#673).
-                        "#".repeat((((cell_w - 6.0) / 7.0).floor() as usize).max(1))
-                    } else {
-                        gridcore::sheet::format_with(&xf, &cl.value, d1904)
-                    },
+                    grid_cell_text(&xf, &cl.value, d1904, cell_w),
                     Some(xf),
                     matches!(cl.value, CellValue::Number(_)),
                 )
