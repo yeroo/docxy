@@ -940,7 +940,7 @@ impl Editor {
     /// sibling paragraphs (merging the ends). A selection spanning different
     /// containers (e.g. body into a table cell) just collapses to the start.
     pub fn delete_selection(&mut self) -> bool {
-        let Some((lo, hi)) = self.selection_range() else {
+        let Some((mut lo, hi)) = self.selection_range() else {
             return false;
         };
         self.anchor = None;
@@ -993,6 +993,15 @@ impl Editor {
             // Merge the remainder onto the first paragraph.
             if let Some(Block::Paragraph(p)) = cont.get_mut(li) {
                 p.content.extend(remainder);
+            }
+            // A block content control (a placed page number, a cover page)
+            // that lost one boundary goes as a control; what is left of its
+            // content stays. The caret's paragraph moves up by the boundaries
+            // dropped before it.
+            let dropped = crate::hf::balance_sdt_boundaries(cont);
+            let shift = dropped.iter().filter(|&&i| i < li).count();
+            if let Some(last) = lo.path.last_mut() {
+                *last -= shift;
             }
         }
         self.caret = lo;

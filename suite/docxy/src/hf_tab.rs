@@ -217,7 +217,7 @@ pub(crate) fn hf_dropdowns() -> Vec<Control<Act>> {
 pub(crate) fn hf_tab() -> rs::Tab<Act> {
     rs::tab(
         "Header & Footer",
-        "JH",
+        "J",
         vec![
             rs::group("Header & Footer", 60, hf_dropdowns()),
             rs::group(
@@ -250,8 +250,8 @@ pub(crate) fn hf_tab() -> rs::Tab<Act> {
                         .key("GF"),
                     ]),
                     Control::Column(vec![
-                        cmdt("hf-prev", "undo", "Previous", hf(HfAct::Previous), "").key("P"),
-                        cmdt("hf-next", "redo", "Next", hf(HfAct::Next), "").key("N"),
+                        cmdt("hf-prev", "undo", "Previous", hf(HfAct::Previous), "").key("PV"),
+                        cmdt("hf-next", "redo", "Next", hf(HfAct::Next), "").key("NX"),
                         cmdt(
                             "hf-link",
                             "copy",
@@ -400,6 +400,17 @@ pub(crate) fn target(tab: &DocTab) -> (usize, HeaderVariant) {
     }
 }
 
+/// The section and variant a command for the header (`is_header`) or footer
+/// acts on: the edited slot when that area is the one open, else the
+/// target section's default one.
+pub(crate) fn target_for(tab: &DocTab, is_header: bool) -> (usize, HeaderVariant) {
+    let (section, variant) = target(tab);
+    match &tab.hf_edit {
+        Some(h) if h.is_header == is_header => (section, variant),
+        _ => (section, HeaderVariant::Default),
+    }
+}
+
 fn body_sections(tab: &DocTab) -> Vec<String> {
     match &tab.surface {
         Surface::Doc(ed) => ed.sections(),
@@ -413,6 +424,12 @@ pub(crate) fn distance_of(tab: &DocTab, is_header: bool) -> Option<i32> {
     body_sections(tab)
         .get(section)
         .map(|s| crate::hf::distance(s, is_header))
+}
+
+/// What the Header from Top (`is_header`) or Footer from Bottom box shows:
+/// the target section's distance in inches (`0.5"`).
+pub(crate) fn distance_text(tab: &DocTab, is_header: bool) -> Option<String> {
+    distance_of(tab, is_header).map(|t| format!("{}\"", crate::page_setup::inches(t)))
 }
 
 /// Whether the edited slot is linked to the previous section's ("Same as
@@ -481,7 +498,47 @@ pub(crate) fn hf_checked(tab: &DocTab, act: HfAct) -> bool {
     }
 }
 
-/// The header/footer XML a part holds, around its block content.
+/// The start of an existing header/footer part up to and including its root
+/// start tag (the XML declaration, `<w:hdr …>` with every namespace and
+/// `mc:Ignorable` it declares), and the end tag that closes it. `None` when
+/// the part holds no such root.
+fn root_of(xml: &str, is_header: bool) -> Option<(String, String)> {
+    let tag = if is_header { "w:hdr" } else { "w:ftr" };
+    let open = format!("<{tag}");
+    let mut from = 0;
+    let start = loop {
+        let at = from + xml[from..].find(&open)?;
+        let after = &xml[at + open.len()..];
+        if after.starts_with([' ', '>', '/', '\t', '\r', '\n']) {
+            break at;
+        }
+        from = at + open.len();
+    };
+    let gt = start + xml[start..].find('>')?;
+    let close = format!("</{tag}>");
+    if xml[..gt].ends_with('/') {
+        // `<w:hdr …/>`: an empty part; open it up.
+        return Some((format!("{}>", &xml[..gt - 1]), close));
+    }
+    Some((xml[..=gt].to_string(), close))
+}
+
+/// Replace an existing header/footer part's content with `inner` (block XML),
+/// keeping the part's own root start tag, so the namespaces its drawings,
+/// VML and markup-compatibility content use stay declared. A part without a
+/// readable root gets a fresh one ([`part_xml`]).
+pub(crate) fn rewrite_part(pkg: &mut Package, part: &str, is_header: bool, inner: &str) {
+    let existing = pkg
+        .part(part)
+        .map(|b| String::from_utf8_lossy(b).into_owned());
+    let xml = match existing.as_deref().and_then(|x| root_of(x, is_header)) {
+        Some((head, tail)) => format!("{head}{inner}{tail}"),
+        None => part_xml(is_header, inner),
+    };
+    pkg.set_part(part, xml.into_bytes());
+}
+
+/// The header/footer XML a new part holds, around its block content.
 pub(crate) fn part_xml(is_header: bool, inner: &str) -> String {
     let tag = if is_header { "w:hdr" } else { "w:ftr" };
     format!(
@@ -529,7 +586,7 @@ pub(crate) fn set_content(
         Some(name) => {
             let pkg = tab.pkg.as_mut().ok_or("Headers/footers need a .docx")?;
             pkg.ensure_styles(&[crate::hf::style_id(is_header)]);
-            pkg.set_part(&name, part_xml(is_header, inner).into_bytes());
+            rewrite_part(pkg, &name, is_header, inner);
             tab.dirty = true;
             Ok(name)
         }
@@ -554,9 +611,14 @@ pub(crate) fn resolved_part(
         .map(|a| a.part_name.clone())
 }
 
-/// Reopen the header/footer editor on `section`/`variant` (after its part or
-/// link changed), keeping Show Document Text.
-fn reopen(tab: &mut DocTab, section: usize, is_header: bool, variant: HeaderVariant) -> bool {
+/// (Re)open the header/footer editor on `section`/`variant` (after its part
+/// or link changed, or to move to another area), keeping Show Document Text.
+pub(crate) fn reopen(
+    tab: &mut DocTab,
+    section: usize,
+    is_header: bool,
+    variant: HeaderVariant,
+) -> bool {
     let show_text = tab.hf_edit.as_ref().is_none_or(|h| h.show_text);
     tab.hf_edit = None;
     let ok = crate::hf::open(tab, section, is_header, variant);
@@ -566,9 +628,8 @@ fn reopen(tab: &mut DocTab, section: usize, is_header: bool, variant: HeaderVari
     ok
 }
 
-/// The navigation order Previous and Next walk: each (section, variant) slot
-/// that some page shows, in page order.
-pub(crate) fn nav_slots(tab: &DocTab) -> Vec<PageSlot> {
+/// The slot each print-layout page shows, in page order.
+pub(crate) fn tab_page_slots(tab: &DocTab) -> Vec<PageSlot> {
     let Surface::Doc(ed) = &tab.surface else {
         return Vec::new();
     };
@@ -577,8 +638,14 @@ pub(crate) fn nav_slots(tab: &DocTab) -> Vec<PageSlot> {
         .iter()
         .map(|cols| cols.first().map_or(0, |c| c.0))
         .collect();
+    crate::hf::page_slots(ed, &firsts, even_odd)
+}
+
+/// The navigation order Previous and Next walk: each (section, variant) slot
+/// that some page shows, in page order.
+pub(crate) fn nav_slots(tab: &DocTab) -> Vec<PageSlot> {
     let mut out: Vec<PageSlot> = Vec::new();
-    for slot in crate::hf::page_slots(ed, &firsts, even_odd) {
+    for slot in tab_page_slots(tab) {
         if !out.contains(&slot) {
             out.push(slot);
         }
@@ -588,17 +655,7 @@ pub(crate) fn nav_slots(tab: &DocTab) -> Vec<PageSlot> {
 
 /// The slot print-layout page `page` (0-based) shows, if there is one.
 pub(crate) fn page_slot(tab: &DocTab, page: usize) -> Option<PageSlot> {
-    let Surface::Doc(ed) = &tab.surface else {
-        return None;
-    };
-    let even_odd = tab.pkg.as_ref().is_some_and(|p| p.has_even_odd());
-    let firsts: Vec<usize> = crate::page_ranges(tab)
-        .iter()
-        .map(|cols| cols.first().map_or(0, |c| c.0))
-        .collect();
-    crate::hf::page_slots(ed, &firsts, even_odd)
-        .get(page)
-        .copied()
+    tab_page_slots(tab).get(page).copied()
 }
 
 fn variant_rank(v: HeaderVariant) -> u8 {
@@ -642,11 +699,7 @@ pub(crate) fn hf_apply(tab: &mut DocTab, act: HfAct) -> Result<(), String> {
             let design = DESIGNS.get(index).ok_or("no such design")?;
             // The design goes in the edited slot when it is of this kind,
             // else in the section's default one.
-            let variant = if is_header == is_header_now {
-                variant
-            } else {
-                HeaderVariant::Default
-            };
+            let (_, variant) = target_for(tab, is_header);
             set_content(
                 tab,
                 section,
@@ -658,21 +711,13 @@ pub(crate) fn hf_apply(tab: &mut DocTab, act: HfAct) -> Result<(), String> {
             tab.status = format!("{}: {}", kind_name(is_header), design.name).into();
         }
         HfAct::Edit(is_header) => {
-            let variant = if tab.hf_edit.is_some() && is_header == is_header_now {
-                variant
-            } else {
-                HeaderVariant::Default
-            };
+            let (_, variant) = target_for(tab, is_header);
             if !reopen(tab, section, is_header, variant) {
                 return Err(tab.status.to_string());
             }
         }
         HfAct::Remove(is_header) => {
-            let variant = if tab.hf_edit.is_some() && is_header == is_header_now {
-                variant
-            } else {
-                HeaderVariant::Default
-            };
+            let (_, variant) = target_for(tab, is_header);
             let name = resolved_part(tab, section, is_header, variant).ok_or_else(|| {
                 format!(
                     "This section has no {}",
@@ -680,10 +725,7 @@ pub(crate) fn hf_apply(tab: &mut DocTab, act: HfAct) -> Result<(), String> {
                 )
             })?;
             let pkg = tab.pkg.as_mut().ok_or("no package")?;
-            pkg.set_part(
-                &name,
-                part_xml(is_header, &crate::hf::empty_content(is_header)).into_bytes(),
-            );
+            rewrite_part(pkg, &name, is_header, &crate::hf::empty_content(is_header));
             tab.dirty = true;
             if tab.hf_edit.as_ref().is_some_and(|h| h.part_name == name) {
                 reopen(tab, section, is_header, variant);
@@ -965,15 +1007,10 @@ impl Docxy {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
-        let (Some(h), Surface::Doc(ed)) = (&tab.hf_edit, &tab.surface) else {
+        let Some(h) = &tab.hf_edit else {
             return;
         };
-        let even_odd = tab.pkg.as_ref().is_some_and(|p| p.has_even_odd());
-        let firsts: Vec<usize> = crate::page_ranges(tab)
-            .iter()
-            .map(|cols| cols.first().map_or(0, |c| c.0))
-            .collect();
-        let slots = crate::hf::page_slots(ed, &firsts, even_odd);
+        let slots = tab_page_slots(tab);
         self.doc_scroll
             .scroll_to_item(crate::hf::edit_page(&slots, h.section, h.variant));
     }

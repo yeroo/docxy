@@ -7,7 +7,11 @@ use super::*;
 use crate::hf::tests::{caret_in, ed, ed_mut, saved, saved_hf, saved_sections, three_sections};
 use core::prelude::v1::test;
 use ctlcore::json::Json;
-use docxcore::hf::has_page_number;
+use docxcore::hf::is_page_number_open;
+
+fn has_page_number(blocks: &[Block]) -> bool {
+    blocks.iter().any(is_page_number_open)
+}
 
 fn labels(items: &[menu::MenuItem]) -> Vec<String> {
     items
@@ -206,7 +210,7 @@ fn format_page_numbers_opens_on_words_defaults_and_writes_pg_num_type() {
         &Json::obj(vec![("value", Json::Str(String::new()))]),
     )
     .unwrap();
-    assert!(format_of(&d).is_err());
+    assert!(format_of(&d, &PageNumberFormat::parse(&ed(&t).sections()[1])).is_err());
 }
 
 /// Criterion 18 / PAG-061 / PAG-CASE-016 step 5.
@@ -250,4 +254,125 @@ fn remove_page_numbers_removes_only_placed_numbers() {
     let h = t.hf_edit.as_ref().unwrap();
     assert!(!has_page_number(&h.editor.doc.body));
     assert!(!remove_all(&mut t).unwrap(), "nothing left to remove");
+}
+
+/// m3: a `w:fmt` the Number format list does not name is shown as itself
+/// and survives OK unchanged, with no undo step.
+#[test]
+fn an_unlisted_number_format_survives_ok() {
+    let mut t = three_sections("format-unlisted", true);
+    ed_mut(&mut t).edit_sections(&[1], |raw| {
+        PageNumberFormat {
+            fmt: Some("decimalZero".into()),
+            chap_sep: Some("colon".into()),
+            chap_style: Some(12),
+            ..Default::default()
+        }
+        .apply(raw)
+    });
+    let before = ed(&t).sections()[1].clone();
+    caret_in(&mut t, 1);
+    let d = format_dialog(&t).unwrap();
+    let c = |name: &str| d.controls.iter().find(|c| c.name == name).unwrap().text();
+    assert_eq!(c("format"), "decimalZero");
+    assert_eq!(c("chap_style"), "12");
+    assert!(
+        !apply_format(ed_mut(&mut t), &d, 1).unwrap(),
+        "nothing changed"
+    );
+    assert_eq!(ed(&t).sections()[1], before);
+    // Changing only the start keeps the unlisted format.
+    let mut d = format_dialog(&t).unwrap();
+    d.set(
+        "numbering",
+        &Json::obj(vec![("value", Json::Str("Start at:".into()))]),
+    )
+    .unwrap();
+    assert!(apply_format(ed_mut(&mut t), &d, 1).unwrap());
+    let f = PageNumberFormat::parse(&ed(&t).sections()[1]);
+    assert_eq!(f.fmt.as_deref(), Some("decimalZero"));
+    assert_eq!((f.start, f.chap_style), (Some(1), Some(12)));
+}
+
+/// M1: rewriting a part keeps its root start tag, so prefixes its drawings
+/// use stay declared.
+#[test]
+fn removing_page_numbers_keeps_the_parts_namespace_declarations() {
+    let mut t = three_sections("namespaces", true);
+    caret_in(&mut t, 0);
+    place(&mut t, false, 0).unwrap();
+    exit_hf_tab(&mut t);
+    let part = crate::hf_tab::resolved_part(&t, 0, false, HeaderVariant::Default).unwrap();
+    // Give the footer Word's root, with a drawing's namespaces, and a drawing.
+    let root = "<w:ftr xmlns:wpc=\"http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas\" \
+        xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" \
+        xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" \
+        xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" \
+        xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" \
+        xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
+        xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\" mc:Ignorable=\"w14\">";
+    let drawing = "<w:p><w:r><w:drawing><wp:inline><a:graphic><a:graphicData/></a:graphic></wp:inline></w:drawing></w:r></w:p>";
+    let pkg = t.pkg.as_mut().unwrap();
+    let old = String::from_utf8_lossy(pkg.part(&part).unwrap()).into_owned();
+    let inner = &old[old
+        .find('>')
+        .map(|i| old[i + 1..].find('>').unwrap() + i + 2)
+        .unwrap()..old.rfind("</w:ftr>").unwrap()];
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n{root}{drawing}{inner}</w:ftr>"
+    );
+    pkg.set_part(&part, xml.into_bytes());
+    assert!(remove_all(&mut t).unwrap());
+    let pkg = saved(&mut t);
+    let out = String::from_utf8_lossy(pkg.part(&part).unwrap()).into_owned();
+    assert!(out.contains(root), "the root stays: {out}");
+    assert!(out.contains("<wp:inline>"), "{out}");
+    assert!(!out.contains("w:sdt"), "{out}");
+    assert!(out.trim_end().ends_with("</w:ftr>"));
+    // Every prefix used in the part is declared on its root.
+    for prefix in ["w:", "wp:", "a:"] {
+        let name = prefix.trim_end_matches(':');
+        assert!(
+            out.contains(&format!("xmlns:{name}=")),
+            "{prefix} unbound: {out}"
+        );
+    }
+}
+
+/// C1: Select All + Delete in a footer holding a placed number, first or
+/// last, saves a well-formed part (the control goes with its content).
+#[test]
+fn select_all_delete_over_a_placed_number_saves_a_well_formed_part() {
+    for top in [false, true] {
+        let mut t = three_sections(if top { "sel-top" } else { "sel-bottom" }, true);
+        caret_in(&mut t, 0);
+        place(&mut t, top, 0).unwrap();
+        let editor = &mut t.hf_edit.as_mut().unwrap().editor;
+        editor.select_all();
+        editor.delete_forward();
+        let pkg = saved(&mut t);
+        let blocks = saved_blocks(&pkg, 0, top);
+        let xml = docxcore::serialize::blocks_to_xml(&blocks);
+        assert_eq!(
+            xml.matches("<w:sdt>").count(),
+            xml.matches("</w:sdt>").count(),
+            "{xml}"
+        );
+    }
+}
+
+/// C1's net: whatever the editor holds, a flush never writes one boundary
+/// of a content control without the other.
+#[test]
+fn flushing_drops_a_content_control_boundary_left_alone() {
+    let mut t = three_sections("flush-net", true);
+    caret_in(&mut t, 0);
+    place(&mut t, false, 0).unwrap();
+    let body = &mut t.hf_edit.as_mut().unwrap().editor.doc.body;
+    let open = body.iter().position(is_page_number_open).unwrap();
+    body.remove(open);
+    let pkg = saved(&mut t);
+    let xml = docxcore::serialize::blocks_to_xml(&saved_blocks(&pkg, 0, false));
+    assert!(!xml.contains("sdt"), "{xml}");
+    assert!(xml.contains(" PAGE "), "the content stays: {xml}");
 }

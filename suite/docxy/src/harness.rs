@@ -1621,10 +1621,8 @@ fn add_combo_values(json: &mut Json, app: &crate::Docxy) {
                 let value = app
                     .tabs
                     .get(app.active)
-                    .and_then(|t| crate::hf_tab::distance_of(t, is_header))
-                    .map_or(Json::Null, |t| {
-                        Json::Str(format!("{}\"", crate::page_setup::inches(t)))
-                    });
+                    .and_then(|t| crate::hf_tab::distance_text(t, is_header))
+                    .map_or(Json::Null, Json::Str);
                 command.push(("value".into(), value));
             }
         }

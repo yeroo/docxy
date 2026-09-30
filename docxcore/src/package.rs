@@ -178,15 +178,6 @@ impl HeaderVariant {
         }
     }
 
-    /// The variant a `w:type` names; anything unknown is the default one.
-    pub fn from_ooxml(val: &str) -> Self {
-        match val {
-            "first" => Self::First,
-            "even" => Self::Even,
-            _ => Self::Default,
-        }
-    }
-
     /// The slot of this variant in [`SectionParts`].
     pub fn index(self) -> usize {
         match self {
@@ -1583,7 +1574,12 @@ fn markdown_style_def(id: &str) -> Option<String> {
         // and a right tab at the right margin of a Letter page with 1" margins
         // (3.25" and 6.5"), no space after.
         "Header" | "Footer" => Some(format!(
-            "<w:style w:type=\"paragraph\" w:styleId=\"{id}\">             <w:name w:val=\"{name}\"/><w:basedOn w:val=\"Normal\"/>             <w:uiPriority w:val=\"99\"/><w:unhideWhenUsed/>             <w:pPr><w:tabs><w:tab w:val=\"center\" w:pos=\"4680\"/>             <w:tab w:val=\"right\" w:pos=\"9360\"/></w:tabs>             <w:spacing w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/></w:pPr></w:style>",
+            "<w:style w:type=\"paragraph\" w:styleId=\"{id}\">\
+             <w:name w:val=\"{name}\"/><w:basedOn w:val=\"Normal\"/>\
+             <w:uiPriority w:val=\"99\"/><w:unhideWhenUsed/>\
+             <w:pPr><w:tabs><w:tab w:val=\"center\" w:pos=\"4680\"/>\
+             <w:tab w:val=\"right\" w:pos=\"9360\"/></w:tabs>\
+             <w:spacing w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/></w:pPr></w:style>",
             name = id.to_ascii_lowercase()
         )),
         _ => None,

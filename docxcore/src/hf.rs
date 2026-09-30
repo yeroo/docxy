@@ -97,11 +97,11 @@ pub fn page_number_sdt_xml(design: &PageNumberDesign, top: bool, sdt_id: u32) ->
 
 /// The opening boundary of a preserved block content control (not a
 /// self-contained one without content).
-fn is_sdt_open(raw: &str) -> bool {
+pub(crate) fn is_sdt_open(raw: &str) -> bool {
     raw.trim_start().starts_with("<w:sdt>") && !raw.trim_end().ends_with("</w:sdt>")
 }
 
-fn is_sdt_close(raw: &str) -> bool {
+pub(crate) fn is_sdt_close(raw: &str) -> bool {
     raw.trim_start().starts_with("</w:sdtContent>")
 }
 
@@ -135,9 +135,28 @@ fn matching_close(blocks: &[Block], open: usize) -> Option<usize> {
     None
 }
 
-/// Whether `blocks` hold a placed page number.
-pub fn has_page_number(blocks: &[Block]) -> bool {
-    blocks.iter().any(is_page_number_open)
+/// Drop every block content-control boundary in `blocks` that has no
+/// partner (an opening one never closed, a closing one never opened), so the
+/// blocks serialize to well-formed XML; the content between stays, as plain
+/// blocks. Nested controls pair up innermost first. The indices dropped, in
+/// ascending order (as they were before the removal).
+pub fn balance_sdt_boundaries(blocks: &mut Vec<Block>) -> Vec<usize> {
+    let mut open: Vec<usize> = Vec::new();
+    let mut orphans: Vec<usize> = Vec::new();
+    for (i, b) in blocks.iter().enumerate() {
+        let Block::Raw(raw) = b else { continue };
+        if is_sdt_open(raw) {
+            open.push(i);
+        } else if is_sdt_close(raw) && open.pop().is_none() {
+            orphans.push(i);
+        }
+    }
+    orphans.extend(open);
+    orphans.sort_unstable();
+    for &i in orphans.iter().rev() {
+        blocks.remove(i);
+    }
+    orphans
 }
 
 /// Remove every placed page number from a header or footer's blocks: each
@@ -197,9 +216,9 @@ mod tests {
         let ours = page_number_sdt_xml(&PAGE_NUMBER_DESIGNS[1], false, 7);
         for sdt in [WORD_SDT.to_string(), ours] {
             let mut b = blocks(&format!("{HAND_TYPED}{sdt}"));
-            assert!(has_page_number(&b), "{sdt}");
+            assert!(b.iter().any(is_page_number_open), "{sdt}");
             assert!(remove_page_numbers(&mut b));
-            assert!(!has_page_number(&b));
+            assert!(!b.iter().any(is_page_number_open));
             // The hand-typed PAGE field stays, and nothing of the control does.
             let xml = crate::serialize::blocks_to_xml(&b);
             assert!(xml.contains("w:instr=\" PAGE \""), "{xml}");
@@ -222,16 +241,16 @@ mod tests {
             </w:sdtContent></w:sdt>";
         let mut b = blocks(&format!("{other}{HAND_TYPED}"));
         let before = b.clone();
-        assert!(!has_page_number(&b));
+        assert!(!b.iter().any(is_page_number_open));
         assert!(!remove_page_numbers(&mut b));
         assert_eq!(b, before);
     }
 
     /// Backspace at the start of a placed number's paragraph, Delete at its
-    /// end, and Select All + Delete never leave one boundary of the control
-    /// without the other, so the saved part stays well formed. (A selection
-    /// that starts before the control and ends inside it still can: that is
-    /// the editor's handling of any block content control, a follow-up.)
+    /// end, Select All + Delete and a selection crossing one boundary never
+    /// leave one boundary of the control without the other, so the saved part
+    /// stays well formed (`Editor::delete_selection` drops the control when
+    /// it takes one of its boundaries).
     #[test]
     fn deleting_at_the_boundaries_keeps_the_control_balanced() {
         use crate::editor::{Caret, Editor};
@@ -273,6 +292,69 @@ mod tests {
         ed.select_all();
         ed.delete_forward();
         assert!(balanced(&ed.doc.body), "{:?}", ed.doc.body);
+        // A selection from inside "Left" into the number, and from the number
+        // into "Right", each crossing one boundary: the control goes, the
+        // text left over stays.
+        for (from, to, left) in [
+            ((0, 2), (para, 0), "Le1Right"),
+            ((para, 0), (4, 2), "Leftght"),
+        ] {
+            let mut ed = Editor::new(crate::model::Document { body: blocks(&xml) });
+            ed.anchor = Some(Caret {
+                path: vec![from.0],
+                offset: from.1,
+            });
+            ed.caret = Caret {
+                path: vec![to.0],
+                offset: to.1,
+            };
+            ed.delete_forward();
+            assert!(
+                balanced(&ed.doc.body),
+                "{from:?}..{to:?}: {:?}",
+                ed.doc.body
+            );
+            assert!(!ed.doc.body.iter().any(|b| matches!(b, Block::Raw(_))));
+            let text: String = ed.doc.body.iter().map(Block::plain_text).collect();
+            assert_eq!(text, left);
+            // The caret is still in a paragraph, where the selection began.
+            let at = ed.caret.path[0];
+            assert!(matches!(ed.doc.body[at], Block::Paragraph(_)));
+        }
+        // Select All + Delete over a number last or first in its part.
+        let number = page_number_sdt_xml(&PAGE_NUMBER_DESIGNS[1], false, 2);
+        for xml in [format!("{before}{number}"), format!("{number}{after}")] {
+            let mut ed = Editor::new(crate::model::Document { body: blocks(&xml) });
+            ed.select_all();
+            ed.delete_forward();
+            assert!(balanced(&ed.doc.body), "{xml}: {:?}", ed.doc.body);
+            let out = crate::serialize::blocks_to_xml(&ed.doc.body);
+            assert_eq!(
+                out.matches("<w:sdt>").count(),
+                out.matches("</w:sdt>").count()
+            );
+        }
+    }
+
+    #[test]
+    fn unmatched_boundaries_are_dropped_and_pairs_kept() {
+        let open = || Block::Raw("<w:sdt><w:sdtPr/><w:sdtContent>".into());
+        let close = || Block::Raw("</w:sdtContent></w:sdt>".into());
+        let p = || Block::Paragraph(Paragraph::default());
+        let mut b = vec![
+            open(),
+            p(),
+            close(),
+            close(),
+            p(),
+            open(),
+            open(),
+            p(),
+            close(),
+        ];
+        assert_eq!(balance_sdt_boundaries(&mut b), vec![3, 5]);
+        assert_eq!(b, vec![open(), p(), close(), p(), open(), p(), close()]);
+        assert!(balance_sdt_boundaries(&mut b).is_empty());
     }
 
     #[test]

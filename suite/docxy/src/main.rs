@@ -12084,13 +12084,13 @@ impl Docxy {
             .is_some_and(|t| t.hf_edit.is_some())
     }
 
-    /// Enter header (or footer) editing of `section` (else the one already
-    /// being edited, else the body caret's) and `variant`: resolve its part or
-    /// create one, show Print Layout so the area is visible, and select the
-    /// contextual Header & Footer tab. No-op for markdown/package-less tabs.
+    /// Enter header (or footer) editing of `section` and `variant`: resolve
+    /// its part or create one, show Print Layout so the area is visible, and
+    /// select the contextual Header & Footer tab. No-op for
+    /// markdown/package-less tabs.
     fn enter_hf_at(
         &mut self,
-        section: Option<usize>,
+        section: usize,
         is_header: bool,
         variant: HeaderVariant,
         window: &mut Window,
@@ -12104,14 +12104,8 @@ impl Docxy {
             return;
         }
         flush_hf_tab(tab); // commit any header/footer already open
-        let section = section.unwrap_or_else(|| hf_section(tab));
-        let show_text = tab.hf_edit.as_ref().is_none_or(|h| h.show_text);
-        tab.hf_edit = None;
-        if !hf::open(tab, section, is_header, variant) {
+        if !hf_tab::reopen(tab, section, is_header, variant) {
             return self.refocus(window, cx);
-        }
-        if let Some(h) = tab.hf_edit.as_mut() {
-            h.show_text = show_text;
         }
         self.page_view = true;
         self.ribbon_tab = RibbonTab::HeaderFooter;
@@ -12185,13 +12179,16 @@ fn flush_hf_tab(tab: &mut DocTab) {
     let (Some(hf), Some(pkg)) = (tab.hf_edit.as_ref(), tab.pkg.as_mut()) else {
         return;
     };
-    let inner = docxcore::serialize::blocks_to_xml(&hf.editor.doc.body);
+    // A content control left with one boundary would write malformed XML:
+    // drop any such boundary (the editor avoids making one; this is the net).
+    let mut blocks = hf.editor.doc.body.clone();
+    docxcore::hf::balance_sdt_boundaries(&mut blocks);
+    let inner = docxcore::serialize::blocks_to_xml(&blocks);
     // Both sides go through the same serializer, so byte layout does not matter.
     if inner == docxcore::serialize::blocks_to_xml(&parse_hf_part(pkg, &hf.part_name)) {
         return;
     }
-    let xml = hf_tab::part_xml(hf.is_header, &inner);
-    pkg.set_part(&hf.part_name, xml.into_bytes());
+    hf_tab::rewrite_part(pkg, &hf.part_name, hf.is_header, &inner);
     tab.dirty = true;
 }
 
@@ -12340,16 +12337,16 @@ impl Docxy {
         if !matches!(tab.surface, Surface::Doc(_)) {
             return Err("the active tab is not a document".into());
         }
+        let slot =
+            hf_tab::page_slot(tab, page).ok_or_else(|| format!("there is no page {}", page + 1))?;
         if area == PageArea::Body {
             if self.hf_active() {
                 self.exit_hf(window, cx);
             }
             return Ok(());
         }
-        let slot =
-            hf_tab::page_slot(tab, page).ok_or_else(|| format!("there is no page {}", page + 1))?;
         let is_header = area == PageArea::Header;
-        self.enter_hf_at(Some(slot.section), is_header, slot.variant, window, cx);
+        self.enter_hf_at(slot.section, is_header, slot.variant, window, cx);
         Ok(())
     }
 
@@ -13589,7 +13586,6 @@ impl Docxy {
         }
     }
 
-    /// The horizontal ruler paints in window coordinates measured from the page.
     /// The indents and tab stops the ruler shows: the caret paragraph's in the
     /// surface being typed into (the open header or footer, else the body).
     /// A paragraph with no tab stops of its own shows its style's, so a new
@@ -13601,6 +13597,7 @@ impl Docxy {
         }
     }
 
+    /// The horizontal ruler paints in window coordinates measured from the page.
     fn ruler(&self, cx: &mut Context<Self>) -> AnyElement {
         use docxcore::model::TabAlign;
         let (indent, tabs) = self.ruler_para();
@@ -20037,10 +20034,8 @@ impl Docxy {
             let is_header = menu == hf_tab::HfMenu::HeaderFromTop;
             self.tabs
                 .get(self.active)
-                .and_then(|t| hf_tab::distance_of(t, is_header))
-                .map_or_else(String::new, |t| {
-                    format!("{}\"", crate::page_setup::inches(t))
-                })
+                .and_then(|t| hf_tab::distance_text(t, is_header))
+                .unwrap_or_default()
                 .into()
         } else if cmd.id == "fontname" {
             props

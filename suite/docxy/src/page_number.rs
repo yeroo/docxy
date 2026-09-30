@@ -9,8 +9,9 @@
 //! holds two, and Remove Page Numbers removes exactly those controls, ours
 //! and Word's, leaving `PAGE` fields typed into the body or a header alone.
 use super::*;
-use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
-use crate::hf_tab::{HfAct, part_xml, resolved_part, set_content, target};
+use crate::dialog::{Control, ControlKind, Dialog, DialogOwner, Value};
+use crate::hf_tab::{HfAct, reopen, resolved_part, rewrite_part, set_content, target, target_for};
+use crate::page_setup::{choice, chosen, ok_cancel, text_of};
 use docxcore::hf::{PAGE_NUMBER_DESIGNS, page_number_sdt_xml, remove_page_numbers};
 use docxcore::sect::PageNumberFormat;
 
@@ -184,7 +185,7 @@ fn strip_part(tab: &mut DocTab, part: &str, is_header: bool) -> bool {
         return false;
     }
     let inner = docxcore::serialize::blocks_to_xml(&blocks);
-    pkg.set_part(part, part_xml(is_header, &inner).into_bytes());
+    rewrite_part(pkg, part, is_header, &inner);
     tab.dirty = true;
     true
 }
@@ -207,12 +208,8 @@ pub(crate) fn place(tab: &mut DocTab, top: bool, design: usize) -> Result<(), St
     }
     let d = PAGE_NUMBER_DESIGNS.get(design).ok_or("no such design")?;
     flush_hf_tab(tab);
-    let (section, variant) = target(tab);
     let is_header = top;
-    let variant = match &tab.hf_edit {
-        Some(h) if h.is_header == is_header => variant,
-        _ => HeaderVariant::Default,
-    };
+    let (section, variant) = target_for(tab, is_header);
     if let Some(other) = resolved_part(tab, section, !is_header, variant) {
         strip_part(tab, &other, !is_header);
     }
@@ -241,12 +238,7 @@ pub(crate) fn place(tab: &mut DocTab, top: bool, design: usize) -> Result<(), St
         pkg.ensure_styles(&["Header", "Footer"]);
     }
     set_content(tab, section, is_header, variant, &inner)?;
-    let show_text = tab.hf_edit.as_ref().is_none_or(|h| h.show_text);
-    tab.hf_edit = None;
-    crate::hf::open(tab, section, is_header, variant);
-    if let Some(h) = tab.hf_edit.as_mut() {
-        h.show_text = show_text;
-    }
+    reopen(tab, section, is_header, variant);
     let gallery = if top { "Top of Page" } else { "Bottom of Page" };
     tab.status = format!("Page number: {gallery}, {}", d.name).into();
     Ok(())
@@ -277,13 +269,9 @@ pub(crate) fn remove_all(tab: &mut DocTab) -> Result<bool, String> {
         any |= strip_part(tab, part, *is_header);
     }
     if let Some(h) = tab.hf_edit.as_ref() {
-        let (section, is_header, variant, show) = (h.section, h.is_header, h.variant, h.show_text);
+        let (section, is_header, variant) = (h.section, h.is_header, h.variant);
         if parts.iter().any(|(n, _)| *n == h.part_name) {
-            tab.hf_edit = None;
-            crate::hf::open(tab, section, is_header, variant);
-            if let Some(h) = tab.hf_edit.as_mut() {
-                h.show_text = show;
-            }
+            reopen(tab, section, is_header, variant);
         }
     }
     tab.status = if any {
@@ -324,23 +312,27 @@ const SEPARATORS: [(&str, &str); 5] = [
 ];
 const NUMBERING: [&str; 2] = ["Continue from previous section", "Start at:"];
 
-fn choice(
+/// A drop-down over `items` on the section's value: its item, or, for a
+/// value the list does not name (a `w:fmt` of `decimalZero`, say), one more
+/// item showing that value, so OK can write it back unchanged.
+fn pick(
     name: &'static str,
     label: &str,
-    kind: ControlKind,
     items: &[&str],
-    at: usize,
+    at: Option<usize>,
+    raw: Option<String>,
 ) -> Control {
-    let mut c = Control::new(name, label, kind, Value::Choice(Some(at)));
-    c.items = items.iter().map(|s| s.to_string()).collect();
-    c
-}
-
-fn chosen(d: &Dialog, name: &str) -> Option<usize> {
-    match d.value(name) {
-        Some(Value::Choice(i)) => *i,
-        _ => None,
+    let mut c = choice(name, label, ControlKind::Dropdown, items, at, None);
+    if at.is_none() {
+        match raw {
+            Some(raw) => {
+                c.items.push(raw);
+                c.value = Value::Choice(Some(items.len()));
+            }
+            None => c.value = Value::Choice(Some(0)),
+        }
     }
+    c
 }
 
 fn set_enabled(d: &mut Dialog, name: &str, on: bool) {
@@ -383,20 +375,15 @@ pub(crate) fn format_dialog(tab: &DocTab) -> Result<Dialog, String> {
     let (section, _) = target(tab);
     let sections = ed.sections();
     let f = PageNumberFormat::parse(sections.get(section).map_or("", String::as_str));
-    let fmt = FORMATS
-        .iter()
-        .position(|(_, v)| *v == f.fmt.as_deref())
-        .unwrap_or(0);
+    let fmt = FORMATS.iter().position(|(_, v)| *v == f.fmt.as_deref());
     let style = f
         .chap_style
         .and_then(|n| usize::try_from(n - 1).ok())
-        .filter(|&n| n < CHAPTER_STYLES.len())
-        .unwrap_or(0);
+        .filter(|&n| n < CHAPTER_STYLES.len());
     let sep = f
         .chap_sep
         .as_deref()
-        .and_then(|v| SEPARATORS.iter().position(|s| s.1 == v))
-        .unwrap_or(0);
+        .and_then(|v| SEPARATORS.iter().position(|s| s.1 == v));
     let mut d = Dialog::message(
         "page-number-format",
         "Page Number Format",
@@ -414,32 +401,26 @@ pub(crate) fn format_dialog(tab: &DocTab) -> Result<Dialog, String> {
     );
     examples.enabled = false;
     d.controls = vec![
-        choice(
-            "format",
-            "Number &format:",
-            ControlKind::Dropdown,
-            &formats,
-            fmt,
-        ),
+        pick("format", "Number &format:", &formats, fmt, f.fmt.clone()),
         Control::new(
             "chapter",
             "Include chapter &number",
             ControlKind::Checkbox,
             Value::Bool(f.chap_style.is_some()),
         ),
-        choice(
+        pick(
             "chap_style",
             "Chapter starts with st&yle:",
-            ControlKind::Dropdown,
             &CHAPTER_STYLES,
             style,
+            f.chap_style.map(|n| n.to_string()),
         ),
-        choice(
+        pick(
             "chap_sep",
             "&Use separator:",
-            ControlKind::Dropdown,
             &SEPARATORS.map(|s| s.0),
             sep,
+            f.chap_sep.clone(),
         ),
         examples,
         choice(
@@ -447,7 +428,8 @@ pub(crate) fn format_dialog(tab: &DocTab) -> Result<Dialog, String> {
             "Page numbering",
             ControlKind::Radio,
             &NUMBERING,
-            usize::from(f.start.is_some()),
+            Some(usize::from(f.start.is_some())),
+            None,
         ),
         Control::new(
             "start",
@@ -457,43 +439,48 @@ pub(crate) fn format_dialog(tab: &DocTab) -> Result<Dialog, String> {
         ),
     ];
     sync_enabled(&mut d);
-    d.buttons = vec![
-        Button {
-            default: true,
-            ..Button::new("OK", ButtonRole::Accept)
-        },
-        Button::new("Cancel", ButtonRole::Cancel),
-    ];
+    d.buttons = ok_cancel();
     d.react = Some(crate::dialog::Reaction(after_set));
     d.mark_opened();
     Ok(d)
 }
 
-/// The format the dialog shows.
-pub(crate) fn format_of(d: &Dialog) -> Result<PageNumberFormat, String> {
-    let fmt = chosen(d, "format")
-        .and_then(|i| FORMATS.get(i))
-        .and_then(|f| f.1)
-        .map(str::to_string);
-    let chapter = d.value("chapter") == Some(&Value::Bool(true));
-    let (chap_style, chap_sep) = if chapter {
-        let style = chosen(d, "chap_style").unwrap_or(0) as i32 + 1;
-        let sep = chosen(d, "chap_sep")
-            .and_then(|i| SEPARATORS.get(i))
-            .map_or("hyphen", |s| s.1);
-        (Some(style), Some(sep.to_string()))
+/// The format the dialog shows, over the section's current one (`orig`):
+/// a part the person left alone keeps its value, so a `w:fmt`, `w:chapStyle`
+/// or `w:chapSep` the lists do not name survives OK unchanged.
+pub(crate) fn format_of(d: &Dialog, orig: &PageNumberFormat) -> Result<PageNumberFormat, String> {
+    let fmt = if d.changed("format") {
+        match chosen(d, "format").and_then(|i| FORMATS.get(i)) {
+            Some(f) => f.1.map(str::to_string),
+            None => orig.fmt.clone(),
+        }
+    } else {
+        orig.fmt.clone()
+    };
+    let chapter_changed = ["chapter", "chap_style", "chap_sep"]
+        .into_iter()
+        .any(|n| d.changed(n));
+    let (chap_style, chap_sep) = if !chapter_changed {
+        (orig.chap_style, orig.chap_sep.clone())
+    } else if d.value("chapter") == Some(&Value::Bool(true)) {
+        let style = match chosen(d, "chap_style") {
+            Some(i) if i < CHAPTER_STYLES.len() => Some(i as i32 + 1),
+            _ => orig.chap_style.or(Some(1)),
+        };
+        let sep = match chosen(d, "chap_sep").and_then(|i| SEPARATORS.get(i)) {
+            Some(s) => Some(s.1.to_string()),
+            None => orig.chap_sep.clone().or(Some("hyphen".into())),
+        };
+        (style, sep)
     } else {
         (None, None)
     };
-    let start = if chosen(d, "numbering") == Some(1) {
-        let text = d
-            .controls
-            .iter()
-            .find(|c| c.name == "start")
-            .map(|c| c.text())
-            .unwrap_or_default();
+    let start = if !d.changed("numbering") && !d.changed("start") {
+        orig.start
+    } else if chosen(d, "numbering") == Some(1) {
         Some(
-            text.trim()
+            text_of(d, "start")
+                .trim()
                 .parse::<i32>()
                 .ok()
                 .filter(|n| *n >= 0)
@@ -513,7 +500,8 @@ pub(crate) fn format_of(d: &Dialog) -> Result<PageNumberFormat, String> {
 /// OK on the Page Number Format dialog: write `w:pgNumType` into the section
 /// as one undo step. Whether it changed.
 pub(crate) fn apply_format(ed: &mut Editor, d: &Dialog, section: usize) -> Result<bool, String> {
-    let f = format_of(d)?;
+    let orig = PageNumberFormat::parse(ed.sections().get(section).map_or("", String::as_str));
+    let f = format_of(d, &orig)?;
     Ok(ed.edit_sections(&[section], |raw| f.apply(raw)))
 }
 

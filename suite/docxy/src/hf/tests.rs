@@ -33,10 +33,15 @@ pub(crate) fn body_blocks(xml: &str) -> Vec<Block> {
     )
 }
 
+/// A fresh directory for one test's files: unique per call, so tests that
+/// happen to share a name never race on it.
 pub(crate) fn tmp_dir(name: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../target/hf-tests")
-        .join(format!("{}-{name}", std::process::id()));
+        .join(format!("{}-{n}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }

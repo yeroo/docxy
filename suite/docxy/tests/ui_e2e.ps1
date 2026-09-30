@@ -146,26 +146,11 @@ function Test-Italic($doc) {
     $xml = Part $doc "word/document.xml"
     if ($xml -match "<w:i/>") { "PASS: Ctrl+I writes <w:i/>" } else { "FAIL: no <w:i/> after Ctrl+I" }
 }
-function Test-Header($doc) {
-    $p = Launch
-    Click $p 300 400
-    Key $p $VK.F10; Key $p $VK.N; Key $p $VK.H   # Insert -> Edit Header
-    Txt $p "hdrmark"
-    Key $p $VK.Esc
-    SaveClose $p
-    $h = Part $doc "word/header1.xml"
-    if ($h -match "hdrmark") { "PASS: header created + text saved (header1.xml)" } else { "FAIL: header text not saved: '$h'" }
-}
-function Test-FirstPage($doc) {
-    $p = Launch
-    Click $p 300 400
-    Key $p $VK.F10; Key $p $VK.N; Key $p $VK.H   # edit header (opens contextual bar)
-    Click $p 347 180                              # "Different First Page" checkbox
-    Key $p $VK.Esc
-    SaveClose $p
-    $xml = Part $doc "word/document.xml"
-    if ($xml -match "<w:titlePg/>") { "PASS: Different First Page writes <w:titlePg/>" } else { "FAIL: no <w:titlePg/>" }
-}
+# The header, first-page and page-number scenarios drove Insert's old Edit Header /
+# Page Number buttons and the header strip by KeyTips and coordinates. Since #706
+# Header, Footer and Page Number are menus (which do not take KeyTips yet) and the
+# strip is the contextual Header & Footer tab, so they are retired here: the
+# headless uiharness/cases/word-header-footer.uit drives the same flows.
 function Test-LineSpacing($doc) {
     $p = Launch
     Click $p 200 343
@@ -174,14 +159,6 @@ function Test-LineSpacing($doc) {
     SaveClose $p
     $xml = Part $doc "word/document.xml"
     if ($xml -match 'w:line="360"') { "PASS: line spacing menu writes w:line=360 (1.5x)" } else { "FAIL: no w:line=360" }
-}
-function Test-PageNumber($doc) {
-    $p = Launch
-    Click $p 200 343
-    Key $p $VK.F10; Key $p $VK.N; Key $p $VK.G   # Insert -> Page Number (PAGE field)
-    SaveClose $p
-    $xml = Part $doc "word/document.xml"
-    if ($xml -match 'w:instr="PAGE"') { "PASS: Page Number inserts a PAGE field" } else { "FAIL: no PAGE field" }
 }
 function Test-NoSpacing($doc) {
     $p = Launch
@@ -276,14 +253,11 @@ $scenarios = @(
     @{ n = "tab"; f = ${function:Test-Tab} },
     @{ n = "bold"; f = ${function:Test-Bold} },
     @{ n = "italic"; f = ${function:Test-Italic} },
-    @{ n = "header"; f = ${function:Test-Header} },
-    @{ n = "first-page"; f = ${function:Test-FirstPage} },
     @{ n = "heading"; f = ${function:Test-Heading} },
     @{ n = "center-align"; f = ${function:Test-CenterAlign} },
     @{ n = "bullets"; f = ${function:Test-Bullets} },
     @{ n = "indent"; f = ${function:Test-Indent} },
     @{ n = "line-spacing"; f = ${function:Test-LineSpacing} },
-    @{ n = "page-number"; f = ${function:Test-PageNumber} },
     @{ n = "no-spacing"; f = ${function:Test-NoSpacing} },
     @{ n = "symbol"; f = ${function:Test-Symbol} },
     @{ n = "equation"; f = ${function:Test-Equation} },

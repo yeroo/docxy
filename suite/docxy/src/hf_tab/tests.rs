@@ -459,3 +459,61 @@ fn saved_links_survive_a_reload() {
     .unwrap();
     assert_eq!(part_text(&pkg, &part), "Header A");
 }
+
+/// The KeyTips one tab shows at once: its buttons', not its menus' items.
+fn tab_key_tips(tab: &rs::Tab<Act>) -> Vec<(&'static str, &'static str)> {
+    let mut out = Vec::new();
+    for group in &tab.groups {
+        for control in &group.items {
+            let mut push = |c: &rs::Cmd<Act>| {
+                if !c.key_tip.is_empty() {
+                    out.push((c.key_tip, c.id));
+                }
+            };
+            match control {
+                Control::Large(c) | Control::Toggle(c) => push(c),
+                Control::Column(cs) => cs.iter().for_each(&mut push),
+                Control::Split { primary, .. } => push(primary),
+                Control::Dropdown { cmd, .. } => push(cmd),
+                Control::Rows(rows) => {
+                    for cell in rows.iter().flatten() {
+                        match cell {
+                            rs::Cell::Btn(c) | rs::Cell::Combo { cmd: c, .. } => push(c),
+                        }
+                    }
+                }
+                Control::Gallery(_) | Control::Separator => {}
+            }
+        }
+    }
+    out
+}
+
+/// m5: no KeyTip on a tab is a prefix of another there, or typing it would
+/// run one command when the person meant the other. Every tab of every kind.
+#[test]
+fn every_tabs_key_tips_are_prefix_free() {
+    let mut tabs: Vec<rs::Tab<Act>> = Vec::new();
+    for kind in [Kind::Docx, Kind::Project, Kind::Xlsx] {
+        tabs.extend(ribbon_for(kind).tabs);
+    }
+    tabs.push(hf_tab());
+    tabs.push(table_tab());
+    tabs.push(gantt_format_tab());
+    for tab in &tabs {
+        let tips = tab_key_tips(tab);
+        for (a, ida) in &tips {
+            for (b, idb) in &tips {
+                if ida != idb {
+                    assert!(
+                        !b.to_ascii_uppercase().starts_with(&a.to_ascii_uppercase()),
+                        "on {}: {ida}'s KeyTip {a} is a prefix of {idb}'s {b}",
+                        tab.name
+                    );
+                }
+            }
+        }
+    }
+    // The contextual tab's own KeyTip is the one its strip entry shows.
+    assert_eq!(hf_tab().key_tip, "J");
+}

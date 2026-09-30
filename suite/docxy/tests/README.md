@@ -40,12 +40,13 @@ a false positive from pre-existing content), launches the app, drives it, saves
 | `tab`         | Tab key ×2 at line start                 | two `<w:tab/>` |
 | `bold`        | Ctrl+A, Ctrl+B                           | `<w:b/>` |
 | `italic`      | Ctrl+A, Ctrl+I                           | `<w:i/>` |
-| `header`      | Insert ▸ Edit Header (KeyTips), type, Esc | `header1.xml` contains the text |
-| `first-page`  | Edit Header ▸ Different First Page toggle | `<w:titlePg/>` |
 | `line-spacing`| Home ▸ Line Spacing menu ▸ 1.5×          | `w:line="360"` |
-| `page-number` | Insert ▸ Page Number (KeyTips)           | `w:instr="PAGE"` field |
 | `no-spacing`  | Home ▸ No Spacing style (gallery)        | `w:line="240"` (single) |
 | `symbol`      | Insert ▸ Symbol (KeyTip) ▸ pick em dash  | em dash in the text |
+
+Header, first-page and page-number scenarios were retired with #706 (Header,
+Footer and Page Number became menus, which do not take KeyTips yet);
+`uiharness/cases/word-header-footer.uit` drives those flows headlessly.
 
 ## Gotchas baked into the harness
 
