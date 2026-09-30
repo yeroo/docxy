@@ -20398,9 +20398,6 @@ impl Docxy {
             .into_any_element()
     }
 
-    /// Whether a toggle command is currently "on" for the caret's formatting, so
-    /// the ribbon button can show a pressed state (Word highlights e.g. Bold when
-    /// the caret sits in bold text).
     /// Whether a ribbon command can run now: [`act_enabled`], and for a
     /// table command, the edited story's state (Merge Cells needs a cell
     /// range, Convert Text to Table a selection outside a table).
@@ -20412,6 +20409,9 @@ impl Docxy {
             }
     }
 
+    /// Whether a toggle command is currently "on" for the caret's formatting, so
+    /// the ribbon button can show a pressed state (Word highlights e.g. Bold when
+    /// the caret sits in bold text).
     fn act_active(&self, act: Act) -> bool {
         use Act::*;
         let doc = match self.tabs.get(self.active).map(|t| &t.surface) {

@@ -611,7 +611,6 @@ pub(crate) fn table_enabled(ed: Option<&Editor>, act: TableAct) -> bool {
         T::InsertTable => true,
         T::TextToTable => ed.has_selection() && ed.cell_range().is_none(),
         T::MergeCells => ed.cell_range().is_some(),
-        T::Borders(BorderCmd::DiagDown | BorderCmd::DiagUp) => ed.in_table(),
         _ => ed.in_table(),
     }
 }
