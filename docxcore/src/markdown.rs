@@ -579,7 +579,7 @@ pub fn from_markdown(src: &str) -> Document {
                     break;
                 };
                 i += 1;
-                let mut text = first.to_string();
+                let mut parts = vec![first];
                 // Fold in continuation lines belonging to THIS item.
                 while i < lines.len() {
                     let l = lines[i];
@@ -590,13 +590,10 @@ pub fn from_markdown(src: &str) -> Document {
                     {
                         break;
                     }
-                    if !text.is_empty() {
-                        text.push(' ');
-                    }
-                    text.push_str(t);
+                    parts.push(t);
                     i += 1;
                 }
-                body.push(list_para(ilvl, ordered, &text));
+                body.push(list_para(ilvl, ordered, &join_soft_wrapped(&parts)));
             }
             continue;
         }
@@ -607,23 +604,20 @@ pub fn from_markdown(src: &str) -> Document {
             continue;
         }
         // Plain paragraph: gather soft-wrapped lines until a blank or a new block.
-        let mut text = String::new();
+        let mut parts = Vec::new();
         while i < lines.len() {
             let l = lines[i];
             let t = l.trim();
             if t.is_empty() || starts_block(l, lines.get(i + 1).copied()) {
                 break;
             }
-            if !text.is_empty() {
-                text.push(' ');
-            }
-            text.push_str(t);
+            parts.push(t);
             i += 1;
         }
         body.push(
             Paragraph {
                 props: ParProps::default(),
-                content: parse_inlines(&text),
+                content: parse_inlines(&join_soft_wrapped(&parts)),
             }
             .into(),
         );
@@ -632,6 +626,84 @@ pub fn from_markdown(src: &str) -> Document {
         body.push(Block::Paragraph(Paragraph::default()));
     }
     Document { body }
+}
+
+/// Join soft-wrapped lines with spaces. A line ending in an unescaped `\` (an
+/// odd run) is a CommonMark hard break: drop that backslash and fold the break
+/// into the join, as a two-space hard break already is. An escaped `dir\\` (an
+/// even run) keeps both for the inline pass, and a `\` inside a code span or
+/// math is content, so it stays.
+fn join_soft_wrapped(lines: &[&str]) -> String {
+    let mut text = String::new();
+    // Char index of each hard-break backslash in `text`.
+    let mut breaks = Vec::new();
+    let mut len = 0;
+    for (n, line) in lines.iter().enumerate() {
+        if !text.is_empty() {
+            text.push(' ');
+            len += 1;
+        }
+        text.push_str(line);
+        len += line.chars().count();
+        let run = line.chars().rev().take_while(|&c| c == '\\').count();
+        if n + 1 < lines.len() && run % 2 == 1 {
+            breaks.push(len - 1);
+        }
+    }
+    if breaks.is_empty() {
+        return text;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let verbatim = verbatim_spans(&chars);
+    let dropped = |k: usize| breaks.contains(&k) && !verbatim.iter().any(|r| r.contains(&k));
+    chars
+        .iter()
+        .enumerate()
+        .filter(|&(k, _)| !dropped(k))
+        .map(|(_, &c)| c)
+        .collect()
+}
+
+/// The char ranges `parse_inlines` copies raw: code span and math contents.
+/// Scans with the same escape, link, code and math rules, in the same order.
+fn verbatim_spans(chars: &[char]) -> Vec<std::ops::Range<usize>> {
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' && chars.get(i + 1).is_some_and(|&n| is_md_escapable(n)) {
+            i += 2;
+            continue;
+        }
+        if c == '[' {
+            if let Some((_, _, adv)) = parse_link(chars, i) {
+                i += adv;
+                continue;
+            }
+        }
+        if c == '`' {
+            let n = chars[i..].iter().take_while(|&&ch| ch == '`').count();
+            if let Some((content_end, close_end)) = find_code_close(chars, i + n, n) {
+                spans.push(i + n..content_end);
+                i = close_end;
+                continue;
+            }
+        }
+        if c == '$' {
+            let n = chars[i..]
+                .iter()
+                .take_while(|&&ch| ch == '$')
+                .count()
+                .min(2);
+            if let Some(close) = find_math_close(chars, i + n, n) {
+                spans.push(i + n..close);
+                i = close + n;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    spans
 }
 
 /// Whether `line` begins a block that should end the current plain paragraph.
@@ -895,9 +967,16 @@ fn parse_inlines(s: &str) -> Vec<Inline> {
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
-        if c == '\\' && i + 1 < chars.len() {
-            buf.push(chars[i + 1]);
-            i += 2;
+        if c == '\\' {
+            // Only an escapable character drops the backslash; `C:\temp` keeps
+            // it, and the `t` goes through normal handling.
+            if let Some(&next) = chars.get(i + 1).filter(|&&n| is_md_escapable(n)) {
+                buf.push(next);
+                i += 2;
+            } else {
+                buf.push(c);
+                i += 1;
+            }
             continue;
         }
         if c == '[' {
@@ -1044,6 +1123,14 @@ fn push_run(out: &mut Vec<Inline>, buf: &mut String, bold: bool, italic: bool, s
     }
 }
 
+/// Whether `\c` is a backslash escape. CommonMark escapes only ASCII
+/// punctuation (`\t` is a literal backslash and `t`). A line-end `\` that
+/// joins soft-wrapped paragraph or list lines (a hard break) is dropped by
+/// `join_soft_wrapped`; one ending a block or a blockquote line stays literal.
+fn is_md_escapable(c: char) -> bool {
+    c.is_ascii_punctuation()
+}
+
 /// Parse `[label](url)` starting at `chars[start] == '['`. Returns
 /// `(label, url, chars_consumed)`.
 fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
@@ -1052,12 +1139,13 @@ fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
         return None;
     }
     let url_end = (close + 2..chars.len()).find(|&j| chars[j] == ')')?;
-    // Unescape the label: a `\` drops itself and keeps the next char (a
-    // trailing lone `\` is kept), matching the inline pass.
+    // Unescape the label: a `\` before an escapable char drops itself and keeps
+    // that char; any other `\` (or a trailing lone one) is kept, matching the
+    // inline pass.
     let mut label = String::new();
     let mut i = start + 1;
     while i < close {
-        if chars[i] == '\\' && i + 1 < close {
+        if chars[i] == '\\' && i + 1 < close && is_md_escapable(chars[i + 1]) {
             label.push(chars[i + 1]);
             i += 2;
         } else {
@@ -1530,6 +1618,139 @@ mod tests {
             Inline::Hyperlink(h) => assert_eq!(h.runs[0].text, "a*b C:\\dir"),
             other => panic!("expected a hyperlink, got {other:?}"),
         }
+    }
+
+    /// Plain texts of a table's first body row.
+    fn body_row_texts(doc: &Document) -> Vec<String> {
+        table_of(doc).rows[1]
+            .cells
+            .iter()
+            .map(|c| c.blocks[0].plain_text())
+            .collect()
+    }
+
+    const BACKSLASH_PIPE_HEADER: &str = "| A | B | C |\n| --- | --- | --- |\n";
+
+    #[test]
+    fn backslash_before_a_letter_is_literal_in_table_cells() {
+        // CommonMark escapes only ASCII punctuation: `\t` is a backslash and a
+        // `t`, so hand-written `C:\temp` must not read as `C:temp` (#595).
+        let doc = from_markdown(&format!(
+            r"{BACKSLASH_PIPE_HEADER}| C:\temp | a\|b | dir\ |"
+        ));
+        assert_eq!(body_row_texts(&doc), [r"C:\temp", "a|b", r"dir\"]);
+    }
+
+    #[test]
+    fn backslash_before_a_letter_is_literal_in_paragraphs_and_link_labels() {
+        assert_eq!(from_markdown(r"C:\temp").body[0].plain_text(), r"C:\temp");
+        let doc = from_markdown(r"[C:\dir](http://x)");
+        let Block::Paragraph(p) = &doc.body[0] else {
+            panic!("expected a paragraph");
+        };
+        match &p.content[0] {
+            Inline::Hyperlink(h) => assert_eq!(h.runs[0].text, r"C:\dir"),
+            other => panic!("expected a hyperlink, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn line_end_backslash_is_a_hard_break_folded_into_the_join() {
+        let para = from_markdown(concat!(r"foo\", "\n", "bar"));
+        assert_eq!(para.body[0].plain_text(), "foo bar");
+        let item = from_markdown(concat!(r"- foo\", "\n", "  bar"));
+        assert_eq!(item.body[0].plain_text(), "foo bar");
+        // An escaped backslash at line end is text, not a break.
+        let escaped = from_markdown(concat!(r"dir\\", "\n", "next"));
+        assert_eq!(escaped.body[0].plain_text(), r"dir\ next");
+        // With no following line a trailing `\` is literal (CommonMark).
+        let last = from_markdown(concat!("start\n", r"end\"));
+        assert_eq!(last.body[0].plain_text(), r"start end\");
+    }
+
+    #[test]
+    fn line_end_backslash_inside_a_code_span_or_math_is_content() {
+        let code_text = |src: &str| {
+            let doc = from_markdown(src);
+            let Block::Paragraph(p) = &doc.body[0] else {
+                panic!("expected a paragraph");
+            };
+            p.content
+                .iter()
+                .find_map(|i| match i {
+                    Inline::Run(r) if r.props.code => Some(r.text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no code run in {:?}", p.content))
+        };
+        // CommonMark spec example: no hard break inside a code span.
+        assert_eq!(code_text(concat!(r"`code\", "\n", "span`")), r"code\ span");
+        assert_eq!(code_text(concat!(r"`a\", "\n", "b`")), r"a\ b");
+        let item = from_markdown(concat!(r"- `a\", "\n", "  b`"));
+        assert!(
+            item.body[0].plain_text().contains(r"a\ b"),
+            "{:?}",
+            item.body[0]
+        );
+        // Inside math the backslash is LaTeX, so it stays in the source.
+        let math = from_markdown(concat!(r"$x\", "\n", "y$ after\\", "\n", "z"));
+        let md = to_markdown(&math);
+        assert!(md.contains(r"x\ y"), "{md}");
+        assert!(md.contains("after z"), "{md}");
+    }
+
+    #[test]
+    fn backslash_escapes_of_punctuation_still_unescape() {
+        let src = r"\* \\ \| \` \~ \[x]";
+        assert_eq!(from_markdown(src).body[0].plain_text(), r"* \ | ` ~ [x]");
+        let doc = from_markdown(&format!(r"{BACKSLASH_PIPE_HEADER}| \* | \\ | \` |"));
+        assert_eq!(body_row_texts(&doc), ["*", r"\", "`"]);
+    }
+
+    #[test]
+    fn table_backslashes_and_pipes_round_trip_docx_first() {
+        let cell = |text: &str| Cell {
+            blocks: vec![
+                Paragraph {
+                    props: ParProps::default(),
+                    content: vec![run(text, false, false)],
+                }
+                .into(),
+            ],
+            ..Default::default()
+        };
+        let row = |texts: [&str; 3]| Row {
+            cells: texts.into_iter().map(cell).collect(),
+            ..Default::default()
+        };
+        let doc = Document {
+            body: vec![Block::Table(Table {
+                grid: vec![3120; 3],
+                rows: vec![row(["A", "B", "C"]), row([r"C:\temp", "a|b", r"dir\"])],
+                ..Default::default()
+            })],
+        };
+        let md = to_markdown(&doc);
+        assert!(md.contains(r"| C:\\temp | a\|b | dir\\ |"), "{md}");
+        assert_eq!(
+            body_row_texts(&from_markdown(&md)),
+            [r"C:\temp", "a|b", r"dir\"]
+        );
+    }
+
+    #[test]
+    fn table_backslashes_and_pipes_round_trip_markdown_first() {
+        let canonical = format!(r"{BACKSLASH_PIPE_HEADER}| C:\\temp | a\|b | dir\\ |");
+        let out = to_markdown(&from_markdown(&canonical));
+        assert_eq!(out.trim_end(), canonical);
+        // Single backslashes before letters/spaces normalize to the canonical row.
+        let loose = format!(r"{BACKSLASH_PIPE_HEADER}| C:\temp | a\|b | dir\ |");
+        let out = to_markdown(&from_markdown(&loose));
+        assert_eq!(out.trim_end(), canonical);
+        assert_eq!(
+            body_row_texts(&from_markdown(&out)),
+            [r"C:\temp", "a|b", r"dir\"]
+        );
     }
 
     #[test]
