@@ -80,8 +80,11 @@ test the more-tabs list wins a real click over the sheet fill handle
   assert reply.item is 13
   call title-bar {}
   assert reply.active is 13
-  # The click switched to tab 13; the handle's sheet is index 23. Its dirty
-  # flag and the cells around M3 are what prove the grid got nothing.
+  # The guard is `assert reply.active is 13` above: the fill handle stops
+  # propagation, so a lost hit order would leave tab 23 active and the
+  # item's tab unselected. What follows is belt-and-braces — a press alone
+  # writes nothing, and sheet_fill_start refuses while the list is open, so
+  # these cannot fire on their own.
   call tab-list {}
   assert reply.tabs.23.dirty is false
   call tab-select {"tab":23}

@@ -898,8 +898,9 @@ pub fn region_name(region: Region) -> String {
 // sheet's fill handle) rather than calling a handler.
 
 /// The 10 points a `pointer-drag` visits: the two ends plus 8 interpolated
-/// moves strictly between them. gpui arms a drag only after the pressed
-/// pointer moves past a 2px threshold, so the first move already does.
+/// moves strictly between them, at k/9 of the distance. gpui arms the drag on
+/// the first pressed move more than 2px from the press, so a from→to distance
+/// of about 2.25px or less never arms and acts as a click.
 fn pointer_drag_path(from: Point<Pixels>, to: Point<Pixels>) -> Vec<Point<Pixels>> {
     let mut path = Vec::with_capacity(10);
     path.push(from);
@@ -5494,6 +5495,30 @@ mod tests {
         }
     }
 
+    /// #545 (FIX r2 m1): with the moves at k/9 of the distance, gpui arms the
+    /// drag on the first pressed move more than 2px from the press. A 6px
+    /// drag (what the drop-back-on-own-chip case uses) arms it; a 2px drag
+    /// never does and acts as a click.
+    #[test]
+    fn pointer_drag_path_arms_a_drag_only_past_2px_from_the_press() {
+        let dist_from_press = |p: &Point<Pixels>, press: &Point<Pixels>| {
+            ((f32::from(p.x) - f32::from(press.x)).powi(2)
+                + (f32::from(p.y) - f32::from(press.y)).powi(2))
+            .sqrt()
+        };
+        let press = point(px(100.), px(100.));
+        let short = pointer_drag_path(press, point(px(106.), px(100.)));
+        assert!(
+            short[1..9].iter().any(|p| dist_from_press(p, &press) > 2.0),
+            "a 6px drag must arm gpui's drag"
+        );
+        let tiny = pointer_drag_path(press, point(px(102.), px(100.)));
+        assert!(
+            tiny[1..9].iter().all(|p| dist_from_press(p, &press) <= 2.0),
+            "a 2px drag must never arm — it acts as a click"
+        );
+    }
+
     /// #545: the pointer-click reply names the more-tabs item whose probe
     /// bounds contain the clicked point, or -1 — the drift guard that keeps
     /// the fill-handle case honest about where the point landed.
@@ -5514,6 +5539,13 @@ mod tests {
         // No probes recorded yet (no frame drawn): nothing contains the point.
         let empty = crate::Probes::default();
         assert_eq!(item_at_point(&empty, point(px(150.), px(80.))), -1);
+        // The frame on screen (next) wins over the finished one (last): with
+        // the items shifted down 100px in next, a point inside the shifted
+        // item 1 resolves, and a point inside only the stale last bounds
+        // does not. Same pattern as Probes' own current() test.
+        probes.next = vec![item(0, 140.), item(1, 168.), item(2, 196.)];
+        assert_eq!(item_at_point(&probes, point(px(150.), px(180.))), 1);
+        assert_eq!(item_at_point(&probes, point(px(150.), px(80.))), -1);
     }
 
     // ---- logical rect -> physical screen pixels ----

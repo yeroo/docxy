@@ -7665,10 +7665,12 @@ impl Docxy {
     /// mouse-down (gpui runs bubble-phase listeners in reverse paint order) and
     /// stops propagation — `grid_press` never runs, and nothing is in flight.
     ///
-    /// The UI test harness drives `grid_press_cell`/`grid_drag_over` directly
-    /// and so never goes through the element tree's hitboxes; a case's `assert
-    /// cells unchanged` therefore cannot see a handler added here. This guard
-    /// can. See `docs/ui-test-harness.md`.
+    /// The UI test harness's handler-calling verbs (`drag`, `fill-drag`)
+    /// drive `grid_press_cell`/`grid_drag_over` directly and so never go
+    /// through the element tree's hitboxes — `pointer-click`/`pointer-drag`
+    /// (#545) do hit-test through gpui, but a case built on the handler
+    /// verbs cannot see a handler added here. This guard can. See
+    /// `docs/ui-test-harness.md`.
     fn sheet_fill_start(&mut self, cx: &mut Context<Self>) {
         let gesture_in_flight = self.grid_gesture_in_flight();
         let src = self.active_sheet().map(|v| v.range());
@@ -8883,10 +8885,16 @@ impl Docxy {
     /// the renderer walks, and the `probe` elements the Chart panel and the
     /// chart cards carry. Nothing here recomputes a position the renderer
     /// already decided, so a region cannot drift from the pixels it names.
-    fn region_bounds(
+    ///
+    /// Probe-backed regions resolve through `lookup`: `rect`/`shot` pass
+    /// `Probes::get` (the last finished frame), pointer verbs pass
+    /// `Probes::current` (the frame on screen, which is what gpui hit-tests
+    /// dispatched input against — FIX r1 i1).
+    fn region_bounds_with(
         &self,
         region: harness::Region,
         window: &Window,
+        lookup: fn(&Probes, &str) -> Option<Bounds<Pixels>>,
     ) -> Result<Bounds<Pixels>, String> {
         use harness::Region;
         match region {
@@ -8895,9 +8903,11 @@ impl Docxy {
                 size: window.viewport_size(),
             }),
             Region::TitleTabs | Region::TabPrev | Region::TabNext | Region::TabMore
-            | Region::TabMoreItem(_) | Region::TabChip(_) => self.probes.borrow()
-                .get(&harness::region_name(region))
-                .ok_or_else(|| format!("{} is not visible", harness::region_name(region))),
+            | Region::TabMoreItem(_) | Region::TabChip(_) => lookup(
+                &self.probes.borrow(),
+                &harness::region_name(region),
+            )
+            .ok_or_else(|| format!("{} is not visible", harness::region_name(region))),
             Region::Gantt
             | Region::Bar(_)
             | Region::ProjectHbarTable
@@ -8906,7 +8916,7 @@ impl Docxy {
             | Region::ProjectTimeline
             | Region::ProjectSplit => self.project_region_bounds(region),
             Region::Grid => self.grid_bounds(),
-            Region::Gallery => self.probes.borrow().get("gallery").ok_or_else(|| {
+            Region::Gallery => lookup(&self.probes.borrow(), "gallery").ok_or_else(|| {
                 "the Styles gallery is not shown (it is on a document's Home tab, with the ribbon expanded)"
                     .to_string()
             }),
@@ -8914,10 +8924,7 @@ impl Docxy {
                 self.project_region_bounds(region)
             }
             Region::Cells(r0, c0, r1, c1) => self.cells_bounds((r0, c0), (r1, c1)),
-            Region::ChartPanel => self
-                .probes
-                .borrow()
-                .get("chart-panel")
+            Region::ChartPanel => lookup(&self.probes.borrow(), "chart-panel")
                 .ok_or_else(|| "the Chart panel is not open".to_string()),
             Region::Chart(i) => {
                 let n = self.chart_count();
@@ -8927,44 +8934,33 @@ impl Docxy {
                         _ => format!("no chart {i}; this sheet has {n} (0..{})", n - 1),
                     });
                 }
-                self.probes
-                    .borrow()
-                    .get(&format!("chart:{i}"))
-                    .ok_or_else(|| {
-                        format!(
-                            "chart {i} is scrolled out of the grid's view, so it has no rectangle"
-                        )
-                    })
+                lookup(&self.probes.borrow(), &format!("chart:{i}")).ok_or_else(|| {
+                    format!(
+                        "chart {i} is scrolled out of the grid's view, so it has no rectangle"
+                    )
+                })
             }
         }
     }
 
-    /// Like `region_bounds`, but for pointer verbs: probe-backed regions
-    /// resolve against the frame that is on screen now (`Probes::current`),
-    /// which is the frame gpui hit-tests dispatched input against — `last`,
-    /// what `rect` answers from, can sit a frame behind it (FIX r1 i1).
+    /// Where a named region is on the last finished frame — what `rect`
+    /// answers from and a `shot` crops to.
+    fn region_bounds(
+        &self,
+        region: harness::Region,
+        window: &Window,
+    ) -> Result<Bounds<Pixels>, String> {
+        self.region_bounds_with(region, window, Probes::get)
+    }
+
+    /// Where a named region is on the frame that is on screen now — what
+    /// pointer verbs aim at, matching the frame gpui hit-tests against.
     fn region_bounds_live(
         &self,
         region: harness::Region,
         window: &Window,
     ) -> Result<Bounds<Pixels>, String> {
-        use harness::Region;
-        match region {
-            Region::TitleTabs
-            | Region::TabPrev
-            | Region::TabNext
-            | Region::TabMore
-            | Region::TabMoreItem(_)
-            | Region::TabChip(_)
-            | Region::Gallery
-            | Region::ChartPanel
-            | Region::Chart(_) => self
-                .probes
-                .borrow()
-                .current(&harness::region_name(region))
-                .ok_or_else(|| format!("{} is not visible", harness::region_name(region))),
-            other => self.region_bounds(other, window),
-        }
+        self.region_bounds_with(region, window, Probes::current)
     }
 
     /// The grid's scrolling cell area: the virtualized row list's own measured
@@ -25108,9 +25104,12 @@ fn sheet_row(
                     // Adding one back would now be inert rather than harmful:
                     // `sheet_fill_start` refuses while a grid gesture is in
                     // flight. Nothing here may rely on that — the press is
-                    // still the only signal — but no UI test can catch a new
-                    // handler on this element (the harness drives the grid's
-                    // methods, not its hitboxes), so the app has to.
+                    // still the only signal — and the handler-calling verbs
+                    // (`drag`, `fill-drag`) cannot catch a new handler on
+                    // this element either (they drive the grid's methods, not
+                    // its hitboxes; `pointer-click`/`pointer-drag` do
+                    // hit-test, see docs/ui-test-harness.md #545), so the app
+                    // has to.
                     .on_mouse_down(MouseButton::Left, move |_ev, _w, cx2| {
                         cx2.stop_propagation();
                         ent_fill_dn.update(cx2, |this, cx2| this.sheet_fill_start(cx2));
