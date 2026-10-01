@@ -161,15 +161,18 @@ pub fn load_xlsx_repair(data: &[u8]) -> Result<(SheetPackage, Repairs), XlsxErro
     let styles_emptied = fixes.iter().any(|(_, fix)| *fix == Fix::Stub(Stub::Styles));
     // The emptied styles part is made once, after the runaway references are
     // gone, however many parts a styles relationship names.
-    let styles_xml = styles_emptied.then(|| {
+    let mut styles_xml = None;
+    if styles_emptied {
         strip_runaway_dxf_ids(&mut parts);
-        minimal_styles_xml(ns.sml, dxf_count_needed(&parts))
-    });
+        styles_xml = Some(minimal_styles_xml(ns.sml, dxf_count_needed(&parts)));
+    }
     for (name, fix) in fixes {
         match fix {
             Fix::Stub(stub) => {
-                let xml = match (stub, &styles_xml) {
-                    (Stub::Styles, Some(xml)) => xml.clone(),
+                let xml = match stub {
+                    Stub::Styles => styles_xml
+                        .clone()
+                        .expect("made above whenever a styles part is emptied"),
                     _ => stub_xml(stub, ns),
                 };
                 parts.push((name.clone(), xml.into_bytes()));
@@ -254,8 +257,8 @@ fn classify(types: &[&str]) -> Option<Fix> {
         .then_some(first)
 }
 
-/// The minimal valid part for `stub`. An emptied styles part is made by the
-/// caller, once, padded to [`dxf_count_needed`].
+/// The minimal valid part for `stub`, except the styles: the caller makes
+/// that once, padded to [`dxf_count_needed`].
 fn stub_xml(stub: Stub, ns: &OoxmlNs) -> String {
     const DECL: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#;
     match stub {
@@ -267,7 +270,7 @@ fn stub_xml(stub: Stub, ns: &OoxmlNs) -> String {
             "{DECL}\n<sst xmlns=\"{}\" count=\"0\" uniqueCount=\"0\"></sst>",
             ns.sml
         ),
-        Stub::Styles => minimal_styles_xml(ns.sml, 0),
+        Stub::Styles => unreachable!("the emptied styles part is made by load_xlsx_repair"),
         Stub::Drawing => format!(
             "{DECL}\n<xdr:wsDr xmlns:xdr=\"{}\" xmlns:a=\"{}\"/>",
             ns.xdr, ns.dml
