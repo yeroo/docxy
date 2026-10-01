@@ -242,15 +242,19 @@ struct VarExtra {
     pre_leveled_finish: Option<String>,
     commitment_start: Option<String>,
     commitment_finish: Option<String>,
-    commitment_type: Option<i32>,
+    /// `None` without a key (Project's default 0); `Some(None)` unreadable.
+    commitment_type: Option<Option<i32>>,
 }
 
-/// A keyed four-byte timestamp; NA is no date.
-fn var_date(value: &[u8], uid: u32, what: &str) -> Result<Option<String>, String> {
+/// A keyed four-byte timestamp; NA and an unreadable value are no date.
+fn var_date(value: &[u8]) -> Option<String> {
     (value.len() == 4)
-        .then(|| crate::mpp::decode_checked_timestamp(value, 0).ok())
+        .then(|| {
+            crate::mpp::decode_checked_timestamp(value, 0)
+                .ok()
+                .flatten()
+        })
         .flatten()
-        .ok_or_else(|| format!("invalid {what} for UID {uid}"))
 }
 
 fn var_fields(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<VarFields, String> {
@@ -304,33 +308,31 @@ fn var_fields(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<VarFields, St
                 .ok_or_else(|| format!("invalid physical percent complete for UID {uid}"))?;
             physical_percent.insert(uid, percent as u8);
         } else {
+            // These keys were ignored before #521, so an unreadable value
+            // leaves its field absent instead of refusing a plan that opened.
             let value = &v2[header_end..end];
             // An empty text is no value: Project's XML omits the element.
-            let text =
-                |what| decode_text(v2, off, uid, what, true).map(|s| (!s.is_empty()).then_some(s));
+            let text = || {
+                decode_text(v2, off, uid, "text", true)
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            };
             let row = extra.entry(uid).or_default();
             match key {
-                CONTACT_KEY => row.contact = text("contact")?,
-                WBS_LEVEL_KEY => row.wbs_level = text("WBS level")?,
-                PRE_LEVELED_START_KEY => {
-                    row.pre_leveled_start = var_date(value, uid, "pre-leveled start")?
-                }
-                PRE_LEVELED_FINISH_KEY => {
-                    row.pre_leveled_finish = var_date(value, uid, "pre-leveled finish")?
-                }
-                COMMITMENT_START_KEY => {
-                    row.commitment_start = var_date(value, uid, "commitment start")?
-                }
-                COMMITMENT_FINISH_KEY => {
-                    row.commitment_finish = var_date(value, uid, "commitment finish")?
-                }
+                CONTACT_KEY => row.contact = text(),
+                WBS_LEVEL_KEY => row.wbs_level = text(),
+                PRE_LEVELED_START_KEY => row.pre_leveled_start = var_date(value),
+                PRE_LEVELED_FINISH_KEY => row.pre_leveled_finish = var_date(value),
+                COMMITMENT_START_KEY => row.commitment_start = var_date(value),
+                COMMITMENT_FINISH_KEY => row.commitment_finish = var_date(value),
+                // MSPDI CommitmentType is 0..=2; e7-commitment-type stores 2.
                 COMMITMENT_TYPE_KEY => {
-                    // MSPDI CommitmentType is 0..=2; e7-commitment-type stores 2.
-                    let code = (value.len() == 2)
-                        .then(|| u16_at(value, 0))
-                        .filter(|&c| c <= 2)
-                        .ok_or_else(|| format!("invalid commitment type for UID {uid}"))?;
-                    row.commitment_type = Some(i32::from(code));
+                    row.commitment_type = Some(
+                        (value.len() == 2)
+                            .then(|| u16_at(value, 0))
+                            .filter(|&c| c <= 2)
+                            .map(i32::from),
+                    )
                 }
                 _ => {}
             }
@@ -431,7 +433,7 @@ fn current_fields(
         pre_leveled_finish: extra.pre_leveled_finish,
         commitment_start: extra.commitment_start,
         commitment_finish: extra.commitment_finish,
-        commitment_type: Some(extra.commitment_type.unwrap_or(0)),
+        commitment_type: extra.commitment_type.unwrap_or(Some(0)),
         display_as_summary: Some(
             fixed2.meta[DISPLAY_AS_SUMMARY_FLAG.0] & DISPLAY_AS_SUMMARY_FLAG.1 != 0,
         ),
@@ -1425,30 +1427,33 @@ mod tests {
             assert_eq!(date(task.pre_leveled_finish), "2026-03-06T17:00:00");
         }
 
-        // Malformed values refuse the table, as the neighbouring keyed fields do.
-        for (key, value, error) in [
-            (
-                COMMITMENT_TYPE_KEY,
-                &3u16.to_le_bytes()[..],
-                "invalid commitment type",
-            ),
-            (COMMITMENT_TYPE_KEY, &[2][..], "invalid commitment type"),
-            (
-                PRE_LEVELED_START_KEY,
-                &[0xc0, 0x12, 0x2d][..],
-                "invalid pre-leveled start",
-            ),
-            (
-                COMMITMENT_FINISH_KEY,
-                &[0x41, 0x38, 0x2c, 0x3c][..],
-                "invalid commitment finish",
-            ),
-            (CONTACT_KEY, &[0x41, 0][..], "unterminated contact"),
+        // Malformed values leave their field absent: these keys were ignored
+        // before, so they must not refuse a plan that used to open.
+        let ctl: Vec<u8> = "a\u{1}"
+            .encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        for (key, value) in [
+            (COMMITMENT_TYPE_KEY, &3u16.to_le_bytes()[..]),
+            (COMMITMENT_TYPE_KEY, &[2][..]),
+            (PRE_LEVELED_START_KEY, &[0xc0, 0x12, 0x2d][..]),
+            (COMMITMENT_FINISH_KEY, &[0x41, 0x38, 0x2c, 0x3c][..]),
+            (CONTACT_KEY, &[0x41, 0][..]),
+            (WBS_LEVEL_KEY, &ctl[..]),
         ] {
             let mut bad = fixture();
             add_var(&mut bad, 1, key, value);
-            let err = decode(&file(&bad, true)).unwrap_err();
-            assert!(err.contains(error), "{key:#x}: {err}");
+            let got = fields(&bad);
+            let absent = match key {
+                COMMITMENT_TYPE_KEY => got.commitment_type.is_none(),
+                PRE_LEVELED_START_KEY => got.pre_leveled_start.is_none(),
+                COMMITMENT_FINISH_KEY => got.commitment_finish.is_none(),
+                CONTACT_KEY => got.contact.is_none(),
+                _ => got.wbs_level.is_none(),
+            };
+            assert!(absent, "{key:#x} {value:02x?}: {got:?}");
+            assert_eq!(got.priority, Some(0), "the rest of the row still decodes");
         }
         // An empty text is no value.
         let mut empty = fixture();
