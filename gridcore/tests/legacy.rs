@@ -428,17 +428,23 @@ fn legacy_imports_match_their_xlsx_originals() {
     );
 }
 
-/// `corpus/legacy/addin`: Excel's `.xlsx` and `.xlsb` of a workbook calling
-/// a function of the add-in shipped with Office (EUROTOOL.XLAM). Excel
-/// stores the call as a library external link (#888).
-fn add_in_books() -> (Workbook, gridcore::xlsx::SheetPackage) {
+/// `corpus/legacy/addin`: Excel's `.xlsx` of a workbook calling a function
+/// of the add-in shipped with Office (EUROTOOL.XLAM), and the import of
+/// Excel's `addin-udf.<ext>` of it. Excel stores the call as a library
+/// external link (#888, #890).
+fn add_in_books(ext: &str) -> (Workbook, gridcore::xlsx::SheetPackage) {
     let dir = corpus("legacy").join("addin");
     let src = load_xlsx(&std::fs::read(dir.join("addin-udf.xlsx")).unwrap())
         .expect("addin-udf.xlsx loads")
         .workbook;
     let (pkg, format) =
-        open_workbook(&std::fs::read(dir.join("addin-udf.xlsb")).unwrap()).expect("xlsb opens");
-    assert_eq!(format, SourceFormat::Xlsb);
+        open_workbook(&std::fs::read(dir.join(format!("addin-udf.{ext}"))).unwrap())
+            .unwrap_or_else(|e| panic!("{ext} opens: {e}"));
+    let want = match ext {
+        "xls" => SourceFormat::Xls,
+        _ => SourceFormat::Xlsb,
+    };
+    assert_eq!(format, want);
     (src, pkg)
 }
 
@@ -462,7 +468,17 @@ fn same_formula_text(file: &str, src: &Workbook, got: &Workbook, errs: &mut Vec<
 
 #[test]
 fn xlsb_add_in_function_keeps_its_formula_and_link() {
-    let (src, pkg) = add_in_books();
+    add_in_function_keeps_its_formula_and_link("xlsb");
+}
+
+#[test]
+fn xls_add_in_function_keeps_its_formula_and_link() {
+    add_in_function_keeps_its_formula_and_link("xls");
+}
+
+fn add_in_function_keeps_its_formula_and_link(ext: &str) {
+    let file = format!("addin-udf.{ext}");
+    let (src, pkg) = add_in_books(ext);
     let got = &pkg.workbook;
     let formula = |wb: &Workbook, r, c| wb.sheets[0].cell(r, c).and_then(|x| x.formula.clone());
     assert_eq!(
@@ -474,8 +490,8 @@ fn xlsb_add_in_function_keeps_its_formula_and_link() {
         Some(r#"[1]!EUROCONVERT(A1,"FRF","EUR")*2"#)
     );
     let mut errs = Vec::new();
-    compare_static("addin-udf.xlsb", &src, got, &mut errs);
-    same_formula_text("addin-udf.xlsb", &src, got, &mut errs);
+    compare_static(&file, &src, got, &mut errs);
+    same_formula_text(&file, &src, got, &mut errs);
     assert!(errs.is_empty(), "{}", errs.join("\n"));
 
     // Recalculation can't call the add-in, so the cached values stay.
@@ -488,7 +504,17 @@ fn xlsb_add_in_function_keeps_its_formula_and_link() {
 
 #[test]
 fn xlsb_add_in_link_survives_save_as_xlsx() {
-    let (src, pkg) = add_in_books();
+    add_in_link_survives_save_as_xlsx("xlsb");
+}
+
+#[test]
+fn xls_add_in_link_survives_save_as_xlsx() {
+    add_in_link_survives_save_as_xlsx("xls");
+}
+
+fn add_in_link_survives_save_as_xlsx(ext: &str) {
+    let file = format!("addin-udf.{ext} (h)");
+    let (src, pkg) = add_in_books(ext);
     let bytes = save_xlsx(&pkg);
     let zip = opccore::zip::ZipArchive::open(&bytes).expect("saved package");
     let part = |name: &str| {
@@ -506,15 +532,20 @@ fn xlsb_add_in_link_survives_save_as_xlsx() {
         link.contains(r#"<definedNames><definedName name="EUROCONVERT"/></definedNames>"#),
         "{link}"
     );
-    // The link part's own rels, as the .xlsb has them: the library one
-    // (rId1) is what sends Excel to its Library folder.
+    // The link part's own rels: the library one (rId1) is what sends Excel
+    // to its Library folder. The .xlsb also has the absolute path Excel
+    // found the add-in at (rId2); the .xls's SUPBOOK names only the Library
+    // file, so its import writes rId1 alone.
     let rels = part("xl/externalLinks/_rels/externalLink1.xml.rels");
     assert!(
         rels.contains(r#"<Relationship Id="rId1" Type="http://schemas.microsoft.com/office/2006/relationships/xlExternalLinkPath/xlLibrary" Target="EUROTOOL.XLAM" TargetMode="External"/>"#),
         "{rels}"
     );
-    assert!(
-        rels.contains(r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLinkPath" Target="file:///C:\Program%20Files\Microsoft%20Office\Root\Office16\Library\EUROTOOL.XLAM" TargetMode="External"/>"#),
+    let absolute = r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLinkPath" Target="file:///C:\Program%20Files\Microsoft%20Office\Root\Office16\Library\EUROTOOL.XLAM" TargetMode="External"/>"#;
+    assert_eq!(rels.contains(absolute), ext == "xlsb", "{rels}");
+    assert_eq!(
+        rels.matches("<Relationship ").count(),
+        if ext == "xlsb" { 2 } else { 1 },
         "{rels}"
     );
     assert!(part("[Content_Types].xml").contains(
@@ -556,19 +587,74 @@ fn xlsb_add_in_link_survives_save_as_xlsx() {
     // Reopened: the same formulas, values and names.
     let back = load_xlsx(&bytes).expect("saved import reloads").workbook;
     let mut errs = Vec::new();
-    compare_static("addin-udf.xlsb (h)", &src, &back, &mut errs);
-    same_formula_text("addin-udf.xlsb (h)", &src, &back, &mut errs);
+    compare_static(&file, &src, &back, &mut errs);
+    same_formula_text(&file, &src, &back, &mut errs);
     assert!(errs.is_empty(), "{}", errs.join("\n"));
+}
+
+#[test]
+fn xlsb_xll_function_keeps_its_formula() {
+    xll_function_keeps_its_formula("xlsb");
+}
+
+#[test]
+fn xls_xll_function_keeps_its_formula() {
+    xll_function_keeps_its_formula("xls");
+}
+
+/// `corpus/legacy/addin/xll-udf`: a call to XLLTWICE, which an XLL add-in
+/// (scripts/xll-fixture) registers. Excel's `.xlsx` spells it
+/// `_xll.XLLTWICE(A1)`, with no external link. The `.xlsb` stores it as a
+/// ptgNameX into a BrtSupAddin book, the `.xls` into the 0x3A01 add-in
+/// SUPBOOK. Both imports, and their saves as `.xlsx`, spell it the same.
+fn xll_function_keeps_its_formula(ext: &str) {
+    let dir = corpus("legacy").join("addin");
+    let src = load_xlsx(&std::fs::read(dir.join("xll-udf.xlsx")).unwrap())
+        .expect("xll-udf.xlsx loads")
+        .workbook;
+    let (pkg, _) = open_workbook(&std::fs::read(dir.join(format!("xll-udf.{ext}"))).unwrap())
+        .unwrap_or_else(|e| panic!("{ext} opens: {e}"));
+    let got = &pkg.workbook;
+    let formula = |wb: &Workbook, r, c| wb.sheets[0].cell(r, c).and_then(|x| x.formula.clone());
+    assert_eq!(formula(got, 0, 1).as_deref(), Some("_xll.XLLTWICE(A1)"));
+    assert_eq!(formula(got, 1, 1).as_deref(), Some("_xll.XLLTWICE(A1)+1"));
+    let file = format!("xll-udf.{ext}");
+    let mut errs = Vec::new();
+    compare_static(&file, &src, got, &mut errs);
+    same_formula_text(&file, &src, got, &mut errs);
+
+    let bytes = save_xlsx(&pkg);
+    let back = load_xlsx(&bytes).expect("saved import reloads");
+    assert!(
+        !back.part_names().iter().any(|n| n.contains("externalLink")),
+        "{:?}",
+        back.part_names()
+    );
+    let file = format!("xll-udf.{ext} (h)");
+    compare_static(&file, &src, &back.workbook, &mut errs);
+    same_formula_text(&file, &src, &back.workbook, &mut errs);
+    assert!(errs.is_empty(), "{}", errs.join("\n"));
+}
+
+#[test]
+fn xlsb_external_workbook_name_keeps_only_its_value() {
+    external_workbook_name_keeps_only_its_value("xlsb");
+}
+
+#[test]
+fn xls_external_workbook_name_keeps_only_its_value() {
+    external_workbook_name_keeps_only_its_value("xls");
 }
 
 /// A name of an ordinary workbook (`SUM([1]!Prices)`, `[1]!Half*2` in
 /// Excel's `.xlsx`) has a definition and cached cells the import doesn't
 /// read: its formula is dropped and the value kept, and no link is written.
-#[test]
-fn xlsb_external_workbook_name_keeps_only_its_value() {
+/// In the `.xls` the book's SUPBOOK path is an ordinary path, not a Library
+/// file, so it gets no link either.
+fn external_workbook_name_keeps_only_its_value(ext: &str) {
     let dir = corpus("legacy").join("addin");
-    let (pkg, _) =
-        open_workbook(&std::fs::read(dir.join("ext-name.xlsb")).unwrap()).expect("xlsb opens");
+    let (pkg, _) = open_workbook(&std::fs::read(dir.join(format!("ext-name.{ext}"))).unwrap())
+        .unwrap_or_else(|e| panic!("{ext} opens: {e}"));
     let sheet = &pkg.workbook.sheets[0];
     for (r, want) in [(0, 7.0), (1, 1.0)] {
         let cell = sheet.cell(r, 0).expect("cell");

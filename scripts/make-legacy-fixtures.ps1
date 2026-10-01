@@ -3,7 +3,8 @@
 # legacy readers: the same workbooks as corpus/xlsx, written by Excel itself.
 #
 # Run from the repo root in Windows PowerShell:  powershell -File scripts/make-legacy-fixtures.ps1
-# (-Sections corpus,extra,addin picks which parts below to rebuild; all by default).
+# (-Sections corpus,extra,addin,xll picks which parts below to rebuild; all by
+# default. xll builds a test XLL with cargo).
 #
 # The ProgID Excel.Application may be registered to xlcomshim on a dev box, so
 # this starts EXCEL.EXE itself and binds to its running class object with
@@ -11,13 +12,13 @@
 # process stopped silently after a few files.
 param(
   [string]$Excel = "C:\Program Files\Microsoft Office\Root\Office16\EXCEL.EXE",
-  [string[]]$Sections = @('corpus', 'extra', 'addin')
+  [string[]]$Sections = @('corpus', 'extra', 'addin', 'xll')
 )
 $ErrorActionPreference = 'Stop'
 # Under -File, `-Sections corpus,extra` arrives as one string 'corpus,extra'.
 $Sections = @($Sections -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-$unknown = @($Sections | Where-Object { $_ -notin @('corpus', 'extra', 'addin') })
-if ($unknown.Count -gt 0) { throw "unknown section(s): $($unknown -join ', ') (expected corpus, extra, addin)" }
+$unknown = @($Sections | Where-Object { $_ -notin @('corpus', 'extra', 'addin', 'xll') })
+if ($unknown.Count -gt 0) { throw "unknown section(s): $($unknown -join ', ') (expected corpus, extra, addin, xll)" }
 Add-Type -TypeDefinition @"
 using System; using System.Runtime.InteropServices;
 public static class RealCom {
@@ -25,6 +26,34 @@ public static class RealCom {
   public static object Local(string clsid) { Guid c = new Guid(clsid); Guid i = new Guid("00020400-0000-0000-C000-000000000046"); object o; int hr = CoCreateInstance(ref c, IntPtr.Zero, 4, ref i, out o); if (hr != 0) throw new Exception("hr=" + hr.ToString("X")); return o; }
 }
 "@
+# Excel's SaveAs .xls of a workbook with an external link stops on the
+# Compatibility Checker ("This workbook has workbook link information that
+# will be lost ..."), even with CheckCompatibility and DisplayAlerts off, and
+# waits for someone to press Continue. SaveAs blocks this thread, so a job
+# watches Excel's top-level windows for the dialog and presses Continue
+# through UI Automation.
+function Save-Xls($wb, [string]$path, [int]$excelPid) {
+  $job = Start-Job -ArgumentList $excelPid -ScriptBlock {
+    param($procId)
+    Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+    $ae = [Windows.Automation.AutomationElement]
+    $ofExcel = New-Object Windows.Automation.PropertyCondition($ae::ProcessIdProperty, $procId)
+    $continue = New-Object Windows.Automation.PropertyCondition($ae::NameProperty, 'Continue')
+    $deadline = (Get-Date).AddSeconds(120)
+    while ((Get-Date) -lt $deadline) {
+      foreach ($w in $ae::RootElement.FindAll([Windows.Automation.TreeScope]::Children, $ofExcel)) {
+        if ($w.Current.Name -notlike '*Compatibility Checker*') { continue }
+        $button = $w.FindFirst([Windows.Automation.TreeScope]::Descendants, $continue)
+        if ($button) {
+          $button.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+          return
+        }
+      }
+      Start-Sleep -Milliseconds 500
+    }
+  }
+  try { $wb.SaveAs($path, 56) } finally { Stop-Job $job; Remove-Job $job -Force }
+}
 if ($Sections -contains 'corpus') {
 $out = Join-Path $PSScriptRoot "..\corpus\legacy"
 New-Item -ItemType Directory -Force $out | Out-Null
@@ -80,9 +109,10 @@ try {
 # corpus/legacy/addin: a workbook calling a function of the add-in shipped
 # with Office (Library\EUROTOOL.XLAM). Excel stores the call as a library
 # external link: `[1]!EUROCONVERT(...)` in the .xlsx, a ptgNameX into a
-# BrtSupBookSrc book in the .xlsb (#888). No .xls: that SaveAs hangs on a
-# modal dialog. The workbook is added before the add-in is opened (opening
-# it with no workbook fails over COM).
+# BrtSupBookSrc book in the .xlsb (#888), and a ptgNameX into a SUPBOOK
+# whose path is Library\EUROTOOL.XLAM in the .xls (#890; Save-Xls presses
+# the Compatibility Checker's Continue). The workbook is added before the
+# add-in is opened (opening it with no workbook fails over COM).
 if ($Sections -contains 'addin') {
 $addin = Join-Path $PSScriptRoot "..\corpus\legacy\addin"
 New-Item -ItemType Directory -Force $addin | Out-Null
@@ -109,6 +139,7 @@ try {
   $wb.CheckCompatibility = $false
   $wb.SaveAs((Join-Path $addin "addin-udf.xlsx"), 51)
   $wb.SaveAs((Join-Path $addin "addin-udf.xlsb"), 50)
+  Save-Xls $wb (Join-Path $addin "addin-udf.xls") $p.Id
   $wb.Close($false)
 
   # ext-name: names of an ordinary workbook (a range and a constant), which
@@ -133,8 +164,49 @@ try {
   $wb.CheckCompatibility = $false
   $wb.SaveAs((Join-Path $addin "ext-name.xlsx"), 51)
   $wb.SaveAs((Join-Path $addin "ext-name.xlsb"), 50)
+  Save-Xls $wb (Join-Path $addin "ext-name.xls") $p.Id
   $wb.Close($false)
   $src.Close($false)
+} finally {
+  $xl.Quit(); [Runtime.InteropServices.Marshal]::ReleaseComObject($xl) | Out-Null
+  Start-Sleep 2; if (!$p.HasExited) { $p.Kill() }
+}
+}
+
+# corpus/legacy/addin/xll-udf: a workbook calling XLLTWICE, a function an XLL
+# add-in registers. No XLL that ships with Office has a function that isn't
+# native, so scripts/xll-fixture builds one (it needs cargo). Excel must be
+# 64-bit, as the XLL is.
+if ($Sections -contains 'xll') {
+$addin = Join-Path $PSScriptRoot "..\corpus\legacy\addin"
+New-Item -ItemType Directory -Force $addin | Out-Null
+$addin = (Resolve-Path $addin).Path
+Remove-Item (Join-Path $addin "xll-udf.*") -ErrorAction SilentlyContinue
+$crate = Join-Path $PSScriptRoot "xll-fixture"
+cargo build --release --quiet --manifest-path (Join-Path $crate "Cargo.toml")
+if ($LASTEXITCODE -ne 0) { throw "building the XLL failed" }
+$xll = Join-Path $crate "target\release\XLLFIXT.XLL"
+Copy-Item (Join-Path $crate "target\release\xll_fixture.dll") $xll -Force
+$p = Start-Process $Excel -ArgumentList "/automation","-Embedding" -PassThru
+Start-Sleep -Seconds 8
+$xl = [RealCom]::Local("00024500-0000-0000-C000-000000000046")
+$xl.DisplayAlerts = $false
+try {
+  $wb = $xl.Workbooks.Add()
+  if (-not $xl.RegisterXLL($xll)) { throw "Excel refused to load $xll" }
+  $ws = $wb.Worksheets.Item(1)
+  $ws.Name = "Data"
+  $ws.Range("A1").Value2 = 21
+  $ws.Range("B1").Formula = '=XLLTWICE(A1)'
+  $ws.Range("B2").Formula = '=XLLTWICE(A1)+1'
+  $xl.Calculate()
+  $got = $ws.Range("B1").Value2
+  if ($got -ne 42) { throw "XLLTWICE(21) gave '$got', not 42: the function isn't registered" }
+  $wb.CheckCompatibility = $false
+  $wb.SaveAs((Join-Path $addin "xll-udf.xlsx"), 51)
+  $wb.SaveAs((Join-Path $addin "xll-udf.xlsb"), 50)
+  Save-Xls $wb (Join-Path $addin "xll-udf.xls") $p.Id
+  $wb.Close($false)
 } finally {
   $xl.Quit(); [Runtime.InteropServices.Marshal]::ReleaseComObject($xl) | Out-Null
   Start-Sleep 2; if (!$p.HasExited) { $p.Kill() }

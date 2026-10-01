@@ -9,10 +9,11 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use super::ftab;
 use super::ptg::{self, Base, Biff, Names};
 use super::{
-    BookIn, Le, Limits, OpenError, SheetIn, XfFormats, biff_error, on_grid, rk, set_array,
-    sheet_prefix,
+    BookIn, ExternalLink, Le, Limits, OpenError, SheetIn, XfFormats, biff_error, on_grid, rk,
+    set_array, sheet_prefix,
 };
 use crate::sheet::{Cell, CellValue, DefinedName};
 
@@ -158,15 +159,46 @@ impl<'a> Cur<'a> {
 enum Book {
     /// The workbook itself (a SUPBOOK with the 0x0401 marker).
     Own,
-    /// An add-in function book (0x3A01): its EXTERNNAMEs are functions.
+    /// An add-in function book (0x3A01): its EXTERNNAMEs are functions an
+    /// XLL registers, spelled as [`ftab::xll_name`] gives.
     AddIn,
-    /// Another workbook, or DDE/OLE: references into it don't decompile.
-    External,
+    /// Another workbook, or DDE/OLE: its place in [`BookIn::external_links`]
+    /// when it is a Library book with a function name (see
+    /// [`library_file`]), else `None` and references into it don't
+    /// decompile.
+    External(Option<usize>),
 }
 
 struct SupBook {
     kind: Book,
-    names: Vec<String>,
+    /// Every EXTERNNAME under the book, in order (ptgNameX counts them
+    /// all): the name, or `None` for one that isn't imported or didn't
+    /// parse.
+    names: Vec<Option<String>>,
+    /// An external book in Excel's Library directory: its file name and
+    /// sheet names, which make its external link.
+    lib: Option<(String, Vec<String>)>,
+}
+
+/// The relationship type of an external link to a book in Excel's Library
+/// directory, as Excel's `.xlsx` of corpus/legacy/addin/addin-udf writes
+/// it.
+const XL_LIBRARY: &str =
+    "http://schemas.microsoft.com/office/2006/relationships/xlExternalLinkPath/xlLibrary";
+
+/// The file name of a SUPBOOK's encoded virtPath ([MS-XLS] 2.5.277
+/// VirtualPath) that names a file in Excel's Library directory: `0x01`
+/// (encoded), `0x08` (the Library directory), then the file name. That is
+/// how Excel writes Library\EUROTOOL.XLAM (corpus/legacy/addin/addin-udf.xls).
+/// Any other form (a volume, a subdirectory, a plain path) has no file
+/// showing how the `.xlsx` spells it, so it gives `None`.
+fn library_file(path: &str) -> Option<String> {
+    let file = path.strip_prefix("\u{1}\u{8}")?;
+    let plain = !file.is_empty()
+        && !file
+            .chars()
+            .any(|ch| ch < ' ' || matches!(ch, '\\' | '/' | ':'));
+    plain.then(|| file.to_string())
 }
 
 /// A NAME record as read, decompiled once every NAME is known.
@@ -206,10 +238,11 @@ impl Names for Globals {
     }
 
     fn name_x(&self, ixti: u32, index: u32) -> Option<String> {
-        let &(book, _, _) = self.xti.get(ixti as usize)?;
+        let &(book, first, _) = self.xti.get(ixti as usize)?;
         let book = self.books.get(book as usize)?;
+        let ext_name = || book.names.get(index.checked_sub(1)? as usize)?.clone();
         match book.kind {
-            Book::AddIn => book.names.get(index.checked_sub(1)? as usize).cloned(),
+            Book::AddIn => ext_name(),
             // A name of this workbook; a sheet-scoped one is qualified with
             // the sheet the XTI names (`Sheet2!Rate`).
             Book::Own => {
@@ -220,7 +253,10 @@ impl Names for Globals {
                     Some(format!("{}{}", self.xti(ixti)?, name.name))
                 }
             }
-            Book::External => None,
+            // A function name of the whole Library book (first sheet -2),
+            // as the `.xlsx` spells it: `[1]!EUROCONVERT`.
+            Book::External(Some(k)) if first == -2 => Some(format!("[{}]!{}", k + 1, ext_name()?)),
+            Book::External(_) => None,
         }
     }
 }
@@ -326,23 +362,51 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
                     c.u16()?;
                     xf_fmt.push(c.u16()?);
                 }
+                // SUPBOOK: the book takes its place before the rest is
+                // read, so a record cut short doesn't shift the books after
+                // it.
                 0x01AE => {
-                    c.u16()?;
-                    let kind = match c.u16()? {
-                        0x0401 => Book::Own,
-                        0x3A01 => Book::AddIn,
-                        _ => Book::External,
-                    };
                     g.books.push(SupBook {
-                        kind,
+                        kind: Book::External(None),
                         names: Vec::new(),
+                        lib: None,
                     });
+                    let ctab = c.u16()?;
+                    let cch = c.u16()?;
+                    match cch {
+                        0x0401 => g.books.last_mut()?.kind = Book::Own,
+                        0x3A01 => g.books.last_mut()?.kind = Book::AddIn,
+                        _ => {
+                            // virtPath (XLUnicodeStringNoCch, `cch` characters),
+                            // then `ctab` sheet names.
+                            let high = c.u8()? & 1 == 1;
+                            let file = library_file(&c.chars(cch as usize, high)?)?;
+                            let mut sheets = Vec::new();
+                            for _ in 0..ctab {
+                                sheets.push(c.xl_string()?);
+                            }
+                            g.books.last_mut()?.lib = Some((file, sheets));
+                        }
+                    }
                 }
+                // EXTERNNAME: likewise its slot first. An add-in book's
+                // (AddinUdf) is a function. A Library book's is one only
+                // with no flags and no definition (`cce` 0, as Excel writes
+                // EUROCONVERT), as the `.xlsb` reader judges them.
                 0x0023 => {
-                    c.u16()?;
+                    let b = g.books.last_mut()?;
+                    b.names.push(None);
+                    let flags = c.u16()?;
                     c.u32()?;
                     let name = c.short_string()?;
-                    g.books.last_mut()?.names.push(name);
+                    let kept = match b.kind {
+                        Book::AddIn => Some(ftab::xll_name(&name)),
+                        Book::External(_) => {
+                            (b.lib.is_some() && flags == 0 && c.u16()? == 0).then_some(name)
+                        }
+                        Book::Own => None,
+                    };
+                    *b.names.last_mut()? = kept;
                 }
                 0x0017 => {
                     let n = c.u16()?;
@@ -381,6 +445,35 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
         if r.ty == 0x002F {
             return Err(OpenError::EncryptedXls);
         }
+    }
+
+    // Links are numbered in the order of the books that have one: Library
+    // books with a function name, as the `.xlsb` reader numbers them.
+    for b in &mut g.books {
+        let (Book::External(k), Some((file, sheets))) = (&mut b.kind, b.lib.take()) else {
+            continue;
+        };
+        if !b.names.iter().any(Option::is_some) {
+            continue;
+        }
+        if book.external_links.len() >= book.limits.links {
+            return Err(OpenError::Corrupt(format!(
+                "too many external links (more than {})",
+                book.limits.links
+            )));
+        }
+        book.external_links.push(ExternalLink {
+            book: "rId1".into(),
+            rels: vec![(
+                "rId1".into(),
+                XL_LIBRARY.into(),
+                file,
+                Some("External".into()),
+            )],
+            sheets,
+            names: b.names.clone(),
+        });
+        *k = Some(book.external_links.len() - 1);
     }
 
     let formats = XfFormats {
@@ -1178,6 +1271,7 @@ pub(crate) mod tests {
             books: vec![SupBook {
                 kind: Book::Own,
                 names: Vec::new(),
+                lib: None,
             }],
             names: vec![raw("Global", 0), raw("Rate", 2)],
         };
@@ -1187,6 +1281,319 @@ pub(crate) mod tests {
         let f = [0x39, 0, 0, 1, 0, 0, 0];
         let got = ptg::decompile(Biff::V8, &f, &[], Base::Cell(None), &g);
         assert_eq!(got.as_deref(), Some("Global"));
+    }
+
+    /// A SUPBOOK of an external book: `ctab` sheet names after the virtPath
+    /// `path` (8-bit characters, as Excel writes EUROTOOL.XLAM's).
+    fn supbook(path: &[u8], sheets: &[&str]) -> Vec<u8> {
+        let mut b = (sheets.len() as u16).to_le_bytes().to_vec();
+        b.extend((path.len() as u16).to_le_bytes());
+        b.push(0);
+        b.extend_from_slice(path);
+        for s in sheets {
+            b.extend((s.len() as u16).to_le_bytes());
+            b.push(0);
+            b.extend(s.as_bytes());
+        }
+        rec(0x01AE, &b)
+    }
+
+    /// EXTERNNAME `name` with `flags` and the definition `rgce`.
+    fn extern_name(flags: u16, name: &str, rgce: &[u8]) -> Vec<u8> {
+        let mut b = flags.to_le_bytes().to_vec();
+        b.extend([0; 4]);
+        b.extend(short(name));
+        b.extend((rgce.len() as u16).to_le_bytes());
+        b.extend_from_slice(rgce);
+        rec(0x0023, &b)
+    }
+
+    fn own_supbook() -> Vec<u8> {
+        rec(0x01AE, &[1, 0, 0x01, 0x04])
+    }
+
+    fn addin_supbook() -> Vec<u8> {
+        rec(0x01AE, &[1, 0, 0x01, 0x3A])
+    }
+
+    fn extern_sheet(xti: &[(u16, i16, i16)]) -> Vec<u8> {
+        let mut b = (xti.len() as u16).to_le_bytes().to_vec();
+        for &(book, first, last) in xti {
+            b.extend(book.to_le_bytes());
+            b.extend(first.to_le_bytes());
+            b.extend(last.to_le_bytes());
+        }
+        rec(0x0017, &b)
+    }
+
+    /// ptgNameX: name `index` (1-based) of XTI `ixti`.
+    fn name_x(ixti: u16, index: u16) -> Vec<u8> {
+        let mut f = vec![0x39];
+        f.extend(ixti.to_le_bytes());
+        f.extend(index.to_le_bytes());
+        f.extend([0, 0]);
+        f
+    }
+
+    /// Cells `(0, i)` with formula `f[i]`, cached `i`.
+    fn formulas(f: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        f.iter()
+            .enumerate()
+            .map(|(i, f)| formula(0, i as u16, i as f64, f))
+            .collect()
+    }
+
+    fn formula_texts(book: &BookIn) -> Vec<Option<String>> {
+        data(book).values().map(|c| c.formula.clone()).collect()
+    }
+
+    const LIB: &[u8] = b"\x01\x08TOOLS.XLAM";
+
+    #[test]
+    fn library_file_takes_only_a_plain_library_file_name() {
+        let path = |b: &[u8]| String::from_utf8(b.to_vec()).unwrap();
+        assert_eq!(
+            library_file(&path(b"\x01\x08EUROTOOL.XLAM")).as_deref(),
+            Some("EUROTOOL.XLAM")
+        );
+        for bad in [
+            &b"\x01\x08Analysis\x03ANALYS32.XLL"[..],
+            b"\x01\x01C\x03Books\x03A.xlsx",
+            b"\x01\x08",
+            b"\x01",
+            b"",
+            b"A.xlsx",
+            b"\x08TOOLS.XLAM",
+            b"\x01\x08a\\b.xlam",
+            b"\x01\x08a/b.xlam",
+            b"\x01\x08C:b.xlam",
+        ] {
+            assert_eq!(library_file(&path(bad)), None, "{bad:?}");
+        }
+    }
+
+    /// Two Library books with a function name become `[1]` and `[2]`; an
+    /// ordinary workbook between them (a plain path) and a Library book
+    /// whose only name has a definition get no link and number nothing.
+    /// A defined name of a linked book, a flagged name and a reference
+    /// scoped to one of its sheets keep only their value.
+    #[test]
+    fn name_x_into_a_library_book_is_numbered_and_qualified() {
+        let globals = [
+            supbook(LIB, &["1028", "1030"]),
+            extern_name(0, "ONE", &[]),
+            supbook(b"\x01\x01C\x03Books\x03Prices.xlsx", &["P"]),
+            extern_name(0, "Prices", &[]),
+            supbook(b"\x01\x08DEFS.XLAM", &[]),
+            extern_name(0, "Rate", &[0x1E, 1, 0]),
+            supbook(b"\x01\x08MORE.XLAM", &[]),
+            extern_name(0, "Half", &[0x1E, 1, 0]),
+            extern_name(0, "TWO", &[]),
+            extern_name(0x0002, "Flagged", &[]),
+            own_supbook(),
+            extern_sheet(&[
+                (0, -2, -2),
+                (1, -2, -2),
+                (2, -2, -2),
+                (3, -2, -2),
+                (3, 0, 0),
+            ]),
+        ];
+        let book = read(&workbook(
+            &globals,
+            &formulas(&[
+                name_x(0, 1),
+                name_x(1, 1),
+                name_x(2, 1),
+                name_x(3, 2),
+                name_x(3, 1),
+                name_x(3, 3),
+                name_x(4, 2),
+                name_x(3, 4),
+            ]),
+        ))
+        .unwrap();
+        assert_eq!(
+            formula_texts(&book),
+            [
+                Some("[1]!ONE".to_string()),
+                None,
+                None,
+                Some("[2]!TWO".to_string()),
+                None,
+                None,
+                None,
+                None,
+            ]
+        );
+        // Every cell keeps its value.
+        assert_eq!(data(&book)[&(0, 7)].value, CellValue::Number(7.0));
+        let links = &book.external_links;
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].book, "rId1");
+        assert_eq!(
+            links[0].rels,
+            [(
+                "rId1".to_string(),
+                XL_LIBRARY.to_string(),
+                "TOOLS.XLAM".to_string(),
+                Some("External".to_string())
+            )]
+        );
+        assert_eq!(links[0].sheets, ["1028", "1030"]);
+        assert_eq!(links[0].names, [Some("ONE".to_string())]);
+        assert_eq!(links[1].rels[0].2, "MORE.XLAM");
+        assert_eq!(links[1].names, [None, Some("TWO".to_string()), None]);
+    }
+
+    /// A SUPBOOK or EXTERNNAME cut short still takes its place, so the
+    /// books and names after it keep their numbers: a formula naming them
+    /// is right or dropped, never wrong.
+    #[test]
+    fn a_truncated_supbook_or_extern_name_keeps_its_slot() {
+        let globals = [
+            // Before any SUPBOOK: ignored.
+            extern_name(0, "Stray", &[]),
+            // Cut off before its cch.
+            rec(0x01AE, &[0, 0]),
+            // Cut off after ctab and cch.
+            rec(0x01AE, &[0, 0, 12, 0]),
+            // Cut off in its sheet names: a book with no link.
+            rec(0x01AE, &[1, 0, 3, 0, 0, 1, 8, b'A']),
+            supbook(LIB, &[]),
+            // Flags only, then cut off before the cce.
+            rec(0x0023, &[0, 0]),
+            rec(0x0023, &[0, 0, 0, 0, 0, 0, 1, 0, b'X']),
+            extern_name(0, "F", &[]),
+            addin_supbook(),
+            rec(0x0023, &[0, 0, 0]),
+            extern_name(0, "EDATE", &[]),
+            own_supbook(),
+            extern_sheet(&[
+                (1, -2, -2),
+                (2, -2, -2),
+                (3, -2, -2),
+                (4, -2, -2),
+                (0, -2, -2),
+            ]),
+        ];
+        let book = read(&workbook(
+            &globals,
+            &formulas(&[
+                name_x(0, 1),
+                name_x(1, 1),
+                name_x(2, 1),
+                name_x(2, 2),
+                name_x(2, 3),
+                name_x(3, 1),
+                name_x(3, 2),
+                name_x(4, 1),
+            ]),
+        ))
+        .unwrap();
+        assert_eq!(
+            formula_texts(&book),
+            [
+                None,
+                None,
+                None,
+                None,
+                Some("[1]!F".to_string()),
+                None,
+                Some("EDATE".to_string()),
+                None,
+            ]
+        );
+        assert_eq!(book.external_links.len(), 1);
+        assert_eq!(book.external_links[0].names, [None, None, Some("F".into())]);
+    }
+
+    /// The 0x3A01 book's names are functions an XLL registers: one that is
+    /// built in (the Analysis ToolPak's, as Excel writes EDATE) stays bare,
+    /// any other is `_xll.NAME`, as Excel's `.xlsx` of
+    /// corpus/legacy/addin/xll-udf spells XLLTWICE. Excel gives each a
+    /// `#REF!` definition, which doesn't matter.
+    #[test]
+    fn name_x_into_the_add_in_book_spells_xll_functions() {
+        let book = read(&workbook(
+            &[
+                addin_supbook(),
+                extern_name(0, "XLLTWICE", &[0x1C, 0x17]),
+                extern_name(0, "EDATE", &[0x1C, 0x17]),
+                own_supbook(),
+                extern_sheet(&[(0, -2, -2)]),
+            ],
+            &formulas(&[name_x(0, 1), name_x(0, 2), name_x(0, 3)]),
+        ))
+        .unwrap();
+        assert_eq!(
+            formula_texts(&book),
+            [
+                Some("_xll.XLLTWICE".to_string()),
+                Some("EDATE".to_string()),
+                None
+            ]
+        );
+        assert!(book.external_links.is_empty());
+    }
+
+    /// A workbook naming more Library books with a function name than the
+    /// budget allows is refused.
+    #[test]
+    fn library_links_are_budgeted() {
+        let stream = workbook(
+            &[
+                supbook(b"\x01\x08A.XLAM", &[]),
+                extern_name(0, "F", &[]),
+                supbook(b"\x01\x08B.XLAM", &[]),
+                extern_name(0, "G", &[]),
+            ],
+            &[],
+        );
+        assert_eq!(read(&stream).unwrap().external_links.len(), 2);
+        let tight = Limits {
+            links: 1,
+            ..Limits::default()
+        };
+        let err = read_with(&stream, tight).err().unwrap();
+        assert!(err.to_string().contains("too many external links"), "{err}");
+    }
+
+    /// The `.xls` import of a Library book's function saves as a `.xlsx`
+    /// with its external link, which loads back with the formula.
+    #[test]
+    fn a_library_link_survives_save_as_xlsx() {
+        let stream = workbook(
+            &[
+                supbook(LIB, &["1028"]),
+                extern_name(0, "F", &[]),
+                own_supbook(),
+                extern_sheet(&[(0, -2, -2)]),
+            ],
+            &formulas(&[name_x(0, 1)]),
+        );
+        let cfb = opccore::cfb::write_cfb(&[("Workbook", stream)]);
+        let (pkg, _) = super::super::open_workbook(&cfb).unwrap();
+        let bytes = crate::xlsx::save_xlsx(&pkg);
+        let back = crate::xlsx::load_xlsx(&bytes).unwrap();
+        assert_eq!(
+            back.workbook.sheets[0]
+                .cell(0, 0)
+                .unwrap()
+                .formula
+                .as_deref(),
+            Some("[1]!F")
+        );
+        let zip = opccore::zip::ZipArchive::open(&bytes).unwrap();
+        let rels = String::from_utf8(
+            zip.read("xl/externalLinks/_rels/externalLink1.xml.rels")
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            rels.contains(r#"Target="TOOLS.XLAM" TargetMode="External""#),
+            "{rels}"
+        );
     }
 
     #[test]

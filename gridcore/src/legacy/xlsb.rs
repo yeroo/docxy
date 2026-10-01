@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use opccore::zip::ZipArchive;
 
+use super::ftab;
 use super::ptg::{self, Base, Biff, Names, Table, utf16};
 use super::{
     BookIn, ExternalLink, Le, Limits, OpenError, SheetIn, XfFormats, biff_error, on_grid, rk,
@@ -84,6 +85,9 @@ const BRT_SUP_SELF: u32 = 357;
 const BRT_SUP_SAME: u32 = 358;
 const BRT_SUP_TABS: u32 = 359;
 const BRT_BEGIN_SUP_BOOK: u32 = 360;
+/// A name of the BrtSupAddin book before it: one function the XLL
+/// registers (corpus/legacy/addin/xll-udf.xlsb has XLLTWICE's).
+const BRT_PLACEHOLDER_NAME: u32 = 361;
 const BRT_EXTERN_SHEET: u32 = 362;
 const BRT_ARR_FMLA: u32 = 426;
 const BRT_SHR_FMLA: u32 = 427;
@@ -115,8 +119,10 @@ enum Book {
     /// Another workbook or an add-in workbook (BrtSupBookSrc): its place in
     /// [`Globals::links`], or `None` when its link part isn't read.
     External(Option<usize>),
-    /// An XLL add-in (BrtSupAddin): its names aren't read.
-    Other,
+    /// An XLL add-in (BrtSupAddin): the functions it registers, from the
+    /// BrtPlaceholderName records after it, spelled as [`ftab::xll_name`]
+    /// gives; `None` for one cut short (ptgNameX still counts it).
+    AddIn(Vec<Option<String>>),
 }
 
 /// The globals a token stream refers to.
@@ -165,7 +171,8 @@ impl Names for Globals {
                 let name = self.links[k].names.get(index.checked_sub(1)? as usize)?;
                 Some(format!("[{}]!{}", k + 1, name.as_ref()?))
             }
-            Book::External(_) | Book::Other => None,
+            Book::AddIn(ref names) => names.get(index.checked_sub(1)? as usize)?.clone(),
+            Book::External(_) => None,
         }
     }
     fn table(&self, id: u32) -> Option<Table> {
@@ -347,7 +354,15 @@ pub(crate) fn read_with(zip: &ZipArchive, limits: Limits) -> Result<BookIn, Open
                     };
                     g.books.push(Book::External(k));
                 }
-                BRT_SUP_ADDIN => g.books.push(Book::Other),
+                BRT_SUP_ADDIN => g.books.push(Book::AddIn(Vec::new())),
+                // Its slot first, so one cut short doesn't shift the rest.
+                BRT_PLACEHOLDER_NAME => {
+                    if let Some(Book::AddIn(names)) = g.books.last_mut() {
+                        names.push(None);
+                        let name = c.wide()?;
+                        *names.last_mut()? = Some(ftab::xll_name(&name));
+                    }
+                }
                 BRT_EXTERN_SHEET => {
                     let n = c.u32()?;
                     for _ in 0..n {
@@ -1032,9 +1047,10 @@ mod tests {
     }
 
     /// A ptgNameX that names nothing readable keeps its cell's value and
-    /// loses the formula: a book with no part, a DDE book, an XLL add-in,
-    /// a name scoped to a sheet of the book, a name past the book's names,
-    /// a book whose own rel is missing, and an XTI past the books.
+    /// loses the formula: a book with no part, a DDE book, an XLL add-in
+    /// with no name at that index, a name scoped to a sheet of the book, a
+    /// name past the book's names, a book whose own rel is missing, and an
+    /// XTI past the books.
     #[test]
     fn name_x_leniency() {
         let src = |rid: &str| rec(BRT_SUP_BOOK_SRC, &wide(rid));
@@ -1081,6 +1097,41 @@ mod tests {
         }
         assert_eq!(c[&(0, 7)].formula.as_deref(), Some("[1]!F"));
         assert_eq!(book.external_links.len(), 1);
+    }
+
+    /// A BrtSupAddin book's names are the BrtPlaceholderName records after
+    /// it (corpus/legacy/addin/xll-udf.xlsb): `_xll.NAME` unless built in.
+    /// One cut short keeps its place and gives no formula; one after any
+    /// other kind of book is not read.
+    #[test]
+    fn name_x_into_an_xll_add_in_book() {
+        let book = open(&xlsb(
+            &[
+                rec(BRT_SUP_ADDIN, &[]),
+                rec(BRT_PLACEHOLDER_NAME, &[1, 0]),
+                rec(BRT_PLACEHOLDER_NAME, &wide("XLLTWICE")),
+                rec(BRT_PLACEHOLDER_NAME, &wide("EDATE")),
+                rec(BRT_SUP_SELF, &[]),
+                rec(BRT_PLACEHOLDER_NAME, &wide("Stray")),
+                extern_sheet(&[(0, -2, -2), (1, -2, -2)]),
+            ],
+            &[
+                rec(BRT_ROW_HDR, &0u32.to_le_bytes()),
+                fmla_num(0, 10.0, &name_x(0, 1)),
+                fmla_num(1, 11.0, &name_x(0, 2)),
+                fmla_num(2, 12.0, &name_x(0, 3)),
+                fmla_num(3, 13.0, &name_x(0, 4)),
+                fmla_num(4, 14.0, &name_x(1, 1)),
+            ],
+        ));
+        let c = &book.sheets[0].cells;
+        let formulas: Vec<_> = (0..5).map(|col| c[&(0, col)].formula.as_deref()).collect();
+        assert_eq!(
+            formulas,
+            [None, Some("_xll.XLLTWICE"), Some("EDATE"), None, None]
+        );
+        assert_eq!(c[&(0, 3)].value, CellValue::Number(13.0));
+        assert!(book.external_links.is_empty());
     }
 
     /// Only a function name (no tokens in its BrtSupNameFmla) is read: a

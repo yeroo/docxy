@@ -1,0 +1,15 @@
+# A tiny XLL add-in that registers one worksheet function, XLLTWICE(x) = 2x,
+# so scripts/make-legacy-fixtures.ps1 (-Sections xll) can have Excel write a
+# workbook calling an XLL function (#890). Built only by that script, never
+# by CI; not a member of the repo's workspace.
+[package]
+name = "xll-fixture"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "lib.rs"
+
+[workspace]
