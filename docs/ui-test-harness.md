@@ -646,7 +646,8 @@ the source. Refused:
   after `from`'s click, which takes the selection back as the pointer's would.
   A handle hidden under a chart card is decided by layout and is not
   modelled;
-- when the press does not arm a fill: `the fill did not arm: the sheet is
+- when the press does not arm a fill: `the fill did not arm: Protected View —
+  select Enable Editing to edit` (#610), `the fill did not arm: the sheet is
   protected` (a protected sheet refuses a fill from the pointer too), or
   `… another gesture is in flight`;
 - an `option`: `AutoFill Options are not implemented in this app`.
@@ -666,7 +667,11 @@ Repair… call after their file pick:
 | `enable-editing {}` | the PROTECTED VIEW message bar's Enable Editing button; refused off a protected tab |
 
 A relative `path` resolves against the active tab's folder, as `save-as`'s
-does, so after `open copy:` a case names its own copy. `open` still reloads a
+does, so after `open copy:` a case names its own copy; with no saved tab
+active it is refused (`… never been saved, so a relative 'path' has no
+folder …`), never resolved against the working directory. An open that
+only focuses a tab or asks about it loads nothing, so the tab's status is
+not judged as a load. `open` still reloads a
 file that is already open without asking unless `reopen` is `"ask"` (see
 `open` above). The modes, as the state's `read_only`, `repaired` and
 `protected` report them:

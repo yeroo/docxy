@@ -2746,14 +2746,19 @@ pub fn dispatch(
         // does, so a case can name the copy `open copy:` made.
         "open" => {
             let raw = arg_str(args, "path")?;
-            let path = match app
-                .tabs
-                .get(app.active)
-                .and_then(|t| t.path.as_deref())
-                .and_then(Path::parent)
-            {
-                Some(base) if Path::new(raw).is_relative() => base.join(raw),
-                _ => PathBuf::from(raw),
+            let path = if Path::new(raw).is_relative() {
+                // A relative path has no folder of its own; never the CWD.
+                let base = app
+                    .tabs
+                    .get(app.active)
+                    .and_then(|t| t.path.as_deref())
+                    .and_then(Path::parent)
+                    .ok_or(
+                        "the active tab has never been saved, so a relative 'path' has no folder: give an absolute path",
+                    )?;
+                base.join(raw)
+            } else {
+                PathBuf::from(raw)
             };
             if !path.is_file() {
                 return Err(format!("no such file: {raw}"));
@@ -2770,14 +2775,14 @@ pub fn dispatch(
                 Some(Json::Str(r)) if r == "ask" => crate::open_mode::Reopen::Ask,
                 Some(_) => return Err("'reopen' must be \"always\" or \"ask\"".into()),
             };
-            app.open_path(&path, mode, reopen)?;
+            let loaded = app.open_path(&path, mode, reopen)?;
             app.backstage = false;
             app.drop_grid_state();
             app.persist();
             cx.notify();
-            // The reopen question is open on the tab: nothing was loaded, so
-            // there is no load to judge.
-            if app.active_dialogs().is_some() {
+            // An open tab was only focused, or asked about: nothing was
+            // loaded, so its status says something else and is not judged.
+            if !loaded {
                 return Done::ok(state(app, window));
             }
             // ⚠️ A load that failed still produces a tab. `doc_from_path`
@@ -2934,7 +2939,12 @@ pub fn dispatch(
             let src = sheet(app)?.range();
             app.sheet_fill_start(cx);
             if app.sheet_fill.is_none() {
-                return Err(if app.sheet_protected() {
+                return Err(if app.protected_view() {
+                    format!(
+                        "the fill did not arm: {}",
+                        crate::open_mode::PROTECTED_STATUS
+                    )
+                } else if app.sheet_protected() {
                     "the fill did not arm: the sheet is protected".into()
                 } else {
                     "the fill did not arm: another gesture is in flight".into()

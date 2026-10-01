@@ -290,6 +290,50 @@ fn a_leaked_edit_on_a_protected_tab_is_rolled_back() {
     assert_eq!(tab.status.as_ref(), PROTECTED_STATUS);
 }
 
+/// #610 r2: a rename (or an AutoFilter) takes no undo snapshot, so a leak of
+/// one left nothing to restore. The backstop now loads the workbook again
+/// from the tab's file, and the hot-exit sidecar written after it holds the
+/// file's sheet name, not the leaked one.
+#[test]
+fn a_leak_without_a_snapshot_is_undone_from_the_file() {
+    let dir = Scratch::new();
+    let (_, mut tab) = protected_tab(&dir);
+    let Surface::Sheet(v) = &mut tab.surface else {
+        unreachable!()
+    };
+    assert!(v.pkg.rename_sheet(0, "Leaked"));
+    assert!(v.undo.is_empty(), "the rename took no snapshot");
+    protected_rollback(&mut tab);
+    let Surface::Sheet(v) = &tab.surface else {
+        unreachable!()
+    };
+    assert_eq!(v.pkg.workbook.sheets[0].name, "Sheet1");
+    assert!(!tab.dirty);
+    assert_eq!(tab.status.as_ref(), PROTECTED_STATUS);
+    assert!(tab.access.protected, "still protected");
+
+    let hd = dir.path("hot");
+    std::fs::create_dir_all(&hd).unwrap();
+    let persisted = persist_tab(&hd, 0, &tab);
+    let hot = std::fs::read(persisted.hot.as_deref().expect("a sidecar")).unwrap();
+    let pkg = gridcore::xlsx::load_xlsx(&hot).unwrap();
+    assert_eq!(pkg.workbook.sheets[0].name, "Sheet1");
+}
+
+/// With no file to read (a template opened from a download is untitled),
+/// the backstop falls back to the oldest snapshot.
+#[test]
+fn a_protected_tab_without_a_file_falls_back_to_its_oldest_snapshot() {
+    let dir = Scratch::new();
+    let (_, mut tab) = protected_tab(&dir);
+    tab.path = None;
+    edit(&mut tab, 2.0);
+    edit(&mut tab, 3.0);
+    protected_rollback(&mut tab);
+    assert_eq!(a1(&tab), CellValue::Number(1.0));
+    assert!(!tab.dirty);
+}
+
 /// Mark `path` as downloaded from the Internet, or `None` when this volume
 /// keeps no alternate data streams.
 #[cfg(windows)]

@@ -165,13 +165,6 @@ fn copy_names(src: &Path) -> impl Iterator<Item = PathBuf> + use<> {
     (1..=COPY_NAMES).map(move |k| dir.join(format!("Copy ({k}){name}")))
 }
 
-/// Excel's name for a copy of `src`: the first of [`copy_names`] that does
-/// not exist yet. Only a preview: [`write_copy`] decides by creating it.
-#[cfg(test)]
-pub(crate) fn copy_target(src: &Path) -> Option<PathBuf> {
-    copy_names(src).find(|p| !p.exists())
-}
-
 /// Write a copy of `src` under the first of its [`copy_names`] that can be
 /// created, and return its path. The bytes are read and written, never
 /// `fs::copy`'d, so no alternate data stream rides along; the caller decides
@@ -413,14 +406,29 @@ mod tests {
     }
 
     #[test]
-    fn copy_target_picks_first_free_name() {
-        let dir = Scratch::new("copy-target");
+    fn copy_names_count_up_beside_the_file() {
+        let src = Path::new("dir").join("book.xlsx");
+        let names: Vec<PathBuf> = copy_names(&src).take(3).collect();
+        assert_eq!(
+            names,
+            [
+                "Copy (1)book.xlsx",
+                "Copy (2)book.xlsx",
+                "Copy (3)book.xlsx"
+            ]
+            .map(|n| Path::new("dir").join(n))
+        );
+        assert_eq!(copy_names(&src).count(), COPY_NAMES as usize);
+    }
+
+    #[test]
+    fn write_copy_takes_the_first_free_name() {
+        let dir = Scratch::new("copy-first-free");
         let src = dir.0.join("book.xlsx");
         std::fs::write(&src, b"x").unwrap();
-        assert_eq!(copy_target(&src).unwrap(), dir.0.join("Copy (1)book.xlsx"));
-        std::fs::write(dir.0.join("Copy (1)book.xlsx"), b"x").unwrap();
-        std::fs::write(dir.0.join("Copy (2)book.xlsx"), b"x").unwrap();
-        assert_eq!(copy_target(&src).unwrap(), dir.0.join("Copy (3)book.xlsx"));
+        std::fs::write(dir.0.join("Copy (1)book.xlsx"), b"1").unwrap();
+        std::fs::write(dir.0.join("Copy (2)book.xlsx"), b"2").unwrap();
+        assert_eq!(write_copy(&src).unwrap(), dir.0.join("Copy (3)book.xlsx"));
     }
 
     /// #610 r1: a name taken after it was chosen (here: before, which

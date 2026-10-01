@@ -190,9 +190,38 @@ fn a_downloaded_workbook_opens_protected_until_enable_editing() {
         "fill-drag",
         vec![("from", s("B2:B3")), ("to", s("B5"))],
     );
-    assert!(
-        fill.is_err(),
-        "the fill handle armed in Protected View: {fill:?}"
+    assert_eq!(
+        fill.unwrap_err(),
+        format!("the fill did not arm: {protected_status}"),
+        "the refusal says why"
+    );
+    // #610 r2: a bar that acts on Enter, left open on another tab, does not
+    // follow into the protected one. Open an ordinary workbook, open its
+    // AutoFilter bar and type a criterion, then come back and press Enter.
+    let local = files.join("local.xlsx");
+    std::fs::copy(root.join("fixtures/basic.xlsx"), &local).unwrap();
+    ok(
+        &driver,
+        "open",
+        vec![("path", s(&local.display().to_string()))],
+    );
+    assert!(!flag(&active_tab(&driver), "protected"));
+    ok(
+        &driver,
+        "ribbon-click",
+        vec![("tab", s("Home")), ("command", s("Filter"))],
+    );
+    ok(&driver, "type", vec![("text", s("North"))]);
+    let back = ok(&driver, "tab-select", vec![("tab", s("book.xlsx"))]);
+    assert_eq!(back.get("protected"), Some(&Json::Bool(true)), "{back}");
+    let st = ok(&driver, "key", vec![("keys", Json::Arr(vec![s("enter")]))]);
+    assert_eq!(st.get("dirty"), Some(&Json::Bool(false)), "{st}");
+    // Enter moved the selection, as on any sheet: no filter bar was there to
+    // take it (a carried one swallows Enter and the selection stays put).
+    assert_ne!(
+        st.get("sel"),
+        back.get("sel"),
+        "the other tab's filter bar followed: {st}"
     );
     let after: Vec<String> = ["B2", "B3", "B4", "C2"]
         .iter()

@@ -6910,17 +6910,32 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
 }
 
 /// The backstop behind Protected View's gates (#610). An edit reached a
-/// protected workbook, so a gate leaked. The tab opened with an empty undo
-/// stack and every gate refuses before taking a snapshot, so the oldest one
-/// on the stack is the workbook as it was opened: put it back, forget both
-/// stacks, and stay clean. An edit that took no snapshot cannot be undone
-/// here, but it cannot be saved either: every save is refused first.
+/// protected workbook, so a gate leaked. Not every edit takes an undo
+/// snapshot first (a sheet rename, an AutoFilter), so the workbook is loaded
+/// again from the tab's file, the way it was opened; the hot-exit sidecar
+/// then holds that too. Only a tab with no file to read (a template opened
+/// from a download) falls back to its oldest snapshot, which is the state at
+/// open because every gate refuses before taking one; an edit that took none
+/// stays in its model there, but it cannot be saved: every save is refused
+/// first. Either way both stacks are forgotten and the tab stays clean.
 fn protected_rollback(tab: &mut DocTab) {
-    if let Surface::Sheet(v) = &mut tab.surface {
-        if !v.undo.is_empty() {
-            let at_open = v.undo.remove(0);
-            v.restore(at_open);
+    let reloaded = tab
+        .path
+        .as_ref()
+        .map(|p| sheet_from_path_mode(p, tab.access.repaired).0)
+        .filter(|s| matches!(s, Surface::Sheet(_)));
+    match reloaded {
+        Some(surface) => tab.surface = surface,
+        None => {
+            if let Surface::Sheet(v) = &mut tab.surface
+                && !v.undo.is_empty()
+            {
+                let at_open = v.undo.remove(0);
+                v.restore(at_open);
+            }
         }
+    }
+    if let Surface::Sheet(v) = &mut tab.surface {
         v.undo.clear();
         v.redo.clear();
         v.end_cell_edit();
@@ -8080,6 +8095,14 @@ impl Docxy {
     fn drop_grid_state(&mut self) {
         self.chart_drop_selection();
         self.bar_close();
+        // The bars that act on Enter point into the grid too: a rename names
+        // a sheet by index, and the filter, row-height and comment bars act
+        // on the selection. Carried into another tab, Enter would apply them
+        // there, a Protected View tab included (#610).
+        self.sheet_rename = None;
+        self.sheet_filter_edit = None;
+        self.sheet_rowh_edit = None;
+        self.sheet_comment_edit = None;
         self.sheet_fill = None;
         self.formula_pick = None;
     }
@@ -9953,6 +9976,10 @@ impl Docxy {
         match key {
             "escape" => self.sheet_rename = None,
             "enter" => {
+                if self.protected_refused(cx) {
+                    self.sheet_rename = None;
+                    return;
+                }
                 if let Some(v) = self.active_sheet_mut() {
                     let old = v.pkg.workbook.sheets.get(idx).map(|s| s.name.clone());
                     // `rename_sheet` follows the refs inside the workbook (and
@@ -10723,6 +10750,9 @@ impl Docxy {
     /// contiguous region whose value fails it (header kept). "clear" unhides.
     fn sheet_apply_filter(&mut self, text: &str, cx: &mut Context<Self>) {
         use gridcore::sheet::CellValue;
+        if self.protected_refused(cx) {
+            return;
+        }
         if let Some(v) = self.active_sheet_mut() {
             let s = v.active;
             let sc = v.sel.1;
@@ -11452,6 +11482,9 @@ impl Docxy {
     /// Set an explicit height (points) on every selected row, or clear it back
     /// to auto-fit when `pts` is `None`.
     fn sheet_set_row_height(&mut self, pts: Option<f64>, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return;
+        }
         self.sheet_snapshot();
         if let Some(v) = self.active_sheet_mut() {
             let s = v.active;
@@ -13759,13 +13792,15 @@ impl Docxy {
     /// is the file's, not the mode's, so it never makes a clean tab reload.
     /// [`Reopen::Always`] reloads without asking: the harness's `open`.
     ///
-    /// `Err` only when Open as Copy could not write the copy; nothing opens.
+    /// `Ok(true)` when a file was loaded, `Ok(false)` when an open tab was
+    /// only focused or asked about. `Err` only when Open as Copy could not
+    /// write the copy; nothing opens.
     fn open_path(
         &mut self,
         path: &std::path::Path,
         mode: OpenMode,
         reopen: Reopen,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         self.project_prompt_cancel();
         let path = path.to_path_buf();
         let mode = if is_sheet_path(&path) && !is_project_path(&path) {
@@ -13785,16 +13820,21 @@ impl Docxy {
             let tab = tab_from_path_mode(&path, mode)?;
             self.tabs.push(tab);
             self.active = self.tabs.len() - 1;
-            return Ok(());
+            return Ok(true);
         };
         self.active = i;
         let tab = &self.tabs[i];
-        match reopen_step(reopen, tab.dirty, tab.access, mode) {
-            ReopenStep::Reload => self.tabs[i] = tab_from_path_mode(&path, mode)?,
-            ReopenStep::Ask => self.tabs[i].dialogs.push(reopen_dialog(&path, mode)),
-            ReopenStep::Focus => {}
-        }
-        Ok(())
+        Ok(match reopen_step(reopen, tab.dirty, tab.access, mode) {
+            ReopenStep::Reload => {
+                self.tabs[i] = tab_from_path_mode(&path, mode)?;
+                true
+            }
+            ReopenStep::Ask => {
+                self.tabs[i].dialogs.push(reopen_dialog(&path, mode));
+                false
+            }
+            ReopenStep::Focus => false,
+        })
     }
 
     /// Open files passed on the command line (e.g. double-clicking a .docx/.xlsx
@@ -15941,7 +15981,9 @@ fn save_sheet_tab(
             finish_sheet_save_asking(tab, target.as_deref(), harness, confirm);
         }
         // Never in a harness instance: rfd runs its own modal loop on this
-        // thread and stops the control pump dead (see `open_args`). A harness
+        // thread and stops the control pump dead (see the "No modal dialog
+        // may sit on a path a verb can reach" note in
+        // docs/ui-test-harness.md). A harness
         // `key ctrl+s` on an untitled workbook reaches here; refusing in words
         // is the only answer a test can read.
         SheetSaveDecision::RefuseHarness(message) => {
@@ -16013,8 +16055,8 @@ fn sheet_macro_losses(v: &SheetView, path: &std::path::Path) -> Vec<&'static str
 /// package that still has the VB project.
 ///
 /// A harness instance never asks: rfd's modal loop would stop the control
-/// pump (see `open_args`). It writes as before, and the status says what was
-/// left out.
+/// pump (see `save_sheet_tab`). It writes as before, and the status says what
+/// was left out.
 fn finish_sheet_save_asking(
     tab: &mut DocTab,
     target: Option<&std::path::Path>,
@@ -27778,8 +27820,8 @@ fn main() {
                     cx.notify();
                     this.persist();
                     // ⚠️ Not in a harness instance — the same modal-loop trap as
-                    // `open_args`, and here it would wedge the shutdown the
-                    // runner waits on after the `quit` verb.
+                    // `save_sheet_tab` describes, and here it would wedge the
+                    // shutdown the runner waits on after the `quit` verb.
                     let close = if this.harness.is_none()
                         && this.ask_on_close
                         && this.tabs.iter().any(|t| t.dirty)

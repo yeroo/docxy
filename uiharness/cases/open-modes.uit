@@ -49,6 +49,13 @@ test reopening a workbook with unsaved changes asks first
 
 test a clean workbook opened again in its own mode only becomes active
   open copy:../fixtures/basic.xlsx
+  click B2
+  type 5
+  key enter
+  key ctrl+s
+  assert dirty is false
+  assert status is not loaded — 1 sheet
+  # Nothing is loaded, so the save's status is not judged as a failed load.
   call open {"path":"basic.xlsx","reopen":"ask"}
   assert dialog is none
   assert read_only is false
@@ -84,3 +91,7 @@ test open refuses an unknown mode and enable-editing outside Protected View
   call-error open {"path":"basic.xlsx","mode":"readonly"} => 'mode' must be normal, read-only, copy or repair
   call-error enable-editing {} => the active tab is not in Protected View
   assert protected is false
+
+test a relative open path needs a tab with a folder
+  call proj.new {}
+  call-error open {"path":"basic.xlsx"} => never been saved, so a relative 'path' has no folder
