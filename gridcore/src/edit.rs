@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use crate::entry::EntryCtx;
 use crate::formula::{
     EditShift, ExcelError, Expr, adjust_for_edit, adjust_formula_for_edit, parse,
-    rename_sheet_in_expr, rename_sheet_in_formula, to_string, translate_formula,
+    rename_sheet_in_expr, rename_sheet_in_formula, to_string, translate, translate_formula,
 };
 use crate::sheet::{
     Cell, CellValue, MAX_COLS, MAX_ROWS, Sheet, Styles, Workbook, f_ref, is_array_f, own_array_ref,
@@ -935,6 +935,18 @@ pub fn rename_sheet(wb: &mut Workbook, idx: usize, new_name: &str) {
             }
         }
     }
+    // Conditional formatting and data validation formulas can name a sheet
+    // too (a list on another sheet). Only one the rename touches is
+    // reprinted, so the loaded spelling stays otherwise.
+    for sheet in &mut wb.sheets {
+        for_each_rule_formula(sheet, |src| {
+            if let Some(updated) =
+                rewrite_if_changed(src, |e| rename_sheet_in_expr(e, &old, new_name))
+            {
+                *src = updated;
+            }
+        });
+    }
     // A chart's refs name their sheet the same way, and a save writes them back
     // out as `<c:f>` — left behind, they'd point at a sheet that no longer
     // exists and Excel would drop the chart's data.
@@ -1282,6 +1294,12 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
         }
     }
 
+    // Conditional formatting and data validation follow the cells they cover,
+    // and their formulas move like cell formulas.
+    for (s, sheet) in wb.sheets.iter_mut().enumerate() {
+        shift_rules(sheet, s == idx, &target_name, &shift);
+    }
+
     // Page breaks (manual and automatic) stay with the row (column) that
     // starts their page.
     let sheet = &mut wb.sheets[idx];
@@ -1371,6 +1389,147 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
             }
         }
     }
+}
+
+/// Every conditional-formatting and data-validation formula on `sheet`.
+fn for_each_rule_formula(sheet: &mut Sheet, mut f: impl FnMut(&mut String)) {
+    for cf in &mut sheet.cond_formats {
+        for rule in &mut cf.rules {
+            rule.formulas_mut().into_iter().for_each(&mut f);
+        }
+    }
+    for dv in &mut sheet.validations {
+        f(&mut dv.formula1);
+        f(&mut dv.formula2);
+    }
+}
+
+/// Move a rule's ranges (`sqref`) through the edit, as merges move, and
+/// return how far its formulas have to be translated first. The formulas
+/// are relative to the ranges' top-left, (min r1, min c1) over them all (the
+/// anchor [`crate::cf`] evaluates them at). When a delete moves that corner
+/// to another cell, by trimming the range that held it or by taking a whole
+/// range that held its row or its column, the cell that becomes the new
+/// anchor read the formulas translated by the distance it sat from the old
+/// one: that (rows, cols) offset comes back. `None` when the edit deleted
+/// every range of a rule that had some.
+fn shift_rule_ranges(
+    ranges: &mut Vec<(u32, u32, u32, u32)>,
+    shift: &EditShift,
+) -> Option<(i64, i64)> {
+    if ranges.is_empty() {
+        return Some((0, 0));
+    }
+    let anchor = |rs: &[(u32, u32, u32, u32)]| {
+        rs.iter()
+            .fold((u32::MAX, u32::MAX), |(r, c), &(r1, c1, _, _)| {
+                (r.min(r1), c.min(c1))
+            })
+    };
+    let before = anchor(ranges);
+    let moved: Vec<_> = ranges
+        .iter()
+        .filter_map(|&(r1, c1, r2, c2)| {
+            if shift.rows {
+                span(r1, r2, shift).map(|(lo, hi)| (lo, c1, hi, c2))
+            } else {
+                span(c1, c2, shift).map(|(lo, hi)| (r1, lo, r2, hi))
+            }
+        })
+        .collect();
+    if moved.is_empty() {
+        return None;
+    }
+    *ranges = moved;
+    // An insert drops no range and moves the corner with its cell.
+    if shift.delta >= 0 {
+        return Some((0, 0));
+    }
+    let after = anchor(ranges);
+    // The new anchor's position before the edit: on the edited axis, past
+    // the deleted band when it sits at or after it; the other axis wasn't
+    // edited.
+    let pre = |v: u32| {
+        if v < shift.at {
+            v as i64
+        } else {
+            v as i64 - shift.delta
+        }
+    };
+    let (pre_r, pre_c) = if shift.rows {
+        (pre(after.0), after.1 as i64)
+    } else {
+        (after.0 as i64, pre(after.1))
+    };
+    Some((pre_r - before.0 as i64, pre_c - before.1 as i64))
+}
+
+/// A rule formula through the edit: translated by `by` to the rule's new
+/// anchor (see [`shift_rule_ranges`]), then adjusted like a cell formula.
+/// Unchanged or unparseable text stays as it is.
+fn shift_rule_formula(
+    src: &mut String,
+    by: (i64, i64),
+    home_is_target: bool,
+    target: &str,
+    shift: &EditShift,
+) {
+    let moved = rewrite_if_changed(src, |e| {
+        let e = if by == (0, 0) {
+            e.clone()
+        } else {
+            translate(e, by.0, by.1)
+        };
+        adjust_for_edit(&e, home_is_target, target, shift)
+    });
+    if let Some(moved) = moved {
+        *src = moved;
+    }
+}
+
+/// Move one sheet's conditional formatting and data validation for an edit
+/// on sheet `target`. On the target sheet their ranges move, and a rule that
+/// loses every range goes (its element named in `cf_removed` / `dv_removed`
+/// for the save); on any sheet their formulas' refs move.
+fn shift_rules(sheet: &mut Sheet, home_is_target: bool, target: &str, shift: &EditShift) {
+    let removed = &mut sheet.cf_removed;
+    sheet.cond_formats.retain_mut(|cf| {
+        let by = if home_is_target {
+            match shift_rule_ranges(&mut cf.ranges, shift) {
+                Some(by) => by,
+                None => {
+                    removed.extend(cf.ix);
+                    return false;
+                }
+            }
+        } else {
+            (0, 0)
+        };
+        for rule in &mut cf.rules {
+            for f in rule.formulas_mut() {
+                shift_rule_formula(f, by, home_is_target, target, shift);
+            }
+        }
+        true
+    });
+    let removed = &mut sheet.dv_removed;
+    sheet.validations.retain_mut(|dv| {
+        let by = if home_is_target {
+            match shift_rule_ranges(&mut dv.ranges, shift) {
+                Some(by) => by,
+                None => {
+                    removed.extend(dv.ix);
+                    return false;
+                }
+            }
+        } else {
+            (0, 0)
+        };
+        for f in [&mut dv.formula1, &mut dv.formula2] {
+            shift_rule_formula(f, by, home_is_target, target, shift);
+        }
+        true
+    });
 }
 
 /// One coordinate through the shift; None = deleted.

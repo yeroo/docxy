@@ -345,6 +345,11 @@ pub struct Sheet {
     /// [`Drawing::anchor_ix`] of drawings deleted since the file was loaded —
     /// the same round-trip means a save has to strike them from the part too.
     pub drawings_removed: Vec<usize>,
+    /// [`CondFormat::ix`] of blocks a structural edit deleted (every range
+    /// gone): the worksheet part still holds them, so a save strikes them.
+    pub cf_removed: Vec<usize>,
+    /// [`DataValidation::ix`] of rules a structural edit deleted, likewise.
+    pub dv_removed: Vec<usize>,
     /// Sheet protection: `Some(attrs)` holds the raw attribute string of the
     /// worksheet's `<sheetProtection>` element (e.g. `sheet="1" objects="1"`),
     /// serialized verbatim so any existing password hash / flag set round-trips.
@@ -997,6 +1002,11 @@ pub struct DataValidation {
     pub formula2: String,
     /// The input-message prompt, if the file supplies one.
     pub prompt: Option<String>,
+    /// The ordinal of this rule's element among the `<dataValidation>`
+    /// children of the worksheet's top-level `<dataValidations>`, so a save
+    /// can write a structural edit's move back to it. `None` for a rule the
+    /// part doesn't hold (an x14 one in `extLst`, one built in memory).
+    pub ix: Option<usize>,
 }
 
 impl DataValidation {
@@ -1560,7 +1570,30 @@ pub enum CfKind {
     /// `expression`: a formula truthy when the rule applies.
     Expression { formula: String },
     /// Anything else (colorScale/dataBar/iconSet/top10/…) — not evaluated.
-    Other,
+    /// Its `<formula>` children are kept so structural edits can move them.
+    Other { formulas: Vec<String> },
+}
+
+impl CfRule {
+    /// The rule's formulas in document order, whatever its kind.
+    pub fn formulas(&self) -> Vec<&String> {
+        match &self.kind {
+            CfKind::CellIs { formulas, .. } | CfKind::Other { formulas } => {
+                formulas.iter().collect()
+            }
+            CfKind::Expression { formula } => vec![formula],
+        }
+    }
+
+    /// [`Self::formulas`], mutably.
+    pub fn formulas_mut(&mut self) -> Vec<&mut String> {
+        match &mut self.kind {
+            CfKind::CellIs { formulas, .. } | CfKind::Other { formulas } => {
+                formulas.iter_mut().collect()
+            }
+            CfKind::Expression { formula } => vec![formula],
+        }
+    }
 }
 
 /// A conditional-formatting block: its `rules` apply over `ranges` (`sqref`).
@@ -1568,6 +1601,11 @@ pub enum CfKind {
 pub struct CondFormat {
     pub ranges: Vec<(u32, u32, u32, u32)>,
     pub rules: Vec<CfRule>,
+    /// The ordinal of this block's element among the worksheet's top-level
+    /// `<conditionalFormatting>` children, so a save can write a structural
+    /// edit's move back to it. `None` for a block the part doesn't hold (an
+    /// x14 one in `extLst`, one built in memory).
+    pub ix: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default)]

@@ -1653,6 +1653,13 @@ fn parse_worksheet(
     let mut in_cf_formula = false;
     let mut cf_formula_buf = String::new();
 
+    // Where the worksheet's top-level blocks stand, as the save finds them, so
+    // each one loaded from there knows its element ([`crate::sheet::CondFormat::ix`]).
+    let cf_spans = cond_format_spans(xml);
+    let dv_spans = validation_spans(xml)
+        .map(|(_, items)| items)
+        .unwrap_or_default();
+
     // Data-validation parse state.
     let mut cur_dv: Option<crate::sheet::DataValidation> = None;
     let mut dv_formula: u8 = 0; // 0 = none, 1 = formula1, 2 = formula2
@@ -1832,9 +1839,11 @@ fn parse_worksheet(
                             ranges.push(r);
                         }
                     }
+                    let start = p.start_pos();
                     cur_cf = Some(CondFormat {
                         ranges,
                         rules: Vec::new(),
+                        ix: cf_spans.iter().position(|&(s, _)| s == start),
                     });
                 }
                 "cfRule" if cur_cf.is_some() => {
@@ -1862,6 +1871,7 @@ fn parse_worksheet(
                     }
                     let pr = p.attr("prompt");
                     let prompt = (!pr.is_empty()).then(|| decode(pr));
+                    let start = p.start_pos();
                     cur_dv = Some(crate::sheet::DataValidation {
                         ranges,
                         kind: p.attr("type").to_string(),
@@ -1869,6 +1879,7 @@ fn parse_worksheet(
                         formula1: String::new(),
                         formula2: String::new(),
                         prompt,
+                        ix: dv_spans.iter().position(|&(s, _)| s == start),
                     });
                 }
                 "formula1" if cur_dv.is_some() => {
@@ -1896,7 +1907,7 @@ fn parse_worksheet(
                 "sheetView" => in_first_view = false,
                 "formula" if in_cf_formula => {
                     in_cf_formula = false;
-                    cf_formulas.push(std::mem::take(&mut cf_formula_buf));
+                    cf_formulas.push(decode(&std::mem::take(&mut cf_formula_buf)));
                 }
                 "cfRule" => {
                     if let (Some((ty, op, dxf_id, priority)), Some(cf)) =
@@ -1910,7 +1921,9 @@ fn parse_worksheet(
                             "expression" => CfKind::Expression {
                                 formula: cf_formulas.first().cloned().unwrap_or_default(),
                             },
-                            _ => CfKind::Other,
+                            _ => CfKind::Other {
+                                formulas: std::mem::take(&mut cf_formulas),
+                            },
                         };
                         cf.rules.push(CfRule {
                             kind,
@@ -3495,7 +3508,363 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
     let out = set_page_breaks(out, "rowBreaks", &sheet.row_breaks);
     let out = set_page_breaks(out, "colBreaks", &sheet.col_breaks);
     // The sheet's autoFilter: rewritten only where a structural edit moved it.
-    set_auto_filter(out, sheet.auto_filter.as_ref())
+    let out = set_auto_filter(out, sheet.auto_filter.as_ref());
+    // Conditional formatting and data validation: likewise.
+    let out = set_cond_formats(out, sheet);
+    set_validations(out, sheet)
+}
+
+/// The worksheet's top-level `<conditionalFormatting>` elements (in any
+/// prefix; never an x14 one in `extLst`), in document order, as (start, end).
+/// A block's [`crate::sheet::CondFormat::ix`] is its position here, for the loader and the
+/// save alike.
+fn cond_format_spans(xml: &str) -> Vec<(usize, usize)> {
+    // Most sheets have none: don't walk the part to learn that.
+    if !xml.contains("conditionalFormatting") {
+        return Vec::new();
+    }
+    worksheet_children(xml)
+        .children
+        .iter()
+        .filter(|c| c.local == "conditionalFormatting")
+        .map(|c| (c.start, c.end))
+        .collect()
+}
+
+/// A (start, end) byte span in a part.
+type Span = (usize, usize);
+
+/// The worksheet's top-level `<dataValidations>` and its `<dataValidation>`
+/// children, as (start, end) in `xml`. A rule's
+/// [`crate::sheet::DataValidation::ix`] is its position among the children.
+fn validation_spans(xml: &str) -> Option<(Span, Vec<Span>)> {
+    if !xml.contains("dataValidations") {
+        return None;
+    }
+    let (s, e) = worksheet_child_span(xml, "dataValidations")?;
+    let items = element_children(&xml[s..e])
+        .into_iter()
+        .filter(|(name, _, _)| name == "dataValidation")
+        .map(|(_, a, b)| (s + a, s + b))
+        .collect();
+    Some(((s, e), items))
+}
+
+/// The ranges of an element's `sqref`, read as the loader reads them; `None`
+/// when a token doesn't read as a cell or range (a whole column, say), since
+/// writing the model's ranges back would lose it.
+fn held_sqref(element: &str) -> Option<Vec<(u32, u32, u32, u32)>> {
+    let tag = start_tag(element)?;
+    let &(_, vs, ve) = tag.attrs.iter().find(|(name, _, _)| *name == "sqref")?;
+    element[vs..ve]
+        .split_whitespace()
+        .map(crate::sheet::parse_range_name)
+        .collect()
+}
+
+/// The start tag a fragment begins with, read with quotes respected: a
+/// `>` inside an attribute value (`error="must be > 0"`, legal and written
+/// by some producers) doesn't end it, as it would for [`tag_end`].
+struct StartTag<'a> {
+    /// Where the element name ends.
+    name_end: usize,
+    /// Each attribute: its name and its value's span.
+    attrs: Vec<(&'a str, usize, usize)>,
+}
+
+/// [`StartTag`] of `element`; `None` when it doesn't read as one.
+fn start_tag(element: &str) -> Option<StartTag<'_>> {
+    let b = element.as_bytes();
+    let stop = |c: u8| c.is_ascii_whitespace() || matches!(c, b'=' | b'>' | b'/');
+    if b.first() != Some(&b'<') {
+        return None;
+    }
+    let mut i = 1;
+    while b.get(i).is_some_and(|&c| !stop(c)) {
+        i += 1;
+    }
+    let mut tag = StartTag {
+        name_end: i,
+        attrs: Vec::new(),
+    };
+    loop {
+        while b.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        match *b.get(i)? {
+            b'>' => return Some(tag),
+            b'/' => {
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let name_start = i;
+        while b.get(i).is_some_and(|&c| !stop(c)) {
+            i += 1;
+        }
+        let name = &element[name_start..i];
+        while b.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        if b.get(i) != Some(&b'=') {
+            if name.is_empty() {
+                return None;
+            }
+            continue;
+        }
+        i += 1;
+        while b.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        let q = *b.get(i).filter(|c| matches!(c, b'"' | b'\''))?;
+        let start = i + 1;
+        let end = start + element[start..].find(q as char)?;
+        tag.attrs.push((name, start, end));
+        i = end + 1;
+    }
+}
+
+/// Where the start tag `element` begins with ends (past its `>`), quotes
+/// respected; `None` when it doesn't read as one.
+fn start_tag_end(element: &str) -> Option<usize> {
+    let tag = start_tag(element)?;
+    let from = tag.attrs.last().map_or(tag.name_end, |&(_, _, e)| e + 1);
+    element[from..].find('>').map(|i| from + i + 1)
+}
+
+/// `ranges` as an `sqref` value.
+fn sqref_of(ranges: &[(u32, u32, u32, u32)]) -> String {
+    ranges
+        .iter()
+        .map(|&(r1, c1, r2, c2)| {
+            if (r1, c1) == (r2, c2) {
+                cell_name(r1, c1)
+            } else {
+                format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A formula element as a part holds it: its decoded text, and the span of
+/// its content within the fragment it was read from (`None` when it is
+/// self-closing or holds markup, so it can't be rewritten in place).
+struct HeldFormula {
+    text: String,
+    content: Option<(usize, usize)>,
+}
+
+/// The direct children of `element` (a fragment that starts with its start
+/// tag) named `name`, read as formulas, with spans relative to `element`.
+fn held_formulas(element: &str, name: &str) -> Vec<HeldFormula> {
+    element_children(element)
+        .into_iter()
+        .filter(|(n, _, _)| n == name)
+        .map(|(_, s, e)| {
+            let f = &element[s..e];
+            let open = start_tag_end(f).unwrap_or(f.len());
+            let close = f.rfind("</").filter(|&c| c >= open && !f.ends_with("/>"));
+            match close {
+                Some(c) if !f[open..c].contains('<') => HeldFormula {
+                    text: decode(&f[open..c]),
+                    content: Some((s + open, s + c)),
+                },
+                _ => HeldFormula {
+                    text: String::new(),
+                    content: None,
+                },
+            }
+        })
+        .collect()
+}
+
+/// Do a held formula and the model's say the same thing, spelling aside?
+/// Both are compared as parsed when both parse (`_xlfn.XOR` is `XOR`).
+fn same_formula(held: &str, model: &str) -> bool {
+    if held == model {
+        return true;
+    }
+    match (crate::formula::parse(held), crate::formula::parse(model)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// `element` with its start tag's `attr` set to `value` in place, so the
+/// attribute order is kept; inserted after the element name when it has
+/// none. A start tag that doesn't read ([`start_tag`]) leaves `element`
+/// unchanged.
+fn set_tag_attr_in_place(mut element: String, attr: &str, value: &str) -> String {
+    let Some(tag) = start_tag(&element) else {
+        return element;
+    };
+    match tag.attrs.iter().find(|(name, _, _)| *name == attr) {
+        Some(&(_, vs, ve)) => element.replace_range(vs..ve, value),
+        None => {
+            let at = tag.name_end;
+            element.insert_str(at, &format!(" {attr}=\"{value}\""));
+        }
+    }
+    element
+}
+
+/// The edits, as (start, end, text), that write each `model` formula whose
+/// held counterpart says otherwise into that counterpart's content. Counts
+/// that differ leave the formulas as they are.
+fn formula_edits(held: &[HeldFormula], model: &[&String]) -> Vec<(usize, usize, String)> {
+    if held.len() != model.len() {
+        return Vec::new();
+    }
+    held.iter()
+        .zip(model)
+        .filter(|(h, m)| !same_formula(&h.text, m))
+        .filter_map(|(h, m)| h.content.map(|(s, e)| (s, e, esc_text(&file_formula(m)))))
+        .collect()
+}
+
+/// `s` with (start, end, text) edits applied, back to front.
+fn apply_edits(mut s: String, mut edits: Vec<(usize, usize, String)>) -> String {
+    edits.sort_by_key(|&(start, _, _)| std::cmp::Reverse(start));
+    for (start, end, text) in edits {
+        s.replace_range(start..end, &text);
+    }
+    s
+}
+
+/// The one model entry whose `ix` names element `k`: `None` when none does,
+/// or when more than one does (a stale claim; nothing says which is right).
+fn sole_claim<T>(
+    items: &[T],
+    k: usize,
+    ix: impl Fn(&T) -> Option<usize>,
+) -> Result<Option<&T>, ()> {
+    let mut claims = items.iter().filter(|t| ix(t) == Some(k));
+    match (claims.next(), claims.next()) {
+        (Some(_), Some(_)) => Err(()),
+        (one, _) => Ok(one),
+    }
+}
+
+/// Sync the worksheet's `<conditionalFormatting>` elements with the model,
+/// as [`set_auto_filter`] does the filter: an element is matched to the
+/// model block whose [`crate::sheet::CondFormat::ix`] names it, and left byte-for-byte
+/// alone while it holds that block's ranges and formulas. A moved block gets
+/// a new `sqref` and its changed `<formula>` texts, everything else kept; a
+/// block a structural edit deleted ([`Sheet::cf_removed`]) loses its element.
+/// An element two model blocks claim, or whose `sqref` doesn't read, is left
+/// as it is.
+fn set_cond_formats(xml: String, sheet: &Sheet) -> String {
+    if sheet.cond_formats.iter().all(|cf| cf.ix.is_none()) && sheet.cf_removed.is_empty() {
+        return xml;
+    }
+    let mut edits = Vec::new();
+    for (k, &(start, end)) in cond_format_spans(&xml).iter().enumerate() {
+        let element = &xml[start..end];
+        let Some(held) = held_sqref(element) else {
+            continue;
+        };
+        let cf = match sole_claim(&sheet.cond_formats, k, |cf| cf.ix) {
+            Err(()) => continue,
+            Ok(None) => {
+                if sheet.cf_removed.contains(&k) {
+                    edits.push((start, end, String::new()));
+                }
+                continue;
+            }
+            Ok(Some(cf)) => cf,
+        };
+        let rules: Vec<(usize, usize)> = element_children(element)
+            .into_iter()
+            .filter(|(n, _, _)| n == "cfRule")
+            .map(|(_, s, e)| (s, e))
+            .collect();
+        if rules.len() != cf.rules.len() {
+            continue;
+        }
+        let mut inner = Vec::new();
+        for (&(rs, re), rule) in rules.iter().zip(&cf.rules) {
+            let held_f = held_formulas(&element[rs..re], "formula");
+            inner.extend(
+                formula_edits(&held_f, &rule.formulas())
+                    .into_iter()
+                    .map(|(s, e, t)| (rs + s, rs + e, t)),
+            );
+        }
+        if held == cf.ranges && inner.is_empty() {
+            continue;
+        }
+        let mut block = apply_edits(element.to_string(), inner);
+        if held != cf.ranges {
+            block = set_tag_attr_in_place(block, "sqref", &sqref_of(&cf.ranges));
+        }
+        edits.push((start, end, block));
+    }
+    apply_edits(xml, edits)
+}
+
+/// Sync the worksheet's `<dataValidation>` elements with the model the way
+/// [`set_cond_formats`] does the conditional formatting: `sqref`,
+/// `<formula1>` and `<formula2>` follow a moved rule, a deleted one
+/// ([`Sheet::dv_removed`]) loses its element, and the `<dataValidations>`
+/// around them keeps a right `count`, or goes once it holds none.
+fn set_validations(xml: String, sheet: &Sheet) -> String {
+    if sheet.validations.iter().all(|dv| dv.ix.is_none()) && sheet.dv_removed.is_empty() {
+        return xml;
+    }
+    let Some(((ws, we), items)) = validation_spans(&xml) else {
+        return xml;
+    };
+    // Edits within the wrapper, relative to its start.
+    let mut edits = Vec::new();
+    let mut removed = 0;
+    for (k, &(start, end)) in items.iter().enumerate() {
+        let element = &xml[start..end];
+        let Some(held) = held_sqref(element) else {
+            continue;
+        };
+        let dv = match sole_claim(&sheet.validations, k, |dv| dv.ix) {
+            Err(()) => continue,
+            Ok(None) => {
+                if sheet.dv_removed.contains(&k) {
+                    edits.push((start - ws, end - ws, String::new()));
+                    removed += 1;
+                }
+                continue;
+            }
+            Ok(Some(dv)) => dv,
+        };
+        let mut inner = formula_edits(&held_formulas(element, "formula1"), &[&dv.formula1]);
+        let f2 = held_formulas(element, "formula2");
+        if !(f2.is_empty() && dv.formula2.is_empty()) {
+            inner.extend(formula_edits(&f2, &[&dv.formula2]));
+        }
+        if held == dv.ranges && inner.is_empty() {
+            continue;
+        }
+        let mut block = apply_edits(element.to_string(), inner);
+        if held != dv.ranges {
+            block = set_tag_attr_in_place(block, "sqref", &sqref_of(&dv.ranges));
+        }
+        edits.push((start - ws, end - ws, block));
+    }
+    if edits.is_empty() {
+        return xml;
+    }
+    let wrapper = if removed == items.len() {
+        String::new()
+    } else {
+        let wrapper = apply_edits(xml[ws..we].to_string(), edits);
+        let has_count = start_tag(&wrapper)
+            .is_some_and(|t| t.attrs.iter().any(|(name, _, _)| *name == "count"));
+        if removed > 0 && has_count {
+            set_tag_attr_in_place(wrapper, "count", &(items.len() - removed).to_string())
+        } else {
+            wrapper
+        }
+    };
+    apply_edits(xml, vec![(ws, we, wrapper)])
 }
 
 /// The span of the sheet's own `<autoFilter>`: a top-level one, not a custom
@@ -5811,10 +6180,24 @@ impl SheetPackage {
             "<conditionalFormatting sqref=\"{sqref}\"><cfRule type=\"cellIs\" dxfId=\"{dxf_id}\" priority=\"{priority}\" operator=\"{op}\">{fmls}</cfRule></conditionalFormatting>"
         );
         let sheet_part = self.sheet_parts[sheet].clone();
+        // (the new block's ordinal, how many there were before it)
+        let mut placed = None;
         if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
-            p.1 = put_worksheet_child(&xml, "conditionalFormatting", &cf_xml, None, false)
-                .into_bytes();
+            let old = cond_format_spans(&xml);
+            let out = put_worksheet_child(&xml, "conditionalFormatting", &cf_xml, None, false);
+            // It lands at its schema position: after the existing blocks in
+            // a well-ordered part, but before any that follow a later-ranked
+            // child in a misordered one. The blocks ahead of it keep their
+            // starts, so the first start that differs is its ordinal.
+            let new = cond_format_spans(&out);
+            if new.len() == old.len() + 1 {
+                let k = (0..old.len())
+                    .find(|&i| new[i].0 != old[i].0)
+                    .unwrap_or(old.len());
+                placed = Some((k, old.len()));
+            }
+            p.1 = out.into_bytes();
         }
         // Model.
         let mut formulas = vec![formula1.to_string()];
@@ -5829,12 +6212,27 @@ impl SheetPackage {
             dxf_id: Some(dxf_id),
             priority,
         };
-        self.workbook.sheets[sheet]
-            .cond_formats
-            .push(crate::sheet::CondFormat {
-                ranges: vec![range],
-                rules: vec![rule],
-            });
+        let s = &mut self.workbook.sheets[sheet];
+        let ix = placed.map(|(k, _)| k);
+        if let Some((k, n)) = placed {
+            // A claim on an ordinal the part didn't have (n or later) names
+            // nothing (an undo restored the model but not the part): it goes.
+            // The real blocks from the new one's place on moved up one.
+            let renumber = |i: usize| match i {
+                i if i >= n => None,
+                i if i >= k => Some(i + 1),
+                i => Some(i),
+            };
+            for cf in &mut s.cond_formats {
+                cf.ix = cf.ix.and_then(renumber);
+            }
+            s.cf_removed = s.cf_removed.iter().filter_map(|&i| renumber(i)).collect();
+        }
+        s.cond_formats.push(crate::sheet::CondFormat {
+            ranges: vec![range],
+            rules: vec![rule],
+            ix,
+        });
         true
     }
 
@@ -5876,8 +6274,10 @@ impl SheetPackage {
             "<dataValidation type=\"{kind}\"{op_attr} allowBlank=\"1\" showInputMessage=\"1\" showErrorMessage=\"1\" sqref=\"{sqref}\">{fmls}</dataValidation>"
         );
         let sheet_part = self.sheet_parts[sheet].clone();
+        let mut ix = None;
         if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
+            let before = validation_spans(&xml).map_or(0, |(_, items)| items.len());
             // Into the existing block (in any prefix), bumping its count, or a
             // new block at its schema position.
             let xml = append_to_worksheet_child(&xml, "dataValidations", &dv_xml, None)
@@ -5885,18 +6285,29 @@ impl SheetPackage {
                     let block = format!("<dataValidations count=\"1\">{dv_xml}</dataValidations>");
                     put_worksheet_child(&xml, "dataValidations", &block, None, false)
                 });
+            // Appended before the block's end tag, so after its existing
+            // rules: the next ordinal, as long as it is really there.
+            let after = validation_spans(&xml).map_or(0, |(_, items)| items.len());
+            ix = (after == before + 1).then_some(before);
             p.1 = xml.into_bytes();
         }
-        self.workbook.sheets[sheet]
-            .validations
-            .push(crate::sheet::DataValidation {
-                ranges: vec![range],
-                kind: kind.to_string(),
-                operator: operator.to_string(),
-                formula1: formula1.to_string(),
-                formula2: formula2.unwrap_or("").to_string(),
-                prompt: None,
-            });
+        let s = &mut self.workbook.sheets[sheet];
+        if let Some(n) = ix {
+            // Stale claims go, as in `add_conditional_format`.
+            for dv in &mut s.validations {
+                dv.ix = dv.ix.filter(|&i| i < n);
+            }
+            s.dv_removed.retain(|&i| i < n);
+        }
+        s.validations.push(crate::sheet::DataValidation {
+            ranges: vec![range],
+            kind: kind.to_string(),
+            operator: operator.to_string(),
+            formula1: formula1.to_string(),
+            formula2: formula2.unwrap_or("").to_string(),
+            prompt: None,
+            ix,
+        });
         true
     }
 
@@ -6047,7 +6458,10 @@ impl SheetPackage {
             }
             p.1 = out.into_bytes();
         }
-        self.workbook.sheets[sheet].cond_formats.clear();
+        let s = &mut self.workbook.sheets[sheet];
+        s.cond_formats.clear();
+        // The elements those named are gone from the part.
+        s.cf_removed.clear();
         true
     }
 
@@ -13388,7 +13802,7 @@ mod print_setup_tests {
     /// A workbook of `sheets` (name, worksheet body inside `<worksheet>`; None
     /// leaves the sheet's part out of the package) with `names` as the
     /// `<definedNames>` content.
-    fn book(names: &str, sheets: &[(&str, Option<&str>)]) -> Vec<u8> {
+    pub(super) fn book(names: &str, sheets: &[(&str, Option<&str>)]) -> Vec<u8> {
         let mut sheet_els = String::new();
         let mut rels = String::new();
         let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
@@ -16028,5 +16442,626 @@ mod ct_workbook_order_tests {
         // With no root end tag, the calcPr append has nothing to go before.
         let out = ensure_full_calc("<workbook><sheets/>");
         assert_eq!(out, "<workbook><sheets/>");
+    }
+}
+
+/// Conditional formatting and data validation follow structural edits and
+/// sheet renames, and a save writes the moved elements back (#822).
+#[cfg(test)]
+mod rule_shift_tests {
+    use super::print_setup_tests::book;
+    use super::*;
+    use crate::edit::{delete_cols, delete_rows, insert_cols, insert_rows, rename_sheet};
+    use crate::sheet::{CfKind, CondFormat, Dxf};
+
+    const NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const SHEET1: &str = "xl/worksheets/sheet1.xml";
+    const SHEET2: &str = "xl/worksheets/sheet2.xml";
+    const DATA: &str = r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#;
+    const MARGINS: &str = r#"<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>"#;
+
+    /// One sheet named `name` whose body after `<sheetData>` is `rest`.
+    fn one(name: &str, rest: &str) -> SheetPackage {
+        let body = format!("{DATA}{rest}");
+        load_xlsx(&book("", &[(name, Some(&body))])).expect("fixture loads")
+    }
+
+    fn part(pkg: &SheetPackage, name: &str) -> String {
+        String::from_utf8_lossy(pkg.part(name).expect("part present")).into_owned()
+    }
+
+    /// Save and reload; the reloaded package and the saved text of `name`.
+    fn saved(pkg: &SheetPackage, name: &str) -> (SheetPackage, String) {
+        let re = load_xlsx(&save_xlsx(pkg)).expect("saved file reloads");
+        let xml = part(&re, name);
+        (re, xml)
+    }
+
+    fn count(xml: &str, needle: &str) -> usize {
+        xml.matches(needle).count()
+    }
+
+    /// The text of a rule's first formula.
+    fn first_formula(cf: &CondFormat) -> String {
+        cf.rules[0].formulas()[0].clone()
+    }
+
+    #[test]
+    fn cf_and_dv_follow_inserts_and_rename_through_save() {
+        // The issue's repro.
+        let mut pkg = one(
+            "Report",
+            r#"<conditionalFormatting sqref="A1:A5"><cfRule type="expression" dxfId="0" priority="1"><formula>_xlfn.XOR(A1,B1)</formula></cfRule></conditionalFormatting><dataValidations count="1"><dataValidation type="custom" allowBlank="1" sqref="B1:B5"><formula1>_xlfn.ISFORMULA(A1)</formula1></dataValidation></dataValidations>"#,
+        );
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        insert_cols(&mut pkg.workbook, 0, 0, 1);
+        rename_sheet(&mut pkg.workbook, 0, "Q1");
+
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.cond_formats[0].ranges, vec![(1, 1, 5, 1)]);
+        assert_eq!(first_formula(&s.cond_formats[0]), "XOR(B2,C2)");
+        assert_eq!(s.validations[0].ranges, vec![(1, 2, 5, 2)]);
+        assert_eq!(s.validations[0].formula1, "ISFORMULA(B2)");
+
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert!(
+            ws.contains(r#"<conditionalFormatting sqref="B2:B6"><cfRule type="expression" dxfId="0" priority="1"><formula>_xlfn.XOR(B2,C2)</formula></cfRule></conditionalFormatting>"#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(r#"<dataValidations count="1"><dataValidation type="custom" allowBlank="1" sqref="C2:C6"><formula1>_xlfn.ISFORMULA(B2)</formula1></dataValidation></dataValidations>"#),
+            "{ws}"
+        );
+        let s = &re.workbook.sheets[0];
+        assert_eq!(s.name, "Q1");
+        assert_eq!(s.cond_formats[0].ranges, vec![(1, 1, 5, 1)]);
+        assert_eq!(first_formula(&s.cond_formats[0]), "_xlfn.XOR(B2,C2)");
+        assert_eq!(s.validations[0].ranges, vec![(1, 2, 5, 2)]);
+        assert_eq!(s.validations[0].formula1, "_xlfn.ISFORMULA(B2)");
+    }
+
+    #[test]
+    fn cf_and_dv_trim_and_drop_on_delete() {
+        // Sheet1: a CF the delete trims and one it takes whole; two DVs, one
+        // trimmed and one taken, so the block stays with a count of 1.
+        // Sheet2: its only DV is taken, so the block goes.
+        let s1 = format!(
+            r#"{DATA}<conditionalFormatting sqref="A1:A5"><cfRule type="expression" priority="1"><formula>$A$1&lt;5</formula></cfRule></conditionalFormatting><conditionalFormatting sqref="C3:C4"><cfRule type="expression" priority="2"><formula>TRUE</formula></cfRule></conditionalFormatting><dataValidations count="2"><dataValidation type="whole" sqref="B3:B4"><formula1>1</formula1></dataValidation><dataValidation type="whole" sqref="D1:D10 E3"><formula1>2</formula1></dataValidation></dataValidations>{MARGINS}"#
+        );
+        let s2 = format!(
+            r#"{DATA}<dataValidations count="1"><dataValidation type="whole" sqref="A2"><formula1>1</formula1></dataValidation></dataValidations>{MARGINS}"#
+        );
+        let mut pkg =
+            load_xlsx(&book("", &[("One", Some(&s1)), ("Two", Some(&s2))])).expect("loads");
+        delete_rows(&mut pkg.workbook, 0, 2, 2); // rows 3:4
+        delete_rows(&mut pkg.workbook, 1, 1, 1); // row 2
+
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.cond_formats.len(), 1);
+        assert_eq!(s.cond_formats[0].ranges, vec![(0, 0, 2, 0)]);
+        assert_eq!(s.cf_removed, vec![1]);
+        assert_eq!(s.validations.len(), 1);
+        // E3 went with its row; D1:D10 lost two of its rows.
+        assert_eq!(s.validations[0].ranges, vec![(0, 3, 7, 3)]);
+        assert_eq!(s.dv_removed, vec![0]);
+        assert!(pkg.workbook.sheets[1].validations.is_empty());
+
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert_eq!(count(&ws, "<conditionalFormatting"), 1, "{ws}");
+        // The absolute ref was not deleted: it keeps its text.
+        assert!(
+            ws.contains(r#"<conditionalFormatting sqref="A1:A3"><cfRule type="expression" priority="1"><formula>$A$1&lt;5</formula>"#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(r#"<dataValidations count="1"><dataValidation type="whole" sqref="D1:D8"><formula1>2</formula1></dataValidation></dataValidations>"#),
+            "{ws}"
+        );
+        assert_eq!(re.workbook.sheets[0].cond_formats.len(), 1);
+        assert_eq!(re.workbook.sheets[0].validations.len(), 1);
+        let ws2 = part(&re, SHEET2);
+        assert!(!ws2.contains("dataValidation"), "{ws2}");
+        assert!(re.workbook.sheets[1].validations.is_empty());
+    }
+
+    #[test]
+    fn cf_relative_ref_survives_anchor_row_delete() {
+        let mut pkg = one(
+            "S",
+            r#"<conditionalFormatting sqref="A1:A5"><cfRule type="expression" priority="1"><formula>A1&gt;0</formula></cfRule></conditionalFormatting>"#,
+        );
+        delete_rows(&mut pkg.workbook, 0, 0, 1);
+        let cf = &pkg.workbook.sheets[0].cond_formats[0];
+        assert_eq!(cf.ranges, vec![(0, 0, 3, 0)]);
+        // The new anchor is the old A2, which read A2: one row up now, A1.
+        assert_eq!(first_formula(cf), "A1>0");
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(
+            ws.contains(r#"<conditionalFormatting sqref="A1:A4"><cfRule type="expression" priority="1"><formula>A1&gt;0</formula>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn cf_relative_ref_survives_anchor_column_delete() {
+        let mut pkg = one(
+            "S",
+            r#"<conditionalFormatting sqref="B1:D1"><cfRule type="cellIs" operator="greaterThan" priority="1"><formula>B2</formula></cfRule></conditionalFormatting>"#,
+        );
+        delete_cols(&mut pkg.workbook, 0, 0, 2); // A:B
+        let cf = &pkg.workbook.sheets[0].cond_formats[0];
+        assert_eq!(cf.ranges, vec![(0, 0, 0, 1)]);
+        // The old C1 read C2; it is A1 now and reads A2.
+        assert_eq!(first_formula(cf), "A2");
+    }
+
+    #[test]
+    fn dv_relative_ref_survives_anchor_row_delete() {
+        let mut pkg = one(
+            "S",
+            r#"<dataValidations count="1"><dataValidation type="custom" sqref="A1:A5"><formula1>ISNUMBER(A1)</formula1></dataValidation></dataValidations>"#,
+        );
+        delete_rows(&mut pkg.workbook, 0, 0, 1);
+        let dv = &pkg.workbook.sheets[0].validations[0];
+        assert_eq!(dv.ranges, vec![(0, 0, 3, 0)]);
+        assert_eq!(dv.formula1, "ISNUMBER(A1)");
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(
+            ws.contains(
+                r#"<dataValidation type="custom" sqref="A1:A4"><formula1>ISNUMBER(A1)</formula1>"#
+            ),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn dv_list_on_other_sheet_follows_its_source_sheet() {
+        let report = format!(
+            r#"{DATA}<conditionalFormatting sqref="B1:B5"><cfRule type="expression" priority="1"><formula>COUNTIF(Lists!$A$1:$A$5,B1)&gt;0</formula></cfRule></conditionalFormatting><dataValidations count="1"><dataValidation type="list" sqref="A1:A5"><formula1>Lists!$A$1:$A$5</formula1></dataValidation></dataValidations>"#
+        );
+        let mut pkg = load_xlsx(&book(
+            "",
+            &[("Report", Some(&report)), ("Lists", Some(DATA))],
+        ))
+        .expect("loads");
+        insert_rows(&mut pkg.workbook, 1, 0, 2);
+        rename_sheet(&mut pkg.workbook, 1, "New Lists");
+
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.validations[0].ranges, vec![(0, 0, 4, 0)]);
+        assert_eq!(s.validations[0].formula1, "'New Lists'!$A$3:$A$7");
+        assert_eq!(s.cond_formats[0].ranges, vec![(0, 1, 4, 1)]);
+        assert_eq!(
+            first_formula(&s.cond_formats[0]),
+            "COUNTIF('New Lists'!$A$3:$A$7,B1)>0"
+        );
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(
+            ws.contains(r#"<dataValidation type="list" sqref="A1:A5"><formula1>'New Lists'!$A$3:$A$7</formula1>"#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(r#"<conditionalFormatting sqref="B1:B5"><cfRule type="expression" priority="1"><formula>COUNTIF('New Lists'!$A$3:$A$7,B1)&gt;0</formula>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn untouched_cf_and_dv_keep_their_bytes() {
+        let cf = r#"<conditionalFormatting sqref="A1:A5" extra="u"><cfRule type="cellIs" operator="between" dxfId="0" priority="1" stopIfTrue="1"><formula>_xlfn.XOR(A1,B1)</formula><formula>  A1 &lt;  5 </formula></cfRule></conditionalFormatting>"#;
+        let dv = r#"<dataValidations count="1" disablePrompts="0"><dataValidation sqref="B1:B5" type="custom" showErrorMessage="1"><formula1>_xlfn.ISFORMULA(A1)</formula1></dataValidation></dataValidations>"#;
+        let other = format!("{DATA}{cf}{dv}");
+        let mut pkg = load_xlsx(&book(
+            "",
+            &[("Report", Some(&other)), ("Other", Some(&other))],
+        ))
+        .expect("loads");
+        // Below and right of every range, and on the other sheet.
+        insert_rows(&mut pkg.workbook, 0, 10, 2);
+        delete_cols(&mut pkg.workbook, 0, 5, 1);
+        insert_rows(&mut pkg.workbook, 1, 0, 3);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(cf), "{ws}");
+        assert!(ws.contains(dv), "{ws}");
+        // The other sheet's moved: only it is rewritten.
+        let ws2 = part(&saved(&pkg, SHEET2).0, SHEET2);
+        assert!(ws2.contains(r#"sqref="A4:A8" extra="u""#), "{ws2}");
+    }
+
+    #[test]
+    fn color_scale_cf_moves_its_sqref() {
+        let mut pkg = one(
+            "S",
+            r#"<conditionalFormatting sqref="A1:A5"><cfRule type="colorScale" priority="1"><colorScale><cfvo type="min"/><cfvo type="max"/><color rgb="FFF8696B"/><color rgb="FF63BE7B"/></colorScale></cfRule><cfRule type="containsText" dxfId="0" priority="2" operator="containsText" text="x"><formula>NOT(ISERROR(SEARCH("x",A1)))</formula></cfRule></conditionalFormatting>"#,
+        );
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let cf = &pkg.workbook.sheets[0].cond_formats[0];
+        assert!(matches!(cf.rules[1].kind, CfKind::Other { .. }));
+        assert_eq!(cf.rules[1].formulas()[0], "NOT(ISERROR(SEARCH(\"x\",A2)))");
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(
+            ws.contains(r#"<conditionalFormatting sqref="A2:A6"><cfRule type="colorScale" priority="1"><colorScale><cfvo type="min"/><cfvo type="max"/><color rgb="FFF8696B"/><color rgb="FF63BE7B"/></colorScale></cfRule><cfRule type="containsText" dxfId="0" priority="2" operator="containsText" text="x"><formula>NOT(ISERROR(SEARCH("x",A2)))</formula></cfRule></conditionalFormatting>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn added_cf_and_dv_move_on_insert() {
+        // One of each from the file, one of each added.
+        let mut pkg = one(
+            "S",
+            r#"<conditionalFormatting sqref="C1"><cfRule type="expression" priority="1"><formula>TRUE</formula></cfRule></conditionalFormatting><dataValidations count="1"><dataValidation type="whole" sqref="D1"><formula1>1</formula1></dataValidation></dataValidations>"#,
+        );
+        assert!(pkg.add_conditional_format(
+            0,
+            (0, 0, 1, 0),
+            "greaterThan",
+            "B1",
+            None,
+            Dxf::default()
+        ));
+        assert!(pkg.add_data_validation(0, (0, 1, 1, 1), "whole", "lessThan", "A1", None));
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.cond_formats[1].ix, Some(1));
+        assert_eq!(s.validations[1].ix, Some(1));
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(r#"<conditionalFormatting sqref="C2">"#), "{ws}");
+        assert!(
+            ws.contains(r#"<conditionalFormatting sqref="A2:A3">"#),
+            "{ws}"
+        );
+        assert!(ws.contains("<formula>B2</formula>"), "{ws}");
+        assert!(
+            ws.contains(r#"<dataValidation type="whole" sqref="D2">"#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(r#"sqref="B2:B3"><formula1>A2</formula1>"#),
+            "{ws}"
+        );
+        assert_eq!(re.workbook.sheets[0].cond_formats.len(), 2);
+        assert_eq!(re.workbook.sheets[0].validations.len(), 2);
+    }
+
+    #[test]
+    fn added_to_a_fresh_sheet_moves_on_insert() {
+        let mut pkg = new_xlsx();
+        assert!(pkg.add_conditional_format(
+            0,
+            (0, 0, 1, 0),
+            "greaterThan",
+            "B1",
+            None,
+            Dxf::default()
+        ));
+        assert!(pkg.add_data_validation(0, (0, 1, 1, 1), "whole", "lessThan", "A1", None));
+        insert_cols(&mut pkg.workbook, 0, 0, 1);
+        let (re, _) = saved(&pkg, SHEET1);
+        let s = &re.workbook.sheets[0];
+        assert_eq!(s.cond_formats[0].ranges, vec![(0, 1, 1, 1)]);
+        assert_eq!(first_formula(&s.cond_formats[0]), "C1");
+        assert_eq!(s.validations[0].ranges, vec![(0, 2, 1, 2)]);
+        assert_eq!(s.validations[0].formula1, "B1");
+    }
+
+    #[test]
+    fn restored_model_writes_its_own_positions() {
+        // AC8: the save compares the model with the part, so a model that an
+        // undo or redo puts back writes ITS positions, whatever happened in
+        // between.
+        let body = r#"<conditionalFormatting sqref="A1:A5"><cfRule type="expression" priority="1"><formula>$B$5&gt;0</formula></cfRule></conditionalFormatting><conditionalFormatting sqref="B2"><cfRule type="expression" priority="2"><formula>TRUE</formula></cfRule></conditionalFormatting><dataValidations count="2"><dataValidation type="custom" sqref="C2"><formula1>C1</formula1></dataValidation><dataValidation type="custom" sqref="D1:D4"><formula1>$E$4</formula1></dataValidation></dataValidations>"#;
+        let mut pkg = one("S", body);
+        let original = pkg.workbook.clone();
+        let read = |b: &[u8]| part(&load_xlsx(b).unwrap(), SHEET1);
+        let before = read(&save_xlsx(&pkg));
+
+        // Delete rows 1:2: B2 and C2 go, the rest trims, $B$5 / $E$4 move.
+        delete_rows(&mut pkg.workbook, 0, 0, 2);
+        let deleted = pkg.workbook.clone();
+        // Then another edit, which an undo takes back to `deleted`.
+        insert_rows(&mut pkg.workbook, 0, 0, 3);
+        pkg.workbook = deleted;
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert_eq!(count(&ws, "<conditionalFormatting"), 1, "{ws}");
+        assert!(
+            ws.contains(r#"<conditionalFormatting sqref="A1:A3"><cfRule type="expression" priority="1"><formula>$B$3&gt;0</formula>"#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(r#"<dataValidations count="1"><dataValidation type="custom" sqref="D1:D2"><formula1>$E$2</formula1></dataValidation></dataValidations>"#),
+            "{ws}"
+        );
+
+        // And all the way back: the loaded positions, byte for byte.
+        pkg.workbook = original;
+        assert_eq!(read(&save_xlsx(&pkg)), before);
+    }
+
+    #[test]
+    fn a_raw_gt_in_an_attribute_neither_moves_nor_duplicates_sqref() {
+        // `>` is legal unescaped in an attribute value; it must not end the
+        // start tag before `sqref`.
+        let dv = r#"<dataValidations count="1"><dataValidation type="whole" error="must be > 0" sqref="A1:A5"><formula1>1</formula1></dataValidation></dataValidations>"#;
+        let cf = r#"<conditionalFormatting pivot="0" note="a>b" sqref="B1:B5"><cfRule type="expression" priority="1"><formula>B1&gt;0</formula></cfRule></conditionalFormatting>"#;
+        let body = format!("{cf}{dv}");
+        let pkg = one("S", &body);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(cf), "{ws}");
+        assert!(ws.contains(dv), "{ws}");
+
+        let mut pkg = one("S", &body);
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert_eq!(count(&ws, "sqref="), 2, "{ws}");
+        assert!(
+            ws.contains(r#"<dataValidation type="whole" error="must be > 0" sqref="A2:A6"><formula1>1</formula1>"#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(r#"<conditionalFormatting pivot="0" note="a>b" sqref="B2:B6"><cfRule type="expression" priority="1"><formula>B2&gt;0</formula>"#),
+            "{ws}"
+        );
+        assert_eq!(
+            re.workbook.sheets[0].validations[0].ranges,
+            vec![(1, 0, 5, 0)]
+        );
+    }
+
+    #[test]
+    fn an_element_without_sqref_is_left_alone() {
+        // The loader keeps a CF block with rules but no `sqref`: no ranges,
+        // and an `ix`. The edit moves its formula in the model, but with no
+        // `sqref` to read the save can't tell what the element covers, so it
+        // leaves it as it is rather than rewrite it (or add an `sqref`).
+        let cf = r#"<conditionalFormatting><cfRule type="expression" priority="1"><formula>A1</formula></cfRule></conditionalFormatting>"#;
+        let mut pkg = one("S", cf);
+        assert_eq!(pkg.workbook.sheets[0].cond_formats[0].ix, Some(0));
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        assert_eq!(first_formula(&pkg.workbook.sheets[0].cond_formats[0]), "A2");
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(cf), "{ws}");
+        // A DV without one isn't modelled at all (no ranges), so it is
+        // left as it is by construction; kept here as a regression guard.
+        let dv = r#"<dataValidations count="1"><dataValidation type="whole"><formula1>A1</formula1></dataValidation></dataValidations>"#;
+        let mut pkg = one("S", dv);
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(dv), "{ws}");
+    }
+
+    #[test]
+    fn x14_cf_in_extlst_is_left_alone() {
+        let x14 = r#"<extLst><ext uri="{78C0D931-6437-407d-A8EE-F0AAD7539E65}" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"><x14:conditionalFormattings><x14:conditionalFormatting xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main"><x14:cfRule type="expression" priority="2" id="{X}"><xm:f>A1&gt;1</xm:f></x14:cfRule><xm:sqref>A1:A5</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst>"#;
+        let mut pkg = one(
+            "S",
+            &format!(
+                r#"<conditionalFormatting sqref="B1:B5"><cfRule type="expression" priority="1"><formula>B1&gt;0</formula></cfRule></conditionalFormatting>{MARGINS}{x14}"#
+            ),
+        );
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.cond_formats.len(), 2);
+        assert_eq!(s.cond_formats[0].ix, Some(0));
+        assert_eq!(s.cond_formats[1].ix, None);
+        // A delete over the x14 block's (unread) cells doesn't drop it.
+        delete_rows(&mut pkg.workbook, 0, 0, 10);
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        assert_eq!(pkg.workbook.sheets[0].cond_formats.len(), 1);
+        assert_eq!(pkg.workbook.sheets[0].cond_formats[0].ix, None);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(x14), "{ws}");
+        assert!(!ws.contains(r#"<conditionalFormatting sqref"#), "{ws}");
+    }
+
+    #[test]
+    fn prefixed_part_with_comment_between_blocks_moves_the_right_element() {
+        let mut pkg = new_xlsx();
+        let first = r#"<x:conditionalFormatting sqref="A1"><x:cfRule type="expression" priority="1"><x:formula>TRUE</x:formula></x:cfRule></x:conditionalFormatting>"#;
+        pkg.set_part(
+            SHEET1,
+            format!(
+                r#"<?xml version="1.0"?><x:worksheet xmlns:x="{NS}"><x:sheetData/>{first}<!-- <x:conditionalFormatting sqref="Z9"/> --><x:conditionalFormatting sqref="C3"><x:cfRule type="expression" priority="2"><x:formula>C3=1</x:formula></x:cfRule></x:conditionalFormatting><x:dataValidations count="1"><!-- --><x:dataValidation type="custom" sqref="C3"><x:formula1>C3&gt;1</x:formula1></x:dataValidation></x:dataValidations></x:worksheet>"#
+            )
+            .into_bytes(),
+        );
+        let mut pkg = load_xlsx(&write_zip(&pkg.parts)).expect("load");
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(
+            s.cond_formats.iter().map(|c| c.ix).collect::<Vec<_>>(),
+            vec![Some(0), Some(1)]
+        );
+        assert_eq!(s.validations[0].ix, Some(0));
+        insert_rows(&mut pkg.workbook, 0, 1, 1); // below A1, above C3
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(first), "{ws}");
+        assert!(
+            ws.contains(r#"<!-- <x:conditionalFormatting sqref="Z9"/> -->"#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(r#"<x:conditionalFormatting sqref="C4"><x:cfRule type="expression" priority="2"><x:formula>C4=1</x:formula>"#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(
+                r#"<x:dataValidation type="custom" sqref="C4"><x:formula1>C4&gt;1</x:formula1>"#
+            ),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn a_stale_claim_from_a_restored_model_yields_to_an_added_block() {
+        let mut pkg = one(
+            "S",
+            r#"<conditionalFormatting sqref="A1"><cfRule type="expression" priority="1"><formula>TRUE</formula></cfRule></conditionalFormatting>"#,
+        );
+        let snapshot = pkg.workbook.clone();
+        assert!(pkg.clear_conditional_formats(0));
+        // An undo that restores the model but not the part.
+        pkg.workbook = snapshot;
+        assert!(pkg.add_conditional_format(
+            0,
+            (2, 2, 2, 2),
+            "greaterThan",
+            "1",
+            None,
+            Dxf::default()
+        ));
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.cond_formats[0].ix, None);
+        assert_eq!(s.cond_formats[1].ix, Some(0));
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert_eq!(count(&ws, "<conditionalFormatting"), 1, "{ws}");
+        assert!(ws.contains(r#"<conditionalFormatting sqref="C4">"#), "{ws}");
+    }
+
+    #[test]
+    fn an_element_two_blocks_claim_is_left_alone() {
+        let cf = r#"<conditionalFormatting sqref="A1"><cfRule type="expression" priority="1"><formula>A1</formula></cfRule></conditionalFormatting>"#;
+        let mut pkg = one("S", cf);
+        let mut twin = pkg.workbook.sheets[0].cond_formats[0].clone();
+        twin.ranges = vec![(5, 5, 5, 5)];
+        pkg.workbook.sheets[0].cond_formats.push(twin);
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(cf), "{ws}");
+    }
+
+    #[test]
+    fn unparseable_sqref_token_element_left_alone() {
+        let cf = r#"<conditionalFormatting sqref="A:A B1:B2"><cfRule type="expression" priority="1"><formula>TRUE</formula></cfRule></conditionalFormatting>"#;
+        let mut pkg = one("S", cf);
+        assert_eq!(
+            pkg.workbook.sheets[0].cond_formats[0].ranges,
+            vec![(0, 1, 1, 1)]
+        );
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(cf), "{ws}");
+        // Nor is it removed when the ranges it could read are all deleted.
+        let mut pkg = one("S", cf);
+        delete_rows(&mut pkg.workbook, 0, 0, 2);
+        assert_eq!(pkg.workbook.sheets[0].cf_removed, vec![0]);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(cf), "{ws}");
+    }
+
+    #[test]
+    fn cf_formula_text_is_decoded_on_load() {
+        let pkg = one(
+            "S",
+            r#"<conditionalFormatting sqref="A1"><cfRule type="expression" priority="1"><formula>A1&lt;5</formula></cfRule></conditionalFormatting>"#,
+        );
+        assert_eq!(
+            first_formula(&pkg.workbook.sheets[0].cond_formats[0]),
+            "A1<5"
+        );
+    }
+
+    /// A CF block over `sqref` with one expression rule `formula`.
+    fn expr_cf(sqref: &str, formula: &str) -> String {
+        format!(
+            r#"<conditionalFormatting sqref="{sqref}"><cfRule type="expression" priority="1"><formula>{formula}</formula></cfRule></conditionalFormatting>"#
+        )
+    }
+
+    #[test]
+    fn deleting_the_range_that_held_the_anchor_column_retranslates() {
+        // Anchor (row 1, col A); A5:A6 held its column. Once it goes, C1
+        // anchors, and it read C1.
+        let mut pkg = one("S", &expr_cf("C1:C2 A5:A6", "A1&gt;0"));
+        delete_rows(&mut pkg.workbook, 0, 4, 2);
+        let cf = &pkg.workbook.sheets[0].cond_formats[0];
+        assert_eq!(cf.ranges, vec![(0, 2, 1, 2)]);
+        assert_eq!(first_formula(cf), "C1>0");
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(&expr_cf("C1:C2", "C1&gt;0")), "{ws}");
+    }
+
+    #[test]
+    fn deleting_the_range_that_held_the_anchor_row_and_column_retranslates() {
+        // A1:A2 goes; the old C5 (now C3) anchors, and it read C5.
+        let mut pkg = one("S", &expr_cf("A1:A2 C5:C6", "A1&gt;0"));
+        delete_rows(&mut pkg.workbook, 0, 0, 2);
+        let cf = &pkg.workbook.sheets[0].cond_formats[0];
+        assert_eq!(cf.ranges, vec![(2, 2, 3, 2)]);
+        assert_eq!(first_formula(cf), "C3>0");
+    }
+
+    #[test]
+    fn deleting_the_columns_that_held_the_anchor_row_retranslates() {
+        // C1:D1 held the anchor's row; once those columns go, A2 anchors.
+        let mut pkg = one("S", &expr_cf("A2:A3 C1:D1", "A1&gt;0"));
+        delete_cols(&mut pkg.workbook, 0, 2, 2);
+        let cf = &pkg.workbook.sheets[0].cond_formats[0];
+        assert_eq!(cf.ranges, vec![(1, 0, 2, 0)]);
+        assert_eq!(first_formula(cf), "A2>0");
+    }
+
+    #[test]
+    fn dv_deleting_the_range_that_held_the_anchor_column_retranslates() {
+        let mut pkg = one(
+            "S",
+            r#"<dataValidations count="1"><dataValidation type="custom" sqref="C1:C2 A5:A6"><formula1>ISNUMBER(A1)</formula1></dataValidation></dataValidations>"#,
+        );
+        delete_rows(&mut pkg.workbook, 0, 4, 2);
+        let dv = &pkg.workbook.sheets[0].validations[0];
+        assert_eq!(dv.ranges, vec![(0, 2, 1, 2)]);
+        assert_eq!(dv.formula1, "ISNUMBER(C1)");
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(
+            ws.contains(r#"sqref="C1:C2"><formula1>ISNUMBER(C1)</formula1>"#),
+            "{ws}"
+        );
+    }
+
+    /// Add a CF over C3 to a part whose blocks stand where the new one lands
+    /// ahead of some of them, move rows, and check each element kept its own
+    /// rule.
+    fn add_into_misordered(body: &str, added_ix: usize, existing: &[(&str, &str)]) {
+        let mut pkg = one("S", body);
+        assert!(pkg.add_conditional_format(
+            0,
+            (2, 2, 2, 2),
+            "greaterThan",
+            "5",
+            None,
+            Dxf::default()
+        ));
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.cond_formats.last().unwrap().ix, Some(added_ix));
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (re, ws) = saved(&pkg, SHEET1);
+        for (sqref, formula) in existing {
+            assert!(ws.contains(&expr_cf(sqref, formula)), "{sqref}: {ws}");
+        }
+        assert!(
+            ws.contains(r#"<conditionalFormatting sqref="C4"><cfRule type="cellIs" dxfId="0" priority="2" operator="greaterThan"><formula>5</formula>"#),
+            "{ws}"
+        );
+        assert_eq!(re.workbook.sheets[0].cond_formats.len(), existing.len() + 1);
+    }
+
+    #[test]
+    fn a_cf_added_ahead_of_a_misplaced_block_keeps_both_in_place() {
+        // A block after <dataValidations>, which ranks after it: the new
+        // block goes before the DVs, so ahead of it.
+        let body = format!(
+            r#"<dataValidations count="1"><dataValidation type="whole" sqref="D1"><formula1>1</formula1></dataValidation></dataValidations>{}"#,
+            expr_cf("A1", "A1=1")
+        );
+        add_into_misordered(&body, 0, &[("A2", "A2=1")]);
+    }
+
+    #[test]
+    fn a_cf_added_between_blocks_split_by_margins_keeps_each_in_place() {
+        let body = format!(
+            "{}{MARGINS}{}",
+            expr_cf("A1", "A1=1"),
+            expr_cf("B1", "B1=2")
+        );
+        add_into_misordered(&body, 1, &[("A2", "A2=1"), ("B2", "B2=2")]);
     }
 }
