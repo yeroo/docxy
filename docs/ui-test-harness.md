@@ -685,8 +685,9 @@ file that is already open without asking unless `reopen` is `"ask"` (see
   `Copy (k)`) and opens that as an ordinary tab. The copy carries the
   source's `Zone.Identifier` stream, so a copy of a downloaded file stays
   downloaded. A copy that cannot be written, or a copy of a downloaded file
-  that cannot be marked as one, opens nothing (the unmarked copy is
-  removed) and is the error.
+  that cannot be marked as one (or whose own mark cannot be read), opens
+  nothing (the unmarked copy is removed) and is the error. A template opens
+  as a new, untitled workbook in every mode, so Copy writes no file for it.
 - **repair**: a lenient load (`gridcore::xlsx::load_xlsx_repair`); the
   status still starts with `loaded` and names what was emptied or dropped.
   Save goes to Save As, which may pick the file itself.

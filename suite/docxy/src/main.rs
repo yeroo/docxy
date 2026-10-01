@@ -4368,8 +4368,11 @@ fn tab_from_path_mode(path: &PathBuf, mode: OpenMode) -> Result<DocTab, String> 
         return Ok(tab_from_path(path));
     }
     let protected = open_mode::is_protected_zone(open_mode::zone_id(path));
+    // A template already opens as a new, untitled workbook, which is what a
+    // copy is for: writing `Copy (1)Budget.xltx` would only leave a file
+    // behind that nothing is bound to (#610 r6).
     let path = match mode {
-        OpenMode::Copy => open_mode::write_copy(path)?,
+        OpenMode::Copy if template_title(path).is_none() => open_mode::write_copy(path)?,
         _ => path.clone(),
     };
     let mut tab = sheet_tab_from_path(&path, mode == OpenMode::Repair);

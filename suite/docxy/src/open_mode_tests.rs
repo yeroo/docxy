@@ -472,12 +472,20 @@ fn template_read_only_or_repair_opens_as_normal_untitled() {
         ),
     )
     .unwrap();
-    for mode in [OpenMode::ReadOnly, OpenMode::Repair] {
+    let plain = tab_from_path_mode(&template, OpenMode::Normal).unwrap();
+    for mode in [OpenMode::ReadOnly, OpenMode::Repair, OpenMode::Copy] {
         let tab = tab_from_path_mode(&template, mode).unwrap();
         assert_eq!(tab.path, None, "{mode:?}: a new workbook from the template");
         assert_eq!(tab.access, Access::default(), "{mode:?}");
         assert!(matches!(tab.surface, Surface::Sheet(_)), "{}", tab.status);
+        assert_eq!(tab.title, plain.title, "{mode:?}");
     }
+    // #610 r6: Open as Copy of a template writes no copy beside it.
+    let files: Vec<_> = std::fs::read_dir(&dir.0)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(files, ["Budget.xltx"], "no Copy (k) file was left behind");
 }
 
 // ---- the reopen question ------------------------------------------------

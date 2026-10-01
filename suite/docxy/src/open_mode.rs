@@ -181,9 +181,10 @@ pub(crate) fn write_copy(src: &Path) -> Result<PathBuf, String> {
     let bytes = std::fs::read(src).map_err(|e| format!("could not copy \"{name}\": {e}"))?;
     let copy = write_new(copy_names(src), &bytes)
         .map_err(|e| format!("could not copy \"{name}\": {e}"))?;
-    let protected = is_protected_zone(zone_id(src));
-    keep_marked(&copy, protected, carry_zone(src, &copy))
-        .map_err(|e| format!("could not mark the copy of \"{name}\" as downloaded: {e}"))?;
+    mark_copy(&copy, read_zone_mark(src), |mark| {
+        write_zone_mark(&copy, mark)
+    })
+    .map_err(|e| format!("could not mark the copy of \"{name}\" as downloaded: {e}"))?;
     Ok(copy)
 }
 
@@ -195,35 +196,66 @@ fn zone_stream(path: &Path) -> PathBuf {
     PathBuf::from(stream)
 }
 
-/// Copy `src`'s `Zone.Identifier` stream onto `dst`. Nothing to do when the
-/// source has none, and off Windows.
-fn carry_zone(src: &Path, dst: &Path) -> std::io::Result<()> {
+/// The bytes of `src`'s `Zone.Identifier` stream, read once (#610 r6):
+/// `None` when it has none, and always off Windows. A volume that keeps no
+/// streams at all (FAT) answers with an invalid-name error, which also means
+/// there is no mark; any other error is returned, since whether the source
+/// is protected is then unknown.
+fn read_zone_mark(src: &Path) -> std::io::Result<Option<Vec<u8>>> {
     #[cfg(windows)]
     {
+        use std::io::ErrorKind;
         match std::fs::read(zone_stream(src)) {
-            Ok(mark) => std::fs::write(zone_stream(dst), mark),
-            Err(_) => Ok(()),
+            Ok(mark) => Ok(Some(mark)),
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::InvalidFilename) => {
+                Ok(None)
+            }
+            Err(e) => Err(e),
         }
     }
     #[cfg(not(windows))]
     {
-        let _ = (src, dst);
+        let _ = src;
+        Ok(None)
+    }
+}
+
+/// Write `mark` as `dst`'s `Zone.Identifier` stream; nothing off Windows.
+fn write_zone_mark(dst: &Path, mark: &[u8]) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        std::fs::write(zone_stream(dst), mark)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (dst, mark);
         Ok(())
     }
 }
 
-/// What a failed [`carry_zone`] does to the `copy` just written: for a
-/// `protected` source the copy is removed and the error stands, so no
-/// unmarked copy of a downloaded file is left behind; for any other source
-/// the mark was only a courtesy, and the copy stays.
-fn keep_marked(copy: &Path, protected: bool, carried: std::io::Result<()>) -> Result<(), String> {
-    match carried {
-        Ok(()) => Ok(()),
-        Err(e) if protected => {
-            let _ = std::fs::remove_file(copy);
-            Err(e.to_string())
-        }
-        Err(_) => Ok(()),
+/// Give the `copy` just written the source's `mark` ([`read_zone_mark`])
+/// through `write`, failing closed: when the source's mark could not be
+/// read, or a protected one (zone 3 or 4) could not be written, the copy is
+/// removed and the error stands, so no unmarked copy of a downloaded file is
+/// left behind. A mark that is not protected is only a courtesy, and a copy
+/// that could not take it stays.
+fn mark_copy(
+    copy: &Path,
+    mark: std::io::Result<Option<Vec<u8>>>,
+    write: impl FnOnce(&[u8]) -> std::io::Result<()>,
+) -> Result<(), String> {
+    let failed = |e: String| {
+        let _ = std::fs::remove_file(copy);
+        Err(e)
+    };
+    match mark {
+        Ok(None) => Ok(()),
+        Err(e) => failed(format!("the original's mark could not be read: {e}")),
+        Ok(Some(mark)) => match write(&mark) {
+            Ok(()) => Ok(()),
+            Err(e) if is_protected_zone(parse_zone_identifier(&mark)) => failed(e.to_string()),
+            Err(_) => Ok(()),
+        },
     }
 }
 
@@ -452,22 +484,38 @@ mod tests {
         }
     }
 
-    /// #610 r5: a copy of a protected file that could not be marked is
-    /// removed, failing closed; any other copy keeps going without its mark.
+    /// #610 r5, r6: the copy is marked fail-closed. A protected mark that
+    /// cannot be written, or a source mark that cannot be read at all, removes
+    /// the copy; a source with no mark, or a local zone's mark that cannot be
+    /// written, keeps it.
     #[test]
     fn an_unmarked_copy_of_a_protected_file_is_removed() {
-        let dir = Scratch::new("keep-marked");
+        let dir = Scratch::new("mark-copy");
         let copy = dir.0.join("Copy (1)book.xlsx");
-        let failed = || Err(std::io::Error::other("no streams here"));
+        let internet = b"[ZoneTransfer]\r\nZoneId=3\r\n".to_vec();
+        let intranet = b"[ZoneTransfer]\r\nZoneId=1\r\n".to_vec();
+        let refused = |_: &[u8]| Err(std::io::Error::other("no streams here"));
+        let written = |_: &[u8]| Ok(());
+
         std::fs::write(&copy, b"x").unwrap();
-        let err = keep_marked(&copy, true, failed()).unwrap_err();
+        let err = mark_copy(&copy, Ok(Some(internet.clone())), refused).unwrap_err();
         assert_eq!(err, "no streams here");
         assert!(!copy.exists(), "the unmarked copy is gone");
+
         std::fs::write(&copy, b"x").unwrap();
-        assert_eq!(keep_marked(&copy, false, failed()), Ok(()));
-        assert!(copy.exists(), "a local file's copy stays");
-        assert_eq!(keep_marked(&copy, true, Ok(())), Ok(()));
-        assert!(copy.exists());
+        let unreadable = Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let err = mark_copy(&copy, unreadable, written).unwrap_err();
+        assert!(
+            err.starts_with("the original's mark could not be read"),
+            "{err}"
+        );
+        assert!(!copy.exists(), "protection unknown: the copy is gone");
+
+        std::fs::write(&copy, b"x").unwrap();
+        assert_eq!(mark_copy(&copy, Ok(None), refused), Ok(()));
+        assert_eq!(mark_copy(&copy, Ok(Some(intranet)), refused), Ok(()));
+        assert_eq!(mark_copy(&copy, Ok(Some(internet)), written), Ok(()));
+        assert!(copy.exists(), "kept");
     }
 
     #[test]
