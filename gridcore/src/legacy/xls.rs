@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use super::ftab;
 use super::ptg::{self, Base, Biff, Names};
 use super::{
     BookIn, ExternalLink, Le, Limits, OpenError, SheetIn, XfFormats, biff_error, on_grid, rk,
@@ -158,7 +159,8 @@ impl<'a> Cur<'a> {
 enum Book {
     /// The workbook itself (a SUPBOOK with the 0x0401 marker).
     Own,
-    /// An add-in function book (0x3A01): its EXTERNNAMEs are functions.
+    /// An add-in function book (0x3A01): its EXTERNNAMEs are functions an
+    /// XLL registers, spelled as [`ftab::xll_name`] gives.
     AddIn,
     /// Another workbook, or DDE/OLE: its place in [`BookIn::external_links`]
     /// when it is a Library book with a function name (see
@@ -400,13 +402,13 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
                     c.u32()?;
                     let name = c.short_string()?;
                     let kept = match b.kind {
-                        Book::AddIn => true,
-                        Book::External(_) => b.lib.is_some() && flags == 0 && c.u16()? == 0,
-                        Book::Own => false,
+                        Book::AddIn => Some(ftab::xll_name(&name)),
+                        Book::External(_) => {
+                            (b.lib.is_some() && flags == 0 && c.u16()? == 0).then_some(name)
+                        }
+                        Book::Own => None,
                     };
-                    if kept {
-                        *b.names.last_mut()? = Some(name);
-                    }
+                    *b.names.last_mut()? = kept;
                 }
                 0x0017 => {
                     let n = c.u16()?;
@@ -1496,6 +1498,35 @@ pub(crate) mod tests {
         );
         assert_eq!(book.external_links.len(), 1);
         assert_eq!(book.external_links[0].names, [None, None, Some("F".into())]);
+    }
+
+    /// The 0x3A01 book's names are functions an XLL registers: one that is
+    /// built in (the Analysis ToolPak's, as Excel writes EDATE) stays bare,
+    /// any other is `_xll.NAME`, as Excel's `.xlsx` of
+    /// corpus/legacy/addin/xll-udf spells XLLTWICE. Excel gives each a
+    /// `#REF!` definition, which doesn't matter.
+    #[test]
+    fn name_x_into_the_add_in_book_spells_xll_functions() {
+        let book = read(&workbook(
+            &[
+                addin_supbook(),
+                extern_name(0, "XLLTWICE", &[0x1C, 0x17]),
+                extern_name(0, "EDATE", &[0x1C, 0x17]),
+                own_supbook(),
+                extern_sheet(&[(0, -2, -2)]),
+            ],
+            &formulas(&[name_x(0, 1), name_x(0, 2), name_x(0, 3)]),
+        ))
+        .unwrap();
+        assert_eq!(
+            formula_texts(&book),
+            [
+                Some("_xll.XLLTWICE".to_string()),
+                Some("EDATE".to_string()),
+                None
+            ]
+        );
+        assert!(book.external_links.is_empty());
     }
 
     /// A workbook naming more Library books with a function name than the

@@ -492,9 +492,30 @@ pub(crate) fn lookup(index: u16) -> Option<(&'static str, Option<u8>)> {
     Some((name, u8::try_from(argc).ok()))
 }
 
+/// How a formula spells a call to `name`, a function an XLL add-in
+/// registers (a ptgNameX into an `.xls` 0x3A01 SUPBOOK or an `.xlsb`
+/// BrtSupAddin book): bare when it is a built-in function, as Excel's
+/// `.xlsx` spells the Analysis ToolPak's EDATE (corpus/legacy/calc-dates),
+/// else `_xll.NAME`, as it spells XLLTWICE (corpus/legacy/addin/xll-udf).
+pub(crate) fn xll_name(name: &str) -> String {
+    let builtin = (0..=484).any(|i| lookup(i).is_some_and(|(n, _)| n.eq_ignore_ascii_case(name)));
+    if builtin {
+        name.to_string()
+    } else {
+        format!("_xll.{name}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xll_names_are_prefixed_unless_built_in() {
+        assert_eq!(xll_name("EDATE"), "EDATE");
+        assert_eq!(xll_name("networkdays"), "networkdays");
+        assert_eq!(xll_name("XLLTWICE"), "_xll.XLLTWICE");
+    }
 
     #[test]
     fn indices_name_the_functions_the_spec_gives_them() {

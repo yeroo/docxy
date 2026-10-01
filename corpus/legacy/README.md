@@ -24,7 +24,15 @@ them (#888, #890). `ext-name` (with its source `ext-name-src.xlsx`) calls
 names of an ordinary workbook instead: `SUM([1]!Prices)` and `[1]!Half*2`. Its
 `.xlsb` and `.xls` store those names the same way, but each has a definition
 and the book's cells are cached, and the import reads neither. So the formulas
-are dropped and the values kept.
+are dropped and the values kept. `xll-udf` calls `XLLTWICE`, a function that
+an XLL add-in registers. No XLL that ships with Office has a function that
+isn't built in, so `scripts/xll-fixture` is a tiny XLL the script builds for
+it. Excel's `.xlsx` spells the call `_xll.XLLTWICE(A1)`, with no external
+link. The `.xlsb` stores it as a ptgNameX into a BrtSupAddin book, whose names
+are BrtPlaceholderName records, and the `.xls` as a ptgNameX into the add-in
+SUPBOOK (0x3A01). That SUPBOOK also holds the Analysis ToolPak's functions
+(EDATE in `calc-dates.xls`), which the `.xlsx` spells bare, so the import
+prefixes `_xll.` only to a name that isn't a built-in function (#890).
 
 ## The test over this corpus (runs in CI)
 
@@ -68,8 +76,10 @@ powershell -File scripts/make-legacy-fixtures.ps1
 It opens each `corpus/xlsx/*.xlsx` in a fresh Excel process and saves it in
 the three formats. Then it rebuilds `extra/`: Excel creates each of those
 workbooks from scratch and saves its `.xlsx` source as well as the three
-formats. Last it rebuilds `addin/`. `-Sections corpus,extra,addin` picks
-which of the three parts to rebuild. Excel's SaveAs `.xls` of a workbook with
+formats. Last it rebuilds `addin/`: `-Sections addin` the EUROTOOL.XLAM
+workbooks, `-Sections xll` `xll-udf` (this builds `scripts/xll-fixture` with
+cargo, and needs 64-bit Excel). `-Sections corpus,extra,addin,xll` picks
+which parts to rebuild. Excel's SaveAs `.xls` of a workbook with
 an external link stops on the Compatibility Checker even under automation, so
 the script presses its Continue button through UI Automation from a
 background job. The output depends on the Excel build,

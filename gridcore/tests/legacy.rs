@@ -593,6 +593,50 @@ fn add_in_link_survives_save_as_xlsx(ext: &str) {
 }
 
 #[test]
+fn xlsb_xll_function_keeps_its_formula() {
+    xll_function_keeps_its_formula("xlsb");
+}
+
+#[test]
+fn xls_xll_function_keeps_its_formula() {
+    xll_function_keeps_its_formula("xls");
+}
+
+/// `corpus/legacy/addin/xll-udf`: a call to XLLTWICE, which an XLL add-in
+/// (scripts/xll-fixture) registers. Excel's `.xlsx` spells it
+/// `_xll.XLLTWICE(A1)`, with no external link. The `.xlsb` stores it as a
+/// ptgNameX into a BrtSupAddin book, the `.xls` into the 0x3A01 add-in
+/// SUPBOOK. Both imports, and their saves as `.xlsx`, spell it the same.
+fn xll_function_keeps_its_formula(ext: &str) {
+    let dir = corpus("legacy").join("addin");
+    let src = load_xlsx(&std::fs::read(dir.join("xll-udf.xlsx")).unwrap())
+        .expect("xll-udf.xlsx loads")
+        .workbook;
+    let (pkg, _) = open_workbook(&std::fs::read(dir.join(format!("xll-udf.{ext}"))).unwrap())
+        .unwrap_or_else(|e| panic!("{ext} opens: {e}"));
+    let got = &pkg.workbook;
+    let formula = |wb: &Workbook, r, c| wb.sheets[0].cell(r, c).and_then(|x| x.formula.clone());
+    assert_eq!(formula(got, 0, 1).as_deref(), Some("_xll.XLLTWICE(A1)"));
+    assert_eq!(formula(got, 1, 1).as_deref(), Some("_xll.XLLTWICE(A1)+1"));
+    let file = format!("xll-udf.{ext}");
+    let mut errs = Vec::new();
+    compare_static(&file, &src, got, &mut errs);
+    same_formula_text(&file, &src, got, &mut errs);
+
+    let bytes = save_xlsx(&pkg);
+    let back = load_xlsx(&bytes).expect("saved import reloads");
+    assert!(
+        !back.part_names().iter().any(|n| n.contains("externalLink")),
+        "{:?}",
+        back.part_names()
+    );
+    let file = format!("xll-udf.{ext} (h)");
+    compare_static(&file, &src, &back.workbook, &mut errs);
+    same_formula_text(&file, &src, &back.workbook, &mut errs);
+    assert!(errs.is_empty(), "{}", errs.join("\n"));
+}
+
+#[test]
 fn xlsb_external_workbook_name_keeps_only_its_value() {
     external_workbook_name_keeps_only_its_value("xlsb");
 }
