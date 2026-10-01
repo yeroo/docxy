@@ -60,6 +60,11 @@ pub(crate) enum DialogOwner {
     },
     /// Its "Do you want to replace the contents of the destination cells?".
     TextToColumnsReplace,
+    /// "Do you want to reopen it?" before an open discards the tab's unsaved
+    /// changes (#610); Yes reloads the tab's file in `mode`.
+    Reopen {
+        mode: crate::open_mode::OpenMode,
+    },
     /// A dialog the model tests build; the app never applies one.
     #[cfg(test)]
     Test,

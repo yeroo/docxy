@@ -99,6 +99,9 @@ fn persisted(path: Option<&Path>, hot: Option<&Path>, dirty: bool) -> PersistTab
         dirty,
         markdown: false,
         load_failed: None,
+        read_only: false,
+        protected: false,
+        repaired: false,
     }
 }
 

@@ -22,6 +22,9 @@ use opccore::xml::{Event, XmlParser};
 use opccore::zip::ZipArchive;
 use opccore::zipwrite::write_zip;
 
+mod repair;
+pub use repair::{Repairs, load_xlsx_repair};
+
 use crate::formula::{file_formula, translate_formula};
 use crate::sheet::{
     Cell, CellMeta, CellValue, ColDef, DefinedName, NumFmt, Sheet, Styles, Table, Workbook, Xf,
@@ -31,7 +34,7 @@ use crate::sheet::{
 
 const OLE2: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum XlsxError {
     /// Not a ZIP container at all.
     NotZip,
@@ -40,6 +43,9 @@ pub enum XlsxError {
     CorruptPart,
     MissingWorkbook,
     NotUtf8,
+    /// [`load_xlsx_repair`] met a damaged part it can neither empty nor drop
+    /// without leaving references to it broken.
+    Unrepairable(String),
 }
 
 impl std::fmt::Display for XlsxError {
@@ -52,6 +58,9 @@ impl std::fmt::Display for XlsxError {
             XlsxError::CorruptPart => "corrupt part in .xlsx container",
             XlsxError::MissingWorkbook => "no xl/workbook.xml in container",
             XlsxError::NotUtf8 => "workbook XML is not valid UTF-8",
+            XlsxError::Unrepairable(part) => {
+                return write!(f, "could not repair: {part} is damaged");
+            }
         })
     }
 }
@@ -209,21 +218,28 @@ fn is_strict_workbook(wb_xml: &str) -> bool {
 
 /// Open an `.xlsx` from bytes, keeping all parts for a lossless-ish save.
 pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
-    let zip = match ZipArchive::open(data) {
-        Some(z) => z,
-        None => {
-            if data.len() >= 8 && data[..8] == OLE2 {
-                return Err(XlsxError::LegacyXls);
-            }
-            return Err(XlsxError::NotZip);
-        }
-    };
+    let zip = open_container(data)?;
     let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
     for e in zip.entries() {
         let bytes = zip.extract(e).ok_or(XlsxError::CorruptPart)?;
         parts.push((e.name.clone(), bytes));
     }
+    load_parts(parts)
+}
 
+/// The ZIP container of an `.xlsx`, or why `data` is not one.
+fn open_container(data: &[u8]) -> Result<ZipArchive<'_>, XlsxError> {
+    match ZipArchive::open(data) {
+        Some(z) => Ok(z),
+        None if data.len() >= 8 && data[..8] == OLE2 => Err(XlsxError::LegacyXls),
+        None => Err(XlsxError::NotZip),
+    }
+}
+
+/// Build the package from its extracted parts: [`load_xlsx`] after reading
+/// the container, and [`load_xlsx_repair`] after mending the parts it could
+/// not read.
+fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> {
     let get = |name: &str| {
         parts
             .iter()
@@ -7429,6 +7445,21 @@ fn shift_local_sheet_ids(xml: &str, removed: usize) -> String {
 const SPREADSHEET_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const RELS_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 
+/// Minimal but Excel-complete styles in the SpreadsheetML namespace `sml`:
+/// two fills (none + gray125) are mandatory; one font, one border, one xf.
+/// `dxfs` empty differential formats follow, so a repaired workbook's
+/// conditional formats and tables keep a `dxfId` that resolves.
+pub(crate) fn minimal_styles_xml(sml: &str, dxfs: usize) -> String {
+    let dxfs = match dxfs {
+        0 => String::new(),
+        n => format!(r#"<dxfs count="{n}">{}</dxfs>"#, "<dxf/>".repeat(n)),
+    };
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="{sml}"><fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>{dxfs}</styleSheet>"#
+    )
+}
+
 /// A fresh single-sheet workbook (the "create new" path and a save target for
 /// in-memory workbooks).
 pub fn new_xlsx() -> SheetPackage {
@@ -7485,12 +7516,7 @@ pub(crate) fn new_xlsx_sheets(names: &[String]) -> SheetPackage {
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="{SPREADSHEET_NS}"><dimension ref="A1"/><sheetViews><sheetView workbookViewId="0"/></sheetViews><sheetData/></worksheet>"#
     );
-    // Minimal but Excel-complete styles: two fills (none + gray125) are
-    // mandatory; one font, one border, one xf.
-    let styles = format!(
-        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<styleSheet xmlns="{SPREADSHEET_NS}"><fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
-    );
+    let styles = minimal_styles_xml(SPREADSHEET_NS, 0);
     let sst = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" uniqueCount="0"></sst>"#;
 

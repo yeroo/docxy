@@ -2000,6 +2000,7 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "dialog-set"
             | "dialog-tab"
             | "dialog-click"
+            | "enable-editing"
     )
 }
 
@@ -2169,6 +2170,28 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
             "dirty",
             Json::Bool(app.tabs.get(app.active).is_some_and(|t| t.dirty)),
         ),
+        // The active tab's caption and open mode (#610).
+        (
+            "caption",
+            Json::Str(
+                app.tabs
+                    .get(app.active)
+                    .map(|t| t.caption())
+                    .unwrap_or_default(),
+            ),
+        ),
+        (
+            "read_only",
+            Json::Bool(app.tabs.get(app.active).is_some_and(|t| t.access.read_only)),
+        ),
+        (
+            "protected",
+            Json::Bool(app.tabs.get(app.active).is_some_and(|t| t.access.protected)),
+        ),
+        (
+            "repaired",
+            Json::Bool(app.tabs.get(app.active).is_some_and(|t| t.access.repaired)),
+        ),
         // What the tab's status line says. Reported because a refusal a modal
         // dialog would otherwise have made is written here (that is what the
         // `harness.is_none()` gates leave behind), and because a document that
@@ -2287,6 +2310,10 @@ fn tab_list(tabs: &[crate::DocTab], active: usize) -> Json {
                 ),
                 ("dirty", Json::Bool(t.dirty)),
                 ("imported", Json::Bool(crate::is_imported(t))),
+                ("caption", Json::Str(t.caption())),
+                ("read_only", Json::Bool(t.access.read_only)),
+                ("protected", Json::Bool(t.access.protected)),
+                ("repaired", Json::Bool(t.access.repaired)),
             ])
         })
         .collect();
@@ -2709,14 +2736,55 @@ pub fn dispatch(
             ("tabs", Json::Num(app.tabs.len() as f64)),
         ])),
 
-        // Open a file, exactly as a path on the command line does.
+        // Open a file, exactly as a path on the command line does, through
+        // the one `open_path` every open takes (#610). `mode` is a
+        // workbook's open mode (`normal`, `read-only`, `copy`, `repair`).
+        // A file already open is reloaded without asking, because `open` is
+        // a case's setup; `reopen: "ask"` asks as a person's open does, and
+        // the question is a dialog the `dialog-*` verbs answer. A relative
+        // `path` resolves against the active tab's folder, as `save-as`'s
+        // does, so a case can name the copy `open copy:` made.
         "open" => {
             let raw = arg_str(args, "path")?;
-            let path = PathBuf::from(raw);
+            let path = if Path::new(raw).is_relative() {
+                // A relative path has no folder of its own; never the CWD.
+                let base = app
+                    .tabs
+                    .get(app.active)
+                    .and_then(|t| t.path.as_deref())
+                    .and_then(Path::parent)
+                    .ok_or(
+                        "the active tab has never been saved, so a relative 'path' has no folder: give an absolute path",
+                    )?;
+                base.join(raw)
+            } else {
+                PathBuf::from(raw)
+            };
             if !path.is_file() {
                 return Err(format!("no such file: {raw}"));
             }
-            app.open_args(vec![path], cx);
+            let mode = match args.get("mode") {
+                None => crate::open_mode::OpenMode::Normal,
+                Some(Json::Str(m)) => crate::open_mode::OpenMode::parse(m)
+                    .ok_or("'mode' must be normal, read-only, copy or repair")?,
+                Some(_) => return Err("'mode' must be a string".into()),
+            };
+            let reopen = match args.get("reopen") {
+                None => crate::open_mode::Reopen::Always,
+                Some(Json::Str(r)) if r == "always" => crate::open_mode::Reopen::Always,
+                Some(Json::Str(r)) if r == "ask" => crate::open_mode::Reopen::Ask,
+                Some(_) => return Err("'reopen' must be \"always\" or \"ask\"".into()),
+            };
+            let loaded = app.open_path(&path, mode, reopen)?;
+            app.backstage = false;
+            app.drop_grid_state();
+            app.persist();
+            cx.notify();
+            // An open tab was only focused, or asked about: nothing was
+            // loaded, so its status says something else and is not judged.
+            if !loaded {
+                return Done::ok(state(app, window));
+            }
             // ⚠️ A load that failed still produces a tab. `doc_from_path`
             // substitutes an empty document and records the reason in the
             // tab's status, so the title is still the fixture's file name and
@@ -2728,6 +2796,17 @@ pub fn dispatch(
                 Some(why) => Err(format!("{raw}: {why}")),
                 None => Done::ok(state(app, window)),
             }
+        }
+
+        // The Protected View message bar's Enable Editing button (#610),
+        // which the harness has no generic way to press.
+        "enable-editing" => {
+            app.refuse_under_dialog()?;
+            if !app.tabs.get(app.active).is_some_and(|t| t.access.protected) {
+                return Err("the active tab is not in Protected View".into());
+            }
+            app.enable_editing(cx);
+            Done::ok(state(app, window))
         }
 
         // A click on a cell: press, click, release — the three events the
@@ -2860,7 +2939,12 @@ pub fn dispatch(
             let src = sheet(app)?.range();
             app.sheet_fill_start(cx);
             if app.sheet_fill.is_none() {
-                return Err(if app.sheet_protected() {
+                return Err(if app.protected_view() {
+                    format!(
+                        "the fill did not arm: {}",
+                        crate::open_mode::PROTECTED_STATUS
+                    )
+                } else if app.sheet_protected() {
                     "the fill did not arm: the sheet is protected".into()
                 } else {
                     "the fill did not arm: another gesture is in flight".into()
@@ -3387,6 +3471,7 @@ mod tests {
             bundle_html: None,
             load_failed: false,
             dialogs: crate::dialog::DialogStack::default(),
+            access: crate::open_mode::Access::default(),
         };
         let mut word = doc(crate::Kind::Docx, "a.docx");
         word.path = Some("C:/work/a.docx".into());
@@ -4560,6 +4645,25 @@ mod tests {
         ] {
             assert!(load_failed(bad), "{bad}");
         }
+    }
+
+    /// #610: Open and Repair's status names what it emptied or dropped, and
+    /// `open mode: repair` must still read it as a load that worked; a
+    /// repair that had to give up is a failed open.
+    #[test]
+    fn repair_status_is_not_a_load_failure() {
+        let dir = crate::open_mode_tests::Scratch::new();
+        let src = crate::open_mode_tests::damaged_book(&dir, "book.xlsx");
+        let tab = crate::tab_from_path_mode(&src, crate::open_mode::OpenMode::Repair).unwrap();
+        assert!(
+            tab.status.contains("emptied xl/styles.xml"),
+            "{}",
+            tab.status
+        );
+        assert!(!load_failed(&tab.status), "{}", tab.status);
+        assert!(load_failed(
+            "xlsx load error: could not repair: xl/charts/chart1.xml is damaged"
+        ));
     }
 
     #[test]

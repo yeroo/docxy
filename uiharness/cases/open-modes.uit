@@ -1,0 +1,97 @@
+# Excel's open modes for a workbook (#610): Open Read-Only, Open as Copy,
+# Open and Repair, and the question before reopening over unsaved changes.
+# Each case opens its own copy first; `call open` then names it by a
+# relative path, which resolves against the active tab's folder.
+# Protected View needs a Zone.Identifier stream no script can write, so it
+# is covered by uiharness/tests/protected_view.rs instead.
+
+test a read-only workbook saves only under a new name
+  open copy:../fixtures/basic.xlsx
+  call open {"path":"basic.xlsx","mode":"read-only"}
+  assert read_only is true
+  assert caption is basic.xlsx [Read-Only]
+  click B2
+  type 99
+  key enter
+  assert dirty is true
+  key ctrl+s
+  assert status is This workbook was opened read-only or repaired, so Save needs Save As, and a harness instance cannot open the Save As dialog; use the harness save-as verb
+  assert dirty is true
+  call-error save-as {"path":"basic.xlsx","overwrite":true} => "basic.xlsx" is read-only. Save a copy under a new name.
+  assert read_only is true
+  call save-as {"path":"mine.xlsx"}
+  assert reply.title is mine.xlsx
+  assert reply.dirty is false
+  assert read_only is false
+  assert caption is mine.xlsx
+
+test reopening a workbook with unsaved changes asks first
+  open copy:../fixtures/basic.xlsx
+  click B2
+  type 99
+  key enter
+  assert dirty is true
+  call open {"path":"basic.xlsx","reopen":"ask"}
+  assert dialog is reopen
+  call dialog-read {}
+  assert reply.text is "basic.xlsx" is already open. Reopening will cause any changes you made to be discarded. Do you want to reopen "basic.xlsx"?
+  call dialog-click {"button":"No"}
+  assert dialog is none
+  assert dirty is true
+  assert cell B2 is 99
+  call open {"path":"basic.xlsx","reopen":"ask","mode":"read-only"}
+  assert dialog is reopen
+  call dialog-click {"button":"Yes"}
+  assert dialog is none
+  assert dirty is false
+  assert read_only is true
+  assert cell B2 is 10
+
+test a clean workbook opened again in its own mode only becomes active
+  open copy:../fixtures/basic.xlsx
+  click B2
+  type 5
+  key enter
+  key ctrl+s
+  assert dirty is false
+  assert status is not loaded — 1 sheet
+  # Nothing is loaded, so the save's status is not judged as a failed load.
+  call open {"path":"basic.xlsx","reopen":"ask"}
+  assert dialog is none
+  assert read_only is false
+  call open {"path":"basic.xlsx","reopen":"ask","mode":"read-only"}
+  assert dialog is none
+  assert read_only is true
+
+test open as copy opens an editable copy beside the workbook
+  open copy:../fixtures/basic.xlsx
+  call open {"path":"basic.xlsx","mode":"copy"}
+  assert title is Copy (1)basic.xlsx
+  assert caption is Copy (1)basic.xlsx
+  assert read_only is false
+  click B2
+  type 5
+  key enter
+  key ctrl+s
+  assert dirty is false
+  call open {"path":"basic.xlsx","mode":"copy"}
+  assert title is Copy (2)basic.xlsx
+
+test open and repair of a sound workbook finds nothing to repair
+  open copy:../fixtures/basic.xlsx
+  call open {"path":"basic.xlsx","mode":"repair"}
+  assert repaired is true
+  assert caption is basic.xlsx [Repaired]
+  assert status is loaded — 1 sheet; repaired: nothing needed repairing
+  key ctrl+s
+  assert status is This workbook was opened read-only or repaired, so Save needs Save As, and a harness instance cannot open the Save As dialog; use the harness save-as verb
+
+test open refuses an unknown mode and enable-editing outside Protected View
+  open copy:../fixtures/basic.xlsx
+  call-error open {"path":"basic.xlsx","mode":"readonly"} => 'mode' must be normal, read-only, copy or repair
+  call-error enable-editing {} => the active tab is not in Protected View
+  assert protected is false
+
+test a relative open path needs a tab with a folder
+  call proj.new {}
+  call-error open {"path":"basic.xlsx"} => never been saved, so a relative 'path' has no folder

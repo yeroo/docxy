@@ -190,14 +190,16 @@ everything a case leaves behind sets the dirty flag — an uncommitted in-cell
 edit, the selection, the scroll position — so reloading only the dirty ones
 would carry the rest into the next case, and a case would pass or fail on the
 order it ran in. (A normal instance still asks before discarding unsaved work,
-and still keeps it if you say no.)
+and still keeps it if you say no; `open`'s `reopen: "ask"` asks the same
+question, as an app dialog — see [Open modes](#open-modes-and-protected-view).)
 
 ⚠️ **No modal dialog may sit on a path a verb can reach.** `rfd` runs its own
 message loop on the app thread, which stops the control pump dead — the window
 keeps answering Windows messages so it *looks* alive, while every verb after it
-times out with nothing on stderr to say why. The reload prompt, the Save As
-dialog a `key ctrl+s` on a never-saved workbook would raise, and the
-unsaved-changes prompt on close are each gated on `harness.is_none()`; anything
+times out with nothing on stderr to say why. The Save As
+dialog a `key ctrl+s` on a never-saved or read-only workbook would raise, and the
+unsaved-changes prompt on close are each gated on `harness.is_none()` (the
+reopen question is an app dialog now, see [Dialogs](#dialogs)); anything
 new in that family needs the same guard, and should refuse in words instead
 (`tab.status`), which a case can read. Save As itself is driven with the
 [`save-as`](#save-as-the-clipboard-and-the-fill-handle) verb, which hands the
@@ -279,6 +281,7 @@ State keys, as the app reports them after every driving verb:
 | Key | |
 |---|---|
 | `tab`, `title`, `dirty`, `status`, `sheet_tab` | the active tab |
+| `caption`, `read_only`, `protected`, `repaired` | the active tab's caption as the strip draws it (`book.xlsx [Read-Only]`) and its open mode; see [Open modes](#open-modes-and-protected-view) |
 | `app_state` | a Project tab's status-bar state, `Ready`, `Edit` (a cell editor, prompt or dialog is open) or `Busy` (a levelling pass is pending); `null` on other tabs |
 | `dialog` | the active tab's top dialog's id, or `none`, on every surface; `dialog-click`'s reply carries the `dialog-read` object under this key instead |
 | `tabs`, `ask_on_close` | open tab count and whether window close asks about unsaved changes |
@@ -378,7 +381,7 @@ footer editor; `selection-set` refuses while it is open.
 | `theme-set {"theme":"dark"}` | set the window theme as the title bar's theme button does (`light`, `dark` or `auto`); replies with the preference and the mode it resolved to |
 | `title-bar {}` | read the measured title content, active chip, tab strip, theme button and drag space; reports tab count, active/first/visible indices, layout mode, `overflow`, `controls_clear`, `active_visible`, `active_dirty_visible` (the active tab is dirty and its bullet lies inside the chip), `theme_visible`, `drag_w`, `drag_ok`, and logical-pixel right edges. `caption_left` comes from a separate probe of Root's inner box minus the pinned caption-control width (102 px on Windows/Linux, zero on macOS) |
 | `title-tab {"action":"prev"}` | use the previous/next overflow arrow's tab-selection handler; `more` toggles the dropdown only while its button is shown (overflow or more-only), and `pick` with an `index` selects a tab after `more` has opened the list |
-| `tab-list {}` | read every open tab in strip order: `{active, tabs:[{index, title, kind, path, dirty, imported}]}`. `kind` is `docx`, `xlsx`, `project` or `mail`; `path` is `null` for a tab never saved; `imported` is true only for a Project read from `.mpp` |
+| `tab-list {}` | read every open tab in strip order: `{active, tabs:[{index, title, kind, path, dirty, imported, caption, read_only, protected, repaired}]}`. `kind` is `docx`, `xlsx`, `project` or `mail`; `path` is `null` for a tab never saved; `imported` is true only for a Project read from `.mpp` |
 | `tab-select {"tab":"schedule"}` | make a tab active as clicking its chip does, and reply with the state. `tab` is an index or a case-insensitive title/path substring over **all** tabs, the rule the `proj.*` verbs use; a miss (`no tab matches 'x'`), an ambiguous match (`several tabs match 'x' (2, 3)`) and an index past the end (`no tab at index 9`) are refused. The Backstage stays as it was, as it does for a chip click |
 | `proj.new {}` | make a blank Project and activate it, as Backstage › New › Project does; replies with `proj.path` for it (`tab`, `path: null`, `name: Project1`, 0 `tasks`, `imported`, the cell state). It takes no `tab` and no `name`: the plan is the app's, so name it by saving it (`proj.save {"path":…}`). The Project control server accepts it too |
 | `window-size {"w":600,"h":700}` | resize the harness window in logical pixels; accepts width 300..4096 and height 200..4096 |
@@ -643,12 +646,58 @@ the source. Refused:
   after `from`'s click, which takes the selection back as the pointer's would.
   A handle hidden under a chart card is decided by layout and is not
   modelled;
-- when the press does not arm a fill: `the fill did not arm: the sheet is
+- when the press does not arm a fill: `the fill did not arm: Protected View —
+  select Enable Editing to edit` (#610), `the fill did not arm: the sheet is
   protected` (a protected sheet refuses a fill from the pointer too), or
   `… another gesture is in flight`;
 - an `option`: `AutoFill Options are not implemented in this app`.
 
 `sheet-fill.uit` covers these.
+
+### Open modes and Protected View
+
+Excel's ways of opening a workbook (#610) go through the `open` verb, the
+same `open_path` the backstage's Open Read-Only…, Open as Copy… and Open and
+Repair… call after their file pick:
+
+| Call | Effect |
+|---|---|
+| `open {"path":"book.xlsx","mode":"read-only"}` | `mode` is `normal` (the default), `read-only`, `copy` or `repair`; a document or Project ignores it |
+| `open {"path":"book.xlsx","reopen":"ask"}` | a person's open of a file already open: a dirty tab asks first (the `reopen` dialog), a clean one reloads only in another mode |
+| `enable-editing {}` | the PROTECTED VIEW message bar's Enable Editing button; refused off a protected tab |
+
+A relative `path` resolves against the active tab's folder, as `save-as`'s
+does, so after `open copy:` a case names its own copy; with no saved tab
+active it is refused (`… never been saved, so a relative 'path' has no
+folder …`), never resolved against the working directory. An open that
+only focuses a tab or asks about it loads nothing, so the tab's status is
+not judged as a load. `open` still reloads a
+file that is already open without asking unless `reopen` is `"ask"` (see
+`open` above). The modes, as the state's `read_only`, `repaired` and
+`protected` report them:
+
+- **read-only**: Save goes to Save As. A harness instance refuses `key
+  ctrl+s` in words (`… opened read-only or repaired, so Save needs Save As …`);
+  `save-as` over the tab's own file is refused (`"book.xlsx" is read-only.
+  Save a copy under a new name.`), and to any other path it writes, rebinds
+  the tab and clears `read_only`.
+- **copy**: writes `Copy (1)book.xlsx` beside the file (the first free
+  `Copy (k)`) and opens that as an ordinary tab. The copy carries the
+  source's `Zone.Identifier` stream, so a copy of a downloaded file stays
+  downloaded. A copy that cannot be written, or a copy of a downloaded file
+  that cannot be marked as one (or whose own mark cannot be read), opens
+  nothing (the unmarked copy is removed) and is the error. A template opens
+  as a new, untitled workbook in every mode, so Copy writes no file for it.
+- **repair**: a lenient load (`gridcore::xlsx::load_xlsx_repair`); the
+  status still starts with `loaded` and names what was emptied or dropped.
+  Save goes to Save As, which may pick the file itself.
+- **Protected View** is the file's, not a mode: a workbook whose
+  `Zone.Identifier` stream says zone 3 or 4 opens protected in every mode,
+  Copy included, and so does that copy when it is opened again later. Edits and saves are refused with `Protected View — select
+  Enable Editing to edit`. A script cannot write that stream, so
+  `uiharness/tests/protected_view.rs` (desktop-only, `--ignored`) covers it.
+
+`open-modes.uit` covers the rest.
 
 ### Dialogs
 
@@ -656,8 +705,21 @@ A dialog is app state on its document tab, **never a native modal loop**, so the
 control pump cannot block on one (#393). Dialogs stack: a button can open a
 child over its parent, and only the top one takes input. The window draws the
 top dialog over a backdrop that covers everything, title bar and ribbon
-included. The only dialog today is the Project `delete-summary` message box;
-`project-dialog.uit` drives it.
+included. Each has a stable id, which the state's `dialog` key reports:
+
+| Id | Dialog |
+|---|---|
+| `delete-summary` | Project: delete a summary task and its subtasks (`project-dialog.uit`) |
+| `page-setup`, `columns` | Word's Page Setup and Columns (#649) |
+| `hf-distance`, `page-number-format` | the Header & Footer tab's distance box (#641) and Page Number Format (#650) |
+| `insert-table`, `delete-cells`, `split-cells`, `sort`, `convert-to-text`, `convert-text-to-table` | the table dialogs (#646, #647) |
+| `text-to-columns`, `text-to-columns-replace` | Excel's Convert Text to Columns Wizard and its replace question (#692) |
+| `reopen` | "… is already open … Do you want to reopen …?" before an open discards a workbook's unsaved changes (#610) |
+
+`reopen`'s **Yes** is not an undo step and applies nothing to the tab: it
+loads the tab again from its file, in the open mode that was asked for
+(read-only, repaired or normal), and the unsaved changes are gone. **No**
+closes it and keeps the tab as it was. `open-modes.uit` drives it.
 
 There is no `dialog-open`. A dialog opens through the verb a person would use
 (`key`, `ribbon-click`, `click-cell {double}`), so a case covers the real entry
@@ -729,8 +791,8 @@ While a dialog is open on the active tab:
   so `key` and `type` drive the widgets the way a person does.
 - **Pointer verbs are refused** with `a dialog is open: <title>`: `click-cell`,
   `drag`, `fill-drag`, `save-as`, `ribbon-click`, `select-chart`, `focus-field`, `title-tab`,
-  `tab-select`, `proj.new`, `backstage {open}`, `backstage-close`, `close-tab`
-  and `selection-set`.
+  `tab-select`, `proj.new`, `backstage {open}`, `backstage-close`, `close-tab`,
+  `selection-set` and `enable-editing`.
 - The state reads `dialog: <id>` (`none` on every surface when nothing is open),
   and a Project's `app_state` reads `Edit`.
 - A control-pipe edit, reload or save of that Project dismisses its dialogs
@@ -821,7 +883,7 @@ stands for a press outside the menu (`click-cell`, `drag`, `fill-drag`,
 `save-as`, `select-chart`,
 `focus-field`, `ribbon-click`, `title-tab`, `close-tab`, `selection-set`,
 `open`, `backstage` open and close (not `read`), `backstage-close`,
-`theme-set`, `ask-on-close`, `autorecover` and the
+`theme-set`, `ask-on-close`, `autorecover`, `enable-editing` and the
 `dialog-*` drivers), which closes it first and then goes on, as the press
 would. Reads leave it open.
 
