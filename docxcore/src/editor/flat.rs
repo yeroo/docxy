@@ -163,9 +163,9 @@ fn inline_chars(inline: &Inline) -> String {
             out
         }
         Inline::Tab(_) => "\t".into(),
-        Inline::Break(BreakKind::Line | BreakKind::Clear(_)) => "\u{000b}".into(),
-        Inline::Break(BreakKind::Page) => "\u{000c}".into(),
-        Inline::Break(BreakKind::Column) => "\u{000e}".into(),
+        Inline::Break(BreakKind::Line | BreakKind::Clear(_), _) => "\u{000b}".into(),
+        Inline::Break(BreakKind::Page, _) => "\u{000c}".into(),
+        Inline::Break(BreakKind::Column, _) => "\u{000e}".into(),
         // A field showing a result is one caret unit, edited as a whole.
         Inline::Field { text, .. } if !text.is_empty() => super::FIELD_CHAR.into(),
         // The editor assigns zero caret units to revision wrappers and other
@@ -241,9 +241,9 @@ mod tests {
                 para(vec![
                     run("a😀"),
                     Inline::Tab(RunProps::default()),
-                    Inline::Break(BreakKind::Line),
-                    Inline::Break(BreakKind::Page),
-                    Inline::Break(BreakKind::Column),
+                    Inline::Break(BreakKind::Line, RunProps::default()),
+                    Inline::Break(BreakKind::Page, RunProps::default()),
+                    Inline::Break(BreakKind::Column, RunProps::default()),
                     Inline::Field {
                         raw: String::new(),
                         text: "shown".into(),

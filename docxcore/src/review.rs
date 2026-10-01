@@ -305,7 +305,7 @@ fn transform_inline(
             }
             result
         }
-        Inline::Tab(props) => transform_run_props(props, target, action),
+        Inline::Tab(props) | Inline::Break(_, props) => transform_run_props(props, target, action),
         Inline::TextBox { blocks, .. } => transform_blocks(blocks, target, action),
         Inline::Revision {
             content,
@@ -318,8 +318,7 @@ fn transform_inline(
             }
             result
         }
-        Inline::Break(_)
-        | Inline::SmartArt { .. }
+        Inline::SmartArt { .. }
         | Inline::Chart { .. }
         | Inline::Equation { .. }
         | Inline::Field { .. }
@@ -797,7 +796,7 @@ fn strip_revision_cue(inline: &mut Inline, kind: RevisionKind, normalize_deleted
                 strip_revision_cue(child, kind, normalize_deleted);
             }
         }
-        Inline::Tab(props) => strip(props),
+        Inline::Tab(props) | Inline::Break(_, props) => strip(props),
         Inline::Revision { content, .. } => {
             for child in content {
                 // Nested revision raw remains authoritative until that nested
@@ -816,8 +815,7 @@ fn strip_revision_cue(inline: &mut Inline, kind: RevisionKind, normalize_deleted
         {
             normalize_deleted_text(raw);
         }
-        Inline::Break(_)
-        | Inline::TextBox { .. }
+        Inline::TextBox { .. }
         | Inline::SmartArt { .. }
         | Inline::Chart { .. }
         | Inline::Equation { .. }

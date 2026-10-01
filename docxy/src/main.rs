@@ -1629,9 +1629,7 @@ impl App {
                 self.status = Some("Inserted page number".to_string());
             }
             PageBreak => {
-                self.editor.paste(&Clip {
-                    paras: vec![vec![Inline::Break(BreakKind::Page)]],
-                });
+                self.editor.insert_break(BreakKind::Page);
                 self.after_edit();
                 self.status = Some("Inserted page break".to_string());
             }
@@ -6627,7 +6625,7 @@ fn clip_has_formatting(clip: &Clip) -> bool {
             Inline::Tab(props) => *props != RunProps::default(),
             Inline::Revision { content, .. } => content.iter().any(inline_has_formatting),
             Inline::TextBox { blocks, .. } => blocks_have_formatting(blocks),
-            Inline::Break(_)
+            Inline::Break(..)
             | Inline::SmartArt { .. }
             | Inline::Chart { .. }
             | Inline::Equation { .. }
@@ -7921,7 +7919,7 @@ mod tests {
                     text: "first page".to_string(),
                     props: RunProps::default(),
                 }),
-                Inline::Break(BreakKind::Page),
+                Inline::Break(BreakKind::Page, RunProps::default()),
                 Inline::Run(Run {
                     text: "second page".to_string(),
                     props: RunProps::default(),
@@ -11667,7 +11665,7 @@ mod tests {
         let mut app = app_with(&["text"]);
         app.editor.move_end();
         app.run_act(ribbon::Act::PageBreak);
-        let has_break = app.editor.doc.body.iter().any(|b| matches!(b, Block::Paragraph(p) if p.content.iter().any(|i| matches!(i, Inline::Break(BreakKind::Page)))));
+        let has_break = app.editor.doc.body.iter().any(|b| matches!(b, Block::Paragraph(p) if p.content.iter().any(|i| matches!(i, Inline::Break(BreakKind::Page, _)))));
         assert!(has_break, "no page break inserted");
     }
 

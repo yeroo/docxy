@@ -215,7 +215,12 @@ fn breaks_go_in_at_the_caret() {
         let Block::Paragraph(p) = &ed(&t).doc.body[1] else {
             panic!()
         };
-        assert!(p.content.contains(&Inline::Break(kind)), "{choice:?}");
+        assert!(
+            p.content
+                .iter()
+                .any(|i| matches!(i, Inline::Break(k, _) if *k == kind)),
+            "{choice:?}"
+        );
     }
     let mut t = three_sections();
     apply(
@@ -310,10 +315,10 @@ fn everything_survives_save_and_reopen() {
             .iter()
             .any(|r| r.contains("suppressLineNumbers"))
     );
-    assert!(
-        p.content
-            .contains(&Inline::Break(BreakKind::Clear(ClearKind::All)))
-    );
+    assert!(p.content.contains(&Inline::Break(
+        BreakKind::Clear(ClearKind::All),
+        RunProps::default()
+    )));
 }
 
 #[test]

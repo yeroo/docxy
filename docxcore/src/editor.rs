@@ -1984,7 +1984,7 @@ fn collect_inline_revision_positions_at(
                     true,
                 );
             }
-            Inline::Tab(props) => {
+            Inline::Tab(props) | Inline::Break(_, props) => {
                 let end = if forced.is_some() {
                     point.clone()
                 } else {
@@ -2022,8 +2022,7 @@ fn collect_inline_revision_positions_at(
                     end: point.clone(),
                 });
             }
-            Inline::Break(_)
-            | Inline::SmartArt { .. }
+            Inline::SmartArt { .. }
             | Inline::Chart { .. }
             | Inline::Equation { .. }
             | Inline::Field { .. }
@@ -2186,7 +2185,7 @@ pub fn inline_len(i: &Inline) -> usize {
     match i {
         Inline::Run(r) => r.text.chars().count(),
         Inline::Hyperlink(h) => link_runs_len(h) + h.content.iter().map(inline_len).sum::<usize>(),
-        Inline::Tab(_) | Inline::Break(_) => 1,
+        Inline::Tab(_) | Inline::Break(..) => 1,
         Inline::Field { text, .. } => usize::from(!text.is_empty()),
         // Zero-length, invisible in the editor (preserved for save only).
         Inline::SmartArt { .. }
@@ -2221,7 +2220,7 @@ fn push_editor_text(content: &[Inline], out: &mut String) {
                 push_editor_text(&h.content, out);
             }
             Inline::Tab(_) => out.push('\t'),
-            Inline::Break(_) => out.push('\n'),
+            Inline::Break(..) => out.push('\n'),
             Inline::Field { text, .. } => {
                 if !text.is_empty() {
                     out.push(FIELD_CHAR);
@@ -2433,7 +2432,7 @@ fn extract_range(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
                 }
             }
             Inline::Tab(rp) => out.push(Inline::Tab(rp.clone())),
-            Inline::Break(k) => out.push(Inline::Break(*k)),
+            Inline::Break(k, rp) => out.push(Inline::Break(*k, rp.clone())),
             Inline::SmartArt { raw, text } => out.push(Inline::SmartArt {
                 raw: raw.clone(),
                 text: text.clone(),
@@ -2621,7 +2620,7 @@ fn content_insert(content: &mut Vec<Inline>, o: usize, ch: char) {
             }
         },
         Inline::Tab(_)
-        | Inline::Break(_)
+        | Inline::Break(..)
         | Inline::SmartArt { .. }
         | Inline::Chart { .. }
         | Inline::Equation { .. }
@@ -2669,14 +2668,14 @@ fn locate(content: &[Inline], o: usize) -> Option<(usize, usize)> {
     None
 }
 
-/// The formatting an inline hands to text typed next to it: a run's, or a
-/// tab's (a tab is a run in OOXML and keeps its `w:rPr`). Hyperlinks, breaks
-/// and zero-width inlines are not sources; a link's style is not extended to
-/// text typed outside the link.
+/// The formatting an inline hands to text typed next to it: a run's, a tab's
+/// or a break's (each is a run in OOXML and keeps its `w:rPr`). Hyperlinks and
+/// zero-width inlines are not sources; a link's style is not extended to text
+/// typed outside the link.
 fn source_props(inline: &Inline) -> Option<&RunProps> {
     match inline {
         Inline::Run(r) => Some(&r.props),
-        Inline::Tab(props) => Some(props),
+        Inline::Tab(props) | Inline::Break(_, props) => Some(props),
         _ => None,
     }
 }
@@ -2698,15 +2697,14 @@ fn source_from(content: &[Inline], i: usize) -> Option<&RunProps> {
 /// `i` takes, following Word (the formatting of the character before it; at
 /// the paragraph start, of the character after it):
 /// - at the paragraph start (`local == 0`): the nearest source at or after `i`;
-/// - after a tab: the tab's own formatting;
-/// - after a break (which records none): the run or tab right after it, the
-///   rest of the break's own run in a loaded document; failing that, the
-///   nearest source before, then after, the break.
+/// - after a tab or a break: its own formatting (#279);
+/// - after a zero-width inline: the run or tab right after it; failing that,
+///   the nearest source before, then after, it.
 fn typing_props(content: &[Inline], i: usize, local: usize) -> RunProps {
     if local == 0 {
         return source_from(content, i).cloned().unwrap_or_default();
     }
-    if let Inline::Tab(props) = &content[i] {
+    if let Inline::Tab(props) | Inline::Break(_, props) = &content[i] {
         return props.clone();
     }
     content
@@ -2760,7 +2758,7 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
                     }
                 }
                 Inline::Tab(_)
-                | Inline::Break(_)
+                | Inline::Break(..)
                 | Inline::SmartArt { .. }
                 | Inline::Chart { .. }
                 | Inline::Equation { .. }
@@ -2864,14 +2862,14 @@ fn range_all_have_at(
                     return false;
                 }
             }
-            // A tab is a formatted character (see `edit_run_range`).
-            Inline::Tab(props) => {
+            // A tab or a break is a formatted character (see `edit_run_range`).
+            Inline::Tab(props) | Inline::Break(_, props) => {
                 if !check(props, 1, pos, saw) {
                     return false;
                 }
             }
-            // Not formatted characters: a field keeps its own result formatting.
-            Inline::Break(_) | Inline::Field { .. } => *pos += inline_len(inline),
+            // Not a formatted character: a field keeps its own result formatting.
+            Inline::Field { .. } => *pos += inline_len(inline),
             Inline::SmartArt { .. }
             | Inline::Chart { .. }
             | Inline::Equation { .. }
@@ -2983,8 +2981,15 @@ fn edit_run_range_at(
                 out.push(Inline::Tab(rp));
                 *pos += 1;
             }
-            Inline::Break(k) => {
-                out.push(Inline::Break(k));
+            // A break is a run in OOXML too: it takes the formatting like a
+            // tab does, so text typed after it keeps it (#279).
+            Inline::Break(k, rp) => {
+                let rp = if (start..end).contains(pos) {
+                    mid_fn("\n", &rp).props
+                } else {
+                    rp
+                };
+                out.push(Inline::Break(k, rp));
                 *pos += 1;
             }
             // A field (one offset, its result formatting its own) or a
@@ -3085,9 +3090,10 @@ fn run_props_at(content: &[Inline], offset: usize) -> RunProps {
     }
 }
 
-/// Run properties a tab inserted at this caret takes: what typing there would
-/// give, except next to a hyperlink. The tab never lands inside the link, so
-/// it takes the nearest source before the link rather than the link's style.
+/// Run properties a tab (or a break) inserted at this caret takes: what typing
+/// there would give, except next to a hyperlink. The tab never lands inside
+/// the link, so it takes the nearest source before the link rather than the
+/// link's style.
 fn tab_props_at(content: &[Inline], offset: usize) -> RunProps {
     match locate(content, offset) {
         Some((i, _)) if matches!(content[i], Inline::Hyperlink(_)) => {
@@ -3125,10 +3131,21 @@ mod tests {
         ];
         assert!(!run_props_at(&with_tab, 0).bold);
         assert!(!run_props_at(&with_tab, 1).bold);
-        // No run before the break: typing takes the next text run's props (#120).
-        let with_break = vec![Inline::Break(BreakKind::Line), content[1].clone()];
-        assert!(run_props_at(&with_break, 0).bold);
-        assert!(run_props_at(&with_break, 1).bold);
+        // A break is a formatted character, like a tab (#279): typing before
+        // it (the character after) and right after it takes its own props.
+        let with_break = vec![
+            Inline::Break(BreakKind::Line, RunProps::default()),
+            content[1].clone(),
+        ];
+        assert!(!run_props_at(&with_break, 0).bold);
+        assert!(!run_props_at(&with_break, 1).bold);
+        let bold = RunProps {
+            bold: true,
+            ..Default::default()
+        };
+        let with_bold_break = vec![Inline::Break(BreakKind::Line, bold), content[0].clone()];
+        assert!(run_props_at(&with_bold_break, 0).bold);
+        assert!(run_props_at(&with_bold_break, 1).bold);
         let with_empty = vec![
             Inline::Run(Run {
                 text: String::new(),
@@ -3157,7 +3174,7 @@ mod tests {
                 }),
             ],
             vec![
-                Inline::Break(BreakKind::Line),
+                Inline::Break(BreakKind::Line, RunProps::default()),
                 Inline::Run(Run {
                     text: "x".into(),
                     props: bold.clone(),
@@ -3182,9 +3199,9 @@ mod tests {
     }
 
     /// Word's rule next to a tab, break or zero-width inline (#120): a typed
-    /// character takes the formatting of the character before it (a tab's own,
-    /// or for a break the rest of its run after it); at the paragraph start,
-    /// that of the character after it. `run_props_at` must predict exactly what
+    /// character takes the formatting of the character before it (a tab's or a
+    /// break's own, #279); at the paragraph start, that of the character after
+    /// it. `run_props_at` must predict exactly what
     /// the insert produces.
     #[test]
     fn typing_next_to_a_non_run_follows_words_rule_120() {
@@ -3204,26 +3221,42 @@ mod tests {
                 false,
             ),
             (
-                "after a trailing line break",
-                vec![run("Name", bold()), Inline::Break(BreakKind::Line)],
+                "after a trailing bold line break",
+                vec![run("Name", bold()), Inline::Break(BreakKind::Line, bold())],
                 5,
                 true,
             ),
             (
-                "after a break, the rest of its own run follows (r1)",
+                "after a plain break in its own run, before a zero-width inline (#279)",
                 vec![
-                    run("a", plain()),
-                    Inline::Break(BreakKind::Line),
-                    run("b", bold()),
+                    run("Name", bold()),
+                    Inline::Break(BreakKind::Line, plain()),
+                    go_back(),
                 ],
-                2,
+                5,
+                false,
+            ),
+            (
+                "after a bold break, before a plain run (#279)",
+                vec![Inline::Break(BreakKind::Line, bold()), run("x", plain())],
+                1,
                 true,
             ),
             (
-                "after a break, a tab from its own run follows",
+                "after a plain break, the next run does not win (#279)",
                 vec![
                     run("a", plain()),
-                    Inline::Break(BreakKind::Line),
+                    Inline::Break(BreakKind::Line, plain()),
+                    run("b", bold()),
+                ],
+                2,
+                false,
+            ),
+            (
+                "after a bold break, before a bold tab",
+                vec![
+                    run("a", plain()),
+                    Inline::Break(BreakKind::Line, bold()),
                     Inline::Tab(bold()),
                     run("x", bold()),
                 ],
@@ -3271,8 +3304,14 @@ mod tests {
                 false,
             ),
             (
-                "before a leading break, skipped",
-                vec![Inline::Break(BreakKind::Line), run("x", bold())],
+                "before a leading plain break: the break is the character after",
+                vec![Inline::Break(BreakKind::Line, plain()), run("x", bold())],
+                0,
+                false,
+            ),
+            (
+                "before a leading bold break",
+                vec![Inline::Break(BreakKind::Line, bold()), run("x", plain())],
                 0,
                 true,
             ),
@@ -3326,7 +3365,7 @@ mod tests {
         );
         let mut after_break = vec![
             run("a", plain()),
-            Inline::Break(BreakKind::Line),
+            Inline::Break(BreakKind::Line, bold()),
             run("b", bold()),
         ];
         content_insert(&mut after_break, 2, 'z');
@@ -3334,8 +3373,25 @@ mod tests {
             after_break,
             vec![
                 run("a", plain()),
-                Inline::Break(BreakKind::Line),
+                Inline::Break(BreakKind::Line, bold()),
                 run("zb", bold()),
+            ]
+        );
+        // A plain break before a bold run: the typed char is plain, its own
+        // run (#279).
+        let mut differs_break = vec![
+            run("a", plain()),
+            Inline::Break(BreakKind::Line, plain()),
+            run("b", bold()),
+        ];
+        content_insert(&mut differs_break, 2, 'z');
+        assert_eq!(
+            differs_break,
+            vec![
+                run("a", plain()),
+                Inline::Break(BreakKind::Line, plain()),
+                run("z", plain()),
+                run("b", bold()),
             ]
         );
     }
@@ -4126,6 +4182,125 @@ mod tests {
         ed.select_match(&ms[0]);
         ed.replace_current_with("three");
         assert_eq!(top_text(&ed), vec!["one three"]);
+    }
+
+    // ---- #279: a break keeps its run's formatting ----
+
+    /// The text run that holds the typed `z`'s formatting.
+    fn typed_props(ed: &Editor) -> RunProps {
+        first_para(ed)
+            .content
+            .iter()
+            .find_map(|i| match i {
+                Inline::Run(r) if r.text.contains('z') => Some(r.props.clone()),
+                _ => None,
+            })
+            .expect("no run holds the typed char")
+    }
+
+    /// The issue's examples, as loaded: typing right after a break takes the
+    /// break's own run formatting (Word's rule), and `run_props_at` predicts
+    /// exactly what the insert gives.
+    #[test]
+    fn typing_after_a_break_takes_its_runs_formatting_279() {
+        let cases = [
+            (
+                "<w:r><w:rPr><w:b/></w:rPr><w:t>Name</w:t></w:r><w:r><w:br/></w:r>\
+                 <w:bookmarkStart w:id=\"0\" w:name=\"_GoBack\"/>",
+                false,
+            ),
+            (
+                "<w:r><w:rPr><w:b/></w:rPr><w:br/></w:r><w:r><w:t>x</w:t></w:r>",
+                true,
+            ),
+        ];
+        for (xml, want_bold) in cases {
+            let mut ed = Editor::new(xml_doc(xml));
+            let after = etext(&ed).chars().position(|c| c == '\n').unwrap() + 1;
+            ed.caret = Caret::at(vec![0], after);
+            let predicted = ed.caret_props();
+            assert_eq!(predicted.bold, want_bold, "{xml}");
+            ed.insert_char('z');
+            assert_eq!(typed_props(&ed), predicted, "{xml}");
+        }
+    }
+
+    /// Formatting a selection that covers a break formats the break too, so
+    /// text typed after it keeps the formatting (#279 r0).
+    #[test]
+    fn bold_over_a_break_reaches_the_break_279() {
+        let mut ed = Editor::new(xml_doc(
+            "<w:r><w:t>Name</w:t><w:br/></w:r><w:bookmarkStart w:id=\"0\" w:name=\"_GoBack\"/>",
+        ));
+        ed.anchor = Some(Caret::at(vec![0], 0));
+        ed.caret = Caret::at(vec![0], 5);
+        ed.toggle_bold();
+        assert!(
+            matches!(&first_para(&ed).content[1], Inline::Break(_, rp) if rp.bold),
+            "{:?}",
+            first_para(&ed).content
+        );
+        ed.clear_selection();
+        ed.caret = Caret::at(vec![0], 5);
+        assert!(ed.caret_props().bold);
+        ed.insert_char('z');
+        assert!(typed_props(&ed).bold);
+        // The whole range now counts as bold, so the toggle turns it off,
+        // break included.
+        ed.anchor = Some(Caret::at(vec![0], 0));
+        ed.caret = Caret::at(vec![0], 5);
+        ed.toggle_bold();
+        assert!(matches!(&first_para(&ed).content[1], Inline::Break(_, rp) if !rp.bold));
+    }
+
+    /// A break inserted in bold text is bold (like a tab), typing after it
+    /// stays bold, and copying it keeps its formatting.
+    #[test]
+    fn an_inserted_break_takes_the_typing_formatting_279() {
+        let mut ed = Editor::new(Document {
+            body: vec![Block::Paragraph(Paragraph {
+                props: ParProps::default(),
+                content: vec![run("Name", bold())],
+            })],
+        });
+        ed.caret = Caret::at(vec![0], 4);
+        ed.insert_break(BreakKind::Page);
+        assert_eq!(
+            first_para(&ed).content[1],
+            Inline::Break(BreakKind::Page, bold())
+        );
+        assert!(ed.caret_props().bold);
+        ed.anchor = Some(Caret::at(vec![0], 4));
+        let clip = ed.copy().unwrap();
+        assert_eq!(
+            clip.paras,
+            vec![vec![Inline::Break(BreakKind::Page, bold())]]
+        );
+        ed.clear_selection();
+        ed.insert_char('z');
+        assert_eq!(etext(&ed), "Name\nz");
+        assert!(typed_props(&ed).bold);
+    }
+
+    /// A break inside a tracked insertion carries the insertion's display cue
+    /// like any run; accepting the insertion clears it from the break too.
+    #[test]
+    fn accepting_an_insertion_clears_its_cue_from_a_break_279() {
+        let mut ed = Editor::new(xml_doc(
+            "<w:r><w:t>a</w:t></w:r><w:ins w:id=\"1\" w:author=\"A\"><w:r><w:br/></w:r></w:ins>",
+        ));
+        fn break_props(content: &[Inline]) -> Option<RunProps> {
+            content.iter().find_map(|i| match i {
+                Inline::Break(_, rp) => Some(rp.clone()),
+                Inline::Revision { content, .. } => break_props(content),
+                _ => None,
+            })
+        }
+        let shown = break_props(&first_para(&ed).content).expect("the inserted break");
+        assert!(shown.underline && shown.revision_cues.underline_added);
+        ed.accept_all_revisions();
+        let accepted = break_props(&first_para(&ed).content).expect("the accepted break");
+        assert_eq!(accepted, RunProps::default());
     }
 
     // ---- #197: find / replace in editor offsets around zero-width inlines ----
@@ -4978,7 +5153,7 @@ mod tests {
             match i {
                 Inline::Run(_) => "Run",
                 Inline::Hyperlink(_) => "Hyperlink",
-                Inline::Break(_) => "Break",
+                Inline::Break(..) => "Break",
                 Inline::Tab(_) => "Tab",
                 Inline::SmartArt { .. } => "SmartArt",
                 Inline::Chart { .. } => "Chart",
@@ -5022,7 +5197,7 @@ mod tests {
                     },
                     Inline::Hyperlink(Hyperlink {
                         content: vec![
-                            Inline::Break(BreakKind::Line),
+                            Inline::Break(BreakKind::Line, RunProps::default()),
                             run("nested", RunProps::default()),
                         ],
                         ..Default::default()
@@ -5030,7 +5205,7 @@ mod tests {
                 ],
                 ..Default::default()
             }),
-            Inline::Break(BreakKind::Line),
+            Inline::Break(BreakKind::Line, RunProps::default()),
             Inline::Tab(RunProps::default()),
             Inline::SmartArt {
                 raw: String::new(),

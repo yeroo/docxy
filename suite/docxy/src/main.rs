@@ -13630,9 +13630,7 @@ impl Docxy {
 
     fn insert_page_break(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.with_editor(window, cx, |e| {
-            e.paste(&Clip {
-                paras: vec![vec![Inline::Break(docxcore::model::BreakKind::Page)]],
-            })
+            e.insert_break(docxcore::model::BreakKind::Page)
         });
     }
 
@@ -18387,7 +18385,7 @@ fn emit_run(
 /// is the engine's `inline_len` for those pieces; `paragraph_el` asserts it.
 fn caret_advance(inline: &Inline) -> usize {
     match inline {
-        Inline::Run(_) | Inline::Tab(_) | Inline::Break(_) | Inline::Field { .. } => {
+        Inline::Run(_) | Inline::Tab(_) | Inline::Break(..) | Inline::Field { .. } => {
             docxcore::editor::inline_len(inline)
         }
         _ => 0,
@@ -18626,7 +18624,7 @@ fn block_height_est(b: &Block, content_w: f32) -> f32 {
             let breaks = p
                 .content
                 .iter()
-                .filter(|i| matches!(i, Inline::Break(_)))
+                .filter(|i| matches!(i, Inline::Break(..)))
                 .count() as f32;
             let lines = (chars / cpl).ceil().max(1.0) + breaks;
             lines * lh
@@ -18699,7 +18697,7 @@ fn ruler_para_of(tab: &DocTab) -> (EffIndent, Vec<docxcore::model::TabStop>) {
 
 /// Does this block force a page break (a `w:br` of type page)?
 fn has_page_break(b: &Block) -> bool {
-    matches!(b, Block::Paragraph(p) if p.content.iter().any(|i| matches!(i, Inline::Break(docxcore::model::BreakKind::Page))))
+    matches!(b, Block::Paragraph(p) if p.content.iter().any(|i| matches!(i, Inline::Break(docxcore::model::BreakKind::Page, _))))
 }
 
 /// Group top-level block indices into pages by accumulated estimated height,
@@ -18942,7 +18940,7 @@ fn paragraph_el(
         items[from..]
             .iter()
             .map(|(it, _)| &**it)
-            .take_while(|it| !matches!(it, Inline::Tab(_) | Inline::Break(_)))
+            .take_while(|it| !matches!(it, Inline::Tab(_) | Inline::Break(..)))
             .map(&inline_w)
             .sum()
     };
@@ -19006,7 +19004,7 @@ fn paragraph_el(
                 );
                 x += w;
             }
-            Inline::Break(_) => {
+            Inline::Break(..) => {
                 emit_break(&mut spans, &mut idx, &mut caret);
                 x = 0.0; // a hard break restarts the line
             }
@@ -32413,7 +32411,10 @@ mod flat_inlines_tests {
                     text: "F".into(),
                 },
                 Inline::Hyperlink(Hyperlink {
-                    content: vec![Inline::Break(BreakKind::Line), run("toso")],
+                    content: vec![
+                        Inline::Break(BreakKind::Line, RunProps::default()),
+                        run("toso"),
+                    ],
                     ..Hyperlink::default()
                 }),
             ],

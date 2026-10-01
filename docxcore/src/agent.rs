@@ -319,11 +319,10 @@ pub fn blocks_carry_formatting(blocks: &[Block]) -> bool {
                 link.runs.iter().any(|run| run.props != RunProps::default())
                     || link.content.iter().any(inline_carries_formatting)
             }
-            Inline::Tab(props) => *props != RunProps::default(),
+            Inline::Tab(props) | Inline::Break(_, props) => *props != RunProps::default(),
             Inline::TextBox { blocks, .. } => blocks_carry_formatting(blocks),
             Inline::Revision { content, .. } => content.iter().any(inline_carries_formatting),
-            Inline::Break(_)
-            | Inline::SmartArt { .. }
+            Inline::SmartArt { .. }
             | Inline::Chart { .. }
             | Inline::Equation { .. }
             | Inline::Field { .. }
@@ -760,16 +759,16 @@ fn checkpoint_for_block_range(ed: &mut Editor, start: usize) {
 
 /// Apply `patch`'s SET-to-value fields to every run in `content` — bare
 /// [`Inline::Run`]s, the runs inside an [`Inline::Hyperlink`] (its `runs`, and
-/// the runs and tabs among its `content`), and tabs (a tab
-/// is a run in OOXML, and text typed after it takes its props), matching
+/// the runs, tabs and breaks among its `content`), tabs and breaks (each is a
+/// run in OOXML, and text typed after it takes its props), matching
 /// `Editor`'s own char-range formatting helpers (`editor.rs`'s
-/// `edit_run_range`). Every other inline kind (breaks, footnote refs, …) is
+/// `edit_run_range`). Every other inline kind (fields, footnote refs, …) is
 /// left untouched.
 fn apply_run_patch(content: &mut [Inline], patch: &RunPatch) {
     for inline in content.iter_mut() {
         match inline {
             Inline::Run(r) => apply_run_patch_props(&mut r.props, patch),
-            Inline::Tab(props) => apply_run_patch_props(props, patch),
+            Inline::Tab(props) | Inline::Break(_, props) => apply_run_patch_props(props, patch),
             Inline::Hyperlink(h) => {
                 for r in h.runs.iter_mut() {
                     apply_run_patch_props(&mut r.props, patch);

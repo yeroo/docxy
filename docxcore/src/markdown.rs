@@ -341,7 +341,7 @@ fn inlines_to_md(content: &[Inline]) -> String {
                     s.push_str(&format!("[{inner}]({url})"));
                 }
             }
-            Inline::Break(_) => s.push_str("  \n"),
+            Inline::Break(..) => s.push_str("  \n"),
             Inline::Tab(_) => s.push('\t'),
             Inline::Equation { raw, text, latex } => match equation_latex(raw, latex) {
                 // Native math → `$…$` (inline) or `$$…$$` (display) with LaTeX.
