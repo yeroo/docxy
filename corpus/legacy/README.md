@@ -10,6 +10,16 @@ gridcore's legacy readers (`gridcore::legacy`, #603). Importing
 Excel's too: `chart-embedded` has a sheet with formulas and an embedded
 column chart (in the `.xls`, a chart substream nested in the worksheet's).
 
+`addin/` holds `addin-udf`, which Excel also built itself. It is saved as
+`.xlsx` and `.xlsb` only, because Excel's SaveAs `.xls` hangs on a dialog for
+it. It calls `EUROCONVERT` from the add-in that ships with Office
+(`Library\EUROTOOL.XLAM`). Excel stores that call as a library external link:
+`[1]!EUROCONVERT(…)` with `xl/externalLinks/externalLink1.xml` in the
+`.xlsx`, and a ptgNameX into a BrtSupBookSrc book in the `.xlsb`. The main
+test doesn't cover it (that test needs all three formats). Instead, two tests
+in `gridcore/tests/legacy.rs` check that the `.xlsb` import and its save as
+`.xlsx` keep the formula and the link the way Excel's `.xlsx` has them (#888).
+
 ## The test over this corpus (runs in CI)
 
 `gridcore/tests/legacy.rs` opens each file with `open_workbook` and checks it
@@ -52,5 +62,7 @@ powershell -File scripts/make-legacy-fixtures.ps1
 It opens each `corpus/xlsx/*.xlsx` in a fresh Excel process and saves it in
 the three formats. Then it rebuilds `extra/`: Excel creates each of those
 workbooks from scratch and saves its `.xlsx` source as well as the three
-formats. The output depends on the Excel build, so regenerate only when the
-`.xlsx` corpus (or the script) changes, and rerun the test.
+formats. Last it rebuilds `addin/`. `-Sections corpus,extra,addin` picks
+which of the three parts to rebuild. The output depends on the Excel build,
+so regenerate only when the `.xlsx` corpus (or the script) changes, and rerun
+the tests.
