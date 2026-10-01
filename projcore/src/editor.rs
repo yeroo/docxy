@@ -382,7 +382,8 @@ impl Editor {
 
     /// Validate newly created/exposed leaves before touching history or UI state.
     /// An edit that changes the outline drops the links it turns into summary
-    /// links, and is refused when it closes a cycle (see `links`).
+    /// links, and is refused when it makes a cycle-free plan cyclic (see
+    /// `links`).
     fn edit_structure(&mut self, edit: impl FnOnce(&mut Project)) -> Result<(), String> {
         let mut next = self.proj.clone();
         edit(&mut next);

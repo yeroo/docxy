@@ -2,17 +2,18 @@
 //! its predecessor, or outdenting one over its successor, makes a link
 //! between a summary and its own subtask; an outline change can also close a
 //! dependency cycle through a summary's links. #310 refuses both for a new
-//! link. For an outline edit, as in Project, the summary link is dropped and
-//! the cycle refuses the edit.
+//! link. For an outline edit, as in Project, the summary link is dropped; an
+//! edit that makes a cycle-free plan cyclic is refused. A plan that already
+//! has a cycle (as loaded) is not checked for more.
 use super::*;
 
-pub(super) const OUTLINE_CYCLE: &str =
-    "This change would create a circular relationship between linked tasks";
+const OUTLINE_CYCLE: &str = "This change would create a circular relationship between linked tasks";
 
 /// Make `next`, the tasks an edit of `prev` produced, keep the link rules
 /// when the edit changed the outline: a link the edit turned into one between
-/// a task and its own outline ancestor is removed, and a dependency cycle
-/// `prev` did not have refuses the edit. Links `prev` already had between a
+/// a task and its own outline ancestor is removed, and the edit is refused
+/// when `next` has a dependency cycle and `prev` has none (a `prev` that is
+/// already cyclic refuses nothing). Links `prev` already had between a
 /// summary and its subtask stay, as #310 keeps them.
 ///
 /// A blank row is outside the outline, so a blank row that becomes a task
@@ -40,8 +41,8 @@ fn same_outline(a: &[Task], b: &[Task]) -> bool {
 }
 
 /// The outline in one pass (`outline::subtree_end_in` per row would be
-/// quadratic on a flat plan): where each row's subtree ends, as that gives
-/// it, each task's parent, and the row of each non-blank UID.
+/// quadratic on a deeply nested outline): where each row's subtree ends, as
+/// that gives it, each task's parent, and the row of each non-blank UID.
 struct Outline {
     ends: Vec<usize>,
     rows: std::collections::HashMap<i32, usize>,
@@ -122,7 +123,7 @@ fn drop_new_summary_links(prev: &[Task], next: &mut [Task]) {
 /// missing row are ignored, as the scheduler ignores them; so are a link
 /// between a task and its own outline ancestor (#310's other rule, which a
 /// loaded file can still hold) and a task linked to itself.
-pub(super) fn has_link_cycle(tasks: &[Task]) -> bool {
+fn has_link_cycle(tasks: &[Task]) -> bool {
     let outline = Outline::new(tasks);
     let entry = |i: usize| 2 * i;
     let exit = |i: usize| 2 * i + 1;

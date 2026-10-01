@@ -191,19 +191,20 @@ fn an_already_cyclic_plan_allows_outline_edits() {
 
 #[test]
 fn outline_cycle_check_is_linear_on_large_summaries() {
-    // P { 250 leaves }, A, S { 250 leaves }, X, Y, Z with A -> S -> X -> P.
-    // Indenting A under P makes it one of P's leaves, which follow X: the
-    // cycle runs through 250x250 leaf pairs each way.
+    // P { 250 leaves }, A, S { 250 leaves }, Y, Z with P -> S -> A: the
+    // summary link P -> S joins 250x250 leaf pairs, which a per-link leaf
+    // expansion would walk. Indenting A under P makes it one of P's leaves,
+    // so A -> S -> A closes a cycle through that link.
     let mut rows = vec![(1, "P", 1)];
     rows.extend((2..=251).map(|uid| (uid, "P leaf", 2)));
     rows.push((252, "A", 1));
     rows.push((253, "S", 1));
     rows.extend((254..=503).map(|uid| (uid, "S leaf", 2)));
-    rows.extend([(504, "X", 1), (505, "Y", 1), (506, "Z", 1)]);
+    rows.extend([(505, "Y", 1), (506, "Z", 1)]);
     let mut proj = project(&rows);
-    link(&mut proj, 253, 252);
-    link(&mut proj, 504, 253);
-    link(&mut proj, 1, 504);
+    link(&mut proj, 253, 1);
+    link(&mut proj, 252, 253);
+    assert!(!has_link_cycle(&proj.tasks));
     let mut ed = Editor::new(proj);
     ed.indent(506, 1).unwrap();
     assert_eq!(level(&ed, 506), 2);
@@ -214,9 +215,9 @@ fn outline_cycle_check_is_linear_on_large_summaries() {
 }
 
 #[test]
-fn edits_that_keep_the_outline_skip_the_check() {
+fn a_rename_keeps_a_loaded_summary_link() {
     // A loaded cycle-free plan with a link the outline makes a summary link:
-    // a rename does not drop it.
+    // an edit that leaves the outline as it is does not drop it.
     let mut proj = project(&[(1, "S", 1), (2, "A", 2)]);
     link(&mut proj, 2, 1);
     let mut ed = Editor::new(proj);
