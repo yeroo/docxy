@@ -82,7 +82,15 @@ pub struct Engine {
     /// The post-circle D-function rerun already ran in this top-level
     /// recalculation (see [`Engine::evaluate`]); it runs at most once.
     db_rerun_done: bool,
+    /// Per sheet, for the current top-level recalculation only: each row →
+    /// the anchors whose spill covered it at some point in the pass
+    /// ([`Engine::foreign_spills`]). Built on first use, extended by every
+    /// spill the pass writes, never pruned: a superset, re-read before use.
+    pass_anchors: HashMap<usize, RowCover>,
 }
+
+/// Row → the anchors whose spill extent covers that row.
+type RowCover = HashMap<u32, Vec<(u32, u32)>>;
 
 /// Spill chains (an anchor whose array feeds another anchor's spill cells)
 /// resolve through repeated post-passes; this bounds pathological loops.
@@ -1133,6 +1141,9 @@ impl Engine {
         // passes (spills, the D-function rerun) have depth ≥ 1.
         if depth == 0 {
             self.db_rerun_done = false;
+            // Hosts change the sheets between engine calls, so an index of
+            // their spills never outlives one top-level pass.
+            self.pass_anchors.clear();
         }
         // Only supported formulas actually evaluate; unsupported ones keep
         // their cached values but still satisfy dependents.
@@ -1288,6 +1299,9 @@ impl Engine {
             spilled.sort_unstable();
             spilled.dedup();
             self.recalc_from_depth(wb, &spilled, depth + 1);
+        }
+        if depth == 0 {
+            self.pass_anchors.clear();
         }
     }
 
@@ -1458,6 +1472,7 @@ impl Engine {
                     }
                     let entry = sheet.cells.entry((r, c)).or_default();
                     entry.spill = Some((h, w));
+                    self.note_spill(key, h);
                     self.spill_blocked.remove(&key);
                 }
             }
@@ -1491,23 +1506,26 @@ impl Engine {
             DynResult::Array(m) => m,
         };
         let off_grid = r + h > crate::sheet::MAX_ROWS || c + w > crate::sheet::MAX_COLS;
-        // Other anchors whose spill overlaps this block or its old extent:
-        // their spilled values are theirs, never this block's. A spill writes
-        // every cell it covers, so when no cell but the anchor exists there
-        // (a one-cell block, or a block over empty cells) there is nothing to
-        // find, and the walk over the rows above is skipped.
-        let (bh, bw) = (h.max(old.0), w.max(old.1));
-        let occupied = (r..r + bh)
-            .any(|rr| (c..c + bw).any(|cc| (rr, cc) != (r, c) && sheet.cell(rr, cc).is_some()));
-        let foreign: Vec<(u32, u32, u32, u32)> = if occupied {
-            sheet
-                .cells
-                .range(..(r + bh, 0))
-                .filter_map(|(&(ar, ac), cl)| cl.spill.map(|(sh, sw)| (ar, ac, sh, sw)))
-                .filter(|&(ar, ac, sh, sw)| {
-                    (ar, ac) != (r, c) && ar + sh > r && ac < c + bw && ac + sw > c
+        let by_formula = off_grid
+            || (r..r + h).any(|rr| {
+                (c..c + w).any(|cc| {
+                    (rr, cc) != (r, c) && sheet.cell(rr, cc).is_some_and(|cl| cl.formula.is_some())
                 })
-                .collect()
+            });
+        // Other anchors whose spill overlaps this block or its old extent:
+        // their spilled values are theirs, never this block's. They matter
+        // to whether the block is blocked, unless a formula already decided
+        // that, and to clearing an old extent beyond the anchor. A spill
+        // writes every cell it covers, so when no cell but the anchor exists
+        // there (a one-cell block, or a block over empty cells) there is
+        // nothing to find.
+        let (bh, bw) = (h.max(old.0), w.max(old.1));
+        let wanted = !by_formula || old != (1, 1);
+        let occupied = wanted
+            && (r..r + bh)
+                .any(|rr| (c..c + bw).any(|cc| (rr, cc) != (r, c) && sheet.cell(rr, cc).is_some()));
+        let foreign = if occupied {
+            self.foreign_spills(sheet, key, (bh, bw))
         } else {
             Vec::new()
         };
@@ -1516,14 +1534,8 @@ impl Engine {
                 .iter()
                 .any(|&(ar, ac, sh, sw)| rr >= ar && rr < ar + sh && cc >= ac && cc < ac + sw)
         };
-        let blocked = off_grid
-            || (r..r + h).any(|rr| {
-                (c..c + w).any(|cc| {
-                    (rr, cc) != (r, c)
-                        && (theirs(rr, cc)
-                            || sheet.cell(rr, cc).is_some_and(|cl| cl.formula.is_some()))
-                })
-            });
+        let blocked = by_formula
+            || (r..r + h).any(|rr| (c..c + w).any(|cc| (rr, cc) != (r, c) && theirs(rr, cc)));
         let mut changed = Vec::new();
         if blocked {
             // Clear what this block wrote before (its old extent), but never
@@ -1560,8 +1572,72 @@ impl Engine {
         }
         // A one-cell block has no extent beyond its anchor (as a scalar).
         sheet.cells.entry((r, c)).or_default().spill = ((h, w) != (1, 1)).then_some((h, w));
+        if (h, w) != (1, 1) {
+            self.note_spill(key, h);
+        }
         self.spill_blocked.remove(&key);
         changed
+    }
+
+    /// The anchors other than `key`'s whose spill now overlaps the `(bh, bw)`
+    /// cells from `key`, as `(row, col, rows, cols)`: [`Engine::fill_cse`]
+    /// leaves their cells alone. Looked up in the sheet's row index for this
+    /// pass ([`Engine::pass_anchors`]), built here on first use, so a pass
+    /// over many blocks walks the sheet once rather than the rows above
+    /// each block. That one walk is O(cells) per pass even for a single
+    /// block near the top of a big sheet, which used to walk only the rows
+    /// above it; the load cap on array refs (`xlsx::cap_array_refs`) keeps
+    /// the index's size, the sum of the extents' heights, within the sheet's.
+    fn foreign_spills(
+        &mut self,
+        sheet: &Sheet,
+        key: Key,
+        (bh, bw): (u32, u32),
+    ) -> Vec<(u32, u32, u32, u32)> {
+        let (s, r, c) = key;
+        let rows = self.pass_anchors.entry(s).or_insert_with(|| {
+            let mut rows = RowCover::new();
+            for (&(ar, ac), cl) in &sheet.cells {
+                if let Some((sh, _)) = cl.spill {
+                    for rr in ar..ar + sh {
+                        rows.entry(rr).or_default().push((ar, ac));
+                    }
+                }
+            }
+            rows
+        });
+        let mut near: Vec<(u32, u32)> = (r..r + bh)
+            .filter_map(|rr| rows.get(&rr))
+            .flatten()
+            .copied()
+            .collect();
+        near.sort_unstable();
+        near.dedup();
+        // The index may hold extents since replaced: each anchor's spill is
+        // read as it is now.
+        near.into_iter()
+            .filter_map(|(ar, ac)| {
+                let (sh, sw) = sheet.cell(ar, ac)?.spill?;
+                Some((ar, ac, sh, sw))
+            })
+            .filter(|&(ar, ac, sh, sw)| {
+                (ar, ac) != (r, c) && ar < r + bh && ar + sh > r && ac < c + bw && ac + sw > c
+            })
+            .collect()
+    }
+
+    /// Record in this pass's index (when the sheet has one) that the anchor
+    /// at `key` now spills over `h` rows from its own.
+    fn note_spill(&mut self, (s, r, c): Key, h: u32) {
+        let Some(rows) = self.pass_anchors.get_mut(&s) else {
+            return;
+        };
+        for rr in r..r + h {
+            let at = rows.entry(rr).or_default();
+            if at.last() != Some(&(r, c)) {
+                at.push((r, c));
+            }
+        }
     }
 }
 
@@ -4603,5 +4679,91 @@ mod tests {
         );
         set(&mut eng, &mut wb, "C1", Cell::formula("INDIRECT(B1,B2)"));
         assert_eq!(value_at(&wb, "C1"), CellValue::Number(5.0));
+    }
+
+    #[test]
+    fn fill_cse_sees_a_spill_begun_earlier_in_the_pass() {
+        // #846 AC5 (r6-m1): the pass's index of spills is built by the first
+        // block that needs it (X at A1, over a loaded A2), before the dynamic
+        // array at C2 spills down C2:C4. The block at B3, filled after it,
+        // must still find that spill over C3 and leave it alone.
+        let mut x = Cell::formula("5");
+        x.f_attrs = Some(" t=\"array\" ref=\"A1:A2\"".to_string());
+        x.spill = Some((2, 1));
+        let mut d = Cell::formula("SEQUENCE(3)");
+        d.f_attrs = Some(" t=\"array\" ref=\"C2\"".to_string());
+        d.meta = Some(Box::new(CellMeta {
+            cm: Some("1".into()),
+            ..CellMeta::default()
+        }));
+        let mut y = Cell::formula("7");
+        y.f_attrs = Some(" t=\"array\" ref=\"B3:C3\"".to_string());
+        let mut wb = wb_one_sheet(&[("A1", x), ("A2", Cell::number(5.0)), ("C2", d), ("B3", y)]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(cell_at(&wb, "C2").spill, Some((3, 1)));
+        assert_eq!(
+            ["C2", "C3", "C4"].map(|n| value_at(&wb, n)),
+            [1.0, 2.0, 3.0].map(CellValue::Number)
+        );
+        assert_eq!(value_at(&wb, "B3"), CellValue::Number(7.0));
+        assert_eq!(cell_at(&wb, "B3").spill, None);
+    }
+
+    /// #846 AC6: `rows` one-row CSE blocks `{=E:G*2}` over A:C, their
+    /// sources in E:G, ten filler columns, and one tall CSE block down J
+    /// (an extent over every row), all with the cached values a fill
+    /// writes, as `--recalc` loads them.
+    fn many_cse_blocks(rows: u32) -> Workbook {
+        let mut sheet = Sheet {
+            name: "Sheet1".to_string(),
+            ..Sheet::default()
+        };
+        let name = crate::sheet::cell_name;
+        for r in 0..rows {
+            let n = r + 1;
+            let mut a = Cell::formula(&format!("E{n}:G{n}*2"));
+            a.f_attrs = Some(format!(" t=\"array\" ref=\"A{n}:C{n}\""));
+            a.spill = Some((1, 3));
+            for j in 0..3 {
+                let v = f64::from(r + j);
+                sheet.cells.insert((r, 4 + j), Cell::number(v));
+                let mut out = if j == 0 { a.clone() } else { Cell::default() };
+                out.value = CellValue::Number(2.0 * v);
+                sheet.cells.insert((r, j), out);
+            }
+            for j in 10..20 {
+                sheet.cells.insert((r, j), Cell::number(f64::from(j)));
+            }
+            sheet.cells.insert((r, 9), Cell::number(f64::from(r)));
+        }
+        let tall = sheet.cells.get_mut(&(0, 9)).unwrap();
+        *tall = Cell {
+            value: CellValue::Number(0.0),
+            ..Cell::formula(&format!("E1:E{rows}"))
+        };
+        tall.f_attrs = Some(format!(" t=\"array\" ref=\"J1:{}\"", name(rows - 1, 9)));
+        tall.spill = Some((rows, 1));
+        Workbook {
+            sheets: vec![sheet],
+            ..Workbook::default()
+        }
+    }
+
+    #[test]
+    fn recalc_of_many_cse_blocks_is_not_quadratic() {
+        // #846 AC6 (r6-m1): finding the other anchors over a block used to
+        // walk every cell above it, so this recalc was O(blocks × cells).
+        let mut wb = many_cse_blocks(8000);
+        let mut eng = Engine::new(&wb);
+        let start = std::time::Instant::now();
+        eng.recalc_all(&mut wb);
+        let took = start.elapsed();
+        eprintln!("recalc_all of 8000 CSE blocks: {took:?}");
+        assert_eq!(value_at(&wb, "C8000"), CellValue::Number(2.0 * 8001.0));
+        assert_eq!(cell_at(&wb, "A8000").spill, Some((1, 3)));
+        assert_eq!(cell_at(&wb, "J1").spill, Some((8000, 1)));
+        assert_eq!(value_at(&wb, "J8000"), CellValue::Number(7999.0));
+        assert!(took < std::time::Duration::from_secs(3), "{took:?}");
     }
 }
