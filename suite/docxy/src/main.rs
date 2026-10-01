@@ -18003,11 +18003,52 @@ fn move_vert(ed: &mut Editor, down: bool) {
     };
     for j in candidates {
         if let Block::Paragraph(p) = &ed.doc.body[j] {
-            let len = p.plain_text().chars().count();
+            // Caret offsets are editor offsets: `plain_text()` also counts
+            // what the caret can't reach (tracked changes, footnote refs, …).
+            let len = docxcore::editor::para_text_len(p);
             ed.caret = Caret::at(vec![j], col.min(len));
             ed.clear_selection();
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod move_vert_tests {
+    use super::{Block, Caret, Document, Editor, Inline, Paragraph, move_vert};
+    use docxcore::model::{RevisionKind, RevisionMetadata, Run};
+
+    fn run(text: &str) -> Inline {
+        Inline::Run(Run {
+            text: text.into(),
+            ..Run::default()
+        })
+    }
+
+    /// #213: the column is clamped to the paragraph's editor length, not its
+    /// `plain_text()`, which also counts a tracked insertion's text.
+    #[test]
+    fn move_vert_clamps_to_the_editor_length_213() {
+        let ins = Inline::Revision {
+            kind: RevisionKind::Insert,
+            metadata: RevisionMetadata::default(),
+            raw: String::new(),
+            content: vec![run("inserted")],
+            content_changed: false,
+        };
+        let para = |content| {
+            Block::Paragraph(Paragraph {
+                content,
+                ..Paragraph::default()
+            })
+        };
+        let mut ed = Editor::new(Document {
+            body: vec![para(vec![run("abcdefgh")]), para(vec![run("ab"), ins])],
+        });
+        assert_eq!(ed.doc.body[1].plain_text().chars().count(), 10);
+        ed.caret = Caret::at(vec![0], 8);
+        move_vert(&mut ed, true);
+        assert_eq!(ed.caret, Caret::at(vec![1], 2));
     }
 }
 
