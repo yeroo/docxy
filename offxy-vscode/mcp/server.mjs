@@ -1110,7 +1110,7 @@ function xlsxyToolDefs() {
     ),
     tool(
       'xlsxy_print_titles',
-      'Set the rows to repeat at top and columns to repeat at left on every printed page. An absent key keeps that part; null or "" clears it. One undo step.',
+      'Set the rows to repeat at top and columns to repeat at left on every printed page; titles that would fill a page by themselves, at the print scale, don\'t repeat. An absent key keeps that part; null or "" clears it. One undo step.',
       Object.fromEntries([
         ['rows', prop('string', 'Whole rows like "1:2".')],
         ['cols', prop('string', 'Whole columns like "A:A".')],
@@ -1150,7 +1150,7 @@ function xlsxyToolDefs() {
     ),
     tool(
       'xlsxy_print_pages',
-      'The pages printing lays out, as Excel would: per page its sheet, body range, repeated title rows/columns, page number and scale, and the total. Read-only. A job over 100,000 pages is an error, as for xlsxy_export_pdf.',
+      'The pages printing lays out, as Excel would: per page its sheet, body range, repeated title rows/columns (none where they would fill a page by themselves), page number and scale, and the total. Read-only. A job over 100,000 pages is an error, as for xlsxy_export_pdf.',
       Object.fromEntries([
         ['what', prop('string', 'active (default: the active or given sheets), workbook (every visible sheet) or selection (`range` of `sheet`).')],
         ['sheets', propArray(itemTy('string'), 'Optional sheet indexes or names: several (grouped) sheets. Default: `sheet`, else the active sheet.')],

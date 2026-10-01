@@ -49,10 +49,10 @@
 //! | `page.header` | `{sheet?, kind?:odd\|even\|first, part?:header\|footer, left?, center?, right?}` | `{stored, left, center, right, changed}` — sections in the editor's form (`&[Page]`, `&[Pages]`, `&[Date]`, `&[Time]`, `&[Path]`, `&[File]`, `&[Tab]`), stored as Excel's codes; with none of left/center/right it only reads; a section over 255 characters is refused; `&[Picture]` only where the section already has a picture; `&L`, `&C` or `&R` inside a section is refused (a literal ampersand is `&&`). One undo step |
 //! | `print-area.set` / `print-area.add` | `{range, sheet?}` | `{printArea, changed}` — `range` is `A1:C10`, `A1:C10,E1:F5`, `A:C` or `1:5`; add appends to the sheet's print area. One undo step |
 //! | `print-area.clear` | `{sheet?}` | `{printArea:null, changed}` |
-//! | `print-titles.set` | `{rows?, cols?, sheet?}` | `{printTitles:{rows,cols}, changed}` — `"1:2"` / `"A:A"`; an absent key keeps that part, `null` or `""` clears it |
+//! | `print-titles.set` | `{rows?, cols?, sheet?}` | `{printTitles:{rows,cols}, changed}` — `"1:2"` / `"A:A"`; an absent key keeps that part, `null` or `""` clears it; titles that would fill a page by themselves, at the print scale, don't repeat |
 //! | `page-break.insert` / `page-break.remove` | `{cell, sheet?}` | `{rowBreaks, colBreaks, changed}` — manual break ids (a row break before 0-based row id); insert adds a break above the cell (not in row 1) and left of it (not in column A); remove takes the manual breaks bordering it |
 //! | `page-break.reset` | `{sheet?}` | `{rowBreaks, colBreaks, changed}` — every manual break goes |
-//! | `print.pages` | `{what?:active\|workbook\|selection, sheet?\|sheets?, range?, ignorePrintAreas?, from?, to?}` | `{total, pages:[{sheet, name, range, number, titleRows, titleCols, scale}]}` — the pages printing lays out; `selection` needs `range` (only its printed cells print); a job over 100,000 pages errors with "This would print more than 100000 pages; …" |
+//! | `print.pages` | `{what?:active\|workbook\|selection, sheet?\|sheets?, range?, ignorePrintAreas?, from?, to?}` | `{total, pages:[{sheet, name, range, number, titleRows, titleCols, scale}]}` — the pages printing lays out (hidden sheets print only when named; titles that would fill a page by themselves, at the print scale, don't repeat); `selection` needs `range` (only its printed cells print); a job over 100,000 pages errors with "This would print more than 100000 pages; …" |
 //! | `wb.export-pdf` | `{path, …print.pages args}` | `{path, pages}` — refuses to overwrite; nothing to print errors with "We didn't find anything to print." and writes no file; so does a job over 100,000 pages (the `print.pages` error) |
 //! | `wb.recalc` | — | `{recalculated:true}` |
 //! | `wb.properties` | — | `{title, tags, categories, subject, comments, company, manager, hyperlinkBase, author, lastModifiedBy, created, modified, custom:[{name,type,value}]}` — File › Info; an absent property is `null`; `type` is `text`/`number`/`bool`/`date`/`other` |
@@ -5546,6 +5546,18 @@ mod print_tests {
             obj(vec![target(), ("cell", s("A5"))]),
         );
         call(&mut a, "print.pages", obj(vec![target()]));
+    }
+
+    #[test]
+    fn a_hidden_current_sheet_still_prints() {
+        // FIX r4 M2: the editor shows and edits hidden sheets.
+        let mut a = app();
+        fill(&mut a, 10, 2);
+        a.pkg.workbook.sheets[0].hidden = true;
+        let r = call(&mut a, "print.pages", Json::Null);
+        assert_eq!(r.get_usize("total"), Some(1));
+        let r = call(&mut a, "print.pages", obj(vec![("what", s("workbook"))]));
+        assert_eq!(r.get_usize("total"), Some(0));
     }
 
     #[test]
