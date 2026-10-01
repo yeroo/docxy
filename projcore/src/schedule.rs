@@ -1466,7 +1466,15 @@ impl<'a> Scheduler<'a> {
                         }
                     }
                     ConstraintType::StartNoLaterThan if self.proj.honor_constraints => {
-                        start_abs = start_abs.min(ds);
+                        // A binding milestone occupies the constraint's own
+                        // instant, as an FNLT one does, not the next morning
+                        // that shares its index.
+                        if t.duration_min == 0 && milestone < start_abs {
+                            held_milestone = Some(milestone);
+                            start_abs = milestone;
+                        } else {
+                            start_abs = start_abs.min(ds);
+                        }
                     }
                     _ => {}
                 }
@@ -1487,7 +1495,7 @@ impl<'a> Scheduler<'a> {
             }
             // A binding FS or ALAP milestone occupies its exact finish or
             // late-start instant, even in a nonworking gap. So do binding
-            // MFO/FNLT and SNET/FNET milestones. Later start-type
+            // MFO/FNLT/SNLT and SNET/FNET milestones. Later start-type
             // links/constraints still snap.
             let s_abs =
                 if fs_milestone_start == Some(start_abs) || held_milestone == Some(start_abs) {
@@ -1782,20 +1790,23 @@ impl<'a> Scheduler<'a> {
                     if !self.starts_summary(t.uid, start_of, graph, &es_abs, &ef_abs) {
                         continue;
                     }
-                    let bound = if kind == ConstraintType::StartNoLaterThan {
+                    let (bound, instant) = if kind == ConstraintType::StartNoLaterThan {
                         let start = tl.snap(date);
-                        tl.abs_finish(tl.to_index(start) + span)
+                        let bound = tl.abs_finish(tl.to_index(start) + span);
+                        (bound, if start == date { date } else { bound })
                     } else {
                         finish_instants(tl, date, self.date_floor(t, linked_tasks.contains(&t.uid)))
-                            .0
                     };
                     if bound < finish_abs {
                         finish_abs = bound;
                         hard_finish_bound = true;
                         // The bound moved the finish to an earlier index, so
                         // a constraint instant on the old index no longer
-                        // applies.
-                        milestone_late = None;
+                        // applies; a milestone takes the summary date's own
+                        // instant (a morning date stays on its morning), as
+                        // under a leaf FNLT.
+                        milestone_late =
+                            (span == 0).then(|| capped_milestone(tl, instant, bound_instant));
                     }
                 }
             }
@@ -3464,8 +3475,9 @@ impl Scheduler<'_> {
         let cap = self
             .constraint_dates(t, linked)
             .and_then(|dates| match t.constraint {
-                ConstraintType::FinishNoLaterThan => Some(dates.milestone),
-                ConstraintType::StartNoLaterThan => Some(dates.start),
+                ConstraintType::FinishNoLaterThan | ConstraintType::StartNoLaterThan => {
+                    Some(dates.milestone)
+                }
                 _ => None,
             })
             .filter(|_| self.proj.honor_constraints);
@@ -6010,6 +6022,8 @@ mod tests {
         let monday = DateTime::from_ymd_hm(2026, 3, 9, 8, 0);
         // A binding MSO keeps its own morning instant in the late dates,
         // honored or not, instead of the evening of the date's index.
+        // Microsoft Project gives the same late dates for MSO and SNLT
+        // Mon 08:00 (#787).
         for honor in [true, false] {
             let proj = finish_constrained_milestone(
                 2400,
@@ -6075,6 +6089,31 @@ mod tests {
         assert_eq!(m.early_start, DateTime::from_ymd_hm(2026, 3, 2, 8, 0));
         assert_eq!(m.late_start, friday);
         assert_eq!(m.late_finish, friday);
+    }
+
+    #[test]
+    fn honored_snlt_milestone_in_conflict_sits_on_its_constraint_instant() {
+        use ConstraintType::{FinishNoLaterThan, StartNoLaterThan};
+        let at = |day, hour| DateTime::from_ymd_hm(2026, 3, day, hour, 0);
+        // (Constraint, date, total slack, A's late finish). Microsoft
+        // Project's values for a milestone in conflict with its
+        // predecessor: it sits on the constraint's own instant, as an
+        // FNLT one does, not the next morning that shares its index (#787).
+        for (constraint, date, slack, a_late_finish) in [
+            (StartNoLaterThan, at(6, 17), -480, at(6, 17)),
+            (StartNoLaterThan, at(9, 12), -240, at(9, 12)),
+            (StartNoLaterThan, at(9, 8), -480, at(6, 17)),
+            (FinishNoLaterThan, at(6, 17), -480, at(6, 17)),
+            (FinishNoLaterThan, at(9, 12), -240, at(9, 12)),
+            (FinishNoLaterThan, at(9, 8), -480, at(6, 17)),
+        ] {
+            let proj = finish_constrained_milestone(2880, constraint, date, true, true);
+            let case = format!("{constraint:?} {date:?}");
+            assert_milestone_at(&proj, date, slack, &case);
+            let a = schedule(&proj).get(1).copied().unwrap();
+            assert_eq!(a.late_finish, a_late_finish, "{case}");
+            assert_eq!(a.total_slack_min, slack, "{case}");
+        }
     }
 
     #[test]
@@ -7486,6 +7525,47 @@ mod tests {
             let r = *schedule(&proj).get(2).unwrap();
             assert_eq!(r.late_start, thursday, "{constraint:?}");
             assert_eq!(r.late_finish, thursday, "{constraint:?}");
+        }
+    }
+
+    #[test]
+    fn child_milestone_under_a_morning_summary_fnlt_keeps_the_morning() {
+        let at = |day, hour| DateTime::from_ymd_hm(2026, 3, day, hour, 0);
+        // (Summary FNLT date, a 1-day FS predecessor inside the summary,
+        // the child milestone's total slack). Microsoft Project's values
+        // (#787): a morning summary date gives its child milestones the
+        // morning, not the previous evening on its working index.
+        for (date, with_p, slack) in [
+            (at(9, 8), false, 2400),
+            (at(9, 8), true, 1920),
+            (at(6, 17), false, 2400),
+            (at(6, 17), true, 1920),
+        ] {
+            let mut summary = summary_task(2, 1);
+            summary.constraint = ConstraintType::FinishNoLaterThan;
+            summary.constraint_date = Some(date);
+            let mut tasks = vec![task(1, "Long", 20 * 480), summary];
+            if with_p {
+                let mut p = task(3, "P", 480);
+                p.outline_level = 2;
+                tasks.push(p);
+            }
+            let mut milestone = task(4, "M", 0);
+            milestone.outline_level = 2;
+            if with_p {
+                milestone.predecessors = vec![fs(3)];
+            }
+            tasks.push(milestone);
+            let proj = Project {
+                start_date: Some(at(2, 8)),
+                tasks,
+                ..Project::default()
+            };
+            let case = format!("with_p={with_p} {date:?}");
+            let m = schedule(&proj).get(4).copied().unwrap();
+            assert_eq!(m.late_start, date, "{case}");
+            assert_eq!(m.late_finish, date, "{case}");
+            assert_eq!(m.total_slack_min, slack, "{case}");
         }
     }
 
@@ -9676,6 +9756,48 @@ mod tests {
         assert_eq!(dates(19), (at(7, 12), at(7, 12)), "Z3");
         assert_eq!(dates(20), (at(7, 17), at(7, 17)), "Z6");
         assert_eq!(dates(21), (at(6, 17), at(6, 17)), "Z7");
+    }
+
+    #[test]
+    fn leveling_caps_an_snlt_milestone_at_its_constraint_instant() {
+        // The SNLT cap mirrors the FNLT one (F2 above): leveling moves G's
+        // finish instant from Fri 6 17:00 to Sat 7 17:00 on the same working
+        // index, and an SNLT Fri 6 17:00 still holds its milestone there,
+        // while a later SNLT Fri 13 17:00 follows G. Not checked with
+        // Project's LevelNow.
+        let mut g = task(5, "G", 480);
+        g.predecessors = vec![lag_link(1, LinkType::FinishFinish, 2880, 8)];
+        let milestone = |uid, constraint, date| {
+            let mut t = task(uid, "M", 0);
+            t.predecessors = vec![Predecessor::fs(5)];
+            t.constraint = constraint;
+            t.constraint_date = Some(date);
+            t
+        };
+        let mut proj = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![
+                task(4, "Busy", 480),
+                task(1, "A", 3 * 480),
+                g,
+                milestone(6, ConstraintType::FinishNoLaterThan, at(6, 17)),
+                milestone(7, ConstraintType::StartNoLaterThan, at(6, 17)),
+                milestone(8, ConstraintType::StartNoLaterThan, at(13, 17)),
+            ],
+            ..Project::default()
+        };
+        proj.resources = vec![worker(1, "Shared", 1.0)];
+        proj.assignments = vec![assign(1, 4, 1, 1.0), assign(2, 1, 1, 1.0)];
+        let sched = schedule(&proj);
+        for uid in [6, 7, 8] {
+            assert_eq!(sched.get(uid).unwrap().early_start, at(6, 17), "uid {uid}");
+        }
+        let leveled = level(&proj);
+        assert_eq!(leveled.finish(5), Some(at(7, 17)));
+        for (uid, expected) in [(6, at(6, 17)), (7, at(6, 17)), (8, at(7, 17))] {
+            assert_eq!(leveled.start(uid), Some(expected), "uid {uid}");
+            assert_eq!(leveled.finish(uid), Some(expected), "uid {uid}");
+        }
     }
 
     // ---- manual summaries (#124) ----
