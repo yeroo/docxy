@@ -1396,8 +1396,9 @@ struct Printer {
     /// numbers that read back exactly.
     file: bool,
     /// The LET/LAMBDA names bound around the expression being printed
-    /// (file spelling only), without their `_xlpm.` prefix.
-    scope: Vec<String>,
+    /// (file spelling only), without their `_xlpm.` prefix, and whether each
+    /// may hold a lambda (see [`Printer::func`]).
+    scope: Vec<(String, bool)>,
 }
 
 impl Printer {
@@ -1471,7 +1472,7 @@ impl Printer {
                 col2,
             } => structured_to_string(table, *item, col1, col2),
             Expr::Name(n) => match self.bound(n).filter(|_| self.file) {
-                Some(b) => param_name(b),
+                Some((b, _)) => param_name(b),
                 None => n.clone(),
             },
             Expr::SpillRef(r) if self.file => format!("_xlfn.ANCHORARRAY({})", ref_to_string(r)),
@@ -1542,14 +1543,25 @@ impl Printer {
     }
 
     /// The LET/LAMBDA name `n` refers to around the current expression,
-    /// spelled as its binding spells it; `None` when nothing binds `n`.
-    fn bound(&self, n: &str) -> Option<&str> {
+    /// spelled as its binding spells it, and whether it may hold a lambda;
+    /// `None` when nothing binds `n`.
+    fn bound(&self, n: &str) -> Option<(&str, bool)> {
         let n = bare_param(n);
         self.scope
             .iter()
             .rev()
-            .find(|s| s.eq_ignore_ascii_case(n))
-            .map(String::as_str)
+            .find(|(s, _)| s.eq_ignore_ascii_case(n))
+            .map(|(s, lambda)| (s.as_str(), *lambda))
+    }
+
+    /// Can a LET value bind a lambda? `LAMBDA(…)` itself, or another name
+    /// that may hold one.
+    fn binds_lambda(&self, value: &Expr) -> bool {
+        match value {
+            Expr::Func(n, _) => n.eq_ignore_ascii_case("LAMBDA"),
+            Expr::Name(n) => self.bound(n).is_some_and(|(_, lambda)| lambda),
+            _ => false,
+        }
     }
 
     fn func(&mut self, name: &str, args: &[Expr]) -> String {
@@ -1557,9 +1569,13 @@ impl Printer {
             return format!("{}({})", name, self.list(args));
         }
         // A bound name called as a function (`LET(f,LAMBDA(…),f(2))`) is the
-        // local lambda, never a builtin of the same name. (The parser
-        // uppercases a called name, so the binding gives the spelling.)
-        if let Some(b) = self.bound(name) {
+        // local lambda, as the evaluator's `let_lambda` reads it. A name bound
+        // to anything else is still the builtin when called
+        // (`LET(sum,SUM(A:A),sum/SUM(B:B))`). A LAMBDA parameter may hold
+        // either, so its call is the local one; the evaluator falls back to the
+        // builtin when it holds no lambda. (The parser uppercases a called
+        // name, so the binding gives the spelling.)
+        if let Some((b, true)) = self.bound(name) {
             let head = param_name(b);
             return format!("{head}({})", self.list(args));
         }
@@ -1580,9 +1596,10 @@ impl Printer {
                         pending = Some(bare_param(n).to_string());
                     }
                     _ => {
+                        let lambda = self.binds_lambda(a);
                         parts.push(self.print(a));
                         if let Some(n) = pending.take() {
-                            self.scope.push(n);
+                            self.scope.push((n, lambda));
                         }
                     }
                 }
@@ -1593,7 +1610,7 @@ impl Printer {
                 match a {
                     Expr::Name(n) if i < last => {
                         parts.push(param_name(n));
-                        self.scope.push(bare_param(n).to_string());
+                        self.scope.push((bare_param(n).to_string(), true));
                     }
                     Expr::Structured {
                         table: None,
@@ -1602,7 +1619,7 @@ impl Printer {
                         col2: None,
                     } if i < last => {
                         parts.push(format!("[{}]", escape_spec(&param_name(n))));
-                        self.scope.push(bare_param(n).to_string());
+                        self.scope.push((bare_param(n).to_string(), true));
                     }
                     _ => parts.push(self.print(a)),
                 }
@@ -3225,6 +3242,15 @@ impl<'a> Eval<'a> {
                 if let Some(lam) = self.let_lambda(name) {
                     return invoke(self, &lam);
                 }
+                // `_xlpm.text(…)` naming a binding that holds no lambda (a
+                // LAMBDA parameter shares a builtin's name, and the file spells
+                // the call as the parameter's): the builtin, as the typed
+                // `TEXT(text,…)` evaluates.
+                let bare = bare_param(name);
+                if bare.len() != name.len() {
+                    let call = Expr::Func(bare.to_ascii_uppercase(), args.clone());
+                    return self.eval_arg(&call);
+                }
                 if is_array_fn(name) {
                     return self.array_fn(name, args);
                 }
@@ -4795,10 +4821,15 @@ fn future_prefix(name: &str) -> Option<&'static str> {
 /// Text that needs nothing, including text already in file spelling, comes
 /// back unchanged (borrowed). A formula that only needs function prefixes has
 /// them inserted in place (and those names uppercased), keeping the rest byte
-/// for byte; one with `#`, `@`,
-/// LET or LAMBDA is parsed and printed again (spacing is not kept, values
-/// are). Text that doesn't lex is returned as it is, and text that doesn't
-/// parse only gets its function prefixes.
+/// for byte; one with `#`, `@`, LET or LAMBDA is parsed and printed again
+/// (spacing is not kept, values are). Text that doesn't lex is returned as it
+/// is. Text that doesn't parse only gets its function prefixes (LET and
+/// LAMBDA included); its `#`, `@` and LET/LAMBDA names stay as they are.
+///
+/// The save runs every formula through this, loaded ones too, since there is
+/// no record of which text is still as loaded. So a bare post-2007 name in a
+/// file (a producer that left the prefix off, or a VBA function an old Excel
+/// file named `TEXTJOIN`) is saved as the builtin.
 pub fn file_formula(src: &str) -> Cow<'_, str> {
     let mut lex = Lexer::new(src);
     let mut toks: Vec<(usize, Tok)> = Vec::new();
@@ -4821,12 +4852,14 @@ pub fn file_formula(src: &str) -> Cow<'_, str> {
             Tok::Hash | Tok::At => reprint = true,
             Tok::Ident(id) if matches!(toks.get(i + 1), Some((_, Tok::LParen))) => {
                 // These change shape (`SINGLE(x)` is `@x`) or bind names,
-                // which only the AST can see.
+                // which only the AST can see; the splice prefixes them only
+                // when the text doesn't parse.
                 if ["LET", "LAMBDA", "SINGLE", "ANCHORARRAY"]
                     .iter()
                     .any(|n| n.eq_ignore_ascii_case(id))
                 {
                     reprint = true;
+                    splices.push((*start, start + id.len(), "_xlfn."));
                 } else if let Some(p) = future_prefix(id) {
                     splices.push((*start, start + id.len(), p));
                 }
@@ -13048,6 +13081,33 @@ mod tests {
             file("LET(sort,LAMBDA(x,x),sort(2))"),
             "_xlfn.LET(_xlpm.sort,_xlfn.LAMBDA(_xlpm.x,_xlpm.x),_xlpm.sort(2))"
         );
+        assert_eq!(
+            file("LET(f,LAMBDA(x,x*3),g,f,g(2))"),
+            "_xlfn.LET(_xlpm.f,_xlfn.LAMBDA(_xlpm.x,_xlpm.x*3),_xlpm.g,_xlpm.f,_xlpm.g(2))"
+        );
+        // A LET name bound to anything else leaves a same-named builtin call
+        // alone.
+        assert_eq!(
+            file("LET(sum,SUM(A1:A3),sum/SUM(B1:B3))"),
+            "_xlfn.LET(_xlpm.sum,SUM(A1:A3),_xlpm.sum/SUM(B1:B3))"
+        );
+        assert_eq!(
+            file("LET(date,TODAY(),DATE(YEAR(date),1,1))"),
+            "_xlfn.LET(_xlpm.date,TODAY(),DATE(YEAR(_xlpm.date),1,1))"
+        );
+        assert_eq!(
+            file("LET(max,10,MAX(A1,max))"),
+            "_xlfn.LET(_xlpm.max,10,MAX(A1,_xlpm.max))"
+        );
+        assert_eq!(
+            file("LET(sort,A1:A3,SORT(sort))"),
+            "_xlfn.LET(_xlpm.sort,A1:A3,_xlfn._xlws.SORT(_xlpm.sort))"
+        );
+        // A LAMBDA parameter may hold a lambda, so its call is the local one.
+        assert_eq!(
+            file("LAMBDA(text,TEXT(text,\"0\"))(A1)"),
+            "_xlfn.LAMBDA(_xlpm.text,_xlpm.text(_xlpm.text,\"0\"))(A1)"
+        );
         // Optional parameters.
         assert_eq!(
             file("LAMBDA(x,[y],IF(ISOMITTED(y),x,x+y))(1)"),
@@ -13085,6 +13145,19 @@ mod tests {
         // only.
         assert!(parse("SEQUENCE(A1#").is_err());
         assert_eq!(file("SEQUENCE(A1#"), "_xlfn.SEQUENCE(A1#");
+        assert!(parse("LET(x,Sheet1!Rate,x*2)").is_err());
+        assert_eq!(
+            file("LET(x,Sheet1!Rate,x*2)"),
+            "_xlfn.LET(x,Sheet1!Rate,x*2)"
+        );
+        assert_eq!(
+            file("lambda(x,Sheet1!Rate*x)(2)+single(Sheet1!Rate)+ANCHORARRAY(Sheet1!Rate)"),
+            "_xlfn.LAMBDA(x,Sheet1!Rate*x)(2)+_xlfn.SINGLE(Sheet1!Rate)+_xlfn.ANCHORARRAY(Sheet1!Rate)"
+        );
+        assert!(matches!(
+            file_formula("SUM(A1#)+Sheet1!Rate"),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]
@@ -13152,6 +13225,12 @@ mod tests {
             ("LET(sort,LAMBDA(x,x*5),sort(2))", 10.0),
             ("LAMBDA(x,[y],IF(ISOMITTED(y),x,x+y))(1)", 1.0),
             ("LAMBDA(x,[y],IF(ISOMITTED(y),x,x+y))(1,2)", 3.0),
+            // Names shared with a builtin that is still called as one.
+            ("LET(sum,SUM(1,2),sum/SUM(1,2,3))", 0.5),
+            ("LET(max,10,MAX(1,max))", 10.0),
+            ("LET(date,45306,DATE(YEAR(date),1,1))", 45292.0),
+            ("LAMBDA(text,LEN(TEXT(text,\"0.0\")))(5)", 3.0),
+            ("LET(f,LAMBDA(x,x*3),g,f,g(2))", 6.0),
         ] {
             let saved = file_formula(typed).into_owned();
             // What a reload holds: the file text as the parser reads it.
