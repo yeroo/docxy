@@ -322,6 +322,57 @@ fn repair_leaves_a_dxf_id_in_text_alone() {
     assert_eq!(dxf_refs(r#"<c><t>x</t></c><cfRule dxfId="2"/>"#).len(), 1);
 }
 
+/// #610 r3: the start-tag test once walked back to the nearest bracket for
+/// every match, so a text node of repeated `dxfId="1"` (2 MB, which deflates
+/// to almost nothing) took quadratic time and hung Open and Repair. Each
+/// byte is now looked at once.
+#[test]
+fn repair_of_a_text_full_of_dxf_ids_is_linear() {
+    let mut parts = parts_of(&fixture());
+    let flood = "dxfId=\"1\"".repeat(200_000);
+    let sst = format!(
+        "<?xml version=\"1.0\"?><sst xmlns=\"{SML}\" count=\"2\" uniqueCount=\"2\"><si><t>hello</t></si><si><t>{flood}</t></si></sst>"
+    );
+    parts
+        .iter_mut()
+        .find(|(n, _)| n == "xl/sharedStrings.xml")
+        .unwrap()
+        .1 = sst.into_bytes();
+    let data = damage(&write_zip(&parts), "xl/styles.xml");
+    let started = std::time::Instant::now();
+    let (_, repairs, saved) = repair_and_resave(&data);
+    let took = started.elapsed();
+    assert_eq!(repairs.emptied, ["xl/styles.xml"]);
+    assert!(
+        took < std::time::Duration::from_secs(10),
+        "repair took {took:?}"
+    );
+    // Text, so none of it was taken for a reference or cut out.
+    assert!(dxf_refs(&flood).is_empty());
+    let kept = parts_of(&saved)
+        .into_iter()
+        .find(|(n, _)| n == "xl/sharedStrings.xml")
+        .unwrap()
+        .1;
+    assert!(String::from_utf8(kept).unwrap().contains(&flood));
+}
+
+#[test]
+fn strip_removes_many_runaway_ids_in_one_pass() {
+    let mut xml = String::new();
+    let mut want = String::new();
+    for i in 0..5_000 {
+        xml.push_str(&format!(
+            "<cfRule dxfId=\"{i}\"/><cfRule priority=\"1\" dxfId=\"9999999{i}\"/>"
+        ));
+        want.push_str(&format!("<cfRule dxfId=\"{i}\"/><cfRule priority=\"1\"/>"));
+    }
+    let mut parts = vec![("x.xml".to_string(), xml.into_bytes())];
+    strip_runaway_dxf_ids(&mut parts);
+    assert_eq!(String::from_utf8(parts[0].1.clone()).unwrap(), want);
+    assert_eq!(dxf_count_needed(&parts), 5_000);
+}
+
 #[test]
 fn dxf_refs_reads_every_kind_and_clamps() {
     let xml = r#"<a dxfId="3"/><t headerRowDxfId="7" x:dataDxfId="18446744073709551616"/><b xfId="9"/><c dxfId="z"/>"#;

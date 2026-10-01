@@ -249,14 +249,16 @@ fn dxf_refs(xml: &str) -> Vec<(usize, usize, u64)> {
     let bytes = xml.as_bytes();
     let mut out = Vec::new();
     let mut from = 0;
+    // The nearest '<' or '>' before `scanned`, kept between matches so each
+    // byte is looked at once however many matches a part holds (#610 r3).
+    let mut bracket: Option<u8> = None;
+    let mut scanned = 0;
     while let Some(i) = xml[from..].find(NEEDLE) {
         let at = from + i;
         let value = at + NEEDLE.len();
         from = value;
+        // The cheap rejects first: not a `…dxfId`, or not a number.
         if !matches!(at.checked_sub(1).map(|p| bytes[p]), Some(b'd' | b'D')) {
-            continue;
-        }
-        if xml[..at].rfind(['<', '>']).map(|p| bytes[p]) != Some(b'<') {
             continue;
         }
         let digits = bytes[value..]
@@ -264,6 +266,16 @@ fn dxf_refs(xml: &str) -> Vec<(usize, usize, u64)> {
             .take_while(|b| b.is_ascii_digit())
             .count();
         if digits == 0 || bytes.get(value + digits) != Some(&b'"') {
+            continue;
+        }
+        if let Some(p) = bytes[scanned..at]
+            .iter()
+            .rposition(|b| matches!(b, b'<' | b'>'))
+        {
+            bracket = Some(bytes[scanned + p]);
+        }
+        scanned = at;
+        if bracket != Some(b'<') {
             continue;
         }
         let id = xml[value..value + digits]
@@ -301,7 +313,7 @@ fn dxf_count_needed(parts: &[(String, Vec<u8>)]) -> usize {
 /// that had one is rewritten.
 fn strip_runaway_dxf_ids(parts: &mut [(String, Vec<u8>)]) {
     for (_, bytes) in parts.iter_mut().filter(|(n, _)| n.ends_with(".xml")) {
-        let mut xml = String::from_utf8_lossy(bytes).into_owned();
+        let xml = String::from_utf8_lossy(bytes).into_owned();
         let runaway: Vec<_> = dxf_refs(&xml)
             .into_iter()
             .filter(|&(_, _, id)| id >= MAX_STUB_DXFS)
@@ -309,10 +321,15 @@ fn strip_runaway_dxf_ids(parts: &mut [(String, Vec<u8>)]) {
         if runaway.is_empty() {
             continue;
         }
-        for (start, end, _) in runaway.into_iter().rev() {
-            xml.replace_range(start..end, "");
+        // One pass: copy what lies between the removed attributes.
+        let mut kept = String::with_capacity(xml.len());
+        let mut copied = 0;
+        for (start, end, _) in runaway {
+            kept.push_str(&xml[copied..start]);
+            copied = end;
         }
-        *bytes = xml.into_bytes();
+        kept.push_str(&xml[copied..]);
+        *bytes = kept.into_bytes();
     }
 }
 
