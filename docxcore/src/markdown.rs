@@ -895,9 +895,16 @@ fn parse_inlines(s: &str) -> Vec<Inline> {
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
-        if c == '\\' && i + 1 < chars.len() {
-            buf.push(chars[i + 1]);
-            i += 2;
+        if c == '\\' {
+            // Only an escapable character drops the backslash; `C:\temp` keeps
+            // it, and the `t` goes through normal handling.
+            if let Some(&next) = chars.get(i + 1).filter(|&&n| is_md_escapable(n)) {
+                buf.push(next);
+                i += 2;
+            } else {
+                buf.push(c);
+                i += 1;
+            }
             continue;
         }
         if c == '[' {
@@ -1044,6 +1051,13 @@ fn push_run(out: &mut Vec<Inline>, buf: &mut String, bold: bool, italic: bool, s
     }
 }
 
+/// Whether `\c` is a backslash escape. CommonMark escapes only ASCII
+/// punctuation (`\t` is a literal backslash and `t`); a backslash before a
+/// newline is kept consumed, as before.
+fn is_md_escapable(c: char) -> bool {
+    c.is_ascii_punctuation() || c == '\n'
+}
+
 /// Parse `[label](url)` starting at `chars[start] == '['`. Returns
 /// `(label, url, chars_consumed)`.
 fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
@@ -1052,12 +1066,13 @@ fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
         return None;
     }
     let url_end = (close + 2..chars.len()).find(|&j| chars[j] == ')')?;
-    // Unescape the label: a `\` drops itself and keeps the next char (a
-    // trailing lone `\` is kept), matching the inline pass.
+    // Unescape the label: a `\` before an escapable char drops itself and keeps
+    // that char; any other `\` (or a trailing lone one) is kept, matching the
+    // inline pass.
     let mut label = String::new();
     let mut i = start + 1;
     while i < close {
-        if chars[i] == '\\' && i + 1 < close {
+        if chars[i] == '\\' && i + 1 < close && is_md_escapable(chars[i + 1]) {
             label.push(chars[i + 1]);
             i += 2;
         } else {
@@ -1530,6 +1545,94 @@ mod tests {
             Inline::Hyperlink(h) => assert_eq!(h.runs[0].text, "a*b C:\\dir"),
             other => panic!("expected a hyperlink, got {other:?}"),
         }
+    }
+
+    /// Plain texts of a table's first body row.
+    fn body_row_texts(doc: &Document) -> Vec<String> {
+        table_of(doc).rows[1]
+            .cells
+            .iter()
+            .map(|c| c.blocks[0].plain_text())
+            .collect()
+    }
+
+    const BACKSLASH_PIPE_HEADER: &str = "| A | B | C |\n| --- | --- | --- |\n";
+
+    #[test]
+    fn backslash_before_a_letter_is_literal_in_table_cells() {
+        // CommonMark escapes only ASCII punctuation: `\t` is a backslash and a
+        // `t`, so hand-written `C:\temp` must not read as `C:temp` (#595).
+        let doc = from_markdown(&format!(
+            r"{BACKSLASH_PIPE_HEADER}| C:\temp | a\|b | dir\ |"
+        ));
+        assert_eq!(body_row_texts(&doc), [r"C:\temp", "a|b", r"dir\"]);
+    }
+
+    #[test]
+    fn backslash_before_a_letter_is_literal_in_paragraphs_and_link_labels() {
+        assert_eq!(from_markdown(r"C:\temp").body[0].plain_text(), r"C:\temp");
+        let doc = from_markdown(r"[C:\dir](http://x)");
+        let Block::Paragraph(p) = &doc.body[0] else {
+            panic!("expected a paragraph");
+        };
+        match &p.content[0] {
+            Inline::Hyperlink(h) => assert_eq!(h.runs[0].text, r"C:\dir"),
+            other => panic!("expected a hyperlink, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backslash_escapes_of_punctuation_still_unescape() {
+        let src = r"\* \\ \| \` \~ \[x]";
+        assert_eq!(from_markdown(src).body[0].plain_text(), r"* \ | ` ~ [x]");
+        let doc = from_markdown(&format!(r"{BACKSLASH_PIPE_HEADER}| \* | \\ | \` |"));
+        assert_eq!(body_row_texts(&doc), ["*", r"\", "`"]);
+    }
+
+    #[test]
+    fn table_backslashes_and_pipes_round_trip_docx_first() {
+        let cell = |text: &str| Cell {
+            blocks: vec![
+                Paragraph {
+                    props: ParProps::default(),
+                    content: vec![run(text, false, false)],
+                }
+                .into(),
+            ],
+            ..Default::default()
+        };
+        let row = |texts: [&str; 3]| Row {
+            cells: texts.into_iter().map(cell).collect(),
+            ..Default::default()
+        };
+        let doc = Document {
+            body: vec![Block::Table(Table {
+                grid: vec![3120; 3],
+                rows: vec![row(["A", "B", "C"]), row([r"C:\temp", "a|b", r"dir\"])],
+                ..Default::default()
+            })],
+        };
+        let md = to_markdown(&doc);
+        assert!(md.contains(r"| C:\\temp | a\|b | dir\\ |"), "{md}");
+        assert_eq!(
+            body_row_texts(&from_markdown(&md)),
+            [r"C:\temp", "a|b", r"dir\"]
+        );
+    }
+
+    #[test]
+    fn table_backslashes_and_pipes_round_trip_markdown_first() {
+        let canonical = format!(r"{BACKSLASH_PIPE_HEADER}| C:\\temp | a\|b | dir\\ |");
+        let out = to_markdown(&from_markdown(&canonical));
+        assert_eq!(out.trim_end(), canonical);
+        // Single backslashes before letters/spaces normalize to the canonical row.
+        let loose = format!(r"{BACKSLASH_PIPE_HEADER}| C:\temp | a\|b | dir\ |");
+        let out = to_markdown(&from_markdown(&loose));
+        assert_eq!(out.trim_end(), canonical);
+        assert_eq!(
+            body_row_texts(&from_markdown(&out)),
+            [r"C:\temp", "a|b", r"dir\"]
+        );
     }
 
     #[test]
