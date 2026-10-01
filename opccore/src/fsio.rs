@@ -111,26 +111,31 @@ fn write_atomic_with_ownership(
         ));
     }
     // Declare the guard before the file so unwinding also closes before cleanup.
-    let (mut temp, mut file) = create_temp(&dest, destination.is_some(), || {
+    let (mut temp, file) = create_temp(&dest, destination.is_some(), || {
         NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
     })?;
-    let result = (|| {
-        writer(&mut file)?;
-        let fallback = if let Some((destination, metadata)) = destination {
-            if restore(&file, &metadata)? {
-                // chown can clear permission bits, so restore mode afterward.
-                file.set_permissions(metadata.permissions())?;
-                None
+    // The handle closes at the end of this block, before the fallback copy
+    // reopens the temp file. A block rather than `drop(file)`: on wasm32
+    // `File` has no `Drop`, and clippy rejects dropping it (drop_non_drop).
+    let result = {
+        let mut file = file;
+        (|| {
+            writer(&mut file)?;
+            let fallback = if let Some((destination, metadata)) = destination {
+                if restore(&file, &metadata)? {
+                    // chown can clear permission bits, so restore mode afterward.
+                    file.set_permissions(metadata.permissions())?;
+                    None
+                } else {
+                    Some(destination)
+                }
             } else {
-                Some(destination)
-            }
-        } else {
-            None
-        };
-        file.sync_all()?;
-        Ok::<_, io::Error>(fallback)
-    })();
-    drop(file);
+                None
+            };
+            file.sync_all()?;
+            Ok::<_, io::Error>(fallback)
+        })()
+    };
     if let Some(mut destination) = result? {
         let mut source = File::open(&temp.0)?;
         destination.set_len(0)?;
@@ -189,9 +194,12 @@ fn create_atomic_with_link(
     writer: impl FnOnce(&mut File) -> io::Result<()>,
     link: impl FnOnce(&Path, &Path) -> io::Result<()>,
 ) -> io::Result<()> {
-    let (temp, mut file) = create_temp(path, false, || NEXT_TEMP.fetch_add(1, Ordering::Relaxed))?;
-    let result = writer(&mut file).and_then(|()| file.sync_all());
-    drop(file);
+    let (temp, file) = create_temp(path, false, || NEXT_TEMP.fetch_add(1, Ordering::Relaxed))?;
+    // Closed at the end of the block, before the link (see `write_atomic_with_ownership`).
+    let result = {
+        let mut file = file;
+        writer(&mut file).and_then(|()| file.sync_all())
+    };
     result?;
     // hard_link never replaces an existing path, unlike rename on Unix.
     if let Err(error) = link(&temp.0, path) {
