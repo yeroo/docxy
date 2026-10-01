@@ -318,9 +318,12 @@ pub(crate) fn zone_id(path: &Path) -> Option<u32> {
 pub(crate) fn parse_zone_identifier(bytes: &[u8]) -> Option<u32> {
     let text = match bytes {
         [0xFF, 0xFE, rest @ ..] => {
+            // An odd trailing byte is not a code unit, and is ignored.
             let units: Vec<u16> = rest
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&pair| u16::from_le_bytes(pair))
                 .collect();
             String::from_utf16_lossy(&units)
         }
@@ -620,6 +623,10 @@ mod tests {
         let mut bytes = vec![0xFF, 0xFE];
         bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
         assert_eq!(parse_zone_identifier(&bytes), Some(3));
+        // An odd trailing byte is no code unit and changes nothing.
+        let mut odd = bytes.clone();
+        odd.push(b'Z');
+        assert_eq!(parse_zone_identifier(&odd), Some(3));
         let mut utf8_bom = vec![0xEF, 0xBB, 0xBF];
         utf8_bom.extend_from_slice(text.as_bytes());
         assert_eq!(parse_zone_identifier(&utf8_bom), Some(3));
