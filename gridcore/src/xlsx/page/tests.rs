@@ -405,3 +405,40 @@ fn inserted_breaks_create_their_elements_and_reset_drops_them() {
     let ws = saved(&pkg);
     assert!(!ws.contains("Breaks") && !ws.contains("<brk"), "{ws}");
 }
+
+#[test]
+fn sheet_format_defaults_and_hidden_sheets_are_read() {
+    let fmt =
+        r#"<sheetFormatPr baseColWidth="10" defaultColWidth="12.5" defaultRowHeight="20.25"/>"#;
+    let names = "";
+    let mut bytes = book(
+        names,
+        &[
+            ("Report", Some(&format!("{fmt}{DATA}"))),
+            ("Quiet", Some(DATA)),
+        ],
+    );
+    // Mark the second sheet hidden in workbook.xml.
+    let pkg = load_xlsx(&bytes).unwrap();
+    let mut parts = pkg.parts.clone();
+    let wb = parts
+        .iter_mut()
+        .find(|(n, _)| n == "xl/workbook.xml")
+        .unwrap();
+    let xml = String::from_utf8_lossy(&wb.1)
+        .replace(r#"name="Quiet""#, r#"name="Quiet" state="veryHidden""#);
+    wb.1 = xml.into_bytes();
+    bytes = super::super::write_zip(&parts);
+    let pkg = load_xlsx(&bytes).unwrap();
+    let f = pkg.workbook.sheets[0].format;
+    assert_eq!(
+        (f.base_col_width, f.default_col_width, f.default_row_height),
+        (10, Some(12.5), Some(20.25))
+    );
+    assert!(!pkg.workbook.sheets[0].hidden);
+    assert!(pkg.workbook.sheets[1].hidden);
+    assert_eq!(
+        pkg.workbook.sheets[1].format,
+        crate::sheet::SheetFormat::default()
+    );
+}

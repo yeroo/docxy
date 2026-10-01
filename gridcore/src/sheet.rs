@@ -514,6 +514,12 @@ pub struct Sheet {
     /// The page setup the worksheet part held at load (the default for a
     /// sheet with no part yet), so a save patches only what changed.
     pub page_setup_loaded: crate::print::setup::PageSetup,
+    /// `<sheetFormatPr>`'s default column width and row height, read only:
+    /// the save leaves the element as it is.
+    pub format: SheetFormat,
+    /// `<sheet state="hidden|veryHidden">` in workbook.xml, read only. A
+    /// hidden sheet doesn't print.
+    pub hidden: bool,
     /// Rows an applied filter hid, as opposed to rows hidden by hand: derived
     /// at load from the `<autoFilter>` criteria, and kept by the editor's own
     /// filter. In memory only. `SUBTOTAL(1..11)` skips these rows but counts
@@ -525,6 +531,28 @@ pub struct Sheet {
     /// rewrites the element only when this differs from what the part holds,
     /// and never adds one the file didn't have.
     pub auto_filter: Option<SheetAutoFilter>,
+}
+
+/// A worksheet's `<sheetFormatPr>` sizes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SheetFormat {
+    /// `defaultColWidth`, in the same units as `<col width>` (padding
+    /// included).
+    pub default_col_width: Option<f64>,
+    /// `baseColWidth`: characters, padding excluded (schema default 8).
+    pub base_col_width: u32,
+    /// `defaultRowHeight` in points.
+    pub default_row_height: Option<f64>,
+}
+
+impl Default for SheetFormat {
+    fn default() -> Self {
+        SheetFormat {
+            default_col_width: None,
+            base_col_width: 8,
+            default_row_height: None,
+        }
+    }
 }
 
 /// The position of a sheet's `<autoFilter>`: its range and the column each

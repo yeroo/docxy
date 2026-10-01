@@ -300,7 +300,7 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
     // localSheetId counts workbook.xml order; map it to model indices in
     // case a sheet part is missing and gets skipped.
     let mut orig_to_model: Vec<Option<usize>> = Vec::new();
-    for (name, rid) in sheet_meta {
+    for (name, rid, hidden) in sheet_meta {
         let part = rels
             .iter()
             .find(|(id, _, _)| *id == rid)
@@ -329,6 +329,7 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
 
         let mut sheet = parse_worksheet(&xml, &shared, &hlink_targets);
         sheet.name = name;
+        sheet.hidden = hidden;
         sheet.auto_filter =
             sheet_auto_filter_span(&xml).and_then(|(s, e)| auto_filter_position(&xml[s..e]));
         let sheet_idx = sheets.len();
@@ -817,7 +818,7 @@ pub(crate) fn parse_rels(xml: &str) -> Vec<(String, String, String)> {
 fn parse_workbook_xml(
     xml: &str,
 ) -> (
-    Vec<(String, String)>,
+    Vec<(String, String, bool)>,
     bool,
     Option<(u32, f64)>,
     Vec<(String, Option<usize>, String)>,
@@ -844,7 +845,8 @@ fn parse_workbook_xml(
                             }
                         }
                     }
-                    sheets.push((name, rid));
+                    let hidden = matches!(p.attr("state"), "hidden" | "veryHidden");
+                    sheets.push((name, rid, hidden));
                 }
                 "workbookPr" => {
                     let v = p.attr("date1904");
@@ -1793,6 +1795,21 @@ fn parse_worksheet(
                     }
                 }
                 "customSheetViews" => in_custom_views = true,
+                // The defaults rows and columns without their own size take.
+                "sheetFormatPr" if !in_custom_views => {
+                    let num = |a: &str| {
+                        p.attr(a)
+                            .trim()
+                            .parse::<f64>()
+                            .ok()
+                            .filter(|v| v.is_finite() && *v >= 0.0)
+                    };
+                    sheet.format = crate::sheet::SheetFormat {
+                        default_col_width: num("defaultColWidth"),
+                        base_col_width: num("baseColWidth").map_or(8, |v| v as u32),
+                        default_row_height: num("defaultRowHeight"),
+                    };
+                }
                 "rowBreaks" if !in_custom_views => in_breaks = Some(true),
                 "colBreaks" if !in_custom_views => in_breaks = Some(false),
                 "brk" => match in_breaks {
