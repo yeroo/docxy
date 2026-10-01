@@ -298,14 +298,28 @@ impl BookIn {
         // so the old names are looked up that way.
         let keys: Vec<String> = raw.iter().map(|n| escape_colon(n)).collect();
         let renames = sheet_renames(&keys, &names);
-        let fix = |f: String, name: bool| -> String {
-            let f = retarget(&f, &renames, name).unwrap_or(f);
+        // A formula calling another book's name (`[1]!F(...)`) doesn't
+        // parse, so `retarget` can't move its references to a renamed
+        // sheet. Rather than keep a stale one, it is dropped (`None`): the
+        // cell keeps its value, as before the import read those names.
+        let fix = |f: String, name: bool| -> Option<String> {
+            let f = match retarget(&f, &renames, name) {
+                Some(f) => f,
+                None if f.contains("]!")
+                    && sheet_qualifiers(&f)
+                        .iter()
+                        .any(|q| renames.by_old.contains_key(q)) =>
+                {
+                    return None;
+                }
+                None => f,
+            };
             let f = if f.contains(COLON) {
                 restore_colons(&f)
             } else {
                 f
             };
-            crate::formula::file_formula(&f).into_owned()
+            Some(crate::formula::file_formula(&f).into_owned())
         };
         let mut pkg = crate::xlsx::new_xlsx_sheets(&names);
         // Each format code becomes an xf (the codes are distinct, so none
@@ -321,14 +335,15 @@ impl BookIn {
             let cells = &mut pkg.workbook.sheets[at].cells;
             for (key, mut cell) in sheet.cells {
                 cell.style = xf_of.get(cell.style as usize).copied().unwrap_or(0);
-                if let Some(f) = cell.formula.take() {
-                    cell.formula = Some(fix(f, false));
-                }
+                cell.formula = cell.formula.take().and_then(|f| fix(f, false));
                 cells.insert(key, cell);
             }
         }
         for mut name in self.names {
-            name.formula = fix(name.formula, true);
+            let Some(formula) = fix(name.formula, true) else {
+                continue;
+            };
+            name.formula = formula;
             pkg.workbook.defined_names.push(name);
         }
         pkg.workbook.date1904 = self.date1904;
@@ -1030,6 +1045,66 @@ mod tests {
         assert_eq!(calc.cell(5, 0).unwrap().value, CellValue::Number(7.0));
         assert_eq!(wb.defined_names[0].formula, format!("{cut}!$A$1"));
         assert_eq!(wb.defined_names[1].formula, "A_B!$A$2");
+    }
+
+    /// A call into another book (`[1]!F(...)`) doesn't parse, so a sheet
+    /// rename can't reach inside it: one naming a renamed sheet is dropped
+    /// (a cell keeps its value, a name is left out), and one that doesn't
+    /// stays as it is.
+    #[test]
+    fn a_call_into_another_book_naming_a_renamed_sheet_is_dropped() {
+        use crate::sheet::CellValue;
+        let long = "L".repeat(33);
+        let cut = "L".repeat(31);
+        let cell = |f: &str, v: f64| Cell {
+            value: CellValue::Number(v),
+            formula: Some(f.to_string()),
+            ..Cell::default()
+        };
+        let mut book = BookIn::new();
+        book.push_sheet(SheetIn {
+            name: long.clone(),
+            ..SheetIn::default()
+        })
+        .unwrap();
+        book.push_sheet(SheetIn {
+            name: "Calc".into(),
+            cells: [
+                ((0, 0), cell(&format!("[1]!F('{long}'!A1)"), 9.0)),
+                ((1, 0), cell("[1]!F(Calc!A1)", 8.0)),
+                ((2, 0), cell(&format!("'{long}'!A1*2"), 7.0)),
+            ]
+            .into_iter()
+            .collect(),
+        })
+        .unwrap();
+        for (name, formula) in [
+            ("Stale", format!("[1]!F('{long}'!$A$1)")),
+            ("Kept", "[1]!F(Calc!$A$1)".to_string()),
+        ] {
+            book.names.push(DefinedName {
+                name: name.into(),
+                scope: None,
+                formula,
+            });
+        }
+        let pkg = book.build();
+        let calc = &pkg.workbook.sheets[1];
+        let at = |r| calc.cell(r, 0).unwrap();
+        assert_eq!(at(0).formula, None);
+        assert_eq!(at(0).value, CellValue::Number(9.0));
+        assert_eq!(at(1).formula.as_deref(), Some("[1]!F(Calc!A1)"));
+        assert_eq!(
+            at(2).formula.as_deref(),
+            Some(format!("{cut}!A1*2").as_str())
+        );
+        let names: Vec<(&str, &str)> = pkg
+            .workbook
+            .defined_names
+            .iter()
+            .map(|n| (n.name.as_str(), n.formula.as_str()))
+            .collect();
+        assert_eq!(names, [("Kept", "[1]!F(Calc!$A$1)")]);
     }
 
     /// A sheet raw-named `A:B` keeps its whole-column and whole-row
