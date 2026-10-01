@@ -125,8 +125,8 @@ const CT_NS: &str = "http://schemas.openxmlformats.org/package/2006/content-type
 
 /// The local name of the current start element when it is a content-types
 /// element: in the OPC content-types namespace, or in no namespace (the
-/// unqualified form older docxy maps used; an unqualified child of a prefixed
-/// root is accepted the same way). `Err` means the prefix is unbound, which
+/// unqualified form hand-written maps and the existing tests use; an
+/// unqualified child of a prefixed root is accepted the same way). `Err` means the prefix is unbound, which
 /// makes the map namespace-malformed.
 fn content_types_name<'a>(parser: &XmlParser<'a>) -> Result<Option<&'a str>, ()> {
     let name = parser.name();
