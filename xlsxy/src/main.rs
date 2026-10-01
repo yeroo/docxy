@@ -8518,6 +8518,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #603: Save As on an import not yet written writes the chosen name as
+    /// chosen, even over a file, and never rebinds to `<stem>N.xlsx`. A Save
+    /// As that fails keeps the import unwritten (the next save rechecks).
+    #[test]
+    fn save_as_on_an_unsaved_import_writes_the_chosen_name() {
+        let dir = tmp("legacy-import-save-as");
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/legacy");
+        let source = dir.join("report.xls");
+        std::fs::copy(corpus.join("oracle-basic.xls"), &source).unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.open_workbook(source.to_str().unwrap());
+        assert!(app.import_unsaved);
+
+        // A failed Save As (no such folder) changes nothing.
+        let bound = app.path.clone();
+        let nowhere = dir.join("missing").join("x.xlsx");
+        assert!(!app.save_as(nowhere.to_string_lossy().into_owned()));
+        assert!(app.import_unsaved);
+        assert_eq!(app.path, bound);
+
+        let chosen = dir.join("chosen.xlsx");
+        std::fs::write(&chosen, b"an older file").unwrap();
+        assert!(app.save_as(chosen.to_string_lossy().into_owned()));
+        assert_eq!(Path::new(&app.path), chosen);
+        let saved = load_xlsx(&std::fs::read(&chosen).unwrap()).unwrap();
+        assert_eq!(saved.workbook.sheets[0].name, app.sheet().name);
+        assert!(!dir.join("report.xlsx").exists());
+        assert!(!dir.join("report1.xlsx").exists());
+        assert!(!app.import_unsaved);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #603: the control surface's open (no dialog) imports them the same way.
     #[test]
     fn opening_without_a_dialog_imports_legacy_workbooks_too() {
