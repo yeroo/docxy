@@ -5580,6 +5580,93 @@ pub fn is_db_fn(name: &str) -> bool {
     )
 }
 
+/// Could this formula (its parsed root) return an array? Excel saves a
+/// formula typed as one as a dynamic array (`cm`, `<f t="array">`) even while
+/// its result is a single value — `FILTER` with no match yet (`#CALC!`),
+/// `INDIRECT(B1)` naming one cell — or it would reopen as a legacy
+/// implicit-intersection formula. A static, root-oriented check, conservative
+/// so that scalar formulas over single cells (`INDIRECT("A2")*2`,
+/// `[@Qty]*[@Price]`) stay scalar: the root may be an array-returning
+/// function, a range-producing `INDIRECT`/`OFFSET`/`INDEX`, a multi-cell
+/// reference or array constant, an operator over a multi-cell reference or
+/// an array function's result, or a pass-through (`IF`, `IFERROR`, `CHOOSE`,
+/// `LET`, …) whose value branch is one of those. An `@` asks for a scalar. A
+/// defined name is left to evaluation, which marks the formula dynamic when
+/// it does produce an array.
+pub fn may_return_array(e: &Expr) -> bool {
+    array_valued(e, true)
+}
+
+/// [`may_return_array`] at the root (`root`) or as an operand, where a
+/// range-producing `INDIRECT`/`OFFSET`/`INDEX` is taken as one cell.
+fn array_valued(e: &Expr, root: bool) -> bool {
+    let single = |a: &CellRef, b: &CellRef| a.row == b.row && a.col == b.col;
+    match e {
+        Expr::Range(a, b) => !single(a, b),
+        Expr::ColRange { .. } | Expr::RowRange { .. } | Expr::SpillRef(_) => true,
+        Expr::ArrayLit(rows) => rows.len() * rows.first().map_or(0, Vec::len) > 1,
+        // A this-row ref, and a header or totals cell of one column, is a
+        // single cell.
+        Expr::Structured {
+            item, col1, col2, ..
+        } => match item {
+            TableItem::ThisRow => false,
+            TableItem::Headers | TableItem::Totals => match (col1, col2) {
+                (Some(_), None) => false,
+                (Some(a), Some(b)) => !a.eq_ignore_ascii_case(b),
+                (None, _) => true,
+            },
+            TableItem::Data | TableItem::All => true,
+        },
+        Expr::Un(UnOp::Implicit, _) => false,
+        Expr::Un(_, x) => array_valued(x, false),
+        Expr::Bin(_, a, b) => array_valued(a, false) || array_valued(b, false),
+        Expr::Func(name, args) => match name.as_str() {
+            "INDIRECT" | "OFFSET" | "INDEX" => root,
+            "IF" => args.iter().skip(1).take(2).any(|a| array_valued(a, root)),
+            "IFERROR" | "IFNA" => args.iter().take(2).any(|a| array_valued(a, root)),
+            "CHOOSE" => args.iter().skip(1).any(|a| array_valued(a, root)),
+            "IFS" => args.iter().skip(1).step_by(2).any(|a| array_valued(a, root)),
+            "SWITCH" => {
+                // SWITCH(expr, value1, result1, …, [default])
+                let results = args.iter().skip(2).step_by(2);
+                let default = (args.len() > 1 && args.len() % 2 == 0).then(|| &args[args.len() - 1]);
+                results.chain(default).any(|a| array_valued(a, root))
+            }
+            "LET" => args.last().is_some_and(|body| {
+                // A body that is just one of the LET's own names is the value
+                // bound to it (the last binding of that name).
+                let bound = match body {
+                    Expr::Name(n) => args[..args.len() - 1]
+                        .chunks(2)
+                        .rev()
+                        .find(|p| matches!(&p[0], Expr::Name(m) if bare_param(m).eq_ignore_ascii_case(bare_param(n))))
+                        .and_then(|p| p.get(1)),
+                    _ => None,
+                };
+                array_valued(bound.unwrap_or(body), root)
+            }),
+            "REDUCE" => false,
+            n => {
+                is_array_fn(n)
+                    || is_higher_order_fn(n)
+                    || matches!(
+                        n,
+                        "GROUPBY"
+                            | "PIVOTBY"
+                            | "REGEXEXTRACT"
+                            | "TRIMRANGE"
+                            | "LINEST"
+                            | "LOGEST"
+                            | "TREND"
+                            | "GROWTH"
+                    )
+            }
+        },
+        _ => false,
+    }
+}
+
 /// Is this one of the dynamic-array functions resolved in `eval_arg` (they
 /// can return matrices)?
 fn is_array_fn(name: &str) -> bool {
@@ -14253,5 +14340,85 @@ mod tests {
         assert_eq!(t("TEXT(0.5,\"0.0\")"), "0.5");
         assert_eq!(t("TEXT(0.5,\"#.#\")"), ".5");
         assert_eq!(t("TEXT(-2.25,\"0.0\")"), "-2.3");
+    }
+
+    #[test]
+    fn may_return_array_rules() {
+        let yes = [
+            "FILTER(A1:A3,A1:A3>5)",
+            "_xlfn._xlws.SORT(A1:A3)",
+            "SEQUENCE(3)",
+            "UNIQUE(A1:A3)",
+            "MAP(A1:A3,LAMBDA(x,x*2))",
+            "BYROW(A1:B3,LAMBDA(r,SUM(r)))",
+            "TREND(A1:A3)",
+            "INDIRECT(B1)",
+            "OFFSET(A1,0,0,3)",
+            "INDEX(A1:C3,2,0)",
+            "A1:A3",
+            "A:A",
+            "1:2",
+            "A1#",
+            "{1,2}",
+            "Sales[Qty]",
+            "Sales[[#Totals],[Qty]:[Price]]",
+            "Sales[#Headers]",
+            "A1:A3*2",
+            "-A1:A3",
+            "SEQUENCE(1)*2",
+            "A1:A3%",
+            "IF(A1>1,FILTER(A1:A3,A1:A3>1),0)",
+            "IFERROR(FILTER(A1:A3,A1:A3>5),\"\")",
+            "IFNA(INDIRECT(B1),0)",
+            "CHOOSE(1,A1:A3,B1:B3)",
+            "SWITCH(A1,1,A1:A3,0)",
+            "SWITCH(A1,1,0,B1:B3)",
+            "IFS(A1>1,A1:A3)",
+            "LET(x,FILTER(A1:A3,A1:A3>1),x)",
+            "LET(x,A1,SEQUENCE(x))",
+            "(A1:A3)",
+        ];
+        let no = [
+            // #724 r1: elementwise ops over single cells are scalar.
+            "[@Qty]*[@Price]",
+            "OFFSET(A2,0,1)+1",
+            "INDIRECT(\"A2\")*2",
+            "-OFFSET(A2,0,0)",
+            "OFFSET(A2,0,0)>1",
+            "OFFSET(A2,0,0)&\"x\"",
+            "ABS(OFFSET(A2,0,0))",
+            "IF(OFFSET(A2,0,0)>1,1,2)",
+            "OFFSET(A2,0,0)*OFFSET(A2,0,1)",
+            "A1+1",
+            "A1",
+            "A1:A1",
+            "{1}",
+            "SUM(A1:A3)",
+            "ROWS(FILTER(A1:A3,A1:A3>1))",
+            "LET(x,FILTER(A1:A3,A1:A3>1),ROWS(x))",
+            "@INDIRECT(B1)",
+            "@A1:A3",
+            "REDUCE(0,A1:A3,LAMBDA(a,b,a+b))",
+            "XLOOKUP(2,A1:A3,A1:A3)",
+            "IF(A1:A3>1,1,2)",
+            "IFERROR(A1,A2)",
+            "Sales[[#Totals],[Qty]]",
+            "Sales[[#Headers],[Qty]]",
+            "Sales[[#Totals],[Qty]]*2",
+            "Sales[[#Totals],[Qty]:[Qty]]",
+            "MyRange",
+            "LAMBDA(x,x)(A1)",
+            "Sheet1:Sheet3!A1",
+            "SUM(Sheet1:Sheet3!A1:A3)",
+        ];
+        for src in yes {
+            assert!(
+                may_return_array(&parse(src).unwrap()),
+                "{src} may be an array"
+            );
+        }
+        for src in no {
+            assert!(!may_return_array(&parse(src).unwrap()), "{src} is scalar");
+        }
     }
 }

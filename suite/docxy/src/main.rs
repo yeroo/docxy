@@ -15595,6 +15595,36 @@ mod clipboard_tests {
         assert_eq!(f_attrs_at(&wb, 1), Some(" t=\"array\" ref=\"D1:D3\""));
     }
 
+    /// #777: a pasted spill block (anchor + its spilled values) pastes as a
+    /// spilling anchor, over empty cells and over old values alike.
+    #[test]
+    fn a_pasted_spill_block_respills() {
+        let mut wb = Workbook {
+            sheets: vec![Sheet {
+                name: "Sheet1".into(),
+                ..Sheet::default()
+            }],
+            ..Workbook::default()
+        };
+        let mut engine = Engine::new(&wb);
+        engine.set_cell(&mut wb, (0, 0, 2), Cell::formula("SEQUENCE(3)"));
+        let block: Vec<Vec<Cell>> = (0..3)
+            .map(|r| vec![wb.sheets[0].cell(r, 2).cloned().unwrap()])
+            .collect();
+        for r in 0..3 {
+            engine.set_cell(&mut wb, (0, r, 8), Cell::text("old"));
+        }
+        let n = |v: f64| CellValue::Number(v);
+        for col in [6, 8] {
+            engine.paste_block(&mut wb, 0, (0, col), &block);
+            let got: Vec<CellValue> = (0..3)
+                .map(|r| wb.sheets[0].cell(r, col).unwrap().value.clone())
+                .collect();
+            assert_eq!(got, vec![n(1.0), n(2.0), n(3.0)], "col {col}");
+            assert_eq!(wb.sheets[0].cell(0, col).unwrap().spill, Some((3, 1)));
+        }
+    }
+
     /// Two sheets, "Sheet1" and "Data"; Data holds 1, 2, 3 in A1:A3 and
     /// `formula` as a CSE block over D1:D3, recalculated.
     fn cse_workbook(formula: &str) -> (Workbook, Engine) {

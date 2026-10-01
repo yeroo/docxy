@@ -6,7 +6,7 @@
 //! a sparse `BTreeMap` so memory is proportional to content, and iteration is
 //! naturally row-major (the order worksheet XML wants).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 // ---------------------------------------------------------------------------
 // A1 reference math
@@ -202,6 +202,13 @@ pub(crate) fn ref_starts_at(fa: &str, anchor: &str) -> bool {
         .is_some_and(|tl| tl.eq_ignore_ascii_case(anchor))
 }
 
+/// Does the `ref` in preserved `<f>` attributes cover `(row, col)`?
+pub(crate) fn ref_covers(fa: &str, row: u32, col: u32) -> bool {
+    f_ref(fa)
+        .and_then(parse_range_name)
+        .is_some_and(|(r1, c1, r2, c2)| (r1..=r2).contains(&row) && (c1..=c2).contains(&col))
+}
+
 /// An array formula at `(row, col)` whose `ref` doesn't start there names
 /// another block (a clone, or a cell moved without the engine): it covers
 /// its own cell instead. A ref that does start there is left as it is.
@@ -222,7 +229,56 @@ pub fn array_block(cell: &Cell) -> Option<(u32, u32, u32, u32)> {
     parse_range_name(f_ref(fa)?)
 }
 
+/// Undo/redo snapshots of the cells at `keys` as the sheet holds them now: a
+/// plain cell inside the spill of a live anchor is spill output, and is
+/// snapshotted as a blank ([`Cell::blank_like`]) the anchor re-spills over.
+/// Put back as a plain value it would block the anchor with `#SPILL!` (the
+/// engine drops a submitted extent and recomputes it). An anchor `frozen`
+/// reports as kept on its cached values (asked only of anchors over a key)
+/// never re-spills, so its cells are kept as they are.
+pub fn snapshot_cells(
+    sheet: &Sheet,
+    keys: &[(u32, u32)],
+    mut frozen: impl FnMut(u32, u32) -> bool,
+) -> Vec<Option<Cell>> {
+    let anchors: Vec<((u32, u32), (u32, u32))> = sheet
+        .cells
+        .iter()
+        .filter(|(_, cl)| cl.formula.is_some())
+        .filter_map(|(&at, cl)| cl.spill.map(|ext| (at, ext)))
+        .collect();
+    let mut live: HashMap<(u32, u32), bool> = HashMap::new();
+    keys.iter()
+        .map(|&(r, c)| {
+            let cell = sheet.cell(r, c)?;
+            let spilled = cell.formula.is_none()
+                && anchors.iter().any(|&((ar, ac), (h, w))| {
+                    (r, c) != (ar, ac)
+                        && r >= ar
+                        && r < ar + h
+                        && c >= ac
+                        && c < ac + w
+                        && *live.entry((ar, ac)).or_insert_with(|| !frozen(ar, ac))
+                });
+            Some(if spilled {
+                cell.blank_like()
+            } else {
+                cell.clone()
+            })
+        })
+        .collect()
+}
+
 impl Cell {
+    /// An empty cell with this one's style: what a spilled value is put back
+    /// as, ahead of the anchor that refills it.
+    pub fn blank_like(&self) -> Cell {
+        Cell {
+            style: self.style,
+            ..Cell::default()
+        }
+    }
+
     pub fn number(n: f64) -> Cell {
         Cell {
             value: CellValue::Number(n),
@@ -2073,6 +2129,51 @@ pub fn sheet_to_csv(sheet: &Sheet, styles: &Styles, date1904: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshots_blank_the_spill_output_of_a_live_anchor() {
+        // #777 r1: C1 spills C1:C3 and is not among the keys; E1 is frozen.
+        let mut sheet = Sheet::default();
+        let anchor = |src: &str| Cell {
+            spill: Some((3, 1)),
+            ..Cell::formula(src)
+        };
+        sheet.set_cell(0, 2, anchor("SEQUENCE(3)"));
+        sheet.set_cell(
+            1,
+            2,
+            Cell {
+                style: 2,
+                ..Cell::number(2.0)
+            },
+        );
+        sheet.set_cell(2, 2, Cell::number(3.0));
+        sheet.set_cell(0, 4, anchor("PIVOTBY(A1,4)"));
+        sheet.set_cell(1, 4, Cell::number(8.0));
+        sheet.set_cell(3, 2, Cell::number(4.0)); // below the spill
+        let keys = [(0, 2), (1, 2), (2, 2), (3, 2), (1, 4), (5, 5)];
+        let mut asked = Vec::new();
+        let frozen = |r, c| (r, c) == (0, 4);
+        let snap = snapshot_cells(&sheet, &keys, |r, c| {
+            asked.push((r, c));
+            frozen(r, c)
+        });
+        assert_eq!(snap[0].as_ref(), sheet.cell(0, 2)); // the anchor itself
+        assert_eq!(
+            snap[1],
+            Some(Cell {
+                style: 2,
+                ..Cell::default()
+            })
+        );
+        assert_eq!(snap[2], Some(Cell::default()));
+        assert_eq!(snap[3], Some(Cell::number(4.0)));
+        assert_eq!(snap[4], Some(Cell::number(8.0))); // a frozen anchor's value
+        assert_eq!(snap[5], None);
+        // Asked once per anchor over a key, never of the others.
+        asked.sort();
+        assert_eq!(asked, vec![(0, 2), (0, 4)]);
+    }
 
     #[test]
     fn an_undisplayable_date_or_time_is_a_hash_run() {

@@ -125,6 +125,30 @@ impl Engine {
         self.unsupported.contains(&key)
     }
 
+    /// Is this cell's formula kept on its cached value — beyond the engine,
+    /// whether or not it has been evaluated yet (xlsxy opens a workbook on its
+    /// cached values)? A formula not yet known to be is evaluated, without
+    /// storing anything, to find out. Hosts ask this of a spill anchor before
+    /// treating its cells as spill output that a re-spill re-creates: a frozen
+    /// anchor never re-spills.
+    pub fn is_frozen(&self, wb: &Workbook, key: Key) -> bool {
+        if self.unsupported.contains(&key) {
+            return true;
+        }
+        let Some(info) = self.formulas.get(&key) else {
+            return false;
+        };
+        let resolver = WbResolver {
+            wb,
+            clock: self.clock,
+            rand_state: StdCell::new(self.seed.unwrap_or(0)),
+            has_rand: self.seed.is_some(),
+        };
+        let mut ev = Eval::new(&resolver, key.0, (key.1, key.2));
+        let _ = ev.eval_dynamic_shaped(&info.ast, !info.legacy);
+        ev.unsupported
+    }
+
     /// Register a cell's formula (if any) as it stands, the way a freshly
     /// built engine sees it.
     fn index_cell(&mut self, wb: &Workbook, key: Key, cell: &Cell) {
@@ -191,10 +215,9 @@ impl Engine {
     /// [`Engine::set_styles`], which leaves a spill whole.
     pub fn set_cell(&mut self, wb: &mut Workbook, key: Key, mut cell: Cell) {
         let (s, r, c) = key;
-        // A pasted anchor's extent is its source's, not this cell's: kept, it
-        // would claim (and overwrite) the values below the target. Evaluation
-        // works out the spill afresh.
-        cell.spill = None;
+        // A pasted anchor's extent is its source's, not this cell's:
+        // [`Engine::put_cell`] drops it, and evaluation works out the spill
+        // afresh.
         let prev = wb.sheets.get(s).and_then(|sh| sh.cell(r, c));
         match prev.filter(|p| cell.formula.is_some() && p.formula == cell.formula) {
             // What kind of formula it is comes from the cell's own previous
@@ -219,6 +242,17 @@ impl Engine {
                 let m = cell.meta.get_or_insert_default();
                 m.modern = true;
                 forget_file_meta(m);
+                // One that could return an array is a dynamic array from the
+                // start, even while its result is one value (FILTER with no
+                // match yet): it saves with a `cm`, or it would reopen as a
+                // legacy formula. Evaluation marks the ones this misses.
+                let may_array = cell
+                    .formula
+                    .as_deref()
+                    .and_then(|f| formula::parse(f).ok())
+                    .is_some_and(|ast| formula::may_return_array(&ast));
+                let m = cell.meta.get_or_insert_default();
+                m.dynamic |= may_array;
             }
             None => {}
         }
@@ -288,7 +322,7 @@ impl Engine {
             }
             if cell.formula.is_none() && in_extent(&anchors, r, c) {
                 members.push((r, c, cell));
-                self.restore_cell(wb, (s, r, c), styled_blank(cell));
+                self.restore_cell(wb, (s, r, c), cell.blank_like());
             } else {
                 self.restore_cell(wb, (s, r, c), cell.clone());
             }
@@ -380,7 +414,7 @@ impl Engine {
                 }
                 if cell.formula.is_none() && in_extent(&extents, r, c) {
                     members.push((r, c, cell));
-                    self.set_cell(wb, (s, r, c), styled_blank(cell));
+                    self.set_cell(wb, (s, r, c), cell.blank_like());
                 } else {
                     self.set_cell(wb, (s, r, c), cell.clone());
                 }
@@ -433,8 +467,56 @@ impl Engine {
         }
     }
 
-    fn put_cell(&mut self, wb: &mut Workbook, key: Key, cell: Cell) {
+    /// A cell's spill extent is the engine's own state, derived by
+    /// [`Engine::eval_one`] — never input. An incoming one (a pasted or filled
+    /// clone of an anchor, an undo/redo snapshot) names the source's spill, and
+    /// left in place it would make the cells under it count as this anchor's
+    /// own, overwriting (or, on a scalar result, clearing) what they hold. So
+    /// it is dropped and the anchor re-spills on its own recalc. Callers that
+    /// submit an anchor together with its spilled values blank those first
+    /// ([`Engine::paste_block`], [`Engine::restore_cells`], and the hosts'
+    /// undo snapshots through [`crate::sheet::snapshot_cells`]), or they would
+    /// block it; a frozen anchor's extent and values are put back by
+    /// `refill_frozen`.
+    fn put_cell(&mut self, wb: &mut Workbook, key: Key, mut cell: Cell) {
+        cell.spill = None;
         let (s, r, c) = key;
+        let mut owner = wb.sheets.get(s).and_then(|sh| spill_owner(sh, r, c));
+        let owner_frozen = owner.is_some_and(|((ar, ac), _)| self.is_frozen(wb, (s, ar, ac)));
+        // A frozen anchor's extent is never corrected: row/column edits
+        // shift its array `ref` but not its extent, and a sort moves the
+        // anchor (extent and all) but leaves its absolute `ref` as is. Its
+        // block is what a `ref` that starts at the anchor covers; elsewhere
+        // the cell is not part of it and the edit leaves the anchor alone.
+        let frozen_ref_covers = owner.filter(|_| owner_frozen).and_then(|(anchor, _)| {
+            let a = wb.sheets[s].cell(anchor.0, anchor.1)?;
+            let fa = a.f_attrs.as_deref().filter(|fa| is_array_f(fa))?;
+            let own = crate::sheet::ref_starts_at(fa, &crate::sheet::cell_name(anchor.0, anchor.1));
+            Some(own && crate::sheet::ref_covers(fa, r, c))
+        });
+        if frozen_ref_covers == Some(false) {
+            owner = None;
+        }
+        // Deleting a cell of a frozen anchor's block (or putting back the
+        // value it holds, as undo/redo of that does) is a no-op but for the
+        // style, as deleting a spilled cell is in Excel: the anchor never
+        // re-spills, so its block must stay whole — cached values, extent
+        // and the `ref` the writer gives it.
+        let in_frozen_block = frozen_ref_covers == Some(true);
+        if in_frozen_block && cell.formula.is_none() {
+            if let Some(sheet) = wb.sheets.get_mut(s) {
+                let held = sheet.cell(r, c);
+                let same = held.is_none_or(|h| h.formula.is_none())
+                    && (cell.value.is_empty() || held.is_some_and(|h| h.value == cell.value));
+                if same {
+                    match sheet.cells.get_mut(&(r, c)) {
+                        Some(h) => h.style = cell.style,
+                        None => sheet.set_cell(r, c, cell),
+                    }
+                    return;
+                }
+            }
+        }
         // Drop stale bookkeeping for this address.
         self.formulas.remove(&key);
         self.circular.remove(&key);
@@ -447,10 +529,14 @@ impl Engine {
                 changed.extend(clear_spill(sheet, s, (r, c), ext, None));
             }
             // An edit landing inside another anchor's spill breaks that
-            // spill: clear its cells (this one is overwritten next) and let
-            // the anchor recalc to #SPILL!.
-            if let Some((anchor, ext)) = spill_owner(sheet, r, c) {
-                changed.extend(clear_spill(sheet, s, anchor, ext, None));
+            // spill: clear its cells and let the anchor recalc to #SPILL!.
+            // A frozen anchor never re-spills, so content typed into its
+            // block leaves its other cached cells as they are (plain values
+            // now that it has no extent).
+            if let Some((anchor, ext)) = owner {
+                if !owner_frozen {
+                    changed.extend(clear_spill(sheet, s, anchor, ext, None));
+                }
                 if let Some(a) = sheet.cells.get_mut(&anchor) {
                     a.spill = None;
                 }
@@ -984,15 +1070,6 @@ fn in_extent(anchors: &[(u32, u32, &Cell)], r: u32, c: u32) -> bool {
             && a.spill
                 .is_some_and(|(h, w)| (ar..ar + h).contains(&r) && (ac..ac + w).contains(&c))
     })
-}
-
-/// A blank keeping `cell`'s style: a spilled value written ahead of its
-/// anchor, which refills it.
-fn styled_blank(cell: &Cell) -> Cell {
-    Cell {
-        style: cell.style,
-        ..Cell::default()
-    }
 }
 
 /// Drop the metadata a cell brought from a file (`cm`, `vm`): its indices
@@ -2826,9 +2903,10 @@ mod tests {
     }
 
     #[test]
-    fn typed_scalar_formula_stays_modern_after_rebuild() {
-        // A typed FILTER that matches nothing yet (#CALC!) is not an array,
-        // but it is ours: after a rebuild it still spills once rows match.
+    fn typed_no_match_filter_is_dynamic_and_respills_after_rebuild() {
+        // A typed FILTER that matches nothing yet (#CALC!) is ours: after a
+        // rebuild it still spills once rows match. It could return an array,
+        // so it is a dynamic array from the start (#777).
         let mut wb = wb_one_sheet(&[
             ("A1", Cell::number(1.0)),
             ("A2", Cell::number(2.0)),
@@ -2838,7 +2916,7 @@ mod tests {
         eng.set_cell(&mut wb, (0, 0, 2), Cell::formula("FILTER(A1:A3,A1:A3>5)"));
         let c1 = wb.sheets[0].cell(0, 2).unwrap();
         assert_eq!(c1.value, CellValue::Error("#CALC!".into()));
-        assert!(c1.is_modern() && !c1.is_dynamic());
+        assert!(c1.is_modern() && c1.is_dynamic());
         let mut eng = Engine::new(&wb);
         eng.recalc_all(&mut wb);
         for (r, v) in [6.0, 7.0, 8.0].into_iter().enumerate() {
@@ -3172,5 +3250,166 @@ mod tests {
         assert_eq!(cell_at(&wb, "D1").spill, Some((3, 1)));
         assert_eq!(value_at(&wb, "D2"), CellValue::Number(4.0));
         assert_eq!(value_at(&wb, "D3"), CellValue::Number(6.0));
+    }
+
+    #[test]
+    fn pasted_anchor_does_not_keep_source_spill_extent() {
+        // #777: a pasted clone of a spill anchor carries the source's extent;
+        // the engine must not take the target's neighbours for its own spill.
+        let mut wb = wb_one_sheet(&[("B1", Cell::number(1.0))]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "C1", Cell::formula("SEQUENCE(3)"));
+        set(&mut eng, &mut wb, "G2", Cell::text("keep"));
+        let c1 = wb.sheets[0].cell(0, 2).unwrap().clone();
+        assert_eq!(c1.spill, Some((3, 1)));
+        set(&mut eng, &mut wb, "G1", c1);
+        assert_eq!(value_at(&wb, "G1"), CellValue::Error("#SPILL!".into()));
+        assert_eq!(value_at(&wb, "G2"), CellValue::Text("keep".into()));
+        assert_eq!(value_at(&wb, "G3"), CellValue::Empty);
+        assert_eq!(wb.sheets[0].cell(0, 6).unwrap().spill, None);
+
+        // Pasted where it evaluates to a scalar, it leaves the cells under the
+        // source's extent alone.
+        set(
+            &mut eng,
+            &mut wb,
+            "D1",
+            Cell::formula("IF(B1=1,SEQUENCE(3),0)"),
+        );
+        set(&mut eng, &mut wb, "K2", Cell::text("x"));
+        set(&mut eng, &mut wb, "K3", Cell::text("y"));
+        let d1 = wb.sheets[0].cell(0, 3).unwrap().clone();
+        assert_eq!(d1.spill, Some((3, 1)));
+        let pasted = Cell {
+            formula: Some("IF(H1=1,SEQUENCE(3),0)".into()),
+            ..d1
+        };
+        set(&mut eng, &mut wb, "K1", pasted);
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(0.0));
+        assert_eq!(value_at(&wb, "K2"), CellValue::Text("x".into()));
+        assert_eq!(value_at(&wb, "K3"), CellValue::Text("y".into()));
+
+        // The #725 repro: D1 SEQUENCE(3), F2 = 99, paste D1 at F1.
+        let mut wb = wb_one_sheet(&[]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "D1", Cell::formula("SEQUENCE(3)"));
+        set(&mut eng, &mut wb, "F2", Cell::number(99.0));
+        let d1 = wb.sheets[0].cell(0, 3).unwrap().clone();
+        set(&mut eng, &mut wb, "F1", d1);
+        assert_eq!(value_at(&wb, "F1"), CellValue::Error("#SPILL!".into()));
+        assert_eq!(value_at(&wb, "F2"), CellValue::Number(99.0));
+        // Clearing the blocker lets it spill.
+        set(&mut eng, &mut wb, "F2", Cell::default());
+        assert_eq!(value_at(&wb, "F3"), CellValue::Number(3.0));
+    }
+
+    #[test]
+    fn restoring_an_anchor_snapshot_does_not_overwrite_neighbours() {
+        // An undo/redo snapshot of an anchor carries the extent it had; put
+        // back where its spill area is now occupied, it is #SPILL!.
+        let mut wb = wb_one_sheet(&[]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "C1", Cell::formula("SEQUENCE(3)"));
+        let snap = wb.sheets[0].cell(0, 2).unwrap().clone();
+        set(&mut eng, &mut wb, "C1", Cell::default());
+        set(&mut eng, &mut wb, "C2", Cell::text("keep"));
+        eng.restore_cell(&mut wb, (0, 0, 2), snap.clone());
+        assert_eq!(value_at(&wb, "C1"), CellValue::Error("#SPILL!".into()));
+        assert_eq!(value_at(&wb, "C2"), CellValue::Text("keep".into()));
+        assert_eq!(value_at(&wb, "C3"), CellValue::Empty);
+        // Over empty cells it spills again.
+        set(&mut eng, &mut wb, "C2", Cell::default());
+        eng.restore_cell(&mut wb, (0, 0, 2), snap);
+        assert_eq!(value_at(&wb, "C3"), CellValue::Number(3.0));
+        assert_eq!(wb.sheets[0].cell(0, 2).unwrap().spill, Some((3, 1)));
+    }
+
+    #[test]
+    fn blanking_a_spill_child_keeps_the_spill() {
+        // An edit inside another anchor's spill clears all of that spill
+        // before the anchor recalcs: blanking its last cell (what a pasted
+        // spill block does with its children) must not leave a stale value
+        // above it to block the anchor.
+        let mut wb = wb_one_sheet(&[]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "C1", Cell::formula("SEQUENCE(3)"));
+        set(&mut eng, &mut wb, "C3", Cell::default());
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(1.0));
+        assert_eq!(value_at(&wb, "C2"), CellValue::Number(2.0));
+        assert_eq!(value_at(&wb, "C3"), CellValue::Number(3.0));
+        // A value typed into it still blocks the anchor, and nothing stale
+        // is left once it goes.
+        set(&mut eng, &mut wb, "C3", Cell::number(9.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Error("#SPILL!".into()));
+        assert_eq!(value_at(&wb, "C2"), CellValue::Empty);
+        set(&mut eng, &mut wb, "C3", Cell::default());
+        assert_eq!(value_at(&wb, "C3"), CellValue::Number(3.0));
+    }
+
+    #[test]
+    fn typed_maybe_array_formulas_are_dynamic() {
+        // #777: a typed formula that could return an array is a dynamic array
+        // even when its result is one value; scalar ones are not.
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("A2", Cell::number(2.0)),
+            ("A3", Cell::number(3.0)),
+            ("B1", Cell::text("A2")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        let cases = [
+            (
+                "D1",
+                "FILTER(A1:A3,A1:A3>5)",
+                true,
+                CellValue::Error("#CALC!".into()),
+            ),
+            ("D2", "INDIRECT(B1)", true, CellValue::Number(2.0)),
+            (
+                "D3",
+                "IFERROR(FILTER(A1:A3,A1:A3>5),\"\")",
+                true,
+                CellValue::Text(String::new()),
+            ),
+            ("D4", "A1+1", false, CellValue::Number(2.0)),
+            ("D5", "SUM(A1:A3)", false, CellValue::Number(6.0)),
+            (
+                "D6",
+                "ROWS(FILTER(A1:A3,A1:A3>1))",
+                false,
+                CellValue::Number(2.0),
+            ),
+            ("D7", "@INDIRECT(B1)", false, CellValue::Number(2.0)),
+        ];
+        for (name, src, _, _) in &cases {
+            set(&mut eng, &mut wb, name, Cell::formula(src));
+        }
+        for (name, src, dynamic, want) in &cases {
+            let (r, c) = crate::sheet::parse_cell_name(name).unwrap();
+            let cell = wb.sheets[0].cell(r, c).unwrap();
+            assert_eq!(&cell.value, want, "{src}");
+            assert!(cell.is_modern(), "{src}");
+            assert_eq!(cell.is_dynamic(), *dynamic, "{src}");
+        }
+    }
+
+    #[test]
+    fn is_frozen_knows_an_unevaluated_unsupported_formula() {
+        // xlsxy opens on cached values: nothing has been evaluated yet.
+        let wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("B1", array_formula("PIVOTBY(A1,4)")),
+            ("C1", array_formula("SEQUENCE(3)")),
+        ]);
+        let eng = Engine::new(&wb);
+        assert!(!eng.is_unsupported((0, 0, 1)));
+        assert!(eng.is_frozen(&wb, (0, 0, 1)));
+        assert!(!eng.is_frozen(&wb, (0, 0, 2)));
+        assert!(!eng.is_frozen(&wb, (0, 0, 0)));
+        // Evaluated, it is known.
+        let mut wb = wb;
+        let mut eng = eng;
+        eng.recalc_all(&mut wb);
+        assert!(eng.is_unsupported((0, 0, 1)) && eng.is_frozen(&wb, (0, 0, 1)));
     }
 }

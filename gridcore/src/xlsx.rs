@@ -10902,6 +10902,40 @@ b",
     }
 
     #[test]
+    fn typed_maybe_array_formulas_save_as_dynamic_arrays() {
+        // #777: a typed formula that could return an array saves as one even
+        // if it never evaluated array-shaped — FILTER with no match yet
+        // (#CALC!), INDIRECT/INDEX naming one cell — so neither Excel nor
+        // xlsxy reopens it as a legacy implicit-intersection formula.
+        let srcs = [
+            "FILTER(A1:A3,A1:A3>5)",
+            "INDIRECT(B1)",
+            "IFERROR(FILTER(A1:A3,A1:A3>5),\"\")",
+            "INDEX(A1:A3,2)",
+        ];
+        let mut typed: Vec<((u32, u32), &str)> = srcs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| ((i as u32, 2), *s))
+            .collect();
+        typed.insert(0, ((0, 1), "\"A2\""));
+        let (pkg, _) = typed_book(&typed);
+        let (re, ws) = resaved(&pkg);
+        for (i, src) in srcs.iter().enumerate() {
+            let f = format!(
+                r#" cm="1"><f t="array" ref="C{n}">{}</f>"#,
+                esc_text(&file_formula(src)),
+                n = i + 1
+            );
+            let c = saved_cell(&ws, &format!("C{}", i + 1));
+            assert!(c.contains(&f), "{f} in {c}");
+            let cell = re.workbook.sheets[0].cell(i as u32, 2).unwrap();
+            assert!(cell.is_array_formula() && cell.has_cm(), "{src}");
+        }
+        assert!(re.part("xl/metadata.xml").is_some());
+    }
+
+    #[test]
     fn typed_blocked_spill_saves_with_cm() {
         // #724 AC2: an anchor whose spill is blocked shows #SPILL! but is
         // still a dynamic array.
@@ -10930,7 +10964,6 @@ b",
             "A1",
             "A1*A2",
             "XLOOKUP(2,A1:A3,A1:A3)",
-            "INDEX(A1:A3,2)",
             "IF(A1>1,1,2)",
             // One-cell ranges from functions are single values too.
             "OFFSET(A1,0,0)+1",
@@ -11611,6 +11644,110 @@ b",
     }
 
     #[test]
+    fn fill_copy_of_a_cm_cell_saves_without_its_cm() {
+        // #777: Ctrl+D/Ctrl+R (fill_changes) copies, like autofill's, carry
+        // none of the source's `<c>` metadata: a copy of a 1x1 dynamic array
+        // whose own formula is scalar saves as a plain formula, not as an
+        // array because the source was one.
+        let rows = r#"<row r="1"><c r="A1"><v>3</v></c><c r="B1"><v>4</v></c><c r="D1" cm="1"><f t="array" ref="D1">A1*2</f><v>6</v></c></row>"#;
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        fill_from_d1(&mut pkg, (0, 4), false);
+        let e1 = pkg.workbook.sheets[0].cell(0, 4).unwrap();
+        assert!(!e1.has_cm() && e1.is_modern() && !e1.is_dynamic());
+        let ws = saved_sheet1(&pkg);
+        assert_eq!(
+            saved_cell(&ws, "E1"),
+            r#"<c r="E1"><f>B1*2</f><v>8</v></c>"#
+        );
+        assert!(saved_cell(&ws, "D1").contains(r#"cm="1""#), "{ws}");
+    }
+
+    #[test]
+    fn deleting_a_cell_of_a_frozen_dynamic_array_keeps_its_block() {
+        // #777 r3: a loaded `cm` dynamic array the engine can't evaluate is
+        // frozen. Deleting one of its cells is a no-op (Excel's too): it
+        // saves whole, not as an anchor over plain constants that Excel's
+        // recalc would block with #SPILL!.
+        let rows = concat!(
+            r#"<row r="1"><c r="A1"><v>1</v></c><c r="E1" cm="1"><f t="array" ref="E1:E3">_xlfn.PIVOTBY(A1,4)</f><v>7</v></c></row>"#,
+            r#"<row r="2"><c r="E2"><v>8</v></c></row>"#,
+            r#"<row r="3"><c r="E3"><v>9</v></c></row>"#,
+        );
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 1, 4), Cell::default());
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(0, 4).unwrap().spill,
+            Some((3, 1))
+        );
+        let ws = saved_sheet1(&pkg);
+        assert!(
+            ws.contains(
+                r#"<c r="E1" cm="1"><f t="array" ref="E1:E3">_xlfn.PIVOTBY(A1,4)</f><v>7</v></c>"#
+            ),
+            "{ws}"
+        );
+        assert!(ws.contains(r#"<c r="E2"><v>8</v></c>"#), "{ws}");
+    }
+
+    #[test]
+    fn delete_outside_a_frozen_arrays_shifted_ref_still_clears() {
+        // #777 r4: a row delete shifts a frozen anchor's `ref` (E1:E3 →
+        // E1:E2) but not its stale extent, so E3 — now the user's "x" — is
+        // not part of the block: Delete clears it. E2 still is: a no-op.
+        let rows = concat!(
+            r#"<row r="1"><c r="A1"><v>1</v></c><c r="E1" cm="1"><f t="array" ref="E1:E3">_xlfn.PIVOTBY(A1,4)</f><v>7</v></c></row>"#,
+            r#"<row r="2"><c r="E2"><v>8</v></c></row>"#,
+            r#"<row r="3"><c r="E3"><v>9</v></c></row>"#,
+            r#"<row r="4"><c r="E4" t="inlineStr"><is><t>x</t></is></c></row>"#,
+        );
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        crate::edit::delete_rows(&mut pkg.workbook, 0, 1, 1);
+        let at = |pkg: &SheetPackage, r: u32| {
+            pkg.workbook.sheets[0]
+                .cell(r, 4)
+                .map_or(CellValue::Empty, |cl| cl.value.clone())
+        };
+        assert_eq!(at(&pkg, 2), CellValue::Text("x".into()));
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        let before = pkg.workbook.sheets[0].cell(2, 4).cloned().unwrap();
+        eng.set_cell(&mut pkg.workbook, (0, 2, 4), Cell::default());
+        assert_eq!(at(&pkg, 2), CellValue::Empty);
+        eng.restore_cell(&mut pkg.workbook, (0, 2, 4), before);
+        assert_eq!(at(&pkg, 2), CellValue::Text("x".into()));
+        eng.set_cell(&mut pkg.workbook, (0, 1, 4), Cell::default());
+        assert_eq!(at(&pkg, 1), CellValue::Number(9.0));
+    }
+
+    #[test]
+    fn delete_inside_a_sorted_frozen_arrays_stale_extent_still_clears() {
+        // #777 r5: a sort moves a frozen anchor (extent and all) but leaves
+        // its ref naming E1:E3; at E2 that ref is another block's, so its
+        // stale extent claims nothing: Delete on the user's "x" clears it.
+        let rows = concat!(
+            r#"<row r="1"><c r="A1"><v>2</v></c><c r="E1" cm="1"><f t="array" ref="E1:E3">_xlfn.PIVOTBY(A1,4)</f><v>7</v></c></row>"#,
+            r#"<row r="2"><c r="A2"><v>1</v></c><c r="E2"><v>8</v></c></row>"#,
+            r#"<row r="3"><c r="A3"><v>4</v></c><c r="E3"><v>9</v></c></row>"#,
+            r#"<row r="4"><c r="A4"><v>3</v></c><c r="E4" t="inlineStr"><is><t>x</t></is></c></row>"#,
+        );
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        crate::edit::sort_rows(&mut pkg.workbook, 0, 0, 3, &[(0, true)]);
+        let at = |pkg: &SheetPackage, r: u32| {
+            pkg.workbook.sheets[0]
+                .cell(r, 4)
+                .map_or(CellValue::Empty, |cl| cl.value.clone())
+        };
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(1, 4).unwrap().spill,
+            Some((3, 1))
+        );
+        assert_eq!(at(&pkg, 2), CellValue::Text("x".into()));
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 2, 4), Cell::default());
+        assert_eq!(at(&pkg, 2), CellValue::Empty);
+    }
+
+    #[test]
     fn cm_is_written_only_on_an_array_formula() {
         // A data-table `<f>` is kept verbatim but is not a dynamic array.
         let rows = r#"<row r="1"><c r="A1"><v>1</v></c><c r="G1" cm="1"><f t="dataTable" ref="G1:G2" dt2D="0" dtr="0" r1="A1"/><v>1</v></c></row>"#;
@@ -11893,8 +12030,9 @@ b",
     #[test]
     fn relocated_cse_clone_blocked_by_a_neighbour_writes_its_own_anchor_ref() {
         // Typed at F5 (#724), its array result makes it a dynamic array.
-        // The same for a 3x1 result blocked by F6 (#SPILL!). The clone is
-        // taken with no spill extent of its own, so F6 counts as foreign.
+        // The same for a 3x1 result blocked by F6 (#SPILL!). The clone
+        // carries the source's spill extent; the engine drops it (#777), so
+        // F6 counts as foreign.
         let rows = CSE_ROWS.replace(
             r#"<c r="D3"><v>6</v></c></row>"#,
             r#"<c r="D3"><v>6</v></c></row><row r="6"><c r="F6" t="inlineStr"><is><t>x</t></is></c></row>"#,
@@ -11902,8 +12040,8 @@ b",
         let mut pkg = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
         let mut eng = crate::engine::Engine::new(&pkg.workbook);
         eng.recalc_all(&mut pkg.workbook);
-        let mut clone = pkg.workbook.sheets[0].cell(0, 3).cloned().unwrap();
-        clone.spill = None;
+        let clone = pkg.workbook.sheets[0].cell(0, 3).cloned().unwrap();
+        assert!(clone.spill.is_some());
         eng.set_cell(&mut pkg.workbook, (0, 4, 5), clone);
         let ws = saved_sheet1(&pkg);
         let f5 = saved_cell(&ws, "F5");

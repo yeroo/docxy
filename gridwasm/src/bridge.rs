@@ -467,6 +467,15 @@ impl Session {
         None
     }
 
+    /// Undo/redo snapshots of `keys` on sheet `sheet_idx` as it is now
+    /// ([`gridcore::sheet::snapshot_cells`]): spill output of a live anchor
+    /// is a blank the anchor re-spills over.
+    fn snapshot(&self, sheet_idx: usize, keys: &[(u32, u32)]) -> Vec<Option<Cell>> {
+        let wb = &self.pkg.workbook;
+        let frozen = |r, c| self.engine.is_frozen(wb, (sheet_idx, r, c));
+        gridcore::sheet::snapshot_cells(&wb.sheets[sheet_idx], keys, frozen)
+    }
+
     /// Apply cell changes as one undo group, through the engine.
     fn apply(&mut self, changes: Vec<(u32, u32, Cell)>) {
         let keys = changes.iter().map(|&(r, c, _)| (r, c)).collect();
@@ -490,12 +499,10 @@ impl Session {
             return;
         }
         let sheet_idx = self.active;
-        let snapshot = |s: &Self| -> Vec<Option<Cell>> {
-            let sheet = &s.pkg.workbook.sheets[sheet_idx];
-            keys.iter()
-                .map(|&(r, c)| sheet.cell(r, c).cloned())
-                .collect()
-        };
+        // Spill output of a live anchor is snapshotted as the blank its
+        // anchor re-spills over ([`Session::snapshot`]), whether or not the
+        // anchor is in the group.
+        let snapshot = |s: &Self| s.snapshot(sheet_idx, &keys);
         let before = snapshot(self);
         write(self);
         let after = snapshot(self);
@@ -3272,6 +3279,120 @@ mod tests {
         // Pasted again, it is a copy: its references move.
         s.dispatch(&format!("paste\t5\t4\t{tsv}"));
         assert_eq!(f(&s, 5, 4).as_deref(), Some("SUM(E3:E5)"));
+    }
+
+    /// Column `c`'s values, rows 0..=2, on the first sheet.
+    fn col3(s: &Session, c: u32) -> Vec<CellValue> {
+        (0..3)
+            .map(|r| {
+                s.pkg.workbook.sheets[0]
+                    .cell(r, c)
+                    .map(|cl| cl.value.clone())
+                    .unwrap_or(CellValue::Empty)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn paste_whole_spill_block_respills_through_undo_redo() {
+        // #777: a copied spill block pastes as a spilling anchor, also on
+        // redo; undo gives back what was there.
+        let n = |v: f64| CellValue::Number(v);
+        let seq = vec![n(1.0), n(2.0), n(3.0)];
+        for old in [None, Some(["a", "b", "c"])] {
+            let mut s = Session::open(&sample_xlsx()).expect("open");
+            s.dispatch("set\t0\t4\t=SEQUENCE(3)"); // E1 spills E1:E3
+            assert_eq!(col3(&s, 4), seq);
+            if let Some(old) = old {
+                for (r, v) in old.iter().enumerate() {
+                    s.dispatch(&format!("set\t{r}\t6\t{v}"));
+                }
+            }
+            let was = col3(&s, 6);
+            s.dispatch("select\t0\t4\t2\t4");
+            let tsv = s.dispatch("copy").unwrap();
+            s.dispatch(&format!("paste\t0\t6\t{tsv}"));
+            assert_eq!(col3(&s, 6), seq, "pasted over {old:?}");
+            for round in 0..2 {
+                s.dispatch("undo");
+                assert_eq!(col3(&s, 6), was, "undo {round} over {old:?}");
+                s.dispatch("redo");
+                assert_eq!(col3(&s, 6), seq, "redo {round} over {old:?}");
+                let g1 = s.pkg.workbook.sheets[0].cell(0, 6).unwrap();
+                assert_eq!(g1.spill, Some((3, 1)));
+            }
+        }
+    }
+
+    #[test]
+    fn paste_single_anchor_over_occupied_spills_error_through_undo_redo() {
+        // #777 / #725: a pasted anchor whose spill area is occupied is
+        // #SPILL! and keeps the occupant.
+        let n = |v: f64| CellValue::Number(v);
+        let keep = CellValue::Text("keep".into());
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("set\t0\t4\t=SEQUENCE(3)");
+        s.dispatch("set\t1\t6\tkeep");
+        s.dispatch("select\t0\t4");
+        let tsv = s.dispatch("copy").unwrap();
+        s.dispatch(&format!("paste\t0\t6\t{tsv}"));
+        let after = vec![
+            CellValue::Error("#SPILL!".into()),
+            keep.clone(),
+            CellValue::Empty,
+        ];
+        assert_eq!(col3(&s, 6), after);
+        s.dispatch("undo");
+        assert_eq!(col3(&s, 6), vec![CellValue::Empty, keep, CellValue::Empty]);
+        s.dispatch("redo");
+        assert_eq!(col3(&s, 6), after);
+        // Over empty cells it spills; undo empties them; redo re-spills.
+        s.dispatch(&format!("paste\t0\t9\t{tsv}"));
+        let seq = vec![n(1.0), n(2.0), n(3.0)];
+        assert_eq!(col3(&s, 9), seq);
+        s.dispatch("undo");
+        assert_eq!(col3(&s, 9), vec![CellValue::Empty; 3]);
+        s.dispatch("redo");
+        assert_eq!(col3(&s, 9), seq);
+    }
+
+    #[test]
+    fn undo_redo_around_a_live_spill_keeps_it_spilling() {
+        // #777 r1: spill output edited without its anchor is snapshotted as
+        // the blank its anchor re-spills over, not as a plain value.
+        let n = |v: f64| CellValue::Number(v);
+        let seq = vec![n(1.0), n(2.0), n(3.0)];
+        let blocked = vec![
+            CellValue::Error("#SPILL!".into()),
+            CellValue::Text("x".into()),
+            CellValue::Empty,
+        ];
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("set\t0\t4\t=SEQUENCE(3)"); // E1 spills E1:E3
+        // Delete E2:E3: a no-op, and so are undo and redo.
+        s.dispatch("clear\t1\t4\t2\t4");
+        for step in ["clear", "undo", "redo", "undo"] {
+            if step != "clear" {
+                s.dispatch(step);
+            }
+            assert_eq!(col3(&s, 4), seq, "{step}");
+            let e1 = s.pkg.workbook.sheets[0].cell(0, 4).unwrap();
+            assert_eq!(e1.spill, Some((3, 1)), "{step}");
+        }
+        // Type into a spill child: #SPILL!; undo re-spills; redo blocks.
+        s.dispatch("set\t1\t4\tx");
+        assert_eq!(col3(&s, 4), blocked);
+        s.dispatch("undo");
+        assert_eq!(col3(&s, 4), seq);
+        s.dispatch("redo");
+        assert_eq!(col3(&s, 4), blocked);
+        // Delete the blocker: it spills; undo brings it back; redo spills.
+        s.dispatch("clear\t1\t4\t1\t4");
+        assert_eq!(col3(&s, 4), seq);
+        s.dispatch("undo");
+        assert_eq!(col3(&s, 4), blocked);
+        s.dispatch("redo");
+        assert_eq!(col3(&s, 4), seq);
     }
 
     #[test]

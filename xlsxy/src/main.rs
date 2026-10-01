@@ -1736,6 +1736,15 @@ impl App {
         self.edit = None;
     }
 
+    /// Undo/redo snapshots of `keys` on sheet `sheet_idx` as it is now
+    /// ([`gridcore::sheet::snapshot_cells`]): spill output of a live anchor
+    /// is a blank the anchor re-spills over.
+    fn snapshot(&self, sheet_idx: usize, keys: &[(u32, u32)]) -> Vec<Option<Cell>> {
+        let wb = &self.pkg.workbook;
+        let frozen = |r, c| self.engine.is_frozen(wb, (sheet_idx, r, c));
+        gridcore::sheet::snapshot_cells(&wb.sheets[sheet_idx], keys, frozen)
+    }
+
     /// Apply cell changes to the current sheet as one undo group.
     fn apply(&mut self, changes: Vec<(u32, u32, Cell)>) {
         self.apply_on(self.sheet, changes);
@@ -1782,15 +1791,12 @@ impl App {
         }
         let circles_before = self.engine.circular_refs();
         self.engine.clock = now_serial();
+        // Spill output of a live anchor is snapshotted as the blank its
+        // anchor re-spills over ([`App::snapshot`]), whether or not the anchor
+        // is in the group.
         let snapshot = |app: &Self| -> Vec<Vec<Option<Cell>>> {
             keys.iter()
-                .map(|(s, cells)| {
-                    let sheet = &app.pkg.workbook.sheets[*s];
-                    cells
-                        .iter()
-                        .map(|&(r, c)| sheet.cell(r, c).cloned())
-                        .collect()
-                })
+                .map(|(s, cells)| app.snapshot(*s, cells))
                 .collect()
         };
         let befores = snapshot(self);
@@ -11253,6 +11259,286 @@ mod tests {
         let b2 = app.pkg.workbook.sheets[0].cell(1, 1).unwrap().clone();
         assert_eq!(b2.formula.as_deref(), Some("A2*2"));
         assert_eq!(b2.value, CellValue::Number(4.0));
+    }
+
+    /// The values of column `c`, rows `r1..=r2`, on the first sheet.
+    fn col_values(app: &App, c: u32, r1: u32, r2: u32) -> Vec<CellValue> {
+        (r1..=r2)
+            .map(|r| {
+                app.pkg.workbook.sheets[0]
+                    .cell(r, c)
+                    .map(|cl| cl.value.clone())
+                    .unwrap_or(CellValue::Empty)
+            })
+            .collect()
+    }
+
+    /// An app with C1 `=SEQUENCE(3)` spilling C1:C3 (typed, through the engine).
+    fn app_with_sequence_in_c1() -> App {
+        let mut app = App::new(new_xlsx(), "test.xlsx");
+        app.os_clip = None;
+        app.apply(vec![(0, 2, Cell::formula("SEQUENCE(3)"))]);
+        let n = |v: f64| CellValue::Number(v);
+        assert_eq!(col_values(&app, 2, 0, 2), vec![n(1.0), n(2.0), n(3.0)]);
+        app
+    }
+
+    #[test]
+    fn paste_whole_spill_block_respills() {
+        // #777: a copied spill block (anchor + its spilled values) pastes as a
+        // spilling anchor, also on redo; undo gives back what was there.
+        let n = |v: f64| CellValue::Number(v);
+        let t = |s: &str| CellValue::Text(s.into());
+        let seq = vec![n(1.0), n(2.0), n(3.0)];
+        for old in [None, Some(["a", "b", "c"])] {
+            let mut app = app_with_sequence_in_c1();
+            if let Some(old) = old {
+                let cells = (0..3).map(|r| (r as u32, 6, Cell::text(old[r]))).collect();
+                app.apply(cells);
+            }
+            let was = col_values(&app, 6, 0, 2);
+            app.anchor = Some((0, 2));
+            app.cur = (2, 2);
+            app.copy(false);
+            app.anchor = None;
+            app.cur = (0, 6);
+            app.paste();
+            let g1 = || app.pkg.workbook.sheets[0].cell(0, 6).cloned().unwrap();
+            assert_eq!(col_values(&app, 6, 0, 2), seq, "pasted over {old:?}");
+            assert_eq!(g1().spill, Some((3, 1)));
+            for round in 0..2 {
+                app.undo();
+                assert_eq!(col_values(&app, 6, 0, 2), was, "undo {round} over {old:?}");
+                app.redo();
+                assert_eq!(col_values(&app, 6, 0, 2), seq, "redo {round} over {old:?}");
+                let g1 = app.pkg.workbook.sheets[0].cell(0, 6).cloned().unwrap();
+                assert_eq!(g1.spill, Some((3, 1)), "redo {round} over {old:?}");
+                assert!(
+                    app.pkg.workbook.sheets[0]
+                        .cell(1, 6)
+                        .unwrap()
+                        .formula
+                        .is_none()
+                );
+            }
+            app.undo();
+            assert_eq!(col_values(&app, 6, 0, 2), was);
+            if old.is_some() {
+                assert_eq!(was, vec![t("a"), t("b"), t("c")]);
+            } else {
+                assert_eq!(was, vec![CellValue::Empty; 3]);
+            }
+        }
+
+        // Copying only a spill child pastes its value.
+        let mut app = app_with_sequence_in_c1();
+        app.cur = (1, 2);
+        app.copy(false);
+        app.cur = (1, 8);
+        app.paste();
+        assert_eq!(col_values(&app, 8, 1, 1), vec![n(2.0)]);
+    }
+
+    #[test]
+    fn paste_single_anchor_over_occupied_spills_error() {
+        // #777 / #725: a pasted anchor whose spill area is occupied is
+        // #SPILL! and keeps the occupant, through undo and redo.
+        let n = |v: f64| CellValue::Number(v);
+        let spill = CellValue::Error("#SPILL!".into());
+        let keep = CellValue::Text("keep".into());
+        let mut app = app_with_sequence_in_c1();
+        app.apply(vec![(1, 6, Cell::text("keep"))]);
+        app.cur = (0, 2);
+        app.copy(false);
+        app.cur = (0, 6);
+        app.paste();
+        let after = vec![spill.clone(), keep.clone(), CellValue::Empty];
+        assert_eq!(col_values(&app, 6, 0, 2), after);
+        app.undo();
+        assert_eq!(
+            col_values(&app, 6, 0, 2),
+            vec![CellValue::Empty, keep, CellValue::Empty]
+        );
+        app.redo();
+        assert_eq!(col_values(&app, 6, 0, 2), after);
+
+        // Over empty cells it spills; undo empties them; redo re-spills.
+        app.cur = (0, 9);
+        app.paste();
+        let seq = vec![n(1.0), n(2.0), n(3.0)];
+        assert_eq!(col_values(&app, 9, 0, 2), seq);
+        app.undo();
+        assert_eq!(col_values(&app, 9, 0, 2), vec![CellValue::Empty; 3]);
+        app.redo();
+        assert_eq!(col_values(&app, 9, 0, 2), seq);
+    }
+
+    #[test]
+    fn undo_redo_around_a_live_spill_keeps_it_spilling() {
+        // #777 r1: spill output edited without its anchor is snapshotted as
+        // the blank its anchor re-spills over, not as a plain value.
+        let n = |v: f64| CellValue::Number(v);
+        let seq = vec![n(1.0), n(2.0), n(3.0)];
+        let spill = CellValue::Error("#SPILL!".into());
+        let x = CellValue::Text("x".into());
+        let spilling = |app: &App| {
+            let c1 = app.pkg.workbook.sheets[0].cell(0, 2).unwrap();
+            c1.spill == Some((3, 1))
+        };
+
+        // Delete C2:C3 under C1's spill: a no-op, and so are undo and redo.
+        let mut app = app_with_sequence_in_c1();
+        app.apply(vec![(1, 2, Cell::default()), (2, 2, Cell::default())]);
+        for step in ["delete", "undo", "redo", "undo"] {
+            match step {
+                "undo" => app.undo(),
+                "redo" => app.redo(),
+                _ => {}
+            }
+            assert_eq!(col_values(&app, 2, 0, 2), seq, "{step}");
+            assert!(spilling(&app), "{step}");
+        }
+
+        // Type into a spill child: #SPILL!; undo re-spills; redo blocks again.
+        let mut app = app_with_sequence_in_c1();
+        app.apply(vec![(1, 2, Cell::text("x"))]);
+        let blocked = vec![spill.clone(), x.clone(), CellValue::Empty];
+        assert_eq!(col_values(&app, 2, 0, 2), blocked);
+        app.undo();
+        assert_eq!(col_values(&app, 2, 0, 2), seq);
+        assert!(spilling(&app));
+        app.redo();
+        assert_eq!(col_values(&app, 2, 0, 2), blocked);
+        app.undo();
+        assert_eq!(col_values(&app, 2, 0, 2), seq);
+
+        // Delete the blocker of a #SPILL! anchor: it spills; undo brings the
+        // blocker back; redo spills again.
+        app.apply(vec![(1, 2, Cell::text("x"))]);
+        app.apply(vec![(1, 2, Cell::default())]);
+        assert_eq!(col_values(&app, 2, 0, 2), seq);
+        app.undo();
+        assert_eq!(col_values(&app, 2, 0, 2), blocked);
+        app.redo();
+        assert_eq!(col_values(&app, 2, 0, 2), seq);
+        assert!(spilling(&app));
+    }
+
+    #[test]
+    fn a_frozen_array_block_keeps_its_cached_values() {
+        // #777 r1: an array anchor the engine can't evaluate never re-spills,
+        // so its cached block is pasted and undone as values. xlsxy opens on
+        // cached values: nothing has been evaluated yet.
+        let n = |v: f64| CellValue::Number(v);
+        let cached = vec![n(7.0), n(8.0), n(9.0)];
+        let mut pkg = new_xlsx();
+        let sheet = &mut pkg.workbook.sheets[0];
+        sheet.set_cell(0, 0, Cell::number(1.0));
+        sheet.set_cell(
+            0,
+            4,
+            Cell {
+                value: n(7.0),
+                formula: Some("PIVOTBY(A1,4)".into()),
+                f_attrs: Some("t=\"array\" ref=\"E1:E3\"".into()),
+                spill: Some((3, 1)),
+                ..Cell::default()
+            },
+        );
+        sheet.set_cell(1, 4, Cell::number(8.0));
+        sheet.set_cell(2, 4, Cell::number(9.0));
+        let mut app = App::new(pkg, "test.xlsx");
+        app.os_clip = None;
+        app.anchor = Some((0, 4));
+        app.cur = (2, 4);
+        app.copy(false);
+        app.anchor = None;
+        app.cur = (0, 6);
+        app.paste();
+        assert_eq!(col_values(&app, 6, 0, 2), cached);
+        // Cleared and undone, the block comes back whole.
+        app.apply((0..3).map(|r| (r, 4, Cell::default())).collect());
+        assert_eq!(col_values(&app, 4, 0, 2), vec![CellValue::Empty; 3]);
+        app.undo();
+        assert_eq!(col_values(&app, 4, 0, 2), cached);
+    }
+
+    #[test]
+    fn deleting_a_cell_of_a_frozen_block_keeps_the_others() {
+        // #777 r2/r3: a frozen anchor never re-spills. Deleting a cell of its
+        // block is a no-op, as deleting a spilled cell is in Excel: values,
+        // extent and saved `ref` stay, through undo and redo. Typing a value
+        // there breaks the block but keeps the other cached cells. Legacy
+        // CSE and dynamic-array blocks, on row 0 and off it.
+        let n = |v: f64| CellValue::Number(v);
+        let cached = vec![n(7.0), n(8.0), n(9.0)];
+        let blocks = [
+            (0u32, 4u32, false),
+            (10, 5, false),
+            (0, 6, true),
+            (10, 7, true),
+        ];
+        let mut pkg = new_xlsx();
+        let sheet = &mut pkg.workbook.sheets[0];
+        sheet.set_cell(0, 0, Cell::number(1.0));
+        for (top, col, dynamic) in blocks {
+            let range = format!("{}:{}", cell_name(top, col), cell_name(top + 2, col));
+            sheet.set_cell(
+                top,
+                col,
+                Cell {
+                    value: n(7.0),
+                    formula: Some("PIVOTBY(A1,4)".into()),
+                    f_attrs: Some(format!("t=\"array\" ref=\"{range}\"")),
+                    spill: Some((3, 1)),
+                    meta: dynamic.then(|| {
+                        Box::new(gridcore::sheet::CellMeta {
+                            dynamic: true,
+                            ..Default::default()
+                        })
+                    }),
+                    ..Cell::default()
+                },
+            );
+            sheet.set_cell(top + 1, col, Cell::number(8.0));
+            sheet.set_cell(top + 2, col, Cell::number(9.0));
+        }
+        let mut app = App::new(pkg, "test.xlsx");
+        app.os_clip = None;
+        for (top, col, dynamic) in blocks {
+            let at = format!("{} dynamic={dynamic}", cell_name(top, col));
+            let block = |app: &App| col_values(app, col, top, top + 2);
+            let extent = |app: &App| app.pkg.workbook.sheets[0].cell(top, col).unwrap().spill;
+            app.apply(vec![(top + 1, col, Cell::default())]);
+            assert_eq!(block(&app), cached, "delete at {at}");
+            assert_eq!(extent(&app), Some((3, 1)), "delete at {at}");
+            app.undo();
+            assert_eq!(block(&app), cached, "undo at {at}");
+            assert_eq!(extent(&app), Some((3, 1)), "undo at {at}");
+            app.redo();
+            assert_eq!(block(&app), cached, "redo at {at}");
+            assert_eq!(extent(&app), Some((3, 1)), "redo at {at}");
+            let saved = gridcore::xlsx::save_xlsx(&app.pkg);
+            let re = gridcore::xlsx::load_xlsx(&saved).unwrap();
+            let ws =
+                String::from_utf8_lossy(re.part("xl/worksheets/sheet1.xml").unwrap()).into_owned();
+            let range = format!("{}:{}", cell_name(top, col), cell_name(top + 2, col));
+            assert!(
+                ws.contains(&format!(r#"<f t="array" ref="{range}">"#)),
+                "{at}: {ws}"
+            );
+            let values: Vec<CellValue> = (top..top + 3)
+                .map(|r| re.workbook.sheets[0].cell(r, col).unwrap().value.clone())
+                .collect();
+            assert_eq!(values, cached, "saved at {at}");
+        }
+        // Typing a value into a frozen block keeps its other cached cells.
+        app.apply(vec![(1, 4, Cell::number(5.0))]);
+        assert_eq!(col_values(&app, 4, 0, 2), vec![n(7.0), n(5.0), n(9.0)]);
+        app.undo();
+        assert_eq!(col_values(&app, 4, 0, 2), cached);
+        app.redo();
+        assert_eq!(col_values(&app, 4, 0, 2), vec![n(7.0), n(5.0), n(9.0)]);
     }
 
     #[test]

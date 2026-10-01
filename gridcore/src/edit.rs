@@ -154,7 +154,8 @@ pub fn replace_all_in_sheet(
 /// Fill Right) — a single cell included — pulls from the row above (or the
 /// column to the left).
 /// Relative references move with the copy and the source's style comes
-/// along. Pure: returns the `(row, col, cell)` changes.
+/// along; its file metadata does not ([`copy_meta`]). Pure: returns the
+/// `(row, col, cell)` changes.
 pub fn fill_changes(
     sheet: &Sheet,
     (r1, c1, r2, c2): (u32, u32, u32, u32),
@@ -163,6 +164,7 @@ pub fn fill_changes(
     let mut changes = Vec::new();
     let mut copy_from = |sr: u32, sc: u32, tr: u32, tc: u32| {
         let mut cell = sheet.cell(sr, sc).cloned().unwrap_or_default();
+        copy_meta(&mut cell);
         if let Some(f) = &cell.formula {
             if let Some(t) = translate_formula(f, tr as i64 - sr as i64, tc as i64 - sc as i64) {
                 cell.formula = Some(t);
@@ -569,6 +571,20 @@ fn rebase(cell: &mut Cell, dr: i64, dc: i64) {
             cell.formula = Some(shifted);
         }
     }
+}
+
+/// The `<c>` metadata a Fill Down/Right copy of `cell` keeps: none of the
+/// file's (`cm`, `vm`, `vm_body`, `ph` describe the source cell and its loaded
+/// value), only what the engine learned about a formula typed here (`modern`,
+/// `dynamic`).
+fn copy_meta(cell: &mut Cell) {
+    cell.meta = cell.meta.take().filter(|m| m.modern || m.dynamic).map(|m| {
+        Box::new(crate::sheet::CellMeta {
+            modern: m.modern,
+            dynamic: m.dynamic,
+            ..Default::default()
+        })
+    });
 }
 
 /// Produce `count` cells continuing a source line: a numeric series when every
@@ -3125,6 +3141,55 @@ mod tests {
         let (_, _, c) = &changes[0];
         assert_eq!(c.value, CellValue::Number(1234.0));
         assert_eq!(styles.xf(c.style).code.as_deref(), Some("#,##0"));
+    }
+
+    #[test]
+    fn fill_changes_drops_file_index_meta_keeps_modern_dynamic() {
+        // #777: Ctrl+D/Ctrl+R copies don't inherit the source's `<c>`
+        // metadata (as autofill's rebase doesn't); what the engine learned
+        // about a typed formula carries over.
+        use crate::sheet::CellMeta;
+        let mut sheet = Sheet::default();
+        let loaded = CellMeta {
+            cm: Some("1".into()),
+            vm: Some(("2".into(), CellValue::Number(1.0))),
+            vm_body: Some("#VALUE!".into()),
+            ph: true,
+            ..CellMeta::default()
+        };
+        sheet.set_cell(
+            0,
+            0,
+            Cell {
+                meta: Some(Box::new(loaded)),
+                f_attrs: Some("t=\"array\" ref=\"A1:A3\"".into()),
+                ..Cell::formula("SEQUENCE(3)")
+            },
+        );
+        let typed = CellMeta {
+            modern: true,
+            dynamic: true,
+            ..CellMeta::default()
+        };
+        sheet.set_cell(
+            0,
+            1,
+            Cell {
+                meta: Some(Box::new(typed.clone())),
+                ..Cell::formula("SEQUENCE(2)")
+            },
+        );
+        // Fill Down over A1:B3: A2:A3 copy the loaded cell, B2:B3 the typed one.
+        let down = fill_changes(&sheet, (0, 0, 2, 1), true);
+        assert_eq!(down.len(), 4);
+        for (r, c, cell) in &down {
+            let want = if *c == 0 { None } else { Some(&typed) };
+            assert_eq!(cell.meta.as_deref(), want, "{r},{c}");
+        }
+        // Fill Right over A1:C1: B1:C1 copy the loaded cell.
+        let right = fill_changes(&sheet, (0, 0, 0, 2), false);
+        assert_eq!(right.len(), 2);
+        assert!(right.iter().all(|(_, _, cell)| cell.meta.is_none()));
     }
 
     #[test]
