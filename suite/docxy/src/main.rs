@@ -1073,103 +1073,6 @@ impl ClipRead {
     }
 }
 
-/// Write a pasted `block` onto sheet `s` from `(br, bc)`, one cell at a time
-/// through the engine. A pasted cell is typed there (`Engine::set_cell`: an
-/// array anchor keeps its block only on its own formula), except a whole
-/// array block pasted back at its own address. An anchor whose stored `ref`
-/// starts where it lands and lies wholly inside the pasted block is restored
-/// as it was — a cut has already cleared its source, so `set_cell` would see a
-/// blank target and type it. It is restored claiming no spill beyond that
-/// `ref`, so it never takes over content outside the paste (pasted at the
-/// same address on another sheet, it stays an array there, as in Excel).
-/// Its spilled values in the block are written as blanks, since the anchor's
-/// recalc refills them (as constants they would block its spill), and the
-/// anchors go last. An anchor the engine can't evaluate keeps its cached
-/// values instead: they are put back as its spill.
-fn paste_grid_block(
-    engine: &mut gridcore::engine::Engine,
-    wb: &mut gridcore::sheet::Workbook,
-    s: usize,
-    (br, bc): (u32, u32),
-    block: &[Vec<gridcore::sheet::Cell>],
-) {
-    let in_block = |r: u32, c: u32| {
-        r >= br
-            && c >= bc
-            && block
-                .get((r - br) as usize)
-                .is_some_and(|row| ((c - bc) as usize) < row.len())
-    };
-    // Each restored anchor, with its spill cut to its stored ref.
-    let mut anchors = Vec::new();
-    for (dr, row) in block.iter().enumerate() {
-        for (dc, cell) in row.iter().enumerate() {
-            let (r, c) = (br + dr as u32, bc + dc as u32);
-            let Some((r1, c1, r2, c2)) = gridcore::sheet::array_block(cell) else {
-                continue;
-            };
-            if (r1, c1) == (r, c) && (r1..=r2).all(|rr| (c1..=c2).all(|cc| in_block(rr, cc))) {
-                let mut cell = cell.clone();
-                cell.spill = cell
-                    .spill
-                    .map(|(h, w)| (h.min(r2 - r1 + 1), w.min(c2 - c1 + 1)));
-                anchors.push((r, c, cell));
-            }
-        }
-    }
-    let spilled = |r: u32, c: u32| {
-        anchors.iter().any(|(ar, ac, a)| {
-            a.spill
-                .is_some_and(|(h, w)| (*ar..ar + h).contains(&r) && (*ac..ac + w).contains(&c))
-        })
-    };
-    let mut members = Vec::new();
-    for (dr, row) in block.iter().enumerate() {
-        for (dc, cell) in row.iter().enumerate() {
-            let (r, c) = (br + dr as u32, bc + dc as u32);
-            if anchors.iter().any(|&(ar, ac, _)| (ar, ac) == (r, c)) {
-                continue;
-            }
-            let cell = if cell.formula.is_none() && spilled(r, c) {
-                members.push((r, c, cell));
-                gridcore::sheet::Cell {
-                    style: cell.style,
-                    ..Default::default()
-                }
-            } else {
-                cell.clone()
-            };
-            engine.set_cell(wb, (s, r, c), cell);
-        }
-    }
-    let mut frozen = Vec::new();
-    for (r, c, cell) in anchors {
-        let ext = cell.spill;
-        engine.restore_cell(wb, (s, r, c), cell);
-        if engine.is_unsupported((s, r, c)) {
-            frozen.push((r, c, ext));
-        }
-    }
-    // Written into the sheet as an evaluated spill is (not through
-    // `set_cell`, which would break the anchor's spill), then recalculated
-    // for their dependents.
-    let mut refilled = Vec::new();
-    for &(r, c, cell) in &members {
-        let owned = frozen.iter().any(|&(ar, ac, ext)| {
-            ext.is_some_and(|(h, w)| (ar..ar + h).contains(&r) && (ac..ac + w).contains(&c))
-        });
-        if owned {
-            if let Some(sheet) = wb.sheets.get_mut(s) {
-                sheet.set_cell(r, c, cell.clone());
-                refilled.push((s, r, c));
-            }
-        }
-    }
-    if !refilled.is_empty() {
-        engine.recalc_from(wb, &refilled);
-    }
-}
-
 /// Whether a paste uses the in-app clip (a sheet's grid clip or a document's
 /// rich clip) recorded as `recorded` rather than what the clipboard holds `now`
 /// (#699, #755). The clip is ours only while the clipboard still holds the text
@@ -10205,7 +10108,10 @@ impl Docxy {
         if let Some(v) = self.active_sheet_mut() {
             let (br, bc) = v.sel;
             let s = v.active;
-            paste_grid_block(&mut v.engine, &mut v.pkg.workbook, s, (br, bc), &block);
+            // A pasted spilling array still spills, and an array block
+            // pasted back in place keeps its block (`Engine::paste_block`).
+            v.engine
+                .paste_block(&mut v.pkg.workbook, s, (br, bc), &block);
             let h = block.len() as u32;
             let w = block.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
             if h > 0 && w > 0 {
@@ -15648,9 +15554,7 @@ fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) -> bool
 
 #[cfg(test)]
 mod clipboard_tests {
-    use super::{
-        ClipRead, ClipboardStore, clip_still_ours, paste_grid_block, recorded_after_write,
-    };
+    use super::{ClipRead, ClipboardStore, clip_still_ours, recorded_after_write};
     use gridcore::engine::Engine;
     use gridcore::sheet::{Cell, CellValue, Sheet, Workbook};
 
@@ -15685,9 +15589,9 @@ mod clipboard_tests {
         let mut engine = Engine::new(&wb);
         engine.recalc_all(&mut wb);
         let block = vec![vec![wb.sheets[1].cell(0, 3).cloned().unwrap()]];
-        paste_grid_block(&mut engine, &mut wb, 0, (0, 3), &block);
+        engine.paste_block(&mut wb, 0, (0, 3), &block);
         assert_eq!(f_attrs_at(&wb, 0), None);
-        paste_grid_block(&mut engine, &mut wb, 1, (0, 3), &block);
+        engine.paste_block(&mut wb, 1, (0, 3), &block);
         assert_eq!(f_attrs_at(&wb, 1), Some(" t=\"array\" ref=\"D1:D3\""));
     }
 
@@ -15761,7 +15665,7 @@ mod clipboard_tests {
         let clip = clip_d1_d3(&wb, 1);
         cut_d1_d3(&mut engine, &mut wb, 1);
         assert_eq!(f_attrs_at(&wb, 1), None, "the cut cleared the block");
-        paste_grid_block(&mut engine, &mut wb, 1, (0, 3), &clip);
+        engine.paste_block(&mut wb, 1, (0, 3), &clip);
         assert_eq!(f_attrs_at(&wb, 1), Some(" t=\"array\" ref=\"D1:D3\""));
         assert_eq!(
             wb.sheets[1].cell(0, 3).unwrap().value,
@@ -15772,7 +15676,7 @@ mod clipboard_tests {
         engine.set_cell(&mut wb, (1, 1, 3), Cell::number(7.0));
         let clip = clip_d1_d3(&wb, 1);
         cut_d1_d3(&mut engine, &mut wb, 1);
-        paste_grid_block(&mut engine, &mut wb, 1, (0, 3), &clip);
+        engine.paste_block(&mut wb, 1, (0, 3), &clip);
         assert_eq!(f_attrs_at(&wb, 1), Some(" t=\"array\" ref=\"D1:D3\""));
         assert_eq!(
             wb.sheets[1].cell(1, 3).unwrap().value,
@@ -15797,7 +15701,7 @@ mod clipboard_tests {
             if cut {
                 cut_d1_d3(&mut engine, &mut wb, 1);
             }
-            paste_grid_block(&mut engine, &mut wb, 1, (0, 3), &clip);
+            engine.paste_block(&mut wb, 1, (0, 3), &clip);
             assert_eq!(
                 f_attrs_at(&wb, 1),
                 Some(" t=\"array\" ref=\"D1:D3\""),
@@ -15812,6 +15716,60 @@ mod clipboard_tests {
         }
     }
 
+    /// Data's D1 spills `A1:A3*2` over D1:D3 (2, 4, 6) as a typed dynamic
+    /// array: modern, no `<f>` attributes.
+    fn typed_spill_workbook() -> (Workbook, Engine) {
+        let (mut wb, mut engine) = cse_workbook("A1");
+        engine.set_cell(&mut wb, (1, 0, 3), Cell::formula("A1:A3*2"));
+        let d1 = wb.sheets[1].cell(0, 3).unwrap();
+        assert!(d1.f_attrs.is_none() && d1.is_dynamic());
+        assert_eq!(d1.spill, Some((3, 1)));
+        (wb, engine)
+    }
+
+    fn spilled() -> Vec<CellValue> {
+        [2.0, 4.0, 6.0].map(CellValue::Number).to_vec()
+    }
+
+    /// #825: a typed dynamic array copied or cut with its spill and pasted
+    /// back in place still spills. Only CSE blocks were kept whole before.
+    #[test]
+    fn a_typed_dynamic_array_pasted_in_place_still_spills() {
+        for cut in [false, true] {
+            let (mut wb, mut engine) = typed_spill_workbook();
+            let clip = clip_d1_d3(&wb, 1);
+            if cut {
+                cut_d1_d3(&mut engine, &mut wb, 1);
+            }
+            engine.paste_block(&mut wb, 1, (0, 3), &clip);
+            let d1 = wb.sheets[1].cell(0, 3).unwrap();
+            assert_eq!(d1.spill, Some((3, 1)), "cut: {cut}: {:?}", d1.value);
+            assert_eq!(d_values(&wb, 1), spilled(), "cut: {cut}");
+        }
+    }
+
+    /// #825: Excel's dynamic array (`t="array"` and a `cm`) copied with its
+    /// spill and pasted at another address spills there, typed, and keeps
+    /// no `cm` (it may index another workbook's metadata).
+    #[test]
+    fn a_loaded_dynamic_array_pasted_elsewhere_spills() {
+        let (mut wb, mut engine) = cse_workbook("A1:A3*2");
+        wb.sheets[1].cells.get_mut(&(0, 3)).unwrap().meta =
+            Some(Box::new(gridcore::sheet::CellMeta {
+                cm: Some("1".into()),
+                ..Default::default()
+            }));
+        let clip = clip_d1_d3(&wb, 1);
+        engine.paste_block(&mut wb, 1, (0, 5), &clip);
+        let f1 = wb.sheets[1].cell(0, 5).unwrap();
+        assert_eq!(f1.spill, Some((3, 1)), "{:?}", f1.value);
+        assert!(f1.f_attrs.is_none() && !f1.has_cm() && f1.is_dynamic());
+        let f: Vec<_> = (0..3)
+            .map(|r| wb.sheets[1].cell(r, 5).unwrap().value.clone())
+            .collect();
+        assert_eq!(f, spilled());
+    }
+
     /// #785: a whole spilling CSE block pasted at its own address on another
     /// sheet stays an array there (as in Excel) and overwrites what its spill
     /// covers; pasted at another address it is typed there, no block.
@@ -15823,12 +15781,12 @@ mod clipboard_tests {
         }
         engine.set_cell(&mut wb, (0, 1, 3), Cell::text("mine"));
         let clip = clip_d1_d3(&wb, 1);
-        paste_grid_block(&mut engine, &mut wb, 0, (0, 3), &clip);
+        engine.paste_block(&mut wb, 0, (0, 3), &clip);
         assert_eq!(f_attrs_at(&wb, 0), Some(" t=\"array\" ref=\"D1:D3\""));
         assert_eq!(wb.sheets[0].cell(0, 3).unwrap().spill, Some((3, 1)));
         assert_eq!(d_values(&wb, 0), vec![CellValue::Number(20.0); 3]);
 
-        paste_grid_block(&mut engine, &mut wb, 1, (0, 5), &clip);
+        engine.paste_block(&mut wb, 1, (0, 5), &clip);
         assert_eq!(wb.sheets[1].cell(0, 5).unwrap().f_attrs, None);
     }
 
@@ -15862,7 +15820,7 @@ mod clipboard_tests {
             CellValue::Number(6.0),
         ];
         for s in [1, 0] {
-            paste_grid_block(&mut engine, &mut wb, s, (0, 3), &clip);
+            engine.paste_block(&mut wb, s, (0, 3), &clip);
             assert_eq!(
                 f_attrs_at(&wb, s),
                 Some(" t=\"array\" ref=\"D1:D3\""),
@@ -15892,7 +15850,7 @@ mod clipboard_tests {
         assert_eq!(wb.sheets[1].cell(0, 3).unwrap().spill, Some((5, 1)));
         let clip = clip_d1_d3(&wb, 1);
         engine.set_cell(&mut wb, (0, 3, 3), Cell::text("mine"));
-        paste_grid_block(&mut engine, &mut wb, 0, (0, 3), &clip);
+        engine.paste_block(&mut wb, 0, (0, 3), &clip);
         assert_eq!(
             wb.sheets[0].cell(3, 3).unwrap().value,
             CellValue::Text("mine".into())

@@ -219,7 +219,7 @@ fn a_grid_clip_pastes_the_same_cells_between_text_and_general() {
     put(&mut v, 2, 1, Cell::text("x"));
     let block = vec![vec![q007.clone(), tabc.clone()]];
     let s = v.active;
-    paste_grid_block(&mut v.engine, &mut v.pkg.workbook, s, (2, 0), &block);
+    v.engine.paste_block(&mut v.pkg.workbook, s, (2, 0), &block);
     assert_eq!(v.sheet().cell(2, 0), Some(&q007));
     assert_eq!(v.sheet().cell(2, 1), Some(&tabc));
 }
