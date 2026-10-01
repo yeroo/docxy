@@ -274,13 +274,22 @@ impl Engine {
     /// ([`PART_OF_ARRAY`]): nothing changes, style included, and this returns
     /// false. True when the edit was applied.
     pub fn set_cell(&mut self, wb: &mut Workbook, key: Key, cell: Cell) -> bool {
-        self.type_cell(wb, key, cell, true)
+        self.type_cell(wb, key, cell, true, true)
     }
 
     /// [`Engine::set_cell`]; `recommit` takes the same text on a frozen
     /// formula as a restyle. [`Engine::paste_block`] types a pasted anchor
     /// without it: the copied block replaces this cell's, whatever its text.
-    fn type_cell(&mut self, wb: &mut Workbook, key: Key, mut cell: Cell, recommit: bool) -> bool {
+    /// `refuse` is [`Engine::put_cell`]'s: off for a cell of a group already
+    /// checked whole ([`Engine::set_cells_prechecked`]).
+    fn type_cell(
+        &mut self,
+        wb: &mut Workbook,
+        key: Key,
+        mut cell: Cell,
+        recommit: bool,
+        refuse: bool,
+    ) -> bool {
         let (s, r, c) = key;
         // A pasted anchor's extent is its source's, not this cell's:
         // [`Engine::put_cell`] drops it, and evaluation works out the spill
@@ -328,7 +337,7 @@ impl Engine {
             }
             None => {}
         }
-        self.put_cell(wb, key, cell, true)
+        self.put_cell(wb, key, cell, refuse)
     }
 
     /// Apply a group of edits to sheet `s` (a paste, a fill, a replace-all)
@@ -352,27 +361,35 @@ impl Engine {
         if self.refuses(wb, s, &changes) {
             return false;
         }
-        self.apply_cells(wb, s, changes);
+        self.set_cells_prechecked(wb, s, changes);
         true
     }
 
-    /// [`Engine::set_cells`] once the group is known not to be refused.
-    fn apply_cells(&mut self, wb: &mut Workbook, s: usize, changes: CellEdits) {
+    /// [`Engine::set_cells`] for a group the caller has already asked
+    /// [`Engine::refuses`] (or [`Engine::refuses_paste`]) about, whole: a
+    /// host that writes one group in parts (a cut's clears, then its paste)
+    /// decides once, before the first part. Nothing is decided again cell by
+    /// cell, against a sheet the group's earlier cells have recalculated.
+    pub fn set_cells_prechecked(&mut self, wb: &mut Workbook, s: usize, changes: CellEdits) {
         let changes = self.cse_anchors_first(wb, s, changes);
         let (now, later) = self.split_frozen_blanks(wb, s, changes);
         for (r, c, cell) in now.into_iter().chain(later) {
-            self.set_cell(wb, (s, r, c), cell);
+            self.type_cell(wb, (s, r, c), cell, true, false);
         }
     }
 
     /// `changes` with those landing on an evaluated legacy CSE anchor moved
     /// to the front, each part in order. Replaced first, the block lets go
     /// of its cells; a value written into the block before it would be
-    /// refused, or refilled by the block and then cleared with it.
+    /// refilled by the block and then cleared with it.
     fn cse_anchors_first(&self, wb: &Workbook, s: usize, changes: CellEdits) -> CellEdits {
-        let (mut first, rest): (Vec<_>, Vec<_>) = changes
-            .into_iter()
-            .partition(|(r, c, _)| self.is_live_cse(wb, (s, *r, *c)));
+        let blocks = self.cse_blocks(wb, s);
+        if blocks.is_empty() {
+            return changes;
+        }
+        let (mut first, rest): (Vec<_>, Vec<_>) = changes.into_iter().partition(|(r, c, _)| {
+            blocks.iter().any(|b| (b.0, b.1) == (*r, *c)) && !self.is_frozen(wb, (s, *r, *c))
+        });
         first.extend(rest);
         first
     }
@@ -388,33 +405,60 @@ impl Engine {
             && !self.is_frozen(wb, key)
     }
 
+    /// The legacy CSE blocks ([`cse_block`]) on sheet `s` whose formulas the
+    /// engine indexes, as `(anchor row, anchor col, rows, cols)`: found once
+    /// per group, from the formulas rather than every cell, so a sheet with
+    /// none pays nothing per edited cell. One the engine can't evaluate is
+    /// among them; callers ask [`Engine::is_frozen`] of a block an edit
+    /// touches.
+    fn cse_blocks(&self, wb: &Workbook, s: usize) -> Vec<(u32, u32, u32, u32)> {
+        let Some(sheet) = wb.sheets.get(s) else {
+            return Vec::new();
+        };
+        self.formulas
+            .keys()
+            .filter(|k| k.0 == s)
+            .filter_map(|&(_, r, c)| {
+                let (h, w) = cse_block(sheet.cell(r, c)?, r, c)?;
+                Some((r, c, h, w))
+            })
+            .collect()
+    }
+
     /// Would applying `changes` to sheet `s` as one group ([`Engine::set_cells`])
     /// change part of an evaluated legacy CSE block? Excel refuses that
-    /// ([`PART_OF_ARRAY`]): a plain value or blank that differs from what a
-    /// non-anchor cell inside the block's `ref` holds, unless the group also
-    /// replaces the block's anchor (with anything but the same formula text,
-    /// which `set_cell` keeps a block). A formula in the block is not
-    /// refused: it blocks the block. A frozen block ([`Engine::is_frozen`])
-    /// keeps its own rules. Hosts ask this before a group whose parts they
-    /// write separately, so they refuse all of it or none.
+    /// ([`PART_OF_ARRAY`]): any plain value or blank written into a cell of
+    /// the block's `ref` other than its anchor, whatever the cell holds now,
+    /// unless the group also replaces the anchor (with a plain cell, or a
+    /// formula whose text differs from the anchor's; the same text again
+    /// keeps it a block). A formula written into the block is not refused,
+    /// nor is a write over a formula already there: the formula blocks the
+    /// block, and replacing it frees it. A frozen block
+    /// ([`Engine::is_frozen`]) keeps its own rules. Hosts that write one
+    /// group in parts ask this, or [`Engine::refuses_paste`], once for the
+    /// whole of it before the first part.
     pub fn refuses(&self, wb: &Workbook, s: usize, changes: &[(u32, u32, Cell)]) -> bool {
         let changes: Vec<(u32, u32, &Cell)> =
             changes.iter().map(|(r, c, cl)| (*r, *c, cl)).collect();
-        self.refused(wb, s, &changes, false)
+        self.refused(wb, s, &changes, &HashSet::new())
     }
 
-    /// [`Engine::refuses`] for a paste of `block` at `(br, bc)`
+    /// [`Engine::refuses`] for a paste of `block` at `at`
     /// ([`Engine::paste_block`]), written as one group with `also` (a cut's
-    /// clears on the same sheet). Any pasted cell on a block's anchor replaces
-    /// it: a pasted array is typed or restored afresh, whatever its text.
+    /// clears on the same sheet). A pasted cell on a block's anchor replaces
+    /// it as a typed one does, and so does an array block `paste_block`
+    /// restores in place there with its own `ref` ([`paste_anchors`]); a
+    /// copied formula with the anchor's own text, typed there, keeps the
+    /// block.
     pub fn refuses_paste(
         &self,
         wb: &Workbook,
         s: usize,
-        (br, bc): (u32, u32),
+        at: (u32, u32),
         block: &[Vec<Cell>],
         also: &[(u32, u32, Cell)],
     ) -> bool {
+        let (br, bc) = at;
         let mut changes: Vec<(u32, u32, &Cell)> =
             also.iter().map(|(r, c, cl)| (*r, *c, cl)).collect();
         for (dr, row) in block.iter().enumerate() {
@@ -422,27 +466,24 @@ impl Engine {
                 changes.push((br + dr as u32, bc + dc as u32, cell));
             }
         }
-        self.refused(wb, s, &changes, true)
+        let restored: HashSet<(u32, u32)> = paste_anchors(block, at)
+            .into_iter()
+            .filter(|a| a.3)
+            .map(|a| (a.0, a.1))
+            .collect();
+        self.refused(wb, s, &changes, &restored)
     }
 
-    /// Would a write over every cell of `(r1, c1, r2, c2)` on sheet `s` (a
-    /// drag fill, which writes the cells itself) change part of an evaluated
-    /// legacy CSE block? Any non-anchor cell of a block's `ref` inside the
-    /// area counts, unless the area also takes the block's anchor.
-    pub fn refuses_area(
-        &self,
-        wb: &Workbook,
-        s: usize,
-        (r1, c1, r2, c2): (u32, u32, u32, u32),
-    ) -> bool {
-        let Some(sheet) = wb.sheets.get(s) else {
-            return false;
-        };
+    /// Would a fill that writes every cell of `dest` on sheet `s` (a drag
+    /// fill's destination: `autofill` writes the cells itself) change part
+    /// of an evaluated legacy CSE block? Any non-anchor cell of a block's
+    /// `ref` inside `dest` counts, unless `dest` also takes the block's
+    /// anchor. The fill's source is not written, so an anchor there is not
+    /// replaced.
+    pub fn refuses_area(&self, wb: &Workbook, s: usize, dest: (u32, u32, u32, u32)) -> bool {
+        let (r1, c1, r2, c2) = dest;
         let inside = |r: u32, c: u32| (r1..=r2).contains(&r) && (c1..=c2).contains(&c);
-        sheet.cells.iter().any(|(&(ar, ac), cl)| {
-            let Some((h, w)) = cl.f_attrs.as_ref().and_then(|_| cse_block(cl, ar, ac)) else {
-                return false;
-            };
+        self.cse_blocks(wb, s).into_iter().any(|(ar, ac, h, w)| {
             let (er, ec) = (ar + h - 1, ac + w - 1);
             // Some cell of the block but its anchor lies in the area.
             let takes_part = (r1.max(ar)..=r2.min(er))
@@ -451,40 +492,37 @@ impl Engine {
         })
     }
 
-    /// [`Engine::refuses`]; with `pasting`, any change on an anchor frees it.
+    /// [`Engine::refuses`]; an anchor in `restored` is replaced by the paste
+    /// whatever lands there.
     fn refused(
         &self,
         wb: &Workbook,
         s: usize,
         changes: &[(u32, u32, &Cell)],
-        pasting: bool,
+        restored: &HashSet<(u32, u32)>,
     ) -> bool {
-        let Some(sheet) = wb.sheets.get(s) else {
+        let blocks = self.cse_blocks(wb, s);
+        if blocks.is_empty() {
             return false;
-        };
+        }
+        let sheet = &wb.sheets[s];
         let at: HashMap<(u32, u32), &Cell> =
             changes.iter().map(|&(r, c, cl)| ((r, c), cl)).collect();
-        let frees = |(ar, ac): (u32, u32)| {
-            at.get(&(ar, ac)).is_some_and(|new| {
-                pasting
-                    || new.formula.is_none()
-                    || sheet
-                        .cell(ar, ac)
-                        .is_none_or(|held| held.formula != new.formula)
-            })
+        let frees = |a: (u32, u32)| {
+            restored.contains(&a)
+                || at.get(&a).is_some_and(|new| {
+                    new.formula.is_none()
+                        || sheet
+                            .cell(a.0, a.1)
+                            .is_none_or(|held| held.formula != new.formula)
+                })
         };
         let mut frozen: HashMap<(u32, u32), bool> = HashMap::new();
         changes.iter().any(|&(r, c, cell)| {
-            if cell.formula.is_some() {
+            if cell.formula.is_some() || sheet.cell(r, c).is_some_and(|h| h.formula.is_some()) {
                 return false;
             }
-            let held = sheet.cell(r, c);
-            if held.is_some_and(|h| h.formula.is_some())
-                || held.map_or(&CellValue::Empty, |h| &h.value) == &cell.value
-            {
-                return false;
-            }
-            let Some(a) = cse_owner(sheet, r, c) else {
+            let Some(a) = block_over(&blocks, r, c) else {
                 return false;
             };
             !frees(a)
@@ -631,42 +669,22 @@ impl Engine {
         if self.refuses_paste(wb, s, (br, bc), block, &[]) {
             return false;
         }
-        let in_block = |r: u32, c: u32| {
-            r >= br
-                && c >= bc
-                && block
-                    .get((r - br) as usize)
-                    .is_some_and(|row| ((c - bc) as usize) < row.len())
-        };
-        let inside = |r: u32, c: u32, (h, w): (u32, u32)| {
-            (r..r + h).all(|rr| (c..c + w).all(|cc| in_block(rr, cc)))
-        };
-        // Each anchor, with its spill (the in-place array block's cut to its
-        // stored ref) and whether it is restored rather than typed.
-        let mut anchors: Vec<(u32, u32, Cell, bool)> = Vec::new();
-        for (dr, row) in block.iter().enumerate() {
-            for (dc, cell) in row.iter().enumerate() {
-                let (r, c) = (br + dr as u32, bc + dc as u32);
-                if cell.formula.is_none() {
-                    continue;
-                }
-                let in_place = array_block(cell).filter(|&(r1, c1, r2, c2)| {
-                    (r1, c1) == (r, c) && inside(r, c, (r2 - r1 + 1, c2 - c1 + 1))
-                });
-                if let Some((r1, c1, r2, c2)) = in_place {
-                    let mut cell = cell.clone();
-                    cell.spill = cell
-                        .spill
-                        .map(|(h, w)| (h.min(r2 - r1 + 1), w.min(c2 - c1 + 1)));
-                    if let Some(m) = cell.meta.as_deref_mut() {
-                        forget_file_meta(m);
-                    }
-                    anchors.push((r, c, cell, true));
-                } else if cell.spill.is_some_and(|ext| inside(r, c, ext)) {
-                    anchors.push((r, c, cell.clone(), false));
-                }
-            }
-        }
+        self.paste_block_prechecked(wb, s, (br, bc), block);
+        true
+    }
+
+    /// [`Engine::paste_block`] for a paste the caller has already asked
+    /// [`Engine::refuses_paste`] about, with the rest of its group (a cut's
+    /// clears, written first through [`Engine::set_cells_prechecked`]).
+    /// Nothing is decided again against the sheet those clears left.
+    pub fn paste_block_prechecked(
+        &mut self,
+        wb: &mut Workbook,
+        s: usize,
+        (br, bc): (u32, u32),
+        block: &[Vec<Cell>],
+    ) {
+        let anchors = paste_anchors(block, (br, bc));
         let extents: Vec<(u32, u32, &Cell)> = anchors
             .iter()
             .map(|(r, c, cell, _)| (*r, *c, cell))
@@ -689,7 +707,8 @@ impl Engine {
         }
         // A pasted anchor landing on an evaluated CSE anchor replaces it
         // before the rest is written, so the block lets go of its cells
-        // ([`Engine::apply_cells`] does the same for a plain cell there).
+        // ([`Engine::set_cells_prechecked`] does the same for a plain cell
+        // there).
         let early: Vec<bool> = anchors
             .iter()
             .map(|(r, c, _, _)| self.is_live_cse(wb, (s, *r, *c)))
@@ -701,21 +720,20 @@ impl Engine {
         let mut frozen = Vec::new();
         for i in order {
             let Some((r, c, cell, restore)) = anchors.get(i) else {
-                self.apply_cells(wb, s, std::mem::take(&mut plain));
+                self.set_cells_prechecked(wb, s, std::mem::take(&mut plain));
                 continue;
             };
             let key = (s, *r, *c);
             if *restore {
                 self.restore_cell(wb, key, cell.clone());
             } else {
-                self.type_cell(wb, key, cell.clone(), false);
+                self.type_cell(wb, key, cell.clone(), false, false);
             }
             if self.is_unsupported(key) {
                 frozen.push((*r, *c, cell));
             }
         }
         self.refill_frozen(wb, s, &frozen, &members);
-        true
     }
 
     /// Put the copied values of `frozen` anchors (ones the engine can't
@@ -783,8 +801,9 @@ impl Engine {
             owner = None;
         }
         // Keep what `spill_owner_of` learnt of a live owner (it may have
-        // evaluated it to find out), so a group of edits refused below asks
-        // [`Engine::is_frozen`] once, not once per cell.
+        // evaluated it to find out), so the cells of a group landing in its
+        // spill, and the refusal below, ask [`Engine::is_frozen`] once, not
+        // once per cell.
         if let Some(((ar, ac), _)) = owner {
             let k = (s, ar, ac);
             if !owner_frozen && self.formulas.contains_key(&k) && !self.unsupported.contains(&k) {
@@ -792,24 +811,14 @@ impl Engine {
             }
         }
         // A legacy CSE block the engine evaluates owns its whole `ref`, as in
-        // Excel ("You can't change part of an array"): a plain value or a
-        // blank that would change one of its cells is refused. Replacing a
-        // formula there (one that blocks the block) is not refused: it frees
-        // the block. A frozen block keeps the rules below.
-        if refuse && cell.formula.is_none() {
-            if let Some(sheet) = wb.sheets.get(s) {
-                let held = sheet.cell(r, c);
-                let frozen = |(ar, ac): (u32, u32)| match owner {
-                    Some((o, _)) if o == (ar, ac) => owner_frozen,
-                    _ => self.is_frozen(wb, (s, ar, ac)),
-                };
-                if cse_owner(sheet, r, c).is_some_and(|a| !frozen(a))
-                    && held.is_none_or(|h| h.formula.is_none())
-                    && held.map_or(&CellValue::Empty, |h| &h.value) != &cell.value
-                {
-                    return false;
-                }
-            }
+        // Excel ("You can't change part of an array"): a cell written alone
+        // (not part of a group checked whole) is decided by the group rule,
+        // [`Engine::refuses`]. A frozen block keeps the rules below.
+        if refuse
+            && cell.formula.is_none()
+            && self.refused(wb, s, &[(r, c, &cell)], &HashSet::new())
+        {
+            return false;
         }
         // Deleting a cell of a frozen anchor's block (or putting back the
         // value it holds, as undo/redo of that does) is a no-op but for the
@@ -1561,14 +1570,55 @@ fn cse_block(cell: &Cell, row: u32, col: u32) -> Option<(u32, u32)> {
     ((r1, c1) == (row, col) && r2 >= r1 && c2 >= c1).then_some((r2 - r1 + 1, c2 - c1 + 1))
 }
 
-/// The anchor of the legacy CSE block ([`cse_block`]) whose `ref` covers
-/// `(r, c)`, other than a block anchored at `(r, c)` itself. A block owns its
-/// whole `ref`, filled or blocked.
-fn cse_owner(sheet: &Sheet, r: u32, c: u32) -> Option<(u32, u32)> {
-    sheet.cells.range(..=(r, c)).find_map(|(&(ar, ac), cl)| {
-        cl.f_attrs.as_ref()?;
-        let (h, w) = cse_block(cl, ar, ac)?;
-        let covers = (ar, ac) != (r, c) && r < ar + h && c >= ac && c < ac + w;
+/// The anchors [`Engine::paste_block`] writes last for a paste of `block`
+/// at `(br, bc)`: `(row, col, cell, restored)`. One is a formula cell whose
+/// spill lies wholly inside the block, typed there; or (#785) a legacy array
+/// block pasted back at its own address with its whole `ref` in the block,
+/// restored there (`restored`), its spill cut to that `ref` and its file
+/// metadata gone.
+fn paste_anchors(block: &[Vec<Cell>], (br, bc): (u32, u32)) -> Vec<(u32, u32, Cell, bool)> {
+    let in_block = |r: u32, c: u32| {
+        r >= br
+            && c >= bc
+            && block
+                .get((r - br) as usize)
+                .is_some_and(|row| ((c - bc) as usize) < row.len())
+    };
+    let inside = |r: u32, c: u32, (h, w): (u32, u32)| {
+        (r..r + h).all(|rr| (c..c + w).all(|cc| in_block(rr, cc)))
+    };
+    let mut anchors = Vec::new();
+    for (dr, row) in block.iter().enumerate() {
+        for (dc, cell) in row.iter().enumerate() {
+            let (r, c) = (br + dr as u32, bc + dc as u32);
+            if cell.formula.is_none() {
+                continue;
+            }
+            let in_place = array_block(cell).filter(|&(r1, c1, r2, c2)| {
+                (r1, c1) == (r, c) && inside(r, c, (r2 - r1 + 1, c2 - c1 + 1))
+            });
+            if let Some((r1, c1, r2, c2)) = in_place {
+                let mut cell = cell.clone();
+                cell.spill = cell
+                    .spill
+                    .map(|(h, w)| (h.min(r2 - r1 + 1), w.min(c2 - c1 + 1)));
+                if let Some(m) = cell.meta.as_deref_mut() {
+                    forget_file_meta(m);
+                }
+                anchors.push((r, c, cell, true));
+            } else if cell.spill.is_some_and(|ext| inside(r, c, ext)) {
+                anchors.push((r, c, cell.clone(), false));
+            }
+        }
+    }
+    anchors
+}
+
+/// The non-anchor cell `(r, c)` of one of `blocks` (`(anchor row, anchor
+/// col, rows, cols)`, [`Engine::cse_blocks`]): that block's anchor.
+fn block_over(blocks: &[(u32, u32, u32, u32)], r: u32, c: u32) -> Option<(u32, u32)> {
+    blocks.iter().find_map(|&(ar, ac, h, w)| {
+        let covers = (ar, ac) != (r, c) && r >= ar && r < ar + h && c >= ac && c < ac + w;
         covers.then_some((ar, ac))
     })
 }
@@ -3660,10 +3710,11 @@ mod tests {
         let mixed = vec![vec![Cell::number(5.0)], vec![Cell::formula("7")]];
         assert!(!eng.paste_block(&mut wb, 0, (1, 3), &mixed));
         assert_eq!(wb.sheets[0].cells, before);
-        // Its own values pasted back over it change nothing: not refused.
+        // Its own values pasted back over it, without its anchor, are still
+        // a write into part of it (r8): refused, as in Excel.
         let same = vec![vec![Cell::number(4.0)], vec![Cell::number(6.0)]];
-        assert!(eng.paste_block(&mut wb, 0, (1, 3), &same));
-        assert_spills(&wb, "D1");
+        assert!(!eng.paste_block(&mut wb, 0, (1, 3), &same));
+        assert_eq!(wb.sheets[0].cells, before);
     }
 
     #[test]
@@ -3729,6 +3780,83 @@ mod tests {
     }
 
     #[test]
+    fn a_pasted_same_text_anchor_keeps_the_block_so_the_rest_is_refused() {
+        // r8 M1: D1:D2 of a live block copied ([its formula; 4]) and pasted
+        // over D1:D2 of a block with the same formula text. Typed there, the
+        // same text keeps the block, so D2 is a write into part of it: the
+        // paste is refused whole. On another sheet, and on the same sheet
+        // after the block's inputs changed.
+        let (mut wb, _) = live_cse_wb();
+        let clip = copy_block(&wb, (0, 3), (1, 3));
+        let mut sheet2 = Sheet {
+            name: "Sheet2".to_string(),
+            ..Sheet::default()
+        };
+        for r in 0..3 {
+            sheet2.set_cell(r, 0, Cell::number(f64::from(r + 5)));
+        }
+        sheet2.set_cell(0, 3, cse_block());
+        wb.sheets.push(sheet2);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        let before = wb.sheets[1].cells.clone();
+        assert!(eng.refuses_paste(&wb, 1, (0, 3), &clip, &[]));
+        assert!(!eng.paste_block(&mut wb, 1, (0, 3), &clip));
+        assert_eq!(wb.sheets[1].cells, before);
+
+        set(&mut eng, &mut wb, "A1", Cell::number(10.0));
+        let before = wb.sheets[0].cells.clone();
+        assert!(!eng.paste_block(&mut wb, 0, (0, 3), &clip));
+        assert_eq!(wb.sheets[0].cells, before);
+        assert_eq!(value_at(&wb, "D1"), CellValue::Number(20.0));
+    }
+
+    #[test]
+    fn a_group_writing_a_held_value_into_a_cse_block_is_refused_whole() {
+        // r8 (second Immaterial): {=A1:A3*1} over D1:D3 = 1, 2, 3, and the
+        // group [A2 = 5, D2 = 2]. D2 already holds 2, but writing it is still
+        // a write into part of the array: refused whole, A2 untouched.
+        let mut c = Cell::formula("A1:A3*1");
+        c.f_attrs = Some(" t=\"array\" ref=\"D1:D3\"".to_string());
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("A2", Cell::number(2.0)),
+            ("A3", Cell::number(3.0)),
+            ("D1", c),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        let before = wb.sheets[0].cells.clone();
+        let group = vec![(1, 0, Cell::number(5.0)), (1, 3, Cell::number(2.0))];
+        assert!(!eng.set_cells(&mut wb, 0, group));
+        assert_eq!(wb.sheets[0].cells, before);
+    }
+
+    #[test]
+    fn a_fill_whose_source_holds_the_anchor_is_refused() {
+        // r8 M2: D1 = 5 and a block anchored at D2 over D2:D4; D1:D2 filled
+        // down to D6 writes D3:D6 only. The anchor lies in the source, which
+        // the fill never rewrites, so it is not replaced: refused.
+        let mut d2 = Cell::formula("A1*2");
+        d2.f_attrs = Some(" t=\"array\" ref=\"D2:D4\"".to_string());
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("D1", Cell::number(5.0)),
+            ("D2", d2),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "D4"), CellValue::Number(2.0));
+        assert!(eng.refuses_area(&wb, 0, (2, 3, 5, 3)));
+        // Filled from D2 itself, over the whole block: still part of it.
+        assert!(eng.refuses_area(&wb, 0, (2, 3, 3, 3)));
+        // Below the block (D5:D6): nothing of it is written.
+        assert!(!eng.refuses_area(&wb, 0, (4, 3, 5, 3)));
+        // A destination that takes the anchor replaces the block.
+        assert!(!eng.refuses_area(&wb, 0, (1, 3, 5, 3)));
+    }
+
+    #[test]
     fn undoing_a_cse_paste_in_reverse_order_puts_every_cell_back() {
         // r7 M3: Sheet2 D1:D3 = 1, 2, 3; a CSE block pasted in place from
         // Sheet1; the undo hands its snapshot over in reverse (members before
@@ -3784,7 +3912,8 @@ mod tests {
         assert!(!eng.set_cell(&mut wb, (0, 1, 3), snap));
         assert_eq!(cell_at(&wb, "D2").style, 0);
         assert!(!eng.set_cell(&mut wb, (0, 1, 3), Cell::number(99.0)));
-        assert!(eng.set_cell(&mut wb, (0, 1, 3), Cell::number(4.0)));
+        // The value it holds already is refused too (r8: no value exemption).
+        assert!(!eng.set_cell(&mut wb, (0, 1, 3), Cell::number(4.0)));
     }
 
     #[test]
