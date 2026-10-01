@@ -13127,11 +13127,22 @@ impl Docxy {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
-        if !save_sheet_tab(tab, harness, explicit_save_as, |suggested| {
+        let pick = |suggested| {
             rfd::FileDialog::new()
                 .add_filter("Excel workbook", &SHEET_EXTENSIONS)
                 .set_file_name(suggested)
                 .save_file()
+        };
+        if !save_sheet_tab(tab, harness, explicit_save_as, pick, |features| {
+            matches!(
+                rfd::MessageDialog::new()
+                    .set_title("docxy")
+                    .set_level(rfd::MessageLevel::Warning)
+                    .set_description(macro_free_question(features))
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show(),
+                rfd::MessageDialogResult::Yes
+            )
         }) {
             return self.refocus(window, cx);
         }
@@ -15389,12 +15400,15 @@ fn sheet_save_decision(
 /// Run the complete workbook Save sequence without a GPUI window. Returns
 /// false when the cell editor holds an entry the sheet refuses (nothing is
 /// written; the status says why) or a harness cannot open the dialog needed
-/// to choose a target.
+/// to choose a target. `pick` is the Save As dialog, and `confirm` the
+/// question before a macro-free type drops macros
+/// ([`finish_sheet_save_asking`]).
 fn save_sheet_tab(
     tab: &mut DocTab,
     harness: bool,
     explicit_save_as: bool,
     pick: impl FnOnce(String) -> Option<PathBuf>,
+    confirm: impl FnOnce(&[&'static str]) -> bool,
 ) -> bool {
     // Commit before choosing a target so the decision and write see the edit.
     if close::prepare_sheet_save(tab).is_err() {
@@ -15402,12 +15416,12 @@ fn save_sheet_tab(
     }
     match sheet_save_decision(tab.path.as_deref(), &tab.title, harness, explicit_save_as) {
         SheetSaveDecision::InPlace(path) => {
-            finish_sheet_save(tab, Some(&path));
+            finish_sheet_save_asking(tab, Some(&path), harness, confirm);
         }
         // A never-saved workbook or Save As asks where to go, Excel-style.
         SheetSaveDecision::Dialog { suggested } => {
             let target = pick(suggested);
-            finish_sheet_save(tab, target.as_deref());
+            finish_sheet_save_asking(tab, target.as_deref(), harness, confirm);
         }
         // Never in a harness instance: rfd runs its own modal loop on this
         // thread and stops the control pump dead (see `open_args`). A harness
@@ -15443,6 +15457,66 @@ fn save_sheet_to(tab: &mut DocTab, target: &std::path::Path) -> bool {
     close::prepare_sheet_save(tab).is_ok() && finish_sheet_save(tab, Some(target))
 }
 
+/// Excel's question before a macro-free file drops `features`
+/// ([`gridcore::xlsx::SheetPackage::macro_features`]), in xlsxy's words.
+fn macro_free_question(features: &[&str]) -> String {
+    format!(
+        "The following features cannot be saved in macro-free workbooks: {}. Save without them?",
+        features.join(", ")
+    )
+}
+
+/// What a file at `path` (already a workbook name, see [`sheet_save_target`])
+/// would lose of `v`'s workbook: its macros when `path` is a macro-free type,
+/// else nothing.
+fn sheet_macro_losses(v: &SheetView, path: &std::path::Path) -> Vec<&'static str> {
+    match gridcore::xlsx::SpreadsheetKind::from_path(path) {
+        Some(kind) if !kind.allows_macros() => v.pkg.macro_features(),
+        _ => Vec::new(),
+    }
+}
+
+/// [`finish_sheet_save`], first asking, as Excel does, before a macro-free
+/// type (`.xlsx`, `.xltx`) drops the workbook's macros: `confirm` gets what
+/// would be lost and answers Yes (`true`) or No. No writes nothing and says
+/// `save cancelled`; the tab stays dirty, so a close that asked to save keeps
+/// it. Yes writes the file without them, and once it is written the open
+/// workbook drops its VB project too, so a later Save As `.xlsm` cannot write
+/// it back (xlsxy's `save_as_without_macros`); a failed write keeps it.
+///
+/// Excel 4.0 macro sheets stay in the open workbook (removing them would
+/// shift every sheet index), so each later macro-free save asks again, an
+/// in-place one included, as in Excel and xlsxy. So does one after undoing
+/// past a structural step taken before this save: that step restores a
+/// package that still has the VB project.
+///
+/// A harness instance never asks: rfd's modal loop would stop the control
+/// pump (see `open_args`). It writes as before, and the status says what was
+/// left out.
+fn finish_sheet_save_asking(
+    tab: &mut DocTab,
+    target: Option<&std::path::Path>,
+    harness: bool,
+    confirm: impl FnOnce(&[&'static str]) -> bool,
+) -> bool {
+    let losses = match (&tab.surface, target.map(sheet_save_target)) {
+        (Surface::Sheet(v), Some(Ok(path))) if !harness => sheet_macro_losses(v, &path),
+        _ => Vec::new(),
+    };
+    let asked = !losses.is_empty();
+    if asked && !confirm(&losses) {
+        tab.status = "save cancelled".into();
+        return false;
+    }
+    let saved = finish_sheet_save(tab, target);
+    if saved && asked {
+        if let Surface::Sheet(v) = &mut tab.surface {
+            v.pkg.remove_vba_project();
+        }
+    }
+    saved
+}
+
 /// Write the workbook tab to `target` (`None` is a cancelled dialog). The tab
 /// is rebound (title, path, clean) only after a successful write; either way
 /// its status says what happened, and the result is whether it was written.
@@ -15464,12 +15538,10 @@ fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) -> bool
         }
     };
     let bytes = sheet_bytes(v, Some(&path));
-    // A macro-free type writes the file without the macros; the open
-    // workbook keeps them, as Excel does, and the status says what went.
-    let dropped = match gridcore::xlsx::SpreadsheetKind::from_path(&path) {
-        Some(kind) if !kind.allows_macros() => v.pkg.macro_features(),
-        _ => Vec::new(),
-    };
+    // A macro-free type writes the file without the macros, and the status
+    // says what went. The open workbook keeps them here; after the user's
+    // Yes, `finish_sheet_save_asking` drops its VB project.
+    let dropped = sheet_macro_losses(v, &path);
     match opccore::fsio::write_atomic(&path, &bytes) {
         Ok(()) => {
             tab.title = file_name(&path).into();
@@ -15988,9 +16060,10 @@ mod load_failed_save_tests {
 #[cfg(test)]
 mod sheet_save_tests {
     use super::{
-        DocTab, Kind, SHEET_NEVER_SAVED_HARNESS, SHEET_SAVE_AS_HARNESS, SHEET_SAVE_FORMATS,
-        SheetSaveDecision, Surface, finish_sheet_save, new_sheet_surface, save_sheet_to,
-        sheet_bytes, sheet_save_decision, sheet_save_target, tab_from_path,
+        DocTab, Kind, PivotDef, SHEET_NEVER_SAVED_HARNESS, SHEET_SAVE_AS_HARNESS,
+        SHEET_SAVE_FORMATS, SheetSaveDecision, SheetView, Surface, finish_sheet_save,
+        macro_free_question, new_sheet_surface, save_sheet_tab, save_sheet_to, sheet_bytes,
+        sheet_save_decision, sheet_save_target, tab_from_path,
     };
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16361,6 +16434,189 @@ mod sheet_save_tests {
         assert!(!original.exists());
     }
 
+    /// A macro workbook with a VB project and nothing else macro.
+    fn vba_book() -> gridcore::xlsx::SheetPackage {
+        let mut pkg = gridcore::xlsx::new_xlsx();
+        let rels = String::from_utf8_lossy(pkg.part("xl/_rels/workbook.xml.rels").unwrap())
+            .replace(
+                "</Relationships>",
+                r#"<Relationship Id="rId99" Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" Target="vbaProject.bin"/></Relationships>"#,
+            );
+        pkg.set_part("xl/_rels/workbook.xml.rels", rels.into_bytes());
+        pkg.set_part("xl/vbaProject.bin", b"VBA".to_vec());
+        let pkg = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx_as(
+            &pkg,
+            gridcore::xlsx::SpreadsheetKind::MacroWorkbook,
+        ))
+        .unwrap();
+        assert_eq!(pkg.macro_features(), ["VB project"]);
+        pkg
+    }
+
+    /// The macro question's answer where it must not be asked.
+    fn not_asked(features: &[&'static str]) -> bool {
+        panic!("asked about {features:?}")
+    }
+
+    fn open_pkg(tab: &DocTab) -> &gridcore::xlsx::SheetPackage {
+        let Surface::Sheet(v) = &tab.surface else {
+            unreachable!()
+        };
+        &v.pkg
+    }
+
+    /// #789: Save or Save As to a macro-free type asks first, in xlsxy's
+    /// words, and No writes nothing; a macro type is not asked about.
+    #[test]
+    fn macro_free_save_asks_and_no_writes_nothing() {
+        use gridcore::xlsx::SpreadsheetKind;
+        assert_eq!(
+            macro_free_question(&["VB project", "Excel 4.0 macro sheets"]),
+            "The following features cannot be saved in macro-free workbooks: \
+             VB project, Excel 4.0 macro sheets. Save without them?"
+        );
+        let dir = Scratch::new();
+        let input = dir.path("in.xlsm");
+        let mut tab = loaded_sheet_tab(&dir, "in.xlsm", &xlm_book(SpreadsheetKind::MacroWorkbook));
+        tab.dirty = true;
+        // Save As .xlsx, .xltx, or a name with no extension (an .xlsx).
+        for name in ["out.xlsx", "out.xltx", "out"] {
+            let mut asked = Vec::new();
+            let target = dir.path(name);
+            assert!(save_sheet_tab(
+                &mut tab,
+                false,
+                true,
+                |_| Some(target.clone()),
+                |features| {
+                    asked = features.to_vec();
+                    false
+                }
+            ));
+            assert_eq!(asked, ["Excel 4.0 macro sheets"], "{name}");
+            assert!(!target.exists() && !dir.path("out.xlsx").exists(), "{name}");
+            assert_eq!(tab.status.as_ref(), "save cancelled", "{name}");
+            assert_eq!(tab.path.as_deref(), Some(input.as_path()));
+            assert_eq!(tab.title.as_ref(), "in.xlsm");
+            assert!(tab.dirty);
+        }
+        assert!(open_pkg(&tab).has_macro_sheets());
+
+        // To a macro type nothing is lost, so nothing is asked.
+        let copy = dir.path("copy.xltm");
+        assert!(save_sheet_tab(
+            &mut tab,
+            false,
+            true,
+            |_| Some(copy.clone()),
+            not_asked
+        ));
+        assert!(copy.is_file());
+
+        // An in-place Save of an .xlsx that still has them asks too.
+        let book = dir.path("book.xlsx");
+        let mut tab = sheet_tab(Some(book.clone()), "book.xlsx");
+        if let Surface::Sheet(v) = &mut tab.surface {
+            v.pkg = xlm_book(SpreadsheetKind::MacroWorkbook);
+        }
+        let mut asked = false;
+        assert!(save_sheet_tab(
+            &mut tab,
+            false,
+            false,
+            |_| panic!("in-place save picked"),
+            |_| {
+                asked = true;
+                false
+            }
+        ));
+        assert!(asked);
+        assert!(!book.exists());
+        assert_eq!(tab.status.as_ref(), "save cancelled");
+        assert!(tab.dirty);
+    }
+
+    /// #789: Yes writes the file without them, and only once it is written
+    /// does the open workbook drop its VB project, so a later Save As
+    /// `.xlsm` neither asks nor writes it back.
+    #[test]
+    fn macro_free_save_yes_drops_vba_from_open_pkg() {
+        let dir = Scratch::new();
+        let mut tab = loaded_sheet_tab(&dir, "in.xlsm", &vba_book());
+        let yes = |features: &[&'static str]| {
+            assert_eq!(features, ["VB project"]);
+            true
+        };
+
+        // A failed write keeps it.
+        let nowhere = dir.path("missing-dir/out.xlsx");
+        assert!(save_sheet_tab(
+            &mut tab,
+            false,
+            true,
+            |_| Some(nowhere.clone()),
+            yes
+        ));
+        assert!(tab.status.starts_with("save failed"), "{}", tab.status);
+        assert!(open_pkg(&tab).has_vba_project());
+
+        let out = dir.path("out.xlsx");
+        assert!(save_sheet_tab(
+            &mut tab,
+            false,
+            true,
+            |_| Some(out.clone()),
+            yes
+        ));
+        let saved = gridcore::xlsx::load_xlsx(&std::fs::read(&out).unwrap()).unwrap();
+        assert!(!saved.has_vba_project());
+        assert!(
+            tab.status.contains("without its VB project"),
+            "{}",
+            tab.status
+        );
+        assert_eq!(tab.path.as_deref(), Some(out.as_path()));
+        assert!(!tab.dirty);
+        assert!(!open_pkg(&tab).has_vba_project());
+
+        let again = dir.path("again.xlsm");
+        assert!(save_sheet_tab(
+            &mut tab,
+            false,
+            true,
+            |_| Some(again.clone()),
+            not_asked
+        ));
+        let saved = gridcore::xlsx::load_xlsx(&std::fs::read(&again).unwrap()).unwrap();
+        assert!(!saved.has_vba_project());
+    }
+
+    /// #789: a harness instance never asks (rfd would stop the control
+    /// pump); it writes as before and the status says what was left out.
+    #[test]
+    fn a_harness_macro_free_save_writes_without_asking() {
+        let dir = Scratch::new();
+        let book = dir.path("book.xlsx");
+        let mut tab = sheet_tab(Some(book.clone()), "book.xlsx");
+        if let Surface::Sheet(v) = &mut tab.surface {
+            v.pkg = vba_book();
+        }
+        assert!(save_sheet_tab(
+            &mut tab,
+            true,
+            false,
+            |_| panic!("in-place save picked"),
+            not_asked
+        ));
+        assert!(book.is_file());
+        assert!(
+            tab.status.contains("without its VB project"),
+            "{}",
+            tab.status
+        );
+        assert!(open_pkg(&tab).has_vba_project());
+    }
+
     /// A sheet tab over a workbook of `Sheet1`, `Two` and `Three`, holding 1,
     /// 2 and 3 in A1.
     fn three_sheet_tab() -> DocTab {
@@ -16378,7 +16634,7 @@ mod sheet_save_tests {
 
     /// Each sheet's name and A1 as a save of `v` reopens them. A sheet the
     /// model and the parts disagree on lands in the wrong part, or in none.
-    fn saved_sheets(v: &crate::SheetView) -> Vec<(String, Option<f64>)> {
+    fn saved_sheets(v: &SheetView) -> Vec<(String, Option<f64>)> {
         let wb_xml = String::from_utf8_lossy(v.pkg.part("xl/workbook.xml").unwrap()).into_owned();
         assert_eq!(
             wb_xml.matches("<sheet ").count(),
@@ -16477,7 +16733,7 @@ mod sheet_save_tests {
         let Surface::Sheet(v) = &mut tab.surface else {
             unreachable!()
         };
-        let def = crate::PivotDef {
+        let def = PivotDef {
             src_sheet: 0,
             src_range: (0, 0, 0, 0),
             out_sheet: 0,
@@ -16507,7 +16763,7 @@ mod sheet_save_tests {
         assert_eq!(saved_sheets(v), with);
     }
 
-    fn comment_texts(v: &crate::SheetView) -> Vec<(usize, u32, u32, String)> {
+    fn comment_texts(v: &SheetView) -> Vec<(usize, u32, u32, String)> {
         v.pkg
             .comments()
             .into_iter()
