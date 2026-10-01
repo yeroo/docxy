@@ -2363,11 +2363,12 @@ impl SheetPackage {
     /// `xlm`, `function` or `vbProcedure`, which a macro-free file cannot
     /// carry either, with or without a macro sheet.
     pub fn has_macro_names(&self) -> bool {
-        self.part("xl/workbook.xml").is_some_and(|b| {
-            !remove_macro_names(&String::from_utf8_lossy(b), &|_: &str| false)
-                .1
-                .is_empty()
-        })
+        self.part(&workbook_part_name(&self.parts))
+            .is_some_and(|b| {
+                !remove_macro_names(&String::from_utf8_lossy(b), &|_: &str| false)
+                    .1
+                    .is_empty()
+            })
     }
 
     /// What a macro-free file (`.xlsx`, `.xltx`) written from this package
@@ -2421,7 +2422,8 @@ impl SheetPackage {
             self.add_sheet(&format!("Sheet{n}"));
         }
         let refers = |formula: &str| names.iter().any(|s| formula_refers_to_sheet(formula, s));
-        if let Some(p) = self.parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
+        let wb_part = workbook_part_name(&self.parts);
+        if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == wb_part) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
             // A `localSheetId` that names no model sheet was loaded as a
             // global name; that model entry goes with its element too, or the
@@ -6473,17 +6475,17 @@ impl SheetPackage {
         }
         // The workbook relationship whose target resolves to the part (a
         // relative, `./` or absolute Target alike) — capture its rId, then
-        // remove it by that Id.
+        // remove it by that Id. The workbook part is wherever the package
+        // rels put it, `xl/workbook.xml` only by convention.
+        let wb_part = workbook_part_name(&self.parts);
+        let wb_dir = wb_part.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let wb_rels = rels_part_name(&wb_part);
         let mut rid = String::new();
-        if let Some(p) = self
-            .parts
-            .iter_mut()
-            .find(|(n, _)| n == "xl/_rels/workbook.xml.rels")
-        {
+        if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == wb_rels) {
             let mut xml = String::from_utf8_lossy(&p.1).into_owned();
             if let Some((id, _, _)) = parse_rels(&xml)
                 .into_iter()
-                .find(|(_, _, t)| resolve_relative("xl", t) == part_name)
+                .find(|(_, _, t)| resolve_relative(wb_dir, t) == part_name)
             {
                 if let Some(el) = find_element_by_attr(&xml, "Relationship", "Id", |v| v == id) {
                     xml.replace_range(el.start..el.end, "");
@@ -6494,7 +6496,7 @@ impl SheetPackage {
         }
         // workbook.xml: drop the <sheet> element and fix defined-name scopes
         // (localSheetId counts sheets in document order).
-        if let Some(p) = self.parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
+        if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == wb_part) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
             let mut xml = if rid.is_empty() {
                 xml
@@ -12703,6 +12705,80 @@ mod kind_tests {
         let wb = part_text(&out, "xl/workbook.xml");
         assert_eq!(wb.matches("<sheet ").count(), 2, "{wb}");
         assert!(!wb.contains("Macro1") && !wb.contains("Dialog1"), "{wb}");
+    }
+
+    /// [`mixed_xlm_book`] with its workbook part at `wb/book.xml` (and its
+    /// rels at `wb/_rels/book.xml.rels`), where only the package rels say
+    /// to look.
+    fn relocated_xlm_book() -> SheetPackage {
+        let parts: Vec<(String, Vec<u8>)> = mixed_xlm_book()
+            .parts
+            .into_iter()
+            .map(|(name, bytes)| {
+                let text = || String::from_utf8_lossy(&bytes).into_owned();
+                match name.as_str() {
+                    "xl/workbook.xml" => ("wb/book.xml".to_string(), bytes),
+                    "xl/_rels/workbook.xml.rels" => (
+                        "wb/_rels/book.xml.rels".to_string(),
+                        text().replace("Target=\"", "Target=\"../xl/").into_bytes(),
+                    ),
+                    "_rels/.rels" => (
+                        name,
+                        text()
+                            .replace("xl/workbook.xml", "wb/book.xml")
+                            .into_bytes(),
+                    ),
+                    "[Content_Types].xml" => (
+                        name,
+                        text()
+                            .replace("/xl/workbook.xml", "/wb/book.xml")
+                            .into_bytes(),
+                    ),
+                    _ => (name, bytes),
+                }
+            })
+            .collect();
+        let pkg = load_xlsx(&write_zip(&parts)).expect("the relocated fixture loads");
+        assert!(pkg.part("xl/workbook.xml").is_none());
+        assert_eq!(pkg.workbook.sheets.len(), 4);
+        pkg
+    }
+
+    /// #789: a workbook part outside `xl/` is found through the package
+    /// rels by the sheet removal and the Excel 4.0 macro paths.
+    #[test]
+    fn remove_sheet_follows_workbook_part_from_rels() {
+        let mut pkg = relocated_xlm_book();
+        assert!(pkg.has_macro_names());
+        assert!(
+            pkg.macro_features()
+                .contains(&"Excel 4.0 function stored in defined names")
+        );
+
+        assert!(pkg.remove_sheet(1));
+        let wb = part_text(&pkg, "wb/book.xml");
+        assert_eq!(wb.matches("<sheet ").count(), 3, "{wb}");
+        assert!(!wb.contains("name=\"Macro1\""), "{wb}");
+        let rels = part_text(&pkg, "wb/_rels/book.xml.rels");
+        assert!(!rels.contains("macrosheets"), "{rels}");
+        assert!(rels.contains("dialogsheets"), "{rels}");
+
+        let mut copy = relocated_xlm_book();
+        assert!(copy.remove_excel4_macros());
+        let wb = part_text(&copy, "wb/book.xml");
+        assert_eq!(wb.matches("<sheet ").count(), 2, "{wb}");
+        assert!(!wb.contains("Macro1") && !wb.contains("Dialog1"), "{wb}");
+        assert!(
+            !wb.contains("CellColor") && !wb.contains("Auto_Open"),
+            "{wb}"
+        );
+        assert!(wb.contains("name=\"Total\""), "{wb}");
+        let rels = part_text(&copy, "wb/_rels/book.xml.rels");
+        assert!(
+            !rels.contains("macrosheets") && !rels.contains("dialogsheets"),
+            "{rels}"
+        );
+        assert!(!copy.has_macro_names() && !copy.has_macro_sheets());
     }
 
     #[test]
