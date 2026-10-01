@@ -174,6 +174,20 @@ pub fn move_index<T>(v: &mut Vec<T>, active: &mut usize, from: usize, to: usize)
     true
 }
 
+/// Whether a drag's snapshot of the tab list still describes it. The payload
+/// records the length and the source tab's title when the drag began; a tab
+/// closed or another reorder landing mid-drag invalidates the snapshot, and
+/// the drop must not guess at what moved. `title_at_ix` is the title the
+/// stored index names now — `None` when it names nothing.
+pub fn drag_applies(
+    len_at_drag: usize,
+    len_now: usize,
+    title_at_ix: Option<&str>,
+    title: &str,
+) -> bool {
+    len_at_drag == len_now && title_at_ix == Some(title)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +227,22 @@ mod tests {
             assert_eq!(v, original);
             assert_eq!(active, 1);
         }
+    }
+
+    /// #545 (FIX r1 i2): a drop is honored only while the strip still matches
+    /// the drag's snapshot — same length, and the stored index still names
+    /// the tab the payload recorded.
+    #[test]
+    fn drag_applies_rejects_a_stale_snapshot() {
+        // The strip is exactly as the drag left it.
+        assert!(drag_applies(3, 3, Some("b"), "b"));
+        // A tab closed mid-drag: the length differs.
+        assert!(!drag_applies(3, 2, Some("b"), "b"));
+        // The index now names another tab (a reorder or a close that shifted
+        // the rest).
+        assert!(!drag_applies(3, 3, Some("c"), "b"));
+        // Out of range after closes.
+        assert!(!drag_applies(4, 2, None, "d"));
     }
 
     #[test]

@@ -26,10 +26,26 @@ test a plain click on a chip without movement still selects it
   call title-bar {}
   assert reply.active is 1
 
+# A press that drifts past gpui's 2px drag threshold arms TabDrag, which
+# cancels the click; a drop back on the source chip must then select it
+# rather than no-op (FIX r1 M1). The offset ends the drag 6px right of
+# chip 1's centre, still well inside it.
+test a small drag that ends back on its chip still selects it
+  call tab-select {"tab":0}
+  shot title-tabs
+  call pointer-drag {"from":"tab-chip:1","to":"tab-chip:1","offset":[6,0]}
+  call title-bar {}
+  assert reply.active is 1
+  call tab-list {}
+  assert reply.tabs.0.title is drag-02.docx
+  assert reply.tabs.1.title is drag-03.docx
+  assert reply.tabs.2.title is drag-01.docx
+  assert reply.tabs.3.title is drag-04.docx
+
 # The more-tabs list (deferred, priority 1) must win a real click over the
 # sheet grid's fill handle (deferred, priority 0) where the two overlap.
-# All twenty copies are the same fixture, so "cells unchanged" compares the
-# snapshot range across identical content after the click switches the sheet.
+# The asserts after the click read the sheet that owns the handle (index 23;
+# the drag case's four docx tabs come first), not the tab the click selects.
 test the more-tabs list wins a real click over the sheet fill handle
   open copy:"../fixtures/basic.xlsx" as sheet-01.xlsx
   open copy:"../fixtures/basic.xlsx" as sheet-02.xlsx
@@ -53,7 +69,8 @@ test the more-tabs list wins a real click over the sheet fill handle
   open copy:"../fixtures/basic.xlsx" as sheet-20.xlsx
   call window-size {"w":1000,"h":700}
   click M3
-  snapshot A1:D8
+  # Around the handle, on sheet-20, which owns the selection.
+  snapshot L2:N6
   call title-tab {"action":"more"}
   shot tab-more-item:0
   call pointer-click {"at":"fill-handle"}
@@ -63,6 +80,9 @@ test the more-tabs list wins a real click over the sheet fill handle
   assert reply.item is 13
   call title-bar {}
   assert reply.active is 13
-  assert dirty is false
+  # The click switched to tab 13; the handle's sheet is index 23. Its dirty
+  # flag and the cells around M3 are what prove the grid got nothing.
+  call tab-list {}
+  assert reply.tabs.23.dirty is false
+  call tab-select {"tab":23}
   assert cells unchanged
-  assert no fill preview

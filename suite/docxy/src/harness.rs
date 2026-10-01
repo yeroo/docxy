@@ -916,14 +916,22 @@ fn pointer_drag_path(from: Point<Pixels>, to: Point<Pixels>) -> Vec<Point<Pixels
 
 /// Which more-tabs item's recorded bounds contain `p` — the drift guard a
 /// `pointer-click` reply reports, or -1 when the point is over no item.
+/// Each name resolves through `Probes::current` (the frame on screen first,
+/// the finished one as fallback), the same frame dispatched input
+/// hit-tests against — a plain `last` read can sit a frame behind it.
 fn item_at_point(probes: &crate::Probes, p: Point<Pixels>) -> i64 {
-    probes
-        .last
+    let names: Vec<&str> = probes
+        .next
         .iter()
-        .find_map(|(name, bounds)| {
+        .chain(&probes.last)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    names
+        .into_iter()
+        .find_map(|name| {
             name.strip_prefix("tab-more-item:")
                 .and_then(|rest| rest.parse::<usize>().ok())
-                .filter(|_| bounds.contains(&p))
+                .filter(|_| probes.current(name).is_some_and(|b| b.contains(&p)))
                 .map(|i| i as i64)
         })
         .unwrap_or(-1)
@@ -978,11 +986,13 @@ fn drag_events(path: &[Point<Pixels>]) -> Vec<PlatformInput> {
 }
 
 /// The centre of a named region's recorded bounds — where a pointer verb
-/// presses or releases. Errors name the region.
+/// presses or releases. Errors name the region. Probe-backed regions read
+/// the frame that is on screen now (see `Docxy::region_bounds_live`), the
+/// one dispatched input hit-tests against.
 fn region_point(app: &crate::Docxy, name: &str, window: &Window) -> Result<Point<Pixels>, String> {
     let region = parse_region(name)?;
     let bounds = app
-        .region_bounds(region, window)
+        .region_bounds_live(region, window)
         .map_err(|e| format!("{name}: {e}"))?;
     Ok(bounds.center())
 }
@@ -995,6 +1005,26 @@ fn fill_handle_point(app: &crate::Docxy) -> Result<Point<Pixels>, String> {
         .ok_or_else(|| "the active tab is not a spreadsheet".to_string())?;
     let br = (v.sel.0.max(v.anchor.0), v.sel.1.max(v.anchor.1));
     Ok(app.cells_bounds(br, br)?.bottom_right())
+}
+
+/// The optional `"offset":[dx,dy]` on `pointer-drag`: logical pixels added to
+/// the resolved `to` point, for a drop that lands near — not on — its
+/// target's centre (e.g. a drag that ends back on its own chip).
+fn drag_offset(args: &Json) -> Result<Option<(f32, f32)>, String> {
+    let Some(raw) = args.get("offset") else {
+        return Ok(None);
+    };
+    let nums = raw.as_array().ok_or("'offset' must be [dx, dy]")?;
+    if nums.len() != 2 {
+        return Err("'offset' must be [dx, dy]".into());
+    }
+    let axis = |i: usize| {
+        nums[i]
+            .as_f64()
+            .map(|n| n as f32)
+            .ok_or_else(|| "'offset' entries must be numbers".to_string())
+    };
+    Ok(Some((axis(0)?, axis(1)?)))
 }
 
 /// A rectangle in physical screen pixels: what a harness crops a window capture
@@ -2932,6 +2962,10 @@ pub fn dispatch(
             let to_name = arg_str(args, "to")?;
             let from = region_point(app, from_name, window)?;
             let to = region_point(app, to_name, window)?;
+            let to = match drag_offset(args)? {
+                Some((dx, dy)) => point(px(f32::from(to.x) + dx), px(f32::from(to.y) + dy)),
+                None => to,
+            };
             let path = pointer_drag_path(from, to);
             let mut done = Done::ok(Json::obj(vec![
                 (
@@ -5319,6 +5353,34 @@ mod tests {
     fn a_chart_region_takes_an_index() {
         assert_eq!(parse_region("chart:0"), Ok(Region::Chart(0)));
         assert_eq!(parse_region("chart:12"), Ok(Region::Chart(12)));
+    }
+
+    /// #545 (FIX r1 M1): `offset` is optional, is a two-number array, and is
+    /// added to the resolved `to` point — the shape a drop-back-on-own-chip
+    /// drag is built from.
+    #[test]
+    fn drag_offset_is_an_optional_two_number_pair() {
+        let no_offset = Json::obj(vec![]);
+        assert_eq!(drag_offset(&no_offset), Ok(None));
+        let with = Json::obj(vec![(
+            "offset",
+            Json::Arr(vec![Json::Num(6.), Json::Num(-3.5)]),
+        )]);
+        assert_eq!(drag_offset(&with), Ok(Some((6.0, -3.5))));
+        for bad in [
+            Json::obj(vec![("offset", Json::Str("6,0".into()))]),
+            Json::obj(vec![("offset", Json::Arr(vec![Json::Num(6.)]))]),
+            Json::obj(vec![(
+                "offset",
+                Json::Arr(vec![Json::Num(6.), Json::Num(0.), Json::Num(1.)]),
+            )]),
+            Json::obj(vec![(
+                "offset",
+                Json::Arr(vec![Json::Num(6.), Json::Str("0".into())]),
+            )]),
+        ] {
+            assert!(drag_offset(&bad).is_err(), "{bad}");
+        }
     }
 
     /// An unknown region must name itself in the refusal and list the ones

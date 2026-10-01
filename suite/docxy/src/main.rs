@@ -7222,9 +7222,9 @@ fn window_frame_borders(window: &Window) -> Edges<f32> {
 /// The pinned TitleBar separately adds left padding and a fullscreen inset.
 fn title_bar_geometry(window: &Window) -> f32 {
     // Workaround for gpui-component's TitleBar `#bar` being flex_shrink_0
-    // (docs/upstream-gpui-component-titlebar.md, #545): a definite content
-    // width keeps a wide strip from pushing the window controls off-screen.
-    // Simplify once a pin bump ships the upstream fix.
+    // (suite/docs/upstream-gpui-component-titlebar.md, #545): a definite
+    // content width keeps a wide strip from pushing the window controls
+    // off-screen. Simplify once a pin bump ships the upstream fix.
     #[cfg(target_os = "macos")]
     const TITLE_LEFT_PAD: f32 = 80.0;
     #[cfg(not(target_os = "macos"))]
@@ -8895,14 +8895,9 @@ impl Docxy {
                 size: window.viewport_size(),
             }),
             Region::TitleTabs | Region::TabPrev | Region::TabNext | Region::TabMore
-            | Region::TabMoreItem(_) => self.probes.borrow()
+            | Region::TabMoreItem(_) | Region::TabChip(_) => self.probes.borrow()
                 .get(&harness::region_name(region))
                 .ok_or_else(|| format!("{} is not visible", harness::region_name(region))),
-            Region::TabChip(i) => self
-                .probes
-                .borrow()
-                .get(&format!("tab-chip:{i}"))
-                .ok_or_else(|| format!("tab chip {i} is not visible")),
             Region::Gantt
             | Region::Bar(_)
             | Region::ProjectHbarTable
@@ -8941,6 +8936,34 @@ impl Docxy {
                         )
                     })
             }
+        }
+    }
+
+    /// Like `region_bounds`, but for pointer verbs: probe-backed regions
+    /// resolve against the frame that is on screen now (`Probes::current`),
+    /// which is the frame gpui hit-tests dispatched input against — `last`,
+    /// what `rect` answers from, can sit a frame behind it (FIX r1 i1).
+    fn region_bounds_live(
+        &self,
+        region: harness::Region,
+        window: &Window,
+    ) -> Result<Bounds<Pixels>, String> {
+        use harness::Region;
+        match region {
+            Region::TitleTabs
+            | Region::TabPrev
+            | Region::TabNext
+            | Region::TabMore
+            | Region::TabMoreItem(_)
+            | Region::TabChip(_)
+            | Region::Gallery
+            | Region::ChartPanel
+            | Region::Chart(_) => self
+                .probes
+                .borrow()
+                .current(&harness::region_name(region))
+                .ok_or_else(|| format!("{} is not visible", harness::region_name(region))),
+            other => self.region_bounds(other, window),
         }
     }
 
@@ -22814,12 +22837,14 @@ impl Docxy {
 }
 
 /// The drag payload for a title-chip drag: the source tab's absolute index,
-/// so a drop reorders by indices, plus its title for the floating preview.
-/// Cloned into the view gpui draws under the cursor — the same pattern as
-/// `TimelineDrag` in `project/timeline.rs`.
+/// plus the strip length and the tab's title at drag start — a tab closed or
+/// another reorder landing mid-drag invalidates the index, and the drop must
+/// not guess at what moved. Cloned into the view gpui draws under the
+/// cursor — the same pattern as `TimelineDrag` in `project/timeline.rs`.
 #[derive(Clone)]
 struct TabDrag {
     ix: usize,
+    len: usize,
     title: SharedString,
 }
 
@@ -22871,15 +22896,20 @@ impl Docxy {
     }
 
     /// Reorder the tabs by drag (#545): move the tab at `from` to index `to`.
-    /// Mirrors `select_tab`'s housekeeping — grid state is kept per active
-    /// document, and the indices it uses just changed.
+    /// A drop back on the source chip is a click that drifted past gpui's
+    /// drag threshold — arming the drag cancels the click, so the drop
+    /// selects the tab instead. Unlike `select_tab`, no grid state is
+    /// dropped: the same document stays active, so the grid under it is
+    /// unchanged.
     fn move_tab(&mut self, from: usize, to: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if from == to {
+            self.select_tab(from, window, cx);
+            return;
+        }
         self.flush_project_passes(cx);
-        self.project_prompt_cancel();
         self.close_menu();
         self.tab_more_open = false;
         if tabstrip::move_index(&mut self.tabs, &mut self.active, from, to) {
-            self.drop_grid_state();
             self.persist();
             cx.notify();
         }
@@ -23145,13 +23175,17 @@ impl Render for Docxy {
                     .on_drag(
                         TabDrag {
                             ix: i,
+                            len: self.tabs.len(),
                             title: tb.title.clone(),
                         },
                         |d, _, _, cx| cx.new(|_| d.clone()),
                     )
                     .drag_over::<TabDrag>(move |s, _, _, _| s.bg(border))
                     .on_drop(cx.listener(move |this, d: &TabDrag, window, cx| {
-                        this.move_tab(d.ix, i, window, cx)
+                        let title = this.tabs.get(d.ix).map(|t| t.title.as_str());
+                        if tabstrip::drag_applies(d.len, this.tabs.len(), title, d.title.as_str()) {
+                            this.move_tab(d.ix, i, window, cx)
+                        }
                     }))
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.select_tab(i, window, cx)),
