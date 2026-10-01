@@ -427,3 +427,136 @@ fn legacy_imports_match_their_xlsx_originals() {
         errs.join("\n")
     );
 }
+
+/// `corpus/legacy/addin`: Excel's `.xlsx` and `.xlsb` of a workbook calling
+/// a function of the add-in shipped with Office (EUROTOOL.XLAM). Excel
+/// stores the call as a library external link (#888).
+fn add_in_books() -> (Workbook, gridcore::xlsx::SheetPackage) {
+    let dir = corpus("legacy").join("addin");
+    let src = load_xlsx(&std::fs::read(dir.join("addin-udf.xlsx")).unwrap())
+        .expect("addin-udf.xlsx loads")
+        .workbook;
+    let (pkg, format) =
+        open_workbook(&std::fs::read(dir.join("addin-udf.xlsb")).unwrap()).expect("xlsb opens");
+    assert_eq!(format, SourceFormat::Xlsb);
+    (src, pkg)
+}
+
+/// Every formula of `src` is in `got`, spelled the same: `[1]!EUROCONVERT`
+/// doesn't parse, so (e) compares text, not the AST.
+fn same_formula_text(file: &str, src: &Workbook, got: &Workbook, errs: &mut Vec<String>) {
+    for (s, sheet) in src.sheets.iter().enumerate() {
+        for (&(r, c), cell) in &sheet.cells {
+            let Some(want) = &cell.formula else { continue };
+            let have = got.sheets[s].cell(r, c).and_then(|x| x.formula.as_deref());
+            if have != Some(want.as_str()) {
+                errs.push(format!(
+                    "{file}: {}!{}: (e) ={have:?} != source ={want}",
+                    sheet.name,
+                    cell_name(r, c)
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn xlsb_add_in_function_keeps_its_formula_and_link() {
+    let (src, pkg) = add_in_books();
+    let got = &pkg.workbook;
+    let formula = |wb: &Workbook, r, c| wb.sheets[0].cell(r, c).and_then(|x| x.formula.clone());
+    assert_eq!(
+        formula(got, 0, 1).as_deref(),
+        Some(r#"[1]!EUROCONVERT(A1,"DEM","EUR")"#)
+    );
+    assert_eq!(
+        formula(got, 1, 1).as_deref(),
+        Some(r#"[1]!EUROCONVERT(A1,"FRF","EUR")*2"#)
+    );
+    let mut errs = Vec::new();
+    compare_static("addin-udf.xlsb", &src, got, &mut errs);
+    same_formula_text("addin-udf.xlsb", &src, got, &mut errs);
+    assert!(errs.is_empty(), "{}", errs.join("\n"));
+
+    // Recalculation can't call the add-in, so the cached values stay.
+    let mut wb = got.clone();
+    Engine::new(&wb).recalc_all(&mut wb);
+    let value = |r, c| wb.sheets[0].cell(r, c).map(|x| x.value.clone());
+    assert_eq!(value(0, 1), Some(CellValue::Number(51.13)));
+    assert_eq!(value(1, 1), Some(CellValue::Number(30.48)));
+}
+
+#[test]
+fn xlsb_add_in_link_survives_save_as_xlsx() {
+    let (src, pkg) = add_in_books();
+    let bytes = save_xlsx(&pkg);
+    let zip = opccore::zip::ZipArchive::open(&bytes).expect("saved package");
+    let part = |name: &str| {
+        String::from_utf8(zip.read(name).unwrap_or_else(|| panic!("{name} missing"))).unwrap()
+    };
+
+    let link = part("xl/externalLinks/externalLink1.xml");
+    assert!(
+        link.contains(r#"<externalBook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1">"#),
+        "{link}"
+    );
+    assert_eq!(link.matches("<sheetName ").count(), 21, "{link}");
+    assert!(link.contains(r#"<sheetName val="1028"/>"#), "{link}");
+    assert!(
+        link.contains(r#"<definedNames><definedName name="EUROCONVERT"/></definedNames>"#),
+        "{link}"
+    );
+    // The link part's own rels, as the .xlsb has them: the library one
+    // (rId1) is what sends Excel to its Library folder.
+    let rels = part("xl/externalLinks/_rels/externalLink1.xml.rels");
+    assert!(
+        rels.contains(r#"<Relationship Id="rId1" Type="http://schemas.microsoft.com/office/2006/relationships/xlExternalLinkPath/xlLibrary" Target="EUROTOOL.XLAM" TargetMode="External"/>"#),
+        "{rels}"
+    );
+    assert!(
+        rels.contains(r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLinkPath" Target="file:///C:\Program%20Files\Microsoft%20Office\Root\Office16\Library\EUROTOOL.XLAM" TargetMode="External"/>"#),
+        "{rels}"
+    );
+    assert!(part("[Content_Types].xml").contains(
+        r#"<Override PartName="/xl/externalLinks/externalLink1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.externalLink+xml"/>"#
+    ));
+
+    // workbook.xml refers to it through an externalLink rel, before the
+    // defined names (CT_Workbook order).
+    let wb_rels = part("xl/_rels/workbook.xml.rels");
+    let rel = wb_rels
+        .split("<Relationship ")
+        .find(|r| r.contains(r#"Target="externalLinks/externalLink1.xml""#))
+        .unwrap_or_else(|| panic!("no workbook rel: {wb_rels}"));
+    assert!(
+        rel.contains(r#"Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLink""#),
+        "{rel}"
+    );
+    let rid = rel
+        .split("Id=\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    let workbook = part("xl/workbook.xml");
+    let refs = workbook
+        .find(&format!(
+            r#"<externalReferences><externalReference r:id="{rid}"/></externalReferences>"#
+        ))
+        .unwrap_or_else(|| panic!("no externalReferences: {workbook}"));
+    let names = workbook
+        .find("<definedNames>")
+        .unwrap_or_else(|| panic!("no definedNames: {workbook}"));
+    assert!(
+        workbook.find("</sheets>").unwrap() < refs && refs < names,
+        "{workbook}"
+    );
+
+    // Reopened: the same formulas, values and names.
+    let back = load_xlsx(&bytes).expect("saved import reloads").workbook;
+    let mut errs = Vec::new();
+    compare_static("addin-udf.xlsb (h)", &src, &back, &mut errs);
+    same_formula_text("addin-udf.xlsb (h)", &src, &back, &mut errs);
+    assert!(errs.is_empty(), "{}", errs.join("\n"));
+}

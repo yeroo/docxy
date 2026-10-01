@@ -794,6 +794,29 @@ pub(crate) fn parse_rels(xml: &str) -> Vec<(String, String, String)> {
     out
 }
 
+/// [`parse_rels`] with each relationship's `TargetMode` (`External`, or
+/// `None` for an internal one): (Id, Type, Target, TargetMode), the target
+/// as written.
+pub(crate) fn parse_rels_mode(xml: &str) -> Vec<(String, String, String, Option<String>)> {
+    let mut out = Vec::new();
+    let mut p = XmlParser::new(xml);
+    loop {
+        match p.next() {
+            Event::Start if local(p.name()) == "Relationship" => {
+                out.push((
+                    decode(p.attr("Id")),
+                    decode(p.attr("Type")),
+                    decode(p.attr("Target")),
+                    Some(decode(p.attr("TargetMode"))).filter(|m| !m.is_empty()),
+                ));
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Sheet (name, r:id) pairs, the 1904 flag, and defined names (name, scope,
 /// formula) from `xl/workbook.xml`.
 #[allow(clippy::type_complexity)]

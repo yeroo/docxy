@@ -173,6 +173,22 @@ pub(crate) struct SheetIn {
     pub cells: BTreeMap<(u32, u32), Cell>,
 }
 
+/// Another workbook or add-in whose names formulas call, as `[k]!NAME`
+/// with `k` its 1-based place in [`BookIn::external_links`] (#888).
+/// [`BookIn::build`] writes it as `xl/externalLinks/externalLink{k}.xml`.
+#[derive(Debug, Default)]
+pub(crate) struct ExternalLink {
+    /// The `Id` in `rels` that names the book (`<externalBook r:id>`).
+    pub book: String,
+    /// The link part's relationships as the file has them: (Id, Type,
+    /// Target, TargetMode).
+    pub rels: Vec<(String, String, String, Option<String>)>,
+    /// The book's sheet names.
+    pub sheets: Vec<String>,
+    /// The book's names, in the file's order.
+    pub names: Vec<String>,
+}
+
 /// A workbook as a reader collects it, before it becomes a package.
 #[derive(Debug, Default)]
 pub(crate) struct BookIn {
@@ -183,6 +199,8 @@ pub(crate) struct BookIn {
     /// `formats` by code.
     format_ix: HashMap<String, u32>,
     pub names: Vec<DefinedName>,
+    /// The external books formulas name, `[1]` first.
+    pub external_links: Vec<ExternalLink>,
     pub date1904: bool,
     pub limits: Limits,
     /// What has been charged against `limits` so far.
@@ -309,7 +327,97 @@ impl BookIn {
             pkg.workbook.defined_names.push(name);
         }
         pkg.workbook.date1904 = self.date1904;
+        write_external_links(&mut pkg, &self.external_links);
         pkg
+    }
+}
+
+/// Each external link as `xl/externalLinks/externalLink{k}.xml` (with its
+/// rels, content type and workbook rel), and `<externalReferences>` naming
+/// them in order, so `[k]!NAME` names link `k`. `pkg` is the fresh package
+/// [`BookIn::build`] makes, whose workbook.xml is `<sheets>` only: its
+/// `<externalReferences>` goes right after `</sheets>`, its schema slot,
+/// and a save puts `<definedNames>` after it.
+fn write_external_links(pkg: &mut SheetPackage, links: &[ExternalLink]) {
+    use crate::xlsx::{add_content_type_override, add_rel, esc_attr};
+    const MAIN: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const RELS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    if links.is_empty() {
+        return;
+    }
+    let mut refs = String::new();
+    for (i, link) in links.iter().enumerate() {
+        let part = format!("xl/externalLinks/externalLink{}.xml", i + 1);
+        let mut body = String::new();
+        if !link.sheets.is_empty() {
+            body.push_str("<sheetNames>");
+            for s in &link.sheets {
+                body.push_str(&format!(r#"<sheetName val="{}"/>"#, esc_attr(s)));
+            }
+            body.push_str("</sheetNames>");
+        }
+        // Each name once: a book's sheet-scoped names may repeat one, and
+        // their scope isn't read.
+        let mut seen = std::collections::HashSet::new();
+        let names: Vec<&String> = link
+            .names
+            .iter()
+            .filter(|n| seen.insert(n.to_lowercase()))
+            .collect();
+        if !names.is_empty() {
+            body.push_str("<definedNames>");
+            for n in names {
+                body.push_str(&format!(r#"<definedName name="{}"/>"#, esc_attr(n)));
+            }
+            body.push_str("</definedNames>");
+        }
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<externalLink xmlns="{MAIN}"><externalBook xmlns:r="{RELS}" r:id="{}">{body}</externalBook></externalLink>"#,
+            esc_attr(&link.book)
+        );
+        let mut rels = String::from(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+        );
+        for (id, ty, target, mode) in &link.rels {
+            rels.push_str(&format!(
+                r#"<Relationship Id="{}" Type="{}" Target="{}""#,
+                esc_attr(id),
+                esc_attr(ty),
+                esc_attr(target)
+            ));
+            if let Some(mode) = mode {
+                rels.push_str(&format!(r#" TargetMode="{}""#, esc_attr(mode)));
+            }
+            rels.push_str("/>");
+        }
+        rels.push_str("</Relationships>");
+        add_content_type_override(
+            &mut pkg.parts,
+            &format!("/{part}"),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.externalLink+xml",
+        );
+        let rid = add_rel(
+            &mut pkg.parts,
+            "xl/_rels/workbook.xml.rels",
+            &format!("{RELS}/externalLink"),
+            &format!("externalLinks/externalLink{}.xml", i + 1),
+        );
+        refs.push_str(&format!(r#"<externalReference r:id="{rid}"/>"#));
+        pkg.parts.push((
+            format!("xl/externalLinks/_rels/externalLink{}.xml.rels", i + 1),
+            rels.into_bytes(),
+        ));
+        pkg.parts.push((part, xml.into_bytes()));
+    }
+    if let Some((_, wb)) = pkg.parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
+        let xml = String::from_utf8_lossy(wb).replacen(
+            "</sheets>",
+            &format!("</sheets><externalReferences>{refs}</externalReferences>"),
+            1,
+        );
+        *wb = xml.into_bytes();
     }
 }
 
@@ -754,6 +862,65 @@ mod tests {
         // A long repeat stays within 31 characters.
         let two = valid_sheet_names([long.as_str(), long.as_str()].into_iter());
         assert_eq!(two[1], format!("{} (2)", "x".repeat(27)));
+    }
+
+    /// Each external link becomes a part, numbered in order and named from
+    /// `<externalReferences>` right after `<sheets>`; a name repeated in
+    /// another case is written once, and attribute text is escaped. A book
+    /// with no links gets none of it.
+    #[test]
+    fn external_links_are_written_in_order() {
+        let text = |pkg: &SheetPackage, name: &str| {
+            String::from_utf8(pkg.part(name).unwrap_or_default().to_vec()).unwrap()
+        };
+        let link = |names: &[&str], target: &str| {
+            ExternalLink {
+            book: "rId1".into(),
+            rels: vec![(
+                "rId1".into(),
+                "http://schemas.microsoft.com/office/2006/relationships/xlExternalLinkPath/xlLibrary".into(),
+                target.into(),
+                Some("External".into()),
+            )],
+            sheets: vec!["S&1".into()],
+            names: names.iter().map(|n| n.to_string()).collect(),
+        }
+        };
+        let mut book = BookIn::new();
+        book.external_links = vec![link(&["F"], "A.XLAM"), link(&["X", "G", "x"], "B&C.XLAM")];
+        let pkg = book.build();
+        let two = text(&pkg, "xl/externalLinks/externalLink2.xml");
+        assert!(
+            two.ends_with(r#" r:id="rId1"><sheetNames><sheetName val="S&amp;1"/></sheetNames><definedNames><definedName name="X"/><definedName name="G"/></definedNames></externalBook></externalLink>"#),
+            "{two}"
+        );
+        assert!(
+            text(&pkg, "xl/externalLinks/_rels/externalLink2.xml.rels")
+                .contains(r#"Target="B&amp;C.XLAM" TargetMode="External"/>"#)
+        );
+        let rels = text(&pkg, "xl/_rels/workbook.xml.rels");
+        let rid = |k: usize| {
+            let at = rels
+                .find(&format!(r#"Target="externalLinks/externalLink{k}.xml""#))
+                .unwrap();
+            let id = rels[..at].rfind("Id=\"").unwrap() + 4;
+            rels[id..].split('"').next().unwrap().to_string()
+        };
+        assert!(text(&pkg, "xl/workbook.xml").contains(&format!(
+            r#"</sheets><externalReferences><externalReference r:id="{}"/><externalReference r:id="{}"/></externalReferences></workbook>"#,
+            rid(1),
+            rid(2)
+        )));
+        assert_eq!(
+            text(&pkg, "[Content_Types].xml")
+                .matches("spreadsheetml.externalLink+xml")
+                .count(),
+            2
+        );
+
+        let pkg = BookIn::new().build();
+        assert!(!pkg.part_names().iter().any(|n| n.contains("externalLink")));
+        assert!(!text(&pkg, "xl/workbook.xml").contains("externalReferences"));
     }
 
     /// A renamed sheet takes its references along: a formula and a defined
