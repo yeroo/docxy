@@ -6,7 +6,7 @@
 //! a sparse `BTreeMap` so memory is proportional to content, and iteration is
 //! naturally row-major (the order worksheet XML wants).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 // ---------------------------------------------------------------------------
 // A1 reference math
@@ -234,7 +234,66 @@ pub fn anchor_pasted_array_ref(cell: &mut Cell, current: Option<&Cell>, row: u32
     }
 }
 
+/// The cells among `cells` (at absolute `(row, col)`) that lie inside the
+/// spill extent of another cell in `cells` and hold no formula: spill output
+/// that the anchor re-creates. The engine drops a submitted extent
+/// ([`crate::engine::Engine::set_cell`] recomputes it), so a paste of a whole
+/// spill block, or an undo/redo snapshot of one, puts these as blanks
+/// ([`Cell::blank_like`]): put back as plain values they would be foreign
+/// content blocking the anchor with `#SPILL!`.
+pub fn spill_children<'a, I>(cells: I) -> HashSet<(u32, u32)>
+where
+    I: IntoIterator<Item = ((u32, u32), &'a Cell)> + Clone,
+{
+    let anchors: Vec<((u32, u32), (u32, u32))> = cells
+        .clone()
+        .into_iter()
+        .filter(|(_, cl)| cl.formula.is_some())
+        .filter_map(|(at, cl)| cl.spill.map(|ext| (at, ext)))
+        .collect();
+    cells
+        .into_iter()
+        .filter(|((r, c), cl)| {
+            cl.formula.is_none()
+                && anchors.iter().any(|&((ar, ac), (h, w))| {
+                    (*r, *c) != (ar, ac) && *r >= ar && *r < ar + h && *c >= ac && *c < ac + w
+                })
+        })
+        .map(|(at, _)| at)
+        .collect()
+}
+
+/// An undo/redo group's snapshots (`None` = no cell), in the order to restore
+/// them, as the cells to put back: spill children of an anchor in the same
+/// group ([`spill_children`]) become blanks the anchor re-spills over.
+pub fn cells_to_restore<'a, I>(snapshots: I) -> Vec<((u32, u32), Cell)>
+where
+    I: IntoIterator<Item = ((u32, u32), &'a Option<Cell>)>,
+{
+    let cells: Vec<((u32, u32), Cell)> = snapshots
+        .into_iter()
+        .map(|(at, snap)| (at, snap.clone().unwrap_or_default()))
+        .collect();
+    let children = spill_children(cells.iter().map(|(at, cl)| (*at, cl)));
+    cells
+        .into_iter()
+        .map(|(at, cl)| match children.contains(&at) {
+            true => (at, cl.blank_like()),
+            false => (at, cl),
+        })
+        .collect()
+}
+
 impl Cell {
+    /// An empty cell with this one's style: what a spill child is put back as
+    /// (see [`spill_children`]).
+    pub fn blank_like(&self) -> Cell {
+        Cell {
+            style: self.style,
+            ..Cell::default()
+        }
+    }
+
     pub fn number(n: f64) -> Cell {
         Cell {
             value: CellValue::Number(n),
@@ -2047,6 +2106,52 @@ pub fn sheet_to_csv(sheet: &Sheet, styles: &Styles, date1904: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spill_children_are_plain_cells_inside_an_anchor_in_the_set() {
+        let anchor = Cell {
+            spill: Some((3, 2)),
+            ..Cell::formula("SEQUENCE(3,2)")
+        };
+        let two = Cell::number(2.0);
+        let inner_formula = Cell::formula("1+1");
+        let cells = [
+            ((1, 1), &anchor),
+            ((1, 2), &two),           // child (same row)
+            ((2, 1), &two),           // child
+            ((3, 2), &two),           // child, last corner
+            ((4, 1), &two),           // below the extent
+            ((1, 3), &two),           // right of the extent
+            ((2, 2), &inner_formula), // a formula is never spill output
+        ];
+        let got = spill_children(cells.iter().copied());
+        let want: HashSet<(u32, u32)> = [(1, 2), (2, 1), (3, 2)].into_iter().collect();
+        assert_eq!(got, want);
+        // A child without its anchor in the set is just a value; an anchor's
+        // extent running past the set is fine.
+        assert!(spill_children([((2, 1), &two)]).is_empty());
+        assert_eq!(
+            spill_children([((1, 1), &anchor), ((2, 1), &two)]),
+            [(2, 1)].into_iter().collect()
+        );
+        // A spill extent on a plain value (none should exist) anchors nothing.
+        let stray = Cell {
+            spill: Some((2, 1)),
+            ..Cell::number(1.0)
+        };
+        assert!(spill_children([((1, 1), &stray), ((2, 1), &two)]).is_empty());
+        let styled = Cell {
+            style: 3,
+            ..Cell::number(2.0)
+        };
+        assert_eq!(
+            styled.blank_like(),
+            Cell {
+                style: 3,
+                ..Cell::default()
+            }
+        );
+    }
 
     #[test]
     fn an_undisplayable_date_or_time_is_a_hash_run() {

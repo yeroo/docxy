@@ -10920,8 +10920,9 @@ b",
     #[test]
     fn relocated_cse_clone_blocked_by_a_neighbour_writes_its_own_anchor_ref() {
         // Typed at F5 (#724), its array result makes it a dynamic array.
-        // The same for a 3x1 result blocked by F6 (#SPILL!). The clone is
-        // taken with no spill extent of its own, so F6 counts as foreign.
+        // The same for a 3x1 result blocked by F6 (#SPILL!). The clone
+        // carries the source's spill extent; the engine drops it (#777), so
+        // F6 counts as foreign.
         let rows = CSE_ROWS.replace(
             r#"<c r="D3"><v>6</v></c></row>"#,
             r#"<c r="D3"><v>6</v></c></row><row r="6"><c r="F6" t="inlineStr"><is><t>x</t></is></c></row>"#,
@@ -10929,8 +10930,8 @@ b",
         let mut pkg = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
         let mut eng = crate::engine::Engine::new(&pkg.workbook);
         eng.recalc_all(&mut pkg.workbook);
-        let mut clone = pkg.workbook.sheets[0].cell(0, 3).cloned().unwrap();
-        clone.spill = None;
+        let clone = pkg.workbook.sheets[0].cell(0, 3).cloned().unwrap();
+        assert!(clone.spill.is_some());
         eng.set_cell(&mut pkg.workbook, (0, 4, 5), clone);
         let ws = saved_sheet1(&pkg);
         let f5 = saved_cell(&ws, "F5");

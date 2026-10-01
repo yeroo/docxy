@@ -446,17 +446,28 @@ impl Session {
             return;
         }
         let sheet_idx = self.active;
-        let mut group = UndoGroup {
-            sheet: sheet_idx,
-            changes: Vec::with_capacity(changes.len()),
-        };
+        // Snapshot the whole group before and after it is applied, not cell
+        // by cell: an earlier change can spill into (or clear) a later cell,
+        // and undo/redo must recreate the state before/after the group.
+        let sheet = &self.pkg.workbook.sheets[sheet_idx];
+        let befores: Vec<Option<Cell>> = changes
+            .iter()
+            .map(|&(r, c, _)| sheet.cell(r, c).cloned())
+            .collect();
+        let keys: Vec<(u32, u32)> = changes.iter().map(|&(r, c, _)| (r, c)).collect();
         for (r, c, cell) in changes {
-            let before = self.pkg.workbook.sheets[sheet_idx].cell(r, c).cloned();
             self.engine
                 .set_cell(&mut self.pkg.workbook, (sheet_idx, r, c), cell);
-            let after = self.pkg.workbook.sheets[sheet_idx].cell(r, c).cloned();
-            group.changes.push((r, c, before, after));
         }
+        let sheet = &self.pkg.workbook.sheets[sheet_idx];
+        let group = UndoGroup {
+            sheet: sheet_idx,
+            changes: keys
+                .into_iter()
+                .zip(befores)
+                .map(|((r, c), before)| (r, c, before, sheet.cell(r, c).cloned()))
+                .collect(),
+        };
         self.undo.push(UndoAction::Cells(group));
         self.edits += 1;
         self.redo.clear();
@@ -467,8 +478,8 @@ impl Session {
         match self.undo.pop() {
             Some(UndoAction::Cells(group)) => {
                 self.active = group.sheet.min(self.pkg.workbook.sheets.len() - 1);
-                for &(r, c, ref before, _) in group.changes.iter().rev() {
-                    let cell = before.clone().unwrap_or_default();
+                let cells = group.changes.iter().rev().map(|(r, c, b, _)| ((*r, *c), b));
+                for ((r, c), cell) in gridcore::sheet::cells_to_restore(cells) {
                     self.engine
                         .restore_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
                 }
@@ -496,8 +507,8 @@ impl Session {
         match self.redo.pop() {
             Some(UndoAction::Cells(group)) => {
                 self.active = group.sheet.min(self.pkg.workbook.sheets.len() - 1);
-                for &(r, c, _, ref after) in group.changes.iter() {
-                    let cell = after.clone().unwrap_or_default();
+                let cells = group.changes.iter().map(|(r, c, _, a)| ((*r, *c), a));
+                for ((r, c), cell) in gridcore::sheet::cells_to_restore(cells) {
                     self.engine
                         .restore_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
                 }
@@ -622,6 +633,14 @@ impl Session {
             r0 as i64 - clip.from.0 as i64,
             c0 as i64 - clip.from.1 as i64,
         );
+        // A copied spill block pastes as its anchor: the anchor re-spills
+        // over its children, pasted as blanks.
+        let children =
+            gridcore::sheet::spill_children(clip.cells.iter().enumerate().flat_map(|(dr, row)| {
+                row.iter().enumerate().filter_map(move |(dc, cell)| {
+                    cell.as_ref().map(|cl| ((dr as u32, dc as u32), cl))
+                })
+            }));
         let mut changes = Vec::new();
         for (dr, row) in clip.cells.iter().enumerate() {
             for (dc, cell) in row.iter().enumerate() {
@@ -630,6 +649,9 @@ impl Session {
                     continue;
                 }
                 let mut cell = cell.clone().unwrap_or_default();
+                if children.contains(&(dr as u32, dc as u32)) {
+                    cell = cell.blank_like();
+                }
                 if !clip.cut && (dr_all, dc_all) != (0, 0) {
                     if let Some(f) = &cell.formula {
                         if let Some(t) = gridcore::formula::translate_formula(f, dr_all, dc_all) {
@@ -3174,6 +3196,81 @@ mod tests {
         // Pasted again, it is a copy: its references move.
         s.dispatch(&format!("paste\t5\t4\t{tsv}"));
         assert_eq!(f(&s, 5, 4).as_deref(), Some("SUM(E3:E5)"));
+    }
+
+    /// Column `c`'s values, rows 0..=2, on the first sheet.
+    fn col3(s: &Session, c: u32) -> Vec<CellValue> {
+        (0..3)
+            .map(|r| {
+                s.pkg.workbook.sheets[0]
+                    .cell(r, c)
+                    .map(|cl| cl.value.clone())
+                    .unwrap_or(CellValue::Empty)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn paste_whole_spill_block_respills_through_undo_redo() {
+        // #777: a copied spill block pastes as a spilling anchor, also on
+        // redo; undo gives back what was there.
+        let n = |v: f64| CellValue::Number(v);
+        let seq = vec![n(1.0), n(2.0), n(3.0)];
+        for old in [None, Some(["a", "b", "c"])] {
+            let mut s = Session::open(&sample_xlsx()).expect("open");
+            s.dispatch("set\t0\t4\t=SEQUENCE(3)"); // E1 spills E1:E3
+            assert_eq!(col3(&s, 4), seq);
+            if let Some(old) = old {
+                for (r, v) in old.iter().enumerate() {
+                    s.dispatch(&format!("set\t{r}\t6\t{v}"));
+                }
+            }
+            let was = col3(&s, 6);
+            s.dispatch("select\t0\t4\t2\t4");
+            let tsv = s.dispatch("copy").unwrap();
+            s.dispatch(&format!("paste\t0\t6\t{tsv}"));
+            assert_eq!(col3(&s, 6), seq, "pasted over {old:?}");
+            for round in 0..2 {
+                s.dispatch("undo");
+                assert_eq!(col3(&s, 6), was, "undo {round} over {old:?}");
+                s.dispatch("redo");
+                assert_eq!(col3(&s, 6), seq, "redo {round} over {old:?}");
+                let g1 = s.pkg.workbook.sheets[0].cell(0, 6).unwrap();
+                assert_eq!(g1.spill, Some((3, 1)));
+            }
+        }
+    }
+
+    #[test]
+    fn paste_single_anchor_over_occupied_spills_error_through_undo_redo() {
+        // #777 / #725: a pasted anchor whose spill area is occupied is
+        // #SPILL! and keeps the occupant.
+        let n = |v: f64| CellValue::Number(v);
+        let keep = CellValue::Text("keep".into());
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("set\t0\t4\t=SEQUENCE(3)");
+        s.dispatch("set\t1\t6\tkeep");
+        s.dispatch("select\t0\t4");
+        let tsv = s.dispatch("copy").unwrap();
+        s.dispatch(&format!("paste\t0\t6\t{tsv}"));
+        let after = vec![
+            CellValue::Error("#SPILL!".into()),
+            keep.clone(),
+            CellValue::Empty,
+        ];
+        assert_eq!(col3(&s, 6), after);
+        s.dispatch("undo");
+        assert_eq!(col3(&s, 6), vec![CellValue::Empty, keep, CellValue::Empty]);
+        s.dispatch("redo");
+        assert_eq!(col3(&s, 6), after);
+        // Over empty cells it spills; undo empties them; redo re-spills.
+        s.dispatch(&format!("paste\t0\t9\t{tsv}"));
+        let seq = vec![n(1.0), n(2.0), n(3.0)];
+        assert_eq!(col3(&s, 9), seq);
+        s.dispatch("undo");
+        assert_eq!(col3(&s, 9), vec![CellValue::Empty; 3]);
+        s.dispatch("redo");
+        assert_eq!(col3(&s, 9), seq);
     }
 
     #[test]

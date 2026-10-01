@@ -1053,7 +1053,9 @@ impl ClipRead {
 /// Write a pasted `block` onto sheet `s` from `(br, bc)`, one cell at a time
 /// through the engine. A pasted array anchor covers its own cell, not the
 /// block it was copied from, unless it lands on that very block
-/// ([`gridcore::sheet::anchor_pasted_array_ref`]).
+/// ([`gridcore::sheet::anchor_pasted_array_ref`]). A copied spill block pastes
+/// as its anchor, which re-spills over its children, pasted as blanks
+/// ([`gridcore::sheet::spill_children`]).
 fn paste_grid_block(
     engine: &mut gridcore::engine::Engine,
     wb: &mut gridcore::sheet::Workbook,
@@ -1061,10 +1063,19 @@ fn paste_grid_block(
     (br, bc): (u32, u32),
     block: &[Vec<gridcore::sheet::Cell>],
 ) {
+    let children =
+        gridcore::sheet::spill_children(block.iter().enumerate().flat_map(|(dr, row)| {
+            row.iter()
+                .enumerate()
+                .map(move |(dc, cell)| ((dr as u32, dc as u32), cell))
+        }));
     for (dr, row) in block.iter().enumerate() {
         for (dc, cell) in row.iter().enumerate() {
             let (r, c) = (br + dr as u32, bc + dc as u32);
-            let mut cell = cell.clone();
+            let mut cell = match children.contains(&(dr as u32, dc as u32)) {
+                true => cell.blank_like(),
+                false => cell.clone(),
+            };
             let current = wb.sheets.get(s).and_then(|sh| sh.cell(r, c));
             gridcore::sheet::anchor_pasted_array_ref(&mut cell, current, r, c);
             engine.set_cell(wb, (s, r, c), cell);
@@ -15447,6 +15458,36 @@ mod clipboard_tests {
         assert_eq!(f_attrs_at(&wb, 0), None);
         paste_grid_block(&mut engine, &mut wb, 1, (0, 3), &block);
         assert_eq!(f_attrs_at(&wb, 1), Some(" t=\"array\" ref=\"D1:D3\""));
+    }
+
+    /// #777: a pasted spill block (anchor + its spilled values) pastes as a
+    /// spilling anchor, over empty cells and over old values alike.
+    #[test]
+    fn a_pasted_spill_block_respills() {
+        let mut wb = Workbook {
+            sheets: vec![Sheet {
+                name: "Sheet1".into(),
+                ..Sheet::default()
+            }],
+            ..Workbook::default()
+        };
+        let mut engine = Engine::new(&wb);
+        engine.set_cell(&mut wb, (0, 0, 2), Cell::formula("SEQUENCE(3)"));
+        let block: Vec<Vec<Cell>> = (0..3)
+            .map(|r| vec![wb.sheets[0].cell(r, 2).cloned().unwrap()])
+            .collect();
+        for r in 0..3 {
+            engine.set_cell(&mut wb, (0, r, 8), Cell::text("old"));
+        }
+        let n = |v: f64| CellValue::Number(v);
+        for col in [6, 8] {
+            paste_grid_block(&mut engine, &mut wb, 0, (0, col), &block);
+            let got: Vec<CellValue> = (0..3)
+                .map(|r| wb.sheets[0].cell(r, col).unwrap().value.clone())
+                .collect();
+            assert_eq!(got, vec![n(1.0), n(2.0), n(3.0)], "col {col}");
+            assert_eq!(wb.sheets[0].cell(0, col).unwrap().spill, Some((3, 1)));
+        }
     }
 
     /// #699: a harness instance never reads or writes the OS clipboard, and

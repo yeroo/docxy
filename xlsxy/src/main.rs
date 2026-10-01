@@ -1709,17 +1709,28 @@ impl App {
         }
         let circles_before = self.engine.circular_refs();
         self.engine.clock = now_serial();
-        let mut group = UndoGroup {
-            sheet: sheet_idx,
-            changes: Vec::with_capacity(changes.len()),
-        };
+        // Snapshot the whole group before and after it is applied, not cell
+        // by cell: an earlier change can spill into (or clear) a later cell,
+        // and undo/redo must recreate the state before/after the group.
+        let sheet = &self.pkg.workbook.sheets[sheet_idx];
+        let befores: Vec<Option<Cell>> = changes
+            .iter()
+            .map(|&(r, c, _)| sheet.cell(r, c).cloned())
+            .collect();
+        let keys: Vec<(u32, u32)> = changes.iter().map(|&(r, c, _)| (r, c)).collect();
         for (r, c, cell) in changes {
-            let before = self.pkg.workbook.sheets[sheet_idx].cell(r, c).cloned();
             self.engine
-                .set_cell(&mut self.pkg.workbook, (sheet_idx, r, c), cell.clone());
-            let after = self.pkg.workbook.sheets[sheet_idx].cell(r, c).cloned();
-            group.changes.push((r, c, before, after));
+                .set_cell(&mut self.pkg.workbook, (sheet_idx, r, c), cell);
         }
+        let sheet = &self.pkg.workbook.sheets[sheet_idx];
+        let group = UndoGroup {
+            sheet: sheet_idx,
+            changes: keys
+                .into_iter()
+                .zip(befores)
+                .map(|((r, c), before)| (r, c, before, sheet.cell(r, c).cloned()))
+                .collect(),
+        };
         self.undo.push(UndoAction::Cells(group));
         self.redo.clear();
         self.modified = true;
@@ -2247,8 +2258,8 @@ impl App {
         match self.undo.pop() {
             Some(UndoAction::Cells(group)) => {
                 self.sheet = group.sheet.min(self.pkg.workbook.sheets.len() - 1);
-                for &(r, c, ref before, _) in group.changes.iter().rev() {
-                    let cell = before.clone().unwrap_or_default();
+                let cells = group.changes.iter().rev().map(|(r, c, b, _)| ((*r, *c), b));
+                for ((r, c), cell) in gridcore::sheet::cells_to_restore(cells) {
                     self.engine
                         .restore_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
                 }
@@ -2273,8 +2284,8 @@ impl App {
         match self.redo.pop() {
             Some(UndoAction::Cells(group)) => {
                 self.sheet = group.sheet.min(self.pkg.workbook.sheets.len() - 1);
-                for &(r, c, _, ref after) in group.changes.iter() {
-                    let cell = after.clone().unwrap_or_default();
+                let cells = group.changes.iter().map(|(r, c, _, a)| ((*r, *c), a));
+                for ((r, c), cell) in gridcore::sheet::cells_to_restore(cells) {
                     self.engine
                         .restore_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
                 }
@@ -2364,6 +2375,15 @@ impl App {
                     r0 as i64 - clip.from.0 as i64,
                     c0 as i64 - clip.from.1 as i64,
                 );
+                // A copied spill block pastes as its anchor: the anchor
+                // re-spills over its children, pasted as blanks.
+                let children = gridcore::sheet::spill_children(
+                    clip.cells.iter().enumerate().flat_map(|(dr, row)| {
+                        row.iter().enumerate().filter_map(move |(dc, cell)| {
+                            cell.as_ref().map(|cl| ((dr as u32, dc as u32), cl))
+                        })
+                    }),
+                );
                 for (dr, row) in clip.cells.iter().enumerate() {
                     for (dc, cell) in row.iter().enumerate() {
                         let (r, c) = (r0 + dr as u32, c0 + dc as u32);
@@ -2371,6 +2391,9 @@ impl App {
                             continue;
                         }
                         let mut new_cell = cell.clone().unwrap_or_default();
+                        if children.contains(&(dr as u32, dc as u32)) {
+                            new_cell = new_cell.blank_like();
+                        }
                         // Copies translate relative refs; cuts keep them, and
                         // so does a copy pasted where it came from (translating
                         // reprints the text, even by zero).
@@ -10419,6 +10442,118 @@ mod tests {
         let b2 = app.pkg.workbook.sheets[0].cell(1, 1).unwrap().clone();
         assert_eq!(b2.formula.as_deref(), Some("A2*2"));
         assert_eq!(b2.value, CellValue::Number(4.0));
+    }
+
+    /// The values of column `c`, rows `r1..=r2`, on the first sheet.
+    fn col_values(app: &App, c: u32, r1: u32, r2: u32) -> Vec<CellValue> {
+        (r1..=r2)
+            .map(|r| {
+                app.pkg.workbook.sheets[0]
+                    .cell(r, c)
+                    .map(|cl| cl.value.clone())
+                    .unwrap_or(CellValue::Empty)
+            })
+            .collect()
+    }
+
+    /// An app with C1 `=SEQUENCE(3)` spilling C1:C3 (typed, through the engine).
+    fn app_with_sequence_in_c1() -> App {
+        let mut app = App::new(new_xlsx(), "test.xlsx");
+        app.os_clip = None;
+        app.apply(vec![(0, 2, Cell::formula("SEQUENCE(3)"))]);
+        let n = |v: f64| CellValue::Number(v);
+        assert_eq!(col_values(&app, 2, 0, 2), vec![n(1.0), n(2.0), n(3.0)]);
+        app
+    }
+
+    #[test]
+    fn paste_whole_spill_block_respills() {
+        // #777: a copied spill block (anchor + its spilled values) pastes as a
+        // spilling anchor, also on redo; undo gives back what was there.
+        let n = |v: f64| CellValue::Number(v);
+        let t = |s: &str| CellValue::Text(s.into());
+        let seq = vec![n(1.0), n(2.0), n(3.0)];
+        for old in [None, Some(["a", "b", "c"])] {
+            let mut app = app_with_sequence_in_c1();
+            if let Some(old) = old {
+                let cells = (0..3).map(|r| (r as u32, 6, Cell::text(old[r]))).collect();
+                app.apply(cells);
+            }
+            let was = col_values(&app, 6, 0, 2);
+            app.anchor = Some((0, 2));
+            app.cur = (2, 2);
+            app.copy(false);
+            app.anchor = None;
+            app.cur = (0, 6);
+            app.paste();
+            let g1 = || app.pkg.workbook.sheets[0].cell(0, 6).cloned().unwrap();
+            assert_eq!(col_values(&app, 6, 0, 2), seq, "pasted over {old:?}");
+            assert_eq!(g1().spill, Some((3, 1)));
+            for round in 0..2 {
+                app.undo();
+                assert_eq!(col_values(&app, 6, 0, 2), was, "undo {round} over {old:?}");
+                app.redo();
+                assert_eq!(col_values(&app, 6, 0, 2), seq, "redo {round} over {old:?}");
+                let g1 = app.pkg.workbook.sheets[0].cell(0, 6).cloned().unwrap();
+                assert_eq!(g1.spill, Some((3, 1)), "redo {round} over {old:?}");
+                assert!(
+                    app.pkg.workbook.sheets[0]
+                        .cell(1, 6)
+                        .unwrap()
+                        .formula
+                        .is_none()
+                );
+            }
+            app.undo();
+            assert_eq!(col_values(&app, 6, 0, 2), was);
+            if old.is_some() {
+                assert_eq!(was, vec![t("a"), t("b"), t("c")]);
+            } else {
+                assert_eq!(was, vec![CellValue::Empty; 3]);
+            }
+        }
+
+        // Copying only a spill child pastes its value.
+        let mut app = app_with_sequence_in_c1();
+        app.cur = (1, 2);
+        app.copy(false);
+        app.cur = (1, 8);
+        app.paste();
+        assert_eq!(col_values(&app, 8, 1, 1), vec![n(2.0)]);
+    }
+
+    #[test]
+    fn paste_single_anchor_over_occupied_spills_error() {
+        // #777 / #725: a pasted anchor whose spill area is occupied is
+        // #SPILL! and keeps the occupant, through undo and redo.
+        let n = |v: f64| CellValue::Number(v);
+        let spill = CellValue::Error("#SPILL!".into());
+        let keep = CellValue::Text("keep".into());
+        let mut app = app_with_sequence_in_c1();
+        app.apply(vec![(1, 6, Cell::text("keep"))]);
+        app.cur = (0, 2);
+        app.copy(false);
+        app.cur = (0, 6);
+        app.paste();
+        let after = vec![spill.clone(), keep.clone(), CellValue::Empty];
+        assert_eq!(col_values(&app, 6, 0, 2), after);
+        app.undo();
+        assert_eq!(
+            col_values(&app, 6, 0, 2),
+            vec![CellValue::Empty, keep, CellValue::Empty]
+        );
+        app.redo();
+        assert_eq!(col_values(&app, 6, 0, 2), after);
+
+        // Over empty cells it spills; undo empties them; redo re-spills.
+        app.cur = (0, 9);
+        app.paste();
+        let seq = vec![n(1.0), n(2.0), n(3.0)];
+        assert_eq!(col_values(&app, 9, 0, 2), seq);
+        app.undo();
+        assert_eq!(col_values(&app, 9, 0, 2), vec![CellValue::Empty; 3]);
+        app.redo();
+        assert_eq!(col_values(&app, 9, 0, 2), seq);
     }
 
     #[test]

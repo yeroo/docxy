@@ -220,7 +220,20 @@ impl Engine {
         self.put_cell(wb, key, cell);
     }
 
-    fn put_cell(&mut self, wb: &mut Workbook, key: Key, cell: Cell) {
+    /// A cell's spill extent is the engine's own state, derived by
+    /// [`Engine::eval_one`] — never input. An incoming one (a pasted or filled
+    /// clone of an anchor, an undo/redo snapshot) names the source's spill, and
+    /// left in place it would make the cells under it count as this anchor's
+    /// own, overwriting (or, on a scalar result, clearing) what they hold. So
+    /// it is dropped and the anchor re-spills on its own recalc. Callers that
+    /// submit an anchor together with its spilled values blank those first
+    /// ([`crate::sheet::spill_children`]), or they would block it.
+    ///
+    /// Known limitation: an unsupported (frozen) anchor never re-evaluates, so
+    /// after a restore its extent stays `None` (`A1#` is `#REF!`); its spilled
+    /// cells were already cleared when it was overwritten.
+    fn put_cell(&mut self, wb: &mut Workbook, key: Key, mut cell: Cell) {
+        cell.spill = None;
         let (s, r, c) = key;
         // Drop stale bookkeeping for this address.
         self.formulas.remove(&key);
@@ -236,7 +249,7 @@ impl Engine {
             // An edit landing inside another anchor's spill breaks that
             // spill: clear its cells and let the anchor recalc to #SPILL!.
             if let Some((anchor, ext)) = spill_owner(sheet, r, c) {
-                changed.extend(clear_spill(sheet, s, anchor, ext, Some((r, c))));
+                changed.extend(clear_spill(sheet, s, anchor, ext, None));
                 if let Some(a) = sheet.cells.get_mut(&anchor) {
                     a.spill = None;
                 }
@@ -2535,5 +2548,99 @@ mod tests {
                 "{src} not dynamic"
             );
         }
+    }
+
+    #[test]
+    fn pasted_anchor_does_not_keep_source_spill_extent() {
+        // #777: a pasted clone of a spill anchor carries the source's extent;
+        // the engine must not take the target's neighbours for its own spill.
+        let mut wb = wb_one_sheet(&[("B1", Cell::number(1.0))]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "C1", Cell::formula("SEQUENCE(3)"));
+        set(&mut eng, &mut wb, "G2", Cell::text("keep"));
+        let c1 = wb.sheets[0].cell(0, 2).unwrap().clone();
+        assert_eq!(c1.spill, Some((3, 1)));
+        set(&mut eng, &mut wb, "G1", c1);
+        assert_eq!(value_at(&wb, "G1"), CellValue::Error("#SPILL!".into()));
+        assert_eq!(value_at(&wb, "G2"), CellValue::Text("keep".into()));
+        assert_eq!(value_at(&wb, "G3"), CellValue::Empty);
+        assert_eq!(wb.sheets[0].cell(0, 6).unwrap().spill, None);
+
+        // Pasted where it evaluates to a scalar, it leaves the cells under the
+        // source's extent alone.
+        set(
+            &mut eng,
+            &mut wb,
+            "D1",
+            Cell::formula("IF(B1=1,SEQUENCE(3),0)"),
+        );
+        set(&mut eng, &mut wb, "K2", Cell::text("x"));
+        set(&mut eng, &mut wb, "K3", Cell::text("y"));
+        let d1 = wb.sheets[0].cell(0, 3).unwrap().clone();
+        assert_eq!(d1.spill, Some((3, 1)));
+        let pasted = Cell {
+            formula: Some("IF(H1=1,SEQUENCE(3),0)".into()),
+            ..d1
+        };
+        set(&mut eng, &mut wb, "K1", pasted);
+        assert_eq!(value_at(&wb, "K1"), CellValue::Number(0.0));
+        assert_eq!(value_at(&wb, "K2"), CellValue::Text("x".into()));
+        assert_eq!(value_at(&wb, "K3"), CellValue::Text("y".into()));
+
+        // The #725 repro: D1 SEQUENCE(3), F2 = 99, paste D1 at F1.
+        let mut wb = wb_one_sheet(&[]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "D1", Cell::formula("SEQUENCE(3)"));
+        set(&mut eng, &mut wb, "F2", Cell::number(99.0));
+        let d1 = wb.sheets[0].cell(0, 3).unwrap().clone();
+        set(&mut eng, &mut wb, "F1", d1);
+        assert_eq!(value_at(&wb, "F1"), CellValue::Error("#SPILL!".into()));
+        assert_eq!(value_at(&wb, "F2"), CellValue::Number(99.0));
+        // Clearing the blocker lets it spill.
+        set(&mut eng, &mut wb, "F2", Cell::default());
+        assert_eq!(value_at(&wb, "F3"), CellValue::Number(3.0));
+    }
+
+    #[test]
+    fn restoring_an_anchor_snapshot_does_not_overwrite_neighbours() {
+        // An undo/redo snapshot of an anchor carries the extent it had; put
+        // back where its spill area is now occupied, it is #SPILL!.
+        let mut wb = wb_one_sheet(&[]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "C1", Cell::formula("SEQUENCE(3)"));
+        let snap = wb.sheets[0].cell(0, 2).unwrap().clone();
+        set(&mut eng, &mut wb, "C1", Cell::default());
+        set(&mut eng, &mut wb, "C2", Cell::text("keep"));
+        eng.restore_cell(&mut wb, (0, 0, 2), snap.clone());
+        assert_eq!(value_at(&wb, "C1"), CellValue::Error("#SPILL!".into()));
+        assert_eq!(value_at(&wb, "C2"), CellValue::Text("keep".into()));
+        assert_eq!(value_at(&wb, "C3"), CellValue::Empty);
+        // Over empty cells it spills again.
+        set(&mut eng, &mut wb, "C2", Cell::default());
+        eng.restore_cell(&mut wb, (0, 0, 2), snap);
+        assert_eq!(value_at(&wb, "C3"), CellValue::Number(3.0));
+        assert_eq!(wb.sheets[0].cell(0, 2).unwrap().spill, Some((3, 1)));
+    }
+
+    #[test]
+    fn blanking_a_spill_child_keeps_the_spill() {
+        // An edit inside another anchor's spill clears all of that spill
+        // before the anchor recalcs: blanking its last cell (what a pasted
+        // spill block does with its children) must not leave a stale value
+        // above it to block the anchor.
+        let mut wb = wb_one_sheet(&[]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "C1", Cell::formula("SEQUENCE(3)"));
+        set(&mut eng, &mut wb, "C3", Cell::default());
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(1.0));
+        assert_eq!(value_at(&wb, "C2"), CellValue::Number(2.0));
+        assert_eq!(value_at(&wb, "C3"), CellValue::Number(3.0));
+        // A value typed into it still blocks the anchor, and nothing stale
+        // is left once it goes.
+        set(&mut eng, &mut wb, "C3", Cell::number(9.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Error("#SPILL!".into()));
+        assert_eq!(value_at(&wb, "C2"), CellValue::Empty);
+        set(&mut eng, &mut wb, "C3", Cell::default());
+        assert_eq!(value_at(&wb, "C3"), CellValue::Number(3.0));
     }
 }
