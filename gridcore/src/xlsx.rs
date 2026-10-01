@@ -1996,7 +1996,58 @@ fn parse_worksheet(
     // Masters of *parseable* groups become plain formulas (their f_attrs
     // were never set), which is what we write back — Excel accepts expanded
     // formulas in place of shared groups.
+    cap_array_refs(&mut sheet);
     sheet
+}
+
+/// Block cells a sheet may name through array `ref`s beyond twice its own
+/// cell count ([`cap_array_refs`]).
+const ARRAY_REF_SLACK: u64 = 1 << 16;
+
+/// Hold the array blocks a loaded sheet names to what the file can back:
+/// Excel writes every cell of a legacy CSE block and of a spilled dynamic
+/// array, so a genuine sheet's blocks cover at most its own cells. Each
+/// array `ref` that starts at its cell (the ones the engine fills or spills
+/// over, and save checks) spends its area from one per-sheet budget of twice
+/// the cell count plus [`ARRAY_REF_SLACK`]; one that doesn't fit is corrupt or
+/// crafted (`ref="A1:XFD1048576"`), and its cell falls back to a one-cell
+/// array, keeping its formula and cached value. A loaded extent
+/// ([`Cell::spill`]) is kept only where it is exactly such a block, so the
+/// budget bounds it too, whatever produced it. Every later walk over a block
+/// or extent is then bounded by the sheet's size.
+///
+/// What is left: a ref within the slack still has its cells made on its
+/// first fill (up to 64Ki), and since refs spend in key order, refs early in
+/// a sheet can leave a later block to fall back. Beyond a crafted file, that
+/// happens to a block larger than the slack from a writer that saves only
+/// its anchor cell (openpyxl's `ArrayFormula`, for one): it loads, and then
+/// saves, as a one-cell array.
+fn cap_array_refs(sheet: &mut Sheet) {
+    let mut budget = 2 * sheet.cells.len() as u64 + ARRAY_REF_SLACK;
+    for (&(row, col), cell) in sheet.cells.iter_mut() {
+        // The block a `ref` that starts at the cell names, as (rows, cols).
+        let own = crate::sheet::array_block(cell)
+            .filter(|&(r1, c1, _, _)| (r1, c1) == (row, col))
+            .map(|(r1, c1, r2, c2)| (r2 - r1 + 1, c2 - c1 + 1));
+        if cell.spill.is_some() && cell.spill != own {
+            cell.spill = None;
+        }
+        let Some((h, w)) = own else {
+            continue;
+        };
+        let area = u64::from(h) * u64::from(w);
+        if area <= 1 {
+            continue;
+        }
+        if area <= budget {
+            budget -= area;
+            continue;
+        }
+        if let Some(fa) = cell.f_attrs.as_deref() {
+            cell.f_attrs = Some(with_ref(fa, &cell_name(row, col)));
+        }
+        cell.spill = None;
+    }
 }
 
 /// Parse the children of one `<c>` (consumes through `</c>`).
@@ -2146,7 +2197,7 @@ fn parse_cell_body(
         if !is_array_f(a) {
             return None;
         }
-        let ref_val = a.split("ref=\"").nth(1)?.split('"').next()?;
+        let ref_val = crate::sheet::f_ref(a)?;
         let (r1, c1, r2, c2) = crate::sheet::parse_range_name(ref_val)?;
         if (r1, c1) != (row, col) {
             return None;
@@ -11478,6 +11529,151 @@ b",
         assert_eq!(val(&pkg, "C2"), CellValue::Empty);
         let ws = saved_sheet1(&pkg);
         assert!(ws.contains(r#"<f t="array" ref="C1">A1:A3</f>"#), "{ws}");
+    }
+
+    #[test]
+    fn a_whole_sheet_array_ref_falls_back_to_its_anchor() {
+        // #846 AC1 (r2-huge-ref): a crafted CSE `ref` over the whole grid is
+        // cut to its anchor at load, before any fill could walk it.
+        let rows =
+            r#"<row r="1"><c r="A1"><f t="array" ref="A1:XFD1048576">1</f><v>1</v></c></row>"#;
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let a1 = pkg.workbook.sheets[0].cell(0, 0).unwrap();
+        assert_eq!(a1.spill, None);
+        assert_eq!(a1.f_attrs.as_deref(), Some(r#" t="array" ref="A1""#));
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        assert_eq!(pkg.workbook.sheets[0].cells.len(), 1);
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<c r="A1"><f t="array" ref="A1">1</f><v>1</v></c>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn a_huge_dynamic_array_ref_falls_back_to_its_anchor() {
+        // #846 AC2: the same for a dynamic array, whose loaded extent the
+        // first recalc would otherwise clear cell by cell; it then spills
+        // what it evaluates to.
+        let rows = r#"<row r="1"><c r="A1" cm="1"><f t="array" ref="A1:XFD1048576">_xlfn.SEQUENCE(2)</f><v>1</v></c></row>"#;
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let a1 = pkg.workbook.sheets[0].cell(0, 0).unwrap();
+        assert_eq!(a1.spill, None);
+        assert_eq!(a1.f_attrs.as_deref(), Some(r#" t="array" ref="A1""#));
+        assert!(a1.is_dynamic());
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(0, 0).unwrap().spill,
+            Some((2, 1))
+        );
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<c r="A1" cm="1"><f t="array" ref="A1:A2">_xlfn.SEQUENCE(2)</f>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn an_extent_from_an_xref_attribute_is_not_loaded() {
+        // #846 r1 M1: the load's extent and the cap read a `ref` the same
+        // way, so `xref="…"` names no block, with or without a real `ref`
+        // after it.
+        for f in [
+            r#"<f t="array" xref="A1:XFD1048576">1</f>"#,
+            r#"<f t="array" xref="A1:XFD1048576" ref="A1">1</f>"#,
+        ] {
+            let rows = format!(r#"<row r="1"><c r="A1">{f}<v>1</v></c></row>"#);
+            let mut pkg = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
+            let a1 = pkg.workbook.sheets[0].cell(0, 0).unwrap();
+            assert!(
+                a1.spill.is_none_or(|ext| ext == (1, 1)),
+                "{f}: {:?}",
+                a1.spill
+            );
+            let mut eng = crate::engine::Engine::new(&pkg.workbook);
+            eng.recalc_all(&mut pkg.workbook);
+            assert_eq!(pkg.workbook.sheets[0].cells.len(), 1, "{f}");
+        }
+    }
+
+    #[test]
+    fn the_cap_drops_an_extent_no_ref_backs() {
+        // #846 r1 M1: whatever set a loaded extent, the cap keeps it only
+        // where a `ref` from the cell names exactly that block.
+        let mut sheet = Sheet::default();
+        let mut a1 = Cell::formula("1");
+        a1.f_attrs = Some(r#" t="array" ref="A1""#.into());
+        a1.spill = Some((crate::sheet::MAX_ROWS, crate::sheet::MAX_COLS));
+        sheet.cells.insert((0, 0), a1);
+        let mut b1 = Cell::formula("1");
+        b1.f_attrs = Some(r#" t="array" ref="B1:B2""#.into());
+        b1.spill = Some((2, 1));
+        sheet.cells.insert((0, 1), b1);
+        cap_array_refs(&mut sheet);
+        assert_eq!(sheet.cell(0, 0).unwrap().spill, None);
+        assert_eq!(sheet.cell(0, 1).unwrap().spill, Some((2, 1)));
+    }
+
+    #[test]
+    fn many_medium_array_refs_share_one_budget() {
+        // #846 AC4: the cap is one budget per sheet, so refs that each fit
+        // can't add up. 40 cells give 2 * 40 + 64Ki = 65 616 block cells:
+        // six 100x100 refs fit, in key order, and the rest fall back.
+        let rows: String = (0..40)
+            .map(|i| {
+                let n = 1 + 100 * i;
+                format!(
+                    r#"<row r="{n}"><c r="A{n}"><f t="array" ref="A{n}:CV{}">1</f><v>1</v></c></row>"#,
+                    n + 99
+                )
+            })
+            .collect();
+        let pkg = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
+        let kept: Vec<u32> = pkg.workbook.sheets[0]
+            .cells
+            .iter()
+            .filter(|(_, cl)| cl.spill.is_some())
+            .map(|(&(r, _), _)| r)
+            .collect();
+        assert_eq!(kept, vec![0, 100, 200, 300, 400, 500]);
+        let a601 = pkg.workbook.sheets[0].cell(600, 0).unwrap();
+        assert_eq!(a601.f_attrs.as_deref(), Some(r#" t="array" ref="A601""#));
+        let a501 = pkg.workbook.sheets[0].cell(500, 0).unwrap();
+        assert_eq!(
+            a501.f_attrs.as_deref(),
+            Some(r#" t="array" ref="A501:CV600""#)
+        );
+    }
+
+    #[test]
+    fn genuine_cse_and_spill_refs_load_unchanged() {
+        // #846 AC3: blocks whose cells the file holds keep their `ref` and
+        // extent, and the cap leaves an array `ref` that doesn't start at its
+        // cell (never a block) as it is, whatever it names.
+        let rows = r#"<row r="1"><c r="A1"><v>1</v></c><c r="D1"><f t="array" ref="D1:D3">A1:A3*2</f><v>2</v></c><c r="E1" cm="1"><f t="array" ref="E1:E3">A1:A3*3</f><v>3</v></c><c r="F1"><f t="array" ref="G1:XFD1048576">A1</f><v>1</v></c></row><row r="2"><c r="A2"><v>2</v></c><c r="D2"><v>4</v></c><c r="E2"><v>6</v></c></row><row r="3"><c r="A3"><v>3</v></c><c r="D3"><v>6</v></c><c r="E3"><v>9</v></c></row>"#;
+        let pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let sheet = &pkg.workbook.sheets[0];
+        let at = |c: u32| sheet.cell(0, c).unwrap();
+        assert_eq!(at(3).spill, Some((3, 1)));
+        assert_eq!(at(3).f_attrs.as_deref(), Some(r#" t="array" ref="D1:D3""#));
+        assert_eq!(at(4).spill, Some((3, 1)));
+        assert_eq!(at(4).f_attrs.as_deref(), Some(r#" t="array" ref="E1:E3""#));
+        assert_eq!(at(5).spill, None);
+        assert_eq!(
+            at(5).f_attrs.as_deref(),
+            Some(r#" t="array" ref="G1:XFD1048576""#)
+        );
+        let (_, ws) = resaved(&pkg);
+        for f in [
+            r#"<c r="D1"><f t="array" ref="D1:D3">A1:A3*2</f><v>2</v></c>"#,
+            r#"<c r="E1" cm="1"><f t="array" ref="E1:E3">A1:A3*3</f><v>3</v></c>"#,
+            // Save has always given a borrowed `ref` back to its own cell.
+            r#"<c r="F1"><f t="array" ref="F1">A1</f><v>1</v></c>"#,
+        ] {
+            assert!(ws.contains(f), "{f}\n{ws}");
+        }
     }
 
     #[test]
