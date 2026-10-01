@@ -458,12 +458,41 @@ pub fn autofill(
     let Some(s) = wb.sheets.get_mut(sheet) else {
         return 0;
     };
+    // A source cell spilled by an anchor that is filled with it is copied
+    // blank (keeping its style): the anchor's copy refills it, where a copied
+    // value would block that copy's spill.
+    let mut spilled = std::collections::HashSet::new();
+    for (&(r, c), cell) in s.cells.range((sr0, 0)..=(sr1, u32::MAX)) {
+        let (Some((h, w)), true) = (cell.spill, (sc0..=sc1).contains(&c)) else {
+            continue;
+        };
+        if cell.formula.is_some() {
+            for rr in r..(r + h).min(sr1 + 1) {
+                for cc in c..(c + w).min(sc1 + 1) {
+                    spilled.insert((rr, cc));
+                }
+            }
+            spilled.remove(&(r, c));
+        }
+    }
+    let source = |s: &Sheet, r: u32, c: u32| {
+        s.cell(r, c).map(|cell| {
+            if cell.formula.is_none() && spilled.contains(&(r, c)) {
+                Cell {
+                    style: cell.style,
+                    ..Cell::default()
+                }
+            } else {
+                cell.clone()
+            }
+        })
+    };
     let mut filled = 0;
     if dr >= dc {
         // Fill DOWN: extend each column into rows sr1+1..=tr.
         let count = (tr - sr1) as usize;
         for c in sc0..=sc1 {
-            let srcvals: Vec<Option<Cell>> = (sr0..=sr1).map(|r| s.cell(r, c).cloned()).collect();
+            let srcvals: Vec<Option<Cell>> = (sr0..=sr1).map(|r| source(s, r, c)).collect();
             let len = srcvals.len();
             for (k, mut cell) in extend_series(&srcvals, count).into_iter().enumerate() {
                 let dst = sr1 + 1 + k as u32;
@@ -482,7 +511,7 @@ pub fn autofill(
         // Fill RIGHT: extend each row into columns sc1+1..=tc.
         let count = (tc - sc1) as usize;
         for r in sr0..=sr1 {
-            let srcvals: Vec<Option<Cell>> = (sc0..=sc1).map(|c| s.cell(r, c).cloned()).collect();
+            let srcvals: Vec<Option<Cell>> = (sc0..=sc1).map(|c| source(s, r, c)).collect();
             let len = srcvals.len();
             for (k, mut cell) in extend_series(&srcvals, count).into_iter().enumerate() {
                 let dst = sc1 + 1 + k as u32;
@@ -1658,6 +1687,66 @@ mod tests {
             w.sheets[0].cell(0, 2).unwrap().value,
             CellValue::Error("#SPILL!".into())
         );
+    }
+
+    fn values(w: &Workbook, names: &[&str]) -> Vec<CellValue> {
+        names
+            .iter()
+            .map(|n| {
+                let (r, c) = parse_cell_name(n).unwrap();
+                w.sheets[0]
+                    .cell(r, c)
+                    .map(|c| c.value.clone())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    fn nums(ns: &[f64]) -> Vec<CellValue> {
+        ns.iter().map(|&n| CellValue::Number(n)).collect()
+    }
+
+    /// #785 r2: a whole spill block filled down or right copies its spilled
+    /// values blank — each copy of the anchor spills there itself, with no
+    /// stale constants in its way. A typed dynamic array and a loaded CSE
+    /// block alike.
+    #[test]
+    fn autofill_of_a_whole_spill_block_spills_each_copy() {
+        let column: Vec<(String, Cell)> = (1..=6)
+            .map(|r| (format!("A{r}"), Cell::number(f64::from(r))))
+            .collect();
+        let column: Vec<(&str, Cell)> = column
+            .iter()
+            .map(|(n, c)| (n.as_str(), c.clone()))
+            .collect();
+        let cse = Cell {
+            formula: Some("A1:A3*2".into()),
+            f_attrs: Some(" t=\"array\" ref=\"D1:D3\"".into()),
+            ..Cell::default()
+        };
+        for anchor in [Cell::formula("A1:A3*2"), cse] {
+            let mut w = wb(&column);
+            let mut eng = Engine::new(&w);
+            eng.set_cell(&mut w, (0, 0, 3), anchor);
+            assert_eq!(w.sheets[0].cell(0, 3).unwrap().spill, Some((3, 1)));
+            assert_eq!(autofill(&mut w, 0, (0, 3, 2, 3), (5, 3)), 3);
+            let mut eng = Engine::new(&w);
+            eng.recalc_all(&mut w);
+            let d = ["D1", "D2", "D3", "D4", "D5", "D6"];
+            assert_eq!(values(&w, &d), nums(&[2.0, 4.0, 6.0, 8.0, 10.0, 12.0]));
+            assert_eq!(w.sheets[0].cell(3, 3).unwrap().spill, Some((3, 1)));
+        }
+
+        // Right: SEQUENCE(1,3) in A5 spills A5:C5; filled to D5:F5.
+        let mut w = wb(&[]);
+        let mut eng = Engine::new(&w);
+        eng.set_cell(&mut w, (0, 4, 0), Cell::formula("SEQUENCE(1,3)"));
+        assert_eq!(autofill(&mut w, 0, (4, 0, 4, 2), (4, 5)), 3);
+        let mut eng = Engine::new(&w);
+        eng.recalc_all(&mut w);
+        let row = ["A5", "B5", "C5", "D5", "E5", "F5"];
+        assert_eq!(values(&w, &row), nums(&[1.0, 2.0, 3.0, 1.0, 2.0, 3.0]));
+        assert_eq!(w.sheets[0].cell(4, 3).unwrap().spill, Some((1, 3)));
     }
 
     #[test]
