@@ -12,8 +12,10 @@
 //! The readers are lenient: a record or token they don't understand is
 //! skipped, and a formula they can't decompile keeps its cached value and
 //! loses only the formula. The hard errors are the files that can't be read
-//! at all: encrypted ones, Excel 5.0/95 workbooks and OLE2 files that are not
-//! spreadsheets.
+//! at all: encrypted ones, Excel 5.0/95 workbooks, OLE2 files that are not
+//! spreadsheets, broken containers, and files that ask for more than
+//! [`Limits`] allows (too many cells or sheets, or `.ods` repeats that
+//! would expand past their budget). A limit is never met by truncating.
 
 mod ftab;
 mod ods;
@@ -21,10 +23,10 @@ mod ptg;
 mod xls;
 mod xlsb;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::sheet::{Cell, DefinedName, Xf};
-use crate::xlsx::{SheetPackage, XlsxError, load_xlsx, new_xlsx};
+use crate::xlsx::{SheetPackage, XlsxError, load_xlsx};
 
 /// The file format a workbook was opened from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +135,34 @@ pub fn open_workbook(data: &[u8]) -> Result<(SheetPackage, SourceFormat), OpenEr
         .map_err(OpenError::Xlsx)
 }
 
+/// What an imported file may make the import allocate. Past any of these
+/// the file is refused ([`OpenError::Corrupt`]), never silently truncated.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Limits {
+    /// Cells across the workbook, every reader ("too many cells"). Far
+    /// past any real workbook, which memory bounds long before this.
+    pub cells: usize,
+    /// The copies `.ods` repeats add (a repeated cell's or row's 2nd, 3rd,
+    /// ... instance): the guard against a tiny file that expands to
+    /// billions ("too many repeated cells").
+    pub repeat_cells: usize,
+    /// The text and formula bytes those copies add.
+    pub repeat_bytes: usize,
+    /// Sheets ("too many sheets").
+    pub sheets: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits {
+            cells: 50_000_000,
+            repeat_cells: 4_000_000,
+            repeat_bytes: 256 << 20,
+            sheets: 4_096,
+        }
+    }
+}
+
 /// One sheet as a reader collects it.
 #[derive(Debug, Default)]
 pub(crate) struct SheetIn {
@@ -149,14 +179,27 @@ pub(crate) struct BookIn {
     /// Number-format codes the cells' `style` indices name; index 0 is
     /// always General.
     pub formats: Vec<String>,
+    /// `formats` by code.
+    format_ix: HashMap<String, u32>,
     pub names: Vec<DefinedName>,
     pub date1904: bool,
+    pub limits: Limits,
+    /// What has been charged against `limits` so far.
+    cells: usize,
+    repeat_cells: usize,
+    repeat_bytes: usize,
 }
 
 impl BookIn {
+    #[cfg(test)]
     pub fn new() -> BookIn {
+        BookIn::with_limits(Limits::default())
+    }
+
+    pub fn with_limits(limits: Limits) -> BookIn {
         BookIn {
             formats: vec!["General".to_string()],
+            limits,
             ..BookIn::default()
         }
     }
@@ -166,41 +209,77 @@ impl BookIn {
         if code.eq_ignore_ascii_case("General") || code.is_empty() {
             return 0;
         }
-        match self.formats.iter().position(|c| c == code) {
-            Some(i) => i as u32,
-            None => {
-                self.formats.push(code.to_string());
-                (self.formats.len() - 1) as u32
-            }
+        if let Some(&i) = self.format_ix.get(code) {
+            return i;
         }
+        self.formats.push(code.to_string());
+        let i = (self.formats.len() - 1) as u32;
+        self.format_ix.insert(code.to_string(), i);
+        i
     }
 
-    /// The package: [`new_xlsx`] with these sheets, cells, number formats,
-    /// names and date system. Formula text goes through
-    /// [`crate::formula::file_formula`], so it is stored as [`load_xlsx`]
-    /// would store it.
+    /// Start a new sheet, unless the workbook already has as many as
+    /// `limits` allows.
+    pub fn push_sheet(&mut self, sheet: SheetIn) -> Result<(), OpenError> {
+        if self.sheets.len() >= self.limits.sheets {
+            return Err(OpenError::Corrupt(format!(
+                "too many sheets (more than {})",
+                self.limits.sheets
+            )));
+        }
+        self.sheets.push(sheet);
+        Ok(())
+    }
+
+    /// Account for `n` more cells in the workbook.
+    pub fn charge_cells(&mut self, n: usize) -> Result<(), OpenError> {
+        self.cells = self.cells.saturating_add(n);
+        if self.cells > self.limits.cells {
+            return Err(OpenError::Corrupt(format!(
+                "too many cells (more than {})",
+                self.limits.cells
+            )));
+        }
+        Ok(())
+    }
+
+    /// Account for `copies` cells a repeat adds, holding `bytes` of text
+    /// and formulas between them. Charged before the copies are made.
+    pub fn charge_repeats(&mut self, copies: usize, bytes: usize) -> Result<(), OpenError> {
+        self.repeat_cells = self.repeat_cells.saturating_add(copies);
+        self.repeat_bytes = self.repeat_bytes.saturating_add(bytes);
+        if self.repeat_cells > self.limits.repeat_cells
+            || self.repeat_bytes > self.limits.repeat_bytes
+        {
+            return Err(OpenError::Corrupt("too many repeated cells".into()));
+        }
+        Ok(())
+    }
+
+    /// The package: a fresh workbook with these sheets, cells, number
+    /// formats, names and date system, built in time linear in its size.
+    /// Formula text goes through [`crate::formula::file_formula`], so it is
+    /// stored as [`load_xlsx`] would store it. Sheet names are made valid
+    /// for Excel ([`valid_sheet_names`]).
     pub fn build(mut self) -> SheetPackage {
-        let mut pkg = new_xlsx();
         if self.sheets.is_empty() {
             self.sheets.push(SheetIn {
                 name: "Sheet1".to_string(),
                 ..SheetIn::default()
             });
         }
-        // Each format code becomes an xf; General stays the default xf 0.
+        let names = valid_sheet_names(self.sheets.iter().map(|s| s.name.as_str()));
+        let mut pkg = crate::xlsx::new_xlsx_sheets(&names);
+        // Each format code becomes an xf (the codes are distinct, so none
+        // needs interning); General stays the default xf 0.
         let mut xf_of = vec![0u32; self.formats.len()];
         for (i, code) in self.formats.iter().enumerate().skip(1) {
             let mut xf = Xf::default();
             xf.set_code(Some(code.clone()));
-            xf_of[i] = pkg.workbook.styles.intern(xf);
+            pkg.workbook.styles.xfs.push(xf);
+            xf_of[i] = (pkg.workbook.styles.xfs.len() - 1) as u32;
         }
-        for (i, sheet) in self.sheets.into_iter().enumerate() {
-            let at = if i == 0 {
-                pkg.workbook.sheets[0].name = sheet.name.clone();
-                0
-            } else {
-                pkg.add_sheet(&sheet.name)
-            };
+        for (at, sheet) in self.sheets.into_iter().enumerate() {
             let cells = &mut pkg.workbook.sheets[at].cells;
             for (key, mut cell) in sheet.cells {
                 cell.style = xf_of.get(cell.style as usize).copied().unwrap_or(0);
@@ -217,6 +296,39 @@ impl BookIn {
         pkg.workbook.date1904 = self.date1904;
         pkg
     }
+}
+
+/// Sheet names Excel accepts, in order: at most 31 characters, none of
+/// `[]:*?/\`, not empty (`SheetN` instead), and unique ignoring case (a
+/// repeat becomes `Name (2)`). A formula that named a sheet by a name this
+/// changes keeps the old name (and so becomes `#REF!` on recalculation):
+/// accepted, since a file with such names is already not one Excel wrote.
+pub(crate) fn valid_sheet_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec<String> {
+    fn cut(s: &str, max: usize) -> String {
+        s.chars().take(max).collect()
+    }
+    let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for (i, raw) in names.enumerate() {
+        let clean: String = raw
+            .chars()
+            .map(|c| if "[]:*?/\\".contains(c) { '_' } else { c })
+            .collect();
+        let mut name = cut(clean.trim_matches('\''), 31);
+        if name.trim().is_empty() {
+            name = format!("Sheet{}", i + 1);
+        }
+        let mut n = 2;
+        let base = name.clone();
+        while taken.contains(&name.to_lowercase()) {
+            let suffix = format!(" ({n})");
+            name = format!("{}{suffix}", cut(&base, 31 - suffix.chars().count()));
+            n += 1;
+        }
+        taken.insert(name.to_lowercase());
+        out.push(name);
+    }
+    out
 }
 
 /// A reference's sheet part as a formula spells it: `Data!`, `'My Sheet'!`,
@@ -323,6 +435,99 @@ mod tests {
         assert_eq!(rk((12345u32 << 2) | 2 | 1), 123.45);
         assert_eq!(rk(((-7i32 as u32) << 2) | 2), -7.0);
         assert_eq!(rk((1.5f64.to_bits() >> 32) as u32), 1.5);
+    }
+
+    #[test]
+    fn sheet_names_are_made_valid() {
+        let long = "x".repeat(40);
+        let got = valid_sheet_names(
+            [
+                "Data",
+                "",
+                "a/b[c]:d*e?f\\g",
+                long.as_str(),
+                "DATA",
+                "Data",
+                "'quoted'",
+            ]
+            .into_iter(),
+        );
+        assert_eq!(
+            got,
+            [
+                "Data".to_string(),
+                "Sheet2".into(),
+                "a_b_c__d_e_f_g".into(),
+                "x".repeat(31),
+                "DATA (2)".into(),
+                "Data (3)".into(),
+                "quoted".into(),
+            ]
+        );
+        // A long repeat stays within 31 characters.
+        let two = valid_sheet_names([long.as_str(), long.as_str()].into_iter());
+        assert_eq!(two[1], format!("{} (2)", "x".repeat(27)));
+    }
+
+    #[test]
+    fn many_sheets_build_in_linear_time_and_too_many_are_refused() {
+        let mut book = BookIn::new();
+        for i in 0..2_000 {
+            book.push_sheet(SheetIn {
+                name: format!("S{i}"),
+                ..SheetIn::default()
+            })
+            .unwrap();
+        }
+        let started = std::time::Instant::now();
+        let pkg = book.build();
+        assert_eq!(pkg.workbook.sheets.len(), 2_000);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let back = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&pkg)).unwrap();
+        assert_eq!(back.workbook.sheets[1999].name, "S1999");
+
+        let mut book = BookIn::new();
+        let started = std::time::Instant::now();
+        let err = (0..20_000)
+            .map(|i| {
+                book.push_sheet(SheetIn {
+                    name: format!("S{i}"),
+                    ..SheetIn::default()
+                })
+            })
+            .find_map(Result::err)
+            .unwrap();
+        assert!(err.to_string().contains("too many sheets"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn budgets_refuse_rather_than_truncate() {
+        let mut book = BookIn::with_limits(Limits {
+            cells: 10,
+            repeat_cells: 3,
+            repeat_bytes: 100,
+            sheets: 2,
+        });
+        book.charge_cells(10).unwrap();
+        assert!(
+            book.charge_cells(1)
+                .unwrap_err()
+                .to_string()
+                .contains("too many cells")
+        );
+        book.charge_repeats(3, 10).unwrap();
+        assert!(book.charge_repeats(1, 0).is_err());
+        let mut book = BookIn::with_limits(Limits {
+            repeat_bytes: 100,
+            ..Limits::default()
+        });
+        assert!(
+            book.charge_repeats(1, 101)
+                .unwrap_err()
+                .to_string()
+                .contains("too many repeated cells")
+        );
     }
 
     #[test]

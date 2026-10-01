@@ -7358,19 +7358,54 @@ const RELS_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/rel
 /// A fresh single-sheet workbook (the "create new" path and a save target for
 /// in-memory workbooks).
 pub fn new_xlsx() -> SheetPackage {
-    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/><Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/></Types>"#;
+    new_xlsx_sheets(&["Sheet1".to_string()])
+}
+
+/// A fresh workbook with one empty sheet per name, in order (at least one:
+/// no names gives `Sheet1`). Every part is written in one pass, so it costs
+/// time linear in the sheets, where [`SheetPackage::add_sheet`] rescans the
+/// package for each.
+pub(crate) fn new_xlsx_sheets(names: &[String]) -> SheetPackage {
+    let fallback = ["Sheet1".to_string()];
+    let names = if names.is_empty() {
+        &fallback[..]
+    } else {
+        names
+    };
+    let n = names.len();
+    let mut overrides = String::new();
+    let mut entries = String::new();
+    let mut sheet_rels = String::new();
+    for (i, name) in names.iter().enumerate() {
+        let k = i + 1;
+        overrides.push_str(&format!(
+            r#"<Override PartName="/xl/worksheets/sheet{k}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>"#
+        ));
+        entries.push_str(&format!(
+            r#"<sheet name="{}" sheetId="{k}" r:id="rId{k}"/>"#,
+            esc_attr(name)
+        ));
+        sheet_rels.push_str(&format!(
+            r#"<Relationship Id="rId{k}" Type="{RELS_NS}/worksheet" Target="worksheets/sheet{k}.xml"/>"#
+        ));
+    }
+    let content_types = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>{overrides}<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/><Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/></Types>"#
+    );
     let root_rels = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{RELS_NS}/officeDocument" Target="xl/workbook.xml"/></Relationships>"#
     );
     let workbook = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<workbook xmlns="{SPREADSHEET_NS}" xmlns:r="{RELS_NS}"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#
+<workbook xmlns="{SPREADSHEET_NS}" xmlns:r="{RELS_NS}"><sheets>{entries}</sheets></workbook>"#
     );
     let wb_rels = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{RELS_NS}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="{RELS_NS}/styles" Target="styles.xml"/><Relationship Id="rId3" Type="{RELS_NS}/sharedStrings" Target="sharedStrings.xml"/></Relationships>"#
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{sheet_rels}<Relationship Id="rId{}" Type="{RELS_NS}/styles" Target="styles.xml"/><Relationship Id="rId{}" Type="{RELS_NS}/sharedStrings" Target="sharedStrings.xml"/></Relationships>"#,
+        n + 1,
+        n + 2
     );
     let worksheet = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -7385,10 +7420,13 @@ pub fn new_xlsx() -> SheetPackage {
     let sst = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" uniqueCount="0"></sst>"#;
 
-    let parts = vec![
+    let sheet_parts: Vec<String> = (1..=n)
+        .map(|k| format!("xl/worksheets/sheet{k}.xml"))
+        .collect();
+    let mut parts = vec![
         (
             "[Content_Types].xml".to_string(),
-            content_types.as_bytes().to_vec(),
+            content_types.into_bytes(),
         ),
         ("_rels/.rels".to_string(), root_rels.into_bytes()),
         ("xl/workbook.xml".to_string(), workbook.into_bytes()),
@@ -7396,25 +7434,27 @@ pub fn new_xlsx() -> SheetPackage {
             "xl/_rels/workbook.xml.rels".to_string(),
             wb_rels.into_bytes(),
         ),
-        (
-            "xl/worksheets/sheet1.xml".to_string(),
-            worksheet.into_bytes(),
-        ),
-        ("xl/styles.xml".to_string(), styles.into_bytes()),
-        ("xl/sharedStrings.xml".to_string(), sst.as_bytes().to_vec()),
     ];
+    for part in &sheet_parts {
+        parts.push((part.clone(), worksheet.as_bytes().to_vec()));
+    }
+    parts.push(("xl/styles.xml".to_string(), styles.into_bytes()));
+    parts.push(("xl/sharedStrings.xml".to_string(), sst.as_bytes().to_vec()));
 
     SheetPackage {
         parts,
-        sheet_parts: vec!["xl/worksheets/sheet1.xml".to_string()],
+        sheet_parts,
         shared: Vec::new(),
         shared_part: Some("xl/sharedStrings.xml".to_string()),
         strict: false,
         workbook: Workbook {
-            sheets: vec![Sheet {
-                name: "Sheet1".to_string(),
-                ..Sheet::default()
-            }],
+            sheets: names
+                .iter()
+                .map(|name| Sheet {
+                    name: name.clone(),
+                    ..Sheet::default()
+                })
+                .collect(),
             styles: Styles {
                 xfs: vec![Xf::default()],
                 ..Default::default()

@@ -7,11 +7,12 @@
 //! (NAME). Each worksheet substream gives its cells. Records not listed here
 //! are skipped.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::ptg::{self, Base, Biff, Names};
 use super::{
-    BookIn, OpenError, SheetIn, biff_error, builtin_format, on_grid, rk, set_array, sheet_prefix,
+    BookIn, Limits, OpenError, SheetIn, biff_error, builtin_format, on_grid, rk, set_array,
+    sheet_prefix,
 };
 use crate::sheet::{Cell, CellValue, DefinedName};
 
@@ -102,15 +103,13 @@ impl<'a> Cur<'a> {
         let mut units: Vec<u16> = Vec::with_capacity(cch.min(1 << 16));
         let mut left = cch;
         while left > 0 {
-            if self.breaks.contains(&self.at) {
+            // `breaks` is ascending: binary searches, so a string split over
+            // many CONTINUEs isn't quadratic.
+            if self.breaks.binary_search(&self.at).is_ok() {
                 high = self.u8()? & 1 == 1;
             }
-            let lim = self
-                .breaks
-                .iter()
-                .copied()
-                .find(|&b| b > self.at)
-                .unwrap_or(self.d.len());
+            let next = self.breaks.partition_point(|&b| b <= self.at);
+            let lim = self.breaks.get(next).copied().unwrap_or(self.d.len());
             let width = if high { 2 } else { 1 };
             let n = ((lim - self.at) / width).min(left);
             if n == 0 {
@@ -263,6 +262,11 @@ const EOF: u16 = 0x000A;
 
 /// Read a BIFF8 `Workbook` stream.
 pub(crate) fn read(stream: &[u8]) -> Result<BookIn, OpenError> {
+    read_with(stream, Limits::default())
+}
+
+/// [`read`] under `limits`.
+pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenError> {
     let recs = records(stream);
     let first = recs
         .first()
@@ -287,7 +291,7 @@ pub(crate) fn read(stream: &[u8]) -> Result<BookIn, OpenError> {
         }
     }
 
-    let mut book = BookIn::new();
+    let mut book = BookIn::with_limits(limits);
     let mut g = Globals {
         sheets: Vec::new(),
         xti: Vec::new(),
@@ -404,8 +408,12 @@ pub(crate) fn read(stream: &[u8]) -> Result<BookIn, OpenError> {
     // Worksheets, in BOUNDSHEET8 order; `imported[i]` is the model index
     // of BOUNDSHEET8 `i`, for sheet-scoped names.
     let mut imported: Vec<Option<usize>> = Vec::new();
+    let index: HashMap<usize, usize> = recs.iter().enumerate().map(|(i, r)| (r.pos, i)).collect();
+    // A substream two BOUNDSHEET8s point at is read once (a crafted file
+    // could otherwise multiply one sheet's cells by its sheet count).
+    let mut seen: HashSet<usize> = HashSet::new();
     for (i, &(pos, dt)) in plies.iter().enumerate() {
-        let start = recs.iter().position(|r| r.pos == pos);
+        let start = index.get(&pos).copied().filter(|_| seen.insert(pos));
         let is_sheet = dt == 0
             && start
                 .and_then(|s| recs[s].data.get(2..4))
@@ -414,12 +422,12 @@ pub(crate) fn read(stream: &[u8]) -> Result<BookIn, OpenError> {
             imported.push(None);
             continue;
         };
-        let sheet = read_sheet(&recs[start + 1..], &g, &sst, &mut book, &format_of);
+        let sheet = read_sheet(&recs[start + 1..], &g, &sst, &mut book, &format_of)?;
         imported.push(Some(book.sheets.len()));
-        book.sheets.push(SheetIn {
+        book.push_sheet(SheetIn {
             name: g.sheets[i].clone(),
             cells: sheet,
-        });
+        })?;
     }
 
     for n in &g.names {
@@ -468,17 +476,20 @@ fn read_sheet(
     sst: &[String],
     book: &mut BookIn,
     format_of: &dyn Fn(u16, &mut BookIn) -> u32,
-) -> std::collections::BTreeMap<(u32, u32), Cell> {
-    let mut cells = std::collections::BTreeMap::new();
+) -> Result<BTreeMap<(u32, u32), Cell>, OpenError> {
+    let mut cells = BTreeMap::new();
+    // Cells charged to the workbook's budget so far.
+    let mut charged = 0usize;
     // The FORMULA whose string result the next STRING record holds.
     let mut want_string: Option<(u32, u32)> = None;
     let mut pending: Vec<Pending> = Vec::new();
     // Shared formulas: (r1, r2, c1, c2) range → (rgce, extra).
-    let mut shared: Vec<Group> = Vec::new();
+    // Shared formulas by their first cell (where ptgExp points).
+    let mut shared: HashMap<(u32, u32), Group> = HashMap::new();
     // Array formulas: anchor → (range, rgce, extra).
     let mut arrays: HashMap<(u32, u32), Group> = HashMap::new();
 
-    let put = |cells: &mut std::collections::BTreeMap<(u32, u32), Cell>,
+    let put = |cells: &mut BTreeMap<(u32, u32), Cell>,
                r: u16,
                c: u16,
                ixfe: u16,
@@ -625,7 +636,7 @@ fn read_sheet(
                     c.u8()?;
                     let cce = c.u16()? as usize;
                     let rgce = c.take(cce)?.to_vec();
-                    shared.push((range, rgce, c.rest().to_vec()));
+                    shared.insert((range.0, range.2), (range, rgce, c.rest().to_vec()));
                 }
                 0x0221 => {
                     let range = ref_u(&mut c)?;
@@ -639,6 +650,10 @@ fn read_sheet(
             }
             Some(())
         })();
+        if cells.len() > charged {
+            book.charge_cells(cells.len() - charged)?;
+            charged = cells.len();
+        }
     }
 
     for p in pending {
@@ -656,16 +671,12 @@ fn read_sheet(
             }
             continue;
         }
-        let contains = |&(r1, r2, c1, c2): &(u32, u32, u32, u32)| {
-            (r1..=r2).contains(&p.at.0) && (c1..=c2).contains(&p.at.1)
-        };
-        let group = shared
-            .iter()
-            .find(|(range, _, _)| (range.0, range.2) == p.master && contains(range))
-            .or_else(|| shared.iter().find(|(range, _, _)| contains(range)));
-        let Some((_, rgce, extra)) = group else {
+        let Some(((r1, r2, c1, c2), rgce, extra)) = shared.get(&p.master) else {
             continue;
         };
+        if !((*r1..=*r2).contains(&p.at.0) && (*c1..=*c2).contains(&p.at.1)) {
+            continue;
+        }
         let base = Base::Shared(p.at.0, p.at.1);
         if let Some(f) = ptg::decompile(Biff::V8, rgce, extra, base, g) {
             if let Some(cell) = cells.get_mut(&p.at) {
@@ -673,7 +684,7 @@ fn read_sheet(
             }
         }
     }
-    cells
+    Ok(cells)
 }
 
 /// A `RefU`: rwFirst, rwLast (16-bit), colFirst, colLast (8-bit), as
@@ -760,7 +771,7 @@ pub(crate) mod tests {
         rec(0x0006, &b)
     }
 
-    fn data(book: &BookIn) -> &std::collections::BTreeMap<(u32, u32), Cell> {
+    fn data(book: &BookIn) -> &BTreeMap<(u32, u32), Cell> {
         &book.sheets[0].cells
     }
 
@@ -942,6 +953,38 @@ pub(crate) mod tests {
 
     /// An embedded chart is a BOF..EOF substream inside the sheet's: its
     /// records are not cells, and the sheet goes on after its EOF.
+    /// Two BOUNDSHEET8s at the same substream: one sheet, read once.
+    #[test]
+    fn a_sheet_two_plies_point_at_is_read_once() {
+        let stream = workbook(&[], &[number(0, 0, 1.0)]);
+        let recs = records(&stream);
+        let bs = recs.iter().find(|r| r.ty == 0x0085).unwrap();
+        let len = 4 + bs.data.len();
+        let mut dup = stream[..bs.pos + len].to_vec();
+        dup.extend_from_slice(&stream[bs.pos..bs.pos + len]);
+        dup.extend_from_slice(&stream[bs.pos + len..]);
+        // Both offsets move by the inserted record.
+        for at in [bs.pos + 4, bs.pos + len + 4] {
+            let off = u32::from_le_bytes(dup[at..at + 4].try_into().unwrap()) + len as u32;
+            dup[at..at + 4].copy_from_slice(&off.to_le_bytes());
+        }
+        let book = read(&dup).unwrap();
+        assert_eq!(book.sheets.len(), 1);
+        assert_eq!(data(&book).len(), 1);
+    }
+
+    #[test]
+    fn the_cell_budget_refuses_a_workbook() {
+        let stream = workbook(&[], &[number(0, 0, 1.0), number(1, 0, 2.0)]);
+        let tight = Limits {
+            cells: 1,
+            ..Limits::default()
+        };
+        let err = read_with(&stream, tight).err().unwrap();
+        assert!(err.to_string().contains("too many cells"), "{err}");
+        assert!(read(&stream).is_ok());
+    }
+
     #[test]
     fn an_embedded_chart_substream_is_skipped() {
         let stream = workbook(

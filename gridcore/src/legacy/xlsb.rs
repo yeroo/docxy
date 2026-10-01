@@ -6,13 +6,14 @@
 //! A record is a varint type (1-2 bytes) and a varint size (1-4 bytes) and
 //! its body. Records not listed here are skipped.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use opccore::zip::ZipArchive;
 
 use super::ptg::{self, Base, Biff, Names, Table, utf16};
 use super::{
-    BookIn, OpenError, SheetIn, biff_error, builtin_format, on_grid, rk, set_array, sheet_prefix,
+    BookIn, Limits, OpenError, SheetIn, biff_error, builtin_format, on_grid, rk, set_array,
+    sheet_prefix,
 };
 use crate::sheet::{Cell, CellValue, DefinedName};
 use crate::xlsx::{parse_rels, rels_part_name, resolve_relative};
@@ -217,11 +218,16 @@ fn rels(zip: &ZipArchive, part: &str) -> HashMap<String, (String, String)> {
 
 /// Read an `.xlsb` package.
 pub(crate) fn read(zip: &ZipArchive) -> Result<BookIn, OpenError> {
+    read_with(zip, Limits::default())
+}
+
+/// [`read`] under `limits`.
+pub(crate) fn read_with(zip: &ZipArchive, limits: Limits) -> Result<BookIn, OpenError> {
     let wb = zip
         .read("xl/workbook.bin")
         .ok_or_else(|| OpenError::Corrupt("unreadable xl/workbook.bin".into()))?;
     let rel = rels(zip, "xl/workbook.bin");
-    let mut book = BookIn::new();
+    let mut book = BookIn::with_limits(limits);
     let mut g = Globals {
         sheets: Vec::new(),
         own: Vec::new(),
@@ -333,22 +339,24 @@ pub(crate) fn read(zip: &ZipArchive) -> Result<BookIn, OpenError> {
         }
     }
     let mut imported: Vec<Option<usize>> = Vec::new();
+    // A part two sheets name is read once.
+    let mut seen: HashSet<&str> = HashSet::new();
     for (i, part) in parts.iter().enumerate() {
         // Only worksheets: a chartsheet's or macro sheet's part is no grid.
         let Some(bytes) = part
             .as_ref()
-            .filter(|p| p.contains("worksheets/"))
+            .filter(|p| p.contains("worksheets/") && seen.insert(p.as_str()))
             .and_then(|p| zip.read(p))
         else {
             imported.push(None);
             continue;
         };
-        let cells = read_sheet(&bytes, &g, &sst, &mut book, &mut format_of);
+        let cells = read_sheet(&bytes, &g, &sst, &mut book, &mut format_of)?;
         imported.push(Some(book.sheets.len()));
-        book.sheets.push(SheetIn {
+        book.push_sheet(SheetIn {
             name: g.sheets[i].clone(),
             cells,
-        });
+        })?;
     }
 
     for RawName {
@@ -392,14 +400,18 @@ fn read_sheet(
     sst: &[String],
     book: &mut BookIn,
     format_of: &mut dyn FnMut(u32, &mut BookIn) -> u32,
-) -> BTreeMap<(u32, u32), Cell> {
+) -> Result<BTreeMap<(u32, u32), Cell>, OpenError> {
     let mut cells = BTreeMap::new();
+    let mut charged = 0usize;
     let mut row = 0u32;
     // Cells whose formula is a ptgExp, resolved once every shared and array
     // formula of the sheet is known.
-    let mut pending: Vec<(u32, u32)> = Vec::new();
-    let mut shared: Vec<Group> = Vec::new();
-    let mut arrays: Vec<Group> = Vec::new();
+    // (cell, master): the master's row is in ptgExp, its column in the
+    // formula's extra data.
+    let mut pending: Vec<((u32, u32), (u32, u32))> = Vec::new();
+    // Shared and array formulas by their first cell.
+    let mut shared: HashMap<(u32, u32), Group> = HashMap::new();
+    let mut arrays: HashMap<(u32, u32), Group> = HashMap::new();
     for (ty, body) in records(bytes) {
         let mut c = Cur::new(body);
         let _ = (|| -> Option<()> {
@@ -431,7 +443,13 @@ fn read_sheet(
                         c.u16()?;
                         let (rgce, extra) = c.formula()?;
                         if rgce.first() == Some(&0x01) {
-                            pending.push((row, col));
+                            let mr = rgce
+                                .get(1..5)
+                                .map_or(row, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+                            let mc = extra
+                                .get(..4)
+                                .map_or(col, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+                            pending.push(((row, col), (mr, mc)));
                         } else {
                             let base = Base::Cell(Some((row, col)));
                             cell.formula = ptg::decompile(Biff::V12, rgce, extra, base, g);
@@ -446,25 +464,29 @@ fn read_sheet(
                     }
                     let (rgce, extra) = c.formula()?;
                     let group = (range, rgce.to_vec(), extra.to_vec());
+                    let key = (range.0, range.2);
                     if ty == BRT_ARR_FMLA {
-                        arrays.push(group);
+                        arrays.insert(key, group);
                     } else {
-                        shared.push(group);
+                        shared.insert(key, group);
                     }
                 }
                 _ => {}
             }
             Some(())
         })();
+        if cells.len() > charged {
+            book.charge_cells(cells.len() - charged)?;
+            charged = cells.len();
+        }
     }
     let contains = |&(r1, r2, c1, c2): &(u32, u32, u32, u32), (r, c): (u32, u32)| {
         (r1..=r2).contains(&r) && (c1..=c2).contains(&c)
     };
-    for at in pending {
-        if let Some((range, rgce, extra)) = arrays.iter().find(|(rg, _, _)| contains(rg, at)) {
-            let (r1, _, c1, _) = *range;
+    for (at, master) in pending {
+        if let Some((range, rgce, extra)) = arrays.get(&master) {
             // The array formula lives on its anchor; the rest are values.
-            if at != (r1, c1) {
+            if at != master {
                 continue;
             }
             let Some(f) = ptg::decompile(Biff::V12, rgce, extra, Base::Cell(Some(at)), g) else {
@@ -475,7 +497,8 @@ fn read_sheet(
             }
             continue;
         }
-        let Some((_, rgce, extra)) = shared.iter().find(|(rg, _, _)| contains(rg, at)) else {
+        let Some((_, rgce, extra)) = shared.get(&master).filter(|(rg, _, _)| contains(rg, at))
+        else {
             continue;
         };
         let f = ptg::decompile(Biff::V12, rgce, extra, Base::Shared(at.0, at.1), g);
@@ -483,7 +506,7 @@ fn read_sheet(
             cell.formula = Some(f);
         }
     }
-    cells
+    Ok(cells)
 }
 
 #[cfg(test)]
@@ -674,6 +697,37 @@ mod tests {
         let f = [0x39, 0, 0, 1, 0, 0, 0];
         let got = ptg::decompile(Biff::V12, &f, &[], Base::Cell(None), &g);
         assert_eq!(got.as_deref(), Some("Global"));
+    }
+
+    /// Two sheets naming the same part: one sheet, read once; and the cell
+    /// budget refuses a workbook past it.
+    #[test]
+    fn a_part_two_sheets_name_is_read_once_and_cells_are_budgeted() {
+        let mut again = vec![0u8; 8];
+        again.extend(wide("rId1"));
+        again.extend(wide("Again"));
+        let mut a = cell(0, 0);
+        a.extend(1.0f64.to_le_bytes());
+        let mut b = cell(1, 0);
+        b.extend(2.0f64.to_le_bytes());
+        let bytes = xlsb(
+            &[rec(BRT_BUNDLE_SH, &again)],
+            &[
+                rec(BRT_ROW_HDR, &0u32.to_le_bytes()),
+                rec(5, &a),
+                rec(5, &b),
+            ],
+        );
+        let book = open(&bytes);
+        assert_eq!(book.sheets.len(), 1);
+        let tight = Limits {
+            cells: 1,
+            ..Limits::default()
+        };
+        let err = read_with(&ZipArchive::open(&bytes).unwrap(), tight)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("too many cells"), "{err}");
     }
 
     #[test]

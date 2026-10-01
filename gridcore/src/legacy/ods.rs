@@ -9,16 +9,19 @@
 //!
 //! Repeated rows and cells (`table:number-rows-repeated="1048000"` on the
 //! padding Excel and LibreOffice write) are expanded only where they hold
-//! something, so padding costs nothing. Repeats that do hold something are
-//! expanded up to [`MAX_CELLS`] cells a workbook; a file that asks for more
-//! is refused rather than allowed to exhaust memory.
+//! something, so padding costs nothing. The copies a repeat that does hold
+//! something adds are charged to a budget ([`super::Limits`]: copies, and
+//! the text and formula bytes they hold) before they are made; a file that
+//! asks for more is refused rather than allowed to exhaust memory. Text in
+//! a cell's annotation or drawn shapes (`office:annotation`, `draw:*`) is
+//! not the cell's value.
 
 use std::collections::{BTreeMap, HashMap};
 
 use opccore::xml::{Event, XmlParser};
 use opccore::zip::ZipArchive;
 
-use super::{BookIn, OpenError, SheetIn, sheet_prefix};
+use super::{BookIn, Limits, OpenError, SheetIn, sheet_prefix};
 use crate::sheet::{Cell, CellValue, DefinedName, MAX_COLS, MAX_ROWS};
 
 /// `2024-01-15` or `2024-01-15T12:30:00.5` as a serial.
@@ -676,17 +679,20 @@ pub(crate) fn read(zip: &ZipArchive) -> Result<BookIn, OpenError> {
         styles.read(&String::from_utf8_lossy(&s));
     }
     styles.read(&content);
-    read_content(&content, &styles)
+    read_content(&content, &styles, Limits::default())
 }
 
-/// The most cells an `.ods` may expand its repeats into, across the
-/// workbook. Real files repeat a value cell a little (a filled-down
-/// constant); a row of 16,384 values repeated a million times is an attack.
-pub(crate) const MAX_CELLS: usize = 4_000_000;
+/// The bytes a copy of `cell` costs the repeat budget: its text and formula.
+fn copy_bytes(cell: &Cell) -> usize {
+    let text = match &cell.value {
+        CellValue::Text(s) | CellValue::Error(s) => s.len(),
+        _ => 0,
+    };
+    1 + text + cell.formula.as_ref().map_or(0, String::len)
+}
 
-fn read_content(xml: &str, styles: &StyleSheet) -> Result<BookIn, OpenError> {
-    let mut book = BookIn::new();
-    let mut total = 0usize;
+fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn, OpenError> {
+    let mut book = BookIn::with_limits(limits);
     let mut codes: HashMap<String, u32> = HashMap::new();
     let mut p = XmlParser::new(xml);
     let mut stack: Vec<String> = Vec::new();
@@ -700,7 +706,9 @@ fn read_content(xml: &str, styles: &StyleSheet) -> Result<BookIn, OpenError> {
     // The current row's cells, before its repeat is known to apply.
     let mut row_cells: Vec<(u32, Cell)> = Vec::new();
     let mut cell: Option<CellIn> = None;
-    let mut annotation = 0usize;
+    // Depth inside an annotation or a drawn shape, whose text is not the
+    // cell's.
+    let mut hidden = 0usize;
     // (name, sheet scope, definition) of each named range/expression.
     let mut names: Vec<(String, Option<usize>, String)> = Vec::new();
     let mut null_date_1904 = false;
@@ -712,10 +720,10 @@ fn read_content(xml: &str, styles: &StyleSheet) -> Result<BookIn, OpenError> {
                 let attr = |a: &str| decoded(p.attr(a));
                 match name.as_str() {
                     "table:table" => {
-                        book.sheets.push(SheetIn {
+                        book.push_sheet(SheetIn {
                             name: attr("table:name"),
                             cells: BTreeMap::new(),
-                        });
+                        })?;
                         col_styles.clear();
                         next_col = 0;
                         row = 0;
@@ -754,8 +762,8 @@ fn read_content(xml: &str, styles: &StyleSheet) -> Result<BookIn, OpenError> {
                         }
                         cell = Some(c);
                     }
-                    "office:annotation" => annotation += 1,
-                    "text:p" if annotation == 0 => {
+                    n if n == "office:annotation" || n.starts_with("draw:") => hidden += 1,
+                    "text:p" if hidden == 0 => {
                         if let Some(c) = cell.as_mut() {
                             if c.paragraphs > 0 {
                                 c.text.push('\n');
@@ -763,18 +771,18 @@ fn read_content(xml: &str, styles: &StyleSheet) -> Result<BookIn, OpenError> {
                             c.paragraphs += 1;
                         }
                     }
-                    "text:s" if annotation == 0 => {
+                    "text:s" if hidden == 0 => {
                         if let Some(c) = cell.as_mut() {
                             let n = p.attr("text:c").parse().unwrap_or(1usize).min(1 << 12);
                             c.text.push_str(&" ".repeat(n));
                         }
                     }
-                    "text:tab" if annotation == 0 => {
+                    "text:tab" if hidden == 0 => {
                         if let Some(c) = cell.as_mut() {
                             c.text.push('\t');
                         }
                     }
-                    "text:line-break" if annotation == 0 => {
+                    "text:line-break" if hidden == 0 => {
                         if let Some(c) = cell.as_mut() {
                             c.text.push('\n');
                         }
@@ -802,7 +810,7 @@ fn read_content(xml: &str, styles: &StyleSheet) -> Result<BookIn, OpenError> {
                 stack.push(name);
             }
             Event::Text => {
-                if annotation == 0 && stack.iter().any(|e| e == "text:p") {
+                if hidden == 0 && stack.iter().any(|e| e == "text:p") {
                     if let Some(c) = cell.as_mut() {
                         XmlParser::append_decoded(p.text(), &mut c.text);
                     }
@@ -811,7 +819,9 @@ fn read_content(xml: &str, styles: &StyleSheet) -> Result<BookIn, OpenError> {
             Event::End => {
                 let name = stack.pop().unwrap_or_default();
                 match name.as_str() {
-                    "office:annotation" => annotation = annotation.saturating_sub(1),
+                    n if n == "office:annotation" || n.starts_with("draw:") => {
+                        hidden = hidden.saturating_sub(1);
+                    }
                     "table:table-cell" | "table:covered-table-cell" => {
                         let Some(c) = cell.take() else { continue };
                         let repeat = c.repeat;
@@ -847,15 +857,10 @@ fn read_content(xml: &str, styles: &StyleSheet) -> Result<BookIn, OpenError> {
                                 ..Cell::default()
                             };
                             let last = col.saturating_add(repeat).min(MAX_COLS);
-                            if row_cells
-                                .len()
-                                .saturating_add((last.saturating_sub(col)) as usize)
-                                > MAX_CELLS
-                            {
-                                return Err(OpenError::Corrupt(format!(
-                                    "too many repeated cells (more than {MAX_CELLS})"
-                                )));
-                            }
+                            let n = last.saturating_sub(col) as usize;
+                            let copies = n.saturating_sub(1);
+                            book.charge_repeats(copies, copies.saturating_mul(copy_bytes(&made)))?;
+                            book.charge_cells(n)?;
                             for cc in col..last {
                                 row_cells.push((cc, made.clone()));
                             }
@@ -863,16 +868,17 @@ fn read_content(xml: &str, styles: &StyleSheet) -> Result<BookIn, OpenError> {
                         col = col.saturating_add(repeat);
                     }
                     "table:table-row" => {
-                        if let Some(sheet) = book.sheets.last_mut() {
-                            if !row_cells.is_empty() {
-                                let last = row.saturating_add(row_repeat).min(MAX_ROWS);
-                                let rows = last.saturating_sub(row) as usize;
-                                total = total.saturating_add(row_cells.len().saturating_mul(rows));
-                                if total > MAX_CELLS {
-                                    return Err(OpenError::Corrupt(format!(
-                                        "too many repeated cells (more than {MAX_CELLS})"
-                                    )));
-                                }
+                        if !row_cells.is_empty() && !book.sheets.is_empty() {
+                            let last = row.saturating_add(row_repeat).min(MAX_ROWS);
+                            // The first instance was charged cell by cell;
+                            // each further row copies them all.
+                            let extra = (last.saturating_sub(row) as usize).saturating_sub(1);
+                            let row_bytes: usize =
+                                row_cells.iter().map(|(_, c)| copy_bytes(c)).sum();
+                            let copies = extra.saturating_mul(row_cells.len());
+                            book.charge_repeats(copies, extra.saturating_mul(row_bytes))?;
+                            book.charge_cells(copies)?;
+                            if let Some(sheet) = book.sheets.last_mut() {
                                 for r in row..last {
                                     for (cc, made) in &row_cells {
                                         sheet.cells.insert((r, *cc), made.clone());
@@ -939,7 +945,7 @@ mod tests {
         let xml = content(body);
         let mut styles = StyleSheet::default();
         styles.read(&xml);
-        read_content(&xml, &styles).unwrap()
+        read_content(&xml, &styles, Limits::default()).unwrap()
     }
 
     #[test]
@@ -1084,19 +1090,77 @@ mod tests {
             r#"<table:table table:name="S"><table:table-row table:number-rows-repeated="1048576"><table:table-cell office:value-type="float" office:value="1" table:number-columns-repeated="16384"/></table:table-row></table:table>"#,
         );
         let started = std::time::Instant::now();
-        let err = read_content(&xml, &StyleSheet::default()).err().unwrap();
+        let err = read_content(&xml, &StyleSheet::default(), Limits::default())
+            .err()
+            .unwrap();
         assert!(err.to_string().contains("too many repeated cells"), "{err}");
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // Few copies of a big string: the byte budget, at the column level
+        // (16,383 copies of 64 KB) and at the row level (4,999 rows of one).
+        let big = "x".repeat(64 << 10);
+        for (rows, cols) in [(244, 16_384), (5_000, 1)] {
+            let xml = content(&format!(
+                r#"<table:table table:name="S"><table:table-row table:number-rows-repeated="{rows}"><table:table-cell office:value-type="string" office:string-value="{big}" table:number-columns-repeated="{cols}"/></table:table-row></table:table>"#
+            ));
+            let started = std::time::Instant::now();
+            let err = read_content(&xml, &StyleSheet::default(), Limits::default())
+                .err()
+                .unwrap();
+            assert!(err.to_string().contains("too many repeated cells"), "{err}");
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        }
         // A filled-down constant is fine.
         let ok = content(
             r#"<table:table table:name="S"><table:table-row table:number-rows-repeated="1000"><table:table-cell office:value-type="float" office:value="1" table:number-columns-repeated="3"/></table:table-row></table:table>"#,
         );
         assert_eq!(
-            read_content(&ok, &StyleSheet::default()).unwrap().sheets[0]
+            read_content(&ok, &StyleSheet::default(), Limits::default())
+                .unwrap()
+                .sheets[0]
                 .cells
                 .len(),
             3000
         );
+    }
+
+    /// The repeat budget charges only the copies repeats add: plain cells
+    /// past it still load, and only the total-cell budget bounds them.
+    #[test]
+    fn plain_cells_are_charged_to_the_cell_budget_only() {
+        let cells: String = (0..20)
+            .map(|i| format!(r#"<table:table-cell office:value-type="float" office:value="{i}"/>"#))
+            .collect();
+        let xml = content(&format!(
+            r#"<table:table table:name="S"><table:table-row>{cells}</table:table-row></table:table>"#
+        ));
+        let tight_repeats = Limits {
+            repeat_cells: 5,
+            ..Limits::default()
+        };
+        let book = read_content(&xml, &StyleSheet::default(), tight_repeats).unwrap();
+        assert_eq!(book.sheets[0].cells.len(), 20);
+        let tight_cells = Limits {
+            cells: 10,
+            ..Limits::default()
+        };
+        let err = read_content(&xml, &StyleSheet::default(), tight_cells)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("too many cells"), "{err}");
+    }
+
+    /// A shape anchored in a cell holds text that is not the cell's.
+    #[test]
+    fn drawn_shapes_text_is_not_the_cells() {
+        let b = read_str(
+            r#"<table:table table:name="S"><table:table-row>
+              <table:table-cell><draw:custom-shape draw:name="s"><text:p>Note</text:p></draw:custom-shape></table:table-cell>
+              <table:table-cell office:value-type="string"><text:p>own</text:p><draw:frame><draw:text-box><text:p>boxed</text:p></draw:text-box></draw:frame></table:table-cell>
+            </table:table-row></table:table>"#,
+        );
+        let c = &b.sheets[0].cells;
+        assert!(!c.contains_key(&(0, 0)));
+        assert_eq!(c[&(0, 1)].value, CellValue::Text("own".into()));
     }
 
     #[test]

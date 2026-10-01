@@ -164,6 +164,11 @@ fn num(x: f64) -> String {
     }
 }
 
+/// The longest token stream decompiled (Excel writes at most a few KB).
+const MAX_RGCE: usize = 16 << 10;
+/// The longest formula text produced (Excel's limit is 8,192 characters).
+const MAX_TEXT: usize = 8_192;
+
 /// Decompile `rgce` (with its trailing extra data `extra`, which holds array
 /// constants) to formula text without the leading `=`.
 pub(crate) fn decompile(
@@ -173,10 +178,18 @@ pub(crate) fn decompile(
     base: Base,
     names: &dyn Names,
 ) -> Option<String> {
+    // Excel's own limits are far below these; past them a token stream is
+    // corrupt, and building ever longer strings from it would be quadratic.
+    if rgce.len() > MAX_RGCE {
+        return None;
+    }
     let mut rd = Rd { b: rgce, at: 0 };
     let mut ex = Rd { b: extra, at: 0 };
     let mut st: Vec<String> = Vec::new();
     while rd.at < rgce.len() {
+        if st.last().is_some_and(|t| t.len() > MAX_TEXT) {
+            return None;
+        }
         let ptg = rd.u8()?;
         match ptg {
             // Binary operators.
@@ -388,7 +401,10 @@ pub(crate) fn decompile(
             _ => return None,
         }
     }
-    if st.len() == 1 { st.pop() } else { None }
+    match st.pop() {
+        Some(f) if st.is_empty() && f.len() <= MAX_TEXT => Some(f),
+        _ => None,
+    }
 }
 
 /// The last `n` stack entries, in argument order.
@@ -839,6 +855,24 @@ pub(crate) mod tests {
         f.extend([0, 0, 0, 0]);
         assert_eq!(decompile(Biff::V12, &f, &[], cell, &TableNames), None);
         assert_eq!(decompile(Biff::V8, &f, &[], cell, &TableNames), None);
+    }
+
+    #[test]
+    fn long_or_runaway_streams_give_up_quickly() {
+        // A number wrapped in 16,000 parentheses: text grows past the limit.
+        let mut f = vec![0x1E, 1, 0];
+        f.extend(std::iter::repeat_n(0x15, 16_000));
+        let started = std::time::Instant::now();
+        assert_eq!(d8(&f), None);
+        // Past the stream bound: refused before decompiling.
+        let mut g = vec![0x1E, 1, 0];
+        g.extend(std::iter::repeat_n(0x15, 20_000));
+        assert_eq!(d8(&g), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // A modest nesting still decompiles.
+        let mut h = vec![0x1E, 1, 0];
+        h.extend(std::iter::repeat_n(0x15, 10));
+        assert_eq!(d8(&h).as_deref(), Some("((((((((((1))))))))))"));
     }
 
     #[test]
