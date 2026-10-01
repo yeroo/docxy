@@ -12861,6 +12861,12 @@ mod tests {
             ("SUM(1:2)", "SUM(Sheet2!1:2)"),
             ("A1#", "Sheet2!A1#"),
             ("SUM({1,2})+IF(A1,B1)", "SUM({1,2})+IF(Sheet2!A1,Sheet2!B1)"),
+            // The Un, Call and ArrayLit arms: a cut `=-B1` must not stay `-B1`.
+            ("-B1", "-Sheet2!B1"),
+            ("B1%", "Sheet2!B1%"),
+            ("@A1:A3", "@Sheet2!A1:A3"),
+            ("LAMBDA(x,x+A1)(1)", "LAMBDA(x,x+Sheet2!A1)(1)"),
+            ("{1,A1}", "{1,Sheet2!A1}"),
         ] {
             let out = qualify_sheet_in_formula(src, "Sheet2").unwrap_or_else(|| {
                 panic!("qualify {src}");

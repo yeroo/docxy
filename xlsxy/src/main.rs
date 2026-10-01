@@ -10823,6 +10823,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_formula_cut_from_a_protected_sheet_is_pasted_unqualified() {
+        // The protected source demotes the cut to a copy: the formula is
+        // translated like any copy's, with no source-sheet qualifier.
+        let mut app = cut_formula_cell_app();
+        app.pkg.workbook.sheets[1].set_protected(true);
+        app.goto_sheet(0);
+        app.cur = (0, 5);
+        app.paste();
+        let cell = app.pkg.workbook.sheets[0].cell(0, 5).unwrap();
+        assert_eq!(cell.formula.as_deref(), Some("E1"));
+        assert!(!cell.formula.as_deref().unwrap().contains("Sheet2!"));
+        // The source is left alone.
+        assert_eq!(
+            app.pkg.workbook.sheets[1]
+                .cell(0, 2)
+                .unwrap()
+                .formula
+                .as_deref(),
+            Some("B1")
+        );
+    }
+
     /// One sheet, no OS clipboard, `cells` as `(row, col, number)`.
     fn cut_app(cells: &[(u32, u32, f64)]) -> App {
         let mut app = App::new(new_xlsx(), "t.xlsx");
