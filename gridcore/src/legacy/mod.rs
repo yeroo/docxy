@@ -488,17 +488,7 @@ pub(crate) fn sheet_prefix(first: &str, last: &str) -> String {
     if first == last {
         return format!("{}!", crate::sheet::quote_sheet_name(first));
     }
-    let q1 = crate::sheet::quote_sheet_name(first);
-    let q2 = crate::sheet::quote_sheet_name(last);
-    if q1.starts_with('\'') || q2.starts_with('\'') {
-        format!(
-            "'{}:{}'!",
-            first.replace('\'', "''"),
-            last.replace('\'', "''")
-        )
-    } else {
-        format!("{q1}:{q2}!")
-    }
+    crate::formula::span_prefix(first, last)
 }
 
 /// An RK number (BIFF8 and BIFF12): a 30-bit integer or the top of an

@@ -1376,6 +1376,27 @@ fn sheet_prefix(name: &str) -> String {
     }
 }
 
+/// A 3D span's sheet part as Excel spells it: `Jan:Mar!`, or quoted as one
+/// token, `'Jan 2024:Mar 2024'!`, when either end needs quotes. An end
+/// needs them when either [`sheet_prefix`] or
+/// [`crate::sheet::quote_sheet_name`] would quote it on its own: the first
+/// quotes a `.`, the second a name shaped like a cell (`'Q1:Q3'!`, which bare
+/// reads as a range) and non-ASCII. An apostrophe in a name is doubled.
+pub(crate) fn span_prefix(first: &str, last: &str) -> String {
+    let quoted = |n: &str| {
+        sheet_prefix(n).starts_with('\'') || crate::sheet::quote_sheet_name(n).starts_with('\'')
+    };
+    if quoted(first) || quoted(last) {
+        format!(
+            "'{}:{}'!",
+            first.replace('\'', "''"),
+            last.replace('\'', "''")
+        )
+    } else {
+        format!("{first}:{last}!")
+    }
+}
+
 fn ref_to_string(r: &CellRef) -> String {
     let mut s = String::new();
     if let Some(sheet) = &r.sheet {
@@ -1468,11 +1489,7 @@ impl Printer {
                 s
             }
             Expr::Ref3D { first, last, a, b } => {
-                let f = sheet_prefix(first);
-                let f = f.trim_end_matches('!');
-                let l = sheet_prefix(last);
-                let l = l.trim_end_matches('!');
-                let head = format!("{f}:{l}!");
+                let head = span_prefix(first, last);
                 if a == b {
                     format!("{head}{}", ref_to_string(a))
                 } else {
@@ -12929,8 +12946,46 @@ mod tests {
         // Sheet rename touches matching endpoints.
         assert_eq!(
             rename_sheet_in_formula("SUM(One:Three!A1)", "Three", "Last Q").unwrap(),
-            "SUM(One:'Last Q'!A1)"
+            "SUM('One:Last Q'!A1)"
         );
+    }
+
+    /// The printer spells a 3D span as Excel does: bare when both names
+    /// are, else one quoted token (#876).
+    #[test]
+    fn three_d_spans_print_as_one_quoted_token() {
+        for (src, printed) in [
+            ("SUM(Sheet1:Sheet3!A1)", "SUM(Sheet1:Sheet3!A1)"),
+            ("SUM('Jan 2024:Mar 2024'!A1)", "SUM('Jan 2024:Mar 2024'!A1)"),
+            (
+                "SUM('Jan 2024':'Mar 2024'!A1)",
+                "SUM('Jan 2024:Mar 2024'!A1)",
+            ),
+            ("'My First':'My Last'!$A$1", "'My First:My Last'!$A$1"),
+            // One end needing quotes quotes the whole span.
+            ("SUM(Jan:'Mar 2024'!A1:B2)", "SUM('Jan:Mar 2024'!A1:B2)"),
+            // Cell-shaped names, which bare would read as a range.
+            ("SUM('Q1:Q3'!A1)", "SUM('Q1:Q3'!A1)"),
+            ("SUM(Q1:Q3!A1)", "SUM('Q1:Q3'!A1)"),
+            // A `.` (quoted by the single-sheet printer) and non-ASCII
+            // (quoted in chart refs): either rule quotes the span.
+            ("SUM('Sheet.1:Sheet.3'!A1)", "SUM('Sheet.1:Sheet.3'!A1)"),
+            ("SUM('Données:Mar'!A1)", "SUM('Données:Mar'!A1)"),
+            // An apostrophe is doubled inside the one quoted token.
+            ("SUM('Bob''s:Mar'!A1)", "SUM('Bob''s:Mar'!A1)"),
+        ] {
+            let ast = parse(src).unwrap_or_else(|e| panic!("parse {src}: {e}"));
+            assert_eq!(to_string(&ast), printed, "{src}");
+            assert_eq!(parse(printed).unwrap(), ast, "{printed}");
+            // The save spells it the same way (`@` makes it reprint).
+            let saved = file_formula(&format!("{src}+@B1")).into_owned();
+            assert_eq!(saved, format!("{printed}+_xlfn.SINGLE(B1)"), "{src}");
+        }
+        let names = |src: &str| match parse(src).unwrap() {
+            Expr::Ref3D { first, last, .. } => (first, last),
+            e => panic!("{src}: {e:?}"),
+        };
+        assert_eq!(names("'Bob''s:Mar'!A1"), ("Bob's".into(), "Mar".into()));
     }
 
     /// Excel spells a 3D span whose names need quotes as one quoted token,
@@ -12950,7 +13005,7 @@ mod tests {
         }
         assert_eq!(
             rename_sheet_in_formula("SUM('Jan 2024:Mar 2024'!A1)", "Mar 2024", "March").unwrap(),
-            "SUM('Jan 2024':March!A1)"
+            "SUM('Jan 2024:March'!A1)"
         );
         // An external qualifier with a `:` is one (book-qualified) sheet,
         // as before the 3D spelling was read.
