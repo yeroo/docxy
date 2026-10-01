@@ -128,7 +128,10 @@ pub fn load_xlsx_repair(data: &[u8]) -> Result<(SheetPackage, Repairs), XlsxErro
                     let own = rels_part_name(&name);
                     parts.retain(|(n, _)| *n != own);
                 }
-                styles_emptied |= stub == Stub::Styles;
+                if stub == Stub::Styles {
+                    styles_emptied = true;
+                    strip_runaway_dxf_ids(&mut parts);
+                }
                 let xml = stub_xml(stub, ns, &parts);
                 parts.push((name.clone(), xml.into_bytes()));
                 repairs.emptied.push(name);
@@ -230,27 +233,82 @@ fn stub_xml(stub: Stub, ns: &OoxmlNs, parts: &[(String, Vec<u8>)]) -> String {
     }
 }
 
-/// One more than the highest differential format any part names
-/// (`dxfId`, `headerRowDxfId`, `dataDxfId`, …), so each still resolves to an
-/// (empty) `<dxf/>` once the styles are emptied.
-fn dxf_count_needed(parts: &[(String, Vec<u8>)]) -> usize {
-    let mut need = 0;
-    for (_, bytes) in parts.iter().filter(|(n, _)| n.ends_with(".xml")) {
-        let xml = String::from_utf8_lossy(bytes);
-        let mut rest: &str = &xml;
-        while let Some(i) = rest.find("xfId=\"") {
-            let before = rest.as_bytes()[..i].last().copied();
-            let after = &rest[i + "xfId=\"".len()..];
-            if matches!(before, Some(b'd' | b'D')) {
-                let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
-                if let Ok(id) = digits.parse::<usize>() {
-                    need = need.max(id + 1);
-                }
-            }
-            rest = after;
+/// The most empty differential formats an emptied styles part is given. A
+/// real workbook names a few hundred at most; a `dxfId` past this is crafted
+/// or corrupt, and padding up to it would take memory without bound (#610).
+const MAX_STUB_DXFS: u64 = 65_536;
+
+/// Every differential-format reference in `xml` (`dxfId`, `headerRowDxfId`,
+/// `dataDxfId`, …) with a numeric value: the attribute's span, from the space
+/// before its name to after its closing quote, and the id. An id too long
+/// for a `u64` reads as `u64::MAX`.
+fn dxf_refs(xml: &str) -> Vec<(usize, usize, u64)> {
+    const NEEDLE: &str = "xfId=\"";
+    let bytes = xml.as_bytes();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = xml[from..].find(NEEDLE) {
+        let at = from + i;
+        let value = at + NEEDLE.len();
+        from = value;
+        if !matches!(at.checked_sub(1).map(|p| bytes[p]), Some(b'd' | b'D')) {
+            continue;
         }
+        let digits = bytes[value..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        if digits == 0 || bytes.get(value + digits) != Some(&b'"') {
+            continue;
+        }
+        let id = xml[value..value + digits]
+            .parse::<u64>()
+            .unwrap_or(u64::MAX);
+        let mut start = at;
+        while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b':') {
+            start -= 1;
+        }
+        if start > 0 && bytes[start - 1].is_ascii_whitespace() {
+            start -= 1;
+        }
+        out.push((start, value + digits + 1, id));
     }
-    need
+    out
+}
+
+/// One more than the highest differential format any part names, so each
+/// still resolves to an (empty) `<dxf/>` once the styles are emptied. Run
+/// after [`strip_runaway_dxf_ids`], it is at most [`MAX_STUB_DXFS`].
+fn dxf_count_needed(parts: &[(String, Vec<u8>)]) -> usize {
+    let need = parts
+        .iter()
+        .filter(|(n, _)| n.ends_with(".xml"))
+        .flat_map(|(_, bytes)| dxf_refs(&String::from_utf8_lossy(bytes)))
+        .map(|(_, _, id)| id.saturating_add(1))
+        .max()
+        .unwrap_or(0);
+    need.min(MAX_STUB_DXFS) as usize
+}
+
+/// Remove every differential-format reference at or past [`MAX_STUB_DXFS`],
+/// as the cell styles are reset: the format it named is gone with the styles
+/// either way, and an emptied styles part cannot hold that many. Only a part
+/// that had one is rewritten.
+fn strip_runaway_dxf_ids(parts: &mut [(String, Vec<u8>)]) {
+    for (_, bytes) in parts.iter_mut().filter(|(n, _)| n.ends_with(".xml")) {
+        let mut xml = String::from_utf8_lossy(bytes).into_owned();
+        let runaway: Vec<_> = dxf_refs(&xml)
+            .into_iter()
+            .filter(|&(_, _, id)| id >= MAX_STUB_DXFS)
+            .collect();
+        if runaway.is_empty() {
+            continue;
+        }
+        for (start, end, _) in runaway.into_iter().rev() {
+            xml.replace_range(start..end, "");
+        }
+        *bytes = xml.into_bytes();
+    }
 }
 
 /// Leave `name` out of `parts`, with every relationship that targets it, its

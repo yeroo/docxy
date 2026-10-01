@@ -11,6 +11,21 @@ const R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relations
 /// shared string, cell, row and column styles, a conditional format's
 /// `dxfId`, a theme, and (added through the API) a drawing with a chart.
 fn fixture() -> Vec<u8> {
+    fixture_with_dxf_ids(&["1"])
+}
+
+/// [`fixture`], its sheet's conditional formats naming `dxf_ids`.
+fn fixture_with_dxf_ids(dxf_ids: &[&str]) -> Vec<u8> {
+    let rules: String = dxf_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            format!(
+                "<cfRule type=\"cellIs\" dxfId=\"{id}\" priority=\"{}\" operator=\"greaterThan\"><formula>1</formula></cfRule>",
+                i + 1
+            )
+        })
+        .collect();
     let ct = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/><Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/><Override PartName=\"/xl/worksheets/sheet2.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/><Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/><Override PartName=\"/xl/sharedStrings.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml\"/><Override PartName=\"/xl/theme/theme1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.theme+xml\"/></Types>";
     let root = format!(
         "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"{R}/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>"
@@ -22,7 +37,7 @@ fn fixture() -> Vec<u8> {
         "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"{R}/worksheet\" Target=\"worksheets/sheet1.xml\"/><Relationship Id=\"rId2\" Type=\"{R}/worksheet\" Target=\"worksheets/sheet2.xml\"/><Relationship Id=\"rId3\" Type=\"{R}/styles\" Target=\"styles.xml\"/><Relationship Id=\"rId4\" Type=\"{R}/sharedStrings\" Target=\"sharedStrings.xml\"/><Relationship Id=\"rId5\" Type=\"{R}/theme\" Target=\"theme/theme1.xml\"/></Relationships>"
     );
     let sheet1 = format!(
-        "<?xml version=\"1.0\"?><worksheet xmlns=\"{SML}\" xmlns:r=\"{R}\"><cols><col min=\"1\" max=\"1\" width=\"12\" customWidth=\"1\" style=\"2\"/></cols><sheetData><row r=\"1\" s=\"2\" customFormat=\"1\"><c r=\"A1\" t=\"s\" s=\"1\"><v>0</v></c><c r=\"B1\" s=\"2\"><v>5</v></c></row></sheetData><conditionalFormatting sqref=\"B1\"><cfRule type=\"cellIs\" dxfId=\"1\" priority=\"1\" operator=\"greaterThan\"><formula>1</formula></cfRule></conditionalFormatting></worksheet>"
+        "<?xml version=\"1.0\"?><worksheet xmlns=\"{SML}\" xmlns:r=\"{R}\"><cols><col min=\"1\" max=\"1\" width=\"12\" customWidth=\"1\" style=\"2\"/></cols><sheetData><row r=\"1\" s=\"2\" customFormat=\"1\"><c r=\"A1\" t=\"s\" s=\"1\"><v>0</v></c><c r=\"B1\" s=\"2\"><v>5</v></c></row></sheetData><conditionalFormatting sqref=\"B1\">{rules}</conditionalFormatting></worksheet>"
     );
     let sheet2 = format!(
         "<?xml version=\"1.0\"?><worksheet xmlns=\"{SML}\"><sheetData><row r=\"1\"><c r=\"A1\"><v>7</v></c></row></sheetData></worksheet>"
@@ -253,6 +268,54 @@ fn repair_styles_stubs_and_formats_survive() {
         back.workbook.styles.xf(style).bold,
         "the bold format survives the save"
     );
+}
+
+/// #610 r1: a crafted `dxfId` must not size the emptied styles part: one past
+/// [`MAX_STUB_DXFS`] (and one past `u64`) is removed, the rest keep theirs.
+#[test]
+fn repair_caps_runaway_dxf_ids() {
+    let data = damage(
+        &fixture_with_dxf_ids(&[
+            "1",
+            "100000000000",
+            "18446744073709551615",
+            "99999999999999999999999",
+        ]),
+        "xl/styles.xml",
+    );
+    let (_, repairs, saved) = repair_and_resave(&data);
+    assert_eq!(repairs.emptied, ["xl/styles.xml"]);
+    let text = |n: &str| {
+        String::from_utf8(
+            parts_of(&saved)
+                .into_iter()
+                .find(|(p, _)| p == n)
+                .unwrap()
+                .1,
+        )
+        .unwrap()
+    };
+    let styles = text("xl/styles.xml");
+    assert!(styles.contains("<dxfs count=\"2\">"), "{styles}");
+    let sheet = text("xl/worksheets/sheet1.xml");
+    assert!(sheet.contains("dxfId=\"1\""), "{sheet}");
+    assert_eq!(sheet.matches("dxfId").count(), 1, "{sheet}");
+}
+
+#[test]
+fn dxf_refs_reads_every_kind_and_clamps() {
+    let xml = r#"<a dxfId="3"/><t headerRowDxfId="7" x:dataDxfId="18446744073709551616"/><b xfId="9"/><c dxfId="z"/>"#;
+    let ids: Vec<u64> = dxf_refs(xml).into_iter().map(|(_, _, id)| id).collect();
+    assert_eq!(ids, [3, 7, u64::MAX]);
+    let (start, end, _) = dxf_refs(xml)[1];
+    assert_eq!(&xml[start..end], " headerRowDxfId=\"7\"");
+    let mut parts = vec![("x.xml".to_string(), xml.as_bytes().to_vec())];
+    strip_runaway_dxf_ids(&mut parts);
+    assert_eq!(
+        String::from_utf8(parts[0].1.clone()).unwrap(),
+        r#"<a dxfId="3"/><t headerRowDxfId="7"/><b xfId="9"/><c dxfId="z"/>"#
+    );
+    assert_eq!(dxf_count_needed(&parts), 8);
 }
 
 #[test]
