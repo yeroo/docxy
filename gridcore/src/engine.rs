@@ -212,14 +212,22 @@ impl Engine {
     /// cell; a pasted clone) keeps what the formula was — a loaded
     /// legacy formula stays legacy, a CSE array keeps its `<f>` attributes, a
     /// dynamic array stays one. A restyle is not an edit: it goes through
-    /// [`Engine::set_styles`], which leaves a spill whole.
+    /// [`Engine::set_styles`], which leaves a spill whole. Nor is the same
+    /// text again on a formula the engine can't evaluate ([`Engine::is_frozen`]):
+    /// it would never recompute the cached value, or re-spill the cached
+    /// block, that a re-entry clears, so only its style is taken.
     pub fn set_cell(&mut self, wb: &mut Workbook, key: Key, mut cell: Cell) {
         let (s, r, c) = key;
         // A pasted anchor's extent is its source's, not this cell's:
         // [`Engine::put_cell`] drops it, and evaluation works out the spill
         // afresh.
         let prev = wb.sheets.get(s).and_then(|sh| sh.cell(r, c));
-        match prev.filter(|p| cell.formula.is_some() && p.formula == cell.formula) {
+        let same = prev.filter(|p| cell.formula.is_some() && p.formula == cell.formula);
+        if same.is_some() && self.is_frozen(wb, key) {
+            self.set_styles(wb, s, &[(r, c, cell.style)]);
+            return;
+        }
+        match same {
             // What kind of formula it is comes from the cell's own previous
             // formula alone — not from the incoming cell, which may be a fresh
             // one (Enter) or a clone pasted from another address, or from
@@ -257,6 +265,27 @@ impl Engine {
             None => {}
         }
         self.put_cell(wb, key, cell);
+    }
+
+    /// Apply a group of edits to sheet `s` (a paste, a fill, a replace-all)
+    /// through [`Engine::set_cell`], in order, except that the blanks landing
+    /// in a frozen anchor's block go last. Such a blank is a no-op while the
+    /// block is whole (`put_cell`), but content the group puts into the same
+    /// block breaks it, and then the blank clears its cell like any other:
+    /// applied last, it does so whatever order the group came in.
+    pub fn set_cells(&mut self, wb: &mut Workbook, s: usize, changes: Vec<(u32, u32, Cell)>) {
+        let spills = wb
+            .sheets
+            .get(s)
+            .is_some_and(|sh| sh.cells.values().any(|cl| cl.spill.is_some()));
+        let (later, now): (Vec<_>, Vec<_>) = changes.into_iter().partition(|(r, c, cell)| {
+            spills
+                && cell.is_blank()
+                && self.spill_owner_of(wb, (s, *r, *c)).frozen_ref_covers == Some(true)
+        });
+        for (r, c, cell) in now.into_iter().chain(later) {
+            self.set_cell(wb, (s, r, c), cell);
+        }
     }
 
     /// Restyle cells on sheet `sheet`: `(row, col, style)` sets only each
@@ -340,8 +369,12 @@ impl Engine {
     /// Write a copied `block` onto sheet `s` from `(br, bc)` (a paste), one
     /// cell at a time through the engine. Rows may differ in length.
     ///
-    /// A pasted cell is typed there ([`Engine::set_cell`]), except that the
-    /// block's spilling arrays come out spilling, as in Excel. An *anchor* is
+    /// A pasted cell is typed there ([`Engine::set_cells`]), except that the
+    /// block's spilling arrays come out spilling, as in Excel. A pasted value
+    /// keeps its value metadata (`vm`: a picture in a cell, a rich error), as
+    /// Excel copies it with the cell; save writes it while the value is the
+    /// one it was loaded with. A pasted formula takes this cell's own
+    /// metadata, as a typed one does. An *anchor* is
     /// a formula cell whose spill lies wholly inside the block, wherever it
     /// lands, or (#785) a legacy array block (`t="array"`) pasted back at its
     /// own address with its whole `ref` in the block. Its spilled values in the
@@ -406,6 +439,7 @@ impl Engine {
             .map(|(r, c, cell, _)| (*r, *c, cell))
             .collect();
         let mut members = Vec::new();
+        let mut plain = Vec::new();
         for (dr, row) in block.iter().enumerate() {
             for (dc, cell) in row.iter().enumerate() {
                 let (r, c) = (br + dr as u32, bc + dc as u32);
@@ -414,12 +448,13 @@ impl Engine {
                 }
                 if cell.formula.is_none() && in_extent(&extents, r, c) {
                     members.push((r, c, cell));
-                    self.set_cell(wb, (s, r, c), cell.blank_like());
+                    plain.push((r, c, cell.blank_like()));
                 } else {
-                    self.set_cell(wb, (s, r, c), cell.clone());
+                    plain.push((r, c, cell.clone()));
                 }
             }
         }
+        self.set_cells(wb, s, plain);
         let mut frozen = Vec::new();
         for (r, c, cell, restore) in &anchors {
             let key = (s, *r, *c);
@@ -478,22 +513,18 @@ impl Engine {
     /// undo snapshots through [`crate::sheet::snapshot_cells`]), or they would
     /// block it; a frozen anchor's extent and values are put back by
     /// `refill_frozen`.
+    ///
+    /// A blank landing in a frozen anchor's block keeps the block whole;
+    /// content landing there drops the anchor's extent, the other cached
+    /// cells staying as plain values.
     fn put_cell(&mut self, wb: &mut Workbook, key: Key, mut cell: Cell) {
         cell.spill = None;
         let (s, r, c) = key;
-        let mut owner = wb.sheets.get(s).and_then(|sh| spill_owner(sh, r, c));
-        let owner_frozen = owner.is_some_and(|((ar, ac), _)| self.is_frozen(wb, (s, ar, ac)));
-        // A frozen anchor's extent is never corrected: row/column edits
-        // shift its array `ref` but not its extent, and a sort moves the
-        // anchor (extent and all) but leaves its absolute `ref` as is. Its
-        // block is what a `ref` that starts at the anchor covers; elsewhere
-        // the cell is not part of it and the edit leaves the anchor alone.
-        let frozen_ref_covers = owner.filter(|_| owner_frozen).and_then(|(anchor, _)| {
-            let a = wb.sheets[s].cell(anchor.0, anchor.1)?;
-            let fa = a.f_attrs.as_deref().filter(|fa| is_array_f(fa))?;
-            let own = crate::sheet::ref_starts_at(fa, &crate::sheet::cell_name(anchor.0, anchor.1));
-            Some(own && crate::sheet::ref_covers(fa, r, c))
-        });
+        let SpillOwner {
+            mut owner,
+            frozen: owner_frozen,
+            frozen_ref_covers,
+        } = self.spill_owner_of(wb, key);
         if frozen_ref_covers == Some(false) {
             owner = None;
         }
@@ -548,6 +579,30 @@ impl Engine {
             wb.sheets[s].set_cell(r, c, cell);
         }
         self.recalc_from(wb, &changed);
+    }
+
+    /// The spill anchor whose extent holds `key` (other than `key` itself),
+    /// and what [`Engine::put_cell`] makes of it.
+    fn spill_owner_of(&self, wb: &Workbook, key: Key) -> SpillOwner {
+        let (s, r, c) = key;
+        let owner = wb.sheets.get(s).and_then(|sh| spill_owner(sh, r, c));
+        let frozen = owner.is_some_and(|((ar, ac), _)| self.is_frozen(wb, (s, ar, ac)));
+        // A frozen anchor's extent is never corrected: row/column edits
+        // shift its array `ref` but not its extent, and a sort moves the
+        // anchor (extent and all) but leaves its absolute `ref` as is. Its
+        // block is what a `ref` that starts at the anchor covers; elsewhere
+        // the cell is not part of it and the edit leaves the anchor alone.
+        let frozen_ref_covers = owner.filter(|_| frozen).and_then(|(anchor, _)| {
+            let a = wb.sheets[s].cell(anchor.0, anchor.1)?;
+            let fa = a.f_attrs.as_deref().filter(|fa| is_array_f(fa))?;
+            let own = crate::sheet::ref_starts_at(fa, &crate::sheet::cell_name(anchor.0, anchor.1));
+            Some(own && crate::sheet::ref_covers(fa, r, c))
+        });
+        SpillOwner {
+            owner,
+            frozen,
+            frozen_ref_covers,
+        }
     }
 
     /// Recalculate every formula in the workbook (headless `--recalc`, or
@@ -1030,6 +1085,17 @@ impl Engine {
         }
         changed
     }
+}
+
+/// The spill anchor over a cell ([`Engine::spill_owner_of`]).
+struct SpillOwner {
+    /// The anchor and its extent.
+    owner: Option<((u32, u32), (u32, u32))>,
+    /// The anchor is one the engine can't evaluate ([`Engine::is_frozen`]).
+    frozen: bool,
+    /// For a frozen array anchor, whether its block holds the cell: `Some(false)`
+    /// when its stored `ref` is not its own or leaves the cell out.
+    frozen_ref_covers: Option<bool>,
 }
 
 /// Clear the plain-value cells of a spill (keeping styles) outside the
@@ -3411,5 +3477,126 @@ mod tests {
         let mut eng = eng;
         eng.recalc_all(&mut wb);
         assert!(eng.is_unsupported((0, 0, 1)) && eng.is_frozen(&wb, (0, 0, 1)));
+    }
+
+    /// A1 = 1 and a frozen array anchor E1 `PIVOTBY(A1,4)` (`ref="E1:E3"`)
+    /// whose cached block E1:E3 is 7/8/9, as xlsxy opens it (on cached
+    /// values, nothing evaluated yet).
+    fn frozen_block_wb() -> Workbook {
+        let mut e1 = array_formula("PIVOTBY(A1,4)");
+        e1.f_attrs = Some("t=\"array\" ref=\"E1:E3\"".to_string());
+        e1.value = CellValue::Number(7.0);
+        e1.spill = Some((3, 1));
+        wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("E1", e1),
+            ("E2", Cell::number(8.0)),
+            ("E3", Cell::number(9.0)),
+        ])
+    }
+
+    fn col_e(wb: &Workbook) -> Vec<CellValue> {
+        ["E1", "E2", "E3"].iter().map(|n| value_at(wb, n)).collect()
+    }
+
+    #[test]
+    fn recommitting_a_frozen_formula_keeps_its_cached_values() {
+        // #840 (r3-pre-frozen-anchor-restyle): the same text again on a
+        // formula the engine can't evaluate is no edit. The editor's cell
+        // comes with no value, and a frozen formula never recomputes one:
+        // the anchor, its block and its extent stay; only the style is taken.
+        let n = |v: f64| CellValue::Number(v);
+        for evaluated in [false, true] {
+            let mut wb = frozen_block_wb();
+            let mut eng = Engine::new(&wb);
+            if evaluated {
+                eng.recalc_all(&mut wb);
+            }
+            let before = cell_at(&wb, "E1");
+            let entered = Cell {
+                style: 3,
+                ..Cell::formula("PIVOTBY(A1,4)")
+            };
+            set(&mut eng, &mut wb, "E1", entered);
+            assert_eq!(col_e(&wb), vec![n(7.0), n(8.0), n(9.0)], "{evaluated}");
+            let e1 = cell_at(&wb, "E1");
+            assert_eq!(e1.spill, Some((3, 1)), "{evaluated}");
+            assert_eq!(e1.style, 3, "{evaluated}");
+            assert_eq!(Cell { style: 0, ..e1 }, before, "{evaluated}");
+            assert!(eng.is_frozen(&wb, (0, 0, 4)));
+        }
+        // A frozen scalar keeps its cached value too.
+        let mut b1 = Cell::formula("PIVOTBY(A1,4)");
+        b1.value = n(5.0);
+        let mut wb = wb_one_sheet(&[("A1", Cell::number(1.0)), ("B1", b1)]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "B1", Cell::formula("PIVOTBY(A1,4)"));
+        assert_eq!(value_at(&wb, "B1"), n(5.0));
+    }
+
+    #[test]
+    fn a_new_formula_on_a_frozen_anchor_still_clears_its_block() {
+        // #840 guard: other text is typed, as before; a live anchor
+        // re-entered unchanged re-spills.
+        let mut wb = frozen_block_wb();
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "E1", Cell::formula("PIVOTBY(A1,5)"));
+        assert_eq!(value_at(&wb, "E2"), CellValue::Empty);
+        assert_eq!(value_at(&wb, "E3"), CellValue::Empty);
+        assert_eq!(cell_at(&wb, "E1").spill, None);
+
+        let mut wb = wb_one_sheet(&[]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "C1", Cell::formula("SEQUENCE(3)"));
+        set(&mut eng, &mut wb, "C1", Cell::formula("SEQUENCE(3)"));
+        assert_eq!(value_at(&wb, "C3"), CellValue::Number(3.0));
+        assert_eq!(cell_at(&wb, "C1").spill, Some((3, 1)));
+    }
+
+    #[test]
+    fn a_blank_and_a_value_in_one_frozen_block_are_order_independent() {
+        // #840 (r4-m1): a blank landing in a frozen block is a no-op only
+        // while the block is whole; with a value put into the same block by
+        // the same group, it clears its cell, in either order. Paste [blank;
+        // 5] at E2, and the same group reversed.
+        let n = |v: f64| CellValue::Number(v);
+        let want = vec![n(7.0), CellValue::Empty, n(5.0)];
+        let mut wb = frozen_block_wb();
+        let mut eng = Engine::new(&wb);
+        eng.paste_block(
+            &mut wb,
+            0,
+            (1, 4),
+            &[vec![Cell::default()], vec![Cell::number(5.0)]],
+        );
+        assert_eq!(col_e(&wb), want, "paste");
+        assert_eq!(cell_at(&wb, "E1").spill, None, "paste");
+        for order in [[1u32, 2], [2, 1]] {
+            let mut wb = frozen_block_wb();
+            let mut eng = Engine::new(&wb);
+            let changes = order
+                .iter()
+                .map(|&r| {
+                    let cell = if r == 1 {
+                        Cell::default()
+                    } else {
+                        Cell::number(5.0)
+                    };
+                    (r, 4, cell)
+                })
+                .collect();
+            eng.set_cells(&mut wb, 0, changes);
+            assert_eq!(col_e(&wb), want, "{order:?}");
+            assert_eq!(cell_at(&wb, "E1").spill, None, "{order:?}");
+        }
+        // Blanks alone, or with a value put back as it was, keep the block.
+        let cached = vec![n(7.0), n(8.0), n(9.0)];
+        for third in [Cell::default(), Cell::number(9.0)] {
+            let mut wb = frozen_block_wb();
+            let mut eng = Engine::new(&wb);
+            eng.set_cells(&mut wb, 0, vec![(1, 4, Cell::default()), (2, 4, third)]);
+            assert_eq!(col_e(&wb), cached);
+            assert_eq!(cell_at(&wb, "E1").spill, Some((3, 1)));
+        }
     }
 }
