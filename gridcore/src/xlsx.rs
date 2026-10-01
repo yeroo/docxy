@@ -9894,6 +9894,8 @@ b",
             "LET(max,10,MAX(A1,max))",
             "LET(date,45306,DATE(YEAR(date),1,1))",
             "LAMBDA(text,LEN(TEXT(text,\"0.0\")))(A1)",
+            // A LET name holding a lambda a call returned.
+            "LET(mk,LAMBDA(n,LAMBDA(x,x+n)),inc,mk(A1),inc(5))",
         ];
         let mut typed: Vec<((u32, u32), &str)> = srcs
             .iter()

@@ -1281,34 +1281,38 @@ fn escape_spec(name: &str) -> String {
     out
 }
 
-/// Print a structured reference back to canonical text.
+/// Print a structured reference back to canonical text. `file` spells the
+/// this-row item as a file stores it, `[#This Row],[c]`: the file grammar has
+/// no `@`.
 fn structured_to_string(
     table: &Option<String>,
     item: TableItem,
     col1: &Option<String>,
     col2: &Option<String>,
+    file: bool,
 ) -> String {
     let prefix = table.clone().unwrap_or_default();
-    let body = match (item, col1, col2) {
-        (TableItem::Data, None, _) => String::new(),
-        (TableItem::Data, Some(c), None) => escape_spec(c),
-        (TableItem::Data, Some(a), Some(b)) => {
-            format!("[{}]:[{}]", escape_spec(a), escape_spec(b))
-        }
-        (TableItem::ThisRow, None, _) => "@".to_string(),
-        (TableItem::ThisRow, Some(c), _) => format!("@{}", escape_spec(c)),
-        (TableItem::All, None, _) => "#All".to_string(),
-        (TableItem::Headers, None, _) => "#Headers".to_string(),
-        (TableItem::Totals, None, _) => "#Totals".to_string(),
-        (item, Some(c), _) => {
-            let tag = match item {
-                TableItem::All => "#All",
-                TableItem::Headers => "#Headers",
-                TableItem::Totals => "#Totals",
-                _ => "#Data",
-            };
-            format!("[{tag}],[{}]", escape_spec(c))
-        }
+    // The column part: `[a]` or the span `[a]:[b]`.
+    let cols = col1.as_ref().map(|a| match col2 {
+        Some(b) => format!("[{}]:[{}]", escape_spec(a), escape_spec(b)),
+        None => format!("[{}]", escape_spec(a)),
+    });
+    let tag = match item {
+        TableItem::Data => "#Data",
+        TableItem::All => "#All",
+        TableItem::Headers => "#Headers",
+        TableItem::Totals => "#Totals",
+        TableItem::ThisRow => "#This Row",
+    };
+    let body = match (item, col1, col2, cols) {
+        (TableItem::Data, None, _, _) => String::new(),
+        (TableItem::Data, Some(c), None, _) => escape_spec(c),
+        (TableItem::Data, _, _, Some(span)) => span,
+        (TableItem::ThisRow, None, _, _) if !file => "@".to_string(),
+        (TableItem::ThisRow, Some(c), None, _) if !file => format!("@{}", escape_spec(c)),
+        (_, None, _, _) => tag.to_string(),
+        (_, _, _, Some(cols)) => format!("[{tag}],{cols}"),
+        (_, Some(_), _, None) => unreachable!("cols is set whenever col1 is"),
     };
     format!("{prefix}[{body}]")
 }
@@ -1470,7 +1474,7 @@ impl Printer {
                 item,
                 col1,
                 col2,
-            } => structured_to_string(table, *item, col1, col2),
+            } => structured_to_string(table, *item, col1, col2, self.file),
             Expr::Name(n) => match self.bound(n).filter(|_| self.file) {
                 Some((b, _)) => param_name(b),
                 None => n.clone(),
@@ -1554,12 +1558,24 @@ impl Printer {
             .map(|(s, lambda)| (s.as_str(), *lambda))
     }
 
-    /// Can a LET value bind a lambda? `LAMBDA(…)` itself, or another name
-    /// that may hold one.
+    /// May a LET value bind a lambda? Yes unless it provably can't: a
+    /// literal, a reference, an operator, or a builtin call that never passes
+    /// a lambda through. A call of a bound local, an unbound name (a defined
+    /// name may be a lambda), an immediate call (`LAMBDA(n,LAMBDA(…))(2)`)
+    /// and the choosing functions (`IF(c,LAMBDA(…),LAMBDA(…))`) may.
     fn binds_lambda(&self, value: &Expr) -> bool {
         match value {
-            Expr::Func(n, _) => n.eq_ignore_ascii_case("LAMBDA"),
-            Expr::Name(n) => self.bound(n).is_some_and(|(_, lambda)| lambda),
+            Expr::Name(n) => self.bound(n).is_none_or(|(_, lambda)| lambda),
+            Expr::Call(..) => true,
+            Expr::Func(n, _) => {
+                self.bound(n).is_some()
+                    || [
+                        "LAMBDA", "LET", "IF", "IFS", "CHOOSE", "SWITCH", "IFERROR", "IFNA",
+                        "INDEX",
+                    ]
+                    .iter()
+                    .any(|f| f.eq_ignore_ascii_case(n))
+            }
             _ => false,
         }
     }
@@ -1569,11 +1585,12 @@ impl Printer {
             return format!("{}({})", name, self.list(args));
         }
         // A bound name called as a function (`LET(f,LAMBDA(…),f(2))`) is the
-        // local lambda, as the evaluator's `let_lambda` reads it. A name bound
-        // to anything else is still the builtin when called
-        // (`LET(sum,SUM(A:A),sum/SUM(B:B))`). A LAMBDA parameter may hold
-        // either, so its call is the local one; the evaluator falls back to the
-        // builtin when it holds no lambda. (The parser uppercases a called
+        // local lambda, as the evaluator's `let_lambda` reads it. A LET name
+        // bound to a value that can't be a lambda leaves a call of the same
+        // name to the builtin (`LET(sum,SUM(A:A),sum/SUM(B:B))`, see
+        // `binds_lambda`). Any other binding, LAMBDA parameters included, may
+        // hold a lambda, so its call is the local one; the evaluator falls back
+        // to the builtin when it holds none. (The parser uppercases a called
         // name, so the binding gives the spelling.)
         if let Some((b, true)) = self.bound(name) {
             let head = param_name(b);
@@ -12488,6 +12505,56 @@ mod tests {
     }
 
     #[test]
+    fn structured_spans_with_an_item_keep_both_columns() {
+        for src in [
+            "SUM(Sales[[#Totals],[Qty]:[Price]])",
+            "SUM(Sales[[#All],[Qty]:[Price]])",
+            "SUM(Sales[[#This Row],[Qty]:[Price]])",
+        ] {
+            let ast = parse(src).unwrap();
+            assert_eq!(to_string(&ast), src);
+            assert_eq!(parse(&to_string(&ast)).unwrap(), ast);
+        }
+    }
+
+    #[test]
+    fn file_formula_spells_structured_refs_as_a_file_stores_them() {
+        // The file grammar has no `@`: this-row is `[#This Row]`. Spans keep
+        // their second column. Values are the same either way.
+        let g = sales_grid();
+        let at_row_3 = |src: &str| {
+            let mut ev = Eval::new(&g, 0, (2, 4));
+            ev.eval(&parse(src).unwrap())
+        };
+        for (typed, saved, want) in [
+            (
+                "LET(t,Sales[[#Totals],[Qty]:[Price]],SUM(t))",
+                "_xlfn.LET(_xlpm.t,Sales[[#Totals],[Qty]:[Price]],SUM(_xlpm.t))",
+                17.5,
+            ),
+            (
+                "LET(p,Sales[@Price],p*2)",
+                "_xlfn.LET(_xlpm.p,Sales[[#This Row],[Price]],_xlpm.p*2)",
+                8.0,
+            ),
+            (
+                "LET(r,Sales[[#This Row],[Qty]:[Price]],SUM(r))",
+                "_xlfn.LET(_xlpm.r,Sales[[#This Row],[Qty]:[Price]],SUM(_xlpm.r))",
+                6.0,
+            ),
+            (
+                "LET(r,Sales[@],COUNTA(r))",
+                "_xlfn.LET(_xlpm.r,Sales[#This Row],COUNTA(_xlpm.r))",
+                3.0,
+            ),
+        ] {
+            assert_eq!(file(typed), saved);
+            assert_eq!(at_row_3(typed), Value::Num(want), "{typed}");
+            assert_eq!(at_row_3(saved), Value::Num(want), "{saved}");
+        }
+    }
+
+    #[test]
     fn structured_refs_evaluate() {
         let g = sales_grid();
         assert_eq!(n("SUM(Sales[Qty])", &g), 10.0); // data rows only
@@ -13103,6 +13170,24 @@ mod tests {
             file("LET(sort,A1:A3,SORT(sort))"),
             "_xlfn.LET(_xlpm.sort,A1:A3,_xlfn._xlws.SORT(_xlpm.sort))"
         );
+        // A value that may evaluate to a lambda: a curried call, a defined
+        // name, an immediate call, a choice between lambdas.
+        assert_eq!(
+            file("LET(mk,LAMBDA(n,LAMBDA(x,x+n)),inc,mk(1),inc(5))"),
+            "_xlfn.LET(_xlpm.mk,_xlfn.LAMBDA(_xlpm.n,_xlfn.LAMBDA(_xlpm.x,_xlpm.x+_xlpm.n)),_xlpm.inc,_xlpm.mk(1),_xlpm.inc(5))"
+        );
+        assert_eq!(
+            file("LET(f,MyFn,f(2))"),
+            "_xlfn.LET(_xlpm.f,MyFn,_xlpm.f(2))"
+        );
+        assert_eq!(
+            file("LET(d,LAMBDA(n,LAMBDA(x,x*n))(2),d(5))"),
+            "_xlfn.LET(_xlpm.d,_xlfn.LAMBDA(_xlpm.n,_xlfn.LAMBDA(_xlpm.x,_xlpm.x*_xlpm.n))(2),_xlpm.d(5))"
+        );
+        assert_eq!(
+            file("LET(f,IF(A1,LAMBDA(x,x),LAMBDA(x,-x)),f(2))"),
+            "_xlfn.LET(_xlpm.f,IF(A1,_xlfn.LAMBDA(_xlpm.x,_xlpm.x),_xlfn.LAMBDA(_xlpm.x,-_xlpm.x)),_xlpm.f(2))"
+        );
         // A LAMBDA parameter may hold a lambda, so its call is the local one.
         assert_eq!(
             file("LAMBDA(text,TEXT(text,\"0\"))(A1)"),
@@ -13231,6 +13316,10 @@ mod tests {
             ("LET(date,45306,DATE(YEAR(date),1,1))", 45292.0),
             ("LAMBDA(text,LEN(TEXT(text,\"0.0\")))(5)", 3.0),
             ("LET(f,LAMBDA(x,x*3),g,f,g(2))", 6.0),
+            // Lambdas a LET name gets from a call or a choice.
+            ("LET(mk,LAMBDA(n,LAMBDA(x,x+n)),inc,mk(1),inc(5))", 6.0),
+            ("LET(d,LAMBDA(n,LAMBDA(x,x*n))(2),d(5))", 10.0),
+            ("LET(f,IF(FALSE,LAMBDA(x,x),LAMBDA(x,-x)),f(2))", -2.0),
         ] {
             let saved = file_formula(typed).into_owned();
             // What a reload holds: the file text as the parser reads it.
