@@ -126,7 +126,8 @@ fn attr_values<'a>(xml: &'a str, attr: &str) -> Vec<&'a str> {
 /// and no cell, row or column style or `dxfId` points past the styles.
 fn assert_references_resolve(data: &[u8]) {
     let parts = parts_of(data);
-    let has = |name: &str| parts.iter().any(|(n, _)| n == name);
+    let names: std::collections::HashSet<&str> = parts.iter().map(|(n, _)| n.as_str()).collect();
+    let has = |name: &str| names.contains(name);
     let text = |name: &str| {
         parts
             .iter()
@@ -138,9 +139,8 @@ fn assert_references_resolve(data: &[u8]) {
         if name.ends_with(".rels") {
             let dir = rels_source_dir(name);
             for (id, _, target) in parse_rels(&xml) {
-                if xml.contains(&format!("Id=\"{id}\" TargetMode=\"External\""))
-                    || target.contains("://")
-                {
+                // An external target (a hyperlink) is a URL, not a part.
+                if target.contains("://") {
                     continue;
                 }
                 let part = resolve_relative(dir, &target);
@@ -359,18 +359,161 @@ fn repair_of_a_text_full_of_dxf_ids_is_linear() {
 
 #[test]
 fn strip_removes_many_runaway_ids_in_one_pass() {
+    // 200,000 kept and 200,000 runaway references, about 10 MB: one
+    // `replace_range` per hit, as before, would move the tail each time.
     let mut xml = String::new();
     let mut want = String::new();
-    for i in 0..5_000 {
+    for i in 0..200_000 {
         xml.push_str(&format!(
-            "<cfRule dxfId=\"{i}\"/><cfRule priority=\"1\" dxfId=\"9999999{i}\"/>"
+            "<cfRule dxfId=\"{}\"/><cfRule priority=\"1\" dxfId=\"9999999{i}\"/>",
+            i % 1000
         ));
-        want.push_str(&format!("<cfRule dxfId=\"{i}\"/><cfRule priority=\"1\"/>"));
+        want.push_str(&format!(
+            "<cfRule dxfId=\"{}\"/><cfRule priority=\"1\"/>",
+            i % 1000
+        ));
     }
     let mut parts = vec![("x.xml".to_string(), xml.into_bytes())];
+    let started = std::time::Instant::now();
     strip_runaway_dxf_ids(&mut parts);
+    let took = started.elapsed();
+    assert!(
+        took < std::time::Duration::from_secs(10),
+        "strip took {took:?}"
+    );
     assert_eq!(String::from_utf8(parts[0].1.clone()).unwrap(), want);
-    assert_eq!(dxf_count_needed(&parts), 5_000);
+    assert_eq!(dxf_count_needed(&parts), 1_000);
+}
+
+/// `data` with the `nth` (0-based) central-directory entry named `name`
+/// made unreadable.
+fn damage_nth(data: &[u8], name: &str, nth: usize) -> Vec<u8> {
+    let offset = ZipArchive::open(data)
+        .unwrap()
+        .entries()
+        .iter()
+        .filter(|e| e.name == name)
+        .nth(nth)
+        .unwrap_or_else(|| panic!("no entry {nth} named {name}"))
+        .local_offset as usize;
+    let mut out = data.to_vec();
+    out[offset..offset + 4].copy_from_slice(&[0, 0, 0, 0]);
+    out
+}
+
+/// #610 r4: a container with more unreadable entries than any damaged
+/// workbook has is refused at once, before any mending.
+#[test]
+fn repair_refuses_too_many_damaged_entries() {
+    let mut parts = parts_of(&fixture());
+    for i in 0..=MAX_DAMAGED {
+        parts.push((format!("custom/extra{i}.xml"), b"<x/>".to_vec()));
+    }
+    let mut data = write_zip(&parts);
+    for i in 0..=MAX_DAMAGED {
+        data = damage(&data, &format!("custom/extra{i}.xml"));
+    }
+    let started = std::time::Instant::now();
+    assert_eq!(load_xlsx_repair(&data).unwrap_err(), XlsxError::CorruptPart);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    // At the bound it is still mended: orphans, dropped.
+    let mut parts = parts_of(&fixture());
+    for i in 0..MAX_DAMAGED {
+        parts.push((format!("custom/extra{i}.xml"), b"<x/>".to_vec()));
+    }
+    let mut data = write_zip(&parts);
+    for i in 0..MAX_DAMAGED {
+        data = damage(&data, &format!("custom/extra{i}.xml"));
+    }
+    let (_, repairs, _) = repair_and_resave(&data);
+    assert_eq!(repairs.dropped.len(), MAX_DAMAGED);
+}
+
+/// #610 r4: a part the central directory lists twice is ambiguous when a
+/// copy of it is damaged, and mending it would write two parts under one
+/// name.
+#[test]
+fn repair_refuses_a_damaged_name_listed_twice() {
+    let mut parts = parts_of(&fixture());
+    let styles = parts
+        .iter()
+        .find(|(n, _)| n == "xl/styles.xml")
+        .unwrap()
+        .clone();
+    parts.push(styles);
+    let data = write_zip(&parts);
+    let want = XlsxError::Unrepairable("xl/styles.xml".into());
+    // One copy damaged, the other readable.
+    assert_eq!(
+        load_xlsx_repair(&damage_nth(&data, "xl/styles.xml", 0)).unwrap_err(),
+        want
+    );
+    assert_eq!(
+        load_xlsx_repair(&damage_nth(&data, "xl/styles.xml", 1)).unwrap_err(),
+        want
+    );
+    // Both damaged.
+    let both = damage_nth(&damage_nth(&data, "xl/styles.xml", 0), "xl/styles.xml", 1);
+    assert_eq!(load_xlsx_repair(&both).unwrap_err(), want);
+}
+
+/// #610 r4: dropping a part rewrites each rels part and the content types
+/// once, however many references name it: 100,000 relationships and
+/// overrides naming the damaged theme go, 100,000 others stay.
+#[test]
+fn repair_prunes_many_references_in_one_pass() {
+    const N: usize = 100_000;
+    let mut parts = parts_of(&fixture());
+    let edit = |parts: &mut Vec<(String, Vec<u8>)>, name: &str, close: &str, add: &str| {
+        let p = parts.iter_mut().find(|(n, _)| n == name).unwrap();
+        let xml = String::from_utf8(p.1.clone()).unwrap();
+        p.1 = xml
+            .replacen(close, &format!("{add}{close}"), 1)
+            .into_bytes();
+    };
+    let mut rels = String::new();
+    for i in 0..N {
+        rels.push_str(&format!(
+            "<Relationship Id=\"rKeep{i}\" Type=\"http://example.com/other\" Target=\"sharedStrings.xml\"/><Relationship Id=\"rTheme{i}\" Type=\"{R}/theme\" Target=\"theme/theme1.xml\"/>"
+        ));
+    }
+    edit(
+        &mut parts,
+        "xl/_rels/workbook.xml.rels",
+        "</Relationships>",
+        &rels,
+    );
+    let mut overrides = String::new();
+    for _ in 0..N {
+        overrides.push_str("<Override PartName=\"/xl/theme/theme1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.theme+xml\"/><Override PartName=\"/xl/sharedStrings.xml\" ContentType=\"application/xml\"/>");
+    }
+    edit(&mut parts, "[Content_Types].xml", "</Types>", &overrides);
+    let data = damage(&write_zip(&parts), "xl/theme/theme1.xml");
+
+    let started = std::time::Instant::now();
+    let (_, repairs, saved) = repair_and_resave(&data);
+    let took = started.elapsed();
+    assert!(
+        took < std::time::Duration::from_secs(20),
+        "repair took {took:?}"
+    );
+    assert_eq!(repairs.dropped, ["xl/theme/theme1.xml"]);
+    let text = |n: &str| {
+        String::from_utf8(
+            parts_of(&saved)
+                .into_iter()
+                .find(|(p, _)| p == n)
+                .unwrap()
+                .1,
+        )
+        .unwrap()
+    };
+    let rels = text("xl/_rels/workbook.xml.rels");
+    assert!(!rels.contains("theme1"));
+    assert_eq!(rels.matches("rKeep").count(), N);
+    let ct = text("[Content_Types].xml");
+    assert!(!ct.contains("theme1"));
+    assert!(ct.matches("/xl/sharedStrings.xml").count() >= N);
 }
 
 #[test]

@@ -17,11 +17,13 @@
 //! - anything else fails with [`XlsxError::Unrepairable`] naming the part.
 
 use super::{
-    OoxmlNs, STRICT, SheetPackage, TRANSITIONAL, XlsxError, find_element_by_attr,
-    is_strict_workbook, load_parts, minimal_styles_xml, open_container, override_element,
-    parse_rels, rels_part_name, resolve_relative, workbook_part_name,
+    OoxmlNs, STRICT, SheetPackage, TRANSITIONAL, XlsxError, decode, is_strict_workbook, load_parts,
+    local, minimal_styles_xml, open_container, parse_rels, rels_part_name, resolve_relative,
+    workbook_part_name,
 };
 use crate::sheet::Workbook;
+use opccore::xml::{Event, XmlParser};
+use std::collections::{HashMap, HashSet};
 
 /// What [`load_xlsx_repair`] did to the damaged entries, by part name.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -72,6 +74,22 @@ pub fn load_xlsx_repair(data: &[u8]) -> Result<(SheetPackage, Repairs), XlsxErro
     if damaged.is_empty() {
         return load_parts(parts).map(|pkg| (pkg, repairs));
     }
+    // A damaged file has a handful of unreadable entries; a container with
+    // hundreds is not a workbook worth mending, and each one costs work
+    // below (#610 r4).
+    if damaged.len() > MAX_DAMAGED {
+        return Err(XlsxError::CorruptPart);
+    }
+    // A name the central directory lists twice, one copy of it damaged, is
+    // ambiguous: which copy did the workbook mean? Mending it would also
+    // write two parts under one name.
+    let readable: HashSet<&str> = parts.iter().map(|(n, _)| n.as_str()).collect();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for name in &damaged {
+        if !seen.insert(name) || readable.contains(name.as_str()) {
+            return Err(XlsxError::Unrepairable(name.clone()));
+        }
+    }
 
     if damaged
         .iter()
@@ -94,14 +112,16 @@ pub fn load_xlsx_repair(data: &[u8]) -> Result<(SheetPackage, Repairs), XlsxErro
 
     // Classify everything against the relationships as they were read, so the
     // order of the damaged entries cannot change an answer.
-    let refs = relationships(&parts);
+    let mut types_of: HashMap<String, Vec<String>> = HashMap::new();
+    for rel in relationships(&parts) {
+        types_of.entry(rel.target).or_default().push(rel.ty);
+    }
     let mut fixes: Vec<(String, Fix)> = Vec::new();
     for name in damaged.iter().filter(|n| !n.ends_with(".rels")) {
-        let types: Vec<&str> = refs
-            .iter()
-            .filter(|r| r.target == *name)
-            .map(|r| r.ty.as_str())
-            .collect();
+        let types: Vec<&str> = types_of
+            .get(name)
+            .map(|t| t.iter().map(String::as_str).collect())
+            .unwrap_or_default();
         match classify(&types) {
             Some(fix) => fixes.push((name.clone(), fix)),
             None => return Err(XlsxError::Unrepairable(name.clone())),
@@ -109,37 +129,53 @@ pub fn load_xlsx_repair(data: &[u8]) -> Result<(SheetPackage, Repairs), XlsxErro
     }
     // A damaged rels part can only go with its own part: an emptied
     // worksheet's or a dropped part's. Any other leaves `r:id`s unresolved.
+    let owners_go: HashSet<String> = fixes
+        .iter()
+        .filter(|(_, fix)| matches!(fix, Fix::Drop | Fix::Stub(Stub::Worksheet)))
+        .map(|(part, _)| rels_part_name(part))
+        .collect();
     for name in damaged.iter().filter(|n| n.ends_with(".rels")) {
-        let owner_goes = fixes.iter().any(|(part, fix)| {
-            rels_part_name(part) == *name && matches!(fix, Fix::Drop | Fix::Stub(Stub::Worksheet))
-        });
-        if !owner_goes {
+        if !owners_go.contains(name) {
             return Err(XlsxError::Unrepairable(name.clone()));
         }
     }
 
-    let mut styles_emptied = false;
+    // Everything that goes, in one pass each over the package: the dropped
+    // parts, their rels and an emptied worksheet's rels (every element they
+    // served went with the sheet's XML) leave it, and every relationship and
+    // override naming a dropped part leaves its rels part and the content
+    // types.
+    let dropped: HashSet<&str> = fixes
+        .iter()
+        .filter(|(_, fix)| *fix == Fix::Drop)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let leaving: HashSet<String> = owners_go
+        .into_iter()
+        .chain(dropped.iter().map(|n| n.to_string()))
+        .collect();
+    parts.retain(|(n, _)| !leaving.contains(n));
+    if !dropped.is_empty() {
+        prune_references(&mut parts, &dropped);
+    }
+    let styles_emptied = fixes.iter().any(|(_, fix)| *fix == Fix::Stub(Stub::Styles));
+    // The emptied styles part is made once, after the runaway references are
+    // gone, however many parts a styles relationship names.
+    let styles_xml = styles_emptied.then(|| {
+        strip_runaway_dxf_ids(&mut parts);
+        minimal_styles_xml(ns.sml, dxf_count_needed(&parts))
+    });
     for (name, fix) in fixes {
         match fix {
             Fix::Stub(stub) => {
-                if stub == Stub::Worksheet {
-                    // Every element its rels served is gone with the sheet's
-                    // XML, so they would only name parts nothing uses.
-                    let own = rels_part_name(&name);
-                    parts.retain(|(n, _)| *n != own);
-                }
-                if stub == Stub::Styles {
-                    styles_emptied = true;
-                    strip_runaway_dxf_ids(&mut parts);
-                }
-                let xml = stub_xml(stub, ns, &parts);
+                let xml = match (stub, &styles_xml) {
+                    (Stub::Styles, Some(xml)) => xml.clone(),
+                    _ => stub_xml(stub, ns),
+                };
                 parts.push((name.clone(), xml.into_bytes()));
                 repairs.emptied.push(name);
             }
-            Fix::Drop => {
-                drop_part(&mut parts, &name);
-                repairs.dropped.push(name);
-            }
+            Fix::Drop => repairs.dropped.push(name),
         }
     }
     let mut pkg = load_parts(parts)?;
@@ -148,6 +184,11 @@ pub fn load_xlsx_repair(data: &[u8]) -> Result<(SheetPackage, Repairs), XlsxErro
     }
     Ok((pkg, repairs))
 }
+
+/// The most unreadable entries [`load_xlsx_repair`] mends. A damaged
+/// workbook has a handful; past this the container is refused outright, so
+/// a crafted one cannot make the mending take time without bound.
+const MAX_DAMAGED: usize = 256;
 
 /// One relationship, its type lowercased and its target resolved to a part
 /// name.
@@ -213,8 +254,9 @@ fn classify(types: &[&str]) -> Option<Fix> {
         .then_some(first)
 }
 
-/// The minimal valid part for `stub`.
-fn stub_xml(stub: Stub, ns: &OoxmlNs, parts: &[(String, Vec<u8>)]) -> String {
+/// The minimal valid part for `stub`. An emptied styles part is made by the
+/// caller, once, padded to [`dxf_count_needed`].
+fn stub_xml(stub: Stub, ns: &OoxmlNs) -> String {
     const DECL: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#;
     match stub {
         Stub::Worksheet => format!(
@@ -225,7 +267,7 @@ fn stub_xml(stub: Stub, ns: &OoxmlNs, parts: &[(String, Vec<u8>)]) -> String {
             "{DECL}\n<sst xmlns=\"{}\" count=\"0\" uniqueCount=\"0\"></sst>",
             ns.sml
         ),
-        Stub::Styles => minimal_styles_xml(ns.sml, dxf_count_needed(parts)),
+        Stub::Styles => minimal_styles_xml(ns.sml, 0),
         Stub::Drawing => format!(
             "{DECL}\n<xdr:wsDr xmlns:xdr=\"{}\" xmlns:a=\"{}\"/>",
             ns.xdr, ns.dml
@@ -333,32 +375,82 @@ fn strip_runaway_dxf_ids(parts: &mut [(String, Vec<u8>)]) {
     }
 }
 
-/// Leave `name` out of `parts`, with every relationship that targets it, its
-/// content-type override and its own rels part.
-fn drop_part(parts: &mut Vec<(String, Vec<u8>)>, name: &str) {
-    let own_rels = rels_part_name(name);
-    parts.retain(|(n, _)| n != name && *n != own_rels);
-    for (rels_name, bytes) in parts.iter_mut().filter(|(n, _)| n.ends_with(".rels")) {
-        let dir = rels_source_dir(rels_name).to_string();
-        let mut xml = String::from_utf8_lossy(bytes).into_owned();
-        let mut changed = false;
-        while let Some(el) = find_element_by_attr(&xml, "Relationship", "Target", |t| {
-            resolve_relative(&dir, t) == name
-        }) {
-            xml.replace_range(el.start..el.end, "");
-            changed = true;
-        }
-        if changed {
+/// Remove every relationship whose target is in `dropped` from each rels
+/// part, and every content-type override naming one, each part in one
+/// forward pass ([`without_elements`]). Only a part that named one is
+/// rewritten.
+fn prune_references(parts: &mut [(String, Vec<u8>)], dropped: &HashSet<&str>) {
+    let overrides: HashSet<String> = dropped
+        .iter()
+        .map(|n| format!("/{n}").to_ascii_lowercase())
+        .collect();
+    for (name, bytes) in parts.iter_mut() {
+        let pruned = if name.ends_with(".rels") {
+            let dir = rels_source_dir(name);
+            without_elements(
+                &String::from_utf8_lossy(bytes),
+                "Relationship",
+                "Target",
+                |t| dropped.contains(resolve_relative(dir, t).as_str()),
+            )
+        } else if name == "[Content_Types].xml" {
+            without_elements(
+                &String::from_utf8_lossy(bytes),
+                "Override",
+                "PartName",
+                |v| overrides.contains(&v.to_ascii_lowercase()),
+            )
+        } else {
+            None
+        };
+        if let Some(xml) = pruned {
             *bytes = xml.into_bytes();
         }
     }
-    if let Some((_, bytes)) = parts.iter_mut().find(|(n, _)| n == "[Content_Types].xml") {
-        let mut xml = String::from_utf8_lossy(bytes).into_owned();
-        while let Some(el) = override_element(&xml, &format!("/{name}")) {
-            xml.replace_range(el.start..el.end, "");
+}
+
+/// `xml` without every `<name ...>` element, content and all, whose `attr`
+/// satisfies `want`: found in one forward pass and copied around in
+/// another. `None` when none matched. A truncated element ends the search,
+/// as it does for `find_element_by_attr`.
+fn without_elements(
+    xml: &str,
+    name: &str,
+    attr: &str,
+    want: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let mut p = XmlParser::new(xml);
+    let mut spans = Vec::new();
+    loop {
+        match p.next() {
+            Event::Start if local(p.name()) == name => {
+                let hit = p
+                    .attrs()
+                    .iter()
+                    .any(|a| local(a.name) == attr && want(&decode(a.value)));
+                if hit {
+                    let start = p.start_pos();
+                    if !p.skip_element_complete() {
+                        break;
+                    }
+                    spans.push((start, p.pos()));
+                }
+            }
+            Event::Eof => break,
+            _ => {}
         }
-        *bytes = xml.into_bytes();
     }
+    if spans.is_empty() {
+        return None;
+    }
+    let mut kept = String::with_capacity(xml.len());
+    let mut copied = 0;
+    for (start, end) in spans {
+        kept.push_str(&xml[copied..start]);
+        copied = end;
+    }
+    kept.push_str(&xml[copied..]);
+    Some(kept)
 }
 
 /// After the styles were emptied only `cellXfs` 0 exists, so every cell, row
