@@ -2,7 +2,6 @@ use super::*;
 use crate::print::area::{PrintTitles, set_print_area, set_print_titles};
 use crate::print::setup::PageOrder;
 use crate::sheet::{Cell, ColDef, PageBreak, SheetFormat};
-use std::sync::Arc;
 
 /// A workbook of sheets named S0, S1, … each filled with numbers in
 /// rows × cols from A1.
@@ -192,7 +191,7 @@ fn title_rows_and_columns_repeat_on_pages_that_do_not_show_them() {
     assert!(
         repeating
             .windows(2)
-            .all(|w| Arc::ptr_eq(&w[0].title_rows, &w[1].title_rows))
+            .all(|w| w[0].title_rows.shares(&w[1].title_rows))
     );
     assert_eq!(second.range(), (45, 0, 88, 9));
     // Pages over repeat column A, so they hold 9 columns.
@@ -445,15 +444,87 @@ fn titles_taller_than_a_page_do_not_repeat() {
 }
 
 #[test]
-fn active_sheets_print_each_visible_sheet_once() {
-    // FIX r3 m3.
+fn active_sheets_print_each_named_sheet_once_hidden_or_not() {
+    // FIX r3 m3, as corrected by r4 M2.
     let mut wb = book(&[(10, 1), (10, 1)]);
     let p = paginate(&wb, &Job::new(What::ActiveSheets(vec![0, 0, 1])));
     assert_eq!(
         p.pages.iter().map(|p| p.sheet).collect::<Vec<_>>(),
         vec![0, 1]
     );
+    // A hidden sheet named as active prints; the entire workbook skips it.
     wb.sheets[1].hidden = true;
-    let p = paginate(&wb, &Job::new(What::ActiveSheets(vec![0, 1])));
+    let p = paginate(&wb, &Job::new(What::ActiveSheets(vec![1])));
+    assert_eq!(p.pages.iter().map(|p| p.sheet).collect::<Vec<_>>(), vec![1]);
+    let p = paginate(&wb, &Job::new(What::EntireWorkbook));
     assert_eq!(p.pages.iter().map(|p| p.sheet).collect::<Vec<_>>(), vec![0]);
+}
+
+#[test]
+fn pages_of_a_range_share_their_row_and_column_lists() {
+    // FIX r4 M3: a page holds a span of its range's lines, not a copy.
+    let wb = book(&[(200, 13)]);
+    let p = active(&wb);
+    assert!(p.pages.len() > 2);
+    assert!(p.pages.windows(2).all(|w| w[0].rows.shares(&w[1].rows)));
+    assert!(p.pages.windows(2).all(|w| w[0].cols.shares(&w[1].cols)));
+    assert_eq!(p.pages[1].rows.first(), Some(&45));
+}
+
+/// The largest whole percentage at which `wb`'s first sheet, printed at that
+/// scale without Fit To, is at most `tall` pages tall: the scale Fit To
+/// 0 × `tall` should choose.
+fn best_scale_for_height(wb: &Workbook, tall: u32) -> u32 {
+    (10..=100)
+        .rev()
+        .find(|&pct| {
+            let mut w = wb.clone();
+            let ps = &mut w.sheets[0].page_setup;
+            ps.fit_to_page = false;
+            ps.scale = pct;
+            active(&w).total <= tall
+        })
+        .unwrap_or(10)
+}
+
+#[test]
+fn fit_to_with_titles_finds_the_largest_scale_on_either_side_of_the_title_threshold() {
+    // FIX r4 M1: a plain binary search landed on 52 % with 91 % fitting.
+    let mut wb = book(&[(150, 1)]);
+    set_print_titles(
+        &mut wb,
+        0,
+        PrintTitles {
+            rows: Some((0, 54)),
+            cols: None,
+        },
+    );
+    let ps = &mut wb.sheets[0].page_setup;
+    ps.fit_to_page = true;
+    ps.fit_width = 0;
+    ps.fit_height = 3;
+    let want = best_scale_for_height(&wb, 3);
+    let p = active(&wb);
+    assert_eq!((p.pages[0].scale * 100.0).round() as u32, want);
+    assert!(want > 52, "{want}");
+    assert!(p.total <= 3);
+
+    // Titles 1:70 over A1:A100, Fit 1 × 2.
+    let mut wb = book(&[(100, 1)]);
+    set_print_titles(
+        &mut wb,
+        0,
+        PrintTitles {
+            rows: Some((0, 69)),
+            cols: None,
+        },
+    );
+    let ps = &mut wb.sheets[0].page_setup;
+    ps.fit_to_page = true;
+    ps.fit_width = 1;
+    ps.fit_height = 2;
+    let want = best_scale_for_height(&wb, 2);
+    let p = active(&wb);
+    assert_eq!((p.pages[0].scale * 100.0).round() as u32, want);
+    assert!(p.total <= 2);
 }

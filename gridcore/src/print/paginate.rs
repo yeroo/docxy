@@ -64,15 +64,14 @@ impl Job {
 pub struct Page {
     pub sheet: usize,
     /// The sheet rows printed in the body, in order (hidden rows left out).
-    pub rows: Vec<u32>,
+    pub rows: Lines,
     /// The sheet columns printed in the body, in order.
-    pub cols: Vec<u32>,
+    pub cols: Lines,
     /// Title rows repeated above the body on this page (none where the body
-    /// already shows them). Shared by every page of the sheet that repeats
-    /// them, so a tall title block costs its size once, not once a page.
-    pub title_rows: Arc<[u32]>,
-    /// Title columns repeated left of the body, shared likewise.
-    pub title_cols: Arc<[u32]>,
+    /// already shows them).
+    pub title_rows: Lines,
+    /// Title columns repeated left of the body.
+    pub title_cols: Lines,
     /// The page number printed for `&P`.
     pub number: u32,
     /// The page's position within its sheet's pages, 1-based: what
@@ -80,6 +79,66 @@ pub struct Page {
     pub sheet_page: u32,
     /// The scale the page prints at (1.0 = 100 %).
     pub scale: f64,
+}
+
+/// A run of sheet rows or columns on a page: a span of one list shared by
+/// every page of its range (or, for titles, its sheet), so a job's storage
+/// is its lines once, not once a page. Reads as a `&[u32]`.
+#[derive(Clone, Debug)]
+pub struct Lines {
+    all: Arc<[u32]>,
+    start: usize,
+    end: usize,
+}
+
+impl Lines {
+    /// `all[start..end]`, sharing `all`.
+    fn span(all: &Arc<[u32]>, start: usize, end: usize) -> Lines {
+        Lines {
+            all: Arc::clone(all),
+            start,
+            end,
+        }
+    }
+
+    /// The whole of `all`.
+    fn whole(all: &Arc<[u32]>) -> Lines {
+        Lines::span(all, 0, all.len())
+    }
+
+    /// Do `self` and `other` share one list?
+    pub fn shares(&self, other: &Lines) -> bool {
+        Arc::ptr_eq(&self.all, &other.all)
+    }
+}
+
+impl std::ops::Deref for Lines {
+    type Target = [u32];
+
+    fn deref(&self) -> &[u32] {
+        &self.all[self.start..self.end]
+    }
+}
+
+impl<'a> IntoIterator for &'a Lines {
+    type Item = &'a u32;
+    type IntoIter = std::slice::Iter<'a, u32>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl PartialEq for Lines {
+    fn eq(&self, other: &Lines) -> bool {
+        **self == **other
+    }
+}
+
+impl PartialEq<Vec<u32>> for Lines {
+    fn eq(&self, other: &Vec<u32>) -> bool {
+        **self == **other
+    }
 }
 
 impl Page {
@@ -359,30 +418,63 @@ fn sheet_scale(wb: &Workbook, sheet: usize, ranges: &[Rect]) -> f64 {
         .iter()
         .map(|&(r1, c1, r2, c2)| (axis(s, r1, r2, true), axis(s, c1, c2, false)))
         .collect();
-    let fits = |pct: u32| {
+    let none = Axis {
+        lines: Vec::new(),
+        sizes: Vec::new(),
+    };
+    // Whether each axis's titles repeat at a scale: (rows, cols).
+    let regime = |pct: u32| {
         let k = f64::from(pct) / 100.0;
-        let tr = repeatable(tr.clone(), room_h, k);
-        let tc = repeatable(tc.clone(), room_w, k);
+        (
+            !repeatable(tr.clone(), room_h, k).lines.is_empty(),
+            !repeatable(tc.clone(), room_w, k).lines.is_empty(),
+        )
+    };
+    let fits = |pct: u32, (keep_r, keep_c): (bool, bool)| {
+        let k = f64::from(pct) / 100.0;
+        let (tr, tc) = (
+            if keep_r { &tr } else { &none },
+            if keep_c { &tc } else { &none },
+        );
         axes.iter().all(|(rows, cols)| {
-            (ps.fit_width == 0 || bands(cols, &tc, room_w, k, &cb).len() <= ps.fit_width as usize)
+            (ps.fit_width == 0 || bands(cols, tc, room_w, k, &cb).len() <= ps.fit_width as usize)
                 && (ps.fit_height == 0
-                    || bands(rows, &tr, room_h, k, &rb).len() <= ps.fit_height as usize)
+                    || bands(rows, tr, room_h, k, &rb).len() <= ps.fit_height as usize)
         })
     };
-    // Fewer pages as the scale falls: the largest fitting percentage.
-    let (mut lo, mut hi) = (10u32, 100u32);
-    if fits(hi) {
-        return 1.0;
-    }
-    while lo < hi {
-        let mid = (lo + hi).div_ceil(2);
-        if fits(mid) {
-            lo = mid;
-        } else {
-            hi = mid - 1;
+    // Whether titles repeat changes with the scale ([`repeatable`]), and a
+    // scale just under that threshold leaves the body less room than one
+    // just over it, so fitting isn't monotonic across the whole 10–100.
+    // Within a run of scales where neither axis changes regime it is: fewer
+    // pages as the scale falls. So: the largest fitting percentage of each
+    // run, and the largest of those.
+    let mut best = None;
+    let mut hi = 100u32;
+    while hi >= 10 {
+        let r = regime(hi);
+        let mut lo = hi;
+        while lo > 10 && regime(lo - 1) == r {
+            lo -= 1;
         }
+        // The largest fitting percentage in lo..=hi, if any.
+        if fits(lo, r) {
+            let (mut a, mut b) = (lo, hi);
+            while a < b {
+                let mid = (a + b).div_ceil(2);
+                if fits(mid, r) {
+                    a = mid;
+                } else {
+                    b = mid - 1;
+                }
+            }
+            best = best.max(Some(a));
+        }
+        if lo == 10 {
+            break;
+        }
+        hi = lo - 1;
     }
-    f64::from(lo) / 100.0
+    f64::from(best.unwrap_or(10)) / 100.0
 }
 
 /// The pages of one sheet's ranges, numbered from 1 within the sheet, at
@@ -398,6 +490,11 @@ fn sheet_pages(wb: &Workbook, sheet: usize, ranges: &[Rect], budget: usize) -> (
     let (shared_rows, shared_cols): (Arc<[u32]>, Arc<[u32]>) =
         (tr.lines.as_slice().into(), tc.lines.as_slice().into());
     let none: Arc<[u32]> = Arc::from([]);
+    let (title_rows_all, title_cols_all, no_titles) = (
+        Lines::whole(&shared_rows),
+        Lines::whole(&shared_cols),
+        Lines::whole(&none),
+    );
     let (rb, cb) = obeyed_breaks(s);
     let mut out = Vec::new();
     for &(r1, c1, r2, c2) in ranges {
@@ -428,16 +525,19 @@ fn sheet_pages(wb: &Workbook, sheet: usize, ranges: &[Rect], budget: usize) -> (
                 }
             }
         }
+        // One shared list per axis of the range; each page holds a span.
+        let (row_all, col_all): (Arc<[u32]>, Arc<[u32]>) =
+            (rows.lines.as_slice().into(), cols.lines.as_slice().into());
         for ((ra, rz), (ca, cz)) in grid {
-            let body_rows = rows.lines[ra..rz].to_vec();
-            let body_cols = cols.lines[ca..cz].to_vec();
+            let body_rows = Lines::span(&row_all, ra, rz);
+            let body_cols = Lines::span(&col_all, ca, cz);
             let title_rows = match tr.lines.last() {
-                Some(&end) if body_rows[0] > end => shared_rows.clone(),
-                _ => none.clone(),
+                Some(&end) if body_rows[0] > end => title_rows_all.clone(),
+                _ => no_titles.clone(),
             };
             let title_cols = match tc.lines.last() {
-                Some(&end) if body_cols[0] > end => shared_cols.clone(),
-                _ => none.clone(),
+                Some(&end) if body_cols[0] > end => title_cols_all.clone(),
+                _ => no_titles.clone(),
             };
             out.push(Page {
                 sheet,
@@ -457,11 +557,13 @@ fn sheet_pages(wb: &Workbook, sheet: usize, ranges: &[Rect], budget: usize) -> (
 /// Lay out a print job. No pages means there is nothing to print.
 pub fn paginate(wb: &Workbook, job: &Job) -> Pages {
     let jobs: Vec<(usize, Vec<Rect>)> = match &job.what {
-        // Each sheet once, and no hidden sheet: hidden sheets don't print.
+        // Each sheet once. A sheet named here prints even when hidden (the
+        // editor shows and edits hidden sheets); only the entire workbook
+        // leaves hidden sheets out.
         What::ActiveSheets(list) => {
             let mut seen = std::collections::HashSet::new();
             list.iter()
-                .filter(|&&i| i < wb.sheets.len() && !wb.sheets[i].hidden && seen.insert(i))
+                .filter(|&&i| i < wb.sheets.len() && seen.insert(i))
                 .map(|&i| (i, sheet_ranges(wb, i, job.ignore_print_areas)))
                 .collect()
         }
