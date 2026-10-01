@@ -758,7 +758,7 @@ fn tool_defs() -> Json {
         ),
         tool(
             "xlsxy_page_header",
-            "Read or set one header or footer as its three sections, in the header editor's form: &[Page], &[Pages], &[Date], &[Time], &[Path], &[File], &[Tab] are stored as Excel's &P &N &D &T &Z &F &A, && is a literal ampersand. With none of left/center/right it only reads. A section over 255 characters is refused; &[Picture] only where the section already has a picture. One undo step.",
+            "Read or set one header or footer as its three sections, in the header editor's form: &[Page], &[Pages], &[Date], &[Time], &[Path], &[File], &[Tab] are stored as Excel's &P &N &D &T &Z &F &A, && is a literal ampersand. With none of left/center/right it only reads. A section over 255 characters is refused, as is &L, &C or &R inside a section (a literal ampersand is &&); &[Picture] only where the section already has a picture. One undo step.",
             vec![
                 ("kind", prop("string", "odd (default), even or first.")),
                 ("part", prop("string", "header (default) or footer.")),

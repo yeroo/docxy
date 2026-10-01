@@ -195,8 +195,10 @@ impl Backstage {
         }
     }
 
-    /// Run Export's highlighted row: the quick export, or Change File Type
-    /// (Save As with that type picked).
+    /// Run Export's highlighted row: the quick export
+    /// ([`BackstageEvent::Export`]), one of the host's extra exports
+    /// ([`BackstageEvent::ExportExtra`]), or Change File Type (Save As with
+    /// that type picked).
     fn export_activate(&mut self, host: &dyn BackstageHost) -> BackstageEvent {
         let extra = self.export_extra.len();
         match self.export_sel.checked_sub(1) {

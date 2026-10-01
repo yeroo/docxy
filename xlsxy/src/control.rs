@@ -46,7 +46,7 @@
 //! | `cell.format` | `{range,patch,sheet?}` | `{formatted}` — one undo group; `patch` keys: `numFmt`/`bold`/`italic`/`fontColor`/`fillColor`/`align` (≥1 required) |
 //! | `col.width` | `{col,width,sheet?}` | `{col,width}` — NOT on the undo stack (mirrors the TUI's F7/F8, which mutate directly) |
 //! | `page.setup` | `{sheet?\|sheets?, …fields}` | the sheet's page layout. Settable fields: `margins:{left,right,top,bottom,header,footer}` (inches), `paperSize`, `orientation`, `scale`, `fitToPage`, `fitToWidth`, `fitToHeight` (0 = Automatic), `firstPageNumber` (`null` = Auto), `pageOrder`, `blackAndWhite`, `draft`, `cellComments`, `errors`, `gridLines`, `headings`, `horizontalCentered`, `verticalCentered`, `differentOddEven`, `differentFirst`, `scaleWithDoc`, `alignWithMargins`. Reply-only: `headers:{oddHeader…firstFooter}` (stored codes; set with `page.header`), `printArea` (`print-area.*`), `printTitles:{rows,cols}` (`print-titles.set`), `rowBreaks`, `colBreaks` (`page-break.*`). Any settable field given sets it (+ `changed`): a fit count turns `fitToPage` on and `scale` turns it off unless `fitToPage` is given; scale outside 10–400 is refused. With `sheets`, the first sheet's page setup is then copied to the others (grouped sheets: not print areas, titles or header pictures). One undo step |
-//! | `page.header` | `{sheet?, kind?:odd\|even\|first, part?:header\|footer, left?, center?, right?}` | `{stored, left, center, right, changed}` — sections in the editor's form (`&[Page]`, `&[Pages]`, `&[Date]`, `&[Time]`, `&[Path]`, `&[File]`, `&[Tab]`), stored as Excel's codes; with none of left/center/right it only reads; a section over 255 characters is refused; `&[Picture]` only where the section already has a picture. One undo step |
+//! | `page.header` | `{sheet?, kind?:odd\|even\|first, part?:header\|footer, left?, center?, right?}` | `{stored, left, center, right, changed}` — sections in the editor's form (`&[Page]`, `&[Pages]`, `&[Date]`, `&[Time]`, `&[Path]`, `&[File]`, `&[Tab]`), stored as Excel's codes; with none of left/center/right it only reads; a section over 255 characters is refused; `&[Picture]` only where the section already has a picture; `&L`, `&C` or `&R` inside a section is refused (a literal ampersand is `&&`). One undo step |
 //! | `print-area.set` / `print-area.add` | `{range, sheet?}` | `{printArea, changed}` — `range` is `A1:C10`, `A1:C10,E1:F5`, `A:C` or `1:5`; add appends to the sheet's print area. One undo step |
 //! | `print-area.clear` | `{sheet?}` | `{printArea:null, changed}` |
 //! | `print-titles.set` | `{rows?, cols?, sheet?}` | `{printTitles:{rows,cols}, changed}` — `"1:2"` / `"A:A"`; an absent key keeps that part, `null` or `""` clears it |
@@ -1564,13 +1564,22 @@ fn col_width(app: &mut App, args: &Json) -> Result<Json, String> {
 
 /// The sheets a page-layout verb applies to: `sheets` (indexes or names),
 /// else `sheet`, else the active one.
+/// A sheet named twice (`[0, 0]`, `["Sheet1", "sheet1"]`) is one sheet,
+/// listed once, in its first place.
 fn sheets_arg(app: &App, args: &Json) -> Result<Vec<usize>, String> {
     match args.get("sheets") {
         None | Some(Json::Null) => Ok(vec![sheet_arg(app, args)?]),
-        Some(Json::Arr(items)) if !items.is_empty() => items
-            .iter()
-            .map(|v| sheet_arg(app, &Json::obj(vec![("sheet", v.clone())])))
-            .collect(),
+        Some(Json::Arr(items)) if !items.is_empty() => {
+            let mut seen = std::collections::HashSet::new();
+            let mut out = Vec::new();
+            for v in items {
+                let si = sheet_arg(app, &Json::obj(vec![("sheet", v.clone())]))?;
+                if seen.insert(si) {
+                    out.push(si);
+                }
+            }
+            Ok(out)
+        }
         Some(_) => Err("'sheets' must be a non-empty array of indexes or names".into()),
     }
 }
@@ -1797,11 +1806,8 @@ fn page_setup_json(app: &App, si: usize) -> Json {
 /// (FIL-147): print areas and titles stay each sheet's own, and header
 /// pictures aren't copied.
 fn page_setup(app: &mut App, args: &Json) -> Result<Json, String> {
-    let mut targets = sheets_arg(app, args)?;
-    // A sheet named twice (`[0, 0]`, `["Sheet1", "sheet1"]`) is one sheet:
-    // the first must not be overwritten by its own group copy.
-    let mut seen = std::collections::HashSet::new();
-    targets.retain(|&si| seen.insert(si));
+    // Deduplicated, so the first sheet is never its own group copy's target.
+    let targets = sheets_arg(app, args)?;
     let first = targets[0];
     if !has_page_fields(args) {
         return Ok(page_setup_json(app, first));
@@ -1839,9 +1845,10 @@ fn with_changed(json: Json, changed: bool) -> Json {
 
 /// `page.header`: read one header or footer as its three sections in the
 /// editor's `&[…]` form, or set them. Field codes typed as `&[Page]` are
-/// stored as Excel's `&P`; `&&` stays a literal ampersand. A header picture
-/// (`&[Picture]`) can be kept where the section already shows one, never
-/// added.
+/// stored as Excel's `&P`; `&&` stays a literal ampersand, and `&L`, `&C`
+/// or `&R` inside a section is refused (it would start another section). A
+/// header picture (`&[Picture]`) can be kept where the section already
+/// shows one, never added.
 fn page_header(app: &mut App, args: &Json) -> Result<Json, String> {
     const VERB: &str = "page.header";
     let si = sheet_arg(app, args)?;
@@ -5539,6 +5546,20 @@ mod print_tests {
             obj(vec![target(), ("cell", s("A5"))]),
         );
         call(&mut a, "print.pages", obj(vec![target()]));
+    }
+
+    #[test]
+    fn a_sheet_named_twice_prints_once() {
+        // FIX r3 m3.
+        let mut a = app();
+        fill(&mut a, 10, 2);
+        for sheets in [
+            Json::Arr(vec![n(0.0), n(0.0)]),
+            Json::Arr(vec![s("Sheet1"), s("sheet1")]),
+        ] {
+            let r = call(&mut a, "print.pages", obj(vec![("sheets", sheets.clone())]));
+            assert_eq!(r.get_usize("total"), Some(1), "{sheets:?}");
+        }
     }
 
     #[test]

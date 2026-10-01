@@ -149,17 +149,10 @@ impl Sections {
     /// ampersand is typed `&&` (FIL-136).
     pub fn from_editor(left: &str, center: &str, right: &str) -> Result<Sections, String> {
         for (name, text) in [("left", left), ("center", center), ("right", right)] {
-            let mut chars = text.chars();
-            while let Some(c) = chars.next() {
-                if c != '&' {
-                    continue;
-                }
-                // `&&` is consumed whole, so its second `&` never reads as a code.
-                if let Some(k @ ('L' | 'C' | 'R')) = chars.next() {
-                    return Err(format!(
-                        "the {name} section has \"&{k}\", which starts a section; type a literal ampersand as \"&&\""
-                    ));
-                }
+            if let Some(k) = ['L', 'C', 'R'].into_iter().find(|&k| has_code(text, k)) {
+                return Err(format!(
+                    "the {name} section has \"&{k}\", which starts a section; type a literal ampersand as \"&&\""
+                ));
             }
         }
         let s = Sections {
