@@ -153,9 +153,67 @@ pub fn layout(avail: f32, n: usize, active: usize, first: usize) -> StripLayout 
     }
 }
 
+/// Move the element at `from` to index `to`, remapping `active` so it keeps
+/// naming the same element. A no-op (`from == to`, or either index out of
+/// range) returns false and leaves both untouched.
+pub fn move_index<T>(v: &mut Vec<T>, active: &mut usize, from: usize, to: usize) -> bool {
+    if from == to || from >= v.len() || to >= v.len() {
+        return false;
+    }
+    let item = v.remove(from);
+    v.insert(to, item);
+    *active = if *active == from {
+        to
+    } else if from < *active && *active <= to {
+        *active - 1
+    } else if to <= *active && *active < from {
+        *active + 1
+    } else {
+        *active
+    };
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn move_index_keeps_active_on_the_same_tab() {
+        let titles = |v: &[usize]| v.iter().map(|i| format!("t{i}")).collect::<Vec<_>>();
+        // The active tab itself moves: active follows it to its new index.
+        let (mut v, mut active) = (titles(&[0, 1, 2, 3]), 0);
+        assert!(move_index(&mut v, &mut active, 0, 2));
+        assert_eq!(v, titles(&[1, 2, 0, 3]));
+        assert_eq!(active, 2);
+        // A tab moves right across the active one: active shifts down one.
+        let (mut v, mut active) = (titles(&[0, 1, 2, 3]), 1);
+        assert!(move_index(&mut v, &mut active, 0, 2));
+        assert_eq!(v, titles(&[1, 2, 0, 3]));
+        assert_eq!(active, 0);
+        // A tab moves left across the active one: active shifts up one.
+        let (mut v, mut active) = (titles(&[0, 1, 2, 3]), 1);
+        assert!(move_index(&mut v, &mut active, 3, 0));
+        assert_eq!(v, titles(&[3, 0, 1, 2]));
+        assert_eq!(active, 2);
+        // A move that does not cross the active tab leaves it alone.
+        let (mut v, mut active) = (titles(&[0, 1, 2, 3]), 0);
+        assert!(move_index(&mut v, &mut active, 2, 3));
+        assert_eq!(v, titles(&[0, 1, 3, 2]));
+        assert_eq!(active, 0);
+    }
+
+    #[test]
+    fn move_index_ignores_same_and_out_of_range() {
+        let mut v = vec!["a", "b", "c"];
+        let original = v.clone();
+        for (from, to) in [(1usize, 1usize), (0, 3), (3, 0), (3, 3)] {
+            let mut active = 1usize;
+            assert!(!move_index(&mut v, &mut active, from, to), "{from}->{to}");
+            assert_eq!(v, original);
+            assert_eq!(active, 1);
+        }
+    }
 
     #[test]
     fn tabs_fit_shrink_and_overflow_at_minimum() {
