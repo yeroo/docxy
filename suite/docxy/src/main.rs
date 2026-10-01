@@ -7169,9 +7169,10 @@ fn restore_tab(t: &PersistTab) -> DocTab {
 /// fell back to its file, or to a placeholder, keeps `t.dirty` in some arms
 /// but lost its unsaved content (#632).
 ///
-/// A tab persisted in Protected View stays protected unless `trusted` holds
-/// its file as it is now (#882): restore can take protection away from a file
-/// trusted since, never add it.
+/// A tab persisted in Protected View stays protected unless its file is
+/// still the one it opened (its persisted stamp) and `trusted` holds it
+/// (#882): restore can take protection away from a file trusted since,
+/// never add it.
 fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab, bool) {
     if t.kind == Kind::Project {
         // Every fallback in `restore_project_tab` (sidecar missing or
@@ -7313,11 +7314,14 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 (tab.surface, tab.status) = sheet_from_path_mode(&p, true);
             }
         }
+        // The tab shows its sidecar, the content opened with `t.stamp`, so
+        // protection drops only when the file is still that one and it is
+        // trusted. A tab with no persisted stamp stays protected.
         let protected = t.protected
-            && !tab
-                .path
-                .as_deref()
-                .is_some_and(|p| trusted.is_trusted(p, trusted::Stamp::of(p)));
+            && !tab.path.as_deref().is_some_and(|p| {
+                let now = trusted::Stamp::of(p);
+                t.stamp.is_some() && t.stamp == now && trusted.is_trusted(p, now)
+            });
         tab.access = open_mode::Access {
             read_only: t.read_only,
             protected,

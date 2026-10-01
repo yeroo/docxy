@@ -505,21 +505,54 @@ fn restore_drops_protection_only_for_a_trusted_file() {
     if mark_downloaded(&src).is_none() {
         return;
     }
-    let persisted = |protected: bool| -> PersistTab {
+    let opened = Stamp::of(&src);
+    let persisted = |protected: bool, stamp: Option<Stamp>| -> PersistTab {
         let json = format!(
-            r#"{{"kind":"Xlsx","title":"book.xlsx","path":{},"protected":{protected}}}"#,
-            serde_json::to_string(&src.display().to_string()).unwrap()
+            r#"{{"kind":"Xlsx","title":"book.xlsx","path":{},"protected":{protected},"stamp":{}}}"#,
+            serde_json::to_string(&src.display().to_string()).unwrap(),
+            serde_json::to_string(&stamp).unwrap()
         );
         serde_json::from_str(&json).unwrap()
     };
     let none = TrustStore::default();
     let mut trusted = TrustStore::default();
-    trusted.trust(&src, Stamp::of(&src).unwrap());
+    trusted.trust(&src, opened.unwrap());
     let restore = |t: &PersistTab, s: &TrustStore| crate::restore_tab_sourced(t, s).0;
-    assert!(restore(&persisted(true), &none).access.protected);
-    assert!(!restore(&persisted(true), &trusted).access.protected);
+    assert!(restore(&persisted(true, opened), &none).access.protected);
+    assert!(!restore(&persisted(true, opened), &trusted).access.protected);
+    // No persisted stamp: what the tab shows cannot be matched, so it stays.
+    assert!(restore(&persisted(true, None), &trusted).access.protected);
     // Enable Editing before the restart is kept, and the zone is not re-read.
-    assert!(!restore(&persisted(false), &none).access.protected);
+    assert!(!restore(&persisted(false, opened), &none).access.protected);
+}
+
+/// r4 m5: the tab shows the content it opened with; a file rewritten since
+/// (and trusted as it is now) does not unprotect it.
+#[cfg(windows)]
+#[test]
+fn restore_keeps_protection_when_the_file_changed_since_it_opened() {
+    let dir = Scratch::new();
+    let src = book(&dir, "book.xlsx");
+    if mark_downloaded(&src).is_none() {
+        return;
+    }
+    let opened = Stamp::of(&src).unwrap();
+    let json = format!(
+        r#"{{"kind":"Xlsx","title":"book.xlsx","path":{},"protected":true,"stamp":{}}}"#,
+        serde_json::to_string(&src.display().to_string()).unwrap(),
+        serde_json::to_string(&opened).unwrap()
+    );
+    let t: PersistTab = serde_json::from_str(&json).unwrap();
+    let mut bytes = std::fs::read(&src).unwrap();
+    bytes.push(0);
+    std::fs::write(&src, &bytes).unwrap();
+    let now = Stamp::of(&src).unwrap();
+    assert_ne!(now, opened);
+    let mut trusted = TrustStore::default();
+    trusted.trust(&src, now);
+    let tab = crate::restore_tab_sourced(&t, &trusted).0;
+    assert!(tab.access.protected);
+    assert_eq!(tab.access.stamp, Some(opened));
 }
 
 /// A protected tab's stamp survives the session, so Enable Editing after a
