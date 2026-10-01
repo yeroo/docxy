@@ -2870,6 +2870,9 @@ impl App {
             let xml = model_part_xml(&self.model_rels, &self.model_measures);
             self.pkg.set_part(MODEL_PART, xml.into_bytes());
         }
+        // As Excel does: the file says when it was saved and by whom (its
+        // author and creation time stay as they were).
+        self.pkg.stamp_save(&iso_now(), &comment_author());
         // The file's type follows the path it is written to.
         save_xlsx_for_path(&self.pkg, &self.path)
     }

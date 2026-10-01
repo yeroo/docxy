@@ -62,6 +62,8 @@ pub(crate) fn verb_for(name: &str) -> Option<&'static str> {
         "xlsxy_format" => "cell.format",
         "xlsxy_col_width" => "col.width",
         "xlsxy_pivot_create" => "pivot.create",
+        "xlsxy_properties" => "wb.properties",
+        "xlsxy_set_properties" => "wb.set-properties",
         _ => return None,
     })
 }
@@ -609,6 +611,42 @@ fn tool_defs() -> Json {
             ],
             &["range", "rows", "values"],
         ),
+        tool(
+            "xlsxy_properties",
+            "Read the workbook's document properties (File › Info): title, tags, categories, \
+             subject, comments, company, manager, hyperlinkBase, the read-only author, \
+             lastModifiedBy, created and modified, and custom [{name, type, value}]. An absent \
+             property is null.",
+            vec![target()],
+            &[],
+        ),
+        tool(
+            "xlsxy_set_properties",
+            "Set document properties (File › Info). Only the given keys change; null or \"\" \
+             removes one. Marks the workbook modified when something changed (save to write \
+             it); not on the undo stack. Replies with the properties and `changed`.",
+            vec![
+                ("title", prop("string", "Title (dc:title).")),
+                ("tags", prop("string", "Tags (cp:keywords).")),
+                ("categories", prop("string", "Categories (cp:category).")),
+                ("subject", prop("string", "Subject (dc:subject).")),
+                ("comments", prop("string", "Comments (dc:description).")),
+                ("company", prop("string", "Company.")),
+                ("manager", prop("string", "Manager.")),
+                ("hyperlinkBase", prop("string", "Hyperlink base.")),
+                (
+                    "custom",
+                    prop(
+                        "object",
+                        "Custom properties as {name: value}: a string is text, a number a \
+                         number, a bool yes/no, {\"date\":\"YYYY-MM-DD\"} a date, null removes. \
+                         A name that exists (any case) changes in place.",
+                    ),
+                ),
+                target(),
+            ],
+            &[],
+        ),
     ])
 }
 
@@ -713,12 +751,15 @@ mod tests {
             "xlsxy_col_width",
             // Wave-3: appended last, same relative order everywhere.
             "xlsxy_pivot_create",
+            // #600: document properties.
+            "xlsxy_properties",
+            "xlsxy_set_properties",
         ];
         let save_pos = names.iter().position(|n| *n == "xlsxy_save").unwrap();
         assert_eq!(
             &names[save_pos + 1..],
             &expected_tail,
-            "wave-1/wave-2/wave-3 tools must be appended right after xlsxy_save, in this order"
+            "wave-1/wave-2/wave-3/#600 tools must be appended right after xlsxy_save, in this order"
         );
         for t in tools {
             assert_eq!(
@@ -772,6 +813,8 @@ mod tests {
             required_of("xlsxy_pivot_create"),
             "[\"range\",\"rows\",\"values\"]"
         );
+        assert_eq!(required_of("xlsxy_properties"), "[]");
+        assert_eq!(required_of("xlsxy_set_properties"), "[]");
     }
 
     #[test]
@@ -959,6 +1002,8 @@ mod tests {
         ("xlsxy_format", "cell.format"),
         ("xlsxy_col_width", "col.width"),
         ("xlsxy_pivot_create", "pivot.create"),
+        ("xlsxy_properties", "wb.properties"),
+        ("xlsxy_set_properties", "wb.set-properties"),
     ];
     /// Tools handled specially in `do_tool` (not simple verb forwards), so
     /// `verb_for` deliberately returns `None` for them.
