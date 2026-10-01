@@ -18178,6 +18178,44 @@ mod find_bar_tests {
         );
     }
 
+    /// ` x` over `x [ins x] x`: the first hit mixes an editable space and the
+    /// tracked `x` (read-only, ranged), the second is editable. Stepping both
+    /// ways moves off the mixed match, and Replace on it is a read-only skip
+    /// (r2 M1).
+    #[test]
+    fn stepping_moves_off_a_mixed_read_only_match_211() {
+        let mut ed = tracked_x();
+        let cur = find_step_in(&mut ed, " x", false, None, false, true);
+        let (i, m) = cur.clone().unwrap();
+        assert_eq!(i, 0);
+        assert!(!m.editable && m.start < m.end, "{m:?}");
+        assert!(ed.is_at_found(&m));
+        let next = find_step_in(&mut ed, " x", false, cur.clone(), false, false);
+        assert_eq!(
+            next.as_ref().map(|(i, m)| (*i, m.editable)),
+            Some((1, true))
+        );
+        let back = find_step_in(&mut ed, " x", false, next, false, false);
+        assert_eq!(
+            back.as_ref().map(|(i, _)| *i),
+            Some(0),
+            "wraps to the mixed match"
+        );
+        let prev = find_step_in(&mut ed, " x", false, back.clone(), true, false);
+        assert_eq!(
+            prev.as_ref().map(|(i, _)| *i),
+            Some(1),
+            "Find Previous moves off it"
+        );
+        let on_mixed = find_step_in(&mut ed, " x", false, prev, false, false);
+        assert_eq!(on_mixed.as_ref().map(|(i, _)| *i), Some(0));
+        let before = ed.doc.body.clone();
+        let (done, after) = replace_one_in(&mut ed, " x", false, on_mixed, "Z");
+        assert_eq!(done, ReplaceOne::ReadOnly);
+        assert_eq!(ed.doc.body, before);
+        assert_eq!(after.as_ref().map(|(i, _)| *i), Some(1));
+    }
+
     /// Two hits in one deletion share an editor offset: stepping visits both.
     #[test]
     fn stepping_visits_matches_that_share_an_offset_211() {

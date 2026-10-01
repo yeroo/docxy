@@ -60,6 +60,17 @@ pub fn step_found(len: usize, current: Option<usize>, reverse: bool) -> Option<u
     })
 }
 
+/// Where [`Editor::select_found`] leaves the editor for a match.
+enum FoundSpot {
+    /// The tracked change it is drawn from is selected for review: the caret
+    /// at the change's review start, nothing selected.
+    Review(RevisionTarget, super::Caret),
+    /// A collapsed caret at the match, nothing selected.
+    Caret(super::Caret),
+    /// The match's range is selected.
+    Range,
+}
+
 /// One displayed char and the editor range it lives at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Shown {
@@ -284,22 +295,42 @@ impl Editor {
         find_visible_in_body(&self.doc.body, query, case_sensitive)
     }
 
-    /// Go to a match. An editable match, or a field's result, is selected; a
-    /// match in a tracked change selects that change for review; any other
-    /// read-only match puts the caret where its construct sits.
+    /// Go to a match. A match drawn (partly) from a tracked change selects
+    /// that change for review; any other ranged match (editable text, a
+    /// field's result) is selected; any other collapsed one puts the caret
+    /// where its construct sits.
     pub fn select_found(&mut self, m: &FoundMatch) {
-        if !m.editable
-            && m.revision
-                .is_some_and(|t| self.select_revision(t).is_some())
-        {
-            return;
+        match self.found_spot(m) {
+            FoundSpot::Review(target, _) => {
+                self.select_revision(target);
+            }
+            FoundSpot::Caret(caret) => {
+                self.caret = caret;
+                self.anchor = None;
+                self.last = EditKind::None;
+            }
+            FoundSpot::Range => self.select_match(&m.to_match()),
+        }
+    }
+
+    /// Where [`Editor::select_found`] puts the editor for `m`. Both it and
+    /// [`Editor::is_at_found`] read this, so they cannot disagree.
+    fn found_spot(&self, m: &FoundMatch) -> FoundSpot {
+        if !m.editable {
+            let review = m.revision.and_then(|target| {
+                self.revision_locations()
+                    .into_iter()
+                    .find(|location| location.address.target == target)
+                    .map(|location| FoundSpot::Review(target, location.start))
+            });
+            if let Some(review) = review {
+                return review;
+            }
         }
         if m.start == m.end {
-            self.caret = super::Caret::at(m.path.clone(), m.start);
-            self.anchor = None;
-            self.last = EditKind::None;
+            FoundSpot::Caret(super::Caret::at(m.path.clone(), m.start))
         } else {
-            self.select_match(&m.to_match());
+            FoundSpot::Range
         }
     }
 
@@ -316,24 +347,18 @@ impl Editor {
     }
 
     /// True while the editor is still on `m` as [`Editor::select_found`] left
-    /// it: a ranged match is exactly the selection; a collapsed one has the
-    /// caret where `select_found` put it, with nothing selected. Hosts step
-    /// from their current match only while this holds, and from the caret
-    /// once the user has moved it (a click with the bar open, another tab).
+    /// it: for a match it selected, the selection is exactly `m`; for one it
+    /// went to (a tracked change's review start, or a collapsed match's
+    /// spot), the caret is there with nothing selected. Hosts step from their
+    /// current match only while this holds, and from the caret once the user
+    /// has moved it (a click with the bar open, another tab).
     pub fn is_at_found(&self, m: &FoundMatch) -> bool {
-        if m.start != m.end {
-            return self.selection_is(m);
+        match self.found_spot(m) {
+            FoundSpot::Review(_, caret) | FoundSpot::Caret(caret) => {
+                !self.has_selection() && self.caret == caret
+            }
+            FoundSpot::Range => self.selection_is(m),
         }
-        if self.has_selection() {
-            return false;
-        }
-        let review_start = m.revision.filter(|_| !m.editable).and_then(|target| {
-            self.revision_locations()
-                .into_iter()
-                .find(|location| location.address.target == target)
-                .map(|location| location.start)
-        });
-        self.caret == review_start.unwrap_or_else(|| super::Caret::at(m.path.clone(), m.start))
     }
 
     /// True when the selection is exactly `m`'s range, so Replace may edit it.
@@ -465,6 +490,35 @@ mod tests {
         assert!(ed.is_at_found(&m), "the editor is on the match");
         ed.caret = Caret::at(vec![0], 0);
         assert!(!ed.is_at_found(&m), "until the caret moves");
+    }
+
+    /// A match mixing editable text and a tracked change's text (`colo[ins
+    /// u]r`) is read-only and ranged; going to it selects the change for
+    /// review, and the editor then counts as on it (r2 M1).
+    #[test]
+    fn a_mixed_match_selects_its_change_and_is_at_it_211() {
+        let mut ed = Editor::new(xml_doc(
+            "<w:r><w:t>colo</w:t></w:r>\
+             <w:ins w:id=\"1\" w:author=\"A\"><w:r><w:t>u</w:t></w:r></w:ins>\
+             <w:r><w:t>r</w:t></w:r>",
+        ));
+        let m = ed.find_visible("colour", false).remove(0);
+        assert!(!m.editable && m.revision.is_some());
+        assert_eq!(
+            (m.start, m.end),
+            (0, 5),
+            "ranged: it covers editable chars too"
+        );
+        ed.select_found(&m);
+        assert_eq!(ed.review_target, m.revision);
+        assert!(!ed.has_selection());
+        assert!(ed.is_at_found(&m), "on the match right after going to it");
+        ed.anchor = Some(Caret::at(vec![0], 0));
+        ed.caret = Caret::at(vec![0], 5);
+        assert!(
+            !ed.is_at_found(&m),
+            "selecting its range is not where Find left it"
+        );
     }
 
     const FIELD: &str = "<w:r><w:t>Body</w:t></w:r>\
