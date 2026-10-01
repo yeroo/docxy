@@ -579,7 +579,7 @@ pub fn from_markdown(src: &str) -> Document {
                     break;
                 };
                 i += 1;
-                let mut text = first.to_string();
+                let mut parts = vec![first];
                 // Fold in continuation lines belonging to THIS item.
                 while i < lines.len() {
                     let l = lines[i];
@@ -590,10 +590,10 @@ pub fn from_markdown(src: &str) -> Document {
                     {
                         break;
                     }
-                    push_continuation(&mut text, t);
+                    parts.push(t);
                     i += 1;
                 }
-                body.push(list_para(ilvl, ordered, &text));
+                body.push(list_para(ilvl, ordered, &join_soft_wrapped(&parts)));
             }
             continue;
         }
@@ -604,20 +604,20 @@ pub fn from_markdown(src: &str) -> Document {
             continue;
         }
         // Plain paragraph: gather soft-wrapped lines until a blank or a new block.
-        let mut text = String::new();
+        let mut parts = Vec::new();
         while i < lines.len() {
             let l = lines[i];
             let t = l.trim();
             if t.is_empty() || starts_block(l, lines.get(i + 1).copied()) {
                 break;
             }
-            push_continuation(&mut text, t);
+            parts.push(t);
             i += 1;
         }
         body.push(
             Paragraph {
                 props: ParProps::default(),
-                content: parse_inlines(&text),
+                content: parse_inlines(&join_soft_wrapped(&parts)),
             }
             .into(),
         );
@@ -628,18 +628,82 @@ pub fn from_markdown(src: &str) -> Document {
     Document { body }
 }
 
-/// Join a soft-wrapped continuation line onto `text` with a space. A line
-/// ending in an unescaped `\` (an odd run) is a CommonMark hard break: drop
-/// that backslash and fold the break into the join, as a two-space hard break
-/// already is. An escaped `dir\\` (an even run) keeps both for the inline pass.
-fn push_continuation(text: &mut String, line: &str) {
-    if text.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1 {
-        text.pop();
+/// Join soft-wrapped lines with spaces. A line ending in an unescaped `\` (an
+/// odd run) is a CommonMark hard break: drop that backslash and fold the break
+/// into the join, as a two-space hard break already is. An escaped `dir\\` (an
+/// even run) keeps both for the inline pass, and a `\` inside a code span or
+/// math is content, so it stays.
+fn join_soft_wrapped(lines: &[&str]) -> String {
+    let mut text = String::new();
+    // Char index of each hard-break backslash in `text`.
+    let mut breaks = Vec::new();
+    let mut len = 0;
+    for (n, line) in lines.iter().enumerate() {
+        if !text.is_empty() {
+            text.push(' ');
+            len += 1;
+        }
+        text.push_str(line);
+        len += line.chars().count();
+        let run = line.chars().rev().take_while(|&c| c == '\\').count();
+        if n + 1 < lines.len() && run % 2 == 1 {
+            breaks.push(len - 1);
+        }
     }
-    if !text.is_empty() {
-        text.push(' ');
+    if breaks.is_empty() {
+        return text;
     }
-    text.push_str(line);
+    let chars: Vec<char> = text.chars().collect();
+    let verbatim = verbatim_spans(&chars);
+    let dropped = |k: usize| breaks.contains(&k) && !verbatim.iter().any(|r| r.contains(&k));
+    chars
+        .iter()
+        .enumerate()
+        .filter(|&(k, _)| !dropped(k))
+        .map(|(_, &c)| c)
+        .collect()
+}
+
+/// The char ranges `parse_inlines` copies raw: code span and math contents.
+/// Scans with the same escape, link, code and math rules, in the same order.
+fn verbatim_spans(chars: &[char]) -> Vec<std::ops::Range<usize>> {
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' && chars.get(i + 1).is_some_and(|&n| is_md_escapable(n)) {
+            i += 2;
+            continue;
+        }
+        if c == '[' {
+            if let Some((_, _, adv)) = parse_link(chars, i) {
+                i += adv;
+                continue;
+            }
+        }
+        if c == '`' {
+            let n = chars[i..].iter().take_while(|&&ch| ch == '`').count();
+            if let Some((content_end, close_end)) = find_code_close(chars, i + n, n) {
+                spans.push(i + n..content_end);
+                i = close_end;
+                continue;
+            }
+        }
+        if c == '$' {
+            let n = chars[i..]
+                .iter()
+                .take_while(|&&ch| ch == '$')
+                .count()
+                .min(2);
+            if let Some(close) = find_math_close(chars, i + n, n) {
+                spans.push(i + n..close);
+                i = close + n;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    spans
 }
 
 /// Whether `line` begins a block that should end the current plain paragraph.
@@ -1060,8 +1124,9 @@ fn push_run(out: &mut Vec<Inline>, buf: &mut String, bold: bool, italic: bool, s
 }
 
 /// Whether `\c` is a backslash escape. CommonMark escapes only ASCII
-/// punctuation (`\t` is a literal backslash and `t`). A line-end `\` (hard
-/// break) never reaches the inline pass: `push_continuation` drops it.
+/// punctuation (`\t` is a literal backslash and `t`). A line-end `\` that
+/// joins soft-wrapped paragraph or list lines (a hard break) is dropped by
+/// `join_soft_wrapped`; one ending a block or a blockquote line stays literal.
 fn is_md_escapable(c: char) -> bool {
     c.is_ascii_punctuation()
 }
@@ -1601,6 +1666,37 @@ mod tests {
         // With no following line a trailing `\` is literal (CommonMark).
         let last = from_markdown(concat!("start\n", r"end\"));
         assert_eq!(last.body[0].plain_text(), r"start end\");
+    }
+
+    #[test]
+    fn line_end_backslash_inside_a_code_span_or_math_is_content() {
+        let code_text = |src: &str| {
+            let doc = from_markdown(src);
+            let Block::Paragraph(p) = &doc.body[0] else {
+                panic!("expected a paragraph");
+            };
+            p.content
+                .iter()
+                .find_map(|i| match i {
+                    Inline::Run(r) if r.props.code => Some(r.text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no code run in {:?}", p.content))
+        };
+        // CommonMark spec example: no hard break inside a code span.
+        assert_eq!(code_text(concat!(r"`code\", "\n", "span`")), r"code\ span");
+        assert_eq!(code_text(concat!(r"`a\", "\n", "b`")), r"a\ b");
+        let item = from_markdown(concat!(r"- `a\", "\n", "  b`"));
+        assert!(
+            item.body[0].plain_text().contains(r"a\ b"),
+            "{:?}",
+            item.body[0]
+        );
+        // Inside math the backslash is LaTeX, so it stays in the source.
+        let math = from_markdown(concat!(r"$x\", "\n", "y$ after\\", "\n", "z"));
+        let md = to_markdown(&math);
+        assert!(md.contains(r"x\ y"), "{md}");
+        assert!(md.contains("after z"), "{md}");
     }
 
     #[test]
