@@ -1319,12 +1319,22 @@ fn shift_grid(sheet: &mut Sheet, shift: &EditShift) {
     let cells = std::mem::take(&mut sheet.cells);
     sheet.cells = cells
         .into_iter()
-        .filter_map(|((r, c), cell)| {
+        .filter_map(|((r, c), mut cell)| {
             let key = if shift.rows {
                 point(r, shift).map(|nr| (nr, c))
             } else {
                 point(c, shift).map(|nc| (r, nc))
             };
+            // A spill's extent stretches/clamps on the edited axis like a
+            // merge: the engine takes it as the block it owns, so a stale one
+            // would clear user data moved into it or block its own values.
+            if let (Some(_), Some((h, w))) = (key, cell.spill) {
+                cell.spill = if shift.rows {
+                    span(r, r + h.saturating_sub(1), shift).map(|(lo, hi)| (hi - lo + 1, w))
+                } else {
+                    span(c, c + w.saturating_sub(1), shift).map(|(lo, hi)| (h, hi - lo + 1))
+                };
+            }
             key.map(|k| (k, cell))
         })
         .collect();
@@ -2856,5 +2866,145 @@ mod tests {
         wb.sheets[0].set_cell(1, 0, plain);
         autofill(&mut wb, 0, (1, 0, 1, 0), (1, 1));
         assert!(wb.sheets[0].cell(1, 1).unwrap().meta.is_none());
+    }
+
+    /// Sheet1 with A{top}:A{top+2} = 1..3, a CSE array `A..:A..*2` anchored in
+    /// column D on the same rows, and user data (99) just below the block —
+    /// recalculated, so the anchor carries its real spill extent.
+    fn cse_column_block(top: u32) -> Workbook {
+        let (a, b) = (top + 1, top + 3);
+        let mut w = wb(&[
+            (&format!("A{a}"), Cell::number(1.0)),
+            (&format!("A{}", a + 1), Cell::number(2.0)),
+            (&format!("A{b}"), Cell::number(3.0)),
+            (
+                &format!("D{a}"),
+                with_f_attrs(
+                    &format!("A{a}:A{b}*2"),
+                    &format!(" t=\"array\" ref=\"D{a}:D{b}\""),
+                ),
+            ),
+            (&format!("D{}", b + 1), Cell::number(99.0)),
+        ]);
+        Engine::new(&w).recalc_all(&mut w);
+        assert_eq!(w.sheets[0].cell(top, 3).unwrap().spill, Some((3, 1)));
+        w
+    }
+
+    fn num(w: &Workbook, name: &str) -> CellValue {
+        let (r, c) = parse_cell_name(name).unwrap();
+        w.sheets[0]
+            .cell(r, c)
+            .map_or(CellValue::Empty, |cl| cl.value.clone())
+    }
+
+    #[test]
+    fn deleting_a_row_inside_a_spill_shrinks_it_and_keeps_user_data() {
+        let mut w = cse_column_block(0);
+        delete_rows(&mut w, 0, 1, 1);
+        // Before any recalc: the stored extent already matches the block.
+        assert_eq!(w.sheets[0].cell(0, 3).unwrap().spill, Some((2, 1)));
+        Engine::new(&w).recalc_all(&mut w);
+        assert_eq!(num(&w, "D1"), CellValue::Number(2.0));
+        assert_eq!(num(&w, "D2"), CellValue::Number(6.0));
+        // The user's 99 moved up into the old extent; the rebuild leaves it.
+        assert_eq!(num(&w, "D3"), CellValue::Number(99.0));
+    }
+
+    #[test]
+    fn inserting_a_row_inside_a_spill_grows_it_without_spill_error() {
+        let mut w = cse_column_block(0);
+        insert_rows(&mut w, 0, 1, 1);
+        assert_eq!(w.sheets[0].cell(0, 3).unwrap().spill, Some((4, 1)));
+        Engine::new(&w).recalc_all(&mut w);
+        // Its own moved-down values are still its own: no #SPILL!.
+        let d: Vec<_> = ["D1", "D2", "D3", "D4"]
+            .iter()
+            .map(|n| num(&w, n))
+            .collect();
+        assert_eq!(
+            d,
+            [2.0, 0.0, 4.0, 6.0].map(CellValue::Number).to_vec(),
+            "{d:?}"
+        );
+        assert_eq!(w.sheets[0].cell(0, 3).unwrap().spill, Some((4, 1)));
+        assert_eq!(num(&w, "D5"), CellValue::Number(99.0));
+    }
+
+    #[test]
+    fn deleting_a_column_inside_a_dynamic_array_shrinks_its_spill() {
+        let mut typed = Cell::formula("A1:C1*2");
+        typed.meta = Some(Box::new(crate::sheet::CellMeta {
+            modern: true,
+            ..Default::default()
+        }));
+        let mut w = wb(&[
+            ("A1", Cell::number(1.0)),
+            ("B1", Cell::number(2.0)),
+            ("C1", Cell::number(3.0)),
+            ("A3", typed),
+            ("D3", Cell::number(99.0)),
+        ]);
+        Engine::new(&w).recalc_all(&mut w);
+        assert_eq!(w.sheets[0].cell(2, 0).unwrap().spill, Some((1, 3)));
+        delete_cols(&mut w, 0, 1, 1);
+        assert_eq!(w.sheets[0].cell(2, 0).unwrap().spill, Some((1, 2)));
+        Engine::new(&w).recalc_all(&mut w);
+        assert_eq!(num(&w, "A3"), CellValue::Number(2.0));
+        assert_eq!(num(&w, "B3"), CellValue::Number(6.0));
+        assert_eq!(num(&w, "C3"), CellValue::Number(99.0));
+    }
+
+    #[test]
+    fn an_edit_outside_a_spill_keeps_its_extent() {
+        // Block D2:D4 (anchor at row 1).
+        let spill_at = |w: &Workbook, r: u32, c: u32| w.sheets[0].cell(r, c).unwrap().spill;
+        let mut w = cse_column_block(1);
+        delete_rows(&mut w, 0, 0, 1); // above: the anchor moves to D1
+        assert_eq!(spill_at(&w, 0, 3), Some((3, 1)));
+        let mut w = cse_column_block(1);
+        insert_rows(&mut w, 0, 4, 1); // just past its last row
+        assert_eq!(spill_at(&w, 1, 3), Some((3, 1)));
+        let mut w = cse_column_block(1);
+        insert_cols(&mut w, 0, 0, 1); // left: the anchor moves to E2
+        assert_eq!(spill_at(&w, 1, 4), Some((3, 1)));
+        // A row edit on another sheet never touches this one.
+        let mut w = cse_column_block(1);
+        w.sheets.push(Sheet {
+            name: "Sheet2".to_string(),
+            ..Sheet::default()
+        });
+        delete_rows(&mut w, 1, 2, 1);
+        assert_eq!(spill_at(&w, 1, 3), Some((3, 1)));
+    }
+
+    #[test]
+    fn a_structural_edit_resizes_a_2d_spill_on_its_own_axis_only() {
+        let block = || {
+            let mut cells = Vec::new();
+            for r in 1..=3 {
+                cells.push((format!("A{r}"), Cell::number(f64::from(r))));
+                cells.push((format!("B{r}"), Cell::number(f64::from(r * 10))));
+            }
+            cells.push((
+                "D1".to_string(),
+                with_f_attrs("A1:B3*2", " t=\"array\" ref=\"D1:E3\""),
+            ));
+            let cells: Vec<(&str, Cell)> =
+                cells.iter().map(|(n, c)| (n.as_str(), c.clone())).collect();
+            let mut w = wb(&cells);
+            Engine::new(&w).recalc_all(&mut w);
+            assert_eq!(w.sheets[0].cell(0, 3).unwrap().spill, Some((3, 2)));
+            w
+        };
+        let mut w = block();
+        delete_rows(&mut w, 0, 1, 1); // a row inside: h shrinks, w stays
+        assert_eq!(w.sheets[0].cell(0, 3).unwrap().spill, Some((2, 2)));
+        let mut w = block();
+        delete_cols(&mut w, 0, 4, 1); // column E: w shrinks, h stays
+        assert_eq!(w.sheets[0].cell(0, 3).unwrap().spill, Some((3, 1)));
+        let mut w = block();
+        insert_cols(&mut w, 0, 4, 1); // between D and E: w grows, h stays
+        assert_eq!(w.sheets[0].cell(0, 3).unwrap().spill, Some((3, 3)));
     }
 }
