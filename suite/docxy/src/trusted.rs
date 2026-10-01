@@ -39,7 +39,10 @@ impl Stamp {
     pub(crate) fn of(path: &Path) -> Option<Stamp> {
         let meta = std::fs::metadata(path).ok()?;
         let modified = meta.modified().ok()?;
-        let ns = modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+        let ns = modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
         Some(Stamp {
             len: meta.len(),
             modified_ns: u64::try_from(ns).ok()?,
@@ -212,7 +215,10 @@ mod tests {
         store.trust(&b, stamp(1, 1));
         store.trust(&a, stamp(1, 2));
         assert_eq!(store.len(), 2);
-        assert!(!store.is_trusted(&a, Some(stamp(1, 1))), "the old stamp is gone");
+        assert!(
+            !store.is_trusted(&a, Some(stamp(1, 1))),
+            "the old stamp is gone"
+        );
         assert!(store.is_trusted(&a, Some(stamp(1, 2))));
         assert_eq!(store.records.last().unwrap().path, key(&a));
     }

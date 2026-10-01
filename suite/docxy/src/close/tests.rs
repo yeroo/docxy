@@ -1359,7 +1359,12 @@ fn a_crash_does_not_label_clean_tabs_recovered() {
     let mut tabs = vec![tab(Kind::Docx), tab(Kind::Xlsx)];
     tabs[1].dirty = true;
     write_session(&root.0, &tabs, 0, prefs());
-    let restored = restore_session(&root.session(), true, std::time::SystemTime::now(), &crate::trusted::TrustStore::default());
+    let restored = restore_session(
+        &root.session(),
+        true,
+        std::time::SystemTime::now(),
+        &crate::trusted::TrustStore::default(),
+    );
     assert!(
         !restored[0].status.starts_with("recovered"),
         "{}",
@@ -1393,7 +1398,12 @@ fn autorecover_captures_an_open_header_and_stays_in_header_mode() {
     assert!(autorecover_prepare(&mut tabs));
     assert!(tabs[0].hf_edit.is_some(), "the header editor stays open");
     write_session(&root.0, &tabs, 0, prefs());
-    let restored = restore_session(&root.session(), true, std::time::SystemTime::now(), &crate::trusted::TrustStore::default());
+    let restored = restore_session(
+        &root.session(),
+        true,
+        std::time::SystemTime::now(),
+        &crate::trusted::TrustStore::default(),
+    );
     assert!(part_text(&restored[0], &part).contains("Recovered header"));
     assert_eq!(referenced_hf(&restored[0], true), Some(part));
 }
@@ -1441,7 +1451,12 @@ fn crash_restore(tabs: Vec<PersistTab>) -> Vec<DocTab> {
         tabs,
         ..Session::default()
     };
-    restore_session(&session, true, std::time::SystemTime::now(), &crate::trusted::TrustStore::default())
+    restore_session(
+        &session,
+        true,
+        std::time::SystemTime::now(),
+        &crate::trusted::TrustStore::default(),
+    )
 }
 
 /// Only content that came from a readable sidecar is an AutoRecover copy: a
@@ -1491,7 +1506,12 @@ fn a_crash_still_labels_sheet_and_project_sidecars_it_read() {
         t.dirty = true;
     }
     write_session(&root.0, &tabs, 0, prefs());
-    let restored = restore_session(&root.session(), true, std::time::SystemTime::now(), &crate::trusted::TrustStore::default());
+    let restored = restore_session(
+        &root.session(),
+        true,
+        std::time::SystemTime::now(),
+        &crate::trusted::TrustStore::default(),
+    );
     for t in &restored {
         assert!(t.dirty);
         assert!(t.status.starts_with("recovered"), "{}", t.status);

@@ -4379,7 +4379,10 @@ mod tests {
     fn slash_r_is_a_flag_on_windows_only() {
         for spelling in ["/r", "/R"] {
             assert!(is_read_only_flag(OsStr::new(spelling), true), "{spelling}");
-            assert!(!is_read_only_flag(OsStr::new(spelling), false), "{spelling}");
+            assert!(
+                !is_read_only_flag(OsStr::new(spelling), false),
+                "{spelling}"
+            );
         }
         assert!(is_read_only_flag(OsStr::new(READ_ONLY_FLAG), false));
         for other in ["/ro", "/read-only", "-r", "/x", "--READ-ONLY"] {

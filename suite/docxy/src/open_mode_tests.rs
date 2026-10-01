@@ -570,8 +570,8 @@ fn a_copy_that_cannot_be_written_opens_nothing() {
         OpenMode::Copy,
         &TrustStore::default(),
     )
-        .err()
-        .expect("no tab");
+    .err()
+    .expect("no tab");
     assert!(err.contains("could not copy \"gone.xlsx\""), "{err}");
 }
 
