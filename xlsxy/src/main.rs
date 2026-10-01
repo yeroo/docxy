@@ -1152,7 +1152,11 @@ struct EditState {
     seed: Option<String>,
 }
 
-/// One undoable action: cell states before/after, per address.
+/// New cell contents by (row, col), applied in order.
+type CellChanges = Vec<(u32, u32, Cell)>;
+
+/// One sheet's share of an undoable cell action: cell states before/after,
+/// per address.
 struct UndoGroup {
     sheet: usize,
     changes: Vec<(u32, u32, Option<Cell>, Option<Cell>)>,
@@ -1184,7 +1188,9 @@ struct WbSnapshot {
 }
 
 enum UndoAction {
-    Cells(UndoGroup),
+    /// One undo step; more than one group when it touched several sheets
+    /// (a cut pasted on another sheet). The view follows the last group.
+    Cells(Vec<UndoGroup>),
     Structural {
         before: WbSnapshot,
         after: WbSnapshot,
@@ -1355,11 +1361,13 @@ struct PivotEdit {
     sel: usize,
 }
 
-/// An internal clipboard: a rect of cells plus its source corner so pasted
-/// formulas can shift their relative references (Excel semantics).
+/// An internal clipboard: a rect of cells plus its source sheet and corner so
+/// pasted formulas can shift their relative references (Excel semantics) and
+/// a cut clears the sheet it came from.
 #[derive(Clone)]
 struct ClipData {
     cells: Vec<Vec<Option<Cell>>>,
+    sheet: usize,
     from: (u32, u32),
     cut: bool,
 }
@@ -1720,24 +1728,38 @@ impl App {
     /// engine. This is the shared edit path for keyboard edits (via [`Self::apply`])
     /// and agent control edits (which may target a non-active sheet).
     fn apply_on(&mut self, sheet_idx: usize, changes: Vec<(u32, u32, Cell)>) {
-        if changes.is_empty() {
+        self.apply_groups(vec![(sheet_idx, changes)]);
+    }
+
+    /// Apply per-sheet cell changes, in order, as one undo step: a cut
+    /// pasted on another sheet clears its source and writes its destination
+    /// together, so one undo puts both back.
+    fn apply_groups(&mut self, groups: Vec<(usize, CellChanges)>) {
+        if groups.iter().all(|(_, changes)| changes.is_empty()) {
             return;
         }
         let circles_before = self.engine.circular_refs();
         self.engine.clock = now_serial();
-        let mut group = UndoGroup {
-            sheet: sheet_idx,
-            changes: Vec::with_capacity(changes.len()),
-            styles_only: false,
-        };
-        for (r, c, cell) in changes {
-            let before = self.pkg.workbook.sheets[sheet_idx].cell(r, c).cloned();
-            self.engine
-                .set_cell(&mut self.pkg.workbook, (sheet_idx, r, c), cell.clone());
-            let after = self.pkg.workbook.sheets[sheet_idx].cell(r, c).cloned();
-            group.changes.push((r, c, before, after));
+        let mut undo = Vec::with_capacity(groups.len());
+        for (sheet_idx, changes) in groups {
+            if changes.is_empty() {
+                continue;
+            }
+            let mut group = UndoGroup {
+                sheet: sheet_idx,
+                changes: Vec::with_capacity(changes.len()),
+                styles_only: false,
+            };
+            for (r, c, cell) in changes {
+                let before = self.pkg.workbook.sheets[sheet_idx].cell(r, c).cloned();
+                self.engine
+                    .set_cell(&mut self.pkg.workbook, (sheet_idx, r, c), cell.clone());
+                let after = self.pkg.workbook.sheets[sheet_idx].cell(r, c).cloned();
+                group.changes.push((r, c, before, after));
+            }
+            undo.push(group);
         }
-        self.undo.push(UndoAction::Cells(group));
+        self.undo.push(UndoAction::Cells(undo));
         self.redo.clear();
         self.modified = true;
         self.warn_new_circles(&circles_before);
@@ -1768,11 +1790,11 @@ impl App {
             .zip(before)
             .map(|(&(r, c, _), before)| (r, c, before, sheet.cell(r, c).cloned()))
             .collect();
-        self.undo.push(UndoAction::Cells(UndoGroup {
+        self.undo.push(UndoAction::Cells(vec![UndoGroup {
             sheet: sheet_idx,
             changes,
             styles_only: true,
-        }));
+        }]));
         self.redo.clear();
         self.modified = true;
         self.warn_new_circles(&circles_before);
@@ -2297,24 +2319,22 @@ impl App {
 
     fn undo(&mut self) {
         match self.undo.pop() {
-            Some(UndoAction::Cells(group)) => {
-                self.sheet = group.sheet.min(self.pkg.workbook.sheets.len() - 1);
-                if group.styles_only {
-                    let styles = group_styles(&group, |ch| &ch.2);
-                    self.engine
-                        .set_styles(&mut self.pkg.workbook, group.sheet, &styles);
-                } else {
+            Some(UndoAction::Cells(groups)) => {
+                for group in groups.iter().rev() {
+                    if group.styles_only {
+                        let styles = group_styles(group, |ch| &ch.2);
+                        self.engine
+                            .set_styles(&mut self.pkg.workbook, group.sheet, &styles);
+                        continue;
+                    }
                     for &(r, c, ref before, _) in group.changes.iter().rev() {
                         let cell = before.clone().unwrap_or_default();
                         self.engine
                             .restore_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
                     }
                 }
-                if let Some(&(r, c, _, _)) = group.changes.first() {
-                    self.cur = (r, c);
-                    self.ensure_visible();
-                }
-                self.redo.push(UndoAction::Cells(group));
+                self.show_undo_group(groups.last());
+                self.redo.push(UndoAction::Cells(groups));
                 self.modified = true;
                 self.status = Some("Undid".to_string());
             }
@@ -2327,26 +2347,34 @@ impl App {
         }
     }
 
+    /// Move the view to an undone/redone group: its sheet and first cell.
+    fn show_undo_group(&mut self, group: Option<&UndoGroup>) {
+        let Some(group) = group else { return };
+        self.sheet = group.sheet.min(self.pkg.workbook.sheets.len() - 1);
+        if let Some(&(r, c, _, _)) = group.changes.first() {
+            self.cur = (r, c);
+            self.ensure_visible();
+        }
+    }
+
     fn redo(&mut self) {
         match self.redo.pop() {
-            Some(UndoAction::Cells(group)) => {
-                self.sheet = group.sheet.min(self.pkg.workbook.sheets.len() - 1);
-                if group.styles_only {
-                    let styles = group_styles(&group, |ch| &ch.3);
-                    self.engine
-                        .set_styles(&mut self.pkg.workbook, group.sheet, &styles);
-                } else {
+            Some(UndoAction::Cells(groups)) => {
+                for group in &groups {
+                    if group.styles_only {
+                        let styles = group_styles(group, |ch| &ch.3);
+                        self.engine
+                            .set_styles(&mut self.pkg.workbook, group.sheet, &styles);
+                        continue;
+                    }
                     for &(r, c, _, ref after) in group.changes.iter() {
                         let cell = after.clone().unwrap_or_default();
                         self.engine
                             .restore_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
                     }
                 }
-                if let Some(&(r, c, _, _)) = group.changes.first() {
-                    self.cur = (r, c);
-                    self.ensure_visible();
-                }
-                self.undo.push(UndoAction::Cells(group));
+                self.show_undo_group(groups.last());
+                self.undo.push(UndoAction::Cells(groups));
                 self.modified = true;
                 self.status = Some("Redid".to_string());
             }
@@ -2386,6 +2414,7 @@ impl App {
         }
         self.clip = Some(ClipData {
             cells: rows,
+            sheet: self.sheet,
             from: (r1, c1),
             cut,
         });
@@ -2408,26 +2437,39 @@ impl App {
         let (r0, c0) = self.cur;
         if own {
             if let Some(clip) = self.clip.clone() {
-                let mut changes = Vec::new();
-                if clip.cut {
-                    // A cut clears its source (once).
+                // A cut clears its source (once), on the sheet it came from.
+                // A source sheet that is gone makes it a copy, and so does a
+                // protected one: the clear would edit a locked sheet off-screen.
+                let same_sheet = clip.sheet == self.sheet;
+                let source_locked = clip.cut
+                    && !same_sheet
+                    && self
+                        .pkg
+                        .workbook
+                        .sheets
+                        .get(clip.sheet)
+                        .is_some_and(|s| s.is_protected());
+                let cut = clip.cut && clip.sheet < self.pkg.workbook.sheets.len() && !source_locked;
+                let mut clears = Vec::new();
+                if cut {
                     let (fr, fc) = clip.from;
                     for (dr, row) in clip.cells.iter().enumerate() {
                         for (dc, cell) in row.iter().enumerate() {
-                            if cell.is_some() {
-                                changes.push((fr + dr as u32, fc + dc as u32, Cell::default()));
+                            // A cell pushed off the grid's edge isn't
+                            // written, so its source stays.
+                            let (dr, dc) = (dr as u32, dc as u32);
+                            if cell.is_some() && r0 + dr < MAX_ROWS && c0 + dc < MAX_COLS {
+                                clears.push((fr + dr, fc + dc, Cell::default()));
                             }
                         }
                     }
-                    self.clip = Some(ClipData {
-                        cut: false,
-                        ..clip.clone()
-                    });
                 }
+                self.cancel_cut();
                 let (dr_all, dc_all) = (
                     r0 as i64 - clip.from.0 as i64,
                     c0 as i64 - clip.from.1 as i64,
                 );
+                let mut writes = Vec::new();
                 for (dr, row) in clip.cells.iter().enumerate() {
                     for (dc, cell) in row.iter().enumerate() {
                         let (r, c) = (r0 + dr as u32, c0 + dc as u32);
@@ -2438,7 +2480,7 @@ impl App {
                         // Copies translate relative refs; cuts keep them, and
                         // so does a copy pasted where it came from (translating
                         // reprints the text, even by zero).
-                        if !clip.cut && (dr_all, dc_all) != (0, 0) {
+                        if !cut && (dr_all, dc_all) != (0, 0) {
                             if let Some(f) = &new_cell.formula {
                                 if let Some(t) = translate_formula(f, dr_all, dc_all) {
                                     new_cell.formula = Some(t);
@@ -2447,7 +2489,7 @@ impl App {
                         }
                         // A pasted array anchor covers its own cell, not the
                         // block it was copied from — unless it lands on that
-                        // very block. `changes` isn't applied yet, so this
+                        // very block. `clears` isn't applied yet, so this
                         // reads the cell as it is before a cut's clears.
                         gridcore::sheet::anchor_pasted_array_ref(
                             &mut new_cell,
@@ -2456,12 +2498,23 @@ impl App {
                             c,
                         );
                         // Overwrite position wins over source-clear on overlap.
-                        changes.retain(|&(cr, cc, _)| (cr, cc) != (r, c));
-                        changes.push((r, c, new_cell));
+                        if same_sheet {
+                            clears.retain(|&(cr, cc, _)| (cr, cc) != (r, c));
+                        }
+                        writes.push((r, c, new_cell));
                     }
                 }
-                self.apply(changes);
-                self.status = Some("Pasted".to_string());
+                if same_sheet {
+                    clears.extend(writes);
+                    self.apply(clears);
+                } else {
+                    self.apply_groups(vec![(clip.sheet, clears), (self.sheet, writes)]);
+                }
+                self.status = Some(if source_locked {
+                    "Pasted (source sheet is protected; cut kept as copy)".to_string()
+                } else {
+                    "Pasted".to_string()
+                });
                 return;
             }
         }
@@ -5485,9 +5538,18 @@ impl App {
         }
     }
 
+    /// Make a pending cut a copy: a later paste clears nothing. Removing a
+    /// sheet does this, since it can take or renumber the cut's source sheet.
+    fn cancel_cut(&mut self) {
+        if let Some(clip) = &mut self.clip {
+            clip.cut = false;
+        }
+    }
+
     fn delete_current_sheet(&mut self) {
         let name = self.pkg.workbook.sheets[self.sheet].name.clone();
         if self.pkg.remove_sheet(self.sheet) {
+            self.cancel_cut();
             self.sheet = self.sheet.min(self.pkg.workbook.sheets.len() - 1);
             self.cur = (0, 0);
             self.top = 0;
@@ -9869,6 +9931,193 @@ mod tests {
             app.status.as_deref(),
             Some(format!("Pasted. {CIRCULAR_WARNING}").as_str())
         );
+    }
+
+    /// Sheet1 A1:B2 = 10..13 and Sheet2 A1:B2 = 1..4, with a cut of
+    /// Sheet2!A1:B2 pending and Sheet1 active (#782).
+    fn cross_sheet_cut_app() -> App {
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Sheet2");
+        let mut app = App::new(pkg, "t.xlsx");
+        app.os_clip = None;
+        let block = |base: f64| {
+            vec![
+                (0, 0, parse_input(&base.to_string())),
+                (0, 1, parse_input(&(base + 1.0).to_string())),
+                (1, 0, parse_input(&(base + 2.0).to_string())),
+                (1, 1, parse_input(&(base + 3.0).to_string())),
+            ]
+        };
+        app.apply_on(0, block(10.0));
+        app.apply_on(1, block(1.0));
+        app.goto_sheet(1);
+        app.anchor = Some((0, 0));
+        app.cur = (1, 1);
+        app.copy(true);
+        app.goto_sheet(0);
+        app
+    }
+
+    fn block_values(app: &App, sheet: usize, r: u32, c: u32) -> Vec<Option<f64>> {
+        let num = |r, c| match app.pkg.workbook.sheets[sheet].cell(r, c).map(|x| &x.value) {
+            Some(CellValue::Number(n)) => Some(*n),
+            _ => None,
+        };
+        vec![num(r, c), num(r, c + 1), num(r + 1, c), num(r + 1, c + 1)]
+    }
+
+    #[test]
+    fn a_cut_pasted_on_another_sheet_clears_its_source_sheet() {
+        // #782: the clears land on the sheet the cut came from, not on the
+        // paste sheet at the same coordinates.
+        let mut app = cross_sheet_cut_app();
+        app.cur = (0, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 0, 5), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 1, 0, 0), vec![None; 4]);
+        assert_eq!(block_values(&app, 0, 0, 0), some([10.0, 11.0, 12.0, 13.0]));
+    }
+
+    #[test]
+    fn undo_of_a_cross_sheet_cut_paste_restores_both_sheets_in_one_step() {
+        let mut app = cross_sheet_cut_app();
+        let depth = app.undo.len();
+        app.cur = (0, 5);
+        app.paste();
+        assert_eq!(app.undo.len(), depth + 1);
+        app.goto_sheet(1);
+        app.undo();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 1, 0, 0), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 0, 0, 5), vec![None; 4]);
+        assert_eq!(block_values(&app, 0, 0, 0), some([10.0, 11.0, 12.0, 13.0]));
+        assert_eq!(app.redo.len(), 1);
+        // The view follows the paste, as after any other undo.
+        assert_eq!((app.sheet, app.cur), (0, (0, 5)));
+        app.goto_sheet(1);
+        app.redo();
+        assert_eq!(block_values(&app, 0, 0, 5), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 1, 0, 0), vec![None; 4]);
+        assert_eq!(block_values(&app, 0, 0, 0), some([10.0, 11.0, 12.0, 13.0]));
+        assert_eq!((app.sheet, app.cur), (0, (0, 5)));
+    }
+
+    #[test]
+    fn a_second_paste_of_a_cross_sheet_cut_is_a_copy() {
+        let mut app = cross_sheet_cut_app();
+        app.cur = (0, 5);
+        app.paste();
+        // Refill the source; the second paste must leave it alone.
+        app.apply_on(1, vec![(0, 0, parse_input("7"))]);
+        app.cur = (5, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 5, 5), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 1, 0, 0)[0], Some(7.0));
+        assert_eq!(block_values(&app, 0, 0, 0), some([10.0, 11.0, 12.0, 13.0]));
+    }
+
+    #[test]
+    fn a_cut_from_a_deleted_sheet_pastes_as_a_copy() {
+        // Deleting a sheet cancels the pending cut: its recorded source
+        // sheet may be gone or renumbered.
+        let mut app = cross_sheet_cut_app();
+        app.goto_sheet(1);
+        app.delete_current_sheet();
+        assert_eq!(app.pkg.workbook.sheets.len(), 1);
+        app.cur = (0, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 0, 5), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 0, 0, 0), some([10.0, 11.0, 12.0, 13.0]));
+    }
+
+    #[test]
+    fn a_cut_whose_sheet_is_deleted_spares_the_sheet_that_takes_its_index() {
+        // Deleting Sheet1 under a pending cut of Sheet1!A1:B2 makes Sheet2
+        // index 0; the paste must not clear Sheet2!A1:B2 as the cut source.
+        let mut app = cross_sheet_cut_app();
+        app.anchor = Some((0, 0));
+        app.cur = (1, 1);
+        app.copy(true);
+        app.delete_current_sheet();
+        assert_eq!(app.pkg.workbook.sheets[0].name, "Sheet2");
+        app.cur = (0, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 0, 0), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 0, 0, 5), some([10.0, 11.0, 12.0, 13.0]));
+    }
+
+    #[test]
+    fn a_cut_pasted_at_the_grid_edge_keeps_the_cells_it_cannot_write() {
+        // Cut A1:B1 pasted at XFD1: A1 moves to XFD1, B1 would land past
+        // the last column, so it is neither written nor cleared.
+        let mut app = cross_sheet_cut_app();
+        app.anchor = Some((0, 0));
+        app.cur = (0, 1);
+        app.copy(true);
+        app.anchor = None;
+        app.cur = (0, MAX_COLS - 1);
+        app.paste();
+        let num = |c| match app.pkg.workbook.sheets[0].cell(0, c).map(|x| &x.value) {
+            Some(CellValue::Number(n)) => Some(*n),
+            _ => None,
+        };
+        assert_eq!(num(MAX_COLS - 1), Some(10.0));
+        assert_eq!(num(0), None);
+        assert_eq!(num(1), Some(11.0));
+    }
+
+    #[test]
+    fn a_cut_from_a_protected_sheet_pastes_elsewhere_as_a_copy() {
+        // Clearing the source would edit a protected sheet off-screen.
+        let mut app = cross_sheet_cut_app();
+        app.pkg.workbook.sheets[1].set_protected(true);
+        app.cur = (0, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 0, 5), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 1, 0, 0), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Pasted (source sheet is protected; cut kept as copy)")
+        );
+    }
+
+    #[test]
+    fn a_cut_whose_source_sheet_is_out_of_range_pastes_as_a_copy() {
+        let mut app = cross_sheet_cut_app();
+        if let Some(clip) = &mut app.clip {
+            clip.sheet = 99;
+        }
+        app.cur = (0, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 0, 5), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 0, 0, 0), some([10.0, 11.0, 12.0, 13.0]));
+        assert_eq!(block_values(&app, 1, 0, 0), some([1.0, 2.0, 3.0, 4.0]));
+    }
+
+    #[test]
+    fn a_same_sheet_cut_paste_is_one_undo_step() {
+        // The same-sheet move keeps today's single group: one undo
+        // restores both the source and the destination.
+        let mut app = cross_sheet_cut_app();
+        app.anchor = Some((0, 0));
+        app.cur = (1, 1);
+        app.copy(true);
+        app.anchor = None;
+        app.cur = (1, 1); // overlaps the source at B2
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 1, 1), some([10.0, 11.0, 12.0, 13.0]));
+        assert_eq!(block_values(&app, 0, 0, 0)[..3], [None, None, None]);
+        app.undo();
+        assert_eq!(block_values(&app, 0, 0, 0), some([10.0, 11.0, 12.0, 13.0]));
+        assert_eq!(block_values(&app, 0, 1, 2)[0], None);
+        assert_eq!(block_values(&app, 1, 0, 0), some([1.0, 2.0, 3.0, 4.0]));
     }
 
     #[test]

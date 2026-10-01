@@ -1166,6 +1166,8 @@ fn sheet_remove(app: &mut App, args: &Json) -> Result<Json, String> {
     if !app.pkg.remove_sheet(si) {
         return Err("cannot remove the last sheet".into());
     }
+    // A pending cut's source sheet may be gone or renumbered.
+    app.cancel_cut();
     // Indices above the removed sheet shift down by one; an unaffected
     // sheet below it keeps its index untouched. Only reset the viewport
     // when the ACTIVE sheet itself is the one that just disappeared —
@@ -2764,6 +2766,45 @@ mod tests {
         dispatch(&mut a, "sheet.add", &Json::Null).unwrap();
         a.undo();
         assert_eq!(a.status.as_deref(), Some("Nothing to undo"));
+    }
+
+    #[test]
+    fn sheet_remove_of_a_lower_sheet_makes_a_pending_cut_a_copy() {
+        // #782: removing a sheet below the cut's source renumbers it; the
+        // pending cut must not then clear the sheet that took its index.
+        let mut a = app();
+        for name in ["Second", "Third"] {
+            dispatch(
+                &mut a,
+                "sheet.add",
+                &Json::obj(vec![("name", Json::Str(name.into()))]),
+            )
+            .unwrap();
+        }
+        let set_on = |a: &mut App, s: usize, text: &str| {
+            a.apply_on(s, vec![(0, 0, gridcore::edit::parse_input(text))]);
+        };
+        set_on(&mut a, 1, "2");
+        set_on(&mut a, 2, "3");
+        a.goto_sheet(1);
+        a.cur = (0, 0);
+        a.copy(true);
+        dispatch(
+            &mut a,
+            "sheet.remove",
+            &Json::obj(vec![("sheet", Json::Num(0.0))]),
+        )
+        .unwrap();
+        // Second is now sheet 0 and Third sheet 1: the cut's recorded index
+        // is in range but names Third.
+        a.goto_sheet(0);
+        a.cur = (0, 5);
+        a.paste();
+        let text =
+            |a: &App, s: usize, r, c| a.pkg.workbook.sheets[s].cell(r, c).map(|x| x.value.clone());
+        assert_eq!(text(&a, 0, 0, 0), Some(CellValue::Number(2.0)));
+        assert_eq!(text(&a, 1, 0, 0), Some(CellValue::Number(3.0)));
+        assert_eq!(text(&a, 0, 0, 5), Some(CellValue::Number(2.0)));
     }
 
     #[test]
