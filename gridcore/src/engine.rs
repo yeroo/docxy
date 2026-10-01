@@ -206,7 +206,18 @@ impl Engine {
             }
             None if cell.formula.is_some() => {
                 cell.f_attrs = None;
-                cell.meta.get_or_insert_default().modern = true;
+                // One that could return an array is a dynamic array from the
+                // start, even while its result is one value (FILTER with no
+                // match yet): it saves with a `cm`, or it would reopen as a
+                // legacy formula. Evaluation marks the ones this misses.
+                let may_array = cell
+                    .formula
+                    .as_deref()
+                    .and_then(|f| formula::parse(f).ok())
+                    .is_some_and(|ast| formula::may_return_array(&ast));
+                let m = cell.meta.get_or_insert_default();
+                m.modern = true;
+                m.dynamic |= may_array;
             }
             None => {}
         }
@@ -2464,8 +2475,9 @@ mod tests {
 
     #[test]
     fn typed_scalar_formula_stays_modern_after_rebuild() {
-        // A typed FILTER that matches nothing yet (#CALC!) is not an array,
-        // but it is ours: after a rebuild it still spills once rows match.
+        // A typed FILTER that matches nothing yet (#CALC!) is ours: after a
+        // rebuild it still spills once rows match. It could return an array,
+        // so it is a dynamic array from the start (#777).
         let mut wb = wb_one_sheet(&[
             ("A1", Cell::number(1.0)),
             ("A2", Cell::number(2.0)),
@@ -2475,7 +2487,7 @@ mod tests {
         eng.set_cell(&mut wb, (0, 0, 2), Cell::formula("FILTER(A1:A3,A1:A3>5)"));
         let c1 = wb.sheets[0].cell(0, 2).unwrap();
         assert_eq!(c1.value, CellValue::Error("#CALC!".into()));
-        assert!(c1.is_modern() && !c1.is_dynamic());
+        assert!(c1.is_modern() && c1.is_dynamic());
         let mut eng = Engine::new(&wb);
         eng.recalc_all(&mut wb);
         for (r, v) in [6.0, 7.0, 8.0].into_iter().enumerate() {
@@ -2642,5 +2654,52 @@ mod tests {
         assert_eq!(value_at(&wb, "C2"), CellValue::Empty);
         set(&mut eng, &mut wb, "C3", Cell::default());
         assert_eq!(value_at(&wb, "C3"), CellValue::Number(3.0));
+    }
+
+    #[test]
+    fn typed_maybe_array_formulas_are_dynamic() {
+        // #777: a typed formula that could return an array is a dynamic array
+        // even when its result is one value; scalar ones are not.
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("A2", Cell::number(2.0)),
+            ("A3", Cell::number(3.0)),
+            ("B1", Cell::text("A2")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        let cases = [
+            (
+                "D1",
+                "FILTER(A1:A3,A1:A3>5)",
+                true,
+                CellValue::Error("#CALC!".into()),
+            ),
+            ("D2", "INDIRECT(B1)", true, CellValue::Number(2.0)),
+            (
+                "D3",
+                "IFERROR(FILTER(A1:A3,A1:A3>5),\"\")",
+                true,
+                CellValue::Text(String::new()),
+            ),
+            ("D4", "A1+1", false, CellValue::Number(2.0)),
+            ("D5", "SUM(A1:A3)", false, CellValue::Number(6.0)),
+            (
+                "D6",
+                "ROWS(FILTER(A1:A3,A1:A3>1))",
+                false,
+                CellValue::Number(2.0),
+            ),
+            ("D7", "@INDIRECT(B1)", false, CellValue::Number(2.0)),
+        ];
+        for (name, src, _, _) in &cases {
+            set(&mut eng, &mut wb, name, Cell::formula(src));
+        }
+        for (name, src, dynamic, want) in &cases {
+            let (r, c) = crate::sheet::parse_cell_name(name).unwrap();
+            let cell = wb.sheets[0].cell(r, c).unwrap();
+            assert_eq!(&cell.value, want, "{src}");
+            assert!(cell.is_modern(), "{src}");
+            assert_eq!(cell.is_dynamic(), *dynamic, "{src}");
+        }
     }
 }

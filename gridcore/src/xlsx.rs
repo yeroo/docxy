@@ -10203,6 +10203,40 @@ b",
     }
 
     #[test]
+    fn typed_maybe_array_formulas_save_as_dynamic_arrays() {
+        // #777: a typed formula that could return an array saves as one even
+        // if it never evaluated array-shaped — FILTER with no match yet
+        // (#CALC!), INDIRECT/INDEX naming one cell — so neither Excel nor
+        // xlsxy reopens it as a legacy implicit-intersection formula.
+        let srcs = [
+            "FILTER(A1:A3,A1:A3>5)",
+            "INDIRECT(B1)",
+            "IFERROR(FILTER(A1:A3,A1:A3>5),\"\")",
+            "INDEX(A1:A3,2)",
+        ];
+        let mut typed: Vec<((u32, u32), &str)> = srcs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| ((i as u32, 2), *s))
+            .collect();
+        typed.insert(0, ((0, 1), "\"A2\""));
+        let (pkg, _) = typed_book(&typed);
+        let (re, ws) = resaved(&pkg);
+        for (i, src) in srcs.iter().enumerate() {
+            let f = format!(
+                r#" cm="1"><f t="array" ref="C{n}">{}</f>"#,
+                esc_text(&file_formula(src)),
+                n = i + 1
+            );
+            let c = saved_cell(&ws, &format!("C{}", i + 1));
+            assert!(c.contains(&f), "{f} in {c}");
+            let cell = re.workbook.sheets[0].cell(i as u32, 2).unwrap();
+            assert!(cell.is_array_formula() && cell.has_cm(), "{src}");
+        }
+        assert!(re.part("xl/metadata.xml").is_some());
+    }
+
+    #[test]
     fn typed_blocked_spill_saves_with_cm() {
         // #724 AC2: an anchor whose spill is blocked shows #SPILL! but is
         // still a dynamic array.
@@ -10231,7 +10265,6 @@ b",
             "A1",
             "A1*A2",
             "XLOOKUP(2,A1:A3,A1:A3)",
-            "INDEX(A1:A3,2)",
             "IF(A1>1,1,2)",
             // One-cell ranges from functions are single values too.
             "OFFSET(A1,0,0)+1",
