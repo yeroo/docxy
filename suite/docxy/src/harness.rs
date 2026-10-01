@@ -4720,7 +4720,12 @@ mod tests {
     fn repair_status_is_not_a_load_failure() {
         let dir = crate::open_mode_tests::Scratch::new();
         let src = crate::open_mode_tests::damaged_book(&dir, "book.xlsx");
-        let tab = crate::tab_from_path_mode(&src, crate::open_mode::OpenMode::Repair).unwrap();
+        let tab = crate::tab_from_path_mode(
+            &src,
+            crate::open_mode::OpenMode::Repair,
+            &crate::trusted::TrustStore::default(),
+        )
+        .unwrap();
         assert!(
             tab.status.contains("emptied xl/styles.xml"),
             "{}",

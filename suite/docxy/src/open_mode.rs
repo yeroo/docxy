@@ -42,6 +42,7 @@ impl OpenMode {
             read_only: self == Self::ReadOnly,
             repaired: self == Self::Repair,
             protected: false,
+            stamp: None,
         }
     }
 }
@@ -57,6 +58,9 @@ pub(crate) struct Access {
     /// Opened with Open and Repair: Save goes to Save As, which may pick the
     /// source.
     pub(crate) repaired: bool,
+    /// A protected tab's file as it was when opened (#882): what Enable
+    /// Editing trusts, so a file replaced since is not trusted with it.
+    pub(crate) stamp: Option<crate::trusted::Stamp>,
 }
 
 impl Access {

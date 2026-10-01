@@ -303,3 +303,67 @@ fn a_downloaded_workbook_opens_protected_until_enable_editing() {
     );
     let _ = ok(&driver, "quit", vec![]);
 }
+
+/// Trusted documents (#882): Enable Editing remembers the file, so opening it
+/// again skips Protected View, until a different file is downloaded to the
+/// same path.
+#[test]
+#[ignore = "requires a built suite and an interactive desktop"]
+fn enable_editing_trusts_the_file_until_it_is_replaced() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let run = Run::create(
+        root.join("../target/protected-view-tests")
+            .join(format!("trusted-{}-{stamp}", std::process::id())),
+    )
+    .unwrap();
+    let sandbox = run.dir().join("sandbox");
+    let files = run.dir().join("files");
+    std::fs::create_dir_all(&files).unwrap();
+    let book = files.join("book.xlsx");
+    std::fs::copy(root.join("fixtures/basic.xlsx"), &book).unwrap();
+    if !mark_downloaded(&book) {
+        return;
+    }
+
+    let exe = launch::find_suite(None).unwrap();
+    let app = launch::launch(&exe, &sandbox).unwrap();
+    let driver = Driver::connect(&app.ctl_dir(), None).unwrap();
+    let open = |driver: &Driver| {
+        ok(
+            driver,
+            "open",
+            vec![("path", s(&book.display().to_string()))],
+        );
+        active_tab(driver)
+    };
+
+    assert!(flag(&open(&driver), "protected"));
+    let st = ok(&driver, "enable-editing", vec![]);
+    assert_eq!(st.get("protected"), Some(&Json::Bool(false)), "{st}");
+    assert_eq!(
+        st.get("status").and_then(Json::as_str),
+        Some("editing enabled"),
+        "{st}"
+    );
+    assert!(
+        sandbox.join("docxy").join("trusted.json").is_file(),
+        "the record lives in the sandbox, not the real profile"
+    );
+
+    // Closed and opened again: trusted, so not protected.
+    ok(&driver, "close-tab", vec![]);
+    let again = open(&driver);
+    assert!(!flag(&again, "protected"), "{again}");
+
+    // Downloaded again to the same path: another file, protected again.
+    ok(&driver, "close-tab", vec![]);
+    std::fs::copy(root.join("fixtures/chart-kinds.xlsx"), &book).unwrap();
+    assert!(mark_downloaded(&book));
+    let replaced = open(&driver);
+    assert!(flag(&replaced, "protected"), "{replaced}");
+    let _ = ok(&driver, "quit", vec![]);
+}

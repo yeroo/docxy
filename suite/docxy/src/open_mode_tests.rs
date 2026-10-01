@@ -4,6 +4,7 @@
 
 use crate::dialog_host::dialog_click;
 use crate::open_mode::{Access, OpenMode, PROTECTED_STATUS, read_only_refusal};
+use crate::trusted::{Stamp, TrustStore};
 use crate::{
     DocTab, PersistTab, SHEET_READ_ONLY_HARNESS, Surface, finish_sheet_save, persist_tab,
     protected_rollback, reopen_dialog, restore_tab, save_sheet_tab, save_sheet_to,
@@ -108,7 +109,7 @@ fn read_only_save_goes_to_save_as() {
     let dir = Scratch::new();
     let src = book(&dir, "book.xlsx");
     let before = std::fs::read(&src).unwrap();
-    let mut tab = tab_from_path_mode(&src, OpenMode::ReadOnly).unwrap();
+    let mut tab = tab_from_path_mode(&src, OpenMode::ReadOnly, &TrustStore::default()).unwrap();
     assert!(tab.access.read_only);
     assert_eq!(tab.caption(), "book.xlsx [Read-Only]");
     assert_eq!(
@@ -130,7 +131,7 @@ fn read_only_save_as_over_source_is_refused_and_source_unchanged() {
     let dir = Scratch::new();
     let src = book(&dir, "book.xlsx");
     let before = std::fs::read(&src).unwrap();
-    let mut tab = tab_from_path_mode(&src, OpenMode::ReadOnly).unwrap();
+    let mut tab = tab_from_path_mode(&src, OpenMode::ReadOnly, &TrustStore::default()).unwrap();
     edit(&mut tab, 2.0);
     let refusal = read_only_refusal("book.xlsx");
 
@@ -158,7 +159,7 @@ fn read_only_save_as_elsewhere_clears_read_only() {
     let dir = Scratch::new();
     let src = book(&dir, "book.xlsx");
     let before = std::fs::read(&src).unwrap();
-    let mut tab = tab_from_path_mode(&src, OpenMode::ReadOnly).unwrap();
+    let mut tab = tab_from_path_mode(&src, OpenMode::ReadOnly, &TrustStore::default()).unwrap();
     edit(&mut tab, 2.0);
     let other = dir.path("mine.xlsx");
     assert!(save_sheet_to(&mut tab, &other), "{}", tab.status);
@@ -180,7 +181,7 @@ fn read_only_save_refused_in_harness() {
     let dir = Scratch::new();
     let src = book(&dir, "book.xlsx");
     let before = std::fs::read(&src).unwrap();
-    let mut tab = tab_from_path_mode(&src, OpenMode::ReadOnly).unwrap();
+    let mut tab = tab_from_path_mode(&src, OpenMode::ReadOnly, &TrustStore::default()).unwrap();
     edit(&mut tab, 2.0);
     let (saved, offered) = save(&mut tab, true, Some(src.clone()));
     assert!(!saved);
@@ -195,7 +196,7 @@ fn read_only_save_refused_in_harness() {
 fn repaired_save_goes_to_save_as_and_may_pick_source() {
     let dir = Scratch::new();
     let src = damaged_book(&dir, "book.xlsx");
-    let mut tab = tab_from_path_mode(&src, OpenMode::Repair).unwrap();
+    let mut tab = tab_from_path_mode(&src, OpenMode::Repair, &TrustStore::default()).unwrap();
     assert!(tab.access.repaired && !tab.access.read_only);
     assert_eq!(tab.caption(), "book.xlsx [Repaired]");
     assert!(
@@ -217,7 +218,7 @@ fn repaired_save_goes_to_save_as_and_may_pick_source() {
 fn a_sound_workbook_opens_repaired_with_nothing_to_repair() {
     let dir = Scratch::new();
     let src = book(&dir, "book.xlsx");
-    let tab = tab_from_path_mode(&src, OpenMode::Repair).unwrap();
+    let tab = tab_from_path_mode(&src, OpenMode::Repair, &TrustStore::default()).unwrap();
     assert!(tab.access.repaired);
     assert!(tab.status.starts_with("loaded"), "{}", tab.status);
     assert!(
@@ -232,7 +233,7 @@ fn a_sound_workbook_opens_repaired_with_nothing_to_repair() {
 fn a_damaged_workbook_opened_normally_still_fails() {
     let dir = Scratch::new();
     let src = damaged_book(&dir, "book.xlsx");
-    let tab = tab_from_path_mode(&src, OpenMode::Normal).unwrap();
+    let tab = tab_from_path_mode(&src, OpenMode::Normal, &TrustStore::default()).unwrap();
     assert!(matches!(tab.surface, Surface::Placeholder));
     assert!(!tab.status.starts_with("loaded"), "{}", tab.status);
 }
@@ -241,7 +242,7 @@ fn a_damaged_workbook_opened_normally_still_fails() {
 
 fn protected_tab(dir: &Scratch) -> (PathBuf, DocTab) {
     let src = book(dir, "book.xlsx");
-    let mut tab = tab_from_path_mode(&src, OpenMode::Normal).unwrap();
+    let mut tab = tab_from_path_mode(&src, OpenMode::Normal, &TrustStore::default()).unwrap();
     tab.access.protected = true;
     (src, tab)
 }
@@ -326,7 +327,7 @@ fn a_leak_without_a_snapshot_is_undone_from_the_file() {
 fn a_leak_on_a_repaired_protected_tab_reloads_through_repair() {
     let dir = Scratch::new();
     let src = damaged_book(&dir, "book.xlsx");
-    let mut tab = tab_from_path_mode(&src, OpenMode::Repair).unwrap();
+    let mut tab = tab_from_path_mode(&src, OpenMode::Repair, &TrustStore::default()).unwrap();
     tab.access.protected = true;
     let Surface::Sheet(v) = &mut tab.surface else {
         panic!("{}", tab.status)
@@ -379,7 +380,7 @@ fn downloaded_workbook_opens_protected() {
         return;
     }
     for mode in [OpenMode::Normal, OpenMode::ReadOnly, OpenMode::Repair] {
-        let tab = tab_from_path_mode(&src, mode).unwrap();
+        let tab = tab_from_path_mode(&src, mode, &TrustStore::default()).unwrap();
         assert!(tab.access.protected, "{mode:?}");
         assert_eq!(tab.caption(), "book.xlsx [Protected View]");
         assert_eq!(tab.access.read_only, mode == OpenMode::ReadOnly);
@@ -388,7 +389,7 @@ fn downloaded_workbook_opens_protected() {
     // The same file without the stream opens editable.
     let local = book(&dir, "local.xlsx");
     assert!(
-        !tab_from_path_mode(&local, OpenMode::Normal)
+        !tab_from_path_mode(&local, OpenMode::Normal, &TrustStore::default())
             .unwrap()
             .access
             .protected
@@ -403,7 +404,7 @@ fn copy_of_downloaded_workbook_is_protected() {
     if mark_downloaded(&src).is_none() {
         return;
     }
-    let tab = tab_from_path_mode(&src, OpenMode::Copy).unwrap();
+    let tab = tab_from_path_mode(&src, OpenMode::Copy, &TrustStore::default()).unwrap();
     let copy = dir.path("Copy (1)book.xlsx");
     assert_eq!(tab.path.as_deref(), Some(copy.as_path()));
     assert!(
@@ -419,12 +420,124 @@ fn copy_of_downloaded_workbook_is_protected() {
     );
     drop(tab);
     for mode in [OpenMode::Normal, OpenMode::ReadOnly, OpenMode::Repair] {
-        let again = tab_from_path_mode(&copy, mode).unwrap();
+        let again = tab_from_path_mode(&copy, mode, &TrustStore::default()).unwrap();
         assert!(
             again.access.protected,
             "{mode:?}: the reopened copy is protected"
         );
     }
+}
+
+// ---- trusted documents (#882) --------------------------------------------
+
+/// A protected tab keeps its file's stamp from the open; that is what Enable
+/// Editing trusts. An unprotected tab has none.
+#[cfg(windows)]
+#[test]
+fn a_protected_tab_keeps_the_stamp_it_opened_with() {
+    let dir = Scratch::new();
+    let src = book(&dir, "book.xlsx");
+    if mark_downloaded(&src).is_none() {
+        return;
+    }
+    let tab = tab_from_path_mode(&src, OpenMode::Normal, &TrustStore::default()).unwrap();
+    assert!(tab.access.protected);
+    assert_eq!(tab.access.stamp, Stamp::of(&src));
+    assert!(tab.access.stamp.is_some());
+    let local = book(&dir, "local.xlsx");
+    let plain = tab_from_path_mode(&local, OpenMode::Normal, &TrustStore::default()).unwrap();
+    assert_eq!(plain.access.stamp, None);
+}
+
+/// A downloaded file trusted as it is now opens editable in every mode. A
+/// copy of it opens editable too, but the copy is not trusted itself: opened
+/// again from disk it is protected.
+#[cfg(windows)]
+#[test]
+fn a_trusted_download_opens_without_protected_view() {
+    let dir = Scratch::new();
+    let src = book(&dir, "book.xlsx");
+    if mark_downloaded(&src).is_none() {
+        return;
+    }
+    let mut trusted = TrustStore::default();
+    trusted.trust(&src, Stamp::of(&src).unwrap());
+    for mode in [OpenMode::Normal, OpenMode::ReadOnly, OpenMode::Repair] {
+        let tab = tab_from_path_mode(&src, mode, &trusted).unwrap();
+        assert!(!tab.access.protected, "{mode:?}");
+        assert_eq!(tab.access.stamp, None, "{mode:?}");
+        assert_eq!(tab.access.read_only, mode == OpenMode::ReadOnly);
+        assert_eq!(tab.access.repaired, mode == OpenMode::Repair);
+    }
+    let copy_tab = tab_from_path_mode(&src, OpenMode::Copy, &trusted).unwrap();
+    assert!(!copy_tab.access.protected, "a copy of a trusted file");
+    let copy = dir.path("Copy (1)book.xlsx");
+    let again = tab_from_path_mode(&copy, OpenMode::Normal, &trusted).unwrap();
+    assert!(again.access.protected, "the copy itself is not trusted");
+}
+
+/// A file replaced at a trusted path (downloaded again) is protected again.
+#[cfg(windows)]
+#[test]
+fn a_download_replaced_at_a_trusted_path_is_protected() {
+    let dir = Scratch::new();
+    let src = book(&dir, "book.xlsx");
+    if mark_downloaded(&src).is_none() {
+        return;
+    }
+    let mut trusted = TrustStore::default();
+    trusted.trust(&src, Stamp::of(&src).unwrap());
+    let mut bytes = std::fs::read(&src).unwrap();
+    bytes.push(0);
+    std::fs::write(&src, &bytes).unwrap();
+    mark_downloaded(&src).unwrap();
+    let tab = tab_from_path_mode(&src, OpenMode::Normal, &trusted).unwrap();
+    assert!(tab.access.protected);
+}
+
+/// Restore takes protection away from a file trusted since the session was
+/// written, keeps it for one that is not, and never adds it.
+#[cfg(windows)]
+#[test]
+fn restore_drops_protection_only_for_a_trusted_file() {
+    let dir = Scratch::new();
+    let src = book(&dir, "book.xlsx");
+    if mark_downloaded(&src).is_none() {
+        return;
+    }
+    let persisted = |protected: bool| -> PersistTab {
+        let json = format!(
+            r#"{{"kind":"Xlsx","title":"book.xlsx","path":{},"protected":{protected}}}"#,
+            serde_json::to_string(&src.display().to_string()).unwrap()
+        );
+        serde_json::from_str(&json).unwrap()
+    };
+    let none = TrustStore::default();
+    let mut trusted = TrustStore::default();
+    trusted.trust(&src, Stamp::of(&src).unwrap());
+    let restore = |t: &PersistTab, s: &TrustStore| crate::restore_tab_sourced(t, s).0;
+    assert!(restore(&persisted(true), &none).access.protected);
+    assert!(!restore(&persisted(true), &trusted).access.protected);
+    // Enable Editing before the restart is kept, and the zone is not re-read.
+    assert!(!restore(&persisted(false), &none).access.protected);
+}
+
+/// A protected tab's stamp survives the session, so Enable Editing after a
+/// restart still trusts the file as it was opened.
+#[cfg(windows)]
+#[test]
+fn a_protected_tab_keeps_its_stamp_across_the_session() {
+    let dir = Scratch::new();
+    let hd = dir.path("hot");
+    std::fs::create_dir_all(&hd).unwrap();
+    let src = book(&dir, "book.xlsx");
+    if mark_downloaded(&src).is_none() {
+        return;
+    }
+    let tab = tab_from_path_mode(&src, OpenMode::Normal, &TrustStore::default()).unwrap();
+    let back = round_trip(&tab, &hd);
+    assert!(back.access.protected);
+    assert_eq!(back.access.stamp, tab.access.stamp);
 }
 
 // ---- copy ---------------------------------------------------------------
@@ -434,7 +547,7 @@ fn open_as_copy_opens_an_editable_copy_and_leaves_source() {
     let dir = Scratch::new();
     let src = book(&dir, "book.xlsx");
     let before = std::fs::read(&src).unwrap();
-    let mut tab = tab_from_path_mode(&src, OpenMode::Copy).unwrap();
+    let mut tab = tab_from_path_mode(&src, OpenMode::Copy, &TrustStore::default()).unwrap();
     let copy = dir.path("Copy (1)book.xlsx");
     assert_eq!(tab.path.as_deref(), Some(copy.as_path()));
     assert_eq!(tab.title.as_ref(), "Copy (1)book.xlsx");
@@ -445,14 +558,18 @@ fn open_as_copy_opens_an_editable_copy_and_leaves_source() {
     assert_eq!(a1_on_disk(&copy), CellValue::Number(2.0));
     assert_eq!(std::fs::read(&src).unwrap(), before);
     // A second copy takes the next name.
-    let again = tab_from_path_mode(&src, OpenMode::Copy).unwrap();
+    let again = tab_from_path_mode(&src, OpenMode::Copy, &TrustStore::default()).unwrap();
     assert_eq!(again.title.as_ref(), "Copy (2)book.xlsx");
 }
 
 #[test]
 fn a_copy_that_cannot_be_written_opens_nothing() {
     let dir = Scratch::new();
-    let err = tab_from_path_mode(&dir.path("gone.xlsx"), OpenMode::Copy)
+    let err = tab_from_path_mode(
+        &dir.path("gone.xlsx"),
+        OpenMode::Copy,
+        &TrustStore::default(),
+    )
         .err()
         .expect("no tab");
     assert!(err.contains("could not copy \"gone.xlsx\""), "{err}");
@@ -472,9 +589,9 @@ fn template_read_only_or_repair_opens_as_normal_untitled() {
         ),
     )
     .unwrap();
-    let plain = tab_from_path_mode(&template, OpenMode::Normal).unwrap();
+    let plain = tab_from_path_mode(&template, OpenMode::Normal, &TrustStore::default()).unwrap();
     for mode in [OpenMode::ReadOnly, OpenMode::Repair, OpenMode::Copy] {
-        let tab = tab_from_path_mode(&template, mode).unwrap();
+        let tab = tab_from_path_mode(&template, mode, &TrustStore::default()).unwrap();
         assert_eq!(tab.path, None, "{mode:?}: a new workbook from the template");
         assert_eq!(tab.access, Access::default(), "{mode:?}");
         assert!(matches!(tab.surface, Surface::Sheet(_)), "{}", tab.status);
@@ -494,7 +611,7 @@ fn template_read_only_or_repair_opens_as_normal_untitled() {
 fn reopen_no_keeps_the_edit_and_yes_reloads_in_the_mode() {
     let dir = Scratch::new();
     let src = book(&dir, "book.xlsx");
-    let mut tab = tab_from_path_mode(&src, OpenMode::Normal).unwrap();
+    let mut tab = tab_from_path_mode(&src, OpenMode::Normal, &TrustStore::default()).unwrap();
     edit(&mut tab, 2.0);
 
     tab.dialogs.push(reopen_dialog(&src, OpenMode::ReadOnly));
@@ -549,7 +666,7 @@ fn persist_tab_round_trips_access() {
             ..Access::default()
         },
     ] {
-        let mut tab = tab_from_path_mode(&src, OpenMode::Normal).unwrap();
+        let mut tab = tab_from_path_mode(&src, OpenMode::Normal, &TrustStore::default()).unwrap();
         tab.access = access;
         let back = round_trip(&tab, &hd);
         assert_eq!(back.access, access);
