@@ -440,6 +440,15 @@ impl Session {
         None
     }
 
+    /// Undo/redo snapshots of `keys` on sheet `sheet_idx` as it is now
+    /// ([`gridcore::sheet::snapshot_cells`]): spill output of a live anchor
+    /// is a blank the anchor re-spills over.
+    fn snapshot(&self, sheet_idx: usize, keys: &[(u32, u32)]) -> Vec<Option<Cell>> {
+        let wb = &self.pkg.workbook;
+        let frozen = |r, c| self.engine.is_frozen(wb, (sheet_idx, r, c));
+        gridcore::sheet::snapshot_cells(&wb.sheets[sheet_idx], keys, frozen)
+    }
+
     /// Apply cell changes as one undo group, through the engine.
     fn apply(&mut self, changes: Vec<(u32, u32, Cell)>) {
         if changes.is_empty() {
@@ -448,24 +457,21 @@ impl Session {
         let sheet_idx = self.active;
         // Snapshot the whole group before and after it is applied, not cell
         // by cell: an earlier change can spill into (or clear) a later cell,
-        // and undo/redo must recreate the state before/after the group.
-        let sheet = &self.pkg.workbook.sheets[sheet_idx];
-        let befores: Vec<Option<Cell>> = changes
-            .iter()
-            .map(|&(r, c, _)| sheet.cell(r, c).cloned())
-            .collect();
+        // and undo/redo must recreate the state before/after the group. Spill
+        // output is snapshotted as blanks its anchor re-spills over.
         let keys: Vec<(u32, u32)> = changes.iter().map(|&(r, c, _)| (r, c)).collect();
+        let befores = self.snapshot(sheet_idx, &keys);
         for (r, c, cell) in changes {
             self.engine
                 .set_cell(&mut self.pkg.workbook, (sheet_idx, r, c), cell);
         }
-        let sheet = &self.pkg.workbook.sheets[sheet_idx];
+        let afters = self.snapshot(sheet_idx, &keys);
         let group = UndoGroup {
             sheet: sheet_idx,
             changes: keys
                 .into_iter()
-                .zip(befores)
-                .map(|((r, c), before)| (r, c, before, sheet.cell(r, c).cloned()))
+                .zip(befores.into_iter().zip(afters))
+                .map(|((r, c), (before, after))| (r, c, before, after))
                 .collect(),
         };
         self.undo.push(UndoAction::Cells(group));
@@ -478,8 +484,8 @@ impl Session {
         match self.undo.pop() {
             Some(UndoAction::Cells(group)) => {
                 self.active = group.sheet.min(self.pkg.workbook.sheets.len() - 1);
-                let cells = group.changes.iter().rev().map(|(r, c, b, _)| ((*r, *c), b));
-                for ((r, c), cell) in gridcore::sheet::cells_to_restore(cells) {
+                for &(r, c, ref before, _) in group.changes.iter().rev() {
+                    let cell = before.clone().unwrap_or_default();
                     self.engine
                         .restore_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
                 }
@@ -507,8 +513,8 @@ impl Session {
         match self.redo.pop() {
             Some(UndoAction::Cells(group)) => {
                 self.active = group.sheet.min(self.pkg.workbook.sheets.len() - 1);
-                let cells = group.changes.iter().map(|(r, c, _, a)| ((*r, *c), a));
-                for ((r, c), cell) in gridcore::sheet::cells_to_restore(cells) {
+                for &(r, c, _, ref after) in group.changes.iter() {
+                    let cell = after.clone().unwrap_or_default();
                     self.engine
                         .restore_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
                 }
@@ -608,8 +614,19 @@ impl Session {
         let (r1, r2) = (self.cur.0.min(ar), self.cur.0.max(ar));
         let (c1, c2) = (self.cur.1.min(ac), self.cur.1.max(ac));
         let sheet = &self.pkg.workbook.sheets[self.active];
+        let frozen = |r, c| {
+            self.engine
+                .is_frozen(&self.pkg.workbook, (self.active, r, c))
+        };
         let cells = (r1..=r2)
-            .map(|r| (c1..=c2).map(|c| sheet.cell(r, c).cloned()).collect())
+            .map(|r| {
+                (c1..=c2)
+                    .map(|c| {
+                        let cell = sheet.cell(r, c);
+                        cell.map(|cl| gridcore::sheet::copied_cell(cl, || frozen(r, c)))
+                    })
+                    .collect()
+            })
             .collect();
         self.clip = Some(GridClip {
             cells,
@@ -3271,6 +3288,45 @@ mod tests {
         assert_eq!(col3(&s, 9), vec![CellValue::Empty; 3]);
         s.dispatch("redo");
         assert_eq!(col3(&s, 9), seq);
+    }
+
+    #[test]
+    fn undo_redo_around_a_live_spill_keeps_it_spilling() {
+        // #777 r1: spill output edited without its anchor is snapshotted as
+        // the blank its anchor re-spills over, not as a plain value.
+        let n = |v: f64| CellValue::Number(v);
+        let seq = vec![n(1.0), n(2.0), n(3.0)];
+        let blocked = vec![
+            CellValue::Error("#SPILL!".into()),
+            CellValue::Text("x".into()),
+            CellValue::Empty,
+        ];
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("set\t0\t4\t=SEQUENCE(3)"); // E1 spills E1:E3
+        // Delete E2:E3: a no-op, and so are undo and redo.
+        s.dispatch("clear\t1\t4\t2\t4");
+        for step in ["clear", "undo", "redo", "undo"] {
+            if step != "clear" {
+                s.dispatch(step);
+            }
+            assert_eq!(col3(&s, 4), seq, "{step}");
+            let e1 = s.pkg.workbook.sheets[0].cell(0, 4).unwrap();
+            assert_eq!(e1.spill, Some((3, 1)), "{step}");
+        }
+        // Type into a spill child: #SPILL!; undo re-spills; redo blocks.
+        s.dispatch("set\t1\t4\tx");
+        assert_eq!(col3(&s, 4), blocked);
+        s.dispatch("undo");
+        assert_eq!(col3(&s, 4), seq);
+        s.dispatch("redo");
+        assert_eq!(col3(&s, 4), blocked);
+        // Delete the blocker: it spills; undo brings it back; redo spills.
+        s.dispatch("clear\t1\t4\t1\t4");
+        assert_eq!(col3(&s, 4), seq);
+        s.dispatch("undo");
+        assert_eq!(col3(&s, 4), blocked);
+        s.dispatch("redo");
+        assert_eq!(col3(&s, 4), seq);
     }
 
     #[test]

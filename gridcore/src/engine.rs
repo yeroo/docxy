@@ -123,6 +123,30 @@ impl Engine {
         self.unsupported.contains(&key)
     }
 
+    /// Is this cell's formula kept on its cached value — beyond the engine,
+    /// whether or not it has been evaluated yet (xlsxy opens a workbook on its
+    /// cached values)? A formula not yet known to be is evaluated, without
+    /// storing anything, to find out. Hosts ask this of a spill anchor before
+    /// treating its cells as spill output that a re-spill re-creates: a frozen
+    /// anchor never re-spills.
+    pub fn is_frozen(&self, wb: &Workbook, key: Key) -> bool {
+        if self.unsupported.contains(&key) {
+            return true;
+        }
+        let Some(info) = self.formulas.get(&key) else {
+            return false;
+        };
+        let resolver = WbResolver {
+            wb,
+            clock: self.clock,
+            rand_state: StdCell::new(self.seed.unwrap_or(0)),
+            has_rand: self.seed.is_some(),
+        };
+        let mut ev = Eval::new(&resolver, key.0, (key.1, key.2));
+        let _ = ev.eval_dynamic_shaped(&info.ast, !info.legacy);
+        ev.unsupported
+    }
+
     /// Register a cell's formula (if any) as it stands, the way a freshly
     /// built engine sees it.
     fn index_cell(&mut self, wb: &Workbook, key: Key, cell: &Cell) {
@@ -2474,7 +2498,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_scalar_formula_stays_modern_after_rebuild() {
+    fn typed_no_match_filter_is_dynamic_and_respills_after_rebuild() {
         // A typed FILTER that matches nothing yet (#CALC!) is ours: after a
         // rebuild it still spills once rows match. It could return an array,
         // so it is a dynamic array from the start (#777).
@@ -2701,5 +2725,25 @@ mod tests {
             assert!(cell.is_modern(), "{src}");
             assert_eq!(cell.is_dynamic(), *dynamic, "{src}");
         }
+    }
+
+    #[test]
+    fn is_frozen_knows_an_unevaluated_unsupported_formula() {
+        // xlsxy opens on cached values: nothing has been evaluated yet.
+        let wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("B1", array_formula("PIVOTBY(A1,4)")),
+            ("C1", array_formula("SEQUENCE(3)")),
+        ]);
+        let eng = Engine::new(&wb);
+        assert!(!eng.is_unsupported((0, 0, 1)));
+        assert!(eng.is_frozen(&wb, (0, 0, 1)));
+        assert!(!eng.is_frozen(&wb, (0, 0, 2)));
+        assert!(!eng.is_frozen(&wb, (0, 0, 0)));
+        // Evaluated, it is known.
+        let mut wb = wb;
+        let mut eng = eng;
+        eng.recalc_all(&mut wb);
+        assert!(eng.is_unsupported((0, 0, 1)) && eng.is_frozen(&wb, (0, 0, 1)));
     }
 }

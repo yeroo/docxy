@@ -9958,7 +9958,12 @@ impl Docxy {
                     let xf = v.pkg.workbook.styles.xf(cell.style);
                     tsv.push_str(&gridcore::entry::copy_field(cell, &xf, v.cell_text(r, c)));
                 }
-                row.push(v.sheet().cell(r, c).cloned().unwrap_or_default());
+                let frozen = || v.engine.is_frozen(&v.pkg.workbook, (v.active, r, c));
+                let cell = v.sheet().cell(r, c);
+                row.push(
+                    cell.map(|cl| gridcore::sheet::copied_cell(cl, frozen))
+                        .unwrap_or_default(),
+                );
             }
             cells.push(row);
             tsv.push('\n');

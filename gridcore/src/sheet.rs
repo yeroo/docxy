@@ -6,7 +6,7 @@
 //! a sparse `BTreeMap` so memory is proportional to content, and iteration is
 //! naturally row-major (the order worksheet XML wants).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
 // A1 reference math
@@ -263,25 +263,56 @@ where
         .collect()
 }
 
-/// An undo/redo group's snapshots (`None` = no cell), in the order to restore
-/// them, as the cells to put back: spill children of an anchor in the same
-/// group ([`spill_children`]) become blanks the anchor re-spills over.
-pub fn cells_to_restore<'a, I>(snapshots: I) -> Vec<((u32, u32), Cell)>
-where
-    I: IntoIterator<Item = ((u32, u32), &'a Option<Cell>)>,
-{
-    let cells: Vec<((u32, u32), Cell)> = snapshots
-        .into_iter()
-        .map(|(at, snap)| (at, snap.clone().unwrap_or_default()))
+/// Undo/redo snapshots of the cells at `keys` as the sheet holds them now: a
+/// plain cell inside the spill of a live anchor is spill output, and is
+/// snapshotted as a blank ([`Cell::blank_like`]) the anchor re-spills over.
+/// Put back as a plain value it would block the anchor with `#SPILL!` (the
+/// engine drops a submitted extent and recomputes it). An anchor `frozen`
+/// reports as kept on its cached values (asked only of anchors over a key)
+/// never re-spills, so its cells are kept as they are.
+pub fn snapshot_cells(
+    sheet: &Sheet,
+    keys: &[(u32, u32)],
+    mut frozen: impl FnMut(u32, u32) -> bool,
+) -> Vec<Option<Cell>> {
+    let anchors: Vec<((u32, u32), (u32, u32))> = sheet
+        .cells
+        .iter()
+        .filter(|(_, cl)| cl.formula.is_some())
+        .filter_map(|(&at, cl)| cl.spill.map(|ext| (at, ext)))
         .collect();
-    let children = spill_children(cells.iter().map(|(at, cl)| (*at, cl)));
-    cells
-        .into_iter()
-        .map(|(at, cl)| match children.contains(&at) {
-            true => (at, cl.blank_like()),
-            false => (at, cl),
+    let mut live: HashMap<(u32, u32), bool> = HashMap::new();
+    keys.iter()
+        .map(|&(r, c)| {
+            let cell = sheet.cell(r, c)?;
+            let spilled = cell.formula.is_none()
+                && anchors.iter().any(|&((ar, ac), (h, w))| {
+                    (r, c) != (ar, ac)
+                        && r >= ar
+                        && r < ar + h
+                        && c >= ac
+                        && c < ac + w
+                        && *live.entry((ar, ac)).or_insert_with(|| !frozen(ar, ac))
+                });
+            Some(if spilled {
+                cell.blank_like()
+            } else {
+                cell.clone()
+            })
         })
         .collect()
+}
+
+/// `cell` as a copy records it for a paste. An anchor kept on its cached
+/// values (`frozen`, asked only of an anchor) never re-spills, so its extent
+/// is dropped: [`spill_children`] then sees no anchor, and a paste of its
+/// block keeps the cached values.
+pub fn copied_cell(cell: &Cell, frozen: impl FnOnce() -> bool) -> Cell {
+    let mut cell = cell.clone();
+    if cell.spill.is_some() && cell.formula.is_some() && frozen() {
+        cell.spill = None;
+    }
+    cell
 }
 
 impl Cell {
@@ -2150,6 +2181,60 @@ mod tests {
                 style: 3,
                 ..Cell::default()
             }
+        );
+    }
+
+    #[test]
+    fn snapshots_blank_the_spill_output_of_a_live_anchor() {
+        // #777 r1: C1 spills C1:C3 and is not among the keys; E1 is frozen.
+        let mut sheet = Sheet::default();
+        let anchor = |src: &str| Cell {
+            spill: Some((3, 1)),
+            ..Cell::formula(src)
+        };
+        sheet.set_cell(0, 2, anchor("SEQUENCE(3)"));
+        sheet.set_cell(
+            1,
+            2,
+            Cell {
+                style: 2,
+                ..Cell::number(2.0)
+            },
+        );
+        sheet.set_cell(2, 2, Cell::number(3.0));
+        sheet.set_cell(0, 4, anchor("PIVOTBY(A1,4)"));
+        sheet.set_cell(1, 4, Cell::number(8.0));
+        sheet.set_cell(3, 2, Cell::number(4.0)); // below the spill
+        let keys = [(0, 2), (1, 2), (2, 2), (3, 2), (1, 4), (5, 5)];
+        let mut asked = Vec::new();
+        let frozen = |r, c| (r, c) == (0, 4);
+        let snap = snapshot_cells(&sheet, &keys, |r, c| {
+            asked.push((r, c));
+            frozen(r, c)
+        });
+        assert_eq!(snap[0].as_ref(), sheet.cell(0, 2)); // the anchor itself
+        assert_eq!(
+            snap[1],
+            Some(Cell {
+                style: 2,
+                ..Cell::default()
+            })
+        );
+        assert_eq!(snap[2], Some(Cell::default()));
+        assert_eq!(snap[3], Some(Cell::number(4.0)));
+        assert_eq!(snap[4], Some(Cell::number(8.0))); // a frozen anchor's value
+        assert_eq!(snap[5], None);
+        // Asked once per anchor over a key, never of the others.
+        asked.sort();
+        asked.dedup();
+        assert_eq!(asked, vec![(0, 2), (0, 4)]);
+        // A copy drops a frozen anchor's extent only.
+        let c1 = sheet.cell(0, 2).unwrap();
+        assert_eq!(copied_cell(c1, || false).spill, Some((3, 1)));
+        assert_eq!(copied_cell(c1, || true).spill, None);
+        assert_eq!(
+            copied_cell(&Cell::number(1.0), || panic!("not an anchor")),
+            Cell::number(1.0)
         );
     }
 

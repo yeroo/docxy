@@ -1696,6 +1696,15 @@ impl App {
     }
 
     /// Apply cell changes to the current sheet as one undo group.
+    /// Undo/redo snapshots of `keys` on sheet `sheet_idx` as it is now
+    /// ([`gridcore::sheet::snapshot_cells`]): spill output of a live anchor
+    /// is a blank the anchor re-spills over.
+    fn snapshot(&self, sheet_idx: usize, keys: &[(u32, u32)]) -> Vec<Option<Cell>> {
+        let wb = &self.pkg.workbook;
+        let frozen = |r, c| self.engine.is_frozen(wb, (sheet_idx, r, c));
+        gridcore::sheet::snapshot_cells(&wb.sheets[sheet_idx], keys, frozen)
+    }
+
     fn apply(&mut self, changes: Vec<(u32, u32, Cell)>) {
         self.apply_on(self.sheet, changes);
     }
@@ -1711,24 +1720,21 @@ impl App {
         self.engine.clock = now_serial();
         // Snapshot the whole group before and after it is applied, not cell
         // by cell: an earlier change can spill into (or clear) a later cell,
-        // and undo/redo must recreate the state before/after the group.
-        let sheet = &self.pkg.workbook.sheets[sheet_idx];
-        let befores: Vec<Option<Cell>> = changes
-            .iter()
-            .map(|&(r, c, _)| sheet.cell(r, c).cloned())
-            .collect();
+        // and undo/redo must recreate the state before/after the group. Spill
+        // output is snapshotted as blanks its anchor re-spills over.
         let keys: Vec<(u32, u32)> = changes.iter().map(|&(r, c, _)| (r, c)).collect();
+        let befores = self.snapshot(sheet_idx, &keys);
         for (r, c, cell) in changes {
             self.engine
                 .set_cell(&mut self.pkg.workbook, (sheet_idx, r, c), cell);
         }
-        let sheet = &self.pkg.workbook.sheets[sheet_idx];
+        let afters = self.snapshot(sheet_idx, &keys);
         let group = UndoGroup {
             sheet: sheet_idx,
             changes: keys
                 .into_iter()
-                .zip(befores)
-                .map(|((r, c), before)| (r, c, before, sheet.cell(r, c).cloned()))
+                .zip(befores.into_iter().zip(afters))
+                .map(|((r, c), (before, after))| (r, c, before, after))
                 .collect(),
         };
         self.undo.push(UndoAction::Cells(group));
@@ -2258,8 +2264,8 @@ impl App {
         match self.undo.pop() {
             Some(UndoAction::Cells(group)) => {
                 self.sheet = group.sheet.min(self.pkg.workbook.sheets.len() - 1);
-                let cells = group.changes.iter().rev().map(|(r, c, b, _)| ((*r, *c), b));
-                for ((r, c), cell) in gridcore::sheet::cells_to_restore(cells) {
+                for &(r, c, ref before, _) in group.changes.iter().rev() {
+                    let cell = before.clone().unwrap_or_default();
                     self.engine
                         .restore_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
                 }
@@ -2284,8 +2290,8 @@ impl App {
         match self.redo.pop() {
             Some(UndoAction::Cells(group)) => {
                 self.sheet = group.sheet.min(self.pkg.workbook.sheets.len() - 1);
-                let cells = group.changes.iter().map(|(r, c, _, a)| ((*r, *c), a));
-                for ((r, c), cell) in gridcore::sheet::cells_to_restore(cells) {
+                for &(r, c, _, ref after) in group.changes.iter() {
+                    let cell = after.clone().unwrap_or_default();
                     self.engine
                         .restore_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
                 }
@@ -2319,7 +2325,13 @@ impl App {
                 if c > c1 {
                     tsv.push('\t');
                 }
-                let cell = sheet.cell(r, c).cloned();
+                let frozen = || {
+                    self.engine
+                        .is_frozen(&self.pkg.workbook, (self.sheet, r, c))
+                };
+                let cell = sheet
+                    .cell(r, c)
+                    .map(|cl| gridcore::sheet::copied_cell(cl, frozen));
                 if let Some(cl) = &cell {
                     // With the `'` a paste needs to read the text back.
                     let xf = self.pkg.workbook.styles.xf(cl.style);
@@ -10554,6 +10566,96 @@ mod tests {
         assert_eq!(col_values(&app, 9, 0, 2), vec![CellValue::Empty; 3]);
         app.redo();
         assert_eq!(col_values(&app, 9, 0, 2), seq);
+    }
+
+    #[test]
+    fn undo_redo_around_a_live_spill_keeps_it_spilling() {
+        // #777 r1: spill output edited without its anchor is snapshotted as
+        // the blank its anchor re-spills over, not as a plain value.
+        let n = |v: f64| CellValue::Number(v);
+        let seq = vec![n(1.0), n(2.0), n(3.0)];
+        let spill = CellValue::Error("#SPILL!".into());
+        let x = CellValue::Text("x".into());
+        let spilling = |app: &App| {
+            let c1 = app.pkg.workbook.sheets[0].cell(0, 2).unwrap();
+            c1.spill == Some((3, 1))
+        };
+
+        // Delete C2:C3 under C1's spill: a no-op, and so are undo and redo.
+        let mut app = app_with_sequence_in_c1();
+        app.apply(vec![(1, 2, Cell::default()), (2, 2, Cell::default())]);
+        for step in ["delete", "undo", "redo", "undo"] {
+            match step {
+                "undo" => app.undo(),
+                "redo" => app.redo(),
+                _ => {}
+            }
+            assert_eq!(col_values(&app, 2, 0, 2), seq, "{step}");
+            assert!(spilling(&app), "{step}");
+        }
+
+        // Type into a spill child: #SPILL!; undo re-spills; redo blocks again.
+        let mut app = app_with_sequence_in_c1();
+        app.apply(vec![(1, 2, Cell::text("x"))]);
+        let blocked = vec![spill.clone(), x.clone(), CellValue::Empty];
+        assert_eq!(col_values(&app, 2, 0, 2), blocked);
+        app.undo();
+        assert_eq!(col_values(&app, 2, 0, 2), seq);
+        assert!(spilling(&app));
+        app.redo();
+        assert_eq!(col_values(&app, 2, 0, 2), blocked);
+        app.undo();
+        assert_eq!(col_values(&app, 2, 0, 2), seq);
+
+        // Delete the blocker of a #SPILL! anchor: it spills; undo brings the
+        // blocker back; redo spills again.
+        app.apply(vec![(1, 2, Cell::text("x"))]);
+        app.apply(vec![(1, 2, Cell::default())]);
+        assert_eq!(col_values(&app, 2, 0, 2), seq);
+        app.undo();
+        assert_eq!(col_values(&app, 2, 0, 2), blocked);
+        app.redo();
+        assert_eq!(col_values(&app, 2, 0, 2), seq);
+        assert!(spilling(&app));
+    }
+
+    #[test]
+    fn a_frozen_array_block_keeps_its_cached_values() {
+        // #777 r1: an array anchor the engine can't evaluate never re-spills,
+        // so its cached block is pasted and undone as values. xlsxy opens on
+        // cached values: nothing has been evaluated yet.
+        let n = |v: f64| CellValue::Number(v);
+        let cached = vec![n(7.0), n(8.0), n(9.0)];
+        let mut pkg = new_xlsx();
+        let sheet = &mut pkg.workbook.sheets[0];
+        sheet.set_cell(0, 0, Cell::number(1.0));
+        sheet.set_cell(
+            0,
+            4,
+            Cell {
+                value: n(7.0),
+                formula: Some("PIVOTBY(A1,4)".into()),
+                f_attrs: Some("t=\"array\" ref=\"E1:E3\"".into()),
+                spill: Some((3, 1)),
+                ..Cell::default()
+            },
+        );
+        sheet.set_cell(1, 4, Cell::number(8.0));
+        sheet.set_cell(2, 4, Cell::number(9.0));
+        let mut app = App::new(pkg, "test.xlsx");
+        app.os_clip = None;
+        app.anchor = Some((0, 4));
+        app.cur = (2, 4);
+        app.copy(false);
+        app.anchor = None;
+        app.cur = (0, 6);
+        app.paste();
+        assert_eq!(col_values(&app, 6, 0, 2), cached);
+        // Cleared and undone, the block comes back whole.
+        app.apply((0..3).map(|r| (r, 4, Cell::default())).collect());
+        assert_eq!(col_values(&app, 4, 0, 2), vec![CellValue::Empty; 3]);
+        app.undo();
+        assert_eq!(col_values(&app, 4, 0, 2), cached);
     }
 
     #[test]
