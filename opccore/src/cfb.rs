@@ -86,10 +86,17 @@ impl Cfb {
         }
         let major = u16le(bytes, 26);
         let sector_shift = u16le(bytes, 30);
-        let sector_size = 1usize << sector_shift;
-        if (major == 3 && sector_size != 512) || (major == 4 && sector_size != 4096) {
-            return Err(format!("unexpected sector size {sector_size} for v{major}"));
-        }
+        // The only two layouts [MS-CFB] defines; anything else is not a
+        // compound file this reads (and a wild shift would overflow).
+        let sector_size = match (major, sector_shift) {
+            (3, 9) => 512,
+            (4, 12) => 4096,
+            _ => {
+                return Err(format!(
+                    "unsupported compound file v{major} with sector shift {sector_shift}"
+                ));
+            }
+        };
         let num_fat_sectors = u32le(bytes, 44);
         let first_dir = u32le(bytes, 48);
         let mini_cutoff = u32le(bytes, 56) as u64;
@@ -109,11 +116,16 @@ impl Cfb {
             entries: Vec::new(),
         };
 
+        // Every chain walk ends within this many steps: a file can't hold
+        // more sectors than that, so a longer chain is a cycle.
+        let max_sectors = cfb.data.len() / sector_size;
+
         // 1) DIFAT: 109 FAT-sector pointers in the header, then any DIFAT-sector chain.
         let mut difat: Vec<u32> = (0..109).map(|i| u32le(&cfb.data, 76 + i * 4)).collect();
         let mut sec = first_difat;
-        let mut guard = 0;
-        while sec != ENDOFCHAIN && sec != FREESECT && guard <= num_difat {
+        let mut guard = 0usize;
+        let difat_cap = (num_difat as usize).min(max_sectors);
+        while sec != ENDOFCHAIN && sec != FREESECT && guard < difat_cap {
             let off = cfb.sector_offset(sec);
             let per = sector_size / 4 - 1; // last slot chains to the next DIFAT sector
             for i in 0..per {
@@ -125,17 +137,17 @@ impl Cfb {
 
         // 2) FAT: concatenate the FAT sectors the DIFAT points at, stopping once
         //    the header's declared FAT-sector count is satisfied.
-        let want_fat = num_fat_sectors as usize;
+        let want_fat = (num_fat_sectors as usize).min(max_sectors);
         let mut read_fat = 0usize;
         for &fs in difat.iter() {
-            if want_fat > 0 && read_fat >= want_fat {
+            if read_fat >= max_sectors || (want_fat > 0 && read_fat >= want_fat) {
                 break;
             }
             if fs == FREESECT || fs == ENDOFCHAIN {
                 continue;
             }
             let off = cfb.sector_offset(fs);
-            if off + sector_size > cfb.data.len() {
+            if off.saturating_add(sector_size) > cfb.data.len() {
                 continue;
             }
             for i in 0..sector_size / 4 {
@@ -195,11 +207,11 @@ impl Cfb {
     }
 
     fn sector_offset(&self, sec: u32) -> usize {
-        (sec as usize + 1) * self.sector_size
+        (sec as usize + 1).saturating_mul(self.sector_size)
     }
 
     fn read_u32(&self, off: usize) -> u32 {
-        if off + 4 <= self.data.len() {
+        if off.saturating_add(4) <= self.data.len() {
             u32le(&self.data, off)
         } else {
             FREESECT
@@ -207,15 +219,19 @@ impl Cfb {
     }
 
     /// Concatenate the sectors of a FAT chain starting at `start`, optionally
-    /// truncated to `size` bytes. Guards against cycles via a step cap.
+    /// truncated to `size` bytes. Guards against cycles: a chain can't be
+    /// longer than the file has sectors.
     fn read_fat_chain(&self, start: u32, size: Option<usize>) -> Vec<u8> {
         let mut out = Vec::new();
         let mut sec = start;
         let mut steps = 0;
-        let cap = self.fat.len() + 2;
-        while sec != ENDOFCHAIN && sec != FREESECT && steps <= cap {
+        let cap = self.data.len() / self.sector_size;
+        while sec != ENDOFCHAIN && sec != FREESECT && steps < cap {
+            if size.is_some_and(|n| out.len() >= n) {
+                break;
+            }
             let off = self.sector_offset(sec);
-            if off + self.sector_size > self.data.len() {
+            if off.saturating_add(self.sector_size) > self.data.len() {
                 break;
             }
             out.extend_from_slice(&self.data[off..off + self.sector_size]);
@@ -233,10 +249,11 @@ impl Cfb {
         let mut out = Vec::new();
         let mut sec = start;
         let mut steps = 0;
-        let cap = self.minifat.len() + 2;
-        while sec != ENDOFCHAIN && sec != FREESECT && steps <= cap {
-            let off = sec as usize * MINI_SECTOR_SIZE;
-            if off + MINI_SECTOR_SIZE > self.mini_stream.len() {
+        // No longer than the mini stream has mini sectors (a cycle otherwise).
+        let cap = self.mini_stream.len() / MINI_SECTOR_SIZE;
+        while sec != ENDOFCHAIN && sec != FREESECT && steps < cap && out.len() < size {
+            let off = (sec as usize).saturating_mul(MINI_SECTOR_SIZE);
+            if off.saturating_add(MINI_SECTOR_SIZE) > self.mini_stream.len() {
                 break;
             }
             out.extend_from_slice(&self.mini_stream[off..off + MINI_SECTOR_SIZE]);
@@ -320,12 +337,20 @@ impl Cfb {
     pub fn paths(&self) -> Vec<String> {
         let mut out = Vec::new();
         if let Some(root) = self.root_index() {
-            self.collect_paths(root, "", &mut out);
+            self.collect_paths(root, "", &mut out, &mut vec![root]);
         }
         out
     }
 
-    fn collect_paths(&self, storage_idx: usize, prefix: &str, out: &mut Vec<String>) {
+    /// `open` holds the storages being walked: a storage listed as its own
+    /// descendant (a corrupt tree) is not entered again.
+    fn collect_paths(
+        &self,
+        storage_idx: usize,
+        prefix: &str,
+        out: &mut Vec<String>,
+        open: &mut Vec<usize>,
+    ) {
         for c in self.children_of(storage_idx) {
             let e = &self.entries[c];
             let path = if prefix.is_empty() {
@@ -335,8 +360,10 @@ impl Cfb {
             };
             if e.is_stream() {
                 out.push(path);
-            } else if e.is_storage() {
-                self.collect_paths(c, &path, out);
+            } else if e.is_storage() && !open.contains(&c) {
+                open.push(c);
+                self.collect_paths(c, &path, out, open);
+                open.pop();
             }
         }
     }
@@ -367,7 +394,8 @@ impl Cfb {
 /// Decode a UTF-16LE directory name; `name_len` is the byte length including the
 /// trailing NUL, as stored in the entry.
 fn utf16_name(raw: &[u8], name_len: usize) -> String {
-    let chars = name_len.saturating_sub(2) / 2; // drop the NUL terminator
+    // Drop the NUL terminator; the field holds at most 32 units.
+    let chars = (name_len.saturating_sub(2) / 2).min(raw.len() / 2);
     let units: Vec<u16> = (0..chars).map(|i| u16le(raw, i * 2)).collect();
     String::from_utf16_lossy(&units)
 }
@@ -642,6 +670,72 @@ pub fn write_cfb_tree(root_children: &[Node]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A one-stream file with header field `at` (u16 or u32) overwritten.
+    fn patched(at: usize, value: &[u8]) -> Vec<u8> {
+        let mut f = write_cfb(&[("Workbook", vec![7u8; 5000])]);
+        f[at..at + value.len()].copy_from_slice(value);
+        f
+    }
+
+    #[test]
+    fn hostile_headers_are_errors_not_panics() {
+        // A sector shift other than v3's 9 / v4's 12, including 0 and 64.
+        for shift in [0u16, 7, 12, 64, 0xFFFF] {
+            assert!(
+                Cfb::open(&patched(30, &shift.to_le_bytes())).is_err(),
+                "{shift}"
+            );
+        }
+        assert!(Cfb::open(&patched(26, &4u16.to_le_bytes())).is_err());
+    }
+
+    #[test]
+    fn hostile_chains_end() {
+        // A DIFAT chain that loops on itself, with a huge declared length.
+        let mut f = patched(68, &0u32.to_le_bytes());
+        f[72..76].copy_from_slice(&u32::MAX.to_le_bytes());
+        let c = Cfb::open(&f).unwrap();
+        assert_eq!(c.read_stream("Workbook").map(|s| s.len()), Some(5000));
+        // A huge DIFAT/FAT count in a bare 512-byte header.
+        let mut tiny = f[..512].to_vec();
+        tiny[44..48].copy_from_slice(&u32::MAX.to_le_bytes());
+        tiny[72..76].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(Cfb::open(&tiny).is_ok_and(|c| c.stream_names().is_empty()));
+        // A FAT whose every entry points back at sector 0: the directory
+        // and stream chains cycle.
+        let mut cyc = write_cfb(&[("Workbook", vec![7u8; 5000])]);
+        let fat0 = u32::from_le_bytes(cyc[76..80].try_into().unwrap()) as usize;
+        let off = (fat0 + 1) * 512;
+        for i in 0..128 {
+            cyc[off + i * 4..off + i * 4 + 4].copy_from_slice(&0u32.to_le_bytes());
+        }
+        let c = Cfb::open(&cyc).unwrap();
+        let _ = c.paths();
+        assert!(
+            c.read_stream("Workbook")
+                .is_none_or(|s| s.len() <= cyc.len())
+        );
+    }
+
+    #[test]
+    fn long_directory_names_and_storage_cycles() {
+        // A name length past the 64-byte field.
+        let mut f = write_cfb(&[("Workbook", vec![1u8; 10])]);
+        let dir = (u32::from_le_bytes(f[48..52].try_into().unwrap()) as usize + 1) * 512;
+        f[dir + 128 + 64..dir + 128 + 66].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        let c = Cfb::open(&f).unwrap();
+        assert_eq!(c.stream_names().len(), 1);
+        // A storage whose child is the root again: no endless recursion.
+        let mut g = write_cfb_tree(&[Node::Storage("S", vec![Node::Stream("x", vec![1])])]);
+        let dir = (u32::from_le_bytes(g[48..52].try_into().unwrap()) as usize + 1) * 512;
+        let storage = (0..4)
+            .map(|i| dir + i * 128)
+            .find(|&e| g[e + 66] == 1)
+            .unwrap();
+        g[storage + 76..storage + 80].copy_from_slice(&0u32.to_le_bytes());
+        let _ = Cfb::open(&g).unwrap().paths();
+    }
 
     #[test]
     fn signature_check() {
