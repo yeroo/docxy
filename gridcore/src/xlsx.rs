@@ -10688,7 +10688,77 @@ b",
         crate::edit::autofill(&mut pkg.workbook, 0, (0, 3, 0, 3), (0, 4));
         let copy = pkg.workbook.sheets[0].cell(0, 4).unwrap();
         assert!(copy.formula.is_some());
-        assert!(copy.meta.is_none());
+        // Typed there (#785): modern, and none of the source's `cm`/`vm`.
+        let meta = copy.meta.as_deref().unwrap();
+        assert!(meta.modern && meta.cm.is_none() && meta.vm.is_none());
+    }
+
+    /// The `<f …>` opening tag (`ref` dropped) and whether the cell has a
+    /// `cm`, of cell `name` in a saved sheet.
+    fn saved_f_kind(ws: &str, name: &str) -> (String, bool) {
+        let at = ws
+            .find(&format!("<c r=\"{name}\""))
+            .unwrap_or_else(|| panic!("{name} in {ws}"));
+        let c = &ws[at..at + ws[at..].find("</c>").unwrap()];
+        let f = c
+            .find("<f")
+            .map_or("", |i| &c[i..i + c[i..].find('>').unwrap()]);
+        let f = f.split(" ref=").next().unwrap().to_string();
+        (f, c.contains(" cm="))
+    }
+
+    /// #785: an autofilled copy of a formula saves the same kind of `<f>` as a
+    /// Fill Right of it (`fill_changes` + `Engine::set_cell`): both are typed
+    /// at the destination (#724), after the engine has evaluated them — the
+    /// suite rebuilds and recalcs after an autofill.
+    #[test]
+    fn autofill_and_fill_copy_a_formula_alike() {
+        let cse_sum = r#"<c r="C1"><f t="array" ref="C1:C3">SUM(A1:A3)</f><v>6</v></c>"#;
+        let cse_array = r#"<c r="C1"><f t="array" ref="C1:C3">A1:A3*2</f><v>2</v></c>"#;
+        let legacy = r#"<c r="C1"><f>A1:A3*2</f><v>2</v></c>"#;
+        let dynamic = r#"<c r="C1" cm="1"><f t="array" ref="C1:C3">_xlfn._xlws.SORT(A1:A3,,-1)</f><v>3</v></c>"#;
+        for (src, want) in [
+            (cse_sum, ("<f".to_string(), false)),
+            (cse_array, ("<f t=\"array\"".to_string(), true)),
+            (legacy, ("<f t=\"array\"".to_string(), true)),
+            (dynamic, ("<f t=\"array\"".to_string(), true)),
+        ] {
+            // A1:A3 for the source, B1:B3 for the copies in D1 to read.
+            let rows: String = (1..=3)
+                .map(|r| {
+                    let extra = if r == 1 { src } else { "" };
+                    format!(r#"<row r="{r}"><c r="A{r}"><v>{r}</v></c><c r="B{r}"><v>5</v></c>{extra}</row>"#)
+                })
+                .collect();
+            let mut auto = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
+            crate::edit::autofill(&mut auto.workbook, 0, (0, 2, 0, 2), (0, 3));
+            let mut eng = crate::engine::Engine::new(&auto.workbook);
+            eng.recalc_all(&mut auto.workbook);
+
+            let mut fill = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
+            let mut eng = crate::engine::Engine::new(&fill.workbook);
+            eng.recalc_all(&mut fill.workbook);
+            for (r, c, cell) in
+                crate::edit::fill_changes(&fill.workbook.sheets[0], (0, 2, 0, 3), false)
+            {
+                eng.set_cell(&mut fill.workbook, (0, r, c), cell);
+            }
+
+            let (a, f) = (saved_sheet1(&auto), saved_sheet1(&fill));
+            assert_eq!(
+                saved_f_kind(&a, "D1"),
+                saved_f_kind(&f, "D1"),
+                "{src}
+{a}
+{f}"
+            );
+            assert_eq!(
+                saved_f_kind(&a, "D1"),
+                want,
+                "{src}
+{a}"
+            );
+        }
     }
 
     #[test]

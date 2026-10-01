@@ -504,26 +504,30 @@ pub fn autofill(
 /// A copy never inherits the source's `<f>` attributes: `t="array" ref="A1:A3"`
 /// or a shared group's `si` names cells this copy does not own, and writing the
 /// same `ref`/`si` out from several cells is what makes Excel offer to repair
-/// the file. Dropped, the copy is an ordinary formula computing the same thing
-/// — which is also what makes it safe to shift.
+/// the file. Dropped, the copy is an ordinary formula — which is also what
+/// makes it safe to shift.
 ///
 /// Nor does it inherit the source's `<c>` metadata: `vm` describes the
-/// source's value, and a `cm` would make a copy of a loaded `t="array"` cell a
-/// dynamic array (engine and writer both go by it) where this ordinary formula
-/// is meant. What the engine learned about a formula typed here does carry
-/// over: a copy of a typed dynamic array is one too (`modern`, `dynamic`).
+/// source's value, and a `cm` names the source's dynamic-array entry. A copy
+/// is typed there, as a paste or Fill Down is (#724, `Engine::set_cell`): a
+/// modern formula, spilling once the engine evaluates it, whatever the source
+/// was — a loaded legacy formula or CSE anchor included. What the engine
+/// learned about a typed dynamic array carries over (`dynamic`); a copy of a
+/// loaded one becomes one again when the engine evaluates its array result.
 fn rebase(cell: &mut Cell, dr: i64, dc: i64) {
-    cell.meta = cell.meta.take().filter(|m| m.modern || m.dynamic).map(|m| {
-        Box::new(crate::sheet::CellMeta {
-            modern: m.modern,
-            dynamic: m.dynamic,
-            ..Default::default()
-        })
-    });
+    let dynamic = cell.meta.as_ref().is_some_and(|m| m.dynamic);
+    cell.meta = None;
     if cell.f_attrs.take().is_some() && cell.formula.as_deref() == Some("") {
         // A shared-group follower whose master wouldn't parse carries no text of
         // its own; without the group marker there is no formula left to write.
         cell.formula = None;
+    }
+    if cell.formula.is_some() {
+        cell.meta = Some(Box::new(crate::sheet::CellMeta {
+            modern: true,
+            dynamic,
+            ..Default::default()
+        }));
     }
     if (dr, dc) == (0, 0) {
         return;
@@ -2857,7 +2861,8 @@ mod tests {
                 ..Default::default()
             })
         );
-        // Nothing learned, nothing kept: no metadata box at all.
+        // A copy of a loaded formula is typed there (#785): modern, and
+        // nothing else of the source's.
         let mut plain = Cell::formula("A1");
         plain.meta = Some(Box::new(crate::sheet::CellMeta {
             cm: Some("1".into()),
@@ -2865,7 +2870,13 @@ mod tests {
         }));
         wb.sheets[0].set_cell(1, 0, plain);
         autofill(&mut wb, 0, (1, 0, 1, 0), (1, 1));
-        assert!(wb.sheets[0].cell(1, 1).unwrap().meta.is_none());
+        assert_eq!(
+            wb.sheets[0].cell(1, 1).unwrap().meta.as_deref(),
+            Some(&crate::sheet::CellMeta {
+                modern: true,
+                ..Default::default()
+            })
+        );
     }
 
     /// Sheet1 with A{top}:A{top+2} = 1..3, a CSE array `A..:A..*2` anchored in
