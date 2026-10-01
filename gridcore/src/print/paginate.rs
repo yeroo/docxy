@@ -7,7 +7,8 @@
 //! its margins, at the sheet's scale (`Adjust to`, or the largest whole
 //! percentage that fits `Fit to` pages, never above 100 %). While `Fit to`
 //! is on, manual breaks are ignored, as Excel ignores them. Print titles
-//! repeat on every page that doesn't already show them. Pages run down then
+//! repeat on every page that doesn't already show them, except titles that
+//! would fill a page by themselves, which don't repeat at all (our rule). Pages run down then
 //! over, or over then down, and are numbered across the whole job.
 //!
 //! Sizes: a column `width` w (in character units, padding included) is
@@ -16,6 +17,8 @@
 //! `defaultColWidth` sizes its columns at `baseColWidth`·7 + 5 px rounded up
 //! to a multiple of 8 (64 px for the familiar 8.43). A row is its `ht`, or
 //! the sheet's `defaultRowHeight`, or 15 pt. A pixel is 0.75 pt.
+
+use std::sync::Arc;
 
 use super::area::{Rect, print_area, print_titles};
 use super::setup::PageOrder;
@@ -65,10 +68,11 @@ pub struct Page {
     /// The sheet columns printed in the body, in order.
     pub cols: Vec<u32>,
     /// Title rows repeated above the body on this page (none where the body
-    /// already shows them).
-    pub title_rows: Vec<u32>,
-    /// Title columns repeated left of the body.
-    pub title_cols: Vec<u32>,
+    /// already shows them). Shared by every page of the sheet that repeats
+    /// them, so a tall title block costs its size once, not once a page.
+    pub title_rows: Arc<[u32]>,
+    /// Title columns repeated left of the body, shared likewise.
+    pub title_cols: Arc<[u32]>,
     /// The page number printed for `&P`.
     pub number: u32,
     /// The page's position within its sheet's pages, 1-based: what
@@ -225,6 +229,7 @@ fn sheet_ranges(wb: &Workbook, sheet: usize, ignore_print_areas: bool) -> Vec<Re
 }
 
 /// One axis of a range: the visible lines and their sizes at 100 %.
+#[derive(Clone)]
 struct Axis {
     lines: Vec<u32>,
     sizes: Vec<f64>,
@@ -255,6 +260,21 @@ fn titles(sheet: &Sheet, span: Option<(u32, u32)>, rows: bool) -> Axis {
             lines: Vec::new(),
             sizes: Vec::new(),
         },
+    }
+}
+
+/// The titles of one axis as they repeat at `scale` in `room`: none when
+/// they would fill the whole page by themselves, so the body paginates as if
+/// there were no titles rather than one line a page. (Our rule: the spec
+/// doesn't say what Excel does with titles taller than a page.)
+fn repeatable(title: Axis, room: f64, scale: f64) -> Axis {
+    if title.sizes.iter().sum::<f64>() * scale >= room {
+        Axis {
+            lines: Vec::new(),
+            sizes: Vec::new(),
+        }
+    } else {
+        title
     }
 }
 
@@ -341,6 +361,8 @@ fn sheet_scale(wb: &Workbook, sheet: usize, ranges: &[Rect]) -> f64 {
         .collect();
     let fits = |pct: u32| {
         let k = f64::from(pct) / 100.0;
+        let tr = repeatable(tr.clone(), room_h, k);
+        let tc = repeatable(tc.clone(), room_w, k);
         axes.iter().all(|(rows, cols)| {
             (ps.fit_width == 0 || bands(cols, &tc, room_w, k, &cb).len() <= ps.fit_width as usize)
                 && (ps.fit_height == 0
@@ -371,7 +393,11 @@ fn sheet_pages(wb: &Workbook, sheet: usize, ranges: &[Rect], budget: usize) -> (
     let scale = sheet_scale(wb, sheet, ranges);
     let (room_w, room_h) = body_points(wb, sheet);
     let t = print_titles(wb, sheet);
-    let (tr, tc) = (titles(s, t.rows, true), titles(s, t.cols, false));
+    let tr = repeatable(titles(s, t.rows, true), room_h, scale);
+    let tc = repeatable(titles(s, t.cols, false), room_w, scale);
+    let (shared_rows, shared_cols): (Arc<[u32]>, Arc<[u32]>) =
+        (tr.lines.as_slice().into(), tc.lines.as_slice().into());
+    let none: Arc<[u32]> = Arc::from([]);
     let (rb, cb) = obeyed_breaks(s);
     let mut out = Vec::new();
     for &(r1, c1, r2, c2) in ranges {
@@ -406,12 +432,12 @@ fn sheet_pages(wb: &Workbook, sheet: usize, ranges: &[Rect], budget: usize) -> (
             let body_rows = rows.lines[ra..rz].to_vec();
             let body_cols = cols.lines[ca..cz].to_vec();
             let title_rows = match tr.lines.last() {
-                Some(&end) if body_rows[0] > end => tr.lines.clone(),
-                _ => Vec::new(),
+                Some(&end) if body_rows[0] > end => shared_rows.clone(),
+                _ => none.clone(),
             };
             let title_cols = match tc.lines.last() {
-                Some(&end) if body_cols[0] > end => tc.lines.clone(),
-                _ => Vec::new(),
+                Some(&end) if body_cols[0] > end => shared_cols.clone(),
+                _ => none.clone(),
             };
             out.push(Page {
                 sheet,
@@ -431,11 +457,14 @@ fn sheet_pages(wb: &Workbook, sheet: usize, ranges: &[Rect], budget: usize) -> (
 /// Lay out a print job. No pages means there is nothing to print.
 pub fn paginate(wb: &Workbook, job: &Job) -> Pages {
     let jobs: Vec<(usize, Vec<Rect>)> = match &job.what {
-        What::ActiveSheets(list) => list
-            .iter()
-            .filter(|&&i| i < wb.sheets.len())
-            .map(|&i| (i, sheet_ranges(wb, i, job.ignore_print_areas)))
-            .collect(),
+        // Each sheet once, and no hidden sheet: hidden sheets don't print.
+        What::ActiveSheets(list) => {
+            let mut seen = std::collections::HashSet::new();
+            list.iter()
+                .filter(|&&i| i < wb.sheets.len() && !wb.sheets[i].hidden && seen.insert(i))
+                .map(|&i| (i, sheet_ranges(wb, i, job.ignore_print_areas)))
+                .collect()
+        }
         What::EntireWorkbook => (0..wb.sheets.len())
             .filter(|&i| !wb.sheets[i].hidden)
             .map(|i| (i, sheet_ranges(wb, i, job.ignore_print_areas)))

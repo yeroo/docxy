@@ -2,6 +2,7 @@ use super::*;
 use crate::print::area::{PrintTitles, set_print_area, set_print_titles};
 use crate::print::setup::PageOrder;
 use crate::sheet::{Cell, ColDef, PageBreak, SheetFormat};
+use std::sync::Arc;
 
 /// A workbook of sheets named S0, S1, … each filled with numbers in
 /// rows × cols from A1.
@@ -174,17 +175,29 @@ fn title_rows_and_columns_repeat_on_pages_that_do_not_show_them() {
     // which costs each a row: 44 rows after the first page.
     let first = &p.pages[0];
     assert_eq!(
-        (first.title_rows.clone(), first.title_cols.clone()),
+        (first.title_rows.to_vec(), first.title_cols.to_vec()),
         (vec![], vec![])
     );
     assert_eq!(first.range(), (0, 0, 44, 9));
     let second = &p.pages[1];
-    assert_eq!(second.title_rows, vec![0]);
-    assert_eq!(second.title_cols, vec![]);
+    assert_eq!(*second.title_rows, [0]);
+    assert!(second.title_cols.is_empty());
+    // One title block for the whole sheet, not a copy per page.
+    let repeating: Vec<_> = p
+        .pages
+        .iter()
+        .filter(|pg| !pg.title_rows.is_empty())
+        .collect();
+    assert!(repeating.len() > 1);
+    assert!(
+        repeating
+            .windows(2)
+            .all(|w| Arc::ptr_eq(&w[0].title_rows, &w[1].title_rows))
+    );
     assert_eq!(second.range(), (45, 0, 88, 9));
     // Pages over repeat column A, so they hold 9 columns.
     let over = p.pages.iter().find(|pg| pg.cols[0] >= 10).unwrap();
-    assert_eq!(over.title_cols, vec![0]);
+    assert_eq!(*over.title_cols, [0]);
     assert_eq!(over.range().1, 10);
 }
 
@@ -401,4 +414,46 @@ fn fit_to_ignores_manual_breaks() {
     // Without Fit to, the break holds.
     wb.sheets[0].page_setup.fit_to_page = false;
     assert_eq!(active(&wb).total, 2);
+}
+
+#[test]
+fn titles_taller_than_a_page_do_not_repeat() {
+    // FIX r3 M1: rows 1:1000 as titles are far taller than one page (684 pt).
+    let mut wb = book(&[(3000, 3)]);
+    let plain = active(&wb).total;
+    set_print_titles(
+        &mut wb,
+        0,
+        PrintTitles {
+            rows: Some((0, 999)),
+            cols: None,
+        },
+    );
+    let p = active(&wb);
+    assert_eq!(p.total, plain);
+    assert!(p.pages.iter().all(|pg| pg.title_rows.is_empty()));
+    // Titles that fit still repeat.
+    set_print_titles(
+        &mut wb,
+        0,
+        PrintTitles {
+            rows: Some((0, 1)),
+            cols: None,
+        },
+    );
+    assert_eq!(*active(&wb).pages[1].title_rows, [0, 1]);
+}
+
+#[test]
+fn active_sheets_print_each_visible_sheet_once() {
+    // FIX r3 m3.
+    let mut wb = book(&[(10, 1), (10, 1)]);
+    let p = paginate(&wb, &Job::new(What::ActiveSheets(vec![0, 0, 1])));
+    assert_eq!(
+        p.pages.iter().map(|p| p.sheet).collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    wb.sheets[1].hidden = true;
+    let p = paginate(&wb, &Job::new(What::ActiveSheets(vec![0, 1])));
+    assert_eq!(p.pages.iter().map(|p| p.sheet).collect::<Vec<_>>(), vec![0]);
 }
