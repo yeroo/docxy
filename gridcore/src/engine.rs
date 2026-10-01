@@ -234,9 +234,10 @@ impl Engine {
                 changed.extend(clear_spill(sheet, s, (r, c), ext, None));
             }
             // An edit landing inside another anchor's spill breaks that
-            // spill: clear its cells and let the anchor recalc to #SPILL!.
+            // spill: clear its cells (this one is overwritten next) and let
+            // the anchor recalc to #SPILL!.
             if let Some((anchor, ext)) = spill_owner(sheet, r, c) {
-                changed.extend(clear_spill(sheet, s, anchor, ext, Some((r, c))));
+                changed.extend(clear_spill(sheet, s, anchor, ext, None));
                 if let Some(a) = sheet.cells.get_mut(&anchor) {
                     a.spill = None;
                 }
@@ -2240,6 +2241,25 @@ mod tests {
         assert_eq!(value_at(&wb, "A1"), CellValue::Number(1.0));
         assert_eq!(value_at(&wb, "A2"), CellValue::Number(2.0));
         assert_eq!(value_at(&wb, "A3"), CellValue::Number(3.0));
+    }
+
+    /// #785 r2: a value typed into a spill away from column A and row 1 clears
+    /// the rest of the spill too (the kept extent was the typed cell's
+    /// address), and clearing it heals the spill.
+    #[test]
+    fn typing_into_a_spill_off_the_origin_clears_the_rest_of_it() {
+        let mut wb = wb_one_sheet(&[("D1", array_formula("SEQUENCE(3)"))]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "D2"), CellValue::Number(2.0));
+        set(&mut eng, &mut wb, "D3", Cell::number(7.0));
+        assert_eq!(value_at(&wb, "D1"), CellValue::Error("#SPILL!".into()));
+        assert_eq!(value_at(&wb, "D2"), CellValue::Empty);
+        assert_eq!(value_at(&wb, "D3"), CellValue::Number(7.0));
+        set(&mut eng, &mut wb, "D3", Cell::default());
+        for (name, v) in [("D1", 1.0), ("D2", 2.0), ("D3", 3.0)] {
+            assert_eq!(value_at(&wb, name), CellValue::Number(v), "{name}");
+        }
     }
 
     #[test]
