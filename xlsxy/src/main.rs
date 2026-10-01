@@ -11796,22 +11796,26 @@ mod tests {
         app.anchor = Some((1, 3));
         app.cur = (2, 4);
         app.fill(false);
-        assert_eq!(
-            col_values(&app, 4, 0, 2),
-            vec![n(7.0), CellValue::Empty, n(5.0)],
-            "fill"
-        );
+        let filled = vec![n(7.0), CellValue::Empty, n(5.0)];
+        assert_eq!(col_values(&app, 4, 0, 2), filled, "fill");
         app.undo();
         assert_eq!(col_values(&app, 4, 0, 2), vec![n(7.0), n(8.0), n(9.0)]);
+        // #840 r2: redo ends as the fill did.
+        app.redo();
+        assert_eq!(col_values(&app, 4, 0, 2), filled, "redo fill");
+        let e1 = |app: &App| app.pkg.workbook.sheets[0].cell(0, 4).unwrap().spill;
+        assert_eq!(e1(&app), None, "redo fill");
 
         // Replace "x" with "" over E2 "x", E3 "xy".
         let mut app = app_with_frozen_block(Cell::text("x"), Cell::text("xy"));
         app.replace_all("x", "");
-        assert_eq!(
-            col_values(&app, 4, 0, 2),
-            vec![n(7.0), CellValue::Empty, t("y")],
-            "replace"
-        );
+        let replaced = vec![n(7.0), CellValue::Empty, t("y")];
+        assert_eq!(col_values(&app, 4, 0, 2), replaced, "replace");
+        app.undo();
+        assert_eq!(col_values(&app, 4, 0, 2), vec![n(7.0), t("x"), t("xy")]);
+        app.redo();
+        assert_eq!(col_values(&app, 4, 0, 2), replaced, "redo replace");
+        assert_eq!(e1(&app), None, "redo replace");
     }
 
     #[test]

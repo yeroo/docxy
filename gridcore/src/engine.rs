@@ -141,9 +141,23 @@ impl Engine {
         if self.supported.contains(&key) {
             return false;
         }
-        let Some(info) = self.formulas.get(&key) else {
-            return false;
-        };
+        self.evaluates_unsupported(wb, key).unwrap_or(false)
+    }
+
+    /// [`Engine::is_frozen`] as the cell's inputs stand now: a formula of
+    /// ours is evaluated afresh, whatever an earlier evaluation met (an
+    /// input that made it unsupported, `INDIRECT` asked for R1C1 say, may
+    /// have changed since). One kept on its cached value for what it is (a
+    /// preserved `<f>`, a parse failure) stays so.
+    fn is_frozen_now(&self, wb: &Workbook, key: Key) -> bool {
+        self.evaluates_unsupported(wb, key)
+            .unwrap_or_else(|| self.unsupported.contains(&key))
+    }
+
+    /// Does evaluating this cell's formula meet something beyond the engine?
+    /// Nothing is stored. `None` for a cell with no formula of ours.
+    fn evaluates_unsupported(&self, wb: &Workbook, key: Key) -> Option<bool> {
+        let info = self.formulas.get(&key)?;
         let resolver = WbResolver {
             wb,
             clock: self.clock,
@@ -154,7 +168,7 @@ impl Engine {
         tests::FROZEN_EVALS.with(|n| n.set(n.get() + 1));
         let mut ev = Eval::new(&resolver, key.0, (key.1, key.2));
         let _ = ev.eval_dynamic_shaped(&info.ast, !info.legacy);
-        ev.unsupported
+        Some(ev.unsupported)
     }
 
     /// Register a cell's formula (if any) as it stands, the way a freshly
@@ -238,7 +252,7 @@ impl Engine {
         // afresh.
         let prev = wb.sheets.get(s).and_then(|sh| sh.cell(r, c));
         let same = prev.filter(|p| cell.formula.is_some() && p.formula == cell.formula);
-        if recommit && same.is_some() && self.is_frozen(wb, key) {
+        if recommit && same.is_some() && self.is_frozen_now(wb, key) {
             self.set_styles(wb, s, &[(r, c, cell.style)]);
             return;
         }
@@ -289,19 +303,15 @@ impl Engine {
     /// block breaks it, and then the blank clears its cell like any other:
     /// applied last, it does so whatever order the group came in.
     pub fn set_cells(&mut self, wb: &mut Workbook, s: usize, changes: Vec<(u32, u32, Cell)>) {
-        // Found once per group, not per blank: a Delete over a large live
-        // spill would otherwise evaluate its anchor for every cell.
-        let blocks = if changes.iter().any(|(_, _, cell)| cell.is_blank()) {
-            self.frozen_blocks(wb, s)
-        } else {
-            Vec::new()
-        };
-        let (later, now): (Vec<_>, Vec<_>) = changes.into_iter().partition(|(r, c, cell)| {
-            cell.is_blank()
-                && blocks.iter().any(|&(anchor, (r1, c1, r2, c2))| {
-                    anchor != (*r, *c) && (r1..=r2).contains(r) && (c1..=c2).contains(c)
-                })
-        });
+        let blanks: Vec<(u32, u32)> = changes
+            .iter()
+            .filter(|(_, _, cell)| cell.is_blank())
+            .map(|&(r, c, _)| (r, c))
+            .collect();
+        let later = self.blanks_in_frozen_blocks(wb, s, &blanks);
+        let (later, now): (Vec<_>, Vec<_>) = changes
+            .into_iter()
+            .partition(|(r, c, _)| later.contains(&(*r, *c)));
         for (r, c, cell) in now.into_iter().chain(later) {
             self.set_cell(wb, (s, r, c), cell);
         }
@@ -364,16 +374,32 @@ impl Engine {
             .map(|(r, c, cl)| (*r, *c, cl))
             .collect();
         let mut members = Vec::new();
+        let mut plain = Vec::new();
         for &(r, c, ref cell) in cells {
             if cell.formula.is_some() && cell.spill.is_some() {
                 continue;
             }
             if cell.formula.is_none() && in_extent(&anchors, r, c) {
                 members.push((r, c, cell));
-                self.restore_cell(wb, (s, r, c), cell.blank_like());
+                plain.push((r, c, cell.blank_like()));
             } else {
-                self.restore_cell(wb, (s, r, c), cell.clone());
+                plain.push((r, c, cell.clone()));
             }
+        }
+        // As in [`Engine::set_cells`]: blanks landing in a frozen block go
+        // after the rest, so the redo of a group that put a blank and a
+        // value into one frozen block ends as the group did.
+        let blanks: Vec<(u32, u32)> = plain
+            .iter()
+            .filter(|(_, _, cell)| cell.is_blank())
+            .map(|&(r, c, _)| (r, c))
+            .collect();
+        let later = self.blanks_in_frozen_blocks(wb, s, &blanks);
+        let (later, now): (Vec<_>, Vec<_>) = plain
+            .into_iter()
+            .partition(|(r, c, _)| later.contains(&(*r, *c)));
+        for (r, c, cell) in now.into_iter().chain(later) {
+            self.restore_cell(wb, (s, r, c), cell);
         }
         let frozen: Vec<_> = anchors
             .iter()
@@ -602,28 +628,49 @@ impl Engine {
         self.recalc_from(wb, &changed);
     }
 
-    /// The blocks of sheet `s`'s frozen array anchors, each with its anchor:
-    /// the cells both its extent and its own `ref` (one that starts at it)
-    /// cover, where a blank is a no-op ([`Engine::spill_owner_of`]'s
-    /// `frozen_ref_covers`).
-    fn frozen_blocks(&self, wb: &Workbook, s: usize) -> Vec<FrozenBlock> {
-        let Some(sheet) = wb.sheets.get(s) else {
-            return Vec::new();
+    /// Which of `blanks` (cells a group is about to blank on sheet `s`) land
+    /// in a frozen array anchor's block as the sheet stands: the cells, but
+    /// the anchor, that both its extent and its own `ref` (one that starts
+    /// at it) cover, where a blank is a no-op ([`Engine::spill_owner_of`]'s
+    /// `frozen_ref_covers`). Found once per group, not per blank; only an
+    /// anchor whose block takes one of them is asked [`Engine::is_frozen`]
+    /// (which may evaluate it).
+    fn blanks_in_frozen_blocks(
+        &self,
+        wb: &Workbook,
+        s: usize,
+        blanks: &[(u32, u32)],
+    ) -> HashSet<(u32, u32)> {
+        let mut out = HashSet::new();
+        let Some(sheet) = wb.sheets.get(s).filter(|_| !blanks.is_empty()) else {
+            return out;
         };
-        sheet
-            .cells
-            .iter()
-            .filter_map(|(&(r, c), cell)| {
-                let (h, w) = cell.spill?;
-                let fa = cell.f_attrs.as_deref().filter(|fa| is_array_f(fa))?;
-                if !crate::sheet::ref_starts_at(fa, &crate::sheet::cell_name(r, c)) {
-                    return None;
-                }
-                let (_, _, r2, c2) = array_block(cell)?;
-                let block = (r, c, r2.min(r + h - 1), c2.min(c + w - 1));
-                self.is_frozen(wb, (s, r, c)).then_some(((r, c), block))
-            })
-            .collect()
+        for (&(r, c), cell) in &sheet.cells {
+            let Some((h, w)) = cell.spill else {
+                continue;
+            };
+            let Some(fa) = cell.f_attrs.as_deref().filter(|fa| is_array_f(fa)) else {
+                continue;
+            };
+            if !crate::sheet::ref_starts_at(fa, &crate::sheet::cell_name(r, c)) {
+                continue;
+            }
+            let Some((_, _, r2, c2)) = array_block(cell) else {
+                continue;
+            };
+            let (r2, c2) = (r2.min(r + h - 1), c2.min(c + w - 1));
+            let inside: Vec<(u32, u32)> = blanks
+                .iter()
+                .copied()
+                .filter(|&(br, bc)| {
+                    (br, bc) != (r, c) && (r..=r2).contains(&br) && (c..=c2).contains(&bc)
+                })
+                .collect();
+            if !inside.is_empty() && self.is_frozen(wb, (s, r, c)) {
+                out.extend(inside);
+            }
+        }
+        out
     }
 
     /// The spill anchor whose extent holds `key` (other than `key` itself),
@@ -1134,10 +1181,6 @@ impl Engine {
         changed
     }
 }
-
-/// A frozen array anchor and the block `(r1, c1, r2, c2)` where a blank is a
-/// no-op ([`Engine::frozen_blocks`]).
-type FrozenBlock = ((u32, u32), (u32, u32, u32, u32));
 
 /// The spill anchor over a cell ([`Engine::spill_owner_of`]).
 struct SpillOwner {
@@ -3729,5 +3772,101 @@ mod tests {
             .collect();
         assert_eq!(col, vec![n(1.0), n(2.0), n(3.0), CellValue::Empty]);
         assert_eq!(cell_at(&wb, "E1").spill, Some((3, 1)));
+    }
+
+    #[test]
+    fn a_blank_group_away_from_array_anchors_evaluates_none() {
+        // #840 r2 M1: only an anchor whose block a blank lands in is asked
+        // whether it is frozen. Loaded arrays (a one-cell CSE, a 3-row CSE, a
+        // dynamic array) elsewhere on the sheet are not evaluated by a Delete
+        // in A10:A12.
+        let array = |src: &str, r: &str, h: u32| {
+            let mut a = array_formula(src);
+            a.f_attrs = Some(format!("t=\"array\" ref=\"{r}\""));
+            a.spill = Some((h, 1));
+            a
+        };
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("D5", array("SUM(A1:A3)", "D5", 1)),
+            ("H1", array("A1:A3*2", "H1:H3", 3)),
+            ("J1", array("SEQUENCE(2)", "J1:J2", 2)),
+            ("A10", Cell::number(1.0)),
+            ("A11", Cell::number(2.0)),
+            ("A12", Cell::number(3.0)),
+        ]);
+        let mut eng = Engine::new(&wb);
+        FROZEN_EVALS.with(|n| n.set(0));
+        let blanks = (9..12u32).map(|r| (r, 0, Cell::default())).collect();
+        eng.set_cells(&mut wb, 0, blanks);
+        assert_eq!(FROZEN_EVALS.with(StdCell::get), 0);
+        assert_eq!(value_at(&wb, "A11"), CellValue::Empty);
+    }
+
+    #[test]
+    fn restoring_a_mixed_group_into_a_frozen_block_ends_as_the_group_did() {
+        // #840 r2 M2: a redo puts back the group's after-snapshot as its
+        // undo group lists it, the edited keys and then the frozen anchor
+        // they lie in: E2 blank, E3 5, E1 (no extent now). Over the whole
+        // frozen block the blank would be a no-op ahead of the 5; it goes
+        // last, as in `set_cells`.
+        let n = |v: f64| CellValue::Number(v);
+        let mut wb = frozen_block_wb();
+        let mut eng = Engine::new(&wb);
+        eng.set_cells(
+            &mut wb,
+            0,
+            vec![(1, 4, Cell::default()), (2, 4, Cell::number(5.0))],
+        );
+        let want = vec![n(7.0), CellValue::Empty, n(5.0)];
+        assert_eq!(col_e(&wb), want);
+        let after: Vec<(u32, u32, Cell)> = (0..3u32)
+            .map(|r| (r, 4, wb.sheets[0].cell(r, 4).cloned().unwrap_or_default()))
+            .collect();
+        let after = [after[1].clone(), after[2].clone(), after[0].clone()];
+        let mut wb = frozen_block_wb();
+        let mut eng = Engine::new(&wb);
+        eng.restore_cells(&mut wb, 0, &after);
+        assert_eq!(col_e(&wb), want);
+        assert_eq!(cell_at(&wb, "E1").spill, None);
+    }
+
+    #[test]
+    fn retyping_a_formula_frozen_by_its_input_recomputes_it() {
+        // #840 r2 m1: INDIRECT asked for R1C1 is beyond the engine, so C1
+        // keeps its cached value. Once B2 asks for A1 style, the same text
+        // typed again is evaluated: only a formula still frozen is kept.
+        let mut c1 = Cell::formula("INDIRECT(B1,B2)");
+        c1.value = CellValue::Number(42.0);
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(5.0)),
+            ("B1", Cell::text("A1")),
+            (
+                "B2",
+                Cell {
+                    value: CellValue::Bool(false),
+                    ..Cell::default()
+                },
+            ),
+            ("C1", c1),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert!(eng.is_unsupported((0, 0, 2)));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(42.0));
+        // Still frozen: retyped, it keeps its cached value.
+        set(&mut eng, &mut wb, "C1", Cell::formula("INDIRECT(B1,B2)"));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(42.0));
+        set(
+            &mut eng,
+            &mut wb,
+            "B2",
+            Cell {
+                value: CellValue::Bool(true),
+                ..Cell::default()
+            },
+        );
+        set(&mut eng, &mut wb, "C1", Cell::formula("INDIRECT(B1,B2)"));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(5.0));
     }
 }
