@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **New: workbook document properties over MCP.** `xlsxy_properties` and
+  `xlsxy_set_properties` read and set Title, Tags, Categories, Subject,
+  Comments, Company, Manager, Hyperlink base and custom properties of a
+  terminal `xlsxy` (File › Info), growing the combined Offxy surface from 64
+  to **66 tools** (31 docxy + 35 xlsxy). A VS Code spreadsheet tab does not
+  answer them yet.
 - **Macro workbooks and templates open in the spreadsheet editor.**
   `offxy.gridEditor` now claims `.xlsm`, `.xltx` and `.xltm` as well as
   `.xlsx`; a save writes the file's own type, and a template is edited in

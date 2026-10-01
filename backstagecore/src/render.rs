@@ -70,7 +70,7 @@ pub fn draw(f: &mut Frame, area: Rect, bs: &mut Backstage, host: &dyn BackstageH
     match bs.item {
         Item::Open => draw_open(f, cols[1], bs, host),
         Item::SaveAs => draw_save_as(f, cols[1], bs, host),
-        Item::Info => draw_info(f, cols[1], host),
+        Item::Info => draw_info(f, cols[1], bs, host),
         Item::Options => draw_options(f, cols[1], bs, host),
         Item::Export if !bs.save_types.is_empty() => draw_export(f, cols[1], bs, host),
         other => {
@@ -371,15 +371,67 @@ fn draw_options(f: &mut Frame, area: Rect, bs: &Backstage, host: &dyn BackstageH
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw_info(f: &mut Frame, area: Rect, host: &dyn BackstageHost) {
+fn draw_info(f: &mut Frame, area: Rect, bs: &mut Backstage, host: &dyn BackstageHost) {
     let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut lines = host.info_lines();
+    let fields = host.info_fields();
+    let custom = host.info_custom_row();
+    let mut scroll = 0usize;
+    if !fields.is_empty() || custom {
+        let focus = bs.pane == Pane::Info;
+        let accent = Style::default().fg(Color::Black).bg(host.accent());
+        lines.push(RLine::raw(""));
+        let first_row = lines.len();
+        let rows = fields
+            .iter()
+            .map(|(label, value)| format!("  {label:<18}{value}"))
+            .chain(custom.then(|| "  Custom property…".to_string()));
+        for (i, text) in rows.enumerate() {
+            let style = if focus && i == bs.info_sel {
+                accent
+            } else {
+                Style::default()
+            };
+            lines.push(RLine::styled(text, style));
+        }
+        lines.push(RLine::raw(""));
+        if let Some(msg) = &bs.info_message {
+            lines.push(RLine::styled(
+                format!("  {msg}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+        }
+        lines.push(RLine::styled(
+            if focus {
+                "  ↑↓ choose · Enter edit · ← menu · Esc close"
+            } else {
+                "  Enter to edit the properties · Esc to close"
+            },
+            dim,
+        ));
+        // Scroll only when the selected row would leave the box, so a row
+        // stays under the pointer between a selecting and an editing click.
+        let inner = area.height.saturating_sub(2) as usize;
+        let sel_line = first_row + bs.info_sel;
+        if focus && inner > 0 {
+            scroll = bs
+                .info_scroll
+                .min(sel_line)
+                .max((sel_line + 1).saturating_sub(inner));
+        }
+        bs.info_scroll = scroll;
+        bs.layout.info_top = i32::from(area.y) + 1 + first_row as i32 - scroll as i32;
+        bs.layout.info_view = (area.y + 1, area.y + 1 + inner as u16);
+    }
     f.render_widget(
-        Paragraph::new(host.info_lines()).block(
-            RBlock::default()
-                .borders(Borders::ALL)
-                .border_style(dim)
-                .title(" Info "),
-        ),
+        Paragraph::new(lines)
+            .scroll((scroll.min(u16::MAX as usize) as u16, 0))
+            .block(
+                RBlock::default()
+                    .borders(Borders::ALL)
+                    .border_style(dim)
+                    .title(" Info "),
+            ),
         area,
     );
 }
@@ -509,6 +561,195 @@ mod tests {
             "heading missing"
         );
         assert!(text.contains("[x] Keep zeros"), "checkbox missing");
+    }
+
+    struct Editable;
+    impl BackstageHost for Editable {
+        fn extensions(&self) -> &'static [&'static str] {
+            &["xlsx"]
+        }
+        fn default_save_name(&self) -> String {
+            "book.xlsx".into()
+        }
+        fn preview_lines(&self, _p: &Path, _w: usize) -> Vec<String> {
+            Vec::new()
+        }
+        fn info_lines(&self) -> Vec<Line<'static>> {
+            vec![Line::raw("  File  book.xlsx"), Line::raw("  Author  Me")]
+        }
+        fn accent(&self) -> Color {
+            Color::Green
+        }
+        fn info_fields(&self) -> Vec<(String, String)> {
+            vec![
+                ("Title".into(), "Budget".into()),
+                ("Tags".into(), String::new()),
+            ]
+        }
+        fn info_custom_row(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn draws_the_info_page_with_its_editable_rows() {
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut bs = Backstage::open(std::env::temp_dir(), &["xlsx"]);
+        bs.focus_info(1);
+        term.draw(|f| {
+            let a = f.area();
+            super::draw(f, a, &mut bs, &Editable);
+        })
+        .unwrap();
+        let text = screen(&term);
+        let lines: Vec<&str> = text.lines().collect();
+        // Box border at y 1, two info lines, a blank line, then the rows.
+        assert_eq!(bs.layout.info_top, 5);
+        assert!(lines[5].contains("Title             Budget"), "{text}");
+        assert!(lines[6].contains("Tags"), "{text}");
+        assert!(lines[7].contains("Custom property…"), "{text}");
+        assert!(text.contains("Enter edit"), "{text}");
+        // The focused row is highlighted in the host's accent.
+        let buf = term.backend().buffer();
+        assert_eq!(buf[(18, 6)].bg, Color::Green);
+        assert_ne!(buf[(18, 5)].bg, Color::Green);
+    }
+
+    /// More rows than the box holds: the page scrolls so the selected row
+    /// stays inside the border, and a click on the border does nothing.
+    #[test]
+    fn a_tall_info_page_keeps_the_selected_row_in_the_box() {
+        struct Tall;
+        impl BackstageHost for Tall {
+            fn extensions(&self) -> &'static [&'static str] {
+                &["xlsx"]
+            }
+            fn default_save_name(&self) -> String {
+                "book.xlsx".into()
+            }
+            fn preview_lines(&self, _p: &Path, _w: usize) -> Vec<String> {
+                Vec::new()
+            }
+            fn info_lines(&self) -> Vec<Line<'static>> {
+                (0..15).map(|i| Line::raw(format!("  line {i}"))).collect()
+            }
+            fn accent(&self) -> Color {
+                Color::Green
+            }
+            fn info_fields(&self) -> Vec<(String, String)> {
+                (0..8)
+                    .map(|i| (format!("Field{i}"), String::new()))
+                    .collect()
+            }
+            fn info_custom_row(&self) -> bool {
+                true
+            }
+        }
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut bs = Backstage::open(std::env::temp_dir(), &["xlsx"]);
+        bs.focus_info(8);
+        term.draw(|f| {
+            let a = f.area();
+            super::draw(f, a, &mut bs, &Tall);
+        })
+        .unwrap();
+        let text = screen(&term);
+        let lines: Vec<&str> = text.lines().collect();
+        // The box spans rows 1..=23; its last inner row is 22.
+        assert_eq!(bs.layout.info_view, (2, 23));
+        assert!(lines[22].contains("Custom property…"), "{text}");
+        assert!(lines[23].contains("└"), "{text}");
+        assert_eq!(term.backend().buffer()[(18, 22)].bg, Color::Green);
+        // A click on the bottom border does nothing; one on the row edits it.
+        assert!(matches!(
+            bs.mouse(20, 23, &Tall),
+            crate::BackstageEvent::None
+        ));
+        assert_eq!(bs.info_sel, 8);
+        assert!(matches!(
+            bs.mouse(20, 22, &Tall),
+            crate::BackstageEvent::EditInfo(8)
+        ));
+        // The page holds still while the selection stays in the box: a row
+        // clicked once is still under the pointer for the second click.
+        let y5 = (bs.layout.info_top + 5) as u16;
+        assert!(matches!(
+            bs.mouse(20, y5, &Tall),
+            crate::BackstageEvent::None
+        ));
+        assert_eq!(bs.info_sel, 5);
+        let before = bs.layout.info_top;
+        term.draw(|f| {
+            let a = f.area();
+            super::draw(f, a, &mut bs, &Tall);
+        })
+        .unwrap();
+        assert_eq!(bs.layout.info_top, before);
+        assert!(matches!(
+            bs.mouse(20, y5, &Tall),
+            crate::BackstageEvent::EditInfo(5)
+        ));
+        // From the top, Down past the box's last row moves the page by one
+        // line per step; Down inside the box doesn't move it.
+        let down = |bs: &mut Backstage, term: &mut Terminal<TestBackend>| {
+            bs.key(
+                ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::Down),
+                &Tall,
+            );
+            term.draw(|f| {
+                let a = f.area();
+                super::draw(f, a, bs, &Tall);
+            })
+            .unwrap();
+            bs.info_scroll
+        };
+        bs.focus_info(0);
+        bs.info_scroll = 0;
+        term.draw(|f| {
+            let a = f.area();
+            super::draw(f, a, &mut bs, &Tall);
+        })
+        .unwrap();
+        assert_eq!(bs.info_scroll, 0);
+        // Rows start on screen row 18; inner rows end at 22: rows 0..=4 fit.
+        let scrolls: Vec<usize> = (1..=8).map(|_| down(&mut bs, &mut term)).collect();
+        assert_eq!(scrolls, [0, 0, 0, 0, 1, 2, 3, 4]);
+        // Back up inside the box: still.
+        bs.key(
+            ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::Up),
+            &Tall,
+        );
+        term.draw(|f| {
+            let a = f.area();
+            super::draw(f, a, &mut bs, &Tall);
+        })
+        .unwrap();
+        assert_eq!(bs.info_scroll, 4);
+        // Unfocused (back on the menu), the page shows its top.
+        bs.pane = crate::Pane::Menu;
+        term.draw(|f| {
+            let a = f.area();
+            super::draw(f, a, &mut bs, &Tall);
+        })
+        .unwrap();
+        let text = screen(&term);
+        assert!(text.lines().nth(2).unwrap().contains("line 0"), "{text}");
+    }
+
+    #[test]
+    fn draws_a_read_only_info_page_as_before() {
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut bs = Backstage::open(std::env::temp_dir(), &["docx"]);
+        bs.item = Item::Info;
+        term.draw(|f| {
+            let a = f.area();
+            super::draw(f, a, &mut bs, &H);
+        })
+        .unwrap();
+        let text = screen(&term);
+        assert!(text.contains("info"), "{text}");
+        assert!(!text.contains("Custom property"), "{text}");
+        assert!(!text.contains("Enter to edit"), "{text}");
     }
 
     #[test]

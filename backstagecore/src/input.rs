@@ -6,6 +6,11 @@ use crate::{Backstage, BackstageEvent, BackstageHost, Item, Pane};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Position;
 
+/// How many editable rows the host's Info page has.
+pub(crate) fn info_rows(host: &dyn BackstageHost) -> usize {
+    host.info_fields().len() + usize::from(host.info_custom_row())
+}
+
 impl Backstage {
     /// Handle a key while the backstage panel is open. `Esc` always closes it;
     /// otherwise the active pane (menu / folder browser / preview / Save As)
@@ -126,6 +131,21 @@ impl Backstage {
                 }
                 BackstageEvent::None
             }
+            Pane::Info => {
+                let rows = info_rows(host);
+                match key.code {
+                    KeyCode::Up => self.info_sel = self.info_sel.saturating_sub(1),
+                    KeyCode::Down => {
+                        self.info_sel = (self.info_sel + 1).min(rows.saturating_sub(1))
+                    }
+                    KeyCode::Enter if self.info_sel < rows => {
+                        return BackstageEvent::EditInfo(self.info_sel);
+                    }
+                    KeyCode::Left => self.pane = Pane::Menu,
+                    _ => {}
+                }
+                BackstageEvent::None
+            }
             // Handled above by save_as_key; here only to keep the match total.
             Pane::SaveAs => BackstageEvent::None,
         }
@@ -139,8 +159,16 @@ impl Backstage {
                 self.refresh_preview(host, self.preview_w);
                 BackstageEvent::None
             }
-            // the Info pane is shown on the right; nothing to do
-            Item::Info => BackstageEvent::None,
+            // The Info pane is shown on the right; a host with editable
+            // properties lets the keyboard into it.
+            Item::Info => {
+                let rows = info_rows(host);
+                if rows > 0 {
+                    self.pane = Pane::Info;
+                    self.info_sel = self.info_sel.min(rows - 1);
+                }
+                BackstageEvent::None
+            }
             Item::Save => BackstageEvent::Save,
             Item::SaveAs => {
                 // Prefill the current file's name with the caret at its end,
@@ -380,6 +408,26 @@ impl Backstage {
             }
             return BackstageEvent::None;
         }
+        // An editable Info row: a click selects it, a click on the selection
+        // edits it.
+        if self.item == Item::Info {
+            let rows = info_rows(host);
+            let (top, end) = self.layout.info_view;
+            // Only the box's inside: a row scrolled under a border is hidden.
+            let row = (top..end)
+                .contains(&y)
+                .then(|| i32::from(y) - self.layout.info_top)
+                .and_then(|i| usize::try_from(i).ok())
+                .filter(|&i| i < rows);
+            if let Some(i) = row {
+                if self.pane == Pane::Info && self.info_sel == i {
+                    return BackstageEvent::EditInfo(i);
+                }
+                self.info_sel = i;
+                self.pane = Pane::Info;
+            }
+            return BackstageEvent::None;
+        }
         // An option row (below the heading and a blank line) flips it.
         if self.item == Item::Options {
             if let Some(i) = (y as usize)
@@ -492,6 +540,136 @@ mod tests {
     }
     fn key(c: KeyCode) -> KeyEvent {
         KeyEvent::from(c)
+    }
+
+    /// A host with two editable Info rows and the custom-property row.
+    struct EditableHost;
+    impl BackstageHost for EditableHost {
+        fn extensions(&self) -> &'static [&'static str] {
+            &["xlsx"]
+        }
+        fn default_save_name(&self) -> String {
+            "book.xlsx".into()
+        }
+        fn preview_lines(&self, _p: &Path, _w: usize) -> Vec<String> {
+            Vec::new()
+        }
+        fn info_lines(&self) -> Vec<Line<'static>> {
+            vec![Line::raw("info")]
+        }
+        fn accent(&self) -> Color {
+            Color::Green
+        }
+        fn info_fields(&self) -> Vec<(String, String)> {
+            vec![
+                ("Title".into(), "Budget".into()),
+                ("Tags".into(), String::new()),
+            ]
+        }
+        fn info_custom_row(&self) -> bool {
+            true
+        }
+    }
+
+    fn on_info() -> Backstage {
+        let mut bs = Backstage::open(std::env::temp_dir(), &["xlsx"]);
+        bs.item = Item::Info;
+        bs.pane = Pane::Menu;
+        bs
+    }
+
+    #[test]
+    fn info_without_fields_stays_read_only() {
+        let mut bs = on_info();
+        assert!(matches!(
+            bs.key(key(KeyCode::Enter), &TestHost),
+            BackstageEvent::None
+        ));
+        assert_eq!(bs.pane, Pane::Menu);
+        bs.layout.info_top = 3;
+        bs.layout.info_view = (2, 20);
+        assert!(matches!(bs.mouse(20, 3, &TestHost), BackstageEvent::None));
+        assert_eq!(bs.pane, Pane::Menu);
+    }
+
+    #[test]
+    fn info_rows_take_the_focus_and_edit_on_enter() {
+        let mut bs = on_info();
+        assert!(matches!(
+            bs.key(key(KeyCode::Right), &EditableHost),
+            BackstageEvent::None
+        ));
+        assert_eq!(bs.pane, Pane::Info);
+        assert_eq!(bs.info_sel, 0);
+        bs.key(key(KeyCode::Down), &EditableHost);
+        assert!(matches!(
+            bs.key(key(KeyCode::Enter), &EditableHost),
+            BackstageEvent::EditInfo(1)
+        ));
+        // Down stops on the custom-property row (index 2).
+        for _ in 0..5 {
+            bs.key(key(KeyCode::Down), &EditableHost);
+        }
+        assert_eq!(bs.info_sel, 2);
+        assert!(matches!(
+            bs.key(key(KeyCode::Enter), &EditableHost),
+            BackstageEvent::EditInfo(2)
+        ));
+        bs.key(key(KeyCode::Left), &EditableHost);
+        assert_eq!(bs.pane, Pane::Menu);
+        assert!(matches!(
+            bs.key(key(KeyCode::Esc), &EditableHost),
+            BackstageEvent::Close
+        ));
+    }
+
+    #[test]
+    fn info_row_click_selects_then_edits() {
+        let mut bs = on_info();
+        bs.layout.info_top = 5;
+        bs.layout.info_view = (2, 20);
+        assert!(matches!(
+            bs.mouse(20, 6, &EditableHost),
+            BackstageEvent::None
+        ));
+        assert_eq!((bs.pane, bs.info_sel), (Pane::Info, 1));
+        assert!(matches!(
+            bs.mouse(20, 6, &EditableHost),
+            BackstageEvent::EditInfo(1)
+        ));
+        // Below the rows: nothing.
+        assert!(matches!(
+            bs.mouse(20, 8, &EditableHost),
+            BackstageEvent::None
+        ));
+        assert_eq!(bs.info_sel, 1);
+    }
+
+    #[test]
+    fn info_clicks_outside_the_box_do_nothing() {
+        let mut bs = on_info();
+        // Scrolled: row 0 sits above the box, row 2 on its last inner row.
+        bs.layout.info_top = 1;
+        bs.layout.info_view = (2, 3);
+        for y in [1, 3, 4] {
+            assert!(matches!(
+                bs.mouse(20, y, &EditableHost),
+                BackstageEvent::None
+            ));
+            assert_eq!(bs.pane, Pane::Menu, "y {y}");
+        }
+        assert!(matches!(
+            bs.mouse(20, 2, &EditableHost),
+            BackstageEvent::None
+        ));
+        assert_eq!((bs.pane, bs.info_sel), (Pane::Info, 1));
+    }
+
+    #[test]
+    fn focus_info_lands_on_a_row() {
+        let mut bs = Backstage::open(std::env::temp_dir(), &["xlsx"]);
+        bs.focus_info(2);
+        assert_eq!((bs.item, bs.pane, bs.info_sel), (Item::Info, Pane::Info, 2));
     }
 
     #[test]
