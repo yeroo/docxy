@@ -373,8 +373,10 @@ mod win {
                 let p = self.new_para();
                 self.push_content_block(Block::Paragraph(p));
             }
+            // The break takes the current character format, like `TypeText`.
+            let props = self.cur.clone();
             if let Some(p) = self.current_paragraph_mut() {
-                p.content.push(Inline::Break(kind));
+                p.content.push(Inline::Break(kind, props));
             }
             self.saved = false;
         }
@@ -2116,7 +2118,7 @@ mod win {
             };
             assert!(matches!(
                 second.content.as_slice(),
-                [Inline::Break(BreakKind::Page)]
+                [Inline::Break(BreakKind::Page, _)]
             ));
         }
     }

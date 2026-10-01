@@ -505,14 +505,19 @@ fn write_inline_with_text_kind(s: &mut String, item: &Inline, text_kind: RunText
             write_rpr(s, props);
             s.push_str("<w:tab/></w:r>");
         }
-        Inline::Break(kind) => match kind {
-            BreakKind::Line => s.push_str("<w:r><w:br/></w:r>"),
-            BreakKind::Page => s.push_str("<w:r><w:br w:type=\"page\"/></w:r>"),
-            BreakKind::Column => s.push_str("<w:r><w:br w:type=\"column\"/></w:r>"),
-            BreakKind::Clear(clear) => {
-                s.push_str(&format!("<w:r><w:br w:clear=\"{}\"/></w:r>", clear.val()))
+        Inline::Break(kind, props) => {
+            s.push_str("<w:r>");
+            write_rpr(s, props);
+            match kind {
+                BreakKind::Line => s.push_str("<w:br/>"),
+                BreakKind::Page => s.push_str("<w:br w:type=\"page\"/>"),
+                BreakKind::Column => s.push_str("<w:br w:type=\"column\"/>"),
+                BreakKind::Clear(clear) => {
+                    s.push_str(&format!("<w:br w:clear=\"{}\"/>", clear.val()))
+                }
             }
-        },
+            s.push_str("</w:r>");
+        }
         Inline::Hyperlink(h) => {
             if let Some(raw) = &h.raw
                 && !h.content_changed
@@ -1809,15 +1814,50 @@ mod tests {
                     run("a", RunProps::default()),
                     Inline::Tab(RunProps::default()),
                     run("b", RunProps::default()),
-                    Inline::Break(BreakKind::Line),
-                    Inline::Break(BreakKind::Page),
-                    Inline::Break(BreakKind::Clear(ClearKind::All)),
-                    Inline::Break(BreakKind::Clear(ClearKind::Left)),
-                    Inline::Break(BreakKind::Clear(ClearKind::Right)),
+                    Inline::Break(BreakKind::Line, RunProps::default()),
+                    Inline::Break(BreakKind::Page, RunProps::default()),
+                    Inline::Break(BreakKind::Clear(ClearKind::All), RunProps::default()),
+                    Inline::Break(BreakKind::Clear(ClearKind::Left), RunProps::default()),
+                    Inline::Break(BreakKind::Clear(ClearKind::Right), RunProps::default()),
                 ],
             )],
         };
         assert_eq!(roundtrip(&d, &Relationships::default()), d);
+    }
+
+    /// #279: a break keeps its run's formatting through save and reload, and
+    /// a break without any still writes the same bytes as before.
+    #[test]
+    fn a_breaks_run_formatting_roundtrips_279() {
+        let bold = RunProps {
+            bold: true,
+            ..Default::default()
+        };
+        let plain = Document {
+            body: vec![para(
+                ParProps::default(),
+                vec![Inline::Break(BreakKind::Line, RunProps::default())],
+            )],
+        };
+        assert!(document_to_xml(&plain).contains("<w:p><w:r><w:br/></w:r></w:p>"));
+        let d = Document {
+            body: vec![para(
+                ParProps::default(),
+                vec![
+                    Inline::Break(BreakKind::Line, bold.clone()),
+                    Inline::Break(BreakKind::Page, bold.clone()),
+                ],
+            )],
+        };
+        let xml = document_to_xml(&d);
+        assert!(
+            xml.contains("<w:r><w:rPr><w:b/></w:rPr><w:br/></w:r>"),
+            "{xml}"
+        );
+        let back = roundtrip(&d, &Relationships::default());
+        assert_eq!(back, d);
+        assert!(matches!(&back.body[0], Block::Paragraph(p)
+            if matches!(&p.content[0], Inline::Break(BreakKind::Line, rp) if rp.bold)));
     }
 
     #[test]

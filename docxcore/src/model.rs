@@ -170,7 +170,10 @@ impl ClearKind {
 pub enum Inline {
     Run(Run),
     Hyperlink(Hyperlink),
-    Break(BreakKind),
+    /// A line, page, column or clearing break (`w:br`/`w:cr`). Like a tab it
+    /// carries the run properties of the run it came from: a break is a run in
+    /// OOXML, and text typed right after it takes its formatting (Word's rule).
+    Break(BreakKind, RunProps),
     /// A tab character. Carries the run properties of the run it came from, so an
     /// underlined tab (the common "type a line across the footer" trick) keeps its
     /// underline both on screen and on save.
@@ -439,7 +442,7 @@ impl Inline {
             }
             Inline::Hyperlink(h) => h.runs.iter().map(|r| r.text.as_str()).collect(),
             Inline::Tab(_) => "\t".to_string(),
-            Inline::Break(_) => "\n".to_string(),
+            Inline::Break(..) => "\n".to_string(),
             Inline::SmartArt { text, .. } => text.join("\n"),
             Inline::Chart { chart, .. } => chart.title.clone().unwrap_or_default(),
             Inline::Equation { text, .. } => text.clone(),
@@ -1184,7 +1187,7 @@ fn assign_inline_revision_targets(
                 assign_inline_revision_targets(child, next, seen);
             }
         }
-        Inline::Tab(props) => assign_run_props_target(props, next, seen),
+        Inline::Tab(props) | Inline::Break(_, props) => assign_run_props_target(props, next, seen),
         Inline::TextBox { blocks, .. } => {
             for block in blocks {
                 assign_block_revision_targets(block, next, seen);
@@ -1201,8 +1204,7 @@ fn assign_inline_revision_targets(
         Inline::UnsupportedRevision { metadata, .. } => {
             assign_metadata_target(metadata, next, seen)
         }
-        Inline::Break(_)
-        | Inline::SmartArt { .. }
+        Inline::SmartArt { .. }
         | Inline::Chart { .. }
         | Inline::Equation { .. }
         | Inline::Field { .. }
@@ -1306,7 +1308,9 @@ fn collect_inline_revisions(
                 collect_inline_revisions(child, parent, depth, out);
             }
         }
-        Inline::Tab(props) => collect_run_props_revisions(props, parent, depth, out),
+        Inline::Tab(props) | Inline::Break(_, props) => {
+            collect_run_props_revisions(props, parent, depth, out)
+        }
         Inline::TextBox { blocks, .. } => {
             for block in blocks {
                 collect_block_revisions(block, parent, depth, out);
@@ -1337,8 +1341,7 @@ fn collect_inline_revisions(
             depth,
             out,
         ),
-        Inline::Break(_)
-        | Inline::SmartArt { .. }
+        Inline::SmartArt { .. }
         | Inline::Chart { .. }
         | Inline::Equation { .. }
         | Inline::Field { .. }

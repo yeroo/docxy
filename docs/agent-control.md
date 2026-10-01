@@ -310,7 +310,9 @@ Notes:
   rest. So `text[start..end]` is the match only when the paragraph holds
   nothing but editable text; otherwise don't splice `text` at those offsets.
   A text box's own paragraphs are still searched and replaced, as matches
-  under their own `path` (with no `block`/`text`).
+  under their own `path` (with no `block`/`text`). The editor's own Find bar
+  (a person's, not these verbs) also shows the text it only draws, as
+  read-only matches it can go to but never replaces.
 - `doc.replace-all` and `doc.undo`/`doc.redo` no-op cleanly: a `query` that
   matches nothing, or an undo/redo on an empty stack, reports `replaced:0`/
   `done:false` and does **not** mark the document modified or flash the

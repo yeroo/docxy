@@ -1430,7 +1430,7 @@ fn mark_revision(inl: &mut Inline, kind: RevisionKind) {
     };
     match inl {
         Inline::Run(r) => apply(&mut r.props),
-        Inline::Tab(props) => apply(props),
+        Inline::Tab(props) | Inline::Break(_, props) => apply(props),
         Inline::Hyperlink(h) => {
             for r in &mut h.runs {
                 apply(&mut r.props);
@@ -1656,7 +1656,7 @@ fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
                     }));
                 }
                 "w:cr" => {
-                    out.push(Inline::Break(BreakKind::Line));
+                    out.push(Inline::Break(BreakKind::Line, props.clone()));
                     p.skip_element();
                 }
                 "w:br" => {
@@ -1674,7 +1674,7 @@ fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
                         (_, Some(clear)) => BreakKind::Clear(clear),
                         _ => BreakKind::Line,
                     };
-                    out.push(Inline::Break(kind));
+                    out.push(Inline::Break(kind, props.clone()));
                     p.skip_element();
                 }
                 "w:tab" => {
@@ -1849,10 +1849,9 @@ fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<I
             let mut inner = Vec::new();
             parse_inlines_into(p, rels, &mut inner);
             let raw = p.raw_slice(raw_start, p.pos()).to_string();
-            if inner
-                .iter()
-                .any(|inline| !matches!(inline, Inline::Run(_) | Inline::Tab(_) | Inline::Break(_)))
-            {
+            if inner.iter().any(|inline| {
+                !matches!(inline, Inline::Run(_) | Inline::Tab(_) | Inline::Break(..))
+            }) {
                 out.push(Inline::Hyperlink(Hyperlink {
                     target: None,
                     anchor: Some(anchor),
@@ -3197,7 +3196,7 @@ mod tests {
         );
         let p = first_para(&d);
         assert!(
-            p.content.iter().any(|i| matches!(i, Inline::Break(_))),
+            p.content.iter().any(|i| matches!(i, Inline::Break(..))),
             "{:?}",
             kinds(&p.content)
         );
@@ -3422,7 +3421,7 @@ mod tests {
         assert!(matches!(c[0], Inline::Run(_)));
         assert!(matches!(c[1], Inline::Tab(_)));
         assert!(matches!(c[2], Inline::Run(_)));
-        assert!(matches!(c[3], Inline::Break(BreakKind::Line)));
+        assert!(matches!(c[3], Inline::Break(BreakKind::Line, _)));
     }
 
     #[test]
@@ -3493,10 +3492,10 @@ mod tests {
                    </w:r></w:p></w:body></w:document>";
         let d = doc(xml);
         let c = &first_para(&d).content;
-        assert!(matches!(c[1], Inline::Break(BreakKind::Page)));
-        assert!(matches!(c[3], Inline::Break(BreakKind::Line))); // plain w:br
-        assert!(matches!(c[4], Inline::Break(BreakKind::Line))); // w:cr
-        assert!(matches!(c[5], Inline::Break(BreakKind::Column)));
+        assert!(matches!(c[1], Inline::Break(BreakKind::Page, _)));
+        assert!(matches!(c[3], Inline::Break(BreakKind::Line, _))); // plain w:br
+        assert!(matches!(c[4], Inline::Break(BreakKind::Line, _))); // w:cr
+        assert!(matches!(c[5], Inline::Break(BreakKind::Column, _)));
     }
 
     #[test]
@@ -3504,11 +3503,17 @@ mod tests {
         let xml = "<w:document><w:body><w:p><w:r>                   <w:br w:clear=\"all\"/><w:br w:type=\"textWrapping\" w:clear=\"left\"/>                   <w:br w:type=\"textWrapping\"/><w:br w:clear=\"none\"/><w:br w:type=\"page\" w:clear=\"all\"/>                   </w:r></w:p></w:body></w:document>";
         let d = doc(xml);
         let c = &first_para(&d).content;
-        assert_eq!(c[0], Inline::Break(BreakKind::Clear(ClearKind::All)));
-        assert_eq!(c[1], Inline::Break(BreakKind::Clear(ClearKind::Left)));
-        assert_eq!(c[2], Inline::Break(BreakKind::Line));
-        assert_eq!(c[3], Inline::Break(BreakKind::Line));
-        assert_eq!(c[4], Inline::Break(BreakKind::Page));
+        assert_eq!(
+            c[0],
+            Inline::Break(BreakKind::Clear(ClearKind::All), RunProps::default())
+        );
+        assert_eq!(
+            c[1],
+            Inline::Break(BreakKind::Clear(ClearKind::Left), RunProps::default())
+        );
+        assert_eq!(c[2], Inline::Break(BreakKind::Line, RunProps::default()));
+        assert_eq!(c[3], Inline::Break(BreakKind::Line, RunProps::default()));
+        assert_eq!(c[4], Inline::Break(BreakKind::Page, RunProps::default()));
     }
 
     #[test]

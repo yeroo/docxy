@@ -1834,7 +1834,7 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Se
                     push(&mut segs, plain_cell(' '));
                 }
             }
-            Inline::Break(kind) => {
+            Inline::Break(kind, _) => {
                 segs.last_mut().unwrap().brk = Some(*kind);
                 segs.push(Seg::default());
             }
@@ -2482,7 +2482,7 @@ mod tests {
     }
 
     fn page_break() -> Inline {
-        Inline::Break(BreakKind::Page)
+        Inline::Break(BreakKind::Page, RunProps::default())
     }
 
     fn close(a: f32, b: f32) -> bool {
@@ -2749,7 +2749,7 @@ mod tests {
     }
 
     fn col_break() -> Inline {
-        Inline::Break(BreakKind::Column)
+        Inline::Break(BreakKind::Column, RunProps::default())
     }
 
     #[test]

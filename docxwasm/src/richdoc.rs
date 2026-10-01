@@ -300,7 +300,7 @@ impl SegWriter<'_, '_> {
                 }
             }
             Inline::Tab(_) => self.atom("tab", width, "", ""),
-            Inline::Break(kind) => {
+            Inline::Break(kind, _) => {
                 let k = match kind {
                     BreakKind::Line | BreakKind::Clear(_) => "br",
                     BreakKind::Page => "pagebreak",
