@@ -4220,24 +4220,26 @@ fn sample_doc() -> Loaded {
 /// mutated / charts aren't re-added on each call). Shared by Save and hot-exit.
 /// A save names its `target`, whose extension sets the file type (a
 /// macro-free one leaves the macros out of the bytes only); hot-exit passes
-/// `None` and keeps the loaded type.
-fn sheet_bytes(v: &SheetView, target: Option<&std::path::Path>) -> Vec<u8> {
+/// `None` and keeps the loaded type. Also returns how many UI charts
+/// `add_chart` refused, so the save can say they are not in the file.
+fn sheet_bytes(v: &SheetView, target: Option<&std::path::Path>) -> (Vec<u8>, usize) {
     let write = |pkg: &gridcore::xlsx::SheetPackage| match target {
         Some(target) => gridcore::xlsx::save_xlsx_for_path(pkg, target),
         None => gridcore::xlsx::save_xlsx(pkg),
     };
     if v.charts.is_empty() {
-        write(&v.pkg)
+        (write(&v.pkg), 0)
     } else {
         let mut pkg = v.pkg.clone();
-        for cv in &v.charts {
-            // The insert asked `can_add_chart` (`insert_ui_chart`), so a
-            // damaged worksheet or drawing part was refused then. Only a
-            // drawing-rels part too broken to take the chart's relationship
-            // can still refuse here, and that isn't reported.
-            pkg.add_chart(cv.sheet, cv.from, cv.to, &cv.data);
-        }
-        write(&pkg)
+        // The insert asked `can_add_chart` (`insert_ui_chart`), but the
+        // package can change after it (a later chart, an edit), so each
+        // chart is asked again here and a refusal is counted, not lost.
+        let refused = v
+            .charts
+            .iter()
+            .filter(|cv| !pkg.add_chart(cv.sheet, cv.from, cv.to, &cv.data))
+            .count();
+        (write(&pkg), refused)
     }
 }
 
@@ -7158,7 +7160,7 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
         }
         Surface::Sheet(v) => {
             let p = hd.join(format!("tab-{i}.xlsx"));
-            opccore::fsio::write_atomic(&p, &sheet_bytes(v, None))
+            opccore::fsio::write_atomic(&p, &sheet_bytes(v, None).0)
                 .ok()
                 .map(|_| p.display().to_string())
         }
@@ -15608,7 +15610,7 @@ fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) -> bool
             return false;
         }
     };
-    let bytes = sheet_bytes(v, Some(&path));
+    let (bytes, refused_charts) = sheet_bytes(v, Some(&path));
     // A macro-free type writes the file without the macros, and the status
     // says what went. The open workbook keeps them here; after the user's
     // Yes, `finish_sheet_save_asking` drops its VB project.
@@ -15616,7 +15618,7 @@ fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) -> bool
     match opccore::fsio::write_atomic(&path, &bytes) {
         Ok(()) => {
             tab.title = file_name(&path).into();
-            tab.status = if dropped.is_empty() {
+            let mut status = if dropped.is_empty() {
                 format!("saved {} bytes → {}", bytes.len(), path.display())
             } else {
                 format!(
@@ -15625,8 +15627,14 @@ fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) -> bool
                     path.display(),
                     dropped.join(", ")
                 )
+            };
+            // A chart the package could no longer take is not in the file.
+            match refused_charts {
+                0 => {}
+                1 => status.push_str("; 1 chart could not be written"),
+                n => status.push_str(&format!("; {n} charts could not be written")),
             }
-            .into();
+            tab.status = status.into();
             tab.path = Some(path);
             tab.dirty = false;
             true
@@ -16486,7 +16494,7 @@ mod sheet_save_tests {
             unreachable!()
         };
         let target = dir.path("report.xlsx");
-        let expected = sheet_bytes(v, Some(&target));
+        let (expected, _) = sheet_bytes(v, Some(&target));
         finish_sheet_save(&mut tab, Some(&target));
         assert_eq!(std::fs::read(&target).unwrap(), expected);
         assert_eq!(tab.path.as_deref(), Some(target.as_path()));
@@ -16500,6 +16508,51 @@ mod sheet_save_tests {
             tab.status.as_ref(),
             format!("saved {} bytes → {}", expected.len(), target.display())
         );
+    }
+
+    /// #814: a UI chart the package can no longer take at save (here a
+    /// worksheet rels part with no `</Relationships>` to add the drawing's
+    /// rel to) is not in the file, and the save says so.
+    #[test]
+    fn a_save_reports_a_chart_add_chart_refused() {
+        let dir = Scratch::new();
+        let mut tab = sheet_tab(None, "Untitled.xlsx");
+        let Surface::Sheet(v) = &mut tab.surface else {
+            unreachable!()
+        };
+        for r in 0..3 {
+            let sh = &mut v.pkg.workbook.sheets[0];
+            sh.set_cell(r, 0, gridcore::sheet::Cell::number(r as f64));
+            sh.set_cell(r, 1, gridcore::sheet::Cell::number(2.0 * r as f64));
+        }
+        let sh = &v.pkg.workbook.sheets[0];
+        let data = gridcore::sheet::chart_from_range(sh, &sh.name, (0, 0, 2, 1), "column", false)
+            .expect("chart data");
+        // Pushed past `insert_ui_chart`, as if the rels part broke after it.
+        v.charts.push(super::ChartView {
+            sheet: 0,
+            from: (0, 3),
+            to: (10, 9),
+            data,
+        });
+        v.pkg.set_part(
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#
+                .to_vec(),
+        );
+        let target = dir.path("report.xlsx");
+        assert!(finish_sheet_save(&mut tab, Some(&target)));
+        let written = std::fs::read(&target).unwrap();
+        assert_eq!(
+            tab.status.as_ref(),
+            format!(
+                "saved {} bytes → {}; 1 chart could not be written",
+                written.len(),
+                target.display()
+            )
+        );
+        let zip = opccore::zip::ZipArchive::open(&written).unwrap();
+        assert!(zip.find("xl/charts/chart1.xml").is_none());
     }
 
     /// #699: the harness's `save-as` writes a workbook through this, and
@@ -27006,7 +27059,8 @@ mod ui_chart_insert_tests {
         assert!(v.insert_ui_chart(c));
         assert_eq!(v.charts.len(), 1);
         assert_eq!(v.undo.len(), 1);
-        let bytes = sheet_bytes(&v, None);
+        let (bytes, refused) = sheet_bytes(&v, None);
+        assert_eq!(refused, 0);
         let zip = opccore::zip::ZipArchive::open(&bytes).unwrap();
         assert!(zip.find("xl/charts/chart1.xml").is_some());
     }
