@@ -630,7 +630,7 @@ impl Engine {
         wb: &Workbook,
         s: usize,
         changes: Vec<(u32, u32, Cell)>,
-    ) -> (Vec<(u32, u32, Cell)>, Vec<(u32, u32, Cell)>) {
+    ) -> (CellEdits, CellEdits) {
         let blanks: Vec<(u32, u32)> = changes
             .iter()
             .filter(|(_, _, cell)| cell.is_blank())
@@ -1196,6 +1196,9 @@ impl Engine {
         changed
     }
 }
+
+/// Edits to one sheet: `(row, col, the cell put there)`, in order.
+type CellEdits = Vec<(u32, u32, Cell)>;
 
 /// The spill anchor over a cell ([`Engine::spill_owner_of`]).
 struct SpillOwner {
