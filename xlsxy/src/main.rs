@@ -1178,6 +1178,17 @@ fn group_styles(
         .collect()
 }
 
+/// The `(row, col, cell)` an undo or redo puts back: each change's `before`
+/// or `after` cell (picked by `side`), blank if absent.
+fn group_cells<'a>(
+    changes: impl Iterator<Item = &'a (u32, u32, Option<Cell>, Option<Cell>)>,
+    side: impl Fn(&(u32, u32, Option<Cell>, Option<Cell>)) -> &Option<Cell>,
+) -> Vec<(u32, u32, Cell)> {
+    changes
+        .map(|ch| (ch.0, ch.1, side(ch).clone().unwrap_or_default()))
+        .collect()
+}
+
 /// Sheets + defined names — the whole calculated state, snapshotted around
 /// structural edits (row/column insert-delete, sheet rename) whose inverse
 /// is not expressible as per-cell changes.
@@ -1741,30 +1752,63 @@ impl App {
     /// pasted on another sheet clears its source and writes its destination
     /// together, so one undo puts both back.
     fn apply_groups(&mut self, groups: Vec<(usize, CellChanges)>) {
-        if groups.iter().all(|(_, changes)| changes.is_empty()) {
+        let keys = groups
+            .iter()
+            .map(|(s, changes)| (*s, changes.iter().map(|&(r, c, _)| (r, c)).collect()))
+            .collect();
+        self.record_groups(keys, |app| {
+            for (sheet_idx, changes) in groups {
+                for (r, c, cell) in changes {
+                    app.engine
+                        .set_cell(&mut app.pkg.workbook, (sheet_idx, r, c), cell);
+                }
+            }
+        });
+    }
+
+    /// Run `write`, which edits the cells `keys` names (per sheet), as one
+    /// undo step. Every cell's before is taken ahead of the first write and
+    /// its after once the last is done, so each group is one snapshot of its
+    /// cells, as [`Engine::restore_cells`] needs: taken cell by cell, a spill
+    /// anchor's after could still claim a cell a later write blocked it with.
+    fn record_groups(
+        &mut self,
+        keys: Vec<(usize, Vec<(u32, u32)>)>,
+        write: impl FnOnce(&mut Self),
+    ) {
+        let keys: Vec<_> = keys.into_iter().filter(|(_, k)| !k.is_empty()).collect();
+        if keys.is_empty() {
             return;
         }
         let circles_before = self.engine.circular_refs();
         self.engine.clock = now_serial();
-        let mut undo = Vec::with_capacity(groups.len());
-        for (sheet_idx, changes) in groups {
-            if changes.is_empty() {
-                continue;
-            }
-            let mut group = UndoGroup {
-                sheet: sheet_idx,
-                changes: Vec::with_capacity(changes.len()),
+        let snapshot = |app: &Self| -> Vec<Vec<Option<Cell>>> {
+            keys.iter()
+                .map(|(s, cells)| {
+                    let sheet = &app.pkg.workbook.sheets[*s];
+                    cells
+                        .iter()
+                        .map(|&(r, c)| sheet.cell(r, c).cloned())
+                        .collect()
+                })
+                .collect()
+        };
+        let befores = snapshot(self);
+        write(self);
+        let afters = snapshot(self);
+        let undo = keys
+            .iter()
+            .zip(befores.into_iter().zip(afters))
+            .map(|((s, cells), (before, after))| UndoGroup {
+                sheet: *s,
+                changes: cells
+                    .iter()
+                    .zip(before.into_iter().zip(after))
+                    .map(|(&(r, c), (b, a))| (r, c, b, a))
+                    .collect(),
                 styles_only: false,
-            };
-            for (r, c, cell) in changes {
-                let before = self.pkg.workbook.sheets[sheet_idx].cell(r, c).cloned();
-                self.engine
-                    .set_cell(&mut self.pkg.workbook, (sheet_idx, r, c), cell.clone());
-                let after = self.pkg.workbook.sheets[sheet_idx].cell(r, c).cloned();
-                group.changes.push((r, c, before, after));
-            }
-            undo.push(group);
-        }
+            })
+            .collect();
         self.undo.push(UndoAction::Cells(undo));
         self.redo.clear();
         self.modified = true;
@@ -2335,11 +2379,9 @@ impl App {
                             .set_styles(&mut self.pkg.workbook, group.sheet, &styles);
                         continue;
                     }
-                    for &(r, c, ref before, _) in group.changes.iter().rev() {
-                        let cell = before.clone().unwrap_or_default();
-                        self.engine
-                            .restore_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
-                    }
+                    let cells = group_cells(group.changes.iter().rev(), |ch| &ch.2);
+                    self.engine
+                        .restore_cells(&mut self.pkg.workbook, group.sheet, &cells);
                 }
                 self.show_undo_group(groups.last());
                 self.redo.push(UndoAction::Cells(groups));
@@ -2375,11 +2417,9 @@ impl App {
                             .set_styles(&mut self.pkg.workbook, group.sheet, &styles);
                         continue;
                     }
-                    for &(r, c, _, ref after) in group.changes.iter() {
-                        let cell = after.clone().unwrap_or_default();
-                        self.engine
-                            .restore_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
-                    }
+                    let cells = group_cells(group.changes.iter(), |ch| &ch.3);
+                    self.engine
+                        .restore_cells(&mut self.pkg.workbook, group.sheet, &cells);
                 }
                 self.show_undo_group(groups.last());
                 self.undo.push(UndoAction::Cells(groups));
@@ -2489,12 +2529,20 @@ impl App {
                     r0 as i64 - clip.from.0 as i64,
                     c0 as i64 - clip.from.1 as i64,
                 );
+                // The block written from (r0, c0): rows and cells pushed off
+                // the grid's edge are dropped, so rows may differ in length.
+                let mut block = Vec::new();
                 let mut writes = Vec::new();
                 for (dr, row) in clip.cells.iter().enumerate() {
+                    let r = r0 + dr as u32;
+                    if r >= MAX_ROWS {
+                        break;
+                    }
+                    let mut out = Vec::new();
                     for (dc, cell) in row.iter().enumerate() {
-                        let (r, c) = (r0 + dr as u32, c0 + dc as u32);
-                        if r >= MAX_ROWS || c >= MAX_COLS {
-                            continue;
+                        let c = c0 + dc as u32;
+                        if c >= MAX_COLS {
+                            break;
                         }
                         let mut new_cell = cell.clone().unwrap_or_default();
                         // Copies translate relative refs; cuts keep them, and
@@ -2508,21 +2556,33 @@ impl App {
                             }
                         }
                         // Overwrite position wins over source-clear on overlap.
-                        // A pasted array anchor is then typed unless it lands
-                        // on its own formula (`Engine::set_cell`): pasted back
-                        // in place, copy or cut, it keeps its block.
                         if same_sheet {
                             clears.retain(|&(cr, cc, _)| (cr, cc) != (r, c));
                         }
-                        writes.push((r, c, new_cell));
+                        writes.push((r, c));
+                        out.push(new_cell);
                     }
+                    block.push(out);
                 }
-                if same_sheet {
-                    clears.extend(writes);
-                    self.apply(clears);
+                // The cut's clears go first, then the block through
+                // `Engine::paste_block`: a pasted spilling array still spills,
+                // and an array block pasted back in place, copy or cut, keeps
+                // its block. One undo step.
+                let (src, here) = (clip.sheet, self.sheet);
+                let clear_keys: Vec<_> = clears.iter().map(|&(r, c, _)| (r, c)).collect();
+                let keys = if same_sheet {
+                    vec![(here, clear_keys.into_iter().chain(writes).collect())]
                 } else {
-                    self.apply_groups(vec![(clip.sheet, clears), (self.sheet, writes)]);
-                }
+                    vec![(src, clear_keys), (here, writes)]
+                };
+                self.record_groups(keys, |app| {
+                    for (r, c, cell) in clears {
+                        app.engine
+                            .set_cell(&mut app.pkg.workbook, (src, r, c), cell);
+                    }
+                    app.engine
+                        .paste_block(&mut app.pkg.workbook, here, (r0, c0), &block);
+                });
                 self.status = Some(if source_locked {
                     "Pasted (source sheet is protected; cut kept as copy)".to_string()
                 } else {
@@ -9085,6 +9145,112 @@ mod tests {
         );
         // Typed at D1 (#724): no block of its own to overlap D2:D4 with.
         assert_eq!(f_attrs_at(&app, 0, 0, 3), None);
+    }
+
+    /// A1:A3 = 1, 2, 3 and a legacy CSE block `{=A1:A3*2}` over D1:D3, as
+    /// load_xlsx reads it, spilling 2, 4, 6.
+    fn app_with_spilling_cse() -> App {
+        let mut pkg = new_xlsx();
+        let sheet = &mut pkg.workbook.sheets[0];
+        for r in 0..3u32 {
+            sheet.set_cell(r, 0, Cell::number(f64::from(r + 1)));
+            sheet.set_cell(r, 3, Cell::number(f64::from(2 * (r + 1))));
+        }
+        sheet.set_cell(
+            0,
+            3,
+            Cell {
+                value: CellValue::Number(2.0),
+                formula: Some("A1:A3*2".into()),
+                f_attrs: Some(" t=\"array\" ref=\"D1:D3\"".into()),
+                spill: Some((3, 1)),
+                ..Cell::default()
+            },
+        );
+        let mut app = App::new(pkg, "t.xlsx");
+        app.os_clip = None;
+        assert_cse_spills(&app, "loaded");
+        app
+    }
+
+    /// D1 is the CSE block over D1:D3, spilling 2, 4, 6.
+    fn assert_cse_spills(app: &App, when: &str) {
+        let d1 = app.sheet().cell(0, 3).unwrap();
+        assert_eq!(d1.spill, Some((3, 1)), "{when}: {:?}", d1.value);
+        assert_eq!(
+            d1.f_attrs.as_deref(),
+            Some(" t=\"array\" ref=\"D1:D3\""),
+            "{when}"
+        );
+        for r in 0..3u32 {
+            assert_eq!(
+                app.sheet().cell(r, 3).unwrap().value,
+                CellValue::Number(f64::from(2 * (r + 1))),
+                "{when}: D{}",
+                r + 1
+            );
+        }
+    }
+
+    #[test]
+    fn a_spilling_cse_block_pasted_in_place_still_spills() {
+        // #825 AC4: copy (or cut) D1:D3 and paste it back at D1. Written cell
+        // by cell, the 4 pasted into D2 blocked D1 (#SPILL!). Undo puts back
+        // exactly what was there, and redo the paste, both still spilling.
+        for cut in [false, true] {
+            let mut app = app_with_spilling_cse();
+            let before = app.sheet().cells.clone();
+            app.cur = (0, 3);
+            app.anchor = Some((2, 3));
+            app.copy(cut);
+            app.cur = (0, 3);
+            app.anchor = None;
+            app.paste();
+            assert_cse_spills(&app, &format!("paste, cut {cut}"));
+            let after = app.sheet().cells.clone();
+            app.undo();
+            assert_cse_spills(&app, &format!("undo, cut {cut}"));
+            assert_eq!(app.sheet().cells, before, "undo, cut {cut}");
+            app.redo();
+            assert_cse_spills(&app, &format!("redo, cut {cut}"));
+            assert_eq!(app.sheet().cells, after, "redo, cut {cut}");
+        }
+    }
+
+    #[test]
+    fn a_group_that_blocks_its_own_spill_undoes_and_redoes_exactly() {
+        // #825 AC9: one edit types a spilling D1 and then a 5 into D2, which
+        // blocks it. Snapshotted cell by cell, D1's after still claimed D2,
+        // so redo blanked the 5 and spilled over it.
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.apply(
+            (0..3)
+                .map(|r| (r, 0, Cell::number(f64::from(r + 1))))
+                .collect(),
+        );
+        let before = app.sheet().cells.clone();
+        app.apply(vec![
+            (0, 3, Cell::formula("A1:A3*2")),
+            (1, 3, Cell::number(5.0)),
+        ]);
+        let blocked = |app: &App, when: &str| {
+            let d1 = app.sheet().cell(0, 3).unwrap();
+            assert_eq!(d1.value, CellValue::Error("#SPILL!".into()), "{when}");
+            assert_eq!(d1.spill, None, "{when}");
+            assert_eq!(
+                app.sheet().cell(1, 3).unwrap().value,
+                CellValue::Number(5.0),
+                "{when}"
+            );
+        };
+        blocked(&app, "edit");
+        let after = app.sheet().cells.clone();
+        app.undo();
+        assert_eq!(app.sheet().cells, before, "undo");
+        app.redo();
+        blocked(&app, "redo");
+        assert_eq!(app.sheet().cells, after, "redo");
     }
 
     #[test]
