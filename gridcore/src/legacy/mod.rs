@@ -5,7 +5,8 @@
 //!
 //! Opening one is an *import*, like a CSV: the reader builds a fresh
 //! [`SheetPackage`] (as `new_xlsx` makes one) with the sheets, values, formulas,
-//! number formats, date system and defined names, so everything downstream
+//! number formats, date system, defined names and the external links that
+//! calls to add-in functions need (`.xlsb`), so everything downstream
 //! (engine, editor, save) sees an ordinary workbook and saving writes
 //! `.xlsx`. Nothing the readers don't model survives the import.
 //!
@@ -14,8 +15,9 @@
 //! loses only the formula. The hard errors are the files that can't be read
 //! at all: encrypted ones, Excel 5.0/95 workbooks, OLE2 files that are not
 //! spreadsheets, broken containers, and files that ask for more than
-//! [`Limits`] allows (too many cells or sheets, or `.ods` repeats that
-//! would expand past their budget). A limit is never met by truncating.
+//! [`Limits`] allows (too many cells, sheets or external links, or `.ods`
+//! repeats that would expand past their budget). A limit is never met by
+//! truncating.
 
 mod ftab;
 mod ods;
@@ -75,7 +77,7 @@ pub enum OpenError {
     NotSpreadsheet,
     /// The container itself can't be read (a broken compound file or ZIP, a
     /// workbook part missing), or the file asks for more than [`Limits`]
-    /// allows (too many cells, sheets or repeated cells).
+    /// allows (too many cells, sheets, external links or repeated cells).
     Corrupt(String),
 }
 
@@ -151,7 +153,7 @@ pub(crate) struct Limits {
     pub repeat_bytes: usize,
     /// Sheets ("too many sheets").
     pub sheets: usize,
-    /// Distinct external books whose names formulas call ("too many
+    /// Distinct external link parts with a function name ("too many
     /// external links").
     pub links: usize,
 }
