@@ -955,6 +955,9 @@ impl Editor {
         p.extend([li, 0, 0, 0]);
         self.caret = Caret::at(p, 0);
         self.last = EditKind::Structural;
+        // A paragraph split into pieces copies its tracked changes onto each;
+        // give every copy its own revision target (#801).
+        self.doc.initialize_revision_targets();
         Ok(())
     }
 }
