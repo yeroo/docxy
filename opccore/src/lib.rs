@@ -11,7 +11,10 @@
 //! - [`zip`] — read-only ZIP reader (stored + deflate).
 //! - [`zipwrite`] — ZIP writer (STORED entries, correct CRC-32).
 //! - [`xml`] — minimal pull parser tuned for OOXML.
+//! - [`cfb`] — OLE2 Compound File Binary reader (and a small writer), the
+//!   container of legacy `.xls`, `.doc` and `.mpp` files.
 
+pub mod cfb;
 pub mod fsio;
 pub mod inflate;
 pub mod xml;

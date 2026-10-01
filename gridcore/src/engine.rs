@@ -2645,6 +2645,39 @@ mod tests {
         assert_eq!(value_at(&wb, "E1"), CellValue::Number(28.0));
     }
 
+    /// #603: Excel's quoted 3D spelling, `'First:Last'!`, evaluates as the
+    /// span, also over names that read as cells (`'Q1:Q3'!`).
+    #[test]
+    fn quoted_three_d_spans_evaluate() {
+        let mut wb = Workbook::default();
+        for (i, name) in ["Jan 2024", "Feb 2024", "Mar 2024", "Q1", "Q2", "Q3", "Sum"]
+            .iter()
+            .enumerate()
+        {
+            let mut s = Sheet {
+                name: name.to_string(),
+                ..Sheet::default()
+            };
+            if i < 6 {
+                s.set_cell(0, 0, Cell::number((i + 1) as f64));
+                s.set_cell(1, 0, Cell::number(100.0));
+            }
+            wb.sheets.push(s);
+        }
+        wb.sheets[6].set_cell(0, 0, Cell::formula("SUM('Jan 2024:Mar 2024'!A1)"));
+        wb.sheets[6].set_cell(1, 0, Cell::formula("SUM('Q1:Q3'!A1:A2)"));
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(
+            wb.sheets[6].cell(0, 0).unwrap().value,
+            CellValue::Number(6.0)
+        );
+        assert_eq!(
+            wb.sheets[6].cell(1, 0).unwrap().value,
+            CellValue::Number(315.0)
+        );
+    }
+
     #[test]
     fn three_d_spans_aggregate_and_propagate() {
         let mut wb = Workbook::default();

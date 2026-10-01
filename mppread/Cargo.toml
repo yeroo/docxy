@@ -15,5 +15,6 @@ categories = ["parser-implementations"]
 workspace = true
 
 [dependencies]
-# std-only plus our project model; the CFB parser itself remains independent.
+# std-only plus our project model and the shared CFB reader in opccore.
+opccore = { version = "0.1.0", path = "../opccore" }
 projcore = { version = "0.1.0", path = "../projcore" }

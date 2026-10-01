@@ -211,6 +211,11 @@ evaluate yet keep Excel's cached results and are saved untouched.
 
 ```sh
 xlsxy book.xlsx                   # open a workbook (grid, formula bar, tabs)
+xlsxy book.xls                    # also .xlsb/.ods: imports values, formulas,
+                                  # number formats and names (not other
+                                  # formatting); Ctrl+S writes book.xlsx
+                                  # (book1.xlsx, ... if that exists); the
+                                  # status line names the target
 xlsxy in.xlsx --recalc out.xlsx   # headless: recalculate everything, save
 xlsxy in.xlsx --csv out.csv       # headless: export the active sheet as CSV UTF-8
 xlsxy corpus/xlsx/*.xlsx --verify # conformance scoreboard: recalc + diff
@@ -407,8 +412,9 @@ cargo test
 The workspace has twenty-one crates; these are the ones a reader of this
 README will meet (`CONTRIBUTING.md` lists the rest):
 
-- **`opccore`** — pure, `std`-only OPC container plumbing (ZIP read/write,
-  DEFLATE, XML pull parser) shared by every engine.
+- **`opccore`** — pure, `std`-only container plumbing shared by every
+  engine: ZIP read/write, DEFLATE, an XML pull parser, and the OLE2 Compound
+  File (MS-CFB) reader of legacy `.xls`/`.doc`/`.mpp` files.
 - **`docxcore`** — the WordprocessingML engine (document model, rendering,
   and the from-scratch PDF writer). No third-party dependencies.
   Embedders constructing `docxcore::render::RenderOptions` directly should set
@@ -419,8 +425,8 @@ README will meet (`CONTRIBUTING.md` lists the rest):
 - **`projcore`** — the project-scheduling engine (task/calendar model, MSPDI
   read/write, Critical Path Method scheduler, Markdown/Mermaid Gantt export,
   native `.yppx` OPC package). `std`-only, on top of `opccore`.
-- **`mppread`** — `std`-only reader for the OLE2 Compound File container of
-  legacy binary `.mpp`/`.doc`/`.xls` files (MS-CFB).
+- **`mppread`** — `std`-only reader of MS Project `.mpp` files, on top of
+  `opccore`'s compound-file reader.
 - **`htmlbundle`** — `std`-only packer for editable HTML (`*.docx.html`):
   wraps a package, the wasm engine and the web UI (`htmlbundle/web/`) into
   one file and unwraps it again. Browser tests live in `webapp/`

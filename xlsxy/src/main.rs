@@ -36,6 +36,7 @@ use gridcore::engine::{Engine, PART_OF_ARRAY};
 use gridcore::entry::{entry_cell, entry_ctx, seed_text};
 use gridcore::formula::translate_formula;
 use gridcore::frame::Agg;
+use gridcore::legacy::{SourceFormat, open_workbook as open_any};
 use gridcore::model::{
     DataModel, MODEL_PART, ModelSpec, Relationship, model_part_xml, model_pivot, parse_model_part,
 };
@@ -44,7 +45,7 @@ use gridcore::sheet::{
     date_unrepresentable, format_with, sheet_to_csv,
 };
 use gridcore::textio::{AutoConvert, TextParse};
-use gridcore::xlsx::{SheetPackage, SpreadsheetKind, load_xlsx, new_xlsx, save_xlsx_for_path};
+use gridcore::xlsx::{SheetPackage, SpreadsheetKind, new_xlsx, save_xlsx_for_path};
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
@@ -438,8 +439,8 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let pkg = match load_xlsx(&data) {
-                Ok(p) => p,
+            let pkg = match open_any(&data) {
+                Ok((p, _)) => p,
                 Err(e) => {
                     eprintln!("error: {input}: {e}");
                     return ExitCode::FAILURE;
@@ -468,13 +469,13 @@ fn main() -> ExitCode {
         }
     }
 
-    let (pkg, path, import_source) = match parsed.inputs.first() {
+    let (pkg, path, import_source, format) = match parsed.inputs.first() {
         // A .txt/.prn in the editor opens the Text Import Wizard over a new
         // workbook (`run_tui` gets it as `wizard`).
         Some(input)
             if is_text_import(input) && parsed.recalc_out.is_none() && parsed.csv_out.is_none() =>
         {
-            (new_xlsx(), "untitled.xlsx".to_string(), None)
+            (new_xlsx(), "untitled.xlsx".to_string(), None, None)
         }
         // CSV/TSV, and a .txt/.prn in a headless run (the wizard's
         // defaults), import as a one-sheet workbook. Ctrl-S then writes
@@ -490,15 +491,24 @@ fn main() -> ExitCode {
             }
         }
         Some(input) => match std::fs::read(input) {
-            Ok(data) => match load_xlsx(&data) {
+            Ok(data) => match open_any(&data) {
+                // An .xls, .xlsb or .ods is an import, as a CSV is: bound to
+                // the .xlsx beside it, so a save never writes over it.
+                Ok((pkg, format)) if format.is_import() => (
+                    pkg,
+                    import_binding(input),
+                    Some(input.clone()),
+                    Some(format),
+                ),
                 // A template opens in the editor as a new workbook from it. A
                 // headless run keeps the template as its source, so the
                 // export guard still refuses to write over it.
-                Ok(pkg) => (
+                Ok((pkg, _)) => (
                     pkg,
                     template_binding(input)
                         .filter(|_| parsed.recalc_out.is_none() && parsed.csv_out.is_none())
                         .unwrap_or_else(|| input.clone()),
+                    None,
                     None,
                 ),
                 Err(e) => {
@@ -507,7 +517,9 @@ fn main() -> ExitCode {
                 }
             },
             // A nonexistent .xlsx path opens a new workbook bound to it.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => (new_xlsx(), input.clone(), None),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                (new_xlsx(), input.clone(), None, None)
+            }
             Err(e) => {
                 eprintln!("error: cannot read {input}: {e}");
                 return ExitCode::FAILURE;
@@ -518,11 +530,22 @@ fn main() -> ExitCode {
                 eprintln!("error: headless modes (--recalc/--csv) require an input file");
                 return ExitCode::from(2);
             }
-            (new_xlsx(), "untitled.xlsx".to_string(), None)
+            (new_xlsx(), "untitled.xlsx".to_string(), None, None)
         }
     };
 
     if let Some(out) = parsed.recalc_out {
+        // Only a workbook package is written: an .xls, .xlsb, .ods, .xml (or
+        // any type Save As refuses) would get .xlsx bytes under its name.
+        if let Some(t) = type_for_path(&out).map(|i| &SAVE_TYPES[i]) {
+            if matches!(save_kind(t), SaveKind::Unsupported | SaveKind::XmlData) {
+                eprintln!(
+                    "error: cannot save as .{} ({}): write .xlsx instead",
+                    t.ext, t.label
+                );
+                return ExitCode::from(2);
+            }
+        }
         let mut pkg = pkg;
         let mut engine = Engine::new(&pkg.workbook);
         engine.clock = now_serial();
@@ -589,7 +612,7 @@ fn main() -> ExitCode {
     match run_tui(
         pkg,
         &path,
-        import_source,
+        import_source.map(|s| (s, format)),
         template,
         welcome,
         parsed.vim,
@@ -643,19 +666,23 @@ fn auto_convert_from_prefs(text: &str) -> AutoConvert {
     auto
 }
 
-/// Load a workbook from disk, returning the package, its save path, and the
-/// imported text file's path if it was one. An `.xlsx` (or other package)
-/// loads as it is; a `.csv`/`.tsv` imports as one sheet as Excel opens it
-/// (`sep=`, typed-entry conversion); a `.txt`/`.prn` imports with the Text
-/// Import Wizard's defaults (the editor shows the wizard instead, see
-/// `App::open_workbook`). A text import is saved to `<name>.xlsx`. A
+/// Load a workbook from disk, returning the package, its save path, the
+/// imported file's path when it was an import, and the format of an
+/// imported `.xls`/`.xlsb`/`.ods` (`None` for everything else). An `.xlsx`
+/// (or other package) loads as it is; a `.csv`/`.tsv` imports as one sheet
+/// as Excel opens it (`sep=`, typed-entry conversion); a `.txt`/`.prn`
+/// imports with the Text Import Wizard's defaults (the editor shows the
+/// wizard instead, see `App::open_workbook`). A text import is saved to
+/// `<name>.xlsx`. An `.xls`, `.xlsb` or `.ods` (read by its bytes, whatever
+/// its name) imports through `gridcore::legacy` and is bound to
+/// [`import_binding`]: `<name>.xlsx`, or the next free numbered name. A
 /// template (`.xltx`, `.xltm`) opens as a new workbook from it, as Excel
 /// starts one: bound to [`template_binding`], so a save never writes the
 /// template itself.
 fn load_workbook(
     path: &str,
     open: &TextOpen,
-) -> Result<(SheetPackage, String, Option<String>), String> {
+) -> Result<(SheetPackage, String, Option<String>, Option<SourceFormat>), String> {
     if is_text_import(path) {
         let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
         let text = gridcore::textio::decode(&bytes, gridcore::textio::Origin::Auto);
@@ -663,6 +690,7 @@ fn load_workbook(
             text_to_pkg(&text, &file_stem(path), &TextParse::default(), open),
             format!("{}.xlsx", &path[..path.len() - 4]),
             Some(path.to_string()),
+            None,
         ));
     }
     if is_delimited(path) {
@@ -675,13 +703,42 @@ fn load_workbook(
             csv_to_pkg(&text, &stem, tab, open),
             format!("{base}.xlsx"),
             Some(path.to_string()),
+            None,
         ))
     } else {
         let data = std::fs::read(path).map_err(|e| e.to_string())?;
-        let pkg = load_xlsx(&data).map_err(|e| e.to_string())?;
+        let (pkg, format) = open_any(&data).map_err(|e| e.to_string())?;
+        if format.is_import() {
+            return Ok((
+                pkg,
+                import_binding(path),
+                Some(path.to_string()),
+                Some(format),
+            ));
+        }
         let save = template_binding(path).unwrap_or_else(|| path.to_string());
-        Ok((pkg, save, None))
+        Ok((pkg, save, None, None))
     }
+}
+
+/// The `.xlsx` an imported workbook is bound to: `book.xls` gives
+/// `book.xlsx` beside it, or, when that exists (or is the imported file
+/// itself, an `.xls` named `.xlsx`), `book1.xlsx`, `book2.xlsx` and so on,
+/// as [`template_binding`] numbers them. A save never lands on a file the
+/// user already has.
+fn import_binding(path: &str) -> String {
+    let source = Path::new(path);
+    let free = |p: &Path| p != source && !p.exists();
+    let plain = source.with_extension("xlsx");
+    if free(&plain) {
+        return plain.to_string_lossy().into_owned();
+    }
+    let base = source.with_extension("");
+    let base = base.to_string_lossy();
+    (1u32..)
+        .map(|n| format!("{base}{n}.xlsx"))
+        .find(|p| free(Path::new(p)))
+        .unwrap_or_else(|| plain.to_string_lossy().into_owned())
 }
 
 /// Whether `path` names a template (`.xltx`, `.xltm`).
@@ -915,7 +972,7 @@ fn iso_now() -> String {
 /// Render the first sheet of a workbook (or a CSV) as preview text lines,
 /// bounded so a huge file can't stall the browser.
 fn preview_lines(path: &str, width: usize) -> Vec<String> {
-    let (pkg, _, _) = match load_workbook(path, &TextOpen::from_prefs()) {
+    let (pkg, ..) = match load_workbook(path, &TextOpen::from_prefs()) {
         Ok(x) => x,
         Err(e) => return vec![format!("(cannot preview: {e})")],
     };
@@ -1448,6 +1505,9 @@ struct App {
     /// The template this workbook was started from, until this session first
     /// writes it (to `Budget1.xlsx` from `Budget.xltx`, or a Save As name).
     template: Option<String>,
+    /// An imported `.xls`/`.xlsb`/`.ods` this session has not written yet:
+    /// its binding was free when it opened, and a save rechecks it.
+    import_unsaved: bool,
     sheet: usize,
     cur: (u32, u32),
     anchor: Option<(u32, u32)>,
@@ -1555,6 +1615,7 @@ impl App {
             path: path.to_string(),
             import_source: None,
             template: None,
+            import_unsaved: false,
             sheet: pkg_active_tab,
             cur: (0, 0),
             anchor: None,
@@ -2967,9 +3028,15 @@ impl App {
         // written yet was bound to a name free when it opened. If that name
         // is taken now (another session from the same template), the save
         // moves on to the next free one rather than replace that file.
-        let taken = match &self.template {
-            Some(t) if Path::new(&self.path).exists() => {
+        // The same for an imported workbook not yet written: if its
+        // `<stem>.xlsx` appeared since it opened, it moves on to the next
+        // free name rather than replace that file.
+        let taken = match (&self.template, &self.import_source) {
+            (Some(t), _) if Path::new(&self.path).exists() => {
                 template_binding(t).map(|free| std::mem::replace(&mut self.path, free))
+            }
+            (None, Some(source)) if self.import_unsaved && Path::new(&self.path).exists() => {
+                Some(std::mem::replace(&mut self.path, import_binding(source)))
             }
             _ => None,
         };
@@ -2990,6 +3057,7 @@ impl App {
                 self.modified = false;
                 self.text_type = None;
                 self.template = None;
+                self.import_unsaved = false;
                 self.status = Some(match taken {
                     Some(taken) => format!(
                         "Saved {} ({} bytes): {taken} already exists",
@@ -3015,6 +3083,7 @@ impl App {
         let previous = std::mem::replace(&mut self.path, path);
         // A name chosen in Save As is written as chosen, even over a file.
         let template = self.template.take();
+        let import_unsaved = std::mem::take(&mut self.import_unsaved);
         if self.save_current().is_ok() {
             self.import_source = None;
             true
@@ -3022,6 +3091,7 @@ impl App {
             // A failed Save As must retain protection for the imported file.
             self.path = previous;
             self.template = template;
+            self.import_unsaved = import_unsaved;
             false
         }
     }
@@ -4124,11 +4194,26 @@ impl App {
             return;
         }
         match load_workbook(path, &self.text_open()) {
-            Ok((pkg, p, import_source)) => {
+            Ok((pkg, p, import_source, format)) => {
                 self.install_workbook(pkg, p, import_source);
+                self.note_import(format);
                 self.note_template(path);
             }
             Err(e) => self.status = Some(format!("Open failed: {e}")),
+        }
+    }
+
+    /// After importing a workbook read as `format` (an `.xls`, `.xlsb` or
+    /// `.ods`), the status line names the format and the `.xlsx` a save
+    /// writes.
+    fn note_import(&mut self, format: Option<SourceFormat>) {
+        if let (Some(format), Some(source)) = (format, &self.import_source) {
+            self.import_unsaved = true;
+            self.status = Some(format!(
+                "Opened {source} ({}); saving writes {}",
+                format.label(),
+                self.path
+            ));
         }
     }
 
@@ -4157,6 +4242,7 @@ impl App {
         self.path = p;
         self.import_source = import_source;
         self.template = None;
+        self.import_unsaved = false;
         self.model_rels = rels;
         self.model_measures = meas;
         self.comments = comments;
@@ -4176,8 +4262,9 @@ impl App {
     /// (`sheet.import-text` takes other options) instead of showing it.
     /// A load that fails is the error (the verb reports it).
     fn open_without_wizard(&mut self, path: &str) -> Result<(), String> {
-        let (pkg, save, source) = load_workbook(path, &self.text_open())?;
+        let (pkg, save, source, format) = load_workbook(path, &self.text_open())?;
         self.install_workbook(pkg, save, source);
+        self.note_import(format);
         self.note_template(path);
         Ok(())
     }
@@ -4258,6 +4345,7 @@ impl App {
         self.path = "untitled.xlsx".to_string();
         self.import_source = None;
         self.template = None;
+        self.import_unsaved = false;
         self.model_rels = Vec::new();
         self.model_measures = Vec::new();
         self.comments = Vec::new();
@@ -5897,7 +5985,9 @@ impl App {
 /// (green).
 impl backstage::BackstageHost for App {
     fn extensions(&self) -> &'static [&'static str] {
-        &["xlsx", "xlsm", "xltx", "xltm", "csv", "tsv", "txt", "prn"]
+        &[
+            "xlsx", "xlsm", "xltx", "xltm", "xls", "xlsb", "ods", "csv", "tsv", "txt", "prn",
+        ]
     }
 
     fn default_save_type(&self) -> Option<usize> {
@@ -7846,7 +7936,7 @@ fn open_url(url: &str) {
 fn run_tui(
     pkg: SheetPackage,
     path: &str,
-    import_source: Option<String>,
+    import: Option<(String, Option<SourceFormat>)>,
     template: Option<String>,
     welcome: bool,
     vim: bool,
@@ -7866,7 +7956,9 @@ fn run_tui(
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(pkg, path);
-    app.import_source = import_source;
+    let format = import.as_ref().and_then(|(_, f)| *f);
+    app.import_source = import.map(|(s, _)| s);
+    app.note_import(format);
     if let Some(template) = template {
         app.note_template(&template);
     }
@@ -7992,7 +8084,7 @@ fn run_tui(
 mod tests {
     use super::*;
     use gridcore::edit::parse_input;
-    use gridcore::xlsx::save_xlsx;
+    use gridcore::xlsx::{load_xlsx, save_xlsx};
 
     /// `Backup of <stem>.xlk` lives beside the file; the stem keeps any
     /// dots in the name.
@@ -8754,6 +8846,173 @@ mod tests {
         // An older file without the keys keeps Excel's defaults.
         again.apply_view_prefs("formula_view=0\n");
         assert_eq!(again.auto_convert, AutoConvert::default());
+    }
+
+    /// #603: an .xls, .xlsb or .ods opens as an import, as a CSV does: bound
+    /// to the .xlsx beside it, with a status line naming the format, and a
+    /// save writes that .xlsx and leaves the original alone. File › Open
+    /// lists the three types.
+    #[test]
+    fn legacy_workbooks_open_as_imports_bound_to_xlsx() {
+        let dir = tmp("legacy-import");
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/legacy");
+        for (ext, label) in [
+            ("xls", "Excel 97-2003 Workbook"),
+            ("xlsb", "Excel Binary Workbook"),
+            ("ods", "OpenDocument Spreadsheet"),
+        ] {
+            let source = dir.join(format!("book.{ext}"));
+            std::fs::copy(corpus.join(format!("oracle-basic.{ext}")), &source).unwrap();
+            let original = std::fs::read(&source).unwrap();
+            let binding = source.with_extension("xlsx");
+            let mut app = App::new(new_xlsx(), "untitled.xlsx");
+            app.open_workbook(source.to_str().unwrap());
+            assert_eq!(Path::new(&app.path), binding, "{ext}");
+            assert_eq!(app.import_source.as_deref(), source.to_str(), "{ext}");
+            let note = format!(
+                "Opened {} ({label}); saving writes {}",
+                source.display(),
+                binding.display()
+            );
+            assert_eq!(app.status.as_deref(), Some(note.as_str()));
+            assert!(!app.sheet().cells.is_empty(), "{ext}");
+            app.save();
+            let saved = load_xlsx(&std::fs::read(&binding).unwrap()).unwrap();
+            assert_eq!(saved.workbook.sheets[0].name, app.sheet().name, "{ext}");
+            assert_eq!(std::fs::read(&source).unwrap(), original, "{ext}");
+            // The next format binds book.xlsx again only once it's gone.
+            std::fs::remove_file(&binding).unwrap();
+        }
+        let app = App::new(new_xlsx(), "untitled.xlsx");
+        for ext in ["xls", "xlsb", "ods"] {
+            assert!(app.extensions().contains(&ext), "{ext}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #603: an import beside an existing `<stem>.xlsx` binds to the next
+    /// free name, so Ctrl+S leaves that file alone; an `.xls` that is named
+    /// `.xlsx` never binds to itself.
+    #[test]
+    fn legacy_imports_never_bind_to_an_existing_file() {
+        let dir = tmp("legacy-import-free");
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/legacy");
+        let source = dir.join("report.xls");
+        std::fs::copy(corpus.join("oracle-basic.xls"), &source).unwrap();
+        let existing = dir.join("report.xlsx");
+        std::fs::write(&existing, b"the user's own report").unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.open_workbook(source.to_str().unwrap());
+        let bound = dir.join("report1.xlsx");
+        assert_eq!(Path::new(&app.path), bound);
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap()
+                .ends_with(&format!("saving writes {}", bound.display()))
+        );
+        app.save();
+        assert_eq!(std::fs::read(&existing).unwrap(), b"the user's own report");
+        assert!(load_xlsx(&std::fs::read(&bound).unwrap()).is_ok());
+
+        // An .xls saved under an .xlsx name.
+        let disguised = dir.join("book.xlsx");
+        std::fs::copy(corpus.join("oracle-basic.xls"), &disguised).unwrap();
+        let original = std::fs::read(&disguised).unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.open_workbook(disguised.to_str().unwrap());
+        assert_eq!(Path::new(&app.path), dir.join("book1.xlsx"));
+        app.save();
+        assert_eq!(std::fs::read(&disguised).unwrap(), original);
+        assert!(load_xlsx(&std::fs::read(dir.join("book1.xlsx")).unwrap()).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #603: the binding is rechecked at the first save: a `<stem>.xlsx`
+    /// that appeared after the open is not overwritten, and once this
+    /// session has written its file, later saves go to it.
+    #[test]
+    fn an_import_rechecks_its_binding_at_the_first_save() {
+        let dir = tmp("legacy-import-late");
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/legacy");
+        let source = dir.join("report.xls");
+        std::fs::copy(corpus.join("oracle-basic.xls"), &source).unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.open_workbook(source.to_str().unwrap());
+        let plain = dir.join("report.xlsx");
+        assert_eq!(Path::new(&app.path), plain);
+        std::fs::write(&plain, b"made by someone else").unwrap();
+        app.save();
+        let bound = dir.join("report1.xlsx");
+        assert_eq!(Path::new(&app.path), bound);
+        assert_eq!(std::fs::read(&plain).unwrap(), b"made by someone else");
+        let status = app.status.clone().unwrap();
+        assert!(
+            status.starts_with(&format!("Saved {}", bound.display())),
+            "{status}"
+        );
+        assert!(
+            status.ends_with(&format!("{} already exists", plain.display())),
+            "{status}"
+        );
+        // A second save writes the same file.
+        app.save();
+        assert_eq!(Path::new(&app.path), bound);
+        assert!(load_xlsx(&std::fs::read(&bound).unwrap()).is_ok());
+        assert!(!dir.join("report2.xlsx").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #603: Save As on an import not yet written writes the chosen name as
+    /// chosen, even over a file, and never rebinds to `<stem>N.xlsx`. A Save
+    /// As that fails keeps the import unwritten (the next save rechecks).
+    #[test]
+    fn save_as_on_an_unsaved_import_writes_the_chosen_name() {
+        let dir = tmp("legacy-import-save-as");
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/legacy");
+        let source = dir.join("report.xls");
+        std::fs::copy(corpus.join("oracle-basic.xls"), &source).unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.open_workbook(source.to_str().unwrap());
+        assert!(app.import_unsaved);
+
+        // A failed Save As (no such folder) changes nothing.
+        let bound = app.path.clone();
+        let nowhere = dir.join("missing").join("x.xlsx");
+        assert!(!app.save_as(nowhere.to_string_lossy().into_owned()));
+        assert!(app.import_unsaved);
+        assert_eq!(app.path, bound);
+
+        let chosen = dir.join("chosen.xlsx");
+        std::fs::write(&chosen, b"an older file").unwrap();
+        assert!(app.save_as(chosen.to_string_lossy().into_owned()));
+        assert_eq!(Path::new(&app.path), chosen);
+        let saved = load_xlsx(&std::fs::read(&chosen).unwrap()).unwrap();
+        assert_eq!(saved.workbook.sheets[0].name, app.sheet().name);
+        assert!(!dir.join("report.xlsx").exists());
+        assert!(!dir.join("report1.xlsx").exists());
+        assert!(!app.import_unsaved);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #603: the control surface's open (no dialog) imports them the same way.
+    #[test]
+    fn opening_without_a_dialog_imports_legacy_workbooks_too() {
+        let dir = tmp("legacy-import-ctl");
+        let source = dir.join("book.ods");
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/legacy");
+        std::fs::copy(corpus.join("calc-refs.ods"), &source).unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.open_without_wizard(source.to_str().unwrap()).unwrap();
+        assert_eq!(Path::new(&app.path), source.with_extension("xlsx"));
+        assert_eq!(app.import_source.as_deref(), source.to_str());
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap()
+                .contains("(OpenDocument Spreadsheet)")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

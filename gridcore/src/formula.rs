@@ -799,6 +799,16 @@ impl<'a> Parser<'a> {
                     return Err("quoted name without !".into());
                 }
                 self.bump()?;
+                // `'Jan 2024:Mar 2024'!A1`: Excel's own spelling of a 3D span
+                // whose names need quotes. A sheet name can't hold `:`, so
+                // the split is unambiguous, except in an external
+                // qualifier (`'C:\Docs\[Budget.xlsx]Sheet1'!A1`,
+                // `'[1]Jan:Mar'!A1`): a name with `[`, `\` or `/` is never
+                // split.
+                let external = name.contains(['[', '\\', '/']);
+                if let Some((first, last)) = name.split_once(':').filter(|_| !external) {
+                    return self.three_d(first.to_string(), last.to_string());
+                }
                 self.sheet_ref(Some(name))
             }
             Tok::Bracket(spec) => {
@@ -2177,6 +2187,26 @@ pub fn rename_sheet_in_expr(e: &Expr, old: &str, new: &str) -> Expr {
                     .map(|row| row.iter().map(|x| walk(x, old, new)).collect())
                     .collect(),
             ),
+            // A span that *is* the old name: a sheet whose own name holds a
+            // `:` (an imported `A:B`, #603), which the parser reads as the
+            // span A..B. Renamed, it is the one sheet it always meant.
+            Expr::Ref3D { first, last, a, b }
+                if format!("{first}:{last}").eq_ignore_ascii_case(old) =>
+            {
+                let a = CellRef {
+                    sheet: Some(new.to_string()),
+                    ..a.clone()
+                };
+                if a.row == b.row
+                    && a.col == b.col
+                    && a.abs_row == b.abs_row
+                    && a.abs_col == b.abs_col
+                {
+                    Expr::Ref(a)
+                } else {
+                    Expr::Range(a, b.clone())
+                }
+            }
             Expr::Ref3D { first, last, a, b } => {
                 let ren = |n: &String| -> String {
                     if n.eq_ignore_ascii_case(old) {
@@ -12763,6 +12793,49 @@ mod tests {
             rename_sheet_in_formula("SUM(One:Three!A1)", "Three", "Last Q").unwrap(),
             "SUM(One:'Last Q'!A1)"
         );
+    }
+
+    /// Excel spells a 3D span whose names need quotes as one quoted token,
+    /// `'Jan 2024:Mar 2024'!A1` (#603: the legacy readers emit it too).
+    #[test]
+    fn a_quoted_three_d_span_is_one_token() {
+        for (excel, ours) in [
+            (
+                "SUM('Jan 2024:Mar 2024'!A1)",
+                "SUM('Jan 2024':'Mar 2024'!A1)",
+            ),
+            ("SUM('Q1:Q3'!A1:A2)", "SUM('Q1':'Q3'!A1:A2)"),
+        ] {
+            let ast = parse(excel).unwrap_or_else(|e| panic!("{excel}: {e}"));
+            assert_eq!(ast, parse(ours).unwrap(), "{excel}");
+            assert!(parse(&display_formula(excel)).is_ok(), "{excel}");
+        }
+        assert_eq!(
+            rename_sheet_in_formula("SUM('Jan 2024:Mar 2024'!A1)", "Mar 2024", "March").unwrap(),
+            "SUM('Jan 2024':March!A1)"
+        );
+        // An external qualifier with a `:` is one (book-qualified) sheet,
+        // as before the 3D spelling was read.
+        for (src, sheet) in [
+            (
+                r"'C:\Docs\[Budget.xlsx]Sheet1'!A1",
+                r"C:\Docs\[Budget.xlsx]Sheet1",
+            ),
+            ("'[1]Jan 1:Mar 1'!A1", "[1]Jan 1:Mar 1"),
+        ] {
+            match parse(src).unwrap_or_else(|e| panic!("{src}: {e}")) {
+                Expr::Ref(r) => assert_eq!(r.sheet.as_deref(), Some(sheet), "{src}"),
+                e => panic!("{src}: {e:?}"),
+            }
+        }
+        match parse(r"'C:\Docs\[Budget.xlsx]Sheet1'!A:A").unwrap() {
+            Expr::ColRange { sheet, .. } => {
+                assert_eq!(sheet.as_deref(), Some(r"C:\Docs\[Budget.xlsx]Sheet1"))
+            }
+            e => panic!("{e:?}"),
+        }
+        // One quoted sheet is still one sheet.
+        assert!(matches!(parse("'My Sheet'!A1").unwrap(), Expr::Ref(_)));
     }
 
     #[test]

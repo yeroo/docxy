@@ -387,3 +387,84 @@ fn a_text_file_converts_headlessly_with_the_wizard_defaults() {
         b"\xEF\xBB\xBFname,qty\r\nPen,4\r\n"
     );
 }
+
+fn corpus(dir: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("corpus")
+        .join(dir)
+}
+
+/// #603: an .xls, .xlsb or .ods input recalculates to a valid .xlsx and
+/// exports CSV, as an .xlsx does.
+#[test]
+fn legacy_inputs_recalc_to_xlsx_and_export_csv() {
+    let dir = Dir::new("legacy-in");
+    for ext in ["xls", "xlsb", "ods"] {
+        let source = corpus("legacy").join(format!("calc-refs.{ext}"));
+        let out = dir.0.join(format!("out-{ext}.xlsx"));
+        let result = run(&source, "--recalc", &out);
+        assert!(
+            result.status.success(),
+            "{ext}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let pkg = gridcore::xlsx::load_xlsx(&std::fs::read(&out).unwrap()).unwrap();
+        let names: Vec<_> = pkg
+            .workbook
+            .sheets
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(names[0], "Data", "{ext}");
+        assert_eq!(pkg.workbook.defined_names.len(), 2, "{ext}");
+        let csv = dir.0.join(format!("out-{ext}.csv"));
+        let result = run(&source, "--csv", &csv);
+        assert!(result.status.success(), "{ext} --csv");
+        assert!(!std::fs::read(&csv).unwrap().is_empty(), "{ext} --csv");
+    }
+}
+
+/// #603: `--recalc` to an .xls, .xlsb, .ods or .xml (types Save As refuses)
+/// exits 2 and writes nothing, rather than .xlsx bytes under that name.
+#[test]
+fn recalc_refuses_to_write_types_it_cannot_save() {
+    let dir = Dir::new("legacy-out");
+    let source = corpus("xlsx").join("calc-refs.xlsx");
+    for (ext, label) in [
+        ("xls", "Excel 97-2003 Workbook"),
+        ("xlsb", "Excel Binary Workbook"),
+        ("ods", "OpenDocument Spreadsheet"),
+        ("xml", "XML Data"),
+    ] {
+        let out = dir.0.join(format!("out.{ext}"));
+        let result = run(&source, "--recalc", &out);
+        assert_eq!(result.status.code(), Some(2), "{ext}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains(&format!(
+                "error: cannot save as .{ext} ({label}): write .xlsx instead"
+            )),
+            "{ext}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!out.exists(), "{ext}");
+    }
+}
+
+/// #603: `--verify` scores an imported workbook's cached values.
+#[test]
+fn verify_accepts_legacy_inputs() {
+    for ext in ["xls", "xlsb", "ods"] {
+        let result = Command::new(env!("CARGO_BIN_EXE_xlsxy"))
+            .arg(corpus("legacy").join(format!("oracle-basic.{ext}")))
+            .arg("--verify")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{ext}: {}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}

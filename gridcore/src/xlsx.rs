@@ -509,7 +509,7 @@ fn sheet_metadata_part(parts: &[(String, Vec<u8>)]) -> (String, bool) {
 
 /// The rels part that belongs to `part`: `xl/workbook.xml` →
 /// `xl/_rels/workbook.xml.rels`.
-fn rels_part_name(part: &str) -> String {
+pub(crate) fn rels_part_name(part: &str) -> String {
     match part.rsplit_once('/') {
         Some((dir, file)) => format!("{dir}/_rels/{file}.rels"),
         None => format!("_rels/{part}.rels"),
@@ -3021,7 +3021,10 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
         let xml = set_active_tab(&xml, active_tab);
         // Same for defined names: a structural edit or a rename moves them in
         // the model (print area and titles included).
-        p.1 = patch_defined_names(&xml, &wb.defined_names, wb.sheets.len()).into_bytes();
+        let xml = patch_defined_names(&xml, &wb.defined_names, wb.sheets.len());
+        // The date system too: an imported 1904 workbook (#603) starts from
+        // new_xlsx's 1900 part, and its dates would shift by 1462 days.
+        p.1 = set_date1904(&xml, wb.date1904).into_bytes();
     }
 
     // --- calc chain: drop it, ask Excel to recalculate ---------------------
@@ -5779,6 +5782,34 @@ fn workbook_order_holds(xml: &str, at: usize, tag: &str) -> bool {
     }
 }
 
+/// workbook.xml whose `<workbookPr date1904>` says `on`, in any prefix. An
+/// existing workbookPr gets the attribute set to "1", or loses a true one;
+/// a 1904 workbook without a workbookPr gets one at its schema position.
+/// A part that already agrees is returned unchanged.
+fn set_date1904(xml: &str, on: bool) -> String {
+    match workbook_child(xml, "workbookPr") {
+        Some(c) => {
+            let was = matches!(attr_at(xml, c.start, "date1904"), Some("1" | "true"));
+            if was == on {
+                xml.to_string()
+            } else {
+                set_tag_attr(xml, c.start, "date1904", on.then_some("1"))
+            }
+        }
+        None if !on => xml.to_string(),
+        None => match workbook_slot(xml, "workbookPr") {
+            WorkbookSlot::At(at, px) => {
+                let mut out = xml.to_string();
+                out.insert_str(at, &format!("<{px}workbookPr date1904=\"1\"/>"));
+                out
+            }
+            // One the walk saw but couldn't read, or an unreadable part:
+            // left as it is rather than given a second workbookPr.
+            WorkbookSlot::Present | WorkbookSlot::Unknown => xml.to_string(),
+        },
+    }
+}
+
 /// Guarantee `<calcPr … fullCalcOnLoad="1"/>` in workbook.xml, in any prefix:
 /// an existing calcPr gets the attribute (or has a `0`/`false` one turned on,
 /// since save has just dropped the calc chain), and a workbook without one
@@ -7401,19 +7432,54 @@ const RELS_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/rel
 /// A fresh single-sheet workbook (the "create new" path and a save target for
 /// in-memory workbooks).
 pub fn new_xlsx() -> SheetPackage {
-    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/><Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/></Types>"#;
+    new_xlsx_sheets(&["Sheet1".to_string()])
+}
+
+/// A fresh workbook with one empty sheet per name, in order (at least one:
+/// no names gives `Sheet1`). Every part is written in one pass, so it costs
+/// time linear in the sheets, where [`SheetPackage::add_sheet`] rescans the
+/// package for each.
+pub(crate) fn new_xlsx_sheets(names: &[String]) -> SheetPackage {
+    let fallback = ["Sheet1".to_string()];
+    let names = if names.is_empty() {
+        &fallback[..]
+    } else {
+        names
+    };
+    let n = names.len();
+    let mut overrides = String::new();
+    let mut entries = String::new();
+    let mut sheet_rels = String::new();
+    for (i, name) in names.iter().enumerate() {
+        let k = i + 1;
+        overrides.push_str(&format!(
+            r#"<Override PartName="/xl/worksheets/sheet{k}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>"#
+        ));
+        entries.push_str(&format!(
+            r#"<sheet name="{}" sheetId="{k}" r:id="rId{k}"/>"#,
+            esc_attr(name)
+        ));
+        sheet_rels.push_str(&format!(
+            r#"<Relationship Id="rId{k}" Type="{RELS_NS}/worksheet" Target="worksheets/sheet{k}.xml"/>"#
+        ));
+    }
+    let content_types = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>{overrides}<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/><Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/></Types>"#
+    );
     let root_rels = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{RELS_NS}/officeDocument" Target="xl/workbook.xml"/></Relationships>"#
     );
     let workbook = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<workbook xmlns="{SPREADSHEET_NS}" xmlns:r="{RELS_NS}"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#
+<workbook xmlns="{SPREADSHEET_NS}" xmlns:r="{RELS_NS}"><sheets>{entries}</sheets></workbook>"#
     );
     let wb_rels = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{RELS_NS}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="{RELS_NS}/styles" Target="styles.xml"/><Relationship Id="rId3" Type="{RELS_NS}/sharedStrings" Target="sharedStrings.xml"/></Relationships>"#
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{sheet_rels}<Relationship Id="rId{}" Type="{RELS_NS}/styles" Target="styles.xml"/><Relationship Id="rId{}" Type="{RELS_NS}/sharedStrings" Target="sharedStrings.xml"/></Relationships>"#,
+        n + 1,
+        n + 2
     );
     let worksheet = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -7428,10 +7494,13 @@ pub fn new_xlsx() -> SheetPackage {
     let sst = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" uniqueCount="0"></sst>"#;
 
-    let parts = vec![
+    let sheet_parts: Vec<String> = (1..=n)
+        .map(|k| format!("xl/worksheets/sheet{k}.xml"))
+        .collect();
+    let mut parts = vec![
         (
             "[Content_Types].xml".to_string(),
-            content_types.as_bytes().to_vec(),
+            content_types.into_bytes(),
         ),
         ("_rels/.rels".to_string(), root_rels.into_bytes()),
         ("xl/workbook.xml".to_string(), workbook.into_bytes()),
@@ -7439,25 +7508,27 @@ pub fn new_xlsx() -> SheetPackage {
             "xl/_rels/workbook.xml.rels".to_string(),
             wb_rels.into_bytes(),
         ),
-        (
-            "xl/worksheets/sheet1.xml".to_string(),
-            worksheet.into_bytes(),
-        ),
-        ("xl/styles.xml".to_string(), styles.into_bytes()),
-        ("xl/sharedStrings.xml".to_string(), sst.as_bytes().to_vec()),
     ];
+    for part in &sheet_parts {
+        parts.push((part.clone(), worksheet.as_bytes().to_vec()));
+    }
+    parts.push(("xl/styles.xml".to_string(), styles.into_bytes()));
+    parts.push(("xl/sharedStrings.xml".to_string(), sst.as_bytes().to_vec()));
 
     SheetPackage {
         parts,
-        sheet_parts: vec!["xl/worksheets/sheet1.xml".to_string()],
+        sheet_parts,
         shared: Vec::new(),
         shared_part: Some("xl/sharedStrings.xml".to_string()),
         strict: false,
         workbook: Workbook {
-            sheets: vec![Sheet {
-                name: "Sheet1".to_string(),
-                ..Sheet::default()
-            }],
+            sheets: names
+                .iter()
+                .map(|name| Sheet {
+                    name: name.clone(),
+                    ..Sheet::default()
+                })
+                .collect(),
             styles: Styles {
                 xfs: vec![Xf::default()],
                 ..Default::default()
@@ -8946,6 +9017,45 @@ mod tests {
         let saved = load_xlsx(&save_xlsx(&pkg)).unwrap();
         assert!(part_text(&saved, "xl/worksheets/sheet1.xml").contains("tabSelected=\"1\""));
         assert!(!part_text(&saved, "xl/worksheets/sheet2.xml").contains("tabSelected"));
+    }
+
+    /// #603: the model's date system is written back. An imported 1904
+    /// workbook starts from new_xlsx's 1900 part and must not stay 1900.
+    #[test]
+    fn save_writes_the_models_date1904() {
+        let mut pkg = new_xlsx();
+        pkg.workbook.date1904 = true;
+        let back = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert!(back.workbook.date1904);
+        let mut pkg = back;
+        pkg.workbook.date1904 = false;
+        assert!(!load_xlsx(&save_xlsx(&pkg)).unwrap().workbook.date1904);
+    }
+
+    #[test]
+    fn set_date1904_patches_inserts_and_removes() {
+        let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        // No workbookPr: one goes before bookViews/sheets.
+        let bare = format!("<workbook xmlns=\"{ns}\"><sheets/></workbook>");
+        assert_eq!(
+            set_date1904(&bare, true),
+            format!("<workbook xmlns=\"{ns}\"><workbookPr date1904=\"1\"/><sheets/></workbook>")
+        );
+        assert_eq!(set_date1904(&bare, false), bare);
+        // A prefixed one keeps its other attributes.
+        let x = format!(
+            "<x:workbook xmlns:x=\"{ns}\"><x:workbookPr defaultThemeVersion=\"1\"/><x:sheets/></x:workbook>"
+        );
+        let on = set_date1904(&x, true);
+        assert!(
+            on.contains("<x:workbookPr date1904=\"1\" defaultThemeVersion=\"1\"/>"),
+            "{on}"
+        );
+        assert_eq!(set_date1904(&on, true), on);
+        assert_eq!(set_date1904(&on, false), x);
+        // A false spelling already agrees with 1900.
+        let f = format!("<workbook xmlns=\"{ns}\"><workbookPr date1904=\"false\"/></workbook>");
+        assert_eq!(set_date1904(&f, false), f);
     }
 
     /// Excel's *Always create backup* (`<workbookPr backupFile>`): the save

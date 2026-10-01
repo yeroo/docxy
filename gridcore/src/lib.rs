@@ -26,6 +26,7 @@
 //! - [`textio`] — delimited/fixed-width text in and out (CSV open, the Text
 //!   Import Wizard, Text to Columns, Save As text types).
 //! - [`xlsx`] — `.xlsx` bytes ⇄ [`sheet::Workbook`] with part preservation.
+//! - [`legacy`] — import of `.xls`, `.xlsb` and `.ods` workbooks.
 //! - [`docprops`] — document properties (`docProps/` core, app, custom).
 
 pub mod cf;
@@ -40,6 +41,7 @@ pub mod filter;
 pub mod format;
 pub mod formula;
 pub mod frame;
+pub mod legacy;
 pub mod model;
 pub mod numfmt;
 pub mod pivot;
