@@ -532,6 +532,9 @@ pub(crate) fn sheet_prefix(first: &str, last: &str) -> String {
 /// renamed sheet too); a bare one is quoted, since a `:` needs it. String
 /// literals are left alone.
 fn restore_colons(src: &str) -> String {
+    // What the printer leaves bare in a name (ASCII letters, digits, `_`,
+    // anything past ASCII), and `.`.
+    let bare = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.') || !c.is_ascii();
     let chars: Vec<char> = src.chars().collect();
     let mut out = String::with_capacity(src.len());
     let mut quote: Option<char> = None;
@@ -547,14 +550,10 @@ fn restore_colons(src: &str) -> String {
                 i += 1;
                 continue;
             }
-            (None, _) if c == COLON || c.is_alphanumeric() || matches!(c, '_' | '.') => {
+            (None, _) if bare(c) => {
                 // A bare name: a qualifier when `!` follows.
                 let start = i;
-                while i < chars.len()
-                    && (chars[i] == COLON
-                        || chars[i].is_alphanumeric()
-                        || matches!(chars[i], '_' | '.'))
-                {
+                while i < chars.len() && bare(chars[i]) {
                     i += 1;
                 }
                 let name: String = chars[start..i].iter().collect();
@@ -1061,6 +1060,10 @@ mod tests {
             restore_colons("A_B!A1+X\u{FDD0}Y!A1+X\u{FDD0}Y"),
             "A_B!A1+'X:Y'!A1+X\u{FDD0}Y"
         );
+        // Every char the printer leaves bare belongs to the name: `·`,
+        // a no-break space, an emoji.
+        assert_eq!(restore_colons("A_B!A1+·X\u{FDD0}Y!A1"), "A_B!A1+'·X:Y'!A1");
+        assert_eq!(restore_colons("X\u{FDD0}Y\u{A0}😀!A1"), "'X:Y\u{A0}😀'!A1");
         assert_eq!(
             restore_colons("'It''s\u{FDD0}'!A1&\"\u{FDD0}'\u{FDD0}\""),
             "'It''s:'!A1&\"\u{FDD0}'\u{FDD0}\""
