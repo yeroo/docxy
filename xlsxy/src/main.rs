@@ -2905,8 +2905,9 @@ impl App {
             let xml = model_part_xml(&self.model_rels, &self.model_measures);
             self.pkg.set_part(MODEL_PART, xml.into_bytes());
         }
-        // As Excel does: the file says when it was saved and by whom (its
-        // author and creation time stay as they were).
+        // As Excel does: the file says when it was saved and by whom. Its
+        // author and creation time are kept, or, on a workbook's first save
+        // (no core properties yet), set to this user and this time.
         self.pkg.stamp_save(&iso_now(), &comment_author());
         // The file's type follows the path it is written to.
         save_xlsx_for_path(&self.pkg, &self.path)
@@ -8303,6 +8304,38 @@ mod tests {
         }
         handle_key(&mut app, key(KeyCode::Enter));
         assert_eq!(app.pkg.doc_properties().title, None);
+    }
+
+    /// #600 r1 M2: with eight custom properties on 80x24, the Info page
+    /// scrolls so the selected `Custom property…` row is inside its box.
+    #[test]
+    fn file_info_keeps_the_selected_row_on_screen() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = App::new(new_xlsx(), "info.xlsx");
+        app.os_clip = None;
+        let mut p = app.pkg.doc_properties();
+        p.custom = (1..=8)
+            .map(|i| CustomProperty {
+                name: format!("Prop{i}"),
+                value: CustomValue::Number(f64::from(i)),
+            })
+            .collect();
+        app.pkg.set_doc_properties(&p);
+        app.open_backstage();
+        app.backstage
+            .as_mut()
+            .unwrap()
+            .focus_info(INFO_FIELDS.len());
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        let buf = term.backend().buffer();
+        let row = |y: u16| (0..80).map(|x| buf[(x, y)].symbol()).collect::<String>();
+        let at = (2..23)
+            .find(|&y| row(y).contains("Custom property…"))
+            .unwrap_or_else(|| panic!("selected row not inside the box"));
+        assert_eq!(buf[(20, at)].bg, Color::Green);
+        assert!(row(23).contains('└'), "{}", row(23));
     }
 
     /// File › Info lists who wrote the workbook and when, from core.xml.

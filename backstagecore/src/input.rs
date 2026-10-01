@@ -412,11 +412,14 @@ impl Backstage {
         // edits it.
         if self.item == Item::Info {
             let rows = info_rows(host);
-            if let Some(i) = y
-                .checked_sub(self.layout.info_top)
-                .map(usize::from)
-                .filter(|&i| i < rows)
-            {
+            let (top, end) = self.layout.info_view;
+            // Only the box's inside: a row scrolled under a border is hidden.
+            let row = (top..end)
+                .contains(&y)
+                .then(|| i32::from(y) - self.layout.info_top)
+                .and_then(|i| usize::try_from(i).ok())
+                .filter(|&i| i < rows);
+            if let Some(i) = row {
                 if self.pane == Pane::Info && self.info_sel == i {
                     return BackstageEvent::EditInfo(i);
                 }
@@ -584,6 +587,7 @@ mod tests {
         ));
         assert_eq!(bs.pane, Pane::Menu);
         bs.layout.info_top = 3;
+        bs.layout.info_view = (2, 20);
         assert!(matches!(bs.mouse(20, 3, &TestHost), BackstageEvent::None));
         assert_eq!(bs.pane, Pane::Menu);
     }
@@ -623,6 +627,7 @@ mod tests {
     fn info_row_click_selects_then_edits() {
         let mut bs = on_info();
         bs.layout.info_top = 5;
+        bs.layout.info_view = (2, 20);
         assert!(matches!(
             bs.mouse(20, 6, &EditableHost),
             BackstageEvent::None
@@ -638,6 +643,26 @@ mod tests {
             BackstageEvent::None
         ));
         assert_eq!(bs.info_sel, 1);
+    }
+
+    #[test]
+    fn info_clicks_outside_the_box_do_nothing() {
+        let mut bs = on_info();
+        // Scrolled: row 0 sits above the box, row 2 on its last inner row.
+        bs.layout.info_top = 1;
+        bs.layout.info_view = (2, 3);
+        for y in [1, 3, 4] {
+            assert!(matches!(
+                bs.mouse(20, y, &EditableHost),
+                BackstageEvent::None
+            ));
+            assert_eq!(bs.pane, Pane::Menu, "y {y}");
+        }
+        assert!(matches!(
+            bs.mouse(20, 2, &EditableHost),
+            BackstageEvent::None
+        ));
+        assert_eq!((bs.pane, bs.info_sel), (Pane::Info, 1));
     }
 
     #[test]

@@ -117,8 +117,11 @@ pub struct BackstageLayout {
     pub type_top: u16,
     pub name_x0: u16,
     pub preview_h: usize,
-    /// Screen row of the Info page's first editable row.
-    pub info_top: u16,
+    /// Screen row of the Info page's first editable row; above the box
+    /// (even negative) when the page is scrolled down.
+    pub info_top: i32,
+    /// The Info box's inner rows, `[first, end)`: only a click there counts.
+    pub info_view: (u16, u16),
 }
 
 pub struct Backstage {

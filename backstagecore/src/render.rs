@@ -376,12 +376,12 @@ fn draw_info(f: &mut Frame, area: Rect, bs: &mut Backstage, host: &dyn Backstage
     let mut lines = host.info_lines();
     let fields = host.info_fields();
     let custom = host.info_custom_row();
+    let mut scroll = 0usize;
     if !fields.is_empty() || custom {
         let focus = bs.pane == Pane::Info;
         let accent = Style::default().fg(Color::Black).bg(host.accent());
         lines.push(RLine::raw(""));
-        // Inside the box's top border.
-        bs.layout.info_top = area.y + 1 + lines.len() as u16;
+        let first_row = lines.len();
         let rows = fields
             .iter()
             .map(|(label, value)| format!("  {label:<18}{value}"))
@@ -403,14 +403,24 @@ fn draw_info(f: &mut Frame, area: Rect, bs: &mut Backstage, host: &dyn Backstage
             },
             dim,
         ));
+        // Scroll the page so the selected row stays inside the box.
+        let inner = area.height.saturating_sub(2) as usize;
+        let sel_line = first_row + bs.info_sel;
+        if focus && inner > 0 {
+            scroll = (sel_line + 1).saturating_sub(inner);
+        }
+        bs.layout.info_top = i32::from(area.y) + 1 + first_row as i32 - scroll as i32;
+        bs.layout.info_view = (area.y + 1, area.y + 1 + inner as u16);
     }
     f.render_widget(
-        Paragraph::new(lines).block(
-            RBlock::default()
-                .borders(Borders::ALL)
-                .border_style(dim)
-                .title(" Info "),
-        ),
+        Paragraph::new(lines)
+            .scroll((scroll.min(u16::MAX as usize) as u16, 0))
+            .block(
+                RBlock::default()
+                    .borders(Borders::ALL)
+                    .border_style(dim)
+                    .title(" Info "),
+            ),
         area,
     );
 }
@@ -592,6 +602,72 @@ mod tests {
         let buf = term.backend().buffer();
         assert_eq!(buf[(18, 6)].bg, Color::Green);
         assert_ne!(buf[(18, 5)].bg, Color::Green);
+    }
+
+    /// More rows than the box holds: the page scrolls so the selected row
+    /// stays inside the border, and a click on the border does nothing.
+    #[test]
+    fn a_tall_info_page_keeps_the_selected_row_in_the_box() {
+        struct Tall;
+        impl BackstageHost for Tall {
+            fn extensions(&self) -> &'static [&'static str] {
+                &["xlsx"]
+            }
+            fn default_save_name(&self) -> String {
+                "book.xlsx".into()
+            }
+            fn preview_lines(&self, _p: &Path, _w: usize) -> Vec<String> {
+                Vec::new()
+            }
+            fn info_lines(&self) -> Vec<Line<'static>> {
+                (0..15).map(|i| Line::raw(format!("  line {i}"))).collect()
+            }
+            fn accent(&self) -> Color {
+                Color::Green
+            }
+            fn info_fields(&self) -> Vec<(String, String)> {
+                (0..8)
+                    .map(|i| (format!("Field{i}"), String::new()))
+                    .collect()
+            }
+            fn info_custom_row(&self) -> bool {
+                true
+            }
+        }
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut bs = Backstage::open(std::env::temp_dir(), &["xlsx"]);
+        bs.focus_info(8);
+        term.draw(|f| {
+            let a = f.area();
+            super::draw(f, a, &mut bs, &Tall);
+        })
+        .unwrap();
+        let text = screen(&term);
+        let lines: Vec<&str> = text.lines().collect();
+        // The box spans rows 1..=23; its last inner row is 22.
+        assert_eq!(bs.layout.info_view, (2, 23));
+        assert!(lines[22].contains("Custom property…"), "{text}");
+        assert!(lines[23].contains("└"), "{text}");
+        assert_eq!(term.backend().buffer()[(18, 22)].bg, Color::Green);
+        // A click on the bottom border does nothing; one on the row edits it.
+        assert!(matches!(
+            bs.mouse(20, 23, &Tall),
+            crate::BackstageEvent::None
+        ));
+        assert_eq!(bs.info_sel, 8);
+        assert!(matches!(
+            bs.mouse(20, 22, &Tall),
+            crate::BackstageEvent::EditInfo(8)
+        ));
+        // Back at the top, the page is not scrolled.
+        bs.info_sel = 0;
+        term.draw(|f| {
+            let a = f.area();
+            super::draw(f, a, &mut bs, &Tall);
+        })
+        .unwrap();
+        let text = screen(&term);
+        assert!(text.lines().nth(2).unwrap().contains("line 0"), "{text}");
     }
 
     #[test]
