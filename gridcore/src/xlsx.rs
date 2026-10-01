@@ -4089,11 +4089,15 @@ fn set_auto_filter(mut xml: String, model: Option<&crate::sheet::SheetAutoFilter
 
 /// Sync one `<rowBreaks>` / `<colBreaks>` element from the model. It is left
 /// byte-for-byte alone while it holds exactly the model's breaks, rewritten
-/// (with its counts) when they differ, dropped when none are left, and never
-/// created: nothing adds breaks yet, so a missing element has nothing to say.
+/// (with its counts) when they differ, dropped when none are left, and
+/// created at its schema position when breaks were inserted on a sheet that
+/// had none.
 fn set_page_breaks(mut xml: String, tag: &str, breaks: &[crate::sheet::PageBreak]) -> String {
     let Some((start, end)) = sheet_breaks_span(&xml, tag) else {
-        return xml;
+        if breaks.is_empty() {
+            return xml;
+        }
+        return put_worksheet_child(&xml, tag, &page_breaks_block(tag, breaks), None, false);
     };
     if parse_page_breaks(&xml[start..end]) == breaks {
         return xml;
@@ -4101,15 +4105,7 @@ fn set_page_breaks(mut xml: String, tag: &str, breaks: &[crate::sheet::PageBreak
     let block = if breaks.is_empty() {
         String::new()
     } else {
-        let manual = breaks.iter().filter(|b| b.is_manual()).count();
-        let mut block = format!(
-            "<{tag} count=\"{}\" manualBreakCount=\"{manual}\">",
-            breaks.len()
-        );
-        for b in breaks {
-            block.push_str(&format!("<brk id=\"{}\"{}/>", b.id, b.attrs));
-        }
-        block.push_str(&format!("</{tag}>"));
+        let block = page_breaks_block(tag, breaks);
         match worksheet_root(&xml) {
             Some(root) => in_worksheet_ns(&root, &block),
             None => block,
@@ -4117,6 +4113,20 @@ fn set_page_breaks(mut xml: String, tag: &str, breaks: &[crate::sheet::PageBreak
     };
     xml.replace_range(start..end, &block);
     xml
+}
+
+/// A `<rowBreaks>` / `<colBreaks>` element (unprefixed) holding `breaks`.
+fn page_breaks_block(tag: &str, breaks: &[crate::sheet::PageBreak]) -> String {
+    let manual = breaks.iter().filter(|b| b.is_manual()).count();
+    let mut block = format!(
+        "<{tag} count=\"{}\" manualBreakCount=\"{manual}\">",
+        breaks.len()
+    );
+    for b in breaks {
+        block.push_str(&format!("<brk id=\"{}\"{}/>", b.id, b.attrs));
+    }
+    block.push_str(&format!("</{tag}>"));
+    block
 }
 
 /// Where the sheet's own `<rowBreaks>` / `<colBreaks>` element is (in any

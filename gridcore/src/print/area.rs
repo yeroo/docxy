@@ -2,8 +2,8 @@
 //! `_xlnm.Print_Titles` defined names, read and written in Excel's spelling.
 
 use crate::sheet::{
-    DefinedName, MAX_COLS, MAX_ROWS, Workbook, cell_name, col_name, parse_cell_name,
-    quote_sheet_name,
+    DefinedName, MAX_COLS, MAX_ROWS, PageBreak, Sheet, Workbook, cell_name, col_name,
+    parse_cell_name, quote_sheet_name,
 };
 
 pub const PRINT_AREA: &str = "_xlnm.Print_Area";
@@ -254,10 +254,78 @@ pub fn rect_name((r1, c1, r2, c2): Rect) -> String {
     }
 }
 
+/// The `<brk>` attributes of a manual break Excel inserts: a row break runs
+/// across every column, a column break down every row.
+fn manual_attrs(row: bool) -> &'static str {
+    if row {
+        " max=\"16383\" man=\"1\""
+    } else {
+        " max=\"1048575\" man=\"1\""
+    }
+}
+
+/// Add (or make manual) the break whose page starts at `id`, kept in order.
+fn add_break(breaks: &mut Vec<PageBreak>, id: u32, row: bool) -> bool {
+    match breaks.binary_search_by_key(&id, |b| b.id) {
+        Ok(i) if breaks[i].is_manual() => false,
+        Ok(i) => {
+            breaks[i].attrs = manual_attrs(row).to_string();
+            true
+        }
+        Err(i) => {
+            breaks.insert(
+                i,
+                PageBreak {
+                    id,
+                    attrs: manual_attrs(row).to_string(),
+                },
+            );
+            true
+        }
+    }
+}
+
+/// Insert Page Break at cell (`row`, `col`), 0-based (FIL-148): a
+/// horizontal break above the cell unless it is in row 1, a vertical one to
+/// its left unless it is in column A. `false` when nothing changed.
+pub fn insert_page_break(sheet: &mut Sheet, row: u32, col: u32) -> bool {
+    let mut changed = false;
+    if row > 0 {
+        changed |= add_break(&mut sheet.row_breaks, row, true);
+    }
+    if col > 0 {
+        changed |= add_break(&mut sheet.col_breaks, col, false);
+    }
+    changed
+}
+
+/// Remove Page Break at cell (`row`, `col`) (FIL-149): the manual breaks
+/// bordering it, above and to the left. `false` when there were none.
+pub fn remove_page_break(sheet: &mut Sheet, row: u32, col: u32) -> bool {
+    let before = sheet.row_breaks.len() + sheet.col_breaks.len();
+    sheet.row_breaks.retain(|b| !(b.id == row && b.is_manual()));
+    sheet.col_breaks.retain(|b| !(b.id == col && b.is_manual()));
+    sheet.row_breaks.len() + sheet.col_breaks.len() != before
+}
+
+/// Reset All Page Breaks: every manual break goes. `false` when there were
+/// none.
+pub fn reset_page_breaks(sheet: &mut Sheet) -> bool {
+    let before = sheet.row_breaks.len() + sheet.col_breaks.len();
+    sheet.row_breaks.retain(|b| !b.is_manual());
+    sheet.col_breaks.retain(|b| !b.is_manual());
+    sheet.row_breaks.len() + sheet.col_breaks.len() != before
+}
+
+/// The manual breaks: (row ids, col ids).
+pub fn manual_breaks(sheet: &Sheet) -> (Vec<u32>, Vec<u32>) {
+    let ids = |v: &[PageBreak]| v.iter().filter(|b| b.is_manual()).map(|b| b.id).collect();
+    (ids(&sheet.row_breaks), ids(&sheet.col_breaks))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sheet::Sheet;
 
     fn wb(names: &[&str]) -> Workbook {
         Workbook {
@@ -344,5 +412,42 @@ mod tests {
         let mut w = wb(&["S"]);
         set_print_area(&mut w, 0, &[(0, 0, 4, MAX_COLS - 1)]);
         assert_eq!(formula(&w, PRINT_AREA).as_deref(), Some("S!$1:$5"));
+    }
+
+    #[test]
+    fn breaks_insert_above_and_left_of_the_cell() {
+        // FIL-CASE-046: A14, D1, F30.
+        let mut s = Sheet::default();
+        assert!(insert_page_break(&mut s, 13, 0));
+        assert_eq!(manual_breaks(&s), (vec![13], vec![]));
+        assert!(insert_page_break(&mut s, 0, 3));
+        assert_eq!(manual_breaks(&s), (vec![13], vec![3]));
+        assert!(insert_page_break(&mut s, 29, 5));
+        assert_eq!(manual_breaks(&s), (vec![13, 29], vec![3, 5]));
+        assert_eq!(s.row_breaks[0].attrs, " max=\"16383\" man=\"1\"");
+        assert_eq!(s.col_breaks[0].attrs, " max=\"1048575\" man=\"1\"");
+        // A1 has nothing above or left of it; a repeat changes nothing.
+        assert!(!insert_page_break(&mut s, 0, 0));
+        assert!(!insert_page_break(&mut s, 13, 0));
+        assert!(remove_page_break(&mut s, 29, 5));
+        assert_eq!(manual_breaks(&s), (vec![13], vec![3]));
+        assert!(!remove_page_break(&mut s, 29, 5));
+        assert!(reset_page_breaks(&mut s));
+        assert!(s.row_breaks.is_empty() && s.col_breaks.is_empty());
+    }
+
+    #[test]
+    fn an_automatic_break_is_made_manual_and_survives_a_reset() {
+        let mut s = Sheet::default();
+        s.row_breaks.push(PageBreak {
+            id: 40,
+            attrs: " max=\"16383\"".into(),
+        });
+        assert!(insert_page_break(&mut s, 20, 0));
+        assert!(!remove_page_break(&mut s, 40, 0), "automatic breaks stay");
+        assert!(reset_page_breaks(&mut s));
+        assert_eq!(s.row_breaks.iter().map(|b| b.id).collect::<Vec<_>>(), [40]);
+        assert!(insert_page_break(&mut s, 40, 0));
+        assert!(s.row_breaks[0].is_manual());
     }
 }

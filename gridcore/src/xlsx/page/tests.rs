@@ -375,3 +375,33 @@ fn an_unaligned_workbook_keeps_a_print_area_it_cannot_place() {
     let wb = workbook_xml(&pkg);
     assert!(wb.contains(AREA), "{wb}");
 }
+
+#[test]
+fn inserted_breaks_create_their_elements_and_reset_drops_them() {
+    // FIL-CASE-046 on a sheet with no breaks.
+    use crate::print::area::{insert_page_break, remove_page_break, reset_page_breaks};
+    let mut pkg = load("", &format!(r#"{MARGINS}<drawing r:id="rId1"/>"#));
+    let sheet = &mut pkg.workbook.sheets[0];
+    insert_page_break(sheet, 13, 0);
+    insert_page_break(sheet, 0, 3);
+    insert_page_break(sheet, 29, 5);
+    let ws = saved(&pkg);
+    let rows = concat!(
+        r#"<rowBreaks count="2" manualBreakCount="2"><brk id="13" max="16383" man="1"/>"#,
+        r#"<brk id="29" max="16383" man="1"/></rowBreaks>"#,
+        r#"<colBreaks count="2" manualBreakCount="2"><brk id="3" max="1048575" man="1"/>"#,
+        r#"<brk id="5" max="1048575" man="1"/></colBreaks><drawing"#,
+    );
+    assert!(ws.contains(&format!("{MARGINS}{rows}")), "{ws}");
+
+    let mut pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+    remove_page_break(&mut pkg.workbook.sheets[0], 29, 5);
+    let ws = saved(&pkg);
+    assert!(
+        ws.contains(r#"<rowBreaks count="1" manualBreakCount="1"><brk id="13" max="16383" man="1"/></rowBreaks><colBreaks count="1" manualBreakCount="1"><brk id="3" max="1048575" man="1"/></colBreaks>"#),
+        "{ws}"
+    );
+    reset_page_breaks(&mut pkg.workbook.sheets[0]);
+    let ws = saved(&pkg);
+    assert!(!ws.contains("Breaks") && !ws.contains("<brk"), "{ws}");
+}
