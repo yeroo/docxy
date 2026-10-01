@@ -2054,26 +2054,26 @@ fn resolve_commands(
 }
 
 /// What the active tab's paste would take besides the clipboard's text: the
-/// document's in-app clip, or the grid clip while the clipboard still holds
-/// what it put there (`grid_paste_uses_clip`); otherwise `none`, and a paste
-/// takes `text` (a document never reads it: see the stale-clip follow-up).
+/// document's rich clip or the sheet's grid clip, while the clipboard still
+/// holds what that copy put there (`clip_still_ours`); otherwise `none`, and a
+/// paste takes `text`.
 fn clipboard_app_json(
     surface: Option<&crate::Surface>,
-    doc: Option<&docxcore::editor::Clip>,
+    doc: Option<&crate::DocClip>,
     grid: Option<&crate::GridClip>,
     now: &crate::ClipRead,
 ) -> Json {
     match surface {
         Some(crate::Surface::Doc(_)) => {
-            if let Some(clip) = doc {
+            if let Some(clip) = doc.filter(|c| crate::clip_still_ours(&c.text, now)) {
                 return Json::obj(vec![
                     ("kind", Json::Str("doc".into())),
-                    ("text", Json::Str(clip.to_text())),
+                    ("text", Json::Str(clip.text.clone())),
                 ]);
             }
         }
         Some(crate::Surface::Sheet(_)) => {
-            if let Some(clip) = grid.filter(|c| crate::grid_paste_uses_clip(&c.text, now)) {
+            if let Some(clip) = grid.filter(|c| crate::clip_still_ours(&c.text, now)) {
                 return Json::obj(vec![
                     ("kind", Json::Str("grid".into())),
                     ("text", Json::Str(clip.text.clone())),
@@ -3296,15 +3296,18 @@ mod tests {
         })
     }
 
-    /// #699: `clipboard` reports what the active tab's paste would take: the
-    /// document clip on a document, the grid clip on a sheet only while the
-    /// clipboard still holds its text, and nothing on other surfaces.
+    /// #699, #755: `clipboard` reports what the active tab's paste would take:
+    /// the document clip on a document and the grid clip on a sheet, each only
+    /// while the clipboard still holds its text, and nothing on other surfaces.
     #[test]
     fn clipboard_reports_the_clip_the_next_paste_would_use() {
         use crate::ClipRead;
         let doc = crate::Surface::Doc(editor(ParProps::default(), RunProps::default()));
         let sheet = crate::new_sheet_surface();
-        let clip = docxcore::editor::Clip::from_text("one\ntwo");
+        let clip = crate::DocClip {
+            clip: docxcore::editor::Clip::from_text("one\ntwo"),
+            text: "one\ntwo".into(),
+        };
         let grid = crate::GridClip {
             cells: vec![vec![Default::default(); 3]; 2],
             text: "a\tb\tc\nd\te\tf\n".into(),
@@ -3318,6 +3321,13 @@ mod tests {
         assert_eq!(on_doc.get_str("text"), Some("one\ntwo"));
         let bare = clipboard_app_json(Some(&doc), None, Some(&grid), &nothing);
         assert_eq!(kind(bare), "none");
+        let doc_echoed = clipboard_app_json(Some(&doc), Some(&clip), None, &text("one\r\ntwo"));
+        assert_eq!(kind(doc_echoed), "doc");
+        // Another app's copy, text or image, is newer than the document clip.
+        let doc_replaced = clipboard_app_json(Some(&doc), Some(&clip), None, &text("other"));
+        assert_eq!(kind(doc_replaced), "none");
+        let doc_image = clipboard_app_json(Some(&doc), Some(&clip), None, &ClipRead::NotText);
+        assert_eq!(kind(doc_image), "none");
 
         let ours = clipboard_app_json(Some(&sheet), Some(&clip), Some(&grid), &text(&grid.text));
         assert_eq!(kind(ours.clone()), "grid");

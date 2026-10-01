@@ -44,8 +44,9 @@ interface EditorSpec {
    *  the open-time modal and the webview's in-tab `createNew` message). These
    *  are webview-native bytes (docx, for both the docx and markdown editors) —
    *  when writing them to disk as a new file's initial content, route through
-   *  `toFileBytes` first (see `seedNewDocument`). */
-  mintEmpty?: (context: vscode.ExtensionContext) => Promise<Uint8Array>;
+   *  `toFileBytes` first (see `seedNewDocument`). `target` is the file the
+   *  bytes are for: a workbook is typed by its extension. */
+  mintEmpty?: (context: vscode.ExtensionContext, target: vscode.Uri) => Promise<Uint8Array>;
   /** Convert on-disk file bytes into the bytes the webview `docx_open`s.
    *  Default identity (the file already holds the editor's native bytes).
    *  The markdown editor uses this to turn `.md` text into in-memory docx
@@ -191,7 +192,7 @@ const EDITORS: EditorSpec[] = [
     wasm: 'gridwasm.wasm',
     emptyPrompt:
       '“{name}” is empty — it isn\'t an Excel workbook yet. Create a new workbook in its place?',
-    mintEmpty: (ctx) => newWorkbook(ctx),
+    mintEmpty: (ctx, target) => newWorkbook(ctx, sheetKindCode(target)),
     ctl: {
       app: 'xlsxy',
       // 'wb.info' is deliberately NOT in this set: same reasoning as
@@ -1051,7 +1052,7 @@ class OffxyEditorProvider implements vscode.CustomEditorProvider<BinaryDocument>
     if (!this.spec.mintEmpty) {
       return;
     }
-    const bytes = await this.spec.mintEmpty(this.context);
+    const bytes = await this.spec.mintEmpty(this.context, document.uri);
     if (document.uri.scheme !== 'untitled') {
       await vscode.workspace.fs.writeFile(document.uri, await this.toDisk(bytes));
     }

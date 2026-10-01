@@ -459,11 +459,12 @@ impl Editor {
                 return Err("the caret is not in a paragraph".into());
             };
             let right = split_content(&mut p.content, off);
-            let mut props = p.props.clone();
-            // The section break ends the section after the split, so it moves
-            // with the paragraph's second half.
+            let props = p.props.clone();
+            // The section break ends the section after the split, so it (and
+            // its tracked change) moves with the paragraph's second half. A
+            // tracked pPrChange stays on both halves, as every split does (#801).
             p.props.section_break = None;
-            props.property_change = None;
+            p.props.section_property_change = None;
             cont.insert(
                 idx + 1,
                 Block::Paragraph(Paragraph {

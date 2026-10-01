@@ -56,7 +56,7 @@ class XlsxFileEditor(
         val bytes = xlsxFile.contentsToByteArray()
         when {
             bytes.isEmpty() -> showEmptyState()
-            !openInPanel(bytes) -> showMessage("Offxy could not read this .xlsx file.")
+            !openInPanel(bytes) -> showMessage("Offxy could not read this workbook.")
         }
         ApplicationManager.getApplication().messageBus.connect(this)
             .subscribe(VirtualFileManager.VFS_CHANGES, object : BulkFileListener {
@@ -208,7 +208,8 @@ class XlsxFileEditor(
     }
 
     fun createNewWorkbook() {
-        val minted = GridEngine.newWorkbook()
+        // Typed for this file: an empty .xltm becomes a macro template.
+        val minted = GridEngine.newWorkbook(xlsxFile.name)
         savingToDisk = true
         try {
             WriteAction.run<RuntimeException> { xlsxFile.setBinaryContent(minted) }

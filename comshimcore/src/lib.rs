@@ -40,6 +40,9 @@ pub const VT_EMPTY: u16 = 0;
 pub const VT_BSTR: u16 = 8;
 pub const VT_ERROR: u16 = 10;
 pub const VT_BOOL: u16 = 11;
+pub const VT_VARIANT: u16 = 12;
+/// A flag on the tag, not a type of its own: a SAFEARRAY of the masked type.
+pub const VT_ARRAY: u16 = 0x2000;
 
 const DISPID_UNKNOWN: i32 = -1;
 
@@ -91,6 +94,16 @@ pub fn install_panic_hook() {
 /// `v` must be a valid, non-null pointer to an initialized `VARIANT`.
 pub unsafe fn vt_of(v: *const VARIANT) -> u16 {
     unsafe { *(v as *const u16) & 0x0fff }
+}
+
+/// Does the VARIANT hold an array (`VT_ARRAY` set on its tag)? [`vt_of`]
+/// masks that flag off, so a caller that cannot take an array asks this.
+///
+/// # Safety
+/// `v` must be a valid, non-null pointer to an initialized `VARIANT`. Only
+/// its leading 16-bit `vt` field is read, as in [`vt_of`].
+pub unsafe fn vt_is_array(v: *const VARIANT) -> bool {
+    unsafe { *(v as *const u16) & VT_ARRAY != 0 }
 }
 
 /// Positional argument `i` (0 = first), accounting for `rgvarg` being stored in

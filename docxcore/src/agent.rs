@@ -17,7 +17,7 @@
 //! indices are paragraphs (the ones the edit verbs accept).
 
 use crate::editor::{Caret, Clip, Editor, Match};
-use crate::model::{Align, Block, Document, Inline, ParProps, RunProps};
+use crate::model::{Align, Block, Document, Inline, ParProps, Paragraph, PropertyChange, RunProps};
 
 /// One block's read-only summary, as reported by [`read`].
 pub struct BlockInfo {
@@ -175,13 +175,43 @@ pub fn insert(ed: &mut Editor, at: usize, text: &str) -> Result<(), String> {
 }
 
 /// Append `text` (newline-split into one or more paragraphs) after the
-/// document's last block.
+/// document's last block. When that block is a paragraph closing a section,
+/// the section mark stays on it and `text` lands in the final section, as
+/// with [`append_blocks`].
 pub fn append(ed: &mut Editor, text: &str) {
     // Paste `\ntext` at the document end: the leading newline starts a fresh
     // paragraph, so `text` lands as new paragraph(s) after the current last one.
+    let start = ed.doc.content_block_count();
     ed.anchor = None;
     ed.move_doc_end();
     ed.paste(&Clip::from_text(&format!("\n{text}")));
+    restore_last_section_mark(ed, start);
+}
+
+/// After an append pasted at the end of the last of the `start` content
+/// blocks, put back the section mark the paste moved onto the new last
+/// paragraph (#748): the old last paragraph still closes its section, and the
+/// appended content lands after it, in the final section.
+fn restore_last_section_mark(ed: &mut Editor, start: usize) {
+    let moved_to = ed.doc.content_block_count().saturating_sub(1);
+    if start == 0
+        || moved_to < start
+        || !matches!(ed.doc.body.get(start - 1), Some(Block::Paragraph(_)))
+    {
+        return;
+    }
+    let Some(Block::Paragraph(p)) = ed.doc.body.get_mut(moved_to) else {
+        return;
+    };
+    if p.props.section_break.is_none() && p.props.section_property_change.is_none() {
+        return;
+    }
+    let brk = p.props.section_break.take();
+    let change = p.props.section_property_change.take();
+    if let Some(Block::Paragraph(last)) = ed.doc.body.get_mut(start - 1) {
+        last.props.section_break = brk;
+        last.props.section_property_change = change;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -395,7 +425,9 @@ pub fn insert_blocks(ed: &mut Editor, at: usize, blocks: Vec<Block>) -> Result<(
 /// `"\n{text}"` trick does for plain text), then [`overwrite_blocks`] turns
 /// the opened slots into the real content. One [`Editor::paste`] call is made,
 /// so this is **one** undo checkpoint, matching `append`. A no-op (empty
-/// `blocks`) touches nothing and pushes no checkpoint.
+/// `blocks`) touches nothing and pushes no checkpoint. As with [`append`], a
+/// section mark on the last paragraph stays there and `blocks` land in the
+/// final section.
 pub fn append_blocks(ed: &mut Editor, blocks: Vec<Block>) {
     if blocks.is_empty() {
         return;
@@ -407,6 +439,8 @@ pub fn append_blocks(ed: &mut Editor, blocks: Vec<Block>) {
     ed.paste(&Clip {
         paras: vec![Vec::new(); count + 1],
     });
+    // Before `overwrite_blocks` replaces the placeholder holding it.
+    restore_last_section_mark(ed, start);
     overwrite_blocks(ed, start, blocks);
 }
 
@@ -434,6 +468,11 @@ pub fn validate_replace_range(doc: &Document, start: usize, end: usize) -> Resul
 /// case being a single empty paragraph). Returns `(replaced, undo_steps)`:
 /// the number of original paragraphs replaced, and the checkpoint count.
 ///
+/// The end paragraph's section mark (its sectPr and tracked sectPr change)
+/// stays on the last replacing paragraph, or on a new empty paragraph after a
+/// trailing table, which adds one block beyond `blocks.len()`. Marks on
+/// paragraphs before `end` are removed with the range (#801).
+///
 /// Validates bounds/paragraph-kind ([`validate_replace_range`]) before the
 /// "non-empty `blocks`" check — same order as [`insert_blocks`], see
 /// [`validate_insert_at`]'s doc comment for why.
@@ -448,18 +487,58 @@ pub fn replace_range_blocks(
         return Err("empty markdown".to_string());
     }
 
+    // The end paragraph's section mark, read before the paste puts it on a
+    // placeholder that `overwrite_blocks` replaces (#801).
+    let mark = match &ed.doc.body[end] {
+        Block::Paragraph(p) => (
+            p.props.section_break.clone(),
+            p.props.section_property_change.clone(),
+        ),
+        _ => (None, None),
+    };
+
     ed.anchor = None;
     ed.caret = Caret::top(end, 0);
     ed.move_end();
     ed.anchor = Some(Caret::top(start, 0));
     let deleted = ed.has_selection();
+    let last = start + blocks.len() - 1;
     ed.paste(&Clip {
         paras: vec![Vec::new(); blocks.len()],
     });
     overwrite_blocks(ed, start, blocks);
+    restore_end_section_mark(ed, last, mark);
 
     let undo_steps = if deleted { 2 } else { 1 };
     Ok((end - start + 1, undo_steps))
+}
+
+/// Put the section mark of a replaced range's end paragraph back on the
+/// replacing content: on block `last` when it is a paragraph, else (a table)
+/// on a new empty paragraph after it, since only a paragraph carries a sectPr.
+/// Marks before the range's end went with the range. Called inside the
+/// replace's last undo checkpoint, so it adds no step (#801).
+fn restore_end_section_mark(
+    ed: &mut Editor,
+    last: usize,
+    (brk, change): (Option<String>, Option<PropertyChange>),
+) {
+    if brk.is_none() && change.is_none() {
+        return;
+    }
+    let at = if matches!(ed.doc.body[last], Block::Paragraph(_)) {
+        last
+    } else {
+        ed.doc
+            .body
+            .insert(last + 1, Block::Paragraph(Paragraph::default()));
+        last + 1
+    };
+    if let Block::Paragraph(p) = &mut ed.doc.body[at] {
+        p.props.section_break = brk;
+        p.props.section_property_change = change;
+    }
+    ed.doc.initialize_revision_targets();
 }
 
 /// Replace every occurrence of `query` with `text` across the whole document
@@ -1099,6 +1178,251 @@ mod tests {
         assert!(ed.undo());
         assert_eq!(paras(&ed.doc), vec!["existing"]);
         assert!(!ed.undo());
+    }
+
+    /// Append after "A", which closes the first section (with a tracked sectPr
+    /// change) before an empty final one: the section and the saved sectPr
+    /// count survive, "A" keeps its mark, the `count` appended blocks have
+    /// none, and one undo restores the document (#748).
+    fn check_append_keeps_the_section_748(
+        what: &str,
+        count: usize,
+        append: impl FnOnce(&mut Editor),
+    ) {
+        use crate::model::{PropertyChange, PropertyScope, PropertySnapshot, PropertyState};
+        let brk = "<w:sectPr><w:type w:val=\"nextPage\"/></w:sectPr>".to_string();
+        let change = PropertyChange {
+            scope: PropertyScope::Section,
+            metadata: Default::default(),
+            raw: format!("<w:sectPrChange w:id=\"7\">{brk}</w:sectPrChange>"),
+            previous: PropertySnapshot::Present(PropertyState::Section(brk.clone())),
+        };
+        let mark = |ed: &Editor, i: usize| match &ed.doc.body[i] {
+            Block::Paragraph(p) => (
+                p.props.section_break.clone(),
+                p.props
+                    .section_property_change
+                    .as_ref()
+                    .map(|c| c.raw.clone()),
+            ),
+            _ => (None, None),
+        };
+        let sect_prs = |ed: &Editor| {
+            crate::serialize::document_to_xml(&ed.doc)
+                .matches("<w:sectPr")
+                .count()
+        };
+        let mut doc = doc_with(&["A"]);
+        if let Block::Paragraph(p) = &mut doc.body[0] {
+            p.props.section_break = Some(brk.clone());
+            p.props.section_property_change = Some(change.clone());
+        }
+        doc.body.push(Block::SectionProperties(SectionProperties {
+            raw: "<w:sectPr/>".into(),
+            property_change: None,
+        }));
+        let mut ed = Editor::new(doc);
+        let before = ed.doc.clone();
+        let sections = ed.sections().len();
+        let saved = sect_prs(&ed);
+        append(&mut ed);
+        assert_eq!(ed.doc.content_block_count(), 1 + count, "{what}");
+        assert_eq!(ed.sections().len(), sections, "{what}");
+        assert_eq!(sect_prs(&ed), saved, "{what}");
+        assert_eq!(mark(&ed, 0), (Some(brk), Some(change.raw)), "{what}");
+        for i in 1..=count {
+            assert_eq!(mark(&ed, i), (None, None), "{what}: block {i}");
+        }
+        assert!(ed.undo());
+        assert_eq!(ed.doc, before, "{what}");
+    }
+
+    #[test]
+    fn append_blocks_after_a_section_closing_paragraph_keeps_the_section_748() {
+        let tables = "| a | b |\n| - | - |\n| 1 | 2 |";
+        for md in ["## Heading", "one\n\ntwo", &format!("one\n\n{tables}")] {
+            let blocks = parse_markdown_blocks(md).unwrap();
+            assert_eq!(
+                md.contains('|'),
+                blocks.iter().any(|b| matches!(b, Block::Table(_))),
+                "{md}"
+            );
+            check_append_keeps_the_section_748(md, blocks.len(), |ed| append_blocks(ed, blocks));
+        }
+    }
+
+    #[test]
+    fn append_after_a_section_closing_paragraph_keeps_the_section_748() {
+        for (text, count) in [("one", 1), ("one\ntwo", 2)] {
+            check_append_keeps_the_section_748(text, count, |ed| append(ed, text));
+        }
+    }
+
+    // ---- #801: replace_range_blocks keeps the range's own section end ----
+
+    fn section_mark_801() -> (String, crate::model::PropertyChange) {
+        use crate::model::{PropertyChange, PropertyScope, PropertySnapshot, PropertyState};
+        let brk = "<w:sectPr><w:type w:val=\"oddPage\"/></w:sectPr>".to_string();
+        let prior = "<w:sectPr><w:type w:val=\"nextPage\"/></w:sectPr>".to_string();
+        let change = PropertyChange {
+            scope: PropertyScope::Section,
+            metadata: Default::default(),
+            raw: format!("<w:sectPrChange w:id=\"7\">{prior}</w:sectPrChange>"),
+            previous: PropertySnapshot::Present(PropertyState::Section(prior)),
+        };
+        (brk, change)
+    }
+
+    /// "A", "B", "C", "D" before a trailing sectPr; the paragraph at `closes`
+    /// ends the first section, with a tracked sectPr change.
+    fn sectioned_801(closes: usize) -> Editor {
+        let (brk, change) = section_mark_801();
+        let mut doc = doc_with(&["A", "B", "C", "D"]);
+        if let Block::Paragraph(p) = &mut doc.body[closes] {
+            p.props.section_break = Some(brk);
+            p.props.section_property_change = Some(change);
+        }
+        doc.body.push(Block::SectionProperties(SectionProperties {
+            raw: "<w:sectPr/>".into(),
+            property_change: None,
+        }));
+        Editor::new(doc)
+    }
+
+    fn mark_801(ed: &Editor, i: usize) -> (Option<String>, Option<String>) {
+        match &ed.doc.body[i] {
+            Block::Paragraph(p) => (
+                p.props.section_break.clone(),
+                p.props
+                    .section_property_change
+                    .as_ref()
+                    .map(|c| c.raw.clone()),
+            ),
+            _ => (None, None),
+        }
+    }
+
+    fn saved_sect_prs_801(ed: &Editor) -> usize {
+        crate::serialize::document_to_xml(&ed.doc)
+            .matches("<w:sectPr")
+            .count()
+    }
+
+    /// Replace `[start..=2]` of `sectioned_801(2)` (where "C" closes the first
+    /// section) via `replace`: the section, the saved sectPr count and the
+    /// tracked change survive, the mark sits on block `marked` alone, the text
+    /// reads `texts`, and undoing `undo_steps` restores the document.
+    fn check_replace_keeps_the_end_mark_801(
+        what: &str,
+        start: usize,
+        marked: usize,
+        texts: &[&str],
+        replace: impl FnOnce(&mut Editor) -> (usize, usize),
+    ) {
+        let (brk, change) = section_mark_801();
+        let mut ed = sectioned_801(2);
+        let before = ed.doc.clone();
+        let sections = ed.sections().len();
+        let saved = saved_sect_prs_801(&ed);
+        let (replaced, undo_steps) = replace(&mut ed);
+        assert_eq!(replaced, 3 - start, "{what}");
+        assert_eq!(paras(&ed.doc), texts, "{what}");
+        assert_eq!(ed.sections().len(), sections, "{what}");
+        assert_eq!(saved_sect_prs_801(&ed), saved, "{what}");
+        for i in 0..ed.doc.content_block_count() {
+            let want = if i == marked {
+                (Some(brk.clone()), Some(change.raw.clone()))
+            } else {
+                (None, None)
+            };
+            assert_eq!(mark_801(&ed, i), want, "{what}: block {i}");
+        }
+        for _ in 0..undo_steps {
+            assert!(ed.undo(), "{what}");
+        }
+        assert_eq!(ed.doc, before, "{what}");
+    }
+
+    #[test]
+    fn replace_range_blocks_keeps_the_end_section_mark_801() {
+        let cases: [(&str, usize, usize, &[&str]); 4] = [
+            ("x", 2, 2, &["A", "B", "x", "D"]),
+            ("x", 1, 1, &["A", "x", "D"]),
+            ("x\n\ny", 1, 2, &["A", "x", "y", "D"]),
+            ("x\n\ny\n\nz", 2, 4, &["A", "B", "x", "y", "z", "D"]),
+        ];
+        for (md, start, marked, texts) in cases {
+            let what = format!("{md:?} over {start}..=2");
+            let blocks = parse_markdown_blocks(md).unwrap();
+            check_replace_keeps_the_end_mark_801(&what, start, marked, texts, |ed| {
+                replace_range_blocks(ed, start, 2, blocks).unwrap()
+            });
+        }
+    }
+
+    #[test]
+    fn replace_range_blocks_ending_in_a_table_keeps_the_section_mark_801() {
+        let table = "| a | b |\n| - | - |\n| 1 | 2 |";
+        for (md, start) in [(table.to_string(), 2), (format!("x\n\n{table}"), 1)] {
+            let blocks = parse_markdown_blocks(&md).unwrap();
+            let n = blocks.len();
+            assert!(matches!(blocks.last(), Some(Block::Table(_))), "{md}");
+            let mut ed = sectioned_801(2);
+            let before = ed.doc.clone();
+            let sections = ed.sections().len();
+            let saved = saved_sect_prs_801(&ed);
+            let (_, steps) = replace_range_blocks(&mut ed, start, 2, blocks).unwrap();
+            // The table, then an empty paragraph that holds the mark.
+            let table_at = start + n - 1;
+            assert!(matches!(ed.doc.body[table_at], Block::Table(_)), "{md}");
+            let (brk, change) = section_mark_801();
+            assert_eq!(
+                mark_801(&ed, table_at + 1),
+                (Some(brk), Some(change.raw)),
+                "{md}"
+            );
+            assert_eq!(ed.doc.body[table_at + 1].plain_text(), "", "{md}");
+            assert_eq!(ed.doc.body[table_at + 2].plain_text(), "D", "{md}");
+            assert_eq!(ed.sections().len(), sections, "{md}");
+            assert_eq!(saved_sect_prs_801(&ed), saved, "{md}");
+            for _ in 0..steps {
+                assert!(ed.undo(), "{md}");
+            }
+            assert_eq!(ed.doc, before, "{md}");
+        }
+    }
+
+    #[test]
+    fn replace_range_blocks_drops_a_section_mark_inside_the_range_801() {
+        // "B" closes the first section and "C", the range's end, closes none:
+        // B's break was inside the replaced range, so it goes with it.
+        for md in ["x", "x\n\ny"] {
+            let mut ed = sectioned_801(1);
+            let sections = ed.sections().len();
+            replace_range_blocks(&mut ed, 1, 2, parse_markdown_blocks(md).unwrap()).unwrap();
+            assert_eq!(ed.sections().len(), sections - 1, "{md}");
+            // Only the trailing sectPr is left to save.
+            assert_eq!(saved_sect_prs_801(&ed), 1, "{md}");
+            for i in 0..ed.doc.content_block_count() {
+                assert_eq!(mark_801(&ed, i), (None, None), "{md}: block {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn replace_range_keeps_the_end_section_mark_801() {
+        // The plain-text verb never lost it: pinned alongside the block one.
+        let cases: [(&str, usize, usize, &[&str]); 3] = [
+            ("x", 2, 2, &["A", "B", "x", "D"]),
+            ("x", 1, 1, &["A", "x", "D"]),
+            ("x\ny", 1, 2, &["A", "x", "y", "D"]),
+        ];
+        for (text, start, marked, texts) in cases {
+            let what = format!("{text:?} over {start}..=2");
+            check_replace_keeps_the_end_mark_801(&what, start, marked, texts, |ed| {
+                replace_range(ed, start, 2, text).unwrap()
+            });
+        }
     }
 
     #[test]

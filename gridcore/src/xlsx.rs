@@ -22,7 +22,7 @@ use opccore::xml::{Event, XmlParser};
 use opccore::zip::ZipArchive;
 use opccore::zipwrite::write_zip;
 
-use crate::formula::translate_formula;
+use crate::formula::{file_formula, translate_formula};
 use crate::sheet::{
     Cell, CellMeta, CellValue, ColDef, DefinedName, NumFmt, Sheet, Styles, Table, Workbook, Xf,
     cell_name, classify_builtin, classify_format_code, is_array_f, parse_cell_name,
@@ -98,6 +98,29 @@ impl SheetPackage {
     /// Remove a part by name (no-op when absent).
     pub fn remove_part(&mut self, name: &str) {
         self.parts.retain(|(n, _)| n != name);
+    }
+
+    /// Excel's *Always create backup* (`<workbookPr backupFile>`,
+    /// Save As › Tools › General Options): true when the attribute is "1"
+    /// or "true" (corpus/xlsx spells the boolean "false"/"true"). Anything
+    /// else — another value, no attribute, no element — means off. The flag
+    /// is read from the package because it only matters at save time.
+    pub fn always_create_backup(&self) -> bool {
+        let name = workbook_part_name(&self.parts);
+        let Some(bytes) = self.part(&name) else {
+            return false;
+        };
+        let xml = String::from_utf8_lossy(bytes);
+        let mut p = XmlParser::new(&xml);
+        loop {
+            match p.next() {
+                Event::Start if local(p.name()) == "workbookPr" => {
+                    return matches!(p.attr("backupFile"), "1" | "true");
+                }
+                Event::Eof => return false,
+                _ => {}
+            }
+        }
     }
 
     /// The raw bytes of a part by name.
@@ -1158,6 +1181,114 @@ fn cell_xf_elements(xml: &str) -> Vec<&str> {
     out
 }
 
+/// The raw `<font>` elements of `<fonts>`, in order (a `<dxf>`'s `<font>`
+/// lives outside `<fonts>` and is not one of them). Read with the loader's
+/// parser ([`element_children`]), so comments and prefixes are no trouble.
+fn font_elements(xml: &str) -> Vec<&str> {
+    let Some(start) = xml
+        .find("<fonts")
+        .filter(|&s| xml[s + 6..].starts_with([' ', '>', '/', '\t', '\r', '\n']))
+    else {
+        return Vec::new();
+    };
+    let fonts = &xml[start..];
+    element_children(fonts)
+        .into_iter()
+        .filter(|(name, _, _)| name == "font")
+        .map(|(_, s, e)| &fonts[s..e])
+        .collect()
+}
+
+/// The child elements of one raw element, as (local name, raw element).
+fn child_elements(raw: &str) -> Vec<(String, String)> {
+    element_children(raw)
+        .into_iter()
+        .map(|(name, s, e)| (name, raw[s..e].to_string()))
+        .collect()
+}
+
+/// A loaded `<font>` with only the children an edit changed rewritten: its
+/// underline, strike, theme colour, family, charset and the rest come along.
+fn edit_font(raw: &str, from: &Xf, to: &Xf, fmt_size: impl Fn(f64) -> String) -> String {
+    // The conventional CT_Font child order, for where a new child goes.
+    const ORDER: [&str; 15] = [
+        "b",
+        "i",
+        "strike",
+        "condense",
+        "extend",
+        "outline",
+        "shadow",
+        "u",
+        "vertAlign",
+        "sz",
+        "color",
+        "name",
+        "family",
+        "charset",
+        "scheme",
+    ];
+    let rank = |n: &str| ORDER.iter().position(|o| *o == n).unwrap_or(ORDER.len());
+    let mut kids = child_elements(raw);
+    // Drop every `name` child (so never two `<b>`), then add `new` if any.
+    let mut set = |name: &str, new: Option<String>| {
+        kids.retain(|(n, _)| n != name);
+        if let Some(el) = new {
+            let at = kids
+                .iter()
+                .position(|(n, _)| rank(n) > rank(name))
+                .unwrap_or(kids.len());
+            kids.insert(at, (name.to_string(), el));
+        }
+    };
+    if from.bold != to.bold {
+        set("b", to.bold.then(|| "<b/>".to_string()));
+    }
+    if from.italic != to.italic {
+        set("i", to.italic.then(|| "<i/>".to_string()));
+    }
+    // The model reads only an rgb colour, so a theme or indexed one reads
+    // as None: an unchanged colour keeps the source `<color>` (theme, tint
+    // and all). Known limit: setting Automatic on a theme-coloured font
+    // compares equal and so keeps the theme colour.
+    if from.color != to.color {
+        set(
+            "color",
+            to.color
+                .map(|(r, g, b)| format!("<color rgb=\"FF{r:02X}{g:02X}{b:02X}\"/>")),
+        );
+    }
+    if from.font_size != to.font_size {
+        set(
+            "sz",
+            Some(format!(
+                "<sz val=\"{}\"/>",
+                fmt_size(to.font_size.unwrap_or(11.0))
+            )),
+        );
+    }
+    if from.font_name != to.font_name {
+        set(
+            "name",
+            Some(format!(
+                "<name val=\"{}\"/>",
+                esc_attr(to.font_name.as_deref().unwrap_or("Calibri"))
+            )),
+        );
+        // The old font's family and scheme describe it, not the new name; a
+        // `<scheme val="minor"/>` would make Excel show the theme font
+        // instead of the name just set.
+        set("family", None);
+        set("scheme", None);
+    }
+    let mut font = String::from("<font>");
+    for (_, el) in &kids {
+        font.push_str(el);
+    }
+    font.push_str("</font>");
+    font
+}
+
 /// An attribute's raw value in one open tag.
 fn tag_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
     let (_, s, e, _) = attr_span(tag, name)?;
@@ -1290,6 +1421,7 @@ fn splice_styles(orig: &str, authored: &[Xf]) -> String {
     let src_parsed = parse_styles(orig).xfs;
     let src_raw = cell_xf_elements(orig);
     let sources_ok = src_raw.len() == src_parsed.len();
+    let src_fonts = font_elements(orig);
 
     for xf in authored {
         let source = xf
@@ -1302,14 +1434,26 @@ fn splice_styles(orig: &str, authored: &[Xf]) -> String {
         };
 
         // Font: the source's while bold/italic/colour/size/name still match
-        // (its underline and the rest come along), else a fresh one.
+        // (its underline and the rest come along), else a fresh one: the
+        // source font with only the changed children rewritten, or one built
+        // from scratch when there is no source font.
         let same_font = source.is_some_and(|(sx, _)| {
             (sx.bold, sx.italic, sx.color, sx.font_size, &sx.font_name)
                 == (xf.bold, xf.italic, xf.color, xf.font_size, &xf.font_name)
         });
-        let font_id = match src_id("fontId").filter(|_| same_font) {
-            Some(id) => id,
-            None => {
+        let src_font = source.and_then(|(sx, _)| {
+            let raw = src_fonts.get(src_id("fontId")? as usize)?;
+            Some((sx, *raw))
+        });
+        let font_id = match (src_id("fontId").filter(|_| same_font), src_font) {
+            (Some(id), _) => id,
+            (None, Some((sx, raw))) => {
+                new_fonts.push_str(&edit_font(raw, sx, xf, fmt_size));
+                let id = font_base + fonts_added;
+                fonts_added += 1;
+                id
+            }
+            (None, None) => {
                 let mut font = String::from("<font>");
                 if xf.bold {
                     font.push_str("<b/>");
@@ -1509,6 +1653,13 @@ fn parse_worksheet(
     let mut in_cf_formula = false;
     let mut cf_formula_buf = String::new();
 
+    // Where the worksheet's top-level blocks stand, as the save finds them, so
+    // each one loaded from there knows its element ([`crate::sheet::CondFormat::ix`]).
+    let cf_spans = cond_format_spans(xml);
+    let dv_spans = validation_spans(xml)
+        .map(|(_, items)| items)
+        .unwrap_or_default();
+
     // Data-validation parse state.
     let mut cur_dv: Option<crate::sheet::DataValidation> = None;
     let mut dv_formula: u8 = 0; // 0 = none, 1 = formula1, 2 = formula2
@@ -1519,6 +1670,11 @@ fn parse_worksheet(
     // same names; those are the view's, not the sheet's, and stay verbatim.
     let mut in_breaks: Option<bool> = None;
     let mut in_custom_views = false;
+    // The sheet's freeze is its first top-level `<sheetView>`'s `<pane>`, the
+    // one the writer (`first_sheet_view`) rewrites. A second view (another
+    // workbook window) or a custom view keeps a pane of its own.
+    let mut sheet_views_seen = 0u32;
+    let mut in_first_view = false;
 
     loop {
         match p.next() {
@@ -1608,7 +1764,11 @@ fn parse_worksheet(
                     }
                 }
                 // A frozen pane: the leading `ySplit` rows / `xSplit` cols stay put.
-                "pane" => {
+                "sheetView" if !in_custom_views => {
+                    in_first_view = sheet_views_seen == 0;
+                    sheet_views_seen += 1;
+                }
+                "pane" if in_first_view && !in_custom_views => {
                     if matches!(p.attr("state"), "frozen" | "frozenSplit") {
                         let cols = p.attr("xSplit").parse::<u32>().unwrap_or(0);
                         let rows = p.attr("ySplit").parse::<u32>().unwrap_or(0);
@@ -1679,9 +1839,11 @@ fn parse_worksheet(
                             ranges.push(r);
                         }
                     }
+                    let start = p.start_pos();
                     cur_cf = Some(CondFormat {
                         ranges,
                         rules: Vec::new(),
+                        ix: cf_spans.iter().position(|&(s, _)| s == start),
                     });
                 }
                 "cfRule" if cur_cf.is_some() => {
@@ -1709,6 +1871,7 @@ fn parse_worksheet(
                     }
                     let pr = p.attr("prompt");
                     let prompt = (!pr.is_empty()).then(|| decode(pr));
+                    let start = p.start_pos();
                     cur_dv = Some(crate::sheet::DataValidation {
                         ranges,
                         kind: p.attr("type").to_string(),
@@ -1716,6 +1879,7 @@ fn parse_worksheet(
                         formula1: String::new(),
                         formula2: String::new(),
                         prompt,
+                        ix: dv_spans.iter().position(|&(s, _)| s == start),
                     });
                 }
                 "formula1" if cur_dv.is_some() => {
@@ -1740,9 +1904,10 @@ fn parse_worksheet(
                 "row" => cur_row += 1,
                 "rowBreaks" | "colBreaks" => in_breaks = None,
                 "customSheetViews" => in_custom_views = false,
+                "sheetView" => in_first_view = false,
                 "formula" if in_cf_formula => {
                     in_cf_formula = false;
-                    cf_formulas.push(std::mem::take(&mut cf_formula_buf));
+                    cf_formulas.push(decode(&std::mem::take(&mut cf_formula_buf)));
                 }
                 "cfRule" => {
                     if let (Some((ty, op, dxf_id, priority)), Some(cf)) =
@@ -1756,7 +1921,9 @@ fn parse_worksheet(
                             "expression" => CfKind::Expression {
                                 formula: cf_formulas.first().cloned().unwrap_or_default(),
                             },
-                            _ => CfKind::Other,
+                            _ => CfKind::Other {
+                                formulas: std::mem::take(&mut cf_formulas),
+                            },
                         };
                         cf.rules.push(CfRule {
                             kind,
@@ -2210,11 +2377,12 @@ impl SheetPackage {
     /// `xlm`, `function` or `vbProcedure`, which a macro-free file cannot
     /// carry either, with or without a macro sheet.
     pub fn has_macro_names(&self) -> bool {
-        self.part("xl/workbook.xml").is_some_and(|b| {
-            !remove_macro_names(&String::from_utf8_lossy(b), &|_: &str| false)
-                .1
-                .is_empty()
-        })
+        self.part(&workbook_part_name(&self.parts))
+            .is_some_and(|b| {
+                !remove_macro_names(&String::from_utf8_lossy(b), &|_: &str| false)
+                    .1
+                    .is_empty()
+            })
     }
 
     /// What a macro-free file (`.xlsx`, `.xltx`) written from this package
@@ -2240,9 +2408,10 @@ impl SheetPackage {
     /// [`Self::remove_sheet`], and the Excel 4.0 names, which go even when
     /// there is no macro sheet: every defined name marked `xlm`, `function`
     /// or `vbProcedure`, and every name whose formula refers to a removed
-    /// sheet (`Auto_Open=Macro1!$A$1`). A workbook of nothing but macro
-    /// sheets first gains a blank worksheet, so one remains. Returns whether
-    /// there was anything to drop.
+    /// sheet (`Auto_Open=Macro1!$A$1`). A cell formula that refers to a
+    /// removed sheet keeps its cell, with that reference as `#REF!`. A
+    /// workbook of nothing but macro sheets first gains a blank worksheet, so
+    /// one remains. Returns whether there was anything to drop.
     ///
     /// Only that copy: an open workbook keeps its macros, as Excel keeps
     /// them, and its sheet indices stay put.
@@ -2268,7 +2437,8 @@ impl SheetPackage {
             self.add_sheet(&format!("Sheet{n}"));
         }
         let refers = |formula: &str| names.iter().any(|s| formula_refers_to_sheet(formula, s));
-        if let Some(p) = self.parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
+        let wb_part = workbook_part_name(&self.parts);
+        if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == wb_part) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
             // A `localSheetId` that names no model sheet was loaded as a
             // global name; that model entry goes with its element too, or the
@@ -2286,6 +2456,9 @@ impl SheetPackage {
                     })
             });
         }
+        // Cell formulas that name a removed sheet read `#REF!`, as Excel
+        // turns them.
+        crate::edit::remove_sheet_refs(&mut self.workbook, &names);
         for &i in doomed.iter().rev() {
             self.remove_sheet(i);
         }
@@ -3175,7 +3348,7 @@ fn cell_xml(
                 "<f t=\"array\" ref=\"{}:{}\">{}</f>",
                 cell_name(row, col),
                 cell_name(row + h - 1, col + w - 1),
-                esc_text(src)
+                esc_text(&file_formula(src))
             );
             (f, true)
         }
@@ -3184,22 +3357,33 @@ fn cell_xml(
         // `f_attrs`, or typed here: its `cm` says it is still one, covering
         // its anchor alone.
         (Some(src), None) if dynamic && !src.is_empty() => (
-            format!("<f t=\"array\" ref=\"{anchor}\">{}</f>", esc_text(src)),
+            format!(
+                "<f t=\"array\" ref=\"{anchor}\">{}</f>",
+                esc_text(&file_formula(src))
+            ),
             true,
         ),
-        (Some(src), None) => (format!("<f>{}</f>", esc_text(src)), false),
+        (Some(src), None) => (format!("<f>{}</f>", esc_text(&file_formula(src))), false),
         (Some(src), Some(fa)) if src.is_empty() => (format!("<f{fa}/>"), is_array_f(fa)),
         // A non-spilling array covers its anchor alone when its stored ref
         // is stale: a dynamic array's cells were cleared since load, and a
         // ref that starts elsewhere names another block (a cell moved
         // without set_cell, a sort say, or loaded that way; set_cell and
         // paste re-anchor themselves). A legacy CSE block (no `cm`) whose ref
-        // starts here keeps it: Excel refills that block on load.
+        // starts here keeps it: the block owns its whole `ref` (the engine
+        // refuses plain edits to part of it), and Excel refills it on load.
         (Some(src), Some(fa)) if is_array_f(fa) && (dynamic || !ref_starts_at(fa, &anchor)) => (
-            format!("<f{}>{}</f>", with_ref(fa, &anchor), esc_text(src)),
+            format!(
+                "<f{}>{}</f>",
+                with_ref(fa, &anchor),
+                esc_text(&file_formula(src))
+            ),
             true,
         ),
-        (Some(src), Some(fa)) => (format!("<f{fa}>{}</f>", esc_text(src)), is_array_f(fa)),
+        (Some(src), Some(fa)) => (
+            format!("<f{fa}>{}</f>", esc_text(&file_formula(src))),
+            is_array_f(fa),
+        ),
         (None, _) => (String::new(), false),
     };
 
@@ -3299,7 +3483,363 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
     let out = set_page_breaks(out, "rowBreaks", &sheet.row_breaks);
     let out = set_page_breaks(out, "colBreaks", &sheet.col_breaks);
     // The sheet's autoFilter: rewritten only where a structural edit moved it.
-    set_auto_filter(out, sheet.auto_filter.as_ref())
+    let out = set_auto_filter(out, sheet.auto_filter.as_ref());
+    // Conditional formatting and data validation: likewise.
+    let out = set_cond_formats(out, sheet);
+    set_validations(out, sheet)
+}
+
+/// The worksheet's top-level `<conditionalFormatting>` elements (in any
+/// prefix; never an x14 one in `extLst`), in document order, as (start, end).
+/// A block's [`crate::sheet::CondFormat::ix`] is its position here, for the loader and the
+/// save alike.
+fn cond_format_spans(xml: &str) -> Vec<(usize, usize)> {
+    // Most sheets have none: don't walk the part to learn that.
+    if !xml.contains("conditionalFormatting") {
+        return Vec::new();
+    }
+    worksheet_children(xml)
+        .children
+        .iter()
+        .filter(|c| c.local == "conditionalFormatting")
+        .map(|c| (c.start, c.end))
+        .collect()
+}
+
+/// A (start, end) byte span in a part.
+type Span = (usize, usize);
+
+/// The worksheet's top-level `<dataValidations>` and its `<dataValidation>`
+/// children, as (start, end) in `xml`. A rule's
+/// [`crate::sheet::DataValidation::ix`] is its position among the children.
+fn validation_spans(xml: &str) -> Option<(Span, Vec<Span>)> {
+    if !xml.contains("dataValidations") {
+        return None;
+    }
+    let (s, e) = worksheet_child_span(xml, "dataValidations")?;
+    let items = element_children(&xml[s..e])
+        .into_iter()
+        .filter(|(name, _, _)| name == "dataValidation")
+        .map(|(_, a, b)| (s + a, s + b))
+        .collect();
+    Some(((s, e), items))
+}
+
+/// The ranges of an element's `sqref`, read as the loader reads them; `None`
+/// when a token doesn't read as a cell or range (a whole column, say), since
+/// writing the model's ranges back would lose it.
+fn held_sqref(element: &str) -> Option<Vec<(u32, u32, u32, u32)>> {
+    let tag = start_tag(element)?;
+    let &(_, vs, ve) = tag.attrs.iter().find(|(name, _, _)| *name == "sqref")?;
+    element[vs..ve]
+        .split_whitespace()
+        .map(crate::sheet::parse_range_name)
+        .collect()
+}
+
+/// The start tag a fragment begins with, read with quotes respected: a
+/// `>` inside an attribute value (`error="must be > 0"`, legal and written
+/// by some producers) doesn't end it, as it would for [`tag_end`].
+struct StartTag<'a> {
+    /// Where the element name ends.
+    name_end: usize,
+    /// Each attribute: its name and its value's span.
+    attrs: Vec<(&'a str, usize, usize)>,
+}
+
+/// [`StartTag`] of `element`; `None` when it doesn't read as one.
+fn start_tag(element: &str) -> Option<StartTag<'_>> {
+    let b = element.as_bytes();
+    let stop = |c: u8| c.is_ascii_whitespace() || matches!(c, b'=' | b'>' | b'/');
+    if b.first() != Some(&b'<') {
+        return None;
+    }
+    let mut i = 1;
+    while b.get(i).is_some_and(|&c| !stop(c)) {
+        i += 1;
+    }
+    let mut tag = StartTag {
+        name_end: i,
+        attrs: Vec::new(),
+    };
+    loop {
+        while b.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        match *b.get(i)? {
+            b'>' => return Some(tag),
+            b'/' => {
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let name_start = i;
+        while b.get(i).is_some_and(|&c| !stop(c)) {
+            i += 1;
+        }
+        let name = &element[name_start..i];
+        while b.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        if b.get(i) != Some(&b'=') {
+            if name.is_empty() {
+                return None;
+            }
+            continue;
+        }
+        i += 1;
+        while b.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        let q = *b.get(i).filter(|c| matches!(c, b'"' | b'\''))?;
+        let start = i + 1;
+        let end = start + element[start..].find(q as char)?;
+        tag.attrs.push((name, start, end));
+        i = end + 1;
+    }
+}
+
+/// Where the start tag `element` begins with ends (past its `>`), quotes
+/// respected; `None` when it doesn't read as one.
+fn start_tag_end(element: &str) -> Option<usize> {
+    let tag = start_tag(element)?;
+    let from = tag.attrs.last().map_or(tag.name_end, |&(_, _, e)| e + 1);
+    element[from..].find('>').map(|i| from + i + 1)
+}
+
+/// `ranges` as an `sqref` value.
+fn sqref_of(ranges: &[(u32, u32, u32, u32)]) -> String {
+    ranges
+        .iter()
+        .map(|&(r1, c1, r2, c2)| {
+            if (r1, c1) == (r2, c2) {
+                cell_name(r1, c1)
+            } else {
+                format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A formula element as a part holds it: its decoded text, and the span of
+/// its content within the fragment it was read from (`None` when it is
+/// self-closing or holds markup, so it can't be rewritten in place).
+struct HeldFormula {
+    text: String,
+    content: Option<(usize, usize)>,
+}
+
+/// The direct children of `element` (a fragment that starts with its start
+/// tag) named `name`, read as formulas, with spans relative to `element`.
+fn held_formulas(element: &str, name: &str) -> Vec<HeldFormula> {
+    element_children(element)
+        .into_iter()
+        .filter(|(n, _, _)| n == name)
+        .map(|(_, s, e)| {
+            let f = &element[s..e];
+            let open = start_tag_end(f).unwrap_or(f.len());
+            let close = f.rfind("</").filter(|&c| c >= open && !f.ends_with("/>"));
+            match close {
+                Some(c) if !f[open..c].contains('<') => HeldFormula {
+                    text: decode(&f[open..c]),
+                    content: Some((s + open, s + c)),
+                },
+                _ => HeldFormula {
+                    text: String::new(),
+                    content: None,
+                },
+            }
+        })
+        .collect()
+}
+
+/// Do a held formula and the model's say the same thing, spelling aside?
+/// Both are compared as parsed when both parse (`_xlfn.XOR` is `XOR`).
+fn same_formula(held: &str, model: &str) -> bool {
+    if held == model {
+        return true;
+    }
+    match (crate::formula::parse(held), crate::formula::parse(model)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// `element` with its start tag's `attr` set to `value` in place, so the
+/// attribute order is kept; inserted after the element name when it has
+/// none. A start tag that doesn't read ([`start_tag`]) leaves `element`
+/// unchanged.
+fn set_tag_attr_in_place(mut element: String, attr: &str, value: &str) -> String {
+    let Some(tag) = start_tag(&element) else {
+        return element;
+    };
+    match tag.attrs.iter().find(|(name, _, _)| *name == attr) {
+        Some(&(_, vs, ve)) => element.replace_range(vs..ve, value),
+        None => {
+            let at = tag.name_end;
+            element.insert_str(at, &format!(" {attr}=\"{value}\""));
+        }
+    }
+    element
+}
+
+/// The edits, as (start, end, text), that write each `model` formula whose
+/// held counterpart says otherwise into that counterpart's content. Counts
+/// that differ leave the formulas as they are.
+fn formula_edits(held: &[HeldFormula], model: &[&String]) -> Vec<(usize, usize, String)> {
+    if held.len() != model.len() {
+        return Vec::new();
+    }
+    held.iter()
+        .zip(model)
+        .filter(|(h, m)| !same_formula(&h.text, m))
+        .filter_map(|(h, m)| h.content.map(|(s, e)| (s, e, esc_text(&file_formula(m)))))
+        .collect()
+}
+
+/// `s` with (start, end, text) edits applied, back to front.
+fn apply_edits(mut s: String, mut edits: Vec<(usize, usize, String)>) -> String {
+    edits.sort_by_key(|&(start, _, _)| std::cmp::Reverse(start));
+    for (start, end, text) in edits {
+        s.replace_range(start..end, &text);
+    }
+    s
+}
+
+/// The one model entry whose `ix` names element `k`: `None` when none does,
+/// or when more than one does (a stale claim; nothing says which is right).
+fn sole_claim<T>(
+    items: &[T],
+    k: usize,
+    ix: impl Fn(&T) -> Option<usize>,
+) -> Result<Option<&T>, ()> {
+    let mut claims = items.iter().filter(|t| ix(t) == Some(k));
+    match (claims.next(), claims.next()) {
+        (Some(_), Some(_)) => Err(()),
+        (one, _) => Ok(one),
+    }
+}
+
+/// Sync the worksheet's `<conditionalFormatting>` elements with the model,
+/// as [`set_auto_filter`] does the filter: an element is matched to the
+/// model block whose [`crate::sheet::CondFormat::ix`] names it, and left byte-for-byte
+/// alone while it holds that block's ranges and formulas. A moved block gets
+/// a new `sqref` and its changed `<formula>` texts, everything else kept; a
+/// block a structural edit deleted ([`Sheet::cf_removed`]) loses its element.
+/// An element two model blocks claim, or whose `sqref` doesn't read, is left
+/// as it is.
+fn set_cond_formats(xml: String, sheet: &Sheet) -> String {
+    if sheet.cond_formats.iter().all(|cf| cf.ix.is_none()) && sheet.cf_removed.is_empty() {
+        return xml;
+    }
+    let mut edits = Vec::new();
+    for (k, &(start, end)) in cond_format_spans(&xml).iter().enumerate() {
+        let element = &xml[start..end];
+        let Some(held) = held_sqref(element) else {
+            continue;
+        };
+        let cf = match sole_claim(&sheet.cond_formats, k, |cf| cf.ix) {
+            Err(()) => continue,
+            Ok(None) => {
+                if sheet.cf_removed.contains(&k) {
+                    edits.push((start, end, String::new()));
+                }
+                continue;
+            }
+            Ok(Some(cf)) => cf,
+        };
+        let rules: Vec<(usize, usize)> = element_children(element)
+            .into_iter()
+            .filter(|(n, _, _)| n == "cfRule")
+            .map(|(_, s, e)| (s, e))
+            .collect();
+        if rules.len() != cf.rules.len() {
+            continue;
+        }
+        let mut inner = Vec::new();
+        for (&(rs, re), rule) in rules.iter().zip(&cf.rules) {
+            let held_f = held_formulas(&element[rs..re], "formula");
+            inner.extend(
+                formula_edits(&held_f, &rule.formulas())
+                    .into_iter()
+                    .map(|(s, e, t)| (rs + s, rs + e, t)),
+            );
+        }
+        if held == cf.ranges && inner.is_empty() {
+            continue;
+        }
+        let mut block = apply_edits(element.to_string(), inner);
+        if held != cf.ranges {
+            block = set_tag_attr_in_place(block, "sqref", &sqref_of(&cf.ranges));
+        }
+        edits.push((start, end, block));
+    }
+    apply_edits(xml, edits)
+}
+
+/// Sync the worksheet's `<dataValidation>` elements with the model the way
+/// [`set_cond_formats`] does the conditional formatting: `sqref`,
+/// `<formula1>` and `<formula2>` follow a moved rule, a deleted one
+/// ([`Sheet::dv_removed`]) loses its element, and the `<dataValidations>`
+/// around them keeps a right `count`, or goes once it holds none.
+fn set_validations(xml: String, sheet: &Sheet) -> String {
+    if sheet.validations.iter().all(|dv| dv.ix.is_none()) && sheet.dv_removed.is_empty() {
+        return xml;
+    }
+    let Some(((ws, we), items)) = validation_spans(&xml) else {
+        return xml;
+    };
+    // Edits within the wrapper, relative to its start.
+    let mut edits = Vec::new();
+    let mut removed = 0;
+    for (k, &(start, end)) in items.iter().enumerate() {
+        let element = &xml[start..end];
+        let Some(held) = held_sqref(element) else {
+            continue;
+        };
+        let dv = match sole_claim(&sheet.validations, k, |dv| dv.ix) {
+            Err(()) => continue,
+            Ok(None) => {
+                if sheet.dv_removed.contains(&k) {
+                    edits.push((start - ws, end - ws, String::new()));
+                    removed += 1;
+                }
+                continue;
+            }
+            Ok(Some(dv)) => dv,
+        };
+        let mut inner = formula_edits(&held_formulas(element, "formula1"), &[&dv.formula1]);
+        let f2 = held_formulas(element, "formula2");
+        if !(f2.is_empty() && dv.formula2.is_empty()) {
+            inner.extend(formula_edits(&f2, &[&dv.formula2]));
+        }
+        if held == dv.ranges && inner.is_empty() {
+            continue;
+        }
+        let mut block = apply_edits(element.to_string(), inner);
+        if held != dv.ranges {
+            block = set_tag_attr_in_place(block, "sqref", &sqref_of(&dv.ranges));
+        }
+        edits.push((start - ws, end - ws, block));
+    }
+    if edits.is_empty() {
+        return xml;
+    }
+    let wrapper = if removed == items.len() {
+        String::new()
+    } else {
+        let wrapper = apply_edits(xml[ws..we].to_string(), edits);
+        let has_count = start_tag(&wrapper)
+            .is_some_and(|t| t.attrs.iter().any(|(name, _, _)| *name == "count"));
+        if removed > 0 && has_count {
+            set_tag_attr_in_place(wrapper, "count", &(items.len() - removed).to_string())
+        } else {
+            wrapper
+        }
+    };
+    apply_edits(xml, vec![(ws, we, wrapper)])
 }
 
 /// The span of the sheet's own `<autoFilter>`: a top-level one, not a custom
@@ -4483,7 +5023,7 @@ fn patch_defined_names(xml: &str, names: &[DefinedName], sheet_count: usize) -> 
                 block.push_str(&format!(
                     "<{pfx}definedName name=\"{}\"{scope}>{}</{pfx}definedName>",
                     esc_attr(&d.name),
-                    esc_text(&d.formula)
+                    esc_text(&file_formula(&d.formula))
                 ));
             }
             let (start, end, wrap) = match (names_close, names_slot) {
@@ -4543,8 +5083,13 @@ fn patch_defined_name(
             _ => None,
         }
     });
-    if let Some(d) = model.filter(|d| d.formula != text) {
-        edits.push((body_start, body_end, esc_text(&d.formula)));
+    // Compared in file spelling, so a loaded definition the model holds as it
+    // was read is left alone.
+    if let Some(f) = model
+        .map(|d| file_formula(&d.formula))
+        .filter(|f| *f != text)
+    {
+        edits.push((body_start, body_end, esc_text(&f)));
     }
     true
 }
@@ -4967,24 +5512,349 @@ fn is_xml_name_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':') || b >= 0x80
 }
 
-/// Guarantee `<calcPr … fullCalcOnLoad="1"/>` in workbook.xml.
-fn ensure_full_calc(xml: &str) -> String {
-    if let Some(i) = xml.find("<calcPr") {
-        if xml[i..].starts_with("<calcPr")
-            && xml[i..xml[i..].find('>').map(|g| i + g).unwrap_or(xml.len())]
-                .contains("fullCalcOnLoad")
-        {
-            return xml.to_string();
+/// CT_Workbook's children, in the order the schema requires them.
+const CT_WORKBOOK_ORDER: [&str; 19] = [
+    "fileVersion",
+    "fileSharing",
+    "workbookPr",
+    "workbookProtection",
+    "bookViews",
+    "sheets",
+    "functionGroups",
+    "externalReferences",
+    "definedNames",
+    "calcPr",
+    "oleSize",
+    "customWorkbookViews",
+    "pivotCaches",
+    "smartTagPr",
+    "smartTagTypes",
+    "webPublishing",
+    "fileRecoveryPr",
+    "webPublishObjects",
+    "extLst",
+];
+
+/// Where a new top-level child goes in workbook.xml ([`workbook_slot`]).
+#[derive(Debug, PartialEq)]
+enum WorkbookSlot {
+    /// Here, in the root's namespace prefix (`"x:"`, or `""`).
+    At(usize, String),
+    /// The workbook already has one, in some prefix: a caller that looked
+    /// for it by one spelling only must not add a second.
+    Present,
+    /// The walk couldn't see every child (a truncated part, a self-closing
+    /// root), so it can vouch for neither.
+    Unknown,
+}
+
+/// Where a new top-level `<tag>` goes in workbook.xml: before the first
+/// child the schema ranks after `tag`, else before the root's end tag.
+/// Children the schema doesn't name (`mc:AlternateContent`, …) are not
+/// anchors.
+fn workbook_slot(xml: &str, tag: &str) -> WorkbookSlot {
+    let rank_of = |name: &str| CT_WORKBOOK_ORDER.iter().position(|&t| t == name);
+    let rank = rank_of(tag).unwrap_or(CT_WORKBOOK_ORDER.len());
+    let mut p = XmlParser::new(xml);
+    // The root start tag.
+    loop {
+        match p.next() {
+            Event::Start => break,
+            Event::Text => {}
+            Event::End | Event::Eof => return WorkbookSlot::Unknown,
         }
-        let mut out = xml.to_string();
-        out.insert_str(i + "<calcPr".len(), " fullCalcOnLoad=\"1\"");
-        out
-    } else {
-        xml.replacen(
+    }
+    let prefix = match p.name().rsplit_once(':') {
+        Some((pfx, _)) => format!("{pfx}:"),
+        None => String::new(),
+    };
+    let mut at = None;
+    loop {
+        match p.next() {
+            Event::Start => {
+                let name = local(p.name());
+                if name == tag {
+                    return WorkbookSlot::Present;
+                }
+                if at.is_none() && rank_of(name).is_some_and(|r| r > rank) {
+                    at = Some(p.start_pos());
+                }
+                if !p.skip_element_complete() {
+                    return WorkbookSlot::Unknown;
+                }
+            }
+            Event::End => {
+                // The root's end tag (a self-closing root has no `</`).
+                return match xml[..p.pos()].rfind("</") {
+                    Some(end) => WorkbookSlot::At(at.unwrap_or(end), prefix),
+                    None => WorkbookSlot::Unknown,
+                };
+            }
+            Event::Text => {}
+            Event::Eof => return WorkbookSlot::Unknown,
+        }
+    }
+}
+
+/// A top-level child of workbook.xml, found by [`workbook_child`].
+#[derive(Debug, PartialEq)]
+struct WorkbookChild {
+    /// The `<` of its start tag.
+    start: usize,
+    /// Just past its end tag (or its `/>`).
+    end: usize,
+    /// `<x:pivotCaches/>`: no content, and no end tag to insert before.
+    self_closing: bool,
+    /// Its name as written (`x:pivotCaches`).
+    qname: String,
+}
+
+/// The top-level `<tag>` of workbook.xml in any prefix, read to its end.
+/// `None` when there is none, or when the walk can't reach a complete one
+/// (a truncated part, a self-closing root).
+fn workbook_child(xml: &str, tag: &str) -> Option<WorkbookChild> {
+    let mut p = XmlParser::new(xml);
+    // The root start tag.
+    loop {
+        match p.next() {
+            Event::Start => break,
+            Event::Text => {}
+            Event::End | Event::Eof => return None,
+        }
+    }
+    loop {
+        match p.next() {
+            Event::Start => {
+                let start = p.start_pos();
+                let qname = p.name().to_string();
+                let self_closing = xml[..p.pos()].ends_with("/>");
+                if !p.skip_element_complete() {
+                    return None;
+                }
+                if local(&qname) == tag {
+                    return Some(WorkbookChild {
+                        start,
+                        end: p.pos(),
+                        self_closing,
+                        qname,
+                    });
+                }
+            }
+            Event::Text => {}
+            Event::End | Event::Eof => return None,
+        }
+    }
+}
+
+/// Whether a top-level `<tag>` standing at `at` in workbook.xml is in its
+/// CT_Workbook place: no child the schema ranks after it comes before `at`,
+/// and none it ranks before comes after. Children the schema doesn't name
+/// don't count. `false` when the walk can't see every child.
+fn workbook_order_holds(xml: &str, at: usize, tag: &str) -> bool {
+    let rank_of = |name: &str| CT_WORKBOOK_ORDER.iter().position(|&t| t == name);
+    let Some(rank) = rank_of(tag) else {
+        return false;
+    };
+    let mut p = XmlParser::new(xml);
+    loop {
+        match p.next() {
+            Event::Start => break,
+            Event::Text => {}
+            Event::End | Event::Eof => return false,
+        }
+    }
+    loop {
+        match p.next() {
+            Event::Start => {
+                let before = p.start_pos() < at;
+                let out_of_order = rank_of(local(p.name()))
+                    .is_some_and(|r| if before { r > rank } else { r < rank });
+                if out_of_order || !p.skip_element_complete() {
+                    return false;
+                }
+            }
+            Event::Text => {}
+            Event::End => return true,
+            Event::Eof => return false,
+        }
+    }
+}
+
+/// Guarantee `<calcPr … fullCalcOnLoad="1"/>` in workbook.xml, in any prefix:
+/// an existing calcPr gets the attribute (or has a `0`/`false` one turned on,
+/// since save has just dropped the calc chain), and a workbook without one
+/// gets one at its schema position.
+fn ensure_full_calc(xml: &str) -> String {
+    let existing = match workbook_child(xml, "calcPr") {
+        Some(c) => Some(c.start),
+        None => match workbook_slot(xml, "calcPr") {
+            // At its schema position: after definedNames, before pivotCaches
+            // and extLst, which a bare append would put it behind.
+            WorkbookSlot::At(at, px) => {
+                let mut out = xml.to_string();
+                out.insert_str(
+                    at,
+                    &format!("<{px}calcPr calcId=\"0\" fullCalcOnLoad=\"1\"/>"),
+                );
+                return out;
+            }
+            // The walk couldn't read the part to its end: the first calcPr
+            // its tags show, if any.
+            WorkbookSlot::Present | WorkbookSlot::Unknown => {
+                find_local_element(xml, "calcPr").map(|(i, _)| i)
+            }
+        },
+    };
+    let Some(start) = existing else {
+        return xml.replacen(
             "</workbook>",
             "<calcPr calcId=\"0\" fullCalcOnLoad=\"1\"/></workbook>",
             1,
-        )
+        );
+    };
+    let end = tag_end(xml, start);
+    let tag = &xml[start..end];
+    // A start tag the part cuts off (no `>`): no place to put the attribute.
+    if !tag.ends_with('>') {
+        return xml.to_string();
+    }
+    match attr_span(tag, "fullCalcOnLoad") {
+        Some((_, s, e, _)) if matches!(&tag[s..e], "1" | "true") => xml.to_string(),
+        Some((_, s, e, _)) => format!("{}1{}", &xml[..start + s], &xml[start + e..]),
+        None => {
+            // Before the tag's end, after the attributes already there.
+            let at = if tag.ends_with("/>") {
+                end - 2
+            } else {
+                end - 1
+            };
+            format!("{} fullCalcOnLoad=\"1\"{}", &xml[..at], &xml[at..])
+        }
+    }
+}
+
+/// workbook.xml with `<pivotCache cacheId=… r:id=…/>` registered. An existing
+/// `<pivotCaches>` (any prefix, self-closing or not) takes the entry in its
+/// own prefix, and moves to its CT_Workbook place when it stood out of it;
+/// without one, a new wrapper goes at that place. The entry's `r:` is bound
+/// to `rels`: on the root when the root binds no `r`, else on the entry
+/// when the root binds it to something else.
+fn register_pivot_cache(xml: &str, cache_id: u32, rid: &str, rels: &str) -> String {
+    let root = worksheet_root(xml);
+    let r_elsewhere = root
+        .as_ref()
+        .and_then(|r| r.r_ns.as_deref())
+        .is_some_and(|r| r != rels);
+    let entry = |px: &str| {
+        let e = format!("<{px}pivotCache cacheId=\"{cache_id}\" r:id=\"{rid}\"/>");
+        if r_elsewhere {
+            with_decl(&e, &format!("xmlns:r=\"{rels}\""))
+        } else {
+            e
+        }
+    };
+    let mut out = match workbook_child(xml, "pivotCaches") {
+        Some(c) => {
+            let px = match c.qname.rsplit_once(':') {
+                Some((pfx, _)) => format!("{pfx}:"),
+                None => String::new(),
+            };
+            let old = &xml[c.start..c.end];
+            let wrapper = if c.self_closing {
+                // `<x:pivotCaches/>`: open it up.
+                format!("{}>{}</{}>", &old[..old.len() - 2], entry(&px), c.qname)
+            } else {
+                let close = old.rfind("</").unwrap_or(old.len());
+                format!("{}{}{}", &old[..close], entry(&px), &old[close..])
+            };
+            let mut rest = format!("{}{}", &xml[..c.start], &xml[c.end..]);
+            // Where it stands, unless that is out of CT_Workbook order (an
+            // older docxy put it right after `</sheets>`): then where a new
+            // one would go.
+            let at = if workbook_order_holds(xml, c.start, "pivotCaches") {
+                c.start
+            } else {
+                match workbook_slot(&rest, "pivotCaches") {
+                    WorkbookSlot::At(at, _) => at,
+                    WorkbookSlot::Present | WorkbookSlot::Unknown => c.start,
+                }
+            };
+            rest.insert_str(at, &wrapper);
+            rest
+        }
+        None => match workbook_slot(xml, "pivotCaches") {
+            // At its CT_Workbook position (after definedNames, calcPr, …),
+            // not right after `</sheets>`, which Excel repairs.
+            WorkbookSlot::At(at, px) => {
+                let mut out = xml.to_string();
+                out.insert_str(
+                    at,
+                    &format!("<{px}pivotCaches>{}</{px}pivotCaches>", entry(&px)),
+                );
+                out
+            }
+            // One the walk saw but couldn't read to its end: not registered.
+            WorkbookSlot::Present => xml.to_string(),
+            // The walk couldn't read the part: the spelling docxy writes.
+            WorkbookSlot::Unknown if xml.contains("</pivotCaches>") => {
+                xml.replacen("</pivotCaches>", &format!("{}</pivotCaches>", entry("")), 1)
+            }
+            WorkbookSlot::Unknown => xml.replacen(
+                "</sheets>",
+                &format!("</sheets><pivotCaches>{}</pivotCaches>", entry("")),
+                1,
+            ),
+        },
+    };
+    // Last: every edit above lies past the root's start tag, so its offsets
+    // still hold here.
+    if let Some(root) = root.filter(|r| r.r_ns.is_none() && !r.self_closing && out != xml) {
+        out.insert_str(root.tag_close, &format!(" xmlns:r=\"{rels}\""));
+    }
+    out
+}
+
+/// workbook.xml without the `<pivotCache>` whose `r:id` is `rid`, undoing
+/// [`register_pivot_cache`] in any prefix: the wrapper goes too when no
+/// entry is left in it, since the schema wants at least one. A part the walk
+/// can't read loses the entry by its unprefixed spelling, as before.
+fn unregister_pivot_cache(xml: &str, rid: &str) -> String {
+    let Some(c) = workbook_child(xml, "pivotCaches") else {
+        let xml = remove_element_containing(xml, "<pivotCache", &format!("r:id=\"{rid}\""));
+        return xml.replace("<pivotCaches></pivotCaches>", "");
+    };
+    let mut p = XmlParser::new(&xml[c.start..c.end]);
+    p.next(); // the wrapper's start tag
+    let mut entries = 0;
+    let mut hit = None;
+    loop {
+        match p.next() {
+            Event::Start => {
+                let start = c.start + p.start_pos();
+                let is_entry = local(p.name()) == "pivotCache";
+                let is_hit = is_entry
+                    && p.attrs()
+                        .iter()
+                        .any(|a| local(a.name) == "id" && a.value == rid);
+                if !p.skip_element_complete() {
+                    break;
+                }
+                if is_entry {
+                    entries += 1;
+                }
+                if is_hit && hit.is_none() {
+                    hit = Some((start, c.start + p.pos()));
+                }
+            }
+            Event::Text => {}
+            Event::End | Event::Eof => break,
+        }
+    }
+    match hit {
+        None => xml.to_string(),
+        // The last entry: the wrapper goes with it.
+        Some(_) if entries == 1 => format!("{}{}", &xml[..c.start], &xml[c.end..]),
+        Some((s, e)) => format!("{}{}", &xml[..s], &xml[e..]),
     }
 }
 
@@ -5068,6 +5938,19 @@ fn rel_id_for(parts: &[(String, Vec<u8>)], rels_part: &str, target: &str) -> Opt
     let at = xml.find(&format!("Target=\"{target}\""))?;
     let open = xml[..at].rfind("<Relationship")?;
     attr_of_tag(&xml[open..], "<Relationship", "Id")
+}
+
+/// Whether a new relationship in `rels_part` would really be written by
+/// [`add_rel`] (which creates a missing part, so `must_exist` is `false`) or
+/// [`add_workbook_rel`] (which doesn't): both splice it in before
+/// `</Relationships>`, and on a part without one (truncated, a self-closed
+/// or prefixed root) they still hand back an rId that names nothing. A
+/// writer asks this before it writes anything that rId would be put in.
+fn rels_takes(parts: &[(String, Vec<u8>)], rels_part: &str, must_exist: bool) -> bool {
+    match parts.iter().find(|(n, _)| n == rels_part) {
+        Some((_, bytes)) => String::from_utf8_lossy(bytes).contains("</Relationships>"),
+        None => !must_exist,
+    }
 }
 
 /// Add a relationship to any rels part (created when missing). Returns the
@@ -5261,18 +6144,35 @@ impl SheetPackage {
         // after any existing ones.
         let (r1, c1, r2, c2) = range;
         let sqref = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
-        let mut fmls = format!("<formula>{}</formula>", esc_text(formula1));
+        let mut fmls = format!("<formula>{}</formula>", esc_text(&file_formula(formula1)));
         if let Some(f2) = formula2 {
-            fmls.push_str(&format!("<formula>{}</formula>", esc_text(f2)));
+            fmls.push_str(&format!(
+                "<formula>{}</formula>",
+                esc_text(&file_formula(f2))
+            ));
         }
         let cf_xml = format!(
             "<conditionalFormatting sqref=\"{sqref}\"><cfRule type=\"cellIs\" dxfId=\"{dxf_id}\" priority=\"{priority}\" operator=\"{op}\">{fmls}</cfRule></conditionalFormatting>"
         );
         let sheet_part = self.sheet_parts[sheet].clone();
+        // (the new block's ordinal, how many there were before it)
+        let mut placed = None;
         if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
-            p.1 = put_worksheet_child(&xml, "conditionalFormatting", &cf_xml, None, false)
-                .into_bytes();
+            let old = cond_format_spans(&xml);
+            let out = put_worksheet_child(&xml, "conditionalFormatting", &cf_xml, None, false);
+            // It lands at its schema position: after the existing blocks in
+            // a well-ordered part, but before any that follow a later-ranked
+            // child in a misordered one. The blocks ahead of it keep their
+            // starts, so the first start that differs is its ordinal.
+            let new = cond_format_spans(&out);
+            if new.len() == old.len() + 1 {
+                let k = (0..old.len())
+                    .find(|&i| new[i].0 != old[i].0)
+                    .unwrap_or(old.len());
+                placed = Some((k, old.len()));
+            }
+            p.1 = out.into_bytes();
         }
         // Model.
         let mut formulas = vec![formula1.to_string()];
@@ -5287,12 +6187,27 @@ impl SheetPackage {
             dxf_id: Some(dxf_id),
             priority,
         };
-        self.workbook.sheets[sheet]
-            .cond_formats
-            .push(crate::sheet::CondFormat {
-                ranges: vec![range],
-                rules: vec![rule],
-            });
+        let s = &mut self.workbook.sheets[sheet];
+        let ix = placed.map(|(k, _)| k);
+        if let Some((k, n)) = placed {
+            // A claim on an ordinal the part didn't have (n or later) names
+            // nothing (an undo restored the model but not the part): it goes.
+            // The real blocks from the new one's place on moved up one.
+            let renumber = |i: usize| match i {
+                i if i >= n => None,
+                i if i >= k => Some(i + 1),
+                i => Some(i),
+            };
+            for cf in &mut s.cond_formats {
+                cf.ix = cf.ix.and_then(renumber);
+            }
+            s.cf_removed = s.cf_removed.iter().filter_map(|&i| renumber(i)).collect();
+        }
+        s.cond_formats.push(crate::sheet::CondFormat {
+            ranges: vec![range],
+            rules: vec![rule],
+            ix,
+        });
         true
     }
 
@@ -5323,16 +6238,21 @@ impl SheetPackage {
         } else {
             format!(" operator=\"{operator}\"")
         };
-        let mut fmls = format!("<formula1>{}</formula1>", esc_text(formula1));
+        let mut fmls = format!("<formula1>{}</formula1>", esc_text(&file_formula(formula1)));
         if let Some(f2) = formula2 {
-            fmls.push_str(&format!("<formula2>{}</formula2>", esc_text(f2)));
+            fmls.push_str(&format!(
+                "<formula2>{}</formula2>",
+                esc_text(&file_formula(f2))
+            ));
         }
         let dv_xml = format!(
             "<dataValidation type=\"{kind}\"{op_attr} allowBlank=\"1\" showInputMessage=\"1\" showErrorMessage=\"1\" sqref=\"{sqref}\">{fmls}</dataValidation>"
         );
         let sheet_part = self.sheet_parts[sheet].clone();
+        let mut ix = None;
         if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
+            let before = validation_spans(&xml).map_or(0, |(_, items)| items.len());
             // Into the existing block (in any prefix), bumping its count, or a
             // new block at its schema position.
             let xml = append_to_worksheet_child(&xml, "dataValidations", &dv_xml, None)
@@ -5340,18 +6260,29 @@ impl SheetPackage {
                     let block = format!("<dataValidations count=\"1\">{dv_xml}</dataValidations>");
                     put_worksheet_child(&xml, "dataValidations", &block, None, false)
                 });
+            // Appended before the block's end tag, so after its existing
+            // rules: the next ordinal, as long as it is really there.
+            let after = validation_spans(&xml).map_or(0, |(_, items)| items.len());
+            ix = (after == before + 1).then_some(before);
             p.1 = xml.into_bytes();
         }
-        self.workbook.sheets[sheet]
-            .validations
-            .push(crate::sheet::DataValidation {
-                ranges: vec![range],
-                kind: kind.to_string(),
-                operator: operator.to_string(),
-                formula1: formula1.to_string(),
-                formula2: formula2.unwrap_or("").to_string(),
-                prompt: None,
-            });
+        let s = &mut self.workbook.sheets[sheet];
+        if let Some(n) = ix {
+            // Stale claims go, as in `add_conditional_format`.
+            for dv in &mut s.validations {
+                dv.ix = dv.ix.filter(|&i| i < n);
+            }
+            s.dv_removed.retain(|&i| i < n);
+        }
+        s.validations.push(crate::sheet::DataValidation {
+            ranges: vec![range],
+            kind: kind.to_string(),
+            operator: operator.to_string(),
+            formula1: formula1.to_string(),
+            formula2: formula2.unwrap_or("").to_string(),
+            prompt: None,
+            ix,
+        });
         true
     }
 
@@ -5502,8 +6433,82 @@ impl SheetPackage {
             }
             p.1 = out.into_bytes();
         }
-        self.workbook.sheets[sheet].cond_formats.clear();
+        let s = &mut self.workbook.sheets[sheet];
+        s.cond_formats.clear();
+        // The elements those named are gone from the part.
+        s.cf_removed.clear();
         true
+    }
+
+    /// Would [`add_chart`](Self::add_chart) on `sheet` get past its checks:
+    /// the sheet exists, its worksheet part has a known place for the
+    /// `<drawing>`, and a drawing part it already has can take an anchor?
+    /// And can the rels parts take the relationships the chart needs: the
+    /// drawing's to the chart, and the worksheet's to a new drawing? A
+    /// caller that keeps a chart to write later (docxy writes UI charts at
+    /// save) asks this when the chart is made, so a refusal is reported then.
+    pub fn can_add_chart(&self, sheet: usize) -> bool {
+        // add_chart names the sheet's part: a sheet the model has but the
+        // package lists no part for (an undo that brought back a removed
+        // sheet restores the model only) can't take one.
+        if sheet >= self.workbook.sheets.len()
+            || sheet >= self.sheet_parts.len()
+            || !self.sheet_takes(sheet, "drawing", true)
+        {
+            return false;
+        }
+        let host = self.chart_host(sheet);
+        // A host part with neither a `</wsDr>` nor a self-closed root to open
+        // is truncated or isn't a drawing.
+        let host_takes = match host.as_deref().and_then(|p| self.part(p)) {
+            Some(xml) => {
+                let xml = String::from_utf8_lossy(xml);
+                let px = wsdr_prefix(&xml);
+                xml.rfind(&format!("</{px}wsDr>")).is_some()
+                    || open_self_closed_root(&xml, &format!("{px}wsDr")).is_some()
+            }
+            None => true,
+        };
+        // The chart's rel goes into the drawing's rels part: the host's, or
+        // the one a new drawing part's name implies, which an orphan left
+        // behind may already hold. The worksheet's rel to the drawing is
+        // reused when the host already has one, and otherwise written.
+        let sheet_part = &self.sheet_parts[sheet];
+        let ws_rels = rels_part_name(sheet_part);
+        let (ws_dir, _) = sheet_part.rsplit_once('/').unwrap_or(("", sheet_part));
+        let rels_take = match &host {
+            Some(h) => {
+                rels_takes(&self.parts, &rels_part_name(h), false)
+                    && (rel_id_for(&self.parts, &ws_rels, &relative_target(ws_dir, h)).is_some()
+                        || rels_takes(&self.parts, &ws_rels, false))
+            }
+            None => {
+                rels_takes(
+                    &self.parts,
+                    &rels_part_name(&self.new_drawing_part()),
+                    false,
+                ) && rels_takes(&self.parts, &ws_rels, false)
+            }
+        };
+        host_takes && rels_take
+    }
+
+    /// The part name a new drawing takes: the first free
+    /// `xl/drawings/drawingN.xml`.
+    fn new_drawing_part(&self) -> String {
+        let mut dn = 1;
+        while self.part(&format!("xl/drawings/drawing{dn}.xml")).is_some() {
+            dn += 1;
+        }
+        format!("xl/drawings/drawing{dn}.xml")
+    }
+
+    /// The drawing part `sheet` already has, which a new chart joins.
+    fn chart_host(&self, sheet: usize) -> Option<String> {
+        self.workbook.sheets[sheet]
+            .drawing_part
+            .clone()
+            .filter(|p| self.part(p).is_some())
     }
 
     /// Write a clustered column chart (cached literal data, self-contained) onto
@@ -5515,7 +6520,7 @@ impl SheetPackage {
     /// `false`, with nothing changed, when the chart can't be written: the
     /// worksheet part (malformed where `<drawing>` would go) and the host
     /// drawing part (no root to splice the anchor into) are asked before any
-    /// part, rel or content type is written.
+    /// part, rel or content type is written ([`can_add_chart`](Self::can_add_chart)).
     pub fn add_chart(
         &mut self,
         sheet: usize,
@@ -5523,7 +6528,7 @@ impl SheetPackage {
         to: (u32, u32),
         data: &crate::sheet::ChartData,
     ) -> bool {
-        if sheet >= self.workbook.sheets.len() || !self.sheet_takes(sheet, "drawing", true) {
+        if !self.can_add_chart(sheet) {
             return false;
         }
         let ns = self.ns();
@@ -5538,32 +6543,12 @@ impl SheetPackage {
         // we'd still read it back, Excel would show only the part the worksheet
         // names. A second chart — or the first on a sheet that already holds a
         // picture — therefore joins the part that is already there.
-        let host = self.workbook.sheets[sheet]
-            .drawing_part
-            .clone()
-            .filter(|p| self.part(p).is_some());
-        let drawing_part = host.clone().unwrap_or_else(|| {
-            let mut dn = 1;
-            while self.part(&format!("xl/drawings/drawing{dn}.xml")).is_some() {
-                dn += 1;
-            }
-            format!("xl/drawings/drawing{dn}.xml")
-        });
+        let host = self.chart_host(sheet);
+        let drawing_part = host.clone().unwrap_or_else(|| self.new_drawing_part());
         let (d_dir, d_file) = drawing_part
             .rsplit_once('/')
             .unwrap_or(("", drawing_part.as_str()));
         let (d_dir, d_file) = (d_dir.to_string(), d_file.to_string());
-        // A host part with neither a `</wsDr>` nor a self-closed root to open
-        // is truncated or isn't a drawing: refuse before writing anything.
-        if let Some(xml) = host.as_deref().and_then(|p| self.part(p)) {
-            let xml = String::from_utf8_lossy(xml);
-            let px = wsdr_prefix(&xml);
-            let spliceable = xml.rfind(&format!("</{px}wsDr>")).is_some()
-                || open_self_closed_root(&xml, &format!("{px}wsDr")).is_some();
-            if !spliceable {
-                return false;
-            }
-        }
 
         // 2) drawing rels → chart (its rId names the chart from the anchor).
         // Minted BEFORE the chart part is written, so a failure here leaves no
@@ -5780,6 +6765,16 @@ impl SheetPackage {
         if dest_sheet >= self.workbook.sheets.len() || fields.is_empty() {
             return None;
         }
+        // The cache's rel (workbook rels) and the table's (the destination
+        // sheet's rels) must be writable before any part is: a cache whose
+        // `<pivotCache r:id>` names nothing, or a table part no sheet reaches,
+        // is worse than no pivot.
+        let sheet_part = self.sheet_parts.get(dest_sheet)?.clone();
+        if !rels_takes(&self.parts, "xl/_rels/workbook.xml.rels", true)
+            || !rels_takes(&self.parts, &rels_part_name(&sheet_part), false)
+        {
+            return None;
+        }
         // Unused part names + the next free cacheId.
         let mut n = 1;
         while self
@@ -5850,11 +6845,20 @@ impl SheetPackage {
             &format!("/{cache_part}"),
             "application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheDefinition+xml",
         );
-        let cache_rid = add_workbook_rel(
+        let cache_target = format!("pivotCache/pivotCacheDefinition{m}.xml");
+        let cache_rid = match add_workbook_rel(
             &mut self.parts,
             &ns.rel("pivotCacheDefinition"),
-            &format!("pivotCache/pivotCacheDefinition{m}.xml"),
-        );
+            &cache_target,
+        ) {
+            // "" means the rel was already there (a dangling one naming the
+            // part name `m` picked): reuse its id.
+            id if id.is_empty() => {
+                rel_id_for(&self.parts, "xl/_rels/workbook.xml.rels", &cache_target)
+                    .unwrap_or_default()
+            }
+            id => id,
+        };
 
         // workbook.xml: register the cache.
         if let Some(p) = self
@@ -5863,17 +6867,7 @@ impl SheetPackage {
             .find(|(pn, _)| pn == "xl/workbook.xml")
         {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
-            let entry = format!("<pivotCache cacheId=\"{cache_id}\" r:id=\"{cache_rid}\"/>");
-            p.1 = if xml.contains("</pivotCaches>") {
-                xml.replacen("</pivotCaches>", &format!("{entry}</pivotCaches>"), 1)
-            } else {
-                xml.replacen(
-                    "</sheets>",
-                    &format!("</sheets><pivotCaches>{entry}</pivotCaches>"),
-                    1,
-                )
-            }
-            .into_bytes();
+            p.1 = register_pivot_cache(&xml, cache_id, &cache_rid, ns.rels).into_bytes();
         }
 
         // The pivot definition. Save rewrites the field layout (the pivot is
@@ -6055,13 +7049,7 @@ impl SheetPackage {
         if !cache_rid.is_empty() {
             if let Some(p) = self.parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
                 let xml = String::from_utf8_lossy(&p.1).into_owned();
-                let xml = remove_element_containing(
-                    &xml,
-                    "<pivotCache",
-                    &format!("r:id=\"{cache_rid}\""),
-                );
-                // The schema wants at least one <pivotCache> in the wrapper.
-                p.1 = xml.replace("<pivotCaches></pivotCaches>", "").into_bytes();
+                p.1 = unregister_pivot_cache(&xml, &cache_rid).into_bytes();
             }
         }
         // Destination sheet's rels: drop its relationship to the table part.
@@ -6159,17 +7147,17 @@ impl SheetPackage {
         }
         // The workbook relationship whose target resolves to the part (a
         // relative, `./` or absolute Target alike) — capture its rId, then
-        // remove it by that Id.
+        // remove it by that Id. The workbook part is wherever the package
+        // rels put it, `xl/workbook.xml` only by convention.
+        let wb_part = workbook_part_name(&self.parts);
+        let wb_dir = wb_part.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let wb_rels = rels_part_name(&wb_part);
         let mut rid = String::new();
-        if let Some(p) = self
-            .parts
-            .iter_mut()
-            .find(|(n, _)| n == "xl/_rels/workbook.xml.rels")
-        {
+        if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == wb_rels) {
             let mut xml = String::from_utf8_lossy(&p.1).into_owned();
             if let Some((id, _, _)) = parse_rels(&xml)
                 .into_iter()
-                .find(|(_, _, t)| resolve_relative("xl", t) == part_name)
+                .find(|(_, _, t)| resolve_relative(wb_dir, t) == part_name)
             {
                 if let Some(el) = find_element_by_attr(&xml, "Relationship", "Id", |v| v == id) {
                     xml.replace_range(el.start..el.end, "");
@@ -6180,7 +7168,7 @@ impl SheetPackage {
         }
         // workbook.xml: drop the <sheet> element and fix defined-name scopes
         // (localSheetId counts sheets in document order).
-        if let Some(p) = self.parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
+        if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == wb_part) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
             let mut xml = if rid.is_empty() {
                 xml
@@ -7861,6 +8849,46 @@ mod tests {
         assert!(!part_text(&saved, "xl/worksheets/sheet2.xml").contains("tabSelected"));
     }
 
+    /// Excel's *Always create backup* (`<workbookPr backupFile>`): the save
+    /// path honours it (xlsxy), so it is read from the package, not the
+    /// model. Only "1"/"true" turn it on; anything else (or no attribute,
+    /// no element, no part) means off.
+    #[test]
+    fn always_create_backup_reads_workbook_pr() {
+        let pkg_with = |wb_pr: &str| {
+            let mut pkg = new_xlsx();
+            pkg.set_part(
+                "xl/workbook.xml",
+                format!("<workbook>{wb_pr}</workbook>").into_bytes(),
+            );
+            pkg
+        };
+        assert!(pkg_with(r#"<workbookPr backupFile="1"/>"#).always_create_backup());
+        assert!(pkg_with(r#"<workbookPr backupFile="true"/>"#).always_create_backup());
+        assert!(!pkg_with(r#"<workbookPr backupFile="0"/>"#).always_create_backup());
+        assert!(!pkg_with(r#"<workbookPr backupFile="false"/>"#).always_create_backup());
+        assert!(!pkg_with("<workbookPr/>").always_create_backup());
+        assert!(!pkg_with("").always_create_backup());
+        assert!(!new_xlsx().always_create_backup());
+    }
+
+    /// The corpus spells the boolean the LibreOffice way
+    /// (`backupFile="false"`, corpus/xlsx/calc-3d.xlsx); flipping just the
+    /// attribute turns the flag on.
+    #[test]
+    fn always_create_backup_reads_the_corpus_attribute() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../corpus/xlsx/calc-3d.xlsx");
+        let bytes = std::fs::read(path).expect("corpus/xlsx/calc-3d.xlsx exists");
+        let mut pkg = load_xlsx(&bytes).expect("corpus loads");
+        let wb = pkg
+            .part("xl/workbook.xml")
+            .expect("workbook part is xl/workbook.xml");
+        assert!(!pkg.always_create_backup());
+        let xml = String::from_utf8_lossy(wb).replace("backupFile=\"false\"", "backupFile=\"1\"");
+        pkg.set_part("xl/workbook.xml", xml.into_bytes());
+        assert!(pkg.always_create_backup());
+    }
+
     #[test]
     fn a_workbook_without_book_views_gains_one_for_a_later_active_tab() {
         let mut pkg = new_xlsx();
@@ -8301,6 +9329,128 @@ b",
         assert_eq!(attr(i, "borderId"), Some(nb.to_string()));
         assert!(saved.workbook.styles.xf(i as u32).bold);
         assert!(xfs[i].contains("vertical=\"top\""));
+    }
+
+    #[test]
+    fn a_font_edit_reads_fonts_with_comments_in_them() {
+        // A commented-out font among the `<fonts>`, and a comment inside the
+        // edited one that looks like its end tag.
+        let styles = concat!(
+            "<styleSheet><fonts count=\"2\"><!-- <font><b/></font> -->",
+            "<font><sz val=\"11\"/></font>",
+            "<font><!-- </font> --><u/><sz val=\"11\"/><name val=\"Calibri\"/></font>",
+            "</fonts></styleSheet>"
+        );
+        let fonts = font_elements(styles);
+        assert_eq!(fonts.len(), 2);
+        let names: Vec<String> = child_elements(fonts[1])
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, ["u", "sz", "name"]);
+        let to = Xf {
+            bold: true,
+            ..Xf::default()
+        };
+        let out = edit_font(fonts[1], &Xf::default(), &to, |s| format!("{s}"));
+        assert_eq!(
+            out,
+            "<font><b/><u/><sz val=\"11\"/><name val=\"Calibri\"/></font>"
+        );
+    }
+
+    #[test]
+    fn a_font_edit_keeps_what_the_model_does_not_carry_of_a_loaded_font() {
+        // An underlined, theme-coloured minor-scheme font with an explicit
+        // `<b val="0"/>`, and a `<dxf>` font that is not one of `<fonts>`.
+        let mut pkg = new_xlsx();
+        let xml = String::from_utf8(pkg.part("xl/styles.xml").unwrap().to_vec()).unwrap();
+        let nf = read_count(&xml, "<fonts");
+        let mut xml = bump_count(&xml, "<fonts", 1);
+        xml = xml.replacen(
+            "</fonts>",
+            "<font><b val=\"0\"/><u/><sz val=\"11\"/><color theme=\"1\"/><name val=\"Calibri\"/><family val=\"2\"/><scheme val=\"minor\"/></font></fonts>",
+            1,
+        );
+        xml = bump_count(&xml, "<cellXfs", 1);
+        xml = xml.replacen(
+            "</cellXfs>",
+            &format!(
+                "<xf numFmtId=\"0\" fontId=\"{nf}\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"/></cellXfs>"
+            ),
+            1,
+        );
+        xml = xml.replacen(
+            "</cellStyles>",
+            "</cellStyles><dxfs count=\"1\"><dxf><font><i/><strike/></font></dxf></dxfs>",
+            1,
+        );
+        assert_eq!(font_elements(&xml).len(), nf as usize + 1);
+        pkg.set_part("xl/styles.xml", xml.into_bytes());
+        let mut pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let src = pkg.workbook.styles.xfs.len() as u32 - 1;
+        let base = pkg.workbook.styles.xf(src);
+        assert!(!base.bold);
+        assert_eq!(base.color, None);
+
+        let mut bold = base.clone();
+        bold.bold = true;
+        let mut red = base.clone();
+        red.color = Some((0xC0, 0x00, 0x00));
+        let mut named = base.clone();
+        named.font_name = Some("Arial".into());
+        for (c, xf) in [bold, red, named].into_iter().enumerate() {
+            let style = pkg.workbook.styles.intern(xf);
+            pkg.workbook.sheets[0].set_cell(
+                0,
+                c as u32,
+                crate::sheet::Cell {
+                    style,
+                    ..crate::sheet::Cell::text("x")
+                },
+            );
+        }
+
+        let saved = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let styles = String::from_utf8(saved.part("xl/styles.xml").unwrap().to_vec()).unwrap();
+        let xfs = cell_xf_elements(&styles);
+        let fonts = font_elements(&styles);
+        let font_of = |c: u32| {
+            let style = saved.workbook.sheets[0].cell(0, c).unwrap().style;
+            let id: usize = tag_attr(xfs[style as usize], "fontId")
+                .unwrap()
+                .parse()
+                .unwrap();
+            (saved.workbook.styles.xf(style), fonts[id])
+        };
+
+        // Bold: one `<b/>` replacing `<b val="0"/>`; underline, theme
+        // colour and scheme kept.
+        let (xf, font) = font_of(0);
+        assert!(xf.bold, "{font}");
+        assert_eq!(font.matches("<b").count(), 1, "{font}");
+        assert!(font.contains("<b/>"), "{font}");
+        assert!(font.contains("<u/>"), "{font}");
+        assert!(font.contains("<color theme=\"1\"/>"), "{font}");
+        assert!(font.contains("<scheme val=\"minor\"/>"), "{font}");
+        assert!(!font.contains("<strike"), "{font}");
+
+        // Colour: the theme colour replaced by the rgb one, underline kept.
+        let (xf, font) = font_of(1);
+        assert_eq!(xf.color, Some((0xC0, 0x00, 0x00)), "{font}");
+        assert!(!xf.bold, "{font}");
+        assert!(font.contains("<color rgb=\"FFC00000\"/>"), "{font}");
+        assert!(!font.contains("theme="), "{font}");
+        assert!(font.contains("<u/>"), "{font}");
+
+        // Name: the new name, the old family and scheme gone, the rest kept.
+        let (xf, font) = font_of(2);
+        assert_eq!(xf.font_name.as_deref(), Some("Arial"), "{font}");
+        assert!(font.contains("<name val=\"Arial\"/>"), "{font}");
+        assert!(!font.contains("<family"), "{font}");
+        assert!(!font.contains("<scheme"), "{font}");
+        assert!(font.contains("<u/>"), "{font}");
+        assert!(font.contains("<color theme=\"1\"/>"), "{font}");
     }
 
     #[test]
@@ -9005,7 +10155,12 @@ b",
         let bytes = save_xlsx(&pkg);
         let pkg2 = load_xlsx(&bytes).unwrap();
         let anchor = pkg2.workbook.sheets[0].cell(0, 0).unwrap();
-        assert_eq!(anchor.formula.as_deref(), Some("SEQUENCE(3)"));
+        // Saved in file spelling (#776); shown as typed.
+        assert_eq!(anchor.formula.as_deref(), Some("_xlfn.SEQUENCE(3)"));
+        assert_eq!(
+            crate::formula::display_formula(anchor.formula.as_deref().unwrap()),
+            "SEQUENCE(3)"
+        );
         assert_eq!(anchor.spill, Some((3, 1)));
         assert!(anchor.f_attrs.as_deref().unwrap().contains("t=\"array\""));
         assert!(anchor.f_attrs.as_deref().unwrap().contains("ref=\"A1:A3\""));
@@ -9492,7 +10647,7 @@ b",
         let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
         let ws = String::from_utf8_lossy(re.part("xl/worksheets/sheet1.xml").unwrap()).into_owned();
         assert!(
-            ws.contains(r#"<c r="D1" cm="1"><f t="array" ref="D1:D2">SEQUENCE(2)</f>"#),
+            ws.contains(r#"<c r="D1" cm="1"><f t="array" ref="D1:D2">_xlfn.SEQUENCE(2)</f>"#),
             "{ws}"
         );
         assert_eq!(re.part("xl/metadata.xml").unwrap(), &before[..]);
@@ -9520,6 +10675,131 @@ b",
     }
 
     #[test]
+    fn typed_xlookup_saves_with_xlfn_prefix() {
+        // #776: a post-2007 function goes to the file with its prefix, or
+        // Excel shows #NAME?.
+        let (pkg, _) = typed_book(&[((0, 2), "XLOOKUP(2,A1:A3,A1:A3)")]);
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<c r="C1"><f>_xlfn.XLOOKUP(2,A1:A3,A1:A3)</f><v>2</v></c>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn typed_spill_ref_saves_as_anchorarray() {
+        let (pkg, _) = typed_book(&[((0, 2), "SEQUENCE(3)"), ((0, 3), "SUM(C1#)")]);
+        let (_, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(r#"<c r="D1"><f>SUM(_xlfn.ANCHORARRAY(C1))</f><v>6</v></c>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn saved_file_formulas_reload_to_the_typed_display_and_value() {
+        // #776 AC7: what the save adds, the load takes away again — the
+        // reloaded formula shows as typed and recalculates to the same value.
+        let srcs = [
+            "LET(x,A1,x+1)",
+            // Row 2: the implicit intersection picks A2.
+            "@A1:A3",
+            "LET(x,A1,x)+LET(x,A2,x*10)",
+            "LAMBDA(a,b,a+b)(A1,A2)",
+            "LET(x,1,LAMBDA(y,x+y)(2))",
+            "LET(f,LAMBDA(x,x*3),f(A2))",
+            "LAMBDA(x,[y],IF(ISOMITTED(y),x,x+y))(A3)",
+            "LAMBDA(x,[y],IF(ISOMITTED(y),x,x+y))(A3,A1)",
+            "SUM(E1#)",
+            "XLOOKUP(2,A1:A3,A1:A3)*1.5",
+            "LET(x,1.23456789E-12,x)*1000",
+            // LET/LAMBDA names shared with a builtin called as one.
+            "LET(sum,SUM(A1:A3),sum/SUM(A1:A2))",
+            "LET(max,10,MAX(A1,max))",
+            "LET(date,45306,DATE(YEAR(date),1,1))",
+            "LAMBDA(text,LEN(TEXT(text,\"0.0\")))(A1)",
+            // A LET name holding a lambda a call returned.
+            "LET(mk,LAMBDA(n,LAMBDA(x,x+n)),inc,mk(A1),inc(5))",
+        ];
+        let mut typed: Vec<((u32, u32), &str)> = srcs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| ((i as u32, 2), *s))
+            .collect();
+        typed.push(((0, 4), "SEQUENCE(3)"));
+        let (pkg, _) = typed_book(&typed);
+        let before: Vec<CellValue> = (0..srcs.len() as u32)
+            .map(|r| pkg.workbook.sheets[0].cell(r, 2).unwrap().value.clone())
+            .collect();
+        assert!(
+            before.iter().all(|v| matches!(v, CellValue::Number(_))),
+            "{before:?}"
+        );
+
+        let (mut re, _) = resaved(&pkg);
+        for (r, src) in srcs.iter().enumerate() {
+            let cell = re.workbook.sheets[0].cell(r as u32, 2).unwrap();
+            let stored = cell.formula.as_deref().unwrap();
+            assert_ne!(stored, *src, "saved without its file spelling");
+            // Up to case: a parameter's call is spelled as the parameter.
+            let shown = crate::formula::display_formula(stored);
+            assert!(shown.eq_ignore_ascii_case(src), "{shown} for {src}");
+        }
+        // Recalculate from nothing, so no cached value can stand in.
+        for r in 0..srcs.len() as u32 {
+            let mut cell = re.workbook.sheets[0].cell(r, 2).unwrap().clone();
+            cell.value = CellValue::Empty;
+            re.workbook.sheets[0].set_cell(r, 2, cell);
+        }
+        rebuild(&mut re);
+        for (r, src) in srcs.iter().enumerate() {
+            assert_eq!(
+                re.workbook.sheets[0].cell(r as u32, 2).unwrap().value,
+                before[r],
+                "{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn added_cf_and_dv_formulas_save_in_file_spelling() {
+        // #776: rule formulas gridcore writes get their prefixes too.
+        use crate::sheet::Dxf;
+        let mut pkg = new_xlsx();
+        let dxf = Dxf {
+            fill: Some((255, 0, 0)),
+            color: None,
+            bold: None,
+            italic: None,
+        };
+        pkg.add_conditional_format(
+            0,
+            (0, 0, 1, 0),
+            "greaterThan",
+            "XLOOKUP(1,B1:B2,C1:C2)",
+            None,
+            dxf,
+        );
+        pkg.add_data_validation(
+            0,
+            (0, 1, 1, 1),
+            "whole",
+            "between",
+            "1",
+            Some("MAXIFS(C1:C9,B1:B9,1)"),
+        );
+        let ws = saved_sheet1(&pkg);
+        assert!(
+            ws.contains("<formula>_xlfn.XLOOKUP(1,B1:B2,C1:C2)</formula>"),
+            "{ws}"
+        );
+        assert!(
+            ws.contains("<formula1>1</formula1><formula2>_xlfn.MAXIFS(C1:C9,B1:B9,1)</formula2>"),
+            "{ws}"
+        );
+    }
+
+    #[test]
     fn typed_spill_saves_with_cm_and_new_metadata_part() {
         // #724 AC1: no metadata.xml yet — save creates it, with its
         // content-type override and workbook relationship.
@@ -9527,7 +10807,7 @@ b",
         assert!(pkg.part("xl/metadata.xml").is_none());
         let (re, ws) = resaved(&pkg);
         assert!(
-            ws.contains(r#"<c r="C1" cm="1"><f t="array" ref="C1:C3">SEQUENCE(3)</f>"#),
+            ws.contains(r#"<c r="C1" cm="1"><f t="array" ref="C1:C3">_xlfn.SEQUENCE(3)</f>"#),
             "{ws}"
         );
         let meta = part_text(&re, "xl/metadata.xml");
@@ -9583,15 +10863,51 @@ b",
         let (pkg, _) = typed_book(&[((0, 1), "SEQUENCE(1)"), ((0, 2), "FILTER(A1:A3,A1:A3>2)")]);
         let (_, ws) = resaved(&pkg);
         assert!(
-            ws.contains(r#"<c r="B1" cm="1"><f t="array" ref="B1">SEQUENCE(1)</f><v>1</v></c>"#),
+            ws.contains(
+                r#"<c r="B1" cm="1"><f t="array" ref="B1">_xlfn.SEQUENCE(1)</f><v>1</v></c>"#
+            ),
             "{ws}"
         );
         assert!(
             ws.contains(
-                r#"<c r="C1" cm="1"><f t="array" ref="C1">FILTER(A1:A3,A1:A3&gt;2)</f><v>3</v></c>"#
+                r#"<c r="C1" cm="1"><f t="array" ref="C1">_xlfn._xlws.FILTER(A1:A3,A1:A3&gt;2)</f><v>3</v></c>"#
             ),
             "{ws}"
         );
+    }
+
+    #[test]
+    fn typed_maybe_array_formulas_save_as_dynamic_arrays() {
+        // #777: a typed formula that could return an array saves as one even
+        // if it never evaluated array-shaped — FILTER with no match yet
+        // (#CALC!), INDIRECT/INDEX naming one cell — so neither Excel nor
+        // xlsxy reopens it as a legacy implicit-intersection formula.
+        let srcs = [
+            "FILTER(A1:A3,A1:A3>5)",
+            "INDIRECT(B1)",
+            "IFERROR(FILTER(A1:A3,A1:A3>5),\"\")",
+            "INDEX(A1:A3,2)",
+        ];
+        let mut typed: Vec<((u32, u32), &str)> = srcs
+            .iter()
+            .enumerate()
+            .map(|(i, s)| ((i as u32, 2), *s))
+            .collect();
+        typed.insert(0, ((0, 1), "\"A2\""));
+        let (pkg, _) = typed_book(&typed);
+        let (re, ws) = resaved(&pkg);
+        for (i, src) in srcs.iter().enumerate() {
+            let f = format!(
+                r#" cm="1"><f t="array" ref="C{n}">{}</f>"#,
+                esc_text(&file_formula(src)),
+                n = i + 1
+            );
+            let c = saved_cell(&ws, &format!("C{}", i + 1));
+            assert!(c.contains(&f), "{f} in {c}");
+            let cell = re.workbook.sheets[0].cell(i as u32, 2).unwrap();
+            assert!(cell.is_array_formula() && cell.has_cm(), "{src}");
+        }
+        assert!(re.part("xl/metadata.xml").is_some());
     }
 
     #[test]
@@ -9608,7 +10924,7 @@ b",
         );
         let (_, ws) = resaved(&pkg);
         assert!(
-            ws.contains(r#"<c r="C1" t="e" cm="1"><f t="array" ref="C1">SEQUENCE(3)</f>"#),
+            ws.contains(r#"<c r="C1" t="e" cm="1"><f t="array" ref="C1">_xlfn.SEQUENCE(3)</f>"#),
             "{ws}"
         );
     }
@@ -9623,7 +10939,6 @@ b",
             "A1",
             "A1*A2",
             "XLOOKUP(2,A1:A3,A1:A3)",
-            "INDEX(A1:A3,2)",
             "IF(A1>1,1,2)",
             // One-cell ranges from functions are single values too.
             "OFFSET(A1,0,0)+1",
@@ -9638,7 +10953,11 @@ b",
         let (pkg, _) = typed_book(&typed);
         let (re, ws) = resaved(&pkg);
         for (i, src) in srcs.iter().enumerate() {
-            let f = format!(r#"<c r="C{}"><f>{}</f>"#, i + 1, esc_text(src));
+            let f = format!(
+                r#"<c r="C{}"><f>{}</f>"#,
+                i + 1,
+                esc_text(&file_formula(src))
+            );
             assert!(ws.contains(&f), "{f} in {ws}");
         }
         assert!(!ws.contains("cm="), "{ws}");
@@ -9684,7 +11003,7 @@ b",
         eng.set_cell(&mut pkg.workbook, (0, 0, 3), Cell::formula("SEQUENCE(2)"));
         let (re, ws) = resaved(&pkg);
         assert!(
-            ws.contains(r#"<c r="D1" cm="1"><f t="array" ref="D1:D2">SEQUENCE(2)</f>"#),
+            ws.contains(r#"<c r="D1" cm="1"><f t="array" ref="D1:D2">_xlfn.SEQUENCE(2)</f>"#),
             "{ws}"
         );
         // The rich errors still carry their `vm` and decode.
@@ -9846,7 +11165,7 @@ b",
         let mut eng = crate::engine::Engine::new(&pkg.workbook);
         eng.set_cell(&mut pkg.workbook, (0, 0, 0), Cell::formula("SEQUENCE(1)"));
         let (re, ws) = resaved(&pkg);
-        assert!(ws.contains(r#"<c r="A1"><f>SEQUENCE(1)</f>"#), "{ws}");
+        assert!(ws.contains(r#"<c r="A1"><f>_xlfn.SEQUENCE(1)</f>"#), "{ws}");
         assert_eq!(re.part("xl/metadata.xml").unwrap(), b"<metadata>");
     }
 
@@ -9913,7 +11232,7 @@ b",
     }
 
     #[test]
-    fn a_value_typed_into_a_cse_block_is_refilled_by_the_block() {
+    fn a_value_typed_into_a_cse_block_is_refused() {
         // Excel refuses to change part of an array; the block owns its cells.
         let mut pkg = cse_book("C1:C3", "A1");
         let mut eng = crate::engine::Engine::new(&pkg.workbook);
@@ -9934,6 +11253,46 @@ b",
             ws.contains(r#"<f t="array" ref="C1:C3">A1</f><v>5</v>"#),
             "{ws}"
         );
+    }
+
+    #[test]
+    fn a_refused_partial_edit_leaves_the_block_whole() {
+        // Typing, pasting or clearing a plain cell inside the block changes
+        // nothing: not the cell, not the anchor's extent, not the saved ref.
+        // Also while a formula blocks the block, for its emptied cells.
+        let mut pkg = cse_book("C1:C3", "A1");
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        let before = pkg.workbook.sheets[0].clone();
+        for (r, cell) in [
+            (1, Cell::number(99.0)),
+            (2, Cell::text("x")),
+            (1, Cell::default()),
+        ] {
+            eng.set_cell(&mut pkg.workbook, (0, r, 2), cell);
+            assert_eq!(pkg.workbook.sheets[0].cells, before.cells, "row {r}");
+        }
+        eng.set_cells(
+            &mut pkg.workbook,
+            0,
+            vec![(1, 2, Cell::number(7.0)), (2, 2, Cell::number(8.0))],
+        );
+        assert_eq!(pkg.workbook.sheets[0].cells, before.cells);
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(0, 2).unwrap().spill,
+            Some((3, 1))
+        );
+        // Blocked by a formula in C2: C3 is emptied, and still the block's.
+        eng.set_cell(&mut pkg.workbook, (0, 1, 2), Cell::formula("7"));
+        eng.set_cell(&mut pkg.workbook, (0, 2, 2), Cell::number(99.0));
+        assert_eq!(val(&pkg, "C3"), CellValue::Empty);
+        let ws = saved_sheet1(&pkg);
+        assert!(ws.contains(r#"<f t="array" ref="C1:C3">A1</f>"#), "{ws}");
+        // Removing the formula is not refused, and frees the block.
+        eng.set_cell(&mut pkg.workbook, (0, 1, 2), Cell::default());
+        for n in ["C1", "C2", "C3"] {
+            assert_eq!(val(&pkg, n), CellValue::Number(1.0), "{n}");
+        }
     }
 
     #[test]
@@ -10131,6 +11490,67 @@ b",
         );
     }
 
+    /// #785: the `<f>` attributes the file's formulas were preserved with — a
+    /// shared group's master (a group whose master we can't parse stays a
+    /// group; a parseable one is expanded at load) and a data table — survive
+    /// every path that rewrites such a cell without changing its formula: a
+    /// restyle (`Engine::set_styles`, #784), the same formula through
+    /// `set_cell` (Enter on an unchanged formula, a paste of it in place; a
+    /// restyled clone here), and undo's `restore_cell`. Each save is the
+    /// unedited one with only the style changed.
+    #[test]
+    fn restyle_and_undo_keep_shared_master_and_data_table_f_attrs() {
+        let rows = concat!(
+            r#"<row r="1"><c r="A1"><v>1</v></c><c r="B1"><f t="shared" ref="B1:B3" si="0">[1]Sheet1!A1*2</f><v>2</v></c><c r="G1"><f t="dataTable" ref="G1:G2" dt2D="0" dtr="0" r1="A1"/><v>1</v></c></row>"#,
+            r#"<row r="2"><c r="A2"><v>2</v></c><c r="B2"><f t="shared" si="0"/><v>4</v></c><c r="G2"><v>1</v></c></row>"#,
+            r#"<row r="3"><c r="A3"><v>3</v></c><c r="B3"><f t="shared" si="0"/><v>6</v></c></row>"#,
+        );
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        let (_, unedited) = resaved(&pkg);
+        assert!(
+            unedited.contains(r#"<c r="B1"><f t="shared""#),
+            "{unedited}"
+        );
+        assert!(
+            unedited.contains(r#"<c r="G1"><f t="dataTable""#),
+            "{unedited}"
+        );
+        let restyled = unedited
+            .replace(r#"<c r="B1">"#, r#"<c r="B1" s="1">"#)
+            .replace(r#"<c r="G1">"#, r#"<c r="G1" s="1">"#);
+
+        let before: Vec<Cell> = [1, 6]
+            .map(|c| pkg.workbook.sheets[0].cell(0, c).cloned().unwrap())
+            .into();
+        for c in [1, 6] {
+            let mut cell = pkg.workbook.sheets[0].cell(0, c).cloned().unwrap();
+            cell.style = 1;
+            eng.set_cell(&mut pkg.workbook, (0, 0, c), cell);
+        }
+        let (re, ws) = resaved(&pkg);
+        assert_eq!(ws, restyled);
+        let sheet = &re.workbook.sheets[0];
+        for (r, c) in [(0, 1), (1, 1), (2, 1), (0, 6)] {
+            let (a, b) = (
+                sheet.cell(r, c).unwrap(),
+                pkg.workbook.sheets[0].cell(r, c).unwrap(),
+            );
+            assert_eq!((&a.formula, &a.value), (&b.formula, &b.value));
+        }
+
+        for (c, cell) in [1, 6].into_iter().zip(before) {
+            eng.restore_cell(&mut pkg.workbook, (0, 0, c), cell);
+        }
+        assert_eq!(resaved(&pkg).1, unedited);
+
+        eng.set_styles(&mut pkg.workbook, 0, &[(0, 1, 1), (0, 6, 1)]);
+        assert_eq!(resaved(&pkg).1, restyled);
+        eng.set_styles(&mut pkg.workbook, 0, &[(0, 1, 0), (0, 6, 0)]);
+        assert_eq!(resaved(&pkg).1, unedited);
+    }
+
     #[test]
     fn restore_cell_keeps_a_legacy_formula_legacy() {
         // Undo puts the snapshot back with restore_cell: the loaded legacy
@@ -10268,15 +11688,16 @@ b",
     }
 
     #[test]
-    fn undoing_an_overwrite_through_restore_cell_restores_cm() {
-        // xlsxy and gridwasm undo by restore_cell-ing the `before` clone back:
-        // the anchor comes back exactly, `t="array"` attributes and `cm`.
+    fn undoing_an_overwrite_through_restore_cells_restores_cm() {
+        // xlsxy and gridwasm undo by restore_cells-ing the group's `before`
+        // clones back: the anchor comes back exactly, `t="array"` attributes
+        // and `cm`.
         let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SORT_ANCHOR))).unwrap();
         let mut eng = crate::engine::Engine::new(&pkg.workbook);
         let before = pkg.workbook.sheets[0].cell(0, 3).cloned().unwrap();
         eng.set_cell(&mut pkg.workbook, (0, 0, 3), Cell::number(1.0));
         assert!(!saved_sheet1(&pkg).contains("cm="));
-        eng.restore_cell(&mut pkg.workbook, (0, 0, 3), before.clone());
+        eng.restore_cells(&mut pkg.workbook, 0, &[(0, 3, before.clone())]);
         assert_eq!(pkg.workbook.sheets[0].cell(0, 3).unwrap(), &before);
         let ws = saved_sheet1(&pkg);
         assert!(
@@ -10286,13 +11707,357 @@ b",
     }
 
     #[test]
-    fn autofill_copy_carries_no_cell_metadata() {
+    fn a_typed_formula_drops_a_foreign_cm() {
+        // #825 AC6: a formula typed here with a `cm` from elsewhere (another
+        // workbook's index) keeps none of it: save resolves a `cm` in this
+        // package's metadata part, which it creates.
+        let (mut pkg, mut eng) = typed_book(&[]);
+        let mut cell = Cell::formula("A1:A3*2");
+        cell.meta = Some(Box::new(crate::sheet::CellMeta {
+            cm: Some("7".into()),
+            ..Default::default()
+        }));
+        eng.set_cell(&mut pkg.workbook, (0, 0, 2), cell);
+        let (re, ws) = resaved(&pkg);
+        assert!(!ws.contains(r#"cm="7""#), "{ws}");
+        assert!(
+            ws.contains(r#"<c r="C1" cm="1"><f t="array" ref="C1:C3">A1:A3*2</f>"#),
+            "{ws}"
+        );
+        let meta = part_text(&re, "xl/metadata.xml");
+        assert!(meta.contains(r#"<cellMetadata count="1">"#), "{meta}");
+    }
+
+    /// Sheet 1's D1:D5 in `pkg`, as a grid copy takes it.
+    fn copied_d1_d5(pkg: &SheetPackage) -> Vec<Vec<Cell>> {
+        (0..5)
+            .map(|r| {
+                vec![
+                    pkg.workbook.sheets[0]
+                        .cell(r, 3)
+                        .cloned()
+                        .unwrap_or_default(),
+                ]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_pasted_anchor_with_a_foreign_cm_saves_a_resolved_cm() {
+        // #825 AC7: Excel's dynamic array (`cm="1"`) copied from workbook A
+        // and pasted at its own address in workbook B, which has no metadata
+        // part. Restored as an array block, it must not carry A's index: save
+        // creates B's part and the `cm` names its entry.
+        let mut a = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SORT_ANCHOR))).unwrap();
+        crate::engine::Engine::new(&a.workbook).recalc_all(&mut a.workbook);
+        let block = copied_d1_d5(&a);
+        assert_eq!(block[0][0].spill, Some((5, 1)));
+        let mut b = new_xlsx();
+        for (r, v) in [3.0, 9.0, 1.0, 7.0, 5.0].into_iter().enumerate() {
+            b.workbook.sheets[0].set_cell(r as u32, 0, Cell::number(v));
+        }
+        assert!(b.part("xl/metadata.xml").is_none());
+        let mut eng = crate::engine::Engine::new(&b.workbook);
+        eng.paste_block(&mut b.workbook, 0, (0, 3), &block);
+        let d1 = b.workbook.sheets[0].cell(0, 3).unwrap();
+        assert_eq!(d1.spill, Some((5, 1)));
+        assert!(!d1.has_cm() && d1.is_dynamic());
+        let (re, ws) = resaved(&b);
+        assert!(
+            ws.contains(r#"<c r="D1" cm="1"><f t="array" ref="D1:D5">"#),
+            "{ws}"
+        );
+        let meta = part_text(&re, "xl/metadata.xml");
+        assert!(
+            meta.contains(r#"<cellMetadata count="1"><bk><rc t="1" v="0"/></bk></cellMetadata>"#),
+            "{meta}"
+        );
+    }
+
+    #[test]
+    fn a_same_workbook_cm_paste_saves_the_same_cm() {
+        // #825 AC6: clearing the `cm` costs nothing in its own workbook: the
+        // paste back in place saves `cm="1"` again, and the metadata part is
+        // left exactly as it was (no second entry).
+        let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SORT_ANCHOR))).unwrap();
+        let before = pkg.part("xl/metadata.xml").unwrap().to_vec();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        let block = copied_d1_d5(&pkg);
+        eng.paste_block(&mut pkg.workbook, 0, (0, 3), &block);
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(0, 3).unwrap().spill,
+            Some((5, 1))
+        );
+        let (re, ws) = resaved(&pkg);
+        assert!(ws.contains(SORT_ANCHOR), "{ws}");
+        assert_eq!(re.part("xl/metadata.xml").unwrap(), &before[..]);
+    }
+
+    #[test]
+    fn autofill_copy_is_typed_and_drops_source_cm_vm() {
         let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SORT_ANCHOR))).unwrap();
         assert!(pkg.workbook.sheets[0].cell(0, 3).unwrap().meta.is_some());
         crate::edit::autofill(&mut pkg.workbook, 0, (0, 3, 0, 3), (0, 4));
         let copy = pkg.workbook.sheets[0].cell(0, 4).unwrap();
         assert!(copy.formula.is_some());
-        assert!(copy.meta.is_none());
+        // Typed there (#785): modern, and none of the source's `cm`/`vm`.
+        let meta = copy.meta.as_deref().unwrap();
+        assert!(meta.modern && meta.cm.is_none() && meta.vm.is_none());
+    }
+
+    /// The `<f …>` opening tag (`ref` dropped) and whether the cell has a
+    /// `cm`, of cell `name` in a saved sheet.
+    fn saved_f_kind(ws: &str, name: &str) -> (String, bool) {
+        let at = ws
+            .find(&format!("<c r=\"{name}\""))
+            .unwrap_or_else(|| panic!("{name} in {ws}"));
+        let c = &ws[at..at + ws[at..].find("</c>").unwrap()];
+        let f = c
+            .find("<f")
+            .map_or("", |i| &c[i..i + c[i..].find('>').unwrap()]);
+        let f = f.split(" ref=").next().unwrap().to_string();
+        (f, c.contains(" cm="))
+    }
+
+    /// #785: an autofilled copy of a formula saves the same kind of `<f>` as a
+    /// Fill Right of it (`fill_changes` + `Engine::set_cell`): both are typed
+    /// at the destination (#724), after the engine has evaluated them — the
+    /// suite rebuilds and recalcs after an autofill.
+    #[test]
+    fn autofill_and_fill_copy_a_formula_alike() {
+        let cse_sum = r#"<c r="C1"><f t="array" ref="C1:C3">SUM(A1:A3)</f><v>6</v></c>"#;
+        let cse_array = r#"<c r="C1"><f t="array" ref="C1:C3">A1:A3*2</f><v>2</v></c>"#;
+        let legacy = r#"<c r="C1"><f>A1:A3*2</f><v>2</v></c>"#;
+        let dynamic = r#"<c r="C1" cm="1"><f t="array" ref="C1:C3">_xlfn._xlws.SORT(A1:A3,,-1)</f><v>3</v></c>"#;
+        for (src, want) in [
+            (cse_sum, ("<f".to_string(), false)),
+            (cse_array, ("<f t=\"array\"".to_string(), true)),
+            (legacy, ("<f t=\"array\"".to_string(), true)),
+            (dynamic, ("<f t=\"array\"".to_string(), true)),
+        ] {
+            // A1:A3 for the source, B1:B3 for the copies in D1 to read.
+            let rows: String = (1..=3)
+                .map(|r| {
+                    let extra = if r == 1 { src } else { "" };
+                    format!(r#"<row r="{r}"><c r="A{r}"><v>{r}</v></c><c r="B{r}"><v>5</v></c>{extra}</row>"#)
+                })
+                .collect();
+            let mut auto = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
+            crate::edit::autofill(&mut auto.workbook, 0, (0, 2, 0, 2), (0, 3));
+            let mut eng = crate::engine::Engine::new(&auto.workbook);
+            eng.recalc_all(&mut auto.workbook);
+
+            let mut fill = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
+            let mut eng = crate::engine::Engine::new(&fill.workbook);
+            eng.recalc_all(&mut fill.workbook);
+            for (r, c, cell) in
+                crate::edit::fill_changes(&fill.workbook.sheets[0], (0, 2, 0, 3), false)
+            {
+                eng.set_cell(&mut fill.workbook, (0, r, c), cell);
+            }
+
+            let (a, f) = (saved_sheet1(&auto), saved_sheet1(&fill));
+            assert_eq!(
+                saved_f_kind(&a, "D1"),
+                saved_f_kind(&f, "D1"),
+                "{src}
+{a}
+{f}"
+            );
+            assert_eq!(
+                saved_f_kind(&a, "D1"),
+                want,
+                "{src}
+{a}"
+            );
+        }
+    }
+
+    #[test]
+    fn fill_copy_of_a_cm_cell_saves_without_its_cm() {
+        // #777: Ctrl+D/Ctrl+R (fill_changes) copies, like autofill's, carry
+        // none of the source's `<c>` metadata: a copy of a 1x1 dynamic array
+        // whose own formula is scalar saves as a plain formula, not as an
+        // array because the source was one.
+        let rows = r#"<row r="1"><c r="A1"><v>3</v></c><c r="B1"><v>4</v></c><c r="D1" cm="1"><f t="array" ref="D1">A1*2</f><v>6</v></c></row>"#;
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        fill_from_d1(&mut pkg, (0, 4), false);
+        let e1 = pkg.workbook.sheets[0].cell(0, 4).unwrap();
+        assert!(!e1.has_cm() && e1.is_modern() && !e1.is_dynamic());
+        let ws = saved_sheet1(&pkg);
+        assert_eq!(
+            saved_cell(&ws, "E1"),
+            r#"<c r="E1"><f>B1*2</f><v>8</v></c>"#
+        );
+        assert!(saved_cell(&ws, "D1").contains(r#"cm="1""#), "{ws}");
+    }
+
+    #[test]
+    fn deleting_a_cell_of_a_frozen_dynamic_array_keeps_its_block() {
+        // #777 r3: a loaded `cm` dynamic array the engine can't evaluate is
+        // frozen. Deleting one of its cells is a no-op (Excel's too): it
+        // saves whole, not as an anchor over plain constants that Excel's
+        // recalc would block with #SPILL!.
+        let rows = concat!(
+            r#"<row r="1"><c r="A1"><v>1</v></c><c r="E1" cm="1"><f t="array" ref="E1:E3">_xlfn.PIVOTBY(A1,4)</f><v>7</v></c></row>"#,
+            r#"<row r="2"><c r="E2"><v>8</v></c></row>"#,
+            r#"<row r="3"><c r="E3"><v>9</v></c></row>"#,
+        );
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 1, 4), Cell::default());
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(0, 4).unwrap().spill,
+            Some((3, 1))
+        );
+        let ws = saved_sheet1(&pkg);
+        assert!(
+            ws.contains(
+                r#"<c r="E1" cm="1"><f t="array" ref="E1:E3">_xlfn.PIVOTBY(A1,4)</f><v>7</v></c>"#
+            ),
+            "{ws}"
+        );
+        assert!(ws.contains(r#"<c r="E2"><v>8</v></c>"#), "{ws}");
+    }
+
+    #[test]
+    fn delete_outside_a_frozen_arrays_shifted_ref_still_clears() {
+        // #777 r4: a row delete shifts a frozen anchor's `ref` (E1:E3 →
+        // E1:E2) but not its stale extent, so E3 — now the user's "x" — is
+        // not part of the block: Delete clears it. E2 still is: a no-op.
+        let rows = concat!(
+            r#"<row r="1"><c r="A1"><v>1</v></c><c r="E1" cm="1"><f t="array" ref="E1:E3">_xlfn.PIVOTBY(A1,4)</f><v>7</v></c></row>"#,
+            r#"<row r="2"><c r="E2"><v>8</v></c></row>"#,
+            r#"<row r="3"><c r="E3"><v>9</v></c></row>"#,
+            r#"<row r="4"><c r="E4" t="inlineStr"><is><t>x</t></is></c></row>"#,
+        );
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        crate::edit::delete_rows(&mut pkg.workbook, 0, 1, 1);
+        let at = |pkg: &SheetPackage, r: u32| {
+            pkg.workbook.sheets[0]
+                .cell(r, 4)
+                .map_or(CellValue::Empty, |cl| cl.value.clone())
+        };
+        assert_eq!(at(&pkg, 2), CellValue::Text("x".into()));
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        let before = pkg.workbook.sheets[0].cell(2, 4).cloned().unwrap();
+        eng.set_cell(&mut pkg.workbook, (0, 2, 4), Cell::default());
+        assert_eq!(at(&pkg, 2), CellValue::Empty);
+        eng.restore_cell(&mut pkg.workbook, (0, 2, 4), before);
+        assert_eq!(at(&pkg, 2), CellValue::Text("x".into()));
+        eng.set_cell(&mut pkg.workbook, (0, 1, 4), Cell::default());
+        assert_eq!(at(&pkg, 1), CellValue::Number(9.0));
+    }
+
+    #[test]
+    fn a_sort_cutting_an_array_block_is_refused() {
+        // #840 (r4-pre-structural-spill): a sort through a frozen dynamic
+        // array, or a legacy CSE block, would scatter its block; it is
+        // refused and leaves the rows, the extent and the saved `ref` alone.
+        for (cm, f) in [(r#" cm="1""#, "_xlfn.PIVOTBY(A1,4)"), ("", "A1:A3*2")] {
+            let rows = format!(
+                concat!(
+                    r#"<row r="1"><c r="A1"><v>2</v></c><c r="E1"{cm}><f t="array" ref="E1:E3">{f}</f><v>7</v></c></row>"#,
+                    r#"<row r="2"><c r="A2"><v>1</v></c><c r="E2"><v>8</v></c></row>"#,
+                    r#"<row r="3"><c r="A3"><v>4</v></c><c r="E3"><v>9</v></c></row>"#,
+                    r#"<row r="4"><c r="A4"><v>3</v></c><c r="E4" t="inlineStr"><is><t>x</t></is></c></row>"#,
+                ),
+                cm = cm,
+                f = f
+            );
+            let mut pkg = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
+            let before = pkg.workbook.sheets[0].cells.clone();
+            assert!(crate::edit::sort_cuts_spill(&pkg.workbook, 0, 0, 3), "{f}");
+            let n = crate::edit::sort_rows(&mut pkg.workbook, 0, 0, 3, &[(0, true)]);
+            assert_eq!(n, 0, "{f}");
+            assert_eq!(pkg.workbook.sheets[0].cells, before, "{f}");
+            let ws = saved_sheet1(&pkg);
+            assert!(ws.contains(r#"<f t="array" ref="E1:E3">"#), "{f}: {ws}");
+        }
+    }
+
+    #[test]
+    fn an_evaluated_cse_block_is_still_an_array_to_sort() {
+        // #840 r1 m1: a legacy CSE `SUM` over its block evaluates to one
+        // value, which fills the block (#775), and save keeps its `ref`. A
+        // sort through a 3-row block is refused; a 1-row block moves with its
+        // row, `ref` and all.
+        let cse = |r: &str| format!(r#"<f t="array" ref="{r}">SUM(B1:B3)</f><v>6</v>"#);
+        let rows = format!(
+            concat!(
+                r#"<row r="1"><c r="A1"><v>9</v></c><c r="B1"><v>1</v></c><c r="D1">{}</c></row>"#,
+                r#"<row r="2"><c r="A2"><v>1</v></c><c r="B2"><v>2</v></c></row>"#,
+                r#"<row r="3"><c r="A3"><v>5</v></c><c r="B3"><v>3</v></c></row>"#,
+            ),
+            cse("D1:D3")
+        );
+        let mut pkg = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(0, 3).unwrap().spill,
+            Some((3, 1))
+        );
+        assert!(crate::edit::sort_cuts_spill(&pkg.workbook, 0, 0, 2));
+        assert_eq!(
+            crate::edit::sort_rows(&mut pkg.workbook, 0, 0, 2, &[(0, true)]),
+            0
+        );
+        let ws = saved_sheet1(&pkg);
+        assert!(
+            ws.contains(r#"<c r="D1"><f t="array" ref="D1:D3">"#),
+            "{ws}"
+        );
+
+        let rows = rows.replace(&cse("D1:D3"), &cse("D1:F1"));
+        let mut pkg = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(0, 3).unwrap().spill,
+            Some((1, 3))
+        );
+        assert_eq!(
+            crate::edit::sort_rows(&mut pkg.workbook, 0, 0, 2, &[(0, true)]),
+            3
+        );
+        let ws = saved_sheet1(&pkg);
+        assert!(
+            ws.contains(r#"<c r="D3"><f t="array" ref="D3:F3">"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn a_sorted_one_row_frozen_array_keeps_its_block() {
+        // #840: a sort moves a one-row frozen array with its row, `ref` and
+        // all, so its block is still its own there: Delete on a cached cell
+        // is a no-op, and save writes the block at its new row.
+        let rows = concat!(
+            r#"<row r="1"><c r="A1"><v>9</v></c><c r="E1" cm="1"><f t="array" ref="E1:G1">_xlfn.PIVOTBY(A1,4)</f><v>7</v></c><c r="F1"><v>8</v></c><c r="G1"><v>9</v></c></row>"#,
+            r#"<row r="2"><c r="A2"><v>1</v></c></row>"#,
+            r#"<row r="3"><c r="A3"><v>5</v></c></row>"#,
+        );
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        assert_eq!(
+            crate::edit::sort_rows(&mut pkg.workbook, 0, 0, 2, &[(0, true)]),
+            3
+        );
+        let e3 = pkg.workbook.sheets[0].cell(2, 4).unwrap();
+        assert_eq!(e3.spill, Some((1, 3)));
+        assert!(e3.f_attrs.as_deref().unwrap().contains(r#"ref="E3:G3""#));
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 2, 5), Cell::default());
+        let at = |c: u32| pkg.workbook.sheets[0].cell(2, c).map(|cl| cl.value.clone());
+        assert_eq!(at(5), Some(CellValue::Number(8.0)));
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(2, 4).unwrap().spill,
+            Some((1, 3))
+        );
+        let ws = saved_sheet1(&pkg);
+        assert!(ws.contains(r#"<f t="array" ref="E3:G3">"#), "{ws}");
+        assert!(ws.contains(r#"<c r="F3"><v>8</v></c>"#), "{ws}");
     }
 
     #[test]
@@ -10323,6 +12088,32 @@ b",
             "{ws}"
         );
         assert!(ws.contains(r#"<c r="B2"><f>A2*2</f><v>18</v></c>"#), "{ws}");
+    }
+
+    #[test]
+    fn a_pasted_value_keeps_its_vm_and_a_pasted_formula_drops_it() {
+        // #840 (plan-paste-vm): a value pasted elsewhere is the same value,
+        // so its value metadata (E1, a rich value) comes along, as Excel
+        // copies a picture in a cell. A formula pasted elsewhere is typed
+        // there: B1's `vm` describes B1's result, not the copy's, so it goes
+        // even though the copy evaluates to the same 6.
+        let rows = r#"<row r="1"><c r="A1"><v>3</v></c><c r="B1" vm="1"><f>A1*2</f><v>6</v></c><c r="E1" t="e" vm="2"><v>#VALUE!</v></c></row>"#;
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        let sheet = &pkg.workbook.sheets[0];
+        let b1 = sheet.cell(0, 1).unwrap().clone();
+        let e1 = sheet.cell(0, 4).unwrap().clone();
+        eng.paste_block(&mut pkg.workbook, 0, (2, 1), &[vec![b1]]);
+        eng.paste_block(&mut pkg.workbook, 0, (2, 5), &[vec![e1]]);
+        let ws = saved_sheet1(&pkg);
+        assert!(ws.contains(r#"<c r="B3"><f>A1*2</f><v>6</v></c>"#), "{ws}");
+        assert!(
+            ws.contains(r#"<c r="F3" t="e" vm="2"><v>#VALUE!</v></c>"#),
+            "{ws}"
+        );
+        // The sources keep theirs.
+        assert!(ws.contains(r#"<c r="B1" vm="1">"#), "{ws}");
     }
 
     #[test]
@@ -10412,6 +12203,65 @@ b",
         let ws = saved_sheet1(&pkg);
         assert!(
             ws.contains(r#"<c r="D1"><f t="array" ref="D1:D3">SUM(A1:A5*A1:A5)</f><v>165</v></c>"#),
+            "{ws}"
+        );
+    }
+
+    /// A legacy CSE block over D1:D3 (no `cm`) with a 1x1 result, as Excel
+    /// saves it: the result repeated over the block. A1:A3 = 1, 2, 3.
+    const CSE_SUM_ROWS: &str = concat!(
+        r#"<row r="1"><c r="A1"><v>1</v></c><c r="D1"><f t="array" ref="D1:D3">SUM(A1:A3)</f><v>6</v></c></row>"#,
+        r#"<row r="2"><c r="A2"><v>2</v></c><c r="D2"><v>6</v></c></row>"#,
+        r#"<row r="3"><c r="A3"><v>3</v></c><c r="D3"><v>6</v></c></row>"#,
+    );
+
+    /// #785, as ruled for #775: a legacy CSE block owns its whole `ref`, as in
+    /// Excel. A plain value or a styled blank typed into part of it is
+    /// refused; a formula blocks it (the anchor keeps its own value) but never
+    /// shrinks its saved `ref`; an untouched block keeps its ref.
+    #[test]
+    fn content_typed_inside_a_cse_block_never_shrinks_its_saved_ref() {
+        const BLOCK: &str = r#"<f t="array" ref="D1:D3">SUM(A1:A3)</f>"#;
+        let edited = |at: (u32, u32), cell: Cell| {
+            let mut pkg = load_xlsx(&cell_meta_fixture(CSE_SUM_ROWS)).unwrap();
+            let mut eng = crate::engine::Engine::new(&pkg.workbook);
+            eng.recalc_all(&mut pkg.workbook);
+            eng.set_cell(&mut pkg.workbook, (0, at.0, at.1), cell);
+            saved_sheet1(&pkg)
+        };
+
+        let ws = edited((1, 3), Cell::formula("A1+1"));
+        assert!(
+            ws.contains(r#"<c r="D1"><f t="array" ref="D1:D3">SUM(A1:A3)</f><v>6</v></c>"#),
+            "{ws}"
+        );
+        assert!(ws.contains(r#"<c r="D2"><f>A1+1</f><v>2</v></c>"#), "{ws}");
+
+        let ws = edited((2, 3), Cell::number(5.0));
+        assert!(
+            ws.contains(r#"<c r="D1"><f t="array" ref="D1:D3">SUM(A1:A3)</f><v>6</v></c>"#),
+            "{ws}"
+        );
+        assert!(ws.contains(r#"<c r="D3"><v>6</v></c>"#), "{ws}");
+
+        let styled = Cell {
+            style: 1,
+            ..Cell::default()
+        };
+        let ws = edited((1, 3), styled);
+        assert!(ws.contains(BLOCK), "{ws}");
+
+        // Recalculated but untouched: the block stays.
+        let mut pkg = load_xlsx(&cell_meta_fixture(CSE_SUM_ROWS)).unwrap();
+        rebuild(&mut pkg);
+        let ws = saved_sheet1(&pkg);
+        assert!(ws.contains(BLOCK), "{ws}");
+
+        // Without an engine, the block saves as it was loaded.
+        let pkg = load_xlsx(&cell_meta_fixture(CSE_SUM_ROWS)).unwrap();
+        let ws = saved_sheet1(&pkg);
+        assert!(
+            ws.contains(r#"<c r="D1"><f t="array" ref="D1:D3">SUM(A1:A3)</f><v>6</v></c>"#),
             "{ws}"
         );
     }
@@ -10524,8 +12374,9 @@ b",
     #[test]
     fn relocated_cse_clone_blocked_by_a_neighbour_writes_its_own_anchor_ref() {
         // Typed at F5 (#724), its array result makes it a dynamic array.
-        // The same for a 3x1 result blocked by F6 (#SPILL!). The clone is
-        // taken with no spill extent of its own, so F6 counts as foreign.
+        // The same for a 3x1 result blocked by F6 (#SPILL!). The clone
+        // carries the source's spill extent; the engine drops it (#777), so
+        // F6 counts as foreign.
         let rows = CSE_ROWS.replace(
             r#"<c r="D3"><v>6</v></c></row>"#,
             r#"<c r="D3"><v>6</v></c></row><row r="6"><c r="F6" t="inlineStr"><is><t>x</t></is></c></row>"#,
@@ -10533,8 +12384,8 @@ b",
         let mut pkg = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
         let mut eng = crate::engine::Engine::new(&pkg.workbook);
         eng.recalc_all(&mut pkg.workbook);
-        let mut clone = pkg.workbook.sheets[0].cell(0, 3).cloned().unwrap();
-        clone.spill = None;
+        let clone = pkg.workbook.sheets[0].cell(0, 3).cloned().unwrap();
+        assert!(clone.spill.is_some());
         eng.set_cell(&mut pkg.workbook, (0, 4, 5), clone);
         let ws = saved_sheet1(&pkg);
         let f5 = saved_cell(&ws, "F5");
@@ -10591,6 +12442,26 @@ b",
         assert!(
             ws.contains(r#"<c r="D6"><f t="array" ref="D6">SUM(A1:A5*A1:A5)</f><v>165</v></c>"#),
             "{ws}"
+        );
+    }
+
+    #[test]
+    fn a_row_delete_inside_a_cse_block_saves_the_shrunk_ref_before_any_recalc() {
+        // The writer takes `ref` from the anchor's spill extent, so that
+        // extent must follow the edit even when nothing recalculates first.
+        let rows = format!(r#"{CSE_ROWS}<row r="4"><c r="D4"><v>99</v></c></row>"#);
+        let mut pkg = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
+        crate::edit::delete_rows(&mut pkg.workbook, 0, 1, 1);
+        let ws = saved_sheet1(&pkg);
+        let d1 = saved_cell(&ws, "D1");
+        assert!(
+            d1.contains(r#"<f t="array" ref="D1:D2">A1:A2*2</f>"#),
+            "{d1}"
+        );
+        rebuild(&mut pkg);
+        assert_eq!(
+            col_d(&pkg, 0..3),
+            [2.0, 6.0, 99.0].map(CellValue::Number).to_vec()
         );
     }
 
@@ -10684,8 +12555,8 @@ b",
     #[test]
     fn insert_row_above_a_loaded_dynamic_array_shifts_its_text_and_ref() {
         // A `cm` array loaded with its `t="array"` `f_attrs` shifts the same
-        // way. Its text is reprinted, which drops the `_xlfn._xlws.` prefix:
-        // the loss every shifted formula already has (a separate follow-up).
+        // way. Its text is reprinted without the `_xlfn._xlws.` prefix, and
+        // the save puts it back (#776).
         let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SORT_ANCHOR))).unwrap();
         rebuild(&mut pkg);
         crate::edit::insert_rows(&mut pkg.workbook, 0, 0, 1);
@@ -10693,7 +12564,7 @@ b",
         let ws = saved_sheet1(&pkg);
         assert!(
             ws.contains(
-                r#"<c r="D2" cm="1"><f t="array" ref="D2:D6">SORT(A2:A6,,-1)</f><v>9</v></c>"#
+                r#"<c r="D2" cm="1"><f t="array" ref="D2:D6">_xlfn._xlws.SORT(A2:A6,,-1)</f><v>9</v></c>"#
             ),
             "{ws}"
         );
@@ -12292,6 +14163,192 @@ mod kind_tests {
         assert!(!wb.contains("Macro1") && !wb.contains("Dialog1"), "{wb}");
     }
 
+    /// [`mixed_xlm_book`] with its workbook part at `wb/book.xml` (and its
+    /// rels at `wb/_rels/book.xml.rels`), where only the package rels say
+    /// to look.
+    fn relocated_xlm_book() -> SheetPackage {
+        let parts: Vec<(String, Vec<u8>)> = mixed_xlm_book()
+            .parts
+            .into_iter()
+            .map(|(name, bytes)| {
+                let text = || String::from_utf8_lossy(&bytes).into_owned();
+                match name.as_str() {
+                    "xl/workbook.xml" => ("wb/book.xml".to_string(), bytes),
+                    "xl/_rels/workbook.xml.rels" => (
+                        "wb/_rels/book.xml.rels".to_string(),
+                        text().replace("Target=\"", "Target=\"../xl/").into_bytes(),
+                    ),
+                    "_rels/.rels" => (
+                        name,
+                        text()
+                            .replace("xl/workbook.xml", "wb/book.xml")
+                            .into_bytes(),
+                    ),
+                    "[Content_Types].xml" => (
+                        name,
+                        text()
+                            .replace("/xl/workbook.xml", "/wb/book.xml")
+                            .into_bytes(),
+                    ),
+                    _ => (name, bytes),
+                }
+            })
+            .collect();
+        let pkg = load_xlsx(&write_zip(&parts)).expect("the relocated fixture loads");
+        assert!(pkg.part("xl/workbook.xml").is_none());
+        assert_eq!(pkg.workbook.sheets.len(), 4);
+        pkg
+    }
+
+    /// #789: a workbook part outside `xl/` is found through the package
+    /// rels by the sheet removal and the Excel 4.0 macro paths.
+    #[test]
+    fn remove_sheet_follows_workbook_part_from_rels() {
+        let mut pkg = relocated_xlm_book();
+        assert!(pkg.has_macro_names());
+        assert!(
+            pkg.macro_features()
+                .contains(&"Excel 4.0 function stored in defined names")
+        );
+
+        assert!(pkg.remove_sheet(1));
+        let wb = part_text(&pkg, "wb/book.xml");
+        assert_eq!(wb.matches("<sheet ").count(), 3, "{wb}");
+        assert!(!wb.contains("name=\"Macro1\""), "{wb}");
+        let rels = part_text(&pkg, "wb/_rels/book.xml.rels");
+        assert!(!rels.contains("macrosheets"), "{rels}");
+        assert!(rels.contains("dialogsheets"), "{rels}");
+
+        let mut copy = relocated_xlm_book();
+        assert!(copy.remove_excel4_macros());
+        let wb = part_text(&copy, "wb/book.xml");
+        assert_eq!(wb.matches("<sheet ").count(), 2, "{wb}");
+        assert!(!wb.contains("Macro1") && !wb.contains("Dialog1"), "{wb}");
+        assert!(
+            !wb.contains("CellColor") && !wb.contains("Auto_Open"),
+            "{wb}"
+        );
+        assert!(wb.contains("name=\"Total\""), "{wb}");
+        let rels = part_text(&copy, "wb/_rels/book.xml.rels");
+        assert!(
+            !rels.contains("macrosheets") && !rels.contains("dialogsheets"),
+            "{rels}"
+        );
+        assert!(!copy.has_macro_names() && !copy.has_macro_sheets());
+    }
+
+    /// #789: a macro-free save turns worksheet formulas that name a removed
+    /// Excel 4.0 macro sheet into `#REF!`, leaves every other formula's text
+    /// as it was, and leaves the open package alone.
+    #[test]
+    fn macro_free_save_turns_macro_sheet_refs_into_ref_errors() {
+        let mut pkg = mixed_xlm_book();
+        let data = &mut pkg.workbook.sheets[0];
+        let gone = [
+            (1, "Macro1!A1+1", "#REF!+1"),
+            (2, "SUM(macro1!A1:B2)*2", "SUM(#REF!)*2"),
+            (3, "SUM(Macro1!A:A)", "SUM(#REF!)"),
+            (4, "SUM(Report!A1,Dialog1!$B$2)", "SUM(Report!A1,#REF!)"),
+            // A 3-D span with a removed end sheet.
+            (5, "SUM(Data:Macro1!A1)", "SUM(#REF!)"),
+        ];
+        for (r, src, _) in gone {
+            data.set_cell(r, 0, Cell::formula(src));
+        }
+        let kept = [
+            (1, "Report!A1*2"),
+            // Macro1 lies between Data and Report: it just leaves the span.
+            (2, "SUM(Data:Report!A1)"),
+            (3, "IF(A1=1,\"Macro1!A1\",B1)"),
+            (4, "XMacro1!A1"),
+        ];
+        for (r, src) in kept {
+            data.set_cell(r, 1, Cell::formula(src));
+        }
+        let mut array = Cell::formula("Macro1!A1:A2");
+        array.f_attrs = Some(" t=\"array\" ref=\"C1:C2\"".into());
+        array.spill = Some((2, 1));
+        data.set_cell(0, 2, array);
+        // The block's other cell, holding a value computed from Macro1.
+        data.set_cell(1, 2, Cell::number(7.0));
+        // Error handling sees the #REF!, so the cached value is its answer.
+        let handled = [
+            (
+                1,
+                "IFERROR(Macro1!A1,0)",
+                "IFERROR(#REF!,0)",
+                CellValue::Number(0.0),
+            ),
+            (
+                2,
+                "ISERROR(Macro1!A1)",
+                "ISERROR(#REF!)",
+                CellValue::Bool(true),
+            ),
+            (
+                3,
+                "Report!A1*0+Macro1!A1",
+                "Report!A1*0+#REF!",
+                CellValue::Error("#REF!".into()),
+            ),
+        ];
+        for (r, src, _, _) in &handled {
+            data.set_cell(*r, 3, Cell::formula(src));
+        }
+        let formulas = |pkg: &SheetPackage| -> Vec<(u32, u32, Option<String>)> {
+            let mut out: Vec<_> = pkg.workbook.sheets[0]
+                .cells
+                .iter()
+                .map(|(&(r, c), cell)| (r, c, cell.formula.clone()))
+                .collect();
+            out.sort();
+            out
+        };
+        let before = (formulas(&pkg), pkg.workbook.sheets.len());
+
+        for kind in [SpreadsheetKind::Workbook, SpreadsheetKind::Template] {
+            let out = roundtrip(&pkg, kind);
+            let data = &out.workbook.sheets[0];
+            for (r, _, want) in gone {
+                let cell = data.cell(r, 0).unwrap();
+                assert_eq!(cell.formula.as_deref(), Some(want), "row {r}");
+                assert_eq!(cell.value, CellValue::Error("#REF!".into()), "row {r}");
+            }
+            for (r, src) in kept {
+                assert_eq!(data.cell(r, 1).unwrap().formula.as_deref(), Some(src));
+            }
+            let array = data.cell(0, 2).unwrap();
+            assert_eq!(array.formula.as_deref(), Some("#REF!"));
+            assert!(array.f_attrs.as_deref().is_some_and(is_array_f));
+            assert_eq!(array.value, CellValue::Error("#REF!".into()));
+            assert_eq!(
+                data.cell(1, 2).unwrap().value,
+                CellValue::Error("#REF!".into()),
+                "the array's block follows its anchor"
+            );
+            for (r, _, want, value) in &handled {
+                let cell = data.cell(*r, 3).unwrap();
+                assert_eq!(cell.formula.as_deref(), Some(*want), "row {r}");
+                assert_eq!(&cell.value, value, "row {r}");
+            }
+        }
+        assert_eq!(
+            (formulas(&pkg), pkg.workbook.sheets.len()),
+            before,
+            "the open workbook keeps its formulas"
+        );
+
+        // A quoted name is the same sheet; a macro-enabled save keeps it all.
+        let mut pkg = xlm_book(&[("Data", "work"), ("Macro 1", "macro"), ("Report", "work")]);
+        pkg.workbook.sheets[0].set_cell(1, 0, Cell::formula("'Macro 1'!A1+1"));
+        let out = roundtrip(&pkg, SpreadsheetKind::Workbook);
+        let cell = out.workbook.sheets[0].cell(1, 0).unwrap();
+        assert_eq!(cell.formula.as_deref(), Some("#REF!+1"));
+        let out = roundtrip(&pkg, SpreadsheetKind::MacroWorkbook);
+        let cell = out.workbook.sheets[0].cell(1, 0).unwrap();
+        assert_eq!(cell.formula.as_deref(), Some("'Macro 1'!A1+1"));
+    }
+
     #[test]
     fn macro_features_names_everything_a_macro_free_file_loses() {
         assert!(new_xlsx().macro_features().is_empty());
@@ -12319,7 +14376,7 @@ mod print_setup_tests {
     /// A workbook of `sheets` (name, worksheet body inside `<worksheet>`; None
     /// leaves the sheet's part out of the package) with `names` as the
     /// `<definedNames>` content.
-    fn book(names: &str, sheets: &[(&str, Option<&str>)]) -> Vec<u8> {
+    pub(super) fn book(names: &str, sheets: &[(&str, Option<&str>)]) -> Vec<u8> {
         let mut sheet_els = String::new();
         let mut rels = String::new();
         let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
@@ -12689,6 +14746,59 @@ mod print_setup_tests {
             )),
             "{ws}"
         );
+    }
+
+    const DATA: &str = r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#;
+    const FROZEN: &str =
+        r#"<pane xSplit="1" ySplit="2" topLeftCell="B3" activePane="bottomRight" state="frozen"/>"#;
+
+    /// Load `body` as the one sheet, check its freeze, and check a plain save
+    /// leaves its `<sheetViews>` and `<customSheetViews>` as they were.
+    fn freeze_of_and_kept(body: &str, views: &[&str]) -> (u32, u32) {
+        let pkg = load_xlsx(&book("", &[("Report", Some(body))])).unwrap();
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        for v in views {
+            assert!(ws.contains(v), "{ws}");
+        }
+        pkg.workbook.sheets[0].freeze
+    }
+
+    #[test]
+    fn a_custom_views_pane_is_not_the_sheets_freeze() {
+        // The sheet's own view is unfrozen; a custom view freezes two rows
+        // and a column. Read as the sheet's, a save would freeze the sheet.
+        let own = r#"<sheetViews><sheetView workbookViewId="0"/></sheetViews>"#;
+        let custom = format!(
+            r#"<customSheetViews><customSheetView guid="{{00000000-0000-0000-0000-000000000001}}">{FROZEN}</customSheetView></customSheetViews>"#
+        );
+        let body = format!("{own}{DATA}{custom}");
+        assert_eq!(freeze_of_and_kept(&body, &[own, &custom]), (0, 0));
+    }
+
+    #[test]
+    fn a_second_sheet_views_pane_is_not_the_sheets_freeze() {
+        // A second `<sheetView>` is another workbook window's view.
+        let views = format!(
+            r#"<sheetViews><sheetView workbookViewId="0"></sheetView><sheetView workbookViewId="1">{FROZEN}</sheetView></sheetViews>"#
+        );
+        let body = format!("{views}{DATA}");
+        assert_eq!(freeze_of_and_kept(&body, &[&views]), (0, 0));
+
+        // The first view frozen, the second split differently: the first's.
+        let views = format!(
+            r#"<sheetViews><sheetView workbookViewId="0">{FROZEN}</sheetView><sheetView workbookViewId="1"><pane ySplit="5" topLeftCell="A6" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>"#
+        );
+        let body = format!("{views}{DATA}");
+        assert_eq!(freeze_of_and_kept(&body, &[&views]), (2, 1));
+    }
+
+    #[test]
+    fn a_self_closing_first_sheet_view_does_not_take_the_second_views_pane() {
+        let views = format!(
+            r#"<sheetViews><sheetView workbookViewId="0"/><sheetView workbookViewId="1">{FROZEN}</sheetView></sheetViews>"#
+        );
+        let body = format!("{views}{DATA}");
+        assert_eq!(freeze_of_and_kept(&body, &[&views]), (0, 0));
     }
 
     #[test]
@@ -13091,6 +15201,41 @@ mod print_setup_tests {
         // Saved again: already there, so not written twice.
         let (_, again) = saved(&re, "xl/workbook.xml");
         assert_eq!(names_el(&again), names_el(&wb));
+    }
+
+    #[test]
+    fn defined_names_save_in_file_spelling() {
+        // #776: a definition written from the model gets its prefixes; one
+        // loaded in file spelling is left as it was.
+        let names = concat!(
+            r#"<definedName name="Rate">Report!$A$5</definedName>"#,
+            r#"<definedName name="Top">_xlfn.SEQUENCE(2)</definedName>"#,
+        );
+        let mut pkg = report(names, "");
+        pkg.workbook
+            .defined_names
+            .iter_mut()
+            .find(|d| d.name == "Rate")
+            .unwrap()
+            .formula = "LAMBDA(x,x*2)".into();
+        pkg.workbook
+            .defined_names
+            .push(name("Seq", None, "SEQUENCE(3)"));
+        let (_, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(
+            wb.contains(
+                r#"<definedName name="Rate">_xlfn.LAMBDA(_xlpm.x,_xlpm.x*2)</definedName>"#
+            ),
+            "{wb}"
+        );
+        assert!(
+            wb.contains(r#"<definedName name="Top">_xlfn.SEQUENCE(2)</definedName>"#),
+            "{wb}"
+        );
+        assert!(
+            wb.contains(r#"<definedName name="Seq">_xlfn.SEQUENCE(3)</definedName>"#),
+            "{wb}"
+        );
     }
 
     #[test]
@@ -13835,6 +15980,115 @@ mod ct_worksheet_order_tests {
     }
 
     #[test]
+    fn can_add_chart_refuses_a_part_damaged_where_drawing_goes() {
+        // Asked up front (docxy, when the user inserts a chart it writes at
+        // save), it answers as add_chart then does.
+        let mut pkg = loaded(&format!("{ROWS}{MARGINS}{STOPPED_TAIL}"));
+        let parts = pkg.parts.clone();
+        assert!(!pkg.can_add_chart(0));
+        assert!(!pkg.add_chart(0, (0, 3), (10, 8), &chart()));
+        assert_eq!(pkg.parts, parts);
+        assert!(!pkg.can_add_chart(1), "no such sheet");
+
+        let mut pkg = loaded(&format!("{ROWS}{MARGINS}"));
+        assert!(pkg.can_add_chart(0));
+        assert!(pkg.add_chart(0, (0, 3), (10, 8), &chart()));
+        // A second chart joins the drawing part the first made.
+        assert!(pkg.can_add_chart(0));
+    }
+
+    const DRAWING_RELS: &str = "xl/drawings/_rels/drawing1.xml.rels";
+    const SHEET_RELS: &str = "xl/worksheets/_rels/sheet1.xml.rels";
+
+    /// A sheet that already holds one chart, so the next joins its drawing.
+    fn with_a_chart() -> SheetPackage {
+        let mut pkg = loaded(&format!("{ROWS}{MARGINS}"));
+        assert!(pkg.add_chart(0, (0, 3), (10, 8), &chart()));
+        let pkg = load_xlsx(&save_xlsx(&pkg)).expect("reload");
+        assert!(pkg.chart_host(0).is_some());
+        pkg
+    }
+
+    /// `name` cut short just before its `</Relationships>`.
+    fn truncate_rels(pkg: &mut SheetPackage, name: &str) {
+        let xml = String::from_utf8(pkg.part(name).unwrap().to_vec()).unwrap();
+        let cut = xml.rfind("</Relationships>").expect("a rels part");
+        pkg.set_part(name, xml.as_bytes()[..cut].to_vec());
+    }
+
+    #[test]
+    fn can_add_chart_refuses_a_broken_drawing_rels_part() {
+        let mut pkg = with_a_chart();
+        truncate_rels(&mut pkg, DRAWING_RELS);
+        assert!(!pkg.can_add_chart(0));
+    }
+
+    #[test]
+    fn can_add_chart_refuses_a_broken_worksheet_rels_part() {
+        // No drawing yet, so the worksheet needs a new rel to one.
+        let mut pkg = loaded(&format!("{ROWS}{MARGINS}"));
+        pkg.set_part(
+            SHEET_RELS,
+            format!(r#"<Relationships xmlns="{R}"/>"#).into_bytes(),
+        );
+        assert!(!pkg.can_add_chart(0));
+    }
+
+    #[test]
+    fn a_broken_worksheet_rels_part_that_already_names_the_drawing_takes_a_chart() {
+        // The rel to the host drawing is there to reuse; nothing new goes in.
+        let mut pkg = with_a_chart();
+        truncate_rels(&mut pkg, SHEET_RELS);
+        assert!(pkg.can_add_chart(0));
+        assert!(pkg.add_chart(0, (12, 3), (20, 8), &chart()));
+        let drawing =
+            String::from_utf8(pkg.part("xl/drawings/drawing1.xml").unwrap().to_vec()).unwrap();
+        assert_eq!(drawing.matches("<xdr:graphicFrame").count(), 2, "{drawing}");
+    }
+
+    #[test]
+    fn add_chart_leaves_the_package_alone_when_a_rels_part_is_broken() {
+        let mut pkg = with_a_chart();
+        truncate_rels(&mut pkg, DRAWING_RELS);
+        let parts = pkg.parts.clone();
+        assert!(!pkg.add_chart(0, (12, 3), (20, 8), &chart()));
+        assert_eq!(pkg.parts, parts);
+
+        let mut pkg = loaded(&format!("{ROWS}{MARGINS}"));
+        pkg.set_part(SHEET_RELS, b"<Relationships xmlns=\"x\">".to_vec());
+        let parts = pkg.parts.clone();
+        assert!(!pkg.add_chart(0, (0, 3), (10, 8), &chart()));
+        assert_eq!(pkg.parts, parts);
+    }
+
+    #[test]
+    fn a_new_drawings_orphaned_rels_part_that_cannot_take_the_chart_refuses_it() {
+        // drawing1.xml is free, but a rels part for it is left behind,
+        // self-closed: the chart's rel could not go in.
+        let mut pkg = loaded(&format!("{ROWS}{MARGINS}"));
+        pkg.set_part(
+            DRAWING_RELS,
+            format!(r#"<Relationships xmlns="{R}"/>"#).into_bytes(),
+        );
+        assert!(pkg.part("xl/drawings/drawing1.xml").is_none());
+        let parts = pkg.parts.clone();
+        assert!(!pkg.can_add_chart(0));
+        assert!(!pkg.add_chart(0, (0, 3), (10, 8), &chart()));
+        assert_eq!(pkg.parts, parts);
+    }
+
+    #[test]
+    fn a_sheet_with_no_part_entry_takes_no_chart() {
+        // The model has the sheet, the package no part name for it.
+        let mut pkg = loaded(&format!("{ROWS}{MARGINS}"));
+        pkg.sheet_parts.pop();
+        let parts = pkg.parts.clone();
+        assert!(!pkg.can_add_chart(0));
+        assert!(!pkg.add_chart(0, (0, 3), (10, 8), &chart()));
+        assert_eq!(pkg.parts, parts);
+    }
+
+    #[test]
     fn an_add_with_no_known_position_is_refused_and_changes_nothing() {
         // The walk stops at headerFooter; drawing, legacyDrawing and
         // tableParts rank after it, where the part can't be read.
@@ -14287,5 +16541,1101 @@ mod strict_tests {
             let xml = String::from_utf8_lossy(bytes);
             assert!(!xml.contains("purl.oclc.org"), "{name}: {xml}");
         }
+    }
+}
+
+/// Children the writer adds to workbook.xml land at their CT_Workbook
+/// position, so Excel opens the file without a repair (#773).
+#[cfg(test)]
+mod ct_workbook_order_tests {
+    use super::*;
+
+    const NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const WB: &str = "xl/workbook.xml";
+
+    /// A new workbook with a Region/Sales range on Sheet1, and its
+    /// workbook.xml replaced by `workbook` when given.
+    fn with_data(workbook: Option<String>) -> SheetPackage {
+        let mut pkg = new_xlsx();
+        if let Some(wb) = workbook {
+            pkg.set_part(WB, wb.into_bytes());
+        }
+        let rows = [("Region", None), ("East", Some(10.0)), ("West", Some(30.0))];
+        for (r, (region, sales)) in rows.iter().enumerate() {
+            let r = r as u32;
+            pkg.workbook.sheets[0].set_cell(r, 0, Cell::text(region));
+            let sales = sales.map_or_else(|| Cell::text("Sales"), Cell::number);
+            pkg.workbook.sheets[0].set_cell(r, 1, sales);
+        }
+        pkg
+    }
+
+    fn pivot(pkg: &mut SheetPackage) {
+        add_default_pivot(pkg).expect("add_pivot");
+    }
+
+    /// A Region/Sales pivot from Sheet1!A1:B3, placed at A6.
+    fn add_default_pivot(pkg: &mut SheetPackage) -> Option<usize> {
+        let measure = crate::pivot::DataField {
+            name: "Sum of Sales".into(),
+            field: 1,
+            agg: crate::frame::Agg::Sum,
+        };
+        pkg.add_pivot(
+            crate::pivot::PivotSource::Range {
+                sheet: "Sheet1".into(),
+                rect: (0, 0, 2, 1),
+            },
+            vec!["Region".into(), "Sales".into()],
+            measure,
+            0,
+            (5, 0),
+        )
+    }
+
+    fn part(pkg: &SheetPackage, name: &str) -> String {
+        String::from_utf8(pkg.part(name).unwrap().to_vec()).unwrap()
+    }
+
+    /// `a` stands before `b` in `xml`.
+    fn before(xml: &str, a: &str, b: &str) -> bool {
+        match (xml.find(a), xml.find(b)) {
+            (Some(i), Some(j)) => i < j,
+            _ => false,
+        }
+    }
+
+    fn workbook(inner: &str) -> String {
+        format!(r#"<?xml version="1.0"?><workbook xmlns="{NS}" xmlns:r="{R}">{inner}</workbook>"#)
+    }
+
+    const SHEETS: &str = r#"<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>"#;
+
+    #[test]
+    fn add_pivot_puts_pivot_caches_after_defined_names_and_calc_pr() {
+        let names =
+            r#"<definedNames><definedName name="Total">Sheet1!$B$2</definedName></definedNames>"#;
+        let calc = r#"<calcPr calcId="191029"/>"#;
+        let mut pkg = with_data(Some(workbook(&format!("{SHEETS}{names}{calc}"))));
+        pivot(&mut pkg);
+        let wb = part(&pkg, WB);
+        assert!(
+            wb.contains(&format!("{calc}<pivotCaches><pivotCache cacheId=")),
+            "{wb}"
+        );
+        assert!(before(&wb, "</pivotCaches>", "</workbook>"), "{wb}");
+    }
+
+    #[test]
+    fn add_pivot_puts_pivot_caches_between_custom_workbook_views_and_ext_lst() {
+        let views = r#"<customWorkbookViews><customWorkbookView name="Mine" guid="{00000000-0000-0000-0000-000000000001}" windowWidth="800" windowHeight="600" activeSheetId="1"/></customWorkbookViews>"#;
+        // An unknown child (x15ac:absPath's wrapper) is not an anchor.
+        let alt = r#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><mc:Choice Requires="x15"/></mc:AlternateContent>"#;
+        let tail = r#"<fileRecoveryPr repairLoad="1"/><extLst><ext uri="{x}"/></extLst>"#;
+        let mut pkg = with_data(Some(workbook(&format!(
+            r#"{alt}{SHEETS}<calcPr calcId="1"/>{views}{tail}"#
+        ))));
+        pivot(&mut pkg);
+        let wb = part(&pkg, WB);
+        assert!(wb.contains(&format!("{views}<pivotCaches>")), "{wb}");
+        assert!(wb.contains(&format!("</pivotCaches>{tail}")), "{wb}");
+    }
+
+    #[test]
+    fn add_pivot_prefixes_pivot_caches_on_a_prefixed_root() {
+        let wb = format!(
+            r#"<?xml version="1.0"?><x:workbook xmlns:x="{NS}" xmlns:r="{R}"><x:sheets><x:sheet name="Sheet1" sheetId="1" r:id="rId1"/></x:sheets><x:calcPr calcId="1"/><x:extLst/></x:workbook>"#
+        );
+        let mut pkg = with_data(Some(wb));
+        pivot(&mut pkg);
+        let wb = part(&pkg, WB);
+        assert!(
+            wb.contains(r#"<x:calcPr calcId="1"/><x:pivotCaches><x:pivotCache cacheId="#),
+            "{wb}"
+        );
+        assert!(wb.contains("</x:pivotCaches><x:extLst/>"), "{wb}");
+        assert!(!wb.contains("<pivotCache"), "{wb}");
+    }
+
+    #[test]
+    fn add_pivot_appends_to_an_existing_pivot_caches() {
+        let caches = r#"<pivotCaches><pivotCache cacheId="7" r:id="rId9"/></pivotCaches>"#;
+        let mut pkg = with_data(Some(workbook(&format!("{SHEETS}{caches}"))));
+        pivot(&mut pkg);
+        let wb = part(&pkg, WB);
+        assert_eq!(wb.matches("<pivotCaches>").count(), 1, "{wb}");
+        assert!(
+            wb.contains(r#"<pivotCaches><pivotCache cacheId="7" r:id="rId9"/><pivotCache "#),
+            "{wb}"
+        );
+    }
+
+    #[test]
+    fn a_new_workbooks_pivot_and_formula_save_calc_pr_before_pivot_caches() {
+        // A new workbook has no <calcPr>: save adds one for the formula,
+        // and it must not land after the pivot's <pivotCaches>.
+        let mut pkg = with_data(None);
+        pkg.workbook.sheets[0].set_cell(3, 1, Cell::formula("SUM(B2:B3)"));
+        pivot(&mut pkg);
+        let saved = load_xlsx(&save_xlsx(&pkg)).expect("reload");
+        let wb = part(&saved, WB);
+        assert!(before(&wb, "<calcPr", "<pivotCaches>"), "{wb}");
+        assert_eq!(saved.workbook.pivots.len(), 1);
+    }
+
+    #[test]
+    fn ensure_full_calc_puts_calc_pr_before_ext_lst() {
+        let names =
+            r#"<definedNames><definedName name="T">Sheet1!$A$1</definedName></definedNames>"#;
+        let out = ensure_full_calc(&workbook(&format!("{SHEETS}{names}<extLst/>")));
+        assert!(
+            out.contains(&format!(
+                r#"{names}<calcPr calcId="0" fullCalcOnLoad="1"/><extLst/>"#
+            )),
+            "{out}"
+        );
+
+        let prefixed =
+            format!(r#"<x:workbook xmlns:x="{NS}"><x:sheets/><x:pivotCaches/></x:workbook>"#);
+        let out = ensure_full_calc(&prefixed);
+        assert!(
+            out.contains(r#"<x:sheets/><x:calcPr calcId="0" fullCalcOnLoad="1"/><x:pivotCaches/>"#),
+            "{out}"
+        );
+    }
+
+    /// Top-level `<…tag>` elements in `xml`, in any prefix.
+    fn count_local(xml: &str, tag: &str) -> usize {
+        let mut p = XmlParser::new(xml);
+        let mut n = 0;
+        loop {
+            match p.next() {
+                Event::Start if local(p.name()) == tag => n += 1,
+                Event::Eof => return n,
+                _ => {}
+            }
+        }
+    }
+
+    fn prefixed(inner: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?><x:workbook xmlns:x="{NS}" xmlns:r="{R}"><x:sheets><x:sheet name="Sheet1" sheetId="1" r:id="rId1"/></x:sheets>{inner}</x:workbook>"#
+        )
+    }
+
+    #[test]
+    fn a_prefixed_calc_pr_is_not_added_twice_at_save() {
+        let mut pkg = with_data(Some(prefixed(r#"<x:calcPr calcId="1"/>"#)));
+        pkg.workbook.sheets[0].set_cell(3, 1, Cell::formula("SUM(B2:B3)"));
+        let saved = load_xlsx(&save_xlsx(&pkg)).expect("reload");
+        let wb = part(&saved, WB);
+        assert_eq!(count_local(&wb, "calcPr"), 1, "{wb}");
+    }
+
+    #[test]
+    fn add_pivot_does_not_add_a_second_prefixed_pivot_caches() {
+        let caches = r#"<x:pivotCaches><x:pivotCache cacheId="7" r:id="rId9"/></x:pivotCaches>"#;
+        let mut pkg = with_data(Some(prefixed(caches)));
+        pivot(&mut pkg);
+        let wb = part(&pkg, WB);
+        assert_eq!(count_local(&wb, "pivotCaches"), 1, "{wb}");
+        // And the cache is registered in it, in its prefix.
+        assert_eq!(count_local(&wb, "pivotCache"), 2, "{wb}");
+        assert!(
+            wb.contains(
+                r#"<x:pivotCache cacheId="7" r:id="rId9"/><x:pivotCache cacheId="8" r:id="#
+            ),
+            "{wb}"
+        );
+        assert!(wb.contains("</x:pivotCaches></x:workbook>"), "{wb}");
+    }
+
+    #[test]
+    fn workbook_slot_is_present_for_a_tag_already_there() {
+        let wb = prefixed(r#"<x:calcPr calcId="1"/><x:extLst/>"#);
+        assert_eq!(workbook_slot(&wb, "calcPr"), WorkbookSlot::Present);
+        // Even out of order, past the place it would go.
+        let wb = prefixed(r#"<x:extLst/><x:calcPr calcId="1"/>"#);
+        assert_eq!(workbook_slot(&wb, "calcPr"), WorkbookSlot::Present);
+        assert!(matches!(
+            workbook_slot(&wb, "pivotCaches"),
+            WorkbookSlot::At(_, _)
+        ));
+    }
+
+    #[test]
+    fn a_prefixed_calc_pr_under_an_unprefixed_root_is_not_added_twice() {
+        let wb = workbook(&format!(r#"{SHEETS}<x:calcPr xmlns:x="{NS}" calcId="1"/>"#));
+        let mut pkg = with_data(Some(wb));
+        pkg.workbook.sheets[0].set_cell(3, 1, Cell::formula("SUM(B2:B3)"));
+        let saved = load_xlsx(&save_xlsx(&pkg)).expect("reload");
+        let wb = part(&saved, WB);
+        assert_eq!(count_local(&wb, "calcPr"), 1, "{wb}");
+    }
+
+    #[test]
+    fn add_pivot_does_not_add_a_second_self_closing_pivot_caches() {
+        let mut pkg = with_data(Some(workbook(&format!("{SHEETS}<pivotCaches/>"))));
+        pivot(&mut pkg);
+        let wb = part(&pkg, WB);
+        assert_eq!(count_local(&wb, "pivotCaches"), 1, "{wb}");
+        // Opened up to hold the entry.
+        assert!(
+            wb.contains(r#"<pivotCaches><pivotCache cacheId="1" r:id="#),
+            "{wb}"
+        );
+        assert!(wb.contains("/></pivotCaches></workbook>"), "{wb}");
+
+        let mut pkg = with_data(Some(prefixed(r#"<x:pivotCaches />"#)));
+        pivot(&mut pkg);
+        let wb = part(&pkg, WB);
+        assert_eq!(count_local(&wb, "pivotCaches"), 1, "{wb}");
+        assert!(
+            wb.contains(r#"<x:pivotCaches ><x:pivotCache cacheId="1" r:id="#),
+            "{wb}"
+        );
+        assert!(wb.contains("/></x:pivotCaches></x:workbook>"), "{wb}");
+    }
+
+    /// The namespace `r:` means on the first `<…pivotCache>` with `cacheId`.
+    fn r_of_new_entry(xml: &str, cache_id: &str) -> Option<String> {
+        let mut p = XmlParser::new(xml);
+        loop {
+            match p.next() {
+                Event::Start
+                    if local(p.name()) == "pivotCache" && p.attr("cacheId") == cache_id =>
+                {
+                    return p
+                        .namespace_attrs()
+                        .iter()
+                        .rev()
+                        .find(|a| a.name == "xmlns:r")
+                        .map(|a| a.value.to_string());
+                }
+                Event::Eof => return None,
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn add_pivot_binds_r_on_a_root_without_xmlns_r() {
+        let wb = format!(
+            r#"<?xml version="1.0"?><x:workbook xmlns:x="{NS}"><x:sheets><x:sheet name="Sheet1" sheetId="1" xmlns:r="{R}" r:id="rId1"/></x:sheets><x:calcPr calcId="1"/></x:workbook>"#
+        );
+        let mut pkg = with_data(Some(wb));
+        pivot(&mut pkg);
+        let wb = part(&pkg, WB);
+        assert_eq!(r_of_new_entry(&wb, "1").as_deref(), Some(R), "{wb}");
+        assert!(
+            wb.contains(&format!(r#"<x:workbook xmlns:x="{NS}" xmlns:r="{R}">"#)),
+            "declared on the root: {wb}"
+        );
+        assert_eq!(count_local(&wb, "pivotCache"), 1, "{wb}");
+    }
+
+    #[test]
+    fn add_pivot_binds_r_when_root_maps_r_elsewhere() {
+        let wb = format!(
+            r#"<?xml version="1.0"?><workbook xmlns="{NS}" xmlns:r="urn:other"><sheets><sheet name="Sheet1" sheetId="1" xmlns:r="{R}" r:id="rId1"/></sheets><pivotCaches><pivotCache cacheId="3" xmlns:r="{R}" r:id="rId7"/></pivotCaches></workbook>"#
+        );
+        let mut pkg = with_data(Some(wb));
+        pivot(&mut pkg);
+        let wb = part(&pkg, WB);
+        assert_eq!(r_of_new_entry(&wb, "4").as_deref(), Some(R), "{wb}");
+        // The root keeps its own binding.
+        assert!(wb.contains(r#"xmlns:r="urn:other">"#), "{wb}");
+        assert_eq!(wb.matches(r#"xmlns:r="urn:other""#).count(), 1, "{wb}");
+    }
+
+    #[test]
+    fn add_pivot_moves_a_misplaced_pivot_caches() {
+        // Where an older docxy put it: right after </sheets>, ahead of
+        // definedNames and calcPr.
+        let caches = r#"<pivotCaches><pivotCache cacheId="7" r:id="rId9"/></pivotCaches>"#;
+        let names =
+            r#"<definedNames><definedName name="T">Sheet1!$A$1</definedName></definedNames>"#;
+        let calc = r#"<calcPr calcId="1"/>"#;
+        let mut pkg = with_data(Some(workbook(&format!(
+            "{SHEETS}{caches}{names}{calc}<extLst/>"
+        ))));
+        pivot(&mut pkg);
+        let wb = part(&pkg, WB);
+        assert_eq!(count_local(&wb, "pivotCaches"), 1, "{wb}");
+        assert!(
+            wb.contains(&format!(
+                r#"{SHEETS}{names}{calc}<pivotCaches><pivotCache cacheId="7" r:id="rId9"/><pivotCache cacheId="8" r:id="#
+            )),
+            "{wb}"
+        );
+        assert!(wb.contains("</pivotCaches><extLst/>"), "{wb}");
+    }
+
+    #[test]
+    fn add_pivot_leaves_a_well_placed_pivot_caches_where_it_is() {
+        // An unknown child between it and extLst is no reason to move it.
+        let alt = r#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"/>"#;
+        let caches = r#"<pivotCaches><pivotCache cacheId="7" r:id="rId9"/></pivotCaches>"#;
+        let mut pkg = with_data(Some(workbook(&format!("{SHEETS}{caches}{alt}<extLst/>"))));
+        pivot(&mut pkg);
+        let wb = part(&pkg, WB);
+        assert!(
+            wb.contains(&format!("</pivotCaches>{alt}<extLst/>")),
+            "{wb}"
+        );
+    }
+
+    #[test]
+    fn add_pivot_refuses_a_broken_workbook_rels_part() {
+        let mut pkg = with_data(None);
+        let rels = part(&pkg, "xl/_rels/workbook.xml.rels");
+        let cut = rels.rfind("</Relationships>").unwrap();
+        pkg.set_part(
+            "xl/_rels/workbook.xml.rels",
+            rels.as_bytes()[..cut].to_vec(),
+        );
+        let parts = pkg.parts.clone();
+        assert!(add_default_pivot(&mut pkg).is_none());
+        assert_eq!(pkg.parts, parts);
+        assert!(pkg.workbook.pivots.is_empty());
+    }
+
+    #[test]
+    fn add_pivot_refuses_a_broken_destination_sheet_rels_part() {
+        let mut pkg = with_data(None);
+        pkg.set_part(
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            format!(r#"<Relationships xmlns="{R}"/>"#).into_bytes(),
+        );
+        let parts = pkg.parts.clone();
+        assert!(add_default_pivot(&mut pkg).is_none());
+        assert_eq!(pkg.parts, parts);
+        assert!(pkg.workbook.pivots.is_empty());
+    }
+
+    #[test]
+    fn ensure_full_calc_marks_a_prefixed_calc_pr() {
+        let out = ensure_full_calc(&prefixed(r#"<x:calcPr calcId="1"/>"#));
+        assert!(
+            out.contains(r#"<x:calcPr calcId="1" fullCalcOnLoad="1"/>"#),
+            "{out}"
+        );
+        assert_eq!(count_local(&out, "calcPr"), 1, "{out}");
+
+        // Open/close, under an unprefixed root.
+        let out = ensure_full_calc(&workbook(&format!(
+            r#"{SHEETS}<x:calcPr xmlns:x="{NS}" calcId="1"></x:calcPr>"#
+        )));
+        assert!(
+            out.contains(&format!(
+                r#"<x:calcPr xmlns:x="{NS}" calcId="1" fullCalcOnLoad="1"></x:calcPr>"#
+            )),
+            "{out}"
+        );
+        assert_eq!(count_local(&out, "calcPr"), 1, "{out}");
+    }
+
+    #[test]
+    fn ensure_full_calc_leaves_a_cut_off_calc_pr_alone() {
+        let wb = format!(
+            r#"<?xml version="1.0"?><workbook xmlns="{NS}" xmlns:r="{R}">{SHEETS}<calcPr calcId="1" x="é"#
+        );
+        assert_eq!(ensure_full_calc(&wb), wb);
+        let wb = format!("{wb}é");
+        assert_eq!(ensure_full_calc(&wb), wb);
+    }
+
+    #[test]
+    fn remove_pivot_takes_its_entry_out_of_a_prefixed_pivot_caches() {
+        let caches = r#"<x:pivotCaches><x:pivotCache cacheId="7" r:id="rId9"/></x:pivotCaches>"#;
+        let mut pkg = with_data(Some(prefixed(caches)));
+        let idx = add_default_pivot(&mut pkg).expect("add_pivot");
+        assert_eq!(count_local(&part(&pkg, WB), "pivotCache"), 2);
+        assert!(pkg.remove_pivot(idx));
+        let wb = part(&pkg, WB);
+        assert!(wb.contains(caches), "{wb}");
+        assert_eq!(count_local(&wb, "pivotCache"), 1, "{wb}");
+    }
+
+    #[test]
+    fn remove_pivot_takes_out_a_wrapper_it_opened() {
+        for caches in [r#"<pivotCaches />"#, r#"<x:pivotCaches/>"#] {
+            let inner = if caches.starts_with("<x:") {
+                prefixed(caches)
+            } else {
+                workbook(&format!("{SHEETS}{caches}"))
+            };
+            let mut pkg = with_data(Some(inner));
+            let idx = add_default_pivot(&mut pkg).expect("add_pivot");
+            assert!(pkg.remove_pivot(idx));
+            let wb = part(&pkg, WB);
+            assert_eq!(count_local(&wb, "pivotCache"), 0, "{wb}");
+            assert_eq!(count_local(&wb, "pivotCaches"), 0, "{wb}");
+        }
+    }
+
+    #[test]
+    fn ensure_full_calc_keeps_a_prefixed_full_calc() {
+        for v in ["1", "true"] {
+            let wb = prefixed(&format!(r#"<x:calcPr calcId="1" fullCalcOnLoad="{v}"/>"#));
+            assert_eq!(ensure_full_calc(&wb), wb);
+        }
+    }
+
+    #[test]
+    fn ensure_full_calc_turns_on_a_false_full_calc() {
+        for v in ["0", "false"] {
+            let wb = prefixed(&format!(r#"<x:calcPr fullCalcOnLoad="{v}" calcId="1"/>"#));
+            let out = ensure_full_calc(&wb);
+            assert!(
+                out.contains(r#"<x:calcPr fullCalcOnLoad="1" calcId="1"/>"#),
+                "{out}"
+            );
+        }
+        let wb = workbook(&format!(
+            r#"{SHEETS}<calcPr calcId="1" fullCalcOnLoad='0'/>"#
+        ));
+        let out = ensure_full_calc(&wb);
+        assert!(
+            out.contains(r#"<calcPr calcId="1" fullCalcOnLoad='1'/>"#),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn workbook_slot_is_unknown_in_a_truncated_part() {
+        assert_eq!(
+            workbook_slot(r#"<workbook><sheets>"#, "calcPr"),
+            WorkbookSlot::Unknown
+        );
+        assert_eq!(
+            workbook_slot(r#"<workbook/>"#, "calcPr"),
+            WorkbookSlot::Unknown
+        );
+        // With no root end tag, the calcPr append has nothing to go before.
+        let out = ensure_full_calc("<workbook><sheets/>");
+        assert_eq!(out, "<workbook><sheets/>");
+    }
+}
+
+/// Conditional formatting and data validation follow structural edits and
+/// sheet renames, and a save writes the moved elements back (#822).
+#[cfg(test)]
+mod rule_shift_tests {
+    use super::print_setup_tests::book;
+    use super::*;
+    use crate::edit::{delete_cols, delete_rows, insert_cols, insert_rows, rename_sheet};
+    use crate::sheet::{CfKind, CondFormat, Dxf};
+
+    const NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const SHEET1: &str = "xl/worksheets/sheet1.xml";
+    const SHEET2: &str = "xl/worksheets/sheet2.xml";
+    const DATA: &str = r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>"#;
+    const MARGINS: &str = r#"<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>"#;
+
+    /// One sheet named `name` whose body after `<sheetData>` is `rest`.
+    fn one(name: &str, rest: &str) -> SheetPackage {
+        let body = format!("{DATA}{rest}");
+        load_xlsx(&book("", &[(name, Some(&body))])).expect("fixture loads")
+    }
+
+    fn part(pkg: &SheetPackage, name: &str) -> String {
+        String::from_utf8_lossy(pkg.part(name).expect("part present")).into_owned()
+    }
+
+    /// Save and reload; the reloaded package and the saved text of `name`.
+    fn saved(pkg: &SheetPackage, name: &str) -> (SheetPackage, String) {
+        let re = load_xlsx(&save_xlsx(pkg)).expect("saved file reloads");
+        let xml = part(&re, name);
+        (re, xml)
+    }
+
+    fn count(xml: &str, needle: &str) -> usize {
+        xml.matches(needle).count()
+    }
+
+    /// The text of a rule's first formula.
+    fn first_formula(cf: &CondFormat) -> String {
+        cf.rules[0].formulas()[0].clone()
+    }
+
+    #[test]
+    fn cf_and_dv_follow_inserts_and_rename_through_save() {
+        // The issue's repro.
+        let mut pkg = one(
+            "Report",
+            r#"<conditionalFormatting sqref="A1:A5"><cfRule type="expression" dxfId="0" priority="1"><formula>_xlfn.XOR(A1,B1)</formula></cfRule></conditionalFormatting><dataValidations count="1"><dataValidation type="custom" allowBlank="1" sqref="B1:B5"><formula1>_xlfn.ISFORMULA(A1)</formula1></dataValidation></dataValidations>"#,
+        );
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        insert_cols(&mut pkg.workbook, 0, 0, 1);
+        rename_sheet(&mut pkg.workbook, 0, "Q1");
+
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.cond_formats[0].ranges, vec![(1, 1, 5, 1)]);
+        assert_eq!(first_formula(&s.cond_formats[0]), "XOR(B2,C2)");
+        assert_eq!(s.validations[0].ranges, vec![(1, 2, 5, 2)]);
+        assert_eq!(s.validations[0].formula1, "ISFORMULA(B2)");
+
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert!(
+            ws.contains(r#"<conditionalFormatting sqref="B2:B6"><cfRule type="expression" dxfId="0" priority="1"><formula>_xlfn.XOR(B2,C2)</formula></cfRule></conditionalFormatting>"#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(r#"<dataValidations count="1"><dataValidation type="custom" allowBlank="1" sqref="C2:C6"><formula1>_xlfn.ISFORMULA(B2)</formula1></dataValidation></dataValidations>"#),
+            "{ws}"
+        );
+        let s = &re.workbook.sheets[0];
+        assert_eq!(s.name, "Q1");
+        assert_eq!(s.cond_formats[0].ranges, vec![(1, 1, 5, 1)]);
+        assert_eq!(first_formula(&s.cond_formats[0]), "_xlfn.XOR(B2,C2)");
+        assert_eq!(s.validations[0].ranges, vec![(1, 2, 5, 2)]);
+        assert_eq!(s.validations[0].formula1, "_xlfn.ISFORMULA(B2)");
+    }
+
+    #[test]
+    fn cf_and_dv_trim_and_drop_on_delete() {
+        // Sheet1: a CF the delete trims and one it takes whole; two DVs, one
+        // trimmed and one taken, so the block stays with a count of 1.
+        // Sheet2: its only DV is taken, so the block goes.
+        let s1 = format!(
+            r#"{DATA}<conditionalFormatting sqref="A1:A5"><cfRule type="expression" priority="1"><formula>$A$1&lt;5</formula></cfRule></conditionalFormatting><conditionalFormatting sqref="C3:C4"><cfRule type="expression" priority="2"><formula>TRUE</formula></cfRule></conditionalFormatting><dataValidations count="2"><dataValidation type="whole" sqref="B3:B4"><formula1>1</formula1></dataValidation><dataValidation type="whole" sqref="D1:D10 E3"><formula1>2</formula1></dataValidation></dataValidations>{MARGINS}"#
+        );
+        let s2 = format!(
+            r#"{DATA}<dataValidations count="1"><dataValidation type="whole" sqref="A2"><formula1>1</formula1></dataValidation></dataValidations>{MARGINS}"#
+        );
+        let mut pkg =
+            load_xlsx(&book("", &[("One", Some(&s1)), ("Two", Some(&s2))])).expect("loads");
+        delete_rows(&mut pkg.workbook, 0, 2, 2); // rows 3:4
+        delete_rows(&mut pkg.workbook, 1, 1, 1); // row 2
+
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.cond_formats.len(), 1);
+        assert_eq!(s.cond_formats[0].ranges, vec![(0, 0, 2, 0)]);
+        assert_eq!(s.cf_removed, vec![1]);
+        assert_eq!(s.validations.len(), 1);
+        // E3 went with its row; D1:D10 lost two of its rows.
+        assert_eq!(s.validations[0].ranges, vec![(0, 3, 7, 3)]);
+        assert_eq!(s.dv_removed, vec![0]);
+        assert!(pkg.workbook.sheets[1].validations.is_empty());
+
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert_eq!(count(&ws, "<conditionalFormatting"), 1, "{ws}");
+        // The absolute ref was not deleted: it keeps its text.
+        assert!(
+            ws.contains(r#"<conditionalFormatting sqref="A1:A3"><cfRule type="expression" priority="1"><formula>$A$1&lt;5</formula>"#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(r#"<dataValidations count="1"><dataValidation type="whole" sqref="D1:D8"><formula1>2</formula1></dataValidation></dataValidations>"#),
+            "{ws}"
+        );
+        assert_eq!(re.workbook.sheets[0].cond_formats.len(), 1);
+        assert_eq!(re.workbook.sheets[0].validations.len(), 1);
+        let ws2 = part(&re, SHEET2);
+        assert!(!ws2.contains("dataValidation"), "{ws2}");
+        assert!(re.workbook.sheets[1].validations.is_empty());
+    }
+
+    #[test]
+    fn cf_relative_ref_survives_anchor_row_delete() {
+        let mut pkg = one(
+            "S",
+            r#"<conditionalFormatting sqref="A1:A5"><cfRule type="expression" priority="1"><formula>A1&gt;0</formula></cfRule></conditionalFormatting>"#,
+        );
+        delete_rows(&mut pkg.workbook, 0, 0, 1);
+        let cf = &pkg.workbook.sheets[0].cond_formats[0];
+        assert_eq!(cf.ranges, vec![(0, 0, 3, 0)]);
+        // The new anchor is the old A2, which read A2: one row up now, A1.
+        assert_eq!(first_formula(cf), "A1>0");
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(
+            ws.contains(r#"<conditionalFormatting sqref="A1:A4"><cfRule type="expression" priority="1"><formula>A1&gt;0</formula>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn cf_relative_ref_survives_anchor_column_delete() {
+        let mut pkg = one(
+            "S",
+            r#"<conditionalFormatting sqref="B1:D1"><cfRule type="cellIs" operator="greaterThan" priority="1"><formula>B2</formula></cfRule></conditionalFormatting>"#,
+        );
+        delete_cols(&mut pkg.workbook, 0, 0, 2); // A:B
+        let cf = &pkg.workbook.sheets[0].cond_formats[0];
+        assert_eq!(cf.ranges, vec![(0, 0, 0, 1)]);
+        // The old C1 read C2; it is A1 now and reads A2.
+        assert_eq!(first_formula(cf), "A2");
+    }
+
+    #[test]
+    fn dv_relative_ref_survives_anchor_row_delete() {
+        let mut pkg = one(
+            "S",
+            r#"<dataValidations count="1"><dataValidation type="custom" sqref="A1:A5"><formula1>ISNUMBER(A1)</formula1></dataValidation></dataValidations>"#,
+        );
+        delete_rows(&mut pkg.workbook, 0, 0, 1);
+        let dv = &pkg.workbook.sheets[0].validations[0];
+        assert_eq!(dv.ranges, vec![(0, 0, 3, 0)]);
+        assert_eq!(dv.formula1, "ISNUMBER(A1)");
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(
+            ws.contains(
+                r#"<dataValidation type="custom" sqref="A1:A4"><formula1>ISNUMBER(A1)</formula1>"#
+            ),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn dv_list_on_other_sheet_follows_its_source_sheet() {
+        let report = format!(
+            r#"{DATA}<conditionalFormatting sqref="B1:B5"><cfRule type="expression" priority="1"><formula>COUNTIF(Lists!$A$1:$A$5,B1)&gt;0</formula></cfRule></conditionalFormatting><dataValidations count="1"><dataValidation type="list" sqref="A1:A5"><formula1>Lists!$A$1:$A$5</formula1></dataValidation></dataValidations>"#
+        );
+        let mut pkg = load_xlsx(&book(
+            "",
+            &[("Report", Some(&report)), ("Lists", Some(DATA))],
+        ))
+        .expect("loads");
+        insert_rows(&mut pkg.workbook, 1, 0, 2);
+        rename_sheet(&mut pkg.workbook, 1, "New Lists");
+
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.validations[0].ranges, vec![(0, 0, 4, 0)]);
+        assert_eq!(s.validations[0].formula1, "'New Lists'!$A$3:$A$7");
+        assert_eq!(s.cond_formats[0].ranges, vec![(0, 1, 4, 1)]);
+        assert_eq!(
+            first_formula(&s.cond_formats[0]),
+            "COUNTIF('New Lists'!$A$3:$A$7,B1)>0"
+        );
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(
+            ws.contains(r#"<dataValidation type="list" sqref="A1:A5"><formula1>'New Lists'!$A$3:$A$7</formula1>"#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(r#"<conditionalFormatting sqref="B1:B5"><cfRule type="expression" priority="1"><formula>COUNTIF('New Lists'!$A$3:$A$7,B1)&gt;0</formula>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn untouched_cf_and_dv_keep_their_bytes() {
+        let cf = r#"<conditionalFormatting sqref="A1:A5" extra="u"><cfRule type="cellIs" operator="between" dxfId="0" priority="1" stopIfTrue="1"><formula>_xlfn.XOR(A1,B1)</formula><formula>  A1 &lt;  5 </formula></cfRule></conditionalFormatting>"#;
+        let dv = r#"<dataValidations count="1" disablePrompts="0"><dataValidation sqref="B1:B5" type="custom" showErrorMessage="1"><formula1>_xlfn.ISFORMULA(A1)</formula1></dataValidation></dataValidations>"#;
+        let other = format!("{DATA}{cf}{dv}");
+        let mut pkg = load_xlsx(&book(
+            "",
+            &[("Report", Some(&other)), ("Other", Some(&other))],
+        ))
+        .expect("loads");
+        // Below and right of every range, and on the other sheet.
+        insert_rows(&mut pkg.workbook, 0, 10, 2);
+        delete_cols(&mut pkg.workbook, 0, 5, 1);
+        insert_rows(&mut pkg.workbook, 1, 0, 3);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(cf), "{ws}");
+        assert!(ws.contains(dv), "{ws}");
+        // The other sheet's moved: only it is rewritten.
+        let ws2 = part(&saved(&pkg, SHEET2).0, SHEET2);
+        assert!(ws2.contains(r#"sqref="A4:A8" extra="u""#), "{ws2}");
+    }
+
+    #[test]
+    fn color_scale_cf_moves_its_sqref() {
+        let mut pkg = one(
+            "S",
+            r#"<conditionalFormatting sqref="A1:A5"><cfRule type="colorScale" priority="1"><colorScale><cfvo type="min"/><cfvo type="max"/><color rgb="FFF8696B"/><color rgb="FF63BE7B"/></colorScale></cfRule><cfRule type="containsText" dxfId="0" priority="2" operator="containsText" text="x"><formula>NOT(ISERROR(SEARCH("x",A1)))</formula></cfRule></conditionalFormatting>"#,
+        );
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let cf = &pkg.workbook.sheets[0].cond_formats[0];
+        assert!(matches!(cf.rules[1].kind, CfKind::Other { .. }));
+        assert_eq!(cf.rules[1].formulas()[0], "NOT(ISERROR(SEARCH(\"x\",A2)))");
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(
+            ws.contains(r#"<conditionalFormatting sqref="A2:A6"><cfRule type="colorScale" priority="1"><colorScale><cfvo type="min"/><cfvo type="max"/><color rgb="FFF8696B"/><color rgb="FF63BE7B"/></colorScale></cfRule><cfRule type="containsText" dxfId="0" priority="2" operator="containsText" text="x"><formula>NOT(ISERROR(SEARCH("x",A2)))</formula></cfRule></conditionalFormatting>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn added_cf_and_dv_move_on_insert() {
+        // One of each from the file, one of each added.
+        let mut pkg = one(
+            "S",
+            r#"<conditionalFormatting sqref="C1"><cfRule type="expression" priority="1"><formula>TRUE</formula></cfRule></conditionalFormatting><dataValidations count="1"><dataValidation type="whole" sqref="D1"><formula1>1</formula1></dataValidation></dataValidations>"#,
+        );
+        assert!(pkg.add_conditional_format(
+            0,
+            (0, 0, 1, 0),
+            "greaterThan",
+            "B1",
+            None,
+            Dxf::default()
+        ));
+        assert!(pkg.add_data_validation(0, (0, 1, 1, 1), "whole", "lessThan", "A1", None));
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.cond_formats[1].ix, Some(1));
+        assert_eq!(s.validations[1].ix, Some(1));
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(r#"<conditionalFormatting sqref="C2">"#), "{ws}");
+        assert!(
+            ws.contains(r#"<conditionalFormatting sqref="A2:A3">"#),
+            "{ws}"
+        );
+        assert!(ws.contains("<formula>B2</formula>"), "{ws}");
+        assert!(
+            ws.contains(r#"<dataValidation type="whole" sqref="D2">"#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(r#"sqref="B2:B3"><formula1>A2</formula1>"#),
+            "{ws}"
+        );
+        assert_eq!(re.workbook.sheets[0].cond_formats.len(), 2);
+        assert_eq!(re.workbook.sheets[0].validations.len(), 2);
+    }
+
+    #[test]
+    fn added_to_a_fresh_sheet_moves_on_insert() {
+        let mut pkg = new_xlsx();
+        assert!(pkg.add_conditional_format(
+            0,
+            (0, 0, 1, 0),
+            "greaterThan",
+            "B1",
+            None,
+            Dxf::default()
+        ));
+        assert!(pkg.add_data_validation(0, (0, 1, 1, 1), "whole", "lessThan", "A1", None));
+        insert_cols(&mut pkg.workbook, 0, 0, 1);
+        let (re, _) = saved(&pkg, SHEET1);
+        let s = &re.workbook.sheets[0];
+        assert_eq!(s.cond_formats[0].ranges, vec![(0, 1, 1, 1)]);
+        assert_eq!(first_formula(&s.cond_formats[0]), "C1");
+        assert_eq!(s.validations[0].ranges, vec![(0, 2, 1, 2)]);
+        assert_eq!(s.validations[0].formula1, "B1");
+    }
+
+    #[test]
+    fn restored_model_writes_its_own_positions() {
+        // AC8: the save compares the model with the part, so a model that an
+        // undo or redo puts back writes ITS positions, whatever happened in
+        // between.
+        let body = r#"<conditionalFormatting sqref="A1:A5"><cfRule type="expression" priority="1"><formula>$B$5&gt;0</formula></cfRule></conditionalFormatting><conditionalFormatting sqref="B2"><cfRule type="expression" priority="2"><formula>TRUE</formula></cfRule></conditionalFormatting><dataValidations count="2"><dataValidation type="custom" sqref="C2"><formula1>C1</formula1></dataValidation><dataValidation type="custom" sqref="D1:D4"><formula1>$E$4</formula1></dataValidation></dataValidations>"#;
+        let mut pkg = one("S", body);
+        let original = pkg.workbook.clone();
+        let read = |b: &[u8]| part(&load_xlsx(b).unwrap(), SHEET1);
+        let before = read(&save_xlsx(&pkg));
+
+        // Delete rows 1:2: B2 and C2 go, the rest trims, $B$5 / $E$4 move.
+        delete_rows(&mut pkg.workbook, 0, 0, 2);
+        let deleted = pkg.workbook.clone();
+        // Then another edit, which an undo takes back to `deleted`.
+        insert_rows(&mut pkg.workbook, 0, 0, 3);
+        pkg.workbook = deleted;
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert_eq!(count(&ws, "<conditionalFormatting"), 1, "{ws}");
+        assert!(
+            ws.contains(r#"<conditionalFormatting sqref="A1:A3"><cfRule type="expression" priority="1"><formula>$B$3&gt;0</formula>"#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(r#"<dataValidations count="1"><dataValidation type="custom" sqref="D1:D2"><formula1>$E$2</formula1></dataValidation></dataValidations>"#),
+            "{ws}"
+        );
+
+        // And all the way back: the loaded positions, byte for byte.
+        pkg.workbook = original;
+        assert_eq!(read(&save_xlsx(&pkg)), before);
+    }
+
+    #[test]
+    fn a_raw_gt_in_an_attribute_neither_moves_nor_duplicates_sqref() {
+        // `>` is legal unescaped in an attribute value; it must not end the
+        // start tag before `sqref`.
+        let dv = r#"<dataValidations count="1"><dataValidation type="whole" error="must be > 0" sqref="A1:A5"><formula1>1</formula1></dataValidation></dataValidations>"#;
+        let cf = r#"<conditionalFormatting pivot="0" note="a>b" sqref="B1:B5"><cfRule type="expression" priority="1"><formula>B1&gt;0</formula></cfRule></conditionalFormatting>"#;
+        let body = format!("{cf}{dv}");
+        let pkg = one("S", &body);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(cf), "{ws}");
+        assert!(ws.contains(dv), "{ws}");
+
+        let mut pkg = one("S", &body);
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert_eq!(count(&ws, "sqref="), 2, "{ws}");
+        assert!(
+            ws.contains(r#"<dataValidation type="whole" error="must be > 0" sqref="A2:A6"><formula1>1</formula1>"#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(r#"<conditionalFormatting pivot="0" note="a>b" sqref="B2:B6"><cfRule type="expression" priority="1"><formula>B2&gt;0</formula>"#),
+            "{ws}"
+        );
+        assert_eq!(
+            re.workbook.sheets[0].validations[0].ranges,
+            vec![(1, 0, 5, 0)]
+        );
+    }
+
+    #[test]
+    fn an_element_without_sqref_is_left_alone() {
+        // The loader keeps a CF block with rules but no `sqref`: no ranges,
+        // and an `ix`. The edit moves its formula in the model, but with no
+        // `sqref` to read the save can't tell what the element covers, so it
+        // leaves it as it is rather than rewrite it (or add an `sqref`).
+        let cf = r#"<conditionalFormatting><cfRule type="expression" priority="1"><formula>A1</formula></cfRule></conditionalFormatting>"#;
+        let mut pkg = one("S", cf);
+        assert_eq!(pkg.workbook.sheets[0].cond_formats[0].ix, Some(0));
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        assert_eq!(first_formula(&pkg.workbook.sheets[0].cond_formats[0]), "A2");
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(cf), "{ws}");
+        // A DV without one isn't modelled at all (no ranges), so it is
+        // left as it is by construction; kept here as a regression guard.
+        let dv = r#"<dataValidations count="1"><dataValidation type="whole"><formula1>A1</formula1></dataValidation></dataValidations>"#;
+        let mut pkg = one("S", dv);
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(dv), "{ws}");
+    }
+
+    #[test]
+    fn x14_cf_in_extlst_is_left_alone() {
+        let x14 = r#"<extLst><ext uri="{78C0D931-6437-407d-A8EE-F0AAD7539E65}" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"><x14:conditionalFormattings><x14:conditionalFormatting xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main"><x14:cfRule type="expression" priority="2" id="{X}"><xm:f>A1&gt;1</xm:f></x14:cfRule><xm:sqref>A1:A5</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst>"#;
+        let mut pkg = one(
+            "S",
+            &format!(
+                r#"<conditionalFormatting sqref="B1:B5"><cfRule type="expression" priority="1"><formula>B1&gt;0</formula></cfRule></conditionalFormatting>{MARGINS}{x14}"#
+            ),
+        );
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.cond_formats.len(), 2);
+        assert_eq!(s.cond_formats[0].ix, Some(0));
+        assert_eq!(s.cond_formats[1].ix, None);
+        // A delete over the x14 block's (unread) cells doesn't drop it.
+        delete_rows(&mut pkg.workbook, 0, 0, 10);
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        assert_eq!(pkg.workbook.sheets[0].cond_formats.len(), 1);
+        assert_eq!(pkg.workbook.sheets[0].cond_formats[0].ix, None);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(x14), "{ws}");
+        assert!(!ws.contains(r#"<conditionalFormatting sqref"#), "{ws}");
+    }
+
+    #[test]
+    fn prefixed_part_with_comment_between_blocks_moves_the_right_element() {
+        let mut pkg = new_xlsx();
+        let first = r#"<x:conditionalFormatting sqref="A1"><x:cfRule type="expression" priority="1"><x:formula>TRUE</x:formula></x:cfRule></x:conditionalFormatting>"#;
+        pkg.set_part(
+            SHEET1,
+            format!(
+                r#"<?xml version="1.0"?><x:worksheet xmlns:x="{NS}"><x:sheetData/>{first}<!-- <x:conditionalFormatting sqref="Z9"/> --><x:conditionalFormatting sqref="C3"><x:cfRule type="expression" priority="2"><x:formula>C3=1</x:formula></x:cfRule></x:conditionalFormatting><x:dataValidations count="1"><!-- --><x:dataValidation type="custom" sqref="C3"><x:formula1>C3&gt;1</x:formula1></x:dataValidation></x:dataValidations></x:worksheet>"#
+            )
+            .into_bytes(),
+        );
+        let mut pkg = load_xlsx(&write_zip(&pkg.parts)).expect("load");
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(
+            s.cond_formats.iter().map(|c| c.ix).collect::<Vec<_>>(),
+            vec![Some(0), Some(1)]
+        );
+        assert_eq!(s.validations[0].ix, Some(0));
+        insert_rows(&mut pkg.workbook, 0, 1, 1); // below A1, above C3
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(first), "{ws}");
+        assert!(
+            ws.contains(r#"<!-- <x:conditionalFormatting sqref="Z9"/> -->"#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(r#"<x:conditionalFormatting sqref="C4"><x:cfRule type="expression" priority="2"><x:formula>C4=1</x:formula>"#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(
+                r#"<x:dataValidation type="custom" sqref="C4"><x:formula1>C4&gt;1</x:formula1>"#
+            ),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn a_stale_claim_from_a_restored_model_yields_to_an_added_block() {
+        let mut pkg = one(
+            "S",
+            r#"<conditionalFormatting sqref="A1"><cfRule type="expression" priority="1"><formula>TRUE</formula></cfRule></conditionalFormatting>"#,
+        );
+        let snapshot = pkg.workbook.clone();
+        assert!(pkg.clear_conditional_formats(0));
+        // An undo that restores the model but not the part.
+        pkg.workbook = snapshot;
+        assert!(pkg.add_conditional_format(
+            0,
+            (2, 2, 2, 2),
+            "greaterThan",
+            "1",
+            None,
+            Dxf::default()
+        ));
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.cond_formats[0].ix, None);
+        assert_eq!(s.cond_formats[1].ix, Some(0));
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert_eq!(count(&ws, "<conditionalFormatting"), 1, "{ws}");
+        assert!(ws.contains(r#"<conditionalFormatting sqref="C4">"#), "{ws}");
+    }
+
+    #[test]
+    fn an_element_two_blocks_claim_is_left_alone() {
+        let cf = r#"<conditionalFormatting sqref="A1"><cfRule type="expression" priority="1"><formula>A1</formula></cfRule></conditionalFormatting>"#;
+        let mut pkg = one("S", cf);
+        let mut twin = pkg.workbook.sheets[0].cond_formats[0].clone();
+        twin.ranges = vec![(5, 5, 5, 5)];
+        pkg.workbook.sheets[0].cond_formats.push(twin);
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(cf), "{ws}");
+    }
+
+    #[test]
+    fn unparseable_sqref_token_element_left_alone() {
+        let cf = r#"<conditionalFormatting sqref="A:A B1:B2"><cfRule type="expression" priority="1"><formula>TRUE</formula></cfRule></conditionalFormatting>"#;
+        let mut pkg = one("S", cf);
+        assert_eq!(
+            pkg.workbook.sheets[0].cond_formats[0].ranges,
+            vec![(0, 1, 1, 1)]
+        );
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(cf), "{ws}");
+        // Nor is it removed when the ranges it could read are all deleted.
+        let mut pkg = one("S", cf);
+        delete_rows(&mut pkg.workbook, 0, 0, 2);
+        assert_eq!(pkg.workbook.sheets[0].cf_removed, vec![0]);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(cf), "{ws}");
+    }
+
+    #[test]
+    fn cf_formula_text_is_decoded_on_load() {
+        let pkg = one(
+            "S",
+            r#"<conditionalFormatting sqref="A1"><cfRule type="expression" priority="1"><formula>A1&lt;5</formula></cfRule></conditionalFormatting>"#,
+        );
+        assert_eq!(
+            first_formula(&pkg.workbook.sheets[0].cond_formats[0]),
+            "A1<5"
+        );
+    }
+
+    /// A CF block over `sqref` with one expression rule `formula`.
+    fn expr_cf(sqref: &str, formula: &str) -> String {
+        format!(
+            r#"<conditionalFormatting sqref="{sqref}"><cfRule type="expression" priority="1"><formula>{formula}</formula></cfRule></conditionalFormatting>"#
+        )
+    }
+
+    #[test]
+    fn deleting_the_range_that_held_the_anchor_column_retranslates() {
+        // Anchor (row 1, col A); A5:A6 held its column. Once it goes, C1
+        // anchors, and it read C1.
+        let mut pkg = one("S", &expr_cf("C1:C2 A5:A6", "A1&gt;0"));
+        delete_rows(&mut pkg.workbook, 0, 4, 2);
+        let cf = &pkg.workbook.sheets[0].cond_formats[0];
+        assert_eq!(cf.ranges, vec![(0, 2, 1, 2)]);
+        assert_eq!(first_formula(cf), "C1>0");
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(&expr_cf("C1:C2", "C1&gt;0")), "{ws}");
+    }
+
+    #[test]
+    fn deleting_the_range_that_held_the_anchor_row_and_column_retranslates() {
+        // A1:A2 goes; the old C5 (now C3) anchors, and it read C5.
+        let mut pkg = one("S", &expr_cf("A1:A2 C5:C6", "A1&gt;0"));
+        delete_rows(&mut pkg.workbook, 0, 0, 2);
+        let cf = &pkg.workbook.sheets[0].cond_formats[0];
+        assert_eq!(cf.ranges, vec![(2, 2, 3, 2)]);
+        assert_eq!(first_formula(cf), "C3>0");
+    }
+
+    #[test]
+    fn deleting_the_columns_that_held_the_anchor_row_retranslates() {
+        // C1:D1 held the anchor's row; once those columns go, A2 anchors.
+        let mut pkg = one("S", &expr_cf("A2:A3 C1:D1", "A1&gt;0"));
+        delete_cols(&mut pkg.workbook, 0, 2, 2);
+        let cf = &pkg.workbook.sheets[0].cond_formats[0];
+        assert_eq!(cf.ranges, vec![(1, 0, 2, 0)]);
+        assert_eq!(first_formula(cf), "A2>0");
+    }
+
+    #[test]
+    fn dv_deleting_the_range_that_held_the_anchor_column_retranslates() {
+        let mut pkg = one(
+            "S",
+            r#"<dataValidations count="1"><dataValidation type="custom" sqref="C1:C2 A5:A6"><formula1>ISNUMBER(A1)</formula1></dataValidation></dataValidations>"#,
+        );
+        delete_rows(&mut pkg.workbook, 0, 4, 2);
+        let dv = &pkg.workbook.sheets[0].validations[0];
+        assert_eq!(dv.ranges, vec![(0, 2, 1, 2)]);
+        assert_eq!(dv.formula1, "ISNUMBER(C1)");
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(
+            ws.contains(r#"sqref="C1:C2"><formula1>ISNUMBER(C1)</formula1>"#),
+            "{ws}"
+        );
+    }
+
+    /// Add a CF over C3 to a part whose blocks stand where the new one lands
+    /// ahead of some of them, move rows, and check each element kept its own
+    /// rule.
+    fn add_into_misordered(body: &str, added_ix: usize, existing: &[(&str, &str)]) {
+        let mut pkg = one("S", body);
+        assert!(pkg.add_conditional_format(
+            0,
+            (2, 2, 2, 2),
+            "greaterThan",
+            "5",
+            None,
+            Dxf::default()
+        ));
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.cond_formats.last().unwrap().ix, Some(added_ix));
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (re, ws) = saved(&pkg, SHEET1);
+        for (sqref, formula) in existing {
+            assert!(ws.contains(&expr_cf(sqref, formula)), "{sqref}: {ws}");
+        }
+        assert!(
+            ws.contains(r#"<conditionalFormatting sqref="C4"><cfRule type="cellIs" dxfId="0" priority="2" operator="greaterThan"><formula>5</formula>"#),
+            "{ws}"
+        );
+        assert_eq!(re.workbook.sheets[0].cond_formats.len(), existing.len() + 1);
+    }
+
+    #[test]
+    fn a_cf_added_ahead_of_a_misplaced_block_keeps_both_in_place() {
+        // A block after <dataValidations>, which ranks after it: the new
+        // block goes before the DVs, so ahead of it.
+        let body = format!(
+            r#"<dataValidations count="1"><dataValidation type="whole" sqref="D1"><formula1>1</formula1></dataValidation></dataValidations>{}"#,
+            expr_cf("A1", "A1=1")
+        );
+        add_into_misordered(&body, 0, &[("A2", "A2=1")]);
+    }
+
+    #[test]
+    fn a_cf_added_between_blocks_split_by_margins_keeps_each_in_place() {
+        let body = format!(
+            "{}{MARGINS}{}",
+            expr_cf("A1", "A1=1"),
+            expr_cf("B1", "B1=2")
+        );
+        add_into_misordered(&body, 1, &[("A2", "A2=1"), ("B2", "B2=2")]);
     }
 }

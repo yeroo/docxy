@@ -23,21 +23,25 @@ fn commit_pending_for_close(tab: &mut DocTab) -> Result<(), String> {
         // the status with the cell editor's last_error.
         return Err(tab.status.to_string());
     }
-    commit_changed_cell(tab);
+    // An unfinished sheet formula (`=SUM(A1`) refuses too, as an invalid
+    // Project buffer does: closing would drop what was typed.
+    commit_changed_cell(tab)?;
     exit_hf_tab(tab);
     Ok(())
 }
 
 /// Window close and harness `quit`: fold every tab's pending edit into what
-/// hot-exit persists. Best-effort, never refuses: an invalid Project buffer
-/// stays uncommitted and its last committed model is persisted. Header/footer
+/// hot-exit persists. Best-effort, never refuses: an invalid Project buffer,
+/// like a sheet cell editor holding an entry the sheet refuses (an unfinished
+/// formula such as `=SUM(A1`), stays uncommitted and the last committed model
+/// is persisted. Header/footer
 /// is flushed rather than exited, so a cancelled window close keeps the user in
 /// header/footer mode.
 pub(crate) fn commit_pending_for_exit(tabs: &mut [DocTab]) {
     for tab in tabs {
         flush_level_pass(tab);
         let _ = commit_project_cell(tab);
-        commit_changed_cell(tab);
+        let _ = commit_changed_cell(tab);
         flush_hf_tab(tab);
     }
 }
@@ -45,23 +49,37 @@ pub(crate) fn commit_pending_for_exit(tabs: &mut [DocTab]) {
 /// Commit a sheet's open cell editor unless it was seeded from a cell and left
 /// unchanged. `commit_edit` also skips that case, but taking the buffer here
 /// would close the editor; cancelled close or Save As must leave it open.
-fn commit_changed_cell(tab: &mut DocTab) {
+/// `Err` (the reason, also put in the tab's status) when the sheet refused the
+/// entry — an unfinished formula, or one over the cell limit — and the editor
+/// stays open with the text.
+fn commit_changed_cell(tab: &mut DocTab) -> Result<(), String> {
     if let Surface::Sheet(v) = &mut tab.surface
         && v.editing.is_some()
         && !v.edit_untouched()
     {
         let changed = v.commit_edit();
+        if v.editing.is_some() {
+            let message = v
+                .entry_error
+                .take()
+                .unwrap_or_else(|| "the cell entry could not be committed".into());
+            tab.status = message.clone().into();
+            return Err(message);
+        }
         tab.dirty |= changed;
         if changed {
             v.anchor = v.sel;
         }
     }
+    Ok(())
 }
 
 /// Apply the cell-editor part of Save before choosing a target and writing.
 /// Keep this path shared with close so Save cannot reparse an untouched editor.
-pub(crate) fn prepare_sheet_save(tab: &mut DocTab) {
-    commit_changed_cell(tab);
+/// `Err` when the editor holds an entry the sheet refuses: Save must not write
+/// (or mark clean) a workbook without what is being typed.
+pub(crate) fn prepare_sheet_save(tab: &mut DocTab) -> Result<(), String> {
+    commit_changed_cell(tab)
 }
 
 fn close_step(

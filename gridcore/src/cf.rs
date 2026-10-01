@@ -138,7 +138,7 @@ fn rule_matches(
                 _ => false,
             }
         }
-        CfKind::Other => false,
+        CfKind::Other { .. } => false,
     }
 }
 
@@ -172,6 +172,7 @@ mod tests {
             ..Dxf::default()
         };
         let cf = CondFormat {
+            ix: None,
             ranges: vec![(0, 0, 9, 0)], // A1:A10
             rules: vec![CfRule {
                 kind: CfKind::CellIs {
@@ -195,6 +196,7 @@ mod tests {
             ..Dxf::default()
         };
         let cf = CondFormat {
+            ix: None,
             ranges: vec![(0, 0, 4, 0)],
             rules: vec![CfRule {
                 kind: CfKind::Expression {
@@ -234,6 +236,7 @@ mod tests {
     /// A single-rule `cellIs` block over A1:A10, dxf 0, priority 1.
     fn cell_is(op: &str, formulas: &[&str]) -> CondFormat {
         CondFormat {
+            ix: None,
             ranges: vec![(0, 0, 9, 0)],
             rules: vec![CfRule {
                 kind: CfKind::CellIs {
@@ -399,6 +402,7 @@ mod tests {
 
         // A rule with no dxf_id is skipped even when it would match.
         let cf = CondFormat {
+            ix: None,
             ranges: vec![(0, 0, 9, 0)],
             rules: vec![CfRule {
                 kind: CfKind::CellIs {
@@ -414,9 +418,10 @@ mod tests {
 
         // CfKind::Other is never evaluated.
         let cf = CondFormat {
+            ix: None,
             ranges: vec![(0, 0, 9, 0)],
             rules: vec![CfRule {
-                kind: CfKind::Other,
+                kind: CfKind::Other { formulas: vec![] },
                 dxf_id: Some(0),
                 priority: 1,
             }],
@@ -438,6 +443,7 @@ mod tests {
         // Two matching rules; priority 2 (red, dxf 0) vs priority 1 (green, dxf 1).
         // Lower priority number = higher precedence → green wins.
         let cf = CondFormat {
+            ix: None,
             ranges: vec![(0, 0, 9, 0)],
             rules: vec![
                 CfRule {
@@ -469,6 +475,7 @@ mod tests {
             ..Dxf::default()
         };
         let cf = CondFormat {
+            ix: None,
             ranges: vec![(0, 0, 4, 0)],
             rules: vec![CfRule {
                 kind: CfKind::Expression {

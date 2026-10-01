@@ -134,6 +134,88 @@ fn invalid_project_buffer_refuses_even_discard_and_correction_clears_status() {
     assert!(t.dirty);
 }
 
+/// A workbook tab saved at `path` whose A1 editor holds `buffer`, typed.
+fn sheet_typing(path: &std::path::Path, buffer: &str) -> DocTab {
+    let mut t = tab(Kind::Xlsx);
+    t.path = Some(path.to_path_buf());
+    let Surface::Sheet(v) = &mut t.surface else {
+        panic!()
+    };
+    v.sel = (0, 0);
+    v.anchor = (0, 0);
+    v.begin_cell_edit(Some(buffer.into()));
+    t
+}
+
+#[test]
+fn an_unfinished_formula_refuses_close_and_save_until_corrected() {
+    let dir = close_test_dir("unfinished-formula");
+    let path = dir.join("book.xlsx");
+    let mut t = sheet_typing(&path, "=SUM(A1");
+    // Close refuses, with Discard as the answer too: the editor keeps it.
+    for answer in [CloseAnswer::Discard, CloseAnswer::Save] {
+        let step = close_step(&mut t, |_| Ok(answer));
+        let CloseStep::Refuse(message) = step else {
+            panic!("{answer:?}: {step:?}")
+        };
+        assert!(message.starts_with("formula error"), "{message}");
+        let Surface::Sheet(v) = &t.surface else {
+            panic!()
+        };
+        assert_eq!(v.editing.as_deref(), Some("=SUM(A1"));
+    }
+    // Save refuses before writing: no file, the tab as it was.
+    assert!(!save_sheet_tab(
+        &mut t,
+        false,
+        false,
+        |_| panic!("asked"),
+        no_macros
+    ));
+    assert!(!save_sheet_to(&mut t, &path));
+    assert!(!path.exists());
+    assert!(!t.dirty);
+    assert!(t.status.starts_with("formula error"), "{}", t.status);
+    let Surface::Sheet(v) = &mut t.surface else {
+        panic!()
+    };
+    assert_eq!(v.editing.as_deref(), Some("=SUM(A1"));
+    assert!(v.undo.is_empty());
+    // Corrected, it saves; the saved (clean) tab then closes without asking.
+    v.editing = Some("=SUM(A1)".into());
+    assert!(save_sheet_tab(
+        &mut t,
+        false,
+        false,
+        |_| panic!("asked"),
+        no_macros
+    ));
+    assert!(path.is_file(), "{}", t.status);
+    assert!(!t.dirty);
+    assert_eq!(close_step(&mut t, |_| panic!("asked")), CloseStep::Remove);
+    // Corrected in the editor and closed: the close commits it, so the tab
+    // is dirty with the formula in A1 when it asks; Discard removes it.
+    let mut t = sheet_typing(&path, "=SUM(A1");
+    let Surface::Sheet(v) = &mut t.surface else {
+        panic!()
+    };
+    v.editing = Some("=SUM(A1)".into());
+    assert_eq!(
+        close_step(&mut t, |t| {
+            assert!(t.dirty);
+            let Surface::Sheet(v) = &t.surface else {
+                panic!()
+            };
+            assert!(v.editing.is_none());
+            let a1 = v.sheet().cell(0, 0).and_then(|c| c.formula.clone());
+            assert_eq!(a1.as_deref(), Some("SUM(A1)"));
+            Ok(CloseAnswer::Discard)
+        }),
+        CloseStep::Remove
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn header_and_footer_buffers_are_flushed_before_asking() {
     for is_header in [true, false] {
@@ -484,7 +566,7 @@ fn changed_commit_still_parses_and_records_undo() {
         assert!(v.redo.is_empty());
         assert_eq!(v.sheet().cell(0, 0).map(|c| &c.value), Some(&expected));
         assert_eq!(
-            v.undo[0].wb.sheets[v.active].cell(0, 0),
+            v.undo[0].workbook().sheets[v.active].cell(0, 0),
             Some(&Cell::text("007"))
         );
     }
@@ -794,9 +876,13 @@ fn close_dialog_save_preserves_an_untouched_text_cell_on_disk() {
         close_step(&mut t, |_| Ok(CloseAnswer::Save)),
         CloseStep::Save
     );
-    assert!(save_sheet_tab(&mut t, false, false, |_| panic!(
-        "in-place save asked"
-    )));
+    assert!(save_sheet_tab(
+        &mut t,
+        false,
+        false,
+        |_| panic!("in-place save asked"),
+        no_macros
+    ));
     let Surface::Sheet(v) = &t.surface else {
         panic!()
     };
@@ -834,9 +920,13 @@ fn save_preserves_an_untouched_cell_editor_and_clean_tab() {
     let path = dir.join("saved.xlsx");
     let mut t = untouched_text_cell();
     t.path = Some(path.clone());
-    assert!(save_sheet_tab(&mut t, false, false, |_| panic!(
-        "in-place save asked"
-    )));
+    assert!(save_sheet_tab(
+        &mut t,
+        false,
+        false,
+        |_| panic!("in-place save asked"),
+        no_macros
+    ));
     assert!(!t.dirty);
     let Surface::Sheet(v) = &t.surface else {
         panic!()
@@ -851,7 +941,7 @@ fn save_preserves_an_untouched_cell_editor_and_clean_tab() {
 #[test]
 fn cancelled_save_as_keeps_an_untouched_cell_editor_open() {
     let mut t = untouched_text_cell();
-    assert!(save_sheet_tab(&mut t, false, true, |_| None));
+    assert!(save_sheet_tab(&mut t, false, true, |_| None, no_macros));
     assert_eq!(t.status.as_ref(), "save cancelled");
     assert!(!t.dirty);
     let Surface::Sheet(v) = &t.surface else {
@@ -867,10 +957,16 @@ fn save_as_uses_the_picker_and_preserves_an_untouched_text_cell() {
     let dir = close_test_dir("untouched-cell-save-as");
     let path = dir.join("picked.xlsx");
     let mut t = untouched_text_cell();
-    assert!(save_sheet_tab(&mut t, false, true, |suggested| {
-        assert_eq!(suggested, "basic.xlsx");
-        Some(path.clone())
-    }));
+    assert!(save_sheet_tab(
+        &mut t,
+        false,
+        true,
+        |suggested| {
+            assert_eq!(suggested, "basic.xlsx");
+            Some(path.clone())
+        },
+        no_macros
+    ));
     assert_eq!(t.path.as_deref(), Some(path.as_path()));
     assert!(!t.dirty);
     let Surface::Sheet(v) = &t.surface else {
@@ -896,9 +992,13 @@ fn save_commits_a_changed_cell_editor_before_writing() {
         };
         v.anchor = (2, 2);
         v.begin_cell_edit(Some(buffer.into()));
-        assert!(save_sheet_tab(&mut t, false, false, |_| panic!(
-            "in-place save asked"
-        )));
+        assert!(save_sheet_tab(
+            &mut t,
+            false,
+            false,
+            |_| panic!("in-place save asked"),
+            no_macros
+        ));
         let Surface::Sheet(v) = &t.surface else {
             panic!()
         };
@@ -927,7 +1027,7 @@ fn preparing_a_changed_cell_for_save_marks_dirty_and_collapses_selection() {
     };
     v.anchor = (2, 2);
     v.begin_cell_edit(Some("abc".into()));
-    prepare_sheet_save(&mut t);
+    prepare_sheet_save(&mut t).unwrap();
     assert!(t.dirty);
     let Surface::Sheet(v) = &t.surface else {
         panic!()
@@ -1388,4 +1488,10 @@ fn a_crash_still_labels_sheet_and_project_sidecars_it_read() {
         assert!(t.dirty);
         assert!(t.status.starts_with("recovered"), "{}", t.status);
     }
+}
+
+/// The macro question's answer for a workbook that has no macros to lose:
+/// it is never asked.
+fn no_macros(features: &[&'static str]) -> bool {
+    panic!("asked about {features:?}")
 }

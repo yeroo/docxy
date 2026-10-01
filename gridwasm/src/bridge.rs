@@ -23,6 +23,33 @@ pub fn new_workbook() -> Vec<u8> {
 struct UndoGroup {
     sheet: usize,
     changes: Vec<(u32, u32, Option<Cell>, Option<Cell>)>,
+    /// A restyle ([`Session::apply_styles`]): undo/redo put back only each
+    /// cell's style, so a spill the cells belong to stays whole.
+    styles_only: bool,
+}
+
+/// The `(row, col, style)` a restyle group puts back: the style of each
+/// change's `before` or `after` cell (picked by `side`), default if absent.
+fn group_styles(
+    group: &UndoGroup,
+    side: impl Fn(&(u32, u32, Option<Cell>, Option<Cell>)) -> &Option<Cell>,
+) -> Vec<(u32, u32, u32)> {
+    group
+        .changes
+        .iter()
+        .map(|ch| (ch.0, ch.1, side(ch).as_ref().map_or(0, |cl| cl.style)))
+        .collect()
+}
+
+/// The `(row, col, cell)` an undo or redo puts back: each change's `before`
+/// or `after` cell (picked by `side`), blank if absent.
+fn group_cells<'a>(
+    changes: impl Iterator<Item = &'a (u32, u32, Option<Cell>, Option<Cell>)>,
+    side: impl Fn(&(u32, u32, Option<Cell>, Option<Cell>)) -> &Option<Cell>,
+) -> Vec<(u32, u32, Cell)> {
+    changes
+        .map(|ch| (ch.0, ch.1, side(ch).clone().unwrap_or_default()))
+        .collect()
 }
 
 /// Sheets + defined names — snapshotted around structural edits whose inverse
@@ -123,6 +150,34 @@ pub struct Session {
     /// verb-name regex that couldn't tell a no-op `autosum`/`cut`/`paste`
     /// (nothing actually changed) from one that mutated.
     edits: u64,
+    /// What this session's last `copy`/`cut` put on the clipboard.
+    clip: Option<GridClip>,
+}
+
+/// A clipboard text as [`GridClip::text`] keeps it and a `paste` compares it:
+/// CRLF read as LF and trailing line breaks dropped, the same on both sides.
+/// A copy whose last row is empty ends in `\n`, and the host may hand the
+/// text back with or without it.
+fn clip_key(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .trim_end_matches('\n')
+        .to_string()
+}
+
+/// A `copy`/`cut`'s cells as they were (formats, formulas, quote prefixes
+/// intact), where they came from, and the TSV handed to the host. A `paste`
+/// of exactly that text pastes these cells, as xlsxy's and the suite's own
+/// clipboards do: the TSV carries no formats, so reading it back as typed
+/// would add or drop an apostrophe between a Text and a General cell. Any
+/// other text is read as typed.
+#[derive(Clone, Debug)]
+struct GridClip {
+    cells: Vec<Vec<Option<Cell>>>,
+    from: (u32, u32),
+    /// A cut: its source is already cleared, and its formulas keep their
+    /// references when pasted (once; later pastes are copies, as in xlsxy).
+    cut: bool,
+    text: String,
 }
 
 impl Session {
@@ -143,6 +198,7 @@ impl Session {
             redo: Vec::new(),
             removed_sheet_stash: None,
             edits: 0,
+            clip: None,
         })
     }
 
@@ -237,9 +293,10 @@ impl Session {
                     self.apply(changes);
                 }
             }
-            "copy" => return Some(self.selection_tsv()),
+            "copy" => return Some(self.record_clip(false)),
             "cut" => {
-                let tsv = self.selection_tsv();
+                // The cells are recorded before the clear below empties them.
+                let tsv = self.record_clip(true);
                 let (ar, ac) = self.anchor.unwrap_or(self.cur);
                 let (r1, r2) = (self.cur.0.min(ar), self.cur.0.max(ar));
                 let (c1, c2) = (self.cur.1.min(ac), self.cur.1.max(ac));
@@ -254,12 +311,16 @@ impl Session {
                 if p.len() == 3 {
                     let (r0, c0): (u32, u32) =
                         (p[0].parse().unwrap_or(0), p[1].parse().unwrap_or(0));
+                    if self.paste_own_clip(r0, c0, p[2]) {
+                        return None;
+                    }
                     // Cap the paste so a hostile/huge clipboard can't lock the
                     // UI in per-cell recalcs (mirrors the TUI's external-paste
                     // guard in xlsxy::main::paste).
                     const MAX_PASTE_CELLS: usize = 100_000;
                     let mut changes = Vec::new();
                     let mut truncated = false;
+                    let ctx = gridcore::entry::entry_ctx(&self.pkg.workbook, self.engine.clock);
                     // Excel-on-Windows clipboards are CRLF and end with a
                     // trailing newline; strip both so a naive split doesn't
                     // (a) leave a stray \r on the last field of every row and
@@ -279,10 +340,11 @@ impl Session {
                                 .cell(r, c)
                                 .map(|x| x.style)
                                 .unwrap_or(0);
-                            // A leading `'` pastes as quote-prefixed text
-                            // (what copy writes for one).
+                            // Read as typed into the target: a leading `'`
+                            // is quote-prefixed text (what copy writes for
+                            // one), a date brings its format.
                             let styles = &mut self.pkg.workbook.styles;
-                            let mut cell = gridcore::entry::paste_cell(styles, style, text);
+                            let mut cell = gridcore::entry::paste_cell(styles, style, text, &ctx);
                             // A pasted `=…` that doesn't parse would freeze as
                             // an unsupported cell (never evaluates, renders
                             // blank); demote it to literal text instead, same
@@ -405,24 +467,95 @@ impl Session {
         None
     }
 
+    /// Undo/redo snapshots of `keys` on sheet `sheet_idx` as it is now
+    /// ([`gridcore::sheet::snapshot_cells`]): spill output of a live anchor
+    /// is a blank the anchor re-spills over.
+    fn snapshot(&self, sheet_idx: usize, keys: &[(u32, u32)]) -> Vec<Option<Cell>> {
+        let wb = &self.pkg.workbook;
+        let frozen = |r, c| self.engine.is_frozen(wb, (sheet_idx, r, c));
+        gridcore::sheet::snapshot_cells(&wb.sheets[sheet_idx], keys, frozen)
+    }
+
     /// Apply cell changes as one undo group, through the engine.
     fn apply(&mut self, changes: Vec<(u32, u32, Cell)>) {
-        if changes.is_empty() {
+        let keys = changes.iter().map(|&(r, c, _)| (r, c)).collect();
+        self.record(keys, |s| {
+            let sheet_idx = s.active;
+            s.engine.set_cells(&mut s.pkg.workbook, sheet_idx, changes);
+        });
+    }
+
+    /// Run `write`, which edits the cells `keys` names on the active sheet,
+    /// as one undo group. Every cell's before is taken ahead of the first
+    /// write and its after once the last is done, so the group is one
+    /// snapshot of its cells, as [`Engine::restore_cells`] needs: taken cell
+    /// by cell, a spill anchor's after could still claim a cell a later
+    /// write blocked it with.
+    fn record(&mut self, keys: Vec<(u32, u32)>, write: impl FnOnce(&mut Self)) {
+        if keys.is_empty() {
             return;
         }
         let sheet_idx = self.active;
-        let mut group = UndoGroup {
-            sheet: sheet_idx,
-            changes: Vec::with_capacity(changes.len()),
+        // An edit can take what only its undo puts back from outside the
+        // keys: overwriting a frozen anchor clears its cached block, and
+        // typing into the block drops the anchor's extent. The group
+        // records the anchor and its block too
+        // ([`gridcore::sheet::frozen_spill_keys`]).
+        let keys = {
+            let wb = &self.pkg.workbook;
+            let frozen = |r, c| self.engine.is_frozen(wb, (sheet_idx, r, c));
+            gridcore::sheet::frozen_spill_keys(&wb.sheets[sheet_idx], &keys, frozen)
         };
-        for (r, c, cell) in changes {
-            let before = self.pkg.workbook.sheets[sheet_idx].cell(r, c).cloned();
-            self.engine
-                .set_cell(&mut self.pkg.workbook, (sheet_idx, r, c), cell);
-            let after = self.pkg.workbook.sheets[sheet_idx].cell(r, c).cloned();
-            group.changes.push((r, c, before, after));
-        }
+        // Spill output of a live anchor is snapshotted as the blank its
+        // anchor re-spills over ([`Session::snapshot`]), whether or not the
+        // anchor is in the group.
+        let snapshot = |s: &Self| s.snapshot(sheet_idx, &keys);
+        let before = snapshot(self);
+        write(self);
+        let after = snapshot(self);
+        let group = UndoGroup {
+            sheet: sheet_idx,
+            changes: keys
+                .iter()
+                .zip(before.into_iter().zip(after))
+                .map(|(&(r, c), (b, a))| (r, c, b, a))
+                .collect(),
+            styles_only: false,
+        };
         self.undo.push(UndoAction::Cells(group));
+        self.edits += 1;
+        self.redo.clear();
+        self.dirty = true;
+    }
+
+    /// Restyle cells on sheet `sheet_idx` — `(row, col, style index)` — as
+    /// one undo group. Only styles change ([`Engine::set_styles`]): a value,
+    /// formula or spill is never re-entered, so formatting a spilled block
+    /// keeps the spill.
+    fn apply_styles(&mut self, sheet_idx: usize, styles: Vec<(u32, u32, u32)>) {
+        if styles.is_empty() {
+            return;
+        }
+        let before: Vec<Option<Cell>> = {
+            let sheet = &self.pkg.workbook.sheets[sheet_idx];
+            styles
+                .iter()
+                .map(|&(r, c, _)| sheet.cell(r, c).cloned())
+                .collect()
+        };
+        self.engine
+            .set_styles(&mut self.pkg.workbook, sheet_idx, &styles);
+        let sheet = &self.pkg.workbook.sheets[sheet_idx];
+        let changes = styles
+            .iter()
+            .zip(before)
+            .map(|(&(r, c, _), before)| (r, c, before, sheet.cell(r, c).cloned()))
+            .collect();
+        self.undo.push(UndoAction::Cells(UndoGroup {
+            sheet: sheet_idx,
+            changes,
+            styles_only: true,
+        }));
         self.edits += 1;
         self.redo.clear();
         self.dirty = true;
@@ -432,10 +565,14 @@ impl Session {
         match self.undo.pop() {
             Some(UndoAction::Cells(group)) => {
                 self.active = group.sheet.min(self.pkg.workbook.sheets.len() - 1);
-                for &(r, c, ref before, _) in group.changes.iter().rev() {
-                    let cell = before.clone().unwrap_or_default();
+                if group.styles_only {
+                    let styles = group_styles(&group, |ch| &ch.2);
                     self.engine
-                        .restore_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
+                        .set_styles(&mut self.pkg.workbook, group.sheet, &styles);
+                } else {
+                    let cells = group_cells(group.changes.iter().rev(), |ch| &ch.2);
+                    self.engine
+                        .restore_cells(&mut self.pkg.workbook, group.sheet, &cells);
                 }
                 self.redo.push(UndoAction::Cells(group));
                 self.dirty = true;
@@ -461,10 +598,14 @@ impl Session {
         match self.redo.pop() {
             Some(UndoAction::Cells(group)) => {
                 self.active = group.sheet.min(self.pkg.workbook.sheets.len() - 1);
-                for &(r, c, _, ref after) in group.changes.iter() {
-                    let cell = after.clone().unwrap_or_default();
+                if group.styles_only {
+                    let styles = group_styles(&group, |ch| &ch.3);
                     self.engine
-                        .restore_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
+                        .set_styles(&mut self.pkg.workbook, group.sheet, &styles);
+                } else {
+                    let cells = group_cells(group.changes.iter(), |ch| &ch.3);
+                    self.engine
+                        .restore_cells(&mut self.pkg.workbook, group.sheet, &cells);
                 }
                 self.undo.push(UndoAction::Cells(group));
                 self.dirty = true;
@@ -521,36 +662,18 @@ impl Session {
         self.engine = engine;
     }
 
-    /// What the editor and formula bar start from: [`Session::cell_src`] with
-    /// a quote prefix's apostrophe put back, so re-committing keeps it text.
+    /// What the editor and formula bar start from (and a copy carries):
+    /// [`gridcore::entry::seed_text`] — every digit of a number, a percent
+    /// cell's `150%`, a quote prefix's apostrophe — as xlsxy and the suite
+    /// seed theirs. grid.js commits the editor even when it is unchanged, so
+    /// the cell is re-read: a number past 15 significant digits comes back
+    /// rounded to 15, and an E-notation seed (`1E300`) in a General cell
+    /// brings the scientific format `0.00E+00`.
     fn cell_seed(&self, row: u32, col: u32) -> String {
-        let src = self.cell_src(row, col);
         let styles = &self.pkg.workbook.styles;
         match self.pkg.workbook.sheets[self.active].cell(row, col) {
-            Some(cell) => gridcore::entry::copy_field(cell, &styles.xf(cell.style), src),
-            None => src,
-        }
-    }
-
-    /// The raw source of a cell, as copied: `=FORMULA` or the raw value text.
-    /// (The number keeps Rust's shortest round-trip text rather than
-    /// General's 15-digit rounding, so a copy or an edit never loses digits.)
-    fn cell_src(&self, row: u32, col: u32) -> String {
-        let Some(cell) = self.pkg.workbook.sheets[self.active].cell(row, col) else {
-            return String::new();
-        };
-        if let Some(f) = &cell.formula {
-            return format!("={f}");
-        }
-        match &cell.value {
-            CellValue::Empty => String::new(),
-            CellValue::Number(n) => {
-                // Shortest round-trip text (Rust's f64 Display is shortest).
-                format!("{n}")
-            }
-            CellValue::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
-            CellValue::Text(s) => s.clone(),
-            CellValue::Error(e) => e.clone(),
+            Some(cell) => gridcore::entry::seed_text(cell, &styles.xf(cell.style)),
+            None => String::new(),
         }
     }
 
@@ -573,8 +696,85 @@ impl Session {
         out
     }
 
-    /// The selection as TSV of raw cell sources (formulas as `=...`), rows by
-    /// `\n`, cells by `\t` — round-trips through `paste`.
+    /// Record the selection as this session's clip and return its TSV.
+    fn record_clip(&mut self, cut: bool) -> String {
+        let text = self.selection_tsv();
+        let (ar, ac) = self.anchor.unwrap_or(self.cur);
+        let (r1, r2) = (self.cur.0.min(ar), self.cur.0.max(ar));
+        let (c1, c2) = (self.cur.1.min(ac), self.cur.1.max(ac));
+        let sheet = &self.pkg.workbook.sheets[self.active];
+        let cells = (r1..=r2)
+            .map(|r| (c1..=c2).map(|c| sheet.cell(r, c).cloned()).collect())
+            .collect();
+        self.clip = Some(GridClip {
+            cells,
+            from: (r1, c1),
+            cut,
+            text: clip_key(&text),
+        });
+        text
+    }
+
+    /// Paste this session's own clip at `(r0, c0)` when `text` is what it
+    /// put on the clipboard (the host may hand back CRLF and a trailing line
+    /// break). A copy's formulas move their relative references with the
+    /// paste; a cut's keep them. False when `text` is someone else's.
+    fn paste_own_clip(&mut self, r0: u32, c0: u32, text: &str) -> bool {
+        let text = clip_key(text);
+        let Some(clip) = self.clip.clone().filter(|c| c.text == text) else {
+            return false;
+        };
+        let (dr_all, dc_all) = (
+            r0 as i64 - clip.from.0 as i64,
+            c0 as i64 - clip.from.1 as i64,
+        );
+        // The block written from (r0, c0): rows and cells pushed off the
+        // grid's edge are dropped, so rows may differ in length.
+        let mut block = Vec::new();
+        let mut keys = Vec::new();
+        for (dr, row) in clip.cells.iter().enumerate() {
+            let r = r0 + dr as u32;
+            if r >= MAX_ROWS {
+                break;
+            }
+            let mut out = Vec::new();
+            for (dc, cell) in row.iter().enumerate() {
+                let c = c0 + dc as u32;
+                if c >= MAX_COLS {
+                    break;
+                }
+                let mut cell = cell.clone().unwrap_or_default();
+                if !clip.cut && (dr_all, dc_all) != (0, 0) {
+                    if let Some(f) = &cell.formula {
+                        if let Some(t) = gridcore::formula::translate_formula(f, dr_all, dc_all) {
+                            cell.formula = Some(t);
+                        }
+                    }
+                }
+                keys.push((r, c));
+                out.push(cell);
+            }
+            block.push(out);
+        }
+        // Through `Engine::paste_block`, as one undo group: a pasted spilling
+        // array still spills, and an array block pasted back in place keeps
+        // its block.
+        self.record(keys, |s| {
+            let sheet_idx = s.active;
+            s.engine
+                .paste_block(&mut s.pkg.workbook, sheet_idx, (r0, c0), &block);
+        });
+        if clip.cut {
+            if let Some(c) = self.clip.as_mut() {
+                c.cut = false;
+            }
+        }
+        true
+    }
+
+    /// The selection as TSV of each cell's editor seed
+    /// ([`Session::cell_seed`]: formulas as `=...`, a quote prefix's `'`),
+    /// rows by `\n`, cells by `\t` — round-trips through `paste`.
     fn selection_tsv(&self) -> String {
         let (ar, ac) = self.anchor.unwrap_or(self.cur);
         let (r1, r2) = (self.cur.0.min(ar), self.cur.0.max(ar));
@@ -598,7 +798,7 @@ impl Session {
     /// snapshot each cell's existing style first (so the loop below never
     /// observes an already-patched style from earlier in the same range),
     /// compute the patched `Xf`, intern it, and hand the whole batch to
-    /// `apply()` — one `UndoGroup`, one `dispatch("undo")` to revert.
+    /// `apply_styles()` — one `UndoGroup`, one `dispatch("undo")` to revert.
     fn apply_format_to_selection(&mut self, patch: &FormatPatch) {
         let (ar, ac) = self.anchor.unwrap_or(self.cur);
         let (r1, r2) = (self.cur.0.min(ar), self.cur.0.max(ar));
@@ -614,27 +814,25 @@ impl Session {
             return;
         }
         let sheet_idx = self.active;
-        let snapshot: Vec<(u32, u32, Option<Cell>)> = {
+        let snapshot: Vec<(u32, u32, u32)> = {
             let sheet = &self.pkg.workbook.sheets[sheet_idx];
             let mut v = Vec::new();
             for r in r1..=r2 {
                 for c in c1..=c2 {
-                    v.push((r, c, sheet.cell(r, c).cloned()));
+                    v.push((r, c, sheet.cell(r, c).map_or(0, |cl| cl.style)));
                 }
             }
             v
         };
-        let mut changes = Vec::with_capacity(snapshot.len());
-        for (r, c, existing) in snapshot {
-            let cur_style = existing.as_ref().map(|cl| cl.style).unwrap_or(0);
+        let mut styles = Vec::with_capacity(snapshot.len());
+        for (r, c, cur_style) in snapshot {
             let base_xf = self.pkg.workbook.styles.xf(cur_style);
             let new_xf = apply_patch_to_xf(&base_xf, patch);
             let idx = self.pkg.workbook.styles.intern(new_xf);
-            let mut cell = existing.unwrap_or_default();
-            cell.style = idx;
-            changes.push((r, c, cell));
+            styles.push((r, c, idx));
         }
-        self.apply(changes);
+        // Only styles change: a spilled block stays spilled (#784).
+        self.apply_styles(sheet_idx, styles);
     }
 
     /// `fmt\t<key>\t<value>` — the toolbar's one-key format verbs.
@@ -796,7 +994,16 @@ impl Session {
                 }
                 first = false;
                 let xf = wb.styles.xf(cell.style);
-                let text = format_with(&xf, &cell.value, wb.date1904);
+                // A General number is fitted to its column in characters, as
+                // Excel's General shows it (at most 11; the editor and a copy
+                // keep every digit).
+                let text = match cell.value {
+                    CellValue::Number(n) if gridcore::entry::is_general(&xf) => {
+                        let chars = sh.col_width(c).floor().max(1.0) as usize;
+                        gridcore::sheet::fmt_general_cell(n, chars)
+                    }
+                    _ => format_with(&xf, &cell.value, wb.date1904),
+                };
                 out.push_str("{\"r\":");
                 out.push_str(&r.to_string());
                 out.push_str(",\"c\":");
@@ -1683,12 +1890,12 @@ impl Session {
     //     earlier version of this bucket used a lossy `sheet.add`-by-name
     //     inverse instead — replaced after review flagged that it would
     //     silently resurrect an EMPTY sheet as "undo".)
-    //   - `cell.format`: Task 3's empirical bucket A carries over unchanged —
-    //     it goes through the identical [`Session::apply`] path `range.set`
-    //     uses (only each cell's `style` index differs; value/formula/spill
-    //     untouched), so it lands in the SAME true wasm-undo-stack `Cells`
-    //     group -> `"undoSteps":1`, unconditionally (a range always covers
-    //     >=1 cell, unlike `range.set`'s possibly-empty `rows` batch).
+    //   - `cell.format`: Task 3's empirical bucket A carries over — it goes
+    //     through [`Session::apply_styles`] (only each cell's `style` index
+    //     changes; value/formula/spill untouched), which pushes ONE `Cells`
+    //     group (`styles_only`) onto the same true wasm undo stack
+    //     `range.set` uses -> `"undoSteps":1`, unconditionally (a range always
+    //     covers >=1 cell, unlike `range.set`'s possibly-empty `rows` batch).
     //   - `col.width`: Task 3 found the TUI's own F7/F8 width-adjust keys
     //     never push onto xlsxy's undo stack at all (no true inverse exists
     //     to reuse) -> here too, NOT pushed onto gridwasm's `undo`/`redo`
@@ -1929,9 +2136,10 @@ impl Session {
     /// `{range,patch,sheet?}` -> `{formatted,undoSteps:1}` — sets `patch`
     /// over every cell in `range` via the shared `gridcore::format` helpers
     /// (`apply_patch_to_xf`/`FormatPatch::parse`), landing as ONE
-    /// [`Session::apply`] call — the SAME true wasm-undo-stack `Cells` group
-    /// `range.set` uses (Task 3's empirical bucket A). Value/formula/spill
-    /// are preserved; only each cell's style index changes. `undoSteps` is
+    /// [`Session::apply_styles`] call — the SAME true wasm-undo-stack `Cells`
+    /// group kind `range.set` uses (Task 3's empirical bucket A). Only each
+    /// cell's style index changes: value, formula and spill are never
+    /// re-entered, so a spilled block stays spilled. `undoSteps` is
     /// unconditionally `1`: unlike `range.set`'s possibly-empty `rows`
     /// batch, a parsed range always covers >=1 cell. Mirrors xlsxy
     /// control.rs's `cell_format` field-for-field (snapshot-then-mutate,
@@ -1949,33 +2157,25 @@ impl Session {
         let pairs = ctl_patch_pairs(patch_arg)?;
         let patch = FormatPatch::parse(&pairs)?;
 
-        let snapshot: Vec<(u32, u32, Option<Cell>)> = {
+        let snapshot: Vec<(u32, u32, u32)> = {
             let sheet = &self.pkg.workbook.sheets[si];
             let mut v = Vec::new();
             for r in r1..=r2 {
                 for c in c1..=c2 {
-                    v.push((r, c, sheet.cell(r, c).cloned()));
+                    v.push((r, c, sheet.cell(r, c).map_or(0, |cl| cl.style)));
                 }
             }
             v
         };
-        let mut changes = Vec::with_capacity(snapshot.len());
-        for (r, c, existing) in snapshot {
-            let cur = existing.as_ref().map(|cl| cl.style).unwrap_or(0);
+        let mut styles = Vec::with_capacity(snapshot.len());
+        for (r, c, cur) in snapshot {
             let base_xf = self.pkg.workbook.styles.xf(cur);
             let new_xf = apply_patch_to_xf(&base_xf, &patch);
             let idx = self.pkg.workbook.styles.intern(new_xf);
-            let mut cell = existing.unwrap_or_default();
-            cell.style = idx;
-            changes.push((r, c, cell));
+            styles.push((r, c, idx));
         }
-        let formatted = changes.len();
-        // `apply` targets `self.active` — temporarily swap it to the target
-        // sheet, same trick `ctl_range_set`/`ctl_cell_set` already use.
-        let prev_active = self.active;
-        self.active = si;
-        self.apply(changes);
-        self.active = prev_active;
+        let formatted = styles.len();
+        self.apply_styles(si, styles);
         Ok(format!("{{\"formatted\":{formatted},\"undoSteps\":1}}"))
     }
 
@@ -2932,11 +3132,448 @@ mod tests {
     }
 
     #[test]
+    fn pasted_text_is_read_like_typed_entry() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("paste\t8\t0\t1/15/2024\t$5\t'007");
+        let wb = &s.pkg.workbook;
+        let at = |c: u32| wb.sheets[0].cell(8, c).cloned().unwrap();
+        let date = at(0);
+        assert_eq!(date.value, CellValue::Number(45_306.0));
+        assert_eq!(wb.styles.xf(date.style).code.as_deref(), Some("m/d/yyyy"));
+        assert_eq!(at(1).value, CellValue::Number(5.0));
+        assert_eq!(at(2).value, CellValue::Text("007".into()));
+        assert!(wb.styles.xf(at(2).style).quote_prefix);
+    }
+
+    #[test]
+    fn the_editor_seeds_every_digit_and_a_percent_cell_its_percent() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.pkg.workbook.sheets[0].set_cell(9, 0, Cell::number(0.1 + 0.2));
+        let mut xf = gridcore::sheet::Xf::default();
+        xf.set_code(Some("0%".into()));
+        let pct = s.pkg.workbook.styles.intern(xf);
+        s.pkg.workbook.sheets[0].set_cell(
+            9,
+            1,
+            Cell {
+                style: pct,
+                ..Cell::number(1.5)
+            },
+        );
+        assert_eq!(s.cell_seed(9, 0), "0.30000000000000004");
+        assert_eq!(s.cell_seed(9, 1), "150%");
+        // The seed re-enters as the same value.
+        s.dispatch("set\t9\t1\t150%");
+        let b10 = s.pkg.workbook.sheets[0].cell(9, 1).unwrap().value.clone();
+        assert_eq!(b10, CellValue::Number(1.5));
+    }
+
+    #[test]
+    fn a_general_number_is_fitted_to_its_column() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.pkg.workbook.sheets[0].set_cell(9, 0, Cell::number(123_456_789_012.0));
+        let chars = s.pkg.workbook.sheets[0].col_width(0).floor() as usize;
+        let want = gridcore::sheet::fmt_general_cell(123_456_789_012.0, chars);
+        let v = s.view_json(None);
+        assert!(v.contains(&format!("\"t\":\"{want}\"")), "{want}: {v}");
+        assert!(!v.contains("\"t\":\"123456789012\""), "{v}");
+        // A wide column still stops at General's 11 characters.
+        s.pkg.workbook.sheets[0].set_col_width(0, 30.0);
+        let v = s.view_json(None);
+        assert!(v.contains("\"t\":\"1.23457E+11\""), "{v}");
+        // The editor keeps every digit.
+        assert_eq!(s.cell_seed(9, 0), "123456789012");
+    }
+
+    #[test]
     fn copy_preserves_formulas_as_source() {
         let mut s = Session::open(&sample_xlsx()).expect("open");
         s.dispatch("select\t3\t1");
         let tsv = s.dispatch("copy").expect("copy");
         assert_eq!(tsv, "=SUM(B1:B3)");
+    }
+
+    #[test]
+    fn a_copy_pasted_back_is_the_same_cells_between_text_and_general() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let styles = &mut s.pkg.workbook.styles;
+        let quoted = styles.intern(gridcore::sheet::Xf {
+            quote_prefix: true,
+            ..gridcore::sheet::Xf::default()
+        });
+        let mut text_xf = gridcore::sheet::Xf::default();
+        text_xf.set_code(Some("@".into()));
+        let text_fmt = styles.intern(text_xf);
+        let sh = &mut s.pkg.workbook.sheets[0];
+        let q007 = Cell {
+            style: quoted,
+            ..Cell::text("007")
+        };
+        let tabc = Cell {
+            style: text_fmt,
+            ..Cell::text("'abc")
+        };
+        sh.set_cell(10, 0, q007.clone());
+        sh.set_cell(10, 1, tabc.clone());
+        // Targets of the other kind.
+        sh.set_cell(
+            12,
+            0,
+            Cell {
+                style: text_fmt,
+                ..Cell::default()
+            },
+        );
+        sh.set_cell(12, 1, Cell::text("x"));
+        s.dispatch("select\t10\t0\t10\t1");
+        let tsv = s.dispatch("copy").unwrap();
+        // The host hands the text back with CRLF and a trailing line break.
+        s.dispatch(&format!("paste\t12\t0\t{}\r\n", tsv.replace('\n', "\r\n")));
+        let at = |s: &Session, r, c| s.pkg.workbook.sheets[0].cell(r, c).cloned().unwrap();
+        assert_eq!(at(&s, 12, 0), q007);
+        assert_eq!(at(&s, 12, 1), tabc);
+        // Text from elsewhere is still read as typed into the target.
+        s.dispatch("paste\t13\t0\t'abc");
+        assert_eq!(at(&s, 13, 0).value, CellValue::Text("abc".into()));
+    }
+
+    #[test]
+    fn a_copy_ending_in_an_empty_row_still_pastes_as_cells() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let sh = &mut s.pkg.workbook.sheets[0];
+        sh.set_cell(20, 0, Cell::formula("B21"));
+        sh.set_cell(25, 2, Cell::text("gone"));
+        s.dispatch("select\t20\t0\t21\t0");
+        let tsv = s.dispatch("copy").unwrap();
+        assert!(tsv.ends_with('\n'), "{tsv:?}");
+        for pasted in [
+            tsv.clone(),
+            tsv.trim_end().to_string(),
+            tsv.replace('\n', "\r\n"),
+        ] {
+            s.dispatch(&format!("paste\t24\t2\t{pasted}"));
+            let at = |r| {
+                s.pkg.workbook.sheets[0]
+                    .cell(r, 2)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            assert_eq!(at(24).formula.as_deref(), Some("D25"), "{pasted:?}");
+            assert!(at(25).is_blank(), "{pasted:?}: the empty row pastes too");
+            s.pkg.workbook.sheets[0].set_cell(25, 2, Cell::text("gone"));
+        }
+    }
+
+    #[test]
+    fn a_pasted_copy_moves_its_references_and_a_cut_keeps_them() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let f = |s: &Session, r, c| {
+            s.pkg.workbook.sheets[0]
+                .cell(r, c)
+                .and_then(|c| c.formula.clone())
+        };
+        s.dispatch("select\t3\t1"); // =SUM(B1:B3)
+        let tsv = s.dispatch("copy").unwrap();
+        s.dispatch(&format!("paste\t3\t2\t{tsv}"));
+        assert_eq!(f(&s, 3, 2).as_deref(), Some("SUM(C1:C3)"));
+        // A cut records the cells before clearing them, and pastes them
+        // unchanged without clearing the source again.
+        s.dispatch("select\t3\t1");
+        let tsv = s.dispatch("cut").unwrap();
+        assert_eq!(f(&s, 3, 1), None, "the cut cleared its source");
+        s.dispatch(&format!("paste\t5\t3\t{tsv}"));
+        assert_eq!(f(&s, 5, 3).as_deref(), Some("SUM(B1:B3)"));
+        // Pasted again, it is a copy: its references move.
+        s.dispatch(&format!("paste\t5\t4\t{tsv}"));
+        assert_eq!(f(&s, 5, 4).as_deref(), Some("SUM(E3:E5)"));
+    }
+
+    /// Column `c`'s values, rows 0..=2, on the first sheet.
+    fn col3(s: &Session, c: u32) -> Vec<CellValue> {
+        (0..3)
+            .map(|r| {
+                s.pkg.workbook.sheets[0]
+                    .cell(r, c)
+                    .map(|cl| cl.value.clone())
+                    .unwrap_or(CellValue::Empty)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn paste_whole_spill_block_respills_through_undo_redo() {
+        // #777: a copied spill block pastes as a spilling anchor, also on
+        // redo; undo gives back what was there.
+        let n = |v: f64| CellValue::Number(v);
+        let seq = vec![n(1.0), n(2.0), n(3.0)];
+        for old in [None, Some(["a", "b", "c"])] {
+            let mut s = Session::open(&sample_xlsx()).expect("open");
+            s.dispatch("set\t0\t4\t=SEQUENCE(3)"); // E1 spills E1:E3
+            assert_eq!(col3(&s, 4), seq);
+            if let Some(old) = old {
+                for (r, v) in old.iter().enumerate() {
+                    s.dispatch(&format!("set\t{r}\t6\t{v}"));
+                }
+            }
+            let was = col3(&s, 6);
+            s.dispatch("select\t0\t4\t2\t4");
+            let tsv = s.dispatch("copy").unwrap();
+            s.dispatch(&format!("paste\t0\t6\t{tsv}"));
+            assert_eq!(col3(&s, 6), seq, "pasted over {old:?}");
+            for round in 0..2 {
+                s.dispatch("undo");
+                assert_eq!(col3(&s, 6), was, "undo {round} over {old:?}");
+                s.dispatch("redo");
+                assert_eq!(col3(&s, 6), seq, "redo {round} over {old:?}");
+                let g1 = s.pkg.workbook.sheets[0].cell(0, 6).unwrap();
+                assert_eq!(g1.spill, Some((3, 1)));
+            }
+        }
+    }
+
+    #[test]
+    fn paste_single_anchor_over_occupied_spills_error_through_undo_redo() {
+        // #777 / #725: a pasted anchor whose spill area is occupied is
+        // #SPILL! and keeps the occupant.
+        let n = |v: f64| CellValue::Number(v);
+        let keep = CellValue::Text("keep".into());
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("set\t0\t4\t=SEQUENCE(3)");
+        s.dispatch("set\t1\t6\tkeep");
+        s.dispatch("select\t0\t4");
+        let tsv = s.dispatch("copy").unwrap();
+        s.dispatch(&format!("paste\t0\t6\t{tsv}"));
+        let after = vec![
+            CellValue::Error("#SPILL!".into()),
+            keep.clone(),
+            CellValue::Empty,
+        ];
+        assert_eq!(col3(&s, 6), after);
+        s.dispatch("undo");
+        assert_eq!(col3(&s, 6), vec![CellValue::Empty, keep, CellValue::Empty]);
+        s.dispatch("redo");
+        assert_eq!(col3(&s, 6), after);
+        // Over empty cells it spills; undo empties them; redo re-spills.
+        s.dispatch(&format!("paste\t0\t9\t{tsv}"));
+        let seq = vec![n(1.0), n(2.0), n(3.0)];
+        assert_eq!(col3(&s, 9), seq);
+        s.dispatch("undo");
+        assert_eq!(col3(&s, 9), vec![CellValue::Empty; 3]);
+        s.dispatch("redo");
+        assert_eq!(col3(&s, 9), seq);
+    }
+
+    #[test]
+    fn undo_redo_around_a_live_spill_keeps_it_spilling() {
+        // #777 r1: spill output edited without its anchor is snapshotted as
+        // the blank its anchor re-spills over, not as a plain value.
+        let n = |v: f64| CellValue::Number(v);
+        let seq = vec![n(1.0), n(2.0), n(3.0)];
+        let blocked = vec![
+            CellValue::Error("#SPILL!".into()),
+            CellValue::Text("x".into()),
+            CellValue::Empty,
+        ];
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("set\t0\t4\t=SEQUENCE(3)"); // E1 spills E1:E3
+        // Delete E2:E3: a no-op, and so are undo and redo.
+        s.dispatch("clear\t1\t4\t2\t4");
+        for step in ["clear", "undo", "redo", "undo"] {
+            if step != "clear" {
+                s.dispatch(step);
+            }
+            assert_eq!(col3(&s, 4), seq, "{step}");
+            let e1 = s.pkg.workbook.sheets[0].cell(0, 4).unwrap();
+            assert_eq!(e1.spill, Some((3, 1)), "{step}");
+        }
+        // Type into a spill child: #SPILL!; undo re-spills; redo blocks.
+        s.dispatch("set\t1\t4\tx");
+        assert_eq!(col3(&s, 4), blocked);
+        s.dispatch("undo");
+        assert_eq!(col3(&s, 4), seq);
+        s.dispatch("redo");
+        assert_eq!(col3(&s, 4), blocked);
+        // Delete the blocker: it spills; undo brings it back; redo spills.
+        s.dispatch("clear\t1\t4\t1\t4");
+        assert_eq!(col3(&s, 4), seq);
+        s.dispatch("undo");
+        assert_eq!(col3(&s, 4), blocked);
+        s.dispatch("redo");
+        assert_eq!(col3(&s, 4), seq);
+    }
+
+    #[test]
+    fn undoing_an_overwrite_of_a_frozen_anchor_restores_its_block() {
+        // #837: typing over a frozen anchor clears its cached block; undo
+        // puts the block back, extent and saved `ref` too.
+        let n = |v: f64| CellValue::Number(v);
+        let cached = vec![n(7.0), n(8.0), n(9.0)];
+        let typed = vec![n(5.0), CellValue::Empty, CellValue::Empty];
+        let mut pkg = new_xlsx();
+        let sheet = &mut pkg.workbook.sheets[0];
+        sheet.set_cell(0, 0, Cell::number(1.0));
+        sheet.set_cell(
+            0,
+            4,
+            Cell {
+                value: n(7.0),
+                formula: Some("PIVOTBY(A1,4)".into()),
+                f_attrs: Some("t=\"array\" ref=\"E1:E3\"".into()),
+                spill: Some((3, 1)),
+                ..Cell::default()
+            },
+        );
+        sheet.set_cell(1, 4, Cell::number(8.0));
+        sheet.set_cell(2, 4, Cell::number(9.0));
+        let mut s = Session::open(&save_xlsx(&pkg)).expect("open");
+        assert_eq!(col3(&s, 4), cached, "loaded");
+        let f_attrs = s.pkg.workbook.sheets[0].cell(0, 4).unwrap().f_attrs.clone();
+        assert!(f_attrs.is_some());
+        s.dispatch("set\t0\t4\t5");
+        assert_eq!(col3(&s, 4), typed);
+        for round in 0..2 {
+            s.dispatch("undo");
+            assert_eq!(col3(&s, 4), cached, "undo {round}");
+            let e1 = s.pkg.workbook.sheets[0].cell(0, 4).unwrap();
+            assert_eq!(e1.spill, Some((3, 1)), "undo {round}");
+            assert_eq!(e1.f_attrs, f_attrs, "undo {round}");
+            if round == 0 {
+                s.dispatch("redo");
+                assert_eq!(col3(&s, 4), typed, "redo");
+            }
+        }
+        let re = Session::open(&s.save()).expect("reopen");
+        assert_eq!(col3(&re, 4), cached, "saved");
+        let ws =
+            String::from_utf8_lossy(re.pkg.part("xl/worksheets/sheet1.xml").unwrap()).into_owned();
+        assert!(ws.contains(r#"<f t="array" ref="E1:E3">"#), "{ws}");
+    }
+
+    #[test]
+    fn recommitting_a_frozen_anchor_keeps_its_block() {
+        // #840: grid.js commits an unchanged editor (F2, Enter), so the same
+        // formula comes back; a frozen anchor keeps its cached block, extent
+        // and saved `ref`, through undo and redo.
+        let n = |v: f64| CellValue::Number(v);
+        let cached = vec![n(7.0), n(8.0), n(9.0)];
+        let mut pkg = new_xlsx();
+        let sheet = &mut pkg.workbook.sheets[0];
+        sheet.set_cell(0, 0, Cell::number(1.0));
+        sheet.set_cell(
+            0,
+            4,
+            Cell {
+                value: n(7.0),
+                formula: Some("PIVOTBY(A1,4)".into()),
+                f_attrs: Some("t=\"array\" ref=\"E1:E3\"".into()),
+                spill: Some((3, 1)),
+                ..Cell::default()
+            },
+        );
+        sheet.set_cell(1, 4, Cell::number(8.0));
+        sheet.set_cell(2, 4, Cell::number(9.0));
+        let mut s = Session::open(&save_xlsx(&pkg)).expect("open");
+        assert_eq!(col3(&s, 4), cached, "loaded");
+        // The editor's seed, as grid.js commits it back.
+        let seed = s.cell_seed(0, 4);
+        assert_eq!(seed, "=_xlfn.PIVOTBY(A1,4)");
+        s.dispatch(&format!("set	0	4	{seed}"));
+        for step in ["set", "undo", "redo"] {
+            if step != "set" {
+                s.dispatch(step);
+            }
+            assert_eq!(col3(&s, 4), cached, "{step}");
+            let e1 = s.pkg.workbook.sheets[0].cell(0, 4).unwrap();
+            assert_eq!(e1.spill, Some((3, 1)), "{step}");
+        }
+        let re = Session::open(&s.save()).expect("reopen");
+        assert_eq!(col3(&re, 4), cached, "saved");
+        let ws =
+            String::from_utf8_lossy(re.pkg.part("xl/worksheets/sheet1.xml").unwrap()).into_owned();
+        assert!(ws.contains(r#"<f t="array" ref="E1:E3">"#), "{ws}");
+    }
+
+    #[test]
+    fn undoing_typing_into_a_frozen_block_restores_its_extent() {
+        // #837 r2: a value typed into a frozen block drops its anchor's
+        // extent; undo puts the extent back, so the block saves whole. One
+        // cell, then every cell but the anchor.
+        let n = |v: f64| CellValue::Number(v);
+        let cached = vec![n(7.0), n(8.0), n(9.0)];
+        let edits = [
+            (vec!["set	1	4	5"], vec![n(7.0), n(5.0), n(9.0)]),
+            (
+                vec![
+                    "select	1	4	2	4",
+                    "paste	1	4	5
+6",
+                ],
+                vec![n(7.0), n(5.0), n(6.0)],
+            ),
+        ];
+        let mut pkg = new_xlsx();
+        let sheet = &mut pkg.workbook.sheets[0];
+        sheet.set_cell(0, 0, Cell::number(1.0));
+        sheet.set_cell(
+            0,
+            4,
+            Cell {
+                value: n(7.0),
+                formula: Some("PIVOTBY(A1,4)".into()),
+                f_attrs: Some("t=\"array\" ref=\"E1:E3\"".into()),
+                spill: Some((3, 1)),
+                ..Cell::default()
+            },
+        );
+        sheet.set_cell(1, 4, Cell::number(8.0));
+        sheet.set_cell(2, 4, Cell::number(9.0));
+        let file = save_xlsx(&pkg);
+        for (cmds, typed) in edits {
+            let mut s = Session::open(&file).expect("open");
+            let at = cmds.join(" ");
+            let extent = |s: &Session| s.pkg.workbook.sheets[0].cell(0, 4).unwrap().spill;
+            for cmd in &cmds {
+                s.dispatch(cmd);
+            }
+            assert_eq!(col3(&s, 4), typed, "{at}");
+            for round in 0..2 {
+                s.dispatch("undo");
+                assert_eq!(col3(&s, 4), cached, "undo {round}, {at}");
+                assert_eq!(extent(&s), Some((3, 1)), "undo {round}, {at}");
+                if round == 0 {
+                    s.dispatch("redo");
+                    assert_eq!(col3(&s, 4), typed, "redo, {at}");
+                }
+            }
+            let re = Session::open(&s.save()).expect("reopen");
+            assert_eq!(col3(&re, 4), cached, "saved, {at}");
+            let ws = String::from_utf8_lossy(re.pkg.part("xl/worksheets/sheet1.xml").unwrap())
+                .into_owned();
+            assert!(ws.contains(r#"<f t="array" ref="E1:E3">"#), "{at}: {ws}");
+        }
+    }
+
+    #[test]
+    fn undoing_an_overwrite_of_a_live_anchor_re_spills_it() {
+        // #837 guard: a live anchor's block is not recorded; undo re-spills
+        // it from its formula.
+        let n = |v: f64| CellValue::Number(v);
+        let seq = vec![n(1.0), n(2.0), n(3.0)];
+        let x = vec![
+            CellValue::Text("x".into()),
+            CellValue::Empty,
+            CellValue::Empty,
+        ];
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("set\t0\t4\t=SEQUENCE(3)");
+        s.dispatch("set\t0\t4\tx");
+        assert_eq!(col3(&s, 4), x);
+        s.dispatch("undo");
+        assert_eq!(col3(&s, 4), seq);
+        let e1 = s.pkg.workbook.sheets[0].cell(0, 4).unwrap();
+        assert_eq!(e1.spill, Some((3, 1)));
+        s.dispatch("redo");
+        assert_eq!(col3(&s, 4), x);
     }
 
     #[test]
@@ -2947,6 +3584,155 @@ mod tests {
         assert_eq!(tsv, "Apple");
         let v = s.view_json(None);
         assert!(!v.contains("Apple"), "{v}");
+    }
+
+    /// A session on a file with A1:A3 = 1, 2, 3 and a legacy CSE block
+    /// `{=A1:A3*2}` over D1:D3, spilling 2, 4, 6.
+    fn session_with_spilling_cse() -> Session {
+        let mut pkg = new_xlsx();
+        let sheet = &mut pkg.workbook.sheets[0];
+        for r in 0..3u32 {
+            sheet.set_cell(r, 0, Cell::number(f64::from(r + 1)));
+            sheet.set_cell(r, 3, Cell::number(f64::from(2 * (r + 1))));
+        }
+        sheet.set_cell(
+            0,
+            3,
+            Cell {
+                value: CellValue::Number(2.0),
+                formula: Some("A1:A3*2".into()),
+                f_attrs: Some(" t=\"array\" ref=\"D1:D3\"".into()),
+                spill: Some((3, 1)),
+                ..Cell::default()
+            },
+        );
+        let s = Session::open(&save_xlsx(&pkg)).expect("open");
+        assert_cse_spills(&s, "loaded");
+        s
+    }
+
+    /// D1 is the CSE block over D1:D3, spilling 2, 4, 6.
+    fn assert_cse_spills(s: &Session, when: &str) {
+        let sheet = &s.pkg.workbook.sheets[0];
+        let d1 = sheet.cell(0, 3).unwrap();
+        assert_eq!(d1.spill, Some((3, 1)), "{when}: {:?}", d1.value);
+        assert_eq!(
+            d1.f_attrs.as_deref(),
+            Some(" t=\"array\" ref=\"D1:D3\""),
+            "{when}"
+        );
+        for r in 0..3u32 {
+            assert_eq!(
+                sheet.cell(r, 3).unwrap().value,
+                CellValue::Number(f64::from(2 * (r + 1))),
+                "{when}: D{}",
+                r + 1
+            );
+        }
+    }
+
+    #[test]
+    fn a_spilling_cse_block_pasted_in_place_still_spills() {
+        // #825 AC4: copy (or cut) D1:D3 and paste it back at D1. Written cell
+        // by cell, the 4 pasted into D2 blocked D1 (#SPILL!). Undo puts back
+        // exactly what was there, and redo the paste, both still spilling.
+        for verb in ["copy", "cut"] {
+            let mut s = session_with_spilling_cse();
+            s.dispatch("select\t0\t3\t2\t3"); // D1:D3
+            let tsv = s.dispatch(verb).unwrap();
+            let before = s.pkg.workbook.sheets[0].cells.clone();
+            s.dispatch(&format!("paste\t0\t3\t{tsv}"));
+            assert_cse_spills(&s, &format!("{verb}: paste"));
+            let after = s.pkg.workbook.sheets[0].cells.clone();
+            s.dispatch("undo");
+            assert_eq!(s.pkg.workbook.sheets[0].cells, before, "{verb}: undo");
+            s.dispatch("redo");
+            assert_cse_spills(&s, &format!("{verb}: redo"));
+            assert_eq!(s.pkg.workbook.sheets[0].cells, after, "{verb}: redo");
+        }
+    }
+
+    #[test]
+    fn a_group_that_blocks_its_own_spill_undoes_and_redoes_exactly() {
+        // #825 AC9: one edit types a spilling D1 and then a 5 into D2, which
+        // blocks it. Snapshotted cell by cell, D2's before was D1's spilled
+        // 4, which undo left behind.
+        let mut s = Session::open(&save_xlsx(&new_xlsx())).expect("open");
+        s.apply(
+            (0..3)
+                .map(|r| (r, 0, Cell::number(f64::from(r + 1))))
+                .collect(),
+        );
+        let before = s.pkg.workbook.sheets[0].cells.clone();
+        s.apply(vec![
+            (0, 3, Cell::formula("A1:A3*2")),
+            (1, 3, Cell::number(5.0)),
+        ]);
+        let blocked = |s: &Session, when: &str| {
+            let sheet = &s.pkg.workbook.sheets[0];
+            let d1 = sheet.cell(0, 3).unwrap();
+            assert_eq!(d1.value, CellValue::Error("#SPILL!".into()), "{when}");
+            assert_eq!(d1.spill, None, "{when}");
+            assert_eq!(
+                sheet.cell(1, 3).unwrap().value,
+                CellValue::Number(5.0),
+                "{when}"
+            );
+        };
+        blocked(&s, "edit");
+        let after = s.pkg.workbook.sheets[0].cells.clone();
+        s.dispatch("undo");
+        assert_eq!(s.pkg.workbook.sheets[0].cells, before, "undo");
+        s.dispatch("redo");
+        blocked(&s, "redo");
+        assert_eq!(s.pkg.workbook.sheets[0].cells, after, "redo");
+    }
+
+    /// A session with `=SEQUENCE(3)` typed into D1 (spilling D1:D3).
+    fn session_with_spill() -> Session {
+        let mut s = Session::open(&save_xlsx(&new_xlsx())).expect("open");
+        s.dispatch("set\t0\t3\t=SEQUENCE(3)");
+        assert_eq!(spill_at_d1(&s), Some((3, 1)));
+        s
+    }
+
+    fn spill_at_d1(s: &Session) -> Option<(u32, u32)> {
+        s.pkg.workbook.sheets[0].cell(0, 3).and_then(|cl| cl.spill)
+    }
+
+    /// D1 still spills over D1:D3 (values 1..3), each cell (not) bold.
+    fn assert_spill_bold(s: &Session, bold: bool, when: &str) {
+        assert_eq!(spill_at_d1(s), Some((3, 1)), "{when}");
+        for r in 0..3u32 {
+            let cell = s.pkg.workbook.sheets[0].cell(r, 3).unwrap();
+            assert_eq!(cell.value, CellValue::Number(f64::from(r + 1)), "{when}");
+            assert_eq!(s.pkg.workbook.styles.xf(cell.style).bold, bold, "{when}");
+        }
+    }
+
+    #[test]
+    fn fmt_bold_on_a_spill_block_keeps_the_spill_through_undo_redo() {
+        // #784: formatting a spilled block left D1 #SPILL!.
+        let mut s = session_with_spill();
+        s.dispatch("select\t0\t3\t2\t3"); // D1:D3
+        s.dispatch("fmt\tbold\ttoggle");
+        assert_spill_bold(&s, true, "bold");
+        s.dispatch("undo");
+        assert_spill_bold(&s, false, "undo");
+        s.dispatch("redo");
+        assert_spill_bold(&s, true, "redo");
+    }
+
+    #[test]
+    fn ctl_cell_format_on_a_spill_block_keeps_the_spill_through_undo_redo() {
+        let mut s = session_with_spill();
+        let r = s.ctl(r#"{"verb":"cell.format","args":{"range":"D1:D3","patch":{"bold":true}}}"#);
+        assert!(r.contains("\"formatted\":3"), "{r}");
+        assert_spill_bold(&s, true, "bold");
+        s.dispatch("undo");
+        assert_spill_bold(&s, false, "undo");
+        s.dispatch("redo");
+        assert_spill_bold(&s, true, "redo");
     }
 
     // -- interactive `fmt`/`decimals`/`autosum` (toolbar verbs) ------------
@@ -2967,8 +3753,8 @@ mod tests {
             );
         }
         // Values are untouched by the format-only edit.
-        assert_eq!(s.cell_src(1, 0), "Apple");
-        assert_eq!(s.cell_src(1, 1), "1.25");
+        assert_eq!(s.cell_seed(1, 0), "Apple");
+        assert_eq!(s.cell_seed(1, 1), "1.25");
 
         s.dispatch("undo"); // ONE undo restores all four cells
         for (r, c) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
@@ -3093,7 +3879,7 @@ mod tests {
         s.dispatch("set\t2\t0\t30"); // A3
         s.dispatch("select\t3\t0"); // A4, active cell
         s.dispatch("autosum");
-        assert_eq!(s.cell_src(3, 0), "=SUM(A1:A3)");
+        assert_eq!(s.cell_seed(3, 0), "=SUM(A1:A3)");
         let v = s.view_json(None);
         assert!(v.contains("\"src\":\"=SUM(A1:A3)\""), "{v}");
         s.dispatch("select\t3\t0");
@@ -3108,7 +3894,7 @@ mod tests {
         s.dispatch("set\t0\t1\t15"); // B1
         s.dispatch("select\t0\t2"); // C1, active cell, nothing above (row 0)
         s.dispatch("autosum");
-        assert_eq!(s.cell_src(0, 2), "=SUM(A1:B1)");
+        assert_eq!(s.cell_seed(0, 2), "=SUM(A1:B1)");
     }
 
     #[test]
@@ -3122,7 +3908,7 @@ mod tests {
             undo_before,
             "no-op must not push an undo group"
         );
-        assert_eq!(s.cell_src(5, 5), "");
+        assert_eq!(s.cell_seed(5, 5), "");
         let v = s.view_json(None);
         assert!(
             v.contains("AutoSum: no numbers to sum"),
@@ -3406,7 +4192,7 @@ mod tests {
         s.dispatch(&format!("set\t0\t0\t{}", "y".repeat(32_768)));
         let err = s.err.clone().expect("an error");
         assert!(err.contains("32767"), "{err}");
-        assert_eq!(s.cell_src(0, 0), "old");
+        assert_eq!(s.cell_seed(0, 0), "old");
         let r = s.ctl(&format!(
             r#"{{"verb":"cell.set","args":{{"ref":"A1","text":"{}"}}}}"#,
             "y".repeat(32_768)
@@ -3445,7 +4231,7 @@ mod tests {
         }
         s.dispatch("set\t42\t0\t'abc");
         assert_eq!(
-            s.cell_src(42, 0),
+            s.cell_seed(42, 0),
             "'abc",
             "a Text cell keeps the entry as typed"
         );
@@ -3478,7 +4264,7 @@ mod tests {
         s.err = None;
         s.dispatch("set\t30\t0\t=SUM(");
         assert_eq!(s.err, None);
-        assert_eq!(s.cell_src(30, 0), "=SUM(");
+        assert_eq!(s.cell_seed(30, 0), "=SUM(");
         s.dispatch("set\t31\t0\t=SUM(");
         assert!(s.err.is_some(), "a General cell still refuses it");
     }

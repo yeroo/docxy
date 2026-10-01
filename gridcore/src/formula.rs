@@ -14,6 +14,8 @@
 //! - Coordinates in the AST are 0-based `i64` so translation can go negative
 //!   and be caught (→ `#REF!`) instead of wrapping.
 
+use std::borrow::Cow;
+
 use crate::sheet::{col_name, fmt_general, parse_col, parts_to_serial, serial_to_parts};
 
 // ---------------------------------------------------------------------------
@@ -1279,34 +1281,38 @@ fn escape_spec(name: &str) -> String {
     out
 }
 
-/// Print a structured reference back to canonical text.
+/// Print a structured reference back to canonical text. `file` spells the
+/// this-row item as a file stores it, `[#This Row],[c]`: the file grammar has
+/// no `@`.
 fn structured_to_string(
     table: &Option<String>,
     item: TableItem,
     col1: &Option<String>,
     col2: &Option<String>,
+    file: bool,
 ) -> String {
     let prefix = table.clone().unwrap_or_default();
-    let body = match (item, col1, col2) {
-        (TableItem::Data, None, _) => String::new(),
-        (TableItem::Data, Some(c), None) => escape_spec(c),
-        (TableItem::Data, Some(a), Some(b)) => {
-            format!("[{}]:[{}]", escape_spec(a), escape_spec(b))
-        }
-        (TableItem::ThisRow, None, _) => "@".to_string(),
-        (TableItem::ThisRow, Some(c), _) => format!("@{}", escape_spec(c)),
-        (TableItem::All, None, _) => "#All".to_string(),
-        (TableItem::Headers, None, _) => "#Headers".to_string(),
-        (TableItem::Totals, None, _) => "#Totals".to_string(),
-        (item, Some(c), _) => {
-            let tag = match item {
-                TableItem::All => "#All",
-                TableItem::Headers => "#Headers",
-                TableItem::Totals => "#Totals",
-                _ => "#Data",
-            };
-            format!("[{tag}],[{}]", escape_spec(c))
-        }
+    // The column part: `[a]` or the span `[a]:[b]`.
+    let cols = col1.as_ref().map(|a| match col2 {
+        Some(b) => format!("[{}]:[{}]", escape_spec(a), escape_spec(b)),
+        None => format!("[{}]", escape_spec(a)),
+    });
+    let tag = match item {
+        TableItem::Data => "#Data",
+        TableItem::All => "#All",
+        TableItem::Headers => "#Headers",
+        TableItem::Totals => "#Totals",
+        TableItem::ThisRow => "#This Row",
+    };
+    let body = match (item, col1, col2, cols) {
+        (TableItem::Data, None, _, _) => String::new(),
+        (TableItem::Data, Some(c), None, _) => escape_spec(c),
+        (TableItem::Data, _, _, Some(span)) => span,
+        (TableItem::ThisRow, None, _, _) if !file => "@".to_string(),
+        (TableItem::ThisRow, Some(c), None, _) if !file => format!("@{}", escape_spec(c)),
+        (_, None, _, _) => tag.to_string(),
+        (_, _, _, Some(cols)) => format!("[{tag}],{cols}"),
+        (_, Some(_), _, None) => unreachable!("cols is set whenever col1 is"),
     };
     format!("{prefix}[{body}]")
 }
@@ -1382,131 +1388,437 @@ fn ref_to_string(r: &CellRef) -> String {
 
 /// Print an AST back to formula text (no leading `=`), with minimal parens.
 pub fn to_string(e: &Expr) -> String {
-    match e {
-        Expr::Num(n) => fmt_general(*n),
-        Expr::Str(s) => format!("\"{}\"", s.replace('"', "\"\"")),
-        Expr::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
-        Expr::Err(x) => x.code().to_string(),
-        Expr::Missing => String::new(),
-        Expr::Ref(r) => ref_to_string(r),
-        Expr::Range(a, b) => format!("{}:{}", ref_to_string(a), ref_to_string(b)),
-        Expr::ColRange {
-            sheet,
-            c1,
-            c2,
-            abs1,
-            abs2,
-        } => {
-            let mut s = sheet.as_deref().map(sheet_prefix).unwrap_or_default();
-            if *c1 < 0 || *c2 < 0 {
-                s.push_str("#REF!");
-                return s;
+    Printer::default().print(e)
+}
+
+/// The AST printer behind [`to_string`] (the spelling held in memory and shown
+/// to the user) and [`file_formula`] (the spelling Excel stores in a file).
+#[derive(Default)]
+struct Printer {
+    /// File spelling: future-function prefixes, `_xlfn.ANCHORARRAY(…)` for
+    /// `A1#`, `_xlfn.SINGLE(…)` for `@x`, `_xlpm.` on LET/LAMBDA names, and
+    /// numbers that read back exactly.
+    file: bool,
+    /// The LET/LAMBDA names bound around the expression being printed
+    /// (file spelling only), without their `_xlpm.` prefix, and whether each
+    /// may hold a lambda (see [`Printer::func`]).
+    scope: Vec<(String, bool)>,
+}
+
+impl Printer {
+    fn print(&mut self, e: &Expr) -> String {
+        match e {
+            Expr::Num(n) => self.num(*n),
+            Expr::Str(s) => format!("\"{}\"", s.replace('"', "\"\"")),
+            Expr::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+            Expr::Err(x) => x.code().to_string(),
+            Expr::Missing => String::new(),
+            Expr::Ref(r) => ref_to_string(r),
+            Expr::Range(a, b) => format!("{}:{}", ref_to_string(a), ref_to_string(b)),
+            Expr::ColRange {
+                sheet,
+                c1,
+                c2,
+                abs1,
+                abs2,
+            } => {
+                let mut s = sheet.as_deref().map(sheet_prefix).unwrap_or_default();
+                if *c1 < 0 || *c2 < 0 {
+                    s.push_str("#REF!");
+                    return s;
+                }
+                s.push_str(&format!(
+                    "{}{}:{}{}",
+                    if *abs1 { "$" } else { "" },
+                    col_name(*c1 as u32),
+                    if *abs2 { "$" } else { "" },
+                    col_name(*c2 as u32)
+                ));
+                s
             }
-            s.push_str(&format!(
-                "{}{}:{}{}",
-                if *abs1 { "$" } else { "" },
-                col_name(*c1 as u32),
-                if *abs2 { "$" } else { "" },
-                col_name(*c2 as u32)
-            ));
-            s
-        }
-        Expr::RowRange {
-            sheet,
-            r1,
-            r2,
-            abs1,
-            abs2,
-        } => {
-            let mut s = sheet.as_deref().map(sheet_prefix).unwrap_or_default();
-            if *r1 < 0 || *r2 < 0 {
-                s.push_str("#REF!");
-                return s;
+            Expr::RowRange {
+                sheet,
+                r1,
+                r2,
+                abs1,
+                abs2,
+            } => {
+                let mut s = sheet.as_deref().map(sheet_prefix).unwrap_or_default();
+                if *r1 < 0 || *r2 < 0 {
+                    s.push_str("#REF!");
+                    return s;
+                }
+                s.push_str(&format!(
+                    "{}{}:{}{}",
+                    if *abs1 { "$" } else { "" },
+                    r1 + 1,
+                    if *abs2 { "$" } else { "" },
+                    r2 + 1
+                ));
+                s
             }
-            s.push_str(&format!(
-                "{}{}:{}{}",
-                if *abs1 { "$" } else { "" },
-                r1 + 1,
-                if *abs2 { "$" } else { "" },
-                r2 + 1
-            ));
-            s
-        }
-        Expr::Ref3D { first, last, a, b } => {
-            let f = sheet_prefix(first);
-            let f = f.trim_end_matches('!');
-            let l = sheet_prefix(last);
-            let l = l.trim_end_matches('!');
-            let head = format!("{f}:{l}!");
-            if a == b {
-                format!("{head}{}", ref_to_string(a))
-            } else {
-                format!("{head}{}:{}", ref_to_string(a), ref_to_string(b))
+            Expr::Ref3D { first, last, a, b } => {
+                let f = sheet_prefix(first);
+                let f = f.trim_end_matches('!');
+                let l = sheet_prefix(last);
+                let l = l.trim_end_matches('!');
+                let head = format!("{f}:{l}!");
+                if a == b {
+                    format!("{head}{}", ref_to_string(a))
+                } else {
+                    format!("{head}{}:{}", ref_to_string(a), ref_to_string(b))
+                }
+            }
+            Expr::Structured {
+                table,
+                item,
+                col1,
+                col2,
+            } => structured_to_string(table, *item, col1, col2, self.file),
+            Expr::Name(n) => match self.bound(n).filter(|_| self.file) {
+                Some((b, _)) => param_name(b),
+                None => n.clone(),
+            },
+            Expr::SpillRef(r) if self.file => format!("_xlfn.ANCHORARRAY({})", ref_to_string(r)),
+            Expr::SpillRef(r) => format!("{}#", ref_to_string(r)),
+            Expr::ArrayLit(rows) => {
+                let body: Vec<String> = rows.iter().map(|row| self.list(row)).collect();
+                format!("{{{}}}", body.join(";"))
+            }
+            Expr::Func(name, args) => self.func(name, args),
+            Expr::Call(callee, args) => {
+                let head = match callee.as_ref() {
+                    Expr::Func(..) | Expr::Call(..) | Expr::Name(_) => self.print(callee),
+                    other => format!("({})", self.print(other)),
+                };
+                format!("{}({})", head, self.list(args))
+            }
+            Expr::Lit(v) => match v {
+                Value::Num(n) => self.num(*n),
+                Value::Str(s) => format!("\"{}\"", s.replace('"', "\"\"")),
+                Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+                Value::Err(x) => x.code().to_string(),
+                Value::Empty => String::new(),
+            },
+            Expr::Un(UnOp::Implicit, x) if self.file => format!("_xlfn.SINGLE({})", self.print(x)),
+            Expr::Un(op, x) => {
+                let inner = if prec(x) < prec(e) {
+                    format!("({})", self.print(x))
+                } else {
+                    self.print(x)
+                };
+                match op {
+                    UnOp::Neg => format!("-{inner}"),
+                    UnOp::Pos => format!("+{inner}"),
+                    UnOp::Percent => format!("{inner}%"),
+                    UnOp::Implicit => format!("@{inner}"),
+                }
+            }
+            Expr::Bin(op, l, r) => {
+                let lp = prec(l) < prec(e);
+                // Same-precedence right operands need parens for - / ^ etc.
+                let rp = prec(r) <= prec(e);
+                let ls = if lp {
+                    format!("({})", self.print(l))
+                } else {
+                    self.print(l)
+                };
+                let rs = if rp {
+                    format!("({})", self.print(r))
+                } else {
+                    self.print(r)
+                };
+                format!("{ls}{}{rs}", bin_symbol(*op))
             }
         }
-        Expr::Structured {
-            table,
-            item,
-            col1,
-            col2,
-        } => structured_to_string(table, *item, col1, col2),
-        Expr::Name(n) => n.clone(),
-        Expr::SpillRef(r) => format!("{}#", ref_to_string(r)),
-        Expr::ArrayLit(rows) => {
-            let body: Vec<String> = rows
-                .iter()
-                .map(|row| row.iter().map(to_string).collect::<Vec<_>>().join(","))
-                .collect();
-            format!("{{{}}}", body.join(";"))
+    }
+
+    fn list(&mut self, args: &[Expr]) -> String {
+        let parts: Vec<String> = args.iter().map(|a| self.print(a)).collect();
+        parts.join(",")
+    }
+
+    fn num(&self, n: f64) -> String {
+        if self.file {
+            file_num(n)
+        } else {
+            fmt_general(n)
         }
-        Expr::Func(name, args) => {
-            let list: Vec<String> = args.iter().map(to_string).collect();
-            format!("{}({})", name, list.join(","))
+    }
+
+    /// The LET/LAMBDA name `n` refers to around the current expression,
+    /// spelled as its binding spells it, and whether it may hold a lambda;
+    /// `None` when nothing binds `n`.
+    fn bound(&self, n: &str) -> Option<(&str, bool)> {
+        let n = bare_param(n);
+        self.scope
+            .iter()
+            .rev()
+            .find(|(s, _)| s.eq_ignore_ascii_case(n))
+            .map(|(s, lambda)| (s.as_str(), *lambda))
+    }
+
+    /// May a LET value bind a lambda? Yes unless it provably can't: a
+    /// literal, a reference, an operator, or a builtin call that never passes
+    /// a lambda through. A call of a local that may hold one, an unbound name
+    /// or a call of one (a defined name or UDF may be or make a lambda), an
+    /// immediate call (`LAMBDA(n,LAMBDA(…))(2)`) and the choosing functions
+    /// (`IF(c,LAMBDA(…),LAMBDA(…))`) may.
+    fn binds_lambda(&self, value: &Expr) -> bool {
+        match value {
+            Expr::Name(n) => self.bound(n).is_none_or(|(_, lambda)| lambda),
+            Expr::Call(..) => true,
+            Expr::Func(n, _) => match self.bound(n) {
+                Some((_, lambda)) => lambda,
+                None => {
+                    [
+                        "LAMBDA", "LET", "IF", "IFS", "CHOOSE", "SWITCH", "IFERROR", "IFNA",
+                        "INDEX",
+                    ]
+                    .iter()
+                    .any(|f| f.eq_ignore_ascii_case(n))
+                        || !is_builtin(n)
+                }
+            },
+            _ => false,
         }
-        Expr::Call(callee, args) => {
-            let list: Vec<String> = args.iter().map(to_string).collect();
-            let head = match callee.as_ref() {
-                Expr::Func(..) | Expr::Call(..) | Expr::Name(_) => to_string(callee),
-                other => format!("({})", to_string(other)),
-            };
-            format!("{}({})", head, list.join(","))
+    }
+
+    fn func(&mut self, name: &str, args: &[Expr]) -> String {
+        if !self.file {
+            return format!("{}({})", name, self.list(args));
         }
-        Expr::Lit(v) => match v {
-            Value::Num(n) => fmt_general(*n),
-            Value::Str(s) => format!("\"{}\"", s.replace('"', "\"\"")),
-            Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
-            Value::Err(x) => x.code().to_string(),
-            Value::Empty => String::new(),
-        },
-        Expr::Un(op, x) => {
-            let inner = if prec(x) < prec(e) {
-                format!("({})", to_string(x))
-            } else {
-                to_string(x)
-            };
-            match op {
-                UnOp::Neg => format!("-{inner}"),
-                UnOp::Pos => format!("+{inner}"),
-                UnOp::Percent => format!("{inner}%"),
-                UnOp::Implicit => format!("@{inner}"),
+        // A bound name called as a function (`LET(f,LAMBDA(…),f(2))`) is the
+        // local lambda, as the evaluator's `let_lambda` reads it. A LET name
+        // bound to a value that can't be a lambda leaves a call of the same
+        // name to the builtin (`LET(sum,SUM(A:A),sum/SUM(B:B))`, see
+        // `binds_lambda`). Any other binding, LAMBDA parameters included, may
+        // hold a lambda, so its call is the local one; the evaluator falls back
+        // to the builtin when it holds none. (The parser uppercases a called
+        // name, so the binding gives the spelling.)
+        if let Some((b, true)) = self.bound(name) {
+            let head = param_name(b);
+            return format!("{head}({})", self.list(args));
+        }
+        let head = match future_prefix(name) {
+            Some(p) => format!("{p}{name}"),
+            None => name.to_string(),
+        };
+        let mark = self.scope.len();
+        let last = args.len().saturating_sub(1);
+        let mut parts = Vec::with_capacity(args.len());
+        if name.eq_ignore_ascii_case("LET") {
+            // `LET(n1, v1, …, body)`: each value sees the names bound before it.
+            let mut pending = None;
+            for (i, a) in args.iter().enumerate() {
+                match a {
+                    Expr::Name(n) if i < last && i % 2 == 0 => {
+                        parts.push(param_name(n));
+                        pending = Some(bare_param(n).to_string());
+                    }
+                    _ => {
+                        let lambda = self.binds_lambda(a);
+                        parts.push(self.print(a));
+                        if let Some(n) = pending.take() {
+                            self.scope.push((n, lambda));
+                        }
+                    }
+                }
             }
+        } else if name.eq_ignore_ascii_case("LAMBDA") {
+            // `LAMBDA(p1, [p2], …, body)`: the body sees every parameter.
+            for (i, a) in args.iter().enumerate() {
+                match a {
+                    Expr::Name(n) if i < last => {
+                        parts.push(param_name(n));
+                        self.scope.push((bare_param(n).to_string(), true));
+                    }
+                    Expr::Structured {
+                        table: None,
+                        item: TableItem::Data,
+                        col1: Some(n),
+                        col2: None,
+                    } if i < last => {
+                        parts.push(format!("[{}]", escape_spec(&param_name(n))));
+                        self.scope.push((bare_param(n).to_string(), true));
+                    }
+                    _ => parts.push(self.print(a)),
+                }
+            }
+        } else {
+            parts = args.iter().map(|a| self.print(a)).collect();
         }
-        Expr::Bin(op, l, r) => {
-            let lp = prec(l) < prec(e);
-            // Same-precedence right operands need parens for - / ^ etc.
-            let rp = prec(r) <= prec(e);
-            let ls = if lp {
-                format!("({})", to_string(l))
-            } else {
-                to_string(l)
-            };
-            let rs = if rp {
-                format!("({})", to_string(r))
-            } else {
-                to_string(r)
-            };
-            format!("{ls}{}{rs}", bin_symbol(*op))
+        self.scope.truncate(mark);
+        format!("{head}({})", parts.join(","))
+    }
+}
+
+/// `n` with a leading `_xlpm.` (Excel's LET/LAMBDA name prefix) removed.
+fn bare_param(n: &str) -> &str {
+    match n.get(..6) {
+        Some(p) if p.eq_ignore_ascii_case("_xlpm.") => &n[6..],
+        _ => n,
+    }
+}
+
+/// `n` as a LET/LAMBDA name is spelled in a file: `_xlpm.n`.
+fn param_name(n: &str) -> String {
+    format!("_xlpm.{}", bare_param(n))
+}
+
+/// Excel 2007 worksheet functions the evaluator doesn't dispatch (yet), so
+/// [`is_builtin`] can't learn them from it. Drop a name here once the
+/// evaluator handles it (`unevaluated_builtins_are_still_unevaluated`).
+const UNEVALUATED_BUILTINS: &[&str] = &[
+    "ACCRINT",
+    "ACCRINTM",
+    "AMORDEGRC",
+    "AMORLINC",
+    "AREAS",
+    "ASC",
+    "BAHTTEXT",
+    "BESSELI",
+    "BESSELJ",
+    "BESSELK",
+    "BESSELY",
+    "CALL",
+    "CHITEST",
+    "COMPLEX",
+    "CONVERT",
+    "COUPDAYBS",
+    "COUPDAYS",
+    "COUPDAYSNC",
+    "COUPNCD",
+    "COUPNUM",
+    "COUPPCD",
+    "CUBEKPIMEMBER",
+    "CUBEMEMBER",
+    "CUBEMEMBERPROPERTY",
+    "CUBERANKEDMEMBER",
+    "CUBESET",
+    "CUBESETCOUNT",
+    "CUBEVALUE",
+    "DISC",
+    "DURATION",
+    "ERF",
+    "ERFC",
+    "EUROCONVERT",
+    "FINDB",
+    "FTEST",
+    "FVSCHEDULE",
+    "GETPIVOTDATA",
+    "GROWTH",
+    "IMABS",
+    "IMAGINARY",
+    "IMARGUMENT",
+    "IMCONJUGATE",
+    "IMCOS",
+    "IMDIV",
+    "IMEXP",
+    "IMLN",
+    "IMLOG10",
+    "IMLOG2",
+    "IMPOWER",
+    "IMPRODUCT",
+    "IMREAL",
+    "IMSIN",
+    "IMSQRT",
+    "IMSUB",
+    "IMSUM",
+    "INFO",
+    "INTRATE",
+    "ISREF",
+    "JIS",
+    "LEFTB",
+    "LENB",
+    "LINEST",
+    "LOGEST",
+    "MDURATION",
+    "MIDB",
+    "ODDFPRICE",
+    "ODDFYIELD",
+    "ODDLPRICE",
+    "ODDLYIELD",
+    "PHONETIC",
+    "PRICE",
+    "PRICEDISC",
+    "PRICEMAT",
+    "PROB",
+    "RECEIVED",
+    "REGISTER.ID",
+    "REPLACEB",
+    "RIGHTB",
+    "RTD",
+    "SEARCHB",
+    "SQL.REQUEST",
+    "STEYX",
+    "TBILLEQ",
+    "TBILLPRICE",
+    "TBILLYIELD",
+    "TREND",
+    "TTEST",
+    "VDB",
+    "YIELD",
+    "YIELDDISC",
+    "YIELDMAT",
+    "ZTEST",
+];
+
+/// Is `name` a builtin function? Excel's post-2007 names and the 2007 ones the
+/// engine doesn't evaluate, and otherwise whatever the evaluator itself knows,
+/// so this stays right as builtins are added: the call, with no arguments,
+/// on a throwaway evaluator over no cells, through the whole dispatch, which
+/// flags a name it doesn't know. A builtin either refuses zero arguments or
+/// computes from the resolver alone (`NoCells` answers nothing: no cells,
+/// clock, random source or names), so the probe panics on none and touches
+/// nothing outside it (`builtin_probe_is_safe_for_every_name`).
+fn is_builtin(name: &str) -> bool {
+    if future_prefix(name).is_some()
+        || UNEVALUATED_BUILTINS
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(name))
+    {
+        return true;
+    }
+    probe_known(name)
+}
+
+/// Does the evaluator dispatch `name`? See [`is_builtin`].
+fn probe_known(name: &str) -> bool {
+    struct NoCells;
+    impl Resolver for NoCells {
+        fn value(&self, _: usize, _: u32, _: u32) -> Value {
+            Value::Empty
         }
+        fn sheet_index(&self, _: &str) -> Option<usize> {
+            None
+        }
+        fn cells_in(&self, _: usize, _: u32, _: u32, _: u32, _: u32) -> Vec<((u32, u32), Value)> {
+            Vec::new()
+        }
+    }
+    let mut ev = Eval::new(&NoCells, 0, (0, 0));
+    ev.eval_arg(&Expr::Func(name.to_ascii_uppercase(), Vec::new()));
+    !ev.name_unknown
+}
+
+/// A number as file formula text that reads back to the same `f64` (the
+/// display printer rounds to General's digits), in `E` notation when the
+/// plain form would be long.
+fn file_num(n: f64) -> String {
+    if !n.is_finite() {
+        return fmt_general(n);
+    }
+    let a = n.abs();
+    if a != 0.0 && !(1e-5..1e21).contains(&a) {
+        let s = format!("{n:E}");
+        // Excel spells a positive exponent with its sign: 1.5E+25.
+        match s.split_once('E') {
+            Some((m, x)) if !x.starts_with('-') => format!("{m}E+{x}"),
+            _ => s,
+        }
+    } else {
+        format!("{n}")
     }
 }
 
@@ -1930,6 +2242,40 @@ pub fn rename_sheet_in_expr(e: &Expr, old: &str, new: &str) -> Expr {
         }
     }
     walk(e, old, new)
+}
+
+/// Turn every reference to a sheet in `removed` (case-insensitive) into
+/// `#REF!`: the whole reference, so no removed sheet name is left in the
+/// formula. Excel writes `#REF!A1` after a sheet delete, keeping the cell
+/// part; the parser has no such form, and the reference is gone either way.
+///
+/// A 3-D span loses its reference only when an end sheet is removed (Excel
+/// moves that end inward instead). A sheet between the ends just drops out
+/// of the span, which is left alone.
+pub fn remove_sheet_refs_in_expr(e: &Expr, removed: &[String]) -> Expr {
+    let gone = |s: &str| removed.iter().any(|r| r.eq_ignore_ascii_case(s));
+    let on_gone = |s: &Option<String>| s.as_deref().is_some_and(gone);
+    let walk = |x: &Expr| remove_sheet_refs_in_expr(x, removed);
+    match e {
+        Expr::Ref(r) | Expr::SpillRef(r) if on_gone(&r.sheet) => Expr::Err(ExcelError::Ref),
+        Expr::Range(a, b) if on_gone(&a.sheet) || on_gone(&b.sheet) => Expr::Err(ExcelError::Ref),
+        Expr::ColRange { sheet, .. } | Expr::RowRange { sheet, .. } if on_gone(sheet) => {
+            Expr::Err(ExcelError::Ref)
+        }
+        Expr::Ref3D { first, last, .. } if gone(first) || gone(last) => Expr::Err(ExcelError::Ref),
+        Expr::ArrayLit(rows) => Expr::ArrayLit(
+            rows.iter()
+                .map(|row| row.iter().map(walk).collect())
+                .collect(),
+        ),
+        Expr::Func(n, args) => Expr::Func(n.clone(), args.iter().map(walk).collect()),
+        Expr::Call(callee, args) => {
+            Expr::Call(Box::new(walk(callee)), args.iter().map(walk).collect())
+        }
+        Expr::Un(op, x) => Expr::Un(*op, Box::new(walk(x))),
+        Expr::Bin(op, l, r) => Expr::Bin(*op, Box::new(walk(l)), Box::new(walk(r))),
+        other => other.clone(),
+    }
 }
 
 /// Run a defined name's definition through `f` (a structural edit or a sheet
@@ -2956,7 +3302,7 @@ impl<'a> Eval<'a> {
                 if let Some(i) = self
                     .lets
                     .iter()
-                    .rposition(|(name, _)| name.eq_ignore_ascii_case(n))
+                    .rposition(|(name, _)| name.eq_ignore_ascii_case(bare_param(n)))
                 {
                     return self.lets[i].1.clone();
                 }
@@ -3067,7 +3413,10 @@ impl<'a> Eval<'a> {
                     return Arg::Scalar(Value::Err(ExcelError::Value));
                 }
                 let hit = match &args[0] {
-                    Expr::Name(n) => self.omitted.iter().any(|o| o.eq_ignore_ascii_case(n)),
+                    Expr::Name(n) => self
+                        .omitted
+                        .iter()
+                        .any(|o| o.eq_ignore_ascii_case(bare_param(n))),
                     _ => false,
                 };
                 Arg::Scalar(Value::Bool(hit))
@@ -3083,6 +3432,15 @@ impl<'a> Eval<'a> {
                 // An explicit LET-bound lambda overrides even a builtin.
                 if let Some(lam) = self.let_lambda(name) {
                     return invoke(self, &lam);
+                }
+                // `_xlpm.text(…)` naming a binding that holds no lambda (a
+                // LAMBDA parameter shares a builtin's name, and the file spells
+                // the call as the parameter's): the builtin, as the typed
+                // `TEXT(text,…)` evaluates.
+                let bare = bare_param(name);
+                if bare.len() != name.len() {
+                    let call = Expr::Func(bare.to_ascii_uppercase(), args.clone());
+                    return self.eval_arg(&call);
                 }
                 if is_array_fn(name) {
                     return self.array_fn(name, args);
@@ -3124,7 +3482,7 @@ impl<'a> Eval<'a> {
                     if seen_optional {
                         return Arg::Scalar(Value::Err(ExcelError::Value));
                     }
-                    params.push((n.clone(), false));
+                    params.push((bare_param(n).to_string(), false));
                 }
                 // `[y]` — Excel's optional-parameter syntax (lexes as a
                 // bare structured reference).
@@ -3135,7 +3493,7 @@ impl<'a> Eval<'a> {
                     col2: None,
                 } => {
                     seen_optional = true;
-                    params.push((n.clone(), true));
+                    params.push((bare_param(n).to_string(), true));
                 }
                 _ => return Arg::Scalar(Value::Err(ExcelError::Value)),
             }
@@ -3186,10 +3544,9 @@ impl<'a> Eval<'a> {
     /// A `LET`-bound lambda used as a function — an explicit local override that
     /// wins even over a builtin of the same name.
     fn let_lambda(&self, name: &str) -> Option<Box<LambdaVal>> {
-        let i = self
-            .lets
-            .iter()
-            .rposition(|(n, v)| n.eq_ignore_ascii_case(name) && matches!(v, Arg::Lambda(_)))?;
+        let i = self.lets.iter().rposition(|(n, v)| {
+            n.eq_ignore_ascii_case(bare_param(name)) && matches!(v, Arg::Lambda(_))
+        })?;
         match &self.lets[i].1 {
             Arg::Lambda(l) => Some(l.clone()),
             _ => None,
@@ -3558,7 +3915,7 @@ impl<'a> Eval<'a> {
                 return Arg::Scalar(Value::Err(ExcelError::Value));
             };
             let v = self.eval_arg(&pair[1]);
-            self.lets.push((name.clone(), v));
+            self.lets.push((bare_param(name).to_string(), v));
         }
         let out = self.eval_arg(&args[args.len() - 1]);
         self.lets.truncate(mark);
@@ -4454,6 +4811,278 @@ fn match_key(v: &Value) -> Option<String> {
     }
 }
 
+/// Excel's "future functions": everything added after Excel 2007, which a file
+/// must spell `_xlfn.NAME` or Excel shows `#NAME?`. `SORT` and `FILTER` also
+/// take `_xlws.` (see [`future_prefix`]). Excel 2007's own functions (`IFERROR`,
+/// `SUMIFS`, `COUNTIFS`, `AVERAGEIFS`, …) are spelled bare.
+const FUTURE_FUNCTIONS: &[&str] = &[
+    // Excel 2010
+    "AGGREGATE",
+    "BETA.DIST",
+    "BETA.INV",
+    "BINOM.DIST",
+    "BINOM.INV",
+    "CEILING.PRECISE",
+    "CHISQ.DIST",
+    "CHISQ.DIST.RT",
+    "CHISQ.INV",
+    "CHISQ.INV.RT",
+    "CHISQ.TEST",
+    "CONFIDENCE.NORM",
+    "CONFIDENCE.T",
+    "COVARIANCE.P",
+    "COVARIANCE.S",
+    "ERF.PRECISE",
+    "ERFC.PRECISE",
+    "EXPON.DIST",
+    "F.DIST",
+    "F.DIST.RT",
+    "F.INV",
+    "F.INV.RT",
+    "F.TEST",
+    "FLOOR.PRECISE",
+    "GAMMA.DIST",
+    "GAMMA.INV",
+    "GAMMALN.PRECISE",
+    "HYPGEOM.DIST",
+    "ISO.CEILING",
+    "LOGNORM.DIST",
+    "LOGNORM.INV",
+    "MODE.MULT",
+    "MODE.SNGL",
+    "NEGBINOM.DIST",
+    "NETWORKDAYS.INTL",
+    "NORM.DIST",
+    "NORM.INV",
+    "NORM.S.DIST",
+    "NORM.S.INV",
+    "PERCENTILE.EXC",
+    "PERCENTILE.INC",
+    "PERCENTRANK.EXC",
+    "PERCENTRANK.INC",
+    "POISSON.DIST",
+    "QUARTILE.EXC",
+    "QUARTILE.INC",
+    "RANK.AVG",
+    "RANK.EQ",
+    "STDEV.P",
+    "STDEV.S",
+    "T.DIST",
+    "T.DIST.2T",
+    "T.DIST.RT",
+    "T.INV",
+    "T.INV.2T",
+    "T.TEST",
+    "VAR.P",
+    "VAR.S",
+    "WEIBULL.DIST",
+    "WORKDAY.INTL",
+    "Z.TEST",
+    // Excel 2013
+    "ACOT",
+    "ACOTH",
+    "ARABIC",
+    "BASE",
+    "BINOM.DIST.RANGE",
+    "BITAND",
+    "BITLSHIFT",
+    "BITOR",
+    "BITRSHIFT",
+    "BITXOR",
+    "CEILING.MATH",
+    "COMBINA",
+    "COT",
+    "COTH",
+    "CSC",
+    "CSCH",
+    "DAYS",
+    "DECIMAL",
+    "ENCODEURL",
+    "FILTERXML",
+    "FLOOR.MATH",
+    "FORMULATEXT",
+    "GAMMA",
+    "GAUSS",
+    "IFNA",
+    "IMCOSH",
+    "IMCOT",
+    "IMCSC",
+    "IMCSCH",
+    "IMSEC",
+    "IMSECH",
+    "IMSINH",
+    "IMTAN",
+    "ISFORMULA",
+    "ISOWEEKNUM",
+    "MUNIT",
+    "NUMBERVALUE",
+    "PDURATION",
+    "PERMUTATIONA",
+    "PHI",
+    "RRI",
+    "SEC",
+    "SECH",
+    "SHEET",
+    "SHEETS",
+    "SKEW.P",
+    "UNICHAR",
+    "UNICODE",
+    "WEBSERVICE",
+    "XOR",
+    // Excel 2016 / 2019
+    "CONCAT",
+    "FORECAST.ETS",
+    "FORECAST.ETS.CONFINT",
+    "FORECAST.ETS.SEASONALITY",
+    "FORECAST.ETS.STAT",
+    "FORECAST.LINEAR",
+    "IFS",
+    "MAXIFS",
+    "MINIFS",
+    "SWITCH",
+    "TEXTJOIN",
+    // Excel 2021 / 365: dynamic arrays, LET, LAMBDA and after
+    "ANCHORARRAY",
+    "ARRAYTOTEXT",
+    "BYCOL",
+    "BYROW",
+    "CHOOSECOLS",
+    "CHOOSEROWS",
+    "DROP",
+    "EXPAND",
+    "FIELDVALUE",
+    "FILTER",
+    "GROUPBY",
+    "HSTACK",
+    "IMAGE",
+    "ISOMITTED",
+    "LAMBDA",
+    "LET",
+    "MAKEARRAY",
+    "MAP",
+    "PERCENTOF",
+    "PIVOTBY",
+    "RANDARRAY",
+    "REDUCE",
+    "REGEXEXTRACT",
+    "REGEXREPLACE",
+    "REGEXTEST",
+    "SCAN",
+    "SEQUENCE",
+    "SINGLE",
+    "SORT",
+    "SORTBY",
+    "STOCKHISTORY",
+    "TAKE",
+    "TEXTAFTER",
+    "TEXTBEFORE",
+    "TEXTSPLIT",
+    "TOCOL",
+    "TOROW",
+    "TRIMRANGE",
+    "UNIQUE",
+    "VALUETOTEXT",
+    "VSTACK",
+    "WRAPCOLS",
+    "WRAPROWS",
+    "XLOOKUP",
+    "XMATCH",
+];
+
+/// The prefix a file spells function `name` with: `_xlfn.` for a future
+/// function, `_xlfn._xlws.` for the two worksheet ones, `None` for the rest.
+fn future_prefix(name: &str) -> Option<&'static str> {
+    if name.eq_ignore_ascii_case("SORT") || name.eq_ignore_ascii_case("FILTER") {
+        Some("_xlfn._xlws.")
+    } else if FUTURE_FUNCTIONS
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case(name))
+    {
+        Some("_xlfn.")
+    } else {
+        None
+    }
+}
+
+/// Turn formula text as held in memory (the user's spelling) into the text a
+/// file stores: the inverse of [`display_formula`]. Post-2007 functions get
+/// their `_xlfn.` prefix, `A1#` becomes `_xlfn.ANCHORARRAY(A1)`, `@x` becomes
+/// `_xlfn.SINGLE(x)`, and LET/LAMBDA names get `_xlpm.`.
+///
+/// Text that needs nothing, including text already in file spelling, comes
+/// back unchanged (borrowed). A formula that only needs function prefixes has
+/// them inserted in place (and those names uppercased), keeping the rest byte
+/// for byte; one with `#`, `@`, LET or LAMBDA is parsed and printed again
+/// (spacing is not kept, values are). Text that doesn't lex is returned as it
+/// is. Text that doesn't parse only gets its function prefixes (LET and
+/// LAMBDA included); its `#`, `@` and LET/LAMBDA names stay as they are.
+///
+/// The save runs every formula through this, loaded ones too, since there is
+/// no record of which text is still as loaded. So a bare post-2007 name in a
+/// file (a producer that left the prefix off, or a VBA function an old Excel
+/// file named `TEXTJOIN`) is saved as the builtin.
+pub fn file_formula(src: &str) -> Cow<'_, str> {
+    let mut lex = Lexer::new(src);
+    let mut toks: Vec<(usize, Tok)> = Vec::new();
+    loop {
+        while lex.pos < lex.src.len() && (lex.src[lex.pos] as char).is_whitespace() {
+            lex.pos += 1;
+        }
+        let start = lex.pos;
+        match lex.next_tok() {
+            Ok(Tok::Eof) => break,
+            Ok(t) => toks.push((start, t)),
+            Err(_) => return Cow::Borrowed(src),
+        }
+    }
+    let mut reprint = false;
+    // (start, end, prefix) of each function name that needs a prefix.
+    let mut splices: Vec<(usize, usize, &str)> = Vec::new();
+    for (i, (start, t)) in toks.iter().enumerate() {
+        match t {
+            Tok::Hash | Tok::At => reprint = true,
+            Tok::Ident(id) if matches!(toks.get(i + 1), Some((_, Tok::LParen))) => {
+                // These change shape (`SINGLE(x)` is `@x`) or bind names,
+                // which only the AST can see; the splice prefixes them only
+                // when the text doesn't parse.
+                if ["LET", "LAMBDA", "SINGLE", "ANCHORARRAY"]
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(id))
+                {
+                    reprint = true;
+                    splices.push((*start, start + id.len(), "_xlfn."));
+                } else if let Some(p) = future_prefix(id) {
+                    splices.push((*start, start + id.len(), p));
+                }
+            }
+            _ => {}
+        }
+    }
+    if reprint {
+        if let Ok(e) = parse(src) {
+            let mut p = Printer {
+                file: true,
+                scope: Vec::new(),
+            };
+            return Cow::Owned(p.print(&e));
+        }
+    }
+    if splices.is_empty() {
+        return Cow::Borrowed(src);
+    }
+    let mut out = String::with_capacity(src.len() + 12 * splices.len());
+    let mut at = 0;
+    for (start, end, prefix) in splices {
+        out.push_str(&src[at..start]);
+        out.push_str(prefix);
+        // Table names are ASCII, so these are char boundaries.
+        out.push_str(&src[start..end].to_ascii_uppercase());
+        at = end;
+    }
+    out.push_str(&src[at..]);
+    Cow::Owned(out)
+}
+
 /// Turn a stored formula into the text Excel *shows*: strip the future-function
 /// (`_xlfn.`), worksheet (`_xlws.`) and lambda-parameter (`_xlpm.`) prefixes, and
 /// rewrite the internal spill/implicit operators — `ANCHORARRAY(A1)` → `A1#`,
@@ -4949,6 +5578,93 @@ pub fn is_db_fn(name: &str) -> bool {
             | "DSTDEV"
             | "DSTDEVP"
     )
+}
+
+/// Could this formula (its parsed root) return an array? Excel saves a
+/// formula typed as one as a dynamic array (`cm`, `<f t="array">`) even while
+/// its result is a single value — `FILTER` with no match yet (`#CALC!`),
+/// `INDIRECT(B1)` naming one cell — or it would reopen as a legacy
+/// implicit-intersection formula. A static, root-oriented check, conservative
+/// so that scalar formulas over single cells (`INDIRECT("A2")*2`,
+/// `[@Qty]*[@Price]`) stay scalar: the root may be an array-returning
+/// function, a range-producing `INDIRECT`/`OFFSET`/`INDEX`, a multi-cell
+/// reference or array constant, an operator over a multi-cell reference or
+/// an array function's result, or a pass-through (`IF`, `IFERROR`, `CHOOSE`,
+/// `LET`, …) whose value branch is one of those. An `@` asks for a scalar. A
+/// defined name is left to evaluation, which marks the formula dynamic when
+/// it does produce an array.
+pub fn may_return_array(e: &Expr) -> bool {
+    array_valued(e, true)
+}
+
+/// [`may_return_array`] at the root (`root`) or as an operand, where a
+/// range-producing `INDIRECT`/`OFFSET`/`INDEX` is taken as one cell.
+fn array_valued(e: &Expr, root: bool) -> bool {
+    let single = |a: &CellRef, b: &CellRef| a.row == b.row && a.col == b.col;
+    match e {
+        Expr::Range(a, b) => !single(a, b),
+        Expr::ColRange { .. } | Expr::RowRange { .. } | Expr::SpillRef(_) => true,
+        Expr::ArrayLit(rows) => rows.len() * rows.first().map_or(0, Vec::len) > 1,
+        // A this-row ref, and a header or totals cell of one column, is a
+        // single cell.
+        Expr::Structured {
+            item, col1, col2, ..
+        } => match item {
+            TableItem::ThisRow => false,
+            TableItem::Headers | TableItem::Totals => match (col1, col2) {
+                (Some(_), None) => false,
+                (Some(a), Some(b)) => !a.eq_ignore_ascii_case(b),
+                (None, _) => true,
+            },
+            TableItem::Data | TableItem::All => true,
+        },
+        Expr::Un(UnOp::Implicit, _) => false,
+        Expr::Un(_, x) => array_valued(x, false),
+        Expr::Bin(_, a, b) => array_valued(a, false) || array_valued(b, false),
+        Expr::Func(name, args) => match name.as_str() {
+            "INDIRECT" | "OFFSET" | "INDEX" => root,
+            "IF" => args.iter().skip(1).take(2).any(|a| array_valued(a, root)),
+            "IFERROR" | "IFNA" => args.iter().take(2).any(|a| array_valued(a, root)),
+            "CHOOSE" => args.iter().skip(1).any(|a| array_valued(a, root)),
+            "IFS" => args.iter().skip(1).step_by(2).any(|a| array_valued(a, root)),
+            "SWITCH" => {
+                // SWITCH(expr, value1, result1, …, [default])
+                let results = args.iter().skip(2).step_by(2);
+                let default = (args.len() > 1 && args.len() % 2 == 0).then(|| &args[args.len() - 1]);
+                results.chain(default).any(|a| array_valued(a, root))
+            }
+            "LET" => args.last().is_some_and(|body| {
+                // A body that is just one of the LET's own names is the value
+                // bound to it (the last binding of that name).
+                let bound = match body {
+                    Expr::Name(n) => args[..args.len() - 1]
+                        .chunks(2)
+                        .rev()
+                        .find(|p| matches!(&p[0], Expr::Name(m) if bare_param(m).eq_ignore_ascii_case(bare_param(n))))
+                        .and_then(|p| p.get(1)),
+                    _ => None,
+                };
+                array_valued(bound.unwrap_or(body), root)
+            }),
+            "REDUCE" => false,
+            n => {
+                is_array_fn(n)
+                    || is_higher_order_fn(n)
+                    || matches!(
+                        n,
+                        "GROUPBY"
+                            | "PIVOTBY"
+                            | "REGEXEXTRACT"
+                            | "TRIMRANGE"
+                            | "LINEST"
+                            | "LOGEST"
+                            | "TREND"
+                            | "GROWTH"
+                    )
+            }
+        },
+        _ => false,
+    }
 }
 
 /// Is this one of the dynamic-array functions resolved in `eval_arg` (they
@@ -12050,6 +12766,56 @@ mod tests {
     }
 
     #[test]
+    fn structured_spans_with_an_item_keep_both_columns() {
+        for src in [
+            "SUM(Sales[[#Totals],[Qty]:[Price]])",
+            "SUM(Sales[[#All],[Qty]:[Price]])",
+            "SUM(Sales[[#This Row],[Qty]:[Price]])",
+        ] {
+            let ast = parse(src).unwrap();
+            assert_eq!(to_string(&ast), src);
+            assert_eq!(parse(&to_string(&ast)).unwrap(), ast);
+        }
+    }
+
+    #[test]
+    fn file_formula_spells_structured_refs_as_a_file_stores_them() {
+        // The file grammar has no `@`: this-row is `[#This Row]`. Spans keep
+        // their second column. Values are the same either way.
+        let g = sales_grid();
+        let at_row_3 = |src: &str| {
+            let mut ev = Eval::new(&g, 0, (2, 4));
+            ev.eval(&parse(src).unwrap())
+        };
+        for (typed, saved, want) in [
+            (
+                "LET(t,Sales[[#Totals],[Qty]:[Price]],SUM(t))",
+                "_xlfn.LET(_xlpm.t,Sales[[#Totals],[Qty]:[Price]],SUM(_xlpm.t))",
+                17.5,
+            ),
+            (
+                "LET(p,Sales[@Price],p*2)",
+                "_xlfn.LET(_xlpm.p,Sales[[#This Row],[Price]],_xlpm.p*2)",
+                8.0,
+            ),
+            (
+                "LET(r,Sales[[#This Row],[Qty]:[Price]],SUM(r))",
+                "_xlfn.LET(_xlpm.r,Sales[[#This Row],[Qty]:[Price]],SUM(_xlpm.r))",
+                6.0,
+            ),
+            (
+                "LET(r,Sales[@],COUNTA(r))",
+                "_xlfn.LET(_xlpm.r,Sales[#This Row],COUNTA(_xlpm.r))",
+                3.0,
+            ),
+        ] {
+            assert_eq!(file(typed), saved);
+            assert_eq!(at_row_3(typed), Value::Num(want), "{typed}");
+            assert_eq!(at_row_3(saved), Value::Num(want), "{saved}");
+        }
+    }
+
+    #[test]
     fn structured_refs_evaluate() {
         let g = sales_grid();
         assert_eq!(n("SUM(Sales[Qty])", &g), 10.0); // data rows only
@@ -12523,6 +13289,380 @@ mod tests {
         let mut ev = Eval::new(&g, 0, (0, 0));
         assert_eq!(ev.eval(&ast), Value::Err(ExcelError::Name));
         assert!(ev.unsupported);
+    }
+
+    /// `file_formula(src)`, checking on the way that it is idempotent.
+    fn file(src: &str) -> String {
+        let once = file_formula(src).into_owned();
+        assert_eq!(file_formula(&once), once, "not idempotent for {src}");
+        once
+    }
+
+    #[test]
+    fn file_formula_prefixes_future_functions() {
+        assert_eq!(file("SEQUENCE(3)"), "_xlfn.SEQUENCE(3)");
+        assert_eq!(file("sequence(3)"), "_xlfn.SEQUENCE(3)");
+        assert_eq!(file("SORT(A1:A5)"), "_xlfn._xlws.SORT(A1:A5)");
+        assert_eq!(
+            file("FILTER(A1:A3,A1:A3>2)"),
+            "_xlfn._xlws.FILTER(A1:A3,A1:A3>2)"
+        );
+        for name in [
+            "XLOOKUP",
+            "UNIQUE",
+            "SORTBY",
+            "CONCAT",
+            "TEXTJOIN",
+            "IFS",
+            "STDEV.S",
+            "T.DIST.2T",
+            "XMATCH",
+            "GROUPBY",
+        ] {
+            assert_eq!(file(&format!("{name}(A1)")), format!("_xlfn.{name}(A1)"));
+        }
+        // Nested, and next to Excel 2007 functions that stay bare.
+        assert_eq!(
+            file("IFERROR(XLOOKUP(A1,B:B,C:C),SUMIFS(C:C,B:B,A1))"),
+            "IFERROR(_xlfn.XLOOKUP(A1,B:B,C:C),SUMIFS(C:C,B:B,A1))"
+        );
+        // Only the names change: spacing and number text are kept.
+        assert_eq!(
+            file("XLOOKUP( A1 , B:B , C:C )*1.50"),
+            "_xlfn.XLOOKUP( A1 , B:B , C:C )*1.50"
+        );
+        // A formula the parser refuses still gets its prefixes.
+        assert!(parse("XLOOKUP(Sheet1!MyName,B:B,C:C)").is_err());
+        assert_eq!(
+            file("XLOOKUP(Sheet1!MyName,B:B,C:C)"),
+            "_xlfn.XLOOKUP(Sheet1!MyName,B:B,C:C)"
+        );
+    }
+
+    #[test]
+    fn future_function_table_leaves_excel_2007_functions_bare() {
+        for src in [
+            "IFERROR(A1,0)",
+            "SUMIFS(C:C,B:B,A1)",
+            "COUNTIFS(B:B,A1)",
+            "AVERAGEIFS(C:C,B:B,A1)",
+            "CONCATENATE(\"a\",\"b\")",
+            "STDEV(A1:A3)",
+            "FORECAST(1,A1:A3,B1:B3)",
+            "RANK(A1,A1:A3)",
+            "NETWORKDAYS(A1,A2)",
+        ] {
+            assert!(matches!(file_formula(src), Cow::Borrowed(_)), "{src}");
+        }
+        for (i, f) in FUTURE_FUNCTIONS.iter().enumerate() {
+            assert_eq!(*f, f.to_ascii_uppercase());
+            assert!(!FUTURE_FUNCTIONS[..i].contains(f), "{f} listed twice");
+        }
+    }
+
+    #[test]
+    fn file_formula_spill_and_implicit_operators() {
+        assert_eq!(file("A1#"), "_xlfn.ANCHORARRAY(A1)");
+        assert_eq!(file("Sheet2!A1#"), "_xlfn.ANCHORARRAY(Sheet2!A1)");
+        assert_eq!(file("SUM(A1#)"), "SUM(_xlfn.ANCHORARRAY(A1))");
+        assert_eq!(file("SORT(A1#)"), "_xlfn._xlws.SORT(_xlfn.ANCHORARRAY(A1))");
+        assert_eq!(file("@A1:A3"), "_xlfn.SINGLE(A1:A3)");
+        assert_eq!(file("@INDEX(A1:A3,2)+1"), "_xlfn.SINGLE(INDEX(A1:A3,2))+1");
+        // The operators typed as their function spelling.
+        assert_eq!(file("SINGLE(A1:A3)"), "_xlfn.SINGLE(A1:A3)");
+        assert_eq!(file("ANCHORARRAY(B2)"), "_xlfn.ANCHORARRAY(B2)");
+        // A structured `@` is this-row, not the operator.
+        for src in [
+            "Sales[@Amount]*2",
+            "[@Amount]*2",
+            "Sales[[#This Row],[Amount]]",
+        ] {
+            assert!(matches!(file_formula(src), Cow::Borrowed(_)), "{src}");
+        }
+    }
+
+    #[test]
+    fn file_formula_let_lambda_params_get_xlpm() {
+        assert_eq!(file("LET(x,1,x+1)"), "_xlfn.LET(_xlpm.x,1,_xlpm.x+1)");
+        assert_eq!(
+            file("LAMBDA(a,b,a+b)(1,2)"),
+            "_xlfn.LAMBDA(_xlpm.a,_xlpm.b,_xlpm.a+_xlpm.b)(1,2)"
+        );
+        // Outside its LET, `x` is a defined name again.
+        assert_eq!(file("LET(x,1,x)+x"), "_xlfn.LET(_xlpm.x,1,_xlpm.x)+x");
+        // A value sees only the names bound before it.
+        assert_eq!(file("LET(x,x+1,x)"), "_xlfn.LET(_xlpm.x,x+1,_xlpm.x)");
+        assert_eq!(
+            file("LET(x,1,y,x+1,y*2)"),
+            "_xlfn.LET(_xlpm.x,1,_xlpm.y,_xlpm.x+1,_xlpm.y*2)"
+        );
+        assert_eq!(
+            file("LET(x,1,LAMBDA(y,x+y)(2))"),
+            "_xlfn.LET(_xlpm.x,1,_xlfn.LAMBDA(_xlpm.y,_xlpm.x+_xlpm.y)(2))"
+        );
+        // A bound lambda called by name, even one named like a builtin.
+        assert_eq!(
+            file("LET(f,LAMBDA(x,x*3),f(2))"),
+            "_xlfn.LET(_xlpm.f,_xlfn.LAMBDA(_xlpm.x,_xlpm.x*3),_xlpm.f(2))"
+        );
+        assert_eq!(
+            file("LET(sort,LAMBDA(x,x),sort(2))"),
+            "_xlfn.LET(_xlpm.sort,_xlfn.LAMBDA(_xlpm.x,_xlpm.x),_xlpm.sort(2))"
+        );
+        assert_eq!(
+            file("LET(f,LAMBDA(x,x*3),g,f,g(2))"),
+            "_xlfn.LET(_xlpm.f,_xlfn.LAMBDA(_xlpm.x,_xlpm.x*3),_xlpm.g,_xlpm.f,_xlpm.g(2))"
+        );
+        // A LET name bound to anything else leaves a same-named builtin call
+        // alone.
+        assert_eq!(
+            file("LET(sum,SUM(A1:A3),sum/SUM(B1:B3))"),
+            "_xlfn.LET(_xlpm.sum,SUM(A1:A3),_xlpm.sum/SUM(B1:B3))"
+        );
+        assert_eq!(
+            file("LET(date,TODAY(),DATE(YEAR(date),1,1))"),
+            "_xlfn.LET(_xlpm.date,TODAY(),DATE(YEAR(_xlpm.date),1,1))"
+        );
+        assert_eq!(
+            file("LET(max,10,MAX(A1,max))"),
+            "_xlfn.LET(_xlpm.max,10,MAX(A1,_xlpm.max))"
+        );
+        assert_eq!(
+            file("LET(sort,A1:A3,SORT(sort))"),
+            "_xlfn.LET(_xlpm.sort,A1:A3,_xlfn._xlws.SORT(_xlpm.sort))"
+        );
+        // A value that may evaluate to a lambda: a curried call, a defined
+        // name, an immediate call, a choice between lambdas.
+        assert_eq!(
+            file("LET(mk,LAMBDA(n,LAMBDA(x,x+n)),inc,mk(1),inc(5))"),
+            "_xlfn.LET(_xlpm.mk,_xlfn.LAMBDA(_xlpm.n,_xlfn.LAMBDA(_xlpm.x,_xlpm.x+_xlpm.n)),_xlpm.inc,_xlpm.mk(1),_xlpm.inc(5))"
+        );
+        assert_eq!(
+            file("LET(f,MyFn,f(2))"),
+            "_xlfn.LET(_xlpm.f,MyFn,_xlpm.f(2))"
+        );
+        assert_eq!(
+            file("LET(d,LAMBDA(n,LAMBDA(x,x*n))(2),d(5))"),
+            "_xlfn.LET(_xlpm.d,_xlfn.LAMBDA(_xlpm.n,_xlfn.LAMBDA(_xlpm.x,_xlpm.x*_xlpm.n))(2),_xlpm.d(5))"
+        );
+        assert_eq!(
+            file("LET(f,IF(A1,LAMBDA(x,x),LAMBDA(x,-x)),f(2))"),
+            "_xlfn.LET(_xlpm.f,IF(A1,_xlfn.LAMBDA(_xlpm.x,_xlpm.x),_xlfn.LAMBDA(_xlpm.x,-_xlpm.x)),_xlpm.f(2))"
+        );
+        // A user function (a defined name, a UDF) may make a lambda; a local
+        // bound to a builtin's value doesn't.
+        assert_eq!(
+            file("LET(addfive,MakeAdder(5),addfive(1))"),
+            "_xlfn.LET(_xlpm.addfive,MAKEADDER(5),_xlpm.addfive(1))"
+        );
+        assert_eq!(
+            file("LET(sum,SUM(A1:A3),max,sum(B1:B3),MAX(sum,max))"),
+            "_xlfn.LET(_xlpm.sum,SUM(A1:A3),_xlpm.max,SUM(B1:B3),MAX(_xlpm.sum,_xlpm.max))"
+        );
+        // A builtin the engine doesn't evaluate is still a builtin.
+        assert_eq!(
+            file("LET(convert,CONVERT(A1,\"m\",\"ft\"),CONVERT(convert,\"ft\",\"in\"))"),
+            "_xlfn.LET(_xlpm.convert,CONVERT(A1,\"m\",\"ft\"),CONVERT(_xlpm.convert,\"ft\",\"in\"))"
+        );
+        // A LAMBDA parameter may hold a lambda, so its call is the local one.
+        assert_eq!(
+            file("LAMBDA(text,TEXT(text,\"0\"))(A1)"),
+            "_xlfn.LAMBDA(_xlpm.text,_xlpm.text(_xlpm.text,\"0\"))(A1)"
+        );
+        // Optional parameters.
+        assert_eq!(
+            file("LAMBDA(x,[y],IF(ISOMITTED(y),x,x+y))(1)"),
+            "_xlfn.LAMBDA(_xlpm.x,[_xlpm.y],IF(_xlfn.ISOMITTED(_xlpm.y),_xlpm.x,_xlpm.x+_xlpm.y))(1)"
+        );
+        // Future functions inside, and names already in file spelling.
+        assert_eq!(
+            file("LET(x,XLOOKUP(1,A1:A3,B1:B3),x*2)"),
+            "_xlfn.LET(_xlpm.x,_xlfn.XLOOKUP(1,A1:A3,B1:B3),_xlpm.x*2)"
+        );
+        assert_eq!(
+            file("LET(_xlpm.x,1,_xlpm.x+x)"),
+            "_xlfn.LET(_xlpm.x,1,_xlpm.x+_xlpm.x)"
+        );
+    }
+
+    #[test]
+    fn builtin_probe_is_safe_for_every_name() {
+        // Every name the evaluator dispatches on (`"NAME" =>` / `"NAME" |`
+        // arms in this file), probed with no arguments: none may panic, and
+        // the function names among them read as builtins.
+        let src = include_str!("formula.rs");
+        let mut names = std::collections::BTreeSet::new();
+        for (i, _) in src.match_indices('"') {
+            let rest = &src[i + 1..];
+            let Some(end) = rest.find('"') else { break };
+            let lit = &rest[..end];
+            let after = rest[end + 1..].trim_start();
+            let is_name = !lit.is_empty()
+                && lit.starts_with(|c: char| c.is_ascii_uppercase())
+                && lit
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '.');
+            if is_name && (after.starts_with("=>") || after.starts_with('|')) {
+                names.insert(lit.to_string());
+            }
+        }
+        assert!(names.len() > 200, "{}", names.len());
+        for n in &names {
+            is_builtin(n);
+        }
+        for n in [
+            "SUM", "MAX", "DATE", "TEXT", "INDIRECT", "RAND", "NOW", "TODAY", "VLOOKUP", "SORT",
+            "FILTER", "MAP", "STDEV.S", "SUBTOTAL", "OFFSET", "TRUE",
+        ] {
+            assert!(is_builtin(n), "{n}");
+        }
+        for n in ["MAKEADDER", "MYFN", "INC", "_XLPM.F"] {
+            assert!(!is_builtin(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn unevaluated_builtins_are_still_unevaluated() {
+        // The list only covers what the probe can't see; a name the evaluator
+        // learns should leave it.
+        for (i, n) in UNEVALUATED_BUILTINS.iter().enumerate() {
+            assert!(is_builtin(n), "{n}");
+            assert!(
+                !probe_known(n),
+                "{n} is evaluated now: drop it from the list"
+            );
+            assert!(future_prefix(n).is_none(), "{n} is a future function");
+            assert!(!UNEVALUATED_BUILTINS[..i].contains(n), "{n} listed twice");
+        }
+    }
+
+    #[test]
+    fn file_formula_leaves_plain_and_prefixed_text_alone() {
+        for src in [
+            "SUM(A1:A3)",
+            "A1 + 1",
+            "_xlfn._xlws.SORT(A1:A5,,-1)",
+            "_xlfn.LET(_xlpm.x,1,_xlpm.x+1)",
+            "SUM(_xlfn.ANCHORARRAY(A1))",
+            "_xlfn.SINGLE(A1:A3)",
+            // String literals are never rewritten.
+            "\"SEQUENCE(1)\"&\"A1#\"&\"@x\"&\"LET(x,1,x)\"",
+            // Text that doesn't lex.
+            "SEQUENCE(1)&\"open",
+        ] {
+            assert!(matches!(file_formula(src), Cow::Borrowed(_)), "{src}");
+        }
+        assert_eq!(file("CONCAT(\"A1#\",\"@\")"), "_xlfn.CONCAT(\"A1#\",\"@\")");
+        // A formula that needs reprinting but doesn't parse gets the prefixes
+        // only.
+        assert!(parse("SEQUENCE(A1#").is_err());
+        assert_eq!(file("SEQUENCE(A1#"), "_xlfn.SEQUENCE(A1#");
+        assert!(parse("LET(x,Sheet1!Rate,x*2)").is_err());
+        assert_eq!(
+            file("LET(x,Sheet1!Rate,x*2)"),
+            "_xlfn.LET(x,Sheet1!Rate,x*2)"
+        );
+        assert_eq!(
+            file("lambda(x,Sheet1!Rate*x)(2)+single(Sheet1!Rate)+ANCHORARRAY(Sheet1!Rate)"),
+            "_xlfn.LAMBDA(x,Sheet1!Rate*x)(2)+_xlfn.SINGLE(Sheet1!Rate)+_xlfn.ANCHORARRAY(Sheet1!Rate)"
+        );
+        assert!(matches!(
+            file_formula("SUM(A1#)+Sheet1!Rate"),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn file_formula_round_trips_through_display_formula() {
+        for src in [
+            "SEQUENCE(3)",
+            "SORT(A1:A5)",
+            "XLOOKUP( A1 , B:B , C:C )",
+            "A1#",
+            "Sheet2!A1#",
+            "SUM(A1#)",
+            "@A1:A3",
+            "LET(x,1,x+1)",
+            "LET(x,1,x)+x",
+            "LAMBDA(a,b,a+b)(1,2)",
+            "LET(x,1,LAMBDA(y,x+y)(2))",
+            "LET(f,LAMBDA(x,x*3),f(2))",
+            "LAMBDA(x,[y],IF(ISOMITTED(y),x,x+y))(1)",
+        ] {
+            assert_eq!(display_formula(&file_formula(src)), src);
+        }
+    }
+
+    #[test]
+    fn file_formula_reprints_numbers_exactly() {
+        // A reprinted formula keeps every digit of its numbers (the display
+        // printer would round 1.23456789E-12 to 1.23457E-12).
+        assert_eq!(
+            file("SUM(A1#)*1.23456789E-12"),
+            "SUM(_xlfn.ANCHORARRAY(A1))*1.23456789E-12"
+        );
+        assert_eq!(
+            file("LET(x,1.5E+25,x)"),
+            "_xlfn.LET(_xlpm.x,1.5E+25,_xlpm.x)"
+        );
+        for lit in [
+            "1.23456789E-12",
+            "1.5E+25",
+            "0.1",
+            "123456789012345",
+            "0.000123456789012345",
+            "98765.4321",
+            "0",
+        ] {
+            let typed = format!("LET(x,{lit},x)");
+            let saved = file(&typed);
+            assert_ne!(saved, typed);
+            let g = empty();
+            assert_eq!(
+                n(&typed, &g).to_bits(),
+                n(&saved, &g).to_bits(),
+                "{typed} saved as {saved}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_spelled_let_and_lambda_evaluate_like_typed() {
+        let g = empty();
+        for (typed, want) in [
+            ("LET(x,1,x+1)", 2.0),
+            ("LAMBDA(a,b,a+b)(1,2)", 3.0),
+            ("LET(x,1,LAMBDA(y,x+y)(2))", 3.0),
+            ("LET(f,LAMBDA(x,x*3),f(2))", 6.0),
+            ("LET(sort,LAMBDA(x,x*5),sort(2))", 10.0),
+            ("LAMBDA(x,[y],IF(ISOMITTED(y),x,x+y))(1)", 1.0),
+            ("LAMBDA(x,[y],IF(ISOMITTED(y),x,x+y))(1,2)", 3.0),
+            // Names shared with a builtin that is still called as one.
+            ("LET(sum,SUM(1,2),sum/SUM(1,2,3))", 0.5),
+            ("LET(max,10,MAX(1,max))", 10.0),
+            ("LET(date,45306,DATE(YEAR(date),1,1))", 45292.0),
+            ("LAMBDA(text,LEN(TEXT(text,\"0.0\")))(5)", 3.0),
+            ("LET(f,LAMBDA(x,x*3),g,f,g(2))", 6.0),
+            // Lambdas a LET name gets from a call or a choice.
+            ("LET(mk,LAMBDA(n,LAMBDA(x,x+n)),inc,mk(1),inc(5))", 6.0),
+            ("LET(d,LAMBDA(n,LAMBDA(x,x*n))(2),d(5))", 10.0),
+            ("LET(f,IF(FALSE,LAMBDA(x,x),LAMBDA(x,-x)),f(2))", -2.0),
+        ] {
+            let saved = file_formula(typed).into_owned();
+            // What a reload holds: the file text as the parser reads it.
+            assert_eq!(n(typed, &g), want, "{typed}");
+            assert_eq!(n(&saved, &g), want, "{saved}");
+        }
+        // A lambda a defined name makes, bound by LET and called.
+        let named = empty().with_name("MakeAdder", "LAMBDA(n,LAMBDA(x,x+n))");
+        let typed = "LET(addfive,MakeAdder(5),addfive(1))";
+        assert_eq!(n(typed, &named), 6.0);
+        assert_eq!(n(&file_formula(typed), &named), 6.0);
+        // Mixed spellings (a partly reprinted formula) bind the same name.
+        assert_eq!(n("_xlfn.LET(_xlpm.x,1,x+1)", &g), 2.0);
+        assert_eq!(n("LET(x,1,_xlpm.x+1)", &g), 2.0);
+        assert_eq!(n("_xlfn.LAMBDA(_xlpm.x,x*2)(3)", &g), 6.0);
+        assert_eq!(n("LAMBDA(x,[_xlpm.y],IF(ISOMITTED(y),x,x+y))(4)", &g), 4.0);
     }
 
     #[test]
@@ -13200,5 +14340,85 @@ mod tests {
         assert_eq!(t("TEXT(0.5,\"0.0\")"), "0.5");
         assert_eq!(t("TEXT(0.5,\"#.#\")"), ".5");
         assert_eq!(t("TEXT(-2.25,\"0.0\")"), "-2.3");
+    }
+
+    #[test]
+    fn may_return_array_rules() {
+        let yes = [
+            "FILTER(A1:A3,A1:A3>5)",
+            "_xlfn._xlws.SORT(A1:A3)",
+            "SEQUENCE(3)",
+            "UNIQUE(A1:A3)",
+            "MAP(A1:A3,LAMBDA(x,x*2))",
+            "BYROW(A1:B3,LAMBDA(r,SUM(r)))",
+            "TREND(A1:A3)",
+            "INDIRECT(B1)",
+            "OFFSET(A1,0,0,3)",
+            "INDEX(A1:C3,2,0)",
+            "A1:A3",
+            "A:A",
+            "1:2",
+            "A1#",
+            "{1,2}",
+            "Sales[Qty]",
+            "Sales[[#Totals],[Qty]:[Price]]",
+            "Sales[#Headers]",
+            "A1:A3*2",
+            "-A1:A3",
+            "SEQUENCE(1)*2",
+            "A1:A3%",
+            "IF(A1>1,FILTER(A1:A3,A1:A3>1),0)",
+            "IFERROR(FILTER(A1:A3,A1:A3>5),\"\")",
+            "IFNA(INDIRECT(B1),0)",
+            "CHOOSE(1,A1:A3,B1:B3)",
+            "SWITCH(A1,1,A1:A3,0)",
+            "SWITCH(A1,1,0,B1:B3)",
+            "IFS(A1>1,A1:A3)",
+            "LET(x,FILTER(A1:A3,A1:A3>1),x)",
+            "LET(x,A1,SEQUENCE(x))",
+            "(A1:A3)",
+        ];
+        let no = [
+            // #724 r1: elementwise ops over single cells are scalar.
+            "[@Qty]*[@Price]",
+            "OFFSET(A2,0,1)+1",
+            "INDIRECT(\"A2\")*2",
+            "-OFFSET(A2,0,0)",
+            "OFFSET(A2,0,0)>1",
+            "OFFSET(A2,0,0)&\"x\"",
+            "ABS(OFFSET(A2,0,0))",
+            "IF(OFFSET(A2,0,0)>1,1,2)",
+            "OFFSET(A2,0,0)*OFFSET(A2,0,1)",
+            "A1+1",
+            "A1",
+            "A1:A1",
+            "{1}",
+            "SUM(A1:A3)",
+            "ROWS(FILTER(A1:A3,A1:A3>1))",
+            "LET(x,FILTER(A1:A3,A1:A3>1),ROWS(x))",
+            "@INDIRECT(B1)",
+            "@A1:A3",
+            "REDUCE(0,A1:A3,LAMBDA(a,b,a+b))",
+            "XLOOKUP(2,A1:A3,A1:A3)",
+            "IF(A1:A3>1,1,2)",
+            "IFERROR(A1,A2)",
+            "Sales[[#Totals],[Qty]]",
+            "Sales[[#Headers],[Qty]]",
+            "Sales[[#Totals],[Qty]]*2",
+            "Sales[[#Totals],[Qty]:[Qty]]",
+            "MyRange",
+            "LAMBDA(x,x)(A1)",
+            "Sheet1:Sheet3!A1",
+            "SUM(Sheet1:Sheet3!A1:A3)",
+        ];
+        for src in yes {
+            assert!(
+                may_return_array(&parse(src).unwrap()),
+                "{src} may be an array"
+            );
+        }
+        for src in no {
+            assert!(!may_return_array(&parse(src).unwrap()), "{src} is scalar");
+        }
     }
 }

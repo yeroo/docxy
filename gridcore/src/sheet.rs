@@ -6,7 +6,7 @@
 //! a sparse `BTreeMap` so memory is proportional to content, and iteration is
 //! naturally row-major (the order worksheet XML wants).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
 // A1 reference math
@@ -204,6 +204,13 @@ pub(crate) fn ref_starts_at(fa: &str, anchor: &str) -> bool {
         .is_some_and(|tl| tl.eq_ignore_ascii_case(anchor))
 }
 
+/// Does the `ref` in preserved `<f>` attributes cover `(row, col)`?
+pub(crate) fn ref_covers(fa: &str, row: u32, col: u32) -> bool {
+    f_ref(fa)
+        .and_then(parse_range_name)
+        .is_some_and(|(r1, c1, r2, c2)| (r1..=r2).contains(&row) && (c1..=c2).contains(&col))
+}
+
 /// An array formula at `(row, col)` whose `ref` doesn't start there names
 /// another block (a clone, or a cell moved without the engine): it covers
 /// its own cell instead. A ref that does start there is left as it is.
@@ -216,27 +223,150 @@ pub(crate) fn own_array_ref(cell: &mut Cell, row: u32, col: u32) {
     }
 }
 
-/// Make an array formula pasted at `(row, col)` cover that cell alone: its
-/// `ref` still names the block it was copied from. A paste calls this for
-/// every pasted cell, before `Engine::set_cell` — which can't tell a paste
-/// at the source's own address (on another sheet, or after the source
-/// moved) from an undo. `current` is the cell being replaced: when it
-/// already holds this very array (same `<f>` attributes and formula), the
-/// block is that cell's and a paste in place keeps it.
-pub fn anchor_pasted_array_ref(cell: &mut Cell, current: Option<&Cell>, row: u32, col: u32) {
-    if !cell.f_attrs.as_deref().is_some_and(is_array_f) {
-        return;
-    }
-    let in_place =
-        current.is_some_and(|cur| cur.f_attrs == cell.f_attrs && cur.formula == cell.formula);
-    if !in_place {
-        if let Some(fa) = cell.f_attrs.as_deref() {
-            cell.f_attrs = Some(with_ref(fa, &cell_name(row, col)));
+/// The block an array formula's stored `ref` names, as 0-based
+/// `(r1, c1, r2, c2)`: `None` for a cell that is not an array formula or
+/// whose `ref` is missing or unreadable.
+pub fn array_block(cell: &Cell) -> Option<(u32, u32, u32, u32)> {
+    let fa = cell.f_attrs.as_deref().filter(|a| is_array_f(a))?;
+    parse_range_name(f_ref(fa)?)
+}
+
+/// Undo/redo snapshots of the cells at `keys` as the sheet holds them now: a
+/// plain cell inside the spill of a live anchor is spill output, and is
+/// snapshotted as a blank ([`Cell::blank_like`]) the anchor re-spills over.
+/// Put back as a plain value it would block the anchor with `#SPILL!` (the
+/// engine drops a submitted extent and recomputes it). An anchor `frozen`
+/// reports as kept on its cached values (asked only of anchors over a key)
+/// never re-spills, so its cells are kept as they are.
+pub fn snapshot_cells(
+    sheet: &Sheet,
+    keys: &[(u32, u32)],
+    mut frozen: impl FnMut(u32, u32) -> bool,
+) -> Vec<Option<Cell>> {
+    let anchors: Vec<((u32, u32), (u32, u32))> = sheet
+        .cells
+        .iter()
+        .filter(|(_, cl)| cl.formula.is_some())
+        .filter_map(|(&at, cl)| cl.spill.map(|ext| (at, ext)))
+        .collect();
+    let mut live: HashMap<(u32, u32), bool> = HashMap::new();
+    keys.iter()
+        .map(|&(r, c)| {
+            let cell = sheet.cell(r, c)?;
+            let spilled = cell.formula.is_none()
+                && anchors.iter().any(|&((ar, ac), (h, w))| {
+                    (r, c) != (ar, ac)
+                        && r >= ar
+                        && r < ar + h
+                        && c >= ac
+                        && c < ac + w
+                        && *live.entry((ar, ac)).or_insert_with(|| !frozen(ar, ac))
+                });
+            Some(if spilled {
+                cell.blank_like()
+            } else {
+                cell.clone()
+            })
+        })
+        .collect()
+}
+
+/// The cells an undo group over `keys` must record: `keys` in order,
+/// followed by what a frozen spill anchor (one `frozen` reports as kept on
+/// its cached values, which never re-spills) needs to come back whole.
+/// [`crate::engine::Engine::restore_cells`] puts its extent and cached
+/// values back only from cells in the same snapshot, and an edit can take
+/// either outside the keys ([`crate::engine::Engine::set_cell`]):
+///
+/// - a key that is the anchor: replacing it clears its spill values;
+/// - a key inside its block: a value typed there drops the anchor's extent.
+///   The anchor is added, and its values too: restoring the anchor clears
+///   them before it refills the ones the group holds.
+///
+/// Each is added once, and not if `keys` names it already. A live anchor
+/// adds nothing: it re-spills from its formula.
+///
+/// Only the values clearing takes are added: plain non-empty cells the
+/// sheet holds in the extent (its `spill`, not its `ref`). An empty cell is
+/// the same before and after, and the extent comes unbounded from a loaded
+/// `ref` (`A1:XFD1048576`), so the walk costs the cells held in its rows,
+/// not its area. `frozen` — an evaluation, in the hosts — is asked once per
+/// anchor, and of a key's own anchor only when it holds such a value
+/// outside `keys`; a live anchor typed over, or over a key, is still asked.
+/// The order within the group is not load-bearing: an anchor's restore
+/// clears or refills its block whichever comes first.
+pub fn frozen_spill_keys(
+    sheet: &Sheet,
+    keys: &[(u32, u32)],
+    mut frozen: impl FnMut(u32, u32) -> bool,
+) -> Vec<(u32, u32)> {
+    let anchor_ext = |at: (u32, u32)| {
+        sheet
+            .cell(at.0, at.1)
+            .filter(|cl| cl.formula.is_some())
+            .and_then(|cl| cl.spill)
+    };
+    // Every spill anchor, found once, for the keys that are not one.
+    let mut all_anchors = None;
+    let mut candidates = Vec::new();
+    for &(r, c) in keys {
+        if let Some(ext) = anchor_ext((r, c)) {
+            candidates.push(((r, c), ext, false));
+            continue;
+        }
+        let anchors = all_anchors.get_or_insert_with(|| {
+            sheet
+                .cells
+                .iter()
+                .filter(|(_, cl)| cl.formula.is_some())
+                .filter_map(|(&at, cl)| cl.spill.map(|ext| (at, ext)))
+                .collect::<Vec<_>>()
+        });
+        for &((ar, ac), (h, w)) in anchors.iter() {
+            if r >= ar && r < ar.saturating_add(h) && c >= ac && c < ac.saturating_add(w) {
+                candidates.push(((ar, ac), (h, w), true));
+            }
         }
     }
+    let mut out = keys.to_vec();
+    let mut seen: HashSet<(u32, u32)> = keys.iter().copied().collect();
+    let mut asked = HashSet::new();
+    for ((r, c), (h, w), owner) in candidates {
+        if !asked.insert((r, c)) {
+            continue;
+        }
+        let cols = c..c.saturating_add(w);
+        let held: Vec<(u32, u32)> = sheet
+            .cells
+            .range((r, c)..(r.saturating_add(h), 0))
+            .filter(|&(&(_, cc), cl)| {
+                cols.contains(&cc) && cl.formula.is_none() && !cl.value.is_empty()
+            })
+            .map(|(&at, _)| at)
+            .filter(|at| !seen.contains(at))
+            .collect();
+        if (held.is_empty() && !owner) || !frozen(r, c) {
+            continue;
+        }
+        for at in owner.then_some((r, c)).into_iter().chain(held) {
+            if seen.insert(at) {
+                out.push(at);
+            }
+        }
+    }
+    out
 }
 
 impl Cell {
+    /// An empty cell with this one's style: what a spilled value is put back
+    /// as, ahead of the anchor that refills it.
+    pub fn blank_like(&self) -> Cell {
+        Cell {
+            style: self.style,
+            ..Cell::default()
+        }
+    }
+
     pub fn number(n: f64) -> Cell {
         Cell {
             value: CellValue::Number(n),
@@ -359,6 +489,11 @@ pub struct Sheet {
     /// [`Drawing::anchor_ix`] of drawings deleted since the file was loaded —
     /// the same round-trip means a save has to strike them from the part too.
     pub drawings_removed: Vec<usize>,
+    /// [`CondFormat::ix`] of blocks a structural edit deleted (every range
+    /// gone): the worksheet part still holds them, so a save strikes them.
+    pub cf_removed: Vec<usize>,
+    /// [`DataValidation::ix`] of rules a structural edit deleted, likewise.
+    pub dv_removed: Vec<usize>,
     /// Sheet protection: `Some(attrs)` holds the raw attribute string of the
     /// worksheet's `<sheetProtection>` element (e.g. `sheet="1" objects="1"`),
     /// serialized verbatim so any existing password hash / flag set round-trips.
@@ -1011,6 +1146,11 @@ pub struct DataValidation {
     pub formula2: String,
     /// The input-message prompt, if the file supplies one.
     pub prompt: Option<String>,
+    /// The ordinal of this rule's element among the `<dataValidation>`
+    /// children of the worksheet's top-level `<dataValidations>`, so a save
+    /// can write a structural edit's move back to it. `None` for a rule the
+    /// part doesn't hold (an x14 one in `extLst`, one built in memory).
+    pub ix: Option<usize>,
 }
 
 impl DataValidation {
@@ -1574,7 +1714,30 @@ pub enum CfKind {
     /// `expression`: a formula truthy when the rule applies.
     Expression { formula: String },
     /// Anything else (colorScale/dataBar/iconSet/top10/…) — not evaluated.
-    Other,
+    /// Its `<formula>` children are kept so structural edits can move them.
+    Other { formulas: Vec<String> },
+}
+
+impl CfRule {
+    /// The rule's formulas in document order, whatever its kind.
+    pub fn formulas(&self) -> Vec<&String> {
+        match &self.kind {
+            CfKind::CellIs { formulas, .. } | CfKind::Other { formulas } => {
+                formulas.iter().collect()
+            }
+            CfKind::Expression { formula } => vec![formula],
+        }
+    }
+
+    /// [`Self::formulas`], mutably.
+    pub fn formulas_mut(&mut self) -> Vec<&mut String> {
+        match &mut self.kind {
+            CfKind::CellIs { formulas, .. } | CfKind::Other { formulas } => {
+                formulas.iter_mut().collect()
+            }
+            CfKind::Expression { formula } => vec![formula],
+        }
+    }
 }
 
 /// A conditional-formatting block: its `rules` apply over `ranges` (`sqref`).
@@ -1582,6 +1745,11 @@ pub enum CfKind {
 pub struct CondFormat {
     pub ranges: Vec<(u32, u32, u32, u32)>,
     pub rules: Vec<CfRule>,
+    /// The ordinal of this block's element among the worksheet's top-level
+    /// `<conditionalFormatting>` children, so a save can write a structural
+    /// edit's move back to it. `None` for a block the part doesn't hold (an
+    /// x14 one in `extLst`, one built in memory).
+    pub ix: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1835,6 +2003,20 @@ pub fn fmt_general(n: f64) -> String {
     }
 }
 
+/// The most characters Excel's General format shows a number in, however
+/// wide the column: 12345678901 is shown whole, 123456789012 as
+/// `1.23457E+11`, 0.123456789012345 as `0.123456789`.
+pub const GENERAL_MAX_CHARS: usize = 11;
+
+/// A General number as a grid cell `width` characters wide shows it:
+/// [`fmt_general_fit`] within General's own [`GENERAL_MAX_CHARS`], and `#`s
+/// across the cell when not even scientific notation fits. Display only:
+/// the editor, a copy and the saved value keep every digit.
+pub fn fmt_general_cell(n: f64, width: usize) -> String {
+    let width = width.max(1);
+    fmt_general_fit(n, width.min(GENERAL_MAX_CHARS)).unwrap_or_else(|| "#".repeat(width))
+}
+
 /// A General number as a cell `width` characters wide shows it: in full
 /// when it fits, else with fewer decimals (`0.333333`), else in scientific
 /// notation with as many mantissa digits as fit (`1.23E+08`). `None` when
@@ -2035,6 +2217,136 @@ pub fn sheet_to_csv(sheet: &Sheet, styles: &Styles, date1904: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshots_blank_the_spill_output_of_a_live_anchor() {
+        // #777 r1: C1 spills C1:C3 and is not among the keys; E1 is frozen.
+        let mut sheet = Sheet::default();
+        let anchor = |src: &str| Cell {
+            spill: Some((3, 1)),
+            ..Cell::formula(src)
+        };
+        sheet.set_cell(0, 2, anchor("SEQUENCE(3)"));
+        sheet.set_cell(
+            1,
+            2,
+            Cell {
+                style: 2,
+                ..Cell::number(2.0)
+            },
+        );
+        sheet.set_cell(2, 2, Cell::number(3.0));
+        sheet.set_cell(0, 4, anchor("PIVOTBY(A1,4)"));
+        sheet.set_cell(1, 4, Cell::number(8.0));
+        sheet.set_cell(3, 2, Cell::number(4.0)); // below the spill
+        let keys = [(0, 2), (1, 2), (2, 2), (3, 2), (1, 4), (5, 5)];
+        let mut asked = Vec::new();
+        let frozen = |r, c| (r, c) == (0, 4);
+        let snap = snapshot_cells(&sheet, &keys, |r, c| {
+            asked.push((r, c));
+            frozen(r, c)
+        });
+        assert_eq!(snap[0].as_ref(), sheet.cell(0, 2)); // the anchor itself
+        assert_eq!(
+            snap[1],
+            Some(Cell {
+                style: 2,
+                ..Cell::default()
+            })
+        );
+        assert_eq!(snap[2], Some(Cell::default()));
+        assert_eq!(snap[3], Some(Cell::number(4.0)));
+        assert_eq!(snap[4], Some(Cell::number(8.0))); // a frozen anchor's value
+        assert_eq!(snap[5], None);
+        // Asked once per anchor over a key, never of the others.
+        asked.sort();
+        assert_eq!(asked, vec![(0, 2), (0, 4)]);
+    }
+
+    #[test]
+    fn frozen_spill_keys_adds_the_block_of_a_frozen_anchor() {
+        // #837: C1 spills C1:C3 live; E1 spills E1:F2 and is frozen: F1
+        // holds 8, E2 9, F2 a styled blank.
+        let mut sheet = Sheet::default();
+        let anchor = |src: &str, ext| Cell {
+            spill: Some(ext),
+            ..Cell::formula(src)
+        };
+        sheet.set_cell(0, 2, anchor("SEQUENCE(3)", (3, 1)));
+        sheet.set_cell(1, 2, Cell::number(2.0));
+        sheet.set_cell(2, 2, Cell::number(3.0));
+        sheet.set_cell(0, 4, anchor("PIVOTBY(A1,4)", (2, 2)));
+        sheet.set_cell(0, 5, Cell::number(8.0));
+        sheet.set_cell(1, 4, Cell::number(9.0));
+        sheet.set_cell(
+            1,
+            5,
+            Cell {
+                style: 3,
+                ..Cell::default()
+            },
+        );
+        sheet.set_cell(1, 6, Cell::number(1.0)); // right of the block
+        let asked = std::cell::RefCell::new(Vec::new());
+        let frozen = |r, c| {
+            asked.borrow_mut().push((r, c));
+            (r, c) == (0, 4)
+        };
+        // A live anchor, a member of its spill, an empty cell: nothing added.
+        for keys in [vec![(0, 2)], vec![(1, 2)], vec![(7, 7)]] {
+            assert_eq!(frozen_spill_keys(&sheet, &keys, frozen), keys);
+        }
+        // A frozen anchor adds its held values once, after the keys,
+        // whatever of them the keys already name.
+        assert_eq!(
+            frozen_spill_keys(&sheet, &[(1, 4), (0, 4), (0, 4), (3, 3)], frozen),
+            vec![(1, 4), (0, 4), (0, 4), (3, 3), (0, 5)]
+        );
+        // An anchor whose values the keys all name is not asked.
+        let all = [(0, 4), (0, 5), (1, 4)];
+        assert_eq!(frozen_spill_keys(&sheet, &all, frozen), all);
+        assert_eq!(*asked.borrow(), vec![(0, 2), (0, 2), (0, 4)]);
+        asked.borrow_mut().clear();
+        // A key inside a frozen block adds the anchor, then its values; one
+        // inside a live spill adds nothing; the frozen anchor is asked once.
+        assert_eq!(
+            frozen_spill_keys(&sheet, &[(1, 5), (2, 2), (1, 4)], frozen),
+            vec![(1, 5), (2, 2), (1, 4), (0, 4), (0, 5)]
+        );
+        assert_eq!(*asked.borrow(), vec![(0, 4), (0, 2)]);
+    }
+
+    #[test]
+    fn frozen_spill_keys_walks_held_cells_not_a_huge_extent() {
+        // #837 r1: a loaded `ref` sizes the extent with no bound.
+        let mut sheet = Sheet::default();
+        for (ext, at) in [((1_048_576, 1), (0, 0)), ((u32::MAX, u32::MAX), (5, 3))] {
+            sheet.set_cell(
+                at.0,
+                at.1,
+                Cell {
+                    spill: Some(ext),
+                    ..Cell::formula("PIVOTBY(A1,4)")
+                },
+            );
+        }
+        sheet.set_cell(9, 0, Cell::number(1.0));
+        sheet.set_cell(1_048_575, 0, Cell::number(2.0));
+        sheet.set_cell(7, 900, Cell::number(3.0));
+        sheet.set_cell(1_048_575, 16_383, Cell::number(4.0));
+        let keys = frozen_spill_keys(&sheet, &[(0, 0), (5, 3)], |_, _| true);
+        assert_eq!(
+            keys,
+            vec![
+                (0, 0),
+                (5, 3),
+                (9, 0),
+                (1_048_575, 0),
+                (7, 900),
+                (1_048_575, 16_383)
+            ]
+        );
+    }
 
     #[test]
     fn an_undisplayable_date_or_time_is_a_hash_run() {
@@ -2599,6 +2911,19 @@ mod tests {
         );
         assert_eq!(fmt_general_fit(42.0, 8).as_deref(), Some("42"));
         assert_eq!(fmt_general_fit(123_456_789.0, 3), None);
+    }
+
+    #[test]
+    fn a_general_cell_shows_at_most_eleven_characters() {
+        // However wide the column, General stops at 11 characters.
+        assert_eq!(fmt_general_cell(123_456_789_012.0, 20), "1.23457E+11");
+        assert_eq!(fmt_general_cell(0.123_456_789_012_345, 20), "0.123456789");
+        assert_eq!(fmt_general_cell(12_345_678_901.0, 20), "12345678901");
+        assert_eq!(fmt_general_cell(42.0, 20), "42");
+        // A narrower column shortens it further, down to `#`s.
+        assert_eq!(fmt_general_cell(123_456_789_012.0, 8), "1.23E+11");
+        assert_eq!(fmt_general_cell(123_456_789.0, 3), "###");
+        assert_eq!(fmt_general_cell(5.0, 0), "5");
     }
 
     #[test]

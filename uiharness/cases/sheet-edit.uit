@@ -90,9 +90,10 @@ test ctrl z while editing undoes the typing only
   type Z
   assert edit is Z
 
-# Enter mode: an arrow commits and moves; while a formula is typed it moves
-# the caret instead, so a half-typed formula is never committed.
-test enter mode arrows commit but not a half-typed formula
+# Enter mode: an arrow commits and moves, a formula's too — except where the
+# formula wants a reference next: there it points at a cell and writes it
+# (#757), and the editor stays open.
+test enter mode arrows commit or point
   open copy:../fixtures/basic.xlsx
   click A11
   type xyz
@@ -102,9 +103,12 @@ test enter mode arrows commit but not a half-typed formula
   assert cell A11 is xyz
   click A12
   type =1+
-  key left
+  key right
   assert editing is true
   assert sel is A12
+  assert edit is =1+B12
+  key right
+  assert edit is =1+C12
   key escape
 
 # #653 #654 #599: typed entries are read the way Excel reads them.

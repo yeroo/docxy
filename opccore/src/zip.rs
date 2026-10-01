@@ -23,6 +23,15 @@ fn rd32(p: &[u8]) -> u32 {
     p[0] as u32 | ((p[1] as u32) << 8) | ((p[2] as u32) << 16) | ((p[3] as u32) << 24)
 }
 
+/// Output cap for inflating a deflate entry that declares `uncomp_size` bytes.
+/// `inflate_raw` treats a cap of 0 as unlimited, so an entry declaring 0 bytes
+/// gets a cap of 1: its stream is cut off within one block step instead of
+/// inflating without bound, and the size check in `extract` still rejects any
+/// non-empty output.
+fn deflate_cap(uncomp_size: u32) -> usize {
+    (uncomp_size as usize).max(1)
+}
+
 pub struct ZipArchive<'a> {
     data: &'a [u8],
     entries: Vec<ZipEntry>,
@@ -105,7 +114,7 @@ impl<'a> ZipArchive<'a> {
             return Some(src.to_vec());
         }
         if entry.method == 8 {
-            let out = inflate_raw(src, entry.uncomp_size as usize)?;
+            let out = inflate_raw(src, deflate_cap(entry.uncomp_size))?;
             if out.len() == entry.uncomp_size as usize {
                 return Some(out);
             }
@@ -222,6 +231,53 @@ mod tests {
     #[test]
     fn too_small_is_rejected() {
         assert!(ZipArchive::open(&[0u8; 4]).is_none());
+    }
+
+    /// Wraps `stream` as the single entry "a" of a ZIP, switched to the deflate
+    /// method and declaring `declared` uncompressed bytes in both headers.
+    fn deflate_zip(stream: &[u8], declared: u32) -> Vec<u8> {
+        let mut zip = make_stored_zip(&[("a", stream)]);
+        let eocd = zip.len() - 22;
+        let central = rd32(&zip[eocd + 16..]) as usize;
+        for (method, uncomp) in [(8, 22), (central + 10, central + 24)] {
+            zip[method..method + 2].copy_from_slice(&8u16.to_le_bytes());
+            zip[uncomp..uncomp + 4].copy_from_slice(&declared.to_le_bytes());
+        }
+        zip
+    }
+
+    /// #451: a declared size of 0 must not become inflate's "unlimited" cap.
+    #[test]
+    fn deflate_cap_never_uncapped() {
+        assert_eq!(deflate_cap(0), 1);
+        assert_eq!(deflate_cap(1), 1);
+        assert_eq!(deflate_cap(4096), 4096);
+        assert_eq!(deflate_cap(u32::MAX), u32::MAX as usize);
+    }
+
+    /// Behaviour (also holds before #451): a zero-declared deflate entry whose
+    /// stream yields data is rejected.
+    #[test]
+    fn zero_declared_deflate_entry_with_data_is_rejected() {
+        // BFINAL=1, BTYPE=00 (stored block) carrying five bytes.
+        let mut stream = vec![0x01, 5, 0, !5u8, 0xFF];
+        stream.extend_from_slice(b"hello");
+        let zip = deflate_zip(&stream, 0);
+        let arc = ZipArchive::open(&zip).expect("open");
+        assert!(arc.read("a").is_none());
+        // The same stream declaring its real size extracts.
+        let zip = deflate_zip(&stream, 5);
+        assert_eq!(ZipArchive::open(&zip).unwrap().read("a").unwrap(), b"hello");
+    }
+
+    /// Behaviour (also holds before #451): a genuinely empty deflate entry
+    /// still extracts as empty.
+    #[test]
+    fn zero_declared_empty_deflate_extracts_empty() {
+        // Fixed-Huffman block holding only the end-of-block symbol.
+        let zip = deflate_zip(&[0x03, 0x00], 0);
+        let arc = ZipArchive::open(&zip).expect("open");
+        assert_eq!(arc.read("a"), Some(Vec::new()));
     }
 
     #[test]
