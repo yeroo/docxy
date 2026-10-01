@@ -45,7 +45,7 @@
 //! | `col.insert` / `col.delete` | `{at,count?,sheet?}` | `{inserted\|deleted}` |
 //! | `cell.format` | `{range,patch,sheet?}` | `{formatted}` — one undo group; `patch` keys: `numFmt`/`bold`/`italic`/`fontColor`/`fillColor`/`align` (≥1 required) |
 //! | `col.width` | `{col,width,sheet?}` | `{col,width}` — NOT on the undo stack (mirrors the TUI's F7/F8, which mutate directly) |
-//! | `page.setup` | `{sheet?\|sheets?, …fields}` | the sheet's page layout: `margins:{left,right,top,bottom,header,footer}` (inches), `paperSize`, `orientation`, `scale`, `fitToPage`, `fitToWidth`, `fitToHeight` (0 = Automatic), `firstPageNumber` (`null` = Auto), `pageOrder`, `blackAndWhite`, `draft`, `cellComments`, `errors`, `gridLines`, `headings`, `horizontalCentered`, `verticalCentered`, `differentOddEven`, `differentFirst`, `scaleWithDoc`, `alignWithMargins`, `headers:{oddHeader…firstFooter}` (stored codes), `printArea`, `printTitles:{rows,cols}`, `rowBreaks`, `colBreaks`. Any field given sets it (+ `changed`): a fit count turns `fitToPage` on and `scale` turns it off unless `fitToPage` is given; scale outside 10–400 is refused. With `sheets`, the first sheet's page setup is then copied to the others (grouped sheets: not print areas, titles or header pictures). One undo step |
+//! | `page.setup` | `{sheet?\|sheets?, …fields}` | the sheet's page layout. Settable fields: `margins:{left,right,top,bottom,header,footer}` (inches), `paperSize`, `orientation`, `scale`, `fitToPage`, `fitToWidth`, `fitToHeight` (0 = Automatic), `firstPageNumber` (`null` = Auto), `pageOrder`, `blackAndWhite`, `draft`, `cellComments`, `errors`, `gridLines`, `headings`, `horizontalCentered`, `verticalCentered`, `differentOddEven`, `differentFirst`, `scaleWithDoc`, `alignWithMargins`. Reply-only: `headers:{oddHeader…firstFooter}` (stored codes; set with `page.header`), `printArea` (`print-area.*`), `printTitles:{rows,cols}` (`print-titles.set`), `rowBreaks`, `colBreaks` (`page-break.*`). Any settable field given sets it (+ `changed`): a fit count turns `fitToPage` on and `scale` turns it off unless `fitToPage` is given; scale outside 10–400 is refused. With `sheets`, the first sheet's page setup is then copied to the others (grouped sheets: not print areas, titles or header pictures). One undo step |
 //! | `page.header` | `{sheet?, kind?:odd\|even\|first, part?:header\|footer, left?, center?, right?}` | `{stored, left, center, right, changed}` — sections in the editor's form (`&[Page]`, `&[Pages]`, `&[Date]`, `&[Time]`, `&[Path]`, `&[File]`, `&[Tab]`), stored as Excel's codes; with none of left/center/right it only reads; a section over 255 characters is refused; `&[Picture]` only where the section already has a picture. One undo step |
 //! | `print-area.set` / `print-area.add` | `{range, sheet?}` | `{printArea, changed}` — `range` is `A1:C10`, `A1:C10,E1:F5`, `A:C` or `1:5`; add appends to the sheet's print area. One undo step |
 //! | `print-area.clear` | `{sheet?}` | `{printArea:null, changed}` |
@@ -1604,7 +1604,8 @@ fn apply_page_fields(s: &mut PageSetup, args: &Json) -> Result<(), String> {
     for (key, v) in pairs {
         let k = key.as_str();
         match k {
-            "sheet" | "sheets" => {}
+            // Addressing, not fields: `target` picks the editor over MCP.
+            "sheet" | "sheets" | "target" => {}
             "margins" => {
                 let Json::Obj(m) = v else {
                     return Err(format!("{VERB}: 'margins' must be an object of inches"));
@@ -1693,7 +1694,9 @@ fn apply_page_fields(s: &mut PageSetup, args: &Json) -> Result<(), String> {
 /// Does `page.setup` carry any field to set?
 fn has_page_fields(args: &Json) -> bool {
     match args {
-        Json::Obj(pairs) => pairs.iter().any(|(k, _)| k != "sheet" && k != "sheets"),
+        Json::Obj(pairs) => pairs
+            .iter()
+            .any(|(k, _)| !matches!(k.as_str(), "sheet" | "sheets" | "target")),
         _ => false,
     }
 }
@@ -1859,15 +1862,23 @@ fn page_header(app: &mut App, args: &Json) -> Result<Json, String> {
         };
         let sections = hf::Sections::from_editor(&text("left")?, &text("center")?, &text("right")?)
             .map_err(|e| format!("{VERB}: {e}"))?;
-        let current = app.pkg.workbook.sheets[si]
-            .page_setup
-            .header_footer
-            .get(slot)
-            .map(str::to_string);
-        if sections.has_picture() && !current.as_deref().is_some_and(|c| hf::has_code(c, 'G')) {
-            return Err(format!(
-                "{VERB}: a header picture (&[Picture]) can only be kept where the section already has one; inserting pictures is not supported"
-            ));
+        let current = hf::Sections::parse(
+            app.pkg.workbook.sheets[si]
+                .page_setup
+                .header_footer
+                .get(slot)
+                .unwrap_or(""),
+        );
+        for (name, new, old) in [
+            ("left", &sections.left, &current.left),
+            ("center", &sections.center, &current.center),
+            ("right", &sections.right, &current.right),
+        ] {
+            if hf::has_code(new, 'G') && !hf::has_code(old, 'G') {
+                return Err(format!(
+                    "{VERB}: a header picture (&[Picture]) can only be kept where the {name} section already has one; inserting pictures is not supported"
+                ));
+            }
         }
         let stored = sections.compose();
         let new = (!stored.is_empty()).then_some(stored);
@@ -5480,6 +5491,46 @@ mod print_tests {
     }
 
     #[test]
+    fn the_mcp_target_key_is_not_a_page_setup_field() {
+        // FIX r1 M2: the MCP bridge forwards `target` with the arguments.
+        let mut a = app();
+        let r = call(&mut a, "page.setup", obj(vec![("target", s("pane-1"))]));
+        assert_eq!(r.get_str("orientation"), Some("default"));
+        assert!(!a.modified);
+        let r = call(
+            &mut a,
+            "page.setup",
+            obj(vec![
+                ("target", s("pane-1")),
+                ("orientation", s("landscape")),
+            ]),
+        );
+        assert_eq!(r.get("changed"), Some(&Json::Bool(true)));
+        let target = || ("target", s("pane-1"));
+        call(
+            &mut a,
+            "page.header",
+            obj(vec![target(), ("center", s("x"))]),
+        );
+        call(
+            &mut a,
+            "print-area.set",
+            obj(vec![target(), ("range", s("A1:B2"))]),
+        );
+        call(
+            &mut a,
+            "print-titles.set",
+            obj(vec![target(), ("rows", s("1:1"))]),
+        );
+        call(
+            &mut a,
+            "page-break.insert",
+            obj(vec![target(), ("cell", s("A5"))]),
+        );
+        call(&mut a, "print.pages", obj(vec![target()]));
+    }
+
+    #[test]
     fn grouped_sheets_take_the_first_sheets_setup_but_keep_their_print_areas() {
         let mut a = app();
         call(&mut a, "sheet.add", obj(vec![("name", s("Two"))]));
@@ -5563,6 +5614,21 @@ mod print_tests {
             obj(vec![("left", s("&[Picture]")), ("right", s("x"))]),
         );
         assert_eq!(r.get_str("stored"), Some("&L&G&Rx"));
+        // FIX r1 m7: the picture belongs to its section; another can't take it.
+        let e = dispatch(
+            &mut a,
+            "page.header",
+            &obj(vec![("left", s("&[Picture]")), ("right", s("&[Picture]"))]),
+        )
+        .unwrap_err();
+        assert!(e.contains("right section"), "{e}");
+        let e = dispatch(
+            &mut a,
+            "page.header",
+            &obj(vec![("right", s("&[Picture]"))]),
+        )
+        .unwrap_err();
+        assert!(e.contains("right section"), "{e}");
         let long = "x".repeat(256);
         assert!(dispatch(&mut a, "page.header", &obj(vec![("left", s(&long))])).is_err());
     }

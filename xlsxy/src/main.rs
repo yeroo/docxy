@@ -83,7 +83,7 @@ fn export_csv_headless(
         Some(p) if opccore::fsio::same_file(p, Path::new(out)) => p.to_str().unwrap_or(source),
         _ => source,
     };
-    export_csv_bytes(source, import_source, out, &bytes)?;
+    export_bytes(source, import_source, out, &bytes)?;
     Ok(bytes.len())
 }
 
@@ -140,13 +140,15 @@ fn export_pdf_headless(
             active,
         ]));
     let (bytes, _) = print_pdf(wb, &job, source).map_err(|e| e.to_string())?;
-    export_csv_bytes(source, import_source, out, &bytes).map_err(|e| e.to_string())?;
+    export_bytes(source, import_source, out, &bytes).map_err(|e| e.to_string())?;
     Ok(bytes.len())
 }
 
-/// An imported text file stays protected independently of the rebound .xlsx
-/// save path. Either path can identify the destination through a filesystem alias.
-fn export_csv_bytes(
+/// Write an export (CSV, PDF, …) to `out` atomically, never over the
+/// workbook `source` or its import source: an imported text file stays
+/// protected independently of the rebound .xlsx save path. Either path can
+/// identify the destination through a filesystem alias.
+fn export_bytes(
     source: &str,
     import_source: Option<&str>,
     out: &str,
@@ -4530,7 +4532,7 @@ impl App {
         self.status = Some(match print_pdf(&self.pkg.workbook, &job, &self.path) {
             Err(e) => e.to_string(),
             Ok((pdf, pages)) => {
-                match export_csv_bytes(&self.path, self.import_source.as_deref(), &out, &pdf) {
+                match export_bytes(&self.path, self.import_source.as_deref(), &out, &pdf) {
                     Ok(()) => format!(
                         "Exported {out} ({pages} page{})",
                         if pages == 1 { "" } else { "s" }
@@ -4549,7 +4551,7 @@ impl App {
             Some((base, _)) => format!("{base}.csv"),
             None => format!("{}.csv", self.path),
         };
-        match export_csv_bytes(&self.path, self.import_source.as_deref(), &out, &csv) {
+        match export_bytes(&self.path, self.import_source.as_deref(), &out, &csv) {
             Ok(()) => self.status = Some(format!("Exported {out} ({} bytes)", csv.len())),
             Err(e) => self.status = Some(format!("Export failed: {e}")),
         }
