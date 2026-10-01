@@ -216,6 +216,8 @@ xlsxy book.xls                    # also .xlsb/.ods: imports values, formulas,
                                   # formatting); Ctrl+S writes book.xlsx
                                   # (book1.xlsx, ... if that exists); the
                                   # status line names the target
+xlsxy book.xlsx --read-only       # (-r) open read-only: Ctrl+S asks for a
+                                  # new name, the file itself is never written
 xlsxy in.xlsx --recalc out.xlsx   # headless: recalculate everything, save
 xlsxy in.xlsx --csv out.csv       # headless: export the active sheet as CSV UTF-8
 xlsxy corpus/xlsx/*.xlsx --verify # conformance scoreboard: recalc + diff
