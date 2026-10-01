@@ -1687,11 +1687,16 @@ struct App {
     circle_warning_pending: bool,
     /// The file opened read-only (`--read-only`, #882): nothing writes it,
     /// so Save on it asks for another name. Compared by file identity, so no
-    /// other spelling or link reaches it. Only a person's Open that loads,
-    /// a finished import, or New clears it. An Open that fails or is
-    /// cancelled, a reload, and the control surface's scripted `wb.open` and
-    /// `wb.reload` keep it: the source stays refused whatever is open.
+    /// other spelling or link reaches it. A person's Open that loads (any
+    /// file, this one included), a finished interactive import, or New
+    /// ends it. The startup import of the `-r` file itself keeps it
+    /// ([`Self::startup_import`]), as do an Open that fails or is cancelled,
+    /// a reload, and the control surface's scripted `wb.open`/`wb.reload`.
     read_only: Option<std::path::PathBuf>,
+    /// The Text Import Wizard `xlsxy -r notes.txt` opened at startup: its
+    /// finish keeps read-only, unlike an interactive import. Cleared when
+    /// that wizard finishes or is cancelled.
+    startup_import: bool,
 }
 
 impl App {
@@ -1782,6 +1787,7 @@ impl App {
             replace_find: None,
             vim: None,
             read_only: None,
+            startup_import: false,
             sheet_picker: None,
             dv_picker: None,
             grid_area: Rect::default(),
@@ -3145,8 +3151,16 @@ impl App {
         let _ = self.save_current();
     }
 
-    /// Open `source` read-only (#882). An import's binding is never its
-    /// source, so for an import nothing is read-only.
+    /// The `.txt`/`.prn` named on the command line: its Text Import Wizard,
+    /// whose finish keeps a `--read-only` file read-only (#882).
+    fn open_startup_wizard(&mut self, text_file: &str) {
+        self.open_workbook(text_file);
+        self.startup_import = self.text_dialog.is_some();
+    }
+
+    /// Open `source` read-only (#882). An import is bound to a new name, so
+    /// its Save writes that file as usual and shows no caption, but every
+    /// write onto `source` itself is still refused.
     fn set_read_only(&mut self, source: &str) {
         self.read_only = Some(std::path::PathBuf::from(source));
     }
@@ -3208,8 +3222,10 @@ impl App {
     /// status line and the `Err`, so a caller that reports it (the control
     /// surface's `wb.save`) says exactly what the status bar says.
     fn save_current(&mut self) -> Result<(), String> {
-        // Every write comes through here: Ctrl+S, `:w`/`:wq`, Save As (which
-        // binds the path first), and the control surface's `wb.save`.
+        // Every save of the workbook comes through here: Ctrl+S, `:w`/`:wq`,
+        // Save As (which binds the path first), and the control surface's
+        // `wb.save`. Other file writes go through write_export,
+        // write_supporting and write_backup.
         if let Err(msg) = self.refuse_read_only(&self.path) {
             self.status = Some(msg.clone());
             return Err(msg);
@@ -4391,7 +4407,8 @@ impl App {
         }
         match load_workbook(path, &self.text_open()) {
             Ok((pkg, p, import_source, format)) => {
-                // A person opened another workbook: read-only ends (#882).
+                // A person's Open that loads ends read-only (#882), the
+                // read-only file's own included.
                 self.read_only = None;
                 self.install_workbook(pkg, p, import_source);
                 self.note_import(format);
@@ -5115,6 +5132,7 @@ impl App {
             textdlg::Outcome::Pending => {}
             textdlg::Outcome::Cancel => {
                 self.text_dialog = None;
+                self.startup_import = false;
                 self.status = Some("Cancelled".to_string());
             }
             textdlg::Outcome::Finish => self.finish_text_dialog(),
@@ -5136,14 +5154,9 @@ impl App {
         match &d.purpose {
             textdlg::Purpose::Import { path, .. } => {
                 let pkg = text_to_pkg(d.text(), &file_stem(path), &opts, &self.text_open());
-                // A finished import of another file ends read-only (#882);
-                // one of the read-only file itself (`xlsxy -r notes.txt`
-                // opens through this wizard) keeps it refused.
-                if !self
-                    .read_only
-                    .as_deref()
-                    .is_some_and(|ro| opccore::fsio::same_file(ro, Path::new(path)))
-                {
+                // A finished interactive import ends read-only (#882); the
+                // startup import of the `-r` file keeps it refused.
+                if !std::mem::take(&mut self.startup_import) {
                     self.read_only = None;
                 }
                 self.install_workbook(pkg, import_binding(path), Some(path.clone()));
@@ -8231,7 +8244,7 @@ fn run_tui(
         app.set_read_only(&source);
     }
     if let Some(text_file) = wizard {
-        app.open_workbook(&text_file);
+        app.open_startup_wizard(&text_file);
     }
     // Detect the terminal's graphics capability (kitty/iTerm2/Sixel); fall back to
     // a half-block renderer so embedded pictures still show something.
@@ -14229,10 +14242,11 @@ mod tests {
         let mut app = App::new(new_xlsx(), "untitled.xlsx");
         app.os_clip = None;
         app.set_read_only(txt.to_str().unwrap());
-        app.open_workbook(txt.to_str().unwrap());
+        app.open_startup_wizard(txt.to_str().unwrap());
         app.finish_text_dialog();
         assert!(app.text_dialog.is_none());
         assert!(app.read_only.is_some());
+        assert!(!app.startup_import, "the flag is spent");
         app.request_save_as(dir.join("other.xlsx").to_string_lossy().into_owned());
         assert!(dir.join("other.xlsx").is_file());
         app.request_save_as(txt.to_string_lossy().into_owned());
@@ -14241,6 +14255,29 @@ mod tests {
             Some("\"notes.txt\" is read-only. Save a copy under a new name.")
         );
         assert_eq!(std::fs::read(&txt).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// r4: an interactive import ends read-only like any Open that loads,
+    /// the read-only text file's own included; a cancelled startup wizard
+    /// leaves no flag behind for a later import.
+    #[test]
+    fn interactive_import_ends_read_only() {
+        let dir = macro_dir("ro-txt-reimport");
+        let txt = dir.join("notes.txt");
+        std::fs::write(&txt, "1\t2\n").unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.os_clip = None;
+        app.set_read_only(txt.to_str().unwrap());
+        app.open_startup_wizard(txt.to_str().unwrap());
+        assert!(app.startup_import);
+        app.text_dialog_key(KeyCode::Esc);
+        assert!(!app.startup_import, "cancel clears the flag");
+        assert!(app.read_only.is_some(), "and keeps read-only");
+        app.apply_backstage_event(backstage::BackstageEvent::Open(txt.clone()));
+        assert!(app.text_dialog.is_some());
+        app.finish_text_dialog();
+        assert!(app.read_only.is_none(), "an interactive re-import ends it");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
