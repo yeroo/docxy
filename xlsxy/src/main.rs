@@ -1618,11 +1618,17 @@ impl App {
     }
 
     /// Toggle protection on the active sheet. Goes through `structural` so it's
-    /// undoable; protecting uses Excel's default flag set.
+    /// undoable; protecting uses Excel's default flag set. It moves no cells,
+    /// so a pending cut stays a cut: a paste refused on a protected sheet
+    /// can still move it once the sheet is unprotected.
     fn toggle_protection(&mut self) {
         let now = !self.protected();
         let s = self.sheet;
+        let cut = self.clip.as_ref().is_some_and(|c| c.cut);
         self.structural(|wb| wb.sheets[s].set_protected(now));
+        if let Some(clip) = &mut self.clip {
+            clip.cut = cut;
+        }
         self.status = Some(if now {
             "Sheet protected — cells are read-only until unprotected".into()
         } else {
@@ -1879,9 +1885,11 @@ impl App {
         self.redo.clear();
         self.modified = true;
         self.clamp_cursor();
+        self.cancel_cut();
     }
 
     fn restore(&mut self, snap: &WbSnapshot) {
+        self.cancel_cut();
         self.pkg.workbook.sheets = snap.sheets.clone();
         self.pkg.workbook.defined_names = snap.names.clone();
         self.rebuild_engine();
@@ -2427,6 +2435,18 @@ impl App {
 
     fn paste(&mut self) {
         let os_text = self.os_clip.as_mut().and_then(|cb| cb.get_text().ok());
+        self.paste_from(os_text);
+    }
+
+    /// Paste with `os_text` as the OS clipboard's text (`None` when there is
+    /// no OS clipboard). A protected sheet refuses the paste and keeps the
+    /// clip as it was, so a cut can still be pasted elsewhere.
+    fn paste_from(&mut self, os_text: Option<String>) {
+        if self.protected() {
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return;
+        }
         // Our own clip (still on the OS clipboard) pastes with formulas and
         // ref translation; external text pastes as TSV values.
         let own = match (&os_text, &self.clip_text) {
@@ -5532,7 +5552,10 @@ impl App {
     }
 
     /// Make a pending cut a copy: a later paste clears nothing. Removing a
-    /// sheet does this, since it can take or renumber the cut's source sheet.
+    /// sheet does this, since it can take or renumber the cut's source sheet,
+    /// and so does any structural edit and the undo/redo of one, since most
+    /// of them move cells under the cut's recorded coordinates. A protection
+    /// toggle moves none and keeps the cut (`toggle_protection`).
     fn cancel_cut(&mut self) {
         if let Some(clip) = &mut self.clip {
             clip.cut = false;
@@ -10077,6 +10100,249 @@ mod tests {
             app.status.as_deref(),
             Some("Pasted (source sheet is protected; cut kept as copy)")
         );
+    }
+
+    /// One sheet, no OS clipboard, `cells` as `(row, col, number)`.
+    fn cut_app(cells: &[(u32, u32, f64)]) -> App {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        let changes = cells
+            .iter()
+            .map(|&(r, c, n)| (r, c, parse_input(&n.to_string())))
+            .collect();
+        app.apply_on(0, changes);
+        app
+    }
+
+    /// Select `from..=to` on the active sheet and cut or copy it.
+    fn clip_range(app: &mut App, from: (u32, u32), to: (u32, u32), cut: bool) {
+        app.anchor = Some(from);
+        app.cur = to;
+        app.copy(cut);
+        app.anchor = None;
+    }
+
+    const PROTECTED_STATUS: &str = "Sheet is protected — unprotect it to edit (Review ▸ Protect)";
+
+    #[test]
+    fn a_row_insert_cancels_a_pending_cut() {
+        // #821: cut A5:B6, insert a row above row 1, paste at F1. The cut's
+        // recorded A5:B6 now holds what was A4:B5; neither block is cleared.
+        let mut app = cut_app(&[
+            (3, 0, 10.0),
+            (3, 1, 11.0),
+            (4, 0, 1.0),
+            (4, 1, 2.0),
+            (5, 0, 3.0),
+            (5, 1, 4.0),
+        ]);
+        clip_range(&mut app, (4, 0), (5, 1), true);
+        app.cur = (0, 0);
+        app.row_op(true);
+        app.cur = (0, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 0, 5), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 0, 5, 0), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 0, 4, 0)[..2], [Some(10.0), Some(11.0)]);
+    }
+
+    #[test]
+    fn a_column_delete_cancels_a_pending_cut() {
+        // Cut C1:D2, delete column A: the cut's cells now sit at B1:C2.
+        let mut app = cut_app(&[
+            (0, 0, 10.0),
+            (0, 1, 11.0),
+            (0, 2, 1.0),
+            (0, 3, 2.0),
+            (1, 2, 3.0),
+            (1, 3, 4.0),
+        ]);
+        clip_range(&mut app, (0, 2), (1, 3), true);
+        app.cur = (0, 0);
+        app.col_op(false);
+        app.cur = (4, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 4, 5), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 0, 0, 1), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 0, 0, 0)[0], Some(11.0));
+    }
+
+    #[test]
+    fn a_sort_cancels_a_pending_cut() {
+        // Cut A1:B2, sort A1:B4 ascending: other rows now sit under A1:B2.
+        let mut app = cut_app(&[
+            (0, 0, 4.0),
+            (0, 1, 40.0),
+            (1, 0, 3.0),
+            (1, 1, 30.0),
+            (2, 0, 2.0),
+            (2, 1, 20.0),
+            (3, 0, 1.0),
+            (3, 1, 10.0),
+        ]);
+        clip_range(&mut app, (0, 0), (1, 1), true);
+        app.cur = (0, 0);
+        app.sort_region(true);
+        app.cur = (0, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 0, 5), some([4.0, 40.0, 3.0, 30.0]));
+        assert_eq!(block_values(&app, 0, 0, 0), some([1.0, 10.0, 2.0, 20.0]));
+        assert_eq!(block_values(&app, 0, 2, 0), some([3.0, 30.0, 4.0, 40.0]));
+    }
+
+    #[test]
+    fn undoing_a_structural_edit_after_a_cut_does_not_revive_it() {
+        // Cut, insert a row, undo: the layout is back, but the cut stays a copy.
+        let mut app = cut_app(&[(0, 0, 1.0), (0, 1, 2.0), (1, 0, 3.0), (1, 1, 4.0)]);
+        clip_range(&mut app, (0, 0), (1, 1), true);
+        app.cur = (0, 0);
+        app.row_op(true);
+        app.undo();
+        app.cur = (4, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 4, 5), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 0, 0, 0), some([1.0, 2.0, 3.0, 4.0]));
+    }
+
+    #[test]
+    fn undoing_a_structural_edit_after_a_cut_cancels_it() {
+        // Insert a row, cut the shifted block A2:B3, undo the insert: the
+        // block is back at A1:B2 and A2:B3 holds other cells.
+        let mut app = cut_app(&[(0, 0, 1.0), (0, 1, 2.0), (1, 0, 3.0), (1, 1, 4.0)]);
+        app.cur = (0, 0);
+        app.row_op(true);
+        clip_range(&mut app, (1, 0), (2, 1), true);
+        app.undo();
+        app.cur = (4, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 4, 5), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 0, 0, 0), some([1.0, 2.0, 3.0, 4.0]));
+    }
+
+    #[test]
+    fn redoing_a_structural_edit_after_a_cut_cancels_it() {
+        // Insert a row, undo, cut A1:B2, redo the insert: the block moves
+        // to A2:B3 and A1:B2 no longer holds the cut's cells.
+        let mut app = cut_app(&[(0, 0, 1.0), (0, 1, 2.0), (1, 0, 3.0), (1, 1, 4.0)]);
+        app.cur = (0, 0);
+        app.row_op(true);
+        app.undo();
+        clip_range(&mut app, (0, 0), (1, 1), true);
+        app.redo();
+        app.cur = (4, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 4, 5), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 0, 1, 0), some([1.0, 2.0, 3.0, 4.0]));
+    }
+
+    #[test]
+    fn toggling_protection_keeps_a_pending_cut() {
+        // A protection toggle moves no cells, so the cut still moves.
+        let mut app = cut_app(&[(0, 0, 1.0), (0, 1, 2.0), (1, 0, 3.0), (1, 1, 4.0)]);
+        clip_range(&mut app, (0, 0), (1, 1), true);
+        app.toggle_protection();
+        app.toggle_protection();
+        assert!(!app.protected());
+        app.cur = (0, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 0, 5), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 0, 0, 0), vec![None; 4]);
+    }
+
+    #[test]
+    fn unprotecting_after_a_refused_paste_moves_the_cut() {
+        // Cut Sheet2!A1:B2, paste on protected Sheet1: refused. Unprotect
+        // as the status says, paste again: the cut moves.
+        let mut app = cross_sheet_cut_app();
+        app.pkg.workbook.sheets[0].set_protected(true);
+        app.cur = (0, 5);
+        app.paste();
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
+        app.toggle_protection();
+        assert!(!app.protected());
+        app.cur = (0, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 0, 5), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 1, 0, 0), vec![None; 4]);
+        assert_eq!(app.status.as_deref(), Some("Pasted"));
+    }
+
+    #[test]
+    fn paste_is_refused_on_a_protected_sheet() {
+        let mut app = cut_app(&[(0, 0, 1.0), (0, 1, 2.0), (1, 0, 3.0), (1, 1, 4.0)]);
+        clip_range(&mut app, (0, 0), (1, 1), false);
+        app.pkg.workbook.sheets[0].set_protected(true);
+        let undo_len = app.undo.len();
+        app.cur = (0, 5);
+        app.paste();
+        assert_eq!(block_values(&app, 0, 0, 5), vec![None; 4]);
+        assert_eq!(app.undo.len(), undo_len);
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
+    }
+
+    #[test]
+    fn a_same_sheet_cut_is_not_pasted_on_a_protected_sheet() {
+        let mut app = cut_app(&[(0, 0, 1.0), (0, 1, 2.0), (1, 0, 3.0), (1, 1, 4.0)]);
+        clip_range(&mut app, (0, 0), (1, 1), true);
+        app.pkg.workbook.sheets[0].set_protected(true); // setup, not the toggle
+        app.cur = (0, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 0, 0), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 0, 0, 5), vec![None; 4]);
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
+    }
+
+    #[test]
+    fn a_refused_paste_on_a_protected_sheet_keeps_the_cut() {
+        // The cut is Sheet2!A1:B2; the active Sheet1 is protected, so the
+        // paste is refused and the cut can still move to Sheet3.
+        let mut app = cross_sheet_cut_app();
+        app.pkg.add_sheet("Sheet3");
+        app.pkg.workbook.sheets[0].set_protected(true);
+        app.cur = (0, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
+        assert_eq!(block_values(&app, 0, 0, 5), vec![None; 4]);
+        assert_eq!(block_values(&app, 1, 0, 0), some([1.0, 2.0, 3.0, 4.0]));
+        assert!(app.clip.as_ref().is_some_and(|c| c.cut));
+        app.goto_sheet(2);
+        app.cur = (0, 5);
+        app.paste();
+        assert_eq!(block_values(&app, 2, 0, 5), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 1, 0, 0), vec![None; 4]);
+    }
+
+    #[test]
+    fn external_text_paste_is_refused_on_a_protected_sheet() {
+        let mut app = cut_app(&[]);
+        app.pkg.workbook.sheets[0].set_protected(true);
+        let undo_len = app.undo.len();
+        app.cur = (0, 5);
+        app.paste_from(Some("5\t6\n7\t8\n".into()));
+        assert_eq!(block_values(&app, 0, 0, 5), vec![None; 4]);
+        assert_eq!(app.undo.len(), undo_len);
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
+    }
+
+    #[test]
+    fn external_text_paste_writes_cells_through_paste_from() {
+        // The seam the protected test above goes through: unprotected, the
+        // external TSV lands.
+        let mut app = cut_app(&[]);
+        app.cur = (0, 5);
+        app.paste_from(Some("5\t6\n7\t8\n".into()));
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 0, 5), some([5.0, 6.0, 7.0, 8.0]));
     }
 
     #[test]
