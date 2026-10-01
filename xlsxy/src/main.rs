@@ -651,9 +651,11 @@ fn main() -> ExitCode {
         import_source.map(|s| (s, format)),
         template,
         welcome,
-        parsed.vim,
         wizard,
-        read_only,
+        TuiFlags {
+            vim: parsed.vim,
+            read_only,
+        },
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -8110,15 +8112,22 @@ fn open_url(url: &str) {
 // Terminal shell
 // ---------------------------------------------------------------------------
 
+/// The editor's command-line switches.
+struct TuiFlags {
+    /// `--vim`: modal navigation.
+    vim: bool,
+    /// `--read-only`: the input file, opened read-only (#882).
+    read_only: Option<String>,
+}
+
 fn run_tui(
     pkg: SheetPackage,
     path: &str,
     import: Option<(String, Option<SourceFormat>)>,
     template: Option<String>,
     welcome: bool,
-    vim: bool,
     wizard: Option<String>,
-    read_only: Option<String>,
+    flags: TuiFlags,
 ) -> io::Result<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -8141,7 +8150,7 @@ fn run_tui(
         app.note_template(&template);
     }
     app.load_view_prefs();
-    if vim {
+    if flags.vim {
         app.vim = Some(VimState {
             mode: VimMode::Normal,
             pending: '\0',
@@ -8149,7 +8158,7 @@ fn run_tui(
         });
     }
     app.start_screen = welcome;
-    if let Some(source) = read_only {
+    if let Some(source) = flags.read_only {
         app.set_read_only(&source);
     }
     if let Some(text_file) = wizard {
