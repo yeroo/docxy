@@ -1239,7 +1239,7 @@ mod tests {
         let b = read_str(&format!(
             r#"<table:table table:name="A:B">{}{}{}</table:table>
             <table:table table:name="C">{}</table:table>
-            <table:table table:name="Calc">{}{}{}{}</table:table>
+            <table:table table:name="Calc">{}{}{}{}{}</table:table>
             <table:named-expressions><table:named-range table:name="Col" table:cell-range-address="$'A:B'.$A$1:.$A$3"/></table:named-expressions>"#,
             num(1),
             num(2),
@@ -1249,6 +1249,7 @@ mod tests {
             f("of:=['A:B'.A2]"),
             f("of:=SUM(['A:B'.A1:'C'.A1])"),
             f("of:=['X:Y'.A1]"),
+            f("of:=['A:B'.A1]+['X:Y'.A1]"),
         ));
         let mut pkg = b.build();
         let wb = &mut pkg.workbook;
@@ -1264,6 +1265,7 @@ mod tests {
         assert_eq!(got(1), ("A_B!A2".into(), CellValue::Number(2.0)));
         assert_eq!(got(2), ("SUM(A_B:C!A1)".into(), CellValue::Number(11.0)));
         assert_eq!(got(3).0, "'X:Y'!A1");
+        assert_eq!(got(4).0, "A_B!A1+'X:Y'!A1");
         assert_eq!(wb.defined_names[0].formula, "A_B!$A$1:$A$3");
     }
 

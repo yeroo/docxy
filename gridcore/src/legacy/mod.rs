@@ -523,26 +523,54 @@ pub(crate) fn sheet_prefix(first: &str, last: &str) -> String {
     crate::formula::span_prefix(&first, &last)
 }
 
-/// `src` with each [`COLON`] left in a quoted sheet qualifier turned back
-/// into `:`: one naming a sheet the workbook doesn't have (an ODS
-/// `['A:B'.A1]` with no table `A:B`), which no rename removed. Its text is
-/// then as the reader would have spelled it without the marker. String
+/// `src` with each [`COLON`] left in a sheet qualifier turned back into
+/// `:`: one naming a sheet the workbook doesn't have (an ODS `['A:B'.A1]`
+/// with no table `A:B`), which no rename removed. Its text is then as the
+/// reader would have spelled it without the marker. The qualifier may be
+/// quoted (as the readers spell it) or bare (the printer leaves a
+/// non-ASCII name bare, and `retarget` reprints a formula that names a
+/// renamed sheet too); a bare one is quoted, since a `:` needs it. String
 /// literals are left alone.
 fn restore_colons(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
     let mut out = String::with_capacity(src.len());
     let mut quote: Option<char> = None;
-    for c in src.chars() {
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
         match (quote, c) {
             (None, '"' | '\'') => quote = Some(c),
             // `''` / `""` inside closes and reopens: same result.
             (Some(q), _) if c == q => quote = None,
             (Some('\''), COLON) => {
                 out.push(':');
+                i += 1;
+                continue;
+            }
+            (None, _) if c == COLON || c.is_alphanumeric() || matches!(c, '_' | '.') => {
+                // A bare name: a qualifier when `!` follows.
+                let start = i;
+                while i < chars.len()
+                    && (chars[i] == COLON
+                        || chars[i].is_alphanumeric()
+                        || matches!(chars[i], '_' | '.'))
+                {
+                    i += 1;
+                }
+                let name: String = chars[start..i].iter().collect();
+                if name.contains(COLON) && chars.get(i) == Some(&'!') {
+                    out.push('\'');
+                    out.push_str(&name.replace(COLON, ":"));
+                    out.push('\'');
+                } else {
+                    out.push_str(&name);
+                }
                 continue;
             }
             _ => {}
         }
         out.push(c);
+        i += 1;
     }
     out
 }
@@ -854,6 +882,10 @@ mod tests {
                     ((3, 0), f(format!("SUM({span}A1)"))),
                     ((4, 0), f(format!("{missing}A1&\"{COLON}\""))),
                     ((5, 0), f(format!("{}A1", sheet_prefix(&marked, &marked)))),
+                    // A renamed sheet and a missing one in one formula: the
+                    // rename reprints it, leaving the missing name bare.
+                    ((6, 0), f(format!("{p}A1+{missing}A1"))),
+                    ((7, 0), f(format!("SUM({}A1)", sheet_prefix("A:B", "X:Y")))),
                 ],
             ),
         ] {
@@ -867,6 +899,11 @@ mod tests {
             name: "Cols".into(),
             scope: None,
             formula: format!("{p}$A:$B"),
+        });
+        book.names.push(DefinedName {
+            name: "Both".into(),
+            scope: None,
+            formula: format!("{p}$A$1,{missing}$A$1"),
         });
         let mut pkg = book.build();
         let wb = &mut pkg.workbook;
@@ -886,8 +923,11 @@ mod tests {
         // A string literal holding the marker is the file's own text.
         assert_eq!(got(4).0, format!("'X:Y'!A1&\"{COLON}\""));
         assert_eq!(got(5), ("M_N!A1".into(), CellValue::Number(100.0)));
+        assert_eq!(got(6).0, "A_B!A1+'X:Y'!A1");
+        assert_eq!(got(7).0, "SUM('A_B:X:Y'!A1)");
         assert_eq!(wb.defined_names[0].formula, "A_B!$A:$B");
-        for r in 0..6 {
+        assert_eq!(wb.defined_names[1].formula, "A_B!$A$1,'X:Y'!$A$1");
+        for r in 0..8 {
             let text = calc.cell(r, 0).unwrap().formula.clone().unwrap();
             let outside: String = text.split('"').step_by(2).collect();
             assert!(!outside.contains(COLON), "{text}");
@@ -1015,6 +1055,12 @@ mod tests {
         assert_eq!(sheet_prefix("A:B", "C"), "'A\u{FDD0}B:C'!");
         assert_eq!(sheet_prefix("C", "A:B"), "'C:A\u{FDD0}B'!");
         assert_eq!(restore_colons("'A\u{FDD0}B'!A1"), "'A:B'!A1");
+        // A bare qualifier (as the printer leaves a non-ASCII name) is
+        // quoted; a bare word that is no qualifier is left alone.
+        assert_eq!(
+            restore_colons("A_B!A1+X\u{FDD0}Y!A1+X\u{FDD0}Y"),
+            "A_B!A1+'X:Y'!A1+X\u{FDD0}Y"
+        );
         assert_eq!(
             restore_colons("'It''s\u{FDD0}'!A1&\"\u{FDD0}'\u{FDD0}\""),
             "'It''s:'!A1&\"\u{FDD0}'\u{FDD0}\""
