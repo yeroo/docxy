@@ -2394,9 +2394,10 @@ impl SheetPackage {
     /// [`Self::remove_sheet`], and the Excel 4.0 names, which go even when
     /// there is no macro sheet: every defined name marked `xlm`, `function`
     /// or `vbProcedure`, and every name whose formula refers to a removed
-    /// sheet (`Auto_Open=Macro1!$A$1`). A workbook of nothing but macro
-    /// sheets first gains a blank worksheet, so one remains. Returns whether
-    /// there was anything to drop.
+    /// sheet (`Auto_Open=Macro1!$A$1`). A cell formula that refers to a
+    /// removed sheet keeps its cell, with that reference as `#REF!`. A
+    /// workbook of nothing but macro sheets first gains a blank worksheet, so
+    /// one remains. Returns whether there was anything to drop.
     ///
     /// Only that copy: an open workbook keeps its macros, as Excel keeps
     /// them, and its sheet indices stay put.
@@ -2441,6 +2442,9 @@ impl SheetPackage {
                     })
             });
         }
+        // Cell formulas that name a removed sheet read `#REF!`, as Excel
+        // turns them.
+        crate::edit::remove_sheet_refs(&mut self.workbook, &names);
         for &i in doomed.iter().rev() {
             self.remove_sheet(i);
         }
@@ -12779,6 +12783,80 @@ mod kind_tests {
             "{rels}"
         );
         assert!(!copy.has_macro_names() && !copy.has_macro_sheets());
+    }
+
+    /// #789: a macro-free save turns worksheet formulas that name a removed
+    /// Excel 4.0 macro sheet into `#REF!`, leaves every other formula's text
+    /// as it was, and leaves the open package alone.
+    #[test]
+    fn macro_free_save_turns_macro_sheet_refs_into_ref_errors() {
+        let mut pkg = mixed_xlm_book();
+        let data = &mut pkg.workbook.sheets[0];
+        let gone = [
+            (1, "Macro1!A1+1", "#REF!+1"),
+            (2, "SUM(macro1!A1:B2)*2", "SUM(#REF!)*2"),
+            (3, "SUM(Macro1!A:A)", "SUM(#REF!)"),
+            (4, "SUM(Report!A1,Dialog1!$B$2)", "SUM(Report!A1,#REF!)"),
+            // A 3-D span with a removed end sheet.
+            (5, "SUM(Data:Macro1!A1)", "SUM(#REF!)"),
+        ];
+        for (r, src, _) in gone {
+            data.set_cell(r, 0, Cell::formula(src));
+        }
+        let kept = [
+            (1, "Report!A1*2"),
+            // Macro1 lies between Data and Report: it just leaves the span.
+            (2, "SUM(Data:Report!A1)"),
+            (3, "IF(A1=1,\"Macro1!A1\",B1)"),
+            (4, "XMacro1!A1"),
+        ];
+        for (r, src) in kept {
+            data.set_cell(r, 1, Cell::formula(src));
+        }
+        let mut array = Cell::formula("Macro1!A1:A2");
+        array.f_attrs = Some(" t=\"array\" ref=\"C1:C2\"".into());
+        data.set_cell(0, 2, array);
+        let formulas = |pkg: &SheetPackage| -> Vec<(u32, u32, Option<String>)> {
+            let mut out: Vec<_> = pkg.workbook.sheets[0]
+                .cells
+                .iter()
+                .map(|(&(r, c), cell)| (r, c, cell.formula.clone()))
+                .collect();
+            out.sort();
+            out
+        };
+        let before = (formulas(&pkg), pkg.workbook.sheets.len());
+
+        for kind in [SpreadsheetKind::Workbook, SpreadsheetKind::Template] {
+            let out = roundtrip(&pkg, kind);
+            let data = &out.workbook.sheets[0];
+            for (r, _, want) in gone {
+                let cell = data.cell(r, 0).unwrap();
+                assert_eq!(cell.formula.as_deref(), Some(want), "row {r}");
+                assert_eq!(cell.value, CellValue::Error("#REF!".into()), "row {r}");
+            }
+            for (r, src) in kept {
+                assert_eq!(data.cell(r, 1).unwrap().formula.as_deref(), Some(src));
+            }
+            let array = data.cell(0, 2).unwrap();
+            assert_eq!(array.formula.as_deref(), Some("#REF!"));
+            assert!(array.f_attrs.as_deref().is_some_and(is_array_f));
+        }
+        assert_eq!(
+            (formulas(&pkg), pkg.workbook.sheets.len()),
+            before,
+            "the open workbook keeps its formulas"
+        );
+
+        // A quoted name is the same sheet; a macro-enabled save keeps it all.
+        let mut pkg = xlm_book(&[("Data", "work"), ("Macro 1", "macro"), ("Report", "work")]);
+        pkg.workbook.sheets[0].set_cell(1, 0, Cell::formula("'Macro 1'!A1+1"));
+        let out = roundtrip(&pkg, SpreadsheetKind::Workbook);
+        let cell = out.workbook.sheets[0].cell(1, 0).unwrap();
+        assert_eq!(cell.formula.as_deref(), Some("#REF!+1"));
+        let out = roundtrip(&pkg, SpreadsheetKind::MacroWorkbook);
+        let cell = out.workbook.sheets[0].cell(1, 0).unwrap();
+        assert_eq!(cell.formula.as_deref(), Some("'Macro 1'!A1+1"));
     }
 
     #[test]

@@ -912,6 +912,33 @@ pub fn rename_sheet(wb: &mut Workbook, idx: usize, new_name: &str) {
     wb.sheets[idx].name = new_name.to_string();
 }
 
+/// Before the sheets named in `removed` leave the workbook, turn every cell
+/// formula's reference to one of them into `#REF!`
+/// ([`crate::formula::remove_sheet_refs_in_expr`]), with `#REF!` as the
+/// cell's value. The formulas [`rename_sheet`] rewrites are the ones covered
+/// (shared groups were expanded at load); a formula that names none of them
+/// keeps its text exactly.
+pub fn remove_sheet_refs(wb: &mut Workbook, removed: &[String]) {
+    if removed.is_empty() {
+        return;
+    }
+    for sheet in &mut wb.sheets {
+        for cell in sheet.cells.values_mut() {
+            let Some(src) = &cell.formula else {
+                continue;
+            };
+            if cell.f_attrs.as_deref().is_some_and(|a| !is_array_f(a)) {
+                continue; // preserved verbatim
+            }
+            let rewrite = |e: &Expr| crate::formula::remove_sheet_refs_in_expr(e, removed);
+            if let Some(updated) = rewrite_if_changed(src, rewrite) {
+                cell.formula = Some(updated);
+                cell.value = CellValue::Error("#REF!".into());
+            }
+        }
+    }
+}
+
 /// Point every ref a chart holds at `new_name` where it named `old`. Public so
 /// the UI can do the same for charts it authored, which live outside the
 /// workbook until they are saved.
