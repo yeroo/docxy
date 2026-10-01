@@ -18083,8 +18083,8 @@ fn replace_one_in(
             // (wrapping), as in the terminal find bar: an adjacent match
             // (`xxx`) or a read-only one right after it is not skipped.
             let matches = ed.find_visible(query, case_sensitive);
-            let next = (!matches.is_empty()).then(|| if i < matches.len() { i } else { 0 });
-            let next = next.and_then(|i| Some((i, matches.into_iter().nth(i)?)));
+            let i = if i < matches.len() { i } else { 0 };
+            let next = matches.into_iter().nth(i).map(|m| (i, m));
             if let Some((_, m)) = &next {
                 ed.select_found(m);
             }
