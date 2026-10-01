@@ -46,7 +46,7 @@ fn fixture_with_dxf_ids(dxf_ids: &[&str]) -> Vec<u8> {
         "<?xml version=\"1.0\"?><styleSheet xmlns=\"{SML}\"><fonts count=\"2\"><font><sz val=\"11\"/><name val=\"Calibri\"/></font><font><b/><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts><fills count=\"2\"><fill><patternFill patternType=\"none\"/></fill><fill><patternFill patternType=\"gray125\"/></fill></fills><borders count=\"1\"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs><cellXfs count=\"3\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/><xf numFmtId=\"0\" fontId=\"1\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"/><xf numFmtId=\"10\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\"/></cellXfs><cellStyles count=\"1\"><cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\"/></cellStyles><dxfs count=\"2\"><dxf><font><b/></font></dxf><dxf><font><i/></font></dxf></dxfs></styleSheet>"
     );
     let sst = format!(
-        "<?xml version=\"1.0\"?><sst xmlns=\"{SML}\" count=\"1\" uniqueCount=\"1\"><si><t>hello</t></si></sst>"
+        "<?xml version=\"1.0\"?><sst xmlns=\"{SML}\" count=\"2\" uniqueCount=\"2\"><si><t>hello</t></si><si><t>a cfRule dxfId=\"70000\" in words</t></si></sst>"
     );
     let theme = "<?xml version=\"1.0\"?><a:theme xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" name=\"Office\"/>";
     let parts: Vec<(String, Vec<u8>)> = vec![
@@ -300,6 +300,26 @@ fn repair_caps_runaway_dxf_ids() {
     let sheet = text("xl/worksheets/sheet1.xml");
     assert!(sheet.contains("dxfId=\"1\""), "{sheet}");
     assert_eq!(sheet.matches("dxfId").count(), 1, "{sheet}");
+}
+
+/// #610 r2: only attributes are references. A shared string that spells
+/// out `dxfId="70000"` keeps it when the styles are emptied.
+#[test]
+fn repair_leaves_a_dxf_id_in_text_alone() {
+    let data = damage(&fixture(), "xl/styles.xml");
+    let (_, _, saved) = repair_and_resave(&data);
+    let sst = parts_of(&saved)
+        .into_iter()
+        .find(|(n, _)| n == "xl/sharedStrings.xml")
+        .unwrap()
+        .1;
+    let sst = String::from_utf8(sst).unwrap();
+    assert!(
+        sst.contains(r#"<t>a cfRule dxfId="70000" in words</t>"#),
+        "{sst}"
+    );
+    assert!(dxf_refs(r#"<si><t>dxfId="70000"</t></si>"#).is_empty());
+    assert_eq!(dxf_refs(r#"<c><t>x</t></c><cfRule dxfId="2"/>"#).len(), 1);
 }
 
 #[test]

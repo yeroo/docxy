@@ -241,7 +241,9 @@ const MAX_STUB_DXFS: u64 = 65_536;
 /// Every differential-format reference in `xml` (`dxfId`, `headerRowDxfId`,
 /// `dataDxfId`, …) with a numeric value: the attribute's span, from the space
 /// before its name to after its closing quote, and the id. An id too long
-/// for a `u64` reads as `u64::MAX`.
+/// for a `u64` reads as `u64::MAX`. Only an attribute counts: the match must
+/// sit inside a start tag (the nearest `<` or `>` before it is a `<`), so
+/// text that spells one out, a shared string say, is left alone.
 fn dxf_refs(xml: &str) -> Vec<(usize, usize, u64)> {
     const NEEDLE: &str = "xfId=\"";
     let bytes = xml.as_bytes();
@@ -252,6 +254,9 @@ fn dxf_refs(xml: &str) -> Vec<(usize, usize, u64)> {
         let value = at + NEEDLE.len();
         from = value;
         if !matches!(at.checked_sub(1).map(|p| bytes[p]), Some(b'd' | b'D')) {
+            continue;
+        }
+        if xml[..at].rfind(['<', '>']).map(|p| bytes[p]) != Some(b'<') {
             continue;
         }
         let digits = bytes[value..]
