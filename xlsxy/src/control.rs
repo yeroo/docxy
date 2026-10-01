@@ -52,8 +52,8 @@
 //! | `print-titles.set` | `{rows?, cols?, sheet?}` | `{printTitles:{rows,cols}, changed}` — `"1:2"` / `"A:A"`; an absent key keeps that part, `null` or `""` clears it |
 //! | `page-break.insert` / `page-break.remove` | `{cell, sheet?}` | `{rowBreaks, colBreaks, changed}` — manual break ids (a row break before 0-based row id); insert adds a break above the cell (not in row 1) and left of it (not in column A); remove takes the manual breaks bordering it |
 //! | `page-break.reset` | `{sheet?}` | `{rowBreaks, colBreaks, changed}` — every manual break goes |
-//! | `print.pages` | `{what?:active\|workbook\|selection, sheet?\|sheets?, range?, ignorePrintAreas?, from?, to?}` | `{total, pages:[{sheet, name, range, number, titleRows, titleCols, scale}]}` — the pages printing lays out; `selection` needs `range` |
-//! | `wb.export-pdf` | `{path, …print.pages args}` | `{path, pages}` — refuses to overwrite; nothing to print errors with "We didn't find anything to print." and writes no file |
+//! | `print.pages` | `{what?:active\|workbook\|selection, sheet?\|sheets?, range?, ignorePrintAreas?, from?, to?}` | `{total, pages:[{sheet, name, range, number, titleRows, titleCols, scale}]}` — the pages printing lays out; `selection` needs `range` (only its printed cells print); a job over 100,000 pages errors with "This would print more than 100000 pages; …" |
+//! | `wb.export-pdf` | `{path, …print.pages args}` | `{path, pages}` — refuses to overwrite; nothing to print errors with "We didn't find anything to print." and writes no file; so does a job over 100,000 pages (the `print.pages` error) |
 //! | `wb.recalc` | — | `{recalculated:true}` |
 //! | `wb.properties` | — | `{title, tags, categories, subject, comments, company, manager, hyperlinkBase, author, lastModifiedBy, created, modified, custom:[{name,type,value}]}` — File › Info; an absent property is `null`; `type` is `text`/`number`/`bool`/`date`/`other` |
 //! | `wb.set-properties` | `{title?, tags?, categories?, subject?, comments?, company?, manager?, hyperlinkBase?, custom?:{name: value\|null}}` | `wb.properties` + `{changed}` — `null`/`""` removes; a custom value is a string (text), number, bool or `{"date":"YYYY-MM-DD[THH:MM:SSZ]"}`; marks the workbook modified when something changed; NOT on the undo stack (Excel's Info edits aren't either) |
@@ -1797,7 +1797,11 @@ fn page_setup_json(app: &App, si: usize) -> Json {
 /// (FIL-147): print areas and titles stay each sheet's own, and header
 /// pictures aren't copied.
 fn page_setup(app: &mut App, args: &Json) -> Result<Json, String> {
-    let targets = sheets_arg(app, args)?;
+    let mut targets = sheets_arg(app, args)?;
+    // A sheet named twice (`[0, 0]`, `["Sheet1", "sheet1"]`) is one sheet:
+    // the first must not be overwritten by its own group copy.
+    let mut seen = std::collections::HashSet::new();
+    targets.retain(|&si| seen.insert(si));
     let first = targets[0];
     if !has_page_fields(args) {
         return Ok(page_setup_json(app, first));
@@ -1808,7 +1812,7 @@ fn page_setup(app: &mut App, args: &Json) -> Result<Json, String> {
         let mut changed = s != wb.sheets[first].page_setup;
         let group = s.for_group();
         wb.sheets[first].page_setup = s;
-        for &si in &targets[1..] {
+        for &si in targets.iter().filter(|&&si| si != first) {
             if wb.sheets[si].page_setup != group {
                 wb.sheets[si].page_setup = group.clone();
                 changed = true;
@@ -1869,10 +1873,14 @@ fn page_header(app: &mut App, args: &Json) -> Result<Json, String> {
                 .get(slot)
                 .unwrap_or(""),
         );
+        let stored = sections.compose();
+        // Checked on the string as it will be stored and read back, so no
+        // spelling can move a picture into another section.
+        let stored_as = hf::Sections::parse(&stored);
         for (name, new, old) in [
-            ("left", &sections.left, &current.left),
-            ("center", &sections.center, &current.center),
-            ("right", &sections.right, &current.right),
+            ("left", &stored_as.left, &current.left),
+            ("center", &stored_as.center, &current.center),
+            ("right", &stored_as.right, &current.right),
         ] {
             if hf::has_code(new, 'G') && !hf::has_code(old, 'G') {
                 return Err(format!(
@@ -1880,7 +1888,6 @@ fn page_header(app: &mut App, args: &Json) -> Result<Json, String> {
                 ));
             }
         }
-        let stored = sections.compose();
         let new = (!stored.is_empty()).then_some(stored);
         changed = app.layout_edit(|wb| {
             let hf = &mut wb.sheets[si].page_setup.header_footer;
@@ -2107,6 +2114,10 @@ fn print_pages(app: &App, args: &Json) -> Result<Json, String> {
     let job = job_arg(app, "print.pages", args)?;
     let wb = &app.pkg.workbook;
     let pages = gridcore::print::paginate::paginate(wb, &job);
+    // A job cut short is the error `wb.export-pdf` gives, not a short list.
+    if pages.truncated {
+        return Err(gridcore::print::pdf::PrintError::TooManyPages.to_string());
+    }
     let span = |v: &[u32], rows: bool| match (v.first(), v.last()) {
         (Some(&a), Some(&b)) if rows => Json::Str(format!("{}:{}", a + 1, b + 1)),
         (Some(&a), Some(&b)) => Json::Str(format!("{}:{}", col_name(a), col_name(b))),
@@ -5531,6 +5542,53 @@ mod print_tests {
     }
 
     #[test]
+    fn a_sheet_named_twice_in_a_group_keeps_its_own_header_picture() {
+        // FIX r2 m6.
+        let mut a = app();
+        a.pkg.workbook.sheets[0].page_setup.header_footer.odd_header = Some("&L&G".into());
+        for sheets in [
+            Json::Arr(vec![n(0.0), n(0.0)]),
+            Json::Arr(vec![s("Sheet1"), s("sheet1")]),
+        ] {
+            call(
+                &mut a,
+                "page.setup",
+                obj(vec![("sheets", sheets), ("gridLines", Json::Bool(true))]),
+            );
+            assert_eq!(
+                a.pkg.workbook.sheets[0]
+                    .page_setup
+                    .header_footer
+                    .odd_header
+                    .as_deref(),
+                Some("&L&G")
+            );
+        }
+    }
+
+    #[test]
+    fn a_job_past_the_page_limit_is_an_error_for_both_print_verbs() {
+        // FIX r2 M1: XFD1048576 at 10 % is hundreds of thousands of pages.
+        let mut a = app();
+        a.pkg.workbook.sheets[0].set_cell(1_048_575, 16_383, Cell::number(1.0));
+        call(&mut a, "page.setup", obj(vec![("scale", n(10.0))]));
+        let e = dispatch(&mut a, "print.pages", &Json::Null).unwrap_err();
+        assert!(e.contains("more than 100000 pages"), "{e}");
+        let e = dispatch(&mut a, "print.pages", &obj(vec![("what", s("workbook"))])).unwrap_err();
+        assert!(e.contains("more than 100000 pages"), "{e}");
+        let out = std::env::temp_dir().join(format!("xlsxy-too-many-{}.pdf", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let e = dispatch(
+            &mut a,
+            "wb.export-pdf",
+            &obj(vec![("path", s(&out.to_string_lossy()))]),
+        )
+        .unwrap_err();
+        assert!(e.contains("more than 100000 pages"), "{e}");
+        assert!(!out.exists());
+    }
+
+    #[test]
     fn grouped_sheets_take_the_first_sheets_setup_but_keep_their_print_areas() {
         let mut a = app();
         call(&mut a, "sheet.add", obj(vec![("name", s("Two"))]));
@@ -5629,6 +5687,22 @@ mod print_tests {
         )
         .unwrap_err();
         assert!(e.contains("right section"), "{e}");
+        // FIX r2 m5: a section code can't smuggle a picture across.
+        let e = dispatch(
+            &mut a,
+            "page.header",
+            &obj(vec![("left", s("&[Picture]&R&[Picture]"))]),
+        )
+        .unwrap_err();
+        assert!(e.contains("starts a section"), "{e}");
+        assert_eq!(
+            a.pkg.workbook.sheets[0]
+                .page_setup
+                .header_footer
+                .odd_header
+                .as_deref(),
+            Some("&L&G&Rx")
+        );
         let long = "x".repeat(256);
         assert!(dispatch(&mut a, "page.header", &obj(vec![("left", s(&long))])).is_err());
     }

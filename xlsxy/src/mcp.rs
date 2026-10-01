@@ -841,7 +841,7 @@ fn tool_defs() -> Json {
         ),
         tool(
             "xlsxy_print_pages",
-            "The pages printing lays out, as Excel would: per page its sheet, body range, repeated title rows/columns, page number and scale, and the total. Read-only.",
+            "The pages printing lays out, as Excel would: per page its sheet, body range, repeated title rows/columns, page number and scale, and the total. Read-only. A job over 100,000 pages is an error, as for xlsxy_export_pdf.",
             vec![
                 (
                     "what",
@@ -889,7 +889,7 @@ fn tool_defs() -> Json {
         ),
         tool(
             "xlsxy_export_pdf",
-            "Print to a PDF file: the active sheet by default, or what print.pages takes. Refuses to overwrite an existing file; with nothing to print it errors (\"We didn't find anything to print.\") and writes no file.",
+            "Print to a PDF file: the active sheet by default, or what print.pages takes. Refuses to overwrite an existing file; with nothing to print it errors (\"We didn't find anything to print.\") and writes no file, as it does for a job over 100,000 pages.",
             vec![
                 ("path", prop("string", "Where to write the PDF.")),
                 (
