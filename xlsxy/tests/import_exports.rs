@@ -507,3 +507,67 @@ fn pdf_prints_the_active_sheet_and_writes_nothing_when_it_is_empty() {
     );
     assert!(!none.exists());
 }
+
+/// #882: `--read-only` never writes the input, so recalculating it in place
+/// (under any spelling) is refused; another output is written as usual.
+#[test]
+fn recalc_in_place_is_refused_under_read_only() {
+    let dir = Dir::new("read-only-recalc");
+    let book = dir.0.join("book.xlsx");
+    std::fs::write(
+        &book,
+        gridcore::xlsx::save_xlsx(&gridcore::xlsx::new_xlsx()),
+    )
+    .unwrap();
+    let before = std::fs::read(&book).unwrap();
+    for target in [book.clone(), dir.0.join("./book.xlsx")] {
+        let result = Command::new(env!("CARGO_BIN_EXE_xlsxy"))
+            .arg(&book)
+            .arg("--read-only")
+            .arg("--recalc")
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(
+            String::from_utf8_lossy(&result.stderr)
+                .contains("\"book.xlsx\" is read-only. Save a copy under a new name."),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(std::fs::read(&book).unwrap(), before);
+    }
+    let out = dir.0.join("out.xlsx");
+    let result = Command::new(env!("CARGO_BIN_EXE_xlsxy"))
+        .arg(&book)
+        .arg("-r")
+        .arg("--recalc")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    assert!(out.is_file());
+    assert_eq!(std::fs::read(&book).unwrap(), before);
+}
+
+/// #882 r2: `--read-only` on a file that does not exist is refused, so a
+/// headless run cannot create the file it was asked to keep.
+#[test]
+fn read_only_refuses_a_missing_input() {
+    let dir = Dir::new("read-only-missing");
+    let book = dir.0.join("new.xlsx");
+    let result = Command::new(env!("CARGO_BIN_EXE_xlsxy"))
+        .arg(&book)
+        .arg("--read-only")
+        .arg("--recalc")
+        .arg(&book)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("read-only: no such file"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!book.exists());
+}

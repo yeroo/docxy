@@ -1078,6 +1078,7 @@ fn a_restore_without_a_sidecar_takes_the_fresh_load_s_mark() {
         read_only: false,
         protected: false,
         repaired: false,
+        stamp: None,
     };
     // Repaired since the session was saved: a normal, saveable document.
     let mut t = restore_tab(&persisted(&good));
@@ -1335,7 +1336,7 @@ fn autorecover_writes_an_unsaved_edit_that_a_crash_restores_as_recovered() {
     assert!(hot.starts_with(hot_dir_in(&root.0)), "{}", hot.display());
 
     let now = std::time::SystemTime::now();
-    let crashed = restore_session(&session, true, now);
+    let crashed = restore_session(&session, true, now, &crate::trusted::TrustStore::default());
     assert!(doc_text(&crashed[0]).contains("recover me"));
     assert!(crashed[0].dirty);
     assert_eq!(crashed[0].path.as_deref(), Some(original.as_path()));
@@ -1347,7 +1348,7 @@ fn autorecover_writes_an_unsaved_edit_that_a_crash_restores_as_recovered() {
     // Restore reads the copy and never writes the original.
     assert_eq!(std::fs::read(&original).unwrap(), before);
 
-    let clean = restore_session(&session, false, now);
+    let clean = restore_session(&session, false, now, &crate::trusted::TrustStore::default());
     assert_eq!(clean[0].status.as_ref(), "unsaved — restored");
     assert!(doc_text(&clean[0]).contains("recover me"));
 }
@@ -1358,7 +1359,12 @@ fn a_crash_does_not_label_clean_tabs_recovered() {
     let mut tabs = vec![tab(Kind::Docx), tab(Kind::Xlsx)];
     tabs[1].dirty = true;
     write_session(&root.0, &tabs, 0, prefs());
-    let restored = restore_session(&root.session(), true, std::time::SystemTime::now());
+    let restored = restore_session(
+        &root.session(),
+        true,
+        std::time::SystemTime::now(),
+        &crate::trusted::TrustStore::default(),
+    );
     assert!(
         !restored[0].status.starts_with("recovered"),
         "{}",
@@ -1392,7 +1398,12 @@ fn autorecover_captures_an_open_header_and_stays_in_header_mode() {
     assert!(autorecover_prepare(&mut tabs));
     assert!(tabs[0].hf_edit.is_some(), "the header editor stays open");
     write_session(&root.0, &tabs, 0, prefs());
-    let restored = restore_session(&root.session(), true, std::time::SystemTime::now());
+    let restored = restore_session(
+        &root.session(),
+        true,
+        std::time::SystemTime::now(),
+        &crate::trusted::TrustStore::default(),
+    );
     assert!(part_text(&restored[0], &part).contains("Recovered header"));
     assert_eq!(referenced_hf(&restored[0], true), Some(part));
 }
@@ -1431,6 +1442,7 @@ fn persisted_tab(
         read_only: false,
         protected: false,
         repaired: false,
+        stamp: None,
     }
 }
 
@@ -1439,7 +1451,12 @@ fn crash_restore(tabs: Vec<PersistTab>) -> Vec<DocTab> {
         tabs,
         ..Session::default()
     };
-    restore_session(&session, true, std::time::SystemTime::now())
+    restore_session(
+        &session,
+        true,
+        std::time::SystemTime::now(),
+        &crate::trusted::TrustStore::default(),
+    )
 }
 
 /// Only content that came from a readable sidecar is an AutoRecover copy: a
@@ -1489,7 +1506,12 @@ fn a_crash_still_labels_sheet_and_project_sidecars_it_read() {
         t.dirty = true;
     }
     write_session(&root.0, &tabs, 0, prefs());
-    let restored = restore_session(&root.session(), true, std::time::SystemTime::now());
+    let restored = restore_session(
+        &root.session(),
+        true,
+        std::time::SystemTime::now(),
+        &crate::trusted::TrustStore::default(),
+    );
     for t in &restored {
         assert!(t.dirty);
         assert!(t.status.starts_with("recovered"), "{}", t.status);

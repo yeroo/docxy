@@ -5,7 +5,8 @@
 //!
 //! Opening one is an *import*, like a CSV: the reader builds a fresh
 //! [`SheetPackage`] (as `new_xlsx` makes one) with the sheets, values, formulas,
-//! number formats, date system and defined names, so everything downstream
+//! number formats, date system, defined names and the external links that
+//! calls to add-in functions need (`.xlsb`), so everything downstream
 //! (engine, editor, save) sees an ordinary workbook and saving writes
 //! `.xlsx`. Nothing the readers don't model survives the import.
 //!
@@ -14,8 +15,9 @@
 //! loses only the formula. The hard errors are the files that can't be read
 //! at all: encrypted ones, Excel 5.0/95 workbooks, OLE2 files that are not
 //! spreadsheets, broken containers, and files that ask for more than
-//! [`Limits`] allows (too many cells or sheets, or `.ods` repeats that
-//! would expand past their budget). A limit is never met by truncating.
+//! [`Limits`] allows (too many cells, sheets or external links, or `.ods`
+//! repeats that would expand past their budget). A limit is never met by
+//! truncating.
 
 mod ftab;
 mod ods;
@@ -75,7 +77,7 @@ pub enum OpenError {
     NotSpreadsheet,
     /// The container itself can't be read (a broken compound file or ZIP, a
     /// workbook part missing), or the file asks for more than [`Limits`]
-    /// allows (too many cells, sheets or repeated cells).
+    /// allows (too many cells, sheets, external links or repeated cells).
     Corrupt(String),
 }
 
@@ -151,6 +153,9 @@ pub(crate) struct Limits {
     pub repeat_bytes: usize,
     /// Sheets ("too many sheets").
     pub sheets: usize,
+    /// Distinct external link parts with a function name ("too many
+    /// external links").
+    pub links: usize,
 }
 
 impl Default for Limits {
@@ -160,6 +165,7 @@ impl Default for Limits {
             repeat_cells: 4_000_000,
             repeat_bytes: 256 << 20,
             sheets: 4_096,
+            links: 4_096,
         }
     }
 }
@@ -173,6 +179,23 @@ pub(crate) struct SheetIn {
     pub cells: BTreeMap<(u32, u32), Cell>,
 }
 
+/// Another workbook or add-in whose names formulas call, as `[k]!NAME`
+/// with `k` its 1-based place in [`BookIn::external_links`] (#888).
+/// [`BookIn::build`] writes it as `xl/externalLinks/externalLink{k}.xml`.
+#[derive(Debug, Default)]
+pub(crate) struct ExternalLink {
+    /// The `Id` in `rels` that names the book (`<externalBook r:id>`).
+    pub book: String,
+    /// The link part's relationships as the file has them: (Id, Type,
+    /// Target, TargetMode).
+    pub rels: Vec<(String, String, String, Option<String>)>,
+    /// The book's sheet names.
+    pub sheets: Vec<String>,
+    /// The book's names, in the file's order (ptgNameX counts them all):
+    /// a function name, or `None` for a name that isn't imported.
+    pub names: Vec<Option<String>>,
+}
+
 /// A workbook as a reader collects it, before it becomes a package.
 #[derive(Debug, Default)]
 pub(crate) struct BookIn {
@@ -183,6 +206,8 @@ pub(crate) struct BookIn {
     /// `formats` by code.
     format_ix: HashMap<String, u32>,
     pub names: Vec<DefinedName>,
+    /// The external books formulas name, `[1]` first.
+    pub external_links: Vec<ExternalLink>,
     pub date1904: bool,
     pub limits: Limits,
     /// What has been charged against `limits` so far.
@@ -275,14 +300,28 @@ impl BookIn {
         // so the old names are looked up that way.
         let keys: Vec<String> = raw.iter().map(|n| escape_colon(n)).collect();
         let renames = sheet_renames(&keys, &names);
-        let fix = |f: String, name: bool| -> String {
-            let f = retarget(&f, &renames, name).unwrap_or(f);
+        // A formula calling another book's name (`[1]!F(...)`) doesn't
+        // parse, so `retarget` can't move its references to a renamed
+        // sheet. Rather than keep a stale one, it is dropped (`None`): the
+        // cell keeps its value, as before the import read those names.
+        let fix = |f: String, name: bool| -> Option<String> {
+            let f = match retarget(&f, &renames, name) {
+                Some(f) => f,
+                None if f.contains("]!")
+                    && sheet_qualifiers(&f)
+                        .iter()
+                        .any(|q| renames.by_old.contains_key(q)) =>
+                {
+                    return None;
+                }
+                None => f,
+            };
             let f = if f.contains(COLON) {
                 restore_colons(&f)
             } else {
                 f
             };
-            crate::formula::file_formula(&f).into_owned()
+            Some(crate::formula::file_formula(&f).into_owned())
         };
         let mut pkg = crate::xlsx::new_xlsx_sheets(&names);
         // Each format code becomes an xf (the codes are distinct, so none
@@ -298,19 +337,124 @@ impl BookIn {
             let cells = &mut pkg.workbook.sheets[at].cells;
             for (key, mut cell) in sheet.cells {
                 cell.style = xf_of.get(cell.style as usize).copied().unwrap_or(0);
-                if let Some(f) = cell.formula.take() {
-                    cell.formula = Some(fix(f, false));
-                }
+                cell.formula = cell.formula.take().and_then(|f| fix(f, false));
                 cells.insert(key, cell);
             }
         }
         for mut name in self.names {
-            name.formula = fix(name.formula, true);
+            let Some(formula) = fix(name.formula, true) else {
+                continue;
+            };
+            name.formula = formula;
             pkg.workbook.defined_names.push(name);
         }
         pkg.workbook.date1904 = self.date1904;
+        write_external_links(&mut pkg, &self.external_links);
         pkg
     }
+}
+
+/// Each external link as `xl/externalLinks/externalLink{k}.xml` (with its
+/// rels, content type and workbook rel), and `<externalReferences>` naming
+/// them in order, so `[k]!NAME` names link `k`. `pkg` is the fresh package
+/// [`BookIn::build`] makes, whose workbook.xml is `<sheets>` only: its
+/// `<externalReferences>` goes right after `</sheets>`, its schema slot,
+/// and a save puts `<definedNames>` after it. The shared parts are each
+/// edited once, so the time is linear in the links.
+fn write_external_links(pkg: &mut SheetPackage, links: &[ExternalLink]) {
+    use crate::xlsx::{esc_attr, parse_rels};
+    const MAIN: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const RELS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const WB_RELS: &str = "xl/_rels/workbook.xml.rels";
+    if links.is_empty() {
+        return;
+    }
+    // Each link's workbook rel is numbered past the rIds already there.
+    let first = pkg.part(WB_RELS).map_or(0, |b| {
+        parse_rels(&String::from_utf8_lossy(b))
+            .iter()
+            .filter_map(|(id, ..)| id.strip_prefix("rId")?.parse::<u32>().ok())
+            .max()
+            .unwrap_or(0)
+    });
+    let (mut refs, mut wb_rels, mut overrides) = (String::new(), String::new(), String::new());
+    for (i, link) in links.iter().enumerate() {
+        let part = format!("xl/externalLinks/externalLink{}.xml", i + 1);
+        let mut body = String::new();
+        if !link.sheets.is_empty() {
+            body.push_str("<sheetNames>");
+            for s in &link.sheets {
+                body.push_str(&format!(r#"<sheetName val="{}"/>"#, esc_attr(s)));
+            }
+            body.push_str("</sheetNames>");
+        }
+        // Each name once: a book's sheet-scoped names may repeat one, and
+        // their scope isn't read.
+        let mut seen = std::collections::HashSet::new();
+        let names: Vec<&String> = link
+            .names
+            .iter()
+            .flatten()
+            .filter(|n| seen.insert(n.to_lowercase()))
+            .collect();
+        if !names.is_empty() {
+            body.push_str("<definedNames>");
+            for n in names {
+                body.push_str(&format!(r#"<definedName name="{}"/>"#, esc_attr(n)));
+            }
+            body.push_str("</definedNames>");
+        }
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<externalLink xmlns="{MAIN}"><externalBook xmlns:r="{RELS}" r:id="{}">{body}</externalBook></externalLink>"#,
+            esc_attr(&link.book)
+        );
+        let mut rels = String::from(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+        );
+        for (id, ty, target, mode) in &link.rels {
+            rels.push_str(&format!(
+                r#"<Relationship Id="{}" Type="{}" Target="{}""#,
+                esc_attr(id),
+                esc_attr(ty),
+                esc_attr(target)
+            ));
+            if let Some(mode) = mode {
+                rels.push_str(&format!(r#" TargetMode="{}""#, esc_attr(mode)));
+            }
+            rels.push_str("/>");
+        }
+        rels.push_str("</Relationships>");
+        overrides.push_str(&format!(
+            r#"<Override PartName="/{part}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.externalLink+xml"/>"#
+        ));
+        let rid = format!("rId{}", first as usize + i + 1);
+        wb_rels.push_str(&format!(
+            r#"<Relationship Id="{rid}" Type="{RELS}/externalLink" Target="externalLinks/externalLink{}.xml"/>"#,
+            i + 1
+        ));
+        refs.push_str(&format!(r#"<externalReference r:id="{rid}"/>"#));
+        pkg.parts.push((
+            format!("xl/externalLinks/_rels/externalLink{}.xml.rels", i + 1),
+            rels.into_bytes(),
+        ));
+        pkg.parts.push((part, xml.into_bytes()));
+    }
+    let mut insert = |name: &str, before: &str, text: &str| {
+        if let Some((_, b)) = pkg.parts.iter_mut().find(|(n, _)| n == name) {
+            *b = String::from_utf8_lossy(b)
+                .replacen(before, &format!("{text}{before}"), 1)
+                .into_bytes();
+        }
+    };
+    insert("[Content_Types].xml", "</Types>", &overrides);
+    insert(WB_RELS, "</Relationships>", &wb_rels);
+    insert(
+        "xl/workbook.xml",
+        "</workbook>",
+        &format!("<externalReferences>{refs}</externalReferences>"),
+    );
 }
 
 /// Sheet names Excel accepts, in order: at most 31 characters, none of
@@ -756,6 +900,65 @@ mod tests {
         assert_eq!(two[1], format!("{} (2)", "x".repeat(27)));
     }
 
+    /// Each external link becomes a part, numbered in order and named from
+    /// `<externalReferences>` right after `<sheets>`; a name repeated in
+    /// another case is written once, and attribute text is escaped. A book
+    /// with no links gets none of it.
+    #[test]
+    fn external_links_are_written_in_order() {
+        let text = |pkg: &SheetPackage, name: &str| {
+            String::from_utf8(pkg.part(name).unwrap_or_default().to_vec()).unwrap()
+        };
+        let link = |names: &[&str], target: &str| {
+            ExternalLink {
+            book: "rId1".into(),
+            rels: vec![(
+                "rId1".into(),
+                "http://schemas.microsoft.com/office/2006/relationships/xlExternalLinkPath/xlLibrary".into(),
+                target.into(),
+                Some("External".into()),
+            )],
+            sheets: vec!["S&1".into()],
+            names: names.iter().map(|n| Some(n.to_string())).collect(),
+        }
+        };
+        let mut book = BookIn::new();
+        book.external_links = vec![link(&["F"], "A.XLAM"), link(&["X", "G", "x"], "B&C.XLAM")];
+        let pkg = book.build();
+        let two = text(&pkg, "xl/externalLinks/externalLink2.xml");
+        assert!(
+            two.ends_with(r#" r:id="rId1"><sheetNames><sheetName val="S&amp;1"/></sheetNames><definedNames><definedName name="X"/><definedName name="G"/></definedNames></externalBook></externalLink>"#),
+            "{two}"
+        );
+        assert!(
+            text(&pkg, "xl/externalLinks/_rels/externalLink2.xml.rels")
+                .contains(r#"Target="B&amp;C.XLAM" TargetMode="External"/>"#)
+        );
+        let rels = text(&pkg, "xl/_rels/workbook.xml.rels");
+        let rid = |k: usize| {
+            let at = rels
+                .find(&format!(r#"Target="externalLinks/externalLink{k}.xml""#))
+                .unwrap();
+            let id = rels[..at].rfind("Id=\"").unwrap() + 4;
+            rels[id..].split('"').next().unwrap().to_string()
+        };
+        assert!(text(&pkg, "xl/workbook.xml").contains(&format!(
+            r#"</sheets><externalReferences><externalReference r:id="{}"/><externalReference r:id="{}"/></externalReferences></workbook>"#,
+            rid(1),
+            rid(2)
+        )));
+        assert_eq!(
+            text(&pkg, "[Content_Types].xml")
+                .matches("spreadsheetml.externalLink+xml")
+                .count(),
+            2
+        );
+
+        let pkg = BookIn::new().build();
+        assert!(!pkg.part_names().iter().any(|n| n.contains("externalLink")));
+        assert!(!text(&pkg, "xl/workbook.xml").contains("externalReferences"));
+    }
+
     /// A renamed sheet takes its references along: a formula and a defined
     /// name on a 33-character name, a second "Data" (references stay on the
     /// first), and a truncated name equal to another sheet's own.
@@ -844,6 +1047,66 @@ mod tests {
         assert_eq!(calc.cell(5, 0).unwrap().value, CellValue::Number(7.0));
         assert_eq!(wb.defined_names[0].formula, format!("{cut}!$A$1"));
         assert_eq!(wb.defined_names[1].formula, "A_B!$A$2");
+    }
+
+    /// A call into another book (`[1]!F(...)`) doesn't parse, so a sheet
+    /// rename can't reach inside it: one naming a renamed sheet is dropped
+    /// (a cell keeps its value, a name is left out), and one that doesn't
+    /// stays as it is.
+    #[test]
+    fn a_call_into_another_book_naming_a_renamed_sheet_is_dropped() {
+        use crate::sheet::CellValue;
+        let long = "L".repeat(33);
+        let cut = "L".repeat(31);
+        let cell = |f: &str, v: f64| Cell {
+            value: CellValue::Number(v),
+            formula: Some(f.to_string()),
+            ..Cell::default()
+        };
+        let mut book = BookIn::new();
+        book.push_sheet(SheetIn {
+            name: long.clone(),
+            ..SheetIn::default()
+        })
+        .unwrap();
+        book.push_sheet(SheetIn {
+            name: "Calc".into(),
+            cells: [
+                ((0, 0), cell(&format!("[1]!F('{long}'!A1)"), 9.0)),
+                ((1, 0), cell("[1]!F(Calc!A1)", 8.0)),
+                ((2, 0), cell(&format!("'{long}'!A1*2"), 7.0)),
+            ]
+            .into_iter()
+            .collect(),
+        })
+        .unwrap();
+        for (name, formula) in [
+            ("Stale", format!("[1]!F('{long}'!$A$1)")),
+            ("Kept", "[1]!F(Calc!$A$1)".to_string()),
+        ] {
+            book.names.push(DefinedName {
+                name: name.into(),
+                scope: None,
+                formula,
+            });
+        }
+        let pkg = book.build();
+        let calc = &pkg.workbook.sheets[1];
+        let at = |r| calc.cell(r, 0).unwrap();
+        assert_eq!(at(0).formula, None);
+        assert_eq!(at(0).value, CellValue::Number(9.0));
+        assert_eq!(at(1).formula.as_deref(), Some("[1]!F(Calc!A1)"));
+        assert_eq!(
+            at(2).formula.as_deref(),
+            Some(format!("{cut}!A1*2").as_str())
+        );
+        let names: Vec<(&str, &str)> = pkg
+            .workbook
+            .defined_names
+            .iter()
+            .map(|n| (n.name.as_str(), n.formula.as_str()))
+            .collect();
+        assert_eq!(names, [("Kept", "[1]!F(Calc!$A$1)")]);
     }
 
     /// A sheet raw-named `A:B` keeps its whole-column and whole-row
@@ -982,6 +1245,35 @@ mod tests {
         assert!(!q.iter().any(|s| s.contains("no")), "{q:?}");
     }
 
+    /// As many links as the budget allows build in linear time, each with
+    /// its own workbook rel, and reload.
+    #[test]
+    fn many_links_build_in_linear_time() {
+        let n = Limits::default().links;
+        let mut book = BookIn::new();
+        book.external_links = (0..n)
+            .map(|i| ExternalLink {
+                book: "rId1".into(),
+                rels: vec![("rId1".into(), "t".into(), format!("B{i}.XLAM"), None)],
+                sheets: Vec::new(),
+                names: vec![Some(format!("F{i}"))],
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let pkg = book.build();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let workbook = String::from_utf8(pkg.part("xl/workbook.xml").unwrap().to_vec()).unwrap();
+        let rels = crate::xlsx::parse_rels(&String::from_utf8_lossy(
+            pkg.part("xl/_rels/workbook.xml.rels").unwrap(),
+        ));
+        let ids: std::collections::HashSet<_> = rels.iter().map(|r| r.0.clone()).collect();
+        assert_eq!(ids.len(), rels.len());
+        assert_eq!(workbook.matches("<externalReference ").count(), n);
+        let started = std::time::Instant::now();
+        crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&pkg)).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
     #[test]
     fn many_sheets_build_in_linear_time_and_too_many_are_refused() {
         let mut book = BookIn::new();
@@ -1021,6 +1313,7 @@ mod tests {
             repeat_cells: 3,
             repeat_bytes: 100,
             sheets: 2,
+            links: 1,
         });
         book.charge_cells(10).unwrap();
         assert!(

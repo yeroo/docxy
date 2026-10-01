@@ -211,6 +211,9 @@ fn path_info(app: &App) -> Json {
     Json::obj(vec![
         ("path", Json::Str(app.path.clone())),
         ("modified", Json::Bool(app.modified)),
+        // Bound to the file `xlsxy --read-only` opened (#882): `wb.save`
+        // is refused until a Save As to another name.
+        ("read_only", Json::Bool(app.bound_read_only())),
         ("sheets", Json::Num(wb.sheets.len() as f64)),
         ("active", Json::Num(app.sheet as f64)),
         ("active_name", Json::Str(wb.sheets[app.sheet].name.clone())),

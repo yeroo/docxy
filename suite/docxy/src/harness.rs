@@ -44,6 +44,10 @@ pub const HARNESS_FLAG: &str = "--harness";
 /// cannot add an argument (equivalent to passing [`HARNESS_FLAG`]).
 pub const HARNESS_ENV: &str = "DOCXY_HARNESS";
 
+/// The command-line flag that opens every workbook on the line read-only
+/// (#882). On Windows Excel's `/r` spelling works too; see [`is_read_only_flag`].
+pub const READ_ONLY_FLAG: &str = "--read-only";
+
 /// The app name the control surface publishes itself under. Not `"docxy"`: the
 /// terminal editor already owns that, and a harness instance is a different
 /// thing to address even though it is the same product.
@@ -59,6 +63,9 @@ const CTL_APP: &str = "suite";
 pub struct Cli {
     /// `--harness` was passed.
     pub harness: bool,
+    /// `--read-only` (or `/r` on Windows) was passed: every workbook on the
+    /// line opens read-only (#882). Documents and projects open as usual.
+    pub read_only: bool,
     /// Positional arguments, in order.
     pub files: Vec<PathBuf>,
     /// `--`-prefixed arguments that are not ours. Kept rather than silently
@@ -84,6 +91,10 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Cli {
                 cli.harness = true;
                 continue;
             }
+            if is_read_only_flag(&arg, cfg!(windows)) {
+                cli.read_only = true;
+                continue;
+            }
             if let Some(s) = arg.to_str()
                 && s.starts_with("--")
             {
@@ -94,6 +105,14 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Cli {
         cli.files.push(PathBuf::from(arg));
     }
     cli
+}
+
+/// Whether `arg` asks for a read-only open: [`READ_ONLY_FLAG`] anywhere,
+/// and Excel's `/r` (either case) on Windows only. Elsewhere `/r` is an
+/// absolute path, so it stays a file. `windows` is a parameter so both
+/// platforms' rules are tested on either.
+fn is_read_only_flag(arg: &OsStr, windows: bool) -> bool {
+    arg == READ_ONLY_FLAG || (windows && (arg == "/r" || arg == "/R"))
 }
 
 /// Whether [`HARNESS_ENV`]'s value means "on". Unset is off; so are the usual
@@ -4340,6 +4359,56 @@ mod tests {
         assert_eq!(cli.files, vec![PathBuf::from(HARNESS_FLAG)]);
     }
 
+    /// `--read-only` turns read-only on for the whole line and is not a file.
+    #[test]
+    fn read_only_flag_is_recognized_and_is_not_a_file() {
+        let cli = parse_args(args(&["a.xlsx", READ_ONLY_FLAG, "b.docx"]));
+        assert!(cli.read_only);
+        assert!(!cli.harness);
+        assert!(cli.unknown_flags.is_empty());
+        assert_eq!(
+            cli.files,
+            vec![PathBuf::from("a.xlsx"), PathBuf::from("b.docx")]
+        );
+        assert!(!parse_args(args(&["a.xlsx"])).read_only);
+    }
+
+    /// Excel's `/r` and `/R` are the flag on Windows only; elsewhere they are
+    /// absolute paths. Nothing else that merely starts with `/r` is a flag.
+    #[test]
+    fn slash_r_is_a_flag_on_windows_only() {
+        for spelling in ["/r", "/R"] {
+            assert!(is_read_only_flag(OsStr::new(spelling), true), "{spelling}");
+            assert!(
+                !is_read_only_flag(OsStr::new(spelling), false),
+                "{spelling}"
+            );
+        }
+        assert!(is_read_only_flag(OsStr::new(READ_ONLY_FLAG), false));
+        for other in ["/ro", "/read-only", "-r", "/x", "--READ-ONLY"] {
+            assert!(!is_read_only_flag(OsStr::new(other), true), "{other}");
+        }
+        let cli = parse_args(args(&["/r", "a.xlsx"]));
+        assert_eq!(cli.read_only, cfg!(windows));
+        let files: Vec<PathBuf> = if cfg!(windows) {
+            vec![PathBuf::from("a.xlsx")]
+        } else {
+            vec![PathBuf::from("/r"), PathBuf::from("a.xlsx")]
+        };
+        assert_eq!(cli.files, files);
+    }
+
+    /// After `--`, the read-only spellings are files.
+    #[test]
+    fn double_dash_makes_read_only_spellings_files() {
+        let cli = parse_args(args(&["--", READ_ONLY_FLAG, "/r"]));
+        assert!(!cli.read_only);
+        assert_eq!(
+            cli.files,
+            vec![PathBuf::from(READ_ONLY_FLAG), PathBuf::from("/r")]
+        );
+    }
+
     // ---- the env alternative ----
 
     #[test]
@@ -4654,7 +4723,12 @@ mod tests {
     fn repair_status_is_not_a_load_failure() {
         let dir = crate::open_mode_tests::Scratch::new();
         let src = crate::open_mode_tests::damaged_book(&dir, "book.xlsx");
-        let tab = crate::tab_from_path_mode(&src, crate::open_mode::OpenMode::Repair).unwrap();
+        let tab = crate::tab_from_path_mode(
+            &src,
+            crate::open_mode::OpenMode::Repair,
+            &crate::trusted::TrustStore::default(),
+        )
+        .unwrap();
         assert!(
             tab.status.contains("emptied xl/styles.xml"),
             "{}",

@@ -88,7 +88,8 @@ fn reopen_click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>> {
     let Some(path) = tab.path.clone() else {
         return Some(Err("this tab has no file to reopen".into()));
     };
-    Some(crate::tab_from_path_mode(&path, mode).map(|fresh| *tab = fresh))
+    let trusted = crate::trusted::TrustStore::load(&crate::config_root());
+    Some(crate::tab_from_path_mode(&path, mode, &trusted).map(|fresh| *tab = fresh))
 }
 
 /// Whether the active tab's top dialog is the reopen question, whose Yes

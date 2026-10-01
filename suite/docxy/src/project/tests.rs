@@ -102,6 +102,7 @@ fn persisted(path: Option<&Path>, hot: Option<&Path>, dirty: bool) -> PersistTab
         read_only: false,
         protected: false,
         repaired: false,
+        stamp: None,
     }
 }
 

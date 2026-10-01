@@ -52,6 +52,7 @@ mod table_dialogs;
 mod table_tab;
 mod table_view;
 mod tabstrip;
+mod trusted;
 mod ttc_dialog;
 use open_mode::{OpenMode, Reopen, ReopenStep, reopen_step};
 use project::*;
@@ -216,6 +217,10 @@ struct PersistTab {
     protected: bool,
     #[serde(default)]
     repaired: bool,
+    /// A protected tab's file as it was opened (#882), for Enable Editing
+    /// after a restart.
+    #[serde(default)]
+    stamp: Option<trusted::Stamp>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -4360,14 +4365,22 @@ fn sheet_tab_from_path(path: &PathBuf, repair: bool) -> DocTab {
 
 /// [`tab_from_path`] in an open mode (#610). Only a workbook takes a mode;
 /// anything else opens as usual. Protected View comes from the source file's
-/// zone, so Open as Copy of a downloaded file is protected too. `Err` only
-/// when the copy could not be written; a failed load is still a tab, whose
-/// status says why.
-fn tab_from_path_mode(path: &PathBuf, mode: OpenMode) -> Result<DocTab, String> {
+/// zone, so Open as Copy of a downloaded file is protected too, unless
+/// `trusted` holds the source as it is now (#882). `Err` only when the copy
+/// could not be written; a failed load is still a tab, whose status says why.
+///
+/// A copy of a trusted source opens unprotected, but the copy carries the
+/// mark and is not trusted itself: opened again from disk it is protected.
+fn tab_from_path_mode(
+    path: &PathBuf,
+    mode: OpenMode,
+    trusted: &trusted::TrustStore,
+) -> Result<DocTab, String> {
     if is_project_path(path) || !is_sheet_path(path) {
         return Ok(tab_from_path(path));
     }
-    let protected = open_mode::is_protected_zone(open_mode::zone_id(path));
+    let protected = open_mode::is_protected_zone(open_mode::zone_id(path))
+        && !trusted.is_trusted(path, trusted::Stamp::of(path));
     // A template already opens as a new, untitled workbook, which is what a
     // copy is for: writing `Copy (1)Budget.xltx` would only leave a file
     // behind that nothing is bound to (#610 r6).
@@ -4375,6 +4388,9 @@ fn tab_from_path_mode(path: &PathBuf, mode: OpenMode) -> Result<DocTab, String> 
         OpenMode::Copy if template_title(path).is_none() => open_mode::write_copy(path)?,
         _ => path.clone(),
     };
+    // Taken before the load: a file replaced while it loads leaves a stamp
+    // that no longer matches, so Enable Editing trusts nothing new.
+    let stamp = protected.then(|| trusted::Stamp::of(&path)).flatten();
     let mut tab = sheet_tab_from_path(&path, mode == OpenMode::Repair);
     // A template opens untitled: Save already asks where to go, and there is
     // no file of its own to keep from being overwritten.
@@ -4382,6 +4398,7 @@ fn tab_from_path_mode(path: &PathBuf, mode: OpenMode) -> Result<DocTab, String> 
         tab.access = mode.access();
     }
     tab.access.protected = protected;
+    tab.access.stamp = stamp;
     Ok(tab)
 }
 
@@ -7144,14 +7161,19 @@ fn doc_to_docx(doc: &Document, comments: &[Comment], base: Option<&Package>) -> 
 /// [`restore_session`]; the tests of single-tab restore come here.
 #[cfg(test)]
 fn restore_tab(t: &PersistTab) -> DocTab {
-    restore_tab_sourced(t).0
+    restore_tab_sourced(t, &trusted::TrustStore::default()).0
 }
 
 /// [`restore_tab`], plus whether the tab's content came from a readable
 /// hot-exit sidecar. Only such a tab holds an AutoRecover copy; a tab that
 /// fell back to its file, or to a placeholder, keeps `t.dirty` in some arms
 /// but lost its unsaved content (#632).
-fn restore_tab_sourced(t: &PersistTab) -> (DocTab, bool) {
+///
+/// A tab persisted in Protected View stays protected unless its file is
+/// still the one it opened (its persisted stamp) and `trusted` holds it
+/// (#882): restore can take protection away from a file trusted since,
+/// never add it.
+fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab, bool) {
     if t.kind == Kind::Project {
         // Every fallback in `restore_project_tab` (sidecar missing or
         // unreadable) comes back clean, so dirty means the sidecar loaded.
@@ -7292,10 +7314,19 @@ fn restore_tab_sourced(t: &PersistTab) -> (DocTab, bool) {
                 (tab.surface, tab.status) = sheet_from_path_mode(&p, true);
             }
         }
+        // The tab shows its sidecar, the content opened with `t.stamp`, so
+        // protection drops only when the file is still that one and it is
+        // trusted. A tab with no persisted stamp stays protected.
+        let protected = t.protected
+            && !tab.path.as_deref().is_some_and(|p| {
+                let now = trusted::Stamp::of(p);
+                t.stamp.is_some() && t.stamp == now && trusted.is_trusted(p, now)
+            });
         tab.access = open_mode::Access {
             read_only: t.read_only,
-            protected: t.protected,
+            protected,
             repaired: t.repaired,
+            stamp: t.stamp.filter(|_| protected),
         };
     }
     (tab, from_hot)
@@ -7307,12 +7338,17 @@ fn restore_tab_sourced(t: &PersistTab) -> (DocTab, bool) {
 /// its own status (a load error included), since it holds no recovered edits.
 /// A recovered tab's `path` still names the original, which restore never
 /// writes: that waits for the user's Save.
-fn restore_session(session: &Session, crashed: bool, now: std::time::SystemTime) -> Vec<DocTab> {
+fn restore_session(
+    session: &Session,
+    crashed: bool,
+    now: std::time::SystemTime,
+    trusted: &trusted::TrustStore,
+) -> Vec<DocTab> {
     session
         .tabs
         .iter()
         .map(|t| {
-            let (mut tab, from_hot) = restore_tab_sourced(t);
+            let (mut tab, from_hot) = restore_tab_sourced(t, trusted);
             if crashed && from_hot && tab.dirty {
                 let saved = t
                     .hot
@@ -7370,6 +7406,7 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
         read_only: t.access.read_only,
         protected: t.access.protected,
         repaired: t.access.repaired,
+        stamp: t.access.stamp,
     }
 }
 
@@ -7460,7 +7497,12 @@ impl Docxy {
         let crashed = recover::was_unclean(&root);
         recover::mark_running(&root);
 
-        let mut tabs = restore_session(&session, crashed, std::time::SystemTime::now());
+        let mut tabs = restore_session(
+            &session,
+            crashed,
+            std::time::SystemTime::now(),
+            &trusted::TrustStore::load(&root),
+        );
         if tabs.is_empty() {
             tabs.push(sample_doc().into_tab(Kind::Docx, "sample.docx".into(), None, false));
         }
@@ -10230,7 +10272,10 @@ impl Docxy {
     }
 
     /// The message bar's Enable Editing (#610): the tab leaves Protected View
-    /// and keeps the read-only or repaired state it was opened with.
+    /// and keeps the read-only or repaired state it was opened with. Its file,
+    /// as it was opened, becomes a trusted document (#882), so it opens for
+    /// editing next time. A tab with no stamp (a session from before #882)
+    /// is not remembered: the file on disk may not be the one it showed.
     pub(crate) fn enable_editing(&mut self, cx: &mut Context<Self>) {
         let Some(t) = self.tabs.get_mut(self.active) else {
             return;
@@ -10239,7 +10284,10 @@ impl Docxy {
             return;
         }
         t.access.protected = false;
-        t.status = "editing enabled".into();
+        t.status = match (t.path.as_deref(), t.access.stamp.take()) {
+            (Some(path), Some(stamp)) => trusted::remember(&config_root(), path, stamp).into(),
+            _ => "editing enabled".into(),
+        };
         self.persist();
         cx.notify();
     }
@@ -13819,8 +13867,9 @@ impl Docxy {
                     .position(|t| t.path.as_deref().map(canonical) == Some(key.clone()))
             })
             .flatten();
+        let trusted = trusted::TrustStore::load(&config_root());
         let Some(i) = open else {
-            let tab = tab_from_path_mode(&path, mode)?;
+            let tab = tab_from_path_mode(&path, mode, &trusted)?;
             self.tabs.push(tab);
             self.active = self.tabs.len() - 1;
             return Ok(true);
@@ -13829,7 +13878,7 @@ impl Docxy {
         let tab = &self.tabs[i];
         Ok(match reopen_step(reopen, tab.dirty, tab.access, mode) {
             ReopenStep::Reload => {
-                self.tabs[i] = tab_from_path_mode(&path, mode)?;
+                self.tabs[i] = tab_from_path_mode(&path, mode, &trusted)?;
                 true
             }
             ReopenStep::Ask => {
@@ -13843,8 +13892,10 @@ impl Docxy {
     /// Open files passed on the command line (e.g. double-clicking a .docx/.xlsx
     /// in Explorer) on top of the restored session. A file already open is
     /// focused rather than duplicated; if that tab has unsaved changes, it
-    /// asks before reloading it from disk ([`Self::open_path`]).
-    fn open_args(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+    /// asks before reloading it from disk ([`Self::open_path`]). With
+    /// `read_only` (`--read-only`, `/r`) every workbook opens read-only (#882);
+    /// `open_path` opens anything else as usual.
+    fn open_args(&mut self, paths: Vec<PathBuf>, read_only: bool, cx: &mut Context<Self>) {
         // ⚠️ A harness instance never asks, and always reloads — whether or
         // not the tab is dirty. Its `open` verb calls `open_path` with
         // `Reopen::Always` itself; this is the command line's path.
@@ -13866,9 +13917,14 @@ impl Docxy {
         } else {
             Reopen::Ask
         };
+        let mode = if read_only {
+            OpenMode::ReadOnly
+        } else {
+            OpenMode::Normal
+        };
         let mut changed = false;
         for path in paths {
-            if let Err(e) = self.open_path(&path, OpenMode::Normal, reopen) {
+            if let Err(e) = self.open_path(&path, mode, reopen) {
                 self.set_status(e);
             }
             changed = true;
@@ -27740,6 +27796,7 @@ fn main() {
     for flag in &cli.unknown_flags {
         eprintln!("docxy: ignoring unknown option {flag}");
     }
+    let cli_read_only = cli.read_only;
     let cli_files: Vec<PathBuf> = cli.files.into_iter().filter(|p| p.is_file()).collect();
 
     // The harness control surface: started only when asked for, and only into
@@ -27809,7 +27866,7 @@ fn main() {
             }
             // Open any command-line files on top of the restored session.
             if !startup_files.is_empty() {
-                view.update(cx, move |this, cx| this.open_args(startup_files, cx));
+                view.update(cx, move |this, cx| this.open_args(startup_files, cli_read_only, cx));
             }
             // Hot-exit: capture the latest (possibly unsaved) content when the
             // window is closed, so a restart restores exactly what was open. By
