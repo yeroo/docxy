@@ -272,6 +272,9 @@ pub(crate) fn read_with(zip: &ZipArchive, limits: Limits) -> Result<BookIn, Open
     // Each BrtBundleSh's part, in sheet order; None for one without a rel.
     let mut parts: Vec<Option<String>> = Vec::new();
     let mut raw_names: Vec<RawName> = Vec::new();
+    // Each external link part read so far: its place in `g.links`.
+    let mut link_of: HashMap<String, Option<usize>> = HashMap::new();
+    let mut too_many_links = false;
     for (ty, body) in records(&wb) {
         let mut c = Cur::new(body);
         let _ = (|| -> Option<()> {
@@ -290,15 +293,30 @@ pub(crate) fn read_with(zip: &ZipArchive, limits: Limits) -> Result<BookIn, Open
                     // have one, which is Excel's `[k]` unless a book with
                     // no names (one only cells refer to, not imported)
                     // comes first: then the numbers differ from Excel's
-                    // but still name the links this import writes.
-                    let link = c
-                        .wide()
-                        .and_then(|rid| rel.get(&rid))
-                        .and_then(|(_, part)| read_link(zip, part));
-                    let k = link.map(|l| {
-                        g.links.push(l);
-                        g.links.len() - 1
-                    });
+                    // but still name the links this import writes. A part
+                    // several books name is read once and is one link.
+                    let part = c.wide().and_then(|rid| rel.get(&rid));
+                    let k = match part {
+                        None => None,
+                        Some((_, part)) => match link_of.get(part) {
+                            Some(&k) => k,
+                            None => {
+                                let k = match read_link(zip, part) {
+                                    Some(_) if g.links.len() >= book.limits.links => {
+                                        too_many_links = true;
+                                        None
+                                    }
+                                    Some(l) => {
+                                        g.links.push(l);
+                                        Some(g.links.len() - 1)
+                                    }
+                                    None => None,
+                                };
+                                link_of.insert(part.clone(), k);
+                                k
+                            }
+                        },
+                    };
                     g.books.push(Book::External(k));
                 }
                 BRT_SUP_ADDIN => g.books.push(Book::Other),
@@ -329,6 +347,12 @@ pub(crate) fn read_with(zip: &ZipArchive, limits: Limits) -> Result<BookIn, Open
             }
             Some(())
         })();
+    }
+    if too_many_links {
+        return Err(OpenError::Corrupt(format!(
+            "too many external links (more than {})",
+            book.limits.links
+        )));
     }
 
     let sst: Vec<String> = zip
@@ -1024,6 +1048,48 @@ mod tests {
         }
         assert_eq!(c[&(0, 7)].formula.as_deref(), Some("[1]!F"));
         assert_eq!(book.external_links.len(), 1);
+    }
+
+    /// Books naming the same link part are one link, read once, however
+    /// many there are; and the link budget refuses a workbook past it.
+    #[test]
+    fn a_repeated_book_is_one_link_and_links_are_budgeted() {
+        let src = |rid: &str| rec(BRT_SUP_BOOK_SRC, &wide(rid));
+        let mut workbook = vec![src("rId2"); 100_000];
+        workbook.push(extern_sheet(&[(0, -2, -2), (99_999, -2, -2)]));
+        let started = std::time::Instant::now();
+        let book = open(&xlsb_links(
+            &workbook,
+            &[
+                rec(BRT_ROW_HDR, &0u32.to_le_bytes()),
+                fmla_num(0, 1.0, &name_x(0, 1)),
+                fmla_num(1, 2.0, &name_x(1, 1)),
+            ],
+            &[("rId2", link_part(0, "rId1", &[], &["F"]), LINK_RELS)],
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(book.external_links.len(), 1);
+        let c = &book.sheets[0].cells;
+        assert_eq!(c[&(0, 0)].formula.as_deref(), Some("[1]!F"));
+        assert_eq!(c[&(0, 1)].formula.as_deref(), Some("[1]!F"));
+
+        let two = xlsb_links(
+            &[src("rId2"), src("rId3")],
+            &[],
+            &[
+                ("rId2", link_part(0, "rId1", &[], &["F"]), LINK_RELS),
+                ("rId3", link_part(0, "rId1", &[], &["G"]), LINK_RELS),
+            ],
+        );
+        assert_eq!(open(&two).external_links.len(), 2);
+        let tight = Limits {
+            links: 1,
+            ..Limits::default()
+        };
+        let err = read_with(&ZipArchive::open(&two).unwrap(), tight)
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("too many external links"), "{err}");
     }
 
     /// Two sheets naming the same part: one sheet, read once; and the cell

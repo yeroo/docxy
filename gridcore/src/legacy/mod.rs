@@ -151,6 +151,9 @@ pub(crate) struct Limits {
     pub repeat_bytes: usize,
     /// Sheets ("too many sheets").
     pub sheets: usize,
+    /// Distinct external books whose names formulas call ("too many
+    /// external links").
+    pub links: usize,
 }
 
 impl Default for Limits {
@@ -160,6 +163,7 @@ impl Default for Limits {
             repeat_cells: 4_000_000,
             repeat_bytes: 256 << 20,
             sheets: 4_096,
+            links: 4_096,
         }
     }
 }
@@ -337,15 +341,25 @@ impl BookIn {
 /// them in order, so `[k]!NAME` names link `k`. `pkg` is the fresh package
 /// [`BookIn::build`] makes, whose workbook.xml is `<sheets>` only: its
 /// `<externalReferences>` goes right after `</sheets>`, its schema slot,
-/// and a save puts `<definedNames>` after it.
+/// and a save puts `<definedNames>` after it. The shared parts are each
+/// edited once, so the time is linear in the links.
 fn write_external_links(pkg: &mut SheetPackage, links: &[ExternalLink]) {
-    use crate::xlsx::{add_content_type_override, add_rel, esc_attr};
+    use crate::xlsx::{esc_attr, parse_rels};
     const MAIN: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
     const RELS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const WB_RELS: &str = "xl/_rels/workbook.xml.rels";
     if links.is_empty() {
         return;
     }
-    let mut refs = String::new();
+    // Each link's workbook rel is numbered past the rIds already there.
+    let first = pkg.part(WB_RELS).map_or(0, |b| {
+        parse_rels(&String::from_utf8_lossy(b))
+            .iter()
+            .filter_map(|(id, ..)| id.strip_prefix("rId")?.parse::<u32>().ok())
+            .max()
+            .unwrap_or(0)
+    });
+    let (mut refs, mut wb_rels, mut overrides) = (String::new(), String::new(), String::new());
     for (i, link) in links.iter().enumerate() {
         let part = format!("xl/externalLinks/externalLink{}.xml", i + 1);
         let mut body = String::new();
@@ -393,17 +407,14 @@ fn write_external_links(pkg: &mut SheetPackage, links: &[ExternalLink]) {
             rels.push_str("/>");
         }
         rels.push_str("</Relationships>");
-        add_content_type_override(
-            &mut pkg.parts,
-            &format!("/{part}"),
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.externalLink+xml",
-        );
-        let rid = add_rel(
-            &mut pkg.parts,
-            "xl/_rels/workbook.xml.rels",
-            &format!("{RELS}/externalLink"),
-            &format!("externalLinks/externalLink{}.xml", i + 1),
-        );
+        overrides.push_str(&format!(
+            r#"<Override PartName="/{part}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.externalLink+xml"/>"#
+        ));
+        let rid = format!("rId{}", first as usize + i + 1);
+        wb_rels.push_str(&format!(
+            r#"<Relationship Id="{rid}" Type="{RELS}/externalLink" Target="externalLinks/externalLink{}.xml"/>"#,
+            i + 1
+        ));
         refs.push_str(&format!(r#"<externalReference r:id="{rid}"/>"#));
         pkg.parts.push((
             format!("xl/externalLinks/_rels/externalLink{}.xml.rels", i + 1),
@@ -411,14 +422,20 @@ fn write_external_links(pkg: &mut SheetPackage, links: &[ExternalLink]) {
         ));
         pkg.parts.push((part, xml.into_bytes()));
     }
-    if let Some((_, wb)) = pkg.parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
-        let xml = String::from_utf8_lossy(wb).replacen(
-            "</sheets>",
-            &format!("</sheets><externalReferences>{refs}</externalReferences>"),
-            1,
-        );
-        *wb = xml.into_bytes();
-    }
+    let mut insert = |name: &str, before: &str, text: &str| {
+        if let Some((_, b)) = pkg.parts.iter_mut().find(|(n, _)| n == name) {
+            *b = String::from_utf8_lossy(b)
+                .replacen(before, &format!("{text}{before}"), 1)
+                .into_bytes();
+        }
+    };
+    insert("[Content_Types].xml", "</Types>", &overrides);
+    insert(WB_RELS, "</Relationships>", &wb_rels);
+    insert(
+        "xl/workbook.xml",
+        "</workbook>",
+        &format!("<externalReferences>{refs}</externalReferences>"),
+    );
 }
 
 /// Sheet names Excel accepts, in order: at most 31 characters, none of
@@ -1149,6 +1166,35 @@ mod tests {
         assert!(!q.iter().any(|s| s.contains("no")), "{q:?}");
     }
 
+    /// As many links as the budget allows build in linear time, each with
+    /// its own workbook rel, and reload.
+    #[test]
+    fn many_links_build_in_linear_time() {
+        let n = Limits::default().links;
+        let mut book = BookIn::new();
+        book.external_links = (0..n)
+            .map(|i| ExternalLink {
+                book: "rId1".into(),
+                rels: vec![("rId1".into(), "t".into(), format!("B{i}.XLAM"), None)],
+                sheets: Vec::new(),
+                names: vec![format!("F{i}")],
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let pkg = book.build();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let workbook = String::from_utf8(pkg.part("xl/workbook.xml").unwrap().to_vec()).unwrap();
+        let rels = crate::xlsx::parse_rels(&String::from_utf8_lossy(
+            pkg.part("xl/_rels/workbook.xml.rels").unwrap(),
+        ));
+        let ids: std::collections::HashSet<_> = rels.iter().map(|r| r.0.clone()).collect();
+        assert_eq!(ids.len(), rels.len());
+        assert_eq!(workbook.matches("<externalReference ").count(), n);
+        let started = std::time::Instant::now();
+        crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&pkg)).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
     #[test]
     fn many_sheets_build_in_linear_time_and_too_many_are_refused() {
         let mut book = BookIn::new();
@@ -1188,6 +1234,7 @@ mod tests {
             repeat_cells: 3,
             repeat_bytes: 100,
             sheets: 2,
+            links: 1,
         });
         book.charge_cells(10).unwrap();
         assert!(
