@@ -10660,24 +10660,38 @@ mod tests {
 
     #[test]
     fn deleting_a_cell_of_a_frozen_block_keeps_the_others() {
-        // #777 r2: a frozen anchor never re-spills, so an edit inside its
-        // block must not clear the rest of its cached values — on row 0 and
-        // off it, through undo, redo and a save.
+        // #777 r2/r3: a frozen anchor never re-spills. Deleting a cell of its
+        // block is a no-op, as deleting a spilled cell is in Excel: values,
+        // extent and saved `ref` stay, through undo and redo. Typing a value
+        // there breaks the block but keeps the other cached cells. Legacy
+        // CSE and dynamic-array blocks, on row 0 and off it.
         let n = |v: f64| CellValue::Number(v);
+        let cached = vec![n(7.0), n(8.0), n(9.0)];
+        let blocks = [
+            (0u32, 4u32, false),
+            (10, 5, false),
+            (0, 6, true),
+            (10, 7, true),
+        ];
         let mut pkg = new_xlsx();
         let sheet = &mut pkg.workbook.sheets[0];
         sheet.set_cell(0, 0, Cell::number(1.0));
-        for (top, col) in [(0u32, 4u32), (10, 5)] {
-            let anchor = cell_name(top, col);
-            let last = cell_name(top + 2, col);
+        for (top, col, dynamic) in blocks {
+            let range = format!("{}:{}", cell_name(top, col), cell_name(top + 2, col));
             sheet.set_cell(
                 top,
                 col,
                 Cell {
                     value: n(7.0),
                     formula: Some("PIVOTBY(A1,4)".into()),
-                    f_attrs: Some(format!("t=\"array\" ref=\"{anchor}:{last}\"")),
+                    f_attrs: Some(format!("t=\"array\" ref=\"{range}\"")),
                     spill: Some((3, 1)),
+                    meta: dynamic.then(|| {
+                        Box::new(gridcore::sheet::CellMeta {
+                            dynamic: true,
+                            ..Default::default()
+                        })
+                    }),
                     ..Cell::default()
                 },
             );
@@ -10686,29 +10700,40 @@ mod tests {
         }
         let mut app = App::new(pkg, "test.xlsx");
         app.os_clip = None;
-        for (top, col) in [(0u32, 4u32), (10, 5)] {
+        for (top, col, dynamic) in blocks {
+            let at = format!("{} dynamic={dynamic}", cell_name(top, col));
             let block = |app: &App| col_values(app, col, top, top + 2);
-            let deleted = vec![n(7.0), CellValue::Empty, n(9.0)];
+            let extent = |app: &App| app.pkg.workbook.sheets[0].cell(top, col).unwrap().spill;
             app.apply(vec![(top + 1, col, Cell::default())]);
-            assert_eq!(block(&app), deleted, "delete at row {top}");
+            assert_eq!(block(&app), cached, "delete at {at}");
+            assert_eq!(extent(&app), Some((3, 1)), "delete at {at}");
             app.undo();
-            assert_eq!(
-                block(&app),
-                vec![n(7.0), n(8.0), n(9.0)],
-                "undo at row {top}"
-            );
+            assert_eq!(block(&app), cached, "undo at {at}");
+            assert_eq!(extent(&app), Some((3, 1)), "undo at {at}");
             app.redo();
-            assert_eq!(block(&app), deleted, "redo at row {top}");
-            let re = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&app.pkg)).unwrap();
-            let saved: Vec<CellValue> = (top..top + 3)
-                .map(|r| {
-                    re.workbook.sheets[0]
-                        .cell(r, col)
-                        .map_or(CellValue::Empty, |cl| cl.value.clone())
-                })
+            assert_eq!(block(&app), cached, "redo at {at}");
+            assert_eq!(extent(&app), Some((3, 1)), "redo at {at}");
+            let saved = gridcore::xlsx::save_xlsx(&app.pkg);
+            let re = gridcore::xlsx::load_xlsx(&saved).unwrap();
+            let ws =
+                String::from_utf8_lossy(re.part("xl/worksheets/sheet1.xml").unwrap()).into_owned();
+            let range = format!("{}:{}", cell_name(top, col), cell_name(top + 2, col));
+            assert!(
+                ws.contains(&format!(r#"<f t="array" ref="{range}">"#)),
+                "{at}: {ws}"
+            );
+            let values: Vec<CellValue> = (top..top + 3)
+                .map(|r| re.workbook.sheets[0].cell(r, col).unwrap().value.clone())
                 .collect();
-            assert_eq!(saved, deleted, "saved at row {top}");
+            assert_eq!(values, cached, "saved at {at}");
         }
+        // Typing a value into a frozen block keeps its other cached cells.
+        app.apply(vec![(1, 4, Cell::number(5.0))]);
+        assert_eq!(col_values(&app, 4, 0, 2), vec![n(7.0), n(5.0), n(9.0)]);
+        app.undo();
+        assert_eq!(col_values(&app, 4, 0, 2), cached);
+        app.redo();
+        assert_eq!(col_values(&app, 4, 0, 2), vec![n(7.0), n(5.0), n(9.0)]);
     }
 
     #[test]

@@ -262,7 +262,8 @@ impl Engine {
     /// own, overwriting (or, on a scalar result, clearing) what they hold. So
     /// it is dropped and the anchor re-spills on its own recalc. Callers that
     /// submit an anchor together with its spilled values blank those first
-    /// ([`crate::sheet::spill_children`]), or they would block it.
+    /// (a paste: [`crate::sheet::spill_children`]; undo/redo snapshots:
+    /// [`crate::sheet::snapshot_cells`]), or they would block it.
     ///
     /// Known limitation: an unsupported (frozen) anchor never re-evaluates, so
     /// after a restore its extent stays `None` (`A1#` is `#REF!`); its spilled
@@ -270,14 +271,33 @@ impl Engine {
     fn put_cell(&mut self, wb: &mut Workbook, key: Key, mut cell: Cell) {
         cell.spill = None;
         let (s, r, c) = key;
+        let owner = wb.sheets.get(s).and_then(|sh| spill_owner(sh, r, c));
+        let owner_frozen = owner.is_some_and(|((ar, ac), _)| self.is_frozen(wb, (s, ar, ac)));
+        // Deleting a cell of a frozen anchor's block (or putting back the
+        // value it holds, as undo/redo of that does) is a no-op but for the
+        // style, as deleting a spilled cell is in Excel: the anchor never
+        // re-spills, so its block must stay whole — cached values, extent
+        // and the `ref` the writer gives it.
+        if owner_frozen && cell.formula.is_none() {
+            if let Some(sheet) = wb.sheets.get_mut(s) {
+                let held = sheet.cell(r, c);
+                let same = held.is_none_or(|h| h.formula.is_none())
+                    && (cell.value.is_empty() || held.is_some_and(|h| h.value == cell.value));
+                if same {
+                    match sheet.cells.get_mut(&(r, c)) {
+                        Some(h) => h.style = cell.style,
+                        None => sheet.set_cell(r, c, cell),
+                    }
+                    return;
+                }
+            }
+        }
         // Drop stale bookkeeping for this address.
         self.formulas.remove(&key);
         self.circular.remove(&key);
         self.unsupported.remove(&key);
         self.spill_blocked.remove(&key);
         let mut changed = vec![key];
-        let owner = wb.sheets.get(s).and_then(|sh| spill_owner(sh, r, c));
-        let owner_frozen = owner.is_some_and(|((ar, ac), _)| self.is_frozen(wb, (s, ar, ac)));
         if let Some(sheet) = wb.sheets.get_mut(s) {
             // Replacing a spill anchor orphans its spilled cells: clear them.
             if let Some(ext) = sheet.cell(r, c).and_then(|cl| cl.spill) {
@@ -285,8 +305,9 @@ impl Engine {
             }
             // An edit landing inside another anchor's spill breaks that
             // spill: clear its cells and let the anchor recalc to #SPILL!.
-            // A frozen anchor never re-spills, so its other cached cells stay
-            // as they are (plain values now that it has no extent).
+            // A frozen anchor never re-spills, so content typed into its
+            // block leaves its other cached cells as they are (plain values
+            // now that it has no extent).
             if let Some((anchor, ext)) = owner {
                 if !owner_frozen {
                     changed.extend(clear_spill(sheet, s, anchor, ext, None));

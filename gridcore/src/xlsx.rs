@@ -10744,6 +10744,34 @@ b",
     }
 
     #[test]
+    fn deleting_a_cell_of_a_frozen_dynamic_array_keeps_its_block() {
+        // #777 r3: a loaded `cm` dynamic array the engine can't evaluate is
+        // frozen. Deleting one of its cells is a no-op (Excel's too): it
+        // saves whole, not as an anchor over plain constants that Excel's
+        // recalc would block with #SPILL!.
+        let rows = concat!(
+            r#"<row r="1"><c r="A1"><v>1</v></c><c r="E1" cm="1"><f t="array" ref="E1:E3">_xlfn.PIVOTBY(A1,4)</f><v>7</v></c></row>"#,
+            r#"<row r="2"><c r="E2"><v>8</v></c></row>"#,
+            r#"<row r="3"><c r="E3"><v>9</v></c></row>"#,
+        );
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 1, 4), Cell::default());
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(0, 4).unwrap().spill,
+            Some((3, 1))
+        );
+        let ws = saved_sheet1(&pkg);
+        assert!(
+            ws.contains(
+                r#"<c r="E1" cm="1"><f t="array" ref="E1:E3">_xlfn.PIVOTBY(A1,4)</f><v>7</v></c>"#
+            ),
+            "{ws}"
+        );
+        assert!(ws.contains(r#"<c r="E2"><v>8</v></c>"#), "{ws}");
+    }
+
+    #[test]
     fn cm_is_written_only_on_an_array_formula() {
         // A data-table `<f>` is kept verbatim but is not a dynamic array.
         let rows = r#"<row r="1"><c r="A1"><v>1</v></c><c r="G1" cm="1"><f t="dataTable" ref="G1:G2" dt2D="0" dtr="0" r1="A1"/><v>1</v></c></row>"#;

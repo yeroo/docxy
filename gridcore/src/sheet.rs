@@ -238,9 +238,9 @@ pub fn anchor_pasted_array_ref(cell: &mut Cell, current: Option<&Cell>, row: u32
 /// spill extent of another cell in `cells` and hold no formula: spill output
 /// that the anchor re-creates. The engine drops a submitted extent
 /// ([`crate::engine::Engine::set_cell`] recomputes it), so a paste of a whole
-/// spill block, or an undo/redo snapshot of one, puts these as blanks
-/// ([`Cell::blank_like`]): put back as plain values they would be foreign
-/// content blocking the anchor with `#SPILL!`.
+/// spill block puts these as blanks ([`Cell::blank_like`]): pasted as plain
+/// values they would be foreign content blocking the anchor with `#SPILL!`.
+/// (Undo/redo snapshots do the same through [`snapshot_cells`].)
 pub fn spill_children<'a, I>(cells: I) -> HashSet<(u32, u32)>
 where
     I: IntoIterator<Item = ((u32, u32), &'a Cell)> + Clone,
