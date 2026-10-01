@@ -87,6 +87,9 @@ if ($Sections -contains 'addin') {
 $addin = Join-Path $PSScriptRoot "..\corpus\legacy\addin"
 New-Item -ItemType Directory -Force $addin | Out-Null
 $addin = (Resolve-Path $addin).Path
+# SaveAs over an existing file hung Excel here (no dialog shows under
+# automation), so the old outputs go first.
+Remove-Item (Join-Path $addin "*.xls*") -ErrorAction SilentlyContinue
 $library = Join-Path (Split-Path $Excel) "Library\EUROTOOL.XLAM"
 $p = Start-Process $Excel -ArgumentList "/automation","-Embedding" -PassThru
 Start-Sleep -Seconds 8
@@ -107,6 +110,31 @@ try {
   $wb.SaveAs((Join-Path $addin "addin-udf.xlsx"), 51)
   $wb.SaveAs((Join-Path $addin "addin-udf.xlsb"), 50)
   $wb.Close($false)
+
+  # ext-name: names of an ordinary workbook (a range and a constant), which
+  # the .xlsb stores the same way, a ptgNameX into a BrtSupBookSrc book, but
+  # with a formula per name and the book's cells cached. The import doesn't
+  # read those, so the formulas are dropped and the values kept. The source
+  # workbook is saved first so the link names it.
+  $src = $xl.Workbooks.Add()
+  $s = $src.Worksheets.Item(1)
+  $s.Name = "P"
+  $s.Range("A1").Value2 = 3
+  $s.Range("A2").Value2 = 4
+  $src.Names.Add("Prices", "=P!`$A`$1:`$A`$2") | Out-Null
+  $src.Names.Add("Half", "=0.5") | Out-Null
+  $src.SaveAs((Join-Path $addin "ext-name-src.xlsx"), 51)
+  $wb = $xl.Workbooks.Add()
+  $ws = $wb.Worksheets.Item(1)
+  $ws.Name = "Data"
+  $ws.Range("A1").Formula = "=SUM('ext-name-src.xlsx'!Prices)"
+  $ws.Range("A2").Formula = "='ext-name-src.xlsx'!Half*2"
+  $xl.Calculate()
+  $wb.CheckCompatibility = $false
+  $wb.SaveAs((Join-Path $addin "ext-name.xlsx"), 51)
+  $wb.SaveAs((Join-Path $addin "ext-name.xlsb"), 50)
+  $wb.Close($false)
+  $src.Close($false)
 } finally {
   $xl.Quit(); [Runtime.InteropServices.Marshal]::ReleaseComObject($xl) | Out-Null
   Start-Sleep 2; if (!$p.HasExited) { $p.Kill() }

@@ -19,6 +19,10 @@ it. It calls `EUROCONVERT` from the add-in that ships with Office
 test doesn't cover it (that test needs all three formats). Instead, two tests
 in `gridcore/tests/legacy.rs` check that the `.xlsb` import and its save as
 `.xlsx` keep the formula and the link the way Excel's `.xlsx` has them (#888).
+`ext-name` (with its source `ext-name-src.xlsx`) calls names of an ordinary
+workbook instead: `SUM([1]!Prices)` and `[1]!Half*2`. Its `.xlsb` stores those
+names the same way, but each has a definition and the book's cells are cached,
+and the import reads neither. So the formulas are dropped and the values kept.
 
 ## The test over this corpus (runs in CI)
 
