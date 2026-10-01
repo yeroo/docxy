@@ -468,6 +468,11 @@ pub fn validate_replace_range(doc: &Document, start: usize, end: usize) -> Resul
 /// case being a single empty paragraph). Returns `(replaced, undo_steps)`:
 /// the number of original paragraphs replaced, and the checkpoint count.
 ///
+/// The end paragraph's section mark (its sectPr and tracked sectPr change)
+/// stays on the last replacing paragraph, or on a new empty paragraph after a
+/// trailing table, which adds one block beyond `blocks.len()`. Marks on
+/// paragraphs before `end` are removed with the range (#801).
+///
 /// Validates bounds/paragraph-kind ([`validate_replace_range`]) before the
 /// "non-empty `blocks`" check — same order as [`insert_blocks`], see
 /// [`validate_insert_at`]'s doc comment for why.
