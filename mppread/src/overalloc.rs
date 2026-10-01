@@ -20,7 +20,7 @@ fn u32_at(b: &[u8], at: usize) -> u32 {
 fn f64_at(b: &[u8], at: usize) -> f64 {
     f64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
-fn stream(cfb: &Cfb, table: &str, name: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn stream(cfb: &Cfb, table: &str, name: &str) -> Result<Vec<u8>, String> {
     let suffix = format!("{table}/{name}");
     let path = cfb
         .paths()
@@ -30,7 +30,12 @@ fn stream(cfb: &Cfb, table: &str, name: &str) -> Result<Vec<u8>, String> {
     cfb.read_path(&path)
         .ok_or_else(|| format!("missing {suffix}"))
 }
-fn count(meta: &[u8], stride: usize, data_len: usize, minimum: usize) -> Result<usize, String> {
+pub(crate) fn count(
+    meta: &[u8],
+    stride: usize,
+    data_len: usize,
+    minimum: usize,
+) -> Result<usize, String> {
     if meta.len() < 16 || meta[..4] != [0xba, 0xad, 0xdf, 0xfa] {
         return Err("invalid fixed table header".into());
     }

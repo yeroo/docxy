@@ -95,6 +95,18 @@ const PHYSICAL_PERCENT_KEY: u16 = 0x045f;
 /// Current-layout Var2Data RTF task notes, validated against Project's
 /// step-07 snapshot and its MSPDI export.
 const TASK_NOTES_KEY: u16 = 0x000f;
+/// Keyed Var2Data fields located by diffing the paired task-extra cases
+/// (corpus/tools/gen_mpp_task_extra_cases.py), each against a plain task in
+/// the same plan: UTF-16 text, four-byte timestamps, and a u16 code.
+const CONTACT_KEY: u16 = 0x0070;
+const WBS_LEVEL_KEY: u16 = 0x018d;
+const PRE_LEVELED_START_KEY: u16 = 0x0171;
+const PRE_LEVELED_FINISH_KEY: u16 = 0x0172;
+const COMMITMENT_TYPE_KEY: u16 = 0x047b;
+const COMMITMENT_START_KEY: u16 = 0x0480;
+const COMMITMENT_FINISH_KEY: u16 = 0x0481;
+/// Fixed2Meta DisplayAsSummary flag (task-extra/e3-display-as-summary).
+const DISPLAY_AS_SUMMARY_FLAG: (usize, u8) = (9, 0x10);
 const LEGACY: TaskLayout = TaskLayout {
     length: 264,
     start: 88,
@@ -218,6 +230,27 @@ struct VarFields {
     notes: HashMap<u32, String>,
     physical_percent: HashMap<u32, u8>,
     wbs: HashMap<u32, String>,
+    extra: HashMap<u32, VarExtra>,
+}
+
+/// The #417 task elements Project keeps as keyed Var2Data.
+#[derive(Default)]
+struct VarExtra {
+    contact: Option<String>,
+    wbs_level: Option<String>,
+    pre_leveled_start: Option<String>,
+    pre_leveled_finish: Option<String>,
+    commitment_start: Option<String>,
+    commitment_finish: Option<String>,
+    commitment_type: Option<i32>,
+}
+
+/// A keyed four-byte timestamp; NA is no date.
+fn var_date(value: &[u8], uid: u32, what: &str) -> Result<Option<String>, String> {
+    (value.len() == 4)
+        .then(|| crate::mpp::decode_checked_timestamp(value, 0).ok())
+        .flatten()
+        .ok_or_else(|| format!("invalid {what} for UID {uid}"))
 }
 
 fn var_fields(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<VarFields, String> {
@@ -237,6 +270,7 @@ fn var_fields(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<VarFields, St
     let mut notes = HashMap::new();
     let mut physical_percent = HashMap::new();
     let mut wbs = HashMap::new();
+    let mut extra: HashMap<u32, VarExtra> = HashMap::new();
     for i in 0..count {
         let e = &vm[24 + i * 12..24 + (i + 1) * 12];
         let uid = u32_at(e, 0);
@@ -269,6 +303,37 @@ fn var_fields(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<VarFields, St
                 .filter(|&p| p <= 100)
                 .ok_or_else(|| format!("invalid physical percent complete for UID {uid}"))?;
             physical_percent.insert(uid, percent as u8);
+        } else {
+            let value = &v2[header_end..end];
+            // An empty text is no value: Project's XML omits the element.
+            let text =
+                |what| decode_text(v2, off, uid, what, true).map(|s| (!s.is_empty()).then_some(s));
+            let row = extra.entry(uid).or_default();
+            match key {
+                CONTACT_KEY => row.contact = text("contact")?,
+                WBS_LEVEL_KEY => row.wbs_level = text("WBS level")?,
+                PRE_LEVELED_START_KEY => {
+                    row.pre_leveled_start = var_date(value, uid, "pre-leveled start")?
+                }
+                PRE_LEVELED_FINISH_KEY => {
+                    row.pre_leveled_finish = var_date(value, uid, "pre-leveled finish")?
+                }
+                COMMITMENT_START_KEY => {
+                    row.commitment_start = var_date(value, uid, "commitment start")?
+                }
+                COMMITMENT_FINISH_KEY => {
+                    row.commitment_finish = var_date(value, uid, "commitment finish")?
+                }
+                COMMITMENT_TYPE_KEY => {
+                    // MSPDI CommitmentType is 0..=2; e7-commitment-type stores 2.
+                    let code = (value.len() == 2)
+                        .then(|| u16_at(value, 0))
+                        .filter(|&c| c <= 2)
+                        .ok_or_else(|| format!("invalid commitment type for UID {uid}"))?;
+                    row.commitment_type = Some(i32::from(code));
+                }
+                _ => {}
+            }
         }
     }
     if names.len() != uids.len() {
@@ -279,6 +344,7 @@ fn var_fields(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<VarFields, St
         notes,
         physical_percent,
         wbs,
+        extra,
     })
 }
 
@@ -300,6 +366,7 @@ fn current_fields(
     uid: u32,
     wbs: Option<String>,
     notes: Option<String>,
+    extra: VarExtra,
 ) -> Result<MppTaskFields, String> {
     let task_type = projcore::TaskType::from_code(i64::from(u16_at(rec, 140)))
         .ok_or_else(|| format!("invalid task type for UID {uid}"))?;
@@ -358,6 +425,16 @@ fn current_fields(
         is_subproject_read_only: Some(meta[15] & 0x80 != 0),
         external_task: Some(meta[15] & 0x40 != 0),
         milestone: Some(meta[10] & 0x02 != 0),
+        contact: extra.contact,
+        wbs_level: extra.wbs_level,
+        pre_leveled_start: extra.pre_leveled_start,
+        pre_leveled_finish: extra.pre_leveled_finish,
+        commitment_start: extra.commitment_start,
+        commitment_finish: extra.commitment_finish,
+        commitment_type: Some(extra.commitment_type.unwrap_or(0)),
+        display_as_summary: Some(
+            fixed2.meta[DISPLAY_AS_SUMMARY_FLAG.0] & DISPLAY_AS_SUMMARY_FLAG.1 != 0,
+        ),
         ..MppTaskFields::default()
     })
 }
@@ -607,6 +684,20 @@ pub(crate) fn decode_table(bytes: &[u8]) -> Result<Table, String> {
                     }
                 }
             }
+            // Both live outside the task table; an unreadable source leaves
+            // the field unknown rather than refusing the plan.
+            let live: HashSet<_> = tasks.iter().filter(|t| !t.is_null).map(|t| t.uid).collect();
+            let published = crate::publish::decode(&cfb, &live).unwrap_or_default();
+            let subprojects = props_data
+                .as_ref()
+                .and_then(|p| crate::props::subproject_names(p).ok());
+            for task in &mut tasks {
+                if let Some(fields) = &mut task.fields {
+                    fields.is_published = published.get(&task.uid).copied();
+                    fields.subproject_name =
+                        subprojects.as_ref().and_then(|s| s.get(&task.uid).cloned());
+                }
+            }
             let new_tasks_are_manual = props_data
                 .as_ref()
                 .ok_or_else(|| "missing project Props stream".to_string())
@@ -648,7 +739,7 @@ fn decode_current(
         .filter(|r| !r.is_null)
         .map(|r| r.uid)
         .collect();
-    let var = var_fields(vm, v2, &uids)?;
+    let mut var = var_fields(vm, v2, &uids)?;
     let mut out = Vec::new();
     let mut wbs_parts = [0u32; 21];
     for (row, fixed2) in indexed.into_iter().zip(fixed2) {
@@ -733,6 +824,7 @@ fn decode_current(
                     .cloned()
                     .or_else(|| default_wbs_mask.then_some(default_wbs)),
                 var.notes.get(&row.uid).cloned(),
+                var.extra.remove(&row.uid).unwrap_or_default(),
             )?),
             ..MppTask::default()
         });
@@ -1272,6 +1364,96 @@ mod tests {
                 b.milestone
             )
         );
+    }
+
+    #[test]
+    fn task_extra_keys_and_flag_decode_and_survive_mspdi_round_trip() {
+        let mut s = fixture();
+        let fields = |s: &Streams| decode(&file(s, true)).unwrap()[1].fields.clone().unwrap();
+        let plain = fields(&s);
+        assert_eq!(plain.contact, None);
+        assert_eq!(plain.wbs_level, None);
+        assert_eq!(plain.pre_leveled_start, None);
+        assert_eq!(plain.commitment_finish, None);
+        // Project exports CommitmentType and DisplayAsSummary on every row.
+        assert_eq!(plain.commitment_type, Some(0));
+        assert_eq!(plain.display_as_summary, Some(false));
+        // No assignment table here: Publish is unknown, not guessed.
+        assert_eq!(plain.is_published, None);
+
+        let text = |v: &str| {
+            let mut b: Vec<u8> = v.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            b.extend_from_slice(&[0, 0]);
+            b
+        };
+        // The exact values of task-extra e1, e4, e5, e6, e7, e8 and e9.
+        add_var(&mut s, 1, CONTACT_KEY, &text("Jürgen Ölmann, Строитель"));
+        add_var(&mut s, 1, WBS_LEVEL_KEY, &text("Level 2"));
+        add_var(&mut s, 1, COMMITMENT_START_KEY, &[0xc0, 0x12, 0x2b, 0x3c]);
+        add_var(&mut s, 1, COMMITMENT_FINISH_KEY, &[0xd8, 0x27, 0x2c, 0x3c]);
+        add_var(&mut s, 1, COMMITMENT_TYPE_KEY, &2u16.to_le_bytes());
+        add_var(&mut s, 1, PRE_LEVELED_START_KEY, &[0xc0, 0x12, 0x2d, 0x3c]);
+        add_var(&mut s, 1, PRE_LEVELED_FINISH_KEY, &[0xd8, 0x27, 0x2e, 0x3c]);
+        // UID 1's Fixed2Meta entry is FixedMeta entry 4.
+        s.f2m[16 + 4 * 96 + DISPLAY_AS_SUMMARY_FLAG.0] |= DISPLAY_AS_SUMMARY_FLAG.1;
+        let set = fields(&s);
+        assert_eq!(set.contact.as_deref(), Some("Jürgen Ölmann, Строитель"));
+        assert_eq!(set.wbs_level.as_deref(), Some("Level 2"));
+        assert_eq!(set.commitment_start.as_deref(), Some("2026-03-03 08:00"));
+        assert_eq!(set.commitment_finish.as_deref(), Some("2026-03-04 17:00"));
+        assert_eq!(set.commitment_type, Some(2));
+        assert_eq!(set.pre_leveled_start.as_deref(), Some("2026-03-05 08:00"));
+        assert_eq!(set.pre_leveled_finish.as_deref(), Some("2026-03-06 17:00"));
+        assert_eq!(set.display_as_summary, Some(true));
+        assert_eq!(
+            fields(&fixture()).display_as_summary,
+            Some(false),
+            "the flag is UID 1's own"
+        );
+
+        let imported = crate::project::project_from_mpp(&file(&s, true)).unwrap();
+        let reread = projcore::mspdi::read_mspdi(&projcore::mspdi::write_mspdi(&imported)).unwrap();
+        for task in [&imported.tasks[0], &reread.tasks[0]] {
+            assert_eq!(task.contact.as_deref(), Some("Jürgen Ölmann, Строитель"));
+            assert_eq!(task.wbs_level.as_deref(), Some("Level 2"));
+            assert_eq!(task.commitment_type, Some(2));
+            assert_eq!(task.display_as_summary, Some(true));
+            let date = |d: Option<projcore::DateTime>| d.unwrap().to_mspdi();
+            assert_eq!(date(task.commitment_start), "2026-03-03T08:00:00");
+            assert_eq!(date(task.commitment_finish), "2026-03-04T17:00:00");
+            assert_eq!(date(task.pre_leveled_start), "2026-03-05T08:00:00");
+            assert_eq!(date(task.pre_leveled_finish), "2026-03-06T17:00:00");
+        }
+
+        // Malformed values refuse the table, as the neighbouring keyed fields do.
+        for (key, value, error) in [
+            (
+                COMMITMENT_TYPE_KEY,
+                &3u16.to_le_bytes()[..],
+                "invalid commitment type",
+            ),
+            (COMMITMENT_TYPE_KEY, &[2][..], "invalid commitment type"),
+            (
+                PRE_LEVELED_START_KEY,
+                &[0xc0, 0x12, 0x2d][..],
+                "invalid pre-leveled start",
+            ),
+            (
+                COMMITMENT_FINISH_KEY,
+                &[0x41, 0x38, 0x2c, 0x3c][..],
+                "invalid commitment finish",
+            ),
+            (CONTACT_KEY, &[0x41, 0][..], "unterminated contact"),
+        ] {
+            let mut bad = fixture();
+            add_var(&mut bad, 1, key, value);
+            let err = decode(&file(&bad, true)).unwrap_err();
+            assert!(err.contains(error), "{key:#x}: {err}");
+        }
+        // An empty text is no value.
+        let mut empty = fixture();
+        add_var(&mut empty, 1, CONTACT_KEY, &[0, 0]);
+        assert_eq!(fields(&empty).contact, None);
     }
 
     #[test]

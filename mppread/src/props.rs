@@ -100,6 +100,90 @@ pub(crate) fn default_calendar_name(b: &[u8]) -> Result<Option<String>, String> 
     Ok(Some(name))
 }
 
+/// Inserted-project table (task-fields/f6-subprojects, two inserted plans):
+/// a `u32` block length, a `u32` count, the `u32` end of an index of `u32`
+/// entries whose low half is a block offset, then four entries per item: a
+/// 20-byte header (type `1` at +16), the task UID, and two OLE File Monikers
+/// (MS-OLEDS 2.3.7) for the path and the relative name. Project's XML
+/// SubprojectName is the path moniker's Unicode extension. Other item types
+/// have no oracle and make the table unknown.
+const SUBPROJECTS: u32 = 0x0240_00a2;
+const FILE_MONIKER: [u8; 16] = [3, 3, 0, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46];
+
+fn file_moniker_path(b: &[u8], at: usize) -> Result<String, String> {
+    let bad = || "unrecognized subproject file moniker".to_string();
+    let u16_at = |o: usize| {
+        b.get(o..o + 2)
+            .map(|s| u16::from_le_bytes(s.try_into().unwrap()))
+    };
+    let u32_at = |o: usize| b.get(o..o + 4).map(|s| u32_at(s, 0) as usize);
+    if b.get(at..at + 16) != Some(&FILE_MONIKER[..]) || u16_at(at + 16) != Some(0) {
+        return Err(bad());
+    }
+    let ansi_len = u32_at(at + 18).ok_or_else(bad)?;
+    let tail = (at + 22).checked_add(ansi_len).ok_or_else(bad)?;
+    if u16_at(tail) != Some(0xffff)
+        || u16_at(tail + 2) != Some(0xdead)
+        || b.get(tail + 4..tail + 24)
+            .is_none_or(|r| r.iter().any(|&x| x != 0))
+    {
+        return Err(bad());
+    }
+    let size = u32_at(tail + 24).ok_or_else(bad)?;
+    let bytes = u32_at(tail + 28).ok_or_else(bad)?;
+    let start = tail + 34;
+    if size == 0
+        || size != bytes + 6
+        || u16_at(tail + 32) != Some(3)
+        || !bytes.is_multiple_of(2)
+        || start + bytes > b.len()
+    {
+        return Err(bad());
+    }
+    let units: Vec<u16> = b[start..start + bytes]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect();
+    String::from_utf16(&units)
+        .ok()
+        .filter(|path| !path.is_empty() && !path.chars().any(char::is_control))
+        .ok_or_else(bad)
+}
+
+/// SubprojectName by task UID; no table means no inserted projects.
+pub(crate) fn subproject_names(b: &[u8]) -> Result<HashMap<u32, String>, String> {
+    let entries = entries(b)?;
+    let Some(block) = entries.get(&SUBPROJECTS) else {
+        return Ok(HashMap::new());
+    };
+    let bad = || "unrecognized subproject table".to_string();
+    if block.len() < 12 || u32_at(block, 0) as usize != block.len() {
+        return Err(bad());
+    }
+    let index_end = u32_at(block, 8) as usize;
+    if index_end < 12 || index_end > block.len() || !(index_end - 12).is_multiple_of(16) {
+        return Err(bad());
+    }
+    let offset = |i: usize| u32_at(block, 12 + i * 4) as usize & 0xffff;
+    let mut out = HashMap::new();
+    for item in 0..(index_end - 12) / 16 {
+        let [header, uid, path] = [0, 1, 2].map(|k| offset(item * 4 + k));
+        if block.get(header + 16) != Some(&1) || uid + 4 > block.len() {
+            return Err(bad());
+        }
+        let task_uid = u32_at(block, uid);
+        if out
+            .insert(task_uid, file_moniker_path(block, path)?)
+            .is_some()
+        {
+            return Err(format!("duplicate subproject for task UID {task_uid}"));
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn new_tasks_are_manual(b: &[u8]) -> Result<bool, String> {
     match entries(b)?.get(&NEW_TASKS_ARE_MANUAL) {
         Some([0, 0]) => Ok(false),
@@ -186,6 +270,71 @@ mod tests {
             (NEW_TASKS_ARE_MANUAL, &[0, 0]),
         ]);
         assert!(new_tasks_are_manual(&dup).is_err());
+    }
+
+    /// An OLE File Moniker as Project writes it: the 8.3 ANSI path, then the
+    /// long Unicode path as the extension.
+    fn moniker(ansi: &str, unicode: &str) -> Vec<u8> {
+        let mut m = FILE_MONIKER.to_vec();
+        m.extend_from_slice(&0u16.to_le_bytes());
+        m.extend_from_slice(&(ansi.len() as u32 + 1).to_le_bytes());
+        m.extend_from_slice(ansi.as_bytes());
+        m.push(0);
+        m.extend_from_slice(&[0xff, 0xff, 0xad, 0xde]);
+        m.extend_from_slice(&[0; 20]);
+        let wide: Vec<u8> = unicode.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        m.extend_from_slice(&(wide.len() as u32 + 6).to_le_bytes());
+        m.extend_from_slice(&(wide.len() as u32).to_le_bytes());
+        m.extend_from_slice(&3u16.to_le_bytes());
+        m.extend_from_slice(&wide);
+        m
+    }
+
+    /// The f6-subprojects table shape: one item per (task UID, path).
+    fn subprojects(items: &[(u32, &str)], kind: u8) -> Vec<u8> {
+        let index_end = 12 + items.len() * 16;
+        let mut index = Vec::new();
+        let mut body = Vec::new();
+        for (uid, path) in items {
+            let mut header = vec![0u8; 20];
+            header[16] = kind;
+            let parts = [
+                header,
+                uid.to_le_bytes().to_vec(),
+                moniker("C:\\SHORT~1.MPP", path),
+                moniker("\\SHORT~1.MPP", "\\name.mpp"),
+            ];
+            for part in parts {
+                index.extend_from_slice(&((index_end + body.len()) as u32).to_le_bytes());
+                body.extend(part);
+            }
+        }
+        let mut block = Vec::new();
+        block.extend_from_slice(&((index_end + body.len()) as u32).to_le_bytes());
+        block.extend_from_slice(&9u32.to_le_bytes());
+        block.extend_from_slice(&(index_end as u32).to_le_bytes());
+        block.extend(index);
+        block.extend(body);
+        stream(&[(SUBPROJECTS, &block)])
+    }
+
+    #[test]
+    fn subproject_names_read_the_long_path_of_each_inserted_project() {
+        let long = "C:\\Users\\Jürgen\\Планы\\f6-child.mpp";
+        let names = subproject_names(&subprojects(&[(2, long), (3, "D:\\b.mpp")], 1)).unwrap();
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[&2], long);
+        assert_eq!(names[&3], "D:\\b.mpp");
+        assert_eq!(subproject_names(&stream(&[])), Ok(HashMap::new()));
+        // Item types other than f6's have no oracle.
+        assert!(subproject_names(&subprojects(&[(2, long)], 3)).is_err());
+        assert!(subproject_names(&subprojects(&[(2, long), (2, long)], 1)).is_err());
+        let mut torn = subprojects(&[(2, long)], 1);
+        let wide: Vec<u8> = long.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let path = torn.windows(wide.len()).position(|w| w == wide).unwrap();
+        // The size before the byte count and key: they no longer agree.
+        torn[path - 10] ^= 1;
+        assert!(subproject_names(&torn).is_err());
     }
 
     #[test]

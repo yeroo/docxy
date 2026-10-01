@@ -403,6 +403,16 @@ fn import_tasks(
                 task.is_subproject_read_only = fields.is_subproject_read_only;
                 task.over_allocated = fields.over_allocated;
                 task.milestone = fields.milestone.unwrap_or(false);
+                task.contact = fields.contact.clone();
+                task.wbs_level = fields.wbs_level.clone();
+                task.pre_leveled_start = date(&fields.pre_leveled_start, "pre-leveled start")?;
+                task.pre_leveled_finish = date(&fields.pre_leveled_finish, "pre-leveled finish")?;
+                task.commitment_start = date(&fields.commitment_start, "commitment start")?;
+                task.commitment_finish = date(&fields.commitment_finish, "commitment finish")?;
+                task.commitment_type = fields.commitment_type;
+                task.display_as_summary = fields.display_as_summary;
+                task.is_published = fields.is_published;
+                task.subproject_name = fields.subproject_name.clone();
             }
             task.manual_start = date(&t.manual_start, "manual start")?;
             task.manual_finish = date(&t.manual_finish, "manual finish")?;
