@@ -117,8 +117,9 @@ def published(app):
     inactive.Active = False
     add(p, "Plain inactive").Active = False
     tasks = save(app, "e2-published")
-    # Project exports IsPublished=0 for every summary and inactive task, even
-    # one published while it was ordinary: only the ordinary direction exports.
+    # A summary or inactive task without a marked assignment exports
+    # IsPublished=0, even one published while it was ordinary. A summary with
+    # a direct assignment follows the assignment rule (f9 "Direct summary").
     for name, value in (("Plain", "1"), ("Unpublished", "0"), ("Published summary", "0"),
                         ("Plain summary", "0"), ("Published inactive", "0"),
                         ("Plain inactive", "0")):

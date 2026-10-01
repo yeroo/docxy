@@ -105,8 +105,10 @@ pub(crate) fn default_calendar_name(b: &[u8]) -> Result<Option<String>, String> 
 /// entries whose low half is a block offset, then four entries per item: a
 /// 20-byte header (type `1` at +16), the task UID, and two OLE File Monikers
 /// (MS-OLEDS 2.3.7) for the path and the relative name. Project's XML
-/// SubprojectName is the path moniker's Unicode extension. Other item types
-/// have no oracle and make the table unknown.
+/// SubprojectName is the path moniker's Unicode extension or, when the
+/// moniker has none, its ASCII ANSI path; a non-ASCII ANSI path without an
+/// extension leaves that item unnamed. Other item types have no oracle and
+/// make the table unknown.
 const SUBPROJECTS: u32 = 0x0240_00a2;
 const FILE_MONIKER: [u8; 16] = [3, 3, 0, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46];
 

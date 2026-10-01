@@ -263,8 +263,10 @@ summary with a direct assignment follows the same rule
 to set Publish on a summary or inactive task, and `e2-published` shows a task
 published while ordinary exporting 0 once it becomes a summary or inactive. The subproject table holds a
 20-byte header (type 1 in `f6`), the task UID and two OLE File Monikers per
-inserted project; SubprojectName is the path moniker's Unicode extension. Other
-item types and malformed tables leave SubprojectName absent. Project also
+inserted project; SubprojectName is the path moniker's Unicode extension or,
+when the moniker has none, its ASCII ANSI path. A non-ASCII ANSI path without
+an extension leaves that item unnamed; other item types and malformed tables
+leave SubprojectName absent. Project also
 exports a childless DisplayAsSummary task as `Summary=1`; the importer keeps it
 a leaf, as it does a childless inserted subproject.
 
