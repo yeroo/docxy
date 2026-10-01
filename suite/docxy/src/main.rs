@@ -7221,6 +7221,10 @@ fn window_frame_borders(window: &Window) -> Edges<f32> {
 /// shadows are its padding and each untiled edge adds a snapped inner border.
 /// The pinned TitleBar separately adds left padding and a fullscreen inset.
 fn title_bar_geometry(window: &Window) -> f32 {
+    // Workaround for gpui-component's TitleBar `#bar` being flex_shrink_0
+    // (docs/upstream-gpui-component-titlebar.md, #545): a definite content
+    // width keeps a wide strip from pushing the window controls off-screen.
+    // Simplify once a pin bump ships the upstream fix.
     #[cfg(target_os = "macos")]
     const TITLE_LEFT_PAD: f32 = 80.0;
     #[cfg(not(target_os = "macos"))]
@@ -8894,6 +8898,11 @@ impl Docxy {
             | Region::TabMoreItem(_) => self.probes.borrow()
                 .get(&harness::region_name(region))
                 .ok_or_else(|| format!("{} is not visible", harness::region_name(region))),
+            Region::TabChip(i) => self
+                .probes
+                .borrow()
+                .get(&format!("tab-chip:{i}"))
+                .ok_or_else(|| format!("tab chip {i} is not visible")),
             Region::Gantt
             | Region::Bar(_)
             | Region::ProjectHbarTable
@@ -22804,6 +22813,29 @@ impl Docxy {
     }
 }
 
+/// The drag payload for a title-chip drag: the source tab's absolute index,
+/// so a drop reorders by indices, plus its title for the floating preview.
+/// Cloned into the view gpui draws under the cursor — the same pattern as
+/// `TimelineDrag` in `project/timeline.rs`.
+#[derive(Clone)]
+struct TabDrag {
+    ix: usize,
+    title: SharedString,
+}
+
+impl Render for TabDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(hsla_u(0xffffff))
+            .border_1()
+            .text_size(px(12.))
+            .child(self.title.clone())
+    }
+}
+
 impl Docxy {
     fn tab_prev(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active > 0 {
@@ -22836,6 +22868,22 @@ impl Docxy {
         if self.tab_more_open {
             self.select_tab(i, window, cx);
         }
+    }
+
+    /// Reorder the tabs by drag (#545): move the tab at `from` to index `to`.
+    /// Mirrors `select_tab`'s housekeeping — grid state is kept per active
+    /// document, and the indices it uses just changed.
+    fn move_tab(&mut self, from: usize, to: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_project_passes(cx);
+        self.project_prompt_cancel();
+        self.close_menu();
+        self.tab_more_open = false;
+        if tabstrip::move_index(&mut self.tabs, &mut self.active, from, to) {
+            self.drop_grid_state();
+            self.persist();
+            cx.notify();
+        }
+        self.refocus(window, cx);
     }
 
     fn tab_more_popup(&self, window: &Window, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
@@ -23090,6 +23138,21 @@ impl Render for Docxy {
                                 this.close_tab(i, window, cx);
                             })),
                     )
+                    // Drag to reorder (#545): the payload names the source
+                    // index, the drop target names its own. The probe is the
+                    // `tab-chip:<i>` region pointer verbs resolve.
+                    .child(probe(&self.probes, format!("tab-chip:{i}")))
+                    .on_drag(
+                        TabDrag {
+                            ix: i,
+                            title: tb.title.clone(),
+                        },
+                        |d, _, _, cx| cx.new(|_| d.clone()),
+                    )
+                    .drag_over::<TabDrag>(move |s, _, _, _| s.bg(border))
+                    .on_drop(cx.listener(move |this, d: &TabDrag, window, cx| {
+                        this.move_tab(d.ix, i, window, cx)
+                    }))
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.select_tab(i, window, cx)),
                     )

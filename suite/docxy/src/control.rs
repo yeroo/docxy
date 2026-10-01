@@ -286,6 +286,10 @@ pub(crate) struct Done {
     pub quit: bool,
     /// Draw one frame before replying. **macOS only** — see [`Done::ok_drawn`].
     pub draw: bool,
+    /// Mouse events the verb asked the pump to dispatch through gpui's own
+    /// hit testing after the entity borrow above it has ended (#545). A
+    /// dispatch inside `update_in` would double-borrow the app.
+    pub pointer: Vec<gpui::PlatformInput>,
 }
 
 impl Done {
@@ -294,6 +298,7 @@ impl Done {
             result,
             quit: false,
             draw: false,
+            pointer: Vec::new(),
         })
     }
 
@@ -326,6 +331,7 @@ impl Done {
             result,
             quit: false,
             draw: cfg!(target_os = "macos"),
+            pointer: Vec::new(),
         })
     }
 }
@@ -361,7 +367,18 @@ pub(crate) fn attach_with_dispatch(
             match target.update_in(cx, |this, window, cx| {
                 dispatch(this, &req.verb, &req.args, window, cx)
             }) {
-                Ok(Ok(done)) => {
+                Ok(Ok(mut done)) => {
+                    // Pointer verbs queue real input: dispatch it through
+                    // gpui's own hit testing now, outside the entity borrow,
+                    // so the listeners it triggers may update the app.
+                    if !done.pointer.is_empty() {
+                        let events = std::mem::take(&mut done.pointer);
+                        let _ = cx.update(|window, cx| {
+                            for event in events {
+                                window.dispatch_event(event, cx);
+                            }
+                        });
+                    }
                     // Before the reply, so a driver that reads the frame
                     // counter and then polls it sees it actually move.
                     if done.draw {

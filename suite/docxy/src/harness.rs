@@ -31,7 +31,10 @@ use crate::{CONFIG_DIR_ENV, RefTarget, SheetView};
 use ctlcore::json::Json;
 use docxcore::editor::{Editor, FlatDocument, StoryOffset};
 use docxcore::model::{Align, VertAlign};
-use gpui::{App, Context, Entity, KeyDownEvent, Keystroke, Pixels, Point, Window, point, px, size};
+use gpui::{
+    App, Context, Entity, KeyDownEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, PlatformInput, Point, Window, point, px, size,
+};
 use gridcore::sheet::{cell_name, parse_cell_name, parse_range_name};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -748,6 +751,9 @@ pub enum Region {
     TabNext,
     TabMore,
     TabMoreItem(usize),
+    /// One visible title-bar chip, by absolute tab index — the same index
+    /// `tab-list` reports. Absent while the chip is scrolled out of the strip.
+    TabChip(usize),
     /// The scrolling cell area of the grid: below the column header, above the
     /// sheet-tab row.
     Grid,
@@ -778,7 +784,7 @@ pub enum Region {
 /// Parse a region name: `window`, `grid`, `chart-panel`, `cell:B3`,
 /// `cell:A1:C5`, `chart:0`, `gantt`, `bar:3`, `project-hbar-table`,
 /// `project-hbar-chart`, `project-vbar`, `project-timeline`, `project-split`,
-/// `gallery`.
+/// `gallery`, `tab-chip:0`.
 ///
 /// `cell:` takes a range as readily as a single cell, so an assertion about a
 /// selection border names the selection rather than its two corners.
@@ -800,6 +806,13 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
                 .parse::<usize>()
                 .map_err(|_| "'tab-more-item' needs a numeric index".to_string())?;
             Ok(Region::TabMoreItem(i))
+        }
+        "tab-chip" => {
+            let i = arg
+                .ok_or("'tab-chip' needs an index")?
+                .parse::<usize>()
+                .map_err(|_| "'tab-chip' needs a numeric index".to_string())?;
+            Ok(Region::TabChip(i))
         }
         "grid" if arg.is_none() => Ok(Region::Grid),
         "chart-panel" if arg.is_none() => Ok(Region::ChartPanel),
@@ -844,7 +857,7 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
             Ok(Region::Chart(i))
         }
         other => Err(format!(
-            "unknown region '{other}' (window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery)"
+            "unknown region '{other}' (window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery)"
         )),
     }
 }
@@ -859,6 +872,7 @@ pub fn region_name(region: Region) -> String {
         Region::TabNext => "tab-next".into(),
         Region::TabMore => "tab-more".into(),
         Region::TabMoreItem(i) => format!("tab-more-item:{i}"),
+        Region::TabChip(i) => format!("tab-chip:{i}"),
         Region::Grid => "grid".into(),
         Region::ChartPanel => "chart-panel".into(),
         Region::Cells(r0, c0, r1, c1) => format!("cell:{}", a1_range((r0, c0, r1, c1))),
@@ -872,6 +886,115 @@ pub fn region_name(region: Region) -> String {
         Region::ProjectSplit => "project-split".into(),
         Region::Gallery => "gallery".into(),
     }
+}
+
+// ---- real pointer input (#545) ---------------------------------------------
+//
+// `pointer-click`/`pointer-drag` build `PlatformInput` mouse events and queue
+// them on the reply; the control pump dispatches them through
+// `Window::dispatch_event` after the entity borrow ends. Hit testing then
+// runs against the last rendered frame exactly as an OS click would — the
+// only way this harness exercises hit order (the more-tabs list over the
+// sheet's fill handle) rather than calling a handler.
+
+/// The 10 points a `pointer-drag` visits: the two ends plus 8 interpolated
+/// moves strictly between them. gpui arms a drag only after the pressed
+/// pointer moves past a 2px threshold, so the first move already does.
+fn pointer_drag_path(from: Point<Pixels>, to: Point<Pixels>) -> Vec<Point<Pixels>> {
+    let mut path = Vec::with_capacity(10);
+    path.push(from);
+    for step in 1..=8 {
+        let t = step as f32 / 9.0;
+        path.push(point(
+            px(f32::from(from.x) + t * (f32::from(to.x) - f32::from(from.x))),
+            px(f32::from(from.y) + t * (f32::from(to.y) - f32::from(from.y))),
+        ));
+    }
+    path.push(to);
+    path
+}
+
+/// Which more-tabs item's recorded bounds contain `p` — the drift guard a
+/// `pointer-click` reply reports, or -1 when the point is over no item.
+fn item_at_point(probes: &crate::Probes, p: Point<Pixels>) -> i64 {
+    probes
+        .last
+        .iter()
+        .find_map(|(name, bounds)| {
+            name.strip_prefix("tab-more-item:")
+                .and_then(|rest| rest.parse::<usize>().ok())
+                .filter(|_| bounds.contains(&p))
+                .map(|i| i as i64)
+        })
+        .unwrap_or(-1)
+}
+
+fn mouse_move(p: Point<Pixels>, pressed: Option<MouseButton>) -> PlatformInput {
+    PlatformInput::MouseMove(MouseMoveEvent {
+        position: p,
+        pressed_button: pressed,
+        modifiers: Modifiers::default(),
+    })
+}
+
+fn mouse_down(p: Point<Pixels>) -> PlatformInput {
+    PlatformInput::MouseDown(MouseDownEvent {
+        button: MouseButton::Left,
+        position: p,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    })
+}
+
+fn mouse_up(p: Point<Pixels>) -> PlatformInput {
+    PlatformInput::MouseUp(MouseUpEvent {
+        button: MouseButton::Left,
+        position: p,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+    })
+}
+
+/// The hover-press-release a `pointer-click` dispatches at `p`.
+fn click_events(p: Point<Pixels>) -> Vec<PlatformInput> {
+    vec![mouse_move(p, None), mouse_down(p), mouse_up(p)]
+}
+
+/// The press-moves-release a `pointer-drag` dispatches along `path`: an
+/// unpressed hover and the press at the start, pressed moves (which arm and
+/// carry the drag) along the middle, the release at the end.
+fn drag_events(path: &[Point<Pixels>]) -> Vec<PlatformInput> {
+    let mut events = Vec::with_capacity(path.len() + 1);
+    events.push(mouse_move(path[0], None));
+    events.push(mouse_down(path[0]));
+    events.extend(
+        path[1..path.len() - 1]
+            .iter()
+            .map(|&p| mouse_move(p, Some(MouseButton::Left))),
+    );
+    events.push(mouse_up(path[path.len() - 1]));
+    events
+}
+
+/// The centre of a named region's recorded bounds — where a pointer verb
+/// presses or releases. Errors name the region.
+fn region_point(app: &crate::Docxy, name: &str, window: &Window) -> Result<Point<Pixels>, String> {
+    let region = parse_region(name)?;
+    let bounds = app
+        .region_bounds(region, window)
+        .map_err(|e| format!("{name}: {e}"))?;
+    Ok(bounds.center())
+}
+
+/// The active sheet's fill-handle point: the bottom-right corner of its
+/// selection, which is where the grid centres the handle's hitbox.
+fn fill_handle_point(app: &crate::Docxy) -> Result<Point<Pixels>, String> {
+    let v = app
+        .active_sheet()
+        .ok_or_else(|| "the active tab is not a spreadsheet".to_string())?;
+    let br = (v.sel.0.max(v.anchor.0), v.sel.1.max(v.anchor.1));
+    Ok(app.cells_bounds(br, br)?.bottom_right())
 }
 
 /// A rectangle in physical screen pixels: what a harness crops a window capture
@@ -2769,6 +2892,64 @@ pub fn dispatch(
             Done::ok(state(app, window))
         }
 
+        // Real pointer input (#545): the events queue on the reply and the
+        // pump dispatches them after this borrow ends, so they hit-test
+        // exactly like an OS click. `item` is the drift guard for the
+        // fill-handle case: which more-tabs item the point landed on.
+        "pointer-click" => {
+            app.refuse_under_dialog()?;
+            let p = match (args.get("region"), args.get("at")) {
+                (Some(region), None) => {
+                    let name = region.as_str().ok_or("'region' must be a region name")?;
+                    region_point(app, name, window)?
+                }
+                (None, Some(at)) => match at.as_str() {
+                    Some("fill-handle") => fill_handle_point(app)?,
+                    Some(other) => {
+                        return Err(format!("unknown pointer target '{other}' (fill-handle)"));
+                    }
+                    None => return Err("'at' must be a string".into()),
+                },
+                (Some(_), Some(_)) => {
+                    return Err("pointer-click takes exactly one of 'region' or 'at'".into());
+                }
+                (None, None) => return Err("pointer-click needs 'region' or 'at'".into()),
+            };
+            let mut done = Done::ok(Json::obj(vec![
+                ("x", Json::Num(f64::from(p.x))),
+                ("y", Json::Num(f64::from(p.y))),
+                (
+                    "item",
+                    Json::Num(item_at_point(&app.probes.borrow(), p) as f64),
+                ),
+            ]))?;
+            done.pointer = click_events(p);
+            Ok(done)
+        }
+        "pointer-drag" => {
+            app.refuse_under_dialog()?;
+            let from_name = arg_str(args, "from")?;
+            let to_name = arg_str(args, "to")?;
+            let from = region_point(app, from_name, window)?;
+            let to = region_point(app, to_name, window)?;
+            let path = pointer_drag_path(from, to);
+            let mut done = Done::ok(Json::obj(vec![
+                (
+                    "from",
+                    Json::Arr(vec![
+                        Json::Num(f64::from(from.x)),
+                        Json::Num(f64::from(from.y)),
+                    ]),
+                ),
+                (
+                    "to",
+                    Json::Arr(vec![Json::Num(f64::from(to.x)), Json::Num(f64::from(to.y))]),
+                ),
+            ]))?;
+            done.pointer = drag_events(&path);
+            Ok(done)
+        }
+
         // Save As without the native dialog (#699), which a harness instance
         // must never open (its modal loop stops the control pump). The target
         // the dialog would have answered with goes to the same save functions
@@ -3127,6 +3308,7 @@ pub fn dispatch(
                 result: Json::obj(vec![("quitting", Json::Bool(true))]),
                 quit: true,
                 draw: false,
+                pointer: Vec::new(),
             })
         }
 
@@ -4116,6 +4298,8 @@ mod tests {
             "rect",
             "ping",
             "task.set",
+            "pointer-click",
+            "pointer-drag",
         ] {
             assert!(!closes_menu(verb, &Json::obj(vec![])), "{verb}");
         }
@@ -4123,6 +4307,17 @@ mod tests {
         assert!(closes_menu("backstage", &action("open")));
         assert!(closes_menu("backstage", &action("close")));
         assert!(!closes_menu("backstage", &action("read")), "a read");
+    }
+
+    /// #545: a real pointer event reaches the menu's own backdrop or item, so
+    /// pointer verbs must NOT pre-close an open menu the way the
+    /// handler-calling press verbs do — pre-closing would eat a pointer click
+    /// aimed at a menu item.
+    #[test]
+    fn pointer_verbs_do_not_preclose_the_menu() {
+        let no_args = Json::obj(vec![]);
+        assert!(!closes_menu("pointer-click", &no_args));
+        assert!(!closes_menu("pointer-drag", &no_args));
     }
 
     /// #397: no menu opens or runs while File or the more-tabs list covers
@@ -5172,6 +5367,7 @@ mod tests {
             Region::TabNext,
             Region::TabMore,
             Region::TabMoreItem(19),
+            Region::TabChip(3),
             Region::Grid,
             Region::ChartPanel,
             Region::Cells(2, 1, 2, 1),
@@ -5197,6 +5393,65 @@ mod tests {
         assert!(parse_region("project-split:1").is_err());
         assert!(parse_region("bar:abc").is_err());
         assert!(parse_region("bar:").is_err());
+        assert!(parse_region("tab-chip").is_err());
+        assert!(parse_region("tab-chip:x").is_err());
+    }
+
+    /// #545: a drag crosses gpui's 2px drag threshold via the 8 pressed moves,
+    /// and the press/release land exactly on the region centres.
+    #[test]
+    fn pointer_drag_path_visits_the_ends_with_eight_moves_between() {
+        let from = point(px(10.), px(20.));
+        let to = point(px(410.), px(220.));
+        let path = pointer_drag_path(from, to);
+        assert_eq!(path.len(), 10, "the two ends plus 8 moves");
+        assert_eq!(path.first(), Some(&from), "press at the source");
+        assert_eq!(path.last(), Some(&to), "release at the target");
+        let mut last_dist = 0.0f32;
+        for (i, p) in path.iter().enumerate() {
+            // Endpoints are asserted above; intermediates are strictly
+            // between the ends on each axis (or on it when the drag is
+            // constant on that axis).
+            if i != 0 && i != path.len() - 1 {
+                for (v, a, b) in [
+                    (f32::from(p.x), f32::from(from.x), f32::from(to.x)),
+                    (f32::from(p.y), f32::from(from.y), f32::from(to.y)),
+                ] {
+                    let (lo, hi) = (a.min(b), a.max(b));
+                    assert!(
+                        (v > lo && v < hi) || (lo == hi && v == lo),
+                        "step {i}: {v} not inside [{lo}, {hi}]"
+                    );
+                }
+            }
+            let dist = ((f32::from(p.x) - f32::from(from.x)).powi(2)
+                + (f32::from(p.y) - f32::from(from.y)).powi(2))
+            .sqrt();
+            assert!(dist >= last_dist, "step {i} regresses");
+            last_dist = dist;
+        }
+    }
+
+    /// #545: the pointer-click reply names the more-tabs item whose probe
+    /// bounds contain the clicked point, or -1 — the drift guard that keeps
+    /// the fill-handle case honest about where the point landed.
+    #[test]
+    fn item_at_point_picks_the_containing_more_tabs_item() {
+        let mut probes = crate::Probes::default();
+        let item = |i: usize, y: f32| {
+            (
+                format!("tab-more-item:{i}"),
+                gpui::Bounds::new(point(px(100.), px(y)), size(px(220.), px(28.))),
+            )
+        };
+        probes.last = vec![item(0, 40.), item(1, 68.), item(2, 96.)];
+        assert_eq!(item_at_point(&probes, point(px(150.), px(80.))), 1);
+        // A point over no item's bounds — beside the list, or past its end.
+        assert_eq!(item_at_point(&probes, point(px(400.), px(80.))), -1);
+        assert_eq!(item_at_point(&probes, point(px(150.), px(300.))), -1);
+        // No probes recorded yet (no frame drawn): nothing contains the point.
+        let empty = crate::Probes::default();
+        assert_eq!(item_at_point(&empty, point(px(150.), px(80.))), -1);
     }
 
     // ---- logical rect -> physical screen pixels ----
