@@ -643,6 +643,11 @@ mod tests {
             sheet(&cut, vec![((0, 0), num(7.0))]),
             sheet("Data", vec![((0, 0), num(1.0))]),
             sheet("Data", vec![((0, 0), num(2.0))]),
+            // A raw name with `:`, between sheets named A and B: references
+            // to 'A:B'! mean it, not the span A..B.
+            sheet("A", vec![((0, 0), num(100.0))]),
+            sheet("A:B", vec![((0, 0), num(3.0)), ((1, 0), num(4.0))]),
+            sheet("B", vec![((0, 0), num(200.0))]),
             sheet(
                 "Calc",
                 vec![
@@ -651,6 +656,8 @@ mod tests {
                     ((2, 0), f("Data!A1")),
                     // A 3D span, Excel's quoted spelling, with a renamed end.
                     ((3, 0), f(&format!("SUM('{cut}:{long}'!A1)"))),
+                    ((4, 0), f("'A:B'!A1")),
+                    ((5, 0), f("SUM('A:B'!A1:A2)")),
                 ],
             ),
         ] {
@@ -660,6 +667,11 @@ mod tests {
             name: "TheVal".into(),
             scope: None,
             formula: format!("'{long}'!$A$1"),
+        });
+        book.names.push(DefinedName {
+            name: "Colon".into(),
+            scope: None,
+            formula: "'A:B'!$A$2".into(),
         });
         let mut pkg = book.build();
         let wb = &mut pkg.workbook;
@@ -671,18 +683,26 @@ mod tests {
                 &format!("{} (2)", "L".repeat(27)),
                 "Data",
                 "Data (2)",
+                "A",
+                "A_B",
+                "B",
                 "Calc"
             ]
         );
         let mut engine = crate::engine::Engine::new(wb);
         engine.recalc_all(wb);
-        let calc = &wb.sheets[4];
+        let calc = &wb.sheets[7];
         assert_eq!(calc.cell(0, 0).unwrap().value, CellValue::Number(10.0));
         assert_eq!(calc.cell(1, 0).unwrap().value, CellValue::Number(7.0));
         assert_eq!(calc.cell(2, 0).unwrap().value, CellValue::Number(1.0));
         // 'cut:long' spans sheets 1..0 → the renamed ends span 0..1: 7 + 5.
         assert_eq!(calc.cell(3, 0).unwrap().value, CellValue::Number(12.0));
+        // 'A:B'! is the sheet now named A_B: 3, and 3 + 4, not A..B sums.
+        assert_eq!(calc.cell(4, 0).unwrap().formula.as_deref(), Some("A_B!A1"));
+        assert_eq!(calc.cell(4, 0).unwrap().value, CellValue::Number(3.0));
+        assert_eq!(calc.cell(5, 0).unwrap().value, CellValue::Number(7.0));
         assert_eq!(wb.defined_names[0].formula, format!("{cut}!$A$1"));
+        assert_eq!(wb.defined_names[1].formula, "A_B!$A$2");
     }
 
     /// Renames cost only the formulas they touch: 4,096 renamed sheets and
