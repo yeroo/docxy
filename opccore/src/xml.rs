@@ -39,6 +39,8 @@ pub struct XmlParser<'a> {
     pending_end: bool,
     /// Byte index of the `<` of the most recent start tag (for raw capture).
     m_start: usize,
+    /// Sticky: set once any token so far was malformed.
+    malformed: bool,
 }
 
 fn is_ws(c: u8) -> bool {
@@ -69,7 +71,18 @@ impl<'a> XmlParser<'a> {
             markup_compatibility_scope_counts: Vec::new(),
             pending_end: false,
             m_start: 0,
+            malformed: false,
         }
+    }
+
+    /// True once any token read so far was malformed: an end tag with
+    /// trailing content or no `>`, an unterminated comment, PI, CDATA section,
+    /// declaration or start tag, a bare `<` at end of input, an attribute
+    /// without a quoted value, a `/` not followed by `>`, or an empty element
+    /// name. Events are unchanged: the parser stays permissive, and callers
+    /// that must be strict check this.
+    pub fn is_malformed(&self) -> bool {
+        self.malformed
     }
 
     /// Byte index of the `<` of the current start tag.
@@ -248,6 +261,7 @@ impl<'a> XmlParser<'a> {
             }
             self.pos += 1; // consume '<'
             if self.pos >= size {
+                self.malformed = true;
                 return Event::Eof;
             }
             let c = self.xml[self.pos];
@@ -257,11 +271,17 @@ impl<'a> XmlParser<'a> {
                 let start = self.pos;
                 let gt = match self.find_from(self.pos, b'>') {
                     Some(x) => x,
-                    None => return Event::Eof,
+                    None => {
+                        self.malformed = true;
+                        return Event::Eof;
+                    }
                 };
                 let mut end = start;
                 while end < gt && !is_ws(self.xml[end]) {
                     end += 1;
+                }
+                if end == start || !self.xml[end..gt].iter().all(|&c| is_ws(c)) {
+                    self.malformed = true;
                 }
                 self.m_name = self.slice(start, end);
                 self.pos = gt + 1;
@@ -272,7 +292,10 @@ impl<'a> XmlParser<'a> {
             if c == b'?' {
                 self.pos = match self.xml[self.pos..].windows(2).position(|w| w == b"?>") {
                     Some(x) => self.pos + x + 2,
-                    None => size,
+                    None => {
+                        self.malformed = true;
+                        size
+                    }
                 };
                 continue;
             }
@@ -284,7 +307,10 @@ impl<'a> XmlParser<'a> {
                         .position(|w| w == b"-->")
                     {
                         Some(x) => self.pos + 3 + x + 3,
-                        None => size,
+                        None => {
+                            self.malformed = true;
+                            size
+                        }
                     };
                     continue;
                 }
@@ -300,6 +326,7 @@ impl<'a> XmlParser<'a> {
                             self.pos = e + 3;
                         }
                         None => {
+                            self.malformed = true;
                             self.m_text = self.slice(start, size);
                             self.pos = size;
                         }
@@ -308,7 +335,10 @@ impl<'a> XmlParser<'a> {
                 }
                 self.pos = match self.find_from(self.pos, b'>') {
                     Some(e) => e + 1,
-                    None => size,
+                    None => {
+                        self.malformed = true;
+                        size
+                    }
                 };
                 continue;
             }
@@ -320,6 +350,9 @@ impl<'a> XmlParser<'a> {
                 self.pos += 1;
             }
             self.m_name = self.slice(start, self.pos);
+            if self.m_name.is_empty() {
+                self.malformed = true;
+            }
             self.m_attrs.clear();
 
             loop {
@@ -327,6 +360,7 @@ impl<'a> XmlParser<'a> {
                     self.pos += 1;
                 }
                 if self.pos >= size {
+                    self.malformed = true;
                     return Event::Eof;
                 }
                 let d = self.xml[self.pos];
@@ -340,6 +374,8 @@ impl<'a> XmlParser<'a> {
                     self.pos += 1;
                     if self.pos < size && self.xml[self.pos] == b'>' {
                         self.pos += 1;
+                    } else {
+                        self.malformed = true;
                     }
                     self.pending_end = true;
                     self.push_namespace_scope();
@@ -368,7 +404,10 @@ impl<'a> XmlParser<'a> {
                         let vs = self.pos;
                         let ve = match self.find_from(self.pos, q) {
                             Some(x) => x,
-                            None => return Event::Eof,
+                            None => {
+                                self.malformed = true;
+                                return Event::Eof;
+                            }
                         };
                         self.m_attrs.push(XmlAttr {
                             name: an,
@@ -378,6 +417,7 @@ impl<'a> XmlParser<'a> {
                         continue;
                     }
                 }
+                self.malformed = true;
                 self.m_attrs.push(XmlAttr {
                     name: an,
                     value: "",
@@ -712,5 +752,67 @@ mod tests {
         }
         assert_eq!(names_started, ["w:p", "w:r", "w:rPr", "w:b", "w:t"]);
         assert_eq!(text, "Bold&text");
+    }
+
+    /// Drain the parser, returning `(event, name)` pairs and the final
+    /// malformed state.
+    fn drain(xml: &str) -> (Vec<(Event, String)>, bool) {
+        let mut p = XmlParser::new(xml);
+        let mut events = Vec::new();
+        loop {
+            let event = p.next();
+            events.push((event, p.name().to_string()));
+            if event == Event::Eof {
+                return (events, p.is_malformed());
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_flag_stays_clear_for_well_formed_input() {
+        let xml = concat!(
+            "<?xml version=\"1.0\"?><!DOCTYPE r><!-- c --><r xmlns:a=\"urn:a\" a:x='1'>",
+            "<?pi data?><a:e b = \"2\"/><![CDATA[<x>]]>t<e></e ></r>
+"
+        );
+        assert!(!drain(xml).1);
+    }
+
+    #[test]
+    fn malformed_flag_reports_each_malformed_token() {
+        for xml in [
+            "<r></r bogus>",
+            "<r></>",
+            "<r></r",
+            "<r></r><",
+            "<r></r><?pi",
+            "<r></r><!-- unterminated",
+            "<r><![CDATA[x</r>",
+            "<r></r><!DOCTYPE",
+            "<r",
+            "<r a=\"1",
+            "<r a>",
+            "<r a=1>",
+            "<r/x>",
+            "<r/",
+            "<>",
+            "< r>",
+        ] {
+            assert!(drain(xml).1, "{xml:?} should be malformed");
+        }
+    }
+
+    #[test]
+    fn malformed_end_tag_tail_keeps_events() {
+        let (events, malformed) = drain("<a></a bogus>");
+        assert!(malformed);
+        assert_eq!(
+            events,
+            [
+                (Event::Start, "a".to_string()),
+                (Event::End, "a".to_string()),
+                (Event::Eof, "a".to_string()),
+            ]
+        );
     }
 }
