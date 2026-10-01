@@ -517,6 +517,9 @@ pub fn autofill(
 fn rebase(cell: &mut Cell, dr: i64, dc: i64) {
     let dynamic = cell.meta.as_ref().is_some_and(|m| m.dynamic);
     cell.meta = None;
+    // The source's spill extent isn't the copy's: the engine would take the
+    // cells under it for the copy's own when it evaluates it.
+    cell.spill = None;
     if cell.f_attrs.take().is_some() && cell.formula.as_deref() == Some("") {
         // A shared-group follower whose master wouldn't parse carries no text of
         // its own; without the group marker there is no formula left to write.
@@ -1627,6 +1630,34 @@ mod tests {
         // The source keeps its own group intact.
         assert_eq!(cell(0).formula.as_deref(), Some("A1*2"));
         assert!(cell(0).f_attrs.is_some());
+    }
+
+    /// #785 r1: a copy of a spilling anchor doesn't bring the source's spill
+    /// extent. Evaluated after the suite's engine rebuild, a constant where
+    /// the copy would spill blocks it rather than being taken as its own.
+    #[test]
+    fn autofill_copy_of_a_spilling_anchor_never_takes_cells_under_its_spill() {
+        let mut w = wb(&[
+            ("A1", Cell::number(1.0)),
+            ("A2", Cell::number(2.0)),
+            ("A3", Cell::number(3.0)),
+            ("C2", Cell::number(99.0)),
+        ]);
+        let mut eng = crate::engine::Engine::new(&w);
+        eng.set_cell(&mut w, (0, 0, 1), Cell::formula("A1:A3*2"));
+        assert_eq!(w.sheets[0].cell(0, 1).unwrap().spill, Some((3, 1)));
+        assert_eq!(autofill(&mut w, 0, (0, 1, 0, 1), (0, 2)), 1);
+        assert_eq!(w.sheets[0].cell(0, 2).unwrap().spill, None);
+        let mut eng = crate::engine::Engine::new(&w);
+        eng.recalc_all(&mut w);
+        assert_eq!(
+            w.sheets[0].cell(1, 2).unwrap().value,
+            CellValue::Number(99.0)
+        );
+        assert_eq!(
+            w.sheets[0].cell(0, 2).unwrap().value,
+            CellValue::Error("#SPILL!".into())
+        );
     }
 
     #[test]

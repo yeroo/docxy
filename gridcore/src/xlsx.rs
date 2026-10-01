@@ -10762,7 +10762,7 @@ b",
     }
 
     #[test]
-    fn autofill_copy_carries_no_cell_metadata() {
+    fn autofill_copy_is_typed_and_drops_source_cm_vm() {
         let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SORT_ANCHOR))).unwrap();
         assert!(pkg.workbook.sheets[0].cell(0, 3).unwrap().meta.is_some());
         crate::edit::autofill(&mut pkg.workbook, 0, (0, 3, 0, 3), (0, 4));
