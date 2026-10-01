@@ -368,8 +368,9 @@ impl Default for PageSetup {
 
 impl PageSetup {
     /// Refuse values Excel's Page Setup refuses: a scale outside 10–400, a
-    /// fit count above 32767, a negative or non-finite margin, a header or
-    /// footer section over 255 characters.
+    /// fit count above 32767, a negative or non-finite margin, paper code 0,
+    /// a first page number of 0. Header and footer sections are checked
+    /// where they are typed ([`crate::print::hf::Sections::from_editor`]).
     pub fn validate(&self) -> Result<(), String> {
         if !SCALE_RANGE.contains(&self.scale) {
             return Err(format!(

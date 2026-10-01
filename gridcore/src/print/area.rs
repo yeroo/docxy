@@ -264,17 +264,23 @@ fn manual_attrs(row: bool) -> &'static str {
     }
 }
 
-/// Add (or make manual) the break whose page starts at `id`, kept in order.
+/// Add (or make manual) the break whose page starts at `id`. The list keeps
+/// the file's order, which need not be sorted, so it is searched in full; a
+/// new break goes before the first one with a larger id.
 fn add_break(breaks: &mut Vec<PageBreak>, id: u32, row: bool) -> bool {
-    match breaks.binary_search_by_key(&id, |b| b.id) {
-        Ok(i) if breaks[i].is_manual() => false,
-        Ok(i) => {
+    match breaks.iter().position(|b| b.id == id) {
+        Some(i) if breaks[i].is_manual() => false,
+        Some(i) => {
             breaks[i].attrs = manual_attrs(row).to_string();
             true
         }
-        Err(i) => {
+        None => {
+            let at = breaks
+                .iter()
+                .position(|b| b.id > id)
+                .unwrap_or(breaks.len());
             breaks.insert(
-                i,
+                at,
                 PageBreak {
                     id,
                     attrs: manual_attrs(row).to_string(),
@@ -434,6 +440,23 @@ mod tests {
         assert!(!remove_page_break(&mut s, 29, 5));
         assert!(reset_page_breaks(&mut s));
         assert!(s.row_breaks.is_empty() && s.col_breaks.is_empty());
+    }
+
+    #[test]
+    fn unsorted_breaks_from_a_file_get_no_duplicate() {
+        // FIX r1 m2: a file may list its breaks out of order.
+        let mut s = Sheet::default();
+        for id in [29, 13] {
+            s.row_breaks.push(PageBreak {
+                id,
+                attrs: " max=\"16383\" man=\"1\"".into(),
+            });
+        }
+        assert!(!insert_page_break(&mut s, 13, 0), "A14 already breaks");
+        assert_eq!(manual_breaks(&s).0, vec![29, 13]);
+        assert!(insert_page_break(&mut s, 20, 0));
+        // Before the first larger id; the file's order is otherwise kept.
+        assert_eq!(manual_breaks(&s).0, vec![20, 29, 13]);
     }
 
     #[test]

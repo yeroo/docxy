@@ -5065,6 +5065,10 @@ fn patch_sheet_names(xml: &str, sheets: &[Sheet]) -> String {
 /// `localSheetId`), a scoped one only when the scopes line up and no element
 /// has that name and scope. `_xlnm._FilterDatabase` is never added, since a
 /// save never adds the `<autoFilter>` it backs.
+///
+/// One kind of element is removed: a sheet's print area or print titles
+/// that the model no longer holds, under the same alignment rule (see
+/// [`patch_defined_name`]).
 fn patch_defined_names(xml: &str, names: &[DefinedName], sheet_count: usize) -> String {
     let aligned = xml.matches("<sheet ").count() == sheet_count;
     // (start, end, replacement): element contents, and where new names go.
@@ -5199,9 +5203,6 @@ fn patch_defined_names(xml: &str, names: &[DefinedName], sheet_count: usize) -> 
     out
 }
 
-/// Queue the new content of the `<definedName>` whose start tag the parser is
-/// on (not a self-closing one) where the model's definition differs, and
-/// leave the parser past its end tag. `false` when the part ends first.
 /// Where a `<definedName>` element starts, and how many sheets the model
 /// has, for [`patch_defined_name`].
 struct NameCtx {
@@ -5215,6 +5216,15 @@ fn removable_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("_xlnm.Print_Area") || name.eq_ignore_ascii_case("_xlnm.Print_Titles")
 }
 
+/// Queue the new content of the `<definedName>` whose start tag the parser is
+/// on (not a self-closing one) where the model's definition differs, and
+/// leave the parser past its end tag. `false` when the part ends first.
+///
+/// A `_xlnm.Print_Area` or `_xlnm.Print_Titles` element whose (name, scope)
+/// the model no longer has is queued for removal instead: Clear Print Area
+/// and clearing the titles delete the name. Only for a scoped key naming a
+/// model sheet (`scope < sheet_count`), which `key` already is only while the
+/// sheets line up; any other name the model lacks stays.
 fn patch_defined_name(
     xml: &str,
     p: &mut XmlParser,

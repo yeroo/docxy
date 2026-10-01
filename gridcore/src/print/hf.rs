@@ -39,6 +39,11 @@ pub fn encode(editor: &str) -> String {
             out.push('&');
             out.push(*code);
             rest = &rest[tok.len()..];
+        } else if rest.len() == 1 {
+            // A lone `&` ending the section would join the next section's
+            // `&C`/`&R` into `&&`: write it as a literal ampersand.
+            out.push_str("&&");
+            rest = "";
         } else {
             out.push('&');
             rest = &rest[1..];
@@ -317,6 +322,17 @@ mod tests {
         assert_eq!(Sections::parse("Page &P").center, "Page &P");
         // `&&L` is a literal "&L", not the left section.
         assert_eq!(Sections::parse("A&&LB").center, "A&&LB");
+    }
+
+    #[test]
+    fn a_trailing_ampersand_stays_in_its_section() {
+        // FIX r1 m5.
+        let s = Sections::from_editor("Smith &", "Page &[Page]", "").unwrap();
+        assert_eq!(s.compose(), "&LSmith &&&CPage &P");
+        let back = Sections::parse(&s.compose());
+        assert_eq!(back.left, "Smith &&");
+        assert_eq!(back.center, "Page &P");
+        assert_eq!(decode(&back.left), "Smith &&");
     }
 
     #[test]

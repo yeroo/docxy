@@ -501,10 +501,10 @@ pub struct Sheet {
     /// Excel on open.
     pub protection: Option<String>,
     /// Page breaks (manual and automatic) from the sheet's own `<rowBreaks>` /
-    /// `<colBreaks>`, not a custom view's, sorted by id. A save rewrites those
-    /// elements only when these differ from what the part holds, and adds one
-    /// only for breaks inserted on a sheet that had none
-    /// ([`crate::print::area::insert_page_break`]).
+    /// `<colBreaks>`, not a custom view's, in the file's order, which need
+    /// not be sorted. A save rewrites those elements only when these differ
+    /// from what the part holds, and adds one only for breaks inserted on a
+    /// sheet that had none ([`crate::print::area::insert_page_break`]).
     pub row_breaks: Vec<PageBreak>,
     pub col_breaks: Vec<PageBreak>,
     /// Margins, paper, scaling, print options and headers/footers. Edit
