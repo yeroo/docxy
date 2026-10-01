@@ -22,6 +22,7 @@ use opccore::xml::{Event, XmlParser};
 use opccore::zip::ZipArchive;
 use opccore::zipwrite::write_zip;
 
+mod page;
 mod repair;
 pub use repair::{Repairs, load_xlsx_repair};
 
@@ -2013,6 +2014,8 @@ fn parse_worksheet(
     // were never set), which is what we write back — Excel accepts expanded
     // formulas in place of shared groups.
     cap_array_refs(&mut sheet);
+    sheet.page_setup = page::read_page_setup(xml);
+    sheet.page_setup_loaded = sheet.page_setup.clone();
     sheet
 }
 
@@ -3600,6 +3603,8 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
     // edit moved them.
     let out = set_page_breaks(out, "rowBreaks", &sheet.row_breaks);
     let out = set_page_breaks(out, "colBreaks", &sheet.col_breaks);
+    // Page setup: only the attributes that changed since the load.
+    let out = page::set_page_setup(&out, &sheet.page_setup, &sheet.page_setup_loaded);
     // The sheet's autoFilter: rewritten only where a structural edit moved it.
     let out = set_auto_filter(out, sheet.auto_filter.as_ref());
     // Conditional formatting and data validation: likewise.

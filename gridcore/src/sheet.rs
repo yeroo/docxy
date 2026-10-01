@@ -506,6 +506,13 @@ pub struct Sheet {
     /// didn't have.
     pub row_breaks: Vec<PageBreak>,
     pub col_breaks: Vec<PageBreak>,
+    /// Margins, paper, scaling, print options and headers/footers. Edit
+    /// this; a save writes what differs from
+    /// [`Sheet::page_setup_loaded`].
+    pub page_setup: crate::print::setup::PageSetup,
+    /// The page setup the worksheet part held at load (the default for a
+    /// sheet with no part yet), so a save patches only what changed.
+    pub page_setup_loaded: crate::print::setup::PageSetup,
     /// Rows an applied filter hid, as opposed to rows hidden by hand: derived
     /// at load from the `<autoFilter>` criteria, and kept by the editor's own
     /// filter. In memory only. `SUBTOTAL(1..11)` skips these rows but counts
