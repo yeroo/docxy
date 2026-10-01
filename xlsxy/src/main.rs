@@ -2590,7 +2590,10 @@ impl App {
                 // The cut's clears go first, then the block through
                 // `Engine::paste_block`: a pasted spilling array still spills,
                 // and an array block pasted back in place, copy or cut, keeps
-                // its block. One undo step.
+                // its block. A clear landing in a frozen array block goes
+                // last (`Engine::split_frozen_blanks`): a no-op while the
+                // block is whole, it clears its cell once the paste has put
+                // content into the block. One undo step.
                 let (src, here) = (clip.sheet, self.sheet);
                 let clear_keys: Vec<_> = clears.iter().map(|&(r, c, _)| (r, c)).collect();
                 let keys = if same_sheet {
@@ -2599,12 +2602,22 @@ impl App {
                     vec![(src, clear_keys), (here, writes)]
                 };
                 self.record_groups(keys, |app| {
+                    let (clears, late) = if same_sheet {
+                        app.engine
+                            .split_frozen_blanks(&app.pkg.workbook, src, clears)
+                    } else {
+                        (clears, Vec::new())
+                    };
                     for (r, c, cell) in clears {
                         app.engine
                             .set_cell(&mut app.pkg.workbook, (src, r, c), cell);
                     }
                     app.engine
                         .paste_block(&mut app.pkg.workbook, here, (r0, c0), &block);
+                    for (r, c, cell) in late {
+                        app.engine
+                            .set_cell(&mut app.pkg.workbook, (src, r, c), cell);
+                    }
                 });
                 self.status = Some(if source_locked {
                     "Pasted (source sheet is protected; cut kept as copy)".to_string()
@@ -11816,6 +11829,28 @@ mod tests {
         app.redo();
         assert_eq!(col_values(&app, 4, 0, 2), replaced, "redo replace");
         assert_eq!(e1(&app), None, "redo replace");
+    }
+
+    #[test]
+    fn cutting_a_frozen_block_cell_into_the_block_clears_its_source() {
+        // #840 r3 p1: cut E3 of a frozen block, paste at E2. The clear of E3
+        // is a no-op while the block is whole, so it goes after the paste,
+        // which breaks the block: E3 is cleared, through undo and redo.
+        let n = |v: f64| CellValue::Number(v);
+        let mut app = app_with_frozen_block(Cell::number(8.0), Cell::number(9.0));
+        let moved = vec![n(7.0), n(9.0), CellValue::Empty];
+        app.anchor = None;
+        app.cur = (2, 4);
+        app.copy(true);
+        app.cur = (1, 4);
+        app.paste();
+        assert_eq!(col_values(&app, 4, 0, 2), moved, "paste");
+        app.undo();
+        assert_eq!(col_values(&app, 4, 0, 2), vec![n(7.0), n(8.0), n(9.0)]);
+        let extent = |app: &App| app.pkg.workbook.sheets[0].cell(0, 4).unwrap().spill;
+        assert_eq!(extent(&app), Some((3, 1)), "undo");
+        app.redo();
+        assert_eq!(col_values(&app, 4, 0, 2), moved, "redo");
     }
 
     #[test]

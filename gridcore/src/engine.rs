@@ -145,11 +145,17 @@ impl Engine {
     }
 
     /// [`Engine::is_frozen`] as the cell's inputs stand now: a formula of
-    /// ours is evaluated afresh, whatever an earlier evaluation met (an
+    /// ours not known to be supported is evaluated afresh, whatever an
+    /// earlier evaluation met (an
     /// input that made it unsupported, `INDIRECT` asked for R1C1 say, may
     /// have changed since). One kept on its cached value for what it is (a
     /// preserved `<f>`, a parse failure) stays so.
     fn is_frozen_now(&self, wb: &Workbook, key: Key) -> bool {
+        // Kept current: evaluation marks it, and an edit to the cell clears
+        // it. Only `unsupported` is sticky.
+        if self.supported.contains(&key) {
+            return false;
+        }
         self.evaluates_unsupported(wb, key)
             .unwrap_or_else(|| self.unsupported.contains(&key))
     }
@@ -303,15 +309,7 @@ impl Engine {
     /// block breaks it, and then the blank clears its cell like any other:
     /// applied last, it does so whatever order the group came in.
     pub fn set_cells(&mut self, wb: &mut Workbook, s: usize, changes: Vec<(u32, u32, Cell)>) {
-        let blanks: Vec<(u32, u32)> = changes
-            .iter()
-            .filter(|(_, _, cell)| cell.is_blank())
-            .map(|&(r, c, _)| (r, c))
-            .collect();
-        let later = self.blanks_in_frozen_blocks(wb, s, &blanks);
-        let (later, now): (Vec<_>, Vec<_>) = changes
-            .into_iter()
-            .partition(|(r, c, _)| later.contains(&(*r, *c)));
+        let (now, later) = self.split_frozen_blanks(wb, s, changes);
         for (r, c, cell) in now.into_iter().chain(later) {
             self.set_cell(wb, (s, r, c), cell);
         }
@@ -389,15 +387,7 @@ impl Engine {
         // As in [`Engine::set_cells`]: blanks landing in a frozen block go
         // after the rest, so the redo of a group that put a blank and a
         // value into one frozen block ends as the group did.
-        let blanks: Vec<(u32, u32)> = plain
-            .iter()
-            .filter(|(_, _, cell)| cell.is_blank())
-            .map(|&(r, c, _)| (r, c))
-            .collect();
-        let later = self.blanks_in_frozen_blocks(wb, s, &blanks);
-        let (later, now): (Vec<_>, Vec<_>) = plain
-            .into_iter()
-            .partition(|(r, c, _)| later.contains(&(*r, *c)));
+        let (now, later) = self.split_frozen_blanks(wb, s, plain);
         for (r, c, cell) in now.into_iter().chain(later) {
             self.restore_cell(wb, (s, r, c), cell);
         }
@@ -626,6 +616,31 @@ impl Engine {
             wb.sheets[s].set_cell(r, c, cell);
         }
         self.recalc_from(wb, &changed);
+    }
+
+    /// A group of edits to sheet `s` split in two, each in order: the rest,
+    /// and the blanks landing in a frozen array block as the sheet stands
+    /// ([`Engine::blanks_in_frozen_blocks`]), to be put after the rest. Such
+    /// a blank is a no-op while its block is whole, so it must come after
+    /// any content the group puts into the block ([`Engine::set_cells`]); a
+    /// host that writes a group in parts (a cut's clears, then its paste)
+    /// puts the second half after the last part.
+    pub fn split_frozen_blanks(
+        &self,
+        wb: &Workbook,
+        s: usize,
+        changes: Vec<(u32, u32, Cell)>,
+    ) -> (Vec<(u32, u32, Cell)>, Vec<(u32, u32, Cell)>) {
+        let blanks: Vec<(u32, u32)> = changes
+            .iter()
+            .filter(|(_, _, cell)| cell.is_blank())
+            .map(|&(r, c, _)| (r, c))
+            .collect();
+        let later = self.blanks_in_frozen_blocks(wb, s, &blanks);
+        let (later, now) = changes
+            .into_iter()
+            .partition(|(r, c, _)| later.contains(&(*r, *c)));
+        (now, later)
     }
 
     /// Which of `blanks` (cells a group is about to blank on sheet `s`) land
@@ -3801,6 +3816,13 @@ mod tests {
         eng.set_cells(&mut wb, 0, blanks);
         assert_eq!(FROZEN_EVALS.with(StdCell::get), 0);
         assert_eq!(value_at(&wb, "A11"), CellValue::Empty);
+        // #840 r3 m1: the same text again on an evaluated, supported
+        // formula is not evaluated to see whether it is frozen.
+        set(&mut eng, &mut wb, "B1", Cell::formula("SEQUENCE(2)"));
+        FROZEN_EVALS.with(|n| n.set(0));
+        set(&mut eng, &mut wb, "B1", Cell::formula("SEQUENCE(2)"));
+        assert_eq!(FROZEN_EVALS.with(StdCell::get), 0);
+        assert_eq!(value_at(&wb, "B2"), CellValue::Number(2.0));
     }
 
     #[test]
