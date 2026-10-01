@@ -182,6 +182,7 @@ Project's warning have no MSPDI field; projcore's unit tests check them.
 | `26-lag-percent-elapsed` | percentage and elapsed lags | ±% of the predecessor's duration, ±elapsed days across a weekend on FS/SS/FF/SF links, an estimated elapsed week, a working lag in hours; the lag and its `LagFormat` survive MSPDI and `.yppx` |
 | `27-manual-summary` | manually scheduled summaries | a manual summary keeps its own Start/Finish: a short one under an auto summary (whose slack its fixed span bounds), one whose finish is the project finish, its start flooring an ASAP subtask, a link pushing one past it and an MSO subtask ignoring it |
 | `28-work-weeks` | alternate work weeks | date-ranged weekday changes, non-working Friday, extra Saturday inherited by Alice, fallback to the calendar's default week and base chain, and exception precedence (#218) |
+| `29-milestone-snet-fnet-instants` | SNET/FNET milestone instants | a zero-duration SNET/FNET milestone holds its constraint instant — at a period end, at a working start, and inside a non-working gap — as Project 2024 does (#779) |
 
 File 28 records a Project 2024 precedence probe. Standard has a default Tuesday
 09:00–12:00, a March 11 holiday, and a March 9–20 “Summer” work week stating
@@ -196,6 +197,13 @@ then the base. A work week's end date is inclusive; an unstated weekday falls
 back to that calendar's own default, including Standard's Tuesday 09:00–12:00.
 The fixture was verified with `verify_mspdi_project.py` as generated and after
 `write_mspdi` saved it.
+
+File 29 records SNET/FNET milestone placement measured against Project 2024 in
+issue #779 with `verify_mspdi_project.py` (0 mismatches): a zero-duration
+milestone holds its constraint instant at a period end (Fri 17:00, Wed 12:00),
+at a working start (Mon 08:00, Wed 13:00), and inside a non-working gap
+(Wed 19:00, Sat 10:00, Wed 07:00, Wed 12:30). Its total slack is measured on
+the working-minute index the held instant shares with the next working start.
 
 See `manifest.json` for machine-readable tags.
 

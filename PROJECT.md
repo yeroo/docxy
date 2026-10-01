@@ -151,6 +151,17 @@ Wednesday 08:00" both come out right.
   plus SNET/FNET date bounds. With `HonorConstraints` enabled (the default,
   persisted as MSPDI `HonorConstraints`), MSO/MFO/FNLT/SNLT override conflicting
   links; with it off, links can delay tasks past those constraint dates.
+  An SNET or FNET milestone holds its constraint instant itself, even at the
+  end of a working period or inside a non-working gap (Fri 17:00, Wed 19:00),
+  as Project 2024 does (#118, #133, #779, corpus file 29); a date before the
+  project start is floored there. A binding MFO or FNLT milestone holds the
+  constraint's own instant: its morning when the date is a working start, else
+  its evening (#89, #132). An FS milestone holds its predecessor's finish
+  instant (#59). Other milestones (MSO, SNLT, an unconstrained one) still snap
+  to the next working start, and a later link still wins. Slack is unaffected:
+  a held instant shares its working-minute index with the next working start.
+  A date typed without a time for SNET or FNET (a Start cell, or
+  `snet`/`fnet DATE`) means that day's first working time.
 - **Backward pass** → late start/finish from the project finish, plus the
   backward-affecting constraints (MFO/FNLT/SNLT/MSO).
 - **Total & free slack**: link conflicts produce negative total slack in both
@@ -409,8 +420,9 @@ collapsed summary, shows it, while a cursor left inside a collapsed subtree by
 a delete or an undo moves up to the summary. A task typed below a collapsed
 last summary becomes its sibling.
 
-Dates use `YYYY-MM-DD`. On an auto task, Start sets SNET and Finish sets FNET at
-the chosen working day's calendar finish (non-working Finish dates are rejected).
+Dates use `YYYY-MM-DD`. On an auto task, Start sets SNET at the chosen day's
+first working time and Finish sets FNET at the chosen working day's calendar
+finish (non-working Finish dates are rejected).
 On a manual task, Start moves the task to that day's first working time (08:00
 on a non-working day) keeping its duration, and Finish sets its finish at the
 day's last working time (17:00 on a non-working day) and its duration to the

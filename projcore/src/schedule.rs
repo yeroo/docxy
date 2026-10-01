@@ -1415,24 +1415,27 @@ impl<'a> Scheduler<'a> {
                         };
                     }
                     ConstraintType::StartNoEarlierThan => {
-                        // A milestone dated at the end of a working period
-                        // occupies that instant, as a finish-constrained one
-                        // does, not the next morning that shares its index.
-                        let bound = if t.duration_min == 0 && milestone == dates.raw.max(floor) {
-                            held_milestone = Some(milestone);
-                            milestone
+                        // A milestone occupies its constraint instant as
+                        // Project does (measured in #779), even in a
+                        // non-working gap, not the next working start that
+                        // shares its index.
+                        let bound = if t.duration_min == 0 {
+                            let instant = dates.raw.max(floor);
+                            held_milestone = Some(instant);
+                            instant
                         } else {
                             ds
                         };
                         start_abs = start_abs.max(bound);
                     }
                     ConstraintType::FinishNoEarlierThan => {
-                        // A milestone dated at the end of a working period (or
-                        // at a working start) occupies that instant, as an SNET
-                        // one does, not the next morning that shares its index.
-                        let bound = if t.duration_min == 0 && milestone == dates.raw.max(floor) {
-                            held_milestone = Some(milestone);
-                            milestone
+                        // As an SNET one does: a milestone occupies its
+                        // constraint instant as Project does (measured in
+                        // #779), even in a non-working gap.
+                        let bound = if t.duration_min == 0 {
+                            let instant = dates.raw.max(floor);
+                            held_milestone = Some(instant);
+                            instant
                         } else {
                             tl.abs_start(tl.to_index(df) - t.duration_min).max(floor)
                         };
@@ -1484,7 +1487,7 @@ impl<'a> Scheduler<'a> {
             }
             // A binding FS or ALAP milestone occupies its exact finish or
             // late-start instant, even in a nonworking gap. So do binding
-            // MFO/FNLT and period-end SNET/FNET milestones. Later start-type
+            // MFO/FNLT and SNET/FNET milestones. Later start-type
             // links/constraints still snap.
             let s_abs =
                 if fs_milestone_start == Some(start_abs) || held_milestone == Some(start_abs) {
@@ -5793,8 +5796,8 @@ mod tests {
             (480, true, at(3, 17), at(3, 17)),
             // The end of the morning period, likewise.
             (480, false, at(3, 12), at(3, 12)),
-            // Not a period end: the next working start, as before.
-            (480, false, at(3, 19), at(4, 8)),
+            // A non-working gap instant is held too, as Project does (#779).
+            (480, false, at(3, 19), at(3, 19)),
             (480, false, at(3, 10), at(3, 10)),
             // A later FS link still wins.
             (1440, true, at(3, 17), at(4, 17)),
@@ -5832,8 +5835,8 @@ mod tests {
             (2400, false, at(9, 8), at(9, 8)),
             // The end of the morning period, as for an SNET.
             (480, false, at(4, 12), at(4, 12)),
-            // Not a period end: the next working start, as before.
-            (480, false, at(4, 19), at(5, 8)),
+            // A non-working gap instant is held too, as Project does (#779).
+            (480, false, at(4, 19), at(4, 19)),
             // A met FNET leaves the FS instant alone; a later FS link wins.
             (2400, true, at(6, 12), at(6, 17)),
             (2880, true, at(6, 17), at(9, 17)),
@@ -5881,6 +5884,69 @@ mod tests {
         assert_eq!(
             leveled.start(3),
             Some(DateTime::from_ymd_hm(2026, 3, 9, 8, 0))
+        );
+    }
+
+    #[test]
+    fn snet_and_fnet_milestones_hold_a_non_working_gap_instant() {
+        use ConstraintType::{FinishNoEarlierThan as Fnet, StartNoEarlierThan as Snet};
+        let at = |day, hour, min| DateTime::from_ymd_hm(2026, 3, day, hour, min);
+        // (constraint, date) — Project 2024 (#779) holds the raw constraint
+        // instant of a zero-duration task, even inside a non-working gap.
+        for (constraint, date) in [
+            (Fnet, at(4, 19, 0)),
+            (Snet, at(4, 19, 0)),
+            (Fnet, at(7, 10, 0)),
+            (Fnet, at(4, 7, 0)),
+            (Fnet, at(4, 12, 30)),
+        ] {
+            for honor in [false, true] {
+                let proj = finish_constrained_milestone(480, constraint, date, honor, false);
+                let case = format!("{constraint:?} honor={honor} {date:?}");
+                let m = schedule(&proj).get(2).copied().unwrap();
+                assert_eq!(m.early_start, date, "{case}");
+                assert_eq!(m.early_finish, date, "{case}");
+                let leveled = level(&proj);
+                assert_eq!(leveled.start(2), Some(date), "{case}");
+                assert_eq!(leveled.finish(2), Some(date), "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn gap_held_fnet_milestone_keeps_its_successor_on_the_next_morning() {
+        let wed_gap = DateTime::from_ymd_hm(2026, 3, 4, 19, 0);
+        let mut proj = finish_constrained_milestone(
+            480,
+            ConstraintType::FinishNoEarlierThan,
+            wed_gap,
+            true,
+            false,
+        );
+        let mut next = task(3, "Next", 480);
+        next.predecessors.push(fs(2));
+        proj.tasks.push(next);
+        let sched = schedule(&proj);
+        // The milestone holds the raw gap instant, as Project 2024 measured
+        // it (#779), and the successor still starts on the next morning the
+        // instant's working index maps to.
+        let m = sched.get(2).unwrap();
+        assert_eq!(m.early_start, wed_gap);
+        assert_eq!(m.early_finish, wed_gap);
+        let next = sched.get(3).unwrap();
+        assert_eq!(next.early_start, DateTime::from_ymd_hm(2026, 3, 5, 8, 0));
+        assert_eq!(next.early_finish, DateTime::from_ymd_hm(2026, 3, 5, 17, 0));
+        // The held instant shares its working-minute index with the next
+        // morning, so slack is unchanged by holding it (both were 0 before
+        // the fix).
+        assert_eq!(m.total_slack_min, 0);
+        assert_eq!(next.total_slack_min, 0);
+        let leveled = level(&proj);
+        assert_eq!(leveled.start(2), Some(wed_gap));
+        assert_eq!(leveled.finish(2), Some(wed_gap));
+        assert_eq!(
+            leveled.start(3),
+            Some(DateTime::from_ymd_hm(2026, 3, 5, 8, 0))
         );
     }
 
