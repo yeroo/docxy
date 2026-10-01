@@ -130,10 +130,23 @@ fn file_moniker_path(b: &[u8], at: usize) -> Result<String, String> {
         return Err(bad());
     }
     let size = u32_at(tail + 24).ok_or_else(bad)?;
+    if size == 0 {
+        // No extension: Windows omits it when the ANSI path needs no long
+        // form (f6's relative-name monikers). The ANSI code page is the
+        // writer's, so only an ASCII path is known.
+        let ansi = &b[at + 22..tail];
+        return match ansi.split_last() {
+            Some((0, path))
+                if !path.is_empty() && path.iter().all(|c| (0x20..0x7f).contains(c)) =>
+            {
+                Ok(String::from_utf8(path.to_vec()).unwrap())
+            }
+            _ => Err(bad()),
+        };
+    }
     let bytes = u32_at(tail + 28).ok_or_else(bad)?;
     let start = tail + 34;
-    if size == 0
-        || size != bytes + 6
+    if size != bytes + 6
         || u16_at(tail + 32) != Some(3)
         || !bytes.is_multiple_of(2)
         || start + bytes > b.len()
@@ -152,7 +165,9 @@ fn file_moniker_path(b: &[u8], at: usize) -> Result<String, String> {
         .ok_or_else(bad)
 }
 
-/// SubprojectName by task UID; no table means no inserted projects.
+/// SubprojectName by task UID; no table means no inserted projects. An item
+/// whose path moniker cannot be read has no name; an unknown item type makes
+/// the whole table unknown, since the index stride is then unknown too.
 pub(crate) fn subproject_names(b: &[u8]) -> Result<HashMap<u32, String>, String> {
     let entries = entries(b)?;
     let Some(block) = entries.get(&SUBPROJECTS) else {
@@ -168,17 +183,18 @@ pub(crate) fn subproject_names(b: &[u8]) -> Result<HashMap<u32, String>, String>
     }
     let offset = |i: usize| u32_at(block, 12 + i * 4) as usize & 0xffff;
     let mut out = HashMap::new();
+    let mut seen = std::collections::HashSet::new();
     for item in 0..(index_end - 12) / 16 {
         let [header, uid, path] = [0, 1, 2].map(|k| offset(item * 4 + k));
         if block.get(header + 16) != Some(&1) || uid + 4 > block.len() {
             return Err(bad());
         }
         let task_uid = u32_at(block, uid);
-        if out
-            .insert(task_uid, file_moniker_path(block, path)?)
-            .is_some()
-        {
+        if !seen.insert(task_uid) {
             return Err(format!("duplicate subproject for task UID {task_uid}"));
+        }
+        if let Ok(name) = file_moniker_path(block, path) {
+            out.insert(task_uid, name);
         }
     }
     Ok(out)
@@ -272,16 +288,21 @@ mod tests {
         assert!(new_tasks_are_manual(&dup).is_err());
     }
 
-    /// An OLE File Moniker as Project writes it: the 8.3 ANSI path, then the
-    /// long Unicode path as the extension.
-    fn moniker(ansi: &str, unicode: &str) -> Vec<u8> {
+    /// An OLE File Moniker as Project writes it: the ANSI (8.3) path, then
+    /// the long Unicode path as the extension, or a zero size when the ANSI
+    /// path is already the long one (`unicode` empty).
+    fn moniker(ansi: &[u8], unicode: &str) -> Vec<u8> {
         let mut m = FILE_MONIKER.to_vec();
         m.extend_from_slice(&0u16.to_le_bytes());
         m.extend_from_slice(&(ansi.len() as u32 + 1).to_le_bytes());
-        m.extend_from_slice(ansi.as_bytes());
+        m.extend_from_slice(ansi);
         m.push(0);
         m.extend_from_slice(&[0xff, 0xff, 0xad, 0xde]);
         m.extend_from_slice(&[0; 20]);
+        if unicode.is_empty() {
+            m.extend_from_slice(&0u32.to_le_bytes());
+            return m;
+        }
         let wide: Vec<u8> = unicode.encode_utf16().flat_map(u16::to_le_bytes).collect();
         m.extend_from_slice(&(wide.len() as u32 + 6).to_le_bytes());
         m.extend_from_slice(&(wide.len() as u32).to_le_bytes());
@@ -290,19 +311,20 @@ mod tests {
         m
     }
 
-    /// The f6-subprojects table shape: one item per (task UID, path).
-    fn subprojects(items: &[(u32, &str)], kind: u8) -> Vec<u8> {
+    /// The f6-subprojects table shape: one item per (task UID, ANSI path,
+    /// Unicode path).
+    fn subprojects(items: &[(u32, &[u8], &str)], kind: u8) -> Vec<u8> {
         let index_end = 12 + items.len() * 16;
         let mut index = Vec::new();
         let mut body = Vec::new();
-        for (uid, path) in items {
+        for &(uid, ansi, unicode) in items {
             let mut header = vec![0u8; 20];
             header[16] = kind;
             let parts = [
                 header,
                 uid.to_le_bytes().to_vec(),
-                moniker("C:\\SHORT~1.MPP", path),
-                moniker("\\SHORT~1.MPP", "\\name.mpp"),
+                moniker(ansi, unicode),
+                moniker(br"\name.mpp", ""),
             ];
             for part in parts {
                 index.extend_from_slice(&((index_end + body.len()) as u32).to_le_bytes());
@@ -320,21 +342,38 @@ mod tests {
 
     #[test]
     fn subproject_names_read_the_long_path_of_each_inserted_project() {
-        let long = "C:\\Users\\Jürgen\\Планы\\f6-child.mpp";
-        let names = subproject_names(&subprojects(&[(2, long), (3, "D:\\b.mpp")], 1)).unwrap();
+        let short: &[u8] = br"C:\USERS\JRGEN~1\F6-CHI~1.MPP";
+        let long = r"C:\Users\Jürgen\Планы\f6-child.mpp";
+        let names = subproject_names(&subprojects(
+            &[(2, short, long), (3, br"D:\PLANS\B.MPP", "")],
+            1,
+        ))
+        .unwrap();
         assert_eq!(names.len(), 2);
         assert_eq!(names[&2], long);
-        assert_eq!(names[&3], "D:\\b.mpp");
+        // No Unicode extension: the ANSI path is the long path.
+        assert_eq!(names[&3], r"D:\PLANS\B.MPP");
         assert_eq!(subproject_names(&stream(&[])), Ok(HashMap::new()));
         // Item types other than f6's have no oracle.
-        assert!(subproject_names(&subprojects(&[(2, long)], 3)).is_err());
-        assert!(subproject_names(&subprojects(&[(2, long), (2, long)], 1)).is_err());
-        let mut torn = subprojects(&[(2, long)], 1);
+        assert!(subproject_names(&subprojects(&[(2, short, long)], 3)).is_err());
+        assert!(subproject_names(&subprojects(&[(2, short, long), (2, short, long)], 1)).is_err());
+        // An unreadable path leaves only that item unnamed: a non-ASCII ANSI
+        // path in an unknown code page, or a torn Unicode extension.
+        let names = subproject_names(&subprojects(
+            &[(2, b"C:\\J\xfcrgen.mpp", ""), (3, br"D:\B.MPP", "")],
+            1,
+        ))
+        .unwrap();
+        assert_eq!(names, HashMap::from([(3, r"D:\B.MPP".to_string())]));
+        let mut torn = subprojects(&[(2, short, long), (3, br"D:\B.MPP", "")], 1);
         let wide: Vec<u8> = long.encode_utf16().flat_map(u16::to_le_bytes).collect();
         let path = torn.windows(wide.len()).position(|w| w == wide).unwrap();
         // The size before the byte count and key: they no longer agree.
         torn[path - 10] ^= 1;
-        assert!(subproject_names(&torn).is_err());
+        assert_eq!(
+            subproject_names(&torn),
+            Ok(HashMap::from([(3, r"D:\B.MPP".to_string())]))
+        );
     }
 
     #[test]
