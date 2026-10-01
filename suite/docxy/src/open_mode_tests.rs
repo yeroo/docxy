@@ -4,7 +4,10 @@
 
 use crate::dialog_host::dialog_click;
 use crate::open_mode::{Access, OpenMode, PROTECTED_STATUS, read_only_refusal};
-use crate::trusted::{Stamp, TrustStore};
+// `Stamp` is used only by the Windows-only Protected View tests.
+#[cfg(windows)]
+use crate::trusted::Stamp;
+use crate::trusted::TrustStore;
 use crate::{
     DocTab, PersistTab, SHEET_READ_ONLY_HARNESS, Surface, finish_sheet_save, persist_tab,
     protected_rollback, reopen_dialog, restore_tab, save_sheet_tab, save_sheet_to,
