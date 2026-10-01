@@ -1666,13 +1666,125 @@ fn param_name(n: &str) -> String {
     format!("_xlpm.{}", bare_param(n))
 }
 
-/// Is `name` a builtin function? Excel's post-2007 names (the engine may not
-/// evaluate them all yet), and otherwise whatever the evaluator itself knows,
+/// Excel 2007 worksheet functions the evaluator doesn't dispatch (yet), so
+/// [`is_builtin`] can't learn them from it. Drop a name here once the
+/// evaluator handles it (`unevaluated_builtins_are_still_unevaluated`).
+const UNEVALUATED_BUILTINS: &[&str] = &[
+    "ACCRINT",
+    "ACCRINTM",
+    "AMORDEGRC",
+    "AMORLINC",
+    "AREAS",
+    "ASC",
+    "BAHTTEXT",
+    "BESSELI",
+    "BESSELJ",
+    "BESSELK",
+    "BESSELY",
+    "CALL",
+    "CHITEST",
+    "COMPLEX",
+    "CONVERT",
+    "COUPDAYBS",
+    "COUPDAYS",
+    "COUPDAYSNC",
+    "COUPNCD",
+    "COUPNUM",
+    "COUPPCD",
+    "CUBEKPIMEMBER",
+    "CUBEMEMBER",
+    "CUBEMEMBERPROPERTY",
+    "CUBERANKEDMEMBER",
+    "CUBESET",
+    "CUBESETCOUNT",
+    "CUBEVALUE",
+    "DISC",
+    "DURATION",
+    "ERF",
+    "ERFC",
+    "EUROCONVERT",
+    "FINDB",
+    "FTEST",
+    "FVSCHEDULE",
+    "GETPIVOTDATA",
+    "GROWTH",
+    "IMABS",
+    "IMAGINARY",
+    "IMARGUMENT",
+    "IMCONJUGATE",
+    "IMCOS",
+    "IMDIV",
+    "IMEXP",
+    "IMLN",
+    "IMLOG10",
+    "IMLOG2",
+    "IMPOWER",
+    "IMPRODUCT",
+    "IMREAL",
+    "IMSIN",
+    "IMSQRT",
+    "IMSUB",
+    "IMSUM",
+    "INFO",
+    "INTRATE",
+    "ISREF",
+    "JIS",
+    "LEFTB",
+    "LENB",
+    "LINEST",
+    "LOGEST",
+    "MDURATION",
+    "MIDB",
+    "ODDFPRICE",
+    "ODDFYIELD",
+    "ODDLPRICE",
+    "ODDLYIELD",
+    "PHONETIC",
+    "PRICE",
+    "PRICEDISC",
+    "PRICEMAT",
+    "PROB",
+    "RECEIVED",
+    "REGISTER.ID",
+    "REPLACEB",
+    "RIGHTB",
+    "RTD",
+    "SEARCHB",
+    "SQL.REQUEST",
+    "STEYX",
+    "TBILLEQ",
+    "TBILLPRICE",
+    "TBILLYIELD",
+    "TREND",
+    "TTEST",
+    "VDB",
+    "YIELD",
+    "YIELDDISC",
+    "YIELDMAT",
+    "ZTEST",
+];
+
+/// Is `name` a builtin function? Excel's post-2007 names and the 2007 ones the
+/// engine doesn't evaluate, and otherwise whatever the evaluator itself knows,
 /// so this stays right as builtins are added: the call, with no arguments,
 /// on a throwaway evaluator over no cells, through the whole dispatch, which
-/// flags a name it doesn't know. Every builtin refuses zero arguments without
-/// panicking or touching anything (`builtin_probe_is_safe_for_every_name`).
+/// flags a name it doesn't know. A builtin either refuses zero arguments or
+/// computes from the resolver alone (`NoCells` answers nothing: no cells,
+/// clock, random source or names), so the probe panics on none and touches
+/// nothing outside it (`builtin_probe_is_safe_for_every_name`).
 fn is_builtin(name: &str) -> bool {
+    if future_prefix(name).is_some()
+        || UNEVALUATED_BUILTINS
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(name))
+    {
+        return true;
+    }
+    probe_known(name)
+}
+
+/// Does the evaluator dispatch `name`? See [`is_builtin`].
+fn probe_known(name: &str) -> bool {
     struct NoCells;
     impl Resolver for NoCells {
         fn value(&self, _: usize, _: u32, _: u32) -> Value {
@@ -1684,9 +1796,6 @@ fn is_builtin(name: &str) -> bool {
         fn cells_in(&self, _: usize, _: u32, _: u32, _: u32, _: u32) -> Vec<((u32, u32), Value)> {
             Vec::new()
         }
-    }
-    if future_prefix(name).is_some() {
-        return true;
     }
     let mut ev = Eval::new(&NoCells, 0, (0, 0));
     ev.eval_arg(&Expr::Func(name.to_ascii_uppercase(), Vec::new()));
@@ -13229,6 +13338,11 @@ mod tests {
             file("LET(sum,SUM(A1:A3),max,sum(B1:B3),MAX(sum,max))"),
             "_xlfn.LET(_xlpm.sum,SUM(A1:A3),_xlpm.max,SUM(B1:B3),MAX(_xlpm.sum,_xlpm.max))"
         );
+        // A builtin the engine doesn't evaluate is still a builtin.
+        assert_eq!(
+            file("LET(convert,CONVERT(A1,\"m\",\"ft\"),CONVERT(convert,\"ft\",\"in\"))"),
+            "_xlfn.LET(_xlpm.convert,CONVERT(A1,\"m\",\"ft\"),CONVERT(_xlpm.convert,\"ft\",\"in\"))"
+        );
         // A LAMBDA parameter may hold a lambda, so its call is the local one.
         assert_eq!(
             file("LAMBDA(text,TEXT(text,\"0\"))(A1)"),
@@ -13283,6 +13397,21 @@ mod tests {
         }
         for n in ["MAKEADDER", "MYFN", "INC", "_XLPM.F"] {
             assert!(!is_builtin(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn unevaluated_builtins_are_still_unevaluated() {
+        // The list only covers what the probe can't see; a name the evaluator
+        // learns should leave it.
+        for (i, n) in UNEVALUATED_BUILTINS.iter().enumerate() {
+            assert!(is_builtin(n), "{n}");
+            assert!(
+                !probe_known(n),
+                "{n} is evaluated now: drop it from the list"
+            );
+            assert!(future_prefix(n).is_none(), "{n} is a future function");
+            assert!(!UNEVALUATED_BUILTINS[..i].contains(n), "{n} listed twice");
         }
     }
 
