@@ -1,7 +1,7 @@
 {
   "name": "offxy",
   "displayName": "Offxy — Word & Excel .docx/.xlsx editor",
-  "description": "Open, read, and edit Microsoft Word .docx and Excel .xlsx files right in an editor tab — powered by WebAssembly builds of the dependency-free docxcore and gridcore engines.",
+  "description": "Open, read, and edit Microsoft Word .docx and Excel .xlsx/.xlsm/.xltx/.xltm files right in an editor tab — powered by WebAssembly builds of the dependency-free docxcore and gridcore engines.",
   "version": "0.3.0",
   "license": "MIT",
   "publisher": "yeroo",
@@ -46,6 +46,15 @@
         "selector": [
           {
             "filenamePattern": "*.xlsx"
+          },
+          {
+            "filenamePattern": "*.xlsm"
+          },
+          {
+            "filenamePattern": "*.xltx"
+          },
+          {
+            "filenamePattern": "*.xltm"
           }
         ],
         "priority": "default"

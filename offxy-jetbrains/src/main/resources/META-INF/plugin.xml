@@ -3,7 +3,7 @@
     <name>Offxy</name>
     <vendor url="https://github.com/yeroo/docxy">yeroo</vendor>
     <description><![CDATA[
-        <p><b>Native Word (.docx) and Excel (.xlsx) editors</b> for JetBrains
+        <p><b>Native Word (.docx) and Excel (.xlsx, .xlsm, .xltx, .xltm) editors</b> for JetBrains
         IDEs &mdash; no webview, no Microsoft Office, no native binaries. The
         engines are the dependency-free
         <a href="https://github.com/yeroo/docxy">docxy</a> Rust cores
@@ -47,7 +47,7 @@
         <fileType name="Offxy Excel Workbook"
                   implementationClass="dev.yeroo.offxy.grid.XlsxFileType"
                   fieldName="INSTANCE"
-                  extensions="xlsx"/>
+                  extensions="xlsx;xlsm;xltx;xltm"/>
         <fileEditorProvider implementation="dev.yeroo.offxy.grid.XlsxEditorProvider"/>
     </extensions>
 

@@ -2363,11 +2363,12 @@ impl SheetPackage {
     /// `xlm`, `function` or `vbProcedure`, which a macro-free file cannot
     /// carry either, with or without a macro sheet.
     pub fn has_macro_names(&self) -> bool {
-        self.part("xl/workbook.xml").is_some_and(|b| {
-            !remove_macro_names(&String::from_utf8_lossy(b), &|_: &str| false)
-                .1
-                .is_empty()
-        })
+        self.part(&workbook_part_name(&self.parts))
+            .is_some_and(|b| {
+                !remove_macro_names(&String::from_utf8_lossy(b), &|_: &str| false)
+                    .1
+                    .is_empty()
+            })
     }
 
     /// What a macro-free file (`.xlsx`, `.xltx`) written from this package
@@ -2393,9 +2394,10 @@ impl SheetPackage {
     /// [`Self::remove_sheet`], and the Excel 4.0 names, which go even when
     /// there is no macro sheet: every defined name marked `xlm`, `function`
     /// or `vbProcedure`, and every name whose formula refers to a removed
-    /// sheet (`Auto_Open=Macro1!$A$1`). A workbook of nothing but macro
-    /// sheets first gains a blank worksheet, so one remains. Returns whether
-    /// there was anything to drop.
+    /// sheet (`Auto_Open=Macro1!$A$1`). A cell formula that refers to a
+    /// removed sheet keeps its cell, with that reference as `#REF!`. A
+    /// workbook of nothing but macro sheets first gains a blank worksheet, so
+    /// one remains. Returns whether there was anything to drop.
     ///
     /// Only that copy: an open workbook keeps its macros, as Excel keeps
     /// them, and its sheet indices stay put.
@@ -2421,7 +2423,8 @@ impl SheetPackage {
             self.add_sheet(&format!("Sheet{n}"));
         }
         let refers = |formula: &str| names.iter().any(|s| formula_refers_to_sheet(formula, s));
-        if let Some(p) = self.parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
+        let wb_part = workbook_part_name(&self.parts);
+        if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == wb_part) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
             // A `localSheetId` that names no model sheet was loaded as a
             // global name; that model entry goes with its element too, or the
@@ -2439,6 +2442,9 @@ impl SheetPackage {
                     })
             });
         }
+        // Cell formulas that name a removed sheet read `#REF!`, as Excel
+        // turns them.
+        crate::edit::remove_sheet_refs(&mut self.workbook, &names);
         for &i in doomed.iter().rev() {
             self.remove_sheet(i);
         }
@@ -6500,17 +6506,17 @@ impl SheetPackage {
         }
         // The workbook relationship whose target resolves to the part (a
         // relative, `./` or absolute Target alike) — capture its rId, then
-        // remove it by that Id.
+        // remove it by that Id. The workbook part is wherever the package
+        // rels put it, `xl/workbook.xml` only by convention.
+        let wb_part = workbook_part_name(&self.parts);
+        let wb_dir = wb_part.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let wb_rels = rels_part_name(&wb_part);
         let mut rid = String::new();
-        if let Some(p) = self
-            .parts
-            .iter_mut()
-            .find(|(n, _)| n == "xl/_rels/workbook.xml.rels")
-        {
+        if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == wb_rels) {
             let mut xml = String::from_utf8_lossy(&p.1).into_owned();
             if let Some((id, _, _)) = parse_rels(&xml)
                 .into_iter()
-                .find(|(_, _, t)| resolve_relative("xl", t) == part_name)
+                .find(|(_, _, t)| resolve_relative(wb_dir, t) == part_name)
             {
                 if let Some(el) = find_element_by_attr(&xml, "Relationship", "Id", |v| v == id) {
                     xml.replace_range(el.start..el.end, "");
@@ -6521,7 +6527,7 @@ impl SheetPackage {
         }
         // workbook.xml: drop the <sheet> element and fix defined-name scopes
         // (localSheetId counts sheets in document order).
-        if let Some(p) = self.parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
+        if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == wb_part) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
             let mut xml = if rid.is_empty() {
                 xml
@@ -12915,6 +12921,192 @@ mod kind_tests {
         let wb = part_text(&out, "xl/workbook.xml");
         assert_eq!(wb.matches("<sheet ").count(), 2, "{wb}");
         assert!(!wb.contains("Macro1") && !wb.contains("Dialog1"), "{wb}");
+    }
+
+    /// [`mixed_xlm_book`] with its workbook part at `wb/book.xml` (and its
+    /// rels at `wb/_rels/book.xml.rels`), where only the package rels say
+    /// to look.
+    fn relocated_xlm_book() -> SheetPackage {
+        let parts: Vec<(String, Vec<u8>)> = mixed_xlm_book()
+            .parts
+            .into_iter()
+            .map(|(name, bytes)| {
+                let text = || String::from_utf8_lossy(&bytes).into_owned();
+                match name.as_str() {
+                    "xl/workbook.xml" => ("wb/book.xml".to_string(), bytes),
+                    "xl/_rels/workbook.xml.rels" => (
+                        "wb/_rels/book.xml.rels".to_string(),
+                        text().replace("Target=\"", "Target=\"../xl/").into_bytes(),
+                    ),
+                    "_rels/.rels" => (
+                        name,
+                        text()
+                            .replace("xl/workbook.xml", "wb/book.xml")
+                            .into_bytes(),
+                    ),
+                    "[Content_Types].xml" => (
+                        name,
+                        text()
+                            .replace("/xl/workbook.xml", "/wb/book.xml")
+                            .into_bytes(),
+                    ),
+                    _ => (name, bytes),
+                }
+            })
+            .collect();
+        let pkg = load_xlsx(&write_zip(&parts)).expect("the relocated fixture loads");
+        assert!(pkg.part("xl/workbook.xml").is_none());
+        assert_eq!(pkg.workbook.sheets.len(), 4);
+        pkg
+    }
+
+    /// #789: a workbook part outside `xl/` is found through the package
+    /// rels by the sheet removal and the Excel 4.0 macro paths.
+    #[test]
+    fn remove_sheet_follows_workbook_part_from_rels() {
+        let mut pkg = relocated_xlm_book();
+        assert!(pkg.has_macro_names());
+        assert!(
+            pkg.macro_features()
+                .contains(&"Excel 4.0 function stored in defined names")
+        );
+
+        assert!(pkg.remove_sheet(1));
+        let wb = part_text(&pkg, "wb/book.xml");
+        assert_eq!(wb.matches("<sheet ").count(), 3, "{wb}");
+        assert!(!wb.contains("name=\"Macro1\""), "{wb}");
+        let rels = part_text(&pkg, "wb/_rels/book.xml.rels");
+        assert!(!rels.contains("macrosheets"), "{rels}");
+        assert!(rels.contains("dialogsheets"), "{rels}");
+
+        let mut copy = relocated_xlm_book();
+        assert!(copy.remove_excel4_macros());
+        let wb = part_text(&copy, "wb/book.xml");
+        assert_eq!(wb.matches("<sheet ").count(), 2, "{wb}");
+        assert!(!wb.contains("Macro1") && !wb.contains("Dialog1"), "{wb}");
+        assert!(
+            !wb.contains("CellColor") && !wb.contains("Auto_Open"),
+            "{wb}"
+        );
+        assert!(wb.contains("name=\"Total\""), "{wb}");
+        let rels = part_text(&copy, "wb/_rels/book.xml.rels");
+        assert!(
+            !rels.contains("macrosheets") && !rels.contains("dialogsheets"),
+            "{rels}"
+        );
+        assert!(!copy.has_macro_names() && !copy.has_macro_sheets());
+    }
+
+    /// #789: a macro-free save turns worksheet formulas that name a removed
+    /// Excel 4.0 macro sheet into `#REF!`, leaves every other formula's text
+    /// as it was, and leaves the open package alone.
+    #[test]
+    fn macro_free_save_turns_macro_sheet_refs_into_ref_errors() {
+        let mut pkg = mixed_xlm_book();
+        let data = &mut pkg.workbook.sheets[0];
+        let gone = [
+            (1, "Macro1!A1+1", "#REF!+1"),
+            (2, "SUM(macro1!A1:B2)*2", "SUM(#REF!)*2"),
+            (3, "SUM(Macro1!A:A)", "SUM(#REF!)"),
+            (4, "SUM(Report!A1,Dialog1!$B$2)", "SUM(Report!A1,#REF!)"),
+            // A 3-D span with a removed end sheet.
+            (5, "SUM(Data:Macro1!A1)", "SUM(#REF!)"),
+        ];
+        for (r, src, _) in gone {
+            data.set_cell(r, 0, Cell::formula(src));
+        }
+        let kept = [
+            (1, "Report!A1*2"),
+            // Macro1 lies between Data and Report: it just leaves the span.
+            (2, "SUM(Data:Report!A1)"),
+            (3, "IF(A1=1,\"Macro1!A1\",B1)"),
+            (4, "XMacro1!A1"),
+        ];
+        for (r, src) in kept {
+            data.set_cell(r, 1, Cell::formula(src));
+        }
+        let mut array = Cell::formula("Macro1!A1:A2");
+        array.f_attrs = Some(" t=\"array\" ref=\"C1:C2\"".into());
+        array.spill = Some((2, 1));
+        data.set_cell(0, 2, array);
+        // The block's other cell, holding a value computed from Macro1.
+        data.set_cell(1, 2, Cell::number(7.0));
+        // Error handling sees the #REF!, so the cached value is its answer.
+        let handled = [
+            (
+                1,
+                "IFERROR(Macro1!A1,0)",
+                "IFERROR(#REF!,0)",
+                CellValue::Number(0.0),
+            ),
+            (
+                2,
+                "ISERROR(Macro1!A1)",
+                "ISERROR(#REF!)",
+                CellValue::Bool(true),
+            ),
+            (
+                3,
+                "Report!A1*0+Macro1!A1",
+                "Report!A1*0+#REF!",
+                CellValue::Error("#REF!".into()),
+            ),
+        ];
+        for (r, src, _, _) in &handled {
+            data.set_cell(*r, 3, Cell::formula(src));
+        }
+        let formulas = |pkg: &SheetPackage| -> Vec<(u32, u32, Option<String>)> {
+            let mut out: Vec<_> = pkg.workbook.sheets[0]
+                .cells
+                .iter()
+                .map(|(&(r, c), cell)| (r, c, cell.formula.clone()))
+                .collect();
+            out.sort();
+            out
+        };
+        let before = (formulas(&pkg), pkg.workbook.sheets.len());
+
+        for kind in [SpreadsheetKind::Workbook, SpreadsheetKind::Template] {
+            let out = roundtrip(&pkg, kind);
+            let data = &out.workbook.sheets[0];
+            for (r, _, want) in gone {
+                let cell = data.cell(r, 0).unwrap();
+                assert_eq!(cell.formula.as_deref(), Some(want), "row {r}");
+                assert_eq!(cell.value, CellValue::Error("#REF!".into()), "row {r}");
+            }
+            for (r, src) in kept {
+                assert_eq!(data.cell(r, 1).unwrap().formula.as_deref(), Some(src));
+            }
+            let array = data.cell(0, 2).unwrap();
+            assert_eq!(array.formula.as_deref(), Some("#REF!"));
+            assert!(array.f_attrs.as_deref().is_some_and(is_array_f));
+            assert_eq!(array.value, CellValue::Error("#REF!".into()));
+            assert_eq!(
+                data.cell(1, 2).unwrap().value,
+                CellValue::Error("#REF!".into()),
+                "the array's block follows its anchor"
+            );
+            for (r, _, want, value) in &handled {
+                let cell = data.cell(*r, 3).unwrap();
+                assert_eq!(cell.formula.as_deref(), Some(*want), "row {r}");
+                assert_eq!(&cell.value, value, "row {r}");
+            }
+        }
+        assert_eq!(
+            (formulas(&pkg), pkg.workbook.sheets.len()),
+            before,
+            "the open workbook keeps its formulas"
+        );
+
+        // A quoted name is the same sheet; a macro-enabled save keeps it all.
+        let mut pkg = xlm_book(&[("Data", "work"), ("Macro 1", "macro"), ("Report", "work")]);
+        pkg.workbook.sheets[0].set_cell(1, 0, Cell::formula("'Macro 1'!A1+1"));
+        let out = roundtrip(&pkg, SpreadsheetKind::Workbook);
+        let cell = out.workbook.sheets[0].cell(1, 0).unwrap();
+        assert_eq!(cell.formula.as_deref(), Some("#REF!+1"));
+        let out = roundtrip(&pkg, SpreadsheetKind::MacroWorkbook);
+        let cell = out.workbook.sheets[0].cell(1, 0).unwrap();
+        assert_eq!(cell.formula.as_deref(), Some("'Macro 1'!A1+1"));
     }
 
     #[test]
