@@ -271,14 +271,27 @@ impl Engine {
     fn put_cell(&mut self, wb: &mut Workbook, key: Key, mut cell: Cell) {
         cell.spill = None;
         let (s, r, c) = key;
-        let owner = wb.sheets.get(s).and_then(|sh| spill_owner(sh, r, c));
+        let mut owner = wb.sheets.get(s).and_then(|sh| spill_owner(sh, r, c));
         let owner_frozen = owner.is_some_and(|((ar, ac), _)| self.is_frozen(wb, (s, ar, ac)));
+        // A frozen anchor's extent is not moved by row/column edits or a
+        // sort; its array `ref` is. Where that `ref` no longer covers the
+        // cell, the cell is not part of its block and the edit leaves the
+        // anchor alone.
+        let frozen_ref_covers = owner.filter(|_| owner_frozen).and_then(|(anchor, _)| {
+            let a = wb.sheets[s].cell(anchor.0, anchor.1)?;
+            let fa = a.f_attrs.as_deref().filter(|fa| is_array_f(fa))?;
+            Some(ref_covers(fa, r, c))
+        });
+        if frozen_ref_covers == Some(false) {
+            owner = None;
+        }
         // Deleting a cell of a frozen anchor's block (or putting back the
         // value it holds, as undo/redo of that does) is a no-op but for the
         // style, as deleting a spilled cell is in Excel: the anchor never
         // re-spills, so its block must stay whole — cached values, extent
         // and the `ref` the writer gives it.
-        if owner_frozen && cell.formula.is_none() {
+        let in_frozen_block = frozen_ref_covers == Some(true);
+        if in_frozen_block && cell.formula.is_none() {
             if let Some(sheet) = wb.sheets.get_mut(s) {
                 let held = sheet.cell(r, c);
                 let same = held.is_none_or(|h| h.formula.is_none())
@@ -835,6 +848,21 @@ fn clear_spill(
         }
     }
     out
+}
+
+/// Does the `ref` in preserved `<f>` attributes cover (r, c)?
+fn ref_covers(fa: &str, r: u32, c: u32) -> bool {
+    let Some(rf) = crate::sheet::f_ref(fa) else {
+        return false;
+    };
+    let (a, b) = rf.split_once(':').unwrap_or((rf, rf));
+    let (Some((r1, c1)), Some((r2, c2))) = (
+        crate::sheet::parse_cell_name(a),
+        crate::sheet::parse_cell_name(b),
+    ) else {
+        return false;
+    };
+    (r1..=r2).contains(&r) && (c1..=c2).contains(&c)
 }
 
 /// The anchor whose spill contains (r, c), if any (excluding (r, c) itself

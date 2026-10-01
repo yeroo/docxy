@@ -10772,6 +10772,35 @@ b",
     }
 
     #[test]
+    fn delete_outside_a_frozen_arrays_shifted_ref_still_clears() {
+        // #777 r4: a row delete shifts a frozen anchor's `ref` (E1:E3 →
+        // E1:E2) but not its stale extent, so E3 — now the user's "x" — is
+        // not part of the block: Delete clears it. E2 still is: a no-op.
+        let rows = concat!(
+            r#"<row r="1"><c r="A1"><v>1</v></c><c r="E1" cm="1"><f t="array" ref="E1:E3">_xlfn.PIVOTBY(A1,4)</f><v>7</v></c></row>"#,
+            r#"<row r="2"><c r="E2"><v>8</v></c></row>"#,
+            r#"<row r="3"><c r="E3"><v>9</v></c></row>"#,
+            r#"<row r="4"><c r="E4" t="inlineStr"><is><t>x</t></is></c></row>"#,
+        );
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        crate::edit::delete_rows(&mut pkg.workbook, 0, 1, 1);
+        let at = |pkg: &SheetPackage, r: u32| {
+            pkg.workbook.sheets[0]
+                .cell(r, 4)
+                .map_or(CellValue::Empty, |cl| cl.value.clone())
+        };
+        assert_eq!(at(&pkg, 2), CellValue::Text("x".into()));
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        let before = pkg.workbook.sheets[0].cell(2, 4).cloned().unwrap();
+        eng.set_cell(&mut pkg.workbook, (0, 2, 4), Cell::default());
+        assert_eq!(at(&pkg, 2), CellValue::Empty);
+        eng.restore_cell(&mut pkg.workbook, (0, 2, 4), before);
+        assert_eq!(at(&pkg, 2), CellValue::Text("x".into()));
+        eng.set_cell(&mut pkg.workbook, (0, 1, 4), Cell::default());
+        assert_eq!(at(&pkg, 1), CellValue::Number(9.0));
+    }
+
+    #[test]
     fn cm_is_written_only_on_an_array_formula() {
         // A data-table `<f>` is kept verbatim but is not a dynamic array.
         let rows = r#"<row r="1"><c r="A1"><v>1</v></c><c r="G1" cm="1"><f t="dataTable" ref="G1:G2" dt2D="0" dtr="0" r1="A1"/><v>1</v></c></row>"#;

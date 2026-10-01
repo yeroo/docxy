@@ -1072,9 +1072,10 @@ fn paste_grid_block(
     for (dr, row) in block.iter().enumerate() {
         for (dc, cell) in row.iter().enumerate() {
             let (r, c) = (br + dr as u32, bc + dc as u32);
-            let mut cell = match children.contains(&(dr as u32, dc as u32)) {
-                true => cell.blank_like(),
-                false => cell.clone(),
+            let mut cell = if children.contains(&(dr as u32, dc as u32)) {
+                cell.blank_like()
+            } else {
+                cell.clone()
             };
             let current = wb.sheets.get(s).and_then(|sh| sh.cell(r, c));
             gridcore::sheet::anchor_pasted_array_ref(&mut cell, current, r, c);
