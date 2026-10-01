@@ -151,39 +151,68 @@ pub(crate) fn reopen_question(name: &str) -> String {
     )
 }
 
-/// Excel's name for a copy of `src`: `Copy (1)book.xlsx` beside it, or the
-/// first `Copy (k)book.xlsx` that does not exist yet.
-pub(crate) fn copy_target(src: &Path) -> Option<PathBuf> {
-    let name = src.file_name()?.to_string_lossy().into_owned();
-    let dir = src.parent().unwrap_or(Path::new(""));
-    (1..=u32::MAX)
-        .map(|k| dir.join(format!("Copy ({k}){name}")))
-        .find(|p| !p.exists())
+/// How many `Copy (k)` names [`write_copy`] tries before it gives up.
+const COPY_NAMES: u32 = 1000;
+
+/// Excel's names for a copy of `src`, in the order they are tried:
+/// `Copy (1)book.xlsx` beside it, then `Copy (2)book.xlsx`, and so on.
+fn copy_names(src: &Path) -> impl Iterator<Item = PathBuf> + use<> {
+    let name = src
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let dir = src.parent().unwrap_or(Path::new("")).to_path_buf();
+    (1..=COPY_NAMES).map(move |k| dir.join(format!("Copy ({k}){name}")))
 }
 
-/// Write a copy of `src` at [`copy_target`] and return its path. The bytes
-/// are read and written, never `fs::copy`'d, so no alternate data stream
-/// rides along; the caller decides Protected View from the source. The copy
-/// is created new, so a file that appeared under that name meanwhile is
-/// never overwritten.
+/// Excel's name for a copy of `src`: the first of [`copy_names`] that does
+/// not exist yet. Only a preview: [`write_copy`] decides by creating it.
+#[cfg(test)]
+pub(crate) fn copy_target(src: &Path) -> Option<PathBuf> {
+    copy_names(src).find(|p| !p.exists())
+}
+
+/// Write a copy of `src` under the first of its [`copy_names`] that can be
+/// created, and return its path. The bytes are read and written, never
+/// `fs::copy`'d, so no alternate data stream rides along; the caller decides
+/// Protected View from the source.
 pub(crate) fn write_copy(src: &Path) -> Result<PathBuf, String> {
     let name = src
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let bytes = std::fs::read(src).map_err(|e| format!("could not copy \"{name}\": {e}"))?;
-    let target =
-        copy_target(src).ok_or_else(|| format!("could not copy \"{name}\": no name is free"))?;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&target)
-        .and_then(|mut f| f.write_all(&bytes))
-        .map_err(|e| {
+    write_new(copy_names(src), &bytes).map_err(|e| format!("could not copy \"{name}\": {e}"))
+}
+
+/// Write `bytes` to the first of `candidates` that does not exist, and
+/// return it. Each is created new, so the existence check and the write are
+/// one step: a file that appears under a name (another instance, a sync
+/// client, a dangling link) is never overwritten and never removed, and the
+/// next name is tried. Only a file this call created is removed, when
+/// writing it fails. Any error but "already exists" ends the search.
+fn write_new(
+    candidates: impl IntoIterator<Item = PathBuf>,
+    bytes: &[u8],
+) -> Result<PathBuf, String> {
+    for target in candidates {
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {e}", target.display())),
+        };
+        if let Err(e) = file.write_all(bytes) {
+            drop(file);
             let _ = std::fs::remove_file(&target);
-            format!("could not copy \"{name}\" to {}: {e}", target.display())
-        })?;
-    Ok(target)
+            return Err(format!("{}: {e}", target.display()));
+        }
+        return Ok(target);
+    }
+    Err("no name is free".into())
 }
 
 /// The Internet (3) and Restricted (4) zones open in Protected View.
@@ -247,8 +276,7 @@ pub(crate) fn parse_zone_identifier(bytes: &[u8]) -> Option<u32> {
 /// Whether a key may reach a workbook in Protected View: moving and
 /// extending the selection, scrolling, switching sheets, copying, finding,
 /// and the modifiers on their own. Everything else would edit.
-pub(crate) fn protected_allows_key(key: &str, ctrl: bool, shift: bool, alt: bool) -> bool {
-    let _ = shift;
+pub(crate) fn protected_allows_key(key: &str, ctrl: bool, alt: bool) -> bool {
     match key {
         "shift" | "control" | "alt" | "platform" | "function" => true,
         "left" | "right" | "up" | "down" | "pageup" | "pagedown" | "home" | "end" | "escape"
@@ -395,6 +423,35 @@ mod tests {
         assert_eq!(copy_target(&src).unwrap(), dir.0.join("Copy (3)book.xlsx"));
     }
 
+    /// #610 r1: a name taken after it was chosen (here: before, which
+    /// `write_new` cannot tell apart, since it never probes) is left exactly
+    /// as it is, and the copy lands at the next name.
+    #[test]
+    fn write_new_skips_a_name_that_exists_and_never_removes_it() {
+        let dir = Scratch::new("write-new-taken");
+        let taken = dir.0.join("Copy (1)book.xlsx");
+        std::fs::write(&taken, b"theirs").unwrap();
+        let names = [taken.clone(), dir.0.join("Copy (2)book.xlsx")];
+        let written = write_new(names, b"ours").unwrap();
+        assert_eq!(written, dir.0.join("Copy (2)book.xlsx"));
+        assert_eq!(std::fs::read(&taken).unwrap(), b"theirs");
+        assert_eq!(std::fs::read(&written).unwrap(), b"ours");
+        // Every name taken: an error, and still nothing touched.
+        let err = write_new([taken.clone()], b"ours").unwrap_err();
+        assert_eq!(err, "no name is free");
+        assert_eq!(std::fs::read(&taken).unwrap(), b"theirs");
+    }
+
+    #[test]
+    fn write_new_stops_at_an_error_other_than_already_exists() {
+        let dir = Scratch::new("write-new-error");
+        let missing = dir.0.join("no-such-folder").join("Copy (1)book.xlsx");
+        let next = dir.0.join("Copy (2)book.xlsx");
+        let err = write_new([missing.clone(), next.clone()], b"ours").unwrap_err();
+        assert!(err.starts_with(&missing.display().to_string()), "{err}");
+        assert!(!next.exists(), "the search ended at the first real error");
+    }
+
     #[test]
     fn write_copy_writes_the_bytes_and_leaves_the_source() {
         let dir = Scratch::new("write-copy");
@@ -486,23 +543,20 @@ mod tests {
         for key in [
             "left", "right", "up", "down", "pageup", "pagedown", "home", "end", "tab", "escape",
         ] {
-            assert!(protected_allows_key(key, false, false, false), "{key}");
-            assert!(
-                protected_allows_key(key, true, true, false),
-                "ctrl+shift+{key}"
-            );
+            assert!(protected_allows_key(key, false, false), "{key}");
+            assert!(protected_allows_key(key, true, false), "ctrl+{key}");
         }
-        assert!(protected_allows_key("enter", false, true, false));
-        assert!(protected_allows_key("shift", false, true, false));
+        assert!(protected_allows_key("enter", false, false));
+        assert!(protected_allows_key("shift", false, false));
         for key in ["c", "a", "f"] {
-            assert!(protected_allows_key(key, true, false, false), "ctrl+{key}");
+            assert!(protected_allows_key(key, true, false), "ctrl+{key}");
         }
     }
 
     #[test]
     fn protected_refuses_keys_that_edit() {
         for key in ["x", "v", "z", "y", "b", "i", "d", "r", "s", ";", "enter"] {
-            assert!(!protected_allows_key(key, true, false, false), "ctrl+{key}");
+            assert!(!protected_allows_key(key, true, false), "ctrl+{key}");
         }
         for key in [
             "a",
@@ -516,11 +570,8 @@ mod tests {
             "insert",
             "space",
         ] {
-            assert!(!protected_allows_key(key, false, false, false), "{key}");
+            assert!(!protected_allows_key(key, false, false), "{key}");
         }
-        assert!(
-            !protected_allows_key("enter", false, false, true),
-            "alt+enter"
-        );
+        assert!(!protected_allows_key("enter", false, true), "alt+enter");
     }
 }

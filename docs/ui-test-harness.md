@@ -769,8 +769,8 @@ While a dialog is open on the active tab:
   so `key` and `type` drive the widgets the way a person does.
 - **Pointer verbs are refused** with `a dialog is open: <title>`: `click-cell`,
   `drag`, `fill-drag`, `save-as`, `ribbon-click`, `select-chart`, `focus-field`, `title-tab`,
-  `tab-select`, `proj.new`, `backstage {open}`, `backstage-close`, `close-tab`
-  and `selection-set`.
+  `tab-select`, `proj.new`, `backstage {open}`, `backstage-close`, `close-tab`,
+  `selection-set` and `enable-editing`.
 - The state reads `dialog: <id>` (`none` on every surface when nothing is open),
   and a Project's `app_state` reads `Edit`.
 - A control-pipe edit, reload or save of that Project dismisses its dialogs
@@ -861,7 +861,7 @@ stands for a press outside the menu (`click-cell`, `drag`, `fill-drag`,
 `save-as`, `select-chart`,
 `focus-field`, `ribbon-click`, `title-tab`, `close-tab`, `selection-set`,
 `open`, `backstage` open and close (not `read`), `backstage-close`,
-`theme-set`, `ask-on-close`, `autorecover` and the
+`theme-set`, `ask-on-close`, `autorecover`, `enable-editing` and the
 `dialog-*` drivers), which closes it first and then goes on, as the press
 would. Reads leave it open.
 

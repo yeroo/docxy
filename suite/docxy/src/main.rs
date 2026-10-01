@@ -724,6 +724,16 @@ fn bar_target(act: SheetAct) -> Option<RefTarget> {
     }
 }
 
+/// The workbook commands Protected View lets through (#610): copying and
+/// moving between comments only look. Everything else edits, opens a bar or
+/// dialog that would, or changes what the file saves (Freeze Panes, Outline).
+fn protected_view_allows_act(act: SheetAct) -> bool {
+    matches!(
+        act,
+        SheetAct::Copy | SheetAct::PrevComment | SheetAct::NextComment | SheetAct::Todo
+    )
+}
+
 /// Whether a ribbon command reads or writes the cell selection.
 ///
 /// The same rule `chart_hand_back` states for keys, asked of the ribbon: a
@@ -739,16 +749,6 @@ fn bar_target(act: SheetAct) -> Option<RefTarget> {
 /// four that never touch it — protection and outlining are properties of the
 /// whole sheet, the Number format combo only opens or closes its strip (a
 /// format picked there is what acts on cells), and `Todo` does nothing at all.
-/// The workbook commands Protected View lets through (#610): copying and
-/// moving between comments only look. Everything else edits, opens a bar or
-/// dialog that would, or changes what the file saves (Freeze Panes, Outline).
-fn protected_view_allows_act(act: SheetAct) -> bool {
-    matches!(
-        act,
-        SheetAct::Copy | SheetAct::PrevComment | SheetAct::NextComment | SheetAct::Todo
-    )
-}
-
 fn act_targets_cells(act: SheetAct) -> bool {
     !matches!(
         act,
@@ -4318,10 +4318,10 @@ fn tab_from_path(path: &PathBuf) -> DocTab {
     if is_project_path(path) {
         return project_tab_from_path(path);
     }
-    let title: SharedString = file_name(path).into();
     if is_sheet_path(path) {
         sheet_tab_from_path(path, false)
     } else {
+        let title: SharedString = file_name(path).into();
         doc_from_path(path).into_tab(Kind::Docx, title, Some(path.clone()), false)
     }
 }
@@ -4330,33 +4330,31 @@ fn tab_from_path(path: &PathBuf) -> DocTab {
 /// opens as a new, untitled workbook.
 fn sheet_tab_from_path(path: &PathBuf, repair: bool) -> DocTab {
     let title: SharedString = file_name(path).into();
-    {
-        let (surface, status) = sheet_from_path_mode(path, repair);
-        let (title, path, status) = match template_title(path) {
-            Some(new_title) if matches!(surface, Surface::Sheet(_)) => (
-                new_title.into(),
-                None,
-                format!("new workbook from template {}", file_name(path)).into(),
-            ),
-            _ => (title, Some(path.clone()), status),
-        };
-        DocTab {
-            kind: Kind::Xlsx,
-            title,
-            path,
-            surface,
-            dirty: false,
-            status,
-            comments: vec![],
-            pkg: None,
-            notes: vec![],
-            markdown: false,
-            hf_edit: None,
-            bundle_html: None,
-            load_failed: false,
-            dialogs: crate::dialog::DialogStack::default(),
-            access: crate::open_mode::Access::default(),
-        }
+    let (surface, status) = sheet_from_path_mode(path, repair);
+    let (title, path, status) = match template_title(path) {
+        Some(new_title) if matches!(surface, Surface::Sheet(_)) => (
+            new_title.into(),
+            None,
+            format!("new workbook from template {}", file_name(path)).into(),
+        ),
+        _ => (title, Some(path.clone()), status),
+    };
+    DocTab {
+        kind: Kind::Xlsx,
+        title,
+        path,
+        surface,
+        dirty: false,
+        status,
+        comments: vec![],
+        pkg: None,
+        notes: vec![],
+        markdown: false,
+        hf_edit: None,
+        bundle_html: None,
+        load_failed: false,
+        dialogs: crate::dialog::DialogStack::default(),
+        access: crate::open_mode::Access::default(),
     }
 }
 
@@ -12802,7 +12800,7 @@ impl Docxy {
         // where it would write.
         if self.protected_view()
             && !self.find_open
-            && !open_mode::protected_allows_key(key, ctrl, shift, alt)
+            && !open_mode::protected_allows_key(key, ctrl, alt)
         {
             self.protected_refused(cx);
             return;
