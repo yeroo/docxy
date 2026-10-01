@@ -701,8 +701,21 @@ A dialog is app state on its document tab, **never a native modal loop**, so the
 control pump cannot block on one (#393). Dialogs stack: a button can open a
 child over its parent, and only the top one takes input. The window draws the
 top dialog over a backdrop that covers everything, title bar and ribbon
-included. The only dialog today is the Project `delete-summary` message box;
-`project-dialog.uit` drives it.
+included. Each has a stable id, which the state's `dialog` key reports:
+
+| Id | Dialog |
+|---|---|
+| `delete-summary` | Project: delete a summary task and its subtasks (`project-dialog.uit`) |
+| `page-setup`, `columns` | Word's Page Setup and Columns (#649) |
+| `hf-distance`, `page-number-format` | the Header & Footer tab's distance box (#641) and Page Number Format (#650) |
+| `insert-table`, `delete-cells`, `split-cells`, `sort`, `convert-to-text`, `convert-text-to-table` | the table dialogs (#646, #647) |
+| `text-to-columns`, `text-to-columns-replace` | Excel's Convert Text to Columns Wizard and its replace question (#692) |
+| `reopen` | "… is already open … Do you want to reopen …?" before an open discards a workbook's unsaved changes (#610) |
+
+`reopen`'s **Yes** is not an undo step and applies nothing to the tab: it
+loads the tab again from its file, in the open mode that was asked for
+(read-only, repaired or normal), and the unsaved changes are gone. **No**
+closes it and keeps the tab as it was. `open-modes.uit` drives it.
 
 There is no `dialog-open`. A dialog opens through the verb a person would use
 (`key`, `ribbon-click`, `click-cell {double}`), so a case covers the real entry

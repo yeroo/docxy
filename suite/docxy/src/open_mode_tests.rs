@@ -320,6 +320,27 @@ fn a_leak_without_a_snapshot_is_undone_from_the_file() {
     assert_eq!(pkg.workbook.sheets[0].name, "Sheet1");
 }
 
+/// #610 r3: a repaired tab is loaded again the way it was opened, through
+/// repair; a strict load of its damaged file would give a placeholder.
+#[test]
+fn a_leak_on_a_repaired_protected_tab_reloads_through_repair() {
+    let dir = Scratch::new();
+    let src = damaged_book(&dir, "book.xlsx");
+    let mut tab = tab_from_path_mode(&src, OpenMode::Repair).unwrap();
+    tab.access.protected = true;
+    let Surface::Sheet(v) = &mut tab.surface else {
+        panic!("{}", tab.status)
+    };
+    assert!(v.pkg.rename_sheet(0, "Leaked"));
+    protected_rollback(&mut tab);
+    let Surface::Sheet(v) = &tab.surface else {
+        panic!("the reload fell back to a placeholder: {}", tab.status)
+    };
+    assert_eq!(v.pkg.workbook.sheets[0].name, "Sheet1");
+    assert!(!tab.dirty);
+    assert!(tab.access.repaired && tab.access.protected);
+}
+
 /// With no file to read (a template opened from a download is untitled),
 /// the backstop falls back to the oldest snapshot.
 #[test]
