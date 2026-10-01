@@ -3693,7 +3693,9 @@ fn same_formula(held: &str, model: &str) -> bool {
 }
 
 /// `element` with its start tag's `attr` set to `value` in place, so the
-/// attribute order is kept; added by [`set_tag_attr`] when it has none.
+/// attribute order is kept; inserted after the element name when it has
+/// none. A start tag that doesn't read ([`start_tag`]) leaves `element`
+/// unchanged.
 fn set_tag_attr_in_place(mut element: String, attr: &str, value: &str) -> String {
     let Some(tag) = start_tag(&element) else {
         return element;
@@ -16808,8 +16810,19 @@ mod rule_shift_tests {
 
     #[test]
     fn an_element_without_sqref_is_left_alone() {
-        // A model rule from it has no ranges, so nothing moves or goes, and
-        // the save never adds an sqref the element didn't have.
+        // The loader keeps a CF block with rules but no `sqref`: no ranges,
+        // and an `ix`. The edit moves its formula in the model, but with no
+        // `sqref` to read the save can't tell what the element covers, so it
+        // leaves it as it is rather than rewrite it (or add an `sqref`).
+        let cf = r#"<conditionalFormatting><cfRule type="expression" priority="1"><formula>A1</formula></cfRule></conditionalFormatting>"#;
+        let mut pkg = one("S", cf);
+        assert_eq!(pkg.workbook.sheets[0].cond_formats[0].ix, Some(0));
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        assert_eq!(first_formula(&pkg.workbook.sheets[0].cond_formats[0]), "A2");
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(cf), "{ws}");
+        // A DV without one isn't modelled at all (no ranges), so it is
+        // left as it is by construction; kept here as a regression guard.
         let dv = r#"<dataValidations count="1"><dataValidation type="whole"><formula1>A1</formula1></dataValidation></dataValidations>"#;
         let mut pkg = one("S", dv);
         insert_rows(&mut pkg.workbook, 0, 0, 1);
