@@ -70,7 +70,7 @@ pub fn draw(f: &mut Frame, area: Rect, bs: &mut Backstage, host: &dyn BackstageH
     match bs.item {
         Item::Open => draw_open(f, cols[1], bs, host),
         Item::SaveAs => draw_save_as(f, cols[1], bs, host),
-        Item::Info => draw_info(f, cols[1], host),
+        Item::Info => draw_info(f, cols[1], bs, host),
         Item::Options => draw_options(f, cols[1], bs, host),
         Item::Export if !bs.save_types.is_empty() => draw_export(f, cols[1], bs, host),
         other => {
@@ -371,10 +371,41 @@ fn draw_options(f: &mut Frame, area: Rect, bs: &Backstage, host: &dyn BackstageH
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw_info(f: &mut Frame, area: Rect, host: &dyn BackstageHost) {
+fn draw_info(f: &mut Frame, area: Rect, bs: &mut Backstage, host: &dyn BackstageHost) {
     let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut lines = host.info_lines();
+    let fields = host.info_fields();
+    let custom = host.info_custom_row();
+    if !fields.is_empty() || custom {
+        let focus = bs.pane == Pane::Info;
+        let accent = Style::default().fg(Color::Black).bg(host.accent());
+        lines.push(RLine::raw(""));
+        // Inside the box's top border.
+        bs.layout.info_top = area.y + 1 + lines.len() as u16;
+        let rows = fields
+            .iter()
+            .map(|(label, value)| format!("  {label:<18}{value}"))
+            .chain(custom.then(|| "  Custom property…".to_string()));
+        for (i, text) in rows.enumerate() {
+            let style = if focus && i == bs.info_sel {
+                accent
+            } else {
+                Style::default()
+            };
+            lines.push(RLine::styled(text, style));
+        }
+        lines.push(RLine::raw(""));
+        lines.push(RLine::styled(
+            if focus {
+                "  ↑↓ choose · Enter edit · ← menu · Esc close"
+            } else {
+                "  Enter to edit the properties · Esc to close"
+            },
+            dim,
+        ));
+    }
     f.render_widget(
-        Paragraph::new(host.info_lines()).block(
+        Paragraph::new(lines).block(
             RBlock::default()
                 .borders(Borders::ALL)
                 .border_style(dim)
@@ -509,6 +540,74 @@ mod tests {
             "heading missing"
         );
         assert!(text.contains("[x] Keep zeros"), "checkbox missing");
+    }
+
+    struct Editable;
+    impl BackstageHost for Editable {
+        fn extensions(&self) -> &'static [&'static str] {
+            &["xlsx"]
+        }
+        fn default_save_name(&self) -> String {
+            "book.xlsx".into()
+        }
+        fn preview_lines(&self, _p: &Path, _w: usize) -> Vec<String> {
+            Vec::new()
+        }
+        fn info_lines(&self) -> Vec<Line<'static>> {
+            vec![Line::raw("  File  book.xlsx"), Line::raw("  Author  Me")]
+        }
+        fn accent(&self) -> Color {
+            Color::Green
+        }
+        fn info_fields(&self) -> Vec<(String, String)> {
+            vec![
+                ("Title".into(), "Budget".into()),
+                ("Tags".into(), String::new()),
+            ]
+        }
+        fn info_custom_row(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn draws_the_info_page_with_its_editable_rows() {
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut bs = Backstage::open(std::env::temp_dir(), &["xlsx"]);
+        bs.focus_info(1);
+        term.draw(|f| {
+            let a = f.area();
+            super::draw(f, a, &mut bs, &Editable);
+        })
+        .unwrap();
+        let text = screen(&term);
+        let lines: Vec<&str> = text.lines().collect();
+        // Box border at y 1, two info lines, a blank line, then the rows.
+        assert_eq!(bs.layout.info_top, 5);
+        assert!(lines[5].contains("Title             Budget"), "{text}");
+        assert!(lines[6].contains("Tags"), "{text}");
+        assert!(lines[7].contains("Custom property…"), "{text}");
+        assert!(text.contains("Enter edit"), "{text}");
+        // The focused row is highlighted in the host's accent.
+        let buf = term.backend().buffer();
+        assert_eq!(buf[(18, 6)].bg, Color::Green);
+        assert_ne!(buf[(18, 5)].bg, Color::Green);
+    }
+
+    #[test]
+    fn draws_a_read_only_info_page_as_before() {
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut bs = Backstage::open(std::env::temp_dir(), &["docx"]);
+        bs.item = Item::Info;
+        term.draw(|f| {
+            let a = f.area();
+            super::draw(f, a, &mut bs, &H);
+        })
+        .unwrap();
+        let text = screen(&term);
+        assert!(text.contains("info"), "{text}");
+        assert!(!text.contains("Custom property"), "{text}");
+        assert!(!text.contains("Enter to edit"), "{text}");
     }
 
     #[test]
