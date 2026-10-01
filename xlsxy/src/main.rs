@@ -30,6 +30,7 @@ mod textdlg;
 use backstage::BackstageHost as _;
 
 use gridcore::comments::Comment;
+use gridcore::docprops::{CustomProperty, CustomValue, DocProperties};
 use gridcore::edit::{fill_changes, replace_all_in_sheet};
 use gridcore::engine::Engine;
 use gridcore::entry::{entry_cell, entry_ctx, seed_text};
@@ -1240,6 +1241,40 @@ enum PromptKind {
     SortKeys,
     /// Row height in points for the selected rows ("auto" clears it).
     RowHeight,
+    /// File › Info: a new value for editable property `n` ([`INFO_FIELDS`]),
+    /// or, past them, `Name = value` for a custom property.
+    DocProperty(u8),
+}
+
+/// File › Info's editable document properties, in display order:
+/// (row label, prompt label).
+const INFO_FIELDS: [(&str, &str); 8] = [
+    ("Title", "Title: "),
+    ("Tags", "Tags: "),
+    ("Categories", "Categories: "),
+    ("Subject", "Subject: "),
+    ("Comments", "Comments: "),
+    ("Company", "Company: "),
+    ("Manager", "Manager: "),
+    ("Hyperlink base", "Hyperlink base: "),
+];
+
+/// The prompt File › Info's `Custom property…` row opens.
+const CUSTOM_PROPERTY_PROMPT: &str = "Custom property  Name = value (empty value removes): ";
+
+/// The property behind [`INFO_FIELDS`] row `i`.
+fn info_field(p: &mut DocProperties, i: usize) -> Option<&mut Option<String>> {
+    Some(match i {
+        0 => &mut p.title,
+        1 => &mut p.keywords,
+        2 => &mut p.category,
+        3 => &mut p.subject,
+        4 => &mut p.description,
+        5 => &mut p.company,
+        6 => &mut p.manager,
+        7 => &mut p.hyperlink_base,
+        _ => return None,
+    })
 }
 
 struct Prompt {
@@ -2870,6 +2905,10 @@ impl App {
             let xml = model_part_xml(&self.model_rels, &self.model_measures);
             self.pkg.set_part(MODEL_PART, xml.into_bytes());
         }
+        // As Excel does: the file says when it was saved and by whom. Its
+        // author and creation time are kept, or, on a workbook's first save
+        // (no core properties yet), set to this user and this time.
+        self.pkg.stamp_save(&iso_now(), &comment_author());
         // The file's type follows the path it is written to.
         save_xlsx_for_path(&self.pkg, &self.path)
     }
@@ -3895,6 +3934,72 @@ impl App {
 
     // --- File backstage ------------------------------------------------------
 
+    /// Set File › Info's property row `i` to `text` (empty removes it); past
+    /// [`INFO_FIELDS`], `text` is `Name = value` for a custom property, its
+    /// type read from the value ([`CustomValue::from_input`]). Not undoable,
+    /// as in Excel; marks the workbook modified when something changed.
+    /// Returns what happened, for the Info page to say.
+    fn commit_doc_property(&mut self, i: usize, text: &str) -> Option<String> {
+        let before = self.pkg.doc_properties();
+        let mut p = before.clone();
+        let label = match info_field(&mut p, i) {
+            Some(slot) => {
+                *slot = (!text.is_empty()).then(|| text.to_string());
+                INFO_FIELDS[i].0
+            }
+            None => {
+                if text.is_empty() {
+                    return None;
+                }
+                let Some((name, value)) = text.split_once('=') else {
+                    return Some("Custom property: type Name = value".to_string());
+                };
+                let (name, value) = (name.trim(), value.trim());
+                if name.is_empty() {
+                    return Some("Custom property: the name is missing".to_string());
+                }
+                let at = p
+                    .custom
+                    .iter()
+                    .position(|c| c.name.to_lowercase() == name.to_lowercase());
+                match (at, value.is_empty()) {
+                    (Some(at), true) => {
+                        p.custom.remove(at);
+                    }
+                    (Some(at), false) => p.custom[at].value = CustomValue::from_input(value),
+                    (None, false) => p.custom.push(CustomProperty {
+                        name: name.to_string(),
+                        value: CustomValue::from_input(value),
+                    }),
+                    (None, true) => {
+                        return Some(format!("No custom property named {name}"));
+                    }
+                }
+                "Custom property"
+            }
+        };
+        if p == before {
+            return None;
+        }
+        match self.pkg.set_doc_properties(&p) {
+            Ok(()) => {
+                self.modified = true;
+                Some(format!("{label} updated"))
+            }
+            Err(e) => Some(e),
+        }
+    }
+
+    /// Back to File › Info on row `row`, after its prompt, saying `message`
+    /// there (the status bar is hidden under the backstage).
+    fn reopen_info(&mut self, row: usize, message: Option<String>) {
+        self.open_backstage();
+        if let Some(b) = &mut self.backstage {
+            b.focus_info(row);
+            b.info_message = message;
+        }
+    }
+
     /// Open the File backstage rooted at the current file's directory.
     fn open_backstage(&mut self) {
         let dir = std::path::Path::new(&self.path)
@@ -4186,6 +4291,13 @@ impl App {
             }
             BackstageEvent::Exit => {
                 self.request_exit();
+                false
+            }
+            // The minibuffer edits the property; the backstage comes back
+            // on Info when it is done (see `reopen_info`).
+            BackstageEvent::EditInfo(i) => {
+                self.backstage = None;
+                self.open_prompt(PromptKind::DocProperty(i as u8));
                 false
             }
         }
@@ -5501,6 +5613,13 @@ impl App {
             ),
             PromptKind::SortKeys => ("Sort by (e.g. B asc, C desc): ", String::new()),
             PromptKind::RowHeight => ("Row height in points (or 'auto'): ", String::new()),
+            PromptKind::DocProperty(i) => {
+                let mut p = self.pkg.doc_properties();
+                match info_field(&mut p, i as usize) {
+                    Some(slot) => (INFO_FIELDS[i as usize].1, slot.take().unwrap_or_default()),
+                    None => (CUSTOM_PROPERTY_PROMPT, String::new()),
+                }
+            }
         };
         let cursor = text.chars().count();
         self.prompt = Some(Prompt {
@@ -5541,6 +5660,10 @@ impl App {
             PromptKind::Filter => self.commit_filter(&text),
             PromptKind::SortKeys => self.commit_sort(&text),
             PromptKind::RowHeight => self.commit_row_height(&text),
+            PromptKind::DocProperty(i) => {
+                let message = self.commit_doc_property(i as usize, &text);
+                self.reopen_info(i as usize, message);
+            }
             PromptKind::SaveAs => {
                 if !text.is_empty() {
                     self.request_save_as(text);
@@ -5757,7 +5880,7 @@ impl backstage::BackstageHost for App {
             .iter()
             .map(|s| s.name.as_str())
             .collect();
-        vec![
+        let mut lines = vec![
             RLine::raw(format!("  File        {}", self.path)),
             RLine::raw(format!(
                 "  Modified    {}",
@@ -5770,7 +5893,41 @@ impl backstage::BackstageHost for App {
                 sheets.join(", ")
             )),
             RLine::raw(format!("  Comments    {}", self.comments.len())),
-        ]
+        ];
+        let p = self.pkg.doc_properties();
+        let row = |label: &str, value: &Option<String>| {
+            RLine::raw(format!("  {label:<18}{}", value.as_deref().unwrap_or("")))
+        };
+        lines.push(RLine::raw(String::new()));
+        lines.push(row("Author", &p.creator));
+        lines.push(row("Last Modified By", &p.last_modified_by));
+        lines.push(row("Created", &p.created));
+        lines.push(row("Last Modified", &p.modified));
+        for (i, c) in p.custom.iter().enumerate() {
+            let label = if i == 0 { "Custom" } else { "" };
+            lines.push(RLine::raw(format!(
+                "  {label:<18}{} = {}",
+                c.name,
+                c.value.display()
+            )));
+        }
+        lines
+    }
+
+    fn info_fields(&self) -> Vec<(String, String)> {
+        let mut p = self.pkg.doc_properties();
+        INFO_FIELDS
+            .iter()
+            .enumerate()
+            .map(|(i, (label, _))| {
+                let value = info_field(&mut p, i).and_then(Option::take);
+                (label.to_string(), value.unwrap_or_default())
+            })
+            .collect()
+    }
+
+    fn info_custom_row(&self) -> bool {
+        true
     }
 
     fn accent(&self) -> Color {
@@ -7186,7 +7343,13 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     if app.prompt.is_some() {
         match key.code {
             KeyCode::Esc => {
-                app.prompt = None;
+                if let Some(Prompt {
+                    kind: PromptKind::DocProperty(i),
+                    ..
+                }) = app.prompt.take()
+                {
+                    app.reopen_info(i as usize, None);
+                }
             }
             KeyCode::Enter => app.commit_prompt(),
             KeyCode::Left => {
@@ -8017,6 +8180,244 @@ mod tests {
         assert!(dir.join("other.html").is_file());
         assert!(!dir.join("other.html.htm").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #600: File › Info edits a property through the minibuffer and comes
+    /// back to Info on the same row; Esc cancels the same way.
+    #[test]
+    fn file_info_edits_properties_through_the_prompt() {
+        let mut app = App::new(new_xlsx(), "info.xlsx");
+        app.os_clip = None;
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        let type_text = |app: &mut App, s: &str| {
+            for c in s.chars() {
+                handle_key(app, key(KeyCode::Char(c)));
+            }
+        };
+        let at_info = |app: &App, row: usize| {
+            let b = app.backstage.as_ref().expect("back on the backstage");
+            assert_eq!(
+                (b.item, b.pane, b.info_sel),
+                (backstage::Item::Info, backstage::Pane::Info, row)
+            );
+        };
+        app.open_backstage();
+        while app.backstage.as_ref().unwrap().item != backstage::Item::Info {
+            app.backstage_key(key(KeyCode::Down));
+        }
+        let labels: Vec<String> = app.info_fields().into_iter().map(|(l, _)| l).collect();
+        assert_eq!(
+            labels,
+            [
+                "Title",
+                "Tags",
+                "Categories",
+                "Subject",
+                "Comments",
+                "Company",
+                "Manager",
+                "Hyperlink base"
+            ]
+        );
+        assert!(app.info_custom_row());
+
+        // Enter focuses the rows; Enter on Title opens its prompt.
+        app.backstage_key(key(KeyCode::Enter));
+        app.backstage_key(key(KeyCode::Enter));
+        assert!(app.backstage.is_none());
+        let p = app.prompt.as_ref().unwrap();
+        assert!(p.kind == PromptKind::DocProperty(0));
+        assert_eq!((p.label, p.text.as_str()), ("Title: ", ""));
+        type_text(&mut app, "Budget");
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(app.prompt.is_none());
+        assert!(app.modified);
+        assert_eq!(app.pkg.doc_properties().title.as_deref(), Some("Budget"));
+        assert_eq!(app.info_fields()[0].1, "Budget");
+        at_info(&app, 0);
+
+        // The prompt opens on the current value; Esc keeps it.
+        app.modified = false;
+        app.backstage_key(key(KeyCode::Enter));
+        let p = app.prompt.as_ref().unwrap();
+        assert_eq!((p.text.as_str(), p.cursor), ("Budget", 6));
+        handle_key(&mut app, key(KeyCode::Backspace));
+        handle_key(&mut app, key(KeyCode::Esc));
+        assert!(app.prompt.is_none());
+        assert!(!app.modified);
+        assert_eq!(app.pkg.doc_properties().title.as_deref(), Some("Budget"));
+        at_info(&app, 0);
+
+        // Company, then the custom-property row after the eight fields.
+        for _ in 0..5 {
+            app.backstage_key(key(KeyCode::Down));
+        }
+        app.backstage_key(key(KeyCode::Enter));
+        type_text(&mut app, "Acme & Co");
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            app.pkg.doc_properties().company.as_deref(),
+            Some("Acme & Co")
+        );
+        at_info(&app, 5);
+        for _ in 0..10 {
+            app.backstage_key(key(KeyCode::Down));
+        }
+        app.backstage_key(key(KeyCode::Enter));
+        let p = app.prompt.as_ref().unwrap();
+        assert!(p.kind == PromptKind::DocProperty(8));
+        assert_eq!(p.label, CUSTOM_PROPERTY_PROMPT);
+        type_text(&mut app, "Count = 42");
+        handle_key(&mut app, key(KeyCode::Enter));
+        at_info(&app, 8);
+        assert_eq!(
+            app.pkg.doc_properties().custom,
+            [CustomProperty {
+                name: "Count".into(),
+                value: CustomValue::Number(42.0),
+            }]
+        );
+        let info: Vec<String> = app.info_lines().iter().map(|l| l.to_string()).collect();
+        assert!(
+            info.iter()
+                .any(|l| l.contains("Custom") && l.contains("Count = 42")),
+            "{info:?}"
+        );
+        // An empty value removes it (the name in any case).
+        app.backstage_key(key(KeyCode::Enter));
+        type_text(&mut app, "count =");
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(app.pkg.doc_properties().custom.is_empty());
+        // Without `=`, nothing changes and the status says why.
+        app.backstage_key(key(KeyCode::Enter));
+        type_text(&mut app, "oops");
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert!(app.pkg.doc_properties().custom.is_empty());
+        assert_eq!(
+            app.backstage.as_ref().unwrap().info_message.as_deref(),
+            Some("Custom property: type Name = value")
+        );
+        at_info(&app, 8);
+
+        // A field set to empty is removed.
+        while app.backstage.as_ref().unwrap().info_sel > 0 {
+            app.backstage_key(key(KeyCode::Up));
+        }
+        app.backstage_key(key(KeyCode::Enter));
+        for _ in 0..6 {
+            handle_key(&mut app, key(KeyCode::Backspace));
+        }
+        handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.pkg.doc_properties().title, None);
+    }
+
+    /// #600 r1 M2: with eight custom properties on 80x24, the Info page
+    /// scrolls so the selected `Custom property…` row is inside its box.
+    #[test]
+    fn file_info_keeps_the_selected_row_on_screen() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = App::new(new_xlsx(), "info.xlsx");
+        app.os_clip = None;
+        let mut p = app.pkg.doc_properties();
+        p.custom = (1..=8)
+            .map(|i| CustomProperty {
+                name: format!("Prop{i}"),
+                value: CustomValue::Number(f64::from(i)),
+            })
+            .collect();
+        app.pkg.set_doc_properties(&p).unwrap();
+        app.open_backstage();
+        app.backstage
+            .as_mut()
+            .unwrap()
+            .focus_info(INFO_FIELDS.len());
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        let buf = term.backend().buffer();
+        let row = |y: u16| (0..80).map(|x| buf[(x, y)].symbol()).collect::<String>();
+        let at = (2..23)
+            .find(|&y| row(y).contains("Custom property…"))
+            .unwrap_or_else(|| panic!("selected row not inside the box"));
+        assert_eq!(buf[(20, at)].bg, Color::Green);
+        assert!(row(23).contains('└'), "{}", row(23));
+    }
+
+    /// #600 r2: the outcome of an Info edit is on screen, on the Info page
+    /// (the status bar is hidden under the backstage) — including an edit
+    /// an unreadable core.xml can't take.
+    #[test]
+    fn file_info_says_how_an_edit_went() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        let screen = |app: &mut App| {
+            let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+            term.draw(|f| draw(app, f)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let edit_title = |app: &mut App, text: &str| {
+            app.open_backstage();
+            app.backstage.as_mut().unwrap().focus_info(0);
+            app.backstage_key(key(KeyCode::Enter));
+            for c in text.chars() {
+                handle_key(app, key(KeyCode::Char(c)));
+            }
+            handle_key(app, key(KeyCode::Enter));
+        };
+
+        let mut app = App::new(new_xlsx(), "ok.xlsx");
+        app.os_clip = None;
+        edit_title(&mut app, "T");
+        assert!(screen(&mut app).contains("Title updated"));
+
+        // A UTF-16 core.xml can't be patched: the edit is refused, visibly.
+        let mut pkg = new_xlsx();
+        pkg.stamp_save("2026-10-01T12:00:00Z", "me");
+        let core = String::from_utf8(pkg.part("docProps/core.xml").unwrap().to_vec()).unwrap();
+        let mut utf16 = vec![0xFF, 0xFE];
+        for u in core.encode_utf16() {
+            utf16.extend_from_slice(&u.to_le_bytes());
+        }
+        pkg.set_part("docProps/core.xml", utf16.clone());
+        let mut app = App::new(pkg, "bad.xlsx");
+        app.os_clip = None;
+        edit_title(&mut app, "T");
+        let text = screen(&mut app);
+        assert!(
+            text.contains("document properties can't be edited: docProps/core.xml is unreadable"),
+            "{text}"
+        );
+        assert!(!app.modified);
+        assert_eq!(app.pkg.part("docProps/core.xml").unwrap(), utf16.as_slice());
+    }
+
+    /// File › Info lists who wrote the workbook and when, from core.xml.
+    #[test]
+    fn file_info_shows_the_read_only_properties() {
+        let mut pkg = new_xlsx();
+        pkg.stamp_save("2026-10-01T12:00:00Z", "Ann");
+        let app = App::new(
+            load_xlsx(&gridcore::xlsx::save_xlsx(&pkg)).unwrap(),
+            "x.xlsx",
+        );
+        let info: Vec<String> = app.info_lines().iter().map(|l| l.to_string()).collect();
+        for want in [
+            "  Author            Ann",
+            "  Last Modified By  Ann",
+            "  Created           2026-10-01T12:00:00Z",
+            "  Last Modified     2026-10-01T12:00:00Z",
+        ] {
+            assert!(info.iter().any(|l| l == want), "{want:?} in {info:?}");
+        }
     }
 
     /// Save As opens on the type the workbook is bound to: Unicode Text

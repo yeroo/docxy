@@ -230,6 +230,46 @@ can have tasks whose `OverAllocated` values are all false.
 The generated `.mpp` and `.xml` files stay git-ignored. The generator sources
 are kept with the fetch scripts in `corpus/tools/`.
 
+`corpus/mpp/task-extra/` holds one paired case per #417 task element
+([#521](https://github.com/yeroo/docxy/issues/521)). Contact and Publish are
+set over COM; the others are seeded through a temporary MSPDI file, and
+`e11-leveled` levels two tasks that share a resource. Each case is saved as
+`.mpp`, reopened from that file and only then exported as `.xml`, so the oracle
+shows what the binary kept. Generate them the same way:
+
+```powershell
+python corpus/tools/gen_mpp_task_extra_cases.py
+```
+
+| Field | Location | Stored as |
+|---|---|---|
+| Contact | Var2Data key `0x0070` | UTF-16 text (`e1-contact`) |
+| WBSLevel | Var2Data key `0x018d` | UTF-16 text (`e4-wbs-level`) |
+| PreLeveledStart, PreLeveledFinish | Var2Data keys `0x0171`, `0x0172` | timestamp (`e8`, `e9`, `e11-leveled`) |
+| CommitmentType | Var2Data key `0x047b` | u16 0..=2, absent meaning 0 (`e7-commitment-type`) |
+| CommitmentStart, CommitmentFinish | Var2Data keys `0x0480`, `0x0481` | timestamp (`e5`, `e6`) |
+| DisplayAsSummary | `Fixed2Meta` +9 bit `0x10` | flag (`e3-display-as-summary`) |
+| IsPublished | assignment `Fixed2Meta` (53-byte entries) +8 bit `0x40` | flag on each of the task's assignment rows (`e2-published`) |
+| SubprojectName | project `Props` key `0x024000a2` | inserted-project table (`task-fields/f6-subprojects`) |
+
+Saving one plan twice with only a task's Publish changed alters nothing in the
+task table: Project keeps Publish on the task's assignment rows. Every
+non-summary task has one, the unassigned placeholder included, and summaries
+normally have none, which is why every snapshot row matched
+`!summary && active`. A task exports IsPublished=1 when it has assignments and
+all of them carry the bit; mixed marks have no oracle and leave it absent. A
+summary with a direct assignment follows the same rule
+(`task-fields/f9-overalloc-edges` "Direct summary" exports 1). Project refuses
+to set Publish on a summary or inactive task, and `e2-published` shows a task
+published while ordinary exporting 0 once it becomes a summary or inactive. The subproject table holds a
+20-byte header (type 1 in `f6`), the task UID and two OLE File Monikers per
+inserted project; SubprojectName is the path moniker's Unicode extension or,
+when the moniker has none, its ASCII ANSI path. A non-ASCII ANSI path without
+an extension leaves that item unnamed; other item types and malformed tables
+leave SubprojectName absent. Project also
+exports a childless DisplayAsSummary task as `Summary=1`; the importer keeps it
+a leaf, as it does a childless inserted subproject.
+
 1. Drop a few `.mpp` files here, ideally spanning Project versions and with the
    same schedule saved *both* as `.mpp` and as MSPDI `.xml` (File ▸ Save As ▸
    XML). The MSPDI export is the **oracle** — the known-good answer.
@@ -288,8 +328,12 @@ used by the three local legacy samples. The newest layout is checked against
 generated snapshots and paired Project 2024 XML exports. MPP12 files may pass
 through the limited legacy task decoder; other MPP12 task tables are refused
 until their layout has a validated field map.
-Task Notes are decoded only on the current-layout path. Notes in legacy/MPP12
-files remain unread, including MPP12 files whose task rows can be imported.
+Task Notes are decoded only on the current-layout path. Every Project-written
+MPP12 snapshot (FixedMeta kind 0, 264-byte task records) is refused before
+task decoding, so its Notes are not read either; the MPP9 legacy path has no
+paired XML and Project 16 cannot save MPP9, so legacy Notes have no oracle.
+StatusManager is not decoded: Project desktop drops a seeded StatusManager when
+it saves `.mpp` (`task-extra/e10-status-manager`), so there is no oracle.
 
 Current Project blank rows are identified by their short FixedMeta record and
 retained with their IDs and UIDs. Superseded task

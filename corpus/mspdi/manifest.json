@@ -288,6 +288,19 @@
         "round-trip"
       ],
       "desc": "Named alternate work weeks change hours and working days, inherit unstated days, and yield to exceptions across the base chain."
+    },
+    {
+      "file": "29-milestone-snet-fnet-instants.xml",
+      "category": "milestone",
+      "tags": [
+        "milestone",
+        "constraint",
+        "constraint-fnet",
+        "constraint-snet",
+        "link",
+        "link-fs"
+      ],
+      "desc": "Project 2024 (#779): SNET/FNET milestones hold their constraint instant, at a period end and inside a non-working gap."
     }
   ]
 }

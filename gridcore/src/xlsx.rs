@@ -2178,14 +2178,14 @@ fn page_break(p: &XmlParser) -> Option<crate::sheet::PageBreak> {
 }
 
 /// Local name (strip any namespace prefix).
-fn local(name: &str) -> &str {
+pub(crate) fn local(name: &str) -> &str {
     match name.rfind(':') {
         Some(i) => &name[i + 1..],
         None => name,
     }
 }
 
-fn decode(raw: &str) -> String {
+pub(crate) fn decode(raw: &str) -> String {
     let mut s = String::new();
     XmlParser::append_decoded(raw, &mut s);
     s
@@ -2468,22 +2468,39 @@ impl SheetPackage {
     /// Excel 4.0 macro sheet (`xlMacrosheet`, `xlIntlMacrosheet`) or a dialog
     /// sheet.
     fn macro_sheet_indices(&self) -> Vec<usize> {
-        let wb_part = workbook_part_name(&self.parts);
-        let wb_dir = wb_part.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-        let Some(rels) = self.part(&rels_part_name(&wb_part)) else {
-            return Vec::new();
-        };
-        let targets: Vec<String> = parse_rels(&String::from_utf8_lossy(rels))
-            .into_iter()
-            .filter(|(_, ty, _)| {
+        self.sheet_rel_types()
+            .iter()
+            .enumerate()
+            .filter(|(_, ty)| {
                 ["/xlMacrosheet", "/xlIntlMacrosheet", "/dialogsheet"]
                     .iter()
                     .any(|suffix| ty.ends_with(suffix))
             })
-            .map(|(_, _, t)| resolve_relative(wb_dir, &t))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The workbook relationship type of each sheet's part, per
+    /// `sheet_parts` index (`…/worksheet`, `…/chartsheet`, a macro or dialog
+    /// sheet), or `""` when no relationship names the part.
+    pub(crate) fn sheet_rel_types(&self) -> Vec<String> {
+        let wb_part = workbook_part_name(&self.parts);
+        let wb_dir = wb_part.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        let rels: Vec<(String, String)> = self
+            .part(&rels_part_name(&wb_part))
+            .map(|b| parse_rels(&String::from_utf8_lossy(b)))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, ty, t)| (resolve_relative(wb_dir, &t), ty))
             .collect();
-        (0..self.sheet_parts.len())
-            .filter(|&i| targets.contains(&self.sheet_parts[i]))
+        self.sheet_parts
+            .iter()
+            .map(|part| {
+                rels.iter()
+                    .find(|(target, _)| target == part)
+                    .map(|(_, ty)| ty.clone())
+                    .unwrap_or_default()
+            })
             .collect()
     }
 }
@@ -2652,17 +2669,17 @@ fn strip_vba_project(parts: &mut Vec<(String, Vec<u8>)>) -> bool {
 /// Where [`find_element_by_attr`] found an element: its whole span (start tag to
 /// end tag, or the self-closed tag) and the byte span of the matched
 /// attribute's value.
-struct ElementSpan {
-    start: usize,
-    end: usize,
-    value: (usize, usize),
+pub(crate) struct ElementSpan {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) value: (usize, usize),
 }
 
 /// The first element with local name `name` (any namespace prefix) whose
 /// attribute `attr` has a (decoded) value `want` accepts. The same parser
 /// that reads rels finds it, so quote style, whitespace, `/>` versus `></X>`,
 /// and comments, CDATA and processing instructions are treated alike.
-fn find_element_by_attr(
+pub(crate) fn find_element_by_attr(
     xml: &str,
     name: &str,
     attr: &str,
@@ -2701,7 +2718,7 @@ fn find_element_by_attr(
 
 /// The `<Override>` whose PartName is `part_name` (OPC part names compare
 /// case-insensitively).
-fn override_element(xml: &str, part_name: &str) -> Option<ElementSpan> {
+pub(crate) fn override_element(xml: &str, part_name: &str) -> Option<ElementSpan> {
     find_element_by_attr(xml, "Override", "PartName", |v| {
         v.eq_ignore_ascii_case(part_name)
     })
@@ -2974,6 +2991,9 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
             p.1 = ensure_full_calc(&xml).into_bytes();
         }
     }
+
+    // --- docProps/app.xml: the sheet list follows the model ---------------
+    crate::docprops::refresh_titles_of_parts(&mut parts, pkg);
 
     parts
 }

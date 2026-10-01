@@ -997,6 +997,42 @@ function xlsxyToolDefs() {
       ]),
       ['range', 'rows', 'values'],
     ),
+    tool(
+      'xlsxy_properties',
+      "Read the workbook's document properties (File › Info): title, tags, categories, " +
+        'subject, comments, company, manager, hyperlinkBase, the read-only author, ' +
+        'lastModifiedBy, created and modified, and custom [{name, type, value}]. An absent ' +
+        'property is null.',
+      Object.fromEntries([target()]),
+      [],
+    ),
+    tool(
+      'xlsxy_set_properties',
+      'Set document properties (File › Info). Only the given keys change; null or "" ' +
+        'removes one. Marks the workbook modified when something changed (save to write ' +
+        'it); not on the undo stack. Replies with the properties and `changed`.',
+      Object.fromEntries([
+        ['title', prop('string', 'Title (dc:title).')],
+        ['tags', prop('string', 'Tags (cp:keywords).')],
+        ['categories', prop('string', 'Categories (cp:category).')],
+        ['subject', prop('string', 'Subject (dc:subject).')],
+        ['comments', prop('string', 'Comments (dc:description).')],
+        ['company', prop('string', 'Company.')],
+        ['manager', prop('string', 'Manager.')],
+        ['hyperlinkBase', prop('string', 'Hyperlink base.')],
+        [
+          'custom',
+          prop(
+            'object',
+            'Custom properties as {name: value}: a string is text, a number a ' +
+              'number, a bool yes/no, {"date":"YYYY-MM-DD"} a date, null removes. ' +
+              'A name that exists (any case) changes in place.',
+          ),
+        ],
+        target(),
+      ]),
+      [],
+    ),
   ];
 }
 
@@ -1070,6 +1106,8 @@ const XLSXY_VERBS = {
   xlsxy_format: 'cell.format',
   xlsxy_col_width: 'col.width',
   xlsxy_pivot_create: 'pivot.create',
+  xlsxy_properties: 'wb.properties',
+  xlsxy_set_properties: 'wb.set-properties',
 };
 
 /** Execute a tool by forwarding to the control surface. Returns the result

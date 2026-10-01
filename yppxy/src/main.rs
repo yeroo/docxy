@@ -994,6 +994,8 @@ impl App {
                 self.export_md();
             }
             BackstageEvent::Exit => self.request_exit(),
+            // yppxy lists no editable Info rows, so this never arrives.
+            BackstageEvent::EditInfo(_) => {}
         }
     }
 

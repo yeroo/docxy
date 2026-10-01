@@ -1240,7 +1240,7 @@ pub fn shift_chart_refs(
     // from the chart's box, so that box decides whether its column is an index
     // into the edited grid. (Shifting leaves the sheet name alone, so reading it
     // after `shift_slot` is the same answer.)
-    let source_mine = cd.source.as_ref().is_some_and(&mine);
+    let source_mine = cd.source.as_ref().is_some_and(mine);
     let mut changed = shift_slot(&mut cd.source);
     changed |= shift_slot(&mut cd.categories_ref);
     for ser in &mut cd.series {

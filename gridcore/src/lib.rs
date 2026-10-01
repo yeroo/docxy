@@ -26,10 +26,12 @@
 //! - [`textio`] — delimited/fixed-width text in and out (CSV open, the Text
 //!   Import Wizard, Text to Columns, Save As text types).
 //! - [`xlsx`] — `.xlsx` bytes ⇄ [`sheet::Workbook`] with part preservation.
+//! - [`docprops`] — document properties (`docProps/` core, app, custom).
 
 pub mod cf;
 pub mod clock;
 pub mod comments;
+pub mod docprops;
 pub mod drawing;
 pub mod edit;
 pub mod engine;

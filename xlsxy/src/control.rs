@@ -46,6 +46,8 @@
 //! | `cell.format` | `{range,patch,sheet?}` | `{formatted}` — one undo group; `patch` keys: `numFmt`/`bold`/`italic`/`fontColor`/`fillColor`/`align` (≥1 required) |
 //! | `col.width` | `{col,width,sheet?}` | `{col,width}` — NOT on the undo stack (mirrors the TUI's F7/F8, which mutate directly) |
 //! | `wb.recalc` | — | `{recalculated:true}` |
+//! | `wb.properties` | — | `{title, tags, categories, subject, comments, company, manager, hyperlinkBase, author, lastModifiedBy, created, modified, custom:[{name,type,value}]}` — File › Info; an absent property is `null`; `type` is `text`/`number`/`bool`/`date`/`other` |
+//! | `wb.set-properties` | `{title?, tags?, categories?, subject?, comments?, company?, manager?, hyperlinkBase?, custom?:{name: value\|null}}` | `wb.properties` + `{changed}` — `null`/`""` removes; a custom value is a string (text), number, bool or `{"date":"YYYY-MM-DD[THH:MM:SSZ]"}`; marks the workbook modified when something changed; NOT on the undo stack (Excel's Info edits aren't either) |
 //! | `wb.save` | — | `{path, …}`; a failed write errors with `save failed: …` (the status-bar text) and the workbook stays modified |
 //! | `wb.reload` | — | `{path, …}` |
 //! | `wb.open` | `{path}` | `{path, …}` |
@@ -62,6 +64,7 @@
 
 use crate::{App, comment_author, iso_now, now_serial};
 use ctlcore::json::Json;
+use gridcore::docprops::{CustomProperty, CustomValue};
 use gridcore::engine::{Engine, cell_to_value, eval_formula_at};
 use gridcore::format::{FormatPatch, FormatValue, apply_patch_to_xf, xf_format_fields};
 use gridcore::formula::Value;
@@ -113,6 +116,8 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         "col.delete" => col_op(app, args, false),
         "cell.format" => cell_format(app, args),
         "col.width" => col_width(app, args),
+        "wb.properties" => Ok(properties_json(app)),
+        "wb.set-properties" => set_properties(app, args),
         "wb.recalc" => {
             app.recalc_and_refresh();
             Ok(Json::obj(vec![("recalculated", Json::Bool(true))]))
@@ -164,6 +169,7 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         // `comment.remove` can legitimately no-op (nothing on the cell), so it
         // signals itself inside `comment_remove`, gated on `removed:true` — a
         // no-op must not flash the activity dot (docxy's no-op principle).
+        // `wb.set-properties` does the same, gated on `changed:true`.
     }
     out
 }
@@ -208,6 +214,147 @@ fn sheet_list(app: &App) -> Json {
         ("active", Json::Num(app.sheet as f64)),
         ("sheets", Json::Arr(sheets)),
     ])
+}
+
+/// `wb.properties`: the document properties File › Info shows.
+fn properties_json(app: &App) -> Json {
+    let p = app.pkg.doc_properties();
+    let opt = |v: &Option<String>| v.clone().map(Json::Str).unwrap_or(Json::Null);
+    let custom = p
+        .custom
+        .iter()
+        .map(|c| {
+            let value = match &c.value {
+                CustomValue::Number(n) => Json::Num(*n),
+                CustomValue::Bool(b) => Json::Bool(*b),
+                CustomValue::Text(s) | CustomValue::Date(s) | CustomValue::Other(s) => {
+                    Json::Str(s.clone())
+                }
+            };
+            Json::obj(vec![
+                ("name", Json::Str(c.name.clone())),
+                ("type", Json::Str(c.value.type_name().into())),
+                ("value", value),
+            ])
+        })
+        .collect();
+    Json::obj(vec![
+        ("title", opt(&p.title)),
+        ("tags", opt(&p.keywords)),
+        ("categories", opt(&p.category)),
+        ("subject", opt(&p.subject)),
+        ("comments", opt(&p.description)),
+        ("company", opt(&p.company)),
+        ("manager", opt(&p.manager)),
+        ("hyperlinkBase", opt(&p.hyperlink_base)),
+        ("author", opt(&p.creator)),
+        ("lastModifiedBy", opt(&p.last_modified_by)),
+        ("created", opt(&p.created)),
+        ("modified", opt(&p.modified)),
+        ("custom", Json::Arr(custom)),
+    ])
+}
+
+/// `wb.set-properties`: set the given properties (`null`/`""` removes one).
+/// Everything is checked before anything changes.
+fn set_properties(app: &mut App, args: &Json) -> Result<Json, String> {
+    let Json::Obj(pairs) = args else {
+        return Err("wb.set-properties needs an object of properties".into());
+    };
+    let before = app.pkg.doc_properties();
+    let mut p = before.clone();
+    for (key, value) in pairs {
+        let slot = match key.as_str() {
+            "title" => &mut p.title,
+            "tags" => &mut p.keywords,
+            "categories" => &mut p.category,
+            "subject" => &mut p.subject,
+            "comments" => &mut p.description,
+            "company" => &mut p.company,
+            "manager" => &mut p.manager,
+            "hyperlinkBase" => &mut p.hyperlink_base,
+            "custom" => {
+                set_custom_properties(&mut p.custom, value)?;
+                continue;
+            }
+            // The MCP bridge forwards its instance selector with the args.
+            "target" => continue,
+            other => return Err(format!("wb.set-properties: unknown property '{other}'")),
+        };
+        *slot = match value {
+            Json::Null => None,
+            Json::Str(s) if s.is_empty() => None,
+            Json::Str(s) => Some(s.clone()),
+            _ => {
+                return Err(format!(
+                    "wb.set-properties: '{key}' must be a string or null"
+                ));
+            }
+        };
+    }
+    let changed = p != before;
+    if changed {
+        app.pkg.set_doc_properties(&p)?;
+        app.modified = true;
+        ctlcore::signal_activity();
+    }
+    let mut out = properties_json(app);
+    if let Json::Obj(fields) = &mut out {
+        fields.push(("changed".into(), Json::Bool(changed)));
+    }
+    Ok(out)
+}
+
+/// Apply `{name: value|null}` to the custom list: a known name (any case)
+/// changes in place, a new one is appended, `null`/`""` removes.
+fn set_custom_properties(custom: &mut Vec<CustomProperty>, edits: &Json) -> Result<(), String> {
+    let Json::Obj(edits) = edits else {
+        return Err("wb.set-properties: 'custom' must be an object of name: value".into());
+    };
+    for (name, value) in edits {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("wb.set-properties: a custom property needs a name".into());
+        }
+        let value = match value {
+            Json::Null => None,
+            Json::Str(s) if s.is_empty() => None,
+            Json::Str(s) => Some(CustomValue::Text(s.clone())),
+            Json::Num(n) if n.is_finite() => Some(CustomValue::Number(*n)),
+            Json::Bool(b) => Some(CustomValue::Bool(*b)),
+            Json::Obj(_) => {
+                let date = value
+                    .get_str("date")
+                    .and_then(gridcore::docprops::normalize_date)
+                    .ok_or_else(|| {
+                        format!(
+                            "wb.set-properties: custom '{name}' date must be {{\"date\":\"YYYY-MM-DD[THH:MM:SSZ]\"}}"
+                        )
+                    })?;
+                Some(CustomValue::Date(date))
+            }
+            _ => {
+                return Err(format!(
+                    "wb.set-properties: custom '{name}' must be a string, number, bool, {{\"date\":…}} or null"
+                ));
+            }
+        };
+        let at = custom
+            .iter()
+            .position(|c| c.name.to_lowercase() == name.to_lowercase());
+        match (at, value) {
+            (Some(i), Some(v)) => custom[i].value = v,
+            (Some(i), None) => {
+                custom.remove(i);
+            }
+            (None, Some(v)) => custom.push(CustomProperty {
+                name: name.to_string(),
+                value: v,
+            }),
+            (None, None) => {}
+        }
+    }
+    Ok(())
 }
 
 /// One cell as JSON: `ref`, coordinates, the typed `value`, the formula
@@ -4195,5 +4342,371 @@ mod tests {
         assert!(!dir.join("Backup of book.xlk").exists());
         drop(lock);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- #600: document properties ------------------------------------------
+
+    fn part_text(pkg: &gridcore::xlsx::SheetPackage, name: &str) -> String {
+        String::from_utf8_lossy(pkg.part(name).unwrap_or_else(|| panic!("no part {name}")))
+            .into_owned()
+    }
+
+    /// The text between `<open>` and `</close>` of the first `tag` element.
+    fn element_text(xml: &str, tag: &str) -> String {
+        let open = xml
+            .find(&format!("<{tag}"))
+            .unwrap_or_else(|| panic!("no <{tag}> in {xml}"));
+        let start = open + xml[open..].find('>').unwrap() + 1;
+        let end = start + xml[start..].find(&format!("</{tag}>")).unwrap();
+        xml[start..end].to_string()
+    }
+
+    /// The issue's openpyxl `props.xlsx`: sheets Alpha and Beta, created by
+    /// "Author One", last modified by "Author Two" on 2020-01-02, with an
+    /// Excel-shaped app.xml that also lists a named range.
+    fn props_fixture() -> Vec<u8> {
+        let mut pkg = new_xlsx();
+        pkg.rename_sheet(0, "Alpha");
+        pkg.add_sheet("Beta");
+        pkg.set_part(
+            "docProps/core.xml",
+            br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:creator>Author One</dc:creator><cp:lastModifiedBy>Author Two</cp:lastModifiedBy><dcterms:created xsi:type="dcterms:W3CDTF">2020-01-02T03:04:05Z</dcterms:created><dcterms:modified xsi:type="dcterms:W3CDTF">2020-01-02T03:04:05Z</dcterms:modified></cp:coreProperties>"#
+                .to_vec(),
+        );
+        pkg.set_part(
+            "docProps/app.xml",
+            br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>Microsoft Excel</Application><HeadingPairs><vt:vector size="4" baseType="variant"><vt:variant><vt:lpstr>Worksheets</vt:lpstr></vt:variant><vt:variant><vt:i4>2</vt:i4></vt:variant><vt:variant><vt:lpstr>Named Ranges</vt:lpstr></vt:variant><vt:variant><vt:i4>1</vt:i4></vt:variant></vt:vector></HeadingPairs><TitlesOfParts><vt:vector size="3" baseType="lpstr"><vt:lpstr>Alpha</vt:lpstr><vt:lpstr>Beta</vt:lpstr><vt:lpstr>Total</vt:lpstr></vt:vector></TitlesOfParts></Properties>"#
+                .to_vec(),
+        );
+        let rels = part_text(&pkg, "_rels/.rels").replace(
+            "</Relationships>",
+            r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/></Relationships>"#,
+        );
+        pkg.set_part("_rels/.rels", rels.into_bytes());
+        save_xlsx(&pkg)
+    }
+
+    /// The issue's repro, end to end: rename Beta → Gamma, set A1, save.
+    #[test]
+    fn wb_save_stamps_core_properties_and_refreshes_titles_of_parts() {
+        let dir = std::env::temp_dir().join(format!("xlsxy-600-props-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = dir.join("props.xlsx");
+        std::fs::write(&book, props_fixture()).unwrap();
+        let mut a = App::new(
+            load_xlsx(&std::fs::read(&book).unwrap()).unwrap(),
+            book.to_str().unwrap(),
+        );
+        a.os_clip = None;
+        dispatch(
+            &mut a,
+            "sheet.rename",
+            &Json::obj(vec![
+                ("sheet", Json::Str("Beta".into())),
+                ("name", Json::Str("Gamma".into())),
+            ]),
+        )
+        .unwrap();
+        set(&mut a, "A1", "1");
+        let before = iso_now();
+        dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+        let after = iso_now();
+
+        let saved = load_xlsx(&std::fs::read(&book).unwrap()).unwrap();
+        let core = part_text(&saved, "docProps/core.xml");
+        let modified = element_text(&core, "dcterms:modified");
+        assert!(
+            before <= modified && modified <= after,
+            "{before} <= {modified} <= {after}"
+        );
+        assert_eq!(modified.len(), "2026-10-01T12:00:00Z".len());
+        assert!(modified.ends_with('Z') && modified.as_bytes()[10] == b'T');
+        assert!(core.contains(r#"<dcterms:modified xsi:type="dcterms:W3CDTF">"#));
+        assert_eq!(element_text(&core, "cp:lastModifiedBy"), comment_author());
+        assert_eq!(element_text(&core, "dc:creator"), "Author One");
+        assert_eq!(
+            element_text(&core, "dcterms:created"),
+            "2020-01-02T03:04:05Z"
+        );
+
+        let app = part_text(&saved, "docProps/app.xml");
+        assert!(app.contains(
+            r#"<vt:variant><vt:lpstr>Worksheets</vt:lpstr></vt:variant><vt:variant><vt:i4>2</vt:i4></vt:variant><vt:variant><vt:lpstr>Named Ranges</vt:lpstr></vt:variant><vt:variant><vt:i4>1</vt:i4></vt:variant>"#
+        ), "{app}");
+        assert!(app.contains(
+            r#"<vt:vector size="3" baseType="lpstr"><vt:lpstr>Alpha</vt:lpstr><vt:lpstr>Gamma</vt:lpstr><vt:lpstr>Total</vt:lpstr></vt:vector>"#
+        ), "{app}");
+
+        // Removing a sheet shrinks the group; the named range stays.
+        dispatch(
+            &mut a,
+            "sheet.remove",
+            &Json::obj(vec![("sheet", Json::Str("Alpha".into()))]),
+        )
+        .unwrap();
+        dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+        let saved = load_xlsx(&std::fs::read(&book).unwrap()).unwrap();
+        let app = part_text(&saved, "docProps/app.xml");
+        assert!(app.contains(
+            r#"<vt:vector size="4" baseType="variant"><vt:variant><vt:lpstr>Worksheets</vt:lpstr></vt:variant><vt:variant><vt:i4>1</vt:i4></vt:variant>"#
+        ), "{app}");
+        assert!(app.contains(
+            r#"<vt:vector size="2" baseType="lpstr"><vt:lpstr>Gamma</vt:lpstr><vt:lpstr>Total</vt:lpstr></vt:vector>"#
+        ), "{app}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A workbook with no core properties gets them on its first save, with
+    /// the package relationship and content type Excel needs to find them.
+    #[test]
+    fn wb_save_of_a_new_workbook_creates_core_properties() {
+        let dir = std::env::temp_dir().join(format!("xlsxy-600-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = dir.join("new.xlsx");
+        let mut a = App::new(new_xlsx(), book.to_str().unwrap());
+        a.os_clip = None;
+        let before = iso_now();
+        dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+        let after = iso_now();
+        let saved = load_xlsx(&std::fs::read(&book).unwrap()).unwrap();
+        let p = saved.doc_properties();
+        assert_eq!(p.creator, Some(comment_author()));
+        assert_eq!(p.last_modified_by, Some(comment_author()));
+        let created = p.created.unwrap();
+        assert!(before <= created && created <= after);
+        assert_eq!(p.modified, Some(created));
+        assert!(part_text(&saved, "_rels/.rels").contains(
+            r#"Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml""#
+        ));
+        assert!(part_text(&saved, "[Content_Types].xml").contains(
+            r#"<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>"#
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn props(a: &mut App) -> Json {
+        dispatch(a, "wb.properties", &Json::Null).unwrap()
+    }
+
+    #[test]
+    fn wb_properties_reports_every_property_with_null_for_absent_ones() {
+        let mut a = App::new(load_xlsx(&props_fixture()).unwrap(), "p.xlsx");
+        a.os_clip = None;
+        let p = props(&mut a);
+        assert_eq!(p.get_str("author"), Some("Author One"));
+        assert_eq!(p.get_str("lastModifiedBy"), Some("Author Two"));
+        assert_eq!(p.get_str("created"), Some("2020-01-02T03:04:05Z"));
+        assert_eq!(p.get_str("modified"), Some("2020-01-02T03:04:05Z"));
+        for key in [
+            "title",
+            "tags",
+            "categories",
+            "subject",
+            "comments",
+            "company",
+            "manager",
+            "hyperlinkBase",
+        ] {
+            assert_eq!(p.get(key), Some(&Json::Null), "{key}");
+        }
+        assert_eq!(p.get("custom"), Some(&Json::Arr(vec![])));
+    }
+
+    #[test]
+    fn wb_set_properties_sets_removes_and_marks_modified() {
+        let mut a = app();
+        assert!(!a.modified);
+        let custom = Json::obj(vec![
+            ("Client", Json::Str("Contoso".into())),
+            ("Count", Json::Num(3.0)),
+            ("Done", Json::Bool(true)),
+            (
+                "Due",
+                Json::obj(vec![("date", Json::Str("2024-05-06".into()))]),
+            ),
+        ]);
+        let r = dispatch(
+            &mut a,
+            "wb.set-properties",
+            &Json::obj(vec![
+                ("title", Json::Str("Budget".into())),
+                ("tags", Json::Str("q3 plan".into())),
+                ("categories", Json::Str("Finance".into())),
+                ("subject", Json::Str("Spend".into())),
+                ("comments", Json::Str("Draft & <notes>".into())),
+                ("company", Json::Str("Acme".into())),
+                ("manager", Json::Str("Pat".into())),
+                ("hyperlinkBase", Json::Str("https://example.com/".into())),
+                ("custom", custom),
+                ("target", Json::Str("pane-1".into())),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(r.get("changed"), Some(&Json::Bool(true)));
+        assert!(a.modified);
+        assert_eq!(r.get_str("title"), Some("Budget"));
+        assert_eq!(r.get_str("comments"), Some("Draft & <notes>"));
+        assert_eq!(r.get_str("hyperlinkBase"), Some("https://example.com/"));
+        let custom = r.get("custom").unwrap().as_array().unwrap();
+        let entry = |i: usize| {
+            (
+                custom[i].get_str("name").unwrap().to_string(),
+                custom[i].get_str("type").unwrap().to_string(),
+                custom[i].get("value").unwrap().clone(),
+            )
+        };
+        assert_eq!(
+            entry(0),
+            ("Client".into(), "text".into(), Json::Str("Contoso".into()))
+        );
+        assert_eq!(entry(1), ("Count".into(), "number".into(), Json::Num(3.0)));
+        assert_eq!(entry(2), ("Done".into(), "bool".into(), Json::Bool(true)));
+        assert_eq!(
+            entry(3),
+            (
+                "Due".into(),
+                "date".into(),
+                Json::Str("2024-05-06T00:00:00Z".into())
+            )
+        );
+
+        // Survives a save and reload.
+        let re = load_xlsx(&save_xlsx(&a.pkg)).unwrap();
+        let mut b = App::new(re, "re.xlsx");
+        b.os_clip = None;
+        let mut again = props(&mut b);
+        if let Json::Obj(f) = &mut again {
+            f.push(("changed".into(), Json::Bool(true)));
+        }
+        assert_eq!(again, r);
+
+        // null and "" remove; a name in another case changes in place.
+        a.modified = false;
+        let r = dispatch(
+            &mut a,
+            "wb.set-properties",
+            &Json::obj(vec![
+                ("title", Json::Null),
+                ("tags", Json::Str(String::new())),
+                (
+                    "custom",
+                    Json::obj(vec![
+                        ("client", Json::Str("Fabrikam".into())),
+                        ("Count", Json::Null),
+                        ("Done", Json::Str(String::new())),
+                    ]),
+                ),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(r.get("changed"), Some(&Json::Bool(true)));
+        assert!(a.modified);
+        assert_eq!(r.get("title"), Some(&Json::Null));
+        assert_eq!(r.get("tags"), Some(&Json::Null));
+        assert_eq!(r.get_str("subject"), Some("Spend"));
+        let names: Vec<&str> = r
+            .get("custom")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.get_str("name").unwrap())
+            .collect();
+        assert_eq!(names, ["Client", "Due"]);
+        assert_eq!(
+            r.get("custom").unwrap().as_array().unwrap()[0].get_str("value"),
+            Some("Fabrikam")
+        );
+    }
+
+    #[test]
+    fn wb_set_properties_no_op_leaves_the_workbook_unmodified() {
+        let mut a = app();
+        let args = Json::obj(vec![("title", Json::Str("T".into()))]);
+        dispatch(&mut a, "wb.set-properties", &args).unwrap();
+        a.modified = false;
+        let r = dispatch(&mut a, "wb.set-properties", &args).unwrap();
+        assert_eq!(r.get("changed"), Some(&Json::Bool(false)));
+        assert!(!a.modified);
+    }
+
+    /// #600 r2: a property that can't land (UTF-16 core.xml) is an error,
+    /// not a `changed:true` that wrote nothing.
+    #[test]
+    fn wb_set_properties_errors_when_core_xml_is_unreadable() {
+        let mut pkg = load_xlsx(&props_fixture()).unwrap();
+        let core = part_text(&pkg, "docProps/core.xml");
+        let mut utf16 = vec![0xFF, 0xFE];
+        for u in core.encode_utf16() {
+            utf16.extend_from_slice(&u.to_le_bytes());
+        }
+        pkg.set_part("docProps/core.xml", utf16.clone());
+        let mut a = App::new(pkg, "u.xlsx");
+        a.os_clip = None;
+        let err = dispatch(
+            &mut a,
+            "wb.set-properties",
+            &Json::obj(vec![
+                ("title", Json::Str("T".into())),
+                ("company", Json::Str("Co".into())),
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "document properties can't be edited: docProps/core.xml is unreadable"
+        );
+        assert!(!a.modified);
+        assert_eq!(a.pkg.part("docProps/core.xml").unwrap(), utf16.as_slice());
+        assert_eq!(props(&mut a).get("company"), Some(&Json::Null));
+        // app.xml is readable: a Company-only edit goes through.
+        let r = dispatch(
+            &mut a,
+            "wb.set-properties",
+            &Json::obj(vec![("company", Json::Str("Co".into()))]),
+        )
+        .unwrap();
+        assert_eq!(r.get("changed"), Some(&Json::Bool(true)));
+        assert_eq!(r.get_str("company"), Some("Co"));
+    }
+
+    #[test]
+    fn wb_set_properties_rejects_bad_input_and_changes_nothing() {
+        let mut a = app();
+        let before = props(&mut a);
+        for args in [
+            Json::obj(vec![
+                ("title", Json::Str("T".into())),
+                ("titel", Json::Str("typo".into())),
+            ]),
+            Json::obj(vec![("title", Json::Num(1.0))]),
+            Json::obj(vec![
+                ("title", Json::Str("T".into())),
+                (
+                    "custom",
+                    Json::obj(vec![(
+                        "Due",
+                        Json::obj(vec![("date", Json::Str("2024-02-30x".into()))]),
+                    )]),
+                ),
+            ]),
+            Json::obj(vec![(
+                "custom",
+                Json::obj(vec![("List", Json::Arr(vec![]))]),
+            )]),
+            Json::obj(vec![("custom", Json::obj(vec![(" ", Json::Num(1.0))]))]),
+            Json::Null,
+        ] {
+            assert!(
+                dispatch(&mut a, "wb.set-properties", &args).is_err(),
+                "{args}"
+            );
+        }
+        assert_eq!(props(&mut a), before);
+        assert!(!a.modified);
     }
 }
