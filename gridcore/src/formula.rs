@@ -5219,14 +5219,15 @@ pub fn file_formula(src: &str) -> Cow<'_, str> {
 /// rewrite the internal spill/implicit operators — `ANCHORARRAY(A1)` → `A1#`,
 /// `SINGLE(x)` → `@x`. Used by `FORMULATEXT`.
 pub fn display_formula(src: &str) -> String {
-    // Strip prefixes only outside string literals, so a literal such as
-    // "_xlfn." survives verbatim.
+    // Strip prefixes only outside string literals and quoted sheet names,
+    // so a literal such as "_xlfn." or a sheet 'x SINGLE(1)' survives
+    // verbatim.
     let b = src.as_bytes();
     let mut out = String::new();
     let mut seg_start = 0usize;
     let mut i = 0usize;
     while i < b.len() {
-        if b[i] == b'"' {
+        if matches!(b[i], b'"' | b'\'') {
             out.push_str(&strip_prefixes(&src[seg_start..i]));
             let end = literal_end(b, i);
             out.push_str(&src[i..end]);
@@ -5242,14 +5243,16 @@ pub fn display_formula(src: &str) -> String {
     rewrite_calls(&out)
 }
 
-/// The end of the string literal whose opening `"` is at `start`: just past
-/// its closing quote (`""` inside is an escaped quote), or the end of the
-/// text when it is unclosed.
+/// The end of the string literal (`"…"`) or quoted sheet name (`'…'`)
+/// whose opening quote is at `start`: just past its closing quote (a doubled
+/// quote inside is an escaped one), or the end of the text when it is
+/// unclosed.
 fn literal_end(b: &[u8], start: usize) -> usize {
+    let q = b[start];
     let mut i = start + 1;
     while i < b.len() {
-        if b[i] == b'"' {
-            if b.get(i + 1) == Some(&b'"') {
+        if b[i] == q {
+            if b.get(i + 1) == Some(&q) {
                 i += 2;
                 continue;
             }
@@ -5270,7 +5273,8 @@ fn strip_prefixes(s: &str) -> String {
 }
 
 /// Replace every whole-word `ANCHORARRAY(arg)` with `arg#` and `SINGLE(arg)`
-/// with `@arg` (balanced parens), outside string literals and with the
+/// with `@arg` (balanced parens), outside string literals and quoted sheet
+/// names, and with the
 /// argument rewritten too, so `SINGLE(SINGLE(A1))` gives `@@A1`. A match
 /// preceded by an identifier character is ignored — `NOTSINGLE(A1)` is left
 /// alone rather than becoming `NOT@A1`. An unbalanced call is left verbatim.
@@ -5280,7 +5284,7 @@ fn rewrite_calls(s: &str) -> String {
     let mut pos = 0usize;
     let mut i = 0usize;
     while i < b.len() {
-        if b[i] == b'"' {
+        if matches!(b[i], b'"' | b'\'') {
             i = literal_end(b, i);
             continue;
         }
@@ -5307,7 +5311,7 @@ fn rewrite_calls(s: &str) -> String {
         let mut j = open;
         while j < b.len() {
             match b[j] {
-                b'"' => {
+                b'"' | b'\'' => {
                     j = literal_end(b, j);
                     continue;
                 }
@@ -11991,6 +11995,17 @@ mod tests {
             ("é_xlfn.SINGLE(A1)", "é@A1"),
             ("_xlfn.SINGLE(Données!A1:A3)", "@Données!A1:A3"),
             ("_xlfn.ANCHORARRAY('日本'!B2)", "'日本'!B2#"),
+        ] {
+            assert_eq!(display_formula(stored), shown, "{stored}");
+        }
+        // A quoted sheet name is the name, as a literal is the text: no
+        // rewrite or prefix strip inside it, and a `"` in it opens no
+        // literal.
+        for (stored, shown) in [
+            ("'x SINGLE(1)'!A1", "'x SINGLE(1)'!A1"),
+            ("'_xlfn.x'!A1+_xlfn.SINGLE(B1)", "'_xlfn.x'!A1+@B1"),
+            ("_xlfn.SINGLE('a\"b'!A1)+_xlfn.SINGLE(C1)", "@'a\"b'!A1+@C1"),
+            ("_xlfn.SINGLE('it''s )'!A1)", "@'it''s )'!A1"),
         ] {
             assert_eq!(display_formula(stored), shown, "{stored}");
         }
