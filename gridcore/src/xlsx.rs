@@ -11720,31 +11720,107 @@ b",
     }
 
     #[test]
-    fn delete_inside_a_sorted_frozen_arrays_stale_extent_still_clears() {
-        // #777 r5: a sort moves a frozen anchor (extent and all) but leaves
-        // its ref naming E1:E3; at E2 that ref is another block's, so its
-        // stale extent claims nothing: Delete on the user's "x" clears it.
+    fn a_sort_cutting_an_array_block_is_refused() {
+        // #840 (r4-pre-structural-spill): a sort through a frozen dynamic
+        // array, or a legacy CSE block, would scatter its block; it is
+        // refused and leaves the rows, the extent and the saved `ref` alone.
+        for (cm, f) in [(r#" cm="1""#, "_xlfn.PIVOTBY(A1,4)"), ("", "A1:A3*2")] {
+            let rows = format!(
+                concat!(
+                    r#"<row r="1"><c r="A1"><v>2</v></c><c r="E1"{cm}><f t="array" ref="E1:E3">{f}</f><v>7</v></c></row>"#,
+                    r#"<row r="2"><c r="A2"><v>1</v></c><c r="E2"><v>8</v></c></row>"#,
+                    r#"<row r="3"><c r="A3"><v>4</v></c><c r="E3"><v>9</v></c></row>"#,
+                    r#"<row r="4"><c r="A4"><v>3</v></c><c r="E4" t="inlineStr"><is><t>x</t></is></c></row>"#,
+                ),
+                cm = cm,
+                f = f
+            );
+            let mut pkg = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
+            let before = pkg.workbook.sheets[0].cells.clone();
+            assert!(crate::edit::sort_cuts_spill(&pkg.workbook, 0, 0, 3), "{f}");
+            let n = crate::edit::sort_rows(&mut pkg.workbook, 0, 0, 3, &[(0, true)]);
+            assert_eq!(n, 0, "{f}");
+            assert_eq!(pkg.workbook.sheets[0].cells, before, "{f}");
+            let ws = saved_sheet1(&pkg);
+            assert!(ws.contains(r#"<f t="array" ref="E1:E3">"#), "{f}: {ws}");
+        }
+    }
+
+    #[test]
+    fn an_evaluated_cse_block_is_still_an_array_to_sort() {
+        // #840 r1 m1: a legacy CSE `SUM` over its block evaluates to one
+        // value, so it has no extent, but save keeps its `ref`. A sort through
+        // a 3-row block is refused; a 1-row block moves with its row, `ref`
+        // and all.
+        let cse = |r: &str| format!(r#"<f t="array" ref="{r}">SUM(B1:B3)</f><v>6</v>"#);
+        let rows = format!(
+            concat!(
+                r#"<row r="1"><c r="A1"><v>9</v></c><c r="B1"><v>1</v></c><c r="D1">{}</c></row>"#,
+                r#"<row r="2"><c r="A2"><v>1</v></c><c r="B2"><v>2</v></c></row>"#,
+                r#"<row r="3"><c r="A3"><v>5</v></c><c r="B3"><v>3</v></c></row>"#,
+            ),
+            cse("D1:D3")
+        );
+        let mut pkg = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        assert_eq!(pkg.workbook.sheets[0].cell(0, 3).unwrap().spill, None);
+        assert!(crate::edit::sort_cuts_spill(&pkg.workbook, 0, 0, 2));
+        assert_eq!(
+            crate::edit::sort_rows(&mut pkg.workbook, 0, 0, 2, &[(0, true)]),
+            0
+        );
+        let ws = saved_sheet1(&pkg);
+        assert!(
+            ws.contains(r#"<c r="D1"><f t="array" ref="D1:D3">"#),
+            "{ws}"
+        );
+
+        let rows = rows.replace(&cse("D1:D3"), &cse("D1:F1"));
+        let mut pkg = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        assert_eq!(pkg.workbook.sheets[0].cell(0, 3).unwrap().spill, None);
+        assert_eq!(
+            crate::edit::sort_rows(&mut pkg.workbook, 0, 0, 2, &[(0, true)]),
+            3
+        );
+        let ws = saved_sheet1(&pkg);
+        assert!(
+            ws.contains(r#"<c r="D3"><f t="array" ref="D3:F3">"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn a_sorted_one_row_frozen_array_keeps_its_block() {
+        // #840: a sort moves a one-row frozen array with its row, `ref` and
+        // all, so its block is still its own there: Delete on a cached cell
+        // is a no-op, and save writes the block at its new row.
         let rows = concat!(
-            r#"<row r="1"><c r="A1"><v>2</v></c><c r="E1" cm="1"><f t="array" ref="E1:E3">_xlfn.PIVOTBY(A1,4)</f><v>7</v></c></row>"#,
-            r#"<row r="2"><c r="A2"><v>1</v></c><c r="E2"><v>8</v></c></row>"#,
-            r#"<row r="3"><c r="A3"><v>4</v></c><c r="E3"><v>9</v></c></row>"#,
-            r#"<row r="4"><c r="A4"><v>3</v></c><c r="E4" t="inlineStr"><is><t>x</t></is></c></row>"#,
+            r#"<row r="1"><c r="A1"><v>9</v></c><c r="E1" cm="1"><f t="array" ref="E1:G1">_xlfn.PIVOTBY(A1,4)</f><v>7</v></c><c r="F1"><v>8</v></c><c r="G1"><v>9</v></c></row>"#,
+            r#"<row r="2"><c r="A2"><v>1</v></c></row>"#,
+            r#"<row r="3"><c r="A3"><v>5</v></c></row>"#,
         );
         let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
-        crate::edit::sort_rows(&mut pkg.workbook, 0, 0, 3, &[(0, true)]);
-        let at = |pkg: &SheetPackage, r: u32| {
-            pkg.workbook.sheets[0]
-                .cell(r, 4)
-                .map_or(CellValue::Empty, |cl| cl.value.clone())
-        };
         assert_eq!(
-            pkg.workbook.sheets[0].cell(1, 4).unwrap().spill,
-            Some((3, 1))
+            crate::edit::sort_rows(&mut pkg.workbook, 0, 0, 2, &[(0, true)]),
+            3
         );
-        assert_eq!(at(&pkg, 2), CellValue::Text("x".into()));
+        let e3 = pkg.workbook.sheets[0].cell(2, 4).unwrap();
+        assert_eq!(e3.spill, Some((1, 3)));
+        assert!(e3.f_attrs.as_deref().unwrap().contains(r#"ref="E3:G3""#));
         let mut eng = crate::engine::Engine::new(&pkg.workbook);
-        eng.set_cell(&mut pkg.workbook, (0, 2, 4), Cell::default());
-        assert_eq!(at(&pkg, 2), CellValue::Empty);
+        eng.set_cell(&mut pkg.workbook, (0, 2, 5), Cell::default());
+        let at = |c: u32| pkg.workbook.sheets[0].cell(2, c).map(|cl| cl.value.clone());
+        assert_eq!(at(5), Some(CellValue::Number(8.0)));
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(2, 4).unwrap().spill,
+            Some((1, 3))
+        );
+        let ws = saved_sheet1(&pkg);
+        assert!(ws.contains(r#"<f t="array" ref="E3:G3">"#), "{ws}");
+        assert!(ws.contains(r#"<c r="F3"><v>8</v></c>"#), "{ws}");
     }
 
     #[test]
@@ -11775,6 +11851,32 @@ b",
             "{ws}"
         );
         assert!(ws.contains(r#"<c r="B2"><f>A2*2</f><v>18</v></c>"#), "{ws}");
+    }
+
+    #[test]
+    fn a_pasted_value_keeps_its_vm_and_a_pasted_formula_drops_it() {
+        // #840 (plan-paste-vm): a value pasted elsewhere is the same value,
+        // so its value metadata (E1, a rich value) comes along, as Excel
+        // copies a picture in a cell. A formula pasted elsewhere is typed
+        // there: B1's `vm` describes B1's result, not the copy's, so it goes
+        // even though the copy evaluates to the same 6.
+        let rows = r#"<row r="1"><c r="A1"><v>3</v></c><c r="B1" vm="1"><f>A1*2</f><v>6</v></c><c r="E1" t="e" vm="2"><v>#VALUE!</v></c></row>"#;
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        let sheet = &pkg.workbook.sheets[0];
+        let b1 = sheet.cell(0, 1).unwrap().clone();
+        let e1 = sheet.cell(0, 4).unwrap().clone();
+        eng.paste_block(&mut pkg.workbook, 0, (2, 1), &[vec![b1]]);
+        eng.paste_block(&mut pkg.workbook, 0, (2, 5), &[vec![e1]]);
+        let ws = saved_sheet1(&pkg);
+        assert!(ws.contains(r#"<c r="B3"><f>A1*2</f><v>6</v></c>"#), "{ws}");
+        assert!(
+            ws.contains(r#"<c r="F3" t="e" vm="2"><v>#VALUE!</v></c>"#),
+            "{ws}"
+        );
+        // The sources keep theirs.
+        assert!(ws.contains(r#"<c r="B1" vm="1">"#), "{ws}");
     }
 
     #[test]

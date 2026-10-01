@@ -1767,7 +1767,8 @@ impl App {
         self.apply_groups(vec![(sheet_idx, changes)]);
     }
 
-    /// Apply per-sheet cell changes, in order, as one undo step: a cut
+    /// Apply per-sheet cell changes, in order ([`Engine::set_cells`]: blanks
+    /// landing in a frozen array block last), as one undo step: a cut
     /// pasted on another sheet clears its source and writes its destination
     /// together, so one undo puts both back.
     fn apply_groups(&mut self, groups: Vec<(usize, CellChanges)>) {
@@ -1777,10 +1778,8 @@ impl App {
             .collect();
         self.record_groups(keys, |app| {
             for (sheet_idx, changes) in groups {
-                for (r, c, cell) in changes {
-                    app.engine
-                        .set_cell(&mut app.pkg.workbook, (sheet_idx, r, c), cell);
-                }
+                app.engine
+                    .set_cells(&mut app.pkg.workbook, sheet_idx, changes);
             }
         });
     }
@@ -2591,7 +2590,10 @@ impl App {
                 // The cut's clears go first, then the block through
                 // `Engine::paste_block`: a pasted spilling array still spills,
                 // and an array block pasted back in place, copy or cut, keeps
-                // its block. One undo step.
+                // its block. A clear landing in a frozen array block goes
+                // last (`Engine::split_frozen_blanks`): a no-op while the
+                // block is whole, it clears its cell once the paste has put
+                // content into the block. One undo step.
                 let (src, here) = (clip.sheet, self.sheet);
                 let clear_keys: Vec<_> = clears.iter().map(|&(r, c, _)| (r, c)).collect();
                 let keys = if same_sheet {
@@ -2600,12 +2602,22 @@ impl App {
                     vec![(src, clear_keys), (here, writes)]
                 };
                 self.record_groups(keys, |app| {
+                    let (clears, late) = if same_sheet {
+                        app.engine
+                            .split_frozen_blanks(&app.pkg.workbook, src, clears)
+                    } else {
+                        (clears, Vec::new())
+                    };
                     for (r, c, cell) in clears {
                         app.engine
                             .set_cell(&mut app.pkg.workbook, (src, r, c), cell);
                     }
                     app.engine
                         .paste_block(&mut app.pkg.workbook, here, (r0, c0), &block);
+                    for (r, c, cell) in late {
+                        app.engine
+                            .set_cell(&mut app.pkg.workbook, (src, r, c), cell);
+                    }
                 });
                 self.status = Some(if source_locked {
                     "Pasted (source sheet is protected; cut kept as copy)".to_string()
@@ -4508,6 +4520,10 @@ impl App {
             return;
         };
         let s = self.sheet;
+        if gridcore::edit::sort_cuts_spill(&self.pkg.workbook, s, start, bottom) {
+            self.status = Some(gridcore::edit::SORT_CUTS_SPILL.into());
+            return;
+        }
         self.structural(move |wb| {
             gridcore::edit::sort_rows(wb, s, start, bottom, &[(sc, ascending)]);
         });
@@ -4529,6 +4545,10 @@ impl App {
             return;
         };
         let s = self.sheet;
+        if gridcore::edit::sort_cuts_spill(&self.pkg.workbook, s, start, bottom) {
+            self.status = Some(gridcore::edit::SORT_CUTS_SPILL.into());
+            return;
+        }
         let keys2 = keys.clone();
         self.structural(move |wb| {
             gridcore::edit::sort_rows(wb, s, start, bottom, &keys2);
@@ -9448,6 +9468,34 @@ mod tests {
     }
 
     #[test]
+    fn a_sort_across_a_spill_is_refused() {
+        // #840: rows that cut a spilled array don't sort; the status says
+        // why and no undo step is pushed. A1:A3 = 3, 1, 2 beside C1
+        // `=SEQUENCE(3)`.
+        use gridcore::sheet::{Cell, CellValue};
+        let mut app = app_with_sequence_in_c1();
+        for (r, n) in [3.0, 1.0, 2.0].iter().enumerate() {
+            app.pkg.workbook.sheets[0].set_cell(r as u32, 0, Cell::number(*n));
+        }
+        app.rebuild_engine();
+        let before = app.sheet().cells.clone();
+        let undo = app.undo.len();
+        app.cur = (0, 0);
+        app.anchor = None;
+        app.sort_region(true);
+        assert_eq!(app.status.as_deref(), Some(gridcore::edit::SORT_CUTS_SPILL));
+        app.status = None;
+        app.commit_sort("A desc");
+        assert_eq!(app.status.as_deref(), Some(gridcore::edit::SORT_CUTS_SPILL));
+        assert_eq!(app.sheet().cells, before);
+        assert_eq!(app.undo.len(), undo);
+        assert_eq!(
+            app.sheet().cell(0, 0).unwrap().value,
+            CellValue::Number(3.0)
+        );
+    }
+
+    #[test]
     fn commit_sort_multi_level() {
         use gridcore::sheet::{Cell, CellValue};
         assert_eq!(
@@ -11689,6 +11737,120 @@ mod tests {
         assert_eq!(col_values(&app, 4, 0, 2), cached);
         app.redo();
         assert_eq!(col_values(&app, 4, 0, 2), vec![n(7.0), n(5.0), n(9.0)]);
+    }
+
+    /// An app over a frozen array block: A1 = 1, E1 `PIVOTBY(A1,4)`
+    /// (`ref="E1:E3"`, cached 7) with `e2` and `e3` as its other cached cells.
+    fn app_with_frozen_block(e2: Cell, e3: Cell) -> App {
+        let mut pkg = new_xlsx();
+        let sheet = &mut pkg.workbook.sheets[0];
+        sheet.set_cell(0, 0, Cell::number(1.0));
+        sheet.set_cell(
+            0,
+            4,
+            Cell {
+                value: CellValue::Number(7.0),
+                formula: Some("PIVOTBY(A1,4)".into()),
+                f_attrs: Some("t=\"array\" ref=\"E1:E3\"".into()),
+                spill: Some((3, 1)),
+                ..Cell::default()
+            },
+        );
+        sheet.set_cell(1, 4, e2);
+        sheet.set_cell(2, 4, e3);
+        let mut app = App::new(pkg, "test.xlsx");
+        app.os_clip = None;
+        app
+    }
+
+    #[test]
+    fn retyping_a_frozen_anchor_keeps_its_block() {
+        // #840: the same formula typed over a frozen anchor (no F2: an
+        // unchanged F2 commits nothing) keeps its cached block, extent and
+        // saved `ref`, through undo and redo.
+        let n = |v: f64| CellValue::Number(v);
+        let cached = vec![n(7.0), n(8.0), n(9.0)];
+        let mut app = app_with_frozen_block(Cell::number(8.0), Cell::number(9.0));
+        let extent = |app: &App| app.pkg.workbook.sheets[0].cell(0, 4).unwrap().spill;
+        app.cur = (0, 4);
+        app.start_edit(Some('='));
+        if let Some(e) = &mut app.edit {
+            e.text = "=PIVOTBY(A1,4)".into();
+            e.cursor = e.text.chars().count();
+        }
+        assert!(app.commit_edit());
+        assert_eq!(col_values(&app, 4, 0, 2), cached, "typed");
+        assert_eq!(extent(&app), Some((3, 1)), "typed");
+        app.undo();
+        assert_eq!(col_values(&app, 4, 0, 2), cached, "undo");
+        assert_eq!(extent(&app), Some((3, 1)), "undo");
+        app.redo();
+        assert_eq!(col_values(&app, 4, 0, 2), cached, "redo");
+        assert_eq!(extent(&app), Some((3, 1)), "redo");
+        let saved = gridcore::xlsx::save_xlsx(&app.pkg);
+        let re = gridcore::xlsx::load_xlsx(&saved).unwrap();
+        let ws = String::from_utf8_lossy(re.part("xl/worksheets/sheet1.xml").unwrap()).into_owned();
+        assert!(ws.contains(r#"<f t="array" ref="E1:E3">"#), "{ws}");
+        let values: Vec<CellValue> = (0..3)
+            .map(|r| re.workbook.sheets[0].cell(r, 4).unwrap().value.clone())
+            .collect();
+        assert_eq!(values, cached, "saved");
+    }
+
+    #[test]
+    fn a_fill_or_replace_mixing_blanks_into_a_frozen_block_clears_them() {
+        // #840 (r4-m1): a group that puts a blank and a value into one frozen
+        // block breaks the block, and the blank clears its cell, though it
+        // comes first. Fill right D2:E3 from D2 = blank, D3 = 5.
+        let n = |v: f64| CellValue::Number(v);
+        let t = |s: &str| CellValue::Text(s.into());
+        let mut app = app_with_frozen_block(Cell::number(8.0), Cell::number(9.0));
+        app.pkg.workbook.sheets[0].set_cell(2, 3, Cell::number(5.0));
+        app.anchor = Some((1, 3));
+        app.cur = (2, 4);
+        app.fill(false);
+        let filled = vec![n(7.0), CellValue::Empty, n(5.0)];
+        assert_eq!(col_values(&app, 4, 0, 2), filled, "fill");
+        app.undo();
+        assert_eq!(col_values(&app, 4, 0, 2), vec![n(7.0), n(8.0), n(9.0)]);
+        // #840 r2: redo ends as the fill did.
+        app.redo();
+        assert_eq!(col_values(&app, 4, 0, 2), filled, "redo fill");
+        let e1 = |app: &App| app.pkg.workbook.sheets[0].cell(0, 4).unwrap().spill;
+        assert_eq!(e1(&app), None, "redo fill");
+
+        // Replace "x" with "" over E2 "x", E3 "xy".
+        let mut app = app_with_frozen_block(Cell::text("x"), Cell::text("xy"));
+        app.replace_all("x", "");
+        let replaced = vec![n(7.0), CellValue::Empty, t("y")];
+        assert_eq!(col_values(&app, 4, 0, 2), replaced, "replace");
+        app.undo();
+        assert_eq!(col_values(&app, 4, 0, 2), vec![n(7.0), t("x"), t("xy")]);
+        app.redo();
+        assert_eq!(col_values(&app, 4, 0, 2), replaced, "redo replace");
+        assert_eq!(e1(&app), None, "redo replace");
+    }
+
+    #[test]
+    fn cutting_a_frozen_block_cell_into_the_block_clears_its_source() {
+        // #840 r3 p1: cut E3 of a frozen block, paste at E2. The clear of E3
+        // is a no-op while the block is whole, so it goes after the paste,
+        // which breaks the block: E3 is cleared, through undo and redo.
+        let n = |v: f64| CellValue::Number(v);
+        let mut app = app_with_frozen_block(Cell::number(8.0), Cell::number(9.0));
+        let moved = vec![n(7.0), n(9.0), CellValue::Empty];
+        app.anchor = None;
+        app.cur = (2, 4);
+        app.copy(true);
+        app.cur = (1, 4);
+        app.paste();
+        assert_eq!(col_values(&app, 4, 0, 2), moved, "paste");
+        app.undo();
+        assert_eq!(col_values(&app, 4, 0, 2), vec![n(7.0), n(8.0), n(9.0)]);
+        let extent = |app: &App| app.pkg.workbook.sheets[0].cell(0, 4).unwrap().spill;
+        assert_eq!(extent(&app), Some((3, 1)), "undo");
+        app.redo();
+        assert_eq!(col_values(&app, 4, 0, 2), moved, "redo");
     }
 
     #[test]
