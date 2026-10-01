@@ -35,3 +35,32 @@ foreach ($src in Get-ChildItem (Join-Path $PSScriptRoot "..\corpus\xlsx\*.xlsx")
     Start-Sleep 2; if (!$p.HasExited) { $p.Kill() }
   }
 }
+
+# corpus/legacy/extra: workbooks built by Excel itself, so the .xlsx source is
+# Excel's too. chart-embedded: a sheet with formulas and an embedded column
+# chart, whose .xls carries the chart as a BOF..EOF substream inside the
+# worksheet's.
+$extra = Join-Path $PSScriptRoot "..\corpus\legacy\extra"
+New-Item -ItemType Directory -Force $extra | Out-Null
+$extra = (Resolve-Path $extra).Path
+$p = Start-Process $Excel -ArgumentList "/automation","-Embedding" -PassThru
+Start-Sleep -Seconds 8
+$xl = [RealCom]::Local("00024500-0000-0000-C000-000000000046")
+$xl.DisplayAlerts = $false
+try {
+  $wb = $xl.Workbooks.Add()
+  $ws = $wb.Worksheets.Item(1)
+  $ws.Name = "Data"
+  $ws.Range("A1").Value2 = "Month"; $ws.Range("B1").Value2 = "Sales"; $ws.Range("C1").Value2 = "Cost"
+  for ($i = 2; $i -le 7; $i++) { $ws.Cells.Item($i,1).Value2 = "M$($i-1)"; $ws.Cells.Item($i,2).Value2 = 100*$i + 7; $ws.Cells.Item($i,3).Formula = "=B$i*0.6" }
+  $ws.Range("E1").Value2 = "Total"; $ws.Range("E2").Formula = "=SUM(B2:B7)"
+  $co = $ws.ChartObjects().Add(300, 20, 360, 220)
+  $co.Chart.ChartType = 51
+  $co.Chart.SetSourceData($ws.Range("A1:C7"))
+  $wb.SaveAs((Join-Path $extra "chart-embedded.xlsx"), 51)
+  foreach ($f in @(@{e='xls';n=56}, @{e='xlsb';n=50}, @{e='ods';n=60})) { $wb.SaveAs((Join-Path $extra "chart-embedded.$($f.e)"), $f.n) }
+  $wb.Close($false)
+} finally {
+  $xl.Quit(); [Runtime.InteropServices.Marshal]::ReleaseComObject($xl) | Out-Null
+  Start-Sleep 2; if (!$p.HasExited) { $p.Kill() }
+}

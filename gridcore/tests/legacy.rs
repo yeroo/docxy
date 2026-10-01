@@ -356,24 +356,32 @@ const FORMATS: &[(&str, SourceFormat)] = &[
 fn legacy_imports_match_their_xlsx_originals() {
     let mut errs = Vec::new();
     let mut files = 0;
-    let mut stems: Vec<_> = std::fs::read_dir(corpus("xlsx"))
-        .expect("corpus/xlsx")
-        .filter_map(|e| {
-            let p = e.ok()?.path();
-            if p.extension()? != "xlsx" {
-                return None;
+    // (source .xlsx, the directory of its legacy copies, stem): the xlsx
+    // corpus, and corpus/legacy/extra, whose sources Excel saved itself.
+    let mut books: Vec<(std::path::PathBuf, std::path::PathBuf, String)> = Vec::new();
+    for (src_dir, legacy_dir) in [
+        (corpus("xlsx"), corpus("legacy")),
+        (
+            corpus("legacy").join("extra"),
+            corpus("legacy").join("extra"),
+        ),
+    ] {
+        for e in std::fs::read_dir(&src_dir).expect("corpus dir") {
+            let p = e.expect("dir entry").path();
+            if p.extension().is_some_and(|x| x == "xlsx") {
+                let stem = p.file_stem().unwrap().to_string_lossy().into_owned();
+                books.push((p, legacy_dir.clone(), stem));
             }
-            Some(p.file_stem()?.to_string_lossy().into_owned())
-        })
-        .collect();
-    stems.sort();
-    for stem in &stems {
-        let src = load_xlsx(&std::fs::read(corpus("xlsx").join(format!("{stem}.xlsx"))).unwrap())
+        }
+    }
+    books.sort();
+    for (src_path, legacy_dir, stem) in &books {
+        let src = load_xlsx(&std::fs::read(src_path).unwrap())
             .expect("corpus xlsx loads")
             .workbook;
         for &(ext, format) in FORMATS {
             let file = format!("{stem}.{ext}");
-            let path = corpus("legacy").join(&file);
+            let path = legacy_dir.join(&file);
             let data = std::fs::read(&path).unwrap_or_else(|e| panic!("{file}: {e}"));
             files += 1;
             let (pkg, got_format) = match open_workbook(&data) {
@@ -409,8 +417,8 @@ fn legacy_imports_match_their_xlsx_originals() {
     }
     assert_eq!(
         files,
-        17 * FORMATS.len(),
-        "expected 17 workbooks per format"
+        18 * FORMATS.len(),
+        "expected 18 workbooks per format"
     );
     assert!(
         errs.is_empty(),

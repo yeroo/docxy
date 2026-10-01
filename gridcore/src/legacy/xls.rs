@@ -497,9 +497,23 @@ fn read_sheet(
         );
     };
 
+    // A substream nested in the sheet's (an embedded chart's BOF..EOF) is
+    // skipped whole: its records (cached series values among them) are not
+    // the sheet's cells, and its EOF doesn't end the sheet.
+    let mut depth = 0usize;
     for r in recs {
-        if r.ty == EOF {
-            break;
+        match r.ty {
+            BOF => {
+                depth += 1;
+                continue;
+            }
+            EOF if depth > 0 => {
+                depth -= 1;
+                continue;
+            }
+            EOF => break,
+            _ if depth > 0 => continue,
+            _ => {}
         }
         let mut c = Cur::new(r);
         let _ = (|| -> Option<()> {
@@ -924,6 +938,27 @@ pub(crate) mod tests {
         assert!(c.keys().all(|&(r, col)| on_grid(r, col)));
         assert_eq!(c[&(2, 0)].formula, None);
         assert_eq!(c[&(2, 0)].value, CellValue::Number(1.0));
+    }
+
+    /// An embedded chart is a BOF..EOF substream inside the sheet's: its
+    /// records are not cells, and the sheet goes on after its EOF.
+    #[test]
+    fn an_embedded_chart_substream_is_skipped() {
+        let stream = workbook(
+            &[],
+            &[
+                number(0, 0, 1.0),
+                bof(0x0020),
+                number(0, 0, 99.0),
+                rec(EOF, &[]),
+                number(1, 0, 2.0),
+            ],
+        );
+        let book = read(&stream).unwrap();
+        let c = data(&book);
+        assert_eq!(c[&(0, 0)].value, CellValue::Number(1.0));
+        assert_eq!(c[&(1, 0)].value, CellValue::Number(2.0));
+        assert_eq!(c.len(), 2);
     }
 
     #[test]

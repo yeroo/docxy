@@ -6,6 +6,10 @@ OpenDocument Spreadsheet (`.ods`): 51 files. They are the oracle for
 gridcore's legacy readers (`gridcore::legacy`, #603). Importing
 `<stem>.<ext>` must give the workbook `corpus/xlsx/<stem>.xlsx` holds.
 
+`extra/` holds workbooks Excel built itself, so their `.xlsx` sources are
+Excel's too: `chart-embedded` has a sheet with formulas and an embedded
+column chart (in the `.xls`, a chart substream nested in the worksheet's).
+
 ## The test over this corpus (runs in CI)
 
 `gridcore/tests/legacy.rs` opens each file with `open_workbook` and checks it
