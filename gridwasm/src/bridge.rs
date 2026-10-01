@@ -499,6 +499,13 @@ impl Session {
             return;
         }
         let sheet_idx = self.active;
+        // A frozen anchor overwritten loses its cached block, which only
+        // its undo can put back: the group records the block too.
+        let keys = {
+            let wb = &self.pkg.workbook;
+            let frozen = |r, c| self.engine.is_frozen(wb, (sheet_idx, r, c));
+            gridcore::sheet::frozen_spill_keys(&wb.sheets[sheet_idx], &keys, frozen)
+        };
         // Spill output of a live anchor is snapshotted as the blank its
         // anchor re-spills over ([`Session::snapshot`]), whether or not the
         // anchor is in the group.
@@ -3393,6 +3400,76 @@ mod tests {
         assert_eq!(col3(&s, 4), blocked);
         s.dispatch("redo");
         assert_eq!(col3(&s, 4), seq);
+    }
+
+    #[test]
+    fn undoing_an_overwrite_of_a_frozen_anchor_restores_its_block() {
+        // #837: typing over a frozen anchor clears its cached block; undo
+        // puts the block back, extent and saved `ref` too.
+        let n = |v: f64| CellValue::Number(v);
+        let cached = vec![n(7.0), n(8.0), n(9.0)];
+        let typed = vec![n(5.0), CellValue::Empty, CellValue::Empty];
+        let mut pkg = new_xlsx();
+        let sheet = &mut pkg.workbook.sheets[0];
+        sheet.set_cell(0, 0, Cell::number(1.0));
+        sheet.set_cell(
+            0,
+            4,
+            Cell {
+                value: n(7.0),
+                formula: Some("PIVOTBY(A1,4)".into()),
+                f_attrs: Some("t=\"array\" ref=\"E1:E3\"".into()),
+                spill: Some((3, 1)),
+                ..Cell::default()
+            },
+        );
+        sheet.set_cell(1, 4, Cell::number(8.0));
+        sheet.set_cell(2, 4, Cell::number(9.0));
+        let mut s = Session::open(&save_xlsx(&pkg)).expect("open");
+        assert_eq!(col3(&s, 4), cached, "loaded");
+        let f_attrs = s.pkg.workbook.sheets[0].cell(0, 4).unwrap().f_attrs.clone();
+        assert!(f_attrs.is_some());
+        s.dispatch("set\t0\t4\t5");
+        assert_eq!(col3(&s, 4), typed);
+        for round in 0..2 {
+            s.dispatch("undo");
+            assert_eq!(col3(&s, 4), cached, "undo {round}");
+            let e1 = s.pkg.workbook.sheets[0].cell(0, 4).unwrap();
+            assert_eq!(e1.spill, Some((3, 1)), "undo {round}");
+            assert_eq!(e1.f_attrs, f_attrs, "undo {round}");
+            if round == 0 {
+                s.dispatch("redo");
+                assert_eq!(col3(&s, 4), typed, "redo");
+            }
+        }
+        let re = Session::open(&s.save()).expect("reopen");
+        assert_eq!(col3(&re, 4), cached, "saved");
+        let ws =
+            String::from_utf8_lossy(re.pkg.part("xl/worksheets/sheet1.xml").unwrap()).into_owned();
+        assert!(ws.contains(r#"<f t="array" ref="E1:E3">"#), "{ws}");
+    }
+
+    #[test]
+    fn undoing_an_overwrite_of_a_live_anchor_re_spills_it() {
+        // #837 guard: a live anchor's block is not recorded; undo re-spills
+        // it from its formula.
+        let n = |v: f64| CellValue::Number(v);
+        let seq = vec![n(1.0), n(2.0), n(3.0)];
+        let x = vec![
+            CellValue::Text("x".into()),
+            CellValue::Empty,
+            CellValue::Empty,
+        ];
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("set\t0\t4\t=SEQUENCE(3)");
+        s.dispatch("set\t0\t4\tx");
+        assert_eq!(col3(&s, 4), x);
+        s.dispatch("undo");
+        assert_eq!(col3(&s, 4), seq);
+        let e1 = s.pkg.workbook.sheets[0].cell(0, 4).unwrap();
+        assert_eq!(e1.spill, Some((3, 1)));
+        s.dispatch("redo");
+        assert_eq!(col3(&s, 4), x);
     }
 
     #[test]
