@@ -226,37 +226,69 @@ fn read_content_types(xml: &str, package: &mut PackageParts) -> Option<()> {
     Some(())
 }
 
+/// Budget, in bytes, for the sum of the declared uncompressed sizes of every
+/// part [`read_yppx`] extracts on open (the main part, the content-type map and
+/// every retained extra part). A package over it is refused before anything is
+/// extracted. Our own writer stores parts uncompressed, so their size is
+/// bounded by the file's; the budget guards against deflated packages from
+/// other tools whose small entries would inflate to gigabytes. The real peak
+/// is several times the budget once the parts are copied and the project
+/// model is built from `project.xml`.
+pub const MAX_PACKAGE_UNCOMPRESSED: u64 = 256 * 1024 * 1024;
+
 /// Read a `.yppx` package back into a [`Project`].
 pub fn read_yppx(bytes: &[u8]) -> Result<Project, String> {
+    read_yppx_within(bytes, MAX_PACKAGE_UNCOMPRESSED)
+}
+
+fn read_yppx_within(bytes: &[u8], budget: u64) -> Result<Project, String> {
     let zip = ZipArchive::open(bytes).ok_or("not a valid .yppx (ZIP) container")?;
-    let part = zip
+    let missing = || format!(".yppx package is missing its {MAIN_PART} part");
+    let main = zip
         .entries()
         .iter()
         .find(|entry| entry.name.eq_ignore_ascii_case(MAIN_PART))
-        .and_then(|entry| zip.extract(entry))
-        .ok_or_else(|| format!(".yppx package is missing its {MAIN_PART} part"))?;
-    let xml = String::from_utf8(part).map_err(|_| format!("{MAIN_PART} is not valid UTF-8"))?;
-    let mut project = read_mspdi(&xml)?;
+        .ok_or_else(missing)?;
     let mut seen = HashSet::new();
-    for entry in zip.entries() {
-        let name = &entry.name;
-        if name.ends_with('/')
-            || name.eq_ignore_ascii_case(CONTENT_TYPES_PART)
-            || name.eq_ignore_ascii_case(MAIN_PART)
-            || !seen.insert(name.to_ascii_lowercase())
-        {
-            continue;
-        }
-        if let Some(bytes) = zip.extract(entry) {
-            project.package.parts.push((name.clone(), Arc::from(bytes)));
-        } else {
-            project.package.unreadable.push(name.clone());
-        }
-    }
-    if let Some(map) = zip
+    let extras: Vec<_> = zip
         .entries()
         .iter()
-        .find(|entry| entry.name.eq_ignore_ascii_case(CONTENT_TYPES_PART))
+        .filter(|entry| {
+            let name = &entry.name;
+            !(name.ends_with('/')
+                || name.eq_ignore_ascii_case(CONTENT_TYPES_PART)
+                || name.eq_ignore_ascii_case(MAIN_PART)
+                || !seen.insert(name.to_ascii_lowercase()))
+        })
+        .collect();
+    let content_types = zip
+        .entries()
+        .iter()
+        .find(|entry| entry.name.eq_ignore_ascii_case(CONTENT_TYPES_PART));
+    let total: u64 = std::iter::once(main)
+        .chain(extras.iter().copied())
+        .chain(content_types)
+        .map(|entry| u64::from(entry.uncomp_size))
+        .sum();
+    if total > budget {
+        return Err(format!(
+            ".yppx package too large: its parts unpack to {total} bytes, over the {budget}-byte budget"
+        ));
+    }
+    let part = zip.extract(main).ok_or_else(missing)?;
+    let xml = String::from_utf8(part).map_err(|_| format!("{MAIN_PART} is not valid UTF-8"))?;
+    let mut project = read_mspdi(&xml)?;
+    for entry in extras {
+        if let Some(bytes) = zip.extract(entry) {
+            project
+                .package
+                .parts
+                .push((entry.name.clone(), Arc::from(bytes)));
+        } else {
+            project.package.unreadable.push(entry.name.clone());
+        }
+    }
+    if let Some(map) = content_types
         .and_then(|entry| zip.extract(entry))
         .and_then(|bytes| decode_content_types(&bytes))
     {
@@ -356,9 +388,8 @@ mod tests {
         write_zip(&entries)
     }
 
-    /// Change one entry to Deflate64 in both ZIP headers, while leaving its
-    /// bytes intact. Our ZIP reader can enumerate it but cannot extract it.
-    fn unsupported_method(mut bytes: Vec<u8>, index: usize) -> Vec<u8> {
+    /// Offsets of the `index`th entry's central-directory and local headers.
+    fn entry_headers(bytes: &[u8], index: usize) -> (usize, usize) {
         let eocd = bytes.windows(4).rposition(|s| s == b"PK\x05\x06").unwrap();
         let mut central =
             u32::from_le_bytes(bytes[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
@@ -376,9 +407,122 @@ mod tests {
         let local =
             u32::from_le_bytes(bytes[central + 42..central + 46].try_into().unwrap()) as usize;
         assert_eq!(&bytes[local..local + 4], b"PK\x03\x04");
+        (central, local)
+    }
+
+    /// Change one entry to Deflate64 in both ZIP headers, while leaving its
+    /// bytes intact. Our ZIP reader can enumerate it but cannot extract it.
+    fn unsupported_method(mut bytes: Vec<u8>, index: usize) -> Vec<u8> {
+        let (central, local) = entry_headers(&bytes, index);
         bytes[local + 8..local + 10].copy_from_slice(&9u16.to_le_bytes());
         bytes[central + 10..central + 12].copy_from_slice(&9u16.to_le_bytes());
         bytes
+    }
+
+    /// Change one entry's declared uncompressed size in both ZIP headers.
+    fn declared_size(mut bytes: Vec<u8>, index: usize, size: u32) -> Vec<u8> {
+        let (central, local) = entry_headers(&bytes, index);
+        bytes[local + 22..local + 26].copy_from_slice(&size.to_le_bytes());
+        bytes[central + 24..central + 28].copy_from_slice(&size.to_le_bytes());
+        bytes
+    }
+
+    /// Sum of the declared uncompressed sizes of a package's entries.
+    fn declared_total(bytes: &[u8]) -> u64 {
+        ZipArchive::open(bytes)
+            .unwrap()
+            .entries()
+            .iter()
+            .map(|entry| u64::from(entry.uncomp_size))
+            .sum()
+    }
+
+    fn assert_too_large(result: Result<Project, String>) {
+        let error = result.unwrap_err();
+        assert!(error.contains("too large"), "{error}");
+    }
+
+    /// #451: a part declaring a huge size is refused before extraction; it
+    /// used to be extracted (or listed unreadable) with no limit.
+    #[test]
+    fn huge_declared_extra_part_is_too_large() {
+        let source = with_parts(ORIGINAL_CONTENT_TYPES, &[("media/big.bin", b"small")]);
+        assert!(read_yppx(&source).is_ok());
+        assert_too_large(read_yppx(&declared_size(source, 2, u32::MAX)));
+    }
+
+    #[test]
+    fn oversized_main_part_is_too_large() {
+        let source = with_parts(ORIGINAL_CONTENT_TYPES, &[]);
+        let main = write_mspdi(&sample()).len() as u64;
+        assert_too_large(read_yppx_within(&source, main - 1));
+    }
+
+    #[test]
+    fn oversized_extra_part_is_too_large() {
+        let small = with_parts(ORIGINAL_CONTENT_TYPES, &[("views.xml", b"<views/>")]);
+        let budget = declared_total(&small);
+        let big = vec![b'x'; 1024];
+        let source = with_parts(ORIGINAL_CONTENT_TYPES, &[("views.xml", &big)]);
+        assert!(read_yppx_within(&small, budget).is_ok());
+        assert_too_large(read_yppx_within(&source, budget));
+    }
+
+    #[test]
+    fn parts_over_budget_in_total_are_too_large() {
+        let part = vec![b'x'; 100];
+        let source = with_parts(
+            ORIGINAL_CONTENT_TYPES,
+            &[("a.bin", &part), ("b.bin", &part), ("c.bin", &part)],
+        );
+        let budget = declared_total(&source) - 1;
+        // Each part fits on its own; only all three together are over.
+        assert!(budget - 200 >= declared_total(&with_parts(ORIGINAL_CONTENT_TYPES, &[])));
+        assert_too_large(read_yppx_within(&source, budget));
+    }
+
+    #[test]
+    fn package_at_budget_opens() {
+        let source = with_parts(ORIGINAL_CONTENT_TYPES, &[("views.xml", b"<views/>")]);
+        let project = read_yppx_within(&source, declared_total(&source)).unwrap();
+        assert_eq!(&*project.package.parts[0].1, b"<views/>");
+    }
+
+    #[test]
+    fn skipped_entries_do_not_count_against_budget() {
+        let kept = with_parts(ORIGINAL_CONTENT_TYPES, &[("views.xml", b"<views/>")]);
+        let budget = declared_total(&kept);
+        let big = vec![b'x'; 1024];
+        let source = with_parts(
+            ORIGINAL_CONTENT_TYPES,
+            &[
+                ("views.xml", b"<views/>"),
+                ("VIEWS.XML", &big),
+                ("Project.xml", &big),
+                ("[content_types].XML", &big),
+                ("media/", b""),
+            ],
+        );
+        // A directory entry declaring bytes is skipped too.
+        let source = declared_size(source, 6, 1024);
+        let project = read_yppx_within(&source, budget).unwrap();
+        assert_eq!(project.package.parts.len(), 1);
+        assert_eq!(&*project.package.parts[0].1, b"<views/>");
+    }
+
+    #[test]
+    fn missing_main_part_is_reported_before_budget() {
+        let source = write_zip(&[
+            (
+                CONTENT_TYPES_PART.into(),
+                ORIGINAL_CONTENT_TYPES.as_bytes().to_vec(),
+            ),
+            ("views.xml".into(), vec![b'x'; 1024]),
+        ]);
+        assert_eq!(
+            read_yppx_within(&source, 0).unwrap_err(),
+            ".yppx package is missing its project.xml part"
+        );
     }
 
     #[test]
