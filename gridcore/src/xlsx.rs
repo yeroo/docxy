@@ -2952,7 +2952,10 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
         let xml = set_active_tab(&xml, active_tab);
         // Same for defined names: a structural edit or a rename moves them in
         // the model (print area and titles included).
-        p.1 = patch_defined_names(&xml, &wb.defined_names, wb.sheets.len()).into_bytes();
+        let xml = patch_defined_names(&xml, &wb.defined_names, wb.sheets.len());
+        // The date system too: an imported 1904 workbook (#603) starts from
+        // new_xlsx's 1900 part, and its dates would shift by 1462 days.
+        p.1 = set_date1904(&xml, wb.date1904).into_bytes();
     }
 
     // --- calc chain: drop it, ask Excel to recalculate ---------------------
@@ -5702,6 +5705,34 @@ fn workbook_order_holds(xml: &str, at: usize, tag: &str) -> bool {
             Event::End => return true,
             Event::Eof => return false,
         }
+    }
+}
+
+/// workbook.xml whose `<workbookPr date1904>` says `on`, in any prefix. An
+/// existing workbookPr gets the attribute set to "1", or loses a true one;
+/// a 1904 workbook without a workbookPr gets one at its schema position.
+/// A part that already agrees is returned unchanged.
+fn set_date1904(xml: &str, on: bool) -> String {
+    match workbook_child(xml, "workbookPr") {
+        Some(c) => {
+            let was = matches!(attr_at(xml, c.start, "date1904"), Some("1" | "true"));
+            if was == on {
+                xml.to_string()
+            } else {
+                set_tag_attr(xml, c.start, "date1904", on.then_some("1"))
+            }
+        }
+        None if !on => xml.to_string(),
+        None => match workbook_slot(xml, "workbookPr") {
+            WorkbookSlot::At(at, px) => {
+                let mut out = xml.to_string();
+                out.insert_str(at, &format!("<{px}workbookPr date1904=\"1\"/>"));
+                out
+            }
+            // One the walk saw but couldn't read, or an unreadable part:
+            // left as it is rather than given a second workbookPr.
+            WorkbookSlot::Present | WorkbookSlot::Unknown => xml.to_string(),
+        },
     }
 }
 
@@ -8878,6 +8909,45 @@ mod tests {
     /// path honours it (xlsxy), so it is read from the package, not the
     /// model. Only "1"/"true" turn it on; anything else (or no attribute,
     /// no element, no part) means off.
+    /// #603: the model's date system is written back. An imported 1904
+    /// workbook starts from new_xlsx's 1900 part and must not stay 1900.
+    #[test]
+    fn save_writes_the_models_date1904() {
+        let mut pkg = new_xlsx();
+        pkg.workbook.date1904 = true;
+        let back = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert!(back.workbook.date1904);
+        let mut pkg = back;
+        pkg.workbook.date1904 = false;
+        assert!(!load_xlsx(&save_xlsx(&pkg)).unwrap().workbook.date1904);
+    }
+
+    #[test]
+    fn set_date1904_patches_inserts_and_removes() {
+        let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        // No workbookPr: one goes before bookViews/sheets.
+        let bare = format!("<workbook xmlns=\"{ns}\"><sheets/></workbook>");
+        assert_eq!(
+            set_date1904(&bare, true),
+            format!("<workbook xmlns=\"{ns}\"><workbookPr date1904=\"1\"/><sheets/></workbook>")
+        );
+        assert_eq!(set_date1904(&bare, false), bare);
+        // A prefixed one keeps its other attributes.
+        let x = format!(
+            "<x:workbook xmlns:x=\"{ns}\"><x:workbookPr defaultThemeVersion=\"1\"/><x:sheets/></x:workbook>"
+        );
+        let on = set_date1904(&x, true);
+        assert!(
+            on.contains("<x:workbookPr date1904=\"1\" defaultThemeVersion=\"1\"/>"),
+            "{on}"
+        );
+        assert_eq!(set_date1904(&on, true), on);
+        assert_eq!(set_date1904(&on, false), x);
+        // A false spelling already agrees with 1900.
+        let f = format!("<workbook xmlns=\"{ns}\"><workbookPr date1904=\"false\"/></workbook>");
+        assert_eq!(set_date1904(&f, false), f);
+    }
+
     #[test]
     fn always_create_backup_reads_workbook_pr() {
         let pkg_with = |wb_pr: &str| {
