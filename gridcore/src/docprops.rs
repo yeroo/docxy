@@ -9,6 +9,11 @@
 //! know (`cp:revision`, `AppVersion`, `DocSecurity`, extensions, a custom
 //! property of a type we don't model) rides along byte for byte. A write
 //! that changes nothing leaves the part untouched.
+//!
+//! A part that isn't UTF-8 XML we can read (UTF-16, truncated, malformed)
+//! reads as empty and is never patched. Only setting custom properties
+//! replaces an unreadable `custom.xml`, since that write says what the part
+//! should hold. Hostile property parts never make a save fail.
 
 use opccore::xml::{Event, XmlParser};
 
@@ -111,11 +116,32 @@ fn locate(parts: &[(String, Vec<u8>)], kind: Part) -> (String, bool) {
     }
 }
 
+/// A property part as the package holds it.
+enum PartXml {
+    Missing,
+    /// There, but not UTF-8 XML we can read: left exactly as it is.
+    Unreadable,
+    Xml(String),
+}
+
+fn part_xml(parts: &[(String, Vec<u8>)], name: &str) -> PartXml {
+    let Some((_, bytes)) = parts.iter().find(|(n, _)| n == name) else {
+        return PartXml::Missing;
+    };
+    // No lossy decoding: a UTF-16 part decoded as UTF-8 can still parse as
+    // (garbage) XML, and patching that would destroy it.
+    match std::str::from_utf8(bytes) {
+        Ok(xml) if read_root(xml, 0).is_some() => PartXml::Xml(xml.to_string()),
+        _ => PartXml::Unreadable,
+    }
+}
+
+/// The text of a readable part.
 fn part_text(parts: &[(String, Vec<u8>)], name: &str) -> Option<String> {
-    parts
-        .iter()
-        .find(|(n, _)| n == name)
-        .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
+    match part_xml(parts, name) {
+        PartXml::Xml(xml) => Some(xml),
+        _ => None,
+    }
 }
 
 /// The workbook's document properties. `None` (or an empty string, when
@@ -414,7 +440,7 @@ fn read_root(xml: &str, depth: usize) -> Option<Elem> {
 fn splice(xml: &str, mut ops: Vec<(usize, usize, String)>) -> String {
     ops.sort_by_key(|&(s, e, _)| (s, e));
     let mut out = String::with_capacity(xml.len() + 256);
-    let mut at = 0;
+    let mut at = 0usize;
     for (s, e, text) in ops {
         out.push_str(&xml[at..s]);
         out.push_str(&text);
@@ -623,7 +649,9 @@ fn read_custom(xml: &str) -> Vec<StoredProperty> {
     for c in root.children.iter().filter(|c| c.local() == "property") {
         let tag = &xml[c.start..c.tag_end];
         let mut p = XmlParser::new(tag);
-        if p.next() != Event::Start {
+        // A property we can't name is not listed, so no edit touches it: it
+        // stays in the part as it is.
+        if p.next() != Event::Start || p.attr("name").is_empty() {
             continue;
         }
         let name = decode(p.attr("name"));
@@ -665,15 +693,16 @@ fn read_custom(xml: &str) -> Vec<StoredProperty> {
 // Writing
 // ---------------------------------------------------------------------------
 
-/// The text of part `kind`, creating it (with its package relationship and
-/// content type) when the package has none.
-fn ensure_part(parts: &mut Vec<(String, Vec<u8>)>, kind: Part) -> (String, String) {
+/// Write an empty part `kind` (adding it, or replacing an unreadable one)
+/// with the package relationship and content type it needs; its name and
+/// text.
+fn create_part(parts: &mut Vec<(String, Vec<u8>)>, kind: Part) -> (String, String) {
     let (name, related) = locate(parts, kind);
-    if let Some(xml) = part_text(parts, &name) {
-        return (name, xml);
-    }
     let xml = kind.template();
-    parts.push((name.clone(), xml.clone().into_bytes()));
+    match parts.iter_mut().find(|(n, _)| *n == name) {
+        Some(p) => p.1 = xml.clone().into_bytes(),
+        None => parts.push((name.clone(), xml.clone().into_bytes())),
+    }
     if !related {
         add_rel(parts, "_rels/.rels", kind.rel_type(), &name);
     }
@@ -712,11 +741,12 @@ fn remove_part(parts: &mut Vec<(String, Vec<u8>)>, name: &str) {
 
 fn set_fields(parts: &mut Vec<(String, Vec<u8>)>, kind: Part, fields: &[Field]) {
     let (name, _) = locate(parts, kind);
-    let exists = parts.iter().any(|(n, _)| *n == name);
-    if !exists && fields.iter().all(|f| f.value.is_none_or(str::is_empty)) {
-        return;
-    }
-    let (name, xml) = ensure_part(parts, kind);
+    let (name, xml) = match part_xml(parts, &name) {
+        PartXml::Xml(xml) => (name, xml),
+        PartXml::Unreadable => return,
+        PartXml::Missing if fields.iter().all(|f| f.value.is_none_or(str::is_empty)) => return,
+        PartXml::Missing => create_part(parts, kind),
+    };
     if let Some(updated) = patch_fields(&xml, fields) {
         put(parts, &name, updated);
     }
@@ -738,73 +768,98 @@ fn custom_value_xml(vt: &str, value: &CustomValue) -> String {
     }
 }
 
+/// A new `<property>` element for `prop`.
+fn property_xml(prefixes: &mut Prefixes, own: &str, pid: u32, prop: &CustomProperty) -> String {
+    let vt = prefixes.get(NS_VT);
+    format!(
+        "<{own}property fmtid=\"{CUSTOM_FMTID}\" pid=\"{pid}\" name=\"{}\">{}</{own}property>",
+        esc_attr(&prop.name),
+        custom_value_xml(&vt, &prop.value)
+    )
+}
+
+/// Make custom.xml hold `custom`. A property whose name (any case) and value
+/// are unchanged keeps its exact bytes; a changed one is rewritten in place
+/// with its pid; a dropped one is cut; a new one is appended with the next
+/// free pid. Whitespace, comments and elements we don't read stay. The part
+/// goes away with its last property.
 fn set_custom(parts: &mut Vec<(String, Vec<u8>)>, custom: &[CustomProperty]) {
     let (name, _) = locate(parts, Part::Custom);
-    let existing_xml = part_text(parts, &name);
-    if custom.is_empty() {
-        if existing_xml.is_some() {
-            remove_part(parts, &name);
-        }
+    let (name, xml) = match part_xml(parts, &name) {
+        PartXml::Xml(xml) => (name, xml),
+        // Nothing to write; and an unreadable part may hold properties we
+        // can't see, so only an explicit list replaces it.
+        PartXml::Missing | PartXml::Unreadable if custom.is_empty() => return,
+        PartXml::Missing | PartXml::Unreadable => create_part(parts, Part::Custom),
+    };
+    let Some(root) = read_root(&xml, 1) else {
         return;
-    }
-    let (name, mut xml) = ensure_part(parts, Part::Custom);
-    let root = match read_root(&xml, 2) {
-        Some(r) => r,
-        None => {
-            // An unreadable part is replaced: the user just set its contents.
-            xml = Part::Custom.template();
-            match read_root(&xml, 2) {
-                Some(r) => r,
-                None => return,
-            }
-        }
     };
     let stored = read_custom(&xml);
+    let unchanged = stored.len() == custom.len()
+        && stored
+            .iter()
+            .zip(custom)
+            .all(|(s, c)| s.name == c.name && s.value == c.value);
+    if unchanged {
+        return;
+    }
+    let all_listed = root
+        .children
+        .iter()
+        .all(|c| stored.iter().any(|s| s.start == c.start));
+    if custom.is_empty() && all_listed {
+        remove_part(parts, &name);
+        return;
+    }
+
+    let same = |a: &str, b: &str| a.to_lowercase() == b.to_lowercase();
+    let own = root.prefix().to_string();
     let mut prefixes = Prefixes {
         root: &root,
         added: Vec::new(),
     };
-    let vt = prefixes.get(NS_VT);
-    let own = root.prefix().to_string();
-    let same = |a: &str, b: &str| a.to_lowercase() == b.to_lowercase();
-    let mut next_pid = stored
+    // Past every pid in the part, listed or not, so pids stay unique.
+    let mut next_pid = root
+        .children
         .iter()
-        .filter(|s| custom.iter().any(|c| same(&c.name, &s.name)))
-        .filter_map(|s| s.pid)
+        .filter_map(|c| {
+            let mut p = XmlParser::new(&xml[c.start..c.tag_end]);
+            (p.next() == Event::Start).then(|| p.attr("pid").trim().parse::<u32>().ok())?
+        })
         .max()
         .unwrap_or(1)
-        .max(1)
+        .clamp(1, u32::MAX - 1)
         + 1;
-    let mut body = String::new();
+    let mut fresh_pid = || {
+        let pid = next_pid;
+        next_pid = next_pid.saturating_add(1);
+        pid
+    };
+    let mut used = vec![false; stored.len()];
+    let mut ops = Vec::new();
+    let mut appended = String::new();
     for prop in custom {
-        let old = stored.iter().find(|s| same(&s.name, &prop.name));
-        match old {
-            Some(s) if s.value == prop.value && s.name == prop.name => {
-                body.push_str(&xml[s.start..s.end]);
+        let found = (0..stored.len()).find(|&i| !used[i] && same(&stored[i].name, &prop.name));
+        match found {
+            Some(i) => {
+                used[i] = true;
+                let s = &stored[i];
+                if s.name != prop.name || s.value != prop.value {
+                    let pid = s.pid.unwrap_or_else(&mut fresh_pid);
+                    ops.push((s.start, s.end, property_xml(&mut prefixes, &own, pid, prop)));
+                }
             }
-            _ => {
-                let pid = match old.and_then(|s| s.pid) {
-                    Some(pid) => pid,
-                    None => {
-                        next_pid += 1;
-                        next_pid - 1
-                    }
-                };
-                body.push_str(&format!(
-                    "<{own}property fmtid=\"{CUSTOM_FMTID}\" pid=\"{pid}\" name=\"{}\">{}</{own}property>",
-                    esc_attr(&prop.name),
-                    custom_value_xml(&vt, &prop.value)
-                ));
+            None => {
+                let pid = fresh_pid();
+                appended.push_str(&property_xml(&mut prefixes, &own, pid, prop));
             }
         }
     }
-    let mut ops = Vec::new();
-    if root.self_closing {
-        prefixes.finish(&xml, body, &mut ops);
-    } else {
-        ops.push((root.tag_end, root.close, body));
-        prefixes.finish(&xml, String::new(), &mut ops);
+    for (s, _) in stored.iter().zip(&used).filter(|(_, used)| !**used) {
+        ops.push((s.start, s.end, String::new()));
     }
+    prefixes.finish(&xml, appended, &mut ops);
     let updated = splice(&xml, ops);
     put(parts, &name, updated);
 }
@@ -885,17 +940,48 @@ impl SheetPackage {
     /// also gets `user` as its author and `now` as its creation time. The
     /// clock is an argument so the stamp is the caller's (and a test's)
     /// choice; [`crate::xlsx::save_xlsx`] itself never stamps.
+    ///
+    /// Only core.xml is written (app.xml and custom.xml are not looked at),
+    /// and an unreadable core.xml is left as it is.
     pub fn stamp_save(&mut self, now: &str, user: &str) {
         let (core, _) = locate(&self.parts, Part::Core);
-        let fresh = !self.parts.iter().any(|(n, _)| *n == core);
-        let mut props = self.doc_properties();
-        props.modified = Some(now.to_string());
-        props.last_modified_by = Some(user.to_string());
+        let fresh = matches!(part_xml(&self.parts, &core), PartXml::Missing);
+        let (now, user) = (Some(now.to_string()), Some(user.to_string()));
+        let mut fields = vec![
+            Field {
+                ns: NS_CP,
+                local: "lastModifiedBy",
+                value: user.as_deref(),
+                w3cdtf: false,
+            },
+            Field {
+                ns: NS_DCTERMS,
+                local: "modified",
+                value: now.as_deref(),
+                w3cdtf: true,
+            },
+        ];
         if fresh {
-            props.creator.get_or_insert_with(|| user.to_string());
-            props.created.get_or_insert_with(|| now.to_string());
+            fields.insert(
+                0,
+                Field {
+                    ns: NS_DC,
+                    local: "creator",
+                    value: user.as_deref(),
+                    w3cdtf: false,
+                },
+            );
+            fields.insert(
+                2,
+                Field {
+                    ns: NS_DCTERMS,
+                    local: "created",
+                    value: now.as_deref(),
+                    w3cdtf: true,
+                },
+            );
         }
-        self.set_doc_properties(&props);
+        set_fields(&mut self.parts, Part::Core, &fields);
     }
 }
 
@@ -961,7 +1047,12 @@ fn refresh_titles(xml: &str, worksheets: &[String], charts: &[String]) -> Option
             count_raw: xml[pair[1].start..pair[1].end].to_string(),
         });
     }
-    if groups.iter().map(|g| g.count).sum::<usize>() != titles.children.len() {
+    // Counts come from the file: a huge one must not overflow the sum (and
+    // wrap round to match) or run past the titles.
+    let total = groups
+        .iter()
+        .try_fold(0usize, |sum, g| sum.checked_add(g.count))?;
+    if total != titles.children.len() {
         return None;
     }
     let ws_group = groups
@@ -983,10 +1074,10 @@ fn refresh_titles(xml: &str, worksheets: &[String], charts: &[String]) -> Option
 
     // Each group's entries: the original ones, or the model's names.
     let mut entries: Vec<Vec<Result<&str, String>>> = Vec::new();
-    let mut at = 0;
+    let mut at = 0usize;
     let mut changed = false;
     for (i, g) in groups.iter().enumerate() {
-        let original = &titles.children[at..at + g.count];
+        let original = titles.children.get(at..at.checked_add(g.count)?)?;
         at += g.count;
         let names = if Some(i) == ws_group {
             Some(worksheets)
@@ -1384,7 +1475,7 @@ mod tests {
     #[test]
     fn unmodeled_custom_values_survive_other_edits() {
         let mut pkg = custom_pkg(&format!(
-            r#"<property fmtid="{CUSTOM_FMTID}" pid="2" name="A"><vt:lpwstr>a</vt:lpwstr></property>{OTHER}<property fmtid="{CUSTOM_FMTID}" pid="9" name="B"><vt:i8>12</vt:i8></property>"#
+            "\n  <property fmtid=\"{CUSTOM_FMTID}\" pid=\"2\" name=\"A\"><vt:lpwstr>a</vt:lpwstr></property>\n  <!-- kept -->{OTHER}\n  <property fmtid=\"{CUSTOM_FMTID}\" pid=\"9\" name=\"B\"><vt:i8>12</vt:i8></property>\n"
         ));
         let mut p = pkg.doc_properties();
         assert_eq!(p.custom.len(), 3);
@@ -1411,7 +1502,111 @@ mod tests {
         let b = xml.find(r#"pid="9" name="B"><vt:i8>12</vt:i8>"#).unwrap();
         let c = xml.find(r#"pid="10" name="C"><vt:bool>false"#).unwrap();
         assert!(a < blob && blob < b && b < c, "{xml}");
+        assert!(xml.contains("</property>\n  <!-- kept -->"), "{xml}");
+        assert!(
+            xml.contains("<vt:i8>12</vt:i8></property>\n<property"),
+            "{xml}"
+        );
         assert_eq!(pkg.doc_properties(), p);
+    }
+
+    /// A custom.xml we can't read: `bytes` as the part, related and typed.
+    fn raw_custom_pkg(bytes: Vec<u8>) -> SheetPackage {
+        let mut pkg = custom_pkg("");
+        pkg.set_part("docProps/custom.xml", bytes);
+        pkg
+    }
+
+    fn utf16(xml: &str) -> Vec<u8> {
+        let mut out = vec![0xFF, 0xFE];
+        for u in xml.encode_utf16() {
+            out.extend_from_slice(&u.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn an_unreadable_custom_xml_survives_saves_and_other_edits() {
+        let valid = format!(
+            r#"<?xml version="1.0" encoding="UTF-16"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><property fmtid="{CUSTOM_FMTID}" pid="2" name="A"><vt:lpwstr>a</vt:lpwstr></property></Properties>"#
+        );
+        let truncated = format!(
+            r#"<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties"><property fmtid="{CUSTOM_FMTID}" pid="2" name="A"><vt:lpwstr>a</vt"#
+        );
+        for bytes in [utf16(&valid), truncated.into_bytes()] {
+            let mut pkg = raw_custom_pkg(bytes.clone());
+            assert!(pkg.doc_properties().custom.is_empty());
+            pkg.stamp_save("2026-10-01T12:00:00Z", "me");
+            let mut re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+            assert_eq!(re.part("docProps/custom.xml").unwrap(), bytes.as_slice());
+            assert!(text(&re, "_rels/.rels").contains("custom-properties"));
+
+            // An unrelated edit leaves it alone too.
+            let mut p = re.doc_properties();
+            p.title = Some("T".into());
+            re.set_doc_properties(&p);
+            assert_eq!(re.part("docProps/custom.xml").unwrap(), bytes.as_slice());
+            assert_eq!(re.doc_properties().title.as_deref(), Some("T"));
+
+            // Setting custom properties replaces it with what was set.
+            p.custom = vec![CustomProperty {
+                name: "B".into(),
+                value: CustomValue::Bool(true),
+            }];
+            re.set_doc_properties(&p);
+            assert_eq!(re.doc_properties(), p);
+            let re = load_xlsx(&save_xlsx(&re)).unwrap();
+            assert_eq!(re.doc_properties().custom, p.custom);
+        }
+    }
+
+    #[test]
+    fn a_utf16_core_xml_is_never_patched() {
+        let bytes = utf16(CORE);
+        let mut pkg = with_props(CORE, APP);
+        pkg.set_part("docProps/core.xml", bytes.clone());
+        pkg.stamp_save("2026-10-01T12:00:00Z", "me");
+        let mut p = pkg.doc_properties();
+        assert_eq!(p.creator, None);
+        p.title = Some("T".into());
+        pkg.set_doc_properties(&p);
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(re.part("docProps/core.xml").unwrap(), bytes.as_slice());
+    }
+
+    #[test]
+    fn a_property_without_a_name_is_kept_as_it_is() {
+        let nameless = r#"<property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid="3"><vt:lpwstr>x</vt:lpwstr></property>"#;
+        let mut pkg = custom_pkg(&format!(
+            r#"<property fmtid="{CUSTOM_FMTID}" pid="2" name="A"><vt:lpwstr>a</vt:lpwstr></property>{nameless}"#
+        ));
+        let mut p = pkg.doc_properties();
+        assert_eq!(p.custom.len(), 1);
+        // Removing the only listed property keeps the part for the other.
+        p.custom.clear();
+        pkg.set_doc_properties(&p);
+        let xml = text(&pkg, "docProps/custom.xml");
+        assert!(xml.contains(nameless), "{xml}");
+        assert!(!xml.contains(r#"name="A""#), "{xml}");
+        // A new one takes a pid after every pid in the part.
+        p.custom.push(CustomProperty {
+            name: "C".into(),
+            value: CustomValue::Text("c".into()),
+        });
+        pkg.set_doc_properties(&p);
+        assert!(text(&pkg, "docProps/custom.xml").contains(r#"pid="4" name="C""#));
+    }
+
+    #[test]
+    fn an_unchanged_custom_list_leaves_the_part_alone() {
+        let body = format!(
+            "\n <property fmtid=\"{CUSTOM_FMTID}\" pid=\"2\" name=\"A\"><vt:lpwstr>a</vt:lpwstr></property> <!-- c -->\n"
+        );
+        let mut pkg = custom_pkg(&body);
+        let before = text(&pkg, "docProps/custom.xml");
+        let p = pkg.doc_properties();
+        pkg.set_doc_properties(&p);
+        assert_eq!(text(&pkg, "docProps/custom.xml"), before);
     }
 
     #[test]
@@ -1546,6 +1741,29 @@ mod tests {
         pkg.rename_sheet(0, "Zed");
         let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
         assert_eq!(text(&re, "docProps/app.xml"), app);
+    }
+
+    #[test]
+    fn titles_of_parts_survive_an_overflowing_count() {
+        for (counts, titles) in [
+            (
+                ["18446744073709551615", "1"],
+                r#"<vt:vector size="0" baseType="lpstr"/>"#,
+            ),
+            (
+                ["18446744073709551615", "2"],
+                r#"<vt:vector size="1" baseType="lpstr"><vt:lpstr>Alpha</vt:lpstr></vt:vector>"#,
+            ),
+        ] {
+            let app = format!(
+                r#"<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><HeadingPairs><vt:vector size="4" baseType="variant"><vt:variant><vt:lpstr>Worksheets</vt:lpstr></vt:variant><vt:variant><vt:i4>{}</vt:i4></vt:variant><vt:variant><vt:lpstr>Named Ranges</vt:lpstr></vt:variant><vt:variant><vt:i4>{}</vt:i4></vt:variant></vt:vector></HeadingPairs><TitlesOfParts>{titles}</TitlesOfParts></Properties>"#,
+                counts[0], counts[1]
+            );
+            let mut pkg = with_props(CORE, &app);
+            pkg.rename_sheet(0, "Zed");
+            let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+            assert_eq!(text(&re, "docProps/app.xml"), app);
+        }
     }
 
     #[test]
