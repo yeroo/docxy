@@ -6,7 +6,7 @@
 //! Every exception is an entry in [`ALLOW`], with its reason.
 
 use gridcore::engine::Engine;
-use gridcore::formula::{display_formula, is_volatile, parse};
+use gridcore::formula::{is_volatile, parse};
 use gridcore::legacy::{SourceFormat, open_workbook};
 use gridcore::sheet::{CellValue, Workbook, cell_name};
 use gridcore::xlsx::{load_xlsx, save_xlsx};
@@ -14,6 +14,8 @@ use gridcore::xlsx::{load_xlsx, save_xlsx};
 /// What an allowlist entry exempts.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Check {
+    /// (a): the sheet's name (the cells are still compared by position).
+    SheetName,
     /// (b): the cached value the file holds.
     Value,
     /// (d): the recalculated value.
@@ -54,6 +56,29 @@ const ALLOW: &[Allow] = &[
         checks: &[Check::Value],
         why: "Excel cached its misreading of Q1:Q3! (Q1 as a cell)",
     },
+    Allow {
+        file: "calc-3d.ods",
+        sheet: "Total",
+        cell: "*",
+        checks: &[Check::Value],
+        why: "Excel cached its misreading of Q1:Q3! (Q1 as a cell)",
+    },
+    // Excel's ODS writer renames sheet "Calc Zone" to "Calc_Zone" in the
+    // file itself (table:name), and the formula naming it follows.
+    Allow {
+        file: "calc-refs.ods",
+        sheet: "Calc Zone",
+        cell: "*",
+        checks: &[Check::SheetName],
+        why: "Excel's .ods export renamed the sheet to Calc_Zone",
+    },
+    Allow {
+        file: "calc-refs.ods",
+        sheet: "Calc Zone",
+        cell: "A7",
+        checks: &[Check::Formula],
+        why: "refers to the renamed sheet: =Calc_Zone!A1+1",
+    },
     // BIFF8 has no tables: Excel writes structured references as the
     // ranges they cover (`Sales[Qty]` → `Orders!$B$2:$B$5`). The values
     // and recalculation agree; tables themselves are not imported.
@@ -67,6 +92,13 @@ const ALLOW: &[Allow] = &[
     // The .xlsb keeps the table, but the import doesn't (tables are a
     // follow-up), so its structured references are written as the ranges
     // they cover, as Excel itself writes them to an .xls.
+    Allow {
+        file: "shape-salestable.ods",
+        sheet: "Orders",
+        cell: "*",
+        checks: &[Check::Formula],
+        why: "Excel's .ods export writes structured refs as ranges",
+    },
     Allow {
         file: "shape-salestable.xlsb",
         sheet: "Orders",
@@ -95,22 +127,44 @@ fn values_agree(a: &CellValue, b: &CellValue) -> bool {
     }
 }
 
-/// A formula as compared: the text Excel shows (no `_xlfn.`, `@x` for
-/// `_xlfn.SINGLE(x)`) without the implicit-intersection `@`s Excel adds
-/// when it writes IFS/SWITCH to an older format, parsed. Whitespace, case
-/// and redundant spelling differences vanish in the AST.
+/// A formula as compared, parsed: whitespace, case and `_xlfn.` spelling
+/// vanish in the AST. Excel wraps IFS and SWITCH in an implicit
+/// intersection (`_xlfn.SINGLE(…)`, shown `@`) when it writes them to an
+/// older format, which the `.xlsx` source doesn't have; both spellings are
+/// unwrapped first.
 fn formula_ast(src: &str) -> Result<gridcore::formula::Expr, String> {
-    let shown = display_formula(src);
-    let mut bare = String::with_capacity(shown.len());
+    const SINGLE: &str = "_XLFN.SINGLE(";
+    let mut bare = String::with_capacity(src.len());
+    // Per open parenthesis: whether it was a SINGLE( whose `)` goes too.
+    let mut parens: Vec<bool> = Vec::new();
     let mut in_str = false;
-    for ch in shown.chars() {
+    let mut i = 0;
+    while i < src.len() {
+        let rest = &src[i..];
+        let ch = rest.chars().next().unwrap();
         if ch == '"' {
             in_str = !in_str;
-        }
-        if ch == '@' && !in_str {
-            continue;
+        } else if !in_str {
+            if rest.len() >= SINGLE.len() && rest[..SINGLE.len()].eq_ignore_ascii_case(SINGLE) {
+                parens.push(true);
+                i += SINGLE.len();
+                continue;
+            }
+            match ch {
+                '@' => {
+                    i += 1;
+                    continue;
+                }
+                '(' => parens.push(false),
+                ')' if parens.pop() == Some(true) => {
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
         }
         bare.push(ch);
+        i += ch.len_utf8();
     }
     parse(&bare)
 }
@@ -154,7 +208,7 @@ fn corpus(dir: &str) -> std::path::PathBuf {
 /// (f) number formats, (g) date system and names.
 fn compare_static(file: &str, src: &Workbook, got: &Workbook, errs: &mut Vec<String>) {
     let names = |wb: &Workbook| wb.sheets.iter().map(|s| s.name.clone()).collect::<Vec<_>>();
-    if names(src) != names(got) {
+    if src.sheets.len() != got.sheets.len() {
         errs.push(format!(
             "{file}: (a) sheets {:?} != {:?}",
             names(got),
@@ -164,6 +218,12 @@ fn compare_static(file: &str, src: &Workbook, got: &Workbook, errs: &mut Vec<Str
     }
     for (s, sheet) in src.sheets.iter().enumerate() {
         let theirs = &got.sheets[s];
+        if theirs.name != sheet.name && !allowed(file, &sheet.name, "*", Check::SheetName) {
+            errs.push(format!(
+                "{file}: (a) sheet {s} is {:?}, source {:?}",
+                theirs.name, sheet.name
+            ));
+        }
         for (&(r, c), cell) in &sheet.cells {
             let at = format!("{file}: {}!{}", sheet.name, cell_name(r, c));
             if cell.value.is_empty() {
@@ -280,8 +340,11 @@ fn compare_formulas(file: &str, src: &Workbook, got: &Workbook, errs: &mut Vec<S
 }
 
 /// The formats under test, each with its fixtures' extension.
-const FORMATS: &[(&str, SourceFormat)] =
-    &[("xls", SourceFormat::Xls), ("xlsb", SourceFormat::Xlsb)];
+const FORMATS: &[(&str, SourceFormat)] = &[
+    ("xls", SourceFormat::Xls),
+    ("xlsb", SourceFormat::Xlsb),
+    ("ods", SourceFormat::Ods),
+];
 
 #[test]
 fn legacy_imports_match_their_xlsx_originals() {
