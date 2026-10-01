@@ -5202,106 +5202,124 @@ pub fn file_formula(src: &str) -> Cow<'_, str> {
 /// rewrite the internal spill/implicit operators — `ANCHORARRAY(A1)` → `A1#`,
 /// `SINGLE(x)` → `@x`. Used by `FORMULATEXT`.
 pub fn display_formula(src: &str) -> String {
-    // Rewrite only outside string literals, so a literal such as "_xlfn." or
-    // "SINGLE(x)" survives verbatim. `"` opens a literal; `""` escapes a quote.
+    // Strip prefixes only outside string literals, so a literal such as
+    // "_xlfn." survives verbatim.
+    let b = src.as_bytes();
     let mut out = String::new();
     let mut seg_start = 0usize;
-    let b = src.as_bytes();
     let mut i = 0usize;
     while i < b.len() {
         if b[i] == b'"' {
-            out.push_str(&transform_segment(&src[seg_start..i]));
-            let lit_start = i;
-            i += 1;
-            while i < b.len() {
-                if b[i] == b'"' {
-                    if i + 1 < b.len() && b[i + 1] == b'"' {
-                        i += 2; // escaped quote inside the literal
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            out.push_str(&src[lit_start..i]);
+            out.push_str(&strip_prefixes(&src[seg_start..i]));
+            let end = literal_end(b, i);
+            out.push_str(&src[i..end]);
+            i = end;
             seg_start = i;
         } else {
             i += 1;
         }
     }
-    out.push_str(&transform_segment(&src[seg_start..]));
-    out
+    out.push_str(&strip_prefixes(&src[seg_start..]));
+    // The calls are rewritten over the whole text, since a call's argument
+    // may hold a literal (`SINGLE(SWITCH(2,1,"one"))`).
+    rewrite_calls(&out)
 }
 
-/// Strip Excel's internal name prefixes and rewrite the spill/implicit operators
-/// on a run of formula text that contains no string literal.
-fn transform_segment(s: &str) -> String {
-    let s = s
-        .replace("_xlfn._xlws.", "")
+/// The end of the string literal whose opening `"` is at `start`: just past
+/// its closing quote (`""` inside is an escaped quote), or the end of the
+/// text when it is unclosed.
+fn literal_end(b: &[u8], start: usize) -> usize {
+    let mut i = start + 1;
+    while i < b.len() {
+        if b[i] == b'"' {
+            if b.get(i + 1) == Some(&b'"') {
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    b.len()
+}
+
+/// Strip Excel's internal name prefixes from a run of formula text that
+/// contains no string literal.
+fn strip_prefixes(s: &str) -> String {
+    s.replace("_xlfn._xlws.", "")
         .replace("_xlfn.", "")
         .replace("_xlws.", "")
-        .replace("_xlpm.", "");
-    let s = rewrite_call(&s, "ANCHORARRAY", |arg| format!("{arg}#"));
-    rewrite_call(&s, "SINGLE", |arg| format!("@{arg}"))
+        .replace("_xlpm.", "")
 }
 
-/// Replace every whole-word `name(arg)` (balanced parens) with `f(arg)`. A match
+/// Replace every whole-word `ANCHORARRAY(arg)` with `arg#` and `SINGLE(arg)`
+/// with `@arg` (balanced parens), outside string literals and with the
+/// argument rewritten too, so `SINGLE(SINGLE(A1))` gives `@@A1`. A match
 /// preceded by an identifier character is ignored — `NOTSINGLE(A1)` is left
-/// alone rather than becoming `NOT@A1`.
-fn rewrite_call(s: &str, name: &str, f: impl Fn(&str) -> String) -> String {
-    let pat = format!("{name}(");
+/// alone rather than becoming `NOT@A1`. An unbalanced call is left verbatim.
+fn rewrite_calls(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = String::new();
     let mut pos = 0usize;
-    while pos < s.len() {
-        let Some(rel) = s[pos..].find(&pat) else {
-            out.push_str(&s[pos..]);
-            return out;
-        };
-        let i = pos + rel;
-        // Left word boundary: the char before `name` must not continue an
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'"' {
+            i = literal_end(b, i);
+            continue;
+        }
+        // Left word boundary: the char before the name must not continue an
         // identifier (ASCII letter/digit/underscore). A UTF-8 lead/continuation
         // byte before it counts as a boundary.
         let left_ok = i == 0 || {
             let pc = b[i - 1];
             !(pc.is_ascii_alphanumeric() || pc == b'_')
         };
-        if !left_ok {
-            // Not a whole-word match; emit through this occurrence and continue.
-            out.push_str(&s[pos..i + 1]);
-            pos = i + 1;
+        let Some(pat) = ["ANCHORARRAY(", "SINGLE("]
+            .into_iter()
+            .find(|p| left_ok && s[i..].starts_with(p))
+        else {
+            i += 1;
             continue;
-        }
-        out.push_str(&s[pos..i]);
-        let after = &s[i + pat.len()..];
+        };
+        let open = i + pat.len();
         let mut depth = 1usize;
-        let mut end = None;
-        for (j, ch) in after.char_indices() {
-            match ch {
-                '(' => depth += 1,
-                ')' => {
+        let mut close = None;
+        let mut j = open;
+        while j < b.len() {
+            match b[j] {
+                b'"' => {
+                    j = literal_end(b, j);
+                    continue;
+                }
+                b'(' => depth += 1,
+                b')' => {
                     depth -= 1;
                     if depth == 0 {
-                        end = Some(j);
+                        close = Some(j);
                         break;
                     }
                 }
                 _ => {}
             }
+            j += 1;
         }
-        match end {
-            Some(e) => {
-                out.push_str(&f(&after[..e]));
-                pos = i + pat.len() + e + 1;
-            }
-            None => {
-                // Unbalanced — leave the rest verbatim.
-                out.push_str(&s[i..]);
-                return out;
-            }
+        let Some(close) = close else {
+            // Unbalanced — leave the rest verbatim.
+            break;
+        };
+        out.push_str(&s[pos..i]);
+        let arg = rewrite_calls(&s[open..close]);
+        if pat == "SINGLE(" {
+            out.push('@');
+            out.push_str(&arg);
+        } else {
+            out.push_str(&arg);
+            out.push('#');
         }
+        pos = close + 1;
+        i = pos;
     }
+    out.push_str(&s[pos..]);
     out
 }
 
@@ -11907,6 +11925,42 @@ mod tests {
             "CONCAT(\"SINGLE(x) _xlfn.\",@A1)"
         );
         assert_eq!(display_formula("\"ANCHORARRAY(z)\""), "\"ANCHORARRAY(z)\"");
+    }
+
+    #[test]
+    fn display_formula_rewrites_single_around_string_literals() {
+        // The call's parens straddle the literals (#876).
+        assert_eq!(
+            display_formula("_xlfn.SINGLE(_xlfn.SWITCH(2,1,\"one\",2,\"two\",\"other\"))"),
+            "@SWITCH(2,1,\"one\",2,\"two\",\"other\")"
+        );
+        // A paren or a call name inside a literal neither closes the call nor
+        // starts one.
+        assert_eq!(
+            display_formula("_xlfn.SINGLE(IF(A1,\")\",B1))"),
+            "@IF(A1,\")\",B1)"
+        );
+        assert_eq!(
+            display_formula("_xlfn.SINGLE(IF(A1,\"SINGLE(\",\"a\"\")\"))"),
+            "@IF(A1,\"SINGLE(\",\"a\"\")\")"
+        );
+        assert_eq!(
+            display_formula("_xlfn.ANCHORARRAY(INDIRECT(\"B2)\"))"),
+            "INDIRECT(\"B2)\")#"
+        );
+        // Nested calls are rewritten at every level, as the printer spells
+        // them.
+        for stored in [
+            "_xlfn.SINGLE(_xlfn.SINGLE(A1))",
+            "_xlfn.SINGLE(_xlfn.ANCHORARRAY(A1))",
+            "SUM(_xlfn.SINGLE(_xlfn.SINGLE(A1:A3)),1)",
+        ] {
+            let printed = to_string(&parse(&display_formula(stored)).unwrap());
+            assert_eq!(display_formula(stored), printed, "{stored}");
+            assert_eq!(to_string(&parse(stored).unwrap()), printed, "{stored}");
+        }
+        // Unbalanced text stays as it is.
+        assert_eq!(display_formula("_xlfn.SINGLE(A1"), "SINGLE(A1");
     }
 
     #[test]
