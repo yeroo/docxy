@@ -10019,13 +10019,14 @@ b",
     }
 
     #[test]
-    fn undoing_a_value_typed_into_a_cse_block_refills_it() {
+    fn undoing_a_formula_typed_into_a_cse_block_refills_it() {
         // xlsxy's undo restores only the edited cell (`restore_cell`).
         let mut pkg = cse_book("C1:C3", "A1");
         let mut eng = crate::engine::Engine::new(&pkg.workbook);
         eng.recalc_all(&mut pkg.workbook);
         let before = pkg.workbook.sheets[0].cell(1, 2).cloned().unwrap();
-        eng.set_cell(&mut pkg.workbook, (0, 1, 2), Cell::number(99.0));
+        eng.set_cell(&mut pkg.workbook, (0, 1, 2), Cell::formula("7"));
+        assert_eq!(val(&pkg, "C3"), CellValue::Empty);
         eng.restore_cell(&mut pkg.workbook, (0, 1, 2), before);
         for n in ["C1", "C2", "C3"] {
             assert_eq!(val(&pkg, n), CellValue::Number(1.0), "{n}");

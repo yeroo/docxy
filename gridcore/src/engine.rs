@@ -7,10 +7,14 @@
 //! engine reports them ([`Engine::circular_refs`]); with it they iterate.
 //! Volatile formulas (`NOW`, `RAND`…) join every recalculation.
 //!
-//! **Graceful degradation:** a formula that fails to parse, carries preserved
-//! `<f>` attributes (array/data-table), or evaluates through something we
-//! don't model yet is marked *unsupported*: its cached value is kept, it is
-//! never re-evaluated, and save writes it back byte-faithful. Dependents read
+//! Array formulas (`t="array"`) are evaluated: a dynamic array spills, and a
+//! legacy Ctrl+Shift+Enter block fills its fixed `ref` ([`Engine::fill_cse`]).
+//!
+//! **Graceful degradation:** a formula that fails to parse, carries other
+//! preserved `<f>` attributes (data tables, unparseable shared groups), or
+//! evaluates through something we don't model yet is marked *unsupported*:
+//! its cached value is kept, it is never re-evaluated, and save writes it
+//! back byte-faithful. Dependents read
 //! the cached value, so partial coverage yields stale-at-worst results,
 //! never wrong-by-our-hand ones.
 
@@ -777,16 +781,25 @@ impl Engine {
         };
         let off_grid = r + h > crate::sheet::MAX_ROWS || c + w > crate::sheet::MAX_COLS;
         // Other anchors whose spill overlaps this block or its old extent:
-        // their spilled values are theirs, never this block's.
+        // their spilled values are theirs, never this block's. A spill writes
+        // every cell it covers, so when no cell but the anchor exists there
+        // (a one-cell block, or a block over empty cells) there is nothing to
+        // find, and the walk over the rows above is skipped.
         let (bh, bw) = (h.max(old.0), w.max(old.1));
-        let foreign: Vec<(u32, u32, u32, u32)> = sheet
-            .cells
-            .range(..(r + bh, 0))
-            .filter_map(|(&(ar, ac), cl)| cl.spill.map(|(sh, sw)| (ar, ac, sh, sw)))
-            .filter(|&(ar, ac, sh, sw)| {
-                (ar, ac) != (r, c) && ar + sh > r && ac < c + bw && ac + sw > c
-            })
-            .collect();
+        let occupied = (r..r + bh)
+            .any(|rr| (c..c + bw).any(|cc| (rr, cc) != (r, c) && sheet.cell(rr, cc).is_some()));
+        let foreign: Vec<(u32, u32, u32, u32)> = if occupied {
+            sheet
+                .cells
+                .range(..(r + bh, 0))
+                .filter_map(|(&(ar, ac), cl)| cl.spill.map(|(sh, sw)| (ar, ac, sh, sw)))
+                .filter(|&(ar, ac, sh, sw)| {
+                    (ar, ac) != (r, c) && ar + sh > r && ac < c + bw && ac + sw > c
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let theirs = |rr: u32, cc: u32| {
             foreign
                 .iter()
