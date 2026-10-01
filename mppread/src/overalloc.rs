@@ -20,7 +20,7 @@ fn u32_at(b: &[u8], at: usize) -> u32 {
 fn f64_at(b: &[u8], at: usize) -> f64 {
     f64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
-fn stream(cfb: &Cfb, table: &str, name: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn stream(cfb: &Cfb, table: &str, name: &str) -> Result<Vec<u8>, String> {
     let suffix = format!("{table}/{name}");
     let path = cfb
         .paths()
@@ -30,7 +30,12 @@ fn stream(cfb: &Cfb, table: &str, name: &str) -> Result<Vec<u8>, String> {
     cfb.read_path(&path)
         .ok_or_else(|| format!("missing {suffix}"))
 }
-fn count(meta: &[u8], stride: usize, data_len: usize, minimum: usize) -> Result<usize, String> {
+pub(crate) fn count(
+    meta: &[u8],
+    stride: usize,
+    data_len: usize,
+    minimum: usize,
+) -> Result<usize, String> {
     if meta.len() < 16 || meta[..4] != [0xba, 0xad, 0xdf, 0xfa] {
         return Err("invalid fixed table header".into());
     }
@@ -229,18 +234,21 @@ pub(crate) fn resources(cfb: &Cfb) -> Result<HashMap<u32, Resource>, String> {
     Ok(out)
 }
 
-pub(crate) fn assignments(cfb: &Cfb) -> Result<Vec<Assignment>, String> {
-    let fm = stream(cfb, "TBkndAssn", "FixedMeta")?;
-    let fd = stream(cfb, "TBkndAssn", "FixedData")?;
-    let n = count(&fm, 34, fd.len(), 0)?;
+/// Live 110-byte assignment records with their FixedMeta entry index, which
+/// also indexes the assignment Fixed2Meta. Blank (kind 4, 16 bytes) and
+/// deleted (kind 2) rows are skipped; any other kind or length is an error.
+pub(crate) fn live_assignment_rows<'a>(
+    fm: &[u8],
+    fd: &'a [u8],
+) -> Result<Vec<(usize, &'a [u8])>, String> {
+    let n = count(fm, 34, fd.len(), 0)?;
     let mut out = Vec::new();
-    let mut seen = HashSet::new();
     let mut previous_end = 0;
     for i in 0..n {
         let meta = &fm[16 + i * 34..16 + (i + 1) * 34];
         let at = u32_at(meta, 4) as usize;
         let end = if i + 1 < n {
-            u32_at(&fm, 16 + (i + 1) * 34 + 4) as usize
+            u32_at(fm, 16 + (i + 1) * 34 + 4) as usize
         } else {
             fd.len()
         };
@@ -258,7 +266,17 @@ pub(crate) fn assignments(cfb: &Cfb) -> Result<Vec<Assignment>, String> {
         if kind == 2 {
             continue; // Deleted assignment row.
         }
-        let row = &fd[at..end];
+        out.push((i, &fd[at..end]));
+    }
+    Ok(out)
+}
+
+pub(crate) fn assignments(cfb: &Cfb) -> Result<Vec<Assignment>, String> {
+    let fm = stream(cfb, "TBkndAssn", "FixedMeta")?;
+    let fd = stream(cfb, "TBkndAssn", "FixedData")?;
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for (_, row) in live_assignment_rows(&fm, &fd)? {
         let uid = u32_at(row, 0);
         let task_uid = u32_at(row, 4);
         let resource_uid = u32_at(row, 8) as i32;

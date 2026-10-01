@@ -200,6 +200,7 @@ fn check_task_fields(
     require_fields: bool,
     exclude_guid: bool,
     exclude_ignore_resource_calendar: bool,
+    source: Oracle,
 ) {
     // A decoded working DurationFormat reaches the model as the MSPDI reader
     // keeps it; any other reads as days.
@@ -265,6 +266,15 @@ fn check_task_fields(
     same!(external_task);
     same!(is_subproject);
     same!(is_subproject_read_only);
+    same!(subproject_name);
+    same!(contact);
+    same!(wbs_level);
+    if source == Oracle::Project {
+        // Project exports these on every row; MPXJ's XML omits them.
+        same!(is_published);
+        same!(display_as_summary);
+        same!(commitment_type);
+    }
     assert_eq!(f.milestone, Some(e.milestone), "{}", at("milestone"));
     assert_eq!(
         imported.milestone,
@@ -310,6 +320,36 @@ fn check_task_fields(
         at("imported create date")
     );
     assert_eq!(imported.deadline, e.deadline, "{}", at("imported deadline"));
+    let dates = [
+        (
+            "pre-leveled start",
+            &f.pre_leveled_start,
+            imported.pre_leveled_start,
+            e.pre_leveled_start,
+        ),
+        (
+            "pre-leveled finish",
+            &f.pre_leveled_finish,
+            imported.pre_leveled_finish,
+            e.pre_leveled_finish,
+        ),
+        (
+            "commitment start",
+            &f.commitment_start,
+            imported.commitment_start,
+            e.commitment_start,
+        ),
+        (
+            "commitment finish",
+            &f.commitment_finish,
+            imported.commitment_finish,
+            e.commitment_finish,
+        ),
+    ];
+    for (what, decoded, got, want) in dates {
+        assert_eq!(decoded.clone(), dt(want), "{}", at(what));
+        assert_eq!(got, want, "{}", at(&format!("imported {what}")));
+    }
 }
 
 fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool {
@@ -599,9 +639,11 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         if t.is_null {
             continue;
         }
-        if t.is_subproject == Some(true) {
+        if t.is_subproject == Some(true) || t.display_as_summary == Some(true) {
             // A childless inserted subproject must remain a schedulable leaf.
             // Preserving Project's Summary=1 needs the projcore follow-up.
+            // Project also exports a childless DisplayAsSummary task as
+            // Summary=1 (task-extra/e3-display-as-summary).
             assert!(
                 !t.summary,
                 "{}: uid {} imported subproject summary",
@@ -657,6 +699,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             require_fields,
             exclusions.guid,
             exclusions.ignore_resource_calendar_uids.contains(&e.uid),
+            source,
         );
         if exclusions.skip_manual(e.uid) {
             assert_eq!(t.manual, a.manual, "{}", at("imported occurrence manual"));
@@ -691,6 +734,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             require_fields,
             exclusions.guid,
             exclusions.ignore_resource_calendar_uids.contains(&e.uid),
+            source,
         );
     }
     for ghost in decoded
@@ -1240,6 +1284,73 @@ fn assignment_oracles() {
                 false,
             );
         }
+    }
+}
+
+#[test]
+fn task_extra_oracles() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/task-extra");
+    if dir.exists() {
+        let cases = pairs(&dir, "");
+        assert_eq!(cases.len(), 11);
+        let mut seen = std::collections::HashSet::new();
+        for (mpp, xml) in &cases {
+            check_pair(mpp, xml, false, Oracle::Project);
+            let decoded = mppread::mpp::decode_tasks(&std::fs::read(mpp).unwrap()).unwrap();
+            for (name, f) in decoded
+                .iter()
+                .filter_map(|t| Some((t.name.as_str(), t.fields.as_ref()?)))
+            {
+                let set = [
+                    ("contact", f.contact.is_some()),
+                    ("wbs_level", f.wbs_level.is_some()),
+                    ("pre_leveled_start", f.pre_leveled_start.is_some()),
+                    ("pre_leveled_finish", f.pre_leveled_finish.is_some()),
+                    ("commitment_start", f.commitment_start.is_some()),
+                    ("commitment_finish", f.commitment_finish.is_some()),
+                    ("commitment_type", f.commitment_type.is_some_and(|c| c != 0)),
+                    ("display_as_summary", f.display_as_summary == Some(true)),
+                    // e2-published's ordinary active leaf with Publish
+                    // cleared: unlike every snapshot leaf, it exports 0.
+                    (
+                        "unpublished",
+                        name == "Unpublished"
+                            && f.is_published == Some(false)
+                            && f.active == Some(true),
+                    ),
+                ];
+                seen.extend(set.into_iter().filter(|(_, on)| *on).map(|(n, _)| n));
+            }
+        }
+        let expected = std::collections::HashSet::from([
+            "contact",
+            "wbs_level",
+            "pre_leveled_start",
+            "pre_leveled_finish",
+            "commitment_start",
+            "commitment_finish",
+            "commitment_type",
+            "display_as_summary",
+            "unpublished",
+        ]);
+        let missing: Vec<_> = expected.difference(&seen).collect();
+        assert!(missing.is_empty(), "never decoded off default: {missing:?}");
+        // Project desktop drops a seeded StatusManager on save (README: Known
+        // decode gaps); the oracle must keep proving that.
+        let gap = std::fs::read_to_string(dir.join("e10-status-manager.xml")).unwrap();
+        assert!(!gap.contains("<StatusManager>"));
+    }
+    let f6 =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/task-fields/f6-subprojects.mpp");
+    if f6.exists() {
+        let decoded = mppread::mpp::decode_tasks(&std::fs::read(&f6).unwrap()).unwrap();
+        let names: Vec<_> = decoded
+            .iter()
+            .filter_map(|t| t.fields.as_ref()?.subproject_name.as_deref())
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names[0].ends_with("\\f6-child.mpp"), "{names:?}");
+        assert!(names[1].ends_with("\\f6-child-b.mpp"), "{names:?}");
     }
 }
 
