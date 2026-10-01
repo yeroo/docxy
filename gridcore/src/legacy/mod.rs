@@ -271,7 +271,19 @@ impl BookIn {
         }
         let raw: Vec<String> = self.sheets.iter().map(|s| s.name.clone()).collect();
         let names = valid_sheet_names(raw.iter().map(String::as_str));
-        let renames = sheet_renames(&raw, &names);
+        // The readers spell a `:` in a name as COLON (see `sheet_prefix`),
+        // so the old names are looked up that way.
+        let keys: Vec<String> = raw.iter().map(|n| escape_colon(n)).collect();
+        let renames = sheet_renames(&keys, &names);
+        let fix = |f: String, name: bool| -> String {
+            let f = retarget(&f, &renames, name).unwrap_or(f);
+            let f = if f.contains(COLON) {
+                restore_colons(&f)
+            } else {
+                f
+            };
+            crate::formula::file_formula(&f).into_owned()
+        };
         let mut pkg = crate::xlsx::new_xlsx_sheets(&names);
         // Each format code becomes an xf (the codes are distinct, so none
         // needs interning); General stays the default xf 0.
@@ -287,15 +299,13 @@ impl BookIn {
             for (key, mut cell) in sheet.cells {
                 cell.style = xf_of.get(cell.style as usize).copied().unwrap_or(0);
                 if let Some(f) = cell.formula.take() {
-                    let f = retarget(&f, &renames, false).unwrap_or(f);
-                    cell.formula = Some(crate::formula::file_formula(&f).into_owned());
+                    cell.formula = Some(fix(f, false));
                 }
                 cells.insert(key, cell);
             }
         }
         for mut name in self.names {
-            let f = retarget(&name.formula, &renames, true).unwrap_or(name.formula);
-            name.formula = crate::formula::file_formula(&f).into_owned();
+            name.formula = fix(name.formula, true);
             pkg.workbook.defined_names.push(name);
         }
         pkg.workbook.date1904 = self.date1904;
@@ -319,7 +329,13 @@ pub(crate) fn valid_sheet_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec
     for (i, raw) in names.enumerate() {
         let clean: String = raw
             .chars()
-            .map(|c| if "[]:*?/\\".contains(c) { '_' } else { c })
+            .map(|c| {
+                if "[]:*?/\\".contains(c) || c == COLON {
+                    '_'
+                } else {
+                    c
+                }
+            })
             .collect();
         let mut name = cut(clean.trim_matches('\''), 31);
         if name.trim().is_empty() {
@@ -479,16 +495,56 @@ fn retarget(src: &str, renames: &Renames, name: bool) -> Option<String> {
     Some(to_string(&e))
 }
 
+/// Stands for a `:` inside a sheet name in the formula text a reader
+/// builds. A raw name such as `A:B` (a crafted file's; Excel and
+/// LibreOffice never write one) would otherwise read as the span A..B, and
+/// `'A:B'!A:A` would not parse at all. A Unicode noncharacter, so no sheet
+/// name means it: [`valid_sheet_names`] replaces it, and
+/// [`BookIn::build`] renames every marked name to its valid one, or puts
+/// the `:` back ([`restore_colons`]) for a sheet the workbook doesn't have.
+const COLON: char = '\u{FDD0}';
+
+/// `name` with each `:` spelled as [`COLON`].
+fn escape_colon(name: &str) -> String {
+    name.replace(':', &COLON.to_string())
+}
+
 /// A reference's sheet part as a formula spells it: `Data!`, `'My Sheet'!`,
 /// or for a 3D span `'Q1:Q3'!` / `Jan:Mar!`. Empty `first` means no sheet.
+/// A `:` inside a name is spelled [`COLON`], which is always quoted.
 pub(crate) fn sheet_prefix(first: &str, last: &str) -> String {
     if first.is_empty() {
         return String::new();
     }
+    let (first, last) = (escape_colon(first), escape_colon(last));
     if first == last {
-        return format!("{}!", crate::sheet::quote_sheet_name(first));
+        return format!("{}!", crate::sheet::quote_sheet_name(&first));
     }
-    crate::formula::span_prefix(first, last)
+    crate::formula::span_prefix(&first, &last)
+}
+
+/// `src` with each [`COLON`] left in a quoted sheet qualifier turned back
+/// into `:`: one naming a sheet the workbook doesn't have (an ODS
+/// `['A:B'.A1]` with no table `A:B`), which no rename removed. Its text is
+/// then as the reader would have spelled it without the marker. String
+/// literals are left alone.
+fn restore_colons(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut quote: Option<char> = None;
+    for c in src.chars() {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            // `''` / `""` inside closes and reopens: same result.
+            (Some(q), _) if c == q => quote = None,
+            (Some('\''), COLON) => {
+                out.push(':');
+                continue;
+            }
+            _ => {}
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// An RK number (BIFF8 and BIFF12): a 30-bit integer or the top of an
@@ -627,6 +683,8 @@ mod tests {
             formula: Some(text.to_string()),
             ..Cell::default()
         };
+        // As the readers spell the sheet raw-named `A:B`.
+        let colon = sheet_prefix("A:B", "A:B");
         let mut book = BookIn::new();
         for s in [
             sheet(&long, vec![((0, 0), num(5.0))]),
@@ -646,8 +704,8 @@ mod tests {
                     ((2, 0), f("Data!A1")),
                     // A 3D span, Excel's quoted spelling, with a renamed end.
                     ((3, 0), f(&format!("SUM('{cut}:{long}'!A1)"))),
-                    ((4, 0), f("'A:B'!A1")),
-                    ((5, 0), f("SUM('A:B'!A1:A2)")),
+                    ((4, 0), f(&format!("{colon}A1"))),
+                    ((5, 0), f(&format!("SUM({colon}A1:A2)"))),
                 ],
             ),
         ] {
@@ -661,7 +719,7 @@ mod tests {
         book.names.push(DefinedName {
             name: "Colon".into(),
             scope: None,
-            formula: "'A:B'!$A$2".into(),
+            formula: format!("{colon}$A$2"),
         });
         let mut pkg = book.build();
         let wb = &mut pkg.workbook;
@@ -693,6 +751,83 @@ mod tests {
         assert_eq!(calc.cell(5, 0).unwrap().value, CellValue::Number(7.0));
         assert_eq!(wb.defined_names[0].formula, format!("{cut}!$A$1"));
         assert_eq!(wb.defined_names[1].formula, "A_B!$A$2");
+    }
+
+    /// A sheet raw-named `A:B` keeps its whole-column and whole-row
+    /// references, which `'A:B'!A:A` (read as the span A..B) lost, and a
+    /// span starting at it. No marker reaches the workbook: one to a sheet
+    /// it doesn't have turns back into `:`, and a raw name holding the
+    /// marker is renamed itself (#876).
+    #[test]
+    fn sheet_named_with_colon_keeps_whole_column_and_row_refs() {
+        use crate::sheet::CellValue;
+        let num = |v: f64| Cell {
+            value: CellValue::Number(v),
+            ..Cell::default()
+        };
+        let f = |text: String| Cell {
+            formula: Some(text),
+            ..Cell::default()
+        };
+        let p = sheet_prefix("A:B", "A:B");
+        let span = sheet_prefix("A:B", "C");
+        let missing = sheet_prefix("X:Y", "X:Y");
+        let marked = format!("M{COLON}N");
+        let mut book = BookIn::new();
+        for (name, cells) in [
+            (
+                "A:B",
+                vec![((0, 0), num(1.0)), ((1, 0), num(2.0)), ((2, 1), num(4.0))],
+            ),
+            ("C", vec![((0, 0), num(10.0))]),
+            (marked.as_str(), vec![((0, 0), num(100.0))]),
+            (
+                "Calc",
+                vec![
+                    ((0, 0), f(format!("SUM({p}A:A)"))),
+                    ((1, 0), f(format!("SUM({p}$1:3)"))),
+                    ((2, 0), f(format!("{p}A1"))),
+                    ((3, 0), f(format!("SUM({span}A1)"))),
+                    ((4, 0), f(format!("{missing}A1&\"{COLON}\""))),
+                    ((5, 0), f(format!("{}A1", sheet_prefix(&marked, &marked)))),
+                ],
+            ),
+        ] {
+            book.push_sheet(SheetIn {
+                name: name.to_string(),
+                cells: cells.into_iter().collect(),
+            })
+            .unwrap();
+        }
+        book.names.push(DefinedName {
+            name: "Cols".into(),
+            scope: None,
+            formula: format!("{p}$A:$B"),
+        });
+        let mut pkg = book.build();
+        let wb = &mut pkg.workbook;
+        let names: Vec<&str> = wb.sheets.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["A_B", "C", "M_N", "Calc"]);
+        let mut engine = crate::engine::Engine::new(wb);
+        engine.recalc_all(wb);
+        let calc = &wb.sheets[3];
+        let got = |r: u32| {
+            let c = calc.cell(r, 0).unwrap();
+            (c.formula.clone().unwrap(), c.value.clone())
+        };
+        assert_eq!(got(0), ("SUM(A_B!A:A)".into(), CellValue::Number(3.0)));
+        assert_eq!(got(1), ("SUM(A_B!$1:3)".into(), CellValue::Number(7.0)));
+        assert_eq!(got(2), ("A_B!A1".into(), CellValue::Number(1.0)));
+        assert_eq!(got(3), ("SUM(A_B:C!A1)".into(), CellValue::Number(11.0)));
+        // A string literal holding the marker is the file's own text.
+        assert_eq!(got(4).0, format!("'X:Y'!A1&\"{COLON}\""));
+        assert_eq!(got(5), ("M_N!A1".into(), CellValue::Number(100.0)));
+        assert_eq!(wb.defined_names[0].formula, "A_B!$A:$B");
+        for r in 0..6 {
+            let text = calc.cell(r, 0).unwrap().formula.clone().unwrap();
+            let outside: String = text.split('"').step_by(2).collect();
+            assert!(!outside.contains(COLON), "{text}");
+        }
     }
 
     /// Renames cost only the formulas they touch: 4,096 renamed sheets and
@@ -809,7 +944,17 @@ mod tests {
         assert_eq!(sheet_prefix("My Sheet", "My Sheet"), "'My Sheet'!");
         assert_eq!(sheet_prefix("Jan", "Mar"), "Jan:Mar!");
         assert_eq!(sheet_prefix("Q1", "Q3"), "'Q1:Q3'!");
+        assert_eq!(sheet_prefix("Sheet.1", "Sheet.3"), "'Sheet.1:Sheet.3'!");
         assert_eq!(sheet_prefix("", ""), "");
+        // A `:` in a name is the marker, always quoted.
+        assert_eq!(sheet_prefix("A:B", "A:B"), "'A\u{FDD0}B'!");
+        assert_eq!(sheet_prefix("A:B", "C"), "'A\u{FDD0}B:C'!");
+        assert_eq!(sheet_prefix("C", "A:B"), "'C:A\u{FDD0}B'!");
+        assert_eq!(restore_colons("'A\u{FDD0}B'!A1"), "'A:B'!A1");
+        assert_eq!(
+            restore_colons("'It''s\u{FDD0}'!A1&\"\u{FDD0}'\u{FDD0}\""),
+            "'It''s:'!A1&\"\u{FDD0}'\u{FDD0}\""
+        );
     }
 
     #[test]

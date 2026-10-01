@@ -128,9 +128,23 @@ fn split_address(s: &str) -> Option<(Option<String>, String)> {
 /// An ODF reference (`.A1`, `.A1:.B2`, `Data.A:.A`, `'Q3'.A1:.A1`,
 /// `Data.$A$1:Data.$A$5`) in Excel's syntax.
 fn convert_ref(r: &str) -> Option<String> {
-    let mut parts = r.splitn(2, ':');
-    let (s1, c1) = split_address(parts.next()?)?;
-    let second = match parts.next() {
+    // The range's `:` is the first one outside a quoted sheet name, which
+    // may hold one (`'A:B'.A1`). `''` inside a name closes and reopens it.
+    let mut quoted = false;
+    let colon = r.char_indices().find_map(|(i, c)| {
+        match c {
+            '\'' => quoted = !quoted,
+            ':' if !quoted => return Some(i),
+            _ => {}
+        }
+        None
+    });
+    let (first, second) = match colon {
+        Some(i) => (&r[..i], Some(&r[i + 1..])),
+        None => (r, None),
+    };
+    let (s1, c1) = split_address(first)?;
+    let second = match second {
         Some(s) => Some(split_address(s)?),
         None => None,
     };
@@ -982,6 +996,17 @@ mod tests {
             Some("SUM('Q1:Q3'!A1:A1)")
         );
         assert_eq!(c("of:=$$TaxRate*100").as_deref(), Some("TaxRate*100"));
+        // A `:` in a quoted table name is part of the name, spelled as the
+        // marker `build` renames (#876).
+        assert_eq!(c("of:=['A:B'.A1]").as_deref(), Some("'A\u{FDD0}B'!A1"));
+        assert_eq!(
+            c("of:=SUM([$'A:B'.A:.A])").as_deref(),
+            Some("SUM('A\u{FDD0}B'!A:A)")
+        );
+        assert_eq!(
+            c("of:=SUM(['A:B'.A1:'C'.A1])").as_deref(),
+            Some("SUM('A\u{FDD0}B:C'!A1:A1)")
+        );
         assert_eq!(
             c("of:=COM.MICROSOFT.SINGLE(COM.MICROSOFT.IFS([.A1]>1;1;TRUE();2))").as_deref(),
             Some("_xlfn.SINGLE(IFS(A1>1,1,TRUE(),2))")
@@ -1193,6 +1218,53 @@ mod tests {
             wb.defined_names[1].formula,
             format!("'{cut}'!$A$1,'{cut}'!$B$1")
         );
+    }
+
+    /// A table named `A:B` (no Excel name holds a `:`) is renamed `A_B`,
+    /// and its references follow: a whole column, a cell, a 3D span and a
+    /// named range. One to a table the file doesn't have keeps its text
+    /// (#876).
+    #[test]
+    fn a_table_named_with_a_colon_keeps_its_references() {
+        let num = |v: u32| {
+            format!(
+                r#"<table:table-row><table:table-cell office:value-type="float" office:value="{v}"/></table:table-row>"#
+            )
+        };
+        let f = |text: &str| {
+            format!(
+                r#"<table:table-row><table:table-cell office:value-type="float" office:value="0" table:formula="{text}"/></table:table-row>"#
+            )
+        };
+        let b = read_str(&format!(
+            r#"<table:table table:name="A:B">{}{}{}</table:table>
+            <table:table table:name="C">{}</table:table>
+            <table:table table:name="Calc">{}{}{}{}</table:table>
+            <table:named-expressions><table:named-range table:name="Col" table:cell-range-address="$'A:B'.$A$1:.$A$3"/></table:named-expressions>"#,
+            num(1),
+            num(2),
+            num(3),
+            num(10),
+            f("of:=SUM(['A:B'.A:.A])"),
+            f("of:=['A:B'.A2]"),
+            f("of:=SUM(['A:B'.A1:'C'.A1])"),
+            f("of:=['X:Y'.A1]"),
+        ));
+        let mut pkg = b.build();
+        let wb = &mut pkg.workbook;
+        assert_eq!(wb.sheets[0].name, "A_B");
+        let mut engine = crate::engine::Engine::new(wb);
+        engine.recalc_all(wb);
+        let calc = &wb.sheets[2];
+        let got = |r: u32| {
+            let c = calc.cell(r, 0).unwrap();
+            (c.formula.clone().unwrap(), c.value.clone())
+        };
+        assert_eq!(got(0), ("SUM(A_B!A:A)".into(), CellValue::Number(6.0)));
+        assert_eq!(got(1), ("A_B!A2".into(), CellValue::Number(2.0)));
+        assert_eq!(got(2), ("SUM(A_B:C!A1)".into(), CellValue::Number(11.0)));
+        assert_eq!(got(3).0, "'X:Y'!A1");
+        assert_eq!(wb.defined_names[0].formula, "A_B!$A$1:$A$3");
     }
 
     #[test]
