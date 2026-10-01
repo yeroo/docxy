@@ -18076,24 +18076,29 @@ fn replace_one_in(
 ) -> (ReplaceOne, Option<(usize, FoundMatch)>) {
     let matches = ed.find_visible(query, case_sensitive);
     let current = cur.filter(|(i, m)| matches.get(*i) == Some(m) && ed.is_at_found(m));
-    let outcome = match &current {
-        Some((_, m)) if m.editable => {
+    match current {
+        Some((i, m)) if m.editable => {
             ed.replace_current_with(with);
-            ReplaceOne::Replaced
+            // The replaced match is gone, so the next one now has its index
+            // (wrapping), as in the terminal find bar: an adjacent match
+            // (`xxx`) or a read-only one right after it is not skipped.
+            let matches = ed.find_visible(query, case_sensitive);
+            let next = (!matches.is_empty()).then(|| if i < matches.len() { i } else { 0 });
+            let next = next.and_then(|i| Some((i, matches.into_iter().nth(i)?)));
+            if let Some((_, m)) = &next {
+                ed.select_found(m);
+            }
+            (ReplaceOne::Replaced, next)
         }
-        Some((_, m)) if !m.editable => ReplaceOne::ReadOnly,
-        _ => ReplaceOne::NoMatch,
-    };
-    // A replaced match is gone: go on from the caret, at the replacement's end.
-    let cur = if outcome == ReplaceOne::Replaced {
-        None
-    } else {
-        current
-    };
-    (
-        outcome,
-        find_step_in(ed, query, case_sensitive, cur, false, false),
-    )
+        Some((i, m)) => (
+            ReplaceOne::ReadOnly,
+            find_step_in(ed, query, case_sensitive, Some((i, m)), false, false),
+        ),
+        None => (
+            ReplaceOne::NoMatch,
+            find_step_in(ed, query, case_sensitive, None, false, false),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -18214,6 +18219,22 @@ mod find_bar_tests {
         assert_eq!(done, ReplaceOne::ReadOnly);
         assert_eq!(ed.doc.body, before);
         assert_eq!(after.as_ref().map(|(i, _)| *i), Some(1));
+    }
+
+    /// Replace goes on to the match right after the replaced one, even when
+    /// it is adjacent (r3 p1: `xxx` used to jump from the first `x` to the
+    /// third).
+    #[test]
+    fn replace_visits_an_adjacent_match_211() {
+        let mut ed = Editor::new(docxcore::markdown::from_markdown("xxx\n"));
+        let mut cur = find_step_in(&mut ed, "x", false, None, false, true);
+        for want in ["Zxx", "ZZx", "ZZZ"] {
+            let (done, next) = replace_one_in(&mut ed, "x", false, cur, "Z");
+            assert_eq!(done, ReplaceOne::Replaced);
+            assert_eq!(text(&ed), want);
+            cur = next;
+        }
+        assert_eq!(cur, None, "no matches left");
     }
 
     /// Two hits in one deletion share an editor offset: stepping visits both.

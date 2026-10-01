@@ -3133,6 +3133,15 @@ impl App {
         self.dirty = true;
         self.status = None;
         self.clear_visual_hint();
+        // An edit with the find bar open (a ribbon Accept, a paste) moves the
+        // text under its matches: rebuild them so Replace never acts on a
+        // stale range. The caret and selection stay where the edit left them.
+        if let Some(f) = self.find.as_mut() {
+            f.matches = self.editor.find_visible(&f.query, false);
+            if f.idx >= f.matches.len() {
+                f.idx = 0;
+            }
+        }
         // The editable body lives outside `pkg`. Any successful body edit can
         // remove, restore, or move a paragraph carrying `w:sectPr`, so refresh
         // the page/header scope before the next overlay layout. Header/footer
@@ -11394,6 +11403,34 @@ mod tests {
         assert_eq!(app.status, None, "and it is not reported as read-only");
         app.on_key(KeyCode::Enter.into_key());
         assert_eq!(first_line(&app), "Z x x");
+    }
+
+    /// An edit while the bar is open (a ribbon Accept here) rebuilds its
+    /// matches, so Replace never acts on a stale range (r3 m2: Enter, Enter
+    /// used to replace the space where the last `x` had been).
+    #[test]
+    fn an_edit_with_the_bar_open_refreshes_its_matches_211() {
+        let mut app = app_with_tracked_x();
+        find_x_replace_with_z(&mut app);
+        app.find_step(1); // onto the tracked `x`, selected for review
+        let caret = app.editor.caret.clone();
+        app.review_current_revision(RevisionAction::Accept);
+        assert_eq!(first_line(&app), "x x x");
+        let f = app.find.as_ref().unwrap();
+        let ranges: Vec<(usize, usize, bool)> = f
+            .matches
+            .iter()
+            .map(|m| (m.start, m.end, m.editable))
+            .collect();
+        assert_eq!(ranges, [(0, 1, true), (2, 3, true), (4, 5, true)]);
+        assert_eq!(f.idx, 1);
+        assert_eq!(
+            app.editor.caret, caret,
+            "the refresh does not move the caret"
+        );
+        app.on_key(KeyCode::Enter.into_key()); // selects the current match again
+        app.on_key(KeyCode::Enter.into_key()); // replaces it
+        assert_eq!(first_line(&app), "x Z x");
     }
 
     #[test]

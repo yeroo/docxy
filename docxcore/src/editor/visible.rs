@@ -20,9 +20,12 @@ use crate::model::{Block, Inline, RevisionTarget};
 /// `editable` is true when every matched char is a run, tab or break char;
 /// then `[start, end)` is exactly the matched text and can be replaced. A
 /// read-only match covers a field's result (`[start, end)` is the field's one
-/// unit) or text the editor gives no width (a tracked change, a footnote
+/// unit), or text the editor gives no width (a tracked change, a footnote
 /// mark, an equation, SmartArt), which has the collapsed range where that
-/// construct sits.
+/// construct sits, or a mix of these with editable text (`colo[ins u]r` for
+/// `colour`, `Body` + a field's `1` for `Body1`), whose range spans all of
+/// it. `revision` is set when any matched char is drawn from a tracked
+/// change; [`Editor::select_found`] then goes to that change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FoundMatch {
     pub path: Vec<usize>,
