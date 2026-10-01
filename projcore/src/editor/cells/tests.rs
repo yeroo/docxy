@@ -974,6 +974,68 @@ fn typed_dates_on_auto_tasks_still_set_constraints() {
     assert_eq!(mspdi(task.constraint_date).unwrap(), "2026-01-08T17:00:00");
 }
 
+#[test]
+fn typed_start_on_an_auto_milestone_uses_the_days_first_working_time() {
+    let mut ed = editor();
+    ed.proj.tasks[0].duration_min = 0;
+    ed.set_start(10, parse_cell_date("2026-01-07").unwrap())
+        .unwrap();
+    let task = ed.project().task(10).unwrap();
+    assert_eq!(task.constraint, ConstraintType::StartNoEarlierThan);
+    assert_eq!(mspdi(task.constraint_date).unwrap(), "2026-01-07T08:00:00");
+    let m = ed.schedule().get(10).unwrap();
+    assert_eq!(mspdi(Some(m.early_start)).unwrap(), "2026-01-07T08:00:00");
+    assert_eq!(mspdi(Some(m.early_finish)).unwrap(), "2026-01-07T08:00:00");
+    // Saturday has no working time: 08:00 (Project's default start time),
+    // which #779's held instant then keeps.
+    ed.set_start(10, parse_cell_date("2026-01-10").unwrap())
+        .unwrap();
+    let task = ed.project().task(10).unwrap();
+    assert_eq!(mspdi(task.constraint_date).unwrap(), "2026-01-10T08:00:00");
+    let m = ed.schedule().get(10).unwrap();
+    assert_eq!(mspdi(Some(m.early_start)).unwrap(), "2026-01-10T08:00:00");
+    assert_eq!(mspdi(Some(m.early_finish)).unwrap(), "2026-01-10T08:00:00");
+    // A non-milestone auto task typed the same day is unchanged.
+    ed.set_start(20, parse_cell_date("2026-01-07").unwrap())
+        .unwrap();
+    let task = ed.project().task(20).unwrap();
+    assert_eq!(mspdi(task.constraint_date).unwrap(), "2026-01-07T08:00:00");
+    let r = ed.schedule().get(20).unwrap();
+    assert_eq!(mspdi(Some(r.early_start)).unwrap(), "2026-01-07T08:00:00");
+}
+
+#[test]
+fn constraint_prompt_date_without_time_uses_the_days_first_working_time() {
+    let mut ed = editor();
+    ed.proj.tasks[0].duration_min = 0;
+    for text in ["snet 2026-01-07", "fnet 2026-01-07"] {
+        ed.set_constraint(10, text).unwrap();
+        let task = ed.project().task(10).unwrap();
+        assert_eq!(
+            mspdi(task.constraint_date).unwrap(),
+            "2026-01-07T08:00:00",
+            "{text}"
+        );
+        let m = ed.schedule().get(10).unwrap();
+        assert_eq!(
+            mspdi(Some(m.early_start)).unwrap(),
+            "2026-01-07T08:00:00",
+            "{text}"
+        );
+    }
+    // An explicit time keeps its instant, which #779 holds in a gap.
+    ed.set_constraint(10, "fnet 2026-01-07T19:00").unwrap();
+    let task = ed.project().task(10).unwrap();
+    assert_eq!(mspdi(task.constraint_date).unwrap(), "2026-01-07T19:00:00");
+    let m = ed.schedule().get(10).unwrap();
+    assert_eq!(mspdi(Some(m.early_start)).unwrap(), "2026-01-07T19:00:00");
+    // FNLT stays out of scope: a date-only prompt still stores midnight.
+    ed.set_constraint(10, "fnlt 2026-01-07").unwrap();
+    let task = ed.project().task(10).unwrap();
+    assert_eq!(task.constraint, ConstraintType::FinishNoLaterThan);
+    assert_eq!(mspdi(task.constraint_date).unwrap(), "2026-01-07T00:00:00");
+}
+
 /// What a save writes for a task: its Start/Finish and ManualStart.
 fn saved(ed: &Editor, uid: i32) -> (Option<String>, Option<String>, Option<String>) {
     let back = crate::mspdi::read_mspdi(&crate::mspdi::write_mspdi(ed.project())).unwrap();
