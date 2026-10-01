@@ -2429,6 +2429,18 @@ impl App {
 
     fn paste(&mut self) {
         let os_text = self.os_clip.as_mut().and_then(|cb| cb.get_text().ok());
+        self.paste_from(os_text);
+    }
+
+    /// Paste with `os_text` as the OS clipboard's text (`None` when there is
+    /// no OS clipboard). A protected sheet refuses the paste and keeps the
+    /// clip as it was, so a cut can still be pasted elsewhere.
+    fn paste_from(&mut self, os_text: Option<String>) {
+        if self.protected() {
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return;
+        }
         // Our own clip (still on the OS clipboard) pastes with formulas and
         // ref translation; external text pastes as TSV values.
         let own = match (&os_text, &self.clip_text) {
@@ -10104,6 +10116,8 @@ mod tests {
         app.anchor = None;
     }
 
+    const PROTECTED_STATUS: &str = "Sheet is protected — unprotect it to edit (Review ▸ Protect)";
+
     #[test]
     fn a_row_insert_cancels_a_pending_cut() {
         // #821: cut A5:B6, insert a row above row 1, paste at F1. The cut's
@@ -10234,6 +10248,76 @@ mod tests {
         let some = |v: [f64; 4]| v.map(Some).to_vec();
         assert_eq!(block_values(&app, 0, 0, 5), some([1.0, 2.0, 3.0, 4.0]));
         assert_eq!(block_values(&app, 0, 0, 0), some([1.0, 2.0, 3.0, 4.0]));
+    }
+
+    #[test]
+    fn paste_is_refused_on_a_protected_sheet() {
+        let mut app = cut_app(&[(0, 0, 1.0), (0, 1, 2.0), (1, 0, 3.0), (1, 1, 4.0)]);
+        clip_range(&mut app, (0, 0), (1, 1), false);
+        app.pkg.workbook.sheets[0].set_protected(true);
+        let undo_len = app.undo.len();
+        app.cur = (0, 5);
+        app.paste();
+        assert_eq!(block_values(&app, 0, 0, 5), vec![None; 4]);
+        assert_eq!(app.undo.len(), undo_len);
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
+    }
+
+    #[test]
+    fn a_same_sheet_cut_is_not_pasted_on_a_protected_sheet() {
+        let mut app = cut_app(&[(0, 0, 1.0), (0, 1, 2.0), (1, 0, 3.0), (1, 1, 4.0)]);
+        clip_range(&mut app, (0, 0), (1, 1), true);
+        app.pkg.workbook.sheets[0].set_protected(true); // setup, not the toggle
+        app.cur = (0, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 0, 0), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 0, 0, 5), vec![None; 4]);
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
+    }
+
+    #[test]
+    fn a_refused_paste_on_a_protected_sheet_keeps_the_cut() {
+        // The cut is Sheet2!A1:B2; the active Sheet1 is protected, so the
+        // paste is refused and the cut can still move to Sheet3.
+        let mut app = cross_sheet_cut_app();
+        app.pkg.add_sheet("Sheet3");
+        app.pkg.workbook.sheets[0].set_protected(true);
+        app.cur = (0, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
+        assert_eq!(block_values(&app, 0, 0, 5), vec![None; 4]);
+        assert_eq!(block_values(&app, 1, 0, 0), some([1.0, 2.0, 3.0, 4.0]));
+        assert!(app.clip.as_ref().is_some_and(|c| c.cut));
+        app.goto_sheet(2);
+        app.cur = (0, 5);
+        app.paste();
+        assert_eq!(block_values(&app, 2, 0, 5), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 1, 0, 0), vec![None; 4]);
+    }
+
+    #[test]
+    fn external_text_paste_is_refused_on_a_protected_sheet() {
+        let mut app = cut_app(&[]);
+        app.pkg.workbook.sheets[0].set_protected(true);
+        let undo_len = app.undo.len();
+        app.cur = (0, 5);
+        app.paste_from(Some("5\t6\n7\t8\n".into()));
+        assert_eq!(block_values(&app, 0, 0, 5), vec![None; 4]);
+        assert_eq!(app.undo.len(), undo_len);
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
+    }
+
+    #[test]
+    fn external_text_paste_writes_cells_through_paste_from() {
+        // The seam the protected test above goes through: unprotected, the
+        // external TSV lands.
+        let mut app = cut_app(&[]);
+        app.cur = (0, 5);
+        app.paste_from(Some("5\t6\n7\t8\n".into()));
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 0, 5), some([5.0, 6.0, 7.0, 8.0]));
     }
 
     #[test]
