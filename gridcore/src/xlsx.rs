@@ -3554,11 +3554,83 @@ fn validation_spans(xml: &str) -> Option<(Span, Vec<Span>)> {
 /// when a token doesn't read as a cell or range (a whole column, say), since
 /// writing the model's ranges back would lose it.
 fn held_sqref(element: &str) -> Option<Vec<(u32, u32, u32, u32)>> {
-    attr_at(element, 0, "sqref")
-        .unwrap_or("")
+    let tag = start_tag(element)?;
+    let &(_, vs, ve) = tag.attrs.iter().find(|(name, _, _)| *name == "sqref")?;
+    element[vs..ve]
         .split_whitespace()
         .map(crate::sheet::parse_range_name)
         .collect()
+}
+
+/// The start tag a fragment begins with, read with quotes respected: a
+/// `>` inside an attribute value (`error="must be > 0"`, legal and written
+/// by some producers) doesn't end it, as it would for [`tag_end`].
+struct StartTag<'a> {
+    /// Where the element name ends.
+    name_end: usize,
+    /// Each attribute: its name and its value's span.
+    attrs: Vec<(&'a str, usize, usize)>,
+}
+
+/// [`StartTag`] of `element`; `None` when it doesn't read as one.
+fn start_tag(element: &str) -> Option<StartTag<'_>> {
+    let b = element.as_bytes();
+    let stop = |c: u8| c.is_ascii_whitespace() || matches!(c, b'=' | b'>' | b'/');
+    if b.first() != Some(&b'<') {
+        return None;
+    }
+    let mut i = 1;
+    while b.get(i).is_some_and(|&c| !stop(c)) {
+        i += 1;
+    }
+    let mut tag = StartTag {
+        name_end: i,
+        attrs: Vec::new(),
+    };
+    loop {
+        while b.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        match *b.get(i)? {
+            b'>' => return Some(tag),
+            b'/' => {
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let name_start = i;
+        while b.get(i).is_some_and(|&c| !stop(c)) {
+            i += 1;
+        }
+        let name = &element[name_start..i];
+        while b.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        if b.get(i) != Some(&b'=') {
+            if name.is_empty() {
+                return None;
+            }
+            continue;
+        }
+        i += 1;
+        while b.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        let q = *b.get(i).filter(|c| matches!(c, b'"' | b'\''))?;
+        let start = i + 1;
+        let end = start + element[start..].find(q as char)?;
+        tag.attrs.push((name, start, end));
+        i = end + 1;
+    }
+}
+
+/// Where the start tag `element` begins with ends (past its `>`), quotes
+/// respected; `None` when it doesn't read as one.
+fn start_tag_end(element: &str) -> Option<usize> {
+    let tag = start_tag(element)?;
+    let from = tag.attrs.last().map_or(tag.name_end, |&(_, _, e)| e + 1);
+    element[from..].find('>').map(|i| from + i + 1)
 }
 
 /// `ranges` as an `sqref` value.
@@ -3592,7 +3664,7 @@ fn held_formulas(element: &str, name: &str) -> Vec<HeldFormula> {
         .filter(|(n, _, _)| n == name)
         .map(|(_, s, e)| {
             let f = &element[s..e];
-            let open = tag_end(f, 0);
+            let open = start_tag_end(f).unwrap_or(f.len());
             let close = f.rfind("</").filter(|&c| c >= open && !f.ends_with("/>"));
             match close {
                 Some(c) if !f[open..c].contains('<') => HeldFormula {
@@ -3623,14 +3695,17 @@ fn same_formula(held: &str, model: &str) -> bool {
 /// `element` with its start tag's `attr` set to `value` in place, so the
 /// attribute order is kept; added by [`set_tag_attr`] when it has none.
 fn set_tag_attr_in_place(mut element: String, attr: &str, value: &str) -> String {
-    let tag = &element[..tag_end(&element, 0)];
-    match attr_span(tag, attr) {
-        Some((_, vs, ve, _)) => {
-            element.replace_range(vs..ve, value);
-            element
+    let Some(tag) = start_tag(&element) else {
+        return element;
+    };
+    match tag.attrs.iter().find(|(name, _, _)| *name == attr) {
+        Some(&(_, vs, ve)) => element.replace_range(vs..ve, value),
+        None => {
+            let at = tag.name_end;
+            element.insert_str(at, &format!(" {attr}=\"{value}\""));
         }
-        None => set_tag_attr(&element, 0, attr, Some(value)),
     }
+    element
 }
 
 /// The edits, as (start, end, text), that write each `model` formula whose
@@ -3779,7 +3854,9 @@ fn set_validations(xml: String, sheet: &Sheet) -> String {
         String::new()
     } else {
         let wrapper = apply_edits(xml[ws..we].to_string(), edits);
-        if removed > 0 && attr_at(&wrapper, 0, "count").is_some() {
+        let has_count = start_tag(&wrapper)
+            .is_some_and(|t| t.attrs.iter().any(|(name, _, _)| *name == "count"));
+        if removed > 0 && has_count {
             set_tag_attr_in_place(wrapper, "count", &(items.len() - removed).to_string())
         } else {
             wrapper
@@ -16667,24 +16744,77 @@ mod rule_shift_tests {
     }
 
     #[test]
-    fn restored_model_writes_original_positions() {
-        let mut pkg = one(
-            "S",
-            r#"<conditionalFormatting sqref="A1:A5"><cfRule type="expression" priority="1"><formula>A1&gt;0</formula></cfRule></conditionalFormatting><conditionalFormatting sqref="B2"><cfRule type="expression" priority="2"><formula>TRUE</formula></cfRule></conditionalFormatting><dataValidations count="2"><dataValidation type="custom" sqref="C2"><formula1>C1</formula1></dataValidation><dataValidation type="custom" sqref="D1:D4"><formula1>D1</formula1></dataValidation></dataValidations>"#,
-        );
-        let before = save_xlsx(&pkg);
-        let undo = pkg.workbook.clone();
+    fn restored_model_writes_its_own_positions() {
+        // AC8: the save compares the model with the part, so a model that an
+        // undo or redo puts back writes ITS positions, whatever happened in
+        // between.
+        let body = r#"<conditionalFormatting sqref="A1:A5"><cfRule type="expression" priority="1"><formula>$B$5&gt;0</formula></cfRule></conditionalFormatting><conditionalFormatting sqref="B2"><cfRule type="expression" priority="2"><formula>TRUE</formula></cfRule></conditionalFormatting><dataValidations count="2"><dataValidation type="custom" sqref="C2"><formula1>C1</formula1></dataValidation><dataValidation type="custom" sqref="D1:D4"><formula1>$E$4</formula1></dataValidation></dataValidations>"#;
+        let mut pkg = one("S", body);
+        let original = pkg.workbook.clone();
+        let read = |b: &[u8]| part(&load_xlsx(b).unwrap(), SHEET1);
+        let before = read(&save_xlsx(&pkg));
+
+        // Delete rows 1:2: B2 and C2 go, the rest trims, $B$5 / $E$4 move.
         delete_rows(&mut pkg.workbook, 0, 0, 2);
-        assert!(!pkg.workbook.sheets[0].cf_removed.is_empty());
-        assert!(!pkg.workbook.sheets[0].dv_removed.is_empty());
-        // Undo: the model comes back, the part was never changed.
-        pkg.workbook = undo;
-        let after = save_xlsx(&pkg);
-        let read = |b: &[u8]| {
-            let p = load_xlsx(b).unwrap();
-            part(&p, SHEET1)
-        };
-        assert_eq!(read(&after), read(&before));
+        let deleted = pkg.workbook.clone();
+        // Then another edit, which an undo takes back to `deleted`.
+        insert_rows(&mut pkg.workbook, 0, 0, 3);
+        pkg.workbook = deleted;
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert_eq!(count(&ws, "<conditionalFormatting"), 1, "{ws}");
+        assert!(
+            ws.contains(r#"<conditionalFormatting sqref="A1:A3"><cfRule type="expression" priority="1"><formula>$B$3&gt;0</formula>"#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(r#"<dataValidations count="1"><dataValidation type="custom" sqref="D1:D2"><formula1>$E$2</formula1></dataValidation></dataValidations>"#),
+            "{ws}"
+        );
+
+        // And all the way back: the loaded positions, byte for byte.
+        pkg.workbook = original;
+        assert_eq!(read(&save_xlsx(&pkg)), before);
+    }
+
+    #[test]
+    fn a_raw_gt_in_an_attribute_neither_moves_nor_duplicates_sqref() {
+        // `>` is legal unescaped in an attribute value; it must not end the
+        // start tag before `sqref`.
+        let dv = r#"<dataValidations count="1"><dataValidation type="whole" error="must be > 0" sqref="A1:A5"><formula1>1</formula1></dataValidation></dataValidations>"#;
+        let cf = r#"<conditionalFormatting pivot="0" note="a>b" sqref="B1:B5"><cfRule type="expression" priority="1"><formula>B1&gt;0</formula></cfRule></conditionalFormatting>"#;
+        let body = format!("{cf}{dv}");
+        let pkg = one("S", &body);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(cf), "{ws}");
+        assert!(ws.contains(dv), "{ws}");
+
+        let mut pkg = one("S", &body);
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert_eq!(count(&ws, "sqref="), 2, "{ws}");
+        assert!(
+            ws.contains(r#"<dataValidation type="whole" error="must be > 0" sqref="A2:A6"><formula1>1</formula1>"#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(r#"<conditionalFormatting pivot="0" note="a>b" sqref="B2:B6"><cfRule type="expression" priority="1"><formula>B2&gt;0</formula>"#),
+            "{ws}"
+        );
+        assert_eq!(
+            re.workbook.sheets[0].validations[0].ranges,
+            vec![(1, 0, 5, 0)]
+        );
+    }
+
+    #[test]
+    fn an_element_without_sqref_is_left_alone() {
+        // A model rule from it has no ranges, so nothing moves or goes, and
+        // the save never adds an sqref the element didn't have.
+        let dv = r#"<dataValidations count="1"><dataValidation type="whole"><formula1>A1</formula1></dataValidation></dataValidations>"#;
+        let mut pkg = one("S", dv);
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(dv), "{ws}");
     }
 
     #[test]
