@@ -319,9 +319,12 @@ impl Cfb {
             .get(storage_idx)
             .map(|e| e.child)
             .unwrap_or(NOSTREAM);
-        let cap = self.entries.len() + 1;
-        while (!stack.is_empty() || cur != NOSTREAM) && out.len() <= cap {
-            while cur != NOSTREAM && (cur as usize) < self.entries.len() {
+        // Each entry is visited once: a corrupt tree (an entry that is its
+        // own left child, a cycle through right links) can't loop.
+        let mut seen = vec![false; self.entries.len()];
+        loop {
+            while cur != NOSTREAM && (cur as usize) < self.entries.len() && !seen[cur as usize] {
+                seen[cur as usize] = true;
                 stack.push(cur);
                 cur = self.entries[cur as usize].left;
             }
@@ -334,38 +337,40 @@ impl Cfb {
 
     /// Full stream paths (`storage/sub/stream`) for every stream, walking the
     /// storage tree from the root.
+    ///
+    /// Each storage is entered once, however many storages list it (a
+    /// corrupt tree could otherwise make the walk exponential or endless),
+    /// and the walk keeps its own stack, so deep nesting can't overflow
+    /// the thread's.
     pub fn paths(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if let Some(root) = self.root_index() {
-            self.collect_paths(root, "", &mut out, &mut vec![root]);
+        let Some(root) = self.root_index() else {
+            return out;
+        };
+        let mut entered = vec![false; self.entries.len()];
+        entered[root] = true;
+        // (storage, its path prefix), last in first out; children are
+        // pushed in reverse so they come off in directory order.
+        let mut todo: Vec<(usize, String)> = vec![(root, String::new())];
+        while let Some((storage, prefix)) = todo.pop() {
+            let mut sub = Vec::new();
+            for c in self.children_of(storage) {
+                let e = &self.entries[c];
+                let path = if prefix.is_empty() {
+                    e.name.clone()
+                } else {
+                    format!("{prefix}/{}", e.name)
+                };
+                if e.is_stream() {
+                    out.push(path);
+                } else if e.is_storage() && !entered[c] {
+                    entered[c] = true;
+                    sub.push((c, path));
+                }
+            }
+            todo.extend(sub.into_iter().rev());
         }
         out
-    }
-
-    /// `open` holds the storages being walked: a storage listed as its own
-    /// descendant (a corrupt tree) is not entered again.
-    fn collect_paths(
-        &self,
-        storage_idx: usize,
-        prefix: &str,
-        out: &mut Vec<String>,
-        open: &mut Vec<usize>,
-    ) {
-        for c in self.children_of(storage_idx) {
-            let e = &self.entries[c];
-            let path = if prefix.is_empty() {
-                e.name.clone()
-            } else {
-                format!("{prefix}/{}", e.name)
-            };
-            if e.is_stream() {
-                out.push(path);
-            } else if e.is_storage() && !open.contains(&c) {
-                open.push(c);
-                self.collect_paths(c, &path, out, open);
-                open.pop();
-            }
-        }
     }
 
     /// Read a stream by its full path, e.g. `"TBkndTask/FixedData"`. Navigates
@@ -735,6 +740,72 @@ mod tests {
             .unwrap();
         g[storage + 76..storage + 80].copy_from_slice(&0u32.to_le_bytes());
         let _ = Cfb::open(&g).unwrap().paths();
+    }
+
+    /// The directory of `f`: (offset of entry 0, entry offset by name).
+    fn directory(f: &[u8]) -> (usize, std::collections::HashMap<String, usize>) {
+        let dir = (u32::from_le_bytes(f[48..52].try_into().unwrap()) as usize + 1) * 512;
+        let mut by_name = std::collections::HashMap::new();
+        for i in 0..4 {
+            let e = dir + i * 128;
+            let len = u16le(f, e + 64) as usize;
+            by_name.insert(utf16_name(&f[e..e + 64], len), e);
+        }
+        (dir, by_name)
+    }
+
+    #[test]
+    fn a_self_left_entry_ends() {
+        let mut f = write_cfb(&[("A", vec![1]), ("B", vec![2]), ("C", vec![3])]);
+        let (_, by_name) = directory(&f);
+        let e = by_name["B"];
+        let index = ((e - directory(&f).0) / 128) as u32;
+        f[e + 68..e + 72].copy_from_slice(&index.to_le_bytes());
+        let c = Cfb::open(&f).unwrap();
+        let started = std::time::Instant::now();
+        assert!(c.paths().len() <= 3);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn storages_sharing_children_are_walked_once() {
+        // 2k storages A1..Ak, B1..Bk: Ai's child is A(i+1), whose right
+        // sibling is B(i+1), and Bi's child is A(i+1) too. Every level
+        // doubles the paths to the next one: 2^k walks without a guard.
+        let k = 24;
+        let nodes: Vec<String> = (1..=k)
+            .flat_map(|i| [format!("A{i}"), format!("B{i}")])
+            .collect();
+        let tree: Vec<Node> = nodes.iter().map(|n| Node::Storage(n, Vec::new())).collect();
+        let mut f = write_cfb_tree(&tree);
+        let dir = (u32::from_le_bytes(f[48..52].try_into().unwrap()) as usize + 1) * 512;
+        let count = 1 + 2 * k;
+        let mut at = std::collections::HashMap::new();
+        for i in 0..count {
+            let e = dir + i * 128;
+            let len = u16le(&f, e + 64) as usize;
+            at.insert(utf16_name(&f[e..e + 64], len), i as u32);
+        }
+        let set = |f: &mut Vec<u8>, entry: u32, field: usize, value: u32| {
+            let e = dir + entry as usize * 128 + field;
+            f[e..e + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        let (left, right, child) = (68, 72, 76);
+        set(&mut f, 0, child, at["A1"]);
+        for i in 1..=k {
+            let (a, b) = (at[&format!("A{i}")], at[&format!("B{i}")]);
+            let next = at.get(&format!("A{}", i + 1)).copied().unwrap_or(NOSTREAM);
+            set(&mut f, a, left, NOSTREAM);
+            set(&mut f, a, right, b);
+            set(&mut f, a, child, next);
+            set(&mut f, b, left, NOSTREAM);
+            set(&mut f, b, right, NOSTREAM);
+            set(&mut f, b, child, next);
+        }
+        let c = Cfb::open(&f).unwrap();
+        let started = std::time::Instant::now();
+        let _ = c.paths();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]
