@@ -36,3 +36,6 @@
 
 # revmux review rounds (agent chatter, prompts, reports) — regenerable
 .revmux/
+
+# The test XLL scripts/make-legacy-fixtures.ps1 builds (-Sections xll).
+/scripts/xll-fixture/target/

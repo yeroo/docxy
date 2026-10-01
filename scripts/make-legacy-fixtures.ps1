@@ -3,7 +3,8 @@
 # legacy readers: the same workbooks as corpus/xlsx, written by Excel itself.
 #
 # Run from the repo root in Windows PowerShell:  powershell -File scripts/make-legacy-fixtures.ps1
-# (-Sections corpus,extra,addin picks which parts below to rebuild; all by default).
+# (-Sections corpus,extra,addin,xll picks which parts below to rebuild; all by
+# default. xll builds a test XLL with cargo).
 #
 # The ProgID Excel.Application may be registered to xlcomshim on a dev box, so
 # this starts EXCEL.EXE itself and binds to its running class object with
@@ -11,13 +12,13 @@
 # process stopped silently after a few files.
 param(
   [string]$Excel = "C:\Program Files\Microsoft Office\Root\Office16\EXCEL.EXE",
-  [string[]]$Sections = @('corpus', 'extra', 'addin')
+  [string[]]$Sections = @('corpus', 'extra', 'addin', 'xll')
 )
 $ErrorActionPreference = 'Stop'
 # Under -File, `-Sections corpus,extra` arrives as one string 'corpus,extra'.
 $Sections = @($Sections -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-$unknown = @($Sections | Where-Object { $_ -notin @('corpus', 'extra', 'addin') })
-if ($unknown.Count -gt 0) { throw "unknown section(s): $($unknown -join ', ') (expected corpus, extra, addin)" }
+$unknown = @($Sections | Where-Object { $_ -notin @('corpus', 'extra', 'addin', 'xll') })
+if ($unknown.Count -gt 0) { throw "unknown section(s): $($unknown -join ', ') (expected corpus, extra, addin, xll)" }
 Add-Type -TypeDefinition @"
 using System; using System.Runtime.InteropServices;
 public static class RealCom {
@@ -166,6 +167,46 @@ try {
   Save-Xls $wb (Join-Path $addin "ext-name.xls") $p.Id
   $wb.Close($false)
   $src.Close($false)
+} finally {
+  $xl.Quit(); [Runtime.InteropServices.Marshal]::ReleaseComObject($xl) | Out-Null
+  Start-Sleep 2; if (!$p.HasExited) { $p.Kill() }
+}
+}
+
+# corpus/legacy/addin/xll-udf: a workbook calling XLLTWICE, a function an XLL
+# add-in registers. No XLL that ships with Office has a function that isn't
+# native, so scripts/xll-fixture builds one (it needs cargo). Excel must be
+# 64-bit, as the XLL is.
+if ($Sections -contains 'xll') {
+$addin = Join-Path $PSScriptRoot "..\corpus\legacy\addin"
+New-Item -ItemType Directory -Force $addin | Out-Null
+$addin = (Resolve-Path $addin).Path
+Remove-Item (Join-Path $addin "xll-udf.*") -ErrorAction SilentlyContinue
+$crate = Join-Path $PSScriptRoot "xll-fixture"
+cargo build --release --quiet --manifest-path (Join-Path $crate "Cargo.toml")
+if ($LASTEXITCODE -ne 0) { throw "building the XLL failed" }
+$xll = Join-Path $crate "target\release\XLLFIXT.XLL"
+Copy-Item (Join-Path $crate "target\release\xll_fixture.dll") $xll -Force
+$p = Start-Process $Excel -ArgumentList "/automation","-Embedding" -PassThru
+Start-Sleep -Seconds 8
+$xl = [RealCom]::Local("00024500-0000-0000-C000-000000000046")
+$xl.DisplayAlerts = $false
+try {
+  $wb = $xl.Workbooks.Add()
+  if (-not $xl.RegisterXLL($xll)) { throw "Excel refused to load $xll" }
+  $ws = $wb.Worksheets.Item(1)
+  $ws.Name = "Data"
+  $ws.Range("A1").Value2 = 21
+  $ws.Range("B1").Formula = '=XLLTWICE(A1)'
+  $ws.Range("B2").Formula = '=XLLTWICE(A1)+1'
+  $xl.Calculate()
+  $got = $ws.Range("B1").Value2
+  if ($got -ne 42) { throw "XLLTWICE(21) gave '$got', not 42: the function isn't registered" }
+  $wb.CheckCompatibility = $false
+  $wb.SaveAs((Join-Path $addin "xll-udf.xlsx"), 51)
+  $wb.SaveAs((Join-Path $addin "xll-udf.xlsb"), 50)
+  Save-Xls $wb (Join-Path $addin "xll-udf.xls") $p.Id
+  $wb.Close($false)
 } finally {
   $xl.Quit(); [Runtime.InteropServices.Marshal]::ReleaseComObject($xl) | Out-Null
   Start-Sleep 2; if (!$p.HasExited) { $p.Kill() }
