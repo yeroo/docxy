@@ -1157,3 +1157,82 @@ fn a_replace_all_mixing_a_blank_into_a_frozen_block_clears_it() {
     assert_eq!(value(&v, 1, 4), CellValue::Empty);
     assert_eq!(value(&v, 2, 4), CellValue::Text("y".into()));
 }
+
+// ---- #775 r7: an edit to part of a legacy CSE array is refused whole ------
+
+/// A1:A3 = 1, 2, 3 and a legacy CSE block `{=A1:A3*2}` over D1:D3 = 2, 4, 6.
+fn view_with_cse_block() -> SheetView {
+    let mut v = view();
+    let s = v.active;
+    let sheet = &mut v.pkg.workbook.sheets[s];
+    for r in 0..3u32 {
+        sheet.set_cell(r, 0, Cell::number(f64::from(r + 1)));
+    }
+    let mut d1 = Cell::formula("A1:A3*2");
+    d1.f_attrs = Some(" t=\"array\" ref=\"D1:D3\"".into());
+    sheet.set_cell(0, 3, d1);
+    v.engine = sheet_engine(&v.pkg.workbook);
+    v.engine.recalc_all(&mut v.pkg.workbook);
+    assert_eq!(value(&v, 2, 3), CellValue::Number(6.0));
+    v
+}
+
+/// Nothing changed, no undo step, and Excel's reason to show.
+fn assert_refused(v: &mut SheetView, before: &std::collections::BTreeMap<(u32, u32), Cell>) {
+    assert_eq!(&v.sheet().cells, before);
+    assert!(v.undo.is_empty());
+    assert_eq!(
+        v.entry_error.take().as_deref(),
+        Some(gridcore::engine::PART_OF_ARRAY)
+    );
+}
+
+#[test]
+fn typing_into_part_of_an_array_is_refused_and_keeps_the_editor() {
+    let mut v = view_with_cse_block();
+    let before = v.sheet().cells.clone();
+    select(&mut v, 1, 3);
+    type_fresh(&mut v, "9");
+    assert_eq!(v.commit_and_move(1, 0), None);
+    assert_eq!(v.editing.as_deref(), Some("9"));
+    assert_eq!(v.sel, (1, 3));
+    assert_refused(&mut v, &before);
+}
+
+#[test]
+fn a_range_entry_or_fill_over_part_of_an_array_is_refused_whole() {
+    // Ctrl+Enter into D2:E3 would write E2:E3 too; none of it lands.
+    let mut v = view_with_cse_block();
+    let before = v.sheet().cells.clone();
+    v.anchor = (1, 3);
+    v.sel = (2, 4);
+    type_fresh(&mut v, "5");
+    v.anchor = (1, 3);
+    v.sel = (2, 4);
+    assert!(!v.commit_edit_to_selection());
+    assert_refused(&mut v, &before);
+    v.end_cell_edit();
+    // Ctrl+D over C2:D4 from C2 = 5, D2 = 4.
+    put(&mut v, 1, 2, Cell::number(5.0));
+    let before = v.sheet().cells.clone();
+    v.anchor = (1, 2);
+    v.sel = (3, 3);
+    assert!(!v.fill_selection(true));
+    assert_refused(&mut v, &before);
+}
+
+#[test]
+fn clearing_part_of_an_array_is_refused_but_not_all_of_it() {
+    // What Delete and a cut ask before they snapshot.
+    let mut v = view_with_cse_block();
+    let s = v.active;
+    v.anchor = (1, 3);
+    v.sel = (2, 3);
+    let part = v.clear_changes();
+    assert!(v.refuses(s, &part));
+    v.entry_error = None;
+    v.anchor = (0, 3);
+    let all = v.clear_changes();
+    assert!(!v.refuses(s, &all));
+    assert!(v.entry_error.is_none());
+}
