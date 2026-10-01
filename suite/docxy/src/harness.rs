@@ -4627,6 +4627,25 @@ mod tests {
         }
     }
 
+    /// #610: Open and Repair's status names what it emptied or dropped, and
+    /// `open mode: repair` must still read it as a load that worked; a
+    /// repair that had to give up is a failed open.
+    #[test]
+    fn repair_status_is_not_a_load_failure() {
+        let dir = crate::open_mode_tests::Scratch::new();
+        let src = crate::open_mode_tests::damaged_book(&dir, "book.xlsx");
+        let tab = crate::tab_from_path_mode(&src, crate::open_mode::OpenMode::Repair).unwrap();
+        assert!(
+            tab.status.contains("emptied xl/styles.xml"),
+            "{}",
+            tab.status
+        );
+        assert!(!load_failed(&tab.status), "{}", tab.status);
+        assert!(load_failed(
+            "xlsx load error: could not repair: xl/charts/chart1.xml is damaged"
+        ));
+    }
+
     #[test]
     fn cell_arg_reports_a_missing_or_mistyped_argument() {
         let args = obj(&[("cell", s("B2"))]);

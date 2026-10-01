@@ -34,6 +34,8 @@ mod html_bundle;
 mod layout_tab;
 mod menu;
 mod open_mode;
+#[cfg(test)]
+mod open_mode_tests;
 mod page_number;
 mod page_setup;
 mod project;
@@ -6929,6 +6931,22 @@ fn protected_rollback(tab: &mut DocTab) {
     tab.status = open_mode::PROTECTED_STATUS.into();
 }
 
+/// Excel's question before reopening `path` over a tab with unsaved changes
+/// (#610): Yes reloads it in `mode` ([`dialog_host`]'s `reopen_click`), No
+/// keeps the tab as it is.
+fn reopen_dialog(path: &std::path::Path, mode: OpenMode) -> dialog::Dialog {
+    dialog::Dialog::message(
+        "reopen",
+        "docxy",
+        open_mode::reopen_question(&file_name(path)),
+        &[
+            ("Yes", dialog::ButtonRole::Accept),
+            ("No", dialog::ButtonRole::Cancel),
+        ],
+        dialog::DialogOwner::Reopen { mode },
+    )
+}
+
 /// What Open and Repair did, as the tail of the load status.
 fn repair_summary(repairs: &gridcore::xlsx::Repairs) -> String {
     if repairs.is_empty() {
@@ -13775,19 +13793,7 @@ impl Docxy {
         let tab = &self.tabs[i];
         match reopen_step(reopen, tab.dirty, tab.access, mode) {
             ReopenStep::Reload => self.tabs[i] = tab_from_path_mode(&path, mode)?,
-            ReopenStep::Ask => {
-                let name = file_name(&path);
-                self.tabs[i].dialogs.push(dialog::Dialog::message(
-                    "reopen",
-                    "docxy",
-                    open_mode::reopen_question(&name),
-                    &[
-                        ("Yes", dialog::ButtonRole::Accept),
-                        ("No", dialog::ButtonRole::Cancel),
-                    ],
-                    dialog::DialogOwner::Reopen { mode },
-                ));
-            }
+            ReopenStep::Ask => self.tabs[i].dialogs.push(reopen_dialog(&path, mode)),
             ReopenStep::Focus => {}
         }
         Ok(())
