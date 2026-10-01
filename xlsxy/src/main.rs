@@ -1618,11 +1618,17 @@ impl App {
     }
 
     /// Toggle protection on the active sheet. Goes through `structural` so it's
-    /// undoable; protecting uses Excel's default flag set.
+    /// undoable; protecting uses Excel's default flag set. It moves no cells,
+    /// so a pending cut stays a cut: a paste refused on a protected sheet
+    /// can still move it once the sheet is unprotected.
     fn toggle_protection(&mut self) {
         let now = !self.protected();
         let s = self.sheet;
+        let cut = self.clip.as_ref().is_some_and(|c| c.cut);
         self.structural(|wb| wb.sheets[s].set_protected(now));
+        if let Some(clip) = &mut self.clip {
+            clip.cut = cut;
+        }
         self.status = Some(if now {
             "Sheet protected — cells are read-only until unprotected".into()
         } else {
@@ -5547,9 +5553,9 @@ impl App {
 
     /// Make a pending cut a copy: a later paste clears nothing. Removing a
     /// sheet does this, since it can take or renumber the cut's source sheet,
-    /// and so does any structural edit (including protection toggles and
-    /// renames) and the undo/redo of one, since it can move the cells under
-    /// the cut's recorded coordinates.
+    /// and so does any structural edit and the undo/redo of one, since most
+    /// of them move cells under the cut's recorded coordinates. A protection
+    /// toggle moves none and keeps the cut (`toggle_protection`).
     fn cancel_cut(&mut self) {
         if let Some(clip) = &mut self.clip {
             clip.cut = false;
@@ -10236,8 +10242,8 @@ mod tests {
     }
 
     #[test]
-    fn toggling_protection_cancels_a_pending_cut() {
-        // Protection toggles are structural edits, so they cancel a cut too.
+    fn toggling_protection_keeps_a_pending_cut() {
+        // A protection toggle moves no cells, so the cut still moves.
         let mut app = cut_app(&[(0, 0, 1.0), (0, 1, 2.0), (1, 0, 3.0), (1, 1, 4.0)]);
         clip_range(&mut app, (0, 0), (1, 1), true);
         app.toggle_protection();
@@ -10247,7 +10253,26 @@ mod tests {
         app.paste();
         let some = |v: [f64; 4]| v.map(Some).to_vec();
         assert_eq!(block_values(&app, 0, 0, 5), some([1.0, 2.0, 3.0, 4.0]));
-        assert_eq!(block_values(&app, 0, 0, 0), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 0, 0, 0), vec![None; 4]);
+    }
+
+    #[test]
+    fn unprotecting_after_a_refused_paste_moves_the_cut() {
+        // Cut Sheet2!A1:B2, paste on protected Sheet1: refused. Unprotect
+        // as the status says, paste again: the cut moves.
+        let mut app = cross_sheet_cut_app();
+        app.pkg.workbook.sheets[0].set_protected(true);
+        app.cur = (0, 5);
+        app.paste();
+        assert_eq!(app.status.as_deref(), Some(PROTECTED_STATUS));
+        app.toggle_protection();
+        assert!(!app.protected());
+        app.cur = (0, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 0, 5), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 1, 0, 0), vec![None; 4]);
+        assert_eq!(app.status.as_deref(), Some("Pasted"));
     }
 
     #[test]
