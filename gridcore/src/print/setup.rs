@@ -419,6 +419,21 @@ impl PageSetup {
             (w, h)
         }
     }
+
+    /// The page setup a grouped sheet takes from this one when Page Setup
+    /// is applied to the group (FIL-147): every field, and the header and
+    /// footer text without picture codes (`&G`), since the pictures
+    /// (`legacyDrawingHF`) belong to this sheet. Print areas and titles are
+    /// defined names, not page setup, so they never travel.
+    pub fn for_group(&self) -> PageSetup {
+        let mut s = self.clone();
+        for slot in HfSlot::ALL {
+            if let Some(t) = s.header_footer.slot_mut(slot) {
+                *t = crate::print::hf::strip_pictures(t);
+            }
+        }
+        s
+    }
 }
 
 /// The (width, height) in points of a `paperSize` code. Codes this table
@@ -514,6 +529,28 @@ mod tests {
         s.orientation = Orientation::Landscape;
         assert_eq!(s.page_points(), (h, w));
         assert_eq!(paper_points(999), paper_points(1));
+    }
+
+    #[test]
+    fn a_group_copy_keeps_every_field_but_drops_header_pictures() {
+        let mut s = PageSetup {
+            orientation: Orientation::Landscape,
+            scale: 75,
+            grid_lines: true,
+            ..PageSetup::default()
+        };
+        s.header_footer.odd_header = Some("&L&G&CTitle".into());
+        s.header_footer.odd_footer = Some("&RPage &P".into());
+        let copy = s.for_group();
+        assert_eq!(copy.header_footer.odd_header.as_deref(), Some("&L&CTitle"));
+        assert_eq!(copy.header_footer.odd_footer.as_deref(), Some("&RPage &P"));
+        assert_eq!(
+            PageSetup {
+                header_footer: s.header_footer.clone(),
+                ..copy
+            },
+            s
+        );
     }
 
     #[test]
