@@ -3004,12 +3004,35 @@ fn sheet_data_xml(
         }
         out.push_str(&format!("<row r=\"{}\"{attrs}>", row + 1));
         for (&(r, c), cell) in cells {
-            out.push_str(&cell_xml(r, c, cell, index_of, any_formulas, new_cm));
+            let taken = block_taken(sheet, r, c, cell);
+            out.push_str(&cell_xml(r, c, cell, index_of, any_formulas, new_cm, taken));
         }
         out.push_str("</row>");
     }
     out.push_str("</sheetData>");
     out
+}
+
+/// Does another cell hold content inside the block a non-spilling array
+/// anchor at `(row, col)` stores in its `ref`? Then the anchor covers its own
+/// cell alone ([`cell_xml`]), or the saved block would overlap their content,
+/// which Excel never writes. An evaluated legacy CSE block refuses plain
+/// edits to part of it, so this is a frozen block content was typed into
+/// (#837/#840), a block a formula in it blocks, or content loaded that way.
+/// A styled blank isn't content.
+fn block_taken(sheet: &Sheet, row: u32, col: u32, cell: &Cell) -> bool {
+    if cell.spill.is_some() {
+        return false;
+    }
+    crate::sheet::array_block(cell).is_some_and(|(r1, c1, r2, c2)| {
+        (r1, c1) == (row, col)
+            && (r1..=r2).any(|r| {
+                sheet
+                    .cells
+                    .range((r, c1)..=(r, c2))
+                    .any(|(&k, other)| k != (row, col) && !other.is_blank())
+            })
+    })
 }
 
 /// A dynamic array typed here ([`CellMeta::dynamic`]) that the file has no
@@ -3295,6 +3318,7 @@ fn cell_xml(
     index_of: &mut impl FnMut(&str) -> usize,
     any_formulas: &mut bool,
     new_cm: Option<&str>,
+    block_taken: bool,
 ) -> String {
     let mut attrs = format!(" r=\"{}\"", cell_name(row, col));
     if cell.style != 0 {
@@ -3370,16 +3394,20 @@ fn cell_xml(
         // ref that starts elsewhere names another block (a cell moved
         // without set_cell, a sort say, or loaded that way; set_cell and
         // paste re-anchor themselves). A legacy CSE block (no `cm`) whose ref
-        // starts here keeps it: the block owns its whole `ref` (the engine
-        // refuses plain edits to part of it), and Excel refills it on load.
-        (Some(src), Some(fa)) if is_array_f(fa) && (dynamic || !ref_starts_at(fa, &anchor)) => (
-            format!(
-                "<f{}>{}</f>",
-                with_ref(fa, &anchor),
-                esc_text(&file_formula(src))
-            ),
-            true,
-        ),
+        // starts here keeps it, and Excel refills it on load, unless another
+        // cell in it now holds content ([`block_taken`]).
+        (Some(src), Some(fa))
+            if is_array_f(fa) && (dynamic || block_taken || !ref_starts_at(fa, &anchor)) =>
+        {
+            (
+                format!(
+                    "<f{}>{}</f>",
+                    with_ref(fa, &anchor),
+                    esc_text(&file_formula(src))
+                ),
+                true,
+            )
+        }
         (Some(src), Some(fa)) => (
             format!("<f{fa}>{}</f>", esc_text(&file_formula(src))),
             is_array_f(fa),
@@ -11283,11 +11311,13 @@ b",
             Some((3, 1))
         );
         // Blocked by a formula in C2: C3 is emptied, and still the block's.
+        // While the formula is there the block saves its anchor alone, as
+        // Excel never writes a formula inside another cell's array.
         eng.set_cell(&mut pkg.workbook, (0, 1, 2), Cell::formula("7"));
         eng.set_cell(&mut pkg.workbook, (0, 2, 2), Cell::number(99.0));
         assert_eq!(val(&pkg, "C3"), CellValue::Empty);
         let ws = saved_sheet1(&pkg);
-        assert!(ws.contains(r#"<f t="array" ref="C1:C3">A1</f>"#), "{ws}");
+        assert!(ws.contains(r#"<f t="array" ref="C1">A1</f>"#), "{ws}");
         // Removing the formula is not refused, and frees the block.
         eng.set_cell(&mut pkg.workbook, (0, 1, 2), Cell::default());
         for n in ["C1", "C2", "C3"] {
@@ -11306,9 +11336,11 @@ b",
         assert_eq!(val(&pkg, "C2"), CellValue::Number(200.0));
         assert_eq!(val(&pkg, "C1"), CellValue::Number(1.0));
         assert_eq!(val(&pkg, "C3"), CellValue::Empty);
-        // Blocked (no extent), it still saves its whole ref.
+        // Blocked (no extent), it saves its anchor alone while the formula
+        // is in its ref: a saved block over a formula is one Excel never
+        // writes.
         let ws = saved_sheet1(&pkg);
-        assert!(ws.contains(r#"<f t="array" ref="C1:C3">A1</f>"#), "{ws}");
+        assert!(ws.contains(r#"<f t="array" ref="C1">A1</f>"#), "{ws}");
         eng.set_cell(&mut pkg.workbook, (0, 0, 0), Cell::number(5.0));
         assert_eq!(val(&pkg, "C1"), CellValue::Number(5.0));
         assert_eq!(val(&pkg, "C2"), CellValue::Number(200.0));
@@ -11317,6 +11349,9 @@ b",
         for n in ["C1", "C2", "C3"] {
             assert_eq!(val(&pkg, n), CellValue::Number(5.0), "{n}");
         }
+        // Refilled, it saves its whole ref again.
+        let ws = saved_sheet1(&pkg);
+        assert!(ws.contains(r#"<f t="array" ref="C1:C3">A1</f>"#), "{ws}");
     }
 
     #[test]
@@ -11978,6 +12013,44 @@ b",
     }
 
     #[test]
+    fn content_typed_into_a_frozen_cse_block_shrinks_its_saved_ref() {
+        // r7 M1: a legacy CSE block the engine can't evaluate still takes
+        // content typed into it (#837/#840): the anchor drops its extent and
+        // then saves covering its own cell alone, never a block over the
+        // typed value. Untouched, it keeps its whole ref.
+        let rows = concat!(
+            r#"<row r="1"><c r="A1"><v>1</v></c><c r="E1"><f t="array" ref="E1:E3">_xlfn.PIVOTBY(A1,4)</f><v>7</v></c></row>"#,
+            r#"<row r="2"><c r="E2"><v>8</v></c></row>"#,
+            r#"<row r="3"><c r="E3"><v>9</v></c></row>"#,
+        );
+        for evaluated in [false, true] {
+            let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+            let mut eng = crate::engine::Engine::new(&pkg.workbook);
+            if evaluated {
+                eng.recalc_all(&mut pkg.workbook);
+            }
+            assert!(eng.is_frozen(&pkg.workbook, (0, 0, 4)));
+            let ws = saved_sheet1(&pkg);
+            assert!(
+                ws.contains(r#"<f t="array" ref="E1:E3">"#),
+                "{evaluated}: {ws}"
+            );
+            assert!(eng.set_cell(&mut pkg.workbook, (0, 1, 4), Cell::number(5.0)));
+            let ws = saved_sheet1(&pkg);
+            assert!(
+                ws.contains(
+                    r#"<c r="E1"><f t="array" ref="E1">_xlfn.PIVOTBY(A1,4)</f><v>7</v></c>"#
+                ),
+                "{evaluated}: {ws}"
+            );
+            assert!(
+                ws.contains(r#"<c r="E2"><v>5</v></c>"#),
+                "{evaluated}: {ws}"
+            );
+        }
+    }
+
+    #[test]
     fn an_evaluated_cse_block_is_still_an_array_to_sort() {
         // #840 r1 m1: a legacy CSE `SUM` over its block evaluates to one
         // value, which fills the block (#775), and save keeps its `ref`. A
@@ -12217,10 +12290,12 @@ b",
 
     /// #785, as ruled for #775: a legacy CSE block owns its whole `ref`, as in
     /// Excel. A plain value or a styled blank typed into part of it is
-    /// refused; a formula blocks it (the anchor keeps its own value) but never
-    /// shrinks its saved `ref`; an untouched block keeps its ref.
+    /// refused and never shrinks its saved `ref`; an untouched block keeps
+    /// its ref. A formula typed into it blocks it (the anchor keeps its own
+    /// value), and while it is there the anchor saves covering its own cell
+    /// alone, as Excel never writes a formula inside another cell's array.
     #[test]
-    fn content_typed_inside_a_cse_block_never_shrinks_its_saved_ref() {
+    fn only_a_formula_typed_inside_a_cse_block_shrinks_its_saved_ref() {
         const BLOCK: &str = r#"<f t="array" ref="D1:D3">SUM(A1:A3)</f>"#;
         let edited = |at: (u32, u32), cell: Cell| {
             let mut pkg = load_xlsx(&cell_meta_fixture(CSE_SUM_ROWS)).unwrap();
@@ -12232,7 +12307,7 @@ b",
 
         let ws = edited((1, 3), Cell::formula("A1+1"));
         assert!(
-            ws.contains(r#"<c r="D1"><f t="array" ref="D1:D3">SUM(A1:A3)</f><v>6</v></c>"#),
+            ws.contains(r#"<c r="D1"><f t="array" ref="D1">SUM(A1:A3)</f><v>6</v></c>"#),
             "{ws}"
         );
         assert!(ws.contains(r#"<c r="D2"><f>A1+1</f><v>2</v></c>"#), "{ws}");
