@@ -490,7 +490,9 @@ impl Session {
         let keys = changes.iter().map(|&(r, c, _)| (r, c)).collect();
         self.record(keys, |s| {
             let sheet_idx = s.active;
-            s.engine.set_cells(&mut s.pkg.workbook, sheet_idx, changes);
+            // Checked above: written without deciding again.
+            s.engine
+                .set_cells_prechecked(&mut s.pkg.workbook, sheet_idx, changes);
         });
         true
     }
@@ -800,7 +802,7 @@ impl Session {
         self.record(keys, |s| {
             let sheet_idx = s.active;
             s.engine
-                .paste_block(&mut s.pkg.workbook, sheet_idx, (r0, c0), &block);
+                .paste_block_prechecked(&mut s.pkg.workbook, sheet_idx, (r0, c0), &block);
         });
         if clip.cut {
             if let Some(c) = self.clip.as_mut() {
@@ -1378,8 +1380,13 @@ impl Session {
             .count();
         let prev_active = self.active;
         self.active = si;
+        // As `ctl_cell_set`: only this clear's own refusal is read back.
+        self.err = None;
         self.dispatch(&format!("clear\t{r1}\t{c1}\t{r2}\t{c2}"));
         self.active = prev_active;
+        if self.err.take().is_some_and(|e| e == PART_OF_ARRAY) {
+            return Err(format!("range.clear: {PART_OF_ARRAY}"));
+        }
         let mut out = String::from("{\"cleared\":");
         out.push_str(&cleared.to_string());
         out.push('}');
@@ -3720,6 +3727,15 @@ mod tests {
         s.dispatch("select\t4\t0\t5\t0"); // A5:A6
         let tsv = s.dispatch("copy").unwrap();
         refused(&mut s, &format!("paste\t1\t3\t{tsv}"), &before);
+        // r8 M4: the agent's range.clear reports the refusal, not success.
+        let out = s.ctl(r#"{"verb":"range.clear","args":{"range":"D2:D3"}}"#);
+        assert!(
+            out.contains("range.clear: You can't change part of an array.")
+                && !out.contains("\"ok\":true"),
+            "{out}"
+        );
+        assert_eq!(s.pkg.workbook.sheets[0].cells, before);
+        assert!(s.undo.is_empty() && !s.dirty && s.err.is_none());
         // Its anchor taken too, the block goes.
         s.dispatch("clear\t0\t3\t2\t3");
         assert!(s.err.is_none());
