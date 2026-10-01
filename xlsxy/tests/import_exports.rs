@@ -112,12 +112,19 @@ fn imported_export_protects_rebound_workbook_and_recalc_still_saves_xlsx_in_plac
     );
     let workbook = std::fs::read(&binding).unwrap();
     assert!(gridcore::xlsx::load_xlsx(&workbook).is_ok());
+    // input.xlsx is taken now, so the CSV binds to input1.xlsx (#876) and
+    // an export through a link to input.xlsx is no export over the
+    // workbook it is bound to. It replaces the link, not the workbook.
     std::fs::hard_link(&binding, &alias).unwrap();
     let result = run(&source, "--csv", &alias);
-    assert!(!result.status.success());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("cannot overwrite"));
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     assert_eq!(std::fs::read(&binding).unwrap(), workbook);
-    assert_eq!(std::fs::read(&alias).unwrap(), workbook);
+    assert!(String::from_utf8_lossy(&std::fs::read(&alias).unwrap()).contains("first,second"));
+    assert!(!dir.0.join("input1.xlsx").exists());
     let result = run(&binding, "--recalc", &binding);
     assert!(
         result.status.success(),
