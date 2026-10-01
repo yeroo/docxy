@@ -9947,6 +9947,9 @@ b",
         assert_eq!(val(&pkg, "C2"), CellValue::Number(200.0));
         assert_eq!(val(&pkg, "C1"), CellValue::Number(1.0));
         assert_eq!(val(&pkg, "C3"), CellValue::Empty);
+        // Blocked (no extent), it still saves its whole ref.
+        let ws = saved_sheet1(&pkg);
+        assert!(ws.contains(r#"<f t="array" ref="C1:C3">A1</f>"#), "{ws}");
         eng.set_cell(&mut pkg.workbook, (0, 0, 0), Cell::number(5.0));
         assert_eq!(val(&pkg, "C1"), CellValue::Number(5.0));
         assert_eq!(val(&pkg, "C2"), CellValue::Number(200.0));
@@ -9954,6 +9957,46 @@ b",
         eng.set_cell(&mut pkg.workbook, (0, 1, 2), Cell::default());
         for n in ["C1", "C2", "C3"] {
             assert_eq!(val(&pkg, n), CellValue::Number(5.0), "{n}");
+        }
+    }
+
+    #[test]
+    fn a_formula_below_the_top_of_a_cse_block_clears_the_cells_above_it() {
+        let mut pkg = cse_book("C1:C3", "A1");
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 2, 2), Cell::formula("7"));
+        assert_eq!(val(&pkg, "C1"), CellValue::Number(1.0));
+        assert_eq!(val(&pkg, "C2"), CellValue::Empty);
+        assert_eq!(val(&pkg, "C3"), CellValue::Number(7.0));
+    }
+
+    #[test]
+    fn a_cse_block_never_takes_cells_another_array_spilled_into() {
+        let mut pkg = cse_book("C1:C3", "A1");
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        // B3 cannot spill into C3 while the block holds it.
+        eng.set_cell(&mut pkg.workbook, (0, 2, 1), Cell::formula("SEQUENCE(1,2)"));
+        assert_eq!(val(&pkg, "B3"), CellValue::Error("#SPILL!".into()));
+        // A formula in C2 blocks the block and frees C3: B3 spills into it.
+        eng.set_cell(&mut pkg.workbook, (0, 1, 2), Cell::formula("7"));
+        assert_eq!(val(&pkg, "B3"), CellValue::Number(1.0));
+        assert_eq!(val(&pkg, "C3"), CellValue::Number(2.0));
+        // Clearing C2: C3 is B3's now, so the block stays blocked.
+        eng.set_cell(&mut pkg.workbook, (0, 1, 2), Cell::default());
+        assert_eq!(val(&pkg, "C1"), CellValue::Number(1.0));
+        assert_eq!(val(&pkg, "C2"), CellValue::Empty);
+        assert_eq!(val(&pkg, "C3"), CellValue::Number(2.0));
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(2, 1).unwrap().spill,
+            Some((1, 2))
+        );
+        assert_eq!(pkg.workbook.sheets[0].cell(0, 2).unwrap().spill, None);
+        // Once B3 no longer spills, the block refills.
+        eng.set_cell(&mut pkg.workbook, (0, 2, 1), Cell::default());
+        for n in ["C1", "C2", "C3"] {
+            assert_eq!(val(&pkg, n), CellValue::Number(1.0), "{n}");
         }
     }
 
@@ -10347,9 +10390,9 @@ b",
     }
 
     #[test]
-    fn legacy_array_block_keeps_its_ref_when_not_spilling() {
-        // A CSE array over D1:D3 (no `cm`) whose result is 1x1: Excel refills
-        // the block on load, so the ref must not shrink to the anchor.
+    fn legacy_array_block_with_a_scalar_result_saves_its_ref() {
+        // A CSE array over D1:D3 (no `cm`) whose result is 1x1: the engine
+        // repeats it over the block, which saves with its whole ref.
         let anchor = r#"<c r="D1"><f t="array" ref="D1:D3">SUM(A1:A5*A1:A5)</f><v>165</v></c>"#;
         let rows = sort_anchor_rows(5, anchor)
             .replacen(

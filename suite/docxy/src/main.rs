@@ -14925,7 +14925,7 @@ mod clipboard_tests {
     use gridcore::engine::Engine;
     use gridcore::sheet::{Cell, CellValue, Sheet, Workbook};
 
-    /// #725: a legacy CSE block over D1:D3 with a 1x1 result (no spill).
+    /// #725: a legacy CSE block over D1:D3 with a 1x1 result (repeated over the block).
     fn cse_sum_block() -> Cell {
         Cell {
             value: CellValue::Number(6.0),

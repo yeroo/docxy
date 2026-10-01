@@ -250,9 +250,11 @@ impl Engine {
                 changed.extend(clear_spill(sheet, s, (r, c), ext, None));
             }
             // An edit landing inside another anchor's spill breaks that
-            // spill: clear its cells and let the anchor recalc to #SPILL!.
+            // spill: clear its cells and recalc the anchor (a dynamic array
+            // shows #SPILL!; a CSE block refills or, blocked, keeps its own
+            // value — see `fill_cse`).
             if let Some((anchor, ext)) = spill_owner(sheet, r, c) {
-                changed.extend(clear_spill(sheet, s, anchor, ext, Some((r, c))));
+                changed.extend(clear_spill(sheet, s, anchor, ext, None));
                 if let Some(a) = sheet.cells.get_mut(&anchor) {
                     a.spill = None;
                 }
@@ -756,9 +758,10 @@ impl Engine {
     /// The block owns every plain value in its `ref`, as in Excel, which
     /// refuses to change part of an array: a value typed into a block cell is
     /// refilled by the block, and so is one an undo restores or an insert
-    /// shifted into a grown `ref`. Only a formula in a block cell blocks it:
-    /// the anchor then shows its own value alone (never `#SPILL!`) until the
-    /// formula goes.
+    /// shifted into a grown `ref`. A formula in a block cell, or a cell inside
+    /// another anchor's spill, blocks it: the anchor then shows its own value
+    /// alone (never `#SPILL!`), leaves the other anchor's cells alone, and
+    /// refills once the block is clear.
     fn fill_cse(
         &mut self,
         sheet: &mut Sheet,
@@ -773,15 +776,48 @@ impl Engine {
             DynResult::Array(m) => m,
         };
         let off_grid = r + h > crate::sheet::MAX_ROWS || c + w > crate::sheet::MAX_COLS;
+        // Other anchors whose spill overlaps this block or its old extent:
+        // their spilled values are theirs, never this block's.
+        let (bh, bw) = (h.max(old.0), w.max(old.1));
+        let foreign: Vec<(u32, u32, u32, u32)> = sheet
+            .cells
+            .range(..(r + bh, 0))
+            .filter_map(|(&(ar, ac), cl)| cl.spill.map(|(sh, sw)| (ar, ac, sh, sw)))
+            .filter(|&(ar, ac, sh, sw)| {
+                (ar, ac) != (r, c) && ar + sh > r && ac < c + bw && ac + sw > c
+            })
+            .collect();
+        let theirs = |rr: u32, cc: u32| {
+            foreign
+                .iter()
+                .any(|&(ar, ac, sh, sw)| rr >= ar && rr < ar + sh && cc >= ac && cc < ac + sw)
+        };
         let blocked = off_grid
             || (r..r + h).any(|rr| {
                 (c..c + w).any(|cc| {
-                    (rr, cc) != (r, c) && sheet.cell(rr, cc).is_some_and(|cl| cl.formula.is_some())
+                    (rr, cc) != (r, c)
+                        && (theirs(rr, cc)
+                            || sheet.cell(rr, cc).is_some_and(|cl| cl.formula.is_some()))
                 })
             });
         let mut changed = Vec::new();
         if blocked {
-            changed.extend(clear_spill(sheet, s, (r, c), old, None));
+            // Clear what this block wrote before (its old extent), but never
+            // another anchor's spilled cells.
+            for rr in r..r + old.0 {
+                for cc in c..c + old.1 {
+                    if (rr, cc) == (r, c) || theirs(rr, cc) {
+                        continue;
+                    }
+                    if sheet
+                        .cell(rr, cc)
+                        .is_some_and(|cl| cl.formula.is_none() && !cl.value.is_empty())
+                    {
+                        sheet.clear_cell(rr, cc);
+                        changed.push((s, rr, cc));
+                    }
+                }
+            }
             let entry = sheet.cells.entry((r, c)).or_default();
             entry.value = value_to_cell(cse_at(&m, 0, 0));
             entry.spill = None;
