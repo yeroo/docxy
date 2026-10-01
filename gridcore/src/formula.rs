@@ -5571,7 +5571,19 @@ fn array_valued(e: &Expr, root: bool) -> bool {
         Expr::Range(a, b) => !single(a, b),
         Expr::ColRange { .. } | Expr::RowRange { .. } | Expr::SpillRef(_) => true,
         Expr::ArrayLit(rows) => rows.len() * rows.first().map_or(0, Vec::len) > 1,
-        Expr::Structured { item, .. } => *item != TableItem::ThisRow,
+        // A this-row ref, and a header or totals cell of one column, is a
+        // single cell.
+        Expr::Structured {
+            item, col1, col2, ..
+        } => match item {
+            TableItem::ThisRow => false,
+            TableItem::Headers | TableItem::Totals => match (col1, col2) {
+                (Some(_), None) => false,
+                (Some(a), Some(b)) => !a.eq_ignore_ascii_case(b),
+                (None, _) => true,
+            },
+            TableItem::Data | TableItem::All => true,
+        },
         Expr::Un(UnOp::Implicit, _) => false,
         Expr::Un(_, x) => array_valued(x, false),
         Expr::Bin(_, a, b) => array_valued(a, false) || array_valued(b, false),
@@ -14315,6 +14327,8 @@ mod tests {
             "A1#",
             "{1,2}",
             "Sales[Qty]",
+            "Sales[[#Totals],[Qty]:[Price]]",
+            "Sales[#Headers]",
             "A1:A3*2",
             "-A1:A3",
             "SEQUENCE(1)*2",
@@ -14354,6 +14368,10 @@ mod tests {
             "XLOOKUP(2,A1:A3,A1:A3)",
             "IF(A1:A3>1,1,2)",
             "IFERROR(A1,A2)",
+            "Sales[[#Totals],[Qty]]",
+            "Sales[[#Headers],[Qty]]",
+            "Sales[[#Totals],[Qty]]*2",
+            "Sales[[#Totals],[Qty]:[Qty]]",
             "MyRange",
             "LAMBDA(x,x)(A1)",
             "Sheet1:Sheet3!A1",
