@@ -11324,7 +11324,7 @@ mod tests {
         assert_eq!(app.sheet().cell(0, 2).unwrap().spill, Some((3, 1)));
         let (_, ws) = saved_sheet1(&app);
         assert!(
-            ws.contains(r#"<c r="C1" cm="1"><f t="array" ref="C1:C3">SEQUENCE(3)</f>"#),
+            ws.contains(r#"<c r="C1" cm="1"><f t="array" ref="C1:C3">_xlfn.SEQUENCE(3)</f>"#),
             "{ws}"
         );
     }
