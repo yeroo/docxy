@@ -1353,6 +1353,9 @@ impl Session {
         self.dispatch(&format!("set\t{r}\t{c}\t{text}"));
         self.active = prev_active;
         if let Some(e) = self.err.take() {
+            if e == PART_OF_ARRAY {
+                return Err(format!("cell.set: {PART_OF_ARRAY}"));
+            }
             return Err(e);
         }
         let s = &self.pkg.workbook.sheets[si];
@@ -3731,6 +3734,15 @@ mod tests {
         let out = s.ctl(r#"{"verb":"range.clear","args":{"range":"D2:D3"}}"#);
         assert!(
             out.contains("range.clear: You can't change part of an array.")
+                && !out.contains("\"ok\":true"),
+            "{out}"
+        );
+        assert_eq!(s.pkg.workbook.sheets[0].cells, before);
+        assert!(s.undo.is_empty() && !s.dirty && s.err.is_none());
+        // r9: so does the agent's cell.set, in the same form.
+        let out = s.ctl(r#"{"verb":"cell.set","args":{"ref":"D2","text":"9"}}"#);
+        assert!(
+            out.contains("cell.set: You can't change part of an array.")
                 && !out.contains("\"ok\":true"),
             "{out}"
         );

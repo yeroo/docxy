@@ -269,10 +269,11 @@ impl Engine {
     /// it would never recompute the cached value, or re-spill the cached
     /// block, that a re-entry clears, so only its style is taken.
     ///
-    /// A plain value or blank that would change a cell inside an evaluated
-    /// legacy CSE block's `ref` (not its anchor) is refused, as in Excel
-    /// ([`PART_OF_ARRAY`]): nothing changes, style included, and this returns
-    /// false. True when the edit was applied.
+    /// Any plain value or blank written into a non-anchor cell of an
+    /// evaluated legacy CSE block's `ref` is refused, whatever the cell holds,
+    /// as in Excel ([`PART_OF_ARRAY`]): nothing changes, style included, and
+    /// this returns false. A write over a formula already in the block is not
+    /// refused (it frees the block). True when the edit was applied.
     pub fn set_cell(&mut self, wb: &mut Workbook, key: Key, cell: Cell) -> bool {
         self.type_cell(wb, key, cell, true, true)
     }
@@ -341,7 +342,7 @@ impl Engine {
     }
 
     /// Apply a group of edits to sheet `s` (a paste, a fill, a replace-all)
-    /// through [`Engine::set_cell`], in order, except that the blanks landing
+    /// as [`Engine::set_cell`] types each cell, in order, except that the blanks landing
     /// in a frozen anchor's block go last. Such a blank is a no-op while the
     /// block is whole (`put_cell`), but content the group puts into the same
     /// block breaks it, and then the blank clears its cell like any other:
@@ -477,9 +478,11 @@ impl Engine {
     /// Would a fill that writes every cell of `dest` on sheet `s` (a drag
     /// fill's destination: `autofill` writes the cells itself) change part
     /// of an evaluated legacy CSE block? Any non-anchor cell of a block's
-    /// `ref` inside `dest` counts, unless `dest` also takes the block's
-    /// anchor. The fill's source is not written, so an anchor there is not
-    /// replaced.
+    /// `ref` inside `dest` counts, unless `dest` holds the block's whole
+    /// `ref`: `autofill` writes straight into the sheet and never clears an
+    /// old block's cells outside `dest`, so only a fill over all of it
+    /// replaces it. The fill's source is not written, so an anchor there is
+    /// not replaced.
     pub fn refuses_area(&self, wb: &Workbook, s: usize, dest: (u32, u32, u32, u32)) -> bool {
         let (r1, c1, r2, c2) = dest;
         let inside = |r: u32, c: u32| (r1..=r2).contains(&r) && (c1..=c2).contains(&c);
@@ -488,7 +491,8 @@ impl Engine {
             // Some cell of the block but its anchor lies in the area.
             let takes_part = (r1.max(ar)..=r2.min(er))
                 .any(|r| (c1.max(ac)..=c2.min(ec)).any(|c| (r, c) != (ar, ac)));
-            takes_part && !inside(ar, ac) && !self.is_frozen(wb, (s, ar, ac))
+            let whole = inside(ar, ac) && inside(er, ec);
+            takes_part && !whole && !self.is_frozen(wb, (s, ar, ac))
         })
     }
 
@@ -657,8 +661,9 @@ impl Engine {
     ///
     /// A paste that would change part of an evaluated legacy CSE block is
     /// refused whole ([`Engine::refuses_paste`]): nothing is written and this
-    /// returns false. One that lands on such a block's anchor replaces the
-    /// block, the anchor first.
+    /// returns false. One that replaces such a block's anchor replaces the
+    /// block, the anchor first: a plain cell there, a formula with other
+    /// text, or the block restored in place ([`Engine::refuses_paste`]).
     pub fn paste_block(
         &mut self,
         wb: &mut Workbook,
@@ -784,11 +789,13 @@ impl Engine {
     /// content landing there drops the anchor's extent, the other cached
     /// cells staying as plain values.
     ///
-    /// With `refuse`, a plain value or blank that would change a non-anchor
-    /// cell of an evaluated legacy CSE block's `ref` is refused, as Excel
-    /// refuses to change part of an array: nothing changes and this returns
-    /// false. Typing and pastes refuse ([`Engine::refuses`] checks a group
-    /// first); a restored snapshot does not.
+    /// With `refuse`, a plain value or blank written into a non-anchor cell
+    /// of an evaluated legacy CSE block's `ref` is refused by the group rule
+    /// ([`Engine::refuses`]), as Excel refuses to change part of an array:
+    /// nothing changes and this returns false. A cell typed alone
+    /// ([`Engine::set_cell`]) refuses; a group checked whole
+    /// ([`Engine::set_cells_prechecked`], [`Engine::paste_block_prechecked`])
+    /// does not, nor does a restored snapshot.
     fn put_cell(&mut self, wb: &mut Workbook, key: Key, mut cell: Cell, refuse: bool) -> bool {
         cell.spill = None;
         let (s, r, c) = key;
@@ -1462,7 +1469,8 @@ impl Engine {
     ///
     /// The block owns every plain value in its `ref`, as in Excel, which
     /// refuses to change part of an array: a value typed or pasted into a
-    /// block cell never lands ([`Engine::put_cell`] refuses it). One that
+    /// block cell never lands ([`Engine::refuses`], [`Engine::refuses_paste`]
+    /// refuse it). One that
     /// reaches the `ref` another way is refilled by the block: loaded there,
     /// shifted into a grown `ref` by an insert, restored by an undo, or left
     /// by a blocking formula that is replaced. A formula in a block cell, or a cell inside
@@ -3852,8 +3860,22 @@ mod tests {
         assert!(eng.refuses_area(&wb, 0, (2, 3, 3, 3)));
         // Below the block (D5:D6): nothing of it is written.
         assert!(!eng.refuses_area(&wb, 0, (4, 3, 5, 3)));
-        // A destination that takes the anchor replaces the block.
+        // A destination that takes the whole block replaces it.
         assert!(!eng.refuses_area(&wb, 0, (1, 3, 5, 3)));
+    }
+
+    #[test]
+    fn a_fill_over_the_anchor_but_not_the_whole_block_is_refused() {
+        // r9: block D3:D8, fill destination D3:D6. `autofill` would replace
+        // the anchor but leave D7:D8 of the old block behind: refused. All
+        // of D3:D8 in the destination is not.
+        let mut d3 = Cell::formula("A1*2");
+        d3.f_attrs = Some(" t=\"array\" ref=\"D3:D8\"".to_string());
+        let mut wb = wb_one_sheet(&[("A1", Cell::number(1.0)), ("D3", d3)]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert!(eng.refuses_area(&wb, 0, (2, 3, 5, 3)));
+        assert!(!eng.refuses_area(&wb, 0, (2, 3, 7, 3)));
     }
 
     #[test]
@@ -3926,8 +3948,12 @@ mod tests {
             let block = copy_block(&wb, (0, 3), (2, 3));
             if cut {
                 cut_d1_d3(&mut eng, &mut wb);
+            } else {
+                // r9: restored in place, the block replaces its own anchor,
+                // so the paste over the live block is not refused.
+                assert!(!eng.refuses_paste(&wb, 0, (0, 3), &block, &[]));
             }
-            eng.paste_block(&mut wb, 0, (0, 3), &block);
+            assert!(eng.paste_block(&mut wb, 0, (0, 3), &block));
             assert_spills(&wb, "D1");
             let d1 = cell_at(&wb, "D1");
             assert_eq!(
