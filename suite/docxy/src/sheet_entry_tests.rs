@@ -1236,3 +1236,30 @@ fn clearing_part_of_an_array_is_refused_but_not_all_of_it() {
     assert!(!v.refuses(s, &all));
     assert!(v.entry_error.is_none());
 }
+
+#[test]
+fn a_drag_fill_from_a_source_holding_the_anchor_is_refused() {
+    // r8 M2: D1 = 5 and a block anchored at D2 over D2:D4. D1:D2 dragged
+    // down to D6 writes D3:D6 only: the anchor stays in the source, so the
+    // fill writes into part of the block and is refused.
+    let mut v = view();
+    let s = v.active;
+    let sheet = &mut v.pkg.workbook.sheets[s];
+    sheet.set_cell(0, 0, Cell::number(1.0));
+    sheet.set_cell(0, 3, Cell::number(5.0));
+    let mut d2 = Cell::formula("A1*2");
+    d2.f_attrs = Some(" t=\"array\" ref=\"D2:D4\"".into());
+    sheet.set_cell(1, 3, d2);
+    v.engine = sheet_engine(&v.pkg.workbook);
+    v.engine.recalc_all(&mut v.pkg.workbook);
+    let src = (0, 3, 1, 3);
+    let bx = fill_box(src, (5, 3));
+    assert_eq!(bx, (0, 3, 5, 3));
+    let dest = fill_dest(src, bx);
+    assert_eq!(dest, (2, 3, 5, 3));
+    assert!(v.engine.refuses_area(&v.pkg.workbook, s, dest));
+    // The whole box would count the anchor as replaced: the r7 bug.
+    assert!(!v.engine.refuses_area(&v.pkg.workbook, s, bx));
+    // Right: the columns past the source.
+    assert_eq!(fill_dest((0, 0, 1, 1), (0, 0, 1, 4)), (0, 2, 1, 4));
+}

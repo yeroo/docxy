@@ -1023,6 +1023,18 @@ fn fill_box(src: (u32, u32, u32, u32), to: (u32, u32)) -> (u32, u32, u32, u32) {
     }
 }
 
+/// The cells a drag fill from `src` over `bx` ([`fill_box`]) writes: the rows
+/// below the source, or the columns right of it (`gridcore::edit::autofill`).
+fn fill_dest(src: (u32, u32, u32, u32), bx: (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
+    let (_, sc0, sr1, sc1) = src;
+    let (br0, _, br1, bc1) = bx;
+    if br1 > sr1 {
+        (sr1 + 1, sc0, br1, sc1)
+    } else {
+        (br0, sc1 + 1, br1, bc1)
+    }
+}
+
 /// The grid clipboard: a rectangular block of cells copied from a sheet.
 #[derive(Clone)]
 struct GridClip {
@@ -1477,8 +1489,9 @@ impl SheetView {
     /// Commit the cell buffer without moving the selection, including undo/recalc.
     /// An entry the cell cannot hold (over 32,767 characters) or a formula
     /// that does not parse (`=SUM(A1`, [`SheetView::formula_error`]) is
-    /// refused: the editor stays open with its text and
-    /// [`SheetView::entry_error`] says why.
+    /// refused, and so is one that would change part of an array
+    /// ([`gridcore::engine::PART_OF_ARRAY`]): the editor stays open with its
+    /// text and [`SheetView::entry_error`] says why.
     fn commit_edit(&mut self) -> bool {
         self.entry_error = None;
         let untouched = self.edit_untouched();
@@ -2043,13 +2056,15 @@ impl SheetView {
         self.end_cell_edit();
         self.push_undo();
         if let Some(cells) = cells {
-            self.engine.set_cells(&mut self.pkg.workbook, s, cells);
+            self.engine
+                .set_cells_prechecked(&mut self.pkg.workbook, s, cells);
         }
         true
     }
 
     /// Ctrl+D / Ctrl+R over the selection (one undo step). False when there
-    /// was nothing to fill.
+    /// was nothing to fill, or the fill was refused as part of an array
+    /// ([`SheetView::entry_error`] says so).
     fn fill_selection(&mut self, down: bool) -> bool {
         let changes = gridcore::edit::fill_changes(self.sheet(), self.range(), down);
         if changes.is_empty() || self.refuses(self.active, &changes) {
@@ -2057,7 +2072,8 @@ impl SheetView {
         }
         self.push_undo();
         let s = self.active;
-        self.engine.set_cells(&mut self.pkg.workbook, s, changes);
+        self.engine
+            .set_cells_prechecked(&mut self.pkg.workbook, s, changes);
         true
     }
 
@@ -9511,11 +9527,11 @@ impl Docxy {
             return;
         }
         // A fill over part of an array is refused whole. `autofill` writes
-        // the cells itself, so the box is asked as an area.
+        // the destination's cells itself, so that area is asked; an anchor in
+        // the source is not rewritten, so it is not replaced.
+        let dest = fill_dest(f.src, (br0, bc0, br1, bc1));
         if self.active_sheet_mut().is_some_and(|v| {
-            let refused = v
-                .engine
-                .refuses_area(&v.pkg.workbook, v.active, (br0, bc0, br1, bc1));
+            let refused = v.engine.refuses_area(&v.pkg.workbook, v.active, dest);
             if refused {
                 v.entry_error = Some(gridcore::engine::PART_OF_ARRAY.to_string());
             }
@@ -10083,7 +10099,8 @@ impl Docxy {
         if let Some(v) = self.active_sheet_mut() {
             let s = v.active;
             let changes = v.clear_changes();
-            v.engine.set_cells(&mut v.pkg.workbook, s, changes);
+            v.engine
+                .set_cells_prechecked(&mut v.pkg.workbook, s, changes);
         }
         self.mark_sheet_dirty();
         cx.notify();
@@ -10225,7 +10242,7 @@ impl Docxy {
             // A pasted spilling array still spills, and an array block
             // pasted back in place keeps its block (`Engine::paste_block`).
             v.engine
-                .paste_block(&mut v.pkg.workbook, s, (br, bc), &block);
+                .paste_block_prechecked(&mut v.pkg.workbook, s, (br, bc), &block);
             let h = block.len() as u32;
             let w = block.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
             if h > 0 && w > 0 {
