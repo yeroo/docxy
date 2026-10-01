@@ -554,7 +554,7 @@ fn changed_commit_still_parses_and_records_undo() {
         assert!(v.redo.is_empty());
         assert_eq!(v.sheet().cell(0, 0).map(|c| &c.value), Some(&expected));
         assert_eq!(
-            v.undo[0].wb.sheets[v.active].cell(0, 0),
+            v.undo[0].workbook().sheets[v.active].cell(0, 0),
             Some(&Cell::text("007"))
         );
     }

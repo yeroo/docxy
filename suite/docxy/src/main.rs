@@ -587,7 +587,7 @@ const PIVOT_AGGS: [(gridcore::frame::Agg, &str); 6] = [
 
 /// A point-in-time snapshot of a spreadsheet for undo/redo.
 struct SheetSnapshot {
-    wb: gridcore::sheet::Workbook,
+    body: SnapshotBody,
     /// UI-authored charts live outside the workbook, so undoing a chart move,
     /// delete or re-point needs them snapshotted alongside it.
     charts: Vec<ChartView>,
@@ -598,6 +598,29 @@ struct SheetSnapshot {
     active: usize,
     sel: (u32, u32),
     anchor: (u32, u32),
+}
+
+/// What an undo step puts back of the package.
+enum SnapshotBody {
+    /// The workbook model alone: enough for an edit that changes only cells,
+    /// styles and the like, and cheap.
+    Workbook(gridcore::sheet::Workbook),
+    /// The whole package, for an edit that changes its parts: adding or
+    /// removing a sheet (its part, relationship and `<sheet>` element), or a
+    /// comment. Restoring only the model over the changed parts would pair
+    /// sheets with the wrong parts at save (#789).
+    Package(Box<gridcore::xlsx::SheetPackage>),
+}
+
+impl SheetSnapshot {
+    /// The workbook this step restores.
+    #[cfg(test)]
+    fn workbook(&self) -> &gridcore::sheet::Workbook {
+        match &self.body {
+            SnapshotBody::Workbook(wb) => wb,
+            SnapshotBody::Package(pkg) => &pkg.workbook,
+        }
+    }
 }
 
 /// An in-progress column-resize drag: which column, and the mouse-x + width it
@@ -1293,6 +1316,163 @@ impl SheetView {
     /// Snapshot before a mutation; share the history limit across all edits.
     fn push_undo(&mut self) {
         self.push_undo_snapshot(self.snapshot());
+    }
+
+    /// Undo one step: the current state goes on the redo stack, taken the
+    /// same way as the step (a package step's redo restores the parts too).
+    /// Returns whether there was a step.
+    fn undo_step(&mut self) -> bool {
+        let Some(snap) = self.undo.pop() else {
+            return false;
+        };
+        let now = self.snapshot_like(&snap);
+        self.redo.push(now);
+        self.restore(snap);
+        true
+    }
+
+    /// Redo one step, the mirror of [`Self::undo_step`].
+    fn redo_step(&mut self) -> bool {
+        let Some(snap) = self.redo.pop() else {
+            return false;
+        };
+        let now = self.snapshot_like(&snap);
+        self.undo.push(now);
+        self.restore(snap);
+        true
+    }
+
+    /// The current state, taken as `snap` was: the package when it holds one.
+    fn snapshot_like(&self, snap: &SheetSnapshot) -> SheetSnapshot {
+        match snap.body {
+            SnapshotBody::Workbook(_) => self.snapshot(),
+            SnapshotBody::Package(_) => self.snapshot_package(),
+        }
+    }
+
+    /// Set the selected cell's comment to `text` by `author` (blank deletes
+    /// it), as one undo step of the whole package: a comment lives in the
+    /// parts (its part, VML, rels and content type), so a model-only step
+    /// could not undo it, and a later package step's undo would silently
+    /// take it away. False when the sheet's XML refuses it: nothing changed
+    /// and there is no step.
+    fn comment_cell(&mut self, author: &str, text: &str) -> bool {
+        let t = text.trim();
+        if t.is_empty() {
+            self.delete_comment();
+            return true;
+        }
+        let snap = self.snapshot_package();
+        let ((r, c), s) = (self.sel, self.active);
+        if !self.pkg.set_comment(s, r, c, author, t) {
+            return false;
+        }
+        self.push_undo_snapshot(snap);
+        true
+    }
+
+    /// Delete the comment on the selected cell, as one undo step of the whole
+    /// package (see [`Self::comment_cell`]). No comment there, no step.
+    fn delete_comment(&mut self) {
+        let ((r, c), s) = (self.sel, self.active);
+        let here = |cm: &gridcore::comments::Comment| cm.sheet == s && cm.row == r && cm.col == c;
+        if !self.pkg.comments().iter().any(here) {
+            return;
+        }
+        self.push_undo_snapshot(self.snapshot_package());
+        self.pkg.remove_comment(s, r, c);
+    }
+
+    /// The lowest "SheetN" (counting from one past the sheet count) no sheet
+    /// has yet, case-insensitively.
+    fn next_sheet_name(&self) -> String {
+        let sheets = &self.pkg.workbook.sheets;
+        (sheets.len() + 1..)
+            .map(|n| format!("Sheet{n}"))
+            .find(|name| !sheets.iter().any(|s| s.name.eq_ignore_ascii_case(name)))
+            .expect("an unused sheet name")
+    }
+
+    /// Add sheet `name` (its part, relationship and `<sheet>` element, as
+    /// [`gridcore::xlsx::SheetPackage::add_sheet`] does) as one undo step,
+    /// and switch to it. Returns its index.
+    fn add_sheet(&mut self, name: &str) -> usize {
+        self.push_undo_snapshot(self.snapshot_package());
+        let idx = self.pkg.add_sheet(name);
+        self.active = idx;
+        self.sel = (0, 0);
+        self.anchor = (0, 0);
+        self.end_cell_edit();
+        self.engine = sheet_engine(&self.pkg.workbook);
+        idx
+    }
+
+    /// Add the output sheet ("Pivot", "Pivot2", …) for pivot `d` and switch
+    /// to it, as one undo step with the pivot view; the caller computes the
+    /// table onto it. Returns the sheet's index.
+    fn add_pivot_sheet(&mut self, mut d: PivotDef) -> usize {
+        let n = self
+            .pkg
+            .workbook
+            .sheets
+            .iter()
+            .filter(|s| s.name.starts_with("Pivot"))
+            .count();
+        let name = if n == 0 {
+            "Pivot".to_string()
+        } else {
+            format!("Pivot{}", n + 1)
+        };
+        // add_sheet wires the OPC part + workbook entry so the sheet saves.
+        let idx = self.add_sheet(&name);
+        d.out_sheet = idx;
+        self.pivot_views.push(d);
+        idx
+    }
+
+    /// Delete sheet `idx` as one undo step, never the last sheet: its part
+    /// and what only it used go with it, and the pivot views, charts and the
+    /// active index above it shift down. Returns whether it was deleted; a
+    /// refusal leaves no undo step.
+    fn delete_sheet(&mut self, idx: usize) -> bool {
+        let count = self.pkg.workbook.sheets.len();
+        if count <= 1 || idx >= count {
+            return false;
+        }
+        let snap = self.snapshot_package();
+        if !self.pkg.remove_sheet(idx) {
+            return false;
+        }
+        self.push_undo_snapshot(snap);
+        // Drop views on the removed sheet; shift indices above it down one.
+        self.pivot_views.retain(|d| d.out_sheet != idx);
+        for d in &mut self.pivot_views {
+            if d.out_sheet > idx {
+                d.out_sheet -= 1;
+            }
+            if d.src_sheet > idx {
+                d.src_sheet -= 1;
+            }
+        }
+        self.charts.retain(|c| c.sheet != idx);
+        for c in &mut self.charts {
+            if c.sheet > idx {
+                c.sheet -= 1;
+            }
+        }
+        // Deleting a sheet BELOW the active one shifts it down by one;
+        // clamping alone would silently leave the view on its neighbour.
+        if idx < self.active {
+            self.active -= 1;
+        }
+        if self.active >= self.pkg.workbook.sheets.len() {
+            self.active = self.pkg.workbook.sheets.len() - 1;
+        }
+        self.sel = (0, 0);
+        self.anchor = (0, 0);
+        self.end_cell_edit();
+        self.engine = sheet_engine(&self.pkg.workbook);
+        true
     }
 
     /// Add a chart the user inserted, with its undo step. It is written only
@@ -2044,8 +2224,18 @@ impl SheetView {
     /// Capture this view's undoable state — the workbook plus everything the UI
     /// keeps beside it that a mutation can move.
     fn snapshot(&self) -> SheetSnapshot {
+        self.snapshot_with(SnapshotBody::Workbook(self.pkg.workbook.clone()))
+    }
+
+    /// [`Self::snapshot`] with the whole package, for an edit that changes
+    /// its parts ([`SnapshotBody::Package`]).
+    fn snapshot_package(&self) -> SheetSnapshot {
+        self.snapshot_with(SnapshotBody::Package(Box::new(self.pkg.clone())))
+    }
+
+    fn snapshot_with(&self, body: SnapshotBody) -> SheetSnapshot {
         SheetSnapshot {
-            wb: self.pkg.workbook.clone(),
+            body,
             charts: self.charts.clone(),
             pivots: self.pivot_views.clone(),
             active: self.active,
@@ -2056,7 +2246,10 @@ impl SheetView {
 
     /// Restore this view from an undo/redo snapshot, rebuilding the recalc engine.
     fn restore(&mut self, snap: SheetSnapshot) {
-        self.pkg.workbook = snap.wb;
+        match snap.body {
+            SnapshotBody::Workbook(wb) => self.pkg.workbook = wb,
+            SnapshotBody::Package(pkg) => self.pkg = *pkg,
+        }
         self.charts = snap.charts;
         self.pivot_views = snap.pivots;
         self.engine = sheet_engine(&self.pkg.workbook);
@@ -9432,26 +9625,9 @@ impl Docxy {
 
     /// Add a new blank sheet (unique "SheetN" name) and switch to it.
     fn sheet_add(&mut self, cx: &mut Context<Self>) {
-        self.sheet_snapshot();
         if let Some(v) = self.active_sheet_mut() {
-            // Pick the lowest "SheetN" not already taken.
-            let mut n = v.pkg.workbook.sheets.len() + 1;
-            let taken = |v: &SheetView, name: &str| {
-                v.pkg
-                    .workbook
-                    .sheets
-                    .iter()
-                    .any(|s| s.name.eq_ignore_ascii_case(name))
-            };
-            while taken(v, &format!("Sheet{n}")) {
-                n += 1;
-            }
-            let idx = v.pkg.add_sheet(&format!("Sheet{n}"));
-            v.active = idx;
-            v.sel = (0, 0);
-            v.anchor = (0, 0);
-            v.end_cell_edit();
-            v.engine = sheet_engine(&v.pkg.workbook);
+            let name = v.next_sheet_name();
+            v.add_sheet(&name);
         }
         // We just switched sheets, same as `select_sheet`.
         self.drop_grid_state();
@@ -9464,45 +9640,8 @@ impl Docxy {
     fn sheet_delete(&mut self, idx: usize, cx: &mut Context<Self>) {
         // Clicking × on a lone sheet does nothing — and must not spend an undo
         // step doing it, which would also throw away the redo stack.
-        if self
-            .active_sheet()
-            .is_none_or(|v| v.pkg.workbook.sheets.len() <= 1 || idx >= v.pkg.workbook.sheets.len())
-        {
+        if !self.active_sheet_mut().is_some_and(|v| v.delete_sheet(idx)) {
             return;
-        }
-        self.sheet_snapshot();
-        if let Some(v) = self.active_sheet_mut() {
-            if !v.pkg.remove_sheet(idx) {
-                return;
-            }
-            // Drop views on the removed sheet; shift indices above it down one.
-            v.pivot_views.retain(|d| d.out_sheet != idx);
-            for d in &mut v.pivot_views {
-                if d.out_sheet > idx {
-                    d.out_sheet -= 1;
-                }
-                if d.src_sheet > idx {
-                    d.src_sheet -= 1;
-                }
-            }
-            v.charts.retain(|c| c.sheet != idx);
-            for c in &mut v.charts {
-                if c.sheet > idx {
-                    c.sheet -= 1;
-                }
-            }
-            // Deleting a sheet BELOW the active one shifts it down by one;
-            // clamping alone would silently leave the view on its neighbour.
-            if idx < v.active {
-                v.active -= 1;
-            }
-            if v.active >= v.pkg.workbook.sheets.len() {
-                v.active = v.pkg.workbook.sheets.len() - 1;
-            }
-            v.sel = (0, 0);
-            v.anchor = (0, 0);
-            v.end_cell_edit();
-            v.engine = sheet_engine(&v.pkg.workbook);
         }
         // The chart list was just re-indexed and the view may have moved.
         self.drop_grid_state();
@@ -9763,16 +9902,7 @@ impl Docxy {
     }
 
     fn sheet_undo(&mut self, cx: &mut Context<Self>) {
-        let mut done = false;
-        if let Some(v) = self.active_sheet_mut() {
-            if let Some(snap) = v.undo.pop() {
-                let now = v.snapshot();
-                v.redo.push(now);
-                v.restore(snap);
-                done = true;
-            }
-        }
-        if done {
+        if self.active_sheet_mut().is_some_and(|v| v.undo_step()) {
             // The chart list just changed under it, so an index into it means
             // something else now.
             self.chart_drop_selection();
@@ -9782,16 +9912,7 @@ impl Docxy {
     }
 
     fn sheet_redo(&mut self, cx: &mut Context<Self>) {
-        let mut done = false;
-        if let Some(v) = self.active_sheet_mut() {
-            if let Some(snap) = v.redo.pop() {
-                let now = v.snapshot();
-                v.undo.push(now);
-                v.restore(snap);
-                done = true;
-            }
-        }
-        if done {
+        if self.active_sheet_mut().is_some_and(|v| v.redo_step()) {
             self.chart_drop_selection();
             self.mark_sheet_dirty();
         }
@@ -10440,25 +10561,14 @@ impl Docxy {
             return;
         };
         let author = Self::comment_author();
-        self.sheet_try_edit(false, |v| {
-            let (r, c) = v.sel;
-            let s = v.active;
-            let t = text.trim();
-            if t.is_empty() {
-                v.pkg.remove_comment(s, r, c);
-                true
-            } else {
-                v.pkg.set_comment(s, r, c, &author, t)
-            }
-        });
+        // The view takes the undo step itself: the whole package.
+        self.sheet_try_edit(false, |v| v.comment_cell(&author, &text));
         cx.notify();
     }
 
     fn sheet_delete_comment(&mut self, cx: &mut Context<Self>) {
         if let Some(v) = self.active_sheet_mut() {
-            let (r, c) = v.sel;
-            let s = v.active;
-            v.pkg.remove_comment(s, r, c);
+            v.delete_comment();
         }
         self.mark_sheet_dirty();
         cx.notify();
@@ -11113,7 +11223,6 @@ impl Docxy {
     fn sheet_insert_pivot(&mut self, cx: &mut Context<Self>) {
         use gridcore::frame::Frame;
         use gridcore::sheet::CellValue;
-        self.sheet_snapshot();
         let mut def: Option<PivotDef> = None;
         if let Some(v) = self.active_sheet() {
             let s = v.active;
@@ -11156,27 +11265,9 @@ impl Docxy {
                 agg,
             });
         }
-        if let Some(mut d) = def {
+        if let Some(d) = def {
             if let Some(v) = self.active_sheet_mut() {
-                let n = v
-                    .pkg
-                    .workbook
-                    .sheets
-                    .iter()
-                    .filter(|s| s.name.starts_with("Pivot"))
-                    .count();
-                let name = if n == 0 {
-                    "Pivot".to_string()
-                } else {
-                    format!("Pivot{}", n + 1)
-                };
-                // add_sheet wires the OPC part + workbook entry so the sheet saves.
-                d.out_sheet = v.pkg.add_sheet(&name);
-                v.active = d.out_sheet;
-                v.pivot_views.push(d);
-                v.sel = (0, 0);
-                v.anchor = (0, 0);
-                v.end_cell_edit();
+                v.add_pivot_sheet(d);
             }
             // A brand-new sheet, so the chart selection and any open field are
             // pointing at the one we came from.
@@ -16268,6 +16359,211 @@ mod sheet_save_tests {
             }
         }
         assert!(!original.exists());
+    }
+
+    /// A sheet tab over a workbook of `Sheet1`, `Two` and `Three`, holding 1,
+    /// 2 and 3 in A1.
+    fn three_sheet_tab() -> DocTab {
+        let mut tab = sheet_tab(None, "Untitled.xlsx");
+        let Surface::Sheet(v) = &mut tab.surface else {
+            unreachable!()
+        };
+        v.pkg.add_sheet("Two");
+        v.pkg.add_sheet("Three");
+        for (i, sheet) in v.pkg.workbook.sheets.iter_mut().enumerate() {
+            sheet.set_cell(0, 0, gridcore::sheet::Cell::number(i as f64 + 1.0));
+        }
+        tab
+    }
+
+    /// Each sheet's name and A1 as a save of `v` reopens them. A sheet the
+    /// model and the parts disagree on lands in the wrong part, or in none.
+    fn saved_sheets(v: &crate::SheetView) -> Vec<(String, Option<f64>)> {
+        let wb_xml = String::from_utf8_lossy(v.pkg.part("xl/workbook.xml").unwrap()).into_owned();
+        assert_eq!(
+            wb_xml.matches("<sheet ").count(),
+            v.pkg.workbook.sheets.len(),
+            "{wb_xml}"
+        );
+        let saved = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&v.pkg)).unwrap();
+        saved
+            .workbook
+            .sheets
+            .iter()
+            .map(|s| {
+                let a1 = s.cell(0, 0).and_then(|c| match c.value {
+                    gridcore::sheet::CellValue::Number(n) => Some(n),
+                    _ => None,
+                });
+                (s.name.clone(), a1)
+            })
+            .collect()
+    }
+
+    fn sheets(list: &[(&str, f64)]) -> Vec<(String, Option<f64>)> {
+        list.iter()
+            .map(|&(n, a1)| (n.to_string(), Some(a1)))
+            .collect()
+    }
+
+    /// #789 (r1-pre1): undoing a sheet delete puts its part back with it, so
+    /// every sheet saves into its own part; redo removes it again.
+    #[test]
+    fn sheet_delete_undo_redo_keeps_sheets_and_parts_aligned() {
+        let mut tab = three_sheet_tab();
+        let Surface::Sheet(v) = &mut tab.surface else {
+            unreachable!()
+        };
+        let all = sheets(&[("Sheet1", 1.0), ("Two", 2.0), ("Three", 3.0)]);
+        let without = sheets(&[("Sheet1", 1.0), ("Three", 3.0)]);
+        assert_eq!(saved_sheets(v), all);
+        v.active = 2;
+        assert!(v.delete_sheet(1));
+        assert_eq!(v.active, 1, "the view stays on Three");
+        assert_eq!(saved_sheets(v), without);
+        assert!(v.undo_step());
+        assert_eq!(saved_sheets(v), all);
+        assert_eq!(v.active, 2);
+        assert!(v.redo_step());
+        assert_eq!(saved_sheets(v), without);
+        assert!(v.undo_step());
+        assert_eq!(saved_sheets(v), all);
+        assert!(!v.undo_step());
+
+        // Out of range, or the last sheet: refused, with no undo step.
+        assert!(!v.delete_sheet(3));
+        assert!(v.undo.is_empty());
+        let mut lone = sheet_tab(None, "Untitled.xlsx");
+        let Surface::Sheet(lone) = &mut lone.surface else {
+            unreachable!()
+        };
+        assert!(!lone.delete_sheet(0));
+        assert!(lone.undo.is_empty());
+    }
+
+    /// #789: an added sheet is undone with its part, relationship and
+    /// `<sheet>` element, not only out of the model.
+    #[test]
+    fn sheet_add_undo_redo_keeps_sheets_and_parts_aligned() {
+        let mut tab = three_sheet_tab();
+        let Surface::Sheet(v) = &mut tab.surface else {
+            unreachable!()
+        };
+        let name = v.next_sheet_name();
+        assert_eq!(name, "Sheet4");
+        assert_eq!(v.add_sheet(&name), 3);
+        assert_eq!(v.active, 3);
+        v.pkg.workbook.sheets[3].set_cell(0, 0, gridcore::sheet::Cell::number(4.0));
+        let four = sheets(&[
+            ("Sheet1", 1.0),
+            ("Two", 2.0),
+            ("Three", 3.0),
+            ("Sheet4", 4.0),
+        ]);
+        assert_eq!(saved_sheets(v), four);
+        assert!(v.undo_step());
+        assert_eq!(
+            saved_sheets(v),
+            sheets(&[("Sheet1", 1.0), ("Two", 2.0), ("Three", 3.0)])
+        );
+        assert!(v.redo_step());
+        assert_eq!(saved_sheets(v), four);
+    }
+
+    /// #789: a pivot's output sheet is undone with its part and its view.
+    #[test]
+    fn pivot_sheet_undo_redo_keeps_sheets_and_parts_aligned() {
+        let mut tab = three_sheet_tab();
+        let Surface::Sheet(v) = &mut tab.surface else {
+            unreachable!()
+        };
+        let def = crate::PivotDef {
+            src_sheet: 0,
+            src_range: (0, 0, 0, 0),
+            out_sheet: 0,
+            names: vec!["A".into()],
+            role: vec![1],
+            agg: vec![0],
+        };
+        assert_eq!(v.add_pivot_sheet(def), 3);
+        assert_eq!(v.pivot_views.len(), 1);
+        assert_eq!(v.pivot_views[0].out_sheet, 3);
+        v.pkg.workbook.sheets[3].set_cell(0, 0, gridcore::sheet::Cell::number(9.0));
+        let with = sheets(&[
+            ("Sheet1", 1.0),
+            ("Two", 2.0),
+            ("Three", 3.0),
+            ("Pivot", 9.0),
+        ]);
+        assert_eq!(saved_sheets(v), with);
+        assert!(v.undo_step());
+        assert!(v.pivot_views.is_empty());
+        assert_eq!(
+            saved_sheets(v),
+            sheets(&[("Sheet1", 1.0), ("Two", 2.0), ("Three", 3.0)])
+        );
+        assert!(v.redo_step());
+        assert_eq!(v.pivot_views.len(), 1);
+        assert_eq!(saved_sheets(v), with);
+    }
+
+    fn comment_texts(v: &crate::SheetView) -> Vec<(usize, u32, u32, String)> {
+        v.pkg
+            .comments()
+            .into_iter()
+            .map(|c| (c.sheet, c.row, c.col, c.text))
+            .collect()
+    }
+
+    /// #789: a comment is its own undo step, so undoing a sheet delete made
+    /// before it cannot take it away with the package, and a comment made
+    /// after an undo clears the redo that would.
+    #[test]
+    fn comments_are_package_undo_steps_that_survive_sheet_undo() {
+        let mut tab = three_sheet_tab();
+        let Surface::Sheet(v) = &mut tab.surface else {
+            unreachable!()
+        };
+        let note = vec![(0, 0, 0, "check".to_string())];
+
+        // Delete Three, then note Sheet1!A1: the first undo takes the note.
+        assert!(v.delete_sheet(2));
+        v.active = 0;
+        v.sel = (0, 0);
+        assert!(v.comment_cell("me", "check"));
+        assert_eq!(comment_texts(v), note);
+        assert!(v.undo_step());
+        assert!(comment_texts(v).is_empty());
+        assert_eq!(v.pkg.workbook.sheets.len(), 2);
+        // Redo brings it back; undoing both puts Three back.
+        assert!(v.redo_step());
+        assert_eq!(comment_texts(v), note);
+        assert!(v.undo_step());
+        assert!(v.undo_step());
+        assert_eq!(
+            saved_sheets(v),
+            sheets(&[("Sheet1", 1.0), ("Two", 2.0), ("Three", 3.0)])
+        );
+
+        // Delete, undo, then a note: redo is gone, so it cannot drop the note.
+        assert!(v.delete_sheet(2));
+        assert!(v.undo_step());
+        v.active = 0;
+        v.sel = (0, 0);
+        assert!(v.comment_cell("me", "check"));
+        assert!(!v.redo_step());
+        assert_eq!(comment_texts(v), note);
+        assert_eq!(v.pkg.workbook.sheets.len(), 3);
+
+        // Deleting it is a step too; nothing to delete is none.
+        let steps = v.undo.len();
+        v.delete_comment();
+        assert!(comment_texts(v).is_empty());
+        assert_eq!(v.undo.len(), steps + 1);
+        v.delete_comment();
+        assert_eq!(v.undo.len(), steps + 1);
+        assert!(v.undo_step());
+        assert_eq!(comment_texts(v), note);
     }
 }
 
