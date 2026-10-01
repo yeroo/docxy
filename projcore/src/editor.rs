@@ -21,6 +21,7 @@ mod batch;
 mod cells;
 mod effort;
 mod fields;
+mod links;
 pub use assignments::{AssignmentPatch, ResourceRef};
 pub use cells::{
     day_finish, format_duration_exact, format_predecessors, format_resource_names, parse_cell_date,
@@ -380,9 +381,12 @@ impl Editor {
     }
 
     /// Validate newly created/exposed leaves before touching history or UI state.
+    /// An edit that changes the outline drops the links it turns into summary
+    /// links, and is refused when it closes a cycle (see `links`).
     fn edit_structure(&mut self, edit: impl FnOnce(&mut Project)) -> Result<(), String> {
         let mut next = self.proj.clone();
         edit(&mut next);
+        links::follow_outline(&self.proj.tasks, &mut next.tasks)?;
         recompute_summaries(&mut next);
         if let Some(error) = crate::schedule::calendar_error(&next) {
             return Err(error);
