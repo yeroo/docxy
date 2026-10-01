@@ -567,7 +567,7 @@ fn main() -> ExitCode {
         // Read-only (#882): the input is never written, so recalculating in
         // place is refused rather than done.
         if let Some(input) = parsed.inputs.first().filter(|_| parsed.read_only)
-            && same_file(Path::new(input), Path::new(&out))
+            && opccore::fsio::same_file(Path::new(input), Path::new(&out))
         {
             eprintln!("error: {}", read_only_refusal(input));
             return ExitCode::from(2);
@@ -1060,15 +1060,6 @@ fn window_title(app: &str, path: &str, modified: bool, read_only: bool) -> Strin
         if modified { "* " } else { "" },
         if read_only { " [Read-Only]" } else { "" }
     )
-}
-
-/// Whether `a` and `b` name the same existing file. A path that does not
-/// exist is no file of the other's.
-fn same_file(a: &Path, b: &Path) -> bool {
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
 }
 
 /// Excel's refusal to write a file opened read-only (#882).
@@ -1664,9 +1655,11 @@ struct App {
     /// whatever status the edit's caller sets, once the action is done
     /// ([`App::flush_circle_warning`]).
     circle_warning_pending: bool,
-    /// The file opened read-only (`--read-only`, #882), canonical: nothing
-    /// writes it, so Save on it asks for another name. An interactive Open or
-    /// New clears it; a reload of the same file keeps it.
+    /// The file opened read-only (`--read-only`, #882): nothing writes it,
+    /// so Save on it asks for another name. Compared by file identity, so no
+    /// other spelling or link reaches it. Installing another workbook (an
+    /// Open that loads, a finished import, New) clears it; an Open that fails
+    /// or is cancelled, and a reload of the same file, keep it.
     read_only: Option<std::path::PathBuf>,
 }
 
@@ -3121,10 +3114,10 @@ impl App {
         let _ = self.save_current();
     }
 
-    /// Open `source` read-only (#882). A path that cannot be resolved (an
-    /// import's binding is never its source) leaves nothing read-only.
+    /// Open `source` read-only (#882). An import's binding is never its
+    /// source, so for an import nothing is read-only.
     fn set_read_only(&mut self, source: &str) {
-        self.read_only = std::fs::canonicalize(source).ok();
+        self.read_only = Some(std::path::PathBuf::from(source));
     }
 
     /// Whether the workbook is bound to the file it was opened read-only from.
@@ -3135,7 +3128,7 @@ impl App {
     /// Excel's refusal when `target` is the file opened read-only.
     fn refuse_read_only(&self, target: &str) -> Result<(), String> {
         match &self.read_only {
-            Some(src) if std::fs::canonicalize(target).is_ok_and(|t| &t == src) => {
+            Some(src) if opccore::fsio::same_file(src, Path::new(target)) => {
                 Err(read_only_refusal(target))
             }
             _ => Ok(()),
@@ -4376,6 +4369,9 @@ impl App {
         self.pkg = pkg;
         self.forget_clip();
         self.path = p;
+        // Another workbook: whatever was opened read-only is gone (#882).
+        // `reload` puts it back for the same file.
+        self.read_only = None;
         self.import_source = import_source;
         self.template = None;
         self.import_unsaved = false;
@@ -4412,6 +4408,14 @@ impl App {
     /// Formatted Text and Web Page cannot be read back, so reload refuses
     /// them and changes nothing.
     fn reload(&mut self) -> Result<(), String> {
+        // The same file again: a read-only one stays read-only (#882).
+        let read_only = self.read_only.clone();
+        let out = self.reload_from_disk();
+        self.read_only = read_only;
+        out
+    }
+
+    fn reload_from_disk(&mut self) -> Result<(), String> {
         let path = self.path.clone();
         // A workbook started from a template has no file of its own until
         // this session writes one; a file of its name is someone else's.
@@ -4479,6 +4483,7 @@ impl App {
         self.pkg = pkg;
         self.forget_clip();
         self.path = "untitled.xlsx".to_string();
+        self.read_only = None;
         self.import_source = None;
         self.template = None;
         self.import_unsaved = false;
@@ -4568,9 +4573,11 @@ impl App {
     }
 
     /// Open or New from the backstage (#882): a modified workbook asks before
-    /// its changes are discarded; an unmodified one goes ahead. Either way
-    /// the workbook stops being read-only, since another file replaces it.
-    /// The control surface's `wb.open` is scripted and does not ask.
+    /// its changes are discarded; an unmodified one goes ahead. The
+    /// workbook stops being read-only only once another one is installed
+    /// ([`Self::install_workbook`], [`Self::new_workbook`]), so an Open that
+    /// fails or is cancelled leaves the source guarded. The control
+    /// surface's `wb.open` is scripted and does not ask.
     fn request_discard(&mut self, next: Next) {
         self.backstage = None;
         if !self.modified {
@@ -4599,7 +4606,6 @@ impl App {
 
     /// Yes to [`ConfirmAction::Discard`], or an Open/New with nothing to lose.
     fn discard_for(&mut self, next: Next) {
-        self.read_only = None;
         match next {
             Next::Open(p) => self.open_workbook(&p),
             Next::New => self.new_workbook(),
@@ -14070,19 +14076,66 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// `--recalc` with `--read-only` is refused onto the input, allowed
-    /// elsewhere; the refusal names the file.
+    /// The refusal names the file, not its folder.
     #[test]
-    fn same_file_and_read_only_refusal() {
-        let (dir, _app) = two_books("ro-same");
-        let a = dir.join("a.xlsx");
-        assert!(same_file(&a, &dir.join(".").join("a.xlsx")));
-        assert!(!same_file(&a, &dir.join("b.xlsx")));
-        assert!(!same_file(&a, &dir.join("missing.xlsx")));
+    fn read_only_refusal_names_the_file() {
         assert_eq!(
-            read_only_refusal(a.to_str().unwrap()),
+            read_only_refusal("some/dir/a.xlsx"),
             "\"a.xlsx\" is read-only. Save a copy under a new name."
         );
+    }
+
+    /// r1 M1: an Open that loads nothing leaves the read-only file guarded:
+    /// a missing file, and a text file whose wizard is cancelled.
+    #[test]
+    fn read_only_survives_an_open_that_fails_or_is_cancelled() {
+        let (dir, mut app) = two_books("ro-open-fails");
+        let a = dir.join("a.xlsx");
+        let before = std::fs::read(&a).unwrap();
+        let refusal = Err("\"a.xlsx\" is read-only. Save a copy under a new name.".to_string());
+        app.set_read_only(a.to_str().unwrap());
+
+        // Nothing to lose, so the Open goes straight to the load, which fails.
+        app.apply_backstage_event(backstage::BackstageEvent::Open(dir.join("missing.xlsx")));
+        assert!(app.status.as_deref().unwrap().starts_with("Open failed"));
+        assert!(app.path.ends_with("a.xlsx"));
+        assert_eq!(app.save_current(), refusal);
+
+        // Over unsaved changes, Yes and then a failed load.
+        type_into_a1(&mut app, 9.0);
+        app.apply_backstage_event(backstage::BackstageEvent::Open(dir.join("missing.xlsx")));
+        assert!(!app.confirm_key(y()));
+        assert_eq!(app.save_current(), refusal);
+
+        // A text file opens its wizard; Esc cancels it and nothing loads.
+        let txt = dir.join("notes.txt");
+        std::fs::write(&txt, "1\t2\n").unwrap();
+        app.modified = false;
+        app.apply_backstage_event(backstage::BackstageEvent::Open(txt));
+        assert!(app.text_dialog.is_some());
+        app.text_dialog_key(KeyCode::Esc);
+        assert!(app.text_dialog.is_none());
+        assert!(app.bound_read_only());
+        assert_eq!(app.save_current(), refusal);
+        assert_eq!(std::fs::read(&a).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A finished import and New are other workbooks: read-only ends.
+    #[test]
+    fn read_only_ends_when_another_workbook_is_installed() {
+        let (dir, mut app) = two_books("ro-installed");
+        let a = dir.join("a.xlsx");
+        app.set_read_only(a.to_str().unwrap());
+        let txt = dir.join("notes.txt");
+        std::fs::write(&txt, "1\t2\n").unwrap();
+        app.apply_backstage_event(backstage::BackstageEvent::Open(txt));
+        app.finish_text_dialog();
+        assert!(app.text_dialog.is_none());
+        assert!(app.read_only.is_none());
+        app.set_read_only(a.to_str().unwrap());
+        app.apply_backstage_event(backstage::BackstageEvent::New);
+        assert!(app.read_only.is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
