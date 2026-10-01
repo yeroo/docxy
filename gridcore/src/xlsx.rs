@@ -2984,12 +2984,33 @@ fn sheet_data_xml(
         }
         out.push_str(&format!("<row r=\"{}\"{attrs}>", row + 1));
         for (&(r, c), cell) in cells {
-            out.push_str(&cell_xml(r, c, cell, index_of, any_formulas, new_cm));
+            let taken = block_taken(sheet, r, c, cell);
+            out.push_str(&cell_xml(r, c, cell, index_of, any_formulas, new_cm, taken));
         }
         out.push_str("</row>");
     }
     out.push_str("</sheetData>");
     out
+}
+
+/// Does another cell hold content inside the block a non-spilling array
+/// anchor at `(row, col)` stores in its `ref`? The engine doesn't own a
+/// legacy CSE block whose result no longer spills over it, so its cells can be
+/// typed into; the anchor then covers its own cell alone ([`cell_xml`]), or
+/// the saved block would overlap their content. A styled blank isn't content.
+fn block_taken(sheet: &Sheet, row: u32, col: u32, cell: &Cell) -> bool {
+    if cell.spill.is_some() {
+        return false;
+    }
+    crate::sheet::array_block(cell).is_some_and(|(r1, c1, r2, c2)| {
+        (r1, c1) == (row, col)
+            && (r1..=r2).any(|r| {
+                sheet
+                    .cells
+                    .range((r, c1)..=(r, c2))
+                    .any(|(&k, other)| k != (row, col) && !other.is_blank())
+            })
+    })
 }
 
 /// A dynamic array typed here ([`CellMeta::dynamic`]) that the file has no
@@ -3275,6 +3296,7 @@ fn cell_xml(
     index_of: &mut impl FnMut(&str) -> usize,
     any_formulas: &mut bool,
     new_cm: Option<&str>,
+    block_taken: bool,
 ) -> String {
     let mut attrs = format!(" r=\"{}\"", cell_name(row, col));
     if cell.style != 0 {
@@ -3350,15 +3372,20 @@ fn cell_xml(
         // ref that starts elsewhere names another block (a cell moved
         // without set_cell, a sort say, or loaded that way; set_cell and
         // paste re-anchor themselves). A legacy CSE block (no `cm`) whose ref
-        // starts here keeps it: Excel refills that block on load.
-        (Some(src), Some(fa)) if is_array_f(fa) && (dynamic || !ref_starts_at(fa, &anchor)) => (
-            format!(
-                "<f{}>{}</f>",
-                with_ref(fa, &anchor),
-                esc_text(&file_formula(src))
-            ),
-            true,
-        ),
+        // starts here keeps it — Excel refills that block on load — unless
+        // another cell in it now holds content ([`block_taken`]).
+        (Some(src), Some(fa))
+            if is_array_f(fa) && (dynamic || block_taken || !ref_starts_at(fa, &anchor)) =>
+        {
+            (
+                format!(
+                    "<f{}>{}</f>",
+                    with_ref(fa, &anchor),
+                    esc_text(&file_formula(src))
+                ),
+                true,
+            )
+        }
         (Some(src), Some(fa)) => (
             format!("<f{fa}>{}</f>", esc_text(&file_formula(src))),
             is_array_f(fa),
@@ -10878,6 +10905,60 @@ b",
         let ws = saved_sheet1(&pkg);
         assert!(
             ws.contains(r#"<c r="D1"><f t="array" ref="D1:D3">SUM(A1:A5*A1:A5)</f><v>165</v></c>"#),
+            "{ws}"
+        );
+    }
+
+    /// A legacy CSE block over D1:D3 (no `cm`) with a 1x1 result, as Excel
+    /// saves it: the result repeated over the block. A1:A3 = 1, 2, 3.
+    const CSE_SUM_ROWS: &str = concat!(
+        r#"<row r="1"><c r="A1"><v>1</v></c><c r="D1"><f t="array" ref="D1:D3">SUM(A1:A3)</f><v>6</v></c></row>"#,
+        r#"<row r="2"><c r="A2"><v>2</v></c><c r="D2"><v>6</v></c></row>"#,
+        r#"<row r="3"><c r="A3"><v>3</v></c><c r="D3"><v>6</v></c></row>"#,
+    );
+
+    /// #785: after recalc the engine doesn't own a non-spilling CSE block's
+    /// other cells, so they can be typed into; the saved anchor then covers
+    /// its own cell, never overlapping their content. A styled blank isn't
+    /// content, and an untouched block keeps its ref.
+    #[test]
+    fn content_typed_inside_a_non_spilling_cse_block_shrinks_its_saved_ref() {
+        const BLOCK: &str = r#"<f t="array" ref="D1:D3">SUM(A1:A3)</f>"#;
+        const ANCHOR: &str = r#"<c r="D1"><f t="array" ref="D1">SUM(A1:A3)</f><v>6</v></c>"#;
+        let edited = |at: (u32, u32), cell: Cell| {
+            let mut pkg = load_xlsx(&cell_meta_fixture(CSE_SUM_ROWS)).unwrap();
+            let mut eng = crate::engine::Engine::new(&pkg.workbook);
+            eng.recalc_all(&mut pkg.workbook);
+            eng.set_cell(&mut pkg.workbook, (0, at.0, at.1), cell);
+            saved_sheet1(&pkg)
+        };
+
+        let ws = edited((1, 3), Cell::formula("A1+1"));
+        assert!(ws.contains(ANCHOR), "{ws}");
+        assert!(ws.contains(r#"<c r="D2"><f>A1+1</f><v>2</v></c>"#), "{ws}");
+
+        let ws = edited((2, 3), Cell::number(5.0));
+        assert!(ws.contains(ANCHOR), "{ws}");
+        assert!(ws.contains(r#"<c r="D3"><v>5</v></c>"#), "{ws}");
+
+        let styled = Cell {
+            style: 1,
+            ..Cell::default()
+        };
+        let ws = edited((1, 3), styled);
+        assert!(ws.contains(BLOCK), "{ws}");
+
+        // Recalculated but untouched: the block stays.
+        let mut pkg = load_xlsx(&cell_meta_fixture(CSE_SUM_ROWS)).unwrap();
+        rebuild(&mut pkg);
+        let ws = saved_sheet1(&pkg);
+        assert!(ws.contains(BLOCK), "{ws}");
+
+        // Without an engine, the block saves as it was loaded.
+        let pkg = load_xlsx(&cell_meta_fixture(CSE_SUM_ROWS)).unwrap();
+        let ws = saved_sheet1(&pkg);
+        assert!(
+            ws.contains(r#"<c r="D1"><f t="array" ref="D1:D3">SUM(A1:A3)</f><v>6</v></c>"#),
             "{ws}"
         );
     }
