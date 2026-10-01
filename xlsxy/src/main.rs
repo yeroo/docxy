@@ -1682,8 +1682,8 @@ impl App {
 
     /// Commit the editor text into the current cell as a typed entry
     /// (gridcore::entry). Returns false (and stays in edit mode) when a
-    /// formula doesn't parse or the entry is over the 32,767-character cell
-    /// limit.
+    /// formula doesn't parse, the entry is over the 32,767-character cell
+    /// limit, or it would change part of an array ([`PART_OF_ARRAY`]).
     fn commit_edit(&mut self) -> bool {
         let Some(edit) = self.edit.take() else {
             return true;
@@ -1798,10 +1798,12 @@ impl App {
             .iter()
             .map(|(s, changes)| (*s, changes.iter().map(|&(r, c, _)| (r, c)).collect()))
             .collect();
+        // Decided once above, for every group: written without deciding
+        // again against what the earlier groups recalculated.
         self.record_groups(keys, |app| {
             for (sheet_idx, changes) in groups {
                 app.engine
-                    .set_cells(&mut app.pkg.workbook, sheet_idx, changes);
+                    .set_cells_prechecked(&mut app.pkg.workbook, sheet_idx, changes);
             }
         });
         true
@@ -2646,16 +2648,13 @@ impl App {
                     } else {
                         (clears, Vec::new())
                     };
-                    for (r, c, cell) in clears {
-                        app.engine
-                            .set_cell(&mut app.pkg.workbook, (src, r, c), cell);
-                    }
+                    // Checked whole above: each part is written without
+                    // deciding again against what the clears recalculated.
+                    let wb = &mut app.pkg.workbook;
+                    app.engine.set_cells_prechecked(wb, src, clears);
                     app.engine
-                        .paste_block(&mut app.pkg.workbook, here, (r0, c0), &block);
-                    for (r, c, cell) in late {
-                        app.engine
-                            .set_cell(&mut app.pkg.workbook, (src, r, c), cell);
-                    }
+                        .paste_block_prechecked(wb, here, (r0, c0), &block);
+                    app.engine.set_cells_prechecked(wb, src, late);
                 });
                 self.status = Some(if source_locked {
                     "Pasted (source sheet is protected; cut kept as copy)".to_string()
@@ -9314,6 +9313,25 @@ mod tests {
             CellValue::Number(7.0)
         );
         assert!(app.sheet().cell(4, 0).is_none_or(|c| c.value.is_empty()));
+    }
+
+    #[test]
+    fn a_cut_whose_clears_change_the_block_is_still_refused_whole() {
+        // r8 M3: B2 = 4; cut A2:B2 and paste at C2, which puts the 4 into
+        // D2. D2 holds 4 now, but clearing A2 would recalculate it: decided
+        // once, before the clears, it is refused whole, the source intact
+        // and the clip still a cut.
+        let mut app = app_with_spilling_cse();
+        app.pkg.workbook.sheets[0].set_cell(1, 1, Cell::number(4.0));
+        let before = app.sheet().cells.clone();
+        app.cur = (1, 0);
+        app.anchor = Some((1, 1));
+        app.copy(true);
+        app.cur = (1, 2);
+        app.anchor = None;
+        app.paste();
+        assert_refused(&app, &before);
+        assert!(app.clip.as_ref().is_some_and(|c| c.cut));
     }
 
     #[test]
