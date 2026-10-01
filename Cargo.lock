@@ -964,6 +964,7 @@ dependencies = [
 name = "mppread"
 version = "0.1.0"
 dependencies = [
+ "opccore",
  "projcore",
 ]
 

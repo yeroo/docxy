@@ -1,6 +1,6 @@
 [package]
 name = "opccore"
-description = "Dependency-free OPC container plumbing shared by docxcore and gridcore: ZIP read/write, DEFLATE, and a minimal XML pull parser."
+description = "Dependency-free OPC container plumbing shared by docxcore and gridcore: ZIP read/write, DEFLATE, a minimal XML pull parser, and the OLE2 compound-file (CFB) reader."
 # Versioned independently of the docxy/docxcore release train.
 version = "0.1.0"
 edition.workspace = true
