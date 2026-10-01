@@ -10554,11 +10554,14 @@ b",
         );
     }
 
-    /// #785: a format edit (a restyled clone through `set_cell`) and its undo
-    /// (`restore_cell`) keep the `<f>` attributes the file's formulas were
-    /// preserved with: a shared group's master (a group whose master we can't
-    /// parse stays a group; a parseable one is expanded at load) and a data
-    /// table. The save is the unedited one with the new style.
+    /// #785: the `<f>` attributes the file's formulas were preserved with — a
+    /// shared group's master (a group whose master we can't parse stays a
+    /// group; a parseable one is expanded at load) and a data table — survive
+    /// every path that rewrites such a cell without changing its formula: a
+    /// restyle (`Engine::set_styles`, #784), the same formula through
+    /// `set_cell` (Enter on an unchanged formula, a paste of it in place; a
+    /// restyled clone here), and undo's `restore_cell`. Each save is the
+    /// unedited one with only the style changed.
     #[test]
     fn restyle_and_undo_keep_shared_master_and_data_table_f_attrs() {
         let rows = concat!(
@@ -10604,6 +10607,11 @@ b",
         for (c, cell) in [1, 6].into_iter().zip(before) {
             eng.restore_cell(&mut pkg.workbook, (0, 0, c), cell);
         }
+        assert_eq!(resaved(&pkg).1, unedited);
+
+        eng.set_styles(&mut pkg.workbook, 0, &[(0, 1, 1), (0, 6, 1)]);
+        assert_eq!(resaved(&pkg).1, restyled);
+        eng.set_styles(&mut pkg.workbook, 0, &[(0, 1, 0), (0, 6, 0)]);
         assert_eq!(resaved(&pkg).1, unedited);
     }
 
