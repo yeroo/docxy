@@ -499,8 +499,11 @@ impl Session {
             return;
         }
         let sheet_idx = self.active;
-        // A frozen anchor overwritten loses its cached block, which only
-        // its undo can put back: the group records the block too.
+        // An edit can take what only its undo puts back from outside the
+        // keys: overwriting a frozen anchor clears its cached block, and
+        // typing into the block drops the anchor's extent. The group
+        // records the anchor and its block too
+        // ([`gridcore::sheet::frozen_spill_keys`]).
         let keys = {
             let wb = &self.pkg.workbook;
             let frozen = |r, c| self.engine.is_frozen(wb, (sheet_idx, r, c));

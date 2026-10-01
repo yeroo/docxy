@@ -1746,7 +1746,8 @@ impl App {
     }
 
     /// The cells an undo group over `keys` on sheet `sheet_idx` records:
-    /// `keys` and the blocks of the frozen anchors among them
+    /// `keys`, plus each frozen anchor that is a key or whose block a key
+    /// lies in, with that block's held values
     /// ([`gridcore::sheet::frozen_spill_keys`]).
     fn undo_keys(&self, sheet_idx: usize, keys: &[(u32, u32)]) -> Vec<(u32, u32)> {
         let wb = &self.pkg.workbook;
@@ -1798,8 +1799,10 @@ impl App {
         if keys.is_empty() {
             return;
         }
-        // A frozen anchor overwritten loses its cached block, which only
-        // its undo can put back: the group records the block too.
+        // An edit can take what only its undo puts back from outside the
+        // keys: overwriting a frozen anchor clears its cached block, and
+        // typing into the block drops the anchor's extent. The group
+        // records the anchor and its block too (`frozen_spill_keys`).
         let keys: Vec<_> = keys
             .into_iter()
             .map(|(s, cells)| (s, self.undo_keys(s, &cells)))
