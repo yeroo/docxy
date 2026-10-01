@@ -41,6 +41,17 @@ fn group_styles(
         .collect()
 }
 
+/// The `(row, col, cell)` an undo or redo puts back: each change's `before`
+/// or `after` cell (picked by `side`), blank if absent.
+fn group_cells<'a>(
+    changes: impl Iterator<Item = &'a (u32, u32, Option<Cell>, Option<Cell>)>,
+    side: impl Fn(&(u32, u32, Option<Cell>, Option<Cell>)) -> &Option<Cell>,
+) -> Vec<(u32, u32, Cell)> {
+    changes
+        .map(|ch| (ch.0, ch.1, side(ch).clone().unwrap_or_default()))
+        .collect()
+}
+
 /// Sheets + defined names — snapshotted around structural edits whose inverse
 /// is not expressible as per-cell changes (Task 3 uses this).
 #[derive(Clone)]
@@ -458,22 +469,45 @@ impl Session {
 
     /// Apply cell changes as one undo group, through the engine.
     fn apply(&mut self, changes: Vec<(u32, u32, Cell)>) {
-        if changes.is_empty() {
+        let keys = changes.iter().map(|&(r, c, _)| (r, c)).collect();
+        self.record(keys, |s| {
+            let sheet_idx = s.active;
+            for (r, c, cell) in changes {
+                s.engine
+                    .set_cell(&mut s.pkg.workbook, (sheet_idx, r, c), cell);
+            }
+        });
+    }
+
+    /// Run `write`, which edits the cells `keys` names on the active sheet,
+    /// as one undo group. Every cell's before is taken ahead of the first
+    /// write and its after once the last is done, so the group is one
+    /// snapshot of its cells, as [`Engine::restore_cells`] needs: taken cell
+    /// by cell, a spill anchor's after could still claim a cell a later
+    /// write blocked it with.
+    fn record(&mut self, keys: Vec<(u32, u32)>, write: impl FnOnce(&mut Self)) {
+        if keys.is_empty() {
             return;
         }
         let sheet_idx = self.active;
-        let mut group = UndoGroup {
+        let snapshot = |s: &Self| -> Vec<Option<Cell>> {
+            let sheet = &s.pkg.workbook.sheets[sheet_idx];
+            keys.iter()
+                .map(|&(r, c)| sheet.cell(r, c).cloned())
+                .collect()
+        };
+        let before = snapshot(self);
+        write(self);
+        let after = snapshot(self);
+        let group = UndoGroup {
             sheet: sheet_idx,
-            changes: Vec::with_capacity(changes.len()),
+            changes: keys
+                .iter()
+                .zip(before.into_iter().zip(after))
+                .map(|(&(r, c), (b, a))| (r, c, b, a))
+                .collect(),
             styles_only: false,
         };
-        for (r, c, cell) in changes {
-            let before = self.pkg.workbook.sheets[sheet_idx].cell(r, c).cloned();
-            self.engine
-                .set_cell(&mut self.pkg.workbook, (sheet_idx, r, c), cell);
-            let after = self.pkg.workbook.sheets[sheet_idx].cell(r, c).cloned();
-            group.changes.push((r, c, before, after));
-        }
         self.undo.push(UndoAction::Cells(group));
         self.edits += 1;
         self.redo.clear();
@@ -522,11 +556,9 @@ impl Session {
                     self.engine
                         .set_styles(&mut self.pkg.workbook, group.sheet, &styles);
                 } else {
-                    for &(r, c, ref before, _) in group.changes.iter().rev() {
-                        let cell = before.clone().unwrap_or_default();
-                        self.engine
-                            .restore_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
-                    }
+                    let cells = group_cells(group.changes.iter().rev(), |ch| &ch.2);
+                    self.engine
+                        .restore_cells(&mut self.pkg.workbook, group.sheet, &cells);
                 }
                 self.redo.push(UndoAction::Cells(group));
                 self.dirty = true;
@@ -557,11 +589,9 @@ impl Session {
                     self.engine
                         .set_styles(&mut self.pkg.workbook, group.sheet, &styles);
                 } else {
-                    for &(r, c, _, ref after) in group.changes.iter() {
-                        let cell = after.clone().unwrap_or_default();
-                        self.engine
-                            .restore_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
-                    }
+                    let cells = group_cells(group.changes.iter(), |ch| &ch.3);
+                    self.engine
+                        .restore_cells(&mut self.pkg.workbook, group.sheet, &cells);
                 }
                 self.undo.push(UndoAction::Cells(group));
                 self.dirty = true;
@@ -684,12 +714,20 @@ impl Session {
             r0 as i64 - clip.from.0 as i64,
             c0 as i64 - clip.from.1 as i64,
         );
-        let mut changes = Vec::new();
+        // The block written from (r0, c0): rows and cells pushed off the
+        // grid's edge are dropped, so rows may differ in length.
+        let mut block = Vec::new();
+        let mut keys = Vec::new();
         for (dr, row) in clip.cells.iter().enumerate() {
+            let r = r0 + dr as u32;
+            if r >= MAX_ROWS {
+                break;
+            }
+            let mut out = Vec::new();
             for (dc, cell) in row.iter().enumerate() {
-                let (r, c) = (r0 + dr as u32, c0 + dc as u32);
-                if r >= MAX_ROWS || c >= MAX_COLS {
-                    continue;
+                let c = c0 + dc as u32;
+                if c >= MAX_COLS {
+                    break;
                 }
                 let mut cell = cell.clone().unwrap_or_default();
                 if !clip.cut && (dr_all, dc_all) != (0, 0) {
@@ -699,10 +737,19 @@ impl Session {
                         }
                     }
                 }
-                changes.push((r, c, cell));
+                keys.push((r, c));
+                out.push(cell);
             }
+            block.push(out);
         }
-        self.apply(changes);
+        // Through `Engine::paste_block`, as one undo group: a pasted spilling
+        // array still spills, and an array block pasted back in place keeps
+        // its block.
+        self.record(keys, |s| {
+            let sheet_idx = s.active;
+            s.engine
+                .paste_block(&mut s.pkg.workbook, sheet_idx, (r0, c0), &block);
+        });
         if clip.cut {
             if let Some(c) = self.clip.as_mut() {
                 c.cut = false;
@@ -3235,6 +3282,108 @@ mod tests {
         assert_eq!(tsv, "Apple");
         let v = s.view_json(None);
         assert!(!v.contains("Apple"), "{v}");
+    }
+
+    /// A session on a file with A1:A3 = 1, 2, 3 and a legacy CSE block
+    /// `{=A1:A3*2}` over D1:D3, spilling 2, 4, 6.
+    fn session_with_spilling_cse() -> Session {
+        let mut pkg = new_xlsx();
+        let sheet = &mut pkg.workbook.sheets[0];
+        for r in 0..3u32 {
+            sheet.set_cell(r, 0, Cell::number(f64::from(r + 1)));
+            sheet.set_cell(r, 3, Cell::number(f64::from(2 * (r + 1))));
+        }
+        sheet.set_cell(
+            0,
+            3,
+            Cell {
+                value: CellValue::Number(2.0),
+                formula: Some("A1:A3*2".into()),
+                f_attrs: Some(" t=\"array\" ref=\"D1:D3\"".into()),
+                spill: Some((3, 1)),
+                ..Cell::default()
+            },
+        );
+        let s = Session::open(&save_xlsx(&pkg)).expect("open");
+        assert_cse_spills(&s, "loaded");
+        s
+    }
+
+    /// D1 is the CSE block over D1:D3, spilling 2, 4, 6.
+    fn assert_cse_spills(s: &Session, when: &str) {
+        let sheet = &s.pkg.workbook.sheets[0];
+        let d1 = sheet.cell(0, 3).unwrap();
+        assert_eq!(d1.spill, Some((3, 1)), "{when}: {:?}", d1.value);
+        assert_eq!(
+            d1.f_attrs.as_deref(),
+            Some(" t=\"array\" ref=\"D1:D3\""),
+            "{when}"
+        );
+        for r in 0..3u32 {
+            assert_eq!(
+                sheet.cell(r, 3).unwrap().value,
+                CellValue::Number(f64::from(2 * (r + 1))),
+                "{when}: D{}",
+                r + 1
+            );
+        }
+    }
+
+    #[test]
+    fn a_spilling_cse_block_pasted_in_place_still_spills() {
+        // #825 AC4: copy (or cut) D1:D3 and paste it back at D1. Written cell
+        // by cell, the 4 pasted into D2 blocked D1 (#SPILL!). Undo puts back
+        // exactly what was there, and redo the paste, both still spilling.
+        for verb in ["copy", "cut"] {
+            let mut s = session_with_spilling_cse();
+            s.dispatch("select\t0\t3\t2\t3"); // D1:D3
+            let tsv = s.dispatch(verb).unwrap();
+            let before = s.pkg.workbook.sheets[0].cells.clone();
+            s.dispatch(&format!("paste\t0\t3\t{tsv}"));
+            assert_cse_spills(&s, &format!("{verb}: paste"));
+            let after = s.pkg.workbook.sheets[0].cells.clone();
+            s.dispatch("undo");
+            assert_eq!(s.pkg.workbook.sheets[0].cells, before, "{verb}: undo");
+            s.dispatch("redo");
+            assert_cse_spills(&s, &format!("{verb}: redo"));
+            assert_eq!(s.pkg.workbook.sheets[0].cells, after, "{verb}: redo");
+        }
+    }
+
+    #[test]
+    fn a_group_that_blocks_its_own_spill_undoes_and_redoes_exactly() {
+        // #825 AC9: one edit types a spilling D1 and then a 5 into D2, which
+        // blocks it. Snapshotted cell by cell, D2's before was D1's spilled
+        // 4, which undo left behind.
+        let mut s = Session::open(&save_xlsx(&new_xlsx())).expect("open");
+        s.apply(
+            (0..3)
+                .map(|r| (r, 0, Cell::number(f64::from(r + 1))))
+                .collect(),
+        );
+        let before = s.pkg.workbook.sheets[0].cells.clone();
+        s.apply(vec![
+            (0, 3, Cell::formula("A1:A3*2")),
+            (1, 3, Cell::number(5.0)),
+        ]);
+        let blocked = |s: &Session, when: &str| {
+            let sheet = &s.pkg.workbook.sheets[0];
+            let d1 = sheet.cell(0, 3).unwrap();
+            assert_eq!(d1.value, CellValue::Error("#SPILL!".into()), "{when}");
+            assert_eq!(d1.spill, None, "{when}");
+            assert_eq!(
+                sheet.cell(1, 3).unwrap().value,
+                CellValue::Number(5.0),
+                "{when}"
+            );
+        };
+        blocked(&s, "edit");
+        let after = s.pkg.workbook.sheets[0].cells.clone();
+        s.dispatch("undo");
+        assert_eq!(s.pkg.workbook.sheets[0].cells, before, "undo");
+        s.dispatch("redo");
+        blocked(&s, "redo");
+        assert_eq!(s.pkg.workbook.sheets[0].cells, after, "redo");
     }
 
     /// A session with `=SEQUENCE(3)` typed into D1 (spilling D1:D3).
