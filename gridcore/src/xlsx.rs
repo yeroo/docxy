@@ -10988,6 +10988,26 @@ b",
     }
 
     #[test]
+    fn a_row_delete_inside_a_cse_block_saves_the_shrunk_ref_before_any_recalc() {
+        // The writer takes `ref` from the anchor's spill extent, so that
+        // extent must follow the edit even when nothing recalculates first.
+        let rows = format!(r#"{CSE_ROWS}<row r="4"><c r="D4"><v>99</v></c></row>"#);
+        let mut pkg = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
+        crate::edit::delete_rows(&mut pkg.workbook, 0, 1, 1);
+        let ws = saved_sheet1(&pkg);
+        let d1 = saved_cell(&ws, "D1");
+        assert!(
+            d1.contains(r#"<f t="array" ref="D1:D2">A1:A2*2</f>"#),
+            "{d1}"
+        );
+        rebuild(&mut pkg);
+        assert_eq!(
+            col_d(&pkg, 0..3),
+            [2.0, 6.0, 99.0].map(CellValue::Number).to_vec()
+        );
+    }
+
+    #[test]
     fn a_filled_down_cse_clone_never_claims_a_block_after_a_row_delete() {
         // The filled copy is typed (#724): no source `ref` to shrink onto it.
         let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SUM_BLOCK))).unwrap();
