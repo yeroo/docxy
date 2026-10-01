@@ -799,6 +799,12 @@ impl<'a> Parser<'a> {
                     return Err("quoted name without !".into());
                 }
                 self.bump()?;
+                // `'Jan 2024:Mar 2024'!A1`: Excel's own spelling of a 3D span
+                // whose names need quotes. A sheet name can't hold `:`, so
+                // the split is unambiguous.
+                if let Some((first, last)) = name.split_once(':') {
+                    return self.three_d(first.to_string(), last.to_string());
+                }
                 self.sheet_ref(Some(name))
             }
             Tok::Bracket(spec) => {
@@ -12763,6 +12769,29 @@ mod tests {
             rename_sheet_in_formula("SUM(One:Three!A1)", "Three", "Last Q").unwrap(),
             "SUM(One:'Last Q'!A1)"
         );
+    }
+
+    /// Excel spells a 3D span whose names need quotes as one quoted token,
+    /// `'Jan 2024:Mar 2024'!A1` (#603: the legacy readers emit it too).
+    #[test]
+    fn a_quoted_three_d_span_is_one_token() {
+        for (excel, ours) in [
+            (
+                "SUM('Jan 2024:Mar 2024'!A1)",
+                "SUM('Jan 2024':'Mar 2024'!A1)",
+            ),
+            ("SUM('Q1:Q3'!A1:A2)", "SUM('Q1':'Q3'!A1:A2)"),
+        ] {
+            let ast = parse(excel).unwrap_or_else(|e| panic!("{excel}: {e}"));
+            assert_eq!(ast, parse(ours).unwrap(), "{excel}");
+            assert!(parse(&display_formula(excel)).is_ok(), "{excel}");
+        }
+        assert_eq!(
+            rename_sheet_in_formula("SUM('Jan 2024:Mar 2024'!A1)", "Mar 2024", "March").unwrap(),
+            "SUM('Jan 2024':March!A1)"
+        );
+        // One quoted sheet is still one sheet.
+        assert!(matches!(parse("'My Sheet'!A1").unwrap(), Expr::Ref(_)));
     }
 
     #[test]
