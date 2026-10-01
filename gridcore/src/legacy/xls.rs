@@ -483,9 +483,12 @@ fn read_sheet(
     // The FORMULA whose string result the next STRING record holds.
     let mut want_string: Option<(u32, u32)> = None;
     let mut pending: Vec<Pending> = Vec::new();
-    // Shared formulas: (r1, r2, c1, c2) range → (rgce, extra).
-    // Shared formulas by their first cell (where ptgExp points).
+    // Shared formulas by their master: the FORMULA just before SHRFMLA,
+    // which is the cell every member's ptgExp names (not necessarily the
+    // range's top-left), and the range's top-left as well.
     let mut shared: HashMap<(u32, u32), Group> = HashMap::new();
+    // The last FORMULA cell read: a SHRFMLA's master.
+    let mut last_formula: Option<(u32, u32)> = None;
     // Array formulas: anchor → (range, rgce, extra).
     let mut arrays: HashMap<(u32, u32), Group> = HashMap::new();
 
@@ -612,6 +615,7 @@ fn read_sheet(
                     };
                     put(&mut cells, row, col, xf, value, book);
                     let at = (row as u32, col as u32);
+                    last_formula = Some(at);
                     if rgce.first() == Some(&0x01) && rgce.len() >= 5 {
                         let mr = u16::from_le_bytes([rgce[1], rgce[2]]) as u32;
                         let mc = u16::from_le_bytes([rgce[3], rgce[4]]) as u32;
@@ -636,7 +640,13 @@ fn read_sheet(
                     c.u8()?;
                     let cce = c.u16()? as usize;
                     let rgce = c.take(cce)?.to_vec();
-                    shared.insert((range.0, range.2), (range, rgce, c.rest().to_vec()));
+                    let group = (range, rgce, c.rest().to_vec());
+                    let corner = (range.0, range.2);
+                    let master = last_formula.unwrap_or(corner);
+                    if master != corner {
+                        shared.insert(corner, group.clone());
+                    }
+                    shared.insert(master, group);
                 }
                 0x0221 => {
                     let range = ref_u(&mut c)?;
@@ -671,12 +681,11 @@ fn read_sheet(
             }
             continue;
         }
-        let Some(((r1, r2, c1, c2), rgce, extra)) = shared.get(&p.master) else {
+        // A cell outside the group's stated range still takes it: writers
+        // get the range wrong, and the tokens are relative to the cell.
+        let Some((_, rgce, extra)) = shared.get(&p.master) else {
             continue;
         };
-        if !((*r1..=*r2).contains(&p.at.0) && (*c1..=*c2).contains(&p.at.1)) {
-            continue;
-        }
         let base = Base::Shared(p.at.0, p.at.1);
         if let Some(f) = ptg::decompile(Biff::V8, rgce, extra, base, g) {
             if let Some(cell) = cells.get_mut(&p.at) {
@@ -885,6 +894,35 @@ pub(crate) mod tests {
         assert_eq!(c[&(2, 1)].formula.as_deref(), Some("A3*2"));
     }
 
+    /// ptgExp names the group's first formula cell, B1 here, while the
+    /// stated range is A1:B2 and the members are B1, A2, B2.
+    #[test]
+    fn shared_formulas_keyed_by_the_cell_ptg_exp_names() {
+        let exp = [0x01, 0, 0, 1, 0];
+        // SHRFMLA A1:B2: =<cell one row down>+1 (ptgRefN row +1, col +0).
+        let mut sh = vec![0, 0, 1, 0, 0, 1, 0, 3];
+        let rgce = [0x2C, 1, 0, 0, 0xC0, 0x1E, 1, 0, 0x03];
+        sh.extend((rgce.len() as u16).to_le_bytes());
+        sh.extend(rgce);
+        let stream = workbook(
+            &[],
+            &[
+                formula(0, 1, 0.0, &exp),
+                rec(0x04BC, &sh),
+                formula(1, 0, 0.0, &exp),
+                formula(1, 1, 0.0, &exp),
+                // Outside A1:B2, still a member.
+                formula(2, 1, 0.0, &exp),
+            ],
+        );
+        let book = read(&stream).unwrap();
+        let c = data(&book);
+        assert_eq!(c[&(0, 1)].formula.as_deref(), Some("B2+1"));
+        assert_eq!(c[&(1, 0)].formula.as_deref(), Some("A3+1"));
+        assert_eq!(c[&(1, 1)].formula.as_deref(), Some("B3+1"));
+        assert_eq!(c[&(2, 1)].formula.as_deref(), Some("B4+1"));
+    }
+
     #[test]
     fn array_formula_on_its_anchor() {
         // {=A1:A2*2} over B1:B2.
@@ -951,8 +989,6 @@ pub(crate) mod tests {
         assert_eq!(c[&(2, 0)].value, CellValue::Number(1.0));
     }
 
-    /// An embedded chart is a BOF..EOF substream inside the sheet's: its
-    /// records are not cells, and the sheet goes on after its EOF.
     /// Two BOUNDSHEET8s at the same substream: one sheet, read once.
     #[test]
     fn a_sheet_two_plies_point_at_is_read_once() {
@@ -985,6 +1021,8 @@ pub(crate) mod tests {
         assert!(read(&stream).is_ok());
     }
 
+    /// An embedded chart is a BOF..EOF substream inside the sheet's: its
+    /// records are not cells, and the sheet goes on after its EOF.
     #[test]
     fn an_embedded_chart_substream_is_skipped() {
         let stream = workbook(

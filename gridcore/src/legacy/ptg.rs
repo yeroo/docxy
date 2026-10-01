@@ -166,8 +166,12 @@ fn num(x: f64) -> String {
 
 /// The longest token stream decompiled (Excel writes at most a few KB).
 const MAX_RGCE: usize = 16 << 10;
-/// The longest formula text produced (Excel's limit is 8,192 characters).
+/// The longest formula text produced, in characters (Excel's limit).
 const MAX_TEXT: usize = 8_192;
+/// The byte length past which a formula can't be within [`MAX_TEXT`]
+/// characters (UTF-8 is at most 4 bytes a character): the runaway guard,
+/// which can't count characters cheaply on every token.
+const MAX_TEXT_BYTES: usize = 4 * MAX_TEXT;
 
 /// Decompile `rgce` (with its trailing extra data `extra`, which holds array
 /// constants) to formula text without the leading `=`.
@@ -187,7 +191,7 @@ pub(crate) fn decompile(
     let mut ex = Rd { b: extra, at: 0 };
     let mut st: Vec<String> = Vec::new();
     while rd.at < rgce.len() {
-        if st.last().is_some_and(|t| t.len() > MAX_TEXT) {
+        if st.last().is_some_and(|t| t.len() > MAX_TEXT_BYTES) {
             return None;
         }
         let ptg = rd.u8()?;
@@ -402,7 +406,7 @@ pub(crate) fn decompile(
         }
     }
     match st.pop() {
-        Some(f) if st.is_empty() && f.len() <= MAX_TEXT => Some(f),
+        Some(f) if st.is_empty() && f.chars().count() <= MAX_TEXT => Some(f),
         _ => None,
     }
 }
@@ -869,6 +873,23 @@ pub(crate) mod tests {
         g.extend(std::iter::repeat_n(0x15, 20_000));
         assert_eq!(d8(&g), None);
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // 5,000 Cyrillic characters (10,000 bytes) are within the limit:
+        // twenty 250-character strings joined with &.
+        let word: Vec<u8> = "ж"
+            .repeat(250)
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let mut long = Vec::new();
+        for i in 0..20 {
+            long.extend([0x17, 250, 1]);
+            long.extend(&word);
+            if i > 0 {
+                long.push(0x08);
+            }
+        }
+        let text = d8(&long).unwrap();
+        assert_eq!(text.chars().filter(|&c| c == 'ж').count(), 5_000);
         // A modest nesting still decompiles.
         let mut h = vec![0x1E, 1, 0];
         h.extend(std::iter::repeat_n(0x15, 10));

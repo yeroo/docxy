@@ -50,5 +50,7 @@ powershell -File scripts/make-legacy-fixtures.ps1
 ```
 
 It opens each `corpus/xlsx/*.xlsx` in a fresh Excel process and saves it in
-the three formats. The output depends on the Excel build, so regenerate only
-when the `.xlsx` corpus changes, and rerun the test.
+the three formats. Then it rebuilds `extra/`: Excel creates each of those
+workbooks from scratch and saves its `.xlsx` source as well as the three
+formats. The output depends on the Excel build, so regenerate only when the
+`.xlsx` corpus (or the script) changes, and rerun the test.

@@ -4,7 +4,7 @@
 //! `.ods`.
 //!
 //! Opening one is an *import*, like a CSV: the reader builds a fresh
-//! [`SheetPackage`] from [`new_xlsx`] with the sheets, values, formulas,
+//! [`SheetPackage`] (as `new_xlsx` makes one) with the sheets, values, formulas,
 //! number formats, date system and defined names, so everything downstream
 //! (engine, editor, save) sees an ordinary workbook and saving writes
 //! `.xlsx`. Nothing the readers don't model survives the import.
@@ -74,7 +74,8 @@ pub enum OpenError {
     /// An OLE2 file with no `Workbook` stream (a `.doc`, an `.mpp`, ...).
     NotSpreadsheet,
     /// The container itself can't be read (a broken compound file or ZIP, a
-    /// workbook part missing).
+    /// workbook part missing), or the file asks for more than [`Limits`]
+    /// allows (too many cells, sheets or repeated cells).
     Corrupt(String),
 }
 
@@ -268,7 +269,9 @@ impl BookIn {
                 ..SheetIn::default()
             });
         }
-        let names = valid_sheet_names(self.sheets.iter().map(|s| s.name.as_str()));
+        let raw: Vec<String> = self.sheets.iter().map(|s| s.name.clone()).collect();
+        let names = valid_sheet_names(raw.iter().map(String::as_str));
+        let renames = sheet_renames(&raw, &names);
         let mut pkg = crate::xlsx::new_xlsx_sheets(&names);
         // Each format code becomes an xf (the codes are distinct, so none
         // needs interning); General stays the default xf 0.
@@ -284,13 +287,15 @@ impl BookIn {
             for (key, mut cell) in sheet.cells {
                 cell.style = xf_of.get(cell.style as usize).copied().unwrap_or(0);
                 if let Some(f) = cell.formula.take() {
+                    let f = retarget(&f, &renames).unwrap_or(f);
                     cell.formula = Some(crate::formula::file_formula(&f).into_owned());
                 }
                 cells.insert(key, cell);
             }
         }
         for mut name in self.names {
-            name.formula = crate::formula::file_formula(&name.formula).into_owned();
+            let f = retarget(&name.formula, &renames).unwrap_or(name.formula);
+            name.formula = crate::formula::file_formula(&f).into_owned();
             pkg.workbook.defined_names.push(name);
         }
         pkg.workbook.date1904 = self.date1904;
@@ -300,9 +305,8 @@ impl BookIn {
 
 /// Sheet names Excel accepts, in order: at most 31 characters, none of
 /// `[]:*?/\`, not empty (`SheetN` instead), and unique ignoring case (a
-/// repeat becomes `Name (2)`). A formula that named a sheet by a name this
-/// changes keeps the old name (and so becomes `#REF!` on recalculation):
-/// accepted, since a file with such names is already not one Excel wrote.
+/// repeat becomes `Name (2)`). References to a renamed sheet follow it
+/// ([`sheet_renames`], [`retarget`]).
 pub(crate) fn valid_sheet_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec<String> {
     fn cut(s: &str, max: usize) -> String {
         s.chars().take(max).collect()
@@ -329,6 +333,53 @@ pub(crate) fn valid_sheet_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec
         out.push(name);
     }
     out
+}
+
+/// The (old, new) sheet names references must follow when `raw` names
+/// become `valid`. A repeat of an earlier name (a second "Data") is left
+/// out: references to "Data" mean the first, as a reader resolves them, and
+/// keep doing so. An empty name has no references.
+fn sheet_renames(raw: &[String], valid: &[String]) -> Vec<(String, String)> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for (old, new) in raw.iter().zip(valid) {
+        let first = seen.insert(old.to_lowercase());
+        if first && old != new && !old.is_empty() {
+            out.push((old.clone(), new.clone()));
+        }
+    }
+    out
+}
+
+/// `src` with its references to each renamed sheet following the rename,
+/// or `None` when it names none of them (or doesn't parse). Every rename is
+/// applied through a placeholder first, so one sheet's new name can be
+/// another's old one. Only formulas whose text holds an old name are
+/// parsed, so the cost is in the formulas a rename touches.
+fn retarget(src: &str, renames: &[(String, String)]) -> Option<String> {
+    use crate::formula::{parse, rename_sheet_in_expr, to_string};
+    if renames.is_empty() {
+        return None;
+    }
+    let low = src.to_lowercase();
+    let hits: Vec<usize> = (0..renames.len())
+        .filter(|&k| {
+            let old = renames[k].0.to_lowercase();
+            low.contains(&old) || low.contains(&old.replace('\'', "''"))
+        })
+        .collect();
+    if hits.is_empty() {
+        return None;
+    }
+    let mut e = parse(src).ok()?;
+    let placeholder = |k: usize| format!("\u{1}legacy sheet {k}\u{1}");
+    for &k in &hits {
+        e = rename_sheet_in_expr(&e, &renames[k].0, &placeholder(k));
+    }
+    for &k in &hits {
+        e = rename_sheet_in_expr(&e, &placeholder(k), &renames[k].1);
+    }
+    Some(to_string(&e))
 }
 
 /// A reference's sheet part as a formula spells it: `Data!`, `'My Sheet'!`,
@@ -467,6 +518,70 @@ mod tests {
         // A long repeat stays within 31 characters.
         let two = valid_sheet_names([long.as_str(), long.as_str()].into_iter());
         assert_eq!(two[1], format!("{} (2)", "x".repeat(27)));
+    }
+
+    /// A renamed sheet takes its references along: a formula and a defined
+    /// name on a 33-character name, a second "Data" (references stay on the
+    /// first), and a truncated name equal to another sheet's own.
+    #[test]
+    fn references_follow_renamed_sheets() {
+        use crate::sheet::CellValue;
+        let long = "L".repeat(33);
+        let cut = "L".repeat(31);
+        let sheet = |name: &str, cells: Vec<((u32, u32), Cell)>| SheetIn {
+            name: name.to_string(),
+            cells: cells.into_iter().collect(),
+        };
+        let num = |v: f64| Cell {
+            value: CellValue::Number(v),
+            ..Cell::default()
+        };
+        let f = |text: &str| Cell {
+            formula: Some(text.to_string()),
+            ..Cell::default()
+        };
+        let mut book = BookIn::new();
+        for s in [
+            sheet(&long, vec![((0, 0), num(5.0))]),
+            sheet(&cut, vec![((0, 0), num(7.0))]),
+            sheet("Data", vec![((0, 0), num(1.0))]),
+            sheet("Data", vec![((0, 0), num(2.0))]),
+            sheet(
+                "Calc",
+                vec![
+                    ((0, 0), f(&format!("'{long}'!A1*2"))),
+                    ((1, 0), f(&format!("'{cut}'!A1"))),
+                    ((2, 0), f("Data!A1")),
+                ],
+            ),
+        ] {
+            book.push_sheet(s).unwrap();
+        }
+        book.names.push(DefinedName {
+            name: "TheVal".into(),
+            scope: None,
+            formula: format!("'{long}'!$A$1"),
+        });
+        let mut pkg = book.build();
+        let wb = &mut pkg.workbook;
+        let names: Vec<&str> = wb.sheets.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                cut.as_str(),
+                &format!("{} (2)", "L".repeat(27)),
+                "Data",
+                "Data (2)",
+                "Calc"
+            ]
+        );
+        let mut engine = crate::engine::Engine::new(wb);
+        engine.recalc_all(wb);
+        let calc = &wb.sheets[4];
+        assert_eq!(calc.cell(0, 0).unwrap().value, CellValue::Number(10.0));
+        assert_eq!(calc.cell(1, 0).unwrap().value, CellValue::Number(7.0));
+        assert_eq!(calc.cell(2, 0).unwrap().value, CellValue::Number(1.0));
+        assert_eq!(wb.defined_names[0].formula, format!("{cut}!$A$1"));
     }
 
     #[test]

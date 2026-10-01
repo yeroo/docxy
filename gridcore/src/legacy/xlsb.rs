@@ -412,6 +412,9 @@ fn read_sheet(
     // Shared and array formulas by their first cell.
     let mut shared: HashMap<(u32, u32), Group> = HashMap::new();
     let mut arrays: HashMap<(u32, u32), Group> = HashMap::new();
+    // The last formula cell read: a BrtShrFmla's master, the cell its
+    // members' ptgExp names (not necessarily the range's top-left).
+    let mut last_formula: Option<(u32, u32)> = None;
     for (ty, body) in records(bytes) {
         let mut c = Cur::new(body);
         let _ = (|| -> Option<()> {
@@ -440,6 +443,7 @@ fn read_sheet(
                         ..Cell::default()
                     };
                     if ty >= 8 {
+                        last_formula = Some((row, col));
                         c.u16()?;
                         let (rgce, extra) = c.formula()?;
                         if rgce.first() == Some(&0x01) {
@@ -464,11 +468,15 @@ fn read_sheet(
                     }
                     let (rgce, extra) = c.formula()?;
                     let group = (range, rgce.to_vec(), extra.to_vec());
-                    let key = (range.0, range.2);
+                    let corner = (range.0, range.2);
                     if ty == BRT_ARR_FMLA {
-                        arrays.insert(key, group);
+                        arrays.insert(corner, group);
                     } else {
-                        shared.insert(key, group);
+                        let master = last_formula.unwrap_or(corner);
+                        if master != corner {
+                            shared.insert(corner, group.clone());
+                        }
+                        shared.insert(master, group);
                     }
                 }
                 _ => {}
@@ -480,9 +488,6 @@ fn read_sheet(
             charged = cells.len();
         }
     }
-    let contains = |&(r1, r2, c1, c2): &(u32, u32, u32, u32), (r, c): (u32, u32)| {
-        (r1..=r2).contains(&r) && (c1..=c2).contains(&c)
-    };
     for (at, master) in pending {
         if let Some((range, rgce, extra)) = arrays.get(&master) {
             // The array formula lives on its anchor; the rest are values.
@@ -497,8 +502,9 @@ fn read_sheet(
             }
             continue;
         }
-        let Some((_, rgce, extra)) = shared.get(&master).filter(|(rg, _, _)| contains(rg, at))
-        else {
+        // A cell outside the group's stated range still takes it: writers
+        // get the range wrong, and the tokens are relative to the cell.
+        let Some((_, rgce, extra)) = shared.get(&master) else {
             continue;
         };
         let f = ptg::decompile(Biff::V12, rgce, extra, Base::Shared(at.0, at.1), g);
@@ -641,6 +647,45 @@ mod tests {
         let c = &book.sheets[0].cells;
         assert_eq!(c[&(0, 2)].formula.as_deref(), Some("A1+1"));
         assert_eq!(c[&(1, 2)].formula.as_deref(), Some("A2+1"));
+    }
+
+    /// ptgExp names the group's first formula cell (B1), not the stated
+    /// range's top-left (A1:B2); members are B1, A2, B2.
+    #[test]
+    fn shared_formulas_keyed_by_the_cell_ptg_exp_names() {
+        let member = |col: u32| {
+            let mut v = cell(col, 0);
+            v.extend(0.0f64.to_le_bytes());
+            v.extend(fmla(&[0x01, 0, 0, 0, 0], &1u32.to_le_bytes()));
+            v
+        };
+        let mut shr = Vec::new();
+        for v in [0u32, 1, 0, 1] {
+            shr.extend(v.to_le_bytes());
+        }
+        // =<cell one row down>+1: ptgRefN row +1, col +0.
+        let rgce = [0x4C, 1, 0, 0, 0, 0, 0xC0, 0x1E, 1, 0, 0x03];
+        shr.extend((rgce.len() as u32).to_le_bytes());
+        shr.extend(rgce);
+        shr.extend(0u32.to_le_bytes());
+        let book = open(&xlsb(
+            &[],
+            &[
+                rec(BRT_ROW_HDR, &0u32.to_le_bytes()),
+                rec(9, &member(1)),
+                rec(BRT_SHR_FMLA, &shr),
+                rec(BRT_ROW_HDR, &1u32.to_le_bytes()),
+                rec(9, &member(0)),
+                rec(9, &member(1)),
+                rec(BRT_ROW_HDR, &2u32.to_le_bytes()),
+                rec(9, &member(1)),
+            ],
+        ));
+        let c = &book.sheets[0].cells;
+        assert_eq!(c[&(0, 1)].formula.as_deref(), Some("B2+1"));
+        assert_eq!(c[&(1, 0)].formula.as_deref(), Some("A3+1"));
+        assert_eq!(c[&(1, 1)].formula.as_deref(), Some("B3+1"));
+        assert_eq!(c[&(2, 1)].formula.as_deref(), Some("B4+1"));
     }
 
     #[test]

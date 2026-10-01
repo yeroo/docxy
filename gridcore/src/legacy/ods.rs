@@ -1163,6 +1163,32 @@ mod tests {
         assert_eq!(c[&(0, 1)].value, CellValue::Text("own".into()));
     }
 
+    /// LibreOffice allows sheet names past Excel's 31 characters: the import
+    /// cuts the name, and the formula and named range that use it follow.
+    #[test]
+    fn a_long_sheet_name_is_cut_and_its_references_follow() {
+        let long = "Quarterly figures for the region";
+        assert_eq!(long.chars().count(), 32);
+        let b = read_str(&format!(
+            r#"<table:table table:name="{long}"><table:table-row><table:table-cell office:value-type="float" office:value="5"/></table:table-row></table:table>
+            <table:table table:name="Calc"><table:table-row><table:table-cell office:value-type="float" office:value="0" table:formula="of:=['{long}'.A1]*2"/></table:table-row></table:table>
+            <table:named-expressions><table:named-range table:name="TheVal" table:cell-range-address="'{long}'.$A$1"/></table:named-expressions>"#
+        ));
+        let mut pkg = b.build();
+        let cut: String = long.chars().take(31).collect();
+        let wb = &mut pkg.workbook;
+        assert_eq!(wb.sheets[0].name, cut);
+        let mut engine = crate::engine::Engine::new(wb);
+        engine.recalc_all(wb);
+        let a1 = wb.sheets[1].cell(0, 0).unwrap();
+        assert_eq!(
+            a1.formula.as_deref(),
+            Some(format!("'{cut}'!A1*2").as_str())
+        );
+        assert_eq!(a1.value, CellValue::Number(10.0));
+        assert_eq!(wb.defined_names[0].formula, format!("'{cut}'!$A$1"));
+    }
+
     #[test]
     fn huge_digit_counts_give_a_bounded_code() {
         let xml = r#"<x><number:number-style style:name="N"><number:number number:decimal-places="4000000000" number:min-decimal-places="4000000000" number:min-integer-digits="4000000000" number:grouping="true"/></number:number-style>
