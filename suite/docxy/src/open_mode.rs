@@ -166,16 +166,65 @@ fn copy_names(src: &Path) -> impl Iterator<Item = PathBuf> + use<> {
 }
 
 /// Write a copy of `src` under the first of its [`copy_names`] that can be
-/// created, and return its path. The bytes are read and written, never
-/// `fs::copy`'d, so no alternate data stream rides along; the caller decides
-/// Protected View from the source.
+/// created, and return its path. The copy carries the source's
+/// `Zone.Identifier` stream (#610 r5), so a copy of a downloaded file is
+/// still downloaded: reopened later, from here or by any tool that reads the
+/// mark, it opens in Protected View again. A copy of a protected file that
+/// cannot be marked is removed, and the copy fails: an unmarked one would be
+/// a way around Protected View. The tab itself decides Protected View from
+/// the source.
 pub(crate) fn write_copy(src: &Path) -> Result<PathBuf, String> {
     let name = src
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let bytes = std::fs::read(src).map_err(|e| format!("could not copy \"{name}\": {e}"))?;
-    write_new(copy_names(src), &bytes).map_err(|e| format!("could not copy \"{name}\": {e}"))
+    let copy = write_new(copy_names(src), &bytes)
+        .map_err(|e| format!("could not copy \"{name}\": {e}"))?;
+    let protected = is_protected_zone(zone_id(src));
+    keep_marked(&copy, protected, carry_zone(src, &copy))
+        .map_err(|e| format!("could not mark the copy of \"{name}\" as downloaded: {e}"))?;
+    Ok(copy)
+}
+
+/// The path of `path`'s `Zone.Identifier` stream, as given (never `\\?\`).
+#[cfg(windows)]
+fn zone_stream(path: &Path) -> PathBuf {
+    let mut stream = path.as_os_str().to_owned();
+    stream.push(":Zone.Identifier");
+    PathBuf::from(stream)
+}
+
+/// Copy `src`'s `Zone.Identifier` stream onto `dst`. Nothing to do when the
+/// source has none, and off Windows.
+fn carry_zone(src: &Path, dst: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        match std::fs::read(zone_stream(src)) {
+            Ok(mark) => std::fs::write(zone_stream(dst), mark),
+            Err(_) => Ok(()),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (src, dst);
+        Ok(())
+    }
+}
+
+/// What a failed [`carry_zone`] does to the `copy` just written: for a
+/// `protected` source the copy is removed and the error stands, so no
+/// unmarked copy of a downloaded file is left behind; for any other source
+/// the mark was only a courtesy, and the copy stays.
+fn keep_marked(copy: &Path, protected: bool, carried: std::io::Result<()>) -> Result<(), String> {
+    match carried {
+        Ok(()) => Ok(()),
+        Err(e) if protected => {
+            let _ = std::fs::remove_file(copy);
+            Err(e.to_string())
+        }
+        Err(_) => Ok(()),
+    }
 }
 
 /// Write `bytes` to the first of `candidates` that does not exist, and
@@ -220,9 +269,7 @@ pub(crate) fn is_protected_zone(zone: Option<u32>) -> bool {
 pub(crate) fn zone_id(path: &Path) -> Option<u32> {
     #[cfg(windows)]
     {
-        let mut stream = path.as_os_str().to_owned();
-        stream.push(":Zone.Identifier");
-        std::fs::read(PathBuf::from(stream))
+        std::fs::read(zone_stream(path))
             .ok()
             .and_then(|bytes| parse_zone_identifier(&bytes))
     }
@@ -405,6 +452,24 @@ mod tests {
         }
     }
 
+    /// #610 r5: a copy of a protected file that could not be marked is
+    /// removed, failing closed; any other copy keeps going without its mark.
+    #[test]
+    fn an_unmarked_copy_of_a_protected_file_is_removed() {
+        let dir = Scratch::new("keep-marked");
+        let copy = dir.0.join("Copy (1)book.xlsx");
+        let failed = || Err(std::io::Error::other("no streams here"));
+        std::fs::write(&copy, b"x").unwrap();
+        let err = keep_marked(&copy, true, failed()).unwrap_err();
+        assert_eq!(err, "no streams here");
+        assert!(!copy.exists(), "the unmarked copy is gone");
+        std::fs::write(&copy, b"x").unwrap();
+        assert_eq!(keep_marked(&copy, false, failed()), Ok(()));
+        assert!(copy.exists(), "a local file's copy stays");
+        assert_eq!(keep_marked(&copy, true, Ok(())), Ok(()));
+        assert!(copy.exists());
+    }
+
     #[test]
     fn copy_names_count_up_beside_the_file() {
         let src = Path::new("dir").join("book.xlsx");
@@ -541,9 +606,9 @@ mod tests {
             return;
         }
         assert_eq!(zone_id(&file), Some(3));
-        // A copy carries no stream.
+        // A copy carries the stream: it is still downloaded (#610 r5).
         let copy = write_copy(&file).unwrap();
-        assert_eq!(zone_id(&copy), None);
+        assert_eq!(zone_id(&copy), zone_id(&file));
     }
 
     #[test]

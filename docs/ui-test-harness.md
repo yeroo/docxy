@@ -682,14 +682,17 @@ file that is already open without asking unless `reopen` is `"ask"` (see
   Save a copy under a new name.`), and to any other path it writes, rebinds
   the tab and clears `read_only`.
 - **copy**: writes `Copy (1)book.xlsx` beside the file (the first free
-  `Copy (k)`) and opens that as an ordinary tab. A copy that cannot be
-  written opens nothing and is the error.
+  `Copy (k)`) and opens that as an ordinary tab. The copy carries the
+  source's `Zone.Identifier` stream, so a copy of a downloaded file stays
+  downloaded. A copy that cannot be written, or a copy of a downloaded file
+  that cannot be marked as one, opens nothing (the unmarked copy is
+  removed) and is the error.
 - **repair**: a lenient load (`gridcore::xlsx::load_xlsx_repair`); the
   status still starts with `loaded` and names what was emptied or dropped.
   Save goes to Save As, which may pick the file itself.
 - **Protected View** is the file's, not a mode: a workbook whose
   `Zone.Identifier` stream says zone 3 or 4 opens protected in every mode,
-  Copy included. Edits and saves are refused with `Protected View — select
+  Copy included, and so does that copy when it is opened again later. Edits and saves are refused with `Protected View — select
   Enable Editing to edit`. A script cannot write that stream, so
   `uiharness/tests/protected_view.rs` (desktop-only, `--ignored`) covers it.
 

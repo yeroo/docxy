@@ -275,6 +275,16 @@ fn a_downloaded_workbook_opens_protected_until_enable_editing() {
         Some("Copy (1)book.xlsx")
     );
     assert!(flag(&copy, "protected"), "{copy}");
+    // The copy is still downloaded (#610 r5): opened again from disk, as
+    // the backstage or a double-click would, it is protected on its own.
+    let copy_path = files.join("Copy (1)book.xlsx");
+    ok(
+        &driver,
+        "open",
+        vec![("path", s(&copy_path.display().to_string()))],
+    );
+    let reopened = active_tab(&driver);
+    assert!(flag(&reopened, "protected"), "{reopened}");
 
     // Enable Editing: an edit now sticks, and Save writes the copy.
     let st = ok(&driver, "enable-editing", vec![]);

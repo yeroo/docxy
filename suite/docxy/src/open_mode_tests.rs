@@ -410,8 +410,21 @@ fn copy_of_downloaded_workbook_is_protected() {
         tab.access.protected,
         "a copy is no way around Protected View"
     );
-    // The copy carries no stream of its own.
-    assert_eq!(crate::open_mode::zone_id(&copy), None);
+    // The copy is still downloaded: it carries the source's stream (#610
+    // r5), so closing its tab and opening it again, in any mode, is
+    // protected too, as it is for any tool that reads the mark.
+    assert_eq!(
+        crate::open_mode::zone_id(&copy),
+        crate::open_mode::zone_id(&src)
+    );
+    drop(tab);
+    for mode in [OpenMode::Normal, OpenMode::ReadOnly, OpenMode::Repair] {
+        let again = tab_from_path_mode(&copy, mode).unwrap();
+        assert!(
+            again.access.protected,
+            "{mode:?}: the reopened copy is protected"
+        );
+    }
 }
 
 // ---- copy ---------------------------------------------------------------
