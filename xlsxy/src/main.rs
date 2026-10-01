@@ -2423,17 +2423,10 @@ impl App {
                                 }
                             }
                         }
-                        // A pasted array anchor covers its own cell, not the
-                        // block it was copied from — unless it lands on that
-                        // very block. `clears` isn't applied yet, so this
-                        // reads the cell as it is before a cut's clears.
-                        gridcore::sheet::anchor_pasted_array_ref(
-                            &mut new_cell,
-                            self.sheet().cell(r, c),
-                            r,
-                            c,
-                        );
                         // Overwrite position wins over source-clear on overlap.
+                        // A pasted array anchor is then typed unless it lands
+                        // on its own formula (`Engine::set_cell`): pasted back
+                        // in place, copy or cut, it keeps its block.
                         if same_sheet {
                             clears.retain(|&(cr, cc, _)| (cr, cc) != (r, c));
                         }

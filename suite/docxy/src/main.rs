@@ -1051,9 +1051,16 @@ impl ClipRead {
 }
 
 /// Write a pasted `block` onto sheet `s` from `(br, bc)`, one cell at a time
-/// through the engine. A pasted array anchor covers its own cell, not the
-/// block it was copied from, unless it lands on that very block
-/// ([`gridcore::sheet::anchor_pasted_array_ref`]).
+/// through the engine. A pasted cell is typed there (`Engine::set_cell`: an
+/// array anchor keeps its block only on its own formula), except a whole
+/// array block pasted back at its own address. An anchor whose stored `ref`
+/// starts where it lands and lies wholly inside the pasted block is restored
+/// as it was — a cut has already cleared its source, so `set_cell` would see a
+/// blank target and type it. Its `ref` covers only cells this paste writes,
+/// so it never claims cells outside the paste (pasted at the same address on
+/// another sheet, it stays an array there, as in Excel). Its spilled values
+/// in the block are written as blanks, since the anchor's recalc refills them
+/// (as constants they would block its spill), and the anchors go last.
 fn paste_grid_block(
     engine: &mut gridcore::engine::Engine,
     wb: &mut gridcore::sheet::Workbook,
@@ -1061,14 +1068,50 @@ fn paste_grid_block(
     (br, bc): (u32, u32),
     block: &[Vec<gridcore::sheet::Cell>],
 ) {
+    let in_block = |r: u32, c: u32| {
+        r >= br
+            && c >= bc
+            && block
+                .get((r - br) as usize)
+                .is_some_and(|row| ((c - bc) as usize) < row.len())
+    };
+    let mut anchors = Vec::new();
     for (dr, row) in block.iter().enumerate() {
         for (dc, cell) in row.iter().enumerate() {
             let (r, c) = (br + dr as u32, bc + dc as u32);
-            let mut cell = cell.clone();
-            let current = wb.sheets.get(s).and_then(|sh| sh.cell(r, c));
-            gridcore::sheet::anchor_pasted_array_ref(&mut cell, current, r, c);
+            let Some((r1, c1, r2, c2)) = gridcore::sheet::array_block(cell) else {
+                continue;
+            };
+            if (r1, c1) == (r, c) && (r1..=r2).all(|rr| (c1..=c2).all(|cc| in_block(rr, cc))) {
+                anchors.push((r, c, cell));
+            }
+        }
+    }
+    let spilled = |r: u32, c: u32| {
+        anchors.iter().any(|&(ar, ac, a)| {
+            a.spill
+                .is_some_and(|(h, w)| (ar..ar + h).contains(&r) && (ac..ac + w).contains(&c))
+        })
+    };
+    for (dr, row) in block.iter().enumerate() {
+        for (dc, cell) in row.iter().enumerate() {
+            let (r, c) = (br + dr as u32, bc + dc as u32);
+            if anchors.iter().any(|&(ar, ac, _)| (ar, ac) == (r, c)) {
+                continue;
+            }
+            let cell = if cell.formula.is_none() && spilled(r, c) {
+                gridcore::sheet::Cell {
+                    style: cell.style,
+                    ..Default::default()
+                }
+            } else {
+                cell.clone()
+            };
             engine.set_cell(wb, (s, r, c), cell);
         }
+    }
+    for (r, c, cell) in anchors {
+        engine.restore_cell(wb, (s, r, c), cell.clone());
     }
 }
 
@@ -15447,6 +15490,147 @@ mod clipboard_tests {
         assert_eq!(f_attrs_at(&wb, 0), None);
         paste_grid_block(&mut engine, &mut wb, 1, (0, 3), &block);
         assert_eq!(f_attrs_at(&wb, 1), Some(" t=\"array\" ref=\"D1:D3\""));
+    }
+
+    /// Two sheets, "Sheet1" and "Data"; Data holds 1, 2, 3 in A1:A3 and
+    /// `formula` as a CSE block over D1:D3, recalculated.
+    fn cse_workbook(formula: &str) -> (Workbook, Engine) {
+        let sheet = |name: &str| Sheet {
+            name: name.to_string(),
+            ..Sheet::default()
+        };
+        let mut wb = Workbook {
+            sheets: vec![sheet("Sheet1"), sheet("Data")],
+            ..Workbook::default()
+        };
+        for r in 0..3 {
+            wb.sheets[1].set_cell(r, 0, Cell::number(f64::from(r + 1)));
+        }
+        wb.sheets[1].set_cell(
+            0,
+            3,
+            Cell {
+                formula: Some(formula.into()),
+                f_attrs: Some(" t=\"array\" ref=\"D1:D3\"".into()),
+                ..Cell::default()
+            },
+        );
+        let mut engine = Engine::new(&wb);
+        engine.recalc_all(&mut wb);
+        (wb, engine)
+    }
+
+    /// The grid clip of D1:D3 on sheet `s`, as `sheet_copy` takes it.
+    fn clip_d1_d3(wb: &Workbook, s: usize) -> Vec<Vec<Cell>> {
+        (0..3)
+            .map(|r| vec![wb.sheets[s].cell(r, 3).cloned().unwrap_or_default()])
+            .collect()
+    }
+
+    /// What `sheet_copy(cut)` does to D1:D3 after taking the clip.
+    fn cut_d1_d3(engine: &mut Engine, wb: &mut Workbook, s: usize) {
+        for r in 0..3 {
+            let style = wb.sheets[s].cell(r, 3).map_or(0, |c| c.style);
+            engine.set_cell(
+                wb,
+                (s, r, 3),
+                Cell {
+                    style,
+                    ..Cell::default()
+                },
+            );
+        }
+    }
+
+    fn d_values(wb: &Workbook, s: usize) -> Vec<CellValue> {
+        (0..3)
+            .map(|r| {
+                wb.sheets[s]
+                    .cell(r, 3)
+                    .map(|c| c.value.clone())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// #785: a non-spilling CSE block cut and pasted back in place keeps its
+    /// block — the cut has already cleared it, so `set_cell` alone would
+    /// type it. A constant in the block's D2 comes back as it was.
+    #[test]
+    fn a_cut_cse_block_pasted_back_in_place_keeps_its_block() {
+        let (mut wb, mut engine) = cse_workbook("SUM(A1:A3)");
+        let clip = clip_d1_d3(&wb, 1);
+        cut_d1_d3(&mut engine, &mut wb, 1);
+        assert_eq!(f_attrs_at(&wb, 1), None, "the cut cleared the block");
+        paste_grid_block(&mut engine, &mut wb, 1, (0, 3), &clip);
+        assert_eq!(f_attrs_at(&wb, 1), Some(" t=\"array\" ref=\"D1:D3\""));
+        assert_eq!(
+            wb.sheets[1].cell(0, 3).unwrap().value,
+            CellValue::Number(6.0)
+        );
+
+        let (mut wb, mut engine) = cse_workbook("SUM(A1:A3)");
+        engine.set_cell(&mut wb, (1, 1, 3), Cell::number(7.0));
+        let clip = clip_d1_d3(&wb, 1);
+        cut_d1_d3(&mut engine, &mut wb, 1);
+        paste_grid_block(&mut engine, &mut wb, 1, (0, 3), &clip);
+        assert_eq!(f_attrs_at(&wb, 1), Some(" t=\"array\" ref=\"D1:D3\""));
+        assert_eq!(
+            wb.sheets[1].cell(1, 3).unwrap().value,
+            CellValue::Number(7.0)
+        );
+    }
+
+    /// #785: a spilling CSE block pasted back in place, copied or cut, keeps
+    /// its block and its spill: its spilled values are not pasted as
+    /// constants over its own spill, which would make it `#SPILL!`.
+    #[test]
+    fn a_spilling_cse_block_pasted_back_in_place_still_spills() {
+        let spilled = vec![
+            CellValue::Number(2.0),
+            CellValue::Number(4.0),
+            CellValue::Number(6.0),
+        ];
+        for cut in [false, true] {
+            let (mut wb, mut engine) = cse_workbook("A1:A3*2");
+            assert_eq!(d_values(&wb, 1), spilled);
+            let clip = clip_d1_d3(&wb, 1);
+            if cut {
+                cut_d1_d3(&mut engine, &mut wb, 1);
+            }
+            paste_grid_block(&mut engine, &mut wb, 1, (0, 3), &clip);
+            assert_eq!(
+                f_attrs_at(&wb, 1),
+                Some(" t=\"array\" ref=\"D1:D3\""),
+                "cut: {cut}"
+            );
+            assert_eq!(
+                wb.sheets[1].cell(0, 3).unwrap().spill,
+                Some((3, 1)),
+                "cut: {cut}"
+            );
+            assert_eq!(d_values(&wb, 1), spilled, "cut: {cut}");
+        }
+    }
+
+    /// #785: a whole spilling CSE block pasted at its own address on another
+    /// sheet stays an array there (as in Excel) and overwrites what its spill
+    /// covers; pasted at another address it is typed there, no block.
+    #[test]
+    fn a_whole_cse_block_pasted_elsewhere() {
+        let (mut wb, mut engine) = cse_workbook("A1:A3*2");
+        for r in 0..3 {
+            wb.sheets[0].set_cell(r, 0, Cell::number(10.0));
+        }
+        engine.set_cell(&mut wb, (0, 1, 3), Cell::text("mine"));
+        let clip = clip_d1_d3(&wb, 1);
+        paste_grid_block(&mut engine, &mut wb, 0, (0, 3), &clip);
+        assert_eq!(f_attrs_at(&wb, 0), Some(" t=\"array\" ref=\"D1:D3\""));
+        assert_eq!(wb.sheets[0].cell(0, 3).unwrap().spill, Some((3, 1)));
+        assert_eq!(d_values(&wb, 0), vec![CellValue::Number(20.0); 3]);
+
+        paste_grid_block(&mut engine, &mut wb, 1, (0, 5), &clip);
+        assert_eq!(wb.sheets[1].cell(0, 5).unwrap().f_attrs, None);
     }
 
     /// #699: a harness instance never reads or writes the OS clipboard, and
