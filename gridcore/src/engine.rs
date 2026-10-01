@@ -273,14 +273,16 @@ impl Engine {
         let (s, r, c) = key;
         let mut owner = wb.sheets.get(s).and_then(|sh| spill_owner(sh, r, c));
         let owner_frozen = owner.is_some_and(|((ar, ac), _)| self.is_frozen(wb, (s, ar, ac)));
-        // A frozen anchor's extent is not moved by row/column edits or a
-        // sort; its array `ref` is. Where that `ref` no longer covers the
-        // cell, the cell is not part of its block and the edit leaves the
-        // anchor alone.
+        // A frozen anchor's extent is never corrected: row/column edits
+        // shift its array `ref` but not its extent, and a sort moves the
+        // anchor (extent and all) but leaves its absolute `ref` as is. Its
+        // block is what a `ref` that starts at the anchor covers; elsewhere
+        // the cell is not part of it and the edit leaves the anchor alone.
         let frozen_ref_covers = owner.filter(|_| owner_frozen).and_then(|(anchor, _)| {
             let a = wb.sheets[s].cell(anchor.0, anchor.1)?;
             let fa = a.f_attrs.as_deref().filter(|fa| is_array_f(fa))?;
-            Some(ref_covers(fa, r, c))
+            let own = crate::sheet::ref_starts_at(fa, &crate::sheet::cell_name(anchor.0, anchor.1));
+            Some(own && crate::sheet::ref_covers(fa, r, c))
         });
         if frozen_ref_covers == Some(false) {
             owner = None;
@@ -848,21 +850,6 @@ fn clear_spill(
         }
     }
     out
-}
-
-/// Does the `ref` in preserved `<f>` attributes cover (r, c)?
-fn ref_covers(fa: &str, r: u32, c: u32) -> bool {
-    let Some(rf) = crate::sheet::f_ref(fa) else {
-        return false;
-    };
-    let (a, b) = rf.split_once(':').unwrap_or((rf, rf));
-    let (Some((r1, c1)), Some((r2, c2))) = (
-        crate::sheet::parse_cell_name(a),
-        crate::sheet::parse_cell_name(b),
-    ) else {
-        return false;
-    };
-    (r1..=r2).contains(&r) && (c1..=c2).contains(&c)
 }
 
 /// The anchor whose spill contains (r, c), if any (excluding (r, c) itself

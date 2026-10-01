@@ -202,6 +202,13 @@ pub(crate) fn ref_starts_at(fa: &str, anchor: &str) -> bool {
         .is_some_and(|tl| tl.eq_ignore_ascii_case(anchor))
 }
 
+/// Does the `ref` in preserved `<f>` attributes cover `(row, col)`?
+pub(crate) fn ref_covers(fa: &str, row: u32, col: u32) -> bool {
+    f_ref(fa)
+        .and_then(parse_range_name)
+        .is_some_and(|(r1, c1, r2, c2)| (r1..=r2).contains(&row) && (c1..=c2).contains(&col))
+}
+
 /// An array formula at `(row, col)` whose `ref` doesn't start there names
 /// another block (a clone, or a cell moved without the engine): it covers
 /// its own cell instead. A ref that does start there is left as it is.

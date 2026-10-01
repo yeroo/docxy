@@ -10801,6 +10801,34 @@ b",
     }
 
     #[test]
+    fn delete_inside_a_sorted_frozen_arrays_stale_extent_still_clears() {
+        // #777 r5: a sort moves a frozen anchor (extent and all) but leaves
+        // its ref naming E1:E3; at E2 that ref is another block's, so its
+        // stale extent claims nothing: Delete on the user's "x" clears it.
+        let rows = concat!(
+            r#"<row r="1"><c r="A1"><v>2</v></c><c r="E1" cm="1"><f t="array" ref="E1:E3">_xlfn.PIVOTBY(A1,4)</f><v>7</v></c></row>"#,
+            r#"<row r="2"><c r="A2"><v>1</v></c><c r="E2"><v>8</v></c></row>"#,
+            r#"<row r="3"><c r="A3"><v>4</v></c><c r="E3"><v>9</v></c></row>"#,
+            r#"<row r="4"><c r="A4"><v>3</v></c><c r="E4" t="inlineStr"><is><t>x</t></is></c></row>"#,
+        );
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        crate::edit::sort_rows(&mut pkg.workbook, 0, 0, 3, &[(0, true)]);
+        let at = |pkg: &SheetPackage, r: u32| {
+            pkg.workbook.sheets[0]
+                .cell(r, 4)
+                .map_or(CellValue::Empty, |cl| cl.value.clone())
+        };
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(1, 4).unwrap().spill,
+            Some((3, 1))
+        );
+        assert_eq!(at(&pkg, 2), CellValue::Text("x".into()));
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 2, 4), Cell::default());
+        assert_eq!(at(&pkg, 2), CellValue::Empty);
+    }
+
+    #[test]
     fn cm_is_written_only_on_an_array_formula() {
         // A data-table `<f>` is kept verbatim but is not a dynamic array.
         let rows = r#"<row r="1"><c r="A1"><v>1</v></c><c r="G1" cm="1"><f t="dataTable" ref="G1:G2" dt2D="0" dtr="0" r1="A1"/><v>1</v></c></row>"#;
