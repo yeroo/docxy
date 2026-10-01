@@ -1107,3 +1107,24 @@ fn a_fill_mixing_a_blank_into_a_frozen_block_clears_it() {
     assert_eq!(value(&v, 1, 4), CellValue::Empty);
     assert_eq!(value(&v, 2, 4), CellValue::Number(5.0));
 }
+
+#[test]
+fn a_sort_across_a_spill_is_refused_with_a_reason() {
+    // #840: rows that cut a spilled array don't sort; `entry_error` (shown
+    // in the tab's status) says why, and no undo step is pushed.
+    let mut v = view();
+    for (r, n) in [3.0, 1.0, 2.0].iter().enumerate() {
+        put(&mut v, r as u32, 0, Cell::number(*n));
+    }
+    put(&mut v, 0, 2, Cell::formula("SEQUENCE(3)"));
+    assert_eq!(value(&v, 2, 2), CellValue::Number(3.0));
+    select(&mut v, 0, 0);
+    let undo = v.undo.len();
+    assert_eq!(v.sort_with_pending_edit(None, &[(0, true)]), (false, false));
+    assert_eq!(
+        v.entry_error.as_deref(),
+        Some(gridcore::edit::SORT_CUTS_SPILL)
+    );
+    assert_eq!(v.undo.len(), undo);
+    assert_eq!(value(&v, 0, 0), CellValue::Number(3.0));
+}

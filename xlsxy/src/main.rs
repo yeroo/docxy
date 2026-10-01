@@ -4507,6 +4507,10 @@ impl App {
             return;
         };
         let s = self.sheet;
+        if gridcore::edit::sort_cuts_spill(&self.pkg.workbook, s, start, bottom) {
+            self.status = Some(gridcore::edit::SORT_CUTS_SPILL.into());
+            return;
+        }
         self.structural(move |wb| {
             gridcore::edit::sort_rows(wb, s, start, bottom, &[(sc, ascending)]);
         });
@@ -4528,6 +4532,10 @@ impl App {
             return;
         };
         let s = self.sheet;
+        if gridcore::edit::sort_cuts_spill(&self.pkg.workbook, s, start, bottom) {
+            self.status = Some(gridcore::edit::SORT_CUTS_SPILL.into());
+            return;
+        }
         let keys2 = keys.clone();
         self.structural(move |wb| {
             gridcore::edit::sort_rows(wb, s, start, bottom, &keys2);
@@ -9444,6 +9452,34 @@ mod tests {
         let v = |r, c| app.sheet().cell(r, c).unwrap().value.clone();
         assert_eq!(v(1, 0), CellValue::Text("B".into()));
         assert_eq!(v(3, 0), CellValue::Text("A".into()));
+    }
+
+    #[test]
+    fn a_sort_across_a_spill_is_refused() {
+        // #840: rows that cut a spilled array don't sort; the status says
+        // why and no undo step is pushed. A1:A3 = 3, 1, 2 beside C1
+        // `=SEQUENCE(3)`.
+        use gridcore::sheet::{Cell, CellValue};
+        let mut app = app_with_sequence_in_c1();
+        for (r, n) in [3.0, 1.0, 2.0].iter().enumerate() {
+            app.pkg.workbook.sheets[0].set_cell(r as u32, 0, Cell::number(*n));
+        }
+        app.rebuild_engine();
+        let before = app.sheet().cells.clone();
+        let undo = app.undo.len();
+        app.cur = (0, 0);
+        app.anchor = None;
+        app.sort_region(true);
+        assert_eq!(app.status.as_deref(), Some(gridcore::edit::SORT_CUTS_SPILL));
+        app.status = None;
+        app.commit_sort("A desc");
+        assert_eq!(app.status.as_deref(), Some(gridcore::edit::SORT_CUTS_SPILL));
+        assert_eq!(app.sheet().cells, before);
+        assert_eq!(app.undo.len(), undo);
+        assert_eq!(
+            app.sheet().cell(0, 0).unwrap().value,
+            CellValue::Number(3.0)
+        );
     }
 
     #[test]

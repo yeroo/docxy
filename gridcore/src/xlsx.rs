@@ -11720,31 +11720,61 @@ b",
     }
 
     #[test]
-    fn delete_inside_a_sorted_frozen_arrays_stale_extent_still_clears() {
-        // #777 r5: a sort moves a frozen anchor (extent and all) but leaves
-        // its ref naming E1:E3; at E2 that ref is another block's, so its
-        // stale extent claims nothing: Delete on the user's "x" clears it.
+    fn a_sort_cutting_an_array_block_is_refused() {
+        // #840 (r4-pre-structural-spill): a sort through a frozen dynamic
+        // array, or a legacy CSE block, would scatter its block; it is
+        // refused and leaves the rows, the extent and the saved `ref` alone.
+        for (cm, f) in [(r#" cm="1""#, "_xlfn.PIVOTBY(A1,4)"), ("", "A1:A3*2")] {
+            let rows = format!(
+                concat!(
+                    r#"<row r="1"><c r="A1"><v>2</v></c><c r="E1"{cm}><f t="array" ref="E1:E3">{f}</f><v>7</v></c></row>"#,
+                    r#"<row r="2"><c r="A2"><v>1</v></c><c r="E2"><v>8</v></c></row>"#,
+                    r#"<row r="3"><c r="A3"><v>4</v></c><c r="E3"><v>9</v></c></row>"#,
+                    r#"<row r="4"><c r="A4"><v>3</v></c><c r="E4" t="inlineStr"><is><t>x</t></is></c></row>"#,
+                ),
+                cm = cm,
+                f = f
+            );
+            let mut pkg = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
+            let before = pkg.workbook.sheets[0].cells.clone();
+            assert!(crate::edit::sort_cuts_spill(&pkg.workbook, 0, 0, 3), "{f}");
+            let n = crate::edit::sort_rows(&mut pkg.workbook, 0, 0, 3, &[(0, true)]);
+            assert_eq!(n, 0, "{f}");
+            assert_eq!(pkg.workbook.sheets[0].cells, before, "{f}");
+            let ws = saved_sheet1(&pkg);
+            assert!(ws.contains(r#"<f t="array" ref="E1:E3">"#), "{f}: {ws}");
+        }
+    }
+
+    #[test]
+    fn a_sorted_one_row_frozen_array_keeps_its_block() {
+        // #840: a sort moves a one-row frozen array with its row, `ref` and
+        // all, so its block is still its own there: Delete on a cached cell
+        // is a no-op, and save writes the block at its new row.
         let rows = concat!(
-            r#"<row r="1"><c r="A1"><v>2</v></c><c r="E1" cm="1"><f t="array" ref="E1:E3">_xlfn.PIVOTBY(A1,4)</f><v>7</v></c></row>"#,
-            r#"<row r="2"><c r="A2"><v>1</v></c><c r="E2"><v>8</v></c></row>"#,
-            r#"<row r="3"><c r="A3"><v>4</v></c><c r="E3"><v>9</v></c></row>"#,
-            r#"<row r="4"><c r="A4"><v>3</v></c><c r="E4" t="inlineStr"><is><t>x</t></is></c></row>"#,
+            r#"<row r="1"><c r="A1"><v>9</v></c><c r="E1" cm="1"><f t="array" ref="E1:G1">_xlfn.PIVOTBY(A1,4)</f><v>7</v></c><c r="F1"><v>8</v></c><c r="G1"><v>9</v></c></row>"#,
+            r#"<row r="2"><c r="A2"><v>1</v></c></row>"#,
+            r#"<row r="3"><c r="A3"><v>5</v></c></row>"#,
         );
         let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
-        crate::edit::sort_rows(&mut pkg.workbook, 0, 0, 3, &[(0, true)]);
-        let at = |pkg: &SheetPackage, r: u32| {
-            pkg.workbook.sheets[0]
-                .cell(r, 4)
-                .map_or(CellValue::Empty, |cl| cl.value.clone())
-        };
         assert_eq!(
-            pkg.workbook.sheets[0].cell(1, 4).unwrap().spill,
-            Some((3, 1))
+            crate::edit::sort_rows(&mut pkg.workbook, 0, 0, 2, &[(0, true)]),
+            3
         );
-        assert_eq!(at(&pkg, 2), CellValue::Text("x".into()));
+        let e3 = pkg.workbook.sheets[0].cell(2, 4).unwrap();
+        assert_eq!(e3.spill, Some((1, 3)));
+        assert!(e3.f_attrs.as_deref().unwrap().contains(r#"ref="E3:G3""#));
         let mut eng = crate::engine::Engine::new(&pkg.workbook);
-        eng.set_cell(&mut pkg.workbook, (0, 2, 4), Cell::default());
-        assert_eq!(at(&pkg, 2), CellValue::Empty);
+        eng.set_cell(&mut pkg.workbook, (0, 2, 5), Cell::default());
+        let at = |c: u32| pkg.workbook.sheets[0].cell(2, c).map(|cl| cl.value.clone());
+        assert_eq!(at(5), Some(CellValue::Number(8.0)));
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(2, 4).unwrap().spill,
+            Some((1, 3))
+        );
+        let ws = saved_sheet1(&pkg);
+        assert!(ws.contains(r#"<f t="array" ref="E3:G3">"#), "{ws}");
+        assert!(ws.contains(r#"<c r="F3"><v>8</v></c>"#), "{ws}");
     }
 
     #[test]

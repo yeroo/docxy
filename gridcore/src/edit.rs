@@ -18,8 +18,8 @@ use crate::formula::{
     rename_sheet_in_expr, rename_sheet_in_formula, to_string, translate, translate_formula,
 };
 use crate::sheet::{
-    Cell, CellValue, MAX_COLS, MAX_ROWS, Sheet, Styles, Workbook, f_ref, is_array_f, own_array_ref,
-    with_ref,
+    Cell, CellValue, MAX_COLS, MAX_ROWS, Sheet, Styles, Workbook, cell_name, f_ref, is_array_f,
+    own_array_ref, ref_starts_at, with_ref,
 };
 
 /// Read text as a bare value: formulas, plain numbers (incl. percent),
@@ -357,22 +357,27 @@ pub fn parse_sort_spec(s: &str) -> Option<Vec<(u32, bool)>> {
 /// whole column" idiom, and materialising a million rows × every used column
 /// would exhaust memory long before it sorted anything. Rows past the used
 /// region are empty, so they sort last either way.
+///
+/// Rows that cut a spilled array ([`sort_cuts_spill`]) are not sorted: as in
+/// Excel, part of an array can't be moved. An array within one row moves
+/// with it, its own `ref` too.
 pub fn sort_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, keys: &[(u32, bool)]) -> usize {
     use std::cmp::Ordering;
+    if sort_cuts_spill(wb, sheet, r1, r2) {
+        return 0;
+    }
     let Some(s) = wb.sheets.get_mut(sheet) else {
         return 0;
     };
-    let (used_rows, cols) = s.used_size();
-    if cols == 0 || used_rows == 0 {
+    let Some((r2, max_c)) = sort_span(s, r1, r2) else {
+        return 0;
+    };
+    if keys.is_empty() {
         return 0;
     }
-    let r2 = r2.min(used_rows - 1);
-    if keys.is_empty() || r2 <= r1 {
-        return 0;
-    }
-    let max_c = cols - 1;
-    let mut rows: Vec<Vec<Option<Cell>>> = (r1..=r2)
-        .map(|r| (0..=max_c).map(|c| s.cell(r, c).cloned()).collect())
+    // Each row with the row it came from.
+    let mut rows: Vec<(u32, Vec<Option<Cell>>)> = (r1..=r2)
+        .map(|r| (r, (0..=max_c).map(|c| s.cell(r, c).cloned()).collect()))
         .collect();
     let is_blank = |cell: &Option<Cell>| cell.as_ref().is_none_or(|c| c.is_blank());
     // Cross-type rank so values of different kinds order deterministically.
@@ -395,7 +400,7 @@ pub fn sort_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, keys: &[(u32
         (Some(CellValue::Bool(x)), Some(CellValue::Bool(y))) => x.cmp(y),
         _ => rank(ka).cmp(&rank(kb)),
     };
-    rows.sort_by(|a, b| {
+    rows.sort_by(|(_, a), (_, b)| {
         for &(col, asc) in keys {
             let col = col as usize;
             if col > max_c as usize {
@@ -418,11 +423,14 @@ pub fn sort_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, keys: &[(u32
         }
         Ordering::Equal
     });
-    for (i, row) in rows.into_iter().enumerate() {
+    for (i, (from, row)) in rows.into_iter().enumerate() {
         let r = r1 + i as u32;
         for (c, cell) in row.into_iter().enumerate() {
             match cell {
-                Some(cl) => s.set_cell(r, c as u32, cl),
+                Some(mut cl) => {
+                    move_own_array_ref(&mut cl, (from, c as u32), r);
+                    s.set_cell(r, c as u32, cl)
+                }
                 None => {
                     s.cells.remove(&(r, c as u32));
                 }
@@ -430,6 +438,59 @@ pub fn sort_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, keys: &[(u32
         }
     }
     (r2 - r1 + 1) as usize
+}
+
+/// What hosts tell the user when [`sort_cuts_spill`] refuses a sort.
+pub const SORT_CUTS_SPILL: &str = "Can't sort: the rows cut a spilled array";
+
+/// Would sorting rows `r1..=r2` of `sheet` ([`sort_rows`], which moves every
+/// column of a row) cut a spilled array: one, live or frozen, whose extent
+/// spans two rows or more and meets those rows? Hosts ask before they sort,
+/// to say why nothing moved.
+pub fn sort_cuts_spill(wb: &Workbook, sheet: usize, r1: u32, r2: u32) -> bool {
+    let Some(s) = wb.sheets.get(sheet) else {
+        return false;
+    };
+    let Some((r2, _)) = sort_span(s, r1, r2) else {
+        return false;
+    };
+    s.cells.iter().any(|(&(ar, _), cell)| {
+        cell.spill
+            .is_some_and(|(h, _)| h > 1 && ar <= r2 && ar.saturating_add(h - 1) >= r1)
+    })
+}
+
+/// The rows [`sort_rows`] sorts of `r1..=r2` and the last column it moves:
+/// `r2` clamped to the last used row, `None` when that leaves under two rows.
+fn sort_span(s: &Sheet, r1: u32, r2: u32) -> Option<(u32, u32)> {
+    let (used_rows, cols) = s.used_size();
+    if cols == 0 || used_rows == 0 {
+        return None;
+    }
+    let r2 = r2.min(used_rows - 1);
+    (r2 > r1).then_some((r2, cols - 1))
+}
+
+/// A spilling array anchor moved from `from` to row `to` takes its block
+/// along: its `ref`, when the anchor owns it (starts there), is rewritten to
+/// its extent at the new row. Left behind, it would name the old rows, and
+/// the cached block of an anchor the engine can't evaluate would no longer
+/// count as its own.
+fn move_own_array_ref(cell: &mut Cell, (from, col): (u32, u32), to: u32) {
+    let Some((h, w)) = cell.spill else {
+        return;
+    };
+    let Some(fa) = cell.f_attrs.as_deref().filter(|fa| is_array_f(fa)) else {
+        return;
+    };
+    if from == to || !ref_starts_at(fa, &cell_name(from, col)) {
+        return;
+    }
+    let mut block = cell_name(to, col);
+    if (h, w) != (1, 1) {
+        block = format!("{block}:{}", cell_name(to + h - 1, col + w - 1));
+    }
+    cell.f_attrs = Some(with_ref(fa, &block));
 }
 
 /// Auto-fill from a source range by dragging its fill handle. `to` is the far
@@ -2121,6 +2182,65 @@ mod tests {
             Some(CellValue::Number(3.0))
         );
         assert!(s.cell(3, 0).is_none_or(|c| c.is_blank()));
+    }
+
+    /// A1:A4 = 3, 1, 4, 2 and a spilling `formula` typed at E1, evaluated.
+    fn data_with_spill_at_e1(formula: &str) -> (Workbook, crate::engine::Engine) {
+        let mut w = wb(&[
+            ("A1", Cell::number(3.0)),
+            ("A2", Cell::number(1.0)),
+            ("A3", Cell::number(4.0)),
+            ("A4", Cell::number(2.0)),
+        ]);
+        let mut eng = crate::engine::Engine::new(&w);
+        eng.set_cell(&mut w, (0, 0, 4), Cell::formula(formula));
+        (w, eng)
+    }
+
+    #[test]
+    fn sort_refuses_rows_that_cut_a_spill() {
+        // #840 (r4-pre-structural-spill): rows that meet a spill of two rows
+        // or more don't sort, whether they hold its anchor or only some of
+        // its cells; rows clear of it do.
+        let (mut w, _) = data_with_spill_at_e1("SEQUENCE(3)");
+        assert_eq!(w.sheets[0].cell(0, 4).unwrap().spill, Some((3, 1)));
+        let before = w.sheets[0].cells.clone();
+        for (r1, r2) in [(0, 3), (2, 3), (1, 1_048_575)] {
+            assert!(sort_cuts_spill(&w, 0, r1, r2), "{r1}..={r2}");
+            assert_eq!(sort_rows(&mut w, 0, r1, r2, &[(0, true)]), 0);
+            assert_eq!(w.sheets[0].cells, before, "{r1}..={r2}");
+        }
+        w.sheets[0].set_cell(4, 0, Cell::number(9.0));
+        w.sheets[0].set_cell(5, 0, Cell::number(8.0));
+        assert!(!sort_cuts_spill(&w, 0, 3, 5));
+        assert_eq!(sort_rows(&mut w, 0, 3, 5, &[(0, true)]), 3);
+        assert_eq!(value_at(&w, "A4"), CellValue::Number(2.0));
+        assert_eq!(value_at(&w, "A6"), CellValue::Number(9.0));
+    }
+
+    #[test]
+    fn sort_moves_a_one_row_spill_with_its_row() {
+        // #840: a spill within one row moves with it and spills there.
+        let (mut w, _) = data_with_spill_at_e1("SEQUENCE(1,3)");
+        assert_eq!(w.sheets[0].cell(0, 4).unwrap().spill, Some((1, 3)));
+        assert!(!sort_cuts_spill(&w, 0, 0, 3));
+        assert_eq!(sort_rows(&mut w, 0, 0, 3, &[(0, true)]), 4);
+        // A1 = 3 sorts third.
+        let mut eng = crate::engine::Engine::new(&w);
+        eng.recalc_all(&mut w);
+        let row = |w: &Workbook, r: u32| -> Vec<CellValue> {
+            (4..7)
+                .map(|c| {
+                    w.sheets[0]
+                        .cell(r, c)
+                        .map_or(CellValue::Empty, |cl| cl.value.clone())
+                })
+                .collect()
+        };
+        let n = |v: f64| CellValue::Number(v);
+        assert_eq!(row(&w, 2), vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(row(&w, 0), vec![CellValue::Empty; 3]);
+        assert_eq!(w.sheets[0].cell(2, 4).unwrap().spill, Some((1, 3)));
     }
 
     #[test]

@@ -588,10 +588,11 @@ impl Engine {
         let owner = wb.sheets.get(s).and_then(|sh| spill_owner(sh, r, c));
         let frozen = owner.is_some_and(|((ar, ac), _)| self.is_frozen(wb, (s, ar, ac)));
         // A frozen anchor's extent is never corrected: row/column edits
-        // shift its array `ref` but not its extent, and a sort moves the
-        // anchor (extent and all) but leaves its absolute `ref` as is. Its
-        // block is what a `ref` that starts at the anchor covers; elsewhere
-        // the cell is not part of it and the edit leaves the anchor alone.
+        // shift its array `ref` but not its extent, and a sort moves a
+        // one-row anchor (extent and all) but leaves a `ref` it does not own
+        // as is. Its block is what a `ref` that starts at the anchor covers;
+        // elsewhere the cell is not part of it and the edit leaves the
+        // anchor alone.
         let frozen_ref_covers = owner.filter(|_| frozen).and_then(|(anchor, _)| {
             let a = wb.sheets[s].cell(anchor.0, anchor.1)?;
             let fa = a.f_attrs.as_deref().filter(|fa| is_array_f(fa))?;

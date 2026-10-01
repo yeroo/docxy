@@ -2104,7 +2104,8 @@ impl SheetView {
         (bottom > start).then_some((start, bottom))
     }
 
-    /// Commit the editor before computing bounds or sorting its row.
+    /// Commit the editor before computing bounds or sorting its row. Rows
+    /// that cut a spilled array are not sorted: `entry_error` says why.
     fn sort_with_pending_edit(
         &mut self,
         field: Option<(u32, u32, u32, u32)>,
@@ -2117,6 +2118,10 @@ impl SheetView {
         let Some((start, bottom)) = sort_rows_from(field, self.sort_bounds()) else {
             return (committed, false);
         };
+        if gridcore::edit::sort_cuts_spill(&self.pkg.workbook, self.active, start, bottom) {
+            self.entry_error = Some(gridcore::edit::SORT_CUTS_SPILL.into());
+            return (committed, false);
+        }
         self.push_undo();
         gridcore::edit::sort_rows(&mut self.pkg.workbook, self.active, start, bottom, keys);
         self.engine = sheet_engine(&self.pkg.workbook);
