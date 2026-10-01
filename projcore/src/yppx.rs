@@ -121,8 +121,32 @@ fn decoded(raw: &str) -> String {
     value
 }
 
-fn local_name(name: &str) -> &str {
-    name.rsplit_once(':').map_or(name, |(_, local)| local)
+const CT_NS: &str = "http://schemas.openxmlformats.org/package/2006/content-types";
+
+/// The local name of the current start element when it is a content-types
+/// element: in the OPC content-types namespace, or in no namespace (the
+/// unqualified form hand-written maps and the existing tests use; an
+/// unqualified child of a prefixed root is accepted the same way). `Err` means the prefix is unbound, which
+/// makes the map namespace-malformed.
+fn content_types_name<'a>(parser: &XmlParser<'a>) -> Result<Option<&'a str>, ()> {
+    let name = parser.name();
+    let (declaration, local) = match name.split_once(':') {
+        Some((prefix, local)) => (Some(prefix), local),
+        None => (None, name),
+    };
+    let namespace = parser
+        .namespace_attrs()
+        .iter()
+        .find(|attr| match declaration {
+            Some(prefix) => attr.name.strip_prefix("xmlns:") == Some(prefix),
+            None => attr.name == "xmlns",
+        })
+        .map(|attr| attr.value);
+    match (declaration, namespace) {
+        (Some(_), None | Some("")) => Err(()),
+        (_, None | Some("") | Some(CT_NS)) => Ok(Some(local)),
+        _ => Ok(None),
+    }
 }
 
 fn decode_content_types(bytes: &[u8]) -> Option<String> {
@@ -157,11 +181,11 @@ fn read_content_types(xml: &str, package: &mut PackageParts) -> Option<()> {
     loop {
         match parser.next() {
             Event::Start => {
-                let name = local_name(parser.name());
-                if stack.is_empty() && (root_closed || name != "Types") {
+                let name = content_types_name(&parser).ok()?;
+                if stack.is_empty() && (root_closed || name != Some("Types")) {
                     return None;
                 }
-                if stack.len() == 1 && name == "Default" {
+                if stack.len() == 1 && name == Some("Default") {
                     let ext = decoded(parser.attr("Extension"));
                     let kind = decoded(parser.attr("ContentType"));
                     if !ext.is_empty() && !kind.is_empty() {
@@ -171,7 +195,7 @@ fn read_content_types(xml: &str, package: &mut PackageParts) -> Option<()> {
                             defaults.push((ext, kind));
                         }
                     }
-                } else if stack.len() == 1 && name == "Override" {
+                } else if stack.len() == 1 && name == Some("Override") {
                     let part = decoded(parser.attr("PartName"));
                     let kind = decoded(parser.attr("ContentType"));
                     if !part.is_empty() && !kind.is_empty() {
@@ -196,7 +220,7 @@ fn read_content_types(xml: &str, package: &mut PackageParts) -> Option<()> {
             }
         }
     }
-    if !root_closed || !stack.is_empty() {
+    if !root_closed || !stack.is_empty() || parser.is_malformed() {
         return None;
     }
     let kept = |part: &str| {
@@ -809,6 +833,95 @@ mod tests {
             ORIGINAL_CONTENT_TYPES.as_bytes()
         );
         assert_eq!(zip.read("views.xml").unwrap(), b"<views/>");
+    }
+
+    /// Round-trip a package whose map is `content_types` and that keeps
+    /// `views.xml`, returning the written map.
+    fn round_trip_map(content_types: &str) -> String {
+        let source = with_parts(content_types, &[("views.xml", b"<views/>")]);
+        let output = write_yppx(&read_yppx(&source).unwrap()).unwrap();
+        let zip = ZipArchive::open(&output).unwrap();
+        assert_eq!(zip.read("views.xml").unwrap(), b"<views/>");
+        String::from_utf8(zip.read(CONTENT_TYPES_PART).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn end_tag_tail_discards_content_type_map() {
+        assert_eq!(
+            round_trip_map(
+                "<Types><Override PartName=\"/views.xml\" ContentType=\"application/x-views\"/></Types bogus>"
+            ),
+            ORIGINAL_CONTENT_TYPES
+        );
+    }
+
+    #[test]
+    fn unterminated_markup_after_root_discards_content_type_map() {
+        for tail in ["<!-- unterminated", "<?pi", "<"] {
+            assert_eq!(
+                round_trip_map(&format!(
+                    "<Types><Override PartName=\"/views.xml\" ContentType=\"application/x-views\"/></Types>{tail}"
+                )),
+                ORIGINAL_CONTENT_TYPES,
+                "tail {tail:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_prefixed_override_is_ignored() {
+        let map = round_trip_map(&format!(
+            "<ct:Types xmlns:ct=\"{CT_NS}\" xmlns:x=\"urn:vendor\"><ct:Default Extension=\"png\" ContentType=\"image/png\"/><x:Override PartName=\"/views.xml\" ContentType=\"application/x-vendor\"/></ct:Types>"
+        ));
+        assert!(map.contains("<Default Extension=\"png\" ContentType=\"image/png\"/>"));
+        assert!(!map.contains("application/x-vendor"));
+        assert!(!map.contains("/views.xml"));
+    }
+
+    #[test]
+    fn foreign_default_namespace_override_is_ignored() {
+        let map = round_trip_map(&format!(
+            "<Types xmlns=\"{CT_NS}\"><Default Extension=\"png\" ContentType=\"image/png\"/><Override xmlns=\"urn:vendor\" PartName=\"/views.xml\" ContentType=\"application/x-vendor\"/></Types>"
+        ));
+        assert!(map.contains("<Default Extension=\"png\" ContentType=\"image/png\"/>"));
+        assert!(!map.contains("application/x-vendor"));
+    }
+
+    #[test]
+    fn foreign_namespace_root_discards_content_type_map() {
+        assert_eq!(
+            round_trip_map(
+                "<Types xmlns=\"urn:vendor\"><Override PartName=\"/views.xml\" ContentType=\"application/x-views\"/></Types>"
+            ),
+            ORIGINAL_CONTENT_TYPES
+        );
+    }
+
+    #[test]
+    fn unbound_prefix_discards_content_type_map() {
+        for map in [
+            "<a:Types><Override PartName=\"/views.xml\" ContentType=\"application/x-views\"/></a:Types>",
+            "<Types><Override PartName=\"/views.xml\" ContentType=\"application/x-views\"/><x:Default Extension=\"png\" ContentType=\"image/png\"/></Types>",
+        ] {
+            assert_eq!(round_trip_map(map), ORIGINAL_CONTENT_TYPES, "{map:?}");
+        }
+    }
+
+    #[test]
+    fn qualified_content_type_maps_are_still_read() {
+        for map in [
+            format!(
+                "<Types xmlns=\"{CT_NS}\"><Override PartName=\"/views.xml\" ContentType=\"application/x-views\"/></Types>"
+            ),
+            format!(
+                "<ct:Types xmlns:ct=\"{CT_NS}\"><ct:Override PartName=\"/views.xml\" ContentType=\"application/x-views\"/></ct:Types>"
+            ),
+        ] {
+            assert!(
+                round_trip_map(&map).contains("application/x-views"),
+                "{map:?}"
+            );
+        }
     }
 
     #[test]
