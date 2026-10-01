@@ -2789,7 +2789,7 @@ mod tests {
         };
         set_on(&mut a, 1, "2");
         set_on(&mut a, 2, "3");
-        a.goto_sheet(2);
+        a.goto_sheet(1);
         a.cur = (0, 0);
         a.copy(true);
         dispatch(
@@ -2798,7 +2798,8 @@ mod tests {
             &Json::obj(vec![("sheet", Json::Num(0.0))]),
         )
         .unwrap();
-        // Second is now sheet 0 and Third sheet 1, still active.
+        // Second is now sheet 0 and Third sheet 1: the cut's recorded index
+        // is in range but names Third.
         a.goto_sheet(0);
         a.cur = (0, 5);
         a.paste();
@@ -2806,7 +2807,7 @@ mod tests {
             |a: &App, s: usize, r, c| a.pkg.workbook.sheets[s].cell(r, c).map(|x| x.value.clone());
         assert_eq!(text(&a, 0, 0, 0), Some(CellValue::Number(2.0)));
         assert_eq!(text(&a, 1, 0, 0), Some(CellValue::Number(3.0)));
-        assert_eq!(text(&a, 0, 0, 5), Some(CellValue::Number(3.0)));
+        assert_eq!(text(&a, 0, 0, 5), Some(CellValue::Number(2.0)));
     }
 
     #[test]

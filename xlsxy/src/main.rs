@@ -2374,16 +2374,28 @@ impl App {
         if own {
             if let Some(clip) = self.clip.clone() {
                 // A cut clears its source (once), on the sheet it came from.
-                // A source sheet that is gone makes it a copy.
-                let cut = clip.cut && clip.sheet < self.pkg.workbook.sheets.len();
+                // A source sheet that is gone makes it a copy, and so does a
+                // protected one: the clear would edit a locked sheet off-screen.
                 let same_sheet = clip.sheet == self.sheet;
+                let source_locked = clip.cut
+                    && !same_sheet
+                    && self
+                        .pkg
+                        .workbook
+                        .sheets
+                        .get(clip.sheet)
+                        .is_some_and(|s| s.is_protected());
+                let cut = clip.cut && clip.sheet < self.pkg.workbook.sheets.len() && !source_locked;
                 let mut clears = Vec::new();
                 if cut {
                     let (fr, fc) = clip.from;
                     for (dr, row) in clip.cells.iter().enumerate() {
                         for (dc, cell) in row.iter().enumerate() {
-                            if cell.is_some() {
-                                clears.push((fr + dr as u32, fc + dc as u32, Cell::default()));
+                            // A cell pushed off the grid's edge isn't
+                            // written, so its source stays.
+                            let (dr, dc) = (dr as u32, dc as u32);
+                            if cell.is_some() && r0 + dr < MAX_ROWS && c0 + dc < MAX_COLS {
+                                clears.push((fr + dr, fc + dc, Cell::default()));
                             }
                         }
                     }
@@ -2434,7 +2446,11 @@ impl App {
                 } else {
                     self.apply_groups(vec![(clip.sheet, clears), (self.sheet, writes)]);
                 }
-                self.status = Some("Pasted".to_string());
+                self.status = Some(if source_locked {
+                    "Pasted (source sheet is protected; cut kept as copy)".to_string()
+                } else {
+                    "Pasted".to_string()
+                });
                 return;
             }
         }
@@ -9855,6 +9871,59 @@ mod tests {
         let some = |v: [f64; 4]| v.map(Some).to_vec();
         assert_eq!(block_values(&app, 0, 0, 5), some([1.0, 2.0, 3.0, 4.0]));
         assert_eq!(block_values(&app, 0, 0, 0), some([10.0, 11.0, 12.0, 13.0]));
+    }
+
+    #[test]
+    fn a_cut_whose_sheet_is_deleted_spares_the_sheet_that_takes_its_index() {
+        // Deleting Sheet1 under a pending cut of Sheet1!A1:B2 makes Sheet2
+        // index 0; the paste must not clear Sheet2!A1:B2 as the cut source.
+        let mut app = cross_sheet_cut_app();
+        app.anchor = Some((0, 0));
+        app.cur = (1, 1);
+        app.copy(true);
+        app.delete_current_sheet();
+        assert_eq!(app.pkg.workbook.sheets[0].name, "Sheet2");
+        app.cur = (0, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 0, 0), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 0, 0, 5), some([10.0, 11.0, 12.0, 13.0]));
+    }
+
+    #[test]
+    fn a_cut_pasted_at_the_grid_edge_keeps_the_cells_it_cannot_write() {
+        // Cut A1:B1 pasted at XFD1: A1 moves to XFD1, B1 would land past
+        // the last column, so it is neither written nor cleared.
+        let mut app = cross_sheet_cut_app();
+        app.anchor = Some((0, 0));
+        app.cur = (0, 1);
+        app.copy(true);
+        app.anchor = None;
+        app.cur = (0, MAX_COLS - 1);
+        app.paste();
+        let num = |c| match app.pkg.workbook.sheets[0].cell(0, c).map(|x| &x.value) {
+            Some(CellValue::Number(n)) => Some(*n),
+            _ => None,
+        };
+        assert_eq!(num(MAX_COLS - 1), Some(10.0));
+        assert_eq!(num(0), None);
+        assert_eq!(num(1), Some(11.0));
+    }
+
+    #[test]
+    fn a_cut_from_a_protected_sheet_pastes_elsewhere_as_a_copy() {
+        // Clearing the source would edit a protected sheet off-screen.
+        let mut app = cross_sheet_cut_app();
+        app.pkg.workbook.sheets[1].set_protected(true);
+        app.cur = (0, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 0, 5), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 1, 0, 0), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Pasted (source sheet is protected; cut kept as copy)")
+        );
     }
 
     #[test]
