@@ -5254,6 +5254,13 @@ mod tests {
             range: (0, 0, 4, 1),
             columns: Vec::new(),
         });
+        // Likewise the print area: a save drops one the model doesn't hold,
+        // as Clear Print Area does (#612).
+        pkg.workbook.defined_names.push(DefinedName {
+            name: "_xlnm.Print_Area".into(),
+            scope: Some(1),
+            formula: "Report!$A$1:$D$20".into(),
+        });
         let mut s = Session::open(&save_xlsx(&pkg)).expect("open");
         assert!(s.pkg.workbook.sheets[1].auto_filter.is_some());
         assert_eq!(
