@@ -1695,7 +1695,6 @@ impl App {
         self.edit = None;
     }
 
-    /// Apply cell changes to the current sheet as one undo group.
     /// Undo/redo snapshots of `keys` on sheet `sheet_idx` as it is now
     /// ([`gridcore::sheet::snapshot_cells`]): spill output of a live anchor
     /// is a blank the anchor re-spills over.
@@ -1705,6 +1704,7 @@ impl App {
         gridcore::sheet::snapshot_cells(&wb.sheets[sheet_idx], keys, frozen)
     }
 
+    /// Apply cell changes to the current sheet as one undo group.
     fn apply(&mut self, changes: Vec<(u32, u32, Cell)>) {
         self.apply_on(self.sheet, changes);
     }
@@ -10656,6 +10656,59 @@ mod tests {
         assert_eq!(col_values(&app, 4, 0, 2), vec![CellValue::Empty; 3]);
         app.undo();
         assert_eq!(col_values(&app, 4, 0, 2), cached);
+    }
+
+    #[test]
+    fn deleting_a_cell_of_a_frozen_block_keeps_the_others() {
+        // #777 r2: a frozen anchor never re-spills, so an edit inside its
+        // block must not clear the rest of its cached values — on row 0 and
+        // off it, through undo, redo and a save.
+        let n = |v: f64| CellValue::Number(v);
+        let mut pkg = new_xlsx();
+        let sheet = &mut pkg.workbook.sheets[0];
+        sheet.set_cell(0, 0, Cell::number(1.0));
+        for (top, col) in [(0u32, 4u32), (10, 5)] {
+            let anchor = cell_name(top, col);
+            let last = cell_name(top + 2, col);
+            sheet.set_cell(
+                top,
+                col,
+                Cell {
+                    value: n(7.0),
+                    formula: Some("PIVOTBY(A1,4)".into()),
+                    f_attrs: Some(format!("t=\"array\" ref=\"{anchor}:{last}\"")),
+                    spill: Some((3, 1)),
+                    ..Cell::default()
+                },
+            );
+            sheet.set_cell(top + 1, col, Cell::number(8.0));
+            sheet.set_cell(top + 2, col, Cell::number(9.0));
+        }
+        let mut app = App::new(pkg, "test.xlsx");
+        app.os_clip = None;
+        for (top, col) in [(0u32, 4u32), (10, 5)] {
+            let block = |app: &App| col_values(app, col, top, top + 2);
+            let deleted = vec![n(7.0), CellValue::Empty, n(9.0)];
+            app.apply(vec![(top + 1, col, Cell::default())]);
+            assert_eq!(block(&app), deleted, "delete at row {top}");
+            app.undo();
+            assert_eq!(
+                block(&app),
+                vec![n(7.0), n(8.0), n(9.0)],
+                "undo at row {top}"
+            );
+            app.redo();
+            assert_eq!(block(&app), deleted, "redo at row {top}");
+            let re = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&app.pkg)).unwrap();
+            let saved: Vec<CellValue> = (top..top + 3)
+                .map(|r| {
+                    re.workbook.sheets[0]
+                        .cell(r, col)
+                        .map_or(CellValue::Empty, |cl| cl.value.clone())
+                })
+                .collect();
+            assert_eq!(saved, deleted, "saved at row {top}");
+        }
     }
 
     #[test]

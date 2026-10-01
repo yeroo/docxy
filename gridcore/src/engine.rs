@@ -276,6 +276,8 @@ impl Engine {
         self.unsupported.remove(&key);
         self.spill_blocked.remove(&key);
         let mut changed = vec![key];
+        let owner = wb.sheets.get(s).and_then(|sh| spill_owner(sh, r, c));
+        let owner_frozen = owner.is_some_and(|((ar, ac), _)| self.is_frozen(wb, (s, ar, ac)));
         if let Some(sheet) = wb.sheets.get_mut(s) {
             // Replacing a spill anchor orphans its spilled cells: clear them.
             if let Some(ext) = sheet.cell(r, c).and_then(|cl| cl.spill) {
@@ -283,8 +285,12 @@ impl Engine {
             }
             // An edit landing inside another anchor's spill breaks that
             // spill: clear its cells and let the anchor recalc to #SPILL!.
-            if let Some((anchor, ext)) = spill_owner(sheet, r, c) {
-                changed.extend(clear_spill(sheet, s, anchor, ext, None));
+            // A frozen anchor never re-spills, so its other cached cells stay
+            // as they are (plain values now that it has no extent).
+            if let Some((anchor, ext)) = owner {
+                if !owner_frozen {
+                    changed.extend(clear_spill(sheet, s, anchor, ext, None));
+                }
                 if let Some(a) = sheet.cells.get_mut(&anchor) {
                     a.spill = None;
                 }

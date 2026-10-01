@@ -2226,7 +2226,6 @@ mod tests {
         assert_eq!(snap[5], None);
         // Asked once per anchor over a key, never of the others.
         asked.sort();
-        asked.dedup();
         assert_eq!(asked, vec![(0, 2), (0, 4)]);
         // A copy drops a frozen anchor's extent only.
         let c1 = sheet.cell(0, 2).unwrap();
