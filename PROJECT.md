@@ -151,6 +151,14 @@ Wednesday 08:00" both come out right.
   plus SNET/FNET date bounds. With `HonorConstraints` enabled (the default,
   persisted as MSPDI `HonorConstraints`), MSO/MFO/FNLT/SNLT override conflicting
   links; with it off, links can delay tasks past those constraint dates.
+  A milestone does not snap to the next working start. One with an SNET or
+  FNET constraint holds the constraint instant itself, even at the end of a
+  working period or inside a non-working gap (Fri 17:00, Wed 19:00), as
+  Project 2024 does (#118, #133, #779, corpus file 29). A binding MFO or FNLT
+  milestone holds the constraint's evening (#89, #132), and an FS milestone
+  holds its predecessor's finish instant (#59). A later link still wins.
+  Slack is unaffected: the held instant shares its working-minute index with
+  the next working start.
 - **Backward pass** → late start/finish from the project finish, plus the
   backward-affecting constraints (MFO/FNLT/SNLT/MSO).
 - **Total & free slack**: link conflicts produce negative total slack in both
