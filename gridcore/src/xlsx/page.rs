@@ -453,62 +453,60 @@ fn patch_header_footer(mut xml: String, now: &HeaderFooter, was: &HeaderFooter) 
             return xml;
         };
         let frag = &xml[s..e];
-        let children = element_children(frag);
-        // Where the element's content ends: before its end tag.
+        let rank = |slot: HfSlot| HfSlot::ALL.iter().position(|&x| x == slot);
+        // The element's content: after its start tag, before its end tag.
+        let content_start = tag_end(frag, 0);
         let content_end = if frag.ends_with("/>") {
             frag.len()
         } else {
             frag.rfind("</").unwrap_or(frag.len())
-        };
-        // (at, end, replacement) within the fragment.
-        let mut splices: Vec<(usize, usize, String)> = Vec::new();
-        for slot in changed {
-            let rank = HfSlot::ALL.iter().position(|&x| x == slot).unwrap_or(0);
-            let existing = children
+        }
+        .max(content_start);
+        let children = element_children(frag);
+        let present = |slot: HfSlot| {
+            children
                 .iter()
-                .find(|(name, _, _)| HfSlot::from_element(name) == Some(slot));
-            let new = now
-                .get(slot)
-                .map(|t| hf_child(&prefix, slot, t))
-                .unwrap_or_default();
-            match existing {
-                Some(&(_, cs, ce)) => splices.push((cs, ce, new)),
-                None if !new.is_empty() => {
-                    // Before the first child that ranks after it.
-                    let at = children
-                        .iter()
-                        .find(|(name, _, _)| {
-                            HfSlot::from_element(name)
-                                .and_then(|x| HfSlot::ALL.iter().position(|&y| y == x))
-                                .is_some_and(|r| r > rank)
-                        })
-                        .map_or(content_end, |&(_, cs, _)| cs);
-                    splices.push((at, at, new));
+                .any(|(n, _, _)| HfSlot::from_element(n) == Some(slot))
+        };
+        // New children, in sequence order, each placed before the first
+        // existing child that ranks after it, or at the end.
+        let mut pending: std::collections::VecDeque<HfSlot> = HfSlot::ALL
+            .into_iter()
+            .filter(|&slot| changed.contains(&slot) && now.get(slot).is_some() && !present(slot))
+            .collect();
+        // One pass over the children in document order: text between them
+        // and unchanged children are copied as they are, a changed child is
+        // replaced (or dropped), and new ones go in where they rank.
+        let mut content = String::new();
+        let mut pos = content_start;
+        for (name, cs, ce) in children.iter().map(|(n, a, b)| (n.as_str(), *a, *b)) {
+            content.push_str(&frag[pos..cs]);
+            let own = HfSlot::from_element(name);
+            if let Some(r) = own.and_then(rank) {
+                while pending.front().is_some_and(|&p| rank(p) < Some(r)) {
+                    let p = pending.pop_front().expect("checked");
+                    content.push_str(&hf_child(&prefix, p, now.get(p).unwrap_or_default()));
                 }
-                None => {}
             }
+            match own.filter(|slot| changed.contains(slot)) {
+                Some(slot) => {
+                    if let Some(t) = now.get(slot) {
+                        content.push_str(&hf_child(&prefix, slot, t));
+                    }
+                }
+                None => content.push_str(&frag[cs..ce]),
+            }
+            pos = ce;
         }
-        // Back to front; inserts at one spot keep their sequence order.
-        splices.sort_by_key(|&(at, _, _)| std::cmp::Reverse(at));
-        let mut frag = frag.to_string();
-        let mut i = 0;
-        while i < splices.len() {
-            let at = splices[i].0;
-            let mut j = i;
-            while j < splices.len() && splices[j].0 == at && splices[j].1 == at {
-                j += 1;
-            }
-            if j > i {
-                // A run of inserts at `at`, collected in reverse: put them back.
-                let text: String = splices[i..j].iter().rev().map(|s| s.2.as_str()).collect();
-                frag.insert_str(at, &text);
-                i = j;
-            } else {
-                let (a, b, ref t) = splices[i];
-                frag.replace_range(a..b, t);
-                i += 1;
-            }
+        content.push_str(&frag[pos..content_end]);
+        for p in pending {
+            content.push_str(&hf_child(&prefix, p, now.get(p).unwrap_or_default()));
         }
+        let frag = format!(
+            "{}{content}{}",
+            &frag[..content_start],
+            &frag[content_end..]
+        );
         xml.replace_range(s..e, &frag);
     }
     if let Some((s, e)) = worksheet_child_span(&xml, "headerFooter") {

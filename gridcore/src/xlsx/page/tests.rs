@@ -442,3 +442,94 @@ fn sheet_format_defaults_and_hidden_sheets_are_read() {
         crate::sheet::SheetFormat::default()
     );
 }
+
+#[test]
+fn two_new_header_children_at_the_end_go_in_sequence_order() {
+    // FIX r1 C2 (a).
+    let mut pkg = load(
+        "",
+        &format!("{MARGINS}<headerFooter><oddHeader>h</oddHeader></headerFooter>"),
+    );
+    let hf = &mut setup(&mut pkg).header_footer;
+    hf.even_header = Some("eh".into());
+    hf.even_footer = Some("ef".into());
+    let ws = saved(&pkg);
+    assert!(
+        ws.contains("<headerFooter><oddHeader>h</oddHeader><evenHeader>eh</evenHeader><evenFooter>ef</evenFooter></headerFooter>"),
+        "{ws}"
+    );
+}
+
+#[test]
+fn a_new_child_before_a_replaced_one_keeps_both() {
+    // FIX r1 C2 (b).
+    let mut pkg = load(
+        "",
+        &format!("{MARGINS}<headerFooter><oddFooter>F</oddFooter></headerFooter>"),
+    );
+    let hf = &mut setup(&mut pkg).header_footer;
+    hf.odd_header = Some("Hello".into());
+    hf.odd_footer = Some("G".into());
+    let ws = saved(&pkg);
+    assert!(
+        ws.contains(
+            "<headerFooter><oddHeader>Hello</oddHeader><oddFooter>G</oddFooter></headerFooter>"
+        ),
+        "{ws}"
+    );
+}
+
+#[test]
+fn every_mix_of_kept_changed_new_and_removed_children_stays_in_order() {
+    // FIX r1 C2: each of the six slots absent, added, kept, changed or
+    // removed, in every combination.
+    use super::{patch_header_footer, read_page_setup};
+    use crate::print::setup::HeaderFooter;
+    use opccore::xml::{Event, XmlParser};
+    const NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    for combo in 0..5usize.pow(6) {
+        let mut was = HeaderFooter::default();
+        let mut now = HeaderFooter::default();
+        let mut children = String::new();
+        let mut k = combo;
+        for (i, slot) in HfSlot::ALL.into_iter().enumerate() {
+            let state = k % 5;
+            k /= 5;
+            let old = format!("w{i}");
+            let (w, n) = match state {
+                0 => (None, None),
+                1 => (None, Some(format!("n{i}"))),
+                2 => (Some(old.clone()), Some(old.clone())),
+                3 => (Some(old.clone()), Some(format!("c{i}&"))),
+                _ => (Some(old.clone()), None),
+            };
+            if w.is_some() {
+                let name = slot.element();
+                children.push_str(&format!(" <{name}>{old}</{name}>"));
+            }
+            *was.slot_mut(slot) = w;
+            *now.slot_mut(slot) = n;
+        }
+        let xml = format!(
+            r#"<?xml version="1.0"?><worksheet xmlns="{NS}"><sheetData/>{MARGINS}<headerFooter>{children} </headerFooter></worksheet>"#
+        );
+        assert_eq!(read_page_setup(&xml).header_footer, was, "{xml}");
+        let out = patch_header_footer(xml.clone(), &now, &was);
+        let mut p = XmlParser::new(&out);
+        while p.next() != Event::Eof {}
+        assert!(!p.is_malformed(), "combo {combo}: {out}");
+        assert_eq!(
+            read_page_setup(&out).header_footer,
+            now,
+            "combo {combo}: {out}"
+        );
+        // Children in schema order.
+        let ranks: Vec<usize> = HfSlot::ALL
+            .iter()
+            .filter_map(|s| out.find(&format!("<{}>", s.element())))
+            .collect();
+        let mut sorted = ranks.clone();
+        sorted.sort_unstable();
+        assert_eq!(ranks, sorted, "combo {combo}: {out}");
+    }
+}
