@@ -89,8 +89,28 @@ pub struct Engine {
     pass_anchors: HashMap<usize, RowCover>,
 }
 
-/// Row → the anchors whose spill extent covers that row.
-type RowCover = HashMap<u32, Vec<(u32, u32)>>;
+/// One sheet's spill anchors by the rows their extents cover
+/// ([`Engine::pass_anchors`]).
+#[derive(Default)]
+struct RowCover {
+    /// Row → the anchors whose extent covers (or covered) that row.
+    rows: HashMap<u32, Vec<(u32, u32)>>,
+    /// Anchor → the rows from its own already in `rows`, so noting a spill
+    /// again adds only rows beyond them.
+    noted: HashMap<(u32, u32), u32>,
+}
+
+impl RowCover {
+    /// Put the anchor at `(r, c)` in every row of an `h`-row extent from it
+    /// that it isn't in yet.
+    fn note(&mut self, (r, c): (u32, u32), h: u32) {
+        let done = self.noted.entry((r, c)).or_insert(0);
+        for rr in r + *done..r + h {
+            self.rows.entry(rr).or_default().push((r, c));
+        }
+        *done = (*done).max(h);
+    }
+}
 
 /// Spill chains (an anchor whose array feeds another anchor's spill cells)
 /// resolve through repeated post-passes; this bounds pathological loops.
@@ -1595,19 +1615,17 @@ impl Engine {
         (bh, bw): (u32, u32),
     ) -> Vec<(u32, u32, u32, u32)> {
         let (s, r, c) = key;
-        let rows = self.pass_anchors.entry(s).or_insert_with(|| {
-            let mut rows = RowCover::new();
-            for (&(ar, ac), cl) in &sheet.cells {
+        let cover = self.pass_anchors.entry(s).or_insert_with(|| {
+            let mut cover = RowCover::default();
+            for (&at, cl) in &sheet.cells {
                 if let Some((sh, _)) = cl.spill {
-                    for rr in ar..ar + sh {
-                        rows.entry(rr).or_default().push((ar, ac));
-                    }
+                    cover.note(at, sh);
                 }
             }
-            rows
+            cover
         });
         let mut near: Vec<(u32, u32)> = (r..r + bh)
-            .filter_map(|rr| rows.get(&rr))
+            .filter_map(|rr| cover.rows.get(&rr))
             .flatten()
             .copied()
             .collect();
@@ -1629,14 +1647,8 @@ impl Engine {
     /// Record in this pass's index (when the sheet has one) that the anchor
     /// at `key` now spills over `h` rows from its own.
     fn note_spill(&mut self, (s, r, c): Key, h: u32) {
-        let Some(rows) = self.pass_anchors.get_mut(&s) else {
-            return;
-        };
-        for rr in r..r + h {
-            let at = rows.entry(rr).or_default();
-            if at.last() != Some(&(r, c)) {
-                at.push((r, c));
-            }
+        if let Some(cover) = self.pass_anchors.get_mut(&s) {
+            cover.note((r, c), h);
         }
     }
 }
@@ -4708,6 +4720,30 @@ mod tests {
         );
         assert_eq!(value_at(&wb, "B3"), CellValue::Number(7.0));
         assert_eq!(cell_at(&wb, "B3").spill, None);
+    }
+
+    #[test]
+    fn noting_a_spill_again_does_not_grow_the_pass_index() {
+        // #846 r1 m2: two anchors over the same rows that re-spill turn by
+        // turn (a circle's iterations, the spill post-passes) leave each row
+        // listing each anchor once.
+        let mut wb = wb_one_sheet(&[]);
+        for (c, h) in [(0, 3), (1, 3)] {
+            let mut a = Cell::formula("1");
+            a.spill = Some((h, 1));
+            wb.sheets[0].cells.insert((0, c), a);
+        }
+        let mut eng = Engine::default();
+        eng.foreign_spills(&wb.sheets[0], (0, 0, 5), (1, 1));
+        for _ in 0..50 {
+            eng.note_spill((0, 0, 0), 3);
+            eng.note_spill((0, 0, 1), 3);
+        }
+        eng.note_spill((0, 0, 1), 4);
+        let rows = &eng.pass_anchors[&0].rows;
+        assert_eq!(rows[&0], vec![(0, 0), (0, 1)]);
+        assert_eq!(rows[&2], vec![(0, 0), (0, 1)]);
+        assert_eq!(rows[&3], vec![(0, 1)]);
     }
 
     /// #846 AC6: `rows` one-row CSE blocks `{=E:G*2}` over A:C, their
