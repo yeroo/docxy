@@ -65,6 +65,10 @@ use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
 use ratatui_image::{Image, Resize};
 
+/// `--csv`: the active sheet as CSV UTF-8 to `out`. Never over the import
+/// source or the workbook's binding, nor over an import's `<stem>.xlsx`:
+/// the binding moves past that name when it exists ([`import_binding`]),
+/// and it is then the user's own workbook.
 fn export_csv_headless(
     pkg: &SheetPackage,
     source: &str,
@@ -73,6 +77,11 @@ fn export_csv_headless(
 ) -> io::Result<usize> {
     let wb = &pkg.workbook;
     let bytes = csv_utf8_bytes(&wb.sheets[wb.active_tab.min(wb.sheets.len() - 1)], wb);
+    let sibling = import_source.map(|s| Path::new(s).with_extension("xlsx"));
+    let source = match &sibling {
+        Some(p) if opccore::fsio::same_file(p, Path::new(out)) => p.to_str().unwrap_or(source),
+        _ => source,
+    };
     export_csv_bytes(source, import_source, out, &bytes)?;
     Ok(bytes.len())
 }
@@ -1522,8 +1531,9 @@ struct App {
     /// The template this workbook was started from, until this session first
     /// writes it (to `Budget1.xlsx` from `Budget.xltx`, or a Save As name).
     template: Option<String>,
-    /// An imported `.xls`/`.xlsb`/`.ods` this session has not written yet:
-    /// its binding was free when it opened, and a save rechecks it.
+    /// An import (a `.csv`/`.tsv`/`.txt`/`.prn` or an `.xls`/`.xlsb`/`.ods`)
+    /// this session has not written yet: its binding was free when it
+    /// opened, and the first save rechecks it.
     import_unsaved: bool,
     sheet: usize,
     cur: (u32, u32),
