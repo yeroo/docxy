@@ -287,14 +287,14 @@ impl BookIn {
             for (key, mut cell) in sheet.cells {
                 cell.style = xf_of.get(cell.style as usize).copied().unwrap_or(0);
                 if let Some(f) = cell.formula.take() {
-                    let f = retarget(&f, &renames).unwrap_or(f);
+                    let f = retarget(&f, &renames, false).unwrap_or(f);
                     cell.formula = Some(crate::formula::file_formula(&f).into_owned());
                 }
                 cells.insert(key, cell);
             }
         }
         for mut name in self.names {
-            let f = retarget(&name.formula, &renames).unwrap_or(name.formula);
+            let f = retarget(&name.formula, &renames, true).unwrap_or(name.formula);
             name.formula = crate::formula::file_formula(&f).into_owned();
             pkg.workbook.defined_names.push(name);
         }
@@ -312,6 +312,9 @@ pub(crate) fn valid_sheet_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec
         s.chars().take(max).collect()
     }
     let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Per base name, the next suffix to try, so N repeats of one name cost
+    // N probes, not N squared.
+    let mut next: HashMap<String, usize> = HashMap::new();
     let mut out = Vec::new();
     for (i, raw) in names.enumerate() {
         let clean: String = raw
@@ -322,12 +325,12 @@ pub(crate) fn valid_sheet_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec
         if name.trim().is_empty() {
             name = format!("Sheet{}", i + 1);
         }
-        let mut n = 2;
         let base = name.clone();
+        let n = next.entry(base.to_lowercase()).or_insert(2);
         while taken.contains(&name.to_lowercase()) {
             let suffix = format!(" ({n})");
             name = format!("{}{suffix}", cut(&base, 31 - suffix.chars().count()));
-            n += 1;
+            *n += 1;
         }
         taken.insert(name.to_lowercase());
         out.push(name);
@@ -335,49 +338,143 @@ pub(crate) fn valid_sheet_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec
     out
 }
 
-/// The (old, new) sheet names references must follow when `raw` names
-/// become `valid`. A repeat of an earlier name (a second "Data") is left
-/// out: references to "Data" mean the first, as a reader resolves them, and
-/// keep doing so. An empty name has no references.
-fn sheet_renames(raw: &[String], valid: &[String]) -> Vec<(String, String)> {
+/// The sheet renames references must follow when `raw` names become
+/// `valid`, looked up by old name without regard to case.
+struct Renames {
+    /// (old, new), in sheet order.
+    pairs: Vec<(String, String)>,
+    /// Lowercased old name → index into `pairs`.
+    by_old: HashMap<String, usize>,
+}
+
+/// The renames for `raw` names becoming `valid`. A repeat of an earlier
+/// name (a second "Data") is left out: references to "Data" mean the first,
+/// as a reader resolves them, and keep doing so. An empty name has no
+/// references.
+fn sheet_renames(raw: &[String], valid: &[String]) -> Renames {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut out = Vec::new();
+    let mut r = Renames {
+        pairs: Vec::new(),
+        by_old: HashMap::new(),
+    };
     for (old, new) in raw.iter().zip(valid) {
-        let first = seen.insert(old.to_lowercase());
-        if first && old != new && !old.is_empty() {
-            out.push((old.clone(), new.clone()));
+        let low = old.to_lowercase();
+        if seen.insert(low.clone()) && old != new && !old.is_empty() {
+            r.by_old.insert(low, r.pairs.len());
+            r.pairs.push((old.clone(), new.clone()));
+        }
+    }
+    r
+}
+
+/// Every token in `src` that may be a sheet qualifier, lowercased: each
+/// quoted `'…'` name (`''` unescaped; a `'First:Last'` span gives both
+/// ends) and each bare name directly before `!` or `:`, outside string
+/// literals. A superset of the sheets the formula names, found in one pass
+/// without parsing.
+fn sheet_qualifiers(src: &str) -> Vec<String> {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '"' => {
+                i += 1;
+                while i < chars.len() {
+                    if chars[i] == '"' {
+                        if chars.get(i + 1) == Some(&'"') {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            '\'' => {
+                let mut name = String::new();
+                i += 1;
+                while i < chars.len() {
+                    if chars[i] == '\'' {
+                        if chars.get(i + 1) == Some(&'\'') {
+                            name.push('\'');
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    name.push(chars[i]);
+                    i += 1;
+                }
+                i += 1;
+                let name = name.to_lowercase();
+                if let Some((a, b)) = name.split_once(':') {
+                    out.push(a.to_string());
+                    out.push(b.to_string());
+                }
+                out.push(name);
+            }
+            c if c.is_alphanumeric() || c == '_' || c == '.' => {
+                let begin = i;
+                while i < chars.len()
+                    && (chars[i].is_alphanumeric() || matches!(chars[i], '_' | '.'))
+                {
+                    i += 1;
+                }
+                if matches!(chars.get(i), Some('!' | ':')) {
+                    out.push(chars[begin..i].iter().collect::<String>().to_lowercase());
+                }
+            }
+            _ => i += 1,
         }
     }
     out
 }
 
 /// `src` with its references to each renamed sheet following the rename,
-/// or `None` when it names none of them (or doesn't parse). Every rename is
-/// applied through a placeholder first, so one sheet's new name can be
-/// another's old one. Only formulas whose text holds an old name are
-/// parsed, so the cost is in the formulas a rename touches.
-fn retarget(src: &str, renames: &[(String, String)]) -> Option<String> {
-    use crate::formula::{parse, rename_sheet_in_expr, to_string};
-    if renames.is_empty() {
+/// or `None` when it names none of them (or doesn't parse). Only a formula
+/// with a qualifier that is an old name ([`sheet_qualifiers`], one pass
+/// and a hash lookup each) is parsed, so a workbook pays for the formulas a
+/// rename touches. Every rename is applied through a placeholder first, so
+/// one sheet's new name can be another's old one. A defined name (`name`)
+/// goes through [`crate::formula::rewrite_defined_name`], so a union of
+/// areas or a `Sheet!#REF!` area follows too.
+fn retarget(src: &str, renames: &Renames, name: bool) -> Option<String> {
+    use crate::formula::{parse, rename_sheet_in_expr, rewrite_defined_name, to_string};
+    if renames.pairs.is_empty() {
         return None;
     }
-    let low = src.to_lowercase();
-    let hits: Vec<usize> = (0..renames.len())
-        .filter(|&k| {
-            let old = renames[k].0.to_lowercase();
-            low.contains(&old) || low.contains(&old.replace('\'', "''"))
-        })
+    let mut hits: Vec<usize> = sheet_qualifiers(src)
+        .iter()
+        .filter_map(|q| renames.by_old.get(q).copied())
         .collect();
+    hits.sort_unstable();
+    hits.dedup();
     if hits.is_empty() {
         return None;
     }
-    let mut e = parse(src).ok()?;
     let placeholder = |k: usize| format!("\u{1}legacy sheet {k}\u{1}");
-    for &k in &hits {
-        e = rename_sheet_in_expr(&e, &renames[k].0, &placeholder(k));
+    let steps = hits
+        .iter()
+        .map(|&k| (renames.pairs[k].0.clone(), placeholder(k)))
+        .chain(
+            hits.iter()
+                .map(|&k| (placeholder(k), renames.pairs[k].1.clone())),
+        );
+    if name {
+        let mut text = src.to_string();
+        for (old, new) in steps {
+            let f = |e: &crate::formula::Expr| rename_sheet_in_expr(e, &old, &new);
+            if let Some(t) = rewrite_defined_name(&text, f, Some((&old, &new))) {
+                text = t;
+            }
+        }
+        return (text != src).then_some(text);
     }
-    for &k in &hits {
-        e = rename_sheet_in_expr(&e, &placeholder(k), &renames[k].1);
+    let mut e = parse(src).ok()?;
+    for (old, new) in steps {
+        e = rename_sheet_in_expr(&e, &old, &new);
     }
     Some(to_string(&e))
 }
@@ -552,6 +649,8 @@ mod tests {
                     ((0, 0), f(&format!("'{long}'!A1*2"))),
                     ((1, 0), f(&format!("'{cut}'!A1"))),
                     ((2, 0), f("Data!A1")),
+                    // A 3D span, Excel's quoted spelling, with a renamed end.
+                    ((3, 0), f(&format!("SUM('{cut}:{long}'!A1)"))),
                 ],
             ),
         ] {
@@ -581,7 +680,56 @@ mod tests {
         assert_eq!(calc.cell(0, 0).unwrap().value, CellValue::Number(10.0));
         assert_eq!(calc.cell(1, 0).unwrap().value, CellValue::Number(7.0));
         assert_eq!(calc.cell(2, 0).unwrap().value, CellValue::Number(1.0));
+        // 'cut:long' spans sheets 1..0 → the renamed ends span 0..1: 7 + 5.
+        assert_eq!(calc.cell(3, 0).unwrap().value, CellValue::Number(12.0));
         assert_eq!(wb.defined_names[0].formula, format!("{cut}!$A$1"));
+    }
+
+    /// Renames cost only the formulas they touch: 4,096 renamed sheets and
+    /// 200,000 formulas naming none of them build quickly.
+    #[test]
+    fn many_renames_over_many_formulas_stay_linear() {
+        let mut book = BookIn::new();
+        for i in 0..4_096 {
+            book.push_sheet(SheetIn {
+                name: format!("{}{i:04}", "N".repeat(32)),
+                ..SheetIn::default()
+            })
+            .unwrap();
+        }
+        let cells = &mut book.sheets[0].cells;
+        for r in 0..200_000u32 {
+            cells.insert(
+                (r, 0),
+                Cell {
+                    formula: Some(format!("Other!A{} + 'Some Sheet'!B2 + \"x!y\"", r + 1)),
+                    ..Cell::default()
+                },
+            );
+        }
+        let started = std::time::Instant::now();
+        let pkg = book.build();
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        assert_eq!(pkg.workbook.sheets[0].name.chars().count(), 31);
+    }
+
+    /// A defined name follows a rename area by area, `Sheet!#REF!` too.
+    #[test]
+    fn defined_names_follow_renames_through_unions_and_ref_errors() {
+        let long = "L".repeat(33);
+        let cut = "L".repeat(31);
+        let renames = sheet_renames(std::slice::from_ref(&long), std::slice::from_ref(&cut));
+        let got = retarget(&format!("'{long}'!$A:$A,'{long}'!#REF!"), &renames, true);
+        assert_eq!(got, Some(format!("{cut}!$A:$A,{cut}!#REF!")));
+    }
+
+    #[test]
+    fn qualifiers_are_found_in_one_pass() {
+        let q = sheet_qualifiers("SUM('It''s:Q3'!A1, Data!B2, \"no!t\", Jan:Mar!C1, A1:B2)");
+        for want in ["it's:q3", "it's", "q3", "data", "jan", "mar", "a1"] {
+            assert!(q.contains(&want.to_string()), "{want} in {q:?}");
+        }
+        assert!(!q.iter().any(|s| s.contains("no")), "{q:?}");
     }
 
     #[test]

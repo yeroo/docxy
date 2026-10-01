@@ -409,7 +409,9 @@ fn read_sheet(
     // (cell, master): the master's row is in ptgExp, its column in the
     // formula's extra data.
     let mut pending: Vec<((u32, u32), (u32, u32))> = Vec::new();
-    // Shared and array formulas by their first cell.
+    // Shared formulas by their master (the formula cell before
+    // BrtShrFmla) and, as an alias that never displaces a master, their
+    // range's top-left; array formulas by their anchor.
     let mut shared: HashMap<(u32, u32), Group> = HashMap::new();
     let mut arrays: HashMap<(u32, u32), Group> = HashMap::new();
     // The last formula cell read: a BrtShrFmla's master, the cell its
@@ -423,6 +425,11 @@ fn read_sheet(
                 // BrtCellBlank .. BrtFmlaError: column, style, then the value.
                 1..=11 => {
                     let col = c.u32()?;
+                    if ty >= 8 {
+                        // A BrtShrFmla after this record belongs to this
+                        // cell, even when the rest doesn't read.
+                        last_formula = Some((row, col));
+                    }
                     if !on_grid(row, col) {
                         return None;
                     }
@@ -443,7 +450,6 @@ fn read_sheet(
                         ..Cell::default()
                     };
                     if ty >= 8 {
-                        last_formula = Some((row, col));
                         c.u16()?;
                         let (rgce, extra) = c.formula()?;
                         if rgce.first() == Some(&0x01) {
@@ -473,8 +479,10 @@ fn read_sheet(
                         arrays.insert(corner, group);
                     } else {
                         let master = last_formula.unwrap_or(corner);
+                        // The corner is only an alias: it never replaces
+                        // a group whose master it is, in either order.
                         if master != corner {
-                            shared.insert(corner, group.clone());
+                            shared.entry(corner).or_insert_with(|| group.clone());
                         }
                         shared.insert(master, group);
                     }
@@ -686,6 +694,60 @@ mod tests {
         assert_eq!(c[&(1, 0)].formula.as_deref(), Some("A3+1"));
         assert_eq!(c[&(1, 1)].formula.as_deref(), Some("B3+1"));
         assert_eq!(c[&(2, 1)].formula.as_deref(), Some("B4+1"));
+    }
+
+    /// Group 1 is A1:A3 with master A1; group 2's master is C1 but its
+    /// stated range is A1:C3, whose top-left is group 1's master. The alias
+    /// must not take A1's group, in either order of arrival.
+    #[test]
+    fn a_corner_alias_never_replaces_a_master() {
+        let member = |row: u32, col: u32, master_col: u32| {
+            let mut v = cell(col, 0);
+            v.extend(0.0f64.to_le_bytes());
+            v.extend(fmla(&[0x01, 0, 0, 0, 0], &master_col.to_le_bytes()));
+            (row, rec(9, &v))
+        };
+        let shr = |c1: u32, c2: u32, op: u8| {
+            let mut v = Vec::new();
+            for x in [0u32, 2, c1, c2] {
+                v.extend(x.to_le_bytes());
+            }
+            // =<cell one row down> op 2
+            let rgce = [0x4C, 1, 0, 0, 0, 0, 0xC0, 0x1E, 2, 0, op];
+            v.extend((rgce.len() as u32).to_le_bytes());
+            v.extend(rgce);
+            v.extend(0u32.to_le_bytes());
+            (0, rec(BRT_SHR_FMLA, &v))
+        };
+        let group1 = vec![
+            member(0, 0, 0),
+            shr(0, 0, 0x03),
+            member(1, 0, 0),
+            member(2, 0, 0),
+        ];
+        let group2 = vec![
+            member(0, 2, 2),
+            shr(0, 2, 0x05),
+            member(1, 2, 2),
+            member(2, 2, 2),
+        ];
+        for order in [
+            [group1.clone(), group2.clone()].concat(),
+            [group2, group1].concat(),
+        ] {
+            let mut sheet = Vec::new();
+            for (row, r) in order {
+                sheet.push(rec(BRT_ROW_HDR, &row.to_le_bytes()));
+                sheet.push(r);
+            }
+            // A BrtRowHdr before the BrtShrFmla resets nothing it needs.
+            let book = open(&xlsb(&[], &sheet));
+            let c = &book.sheets[0].cells;
+            assert_eq!(c[&(0, 0)].formula.as_deref(), Some("A2+2"));
+            assert_eq!(c[&(2, 0)].formula.as_deref(), Some("A4+2"));
+            assert_eq!(c[&(0, 2)].formula.as_deref(), Some("C2*2"));
+            assert_eq!(c[&(2, 2)].formula.as_deref(), Some("C4*2"));
+        }
     }
 
     #[test]

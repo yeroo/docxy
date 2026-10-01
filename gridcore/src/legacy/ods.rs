@@ -1172,7 +1172,8 @@ mod tests {
         let b = read_str(&format!(
             r#"<table:table table:name="{long}"><table:table-row><table:table-cell office:value-type="float" office:value="5"/></table:table-row></table:table>
             <table:table table:name="Calc"><table:table-row><table:table-cell office:value-type="float" office:value="0" table:formula="of:=['{long}'.A1]*2"/></table:table-row></table:table>
-            <table:named-expressions><table:named-range table:name="TheVal" table:cell-range-address="'{long}'.$A$1"/></table:named-expressions>"#
+            <table:named-expressions><table:named-range table:name="TheVal" table:cell-range-address="'{long}'.$A$1"/>
+            <table:named-expression table:name="Both" table:expression="of:=[$'{long}'.$A$1]~[$'{long}'.$B$1]"/></table:named-expressions>"#
         ));
         let mut pkg = b.build();
         let cut: String = long.chars().take(31).collect();
@@ -1187,6 +1188,11 @@ mod tests {
         );
         assert_eq!(a1.value, CellValue::Number(10.0));
         assert_eq!(wb.defined_names[0].formula, format!("'{cut}'!$A$1"));
+        // An ODF union (`~`) is a list of areas, each renamed.
+        assert_eq!(
+            wb.defined_names[1].formula,
+            format!("'{cut}'!$A$1,'{cut}'!$B$1")
+        );
     }
 
     #[test]

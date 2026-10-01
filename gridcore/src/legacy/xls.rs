@@ -594,6 +594,9 @@ fn read_sheet(
                 }
                 0x0006 => {
                     let (row, col, xf) = (c.u16()?, c.u16()?, c.u16()?);
+                    // A SHRFMLA after this record belongs to this cell, even
+                    // when the rest of the record doesn't read.
+                    last_formula = Some((row as u32, col as u32));
                     let val = c.take(8)?;
                     c.u16()?;
                     c.u32()?;
@@ -615,7 +618,6 @@ fn read_sheet(
                     };
                     put(&mut cells, row, col, xf, value, book);
                     let at = (row as u32, col as u32);
-                    last_formula = Some(at);
                     if rgce.first() == Some(&0x01) && rgce.len() >= 5 {
                         let mr = u16::from_le_bytes([rgce[1], rgce[2]]) as u32;
                         let mc = u16::from_le_bytes([rgce[3], rgce[4]]) as u32;
@@ -643,8 +645,10 @@ fn read_sheet(
                     let group = (range, rgce, c.rest().to_vec());
                     let corner = (range.0, range.2);
                     let master = last_formula.unwrap_or(corner);
+                    // The corner is only an alias: it never replaces a
+                    // group whose master it is, whichever arrived first.
                     if master != corner {
-                        shared.insert(corner, group.clone());
+                        shared.entry(corner).or_insert_with(|| group.clone());
                     }
                     shared.insert(master, group);
                 }
@@ -921,6 +925,69 @@ pub(crate) mod tests {
         assert_eq!(c[&(1, 0)].formula.as_deref(), Some("A3+1"));
         assert_eq!(c[&(1, 1)].formula.as_deref(), Some("B3+1"));
         assert_eq!(c[&(2, 1)].formula.as_deref(), Some("B4+1"));
+    }
+
+    /// Group 1 is A1:A3 with master A1; group 2's master is C1 but its
+    /// stated range is A1:C3, whose top-left is group 1's master. The alias
+    /// must not take A1's group, in either order of arrival.
+    #[test]
+    fn a_corner_alias_never_replaces_a_master() {
+        let exp = |r: u8, c: u8| [0x01, r, 0, c, 0];
+        let shrfmla = |range: [u8; 6], op: u8| {
+            let mut sh = range.to_vec();
+            sh.extend([0, 3]);
+            // =<cell one row down> op 2
+            let rgce = [0x2C, 1, 0, 0, 0xC0, 0x1E, 2, 0, op];
+            sh.extend((rgce.len() as u16).to_le_bytes());
+            sh.extend(rgce);
+            rec(0x04BC, &sh)
+        };
+        let group1 = vec![
+            formula(0, 0, 0.0, &exp(0, 0)),
+            shrfmla([0, 0, 2, 0, 0, 0], 0x03),
+            formula(1, 0, 0.0, &exp(0, 0)),
+            formula(2, 0, 0.0, &exp(0, 0)),
+        ];
+        let group2 = vec![
+            formula(0, 2, 0.0, &exp(0, 2)),
+            shrfmla([0, 0, 2, 0, 0, 2], 0x05),
+            formula(1, 2, 0.0, &exp(0, 2)),
+            formula(2, 2, 0.0, &exp(0, 2)),
+        ];
+        for sheet in [
+            [group1.clone(), group2.clone()].concat(),
+            [group2, group1].concat(),
+        ] {
+            let book = read(&workbook(&[], &sheet)).unwrap();
+            let c = data(&book);
+            assert_eq!(c[&(0, 0)].formula.as_deref(), Some("A2+2"));
+            assert_eq!(c[&(2, 0)].formula.as_deref(), Some("A4+2"));
+            assert_eq!(c[&(0, 2)].formula.as_deref(), Some("C2*2"));
+            assert_eq!(c[&(2, 2)].formula.as_deref(), Some("C4*2"));
+        }
+    }
+
+    /// A FORMULA too short to read past its cell still is the master of the
+    /// SHRFMLA after it.
+    #[test]
+    fn a_truncated_formula_is_still_the_next_groups_master() {
+        // The stated range (B2) isn't the master (B1), so only the master
+        // key finds the group.
+        let mut sh = vec![1, 0, 1, 0, 1, 1, 0, 2];
+        let rgce = [0x2C, 1, 0, 0, 0xC0, 0x1E, 1, 0, 0x03];
+        sh.extend((rgce.len() as u16).to_le_bytes());
+        sh.extend(rgce);
+        let stream = workbook(
+            &[],
+            &[
+                formula(5, 5, 0.0, &[0x1E, 1, 0]),
+                rec(0x0006, &cell(0, 1, 0)),
+                rec(0x04BC, &sh),
+                formula(1, 1, 0.0, &[0x01, 0, 0, 1, 0]),
+            ],
+        );
+        let book = read(&stream).unwrap();
+        assert_eq!(data(&book)[&(1, 1)].formula.as_deref(), Some("B3+1"));
     }
 
     #[test]
