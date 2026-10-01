@@ -370,8 +370,7 @@ fn a_set_print_area_is_written_and_a_new_one_added() {
 fn an_unaligned_workbook_keeps_a_print_area_it_cannot_place() {
     use crate::print::area::clear_print_area;
     // The second sheet's part is missing, so localSheetId can't be trusted.
-    let names = format!("{AREA}");
-    let mut pkg = load_xlsx(&book(&names, &[("Report", Some(DATA)), ("Gone", None)])).unwrap();
+    let mut pkg = load_xlsx(&book(AREA, &[("Report", Some(DATA)), ("Gone", None)])).unwrap();
     clear_print_area(&mut pkg.workbook, 0);
     let wb = workbook_xml(&pkg);
     assert!(wb.contains(AREA), "{wb}");
