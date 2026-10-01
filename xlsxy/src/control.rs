@@ -62,7 +62,7 @@
 
 use crate::{App, comment_author, iso_now, now_serial};
 use ctlcore::json::Json;
-use gridcore::engine::{Engine, cell_to_value, eval_formula_at};
+use gridcore::engine::{Engine, PART_OF_ARRAY, cell_to_value, eval_formula_at};
 use gridcore::format::{FormatPatch, FormatValue, apply_patch_to_xf, xf_format_fields};
 use gridcore::formula::Value;
 use gridcore::frame::{Agg, Frame, pivot, pivot_spec_from_names, pivot_table_strings, range_stats};
@@ -708,7 +708,9 @@ fn cell_set(app: &mut App, args: &Json) -> Result<Json, String> {
     // recognised shape takes its format, and an over-long entry is refused.
     let cell = gridcore::entry::entry_cell(&mut app.pkg.workbook, si, r, c, text, now_serial())
         .map_err(|e| format!("cell.set: {e}"))?;
-    app.apply_on(si, vec![(r, c, cell)]);
+    if !app.apply_on(si, vec![(r, c, cell)]) {
+        return Err(format!("cell.set: {PART_OF_ARRAY}"));
+    }
     let s = &app.pkg.workbook.sheets[si];
     match s.cell(r, c) {
         Some(cell) => Ok(cell_json(r, c, cell)),
@@ -739,7 +741,9 @@ fn range_clear(app: &mut App, args: &Json) -> Result<Json, String> {
         ));
     }
     let cleared = changes.len();
-    app.apply_on(si, changes);
+    if !app.apply_on(si, changes) {
+        return Err(format!("range.clear: {PART_OF_ARRAY}"));
+    }
     Ok(Json::obj(vec![("cleared", Json::Num(cleared as f64))]))
 }
 
@@ -841,7 +845,9 @@ fn range_set(app: &mut App, args: &Json) -> Result<Json, String> {
         changes.push((r, c, cell));
     }
     let n = changes.len();
-    app.apply_on(si, changes);
+    if !app.apply_on(si, changes) {
+        return Err(format!("range.set: {PART_OF_ARRAY}"));
+    }
     Ok(Json::obj(vec![("set", Json::Num(n as f64))]))
 }
 
