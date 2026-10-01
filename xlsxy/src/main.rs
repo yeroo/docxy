@@ -1879,9 +1879,11 @@ impl App {
         self.redo.clear();
         self.modified = true;
         self.clamp_cursor();
+        self.cancel_cut();
     }
 
     fn restore(&mut self, snap: &WbSnapshot) {
+        self.cancel_cut();
         self.pkg.workbook.sheets = snap.sheets.clone();
         self.pkg.workbook.defined_names = snap.names.clone();
         self.rebuild_engine();
@@ -5532,7 +5534,10 @@ impl App {
     }
 
     /// Make a pending cut a copy: a later paste clears nothing. Removing a
-    /// sheet does this, since it can take or renumber the cut's source sheet.
+    /// sheet does this, since it can take or renumber the cut's source sheet,
+    /// and so does any structural edit (including protection toggles and
+    /// renames) and the undo/redo of one, since it can move the cells under
+    /// the cut's recorded coordinates.
     fn cancel_cut(&mut self) {
         if let Some(clip) = &mut self.clip {
             clip.cut = false;
@@ -10077,6 +10082,158 @@ mod tests {
             app.status.as_deref(),
             Some("Pasted (source sheet is protected; cut kept as copy)")
         );
+    }
+
+    /// One sheet, no OS clipboard, `cells` as `(row, col, number)`.
+    fn cut_app(cells: &[(u32, u32, f64)]) -> App {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        let changes = cells
+            .iter()
+            .map(|&(r, c, n)| (r, c, parse_input(&n.to_string())))
+            .collect();
+        app.apply_on(0, changes);
+        app
+    }
+
+    /// Select `from..=to` on the active sheet and cut or copy it.
+    fn clip_range(app: &mut App, from: (u32, u32), to: (u32, u32), cut: bool) {
+        app.anchor = Some(from);
+        app.cur = to;
+        app.copy(cut);
+        app.anchor = None;
+    }
+
+    #[test]
+    fn a_row_insert_cancels_a_pending_cut() {
+        // #821: cut A5:B6, insert a row above row 1, paste at F1. The cut's
+        // recorded A5:B6 now holds what was A4:B5; neither block is cleared.
+        let mut app = cut_app(&[
+            (3, 0, 10.0),
+            (3, 1, 11.0),
+            (4, 0, 1.0),
+            (4, 1, 2.0),
+            (5, 0, 3.0),
+            (5, 1, 4.0),
+        ]);
+        clip_range(&mut app, (4, 0), (5, 1), true);
+        app.cur = (0, 0);
+        app.row_op(true);
+        app.cur = (0, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 0, 5), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 0, 5, 0), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 0, 4, 0)[..2], [Some(10.0), Some(11.0)]);
+    }
+
+    #[test]
+    fn a_column_delete_cancels_a_pending_cut() {
+        // Cut C1:D2, delete column A: the cut's cells now sit at B1:C2.
+        let mut app = cut_app(&[
+            (0, 0, 10.0),
+            (0, 1, 11.0),
+            (0, 2, 1.0),
+            (0, 3, 2.0),
+            (1, 2, 3.0),
+            (1, 3, 4.0),
+        ]);
+        clip_range(&mut app, (0, 2), (1, 3), true);
+        app.cur = (0, 0);
+        app.col_op(false);
+        app.cur = (4, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 4, 5), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 0, 0, 1), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 0, 0, 0)[0], Some(11.0));
+    }
+
+    #[test]
+    fn a_sort_cancels_a_pending_cut() {
+        // Cut A1:B2, sort A1:B4 ascending: other rows now sit under A1:B2.
+        let mut app = cut_app(&[
+            (0, 0, 4.0),
+            (0, 1, 40.0),
+            (1, 0, 3.0),
+            (1, 1, 30.0),
+            (2, 0, 2.0),
+            (2, 1, 20.0),
+            (3, 0, 1.0),
+            (3, 1, 10.0),
+        ]);
+        clip_range(&mut app, (0, 0), (1, 1), true);
+        app.cur = (0, 0);
+        app.sort_region(true);
+        app.cur = (0, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 0, 5), some([4.0, 40.0, 3.0, 30.0]));
+        assert_eq!(block_values(&app, 0, 0, 0), some([1.0, 10.0, 2.0, 20.0]));
+        assert_eq!(block_values(&app, 0, 2, 0), some([3.0, 30.0, 4.0, 40.0]));
+    }
+
+    #[test]
+    fn undoing_a_structural_edit_after_a_cut_does_not_revive_it() {
+        // Cut, insert a row, undo: the layout is back, but the cut stays a copy.
+        let mut app = cut_app(&[(0, 0, 1.0), (0, 1, 2.0), (1, 0, 3.0), (1, 1, 4.0)]);
+        clip_range(&mut app, (0, 0), (1, 1), true);
+        app.cur = (0, 0);
+        app.row_op(true);
+        app.undo();
+        app.cur = (4, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 4, 5), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 0, 0, 0), some([1.0, 2.0, 3.0, 4.0]));
+    }
+
+    #[test]
+    fn undoing_a_structural_edit_after_a_cut_cancels_it() {
+        // Insert a row, cut the shifted block A2:B3, undo the insert: the
+        // block is back at A1:B2 and A2:B3 holds other cells.
+        let mut app = cut_app(&[(0, 0, 1.0), (0, 1, 2.0), (1, 0, 3.0), (1, 1, 4.0)]);
+        app.cur = (0, 0);
+        app.row_op(true);
+        clip_range(&mut app, (1, 0), (2, 1), true);
+        app.undo();
+        app.cur = (4, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 4, 5), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 0, 0, 0), some([1.0, 2.0, 3.0, 4.0]));
+    }
+
+    #[test]
+    fn redoing_a_structural_edit_after_a_cut_cancels_it() {
+        // Insert a row, undo, cut A1:B2, redo the insert: the block moves
+        // to A2:B3 and A1:B2 no longer holds the cut's cells.
+        let mut app = cut_app(&[(0, 0, 1.0), (0, 1, 2.0), (1, 0, 3.0), (1, 1, 4.0)]);
+        app.cur = (0, 0);
+        app.row_op(true);
+        app.undo();
+        clip_range(&mut app, (0, 0), (1, 1), true);
+        app.redo();
+        app.cur = (4, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 4, 5), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 0, 1, 0), some([1.0, 2.0, 3.0, 4.0]));
+    }
+
+    #[test]
+    fn toggling_protection_cancels_a_pending_cut() {
+        // Protection toggles are structural edits, so they cancel a cut too.
+        let mut app = cut_app(&[(0, 0, 1.0), (0, 1, 2.0), (1, 0, 3.0), (1, 1, 4.0)]);
+        clip_range(&mut app, (0, 0), (1, 1), true);
+        app.toggle_protection();
+        app.toggle_protection();
+        assert!(!app.protected());
+        app.cur = (0, 5);
+        app.paste();
+        let some = |v: [f64; 4]| v.map(Some).to_vec();
+        assert_eq!(block_values(&app, 0, 0, 5), some([1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(block_values(&app, 0, 0, 0), some([1.0, 2.0, 3.0, 4.0]));
     }
 
     #[test]
