@@ -5370,6 +5370,10 @@ fn ensure_full_calc(xml: &str) -> String {
     };
     let end = tag_end(xml, start);
     let tag = &xml[start..end];
+    // A start tag the part cuts off (no `>`): no place to put the attribute.
+    if !tag.ends_with('>') {
+        return xml.to_string();
+    }
     match attr_span(tag, "fullCalcOnLoad") {
         Some((_, s, e, _)) if matches!(&tag[s..e], "1" | "true") => xml.to_string(),
         Some((_, s, e, _)) => format!("{}1{}", &xml[..start + s], &xml[start + e..]),
@@ -5464,6 +5468,50 @@ fn register_pivot_cache(xml: &str, cache_id: u32, rid: &str, rels: &str) -> Stri
         out.insert_str(root.tag_close, &format!(" xmlns:r=\"{rels}\""));
     }
     out
+}
+
+/// workbook.xml without the `<pivotCache>` whose `r:id` is `rid`, undoing
+/// [`register_pivot_cache`] in any prefix: the wrapper goes too when no
+/// entry is left in it, since the schema wants at least one. A part the walk
+/// can't read loses the entry by its unprefixed spelling, as before.
+fn unregister_pivot_cache(xml: &str, rid: &str) -> String {
+    let Some(c) = workbook_child(xml, "pivotCaches") else {
+        let xml = remove_element_containing(xml, "<pivotCache", &format!("r:id=\"{rid}\""));
+        return xml.replace("<pivotCaches></pivotCaches>", "");
+    };
+    let mut p = XmlParser::new(&xml[c.start..c.end]);
+    p.next(); // the wrapper's start tag
+    let mut entries = 0;
+    let mut hit = None;
+    loop {
+        match p.next() {
+            Event::Start => {
+                let start = c.start + p.start_pos();
+                let is_entry = local(p.name()) == "pivotCache";
+                let is_hit = is_entry
+                    && p.attrs()
+                        .iter()
+                        .any(|a| local(a.name) == "id" && a.value == rid);
+                if !p.skip_element_complete() {
+                    break;
+                }
+                if is_entry {
+                    entries += 1;
+                }
+                if is_hit && hit.is_none() {
+                    hit = Some((start, c.start + p.pos()));
+                }
+            }
+            Event::Text => {}
+            Event::End | Event::Eof => break,
+        }
+    }
+    match hit {
+        None => xml.to_string(),
+        // The last entry: the wrapper goes with it.
+        Some(_) if entries == 1 => format!("{}{}", &xml[..c.start], &xml[c.end..]),
+        Some((s, e)) => format!("{}{}", &xml[..s], &xml[e..]),
+    }
 }
 
 /// A self-closed root element (`<xdr:wsDr …/>`) reopened: everything up to and
@@ -6032,9 +6080,10 @@ impl SheetPackage {
             }
             None => true,
         };
-        // The chart's rel goes into the host's rels part (a new drawing's is
-        // created). The worksheet's rel to the drawing is reused when the
-        // host already has one, and otherwise written.
+        // The chart's rel goes into the drawing's rels part: the host's, or
+        // the one a new drawing part's name implies, which an orphan left
+        // behind may already hold. The worksheet's rel to the drawing is
+        // reused when the host already has one, and otherwise written.
         let sheet_part = &self.sheet_parts[sheet];
         let ws_rels = rels_part_name(sheet_part);
         let (ws_dir, _) = sheet_part.rsplit_once('/').unwrap_or(("", sheet_part));
@@ -6044,9 +6093,25 @@ impl SheetPackage {
                     && (rel_id_for(&self.parts, &ws_rels, &relative_target(ws_dir, h)).is_some()
                         || rels_takes(&self.parts, &ws_rels, false))
             }
-            None => rels_takes(&self.parts, &ws_rels, false),
+            None => {
+                rels_takes(
+                    &self.parts,
+                    &rels_part_name(&self.new_drawing_part()),
+                    false,
+                ) && rels_takes(&self.parts, &ws_rels, false)
+            }
         };
         host_takes && rels_take
+    }
+
+    /// The part name a new drawing takes: the first free
+    /// `xl/drawings/drawingN.xml`.
+    fn new_drawing_part(&self) -> String {
+        let mut dn = 1;
+        while self.part(&format!("xl/drawings/drawing{dn}.xml")).is_some() {
+            dn += 1;
+        }
+        format!("xl/drawings/drawing{dn}.xml")
     }
 
     /// The drawing part `sheet` already has, which a new chart joins.
@@ -6090,13 +6155,7 @@ impl SheetPackage {
         // names. A second chart — or the first on a sheet that already holds a
         // picture — therefore joins the part that is already there.
         let host = self.chart_host(sheet);
-        let drawing_part = host.clone().unwrap_or_else(|| {
-            let mut dn = 1;
-            while self.part(&format!("xl/drawings/drawing{dn}.xml")).is_some() {
-                dn += 1;
-            }
-            format!("xl/drawings/drawing{dn}.xml")
-        });
+        let drawing_part = host.clone().unwrap_or_else(|| self.new_drawing_part());
         let (d_dir, d_file) = drawing_part
             .rsplit_once('/')
             .unwrap_or(("", drawing_part.as_str()));
@@ -6601,13 +6660,7 @@ impl SheetPackage {
         if !cache_rid.is_empty() {
             if let Some(p) = self.parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
                 let xml = String::from_utf8_lossy(&p.1).into_owned();
-                let xml = remove_element_containing(
-                    &xml,
-                    "<pivotCache",
-                    &format!("r:id=\"{cache_rid}\""),
-                );
-                // The schema wants at least one <pivotCache> in the wrapper.
-                p.1 = xml.replace("<pivotCaches></pivotCaches>", "").into_bytes();
+                p.1 = unregister_pivot_cache(&xml, &cache_rid).into_bytes();
             }
         }
         // Destination sheet's rels: drop its relationship to the table part.
@@ -15021,6 +15074,22 @@ mod ct_worksheet_order_tests {
     }
 
     #[test]
+    fn a_new_drawings_orphaned_rels_part_that_cannot_take_the_chart_refuses_it() {
+        // drawing1.xml is free, but a rels part for it is left behind,
+        // self-closed: the chart's rel could not go in.
+        let mut pkg = loaded(&format!("{ROWS}{MARGINS}"));
+        pkg.set_part(
+            DRAWING_RELS,
+            format!(r#"<Relationships xmlns="{R}"/>"#).into_bytes(),
+        );
+        assert!(pkg.part("xl/drawings/drawing1.xml").is_none());
+        let parts = pkg.parts.clone();
+        assert!(!pkg.can_add_chart(0));
+        assert!(!pkg.add_chart(0, (0, 3), (10, 8), &chart()));
+        assert_eq!(pkg.parts, parts);
+    }
+
+    #[test]
     fn a_sheet_with_no_part_entry_takes_no_chart() {
         // The model has the sheet, the package no part name for it.
         let mut pkg = loaded(&format!("{ROWS}{MARGINS}"));
@@ -15877,6 +15946,45 @@ mod ct_workbook_order_tests {
             "{out}"
         );
         assert_eq!(count_local(&out, "calcPr"), 1, "{out}");
+    }
+
+    #[test]
+    fn ensure_full_calc_leaves_a_cut_off_calc_pr_alone() {
+        let wb = format!(
+            r#"<?xml version="1.0"?><workbook xmlns="{NS}" xmlns:r="{R}">{SHEETS}<calcPr calcId="1" x="é"#
+        );
+        assert_eq!(ensure_full_calc(&wb), wb);
+        let wb = format!("{wb}é");
+        assert_eq!(ensure_full_calc(&wb), wb);
+    }
+
+    #[test]
+    fn remove_pivot_takes_its_entry_out_of_a_prefixed_pivot_caches() {
+        let caches = r#"<x:pivotCaches><x:pivotCache cacheId="7" r:id="rId9"/></x:pivotCaches>"#;
+        let mut pkg = with_data(Some(prefixed(caches)));
+        let idx = add_default_pivot(&mut pkg).expect("add_pivot");
+        assert_eq!(count_local(&part(&pkg, WB), "pivotCache"), 2);
+        assert!(pkg.remove_pivot(idx));
+        let wb = part(&pkg, WB);
+        assert!(wb.contains(caches), "{wb}");
+        assert_eq!(count_local(&wb, "pivotCache"), 1, "{wb}");
+    }
+
+    #[test]
+    fn remove_pivot_takes_out_a_wrapper_it_opened() {
+        for caches in [r#"<pivotCaches />"#, r#"<x:pivotCaches/>"#] {
+            let inner = if caches.starts_with("<x:") {
+                prefixed(caches)
+            } else {
+                workbook(&format!("{SHEETS}{caches}"))
+            };
+            let mut pkg = with_data(Some(inner));
+            let idx = add_default_pivot(&mut pkg).expect("add_pivot");
+            assert!(pkg.remove_pivot(idx));
+            let wb = part(&pkg, WB);
+            assert_eq!(count_local(&wb, "pivotCache"), 0, "{wb}");
+            assert_eq!(count_local(&wb, "pivotCaches"), 0, "{wb}");
+        }
     }
 
     #[test]
