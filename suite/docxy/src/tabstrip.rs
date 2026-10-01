@@ -178,7 +178,10 @@ pub fn move_index<T>(v: &mut Vec<T>, active: &mut usize, from: usize, to: usize)
 /// records the length and the source tab's title when the drag began; a tab
 /// closed or another reorder landing mid-drag invalidates the snapshot, and
 /// the drop must not guess at what moved. `title_at_ix` is the title the
-/// stored index names now — `None` when it names nothing.
+/// stored index names now — `None` when it names nothing. Documented
+/// limitation: titles are not unique (new documents are all `Untitled.*`),
+/// so a shift that lands the stored index on a same-title tab (at the same
+/// length) passes the guard.
 pub fn drag_applies(
     len_at_drag: usize,
     len_now: usize,
@@ -243,6 +246,9 @@ mod tests {
         assert!(!drag_applies(3, 3, Some("c"), "b"));
         // Out of range after closes.
         assert!(!drag_applies(4, 2, None, "d"));
+        // Documented limitation: titles are not unique, so a shift that
+        // lands the stored index on a tab with the same title passes.
+        assert!(drag_applies(3, 3, Some("Untitled.docx"), "Untitled.docx"));
     }
 
     #[test]

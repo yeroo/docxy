@@ -2627,6 +2627,21 @@ impl Probes {
             .map(|(_, b)| *b)
             .or_else(|| self.get(name))
     }
+
+    /// Like `current`, but for input that hit-tests the frame on screen: the
+    /// `next` frame alone, refusing a region that has vanished from it. The
+    /// `last` fallback applies only when `next` is entirely empty — nothing
+    /// recorded since the rotation — so a region that disappeared (a closed
+    /// tab's chip, a dismissed menu) is not aimed at its stale bounds.
+    /// `current`'s per-name fallback stays for callers that only read
+    /// geometry, like split-menu anchoring.
+    fn on_screen(&self, name: &str) -> Option<Bounds<Pixels>> {
+        if self.next.is_empty() {
+            self.get(name)
+        } else {
+            self.next.iter().find(|(n, _)| n == name).map(|(_, b)| *b)
+        }
+    }
 }
 
 /// Where a split button's drop-down opens: under the whole button, at its
@@ -2677,6 +2692,23 @@ mod probes_tests {
         p.last.push(("chart-panel".into(), at(5.)));
         assert_eq!(p.current("chart-panel"), Some(at(5.)));
         assert_eq!(p.current("missing"), None);
+    }
+
+    /// FIX r3 m2: a region that vanished from the on-screen frame is refused,
+    /// not aimed at its stale bounds; only an entirely empty `next` (nothing
+    /// recorded since the rotation) falls back to `last`.
+    #[test]
+    fn on_screen_refuses_a_region_the_on_screen_frame_lacks() {
+        let at = |x: f32| Bounds::new(point(px(x), px(0.)), size(px(10.), px(10.)));
+        let mut p = Probes::default();
+        p.last = vec![("tab-chip:4".into(), at(40.))];
+        // Nothing recorded since the rotation: the finished frame answers.
+        assert_eq!(p.on_screen("tab-chip:4"), Some(at(40.)));
+        // A frame is on screen that no longer records the region: refuse.
+        p.next = vec![("tab-chip:5".into(), at(90.))];
+        assert_eq!(p.on_screen("tab-chip:4"), None);
+        assert_eq!(p.on_screen("tab-chip:5"), Some(at(90.)));
+        assert_eq!(p.on_screen("missing"), None);
     }
 }
 
@@ -8888,8 +8920,8 @@ impl Docxy {
     ///
     /// Probe-backed regions resolve through `lookup`: `rect`/`shot` pass
     /// `Probes::get` (the last finished frame), pointer verbs pass
-    /// `Probes::current` (the frame on screen, which is what gpui hit-tests
-    /// dispatched input against — FIX r1 i1).
+    /// `Probes::on_screen` (the frame on screen, which is what gpui
+    /// hit-tests dispatched input against — FIX r1 i1).
     fn region_bounds_with(
         &self,
         region: harness::Region,
@@ -8955,12 +8987,13 @@ impl Docxy {
 
     /// Where a named region is on the frame that is on screen now — what
     /// pointer verbs aim at, matching the frame gpui hit-tests against.
+    /// Vanished regions refuse instead of falling back to stale bounds.
     fn region_bounds_live(
         &self,
         region: harness::Region,
         window: &Window,
     ) -> Result<Bounds<Pixels>, String> {
-        self.region_bounds_with(region, window, Probes::current)
+        self.region_bounds_with(region, window, Probes::on_screen)
     }
 
     /// The grid's scrolling cell area: the virtualized row list's own measured
@@ -22834,9 +22867,12 @@ impl Docxy {
 
 /// The drag payload for a title-chip drag: the source tab's absolute index,
 /// plus the strip length and the tab's title at drag start — a tab closed or
-/// another reorder landing mid-drag invalidates the index, and the drop must
-/// not guess at what moved. Cloned into the view gpui draws under the
-/// cursor — the same pattern as `TimelineDrag` in `project/timeline.rs`.
+/// another reorder landing mid-drag invalidates the snapshot, and the drop
+/// must not guess at what moved. Titles are not unique (new documents are
+/// all `Untitled.*`), so the guard passes if the shifted index happens to
+/// land on a same-title tab; a per-tab id would close that and is out of
+/// scope here. Cloned into the view gpui draws under the cursor — the same
+/// pattern as `TimelineDrag` in `project/timeline.rs`.
 #[derive(Clone)]
 struct TabDrag {
     ix: usize,
@@ -22845,13 +22881,18 @@ struct TabDrag {
 }
 
 impl Render for TabDrag {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The drag view renders outside the themed Root, so it asks the
+        // theme directly — the same palette the more-tabs popup uses.
+        let pal = Pal::of(cx);
         div()
             .px_2()
             .py_1()
             .rounded_md()
-            .bg(hsla_u(0xffffff))
+            .bg(pal.panel)
             .border_1()
+            .border_color(pal.border)
+            .text_color(pal.fg)
             .text_size(px(12.))
             .child(self.title.clone())
     }

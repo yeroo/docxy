@@ -917,22 +917,23 @@ fn pointer_drag_path(from: Point<Pixels>, to: Point<Pixels>) -> Vec<Point<Pixels
 
 /// Which more-tabs item's recorded bounds contain `p` — the drift guard a
 /// `pointer-click` reply reports, or -1 when the point is over no item.
-/// Each name resolves through `Probes::current` (the frame on screen first,
-/// the finished one as fallback), the same frame dispatched input
-/// hit-tests against — a plain `last` read can sit a frame behind it.
+/// Candidates come from the frame that is on screen (`next`), falling back
+/// to the finished one only when nothing has been recorded since the
+/// rotation: that is the frame gpui hit-tests dispatched input against, and
+/// an item the on-screen frame no longer records is not reported (FIX r3
+/// m3).
 fn item_at_point(probes: &crate::Probes, p: Point<Pixels>) -> i64 {
-    let names: Vec<&str> = probes
-        .next
+    let frame = if probes.next.is_empty() {
+        &probes.last
+    } else {
+        &probes.next
+    };
+    frame
         .iter()
-        .chain(&probes.last)
-        .map(|(name, _)| name.as_str())
-        .collect();
-    names
-        .into_iter()
-        .find_map(|name| {
+        .find_map(|(name, bounds)| {
             name.strip_prefix("tab-more-item:")
                 .and_then(|rest| rest.parse::<usize>().ok())
-                .filter(|_| probes.current(name).is_some_and(|b| b.contains(&p)))
+                .filter(|_| bounds.contains(&p))
                 .map(|i| i as i64)
         })
         .unwrap_or(-1)
@@ -5460,7 +5461,9 @@ mod tests {
         assert!(parse_region("tab-chip:x").is_err());
     }
 
-    /// #545: a drag crosses gpui's 2px drag threshold via the 8 pressed moves,
+    /// #545: the drag arms once a pressed move lands more than 2px from the
+    /// press (so a from→to distance of about 2.25px or less never arms and
+    /// acts as a click), the 8 moves interpolate strictly between the ends,
     /// and the press/release land exactly on the region centres.
     #[test]
     fn pointer_drag_path_visits_the_ends_with_eight_moves_between() {
@@ -5545,6 +5548,10 @@ mod tests {
         // does not. Same pattern as Probes' own current() test.
         probes.next = vec![item(0, 140.), item(1, 168.), item(2, 196.)];
         assert_eq!(item_at_point(&probes, point(px(150.), px(180.))), 1);
+        assert_eq!(item_at_point(&probes, point(px(150.), px(80.))), -1);
+        // The on-screen list is shorter: an item only the stale frame
+        // records is not reported — a pointer would not hit it either.
+        probes.next = vec![item(0, 140.)];
         assert_eq!(item_at_point(&probes, point(px(150.), px(80.))), -1);
     }
 
