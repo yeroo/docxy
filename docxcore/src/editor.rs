@@ -1087,7 +1087,9 @@ impl Editor {
         Some(clip)
     }
 
-    /// Paste a [`Clip`] at the caret (replacing any selection).
+    /// Paste a [`Clip`] at the caret (replacing any selection). Pasting inside
+    /// a hyperlink splits it, so the pasted content lands between two links
+    /// to the same target, not inside the link (see `split_content`).
     pub fn paste(&mut self, clip: &Clip) {
         if clip.paras.is_empty() {
             return;
@@ -2788,6 +2790,11 @@ fn keep_section_mark(kept: &mut ParProps, gone: ParProps) {
     }
 }
 
+/// Split `content` at caret offset `o`: `content` keeps what is before it,
+/// and the rest is returned. A zero-width inline exactly at `o` stays on the
+/// left. A run or a hyperlink that `o` falls strictly inside is split in two:
+/// Enter, paste and Tab inside a link leave a link on each side of what they
+/// insert (#352), while typing inside a link extends it (`content_insert`).
 fn split_content(content: &mut Vec<Inline>, o: usize) -> Vec<Inline> {
     let mut acc = 0;
     for i in 0..content.len() {
@@ -2797,15 +2804,69 @@ fn split_content(content: &mut Vec<Inline>, o: usize) -> Vec<Inline> {
             if local == 0 {
                 return content.split_off(i);
             }
-            if let Inline::Run(r) = &mut content[i] {
-                let b = char_byte(&r.text, local);
-                let right = r.text.split_off(b);
-                let props = r.props.clone();
-                let mut rest = content.split_off(i + 1);
-                rest.insert(0, Inline::Run(Run { text: right, props }));
-                return rest;
+            let right = match &mut content[i] {
+                Inline::Run(r) => {
+                    let b = char_byte(&r.text, local);
+                    let text = r.text.split_off(b);
+                    Inline::Run(Run {
+                        text,
+                        props: r.props.clone(),
+                    })
+                }
+                Inline::Hyperlink(h) => Inline::Hyperlink(split_link(h, local)),
+                _ => return content.split_off(i),
+            };
+            let mut rest = content.split_off(i + 1);
+            rest.insert(0, right);
+            return rest;
+        }
+        acc += l;
+    }
+    Vec::new()
+}
+
+/// Split a hyperlink at `local`, strictly inside its text: `h` keeps what is
+/// before it, and the returned link, with the same target, anchor and
+/// relationship, takes the rest. Each half keeps its own children. A link
+/// loaded from XML rebuilds both halves from `raw`'s opening tag on save, so
+/// each keeps the original `w:hyperlink` attributes.
+fn split_link(h: &mut Hyperlink, local: usize) -> Hyperlink {
+    let (runs, content) = match link_part(h, local) {
+        LinkPart::Runs(local) => (
+            split_runs(&mut h.runs, local),
+            std::mem::take(&mut h.content),
+        ),
+        LinkPart::Content(local) => (Vec::new(), split_content(&mut h.content, local)),
+    };
+    h.content_changed |= h.raw.is_some();
+    Hyperlink {
+        target: h.target.clone(),
+        anchor: h.anchor.clone(),
+        rel_id: h.rel_id.clone(),
+        runs,
+        content,
+        raw: h.raw.clone(),
+        content_changed: h.raw.is_some(),
+    }
+}
+
+/// Split `runs` at char offset `o`: `runs` keeps what is before it, and the
+/// rest is returned.
+fn split_runs(runs: &mut Vec<Run>, o: usize) -> Vec<Run> {
+    let mut acc = 0;
+    for i in 0..runs.len() {
+        let l = runs[i].text.chars().count();
+        if o < acc + l {
+            let local = o - acc;
+            if local == 0 {
+                return runs.split_off(i);
             }
-            return content.split_off(i);
+            let b = char_byte(&runs[i].text, local);
+            let text = runs[i].text.split_off(b);
+            let props = runs[i].props.clone();
+            let mut rest = runs.split_off(i + 1);
+            rest.insert(0, Run { text, props });
+            return rest;
         }
         acc += l;
     }
@@ -4572,6 +4633,161 @@ mod tests {
             "{:?}",
             link.content
         );
+    }
+
+    // ---- #352: Enter, paste and Tab inside a hyperlink split it ----
+
+    const SIMPLE_LINK_352: &str = "<w:r><w:t xml:space=\"preserve\">a </w:t></w:r>\
+        <w:hyperlink w:anchor=\"top\"><w:r><w:t>Contoso</w:t></w:r></w:hyperlink>";
+
+    /// A complex link: proofing marks at the split point (`Con|toso`) and at
+    /// its end, and an attribute (`w:history`) only its raw XML keeps.
+    const COMPLEX_LINK_352: &str = "<w:r><w:t xml:space=\"preserve\">a </w:t></w:r>\
+        <w:hyperlink w:anchor=\"top\" w:history=\"1\"><w:r><w:t>Con</w:t></w:r>\
+        <w:proofErr w:type=\"spellStart\"/><w:r><w:t>toso</w:t></w:r>\
+        <w:proofErr w:type=\"spellEnd\"/></w:hyperlink>";
+
+    fn link_text(h: &Hyperlink) -> String {
+        editor_text(&[Inline::Hyperlink(h.clone())])
+    }
+
+    fn holds_raw(h: &Hyperlink, needle: &str) -> bool {
+        h.content
+            .iter()
+            .any(|i| matches!(i, Inline::Raw(raw) if raw.contains(needle)))
+    }
+
+    /// Every paragraph's text after a save and reload.
+    fn reloaded_texts(ed: &Editor) -> Vec<String> {
+        let xml = crate::serialize::document_to_xml(&ed.doc);
+        let back = crate::load::parse_document_xml(&xml, &crate::load::Relationships::default());
+        back.body.iter().map(Block::plain_text).collect()
+    }
+
+    /// Checks shared by both halves of a split complex link: each keeps the
+    /// original `w:hyperlink` attributes on save, the proofing mark at the
+    /// split point goes left and the one at the end stays right, and the
+    /// saved XML reloads to the same text.
+    fn check_complex_halves(ed: &Editor, left: &Hyperlink, right: &Hyperlink) {
+        let xml = crate::serialize::document_to_xml(&ed.doc);
+        assert_eq!(
+            xml.matches("<w:hyperlink w:anchor=\"top\" w:history=\"1\">")
+                .count(),
+            2,
+            "{xml}"
+        );
+        assert!(left.content_changed && right.content_changed);
+        assert!(holds_raw(left, "spellStart") && !holds_raw(left, "spellEnd"));
+        assert!(holds_raw(right, "spellEnd") && !holds_raw(right, "spellStart"));
+        let before: Vec<String> = ed.doc.body.iter().map(Block::plain_text).collect();
+        assert_eq!(reloaded_texts(ed), before);
+    }
+
+    #[test]
+    fn enter_inside_a_link_splits_it_352() {
+        for xml in [SIMPLE_LINK_352, COMPLEX_LINK_352] {
+            let mut ed = Editor::new(xml_doc(xml));
+            ed.caret = Caret::at(vec![0], 5); // a Con|toso
+            ed.insert_newline();
+            let Block::Paragraph(p0) = &ed.doc.body[0] else {
+                panic!()
+            };
+            let Block::Paragraph(p1) = &ed.doc.body[1] else {
+                panic!()
+            };
+            let (left, right) = (link_at(&p0.content, 1), link_at(&p1.content, 0));
+            assert_eq!(p0.content.len(), 2, "{xml}");
+            assert_eq!(
+                (link_text(left), link_text(right)),
+                ("Con".into(), "toso".into())
+            );
+            assert_eq!(left.anchor.as_deref(), Some("top"));
+            assert_eq!(right.anchor.as_deref(), Some("top"));
+            assert_eq!(ed.caret, Caret::at(vec![1], 0));
+            if xml == COMPLEX_LINK_352 {
+                check_complex_halves(&ed, left, right);
+            }
+        }
+    }
+
+    #[test]
+    fn pasting_inside_a_link_lands_between_its_halves_352() {
+        for xml in [SIMPLE_LINK_352, COMPLEX_LINK_352] {
+            let mut ed = Editor::new(xml_doc(xml));
+            ed.caret = Caret::at(vec![0], 5);
+            ed.paste(&Clip {
+                paras: vec![vec![run("X", RunProps::default())]],
+            });
+            assert_eq!(etext(&ed), "a ConXtoso", "{xml}");
+            assert_eq!(ed.caret, Caret::at(vec![0], 6));
+            assert_eq!(
+                etext(&ed).chars().nth(5),
+                Some('X'),
+                "the char before the caret"
+            );
+            let content = &first_para(&ed).content;
+            assert_eq!(content.len(), 4, "{content:?}");
+            assert!(matches!(&content[2], Inline::Run(r) if r.text == "X"));
+            let (left, right) = (link_at(content, 1), link_at(content, 3));
+            assert_eq!(
+                (link_text(left), link_text(right)),
+                ("Con".into(), "toso".into())
+            );
+            assert_eq!(left.anchor, right.anchor);
+            if xml == COMPLEX_LINK_352 {
+                check_complex_halves(&ed, left, right);
+            }
+        }
+    }
+
+    #[test]
+    fn a_tab_inside_a_link_lands_between_its_halves_352() {
+        for xml in [SIMPLE_LINK_352, COMPLEX_LINK_352] {
+            let mut ed = Editor::new(xml_doc(xml));
+            ed.caret = Caret::at(vec![0], 5);
+            ed.insert_tab();
+            assert_eq!(etext(&ed), "a Con\ttoso", "{xml}");
+            assert_eq!(ed.caret, Caret::at(vec![0], 6));
+            let content = &first_para(&ed).content;
+            assert!(matches!(content[2], Inline::Tab(_)), "{content:?}");
+            let (left, right) = (link_at(content, 1), link_at(content, 3));
+            assert_eq!(
+                (link_text(left), link_text(right)),
+                ("Con".into(), "toso".into())
+            );
+            if xml == COMPLEX_LINK_352 {
+                check_complex_halves(&ed, left, right);
+            }
+        }
+    }
+
+    /// A link with both plain `runs` and other `content` splits on the side
+    /// the caret is in (`link_part`).
+    #[test]
+    fn a_link_with_runs_and_content_splits_on_the_carets_side_352() {
+        let link = || {
+            vec![Inline::Hyperlink(Hyperlink {
+                anchor: Some("top".into()),
+                runs: vec![Run {
+                    text: "ab".into(),
+                    props: RunProps::default(),
+                }],
+                content: vec![run("cd", RunProps::default())],
+                ..Default::default()
+            })]
+        };
+        for (at, left, right) in [(1, "a", "bcd"), (2, "ab", "cd"), (3, "abc", "d")] {
+            let mut content = link();
+            let rest = split_content(&mut content, at);
+            assert_eq!(editor_text(&content), left, "split at {at}");
+            assert_eq!(editor_text(&rest), right, "split at {at}");
+            let (l, r) = (link_at(&content, 0), link_at(&rest, 0));
+            assert_eq!(l.anchor, r.anchor);
+            assert!(
+                !l.content_changed && !r.content_changed,
+                "no raw, nothing to rebuild"
+            );
+        }
     }
 
     #[test]
