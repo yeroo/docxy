@@ -6,7 +6,7 @@
 //! a sparse `BTreeMap` so memory is proportional to content, and iteration is
 //! naturally row-major (the order worksheet XML wants).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
 // A1 reference math
@@ -267,6 +267,47 @@ pub fn snapshot_cells(
             })
         })
         .collect()
+}
+
+/// The cells an undo group over `keys` must record: `keys` in order,
+/// followed by the spill cells (its extent, not its `ref`) of each key that
+/// is a spill anchor `frozen` reports as kept on its cached values, each
+/// added once and not if `keys` names it already. Replacing an anchor clears
+/// its spill ([`crate::engine::Engine::set_cell`]), and a frozen anchor never
+/// re-spills: [`crate::engine::Engine::restore_cells`] puts its cached
+/// values back only from cells in the same snapshot. A live anchor adds
+/// nothing — it re-spills from its formula — so overwriting
+/// `=SEQUENCE(1000000)` records one cell. The order within the group is not
+/// load-bearing: an anchor's restore clears or refills its block whichever
+/// comes first.
+pub fn frozen_spill_keys(
+    sheet: &Sheet,
+    keys: &[(u32, u32)],
+    mut frozen: impl FnMut(u32, u32) -> bool,
+) -> Vec<(u32, u32)> {
+    let mut out = keys.to_vec();
+    let mut seen: HashSet<(u32, u32)> = keys.iter().copied().collect();
+    let mut asked = HashSet::new();
+    for &(r, c) in keys {
+        let Some((h, w)) = sheet
+            .cell(r, c)
+            .filter(|cl| cl.formula.is_some())
+            .and_then(|cl| cl.spill)
+        else {
+            continue;
+        };
+        if !asked.insert((r, c)) || !frozen(r, c) {
+            continue;
+        }
+        for rr in r..r + h {
+            for cc in c..c + w {
+                if seen.insert((rr, cc)) {
+                    out.push((rr, cc));
+                }
+            }
+        }
+    }
+    out
 }
 
 impl Cell {
@@ -2173,6 +2214,33 @@ mod tests {
         // Asked once per anchor over a key, never of the others.
         asked.sort();
         assert_eq!(asked, vec![(0, 2), (0, 4)]);
+    }
+
+    #[test]
+    fn frozen_spill_keys_adds_the_block_of_a_frozen_anchor() {
+        // #837: C1 spills C1:C3 live; E1 spills E1:F2 and is frozen.
+        let mut sheet = Sheet::default();
+        let anchor = |src: &str, ext| Cell {
+            spill: Some(ext),
+            ..Cell::formula(src)
+        };
+        sheet.set_cell(0, 2, anchor("SEQUENCE(3)", (3, 1)));
+        sheet.set_cell(1, 2, Cell::number(2.0));
+        sheet.set_cell(2, 2, Cell::number(3.0));
+        sheet.set_cell(0, 4, anchor("PIVOTBY(A1,4)", (2, 2)));
+        sheet.set_cell(0, 5, Cell::number(8.0));
+        sheet.set_cell(1, 4, Cell::number(9.0));
+        let frozen = |r, c| (r, c) == (0, 4);
+        // A live anchor, a member alone, an empty cell: nothing added.
+        for keys in [vec![(0, 2)], vec![(1, 4)], vec![(7, 7)]] {
+            assert_eq!(frozen_spill_keys(&sheet, &keys, frozen), keys);
+        }
+        // A frozen anchor adds its block once, after the keys, whatever
+        // of it the keys already name.
+        assert_eq!(
+            frozen_spill_keys(&sheet, &[(1, 5), (0, 4), (0, 4), (3, 3)], frozen),
+            vec![(1, 5), (0, 4), (0, 4), (3, 3), (0, 5), (1, 4)]
+        );
     }
 
     #[test]
