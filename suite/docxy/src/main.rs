@@ -1411,18 +1411,13 @@ impl SheetView {
     /// to it, as one undo step with the pivot view; the caller computes the
     /// table onto it. Returns the sheet's index.
     fn add_pivot_sheet(&mut self, mut d: PivotDef) -> usize {
-        let n = self
-            .pkg
-            .workbook
-            .sheets
-            .iter()
-            .filter(|s| s.name.starts_with("Pivot"))
-            .count();
-        let name = if n == 0 {
-            "Pivot".to_string()
-        } else {
-            format!("Pivot{}", n + 1)
-        };
+        // The first name no sheet has, case-insensitively: counting the
+        // "Pivot…" sheets would repeat a name once one of them is deleted.
+        let sheets = &self.pkg.workbook.sheets;
+        let name = std::iter::once("Pivot".to_string())
+            .chain((2..).map(|n| format!("Pivot{n}")))
+            .find(|name| !sheets.iter().any(|s| s.name.eq_ignore_ascii_case(name)))
+            .expect("an unused pivot sheet name");
         // add_sheet wires the OPC part + workbook entry so the sheet saves.
         let idx = self.add_sheet(&name);
         d.out_sheet = idx;
@@ -15486,7 +15481,8 @@ fn sheet_macro_losses(v: &SheetView, path: &std::path::Path) -> Vec<&'static str
 ///
 /// Excel 4.0 macro sheets stay in the open workbook (removing them would
 /// shift every sheet index), so each later macro-free save asks again, an
-/// in-place one included, as in Excel and xlsxy. So does one after undoing
+/// in-place one included, as in Excel; xlsxy asks only on Save As. So does
+/// one after undoing
 /// past a structural step taken before this save: that step restores a
 /// package that still has the VB project.
 ///
@@ -16761,6 +16757,44 @@ mod sheet_save_tests {
         assert!(v.redo_step());
         assert_eq!(v.pivot_views.len(), 1);
         assert_eq!(saved_sheets(v), with);
+    }
+
+    /// #789 r1: a pivot's output sheet takes the first free "Pivot", "Pivot2",
+    /// … name, so deleting one never leads to two sheets of the same name.
+    #[test]
+    fn pivot_sheets_take_the_first_free_name() {
+        let mut tab = three_sheet_tab();
+        let Surface::Sheet(v) = &mut tab.surface else {
+            unreachable!()
+        };
+        let def = || PivotDef {
+            src_sheet: 0,
+            src_range: (0, 0, 0, 0),
+            out_sheet: 0,
+            names: vec!["A".into()],
+            role: vec![1],
+            agg: vec![0],
+        };
+        let names = |v: &SheetView| -> Vec<String> {
+            v.pkg
+                .workbook
+                .sheets
+                .iter()
+                .map(|s| s.name.clone())
+                .collect()
+        };
+        v.pkg.workbook.sheets[1].name = "PivotData".into();
+        let first = v.add_pivot_sheet(def());
+        let second = v.add_pivot_sheet(def());
+        assert_eq!(names(v)[first], "Pivot", "PivotData does not count");
+        assert_eq!(names(v)[second], "Pivot2");
+        assert!(v.delete_sheet(first));
+        let third = v.add_pivot_sheet(def());
+        assert_eq!(names(v)[third], "Pivot");
+        let mut seen = names(v);
+        seen.sort_by_key(|n| n.to_lowercase());
+        seen.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        assert_eq!(seen.len(), v.pkg.workbook.sheets.len(), "{:?}", names(v));
     }
 
     fn comment_texts(v: &SheetView) -> Vec<(usize, u32, u32, String)> {
