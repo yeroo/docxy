@@ -5,7 +5,8 @@ import com.intellij.openapi.fileTypes.FileType
 import com.intellij.openapi.vfs.VirtualFile
 import javax.swing.Icon
 
-/** Claims `xlsx` as an IDE-openable (binary) file type — without this the
+/** Claims the workbook extensions (`xlsx`, `xlsm`, `xltx`, `xltm`, listed in
+ *  plugin.xml) as an IDE-openable (binary) file type — without this the
  *  platform's Native type launches Excel before any editor provider runs
  *  (the docx lesson, applied up front). */
 object XlsxFileType : FileType {

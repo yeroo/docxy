@@ -2244,6 +2244,40 @@ pub fn rename_sheet_in_expr(e: &Expr, old: &str, new: &str) -> Expr {
     walk(e, old, new)
 }
 
+/// Turn every reference to a sheet in `removed` (case-insensitive) into
+/// `#REF!`: the whole reference, so no removed sheet name is left in the
+/// formula. Excel writes `#REF!A1` after a sheet delete, keeping the cell
+/// part; the parser has no such form, and the reference is gone either way.
+///
+/// A 3-D span loses its reference only when an end sheet is removed (Excel
+/// moves that end inward instead). A sheet between the ends just drops out
+/// of the span, which is left alone.
+pub fn remove_sheet_refs_in_expr(e: &Expr, removed: &[String]) -> Expr {
+    let gone = |s: &str| removed.iter().any(|r| r.eq_ignore_ascii_case(s));
+    let on_gone = |s: &Option<String>| s.as_deref().is_some_and(gone);
+    let walk = |x: &Expr| remove_sheet_refs_in_expr(x, removed);
+    match e {
+        Expr::Ref(r) | Expr::SpillRef(r) if on_gone(&r.sheet) => Expr::Err(ExcelError::Ref),
+        Expr::Range(a, b) if on_gone(&a.sheet) || on_gone(&b.sheet) => Expr::Err(ExcelError::Ref),
+        Expr::ColRange { sheet, .. } | Expr::RowRange { sheet, .. } if on_gone(sheet) => {
+            Expr::Err(ExcelError::Ref)
+        }
+        Expr::Ref3D { first, last, .. } if gone(first) || gone(last) => Expr::Err(ExcelError::Ref),
+        Expr::ArrayLit(rows) => Expr::ArrayLit(
+            rows.iter()
+                .map(|row| row.iter().map(walk).collect())
+                .collect(),
+        ),
+        Expr::Func(n, args) => Expr::Func(n.clone(), args.iter().map(walk).collect()),
+        Expr::Call(callee, args) => {
+            Expr::Call(Box::new(walk(callee)), args.iter().map(walk).collect())
+        }
+        Expr::Un(op, x) => Expr::Un(*op, Box::new(walk(x))),
+        Expr::Bin(op, l, r) => Expr::Bin(*op, Box::new(walk(l)), Box::new(walk(r))),
+        other => other.clone(),
+    }
+}
+
 /// Run a defined name's definition through `f` (a structural edit or a sheet
 /// rename) and return the new text, or `None` when nothing changed or the
 /// text can't be read. Unlike cell formulas, a name may be a union of areas

@@ -4,6 +4,9 @@
 
 Initial release.
 
+- The workbook editor claims `.xlsm`, `.xltx` and `.xltm` as well as
+  `.xlsx`; a save writes the file's own type, and "Create new workbook" in
+  an empty file mints that file's type.
 - Native `.xlsx` editor: virtualized grid over gridwasm's windowed viewport
   protocol (Chicory, pure JVM) — values/formulas with live recalc, formula
   bar, formatting toolbar (bold/italic/align/decimals/autosum), insert/

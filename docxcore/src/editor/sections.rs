@@ -801,4 +801,160 @@ mod tests {
         assert_eq!(e.sections().len(), 2);
         assert_eq!(start_of(&e.sections()[0]), SectionStart::OddPage);
     }
+
+    // ---- #801: every paragraph split keeps a tracked pPrChange on both halves ----
+
+    const PPR_CHANGE: &str =
+        "<w:pPrChange w:id=\"9\"><w:pPr><w:jc w:val=\"left\"/></w:pPr></w:pPrChange>";
+
+    /// "ab,cd", centred with a tracked change from left, then "z".
+    fn ppr_change_editor() -> Editor {
+        let xml = format!(
+            concat!(
+                "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">",
+                "<w:body><w:p><w:pPr><w:jc w:val=\"center\"/>{}</w:pPr>",
+                "<w:r><w:t>ab,cd</w:t></w:r></w:p>",
+                "<w:p><w:r><w:t>z</w:t></w:r></w:p></w:body></w:document>"
+            ),
+            PPR_CHANGE
+        );
+        let doc = crate::load::parse_document_xml(&xml, &crate::load::Relationships::default());
+        let e = Editor::new(doc);
+        assert!(props_of(&e, 0).property_change.is_some());
+        e
+    }
+
+    fn ppr_change_raw(e: &Editor, i: usize) -> Option<String> {
+        props_of(e, i)
+            .property_change
+            .as_ref()
+            .map(|c| c.raw.clone())
+    }
+
+    /// Paragraphs `at` all carry the original pPrChange raw, each with its
+    /// own revision target.
+    fn assert_ppr_change_on(e: &Editor, raw: &Option<String>, at: &[usize], what: &str) {
+        let mut targets = Vec::new();
+        for &i in at {
+            assert_eq!(&ppr_change_raw(e, i), raw, "{what}: para {i}");
+            assert_eq!(
+                props_of(e, i).align,
+                crate::model::Align::Center,
+                "{what}: {i}"
+            );
+            let c = props_of(e, i).property_change.as_ref().unwrap();
+            assert!(c.metadata.target.is_assigned(), "{what}: para {i}");
+            targets.push(c.metadata.target);
+        }
+        targets.sort_by_key(|t| t.0);
+        targets.dedup();
+        assert_eq!(targets.len(), at.len(), "{what}: distinct targets");
+    }
+
+    #[test]
+    fn enter_keeps_the_ppr_change_on_both_halves_801() {
+        let mut e = ppr_change_editor();
+        let raw = ppr_change_raw(&e, 0);
+        e.caret = Caret::top(0, 2);
+        e.insert_newline();
+        assert_eq!(
+            (text_of(&e, 0), text_of(&e, 1)),
+            ("ab".into(), ",cd".into())
+        );
+        assert_ppr_change_on(&e, &raw, &[0, 1], "enter");
+    }
+
+    #[test]
+    fn multi_paragraph_paste_keeps_the_ppr_change_on_every_paragraph_801() {
+        let run = |t: &str| {
+            vec![Inline::Run(Run {
+                text: t.into(),
+                ..Run::default()
+            })]
+        };
+        for n in [2, 3] {
+            let mut e = ppr_change_editor();
+            let raw = ppr_change_raw(&e, 0);
+            let clip = Clip {
+                paras: ["A", "B", "C"][..n].iter().map(|t| run(t)).collect(),
+            };
+            e.caret = Caret::top(0, 2);
+            e.paste(&clip);
+            let at: Vec<usize> = (0..n).collect();
+            assert_ppr_change_on(&e, &raw, &at, &format!("{n} paragraphs"));
+        }
+    }
+
+    #[test]
+    fn section_break_split_keeps_the_ppr_change_on_both_halves_801() {
+        let mut e = ppr_change_editor();
+        let raw = ppr_change_raw(&e, 0);
+        e.caret = Caret::top(0, 2);
+        e.insert_section_break(SectionStart::NextPage).unwrap();
+        assert_eq!(
+            (text_of(&e, 0), text_of(&e, 1)),
+            ("ab".into(), ",cd".into())
+        );
+        assert!(props_of(&e, 0).section_break.is_some());
+        assert_ppr_change_on(&e, &raw, &[0, 1], "section break");
+    }
+
+    #[test]
+    fn insert_table_split_keeps_the_ppr_change_on_both_halves_801() {
+        let mut e = ppr_change_editor();
+        let raw = ppr_change_raw(&e, 0);
+        e.caret = Caret::top(0, 2);
+        e.insert_table(1, 1, crate::table::AutoFit::Default)
+            .unwrap();
+        assert!(matches!(e.doc.body[1], Block::Table(_)));
+        assert_eq!(
+            (text_of(&e, 0), text_of(&e, 2)),
+            ("ab".into(), ",cd".into())
+        );
+        assert_ppr_change_on(&e, &raw, &[0, 2], "insert table");
+    }
+
+    #[test]
+    fn text_to_table_keeps_the_ppr_change_on_every_piece_801() {
+        let mut e = ppr_change_editor();
+        let raw = ppr_change_raw(&e, 0);
+        e.anchor = Some(Caret::top(0, 0));
+        e.caret = Caret::top(0, 5);
+        e.text_to_table(super::super::CellSep::Char(','), None)
+            .unwrap();
+        let Some(Block::Table(t)) = e.doc.body.first() else {
+            panic!("no table")
+        };
+        let pieces: Vec<&Paragraph> = t.rows[0]
+            .cells
+            .iter()
+            .map(|c| match c.blocks.first() {
+                Some(Block::Paragraph(p)) => p,
+                _ => panic!("cell without a paragraph"),
+            })
+            .collect();
+        assert_eq!(pieces.len(), 2);
+        let mut targets = Vec::new();
+        for p in pieces {
+            let c = p.props.property_change.as_ref().expect("pPrChange kept");
+            assert_eq!(Some(c.raw.clone()), raw);
+            targets.push(c.metadata.target);
+        }
+        assert_ne!(targets[0], targets[1]);
+    }
+
+    #[test]
+    fn rejecting_the_split_off_ppr_change_reverts_only_its_paragraph_801() {
+        let mut e = ppr_change_editor();
+        e.caret = Caret::top(0, 2);
+        e.insert_table(1, 1, crate::table::AutoFit::Default)
+            .unwrap();
+        let second = props_of(&e, 2).property_change.as_ref().unwrap();
+        let target = second.metadata.target;
+        assert!(e.reject_revision(target).is_applied());
+        assert_eq!(props_of(&e, 2).property_change, None);
+        assert_eq!(props_of(&e, 2).align, crate::model::Align::Left);
+        assert!(props_of(&e, 0).property_change.is_some());
+        assert_eq!(props_of(&e, 0).align, crate::model::Align::Center);
+    }
 }

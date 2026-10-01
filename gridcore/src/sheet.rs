@@ -6,7 +6,7 @@
 //! a sparse `BTreeMap` so memory is proportional to content, and iteration is
 //! naturally row-major (the order worksheet XML wants).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 // ---------------------------------------------------------------------------
 // A1 reference math
@@ -221,53 +221,12 @@ pub(crate) fn own_array_ref(cell: &mut Cell, row: u32, col: u32) {
     }
 }
 
-/// Make an array formula pasted at `(row, col)` cover that cell alone: its
-/// `ref` still names the block it was copied from. A paste calls this for
-/// every pasted cell, before `Engine::set_cell` — which can't tell a paste
-/// at the source's own address (on another sheet, or after the source
-/// moved) from an undo. `current` is the cell being replaced: when it
-/// already holds this very array (same `<f>` attributes and formula), the
-/// block is that cell's and a paste in place keeps it.
-pub fn anchor_pasted_array_ref(cell: &mut Cell, current: Option<&Cell>, row: u32, col: u32) {
-    if !cell.f_attrs.as_deref().is_some_and(is_array_f) {
-        return;
-    }
-    let in_place =
-        current.is_some_and(|cur| cur.f_attrs == cell.f_attrs && cur.formula == cell.formula);
-    if !in_place {
-        if let Some(fa) = cell.f_attrs.as_deref() {
-            cell.f_attrs = Some(with_ref(fa, &cell_name(row, col)));
-        }
-    }
-}
-
-/// The cells among `cells` (at absolute `(row, col)`) that lie inside the
-/// spill extent of another cell in `cells` and hold no formula: spill output
-/// that the anchor re-creates. The engine drops a submitted extent
-/// ([`crate::engine::Engine::set_cell`] recomputes it), so a paste of a whole
-/// spill block puts these as blanks ([`Cell::blank_like`]): pasted as plain
-/// values they would be foreign content blocking the anchor with `#SPILL!`.
-/// (Undo/redo snapshots do the same through [`snapshot_cells`].)
-pub fn spill_children<'a, I>(cells: I) -> HashSet<(u32, u32)>
-where
-    I: IntoIterator<Item = ((u32, u32), &'a Cell)> + Clone,
-{
-    let anchors: Vec<((u32, u32), (u32, u32))> = cells
-        .clone()
-        .into_iter()
-        .filter(|(_, cl)| cl.formula.is_some())
-        .filter_map(|(at, cl)| cl.spill.map(|ext| (at, ext)))
-        .collect();
-    cells
-        .into_iter()
-        .filter(|((r, c), cl)| {
-            cl.formula.is_none()
-                && anchors.iter().any(|&((ar, ac), (h, w))| {
-                    (*r, *c) != (ar, ac) && *r >= ar && *r < ar + h && *c >= ac && *c < ac + w
-                })
-        })
-        .map(|(at, _)| at)
-        .collect()
+/// The block an array formula's stored `ref` names, as 0-based
+/// `(r1, c1, r2, c2)`: `None` for a cell that is not an array formula or
+/// whose `ref` is missing or unreadable.
+pub fn array_block(cell: &Cell) -> Option<(u32, u32, u32, u32)> {
+    let fa = cell.f_attrs.as_deref().filter(|a| is_array_f(a))?;
+    parse_range_name(f_ref(fa)?)
 }
 
 /// Undo/redo snapshots of the cells at `keys` as the sheet holds them now: a
@@ -310,21 +269,9 @@ pub fn snapshot_cells(
         .collect()
 }
 
-/// `cell` as a copy records it for a paste. An anchor kept on its cached
-/// values (`frozen`, asked only of an anchor) never re-spills, so its extent
-/// is dropped: [`spill_children`] then sees no anchor, and a paste of its
-/// block keeps the cached values.
-pub fn copied_cell(cell: &Cell, frozen: impl FnOnce() -> bool) -> Cell {
-    let mut cell = cell.clone();
-    if cell.spill.is_some() && cell.formula.is_some() && frozen() {
-        cell.spill = None;
-    }
-    cell
-}
-
 impl Cell {
-    /// An empty cell with this one's style: what a spill child is put back as
-    /// (see [`spill_children`]).
+    /// An empty cell with this one's style: what a spilled value is put back
+    /// as, ahead of the anchor that refills it.
     pub fn blank_like(&self) -> Cell {
         Cell {
             style: self.style,
@@ -454,6 +401,11 @@ pub struct Sheet {
     /// [`Drawing::anchor_ix`] of drawings deleted since the file was loaded —
     /// the same round-trip means a save has to strike them from the part too.
     pub drawings_removed: Vec<usize>,
+    /// [`CondFormat::ix`] of blocks a structural edit deleted (every range
+    /// gone): the worksheet part still holds them, so a save strikes them.
+    pub cf_removed: Vec<usize>,
+    /// [`DataValidation::ix`] of rules a structural edit deleted, likewise.
+    pub dv_removed: Vec<usize>,
     /// Sheet protection: `Some(attrs)` holds the raw attribute string of the
     /// worksheet's `<sheetProtection>` element (e.g. `sheet="1" objects="1"`),
     /// serialized verbatim so any existing password hash / flag set round-trips.
@@ -1106,6 +1058,11 @@ pub struct DataValidation {
     pub formula2: String,
     /// The input-message prompt, if the file supplies one.
     pub prompt: Option<String>,
+    /// The ordinal of this rule's element among the `<dataValidation>`
+    /// children of the worksheet's top-level `<dataValidations>`, so a save
+    /// can write a structural edit's move back to it. `None` for a rule the
+    /// part doesn't hold (an x14 one in `extLst`, one built in memory).
+    pub ix: Option<usize>,
 }
 
 impl DataValidation {
@@ -1669,7 +1626,30 @@ pub enum CfKind {
     /// `expression`: a formula truthy when the rule applies.
     Expression { formula: String },
     /// Anything else (colorScale/dataBar/iconSet/top10/…) — not evaluated.
-    Other,
+    /// Its `<formula>` children are kept so structural edits can move them.
+    Other { formulas: Vec<String> },
+}
+
+impl CfRule {
+    /// The rule's formulas in document order, whatever its kind.
+    pub fn formulas(&self) -> Vec<&String> {
+        match &self.kind {
+            CfKind::CellIs { formulas, .. } | CfKind::Other { formulas } => {
+                formulas.iter().collect()
+            }
+            CfKind::Expression { formula } => vec![formula],
+        }
+    }
+
+    /// [`Self::formulas`], mutably.
+    pub fn formulas_mut(&mut self) -> Vec<&mut String> {
+        match &mut self.kind {
+            CfKind::CellIs { formulas, .. } | CfKind::Other { formulas } => {
+                formulas.iter_mut().collect()
+            }
+            CfKind::Expression { formula } => vec![formula],
+        }
+    }
 }
 
 /// A conditional-formatting block: its `rules` apply over `ranges` (`sqref`).
@@ -1677,6 +1657,11 @@ pub enum CfKind {
 pub struct CondFormat {
     pub ranges: Vec<(u32, u32, u32, u32)>,
     pub rules: Vec<CfRule>,
+    /// The ordinal of this block's element among the worksheet's top-level
+    /// `<conditionalFormatting>` children, so a save can write a structural
+    /// edit's move back to it. `None` for a block the part doesn't hold (an
+    /// x14 one in `extLst`, one built in memory).
+    pub ix: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2146,52 +2131,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn spill_children_are_plain_cells_inside_an_anchor_in_the_set() {
-        let anchor = Cell {
-            spill: Some((3, 2)),
-            ..Cell::formula("SEQUENCE(3,2)")
-        };
-        let two = Cell::number(2.0);
-        let inner_formula = Cell::formula("1+1");
-        let cells = [
-            ((1, 1), &anchor),
-            ((1, 2), &two),           // child (same row)
-            ((2, 1), &two),           // child
-            ((3, 2), &two),           // child, last corner
-            ((4, 1), &two),           // below the extent
-            ((1, 3), &two),           // right of the extent
-            ((2, 2), &inner_formula), // a formula is never spill output
-        ];
-        let got = spill_children(cells.iter().copied());
-        let want: HashSet<(u32, u32)> = [(1, 2), (2, 1), (3, 2)].into_iter().collect();
-        assert_eq!(got, want);
-        // A child without its anchor in the set is just a value; an anchor's
-        // extent running past the set is fine.
-        assert!(spill_children([((2, 1), &two)]).is_empty());
-        assert_eq!(
-            spill_children([((1, 1), &anchor), ((2, 1), &two)]),
-            [(2, 1)].into_iter().collect()
-        );
-        // A spill extent on a plain value (none should exist) anchors nothing.
-        let stray = Cell {
-            spill: Some((2, 1)),
-            ..Cell::number(1.0)
-        };
-        assert!(spill_children([((1, 1), &stray), ((2, 1), &two)]).is_empty());
-        let styled = Cell {
-            style: 3,
-            ..Cell::number(2.0)
-        };
-        assert_eq!(
-            styled.blank_like(),
-            Cell {
-                style: 3,
-                ..Cell::default()
-            }
-        );
-    }
-
-    #[test]
     fn snapshots_blank_the_spill_output_of_a_live_anchor() {
         // #777 r1: C1 spills C1:C3 and is not among the keys; E1 is frozen.
         let mut sheet = Sheet::default();
@@ -2234,14 +2173,6 @@ mod tests {
         // Asked once per anchor over a key, never of the others.
         asked.sort();
         assert_eq!(asked, vec![(0, 2), (0, 4)]);
-        // A copy drops a frozen anchor's extent only.
-        let c1 = sheet.cell(0, 2).unwrap();
-        assert_eq!(copied_cell(c1, || false).spill, Some((3, 1)));
-        assert_eq!(copied_cell(c1, || true).spill, None);
-        assert_eq!(
-            copied_cell(&Cell::number(1.0), || panic!("not an anchor")),
-            Cell::number(1.0)
-        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use crate::entry::EntryCtx;
 use crate::formula::{
     EditShift, ExcelError, Expr, adjust_for_edit, adjust_formula_for_edit, parse,
-    rename_sheet_in_expr, rename_sheet_in_formula, to_string, translate_formula,
+    rename_sheet_in_expr, rename_sheet_in_formula, to_string, translate, translate_formula,
 };
 use crate::sheet::{
     Cell, CellValue, MAX_COLS, MAX_ROWS, Sheet, Styles, Workbook, f_ref, is_array_f, own_array_ref,
@@ -460,12 +460,41 @@ pub fn autofill(
     let Some(s) = wb.sheets.get_mut(sheet) else {
         return 0;
     };
+    // A source cell spilled by an anchor that is filled with it is copied
+    // blank (keeping its style): the anchor's copy refills it, where a copied
+    // value would block that copy's spill.
+    let mut spilled = std::collections::HashSet::new();
+    for (&(r, c), cell) in s.cells.range((sr0, 0)..=(sr1, u32::MAX)) {
+        let (Some((h, w)), true) = (cell.spill, (sc0..=sc1).contains(&c)) else {
+            continue;
+        };
+        if cell.formula.is_some() {
+            for rr in r..(r + h).min(sr1 + 1) {
+                for cc in c..(c + w).min(sc1 + 1) {
+                    spilled.insert((rr, cc));
+                }
+            }
+            spilled.remove(&(r, c));
+        }
+    }
+    let source = |s: &Sheet, r: u32, c: u32| {
+        s.cell(r, c).map(|cell| {
+            if cell.formula.is_none() && spilled.contains(&(r, c)) {
+                Cell {
+                    style: cell.style,
+                    ..Cell::default()
+                }
+            } else {
+                cell.clone()
+            }
+        })
+    };
     let mut filled = 0;
     if dr >= dc {
         // Fill DOWN: extend each column into rows sr1+1..=tr.
         let count = (tr - sr1) as usize;
         for c in sc0..=sc1 {
-            let srcvals: Vec<Option<Cell>> = (sr0..=sr1).map(|r| s.cell(r, c).cloned()).collect();
+            let srcvals: Vec<Option<Cell>> = (sr0..=sr1).map(|r| source(s, r, c)).collect();
             let len = srcvals.len();
             for (k, mut cell) in extend_series(&srcvals, count).into_iter().enumerate() {
                 let dst = sr1 + 1 + k as u32;
@@ -484,7 +513,7 @@ pub fn autofill(
         // Fill RIGHT: extend each row into columns sc1+1..=tc.
         let count = (tc - sc1) as usize;
         for r in sr0..=sr1 {
-            let srcvals: Vec<Option<Cell>> = (sc0..=sc1).map(|c| s.cell(r, c).cloned()).collect();
+            let srcvals: Vec<Option<Cell>> = (sc0..=sc1).map(|c| source(s, r, c)).collect();
             let len = srcvals.len();
             for (k, mut cell) in extend_series(&srcvals, count).into_iter().enumerate() {
                 let dst = sc1 + 1 + k as u32;
@@ -506,20 +535,33 @@ pub fn autofill(
 /// A copy never inherits the source's `<f>` attributes: `t="array" ref="A1:A3"`
 /// or a shared group's `si` names cells this copy does not own, and writing the
 /// same `ref`/`si` out from several cells is what makes Excel offer to repair
-/// the file. Dropped, the copy is an ordinary formula computing the same thing
-/// — which is also what makes it safe to shift.
+/// the file. Dropped, the copy is an ordinary formula — which is also what
+/// makes it safe to shift.
 ///
 /// Nor does it inherit the source's `<c>` metadata: `vm` describes the
-/// source's value, and a `cm` would make a copy of a loaded `t="array"` cell a
-/// dynamic array (engine and writer both go by it) where this ordinary formula
-/// is meant. What the engine learned about a formula typed here does carry
-/// over: a copy of a typed dynamic array is one too (`modern`, `dynamic`).
+/// source's value, and a `cm` names the source's dynamic-array entry. A copy
+/// is typed there, as a paste or Fill Down is (#724, `Engine::set_cell`): a
+/// modern formula, spilling once the engine evaluates it, whatever the source
+/// was — a loaded legacy formula or CSE anchor included. What the engine
+/// learned about a typed dynamic array carries over (`dynamic`); a copy of a
+/// loaded one becomes one again when the engine evaluates its array result.
 fn rebase(cell: &mut Cell, dr: i64, dc: i64) {
-    copy_meta(cell);
+    let dynamic = cell.meta.as_ref().is_some_and(|m| m.dynamic);
+    cell.meta = None;
+    // The source's spill extent isn't the copy's: the engine would take the
+    // cells under it for the copy's own when it evaluates it.
+    cell.spill = None;
     if cell.f_attrs.take().is_some() && cell.formula.as_deref() == Some("") {
         // A shared-group follower whose master wouldn't parse carries no text of
         // its own; without the group marker there is no formula left to write.
         cell.formula = None;
+    }
+    if cell.formula.is_some() {
+        cell.meta = Some(Box::new(crate::sheet::CellMeta {
+            modern: true,
+            dynamic,
+            ..Default::default()
+        }));
     }
     if (dr, dc) == (0, 0) {
         return;
@@ -531,9 +573,10 @@ fn rebase(cell: &mut Cell, dr: i64, dc: i64) {
     }
 }
 
-/// The `<c>` metadata a copy of `cell` keeps: none of the file's (`cm`, `vm`,
-/// `vm_body`, `ph` describe the source cell and its loaded value), only what
-/// the engine learned about a formula typed here (`modern`, `dynamic`).
+/// The `<c>` metadata a Fill Down/Right copy of `cell` keeps: none of the
+/// file's (`cm`, `vm`, `vm_body`, `ph` describe the source cell and its loaded
+/// value), only what the engine learned about a formula typed here (`modern`,
+/// `dynamic`).
 fn copy_meta(cell: &mut Cell) {
     cell.meta = cell.meta.take().filter(|m| m.modern || m.dynamic).map(|m| {
         Box::new(crate::sheet::CellMeta {
@@ -908,6 +951,18 @@ pub fn rename_sheet(wb: &mut Workbook, idx: usize, new_name: &str) {
             }
         }
     }
+    // Conditional formatting and data validation formulas can name a sheet
+    // too (a list on another sheet). Only one the rename touches is
+    // reprinted, so the loaded spelling stays otherwise.
+    for sheet in &mut wb.sheets {
+        for_each_rule_formula(sheet, |src| {
+            if let Some(updated) =
+                rewrite_if_changed(src, |e| rename_sheet_in_expr(e, &old, new_name))
+            {
+                *src = updated;
+            }
+        });
+    }
     // A chart's refs name their sheet the same way, and a save writes them back
     // out as `<c:f>` — left behind, they'd point at a sheet that no longer
     // exists and Excel would drop the chart's data.
@@ -919,6 +974,71 @@ pub fn rename_sheet(wb: &mut Workbook, idx: usize, new_name: &str) {
         }
     }
     wb.sheets[idx].name = new_name.to_string();
+}
+
+/// Before the sheets named in `removed` leave the workbook, turn every cell
+/// formula's reference to one of them into `#REF!`
+/// ([`crate::formula::remove_sheet_refs_in_expr`]). The formulas
+/// [`rename_sheet`] rewrites are the ones covered (shared groups were
+/// expanded at load); a formula that names none of them keeps its text
+/// exactly.
+///
+/// A rewritten cell's cached value is its new formula evaluated
+/// ([`crate::engine::eval_formula_at`]), so `IFERROR(#REF!,0)` caches 0
+/// rather than `#REF!`. An array formula's whole block (its `spill`) takes
+/// the anchor's value, which is right once the removed range has collapsed
+/// to the scalar `#REF!`. Only the rewritten cells are evaluated: a cell that
+/// reads one keeps its cached value, and a volatile formula keeps its own,
+/// until the file is next calculated.
+pub fn remove_sheet_refs(wb: &mut Workbook, removed: &[String]) {
+    if removed.is_empty() {
+        return;
+    }
+    let mut rewritten = Vec::new();
+    for (s, sheet) in wb.sheets.iter_mut().enumerate() {
+        for (&(r, c), cell) in sheet.cells.iter_mut() {
+            let Some(src) = &cell.formula else {
+                continue;
+            };
+            if cell.f_attrs.as_deref().is_some_and(|a| !is_array_f(a)) {
+                continue; // preserved verbatim
+            }
+            let rewrite = |e: &Expr| crate::formula::remove_sheet_refs_in_expr(e, removed);
+            if let Some(updated) = rewrite_if_changed(src, rewrite) {
+                cell.formula = Some(updated);
+                rewritten.push((s, r, c));
+            }
+        }
+    }
+    // Evaluated once every rewrite is in, against the rewritten workbook.
+    let values: Vec<CellValue> = rewritten
+        .iter()
+        .map(|&(s, r, c)| {
+            let src = wb.sheets[s].cells[&(r, c)].formula.as_deref().unwrap_or("");
+            crate::engine::value_to_cell(crate::engine::eval_formula_at(wb, s, r, c, src))
+        })
+        .collect();
+    for ((s, r, c), value) in rewritten.into_iter().zip(values) {
+        let sheet = &mut wb.sheets[s];
+        let Some(cell) = sheet.cells.get_mut(&(r, c)) else {
+            continue;
+        };
+        let block = cell.spill.filter(|_| cell.is_array_formula());
+        cell.value = value.clone();
+        let Some((rows, cols)) = block else {
+            continue;
+        };
+        for dr in 0..rows {
+            for dc in 0..cols {
+                if (dr, dc) == (0, 0) {
+                    continue;
+                }
+                if let Some(follower) = sheet.cells.get_mut(&(r + dr, c + dc)) {
+                    follower.value = value.clone();
+                }
+            }
+        }
+    }
 }
 
 /// Point every ref a chart holds at `new_name` where it named `old`. Public so
@@ -1190,6 +1310,12 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
         }
     }
 
+    // Conditional formatting and data validation follow the cells they cover,
+    // and their formulas move like cell formulas.
+    for (s, sheet) in wb.sheets.iter_mut().enumerate() {
+        shift_rules(sheet, s == idx, &target_name, &shift);
+    }
+
     // Page breaks (manual and automatic) stay with the row (column) that
     // starts their page.
     let sheet = &mut wb.sheets[idx];
@@ -1281,6 +1407,147 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
     }
 }
 
+/// Every conditional-formatting and data-validation formula on `sheet`.
+fn for_each_rule_formula(sheet: &mut Sheet, mut f: impl FnMut(&mut String)) {
+    for cf in &mut sheet.cond_formats {
+        for rule in &mut cf.rules {
+            rule.formulas_mut().into_iter().for_each(&mut f);
+        }
+    }
+    for dv in &mut sheet.validations {
+        f(&mut dv.formula1);
+        f(&mut dv.formula2);
+    }
+}
+
+/// Move a rule's ranges (`sqref`) through the edit, as merges move, and
+/// return how far its formulas have to be translated first. The formulas
+/// are relative to the ranges' top-left, (min r1, min c1) over them all (the
+/// anchor [`crate::cf`] evaluates them at). When a delete moves that corner
+/// to another cell, by trimming the range that held it or by taking a whole
+/// range that held its row or its column, the cell that becomes the new
+/// anchor read the formulas translated by the distance it sat from the old
+/// one: that (rows, cols) offset comes back. `None` when the edit deleted
+/// every range of a rule that had some.
+fn shift_rule_ranges(
+    ranges: &mut Vec<(u32, u32, u32, u32)>,
+    shift: &EditShift,
+) -> Option<(i64, i64)> {
+    if ranges.is_empty() {
+        return Some((0, 0));
+    }
+    let anchor = |rs: &[(u32, u32, u32, u32)]| {
+        rs.iter()
+            .fold((u32::MAX, u32::MAX), |(r, c), &(r1, c1, _, _)| {
+                (r.min(r1), c.min(c1))
+            })
+    };
+    let before = anchor(ranges);
+    let moved: Vec<_> = ranges
+        .iter()
+        .filter_map(|&(r1, c1, r2, c2)| {
+            if shift.rows {
+                span(r1, r2, shift).map(|(lo, hi)| (lo, c1, hi, c2))
+            } else {
+                span(c1, c2, shift).map(|(lo, hi)| (r1, lo, r2, hi))
+            }
+        })
+        .collect();
+    if moved.is_empty() {
+        return None;
+    }
+    *ranges = moved;
+    // An insert drops no range and moves the corner with its cell.
+    if shift.delta >= 0 {
+        return Some((0, 0));
+    }
+    let after = anchor(ranges);
+    // The new anchor's position before the edit: on the edited axis, past
+    // the deleted band when it sits at or after it; the other axis wasn't
+    // edited.
+    let pre = |v: u32| {
+        if v < shift.at {
+            v as i64
+        } else {
+            v as i64 - shift.delta
+        }
+    };
+    let (pre_r, pre_c) = if shift.rows {
+        (pre(after.0), after.1 as i64)
+    } else {
+        (after.0 as i64, pre(after.1))
+    };
+    Some((pre_r - before.0 as i64, pre_c - before.1 as i64))
+}
+
+/// A rule formula through the edit: translated by `by` to the rule's new
+/// anchor (see [`shift_rule_ranges`]), then adjusted like a cell formula.
+/// Unchanged or unparseable text stays as it is.
+fn shift_rule_formula(
+    src: &mut String,
+    by: (i64, i64),
+    home_is_target: bool,
+    target: &str,
+    shift: &EditShift,
+) {
+    let moved = rewrite_if_changed(src, |e| {
+        let e = if by == (0, 0) {
+            e.clone()
+        } else {
+            translate(e, by.0, by.1)
+        };
+        adjust_for_edit(&e, home_is_target, target, shift)
+    });
+    if let Some(moved) = moved {
+        *src = moved;
+    }
+}
+
+/// Move one sheet's conditional formatting and data validation for an edit
+/// on sheet `target`. On the target sheet their ranges move, and a rule that
+/// loses every range goes (its element named in `cf_removed` / `dv_removed`
+/// for the save); on any sheet their formulas' refs move.
+fn shift_rules(sheet: &mut Sheet, home_is_target: bool, target: &str, shift: &EditShift) {
+    let removed = &mut sheet.cf_removed;
+    sheet.cond_formats.retain_mut(|cf| {
+        let by = if home_is_target {
+            match shift_rule_ranges(&mut cf.ranges, shift) {
+                Some(by) => by,
+                None => {
+                    removed.extend(cf.ix);
+                    return false;
+                }
+            }
+        } else {
+            (0, 0)
+        };
+        for rule in &mut cf.rules {
+            for f in rule.formulas_mut() {
+                shift_rule_formula(f, by, home_is_target, target, shift);
+            }
+        }
+        true
+    });
+    let removed = &mut sheet.dv_removed;
+    sheet.validations.retain_mut(|dv| {
+        let by = if home_is_target {
+            match shift_rule_ranges(&mut dv.ranges, shift) {
+                Some(by) => by,
+                None => {
+                    removed.extend(dv.ix);
+                    return false;
+                }
+            }
+        } else {
+            (0, 0)
+        };
+        for f in [&mut dv.formula1, &mut dv.formula2] {
+            shift_rule_formula(f, by, home_is_target, target, shift);
+        }
+        true
+    });
+}
+
 /// One coordinate through the shift; None = deleted.
 fn point(v: u32, shift: &EditShift) -> Option<u32> {
     let v = v as i64;
@@ -1328,12 +1595,22 @@ fn shift_grid(sheet: &mut Sheet, shift: &EditShift) {
     let cells = std::mem::take(&mut sheet.cells);
     sheet.cells = cells
         .into_iter()
-        .filter_map(|((r, c), cell)| {
+        .filter_map(|((r, c), mut cell)| {
             let key = if shift.rows {
                 point(r, shift).map(|nr| (nr, c))
             } else {
                 point(c, shift).map(|nc| (r, nc))
             };
+            // A spill's extent stretches/clamps on the edited axis like a
+            // merge: the engine takes it as the block it owns, so a stale one
+            // would clear user data moved into it or block its own values.
+            if let (Some(_), Some((h, w))) = (key, cell.spill) {
+                cell.spill = if shift.rows {
+                    span(r, r + h.saturating_sub(1), shift).map(|(lo, hi)| (hi - lo + 1, w))
+                } else {
+                    span(c, c + w.saturating_sub(1), shift).map(|(lo, hi)| (h, hi - lo + 1))
+                };
+            }
             key.map(|k| (k, cell))
         })
         .collect();
@@ -1622,6 +1899,108 @@ mod tests {
         // The source keeps its own group intact.
         assert_eq!(cell(0).formula.as_deref(), Some("A1*2"));
         assert!(cell(0).f_attrs.is_some());
+    }
+
+    /// #785 r1: a copy of a spilling anchor doesn't bring the source's spill
+    /// extent. Evaluated after the suite's engine rebuild, a constant where
+    /// the copy would spill blocks it rather than being taken as its own.
+    #[test]
+    fn autofill_copy_of_a_spilling_anchor_never_takes_cells_under_its_spill() {
+        let mut w = wb(&[
+            ("A1", Cell::number(1.0)),
+            ("A2", Cell::number(2.0)),
+            ("A3", Cell::number(3.0)),
+            ("C2", Cell::number(99.0)),
+        ]);
+        let mut eng = crate::engine::Engine::new(&w);
+        eng.set_cell(&mut w, (0, 0, 1), Cell::formula("A1:A3*2"));
+        assert_eq!(w.sheets[0].cell(0, 1).unwrap().spill, Some((3, 1)));
+        assert_eq!(autofill(&mut w, 0, (0, 1, 0, 1), (0, 2)), 1);
+        assert_eq!(w.sheets[0].cell(0, 2).unwrap().spill, None);
+        let mut eng = crate::engine::Engine::new(&w);
+        eng.recalc_all(&mut w);
+        assert_eq!(
+            w.sheets[0].cell(1, 2).unwrap().value,
+            CellValue::Number(99.0)
+        );
+        assert_eq!(
+            w.sheets[0].cell(0, 2).unwrap().value,
+            CellValue::Error("#SPILL!".into())
+        );
+    }
+
+    fn values(w: &Workbook, names: &[&str]) -> Vec<CellValue> {
+        names
+            .iter()
+            .map(|n| {
+                let (r, c) = parse_cell_name(n).unwrap();
+                w.sheets[0]
+                    .cell(r, c)
+                    .map(|c| c.value.clone())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    fn nums(ns: &[f64]) -> Vec<CellValue> {
+        ns.iter().map(|&n| CellValue::Number(n)).collect()
+    }
+
+    /// #785 r2: a whole spill block filled down or right copies its spilled
+    /// values blank — each copy of the anchor spills there itself, with no
+    /// stale constants in its way. A typed dynamic array and a loaded CSE
+    /// block alike.
+    #[test]
+    fn autofill_of_a_whole_spill_block_spills_each_copy() {
+        let column: Vec<(String, Cell)> = (1..=6)
+            .map(|r| (format!("A{r}"), Cell::number(f64::from(r))))
+            .collect();
+        let column: Vec<(&str, Cell)> = column
+            .iter()
+            .map(|(n, c)| (n.as_str(), c.clone()))
+            .collect();
+        // A loaded CSE block, as the loader gives it: its `<f>` attributes, the
+        // spill its ref records, and its values stored over the block.
+        let cse = Cell {
+            value: CellValue::Number(2.0),
+            formula: Some("A1:A3*2".into()),
+            f_attrs: Some(" t=\"array\" ref=\"D1:D3\"".into()),
+            spill: Some((3, 1)),
+            ..Cell::default()
+        };
+        for loaded in [false, true] {
+            let mut w = wb(&column);
+            if loaded {
+                w.sheets[0].set_cell(0, 3, cse.clone());
+                w.sheets[0].set_cell(1, 3, Cell::number(4.0));
+                w.sheets[0].set_cell(2, 3, Cell::number(6.0));
+                Engine::new(&w).recalc_all(&mut w);
+            } else {
+                let mut eng = Engine::new(&w);
+                eng.set_cell(&mut w, (0, 0, 3), Cell::formula("A1:A3*2"));
+            }
+            assert_eq!(w.sheets[0].cell(0, 3).unwrap().spill, Some((3, 1)));
+            let d1 = w.sheets[0].cell(0, 3).unwrap();
+            assert_eq!(d1.f_attrs.is_some(), loaded);
+            assert_eq!(autofill(&mut w, 0, (0, 3, 2, 3), (5, 3)), 3);
+            let mut eng = Engine::new(&w);
+            eng.recalc_all(&mut w);
+            let d = ["D1", "D2", "D3", "D4", "D5", "D6"];
+            assert_eq!(values(&w, &d), nums(&[2.0, 4.0, 6.0, 8.0, 10.0, 12.0]));
+            assert_eq!(w.sheets[0].cell(3, 3).unwrap().spill, Some((3, 1)));
+            assert_eq!(w.sheets[0].cell(0, 3).unwrap().f_attrs.is_some(), loaded);
+        }
+
+        // Right: SEQUENCE(1,3) in A5 spills A5:C5; filled to D5:F5.
+        let mut w = wb(&[]);
+        let mut eng = Engine::new(&w);
+        eng.set_cell(&mut w, (0, 4, 0), Cell::formula("SEQUENCE(1,3)"));
+        assert_eq!(autofill(&mut w, 0, (4, 0, 4, 2), (4, 5)), 3);
+        let mut eng = Engine::new(&w);
+        eng.recalc_all(&mut w);
+        let row = ["A5", "B5", "C5", "D5", "E5", "F5"];
+        assert_eq!(values(&w, &row), nums(&[1.0, 2.0, 3.0, 1.0, 2.0, 3.0]));
+        assert_eq!(w.sheets[0].cell(4, 3).unwrap().spill, Some((1, 3)));
     }
 
     #[test]
@@ -2905,7 +3284,8 @@ mod tests {
                 ..Default::default()
             })
         );
-        // Nothing learned, nothing kept: no metadata box at all.
+        // A copy of a loaded formula is typed there (#785): modern, and
+        // nothing else of the source's.
         let mut plain = Cell::formula("A1");
         plain.meta = Some(Box::new(crate::sheet::CellMeta {
             cm: Some("1".into()),
@@ -2913,6 +3293,145 @@ mod tests {
         }));
         wb.sheets[0].set_cell(1, 0, plain);
         autofill(&mut wb, 0, (1, 0, 1, 0), (1, 1));
-        assert!(wb.sheets[0].cell(1, 1).unwrap().meta.is_none());
+        assert_eq!(
+            wb.sheets[0].cell(1, 1).unwrap().meta.as_deref(),
+            Some(&crate::sheet::CellMeta {
+                modern: true,
+                ..Default::default()
+            })
+        );
+    }
+
+    /// Sheet1 with A{top}:A{top+2} = 1..3, a CSE array `A..:A..*2` anchored in
+    /// column D on the same rows, and user data (99) just below the block —
+    /// recalculated, so the anchor carries its real spill extent.
+    fn cse_column_block(top: u32) -> Workbook {
+        let (a, b) = (top + 1, top + 3);
+        let mut w = wb(&[
+            (&format!("A{a}"), Cell::number(1.0)),
+            (&format!("A{}", a + 1), Cell::number(2.0)),
+            (&format!("A{b}"), Cell::number(3.0)),
+            (
+                &format!("D{a}"),
+                with_f_attrs(
+                    &format!("A{a}:A{b}*2"),
+                    &format!(" t=\"array\" ref=\"D{a}:D{b}\""),
+                ),
+            ),
+            (&format!("D{}", b + 1), Cell::number(99.0)),
+        ]);
+        Engine::new(&w).recalc_all(&mut w);
+        assert_eq!(w.sheets[0].cell(top, 3).unwrap().spill, Some((3, 1)));
+        w
+    }
+
+    #[test]
+    fn deleting_a_row_inside_a_spill_shrinks_it_and_keeps_user_data() {
+        let mut w = cse_column_block(0);
+        delete_rows(&mut w, 0, 1, 1);
+        // Before any recalc: the stored extent already matches the block.
+        assert_eq!(w.sheets[0].cell(0, 3).unwrap().spill, Some((2, 1)));
+        Engine::new(&w).recalc_all(&mut w);
+        assert_eq!(value_at(&w, "D1"), CellValue::Number(2.0));
+        assert_eq!(value_at(&w, "D2"), CellValue::Number(6.0));
+        // The user's 99 moved up into the old extent; the rebuild leaves it.
+        assert_eq!(value_at(&w, "D3"), CellValue::Number(99.0));
+    }
+
+    #[test]
+    fn inserting_a_row_inside_a_spill_grows_it_without_spill_error() {
+        let mut w = cse_column_block(0);
+        insert_rows(&mut w, 0, 1, 1);
+        assert_eq!(w.sheets[0].cell(0, 3).unwrap().spill, Some((4, 1)));
+        Engine::new(&w).recalc_all(&mut w);
+        // Its own moved-down values are still its own: no #SPILL!.
+        let d: Vec<_> = ["D1", "D2", "D3", "D4"]
+            .iter()
+            .map(|n| value_at(&w, n))
+            .collect();
+        assert_eq!(
+            d,
+            [2.0, 0.0, 4.0, 6.0].map(CellValue::Number).to_vec(),
+            "{d:?}"
+        );
+        assert_eq!(w.sheets[0].cell(0, 3).unwrap().spill, Some((4, 1)));
+        assert_eq!(value_at(&w, "D5"), CellValue::Number(99.0));
+    }
+
+    #[test]
+    fn deleting_a_column_inside_a_dynamic_array_shrinks_its_spill() {
+        let mut typed = Cell::formula("A1:C1*2");
+        typed.meta = Some(Box::new(crate::sheet::CellMeta {
+            modern: true,
+            ..Default::default()
+        }));
+        let mut w = wb(&[
+            ("A1", Cell::number(1.0)),
+            ("B1", Cell::number(2.0)),
+            ("C1", Cell::number(3.0)),
+            ("A3", typed),
+            ("D3", Cell::number(99.0)),
+        ]);
+        Engine::new(&w).recalc_all(&mut w);
+        assert_eq!(w.sheets[0].cell(2, 0).unwrap().spill, Some((1, 3)));
+        delete_cols(&mut w, 0, 1, 1);
+        assert_eq!(w.sheets[0].cell(2, 0).unwrap().spill, Some((1, 2)));
+        Engine::new(&w).recalc_all(&mut w);
+        assert_eq!(value_at(&w, "A3"), CellValue::Number(2.0));
+        assert_eq!(value_at(&w, "B3"), CellValue::Number(6.0));
+        assert_eq!(value_at(&w, "C3"), CellValue::Number(99.0));
+    }
+
+    #[test]
+    fn an_edit_outside_a_spill_keeps_its_extent() {
+        // Block D2:D4 (anchor at row 1).
+        let spill_at = |w: &Workbook, r: u32, c: u32| w.sheets[0].cell(r, c).unwrap().spill;
+        let mut w = cse_column_block(1);
+        delete_rows(&mut w, 0, 0, 1); // above: the anchor moves to D1
+        assert_eq!(spill_at(&w, 0, 3), Some((3, 1)));
+        let mut w = cse_column_block(1);
+        insert_rows(&mut w, 0, 4, 1); // just past its last row
+        assert_eq!(spill_at(&w, 1, 3), Some((3, 1)));
+        let mut w = cse_column_block(1);
+        insert_cols(&mut w, 0, 0, 1); // left: the anchor moves to E2
+        assert_eq!(spill_at(&w, 1, 4), Some((3, 1)));
+        // A row edit on another sheet never touches this one.
+        let mut w = cse_column_block(1);
+        w.sheets.push(Sheet {
+            name: "Sheet2".to_string(),
+            ..Sheet::default()
+        });
+        delete_rows(&mut w, 1, 2, 1);
+        assert_eq!(spill_at(&w, 1, 3), Some((3, 1)));
+    }
+
+    #[test]
+    fn a_structural_edit_resizes_a_2d_spill_on_its_own_axis_only() {
+        let block = || {
+            let mut cells = Vec::new();
+            for r in 1..=3 {
+                cells.push((format!("A{r}"), Cell::number(f64::from(r))));
+                cells.push((format!("B{r}"), Cell::number(f64::from(r * 10))));
+            }
+            cells.push((
+                "D1".to_string(),
+                with_f_attrs("A1:B3*2", " t=\"array\" ref=\"D1:E3\""),
+            ));
+            let cells: Vec<(&str, Cell)> =
+                cells.iter().map(|(n, c)| (n.as_str(), c.clone())).collect();
+            let mut w = wb(&cells);
+            Engine::new(&w).recalc_all(&mut w);
+            assert_eq!(w.sheets[0].cell(0, 3).unwrap().spill, Some((3, 2)));
+            w
+        };
+        let mut w = block();
+        delete_rows(&mut w, 0, 1, 1); // a row inside: h shrinks, w stays
+        assert_eq!(w.sheets[0].cell(0, 3).unwrap().spill, Some((2, 2)));
+        let mut w = block();
+        delete_cols(&mut w, 0, 4, 1); // column E: w shrinks, h stays
+        assert_eq!(w.sheets[0].cell(0, 3).unwrap().spill, Some((3, 1)));
+        let mut w = block();
+        insert_cols(&mut w, 0, 4, 1); // between D and E: w grows, h stays
+        assert_eq!(w.sheets[0].cell(0, 3).unwrap().spill, Some((3, 3)));
     }
 }

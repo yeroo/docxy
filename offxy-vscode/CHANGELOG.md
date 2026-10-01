@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Macro workbooks and templates open in the spreadsheet editor.**
+  `offxy.gridEditor` now claims `.xlsm`, `.xltx` and `.xltm` as well as
+  `.xlsx`; a save writes the file's own type, and a template is edited in
+  place as a template. Creating a workbook in an empty file mints that
+  file's type, so an empty `.xltm` becomes a macro template Excel opens.
 - **New: imported DOCX tracked changes are reviewable everywhere.** The TUI,
   wasm control bridge, VS Code tabs, and MCP server can list and navigate
   revisions and accept/reject one or all supported changes with structured

@@ -1166,6 +1166,8 @@ fn sheet_remove(app: &mut App, args: &Json) -> Result<Json, String> {
     if !app.pkg.remove_sheet(si) {
         return Err("cannot remove the last sheet".into());
     }
+    // A pending cut's source sheet may be gone or renumbered.
+    app.cancel_cut();
     // Indices above the removed sheet shift down by one; an unaffected
     // sheet below it keeps its index untouched. Only reset the viewport
     // when the ACTIVE sheet itself is the one that just disappeared —
@@ -1277,10 +1279,10 @@ fn patch_pairs(patch: &Json) -> Result<Vec<(String, String)>, String> {
 }
 
 /// Set `patch` over every cell in `range`, on the existing
-/// `Styles::intern`/`apply_format` path — one [`App::apply_on`] call, so the
-/// whole range lands as ONE undo group exactly like the TUI's own
-/// `apply_format`. Value/formula/spill are preserved; only each cell's style
-/// index changes.
+/// `Styles::intern`/`apply_format` path — one [`App::apply_styles_on`] call,
+/// so the whole range lands as ONE undo group exactly like the TUI's own
+/// `apply_format`. Only each cell's style index changes: value, formula and
+/// spill are never re-entered, so a spilled block stays spilled.
 fn cell_format(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg(app, args)?;
     let rg = args.get_str("range").ok_or("cell.format needs a 'range'")?;
@@ -1292,28 +1294,25 @@ fn cell_format(app: &mut App, args: &Json) -> Result<Json, String> {
     let pairs = patch_pairs(patch_arg)?;
     let patch = FormatPatch::parse(&pairs)?;
 
-    let snapshot: Vec<(u32, u32, Option<Cell>)> = {
+    let snapshot: Vec<(u32, u32, u32)> = {
         let sheet = &app.pkg.workbook.sheets[si];
         let mut v = Vec::new();
         for r in r1..=r2 {
             for c in c1..=c2 {
-                v.push((r, c, sheet.cell(r, c).cloned()));
+                v.push((r, c, sheet.cell(r, c).map_or(0, |cl| cl.style)));
             }
         }
         v
     };
-    let mut changes = Vec::with_capacity(snapshot.len());
-    for (r, c, existing) in snapshot {
-        let cur = existing.as_ref().map(|cl| cl.style).unwrap_or(0);
+    let mut styles = Vec::with_capacity(snapshot.len());
+    for (r, c, cur) in snapshot {
         let base_xf = app.pkg.workbook.styles.xf(cur);
         let new_xf = apply_patch_to_xf(&base_xf, &patch);
         let idx = app.pkg.workbook.styles.intern(new_xf);
-        let mut cell = existing.unwrap_or_default();
-        cell.style = idx;
-        changes.push((r, c, cell));
+        styles.push((r, c, idx));
     }
-    let formatted = changes.len();
-    app.apply_on(si, changes);
+    let formatted = styles.len();
+    app.apply_styles_on(si, styles);
     Ok(Json::obj(vec![("formatted", Json::Num(formatted as f64))]))
 }
 
@@ -2770,6 +2769,45 @@ mod tests {
     }
 
     #[test]
+    fn sheet_remove_of_a_lower_sheet_makes_a_pending_cut_a_copy() {
+        // #782: removing a sheet below the cut's source renumbers it; the
+        // pending cut must not then clear the sheet that took its index.
+        let mut a = app();
+        for name in ["Second", "Third"] {
+            dispatch(
+                &mut a,
+                "sheet.add",
+                &Json::obj(vec![("name", Json::Str(name.into()))]),
+            )
+            .unwrap();
+        }
+        let set_on = |a: &mut App, s: usize, text: &str| {
+            a.apply_on(s, vec![(0, 0, gridcore::edit::parse_input(text))]);
+        };
+        set_on(&mut a, 1, "2");
+        set_on(&mut a, 2, "3");
+        a.goto_sheet(1);
+        a.cur = (0, 0);
+        a.copy(true);
+        dispatch(
+            &mut a,
+            "sheet.remove",
+            &Json::obj(vec![("sheet", Json::Num(0.0))]),
+        )
+        .unwrap();
+        // Second is now sheet 0 and Third sheet 1: the cut's recorded index
+        // is in range but names Third.
+        a.goto_sheet(0);
+        a.cur = (0, 5);
+        a.paste();
+        let text =
+            |a: &App, s: usize, r, c| a.pkg.workbook.sheets[s].cell(r, c).map(|x| x.value.clone());
+        assert_eq!(text(&a, 0, 0, 0), Some(CellValue::Number(2.0)));
+        assert_eq!(text(&a, 1, 0, 0), Some(CellValue::Number(3.0)));
+        assert_eq!(text(&a, 0, 0, 5), Some(CellValue::Number(2.0)));
+    }
+
+    #[test]
     fn sheet_remove_errors_on_the_last_sheet() {
         let mut a = app();
         let err = dispatch(
@@ -3261,6 +3299,37 @@ mod tests {
                 "{r} should have no format key after undo, got {g:?}"
             );
         }
+    }
+
+    #[test]
+    fn cell_format_over_a_spill_keeps_it_as_one_undo_group() {
+        // #784: restyling a spilled block changes styles only.
+        let mut a = app();
+        set(&mut a, "D1", "=SEQUENCE(3)");
+        let spill = |a: &App| a.pkg.workbook.sheets[0].cell(0, 3).unwrap().spill;
+        assert_eq!(spill(&a), Some((3, 1)));
+        let depth = a.undo.len();
+        dispatch(
+            &mut a,
+            "cell.format",
+            &Json::obj(vec![
+                ("range", Json::Str("D1:D3".into())),
+                ("patch", Json::obj(vec![("bold", Json::Bool(true))])),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(a.undo.len(), depth + 1);
+        assert_eq!(spill(&a), Some((3, 1)));
+        for r in 0..3u32 {
+            let cell = a.pkg.workbook.sheets[0].cell(r, 3).unwrap();
+            assert_eq!(cell.value, CellValue::Number(f64::from(r + 1)));
+            assert!(a.pkg.workbook.styles.xf(cell.style).bold);
+        }
+        a.undo();
+        assert_eq!(spill(&a), Some((3, 1)));
+        assert_eq!(a.pkg.workbook.sheets[0].cell(0, 3).unwrap().style, 0);
+        a.redo();
+        assert_eq!(spill(&a), Some((3, 1)));
     }
 
     #[test]

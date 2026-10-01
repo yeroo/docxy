@@ -587,7 +587,7 @@ const PIVOT_AGGS: [(gridcore::frame::Agg, &str); 6] = [
 
 /// A point-in-time snapshot of a spreadsheet for undo/redo.
 struct SheetSnapshot {
-    wb: gridcore::sheet::Workbook,
+    body: SnapshotBody,
     /// UI-authored charts live outside the workbook, so undoing a chart move,
     /// delete or re-point needs them snapshotted alongside it.
     charts: Vec<ChartView>,
@@ -598,6 +598,29 @@ struct SheetSnapshot {
     active: usize,
     sel: (u32, u32),
     anchor: (u32, u32),
+}
+
+/// What an undo step puts back of the package.
+enum SnapshotBody {
+    /// The workbook model alone: enough for an edit that changes only cells,
+    /// styles and the like, and cheap.
+    Workbook(gridcore::sheet::Workbook),
+    /// The whole package, for an edit that changes its parts: adding or
+    /// removing a sheet (its part, relationship and `<sheet>` element), or a
+    /// comment. Restoring only the model over the changed parts would pair
+    /// sheets with the wrong parts at save (#789).
+    Package(Box<gridcore::xlsx::SheetPackage>),
+}
+
+impl SheetSnapshot {
+    /// The workbook this step restores.
+    #[cfg(test)]
+    fn workbook(&self) -> &gridcore::sheet::Workbook {
+        match &self.body {
+            SnapshotBody::Workbook(wb) => wb,
+            SnapshotBody::Package(pkg) => &pkg.workbook,
+        }
+    }
 }
 
 /// An in-progress column-resize drag: which column, and the mouse-x + width it
@@ -1050,40 +1073,6 @@ impl ClipRead {
     }
 }
 
-/// Write a pasted `block` onto sheet `s` from `(br, bc)`, one cell at a time
-/// through the engine. A pasted array anchor covers its own cell, not the
-/// block it was copied from, unless it lands on that very block
-/// ([`gridcore::sheet::anchor_pasted_array_ref`]). A copied spill block pastes
-/// as its anchor, which re-spills over its children, pasted as blanks
-/// ([`gridcore::sheet::spill_children`]).
-fn paste_grid_block(
-    engine: &mut gridcore::engine::Engine,
-    wb: &mut gridcore::sheet::Workbook,
-    s: usize,
-    (br, bc): (u32, u32),
-    block: &[Vec<gridcore::sheet::Cell>],
-) {
-    let children =
-        gridcore::sheet::spill_children(block.iter().enumerate().flat_map(|(dr, row)| {
-            row.iter()
-                .enumerate()
-                .map(move |(dc, cell)| ((dr as u32, dc as u32), cell))
-        }));
-    for (dr, row) in block.iter().enumerate() {
-        for (dc, cell) in row.iter().enumerate() {
-            let (r, c) = (br + dr as u32, bc + dc as u32);
-            let mut cell = if children.contains(&(dr as u32, dc as u32)) {
-                cell.blank_like()
-            } else {
-                cell.clone()
-            };
-            let current = wb.sheets.get(s).and_then(|sh| sh.cell(r, c));
-            gridcore::sheet::anchor_pasted_array_ref(&mut cell, current, r, c);
-            engine.set_cell(wb, (s, r, c), cell);
-        }
-    }
-}
-
 /// Whether a paste uses the in-app clip (a sheet's grid clip or a document's
 /// rich clip) recorded as `recorded` rather than what the clipboard holds `now`
 /// (#699, #755). The clip is ours only while the clipboard still holds the text
@@ -1305,6 +1294,158 @@ impl SheetView {
     /// Snapshot before a mutation; share the history limit across all edits.
     fn push_undo(&mut self) {
         self.push_undo_snapshot(self.snapshot());
+    }
+
+    /// Undo one step: the current state goes on the redo stack, taken the
+    /// same way as the step (a package step's redo restores the parts too).
+    /// Returns whether there was a step.
+    fn undo_step(&mut self) -> bool {
+        let Some(snap) = self.undo.pop() else {
+            return false;
+        };
+        let now = self.snapshot_like(&snap);
+        self.redo.push(now);
+        self.restore(snap);
+        true
+    }
+
+    /// Redo one step, the mirror of [`Self::undo_step`].
+    fn redo_step(&mut self) -> bool {
+        let Some(snap) = self.redo.pop() else {
+            return false;
+        };
+        let now = self.snapshot_like(&snap);
+        self.undo.push(now);
+        self.restore(snap);
+        true
+    }
+
+    /// The current state, taken as `snap` was: the package when it holds one.
+    fn snapshot_like(&self, snap: &SheetSnapshot) -> SheetSnapshot {
+        match snap.body {
+            SnapshotBody::Workbook(_) => self.snapshot(),
+            SnapshotBody::Package(_) => self.snapshot_package(),
+        }
+    }
+
+    /// Set the selected cell's comment to `text` by `author` (blank deletes
+    /// it), as one undo step of the whole package: a comment lives in the
+    /// parts (its part, VML, rels and content type), so a model-only step
+    /// could not undo it, and a later package step's undo would silently
+    /// take it away. False when the sheet's XML refuses it: nothing changed
+    /// and there is no step.
+    fn comment_cell(&mut self, author: &str, text: &str) -> bool {
+        let t = text.trim();
+        if t.is_empty() {
+            self.delete_comment();
+            return true;
+        }
+        let snap = self.snapshot_package();
+        let ((r, c), s) = (self.sel, self.active);
+        if !self.pkg.set_comment(s, r, c, author, t) {
+            return false;
+        }
+        self.push_undo_snapshot(snap);
+        true
+    }
+
+    /// Delete the comment on the selected cell, as one undo step of the whole
+    /// package (see [`Self::comment_cell`]). No comment there, no step.
+    fn delete_comment(&mut self) {
+        let ((r, c), s) = (self.sel, self.active);
+        let here = |cm: &gridcore::comments::Comment| cm.sheet == s && cm.row == r && cm.col == c;
+        if !self.pkg.comments().iter().any(here) {
+            return;
+        }
+        self.push_undo_snapshot(self.snapshot_package());
+        self.pkg.remove_comment(s, r, c);
+    }
+
+    /// The lowest "SheetN" (counting from one past the sheet count) no sheet
+    /// has yet, case-insensitively.
+    fn next_sheet_name(&self) -> String {
+        let sheets = &self.pkg.workbook.sheets;
+        (sheets.len() + 1..)
+            .map(|n| format!("Sheet{n}"))
+            .find(|name| !sheets.iter().any(|s| s.name.eq_ignore_ascii_case(name)))
+            .expect("an unused sheet name")
+    }
+
+    /// Add sheet `name` (its part, relationship and `<sheet>` element, as
+    /// [`gridcore::xlsx::SheetPackage::add_sheet`] does) as one undo step,
+    /// and switch to it. Returns its index.
+    fn add_sheet(&mut self, name: &str) -> usize {
+        self.push_undo_snapshot(self.snapshot_package());
+        let idx = self.pkg.add_sheet(name);
+        self.active = idx;
+        self.sel = (0, 0);
+        self.anchor = (0, 0);
+        self.end_cell_edit();
+        self.engine = sheet_engine(&self.pkg.workbook);
+        idx
+    }
+
+    /// Add the output sheet ("Pivot", "Pivot2", …) for pivot `d` and switch
+    /// to it, as one undo step with the pivot view; the caller computes the
+    /// table onto it. Returns the sheet's index.
+    fn add_pivot_sheet(&mut self, mut d: PivotDef) -> usize {
+        // The first name no sheet has, case-insensitively: counting the
+        // "Pivot…" sheets would repeat a name once one of them is deleted.
+        let sheets = &self.pkg.workbook.sheets;
+        let name = std::iter::once("Pivot".to_string())
+            .chain((2..).map(|n| format!("Pivot{n}")))
+            .find(|name| !sheets.iter().any(|s| s.name.eq_ignore_ascii_case(name)))
+            .expect("an unused pivot sheet name");
+        // add_sheet wires the OPC part + workbook entry so the sheet saves.
+        let idx = self.add_sheet(&name);
+        d.out_sheet = idx;
+        self.pivot_views.push(d);
+        idx
+    }
+
+    /// Delete sheet `idx` as one undo step, never the last sheet: its part
+    /// and what only it used go with it, and the pivot views, charts and the
+    /// active index above it shift down. Returns whether it was deleted; a
+    /// refusal leaves no undo step.
+    fn delete_sheet(&mut self, idx: usize) -> bool {
+        let count = self.pkg.workbook.sheets.len();
+        if count <= 1 || idx >= count {
+            return false;
+        }
+        let snap = self.snapshot_package();
+        if !self.pkg.remove_sheet(idx) {
+            return false;
+        }
+        self.push_undo_snapshot(snap);
+        // Drop views on the removed sheet; shift indices above it down one.
+        self.pivot_views.retain(|d| d.out_sheet != idx);
+        for d in &mut self.pivot_views {
+            if d.out_sheet > idx {
+                d.out_sheet -= 1;
+            }
+            if d.src_sheet > idx {
+                d.src_sheet -= 1;
+            }
+        }
+        self.charts.retain(|c| c.sheet != idx);
+        for c in &mut self.charts {
+            if c.sheet > idx {
+                c.sheet -= 1;
+            }
+        }
+        // Deleting a sheet BELOW the active one shifts it down by one;
+        // clamping alone would silently leave the view on its neighbour.
+        if idx < self.active {
+            self.active -= 1;
+        }
+        if self.active >= self.pkg.workbook.sheets.len() {
+            self.active = self.pkg.workbook.sheets.len() - 1;
+        }
+        self.sel = (0, 0);
+        self.anchor = (0, 0);
+        self.end_cell_edit();
+        self.engine = sheet_engine(&self.pkg.workbook);
+        true
     }
 
     /// Add a chart the user inserted, with its undo step. It is written only
@@ -2056,8 +2197,18 @@ impl SheetView {
     /// Capture this view's undoable state — the workbook plus everything the UI
     /// keeps beside it that a mutation can move.
     fn snapshot(&self) -> SheetSnapshot {
+        self.snapshot_with(SnapshotBody::Workbook(self.pkg.workbook.clone()))
+    }
+
+    /// [`Self::snapshot`] with the whole package, for an edit that changes
+    /// its parts ([`SnapshotBody::Package`]).
+    fn snapshot_package(&self) -> SheetSnapshot {
+        self.snapshot_with(SnapshotBody::Package(Box::new(self.pkg.clone())))
+    }
+
+    fn snapshot_with(&self, body: SnapshotBody) -> SheetSnapshot {
         SheetSnapshot {
-            wb: self.pkg.workbook.clone(),
+            body,
             charts: self.charts.clone(),
             pivots: self.pivot_views.clone(),
             active: self.active,
@@ -2068,7 +2219,10 @@ impl SheetView {
 
     /// Restore this view from an undo/redo snapshot, rebuilding the recalc engine.
     fn restore(&mut self, snap: SheetSnapshot) {
-        self.pkg.workbook = snap.wb;
+        match snap.body {
+            SnapshotBody::Workbook(wb) => self.pkg.workbook = wb,
+            SnapshotBody::Package(pkg) => self.pkg = *pkg,
+        }
         self.charts = snap.charts;
         self.pivot_views = snap.pivots;
         self.engine = sheet_engine(&self.pkg.workbook);
@@ -3969,24 +4123,26 @@ fn sample_doc() -> Loaded {
 /// mutated / charts aren't re-added on each call). Shared by Save and hot-exit.
 /// A save names its `target`, whose extension sets the file type (a
 /// macro-free one leaves the macros out of the bytes only); hot-exit passes
-/// `None` and keeps the loaded type.
-fn sheet_bytes(v: &SheetView, target: Option<&std::path::Path>) -> Vec<u8> {
+/// `None` and keeps the loaded type. Also returns how many UI charts
+/// `add_chart` refused, so the save can say they are not in the file.
+fn sheet_bytes(v: &SheetView, target: Option<&std::path::Path>) -> (Vec<u8>, usize) {
     let write = |pkg: &gridcore::xlsx::SheetPackage| match target {
         Some(target) => gridcore::xlsx::save_xlsx_for_path(pkg, target),
         None => gridcore::xlsx::save_xlsx(pkg),
     };
     if v.charts.is_empty() {
-        write(&v.pkg)
+        (write(&v.pkg), 0)
     } else {
         let mut pkg = v.pkg.clone();
-        for cv in &v.charts {
-            // The insert asked `can_add_chart` (`insert_ui_chart`), so a
-            // damaged worksheet or drawing part was refused then. Only a
-            // drawing-rels part too broken to take the chart's relationship
-            // can still refuse here, and that isn't reported.
-            pkg.add_chart(cv.sheet, cv.from, cv.to, &cv.data);
-        }
-        write(&pkg)
+        // The insert asked `can_add_chart` (`insert_ui_chart`), but the
+        // package can change after it (a later chart, an edit), so each
+        // chart is asked again here and a refusal is counted, not lost.
+        let refused = v
+            .charts
+            .iter()
+            .filter(|cv| !pkg.add_chart(cv.sheet, cv.from, cv.to, &cv.data))
+            .count();
+        (write(&pkg), refused)
     }
 }
 
@@ -6907,7 +7063,7 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
         }
         Surface::Sheet(v) => {
             let p = hd.join(format!("tab-{i}.xlsx"));
-            opccore::fsio::write_atomic(&p, &sheet_bytes(v, None))
+            opccore::fsio::write_atomic(&p, &sheet_bytes(v, None).0)
                 .ok()
                 .map(|_| p.display().to_string())
         }
@@ -9444,26 +9600,9 @@ impl Docxy {
 
     /// Add a new blank sheet (unique "SheetN" name) and switch to it.
     fn sheet_add(&mut self, cx: &mut Context<Self>) {
-        self.sheet_snapshot();
         if let Some(v) = self.active_sheet_mut() {
-            // Pick the lowest "SheetN" not already taken.
-            let mut n = v.pkg.workbook.sheets.len() + 1;
-            let taken = |v: &SheetView, name: &str| {
-                v.pkg
-                    .workbook
-                    .sheets
-                    .iter()
-                    .any(|s| s.name.eq_ignore_ascii_case(name))
-            };
-            while taken(v, &format!("Sheet{n}")) {
-                n += 1;
-            }
-            let idx = v.pkg.add_sheet(&format!("Sheet{n}"));
-            v.active = idx;
-            v.sel = (0, 0);
-            v.anchor = (0, 0);
-            v.end_cell_edit();
-            v.engine = sheet_engine(&v.pkg.workbook);
+            let name = v.next_sheet_name();
+            v.add_sheet(&name);
         }
         // We just switched sheets, same as `select_sheet`.
         self.drop_grid_state();
@@ -9476,45 +9615,8 @@ impl Docxy {
     fn sheet_delete(&mut self, idx: usize, cx: &mut Context<Self>) {
         // Clicking × on a lone sheet does nothing — and must not spend an undo
         // step doing it, which would also throw away the redo stack.
-        if self
-            .active_sheet()
-            .is_none_or(|v| v.pkg.workbook.sheets.len() <= 1 || idx >= v.pkg.workbook.sheets.len())
-        {
+        if !self.active_sheet_mut().is_some_and(|v| v.delete_sheet(idx)) {
             return;
-        }
-        self.sheet_snapshot();
-        if let Some(v) = self.active_sheet_mut() {
-            if !v.pkg.remove_sheet(idx) {
-                return;
-            }
-            // Drop views on the removed sheet; shift indices above it down one.
-            v.pivot_views.retain(|d| d.out_sheet != idx);
-            for d in &mut v.pivot_views {
-                if d.out_sheet > idx {
-                    d.out_sheet -= 1;
-                }
-                if d.src_sheet > idx {
-                    d.src_sheet -= 1;
-                }
-            }
-            v.charts.retain(|c| c.sheet != idx);
-            for c in &mut v.charts {
-                if c.sheet > idx {
-                    c.sheet -= 1;
-                }
-            }
-            // Deleting a sheet BELOW the active one shifts it down by one;
-            // clamping alone would silently leave the view on its neighbour.
-            if idx < v.active {
-                v.active -= 1;
-            }
-            if v.active >= v.pkg.workbook.sheets.len() {
-                v.active = v.pkg.workbook.sheets.len() - 1;
-            }
-            v.sel = (0, 0);
-            v.anchor = (0, 0);
-            v.end_cell_edit();
-            v.engine = sheet_engine(&v.pkg.workbook);
         }
         // The chart list was just re-indexed and the view may have moved.
         self.drop_grid_state();
@@ -9775,16 +9877,7 @@ impl Docxy {
     }
 
     fn sheet_undo(&mut self, cx: &mut Context<Self>) {
-        let mut done = false;
-        if let Some(v) = self.active_sheet_mut() {
-            if let Some(snap) = v.undo.pop() {
-                let now = v.snapshot();
-                v.redo.push(now);
-                v.restore(snap);
-                done = true;
-            }
-        }
-        if done {
+        if self.active_sheet_mut().is_some_and(|v| v.undo_step()) {
             // The chart list just changed under it, so an index into it means
             // something else now.
             self.chart_drop_selection();
@@ -9794,16 +9887,7 @@ impl Docxy {
     }
 
     fn sheet_redo(&mut self, cx: &mut Context<Self>) {
-        let mut done = false;
-        if let Some(v) = self.active_sheet_mut() {
-            if let Some(snap) = v.redo.pop() {
-                let now = v.snapshot();
-                v.undo.push(now);
-                v.restore(snap);
-                done = true;
-            }
-        }
-        if done {
+        if self.active_sheet_mut().is_some_and(|v| v.redo_step()) {
             self.chart_drop_selection();
             self.mark_sheet_dirty();
         }
@@ -9959,12 +10043,7 @@ impl Docxy {
                     let xf = v.pkg.workbook.styles.xf(cell.style);
                     tsv.push_str(&gridcore::entry::copy_field(cell, &xf, v.cell_text(r, c)));
                 }
-                let frozen = || v.engine.is_frozen(&v.pkg.workbook, (v.active, r, c));
-                let cell = v.sheet().cell(r, c);
-                row.push(
-                    cell.map(|cl| gridcore::sheet::copied_cell(cl, frozen))
-                        .unwrap_or_default(),
-                );
+                row.push(v.sheet().cell(r, c).cloned().unwrap_or_default());
             }
             cells.push(row);
             tsv.push('\n');
@@ -10029,7 +10108,10 @@ impl Docxy {
         if let Some(v) = self.active_sheet_mut() {
             let (br, bc) = v.sel;
             let s = v.active;
-            paste_grid_block(&mut v.engine, &mut v.pkg.workbook, s, (br, bc), &block);
+            // A pasted spilling array still spills, and an array block
+            // pasted back in place keeps its block (`Engine::paste_block`).
+            v.engine
+                .paste_block(&mut v.pkg.workbook, s, (br, bc), &block);
             let h = block.len() as u32;
             let w = block.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
             if h > 0 && w > 0 {
@@ -10457,25 +10539,14 @@ impl Docxy {
             return;
         };
         let author = Self::comment_author();
-        self.sheet_try_edit(false, |v| {
-            let (r, c) = v.sel;
-            let s = v.active;
-            let t = text.trim();
-            if t.is_empty() {
-                v.pkg.remove_comment(s, r, c);
-                true
-            } else {
-                v.pkg.set_comment(s, r, c, &author, t)
-            }
-        });
+        // The view takes the undo step itself: the whole package.
+        self.sheet_try_edit(false, |v| v.comment_cell(&author, &text));
         cx.notify();
     }
 
     fn sheet_delete_comment(&mut self, cx: &mut Context<Self>) {
         if let Some(v) = self.active_sheet_mut() {
-            let (r, c) = v.sel;
-            let s = v.active;
-            v.pkg.remove_comment(s, r, c);
+            v.delete_comment();
         }
         self.mark_sheet_dirty();
         cx.notify();
@@ -11130,7 +11201,6 @@ impl Docxy {
     fn sheet_insert_pivot(&mut self, cx: &mut Context<Self>) {
         use gridcore::frame::Frame;
         use gridcore::sheet::CellValue;
-        self.sheet_snapshot();
         let mut def: Option<PivotDef> = None;
         if let Some(v) = self.active_sheet() {
             let s = v.active;
@@ -11173,27 +11243,9 @@ impl Docxy {
                 agg,
             });
         }
-        if let Some(mut d) = def {
+        if let Some(d) = def {
             if let Some(v) = self.active_sheet_mut() {
-                let n = v
-                    .pkg
-                    .workbook
-                    .sheets
-                    .iter()
-                    .filter(|s| s.name.starts_with("Pivot"))
-                    .count();
-                let name = if n == 0 {
-                    "Pivot".to_string()
-                } else {
-                    format!("Pivot{}", n + 1)
-                };
-                // add_sheet wires the OPC part + workbook entry so the sheet saves.
-                d.out_sheet = v.pkg.add_sheet(&name);
-                v.active = d.out_sheet;
-                v.pivot_views.push(d);
-                v.sel = (0, 0);
-                v.anchor = (0, 0);
-                v.end_cell_edit();
+                v.add_pivot_sheet(d);
             }
             // A brand-new sheet, so the chart selection and any open field are
             // pointing at the one we came from.
@@ -13053,11 +13105,22 @@ impl Docxy {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
-        if !save_sheet_tab(tab, harness, explicit_save_as, |suggested| {
+        let pick = |suggested| {
             rfd::FileDialog::new()
                 .add_filter("Excel workbook", &SHEET_EXTENSIONS)
                 .set_file_name(suggested)
                 .save_file()
+        };
+        if !save_sheet_tab(tab, harness, explicit_save_as, pick, |features| {
+            matches!(
+                rfd::MessageDialog::new()
+                    .set_title("docxy")
+                    .set_level(rfd::MessageLevel::Warning)
+                    .set_description(macro_free_question(features))
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show(),
+                rfd::MessageDialogResult::Yes
+            )
         }) {
             return self.refocus(window, cx);
         }
@@ -15315,12 +15378,15 @@ fn sheet_save_decision(
 /// Run the complete workbook Save sequence without a GPUI window. Returns
 /// false when the cell editor holds an entry the sheet refuses (nothing is
 /// written; the status says why) or a harness cannot open the dialog needed
-/// to choose a target.
+/// to choose a target. `pick` is the Save As dialog, and `confirm` the
+/// question before a macro-free type drops macros
+/// ([`finish_sheet_save_asking`]).
 fn save_sheet_tab(
     tab: &mut DocTab,
     harness: bool,
     explicit_save_as: bool,
     pick: impl FnOnce(String) -> Option<PathBuf>,
+    confirm: impl FnOnce(&[&'static str]) -> bool,
 ) -> bool {
     // Commit before choosing a target so the decision and write see the edit.
     if close::prepare_sheet_save(tab).is_err() {
@@ -15328,12 +15394,12 @@ fn save_sheet_tab(
     }
     match sheet_save_decision(tab.path.as_deref(), &tab.title, harness, explicit_save_as) {
         SheetSaveDecision::InPlace(path) => {
-            finish_sheet_save(tab, Some(&path));
+            finish_sheet_save_asking(tab, Some(&path), harness, confirm);
         }
         // A never-saved workbook or Save As asks where to go, Excel-style.
         SheetSaveDecision::Dialog { suggested } => {
             let target = pick(suggested);
-            finish_sheet_save(tab, target.as_deref());
+            finish_sheet_save_asking(tab, target.as_deref(), harness, confirm);
         }
         // Never in a harness instance: rfd runs its own modal loop on this
         // thread and stops the control pump dead (see `open_args`). A harness
@@ -15369,6 +15435,67 @@ fn save_sheet_to(tab: &mut DocTab, target: &std::path::Path) -> bool {
     close::prepare_sheet_save(tab).is_ok() && finish_sheet_save(tab, Some(target))
 }
 
+/// Excel's question before a macro-free file drops `features`
+/// ([`gridcore::xlsx::SheetPackage::macro_features`]), in xlsxy's words.
+fn macro_free_question(features: &[&str]) -> String {
+    format!(
+        "The following features cannot be saved in macro-free workbooks: {}. Save without them?",
+        features.join(", ")
+    )
+}
+
+/// What a file at `path` (already a workbook name, see [`sheet_save_target`])
+/// would lose of `v`'s workbook: its macros when `path` is a macro-free type,
+/// else nothing.
+fn sheet_macro_losses(v: &SheetView, path: &std::path::Path) -> Vec<&'static str> {
+    match gridcore::xlsx::SpreadsheetKind::from_path(path) {
+        Some(kind) if !kind.allows_macros() => v.pkg.macro_features(),
+        _ => Vec::new(),
+    }
+}
+
+/// [`finish_sheet_save`], first asking, as Excel does, before a macro-free
+/// type (`.xlsx`, `.xltx`) drops the workbook's macros: `confirm` gets what
+/// would be lost and answers Yes (`true`) or No. No writes nothing and says
+/// `save cancelled`; the tab stays dirty, so a close that asked to save keeps
+/// it. Yes writes the file without them, and once it is written the open
+/// workbook drops its VB project too, so a later Save As `.xlsm` cannot write
+/// it back (xlsxy's `save_as_without_macros`); a failed write keeps it.
+///
+/// Excel 4.0 macro sheets stay in the open workbook (removing them would
+/// shift every sheet index), so each later macro-free save asks again, an
+/// in-place one included, as in Excel; xlsxy asks only on Save As. So does
+/// one after undoing
+/// past a structural step taken before this save: that step restores a
+/// package that still has the VB project.
+///
+/// A harness instance never asks: rfd's modal loop would stop the control
+/// pump (see `open_args`). It writes as before, and the status says what was
+/// left out.
+fn finish_sheet_save_asking(
+    tab: &mut DocTab,
+    target: Option<&std::path::Path>,
+    harness: bool,
+    confirm: impl FnOnce(&[&'static str]) -> bool,
+) -> bool {
+    let losses = match (&tab.surface, target.map(sheet_save_target)) {
+        (Surface::Sheet(v), Some(Ok(path))) if !harness => sheet_macro_losses(v, &path),
+        _ => Vec::new(),
+    };
+    let asked = !losses.is_empty();
+    if asked && !confirm(&losses) {
+        tab.status = "save cancelled".into();
+        return false;
+    }
+    let saved = finish_sheet_save(tab, target);
+    if saved && asked {
+        if let Surface::Sheet(v) = &mut tab.surface {
+            v.pkg.remove_vba_project();
+        }
+    }
+    saved
+}
+
 /// Write the workbook tab to `target` (`None` is a cancelled dialog). The tab
 /// is rebound (title, path, clean) only after a successful write; either way
 /// its status says what happened, and the result is whether it was written.
@@ -15389,17 +15516,15 @@ fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) -> bool
             return false;
         }
     };
-    let bytes = sheet_bytes(v, Some(&path));
-    // A macro-free type writes the file without the macros; the open
-    // workbook keeps them, as Excel does, and the status says what went.
-    let dropped = match gridcore::xlsx::SpreadsheetKind::from_path(&path) {
-        Some(kind) if !kind.allows_macros() => v.pkg.macro_features(),
-        _ => Vec::new(),
-    };
+    let (bytes, refused_charts) = sheet_bytes(v, Some(&path));
+    // A macro-free type writes the file without the macros, and the status
+    // says what went. The open workbook keeps them here; after the user's
+    // Yes, `finish_sheet_save_asking` drops its VB project.
+    let dropped = sheet_macro_losses(v, &path);
     match opccore::fsio::write_atomic(&path, &bytes) {
         Ok(()) => {
             tab.title = file_name(&path).into();
-            tab.status = if dropped.is_empty() {
+            let mut status = if dropped.is_empty() {
                 format!("saved {} bytes → {}", bytes.len(), path.display())
             } else {
                 format!(
@@ -15408,8 +15533,14 @@ fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) -> bool
                     path.display(),
                     dropped.join(", ")
                 )
+            };
+            // A chart the package could no longer take is not in the file.
+            match refused_charts {
+                0 => {}
+                1 => status.push_str("; 1 chart could not be written"),
+                n => status.push_str(&format!("; {n} charts could not be written")),
             }
-            .into();
+            tab.status = status.into();
             tab.path = Some(path);
             tab.dirty = false;
             true
@@ -15423,9 +15554,7 @@ fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) -> bool
 
 #[cfg(test)]
 mod clipboard_tests {
-    use super::{
-        ClipRead, ClipboardStore, clip_still_ours, paste_grid_block, recorded_after_write,
-    };
+    use super::{ClipRead, ClipboardStore, clip_still_ours, recorded_after_write};
     use gridcore::engine::Engine;
     use gridcore::sheet::{Cell, CellValue, Sheet, Workbook};
 
@@ -15460,9 +15589,9 @@ mod clipboard_tests {
         let mut engine = Engine::new(&wb);
         engine.recalc_all(&mut wb);
         let block = vec![vec![wb.sheets[1].cell(0, 3).cloned().unwrap()]];
-        paste_grid_block(&mut engine, &mut wb, 0, (0, 3), &block);
+        engine.paste_block(&mut wb, 0, (0, 3), &block);
         assert_eq!(f_attrs_at(&wb, 0), None);
-        paste_grid_block(&mut engine, &mut wb, 1, (0, 3), &block);
+        engine.paste_block(&mut wb, 1, (0, 3), &block);
         assert_eq!(f_attrs_at(&wb, 1), Some(" t=\"array\" ref=\"D1:D3\""));
     }
 
@@ -15487,13 +15616,279 @@ mod clipboard_tests {
         }
         let n = |v: f64| CellValue::Number(v);
         for col in [6, 8] {
-            paste_grid_block(&mut engine, &mut wb, 0, (0, col), &block);
+            engine.paste_block(&mut wb, 0, (0, col), &block);
             let got: Vec<CellValue> = (0..3)
                 .map(|r| wb.sheets[0].cell(r, col).unwrap().value.clone())
                 .collect();
             assert_eq!(got, vec![n(1.0), n(2.0), n(3.0)], "col {col}");
             assert_eq!(wb.sheets[0].cell(0, col).unwrap().spill, Some((3, 1)));
         }
+    }
+
+    /// Two sheets, "Sheet1" and "Data"; Data holds 1, 2, 3 in A1:A3 and
+    /// `formula` as a CSE block over D1:D3, recalculated.
+    fn cse_workbook(formula: &str) -> (Workbook, Engine) {
+        let sheet = |name: &str| Sheet {
+            name: name.to_string(),
+            ..Sheet::default()
+        };
+        let mut wb = Workbook {
+            sheets: vec![sheet("Sheet1"), sheet("Data")],
+            ..Workbook::default()
+        };
+        for r in 0..3 {
+            wb.sheets[1].set_cell(r, 0, Cell::number(f64::from(r + 1)));
+        }
+        wb.sheets[1].set_cell(
+            0,
+            3,
+            Cell {
+                formula: Some(formula.into()),
+                f_attrs: Some(" t=\"array\" ref=\"D1:D3\"".into()),
+                ..Cell::default()
+            },
+        );
+        let mut engine = Engine::new(&wb);
+        engine.recalc_all(&mut wb);
+        (wb, engine)
+    }
+
+    /// The grid clip of D1:D3 on sheet `s`, as `sheet_copy` takes it.
+    fn clip_d1_d3(wb: &Workbook, s: usize) -> Vec<Vec<Cell>> {
+        (0..3)
+            .map(|r| vec![wb.sheets[s].cell(r, 3).cloned().unwrap_or_default()])
+            .collect()
+    }
+
+    /// What `sheet_copy(cut)` does to D1:D3 after taking the clip.
+    fn cut_d1_d3(engine: &mut Engine, wb: &mut Workbook, s: usize) {
+        for r in 0..3 {
+            let style = wb.sheets[s].cell(r, 3).map_or(0, |c| c.style);
+            engine.set_cell(
+                wb,
+                (s, r, 3),
+                Cell {
+                    style,
+                    ..Cell::default()
+                },
+            );
+        }
+    }
+
+    fn d_values(wb: &Workbook, s: usize) -> Vec<CellValue> {
+        (0..3)
+            .map(|r| {
+                wb.sheets[s]
+                    .cell(r, 3)
+                    .map(|c| c.value.clone())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// #785: a non-spilling CSE block cut and pasted back in place keeps its
+    /// block — the cut has already cleared it, so `set_cell` alone would
+    /// type it. A constant in the block's D2 comes back as it was.
+    #[test]
+    fn a_cut_cse_block_pasted_back_in_place_keeps_its_block() {
+        let (mut wb, mut engine) = cse_workbook("SUM(A1:A3)");
+        let clip = clip_d1_d3(&wb, 1);
+        cut_d1_d3(&mut engine, &mut wb, 1);
+        assert_eq!(f_attrs_at(&wb, 1), None, "the cut cleared the block");
+        engine.paste_block(&mut wb, 1, (0, 3), &clip);
+        assert_eq!(f_attrs_at(&wb, 1), Some(" t=\"array\" ref=\"D1:D3\""));
+        assert_eq!(
+            wb.sheets[1].cell(0, 3).unwrap().value,
+            CellValue::Number(6.0)
+        );
+
+        let (mut wb, mut engine) = cse_workbook("SUM(A1:A3)");
+        engine.set_cell(&mut wb, (1, 1, 3), Cell::number(7.0));
+        let clip = clip_d1_d3(&wb, 1);
+        cut_d1_d3(&mut engine, &mut wb, 1);
+        engine.paste_block(&mut wb, 1, (0, 3), &clip);
+        assert_eq!(f_attrs_at(&wb, 1), Some(" t=\"array\" ref=\"D1:D3\""));
+        assert_eq!(
+            wb.sheets[1].cell(1, 3).unwrap().value,
+            CellValue::Number(7.0)
+        );
+    }
+
+    /// #785: a spilling CSE block pasted back in place, copied or cut, keeps
+    /// its block and its spill: its spilled values are not pasted as
+    /// constants over its own spill, which would make it `#SPILL!`.
+    #[test]
+    fn a_spilling_cse_block_pasted_back_in_place_still_spills() {
+        let spilled = vec![
+            CellValue::Number(2.0),
+            CellValue::Number(4.0),
+            CellValue::Number(6.0),
+        ];
+        for cut in [false, true] {
+            let (mut wb, mut engine) = cse_workbook("A1:A3*2");
+            assert_eq!(d_values(&wb, 1), spilled);
+            let clip = clip_d1_d3(&wb, 1);
+            if cut {
+                cut_d1_d3(&mut engine, &mut wb, 1);
+            }
+            engine.paste_block(&mut wb, 1, (0, 3), &clip);
+            assert_eq!(
+                f_attrs_at(&wb, 1),
+                Some(" t=\"array\" ref=\"D1:D3\""),
+                "cut: {cut}"
+            );
+            assert_eq!(
+                wb.sheets[1].cell(0, 3).unwrap().spill,
+                Some((3, 1)),
+                "cut: {cut}"
+            );
+            assert_eq!(d_values(&wb, 1), spilled, "cut: {cut}");
+        }
+    }
+
+    /// Data's D1 spills `A1:A3*2` over D1:D3 (2, 4, 6) as a typed dynamic
+    /// array: modern, no `<f>` attributes.
+    fn typed_spill_workbook() -> (Workbook, Engine) {
+        let (mut wb, mut engine) = cse_workbook("A1");
+        engine.set_cell(&mut wb, (1, 0, 3), Cell::formula("A1:A3*2"));
+        let d1 = wb.sheets[1].cell(0, 3).unwrap();
+        assert!(d1.f_attrs.is_none() && d1.is_dynamic());
+        assert_eq!(d1.spill, Some((3, 1)));
+        (wb, engine)
+    }
+
+    fn spilled() -> Vec<CellValue> {
+        [2.0, 4.0, 6.0].map(CellValue::Number).to_vec()
+    }
+
+    /// #825: a typed dynamic array copied or cut with its spill and pasted
+    /// back in place still spills. Only CSE blocks were kept whole before.
+    #[test]
+    fn a_typed_dynamic_array_pasted_in_place_still_spills() {
+        for cut in [false, true] {
+            let (mut wb, mut engine) = typed_spill_workbook();
+            let clip = clip_d1_d3(&wb, 1);
+            if cut {
+                cut_d1_d3(&mut engine, &mut wb, 1);
+            }
+            engine.paste_block(&mut wb, 1, (0, 3), &clip);
+            let d1 = wb.sheets[1].cell(0, 3).unwrap();
+            assert_eq!(d1.spill, Some((3, 1)), "cut: {cut}: {:?}", d1.value);
+            assert_eq!(d_values(&wb, 1), spilled(), "cut: {cut}");
+        }
+    }
+
+    /// #825: Excel's dynamic array (`t="array"` and a `cm`) copied with its
+    /// spill and pasted at another address spills there, typed, and keeps
+    /// no `cm` (it may index another workbook's metadata).
+    #[test]
+    fn a_loaded_dynamic_array_pasted_elsewhere_spills() {
+        let (mut wb, mut engine) = cse_workbook("A1:A3*2");
+        wb.sheets[1].cells.get_mut(&(0, 3)).unwrap().meta =
+            Some(Box::new(gridcore::sheet::CellMeta {
+                cm: Some("1".into()),
+                ..Default::default()
+            }));
+        let clip = clip_d1_d3(&wb, 1);
+        engine.paste_block(&mut wb, 1, (0, 5), &clip);
+        let f1 = wb.sheets[1].cell(0, 5).unwrap();
+        assert_eq!(f1.spill, Some((3, 1)), "{:?}", f1.value);
+        assert!(f1.f_attrs.is_none() && !f1.has_cm() && f1.is_dynamic());
+        let f: Vec<_> = (0..3)
+            .map(|r| wb.sheets[1].cell(r, 5).unwrap().value.clone())
+            .collect();
+        assert_eq!(f, spilled());
+    }
+
+    /// #785: a whole spilling CSE block pasted at its own address on another
+    /// sheet stays an array there (as in Excel) and overwrites what its spill
+    /// covers; pasted at another address it is typed there, no block.
+    #[test]
+    fn a_whole_cse_block_pasted_elsewhere() {
+        let (mut wb, mut engine) = cse_workbook("A1:A3*2");
+        for r in 0..3 {
+            wb.sheets[0].set_cell(r, 0, Cell::number(10.0));
+        }
+        engine.set_cell(&mut wb, (0, 1, 3), Cell::text("mine"));
+        let clip = clip_d1_d3(&wb, 1);
+        engine.paste_block(&mut wb, 0, (0, 3), &clip);
+        assert_eq!(f_attrs_at(&wb, 0), Some(" t=\"array\" ref=\"D1:D3\""));
+        assert_eq!(wb.sheets[0].cell(0, 3).unwrap().spill, Some((3, 1)));
+        assert_eq!(d_values(&wb, 0), vec![CellValue::Number(20.0); 3]);
+
+        engine.paste_block(&mut wb, 1, (0, 5), &clip);
+        assert_eq!(wb.sheets[1].cell(0, 5).unwrap().f_attrs, None);
+    }
+
+    /// #785: a CSE block the engine can't evaluate (an external ref) is
+    /// frozen on its cached values. Pasted back in place, or at its own
+    /// address on another sheet, it keeps them, its block and its spill, and
+    /// its dependents see them.
+    #[test]
+    fn a_frozen_cse_block_pasted_back_keeps_its_cached_values() {
+        let (mut wb, _) = cse_workbook("A1");
+        let d1 = wb.sheets[1].cells.get_mut(&(0, 3)).unwrap();
+        d1.formula = Some("[1]Sheet1!A1:A3*2".into());
+        d1.value = CellValue::Number(2.0);
+        d1.spill = Some((3, 1));
+        wb.sheets[1].set_cell(1, 3, Cell::number(4.0));
+        wb.sheets[1].set_cell(2, 3, Cell::number(6.0));
+        for s in 0..2 {
+            wb.sheets[s].set_cell(0, 4, Cell::formula("SUM(D1:D3)"));
+        }
+        let mut engine = Engine::new(&wb);
+        engine.recalc_all(&mut wb);
+        assert!(engine.is_unsupported((1, 0, 3)));
+        assert_eq!(
+            wb.sheets[1].cell(0, 4).unwrap().value,
+            CellValue::Number(12.0)
+        );
+        let clip = clip_d1_d3(&wb, 1);
+        let cached = vec![
+            CellValue::Number(2.0),
+            CellValue::Number(4.0),
+            CellValue::Number(6.0),
+        ];
+        for s in [1, 0] {
+            engine.paste_block(&mut wb, s, (0, 3), &clip);
+            assert_eq!(
+                f_attrs_at(&wb, s),
+                Some(" t=\"array\" ref=\"D1:D3\""),
+                "sheet {s}"
+            );
+            assert_eq!(
+                wb.sheets[s].cell(0, 3).unwrap().spill,
+                Some((3, 1)),
+                "sheet {s}"
+            );
+            assert_eq!(d_values(&wb, s), cached, "sheet {s}");
+            let e1 = &wb.sheets[s].cell(0, 4).unwrap().value;
+            assert_eq!(e1, &CellValue::Number(12.0), "sheet {s}");
+        }
+    }
+
+    /// #785: a CSE block whose result outgrew its stored ref spills past the
+    /// copied block. Pasted at its own address on another sheet, it claims no
+    /// more than its ref: a constant below the block stays, and the anchor
+    /// shows `#SPILL!` as the spill it can't make.
+    #[test]
+    fn a_restored_cse_block_never_takes_cells_below_its_ref() {
+        let (mut wb, mut engine) = cse_workbook("A1:A5*2");
+        for r in 3..5 {
+            engine.set_cell(&mut wb, (1, r, 0), Cell::number(f64::from(r + 1)));
+        }
+        assert_eq!(wb.sheets[1].cell(0, 3).unwrap().spill, Some((5, 1)));
+        let clip = clip_d1_d3(&wb, 1);
+        engine.set_cell(&mut wb, (0, 3, 3), Cell::text("mine"));
+        engine.paste_block(&mut wb, 0, (0, 3), &clip);
+        assert_eq!(
+            wb.sheets[0].cell(3, 3).unwrap().value,
+            CellValue::Text("mine".into())
+        );
+        assert_eq!(
+            wb.sheets[0].cell(0, 3).unwrap().value,
+            CellValue::Error("#SPILL!".into())
+        );
     }
 
     /// #699: a harness instance never reads or writes the OS clipboard, and
@@ -15944,9 +16339,10 @@ mod load_failed_save_tests {
 #[cfg(test)]
 mod sheet_save_tests {
     use super::{
-        DocTab, Kind, SHEET_NEVER_SAVED_HARNESS, SHEET_SAVE_AS_HARNESS, SHEET_SAVE_FORMATS,
-        SheetSaveDecision, Surface, finish_sheet_save, new_sheet_surface, save_sheet_to,
-        sheet_bytes, sheet_save_decision, sheet_save_target, tab_from_path,
+        DocTab, Kind, PivotDef, SHEET_NEVER_SAVED_HARNESS, SHEET_SAVE_AS_HARNESS,
+        SHEET_SAVE_FORMATS, SheetSaveDecision, SheetView, Surface, finish_sheet_save,
+        macro_free_question, new_sheet_surface, save_sheet_tab, save_sheet_to, sheet_bytes,
+        sheet_save_decision, sheet_save_target, tab_from_path,
     };
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16086,7 +16482,7 @@ mod sheet_save_tests {
             unreachable!()
         };
         let target = dir.path("report.xlsx");
-        let expected = sheet_bytes(v, Some(&target));
+        let (expected, _) = sheet_bytes(v, Some(&target));
         finish_sheet_save(&mut tab, Some(&target));
         assert_eq!(std::fs::read(&target).unwrap(), expected);
         assert_eq!(tab.path.as_deref(), Some(target.as_path()));
@@ -16100,6 +16496,51 @@ mod sheet_save_tests {
             tab.status.as_ref(),
             format!("saved {} bytes → {}", expected.len(), target.display())
         );
+    }
+
+    /// #814: a UI chart the package can no longer take at save (here a
+    /// worksheet rels part with no `</Relationships>` to add the drawing's
+    /// rel to) is not in the file, and the save says so.
+    #[test]
+    fn a_save_reports_a_chart_add_chart_refused() {
+        let dir = Scratch::new();
+        let mut tab = sheet_tab(None, "Untitled.xlsx");
+        let Surface::Sheet(v) = &mut tab.surface else {
+            unreachable!()
+        };
+        for r in 0..3 {
+            let sh = &mut v.pkg.workbook.sheets[0];
+            sh.set_cell(r, 0, gridcore::sheet::Cell::number(r as f64));
+            sh.set_cell(r, 1, gridcore::sheet::Cell::number(2.0 * r as f64));
+        }
+        let sh = &v.pkg.workbook.sheets[0];
+        let data = gridcore::sheet::chart_from_range(sh, &sh.name, (0, 0, 2, 1), "column", false)
+            .expect("chart data");
+        // Pushed past `insert_ui_chart`, as if the rels part broke after it.
+        v.charts.push(super::ChartView {
+            sheet: 0,
+            from: (0, 3),
+            to: (10, 9),
+            data,
+        });
+        v.pkg.set_part(
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#
+                .to_vec(),
+        );
+        let target = dir.path("report.xlsx");
+        assert!(finish_sheet_save(&mut tab, Some(&target)));
+        let written = std::fs::read(&target).unwrap();
+        assert_eq!(
+            tab.status.as_ref(),
+            format!(
+                "saved {} bytes → {}; 1 chart could not be written",
+                written.len(),
+                target.display()
+            )
+        );
+        let zip = opccore::zip::ZipArchive::open(&written).unwrap();
+        assert!(zip.find("xl/charts/chart1.xml").is_none());
     }
 
     /// #699: the harness's `save-as` writes a workbook through this, and
@@ -16315,6 +16756,432 @@ mod sheet_save_tests {
             }
         }
         assert!(!original.exists());
+    }
+
+    /// A macro workbook with a VB project and nothing else macro.
+    fn vba_book() -> gridcore::xlsx::SheetPackage {
+        let mut pkg = gridcore::xlsx::new_xlsx();
+        let rels = String::from_utf8_lossy(pkg.part("xl/_rels/workbook.xml.rels").unwrap())
+            .replace(
+                "</Relationships>",
+                r#"<Relationship Id="rId99" Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" Target="vbaProject.bin"/></Relationships>"#,
+            );
+        pkg.set_part("xl/_rels/workbook.xml.rels", rels.into_bytes());
+        pkg.set_part("xl/vbaProject.bin", b"VBA".to_vec());
+        let pkg = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx_as(
+            &pkg,
+            gridcore::xlsx::SpreadsheetKind::MacroWorkbook,
+        ))
+        .unwrap();
+        assert_eq!(pkg.macro_features(), ["VB project"]);
+        pkg
+    }
+
+    /// The macro question's answer where it must not be asked.
+    fn not_asked(features: &[&'static str]) -> bool {
+        panic!("asked about {features:?}")
+    }
+
+    fn open_pkg(tab: &DocTab) -> &gridcore::xlsx::SheetPackage {
+        let Surface::Sheet(v) = &tab.surface else {
+            unreachable!()
+        };
+        &v.pkg
+    }
+
+    /// #789: Save or Save As to a macro-free type asks first, in xlsxy's
+    /// words, and No writes nothing; a macro type is not asked about.
+    #[test]
+    fn macro_free_save_asks_and_no_writes_nothing() {
+        use gridcore::xlsx::SpreadsheetKind;
+        assert_eq!(
+            macro_free_question(&["VB project", "Excel 4.0 macro sheets"]),
+            "The following features cannot be saved in macro-free workbooks: \
+             VB project, Excel 4.0 macro sheets. Save without them?"
+        );
+        let dir = Scratch::new();
+        let input = dir.path("in.xlsm");
+        let mut tab = loaded_sheet_tab(&dir, "in.xlsm", &xlm_book(SpreadsheetKind::MacroWorkbook));
+        tab.dirty = true;
+        // Save As .xlsx, .xltx, or a name with no extension (an .xlsx).
+        for name in ["out.xlsx", "out.xltx", "out"] {
+            let mut asked = Vec::new();
+            let target = dir.path(name);
+            assert!(save_sheet_tab(
+                &mut tab,
+                false,
+                true,
+                |_| Some(target.clone()),
+                |features| {
+                    asked = features.to_vec();
+                    false
+                }
+            ));
+            assert_eq!(asked, ["Excel 4.0 macro sheets"], "{name}");
+            assert!(!target.exists() && !dir.path("out.xlsx").exists(), "{name}");
+            assert_eq!(tab.status.as_ref(), "save cancelled", "{name}");
+            assert_eq!(tab.path.as_deref(), Some(input.as_path()));
+            assert_eq!(tab.title.as_ref(), "in.xlsm");
+            assert!(tab.dirty);
+        }
+        assert!(open_pkg(&tab).has_macro_sheets());
+
+        // To a macro type nothing is lost, so nothing is asked.
+        let copy = dir.path("copy.xltm");
+        assert!(save_sheet_tab(
+            &mut tab,
+            false,
+            true,
+            |_| Some(copy.clone()),
+            not_asked
+        ));
+        assert!(copy.is_file());
+
+        // An in-place Save of an .xlsx that still has them asks too.
+        let book = dir.path("book.xlsx");
+        let mut tab = sheet_tab(Some(book.clone()), "book.xlsx");
+        if let Surface::Sheet(v) = &mut tab.surface {
+            v.pkg = xlm_book(SpreadsheetKind::MacroWorkbook);
+        }
+        let mut asked = false;
+        assert!(save_sheet_tab(
+            &mut tab,
+            false,
+            false,
+            |_| panic!("in-place save picked"),
+            |_| {
+                asked = true;
+                false
+            }
+        ));
+        assert!(asked);
+        assert!(!book.exists());
+        assert_eq!(tab.status.as_ref(), "save cancelled");
+        assert!(tab.dirty);
+    }
+
+    /// #789: Yes writes the file without them, and only once it is written
+    /// does the open workbook drop its VB project, so a later Save As
+    /// `.xlsm` neither asks nor writes it back.
+    #[test]
+    fn macro_free_save_yes_drops_vba_from_open_pkg() {
+        let dir = Scratch::new();
+        let mut tab = loaded_sheet_tab(&dir, "in.xlsm", &vba_book());
+        let yes = |features: &[&'static str]| {
+            assert_eq!(features, ["VB project"]);
+            true
+        };
+
+        // A failed write keeps it.
+        let nowhere = dir.path("missing-dir/out.xlsx");
+        assert!(save_sheet_tab(
+            &mut tab,
+            false,
+            true,
+            |_| Some(nowhere.clone()),
+            yes
+        ));
+        assert!(tab.status.starts_with("save failed"), "{}", tab.status);
+        assert!(open_pkg(&tab).has_vba_project());
+
+        let out = dir.path("out.xlsx");
+        assert!(save_sheet_tab(
+            &mut tab,
+            false,
+            true,
+            |_| Some(out.clone()),
+            yes
+        ));
+        let saved = gridcore::xlsx::load_xlsx(&std::fs::read(&out).unwrap()).unwrap();
+        assert!(!saved.has_vba_project());
+        assert!(
+            tab.status.contains("without its VB project"),
+            "{}",
+            tab.status
+        );
+        assert_eq!(tab.path.as_deref(), Some(out.as_path()));
+        assert!(!tab.dirty);
+        assert!(!open_pkg(&tab).has_vba_project());
+
+        let again = dir.path("again.xlsm");
+        assert!(save_sheet_tab(
+            &mut tab,
+            false,
+            true,
+            |_| Some(again.clone()),
+            not_asked
+        ));
+        let saved = gridcore::xlsx::load_xlsx(&std::fs::read(&again).unwrap()).unwrap();
+        assert!(!saved.has_vba_project());
+    }
+
+    /// #789: a harness instance never asks (rfd would stop the control
+    /// pump); it writes as before and the status says what was left out.
+    #[test]
+    fn a_harness_macro_free_save_writes_without_asking() {
+        let dir = Scratch::new();
+        let book = dir.path("book.xlsx");
+        let mut tab = sheet_tab(Some(book.clone()), "book.xlsx");
+        if let Surface::Sheet(v) = &mut tab.surface {
+            v.pkg = vba_book();
+        }
+        assert!(save_sheet_tab(
+            &mut tab,
+            true,
+            false,
+            |_| panic!("in-place save picked"),
+            not_asked
+        ));
+        assert!(book.is_file());
+        assert!(
+            tab.status.contains("without its VB project"),
+            "{}",
+            tab.status
+        );
+        assert!(open_pkg(&tab).has_vba_project());
+    }
+
+    /// A sheet tab over a workbook of `Sheet1`, `Two` and `Three`, holding 1,
+    /// 2 and 3 in A1.
+    fn three_sheet_tab() -> DocTab {
+        let mut tab = sheet_tab(None, "Untitled.xlsx");
+        let Surface::Sheet(v) = &mut tab.surface else {
+            unreachable!()
+        };
+        v.pkg.add_sheet("Two");
+        v.pkg.add_sheet("Three");
+        for (i, sheet) in v.pkg.workbook.sheets.iter_mut().enumerate() {
+            sheet.set_cell(0, 0, gridcore::sheet::Cell::number(i as f64 + 1.0));
+        }
+        tab
+    }
+
+    /// Each sheet's name and A1 as a save of `v` reopens them. A sheet the
+    /// model and the parts disagree on lands in the wrong part, or in none.
+    fn saved_sheets(v: &SheetView) -> Vec<(String, Option<f64>)> {
+        let wb_xml = String::from_utf8_lossy(v.pkg.part("xl/workbook.xml").unwrap()).into_owned();
+        assert_eq!(
+            wb_xml.matches("<sheet ").count(),
+            v.pkg.workbook.sheets.len(),
+            "{wb_xml}"
+        );
+        let saved = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&v.pkg)).unwrap();
+        saved
+            .workbook
+            .sheets
+            .iter()
+            .map(|s| {
+                let a1 = s.cell(0, 0).and_then(|c| match c.value {
+                    gridcore::sheet::CellValue::Number(n) => Some(n),
+                    _ => None,
+                });
+                (s.name.clone(), a1)
+            })
+            .collect()
+    }
+
+    fn sheets(list: &[(&str, f64)]) -> Vec<(String, Option<f64>)> {
+        list.iter()
+            .map(|&(n, a1)| (n.to_string(), Some(a1)))
+            .collect()
+    }
+
+    /// #789 (r1-pre1): undoing a sheet delete puts its part back with it, so
+    /// every sheet saves into its own part; redo removes it again.
+    #[test]
+    fn sheet_delete_undo_redo_keeps_sheets_and_parts_aligned() {
+        let mut tab = three_sheet_tab();
+        let Surface::Sheet(v) = &mut tab.surface else {
+            unreachable!()
+        };
+        let all = sheets(&[("Sheet1", 1.0), ("Two", 2.0), ("Three", 3.0)]);
+        let without = sheets(&[("Sheet1", 1.0), ("Three", 3.0)]);
+        assert_eq!(saved_sheets(v), all);
+        v.active = 2;
+        assert!(v.delete_sheet(1));
+        assert_eq!(v.active, 1, "the view stays on Three");
+        assert_eq!(saved_sheets(v), without);
+        assert!(v.undo_step());
+        assert_eq!(saved_sheets(v), all);
+        assert_eq!(v.active, 2);
+        assert!(v.redo_step());
+        assert_eq!(saved_sheets(v), without);
+        assert!(v.undo_step());
+        assert_eq!(saved_sheets(v), all);
+        assert!(!v.undo_step());
+
+        // Out of range, or the last sheet: refused, with no undo step.
+        assert!(!v.delete_sheet(3));
+        assert!(v.undo.is_empty());
+        let mut lone = sheet_tab(None, "Untitled.xlsx");
+        let Surface::Sheet(lone) = &mut lone.surface else {
+            unreachable!()
+        };
+        assert!(!lone.delete_sheet(0));
+        assert!(lone.undo.is_empty());
+    }
+
+    /// #789: an added sheet is undone with its part, relationship and
+    /// `<sheet>` element, not only out of the model.
+    #[test]
+    fn sheet_add_undo_redo_keeps_sheets_and_parts_aligned() {
+        let mut tab = three_sheet_tab();
+        let Surface::Sheet(v) = &mut tab.surface else {
+            unreachable!()
+        };
+        let name = v.next_sheet_name();
+        assert_eq!(name, "Sheet4");
+        assert_eq!(v.add_sheet(&name), 3);
+        assert_eq!(v.active, 3);
+        v.pkg.workbook.sheets[3].set_cell(0, 0, gridcore::sheet::Cell::number(4.0));
+        let four = sheets(&[
+            ("Sheet1", 1.0),
+            ("Two", 2.0),
+            ("Three", 3.0),
+            ("Sheet4", 4.0),
+        ]);
+        assert_eq!(saved_sheets(v), four);
+        assert!(v.undo_step());
+        assert_eq!(
+            saved_sheets(v),
+            sheets(&[("Sheet1", 1.0), ("Two", 2.0), ("Three", 3.0)])
+        );
+        assert!(v.redo_step());
+        assert_eq!(saved_sheets(v), four);
+    }
+
+    /// #789: a pivot's output sheet is undone with its part and its view.
+    #[test]
+    fn pivot_sheet_undo_redo_keeps_sheets_and_parts_aligned() {
+        let mut tab = three_sheet_tab();
+        let Surface::Sheet(v) = &mut tab.surface else {
+            unreachable!()
+        };
+        let def = PivotDef {
+            src_sheet: 0,
+            src_range: (0, 0, 0, 0),
+            out_sheet: 0,
+            names: vec!["A".into()],
+            role: vec![1],
+            agg: vec![0],
+        };
+        assert_eq!(v.add_pivot_sheet(def), 3);
+        assert_eq!(v.pivot_views.len(), 1);
+        assert_eq!(v.pivot_views[0].out_sheet, 3);
+        v.pkg.workbook.sheets[3].set_cell(0, 0, gridcore::sheet::Cell::number(9.0));
+        let with = sheets(&[
+            ("Sheet1", 1.0),
+            ("Two", 2.0),
+            ("Three", 3.0),
+            ("Pivot", 9.0),
+        ]);
+        assert_eq!(saved_sheets(v), with);
+        assert!(v.undo_step());
+        assert!(v.pivot_views.is_empty());
+        assert_eq!(
+            saved_sheets(v),
+            sheets(&[("Sheet1", 1.0), ("Two", 2.0), ("Three", 3.0)])
+        );
+        assert!(v.redo_step());
+        assert_eq!(v.pivot_views.len(), 1);
+        assert_eq!(saved_sheets(v), with);
+    }
+
+    /// #789 r1: a pivot's output sheet takes the first free "Pivot", "Pivot2",
+    /// … name, so deleting one never leads to two sheets of the same name.
+    #[test]
+    fn pivot_sheets_take_the_first_free_name() {
+        let mut tab = three_sheet_tab();
+        let Surface::Sheet(v) = &mut tab.surface else {
+            unreachable!()
+        };
+        let def = || PivotDef {
+            src_sheet: 0,
+            src_range: (0, 0, 0, 0),
+            out_sheet: 0,
+            names: vec!["A".into()],
+            role: vec![1],
+            agg: vec![0],
+        };
+        let names = |v: &SheetView| -> Vec<String> {
+            v.pkg
+                .workbook
+                .sheets
+                .iter()
+                .map(|s| s.name.clone())
+                .collect()
+        };
+        v.pkg.workbook.sheets[1].name = "PivotData".into();
+        let first = v.add_pivot_sheet(def());
+        let second = v.add_pivot_sheet(def());
+        assert_eq!(names(v)[first], "Pivot", "PivotData does not count");
+        assert_eq!(names(v)[second], "Pivot2");
+        assert!(v.delete_sheet(first));
+        let third = v.add_pivot_sheet(def());
+        assert_eq!(names(v)[third], "Pivot");
+        let mut seen = names(v);
+        seen.sort_by_key(|n| n.to_lowercase());
+        seen.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        assert_eq!(seen.len(), v.pkg.workbook.sheets.len(), "{:?}", names(v));
+    }
+
+    fn comment_texts(v: &SheetView) -> Vec<(usize, u32, u32, String)> {
+        v.pkg
+            .comments()
+            .into_iter()
+            .map(|c| (c.sheet, c.row, c.col, c.text))
+            .collect()
+    }
+
+    /// #789: a comment is its own undo step, so undoing a sheet delete made
+    /// before it cannot take it away with the package, and a comment made
+    /// after an undo clears the redo that would.
+    #[test]
+    fn comments_are_package_undo_steps_that_survive_sheet_undo() {
+        let mut tab = three_sheet_tab();
+        let Surface::Sheet(v) = &mut tab.surface else {
+            unreachable!()
+        };
+        let note = vec![(0, 0, 0, "check".to_string())];
+
+        // Delete Three, then note Sheet1!A1: the first undo takes the note.
+        assert!(v.delete_sheet(2));
+        v.active = 0;
+        v.sel = (0, 0);
+        assert!(v.comment_cell("me", "check"));
+        assert_eq!(comment_texts(v), note);
+        assert!(v.undo_step());
+        assert!(comment_texts(v).is_empty());
+        assert_eq!(v.pkg.workbook.sheets.len(), 2);
+        // Redo brings it back; undoing both puts Three back.
+        assert!(v.redo_step());
+        assert_eq!(comment_texts(v), note);
+        assert!(v.undo_step());
+        assert!(v.undo_step());
+        assert_eq!(
+            saved_sheets(v),
+            sheets(&[("Sheet1", 1.0), ("Two", 2.0), ("Three", 3.0)])
+        );
+
+        // Delete, undo, then a note: redo is gone, so it cannot drop the note.
+        assert!(v.delete_sheet(2));
+        assert!(v.undo_step());
+        v.active = 0;
+        v.sel = (0, 0);
+        assert!(v.comment_cell("me", "check"));
+        assert!(!v.redo_step());
+        assert_eq!(comment_texts(v), note);
+        assert_eq!(v.pkg.workbook.sheets.len(), 3);
+
+        // Deleting it is a step too; nothing to delete is none.
+        let steps = v.undo.len();
+        v.delete_comment();
+        assert!(comment_texts(v).is_empty());
+        assert_eq!(v.undo.len(), steps + 1);
+        v.delete_comment();
+        assert_eq!(v.undo.len(), steps + 1);
+        assert!(v.undo_step());
+        assert_eq!(comment_texts(v), note);
     }
 }
 
@@ -26180,7 +27047,8 @@ mod ui_chart_insert_tests {
         assert!(v.insert_ui_chart(c));
         assert_eq!(v.charts.len(), 1);
         assert_eq!(v.undo.len(), 1);
-        let bytes = sheet_bytes(&v, None);
+        let (bytes, refused) = sheet_bytes(&v, None);
+        assert_eq!(refused, 0);
         let zip = opccore::zip::ZipArchive::open(&bytes).unwrap();
         assert!(zip.find("xl/charts/chart1.xml").is_some());
     }
