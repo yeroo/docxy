@@ -10554,6 +10554,59 @@ b",
         );
     }
 
+    /// #785: a format edit (a restyled clone through `set_cell`) and its undo
+    /// (`restore_cell`) keep the `<f>` attributes the file's formulas were
+    /// preserved with: a shared group's master (a group whose master we can't
+    /// parse stays a group; a parseable one is expanded at load) and a data
+    /// table. The save is the unedited one with the new style.
+    #[test]
+    fn restyle_and_undo_keep_shared_master_and_data_table_f_attrs() {
+        let rows = concat!(
+            r#"<row r="1"><c r="A1"><v>1</v></c><c r="B1"><f t="shared" ref="B1:B3" si="0">[1]Sheet1!A1*2</f><v>2</v></c><c r="G1"><f t="dataTable" ref="G1:G2" dt2D="0" dtr="0" r1="A1"/><v>1</v></c></row>"#,
+            r#"<row r="2"><c r="A2"><v>2</v></c><c r="B2"><f t="shared" si="0"/><v>4</v></c><c r="G2"><v>1</v></c></row>"#,
+            r#"<row r="3"><c r="A3"><v>3</v></c><c r="B3"><f t="shared" si="0"/><v>6</v></c></row>"#,
+        );
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        let (_, unedited) = resaved(&pkg);
+        assert!(
+            unedited.contains(r#"<c r="B1"><f t="shared""#),
+            "{unedited}"
+        );
+        assert!(
+            unedited.contains(r#"<c r="G1"><f t="dataTable""#),
+            "{unedited}"
+        );
+        let restyled = unedited
+            .replace(r#"<c r="B1">"#, r#"<c r="B1" s="1">"#)
+            .replace(r#"<c r="G1">"#, r#"<c r="G1" s="1">"#);
+
+        let before: Vec<Cell> = [1, 6]
+            .map(|c| pkg.workbook.sheets[0].cell(0, c).cloned().unwrap())
+            .into();
+        for c in [1, 6] {
+            let mut cell = pkg.workbook.sheets[0].cell(0, c).cloned().unwrap();
+            cell.style = 1;
+            eng.set_cell(&mut pkg.workbook, (0, 0, c), cell);
+        }
+        let (re, ws) = resaved(&pkg);
+        assert_eq!(ws, restyled);
+        let sheet = &re.workbook.sheets[0];
+        for (r, c) in [(0, 1), (1, 1), (2, 1), (0, 6)] {
+            let (a, b) = (
+                sheet.cell(r, c).unwrap(),
+                pkg.workbook.sheets[0].cell(r, c).unwrap(),
+            );
+            assert_eq!((&a.formula, &a.value), (&b.formula, &b.value));
+        }
+
+        for (c, cell) in [1, 6].into_iter().zip(before) {
+            eng.restore_cell(&mut pkg.workbook, (0, 0, c), cell);
+        }
+        assert_eq!(resaved(&pkg).1, unedited);
+    }
+
     #[test]
     fn restore_cell_keeps_a_legacy_formula_legacy() {
         // Undo puts the snapshot back with restore_cell: the loaded legacy
