@@ -154,13 +154,11 @@ impl Sections {
                 if c != '&' {
                     continue;
                 }
-                match chars.next() {
-                    Some(k @ ('L' | 'C' | 'R')) => {
-                        return Err(format!(
-                            "the {name} section has \"&{k}\", which starts a section; type a literal ampersand as \"&&\""
-                        ));
-                    }
-                    _ => {}
+                // `&&` is consumed whole, so its second `&` never reads as a code.
+                if let Some(k @ ('L' | 'C' | 'R')) = chars.next() {
+                    return Err(format!(
+                        "the {name} section has \"&{k}\", which starts a section; type a literal ampersand as \"&&\""
+                    ));
                 }
             }
         }
