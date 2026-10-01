@@ -14,6 +14,10 @@ param(
   [string[]]$Sections = @('corpus', 'extra', 'addin')
 )
 $ErrorActionPreference = 'Stop'
+# Under -File, `-Sections corpus,extra` arrives as one string 'corpus,extra'.
+$Sections = @($Sections -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+$unknown = @($Sections | Where-Object { $_ -notin @('corpus', 'extra', 'addin') })
+if ($unknown.Count -gt 0) { throw "unknown section(s): $($unknown -join ', ') (expected corpus, extra, addin)" }
 Add-Type -TypeDefinition @"
 using System; using System.Runtime.InteropServices;
 public static class RealCom {
