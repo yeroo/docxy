@@ -11,8 +11,11 @@ use std::collections::{BTreeMap, HashMap};
 use opccore::zip::ZipArchive;
 
 use super::ptg::{self, Base, Biff, Names, Table, utf16};
-use super::{BookIn, OpenError, SheetIn, biff_error, builtin_format, sheet_prefix};
+use super::{
+    BookIn, OpenError, SheetIn, biff_error, builtin_format, on_grid, rk, set_array, sheet_prefix,
+};
 use crate::sheet::{Cell, CellValue, DefinedName};
+use crate::xlsx::{parse_rels, rels_part_name, resolve_relative};
 
 /// The records of a part: (type, body). A record cut off by the end of the
 /// part ends the list.
@@ -92,16 +95,6 @@ impl<'a> Cur<'a> {
     }
 }
 
-/// The value of an RK number (as in BIFF8).
-fn rk(v: u32) -> f64 {
-    let x = if v & 2 != 0 {
-        ((v as i32) >> 2) as f64
-    } else {
-        f64::from_bits(((v & 0xFFFF_FFFC) as u64) << 32)
-    };
-    if v & 1 != 0 { x / 100.0 } else { x }
-}
-
 const BRT_ROW_HDR: u32 = 0;
 const BRT_NAME: u32 = 39;
 const BRT_FMT: u32 = 44;
@@ -137,7 +130,8 @@ struct Globals {
     /// Per SUPBOOK: whether it is this workbook.
     own: Vec<bool>,
     xti: Vec<(u32, i32, i32)>,
-    names: Vec<String>,
+    /// Each BrtName's name and sheet (`0xFFFFFFFF` for the workbook).
+    names: Vec<(String, u32)>,
     /// Tables by id, for structured references.
     tables: HashMap<u32, Table>,
 }
@@ -152,14 +146,19 @@ impl Names for Globals {
         Some(sheet_prefix(&name(first)?, &name(last)?))
     }
     fn name(&self, index: u32) -> Option<String> {
-        self.names.get(index.checked_sub(1)? as usize).cloned()
+        Some(self.names.get(index.checked_sub(1)? as usize)?.0.clone())
     }
     fn name_x(&self, ixti: u32, index: u32) -> Option<String> {
         let &(book, _, _) = self.xti.get(ixti as usize)?;
-        if *self.own.get(book as usize)? {
-            self.name(index)
+        if !*self.own.get(book as usize)? {
+            return None;
+        }
+        // A sheet-scoped name is qualified with the XTI's sheet.
+        let (name, itab) = self.names.get(index.checked_sub(1)? as usize)?;
+        if *itab == 0xFFFF_FFFF {
+            Some(name.clone())
         } else {
-            None
+            Some(format!("{}{name}", self.xti(ixti)?))
         }
     }
     fn table(&self, id: u32) -> Option<Table> {
@@ -171,13 +170,11 @@ const BRT_BEGIN_LIST: u32 = 343;
 
 /// The tables of sheet `sheet` (its part's table rels), by id.
 fn read_tables(zip: &ZipArchive, part: &str, sheet: &str, out: &mut HashMap<u32, Table>) {
-    let (dir, file) = part.rsplit_once('/').unwrap_or(("", part));
-    let rels_part = format!("{dir}/_rels/{file}.rels");
-    for target in rels(zip, &rels_part, &format!("{dir}/")).into_values() {
-        if !target.contains("tables/") {
+    for (ty, target) in rels(zip, part).into_values() {
+        if !ty.ends_with("/table") {
             continue;
         }
-        let Some(bytes) = zip.read(&normalize(&target)) else {
+        let Some(bytes) = zip.read(&target) else {
             continue;
         };
         for (ty, body) in records(&bytes) {
@@ -206,45 +203,16 @@ fn read_tables(zip: &ZipArchive, part: &str, sheet: &str, out: &mut HashMap<u32,
     }
 }
 
-/// A part path with its `..` segments resolved (`xl/worksheets/../tables/t.bin`
-/// is `xl/tables/t.bin`).
-fn normalize(path: &str) -> String {
-    let mut out: Vec<&str> = Vec::new();
-    for seg in path.split('/') {
-        match seg {
-            ".." => {
-                out.pop();
-            }
-            "." | "" => {}
-            s => out.push(s),
-        }
-    }
-    out.join("/")
-}
-
-/// The `Target`s of a rels part by `Id`, resolved against `dir`.
-fn rels(zip: &ZipArchive, part: &str, dir: &str) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    let Some(bytes) = zip.read(part) else {
-        return out;
+/// The relationships of `part`, by `Id`: (type, the target part's name).
+fn rels(zip: &ZipArchive, part: &str) -> HashMap<String, (String, String)> {
+    let Some(bytes) = zip.read(&rels_part_name(part)) else {
+        return HashMap::new();
     };
-    let xml = String::from_utf8_lossy(&bytes);
-    let mut p = opccore::xml::XmlParser::new(&xml);
-    loop {
-        match p.next() {
-            opccore::xml::Event::Start if p.name().ends_with("Relationship") => {
-                let target = p.attr("Target");
-                let path = match target.strip_prefix('/') {
-                    Some(abs) => abs.to_string(),
-                    None => format!("{dir}{target}"),
-                };
-                out.insert(p.attr("Id").to_string(), path);
-            }
-            opccore::xml::Event::Eof => break,
-            _ => {}
-        }
-    }
-    out
+    let dir = part.rsplit_once('/').map_or("", |(d, _)| d);
+    parse_rels(&String::from_utf8_lossy(&bytes))
+        .into_iter()
+        .map(|(id, ty, target)| (id, (ty, resolve_relative(dir, &target))))
+        .collect()
 }
 
 /// Read an `.xlsb` package.
@@ -252,7 +220,7 @@ pub(crate) fn read(zip: &ZipArchive) -> Result<BookIn, OpenError> {
     let wb = zip
         .read("xl/workbook.bin")
         .ok_or_else(|| OpenError::Corrupt("unreadable xl/workbook.bin".into()))?;
-    let rel = rels(zip, "xl/_rels/workbook.bin.rels", "xl/");
+    let rel = rels(zip, "xl/workbook.bin");
     let mut book = BookIn::new();
     let mut g = Globals {
         sheets: Vec::new(),
@@ -261,7 +229,7 @@ pub(crate) fn read(zip: &ZipArchive) -> Result<BookIn, OpenError> {
         names: Vec::new(),
         tables: HashMap::new(),
     };
-    // (name, part) of each sheet; the part is None for one without a rel.
+    // Each BrtBundleSh's part, in sheet order; None for one without a rel.
     let mut parts: Vec<Option<String>> = Vec::new();
     let mut raw_names: Vec<RawName> = Vec::new();
     for (ty, body) in records(&wb) {
@@ -274,7 +242,7 @@ pub(crate) fn read(zip: &ZipArchive) -> Result<BookIn, OpenError> {
                     c.u32()?;
                     let rid = c.wide()?;
                     g.sheets.push(c.wide()?);
-                    parts.push(rel.get(&rid).cloned());
+                    parts.push(rel.get(&rid).map(|(_, target)| target.clone()));
                 }
                 BRT_SUP_SELF | BRT_SUP_SAME => g.own.push(true),
                 BRT_SUP_BOOK_SRC | BRT_SUP_ADDIN => g.own.push(false),
@@ -292,7 +260,7 @@ pub(crate) fn read(zip: &ZipArchive) -> Result<BookIn, OpenError> {
                     let (rgce, extra) = c.formula()?;
                     // fFunc / fOB / fProc, and the _xlfn. future functions.
                     let function = flags & 0x0E != 0 || name.starts_with("_xlfn.");
-                    g.names.push(name.clone());
+                    g.names.push((name.clone(), itab));
                     raw_names.push(RawName {
                         name,
                         function,
@@ -440,6 +408,9 @@ fn read_sheet(
                 // BrtCellBlank .. BrtFmlaError: column, style, then the value.
                 1..=11 => {
                     let col = c.u32()?;
+                    if !on_grid(row, col) {
+                        return None;
+                    }
                     let style = c.u32()? & 0x00FF_FFFF;
                     let value = match ty {
                         1 => CellValue::Empty,
@@ -491,7 +462,7 @@ fn read_sheet(
     };
     for at in pending {
         if let Some((range, rgce, extra)) = arrays.iter().find(|(rg, _, _)| contains(rg, at)) {
-            let (r1, r2, c1, c2) = *range;
+            let (r1, _, c1, _) = *range;
             // The array formula lives on its anchor; the rest are values.
             if at != (r1, c1) {
                 continue;
@@ -500,15 +471,7 @@ fn read_sheet(
                 continue;
             };
             if let Some(cell) = cells.get_mut(&at) {
-                let name = crate::sheet::cell_name;
-                let ext = if (r1, c1) == (r2, c2) {
-                    name(r1, c1)
-                } else {
-                    format!("{}:{}", name(r1, c1), name(r2, c2))
-                };
-                cell.formula = Some(f);
-                cell.f_attrs = Some(format!(" t=\"array\" ref=\"{ext}\""));
-                cell.spill = Some((r2 - r1 + 1, c2 - c1 + 1));
+                set_array(cell, *range, f);
             }
             continue;
         }
@@ -693,6 +656,47 @@ mod tests {
         assert_eq!(book.names.len(), 1);
         assert_eq!(book.names[0].name, "TheData");
         assert_eq!(book.names[0].formula, "Data!$A$1:$A$2");
+    }
+
+    /// `=Sheet2!Rate*2` with a name scoped to Sheet2 keeps the sheet.
+    #[test]
+    fn name_x_into_this_workbook_keeps_the_sheet() {
+        let g = Globals {
+            sheets: vec!["Data".into(), "Sheet2".into()],
+            own: vec![true],
+            xti: vec![(0, 1, 1)],
+            names: vec![("Global".into(), 0xFFFF_FFFF), ("Rate".into(), 1)],
+            tables: HashMap::new(),
+        };
+        let f = [0x39, 0, 0, 2, 0, 0, 0, 0x1E, 2, 0, 0x05];
+        let got = ptg::decompile(Biff::V12, &f, &[], Base::Cell(None), &g);
+        assert_eq!(got.as_deref(), Some("Sheet2!Rate*2"));
+        let f = [0x39, 0, 0, 1, 0, 0, 0];
+        let got = ptg::decompile(Biff::V12, &f, &[], Base::Cell(None), &g);
+        assert_eq!(got.as_deref(), Some("Global"));
+    }
+
+    #[test]
+    fn cells_past_the_grid_are_dropped() {
+        let mut far = cell(16384, 0);
+        far.extend(1.0f64.to_le_bytes());
+        let mut deep = cell(0, 0);
+        deep.extend(2.0f64.to_le_bytes());
+        let mut ok = cell(16383, 0);
+        ok.extend(3.0f64.to_le_bytes());
+        let book = open(&xlsb(
+            &[],
+            &[
+                rec(BRT_ROW_HDR, &0u32.to_le_bytes()),
+                rec(5, &far),
+                rec(5, &ok),
+                rec(BRT_ROW_HDR, &2_000_000u32.to_le_bytes()),
+                rec(5, &deep),
+            ],
+        ));
+        let c = &book.sheets[0].cells;
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[&(0, 16383)].value, CellValue::Number(3.0));
     }
 
     #[test]

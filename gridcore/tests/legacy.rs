@@ -26,15 +26,20 @@ enum Check {
     Format,
 }
 
-/// One exemption: in `file`, cell `cell` of sheet `sheet` ("*" for every
-/// cell of it) skips `checks`, because `why`.
+/// One exemption: in `file`, the `cells` of sheet `sheet` (`["*"]` for
+/// every cell of it) skip `checks`, because `why`.
 struct Allow {
     file: &'static str,
     sheet: &'static str,
-    cell: &'static str,
+    cells: &'static [&'static str],
     checks: &'static [Check],
     why: &'static str,
 }
+
+/// shape-salestable's cells whose formulas use structured references.
+const STRUCTURED_REFS: &[&str] = &[
+    "D2", "D3", "D4", "D5", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8",
+];
 
 const ALLOW: &[Allow] = &[
     // The source formulas are `SUM(Q1:Q3!A1:A1)` and so on, unquoted. When
@@ -45,21 +50,21 @@ const ALLOW: &[Allow] = &[
     Allow {
         file: "calc-3d.xlsb",
         sheet: "Total",
-        cell: "*",
+        cells: &["*"],
         checks: &[Check::Value],
         why: "Excel cached its misreading of Q1:Q3! (Q1 as a cell)",
     },
     Allow {
         file: "calc-3d.xls",
         sheet: "Total",
-        cell: "*",
+        cells: &["*"],
         checks: &[Check::Value],
         why: "Excel cached its misreading of Q1:Q3! (Q1 as a cell)",
     },
     Allow {
         file: "calc-3d.ods",
         sheet: "Total",
-        cell: "*",
+        cells: &["*"],
         checks: &[Check::Value],
         why: "Excel cached its misreading of Q1:Q3! (Q1 as a cell)",
     },
@@ -68,41 +73,42 @@ const ALLOW: &[Allow] = &[
     Allow {
         file: "calc-refs.ods",
         sheet: "Calc Zone",
-        cell: "*",
+        cells: &["*"],
         checks: &[Check::SheetName],
         why: "Excel's .ods export renamed the sheet to Calc_Zone",
     },
     Allow {
         file: "calc-refs.ods",
         sheet: "Calc Zone",
-        cell: "A7",
+        cells: &["A7"],
         checks: &[Check::Formula],
         why: "refers to the renamed sheet: =Calc_Zone!A1+1",
     },
-    // BIFF8 has no tables: Excel writes structured references as the
-    // ranges they cover (`Sales[Qty]` → `Orders!$B$2:$B$5`). The values
-    // and recalculation agree; tables themselves are not imported.
+    // The cells of shape-salestable that hold structured references: the
+    // calculated column D2:D5 and the summaries F1:F8. Each format stores
+    // them as the ranges they cover (`Sales[Qty]` → `Orders!$B$2:$B$5`):
+    // an .xls has no tables, Excel's .ods export writes ranges, and the
+    // .xlsb's table isn't imported (tables are a follow-up), so its ptgList
+    // tokens are read as the ranges, as Excel writes them to an .xls. The
+    // values and recalculation agree.
     Allow {
         file: "shape-salestable.xls",
         sheet: "Orders",
-        cell: "*",
+        cells: STRUCTURED_REFS,
         checks: &[Check::Formula],
         why: ".xls has no tables; structured refs are stored as ranges",
     },
-    // The .xlsb keeps the table, but the import doesn't (tables are a
-    // follow-up), so its structured references are written as the ranges
-    // they cover, as Excel itself writes them to an .xls.
     Allow {
         file: "shape-salestable.ods",
         sheet: "Orders",
-        cell: "*",
+        cells: STRUCTURED_REFS,
         checks: &[Check::Formula],
         why: "Excel's .ods export writes structured refs as ranges",
     },
     Allow {
         file: "shape-salestable.xlsb",
         sheet: "Orders",
-        cell: "*",
+        cells: STRUCTURED_REFS,
         checks: &[Check::Formula],
         why: "tables are not imported; structured refs become ranges",
     },
@@ -112,7 +118,7 @@ fn allowed(file: &str, sheet: &str, cell: &str, check: Check) -> bool {
     ALLOW.iter().any(|a| {
         a.file == file
             && a.sheet == sheet
-            && (a.cell == "*" || a.cell == cell)
+            && a.cells.iter().any(|c| *c == "*" || *c == cell)
             && a.checks.contains(&check)
     })
 }
@@ -394,7 +400,11 @@ fn legacy_imports_match_their_xlsx_originals() {
     for a in ALLOW {
         println!(
             "  allow {} {}!{} {:?}: {}",
-            a.file, a.sheet, a.cell, a.checks, a.why
+            a.file,
+            a.sheet,
+            a.cells.join(","),
+            a.checks,
+            a.why
         );
     }
     assert_eq!(

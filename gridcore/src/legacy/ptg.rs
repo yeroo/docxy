@@ -530,21 +530,25 @@ fn area_ref(v: Biff, (r1, r2, c1w, c2w): (u32, u32, u16, u16), at: Option<(u32, 
 /// all, headers, totals, this row, or the combinations Excel allows).
 fn list_ref(t: &Table, flags: u16, c1: u32, c2: u32, base: Base) -> Option<String> {
     let (r1, r2, tc1, tc2) = t.range;
-    let (cols_lo, cols_hi) = match flags & 0x3 {
-        0 => (tc1, tc2),
-        1 => (tc1 + c1, tc1 + c1),
-        _ => (tc1 + c1, tc1 + c2),
-    };
-    if cols_hi > tc2 {
+    // A table that is inverted or leaves the grid names no range.
+    if r2 < r1 || tc2 < tc1 || !super::on_grid(r2, tc2) {
         return None;
     }
-    let data = (r1 + t.header, r2.checked_sub(t.totals)?);
+    let (cols_lo, cols_hi) = match flags & 0x3 {
+        0 => (tc1, tc2),
+        1 => (tc1.checked_add(c1)?, tc1.checked_add(c1)?),
+        _ => (tc1.checked_add(c1)?, tc1.checked_add(c2)?),
+    };
+    if cols_hi > tc2 || cols_lo > cols_hi {
+        return None;
+    }
+    let data = (r1.checked_add(t.header)?, r2.checked_sub(t.totals)?);
     let rows = match (flags >> 2) & 0x1F {
         0x00 | 0x04 => data,
         0x01 => (r1, r2),
-        0x02 => (r1, r1 + t.header.checked_sub(1)?),
+        0x02 => (r1, r1.checked_add(t.header.checked_sub(1)?)?),
         0x06 => (r1, data.1),
-        0x08 => (r2 + 1 - t.totals, r2),
+        0x08 => (r2.checked_add(1)?.checked_sub(t.totals)?, r2),
         0x0C => (data.0, r2),
         0x10 => {
             // `[#This Row]`: the formula's own row, as `$B2`.
@@ -825,6 +829,9 @@ pub(crate) mod tests {
         assert_eq!(list(0x08, 0, 0, cell).as_deref(), Some("Orders!$A$1:$D$1"));
         // Sales[[#This Row],[Qty]] in row 3.
         assert_eq!(list(0x0641, 1, 1, cell).as_deref(), Some("Orders!$B3"));
+        // Column offsets past the table (or u32) give nothing.
+        assert_eq!(list(0x01, 9, 9, cell), None);
+        assert_eq!(list(0x02, 2, 1, cell), None);
         // No totals row to name, an unknown table, and BIFF8 has no ptgList.
         assert_eq!(list(0x21, 0, 0, cell), None);
         let mut f = vec![0x18, 0x19, 0, 0, 1, 0];

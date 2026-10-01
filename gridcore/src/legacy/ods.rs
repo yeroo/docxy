@@ -9,7 +9,9 @@
 //!
 //! Repeated rows and cells (`table:number-rows-repeated="1048000"` on the
 //! padding Excel and LibreOffice write) are expanded only where they hold
-//! something, so a padded file allocates nothing for its padding.
+//! something, so padding costs nothing. Repeats that do hold something are
+//! expanded up to [`MAX_CELLS`] cells a workbook; a file that asks for more
+//! is refused rather than allowed to exhaust memory.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -18,30 +20,6 @@ use opccore::zip::ZipArchive;
 
 use super::{BookIn, OpenError, SheetIn, sheet_prefix};
 use crate::sheet::{Cell, CellValue, DefinedName, MAX_COLS, MAX_ROWS};
-
-/// Excel's serial for a date-time, in the 1900 system (with its phantom
-/// 29 Feb 1900) or the 1904 one.
-fn date_serial(y: i64, m: u32, d: u32, secs: f64, date1904: bool) -> f64 {
-    // Days from 1970-01-01 (civil algorithm, proleptic Gregorian).
-    fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-        let y = if m <= 2 { y - 1 } else { y };
-        let era = y.div_euclid(400);
-        let yoe = y - era * 400;
-        let mp = (m as i64 + 9) % 12;
-        let doy = (153 * mp + 2) / 5 + d as i64 - 1;
-        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-        era * 146_097 + doe - 719_468
-    }
-    let days = days_from_civil(y, m, d);
-    let serial = if date1904 {
-        days - days_from_civil(1904, 1, 1)
-    } else {
-        let s = days - days_from_civil(1899, 12, 30);
-        // Serials 1..=59 are Jan/Feb 1900, before Excel's fictitious leap day.
-        if s < 61 { s - 1 } else { s }
-    };
-    serial as f64 + secs / 86_400.0
-}
 
 /// `2024-01-15` or `2024-01-15T12:30:00.5` as a serial.
 fn parse_date(s: &str, date1904: bool) -> Option<f64> {
@@ -63,7 +41,10 @@ fn parse_date(s: &str, date1904: bool) -> Option<f64> {
             .ok()?;
         secs = h * 3600.0 + mi * 60.0 + sec;
     }
-    Some(date_serial(y, m, d, secs, date1904))
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some(crate::sheet::parts_to_serial(y, m, d, 0, date1904) + secs / 86_400.0)
 }
 
 /// An ISO 8601 duration (`PT12H30M15S`) as a fraction of a day.
@@ -290,6 +271,9 @@ pub(crate) fn convert_formula(f: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 // Number formats
 // ---------------------------------------------------------------------------
+
+/// The most digits a data style may ask for in any one place.
+const MAX_DIGITS: u32 = 30;
 
 /// One element of an ODF data style, in order.
 #[derive(Debug, Clone)]
@@ -555,7 +539,9 @@ impl StyleSheet {
                     let Some((_, style)) = cur.as_mut() else {
                         continue;
                     };
-                    let num = |a: &str| p.attr(a).parse::<u32>().ok();
+                    // Digit counts, bounded as Excel bounds decimals (30), so a
+                    // hostile count can't size a format code.
+                    let num = |a: &str| p.attr(a).parse::<u32>().ok().map(|n| n.min(MAX_DIGITS));
                     let long = p.attr("number:style") == "long";
                     let part = match name {
                         "number:number" => Some(Part::Number(
@@ -690,11 +676,17 @@ pub(crate) fn read(zip: &ZipArchive) -> Result<BookIn, OpenError> {
         styles.read(&String::from_utf8_lossy(&s));
     }
     styles.read(&content);
-    Ok(read_content(&content, &styles))
+    read_content(&content, &styles)
 }
 
-fn read_content(xml: &str, styles: &StyleSheet) -> BookIn {
+/// The most cells an `.ods` may expand its repeats into, across the
+/// workbook. Real files repeat a value cell a little (a filled-down
+/// constant); a row of 16,384 values repeated a million times is an attack.
+pub(crate) const MAX_CELLS: usize = 4_000_000;
+
+fn read_content(xml: &str, styles: &StyleSheet) -> Result<BookIn, OpenError> {
     let mut book = BookIn::new();
+    let mut total = 0usize;
     let mut codes: HashMap<String, u32> = HashMap::new();
     let mut p = XmlParser::new(xml);
     let mut stack: Vec<String> = Vec::new();
@@ -855,6 +847,15 @@ fn read_content(xml: &str, styles: &StyleSheet) -> BookIn {
                                 ..Cell::default()
                             };
                             let last = col.saturating_add(repeat).min(MAX_COLS);
+                            if row_cells
+                                .len()
+                                .saturating_add((last.saturating_sub(col)) as usize)
+                                > MAX_CELLS
+                            {
+                                return Err(OpenError::Corrupt(format!(
+                                    "too many repeated cells (more than {MAX_CELLS})"
+                                )));
+                            }
                             for cc in col..last {
                                 row_cells.push((cc, made.clone()));
                             }
@@ -865,6 +866,13 @@ fn read_content(xml: &str, styles: &StyleSheet) -> BookIn {
                         if let Some(sheet) = book.sheets.last_mut() {
                             if !row_cells.is_empty() {
                                 let last = row.saturating_add(row_repeat).min(MAX_ROWS);
+                                let rows = last.saturating_sub(row) as usize;
+                                total = total.saturating_add(row_cells.len().saturating_mul(rows));
+                                if total > MAX_CELLS {
+                                    return Err(OpenError::Corrupt(format!(
+                                        "too many repeated cells (more than {MAX_CELLS})"
+                                    )));
+                                }
                                 for r in row..last {
                                     for (cc, made) in &row_cells {
                                         sheet.cells.insert((r, *cc), made.clone());
@@ -888,7 +896,7 @@ fn read_content(xml: &str, styles: &StyleSheet) -> BookIn {
             formula,
         });
     }
-    book
+    Ok(book)
 }
 
 /// A cell's value from its `office:value-type` and value attributes (or its
@@ -931,20 +939,20 @@ mod tests {
         let xml = content(body);
         let mut styles = StyleSheet::default();
         styles.read(&xml);
-        read_content(&xml, &styles)
+        read_content(&xml, &styles).unwrap()
     }
 
     #[test]
     fn date_serials_match_excel() {
-        assert_eq!(date_serial(1900, 1, 1, 0.0, false), 1.0);
-        assert_eq!(date_serial(1900, 2, 28, 0.0, false), 59.0);
-        assert_eq!(date_serial(1900, 3, 1, 0.0, false), 61.0);
-        assert_eq!(date_serial(2024, 1, 15, 0.0, false), 45306.0);
-        assert_eq!(date_serial(1904, 1, 1, 0.0, true), 0.0);
-        assert_eq!(
-            date_serial(2024, 1, 15, 43_200.0, true),
-            45306.0 - 1462.0 + 0.5
-        );
+        let d = |s: &str, d1904| parse_date(s, d1904).unwrap();
+        assert_eq!(d("1900-01-01", false), 1.0);
+        assert_eq!(d("1900-02-28", false), 59.0);
+        assert_eq!(d("1900-03-01", false), 61.0);
+        assert_eq!(d("2024-01-15", false), 45306.0);
+        assert_eq!(d("1904-01-01", true), 0.0);
+        assert_eq!(d("2024-01-15T12:00:00", true), 45306.0 - 1462.0 + 0.5);
+        assert_eq!(d("2024-01-15T00:00:00.5", false), 45306.0 + 0.5 / 86_400.0);
+        assert_eq!(parse_date("2024-13-01", false), None);
         let half_past = parse_duration("PT12H30M00S").unwrap();
         assert!((half_past - 12.5 / 24.0).abs() < 1e-12);
         assert_eq!(parse_date("2024-01-15T06:00:00", false), Some(45306.25));
@@ -1068,6 +1076,41 @@ mod tests {
         assert_eq!(code("X").as_deref(), Some("@"));
         assert_eq!(s.code("ce1").as_deref(), Some("General"));
         assert_eq!(s.code("ce2"), code("C"));
+    }
+
+    #[test]
+    fn a_row_times_column_repeat_bomb_is_refused_quickly() {
+        let xml = content(
+            r#"<table:table table:name="S"><table:table-row table:number-rows-repeated="1048576"><table:table-cell office:value-type="float" office:value="1" table:number-columns-repeated="16384"/></table:table-row></table:table>"#,
+        );
+        let started = std::time::Instant::now();
+        let err = read_content(&xml, &StyleSheet::default()).err().unwrap();
+        assert!(err.to_string().contains("too many repeated cells"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // A filled-down constant is fine.
+        let ok = content(
+            r#"<table:table table:name="S"><table:table-row table:number-rows-repeated="1000"><table:table-cell office:value-type="float" office:value="1" table:number-columns-repeated="3"/></table:table-row></table:table>"#,
+        );
+        assert_eq!(
+            read_content(&ok, &StyleSheet::default()).unwrap().sheets[0]
+                .cells
+                .len(),
+            3000
+        );
+    }
+
+    #[test]
+    fn huge_digit_counts_give_a_bounded_code() {
+        let xml = r#"<x><number:number-style style:name="N"><number:number number:decimal-places="4000000000" number:min-decimal-places="4000000000" number:min-integer-digits="4000000000" number:grouping="true"/></number:number-style>
+          <number:number-style style:name="E"><number:scientific-number number:decimal-places="4000000000" number:min-integer-digits="4000000000" number:min-exponent-digits="4000000000"/></number:number-style>
+          <number:number-style style:name="F"><number:fraction number:min-denominator-digits="4000000000"/></number:number-style>
+          <number:time-style style:name="T"><number:seconds number:decimal-places="4000000000"/></number:time-style></x>"#;
+        let mut s = StyleSheet::default();
+        s.read(xml);
+        for n in ["N", "E", "F", "T"] {
+            let code = format_code(&s.data, n).unwrap();
+            assert!(code.len() < 200, "{n}: {}", code.len());
+        }
     }
 
     #[test]

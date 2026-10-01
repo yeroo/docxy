@@ -241,6 +241,47 @@ pub(crate) fn sheet_prefix(first: &str, last: &str) -> String {
     }
 }
 
+/// An RK number (BIFF8 and BIFF12): a 30-bit integer or the top of an
+/// IEEE double, either optionally scaled by 1/100.
+pub(crate) fn rk(v: u32) -> f64 {
+    let x = if v & 2 != 0 {
+        ((v as i32) >> 2) as f64
+    } else {
+        f64::from_bits(((v & 0xFFFF_FFFC) as u64) << 32)
+    };
+    if v & 1 != 0 { x / 100.0 } else { x }
+}
+
+/// Whether (row, col) is on the grid. A cell a file puts past it never
+/// reaches the model.
+pub(crate) fn on_grid(row: u32, col: u32) -> bool {
+    row < crate::sheet::MAX_ROWS && col < crate::sheet::MAX_COLS
+}
+
+/// Make `cell` the anchor of a legacy (CSE) array formula `formula` over
+/// `(r1, r2, c1, c2)`, as an `.xlsx` holds one: the formula and its
+/// `t="array" ref` on the anchor, the other cells plain values. A range that
+/// is inverted or leaves the grid is not an array this can hold: `false`.
+pub(crate) fn set_array(
+    cell: &mut Cell,
+    (r1, r2, c1, c2): (u32, u32, u32, u32),
+    formula: String,
+) -> bool {
+    if r2 < r1 || c2 < c1 || !on_grid(r2, c2) {
+        return false;
+    }
+    let name = crate::sheet::cell_name;
+    let ext = if (r1, c1) == (r2, c2) {
+        name(r1, c1)
+    } else {
+        format!("{}:{}", name(r1, c1), name(r2, c2))
+    };
+    cell.formula = Some(formula);
+    cell.f_attrs = Some(format!(" t=\"array\" ref=\"{ext}\""));
+    cell.spill = Some((r2 - r1 + 1, c2 - c1 + 1));
+    true
+}
+
 /// The error text of a BIFF error code (shared by BIFF8 and BIFF12).
 pub(crate) fn biff_error(code: u8) -> &'static str {
     match code {
@@ -265,6 +306,24 @@ pub(crate) fn builtin_format(id: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arrays_need_an_upright_range_on_the_grid() {
+        let mut c = Cell::default();
+        assert!(!set_array(&mut c, (5, 2, 0, 0), "1".into()));
+        assert!(!set_array(&mut c, (0, 0, 3, 1), "1".into()));
+        assert!(!set_array(&mut c, (0, 2_000_000, 0, 0), "1".into()));
+        assert_eq!(c, Cell::default());
+        assert!(set_array(&mut c, (0, 1, 1, 1), "A1:A2*2".into()));
+        assert_eq!(c.spill, Some((2, 1)));
+    }
+
+    #[test]
+    fn rk_numbers() {
+        assert_eq!(rk((12345u32 << 2) | 2 | 1), 123.45);
+        assert_eq!(rk(((-7i32 as u32) << 2) | 2), -7.0);
+        assert_eq!(rk((1.5f64.to_bits() >> 32) as u32), 1.5);
+    }
 
     #[test]
     fn sheet_prefixes_quote_as_needed() {

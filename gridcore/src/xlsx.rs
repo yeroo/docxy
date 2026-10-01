@@ -509,7 +509,7 @@ fn sheet_metadata_part(parts: &[(String, Vec<u8>)]) -> (String, bool) {
 
 /// The rels part that belongs to `part`: `xl/workbook.xml` →
 /// `xl/_rels/workbook.xml.rels`.
-fn rels_part_name(part: &str) -> String {
+pub(crate) fn rels_part_name(part: &str) -> String {
     match part.rsplit_once('/') {
         Some((dir, file)) => format!("{dir}/_rels/{file}.rels"),
         None => format!("_rels/{part}.rels"),
@@ -8905,10 +8905,6 @@ mod tests {
         assert!(!part_text(&saved, "xl/worksheets/sheet2.xml").contains("tabSelected"));
     }
 
-    /// Excel's *Always create backup* (`<workbookPr backupFile>`): the save
-    /// path honours it (xlsxy), so it is read from the package, not the
-    /// model. Only "1"/"true" turn it on; anything else (or no attribute,
-    /// no element, no part) means off.
     /// #603: the model's date system is written back. An imported 1904
     /// workbook starts from new_xlsx's 1900 part and must not stay 1900.
     #[test]
@@ -8948,6 +8944,10 @@ mod tests {
         assert_eq!(set_date1904(&f, false), f);
     }
 
+    /// Excel's *Always create backup* (`<workbookPr backupFile>`): the save
+    /// path honours it (xlsxy), so it is read from the package, not the
+    /// model. Only "1"/"true" turn it on; anything else (or no attribute,
+    /// no element, no part) means off.
     #[test]
     fn always_create_backup_reads_workbook_pr() {
         let pkg_with = |wb_pr: &str| {

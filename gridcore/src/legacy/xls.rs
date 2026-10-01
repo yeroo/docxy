@@ -10,7 +10,9 @@
 use std::collections::HashMap;
 
 use super::ptg::{self, Base, Biff, Names};
-use super::{BookIn, OpenError, SheetIn, biff_error, builtin_format, sheet_prefix};
+use super::{
+    BookIn, OpenError, SheetIn, biff_error, builtin_format, on_grid, rk, set_array, sheet_prefix,
+};
 use crate::sheet::{Cell, CellValue, DefinedName};
 
 /// One record, with any CONTINUE records that follow it appended to `data`.
@@ -163,17 +165,6 @@ impl<'a> Cur<'a> {
     }
 }
 
-/// An RK number: a 30-bit integer or the top of an IEEE double, either
-/// optionally scaled by 1/100.
-fn rk(v: u32) -> f64 {
-    let x = if v & 2 != 0 {
-        ((v as i32) >> 2) as f64
-    } else {
-        f64::from_bits(((v & 0xFFFF_FFFC) as u64) << 32)
-    };
-    if v & 1 != 0 { x / 100.0 } else { x }
-}
-
 #[derive(Debug, PartialEq)]
 enum Book {
     /// The workbook itself (a SUPBOOK with the 0x0401 marker).
@@ -230,7 +221,16 @@ impl Names for Globals {
         let book = self.books.get(book as usize)?;
         match book.kind {
             Book::AddIn => book.names.get(index.checked_sub(1)? as usize).cloned(),
-            Book::Own => self.name(index),
+            // A name of this workbook; a sheet-scoped one is qualified with
+            // the sheet the XTI names (`Sheet2!Rate`).
+            Book::Own => {
+                let name = self.names.get(index.checked_sub(1)? as usize)?;
+                if name.itab == 0 {
+                    Some(name.name.clone())
+                } else {
+                    Some(format!("{}{}", self.xti(ixti)?, name.name))
+                }
+            }
             Book::External => None,
         }
     }
@@ -267,8 +267,8 @@ pub(crate) fn read(stream: &[u8]) -> Result<BookIn, OpenError> {
     let first = recs
         .first()
         .ok_or_else(|| OpenError::Corrupt("empty Workbook stream".into()))?;
-    // BIFF8's BOF says version 0x0600; BIFF5/7 says 0x0500, and older
-    // formats use other BOF record ids altogether.
+    // BIFF8's BOF says version 0x0600 and BIFF5/7's 0x0500; anything else
+    // (older BOF record ids, garbage) is no workbook this reads.
     let version = (first.ty == BOF)
         .then(|| {
             first
@@ -277,8 +277,14 @@ pub(crate) fn read(stream: &[u8]) -> Result<BookIn, OpenError> {
                 .map(|v| u16::from_le_bytes([v[0], v[1]]))
         })
         .flatten();
-    if version != Some(0x0600) {
-        return Err(OpenError::Biff5);
+    match version {
+        Some(0x0600) => {}
+        Some(0x0500) => return Err(OpenError::Biff5),
+        _ => {
+            return Err(OpenError::Corrupt(
+                "the Workbook stream is not a BIFF8 workbook".into(),
+            ));
+        }
     }
 
     let mut book = BookIn::new();
@@ -441,11 +447,13 @@ pub(crate) fn read(stream: &[u8]) -> Result<BookIn, OpenError> {
     Ok(book)
 }
 
-/// A formula cell's token stream, kept until the sheet's shared and array
-/// formulas are all known.
+/// A formula cell whose tokens are a ptgExp: it is resolved once the
+/// sheet's shared and array formulas (which follow their first cell) are
+/// all known.
 struct Pending {
+    /// The cell.
     at: (u32, u32),
-    /// ptgExp's master cell.
+    /// The shared or array formula's master cell, as ptgExp names it.
     master: (u32, u32),
 }
 
@@ -476,6 +484,9 @@ fn read_sheet(
                ixfe: u16,
                value: CellValue,
                book: &mut BookIn| {
+        if !on_grid(r as u32, c as u32) {
+            return;
+        }
         cells.insert(
             (r as u32, c as u32),
             Cell {
@@ -515,14 +526,8 @@ fn read_sheet(
                     for i in 0..n {
                         let xf = c.u16()?;
                         let v = rk(c.u32()?);
-                        put(
-                            &mut cells,
-                            row,
-                            first + i as u16,
-                            xf,
-                            CellValue::Number(v),
-                            book,
-                        );
+                        let col = first.checked_add(u16::try_from(i).ok()?)?;
+                        put(&mut cells, row, col, xf, CellValue::Number(v), book);
                     }
                 }
                 0x00FD => {
@@ -555,14 +560,8 @@ fn read_sheet(
                     let n = (r.data.len().checked_sub(6)?) / 2;
                     for i in 0..n {
                         let xf = c.u16()?;
-                        put(
-                            &mut cells,
-                            row,
-                            first + i as u16,
-                            xf,
-                            CellValue::Empty,
-                            book,
-                        );
+                        let col = first.checked_add(u16::try_from(i).ok()?)?;
+                        put(&mut cells, row, col, xf, CellValue::Empty, book);
                     }
                 }
                 0x0006 => {
@@ -637,17 +636,8 @@ fn read_sheet(
                 else {
                     continue;
                 };
-                let (r1, r2, c1, c2) = *range;
                 if let Some(cell) = cells.get_mut(&p.at) {
-                    let name = crate::sheet::cell_name;
-                    let ext = if (r1, c1) == (r2, c2) {
-                        name(r1, c1)
-                    } else {
-                        format!("{}:{}", name(r1, c1), name(r2, c2))
-                    };
-                    cell.formula = Some(f);
-                    cell.f_attrs = Some(format!(" t=\"array\" ref=\"{ext}\""));
-                    cell.spill = Some((r2 - r1 + 1, c2 - c1 + 1));
+                    set_array(cell, *range, f);
                 }
             }
             continue;
@@ -900,6 +890,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn coordinates_past_the_grid_or_u16_are_dropped() {
+        // MULRK from column 16383 (XFD) over three cells: only XFD is on
+        // the grid. MULBLANK from 0xFFFF over two cells would overflow u16.
+        let mut mulrk = cell(0, 16383, 0)[..4].to_vec();
+        for v in [1u32, 2, 3] {
+            mulrk.extend([0, 0]);
+            mulrk.extend(((v << 2) | 2).to_le_bytes());
+        }
+        mulrk.extend(16385u16.to_le_bytes());
+        let mut mulblank = cell(1, 0xFFFF, 0)[..4].to_vec();
+        mulblank.extend([0, 0, 0, 0]);
+        mulblank.extend(0u16.to_le_bytes());
+        // An ARRAY whose range is upside down: no formula, no panic.
+        let exp = [0x01, 2, 0, 0, 0];
+        let mut arr = vec![2, 0, 0, 0, 0, 0];
+        arr.extend([0, 0, 0, 0, 0, 0]);
+        arr.extend(3u16.to_le_bytes());
+        arr.extend([0x1E, 1, 0]);
+        let stream = workbook(
+            &[],
+            &[
+                rec(0x00BD, &mulrk),
+                rec(0x00BE, &mulblank),
+                number(0, 20000, 1.0),
+                formula(2, 0, 1.0, &exp),
+                rec(0x0221, &arr),
+            ],
+        );
+        let book = read(&stream).unwrap();
+        let c = data(&book);
+        assert_eq!(c[&(0, 16383)].value, CellValue::Number(1.0));
+        assert!(c.keys().all(|&(r, col)| on_grid(r, col)));
+        assert_eq!(c[&(2, 0)].formula, None);
+        assert_eq!(c[&(2, 0)].value, CellValue::Number(1.0));
+    }
+
+    #[test]
     fn leniency_unknown_records_ptgs_and_truncation() {
         // An unknown record, a formula with an unknown ptg (keeps its value),
         // a NUMBER too short for its fields, then a record cut off by the end
@@ -968,6 +995,34 @@ pub(crate) mod tests {
         assert_eq!(book.names[0].formula, "0.21");
     }
 
+    /// `=Sheet2!Rate*2` with a name scoped to Sheet2: ptgNameX through an
+    /// XTI into this workbook keeps the sheet.
+    #[test]
+    fn name_x_into_this_workbook_keeps_the_sheet() {
+        let raw = |name: &str, itab| RawName {
+            name: name.into(),
+            function: false,
+            itab,
+            rgce: Vec::new(),
+            extra: Vec::new(),
+        };
+        let g = Globals {
+            sheets: vec!["Data".into(), "Sheet 2".into()],
+            xti: vec![(0, 1, 1)],
+            books: vec![SupBook {
+                kind: Book::Own,
+                names: Vec::new(),
+            }],
+            names: vec![raw("Global", 0), raw("Rate", 2)],
+        };
+        let f = [0x39, 0, 0, 2, 0, 0, 0, 0x1E, 2, 0, 0x05];
+        let got = ptg::decompile(Biff::V8, &f, &[], Base::Cell(None), &g);
+        assert_eq!(got.as_deref(), Some("'Sheet 2'!Rate*2"));
+        let f = [0x39, 0, 0, 1, 0, 0, 0];
+        let got = ptg::decompile(Biff::V8, &f, &[], Base::Cell(None), &g);
+        assert_eq!(got.as_deref(), Some("Global"));
+    }
+
     #[test]
     fn encrypted_and_biff5_are_refused() {
         let enc = workbook(&[rec(0x002F, &[1, 0, 1, 0, 1, 0])], &[]);
@@ -980,6 +1035,19 @@ pub(crate) mod tests {
         b5.extend([5, 0, 0, 0, 0, 0, 0, 0]);
         let biff5 = rec(BOF, &b5);
         assert_eq!(read(&biff5).err(), Some(OpenError::Biff5));
+        // A BIFF4 BOF id, an unknown version, and noise are corrupt, not BIFF5.
+        let mut b8 = 0x0600u16.to_le_bytes().to_vec();
+        b8.extend([5, 0]);
+        for stream in [
+            rec(0x0409, &b8),
+            rec(BOF, &[0x00, 0x07, 5, 0]),
+            vec![1, 2, 3, 4, 5, 6],
+        ] {
+            assert!(
+                matches!(read(&stream), Err(OpenError::Corrupt(_))),
+                "{stream:?}"
+            );
+        }
         assert_eq!(
             OpenError::Biff5.to_string(),
             "Excel 5.0/95 workbooks are not supported"
