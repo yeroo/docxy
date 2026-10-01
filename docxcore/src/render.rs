@@ -1345,7 +1345,7 @@ fn following_inline_width(items: &[FlatInline<'_>], from: usize) -> usize {
         match it {
             // Both are laid out as `FlatItem::Run`s by `flat_inlines`.
             Inline::Run(_) | Inline::Hyperlink(_) => {}
-            Inline::Tab(_) | Inline::Break(_) => break,
+            Inline::Tab(_) | Inline::Break(..) => break,
             Inline::Equation { text, .. } if !text.contains('\n') => w += str_width(text),
             Inline::Field { text, .. } => w += str_width(text),
             Inline::Revision { content, .. } => {
@@ -1365,7 +1365,7 @@ fn following_inline_width(items: &[FlatInline<'_>], from: usize) -> usize {
 
 /// A note reference's display marker: the id in Unicode superscript digits, so a
 /// footnote/endnote anchor reads as a superscript number in the terminal.
-fn superscript(n: i32) -> String {
+pub(crate) fn superscript(n: i32) -> String {
     n.to_string()
         .chars()
         .map(|c| match c {
@@ -1566,7 +1566,7 @@ fn flatten_para(
                 }
                 mc += 1;
             }
-            Inline::Break(kind) => {
+            Inline::Break(kind, _) => {
                 match kind {
                     BreakKind::Line | BreakKind::Clear(_) => {
                         if inv {
@@ -2436,6 +2436,13 @@ fn emit_block_item(
         }
         _ => {}
     }
+}
+
+/// Whether this raw run is drawn as an image box on its own lines (a larger
+/// image), splitting the paragraph's inline text around it, rather than as a
+/// small picture flowing in the text.
+pub(crate) fn is_block_image(raw: &str) -> bool {
+    inline_image(raw).is_none() && raw_image_extent(raw).is_some()
 }
 
 /// Parse an embedded image's display size in pixels (96 dpi) from raw run XML.
@@ -4799,7 +4806,7 @@ mod tests {
     fn page_break_renders_labeled_separator() {
         let d = doc(vec![para(vec![
             run("a", RunProps::default()),
-            Inline::Break(BreakKind::Page),
+            Inline::Break(BreakKind::Page, RunProps::default()),
             run("b", RunProps::default()),
         ])]);
         let mut o = opts(24);
@@ -5304,7 +5311,7 @@ mod tests {
         // A hard page break must start a second page even with little content.
         let p = para(vec![
             run("before", RunProps::default()),
-            Inline::Break(BreakKind::Page),
+            Inline::Break(BreakKind::Page, RunProps::default()),
             run("after", RunProps::default()),
         ]);
         let mut o = opts(60);

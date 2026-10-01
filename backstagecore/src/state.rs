@@ -102,6 +102,8 @@ pub enum Pane {
     Options,
     /// Export's list: the host's quick export, then Change File Type.
     Export,
+    /// The Info page's editable rows (hosts with [`crate::BackstageHost::info_fields`]).
+    Info,
 }
 
 /// Click rects and scroll offsets recorded by `draw` (Task 3) and read by
@@ -115,6 +117,11 @@ pub struct BackstageLayout {
     pub type_top: u16,
     pub name_x0: u16,
     pub preview_h: usize,
+    /// Screen row of the Info page's first editable row; above the box
+    /// (even negative) when the page is scrolled down.
+    pub info_top: i32,
+    /// The Info box's inner rows, `[first, end)`: only a click there counts.
+    pub info_view: (u16, u16),
 }
 
 pub struct Backstage {
@@ -163,6 +170,13 @@ pub struct Backstage {
     pub export_sel: usize,
     /// The quick export's label on the Export page.
     pub export_quick: String,
+    /// The highlighted editable row of the Info page.
+    pub info_sel: usize,
+    /// The Info page's first line on screen, kept between draws so the
+    /// page only moves when the selection would leave the box.
+    pub info_scroll: usize,
+    /// A line the host shows on the Info page: how the last edit went.
+    pub info_message: Option<String>,
     // Filled by `draw` (Task 3) and read by `mouse` (Task 2, `input.rs`), a
     // sibling module — needs crate-wide visibility, not just within `state`.
     pub(crate) layout: BackstageLayout,
@@ -198,6 +212,9 @@ impl Backstage {
             type_focus: false,
             export_sel: 0,
             export_quick: String::new(),
+            info_sel: 0,
+            info_scroll: 0,
+            info_message: None,
             layout: BackstageLayout::default(),
         };
         b.refresh();
@@ -279,6 +296,14 @@ impl Backstage {
         if let Some(i) = ty {
             self.pick_type(i);
         }
+    }
+
+    /// Show Info with its editable row `row` focused (where a host returns
+    /// after editing one).
+    pub fn focus_info(&mut self, row: usize) {
+        self.item = Item::Info;
+        self.pane = Pane::Info;
+        self.info_sel = row;
     }
 
     /// The menu items, in display order.

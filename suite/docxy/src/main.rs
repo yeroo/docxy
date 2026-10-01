@@ -55,7 +55,7 @@ use project::*;
 use std::path::PathBuf;
 
 use docxcore::comments::Comment;
-use docxcore::editor::{Caret, Clip, Editor};
+use docxcore::editor::{Caret, Clip, Editor, FoundMatch, step_found};
 use docxcore::model::{
     Align, Block, BorderKind, Document, Inline, ParBorders, Paragraph, RunProps, Table, VertAlign,
 };
@@ -2455,6 +2455,9 @@ struct Docxy {
     replace_text: String,
     find_field: FindField,
     find_case: bool,
+    /// The find bar's current match and its index in the search it came from
+    /// (see `find_step_in`).
+    find_cur: Option<(usize, FoundMatch)>,
     // Font-colour / highlight swatch picker (None = closed).
     picker: Option<PickKind>,
     // Scroll handle for the document body, so the caret can be kept in view.
@@ -7322,6 +7325,7 @@ impl Docxy {
             replace_text: String::new(),
             find_field: FindField::Query,
             find_case: false,
+            find_cur: None,
             picker: None,
             doc_scroll: ScrollHandle::new(),
             comment_open: false,
@@ -13590,6 +13594,8 @@ impl Docxy {
     /// Open the find bar (focused on the query field) or close it.
     fn toggle_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.find_open = !self.find_open;
+        // A new Find starts from the caret, not from a match left by the last.
+        self.find_cur = None;
         if self.find_open {
             self.find_field = FindField::Query;
             // Seed from the current selection, if any, for a quick "find selected".
@@ -13606,13 +13612,14 @@ impl Docxy {
         }
     }
 
-    /// Number of matches for the current query in the active document.
+    /// Matches for the current query in the active document: everything Find
+    /// shows, read-only matches included.
     fn match_count(&self) -> usize {
         if self.find_query.is_empty() {
             return 0;
         }
         match self.tabs.get(self.active).map(|t| &t.surface) {
-            Some(Surface::Doc(ed)) => ed.find_all(&self.find_query, self.find_case).len(),
+            Some(Surface::Doc(ed)) => ed.find_visible(&self.find_query, self.find_case).len(),
             _ => 0,
         }
     }
@@ -13622,53 +13629,54 @@ impl Docxy {
     fn find_step(&mut self, reverse: bool, from_start: bool, cx: &mut Context<Self>) {
         let q = self.find_query.clone();
         let cs = self.find_case;
+        let cur = self.find_cur.take();
         if let Some(ed) = self.active_editor() {
-            if from_start {
-                ed.move_doc_start();
-                ed.clear_selection();
-            }
-            if let Some(m) = ed.find_next(&q, cs, reverse) {
-                ed.select_match(&m);
-            }
+            let next = find_step_in(ed, &q, cs, cur, reverse, from_start);
+            self.find_cur = next;
         }
         cx.notify();
     }
 
-    /// Replace the current match (if one is selected) and advance to the next.
+    /// Replace the current match, if it is editable and still selected, and
+    /// advance to the next; a read-only match is skipped.
     fn replace_one(&mut self, cx: &mut Context<Self>) {
         let with = self.replace_text.clone();
         let q = self.find_query.clone();
         let cs = self.find_case;
-        let mut changed = false;
+        let cur = self.find_cur.take();
+        let mut outcome = None;
         if let Some(ed) = self.active_editor() {
-            if ed.has_selection() {
-                ed.replace_current_with(&with);
-                changed = true;
-            }
-            if let Some(m) = ed.find_next(&q, cs, false) {
-                ed.select_match(&m);
-            }
+            let (done, next) = replace_one_in(ed, &q, cs, cur, &with);
+            outcome = Some(done);
+            self.find_cur = next;
         }
-        if changed {
-            if let Some(t) = self.tabs.get_mut(self.active) {
-                t.dirty = true;
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            match outcome {
+                Some(ReplaceOne::Replaced) => t.dirty = true,
+                Some(ReplaceOne::ReadOnly) => t.status = "read-only match skipped".into(),
+                _ => {}
             }
         }
         cx.notify();
     }
 
-    /// Replace every match; report the count in the status line.
+    /// Replace every editable match; report the count in the status line.
     fn replace_all_now(&mut self, cx: &mut Context<Self>) {
         let with = self.replace_text.clone();
         let q = self.find_query.clone();
         let cs = self.find_case;
-        let mut n = 0;
+        let (mut n, mut read_only) = (0, 0);
         if let Some(ed) = self.active_editor() {
-            n = ed.replace_all(&q, &with, cs);
+            (n, read_only) = ed.replace_all_visible(&q, &with, cs);
         }
-        if n > 0 {
-            if let Some(t) = self.tabs.get_mut(self.active) {
+        self.find_cur = None;
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            if n > 0 {
                 t.dirty = true;
+            }
+            if read_only > 0 {
+                t.status = format!("replaced {n}; {read_only} read-only match(es) skipped").into();
+            } else if n > 0 {
                 t.status = format!("replaced {n}").into();
             }
         }
@@ -13757,9 +13765,7 @@ impl Docxy {
 
     fn insert_page_break(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.with_editor(window, cx, |e| {
-            e.paste(&Clip {
-                paras: vec![vec![Inline::Break(docxcore::model::BreakKind::Page)]],
-            })
+            e.insert_break(docxcore::model::BreakKind::Page)
         });
     }
 
@@ -18136,11 +18142,289 @@ fn move_vert(ed: &mut Editor, down: bool) {
     };
     for j in candidates {
         if let Block::Paragraph(p) = &ed.doc.body[j] {
-            let len = p.plain_text().chars().count();
+            // Caret offsets are editor offsets: `plain_text()` also counts
+            // what the caret can't reach (tracked changes, footnote refs, …).
+            let len = docxcore::editor::para_text_len(p);
             ed.caret = Caret::at(vec![j], col.min(len));
             ed.clear_selection();
             return;
         }
+    }
+}
+
+/// What the find bar's Replace did (#211).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplaceOne {
+    /// The current match was editable and selected: replaced.
+    Replaced,
+    /// The current match is read-only (in a tracked change, a field's result,
+    /// …): left alone.
+    ReadOnly,
+    /// No current match is selected: nothing replaced.
+    NoMatch,
+}
+
+/// The find bar's step over what the document shows (#211). It steps from
+/// the current match `cur` while that is still the match at its index (the
+/// document has not changed under it) and the editor is still on it (no click
+/// or caret move since, no other tab), else from the caret, or from the
+/// document top with `from_start`. Stepping by index visits every match once,
+/// even several sharing one editor offset. Selects and returns the new
+/// current match.
+fn find_step_in(
+    ed: &mut Editor,
+    query: &str,
+    case_sensitive: bool,
+    cur: Option<(usize, FoundMatch)>,
+    reverse: bool,
+    from_start: bool,
+) -> Option<(usize, FoundMatch)> {
+    if from_start {
+        ed.move_doc_start();
+        ed.clear_selection();
+    }
+    let matches = ed.find_visible(query, case_sensitive);
+    let idx = match cur {
+        Some((i, m)) if !from_start && matches.get(i) == Some(&m) && ed.is_at_found(&m) => {
+            step_found(matches.len(), Some(i), reverse)
+        }
+        _ if from_start => step_found(matches.len(), None, reverse),
+        _ => ed.found_from_caret(&matches, reverse),
+    }?;
+    let m = matches.into_iter().nth(idx)?;
+    ed.select_found(&m);
+    Some((idx, m))
+}
+
+/// Replace the find bar's current match `cur` with `with` only when it is an
+/// editable match and still exactly the selection (#211): a read-only match
+/// is never edited, nor is a selection that is not a match. Then step to the
+/// next match (from the caret, if the editor has left the current one).
+fn replace_one_in(
+    ed: &mut Editor,
+    query: &str,
+    case_sensitive: bool,
+    cur: Option<(usize, FoundMatch)>,
+    with: &str,
+) -> (ReplaceOne, Option<(usize, FoundMatch)>) {
+    let matches = ed.find_visible(query, case_sensitive);
+    let current = cur.filter(|(i, m)| matches.get(*i) == Some(m) && ed.is_at_found(m));
+    match current {
+        Some((i, m)) if m.editable => {
+            ed.replace_current_with(with);
+            // The replaced match is gone, so the next one now has its index
+            // (wrapping), as in the terminal find bar: an adjacent match
+            // (`xxx`) or a read-only one right after it is not skipped.
+            let matches = ed.find_visible(query, case_sensitive);
+            let i = if i < matches.len() { i } else { 0 };
+            let next = matches.into_iter().nth(i).map(|m| (i, m));
+            if let Some((_, m)) = &next {
+                ed.select_found(m);
+            }
+            (ReplaceOne::Replaced, next)
+        }
+        Some((i, m)) => (
+            ReplaceOne::ReadOnly,
+            find_step_in(ed, query, case_sensitive, Some((i, m)), false, false),
+        ),
+        None => (
+            ReplaceOne::NoMatch,
+            find_step_in(ed, query, case_sensitive, None, false, false),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod find_bar_tests {
+    use super::{Caret, Editor, ReplaceOne, find_step_in, replace_one_in};
+
+    /// `x ` + a tracked insertion `x` + ` x`.
+    fn tracked_x() -> Editor {
+        Editor::new(docxcore::load::parse_document_xml(
+            "<w:document><w:body><w:p>\
+             <w:r><w:t xml:space=\"preserve\">x </w:t></w:r>\
+             <w:ins w:id=\"1\" w:author=\"A\"><w:r><w:t>x</w:t></w:r></w:ins>\
+             <w:r><w:t xml:space=\"preserve\"> x</w:t></w:r>\
+             </w:p></w:body></w:document>",
+            &docxcore::load::Relationships::default(),
+        ))
+    }
+
+    fn text(ed: &Editor) -> String {
+        ed.doc.body[0].plain_text()
+    }
+
+    #[test]
+    fn replace_skips_a_read_only_match_and_advances_211() {
+        let mut ed = tracked_x();
+        let cur = find_step_in(&mut ed, "x", false, None, false, true);
+        assert_eq!(cur.as_ref().map(|(i, m)| (*i, m.editable)), Some((0, true)));
+        let cur = find_step_in(&mut ed, "x", false, cur, false, false);
+        assert_eq!(
+            cur.as_ref().map(|(i, m)| (*i, m.editable)),
+            Some((1, false))
+        );
+        let before = ed.doc.body.clone();
+        let (done, cur) = replace_one_in(&mut ed, "x", false, cur, "Z");
+        assert_eq!(done, ReplaceOne::ReadOnly);
+        assert_eq!(ed.doc.body, before, "a read-only match is never edited");
+        assert_eq!(cur.as_ref().map(|(i, _)| *i), Some(2), "Replace moved on");
+        let (done, _) = replace_one_in(&mut ed, "x", false, cur, "Z");
+        assert_eq!(done, ReplaceOne::Replaced);
+        assert_eq!(text(&ed), "x x Z");
+    }
+
+    /// Replace no longer replaces whatever happens to be selected.
+    #[test]
+    fn replace_with_a_selection_that_is_not_a_match_does_nothing_211() {
+        let mut ed = tracked_x();
+        let cur = find_step_in(&mut ed, "x", false, None, false, true);
+        ed.anchor = Some(Caret::at(vec![0], 0));
+        ed.caret = Caret::at(vec![0], 2); // "x ", not the match "x"
+        let before = ed.doc.body.clone();
+        let (done, _) = replace_one_in(&mut ed, "x", false, cur, "Z");
+        assert_eq!(done, ReplaceOne::NoMatch);
+        assert_eq!(ed.doc.body, before);
+        let (done, _) = replace_one_in(&mut ed, "x", false, None, "Z");
+        assert_eq!(done, ReplaceOne::NoMatch, "nor with no current match");
+        assert_eq!(ed.doc.body, before);
+    }
+
+    /// After the caret moves (a click while the bar is open), the next step
+    /// goes from the caret, not from the stale current match (m4 of review r1).
+    #[test]
+    fn a_moved_caret_restarts_stepping_from_the_caret_211() {
+        let mut ed = tracked_x(); // `x` at 0, the tracked `x` at 2 (collapsed), `x` at 3
+        let cur = find_step_in(&mut ed, "x", false, None, false, true);
+        assert_eq!(cur.as_ref().map(|(i, _)| *i), Some(0));
+        ed.clear_selection();
+        ed.caret = Caret::at(vec![0], 2); // clicked just past the tracked `x`
+        let cur = find_step_in(&mut ed, "x", false, cur, false, false);
+        assert_eq!(cur.as_ref().map(|(i, _)| *i), Some(2), "not match 1");
+        // Replace with a stale current match edits nothing and goes on from
+        // the caret.
+        ed.clear_selection();
+        ed.caret = Caret::at(vec![0], 0);
+        let before = ed.doc.body.clone();
+        let (done, cur) = replace_one_in(&mut ed, "x", false, cur, "Z");
+        assert_eq!(done, ReplaceOne::NoMatch);
+        assert_eq!(ed.doc.body, before);
+        assert_eq!(
+            cur.as_ref().map(|(i, _)| *i),
+            Some(1),
+            "the first match after the caret"
+        );
+    }
+
+    /// ` x` over `x [ins x] x`: the first hit mixes an editable space and the
+    /// tracked `x` (read-only, ranged), the second is editable. Stepping both
+    /// ways moves off the mixed match, and Replace on it is a read-only skip
+    /// (r2 M1).
+    #[test]
+    fn stepping_moves_off_a_mixed_read_only_match_211() {
+        let mut ed = tracked_x();
+        let cur = find_step_in(&mut ed, " x", false, None, false, true);
+        let (i, m) = cur.clone().unwrap();
+        assert_eq!(i, 0);
+        assert!(!m.editable && m.start < m.end, "{m:?}");
+        assert!(ed.is_at_found(&m));
+        let next = find_step_in(&mut ed, " x", false, cur.clone(), false, false);
+        assert_eq!(
+            next.as_ref().map(|(i, m)| (*i, m.editable)),
+            Some((1, true))
+        );
+        let back = find_step_in(&mut ed, " x", false, next, false, false);
+        assert_eq!(
+            back.as_ref().map(|(i, _)| *i),
+            Some(0),
+            "wraps to the mixed match"
+        );
+        let prev = find_step_in(&mut ed, " x", false, back.clone(), true, false);
+        assert_eq!(
+            prev.as_ref().map(|(i, _)| *i),
+            Some(1),
+            "Find Previous moves off it"
+        );
+        let on_mixed = find_step_in(&mut ed, " x", false, prev, false, false);
+        assert_eq!(on_mixed.as_ref().map(|(i, _)| *i), Some(0));
+        let before = ed.doc.body.clone();
+        let (done, after) = replace_one_in(&mut ed, " x", false, on_mixed, "Z");
+        assert_eq!(done, ReplaceOne::ReadOnly);
+        assert_eq!(ed.doc.body, before);
+        assert_eq!(after.as_ref().map(|(i, _)| *i), Some(1));
+    }
+
+    /// Replace goes on to the match right after the replaced one, even when
+    /// it is adjacent (r3 p1: `xxx` used to jump from the first `x` to the
+    /// third).
+    #[test]
+    fn replace_visits_an_adjacent_match_211() {
+        let mut ed = Editor::new(docxcore::markdown::from_markdown("xxx\n"));
+        let mut cur = find_step_in(&mut ed, "x", false, None, false, true);
+        for want in ["Zxx", "ZZx", "ZZZ"] {
+            let (done, next) = replace_one_in(&mut ed, "x", false, cur, "Z");
+            assert_eq!(done, ReplaceOne::Replaced);
+            assert_eq!(text(&ed), want);
+            cur = next;
+        }
+        assert_eq!(cur, None, "no matches left");
+    }
+
+    /// Two hits in one deletion share an editor offset: stepping visits both.
+    #[test]
+    fn stepping_visits_matches_that_share_an_offset_211() {
+        let mut ed = Editor::new(docxcore::load::parse_document_xml(
+            "<w:document><w:body><w:p>\
+             <w:del w:id=\"1\" w:author=\"A\"><w:r><w:delText>ab ab</w:delText></w:r></w:del>\
+             </w:p></w:body></w:document>",
+            &docxcore::load::Relationships::default(),
+        ));
+        let mut cur = find_step_in(&mut ed, "ab", false, None, false, true);
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            seen.push(cur.as_ref().map(|(i, _)| *i));
+            cur = find_step_in(&mut ed, "ab", false, cur, false, false);
+        }
+        assert_eq!(seen, [Some(0), Some(1), Some(0)]);
+    }
+}
+
+#[cfg(test)]
+mod move_vert_tests {
+    use super::{Block, Caret, Document, Editor, Inline, Paragraph, move_vert};
+    use docxcore::model::{RevisionKind, RevisionMetadata, Run};
+
+    fn run(text: &str) -> Inline {
+        Inline::Run(Run {
+            text: text.into(),
+            ..Run::default()
+        })
+    }
+
+    /// #213: the column is clamped to the paragraph's editor length, not its
+    /// `plain_text()`, which also counts a tracked insertion's text.
+    #[test]
+    fn move_vert_clamps_to_the_editor_length_213() {
+        let ins = Inline::Revision {
+            kind: RevisionKind::Insert,
+            metadata: RevisionMetadata::default(),
+            raw: String::new(),
+            content: vec![run("inserted")],
+            content_changed: false,
+        };
+        let para = |content| {
+            Block::Paragraph(Paragraph {
+                content,
+                ..Paragraph::default()
+            })
+        };
+        let mut ed = Editor::new(Document {
+            body: vec![para(vec![run("abcdefgh")]), para(vec![run("ab"), ins])],
+        });
+        assert_eq!(ed.doc.body[1].plain_text().chars().count(), 10);
+        ed.caret = Caret::at(vec![0], 8);
+        move_vert(&mut ed, true);
+        assert_eq!(ed.caret, Caret::at(vec![1], 2));
     }
 }
 
@@ -18479,7 +18763,7 @@ fn emit_run(
 /// is the engine's `inline_len` for those pieces; `paragraph_el` asserts it.
 fn caret_advance(inline: &Inline) -> usize {
     match inline {
-        Inline::Run(_) | Inline::Tab(_) | Inline::Break(_) | Inline::Field { .. } => {
+        Inline::Run(_) | Inline::Tab(_) | Inline::Break(..) | Inline::Field { .. } => {
             docxcore::editor::inline_len(inline)
         }
         _ => 0,
@@ -18718,7 +19002,7 @@ fn block_height_est(b: &Block, content_w: f32) -> f32 {
             let breaks = p
                 .content
                 .iter()
-                .filter(|i| matches!(i, Inline::Break(_)))
+                .filter(|i| matches!(i, Inline::Break(..)))
                 .count() as f32;
             let lines = (chars / cpl).ceil().max(1.0) + breaks;
             lines * lh
@@ -18791,7 +19075,7 @@ fn ruler_para_of(tab: &DocTab) -> (EffIndent, Vec<docxcore::model::TabStop>) {
 
 /// Does this block force a page break (a `w:br` of type page)?
 fn has_page_break(b: &Block) -> bool {
-    matches!(b, Block::Paragraph(p) if p.content.iter().any(|i| matches!(i, Inline::Break(docxcore::model::BreakKind::Page))))
+    matches!(b, Block::Paragraph(p) if p.content.iter().any(|i| matches!(i, Inline::Break(docxcore::model::BreakKind::Page, _))))
 }
 
 /// Group top-level block indices into pages by accumulated estimated height,
@@ -19034,7 +19318,7 @@ fn paragraph_el(
         items[from..]
             .iter()
             .map(|(it, _)| &**it)
-            .take_while(|it| !matches!(it, Inline::Tab(_) | Inline::Break(_)))
+            .take_while(|it| !matches!(it, Inline::Tab(_) | Inline::Break(..)))
             .map(&inline_w)
             .sum()
     };
@@ -19098,7 +19382,7 @@ fn paragraph_el(
                 );
                 x += w;
             }
-            Inline::Break(_) => {
+            Inline::Break(..) => {
                 emit_break(&mut spans, &mut idx, &mut caret);
                 x = 0.0; // a hard break restarts the line
             }
@@ -32505,7 +32789,10 @@ mod flat_inlines_tests {
                     text: "F".into(),
                 },
                 Inline::Hyperlink(Hyperlink {
-                    content: vec![Inline::Break(BreakKind::Line), run("toso")],
+                    content: vec![
+                        Inline::Break(BreakKind::Line, RunProps::default()),
+                        run("toso"),
+                    ],
                     ..Hyperlink::default()
                 }),
             ],

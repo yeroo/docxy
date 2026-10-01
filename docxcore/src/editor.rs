@@ -17,10 +17,12 @@ mod sections;
 mod table_design;
 mod table_layout;
 mod tables;
+mod visible;
 pub use flat::{FlatDocument, FlatStory, StoryOffset};
 pub use table_design::BorderCmd;
 pub use table_layout::{AutoFitKind, CellSep, DeleteShift, SortKey, SortKind, SortSpec};
 pub use tables::{CellRange, TablePos};
+pub use visible::{FoundMatch, step_found};
 
 /// A path into the document tree (to a paragraph) plus a character offset.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1087,7 +1089,9 @@ impl Editor {
         Some(clip)
     }
 
-    /// Paste a [`Clip`] at the caret (replacing any selection).
+    /// Paste a [`Clip`] at the caret (replacing any selection). Pasting inside
+    /// a hyperlink splits it, so the pasted content lands between two links
+    /// to the same target, not inside the link (see `split_content`).
     pub fn paste(&mut self, clip: &Clip) {
         if clip.paras.is_empty() {
             return;
@@ -1587,7 +1591,8 @@ impl Editor {
 /// including those inside a hyperlink) is drawn but not searched: a match
 /// there could be neither selected nor replaced. Nor is a field's result: the
 /// field is one unit, [`FIELD_CHAR`] in the searched text. A hyperlink's plain
-/// runs are searched, whatever else the link holds.
+/// runs are searched, whatever else the link holds. The UI's Find also shows
+/// that drawn text, as read-only matches: [`Editor::find_visible`] (#211).
 pub(crate) fn find_all_in_body(body: &[Block], query: &str, case_sensitive: bool) -> Vec<Match> {
     if query.is_empty() {
         return Vec::new();
@@ -1623,7 +1628,17 @@ impl Editor {
     /// The next match relative to the caret (wrapping), forward or backward.
     pub fn find_next(&self, query: &str, case_sensitive: bool, reverse: bool) -> Option<Match> {
         let all = self.find_all(query, case_sensitive);
-        if all.is_empty() {
+        let starts: Vec<(&[usize], usize)> =
+            all.iter().map(|m| (m.path.as_slice(), m.start)).collect();
+        let i = self.index_from_caret(&starts, reverse)?;
+        all.into_iter().nth(i)
+    }
+
+    /// Of positions `starts` (paragraph path, offset) in document order: the
+    /// index of the first one after the caret (in reverse, the last one
+    /// before it), wrapping. `None` when there are none.
+    fn index_from_caret(&self, starts: &[(&[usize], usize)], reverse: bool) -> Option<usize> {
+        if starts.is_empty() {
             return None;
         }
         let paths = all_paragraph_paths(&self.doc.body);
@@ -1633,18 +1648,17 @@ impl Editor {
                 off,
             )
         };
-        let ck = key(&self.caret.path, self.caret.offset);
+        let caret = key(&self.caret.path, self.caret.offset);
         if reverse {
-            all.iter()
-                .rev()
-                .find(|m| key(&m.path, m.start) < ck)
-                .cloned()
-                .or_else(|| all.last().cloned())
+            starts
+                .iter()
+                .rposition(|&(path, off)| key(path, off) < caret)
+                .or(Some(starts.len() - 1))
         } else {
-            all.iter()
-                .find(|m| key(&m.path, m.start) > ck)
-                .cloned()
-                .or_else(|| all.first().cloned())
+            starts
+                .iter()
+                .position(|&(path, off)| key(path, off) > caret)
+                .or(Some(0))
         }
     }
 
@@ -1689,41 +1703,11 @@ impl Editor {
     }
 
     /// Replace every match of `query` with `with`. Returns the number replaced.
+    /// The editor search ([`Editor::find_all`]): agents and automation use
+    /// this; the UI's Replace All uses [`Editor::replace_all_visible`].
     pub fn replace_all(&mut self, query: &str, with: &str, case_sensitive: bool) -> usize {
         let matches = self.find_all(query, case_sensitive);
-        if matches.is_empty() {
-            return 0;
-        }
-        self.checkpoint(EditKind::Structural);
-        // Group consecutive matches by paragraph (find_all already orders them).
-        let mut groups: Vec<(Vec<usize>, Vec<Match>)> = Vec::new();
-        for m in matches {
-            if let Some(last) = groups.last_mut() {
-                if last.0 == m.path {
-                    last.1.push(m);
-                    continue;
-                }
-            }
-            groups.push((m.path.clone(), vec![m]));
-        }
-        let mut count = 0;
-        // Paragraphs back to front too. A text box's paragraphs are addressed
-        // through the host's inline index (`[i, k, j]`, listed after `[i]`),
-        // and an edit to the host can remove an emptied run before the text
-        // box and shift `k`: edit the text box paragraphs first, while their
-        // paths still resolve to the same text box.
-        for (path, mut ms) in groups.into_iter().rev() {
-            ms.sort_by_key(|m| std::cmp::Reverse(m.start)); // back-to-front keeps offsets valid
-            if let Some(p) = para_mut(&mut self.doc.body, &path) {
-                for m in ms {
-                    replace_range_in_content(&mut p.content, m.start, m.end, with);
-                    count += 1;
-                }
-            }
-        }
-        self.clear_selection();
-        self.clamp();
-        count
+        self.replace_matches(matches, with)
     }
 
     /// Set paragraph alignment on the selected paragraphs (or the caret's).
@@ -1984,7 +1968,7 @@ fn collect_inline_revision_positions_at(
                     true,
                 );
             }
-            Inline::Tab(props) => {
+            Inline::Tab(props) | Inline::Break(_, props) => {
                 let end = if forced.is_some() {
                     point.clone()
                 } else {
@@ -2022,8 +2006,7 @@ fn collect_inline_revision_positions_at(
                     end: point.clone(),
                 });
             }
-            Inline::Break(_)
-            | Inline::SmartArt { .. }
+            Inline::SmartArt { .. }
             | Inline::Chart { .. }
             | Inline::Equation { .. }
             | Inline::Field { .. }
@@ -2186,7 +2169,7 @@ pub fn inline_len(i: &Inline) -> usize {
     match i {
         Inline::Run(r) => r.text.chars().count(),
         Inline::Hyperlink(h) => link_runs_len(h) + h.content.iter().map(inline_len).sum::<usize>(),
-        Inline::Tab(_) | Inline::Break(_) => 1,
+        Inline::Tab(_) | Inline::Break(..) => 1,
         Inline::Field { text, .. } => usize::from(!text.is_empty()),
         // Zero-length, invisible in the editor (preserved for save only).
         Inline::SmartArt { .. }
@@ -2221,7 +2204,7 @@ fn push_editor_text(content: &[Inline], out: &mut String) {
                 push_editor_text(&h.content, out);
             }
             Inline::Tab(_) => out.push('\t'),
-            Inline::Break(_) => out.push('\n'),
+            Inline::Break(..) => out.push('\n'),
             Inline::Field { text, .. } => {
                 if !text.is_empty() {
                     out.push(FIELD_CHAR);
@@ -2433,7 +2416,7 @@ fn extract_range(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
                 }
             }
             Inline::Tab(rp) => out.push(Inline::Tab(rp.clone())),
-            Inline::Break(k) => out.push(Inline::Break(*k)),
+            Inline::Break(k, rp) => out.push(Inline::Break(*k, rp.clone())),
             Inline::SmartArt { raw, text } => out.push(Inline::SmartArt {
                 raw: raw.clone(),
                 text: text.clone(),
@@ -2621,7 +2604,7 @@ fn content_insert(content: &mut Vec<Inline>, o: usize, ch: char) {
             }
         },
         Inline::Tab(_)
-        | Inline::Break(_)
+        | Inline::Break(..)
         | Inline::SmartArt { .. }
         | Inline::Chart { .. }
         | Inline::Equation { .. }
@@ -2669,14 +2652,14 @@ fn locate(content: &[Inline], o: usize) -> Option<(usize, usize)> {
     None
 }
 
-/// The formatting an inline hands to text typed next to it: a run's, or a
-/// tab's (a tab is a run in OOXML and keeps its `w:rPr`). Hyperlinks, breaks
-/// and zero-width inlines are not sources; a link's style is not extended to
-/// text typed outside the link.
+/// The formatting an inline hands to text typed next to it: a run's, a tab's
+/// or a break's (each is a run in OOXML and keeps its `w:rPr`). Hyperlinks and
+/// zero-width inlines are not sources; a link's style is not extended to text
+/// typed outside the link.
 fn source_props(inline: &Inline) -> Option<&RunProps> {
     match inline {
         Inline::Run(r) => Some(&r.props),
-        Inline::Tab(props) => Some(props),
+        Inline::Tab(props) | Inline::Break(_, props) => Some(props),
         _ => None,
     }
 }
@@ -2698,15 +2681,14 @@ fn source_from(content: &[Inline], i: usize) -> Option<&RunProps> {
 /// `i` takes, following Word (the formatting of the character before it; at
 /// the paragraph start, of the character after it):
 /// - at the paragraph start (`local == 0`): the nearest source at or after `i`;
-/// - after a tab: the tab's own formatting;
-/// - after a break (which records none): the run or tab right after it, the
-///   rest of the break's own run in a loaded document; failing that, the
-///   nearest source before, then after, the break.
+/// - after a tab or a break: its own formatting (#279);
+/// - after a zero-width inline: the run or tab right after it; failing that,
+///   the nearest source before, then after, it.
 fn typing_props(content: &[Inline], i: usize, local: usize) -> RunProps {
     if local == 0 {
         return source_from(content, i).cloned().unwrap_or_default();
     }
-    if let Inline::Tab(props) = &content[i] {
+    if let Inline::Tab(props) | Inline::Break(_, props) = &content[i] {
         return props.clone();
     }
     content
@@ -2760,7 +2742,7 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
                     }
                 }
                 Inline::Tab(_)
-                | Inline::Break(_)
+                | Inline::Break(..)
                 | Inline::SmartArt { .. }
                 | Inline::Chart { .. }
                 | Inline::Equation { .. }
@@ -2790,6 +2772,11 @@ fn keep_section_mark(kept: &mut ParProps, gone: ParProps) {
     }
 }
 
+/// Split `content` at caret offset `o`: `content` keeps what is before it,
+/// and the rest is returned. A zero-width inline exactly at `o` stays on the
+/// left. A run or a hyperlink that `o` falls strictly inside is split in two:
+/// Enter, paste and Tab inside a link leave a link on each side of what they
+/// insert (#352), while typing inside a link extends it (`content_insert`).
 fn split_content(content: &mut Vec<Inline>, o: usize) -> Vec<Inline> {
     let mut acc = 0;
     for i in 0..content.len() {
@@ -2799,15 +2786,69 @@ fn split_content(content: &mut Vec<Inline>, o: usize) -> Vec<Inline> {
             if local == 0 {
                 return content.split_off(i);
             }
-            if let Inline::Run(r) = &mut content[i] {
-                let b = char_byte(&r.text, local);
-                let right = r.text.split_off(b);
-                let props = r.props.clone();
-                let mut rest = content.split_off(i + 1);
-                rest.insert(0, Inline::Run(Run { text: right, props }));
-                return rest;
+            let right = match &mut content[i] {
+                Inline::Run(r) => {
+                    let b = char_byte(&r.text, local);
+                    let text = r.text.split_off(b);
+                    Inline::Run(Run {
+                        text,
+                        props: r.props.clone(),
+                    })
+                }
+                Inline::Hyperlink(h) => Inline::Hyperlink(split_link(h, local)),
+                _ => return content.split_off(i),
+            };
+            let mut rest = content.split_off(i + 1);
+            rest.insert(0, right);
+            return rest;
+        }
+        acc += l;
+    }
+    Vec::new()
+}
+
+/// Split a hyperlink at `local`, strictly inside its text: `h` keeps what is
+/// before it, and the returned link, with the same target, anchor and
+/// relationship, takes the rest. Each half keeps its own children. A link
+/// loaded from XML rebuilds both halves from `raw`'s opening tag on save, so
+/// each keeps the original `w:hyperlink` attributes.
+fn split_link(h: &mut Hyperlink, local: usize) -> Hyperlink {
+    let (runs, content) = match link_part(h, local) {
+        LinkPart::Runs(local) => (
+            split_runs(&mut h.runs, local),
+            std::mem::take(&mut h.content),
+        ),
+        LinkPart::Content(local) => (Vec::new(), split_content(&mut h.content, local)),
+    };
+    h.content_changed |= h.raw.is_some();
+    Hyperlink {
+        target: h.target.clone(),
+        anchor: h.anchor.clone(),
+        rel_id: h.rel_id.clone(),
+        runs,
+        content,
+        raw: h.raw.clone(),
+        content_changed: h.raw.is_some(),
+    }
+}
+
+/// Split `runs` at char offset `o`: `runs` keeps what is before it, and the
+/// rest is returned.
+fn split_runs(runs: &mut Vec<Run>, o: usize) -> Vec<Run> {
+    let mut acc = 0;
+    for i in 0..runs.len() {
+        let l = runs[i].text.chars().count();
+        if o < acc + l {
+            let local = o - acc;
+            if local == 0 {
+                return runs.split_off(i);
             }
-            return content.split_off(i);
+            let b = char_byte(&runs[i].text, local);
+            let text = runs[i].text.split_off(b);
+            let props = runs[i].props.clone();
+            let mut rest = runs.split_off(i + 1);
+            rest.insert(0, Run { text, props });
+            return rest;
         }
         acc += l;
     }
@@ -2864,14 +2905,14 @@ fn range_all_have_at(
                     return false;
                 }
             }
-            // A tab is a formatted character (see `edit_run_range`).
-            Inline::Tab(props) => {
+            // A tab or a break is a formatted character (see `edit_run_range`).
+            Inline::Tab(props) | Inline::Break(_, props) => {
                 if !check(props, 1, pos, saw) {
                     return false;
                 }
             }
-            // Not formatted characters: a field keeps its own result formatting.
-            Inline::Break(_) | Inline::Field { .. } => *pos += inline_len(inline),
+            // Not a formatted character: a field keeps its own result formatting.
+            Inline::Field { .. } => *pos += inline_len(inline),
             Inline::SmartArt { .. }
             | Inline::Chart { .. }
             | Inline::Equation { .. }
@@ -2983,8 +3024,15 @@ fn edit_run_range_at(
                 out.push(Inline::Tab(rp));
                 *pos += 1;
             }
-            Inline::Break(k) => {
-                out.push(Inline::Break(k));
+            // A break is a run in OOXML too: it takes the formatting like a
+            // tab does, so text typed after it keeps it (#279).
+            Inline::Break(k, rp) => {
+                let rp = if (start..end).contains(pos) {
+                    mid_fn("\n", &rp).props
+                } else {
+                    rp
+                };
+                out.push(Inline::Break(k, rp));
                 *pos += 1;
             }
             // A field (one offset, its result formatting its own) or a
@@ -3085,9 +3133,10 @@ fn run_props_at(content: &[Inline], offset: usize) -> RunProps {
     }
 }
 
-/// Run properties a tab inserted at this caret takes: what typing there would
-/// give, except next to a hyperlink. The tab never lands inside the link, so
-/// it takes the nearest source before the link rather than the link's style.
+/// Run properties a tab (or a break) inserted at this caret takes: what typing
+/// there would give, except next to a hyperlink. The tab never lands inside
+/// the link, so it takes the nearest source before the link rather than the
+/// link's style.
 fn tab_props_at(content: &[Inline], offset: usize) -> RunProps {
     match locate(content, offset) {
         Some((i, _)) if matches!(content[i], Inline::Hyperlink(_)) => {
@@ -3125,10 +3174,21 @@ mod tests {
         ];
         assert!(!run_props_at(&with_tab, 0).bold);
         assert!(!run_props_at(&with_tab, 1).bold);
-        // No run before the break: typing takes the next text run's props (#120).
-        let with_break = vec![Inline::Break(BreakKind::Line), content[1].clone()];
-        assert!(run_props_at(&with_break, 0).bold);
-        assert!(run_props_at(&with_break, 1).bold);
+        // A break is a formatted character, like a tab (#279): typing before
+        // it (the character after) and right after it takes its own props.
+        let with_break = vec![
+            Inline::Break(BreakKind::Line, RunProps::default()),
+            content[1].clone(),
+        ];
+        assert!(!run_props_at(&with_break, 0).bold);
+        assert!(!run_props_at(&with_break, 1).bold);
+        let bold = RunProps {
+            bold: true,
+            ..Default::default()
+        };
+        let with_bold_break = vec![Inline::Break(BreakKind::Line, bold), content[0].clone()];
+        assert!(run_props_at(&with_bold_break, 0).bold);
+        assert!(run_props_at(&with_bold_break, 1).bold);
         let with_empty = vec![
             Inline::Run(Run {
                 text: String::new(),
@@ -3157,7 +3217,7 @@ mod tests {
                 }),
             ],
             vec![
-                Inline::Break(BreakKind::Line),
+                Inline::Break(BreakKind::Line, RunProps::default()),
                 Inline::Run(Run {
                     text: "x".into(),
                     props: bold.clone(),
@@ -3182,9 +3242,9 @@ mod tests {
     }
 
     /// Word's rule next to a tab, break or zero-width inline (#120): a typed
-    /// character takes the formatting of the character before it (a tab's own,
-    /// or for a break the rest of its run after it); at the paragraph start,
-    /// that of the character after it. `run_props_at` must predict exactly what
+    /// character takes the formatting of the character before it (a tab's or a
+    /// break's own, #279); at the paragraph start, that of the character after
+    /// it. `run_props_at` must predict exactly what
     /// the insert produces.
     #[test]
     fn typing_next_to_a_non_run_follows_words_rule_120() {
@@ -3204,26 +3264,42 @@ mod tests {
                 false,
             ),
             (
-                "after a trailing line break",
-                vec![run("Name", bold()), Inline::Break(BreakKind::Line)],
+                "after a trailing bold line break",
+                vec![run("Name", bold()), Inline::Break(BreakKind::Line, bold())],
                 5,
                 true,
             ),
             (
-                "after a break, the rest of its own run follows (r1)",
+                "after a plain break in its own run, before a zero-width inline (#279)",
                 vec![
-                    run("a", plain()),
-                    Inline::Break(BreakKind::Line),
-                    run("b", bold()),
+                    run("Name", bold()),
+                    Inline::Break(BreakKind::Line, plain()),
+                    go_back(),
                 ],
-                2,
+                5,
+                false,
+            ),
+            (
+                "after a bold break, before a plain run (#279)",
+                vec![Inline::Break(BreakKind::Line, bold()), run("x", plain())],
+                1,
                 true,
             ),
             (
-                "after a break, a tab from its own run follows",
+                "after a plain break, the next run does not win (#279)",
                 vec![
                     run("a", plain()),
-                    Inline::Break(BreakKind::Line),
+                    Inline::Break(BreakKind::Line, plain()),
+                    run("b", bold()),
+                ],
+                2,
+                false,
+            ),
+            (
+                "after a bold break, before a bold tab",
+                vec![
+                    run("a", plain()),
+                    Inline::Break(BreakKind::Line, bold()),
                     Inline::Tab(bold()),
                     run("x", bold()),
                 ],
@@ -3271,8 +3347,14 @@ mod tests {
                 false,
             ),
             (
-                "before a leading break, skipped",
-                vec![Inline::Break(BreakKind::Line), run("x", bold())],
+                "before a leading plain break: the break is the character after",
+                vec![Inline::Break(BreakKind::Line, plain()), run("x", bold())],
+                0,
+                false,
+            ),
+            (
+                "before a leading bold break",
+                vec![Inline::Break(BreakKind::Line, bold()), run("x", plain())],
                 0,
                 true,
             ),
@@ -3326,7 +3408,7 @@ mod tests {
         );
         let mut after_break = vec![
             run("a", plain()),
-            Inline::Break(BreakKind::Line),
+            Inline::Break(BreakKind::Line, bold()),
             run("b", bold()),
         ];
         content_insert(&mut after_break, 2, 'z');
@@ -3334,8 +3416,25 @@ mod tests {
             after_break,
             vec![
                 run("a", plain()),
-                Inline::Break(BreakKind::Line),
+                Inline::Break(BreakKind::Line, bold()),
                 run("zb", bold()),
+            ]
+        );
+        // A plain break before a bold run: the typed char is plain, its own
+        // run (#279).
+        let mut differs_break = vec![
+            run("a", plain()),
+            Inline::Break(BreakKind::Line, plain()),
+            run("b", bold()),
+        ];
+        content_insert(&mut differs_break, 2, 'z');
+        assert_eq!(
+            differs_break,
+            vec![
+                run("a", plain()),
+                Inline::Break(BreakKind::Line, plain()),
+                run("z", plain()),
+                run("b", bold()),
             ]
         );
     }
@@ -4128,6 +4227,125 @@ mod tests {
         assert_eq!(top_text(&ed), vec!["one three"]);
     }
 
+    // ---- #279: a break keeps its run's formatting ----
+
+    /// The text run that holds the typed `z`'s formatting.
+    fn typed_props(ed: &Editor) -> RunProps {
+        first_para(ed)
+            .content
+            .iter()
+            .find_map(|i| match i {
+                Inline::Run(r) if r.text.contains('z') => Some(r.props.clone()),
+                _ => None,
+            })
+            .expect("no run holds the typed char")
+    }
+
+    /// The issue's examples, as loaded: typing right after a break takes the
+    /// break's own run formatting (Word's rule), and `run_props_at` predicts
+    /// exactly what the insert gives.
+    #[test]
+    fn typing_after_a_break_takes_its_runs_formatting_279() {
+        let cases = [
+            (
+                "<w:r><w:rPr><w:b/></w:rPr><w:t>Name</w:t></w:r><w:r><w:br/></w:r>\
+                 <w:bookmarkStart w:id=\"0\" w:name=\"_GoBack\"/>",
+                false,
+            ),
+            (
+                "<w:r><w:rPr><w:b/></w:rPr><w:br/></w:r><w:r><w:t>x</w:t></w:r>",
+                true,
+            ),
+        ];
+        for (xml, want_bold) in cases {
+            let mut ed = Editor::new(xml_doc(xml));
+            let after = etext(&ed).chars().position(|c| c == '\n').unwrap() + 1;
+            ed.caret = Caret::at(vec![0], after);
+            let predicted = ed.caret_props();
+            assert_eq!(predicted.bold, want_bold, "{xml}");
+            ed.insert_char('z');
+            assert_eq!(typed_props(&ed), predicted, "{xml}");
+        }
+    }
+
+    /// Formatting a selection that covers a break formats the break too, so
+    /// text typed after it keeps the formatting (#279 r0).
+    #[test]
+    fn bold_over_a_break_reaches_the_break_279() {
+        let mut ed = Editor::new(xml_doc(
+            "<w:r><w:t>Name</w:t><w:br/></w:r><w:bookmarkStart w:id=\"0\" w:name=\"_GoBack\"/>",
+        ));
+        ed.anchor = Some(Caret::at(vec![0], 0));
+        ed.caret = Caret::at(vec![0], 5);
+        ed.toggle_bold();
+        assert!(
+            matches!(&first_para(&ed).content[1], Inline::Break(_, rp) if rp.bold),
+            "{:?}",
+            first_para(&ed).content
+        );
+        ed.clear_selection();
+        ed.caret = Caret::at(vec![0], 5);
+        assert!(ed.caret_props().bold);
+        ed.insert_char('z');
+        assert!(typed_props(&ed).bold);
+        // The whole range now counts as bold, so the toggle turns it off,
+        // break included.
+        ed.anchor = Some(Caret::at(vec![0], 0));
+        ed.caret = Caret::at(vec![0], 5);
+        ed.toggle_bold();
+        assert!(matches!(&first_para(&ed).content[1], Inline::Break(_, rp) if !rp.bold));
+    }
+
+    /// A break inserted in bold text is bold (like a tab), typing after it
+    /// stays bold, and copying it keeps its formatting.
+    #[test]
+    fn an_inserted_break_takes_the_typing_formatting_279() {
+        let mut ed = Editor::new(Document {
+            body: vec![Block::Paragraph(Paragraph {
+                props: ParProps::default(),
+                content: vec![run("Name", bold())],
+            })],
+        });
+        ed.caret = Caret::at(vec![0], 4);
+        ed.insert_break(BreakKind::Page);
+        assert_eq!(
+            first_para(&ed).content[1],
+            Inline::Break(BreakKind::Page, bold())
+        );
+        assert!(ed.caret_props().bold);
+        ed.anchor = Some(Caret::at(vec![0], 4));
+        let clip = ed.copy().unwrap();
+        assert_eq!(
+            clip.paras,
+            vec![vec![Inline::Break(BreakKind::Page, bold())]]
+        );
+        ed.clear_selection();
+        ed.insert_char('z');
+        assert_eq!(etext(&ed), "Name\nz");
+        assert!(typed_props(&ed).bold);
+    }
+
+    /// A break inside a tracked insertion carries the insertion's display cue
+    /// like any run; accepting the insertion clears it from the break too.
+    #[test]
+    fn accepting_an_insertion_clears_its_cue_from_a_break_279() {
+        let mut ed = Editor::new(xml_doc(
+            "<w:r><w:t>a</w:t></w:r><w:ins w:id=\"1\" w:author=\"A\"><w:r><w:br/></w:r></w:ins>",
+        ));
+        fn break_props(content: &[Inline]) -> Option<RunProps> {
+            content.iter().find_map(|i| match i {
+                Inline::Break(_, rp) => Some(rp.clone()),
+                Inline::Revision { content, .. } => break_props(content),
+                _ => None,
+            })
+        }
+        let shown = break_props(&first_para(&ed).content).expect("the inserted break");
+        assert!(shown.underline && shown.revision_cues.underline_added);
+        ed.accept_all_revisions();
+        let accepted = break_props(&first_para(&ed).content).expect("the accepted break");
+        assert_eq!(accepted, RunProps::default());
+    }
+
     // ---- #197: find / replace in editor offsets around zero-width inlines ----
 
     /// A one-paragraph document loaded from `<w:p>` inner XML, so the inlines
@@ -4397,6 +4615,161 @@ mod tests {
             "{:?}",
             link.content
         );
+    }
+
+    // ---- #352: Enter, paste and Tab inside a hyperlink split it ----
+
+    const SIMPLE_LINK_352: &str = "<w:r><w:t xml:space=\"preserve\">a </w:t></w:r>\
+        <w:hyperlink w:anchor=\"top\"><w:r><w:t>Contoso</w:t></w:r></w:hyperlink>";
+
+    /// A complex link: proofing marks at the split point (`Con|toso`) and at
+    /// its end, and an attribute (`w:history`) only its raw XML keeps.
+    const COMPLEX_LINK_352: &str = "<w:r><w:t xml:space=\"preserve\">a </w:t></w:r>\
+        <w:hyperlink w:anchor=\"top\" w:history=\"1\"><w:r><w:t>Con</w:t></w:r>\
+        <w:proofErr w:type=\"spellStart\"/><w:r><w:t>toso</w:t></w:r>\
+        <w:proofErr w:type=\"spellEnd\"/></w:hyperlink>";
+
+    fn link_text(h: &Hyperlink) -> String {
+        editor_text(&[Inline::Hyperlink(h.clone())])
+    }
+
+    fn holds_raw(h: &Hyperlink, needle: &str) -> bool {
+        h.content
+            .iter()
+            .any(|i| matches!(i, Inline::Raw(raw) if raw.contains(needle)))
+    }
+
+    /// Every paragraph's text after a save and reload.
+    fn reloaded_texts(ed: &Editor) -> Vec<String> {
+        let xml = crate::serialize::document_to_xml(&ed.doc);
+        let back = crate::load::parse_document_xml(&xml, &crate::load::Relationships::default());
+        back.body.iter().map(Block::plain_text).collect()
+    }
+
+    /// Checks shared by both halves of a split complex link: each keeps the
+    /// original `w:hyperlink` attributes on save, the proofing mark at the
+    /// split point goes left and the one at the end stays right, and the
+    /// saved XML reloads to the same text.
+    fn check_complex_halves(ed: &Editor, left: &Hyperlink, right: &Hyperlink) {
+        let xml = crate::serialize::document_to_xml(&ed.doc);
+        assert_eq!(
+            xml.matches("<w:hyperlink w:anchor=\"top\" w:history=\"1\">")
+                .count(),
+            2,
+            "{xml}"
+        );
+        assert!(left.content_changed && right.content_changed);
+        assert!(holds_raw(left, "spellStart") && !holds_raw(left, "spellEnd"));
+        assert!(holds_raw(right, "spellEnd") && !holds_raw(right, "spellStart"));
+        let before: Vec<String> = ed.doc.body.iter().map(Block::plain_text).collect();
+        assert_eq!(reloaded_texts(ed), before);
+    }
+
+    #[test]
+    fn enter_inside_a_link_splits_it_352() {
+        for xml in [SIMPLE_LINK_352, COMPLEX_LINK_352] {
+            let mut ed = Editor::new(xml_doc(xml));
+            ed.caret = Caret::at(vec![0], 5); // a Con|toso
+            ed.insert_newline();
+            let Block::Paragraph(p0) = &ed.doc.body[0] else {
+                panic!()
+            };
+            let Block::Paragraph(p1) = &ed.doc.body[1] else {
+                panic!()
+            };
+            let (left, right) = (link_at(&p0.content, 1), link_at(&p1.content, 0));
+            assert_eq!(p0.content.len(), 2, "{xml}");
+            assert_eq!(
+                (link_text(left), link_text(right)),
+                ("Con".into(), "toso".into())
+            );
+            assert_eq!(left.anchor.as_deref(), Some("top"));
+            assert_eq!(right.anchor.as_deref(), Some("top"));
+            assert_eq!(ed.caret, Caret::at(vec![1], 0));
+            if xml == COMPLEX_LINK_352 {
+                check_complex_halves(&ed, left, right);
+            }
+        }
+    }
+
+    #[test]
+    fn pasting_inside_a_link_lands_between_its_halves_352() {
+        for xml in [SIMPLE_LINK_352, COMPLEX_LINK_352] {
+            let mut ed = Editor::new(xml_doc(xml));
+            ed.caret = Caret::at(vec![0], 5);
+            ed.paste(&Clip {
+                paras: vec![vec![run("X", RunProps::default())]],
+            });
+            assert_eq!(etext(&ed), "a ConXtoso", "{xml}");
+            assert_eq!(ed.caret, Caret::at(vec![0], 6));
+            assert_eq!(
+                etext(&ed).chars().nth(5),
+                Some('X'),
+                "the char before the caret"
+            );
+            let content = &first_para(&ed).content;
+            assert_eq!(content.len(), 4, "{content:?}");
+            assert!(matches!(&content[2], Inline::Run(r) if r.text == "X"));
+            let (left, right) = (link_at(content, 1), link_at(content, 3));
+            assert_eq!(
+                (link_text(left), link_text(right)),
+                ("Con".into(), "toso".into())
+            );
+            assert_eq!(left.anchor, right.anchor);
+            if xml == COMPLEX_LINK_352 {
+                check_complex_halves(&ed, left, right);
+            }
+        }
+    }
+
+    #[test]
+    fn a_tab_inside_a_link_lands_between_its_halves_352() {
+        for xml in [SIMPLE_LINK_352, COMPLEX_LINK_352] {
+            let mut ed = Editor::new(xml_doc(xml));
+            ed.caret = Caret::at(vec![0], 5);
+            ed.insert_tab();
+            assert_eq!(etext(&ed), "a Con\ttoso", "{xml}");
+            assert_eq!(ed.caret, Caret::at(vec![0], 6));
+            let content = &first_para(&ed).content;
+            assert!(matches!(content[2], Inline::Tab(_)), "{content:?}");
+            let (left, right) = (link_at(content, 1), link_at(content, 3));
+            assert_eq!(
+                (link_text(left), link_text(right)),
+                ("Con".into(), "toso".into())
+            );
+            if xml == COMPLEX_LINK_352 {
+                check_complex_halves(&ed, left, right);
+            }
+        }
+    }
+
+    /// A link with both plain `runs` and other `content` splits on the side
+    /// the caret is in (`link_part`).
+    #[test]
+    fn a_link_with_runs_and_content_splits_on_the_carets_side_352() {
+        let link = || {
+            vec![Inline::Hyperlink(Hyperlink {
+                anchor: Some("top".into()),
+                runs: vec![Run {
+                    text: "ab".into(),
+                    props: RunProps::default(),
+                }],
+                content: vec![run("cd", RunProps::default())],
+                ..Default::default()
+            })]
+        };
+        for (at, left, right) in [(1, "a", "bcd"), (2, "ab", "cd"), (3, "abc", "d")] {
+            let mut content = link();
+            let rest = split_content(&mut content, at);
+            assert_eq!(editor_text(&content), left, "split at {at}");
+            assert_eq!(editor_text(&rest), right, "split at {at}");
+            let (l, r) = (link_at(&content, 0), link_at(&rest, 0));
+            assert_eq!(l.anchor, r.anchor);
+            assert!(
+                !l.content_changed && !r.content_changed,
+                "no raw, nothing to rebuild"
+            );
+        }
     }
 
     #[test]
@@ -4978,7 +5351,7 @@ mod tests {
             match i {
                 Inline::Run(_) => "Run",
                 Inline::Hyperlink(_) => "Hyperlink",
-                Inline::Break(_) => "Break",
+                Inline::Break(..) => "Break",
                 Inline::Tab(_) => "Tab",
                 Inline::SmartArt { .. } => "SmartArt",
                 Inline::Chart { .. } => "Chart",
@@ -5022,7 +5395,7 @@ mod tests {
                     },
                     Inline::Hyperlink(Hyperlink {
                         content: vec![
-                            Inline::Break(BreakKind::Line),
+                            Inline::Break(BreakKind::Line, RunProps::default()),
                             run("nested", RunProps::default()),
                         ],
                         ..Default::default()
@@ -5030,7 +5403,7 @@ mod tests {
                 ],
                 ..Default::default()
             }),
-            Inline::Break(BreakKind::Line),
+            Inline::Break(BreakKind::Line, RunProps::default()),
             Inline::Tab(RunProps::default()),
             Inline::SmartArt {
                 raw: String::new(),
@@ -5094,6 +5467,43 @@ mod tests {
             all.iter().map(inline_len).sum::<usize>()
         );
         assert_eq!(editor_text(&all[3..4]), "mixed\t\u{FFFC}\nnested");
+    }
+
+    /// #211: the UI's visible walk and the editor agree on every offset. Its
+    /// editable chars are exactly the editor's text minus field units, each
+    /// at its own offset, and a field's result spans exactly its unit. Adding
+    /// an `Inline` variant without teaching both walks fails here.
+    #[test]
+    fn the_visible_walk_keeps_the_editors_offsets_211() {
+        let all = every_inline();
+        let etext: Vec<char> = editor_text(&all).chars().collect();
+        let shown: Vec<_> = visible::shown_segments(&all)
+            .into_iter()
+            .flatten()
+            .collect();
+        let editable: Vec<(usize, char)> = shown
+            .iter()
+            .filter(|s| s.editable)
+            .inspect(|s| assert_eq!(s.end, s.start + 1, "{s:?}"))
+            .map(|s| (s.start, s.ch))
+            .collect();
+        let expected: Vec<(usize, char)> = etext
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, c)| *c != FIELD_CHAR)
+            .collect();
+        assert_eq!(editable, expected);
+        for s in shown.iter().filter(|s| !s.editable && s.end > s.start) {
+            assert_eq!(s.end, s.start + 1, "{s:?}");
+            assert_eq!(etext[s.start], FIELD_CHAR, "{s:?} is a field's unit");
+        }
+        // What is drawn but not editable: field results, a tracked change's
+        // runs, SmartArt node text, an equation, a footnote mark. Not a
+        // chart's title (charts are not searched) or the text box's text
+        // (searched by its own path).
+        let read_only: String = shown.iter().filter(|s| !s.editable).map(|s| s.ch).collect();
+        assert_eq!(read_only, "Frevsmartx+yresultadded⁷");
     }
 
     #[test]

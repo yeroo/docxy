@@ -1081,6 +1081,54 @@ def build():
             resources_xml=resources_28,
             calendars=[standard_28, alice_28, bob_28, carol_28]))
 
+    # 29 — Project 2024 (#779) holds a zero-duration SNET/FNET milestone at
+    # its constraint instant, at a period end, at a working start, and inside
+    # a non-working gap.
+    add("29-milestone-snet-fnet-instants.xml",
+        ["milestone", "constraint", "constraint-fnet", "constraint-snet",
+         "link", "link-fs"],
+        "Project 2024 (#779): SNET/FNET milestones hold their constraint "
+        "instant, at a period end and inside a non-working gap.",
+        project("milestone-snet-fnet-instants", "\n".join([
+            task(1, "A", 5 * D, dt(2), dt(6, "17:00:00"), **CRIT),
+            task(2, "M1 FS A, FNET Fri 17", 0, dt(6, "17:00:00"), dt(6, "17:00:00"),
+                 **CRIT, milestone=True, preds=[(1, FS, 0)],
+                 ctype=FNET, cdate=dt(6, "17:00:00")),
+            task(3, "B", 2 * D, dt(2), dt(3, "17:00:00"), slack=1440, critical=False),
+            task(4, "M2 FS B, FNET Fri 17", 0, dt(6, "17:00:00"), dt(6, "17:00:00"),
+                 **CRIT, milestone=True, preds=[(3, FS, 0)],
+                 ctype=FNET, cdate=dt(6, "17:00:00")),
+            task(5, "M3 FNET Fri 17", 0, dt(6, "17:00:00"), dt(6, "17:00:00"),
+                 **CRIT, milestone=True, ctype=FNET, cdate=dt(6, "17:00:00")),
+            task(6, "M4 FNET Mon 08", 0, dt(9), dt(9),
+                 **CRIT, milestone=True, ctype=FNET, cdate=dt(9)),
+            task(7, "M5 FNET Wed 12", 0, dt(4, "12:00:00"), dt(4, "12:00:00"),
+                 slack=1200, critical=False, milestone=True,
+                 ctype=FNET, cdate=dt(4, "12:00:00")),
+            task(8, "M6 FNET Wed 13", 0, dt(4, "13:00:00"), dt(4, "13:00:00"),
+                 slack=1200, critical=False, milestone=True,
+                 ctype=FNET, cdate=dt(4, "13:00:00")),
+            task(9, "M7 FNET Wed 19", 0, dt(4, "19:00:00"), dt(4, "19:00:00"),
+                 slack=960, critical=False, milestone=True,
+                 ctype=FNET, cdate=dt(4, "19:00:00")),
+            task(10, "M8 FNET Sat 10", 0, dt(7, "10:00:00"), dt(7, "10:00:00"),
+                 **CRIT, milestone=True, ctype=FNET, cdate=dt(7, "10:00:00")),
+            task(11, "M9 FNET Wed 10", 0, dt(4, "10:00:00"), dt(4, "10:00:00"),
+                 slack=1320, critical=False, milestone=True,
+                 ctype=FNET, cdate=dt(4, "10:00:00")),
+            task(12, "M10 SNET Wed 19", 0, dt(4, "19:00:00"), dt(4, "19:00:00"),
+                 slack=960, critical=False, milestone=True,
+                 ctype=SNET, cdate=dt(4, "19:00:00")),
+            task(13, "M11 SNET Fri 17", 0, dt(6, "17:00:00"), dt(6, "17:00:00"),
+                 **CRIT, milestone=True, ctype=SNET, cdate=dt(6, "17:00:00")),
+            task(14, "M12 FNET Wed 07", 0, dt(4, "07:00:00"), dt(4, "07:00:00"),
+                 slack=1440, critical=False, milestone=True,
+                 ctype=FNET, cdate=dt(4, "07:00:00")),
+            task(15, "M13 FNET Wed 12:30", 0, dt(4, "12:30:00"), dt(4, "12:30:00"),
+                 slack=1200, critical=False, milestone=True,
+                 ctype=FNET, cdate=dt(4, "12:30:00")),
+        ])))
+
     manifest = {
         "anchor": "2026-03-02T08:00:00",
         "calendar": "Standard 8h/day Mon-Fri (08:00-12:00, 13:00-17:00)",

@@ -123,6 +123,27 @@ pub struct MppTaskFields {
     /// absent. Project does not store a task-local bit for this field.
     pub over_allocated: Option<bool>,
     pub milestone: Option<bool>,
+    /// Keyed Var2Data text and timestamps located by the paired
+    /// `task-extra` cases (corpus/tools/gen_mpp_task_extra_cases.py): absent
+    /// keys are absent elements in Project's XML.
+    pub contact: Option<String>,
+    pub wbs_level: Option<String>,
+    pub pre_leveled_start: Option<String>,
+    pub pre_leveled_finish: Option<String>,
+    pub commitment_start: Option<String>,
+    pub commitment_finish: Option<String>,
+    /// Project exports CommitmentType on every row; no key means 0.
+    pub commitment_type: Option<i32>,
+    /// Fixed2Meta +9 bit 0x10 (task-extra/e3-display-as-summary).
+    pub display_as_summary: Option<bool>,
+    /// Project keeps Publish on the task's assignment rows, the unassigned
+    /// placeholder included, not on the task: a task is published when it has
+    /// assignments and all are marked. Summaries normally have none (a direct
+    /// summary assignment counts like any other). Mixed assignment marks, or
+    /// an unreadable assignment table, leave it absent.
+    pub is_published: Option<bool>,
+    /// The inserted project's path, from the project Props subproject table.
+    pub subproject_name: Option<String>,
 }
 
 /// A task's recorded progress, work and cost, in MSPDI's units: whole minutes

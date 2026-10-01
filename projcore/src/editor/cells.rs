@@ -79,19 +79,20 @@ impl Editor {
 
     /// Set a task's start to a typed day. A manual task moves there, at the
     /// day's first working time, keeping its duration; an auto task gets a
-    /// Start-No-Earlier-Than constraint on that day. A blank row is judged as
-    /// the task the edit makes it (manual in a plan whose new tasks are).
+    /// Start-No-Earlier-Than constraint at that day's first working time. A
+    /// blank row is judged as the task the edit makes it (manual in a plan
+    /// whose new tasks are).
     pub fn set_start(&mut self, uid: i32, day: DateTime) -> Result<(), String> {
         let i = self.index(uid)?;
         if self.proj.tasks[i].is_external_leaf() {
             return Err(EXTERNAL_TASK_DATES.into());
         }
-        let task = &self.row_as_edited(i);
+        let task = self.row_as_edited(i);
+        let start = day_start(&self.proj, &task, day);
         if !task.manual {
-            return self.set_start_at(uid, day);
+            return self.set_start_at(uid, start);
         }
         self.validate_pinned_day(day)?;
-        let start = day_start(&self.proj, task, day);
         self.set_start_at(uid, start)
     }
 
@@ -926,7 +927,7 @@ pub(super) use crate::assign::task_calendar;
 /// Start of a typed date: its first working time, or 08:00 (Project's default
 /// start time) on a non-working day or holiday, where a manual task may still
 /// start.
-fn day_start(proj: &Project, task: &Task, date: DateTime) -> DateTime {
+pub(crate) fn day_start(proj: &Project, task: &Task, date: DateTime) -> DateTime {
     let from = task_calendar(proj, task)
         .day(date.day_number())
         .first()

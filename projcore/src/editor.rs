@@ -39,7 +39,7 @@ pub use fields::{
 // keeps links shown in a fallback unit; the plain parser stays internal.
 #[cfg(test)]
 use cells::parse_predecessors;
-use cells::{bracket_units, parse_resource_token, same_shown_units};
+use cells::{bracket_units, day_start, parse_resource_token, same_shown_units};
 mod moving;
 mod outline;
 use outline::subtree_end;
@@ -1089,7 +1089,25 @@ impl Editor {
 
     pub fn set_constraint(&mut self, uid: i32, text: &str) -> Result<(), String> {
         let (constraint, constraint_date) = parse_constraint(text)?;
-        self.set_constraint_typed(uid, constraint, constraint_date)
+        // A date typed without a time names a day: SNET/FNET take its first
+        // working time, the instant a milestone then holds (#779). An
+        // explicit time keeps its instant; other constraint types are
+        // untouched.
+        let has_time = text
+            .split_whitespace()
+            .nth(1)
+            .is_some_and(|token| token.contains('T'));
+        let date = match (constraint, constraint_date) {
+            (
+                ConstraintType::StartNoEarlierThan | ConstraintType::FinishNoEarlierThan,
+                Some(date),
+            ) if !has_time => {
+                let task = self.row_as_edited(self.index(uid)?);
+                Some(day_start(&self.proj, &task, date))
+            }
+            (_, date) => date,
+        };
+        self.set_constraint_typed(uid, constraint, date)
     }
 
     pub fn assign_resource(&mut self, uid: i32, name: &str) -> Result<AssignOutcome, String> {

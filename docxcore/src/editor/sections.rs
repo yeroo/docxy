@@ -8,7 +8,7 @@
 //! in. Every edit here is one undo step on the editor's document, which is
 //! what the page view and Save read.
 
-use super::{Caret, EditKind, Editor, split_content};
+use super::{Caret, EditKind, Editor, resolve_para, split_content, tab_props_at};
 use crate::model::{Block, BreakKind, Inline, Paragraph, SectionProperties};
 use crate::sect::{SectionSetup, SectionStart};
 
@@ -232,9 +232,19 @@ impl Editor {
     }
 
     /// Insert a page, column or clearing line break at the caret.
+    ///
+    /// Like a tab (see [`Editor::insert_tab`]), the break takes the formatting
+    /// typing at the caret would, except next to a hyperlink, and text typed
+    /// after it keeps that formatting (#279).
     pub fn insert_break(&mut self, kind: BreakKind) {
+        if self.has_selection() {
+            self.delete_selection();
+        }
+        let props = resolve_para(&self.doc.body, &self.caret.path)
+            .map(|p| tab_props_at(&p.content, self.caret.offset))
+            .unwrap_or_default();
         self.paste(&Clip {
-            paras: vec![vec![Inline::Break(kind)]],
+            paras: vec![vec![Inline::Break(kind, props)]],
         });
     }
 
@@ -484,9 +494,10 @@ mod tests {
         let Block::Paragraph(p) = &e.doc.body[1] else {
             panic!()
         };
-        assert!(p.content.contains(&Inline::Break(BreakKind::Clear(
-            crate::model::ClearKind::All
-        ))));
+        assert!(p.content.iter().any(|i| matches!(
+            i,
+            Inline::Break(BreakKind::Clear(crate::model::ClearKind::All), _)
+        )));
     }
 
     #[test]

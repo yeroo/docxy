@@ -23,6 +23,8 @@
 //! and elapsed lags, issue #104), whose plan and values Project itself
 //! produced (`corpus/tools/gen_mpp_lag_cases.py`), and file 27 (manual
 //! summaries, issue #124), and file 28 (alternate work weeks, issue #218).
+//! File 29 (SNET/FNET milestone instants, issue #779) was likewise checked
+//! against Project 2024 by `verify_mspdi_project.py`, with 0 mismatches.
 //! Slack invariants below also check
 //! properties that do not depend on the embedded expectations.
 

@@ -195,7 +195,7 @@ for the two ways a tab's semantics differ from a terminal instance.
   sidesteps the versioned-path problem entirely — see
   [docs/agent-control.md](../docs/agent-control.md#mcp-native-tools-in-claude-code).
 - **Tools** — the bundled server (`serverInfo.name` `"offxy"`) exposes exactly
-  the tool surface the terminal apps' own `docxy --mcp`/`xlsxy --mcp` do (64
+  the tool surface the terminal apps' own `docxy --mcp`/`xlsxy --mcp` do (66
   tools total): `docxy_list`, `docxy_new`, `docxy_status`, `docxy_outline`,
   `docxy_read`, `docxy_find`, `docxy_replace_range`, `docxy_insert`,
   `docxy_append`, `docxy_save`, `docxy_export`, `docxy_export_pdf`,
@@ -220,9 +220,13 @@ for the two ways a tab's semantics differ from a terminal instance.
   `xlsxy_sheet_add`, `xlsxy_sheet_remove`, `xlsxy_sheet_rename`,
   `xlsxy_row_insert`, `xlsxy_row_delete`, `xlsxy_col_insert`,
   `xlsxy_col_delete`, `xlsxy_eval`, `xlsxy_stats`, `xlsxy_charts`,
-  `xlsxy_pivots`, `xlsxy_format`, `xlsxy_col_width`, `xlsxy_pivot_create`
-  (33) — `xlsxy_pivot_create` builds a REAL, persistent workbook pivot table
-  on a new sheet (unlike the read-only, ad-hoc `xlsxy_pivot`). It's
+  `xlsxy_pivots`, `xlsxy_format`, `xlsxy_col_width`, `xlsxy_pivot_create`,
+  `xlsxy_properties`, `xlsxy_set_properties`
+  (35) — `xlsxy_pivot_create` builds a REAL, persistent workbook pivot table
+  on a new sheet (unlike the read-only, ad-hoc `xlsxy_pivot`), and
+  `xlsxy_properties`/`xlsxy_set_properties` read and set the document
+  properties (File › Info) of a terminal `xlsxy` (a VS Code tab answers them
+  with "unknown verb" for now). It's
   a thin bridge — it opens no document itself, only forwards to whichever
   `docxy`/`xlsxy` instance (a VS Code tab or a terminal pane) is already
   running (the `_new` tools are the exception: they create the file on disk

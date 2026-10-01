@@ -25,6 +25,7 @@ pub mod oleps;
 mod overalloc;
 pub mod project;
 mod props;
+mod publish;
 mod rscdecode;
 mod rtf;
 mod rtf_codepage;
