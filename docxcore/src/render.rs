@@ -1365,7 +1365,7 @@ fn following_inline_width(items: &[FlatInline<'_>], from: usize) -> usize {
 
 /// A note reference's display marker: the id in Unicode superscript digits, so a
 /// footnote/endnote anchor reads as a superscript number in the terminal.
-fn superscript(n: i32) -> String {
+pub(crate) fn superscript(n: i32) -> String {
     n.to_string()
         .chars()
         .map(|c| match c {
@@ -2436,6 +2436,13 @@ fn emit_block_item(
         }
         _ => {}
     }
+}
+
+/// Whether this raw run is drawn as an image box on its own lines (a larger
+/// image), splitting the paragraph's inline text around it, rather than as a
+/// small picture flowing in the text.
+pub(crate) fn is_block_image(raw: &str) -> bool {
+    inline_image(raw).is_none() && raw_image_extent(raw).is_some()
 }
 
 /// Parse an embedded image's display size in pixels (96 dpi) from raw run XML.

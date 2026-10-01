@@ -17,10 +17,12 @@ mod sections;
 mod table_design;
 mod table_layout;
 mod tables;
+mod visible;
 pub use flat::{FlatDocument, FlatStory, StoryOffset};
 pub use table_design::BorderCmd;
 pub use table_layout::{AutoFitKind, CellSep, DeleteShift, SortKey, SortKind, SortSpec};
 pub use tables::{CellRange, TablePos};
+pub use visible::{FoundMatch, step_found};
 
 /// A path into the document tree (to a paragraph) plus a character offset.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1589,7 +1591,8 @@ impl Editor {
 /// including those inside a hyperlink) is drawn but not searched: a match
 /// there could be neither selected nor replaced. Nor is a field's result: the
 /// field is one unit, [`FIELD_CHAR`] in the searched text. A hyperlink's plain
-/// runs are searched, whatever else the link holds.
+/// runs are searched, whatever else the link holds. The UI's Find also shows
+/// that drawn text, as read-only matches: [`Editor::find_visible`] (#211).
 pub(crate) fn find_all_in_body(body: &[Block], query: &str, case_sensitive: bool) -> Vec<Match> {
     if query.is_empty() {
         return Vec::new();
@@ -1691,41 +1694,11 @@ impl Editor {
     }
 
     /// Replace every match of `query` with `with`. Returns the number replaced.
+    /// The editor search ([`Editor::find_all`]): agents and automation use
+    /// this; the UI's Replace All uses [`Editor::replace_all_visible`].
     pub fn replace_all(&mut self, query: &str, with: &str, case_sensitive: bool) -> usize {
         let matches = self.find_all(query, case_sensitive);
-        if matches.is_empty() {
-            return 0;
-        }
-        self.checkpoint(EditKind::Structural);
-        // Group consecutive matches by paragraph (find_all already orders them).
-        let mut groups: Vec<(Vec<usize>, Vec<Match>)> = Vec::new();
-        for m in matches {
-            if let Some(last) = groups.last_mut() {
-                if last.0 == m.path {
-                    last.1.push(m);
-                    continue;
-                }
-            }
-            groups.push((m.path.clone(), vec![m]));
-        }
-        let mut count = 0;
-        // Paragraphs back to front too. A text box's paragraphs are addressed
-        // through the host's inline index (`[i, k, j]`, listed after `[i]`),
-        // and an edit to the host can remove an emptied run before the text
-        // box and shift `k`: edit the text box paragraphs first, while their
-        // paths still resolve to the same text box.
-        for (path, mut ms) in groups.into_iter().rev() {
-            ms.sort_by_key(|m| std::cmp::Reverse(m.start)); // back-to-front keeps offsets valid
-            if let Some(p) = para_mut(&mut self.doc.body, &path) {
-                for m in ms {
-                    replace_range_in_content(&mut p.content, m.start, m.end, with);
-                    count += 1;
-                }
-            }
-        }
-        self.clear_selection();
-        self.clamp();
-        count
+        self.replace_matches(matches, with)
     }
 
     /// Set paragraph alignment on the selected paragraphs (or the caret's).
@@ -5485,6 +5458,43 @@ mod tests {
             all.iter().map(inline_len).sum::<usize>()
         );
         assert_eq!(editor_text(&all[3..4]), "mixed\t\u{FFFC}\nnested");
+    }
+
+    /// #211: the UI's visible walk and the editor agree on every offset. Its
+    /// editable chars are exactly the editor's text minus field units, each
+    /// at its own offset, and a field's result spans exactly its unit. Adding
+    /// an `Inline` variant without teaching both walks fails here.
+    #[test]
+    fn the_visible_walk_keeps_the_editors_offsets_211() {
+        let all = every_inline();
+        let etext: Vec<char> = editor_text(&all).chars().collect();
+        let shown: Vec<_> = visible::shown_segments(&all)
+            .into_iter()
+            .flatten()
+            .collect();
+        let editable: Vec<(usize, char)> = shown
+            .iter()
+            .filter(|s| s.editable)
+            .inspect(|s| assert_eq!(s.end, s.start + 1, "{s:?}"))
+            .map(|s| (s.start, s.ch))
+            .collect();
+        let expected: Vec<(usize, char)> = etext
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, c)| *c != FIELD_CHAR)
+            .collect();
+        assert_eq!(editable, expected);
+        for s in shown.iter().filter(|s| !s.editable && s.end > s.start) {
+            assert_eq!(s.end, s.start + 1, "{s:?}");
+            assert_eq!(etext[s.start], FIELD_CHAR, "{s:?} is a field's unit");
+        }
+        // What is drawn but not editable: field results, a tracked change's
+        // runs, SmartArt node text, an equation, a footnote mark. Not a
+        // chart's title (charts are not searched) or the text box's text
+        // (searched by its own path).
+        let read_only: String = shown.iter().filter(|s| !s.editable).map(|s| s.ch).collect();
+        assert_eq!(read_only, "Frevsmartx+yresultadded⁷");
     }
 
     #[test]

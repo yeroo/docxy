@@ -36,7 +36,7 @@ use std::process::ExitCode;
 // for the `impl backstage::BackstageHost for App` call sites below.
 use backstage::BackstageHost as _;
 
-use docxcore::editor::{Caret, Clip, Editor, Match};
+use docxcore::editor::{Caret, Clip, Editor, FoundMatch};
 use docxcore::export::{PdfOptions, to_pdf};
 #[cfg(test)]
 use docxcore::load::parse_header_footer;
@@ -498,7 +498,7 @@ struct FindState {
     /// `None` = find-only; `Some` = replace mode (the replacement text).
     replacement: Option<String>,
     editing_replacement: bool,
-    matches: Vec<Match>,
+    matches: Vec<FoundMatch>,
     idx: usize,
 }
 
@@ -4476,15 +4476,18 @@ impl App {
         self.dirty = true;
     }
 
+    /// Re-run the find bar's search. It searches what the document shows,
+    /// so a match can be read-only (in a tracked change, a field's result, …):
+    /// see [`docxcore::editor::FoundMatch`].
     fn find_recompute(&mut self) {
         let Some((query, idx0)) = self.find.as_ref().map(|f| (f.query.clone(), f.idx)) else {
             return;
         };
-        let matches = self.editor.find_all(&query, false);
+        let matches = self.editor.find_visible(&query, false);
         let idx = if idx0 < matches.len() { idx0 } else { 0 };
         if let Some(m) = matches.get(idx) {
             let m = m.clone();
-            self.editor.select_match(&m);
+            self.editor.select_found(&m);
             self.clear_visual_hint();
         } else {
             self.editor.clear_selection();
@@ -4503,7 +4506,7 @@ impl App {
         };
         let nidx = (idx as i64 + delta).rem_euclid(len as i64) as usize;
         let m = self.find.as_ref().unwrap().matches[nidx].clone();
-        self.editor.select_match(&m);
+        self.editor.select_found(&m);
         if let Some(f) = &mut self.find {
             f.idx = nidx;
         }
@@ -4546,9 +4549,13 @@ impl App {
                     if !self.mutation_allowed(protection::MutationKind::Content) {
                         return false;
                     }
-                    let n = self.editor.replace_all(&q, &repl, false);
-                    self.modified = true;
-                    self.status = Some(format!("Replaced {n}"));
+                    let (n, read_only) = self.editor.replace_all_visible(&q, &repl, false);
+                    self.modified |= n > 0;
+                    self.status = Some(if read_only > 0 {
+                        format!("Replaced {n}; {read_only} read-only match(es) skipped")
+                    } else {
+                        format!("Replaced {n}")
+                    });
                     self.find_recompute();
                 }
             }
@@ -4562,14 +4569,27 @@ impl App {
                     if !self.mutation_allowed(protection::MutationKind::Content) {
                         return false;
                     }
-                    let repl = self
-                        .find
-                        .as_ref()
-                        .and_then(|f| f.replacement.clone())
-                        .unwrap_or_default();
-                    self.editor.replace_current_with(&repl);
-                    self.modified = true;
-                    self.find_recompute();
+                    let (repl, current) = match &self.find {
+                        Some(f) => (
+                            f.replacement.clone().unwrap_or_default(),
+                            f.matches.get(f.idx).cloned(),
+                        ),
+                        None => (String::new(), None),
+                    };
+                    // Only an editable match that is still selected is
+                    // replaced; a read-only one is skipped.
+                    match current {
+                        Some(m) if m.editable && self.editor.selection_is(&m) => {
+                            self.editor.replace_current_with(&repl);
+                            self.modified = true;
+                            self.find_recompute();
+                        }
+                        Some(_) => {
+                            self.status = Some("Read-only match skipped".to_string());
+                            self.find_step(1);
+                        }
+                        None => {}
+                    }
                 } else {
                     self.find_step(1);
                 }
@@ -5721,9 +5741,15 @@ impl App {
         } else if let Some(f) = &self.find {
             let n = f.matches.len();
             let cur = if n > 0 { f.idx + 1 } else { 0 };
+            let read_only = f.matches.get(f.idx).is_some_and(|m| !m.editable);
+            let cur = if read_only {
+                format!("{cur}/{n} read-only")
+            } else {
+                format!("{cur}/{n}")
+            };
             match &f.replacement {
                 None => format!(
-                    " Find: {}▏  ({cur}/{n})  ·  ↵/↓ next · ↑ prev · Tab→replace · Esc done",
+                    " Find: {}▏  ({cur})  ·  ↵/↓ next · ↑ prev · Tab→replace · Esc done",
                     f.query
                 ),
                 Some(repl) => {
@@ -5733,7 +5759,7 @@ impl App {
                         ("▏", "")
                     };
                     format!(
-                        " Replace: {}{qc} → {}{rc}  ({cur}/{n})  ·  ↵ replace · Ctrl-A all · Tab field · Esc done",
+                        " Replace: {}{qc} → {}{rc}  ({cur})  ·  ↵ replace · Ctrl-A all · Tab field · Esc done",
                         f.query, repl
                     )
                 }
@@ -11265,6 +11291,75 @@ mod tests {
         app.on_key(key(KeyCode::Char('Z'))); // replacement
         app.on_key(ctrl(KeyCode::Char('a'))); // replace all
         assert_eq!(first_line(&app), "Z y Z");
+    }
+
+    /// `x ` + a tracked insertion `x` + ` x`: Find shows all three (#211).
+    fn app_with_tracked_x() -> App {
+        let doc = docxcore::load::parse_document_xml(
+            "<w:document><w:body><w:p>\
+             <w:r><w:t xml:space=\"preserve\">x </w:t></w:r>\
+             <w:ins w:id=\"1\" w:author=\"A\"><w:r><w:t>x</w:t></w:r></w:ins>\
+             <w:r><w:t xml:space=\"preserve\"> x</w:t></w:r>\
+             </w:p></w:body></w:document>",
+            &docxcore::load::Relationships::default(),
+        );
+        let mut app = App::new(new_package(doc), "test.docx", false);
+        app.os_clip = None;
+        app
+    }
+
+    fn find_x_replace_with_z(app: &mut App) {
+        app.on_key(ctrl(KeyCode::Char('f')));
+        app.on_key(key(KeyCode::Char('x')));
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Char('Z')));
+    }
+
+    #[test]
+    fn find_bar_shows_text_in_a_tracked_change_211() {
+        let mut app = app_with_tracked_x();
+        app.on_key(ctrl(KeyCode::Char('f')));
+        app.on_key(key(KeyCode::Char('x')));
+        let f = app.find.as_ref().unwrap();
+        let editable: Vec<bool> = f.matches.iter().map(|m| m.editable).collect();
+        assert_eq!(editable, [true, false, true]);
+        app.on_key(KeyCode::Down.into_key());
+        assert_eq!(
+            app.find.as_ref().unwrap().idx,
+            1,
+            "the read-only match is visited"
+        );
+    }
+
+    /// Replace on a read-only match leaves the document alone and moves on;
+    /// on the next (editable) match it replaces.
+    #[test]
+    fn find_bar_replace_skips_a_read_only_match_211() {
+        let mut app = app_with_tracked_x();
+        find_x_replace_with_z(&mut app);
+        app.find_step(1); // onto the tracked `x`
+        let before = app.editor.doc.body.clone();
+        app.on_key(KeyCode::Enter.into_key());
+        assert_eq!(
+            app.editor.doc.body, before,
+            "a read-only match is never edited"
+        );
+        assert!(!app.modified);
+        assert_eq!(app.find.as_ref().unwrap().idx, 2, "and Replace advanced");
+        app.on_key(KeyCode::Enter.into_key());
+        assert_eq!(first_line(&app), "x x Z");
+    }
+
+    #[test]
+    fn find_bar_replace_all_reports_skipped_read_only_matches_211() {
+        let mut app = app_with_tracked_x();
+        find_x_replace_with_z(&mut app);
+        app.on_key(ctrl(KeyCode::Char('a')));
+        assert_eq!(first_line(&app), "Z x Z", "the tracked `x` stays");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Replaced 2; 1 read-only match(es) skipped")
+        );
     }
 
     #[test]

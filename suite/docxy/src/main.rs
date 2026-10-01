@@ -55,7 +55,7 @@ use project::*;
 use std::path::PathBuf;
 
 use docxcore::comments::Comment;
-use docxcore::editor::{Caret, Clip, Editor};
+use docxcore::editor::{Caret, Clip, Editor, FoundMatch, step_found};
 use docxcore::model::{
     Align, Block, BorderKind, Document, Inline, ParBorders, Paragraph, RunProps, Table, VertAlign,
 };
@@ -2384,6 +2384,9 @@ struct Docxy {
     replace_text: String,
     find_field: FindField,
     find_case: bool,
+    /// The find bar's current match and its index in the search it came from
+    /// (see `find_step_in`).
+    find_cur: Option<(usize, FoundMatch)>,
     // Font-colour / highlight swatch picker (None = closed).
     picker: Option<PickKind>,
     // Scroll handle for the document body, so the caret can be kept in view.
@@ -7251,6 +7254,7 @@ impl Docxy {
             replace_text: String::new(),
             find_field: FindField::Query,
             find_case: false,
+            find_cur: None,
             picker: None,
             doc_scroll: ScrollHandle::new(),
             comment_open: false,
@@ -13479,13 +13483,14 @@ impl Docxy {
         }
     }
 
-    /// Number of matches for the current query in the active document.
+    /// Matches for the current query in the active document: everything Find
+    /// shows, read-only matches included.
     fn match_count(&self) -> usize {
         if self.find_query.is_empty() {
             return 0;
         }
         match self.tabs.get(self.active).map(|t| &t.surface) {
-            Some(Surface::Doc(ed)) => ed.find_all(&self.find_query, self.find_case).len(),
+            Some(Surface::Doc(ed)) => ed.find_visible(&self.find_query, self.find_case).len(),
             _ => 0,
         }
     }
@@ -13495,53 +13500,54 @@ impl Docxy {
     fn find_step(&mut self, reverse: bool, from_start: bool, cx: &mut Context<Self>) {
         let q = self.find_query.clone();
         let cs = self.find_case;
+        let cur = self.find_cur.take();
         if let Some(ed) = self.active_editor() {
-            if from_start {
-                ed.move_doc_start();
-                ed.clear_selection();
-            }
-            if let Some(m) = ed.find_next(&q, cs, reverse) {
-                ed.select_match(&m);
-            }
+            let next = find_step_in(ed, &q, cs, cur, reverse, from_start);
+            self.find_cur = next;
         }
         cx.notify();
     }
 
-    /// Replace the current match (if one is selected) and advance to the next.
+    /// Replace the current match, if it is editable and still selected, and
+    /// advance to the next; a read-only match is skipped.
     fn replace_one(&mut self, cx: &mut Context<Self>) {
         let with = self.replace_text.clone();
         let q = self.find_query.clone();
         let cs = self.find_case;
-        let mut changed = false;
+        let cur = self.find_cur.take();
+        let mut outcome = None;
         if let Some(ed) = self.active_editor() {
-            if ed.has_selection() {
-                ed.replace_current_with(&with);
-                changed = true;
-            }
-            if let Some(m) = ed.find_next(&q, cs, false) {
-                ed.select_match(&m);
-            }
+            let (done, next) = replace_one_in(ed, &q, cs, cur, &with);
+            outcome = Some(done);
+            self.find_cur = next;
         }
-        if changed {
-            if let Some(t) = self.tabs.get_mut(self.active) {
-                t.dirty = true;
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            match outcome {
+                Some(ReplaceOne::Replaced) => t.dirty = true,
+                Some(ReplaceOne::ReadOnly) => t.status = "read-only match skipped".into(),
+                _ => {}
             }
         }
         cx.notify();
     }
 
-    /// Replace every match; report the count in the status line.
+    /// Replace every editable match; report the count in the status line.
     fn replace_all_now(&mut self, cx: &mut Context<Self>) {
         let with = self.replace_text.clone();
         let q = self.find_query.clone();
         let cs = self.find_case;
-        let mut n = 0;
+        let (mut n, mut read_only) = (0, 0);
         if let Some(ed) = self.active_editor() {
-            n = ed.replace_all(&q, &with, cs);
+            (n, read_only) = ed.replace_all_visible(&q, &with, cs);
         }
-        if n > 0 {
-            if let Some(t) = self.tabs.get_mut(self.active) {
+        self.find_cur = None;
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            if n > 0 {
                 t.dirty = true;
+            }
+            if read_only > 0 {
+                t.status = format!("replaced {n}; {read_only} read-only match(es) skipped").into();
+            } else if n > 0 {
                 t.status = format!("replaced {n}").into();
             }
         }
@@ -18008,6 +18014,157 @@ fn move_vert(ed: &mut Editor, down: bool) {
             ed.clear_selection();
             return;
         }
+    }
+}
+
+/// What the find bar's Replace did (#211).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplaceOne {
+    /// The current match was editable and selected: replaced.
+    Replaced,
+    /// The current match is read-only (in a tracked change, a field's result,
+    /// …): left alone.
+    ReadOnly,
+    /// No current match is selected: nothing replaced.
+    NoMatch,
+}
+
+/// The find bar's step over what the document shows (#211). It steps from
+/// the current match `cur` while that is still the match at its index (the
+/// document has not changed under it), else from the caret, or from the
+/// document top with `from_start`. Stepping by index visits every match once,
+/// even several sharing one editor offset. Selects and returns the new
+/// current match.
+fn find_step_in(
+    ed: &mut Editor,
+    query: &str,
+    case_sensitive: bool,
+    cur: Option<(usize, FoundMatch)>,
+    reverse: bool,
+    from_start: bool,
+) -> Option<(usize, FoundMatch)> {
+    if from_start {
+        ed.move_doc_start();
+        ed.clear_selection();
+    }
+    let matches = ed.find_visible(query, case_sensitive);
+    let idx = match cur {
+        Some((i, m)) if !from_start && matches.get(i) == Some(&m) => {
+            step_found(matches.len(), Some(i), reverse)
+        }
+        _ if from_start => step_found(matches.len(), None, reverse),
+        _ => ed.found_from_caret(&matches, reverse),
+    }?;
+    let m = matches.into_iter().nth(idx)?;
+    ed.select_found(&m);
+    Some((idx, m))
+}
+
+/// Replace the find bar's current match `cur` with `with` only when it is an
+/// editable match and still exactly the selection (#211): a read-only match
+/// is never edited, nor is a selection that is not a match. Then step to the
+/// next match.
+fn replace_one_in(
+    ed: &mut Editor,
+    query: &str,
+    case_sensitive: bool,
+    cur: Option<(usize, FoundMatch)>,
+    with: &str,
+) -> (ReplaceOne, Option<(usize, FoundMatch)>) {
+    let matches = ed.find_visible(query, case_sensitive);
+    let current = cur.filter(|(i, m)| matches.get(*i) == Some(m));
+    let outcome = match &current {
+        Some((_, m)) if m.editable && ed.selection_is(m) => {
+            ed.replace_current_with(with);
+            ReplaceOne::Replaced
+        }
+        Some((_, m)) if !m.editable => ReplaceOne::ReadOnly,
+        _ => ReplaceOne::NoMatch,
+    };
+    // A replaced match is gone: go on from the caret, at the replacement's end.
+    let cur = if outcome == ReplaceOne::Replaced {
+        None
+    } else {
+        current
+    };
+    (
+        outcome,
+        find_step_in(ed, query, case_sensitive, cur, false, false),
+    )
+}
+
+#[cfg(test)]
+mod find_bar_tests {
+    use super::{Caret, Editor, ReplaceOne, find_step_in, replace_one_in};
+
+    /// `x ` + a tracked insertion `x` + ` x`.
+    fn tracked_x() -> Editor {
+        Editor::new(docxcore::load::parse_document_xml(
+            "<w:document><w:body><w:p>\
+             <w:r><w:t xml:space=\"preserve\">x </w:t></w:r>\
+             <w:ins w:id=\"1\" w:author=\"A\"><w:r><w:t>x</w:t></w:r></w:ins>\
+             <w:r><w:t xml:space=\"preserve\"> x</w:t></w:r>\
+             </w:p></w:body></w:document>",
+            &docxcore::load::Relationships::default(),
+        ))
+    }
+
+    fn text(ed: &Editor) -> String {
+        ed.doc.body[0].plain_text()
+    }
+
+    #[test]
+    fn replace_skips_a_read_only_match_and_advances_211() {
+        let mut ed = tracked_x();
+        let cur = find_step_in(&mut ed, "x", false, None, false, true);
+        assert_eq!(cur.as_ref().map(|(i, m)| (*i, m.editable)), Some((0, true)));
+        let cur = find_step_in(&mut ed, "x", false, cur, false, false);
+        assert_eq!(
+            cur.as_ref().map(|(i, m)| (*i, m.editable)),
+            Some((1, false))
+        );
+        let before = ed.doc.body.clone();
+        let (done, cur) = replace_one_in(&mut ed, "x", false, cur, "Z");
+        assert_eq!(done, ReplaceOne::ReadOnly);
+        assert_eq!(ed.doc.body, before, "a read-only match is never edited");
+        assert_eq!(cur.as_ref().map(|(i, _)| *i), Some(2), "Replace moved on");
+        let (done, _) = replace_one_in(&mut ed, "x", false, cur, "Z");
+        assert_eq!(done, ReplaceOne::Replaced);
+        assert_eq!(text(&ed), "x x Z");
+    }
+
+    /// Replace no longer replaces whatever happens to be selected.
+    #[test]
+    fn replace_with_a_selection_that_is_not_a_match_does_nothing_211() {
+        let mut ed = tracked_x();
+        let cur = find_step_in(&mut ed, "x", false, None, false, true);
+        ed.anchor = Some(Caret::at(vec![0], 0));
+        ed.caret = Caret::at(vec![0], 2); // "x ", not the match "x"
+        let before = ed.doc.body.clone();
+        let (done, _) = replace_one_in(&mut ed, "x", false, cur, "Z");
+        assert_eq!(done, ReplaceOne::NoMatch);
+        assert_eq!(ed.doc.body, before);
+        let (done, _) = replace_one_in(&mut ed, "x", false, None, "Z");
+        assert_eq!(done, ReplaceOne::NoMatch, "nor with no current match");
+        assert_eq!(ed.doc.body, before);
+    }
+
+    /// Two hits in one deletion share an editor offset: stepping visits both.
+    #[test]
+    fn stepping_visits_matches_that_share_an_offset_211() {
+        let mut ed = Editor::new(docxcore::load::parse_document_xml(
+            "<w:document><w:body><w:p>\
+             <w:del w:id=\"1\" w:author=\"A\"><w:r><w:delText>ab ab</w:delText></w:r></w:del>\
+             </w:p></w:body></w:document>",
+            &docxcore::load::Relationships::default(),
+        ));
+        let mut cur = find_step_in(&mut ed, "ab", false, None, false, true);
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            seen.push(cur.as_ref().map(|(i, _)| *i));
+            cur = find_step_in(&mut ed, "ab", false, cur, false, false);
+        }
+        assert_eq!(seen, [Some(0), Some(1), Some(0)]);
     }
 }
 
