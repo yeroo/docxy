@@ -696,6 +696,13 @@ file that is already open without asking unless `reopen` is `"ask"` (see
   Copy included, and so does that copy when it is opened again later. Edits and saves are refused with `Protected View — select
   Enable Editing to edit`. A script cannot write that stream, so
   `uiharness/tests/protected_view.rs` (desktop-only, `--ignored`) covers it.
+- **Trusted documents** (#882): Enable Editing records the file in
+  `<DOCXY_CONFIG_DIR>/docxy/trusted.json` by its canonical path, length and
+  modified time as it was opened. That file opens again without Protected
+  View, in every mode; a different file downloaded to the same path does not
+  match and is protected again. A copy of a trusted file opens editable, but
+  the copy is not trusted itself. A store that cannot be written leaves
+  editing enabled and the status says `editing enabled (not remembered: …)`.
 
 `open-modes.uit` covers the rest.
 

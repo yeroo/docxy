@@ -101,10 +101,19 @@ fn export_csv_bytes(
     out: &str,
     bytes: &[u8],
 ) -> io::Result<()> {
-    let source = import_source
+    export_atomic(
+        Some(Path::new(export_source(source, import_source, out))),
+        Path::new(out),
+        bytes,
+    )
+}
+
+/// The file an export to `out` must not replace: the imported text file
+/// when `out` is it (under any alias), else the workbook's own file.
+fn export_source<'a>(source: &'a str, import_source: Option<&'a str>, out: &str) -> &'a str {
+    import_source
         .filter(|import| opccore::fsio::same_file(Path::new(import), Path::new(out)))
-        .unwrap_or(source);
-    export_atomic(Some(Path::new(source)), Path::new(out), bytes)
+        .unwrap_or(source)
 }
 
 /// Where *Always create backup* keeps the previous version: beside the file,
@@ -451,6 +460,10 @@ fn main() -> ExitCode {
         eprintln!("error: more than one input file (only --verify takes several)");
         return ExitCode::from(2);
     }
+    if let Some(err) = read_only_input_error(&parsed) {
+        eprintln!("error: {err}");
+        return ExitCode::from(2);
+    }
 
     // --verify sweeps any number of workbooks and prints an aggregate.
     if parsed.verify {
@@ -564,6 +577,14 @@ fn main() -> ExitCode {
     };
 
     if let Some(out) = parsed.recalc_out {
+        // Read-only (#882): the input is never written, so recalculating in
+        // place is refused rather than done.
+        if let Some(input) = parsed.inputs.first().filter(|_| parsed.read_only)
+            && opccore::fsio::same_file(Path::new(input), Path::new(&out))
+        {
+            eprintln!("error: {}", read_only_refusal(input));
+            return ExitCode::from(2);
+        }
         // Only a workbook package is written: an .xls, .xlsb, .ods, .xml (or
         // any type Save As refuses) would get .xlsx bytes under its name.
         if let Some(t) = unwritable_type(&out) {
@@ -636,14 +657,18 @@ fn main() -> ExitCode {
         .first()
         .filter(|input| is_template(input) && **input != path)
         .cloned();
+    let read_only = parsed.inputs.first().filter(|_| parsed.read_only).cloned();
     match run_tui(
         pkg,
         &path,
         import_source.map(|s| (s, format)),
         template,
         welcome,
-        parsed.vim,
         wizard,
+        TuiFlags {
+            vim: parsed.vim,
+            read_only,
+        },
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -894,6 +919,8 @@ struct Parsed {
     verify: bool,
     help: bool,
     vim: bool,
+    /// `--read-only` / `-r` (#882): the input is never written.
+    read_only: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<Parsed, String> {
@@ -904,12 +931,14 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
         verify: false,
         help: false,
         vim: false,
+        read_only: false,
     };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--help" | "-h" => p.help = true,
             "--vim" => p.vim = true,
+            "--read-only" | "-r" => p.read_only = true,
             "--verify" => p.verify = true,
             "--recalc" => {
                 i += 1;
@@ -951,6 +980,7 @@ fn print_usage() {
            xlsxy <in> --verify              conformance scoreboard: recalculate\n  \
                                             and diff against Excel's cached values\n  \
            xlsxy <file> --vim               modal (vim) navigation: hjkl, v, dd, :w :q\n  \
+           xlsxy <file> --read-only (-r)    open read-only: Save asks for a new name\n  \
            xlsxy --mcp                      run the MCP bridge to drive a live xlsxy\n  \
            xlsxy install skill              install the agent SKILL.md (self-onboarding)\n\n\
          EDITOR KEYS:\n  \
@@ -1031,13 +1061,44 @@ fn preview_lines(path: &str, width: usize) -> Vec<String> {
 }
 
 /// The terminal window title: `* AppName - filename` (the `* ` only when the
-/// file has unsaved changes).
-fn window_title(app: &str, path: &str, modified: bool) -> String {
-    let name = std::path::Path::new(path)
+/// file has unsaved changes), and Excel's ` [Read-Only]` while the file is
+/// one opened read-only (#882).
+fn window_title(app: &str, path: &str, modified: bool, read_only: bool) -> String {
+    let name = file_name_of(path);
+    format!(
+        "{}{app} - {name}{}",
+        if modified { "* " } else { "" },
+        if read_only { " [Read-Only]" } else { "" }
+    )
+}
+
+/// Why `--read-only` cannot open its input (#882): there is none, or it is
+/// not a file. Only an existing file can be kept from being written; a
+/// missing one would be created by the first Save.
+fn read_only_input_error(parsed: &Parsed) -> Option<String> {
+    if !parsed.read_only {
+        return None;
+    }
+    let Some(input) = parsed.inputs.first() else {
+        return Some("--read-only needs a file to open".to_string());
+    };
+    (!Path::new(input).is_file()).then(|| format!("cannot open {input} read-only: no such file"))
+}
+
+/// Excel's refusal to write a file opened read-only (#882).
+fn read_only_refusal(path: &str) -> String {
+    format!(
+        "\"{}\" is read-only. Save a copy under a new name.",
+        file_name_of(path)
+    )
+}
+
+/// `path`'s file name, or `path` itself when it has none.
+fn file_name_of(path: &str) -> String {
+    Path::new(path)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string());
-    format!("{}{app} - {name}", if modified { "* " } else { "" })
+        .unwrap_or_else(|| path.to_string())
 }
 
 /// Path of the persisted view-preferences file (XDG / APPDATA).
@@ -1518,6 +1579,15 @@ enum ConfirmAction {
     SaveWithoutMacros(String),
     /// Text to Columns over cells that hold data.
     TextToColumns(gridcore::edit::TtcSource, TextParse),
+    /// Open or New over a modified workbook discards its changes (#882).
+    Discard(Next),
+}
+
+/// What Yes to [`ConfirmAction::Discard`] goes on to do.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Next {
+    Open(String),
+    New,
 }
 
 // The Yes/No modal itself lives in `backstage::Confirm<ConfirmAction>` (shared
@@ -1615,6 +1685,18 @@ struct App {
     /// whatever status the edit's caller sets, once the action is done
     /// ([`App::flush_circle_warning`]).
     circle_warning_pending: bool,
+    /// The file opened read-only (`--read-only`, #882): nothing writes it,
+    /// so Save on it asks for another name. Compared by file identity, so no
+    /// other spelling or link reaches it. A person's Open that loads (any
+    /// file, this one included), a finished interactive import, or New
+    /// ends it. The startup import of the `-r` file itself keeps it
+    /// ([`Self::startup_import`]), as do an Open that fails or is cancelled,
+    /// a reload, and the control surface's scripted `wb.open`/`wb.reload`.
+    read_only: Option<std::path::PathBuf>,
+    /// The Text Import Wizard `xlsxy -r notes.txt` opened at startup: its
+    /// finish keeps read-only, unlike an interactive import. Cleared when
+    /// that wizard finishes or is cancelled.
+    startup_import: bool,
 }
 
 impl App {
@@ -1704,6 +1786,8 @@ impl App {
             img_cache: std::collections::HashMap::new(),
             replace_find: None,
             vim: None,
+            read_only: None,
+            startup_import: false,
             sheet_picker: None,
             dv_picker: None,
             grid_area: Rect::default(),
@@ -3056,14 +3140,96 @@ impl App {
         save_xlsx_for_path(&self.pkg, &self.path)
     }
 
+    /// Ctrl+S, `:w` and the backstage's Save. On a file opened read-only it
+    /// opens Save As instead (#882), as Excel does.
     fn save(&mut self) {
+        if let Err(msg) = self.refuse_read_only(&self.path) {
+            self.open_prompt(PromptKind::SaveAs);
+            self.status = Some(msg);
+            return;
+        }
         let _ = self.save_current();
+    }
+
+    /// The `.txt`/`.prn` named on the command line: its Text Import Wizard,
+    /// whose finish keeps a `--read-only` file read-only (#882).
+    fn open_startup_wizard(&mut self, text_file: &str) {
+        self.open_workbook(text_file);
+        self.startup_import = self.text_dialog.is_some();
+    }
+
+    /// Open `source` read-only (#882). An import is bound to a new name, so
+    /// its Save writes that file as usual and shows no caption, but every
+    /// write onto `source` itself is still refused.
+    fn set_read_only(&mut self, source: &str) {
+        self.read_only = Some(std::path::PathBuf::from(source));
+    }
+
+    /// Whether the workbook is bound to the file it was opened read-only from.
+    fn bound_read_only(&self) -> bool {
+        self.refuse_read_only(&self.path).is_err()
+    }
+
+    /// Excel's refusal when `target` is the file opened read-only.
+    fn refuse_read_only(&self, target: impl AsRef<Path>) -> Result<(), String> {
+        let target = target.as_ref();
+        match &self.read_only {
+            Some(src) if opccore::fsio::same_file(src, target) => {
+                Err(read_only_refusal(&target.to_string_lossy()))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    // ---- writes ----------------------------------------------------------
+    //
+    // Every file an App method writes goes through one of these three, and
+    // each refuses the file opened read-only (#882) itself, so a new route
+    // cannot forget to ask. The one other write is the view-preferences file
+    // (`save_view_prefs`), the app's own config. Headless runs (`--recalc`,
+    // `--csv`) have no App and guard the input at startup.
+
+    fn guard_write(&self, target: &Path) -> io::Result<()> {
+        self.refuse_read_only(target)
+            .map_err(|msg| io::Error::new(io::ErrorKind::PermissionDenied, msg))
+    }
+
+    /// `bytes` to `target` atomically, never replacing `source` (the file
+    /// an export was made from, see `export_atomic`) or the read-only file.
+    fn write_export(&self, source: Option<&Path>, target: &Path, bytes: &[u8]) -> io::Result<()> {
+        self.guard_write(target)?;
+        export_atomic(source, target, bytes)
+    }
+
+    /// A supporting file (a Web Page's `<stem>_files/…`), its folder made
+    /// first; never the read-only file.
+    fn write_supporting(&self, target: &Path, bytes: &[u8]) -> io::Result<()> {
+        self.guard_write(target)?;
+        if let Some(dir) = target.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(target, bytes)
+    }
+
+    /// *Always create backup*'s copy of `dest` ([`keep_backup`]); never
+    /// over the read-only file.
+    fn write_backup(&self, dest: &Path) -> io::Result<()> {
+        self.guard_write(&backup_path(dest))?;
+        keep_backup(dest)
     }
 
     /// Write the workbook to `self.path`. A failure's message is both the
     /// status line and the `Err`, so a caller that reports it (the control
     /// surface's `wb.save`) says exactly what the status bar says.
     fn save_current(&mut self) -> Result<(), String> {
+        // Every save of the workbook comes through here: Ctrl+S, `:w`/`:wq`,
+        // Save As (which binds the path first), and the control surface's
+        // `wb.save`. Other file writes go through write_export,
+        // write_supporting and write_backup.
+        if let Err(msg) = self.refuse_read_only(&self.path) {
+            self.status = Some(msg.clone());
+            return Err(msg);
+        }
         if let Some(t) = self.bound_text_type() {
             return self.save_text(t);
         }
@@ -3085,13 +3251,13 @@ impl App {
         };
         let bytes = self.package_bytes();
         if self.pkg.always_create_backup() {
-            if let Err(e) = keep_backup(Path::new(&self.path)) {
+            if let Err(e) = self.write_backup(Path::new(&self.path)) {
                 let msg = format!("save failed: {e}");
                 self.status = Some(msg.clone());
                 return Err(msg);
             }
         }
-        match export_atomic(
+        match self.write_export(
             self.import_source.as_deref().map(Path::new),
             Path::new(&self.path),
             &bytes,
@@ -3186,20 +3352,18 @@ impl App {
         };
         let sheet_name = sheet.name.clone();
         let many = wb.sheets.len() > 1;
-        let written = export_atomic(
-            self.import_source.as_deref().map(Path::new),
-            Path::new(&self.path),
-            &bytes,
-        )
-        .and_then(|()| {
-            for (p, body) in &extra {
-                if let Some(dir) = p.parent() {
-                    std::fs::create_dir_all(dir)?;
+        let written = self
+            .write_export(
+                self.import_source.as_deref().map(Path::new),
+                Path::new(&self.path),
+                &bytes,
+            )
+            .and_then(|()| {
+                for (p, body) in &extra {
+                    self.write_supporting(p, body.as_bytes())?;
                 }
-                std::fs::write(p, body)?;
-            }
-            Ok(())
-        });
+                Ok(())
+            });
         match written {
             Ok(()) => {
                 self.modified = true;
@@ -3275,6 +3439,11 @@ impl App {
     /// Save the package As, first asking (as Excel does) before a macro-free
     /// type drops the workbook's VBA project or Excel 4.0 macros.
     fn request_save_as_package(&mut self, path: String) {
+        // Refused before asking about the macros it would drop.
+        if let Err(msg) = self.refuse_read_only(&path) {
+            self.status = Some(msg);
+            return;
+        }
         let drops_macros = SpreadsheetKind::from_path(&path).is_some_and(|k| !k.allows_macros());
         let features = self.pkg.macro_features();
         if drops_macros && !features.is_empty() {
@@ -4238,6 +4407,9 @@ impl App {
         }
         match load_workbook(path, &self.text_open()) {
             Ok((pkg, p, import_source, format)) => {
+                // A person's Open that loads ends read-only (#882), the
+                // read-only file's own included.
+                self.read_only = None;
                 self.install_workbook(pkg, p, import_source);
                 self.note_import(format);
                 self.note_template(path);
@@ -4386,6 +4558,7 @@ impl App {
         self.pkg = pkg;
         self.forget_clip();
         self.path = "untitled.xlsx".to_string();
+        self.read_only = None;
         self.import_source = None;
         self.template = None;
         self.import_unsaved = false;
@@ -4420,7 +4593,8 @@ impl App {
             Some((base, _)) => format!("{base}.csv"),
             None => format!("{}.csv", self.path),
         };
-        match export_csv_bytes(&self.path, self.import_source.as_deref(), &out, &csv) {
+        let source = export_source(&self.path, self.import_source.as_deref(), &out);
+        match self.write_export(Some(Path::new(source)), Path::new(&out), &csv) {
             Ok(()) => self.status = Some(format!("Exported {out} ({} bytes)", csv.len())),
             Err(e) => self.status = Some(format!("Export failed: {e}")),
         }
@@ -4439,12 +4613,12 @@ impl App {
                 false
             }
             BackstageEvent::New => {
-                self.new_workbook();
+                self.request_discard(Next::New);
                 false
             }
             BackstageEvent::Open(p) => {
                 let p = p.to_string_lossy().into_owned();
-                self.open_workbook(&p);
+                self.request_discard(Next::Open(p));
                 false
             }
             BackstageEvent::Save => {
@@ -4471,6 +4645,40 @@ impl App {
                 self.open_prompt(PromptKind::DocProperty(i as u8));
                 false
             }
+        }
+    }
+
+    /// Open or New from the backstage (#882): a modified workbook asks before
+    /// its changes are discarded; an unmodified one goes ahead. The
+    /// workbook stops being read-only only once another one has loaded
+    /// ([`Self::open_workbook`], the import's finish, [`Self::new_workbook`]),
+    /// so an Open that fails or is cancelled leaves the source guarded. The
+    /// control surface's `wb.open` is scripted, does not ask, and keeps it.
+    fn request_discard(&mut self, next: Next) {
+        self.backstage = None;
+        if !self.modified {
+            self.discard_for(next);
+            return;
+        }
+        let name = file_name_of(&self.path);
+        let prompt = match &next {
+            Next::Open(p) => {
+                let other = file_name_of(p);
+                format!("Discard changes to \"{name}\" and open \"{other}\"?")
+            }
+            Next::New => format!("Discard changes to \"{name}\" and start a new workbook?"),
+        };
+        self.confirm = Some(
+            backstage::Confirm::new(prompt, ConfirmAction::Discard(next), Color::Green)
+                .default_no(),
+        );
+    }
+
+    /// Yes to [`ConfirmAction::Discard`], or an Open/New with nothing to lose.
+    fn discard_for(&mut self, next: Next) {
+        match next {
+            Next::Open(p) => self.open_workbook(&p),
+            Next::New => self.new_workbook(),
         }
     }
 
@@ -4528,6 +4736,10 @@ impl App {
                     }
                     ConfirmAction::TextToColumns(src, opts) => {
                         self.apply_text_to_columns(&src, &opts);
+                        false
+                    }
+                    ConfirmAction::Discard(next) => {
+                        self.discard_for(next);
                         false
                     }
                 }
@@ -4920,6 +5132,7 @@ impl App {
             textdlg::Outcome::Pending => {}
             textdlg::Outcome::Cancel => {
                 self.text_dialog = None;
+                self.startup_import = false;
                 self.status = Some("Cancelled".to_string());
             }
             textdlg::Outcome::Finish => self.finish_text_dialog(),
@@ -4941,6 +5154,11 @@ impl App {
         match &d.purpose {
             textdlg::Purpose::Import { path, .. } => {
                 let pkg = text_to_pkg(d.text(), &file_stem(path), &opts, &self.text_open());
+                // A finished interactive import ends read-only (#882); the
+                // startup import of the `-r` file keeps it refused.
+                if !std::mem::take(&mut self.startup_import) {
+                    self.read_only = None;
+                }
                 self.install_workbook(pkg, import_binding(path), Some(path.clone()));
                 self.import_unsaved = true;
             }
@@ -7976,14 +8194,22 @@ fn open_url(url: &str) {
 // Terminal shell
 // ---------------------------------------------------------------------------
 
+/// The editor's command-line switches.
+struct TuiFlags {
+    /// `--vim`: modal navigation.
+    vim: bool,
+    /// `--read-only`: the input file, opened read-only (#882).
+    read_only: Option<String>,
+}
+
 fn run_tui(
     pkg: SheetPackage,
     path: &str,
     import: Option<(String, Option<SourceFormat>)>,
     template: Option<String>,
     welcome: bool,
-    vim: bool,
     wizard: Option<String>,
+    flags: TuiFlags,
 ) -> io::Result<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -8006,7 +8232,7 @@ fn run_tui(
         app.note_template(&template);
     }
     app.load_view_prefs();
-    if vim {
+    if flags.vim {
         app.vim = Some(VimState {
             mode: VimMode::Normal,
             pending: '\0',
@@ -8014,8 +8240,11 @@ fn run_tui(
         });
     }
     app.start_screen = welcome;
+    if let Some(source) = flags.read_only {
+        app.set_read_only(&source);
+    }
     if let Some(text_file) = wizard {
-        app.open_workbook(&text_file);
+        app.open_startup_wizard(&text_file);
     }
     // Detect the terminal's graphics capability (kitty/iTerm2/Sixel); fall back to
     // a half-block renderer so embedded pictures still show something.
@@ -8072,7 +8301,7 @@ fn run_tui(
 
     let result = loop {
         // Reflect the file + unsaved state in the terminal window title.
-        let title = window_title("xlsxy", &app.path, app.modified);
+        let title = window_title("xlsxy", &app.path, app.modified, app.bound_read_only());
         if title != last_title {
             let _ = execute!(io::stdout(), SetTitle(&title));
             last_title = title;
@@ -12152,16 +12381,20 @@ mod tests {
     #[test]
     fn window_title_format() {
         assert_eq!(
-            window_title("xlsxy", "/tmp/report.xlsx", false),
+            window_title("xlsxy", "/tmp/report.xlsx", false, false),
             "xlsxy - report.xlsx"
         );
         assert_eq!(
-            window_title("xlsxy", "/tmp/report.xlsx", true),
+            window_title("xlsxy", "/tmp/report.xlsx", true, false),
             "* xlsxy - report.xlsx"
         );
         assert_eq!(
-            window_title("xlsxy", "book.xlsx", true),
+            window_title("xlsxy", "book.xlsx", true, false),
             "* xlsxy - book.xlsx"
+        );
+        assert_eq!(
+            window_title("xlsxy", "book.xlsx", true, true),
+            "* xlsxy - book.xlsx [Read-Only]"
         );
     }
 
@@ -13676,6 +13909,496 @@ mod tests {
         );
         assert!(parse_args(&["-".into()]).is_err());
         assert!(parse_args(&["a.xlsx".into(), "--recalc".into(), "o.xlsx".into()]).is_ok());
+    }
+
+    /// #882: `--read-only` and `-r` are flags, not files or unknown options,
+    /// and go with the headless modes too.
+    #[test]
+    fn read_only_flag_parses() {
+        for flag in ["--read-only", "-r"] {
+            let p = parse_args(&["a.xlsx".into(), flag.into()]).unwrap();
+            assert!(p.read_only, "{flag}");
+            assert_eq!(p.inputs, vec!["a.xlsx".to_string()]);
+        }
+        assert!(!parse_args(&["a.xlsx".into()]).unwrap().read_only);
+        let p =
+            parse_args(&["-r".into(), "a.xlsx".into(), "--csv".into(), "o.csv".into()]).unwrap();
+        assert!(p.read_only && p.csv_out.is_some());
+        assert!(parse_args(&["--read-onl".into()]).is_err(), "a near miss");
+    }
+
+    // ---- #882: Open/New over unsaved changes, and read-only ----
+
+    /// A scratch folder holding `a.xlsx` (A1 = 1) and `b.xlsx` (A1 = 2), and
+    /// an app on `a.xlsx`.
+    fn two_books(name: &str) -> (std::path::PathBuf, App) {
+        use gridcore::sheet::Cell;
+        let dir = macro_dir(name);
+        for (file, v) in [("a.xlsx", 1.0), ("b.xlsx", 2.0)] {
+            let mut pkg = new_xlsx();
+            pkg.workbook.sheets[0].set_cell(0, 0, Cell::number(v));
+            std::fs::write(dir.join(file), save_xlsx(&pkg)).unwrap();
+        }
+        let a = dir.join("a.xlsx");
+        let pkg = load_xlsx(&std::fs::read(&a).unwrap()).unwrap();
+        let mut app = App::new(pkg, a.to_str().unwrap());
+        app.os_clip = None;
+        (dir, app)
+    }
+
+    fn a1(app: &App) -> f64 {
+        match app.pkg.workbook.sheets[0].cell(0, 0).map(|c| &c.value) {
+            Some(gridcore::sheet::CellValue::Number(n)) => *n,
+            other => panic!("A1 is {other:?}"),
+        }
+    }
+
+    fn type_into_a1(app: &mut App, v: f64) {
+        use gridcore::sheet::Cell;
+        app.pkg.workbook.sheets[0].set_cell(0, 0, Cell::number(v));
+        app.modified = true;
+    }
+
+    fn y() -> KeyEvent {
+        KeyEvent::from(KeyCode::Char('y'))
+    }
+
+    fn n() -> KeyEvent {
+        KeyEvent::from(KeyCode::Char('n'))
+    }
+
+    /// Open from the backstage over unsaved changes asks; No keeps them.
+    #[test]
+    fn open_over_unsaved_changes_asks_and_no_keeps_them() {
+        let (dir, mut app) = two_books("discard-no");
+        type_into_a1(&mut app, 9.0);
+        let b = dir.join("b.xlsx");
+        app.apply_backstage_event(backstage::BackstageEvent::Open(b.clone()));
+        let c = app.confirm.as_ref().expect("Open asks first");
+        assert_eq!(
+            c.prompt(),
+            "Discard changes to \"a.xlsx\" and open \"b.xlsx\"?"
+        );
+        assert!(app.backstage.is_none());
+        assert_eq!(a1(&app), 9.0, "nothing is opened before the answer");
+        assert!(!app.confirm_key(n()));
+        assert!(app.confirm.is_none());
+        assert!(app.modified);
+        assert_eq!(a1(&app), 9.0, "No keeps the changes");
+        assert!(app.path.ends_with("a.xlsx"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Yes discards the changes and opens the other file.
+    #[test]
+    fn open_over_unsaved_changes_yes_opens() {
+        let (dir, mut app) = two_books("discard-yes");
+        type_into_a1(&mut app, 9.0);
+        let b = dir.join("b.xlsx");
+        app.apply_backstage_event(backstage::BackstageEvent::Open(b.clone()));
+        assert!(!app.confirm_key(y()));
+        assert!(app.confirm.is_none());
+        assert_eq!(Path::new(&app.path), b);
+        assert!(!app.modified);
+        assert_eq!(a1(&app), 2.0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// With nothing to lose, Open goes ahead without asking.
+    #[test]
+    fn open_with_no_changes_does_not_ask() {
+        let (dir, mut app) = two_books("discard-clean");
+        let b = dir.join("b.xlsx");
+        app.apply_backstage_event(backstage::BackstageEvent::Open(b.clone()));
+        assert!(app.confirm.is_none());
+        assert_eq!(Path::new(&app.path), b);
+        assert_eq!(a1(&app), 2.0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// New from the backstage over unsaved changes asks too.
+    #[test]
+    fn new_over_unsaved_changes_asks() {
+        let (dir, mut app) = two_books("discard-new");
+        type_into_a1(&mut app, 9.0);
+        app.apply_backstage_event(backstage::BackstageEvent::New);
+        assert_eq!(
+            app.confirm.as_ref().expect("New asks first").prompt(),
+            "Discard changes to \"a.xlsx\" and start a new workbook?"
+        );
+        assert!(!app.confirm_key(n()));
+        assert_eq!(a1(&app), 9.0);
+        assert!(app.path.ends_with("a.xlsx"));
+        app.apply_backstage_event(backstage::BackstageEvent::New);
+        assert!(!app.confirm_key(y()));
+        assert_eq!(app.path, "untitled.xlsx");
+        assert!(!app.modified);
+        let clean = App::new(new_xlsx(), "c.xlsx");
+        let mut clean = clean;
+        clean.apply_backstage_event(backstage::BackstageEvent::New);
+        assert!(clean.confirm.is_none(), "nothing to lose");
+        assert_eq!(clean.path, "untitled.xlsx");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Opened read-only: the title says so, and Ctrl+S never writes the file,
+    /// it opens Save As with Excel's words.
+    #[test]
+    fn read_only_save_opens_save_as_and_writes_nothing() {
+        let (dir, mut app) = two_books("ro-save");
+        let a = dir.join("a.xlsx");
+        let before = std::fs::read(&a).unwrap();
+        app.set_read_only(a.to_str().unwrap());
+        assert!(app.bound_read_only());
+        assert_eq!(
+            window_title("xlsxy", &app.path, false, app.bound_read_only()),
+            "xlsxy - a.xlsx [Read-Only]"
+        );
+        type_into_a1(&mut app, 9.0);
+        app.save();
+        let refusal = "\"a.xlsx\" is read-only. Save a copy under a new name.";
+        assert_eq!(app.status.as_deref(), Some(refusal));
+        assert!(
+            matches!(
+                app.prompt.as_ref().map(|p| &p.kind),
+                Some(PromptKind::SaveAs)
+            ),
+            "Save opens Save As"
+        );
+        assert_eq!(std::fs::read(&a).unwrap(), before);
+        assert!(app.modified);
+        // The routes without a dialog refuse in the same words.
+        app.prompt = None;
+        assert_eq!(app.save_current(), Err(refusal.to_string()));
+        assert!(!app.vim_run_command("wq"), ":wq does not quit");
+        assert_eq!(std::fs::read(&a).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Save As to the read-only file is refused; to another name it writes,
+    /// and the workbook is an ordinary one bound to that name.
+    #[test]
+    fn read_only_save_as_refuses_the_source_and_rebinds_elsewhere() {
+        let (dir, mut app) = two_books("ro-save-as");
+        let a = dir.join("a.xlsx");
+        let before = std::fs::read(&a).unwrap();
+        app.set_read_only(a.to_str().unwrap());
+        type_into_a1(&mut app, 9.0);
+        app.request_save_as(a.to_str().unwrap().to_string());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("\"a.xlsx\" is read-only. Save a copy under a new name.")
+        );
+        assert_eq!(std::fs::read(&a).unwrap(), before);
+        assert!(app.path.ends_with("a.xlsx"), "still bound to the source");
+        // The same file under another spelling is still the source.
+        let roundabout = dir.join(".").join("a.xlsx");
+        assert!(!app.save_as(roundabout.to_str().unwrap().to_string()));
+        assert_eq!(std::fs::read(&a).unwrap(), before);
+
+        let c = dir.join("c.xlsx");
+        app.request_save_as(c.to_str().unwrap().to_string());
+        assert_eq!(Path::new(&app.path), c);
+        assert!(!app.modified);
+        assert!(!app.bound_read_only());
+        type_into_a1(&mut app, 10.0);
+        app.save();
+        assert!(app.prompt.is_none(), "an ordinary Save");
+        assert!(!app.modified);
+        let back = load_xlsx(&std::fs::read(&c).unwrap()).unwrap();
+        assert_eq!(
+            back.workbook.sheets[0].cell(0, 0).map(|c| c.value.clone()),
+            Some(gridcore::sheet::CellValue::Number(10.0))
+        );
+        assert_eq!(std::fs::read(&a).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Reverting re-reads the same file and keeps it read-only; an
+    /// interactive Open, even of the same file, is an ordinary open.
+    #[test]
+    fn read_only_survives_reload_and_ends_at_open() {
+        let (dir, mut app) = two_books("ro-reload");
+        let a = dir.join("a.xlsx");
+        app.set_read_only(a.to_str().unwrap());
+        type_into_a1(&mut app, 9.0);
+        app.reload().unwrap();
+        assert_eq!(a1(&app), 1.0);
+        assert!(app.bound_read_only(), "reload keeps read-only");
+        app.apply_backstage_event(backstage::BackstageEvent::Open(a.clone()));
+        assert!(app.confirm.is_none());
+        assert!(!app.bound_read_only(), "Open is an ordinary open");
+        assert!(app.read_only.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An import is bound to a new `.xlsx`, never its source, so read-only
+    /// changes nothing for it: no caption, and Save writes the new file.
+    #[test]
+    fn read_only_import_saves_its_new_binding() {
+        let dir = macro_dir("ro-import");
+        let csv = dir.join("data.csv");
+        std::fs::write(&csv, "1,2\n").unwrap();
+        let (pkg, path, source, _) =
+            load_workbook(csv.to_str().unwrap(), &TextOpen::from_prefs()).unwrap();
+        let mut app = App::new(pkg, &path);
+        app.os_clip = None;
+        app.import_source = source;
+        app.set_read_only(csv.to_str().unwrap());
+        assert!(!app.bound_read_only());
+        assert!(app.save_current().is_ok());
+        assert!(Path::new(&app.path).exists());
+        assert_eq!(std::fs::read_to_string(&csv).unwrap(), "1,2\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// r2 M1: the control surface's `wb.open` and `wb.reload` keep the source
+    /// read-only, whatever is opened in between.
+    #[test]
+    fn read_only_survives_the_control_surfaces_open() {
+        use ctlcore::json::Json;
+        let (dir, mut app) = two_books("ro-wb-open");
+        let a = dir.join("a.xlsx");
+        let b = dir.join("b.xlsx");
+        let before = std::fs::read(&a).unwrap();
+        let refusal = "\"a.xlsx\" is read-only. Save a copy under a new name.".to_string();
+        app.set_read_only(a.to_str().unwrap());
+        let open = |app: &mut App, p: &Path| {
+            control::dispatch(
+                app,
+                "wb.open",
+                &Json::obj(vec![("path", Json::Str(p.to_string_lossy().into()))]),
+            )
+            .unwrap();
+        };
+        open(&mut app, &a);
+        assert_eq!(
+            control::dispatch(&mut app, "wb.save", &Json::obj(vec![])),
+            Err(refusal.clone())
+        );
+        control::dispatch(&mut app, "wb.reload", &Json::obj(vec![])).unwrap();
+        assert_eq!(
+            control::dispatch(&mut app, "wb.save", &Json::obj(vec![])),
+            Err(refusal.clone())
+        );
+        open(&mut app, &b);
+        assert!(
+            control::dispatch(&mut app, "wb.save", &Json::obj(vec![])).is_ok(),
+            "another file saves"
+        );
+        let read_only = |app: &mut App| {
+            control::dispatch(app, "wb.path", &Json::obj(vec![]))
+                .unwrap()
+                .get("read_only")
+                .and_then(Json::as_bool)
+        };
+        assert_eq!(read_only(&mut app), Some(false), "b.xlsx is not the source");
+        open(&mut app, &a);
+        assert_eq!(read_only(&mut app), Some(true));
+        assert_eq!(
+            control::dispatch(&mut app, "wb.save", &Json::obj(vec![])),
+            Err(refusal)
+        );
+        assert_eq!(std::fs::read(&a).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// r2 m1: `--read-only` needs an input that exists.
+    #[test]
+    fn read_only_needs_an_existing_input() {
+        let (dir, _app) = two_books("ro-missing");
+        let parse = |args: &[&str]| {
+            parse_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        let a = dir.join("a.xlsx").to_string_lossy().into_owned();
+        let missing = dir.join("new.xlsx").to_string_lossy().into_owned();
+        assert_eq!(read_only_input_error(&parse(&["-r", &a])), None);
+        assert_eq!(
+            read_only_input_error(&parse(&[&missing])),
+            None,
+            "not read-only"
+        );
+        assert_eq!(
+            read_only_input_error(&parse(&["-r", &missing])),
+            Some(format!("cannot open {missing} read-only: no such file"))
+        );
+        assert_eq!(
+            read_only_input_error(&parse(&["--read-only"])),
+            Some("--read-only needs a file to open".to_string())
+        );
+        let folder = dir.to_string_lossy().into_owned();
+        assert!(read_only_input_error(&parse(&["-r", &folder])).is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// r3 M1: `xlsxy -r notes.txt` imports through the wizard; finishing it
+    /// keeps the text file refused, through every later Save As.
+    #[test]
+    fn read_only_text_import_keeps_its_source_refused() {
+        let dir = macro_dir("ro-txt-import");
+        let txt = dir.join("notes.txt");
+        std::fs::write(&txt, "1\t2\n").unwrap();
+        let before = std::fs::read(&txt).unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.os_clip = None;
+        app.set_read_only(txt.to_str().unwrap());
+        app.open_startup_wizard(txt.to_str().unwrap());
+        app.finish_text_dialog();
+        assert!(app.text_dialog.is_none());
+        assert!(app.read_only.is_some());
+        assert!(!app.startup_import, "the flag is spent");
+        app.request_save_as(dir.join("other.xlsx").to_string_lossy().into_owned());
+        assert!(dir.join("other.xlsx").is_file());
+        app.request_save_as(txt.to_string_lossy().into_owned());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("\"notes.txt\" is read-only. Save a copy under a new name.")
+        );
+        assert_eq!(std::fs::read(&txt).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// r4: an interactive import ends read-only like any Open that loads,
+    /// the read-only text file's own included; a cancelled startup wizard
+    /// leaves no flag behind for a later import.
+    #[test]
+    fn interactive_import_ends_read_only() {
+        let dir = macro_dir("ro-txt-reimport");
+        let txt = dir.join("notes.txt");
+        std::fs::write(&txt, "1\t2\n").unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.os_clip = None;
+        app.set_read_only(txt.to_str().unwrap());
+        app.open_startup_wizard(txt.to_str().unwrap());
+        assert!(app.startup_import);
+        app.text_dialog_key(KeyCode::Esc);
+        assert!(!app.startup_import, "cancel clears the flag");
+        assert!(app.read_only.is_some(), "and keeps read-only");
+        app.apply_backstage_event(backstage::BackstageEvent::Open(txt.clone()));
+        assert!(app.text_dialog.is_some());
+        app.finish_text_dialog();
+        assert!(app.read_only.is_none(), "an interactive re-import ends it");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// r3 M2: File > Export never writes the read-only CSV, even after a
+    /// Save As has bound the workbook beside it.
+    #[test]
+    fn read_only_export_refuses_the_source() {
+        let dir = macro_dir("ro-export");
+        let csv = dir.join("data.csv");
+        std::fs::write(&csv, "1,2\n").unwrap();
+        let before = std::fs::read(&csv).unwrap();
+        let (pkg, path, source, _) =
+            load_workbook(csv.to_str().unwrap(), &TextOpen::from_prefs()).unwrap();
+        let mut app = App::new(pkg, &path);
+        app.os_clip = None;
+        app.import_source = source;
+        app.set_read_only(csv.to_str().unwrap());
+        app.request_save_as(dir.join("data.xlsx").to_string_lossy().into_owned());
+        assert_eq!(Path::new(&app.path), dir.join("data.xlsx"));
+        assert!(app.import_source.is_none());
+        app.export_csv();
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Export failed: \"data.csv\" is read-only. Save a copy under a new name.")
+        );
+        assert_eq!(std::fs::read(&csv).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// r3: the backup and a Web Page's supporting files are guarded too.
+    #[test]
+    fn read_only_guards_backups_and_supporting_files() {
+        let (dir, mut app) = two_books("ro-helpers");
+        let a = dir.join("a.xlsx");
+        let before = std::fs::read(&a).unwrap();
+        app.set_read_only(a.to_str().unwrap());
+        let refused = |r: io::Result<()>, name: &str| {
+            let e = r.expect_err("refused");
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                e.to_string(),
+                format!("\"{name}\" is read-only. Save a copy under a new name.")
+            );
+        };
+        refused(app.write_supporting(&a, b"x"), "a.xlsx");
+        refused(app.write_export(None, &a, b"x"), "a.xlsx");
+        assert_eq!(std::fs::read(&a).unwrap(), before);
+        // A backup that would land on the read-only file is refused too.
+        let held = dir.join("Backup of b.xlk");
+        std::fs::write(&held, b"kept").unwrap();
+        app.set_read_only(held.to_str().unwrap());
+        refused(app.write_backup(&dir.join("b.xlsx")), "Backup of b.xlk");
+        assert_eq!(std::fs::read(&held).unwrap(), b"kept");
+        assert!(
+            app.write_supporting(&dir.join("page_files").join("s.css"), b"x")
+                .is_ok()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The refusal names the file, not its folder.
+    #[test]
+    fn read_only_refusal_names_the_file() {
+        assert_eq!(
+            read_only_refusal("some/dir/a.xlsx"),
+            "\"a.xlsx\" is read-only. Save a copy under a new name."
+        );
+    }
+
+    /// r1 M1: an Open that loads nothing leaves the read-only file guarded:
+    /// a missing file, and a text file whose wizard is cancelled.
+    #[test]
+    fn read_only_survives_an_open_that_fails_or_is_cancelled() {
+        let (dir, mut app) = two_books("ro-open-fails");
+        let a = dir.join("a.xlsx");
+        let before = std::fs::read(&a).unwrap();
+        let refusal = Err("\"a.xlsx\" is read-only. Save a copy under a new name.".to_string());
+        app.set_read_only(a.to_str().unwrap());
+
+        // Nothing to lose, so the Open goes straight to the load, which fails.
+        app.apply_backstage_event(backstage::BackstageEvent::Open(dir.join("missing.xlsx")));
+        assert!(app.status.as_deref().unwrap().starts_with("Open failed"));
+        assert!(app.path.ends_with("a.xlsx"));
+        assert_eq!(app.save_current(), refusal);
+
+        // Over unsaved changes, Yes and then a failed load.
+        type_into_a1(&mut app, 9.0);
+        app.apply_backstage_event(backstage::BackstageEvent::Open(dir.join("missing.xlsx")));
+        assert!(!app.confirm_key(y()));
+        assert_eq!(app.save_current(), refusal);
+
+        // A text file opens its wizard; Esc cancels it and nothing loads.
+        let txt = dir.join("notes.txt");
+        std::fs::write(&txt, "1\t2\n").unwrap();
+        app.modified = false;
+        app.apply_backstage_event(backstage::BackstageEvent::Open(txt));
+        assert!(app.text_dialog.is_some());
+        app.text_dialog_key(KeyCode::Esc);
+        assert!(app.text_dialog.is_none());
+        assert!(app.bound_read_only());
+        assert_eq!(app.save_current(), refusal);
+        assert_eq!(std::fs::read(&a).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A finished import and New are other workbooks: read-only ends.
+    #[test]
+    fn read_only_ends_when_another_workbook_is_installed() {
+        let (dir, mut app) = two_books("ro-installed");
+        let a = dir.join("a.xlsx");
+        app.set_read_only(a.to_str().unwrap());
+        let txt = dir.join("notes.txt");
+        std::fs::write(&txt, "1\t2\n").unwrap();
+        app.apply_backstage_event(backstage::BackstageEvent::Open(txt));
+        app.finish_text_dialog();
+        assert!(app.text_dialog.is_none());
+        assert!(app.read_only.is_none());
+        app.set_read_only(a.to_str().unwrap());
+        app.apply_backstage_event(backstage::BackstageEvent::New);
+        assert!(app.read_only.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// #724: a new workbook with 1, 2, 3 in A1:A3 (and `extra` cells set
