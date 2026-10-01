@@ -11424,15 +11424,16 @@ b",
     }
 
     #[test]
-    fn undoing_an_overwrite_through_restore_cell_restores_cm() {
-        // xlsxy and gridwasm undo by restore_cell-ing the `before` clone back:
-        // the anchor comes back exactly, `t="array"` attributes and `cm`.
+    fn undoing_an_overwrite_through_restore_cells_restores_cm() {
+        // xlsxy and gridwasm undo by restore_cells-ing the group's `before`
+        // clones back: the anchor comes back exactly, `t="array"` attributes
+        // and `cm`.
         let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SORT_ANCHOR))).unwrap();
         let mut eng = crate::engine::Engine::new(&pkg.workbook);
         let before = pkg.workbook.sheets[0].cell(0, 3).cloned().unwrap();
         eng.set_cell(&mut pkg.workbook, (0, 0, 3), Cell::number(1.0));
         assert!(!saved_sheet1(&pkg).contains("cm="));
-        eng.restore_cell(&mut pkg.workbook, (0, 0, 3), before.clone());
+        eng.restore_cells(&mut pkg.workbook, 0, &[(0, 3, before.clone())]);
         assert_eq!(pkg.workbook.sheets[0].cell(0, 3).unwrap(), &before);
         let ws = saved_sheet1(&pkg);
         assert!(

@@ -199,16 +199,19 @@ impl Engine {
         match prev.filter(|p| cell.formula.is_some() && p.formula == cell.formula) {
             // What kind of formula it is comes from the cell's own previous
             // formula alone — not from the incoming cell, which may be a fresh
-            // one (Enter) or a clone pasted from another address whose
-            // `ref`/`si`/`cm` are not this cell's.
+            // one (Enter) or a clone pasted from another address, or from
+            // another workbook, whose `ref`/`si`/`cm`/`vm` are not this cell's.
             Some(p) => {
                 cell.f_attrs = p.f_attrs.clone();
                 own_array_ref(&mut cell, r, c);
                 let pm = p.meta.as_deref().cloned().unwrap_or_default();
-                let kind_of = |m: &CellMeta| (m.cm.clone(), m.modern, m.dynamic);
+                let kind_of = |m: &CellMeta| {
+                    let file = (m.cm.clone(), m.vm.clone(), m.vm_body.clone());
+                    (file, m.modern, m.dynamic)
+                };
                 if cell.meta.as_deref().map(kind_of).unwrap_or_default() != kind_of(&pm) {
                     let m = cell.meta.get_or_insert_default();
-                    (m.cm, m.modern, m.dynamic) = kind_of(&pm);
+                    ((m.cm, m.vm, m.vm_body), m.modern, m.dynamic) = kind_of(&pm);
                 }
             }
             None if cell.formula.is_some() => {
@@ -256,9 +259,10 @@ impl Engine {
         self.recalc_from(wb, &keys);
     }
 
-    /// Put a cell back exactly as it was (undo/redo): its `<f>` attributes and
-    /// metadata stay, and its formula is indexed as [`Engine::new`] would.
-    /// Restoring a snapshot is not typing.
+    /// Put one cell back exactly as it was: its `<f>` attributes and metadata
+    /// stay, and its formula is indexed as [`Engine::new`] would. Restoring a
+    /// snapshot is not typing. An undo or redo of a group goes through
+    /// [`Engine::restore_cells`], which puts each cell back with this.
     pub fn restore_cell(&mut self, wb: &mut Workbook, key: Key, cell: Cell) {
         self.put_cell(wb, key, cell);
     }
@@ -3087,18 +3091,28 @@ mod tests {
         // #825 AC3: undo restores the befores in reverse (anchor first, then
         // its spilled 4 and 6, which would block it one by one); redo the
         // afters in order. Both leave D1 spilling, exactly as recorded.
-        for anchor in [cse_block(), Cell::formula("A1:A3*2")] {
-            let (mut wb, mut eng) = spilling_book(Cell::default());
-            set(&mut eng, &mut wb, "D1", anchor);
+        // The CSE block keeps its `<f>` attributes both ways.
+        for cse in [true, false] {
+            let (mut wb, mut eng) = if cse {
+                spilling_book(cse_block())
+            } else {
+                let (mut wb, mut eng) = spilling_book(Cell::default());
+                set(&mut eng, &mut wb, "D1", Cell::formula("A1:A3*2"));
+                (wb, eng)
+            };
+            let f_attrs = cse.then_some(" t=\"array\" ref=\"D1:D3\"");
+            assert_eq!(cell_at(&wb, "D1").f_attrs.as_deref(), f_attrs);
             let block = copy_block(&wb, (0, 3), (2, 3));
             let (before, after) = recorded_paste(&mut eng, &mut wb, (0, 3), &block);
             let undo: Snapshot = before.iter().rev().cloned().collect();
             eng.restore_cells(&mut wb, 0, &undo);
             assert_spills(&wb, "D1");
             assert_snapshot(&wb, &before);
+            assert_eq!(cell_at(&wb, "D1").f_attrs.as_deref(), f_attrs, "undo");
             eng.restore_cells(&mut wb, 0, &after);
             assert_spills(&wb, "D1");
             assert_snapshot(&wb, &after);
+            assert_eq!(cell_at(&wb, "D1").f_attrs.as_deref(), f_attrs, "redo");
         }
     }
 
@@ -3118,6 +3132,24 @@ mod tests {
         eng.restore_cells(&mut wb, 0, &after);
         assert_snapshot(&wb, &after);
         assert!(cell_at(&wb, "D1").formula.is_none());
+    }
+
+    #[test]
+    fn a_same_formula_pasted_over_a_cell_keeps_no_foreign_vm() {
+        // #825 r1 p4: a clone of the same formula from another workbook lands
+        // on this cell's own formula (set_cell's same-formula arm). Its `vm`
+        // indexes the other workbook's metadata: this cell's own (none) wins.
+        let (mut wb, mut eng) = spilling_book(Cell::default());
+        set(&mut eng, &mut wb, "D1", Cell::formula("A1:A3*2"));
+        let mut clone = cell_at(&wb, "D1");
+        let m = clone.meta.get_or_insert_default();
+        m.vm = Some(("9".into(), CellValue::Number(2.0)));
+        m.vm_body = Some("2".into());
+        set(&mut eng, &mut wb, "D1", clone);
+        let m = cell_at(&wb, "D1").meta.unwrap();
+        assert_eq!((m.vm, m.vm_body), (None, None));
+        assert!(m.modern && m.dynamic);
+        assert_spills(&wb, "D1");
     }
 
     #[test]
