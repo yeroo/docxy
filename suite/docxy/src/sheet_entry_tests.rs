@@ -1128,3 +1128,32 @@ fn a_sort_across_a_spill_is_refused_with_a_reason() {
     assert_eq!(v.undo.len(), undo);
     assert_eq!(value(&v, 0, 0), CellValue::Number(3.0));
 }
+
+#[test]
+fn a_replace_all_mixing_a_blank_into_a_frozen_block_clears_it() {
+    // #840 r1 p1: replace "x" with "" over a frozen array block E1:E3 whose
+    // cached cells are E2 "x", E3 "xy": E2 becomes blank and E3 "y" in one
+    // group, so the blank clears E2 though it comes first.
+    let mut v = view();
+    let s = v.active;
+    let sheet = &mut v.pkg.workbook.sheets[s];
+    sheet.set_cell(0, 0, Cell::number(1.0));
+    sheet.set_cell(
+        0,
+        4,
+        Cell {
+            value: CellValue::Number(7.0),
+            formula: Some("PIVOTBY(A1,4)".into()),
+            f_attrs: Some("t=\"array\" ref=\"E1:E3\"".into()),
+            spill: Some((3, 1)),
+            ..Cell::default()
+        },
+    );
+    sheet.set_cell(1, 4, Cell::text("x"));
+    sheet.set_cell(2, 4, Cell::text("xy"));
+    v.engine = sheet_engine(&v.pkg.workbook);
+    assert_eq!(v.replace_all_cells("x", ""), 2);
+    assert_eq!(value(&v, 0, 4), CellValue::Number(7.0));
+    assert_eq!(value(&v, 1, 4), CellValue::Empty);
+    assert_eq!(value(&v, 2, 4), CellValue::Text("y".into()));
+}

@@ -473,8 +473,9 @@ struct SheetView {
     /// count each render; visible rows are re-measured every layout, so height
     /// changes take effect without an explicit reset.
     vlist: ListState,
-    /// Why the last commit was refused (an entry over the cell limit, or a
-    /// formula that does not parse: `formula_error`); the host shows it in
+    /// Why the last commit or sort was refused (an entry over the cell
+    /// limit, or a formula that does not parse: `formula_error`; a sort whose
+    /// rows cut a spilled array: `SORT_CUTS_SPILL`); the host shows it in
     /// the status bar.
     entry_error: Option<String>,
     /// Leftmost visible column (horizontal scroll offset). Columns virtualize by
@@ -1888,26 +1889,50 @@ impl SheetView {
     /// edited no longer shows its `%`). False when the cell had no match or
     /// cannot hold the result.
     fn replace_in_cell(&mut self, r: u32, c: u32, q: &str, rep: &str) -> bool {
-        let Some(cell) = self.sheet().cell(r, c).cloned() else {
+        let Some(new_cell) = self.replaced_cell(r, c, q, rep) else {
             return false;
         };
+        let s = self.active;
+        self.engine
+            .set_cell(&mut self.pkg.workbook, (s, r, c), new_cell);
+        true
+    }
+
+    /// Find & Replace over every cell of the sheet, as one group
+    /// ([`Engine::set_cells`]: a blank it leaves in a frozen array block
+    /// clears its cell whatever order the cells come in). Each cell is
+    /// matched as it was before the replace. The number of cells replaced.
+    fn replace_all_cells(&mut self, q: &str, rep: &str) -> u32 {
+        let keys: Vec<(u32, u32)> = self.sheet().cells.keys().copied().collect();
+        let changes: Vec<(u32, u32, gridcore::sheet::Cell)> = keys
+            .into_iter()
+            .filter_map(|(r, c)| self.replaced_cell(r, c, q, rep).map(|cell| (r, c, cell)))
+            .collect();
+        let n = changes.len() as u32;
+        let s = self.active;
+        self.engine.set_cells(&mut self.pkg.workbook, s, changes);
+        n
+    }
+
+    /// The cell `(r, c)` becomes when `q` is replaced by `rep` in it
+    /// ([`Self::replace_in_cell`]), or `None`.
+    fn replaced_cell(
+        &mut self,
+        r: u32,
+        c: u32,
+        q: &str,
+        rep: &str,
+    ) -> Option<gridcore::sheet::Cell> {
+        let cell = self.sheet().cell(r, c).cloned()?;
         let text = self.search_text(r, c);
         if q.is_empty() || !text.to_lowercase().contains(&q.to_lowercase()) {
-            return false;
+            return None;
         }
         let xf = self.pkg.workbook.styles.xf(cell.style);
         let new = gridcore::entry::replaced_entry(&cell, &xf, ci_replace(&text, q, rep));
         let ctx = gridcore::entry::entry_ctx(&self.pkg.workbook, self.engine.clock);
         let styles = &mut self.pkg.workbook.styles;
-        match gridcore::entry::reenter_cell(&cell, styles, &ctx, &text, &new) {
-            Ok(new_cell) => {
-                let s = self.active;
-                self.engine
-                    .set_cell(&mut self.pkg.workbook, (s, r, c), new_cell);
-                true
-            }
-            Err(_) => false,
-        }
+        gridcore::entry::reenter_cell(&cell, styles, &ctx, &text, &new).ok()
     }
 
     /// Apply a formatting change to the selection and keep it for F4.
@@ -9932,9 +9957,11 @@ impl Docxy {
         cx.notify();
     }
 
-    /// After a commit: when the entry was refused (over the cell limit, or a
-    /// formula that does not parse), say why in the status bar and report it,
-    /// so the caller leaves the editor open.
+    /// After a commit or a sort: when it was refused (an entry over the cell
+    /// limit, or a formula that does not parse; a sort whose rows cut a
+    /// spilled array), say why in the status bar and report it. A refused
+    /// entry leaves its editor open; a refused sort has none open (its
+    /// pending edit was committed first).
     fn sheet_entry_refused(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(err) = self.active_sheet_mut().and_then(|v| v.entry_error.take()) else {
             return false;
@@ -11181,15 +11208,9 @@ impl Docxy {
             return;
         }
         self.sheet_snapshot();
-        let mut n = 0u32;
-        if let Some(v) = self.active_sheet_mut() {
-            let cells: Vec<(u32, u32)> = v.sheet().cells.keys().copied().collect();
-            for (r, c) in cells {
-                if v.replace_in_cell(r, c, &q, &rep) {
-                    n += 1;
-                }
-            }
-        }
+        let n = self
+            .active_sheet_mut()
+            .map_or(0, |v| v.replace_all_cells(&q, &rep));
         if let Some(t) = self.tabs.get_mut(self.active) {
             t.status = format!("replaced {n}").into();
         }
