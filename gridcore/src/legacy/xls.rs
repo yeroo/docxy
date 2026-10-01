@@ -366,29 +366,27 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
                 // read, so a record cut short doesn't shift the books after
                 // it.
                 0x01AE => {
-                    let ctab = c.u16()?;
-                    let cch = c.u16()?;
-                    let kind = match cch {
-                        0x0401 => Book::Own,
-                        0x3A01 => Book::AddIn,
-                        _ => Book::External(None),
-                    };
-                    let external = matches!(kind, Book::External(_));
                     g.books.push(SupBook {
-                        kind,
+                        kind: Book::External(None),
                         names: Vec::new(),
                         lib: None,
                     });
-                    if external {
-                        // virtPath (XLUnicodeStringNoCch, `cch` characters),
-                        // then `ctab` sheet names.
-                        let high = c.u8()? & 1 == 1;
-                        let file = library_file(&c.chars(cch as usize, high)?)?;
-                        let mut sheets = Vec::new();
-                        for _ in 0..ctab {
-                            sheets.push(c.xl_string()?);
+                    let ctab = c.u16()?;
+                    let cch = c.u16()?;
+                    match cch {
+                        0x0401 => g.books.last_mut()?.kind = Book::Own,
+                        0x3A01 => g.books.last_mut()?.kind = Book::AddIn,
+                        _ => {
+                            // virtPath (XLUnicodeStringNoCch, `cch` characters),
+                            // then `ctab` sheet names.
+                            let high = c.u8()? & 1 == 1;
+                            let file = library_file(&c.chars(cch as usize, high)?)?;
+                            let mut sheets = Vec::new();
+                            for _ in 0..ctab {
+                                sheets.push(c.xl_string()?);
+                            }
+                            g.books.last_mut()?.lib = Some((file, sheets));
                         }
-                        g.books.last_mut()?.lib = Some((file, sheets));
                     }
                 }
                 // EXTERNNAME: likewise its slot first. An add-in book's
@@ -1456,6 +1454,8 @@ pub(crate) mod tests {
         let globals = [
             // Before any SUPBOOK: ignored.
             extern_name(0, "Stray", &[]),
+            // Cut off before its cch.
+            rec(0x01AE, &[0, 0]),
             // Cut off after ctab and cch.
             rec(0x01AE, &[0, 0, 12, 0]),
             // Cut off in its sheet names: a book with no link.
@@ -1469,7 +1469,13 @@ pub(crate) mod tests {
             rec(0x0023, &[0, 0, 0]),
             extern_name(0, "EDATE", &[]),
             own_supbook(),
-            extern_sheet(&[(0, -2, -2), (1, -2, -2), (2, -2, -2), (3, -2, -2)]),
+            extern_sheet(&[
+                (1, -2, -2),
+                (2, -2, -2),
+                (3, -2, -2),
+                (4, -2, -2),
+                (0, -2, -2),
+            ]),
         ];
         let book = read(&workbook(
             &globals,
@@ -1481,6 +1487,7 @@ pub(crate) mod tests {
                 name_x(2, 3),
                 name_x(3, 1),
                 name_x(3, 2),
+                name_x(4, 1),
             ]),
         ))
         .unwrap();
@@ -1494,6 +1501,7 @@ pub(crate) mod tests {
                 Some("[1]!F".to_string()),
                 None,
                 Some("EDATE".to_string()),
+                None,
             ]
         );
         assert_eq!(book.external_links.len(), 1);

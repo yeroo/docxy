@@ -1047,9 +1047,10 @@ mod tests {
     }
 
     /// A ptgNameX that names nothing readable keeps its cell's value and
-    /// loses the formula: a book with no part, a DDE book, an XLL add-in,
-    /// a name scoped to a sheet of the book, a name past the book's names,
-    /// a book whose own rel is missing, and an XTI past the books.
+    /// loses the formula: a book with no part, a DDE book, an XLL add-in
+    /// with no name at that index, a name scoped to a sheet of the book, a
+    /// name past the book's names, a book whose own rel is missing, and an
+    /// XTI past the books.
     #[test]
     fn name_x_leniency() {
         let src = |rid: &str| rec(BRT_SUP_BOOK_SRC, &wide(rid));

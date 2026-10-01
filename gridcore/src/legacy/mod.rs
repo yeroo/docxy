@@ -6,7 +6,7 @@
 //! Opening one is an *import*, like a CSV: the reader builds a fresh
 //! [`SheetPackage`] (as `new_xlsx` makes one) with the sheets, values, formulas,
 //! number formats, date system, defined names and the external links that
-//! calls to add-in functions need (`.xlsb`), so everything downstream
+//! calls to add-in functions need (`.xlsb`, `.xls`), so everything downstream
 //! (engine, editor, save) sees an ordinary workbook and saving writes
 //! `.xlsx`. Nothing the readers don't model survives the import.
 //!
