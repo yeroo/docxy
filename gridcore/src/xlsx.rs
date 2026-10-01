@@ -10692,6 +10692,25 @@ b",
     }
 
     #[test]
+    fn fill_copy_of_a_cm_cell_saves_without_its_cm() {
+        // #777: Ctrl+D/Ctrl+R (fill_changes) copies, like autofill's, carry
+        // none of the source's `<c>` metadata: a copy of a 1x1 dynamic array
+        // whose own formula is scalar saves as a plain formula, not as an
+        // array because the source was one.
+        let rows = r#"<row r="1"><c r="A1"><v>3</v></c><c r="B1"><v>4</v></c><c r="D1" cm="1"><f t="array" ref="D1">A1*2</f><v>6</v></c></row>"#;
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        fill_from_d1(&mut pkg, (0, 4), false);
+        let e1 = pkg.workbook.sheets[0].cell(0, 4).unwrap();
+        assert!(!e1.has_cm() && e1.is_modern() && !e1.is_dynamic());
+        let ws = saved_sheet1(&pkg);
+        assert_eq!(
+            saved_cell(&ws, "E1"),
+            r#"<c r="E1"><f>B1*2</f><v>8</v></c>"#
+        );
+        assert!(saved_cell(&ws, "D1").contains(r#"cm="1""#), "{ws}");
+    }
+
+    #[test]
     fn cm_is_written_only_on_an_array_formula() {
         // A data-table `<f>` is kept verbatim but is not a dynamic array.
         let rows = r#"<row r="1"><c r="A1"><v>1</v></c><c r="G1" cm="1"><f t="dataTable" ref="G1:G2" dt2D="0" dtr="0" r1="A1"/><v>1</v></c></row>"#;
