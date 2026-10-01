@@ -534,10 +534,10 @@ fn main() -> ExitCode {
     };
 
     if let Some(out) = parsed.recalc_out {
-        // Only a workbook package is written: an .xls, .xlsb, .ods (or any
-        // type Save As refuses) would get .xlsx bytes under its name.
+        // Only a workbook package is written: an .xls, .xlsb, .ods, .xml (or
+        // any type Save As refuses) would get .xlsx bytes under its name.
         if let Some(t) = type_for_path(&out).map(|i| &SAVE_TYPES[i]) {
-            if save_kind(t) == SaveKind::Unsupported {
+            if matches!(save_kind(t), SaveKind::Unsupported | SaveKind::XmlData) {
                 eprintln!(
                     "error: cannot save as .{} ({}): write .xlsx instead",
                     t.ext, t.label
@@ -717,12 +717,23 @@ fn load_workbook(
 }
 
 /// The `.xlsx` an imported workbook is bound to: `book.xls` gives
-/// `book.xlsx` beside it.
+/// `book.xlsx` beside it, or, when that exists (or is the imported file
+/// itself, an `.xls` named `.xlsx`), `book1.xlsx`, `book2.xlsx` and so on,
+/// as [`template_binding`] numbers them. A save never lands on a file the
+/// user already has.
 fn import_binding(path: &str) -> String {
-    Path::new(path)
-        .with_extension("xlsx")
-        .to_string_lossy()
-        .into_owned()
+    let source = Path::new(path);
+    let free = |p: &Path| p != source && !p.exists();
+    let plain = source.with_extension("xlsx");
+    if free(&plain) {
+        return plain.to_string_lossy().into_owned();
+    }
+    let base = source.with_extension("");
+    let base = base.to_string_lossy();
+    (1u32..)
+        .map(|n| format!("{base}{n}.xlsx"))
+        .find(|p| free(Path::new(p)))
+        .unwrap_or_else(|| plain.to_string_lossy().into_owned())
 }
 
 /// Whether `path` names a template (`.xltx`, `.xltm`).
@@ -8404,11 +8415,51 @@ mod tests {
             let saved = load_xlsx(&std::fs::read(&binding).unwrap()).unwrap();
             assert_eq!(saved.workbook.sheets[0].name, app.sheet().name, "{ext}");
             assert_eq!(std::fs::read(&source).unwrap(), original, "{ext}");
+            // The next format binds book.xlsx again only once it's gone.
+            std::fs::remove_file(&binding).unwrap();
         }
         let app = App::new(new_xlsx(), "untitled.xlsx");
         for ext in ["xls", "xlsb", "ods"] {
             assert!(app.extensions().contains(&ext), "{ext}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #603: an import beside an existing `<stem>.xlsx` binds to the next
+    /// free name, so Ctrl+S leaves that file alone; an `.xls` that is named
+    /// `.xlsx` never binds to itself.
+    #[test]
+    fn legacy_imports_never_bind_to_an_existing_file() {
+        let dir = tmp("legacy-import-free");
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/legacy");
+        let source = dir.join("report.xls");
+        std::fs::copy(corpus.join("oracle-basic.xls"), &source).unwrap();
+        let existing = dir.join("report.xlsx");
+        std::fs::write(&existing, b"the user's own report").unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.open_workbook(source.to_str().unwrap());
+        let bound = dir.join("report1.xlsx");
+        assert_eq!(Path::new(&app.path), bound);
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap()
+                .ends_with(&format!("saving writes {}", bound.display()))
+        );
+        app.save();
+        assert_eq!(std::fs::read(&existing).unwrap(), b"the user's own report");
+        assert!(load_xlsx(&std::fs::read(&bound).unwrap()).is_ok());
+
+        // An .xls saved under an .xlsx name.
+        let disguised = dir.join("book.xlsx");
+        std::fs::copy(corpus.join("oracle-basic.xls"), &disguised).unwrap();
+        let original = std::fs::read(&disguised).unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.open_workbook(disguised.to_str().unwrap());
+        assert_eq!(Path::new(&app.path), dir.join("book1.xlsx"));
+        app.save();
+        assert_eq!(std::fs::read(&disguised).unwrap(), original);
+        assert!(load_xlsx(&std::fs::read(dir.join("book1.xlsx")).unwrap()).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

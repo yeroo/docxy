@@ -425,8 +425,8 @@ fn legacy_inputs_recalc_to_xlsx_and_export_csv() {
     }
 }
 
-/// #603: `--recalc` to an .xls, .xlsb or .ods (types Save As refuses) exits
-/// 2 and writes nothing, rather than .xlsx bytes under that name.
+/// #603: `--recalc` to an .xls, .xlsb, .ods or .xml (types Save As refuses)
+/// exits 2 and writes nothing, rather than .xlsx bytes under that name.
 #[test]
 fn recalc_refuses_to_write_types_it_cannot_save() {
     let dir = Dir::new("legacy-out");
@@ -435,6 +435,7 @@ fn recalc_refuses_to_write_types_it_cannot_save() {
         ("xls", "Excel 97-2003 Workbook"),
         ("xlsb", "Excel Binary Workbook"),
         ("ods", "OpenDocument Spreadsheet"),
+        ("xml", "XML Data"),
     ] {
         let out = dir.0.join(format!("out.{ext}"));
         let result = run(&source, "--recalc", &out);
