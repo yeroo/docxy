@@ -776,27 +776,15 @@ fn rich_error_code(error_type: u32) -> Option<&'static str> {
 
 /// Parse a `.rels` stream into (id, type, target) triples.
 pub(crate) fn parse_rels(xml: &str) -> Vec<(String, String, String)> {
-    let mut out = Vec::new();
-    let mut p = XmlParser::new(xml);
-    loop {
-        match p.next() {
-            Event::Start if local(p.name()) == "Relationship" => {
-                out.push((
-                    decode(p.attr("Id")),
-                    decode(p.attr("Type")),
-                    decode(p.attr("Target")),
-                ));
-            }
-            Event::Eof => break,
-            _ => {}
-        }
-    }
-    out
+    parse_rels_mode(xml)
+        .into_iter()
+        .map(|(id, ty, target, _)| (id, ty, target))
+        .collect()
 }
 
-/// [`parse_rels`] with each relationship's `TargetMode` (`External`, or
-/// `None` for an internal one): (Id, Type, Target, TargetMode), the target
-/// as written.
+/// A `.rels` stream's relationships with their `TargetMode` (`External`,
+/// or `None` for an internal one): (Id, Type, Target, TargetMode), the
+/// target as written.
 pub(crate) fn parse_rels_mode(xml: &str) -> Vec<(String, String, String, Option<String>)> {
     let mut out = Vec::new();
     let mut p = XmlParser::new(xml);
