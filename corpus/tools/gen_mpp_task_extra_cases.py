@@ -37,6 +37,8 @@ SEEDS = (
     ("e9-pre-leveled-finish", "PreLeveledFinish", "2026-03-06T17:00:00"),
     ("e10-status-manager", "StatusManager", "Alice"),
 )
+# Seeded fields Project desktop drops on an .mpp save (README: Known decode gaps).
+GAPS = {"StatusManager"}
 
 
 def new_plan(app):
@@ -178,12 +180,17 @@ def seeded(app):
             open_file(app, source)
             tasks = save(app, slug)
             got = tasks.get(field, {}).get(field)
-            if got == value:
-                expect(slug, tasks, "Plain", field, tasks["Plain"].get(field))
-            else:
-                # Evidence for a decode gap: the field did not survive an .mpp save.
-                print(f"{slug}: Project did not keep {field}={value!r} through .mpp "
-                      f"(exported {got!r}); left as a decode gap", flush=True)
+            if field in GAPS:
+                # Evidence for a decode gap: the field must not survive an .mpp save.
+                if got is not None:
+                    raise AssertionError(f"{slug}: Project now keeps {field}={got!r}; decode it")
+                print(f"{slug}: Project did not keep {field}={value!r} through .mpp; "
+                      "left as a decode gap", flush=True)
+                continue
+            expect(slug, tasks, field, field, value)
+            # The plain neighbour must differ, or the diff locates nothing.
+            if tasks["Plain"].get(field) == value:
+                raise AssertionError(f"{slug}: Plain.{field} also = {value!r}")
 
 
 def main():

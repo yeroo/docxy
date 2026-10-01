@@ -1297,9 +1297,9 @@ fn task_extra_oracles() {
         for (mpp, xml) in &cases {
             check_pair(mpp, xml, false, Oracle::Project);
             let decoded = mppread::mpp::decode_tasks(&std::fs::read(mpp).unwrap()).unwrap();
-            for (uid, f) in decoded
+            for (name, f) in decoded
                 .iter()
-                .filter_map(|t| Some((t.uid, t.fields.as_ref()?)))
+                .filter_map(|t| Some((t.name.as_str(), t.fields.as_ref()?)))
             {
                 let set = [
                     ("contact", f.contact.is_some()),
@@ -1310,17 +1310,31 @@ fn task_extra_oracles() {
                     ("commitment_finish", f.commitment_finish.is_some()),
                     ("commitment_type", f.commitment_type.is_some_and(|c| c != 0)),
                     ("display_as_summary", f.display_as_summary == Some(true)),
-                    // Unpublished while an ordinary active task, unlike every
-                    // snapshot row (e2-published).
+                    // e2-published's ordinary active leaf with Publish
+                    // cleared: unlike every snapshot leaf, it exports 0.
                     (
                         "unpublished",
-                        uid != 0 && f.is_published == Some(false) && f.active == Some(true),
+                        name == "Unpublished"
+                            && f.is_published == Some(false)
+                            && f.active == Some(true),
                     ),
                 ];
                 seen.extend(set.into_iter().filter(|(_, on)| *on).map(|(n, _)| n));
             }
         }
-        assert_eq!(seen.len(), 9, "fields never decoded off default: {seen:?}");
+        let expected = std::collections::HashSet::from([
+            "contact",
+            "wbs_level",
+            "pre_leveled_start",
+            "pre_leveled_finish",
+            "commitment_start",
+            "commitment_finish",
+            "commitment_type",
+            "display_as_summary",
+            "unpublished",
+        ]);
+        let missing: Vec<_> = expected.difference(&seen).collect();
+        assert!(missing.is_empty(), "never decoded off default: {missing:?}");
         // Project desktop drops a seeded StatusManager on save (README: Known
         // decode gaps); the oracle must keep proving that.
         let gap = std::fs::read_to_string(dir.join("e10-status-manager.xml")).unwrap();
