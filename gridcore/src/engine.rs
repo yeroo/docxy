@@ -606,7 +606,7 @@ impl Engine {
     /// the cells both its extent and its own `ref` (one that starts at it)
     /// cover, where a blank is a no-op ([`Engine::spill_owner_of`]'s
     /// `frozen_ref_covers`).
-    fn frozen_blocks(&self, wb: &Workbook, s: usize) -> Vec<((u32, u32), (u32, u32, u32, u32))> {
+    fn frozen_blocks(&self, wb: &Workbook, s: usize) -> Vec<FrozenBlock> {
         let Some(sheet) = wb.sheets.get(s) else {
             return Vec::new();
         };
@@ -1134,6 +1134,10 @@ impl Engine {
         changed
     }
 }
+
+/// A frozen array anchor and the block `(r1, c1, r2, c2)` where a blank is a
+/// no-op ([`Engine::frozen_blocks`]).
+type FrozenBlock = ((u32, u32), (u32, u32, u32, u32));
 
 /// The spill anchor over a cell ([`Engine::spill_owner_of`]).
 struct SpillOwner {
