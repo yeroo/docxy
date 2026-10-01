@@ -699,8 +699,6 @@ impl Session {
                         }
                     }
                 }
-                let current = self.pkg.workbook.sheets[self.active].cell(r, c);
-                gridcore::sheet::anchor_pasted_array_ref(&mut cell, current, r, c);
                 changes.push((r, c, cell));
             }
         }

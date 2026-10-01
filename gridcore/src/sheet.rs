@@ -214,24 +214,12 @@ pub(crate) fn own_array_ref(cell: &mut Cell, row: u32, col: u32) {
     }
 }
 
-/// Make an array formula pasted at `(row, col)` cover that cell alone: its
-/// `ref` still names the block it was copied from. A paste calls this for
-/// every pasted cell, before `Engine::set_cell` — which can't tell a paste
-/// at the source's own address (on another sheet, or after the source
-/// moved) from an undo. `current` is the cell being replaced: when it
-/// already holds this very array (same `<f>` attributes and formula), the
-/// block is that cell's and a paste in place keeps it.
-pub fn anchor_pasted_array_ref(cell: &mut Cell, current: Option<&Cell>, row: u32, col: u32) {
-    if !cell.f_attrs.as_deref().is_some_and(is_array_f) {
-        return;
-    }
-    let in_place =
-        current.is_some_and(|cur| cur.f_attrs == cell.f_attrs && cur.formula == cell.formula);
-    if !in_place {
-        if let Some(fa) = cell.f_attrs.as_deref() {
-            cell.f_attrs = Some(with_ref(fa, &cell_name(row, col)));
-        }
-    }
+/// The block an array formula's stored `ref` names, as 0-based
+/// `(r1, c1, r2, c2)`: `None` for a cell that is not an array formula or
+/// whose `ref` is missing or unreadable.
+pub fn array_block(cell: &Cell) -> Option<(u32, u32, u32, u32)> {
+    let fa = cell.f_attrs.as_deref().filter(|a| is_array_f(a))?;
+    parse_range_name(f_ref(fa)?)
 }
 
 impl Cell {
