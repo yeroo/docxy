@@ -13,7 +13,7 @@
 //! this doesn't know makes the whole formula `None`: the reader then keeps
 //! the cell's cached value without a formula.
 
-use super::{biff_error, ftab};
+use super::{Le, biff_error, ftab};
 
 /// Which record format a token stream comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,33 +78,11 @@ pub(crate) enum Base {
     Shared(u32, u32),
 }
 
-/// A little-endian reader over a byte slice.
-struct Rd<'a> {
-    b: &'a [u8],
-    at: usize,
-}
+/// A little-endian reader over a token stream.
+type Rd<'a> = Le<'a>;
 
-impl Rd<'_> {
-    fn take(&mut self, n: usize) -> Option<&[u8]> {
-        let s = self.b.get(self.at..self.at.checked_add(n)?)?;
-        self.at += n;
-        Some(s)
-    }
-    fn u8(&mut self) -> Option<u8> {
-        Some(self.take(1)?[0])
-    }
-    fn u16(&mut self) -> Option<u16> {
-        let s = self.take(2)?;
-        Some(u16::from_le_bytes([s[0], s[1]]))
-    }
-    fn u32(&mut self) -> Option<u32> {
-        let s = self.take(4)?;
-        Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
-    }
-    fn f64(&mut self) -> Option<f64> {
-        let s = self.take(8)?;
-        Some(f64::from_le_bytes(s.try_into().ok()?))
-    }
+/// The token streams' fields, which differ between BIFF8 and BIFF12.
+impl Le<'_> {
     fn row(&mut self, v: Biff) -> Option<u32> {
         match v {
             Biff::V8 => self.u16().map(u32::from),
@@ -189,8 +167,8 @@ pub(crate) fn decompile(
     if rgce.len() > MAX_RGCE {
         return None;
     }
-    let mut rd = Rd { b: rgce, at: 0 };
-    let mut ex = Rd { b: extra, at: 0 };
+    let mut rd = Rd::new(rgce);
+    let mut ex = Rd::new(extra);
     let mut st: Vec<String> = Vec::new();
     while rd.at < rgce.len() {
         if st.last().is_some_and(|t| t.len() > MAX_TEXT_BYTES) {

@@ -547,6 +547,70 @@ fn restore_colons(src: &str) -> String {
     out
 }
 
+/// A little-endian cursor over a byte slice, for the BIFF8 and BIFF12
+/// readers. Each format's own strings and layouts are methods in its file
+/// (`xls::Cur` wraps one with its CONTINUE breaks).
+pub(crate) struct Le<'a> {
+    pub(crate) d: &'a [u8],
+    pub(crate) at: usize,
+}
+
+impl<'a> Le<'a> {
+    pub(crate) fn new(d: &'a [u8]) -> Le<'a> {
+        Le { d, at: 0 }
+    }
+    pub(crate) fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let s = self.d.get(self.at..self.at.checked_add(n)?)?;
+        self.at += n;
+        Some(s)
+    }
+    pub(crate) fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+    pub(crate) fn u16(&mut self) -> Option<u16> {
+        let s = self.take(2)?;
+        Some(u16::from_le_bytes([s[0], s[1]]))
+    }
+    pub(crate) fn u32(&mut self) -> Option<u32> {
+        let s = self.take(4)?;
+        Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+    pub(crate) fn f64(&mut self) -> Option<f64> {
+        Some(f64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+    /// Everything left.
+    pub(crate) fn rest(&mut self) -> &'a [u8] {
+        let s = self.d.get(self.at..).unwrap_or(&[]);
+        self.at = self.d.len();
+        s
+    }
+}
+
+/// A file's number formats as its xfs use them (BIFF8 and BIFF12 alike):
+/// each xf's format id, and the file's own format codes by id.
+#[derive(Default)]
+pub(crate) struct XfFormats {
+    pub(crate) xf_fmt: Vec<u16>,
+    pub(crate) codes: HashMap<u16, String>,
+}
+
+impl XfFormats {
+    /// The `book.formats` index of xf `xf`'s number format: the file's own
+    /// code for its id, else the built-in one, else General.
+    pub(crate) fn format_of(&self, xf: u32, book: &mut BookIn) -> u32 {
+        let ifmt = self.xf_fmt.get(xf as usize).copied().unwrap_or(0);
+        match self
+            .codes
+            .get(&ifmt)
+            .cloned()
+            .or_else(|| builtin_format(ifmt as u32))
+        {
+            Some(code) => book.format_index(&code),
+            None => 0,
+        }
+    }
+}
+
 /// An RK number (BIFF8 and BIFF12): a 30-bit integer or the top of an
 /// IEEE double, either optionally scaled by 1/100.
 pub(crate) fn rk(v: u32) -> f64 {

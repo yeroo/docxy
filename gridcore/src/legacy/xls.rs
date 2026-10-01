@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::ptg::{self, Base, Biff, Names};
 use super::{
-    BookIn, Limits, OpenError, SheetIn, biff_error, builtin_format, on_grid, rk, set_array,
+    BookIn, Le, Limits, OpenError, SheetIn, XfFormats, biff_error, on_grid, rk, set_array,
     sheet_prefix,
 };
 use crate::sheet::{Cell, CellValue, DefinedName};
@@ -57,44 +57,32 @@ fn records(s: &[u8]) -> Vec<Rec> {
     out
 }
 
-/// A little-endian cursor over one record's data.
+/// A little-endian cursor over one record's data, which knows where its
+/// CONTINUE pieces start.
 struct Cur<'a> {
-    d: &'a [u8],
+    le: Le<'a>,
     breaks: &'a [usize],
-    at: usize,
+}
+
+impl<'a> std::ops::Deref for Cur<'a> {
+    type Target = Le<'a>;
+    fn deref(&self) -> &Le<'a> {
+        &self.le
+    }
+}
+
+impl<'a> std::ops::DerefMut for Cur<'a> {
+    fn deref_mut(&mut self) -> &mut Le<'a> {
+        &mut self.le
+    }
 }
 
 impl<'a> Cur<'a> {
     fn new(r: &'a Rec) -> Cur<'a> {
         Cur {
-            d: &r.data,
+            le: Le::new(&r.data),
             breaks: &r.breaks,
-            at: 0,
         }
-    }
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let s = self.d.get(self.at..self.at.checked_add(n)?)?;
-        self.at += n;
-        Some(s)
-    }
-    fn u8(&mut self) -> Option<u8> {
-        Some(self.take(1)?[0])
-    }
-    fn u16(&mut self) -> Option<u16> {
-        let s = self.take(2)?;
-        Some(u16::from_le_bytes([s[0], s[1]]))
-    }
-    fn u32(&mut self) -> Option<u32> {
-        let s = self.take(4)?;
-        Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
-    }
-    fn f64(&mut self) -> Option<f64> {
-        Some(f64::from_le_bytes(self.take(8)?.try_into().ok()?))
-    }
-    fn rest(&mut self) -> &'a [u8] {
-        let s = self.d.get(self.at..).unwrap_or(&[]);
-        self.at = self.d.len();
-        s
     }
 
     /// `cch` characters starting with high-byte mode `high`; where the data
@@ -395,16 +383,9 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
         }
     }
 
-    let format_of = |ixfe: u16, book: &mut BookIn| -> u32 {
-        let ifmt = xf_fmt.get(ixfe as usize).copied().unwrap_or(0);
-        match fmt_codes
-            .get(&ifmt)
-            .cloned()
-            .or_else(|| builtin_format(ifmt as u32))
-        {
-            Some(code) => book.format_index(&code),
-            None => 0,
-        }
+    let formats = XfFormats {
+        xf_fmt,
+        codes: fmt_codes,
     };
 
     // Worksheets, in BOUNDSHEET8 order; `imported[i]` is the model index
@@ -424,7 +405,7 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
             imported.push(None);
             continue;
         };
-        let sheet = read_sheet(&recs[start + 1..], &g, &sst, &mut book, &format_of)?;
+        let sheet = read_sheet(&recs[start + 1..], &g, &sst, &mut book, &formats)?;
         imported.push(Some(book.sheets.len()));
         book.push_sheet(SheetIn {
             name: g.sheets[i].clone(),
@@ -477,7 +458,7 @@ fn read_sheet(
     g: &Globals,
     sst: &[String],
     book: &mut BookIn,
-    format_of: &dyn Fn(u16, &mut BookIn) -> u32,
+    formats: &XfFormats,
 ) -> Result<BTreeMap<(u32, u32), Cell>, OpenError> {
     let mut cells = BTreeMap::new();
     // Cells charged to the workbook's budget so far.
@@ -507,7 +488,7 @@ fn read_sheet(
             (r as u32, c as u32),
             Cell {
                 value,
-                style: format_of(ixfe, book),
+                style: formats.format_of(ixfe.into(), book),
                 ..Cell::default()
             },
         );
