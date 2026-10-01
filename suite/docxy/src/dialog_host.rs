@@ -62,9 +62,40 @@ fn apply_dialog(
         DialogOwner::TextToColumns { .. } | DialogOwner::TextToColumnsReplace => {
             Err("Text to Columns applies through its own wizard".into())
         }
+        // Handled in `reopen_click`, before this: Yes replaces the whole tab.
+        DialogOwner::Reopen { .. } => Err("reopening replaces the tab".into()),
         #[cfg(test)]
         DialogOwner::Test => Ok(false),
     }
+}
+
+/// Yes on the reopen question (#610): the tab's file, loaded again in the
+/// mode that was asked for, replaces the tab and its unsaved changes. `None`
+/// for any other dialog or button (No is the cancel button and just closes).
+fn reopen_click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>> {
+    let top = tab.dialogs.top()?;
+    let DialogOwner::Reopen { mode } = top.owner else {
+        return None;
+    };
+    let accept = top
+        .buttons
+        .iter()
+        .find(|b| b.label.eq_ignore_ascii_case(button))
+        .is_some_and(|b| b.role == dialog::ButtonRole::Accept);
+    if !accept {
+        return None;
+    }
+    let Some(path) = tab.path.clone() else {
+        return Some(Err("this tab has no file to reopen".into()));
+    };
+    Some(crate::tab_from_path_mode(&path, mode).map(|fresh| *tab = fresh))
+}
+
+/// Whether the active tab's top dialog is the reopen question, whose Yes
+/// replaces the tab under any grid state the window keeps for it.
+fn reopen_on_top(tab: Option<&DocTab>) -> bool {
+    tab.and_then(|t| t.dialogs.top())
+        .is_some_and(|d| matches!(d.owner, DialogOwner::Reopen { .. }))
 }
 
 /// Press a button on the tab's top dialog, by its label.
@@ -73,6 +104,9 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Result<(), String>
     flush_level_pass(tab);
     // Text to Columns asks its own question before it applies.
     if let Some(done) = crate::ttc_dialog::click(tab, button) {
+        return done;
+    }
+    if let Some(done) = reopen_click(tab, button) {
         return done;
     }
     let DocTab {
@@ -176,8 +210,20 @@ impl Docxy {
 
     /// Press a button on the active tab's top dialog.
     pub(crate) fn dialog_press(&mut self, button: &str) -> Result<(), String> {
+        let reopen = reopen_on_top(self.tabs.get(self.active));
         let tab = self.tabs.get_mut(self.active).ok_or(NONE_OPEN)?;
-        dialog_click(tab, button)
+        dialog_click(tab, button)?;
+        if reopen {
+            self.after_reopen();
+        }
+        Ok(())
+    }
+
+    /// The tab may have been replaced by its file: nothing the window held
+    /// for the old one applies, and the session should say what is open.
+    fn after_reopen(&mut self) {
+        self.drop_grid_state();
+        self.persist();
     }
 
     /// A key for the active tab's dialog; see [`dialog_key`].
@@ -188,11 +234,15 @@ impl Docxy {
         m: Modifiers,
         cx: &mut Context<Self>,
     ) -> bool {
+        let reopen = reopen_on_top(self.tabs.get(self.active));
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return false;
         };
         let taken = dialog_key(tab, key, typed, m);
         if taken {
+            if reopen {
+                self.after_reopen();
+            }
             cx.notify();
         }
         taken

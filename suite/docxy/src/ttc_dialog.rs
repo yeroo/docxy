@@ -506,6 +506,7 @@ mod tests {
             bundle_html: None,
             load_failed: false,
             dialogs: crate::dialog::DialogStack::default(),
+            access: crate::open_mode::Access::default(),
         }
     }
 

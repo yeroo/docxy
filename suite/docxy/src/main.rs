@@ -33,6 +33,7 @@ mod hf_tab;
 mod html_bundle;
 mod layout_tab;
 mod menu;
+mod open_mode;
 mod page_number;
 mod page_setup;
 mod project;
@@ -50,6 +51,7 @@ mod table_tab;
 mod table_view;
 mod tabstrip;
 mod ttc_dialog;
+use open_mode::{OpenMode, Reopen, ReopenStep, reopen_step};
 use project::*;
 
 use std::path::PathBuf;
@@ -203,6 +205,15 @@ struct PersistTab {
     /// written before this was recorded: restore then asks the file itself.
     #[serde(default)]
     load_failed: Option<bool>,
+    /// The tab's [`open_mode::Access`] (#610), so a read-only, repaired or
+    /// Protected View tab comes back the same. Protected View is kept, never
+    /// re-read from the file's zone: that would undo Enable Editing.
+    #[serde(default)]
+    read_only: bool,
+    #[serde(default)]
+    protected: bool,
+    #[serde(default)]
+    repaired: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -726,6 +737,16 @@ fn bar_target(act: SheetAct) -> Option<RefTarget> {
 /// four that never touch it — protection and outlining are properties of the
 /// whole sheet, the Number format combo only opens or closes its strip (a
 /// format picked there is what acts on cells), and `Todo` does nothing at all.
+/// The workbook commands Protected View lets through (#610): copying and
+/// moving between comments only look. Everything else edits, opens a bar or
+/// dialog that would, or changes what the file saves (Freeze Panes, Outline).
+fn protected_view_allows_act(act: SheetAct) -> bool {
+    matches!(
+        act,
+        SheetAct::Copy | SheetAct::PrevComment | SheetAct::NextComment | SheetAct::Todo
+    )
+}
+
 fn act_targets_cells(act: SheetAct) -> bool {
     !matches!(
         act,
@@ -2405,6 +2426,18 @@ struct DocTab {
     /// app state, never a native modal loop: it draws over the window, takes
     /// every key while open, and the harness drives it as the pointer would.
     dialogs: dialog::DialogStack,
+    /// How this tab may use its file (#610): opened read-only, repaired, or
+    /// in Protected View. Only a workbook tab ever sets any of it.
+    access: open_mode::Access,
+}
+
+impl DocTab {
+    /// What the tab strip shows for this tab: its file name, then Excel's
+    /// `[Protected View]`, `[Repaired]` or `[Read-Only]` (#610). `title`
+    /// itself stays the plain name, because it seeds Save As.
+    fn caption(&self) -> String {
+        open_mode::caption(&self.title, self.access)
+    }
 }
 
 /// Live header/footer edit session: an editor over the parsed header/footer
@@ -4138,6 +4171,7 @@ impl Loaded {
             bundle_html: self.bundle_html,
             load_failed: self.load_failed,
             dialogs: crate::dialog::DialogStack::default(),
+            access: crate::open_mode::Access::default(),
         }
     }
 }
@@ -4284,7 +4318,18 @@ fn tab_from_path(path: &PathBuf) -> DocTab {
     }
     let title: SharedString = file_name(path).into();
     if is_sheet_path(path) {
-        let (surface, status) = sheet_from_path(path);
+        sheet_tab_from_path(path, false)
+    } else {
+        doc_from_path(path).into_tab(Kind::Docx, title, Some(path.clone()), false)
+    }
+}
+
+/// A workbook tab for `path`, loaded leniently when `repair`. A template
+/// opens as a new, untitled workbook.
+fn sheet_tab_from_path(path: &PathBuf, repair: bool) -> DocTab {
+    let title: SharedString = file_name(path).into();
+    {
+        let (surface, status) = sheet_from_path_mode(path, repair);
         let (title, path, status) = match template_title(path) {
             Some(new_title) if matches!(surface, Surface::Sheet(_)) => (
                 new_title.into(),
@@ -4308,10 +4353,33 @@ fn tab_from_path(path: &PathBuf) -> DocTab {
             bundle_html: None,
             load_failed: false,
             dialogs: crate::dialog::DialogStack::default(),
+            access: crate::open_mode::Access::default(),
         }
-    } else {
-        doc_from_path(path).into_tab(Kind::Docx, title, Some(path.clone()), false)
     }
+}
+
+/// [`tab_from_path`] in an open mode (#610). Only a workbook takes a mode;
+/// anything else opens as usual. Protected View comes from the source file's
+/// zone, so Open as Copy of a downloaded file is protected too. `Err` only
+/// when the copy could not be written; a failed load is still a tab, whose
+/// status says why.
+fn tab_from_path_mode(path: &PathBuf, mode: OpenMode) -> Result<DocTab, String> {
+    if is_project_path(path) || !is_sheet_path(path) {
+        return Ok(tab_from_path(path));
+    }
+    let protected = open_mode::is_protected_zone(open_mode::zone_id(path));
+    let path = match mode {
+        OpenMode::Copy => open_mode::write_copy(path)?,
+        _ => path.clone(),
+    };
+    let mut tab = sheet_tab_from_path(&path, mode == OpenMode::Repair);
+    // A template opens untitled: Save already asks where to go, and there is
+    // no file of its own to keep from being overwritten.
+    if tab.path.is_some() {
+        tab.access = mode.access();
+    }
+    tab.access.protected = protected;
+    Ok(tab)
 }
 
 /// Char index → byte offset in `s` (clamped to the string length).
@@ -6770,9 +6838,24 @@ fn has_uncached_formula(wb: &gridcore::sheet::Workbook) -> bool {
 }
 
 fn sheet_from_path(path: &PathBuf) -> (Surface, SharedString) {
+    sheet_from_path_mode(path, false)
+}
+
+/// [`sheet_from_path`], through Open and Repair's lenient load when `repair`
+/// (#610). The status of a repaired load still starts with `loaded`, so the
+/// harness does not read it as a failed open, and names every part that was
+/// emptied or dropped.
+fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString) {
+    let loaded = |bytes: &[u8]| {
+        if repair {
+            gridcore::xlsx::load_xlsx_repair(bytes)
+        } else {
+            gridcore::xlsx::load_xlsx(bytes).map(|pkg| (pkg, gridcore::xlsx::Repairs::default()))
+        }
+    };
     match std::fs::read(path) {
-        Ok(bytes) => match gridcore::xlsx::load_xlsx(&bytes) {
-            Ok(mut pkg) => {
+        Ok(bytes) => match loaded(&bytes) {
+            Ok((mut pkg, repairs)) => {
                 let n = pkg.workbook.sheets.len();
                 let mut engine = sheet_engine(&pkg.workbook);
                 // A formula saved without its cached `<v>` (openpyxl writes
@@ -6807,10 +6890,15 @@ fn sheet_from_path(path: &PathBuf) -> (Surface, SharedString) {
                     follow_sel: (0, 0),
                     reveal_col: None,
                 };
-                (
-                    Surface::Sheet(view),
-                    format!("loaded — {n} sheet{}", if n == 1 { "" } else { "s" }).into(),
-                )
+                let mut status = format!("loaded — {n} sheet{}", if n == 1 { "" } else { "s" });
+                if repair {
+                    status.push_str(&repair_summary(&repairs));
+                }
+                (Surface::Sheet(view), status.into())
+            }
+            // A repair's refusal names the part, in words.
+            Err(e @ gridcore::xlsx::XlsxError::Unrepairable(_)) => {
+                (Surface::Placeholder, format!("xlsx load error: {e}").into())
             }
             Err(e) => (
                 Surface::Placeholder,
@@ -6819,6 +6907,44 @@ fn sheet_from_path(path: &PathBuf) -> (Surface, SharedString) {
         },
         Err(e) => (Surface::Placeholder, format!("read error: {e}").into()),
     }
+}
+
+/// The backstop behind Protected View's gates (#610). An edit reached a
+/// protected workbook, so a gate leaked. The tab opened with an empty undo
+/// stack and every gate refuses before taking a snapshot, so the oldest one
+/// on the stack is the workbook as it was opened: put it back, forget both
+/// stacks, and stay clean. An edit that took no snapshot cannot be undone
+/// here, but it cannot be saved either: every save is refused first.
+fn protected_rollback(tab: &mut DocTab) {
+    if let Surface::Sheet(v) = &mut tab.surface {
+        if !v.undo.is_empty() {
+            let at_open = v.undo.remove(0);
+            v.restore(at_open);
+        }
+        v.undo.clear();
+        v.redo.clear();
+        v.end_cell_edit();
+    }
+    tab.dirty = false;
+    tab.status = open_mode::PROTECTED_STATUS.into();
+}
+
+/// What Open and Repair did, as the tail of the load status.
+fn repair_summary(repairs: &gridcore::xlsx::Repairs) -> String {
+    if repairs.is_empty() {
+        return "; repaired: nothing needed repairing".into();
+    }
+    let mut out = String::from("; repaired:");
+    if !repairs.emptied.is_empty() {
+        out.push_str(&format!(" emptied {}", repairs.emptied.join(", ")));
+    }
+    if !repairs.dropped.is_empty() {
+        if !repairs.emptied.is_empty() {
+            out.push(';');
+        }
+        out.push_str(&format!(" dropped {}", repairs.dropped.join(", ")));
+    }
+    out
 }
 
 fn build_surface(
@@ -7091,6 +7217,7 @@ fn restore_tab_sourced(t: &PersistTab) -> (DocTab, bool) {
                 bundle_html: None,
                 load_failed: false,
                 dialogs: crate::dialog::DialogStack::default(),
+                access: crate::open_mode::Access::default(),
             }
         }
         // A document with no sidecar reloads its file, bundle included; the
@@ -7117,11 +7244,26 @@ fn restore_tab_sourced(t: &PersistTab) -> (DocTab, bool) {
                 bundle_html: None,
                 load_failed: false,
                 dialogs: crate::dialog::DialogStack::default(),
+                access: crate::open_mode::Access::default(),
             }
         }
     };
     // The hot sidecar is always .docx; restore the Markdown flag from session.
     tab.markdown = t.markdown || tab.markdown;
+    if t.kind == Kind::Xlsx {
+        // A repaired tab with no readable sidecar reopens its damaged file
+        // the way it was opened, or the strict load would refuse it.
+        if t.repaired && !from_hot && matches!(tab.surface, Surface::Placeholder) {
+            if let Some(p) = tab.path.clone() {
+                (tab.surface, tab.status) = sheet_from_path_mode(&p, true);
+            }
+        }
+        tab.access = open_mode::Access {
+            read_only: t.read_only,
+            protected: t.protected,
+            repaired: t.repaired,
+        };
+    }
     (tab, from_hot)
 }
 
@@ -7191,6 +7333,9 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
         },
         markdown: t.markdown,
         load_failed: Some(t.load_failed),
+        read_only: t.access.read_only,
+        protected: t.access.protected,
+        repaired: t.access.repaired,
     }
 }
 
@@ -7559,6 +7704,7 @@ impl Docxy {
             bundle_html: None,
             load_failed: false,
             dialogs: crate::dialog::DialogStack::default(),
+            access: crate::open_mode::Access::default(),
         };
         self.tabs.push(match kind {
             Kind::Project => new_project_tab(),
@@ -7666,6 +7812,9 @@ impl Docxy {
     /// cells unchanged` therefore cannot see a handler added here. This guard
     /// can. See `docs/ui-test-harness.md`.
     fn sheet_fill_start(&mut self, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return;
+        }
         let gesture_in_flight = self.grid_gesture_in_flight();
         let src = self.active_sheet().map(|v| v.range());
         let protected = self.sheet_protected();
@@ -7768,6 +7917,11 @@ impl Docxy {
         self.chart_sel = after.chart;
         // The panel swaps to it, opening if it was shut.
         self.chart_panel_event(PanelEvent::Select(idx));
+        // Selecting a chart only looks; moving or resizing it would edit.
+        if self.protected_view() {
+            cx.notify();
+            return;
+        }
         self.chart_drag = Some(ChartDrag {
             idx,
             edge,
@@ -8163,6 +8317,9 @@ impl Docxy {
         data: gridcore::sheet::ChartData,
         cx: &mut Context<Self>,
     ) {
+        if self.protected_refused(cx) {
+            return;
+        }
         self.set_status(format!(
             "Chart reads each {} as a series \u{2014} {} series over {} categories",
             if data.by_row { "row" } else { "column" },
@@ -8182,6 +8339,9 @@ impl Docxy {
     /// Switch the panel's chart (`chart_data`'s) between column / bar / line /
     /// pie.
     fn chart_set_kind(&mut self, kind: &str, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return;
+        }
         let Some(data) = self.chart_data() else {
             return;
         };
@@ -8272,6 +8432,9 @@ impl Docxy {
 
     /// Colour one series of the panel's chart (`chart_data`'s).
     fn chart_set_color(&mut self, series: usize, rgb: u32, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return;
+        }
         let Some(mut data) = self.chart_data() else {
             return;
         };
@@ -8397,6 +8560,9 @@ impl Docxy {
     /// retyped range into "A1:B5A1:D5"). Clicks once focused place the caret
     /// normally.
     fn ref_field_focus(&mut self, target: RefTarget, seed: String, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return;
+        }
         // A bar's own field is routed to first and must leave its bar standing;
         // anything else has to take the keyboard away from whatever bar is open.
         if !target.is_bar() {
@@ -8607,6 +8773,9 @@ impl Docxy {
     /// Add an empty series and put the keyboard in its values field, so the
     /// next thing you do is say what it plots.
     fn series_add(&mut self, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return;
+        }
         let Some(mut data) = self.chart_data() else {
             return;
         };
@@ -9716,6 +9885,9 @@ impl Docxy {
 
     /// Add a new blank sheet (unique "SheetN" name) and switch to it.
     fn sheet_add(&mut self, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return;
+        }
         if let Some(v) = self.active_sheet_mut() {
             let name = v.next_sheet_name();
             v.add_sheet(&name);
@@ -9729,6 +9901,9 @@ impl Docxy {
     /// Delete sheet `idx` (guarded: never the last sheet). Fixes up the active
     /// index and any pivot/chart views that referenced shifted sheet indices.
     fn sheet_delete(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return;
+        }
         // Clicking × on a lone sheet does nothing — and must not spend an undo
         // step doing it, which would also throw away the redo stack.
         if !self.active_sheet_mut().is_some_and(|v| v.delete_sheet(idx)) {
@@ -9742,6 +9917,9 @@ impl Docxy {
 
     /// Begin an inline rename of tab `idx`, seeding the buffer with its name.
     fn sheet_begin_rename(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return;
+        }
         let name = self
             .active_sheet()
             .and_then(|v| v.pkg.workbook.sheets.get(idx).map(|s| s.name.clone()));
@@ -9921,16 +10099,109 @@ impl Docxy {
             Some(Surface::Sheet(_))
         )
     }
+    /// Every edit of a workbook ends here. In Protected View that means a
+    /// gate before it leaked: the edit is rolled back instead
+    /// ([`protected_rollback`]), so the tab never turns dirty.
     fn mark_sheet_dirty(&mut self) {
         if let Some(t) = self.tabs.get_mut(self.active) {
+            if t.access.protected {
+                protected_rollback(t);
+                return;
+            }
             t.dirty = true;
         }
+    }
+
+    /// Whether the active tab is in Protected View (#610).
+    fn protected_view(&self) -> bool {
+        self.tabs
+            .get(self.active)
+            .is_some_and(|t| t.access.protected)
+    }
+
+    /// Refuse an edit in Protected View, saying how to edit; `true` when it
+    /// was refused. Every gate that would change the workbook asks this first.
+    fn protected_refused(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.protected_view() {
+            return false;
+        }
+        self.set_status(open_mode::PROTECTED_STATUS);
+        cx.notify();
+        true
+    }
+
+    /// Excel's PROTECTED VIEW message bar (#610), under the ribbon while the
+    /// active workbook came from the Internet: what it is, why, and the one
+    /// way out. Its colours are Excel's, in either theme.
+    fn protected_view_bar(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let ink = hsla_u(0x3B3B3B);
+        h_flex()
+            .id("pv-bar")
+            .w_full()
+            .h(px(36.))
+            .flex_none()
+            .items_center()
+            .gap_3()
+            .px_3()
+            .bg(hsla_u(0xFFF4CE))
+            .border_b_1()
+            .border_color(pal.border)
+            .text_size(px(12.))
+            .text_color(ink)
+            .child(
+                div()
+                    .flex_none()
+                    .font_weight(FontWeight::BOLD)
+                    .child(open_mode::PROTECTED_LABEL),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(open_mode::PROTECTED_TEXT),
+            )
+            .child(
+                div()
+                    .id("pv-enable")
+                    .flex_none()
+                    .px_3()
+                    .py_1()
+                    .border_1()
+                    .border_color(hsla_u(0x8A8886))
+                    .rounded_sm()
+                    .bg(hsla_u(0xFFFFFF))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(hsla_u(0xF3F2F1)))
+                    .child("Enable Editing")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.enable_editing(cx);
+                        this.refocus(window, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// The message bar's Enable Editing (#610): the tab leaves Protected View
+    /// and keeps the read-only or repaired state it was opened with.
+    pub(crate) fn enable_editing(&mut self, cx: &mut Context<Self>) {
+        let Some(t) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        if !t.access.protected {
+            return;
+        }
+        t.access.protected = false;
+        t.status = "editing enabled".into();
+        self.persist();
+        cx.notify();
     }
 
     /// Begin editing the selected cell. `initial` seeds the buffer (a freshly
     /// typed character); `None` re-edits the existing content (F2).
     fn sheet_begin_edit(&mut self, initial: Option<String>, cx: &mut Context<Self>) {
-        if self.sheet_protected() {
+        if self.sheet_protected() || self.protected_refused(cx) {
             return;
         }
         // A cell editor and a range field cannot both hold the keyboard. The
@@ -10096,7 +10367,7 @@ impl Docxy {
     /// Clear the whole selected range's content (Delete / Backspace), keeping
     /// each cell's style.
     fn sheet_clear(&mut self, cx: &mut Context<Self>) {
-        if self.sheet_protected() || self.sheet_clear_refused(cx) {
+        if self.sheet_protected() || self.protected_refused(cx) || self.sheet_clear_refused(cx) {
             return;
         }
         self.sheet_snapshot();
@@ -10146,8 +10417,9 @@ impl Docxy {
     /// Copy (or cut) the selected range into the grid clipboard and, as TSV, the
     /// system clipboard.
     fn sheet_copy(&mut self, cut: bool, cx: &mut Context<Self>) {
-        // A cut of part of an array is refused before anything is copied.
-        if cut && self.sheet_clear_refused(cx) {
+        // A cut of part of an array is refused before anything is copied; a
+        // cut in Protected View too, since its paste would clear the source.
+        if cut && (self.protected_refused(cx) || self.sheet_clear_refused(cx)) {
             return;
         }
         let Some(v) = self.active_sheet() else { return };
@@ -10183,7 +10455,7 @@ impl Docxy {
     /// clipboard holds (full-fidelity cells), else the clipboard text parsed as
     /// TSV.
     fn sheet_paste(&mut self, cx: &mut Context<Self>) {
-        if self.sheet_protected() {
+        if self.sheet_protected() || self.protected_refused(cx) {
             return;
         }
         let now = self.clipboard_read(cx);
@@ -10259,7 +10531,10 @@ impl Docxy {
 
     // ---- column resize -----------------------------------------------------
 
-    fn col_resize_start(&mut self, col: u32, x: f32, _cx: &mut Context<Self>) {
+    fn col_resize_start(&mut self, col: u32, x: f32, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return;
+        }
         self.sheet_snapshot();
         if let Some(v) = self.active_sheet_mut() {
             let w = v.sheet().col_width(col);
@@ -10670,6 +10945,9 @@ impl Docxy {
 
     /// Commit the comment bar's buffer onto the selected cell (empty = delete).
     fn sheet_commit_comment(&mut self, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return;
+        }
         let Some(text) = self.sheet_comment_edit.take() else {
             return;
         };
@@ -11095,12 +11373,18 @@ impl Docxy {
     }
 
     fn sheet_dv_toggle(&mut self, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return;
+        }
         self.sheet_dv_open = !self.sheet_dv_open;
         cx.notify();
     }
 
     /// Set the selected cell to `value` (a picked validation option).
     fn sheet_dv_pick(&mut self, value: String, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return;
+        }
         self.sheet_dv_open = false;
         if self.active_sheet_mut().is_some_and(|v| {
             let (s, (r, c)) = (v.active, v.sel);
@@ -11297,6 +11581,9 @@ impl Docxy {
 
     /// Replace the query in the current cell (if it matches), then move to the next.
     fn sheet_replace(&mut self, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return;
+        }
         let q = self.find_query.clone();
         let rep = self.replace_text.clone();
         if q.is_empty() {
@@ -11325,6 +11612,9 @@ impl Docxy {
 
     /// Replace the query in every matching cell of the sheet.
     fn sheet_replace_all(&mut self, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return;
+        }
         let q = self.find_query.clone();
         let rep = self.replace_text.clone();
         if q.is_empty() {
@@ -11490,6 +11780,9 @@ impl Docxy {
     /// Cycle a source field's role in pivot `idx`: none → Rows → Columns → Values,
     /// then recompute.
     fn pivot_cycle_field(&mut self, idx: usize, field: usize, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return;
+        }
         self.sheet_snapshot();
         if let Some(v) = self.active_sheet_mut() {
             if let Some(d) = v.pivot_views.get_mut(idx) {
@@ -11506,6 +11799,9 @@ impl Docxy {
     /// Cycle a value field's aggregation (Sum → Count → Avg → Max → Min →
     /// Product) in pivot `idx`, then recompute.
     fn pivot_cycle_agg(&mut self, idx: usize, field: usize, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return;
+        }
         self.sheet_snapshot();
         if let Some(v) = self.active_sheet_mut() {
             if let Some(d) = v.pivot_views.get_mut(idx) {
@@ -12366,6 +12662,11 @@ impl Docxy {
     /// Dispatch a spreadsheet ribbon command.
     fn run_sheet_act(&mut self, act: SheetAct, window: &mut Window, cx: &mut Context<Self>) {
         use gridcore::sheet::Align;
+        // Protected View (#610): the ribbon is hidden, but shortcuts, KeyTips
+        // and the harness's `ribbon-click` still come here.
+        if !protected_view_allows_act(act) && self.protected_refused(cx) {
+            return self.refocus(window, cx);
+        }
         // Before anything reads the selection — including the bar seeding below
         // — the grid takes it back, so a command that acts on cells acts on
         // cells the user can see. `chart_hand_back` returns at once when no
@@ -12478,6 +12779,16 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Protected View (#610): only keys that look, move or copy reach the
+        // workbook. The find bar still takes typing; its Replace is refused
+        // where it would write.
+        if self.protected_view()
+            && !self.find_open
+            && !open_mode::protected_allows_key(key, ctrl, shift, alt)
+        {
+            self.protected_refused(cx);
+            return;
+        }
         // An inline sheet-tab rename swallows all typing until Enter/Esc.
         if self.sheet_rename.is_some() {
             return self.sheet_rename_key(ev, key, cx);
@@ -13390,9 +13701,7 @@ impl Docxy {
             .add_filter("Excel workbook", &SHEET_EXTENSIONS)
             .pick_file()
         {
-            self.tabs.push(tab_from_path(&path));
-            self.active = self.tabs.len() - 1;
-            self.drop_grid_state();
+            self.open_picked(&path, OpenMode::Normal);
         }
         self.backstage = false;
         self.bs_new = false;
@@ -13400,70 +13709,120 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
+    /// The backstage's Open Read-Only…, Open as Copy… and Open and Repair…
+    /// (#610): the same pick as Open…, for workbooks only, then the mode.
+    fn open_file_mode(&mut self, mode: OpenMode, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Excel workbook", &SHEET_EXTENSIONS)
+            .pick_file()
+        {
+            self.open_picked(&path, mode);
+        }
+        self.backstage = false;
+        self.bs_new = false;
+        self.persist();
+        self.refocus(window, cx);
+    }
+
+    /// Open a path a person picked; a copy that could not be written says
+    /// why on the tab that was active.
+    fn open_picked(&mut self, path: &std::path::Path, mode: OpenMode) {
+        if let Err(e) = self.open_path(path, mode, Reopen::Ask) {
+            self.set_status(e);
+        }
+        self.drop_grid_state();
+    }
+
+    /// Open `path` in `mode`: the one way every open goes (#610), so the
+    /// backstage, the command line and the harness cannot drift apart.
+    ///
+    /// A path already open is not opened twice (Open as Copy aside, which
+    /// makes a new file). With [`Reopen::Ask`] a tab with unsaved changes
+    /// asks first, as a dialog on that tab; a clean one reloads when it was
+    /// opened in another mode and is only focused otherwise. Protected View
+    /// is the file's, not the mode's, so it never makes a clean tab reload.
+    /// [`Reopen::Always`] reloads without asking: the harness's `open`.
+    ///
+    /// `Err` only when Open as Copy could not write the copy; nothing opens.
+    fn open_path(
+        &mut self,
+        path: &std::path::Path,
+        mode: OpenMode,
+        reopen: Reopen,
+    ) -> Result<(), String> {
+        self.project_prompt_cancel();
+        let path = path.to_path_buf();
+        let mode = if is_sheet_path(&path) && !is_project_path(&path) {
+            mode
+        } else {
+            OpenMode::Normal
+        };
+        let open = (mode != OpenMode::Copy)
+            .then(|| {
+                let key = canonical(&path);
+                self.tabs
+                    .iter()
+                    .position(|t| t.path.as_deref().map(canonical) == Some(key.clone()))
+            })
+            .flatten();
+        let Some(i) = open else {
+            let tab = tab_from_path_mode(&path, mode)?;
+            self.tabs.push(tab);
+            self.active = self.tabs.len() - 1;
+            return Ok(());
+        };
+        self.active = i;
+        let tab = &self.tabs[i];
+        match reopen_step(reopen, tab.dirty, tab.access, mode) {
+            ReopenStep::Reload => self.tabs[i] = tab_from_path_mode(&path, mode)?,
+            ReopenStep::Ask => {
+                let name = file_name(&path);
+                self.tabs[i].dialogs.push(dialog::Dialog::message(
+                    "reopen",
+                    "docxy",
+                    open_mode::reopen_question(&name),
+                    &[
+                        ("Yes", dialog::ButtonRole::Accept),
+                        ("No", dialog::ButtonRole::Cancel),
+                    ],
+                    dialog::DialogOwner::Reopen { mode },
+                ));
+            }
+            ReopenStep::Focus => {}
+        }
+        Ok(())
+    }
+
     /// Open files passed on the command line (e.g. double-clicking a .docx/.xlsx
     /// in Explorer) on top of the restored session. A file already open is
-    /// focused rather than duplicated; if that tab has unsaved changes, ask
-    /// before reloading it from disk.
+    /// focused rather than duplicated; if that tab has unsaved changes, it
+    /// asks before reloading it from disk ([`Self::open_path`]).
     fn open_args(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        self.project_prompt_cancel();
+        // ⚠️ A harness instance never asks, and always reloads — whether or
+        // not the tab is dirty. Its `open` verb calls `open_path` with
+        // `Reopen::Always` itself; this is the command line's path.
+        //
+        // Always reloads because the cases in a script share one instance,
+        // and `open` is the only setup a case has. If it meant "make this the
+        // active tab" a case would inherit whatever an earlier one left
+        // behind, and would pass or fail on the order it ran in. Plenty of
+        // what a case leaves behind never sets `dirty`: an uncommitted
+        // in-cell edit sits in `SheetView::editing` until `sheet_commit`
+        // writes it into the workbook, and the selection and the scroll
+        // position are not document state at all. Asking `dirty` first would
+        // reload for the committed edits and keep the rest — the worst of
+        // both. Discarding is the point: it is the previous case's, and
+        // nothing is meant to survive it. A case that wants the person's
+        // question asks for it with `open`'s `reopen: "ask"`.
+        let reopen = if self.harness.is_some() {
+            Reopen::Always
+        } else {
+            Reopen::Ask
+        };
         let mut changed = false;
         for path in paths {
-            let key = canonical(&path);
-            match self
-                .tabs
-                .iter()
-                .position(|t| t.path.as_deref().map(canonical) == Some(key.clone()))
-            {
-                Some(i) => {
-                    // ⚠️ A harness instance never asks, and always reloads —
-                    // whether or not the tab is dirty.
-                    //
-                    // Never asks because `rfd`'s dialog runs its own modal
-                    // message loop on this thread, so it stops the control
-                    // pump dead: the window still answers Windows messages,
-                    // so it LOOKS alive, while every verb after it times out
-                    // with nothing on stderr to say why. Found by running
-                    // `uiharness/cases/sheet-selection.uit` — case 3 points
-                    // a chart field at some cells, which dirties the tab,
-                    // and case 4's `open` of the same fixture hung the run.
-                    //
-                    // Always reloads because the cases in a script share one
-                    // instance, and `open` is the only setup a case has. If it
-                    // meant "make this the active tab" a case would inherit
-                    // whatever an earlier one left behind, and would pass or
-                    // fail on the order it ran in. Plenty of what a case leaves
-                    // behind never sets `dirty`: an uncommitted in-cell edit
-                    // sits in `SheetView::editing` until `sheet_commit` writes
-                    // it into the workbook, and the selection and the scroll
-                    // position are not document state at all. Asking `dirty`
-                    // first would reload for the committed edits and keep the
-                    // rest — the worst of both. Discarding is the point: it is
-                    // the previous case's, and nothing is meant to survive it.
-                    let reload = if self.harness.is_some() {
-                        true
-                    } else {
-                        self.tabs[i].dirty
-                            && matches!(
-                            rfd::MessageDialog::new()
-                                .set_title("docxy")
-                                .set_description(format!(
-                                    "\"{}\" is already open with unsaved changes.\n\nReload it from disk? Your unsaved changes will be lost.\nChoose No to keep your current version.",
-                                    file_name(&path)
-                                ))
-                                .set_buttons(rfd::MessageButtons::YesNo)
-                                .show(),
-                            rfd::MessageDialogResult::Yes
-                        )
-                    };
-                    if reload {
-                        self.tabs[i] = tab_from_path(&path);
-                    }
-                    self.active = i;
-                }
-                None => {
-                    self.tabs.push(tab_from_path(&path));
-                    self.active = self.tabs.len() - 1;
-                }
+            if let Err(e) = self.open_path(&path, OpenMode::Normal, reopen) {
+                self.set_status(e);
             }
             changed = true;
         }
@@ -15495,6 +15854,10 @@ const SHEET_NEVER_SAVED_HARNESS: &str = "this workbook has never been saved, and
 /// What a harness instance says when asked to Save As a workbook.
 const SHEET_SAVE_AS_HARNESS: &str = "This workbook needs Save As, and a harness instance cannot open the Save As dialog; use the harness save-as verb";
 
+/// What a harness instance says when Save of a read-only or repaired
+/// workbook needs the Save As dialog (#610).
+const SHEET_READ_ONLY_HARNESS: &str = "This workbook was opened read-only or repaired, so Save needs Save As, and a harness instance cannot open the Save As dialog; use the harness save-as verb";
+
 /// Where a workbook Save goes, decided before any dialog opens.
 #[derive(Debug, PartialEq, Eq)]
 enum SheetSaveDecision {
@@ -15506,18 +15869,23 @@ enum SheetSaveDecision {
     RefuseHarness(&'static str),
 }
 
+/// `needs_dialog` is a workbook opened read-only or repaired (#610): its
+/// plain Save goes to Save As, as in Excel, instead of overwriting the file.
 fn sheet_save_decision(
     path: Option<&std::path::Path>,
     title: &str,
     harness: bool,
     explicit_save_as: bool,
+    needs_dialog: bool,
 ) -> SheetSaveDecision {
-    if let (Some(path), false) = (path, explicit_save_as) {
+    if let (Some(path), false) = (path, explicit_save_as || needs_dialog) {
         return SheetSaveDecision::InPlace(path.to_path_buf());
     }
     if harness {
         return SheetSaveDecision::RefuseHarness(if explicit_save_as {
             SHEET_SAVE_AS_HARNESS
+        } else if needs_dialog && path.is_some() {
+            SHEET_READ_ONLY_HARNESS
         } else {
             SHEET_NEVER_SAVED_HARNESS
         });
@@ -15544,11 +15912,22 @@ fn save_sheet_tab(
     pick: impl FnOnce(String) -> Option<PathBuf>,
     confirm: impl FnOnce(&[&'static str]) -> bool,
 ) -> bool {
+    // Protected View writes nothing, Save As included (#610).
+    if tab.access.protected {
+        tab.status = open_mode::PROTECTED_STATUS.into();
+        return false;
+    }
     // Commit before choosing a target so the decision and write see the edit.
     if close::prepare_sheet_save(tab).is_err() {
         return false;
     }
-    match sheet_save_decision(tab.path.as_deref(), &tab.title, harness, explicit_save_as) {
+    match sheet_save_decision(
+        tab.path.as_deref(),
+        &tab.title,
+        harness,
+        explicit_save_as,
+        tab.access.save_needs_dialog(),
+    ) {
         SheetSaveDecision::InPlace(path) => {
             finish_sheet_save_asking(tab, Some(&path), harness, confirm);
         }
@@ -15588,6 +15967,10 @@ const SHEET_SAVE_FORMATS: &str = "Workbooks can only be saved as .xlsx, .xlsm, .
 /// makes first, then the write the dialog's answer feeds. Returns whether the
 /// file was written.
 fn save_sheet_to(tab: &mut DocTab, target: &std::path::Path) -> bool {
+    if tab.access.protected {
+        tab.status = open_mode::PROTECTED_STATUS.into();
+        return false;
+    }
     close::prepare_sheet_save(tab).is_ok() && finish_sheet_save(tab, Some(target))
 }
 
@@ -15672,6 +16055,19 @@ fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) -> bool
             return false;
         }
     };
+    // Every way here is gated before; this is the last word on Protected
+    // View, and the only one on a read-only tab's own file (#610). A repaired
+    // tab may be saved over its source: the user chose to.
+    if tab.access.protected {
+        tab.status = open_mode::PROTECTED_STATUS.into();
+        return false;
+    }
+    if let Some(src) = tab.path.as_deref().filter(|_| tab.access.read_only)
+        && canonical(src) == canonical(&path)
+    {
+        tab.status = open_mode::read_only_refusal(&file_name(src)).into();
+        return false;
+    }
     let (bytes, refused_charts) = sheet_bytes(v, Some(&path));
     // A macro-free type writes the file without the macros, and the status
     // says what went. The open workbook keeps them here; after the user's
@@ -15699,6 +16095,9 @@ fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) -> bool
             tab.status = status.into();
             tab.path = Some(path);
             tab.dirty = false;
+            // The tab is now bound to a file it wrote itself.
+            tab.access.read_only = false;
+            tab.access.repaired = false;
             true
         }
         Err(e) => {
@@ -16552,6 +16951,7 @@ mod sheet_save_tests {
             bundle_html: None,
             load_failed: false,
             dialogs: crate::dialog::DialogStack::default(),
+            access: crate::open_mode::Access::default(),
         }
     }
 
@@ -16565,16 +16965,16 @@ mod sheet_save_tests {
     fn save_as_always_asks_with_an_xlsx_name() {
         let saved = Path::new("/x/report.xlsx");
         assert_eq!(
-            sheet_save_decision(Some(saved), "report.xlsx", false, true),
+            sheet_save_decision(Some(saved), "report.xlsx", false, true, false),
             dialog("report.xlsx")
         );
         assert_eq!(
-            sheet_save_decision(None, "Untitled.xlsx", false, true),
+            sheet_save_decision(None, "Untitled.xlsx", false, true, false),
             dialog("Untitled.xlsx")
         );
         // The path wins over a title that says something else.
         assert_eq!(
-            sheet_save_decision(Some(saved), "renamed", false, true),
+            sheet_save_decision(Some(saved), "renamed", false, true, false),
             dialog("report.xlsx")
         );
     }
@@ -16583,7 +16983,7 @@ mod sheet_save_tests {
     fn save_as_in_a_harness_refuses_in_words_saved_or_not() {
         for path in [None, Some(Path::new("/x/report.xlsx"))] {
             assert_eq!(
-                sheet_save_decision(path, "report.xlsx", true, true),
+                sheet_save_decision(path, "report.xlsx", true, true, false),
                 SheetSaveDecision::RefuseHarness(SHEET_SAVE_AS_HARNESS)
             );
         }
@@ -16598,16 +16998,16 @@ mod sheet_save_tests {
         let saved = Path::new("/x/report.xlsx");
         for harness in [false, true] {
             assert_eq!(
-                sheet_save_decision(Some(saved), "report.xlsx", harness, false),
+                sheet_save_decision(Some(saved), "report.xlsx", harness, false, false),
                 SheetSaveDecision::InPlace(saved.to_path_buf())
             );
         }
         assert_eq!(
-            sheet_save_decision(None, "Untitled.xlsx", false, false),
+            sheet_save_decision(None, "Untitled.xlsx", false, false, false),
             dialog("Untitled.xlsx")
         );
         assert_eq!(
-            sheet_save_decision(None, "Untitled.xlsx", true, false),
+            sheet_save_decision(None, "Untitled.xlsx", true, false, false),
             SheetSaveDecision::RefuseHarness(SHEET_NEVER_SAVED_HARNESS)
         );
         assert_eq!(
@@ -16846,7 +17246,7 @@ mod sheet_save_tests {
             "new workbook from template Budget.xltx"
         );
         assert_eq!(
-            sheet_save_decision(None, &tab.title, false, false),
+            sheet_save_decision(None, &tab.title, false, false, false),
             dialog("Budget1.xlsx")
         );
 
@@ -16865,7 +17265,7 @@ mod sheet_save_tests {
         assert!(tab.path.is_none());
         assert_eq!(tab.title.as_ref(), "Macros1.xlsm");
         assert_eq!(
-            sheet_save_decision(None, &tab.title, false, false),
+            sheet_save_decision(None, &tab.title, false, false, false),
             dialog("Macros1.xlsm")
         );
 
@@ -21605,6 +22005,9 @@ impl Docxy {
 
     /// Apply the current CF buffer (used by the Apply button; Enter uses sheet_cf_key).
     fn sheet_cf_commit(&mut self, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return;
+        }
         let buf = self.sheet_cf_edit.clone().unwrap_or_default();
         let buf = if buf.trim().is_empty() {
             ">500".to_string()
@@ -22700,6 +23103,31 @@ impl Docxy {
                         .mt_4()
                         .child("Open"),
                 )
+                // Excel's other ways to open a workbook (#610), beside the
+                // rail's Open…: each picks a workbook, then opens it so.
+                .child(h_flex().gap_2().children(
+                    [
+                        ("bs-open-readonly", "Open Read-Only…", OpenMode::ReadOnly),
+                        ("bs-open-copy", "Open as Copy…", OpenMode::Copy),
+                        ("bs-open-repair", "Open and Repair…", OpenMode::Repair),
+                    ]
+                    .map(|(id, label, mode)| {
+                        div()
+                            .id(id)
+                            .px_3()
+                            .py_1p5()
+                            .cursor_pointer()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(sidebar)
+                            .text_color(fg)
+                            .hover(|d| d.bg(sidebar))
+                            .child(label)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_file_mode(mode, window, cx)
+                            }))
+                    }),
+                ))
                 .child(v_flex().gap_0p5().children(recents))
                 .child(
                     div()
@@ -22883,7 +23311,7 @@ impl Docxy {
                             .min_w_0()
                             .overflow_hidden()
                             .whitespace_nowrap()
-                            .child(SharedString::from(tab.title.to_string())),
+                            .child(SharedString::from(tab.caption())),
                     )
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.tab_more_pick(i, window, cx)),
@@ -23026,7 +23454,7 @@ impl Render for Docxy {
                 let active = i == self.active && !self.backstage;
                 let full_tip = SharedString::from(format!(
                     "{}{}{}",
-                    tb.title,
+                    tb.caption(),
                     if is_imported(tb) { " · imported" } else { "" },
                     if tb.dirty { " · unsaved changes" } else { "" },
                 ));
@@ -23057,7 +23485,7 @@ impl Render for Docxy {
                             .child(SharedString::from(format!(
                                 "{} {}",
                                 tb.kind.glyph(),
-                                tb.title
+                                tb.caption()
                             ))),
                     )
                     // Keep status visible when the title is clipped. The full
@@ -23281,7 +23709,11 @@ impl Render for Docxy {
         );
         let vw = f32::from(window.viewport_size().width);
         let ribbon_tabs = self.ribbon_tabs(fg, dim, panel, cx);
+        // Protected View (#610) hides the ribbon's commands, as Excel greys
+        // them out; its message bar takes their place.
+        let protected = self.active_is_sheet() && self.protected_view();
         let ribbon_body = (!self.ribbon_min
+            && !protected
             && (is_doc || self.active_is_sheet() || self.active_is_project()))
         .then(|| {
             if is_doc || self.active_is_project() {
@@ -23291,6 +23723,7 @@ impl Render for Docxy {
             }
         });
         let project_prompt = self.project_prompt_bar(pal, cx);
+        let protected_bar = protected.then(|| self.protected_view_bar(pal, cx));
         let find_bar = (is_doc && self.find_open).then(|| self.find_bar(pal, cx));
         let picker_bar = (is_doc)
             .then_some(self.picker)
@@ -24003,6 +24436,7 @@ impl Render for Docxy {
             .child(title_bar)
             .child(ribbon_tabs)
             .when_some(ribbon_body, |d, r| d.child(r))
+            .when_some(protected_bar, |d, b| d.child(b))
             .when_some(find_bar, |d, f| d.child(f))
             .when_some(picker_bar, |d, p| d.child(p))
             .when_some(sheet_pick_bar, |d, p| d.child(p))
