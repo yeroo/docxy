@@ -101,10 +101,19 @@ fn export_csv_bytes(
     out: &str,
     bytes: &[u8],
 ) -> io::Result<()> {
-    let source = import_source
+    export_atomic(
+        Some(Path::new(export_source(source, import_source, out))),
+        Path::new(out),
+        bytes,
+    )
+}
+
+/// The file an export to `out` must not replace: the imported text file
+/// when `out` is it (under any alias), else the workbook's own file.
+fn export_source<'a>(source: &'a str, import_source: Option<&'a str>, out: &str) -> &'a str {
+    import_source
         .filter(|import| opccore::fsio::same_file(Path::new(import), Path::new(out)))
-        .unwrap_or(source);
-    export_atomic(Some(Path::new(source)), Path::new(out), bytes)
+        .unwrap_or(source)
 }
 
 /// Where *Always create backup* keeps the previous version: beside the file,
@@ -1055,10 +1064,7 @@ fn preview_lines(path: &str, width: usize) -> Vec<String> {
 /// file has unsaved changes), and Excel's ` [Read-Only]` while the file is
 /// one opened read-only (#882).
 fn window_title(app: &str, path: &str, modified: bool, read_only: bool) -> String {
-    let name = std::path::Path::new(path)
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string());
+    let name = file_name_of(path);
     format!(
         "{}{app} - {name}{}",
         if modified { "* " } else { "" },
@@ -1081,11 +1087,18 @@ fn read_only_input_error(parsed: &Parsed) -> Option<String> {
 
 /// Excel's refusal to write a file opened read-only (#882).
 fn read_only_refusal(path: &str) -> String {
-    let name = Path::new(path)
+    format!(
+        "\"{}\" is read-only. Save a copy under a new name.",
+        file_name_of(path)
+    )
+}
+
+/// `path`'s file name, or `path` itself when it has none.
+fn file_name_of(path: &str) -> String {
+    Path::new(path)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string());
-    format!("\"{name}\" is read-only. Save a copy under a new name.")
+        .unwrap_or_else(|| path.to_string())
 }
 
 /// Path of the persisted view-preferences file (XDG / APPDATA).
@@ -3124,7 +3137,7 @@ impl App {
     /// Ctrl+S, `:w` and the backstage's Save. On a file opened read-only it
     /// opens Save As instead (#882), as Excel does.
     fn save(&mut self) {
-        if let Err(msg) = self.refuse_read_only(&self.path.clone()) {
+        if let Err(msg) = self.refuse_read_only(&self.path) {
             self.open_prompt(PromptKind::SaveAs);
             self.status = Some(msg);
             return;
@@ -3144,13 +3157,51 @@ impl App {
     }
 
     /// Excel's refusal when `target` is the file opened read-only.
-    fn refuse_read_only(&self, target: &str) -> Result<(), String> {
+    fn refuse_read_only(&self, target: impl AsRef<Path>) -> Result<(), String> {
+        let target = target.as_ref();
         match &self.read_only {
-            Some(src) if opccore::fsio::same_file(src, Path::new(target)) => {
-                Err(read_only_refusal(target))
+            Some(src) if opccore::fsio::same_file(src, target) => {
+                Err(read_only_refusal(&target.to_string_lossy()))
             }
             _ => Ok(()),
         }
+    }
+
+    // ---- writes ----------------------------------------------------------
+    //
+    // Every file an App method writes goes through one of these three, and
+    // each refuses the file opened read-only (#882) itself, so a new route
+    // cannot forget to ask. The one other write is the view-preferences file
+    // (`save_view_prefs`), the app's own config. Headless runs (`--recalc`,
+    // `--csv`) have no App and guard the input at startup.
+
+    fn guard_write(&self, target: &Path) -> io::Result<()> {
+        self.refuse_read_only(target)
+            .map_err(|msg| io::Error::new(io::ErrorKind::PermissionDenied, msg))
+    }
+
+    /// `bytes` to `target` atomically, never replacing `source` (the file
+    /// an export was made from, see `export_atomic`) or the read-only file.
+    fn write_export(&self, source: Option<&Path>, target: &Path, bytes: &[u8]) -> io::Result<()> {
+        self.guard_write(target)?;
+        export_atomic(source, target, bytes)
+    }
+
+    /// A supporting file (a Web Page's `<stem>_files/…`), its folder made
+    /// first; never the read-only file.
+    fn write_supporting(&self, target: &Path, bytes: &[u8]) -> io::Result<()> {
+        self.guard_write(target)?;
+        if let Some(dir) = target.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(target, bytes)
+    }
+
+    /// *Always create backup*'s copy of `dest` ([`keep_backup`]); never
+    /// over the read-only file.
+    fn write_backup(&self, dest: &Path) -> io::Result<()> {
+        self.guard_write(&backup_path(dest))?;
+        keep_backup(dest)
     }
 
     /// Write the workbook to `self.path`. A failure's message is both the
@@ -3184,13 +3235,13 @@ impl App {
         };
         let bytes = self.package_bytes();
         if self.pkg.always_create_backup() {
-            if let Err(e) = keep_backup(Path::new(&self.path)) {
+            if let Err(e) = self.write_backup(Path::new(&self.path)) {
                 let msg = format!("save failed: {e}");
                 self.status = Some(msg.clone());
                 return Err(msg);
             }
         }
-        match export_atomic(
+        match self.write_export(
             self.import_source.as_deref().map(Path::new),
             Path::new(&self.path),
             &bytes,
@@ -3285,20 +3336,18 @@ impl App {
         };
         let sheet_name = sheet.name.clone();
         let many = wb.sheets.len() > 1;
-        let written = export_atomic(
-            self.import_source.as_deref().map(Path::new),
-            Path::new(&self.path),
-            &bytes,
-        )
-        .and_then(|()| {
-            for (p, body) in &extra {
-                if let Some(dir) = p.parent() {
-                    std::fs::create_dir_all(dir)?;
+        let written = self
+            .write_export(
+                self.import_source.as_deref().map(Path::new),
+                Path::new(&self.path),
+                &bytes,
+            )
+            .and_then(|()| {
+                for (p, body) in &extra {
+                    self.write_supporting(p, body.as_bytes())?;
                 }
-                std::fs::write(p, body)?;
-            }
-            Ok(())
-        });
+                Ok(())
+            });
         match written {
             Ok(()) => {
                 self.modified = true;
@@ -4527,7 +4576,8 @@ impl App {
             Some((base, _)) => format!("{base}.csv"),
             None => format!("{}.csv", self.path),
         };
-        match export_csv_bytes(&self.path, self.import_source.as_deref(), &out, &csv) {
+        let source = export_source(&self.path, self.import_source.as_deref(), &out);
+        match self.write_export(Some(Path::new(source)), Path::new(&out), &csv) {
             Ok(()) => self.status = Some(format!("Exported {out} ({} bytes)", csv.len())),
             Err(e) => self.status = Some(format!("Export failed: {e}")),
         }
@@ -4593,16 +4643,10 @@ impl App {
             self.discard_for(next);
             return;
         }
-        let name = Path::new(&self.path)
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.path.clone());
+        let name = file_name_of(&self.path);
         let prompt = match &next {
             Next::Open(p) => {
-                let other = Path::new(p)
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| p.clone());
+                let other = file_name_of(p);
                 format!("Discard changes to \"{name}\" and open \"{other}\"?")
             }
             Next::New => format!("Discard changes to \"{name}\" and start a new workbook?"),
@@ -5092,8 +5136,16 @@ impl App {
         match &d.purpose {
             textdlg::Purpose::Import { path, .. } => {
                 let pkg = text_to_pkg(d.text(), &file_stem(path), &opts, &self.text_open());
-                // A finished import is another workbook: read-only ends (#882).
-                self.read_only = None;
+                // A finished import of another file ends read-only (#882);
+                // one of the read-only file itself (`xlsxy -r notes.txt`
+                // opens through this wizard) keeps it refused.
+                if !self
+                    .read_only
+                    .as_deref()
+                    .is_some_and(|ro| opccore::fsio::same_file(ro, Path::new(path)))
+                {
+                    self.read_only = None;
+                }
                 self.install_workbook(pkg, import_binding(path), Some(path.clone()));
                 self.import_unsaved = true;
             }
@@ -14121,7 +14173,15 @@ mod tests {
             control::dispatch(&mut app, "wb.save", &Json::obj(vec![])).is_ok(),
             "another file saves"
         );
+        let read_only = |app: &mut App| {
+            control::dispatch(app, "wb.path", &Json::obj(vec![]))
+                .unwrap()
+                .get("read_only")
+                .and_then(Json::as_bool)
+        };
+        assert_eq!(read_only(&mut app), Some(false), "b.xlsx is not the source");
         open(&mut app, &a);
+        assert_eq!(read_only(&mut app), Some(true));
         assert_eq!(
             control::dispatch(&mut app, "wb.save", &Json::obj(vec![])),
             Err(refusal)
@@ -14155,6 +14215,89 @@ mod tests {
         );
         let folder = dir.to_string_lossy().into_owned();
         assert!(read_only_input_error(&parse(&["-r", &folder])).is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// r3 M1: `xlsxy -r notes.txt` imports through the wizard; finishing it
+    /// keeps the text file refused, through every later Save As.
+    #[test]
+    fn read_only_text_import_keeps_its_source_refused() {
+        let dir = macro_dir("ro-txt-import");
+        let txt = dir.join("notes.txt");
+        std::fs::write(&txt, "1\t2\n").unwrap();
+        let before = std::fs::read(&txt).unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.os_clip = None;
+        app.set_read_only(txt.to_str().unwrap());
+        app.open_workbook(txt.to_str().unwrap());
+        app.finish_text_dialog();
+        assert!(app.text_dialog.is_none());
+        assert!(app.read_only.is_some());
+        app.request_save_as(dir.join("other.xlsx").to_string_lossy().into_owned());
+        assert!(dir.join("other.xlsx").is_file());
+        app.request_save_as(txt.to_string_lossy().into_owned());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("\"notes.txt\" is read-only. Save a copy under a new name.")
+        );
+        assert_eq!(std::fs::read(&txt).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// r3 M2: File > Export never writes the read-only CSV, even after a
+    /// Save As has bound the workbook beside it.
+    #[test]
+    fn read_only_export_refuses_the_source() {
+        let dir = macro_dir("ro-export");
+        let csv = dir.join("data.csv");
+        std::fs::write(&csv, "1,2\n").unwrap();
+        let before = std::fs::read(&csv).unwrap();
+        let (pkg, path, source, _) =
+            load_workbook(csv.to_str().unwrap(), &TextOpen::from_prefs()).unwrap();
+        let mut app = App::new(pkg, &path);
+        app.os_clip = None;
+        app.import_source = source;
+        app.set_read_only(csv.to_str().unwrap());
+        app.request_save_as(dir.join("data.xlsx").to_string_lossy().into_owned());
+        assert_eq!(Path::new(&app.path), dir.join("data.xlsx"));
+        assert!(app.import_source.is_none());
+        app.export_csv();
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Export failed: \"data.csv\" is read-only. Save a copy under a new name.")
+        );
+        assert_eq!(std::fs::read(&csv).unwrap(), before);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// r3: the backup and a Web Page's supporting files are guarded too.
+    #[test]
+    fn read_only_guards_backups_and_supporting_files() {
+        let (dir, mut app) = two_books("ro-helpers");
+        let a = dir.join("a.xlsx");
+        let before = std::fs::read(&a).unwrap();
+        app.set_read_only(a.to_str().unwrap());
+        let refused = |r: io::Result<()>, name: &str| {
+            let e = r.expect_err("refused");
+            assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                e.to_string(),
+                format!("\"{name}\" is read-only. Save a copy under a new name.")
+            );
+        };
+        refused(app.write_supporting(&a, b"x"), "a.xlsx");
+        refused(app.write_export(None, &a, b"x"), "a.xlsx");
+        assert_eq!(std::fs::read(&a).unwrap(), before);
+        // A backup that would land on the read-only file is refused too.
+        let held = dir.join("Backup of b.xlk");
+        std::fs::write(&held, b"kept").unwrap();
+        app.set_read_only(held.to_str().unwrap());
+        refused(app.write_backup(&dir.join("b.xlsx")), "Backup of b.xlk");
+        assert_eq!(std::fs::read(&held).unwrap(), b"kept");
+        assert!(
+            app.write_supporting(&dir.join("page_files").join("s.css"), b"x")
+                .is_ok()
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
