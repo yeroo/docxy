@@ -305,3 +305,74 @@ fn a_sheet_added_in_session_writes_nothing_until_set() {
         "{ws}"
     );
 }
+
+const AREA: &str =
+    r#"<definedName name="_xlnm.Print_Area" localSheetId="0">Report!$A$1:$D$20</definedName>"#;
+const TITLES: &str = r#"<definedName name="_xlnm.Print_Titles" localSheetId="0">Report!$A:$A,Report!$1:$2</definedName>"#;
+const TOTAL: &str = r#"<definedName name="Total">Report!$B$2</definedName>"#;
+
+fn workbook_xml(pkg: &SheetPackage) -> String {
+    let re = load_xlsx(&save_xlsx(pkg)).expect("saved file reloads");
+    String::from_utf8_lossy(re.part("xl/workbook.xml").expect("workbook")).into_owned()
+}
+
+#[test]
+fn a_cleared_print_area_and_titles_leave_workbook_xml() {
+    use crate::print::area::{PrintTitles, clear_print_area, set_print_titles};
+    let names = format!("{TOTAL}{AREA}{TITLES}");
+    let mut pkg = load_xlsx(&book(&names, &[("Report", Some(DATA))])).unwrap();
+    assert!(clear_print_area(&mut pkg.workbook, 0));
+    let wb = workbook_xml(&pkg);
+    assert!(!wb.contains("Print_Area"), "{wb}");
+    assert!(wb.contains(TOTAL) && wb.contains(TITLES), "{wb}");
+    set_print_titles(&mut pkg.workbook, 0, PrintTitles::default());
+    let wb = workbook_xml(&pkg);
+    assert!(!wb.contains("Print_Titles"), "{wb}");
+    assert!(
+        wb.contains(&format!("<definedNames>{TOTAL}</definedNames>")),
+        "{wb}"
+    );
+}
+
+#[test]
+fn a_cleared_then_restored_print_area_saves_byte_identical() {
+    use crate::print::area::clear_print_area;
+    let names = format!("{AREA}{TITLES}");
+    let mut pkg = load_xlsx(&book(&names, &[("Report", Some(DATA))])).unwrap();
+    let before = workbook_xml(&pkg);
+    let snapshot = pkg.workbook.defined_names.clone();
+    clear_print_area(&mut pkg.workbook, 0);
+    // Undo puts the names back as they were.
+    pkg.workbook.defined_names = snapshot;
+    assert_eq!(workbook_xml(&pkg), before);
+}
+
+#[test]
+fn a_set_print_area_is_written_and_a_new_one_added() {
+    use crate::print::area::{add_print_area, set_print_area};
+    let mut pkg = load_xlsx(&book(AREA, &[("Report", Some(DATA))])).unwrap();
+    add_print_area(&mut pkg.workbook, 0, (0, 5, 4, 6));
+    let wb = workbook_xml(&pkg);
+    assert!(
+        wb.contains(r#"<definedName name="_xlnm.Print_Area" localSheetId="0">Report!$A$1:$D$20,Report!$F$1:$G$5</definedName>"#),
+        "{wb}"
+    );
+    let mut pkg = load_xlsx(&book("", &[("Report", Some(DATA))])).unwrap();
+    set_print_area(&mut pkg.workbook, 0, &[(0, 0, 9, 2)]);
+    let wb = workbook_xml(&pkg);
+    assert!(
+        wb.contains(r#"<definedName name="_xlnm.Print_Area" localSheetId="0">Report!$A$1:$C$10</definedName>"#),
+        "{wb}"
+    );
+}
+
+#[test]
+fn an_unaligned_workbook_keeps_a_print_area_it_cannot_place() {
+    use crate::print::area::clear_print_area;
+    // The second sheet's part is missing, so localSheetId can't be trusted.
+    let names = format!("{AREA}");
+    let mut pkg = load_xlsx(&book(&names, &[("Report", Some(DATA)), ("Gone", None)])).unwrap();
+    clear_print_area(&mut pkg.workbook, 0);
+    let wb = workbook_xml(&pkg);
+    assert!(wb.contains(AREA), "{wb}");
+}

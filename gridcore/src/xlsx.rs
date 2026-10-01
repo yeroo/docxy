@@ -5080,7 +5080,11 @@ fn patch_defined_names(xml: &str, names: &[DefinedName], sheet_count: usize) -> 
                             continue;
                         }
                         depth -= 1; // its end tag is consumed here
-                        if !patch_defined_name(xml, &mut p, key, names, &mut edits) {
+                        let ctx = NameCtx {
+                            start: p.start_pos(),
+                            sheet_count,
+                        };
+                        if !patch_defined_name(xml, &mut p, key, names, ctx, &mut edits) {
                             break;
                         }
                     }
@@ -5171,11 +5175,25 @@ fn patch_defined_names(xml: &str, names: &[DefinedName], sheet_count: usize) -> 
 /// Queue the new content of the `<definedName>` whose start tag the parser is
 /// on (not a self-closing one) where the model's definition differs, and
 /// leave the parser past its end tag. `false` when the part ends first.
+/// Where a `<definedName>` element starts, and how many sheets the model
+/// has, for [`patch_defined_name`].
+struct NameCtx {
+    start: usize,
+    sheet_count: usize,
+}
+
+/// The built-in names a save deletes once the model has none of them for a
+/// sheet: Clear Print Area, and clearing the print titles.
+fn removable_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("_xlnm.Print_Area") || name.eq_ignore_ascii_case("_xlnm.Print_Titles")
+}
+
 fn patch_defined_name(
     xml: &str,
     p: &mut XmlParser,
     key: Option<(String, Option<usize>)>,
     names: &[DefinedName],
+    ctx: NameCtx,
     edits: &mut Vec<(usize, usize, String)>,
 ) -> bool {
     let body_start = p.pos();
@@ -5197,7 +5215,22 @@ fn patch_defined_name(
     let Some(body_end) = body_end else {
         return false;
     };
-    let model = key.filter(|_| !nested).and_then(|(name, scope)| {
+    let key = key.filter(|_| !nested);
+    // A print area or titles the model no longer has, for a sheet the key
+    // names reliably (it is only scoped while the sheets line up), was
+    // cleared: its element goes.
+    if let Some((name, Some(scope))) = &key {
+        if removable_name(name)
+            && *scope < ctx.sheet_count
+            && !names
+                .iter()
+                .any(|d| d.scope == Some(*scope) && d.name.eq_ignore_ascii_case(name))
+        {
+            edits.push((ctx.start, p.pos(), String::new()));
+            return true;
+        }
+    }
+    let model = key.and_then(|(name, scope)| {
         let mut hits = names
             .iter()
             .filter(|d| d.scope == scope && d.name.eq_ignore_ascii_case(&name));
