@@ -124,7 +124,8 @@ struct Globals {
     sheets: Vec<String>,
     /// Per SUPBOOK, what it is.
     books: Vec<Book>,
-    /// The external books whose names formulas call, `[1]` first.
+    /// The external books with a function name formulas can call
+    /// ([`read_link`]), `[1]` first.
     links: Vec<ExternalLink>,
     xti: Vec<(u32, i32, i32)>,
     /// Each BrtName's name and sheet (`0xFFFFFFFF` for the workbook).
@@ -315,11 +316,13 @@ pub(crate) fn read_with(zip: &ZipArchive, limits: Limits) -> Result<BookIn, Open
                 BRT_SUP_SELF | BRT_SUP_SAME => g.books.push(Book::Own),
                 BRT_SUP_BOOK_SRC => {
                     // Links are numbered in the order of the books that
-                    // have one, which is Excel's `[k]` unless a book with
-                    // no names (one only cells refer to, not imported)
-                    // comes first: then the numbers differ from Excel's
-                    // but still name the links this import writes. A part
-                    // several books name is read once and is one link.
+                    // have one: those with a function name. That is
+                    // Excel's `[k]` unless a book without one comes first
+                    // (one only cells refer to, or whose range or constant
+                    // names formulas call, neither imported): then the
+                    // numbers differ from Excel's but still name the links
+                    // this import writes. A part several books name is
+                    // read once and is one link.
                     let part = c.wide().and_then(|rid| rel.get(&rid));
                     let k = match part {
                         None => None,
@@ -973,8 +976,9 @@ mod tests {
         assert_eq!(got.as_deref(), Some("Global"));
     }
 
-    /// ptgNameX into another book's name reads `[k]!NAME`, `k` counting the
-    /// books that have names: one with none (the first) gets no link.
+    /// ptgNameX into another book's function name reads `[k]!NAME`, `k`
+    /// counting the books that have a function name: one without (the
+    /// first) gets no link.
     #[test]
     fn name_x_into_an_external_book_is_numbered_and_qualified() {
         let src = |rid: &str| rec(BRT_SUP_BOOK_SRC, &wide(rid));
