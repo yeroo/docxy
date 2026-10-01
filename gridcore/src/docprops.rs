@@ -890,7 +890,39 @@ impl SheetPackage {
     /// parts is touched; a part is created (with its relationship and
     /// content type) only when there is something to put in it, and
     /// `custom.xml` goes away with its last property.
-    pub fn set_doc_properties(&mut self, props: &DocProperties) {
+    ///
+    /// An `Err` names the unreadable part (core.xml or app.xml) a changed
+    /// property would have to go into; nothing is written then.
+    pub fn set_doc_properties(&mut self, props: &DocProperties) -> Result<(), String> {
+        let now = self.doc_properties();
+        let differ = |pairs: &[(&Option<String>, &Option<String>)]| {
+            let norm = |v: &Option<String>| v.clone().filter(|s| !s.is_empty());
+            pairs.iter().any(|(a, b)| norm(a) != norm(b))
+        };
+        let core_changed = differ(&[
+            (&props.title, &now.title),
+            (&props.subject, &now.subject),
+            (&props.creator, &now.creator),
+            (&props.keywords, &now.keywords),
+            (&props.description, &now.description),
+            (&props.last_modified_by, &now.last_modified_by),
+            (&props.created, &now.created),
+            (&props.modified, &now.modified),
+            (&props.category, &now.category),
+        ]);
+        let app_changed = differ(&[
+            (&props.company, &now.company),
+            (&props.manager, &now.manager),
+            (&props.hyperlink_base, &now.hyperlink_base),
+        ]);
+        for (kind, changed) in [(Part::Core, core_changed), (Part::App, app_changed)] {
+            let (name, _) = locate(&self.parts, kind);
+            if changed && matches!(part_xml(&self.parts, &name), PartXml::Unreadable) {
+                return Err(format!(
+                    "document properties can't be edited: {name} is unreadable"
+                ));
+            }
+        }
         fn f<'a>(ns: &'a str, local: &'a str, value: &'a Option<String>) -> Field<'a> {
             Field {
                 ns,
@@ -933,19 +965,22 @@ impl SheetPackage {
         set_fields(&mut self.parts, Part::App, &app);
 
         set_custom(&mut self.parts, &props.custom);
+        Ok(())
     }
 
     /// Stamp a save: `dcterms:modified` = `now` (W3CDTF) and
-    /// `cp:lastModifiedBy` = `user`. A package with no core properties yet
-    /// also gets `user` as its author and `now` as its creation time. The
+    /// `cp:lastModifiedBy` = `user`. A package without an author or a
+    /// creation time also gets `user` and `now` for them. The
     /// clock is an argument so the stamp is the caller's (and a test's)
     /// choice; [`crate::xlsx::save_xlsx`] itself never stamps.
     ///
     /// Only core.xml is written (app.xml and custom.xml are not looked at),
     /// and an unreadable core.xml is left as it is.
     pub fn stamp_save(&mut self, now: &str, user: &str) {
-        let (core, _) = locate(&self.parts, Part::Core);
-        let fresh = matches!(part_xml(&self.parts, &core), PartXml::Missing);
+        // Author and creation time are set where the file has none: no core
+        // part yet, or one written without them (a Title set before the
+        // first save creates core.xml with just that).
+        let current = self.doc_properties();
         let (now, user) = (Some(now.to_string()), Some(user.to_string()));
         let mut fields = vec![
             Field {
@@ -961,7 +996,7 @@ impl SheetPackage {
                 w3cdtf: true,
             },
         ];
-        if fresh {
+        if current.creator.is_none() {
             fields.insert(
                 0,
                 Field {
@@ -971,15 +1006,14 @@ impl SheetPackage {
                     w3cdtf: false,
                 },
             );
-            fields.insert(
-                2,
-                Field {
-                    ns: NS_DCTERMS,
-                    local: "created",
-                    value: now.as_deref(),
-                    w3cdtf: true,
-                },
-            );
+        }
+        if current.created.is_none() {
+            fields.push(Field {
+                ns: NS_DCTERMS,
+                local: "created",
+                value: now.as_deref(),
+                w3cdtf: true,
+            });
         }
         set_fields(&mut self.parts, Part::Core, &fields);
     }
@@ -1269,7 +1303,7 @@ mod tests {
                 value: CustomValue::Date("2024-05-06T00:00:00Z".into()),
             },
         ];
-        pkg.set_doc_properties(&p);
+        pkg.set_doc_properties(&p).unwrap();
         let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
         assert_eq!(re.doc_properties(), p);
 
@@ -1311,11 +1345,11 @@ mod tests {
         let mut pkg = with_props(CORE, APP);
         let mut p = pkg.doc_properties();
         p.title = Some("x".into());
-        pkg.set_doc_properties(&p);
+        pkg.set_doc_properties(&p).unwrap();
         assert!(text(&pkg, "docProps/core.xml").contains("<dc:title>x</dc:title>"));
         p.title = Some(String::new());
         p.last_modified_by = None;
-        pkg.set_doc_properties(&p);
+        pkg.set_doc_properties(&p).unwrap();
         let core = text(&pkg, "docProps/core.xml");
         assert!(!core.contains("title"));
         assert!(!core.contains("lastModifiedBy"));
@@ -1327,7 +1361,7 @@ mod tests {
         let mut pkg = with_props(CORE, APP);
         let before = save_xlsx(&pkg);
         let p = pkg.doc_properties();
-        pkg.set_doc_properties(&p);
+        pkg.set_doc_properties(&p).unwrap();
         assert_eq!(save_xlsx(&pkg), before);
     }
 
@@ -1342,7 +1376,7 @@ mod tests {
         p.title = Some("New".into());
         p.company = Some("Co".into());
         p.modified = Some("2024-01-01T00:00:00Z".into());
-        pkg.set_doc_properties(&p);
+        pkg.set_doc_properties(&p).unwrap();
         let core = text(&pkg, "docProps/core.xml");
         assert!(core.contains("<dc:title>New</dc:title>"));
         // dcterms and xsi were not declared: the patch declares them.
@@ -1403,7 +1437,7 @@ mod tests {
             company: Some("Acme".into()),
             ..DocProperties::default()
         };
-        pkg.set_doc_properties(&p);
+        pkg.set_doc_properties(&p).unwrap();
         let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
         assert_eq!(re.doc_properties().company.as_deref(), Some("Acme"));
         assert!(text(&re, "_rels/.rels").contains(
@@ -1440,7 +1474,7 @@ mod tests {
         assert_eq!(p.company.as_deref(), Some("Strict Co"));
         p.company = Some("Other".into());
         p.manager = Some("M".into());
-        pkg.set_doc_properties(&p);
+        pkg.set_doc_properties(&p).unwrap();
         assert!(pkg.part("docProps/app.xml").is_none());
         assert_eq!(pkg.doc_properties(), p);
         assert!(text(&pkg, "meta/x.xml").contains("<Manager>M</Manager>"));
@@ -1485,7 +1519,7 @@ mod tests {
         // An unrelated property edit: custom.xml is untouched.
         let before = text(&pkg, "docProps/custom.xml");
         p.title = Some("t".into());
-        pkg.set_doc_properties(&p);
+        pkg.set_doc_properties(&p).unwrap();
         assert_eq!(text(&pkg, "docProps/custom.xml"), before);
 
         // Editing another custom property keeps the Other one, its order
@@ -1495,7 +1529,7 @@ mod tests {
             name: "C".into(),
             value: CustomValue::Bool(false),
         });
-        pkg.set_doc_properties(&p);
+        pkg.set_doc_properties(&p).unwrap();
         let xml = text(&pkg, "docProps/custom.xml");
         let a = xml.find(r#"pid="2" name="A"><vt:lpwstr>changed"#).unwrap();
         let blob = xml.find(OTHER).unwrap();
@@ -1544,7 +1578,7 @@ mod tests {
             // An unrelated edit leaves it alone too.
             let mut p = re.doc_properties();
             p.title = Some("T".into());
-            re.set_doc_properties(&p);
+            re.set_doc_properties(&p).unwrap();
             assert_eq!(re.part("docProps/custom.xml").unwrap(), bytes.as_slice());
             assert_eq!(re.doc_properties().title.as_deref(), Some("T"));
 
@@ -1553,11 +1587,56 @@ mod tests {
                 name: "B".into(),
                 value: CustomValue::Bool(true),
             }];
-            re.set_doc_properties(&p);
+            re.set_doc_properties(&p).unwrap();
             assert_eq!(re.doc_properties(), p);
             let re = load_xlsx(&save_xlsx(&re)).unwrap();
             assert_eq!(re.doc_properties().custom, p.custom);
         }
+    }
+
+    #[test]
+    fn stamp_sets_the_author_and_creation_time_a_core_part_lacks() {
+        // A Title set before the first save makes a core.xml with just that.
+        let mut pkg = new_xlsx();
+        let p = DocProperties {
+            title: Some("T".into()),
+            ..DocProperties::default()
+        };
+        pkg.set_doc_properties(&p).unwrap();
+        pkg.stamp_save("2026-10-01T12:00:00Z", "me");
+        let p = pkg.doc_properties();
+        assert_eq!(p.title.as_deref(), Some("T"));
+        assert_eq!(p.creator.as_deref(), Some("me"));
+        assert_eq!(p.created.as_deref(), Some("2026-10-01T12:00:00Z"));
+        // An existing author and creation time are kept.
+        pkg.stamp_save("2027-01-01T00:00:00Z", "you");
+        let p = pkg.doc_properties();
+        assert_eq!(p.creator.as_deref(), Some("me"));
+        assert_eq!(p.created.as_deref(), Some("2026-10-01T12:00:00Z"));
+        assert_eq!(p.last_modified_by.as_deref(), Some("you"));
+        assert_eq!(p.modified.as_deref(), Some("2027-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn an_edit_to_an_unreadable_part_is_an_error() {
+        let bytes = utf16(CORE);
+        let mut pkg = with_props(CORE, APP);
+        pkg.set_part("docProps/core.xml", bytes.clone());
+        let mut p = pkg.doc_properties();
+        p.title = Some("T".into());
+        p.company = Some("Co".into());
+        let err = pkg.set_doc_properties(&p).unwrap_err();
+        assert_eq!(
+            err,
+            "document properties can't be edited: docProps/core.xml is unreadable"
+        );
+        // Nothing was written, app.xml included.
+        assert_eq!(pkg.part("docProps/core.xml").unwrap(), bytes.as_slice());
+        assert_eq!(pkg.doc_properties().company, None);
+        // A change to a readable part alone still goes through.
+        p.title = None;
+        pkg.set_doc_properties(&p).unwrap();
+        assert_eq!(pkg.doc_properties().company.as_deref(), Some("Co"));
     }
 
     #[test]
@@ -1569,7 +1648,7 @@ mod tests {
         let mut p = pkg.doc_properties();
         assert_eq!(p.creator, None);
         p.title = Some("T".into());
-        pkg.set_doc_properties(&p);
+        assert!(pkg.set_doc_properties(&p).is_err());
         let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
         assert_eq!(re.part("docProps/core.xml").unwrap(), bytes.as_slice());
     }
@@ -1584,7 +1663,7 @@ mod tests {
         assert_eq!(p.custom.len(), 1);
         // Removing the only listed property keeps the part for the other.
         p.custom.clear();
-        pkg.set_doc_properties(&p);
+        pkg.set_doc_properties(&p).unwrap();
         let xml = text(&pkg, "docProps/custom.xml");
         assert!(xml.contains(nameless), "{xml}");
         assert!(!xml.contains(r#"name="A""#), "{xml}");
@@ -1593,7 +1672,7 @@ mod tests {
             name: "C".into(),
             value: CustomValue::Text("c".into()),
         });
-        pkg.set_doc_properties(&p);
+        pkg.set_doc_properties(&p).unwrap();
         assert!(text(&pkg, "docProps/custom.xml").contains(r#"pid="4" name="C""#));
     }
 
@@ -1605,7 +1684,7 @@ mod tests {
         let mut pkg = custom_pkg(&body);
         let before = text(&pkg, "docProps/custom.xml");
         let p = pkg.doc_properties();
-        pkg.set_doc_properties(&p);
+        pkg.set_doc_properties(&p).unwrap();
         assert_eq!(text(&pkg, "docProps/custom.xml"), before);
     }
 
@@ -1616,7 +1695,7 @@ mod tests {
         ));
         let mut p = pkg.doc_properties();
         p.custom.clear();
-        pkg.set_doc_properties(&p);
+        pkg.set_doc_properties(&p).unwrap();
         assert!(pkg.part("docProps/custom.xml").is_none());
         assert!(!text(&pkg, "_rels/.rels").contains("custom-properties"));
         assert!(!text(&pkg, "[Content_Types].xml").contains("custom.xml"));
