@@ -1719,22 +1719,36 @@ mod tests {
             .iter()
             .map(|(n, c)| (n.as_str(), c.clone()))
             .collect();
+        // A loaded CSE block, as the loader gives it: its `<f>` attributes, the
+        // spill its ref records, and its values stored over the block.
         let cse = Cell {
+            value: CellValue::Number(2.0),
             formula: Some("A1:A3*2".into()),
             f_attrs: Some(" t=\"array\" ref=\"D1:D3\"".into()),
+            spill: Some((3, 1)),
             ..Cell::default()
         };
-        for anchor in [Cell::formula("A1:A3*2"), cse] {
+        for loaded in [false, true] {
             let mut w = wb(&column);
-            let mut eng = Engine::new(&w);
-            eng.set_cell(&mut w, (0, 0, 3), anchor);
+            if loaded {
+                w.sheets[0].set_cell(0, 3, cse.clone());
+                w.sheets[0].set_cell(1, 3, Cell::number(4.0));
+                w.sheets[0].set_cell(2, 3, Cell::number(6.0));
+                Engine::new(&w).recalc_all(&mut w);
+            } else {
+                let mut eng = Engine::new(&w);
+                eng.set_cell(&mut w, (0, 0, 3), Cell::formula("A1:A3*2"));
+            }
             assert_eq!(w.sheets[0].cell(0, 3).unwrap().spill, Some((3, 1)));
+            let d1 = w.sheets[0].cell(0, 3).unwrap();
+            assert_eq!(d1.f_attrs.is_some(), loaded);
             assert_eq!(autofill(&mut w, 0, (0, 3, 2, 3), (5, 3)), 3);
             let mut eng = Engine::new(&w);
             eng.recalc_all(&mut w);
             let d = ["D1", "D2", "D3", "D4", "D5", "D6"];
             assert_eq!(values(&w, &d), nums(&[2.0, 4.0, 6.0, 8.0, 10.0, 12.0]));
             assert_eq!(w.sheets[0].cell(3, 3).unwrap().spill, Some((3, 1)));
+            assert_eq!(w.sheets[0].cell(0, 3).unwrap().f_attrs.is_some(), loaded);
         }
 
         // Right: SEQUENCE(1,3) in A5 spills A5:C5; filled to D5:F5.
