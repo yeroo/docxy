@@ -88,6 +88,9 @@ const BRT_EXTERN_SHEET: u32 = 362;
 const BRT_ARR_FMLA: u32 = 426;
 const BRT_SHR_FMLA: u32 = 427;
 const BRT_SUP_NAME_START: u32 = 577;
+/// A name's definition in an external link part: `cce` and tokens (see
+/// [`read_link`]; corpus/legacy/addin has both kinds).
+const BRT_SUP_NAME_FMLA: u32 = 585;
 const BRT_BEGIN_CELL_XFS: u32 = 617;
 const BRT_END_CELL_XFS: u32 = 618;
 const BRT_SUP_ADDIN: u32 = 667;
@@ -154,12 +157,12 @@ impl Names for Globals {
                     Some(format!("{}{name}", self.xti(ixti)?))
                 }
             }
-            // A name of the whole book (first sheet -2), as the `.xlsx`
-            // spells it: `[1]!EUROCONVERT`. One scoped to a sheet of the
-            // book isn't read.
+            // A function name of the whole book (first sheet -2), as the
+            // `.xlsx` spells it: `[1]!EUROCONVERT`. One scoped to a sheet of
+            // the book, or a range or constant name, isn't read.
             Book::External(Some(k)) if first == -2 => {
                 let name = self.links[k].names.get(index.checked_sub(1)? as usize)?;
-                Some(format!("[{}]!{name}", k + 1))
+                Some(format!("[{}]!{}", k + 1, name.as_ref()?))
             }
             Book::External(_) | Book::Other => None,
         }
@@ -221,12 +224,22 @@ fn rels(zip: &ZipArchive, part: &str) -> HashMap<String, (String, String)> {
 /// The external link part `part` of a BrtSupBookSrc: the book's rel, sheet
 /// names and names (BrtBeginSupBook, BrtSupTabs, BrtSupNameStart) and the
 /// part's relationships. `None` unless it is a workbook's (`sbt` 0, not DDE
-/// or OLE) whose rel is there and which has names: only a name makes a
-/// formula refer to the book, and the import keeps nothing else of it.
+/// or OLE) whose rel is there and which has a function name: only a
+/// function name makes a formula refer to the book in a way the import
+/// keeps, and it keeps nothing else of it.
+///
+/// A name is a function (an add-in's, such as EUROCONVERT) when its
+/// BrtSupNameFmla holds no tokens (`cce` 0, as Excel writes EUROTOOL.XLAM's
+/// names). A workbook's range or constant name has its definition there
+/// (`Prices`: ptgArea3d, `Half`: `#REF!`) and the book's cells cached
+/// beside it, neither of which the import reads, so such a name is `None`;
+/// so is one with the record missing or cut short.
 fn read_link(zip: &ZipArchive, part: &str) -> Option<ExternalLink> {
     let bytes = zip.read(part)?;
     let mut link = ExternalLink::default();
     let mut workbook = false;
+    // The latest BrtSupNameStart's name, until its BrtSupNameFmla.
+    let mut pending: Option<String> = None;
     for (ty, body) in records(&bytes) {
         let mut c = Cur::new(body);
         match ty {
@@ -239,14 +252,26 @@ fn read_link(zip: &ZipArchive, part: &str) -> Option<ExternalLink> {
                     link.sheets.push(c.wide()?);
                 }
             }
-            BRT_SUP_NAME_START => link.names.push(c.wide()?),
+            // Every name takes its place: ptgNameX counts them all.
+            BRT_SUP_NAME_START => {
+                pending = c.wide();
+                link.names.push(None);
+            }
+            BRT_SUP_NAME_FMLA => {
+                if let (Some(name), Some(0)) = (pending.take(), c.u32()) {
+                    if let Some(slot) = link.names.last_mut() {
+                        *slot = Some(name);
+                    }
+                }
+            }
             _ => {}
         }
     }
     let bytes = zip.read(&rels_part_name(part))?;
     link.rels = parse_rels_mode(&String::from_utf8_lossy(&bytes));
     let named = link.rels.iter().any(|(id, ..)| *id == link.book);
-    (workbook && named && !link.names.is_empty()).then_some(link)
+    let functions = link.names.iter().any(Option::is_some);
+    (workbook && named && functions).then_some(link)
 }
 
 /// Read an `.xlsb` package.
@@ -697,8 +722,9 @@ mod tests {
         }
         v.extend(rec(BRT_SUP_TABS, &tabs));
         for n in names {
+            // A function name: no tokens.
             v.extend(rec(BRT_SUP_NAME_START, &wide(n)));
-            v.extend(rec(585, &[0; 4]));
+            v.extend(rec(BRT_SUP_NAME_FMLA, &[0; 4]));
         }
         v
     }
@@ -983,10 +1009,13 @@ mod tests {
         assert_eq!(c[&(0, 1)].formula.as_deref(), Some("[2]!EUROCONVERT(2)"));
         let links = &book.external_links;
         assert_eq!(links.len(), 2);
-        assert_eq!(links[0].names, ["ONE"]);
+        assert_eq!(links[0].names, [Some("ONE".to_string())]);
         assert_eq!(links[1].book, "rId1");
         assert_eq!(links[1].sheets, ["1028", "1030"]);
-        assert_eq!(links[1].names, ["X", "EUROCONVERT"]);
+        assert_eq!(
+            links[1].names,
+            [Some("X".to_string()), Some("EUROCONVERT".to_string())]
+        );
         assert_eq!(
             links[1].rels,
             [(
@@ -1048,6 +1077,76 @@ mod tests {
         }
         assert_eq!(c[&(0, 7)].formula.as_deref(), Some("[1]!F"));
         assert_eq!(book.external_links.len(), 1);
+    }
+
+    /// Only a function name (no tokens in its BrtSupNameFmla) is read: a
+    /// range or constant name of the book, or one whose definition is
+    /// missing or cut short, keeps its place among the names but gives no
+    /// formula, and only function names are written. A book with no
+    /// function name gets no link.
+    #[test]
+    fn only_function_names_of_an_external_book_are_read() {
+        let src = |rid: &str| rec(BRT_SUP_BOOK_SRC, &wide(rid));
+        let name = |n: &str, fmla: Option<&[u8]>| {
+            let mut v = rec(BRT_SUP_NAME_START, &wide(n));
+            if let Some(f) = fmla {
+                v.extend(rec(BRT_SUP_NAME_FMLA, f));
+            }
+            v
+        };
+        // Excel's: Prices = ptgArea3d, Half = #REF!.
+        let prices: &[u8] = &[13, 0, 0, 0, 0x3B, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0];
+        let half: &[u8] = &[2, 0, 0, 0, 0x1C, 0x17];
+        let mut part = link_part(0, "rId1", &["P"], &["F"]);
+        part.extend(name("Prices", Some(prices)));
+        part.extend(name("Half", Some(half)));
+        part.extend(name("Missing", None));
+        part.extend(name("Cut", Some(&[0, 0])));
+        part.extend(name("G", Some(&[0; 4])));
+        let mut ranges = link_part(0, "rId1", &["P"], &[]);
+        ranges.extend(name("Prices", Some(prices)));
+        let book = open(&xlsb_links(
+            &[
+                src("rId2"),
+                src("rId3"),
+                extern_sheet(&[(0, -2, -2), (1, -2, -2)]),
+            ],
+            &[
+                rec(BRT_ROW_HDR, &0u32.to_le_bytes()),
+                fmla_num(0, 1.0, &name_x(0, 1)),
+                fmla_num(1, 2.0, &name_x(0, 2)),
+                fmla_num(2, 3.0, &name_x(0, 3)),
+                fmla_num(3, 4.0, &name_x(0, 4)),
+                fmla_num(4, 5.0, &name_x(0, 5)),
+                fmla_num(5, 6.0, &name_x(0, 6)),
+                fmla_num(6, 7.0, &name_x(1, 1)),
+            ],
+            &[("rId2", part, LINK_RELS), ("rId3", ranges, LINK_RELS)],
+        ));
+        let c = &book.sheets[0].cells;
+        let got: Vec<Option<&str>> = (0..7).map(|col| c[&(0, col)].formula.as_deref()).collect();
+        assert_eq!(
+            got,
+            [Some("[1]!F"), None, None, None, None, Some("[1]!G"), None]
+        );
+        for col in 0..7 {
+            assert_eq!(c[&(0, col)].value, CellValue::Number(col as f64 + 1.0));
+        }
+        assert_eq!(book.external_links.len(), 1);
+        let pkg = book.build();
+        let link = String::from_utf8(
+            pkg.part("xl/externalLinks/externalLink1.xml")
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            link.contains(
+                r#"<definedNames><definedName name="F"/><definedName name="G"/></definedNames>"#
+            ),
+            "{link}"
+        );
+        assert!(pkg.part("xl/externalLinks/externalLink2.xml").is_none());
     }
 
     /// Books naming the same link part are one link, read once, however

@@ -560,3 +560,26 @@ fn xlsb_add_in_link_survives_save_as_xlsx() {
     same_formula_text("addin-udf.xlsb (h)", &src, &back, &mut errs);
     assert!(errs.is_empty(), "{}", errs.join("\n"));
 }
+
+/// A name of an ordinary workbook (`SUM([1]!Prices)`, `[1]!Half*2` in
+/// Excel's `.xlsx`) has a definition and cached cells the import doesn't
+/// read: its formula is dropped and the value kept, and no link is written.
+#[test]
+fn xlsb_external_workbook_name_keeps_only_its_value() {
+    let dir = corpus("legacy").join("addin");
+    let (pkg, _) =
+        open_workbook(&std::fs::read(dir.join("ext-name.xlsb")).unwrap()).expect("xlsb opens");
+    let sheet = &pkg.workbook.sheets[0];
+    for (r, want) in [(0, 7.0), (1, 1.0)] {
+        let cell = sheet.cell(r, 0).expect("cell");
+        assert_eq!(cell.value, CellValue::Number(want), "row {r}");
+        assert_eq!(cell.formula, None, "row {r}");
+    }
+    let bytes = save_xlsx(&pkg);
+    let back = load_xlsx(&bytes).expect("saved import reloads");
+    assert!(
+        !back.part_names().iter().any(|n| n.contains("externalLink")),
+        "{:?}",
+        back.part_names()
+    );
+}

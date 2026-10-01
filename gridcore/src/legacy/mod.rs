@@ -189,8 +189,9 @@ pub(crate) struct ExternalLink {
     pub rels: Vec<(String, String, String, Option<String>)>,
     /// The book's sheet names.
     pub sheets: Vec<String>,
-    /// The book's names, in the file's order.
-    pub names: Vec<String>,
+    /// The book's names, in the file's order (ptgNameX counts them all):
+    /// a function name, or `None` for a name that isn't imported.
+    pub names: Vec<Option<String>>,
 }
 
 /// A workbook as a reader collects it, before it becomes a package.
@@ -376,6 +377,7 @@ fn write_external_links(pkg: &mut SheetPackage, links: &[ExternalLink]) {
         let names: Vec<&String> = link
             .names
             .iter()
+            .flatten()
             .filter(|n| seen.insert(n.to_lowercase()))
             .collect();
         if !names.is_empty() {
@@ -900,7 +902,7 @@ mod tests {
                 Some("External".into()),
             )],
             sheets: vec!["S&1".into()],
-            names: names.iter().map(|n| n.to_string()).collect(),
+            names: names.iter().map(|n| Some(n.to_string())).collect(),
         }
         };
         let mut book = BookIn::new();
@@ -1177,7 +1179,7 @@ mod tests {
                 book: "rId1".into(),
                 rels: vec![("rId1".into(), "t".into(), format!("B{i}.XLAM"), None)],
                 sheets: Vec::new(),
-                names: vec![format!("F{i}")],
+                names: vec![Some(format!("F{i}"))],
             })
             .collect();
         let started = std::time::Instant::now();
