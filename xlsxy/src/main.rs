@@ -4705,7 +4705,9 @@ impl App {
         self.status = Some(match print_pdf(&self.pkg.workbook, &job, &self.path) {
             Err(e) => e.to_string(),
             Ok((pdf, pages)) => {
-                match export_bytes(&self.path, self.import_source.as_deref(), &out, &pdf) {
+                // Through the App's guarded write, like every App write (#882).
+                let source = export_source(&self.path, self.import_source.as_deref(), &out);
+                match self.write_export(Some(Path::new(source)), Path::new(&out), &pdf) {
                     Ok(()) => format!(
                         "Exported {out} ({pages} page{})",
                         if pages == 1 { "" } else { "s" }
@@ -9541,6 +9543,31 @@ mod tests {
         let bytes = std::fs::read(&pdf).unwrap();
         assert!(String::from_utf8_lossy(&bytes).contains("(hello) Tj"));
         assert!(app.backstage.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backstage_pdf_export_of_a_read_only_workbook_writes_the_pdf_only() {
+        // #882: a read-only workbook is never written; its PDF is a new file.
+        let dir = std::env::temp_dir().join(format!("xlsxy-pdf-ro-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = dir.join("book.xlsx");
+        let pdf = dir.join("book.pdf");
+        let _ = std::fs::remove_file(&pdf);
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].set_cell(0, 0, gridcore::sheet::Cell::text("hello"));
+        std::fs::write(&book, save_xlsx(&pkg)).unwrap();
+        let before = std::fs::read(&book).unwrap();
+        let mut app = App::new(pkg, book.to_str().unwrap());
+        app.set_read_only(book.to_str().unwrap());
+        app.export_pdf();
+        assert!(
+            app.status.as_deref().unwrap().starts_with("Exported"),
+            "{:?}",
+            app.status
+        );
+        assert!(String::from_utf8_lossy(&std::fs::read(&pdf).unwrap()).contains("(hello) Tj"));
+        assert_eq!(std::fs::read(&book).unwrap(), before);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
