@@ -3450,6 +3450,66 @@ mod tests {
     }
 
     #[test]
+    fn undoing_typing_into_a_frozen_block_restores_its_extent() {
+        // #837 r2: a value typed into a frozen block drops its anchor's
+        // extent; undo puts the extent back, so the block saves whole. One
+        // cell, then every cell but the anchor.
+        let n = |v: f64| CellValue::Number(v);
+        let cached = vec![n(7.0), n(8.0), n(9.0)];
+        let edits = [
+            (vec!["set	1	4	5"], vec![n(7.0), n(5.0), n(9.0)]),
+            (
+                vec![
+                    "select	1	4	2	4",
+                    "paste	1	4	5
+6",
+                ],
+                vec![n(7.0), n(5.0), n(6.0)],
+            ),
+        ];
+        let mut pkg = new_xlsx();
+        let sheet = &mut pkg.workbook.sheets[0];
+        sheet.set_cell(0, 0, Cell::number(1.0));
+        sheet.set_cell(
+            0,
+            4,
+            Cell {
+                value: n(7.0),
+                formula: Some("PIVOTBY(A1,4)".into()),
+                f_attrs: Some("t=\"array\" ref=\"E1:E3\"".into()),
+                spill: Some((3, 1)),
+                ..Cell::default()
+            },
+        );
+        sheet.set_cell(1, 4, Cell::number(8.0));
+        sheet.set_cell(2, 4, Cell::number(9.0));
+        let file = save_xlsx(&pkg);
+        for (cmds, typed) in edits {
+            let mut s = Session::open(&file).expect("open");
+            let at = cmds.join(" ");
+            let extent = |s: &Session| s.pkg.workbook.sheets[0].cell(0, 4).unwrap().spill;
+            for cmd in &cmds {
+                s.dispatch(cmd);
+            }
+            assert_eq!(col3(&s, 4), typed, "{at}");
+            for round in 0..2 {
+                s.dispatch("undo");
+                assert_eq!(col3(&s, 4), cached, "undo {round}, {at}");
+                assert_eq!(extent(&s), Some((3, 1)), "undo {round}, {at}");
+                if round == 0 {
+                    s.dispatch("redo");
+                    assert_eq!(col3(&s, 4), typed, "redo, {at}");
+                }
+            }
+            let re = Session::open(&s.save()).expect("reopen");
+            assert_eq!(col3(&re, 4), cached, "saved, {at}");
+            let ws = String::from_utf8_lossy(re.pkg.part("xl/worksheets/sheet1.xml").unwrap())
+                .into_owned();
+            assert!(ws.contains(r#"<f t="array" ref="E1:E3">"#), "{at}: {ws}");
+        }
+    }
+
+    #[test]
     fn undoing_an_overwrite_of_a_live_anchor_re_spills_it() {
         // #837 guard: a live anchor's block is not recorded; undo re-spills
         // it from its formula.

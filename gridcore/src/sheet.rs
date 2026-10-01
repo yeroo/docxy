@@ -270,38 +270,66 @@ pub fn snapshot_cells(
 }
 
 /// The cells an undo group over `keys` must record: `keys` in order,
-/// followed by the spill values of each key that is a spill anchor `frozen`
-/// reports as kept on its cached values, each added once and not if `keys`
-/// names it already. Replacing an anchor clears its spill
-/// ([`crate::engine::Engine::set_cell`]), and a frozen anchor never
-/// re-spills: [`crate::engine::Engine::restore_cells`] puts its cached values
-/// back only from cells in the same snapshot.
+/// followed by what a frozen spill anchor (one `frozen` reports as kept on
+/// its cached values, which never re-spills) needs to come back whole.
+/// [`crate::engine::Engine::restore_cells`] puts its extent and cached
+/// values back only from cells in the same snapshot, and an edit can take
+/// either outside the keys ([`crate::engine::Engine::set_cell`]):
 ///
-/// Only the cells that clearing takes are added: plain non-empty values the
-/// sheet holds in the anchor's extent (its `spill`, not its `ref`). An empty
-/// cell is the same before and after, and the extent comes unbounded from a
-/// loaded `ref` (`A1:XFD1048576`), so the walk costs the cells held in its
-/// rows, not its area. `frozen` — an evaluation, in the hosts — is asked
-/// only of an anchor with such a cell outside `keys`: a live anchor typed
-/// over is still asked, and adds nothing, since it re-spills from its
-/// formula. The order within the group is not load-bearing: an anchor's
-/// restore clears or refills its block whichever comes first.
+/// - a key that is the anchor: replacing it clears its spill values;
+/// - a key inside its block: a value typed there drops the anchor's extent.
+///   The anchor is added, and its values too: restoring the anchor clears
+///   them before it refills the ones the group holds.
+///
+/// Each is added once, and not if `keys` names it already. A live anchor
+/// adds nothing: it re-spills from its formula.
+///
+/// Only the values clearing takes are added: plain non-empty cells the
+/// sheet holds in the extent (its `spill`, not its `ref`). An empty cell is
+/// the same before and after, and the extent comes unbounded from a loaded
+/// `ref` (`A1:XFD1048576`), so the walk costs the cells held in its rows,
+/// not its area. `frozen` — an evaluation, in the hosts — is asked once per
+/// anchor, and of a key's own anchor only when it holds such a value
+/// outside `keys`; a live anchor typed over, or over a key, is still asked.
+/// The order within the group is not load-bearing: an anchor's restore
+/// clears or refills its block whichever comes first.
 pub fn frozen_spill_keys(
     sheet: &Sheet,
     keys: &[(u32, u32)],
     mut frozen: impl FnMut(u32, u32) -> bool,
 ) -> Vec<(u32, u32)> {
+    let anchor_ext = |at: (u32, u32)| {
+        sheet
+            .cell(at.0, at.1)
+            .filter(|cl| cl.formula.is_some())
+            .and_then(|cl| cl.spill)
+    };
+    // Every spill anchor, found once, for the keys that are not one.
+    let mut all_anchors = None;
+    let mut candidates = Vec::new();
+    for &(r, c) in keys {
+        if let Some(ext) = anchor_ext((r, c)) {
+            candidates.push(((r, c), ext, false));
+            continue;
+        }
+        let anchors = all_anchors.get_or_insert_with(|| {
+            sheet
+                .cells
+                .iter()
+                .filter(|(_, cl)| cl.formula.is_some())
+                .filter_map(|(&at, cl)| cl.spill.map(|ext| (at, ext)))
+                .collect::<Vec<_>>()
+        });
+        for &((ar, ac), (h, w)) in anchors.iter() {
+            if r >= ar && r < ar.saturating_add(h) && c >= ac && c < ac.saturating_add(w) {
+                candidates.push(((ar, ac), (h, w), true));
+            }
+        }
+    }
     let mut out = keys.to_vec();
     let mut seen: HashSet<(u32, u32)> = keys.iter().copied().collect();
     let mut asked = HashSet::new();
-    for &(r, c) in keys {
-        let Some((h, w)) = sheet
-            .cell(r, c)
-            .filter(|cl| cl.formula.is_some())
-            .and_then(|cl| cl.spill)
-        else {
-            continue;
-        };
+    for ((r, c), (h, w), owner) in candidates {
         if !asked.insert((r, c)) {
             continue;
         }
@@ -315,12 +343,13 @@ pub fn frozen_spill_keys(
             .map(|(&at, _)| at)
             .filter(|at| !seen.contains(at))
             .collect();
-        if held.is_empty() || !frozen(r, c) {
+        if (held.is_empty() && !owner) || !frozen(r, c) {
             continue;
         }
-        for at in held {
-            seen.insert(at);
-            out.push(at);
+        for at in owner.then_some((r, c)).into_iter().chain(held) {
+            if seen.insert(at) {
+                out.push(at);
+            }
         }
     }
     out
@@ -2256,25 +2285,33 @@ mod tests {
             },
         );
         sheet.set_cell(1, 6, Cell::number(1.0)); // right of the block
-        let mut asked = Vec::new();
-        let mut frozen = |r, c| {
-            asked.push((r, c));
+        let asked = std::cell::RefCell::new(Vec::new());
+        let frozen = |r, c| {
+            asked.borrow_mut().push((r, c));
             (r, c) == (0, 4)
         };
-        // A live anchor, a member alone, an empty cell: nothing added.
-        for keys in [vec![(0, 2)], vec![(1, 4)], vec![(7, 7)]] {
-            assert_eq!(frozen_spill_keys(&sheet, &keys, &mut frozen), keys);
+        // A live anchor, a member of its spill, an empty cell: nothing added.
+        for keys in [vec![(0, 2)], vec![(1, 2)], vec![(7, 7)]] {
+            assert_eq!(frozen_spill_keys(&sheet, &keys, frozen), keys);
         }
         // A frozen anchor adds its held values once, after the keys,
         // whatever of them the keys already name.
         assert_eq!(
-            frozen_spill_keys(&sheet, &[(1, 4), (0, 4), (0, 4), (3, 3)], &mut frozen),
+            frozen_spill_keys(&sheet, &[(1, 4), (0, 4), (0, 4), (3, 3)], frozen),
             vec![(1, 4), (0, 4), (0, 4), (3, 3), (0, 5)]
         );
         // An anchor whose values the keys all name is not asked.
         let all = [(0, 4), (0, 5), (1, 4)];
-        assert_eq!(frozen_spill_keys(&sheet, &all, &mut frozen), all);
-        assert_eq!(asked, vec![(0, 2), (0, 4)]);
+        assert_eq!(frozen_spill_keys(&sheet, &all, frozen), all);
+        assert_eq!(*asked.borrow(), vec![(0, 2), (0, 2), (0, 4)]);
+        asked.borrow_mut().clear();
+        // A key inside a frozen block adds the anchor, then its values; one
+        // inside a live spill adds nothing; the frozen anchor is asked once.
+        assert_eq!(
+            frozen_spill_keys(&sheet, &[(1, 5), (2, 2), (1, 4)], frozen),
+            vec![(1, 5), (2, 2), (1, 4), (0, 4), (0, 5)]
+        );
+        assert_eq!(*asked.borrow(), vec![(0, 4), (0, 2)]);
     }
 
     #[test]

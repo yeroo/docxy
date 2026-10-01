@@ -11528,6 +11528,67 @@ mod tests {
     }
 
     #[test]
+    fn undoing_typing_into_a_frozen_block_restores_its_extent() {
+        // #837 r2: a value typed into a frozen block drops its anchor's
+        // extent; undo puts the extent back, so the block saves whole. One
+        // cell, then every cell but the anchor.
+        let n = |v: f64| CellValue::Number(v);
+        let cached = vec![n(7.0), n(8.0), n(9.0)];
+        let edits = [
+            (
+                vec![(1, 4, Cell::number(5.0))],
+                vec![n(7.0), n(5.0), n(9.0)],
+            ),
+            (
+                vec![(1, 4, Cell::number(5.0)), (2, 4, Cell::number(6.0))],
+                vec![n(7.0), n(5.0), n(6.0)],
+            ),
+        ];
+        for (edit, typed) in edits {
+            let mut pkg = new_xlsx();
+            let sheet = &mut pkg.workbook.sheets[0];
+            sheet.set_cell(0, 0, Cell::number(1.0));
+            sheet.set_cell(
+                0,
+                4,
+                Cell {
+                    value: n(7.0),
+                    formula: Some("PIVOTBY(A1,4)".into()),
+                    f_attrs: Some("t=\"array\" ref=\"E1:E3\"".into()),
+                    spill: Some((3, 1)),
+                    ..Cell::default()
+                },
+            );
+            sheet.set_cell(1, 4, Cell::number(8.0));
+            sheet.set_cell(2, 4, Cell::number(9.0));
+            let mut app = App::new(pkg, "test.xlsx");
+            app.os_clip = None;
+            let at = format!("{} cells", edit.len());
+            let extent = |app: &App| app.pkg.workbook.sheets[0].cell(0, 4).unwrap().spill;
+            app.apply(edit);
+            assert_eq!(col_values(&app, 4, 0, 2), typed, "{at}");
+            for round in 0..2 {
+                app.undo();
+                assert_eq!(col_values(&app, 4, 0, 2), cached, "undo {round}, {at}");
+                assert_eq!(extent(&app), Some((3, 1)), "undo {round}, {at}");
+                if round == 0 {
+                    app.redo();
+                    assert_eq!(col_values(&app, 4, 0, 2), typed, "redo, {at}");
+                }
+            }
+            let saved = gridcore::xlsx::save_xlsx(&app.pkg);
+            let re = gridcore::xlsx::load_xlsx(&saved).unwrap();
+            let ws =
+                String::from_utf8_lossy(re.part("xl/worksheets/sheet1.xml").unwrap()).into_owned();
+            assert!(ws.contains(r#"<f t="array" ref="E1:E3">"#), "{at}: {ws}");
+            let values: Vec<CellValue> = (0..3)
+                .map(|r| re.workbook.sheets[0].cell(r, 4).unwrap().value.clone())
+                .collect();
+            assert_eq!(values, cached, "saved, {at}");
+        }
+    }
+
+    #[test]
     fn undoing_an_overwrite_of_a_live_anchor_re_spills_it() {
         // #837 guard: a live anchor's block is not recorded; undo re-spills
         // it from its formula.
