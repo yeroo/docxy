@@ -1767,7 +1767,8 @@ impl App {
         self.apply_groups(vec![(sheet_idx, changes)]);
     }
 
-    /// Apply per-sheet cell changes, in order, as one undo step: a cut
+    /// Apply per-sheet cell changes, in order ([`Engine::set_cells`]: blanks
+    /// landing in a frozen array block last), as one undo step: a cut
     /// pasted on another sheet clears its source and writes its destination
     /// together, so one undo puts both back.
     fn apply_groups(&mut self, groups: Vec<(usize, CellChanges)>) {
@@ -1777,10 +1778,8 @@ impl App {
             .collect();
         self.record_groups(keys, |app| {
             for (sheet_idx, changes) in groups {
-                for (r, c, cell) in changes {
-                    app.engine
-                        .set_cell(&mut app.pkg.workbook, (sheet_idx, r, c), cell);
-                }
+                app.engine
+                    .set_cells(&mut app.pkg.workbook, sheet_idx, changes);
             }
         });
     }
@@ -11689,6 +11688,94 @@ mod tests {
         assert_eq!(col_values(&app, 4, 0, 2), cached);
         app.redo();
         assert_eq!(col_values(&app, 4, 0, 2), vec![n(7.0), n(5.0), n(9.0)]);
+    }
+
+    /// An app over a frozen array block: A1 = 1, E1 `PIVOTBY(A1,4)`
+    /// (`ref="E1:E3"`, cached 7) with `e2` and `e3` as its other cached cells.
+    fn app_with_frozen_block(e2: Cell, e3: Cell) -> App {
+        let mut pkg = new_xlsx();
+        let sheet = &mut pkg.workbook.sheets[0];
+        sheet.set_cell(0, 0, Cell::number(1.0));
+        sheet.set_cell(
+            0,
+            4,
+            Cell {
+                value: CellValue::Number(7.0),
+                formula: Some("PIVOTBY(A1,4)".into()),
+                f_attrs: Some("t=\"array\" ref=\"E1:E3\"".into()),
+                spill: Some((3, 1)),
+                ..Cell::default()
+            },
+        );
+        sheet.set_cell(1, 4, e2);
+        sheet.set_cell(2, 4, e3);
+        let mut app = App::new(pkg, "test.xlsx");
+        app.os_clip = None;
+        app
+    }
+
+    #[test]
+    fn retyping_a_frozen_anchor_keeps_its_block() {
+        // #840: the same formula typed over a frozen anchor (no F2: an
+        // unchanged F2 commits nothing) keeps its cached block, extent and
+        // saved `ref`, through undo and redo.
+        let n = |v: f64| CellValue::Number(v);
+        let cached = vec![n(7.0), n(8.0), n(9.0)];
+        let mut app = app_with_frozen_block(Cell::number(8.0), Cell::number(9.0));
+        let extent = |app: &App| app.pkg.workbook.sheets[0].cell(0, 4).unwrap().spill;
+        app.cur = (0, 4);
+        app.start_edit(Some('='));
+        if let Some(e) = &mut app.edit {
+            e.text = "=PIVOTBY(A1,4)".into();
+            e.cursor = e.text.chars().count();
+        }
+        assert!(app.commit_edit());
+        assert_eq!(col_values(&app, 4, 0, 2), cached, "typed");
+        assert_eq!(extent(&app), Some((3, 1)), "typed");
+        app.undo();
+        assert_eq!(col_values(&app, 4, 0, 2), cached, "undo");
+        assert_eq!(extent(&app), Some((3, 1)), "undo");
+        app.redo();
+        assert_eq!(col_values(&app, 4, 0, 2), cached, "redo");
+        assert_eq!(extent(&app), Some((3, 1)), "redo");
+        let saved = gridcore::xlsx::save_xlsx(&app.pkg);
+        let re = gridcore::xlsx::load_xlsx(&saved).unwrap();
+        let ws = String::from_utf8_lossy(re.part("xl/worksheets/sheet1.xml").unwrap()).into_owned();
+        assert!(ws.contains(r#"<f t="array" ref="E1:E3">"#), "{ws}");
+        let values: Vec<CellValue> = (0..3)
+            .map(|r| re.workbook.sheets[0].cell(r, 4).unwrap().value.clone())
+            .collect();
+        assert_eq!(values, cached, "saved");
+    }
+
+    #[test]
+    fn a_fill_or_replace_mixing_blanks_into_a_frozen_block_clears_them() {
+        // #840 (r4-m1): a group that puts a blank and a value into one frozen
+        // block breaks the block, and the blank clears its cell, though it
+        // comes first. Fill right D2:E3 from D2 = blank, D3 = 5.
+        let n = |v: f64| CellValue::Number(v);
+        let t = |s: &str| CellValue::Text(s.into());
+        let mut app = app_with_frozen_block(Cell::number(8.0), Cell::number(9.0));
+        app.pkg.workbook.sheets[0].set_cell(2, 3, Cell::number(5.0));
+        app.anchor = Some((1, 3));
+        app.cur = (2, 4);
+        app.fill(false);
+        assert_eq!(
+            col_values(&app, 4, 0, 2),
+            vec![n(7.0), CellValue::Empty, n(5.0)],
+            "fill"
+        );
+        app.undo();
+        assert_eq!(col_values(&app, 4, 0, 2), vec![n(7.0), n(8.0), n(9.0)]);
+
+        // Replace "x" with "" over E2 "x", E3 "xy".
+        let mut app = app_with_frozen_block(Cell::text("x"), Cell::text("xy"));
+        app.replace_all("x", "");
+        assert_eq!(
+            col_values(&app, 4, 0, 2),
+            vec![n(7.0), CellValue::Empty, t("y")],
+            "replace"
+        );
     }
 
     #[test]

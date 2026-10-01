@@ -1977,10 +1977,7 @@ impl SheetView {
         }
         self.push_undo();
         let s = self.active;
-        for (r, c, cell) in changes {
-            self.engine
-                .set_cell(&mut self.pkg.workbook, (s, r, c), cell);
-        }
+        self.engine.set_cells(&mut self.pkg.workbook, s, changes);
         true
     }
 

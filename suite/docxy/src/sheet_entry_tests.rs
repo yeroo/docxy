@@ -1074,3 +1074,36 @@ fn find_and_replace_search_the_same_text() {
     );
     assert_eq!(value(&v, 3, 0), CellValue::Number(4.0));
 }
+
+#[test]
+fn a_fill_mixing_a_blank_into_a_frozen_block_clears_it() {
+    // #840 (r4-m1): Ctrl+R over D2:E3 from D2 = blank, D3 = 5 into a frozen
+    // array block E1:E3 (an anchor the engine can't evaluate, cached
+    // 7/8/9): the 5 breaks the block, and the blank clears E2 though it
+    // comes first.
+    let mut v = view();
+    let s = v.active;
+    let sheet = &mut v.pkg.workbook.sheets[s];
+    sheet.set_cell(0, 0, Cell::number(1.0));
+    sheet.set_cell(
+        0,
+        4,
+        Cell {
+            value: CellValue::Number(7.0),
+            formula: Some("PIVOTBY(A1,4)".into()),
+            f_attrs: Some("t=\"array\" ref=\"E1:E3\"".into()),
+            spill: Some((3, 1)),
+            ..Cell::default()
+        },
+    );
+    sheet.set_cell(1, 4, Cell::number(8.0));
+    sheet.set_cell(2, 4, Cell::number(9.0));
+    sheet.set_cell(2, 3, Cell::number(5.0));
+    v.engine = sheet_engine(&v.pkg.workbook);
+    v.sel = (1, 3);
+    v.anchor = (2, 4);
+    assert!(v.fill_selection(false));
+    assert_eq!(value(&v, 0, 4), CellValue::Number(7.0));
+    assert_eq!(value(&v, 1, 4), CellValue::Empty);
+    assert_eq!(value(&v, 2, 4), CellValue::Number(5.0));
+}
