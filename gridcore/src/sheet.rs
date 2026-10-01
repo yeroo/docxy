@@ -270,16 +270,22 @@ pub fn snapshot_cells(
 }
 
 /// The cells an undo group over `keys` must record: `keys` in order,
-/// followed by the spill cells (its extent, not its `ref`) of each key that
-/// is a spill anchor `frozen` reports as kept on its cached values, each
-/// added once and not if `keys` names it already. Replacing an anchor clears
-/// its spill ([`crate::engine::Engine::set_cell`]), and a frozen anchor never
-/// re-spills: [`crate::engine::Engine::restore_cells`] puts its cached
-/// values back only from cells in the same snapshot. A live anchor adds
-/// nothing — it re-spills from its formula — so overwriting
-/// `=SEQUENCE(1000000)` records one cell. The order within the group is not
-/// load-bearing: an anchor's restore clears or refills its block whichever
-/// comes first.
+/// followed by the spill values of each key that is a spill anchor `frozen`
+/// reports as kept on its cached values, each added once and not if `keys`
+/// names it already. Replacing an anchor clears its spill
+/// ([`crate::engine::Engine::set_cell`]), and a frozen anchor never
+/// re-spills: [`crate::engine::Engine::restore_cells`] puts its cached values
+/// back only from cells in the same snapshot.
+///
+/// Only the cells that clearing takes are added: plain non-empty values the
+/// sheet holds in the anchor's extent (its `spill`, not its `ref`). An empty
+/// cell is the same before and after, and the extent comes unbounded from a
+/// loaded `ref` (`A1:XFD1048576`), so the walk costs the cells held in its
+/// rows, not its area. `frozen` — an evaluation, in the hosts — is asked
+/// only of an anchor with such a cell outside `keys`: a live anchor typed
+/// over is still asked, and adds nothing, since it re-spills from its
+/// formula. The order within the group is not load-bearing: an anchor's
+/// restore clears or refills its block whichever comes first.
 pub fn frozen_spill_keys(
     sheet: &Sheet,
     keys: &[(u32, u32)],
@@ -296,15 +302,25 @@ pub fn frozen_spill_keys(
         else {
             continue;
         };
-        if !asked.insert((r, c)) || !frozen(r, c) {
+        if !asked.insert((r, c)) {
             continue;
         }
-        for rr in r..r + h {
-            for cc in c..c + w {
-                if seen.insert((rr, cc)) {
-                    out.push((rr, cc));
-                }
-            }
+        let cols = c..c.saturating_add(w);
+        let held: Vec<(u32, u32)> = sheet
+            .cells
+            .range((r, c)..(r.saturating_add(h), 0))
+            .filter(|&(&(_, cc), cl)| {
+                cols.contains(&cc) && cl.formula.is_none() && !cl.value.is_empty()
+            })
+            .map(|(&at, _)| at)
+            .filter(|at| !seen.contains(at))
+            .collect();
+        if held.is_empty() || !frozen(r, c) {
+            continue;
+        }
+        for at in held {
+            seen.insert(at);
+            out.push(at);
         }
     }
     out
@@ -2218,7 +2234,8 @@ mod tests {
 
     #[test]
     fn frozen_spill_keys_adds_the_block_of_a_frozen_anchor() {
-        // #837: C1 spills C1:C3 live; E1 spills E1:F2 and is frozen.
+        // #837: C1 spills C1:C3 live; E1 spills E1:F2 and is frozen: F1
+        // holds 8, E2 9, F2 a styled blank.
         let mut sheet = Sheet::default();
         let anchor = |src: &str, ext| Cell {
             spill: Some(ext),
@@ -2230,16 +2247,65 @@ mod tests {
         sheet.set_cell(0, 4, anchor("PIVOTBY(A1,4)", (2, 2)));
         sheet.set_cell(0, 5, Cell::number(8.0));
         sheet.set_cell(1, 4, Cell::number(9.0));
-        let frozen = |r, c| (r, c) == (0, 4);
+        sheet.set_cell(
+            1,
+            5,
+            Cell {
+                style: 3,
+                ..Cell::default()
+            },
+        );
+        sheet.set_cell(1, 6, Cell::number(1.0)); // right of the block
+        let mut asked = Vec::new();
+        let mut frozen = |r, c| {
+            asked.push((r, c));
+            (r, c) == (0, 4)
+        };
         // A live anchor, a member alone, an empty cell: nothing added.
         for keys in [vec![(0, 2)], vec![(1, 4)], vec![(7, 7)]] {
-            assert_eq!(frozen_spill_keys(&sheet, &keys, frozen), keys);
+            assert_eq!(frozen_spill_keys(&sheet, &keys, &mut frozen), keys);
         }
-        // A frozen anchor adds its block once, after the keys, whatever
-        // of it the keys already name.
+        // A frozen anchor adds its held values once, after the keys,
+        // whatever of them the keys already name.
         assert_eq!(
-            frozen_spill_keys(&sheet, &[(1, 5), (0, 4), (0, 4), (3, 3)], frozen),
-            vec![(1, 5), (0, 4), (0, 4), (3, 3), (0, 5), (1, 4)]
+            frozen_spill_keys(&sheet, &[(1, 4), (0, 4), (0, 4), (3, 3)], &mut frozen),
+            vec![(1, 4), (0, 4), (0, 4), (3, 3), (0, 5)]
+        );
+        // An anchor whose values the keys all name is not asked.
+        let all = [(0, 4), (0, 5), (1, 4)];
+        assert_eq!(frozen_spill_keys(&sheet, &all, &mut frozen), all);
+        assert_eq!(asked, vec![(0, 2), (0, 4)]);
+    }
+
+    #[test]
+    fn frozen_spill_keys_walks_held_cells_not_a_huge_extent() {
+        // #837 r1: a loaded `ref` sizes the extent with no bound.
+        let mut sheet = Sheet::default();
+        for (ext, at) in [((1_048_576, 1), (0, 0)), ((u32::MAX, u32::MAX), (5, 3))] {
+            sheet.set_cell(
+                at.0,
+                at.1,
+                Cell {
+                    spill: Some(ext),
+                    ..Cell::formula("PIVOTBY(A1,4)")
+                },
+            );
+        }
+        sheet.set_cell(9, 0, Cell::number(1.0));
+        sheet.set_cell(1_048_575, 0, Cell::number(2.0));
+        sheet.set_cell(7, 900, Cell::number(3.0));
+        sheet.set_cell(1_048_575, 16_383, Cell::number(4.0));
+        let keys = frozen_spill_keys(&sheet, &[(0, 0), (5, 3)], |_, _| true);
+        assert_eq!(
+            keys,
+            vec![
+                (0, 0),
+                (5, 3),
+                (9, 0),
+                (1_048_575, 0),
+                (7, 900),
+                (1_048_575, 16_383)
+            ]
         );
     }
 
