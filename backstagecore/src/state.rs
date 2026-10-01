@@ -172,6 +172,11 @@ pub struct Backstage {
     pub export_quick: String,
     /// The highlighted editable row of the Info page.
     pub info_sel: usize,
+    /// The Info page's first line on screen, kept between draws so the
+    /// page only moves when the selection would leave the box.
+    pub info_scroll: usize,
+    /// A line the host shows on the Info page: how the last edit went.
+    pub info_message: Option<String>,
     // Filled by `draw` (Task 3) and read by `mouse` (Task 2, `input.rs`), a
     // sibling module — needs crate-wide visibility, not just within `state`.
     pub(crate) layout: BackstageLayout,
@@ -208,6 +213,8 @@ impl Backstage {
             export_sel: 0,
             export_quick: String::new(),
             info_sel: 0,
+            info_scroll: 0,
+            info_message: None,
             layout: BackstageLayout::default(),
         };
         b.refresh();

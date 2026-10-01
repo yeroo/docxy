@@ -3938,7 +3938,8 @@ impl App {
     /// [`INFO_FIELDS`], `text` is `Name = value` for a custom property, its
     /// type read from the value ([`CustomValue::from_input`]). Not undoable,
     /// as in Excel; marks the workbook modified when something changed.
-    fn commit_doc_property(&mut self, i: usize, text: &str) {
+    /// Returns what happened, for the Info page to say.
+    fn commit_doc_property(&mut self, i: usize, text: &str) -> Option<String> {
         let before = self.pkg.doc_properties();
         let mut p = before.clone();
         let label = match info_field(&mut p, i) {
@@ -3948,16 +3949,14 @@ impl App {
             }
             None => {
                 if text.is_empty() {
-                    return;
+                    return None;
                 }
                 let Some((name, value)) = text.split_once('=') else {
-                    self.status = Some("Custom property: type Name = value".to_string());
-                    return;
+                    return Some("Custom property: type Name = value".to_string());
                 };
                 let (name, value) = (name.trim(), value.trim());
                 if name.is_empty() {
-                    self.status = Some("Custom property: the name is missing".to_string());
-                    return;
+                    return Some("Custom property: the name is missing".to_string());
                 }
                 let at = p
                     .custom
@@ -3973,25 +3972,31 @@ impl App {
                         value: CustomValue::from_input(value),
                     }),
                     (None, true) => {
-                        self.status = Some(format!("No custom property named {name}"));
-                        return;
+                        return Some(format!("No custom property named {name}"));
                     }
                 }
                 "Custom property"
             }
         };
-        if p != before {
-            self.pkg.set_doc_properties(&p);
-            self.modified = true;
-            self.status = Some(format!("{label} updated"));
+        if p == before {
+            return None;
+        }
+        match self.pkg.set_doc_properties(&p) {
+            Ok(()) => {
+                self.modified = true;
+                Some(format!("{label} updated"))
+            }
+            Err(e) => Some(e),
         }
     }
 
-    /// Back to File › Info on row `row`, after its prompt.
-    fn reopen_info(&mut self, row: usize) {
+    /// Back to File › Info on row `row`, after its prompt, saying `message`
+    /// there (the status bar is hidden under the backstage).
+    fn reopen_info(&mut self, row: usize, message: Option<String>) {
         self.open_backstage();
         if let Some(b) = &mut self.backstage {
             b.focus_info(row);
+            b.info_message = message;
         }
     }
 
@@ -5656,8 +5661,8 @@ impl App {
             PromptKind::SortKeys => self.commit_sort(&text),
             PromptKind::RowHeight => self.commit_row_height(&text),
             PromptKind::DocProperty(i) => {
-                self.commit_doc_property(i as usize, &text);
-                self.reopen_info(i as usize);
+                let message = self.commit_doc_property(i as usize, &text);
+                self.reopen_info(i as usize, message);
             }
             PromptKind::SaveAs => {
                 if !text.is_empty() {
@@ -7343,7 +7348,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                     ..
                 }) = app.prompt.take()
                 {
-                    app.reopen_info(i as usize);
+                    app.reopen_info(i as usize, None);
                 }
             }
             KeyCode::Enter => app.commit_prompt(),
@@ -8289,7 +8294,7 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Enter));
         assert!(app.pkg.doc_properties().custom.is_empty());
         assert_eq!(
-            app.status.as_deref(),
+            app.backstage.as_ref().unwrap().info_message.as_deref(),
             Some("Custom property: type Name = value")
         );
         at_info(&app, 8);
@@ -8321,7 +8326,7 @@ mod tests {
                 value: CustomValue::Number(f64::from(i)),
             })
             .collect();
-        app.pkg.set_doc_properties(&p);
+        app.pkg.set_doc_properties(&p).unwrap();
         app.open_backstage();
         app.backstage
             .as_mut()
@@ -8336,6 +8341,63 @@ mod tests {
             .unwrap_or_else(|| panic!("selected row not inside the box"));
         assert_eq!(buf[(20, at)].bg, Color::Green);
         assert!(row(23).contains('└'), "{}", row(23));
+    }
+
+    /// #600 r2: the outcome of an Info edit is on screen, on the Info page
+    /// (the status bar is hidden under the backstage) — including an edit
+    /// an unreadable core.xml can't take.
+    #[test]
+    fn file_info_says_how_an_edit_went() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        let screen = |app: &mut App| {
+            let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+            term.draw(|f| draw(app, f)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let edit_title = |app: &mut App, text: &str| {
+            app.open_backstage();
+            app.backstage.as_mut().unwrap().focus_info(0);
+            app.backstage_key(key(KeyCode::Enter));
+            for c in text.chars() {
+                handle_key(app, key(KeyCode::Char(c)));
+            }
+            handle_key(app, key(KeyCode::Enter));
+        };
+
+        let mut app = App::new(new_xlsx(), "ok.xlsx");
+        app.os_clip = None;
+        edit_title(&mut app, "T");
+        assert!(screen(&mut app).contains("Title updated"));
+
+        // A UTF-16 core.xml can't be patched: the edit is refused, visibly.
+        let mut pkg = new_xlsx();
+        pkg.stamp_save("2026-10-01T12:00:00Z", "me");
+        let core = String::from_utf8(pkg.part("docProps/core.xml").unwrap().to_vec()).unwrap();
+        let mut utf16 = vec![0xFF, 0xFE];
+        for u in core.encode_utf16() {
+            utf16.extend_from_slice(&u.to_le_bytes());
+        }
+        pkg.set_part("docProps/core.xml", utf16.clone());
+        let mut app = App::new(pkg, "bad.xlsx");
+        app.os_clip = None;
+        edit_title(&mut app, "T");
+        let text = screen(&mut app);
+        assert!(
+            text.contains("document properties can't be edited: docProps/core.xml is unreadable"),
+            "{text}"
+        );
+        assert!(!app.modified);
+        assert_eq!(app.pkg.part("docProps/core.xml").unwrap(), utf16.as_slice());
     }
 
     /// File › Info lists who wrote the workbook and when, from core.xml.

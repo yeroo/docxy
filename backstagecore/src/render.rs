@@ -395,6 +395,12 @@ fn draw_info(f: &mut Frame, area: Rect, bs: &mut Backstage, host: &dyn Backstage
             lines.push(RLine::styled(text, style));
         }
         lines.push(RLine::raw(""));
+        if let Some(msg) = &bs.info_message {
+            lines.push(RLine::styled(
+                format!("  {msg}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+        }
         lines.push(RLine::styled(
             if focus {
                 "  ↑↓ choose · Enter edit · ← menu · Esc close"
@@ -403,12 +409,17 @@ fn draw_info(f: &mut Frame, area: Rect, bs: &mut Backstage, host: &dyn Backstage
             },
             dim,
         ));
-        // Scroll the page so the selected row stays inside the box.
+        // Scroll only when the selected row would leave the box, so a row
+        // stays under the pointer between a selecting and an editing click.
         let inner = area.height.saturating_sub(2) as usize;
         let sel_line = first_row + bs.info_sel;
         if focus && inner > 0 {
-            scroll = (sel_line + 1).saturating_sub(inner);
+            scroll = bs
+                .info_scroll
+                .min(sel_line)
+                .max((sel_line + 1).saturating_sub(inner));
         }
+        bs.info_scroll = scroll;
         bs.layout.info_top = i32::from(area.y) + 1 + first_row as i32 - scroll as i32;
         bs.layout.info_view = (area.y + 1, area.y + 1 + inner as u16);
     }
@@ -659,8 +670,63 @@ mod tests {
             bs.mouse(20, 22, &Tall),
             crate::BackstageEvent::EditInfo(8)
         ));
-        // Back at the top, the page is not scrolled.
-        bs.info_sel = 0;
+        // The page holds still while the selection stays in the box: a row
+        // clicked once is still under the pointer for the second click.
+        let y5 = (bs.layout.info_top + 5) as u16;
+        assert!(matches!(
+            bs.mouse(20, y5, &Tall),
+            crate::BackstageEvent::None
+        ));
+        assert_eq!(bs.info_sel, 5);
+        let before = bs.layout.info_top;
+        term.draw(|f| {
+            let a = f.area();
+            super::draw(f, a, &mut bs, &Tall);
+        })
+        .unwrap();
+        assert_eq!(bs.layout.info_top, before);
+        assert!(matches!(
+            bs.mouse(20, y5, &Tall),
+            crate::BackstageEvent::EditInfo(5)
+        ));
+        // From the top, Down past the box's last row moves the page by one
+        // line per step; Down inside the box doesn't move it.
+        let down = |bs: &mut Backstage, term: &mut Terminal<TestBackend>| {
+            bs.key(
+                ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::Down),
+                &Tall,
+            );
+            term.draw(|f| {
+                let a = f.area();
+                super::draw(f, a, bs, &Tall);
+            })
+            .unwrap();
+            bs.info_scroll
+        };
+        bs.focus_info(0);
+        bs.info_scroll = 0;
+        term.draw(|f| {
+            let a = f.area();
+            super::draw(f, a, &mut bs, &Tall);
+        })
+        .unwrap();
+        assert_eq!(bs.info_scroll, 0);
+        // Rows start on screen row 18; inner rows end at 22: rows 0..=4 fit.
+        let scrolls: Vec<usize> = (1..=8).map(|_| down(&mut bs, &mut term)).collect();
+        assert_eq!(scrolls, [0, 0, 0, 0, 1, 2, 3, 4]);
+        // Back up inside the box: still.
+        bs.key(
+            ratatui::crossterm::event::KeyEvent::from(ratatui::crossterm::event::KeyCode::Up),
+            &Tall,
+        );
+        term.draw(|f| {
+            let a = f.area();
+            super::draw(f, a, &mut bs, &Tall);
+        })
+        .unwrap();
+        assert_eq!(bs.info_scroll, 4);
+        // Unfocused (back on the menu), the page shows its top.
+        bs.pane = crate::Pane::Menu;
         term.draw(|f| {
             let a = f.area();
             super::draw(f, a, &mut bs, &Tall);

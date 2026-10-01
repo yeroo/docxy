@@ -294,7 +294,7 @@ fn set_properties(app: &mut App, args: &Json) -> Result<Json, String> {
     }
     let changed = p != before;
     if changed {
-        app.pkg.set_doc_properties(&p);
+        app.pkg.set_doc_properties(&p)?;
         app.modified = true;
         ctlcore::signal_activity();
     }
@@ -4632,6 +4632,46 @@ mod tests {
         let r = dispatch(&mut a, "wb.set-properties", &args).unwrap();
         assert_eq!(r.get("changed"), Some(&Json::Bool(false)));
         assert!(!a.modified);
+    }
+
+    /// #600 r2: a property that can't land (UTF-16 core.xml) is an error,
+    /// not a `changed:true` that wrote nothing.
+    #[test]
+    fn wb_set_properties_errors_when_core_xml_is_unreadable() {
+        let mut pkg = load_xlsx(&props_fixture()).unwrap();
+        let core = part_text(&pkg, "docProps/core.xml");
+        let mut utf16 = vec![0xFF, 0xFE];
+        for u in core.encode_utf16() {
+            utf16.extend_from_slice(&u.to_le_bytes());
+        }
+        pkg.set_part("docProps/core.xml", utf16.clone());
+        let mut a = App::new(pkg, "u.xlsx");
+        a.os_clip = None;
+        let err = dispatch(
+            &mut a,
+            "wb.set-properties",
+            &Json::obj(vec![
+                ("title", Json::Str("T".into())),
+                ("company", Json::Str("Co".into())),
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "document properties can't be edited: docProps/core.xml is unreadable"
+        );
+        assert!(!a.modified);
+        assert_eq!(a.pkg.part("docProps/core.xml").unwrap(), utf16.as_slice());
+        assert_eq!(props(&mut a).get("company"), Some(&Json::Null));
+        // app.xml is readable: a Company-only edit goes through.
+        let r = dispatch(
+            &mut a,
+            "wb.set-properties",
+            &Json::obj(vec![("company", Json::Str("Co".into()))]),
+        )
+        .unwrap();
+        assert_eq!(r.get("changed"), Some(&Json::Bool(true)));
+        assert_eq!(r.get_str("company"), Some("Co"));
     }
 
     #[test]

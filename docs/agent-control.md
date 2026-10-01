@@ -583,7 +583,8 @@ id), so it lists alongside terminal instances (`docxy-<pid>` /
 windows that open a same-basename file, which would otherwise mint the same
 `<basename>-<n>` in both and clobber each other's discovery file. A tab exposes
 **exactly** the terminal verb
-surface, nothing more: a couple of internal-only verbs the extension host
+surface, nothing more (except xlsxy's `wb.properties`/`wb.set-properties`, which
+only a terminal xlsxy answers so far; a tab answers `unknown verb`): a couple of internal-only verbs the extension host
 uses to compose its own `doc.path`/`wb.path` replies (`doc.blocks`, `wb.info`)
 are deliberately not in the tab's exposed verb set, and are rejected as
 `"unknown verb"` — same as a terminal instance, which has no arm for them at
@@ -740,7 +741,9 @@ Differences from a terminal pane:
   `unknown verb 'doc.blocks'` externally, same as every other surface.
 
 **Excel tabs** (`xlsxy-jetbrains-<basename>-<pid>-<n>` in xlsxy's ctl dir)
-serve the full xlsxy verb surface through `grid_ctl`, with the same host-verb
+serve the full xlsxy verb surface through `grid_ctl` (except
+`wb.properties`/`wb.set-properties`, terminal xlsxy only for now: a tab answers
+`unknown verb`), with the same host-verb
 split (`wb.path`/`wb.save`/`wb.reload`/`wb.open`; `wb.open` opens a new tab;
 `wb.info` internal). Every mutating agent verb lands as **one IDE undo step**
 driving the engine's own undo stack — the same mechanism the grid UI uses,
@@ -766,8 +769,8 @@ name and defaults to the active sheet):
 | `col.width` | `{col, width, sheet?}` | `{col, width}` — `col` accepts a letter or a 0-based index; the reply always echoes the **numeric** index |
 | `find` | `{query, sheet?}` | `{query, count, matches:[…]}` |
 | `wb.recalc` | — | `{recalculated:true}` |
-| `wb.properties` | — | `{title, tags, categories, subject, comments, company, manager, hyperlinkBase, author, lastModifiedBy, created, modified, custom:[{name, type, value}]}` — the document properties File › Info shows; an absent one is `null`; a custom `type` is `text`/`number`/`bool`/`date`/`other` (a variant type xlsxy does not model, its raw XML as `value`) |
-| `wb.set-properties` | `{title?, tags?, categories?, subject?, comments?, company?, manager?, hyperlinkBase?, custom?: {name: value\|null}}` | `wb.properties` + `{changed}`. Only the given keys change; `null` or `""` removes one. A custom value is a string (text), a number, a bool (yes/no) or `{"date":"YYYY-MM-DD[THH:MM:SSZ]"}`; a name that exists (in any case) changes in place, keeping its position. An unknown key is an error and nothing changes. Marks the workbook modified when something changed; not on the undo stack (Excel's Info edits aren't either). Author, Last Modified By, Created and Modified are read-only: every `wb.save` stamps Modified (UTC) and Last Modified By (the OS user name, as for comments), and Author and Created are set only on a workbook's first save |
+| `wb.properties` | — | **Terminal xlsxy only for now** (a VS Code or JetBrains tab answers `unknown verb`). `{title, tags, categories, subject, comments, company, manager, hyperlinkBase, author, lastModifiedBy, created, modified, custom:[{name, type, value}]}` — the document properties File › Info shows; an absent one is `null`; a custom `type` is `text`/`number`/`bool`/`date`/`other` (a variant type xlsxy does not model, its raw XML as `value`) |
+| `wb.set-properties` | `{title?, tags?, categories?, subject?, comments?, company?, manager?, hyperlinkBase?, custom?: {name: value\|null}}` | Terminal xlsxy only for now. `wb.properties` + `{changed}`. Only the given keys change; `null` or `""` removes one. A custom value is a string (text), a number, a bool (yes/no) or `{"date":"YYYY-MM-DD[THH:MM:SSZ]"}`; a name that exists (in any case) changes in place, keeping its position. An unknown key is an error and nothing changes, as is a change that would go into a `docProps/core.xml` or `app.xml` xlsxy can't read (e.g. UTF-16): `document properties can't be edited: <part> is unreadable`. Marks the workbook modified when something changed; not on the undo stack (Excel's Info edits aren't either). Author, Last Modified By, Created and Modified are read-only: every `wb.save` stamps Modified (UTC) and Last Modified By (the OS user name, as for comments), and Author and Created are set on a save only when the file has none (its first save, typically) |
 | `wb.save` | — | `{path, …}`; a failed write answers `ok:false` with `save failed: …` (the status-bar text) and the workbook stays modified. When the workbook has Excel's *Always create backup* (`<workbookPr backupFile="1">`), the file being replaced is first kept as `Backup of <stem>.xlk` in the same folder (replacing an older backup); a backup that cannot be written fails the save with `save failed: …` naming the backup, and the workbook file untouched |
 | `wb.reload` | — | `{path, …}` (re-reads the file, dropping unsaved edits). A workbook last saved as CSV UTF-8, CSV (Comma delimited), Text (Tab delimited) or Unicode Text is re-imported from that file (no dialog) and stays bound to it and its type. One last saved as Formatted Text (`.prn`) or Web Page is refused ("… cannot be read back; reload is not available for this file") and nothing changes |
 | `wb.open` | `{path}` | `{path, …}`; a `.csv`/`.tsv` opens as Excel opens it, and a `.txt`/`.prn` is imported with the Text Import Wizard's defaults (tab-delimited, General columns) without showing the wizard — use `sheet.import-text` for other options. An opened `.csv`/`.tsv`/`.txt`/`.prn` is **rebound to `<name>.xlsx`**: `wb.save` writes that workbook (replacing an existing `<name>.xlsx`) and never the text file. A load that fails is the verb's error |
