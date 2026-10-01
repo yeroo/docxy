@@ -32,7 +32,8 @@ bold/italic/color); reproducing Excel's visual styling is a non-goal.
 - Legacy formats (#603): `xlsxy book.xls` (also `.xlsb`, `.ods`) imports the
   values, formulas, number formats, date system and defined names through
   `gridcore::legacy`; other formatting is not imported, and Ctrl+S writes
-  `book.xlsx` beside the original.
+  `book.xlsx` beside the original (`book1.xlsx`, ... if that exists); the
+  status line names the target.
 
 **Non-goals (at least initially)**
 - Full visual formatting *editing* (fonts, fills, borders); v1 renders what the

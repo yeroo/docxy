@@ -214,6 +214,8 @@ xlsxy book.xlsx                   # open a workbook (grid, formula bar, tabs)
 xlsxy book.xls                    # also .xlsb/.ods: imports values, formulas,
                                   # number formats and names (not other
                                   # formatting); Ctrl+S writes book.xlsx
+                                  # (book1.xlsx, ... if that exists); the
+                                  # status line names the target
 xlsxy in.xlsx --recalc out.xlsx   # headless: recalculate everything, save
 xlsxy in.xlsx --csv out.csv       # headless: export the active sheet as CSV UTF-8
 xlsxy corpus/xlsx/*.xlsx --verify # conformance scoreboard: recalc + diff

@@ -665,12 +665,16 @@ fn auto_convert_from_prefs(text: &str) -> AutoConvert {
     auto
 }
 
-/// Load a workbook from disk, returning the package, its save path, and the
-/// imported text file's path if it was one. An `.xlsx` (or other package)
-/// loads as it is; a `.csv`/`.tsv` imports as one sheet as Excel opens it
-/// (`sep=`, typed-entry conversion); a `.txt`/`.prn` imports with the Text
-/// Import Wizard's defaults (the editor shows the wizard instead, see
-/// `App::open_workbook`). A text import is saved to `<name>.xlsx`. A
+/// Load a workbook from disk, returning the package, its save path, the
+/// imported file's path when it was an import, and the format of an
+/// imported `.xls`/`.xlsb`/`.ods` (`None` for everything else). An `.xlsx`
+/// (or other package) loads as it is; a `.csv`/`.tsv` imports as one sheet
+/// as Excel opens it (`sep=`, typed-entry conversion); a `.txt`/`.prn`
+/// imports with the Text Import Wizard's defaults (the editor shows the
+/// wizard instead, see `App::open_workbook`). A text import is saved to
+/// `<name>.xlsx`. An `.xls`, `.xlsb` or `.ods` (read by its bytes, whatever
+/// its name) imports through `gridcore::legacy` and is bound to
+/// [`import_binding`]: `<name>.xlsx`, or the next free numbered name. A
 /// template (`.xltx`, `.xltm`) opens as a new workbook from it, as Excel
 /// starts one: bound to [`template_binding`], so a save never writes the
 /// template itself.
@@ -1466,6 +1470,9 @@ struct App {
     /// The template this workbook was started from, until this session first
     /// writes it (to `Budget1.xlsx` from `Budget.xltx`, or a Save As name).
     template: Option<String>,
+    /// An imported `.xls`/`.xlsb`/`.ods` this session has not written yet:
+    /// its binding was free when it opened, and a save rechecks it.
+    import_unsaved: bool,
     sheet: usize,
     cur: (u32, u32),
     anchor: Option<(u32, u32)>,
@@ -1573,6 +1580,7 @@ impl App {
             path: path.to_string(),
             import_source: None,
             template: None,
+            import_unsaved: false,
             sheet: pkg_active_tab,
             cur: (0, 0),
             anchor: None,
@@ -2942,9 +2950,15 @@ impl App {
         // written yet was bound to a name free when it opened. If that name
         // is taken now (another session from the same template), the save
         // moves on to the next free one rather than replace that file.
-        let taken = match &self.template {
-            Some(t) if Path::new(&self.path).exists() => {
+        // The same for an imported workbook not yet written: if its
+        // `<stem>.xlsx` appeared since it opened, it moves on to the next
+        // free name rather than replace that file.
+        let taken = match (&self.template, &self.import_source) {
+            (Some(t), _) if Path::new(&self.path).exists() => {
                 template_binding(t).map(|free| std::mem::replace(&mut self.path, free))
+            }
+            (None, Some(source)) if self.import_unsaved && Path::new(&self.path).exists() => {
+                Some(std::mem::replace(&mut self.path, import_binding(source)))
             }
             _ => None,
         };
@@ -2965,6 +2979,7 @@ impl App {
                 self.modified = false;
                 self.text_type = None;
                 self.template = None;
+                self.import_unsaved = false;
                 self.status = Some(match taken {
                     Some(taken) => format!(
                         "Saved {} ({} bytes): {taken} already exists",
@@ -2990,6 +3005,7 @@ impl App {
         let previous = std::mem::replace(&mut self.path, path);
         // A name chosen in Save As is written as chosen, even over a file.
         let template = self.template.take();
+        let import_unsaved = std::mem::take(&mut self.import_unsaved);
         if self.save_current().is_ok() {
             self.import_source = None;
             true
@@ -2997,6 +3013,7 @@ impl App {
             // A failed Save As must retain protection for the imported file.
             self.path = previous;
             self.template = template;
+            self.import_unsaved = import_unsaved;
             false
         }
     }
@@ -4046,6 +4063,7 @@ impl App {
     /// writes.
     fn note_import(&mut self, format: Option<SourceFormat>) {
         if let (Some(format), Some(source)) = (format, &self.import_source) {
+            self.import_unsaved = true;
             self.status = Some(format!(
                 "Opened {source} ({}); saving writes {}",
                 format.label(),
@@ -4079,6 +4097,7 @@ impl App {
         self.path = p;
         self.import_source = import_source;
         self.template = None;
+        self.import_unsaved = false;
         self.model_rels = rels;
         self.model_measures = meas;
         self.comments = comments;
@@ -4181,6 +4200,7 @@ impl App {
         self.path = "untitled.xlsx".to_string();
         self.import_source = None;
         self.template = None;
+        self.import_unsaved = false;
         self.model_rels = Vec::new();
         self.model_measures = Vec::new();
         self.comments = Vec::new();
@@ -8460,6 +8480,41 @@ mod tests {
         app.save();
         assert_eq!(std::fs::read(&disguised).unwrap(), original);
         assert!(load_xlsx(&std::fs::read(dir.join("book1.xlsx")).unwrap()).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #603: the binding is rechecked at the first save: a `<stem>.xlsx`
+    /// that appeared after the open is not overwritten, and once this
+    /// session has written its file, later saves go to it.
+    #[test]
+    fn an_import_rechecks_its_binding_at_the_first_save() {
+        let dir = tmp("legacy-import-late");
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/legacy");
+        let source = dir.join("report.xls");
+        std::fs::copy(corpus.join("oracle-basic.xls"), &source).unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.open_workbook(source.to_str().unwrap());
+        let plain = dir.join("report.xlsx");
+        assert_eq!(Path::new(&app.path), plain);
+        std::fs::write(&plain, b"made by someone else").unwrap();
+        app.save();
+        let bound = dir.join("report1.xlsx");
+        assert_eq!(Path::new(&app.path), bound);
+        assert_eq!(std::fs::read(&plain).unwrap(), b"made by someone else");
+        let status = app.status.clone().unwrap();
+        assert!(
+            status.starts_with(&format!("Saved {}", bound.display())),
+            "{status}"
+        );
+        assert!(
+            status.ends_with(&format!("{} already exists", plain.display())),
+            "{status}"
+        );
+        // A second save writes the same file.
+        app.save();
+        assert_eq!(Path::new(&app.path), bound);
+        assert!(load_xlsx(&std::fs::read(&bound).unwrap()).is_ok());
+        assert!(!dir.join("report2.xlsx").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
