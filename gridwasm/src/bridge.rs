@@ -23,6 +23,22 @@ pub fn new_workbook() -> Vec<u8> {
 struct UndoGroup {
     sheet: usize,
     changes: Vec<(u32, u32, Option<Cell>, Option<Cell>)>,
+    /// A restyle ([`Session::apply_styles`]): undo/redo put back only each
+    /// cell's style, so a spill the cells belong to stays whole.
+    styles_only: bool,
+}
+
+/// The `(row, col, style)` a restyle group puts back: the style of each
+/// change's `before` or `after` cell (picked by `side`), default if absent.
+fn group_styles(
+    group: &UndoGroup,
+    side: impl Fn(&(u32, u32, Option<Cell>, Option<Cell>)) -> &Option<Cell>,
+) -> Vec<(u32, u32, u32)> {
+    group
+        .changes
+        .iter()
+        .map(|ch| (ch.0, ch.1, side(ch).as_ref().map_or(0, |cl| cl.style)))
+        .collect()
 }
 
 /// Sheets + defined names — snapshotted around structural edits whose inverse
@@ -449,6 +465,7 @@ impl Session {
         let mut group = UndoGroup {
             sheet: sheet_idx,
             changes: Vec::with_capacity(changes.len()),
+            styles_only: false,
         };
         for (r, c, cell) in changes {
             let before = self.pkg.workbook.sheets[sheet_idx].cell(r, c).cloned();
@@ -463,14 +480,53 @@ impl Session {
         self.dirty = true;
     }
 
+    /// Restyle cells on sheet `sheet_idx` — `(row, col, style index)` — as
+    /// one undo group. Only styles change ([`Engine::set_styles`]): a value,
+    /// formula or spill is never re-entered, so formatting a spilled block
+    /// keeps the spill.
+    fn apply_styles(&mut self, sheet_idx: usize, styles: Vec<(u32, u32, u32)>) {
+        if styles.is_empty() {
+            return;
+        }
+        let before: Vec<Option<Cell>> = {
+            let sheet = &self.pkg.workbook.sheets[sheet_idx];
+            styles
+                .iter()
+                .map(|&(r, c, _)| sheet.cell(r, c).cloned())
+                .collect()
+        };
+        self.engine
+            .set_styles(&mut self.pkg.workbook, sheet_idx, &styles);
+        let sheet = &self.pkg.workbook.sheets[sheet_idx];
+        let changes = styles
+            .iter()
+            .zip(before)
+            .map(|(&(r, c, _), before)| (r, c, before, sheet.cell(r, c).cloned()))
+            .collect();
+        self.undo.push(UndoAction::Cells(UndoGroup {
+            sheet: sheet_idx,
+            changes,
+            styles_only: true,
+        }));
+        self.edits += 1;
+        self.redo.clear();
+        self.dirty = true;
+    }
+
     fn do_undo(&mut self) {
         match self.undo.pop() {
             Some(UndoAction::Cells(group)) => {
                 self.active = group.sheet.min(self.pkg.workbook.sheets.len() - 1);
-                for &(r, c, ref before, _) in group.changes.iter().rev() {
-                    let cell = before.clone().unwrap_or_default();
+                if group.styles_only {
+                    let styles = group_styles(&group, |ch| &ch.2);
                     self.engine
-                        .restore_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
+                        .set_styles(&mut self.pkg.workbook, group.sheet, &styles);
+                } else {
+                    for &(r, c, ref before, _) in group.changes.iter().rev() {
+                        let cell = before.clone().unwrap_or_default();
+                        self.engine
+                            .restore_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
+                    }
                 }
                 self.redo.push(UndoAction::Cells(group));
                 self.dirty = true;
@@ -496,10 +552,16 @@ impl Session {
         match self.redo.pop() {
             Some(UndoAction::Cells(group)) => {
                 self.active = group.sheet.min(self.pkg.workbook.sheets.len() - 1);
-                for &(r, c, _, ref after) in group.changes.iter() {
-                    let cell = after.clone().unwrap_or_default();
+                if group.styles_only {
+                    let styles = group_styles(&group, |ch| &ch.3);
                     self.engine
-                        .restore_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
+                        .set_styles(&mut self.pkg.workbook, group.sheet, &styles);
+                } else {
+                    for &(r, c, _, ref after) in group.changes.iter() {
+                        let cell = after.clone().unwrap_or_default();
+                        self.engine
+                            .restore_cell(&mut self.pkg.workbook, (group.sheet, r, c), cell);
+                    }
                 }
                 self.undo.push(UndoAction::Cells(group));
                 self.dirty = true;
@@ -677,7 +739,7 @@ impl Session {
     /// snapshot each cell's existing style first (so the loop below never
     /// observes an already-patched style from earlier in the same range),
     /// compute the patched `Xf`, intern it, and hand the whole batch to
-    /// `apply()` — one `UndoGroup`, one `dispatch("undo")` to revert.
+    /// `apply_styles()` — one `UndoGroup`, one `dispatch("undo")` to revert.
     fn apply_format_to_selection(&mut self, patch: &FormatPatch) {
         let (ar, ac) = self.anchor.unwrap_or(self.cur);
         let (r1, r2) = (self.cur.0.min(ar), self.cur.0.max(ar));
@@ -693,27 +755,25 @@ impl Session {
             return;
         }
         let sheet_idx = self.active;
-        let snapshot: Vec<(u32, u32, Option<Cell>)> = {
+        let snapshot: Vec<(u32, u32, u32)> = {
             let sheet = &self.pkg.workbook.sheets[sheet_idx];
             let mut v = Vec::new();
             for r in r1..=r2 {
                 for c in c1..=c2 {
-                    v.push((r, c, sheet.cell(r, c).cloned()));
+                    v.push((r, c, sheet.cell(r, c).map_or(0, |cl| cl.style)));
                 }
             }
             v
         };
-        let mut changes = Vec::with_capacity(snapshot.len());
-        for (r, c, existing) in snapshot {
-            let cur_style = existing.as_ref().map(|cl| cl.style).unwrap_or(0);
+        let mut styles = Vec::with_capacity(snapshot.len());
+        for (r, c, cur_style) in snapshot {
             let base_xf = self.pkg.workbook.styles.xf(cur_style);
             let new_xf = apply_patch_to_xf(&base_xf, patch);
             let idx = self.pkg.workbook.styles.intern(new_xf);
-            let mut cell = existing.unwrap_or_default();
-            cell.style = idx;
-            changes.push((r, c, cell));
+            styles.push((r, c, idx));
         }
-        self.apply(changes);
+        // Only styles change: a spilled block stays spilled (#784).
+        self.apply_styles(sheet_idx, styles);
     }
 
     /// `fmt\t<key>\t<value>` — the toolbar's one-key format verbs.
@@ -2017,9 +2077,10 @@ impl Session {
     /// `{range,patch,sheet?}` -> `{formatted,undoSteps:1}` — sets `patch`
     /// over every cell in `range` via the shared `gridcore::format` helpers
     /// (`apply_patch_to_xf`/`FormatPatch::parse`), landing as ONE
-    /// [`Session::apply`] call — the SAME true wasm-undo-stack `Cells` group
-    /// `range.set` uses (Task 3's empirical bucket A). Value/formula/spill
-    /// are preserved; only each cell's style index changes. `undoSteps` is
+    /// [`Session::apply_styles`] call — the SAME true wasm-undo-stack `Cells`
+    /// group kind `range.set` uses (Task 3's empirical bucket A). Only each
+    /// cell's style index changes: value, formula and spill are never
+    /// re-entered, so a spilled block stays spilled. `undoSteps` is
     /// unconditionally `1`: unlike `range.set`'s possibly-empty `rows`
     /// batch, a parsed range always covers >=1 cell. Mirrors xlsxy
     /// control.rs's `cell_format` field-for-field (snapshot-then-mutate,
@@ -2037,33 +2098,25 @@ impl Session {
         let pairs = ctl_patch_pairs(patch_arg)?;
         let patch = FormatPatch::parse(&pairs)?;
 
-        let snapshot: Vec<(u32, u32, Option<Cell>)> = {
+        let snapshot: Vec<(u32, u32, u32)> = {
             let sheet = &self.pkg.workbook.sheets[si];
             let mut v = Vec::new();
             for r in r1..=r2 {
                 for c in c1..=c2 {
-                    v.push((r, c, sheet.cell(r, c).cloned()));
+                    v.push((r, c, sheet.cell(r, c).map_or(0, |cl| cl.style)));
                 }
             }
             v
         };
-        let mut changes = Vec::with_capacity(snapshot.len());
-        for (r, c, existing) in snapshot {
-            let cur = existing.as_ref().map(|cl| cl.style).unwrap_or(0);
+        let mut styles = Vec::with_capacity(snapshot.len());
+        for (r, c, cur) in snapshot {
             let base_xf = self.pkg.workbook.styles.xf(cur);
             let new_xf = apply_patch_to_xf(&base_xf, &patch);
             let idx = self.pkg.workbook.styles.intern(new_xf);
-            let mut cell = existing.unwrap_or_default();
-            cell.style = idx;
-            changes.push((r, c, cell));
+            styles.push((r, c, idx));
         }
-        let formatted = changes.len();
-        // `apply` targets `self.active` — temporarily swap it to the target
-        // sheet, same trick `ctl_range_set`/`ctl_cell_set` already use.
-        let prev_active = self.active;
-        self.active = si;
-        self.apply(changes);
-        self.active = prev_active;
+        let formatted = styles.len();
+        self.apply_styles(si, styles);
         Ok(format!("{{\"formatted\":{formatted},\"undoSteps\":1}}"))
     }
 
@@ -3184,6 +3237,53 @@ mod tests {
         assert_eq!(tsv, "Apple");
         let v = s.view_json(None);
         assert!(!v.contains("Apple"), "{v}");
+    }
+
+    /// A session with `=SEQUENCE(3)` typed into D1 (spilling D1:D3).
+    fn session_with_spill() -> Session {
+        let mut s = Session::open(&save_xlsx(&new_xlsx())).expect("open");
+        s.dispatch("set\t0\t3\t=SEQUENCE(3)");
+        assert_eq!(spill_at_d1(&s), Some((3, 1)));
+        s
+    }
+
+    fn spill_at_d1(s: &Session) -> Option<(u32, u32)> {
+        s.pkg.workbook.sheets[0].cell(0, 3).and_then(|cl| cl.spill)
+    }
+
+    /// D1 still spills over D1:D3 (values 1..3), each cell (not) bold.
+    fn assert_spill_bold(s: &Session, bold: bool, when: &str) {
+        assert_eq!(spill_at_d1(s), Some((3, 1)), "{when}");
+        for r in 0..3u32 {
+            let cell = s.pkg.workbook.sheets[0].cell(r, 3).unwrap();
+            assert_eq!(cell.value, CellValue::Number(f64::from(r + 1)), "{when}");
+            assert_eq!(s.pkg.workbook.styles.xf(cell.style).bold, bold, "{when}");
+        }
+    }
+
+    #[test]
+    fn fmt_bold_on_a_spill_block_keeps_the_spill_through_undo_redo() {
+        // #784: formatting a spilled block left D1 #SPILL!.
+        let mut s = session_with_spill();
+        s.dispatch("select\t0\t3\t2\t3"); // D1:D3
+        s.dispatch("fmt\tbold\ttoggle");
+        assert_spill_bold(&s, true, "bold");
+        s.dispatch("undo");
+        assert_spill_bold(&s, false, "undo");
+        s.dispatch("redo");
+        assert_spill_bold(&s, true, "redo");
+    }
+
+    #[test]
+    fn ctl_cell_format_on_a_spill_block_keeps_the_spill_through_undo_redo() {
+        let mut s = session_with_spill();
+        let r = s.ctl(r#"{"verb":"cell.format","args":{"range":"D1:D3","patch":{"bold":true}}}"#);
+        assert!(r.contains("\"formatted\":3"), "{r}");
+        assert_spill_bold(&s, true, "bold");
+        s.dispatch("undo");
+        assert_spill_bold(&s, false, "undo");
+        s.dispatch("redo");
+        assert_spill_bold(&s, true, "redo");
     }
 
     // -- interactive `fmt`/`decimals`/`autosum` (toolbar verbs) ------------
