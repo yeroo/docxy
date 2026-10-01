@@ -311,7 +311,12 @@ impl Cfb {
     /// The direct children of a storage, in the directory's in-order sequence.
     /// (The CFB directory is a red-black tree; an in-order walk of a storage's
     /// child subtree yields its entries.)
-    fn children_of(&self, storage_idx: usize) -> Vec<usize> {
+    ///
+    /// `seen` is shared by a whole walk: an entry it already holds is not
+    /// visited again, so a corrupt tree (an entry that is its own left child,
+    /// a cycle through right links, an entry two storages both claim) can't
+    /// loop or be listed twice. A valid entry has one parent.
+    fn children_of(&self, storage_idx: usize, seen: &mut [bool]) -> Vec<usize> {
         let mut out = Vec::new();
         let mut stack: Vec<u32> = Vec::new();
         let mut cur = self
@@ -319,9 +324,6 @@ impl Cfb {
             .get(storage_idx)
             .map(|e| e.child)
             .unwrap_or(NOSTREAM);
-        // Each entry is visited once: a corrupt tree (an entry that is its
-        // own left child, a cycle through right links) can't loop.
-        let mut seen = vec![false; self.entries.len()];
         loop {
             while cur != NOSTREAM && (cur as usize) < self.entries.len() && !seen[cur as usize] {
                 seen[cur as usize] = true;
@@ -347,14 +349,16 @@ impl Cfb {
         let Some(root) = self.root_index() else {
             return out;
         };
-        let mut entered = vec![false; self.entries.len()];
-        entered[root] = true;
+        // Every entry the walk has reached: each is listed under, and each
+        // storage entered from, the first storage that claims it.
+        let mut seen = vec![false; self.entries.len()];
+        seen[root] = true;
         // (storage, its path prefix), last in first out; children are
         // pushed in reverse so they come off in directory order.
         let mut todo: Vec<(usize, String)> = vec![(root, String::new())];
         while let Some((storage, prefix)) = todo.pop() {
             let mut sub = Vec::new();
-            for c in self.children_of(storage) {
+            for c in self.children_of(storage, &mut seen) {
                 let e = &self.entries[c];
                 let path = if prefix.is_empty() {
                     e.name.clone()
@@ -363,8 +367,7 @@ impl Cfb {
                 };
                 if e.is_stream() {
                     out.push(path);
-                } else if e.is_storage() && !entered[c] {
-                    entered[c] = true;
+                } else if e.is_storage() {
                     sub.push((c, path));
                 }
             }
@@ -378,9 +381,12 @@ impl Cfb {
     pub fn read_path(&self, path: &str) -> Option<Vec<u8>> {
         let mut idx = self.root_index()?;
         let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+        // This lookup's own walk state.
+        let mut seen = vec![false; self.entries.len()];
+        seen[idx] = true;
         for (i, part) in parts.iter().enumerate() {
             let child = self
-                .children_of(idx)
+                .children_of(idx, &mut seen)
                 .into_iter()
                 .find(|&c| self.entries[c].name == *part)?;
             let e = &self.entries[child];
