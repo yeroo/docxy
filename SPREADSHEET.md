@@ -24,11 +24,18 @@ bold/italic/color); reproducing Excel's visual styling is a non-goal.
   own cached values — a scoreboard, not a claim (§8).
 - Grid editing UX with Excel muscle memory: formula bar, A1 navigation, range
   selection, fill-down semantics, ref-translating copy/paste.
-- Lossless save: everything unmodeled (pivots, conditional formatting, print
-  setup…) preserved byte-for-byte. Charts are now modeled (§4a), so an *edited*
+- Lossless save: everything unmodeled (pivots, conditional formatting, …)
+  preserved byte-for-byte. Page setup (#612) is modeled and patched back one
+  attribute at a time, so an untouched sheet's print setup is still
+  byte-identical. Charts are now modeled (§4a), so an *edited*
   chart is regenerated and a moved/deleted drawing has its anchor rewritten;
   untouched ones still round-trip verbatim.
-- Headless CLI: `xlsxy in.xlsx --recalc out.xlsx`, `xlsxy in.xlsx --csv out.csv`.
+- Headless CLI: `xlsxy in.xlsx --recalc out.xlsx`, `xlsxy in.xlsx --csv out.csv`,
+  `xlsxy in.xlsx --pdf out.pdf`.
+- Printing (#612): `gridcore::print` paginates sheets as Excel does (print
+  areas, titles, breaks, fit-to, page order, hidden rows/sheets) and writes
+  them as PDF; xlsxy edits page setup, print areas, titles and breaks through
+  its control verbs and exports PDF from File › Export and `--pdf`.
 - Legacy formats (#603): `xlsxy book.xls` (also `.xlsb`, `.ods`) imports the
   values, formulas, number formats, date system and defined names through
   `gridcore::legacy`; other formatting is not imported, and Ctrl+S writes

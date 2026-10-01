@@ -1513,5 +1513,406 @@
       },
       "required": []
     }
+  },
+  {
+    "name": "xlsxy_page_setup",
+    "description": "Read a sheet's page layout (margins, paper, orientation, scaling, print options, headers/footers, print area, print titles, manual page breaks), or set fields of it: only the given fields change. A fit count turns fitToPage on and scale turns it off unless fitToPage is given; scale outside 10-400 is refused. With `sheets`, the first sheet's page setup is then copied to the others (as Page Setup on grouped sheets: not print areas, titles or header pictures). One undo step; replies with the layout and `changed`.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "margins": {
+          "type": "object",
+          "description": "Margins in inches: {left, right, top, bottom, header, footer}; given keys change."
+        },
+        "paperSize": {
+          "type": "number",
+          "description": "Paper code (1 Letter, 5 Legal, 8 A3, 9 A4, 11 A5, …)."
+        },
+        "orientation": {
+          "type": "string",
+          "description": "portrait, landscape or default."
+        },
+        "scale": {
+          "type": "number",
+          "description": "Adjust to this percentage (10-400)."
+        },
+        "fitToPage": {
+          "type": "boolean",
+          "description": "Fit to fitToWidth × fitToHeight pages instead of scaling."
+        },
+        "fitToWidth": {
+          "type": "number",
+          "description": "Pages wide for Fit to (0 = Automatic)."
+        },
+        "fitToHeight": {
+          "type": "number",
+          "description": "Pages tall for Fit to (0 = Automatic)."
+        },
+        "firstPageNumber": {
+          "type": "number",
+          "description": "First page number; null for Auto."
+        },
+        "pageOrder": {
+          "type": "string",
+          "description": "downThenOver or overThenDown."
+        },
+        "gridLines": {
+          "type": "boolean",
+          "description": "Print gridlines."
+        },
+        "headings": {
+          "type": "boolean",
+          "description": "Print row and column headings."
+        },
+        "horizontalCentered": {
+          "type": "boolean",
+          "description": "Center on page horizontally."
+        },
+        "verticalCentered": {
+          "type": "boolean",
+          "description": "Center on page vertically."
+        },
+        "blackAndWhite": {
+          "type": "boolean",
+          "description": "Black and white."
+        },
+        "draft": {
+          "type": "boolean",
+          "description": "Draft quality."
+        },
+        "cellComments": {
+          "type": "string",
+          "description": "none, asDisplayed or atEnd."
+        },
+        "errors": {
+          "type": "string",
+          "description": "How errors print: displayed, blank, dash or NA."
+        },
+        "differentOddEven": {
+          "type": "boolean",
+          "description": "Different odd and even page headers."
+        },
+        "differentFirst": {
+          "type": "boolean",
+          "description": "Different first page header."
+        },
+        "scaleWithDoc": {
+          "type": "boolean",
+          "description": "Scale headers with the document."
+        },
+        "alignWithMargins": {
+          "type": "boolean",
+          "description": "Align headers with the page margins."
+        },
+        "sheets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Optional sheet indexes or names: several (grouped) sheets. Default: `sheet`, else the active sheet."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "xlsxy_page_header",
+    "description": "Read or set one header or footer as its three sections, in the header editor's form: &[Page], &[Pages], &[Date], &[Time], &[Path], &[File], &[Tab] are stored as Excel's &P &N &D &T &Z &F &A, && is a literal ampersand. With none of left/center/right it only reads. A section over 255 characters is refused; &[Picture] only where the section already has a picture. One undo step.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "description": "odd (default), even or first."
+        },
+        "part": {
+          "type": "string",
+          "description": "header (default) or footer."
+        },
+        "left": {
+          "type": "string",
+          "description": "Left section (an absent one is empty when setting)."
+        },
+        "center": {
+          "type": "string",
+          "description": "Center section."
+        },
+        "right": {
+          "type": "string",
+          "description": "Right section."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "xlsxy_print_area_set",
+    "description": "Set the sheet's print area (Set Print Area): ranges like \"A1:C10\" or \"A1:C10,E1:F5\", whole columns \"A:C\" or rows \"1:5\". One undo step.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "range": {
+          "type": "string",
+          "description": "The print area."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "range"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_print_area_add",
+    "description": "Add a range to the sheet's print area (Add to Print Area); with none yet it becomes one. One undo step.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "range": {
+          "type": "string",
+          "description": "The range to add."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "range"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_print_area_clear",
+    "description": "Clear the sheet's print area. One undo step when there was one.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "xlsxy_print_titles",
+    "description": "Set the rows to repeat at top and columns to repeat at left on every printed page. An absent key keeps that part; null or \"\" clears it. One undo step.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "rows": {
+          "type": "string",
+          "description": "Whole rows like \"1:2\"."
+        },
+        "cols": {
+          "type": "string",
+          "description": "Whole columns like \"A:A\"."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "xlsxy_page_break_insert",
+    "description": "Insert Page Break at a cell: a row break above it (unless in row 1) and a column break left of it (unless in column A). Replies with the manual break ids. One undo step.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "cell": {
+          "type": "string",
+          "description": "A1-style cell, e.g. \"A14\"."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "cell"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_page_break_remove",
+    "description": "Remove the manual page breaks bordering a cell (above it and left of it). One undo step.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "cell": {
+          "type": "string",
+          "description": "A1-style cell."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "cell"
+      ]
+    }
+  },
+  {
+    "name": "xlsxy_page_break_reset",
+    "description": "Reset All Page Breaks: remove every manual break on the sheet. One undo step.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "xlsxy_print_pages",
+    "description": "The pages printing lays out, as Excel would: per page its sheet, body range, repeated title rows/columns, page number and scale, and the total. Read-only.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "what": {
+          "type": "string",
+          "description": "active (default: the active or given sheets), workbook (every visible sheet) or selection (`range` of `sheet`)."
+        },
+        "sheets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Optional sheet indexes or names: several (grouped) sheets. Default: `sheet`, else the active sheet."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "range": {
+          "type": "string",
+          "description": "For what=selection: ranges like \"A1:C10,E1:F5\", each printed on pages of its own."
+        },
+        "ignorePrintAreas": {
+          "type": "boolean",
+          "description": "Print the used area even where a print area is set."
+        },
+        "from": {
+          "type": "number",
+          "description": "First page to print, 1-based (default: the first)."
+        },
+        "to": {
+          "type": "number",
+          "description": "Last page to print (default: the last)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "xlsxy_export_pdf",
+    "description": "Print to a PDF file: the active sheet by default, or what print.pages takes. Refuses to overwrite an existing file; with nothing to print it errors (\"We didn't find anything to print.\") and writes no file.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Where to write the PDF."
+        },
+        "what": {
+          "type": "string",
+          "description": "active (default: the active or given sheets), workbook (every visible sheet) or selection (`range` of `sheet`)."
+        },
+        "sheets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Optional sheet indexes or names: several (grouped) sheets. Default: `sheet`, else the active sheet."
+        },
+        "sheet": {
+          "type": "string",
+          "description": "Optional sheet index or name (default: the active sheet)."
+        },
+        "range": {
+          "type": "string",
+          "description": "For what=selection: ranges like \"A1:C10,E1:F5\", each printed on pages of its own."
+        },
+        "ignorePrintAreas": {
+          "type": "boolean",
+          "description": "Print the used area even where a print area is set."
+        },
+        "from": {
+          "type": "number",
+          "description": "First page to print, 1-based (default: the first)."
+        },
+        "to": {
+          "type": "number",
+          "description": "Last page to print (default: the last)."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which xlsxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "path"
+      ]
+    }
   }
 ]
