@@ -32,7 +32,7 @@ use backstage::BackstageHost as _;
 use gridcore::comments::Comment;
 use gridcore::docprops::{CustomProperty, CustomValue, DocProperties};
 use gridcore::edit::{fill_changes, replace_all_in_sheet};
-use gridcore::engine::Engine;
+use gridcore::engine::{Engine, PART_OF_ARRAY};
 use gridcore::entry::{entry_cell, entry_ctx, seed_text};
 use gridcore::formula::translate_formula;
 use gridcore::frame::Agg;
@@ -1717,8 +1717,8 @@ impl App {
 
     /// Commit the editor text into the current cell as a typed entry
     /// (gridcore::entry). Returns false (and stays in edit mode) when a
-    /// formula doesn't parse or the entry is over the 32,767-character cell
-    /// limit.
+    /// formula doesn't parse, the entry is over the 32,767-character cell
+    /// limit, or it would change part of an array ([`PART_OF_ARRAY`]).
     fn commit_edit(&mut self) -> bool {
         let Some(edit) = self.edit.take() else {
             return true;
@@ -1763,7 +1763,16 @@ impl App {
                 return false;
             }
         };
-        self.apply(vec![(r, c, cell)]);
+        if !self.apply(vec![(r, c, cell)]) {
+            // Refused (part of an array): keep the editor open, as Excel does.
+            self.edit = Some(EditState {
+                cursor: text.chars().count(),
+                text,
+                replace: false,
+                seed,
+            });
+            return false;
+        }
         true
     }
 
@@ -1790,33 +1799,49 @@ impl App {
         gridcore::sheet::frozen_spill_keys(&wb.sheets[sheet_idx], keys, frozen)
     }
 
-    /// Apply cell changes to the current sheet as one undo group.
-    fn apply(&mut self, changes: Vec<(u32, u32, Cell)>) {
-        self.apply_on(self.sheet, changes);
+    /// Apply cell changes to the current sheet as one undo group. False
+    /// when refused ([`App::apply_groups`]).
+    fn apply(&mut self, changes: Vec<(u32, u32, Cell)>) -> bool {
+        self.apply_on(self.sheet, changes)
     }
 
     /// Apply cell changes to sheet `sheet_idx` as one undo group, through the
     /// engine. This is the shared edit path for keyboard edits (via [`Self::apply`])
     /// and agent control edits (which may target a non-active sheet).
-    fn apply_on(&mut self, sheet_idx: usize, changes: Vec<(u32, u32, Cell)>) {
-        self.apply_groups(vec![(sheet_idx, changes)]);
+    fn apply_on(&mut self, sheet_idx: usize, changes: Vec<(u32, u32, Cell)>) -> bool {
+        self.apply_groups(vec![(sheet_idx, changes)])
     }
 
     /// Apply per-sheet cell changes, in order ([`Engine::set_cells`]: blanks
     /// landing in a frozen array block last), as one undo step: a cut
     /// pasted on another sheet clears its source and writes its destination
     /// together, so one undo puts both back.
-    fn apply_groups(&mut self, groups: Vec<(usize, CellChanges)>) {
+    ///
+    /// Refused whole, with nothing applied, no undo step and the status
+    /// saying why, when a group would change part of an array
+    /// ([`Engine::refuses`]). False then.
+    fn apply_groups(&mut self, groups: Vec<(usize, CellChanges)>) -> bool {
+        let wb = &self.pkg.workbook;
+        if groups
+            .iter()
+            .any(|(s, changes)| self.engine.refuses(wb, *s, changes))
+        {
+            self.status = Some(PART_OF_ARRAY.to_string());
+            return false;
+        }
         let keys = groups
             .iter()
             .map(|(s, changes)| (*s, changes.iter().map(|&(r, c, _)| (r, c)).collect()))
             .collect();
+        // Decided once above, for every group: written without deciding
+        // again against what the earlier groups recalculated.
         self.record_groups(keys, |app| {
             for (sheet_idx, changes) in groups {
                 app.engine
-                    .set_cells(&mut app.pkg.workbook, sheet_idx, changes);
+                    .set_cells_prechecked(&mut app.pkg.workbook, sheet_idx, changes);
             }
         });
+        true
     }
 
     /// Run `write`, which edits the cells `keys` names (per sheet), as one
@@ -2582,7 +2607,6 @@ impl App {
                         }
                     }
                 }
-                self.cancel_cut();
                 let (dr_all, dc_all) = (
                     r0 as i64 - clip.from.0 as i64,
                     c0 as i64 - clip.from.1 as i64,
@@ -2630,6 +2654,22 @@ impl App {
                 // block is whole, it clears its cell once the paste has put
                 // content into the block. One undo step.
                 let (src, here) = (clip.sheet, self.sheet);
+                // Refused whole, before the cut's source is cleared, when the
+                // clears or the paste would change part of an array: the clip
+                // stays as it was, so it can still be pasted elsewhere.
+                let wb = &self.pkg.workbook;
+                let refused = if same_sheet {
+                    self.engine
+                        .refuses_paste(wb, here, (r0, c0), &block, &clears)
+                } else {
+                    self.engine.refuses(wb, src, &clears)
+                        || self.engine.refuses_paste(wb, here, (r0, c0), &block, &[])
+                };
+                if refused {
+                    self.status = Some(PART_OF_ARRAY.to_string());
+                    return;
+                }
+                self.cancel_cut();
                 let clear_keys: Vec<_> = clears.iter().map(|&(r, c, _)| (r, c)).collect();
                 let keys = if same_sheet {
                     vec![(here, clear_keys.into_iter().chain(writes).collect())]
@@ -2643,16 +2683,13 @@ impl App {
                     } else {
                         (clears, Vec::new())
                     };
-                    for (r, c, cell) in clears {
-                        app.engine
-                            .set_cell(&mut app.pkg.workbook, (src, r, c), cell);
-                    }
+                    // Checked whole above: each part is written without
+                    // deciding again against what the clears recalculated.
+                    let wb = &mut app.pkg.workbook;
+                    app.engine.set_cells_prechecked(wb, src, clears);
                     app.engine
-                        .paste_block(&mut app.pkg.workbook, here, (r0, c0), &block);
-                    for (r, c, cell) in late {
-                        app.engine
-                            .set_cell(&mut app.pkg.workbook, (src, r, c), cell);
-                    }
+                        .paste_block_prechecked(wb, here, (r0, c0), &block);
+                    app.engine.set_cells_prechecked(wb, src, late);
                 });
                 self.status = Some(if source_locked {
                     "Pasted (source sheet is protected; cut kept as copy)".to_string()
@@ -2699,7 +2736,9 @@ impl App {
                     changes.push((r, c, cell));
                 }
             }
-            self.apply(changes);
+            if !self.apply(changes) {
+                return;
+            }
             self.status = Some(if truncated {
                 format!("Pasted (clipped to {MAX_PASTE_CELLS} cells)")
             } else {
@@ -3773,8 +3812,9 @@ impl App {
                     now_serial(),
                 ) {
                     Ok(cell) => {
-                        self.apply(vec![(r, c, cell)]);
-                        self.status = Some(format!("Set {} = {value}", cell_name(r, c)));
+                        if self.apply(vec![(r, c, cell)]) {
+                            self.status = Some(format!("Set {} = {value}", cell_name(r, c)));
+                        }
                     }
                     Err(e) => self.status = Some(e.to_string()),
                 }
@@ -5220,7 +5260,9 @@ impl App {
             return;
         }
         let n = changes.len();
-        self.apply(changes);
+        if !self.apply(changes) {
+            return;
+        }
         self.status = Some(format!(
             "Filled {n} cell{} {}",
             if n == 1 { "" } else { "s" },
@@ -5283,7 +5325,9 @@ impl App {
             self.status = Some(format!("Not found: {find}"));
             return;
         }
-        self.apply(changes);
+        if !self.apply(changes) {
+            return;
+        }
         self.status = Some(format!("Replaced in {n} cell(s)"));
     }
 
@@ -9528,7 +9572,7 @@ mod tests {
         assert!(app.sheet().cell(0, 0).is_some_and(|cl| cl.style != 0));
     }
 
-    /// A legacy CSE block over D1:D3 with a 1x1 result (nothing spills).
+    /// A legacy CSE block over D1:D3 with a 1x1 result (repeated over the block).
     fn cse_sum_block() -> Cell {
         Cell {
             value: CellValue::Number(6.0),
@@ -9635,6 +9679,93 @@ mod tests {
                 r + 1
             );
         }
+    }
+
+    /// r7 M2: a refused edit changes nothing, records no undo step, leaves
+    /// the workbook unmodified, and says why in Excel's words.
+    fn assert_refused(app: &App, before: &std::collections::BTreeMap<(u32, u32), Cell>) {
+        assert_eq!(&app.sheet().cells, before);
+        assert!(app.undo.is_empty());
+        assert!(!app.modified);
+        assert_eq!(app.status.as_deref(), Some(PART_OF_ARRAY));
+        assert_cse_spills(app, "refused");
+    }
+
+    #[test]
+    fn a_cut_pasted_into_part_of_a_cse_block_is_refused_whole() {
+        // Cut A5:A6 and paste at D2: the cut's source is not cleared, and
+        // the clip stays a cut that pastes elsewhere.
+        let mut app = app_with_spilling_cse();
+        app.pkg.workbook.sheets[0].set_cell(4, 0, Cell::number(7.0));
+        app.pkg.workbook.sheets[0].set_cell(5, 0, Cell::number(8.0));
+        let before = app.sheet().cells.clone();
+        app.cur = (4, 0);
+        app.anchor = Some((5, 0));
+        app.copy(true);
+        app.cur = (1, 3);
+        app.anchor = None;
+        app.paste();
+        assert_refused(&app, &before);
+        app.cur = (0, 5);
+        app.paste();
+        assert_eq!(app.status.as_deref(), Some("Pasted"));
+        assert_eq!(
+            app.sheet().cell(0, 5).unwrap().value,
+            CellValue::Number(7.0)
+        );
+        assert!(app.sheet().cell(4, 0).is_none_or(|c| c.value.is_empty()));
+    }
+
+    #[test]
+    fn a_cut_whose_clears_change_the_block_is_still_refused_whole() {
+        // r8 M3: B2 = 4; cut A2:B2 and paste at C2, which puts the 4 into
+        // D2. D2 holds 4 now, but clearing A2 would recalculate it: decided
+        // once, before the clears, it is refused whole, the source intact
+        // and the clip still a cut.
+        let mut app = app_with_spilling_cse();
+        app.pkg.workbook.sheets[0].set_cell(1, 1, Cell::number(4.0));
+        let before = app.sheet().cells.clone();
+        app.cur = (1, 0);
+        app.anchor = Some((1, 1));
+        app.copy(true);
+        app.cur = (1, 2);
+        app.anchor = None;
+        app.paste();
+        assert_refused(&app, &before);
+        assert!(app.clip.as_ref().is_some_and(|c| c.cut));
+    }
+
+    #[test]
+    fn typing_into_part_of_a_cse_block_is_refused_and_keeps_the_editor() {
+        let mut app = app_with_spilling_cse();
+        let before = app.sheet().cells.clone();
+        app.cur = (1, 3);
+        app.start_edit(Some('9'));
+        assert!(!app.commit_edit());
+        assert_eq!(app.edit.as_ref().map(|e| e.text.as_str()), Some("9"));
+        assert_refused(&app, &before);
+    }
+
+    #[test]
+    fn a_fill_or_clear_over_part_of_a_cse_block_is_refused_whole() {
+        // Ctrl-D over C2:D4 would write C3:C4 and D3:D4; D3 is the block's.
+        let mut app = app_with_spilling_cse();
+        app.pkg.workbook.sheets[0].set_cell(1, 2, Cell::number(5.0));
+        let before = app.sheet().cells.clone();
+        app.cur = (3, 3);
+        app.anchor = Some((1, 2));
+        app.fill(true);
+        assert_refused(&app, &before);
+        app.cur = (2, 3);
+        app.anchor = Some((1, 2));
+        app.clear_selection();
+        assert_refused(&app, &before);
+        // All of it, anchor included, clears.
+        app.cur = (0, 3);
+        app.anchor = Some((2, 3));
+        app.clear_selection();
+        assert!((0..3).all(|r| app.sheet().cell(r, 3).is_none_or(|c| c.value.is_empty())));
+        assert_eq!(app.undo.len(), 1);
     }
 
     #[test]

@@ -1023,6 +1023,18 @@ fn fill_box(src: (u32, u32, u32, u32), to: (u32, u32)) -> (u32, u32, u32, u32) {
     }
 }
 
+/// The cells a drag fill from `src` over `bx` ([`fill_box`]) writes: the rows
+/// below the source, or the columns right of it (`gridcore::edit::autofill`).
+fn fill_dest(src: (u32, u32, u32, u32), bx: (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
+    let (_, sc0, sr1, sc1) = src;
+    let (br0, _, br1, bc1) = bx;
+    if br1 > sr1 {
+        (sr1 + 1, sc0, br1, sc1)
+    } else {
+        (br0, sc1 + 1, br1, bc1)
+    }
+}
+
 /// The grid clipboard: a rectangular block of cells copied from a sheet.
 #[derive(Clone)]
 struct GridClip {
@@ -1477,8 +1489,9 @@ impl SheetView {
     /// Commit the cell buffer without moving the selection, including undo/recalc.
     /// An entry the cell cannot hold (over 32,767 characters) or a formula
     /// that does not parse (`=SUM(A1`, [`SheetView::formula_error`]) is
-    /// refused: the editor stays open with its text and
-    /// [`SheetView::entry_error`] says why.
+    /// refused, and so is one that would change part of an array
+    /// ([`gridcore::engine::PART_OF_ARRAY`]): the editor stays open with its
+    /// text and [`SheetView::entry_error`] says why.
     fn commit_edit(&mut self) -> bool {
         self.entry_error = None;
         let untouched = self.edit_untouched();
@@ -1505,15 +1518,47 @@ impl SheetView {
             self.entry_error = Some(e);
             return false;
         }
-        let buf = self.editing.take().unwrap_or_default();
+        let buf = buf.to_string();
+        let today = self.engine.clock;
+        let cell = gridcore::entry::entry_cell(&mut self.pkg.workbook, s, r, c, &buf, today).ok();
+        // Part of an array: refused, as Excel refuses it, the editor kept.
+        if let Some(cell) = &cell {
+            if self.refuses(s, &[(r, c, cell.clone())]) {
+                return false;
+            }
+        }
+        self.editing = None;
         self.end_cell_edit();
         self.push_undo();
-        let today = self.engine.clock;
-        if let Ok(cell) = gridcore::entry::entry_cell(&mut self.pkg.workbook, s, r, c, &buf, today)
-        {
+        if let Some(cell) = cell {
             self.engine.set_cell(&mut self.pkg.workbook, origin, cell);
         }
         true
+    }
+
+    /// Would `changes` to sheet `s` change part of an array
+    /// ([`Engine::refuses`])? Then [`SheetView::entry_error`] says so, as
+    /// Excel does, and the caller writes nothing, records no undo step and
+    /// leaves the tab clean.
+    fn refuses(&mut self, s: usize, changes: &[(u32, u32, gridcore::sheet::Cell)]) -> bool {
+        let refused = self.engine.refuses(&self.pkg.workbook, s, changes);
+        if refused {
+            self.entry_error = Some(gridcore::engine::PART_OF_ARRAY.to_string());
+        }
+        refused
+    }
+
+    /// The blanks clearing the selected range writes: each cell's content
+    /// goes, its style stays.
+    fn clear_changes(&self) -> Vec<(u32, u32, gridcore::sheet::Cell)> {
+        let (r0, c0, r1, c1) = self.range();
+        let mut changes = Vec::new();
+        for (&(r, c), cell) in self.sheet().cells.range((r0, 0)..=(r1, u32::MAX)) {
+            if (c0..=c1).contains(&c) {
+                changes.push((r, c, cell.blank_like()));
+            }
+        }
+        changes
     }
 
     /// Why `buf` cannot be committed into the cells `rect` of sheet `s` as a
@@ -1903,15 +1948,37 @@ impl SheetView {
     /// clears its cell whatever order the cells come in). Each cell is
     /// matched as it was before the replace. The number of cells replaced.
     fn replace_all_cells(&mut self, q: &str, rep: &str) -> u32 {
-        let keys: Vec<(u32, u32)> = self.sheet().cells.keys().copied().collect();
-        let changes: Vec<(u32, u32, gridcore::sheet::Cell)> = keys
-            .into_iter()
-            .filter_map(|(r, c)| self.replaced_cell(r, c, q, rep).map(|cell| (r, c, cell)))
-            .collect();
+        let changes = self.replace_all_changes(q, rep);
         let n = changes.len() as u32;
         let s = self.active;
         self.engine.set_cells(&mut self.pkg.workbook, s, changes);
         n
+    }
+
+    /// The cells [`Self::replace_all_cells`] writes.
+    fn replace_all_changes(
+        &mut self,
+        q: &str,
+        rep: &str,
+    ) -> Vec<(u32, u32, gridcore::sheet::Cell)> {
+        let keys: Vec<(u32, u32)> = self.sheet().cells.keys().copied().collect();
+        keys.into_iter()
+            .filter_map(|(r, c)| self.replaced_cell(r, c, q, rep).map(|cell| (r, c, cell)))
+            .collect()
+    }
+
+    /// Would Replace (on `(r, c)`, or with `all` on every cell) change part
+    /// of an array ([`Self::refuses`])? Asked before the undo step is taken.
+    fn replace_refused(&mut self, (r, c): (u32, u32), q: &str, rep: &str, all: bool) -> bool {
+        let changes = if all {
+            self.replace_all_changes(q, rep)
+        } else {
+            self.replaced_cell(r, c, q, rep)
+                .map(|cell| vec![(r, c, cell)])
+                .unwrap_or_default()
+        };
+        let s = self.active;
+        self.refuses(s, &changes)
     }
 
     /// The cell `(r, c)` becomes when `q` is replaced by `rep` in it
@@ -1980,29 +2047,33 @@ impl SheetView {
             self.entry_error = Some(e);
             return false;
         }
-        self.end_cell_edit();
-        self.push_undo();
         let today = self.engine.clock;
         let wb = &mut self.pkg.workbook;
-        if let Ok(cells) = gridcore::entry::entry_range(wb, s, range, (r, c), &buf, today) {
-            for (rr, cc, cell) in cells {
-                self.engine
-                    .set_cell(&mut self.pkg.workbook, (s, rr, cc), cell);
-            }
+        let cells = gridcore::entry::entry_range(wb, s, range, (r, c), &buf, today).ok();
+        if cells.as_ref().is_some_and(|cells| self.refuses(s, cells)) {
+            return false;
+        }
+        self.end_cell_edit();
+        self.push_undo();
+        if let Some(cells) = cells {
+            self.engine
+                .set_cells_prechecked(&mut self.pkg.workbook, s, cells);
         }
         true
     }
 
     /// Ctrl+D / Ctrl+R over the selection (one undo step). False when there
-    /// was nothing to fill.
+    /// was nothing to fill, or the fill was refused as part of an array
+    /// ([`SheetView::entry_error`] says so).
     fn fill_selection(&mut self, down: bool) -> bool {
         let changes = gridcore::edit::fill_changes(self.sheet(), self.range(), down);
-        if changes.is_empty() {
+        if changes.is_empty() || self.refuses(self.active, &changes) {
             return false;
         }
         self.push_undo();
         let s = self.active;
-        self.engine.set_cells(&mut self.pkg.workbook, s, changes);
+        self.engine
+            .set_cells_prechecked(&mut self.pkg.workbook, s, changes);
         true
     }
 
@@ -9459,6 +9530,20 @@ impl Docxy {
         if (br0, bc0, br1, bc1) == f.src {
             return;
         }
+        // A fill over part of an array is refused whole. `autofill` writes
+        // the destination's cells itself, so that area is asked; an anchor in
+        // the source is not rewritten, so it is not replaced.
+        let dest = fill_dest(f.src, (br0, bc0, br1, bc1));
+        if self.active_sheet_mut().is_some_and(|v| {
+            let refused = v.engine.refuses_area(&v.pkg.workbook, v.active, dest);
+            if refused {
+                v.entry_error = Some(gridcore::engine::PART_OF_ARRAY.to_string());
+            }
+            refused
+        }) {
+            self.sheet_entry_refused(cx);
+            return;
+        }
         self.sheet_snapshot();
         if let Some(v) = self.active_sheet_mut() {
             let s = v.active;
@@ -10011,29 +10096,29 @@ impl Docxy {
     /// Clear the whole selected range's content (Delete / Backspace), keeping
     /// each cell's style.
     fn sheet_clear(&mut self, cx: &mut Context<Self>) {
-        if self.sheet_protected() {
+        if self.sheet_protected() || self.sheet_clear_refused(cx) {
             return;
         }
         self.sheet_snapshot();
         if let Some(v) = self.active_sheet_mut() {
-            let (r0, c0, r1, c1) = v.range();
             let s = v.active;
-            for r in r0..=r1 {
-                for c in c0..=c1 {
-                    let style = v.sheet().cell(r, c).map(|cl| cl.style).unwrap_or(0);
-                    v.engine.set_cell(
-                        &mut v.pkg.workbook,
-                        (s, r, c),
-                        gridcore::sheet::Cell {
-                            style,
-                            ..Default::default()
-                        },
-                    );
-                }
-            }
+            let changes = v.clear_changes();
+            v.engine
+                .set_cells_prechecked(&mut v.pkg.workbook, s, changes);
         }
         self.mark_sheet_dirty();
         cx.notify();
+    }
+
+    /// Would clearing the selected range change part of an array? Then the
+    /// status says so, as Excel does, and nothing is cleared or copied.
+    fn sheet_clear_refused(&mut self, cx: &mut Context<Self>) -> bool {
+        let refused = self.active_sheet_mut().is_some_and(|v| {
+            let s = v.active;
+            let changes = v.clear_changes();
+            v.refuses(s, &changes)
+        });
+        refused && self.sheet_entry_refused(cx)
     }
 
     /// Put `text` on the clipboard: the OS one, or the private one in a harness.
@@ -10061,6 +10146,10 @@ impl Docxy {
     /// Copy (or cut) the selected range into the grid clipboard and, as TSV, the
     /// system clipboard.
     fn sheet_copy(&mut self, cut: bool, cx: &mut Context<Self>) {
+        // A cut of part of an array is refused before anything is copied.
+        if cut && self.sheet_clear_refused(cx) {
+            return;
+        }
         let Some(v) = self.active_sheet() else { return };
         let (r0, c0, r1, c1) = v.range();
         let mut cells = Vec::new();
@@ -10137,6 +10226,19 @@ impl Docxy {
         if block.is_empty() {
             return;
         }
+        // A paste over part of an array is refused whole.
+        if self.active_sheet_mut().is_some_and(|v| {
+            let refused = v
+                .engine
+                .refuses_paste(&v.pkg.workbook, v.active, v.sel, &block, &[]);
+            if refused {
+                v.entry_error = Some(gridcore::engine::PART_OF_ARRAY.to_string());
+            }
+            refused
+        }) {
+            self.sheet_entry_refused(cx);
+            return;
+        }
         self.sheet_snapshot();
         if let Some(v) = self.active_sheet_mut() {
             let (br, bc) = v.sel;
@@ -10144,7 +10246,7 @@ impl Docxy {
             // A pasted spilling array still spills, and an array block
             // pasted back in place keeps its block (`Engine::paste_block`).
             v.engine
-                .paste_block(&mut v.pkg.workbook, s, (br, bc), &block);
+                .paste_block_prechecked(&mut v.pkg.workbook, s, (br, bc), &block);
             let h = block.len() as u32;
             let w = block.iter().map(|r| r.len()).max().unwrap_or(0) as u32;
             if h > 0 && w > 0 {
@@ -10999,6 +11101,16 @@ impl Docxy {
 
     /// Set the selected cell to `value` (a picked validation option).
     fn sheet_dv_pick(&mut self, value: String, cx: &mut Context<Self>) {
+        self.sheet_dv_open = false;
+        if self.active_sheet_mut().is_some_and(|v| {
+            let (s, (r, c)) = (v.active, v.sel);
+            let today = v.engine.clock;
+            gridcore::entry::entry_cell(&mut v.pkg.workbook, s, r, c, &value, today)
+                .is_ok_and(|cell| v.refuses(s, &[(r, c, cell)]))
+        }) {
+            self.sheet_entry_refused(cx);
+            return;
+        }
         self.sheet_snapshot();
         if let Some(v) = self.active_sheet_mut() {
             let (r, c) = v.sel;
@@ -11195,6 +11307,13 @@ impl Docxy {
         // is one you cannot see happening. Before `sheet_snapshot`, so the undo
         // step is taken with the selection already back on the cells.
         self.chart_hand_back(cx);
+        if self
+            .active_sheet_mut()
+            .is_some_and(|v| v.replace_refused(v.sel, &q, &rep, false))
+        {
+            self.sheet_entry_refused(cx);
+            return;
+        }
         self.sheet_snapshot();
         if let Some(v) = self.active_sheet_mut() {
             let (r, c) = v.sel;
@@ -11209,6 +11328,13 @@ impl Docxy {
         let q = self.find_query.clone();
         let rep = self.replace_text.clone();
         if q.is_empty() {
+            return;
+        }
+        if self
+            .active_sheet_mut()
+            .is_some_and(|v| v.replace_refused(v.sel, &q, &rep, true))
+        {
+            self.sheet_entry_refused(cx);
             return;
         }
         self.sheet_snapshot();
@@ -12484,6 +12610,7 @@ impl Docxy {
                         {
                             self.mark_sheet_dirty();
                         }
+                        self.sheet_entry_refused(cx);
                     }
                     cx.notify();
                     return;
@@ -15587,7 +15714,7 @@ mod clipboard_tests {
     use gridcore::engine::Engine;
     use gridcore::sheet::{Cell, CellValue, Sheet, Workbook};
 
-    /// #725: a legacy CSE block over D1:D3 with a 1x1 result (no spill).
+    /// #725: a legacy CSE block over D1:D3 with a 1x1 result (repeated over the block).
     fn cse_sum_block() -> Cell {
         Cell {
             value: CellValue::Number(6.0),
@@ -15715,9 +15842,10 @@ mod clipboard_tests {
             .collect()
     }
 
-    /// #785: a non-spilling CSE block cut and pasted back in place keeps its
-    /// block — the cut has already cleared it, so `set_cell` alone would
-    /// type it. A constant in the block's D2 comes back as it was.
+    /// #785: a CSE block cut and pasted back in place keeps its block — the
+    /// cut has already cleared it, so `set_cell` alone would type it. A
+    /// constant typed into the block's D2 is refused (#775: the block owns
+    /// its `ref`), so the block comes back whole.
     #[test]
     fn a_cut_cse_block_pasted_back_in_place_keeps_its_block() {
         let (mut wb, mut engine) = cse_workbook("SUM(A1:A3)");
@@ -15733,13 +15861,18 @@ mod clipboard_tests {
 
         let (mut wb, mut engine) = cse_workbook("SUM(A1:A3)");
         engine.set_cell(&mut wb, (1, 1, 3), Cell::number(7.0));
+        assert_eq!(
+            wb.sheets[1].cell(1, 3).unwrap().value,
+            CellValue::Number(6.0),
+            "the partial edit is refused"
+        );
         let clip = clip_d1_d3(&wb, 1);
         cut_d1_d3(&mut engine, &mut wb, 1);
         engine.paste_block(&mut wb, 1, (0, 3), &clip);
         assert_eq!(f_attrs_at(&wb, 1), Some(" t=\"array\" ref=\"D1:D3\""));
         assert_eq!(
             wb.sheets[1].cell(1, 3).unwrap().value,
-            CellValue::Number(7.0)
+            CellValue::Number(6.0)
         );
     }
 
@@ -15896,17 +16029,18 @@ mod clipboard_tests {
         }
     }
 
-    /// #785: a CSE block whose result outgrew its stored ref spills past the
-    /// copied block. Pasted at its own address on another sheet, it claims no
-    /// more than its ref: a constant below the block stays, and the anchor
-    /// shows `#SPILL!` as the spill it can't make.
+    /// #785, as ruled for #775: a CSE block whose result outgrew its stored
+    /// ref never spills past it — the result is cut off at the block's edge.
+    /// Pasted at its own address on another sheet, it claims no more than its
+    /// ref: a constant below the block stays, and the block fills.
     #[test]
     fn a_restored_cse_block_never_takes_cells_below_its_ref() {
         let (mut wb, mut engine) = cse_workbook("A1:A5*2");
         for r in 3..5 {
             engine.set_cell(&mut wb, (1, r, 0), Cell::number(f64::from(r + 1)));
         }
-        assert_eq!(wb.sheets[1].cell(0, 3).unwrap().spill, Some((5, 1)));
+        assert_eq!(wb.sheets[1].cell(0, 3).unwrap().spill, Some((3, 1)));
+        assert!(wb.sheets[1].cell(3, 3).is_none_or(|c| c.value.is_empty()));
         let clip = clip_d1_d3(&wb, 1);
         engine.set_cell(&mut wb, (0, 3, 3), Cell::text("mine"));
         engine.paste_block(&mut wb, 0, (0, 3), &clip);
@@ -15914,10 +16048,9 @@ mod clipboard_tests {
             wb.sheets[0].cell(3, 3).unwrap().value,
             CellValue::Text("mine".into())
         );
-        assert_eq!(
-            wb.sheets[0].cell(0, 3).unwrap().value,
-            CellValue::Error("#SPILL!".into())
-        );
+        let anchor = wb.sheets[0].cell(0, 3).unwrap();
+        assert_eq!(anchor.spill, Some((3, 1)));
+        assert_ne!(anchor.value, CellValue::Error("#SPILL!".into()));
     }
 
     /// #699: a harness instance never reads or writes the OS clipboard, and

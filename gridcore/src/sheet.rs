@@ -119,14 +119,16 @@ pub struct Cell {
     /// (data-table formulas, unparseable shared groups). Cells carrying this
     /// are never re-evaluated and their `<f>` is written back exactly — with
     /// one exception: array formulas (`t="array"`) are evaluated by the
-    /// dynamic-array engine, which tracks their extent in [`Cell::spill`].
+    /// engine (a dynamic array spills, a legacy CSE block fills its `ref`),
+    /// which tracks their extent in [`Cell::spill`].
     pub f_attrs: Option<String>,
     /// Index into [`Styles::xfs`] (`s=` attribute); 0 is the default style.
     pub style: u32,
-    /// (rows, cols) of the dynamic-array spill anchored here, including this
-    /// cell — set by the recalc engine (or from `<f t="array" ref="…">` at
-    /// load). The spilled cells themselves are plain values owned by this
-    /// anchor. `None` = no spill (scalar result).
+    /// (rows, cols) of the array anchored here, including this cell: a
+    /// dynamic array's spill, or the fixed block a legacy CSE array filled —
+    /// set by the recalc engine (or from `<f t="array" ref="…">` at load).
+    /// The other cells are plain values owned by this anchor. `None` for a
+    /// scalar dynamic-array result, a one-cell CSE block, or a blocked one.
     pub spill: Option<(u32, u32)>,
     /// `<c>` metadata attributes kept from the file (`cm`, `vm`, `ph`), and
     /// what the engine knows about a formula typed here (`modern`,
@@ -387,8 +389,8 @@ impl Cell {
     pub fn is_blank(&self) -> bool {
         self.value.is_empty() && self.formula.is_none()
     }
-    /// Is the formula an array one, evaluated by the dynamic-array engine: a
-    /// `t="array"` `<f>`, or a dynamic array ([`Cell::is_dynamic`]) whose
+    /// Is the formula an array one, evaluated as an array by the engine (a
+    /// spill, or a legacy CSE block's fill): a `t="array"` `<f>`, or a dynamic array ([`Cell::is_dynamic`]) whose
     /// `f_attrs` an edit dropped ([`crate::engine::Engine::set_cell`])?
     pub fn is_array_formula(&self) -> bool {
         self.f_attrs.as_deref().is_some_and(is_array_f) || self.is_dynamic()
