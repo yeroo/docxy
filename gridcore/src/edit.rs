@@ -444,9 +444,11 @@ pub fn sort_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, keys: &[(u32
 pub const SORT_CUTS_SPILL: &str = "Can't sort: the rows cut a spilled array";
 
 /// Would sorting rows `r1..=r2` of `sheet` ([`sort_rows`], which moves every
-/// column of a row) cut a spilled array: one, live or frozen, whose extent
-/// spans two rows or more and meets those rows? Hosts ask before they sort,
-/// to say why nothing moved.
+/// column of a row) cut an array: one, live or frozen, whose block spans
+/// two rows or more and meets those rows? Its block is its extent, or for a
+/// legacy CSE array whose result no longer spills ([`array_rect`]) the
+/// `ref` it saves with. Hosts ask before they sort, to say why nothing
+/// moved.
 pub fn sort_cuts_spill(wb: &Workbook, sheet: usize, r1: u32, r2: u32) -> bool {
     let Some(s) = wb.sheets.get(sheet) else {
         return false;
@@ -454,10 +456,30 @@ pub fn sort_cuts_spill(wb: &Workbook, sheet: usize, r1: u32, r2: u32) -> bool {
     let Some((r2, _)) = sort_span(s, r1, r2) else {
         return false;
     };
-    s.cells.iter().any(|(&(ar, _), cell)| {
-        cell.spill
+    s.cells.iter().any(|(&(ar, ac), cell)| {
+        array_rect(cell, (ar, ac))
             .is_some_and(|(h, _)| h > 1 && ar <= r2 && ar.saturating_add(h - 1) >= r1)
     })
+}
+
+/// The `(height, width)` of the array block anchored at `at`: its spill
+/// extent, or else, for a legacy CSE array (no `cm`, not a dynamic array),
+/// the `ref` it owns (one that starts at `at`). A CSE formula evaluated to
+/// one value (`SUM` over its block) has no extent, but save keeps that
+/// `ref`, and Excel fills the block from it.
+fn array_rect(cell: &Cell, at: (u32, u32)) -> Option<(u32, u32)> {
+    if cell.spill.is_some() {
+        return cell.spill;
+    }
+    if cell.is_dynamic() {
+        return None;
+    }
+    let fa = cell.f_attrs.as_deref().filter(|fa| is_array_f(fa))?;
+    if !ref_starts_at(fa, &cell_name(at.0, at.1)) {
+        return None;
+    }
+    let (r1, c1, r2, c2) = crate::sheet::array_block(cell)?;
+    Some((r2 - r1 + 1, c2 - c1 + 1))
 }
 
 /// The rows [`sort_rows`] sorts of `r1..=r2` and the last column it moves:
@@ -471,13 +493,13 @@ fn sort_span(s: &Sheet, r1: u32, r2: u32) -> Option<(u32, u32)> {
     (r2 > r1).then_some((r2, cols - 1))
 }
 
-/// A spilling array anchor moved from `from` to row `to` takes its block
-/// along: its `ref`, when the anchor owns it (starts there), is rewritten to
-/// its extent at the new row. Left behind, it would name the old rows, and
+/// An array anchor moved from `from` to row `to` takes its block along: its
+/// `ref`, when the anchor owns it (starts there), is rewritten to its block
+/// ([`array_rect`]) at the new row. Left behind, it would name the old rows:
 /// the cached block of an anchor the engine can't evaluate would no longer
-/// count as its own.
+/// count as its own, and a CSE block would save as its anchor alone.
 fn move_own_array_ref(cell: &mut Cell, (from, col): (u32, u32), to: u32) {
-    let Some((h, w)) = cell.spill else {
+    let Some((h, w)) = array_rect(cell, (from, col)) else {
         return;
     };
     let Some(fa) = cell.f_attrs.as_deref().filter(|fa| is_array_f(fa)) else {

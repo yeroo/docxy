@@ -11747,6 +11747,52 @@ b",
     }
 
     #[test]
+    fn an_evaluated_cse_block_is_still_an_array_to_sort() {
+        // #840 r1 m1: a legacy CSE `SUM` over its block evaluates to one
+        // value, so it has no extent, but save keeps its `ref`. A sort through
+        // a 3-row block is refused; a 1-row block moves with its row, `ref`
+        // and all.
+        let cse = |r: &str| format!(r#"<f t="array" ref="{r}">SUM(B1:B3)</f><v>6</v>"#);
+        let rows = format!(
+            concat!(
+                r#"<row r="1"><c r="A1"><v>9</v></c><c r="B1"><v>1</v></c><c r="D1">{}</c></row>"#,
+                r#"<row r="2"><c r="A2"><v>1</v></c><c r="B2"><v>2</v></c></row>"#,
+                r#"<row r="3"><c r="A3"><v>5</v></c><c r="B3"><v>3</v></c></row>"#,
+            ),
+            cse("D1:D3")
+        );
+        let mut pkg = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        assert_eq!(pkg.workbook.sheets[0].cell(0, 3).unwrap().spill, None);
+        assert!(crate::edit::sort_cuts_spill(&pkg.workbook, 0, 0, 2));
+        assert_eq!(
+            crate::edit::sort_rows(&mut pkg.workbook, 0, 0, 2, &[(0, true)]),
+            0
+        );
+        let ws = saved_sheet1(&pkg);
+        assert!(
+            ws.contains(r#"<c r="D1"><f t="array" ref="D1:D3">"#),
+            "{ws}"
+        );
+
+        let rows = rows.replace(&cse("D1:D3"), &cse("D1:F1"));
+        let mut pkg = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        assert_eq!(pkg.workbook.sheets[0].cell(0, 3).unwrap().spill, None);
+        assert_eq!(
+            crate::edit::sort_rows(&mut pkg.workbook, 0, 0, 2, &[(0, true)]),
+            3
+        );
+        let ws = saved_sheet1(&pkg);
+        assert!(
+            ws.contains(r#"<c r="D3"><f t="array" ref="D3:F3">"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
     fn a_sorted_one_row_frozen_array_keeps_its_block() {
         // #840: a sort moves a one-row frozen array with its row, `ref` and
         // all, so its block is still its own there: Delete on a cached cell
