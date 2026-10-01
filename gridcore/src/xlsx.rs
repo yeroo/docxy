@@ -11808,6 +11808,32 @@ b",
     }
 
     #[test]
+    fn a_pasted_value_keeps_its_vm_and_a_pasted_formula_drops_it() {
+        // #840 (plan-paste-vm): a value pasted elsewhere is the same value,
+        // so its value metadata (E1, a rich value) comes along, as Excel
+        // copies a picture in a cell. A formula pasted elsewhere is typed
+        // there: B1's `vm` describes B1's result, not the copy's, so it goes
+        // even though the copy evaluates to the same 6.
+        let rows = r#"<row r="1"><c r="A1"><v>3</v></c><c r="B1" vm="1"><f>A1*2</f><v>6</v></c><c r="E1" t="e" vm="2"><v>#VALUE!</v></c></row>"#;
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        let sheet = &pkg.workbook.sheets[0];
+        let b1 = sheet.cell(0, 1).unwrap().clone();
+        let e1 = sheet.cell(0, 4).unwrap().clone();
+        eng.paste_block(&mut pkg.workbook, 0, (2, 1), &[vec![b1]]);
+        eng.paste_block(&mut pkg.workbook, 0, (2, 5), &[vec![e1]]);
+        let ws = saved_sheet1(&pkg);
+        assert!(ws.contains(r#"<c r="B3"><f>A1*2</f><v>6</v></c>"#), "{ws}");
+        assert!(
+            ws.contains(r#"<c r="F3" t="e" vm="2"><v>#VALUE!</v></c>"#),
+            "{ws}"
+        );
+        // The sources keep theirs.
+        assert!(ws.contains(r#"<c r="B1" vm="1">"#), "{ws}");
+    }
+
+    #[test]
     fn blocked_spill_anchor_keeps_cm_and_vm() {
         // Excel's #SPILL! anchor: D3 blocks the spill and recalc agrees, so the
         // value `vm` describes is unchanged.
