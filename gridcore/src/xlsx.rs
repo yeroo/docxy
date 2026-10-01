@@ -2011,23 +2011,31 @@ const ARRAY_REF_SLACK: u64 = 1 << 16;
 /// over, and save checks) spends its area from one per-sheet budget of twice
 /// the cell count plus [`ARRAY_REF_SLACK`]; one that doesn't fit is corrupt or
 /// crafted (`ref="A1:XFD1048576"`), and its cell falls back to a one-cell
-/// array, keeping its formula and cached value. Every later walk over a
-/// block or extent is then bounded by the sheet's size.
+/// array, keeping its formula and cached value. A loaded extent
+/// ([`Cell::spill`]) is kept only where it is exactly such a block, so the
+/// budget bounds it too, whatever produced it. Every later walk over a block
+/// or extent is then bounded by the sheet's size.
 ///
 /// What is left: a ref within the slack still has its cells made on its
-/// first fill (up to 64Ki), and since refs spend in key order, crafted refs
-/// early in a sheet can leave a later genuine block to fall back — only ever
-/// in a crafted file.
+/// first fill (up to 64Ki), and since refs spend in key order, refs early in
+/// a sheet can leave a later block to fall back. Beyond a crafted file, that
+/// happens to a block larger than the slack from a writer that saves only
+/// its anchor cell (openpyxl's `ArrayFormula`, for one): it loads, and then
+/// saves, as a one-cell array.
 fn cap_array_refs(sheet: &mut Sheet) {
     let mut budget = 2 * sheet.cells.len() as u64 + ARRAY_REF_SLACK;
     for (&(row, col), cell) in sheet.cells.iter_mut() {
-        let Some((r1, c1, r2, c2)) = crate::sheet::array_block(cell) else {
+        // The block a `ref` that starts at the cell names, as (rows, cols).
+        let own = crate::sheet::array_block(cell)
+            .filter(|&(r1, c1, _, _)| (r1, c1) == (row, col))
+            .map(|(r1, c1, r2, c2)| (r2 - r1 + 1, c2 - c1 + 1));
+        if cell.spill.is_some() && cell.spill != own {
+            cell.spill = None;
+        }
+        let Some((h, w)) = own else {
             continue;
         };
-        if (r1, c1) != (row, col) {
-            continue;
-        }
-        let area = u64::from(r2 - r1 + 1) * u64::from(c2 - c1 + 1);
+        let area = u64::from(h) * u64::from(w);
         if area <= 1 {
             continue;
         }
@@ -2189,7 +2197,7 @@ fn parse_cell_body(
         if !is_array_f(a) {
             return None;
         }
-        let ref_val = a.split("ref=\"").nth(1)?.split('"').next()?;
+        let ref_val = crate::sheet::f_ref(a)?;
         let (r1, c1, r2, c2) = crate::sheet::parse_range_name(ref_val)?;
         if (r1, c1) != (row, col) {
             return None;
@@ -11565,6 +11573,47 @@ b",
             ws.contains(r#"<c r="A1" cm="1"><f t="array" ref="A1:A2">_xlfn.SEQUENCE(2)</f>"#),
             "{ws}"
         );
+    }
+
+    #[test]
+    fn an_extent_from_an_xref_attribute_is_not_loaded() {
+        // #846 r1 M1: the load's extent and the cap read a `ref` the same
+        // way, so `xref="…"` names no block, with or without a real `ref`
+        // after it.
+        for f in [
+            r#"<f t="array" xref="A1:XFD1048576">1</f>"#,
+            r#"<f t="array" xref="A1:XFD1048576" ref="A1">1</f>"#,
+        ] {
+            let rows = format!(r#"<row r="1"><c r="A1">{f}<v>1</v></c></row>"#);
+            let mut pkg = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
+            let a1 = pkg.workbook.sheets[0].cell(0, 0).unwrap();
+            assert!(
+                a1.spill.is_none_or(|ext| ext == (1, 1)),
+                "{f}: {:?}",
+                a1.spill
+            );
+            let mut eng = crate::engine::Engine::new(&pkg.workbook);
+            eng.recalc_all(&mut pkg.workbook);
+            assert_eq!(pkg.workbook.sheets[0].cells.len(), 1, "{f}");
+        }
+    }
+
+    #[test]
+    fn the_cap_drops_an_extent_no_ref_backs() {
+        // #846 r1 M1: whatever set a loaded extent, the cap keeps it only
+        // where a `ref` from the cell names exactly that block.
+        let mut sheet = Sheet::default();
+        let mut a1 = Cell::formula("1");
+        a1.f_attrs = Some(r#" t="array" ref="A1""#.into());
+        a1.spill = Some((crate::sheet::MAX_ROWS, crate::sheet::MAX_COLS));
+        sheet.cells.insert((0, 0), a1);
+        let mut b1 = Cell::formula("1");
+        b1.f_attrs = Some(r#" t="array" ref="B1:B2""#.into());
+        b1.spill = Some((2, 1));
+        sheet.cells.insert((0, 1), b1);
+        cap_array_refs(&mut sheet);
+        assert_eq!(sheet.cell(0, 0).unwrap().spill, None);
+        assert_eq!(sheet.cell(0, 1).unwrap().spill, Some((2, 1)));
     }
 
     #[test]
