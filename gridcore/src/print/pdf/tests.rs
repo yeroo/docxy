@@ -18,7 +18,7 @@ fn opts() -> PdfOptions {
     }
 }
 
-fn pdf_of(wb: &Workbook, sheets: Vec<usize>) -> Result<Vec<u8>, NothingToPrint> {
+fn pdf_of(wb: &Workbook, sheets: Vec<usize>) -> Result<Vec<u8>, PrintError> {
     let pages = paginate(wb, &Job::new(What::ActiveSheets(sheets)));
     to_pdf(wb, &pages, &opts())
 }
@@ -74,9 +74,9 @@ fn clip_of(pdf: &[u8], text: &str) -> (f64, f64, f64, f64) {
 fn an_empty_sheet_is_nothing_to_print() {
     let mut wb = Workbook::default();
     wb.sheets.push(sheet("Empty"));
-    assert_eq!(pdf_of(&wb, vec![0]), Err(NothingToPrint));
+    assert_eq!(pdf_of(&wb, vec![0]), Err(PrintError::NothingToPrint));
     assert_eq!(
-        NothingToPrint.to_string(),
+        PrintError::NothingToPrint.to_string(),
         "We didn't find anything to print."
     );
 }
@@ -286,4 +286,49 @@ fn landscape_pages_are_turned_and_text_outside_cp1252_is_a_question_mark() {
     assert!(raw.contains("/MediaBox [0 0 792 612]"), "{raw}");
     assert!(pdf.windows(4).any(|w| w == b"Gr\xFC\xDF"), "Latin-1 kept");
     assert!(raw.contains("\\(ok\\) ??) Tj"), "{raw}");
+}
+
+#[test]
+fn cp1252s_high_row_is_kept_and_anything_else_is_a_question_mark() {
+    let mut wb = Workbook::default();
+    let mut s = sheet("S");
+    s.set_cell(0, 0, Cell::text("Brand™ Œuvre €5 — “ok”"));
+    wb.sheets.push(s);
+    let pdf = pdf_of(&wb, vec![0]).unwrap();
+    let want: &[u8] = b"(Brand\x99 \x8Cuvre \x805 \x97 \x93ok\x94) Tj";
+    assert!(pdf.windows(want.len()).any(|w| w == want));
+    assert_eq!(winansi('Ā'), b'?');
+    assert_eq!(winansi('\u{81}'), b'?', "unused in cp1252");
+}
+
+#[test]
+fn a_selection_with_nothing_in_it_is_nothing_to_print() {
+    let mut wb = Workbook::default();
+    let mut s = sheet("S");
+    s.set_cell(0, 0, Cell::number(1.0));
+    wb.sheets.push(s);
+    let pages = paginate(
+        &wb,
+        &Job::new(What::Selection {
+            sheet: 0,
+            ranges: vec![(99, 25, 100, 25)],
+        }),
+    );
+    assert_eq!(
+        to_pdf(&wb, &pages, &opts()),
+        Err(PrintError::NothingToPrint)
+    );
+}
+
+#[test]
+fn a_job_cut_short_is_refused() {
+    let mut wb = Workbook::default();
+    let mut s = sheet("S");
+    s.set_cell(0, 0, Cell::number(1.0));
+    wb.sheets.push(s);
+    let mut pages = paginate(&wb, &Job::new(What::ActiveSheets(vec![0])));
+    pages.truncated = true;
+    let e = to_pdf(&wb, &pages, &opts()).unwrap_err();
+    assert_eq!(e, PrintError::TooManyPages);
+    assert!(e.to_string().contains("100000 pages"), "{e}");
 }

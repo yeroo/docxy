@@ -96,7 +96,14 @@ pub struct Pages {
     pub pages: Vec<Page>,
     /// How many pages the whole job has: `&N`.
     pub total: u32,
+    /// The job has more than [`MAX_PAGES`] pages; layout stopped there.
+    pub truncated: bool,
 }
+
+/// The most pages one job lays out. A used area that runs to the sheet's
+/// last row prints a few thousand pages even at 10 %; past this, the job is
+/// cut short and [`Pages::truncated`] says so.
+pub const MAX_PAGES: usize = 100_000;
 
 /// Maximum digit width of the default font (Calibri 11) in pixels.
 const MDW: f64 = 7.0;
@@ -294,6 +301,31 @@ fn manual(breaks: &[crate::sheet::PageBreak]) -> Vec<u32> {
         .collect()
 }
 
+/// The manual breaks a sheet's pages obey: (rows, cols). None while `Fit to`
+/// is on, which ignores them, as Excel does.
+fn obeyed_breaks(s: &Sheet) -> (Vec<u32>, Vec<u32>) {
+    if s.page_setup.fit_to_page {
+        (Vec::new(), Vec::new())
+    } else {
+        (manual(&s.row_breaks), manual(&s.col_breaks))
+    }
+}
+
+/// `rect` cut down to its printed cells: from its top-left corner to the
+/// last row and column inside it that hold a printed cell. `None` when it
+/// holds none, so an empty selection prints nothing.
+fn printed_extent(wb: &Workbook, sheet: usize, (r1, c1, r2, c2): Rect) -> Option<Rect> {
+    let s = &wb.sheets[sheet];
+    let mut last: Option<(u32, u32)> = None;
+    for &(r, c) in s.cells.keys() {
+        if (r1..=r2).contains(&r) && (c1..=c2).contains(&c) && prints(wb, s, r, c) {
+            let (lr, lc) = last.unwrap_or((r1, c1));
+            last = Some((lr.max(r), lc.max(c)));
+        }
+    }
+    last.map(|(r, c)| (r1, c1, r, c))
+}
+
 /// The scale a sheet prints at: `Adjust to`, or with `Fit to` the largest
 /// whole percentage (10–100) at which every range fits.
 fn sheet_scale(wb: &Workbook, sheet: usize, ranges: &[Rect]) -> f64 {
@@ -308,7 +340,7 @@ fn sheet_scale(wb: &Workbook, sheet: usize, ranges: &[Rect]) -> f64 {
     let (room_w, room_h) = body_points(wb, sheet);
     let t = print_titles(wb, sheet);
     let (tr, tc) = (titles(s, t.rows, true), titles(s, t.cols, false));
-    let (rb, cb) = (manual(&s.row_breaks), manual(&s.col_breaks));
+    let (rb, cb) = obeyed_breaks(s);
     let axes: Vec<(Axis, Axis)> = ranges
         .iter()
         .map(|&(r1, c1, r2, c2)| (axis(s, r1, r2, true), axis(s, c1, c2, false)))
@@ -337,15 +369,16 @@ fn sheet_scale(wb: &Workbook, sheet: usize, ranges: &[Rect]) -> f64 {
     f64::from(lo) / 100.0
 }
 
-/// The pages of one sheet's ranges, numbered from 1 within the sheet.
-fn sheet_pages(wb: &Workbook, sheet: usize, ranges: &[Rect]) -> Vec<Page> {
+/// The pages of one sheet's ranges, numbered from 1 within the sheet, at
+/// most `budget` of them; `true` when more were cut off.
+fn sheet_pages(wb: &Workbook, sheet: usize, ranges: &[Rect], budget: usize) -> (Vec<Page>, bool) {
     let s = &wb.sheets[sheet];
     let ps = &s.page_setup;
     let scale = sheet_scale(wb, sheet, ranges);
     let (room_w, room_h) = body_points(wb, sheet);
     let t = print_titles(wb, sheet);
     let (tr, tc) = (titles(s, t.rows, true), titles(s, t.cols, false));
-    let (rb, cb) = (manual(&s.row_breaks), manual(&s.col_breaks));
+    let (rb, cb) = obeyed_breaks(s);
     let mut out = Vec::new();
     for &(r1, c1, r2, c2) in ranges {
         let rows = axis(s, r1, r2, true);
@@ -355,6 +388,9 @@ fn sheet_pages(wb: &Workbook, sheet: usize, ranges: &[Rect]) -> Vec<Page> {
         }
         let row_bands = bands(&rows, &tr, room_h, scale, &rb);
         let col_bands = bands(&cols, &tc, room_w, scale, &cb);
+        if out.len() + row_bands.len().saturating_mul(col_bands.len()) > budget {
+            return (out, true);
+        }
         let mut grid = Vec::new();
         match ps.page_order {
             PageOrder::DownThenOver => {
@@ -395,7 +431,7 @@ fn sheet_pages(wb: &Workbook, sheet: usize, ranges: &[Rect]) -> Vec<Page> {
             });
         }
     }
-    out
+    (out, false)
 }
 
 /// Lay out a print job. No pages means there is nothing to print.
@@ -410,15 +446,23 @@ pub fn paginate(wb: &Workbook, job: &Job) -> Pages {
             .filter(|&i| !wb.sheets[i].hidden)
             .map(|i| (i, sheet_ranges(wb, i, job.ignore_print_areas)))
             .collect(),
-        What::Selection { sheet, ranges } if *sheet < wb.sheets.len() => {
-            vec![(*sheet, ranges.clone())]
-        }
+        // Only as far as the printed cells: `A:A` prints the used rows, and
+        // a range with nothing in it prints nothing.
+        What::Selection { sheet, ranges } if *sheet < wb.sheets.len() => vec![(
+            *sheet,
+            ranges
+                .iter()
+                .filter_map(|&r| printed_extent(wb, *sheet, r))
+                .collect(),
+        )],
         What::Selection { .. } => Vec::new(),
     };
     let mut all = Vec::new();
     let mut next = 1u32;
+    let mut truncated = false;
     for (sheet, ranges) in jobs {
-        let mut pages = sheet_pages(wb, sheet, &ranges);
+        let (mut pages, cut) = sheet_pages(wb, sheet, &ranges, MAX_PAGES - all.len());
+        truncated |= cut;
         if pages.is_empty() {
             continue;
         }
@@ -430,6 +474,9 @@ pub fn paginate(wb: &Workbook, job: &Job) -> Pages {
             next += 1;
         }
         all.extend(pages);
+        if truncated {
+            break;
+        }
     }
     let total = all.len() as u32;
     let from = job.from.unwrap_or(1).max(1);
@@ -443,7 +490,11 @@ pub fn paginate(wb: &Workbook, job: &Job) -> Pages {
         })
         .map(|(_, p)| p)
         .collect();
-    Pages { pages, total }
+    Pages {
+        pages,
+        total,
+        truncated,
+    }
 }
 
 #[cfg(test)]

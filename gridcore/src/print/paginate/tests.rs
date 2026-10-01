@@ -331,3 +331,55 @@ fn a_selection_prints_each_range_on_its_own_pages() {
         vec![(0, 0, 1, 1), (5, 5, 6, 6)]
     );
 }
+
+#[test]
+fn whole_column_and_whole_sheet_selections_print_only_the_used_cells() {
+    // FIX r1 C1: `A:A` and `A:XFD` over a small sheet.
+    let wb = book(&[(100, 13)]);
+    let used = active(&wb).total;
+    let sel = |ranges| paginate(&wb, &Job::new(What::Selection { sheet: 0, ranges }));
+    let a = sel(vec![(0, 0, MAX_ROWS - 1, 0)]);
+    assert_eq!(
+        ranges(&a),
+        vec![(0, 0, 44, 0), (45, 0, 89, 0), (90, 0, 99, 0)]
+    );
+    let all = sel(vec![(0, 0, MAX_ROWS - 1, MAX_COLS - 1)]);
+    assert_eq!(all.total, used);
+    assert!(!all.truncated);
+    // A range with nothing in it prints nothing.
+    assert_eq!(sel(vec![(99, 25, 100, 25)]).total, 0);
+    assert_eq!(sel(vec![(200, 0, 300, 3), (0, 0, 1, 1)]).total, 1);
+}
+
+#[test]
+fn a_job_past_the_page_limit_is_cut_short() {
+    let mut wb = book(&[(1, 1)]);
+    // A cell in the sheet's last row and column: about 2,300 pages down by
+    // 154 across at 10 %.
+    wb.sheets[0].set_cell(MAX_ROWS - 1, MAX_COLS - 1, Cell::number(1.0));
+    wb.sheets[0].page_setup.scale = 10;
+    let p = active(&wb);
+    assert!(p.truncated);
+    assert!(p.pages.len() <= MAX_PAGES);
+}
+
+#[test]
+fn fit_to_ignores_manual_breaks() {
+    // FIX r1 M1: Excel prints a fitted sheet on its pages whatever breaks
+    // it carries.
+    let mut wb = book(&[(30, 3)]);
+    wb.sheets[0].row_breaks.push(PageBreak {
+        id: 13,
+        attrs: " max=\"16383\" man=\"1\"".into(),
+    });
+    let ps = &mut wb.sheets[0].page_setup;
+    ps.fit_to_page = true;
+    ps.fit_width = 1;
+    ps.fit_height = 1;
+    let p = active(&wb);
+    assert_eq!(p.total, 1);
+    assert_eq!(p.pages[0].scale, 1.0);
+    // Without Fit to, the break holds.
+    wb.sheets[0].page_setup.fit_to_page = false;
+    assert_eq!(active(&wb).total, 2);
+}

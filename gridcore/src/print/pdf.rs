@@ -17,17 +17,29 @@ use super::paginate::{Page, Pages, body_points, col_points, heading_points, row_
 use super::setup::PrintErrors;
 use crate::sheet::{Align, CellValue, Workbook, col_name, format_with};
 
-/// "We didn't find anything to print." (FIL-103): the job has no pages.
+/// Why a job writes no PDF.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NothingToPrint;
+pub enum PrintError {
+    /// "We didn't find anything to print." (FIL-103): the job has no pages.
+    NothingToPrint,
+    /// The job has more than [`super::paginate::MAX_PAGES`] pages.
+    TooManyPages,
+}
 
-impl std::fmt::Display for NothingToPrint {
+impl std::fmt::Display for PrintError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("We didn't find anything to print.")
+        match self {
+            PrintError::NothingToPrint => f.write_str("We didn't find anything to print."),
+            PrintError::TooManyPages => write!(
+                f,
+                "This would print more than {} pages; set a print area or select less.",
+                super::paginate::MAX_PAGES
+            ),
+        }
     }
 }
 
-impl std::error::Error for NothingToPrint {}
+impl std::error::Error for PrintError {}
 
 /// What the header and footer fields print that the workbook doesn't know.
 #[derive(Clone, Debug, Default)]
@@ -86,22 +98,45 @@ pub fn text_width(s: &str, bold: bool, size: f64) -> f64 {
     f64::from(units) / 1000.0 * size
 }
 
-/// A char as one WinAnsi byte; anything else is `?`.
+/// A char as one WinAnsi (cp1252) byte; anything else is `?`.
 fn winansi(ch: char) -> u8 {
+    // cp1252's 0x80–0x9F row; 0x81, 0x8D, 0x8F, 0x90 and 0x9D are unused.
+    const HIGH: [(char, u8); 27] = [
+        ('€', 0x80),
+        ('‚', 0x82),
+        ('ƒ', 0x83),
+        ('„', 0x84),
+        ('…', 0x85),
+        ('†', 0x86),
+        ('‡', 0x87),
+        ('ˆ', 0x88),
+        ('‰', 0x89),
+        ('Š', 0x8A),
+        ('‹', 0x8B),
+        ('Œ', 0x8C),
+        ('Ž', 0x8E),
+        ('‘', 0x91),
+        ('’', 0x92),
+        ('“', 0x93),
+        ('”', 0x94),
+        ('•', 0x95),
+        ('–', 0x96),
+        ('—', 0x97),
+        ('˜', 0x98),
+        ('™', 0x99),
+        ('š', 0x9A),
+        ('›', 0x9B),
+        ('œ', 0x9C),
+        ('ž', 0x9E),
+        ('Ÿ', 0x9F),
+    ];
     match ch as u32 {
-        0x20AC => 0x80,
-        0x201A => 0x82,
-        0x2026 => 0x85,
-        0x2022 => 0x95,
-        0x2013 => 0x96,
-        0x2014 => 0x97,
-        0x2018 => 0x91,
-        0x2019 => 0x92,
-        0x201C => 0x93,
-        0x201D => 0x94,
         u @ 0x20..=0x7E => u as u8,
         u @ 0xA0..=0xFF => u as u8,
-        _ => b'?',
+        _ => HIGH
+            .iter()
+            .find(|(c, _)| *c == ch)
+            .map_or(b'?', |&(_, b)| b),
     }
 }
 
@@ -487,11 +522,15 @@ fn draw_page(wb: &Workbook, page: &Page, total: u32, opts: &PdfOptions) -> (f64,
     (pw, ph, c.out)
 }
 
-/// The pages as a PDF. No pages is [`NothingToPrint`], and nothing is
-/// written.
-pub fn to_pdf(wb: &Workbook, pages: &Pages, opts: &PdfOptions) -> Result<Vec<u8>, NothingToPrint> {
+/// The pages as a PDF. No pages is [`PrintError::NothingToPrint`], a job
+/// cut short at [`super::paginate::MAX_PAGES`] is
+/// [`PrintError::TooManyPages`], and either writes nothing.
+pub fn to_pdf(wb: &Workbook, pages: &Pages, opts: &PdfOptions) -> Result<Vec<u8>, PrintError> {
+    if pages.truncated {
+        return Err(PrintError::TooManyPages);
+    }
     if pages.pages.is_empty() {
-        return Err(NothingToPrint);
+        return Err(PrintError::NothingToPrint);
     }
     // Objects: 1 Catalog, 2 Pages, 3–6 fonts, then per page content + page.
     let mut objs: Vec<Vec<u8>> = vec![Vec::new(), Vec::new()];

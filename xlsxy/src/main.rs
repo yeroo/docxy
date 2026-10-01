@@ -100,7 +100,7 @@ pub(crate) fn print_pdf(
     wb: &gridcore::sheet::Workbook,
     job: &gridcore::print::paginate::Job,
     path: &str,
-) -> Result<(Vec<u8>, u32), gridcore::print::pdf::NothingToPrint> {
+) -> Result<(Vec<u8>, u32), gridcore::print::pdf::PrintError> {
     let pages = gridcore::print::paginate::paginate(wb, job);
     let serial = now_serial().unwrap_or(0.0);
     let fmt = |code: &str| {
