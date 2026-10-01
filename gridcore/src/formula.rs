@@ -5221,16 +5221,21 @@ pub fn file_formula(src: &str) -> Cow<'_, str> {
 pub fn display_formula(src: &str) -> String {
     // Strip prefixes only outside string literals and quoted sheet names,
     // so a literal such as "_xlfn." or a sheet 'x SINGLE(1)' survives
-    // verbatim.
+    // verbatim. A bracketed spec loses only `_xlpm.`, which a LAMBDA's
+    // optional parameter (`[_xlpm.y]`) carries; a column `[_xlfn.x]` stays.
     let b = src.as_bytes();
     let mut out = String::new();
     let mut seg_start = 0usize;
     let mut i = 0usize;
     while i < b.len() {
-        if matches!(b[i], b'"' | b'\'') {
+        if is_quote_open(b[i]) {
             out.push_str(&strip_prefixes(&src[seg_start..i]));
-            let end = literal_end(b, i);
-            out.push_str(&src[i..end]);
+            let end = skip_quoted(b, i);
+            if b[i] == b'[' {
+                out.push_str(&src[i..end].replace("_xlpm.", ""));
+            } else {
+                out.push_str(&src[i..end]);
+            }
             i = end;
             seg_start = i;
         } else {
@@ -5243,13 +5248,40 @@ pub fn display_formula(src: &str) -> String {
     rewrite_calls(&out)
 }
 
-/// The end of the string literal (`"…"`) or quoted sheet name (`'…'`)
-/// whose opening quote is at `start`: just past its closing quote (a doubled
-/// quote inside is an escaped one), or the end of the text when it is
-/// unclosed.
-fn literal_end(b: &[u8], start: usize) -> usize {
+/// Whether `c` opens a run of formula text whose bytes mean nothing to a
+/// scan for names and parens: a string literal, a quoted sheet name or a
+/// structured-reference spec ([`skip_quoted`]).
+pub(crate) fn is_quote_open(c: u8) -> bool {
+    matches!(c, b'"' | b'\'' | b'[')
+}
+
+/// The end of the run [`is_quote_open`] starts at `start`, as the lexer
+/// reads it: just past the closing quote of a string literal (`"…"`) or a
+/// quoted sheet name (`'…'`), a doubled quote inside being an escaped one;
+/// just past the matching `]` of a structured-reference spec (`[…]`, which
+/// nests, and in which `'` escapes the next byte, as in `Table1[Item '#]`).
+/// The end of the text when the run is unclosed.
+pub(crate) fn skip_quoted(b: &[u8], start: usize) -> usize {
     let q = b[start];
     let mut i = start + 1;
+    if q == b'[' {
+        let mut depth = 1usize;
+        while i < b.len() {
+            match b[i] {
+                b'\'' => i += 1,
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i + 1;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        return b.len();
+    }
     while i < b.len() {
         if b[i] == q {
             if b.get(i + 1) == Some(&q) {
@@ -5284,8 +5316,8 @@ fn rewrite_calls(s: &str) -> String {
     let mut pos = 0usize;
     let mut i = 0usize;
     while i < b.len() {
-        if matches!(b[i], b'"' | b'\'') {
-            i = literal_end(b, i);
+        if is_quote_open(b[i]) {
+            i = skip_quoted(b, i);
             continue;
         }
         // Left word boundary: the char before the name must not continue an
@@ -5311,8 +5343,8 @@ fn rewrite_calls(s: &str) -> String {
         let mut j = open;
         while j < b.len() {
             match b[j] {
-                b'"' | b'\'' => {
-                    j = literal_end(b, j);
+                c if is_quote_open(c) => {
+                    j = skip_quoted(b, j);
                     continue;
                 }
                 b'(' => depth += 1,
@@ -12006,6 +12038,31 @@ mod tests {
             ("'_xlfn.x'!A1+_xlfn.SINGLE(B1)", "'_xlfn.x'!A1+@B1"),
             ("_xlfn.SINGLE('a\"b'!A1)+_xlfn.SINGLE(C1)", "@'a\"b'!A1+@C1"),
             ("_xlfn.SINGLE('it''s )'!A1)", "@'it''s )'!A1"),
+        ] {
+            assert_eq!(display_formula(stored), shown, "{stored}");
+        }
+        // A structured-reference spec is read as the lexer reads it: a `'`
+        // escapes the next byte, and nothing inside (`'`, `"`, parens, a
+        // function prefix) counts (#876 r3).
+        for (stored, shown) in [
+            ("Table1[Item '#]+_xlfn.SINGLE(A1)", "Table1[Item '#]+@A1"),
+            (
+                "_xlfn.SINGLE(Orders[Order '#])+_xlfn.XLOOKUP(A1,B:B,C:C)",
+                "@Orders[Order '#]+XLOOKUP(A1,B:B,C:C)",
+            ),
+            ("T['#a]+_xlfn.SINGLE(B1)+T['#b]", "T['#a]+@B1+T['#b]"),
+            ("T[a\"b]+_xlfn.SINGLE(A1)", "T[a\"b]+@A1"),
+            (
+                "_xlfn.SINGLE(T[[#This Row],[Item '#]])+_xlfn.SINGLE(C1)",
+                "@T[[#This Row],[Item '#]]+@C1",
+            ),
+            ("_xlfn.SINGLE(T[a)b])", "@T[a)b]"),
+            ("T[x '] y]+_xlfn.SINGLE(A1)", "T[x '] y]+@A1"),
+            ("T[_xlfn.x]+_xlfn.SINGLE(A1)", "T[_xlfn.x]+@A1"),
+            (
+                "_xlfn.LAMBDA(_xlpm.x,[_xlpm.y],_xlpm.x)(1)",
+                "LAMBDA(x,[y],x)(1)",
+            ),
         ] {
             assert_eq!(display_formula(stored), shown, "{stored}");
         }

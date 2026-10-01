@@ -530,46 +530,48 @@ pub(crate) fn sheet_prefix(first: &str, last: &str) -> String {
 /// quoted (as the readers spell it) or bare (the printer leaves a
 /// non-ASCII name bare, and `retarget` reprints a formula that names a
 /// renamed sheet too); a bare one is quoted, since a `:` needs it. String
-/// literals are left alone.
+/// literals and structured-reference specs are left alone.
 fn restore_colons(src: &str) -> String {
+    use crate::formula::{is_quote_open, skip_quoted};
     // What the printer leaves bare in a name (ASCII letters, digits, `_`,
     // anything past ASCII), and `.`.
     let bare = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.') || !c.is_ascii();
-    let chars: Vec<char> = src.chars().collect();
+    let b = src.as_bytes();
     let mut out = String::with_capacity(src.len());
-    let mut quote: Option<char> = None;
     let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        match (quote, c) {
-            (None, '"' | '\'') => quote = Some(c),
-            // `''` / `""` inside closes and reopens: same result.
-            (Some(q), _) if c == q => quote = None,
-            (Some('\''), COLON) => {
-                out.push(':');
-                i += 1;
-                continue;
+    while i < b.len() {
+        // A literal, a quoted name or a structured-reference spec, read as
+        // the lexer reads it; only a quoted name can be a qualifier.
+        if is_quote_open(b[i]) {
+            let end = skip_quoted(b, i);
+            if b[i] == b'\'' {
+                out.push_str(&src[i..end].replace(COLON, ":"));
+            } else {
+                out.push_str(&src[i..end]);
             }
-            (None, _) if bare(c) => {
-                // A bare name: a qualifier when `!` follows.
-                let start = i;
-                while i < chars.len() && bare(chars[i]) {
-                    i += 1;
-                }
-                let name: String = chars[start..i].iter().collect();
-                if name.contains(COLON) && chars.get(i) == Some(&'!') {
-                    out.push('\'');
-                    out.push_str(&name.replace(COLON, ":"));
-                    out.push('\'');
-                } else {
-                    out.push_str(&name);
-                }
-                continue;
-            }
-            _ => {}
+            i = end;
+            continue;
         }
-        out.push(c);
-        i += 1;
+        let start = i;
+        for c in src[i..].chars().take_while(|&c| bare(c)) {
+            i += c.len_utf8();
+        }
+        if i == start {
+            // Not a name: an operator, a paren, `!`.
+            let c = src[i..].chars().next().unwrap_or_default();
+            out.push(c);
+            i += c.len_utf8().max(1);
+            continue;
+        }
+        // A bare name: a qualifier when `!` follows.
+        let name = &src[start..i];
+        if name.contains(COLON) && b.get(i) == Some(&b'!') {
+            out.push('\'');
+            out.push_str(&name.replace(COLON, ":"));
+            out.push('\'');
+        } else {
+            out.push_str(name);
+        }
     }
     out
 }
@@ -1038,6 +1040,20 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("too many repeated cells")
+        );
+    }
+
+    /// A spec's `'` escapes its next byte; it opens no quoted name, so what
+    /// follows the spec is still read (#876 r3).
+    #[test]
+    fn restore_colons_reads_structured_references_as_the_lexer_does() {
+        assert_eq!(
+            restore_colons("T[Item '#]+'X\u{FDD0}Y'!A1+X\u{FDD0}Y!B1"),
+            "T[Item '#]+'X:Y'!A1+'X:Y'!B1"
+        );
+        assert_eq!(
+            restore_colons("T[[#This Row],[a'[\u{FDD0}]]&'X\u{FDD0}Y'!A1"),
+            "T[[#This Row],[a'[\u{FDD0}]]&'X:Y'!A1"
         );
     }
 
