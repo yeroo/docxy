@@ -182,18 +182,19 @@ impl Engine {
     ///
     /// A formula whose text differs from the one in the cell is typed: it is
     /// ours now, modern (it spills), and its preserved `<f>` attributes go. The
-    /// same text again (a restyle clones the cell; re-committing the editor
-    /// unchanged builds a fresh one) keeps what the formula was — a loaded
+    /// same text again (re-committing the editor unchanged builds a fresh
+    /// cell; a pasted clone) keeps what the formula was — a loaded
     /// legacy formula stays legacy, a CSE array keeps its `<f>` attributes, a
-    /// dynamic array stays one.
+    /// dynamic array stays one. A restyle is not an edit: it goes through
+    /// [`Engine::set_styles`], which leaves a spill whole.
     pub fn set_cell(&mut self, wb: &mut Workbook, key: Key, mut cell: Cell) {
         let (s, r, c) = key;
         let prev = wb.sheets.get(s).and_then(|sh| sh.cell(r, c));
         match prev.filter(|p| cell.formula.is_some() && p.formula == cell.formula) {
             // What kind of formula it is comes from the cell's own previous
             // formula alone — not from the incoming cell, which may be a fresh
-            // one (Enter), a restyled clone, or a clone pasted from another
-            // address whose `ref`/`si`/`cm` are not this cell's.
+            // one (Enter) or a clone pasted from another address whose
+            // `ref`/`si`/`cm` are not this cell's.
             Some(p) => {
                 cell.f_attrs = p.f_attrs.clone();
                 own_array_ref(&mut cell, r, c);
@@ -211,6 +212,40 @@ impl Engine {
             None => {}
         }
         self.put_cell(wb, key, cell);
+    }
+
+    /// Restyle cells on sheet `sheet`: `(row, col, style)` sets only each
+    /// cell's style index. Value, formula, spill and metadata are untouched,
+    /// so restyling a spilled cell leaves the spill whole (an edit through
+    /// [`Engine::set_cell`] would break it). A blank cell restyled to the
+    /// default style is dropped, as [`Sheet::set_cell`] does. One recalculation
+    /// follows, so formulas that read a style (`CELL("format")`) see it.
+    pub fn set_styles(&mut self, wb: &mut Workbook, sheet: usize, styles: &[(u32, u32, u32)]) {
+        let Some(sh) = wb.sheets.get_mut(sheet) else {
+            return;
+        };
+        for &(r, c, style) in styles {
+            match sh.cells.get_mut(&(r, c)) {
+                Some(cell) => {
+                    cell.style = style;
+                    if cell.is_blank() && style == 0 {
+                        sh.cells.remove(&(r, c));
+                    }
+                }
+                None if style != 0 => {
+                    sh.cells.insert(
+                        (r, c),
+                        Cell {
+                            style,
+                            ..Cell::default()
+                        },
+                    );
+                }
+                None => {}
+            }
+        }
+        let keys: Vec<Key> = styles.iter().map(|&(r, c, _)| (sheet, r, c)).collect();
+        self.recalc_from(wb, &keys);
     }
 
     /// Put a cell back exactly as it was (undo/redo): its `<f>` attributes and
@@ -2260,6 +2295,118 @@ mod tests {
         for (name, v) in [("D1", 1.0), ("D2", 2.0), ("D3", 3.0)] {
             assert_eq!(value_at(&wb, name), CellValue::Number(v), "{name}");
         }
+    }
+
+    fn spill_of(wb: &Workbook, name: &str) -> Option<(u32, u32)> {
+        let (r, c) = crate::sheet::parse_cell_name(name).unwrap();
+        wb.sheets[0].cell(r, c).and_then(|cl| cl.spill)
+    }
+
+    fn style_of(wb: &Workbook, name: &str) -> u32 {
+        let (r, c) = crate::sheet::parse_cell_name(name).unwrap();
+        wb.sheets[0].cell(r, c).map_or(0, |cl| cl.style)
+    }
+
+    #[test]
+    fn restyling_a_whole_spill_keeps_it() {
+        // #784: formatting a spill block (or one member) changes styles only.
+        let mut wb = wb_one_sheet(&[]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "D1", Cell::formula("SEQUENCE(3)"));
+        assert_eq!(spill_of(&wb, "D1"), Some((3, 1)));
+        eng.set_styles(&mut wb, 0, &[(0, 3, 1), (1, 3, 1), (2, 3, 1)]);
+        assert_eq!(spill_of(&wb, "D1"), Some((3, 1)));
+        for (i, name) in ["D1", "D2", "D3"].into_iter().enumerate() {
+            assert_eq!(value_at(&wb, name), CellValue::Number(i as f64 + 1.0));
+            assert_eq!(style_of(&wb, name), 1, "{name}");
+        }
+        // A lone member.
+        eng.set_styles(&mut wb, 0, &[(1, 3, 2)]);
+        assert_eq!(spill_of(&wb, "D1"), Some((3, 1)));
+        assert_eq!(value_at(&wb, "D2"), CellValue::Number(2.0));
+        assert_eq!(style_of(&wb, "D2"), 2);
+        assert_eq!(style_of(&wb, "D3"), 1);
+    }
+
+    #[test]
+    fn restyling_a_legacy_array_keeps_it() {
+        let mut cse = Cell::formula("A1:A3*2");
+        cse.f_attrs = Some(" t=\"array\" ref=\"D1:D3\"".to_string());
+        cse.meta = Some(Box::new(CellMeta {
+            cm: Some("1".to_string()),
+            ..CellMeta::default()
+        }));
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("A2", Cell::number(2.0)),
+            ("A3", Cell::number(3.0)),
+            ("D1", cse),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(spill_of(&wb, "D1"), Some((3, 1)));
+        let before = wb.sheets[0].cell(0, 3).cloned().unwrap();
+        eng.set_styles(&mut wb, 0, &[(0, 3, 1), (1, 3, 1), (2, 3, 1)]);
+        assert_eq!(spill_of(&wb, "D1"), Some((3, 1)));
+        for (i, name) in ["D1", "D2", "D3"].into_iter().enumerate() {
+            assert_eq!(
+                value_at(&wb, name),
+                CellValue::Number(2.0 * (i as f64 + 1.0))
+            );
+            assert_eq!(style_of(&wb, name), 1, "{name}");
+        }
+        let after = wb.sheets[0].cell(0, 3).unwrap();
+        assert_eq!(after.f_attrs, before.f_attrs);
+        assert_eq!(after.meta, before.meta);
+    }
+
+    #[test]
+    fn restyle_recalcs_cell_format_dependents() {
+        // A style is read by CELL("format"): restyling must recalc its
+        // readers (this part held before #784 too) and keep the spill.
+        let mut wb = wb_one_sheet(&[("C1", Cell::formula("CELL(\"format\",D2)"))]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "D1", Cell::formula("SEQUENCE(3)"));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Text("G".into()));
+        let mut xf = wb.styles.xf(0);
+        xf.set_code(Some("0.00".to_string()));
+        let idx = wb.styles.intern(xf);
+        eng.set_styles(&mut wb, 0, &[(1, 3, idx)]);
+        assert_eq!(value_at(&wb, "C1"), CellValue::Text("F2".into()));
+        assert_eq!(spill_of(&wb, "D1"), Some((3, 1)));
+        assert_eq!(value_at(&wb, "D2"), CellValue::Number(2.0));
+    }
+
+    #[test]
+    fn resubmitting_a_spilled_value_still_breaks_the_spill() {
+        // Guard: an entry into a spill breaks it even when it equals the
+        // spilled value (only a restyle, through set_styles, does not).
+        let mut wb = wb_one_sheet(&[]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "D1", Cell::formula("SEQUENCE(3)"));
+        set(&mut eng, &mut wb, "D2", Cell::number(2.0));
+        assert_eq!(value_at(&wb, "D1"), CellValue::Error("#SPILL!".into()));
+        assert_eq!(spill_of(&wb, "D1"), None);
+    }
+
+    #[test]
+    fn set_styles_leaves_no_blank_cells() {
+        let mut wb = wb_one_sheet(&[("A1", Cell::number(5.0))]);
+        let mut eng = Engine::new(&wb);
+        // Default style on an absent cell creates nothing.
+        eng.set_styles(&mut wb, 0, &[(0, 1, 0)]);
+        assert!(wb.sheets[0].cell(0, 1).is_none());
+        // Styling a blank cell creates it; restoring the default drops it.
+        eng.set_styles(&mut wb, 0, &[(0, 1, 3)]);
+        assert_eq!(style_of(&wb, "B1"), 3);
+        eng.set_styles(&mut wb, 0, &[(0, 1, 0)]);
+        assert!(wb.sheets[0].cell(0, 1).is_none());
+        // A cell with content keeps it at the default style.
+        eng.set_styles(&mut wb, 0, &[(0, 0, 3), (0, 0, 0)]);
+        assert_eq!(value_at(&wb, "A1"), CellValue::Number(5.0));
+        // An out-of-range sheet is ignored.
+        eng.set_styles(&mut wb, 9, &[(0, 0, 3)]);
+        assert_eq!(style_of(&wb, "A1"), 0);
     }
 
     #[test]

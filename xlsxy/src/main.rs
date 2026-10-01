@@ -1160,6 +1160,22 @@ type CellChanges = Vec<(u32, u32, Cell)>;
 struct UndoGroup {
     sheet: usize,
     changes: Vec<(u32, u32, Option<Cell>, Option<Cell>)>,
+    /// A restyle ([`App::apply_styles_on`]): undo/redo put back only each
+    /// cell's style, so a spill the cells belong to stays whole.
+    styles_only: bool,
+}
+
+/// The `(row, col, style)` a restyle group puts back: the style of each
+/// change's `before` or `after` cell (picked by `side`), default if absent.
+fn group_styles(
+    group: &UndoGroup,
+    side: impl Fn(&(u32, u32, Option<Cell>, Option<Cell>)) -> &Option<Cell>,
+) -> Vec<(u32, u32, u32)> {
+    group
+        .changes
+        .iter()
+        .map(|ch| (ch.0, ch.1, side(ch).as_ref().map_or(0, |cl| cl.style)))
+        .collect()
 }
 
 /// Sheets + defined names — the whole calculated state, snapshotted around
@@ -1732,6 +1748,7 @@ impl App {
             let mut group = UndoGroup {
                 sheet: sheet_idx,
                 changes: Vec::with_capacity(changes.len()),
+                styles_only: false,
             };
             for (r, c, cell) in changes {
                 let before = self.pkg.workbook.sheets[sheet_idx].cell(r, c).cloned();
@@ -1743,6 +1760,41 @@ impl App {
             undo.push(group);
         }
         self.undo.push(UndoAction::Cells(undo));
+        self.redo.clear();
+        self.modified = true;
+        self.warn_new_circles(&circles_before);
+    }
+
+    /// Restyle cells on sheet `sheet_idx` — `(row, col, style index)` — as one
+    /// undo group. Only styles change ([`Engine::set_styles`]): a value,
+    /// formula or spill is never re-entered, so formatting a spilled block
+    /// keeps the spill.
+    fn apply_styles_on(&mut self, sheet_idx: usize, styles: Vec<(u32, u32, u32)>) {
+        if styles.is_empty() {
+            return;
+        }
+        let circles_before = self.engine.circular_refs();
+        self.engine.clock = now_serial();
+        let before: Vec<Option<Cell>> = {
+            let sheet = &self.pkg.workbook.sheets[sheet_idx];
+            styles
+                .iter()
+                .map(|&(r, c, _)| sheet.cell(r, c).cloned())
+                .collect()
+        };
+        self.engine
+            .set_styles(&mut self.pkg.workbook, sheet_idx, &styles);
+        let sheet = &self.pkg.workbook.sheets[sheet_idx];
+        let changes = styles
+            .iter()
+            .zip(before)
+            .map(|(&(r, c, _), before)| (r, c, before, sheet.cell(r, c).cloned()))
+            .collect();
+        self.undo.push(UndoAction::Cells(vec![UndoGroup {
+            sheet: sheet_idx,
+            changes,
+            styles_only: true,
+        }]));
         self.redo.clear();
         self.modified = true;
         self.warn_new_circles(&circles_before);
@@ -2269,6 +2321,12 @@ impl App {
         match self.undo.pop() {
             Some(UndoAction::Cells(groups)) => {
                 for group in groups.iter().rev() {
+                    if group.styles_only {
+                        let styles = group_styles(group, |ch| &ch.2);
+                        self.engine
+                            .set_styles(&mut self.pkg.workbook, group.sheet, &styles);
+                        continue;
+                    }
                     for &(r, c, ref before, _) in group.changes.iter().rev() {
                         let cell = before.clone().unwrap_or_default();
                         self.engine
@@ -2303,6 +2361,12 @@ impl App {
         match self.redo.pop() {
             Some(UndoAction::Cells(groups)) => {
                 for group in &groups {
+                    if group.styles_only {
+                        let styles = group_styles(group, |ch| &ch.3);
+                        self.engine
+                            .set_styles(&mut self.pkg.workbook, group.sheet, &styles);
+                        continue;
+                    }
                     for &(r, c, _, ref after) in group.changes.iter() {
                         let cell = after.clone().unwrap_or_default();
                         self.engine
@@ -3150,28 +3214,25 @@ impl App {
     /// result so styles aren't duplicated), as one undoable edit.
     fn apply_format(&mut self, f: impl Fn(&mut Xf)) {
         let (r1, c1, r2, c2) = self.iter_selection();
-        let snapshot: Vec<(u32, u32, Option<Cell>)> = {
+        let snapshot: Vec<(u32, u32, u32)> = {
             let sheet = self.sheet();
             let mut v = Vec::new();
             for r in r1..=r2 {
                 for c in c1..=c2 {
-                    v.push((r, c, sheet.cell(r, c).cloned()));
+                    v.push((r, c, sheet.cell(r, c).map_or(0, |cl| cl.style)));
                 }
             }
             v
         };
-        let mut changes = Vec::new();
-        for (r, c, existing) in snapshot {
-            let cur = existing.as_ref().map(|cl| cl.style).unwrap_or(0);
+        let mut styles = Vec::new();
+        for (r, c, cur) in snapshot {
             let mut xf = self.pkg.workbook.styles.xf(cur);
             f(&mut xf);
             let idx = self.pkg.workbook.styles.intern(xf);
-            // Preserve value/formula/spill; change only the style.
-            let mut cell = existing.unwrap_or_default();
-            cell.style = idx;
-            changes.push((r, c, cell));
+            styles.push((r, c, idx));
         }
-        self.apply(changes);
+        // Only styles change: a spilled block stays spilled (#784).
+        self.apply_styles_on(self.sheet, styles);
     }
 
     fn toggle_bold(&mut self) {
@@ -8838,6 +8899,105 @@ mod tests {
             )),
             "{ws}"
         );
+    }
+
+    /// An app with `formula` typed into D1 (spilling down column D).
+    fn app_with_spill(formula: &str) -> App {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.apply(vec![(0, 3, Cell::formula(formula))]);
+        assert_eq!(app.sheet().cell(0, 3).unwrap().spill, Some((3, 1)));
+        app
+    }
+
+    /// D1 still spills over D1:D3, and each of D1:D3 is (not) bold.
+    fn assert_spill_bold(app: &App, bold: bool, when: &str) {
+        let anchor = app.sheet().cell(0, 3).unwrap();
+        assert_eq!(anchor.spill, Some((3, 1)), "{when}: {:?}", anchor.value);
+        for r in 0..3 {
+            let cell = app.sheet().cell(r, 3).unwrap();
+            assert!(!cell.value.is_empty(), "{when}: D{}", r + 1);
+            let xf = app.pkg.workbook.styles.xf(cell.style);
+            assert_eq!(xf.bold, bold, "{when}: D{}", r + 1);
+        }
+    }
+
+    #[test]
+    fn bold_on_a_spill_block_keeps_the_spill_through_undo_redo() {
+        // #784: formatting a whole spilled block left D1 #SPILL!.
+        let mut app = app_with_spill("SEQUENCE(3)");
+        app.anchor = Some((0, 3));
+        app.cur = (2, 3);
+        app.toggle_bold();
+        assert_spill_bold(&app, true, "bold");
+        for r in 0..3 {
+            let v = app.sheet().cell(r, 3).unwrap().value.clone();
+            assert_eq!(v, CellValue::Number(f64::from(r + 1)));
+        }
+        app.undo();
+        assert_spill_bold(&app, false, "undo");
+        app.redo();
+        assert_spill_bold(&app, true, "redo");
+    }
+
+    #[test]
+    fn bold_on_one_spill_member_keeps_the_spill_through_undo_redo() {
+        let mut app = app_with_spill("SEQUENCE(3)");
+        app.anchor = None;
+        app.cur = (1, 3);
+        app.toggle_bold();
+        let bold_at = |app: &App, r: u32| {
+            let style = app.sheet().cell(r, 3).unwrap().style;
+            app.pkg.workbook.styles.xf(style).bold
+        };
+        let check = |app: &App, d2_bold: bool, when: &str| {
+            assert_eq!(
+                app.sheet().cell(0, 3).unwrap().spill,
+                Some((3, 1)),
+                "{when}"
+            );
+            assert_eq!(
+                app.sheet().cell(1, 3).unwrap().value,
+                CellValue::Number(2.0),
+                "{when}"
+            );
+            assert_eq!(bold_at(app, 1), d2_bold, "{when}");
+            assert!(!bold_at(app, 0) && !bold_at(app, 2), "{when}");
+        };
+        check(&app, true, "bold");
+        app.undo();
+        check(&app, false, "undo");
+        app.redo();
+        check(&app, true, "redo");
+    }
+
+    #[test]
+    fn bold_on_a_randarray_spill_keeps_it_through_undo_redo() {
+        // Volatile: every recalc redraws the values, so a restyle's undo must
+        // not hinge on the cells' values being unchanged.
+        let mut app = app_with_spill("RANDARRAY(3)");
+        app.anchor = Some((0, 3));
+        app.cur = (2, 3);
+        app.toggle_bold();
+        assert_spill_bold(&app, true, "bold");
+        app.undo();
+        assert_spill_bold(&app, false, "undo");
+        app.redo();
+        assert_spill_bold(&app, true, "redo");
+    }
+
+    #[test]
+    fn undo_bold_on_an_empty_cell_leaves_no_cell() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.cur = (0, 0);
+        app.anchor = None;
+        app.toggle_bold();
+        assert!(app.sheet().cell(0, 0).is_some_and(|cl| cl.style != 0));
+        app.undo();
+        assert!(app.sheet().cell(0, 0).is_none());
+        app.redo();
+        assert!(app.sheet().cell(0, 0).is_some_and(|cl| cl.style != 0));
     }
 
     /// A legacy CSE block over D1:D3 with a 1x1 result (nothing spills).
