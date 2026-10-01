@@ -5291,9 +5291,12 @@ fn rewrite_calls(s: &str) -> String {
             let pc = b[i - 1];
             !(pc.is_ascii_alphanumeric() || pc == b'_')
         };
+        // Bytes, not `&s[i..]`: `i` steps over every byte, inside a non-ASCII
+        // char too. The names are ASCII, so a match starts on a char
+        // boundary and so do `open`, `close` and `pos`.
         let Some(pat) = ["ANCHORARRAY(", "SINGLE("]
             .into_iter()
-            .find(|p| left_ok && s[i..].starts_with(p))
+            .find(|p| left_ok && b[i..].starts_with(p.as_bytes()))
         else {
             i += 1;
             continue;
@@ -11978,6 +11981,19 @@ mod tests {
         }
         // Unbalanced text stays as it is.
         assert_eq!(display_formula("_xlfn.SINGLE(A1"), "SINGLE(A1");
+        // Non-ASCII outside a literal: a sheet name, a bare name, a LET
+        // name, one right before a call, and one inside its argument.
+        for (stored, shown) in [
+            ("'Données'!A1", "'Données'!A1"),
+            ("Données!A1+Ünit", "Données!A1+Ünit"),
+            ("_xlfn.LET(_xlpm.größe,2,größe*2)", "LET(größe,2,größe*2)"),
+            ("Données+_xlfn.SINGLE(A1)", "Données+@A1"),
+            ("é_xlfn.SINGLE(A1)", "é@A1"),
+            ("_xlfn.SINGLE(Données!A1:A3)", "@Données!A1:A3"),
+            ("_xlfn.ANCHORARRAY('日本'!B2)", "'日本'!B2#"),
+        ] {
+            assert_eq!(display_formula(stored), shown, "{stored}");
+        }
     }
 
     #[test]
