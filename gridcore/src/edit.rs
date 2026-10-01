@@ -2891,13 +2891,6 @@ mod tests {
         w
     }
 
-    fn num(w: &Workbook, name: &str) -> CellValue {
-        let (r, c) = parse_cell_name(name).unwrap();
-        w.sheets[0]
-            .cell(r, c)
-            .map_or(CellValue::Empty, |cl| cl.value.clone())
-    }
-
     #[test]
     fn deleting_a_row_inside_a_spill_shrinks_it_and_keeps_user_data() {
         let mut w = cse_column_block(0);
@@ -2905,10 +2898,10 @@ mod tests {
         // Before any recalc: the stored extent already matches the block.
         assert_eq!(w.sheets[0].cell(0, 3).unwrap().spill, Some((2, 1)));
         Engine::new(&w).recalc_all(&mut w);
-        assert_eq!(num(&w, "D1"), CellValue::Number(2.0));
-        assert_eq!(num(&w, "D2"), CellValue::Number(6.0));
+        assert_eq!(value_at(&w, "D1"), CellValue::Number(2.0));
+        assert_eq!(value_at(&w, "D2"), CellValue::Number(6.0));
         // The user's 99 moved up into the old extent; the rebuild leaves it.
-        assert_eq!(num(&w, "D3"), CellValue::Number(99.0));
+        assert_eq!(value_at(&w, "D3"), CellValue::Number(99.0));
     }
 
     #[test]
@@ -2920,7 +2913,7 @@ mod tests {
         // Its own moved-down values are still its own: no #SPILL!.
         let d: Vec<_> = ["D1", "D2", "D3", "D4"]
             .iter()
-            .map(|n| num(&w, n))
+            .map(|n| value_at(&w, n))
             .collect();
         assert_eq!(
             d,
@@ -2928,7 +2921,7 @@ mod tests {
             "{d:?}"
         );
         assert_eq!(w.sheets[0].cell(0, 3).unwrap().spill, Some((4, 1)));
-        assert_eq!(num(&w, "D5"), CellValue::Number(99.0));
+        assert_eq!(value_at(&w, "D5"), CellValue::Number(99.0));
     }
 
     #[test]
@@ -2950,9 +2943,9 @@ mod tests {
         delete_cols(&mut w, 0, 1, 1);
         assert_eq!(w.sheets[0].cell(2, 0).unwrap().spill, Some((1, 2)));
         Engine::new(&w).recalc_all(&mut w);
-        assert_eq!(num(&w, "A3"), CellValue::Number(2.0));
-        assert_eq!(num(&w, "B3"), CellValue::Number(6.0));
-        assert_eq!(num(&w, "C3"), CellValue::Number(99.0));
+        assert_eq!(value_at(&w, "A3"), CellValue::Number(2.0));
+        assert_eq!(value_at(&w, "B3"), CellValue::Number(6.0));
+        assert_eq!(value_at(&w, "C3"), CellValue::Number(99.0));
     }
 
     #[test]
