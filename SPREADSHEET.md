@@ -29,6 +29,10 @@ bold/italic/color); reproducing Excel's visual styling is a non-goal.
   chart is regenerated and a moved/deleted drawing has its anchor rewritten;
   untouched ones still round-trip verbatim.
 - Headless CLI: `xlsxy in.xlsx --recalc out.xlsx`, `xlsxy in.xlsx --csv out.csv`.
+- Legacy formats (#603): `xlsxy book.xls` (also `.xlsb`, `.ods`) imports the
+  values, formulas, number formats, date system and defined names through
+  `gridcore::legacy`; other formatting is not imported, and Ctrl+S writes
+  `book.xlsx` beside the original.
 
 **Non-goals (at least initially)**
 - Full visual formatting *editing* (fonts, fills, borders); v1 renders what the
@@ -425,7 +429,8 @@ The strategic piece: **conformance is measured, not claimed.**
   keys); `model_pivot` groups by any related column and evaluates measures
   per group with **filter context** propagated through the relationships.
   xlsxy opens `.csv` files directly (imported as a workbook, saved as
-  `.xlsx`). The TUI surface shipped: `Ctrl-M` opens the model view (tables,
+  `.xlsx`), and `.xls`/`.xlsb`/`.ods` the same way (values, formulas, number
+  formats and names; not other formatting). The TUI surface shipped: `Ctrl-M` opens the model view (tables,
   relationships, measures) with prompt-driven editing — `r` relates
   `Sales[PID] = Products[ID]` (validated against the live tables), `m`
   defines `Total = SUM(Sales[Amount])`, `p` materializes a report

@@ -26,8 +26,8 @@ reads/writes MSPDI, and keeps its own native package, `.yppx`.
   plumbing). No third-party dependencies.
 - **`yppxy`** — the TUI (ratatui): task outline + live terminal Gantt, the same
   ribbon/backstage UX as docxy/xlsxy.
-- **`mppread`** — `std`-only reader for the OLE2 Compound File container of
-  legacy binary `.mpp`/`.doc`/`.xls` files.
+- **`mppread`** — `std`-only reader of MS Project `.mpp` files, on top of
+  `opccore`'s OLE2 Compound File (MS-CFB) reader.
 
 ## `projcore` layers
 

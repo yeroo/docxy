@@ -21,10 +21,21 @@ against the `.xlsx`:
 - (h) (b), (f) and (g) still hold after `save_xlsx` and a reload.
 
 Each exception is a commented entry in the test's `ALLOW` list, which the
-test prints. Two come from the fixtures themselves rather than the readers:
-Excel read the source's unquoted `SUM(Q1:Q3!A1:A1)` (calc-3d) with `Q1` as a
-cell, so the values it cached are `#VALUE!`; and an `.xls` has no tables, so
-Excel stored shape-salestable's structured references as plain ranges.
+test prints. There are eight, for three causes:
+
+- **calc-3d, all three formats (cached values):** Excel read the source's
+  unquoted `SUM(Q1:Q3!A1:A1)` with `Q1` as a cell, so the values it cached
+  are `#VALUE!`. gridcore recalculates the stored formula correctly.
+- **calc-refs.ods (sheet name, and the one formula naming it):** Excel's
+  `.ods` writer renamed the sheet "Calc Zone" to `Calc_Zone` in the file.
+- **shape-salestable, all three formats (the 12 formulas with structured
+  references):** they arrive as the ranges they cover. Excel wrote them that
+  way to the `.xls` (no tables) and the `.ods`; the `.xlsb` keeps its table,
+  but the import doesn't model tables, so the reader resolves them the same
+  way.
+
+So seven entries come from what Excel wrote, and one (the `.xlsb`
+structured references) from the reader not importing tables.
 
 ## Regenerating
 
