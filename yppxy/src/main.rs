@@ -993,6 +993,8 @@ impl App {
                 self.backstage = None;
                 self.export_md();
             }
+            // yppxy lists no extra exports.
+            BackstageEvent::ExportExtra(_) => {}
             BackstageEvent::Exit => self.request_exit(),
             // yppxy lists no editable Info rows, so this never arrives.
             BackstageEvent::EditInfo(_) => {}

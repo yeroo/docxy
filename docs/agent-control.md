@@ -583,8 +583,10 @@ id), so it lists alongside terminal instances (`docxy-<pid>` /
 windows that open a same-basename file, which would otherwise mint the same
 `<basename>-<n>` in both and clobber each other's discovery file. A tab exposes
 **exactly** the terminal verb
-surface, nothing more (except xlsxy's `wb.properties`/`wb.set-properties`, which
-only a terminal xlsxy answers so far; a tab answers `unknown verb`): a couple of internal-only verbs the extension host
+surface, nothing more (except xlsxy's `wb.properties`/`wb.set-properties` and the
+page-layout and printing verbs (`page.*`, `print-area.*`, `print-titles.set`,
+`page-break.*`, `print.pages`, `wb.export-pdf`), which only a terminal xlsxy
+answers so far; a tab answers `unknown verb`): a couple of internal-only verbs the extension host
 uses to compose its own `doc.path`/`wb.path` replies (`doc.blocks`, `wb.info`)
 are deliberately not in the tab's exposed verb set, and are rejected as
 `"unknown verb"` — same as a terminal instance, which has no arm for them at
@@ -742,8 +744,8 @@ Differences from a terminal pane:
 
 **Excel tabs** (`xlsxy-jetbrains-<basename>-<pid>-<n>` in xlsxy's ctl dir)
 serve the full xlsxy verb surface through `grid_ctl` (except
-`wb.properties`/`wb.set-properties`, terminal xlsxy only for now: a tab answers
-`unknown verb`), with the same host-verb
+`wb.properties`/`wb.set-properties` and the page-layout and printing verbs,
+terminal xlsxy only for now: a tab answers `unknown verb`), with the same host-verb
 split (`wb.path`/`wb.save`/`wb.reload`/`wb.open`; `wb.open` opens a new tab;
 `wb.info` internal). Every mutating agent verb lands as **one IDE undo step**
 driving the engine's own undo stack — the same mechanism the grid UI uses,
@@ -795,6 +797,15 @@ name and defaults to the active sheet):
 | `sheet.rename` | `{sheet,name}` | `{name}` — rewrites formula/defined-name references |
 | `row.insert` / `row.delete` | `{at,count?,sheet?}` | `{inserted\|deleted:N}` |
 | `col.insert` / `col.delete` | `{at,count?,sheet?}` | `{inserted\|deleted:N}` |
+| `page.setup` | `{sheet?\|sheets?, …fields}` | Terminal xlsxy only for now. The sheet's page layout. Settable fields: `margins:{left,right,top,bottom,header,footer}` (inches), `paperSize` (1 Letter, 9 A4, …), `orientation` (`portrait`/`landscape`/`default`), `scale`, `fitToPage`, `fitToWidth`, `fitToHeight` (0 = Automatic; absent in the file means 1), `firstPageNumber` (`null` = Auto), `pageOrder`, `blackAndWhite`, `draft`, `cellComments`, `errors`, `gridLines`, `headings`, `horizontalCentered`, `verticalCentered`, `differentOddEven`, `differentFirst`, `scaleWithDoc`, `alignWithMargins`. Reply-only (set them with their own verbs): `headers:{oddHeader…firstFooter}` (stored codes; `page.header`), `printArea` (`print-area.*`), `printTitles:{rows,cols}` (`print-titles.set`), `rowBreaks`, `colBreaks` (`page-break.*`). Any settable field given sets it and the reply adds `changed`; a reply-only key is an unknown field; the save rewrites only the attributes that changed. A fit count turns `fitToPage` on and `scale` turns it off, unless `fitToPage` is given. Scale outside 10–400, a fit count over 32767, a negative margin or an unknown field is an error and nothing changes. With `sheets`, the fields go to the first sheet and its page setup is then copied to the others, as Page Setup on grouped sheets does: print areas and titles stay each sheet's own, header pictures (`&G`) are not copied. One undo step |
+| `page.header` | `{sheet?, kind?:odd\|even\|first, part?:header\|footer, left?, center?, right?}` | Terminal xlsxy only for now. `{stored, left, center, right, changed}`. The three sections in the header editor's form: `&[Page]`, `&[Pages]`, `&[Date]`, `&[Time]`, `&[Path]`, `&[File]`, `&[Tab]` are stored as Excel's `&P`, `&N`, `&D`, `&T`, `&Z`, `&F`, `&A`; `&&` stays a literal ampersand; formatting codes (`&"Arial,Bold"`, `&12`) pass through. With none of `left`/`center`/`right` it only reads; when setting, an absent section is empty and all three empty removes the header. A section over 255 characters is refused, and so is `&L`, `&C` or `&R` inside a section (it would start another; type a literal ampersand as `&&`). `&[Picture]` is accepted only where the section already shows a picture (header pictures can't be inserted yet). One undo step |
+| `print-area.set` / `print-area.add` | `{range, sheet?}` | Terminal xlsxy only for now. `{printArea, changed}` — `range` is `A1:C10`, several ranges `A1:C10,E1:F5`, whole columns `A:C` or rows `1:5`; written as `Sheet1!$A$1:$C$10,…`. `add` appends to the print area (or sets one). One undo step |
+| `print-area.clear` | `{sheet?}` | Terminal xlsxy only for now. `{printArea:null, changed}`; the save removes the `_xlnm.Print_Area` name. One undo step when there was one |
+| `print-titles.set` | `{rows?, cols?, sheet?}` | Terminal xlsxy only for now. `{printTitles:{rows,cols}, changed}` — rows to repeat at top (`"1:2"`) and columns at left (`"A:A"`), written columns first; an absent key keeps that part, `null` or `""` clears it. They repeat on every page that doesn't already show them, except that titles that would fill a page by themselves, at the print scale, don't repeat (our rule; the spec is silent). One undo step |
+| `page-break.insert` / `page-break.remove` | `{cell, sheet?}` | Terminal xlsxy only for now. `{rowBreaks, colBreaks, changed}` — the manual breaks' ids (a row break with id 13 starts its page at row 14). Insert at a cell adds a break above it (unless it is in row 1) and left of it (unless it is in column A); remove takes the manual breaks bordering it. One undo step when something changed |
+| `page-break.reset` | `{sheet?}` | Terminal xlsxy only for now. `{rowBreaks, colBreaks, changed}` — Reset All Page Breaks: every manual break goes, automatic ones stay |
+| `print.pages` | `{what?, sheet?\|sheets?, range?, ignorePrintAreas?, from?, to?}` | Terminal xlsxy only for now. `{total, pages:[{sheet, name, range, number, titleRows, titleCols, scale}]}` — the pages printing lays out. `what`: `active` (default; `sheets`, `sheet` or the active sheet, each starting new pages), `workbook` (every visible sheet) or `selection` (`range` of `sheet`, comma-separated ranges each on pages of their own). A print area's ranges each start new pages; hidden rows and columns don't print, nor do hidden sheets with `workbook` (a hidden sheet named by `sheet`/`sheets`, or active, prints); title rows/columns repeat on pages that don't show them, except that titles that would fill a page by themselves, at the print scale, don't repeat; numbering continues across sheets and honours a first page number; `from`/`to` pick pages by position (1-based), `total` counts them all. A selected range prints only as far as its printed cells, and one with none prints nothing. A job over 100,000 pages is an error, `This would print more than 100000 pages; set a print area or select less.`, as for `wb.export-pdf` |
+| `wb.export-pdf` | `{path, …print.pages args}` | Terminal xlsxy only for now. `{path, pages}` — the job as PDF (the active sheet by default), the **live buffer**; `&D`/`&T` are the local date and time. Refuses to overwrite (`already exists: …`). Nothing to print errors with `We didn't find anything to print.` and writes no file, and so does a job over 100,000 pages (`print.pages`' error). Text outside Windows-1252 prints as `?` (standard PDF fonts). Doesn't mark the workbook modified |
 
 Notes:
 
@@ -911,8 +922,12 @@ MCP: `claude mcp add xlsxy -- xlsxy --mcp` → `xlsxy_list`, `xlsxy_new`,
 `xlsxy_row_insert`, `xlsxy_row_delete`, `xlsxy_col_insert`,
 `xlsxy_col_delete`, `xlsxy_eval`, `xlsxy_stats`, `xlsxy_charts`,
 `xlsxy_pivots`, `xlsxy_format`, `xlsxy_col_width`, `xlsxy_pivot_create`,
-`xlsxy_properties`, `xlsxy_set_properties` (35 total; docxy's 31 + xlsxy's 35 =
-**66 tools** total across both apps).
+`xlsxy_properties`, `xlsxy_set_properties`, `xlsxy_page_setup`,
+`xlsxy_page_header`, `xlsxy_print_area_set`, `xlsxy_print_area_add`,
+`xlsxy_print_area_clear`, `xlsxy_print_titles`, `xlsxy_page_break_insert`,
+`xlsxy_page_break_remove`, `xlsxy_page_break_reset`, `xlsxy_print_pages`,
+`xlsxy_export_pdf` (46 total; docxy's 31 + xlsxy's 46 = **77 tools** total
+across both apps).
 Skill: `xlsxy install skill`.
 
 **yppxy** (project schedule; tasks addressed by UID, durations like `3d`/`4h`):

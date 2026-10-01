@@ -1922,6 +1922,8 @@ impl App {
                 self.backstage = None;
                 false
             }
+            // docxy lists no extra exports.
+            BackstageEvent::ExportExtra(_) => false,
             BackstageEvent::Exit => {
                 self.request_exit();
                 self.quit_requested

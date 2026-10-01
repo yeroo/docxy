@@ -5,6 +5,7 @@
 //!   xlsxy <file.xlsx>                   open in the editor
 //!   xlsxy <in.xlsx> --recalc <out>      headless: recalculate and save
 //!   xlsxy <in.xlsx> --csv <out.csv>     headless: export the active sheet as CSV UTF-8
+//!   xlsxy <in.xlsx> --pdf <out.pdf>     headless: print the active sheet to PDF
 //!
 //! The engine lives in the pure `gridcore` crate; this binary is the TUI
 //! shell: a cell grid with Excel muscle memory (formula bar, A1 navigation,
@@ -82,7 +83,7 @@ fn export_csv_headless(
         Some(p) if opccore::fsio::same_file(p, Path::new(out)) => p.to_str().unwrap_or(source),
         _ => source,
     };
-    export_csv_bytes(source, import_source, out, &bytes)?;
+    export_bytes(source, import_source, out, &bytes)?;
     Ok(bytes.len())
 }
 
@@ -93,9 +94,61 @@ fn csv_utf8_bytes(sheet: &gridcore::sheet::Sheet, wb: &gridcore::sheet::Workbook
     gridcore::textio::encode(&csv, gridcore::textio::Encoding::Utf8Bom)
 }
 
-/// An imported text file stays protected independently of the rebound .xlsx
-/// save path. Either path can identify the destination through a filesystem alias.
-fn export_csv_bytes(
+/// A print job as PDF bytes: `&D`/`&T` from the local clock, `&Z`/`&F`
+/// from the workbook's `path`.
+pub(crate) fn print_pdf(
+    wb: &gridcore::sheet::Workbook,
+    job: &gridcore::print::paginate::Job,
+    path: &str,
+) -> Result<(Vec<u8>, u32), gridcore::print::pdf::PrintError> {
+    let pages = gridcore::print::paginate::paginate(wb, job);
+    let serial = now_serial().unwrap_or(0.0);
+    let fmt = |code: &str| {
+        gridcore::numfmt::parse_format(code)
+            .and_then(|f| f.format_number(serial, false))
+            .unwrap_or_default()
+    };
+    let abs = std::path::absolute(Path::new(path)).unwrap_or_else(|_| Path::new(path).into());
+    let opts = gridcore::print::pdf::PdfOptions {
+        date: fmt("m/d/yyyy"),
+        time: fmt("h:mm AM/PM"),
+        path: abs
+            .parent()
+            .map(|d| format!("{}{}", d.display(), std::path::MAIN_SEPARATOR))
+            .unwrap_or_default(),
+        file: abs
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    };
+    let bytes = gridcore::print::pdf::to_pdf(wb, &pages, &opts)?;
+    Ok((bytes, pages.pages.len() as u32))
+}
+
+/// `--pdf`: the active sheet printed to `out`, never over the workbook or
+/// its import source. A sheet with nothing to print writes no file.
+fn export_pdf_headless(
+    pkg: &SheetPackage,
+    source: &str,
+    import_source: Option<&str>,
+    out: &str,
+) -> Result<usize, String> {
+    let wb = &pkg.workbook;
+    let active = wb.active_tab.min(wb.sheets.len() - 1);
+    let job =
+        gridcore::print::paginate::Job::new(gridcore::print::paginate::What::ActiveSheets(vec![
+            active,
+        ]));
+    let (bytes, _) = print_pdf(wb, &job, source).map_err(|e| e.to_string())?;
+    export_bytes(source, import_source, out, &bytes).map_err(|e| e.to_string())?;
+    Ok(bytes.len())
+}
+
+/// Write an export (CSV, PDF, …) to `out` atomically, never over the
+/// workbook `source` or its import source: an imported text file stays
+/// protected independently of the rebound .xlsx save path. Either path can
+/// identify the destination through a filesystem alias.
+fn export_bytes(
     source: &str,
     import_source: Option<&str>,
     out: &str,
@@ -568,8 +621,8 @@ fn main() -> ExitCode {
             }
         },
         None => {
-            if parsed.recalc_out.is_some() || parsed.csv_out.is_some() {
-                eprintln!("error: headless modes (--recalc/--csv) require an input file");
+            if parsed.recalc_out.is_some() || parsed.csv_out.is_some() || parsed.pdf_out.is_some() {
+                eprintln!("error: headless modes (--recalc/--csv/--pdf) require an input file");
                 return ExitCode::from(2);
             }
             (new_xlsx(), "untitled.xlsx".to_string(), None, None)
@@ -635,6 +688,17 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
         println!("wrote {out} ({} bytes)", bytes.len());
+        return ExitCode::SUCCESS;
+    }
+
+    if let Some(out) = parsed.pdf_out {
+        match export_pdf_headless(&pkg, &path, import_source.as_deref(), &out) {
+            Ok(len) => println!("wrote {out} ({len} bytes)"),
+            Err(e) => {
+                eprintln!("error: {out}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
         return ExitCode::SUCCESS;
     }
 
@@ -916,6 +980,7 @@ struct Parsed {
     inputs: Vec<String>,
     recalc_out: Option<String>,
     csv_out: Option<String>,
+    pdf_out: Option<String>,
     verify: bool,
     help: bool,
     vim: bool,
@@ -928,6 +993,7 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
         inputs: Vec::new(),
         recalc_out: None,
         csv_out: None,
+        pdf_out: None,
         verify: false,
         help: false,
         vim: false,
@@ -948,6 +1014,10 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
                 i += 1;
                 p.csv_out = Some(args.get(i).ok_or("--csv needs an output path")?.clone());
             }
+            "--pdf" => {
+                i += 1;
+                p.pdf_out = Some(args.get(i).ok_or("--pdf needs an output path")?.clone());
+            }
             // A lone "-" is a filename-ish token, not an option; reject it
             // explicitly (stdin isn't supported) rather than as "unknown -".
             "-" => return Err("stdin (\"-\") is not supported; pass a file path".to_string()),
@@ -960,9 +1030,10 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     // surprise; reject the combination instead.
     let modes = usize::from(p.recalc_out.is_some())
         + usize::from(p.csv_out.is_some())
+        + usize::from(p.pdf_out.is_some())
         + usize::from(p.verify);
     if modes > 1 {
-        return Err("choose only one of --recalc, --csv, --verify".to_string());
+        return Err("choose only one of --recalc, --csv, --pdf, --verify".to_string());
     }
     Ok(p)
 }
@@ -977,6 +1048,7 @@ fn print_usage() {
            xlsxy <file.txt|.prn>            import text through the Text Import Wizard\n  \
            xlsxy <in> --recalc <out.xlsx>   recalculate all formulas, save, exit\n  \
            xlsxy <in> --csv <out.csv>       export the active sheet as CSV UTF-8, exit\n  \
+           xlsxy <in> --pdf <out.pdf>       print the active sheet to PDF, exit\n  \
            xlsxy <in> --verify              conformance scoreboard: recalculate\n  \
                                             and diff against Excel's cached values\n  \
            xlsxy <file> --vim               modal (vim) navigation: hjkl, v, dd, :w :q\n  \
@@ -2159,6 +2231,39 @@ impl App {
         };
         let (here, elsewhere): (Vec<_>, Vec<_>) = refs.iter().partition(|k| k.0 == self.sheet);
         here.iter().chain(elsewhere.iter()).map(name).collect()
+    }
+
+    /// Snapshot-run-snapshot for an edit to page layout (page setup, print
+    /// areas and titles, page breaks): `op` returns whether it changed
+    /// anything, and only a change lands on the undo stack and marks the
+    /// workbook modified. An error leaves the workbook as it was. No cell
+    /// moves, so nothing is recalculated.
+    fn layout_edit(
+        &mut self,
+        op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<bool, String>,
+    ) -> Result<bool, String> {
+        let before = WbSnapshot {
+            sheets: self.pkg.workbook.sheets.clone(),
+            names: self.pkg.workbook.defined_names.clone(),
+        };
+        match op(&mut self.pkg.workbook) {
+            Err(e) => {
+                self.pkg.workbook.sheets = before.sheets;
+                self.pkg.workbook.defined_names = before.names;
+                Err(e)
+            }
+            Ok(false) => Ok(false),
+            Ok(true) => {
+                let after = WbSnapshot {
+                    sheets: self.pkg.workbook.sheets.clone(),
+                    names: self.pkg.workbook.defined_names.clone(),
+                };
+                self.undo.push(UndoAction::Structural { before, after });
+                self.redo.clear();
+                self.modified = true;
+                Ok(true)
+            }
+        }
     }
 
     /// Snapshot-run-snapshot for structural edits (row/col ops, renames):
@@ -4357,7 +4462,8 @@ impl App {
                 .with_save_types(
                     &SAVE_TYPES,
                     "Export the current sheet as CSV UTF-8 next to the workbook",
-                ),
+                )
+                .with_extra_exports(&["Export the current sheet as PDF next to the workbook"]),
         );
         self.ribbon_focus = ribbon::Focus::None;
     }
@@ -4586,6 +4692,33 @@ impl App {
         self.comment_sel = 0;
     }
 
+    /// Print the current sheet to a `.pdf` next to the workbook. A sheet with
+    /// nothing to print says so and writes nothing.
+    fn export_pdf(&mut self) {
+        let job = gridcore::print::paginate::Job::new(
+            gridcore::print::paginate::What::ActiveSheets(vec![self.sheet]),
+        );
+        let out = match self.path.rsplit_once('.') {
+            Some((base, _)) => format!("{base}.pdf"),
+            None => format!("{}.pdf", self.path),
+        };
+        self.status = Some(match print_pdf(&self.pkg.workbook, &job, &self.path) {
+            Err(e) => e.to_string(),
+            Ok((pdf, pages)) => {
+                // Through the App's guarded write, like every App write (#882).
+                let source = export_source(&self.path, self.import_source.as_deref(), &out);
+                match self.write_export(Some(Path::new(source)), Path::new(&out), &pdf) {
+                    Ok(()) => format!(
+                        "Exported {out} ({pages} page{})",
+                        if pages == 1 { "" } else { "s" }
+                    ),
+                    Err(e) => format!("Export failed: {e}"),
+                }
+            }
+        });
+        self.backstage = None;
+    }
+
     /// Export the current sheet to a `.csv` (CSV UTF-8) next to the workbook.
     fn export_csv(&mut self) {
         let csv = csv_utf8_bytes(self.sheet(), &self.pkg.workbook);
@@ -4632,6 +4765,10 @@ impl App {
             }
             BackstageEvent::Export => {
                 self.export_csv();
+                false
+            }
+            BackstageEvent::ExportExtra(_) => {
+                self.export_pdf();
                 false
             }
             BackstageEvent::Exit => {
@@ -8959,7 +9096,8 @@ mod tests {
             .iter()
             .position(|t| t.label == "Text (Tab delimited)")
             .unwrap();
-        for _ in 0..=tab {
+        // Past the CSV and PDF exports to the type.
+        for _ in 0..=tab + 1 {
             app.backstage_key(key(KeyCode::Down));
         }
         app.backstage_key(key(KeyCode::Enter));
@@ -9378,6 +9516,58 @@ mod tests {
                 .unwrap()
                 .contains("(OpenDocument Spreadsheet)")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backstage_pdf_export_prints_the_current_sheet_next_to_the_workbook() {
+        let dir = std::env::temp_dir().join(format!("xlsxy-pdf-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = dir.join("book.xlsx");
+        let pdf = dir.join("book.pdf");
+        let _ = std::fs::remove_file(&pdf);
+        let mut app = App::new(new_xlsx(), book.to_str().unwrap());
+        app.export_pdf();
+        assert_eq!(
+            app.status.as_deref(),
+            Some("We didn't find anything to print.")
+        );
+        assert!(!pdf.exists());
+        app.pkg.workbook.sheets[0].set_cell(0, 0, gridcore::sheet::Cell::text("hello"));
+        app.export_pdf();
+        assert!(
+            app.status.as_deref().unwrap().ends_with("(1 page)"),
+            "{:?}",
+            app.status
+        );
+        let bytes = std::fs::read(&pdf).unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("(hello) Tj"));
+        assert!(app.backstage.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backstage_pdf_export_of_a_read_only_workbook_writes_the_pdf_only() {
+        // #882: a read-only workbook is never written; its PDF is a new file.
+        let dir = std::env::temp_dir().join(format!("xlsxy-pdf-ro-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = dir.join("book.xlsx");
+        let pdf = dir.join("book.pdf");
+        let _ = std::fs::remove_file(&pdf);
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].set_cell(0, 0, gridcore::sheet::Cell::text("hello"));
+        std::fs::write(&book, save_xlsx(&pkg)).unwrap();
+        let before = std::fs::read(&book).unwrap();
+        let mut app = App::new(pkg, book.to_str().unwrap());
+        app.set_read_only(book.to_str().unwrap());
+        app.export_pdf();
+        assert!(
+            app.status.as_deref().unwrap().starts_with("Exported"),
+            "{:?}",
+            app.status
+        );
+        assert!(String::from_utf8_lossy(&std::fs::read(&pdf).unwrap()).contains("(hello) Tj"));
+        assert_eq!(std::fs::read(&book).unwrap(), before);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -13909,6 +14099,19 @@ mod tests {
         );
         assert!(parse_args(&["-".into()]).is_err());
         assert!(parse_args(&["a.xlsx".into(), "--recalc".into(), "o.xlsx".into()]).is_ok());
+        let p = parse_args(&["a.xlsx".into(), "--pdf".into(), "o.pdf".into()]).unwrap();
+        assert_eq!(p.pdf_out.as_deref(), Some("o.pdf"));
+        assert!(parse_args(&["a.xlsx".into(), "--pdf".into()]).is_err());
+        assert!(
+            parse_args(&[
+                "a.xlsx".into(),
+                "--pdf".into(),
+                "o.pdf".into(),
+                "--csv".into(),
+                "o.csv".into()
+            ])
+            .is_err()
+        );
     }
 
     /// #882: `--read-only` and `-r` are flags, not files or unknown options,

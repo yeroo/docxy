@@ -22,6 +22,7 @@ use opccore::xml::{Event, XmlParser};
 use opccore::zip::ZipArchive;
 use opccore::zipwrite::write_zip;
 
+mod page;
 mod repair;
 pub use repair::{Repairs, load_xlsx_repair};
 
@@ -299,7 +300,7 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
     // localSheetId counts workbook.xml order; map it to model indices in
     // case a sheet part is missing and gets skipped.
     let mut orig_to_model: Vec<Option<usize>> = Vec::new();
-    for (name, rid) in sheet_meta {
+    for (name, rid, hidden) in sheet_meta {
         let part = rels
             .iter()
             .find(|(id, _, _)| *id == rid)
@@ -328,6 +329,7 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
 
         let mut sheet = parse_worksheet(&xml, &shared, &hlink_targets);
         sheet.name = name;
+        sheet.hidden = hidden;
         sheet.auto_filter =
             sheet_auto_filter_span(&xml).and_then(|(s, e)| auto_filter_position(&xml[s..e]));
         let sheet_idx = sheets.len();
@@ -827,7 +829,7 @@ pub(crate) fn parse_rels_mode(xml: &str) -> Vec<(String, String, String, Option<
 fn parse_workbook_xml(
     xml: &str,
 ) -> (
-    Vec<(String, String)>,
+    Vec<(String, String, bool)>,
     bool,
     Option<(u32, f64)>,
     Vec<(String, Option<usize>, String)>,
@@ -854,7 +856,8 @@ fn parse_workbook_xml(
                             }
                         }
                     }
-                    sheets.push((name, rid));
+                    let hidden = matches!(p.attr("state"), "hidden" | "veryHidden");
+                    sheets.push((name, rid, hidden));
                 }
                 "workbookPr" => {
                     let v = p.attr("date1904");
@@ -1803,6 +1806,21 @@ fn parse_worksheet(
                     }
                 }
                 "customSheetViews" => in_custom_views = true,
+                // The defaults rows and columns without their own size take.
+                "sheetFormatPr" if !in_custom_views => {
+                    let num = |a: &str| {
+                        p.attr(a)
+                            .trim()
+                            .parse::<f64>()
+                            .ok()
+                            .filter(|v| v.is_finite() && *v >= 0.0)
+                    };
+                    sheet.format = crate::sheet::SheetFormat {
+                        default_col_width: num("defaultColWidth"),
+                        base_col_width: num("baseColWidth").map_or(8, |v| v as u32),
+                        default_row_height: num("defaultRowHeight"),
+                    };
+                }
                 "rowBreaks" if !in_custom_views => in_breaks = Some(true),
                 "colBreaks" if !in_custom_views => in_breaks = Some(false),
                 "brk" => match in_breaks {
@@ -2024,6 +2042,8 @@ fn parse_worksheet(
     // were never set), which is what we write back — Excel accepts expanded
     // formulas in place of shared groups.
     cap_array_refs(&mut sheet);
+    sheet.page_setup = page::read_page_setup(xml);
+    sheet.page_setup_loaded = sheet.page_setup.clone();
     sheet
 }
 
@@ -3611,6 +3631,8 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
     // edit moved them.
     let out = set_page_breaks(out, "rowBreaks", &sheet.row_breaks);
     let out = set_page_breaks(out, "colBreaks", &sheet.col_breaks);
+    // Page setup: only the attributes that changed since the load.
+    let out = page::set_page_setup(&out, &sheet.page_setup, &sheet.page_setup_loaded);
     // The sheet's autoFilter: rewritten only where a structural edit moved it.
     let out = set_auto_filter(out, sheet.auto_filter.as_ref());
     // Conditional formatting and data validation: likewise.
@@ -4095,11 +4117,15 @@ fn set_auto_filter(mut xml: String, model: Option<&crate::sheet::SheetAutoFilter
 
 /// Sync one `<rowBreaks>` / `<colBreaks>` element from the model. It is left
 /// byte-for-byte alone while it holds exactly the model's breaks, rewritten
-/// (with its counts) when they differ, dropped when none are left, and never
-/// created: nothing adds breaks yet, so a missing element has nothing to say.
+/// (with its counts) when they differ, dropped when none are left, and
+/// created at its schema position when breaks were inserted on a sheet that
+/// had none.
 fn set_page_breaks(mut xml: String, tag: &str, breaks: &[crate::sheet::PageBreak]) -> String {
     let Some((start, end)) = sheet_breaks_span(&xml, tag) else {
-        return xml;
+        if breaks.is_empty() {
+            return xml;
+        }
+        return put_worksheet_child(&xml, tag, &page_breaks_block(tag, breaks), None, false);
     };
     if parse_page_breaks(&xml[start..end]) == breaks {
         return xml;
@@ -4107,15 +4133,7 @@ fn set_page_breaks(mut xml: String, tag: &str, breaks: &[crate::sheet::PageBreak
     let block = if breaks.is_empty() {
         String::new()
     } else {
-        let manual = breaks.iter().filter(|b| b.is_manual()).count();
-        let mut block = format!(
-            "<{tag} count=\"{}\" manualBreakCount=\"{manual}\">",
-            breaks.len()
-        );
-        for b in breaks {
-            block.push_str(&format!("<brk id=\"{}\"{}/>", b.id, b.attrs));
-        }
-        block.push_str(&format!("</{tag}>"));
+        let block = page_breaks_block(tag, breaks);
         match worksheet_root(&xml) {
             Some(root) => in_worksheet_ns(&root, &block),
             None => block,
@@ -4123,6 +4141,20 @@ fn set_page_breaks(mut xml: String, tag: &str, breaks: &[crate::sheet::PageBreak
     };
     xml.replace_range(start..end, &block);
     xml
+}
+
+/// A `<rowBreaks>` / `<colBreaks>` element (unprefixed) holding `breaks`.
+fn page_breaks_block(tag: &str, breaks: &[crate::sheet::PageBreak]) -> String {
+    let manual = breaks.iter().filter(|b| b.is_manual()).count();
+    let mut block = format!(
+        "<{tag} count=\"{}\" manualBreakCount=\"{manual}\">",
+        breaks.len()
+    );
+    for b in breaks {
+        block.push_str(&format!("<brk id=\"{}\"{}/>", b.id, b.attrs));
+    }
+    block.push_str(&format!("</{tag}>"));
+    block
 }
 
 /// Where the sheet's own `<rowBreaks>` / `<colBreaks>` element is (in any
@@ -5044,6 +5076,10 @@ fn patch_sheet_names(xml: &str, sheets: &[Sheet]) -> String {
 /// `localSheetId`), a scoped one only when the scopes line up and no element
 /// has that name and scope. `_xlnm._FilterDatabase` is never added, since a
 /// save never adds the `<autoFilter>` it backs.
+///
+/// One kind of element is removed: a sheet's print area or print titles
+/// that the model no longer holds, under the same alignment rule (see
+/// [`patch_defined_name`]).
 fn patch_defined_names(xml: &str, names: &[DefinedName], sheet_count: usize) -> String {
     let aligned = xml.matches("<sheet ").count() == sheet_count;
     // (start, end, replacement): element contents, and where new names go.
@@ -5086,7 +5122,11 @@ fn patch_defined_names(xml: &str, names: &[DefinedName], sheet_count: usize) -> 
                             continue;
                         }
                         depth -= 1; // its end tag is consumed here
-                        if !patch_defined_name(xml, &mut p, key, names, &mut edits) {
+                        let ctx = NameCtx {
+                            start: p.start_pos(),
+                            sheet_count,
+                        };
+                        if !patch_defined_name(xml, &mut p, key, names, ctx, &mut edits) {
                             break;
                         }
                     }
@@ -5174,14 +5214,34 @@ fn patch_defined_names(xml: &str, names: &[DefinedName], sheet_count: usize) -> 
     out
 }
 
+/// Where a `<definedName>` element starts, and how many sheets the model
+/// has, for [`patch_defined_name`].
+struct NameCtx {
+    start: usize,
+    sheet_count: usize,
+}
+
+/// The built-in names a save deletes once the model has none of them for a
+/// sheet: Clear Print Area, and clearing the print titles.
+fn removable_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("_xlnm.Print_Area") || name.eq_ignore_ascii_case("_xlnm.Print_Titles")
+}
+
 /// Queue the new content of the `<definedName>` whose start tag the parser is
 /// on (not a self-closing one) where the model's definition differs, and
 /// leave the parser past its end tag. `false` when the part ends first.
+///
+/// A `_xlnm.Print_Area` or `_xlnm.Print_Titles` element whose (name, scope)
+/// the model no longer has is queued for removal instead: Clear Print Area
+/// and clearing the titles delete the name. Only for a scoped key naming a
+/// model sheet (`scope < sheet_count`), which `key` already is only while the
+/// sheets line up; any other name the model lacks stays.
 fn patch_defined_name(
     xml: &str,
     p: &mut XmlParser,
     key: Option<(String, Option<usize>)>,
     names: &[DefinedName],
+    ctx: NameCtx,
     edits: &mut Vec<(usize, usize, String)>,
 ) -> bool {
     let body_start = p.pos();
@@ -5203,7 +5263,22 @@ fn patch_defined_name(
     let Some(body_end) = body_end else {
         return false;
     };
-    let model = key.filter(|_| !nested).and_then(|(name, scope)| {
+    let key = key.filter(|_| !nested);
+    // A print area or titles the model no longer has, for a sheet the key
+    // names reliably (it is only scoped while the sheets line up), was
+    // cleared: its element goes.
+    if let Some((name, Some(scope))) = &key {
+        if removable_name(name)
+            && *scope < ctx.sheet_count
+            && !names
+                .iter()
+                .any(|d| d.scope == Some(*scope) && d.name.eq_ignore_ascii_case(name))
+        {
+            edits.push((ctx.start, p.pos(), String::new()));
+            return true;
+        }
+    }
+    let model = key.and_then(|(name, scope)| {
         let mut hits = names
             .iter()
             .filter(|d| d.scope == scope && d.name.eq_ignore_ascii_case(&name));

@@ -32,10 +32,12 @@ pub fn draw(f: &mut Frame, area: Rect, bs: &mut Backstage, host: &dyn BackstageH
     };
     let list_h = (area.height as usize).saturating_sub(3).max(1);
     bs.layout.list_start = if bs.item == Item::Export {
-        // Export's type rows start 6 rows down; keep the selection in view.
-        let rows = (area.height as usize).saturating_sub(7).max(1);
+        // Export's type rows start 6 rows down, past the extra exports; keep
+        // the selection in view.
+        let extra = bs.export_extra.len();
+        let rows = (area.height as usize).saturating_sub(7 + extra).max(1);
         bs.export_sel
-            .saturating_sub(1)
+            .saturating_sub(1 + extra)
             .saturating_sub(rows - 1)
             .min(bs.save_types.len().saturating_sub(rows))
     } else {
@@ -315,14 +317,18 @@ fn draw_export(f: &mut Frame, area: Rect, bs: &Backstage, host: &dyn BackstageHo
             },
         )
     };
+    let extra = bs.export_extra.len();
     let mut lines = vec![
         RLine::styled(" Export", bold),
         RLine::raw(""),
         row(format!(" {}", bs.export_quick), bs.export_sel == 0),
-        RLine::raw(""),
-        RLine::styled(" Change File Type", bold),
     ];
-    let rows = (area.height as usize).saturating_sub(6).max(1);
+    for (i, label) in bs.export_extra.iter().enumerate() {
+        lines.push(row(format!(" {label}"), bs.export_sel == i + 1));
+    }
+    lines.push(RLine::raw(""));
+    lines.push(RLine::styled(" Change File Type", bold));
+    let rows = (area.height as usize).saturating_sub(6 + extra).max(1);
     for (i, t) in bs
         .save_types
         .iter()
@@ -332,7 +338,7 @@ fn draw_export(f: &mut Frame, area: Rect, bs: &Backstage, host: &dyn BackstageHo
     {
         lines.push(row(
             format!("   {} (*.{})", t.label, t.ext),
-            bs.export_sel == i + 1,
+            bs.export_sel == i + 1 + extra,
         ));
     }
     f.render_widget(Paragraph::new(lines), area);
@@ -502,7 +508,8 @@ mod tests {
     fn draws_save_as_with_a_type_box_and_export_with_change_file_type() {
         let mut term = Terminal::new(TestBackend::new(90, 24)).unwrap();
         let mut bs = Backstage::open(std::env::temp_dir(), &["xlsx"])
-            .with_save_types(TYPES, "Export CSV next to the workbook");
+            .with_save_types(TYPES, "Export CSV next to the workbook")
+            .with_extra_exports(&["Export PDF next to the workbook"]);
         bs.begin_save_as("book.xlsx".into(), None);
         term.draw(|f| {
             let a = f.area();
@@ -523,6 +530,7 @@ mod tests {
         .unwrap();
         let text = screen(&term);
         assert!(text.contains("Export CSV next to the workbook"), "{text}");
+        assert!(text.contains("Export PDF next to the workbook"), "{text}");
         assert!(text.contains("Change File Type"), "{text}");
         assert!(text.contains("Text (Tab delimited) (*.txt)"), "{text}");
     }

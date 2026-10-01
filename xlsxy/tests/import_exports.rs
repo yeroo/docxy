@@ -474,6 +474,40 @@ fn verify_accepts_legacy_inputs() {
     }
 }
 
+#[test]
+fn pdf_prints_the_active_sheet_and_writes_nothing_when_it_is_empty() {
+    let dir = Dir::new("pdf");
+    let source = dir.0.join("data.csv");
+    std::fs::write(&source, "name,amount\nAlice,30\n").unwrap();
+    let out = dir.0.join("data.pdf");
+    let result = run(&source, "--pdf", &out);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let pdf = std::fs::read(&out).unwrap();
+    assert!(pdf.starts_with(b"%PDF-"));
+    assert!(String::from_utf8_lossy(&pdf).contains("(Alice) Tj"));
+
+    // The source is never overwritten.
+    let result = run(&source, "--pdf", &source);
+    assert!(!result.status.success());
+    assert_eq!(std::fs::read(&source).unwrap(), b"name,amount\nAlice,30\n");
+
+    let empty = dir.0.join("empty.csv");
+    std::fs::write(&empty, "").unwrap();
+    let none = dir.0.join("empty.pdf");
+    let result = run(&empty, "--pdf", &none);
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("We didn't find anything to print."),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!none.exists());
+}
+
 /// #882: `--read-only` never writes the input, so recalculating it in place
 /// (under any spelling) is refused; another output is written as usual.
 #[test]

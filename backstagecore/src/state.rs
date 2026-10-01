@@ -170,6 +170,8 @@ pub struct Backstage {
     pub export_sel: usize,
     /// The quick export's label on the Export page.
     pub export_quick: String,
+    /// More exports the host offers, listed under the quick export.
+    pub export_extra: Vec<String>,
     /// The highlighted editable row of the Info page.
     pub info_sel: usize,
     /// The Info page's first line on screen, kept between draws so the
@@ -212,6 +214,7 @@ impl Backstage {
             type_focus: false,
             export_sel: 0,
             export_quick: String::new(),
+            export_extra: Vec::new(),
             info_sel: 0,
             info_scroll: 0,
             info_message: None,
@@ -238,6 +241,13 @@ impl Backstage {
     pub fn with_save_types(mut self, types: &'static [SaveType], quick_export: &str) -> Backstage {
         self.save_types = types;
         self.export_quick = quick_export.to_string();
+        self
+    }
+
+    /// List more exports on the Export page, under the quick export; running
+    /// one is [`crate::BackstageEvent::ExportExtra`] with its index.
+    pub fn with_extra_exports(mut self, labels: &[&str]) -> Backstage {
+        self.export_extra = labels.iter().map(|l| l.to_string()).collect();
         self
     }
 

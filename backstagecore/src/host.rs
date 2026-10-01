@@ -47,6 +47,9 @@ pub enum BackstageEvent {
         name: String,
     },
     Export,
+    /// One of the extra exports [`crate::Backstage::with_extra_exports`]
+    /// listed under the quick export, by index.
+    ExportExtra(usize),
     Exit,
     /// Enter (or a second click) on the Info pane's row `i`: one of
     /// [`BackstageHost::info_fields`], or the custom-property row after them.

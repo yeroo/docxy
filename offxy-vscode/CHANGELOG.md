@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **New: page layout and printing over MCP (#612).** `xlsxy_page_setup`,
+  `xlsxy_page_header`, `xlsxy_print_area_set`/`_add`/`_clear`,
+  `xlsxy_print_titles`, `xlsxy_page_break_insert`/`_remove`/`_reset`,
+  `xlsxy_print_pages` and `xlsxy_export_pdf` edit a terminal `xlsxy`'s page
+  setup, headers and footers, print areas, titles and breaks, list the pages
+  it prints on and print them to PDF, growing the combined Offxy surface from
+  66 to **77 tools** (31 docxy + 46 xlsxy). A VS Code spreadsheet tab does not
+  answer them yet.
 - **New: workbook document properties over MCP.** `xlsxy_properties` and
   `xlsxy_set_properties` read and set Title, Tags, Categories, Subject,
   Comments, Company, Manager, Hyperlink base and custom properties of a

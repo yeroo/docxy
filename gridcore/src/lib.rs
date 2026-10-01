@@ -28,6 +28,7 @@
 //! - [`xlsx`] — `.xlsx` bytes ⇄ [`sheet::Workbook`] with part preservation.
 //! - [`legacy`] — import of `.xls`, `.xlsb` and `.ods` workbooks.
 //! - [`docprops`] — document properties (`docProps/` core, app, custom).
+//! - [`print`] — page setup, print areas and breaks, pagination, sheet PDF.
 
 pub mod cf;
 pub mod clock;
@@ -46,6 +47,7 @@ pub mod model;
 pub mod numfmt;
 pub mod pivot;
 pub mod pivotcalc;
+pub mod print;
 pub mod sheet;
 pub mod stats;
 pub mod textio;

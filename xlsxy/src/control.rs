@@ -45,6 +45,15 @@
 //! | `col.insert` / `col.delete` | `{at,count?,sheet?}` | `{inserted\|deleted}` |
 //! | `cell.format` | `{range,patch,sheet?}` | `{formatted}` — one undo group; `patch` keys: `numFmt`/`bold`/`italic`/`fontColor`/`fillColor`/`align` (≥1 required) |
 //! | `col.width` | `{col,width,sheet?}` | `{col,width}` — NOT on the undo stack (mirrors the TUI's F7/F8, which mutate directly) |
+//! | `page.setup` | `{sheet?\|sheets?, …fields}` | the sheet's page layout. Settable fields: `margins:{left,right,top,bottom,header,footer}` (inches), `paperSize`, `orientation`, `scale`, `fitToPage`, `fitToWidth`, `fitToHeight` (0 = Automatic), `firstPageNumber` (`null` = Auto), `pageOrder`, `blackAndWhite`, `draft`, `cellComments`, `errors`, `gridLines`, `headings`, `horizontalCentered`, `verticalCentered`, `differentOddEven`, `differentFirst`, `scaleWithDoc`, `alignWithMargins`. Reply-only: `headers:{oddHeader…firstFooter}` (stored codes; set with `page.header`), `printArea` (`print-area.*`), `printTitles:{rows,cols}` (`print-titles.set`), `rowBreaks`, `colBreaks` (`page-break.*`). Any settable field given sets it (+ `changed`): a fit count turns `fitToPage` on and `scale` turns it off unless `fitToPage` is given; scale outside 10–400 is refused. With `sheets`, the first sheet's page setup is then copied to the others (grouped sheets: not print areas, titles or header pictures). One undo step |
+//! | `page.header` | `{sheet?, kind?:odd\|even\|first, part?:header\|footer, left?, center?, right?}` | `{stored, left, center, right, changed}` — sections in the editor's form (`&[Page]`, `&[Pages]`, `&[Date]`, `&[Time]`, `&[Path]`, `&[File]`, `&[Tab]`), stored as Excel's codes; with none of left/center/right it only reads; a section over 255 characters is refused; `&[Picture]` only where the section already has a picture; `&L`, `&C` or `&R` inside a section is refused (a literal ampersand is `&&`). One undo step |
+//! | `print-area.set` / `print-area.add` | `{range, sheet?}` | `{printArea, changed}` — `range` is `A1:C10`, `A1:C10,E1:F5`, `A:C` or `1:5`; add appends to the sheet's print area. One undo step |
+//! | `print-area.clear` | `{sheet?}` | `{printArea:null, changed}` |
+//! | `print-titles.set` | `{rows?, cols?, sheet?}` | `{printTitles:{rows,cols}, changed}` — `"1:2"` / `"A:A"`; an absent key keeps that part, `null` or `""` clears it; titles that would fill a page by themselves, at the print scale, don't repeat |
+//! | `page-break.insert` / `page-break.remove` | `{cell, sheet?}` | `{rowBreaks, colBreaks, changed}` — manual break ids (a row break before 0-based row id); insert adds a break above the cell (not in row 1) and left of it (not in column A); remove takes the manual breaks bordering it |
+//! | `page-break.reset` | `{sheet?}` | `{rowBreaks, colBreaks, changed}` — every manual break goes |
+//! | `print.pages` | `{what?:active\|workbook\|selection, sheet?\|sheets?, range?, ignorePrintAreas?, from?, to?}` | `{total, pages:[{sheet, name, range, number, titleRows, titleCols, scale}]}` — the pages printing lays out (hidden sheets print only when named; titles that would fill a page by themselves, at the print scale, don't repeat); `selection` needs `range` (only its printed cells print); a job over 100,000 pages errors with "This would print more than 100000 pages; …" |
+//! | `wb.export-pdf` | `{path, …print.pages args}` | `{path, pages}` — refuses to overwrite; nothing to print errors with "We didn't find anything to print." and writes no file; so does a job over 100,000 pages (the `print.pages` error) |
 //! | `wb.recalc` | — | `{recalculated:true}` |
 //! | `wb.properties` | — | `{title, tags, categories, subject, comments, company, manager, hyperlinkBase, author, lastModifiedBy, created, modified, custom:[{name,type,value}]}` — File › Info; an absent property is `null`; `type` is `text`/`number`/`bool`/`date`/`other` |
 //! | `wb.set-properties` | `{title?, tags?, categories?, subject?, comments?, company?, manager?, hyperlinkBase?, custom?:{name: value\|null}}` | `wb.properties` + `{changed}` — `null`/`""` removes; a custom value is a string (text), number, bool or `{"date":"YYYY-MM-DD[THH:MM:SSZ]"}`; marks the workbook modified when something changed; NOT on the undo stack (Excel's Info edits aren't either) |
@@ -69,9 +78,15 @@ use gridcore::engine::{Engine, PART_OF_ARRAY, cell_to_value, eval_formula_at};
 use gridcore::format::{FormatPatch, FormatValue, apply_patch_to_xf, xf_format_fields};
 use gridcore::formula::Value;
 use gridcore::frame::{Agg, Frame, pivot, pivot_spec_from_names, pivot_table_strings, range_stats};
+use gridcore::print::area;
+use gridcore::print::hf;
+use gridcore::print::paginate::{Job, What};
+use gridcore::print::setup::{
+    CellComments, HfSlot, Orientation, PageOrder, PageSetup, PrintErrors,
+};
 use gridcore::sheet::{
-    Cell, CellValue, DrawingKind, Styles, cell_name, fmt_general, parse_cell_name, parse_col,
-    parse_range_name, sheet_to_csv,
+    Cell, CellValue, DrawingKind, Styles, cell_name, col_name, fmt_general, parse_cell_name,
+    parse_col, parse_range_name, sheet_to_csv,
 };
 
 /// The most cells one `sheet.read` returns (non-empty cells in the window);
@@ -116,6 +131,17 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         "col.delete" => col_op(app, args, false),
         "cell.format" => cell_format(app, args),
         "col.width" => col_width(app, args),
+        "page.setup" => page_setup(app, args),
+        "page.header" => page_header(app, args),
+        "print-area.set" => print_area_op(app, args, "set"),
+        "print-area.add" => print_area_op(app, args, "add"),
+        "print-area.clear" => print_area_op(app, args, "clear"),
+        "print-titles.set" => print_titles_set(app, args),
+        "page-break.insert" => page_break_op(app, args, "insert"),
+        "page-break.remove" => page_break_op(app, args, "remove"),
+        "page-break.reset" => page_break_op(app, args, "reset"),
+        "print.pages" => print_pages(app, args),
+        "wb.export-pdf" => wb_export_pdf(app, args),
         "wb.properties" => Ok(properties_json(app)),
         "wb.set-properties" => set_properties(app, args),
         "wb.recalc" => {
@@ -169,7 +195,9 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         // `comment.remove` can legitimately no-op (nothing on the cell), so it
         // signals itself inside `comment_remove`, gated on `removed:true` — a
         // no-op must not flash the activity dot (docxy's no-op principle).
-        // `wb.set-properties` does the same, gated on `changed:true`.
+        // `wb.set-properties` does the same, gated on `changed:true`, and so
+        // do the page-layout verbs (`page.*`, `print-area.*`,
+        // `print-titles.set`, `page-break.*`).
     }
     out
 }
@@ -1530,6 +1558,629 @@ fn col_width(app: &mut App, args: &Json) -> Result<Json, String> {
     Ok(Json::obj(vec![
         ("col", Json::Num(col as f64)),
         ("width", Json::Num(width)),
+    ]))
+}
+
+// ---------------------------------------------------------------------------
+// Page layout and printing
+// ---------------------------------------------------------------------------
+
+/// The sheets a page-layout verb applies to: `sheets` (indexes or names),
+/// else `sheet`, else the active one.
+/// A sheet named twice (`[0, 0]`, `["Sheet1", "sheet1"]`) is one sheet,
+/// listed once, in its first place.
+fn sheets_arg(app: &App, args: &Json) -> Result<Vec<usize>, String> {
+    match args.get("sheets") {
+        None | Some(Json::Null) => Ok(vec![sheet_arg(app, args)?]),
+        Some(Json::Arr(items)) if !items.is_empty() => {
+            let mut seen = std::collections::HashSet::new();
+            let mut out = Vec::new();
+            for v in items {
+                let si = sheet_arg(app, &Json::obj(vec![("sheet", v.clone())]))?;
+                if seen.insert(si) {
+                    out.push(si);
+                }
+            }
+            Ok(out)
+        }
+        Some(_) => Err("'sheets' must be a non-empty array of indexes or names".into()),
+    }
+}
+
+/// A `u32` field: a whole number ≥ 0.
+fn u32_field(verb: &str, key: &str, v: &Json) -> Result<u32, String> {
+    match v.as_f64() {
+        Some(n) if n >= 0.0 && n.fract() == 0.0 && n <= f64::from(u32::MAX) => Ok(n as u32),
+        _ => Err(format!("{verb}: '{key}' must be a whole number ≥ 0")),
+    }
+}
+
+fn bool_field(verb: &str, key: &str, v: &Json) -> Result<bool, String> {
+    v.as_bool()
+        .ok_or_else(|| format!("{verb}: '{key}' must be true or false"))
+}
+
+fn word_field<'a>(verb: &str, key: &str, v: &'a Json) -> Result<&'a str, String> {
+    v.as_str()
+        .ok_or_else(|| format!("{verb}: '{key}' must be a string"))
+}
+
+/// Apply `page.setup`'s field keys to `s`. As in Excel's Page Setup, setting
+/// a fit count turns `Fit to` on and setting `scale` turns it off, unless
+/// `fitToPage` itself is given.
+fn apply_page_fields(s: &mut PageSetup, args: &Json) -> Result<(), String> {
+    const VERB: &str = "page.setup";
+    let Json::Obj(pairs) = args else {
+        return Ok(());
+    };
+    for (key, v) in pairs {
+        let k = key.as_str();
+        match k {
+            // Addressing, not fields: `target` picks the editor over MCP.
+            "sheet" | "sheets" | "target" => {}
+            "margins" => {
+                let Json::Obj(m) = v else {
+                    return Err(format!("{VERB}: 'margins' must be an object of inches"));
+                };
+                for (side, inches) in m {
+                    let n = inches
+                        .as_f64()
+                        .ok_or_else(|| format!("{VERB}: margin '{side}' must be a number"))?;
+                    let field = match side.as_str() {
+                        "left" => &mut s.margins.left,
+                        "right" => &mut s.margins.right,
+                        "top" => &mut s.margins.top,
+                        "bottom" => &mut s.margins.bottom,
+                        "header" => &mut s.margins.header,
+                        "footer" => &mut s.margins.footer,
+                        other => return Err(format!("{VERB}: unknown margin '{other}'")),
+                    };
+                    *field = n;
+                }
+            }
+            "paperSize" => s.paper_size = u32_field(VERB, k, v)?,
+            "orientation" => {
+                let w = word_field(VERB, k, v)?;
+                s.orientation = Orientation::parse(w).ok_or_else(|| {
+                    format!("{VERB}: orientation is portrait, landscape or default, not '{w}'")
+                })?;
+            }
+            "scale" => {
+                s.scale = u32_field(VERB, k, v)?;
+                if args.get("fitToPage").is_none() {
+                    s.fit_to_page = false;
+                }
+            }
+            "fitToPage" => s.fit_to_page = bool_field(VERB, k, v)?,
+            "fitToWidth" | "fitToHeight" => {
+                let n = u32_field(VERB, k, v)?;
+                if k == "fitToWidth" {
+                    s.fit_width = n;
+                } else {
+                    s.fit_height = n;
+                }
+                if args.get("fitToPage").is_none() {
+                    s.fit_to_page = true;
+                }
+            }
+            "firstPageNumber" => {
+                s.first_page_number = match v {
+                    Json::Null => None,
+                    v => Some(u32_field(VERB, k, v)?),
+                }
+            }
+            "pageOrder" => {
+                let w = word_field(VERB, k, v)?;
+                s.page_order = PageOrder::parse(w).ok_or_else(|| {
+                    format!("{VERB}: pageOrder is downThenOver or overThenDown, not '{w}'")
+                })?;
+            }
+            "cellComments" => {
+                let w = word_field(VERB, k, v)?;
+                s.cell_comments = CellComments::parse(w).ok_or_else(|| {
+                    format!("{VERB}: cellComments is none, asDisplayed or atEnd, not '{w}'")
+                })?;
+            }
+            "errors" => {
+                let w = word_field(VERB, k, v)?;
+                s.errors = PrintErrors::parse(w).ok_or_else(|| {
+                    format!("{VERB}: errors is displayed, blank, dash or NA, not '{w}'")
+                })?;
+            }
+            "blackAndWhite" => s.black_and_white = bool_field(VERB, k, v)?,
+            "draft" => s.draft = bool_field(VERB, k, v)?,
+            "gridLines" => s.grid_lines = bool_field(VERB, k, v)?,
+            "headings" => s.headings = bool_field(VERB, k, v)?,
+            "horizontalCentered" => s.h_centered = bool_field(VERB, k, v)?,
+            "verticalCentered" => s.v_centered = bool_field(VERB, k, v)?,
+            "differentOddEven" => s.header_footer.different_odd_even = bool_field(VERB, k, v)?,
+            "differentFirst" => s.header_footer.different_first = bool_field(VERB, k, v)?,
+            "scaleWithDoc" => s.header_footer.scale_with_doc = bool_field(VERB, k, v)?,
+            "alignWithMargins" => s.header_footer.align_with_margins = bool_field(VERB, k, v)?,
+            other => return Err(format!("{VERB}: unknown field '{other}'")),
+        }
+    }
+    s.validate().map_err(|e| format!("{VERB}: {e}"))
+}
+
+/// Does `page.setup` carry any field to set?
+fn has_page_fields(args: &Json) -> bool {
+    match args {
+        Json::Obj(pairs) => pairs
+            .iter()
+            .any(|(k, _)| !matches!(k.as_str(), "sheet" | "sheets" | "target")),
+        _ => false,
+    }
+}
+
+fn opt_str(s: Option<&str>) -> Json {
+    s.map_or(Json::Null, |s| Json::Str(s.to_string()))
+}
+
+/// A sheet's page layout as `page.setup` reports it.
+fn page_setup_json(app: &App, si: usize) -> Json {
+    let wb = &app.pkg.workbook;
+    let sheet = &wb.sheets[si];
+    let s = &sheet.page_setup;
+    let hf = &s.header_footer;
+    let m = &s.margins;
+    let titles = area::print_titles(wb, si);
+    let span = |v: Option<(u32, u32)>, rows: bool| match v {
+        Some((a, b)) if rows => Json::Str(format!("{}:{}", a + 1, b + 1)),
+        Some((a, b)) => Json::Str(format!("{}:{}", col_name(a), col_name(b))),
+        None => Json::Null,
+    };
+    let print_area: Vec<String> = area::print_area(wb, si)
+        .into_iter()
+        .map(area::rect_name)
+        .collect();
+    let (row_breaks, col_breaks) = area::manual_breaks(sheet);
+    let ids = |v: Vec<u32>| Json::Arr(v.into_iter().map(|i| Json::Num(i as f64)).collect());
+    Json::obj(vec![
+        ("sheet", Json::Num(si as f64)),
+        ("name", Json::Str(sheet.name.clone())),
+        (
+            "margins",
+            Json::obj(vec![
+                ("left", Json::Num(m.left)),
+                ("right", Json::Num(m.right)),
+                ("top", Json::Num(m.top)),
+                ("bottom", Json::Num(m.bottom)),
+                ("header", Json::Num(m.header)),
+                ("footer", Json::Num(m.footer)),
+            ]),
+        ),
+        ("paperSize", Json::Num(s.paper_size as f64)),
+        ("orientation", Json::Str(s.orientation.as_str().into())),
+        ("scale", Json::Num(s.scale as f64)),
+        ("fitToPage", Json::Bool(s.fit_to_page)),
+        ("fitToWidth", Json::Num(s.fit_width as f64)),
+        ("fitToHeight", Json::Num(s.fit_height as f64)),
+        (
+            "firstPageNumber",
+            s.first_page_number
+                .map_or(Json::Null, |n| Json::Num(n as f64)),
+        ),
+        ("pageOrder", Json::Str(s.page_order.as_str().into())),
+        ("blackAndWhite", Json::Bool(s.black_and_white)),
+        ("draft", Json::Bool(s.draft)),
+        ("cellComments", Json::Str(s.cell_comments.as_str().into())),
+        ("errors", Json::Str(s.errors.as_str().into())),
+        ("gridLines", Json::Bool(s.grid_lines)),
+        ("headings", Json::Bool(s.headings)),
+        ("horizontalCentered", Json::Bool(s.h_centered)),
+        ("verticalCentered", Json::Bool(s.v_centered)),
+        ("differentOddEven", Json::Bool(hf.different_odd_even)),
+        ("differentFirst", Json::Bool(hf.different_first)),
+        ("scaleWithDoc", Json::Bool(hf.scale_with_doc)),
+        ("alignWithMargins", Json::Bool(hf.align_with_margins)),
+        (
+            "headers",
+            Json::Obj(
+                HfSlot::ALL
+                    .iter()
+                    .map(|&slot| (slot.element().to_string(), opt_str(hf.get(slot))))
+                    .collect(),
+            ),
+        ),
+        (
+            "printArea",
+            if print_area.is_empty() {
+                Json::Null
+            } else {
+                Json::Str(print_area.join(","))
+            },
+        ),
+        (
+            "printTitles",
+            Json::obj(vec![
+                ("rows", span(titles.rows, true)),
+                ("cols", span(titles.cols, false)),
+            ]),
+        ),
+        ("rowBreaks", ids(row_breaks)),
+        ("colBreaks", ids(col_breaks)),
+    ])
+}
+
+/// `page.setup`: read a sheet's page layout, or set fields of it. With
+/// `sheets`, the fields go to the first sheet and its whole page setup is
+/// then copied to the others, as Page Setup on grouped sheets does
+/// (FIL-147): print areas and titles stay each sheet's own, and header
+/// pictures aren't copied.
+fn page_setup(app: &mut App, args: &Json) -> Result<Json, String> {
+    // Deduplicated, so the first sheet is never its own group copy's target.
+    let targets = sheets_arg(app, args)?;
+    let first = targets[0];
+    if !has_page_fields(args) {
+        return Ok(page_setup_json(app, first));
+    }
+    let changed = app.layout_edit(|wb| {
+        let mut s = wb.sheets[first].page_setup.clone();
+        apply_page_fields(&mut s, args)?;
+        let mut changed = s != wb.sheets[first].page_setup;
+        let group = s.for_group();
+        wb.sheets[first].page_setup = s;
+        for &si in targets.iter().filter(|&&si| si != first) {
+            if wb.sheets[si].page_setup != group {
+                wb.sheets[si].page_setup = group.clone();
+                changed = true;
+            }
+        }
+        Ok(changed)
+    })?;
+    if changed {
+        ctlcore::signal_activity();
+    }
+    Ok(with_changed(page_setup_json(app, first), changed))
+}
+
+/// `json` with `changed` added.
+fn with_changed(json: Json, changed: bool) -> Json {
+    match json {
+        Json::Obj(mut pairs) => {
+            pairs.push(("changed".into(), Json::Bool(changed)));
+            Json::Obj(pairs)
+        }
+        other => other,
+    }
+}
+
+/// `page.header`: read one header or footer as its three sections in the
+/// editor's `&[…]` form, or set them. Field codes typed as `&[Page]` are
+/// stored as Excel's `&P`; `&&` stays a literal ampersand, and `&L`, `&C`
+/// or `&R` inside a section is refused (it would start another section). A
+/// header picture (`&[Picture]`) can be kept where the section already
+/// shows one, never added.
+fn page_header(app: &mut App, args: &Json) -> Result<Json, String> {
+    const VERB: &str = "page.header";
+    let si = sheet_arg(app, args)?;
+    let kind = args.get_str("kind").unwrap_or("odd");
+    let part = args.get_str("part").unwrap_or("header");
+    let slot = HfSlot::from_kind(kind, part).ok_or_else(|| {
+        format!(
+            "{VERB}: kind is odd, even or first and part is header or footer, not '{kind}'/'{part}'"
+        )
+    })?;
+    let editing = ["left", "center", "right"]
+        .iter()
+        .any(|k| args.get(k).is_some());
+    let mut changed = false;
+    if editing {
+        let text = |k: &str| -> Result<String, String> {
+            match args.get(k) {
+                None | Some(Json::Null) => Ok(String::new()),
+                Some(Json::Str(s)) => Ok(s.clone()),
+                Some(_) => Err(format!("{VERB}: '{k}' must be a string")),
+            }
+        };
+        let sections = hf::Sections::from_editor(&text("left")?, &text("center")?, &text("right")?)
+            .map_err(|e| format!("{VERB}: {e}"))?;
+        let current = hf::Sections::parse(
+            app.pkg.workbook.sheets[si]
+                .page_setup
+                .header_footer
+                .get(slot)
+                .unwrap_or(""),
+        );
+        let stored = sections.compose();
+        // Checked on the string as it will be stored and read back, so no
+        // spelling can move a picture into another section.
+        let stored_as = hf::Sections::parse(&stored);
+        for (name, new, old) in [
+            ("left", &stored_as.left, &current.left),
+            ("center", &stored_as.center, &current.center),
+            ("right", &stored_as.right, &current.right),
+        ] {
+            if hf::has_code(new, 'G') && !hf::has_code(old, 'G') {
+                return Err(format!(
+                    "{VERB}: a header picture (&[Picture]) can only be kept where the {name} section already has one; inserting pictures is not supported"
+                ));
+            }
+        }
+        let new = (!stored.is_empty()).then_some(stored);
+        changed = app.layout_edit(|wb| {
+            let hf = &mut wb.sheets[si].page_setup.header_footer;
+            let changed = *hf.slot_mut(slot) != new;
+            *hf.slot_mut(slot) = new;
+            Ok(changed)
+        })?;
+        if changed {
+            ctlcore::signal_activity();
+        }
+    }
+    let stored = app.pkg.workbook.sheets[si]
+        .page_setup
+        .header_footer
+        .get(slot)
+        .map(str::to_string);
+    let s = hf::Sections::parse(stored.as_deref().unwrap_or(""));
+    Ok(Json::obj(vec![
+        ("sheet", Json::Num(si as f64)),
+        ("kind", Json::Str(kind.into())),
+        ("part", Json::Str(part.into())),
+        ("stored", opt_str(stored.as_deref())),
+        ("left", Json::Str(hf::decode(&s.left))),
+        ("center", Json::Str(hf::decode(&s.center))),
+        ("right", Json::Str(hf::decode(&s.right))),
+        ("changed", Json::Bool(changed)),
+    ]))
+}
+
+/// Ranges like `A1:C10,E1:F5`, `A:B` or `1:2`, every one readable.
+fn ranges_arg(verb: &str, args: &Json, key: &str) -> Result<Vec<area::PrintRef>, String> {
+    let text = args
+        .get_str(key)
+        .ok_or_else(|| format!("{verb} needs a '{key}' like \"A1:C10\""))?;
+    let parts = text.split(',').filter(|p| !p.trim().is_empty()).count();
+    let refs = area::parse_refs(text);
+    if parts == 0 || refs.len() != parts {
+        return Err(format!("{verb}: bad range '{text}'"));
+    }
+    Ok(refs)
+}
+
+fn print_area_json(app: &App, si: usize, changed: bool) -> Json {
+    let wb = &app.pkg.workbook;
+    let formula = wb
+        .defined_names
+        .iter()
+        .find(|d| d.scope == Some(si) && d.name.eq_ignore_ascii_case(area::PRINT_AREA))
+        .map(|d| d.formula.clone());
+    Json::obj(vec![
+        ("sheet", Json::Num(si as f64)),
+        ("printArea", opt_str(formula.as_deref())),
+        ("changed", Json::Bool(changed)),
+    ])
+}
+
+/// `print-area.set` / `.add` / `.clear`.
+fn print_area_op(app: &mut App, args: &Json, op: &str) -> Result<Json, String> {
+    let verb = format!("print-area.{op}");
+    let si = sheet_arg(app, args)?;
+    let refs = match op {
+        "clear" => Vec::new(),
+        _ => ranges_arg(&verb, args, "range")?,
+    };
+    let changed = app.layout_edit(|wb| {
+        let before = area::print_area(wb, si);
+        match op {
+            "set" => {
+                let rects: Vec<_> = refs.iter().map(|r| r.rect()).collect();
+                area::set_print_area(wb, si, &rects);
+            }
+            "add" => {
+                for r in &refs {
+                    area::add_print_area(wb, si, r.rect());
+                }
+            }
+            _ => {
+                area::clear_print_area(wb, si);
+            }
+        }
+        Ok(area::print_area(wb, si) != before)
+    })?;
+    if changed {
+        ctlcore::signal_activity();
+    }
+    Ok(print_area_json(app, si, changed))
+}
+
+/// `print-titles.set {rows?, cols?}`: `"1:2"` rows to repeat at top, `"A:A"`
+/// columns at left. An absent key keeps that part; `null` or `""` clears it.
+fn print_titles_set(app: &mut App, args: &Json) -> Result<Json, String> {
+    const VERB: &str = "print-titles.set";
+    let si = sheet_arg(app, args)?;
+    let mut titles = area::print_titles(&app.pkg.workbook, si);
+    for (key, rows) in [("rows", true), ("cols", false)] {
+        match args.get(key) {
+            None => {}
+            Some(Json::Null) => set_titles_part(&mut titles, rows, None),
+            Some(Json::Str(s)) if s.trim().is_empty() => set_titles_part(&mut titles, rows, None),
+            Some(Json::Str(s)) => {
+                let span = match area::parse_refs(s).as_slice() {
+                    [area::PrintRef::Rows(a, b)] if rows => (*a, *b),
+                    [area::PrintRef::Cols(a, b)] if !rows => (*a, *b),
+                    _ => {
+                        return Err(format!(
+                            "{VERB}: '{key}' must be {} like \"{}\", not '{s}'",
+                            if rows { "whole rows" } else { "whole columns" },
+                            if rows { "1:2" } else { "A:B" }
+                        ));
+                    }
+                };
+                set_titles_part(&mut titles, rows, Some(span));
+            }
+            Some(_) => return Err(format!("{VERB}: '{key}' must be a string or null")),
+        }
+    }
+    let changed = app.layout_edit(|wb| {
+        let before = area::print_titles(wb, si);
+        area::set_print_titles(wb, si, titles);
+        Ok(area::print_titles(wb, si) != before)
+    })?;
+    if changed {
+        ctlcore::signal_activity();
+    }
+    let json = page_setup_json(app, si);
+    Ok(Json::obj(vec![
+        ("sheet", Json::Num(si as f64)),
+        (
+            "printTitles",
+            json.get("printTitles").cloned().unwrap_or(Json::Null),
+        ),
+        ("changed", Json::Bool(changed)),
+    ]))
+}
+
+fn set_titles_part(t: &mut area::PrintTitles, rows: bool, span: Option<(u32, u32)>) {
+    if rows {
+        t.rows = span;
+    } else {
+        t.cols = span;
+    }
+}
+
+/// `page-break.insert` / `.remove {cell}` / `.reset`.
+fn page_break_op(app: &mut App, args: &Json, op: &str) -> Result<Json, String> {
+    let si = sheet_arg(app, args)?;
+    let cell = match op {
+        "reset" => None,
+        _ => {
+            let r = args
+                .get_str("cell")
+                .ok_or_else(|| format!("page-break.{op} needs a 'cell' like \"A14\""))?;
+            Some(parse_cell_name(r.trim()).ok_or_else(|| format!("bad cell ref '{r}'"))?)
+        }
+    };
+    let changed = app.layout_edit(|wb| {
+        let sheet = &mut wb.sheets[si];
+        Ok(match (op, cell) {
+            ("insert", Some((r, c))) => area::insert_page_break(sheet, r, c),
+            ("remove", Some((r, c))) => area::remove_page_break(sheet, r, c),
+            _ => area::reset_page_breaks(sheet),
+        })
+    })?;
+    if changed {
+        ctlcore::signal_activity();
+    }
+    let (rows, cols) = area::manual_breaks(&app.pkg.workbook.sheets[si]);
+    let ids = |v: Vec<u32>| Json::Arr(v.into_iter().map(|i| Json::Num(i as f64)).collect());
+    Ok(Json::obj(vec![
+        ("sheet", Json::Num(si as f64)),
+        ("rowBreaks", ids(rows)),
+        ("colBreaks", ids(cols)),
+        ("changed", Json::Bool(changed)),
+    ]))
+}
+
+/// The print job `print.pages` and `wb.export-pdf` describe: `what` is
+/// `active` (the default: `sheets`, or `sheet`, or the active sheet),
+/// `workbook` (every visible sheet) or `selection` (`range`, comma-separated
+/// ranges of `sheet`); `ignorePrintAreas`, `from` and `to` as on the Print
+/// page.
+fn job_arg(app: &App, verb: &str, args: &Json) -> Result<Job, String> {
+    let what = match args.get_str("what").unwrap_or("active") {
+        "active" => What::ActiveSheets(sheets_arg(app, args)?),
+        "workbook" => What::EntireWorkbook,
+        "selection" => What::Selection {
+            sheet: sheet_arg(app, args)?,
+            ranges: ranges_arg(verb, args, "range")?
+                .into_iter()
+                .map(|r| r.rect())
+                .collect(),
+        },
+        other => {
+            return Err(format!(
+                "{verb}: what is active, workbook or selection, not '{other}'"
+            ));
+        }
+    };
+    let page = |key: &str| -> Result<Option<u32>, String> {
+        match args.get(key) {
+            None | Some(Json::Null) => Ok(None),
+            Some(v) => match u32_field(verb, key, v)? {
+                0 => Err(format!("{verb}: '{key}' counts pages from 1")),
+                n => Ok(Some(n)),
+            },
+        }
+    };
+    let ignore = match args.get("ignorePrintAreas") {
+        None | Some(Json::Null) => false,
+        Some(v) => bool_field(verb, "ignorePrintAreas", v)?,
+    };
+    Ok(Job {
+        what,
+        ignore_print_areas: ignore,
+        from: page("from")?,
+        to: page("to")?,
+    })
+}
+
+/// `print.pages`: the pages a print job prints on — each page's sheet, the
+/// range of its body, the title rows and columns repeated on it, its page
+/// number and scale — and the job's page count.
+fn print_pages(app: &App, args: &Json) -> Result<Json, String> {
+    let job = job_arg(app, "print.pages", args)?;
+    let wb = &app.pkg.workbook;
+    let pages = gridcore::print::paginate::paginate(wb, &job);
+    // A job cut short is the error `wb.export-pdf` gives, not a short list.
+    if pages.truncated {
+        return Err(gridcore::print::pdf::PrintError::TooManyPages.to_string());
+    }
+    let span = |v: &[u32], rows: bool| match (v.first(), v.last()) {
+        (Some(&a), Some(&b)) if rows => Json::Str(format!("{}:{}", a + 1, b + 1)),
+        (Some(&a), Some(&b)) => Json::Str(format!("{}:{}", col_name(a), col_name(b))),
+        _ => Json::Null,
+    };
+    let list = pages
+        .pages
+        .iter()
+        .map(|p| {
+            Json::obj(vec![
+                ("sheet", Json::Num(p.sheet as f64)),
+                ("name", Json::Str(wb.sheets[p.sheet].name.clone())),
+                ("range", Json::Str(area::rect_name(p.range()))),
+                ("number", Json::Num(p.number as f64)),
+                ("titleRows", span(&p.title_rows, true)),
+                ("titleCols", span(&p.title_cols, false)),
+                ("scale", Json::Num((p.scale * 100.0).round())),
+            ])
+        })
+        .collect();
+    Ok(Json::obj(vec![
+        ("total", Json::Num(pages.total as f64)),
+        ("pages", Json::Arr(list)),
+    ]))
+}
+
+/// `wb.export-pdf`: print a job (as `print.pages` takes it; the active sheet
+/// by default) to a PDF at `path` (absolutized against this process's cwd),
+/// refusing to overwrite an existing file. Nothing to print is an error and
+/// writes no file. Neither marks the workbook modified nor touches undo.
+fn wb_export_pdf(app: &App, args: &Json) -> Result<Json, String> {
+    let path = args.get_str("path").ok_or("wb.export-pdf needs a 'path'")?;
+    let job = job_arg(app, "wb.export-pdf", args)?;
+    let abs =
+        std::path::absolute(std::path::Path::new(path)).map_err(|e| format!("bad path: {e}"))?;
+    if abs.exists() {
+        return Err(format!("already exists: {}", abs.display()));
+    }
+    let (pdf, pages) =
+        crate::print_pdf(&app.pkg.workbook, &job, &app.path).map_err(|e| e.to_string())?;
+    if let Some(parent) = abs.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create failed: {e}"))?;
+    }
+    opccore::fsio::create_atomic(&abs, &pdf).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            format!("already exists: {}", abs.display())
+        } else {
+            format!("create failed: {e}")
+        }
+    })?;
+    Ok(Json::obj(vec![
+        ("path", Json::Str(abs.display().to_string())),
+        ("pages", Json::Num(pages as f64)),
     ]))
 }
 
@@ -4717,5 +5368,558 @@ mod tests {
         }
         assert_eq!(props(&mut a), before);
         assert!(!a.modified);
+    }
+}
+
+#[cfg(test)]
+mod print_tests {
+    use super::*;
+    use gridcore::xlsx::new_xlsx;
+
+    fn app() -> App {
+        let mut a = App::new(new_xlsx(), "print-test.xlsx");
+        a.os_clip = None;
+        a
+    }
+
+    fn obj(pairs: Vec<(&str, Json)>) -> Json {
+        Json::obj(pairs)
+    }
+
+    fn s(v: &str) -> Json {
+        Json::Str(v.into())
+    }
+
+    fn n(v: f64) -> Json {
+        Json::Num(v)
+    }
+
+    fn call(a: &mut App, verb: &str, args: Json) -> Json {
+        dispatch(a, verb, &args).unwrap_or_else(|e| panic!("{verb}: {e}"))
+    }
+
+    /// Numbers in A1:<cols × rows>.
+    fn fill(a: &mut App, rows: u32, cols: u32) {
+        let sheet = &mut a.pkg.workbook.sheets[a.sheet];
+        for r in 0..rows {
+            for c in 0..cols {
+                sheet.set_cell(r, c, Cell::number(f64::from(r * 100 + c)));
+            }
+        }
+    }
+
+    /// The saved worksheet part of the first sheet (`xl/worksheets/sheet1.xml`
+    /// in a new workbook).
+    fn saved_sheet(a: &App, i: usize) -> String {
+        let pkg = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&a.pkg)).unwrap();
+        let part = format!("xl/worksheets/sheet{}.xml", i + 1);
+        String::from_utf8_lossy(pkg.part(&part).unwrap()).into_owned()
+    }
+
+    fn saved_workbook(a: &App) -> String {
+        let pkg = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&a.pkg)).unwrap();
+        String::from_utf8_lossy(pkg.part("xl/workbook.xml").unwrap()).into_owned()
+    }
+
+    #[test]
+    fn page_setup_reads_the_defaults_without_marking_anything() {
+        let mut a = app();
+        let r = call(&mut a, "page.setup", Json::Null);
+        assert_eq!(r.get_str("orientation"), Some("default"));
+        assert_eq!(r.get_usize("scale"), Some(100));
+        assert_eq!(r.get_usize("fitToWidth"), Some(1));
+        assert_eq!(r.get("firstPageNumber"), Some(&Json::Null));
+        assert_eq!(r.get("printArea"), Some(&Json::Null));
+        assert_eq!(
+            r.get("margins").unwrap().get("left").unwrap().as_f64(),
+            Some(0.7)
+        );
+        assert!(!a.modified);
+    }
+
+    #[test]
+    fn page_setup_sets_named_attributes_and_undoes_in_one_step() {
+        let mut a = app();
+        let r = call(
+            &mut a,
+            "page.setup",
+            obj(vec![
+                ("orientation", s("landscape")),
+                ("paperSize", n(9.0)),
+                ("gridLines", Json::Bool(true)),
+                ("margins", obj(vec![("left", n(1.0))])),
+            ]),
+        );
+        assert_eq!(r.get("changed"), Some(&Json::Bool(true)));
+        assert!(a.modified);
+        let ws = saved_sheet(&a, 0);
+        assert!(ws.contains(r#"<printOptions gridLines="1"/>"#), "{ws}");
+        assert!(
+            ws.contains(r#"<pageMargins left="1" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>"#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(r#"<pageSetup orientation="landscape" paperSize="9"/>"#)
+                || ws.contains(r#"<pageSetup paperSize="9" orientation="landscape"/>"#),
+            "{ws}"
+        );
+        a.undo();
+        let r = call(&mut a, "page.setup", Json::Null);
+        assert_eq!(r.get_str("orientation"), Some("default"));
+        assert_eq!(r.get("gridLines"), Some(&Json::Bool(false)));
+    }
+
+    #[test]
+    fn a_fit_count_turns_fit_on_and_a_scale_turns_it_off() {
+        // FIL-CASE-044.
+        let mut a = app();
+        let r = call(&mut a, "page.setup", obj(vec![("fitToWidth", n(1.0))]));
+        assert_eq!(r.get("fitToPage"), Some(&Json::Bool(true)));
+        call(&mut a, "page.setup", obj(vec![("fitToWidth", n(0.0))]));
+        let r = call(&mut a, "page.setup", obj(vec![("scale", n(150.0))]));
+        assert_eq!(r.get("fitToPage"), Some(&Json::Bool(false)));
+        let ws = saved_sheet(&a, 0);
+        assert!(ws.contains(r#"scale="150""#), "{ws}");
+        assert!(!ws.contains("fitToPage"), "{ws}");
+    }
+
+    #[test]
+    fn out_of_range_scale_and_unknown_fields_are_refused_unchanged() {
+        // FIL-CASE-040 step 3.
+        let mut a = app();
+        for bad in [401.0, 9.0] {
+            let e = dispatch(&mut a, "page.setup", &obj(vec![("scale", n(bad))])).unwrap_err();
+            assert!(e.contains("10–400"), "{e}");
+        }
+        let e = dispatch(&mut a, "page.setup", &obj(vec![("scael", n(50.0))])).unwrap_err();
+        assert!(e.contains("unknown field 'scael'"), "{e}");
+        let e = dispatch(
+            &mut a,
+            "page.setup",
+            &obj(vec![("orientation", s("sideways"))]),
+        )
+        .unwrap_err();
+        assert!(e.contains("sideways"), "{e}");
+        assert!(!a.modified);
+        assert_eq!(
+            a.pkg.workbook.sheets[0].page_setup,
+            gridcore::print::setup::PageSetup::default()
+        );
+        // Setting a value it already has changes nothing.
+        let r = call(&mut a, "page.setup", obj(vec![("scale", n(100.0))]));
+        assert_eq!(r.get("changed"), Some(&Json::Bool(false)));
+        assert!(!a.modified);
+    }
+
+    #[test]
+    fn the_mcp_target_key_is_not_a_page_setup_field() {
+        // FIX r1 M2: the MCP bridge forwards `target` with the arguments.
+        let mut a = app();
+        let r = call(&mut a, "page.setup", obj(vec![("target", s("pane-1"))]));
+        assert_eq!(r.get_str("orientation"), Some("default"));
+        assert!(!a.modified);
+        let r = call(
+            &mut a,
+            "page.setup",
+            obj(vec![
+                ("target", s("pane-1")),
+                ("orientation", s("landscape")),
+            ]),
+        );
+        assert_eq!(r.get("changed"), Some(&Json::Bool(true)));
+        let target = || ("target", s("pane-1"));
+        call(
+            &mut a,
+            "page.header",
+            obj(vec![target(), ("center", s("x"))]),
+        );
+        call(
+            &mut a,
+            "print-area.set",
+            obj(vec![target(), ("range", s("A1:B2"))]),
+        );
+        call(
+            &mut a,
+            "print-titles.set",
+            obj(vec![target(), ("rows", s("1:1"))]),
+        );
+        call(
+            &mut a,
+            "page-break.insert",
+            obj(vec![target(), ("cell", s("A5"))]),
+        );
+        call(&mut a, "print.pages", obj(vec![target()]));
+    }
+
+    #[test]
+    fn a_hidden_current_sheet_still_prints() {
+        // FIX r4 M2: the editor shows and edits hidden sheets.
+        let mut a = app();
+        fill(&mut a, 10, 2);
+        a.pkg.workbook.sheets[0].hidden = true;
+        let r = call(&mut a, "print.pages", Json::Null);
+        assert_eq!(r.get_usize("total"), Some(1));
+        let r = call(&mut a, "print.pages", obj(vec![("what", s("workbook"))]));
+        assert_eq!(r.get_usize("total"), Some(0));
+    }
+
+    #[test]
+    fn a_sheet_named_twice_prints_once() {
+        // FIX r3 m3.
+        let mut a = app();
+        fill(&mut a, 10, 2);
+        for sheets in [
+            Json::Arr(vec![n(0.0), n(0.0)]),
+            Json::Arr(vec![s("Sheet1"), s("sheet1")]),
+        ] {
+            let r = call(&mut a, "print.pages", obj(vec![("sheets", sheets.clone())]));
+            assert_eq!(r.get_usize("total"), Some(1), "{sheets:?}");
+        }
+    }
+
+    #[test]
+    fn a_sheet_named_twice_in_a_group_keeps_its_own_header_picture() {
+        // FIX r2 m6.
+        let mut a = app();
+        a.pkg.workbook.sheets[0].page_setup.header_footer.odd_header = Some("&L&G".into());
+        for sheets in [
+            Json::Arr(vec![n(0.0), n(0.0)]),
+            Json::Arr(vec![s("Sheet1"), s("sheet1")]),
+        ] {
+            call(
+                &mut a,
+                "page.setup",
+                obj(vec![("sheets", sheets), ("gridLines", Json::Bool(true))]),
+            );
+            assert_eq!(
+                a.pkg.workbook.sheets[0]
+                    .page_setup
+                    .header_footer
+                    .odd_header
+                    .as_deref(),
+                Some("&L&G")
+            );
+        }
+    }
+
+    #[test]
+    fn a_job_past_the_page_limit_is_an_error_for_both_print_verbs() {
+        // FIX r2 M1: XFD1048576 at 10 % is hundreds of thousands of pages.
+        let mut a = app();
+        a.pkg.workbook.sheets[0].set_cell(1_048_575, 16_383, Cell::number(1.0));
+        call(&mut a, "page.setup", obj(vec![("scale", n(10.0))]));
+        let e = dispatch(&mut a, "print.pages", &Json::Null).unwrap_err();
+        assert!(e.contains("more than 100000 pages"), "{e}");
+        let e = dispatch(&mut a, "print.pages", &obj(vec![("what", s("workbook"))])).unwrap_err();
+        assert!(e.contains("more than 100000 pages"), "{e}");
+        let out = std::env::temp_dir().join(format!("xlsxy-too-many-{}.pdf", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let e = dispatch(
+            &mut a,
+            "wb.export-pdf",
+            &obj(vec![("path", s(&out.to_string_lossy()))]),
+        )
+        .unwrap_err();
+        assert!(e.contains("more than 100000 pages"), "{e}");
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn grouped_sheets_take_the_first_sheets_setup_but_keep_their_print_areas() {
+        let mut a = app();
+        call(&mut a, "sheet.add", obj(vec![("name", s("Two"))]));
+        a.sheet = 0;
+        call(
+            &mut a,
+            "print-area.set",
+            obj(vec![("range", s("A1:B2")), ("sheet", s("Two"))]),
+        );
+        call(
+            &mut a,
+            "page.header",
+            obj(vec![("sheet", n(0.0)), ("center", s("Report"))]),
+        );
+        call(
+            &mut a,
+            "page.setup",
+            obj(vec![
+                ("sheets", Json::Arr(vec![n(0.0), s("Two")])),
+                ("orientation", s("landscape")),
+            ]),
+        );
+        let two = &a.pkg.workbook.sheets[1].page_setup;
+        assert_eq!(two.orientation.as_str(), "landscape");
+        assert_eq!(two.header_footer.odd_header.as_deref(), Some("&CReport"));
+        let r = call(&mut a, "page.setup", obj(vec![("sheet", s("Two"))]));
+        assert_eq!(r.get_str("printArea"), Some("A1:B2"));
+    }
+
+    #[test]
+    fn header_fields_typed_in_editor_form_are_stored_as_excel_codes() {
+        // FIL-CASE-041.
+        let mut a = app();
+        let r = call(
+            &mut a,
+            "page.header",
+            obj(vec![
+                ("center", s("R&&D &[Page] of &[Pages]")),
+                ("right", s("&[Tab]")),
+            ]),
+        );
+        assert_eq!(r.get_str("stored"), Some("&CR&&D &P of &N&R&A"));
+        let r = call(
+            &mut a,
+            "page.header",
+            obj(vec![("part", s("footer")), ("left", s("&[Path]&[File]"))]),
+        );
+        assert_eq!(r.get_str("stored"), Some("&L&Z&F"));
+        let ws = saved_sheet(&a, 0);
+        assert!(
+            ws.contains("<headerFooter><oddHeader>&amp;CR&amp;&amp;D &amp;P of &amp;N&amp;R&amp;A</oddHeader><oddFooter>&amp;L&amp;Z&amp;F</oddFooter></headerFooter>"),
+            "{ws}"
+        );
+        // Reading gives the editor form back.
+        let r = call(&mut a, "page.header", Json::Null);
+        assert_eq!(r.get_str("center"), Some("R&&D &[Page] of &[Pages]"));
+        assert_eq!(r.get_str("right"), Some("&[Tab]"));
+        assert_eq!(r.get("changed"), Some(&Json::Bool(false)));
+        // Clearing every section removes it.
+        call(
+            &mut a,
+            "page.header",
+            obj(vec![("part", s("footer")), ("left", s(""))]),
+        );
+        assert_eq!(
+            a.pkg.workbook.sheets[0].page_setup.header_footer.odd_footer,
+            None
+        );
+    }
+
+    #[test]
+    fn a_header_picture_can_be_kept_but_not_added() {
+        let mut a = app();
+        let e = dispatch(&mut a, "page.header", &obj(vec![("left", s("&[Picture]"))])).unwrap_err();
+        assert!(e.contains("&[Picture]"), "{e}");
+        assert!(!a.modified);
+        a.pkg.workbook.sheets[0].page_setup.header_footer.odd_header = Some("&L&G".into());
+        let r = call(
+            &mut a,
+            "page.header",
+            obj(vec![("left", s("&[Picture]")), ("right", s("x"))]),
+        );
+        assert_eq!(r.get_str("stored"), Some("&L&G&Rx"));
+        // FIX r1 m7: the picture belongs to its section; another can't take it.
+        let e = dispatch(
+            &mut a,
+            "page.header",
+            &obj(vec![("left", s("&[Picture]")), ("right", s("&[Picture]"))]),
+        )
+        .unwrap_err();
+        assert!(e.contains("right section"), "{e}");
+        let e = dispatch(
+            &mut a,
+            "page.header",
+            &obj(vec![("right", s("&[Picture]"))]),
+        )
+        .unwrap_err();
+        assert!(e.contains("right section"), "{e}");
+        // FIX r2 m5: a section code can't smuggle a picture across.
+        let e = dispatch(
+            &mut a,
+            "page.header",
+            &obj(vec![("left", s("&[Picture]&R&[Picture]"))]),
+        )
+        .unwrap_err();
+        assert!(e.contains("starts a section"), "{e}");
+        assert_eq!(
+            a.pkg.workbook.sheets[0]
+                .page_setup
+                .header_footer
+                .odd_header
+                .as_deref(),
+            Some("&L&G&Rx")
+        );
+        let long = "x".repeat(256);
+        assert!(dispatch(&mut a, "page.header", &obj(vec![("left", s(&long))])).is_err());
+    }
+
+    #[test]
+    fn print_area_set_add_and_clear() {
+        // FIL-CASE-045.
+        let mut a = app();
+        fill(&mut a, 40, 10);
+        let r = call(&mut a, "print-area.set", obj(vec![("range", s("A1:C10"))]));
+        assert_eq!(r.get_str("printArea"), Some("Sheet1!$A$1:$C$10"));
+        call(&mut a, "print-area.add", obj(vec![("range", s("E1:F5"))]));
+        let wb = saved_workbook(&a);
+        assert!(
+            wb.contains(r#"<definedName name="_xlnm.Print_Area" localSheetId="0">Sheet1!$A$1:$C$10,Sheet1!$E$1:$F$5</definedName>"#),
+            "{wb}"
+        );
+        let r = call(&mut a, "print-area.clear", Json::Null);
+        assert_eq!(r.get("printArea"), Some(&Json::Null));
+        assert!(!saved_workbook(&a).contains("Print_Area"));
+        a.undo();
+        assert!(saved_workbook(&a).contains("Print_Area"));
+        let e = dispatch(
+            &mut a,
+            "print-area.set",
+            &obj(vec![("range", s("A1:C10,bogus"))]),
+        )
+        .unwrap_err();
+        assert!(e.contains("bad range"), "{e}");
+    }
+
+    #[test]
+    fn print_titles_set_and_clear_each_part() {
+        let mut a = app();
+        let r = call(
+            &mut a,
+            "print-titles.set",
+            obj(vec![("rows", s("1:2")), ("cols", s("A:A"))]),
+        );
+        let t = r.get("printTitles").unwrap();
+        assert_eq!(
+            (t.get_str("rows"), t.get_str("cols")),
+            (Some("1:2"), Some("A:A"))
+        );
+        assert!(saved_workbook(&a).contains(
+            r#"<definedName name="_xlnm.Print_Titles" localSheetId="0">Sheet1!$A:$A,Sheet1!$1:$2</definedName>"#
+        ));
+        let r = call(&mut a, "print-titles.set", obj(vec![("cols", Json::Null)]));
+        let t = r.get("printTitles").unwrap();
+        assert_eq!(
+            (t.get_str("rows"), t.get("cols")),
+            (Some("1:2"), Some(&Json::Null))
+        );
+        let e = dispatch(&mut a, "print-titles.set", &obj(vec![("rows", s("A:A"))])).unwrap_err();
+        assert!(e.contains("whole rows"), "{e}");
+    }
+
+    #[test]
+    fn page_breaks_insert_remove_reset_and_undo() {
+        // FIL-CASE-046.
+        let mut a = app();
+        fill(&mut a, 60, 8);
+        for cell in ["A14", "D1", "F30"] {
+            call(&mut a, "page-break.insert", obj(vec![("cell", s(cell))]));
+        }
+        let ws = saved_sheet(&a, 0);
+        assert!(
+            ws.contains(r#"<rowBreaks count="2" manualBreakCount="2"><brk id="13" max="16383" man="1"/><brk id="29" max="16383" man="1"/></rowBreaks><colBreaks count="2" manualBreakCount="2"><brk id="3" max="1048575" man="1"/><brk id="5" max="1048575" man="1"/></colBreaks>"#),
+            "{ws}"
+        );
+        let r = call(&mut a, "page-break.remove", obj(vec![("cell", s("F30"))]));
+        assert_eq!(r.get("rowBreaks").unwrap().to_string(), "[13]");
+        assert_eq!(r.get("colBreaks").unwrap().to_string(), "[3]");
+        let r = call(&mut a, "page-break.reset", Json::Null);
+        assert_eq!(r.get("changed"), Some(&Json::Bool(true)));
+        let ws = saved_sheet(&a, 0);
+        assert!(!ws.contains("Breaks"), "{ws}");
+        a.undo();
+        assert_eq!(
+            gridcore::print::area::manual_breaks(&a.pkg.workbook.sheets[0]),
+            (vec![13], vec![3])
+        );
+        let r = call(&mut a, "page-break.insert", obj(vec![("cell", s("A1"))]));
+        assert_eq!(r.get("changed"), Some(&Json::Bool(false)));
+    }
+
+    #[test]
+    fn print_pages_reports_each_pages_range_titles_and_number() {
+        // FIL-CASE-042's shape.
+        let mut a = app();
+        fill(&mut a, 200, 13);
+        call(
+            &mut a,
+            "print-titles.set",
+            obj(vec![("rows", s("1:1")), ("cols", s("A:A"))]),
+        );
+        call(
+            &mut a,
+            "print-area.set",
+            obj(vec![("range", s("A1:F100,H1:M50"))]),
+        );
+        call(
+            &mut a,
+            "page.setup",
+            obj(vec![
+                ("pageOrder", s("overThenDown")),
+                ("fitToWidth", n(1.0)),
+                ("fitToHeight", n(0.0)),
+            ]),
+        );
+        let r = call(&mut a, "print.pages", Json::Null);
+        let pages = r.get("pages").unwrap().as_array().unwrap();
+        assert_eq!(r.get_usize("total"), Some(pages.len()));
+        assert_eq!(pages[0].get_str("range"), Some("A1:F45"));
+        assert_eq!(pages[0].get("titleRows"), Some(&Json::Null));
+        assert_eq!(pages[1].get_str("titleRows"), Some("1:1"));
+        // The second range starts a page of its own, with column A repeated.
+        let h = pages
+            .iter()
+            .find(|p| p.get_str("range").is_some_and(|r| r.starts_with("H1")))
+            .unwrap();
+        assert_eq!(h.get_str("titleCols"), Some("A:A"));
+        let r = call(
+            &mut a,
+            "print.pages",
+            obj(vec![
+                ("ignorePrintAreas", Json::Bool(true)),
+                ("from", n(2.0)),
+                ("to", n(2.0)),
+            ]),
+        );
+        assert_eq!(r.get("pages").unwrap().as_array().unwrap().len(), 1);
+        let r = call(
+            &mut a,
+            "print.pages",
+            obj(vec![("what", s("selection")), ("range", s("B2:C3,E5"))]),
+        );
+        let pages = r.get("pages").unwrap().as_array().unwrap();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[1].get_str("range"), Some("E5"));
+        assert!(dispatch(&mut a, "print.pages", &obj(vec![("what", s("chart"))])).is_err());
+        assert!(dispatch(&mut a, "print.pages", &obj(vec![("what", s("selection"))])).is_err());
+    }
+
+    #[test]
+    fn export_pdf_writes_once_and_refuses_an_empty_sheet() {
+        // FIL-CASE-043.
+        let dir = std::env::temp_dir().join(format!("xlsxy-pdf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut a = app();
+        fill(&mut a, 100, 13);
+        call(
+            &mut a,
+            "page.header",
+            obj(vec![("center", s("Page &[Page] of &[Pages]"))]),
+        );
+        call(&mut a, "sheet.add", obj(vec![("name", s("Empty"))]));
+        a.sheet = 0;
+        let out = dir.join("out.pdf");
+        let path = out.to_string_lossy().into_owned();
+        let r = call(&mut a, "wb.export-pdf", obj(vec![("path", s(&path))]));
+        let bytes = std::fs::read(&out).unwrap();
+        assert!(bytes.starts_with(b"%PDF-"));
+        let text = String::from_utf8_lossy(&bytes);
+        let pages = r.get_usize("pages").unwrap();
+        assert!(text.contains(&format!("(Page 1 of {pages}) Tj")), "header");
+        assert!(text.contains(&format!("/Count {pages}")));
+        let e = dispatch(&mut a, "wb.export-pdf", &obj(vec![("path", s(&path))])).unwrap_err();
+        assert!(e.starts_with("already exists"), "{e}");
+        let empty = dir.join("empty.pdf");
+        let e = dispatch(
+            &mut a,
+            "wb.export-pdf",
+            &obj(vec![
+                ("path", s(&empty.to_string_lossy())),
+                ("sheet", s("Empty")),
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(e, "We didn't find anything to print.");
+        assert!(!empty.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

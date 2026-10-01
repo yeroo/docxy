@@ -108,7 +108,7 @@ impl Backstage {
                 }
             }
             Pane::Export => {
-                let last = self.save_types.len();
+                let last = self.save_types.len() + self.export_extra.len();
                 match key.code {
                     KeyCode::Up => self.export_sel = self.export_sel.saturating_sub(1),
                     KeyCode::Down => self.export_sel = (self.export_sel + 1).min(last),
@@ -195,13 +195,17 @@ impl Backstage {
         }
     }
 
-    /// Run Export's highlighted row: the quick export, or Change File Type
-    /// (Save As with that type picked).
+    /// Run Export's highlighted row: the quick export
+    /// ([`BackstageEvent::Export`]), one of the host's extra exports
+    /// ([`BackstageEvent::ExportExtra`]), or Change File Type (Save As with
+    /// that type picked).
     fn export_activate(&mut self, host: &dyn BackstageHost) -> BackstageEvent {
+        let extra = self.export_extra.len();
         match self.export_sel.checked_sub(1) {
             None => BackstageEvent::Export,
+            Some(i) if i < extra => BackstageEvent::ExportExtra(i),
             Some(i) => {
-                self.begin_save_as(host.default_save_name(), Some(i));
+                self.begin_save_as(host.default_save_name(), Some(i - extra));
                 BackstageEvent::None
             }
         }
@@ -389,13 +393,18 @@ impl Backstage {
             }
             return BackstageEvent::None;
         }
-        // Export's rows: the quick export at y 3, the types from y 6 (see
-        // `draw_export`). A click selects; a click on the selection runs it.
+        // Export's rows: the quick export at y 3, the extra exports under it,
+        // the types three rows after those (see `draw_export`). A click
+        // selects; a click on the selection runs it.
         if self.item == Item::Export && !self.save_types.is_empty() {
+            let extra = self.export_extra.len();
+            let types_y = 6 + extra as u16;
             let row = match y {
-                3 => Some(0),
-                y if y >= 6 => Some(self.layout.list_start + (y - 6) as usize + 1)
-                    .filter(|&r| r <= self.save_types.len()),
+                y if (3..3 + 1 + extra as u16).contains(&y) => Some((y - 3) as usize),
+                y if y >= types_y => {
+                    Some(self.layout.list_start + (y - types_y) as usize + 1 + extra)
+                        .filter(|&r| r <= self.save_types.len() + extra)
+                }
                 _ => None,
             };
             if let Some(r) = row {
@@ -576,6 +585,59 @@ mod tests {
         bs.item = Item::Info;
         bs.pane = Pane::Menu;
         bs
+    }
+
+    const TYPES: &[crate::SaveType] = &[
+        crate::SaveType {
+            label: "Excel Workbook",
+            ext: "xlsx",
+        },
+        crate::SaveType {
+            label: "CSV UTF-8",
+            ext: "csv",
+        },
+    ];
+
+    #[test]
+    fn extra_exports_sit_between_the_quick_export_and_the_types() {
+        let mut bs = Backstage::open(std::env::temp_dir(), &["xlsx"])
+            .with_save_types(TYPES, "Export CSV")
+            .with_extra_exports(&["Export PDF"]);
+        bs.item = Item::Export;
+        bs.pane = Pane::Export;
+        assert!(matches!(
+            bs.key(key(KeyCode::Enter), &TestHost),
+            BackstageEvent::Export
+        ));
+        bs.key(key(KeyCode::Down), &TestHost);
+        assert!(matches!(
+            bs.key(key(KeyCode::Enter), &TestHost),
+            BackstageEvent::ExportExtra(0)
+        ));
+        // Down reaches the last type and stops there.
+        for _ in 0..5 {
+            bs.key(key(KeyCode::Down), &TestHost);
+        }
+        assert_eq!(bs.export_sel, 3);
+        bs.key(key(KeyCode::Enter), &TestHost);
+        assert_eq!(
+            bs.type_sel, 1,
+            "the second type, not shifted by the extra row"
+        );
+
+        // Clicks: the extra row at y 4, the first type at y 7.
+        let mut bs = Backstage::open(std::env::temp_dir(), &["xlsx"])
+            .with_save_types(TYPES, "Export CSV")
+            .with_extra_exports(&["Export PDF"]);
+        bs.item = Item::Export;
+        bs.mouse(40, 4, &TestHost);
+        assert_eq!(bs.export_sel, 1);
+        assert!(matches!(
+            bs.mouse(40, 4, &TestHost),
+            BackstageEvent::ExportExtra(0)
+        ));
+        bs.mouse(40, 7, &TestHost);
+        assert_eq!(bs.export_sel, 2);
     }
 
     #[test]
