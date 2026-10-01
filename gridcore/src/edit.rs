@@ -914,16 +914,25 @@ pub fn rename_sheet(wb: &mut Workbook, idx: usize, new_name: &str) {
 
 /// Before the sheets named in `removed` leave the workbook, turn every cell
 /// formula's reference to one of them into `#REF!`
-/// ([`crate::formula::remove_sheet_refs_in_expr`]), with `#REF!` as the
-/// cell's value. The formulas [`rename_sheet`] rewrites are the ones covered
-/// (shared groups were expanded at load); a formula that names none of them
-/// keeps its text exactly.
+/// ([`crate::formula::remove_sheet_refs_in_expr`]). The formulas
+/// [`rename_sheet`] rewrites are the ones covered (shared groups were
+/// expanded at load); a formula that names none of them keeps its text
+/// exactly.
+///
+/// A rewritten cell's cached value is its new formula evaluated
+/// ([`crate::engine::eval_formula_at`]), so `IFERROR(#REF!,0)` caches 0
+/// rather than `#REF!`. An array formula's whole block (its `spill`) takes
+/// the anchor's value, which is right once the removed range has collapsed
+/// to the scalar `#REF!`. Only the rewritten cells are evaluated: a cell that
+/// reads one keeps its cached value, and a volatile formula keeps its own,
+/// until the file is next calculated.
 pub fn remove_sheet_refs(wb: &mut Workbook, removed: &[String]) {
     if removed.is_empty() {
         return;
     }
-    for sheet in &mut wb.sheets {
-        for cell in sheet.cells.values_mut() {
+    let mut rewritten = Vec::new();
+    for (s, sheet) in wb.sheets.iter_mut().enumerate() {
+        for (&(r, c), cell) in sheet.cells.iter_mut() {
             let Some(src) = &cell.formula else {
                 continue;
             };
@@ -933,7 +942,36 @@ pub fn remove_sheet_refs(wb: &mut Workbook, removed: &[String]) {
             let rewrite = |e: &Expr| crate::formula::remove_sheet_refs_in_expr(e, removed);
             if let Some(updated) = rewrite_if_changed(src, rewrite) {
                 cell.formula = Some(updated);
-                cell.value = CellValue::Error("#REF!".into());
+                rewritten.push((s, r, c));
+            }
+        }
+    }
+    // Evaluated once every rewrite is in, against the rewritten workbook.
+    let values: Vec<CellValue> = rewritten
+        .iter()
+        .map(|&(s, r, c)| {
+            let src = wb.sheets[s].cells[&(r, c)].formula.as_deref().unwrap_or("");
+            crate::engine::value_to_cell(crate::engine::eval_formula_at(wb, s, r, c, src))
+        })
+        .collect();
+    for ((s, r, c), value) in rewritten.into_iter().zip(values) {
+        let sheet = &mut wb.sheets[s];
+        let Some(cell) = sheet.cells.get_mut(&(r, c)) else {
+            continue;
+        };
+        let block = cell.spill.filter(|_| cell.is_array_formula());
+        cell.value = value.clone();
+        let Some((rows, cols)) = block else {
+            continue;
+        };
+        for dr in 0..rows {
+            for dc in 0..cols {
+                if (dr, dc) == (0, 0) {
+                    continue;
+                }
+                if let Some(follower) = sheet.cells.get_mut(&(r + dr, c + dc)) {
+                    follower.value = value.clone();
+                }
             }
         }
     }

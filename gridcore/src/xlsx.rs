@@ -12815,7 +12815,34 @@ mod kind_tests {
         }
         let mut array = Cell::formula("Macro1!A1:A2");
         array.f_attrs = Some(" t=\"array\" ref=\"C1:C2\"".into());
+        array.spill = Some((2, 1));
         data.set_cell(0, 2, array);
+        // The block's other cell, holding a value computed from Macro1.
+        data.set_cell(1, 2, Cell::number(7.0));
+        // Error handling sees the #REF!, so the cached value is its answer.
+        let handled = [
+            (
+                1,
+                "IFERROR(Macro1!A1,0)",
+                "IFERROR(#REF!,0)",
+                CellValue::Number(0.0),
+            ),
+            (
+                2,
+                "ISERROR(Macro1!A1)",
+                "ISERROR(#REF!)",
+                CellValue::Bool(true),
+            ),
+            (
+                3,
+                "Report!A1*0+Macro1!A1",
+                "Report!A1*0+#REF!",
+                CellValue::Error("#REF!".into()),
+            ),
+        ];
+        for (r, src, _, _) in &handled {
+            data.set_cell(*r, 3, Cell::formula(src));
+        }
         let formulas = |pkg: &SheetPackage| -> Vec<(u32, u32, Option<String>)> {
             let mut out: Vec<_> = pkg.workbook.sheets[0]
                 .cells
@@ -12841,6 +12868,17 @@ mod kind_tests {
             let array = data.cell(0, 2).unwrap();
             assert_eq!(array.formula.as_deref(), Some("#REF!"));
             assert!(array.f_attrs.as_deref().is_some_and(is_array_f));
+            assert_eq!(array.value, CellValue::Error("#REF!".into()));
+            assert_eq!(
+                data.cell(1, 2).unwrap().value,
+                CellValue::Error("#REF!".into()),
+                "the array's block follows its anchor"
+            );
+            for (r, _, want, value) in &handled {
+                let cell = data.cell(*r, 3).unwrap();
+                assert_eq!(cell.formula.as_deref(), Some(*want), "row {r}");
+                assert_eq!(&cell.value, value, "row {r}");
+            }
         }
         assert_eq!(
             (formulas(&pkg), pkg.workbook.sheets.len()),

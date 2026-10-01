@@ -936,7 +936,7 @@ fn to_table_info(t: &crate::sheet::Table) -> crate::formula::TableInfo {
 
 /// Engine result → stored cell value. A formula referencing an empty cell
 /// yields 0 in Excel (`=Z99` shows 0), so Empty lands as Number(0).
-fn value_to_cell(v: Value) -> CellValue {
+pub(crate) fn value_to_cell(v: Value) -> CellValue {
     match v {
         Value::Empty => CellValue::Number(0.0),
         Value::Num(n) => CellValue::Number(n),
