@@ -3,13 +3,21 @@
 # legacy readers: the same workbooks as corpus/xlsx, written by Excel itself.
 #
 # Run from the repo root in Windows PowerShell:  powershell -File scripts/make-legacy-fixtures.ps1
+# (-Sections corpus,extra,addin picks which parts below to rebuild; all by default).
 #
 # The ProgID Excel.Application may be registered to xlcomshim on a dev box, so
 # this starts EXCEL.EXE itself and binds to its running class object with
 # CLSCTX_LOCAL_SERVER. One Excel process per source file: a batch in one
 # process stopped silently after a few files.
-param([string]$Excel = "C:\Program Files\Microsoft Office\Root\Office16\EXCEL.EXE")
+param(
+  [string]$Excel = "C:\Program Files\Microsoft Office\Root\Office16\EXCEL.EXE",
+  [string[]]$Sections = @('corpus', 'extra', 'addin')
+)
 $ErrorActionPreference = 'Stop'
+# Under -File, `-Sections corpus,extra` arrives as one string 'corpus,extra'.
+$Sections = @($Sections -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+$unknown = @($Sections | Where-Object { $_ -notin @('corpus', 'extra', 'addin') })
+if ($unknown.Count -gt 0) { throw "unknown section(s): $($unknown -join ', ') (expected corpus, extra, addin)" }
 Add-Type -TypeDefinition @"
 using System; using System.Runtime.InteropServices;
 public static class RealCom {
@@ -17,6 +25,7 @@ public static class RealCom {
   public static object Local(string clsid) { Guid c = new Guid(clsid); Guid i = new Guid("00020400-0000-0000-C000-000000000046"); object o; int hr = CoCreateInstance(ref c, IntPtr.Zero, 4, ref i, out o); if (hr != 0) throw new Exception("hr=" + hr.ToString("X")); return o; }
 }
 "@
+if ($Sections -contains 'corpus') {
 $out = Join-Path $PSScriptRoot "..\corpus\legacy"
 New-Item -ItemType Directory -Force $out | Out-Null
 foreach ($src in Get-ChildItem (Join-Path $PSScriptRoot "..\corpus\xlsx\*.xlsx")) {
@@ -35,11 +44,13 @@ foreach ($src in Get-ChildItem (Join-Path $PSScriptRoot "..\corpus\xlsx\*.xlsx")
     Start-Sleep 2; if (!$p.HasExited) { $p.Kill() }
   }
 }
+}
 
 # corpus/legacy/extra: workbooks built by Excel itself, so the .xlsx source is
 # Excel's too. chart-embedded: a sheet with formulas and an embedded column
 # chart, whose .xls carries the chart as a BOF..EOF substream inside the
 # worksheet's.
+if ($Sections -contains 'extra') {
 $extra = Join-Path $PSScriptRoot "..\corpus\legacy\extra"
 New-Item -ItemType Directory -Force $extra | Out-Null
 $extra = (Resolve-Path $extra).Path
@@ -63,4 +74,69 @@ try {
 } finally {
   $xl.Quit(); [Runtime.InteropServices.Marshal]::ReleaseComObject($xl) | Out-Null
   Start-Sleep 2; if (!$p.HasExited) { $p.Kill() }
+}
+}
+
+# corpus/legacy/addin: a workbook calling a function of the add-in shipped
+# with Office (Library\EUROTOOL.XLAM). Excel stores the call as a library
+# external link: `[1]!EUROCONVERT(...)` in the .xlsx, a ptgNameX into a
+# BrtSupBookSrc book in the .xlsb (#888). No .xls: that SaveAs hangs on a
+# modal dialog. The workbook is added before the add-in is opened (opening
+# it with no workbook fails over COM).
+if ($Sections -contains 'addin') {
+$addin = Join-Path $PSScriptRoot "..\corpus\legacy\addin"
+New-Item -ItemType Directory -Force $addin | Out-Null
+$addin = (Resolve-Path $addin).Path
+# SaveAs over an existing file hung Excel here (no dialog shows under
+# automation), so the old outputs go first.
+Remove-Item (Join-Path $addin "*.xls*") -ErrorAction SilentlyContinue
+$library = Join-Path (Split-Path $Excel) "Library\EUROTOOL.XLAM"
+$p = Start-Process $Excel -ArgumentList "/automation","-Embedding" -PassThru
+Start-Sleep -Seconds 8
+$xl = [RealCom]::Local("00024500-0000-0000-C000-000000000046")
+$xl.DisplayAlerts = $false
+try {
+  $wb = $xl.Workbooks.Add()
+  $xl.Workbooks.Open($library) | Out-Null
+  $wb.Activate()
+  $ws = $wb.Worksheets.Item(1)
+  $ws.Name = "Data"
+  $ws.Range("A1").Value2 = 100
+  $ws.Range("B1").Formula = '=EUROCONVERT(A1,"DEM","EUR")'
+  $ws.Range("B2").Formula = '=EUROCONVERT(A1,"FRF","EUR")*2'
+  $wb.Names.Add("Rate", "=Data!`$A`$1") | Out-Null
+  $xl.Calculate()
+  $wb.CheckCompatibility = $false
+  $wb.SaveAs((Join-Path $addin "addin-udf.xlsx"), 51)
+  $wb.SaveAs((Join-Path $addin "addin-udf.xlsb"), 50)
+  $wb.Close($false)
+
+  # ext-name: names of an ordinary workbook (a range and a constant), which
+  # the .xlsb stores the same way, a ptgNameX into a BrtSupBookSrc book, but
+  # with a formula per name and the book's cells cached. The import doesn't
+  # read those, so the formulas are dropped and the values kept. The source
+  # workbook is saved first so the link names it.
+  $src = $xl.Workbooks.Add()
+  $s = $src.Worksheets.Item(1)
+  $s.Name = "P"
+  $s.Range("A1").Value2 = 3
+  $s.Range("A2").Value2 = 4
+  $src.Names.Add("Prices", "=P!`$A`$1:`$A`$2") | Out-Null
+  $src.Names.Add("Half", "=0.5") | Out-Null
+  $src.SaveAs((Join-Path $addin "ext-name-src.xlsx"), 51)
+  $wb = $xl.Workbooks.Add()
+  $ws = $wb.Worksheets.Item(1)
+  $ws.Name = "Data"
+  $ws.Range("A1").Formula = "=SUM('ext-name-src.xlsx'!Prices)"
+  $ws.Range("A2").Formula = "='ext-name-src.xlsx'!Half*2"
+  $xl.Calculate()
+  $wb.CheckCompatibility = $false
+  $wb.SaveAs((Join-Path $addin "ext-name.xlsx"), 51)
+  $wb.SaveAs((Join-Path $addin "ext-name.xlsb"), 50)
+  $wb.Close($false)
+  $src.Close($false)
+} finally {
+  $xl.Quit(); [Runtime.InteropServices.Marshal]::ReleaseComObject($xl) | Out-Null
+  Start-Sleep 2; if (!$p.HasExited) { $p.Kill() }
+}
 }
