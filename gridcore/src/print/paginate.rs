@@ -5,7 +5,8 @@
 //! are skipped. Pages break where a manual break says, and otherwise where
 //! the next row or column would cross the printable area: the paper less
 //! its margins, at the sheet's scale (`Adjust to`, or the largest whole
-//! percentage that fits `Fit to` pages, never above 100 %). Print titles
+//! percentage that fits `Fit to` pages, never above 100 %). While `Fit to`
+//! is on, manual breaks are ignored, as Excel ignores them. Print titles
 //! repeat on every page that doesn't already show them. Pages run down then
 //! over, or over then down, and are numbered across the whole job.
 //!
@@ -96,7 +97,8 @@ pub struct Pages {
     pub pages: Vec<Page>,
     /// How many pages the whole job has: `&N`.
     pub total: u32,
-    /// The job has more than [`MAX_PAGES`] pages; layout stopped there.
+    /// The job has more than [`MAX_PAGES`] pages: layout stopped before the
+    /// range that would cross the limit, and laid out no sheet after it.
     pub truncated: bool,
 }
 
@@ -197,15 +199,7 @@ fn prints(wb: &Workbook, sheet: &Sheet, row: u32, col: u32) -> bool {
 
 /// The used area: A1 to the last row and column with a printed cell.
 pub fn used_area(wb: &Workbook, sheet: usize) -> Option<Rect> {
-    let s = &wb.sheets[sheet];
-    let mut last: Option<(u32, u32)> = None;
-    for &(r, c) in s.cells.keys() {
-        if prints(wb, s, r, c) {
-            let (lr, lc) = last.unwrap_or((0, 0));
-            last = Some((lr.max(r), lc.max(c)));
-        }
-    }
-    last.map(|(r, c)| (0, 0, r, c))
+    printed_extent(wb, sheet, (0, 0, MAX_ROWS - 1, MAX_COLS - 1))
 }
 
 /// The ranges a sheet prints, in order.
@@ -462,19 +456,20 @@ pub fn paginate(wb: &Workbook, job: &Job) -> Pages {
     let mut truncated = false;
     for (sheet, ranges) in jobs {
         let (mut pages, cut) = sheet_pages(wb, sheet, &ranges, MAX_PAGES - all.len());
-        truncated |= cut;
-        if pages.is_empty() {
-            continue;
-        }
-        if let Some(n) = wb.sheets[sheet].page_setup.first_page_number {
+        if let Some(n) = wb.sheets[sheet]
+            .page_setup
+            .first_page_number
+            .filter(|_| !pages.is_empty())
+        {
             next = n;
         }
         for p in &mut pages {
             p.number = next;
-            next += 1;
+            next = next.saturating_add(1);
         }
         all.extend(pages);
-        if truncated {
+        if cut {
+            truncated = true;
             break;
         }
     }

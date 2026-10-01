@@ -144,8 +144,26 @@ impl Sections {
     }
 
     /// The sections from the editor's form, each checked against
-    /// [`MAX_SECTION`].
+    /// [`MAX_SECTION`]. A section code (`&L`, `&C`, `&R`) inside a section is
+    /// refused: it would start another section, and in the editor a literal
+    /// ampersand is typed `&&` (FIL-136).
     pub fn from_editor(left: &str, center: &str, right: &str) -> Result<Sections, String> {
+        for (name, text) in [("left", left), ("center", center), ("right", right)] {
+            let mut chars = text.chars();
+            while let Some(c) = chars.next() {
+                if c != '&' {
+                    continue;
+                }
+                match chars.next() {
+                    Some(k @ ('L' | 'C' | 'R')) => {
+                        return Err(format!(
+                            "the {name} section has \"&{k}\", which starts a section; type a literal ampersand as \"&&\""
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
         let s = Sections {
             left: encode(left),
             center: encode(center),
@@ -164,13 +182,6 @@ impl Sections {
             }
         }
         Ok(s)
-    }
-
-    /// Does any section show a picture (`&G`)?
-    pub fn has_picture(&self) -> bool {
-        [&self.left, &self.center, &self.right]
-            .iter()
-            .any(|t| has_code(t, 'G'))
     }
 }
 
@@ -254,7 +265,11 @@ pub fn render(section: &str, f: &Fields) -> String {
                         .take_while(|c| c.is_ascii_digit())
                         .collect();
                     if let Ok(d) = digits.parse::<i64>() {
-                        n = if sign == '+' { n + d } else { n - d };
+                        n = if sign == '+' {
+                            n.saturating_add(d)
+                        } else {
+                            n.saturating_sub(d)
+                        };
                         i += 1 + digits.len();
                     }
                 }
@@ -325,6 +340,17 @@ mod tests {
     }
 
     #[test]
+    fn a_section_code_inside_a_section_is_refused() {
+        // FIX r2 m4: in the editor a literal ampersand is `&&`.
+        let e = Sections::from_editor("Smith &Co", "", "").unwrap_err();
+        assert!(e.contains("left section") && e.contains("&C"), "{e}");
+        assert!(Sections::from_editor("", "", "&[Picture]&R&[Picture]").is_err());
+        assert!(Sections::from_editor("&[Picture]&R&[Picture]", "", "").is_err());
+        let s = Sections::from_editor("Smith &&Co", "&B&[Page]", "").unwrap();
+        assert_eq!(Sections::parse(&s.compose()).left, "Smith &&Co");
+    }
+
+    #[test]
     fn a_trailing_ampersand_stays_in_its_section() {
         // FIX r1 m5.
         let s = Sections::from_editor("Smith &", "Page &[Page]", "").unwrap();
@@ -364,12 +390,18 @@ mod tests {
         );
         assert_eq!(render("&KFF0000red&G", &f), "red");
         assert_eq!(render("&P+10", &f), "12");
+        // FIX r2 m2: an absurd offset saturates instead of overflowing.
+        assert_eq!(render("&P+9223372036854775807", &f), i64::MAX.to_string());
+        assert_eq!(
+            render("&P-9223372036854775807", &f),
+            (2 - i64::MAX).to_string()
+        );
     }
 
     #[test]
     fn pictures_are_found_and_stripped() {
-        assert!(Sections::parse("&C&G").has_picture());
-        assert!(!Sections::parse("&C&&G").has_picture());
+        assert!(has_code(&Sections::parse("&C&G").center, 'G'));
+        assert!(!has_code(&Sections::parse("&C&&G").center, 'G'));
         assert_eq!(strip_pictures("&L&G&CTitle&&G"), "&L&CTitle&&G");
     }
 }

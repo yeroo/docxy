@@ -361,6 +361,25 @@ fn a_job_past_the_page_limit_is_cut_short() {
     let p = active(&wb);
     assert!(p.truncated);
     assert!(p.pages.len() <= MAX_PAGES);
+    // FIX r2 m1: no sheet after the one cut short is laid out.
+    let mut wb = book(&[(1, 1), (5, 5)]);
+    wb.sheets[0].set_cell(MAX_ROWS - 1, MAX_COLS - 1, Cell::number(1.0));
+    wb.sheets[0].page_setup.scale = 10;
+    let p = paginate(&wb, &Job::new(What::ActiveSheets(vec![0, 1])));
+    assert!(p.truncated);
+    assert!(p.pages.iter().all(|pg| pg.sheet == 0), "sheet 1 laid out");
+}
+
+#[test]
+fn a_page_number_at_the_top_of_its_range_does_not_overflow() {
+    // FIX r2 m2.
+    let mut wb = book(&[(100, 1)]);
+    wb.sheets[0].page_setup.first_page_number = Some(u32::MAX);
+    let p = active(&wb);
+    assert_eq!(
+        p.pages.iter().map(|p| p.number).collect::<Vec<_>>(),
+        vec![u32::MAX; 3]
+    );
 }
 
 #[test]
