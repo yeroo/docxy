@@ -193,8 +193,8 @@ impl Engine {
         match prev.filter(|p| cell.formula.is_some() && p.formula == cell.formula) {
             // What kind of formula it is comes from the cell's own previous
             // formula alone — not from the incoming cell, which may be a fresh
-            // one (Enter), a restyled clone, or a clone pasted from another
-            // address whose `ref`/`si`/`cm` are not this cell's.
+            // one (Enter) or a clone pasted from another address whose
+            // `ref`/`si`/`cm` are not this cell's.
             Some(p) => {
                 cell.f_attrs = p.f_attrs.clone();
                 own_array_ref(&mut cell, r, c);

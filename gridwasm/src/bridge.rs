@@ -1831,12 +1831,12 @@ impl Session {
     //     earlier version of this bucket used a lossy `sheet.add`-by-name
     //     inverse instead — replaced after review flagged that it would
     //     silently resurrect an EMPTY sheet as "undo".)
-    //   - `cell.format`: Task 3's empirical bucket A carries over unchanged —
-    //     it goes through the identical [`Session::apply`] path `range.set`
-    //     uses (only each cell's `style` index differs; value/formula/spill
-    //     untouched), so it lands in the SAME true wasm-undo-stack `Cells`
-    //     group -> `"undoSteps":1`, unconditionally (a range always covers
-    //     >=1 cell, unlike `range.set`'s possibly-empty `rows` batch).
+    //   - `cell.format`: Task 3's empirical bucket A carries over — it goes
+    //     through [`Session::apply_styles`] (only each cell's `style` index
+    //     changes; value/formula/spill untouched), which pushes ONE `Cells`
+    //     group (`styles_only`) onto the same true wasm undo stack
+    //     `range.set` uses -> `"undoSteps":1`, unconditionally (a range always
+    //     covers >=1 cell, unlike `range.set`'s possibly-empty `rows` batch).
     //   - `col.width`: Task 3 found the TUI's own F7/F8 width-adjust keys
     //     never push onto xlsxy's undo stack at all (no true inverse exists
     //     to reuse) -> here too, NOT pushed onto gridwasm's `undo`/`redo`
