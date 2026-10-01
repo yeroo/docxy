@@ -3472,8 +3472,9 @@ impl Scheduler<'_> {
         let cap = self
             .constraint_dates(t, linked)
             .and_then(|dates| match t.constraint {
-                ConstraintType::FinishNoLaterThan => Some(dates.milestone),
-                ConstraintType::StartNoLaterThan => Some(dates.milestone),
+                ConstraintType::FinishNoLaterThan | ConstraintType::StartNoLaterThan => {
+                    Some(dates.milestone)
+                }
                 _ => None,
             })
             .filter(|_| self.proj.honor_constraints);
