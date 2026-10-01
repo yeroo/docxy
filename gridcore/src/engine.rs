@@ -21,7 +21,9 @@ use crate::formula::{
     self, DynResult, Eval, ExcelError, Expr, Resolver, Value, always_recalc, collect_refs,
     contains_db_fn,
 };
-use crate::sheet::{Cell, CellMeta, CellValue, Sheet, Workbook, is_array_f, own_array_ref};
+use crate::sheet::{
+    Cell, CellMeta, CellValue, Sheet, Workbook, array_block, is_array_f, own_array_ref,
+};
 
 /// (sheet index, row, col) — the engine's cell address.
 pub type Key = (usize, u32, u32);
@@ -189,6 +191,10 @@ impl Engine {
     /// [`Engine::set_styles`], which leaves a spill whole.
     pub fn set_cell(&mut self, wb: &mut Workbook, key: Key, mut cell: Cell) {
         let (s, r, c) = key;
+        // A pasted anchor's extent is its source's, not this cell's: kept, it
+        // would claim (and overwrite) the values below the target. Evaluation
+        // works out the spill afresh.
+        cell.spill = None;
         let prev = wb.sheets.get(s).and_then(|sh| sh.cell(r, c));
         match prev.filter(|p| cell.formula.is_some() && p.formula == cell.formula) {
             // What kind of formula it is comes from the cell's own previous
@@ -207,7 +213,9 @@ impl Engine {
             }
             None if cell.formula.is_some() => {
                 cell.f_attrs = None;
-                cell.meta.get_or_insert_default().modern = true;
+                let m = cell.meta.get_or_insert_default();
+                m.modern = true;
+                forget_file_meta(m);
             }
             None => {}
         }
@@ -253,6 +261,172 @@ impl Engine {
     /// Restoring a snapshot is not typing.
     pub fn restore_cell(&mut self, wb: &mut Workbook, key: Key, cell: Cell) {
         self.put_cell(wb, key, cell);
+    }
+
+    /// Put a group of cells on sheet `s` back exactly as they were (an undo or
+    /// redo of one edit), whatever order they come in. The cells must be one
+    /// snapshot, all taken at the same moment: then a value inside a spill
+    /// anchor's extent is that anchor's spilled value. Those values are
+    /// written as styled blanks first and the anchors last, so each anchor's
+    /// recalc refills its spill; restored one by one, a spilled value landing
+    /// after its anchor would block it (`#SPILL!`). An anchor the engine can't
+    /// evaluate keeps its snapshot values instead.
+    pub fn restore_cells(&mut self, wb: &mut Workbook, s: usize, cells: &[(u32, u32, Cell)]) {
+        let anchors: Vec<(u32, u32, &Cell)> = cells
+            .iter()
+            .filter(|(_, _, cl)| cl.formula.is_some() && cl.spill.is_some())
+            .map(|(r, c, cl)| (*r, *c, cl))
+            .collect();
+        let mut members = Vec::new();
+        for &(r, c, ref cell) in cells {
+            if cell.formula.is_some() && cell.spill.is_some() {
+                continue;
+            }
+            if cell.formula.is_none() && in_extent(&anchors, r, c) {
+                members.push((r, c, cell));
+                self.restore_cell(wb, (s, r, c), styled_blank(cell));
+            } else {
+                self.restore_cell(wb, (s, r, c), cell.clone());
+            }
+        }
+        let frozen: Vec<_> = anchors
+            .iter()
+            .filter_map(|&(r, c, cell)| {
+                self.restore_cell(wb, (s, r, c), cell.clone());
+                self.is_unsupported((s, r, c)).then_some((r, c, cell))
+            })
+            .collect();
+        self.refill_frozen(wb, s, &frozen, &members);
+    }
+
+    /// Write a copied `block` onto sheet `s` from `(br, bc)` (a paste), one
+    /// cell at a time through the engine. Rows may differ in length.
+    ///
+    /// A pasted cell is typed there ([`Engine::set_cell`]), except that the
+    /// block's spilling arrays come out spilling, as in Excel. An *anchor* is
+    /// a formula cell whose spill lies wholly inside the block, wherever it
+    /// lands, or (#785) a legacy array block (`t="array"`) pasted back at its
+    /// own address with its whole `ref` in the block. Its spilled values in the
+    /// block are written as styled blanks (as constants they would block its
+    /// spill), and the anchors go last so their recalc refills them.
+    ///
+    /// The in-place array block is restored as it was ([`Engine::restore_cell`]),
+    /// keeping its `<f>` attributes: a cut has already cleared its source, so
+    /// `set_cell` would see a blank target and type it. It claims no spill
+    /// beyond its `ref`, so it never takes over content outside the paste
+    /// (pasted at the same address on another sheet it stays an array there,
+    /// as in Excel). Its file metadata goes, as a typed formula's does: the
+    /// `cm` may index another workbook's metadata, and save resolves a fresh
+    /// one. Every other anchor goes through `set_cell`. An anchor the engine
+    /// can't evaluate keeps its copied values instead: they are put back as
+    /// its spill.
+    pub fn paste_block(
+        &mut self,
+        wb: &mut Workbook,
+        s: usize,
+        (br, bc): (u32, u32),
+        block: &[Vec<Cell>],
+    ) {
+        let in_block = |r: u32, c: u32| {
+            r >= br
+                && c >= bc
+                && block
+                    .get((r - br) as usize)
+                    .is_some_and(|row| ((c - bc) as usize) < row.len())
+        };
+        let inside = |r: u32, c: u32, (h, w): (u32, u32)| {
+            (r..r + h).all(|rr| (c..c + w).all(|cc| in_block(rr, cc)))
+        };
+        // Each anchor, with its spill (the in-place array block's cut to its
+        // stored ref) and whether it is restored rather than typed.
+        let mut anchors: Vec<(u32, u32, Cell, bool)> = Vec::new();
+        for (dr, row) in block.iter().enumerate() {
+            for (dc, cell) in row.iter().enumerate() {
+                let (r, c) = (br + dr as u32, bc + dc as u32);
+                if cell.formula.is_none() {
+                    continue;
+                }
+                let in_place = array_block(cell).filter(|&(r1, c1, r2, c2)| {
+                    (r1, c1) == (r, c) && inside(r, c, (r2 - r1 + 1, c2 - c1 + 1))
+                });
+                if let Some((r1, c1, r2, c2)) = in_place {
+                    let mut cell = cell.clone();
+                    cell.spill = cell
+                        .spill
+                        .map(|(h, w)| (h.min(r2 - r1 + 1), w.min(c2 - c1 + 1)));
+                    if let Some(m) = cell.meta.as_deref_mut() {
+                        forget_file_meta(m);
+                    }
+                    anchors.push((r, c, cell, true));
+                } else if cell.spill.is_some_and(|ext| inside(r, c, ext)) {
+                    anchors.push((r, c, cell.clone(), false));
+                }
+            }
+        }
+        let extents: Vec<(u32, u32, &Cell)> = anchors
+            .iter()
+            .map(|(r, c, cell, _)| (*r, *c, cell))
+            .collect();
+        let mut members = Vec::new();
+        for (dr, row) in block.iter().enumerate() {
+            for (dc, cell) in row.iter().enumerate() {
+                let (r, c) = (br + dr as u32, bc + dc as u32);
+                if extents.iter().any(|&(ar, ac, _)| (ar, ac) == (r, c)) {
+                    continue;
+                }
+                if cell.formula.is_none() && in_extent(&extents, r, c) {
+                    members.push((r, c, cell));
+                    self.set_cell(wb, (s, r, c), styled_blank(cell));
+                } else {
+                    self.set_cell(wb, (s, r, c), cell.clone());
+                }
+            }
+        }
+        let mut frozen = Vec::new();
+        for (r, c, cell, restore) in &anchors {
+            let key = (s, *r, *c);
+            if *restore {
+                self.restore_cell(wb, key, cell.clone());
+            } else {
+                self.set_cell(wb, key, cell.clone());
+            }
+            if self.is_unsupported(key) {
+                frozen.push((*r, *c, cell));
+            }
+        }
+        self.refill_frozen(wb, s, &frozen, &members);
+    }
+
+    /// Put the copied values of `frozen` anchors (ones the engine can't
+    /// evaluate, so their recalc refills nothing) back as their spill:
+    /// written into the sheet as an evaluated spill is (not through
+    /// `set_cell`, which would break it), then recalculated for their
+    /// dependents. `members` are the values written as blanks.
+    fn refill_frozen(
+        &mut self,
+        wb: &mut Workbook,
+        s: usize,
+        frozen: &[(u32, u32, &Cell)],
+        members: &[(u32, u32, &Cell)],
+    ) {
+        let Some(sheet) = wb.sheets.get_mut(s) else {
+            return;
+        };
+        for &(r, c, cell) in frozen {
+            if let Some(a) = sheet.cells.get_mut(&(r, c)) {
+                a.spill = cell.spill;
+            }
+        }
+        let mut refilled = Vec::new();
+        for &(r, c, cell) in members {
+            if in_extent(frozen, r, c) {
+                sheet.set_cell(r, c, cell.clone());
+                refilled.push((s, r, c));
+            }
+        }
+        if !refilled.is_empty() {
+            self.recalc_from(wb, &refilled);
+        }
     }
 
     fn put_cell(&mut self, wb: &mut Workbook, key: Key, cell: Cell) {
@@ -796,6 +970,37 @@ fn clear_spill(
         }
     }
     out
+}
+
+/// Is (r, c) inside the spill of one of `anchors` (other than an anchor
+/// itself)?
+fn in_extent(anchors: &[(u32, u32, &Cell)], r: u32, c: u32) -> bool {
+    anchors.iter().any(|&(ar, ac, a)| {
+        (ar, ac) != (r, c)
+            && a.spill
+                .is_some_and(|(h, w)| (ar..ar + h).contains(&r) && (ac..ac + w).contains(&c))
+    })
+}
+
+/// A blank keeping `cell`'s style: a spilled value written ahead of its
+/// anchor, which refills it.
+fn styled_blank(cell: &Cell) -> Cell {
+    Cell {
+        style: cell.style,
+        ..Cell::default()
+    }
+}
+
+/// Drop the metadata a cell brought from a file (`cm`, `vm`): its indices
+/// name entries in the metadata part of the workbook it came from, which a
+/// formula typed or pasted here need not share. A `cm` marked a dynamic
+/// array, so the cell stays one, and save resolves a `cm` in this package.
+fn forget_file_meta(m: &mut CellMeta) {
+    if m.cm.take().is_some() {
+        m.dynamic = true;
+    }
+    m.vm = None;
+    m.vm_body = None;
 }
 
 /// The anchor whose spill contains (r, c), if any (excluding (r, c) itself
@@ -2702,5 +2907,238 @@ mod tests {
                 "{src} not dynamic"
             );
         }
+    }
+
+    // ---- #825: spilling arrays pasted, undone and redone ------------------
+
+    /// A1:A3 = 1, 2, 3 and `anchor` at D1, evaluated as a fresh engine sees
+    /// it: `=A1:A3*2` spills 2, 4, 6 down D1:D3.
+    fn spilling_book(anchor: Cell) -> (Workbook, Engine) {
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("A2", Cell::number(2.0)),
+            ("A3", Cell::number(3.0)),
+            ("D1", anchor),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        (wb, eng)
+    }
+
+    /// A legacy CSE block, `{=A1:A3*2}` over D1:D3.
+    fn cse_block() -> Cell {
+        let mut c = Cell::formula("A1:A3*2");
+        c.f_attrs = Some(" t=\"array\" ref=\"D1:D3\"".to_string());
+        c
+    }
+
+    /// The cells of `r1..=r2` x `c1..=c2` on sheet 0, as a copy takes them.
+    fn copy_block(wb: &Workbook, (r1, c1): (u32, u32), (r2, c2): (u32, u32)) -> Vec<Vec<Cell>> {
+        (r1..=r2)
+            .map(|r| {
+                (c1..=c2)
+                    .map(|c| wb.sheets[0].cell(r, c).cloned().unwrap_or_default())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn cell_at(wb: &Workbook, name: &str) -> Cell {
+        let (r, c) = crate::sheet::parse_cell_name(name).unwrap();
+        wb.sheets[0].cell(r, c).cloned().unwrap_or_default()
+    }
+
+    /// `anchor` spills (3, 1) with 2, 4, 6 down from it.
+    fn assert_spills(wb: &Workbook, anchor: &str) {
+        let (r, c) = crate::sheet::parse_cell_name(anchor).unwrap();
+        assert_eq!(cell_at(wb, anchor).spill, Some((3, 1)), "{anchor}");
+        for (i, want) in [2.0, 4.0, 6.0].into_iter().enumerate() {
+            let name = crate::sheet::cell_name(r + i as u32, c);
+            assert_eq!(value_at(wb, &name), CellValue::Number(want), "{name}");
+        }
+    }
+
+    /// Clear D1:D3 as a cut's source clear does.
+    fn cut_d1_d3(eng: &mut Engine, wb: &mut Workbook) {
+        for r in 0..3 {
+            eng.set_cell(wb, (0, r, 3), Cell::default());
+        }
+    }
+
+    #[test]
+    fn pasting_a_spilling_cse_block_in_place_keeps_it_spilling() {
+        // #825 AC1: copy or cut D1:D3, paste at D1. One cell at a time through
+        // set_cell, the 4 written into D2 blocks D1 (#SPILL!).
+        for cut in [false, true] {
+            let (mut wb, mut eng) = spilling_book(cse_block());
+            assert_spills(&wb, "D1");
+            let block = copy_block(&wb, (0, 3), (2, 3));
+            if cut {
+                cut_d1_d3(&mut eng, &mut wb);
+            }
+            eng.paste_block(&mut wb, 0, (0, 3), &block);
+            assert_spills(&wb, "D1");
+            let d1 = cell_at(&wb, "D1");
+            assert_eq!(
+                d1.f_attrs.as_deref(),
+                Some(" t=\"array\" ref=\"D1:D3\""),
+                "cut {cut}"
+            );
+            assert!(cell_at(&wb, "D2").formula.is_none());
+        }
+    }
+
+    #[test]
+    fn pasting_a_typed_dynamic_array_block_keeps_it_spilling() {
+        // #825 AC2: a typed dynamic array (no `f_attrs`) copied D1:D3 and
+        // pasted back in place (set_cell's same-formula arm), cut and pasted
+        // back (its typed arm), and pasted at F1.
+        for (cut, at) in [(false, "D1"), (true, "D1"), (false, "F1")] {
+            let (mut wb, mut eng) = spilling_book(Cell::default());
+            set(&mut eng, &mut wb, "D1", Cell::formula("A1:A3*2"));
+            assert_spills(&wb, "D1");
+            let block = copy_block(&wb, (0, 3), (2, 3));
+            if cut {
+                cut_d1_d3(&mut eng, &mut wb);
+            }
+            let (r, c) = crate::sheet::parse_cell_name(at).unwrap();
+            eng.paste_block(&mut wb, 0, (r, c), &block);
+            assert_spills(&wb, at);
+            let anchor = cell_at(&wb, at);
+            assert!(
+                anchor.f_attrs.is_none() && anchor.is_dynamic(),
+                "{at} cut {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_loaded_dynamic_array_pasted_elsewhere_spills() {
+        // #825 AC2: Excel's dynamic array (`t="array"` and a `cm`) copied with
+        // its spill and pasted at F1 is typed there and spills, its `cm` gone
+        // (save resolves one) and still a dynamic array.
+        let mut da = cse_block();
+        da.meta = Some(Box::new(CellMeta {
+            cm: Some("1".into()),
+            ..CellMeta::default()
+        }));
+        let (mut wb, mut eng) = spilling_book(da);
+        assert_spills(&wb, "D1");
+        let block = copy_block(&wb, (0, 3), (2, 3));
+        eng.paste_block(&mut wb, 0, (0, 5), &block);
+        assert_spills(&wb, "F1");
+        let f1 = cell_at(&wb, "F1");
+        let m = f1.meta.as_deref().unwrap();
+        assert!(f1.f_attrs.is_none() && m.cm.is_none() && m.dynamic && m.modern);
+    }
+
+    #[test]
+    fn a_pasted_anchor_does_not_claim_cells_below_its_target() {
+        // #825 AC10: a spilling anchor copied alone keeps its source's
+        // `spill`; set_cell must not let it take over the 99 below F1.
+        let (mut wb, mut eng) = spilling_book(Cell::default());
+        set(&mut eng, &mut wb, "D1", Cell::formula("A1:A3*2"));
+        set(&mut eng, &mut wb, "F2", Cell::number(99.0));
+        let anchor = cell_at(&wb, "D1");
+        assert_eq!(anchor.spill, Some((3, 1)));
+        set(&mut eng, &mut wb, "F1", anchor);
+        assert_eq!(value_at(&wb, "F2"), CellValue::Number(99.0));
+        assert_eq!(value_at(&wb, "F1"), CellValue::Error("#SPILL!".into()));
+        assert_eq!(cell_at(&wb, "F1").spill, None);
+    }
+
+    /// Before/after snapshots of the cells a paste of `block` at `at` writes.
+    type Snapshot = Vec<(u32, u32, Cell)>;
+
+    /// Paste `block` at `at` the way xlsxy and gridwasm record it: every
+    /// `before` taken ahead of the paste and every `after` once it is done.
+    fn recorded_paste(
+        eng: &mut Engine,
+        wb: &mut Workbook,
+        at: (u32, u32),
+        block: &[Vec<Cell>],
+    ) -> (Snapshot, Snapshot) {
+        let keys: Vec<(u32, u32)> = block
+            .iter()
+            .enumerate()
+            .flat_map(|(dr, row)| {
+                (0..row.len()).map(move |dc| (at.0 + dr as u32, at.1 + dc as u32))
+            })
+            .collect();
+        let snap = |wb: &Workbook| -> Snapshot {
+            keys.iter()
+                .map(|&(r, c)| (r, c, wb.sheets[0].cell(r, c).cloned().unwrap_or_default()))
+                .collect()
+        };
+        let before = snap(wb);
+        eng.paste_block(wb, 0, at, block);
+        (before, snap(wb))
+    }
+
+    fn assert_snapshot(wb: &Workbook, snap: &Snapshot) {
+        for (r, c, cell) in snap {
+            let now = wb.sheets[0].cell(*r, *c).cloned().unwrap_or_default();
+            assert_eq!(now, *cell, "({r}, {c})");
+        }
+    }
+
+    #[test]
+    fn restore_cells_restores_a_spill_anchor_after_its_members() {
+        // #825 AC3: undo restores the befores in reverse (anchor first, then
+        // its spilled 4 and 6, which would block it one by one); redo the
+        // afters in order. Both leave D1 spilling, exactly as recorded.
+        for anchor in [cse_block(), Cell::formula("A1:A3*2")] {
+            let (mut wb, mut eng) = spilling_book(Cell::default());
+            set(&mut eng, &mut wb, "D1", anchor);
+            let block = copy_block(&wb, (0, 3), (2, 3));
+            let (before, after) = recorded_paste(&mut eng, &mut wb, (0, 3), &block);
+            let undo: Snapshot = before.iter().rev().cloned().collect();
+            eng.restore_cells(&mut wb, 0, &undo);
+            assert_spills(&wb, "D1");
+            assert_snapshot(&wb, &before);
+            eng.restore_cells(&mut wb, 0, &after);
+            assert_spills(&wb, "D1");
+            assert_snapshot(&wb, &after);
+        }
+    }
+
+    #[test]
+    fn undoing_a_paste_over_a_live_spill_restores_the_spill() {
+        // #825 AC3: constants pasted over D1:D3 replace the dynamic array;
+        // undo brings back the anchor and its spill, redo the constants.
+        let (mut wb, mut eng) = spilling_book(Cell::default());
+        set(&mut eng, &mut wb, "D1", Cell::formula("A1:A3*2"));
+        let block: Vec<Vec<Cell>> = (7..10).map(|n| vec![Cell::number(n as f64)]).collect();
+        let (before, after) = recorded_paste(&mut eng, &mut wb, (0, 3), &block);
+        assert_eq!(value_at(&wb, "D2"), CellValue::Number(8.0));
+        let undo: Snapshot = before.iter().rev().cloned().collect();
+        eng.restore_cells(&mut wb, 0, &undo);
+        assert_spills(&wb, "D1");
+        assert_snapshot(&wb, &before);
+        eng.restore_cells(&mut wb, 0, &after);
+        assert_snapshot(&wb, &after);
+        assert!(cell_at(&wb, "D1").formula.is_none());
+    }
+
+    #[test]
+    fn a_frozen_anchor_pasted_in_place_keeps_its_copied_spill() {
+        // An anchor the engine can't evaluate keeps its cached values: the
+        // paste puts them back as its spill rather than blanks.
+        let mut anchor = Cell::formula("NOSUCHFN(A1:A3)");
+        anchor.f_attrs = Some(" t=\"array\" ref=\"D1:D3\"".to_string());
+        anchor.value = CellValue::Number(2.0);
+        anchor.spill = Some((3, 1));
+        let mut wb = wb_one_sheet(&[
+            ("D1", anchor),
+            ("D2", Cell::number(4.0)),
+            ("D3", Cell::number(6.0)),
+        ]);
+        let mut eng = Engine::new(&wb);
+        let block = copy_block(&wb, (0, 3), (2, 3));
+        eng.paste_block(&mut wb, 0, (0, 3), &block);
+        assert!(eng.is_unsupported((0, 0, 3)));
+        assert_eq!(cell_at(&wb, "D1").spill, Some((3, 1)));
+        assert_eq!(value_at(&wb, "D2"), CellValue::Number(4.0));
+        assert_eq!(value_at(&wb, "D3"), CellValue::Number(6.0));
     }
 }

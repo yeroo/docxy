@@ -11442,6 +11442,94 @@ b",
     }
 
     #[test]
+    fn a_typed_formula_drops_a_foreign_cm() {
+        // #825 AC6: a formula typed here with a `cm` from elsewhere (another
+        // workbook's index) keeps none of it: save resolves a `cm` in this
+        // package's metadata part, which it creates.
+        let (mut pkg, mut eng) = typed_book(&[]);
+        let mut cell = Cell::formula("A1:A3*2");
+        cell.meta = Some(Box::new(crate::sheet::CellMeta {
+            cm: Some("7".into()),
+            ..Default::default()
+        }));
+        eng.set_cell(&mut pkg.workbook, (0, 0, 2), cell);
+        let (re, ws) = resaved(&pkg);
+        assert!(!ws.contains(r#"cm="7""#), "{ws}");
+        assert!(
+            ws.contains(r#"<c r="C1" cm="1"><f t="array" ref="C1:C3">A1:A3*2</f>"#),
+            "{ws}"
+        );
+        let meta = part_text(&re, "xl/metadata.xml");
+        assert!(meta.contains(r#"<cellMetadata count="1">"#), "{meta}");
+    }
+
+    /// Sheet 1's D1:D5 in `pkg`, as a grid copy takes it.
+    fn copied_d1_d5(pkg: &SheetPackage) -> Vec<Vec<Cell>> {
+        (0..5)
+            .map(|r| {
+                vec![
+                    pkg.workbook.sheets[0]
+                        .cell(r, 3)
+                        .cloned()
+                        .unwrap_or_default(),
+                ]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_pasted_anchor_with_a_foreign_cm_saves_a_resolved_cm() {
+        // #825 AC7: Excel's dynamic array (`cm="1"`) copied from workbook A
+        // and pasted at its own address in workbook B, which has no metadata
+        // part. Restored as an array block, it must not carry A's index: save
+        // creates B's part and the `cm` names its entry.
+        let mut a = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SORT_ANCHOR))).unwrap();
+        crate::engine::Engine::new(&a.workbook).recalc_all(&mut a.workbook);
+        let block = copied_d1_d5(&a);
+        assert_eq!(block[0][0].spill, Some((5, 1)));
+        let mut b = new_xlsx();
+        for (r, v) in [3.0, 9.0, 1.0, 7.0, 5.0].into_iter().enumerate() {
+            b.workbook.sheets[0].set_cell(r as u32, 0, Cell::number(v));
+        }
+        assert!(b.part("xl/metadata.xml").is_none());
+        let mut eng = crate::engine::Engine::new(&b.workbook);
+        eng.paste_block(&mut b.workbook, 0, (0, 3), &block);
+        let d1 = b.workbook.sheets[0].cell(0, 3).unwrap();
+        assert_eq!(d1.spill, Some((5, 1)));
+        assert!(!d1.has_cm() && d1.is_dynamic());
+        let (re, ws) = resaved(&b);
+        assert!(
+            ws.contains(r#"<c r="D1" cm="1"><f t="array" ref="D1:D5">"#),
+            "{ws}"
+        );
+        let meta = part_text(&re, "xl/metadata.xml");
+        assert!(
+            meta.contains(r#"<cellMetadata count="1"><bk><rc t="1" v="0"/></bk></cellMetadata>"#),
+            "{meta}"
+        );
+    }
+
+    #[test]
+    fn a_same_workbook_cm_paste_saves_the_same_cm() {
+        // #825 AC6: clearing the `cm` costs nothing in its own workbook: the
+        // paste back in place saves `cm="1"` again, and the metadata part is
+        // left exactly as it was (no second entry).
+        let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SORT_ANCHOR))).unwrap();
+        let before = pkg.part("xl/metadata.xml").unwrap().to_vec();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.recalc_all(&mut pkg.workbook);
+        let block = copied_d1_d5(&pkg);
+        eng.paste_block(&mut pkg.workbook, 0, (0, 3), &block);
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(0, 3).unwrap().spill,
+            Some((5, 1))
+        );
+        let (re, ws) = resaved(&pkg);
+        assert!(ws.contains(SORT_ANCHOR), "{ws}");
+        assert_eq!(re.part("xl/metadata.xml").unwrap(), &before[..]);
+    }
+
+    #[test]
     fn autofill_copy_is_typed_and_drops_source_cm_vm() {
         let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SORT_ANCHOR))).unwrap();
         assert!(pkg.workbook.sheets[0].cell(0, 3).unwrap().meta.is_some());
