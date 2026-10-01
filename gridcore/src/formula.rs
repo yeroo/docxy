@@ -1560,22 +1560,26 @@ impl Printer {
 
     /// May a LET value bind a lambda? Yes unless it provably can't: a
     /// literal, a reference, an operator, or a builtin call that never passes
-    /// a lambda through. A call of a bound local, an unbound name (a defined
-    /// name may be a lambda), an immediate call (`LAMBDA(n,LAMBDA(…))(2)`)
-    /// and the choosing functions (`IF(c,LAMBDA(…),LAMBDA(…))`) may.
+    /// a lambda through. A call of a local that may hold one, an unbound name
+    /// or a call of one (a defined name or UDF may be or make a lambda), an
+    /// immediate call (`LAMBDA(n,LAMBDA(…))(2)`) and the choosing functions
+    /// (`IF(c,LAMBDA(…),LAMBDA(…))`) may.
     fn binds_lambda(&self, value: &Expr) -> bool {
         match value {
             Expr::Name(n) => self.bound(n).is_none_or(|(_, lambda)| lambda),
             Expr::Call(..) => true,
-            Expr::Func(n, _) => {
-                self.bound(n).is_some()
-                    || [
+            Expr::Func(n, _) => match self.bound(n) {
+                Some((_, lambda)) => lambda,
+                None => {
+                    [
                         "LAMBDA", "LET", "IF", "IFS", "CHOOSE", "SWITCH", "IFERROR", "IFNA",
                         "INDEX",
                     ]
                     .iter()
                     .any(|f| f.eq_ignore_ascii_case(n))
-            }
+                        || !is_builtin(n)
+                }
+            },
             _ => false,
         }
     }
@@ -1660,6 +1664,33 @@ fn bare_param(n: &str) -> &str {
 /// `n` as a LET/LAMBDA name is spelled in a file: `_xlpm.n`.
 fn param_name(n: &str) -> String {
     format!("_xlpm.{}", bare_param(n))
+}
+
+/// Is `name` a builtin function? Excel's post-2007 names (the engine may not
+/// evaluate them all yet), and otherwise whatever the evaluator itself knows,
+/// so this stays right as builtins are added: the call, with no arguments,
+/// on a throwaway evaluator over no cells, through the whole dispatch, which
+/// flags a name it doesn't know. Every builtin refuses zero arguments without
+/// panicking or touching anything (`builtin_probe_is_safe_for_every_name`).
+fn is_builtin(name: &str) -> bool {
+    struct NoCells;
+    impl Resolver for NoCells {
+        fn value(&self, _: usize, _: u32, _: u32) -> Value {
+            Value::Empty
+        }
+        fn sheet_index(&self, _: &str) -> Option<usize> {
+            None
+        }
+        fn cells_in(&self, _: usize, _: u32, _: u32, _: u32, _: u32) -> Vec<((u32, u32), Value)> {
+            Vec::new()
+        }
+    }
+    if future_prefix(name).is_some() {
+        return true;
+    }
+    let mut ev = Eval::new(&NoCells, 0, (0, 0));
+    ev.eval_arg(&Expr::Func(name.to_ascii_uppercase(), Vec::new()));
+    !ev.name_unknown
 }
 
 /// A number as file formula text that reads back to the same `f64` (the
@@ -13188,6 +13219,16 @@ mod tests {
             file("LET(f,IF(A1,LAMBDA(x,x),LAMBDA(x,-x)),f(2))"),
             "_xlfn.LET(_xlpm.f,IF(A1,_xlfn.LAMBDA(_xlpm.x,_xlpm.x),_xlfn.LAMBDA(_xlpm.x,-_xlpm.x)),_xlpm.f(2))"
         );
+        // A user function (a defined name, a UDF) may make a lambda; a local
+        // bound to a builtin's value doesn't.
+        assert_eq!(
+            file("LET(addfive,MakeAdder(5),addfive(1))"),
+            "_xlfn.LET(_xlpm.addfive,MAKEADDER(5),_xlpm.addfive(1))"
+        );
+        assert_eq!(
+            file("LET(sum,SUM(A1:A3),max,sum(B1:B3),MAX(sum,max))"),
+            "_xlfn.LET(_xlpm.sum,SUM(A1:A3),_xlpm.max,SUM(B1:B3),MAX(_xlpm.sum,_xlpm.max))"
+        );
         // A LAMBDA parameter may hold a lambda, so its call is the local one.
         assert_eq!(
             file("LAMBDA(text,TEXT(text,\"0\"))(A1)"),
@@ -13207,6 +13248,42 @@ mod tests {
             file("LET(_xlpm.x,1,_xlpm.x+x)"),
             "_xlfn.LET(_xlpm.x,1,_xlpm.x+_xlpm.x)"
         );
+    }
+
+    #[test]
+    fn builtin_probe_is_safe_for_every_name() {
+        // Every name the evaluator dispatches on (`"NAME" =>` / `"NAME" |`
+        // arms in this file), probed with no arguments: none may panic, and
+        // the function names among them read as builtins.
+        let src = include_str!("formula.rs");
+        let mut names = std::collections::BTreeSet::new();
+        for (i, _) in src.match_indices('"') {
+            let rest = &src[i + 1..];
+            let Some(end) = rest.find('"') else { break };
+            let lit = &rest[..end];
+            let after = rest[end + 1..].trim_start();
+            let is_name = !lit.is_empty()
+                && lit.starts_with(|c: char| c.is_ascii_uppercase())
+                && lit
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '.');
+            if is_name && (after.starts_with("=>") || after.starts_with('|')) {
+                names.insert(lit.to_string());
+            }
+        }
+        assert!(names.len() > 200, "{}", names.len());
+        for n in &names {
+            is_builtin(n);
+        }
+        for n in [
+            "SUM", "MAX", "DATE", "TEXT", "INDIRECT", "RAND", "NOW", "TODAY", "VLOOKUP", "SORT",
+            "FILTER", "MAP", "STDEV.S", "SUBTOTAL", "OFFSET", "TRUE",
+        ] {
+            assert!(is_builtin(n), "{n}");
+        }
+        for n in ["MAKEADDER", "MYFN", "INC", "_XLPM.F"] {
+            assert!(!is_builtin(n), "{n}");
+        }
     }
 
     #[test]
@@ -13326,6 +13403,11 @@ mod tests {
             assert_eq!(n(typed, &g), want, "{typed}");
             assert_eq!(n(&saved, &g), want, "{saved}");
         }
+        // A lambda a defined name makes, bound by LET and called.
+        let named = empty().with_name("MakeAdder", "LAMBDA(n,LAMBDA(x,x+n))");
+        let typed = "LET(addfive,MakeAdder(5),addfive(1))";
+        assert_eq!(n(typed, &named), 6.0);
+        assert_eq!(n(&file_formula(typed), &named), 6.0);
         // Mixed spellings (a partly reprinted formula) bind the same name.
         assert_eq!(n("_xlfn.LET(_xlpm.x,1,x+1)", &g), 2.0);
         assert_eq!(n("LET(x,1,_xlpm.x+1)", &g), 2.0);
