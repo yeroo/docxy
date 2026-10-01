@@ -2244,6 +2244,90 @@ pub fn rename_sheet_in_expr(e: &Expr, old: &str, new: &str) -> Expr {
     walk(e, old, new)
 }
 
+/// Give every unqualified reference the sheet qualifier `sheet`: a cut moved
+/// to another sheet keeps reading the cells it read (Excel writes `=B1`
+/// moved off Sheet2 as `=Sheet2!B1`). Qualified references, 3-D spans, names
+/// and structured references are left alone.
+pub fn qualify_sheet_in_expr(e: &Expr, sheet: &str) -> Expr {
+    fn walk(e: &Expr, sheet: &str) -> Expr {
+        let fix = |s: &Option<String>| -> Option<String> {
+            match s {
+                None => Some(sheet.to_string()),
+                other => other.clone(),
+            }
+        };
+        match e {
+            Expr::Ref(r) => Expr::Ref(CellRef {
+                sheet: fix(&r.sheet),
+                ..r.clone()
+            }),
+            Expr::SpillRef(r) => Expr::SpillRef(CellRef {
+                sheet: fix(&r.sheet),
+                ..r.clone()
+            }),
+            Expr::ArrayLit(rows) => Expr::ArrayLit(
+                rows.iter()
+                    .map(|row| row.iter().map(|x| walk(x, sheet)).collect())
+                    .collect(),
+            ),
+            // A 3-D span is always sheet-qualified; leave it alone.
+            Expr::Ref3D { .. } => e.clone(),
+            Expr::Range(a, b) => Expr::Range(
+                CellRef {
+                    sheet: fix(&a.sheet),
+                    ..a.clone()
+                },
+                b.clone(),
+            ),
+            Expr::ColRange {
+                sheet: s,
+                c1,
+                c2,
+                abs1,
+                abs2,
+            } => Expr::ColRange {
+                sheet: fix(s),
+                c1: *c1,
+                c2: *c2,
+                abs1: *abs1,
+                abs2: *abs2,
+            },
+            Expr::RowRange {
+                sheet: s,
+                r1,
+                r2,
+                abs1,
+                abs2,
+            } => Expr::RowRange {
+                sheet: fix(s),
+                r1: *r1,
+                r2: *r2,
+                abs1: *abs1,
+                abs2: *abs2,
+            },
+            Expr::Func(n, args) => {
+                Expr::Func(n.clone(), args.iter().map(|a| walk(a, sheet)).collect())
+            }
+            Expr::Call(callee, args) => Expr::Call(
+                Box::new(walk(callee, sheet)),
+                args.iter().map(|a| walk(a, sheet)).collect(),
+            ),
+            Expr::Un(op, x) => Expr::Un(*op, Box::new(walk(x, sheet))),
+            Expr::Bin(op, l, r) => {
+                Expr::Bin(*op, Box::new(walk(l, sheet)), Box::new(walk(r, sheet)))
+            }
+            other => other.clone(),
+        }
+    }
+    walk(e, sheet)
+}
+
+/// Parse–qualify–print in one step; `None` when the source doesn't parse.
+pub fn qualify_sheet_in_formula(src: &str, sheet: &str) -> Option<String> {
+    let ast = parse(src).ok()?;
+    Some(to_string(&qualify_sheet_in_expr(&ast, sheet)))
+}
+
 /// Turn every reference to a sheet in `removed` (case-insensitive) into
 /// `#REF!`: the whole reference, so no removed sheet name is left in the
 /// formula. Excel writes `#REF!A1` after a sheet delete, keeping the cell
@@ -12763,6 +12847,62 @@ mod tests {
             rename_sheet_in_formula("SUM(One:Three!A1)", "Three", "Last Q").unwrap(),
             "SUM(One:'Last Q'!A1)"
         );
+    }
+
+    #[test]
+    fn qualify_sheet_adds_the_source_sheet_to_unqualified_refs() {
+        // A cut pasted on another sheet keeps reading the cells it read: an
+        // unqualified ref gains the source sheet's name.
+        for (src, want) in [
+            ("B1", "Sheet2!B1"),
+            ("$B$1+C2", "Sheet2!$B$1+Sheet2!C2"),
+            ("SUM(A1:B2)", "SUM(Sheet2!A1:B2)"),
+            ("SUM(C:C)", "SUM(Sheet2!C:C)"),
+            ("SUM(1:2)", "SUM(Sheet2!1:2)"),
+            ("A1#", "Sheet2!A1#"),
+            ("SUM({1,2})+IF(A1,B1)", "SUM({1,2})+IF(Sheet2!A1,Sheet2!B1)"),
+        ] {
+            let out = qualify_sheet_in_formula(src, "Sheet2").unwrap_or_else(|| {
+                panic!("qualify {src}");
+            });
+            assert_eq!(out, want, "{src}");
+            assert!(parse(&out).is_ok(), "{out}");
+        }
+    }
+
+    #[test]
+    fn qualify_sheet_leaves_qualified_refs_names_and_3d_spans_alone() {
+        for src in [
+            "Other!B1+B1",
+            "SUM(One:Three!A1)",
+            "Rate*2",
+            "Table1[Amount]",
+            "\"x\"&1",
+            "INDIRECT(\"B1\")",
+        ] {
+            let out = qualify_sheet_in_formula(src, "Sheet2").unwrap_or_else(|| {
+                panic!("qualify {src}");
+            });
+            if src == "Other!B1+B1" {
+                assert_eq!(out, "Other!B1+Sheet2!B1", "{src}");
+            } else {
+                assert_eq!(out, src, "{src}");
+            }
+            assert!(parse(&out).is_ok(), "{out}");
+        }
+    }
+
+    #[test]
+    fn qualify_sheet_quotes_a_name_that_needs_it() {
+        assert_eq!(
+            qualify_sheet_in_formula("B1", "My Data").unwrap(),
+            "'My Data'!B1"
+        );
+    }
+
+    #[test]
+    fn qualify_sheet_in_formula_returns_none_on_unparseable_source() {
+        assert!(qualify_sheet_in_formula("SUM(A1", "Sheet2").is_none());
     }
 
     #[test]

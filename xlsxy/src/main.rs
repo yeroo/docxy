@@ -34,7 +34,7 @@ use gridcore::docprops::{CustomProperty, CustomValue, DocProperties};
 use gridcore::edit::{fill_changes, replace_all_in_sheet};
 use gridcore::engine::Engine;
 use gridcore::entry::{entry_cell, entry_ctx, seed_text};
-use gridcore::formula::translate_formula;
+use gridcore::formula::{qualify_sheet_in_formula, translate_formula};
 use gridcore::frame::Agg;
 use gridcore::model::{
     DataModel, MODEL_PART, ModelSpec, Relationship, model_part_xml, model_pivot, parse_model_part,
@@ -2568,6 +2568,14 @@ impl App {
                         .get(clip.sheet)
                         .is_some_and(|s| s.is_protected());
                 let cut = clip.cut && clip.sheet < self.pkg.workbook.sheets.len() && !source_locked;
+                // A cut pasted on another sheet moves its formulas off the
+                // source sheet; their unqualified refs are qualified with it
+                // below, so a moved `=B1` keeps reading Sheet2!B1.
+                let src_name = if cut && !same_sheet {
+                    Some(self.pkg.workbook.sheets[clip.sheet].name.clone())
+                } else {
+                    None
+                };
                 let mut clears = Vec::new();
                 if cut {
                     let (fr, fc) = clip.from;
@@ -2611,6 +2619,14 @@ impl App {
                                 if let Some(t) = translate_formula(f, dr_all, dc_all) {
                                     new_cell.formula = Some(t);
                                 }
+                            }
+                        }
+                        // A cut moved to another sheet keeps reading the
+                        // cells it read: qualify with the source sheet (an
+                        // unparseable formula keeps its text).
+                        if let (Some(f), Some(sheet)) = (&new_cell.formula, &src_name) {
+                            if let Some(t) = qualify_sheet_in_formula(f, sheet) {
+                                new_cell.formula = Some(t);
                             }
                         }
                         // Overwrite position wins over source-clear on overlap.
@@ -10632,6 +10648,72 @@ mod tests {
         assert_eq!(block_values(&app, 0, 0, 5), some([1.0, 2.0, 3.0, 4.0]));
         assert_eq!(block_values(&app, 1, 0, 0), vec![None; 4]);
         assert_eq!(block_values(&app, 0, 0, 0), some([10.0, 11.0, 12.0, 13.0]));
+    }
+
+    /// Sheet2!C1 holding `=B1`, selected as the whole clip (re-cut from the
+    /// cross_sheet_cut_app's pending block cut).
+    fn cut_formula_cell_app() -> App {
+        let mut app = cross_sheet_cut_app();
+        app.goto_sheet(1);
+        app.apply_on(1, vec![(0, 2, parse_input("=B1"))]);
+        app.anchor = Some((0, 2));
+        app.cur = (0, 2);
+        app.copy(true);
+        app
+    }
+
+    #[test]
+    fn a_formula_cut_to_another_sheet_keeps_reading_its_source_sheet() {
+        // #820: the moved formula is qualified with the sheet it came from,
+        // so it still reads Sheet2!B1 (=2), not Sheet1!B1 (=11).
+        let mut app = cut_formula_cell_app();
+        app.goto_sheet(0);
+        app.cur = (0, 5);
+        app.paste();
+        let cell = app.pkg.workbook.sheets[0].cell(0, 5).unwrap();
+        assert_eq!(cell.formula.as_deref(), Some("Sheet2!B1"));
+        assert_eq!(cell.value, CellValue::Number(2.0));
+        // The dependency is live, not just the text: editing Sheet2!B1
+        // re-flows into the moved formula.
+        app.apply_on(1, vec![(0, 1, parse_input("50"))]);
+        let cell = app.pkg.workbook.sheets[0].cell(0, 5).unwrap();
+        assert_eq!(cell.value, CellValue::Number(50.0));
+    }
+
+    #[test]
+    fn undo_of_a_cross_sheet_formula_cut_restores_the_unqualified_formula() {
+        let mut app = cut_formula_cell_app();
+        app.goto_sheet(0);
+        app.cur = (0, 5);
+        app.paste();
+        app.undo();
+        let c1 = app.pkg.workbook.sheets[1].cell(0, 2).unwrap();
+        assert_eq!(c1.formula.as_deref(), Some("B1"));
+        assert_eq!(c1.value, CellValue::Number(2.0));
+        assert!(app.pkg.workbook.sheets[0].cell(0, 5).is_none());
+    }
+
+    #[test]
+    fn a_formula_copied_to_another_sheet_gets_no_qualifier() {
+        let mut app = cut_formula_cell_app();
+        // Re-copy as a copy (not a cut): translation, no qualifier.
+        app.copy(false);
+        app.goto_sheet(0);
+        app.cur = (0, 5);
+        app.paste();
+        let cell = app.pkg.workbook.sheets[0].cell(0, 5).unwrap();
+        assert_eq!(cell.formula.as_deref(), Some("E1"));
+        assert!(!cell.formula.as_deref().unwrap().contains("Sheet2!"));
+    }
+
+    #[test]
+    fn a_formula_cut_on_its_own_sheet_keeps_its_text() {
+        let mut app = cut_formula_cell_app();
+        app.cur = (0, 5);
+        app.paste();
+        let cell = app.pkg.workbook.sheets[1].cell(0, 5).unwrap();
+        assert_eq!(cell.formula.as_deref(), Some("B1"));
+        assert_eq!(cell.value, CellValue::Number(2.0));
     }
 
     #[test]
