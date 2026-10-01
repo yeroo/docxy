@@ -25,6 +25,34 @@ public static class RealCom {
   public static object Local(string clsid) { Guid c = new Guid(clsid); Guid i = new Guid("00020400-0000-0000-C000-000000000046"); object o; int hr = CoCreateInstance(ref c, IntPtr.Zero, 4, ref i, out o); if (hr != 0) throw new Exception("hr=" + hr.ToString("X")); return o; }
 }
 "@
+# Excel's SaveAs .xls of a workbook with an external link stops on the
+# Compatibility Checker ("This workbook has workbook link information that
+# will be lost ..."), even with CheckCompatibility and DisplayAlerts off, and
+# waits for someone to press Continue. SaveAs blocks this thread, so a job
+# watches Excel's top-level windows for the dialog and presses Continue
+# through UI Automation.
+function Save-Xls($wb, [string]$path, [int]$excelPid) {
+  $job = Start-Job -ArgumentList $excelPid -ScriptBlock {
+    param($procId)
+    Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+    $ae = [Windows.Automation.AutomationElement]
+    $ofExcel = New-Object Windows.Automation.PropertyCondition($ae::ProcessIdProperty, $procId)
+    $continue = New-Object Windows.Automation.PropertyCondition($ae::NameProperty, 'Continue')
+    $deadline = (Get-Date).AddSeconds(120)
+    while ((Get-Date) -lt $deadline) {
+      foreach ($w in $ae::RootElement.FindAll([Windows.Automation.TreeScope]::Children, $ofExcel)) {
+        if ($w.Current.Name -notlike '*Compatibility Checker*') { continue }
+        $button = $w.FindFirst([Windows.Automation.TreeScope]::Descendants, $continue)
+        if ($button) {
+          $button.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()
+          return
+        }
+      }
+      Start-Sleep -Milliseconds 500
+    }
+  }
+  try { $wb.SaveAs($path, 56) } finally { Stop-Job $job; Remove-Job $job -Force }
+}
 if ($Sections -contains 'corpus') {
 $out = Join-Path $PSScriptRoot "..\corpus\legacy"
 New-Item -ItemType Directory -Force $out | Out-Null
@@ -80,9 +108,10 @@ try {
 # corpus/legacy/addin: a workbook calling a function of the add-in shipped
 # with Office (Library\EUROTOOL.XLAM). Excel stores the call as a library
 # external link: `[1]!EUROCONVERT(...)` in the .xlsx, a ptgNameX into a
-# BrtSupBookSrc book in the .xlsb (#888). No .xls: that SaveAs hangs on a
-# modal dialog. The workbook is added before the add-in is opened (opening
-# it with no workbook fails over COM).
+# BrtSupBookSrc book in the .xlsb (#888), and a ptgNameX into a SUPBOOK
+# whose path is Library\EUROTOOL.XLAM in the .xls (#890; Save-Xls presses
+# the Compatibility Checker's Continue). The workbook is added before the
+# add-in is opened (opening it with no workbook fails over COM).
 if ($Sections -contains 'addin') {
 $addin = Join-Path $PSScriptRoot "..\corpus\legacy\addin"
 New-Item -ItemType Directory -Force $addin | Out-Null
@@ -109,6 +138,7 @@ try {
   $wb.CheckCompatibility = $false
   $wb.SaveAs((Join-Path $addin "addin-udf.xlsx"), 51)
   $wb.SaveAs((Join-Path $addin "addin-udf.xlsb"), 50)
+  Save-Xls $wb (Join-Path $addin "addin-udf.xls") $p.Id
   $wb.Close($false)
 
   # ext-name: names of an ordinary workbook (a range and a constant), which
@@ -133,6 +163,7 @@ try {
   $wb.CheckCompatibility = $false
   $wb.SaveAs((Join-Path $addin "ext-name.xlsx"), 51)
   $wb.SaveAs((Join-Path $addin "ext-name.xlsb"), 50)
+  Save-Xls $wb (Join-Path $addin "ext-name.xls") $p.Id
   $wb.Close($false)
   $src.Close($false)
 } finally {

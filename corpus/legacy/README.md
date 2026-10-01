@@ -10,19 +10,21 @@ gridcore's legacy readers (`gridcore::legacy`, #603). Importing
 Excel's too: `chart-embedded` has a sheet with formulas and an embedded
 column chart (in the `.xls`, a chart substream nested in the worksheet's).
 
-`addin/` holds `addin-udf`, which Excel also built itself. It is saved as
-`.xlsx` and `.xlsb` only, because Excel's SaveAs `.xls` hangs on a dialog for
-it. It calls `EUROCONVERT` from the add-in that ships with Office
-(`Library\EUROTOOL.XLAM`). Excel stores that call as a library external link:
-`[1]!EUROCONVERT(…)` with `xl/externalLinks/externalLink1.xml` in the
-`.xlsx`, and a ptgNameX into a BrtSupBookSrc book in the `.xlsb`. The main
-test doesn't cover it (that test needs all three formats). Instead, two tests
-in `gridcore/tests/legacy.rs` check that the `.xlsb` import and its save as
-`.xlsx` keep the formula and the link the way Excel's `.xlsx` has them (#888).
-`ext-name` (with its source `ext-name-src.xlsx`) calls names of an ordinary
-workbook instead: `SUM([1]!Prices)` and `[1]!Half*2`. Its `.xlsb` stores those
-names the same way, but each has a definition and the book's cells are cached,
-and the import reads neither. So the formulas are dropped and the values kept.
+`addin/` holds `addin-udf`, which Excel also built itself, saved as `.xlsx`,
+`.xlsb` and `.xls` (no `.ods`). It calls `EUROCONVERT` from the add-in that
+ships with Office (`Library\EUROTOOL.XLAM`). Excel stores that call as a
+library external link: `[1]!EUROCONVERT(…)` with
+`xl/externalLinks/externalLink1.xml` in the `.xlsx`, a ptgNameX into a
+BrtSupBookSrc book in the `.xlsb`, and a ptgNameX into a SUPBOOK whose path is
+the Library file `EUROTOOL.XLAM` in the `.xls`. The main test doesn't cover it
+(that test needs all three formats). Instead, tests in
+`gridcore/tests/legacy.rs` check that the `.xlsb` and `.xls` imports and their
+saves as `.xlsx` keep the formula and the link the way Excel's `.xlsx` has
+them (#888, #890). `ext-name` (with its source `ext-name-src.xlsx`) calls
+names of an ordinary workbook instead: `SUM([1]!Prices)` and `[1]!Half*2`. Its
+`.xlsb` and `.xls` store those names the same way, but each has a definition
+and the book's cells are cached, and the import reads neither. So the formulas
+are dropped and the values kept.
 
 ## The test over this corpus (runs in CI)
 
@@ -67,6 +69,9 @@ It opens each `corpus/xlsx/*.xlsx` in a fresh Excel process and saves it in
 the three formats. Then it rebuilds `extra/`: Excel creates each of those
 workbooks from scratch and saves its `.xlsx` source as well as the three
 formats. Last it rebuilds `addin/`. `-Sections corpus,extra,addin` picks
-which of the three parts to rebuild. The output depends on the Excel build,
+which of the three parts to rebuild. Excel's SaveAs `.xls` of a workbook with
+an external link stops on the Compatibility Checker even under automation, so
+the script presses its Continue button through UI Automation from a
+background job. The output depends on the Excel build,
 so regenerate only when the `.xlsx` corpus (or the script) changes, and rerun
 the tests.
