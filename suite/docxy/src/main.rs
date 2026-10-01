@@ -13843,8 +13843,10 @@ impl Docxy {
     /// Open files passed on the command line (e.g. double-clicking a .docx/.xlsx
     /// in Explorer) on top of the restored session. A file already open is
     /// focused rather than duplicated; if that tab has unsaved changes, it
-    /// asks before reloading it from disk ([`Self::open_path`]).
-    fn open_args(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+    /// asks before reloading it from disk ([`Self::open_path`]). With
+    /// `read_only` (`--read-only`, `/r`) every workbook opens read-only (#882);
+    /// `open_path` opens anything else as usual.
+    fn open_args(&mut self, paths: Vec<PathBuf>, read_only: bool, cx: &mut Context<Self>) {
         // ⚠️ A harness instance never asks, and always reloads — whether or
         // not the tab is dirty. Its `open` verb calls `open_path` with
         // `Reopen::Always` itself; this is the command line's path.
@@ -13866,9 +13868,14 @@ impl Docxy {
         } else {
             Reopen::Ask
         };
+        let mode = if read_only {
+            OpenMode::ReadOnly
+        } else {
+            OpenMode::Normal
+        };
         let mut changed = false;
         for path in paths {
-            if let Err(e) = self.open_path(&path, OpenMode::Normal, reopen) {
+            if let Err(e) = self.open_path(&path, mode, reopen) {
                 self.set_status(e);
             }
             changed = true;
@@ -27740,6 +27747,7 @@ fn main() {
     for flag in &cli.unknown_flags {
         eprintln!("docxy: ignoring unknown option {flag}");
     }
+    let cli_read_only = cli.read_only;
     let cli_files: Vec<PathBuf> = cli.files.into_iter().filter(|p| p.is_file()).collect();
 
     // The harness control surface: started only when asked for, and only into
@@ -27809,7 +27817,7 @@ fn main() {
             }
             // Open any command-line files on top of the restored session.
             if !startup_files.is_empty() {
-                view.update(cx, move |this, cx| this.open_args(startup_files, cx));
+                view.update(cx, move |this, cx| this.open_args(startup_files, cli_read_only, cx));
             }
             // Hot-exit: capture the latest (possibly unsaved) content when the
             // window is closed, so a restart restores exactly what was open. By
