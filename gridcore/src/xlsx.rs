@@ -6101,13 +6101,24 @@ impl SheetPackage {
             "<conditionalFormatting sqref=\"{sqref}\"><cfRule type=\"cellIs\" dxfId=\"{dxf_id}\" priority=\"{priority}\" operator=\"{op}\">{fmls}</cfRule></conditionalFormatting>"
         );
         let sheet_part = self.sheet_parts[sheet].clone();
-        let mut ix = None;
+        // (the new block's ordinal, how many there were before it)
+        let mut placed = None;
         if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
-            // It goes after the existing blocks, so it is the next ordinal.
-            ix = Some(cond_format_spans(&xml).len());
-            p.1 = put_worksheet_child(&xml, "conditionalFormatting", &cf_xml, None, false)
-                .into_bytes();
+            let old = cond_format_spans(&xml);
+            let out = put_worksheet_child(&xml, "conditionalFormatting", &cf_xml, None, false);
+            // It lands at its schema position: after the existing blocks in
+            // a well-ordered part, but before any that follow a later-ranked
+            // child in a misordered one. The blocks ahead of it keep their
+            // starts, so the first start that differs is its ordinal.
+            let new = cond_format_spans(&out);
+            if new.len() == old.len() + 1 {
+                let k = (0..old.len())
+                    .find(|&i| new[i].0 != old[i].0)
+                    .unwrap_or(old.len());
+                placed = Some((k, old.len()));
+            }
+            p.1 = out.into_bytes();
         }
         // Model.
         let mut formulas = vec![formula1.to_string()];
@@ -6123,14 +6134,20 @@ impl SheetPackage {
             priority,
         };
         let s = &mut self.workbook.sheets[sheet];
-        if let Some(n) = ix {
-            // A model entry already claiming this element or a later one
-            // names nothing the part holds (an undo restored the model but
-            // not the part): its claim is stale, and the new block's is real.
+        let ix = placed.map(|(k, _)| k);
+        if let Some((k, n)) = placed {
+            // A claim on an ordinal the part didn't have (n or later) names
+            // nothing (an undo restored the model but not the part): it goes.
+            // The real blocks from the new one's place on moved up one.
+            let renumber = |i: usize| match i {
+                i if i >= n => None,
+                i if i >= k => Some(i + 1),
+                i => Some(i),
+            };
             for cf in &mut s.cond_formats {
-                cf.ix = cf.ix.filter(|&i| i < n);
+                cf.ix = cf.ix.and_then(renumber);
             }
-            s.cf_removed.retain(|&i| i < n);
+            s.cf_removed = s.cf_removed.iter().filter_map(|&i| renumber(i)).collect();
         }
         s.cond_formats.push(crate::sheet::CondFormat {
             ranges: vec![range],
@@ -6181,8 +6198,7 @@ impl SheetPackage {
         let mut ix = None;
         if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
-            // It goes after the block's existing rules: the next ordinal.
-            ix = Some(validation_spans(&xml).map_or(0, |(_, items)| items.len()));
+            let before = validation_spans(&xml).map_or(0, |(_, items)| items.len());
             // Into the existing block (in any prefix), bumping its count, or a
             // new block at its schema position.
             let xml = append_to_worksheet_child(&xml, "dataValidations", &dv_xml, None)
@@ -6190,6 +6206,10 @@ impl SheetPackage {
                     let block = format!("<dataValidations count=\"1\">{dv_xml}</dataValidations>");
                     put_worksheet_child(&xml, "dataValidations", &block, None, false)
                 });
+            // Appended before the block's end tag, so after its existing
+            // rules: the next ordinal, as long as it is really there.
+            let after = validation_spans(&xml).map_or(0, |(_, items)| items.len());
+            ix = (after == before + 1).then_some(before);
             p.1 = xml.into_bytes();
         }
         let s = &mut self.workbook.sheets[sheet];
@@ -16795,5 +16815,110 @@ mod rule_shift_tests {
             first_formula(&pkg.workbook.sheets[0].cond_formats[0]),
             "A1<5"
         );
+    }
+
+    /// A CF block over `sqref` with one expression rule `formula`.
+    fn expr_cf(sqref: &str, formula: &str) -> String {
+        format!(
+            r#"<conditionalFormatting sqref="{sqref}"><cfRule type="expression" priority="1"><formula>{formula}</formula></cfRule></conditionalFormatting>"#
+        )
+    }
+
+    #[test]
+    fn deleting_the_range_that_held_the_anchor_column_retranslates() {
+        // Anchor (row 1, col A); A5:A6 held its column. Once it goes, C1
+        // anchors, and it read C1.
+        let mut pkg = one("S", &expr_cf("C1:C2 A5:A6", "A1&gt;0"));
+        delete_rows(&mut pkg.workbook, 0, 4, 2);
+        let cf = &pkg.workbook.sheets[0].cond_formats[0];
+        assert_eq!(cf.ranges, vec![(0, 2, 1, 2)]);
+        assert_eq!(first_formula(cf), "C1>0");
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(&expr_cf("C1:C2", "C1&gt;0")), "{ws}");
+    }
+
+    #[test]
+    fn deleting_the_range_that_held_the_anchor_row_and_column_retranslates() {
+        // A1:A2 goes; the old C5 (now C3) anchors, and it read C5.
+        let mut pkg = one("S", &expr_cf("A1:A2 C5:C6", "A1&gt;0"));
+        delete_rows(&mut pkg.workbook, 0, 0, 2);
+        let cf = &pkg.workbook.sheets[0].cond_formats[0];
+        assert_eq!(cf.ranges, vec![(2, 2, 3, 2)]);
+        assert_eq!(first_formula(cf), "C3>0");
+    }
+
+    #[test]
+    fn deleting_the_columns_that_held_the_anchor_row_retranslates() {
+        // C1:D1 held the anchor's row; once those columns go, A2 anchors.
+        let mut pkg = one("S", &expr_cf("A2:A3 C1:D1", "A1&gt;0"));
+        delete_cols(&mut pkg.workbook, 0, 2, 2);
+        let cf = &pkg.workbook.sheets[0].cond_formats[0];
+        assert_eq!(cf.ranges, vec![(1, 0, 2, 0)]);
+        assert_eq!(first_formula(cf), "A2>0");
+    }
+
+    #[test]
+    fn dv_deleting_the_range_that_held_the_anchor_column_retranslates() {
+        let mut pkg = one(
+            "S",
+            r#"<dataValidations count="1"><dataValidation type="custom" sqref="C1:C2 A5:A6"><formula1>ISNUMBER(A1)</formula1></dataValidation></dataValidations>"#,
+        );
+        delete_rows(&mut pkg.workbook, 0, 4, 2);
+        let dv = &pkg.workbook.sheets[0].validations[0];
+        assert_eq!(dv.ranges, vec![(0, 2, 1, 2)]);
+        assert_eq!(dv.formula1, "ISNUMBER(C1)");
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(
+            ws.contains(r#"sqref="C1:C2"><formula1>ISNUMBER(C1)</formula1>"#),
+            "{ws}"
+        );
+    }
+
+    /// Add a CF over C3 to a part whose blocks stand where the new one lands
+    /// ahead of some of them, move rows, and check each element kept its own
+    /// rule.
+    fn add_into_misordered(body: &str, added_ix: usize, existing: &[(&str, &str)]) {
+        let mut pkg = one("S", body);
+        assert!(pkg.add_conditional_format(
+            0,
+            (2, 2, 2, 2),
+            "greaterThan",
+            "5",
+            None,
+            Dxf::default()
+        ));
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.cond_formats.last().unwrap().ix, Some(added_ix));
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (re, ws) = saved(&pkg, SHEET1);
+        for (sqref, formula) in existing {
+            assert!(ws.contains(&expr_cf(sqref, formula)), "{sqref}: {ws}");
+        }
+        assert!(
+            ws.contains(r#"<conditionalFormatting sqref="C4"><cfRule type="cellIs" dxfId="0" priority="2" operator="greaterThan"><formula>5</formula>"#),
+            "{ws}"
+        );
+        assert_eq!(re.workbook.sheets[0].cond_formats.len(), existing.len() + 1);
+    }
+
+    #[test]
+    fn a_cf_added_ahead_of_a_misplaced_block_keeps_both_in_place() {
+        // A block after <dataValidations>, which ranks after it: the new
+        // block goes before the DVs, so ahead of it.
+        let body = format!(
+            r#"<dataValidations count="1"><dataValidation type="whole" sqref="D1"><formula1>1</formula1></dataValidation></dataValidations>{}"#,
+            expr_cf("A1", "A1=1")
+        );
+        add_into_misordered(&body, 0, &[("A2", "A2=1")]);
+    }
+
+    #[test]
+    fn a_cf_added_between_blocks_split_by_margins_keeps_each_in_place() {
+        let body = format!(
+            "{}{MARGINS}{}",
+            expr_cf("A1", "A1=1"),
+            expr_cf("B1", "B1=2")
+        );
+        add_into_misordered(&body, 1, &[("A2", "A2=1"), ("B2", "B2=2")]);
     }
 }

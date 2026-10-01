@@ -1406,11 +1406,13 @@ fn for_each_rule_formula(sheet: &mut Sheet, mut f: impl FnMut(&mut String)) {
 
 /// Move a rule's ranges (`sqref`) through the edit, as merges move, and
 /// return how far its formulas have to be translated first. The formulas
-/// are relative to the ranges' top-left (the anchor [`crate::cf`] evaluates
-/// them at). When a delete trims that corner away, the cell that becomes the
-/// new anchor read them translated by the distance it sat from the old one:
-/// that (rows, cols) offset comes back. `None` when the edit deleted every
-/// range of a rule that had some.
+/// are relative to the ranges' top-left, (min r1, min c1) over them all (the
+/// anchor [`crate::cf`] evaluates them at). When a delete moves that corner
+/// to another cell, by trimming the range that held it or by taking a whole
+/// range that held its row or its column, the cell that becomes the new
+/// anchor read the formulas translated by the distance it sat from the old
+/// one: that (rows, cols) offset comes back. `None` when the edit deleted
+/// every range of a rule that had some.
 fn shift_rule_ranges(
     ranges: &mut Vec<(u32, u32, u32, u32)>,
     shift: &EditShift,
@@ -1418,13 +1420,13 @@ fn shift_rule_ranges(
     if ranges.is_empty() {
         return Some((0, 0));
     }
-    let axis_min = |rs: &[(u32, u32, u32, u32)]| {
+    let anchor = |rs: &[(u32, u32, u32, u32)]| {
         rs.iter()
-            .map(|&(r1, c1, _, _)| if shift.rows { r1 } else { c1 })
-            .min()
-            .unwrap_or(0)
+            .fold((u32::MAX, u32::MAX), |(r, c), &(r1, c1, _, _)| {
+                (r.min(r1), c.min(c1))
+            })
     };
-    let before = axis_min(ranges);
+    let before = anchor(ranges);
     let moved: Vec<_> = ranges
         .iter()
         .filter_map(|&(r1, c1, r2, c2)| {
@@ -1439,20 +1441,27 @@ fn shift_rule_ranges(
         return None;
     }
     *ranges = moved;
-    // Only a delete trims: an insert moves the corner with its cell.
-    let d = if shift.delta < 0 {
-        let after = axis_min(ranges);
-        // The new anchor's position before the edit.
-        let pre = if after < shift.at {
-            after as i64
+    // An insert drops no range and moves the corner with its cell.
+    if shift.delta >= 0 {
+        return Some((0, 0));
+    }
+    let after = anchor(ranges);
+    // The new anchor's position before the edit: on the edited axis, past
+    // the deleted band when it sits at or after it; the other axis wasn't
+    // edited.
+    let pre = |v: u32| {
+        if v < shift.at {
+            v as i64
         } else {
-            after as i64 - shift.delta
-        };
-        pre - before as i64
-    } else {
-        0
+            v as i64 - shift.delta
+        }
     };
-    Some(if shift.rows { (d, 0) } else { (0, d) })
+    let (pre_r, pre_c) = if shift.rows {
+        (pre(after.0), after.1 as i64)
+    } else {
+        (after.0 as i64, pre(after.1))
+    };
+    Some((pre_r - before.0 as i64, pre_c - before.1 as i64))
 }
 
 /// A rule formula through the edit: translated by `by` to the rule's new
