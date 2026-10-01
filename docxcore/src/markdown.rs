@@ -590,10 +590,7 @@ pub fn from_markdown(src: &str) -> Document {
                     {
                         break;
                     }
-                    if !text.is_empty() {
-                        text.push(' ');
-                    }
-                    text.push_str(t);
+                    push_continuation(&mut text, t);
                     i += 1;
                 }
                 body.push(list_para(ilvl, ordered, &text));
@@ -614,10 +611,7 @@ pub fn from_markdown(src: &str) -> Document {
             if t.is_empty() || starts_block(l, lines.get(i + 1).copied()) {
                 break;
             }
-            if !text.is_empty() {
-                text.push(' ');
-            }
-            text.push_str(t);
+            push_continuation(&mut text, t);
             i += 1;
         }
         body.push(
@@ -632,6 +626,20 @@ pub fn from_markdown(src: &str) -> Document {
         body.push(Block::Paragraph(Paragraph::default()));
     }
     Document { body }
+}
+
+/// Join a soft-wrapped continuation line onto `text` with a space. A line
+/// ending in an unescaped `\` (an odd run) is a CommonMark hard break: drop
+/// that backslash and fold the break into the join, as a two-space hard break
+/// already is. An escaped `dir\\` (an even run) keeps both for the inline pass.
+fn push_continuation(text: &mut String, line: &str) {
+    if text.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1 {
+        text.pop();
+    }
+    if !text.is_empty() {
+        text.push(' ');
+    }
+    text.push_str(line);
 }
 
 /// Whether `line` begins a block that should end the current plain paragraph.
@@ -1052,10 +1060,10 @@ fn push_run(out: &mut Vec<Inline>, buf: &mut String, bold: bool, italic: bool, s
 }
 
 /// Whether `\c` is a backslash escape. CommonMark escapes only ASCII
-/// punctuation (`\t` is a literal backslash and `t`); a backslash before a
-/// newline is kept consumed, as before.
+/// punctuation (`\t` is a literal backslash and `t`). A line-end `\` (hard
+/// break) never reaches the inline pass: `push_continuation` drops it.
 fn is_md_escapable(c: char) -> bool {
-    c.is_ascii_punctuation() || c == '\n'
+    c.is_ascii_punctuation()
 }
 
 /// Parse `[label](url)` starting at `chars[start] == '['`. Returns
@@ -1579,6 +1587,20 @@ mod tests {
             Inline::Hyperlink(h) => assert_eq!(h.runs[0].text, r"C:\dir"),
             other => panic!("expected a hyperlink, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn line_end_backslash_is_a_hard_break_folded_into_the_join() {
+        let para = from_markdown(concat!(r"foo\", "\n", "bar"));
+        assert_eq!(para.body[0].plain_text(), "foo bar");
+        let item = from_markdown(concat!(r"- foo\", "\n", "  bar"));
+        assert_eq!(item.body[0].plain_text(), "foo bar");
+        // An escaped backslash at line end is text, not a break.
+        let escaped = from_markdown(concat!(r"dir\\", "\n", "next"));
+        assert_eq!(escaped.body[0].plain_text(), r"dir\ next");
+        // With no following line a trailing `\` is literal (CommonMark).
+        let last = from_markdown(concat!("start\n", r"end\"));
+        assert_eq!(last.body[0].plain_text(), r"start end\");
     }
 
     #[test]
