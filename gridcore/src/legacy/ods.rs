@@ -114,7 +114,13 @@ fn split_address(s: &str) -> Option<(Option<String>, String)> {
                 name.push(ch);
             }
         }
-        (Some(name), &q[end?..])
+        // The A1 part follows the name's `.`; anything else (an external
+        // `'file:///b.ods'#$Sheet1.A1`) is no reference this reads.
+        let rest = &q[end?..];
+        if !(rest.is_empty() || rest.starts_with('.')) {
+            return None;
+        }
+        (Some(name), rest)
     } else if let Some(dot) = s.rfind('.') {
         let sheet = &s[..dot];
         ((!sheet.is_empty()).then(|| sheet.to_string()), &s[dot..])
@@ -151,6 +157,11 @@ fn convert_ref(r: &str) -> Option<String> {
     if c1.contains("#REF!") || second.as_ref().is_some_and(|(_, c)| c.contains("#REF!")) {
         return Some("#REF!".to_string());
     }
+    // Only an A1 shape is passed on: anything else would be stored as a
+    // formula Excel can't read, so the cell keeps its value instead.
+    if !a1_shaped(&c1) || second.as_ref().is_some_and(|(_, c)| !a1_shaped(c)) {
+        return None;
+    }
     let first_sheet = s1.unwrap_or_default();
     match second {
         None => Some(format!("{}{c1}", sheet_prefix(&first_sheet, &first_sheet))),
@@ -159,6 +170,24 @@ fn convert_ref(r: &str) -> Option<String> {
             Some(format!("{}{c1}:{c2}", sheet_prefix(&first_sheet, &last)))
         }
     }
+}
+
+/// Whether `c` is shaped like an A1 cell, column or row (`$A$1`, `A`,
+/// `$3`): up to three letters then up to seven digits, either optionally
+/// anchored, not both empty.
+fn a1_shaped(c: &str) -> bool {
+    let c = c.strip_prefix('$').unwrap_or(c);
+    let letters = c.bytes().take_while(u8::is_ascii_alphabetic).count();
+    let digits = &c[letters..];
+    let digits = if letters > 0 {
+        digits.strip_prefix('$').unwrap_or(digits)
+    } else {
+        digits
+    };
+    letters <= 3
+        && digits.len() <= 7
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && letters + digits.len() > 0
 }
 
 /// An OpenFormula expression (`of:=…`, the namespace prefix optional) in
@@ -1007,6 +1036,13 @@ mod tests {
             c("of:=SUM(['A:B'.A1:'C'.A1])").as_deref(),
             Some("SUM('A\u{FDD0}B:C'!A1:A1)")
         );
+        // An external reference is dropped (the cell keeps its value), not
+        // stored as text no reader parses.
+        assert_eq!(c("of:=['file:///C:/b.ods'#$Sheet1.A1]"), None);
+        assert_eq!(c("of:=SUM(['file:///C:/b.ods'#$Sheet1.A1:.B2])"), None);
+        assert_eq!(c("of:=[$'My Sheet'.B2]+[file:///b.ods#$Sheet1.A1]"), None);
+        assert!(a1_shaped("$A$1") && a1_shaped("XFD") && a1_shaped("$3") && a1_shaped("A1"));
+        assert!(!a1_shaped("") && !a1_shaped("$") && !a1_shaped("file") && !a1_shaped("#A1"));
         assert_eq!(
             c("of:=COM.MICROSOFT.SINGLE(COM.MICROSOFT.IFS([.A1]>1;1;TRUE();2))").as_deref(),
             Some("_xlfn.SINGLE(IFS(A1>1,1,TRUE(),2))")
