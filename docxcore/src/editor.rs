@@ -1628,7 +1628,17 @@ impl Editor {
     /// The next match relative to the caret (wrapping), forward or backward.
     pub fn find_next(&self, query: &str, case_sensitive: bool, reverse: bool) -> Option<Match> {
         let all = self.find_all(query, case_sensitive);
-        if all.is_empty() {
+        let starts: Vec<(&[usize], usize)> =
+            all.iter().map(|m| (m.path.as_slice(), m.start)).collect();
+        let i = self.index_from_caret(&starts, reverse)?;
+        all.into_iter().nth(i)
+    }
+
+    /// Of positions `starts` (paragraph path, offset) in document order: the
+    /// index of the first one after the caret (in reverse, the last one
+    /// before it), wrapping. `None` when there are none.
+    fn index_from_caret(&self, starts: &[(&[usize], usize)], reverse: bool) -> Option<usize> {
+        if starts.is_empty() {
             return None;
         }
         let paths = all_paragraph_paths(&self.doc.body);
@@ -1638,18 +1648,17 @@ impl Editor {
                 off,
             )
         };
-        let ck = key(&self.caret.path, self.caret.offset);
+        let caret = key(&self.caret.path, self.caret.offset);
         if reverse {
-            all.iter()
-                .rev()
-                .find(|m| key(&m.path, m.start) < ck)
-                .cloned()
-                .or_else(|| all.last().cloned())
+            starts
+                .iter()
+                .rposition(|&(path, off)| key(path, off) < caret)
+                .or(Some(starts.len() - 1))
         } else {
-            all.iter()
-                .find(|m| key(&m.path, m.start) > ck)
-                .cloned()
-                .or_else(|| all.first().cloned())
+            starts
+                .iter()
+                .position(|&(path, off)| key(path, off) > caret)
+                .or(Some(0))
         }
     }
 

@@ -4577,16 +4577,22 @@ impl App {
                         None => (String::new(), None),
                     };
                     // Only an editable match that is still selected is
-                    // replaced; a read-only one is skipped.
+                    // replaced; a read-only one is skipped. An editable match
+                    // the selection has moved off (a click while the bar is
+                    // open) is selected again first, not replaced unseen.
                     match current {
                         Some(m) if m.editable && self.editor.selection_is(&m) => {
                             self.editor.replace_current_with(&repl);
                             self.modified = true;
                             self.find_recompute();
                         }
-                        Some(_) => {
+                        Some(m) if !m.editable => {
                             self.status = Some("Read-only match skipped".to_string());
                             self.find_step(1);
+                        }
+                        Some(m) => {
+                            self.editor.select_found(&m);
+                            self.dirty = true;
                         }
                         None => {}
                     }
@@ -6648,11 +6654,11 @@ fn clip_has_formatting(clip: &Clip) -> bool {
                 link.runs.iter().any(|run| run.props != RunProps::default())
                     || link.content.iter().any(inline_has_formatting)
             }
-            Inline::Tab(props) => *props != RunProps::default(),
+            // A tab or a break is a run in OOXML and carries its own rPr (#279).
+            Inline::Tab(props) | Inline::Break(_, props) => *props != RunProps::default(),
             Inline::Revision { content, .. } => content.iter().any(inline_has_formatting),
             Inline::TextBox { blocks, .. } => blocks_have_formatting(blocks),
-            Inline::Break(..)
-            | Inline::SmartArt { .. }
+            Inline::SmartArt { .. }
             | Inline::Chart { .. }
             | Inline::Equation { .. }
             | Inline::Field { .. }
@@ -10792,6 +10798,28 @@ mod tests {
         }));
     }
 
+    /// A break carries its run's formatting (#279), so a clip holding only a
+    /// bold break is formatted content, refused like a bold run is under
+    /// formatting protection.
+    #[test]
+    fn a_formatted_break_counts_as_clip_formatting_279() {
+        let brk = |bold| {
+            Inline::Break(
+                BreakKind::Line,
+                RunProps {
+                    bold,
+                    ..RunProps::default()
+                },
+            )
+        };
+        assert!(clip_has_formatting(&Clip {
+            paras: vec![vec![brk(true)]],
+        }));
+        assert!(!clip_has_formatting(&Clip {
+            paras: vec![vec![brk(false)]],
+        }));
+    }
+
     fn vim_app(paras: &[&str]) -> App {
         let mut app = app_with(paras);
         app.vim = Some(VimState::new());
@@ -11348,6 +11376,24 @@ mod tests {
         assert_eq!(app.find.as_ref().unwrap().idx, 2, "and Replace advanced");
         app.on_key(KeyCode::Enter.into_key());
         assert_eq!(first_line(&app), "x x Z");
+    }
+
+    /// Replace with the selection moved off the current editable match
+    /// selects the match again and edits nothing (m3 of review r1).
+    #[test]
+    fn find_bar_replace_reselects_a_match_the_selection_left_211() {
+        let mut app = app_with_tracked_x();
+        find_x_replace_with_z(&mut app);
+        let m = app.find.as_ref().unwrap().matches[0].clone();
+        assert!(m.editable && app.editor.selection_is(&m));
+        app.editor.clear_selection(); // a click elsewhere
+        let before = app.editor.doc.body.clone();
+        app.on_key(KeyCode::Enter.into_key());
+        assert_eq!(app.editor.doc.body, before, "nothing replaced");
+        assert!(app.editor.selection_is(&m), "the match is selected again");
+        assert_eq!(app.status, None, "and it is not reported as read-only");
+        app.on_key(KeyCode::Enter.into_key());
+        assert_eq!(first_line(&app), "Z x x");
     }
 
     #[test]

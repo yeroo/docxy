@@ -13467,6 +13467,8 @@ impl Docxy {
     /// Open the find bar (focused on the query field) or close it.
     fn toggle_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.find_open = !self.find_open;
+        // A new Find starts from the caret, not from a match left by the last.
+        self.find_cur = None;
         if self.find_open {
             self.find_field = FindField::Query;
             // Seed from the current selection, if any, for a quick "find selected".
@@ -18031,7 +18033,8 @@ enum ReplaceOne {
 
 /// The find bar's step over what the document shows (#211). It steps from
 /// the current match `cur` while that is still the match at its index (the
-/// document has not changed under it), else from the caret, or from the
+/// document has not changed under it) and the editor is still on it (no click
+/// or caret move since, no other tab), else from the caret, or from the
 /// document top with `from_start`. Stepping by index visits every match once,
 /// even several sharing one editor offset. Selects and returns the new
 /// current match.
@@ -18049,7 +18052,7 @@ fn find_step_in(
     }
     let matches = ed.find_visible(query, case_sensitive);
     let idx = match cur {
-        Some((i, m)) if !from_start && matches.get(i) == Some(&m) => {
+        Some((i, m)) if !from_start && matches.get(i) == Some(&m) && ed.is_at_found(&m) => {
             step_found(matches.len(), Some(i), reverse)
         }
         _ if from_start => step_found(matches.len(), None, reverse),
@@ -18063,7 +18066,7 @@ fn find_step_in(
 /// Replace the find bar's current match `cur` with `with` only when it is an
 /// editable match and still exactly the selection (#211): a read-only match
 /// is never edited, nor is a selection that is not a match. Then step to the
-/// next match.
+/// next match (from the caret, if the editor has left the current one).
 fn replace_one_in(
     ed: &mut Editor,
     query: &str,
@@ -18072,9 +18075,9 @@ fn replace_one_in(
     with: &str,
 ) -> (ReplaceOne, Option<(usize, FoundMatch)>) {
     let matches = ed.find_visible(query, case_sensitive);
-    let current = cur.filter(|(i, m)| matches.get(*i) == Some(m));
+    let current = cur.filter(|(i, m)| matches.get(*i) == Some(m) && ed.is_at_found(m));
     let outcome = match &current {
-        Some((_, m)) if m.editable && ed.selection_is(m) => {
+        Some((_, m)) if m.editable => {
             ed.replace_current_with(with);
             ReplaceOne::Replaced
         }
@@ -18147,6 +18150,32 @@ mod find_bar_tests {
         let (done, _) = replace_one_in(&mut ed, "x", false, None, "Z");
         assert_eq!(done, ReplaceOne::NoMatch, "nor with no current match");
         assert_eq!(ed.doc.body, before);
+    }
+
+    /// After the caret moves (a click while the bar is open), the next step
+    /// goes from the caret, not from the stale current match (m4 of review r1).
+    #[test]
+    fn a_moved_caret_restarts_stepping_from_the_caret_211() {
+        let mut ed = tracked_x(); // `x` at 0, the tracked `x` at 2 (collapsed), `x` at 3
+        let cur = find_step_in(&mut ed, "x", false, None, false, true);
+        assert_eq!(cur.as_ref().map(|(i, _)| *i), Some(0));
+        ed.clear_selection();
+        ed.caret = Caret::at(vec![0], 2); // clicked just past the tracked `x`
+        let cur = find_step_in(&mut ed, "x", false, cur, false, false);
+        assert_eq!(cur.as_ref().map(|(i, _)| *i), Some(2), "not match 1");
+        // Replace with a stale current match edits nothing and goes on from
+        // the caret.
+        ed.clear_selection();
+        ed.caret = Caret::at(vec![0], 0);
+        let before = ed.doc.body.clone();
+        let (done, cur) = replace_one_in(&mut ed, "x", false, cur, "Z");
+        assert_eq!(done, ReplaceOne::NoMatch);
+        assert_eq!(ed.doc.body, before);
+        assert_eq!(
+            cur.as_ref().map(|(i, _)| *i),
+            Some(1),
+            "the first match after the caret"
+        );
     }
 
     /// Two hits in one deletion share an editor offset: stepping visits both.

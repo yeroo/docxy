@@ -219,6 +219,12 @@ impl Walk {
 /// The search behind [`Editor::find_visible`]: every paragraph (text box
 /// paragraphs after their host, as [`super::find_all_in_body`] orders them),
 /// matches in display order, non-overlapping within a segment.
+///
+/// Editable text wins over read-only text it overlaps: a read-only hit is
+/// dropped when an editable hit starts inside it (`[ins a]` + `aa`, query
+/// `aa`, finds the editable `aa`, not `[a]a`), so a match the user could
+/// replace is never hidden. Hits still never overlap, so no drawn char is
+/// counted twice.
 pub(crate) fn find_visible_in_body(
     body: &[Block],
     query: &str,
@@ -234,25 +240,35 @@ pub(crate) fn find_visible_in_body(
             continue;
         };
         for segment in shown_segments(&p.content) {
-            let mut i = 0;
-            while i + q.len() <= segment.len() {
-                let hit = &segment[i..i + q.len()];
-                if hit
-                    .iter()
+            let hit_at = |i: usize| -> Option<FoundMatch> {
+                let hit = segment.get(i..i + q.len())?;
+                hit.iter()
                     .zip(&q)
                     .all(|(s, c)| char_eq(s.ch, *c, case_sensitive))
-                {
-                    out.push(FoundMatch {
+                    .then(|| FoundMatch {
                         path: path.clone(),
                         start: hit.iter().map(|s| s.start).min().unwrap_or(0),
                         end: hit.iter().map(|s| s.end).max().unwrap_or(0),
                         editable: hit.iter().all(|s| s.editable),
                         revision: hit.iter().find_map(|s| s.revision),
-                    });
-                    i += q.len();
-                } else {
+                    })
+            };
+            let mut i = 0;
+            while i + q.len() <= segment.len() {
+                let Some(m) = hit_at(i) else {
                     i += 1;
+                    continue;
+                };
+                if !m.editable {
+                    let editable_inside =
+                        (i + 1..i + q.len()).find(|&j| hit_at(j).is_some_and(|h| h.editable));
+                    if let Some(j) = editable_inside {
+                        i = j;
+                        continue;
+                    }
                 }
+                out.push(m);
+                i += q.len();
             }
         }
     }
@@ -292,28 +308,32 @@ impl Editor {
     /// [`Editor::find_next`] steps. From then on, step by index
     /// ([`step_found`]).
     pub fn found_from_caret(&self, matches: &[FoundMatch], reverse: bool) -> Option<usize> {
-        if matches.is_empty() {
-            return None;
+        let starts: Vec<(&[usize], usize)> = matches
+            .iter()
+            .map(|m| (m.path.as_slice(), m.start))
+            .collect();
+        self.index_from_caret(&starts, reverse)
+    }
+
+    /// True while the editor is still on `m` as [`Editor::select_found`] left
+    /// it: a ranged match is exactly the selection; a collapsed one has the
+    /// caret where `select_found` put it, with nothing selected. Hosts step
+    /// from their current match only while this holds, and from the caret
+    /// once the user has moved it (a click with the bar open, another tab).
+    pub fn is_at_found(&self, m: &FoundMatch) -> bool {
+        if m.start != m.end {
+            return self.selection_is(m);
         }
-        let paths = all_paragraph_paths(&self.doc.body);
-        let key = |path: &[usize], off: usize| {
-            (
-                paths.iter().position(|p| p.as_slice() == path).unwrap_or(0),
-                off,
-            )
-        };
-        let caret = key(&self.caret.path, self.caret.offset);
-        if reverse {
-            matches
-                .iter()
-                .rposition(|m| key(&m.path, m.start) < caret)
-                .or(Some(matches.len() - 1))
-        } else {
-            matches
-                .iter()
-                .position(|m| key(&m.path, m.start) > caret)
-                .or(Some(0))
+        if self.has_selection() {
+            return false;
         }
+        let review_start = m.revision.filter(|_| !m.editable).and_then(|target| {
+            self.revision_locations()
+                .into_iter()
+                .find(|location| location.address.target == target)
+                .map(|location| location.start)
+        });
+        self.caret == review_start.unwrap_or_else(|| super::Caret::at(m.path.clone(), m.start))
     }
 
     /// True when the selection is exactly `m`'s range, so Replace may edit it.
@@ -441,7 +461,10 @@ mod tests {
         assert_eq!(ed.review_target, m.revision);
         assert_eq!(ed.caret, Caret::at(vec![0], 5));
         assert!(!ed.has_selection());
-        assert!(!ed.selection_is(&m) || m.start == m.end);
+        assert_eq!(m.start, m.end, "a tracked change's text is collapsed");
+        assert!(ed.is_at_found(&m), "the editor is on the match");
+        ed.caret = Caret::at(vec![0], 0);
+        assert!(!ed.is_at_found(&m), "until the caret moves");
     }
 
     const FIELD: &str = "<w:r><w:t>Body</w:t></w:r>\
@@ -457,6 +480,9 @@ mod tests {
         assert_eq!((one[0].start, one[0].end), (4, 5), "the field's one unit");
         ed.select_found(&one[0]);
         assert!(ed.selection_is(&one[0]), "the field is selected as a unit");
+        assert!(ed.is_at_found(&one[0]));
+        ed.clear_selection();
+        assert!(!ed.is_at_found(&one[0]));
         let joined = ed.find_visible("Body1", false);
         assert_eq!(joined.len(), 1);
         assert!(
@@ -567,6 +593,28 @@ mod tests {
             assert_eq!(as_matches, ed.find_all(query, case_sensitive), "{query:?}");
             assert!(!as_matches.is_empty());
         }
+    }
+
+    /// A read-only hit never hides an editable one that overlaps it: `[ins a]`
+    /// + `aa` finds the editable `aa` (m1 of review r1).
+    #[test]
+    fn editable_text_wins_over_an_overlapping_read_only_hit_211() {
+        let mut ed = Editor::new(xml_doc(
+            "<w:ins w:id=\"1\" w:author=\"A\"><w:r><w:t>a</w:t></w:r></w:ins>\
+             <w:r><w:t>aa</w:t></w:r>",
+        ));
+        let ms = ed.find_visible("aa", false);
+        assert_eq!(ms.len(), 1, "{ms:?}");
+        assert!(ms[0].editable);
+        assert_eq!((ms[0].start, ms[0].end), (0, 2));
+        assert_eq!(ed.replace_all_visible("aa", "b", false), (1, 0));
+        assert_eq!(text(&ed), "b");
+        // Read-only hits alone still don't overlap: `aaa` drawn in a deletion,
+        // query `aa`, is one hit.
+        let ed = Editor::new(xml_doc(
+            "<w:del w:id=\"1\" w:author=\"A\"><w:r><w:delText>aaa</w:delText></w:r></w:del>",
+        ));
+        assert_eq!(ed.find_visible("aa", false).len(), 1);
     }
 
     /// Two hits in one deletion share an editor offset; stepping by index
