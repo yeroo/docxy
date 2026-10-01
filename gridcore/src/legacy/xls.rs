@@ -118,8 +118,10 @@ impl<'a> Cur<'a> {
             let raw = self.take(n * width)?;
             if high {
                 units.extend(
-                    raw.chunks_exact(2)
-                        .map(|c| u16::from_le_bytes([c[0], c[1]])),
+                    raw.as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|&[a, b]| u16::from_le_bytes([a, b])),
                 );
             } else {
                 units.extend(raw.iter().map(|&b| b as u16));
@@ -846,7 +848,7 @@ pub(crate) mod tests {
         f.extend([0, 0, 0, 0, 0, 0, 0xFF, 0xFF]);
         f.extend([0; 6]);
         f.extend([4, 0, 0x17, 1, 0]); // ="x"
-        f.extend([b'x']);
+        f.push(b'x');
         let mut s = vec![2, 0, 0];
         s.extend(b"hi");
         let mut b = cell(1, 0, 0);

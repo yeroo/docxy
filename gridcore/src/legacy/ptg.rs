@@ -144,8 +144,10 @@ impl Rd<'_> {
 /// UTF-16LE bytes as a string (lone surrogates replaced).
 pub(crate) fn utf16(raw: &[u8]) -> String {
     let units: Vec<u16> = raw
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[a, b]| u16::from_le_bytes([a, b]))
         .collect();
     String::from_utf16_lossy(&units)
 }
