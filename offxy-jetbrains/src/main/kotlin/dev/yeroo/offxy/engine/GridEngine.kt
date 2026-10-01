@@ -64,8 +64,21 @@ class GridEngine : WasmBinding("/gridwasm.wasm", "grid") {
             (listOf("xlsx", "xlsm", "xltx", "xltm")
                 .indexOf(fileName.substringAfterLast('.', "").lowercase()) + 1).toLong()
 
-        /** Bytes of a fresh empty workbook (`grid_new`). Stateless. */
-        fun newWorkbook(): ByteArray =
-            GridEngine().use { it.readResult(it.instance.export("grid_new").apply()[0]) }
+        /**
+         * Bytes of a fresh empty workbook (`grid_new`), typed for a file
+         * named [fileName] ([kindCode]): an empty `.xltm` gets a macro
+         * template, not a workbook-typed package Excel refuses under that
+         * name. Stateless.
+         */
+        fun newWorkbook(fileName: String = "Book.xlsx"): ByteArray =
+            GridEngine().use { e ->
+                val fresh = e.readResult(e.instance.export("grid_new").apply()[0])
+                if (kindCode(fileName) <= 1L) {
+                    fresh
+                } else {
+                    check(e.open(fresh)) { "grid_new's workbook did not open" }
+                    e.saveAs(fileName)
+                }
+            }
     }
 }
