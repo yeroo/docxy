@@ -2741,10 +2741,20 @@ pub fn dispatch(
         // workbook's open mode (`normal`, `read-only`, `copy`, `repair`).
         // A file already open is reloaded without asking, because `open` is
         // a case's setup; `reopen: "ask"` asks as a person's open does, and
-        // the question is a dialog the `dialog-*` verbs answer.
+        // the question is a dialog the `dialog-*` verbs answer. A relative
+        // `path` resolves against the active tab's folder, as `save-as`'s
+        // does, so a case can name the copy `open copy:` made.
         "open" => {
             let raw = arg_str(args, "path")?;
-            let path = PathBuf::from(raw);
+            let path = match app
+                .tabs
+                .get(app.active)
+                .and_then(|t| t.path.as_deref())
+                .and_then(Path::parent)
+            {
+                Some(base) if Path::new(raw).is_relative() => base.join(raw),
+                _ => PathBuf::from(raw),
+            };
             if !path.is_file() {
                 return Err(format!("no such file: {raw}"));
             }
