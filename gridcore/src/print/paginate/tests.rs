@@ -528,3 +528,27 @@ fn fit_to_with_titles_finds_the_largest_scale_on_either_side_of_the_title_thresh
     assert_eq!((p.pages[0].scale * 100.0).round() as u32, want);
     assert!(p.total <= 2);
 }
+
+#[test]
+fn fit_to_with_titles_inside_the_range_takes_the_largest_fitting_scale() {
+    // FIX r5 m1: rows 1-110, titles 51:56, Fit 0 x 2. The page count isn't
+    // monotonic here: 82 % fits, and a bisection returned 78 %.
+    let mut wb = book(&[(110, 1)]);
+    set_print_titles(
+        &mut wb,
+        0,
+        PrintTitles {
+            rows: Some((50, 55)),
+            cols: None,
+        },
+    );
+    let ps = &mut wb.sheets[0].page_setup;
+    ps.fit_to_page = true;
+    ps.fit_width = 0;
+    ps.fit_height = 2;
+    let want = best_scale_for_height(&wb, 2);
+    assert_eq!(want, 82);
+    let p = active(&wb);
+    assert_eq!((p.pages[0].scale * 100.0).round() as u32, want);
+    assert!(p.total <= 2);
+}

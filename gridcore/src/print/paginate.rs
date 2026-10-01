@@ -107,7 +107,8 @@ impl Lines {
     }
 
     /// Do `self` and `other` share one list?
-    pub fn shares(&self, other: &Lines) -> bool {
+    #[cfg(test)]
+    pub(crate) fn shares(&self, other: &Lines) -> bool {
         Arc::ptr_eq(&self.all, &other.all)
     }
 }
@@ -135,6 +136,7 @@ impl PartialEq for Lines {
     }
 }
 
+#[cfg(test)]
 impl PartialEq<Vec<u32>> for Lines {
     fn eq(&self, other: &Vec<u32>) -> bool {
         **self == **other
@@ -327,14 +329,20 @@ fn titles(sheet: &Sheet, span: Option<(u32, u32)>, rows: bool) -> Axis {
 /// there were no titles rather than one line a page. (Our rule: the spec
 /// doesn't say what Excel does with titles taller than a page.)
 fn repeatable(title: Axis, room: f64, scale: f64) -> Axis {
-    if title.sizes.iter().sum::<f64>() * scale >= room {
+    if repeats(title.sizes.iter().sum(), room, scale) {
+        title
+    } else {
         Axis {
             lines: Vec::new(),
             sizes: Vec::new(),
         }
-    } else {
-        title
     }
+}
+
+/// Do titles `size` points tall (or wide) at 100 % repeat at `scale` in
+/// `room`? Not when they would fill it by themselves ([`repeatable`]).
+fn repeats(size: f64, room: f64, scale: f64) -> bool {
+    size * scale < room
 }
 
 /// Split an axis into bands (index ranges into `ax.lines`) that fit `room`
@@ -423,11 +431,12 @@ fn sheet_scale(wb: &Workbook, sheet: usize, ranges: &[Rect]) -> f64 {
         sizes: Vec::new(),
     };
     // Whether each axis's titles repeat at a scale: (rows, cols).
+    let (title_h, title_w): (f64, f64) = (tr.sizes.iter().sum(), tc.sizes.iter().sum());
     let regime = |pct: u32| {
         let k = f64::from(pct) / 100.0;
         (
-            !repeatable(tr.clone(), room_h, k).lines.is_empty(),
-            !repeatable(tc.clone(), room_w, k).lines.is_empty(),
+            !tr.lines.is_empty() && repeats(title_h, room_h, k),
+            !tc.lines.is_empty() && repeats(title_w, room_w, k),
         )
     };
     let fits = |pct: u32, (keep_r, keep_c): (bool, bool)| {
@@ -442,38 +451,11 @@ fn sheet_scale(wb: &Workbook, sheet: usize, ranges: &[Rect]) -> f64 {
                     || bands(rows, tr, room_h, k, &rb).len() <= ps.fit_height as usize)
         })
     };
-    // Whether titles repeat changes with the scale ([`repeatable`]), and a
-    // scale just under that threshold leaves the body less room than one
-    // just over it, so fitting isn't monotonic across the whole 10–100.
-    // Within a run of scales where neither axis changes regime it is: fewer
-    // pages as the scale falls. So: the largest fitting percentage of each
-    // run, and the largest of those.
-    let mut best = None;
-    let mut hi = 100u32;
-    while hi >= 10 {
-        let r = regime(hi);
-        let mut lo = hi;
-        while lo > 10 && regime(lo - 1) == r {
-            lo -= 1;
-        }
-        // The largest fitting percentage in lo..=hi, if any.
-        if fits(lo, r) {
-            let (mut a, mut b) = (lo, hi);
-            while a < b {
-                let mid = (a + b).div_ceil(2);
-                if fits(mid, r) {
-                    a = mid;
-                } else {
-                    b = mid - 1;
-                }
-            }
-            best = best.max(Some(a));
-        }
-        if lo == 10 {
-            break;
-        }
-        hi = lo - 1;
-    }
+    // The page count isn't monotonic in the scale: whether titles repeat
+    // changes with it ([`repeatable`]), and titles inside the range shift
+    // where pages break. So no bisection: the largest whole percentage that
+    // fits, scanning down from 100 (at most 91 layouts).
+    let best = (10..=100u32).rev().find(|&pct| fits(pct, regime(pct)));
     f64::from(best.unwrap_or(10)) / 100.0
 }
 

@@ -518,7 +518,8 @@ pub struct Sheet {
     /// the save leaves the element as it is.
     pub format: SheetFormat,
     /// `<sheet state="hidden|veryHidden">` in workbook.xml, read only. A
-    /// hidden sheet doesn't print.
+    /// hidden sheet is left out when the entire workbook prints; a named or
+    /// active hidden sheet prints.
     pub hidden: bool,
     /// Rows an applied filter hid, as opposed to rows hidden by hand: derived
     /// at load from the `<autoFilter>` criteria, and kept by the editor's own
