@@ -114,7 +114,13 @@ fn split_address(s: &str) -> Option<(Option<String>, String)> {
                 name.push(ch);
             }
         }
-        (Some(name), &q[end?..])
+        // The A1 part follows the name's `.`; anything else (an external
+        // `'file:///b.ods'#$Sheet1.A1`) is no reference this reads.
+        let rest = &q[end?..];
+        if !(rest.is_empty() || rest.starts_with('.')) {
+            return None;
+        }
+        (Some(name), rest)
     } else if let Some(dot) = s.rfind('.') {
         let sheet = &s[..dot];
         ((!sheet.is_empty()).then(|| sheet.to_string()), &s[dot..])
@@ -128,14 +134,33 @@ fn split_address(s: &str) -> Option<(Option<String>, String)> {
 /// An ODF reference (`.A1`, `.A1:.B2`, `Data.A:.A`, `'Q3'.A1:.A1`,
 /// `Data.$A$1:Data.$A$5`) in Excel's syntax.
 fn convert_ref(r: &str) -> Option<String> {
-    let mut parts = r.splitn(2, ':');
-    let (s1, c1) = split_address(parts.next()?)?;
-    let second = match parts.next() {
+    // The range's `:` is the first one outside a quoted sheet name, which
+    // may hold one (`'A:B'.A1`). `''` inside a name closes and reopens it.
+    let mut quoted = false;
+    let colon = r.char_indices().find_map(|(i, c)| {
+        match c {
+            '\'' => quoted = !quoted,
+            ':' if !quoted => return Some(i),
+            _ => {}
+        }
+        None
+    });
+    let (first, second) = match colon {
+        Some(i) => (&r[..i], Some(&r[i + 1..])),
+        None => (r, None),
+    };
+    let (s1, c1) = split_address(first)?;
+    let second = match second {
         Some(s) => Some(split_address(s)?),
         None => None,
     };
     if c1.contains("#REF!") || second.as_ref().is_some_and(|(_, c)| c.contains("#REF!")) {
         return Some("#REF!".to_string());
+    }
+    // Only an A1 shape is passed on: anything else would be stored as a
+    // formula Excel can't read, so the cell keeps its value instead.
+    if !a1_shaped(&c1) || second.as_ref().is_some_and(|(_, c)| !a1_shaped(c)) {
+        return None;
     }
     let first_sheet = s1.unwrap_or_default();
     match second {
@@ -145,6 +170,24 @@ fn convert_ref(r: &str) -> Option<String> {
             Some(format!("{}{c1}:{c2}", sheet_prefix(&first_sheet, &last)))
         }
     }
+}
+
+/// Whether `c` is shaped like an A1 cell, column or row (`$A$1`, `A`,
+/// `$3`): up to three letters then up to seven digits, either optionally
+/// anchored, not both empty.
+fn a1_shaped(c: &str) -> bool {
+    let c = c.strip_prefix('$').unwrap_or(c);
+    let letters = c.bytes().take_while(u8::is_ascii_alphabetic).count();
+    let digits = &c[letters..];
+    let digits = if letters > 0 {
+        digits.strip_prefix('$').unwrap_or(digits)
+    } else {
+        digits
+    };
+    letters <= 3
+        && digits.len() <= 7
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && letters + digits.len() > 0
 }
 
 /// An OpenFormula expression (`of:=…`, the namespace prefix optional) in
@@ -982,6 +1025,24 @@ mod tests {
             Some("SUM('Q1:Q3'!A1:A1)")
         );
         assert_eq!(c("of:=$$TaxRate*100").as_deref(), Some("TaxRate*100"));
+        // A `:` in a quoted table name is part of the name, spelled as the
+        // marker `build` renames (#876).
+        assert_eq!(c("of:=['A:B'.A1]").as_deref(), Some("'A\u{FDD0}B'!A1"));
+        assert_eq!(
+            c("of:=SUM([$'A:B'.A:.A])").as_deref(),
+            Some("SUM('A\u{FDD0}B'!A:A)")
+        );
+        assert_eq!(
+            c("of:=SUM(['A:B'.A1:'C'.A1])").as_deref(),
+            Some("SUM('A\u{FDD0}B:C'!A1:A1)")
+        );
+        // An external reference is dropped (the cell keeps its value), not
+        // stored as text no reader parses.
+        assert_eq!(c("of:=['file:///C:/b.ods'#$Sheet1.A1]"), None);
+        assert_eq!(c("of:=SUM(['file:///C:/b.ods'#$Sheet1.A1:.B2])"), None);
+        assert_eq!(c("of:=[$'My Sheet'.B2]+[file:///b.ods#$Sheet1.A1]"), None);
+        assert!(a1_shaped("$A$1") && a1_shaped("XFD") && a1_shaped("$3") && a1_shaped("A1"));
+        assert!(!a1_shaped("") && !a1_shaped("$") && !a1_shaped("file") && !a1_shaped("#A1"));
         assert_eq!(
             c("of:=COM.MICROSOFT.SINGLE(COM.MICROSOFT.IFS([.A1]>1;1;TRUE();2))").as_deref(),
             Some("_xlfn.SINGLE(IFS(A1>1,1,TRUE(),2))")
@@ -1193,6 +1254,55 @@ mod tests {
             wb.defined_names[1].formula,
             format!("'{cut}'!$A$1,'{cut}'!$B$1")
         );
+    }
+
+    /// A table named `A:B` (no Excel name holds a `:`) is renamed `A_B`,
+    /// and its references follow: a whole column, a cell, a 3D span and a
+    /// named range. One to a table the file doesn't have keeps its text
+    /// (#876).
+    #[test]
+    fn a_table_named_with_a_colon_keeps_its_references() {
+        let num = |v: u32| {
+            format!(
+                r#"<table:table-row><table:table-cell office:value-type="float" office:value="{v}"/></table:table-row>"#
+            )
+        };
+        let f = |text: &str| {
+            format!(
+                r#"<table:table-row><table:table-cell office:value-type="float" office:value="0" table:formula="{text}"/></table:table-row>"#
+            )
+        };
+        let b = read_str(&format!(
+            r#"<table:table table:name="A:B">{}{}{}</table:table>
+            <table:table table:name="C">{}</table:table>
+            <table:table table:name="Calc">{}{}{}{}{}</table:table>
+            <table:named-expressions><table:named-range table:name="Col" table:cell-range-address="$'A:B'.$A$1:.$A$3"/></table:named-expressions>"#,
+            num(1),
+            num(2),
+            num(3),
+            num(10),
+            f("of:=SUM(['A:B'.A:.A])"),
+            f("of:=['A:B'.A2]"),
+            f("of:=SUM(['A:B'.A1:'C'.A1])"),
+            f("of:=['X:Y'.A1]"),
+            f("of:=['A:B'.A1]+['X:Y'.A1]"),
+        ));
+        let mut pkg = b.build();
+        let wb = &mut pkg.workbook;
+        assert_eq!(wb.sheets[0].name, "A_B");
+        let mut engine = crate::engine::Engine::new(wb);
+        engine.recalc_all(wb);
+        let calc = &wb.sheets[2];
+        let got = |r: u32| {
+            let c = calc.cell(r, 0).unwrap();
+            (c.formula.clone().unwrap(), c.value.clone())
+        };
+        assert_eq!(got(0), ("SUM(A_B!A:A)".into(), CellValue::Number(6.0)));
+        assert_eq!(got(1), ("A_B!A2".into(), CellValue::Number(2.0)));
+        assert_eq!(got(2), ("SUM(A_B:C!A1)".into(), CellValue::Number(11.0)));
+        assert_eq!(got(3).0, "'X:Y'!A1");
+        assert_eq!(got(4).0, "A_B!A1+'X:Y'!A1");
+        assert_eq!(wb.defined_names[0].formula, "A_B!$A$1:$A$3");
     }
 
     #[test]

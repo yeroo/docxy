@@ -12,7 +12,7 @@ use opccore::zip::ZipArchive;
 
 use super::ptg::{self, Base, Biff, Names, Table, utf16};
 use super::{
-    BookIn, Limits, OpenError, SheetIn, biff_error, builtin_format, on_grid, rk, set_array,
+    BookIn, Le, Limits, OpenError, SheetIn, XfFormats, biff_error, on_grid, rk, set_array,
     sheet_prefix,
 };
 use crate::sheet::{Cell, CellValue, DefinedName};
@@ -49,34 +49,10 @@ fn records(b: &[u8]) -> Vec<(u32, &[u8])> {
 }
 
 /// A little-endian cursor over one record body.
-struct Cur<'a> {
-    d: &'a [u8],
-    at: usize,
-}
+type Cur<'a> = Le<'a>;
 
-impl<'a> Cur<'a> {
-    fn new(d: &'a [u8]) -> Cur<'a> {
-        Cur { d, at: 0 }
-    }
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let s = self.d.get(self.at..self.at.checked_add(n)?)?;
-        self.at += n;
-        Some(s)
-    }
-    fn u8(&mut self) -> Option<u8> {
-        Some(self.take(1)?[0])
-    }
-    fn u16(&mut self) -> Option<u16> {
-        let s = self.take(2)?;
-        Some(u16::from_le_bytes([s[0], s[1]]))
-    }
-    fn u32(&mut self) -> Option<u32> {
-        let s = self.take(4)?;
-        Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
-    }
-    fn f64(&mut self) -> Option<f64> {
-        Some(f64::from_le_bytes(self.take(8)?.try_into().ok()?))
-    }
+/// BIFF12's own fields.
+impl<'a> Le<'a> {
     /// `XLWideString`: a 32-bit count of UTF-16 units. `0xFFFFFFFF` (a null
     /// `XLNullableWideString`) reads as empty.
     fn wide(&mut self) -> Option<String> {
@@ -318,16 +294,9 @@ pub(crate) fn read_with(zip: &ZipArchive, limits: Limits) -> Result<BookIn, Open
             }
         }
     }
-    let mut format_of = |xf: u32, book: &mut BookIn| -> u32 {
-        let ifmt = xf_fmt.get(xf as usize).copied().unwrap_or(0);
-        match fmt_codes
-            .get(&ifmt)
-            .cloned()
-            .or_else(|| builtin_format(ifmt as u32))
-        {
-            Some(code) => book.format_index(&code),
-            None => 0,
-        }
+    let formats = XfFormats {
+        xf_fmt,
+        codes: fmt_codes,
     };
 
     // Every table first: a formula may name one on another sheet.
@@ -351,7 +320,7 @@ pub(crate) fn read_with(zip: &ZipArchive, limits: Limits) -> Result<BookIn, Open
             imported.push(None);
             continue;
         };
-        let cells = read_sheet(&bytes, &g, &sst, &mut book, &mut format_of)?;
+        let cells = read_sheet(&bytes, &g, &sst, &mut book, &formats)?;
         imported.push(Some(book.sheets.len()));
         book.push_sheet(SheetIn {
             name: g.sheets[i].clone(),
@@ -399,7 +368,7 @@ fn read_sheet(
     g: &Globals,
     sst: &[String],
     book: &mut BookIn,
-    format_of: &mut dyn FnMut(u32, &mut BookIn) -> u32,
+    formats: &XfFormats,
 ) -> Result<BTreeMap<(u32, u32), Cell>, OpenError> {
     let mut cells = BTreeMap::new();
     let mut charged = 0usize;
@@ -446,7 +415,7 @@ fn read_sheet(
                     };
                     let mut cell = Cell {
                         value,
-                        style: format_of(style, book),
+                        style: formats.format_of(style, book),
                         ..Cell::default()
                     };
                     if ty >= 8 {

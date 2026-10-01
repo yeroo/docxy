@@ -65,6 +65,10 @@ use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
 use ratatui_image::{Image, Resize};
 
+/// `--csv`: the active sheet as CSV UTF-8 to `out`. Never over the import
+/// source or the workbook's binding, nor over an import's `<stem>.xlsx`:
+/// the binding moves past that name when it exists ([`import_binding`]),
+/// and it is then the user's own workbook.
 fn export_csv_headless(
     pkg: &SheetPackage,
     source: &str,
@@ -73,6 +77,11 @@ fn export_csv_headless(
 ) -> io::Result<usize> {
     let wb = &pkg.workbook;
     let bytes = csv_utf8_bytes(&wb.sheets[wb.active_tab.min(wb.sheets.len() - 1)], wb);
+    let sibling = import_source.map(|s| Path::new(s).with_extension("xlsx"));
+    let source = match &sibling {
+        Some(p) if opccore::fsio::same_file(p, Path::new(out)) => p.to_str().unwrap_or(source),
+        _ => source,
+    };
     export_csv_bytes(source, import_source, out, &bytes)?;
     Ok(bytes.len())
 }
@@ -356,6 +365,25 @@ fn type_for_path(path: &str) -> Option<usize> {
     SAVE_TYPES.iter().position(|t| t.ext == ext)
 }
 
+/// `path`'s save type when a save can't write a workbook under it: an
+/// `.xls`, `.xlsb`, `.ods` (no writer), an `.xml` (needs XML maps), and so
+/// on. `None` for a type it writes, and for no or an unknown extension.
+fn unwritable_type(path: &str) -> Option<&'static backstage::SaveType> {
+    let t = &SAVE_TYPES[type_for_path(path)?];
+    matches!(save_kind(t), SaveKind::Unsupported | SaveKind::XmlData).then_some(t)
+}
+
+/// The path a new workbook opened on the missing `path` is bound to:
+/// `path` itself, unless a save can't write its type (`xlsxy new.xls`),
+/// when it is [`import_binding`]'s `.xlsx`, as Excel starts a new workbook
+/// as one. A save then never writes `.xlsx` bytes under an `.xls` name.
+fn missing_binding(path: &str) -> String {
+    match unwritable_type(path) {
+        Some(_) => import_binding(path),
+        None => path.to_string(),
+    }
+}
+
 /// `path`'s extension as the type list spells it: lower case, with `.html`
 /// and `.mhtml` the Web Page types' `.htm` and `.mht`.
 fn type_ext(path: &str) -> Option<String> {
@@ -479,8 +507,8 @@ fn main() -> ExitCode {
         }
         // CSV/TSV, and a .txt/.prn in a headless run (the wizard's
         // defaults), import as a one-sheet workbook. Ctrl-S then writes
-        // .xlsx: the path is rebound so a spreadsheet never lands in a text
-        // file.
+        // .xlsx: the path is rebound to a free name so a spreadsheet never
+        // lands in a text file or on an existing workbook.
         Some(input) if is_delimited(input) || is_text_import(input) => {
             match load_workbook(input, &TextOpen::from_prefs()) {
                 Ok(loaded) => loaded,
@@ -516,9 +544,10 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
-            // A nonexistent .xlsx path opens a new workbook bound to it.
+            // A nonexistent path opens a new workbook bound to it, or to a
+            // free .xlsx when a save can't write its type (`new.xls`).
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                (new_xlsx(), input.clone(), None, None)
+                (new_xlsx(), missing_binding(input), None, None)
             }
             Err(e) => {
                 eprintln!("error: cannot read {input}: {e}");
@@ -537,14 +566,12 @@ fn main() -> ExitCode {
     if let Some(out) = parsed.recalc_out {
         // Only a workbook package is written: an .xls, .xlsb, .ods, .xml (or
         // any type Save As refuses) would get .xlsx bytes under its name.
-        if let Some(t) = type_for_path(&out).map(|i| &SAVE_TYPES[i]) {
-            if matches!(save_kind(t), SaveKind::Unsupported | SaveKind::XmlData) {
-                eprintln!(
-                    "error: cannot save as .{} ({}): write .xlsx instead",
-                    t.ext, t.label
-                );
-                return ExitCode::from(2);
-            }
+        if let Some(t) = unwritable_type(&out) {
+            eprintln!(
+                "error: cannot save as .{} ({}): write .xlsx instead",
+                t.ext, t.label
+            );
+            return ExitCode::from(2);
         }
         let mut pkg = pkg;
         let mut engine = Engine::new(&pkg.workbook);
@@ -672,9 +699,9 @@ fn auto_convert_from_prefs(text: &str) -> AutoConvert {
 /// (or other package) loads as it is; a `.csv`/`.tsv` imports as one sheet
 /// as Excel opens it (`sep=`, typed-entry conversion); a `.txt`/`.prn`
 /// imports with the Text Import Wizard's defaults (the editor shows the
-/// wizard instead, see `App::open_workbook`). A text import is saved to
-/// `<name>.xlsx`. An `.xls`, `.xlsb` or `.ods` (read by its bytes, whatever
-/// its name) imports through `gridcore::legacy` and is bound to
+/// wizard instead, see `App::open_workbook`). An `.xls`, `.xlsb` or `.ods`
+/// (read by its bytes, whatever its name) imports through
+/// `gridcore::legacy`. Every import, text or workbook, is bound to
 /// [`import_binding`]: `<name>.xlsx`, or the next free numbered name. A
 /// template (`.xltx`, `.xltm`) opens as a new workbook from it, as Excel
 /// starts one: bound to [`template_binding`], so a save never writes the
@@ -688,7 +715,7 @@ fn load_workbook(
         let text = gridcore::textio::decode(&bytes, gridcore::textio::Origin::Auto);
         return Ok((
             text_to_pkg(&text, &file_stem(path), &TextParse::default(), open),
-            format!("{}.xlsx", &path[..path.len() - 4]),
+            import_binding(path),
             Some(path.to_string()),
             None,
         ));
@@ -698,10 +725,9 @@ fn load_workbook(
         let text = gridcore::textio::decode(&bytes, gridcore::textio::Origin::Auto);
         let tab = path.to_ascii_lowercase().ends_with(".tsv");
         let stem = file_stem(path);
-        let base = &path[..path.len() - 4];
         Ok((
             csv_to_pkg(&text, &stem, tab, open),
-            format!("{base}.xlsx"),
+            import_binding(path),
             Some(path.to_string()),
             None,
         ))
@@ -1505,8 +1531,9 @@ struct App {
     /// The template this workbook was started from, until this session first
     /// writes it (to `Budget1.xlsx` from `Budget.xltx`, or a Save As name).
     template: Option<String>,
-    /// An imported `.xls`/`.xlsb`/`.ods` this session has not written yet:
-    /// its binding was free when it opened, and a save rechecks it.
+    /// An import (a `.csv`/`.tsv`/`.txt`/`.prn` or an `.xls`/`.xlsb`/`.ods`)
+    /// this session has not written yet: its binding was free when it
+    /// opened, and the first save rechecks it.
     import_unsaved: bool,
     sheet: usize,
     cur: (u32, u32),
@@ -4219,12 +4246,12 @@ impl App {
         }
     }
 
-    /// After importing a workbook read as `format` (an `.xls`, `.xlsb` or
-    /// `.ods`), the status line names the format and the `.xlsx` a save
-    /// writes.
+    /// After an import, the first save rechecks the binding. After
+    /// importing a workbook read as `format` (an `.xls`, `.xlsb` or `.ods`),
+    /// the status line names the format and the `.xlsx` a save writes.
     fn note_import(&mut self, format: Option<SourceFormat>) {
+        self.import_unsaved = self.import_source.is_some();
         if let (Some(format), Some(source)) = (format, &self.import_source) {
-            self.import_unsaved = true;
             self.status = Some(format!(
                 "Opened {source} ({}); saving writes {}",
                 format.label(),
@@ -4914,8 +4941,8 @@ impl App {
         match &d.purpose {
             textdlg::Purpose::Import { path, .. } => {
                 let pkg = text_to_pkg(d.text(), &file_stem(path), &opts, &self.text_open());
-                let save_path = format!("{}.xlsx", &path[..path.len() - 4]);
-                self.install_workbook(pkg, save_path, Some(path.clone()));
+                self.install_workbook(pkg, import_binding(path), Some(path.clone()));
+                self.import_unsaved = true;
             }
             textdlg::Purpose::Columns { src, .. } => {
                 let Some(dest) = parse_a1(&d.dest) else {
@@ -8903,6 +8930,100 @@ mod tests {
         for ext in ["xls", "xlsb", "ods"] {
             assert!(app.extensions().contains(&ext), "{ext}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #876: a CSV/TSV or text import binds as an `.xls` does: to
+    /// `<stem>.xlsx` when it is free, else the next free numbered name, so
+    /// Ctrl+S leaves an existing workbook alone.
+    #[test]
+    fn csv_import_never_binds_over_an_existing_xlsx() {
+        let dir = tmp("csv-import-free");
+        let opts = TextOpen::from_prefs();
+        for ext in ["csv", "tsv", "txt", "prn"] {
+            let source = dir.join(format!("{ext}book.{ext}"));
+            std::fs::write(&source, "a,b\n1,2\n").unwrap();
+            let (_, bound, from, _) = load_workbook(source.to_str().unwrap(), &opts).unwrap();
+            assert_eq!(Path::new(&bound), source.with_extension("xlsx"), "{ext}");
+            assert_eq!(from.as_deref(), source.to_str());
+            std::fs::write(source.with_extension("xlsx"), b"taken").unwrap();
+            let (_, bound, _, _) = load_workbook(source.to_str().unwrap(), &opts).unwrap();
+            assert_eq!(
+                bound,
+                format!("{}1.xlsx", source.with_extension("").display())
+            );
+        }
+
+        let source = dir.join("book.csv");
+        std::fs::write(&source, "a,b\n1,2\n").unwrap();
+        let existing = dir.join("book.xlsx");
+        std::fs::write(&existing, b"the user's own book").unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.open_workbook(source.to_str().unwrap());
+        let bound = dir.join("book1.xlsx");
+        assert_eq!(Path::new(&app.path), bound);
+        app.save();
+        assert_eq!(std::fs::read(&existing).unwrap(), b"the user's own book");
+        assert!(load_xlsx(&std::fs::read(&bound).unwrap()).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #876: a CSV import rechecks its binding at the first save, as an
+    /// `.xls` import does: a `<stem>.xlsx` made after the open is kept.
+    #[test]
+    fn a_csv_import_rechecks_its_binding_at_the_first_save() {
+        let dir = tmp("csv-import-late");
+        let source = dir.join("late.csv");
+        std::fs::write(&source, "a,b\n1,2\n").unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.open_workbook(source.to_str().unwrap());
+        let plain = dir.join("late.xlsx");
+        assert_eq!(Path::new(&app.path), plain);
+        std::fs::write(&plain, b"made by someone else").unwrap();
+        app.save();
+        assert_eq!(Path::new(&app.path), dir.join("late1.xlsx"));
+        assert_eq!(std::fs::read(&plain).unwrap(), b"made by someone else");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #876: the Text Import Wizard's Finish binds the import to a free
+    /// name too.
+    #[test]
+    fn text_wizard_import_binds_to_a_free_name() {
+        let dir = tmp("text-wizard-free");
+        let source = dir.join("notes.txt");
+        std::fs::write(&source, "a\tb\n1\t2\n").unwrap();
+        let existing = dir.join("notes.xlsx");
+        std::fs::write(&existing, b"the user's own notes").unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.open_workbook(source.to_str().unwrap());
+        assert!(app.text_dialog.is_some());
+        app.finish_text_dialog();
+        let bound = dir.join("notes1.xlsx");
+        assert_eq!(Path::new(&app.path), bound);
+        assert_eq!(app.import_source.as_deref(), source.to_str());
+        assert!(app.import_unsaved);
+        app.save();
+        assert_eq!(std::fs::read(&existing).unwrap(), b"the user's own notes");
+        assert!(load_xlsx(&std::fs::read(&bound).unwrap()).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #876: `xlsxy new.xls` on a missing path starts a workbook bound to
+    /// a free `.xlsx`, as Excel would; a type a save writes, or no known
+    /// type at all, stays bound as typed.
+    #[test]
+    fn missing_legacy_path_binds_a_new_workbook_to_xlsx() {
+        let dir = tmp("missing-legacy");
+        let at = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        for name in ["new.xls", "new.xlsb", "new.ods", "new.XLS", "new.xml"] {
+            assert_eq!(missing_binding(&at(name)), at("new.xlsx"), "{name}");
+        }
+        for name in ["new.xlsx", "new.xlsm", "new", "new.zzz"] {
+            assert_eq!(missing_binding(&at(name)), at(name), "{name}");
+        }
+        std::fs::write(dir.join("new.xlsx"), b"taken").unwrap();
+        assert_eq!(missing_binding(&at("new.xls")), at("new1.xlsx"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

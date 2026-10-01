@@ -1376,6 +1376,27 @@ fn sheet_prefix(name: &str) -> String {
     }
 }
 
+/// A 3D span's sheet part as Excel spells it: `Jan:Mar!`, or quoted as one
+/// token, `'Jan 2024:Mar 2024'!`, when either end needs quotes. An end
+/// needs them when either [`sheet_prefix`] or
+/// [`crate::sheet::quote_sheet_name`] would quote it on its own: the first
+/// quotes a `.`, the second a name shaped like a cell (`'Q1:Q3'!`, which bare
+/// reads as a range) and non-ASCII. An apostrophe in a name is doubled.
+pub(crate) fn span_prefix(first: &str, last: &str) -> String {
+    let quoted = |n: &str| {
+        sheet_prefix(n).starts_with('\'') || crate::sheet::quote_sheet_name(n).starts_with('\'')
+    };
+    if quoted(first) || quoted(last) {
+        format!(
+            "'{}:{}'!",
+            first.replace('\'', "''"),
+            last.replace('\'', "''")
+        )
+    } else {
+        format!("{first}:{last}!")
+    }
+}
+
 fn ref_to_string(r: &CellRef) -> String {
     let mut s = String::new();
     if let Some(sheet) = &r.sheet {
@@ -1468,11 +1489,7 @@ impl Printer {
                 s
             }
             Expr::Ref3D { first, last, a, b } => {
-                let f = sheet_prefix(first);
-                let f = f.trim_end_matches('!');
-                let l = sheet_prefix(last);
-                let l = l.trim_end_matches('!');
-                let head = format!("{f}:{l}!");
+                let head = span_prefix(first, last);
                 if a == b {
                     format!("{head}{}", ref_to_string(a))
                 } else {
@@ -5202,106 +5219,163 @@ pub fn file_formula(src: &str) -> Cow<'_, str> {
 /// rewrite the internal spill/implicit operators — `ANCHORARRAY(A1)` → `A1#`,
 /// `SINGLE(x)` → `@x`. Used by `FORMULATEXT`.
 pub fn display_formula(src: &str) -> String {
-    // Rewrite only outside string literals, so a literal such as "_xlfn." or
-    // "SINGLE(x)" survives verbatim. `"` opens a literal; `""` escapes a quote.
+    // Strip prefixes only outside string literals and quoted sheet names,
+    // so a literal such as "_xlfn." or a sheet 'x SINGLE(1)' survives
+    // verbatim. A bracketed spec loses only `_xlpm.`, which a LAMBDA's
+    // optional parameter (`[_xlpm.y]`) carries; a column `[_xlfn.x]` stays.
+    let b = src.as_bytes();
     let mut out = String::new();
     let mut seg_start = 0usize;
-    let b = src.as_bytes();
     let mut i = 0usize;
     while i < b.len() {
-        if b[i] == b'"' {
-            out.push_str(&transform_segment(&src[seg_start..i]));
-            let lit_start = i;
-            i += 1;
-            while i < b.len() {
-                if b[i] == b'"' {
-                    if i + 1 < b.len() && b[i + 1] == b'"' {
-                        i += 2; // escaped quote inside the literal
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
+        if is_quote_open(b[i]) {
+            out.push_str(&strip_prefixes(&src[seg_start..i]));
+            let end = skip_quoted(b, i);
+            if b[i] == b'[' {
+                out.push_str(&src[i..end].replace("_xlpm.", ""));
+            } else {
+                out.push_str(&src[i..end]);
             }
-            out.push_str(&src[lit_start..i]);
+            i = end;
             seg_start = i;
         } else {
             i += 1;
         }
     }
-    out.push_str(&transform_segment(&src[seg_start..]));
-    out
+    out.push_str(&strip_prefixes(&src[seg_start..]));
+    // The calls are rewritten over the whole text, since a call's argument
+    // may hold a literal (`SINGLE(SWITCH(2,1,"one"))`).
+    rewrite_calls(&out)
 }
 
-/// Strip Excel's internal name prefixes and rewrite the spill/implicit operators
-/// on a run of formula text that contains no string literal.
-fn transform_segment(s: &str) -> String {
-    let s = s
-        .replace("_xlfn._xlws.", "")
+/// Whether `c` opens a run of formula text whose bytes mean nothing to a
+/// scan for names and parens: a string literal, a quoted sheet name or a
+/// structured-reference spec ([`skip_quoted`]).
+pub(crate) fn is_quote_open(c: u8) -> bool {
+    matches!(c, b'"' | b'\'' | b'[')
+}
+
+/// The end of the run [`is_quote_open`] starts at `start`, as the lexer
+/// reads it: just past the closing quote of a string literal (`"…"`) or a
+/// quoted sheet name (`'…'`), a doubled quote inside being an escaped one;
+/// just past the matching `]` of a structured-reference spec (`[…]`, which
+/// nests, and in which `'` escapes the next byte, as in `Table1[Item '#]`).
+/// The end of the text when the run is unclosed.
+pub(crate) fn skip_quoted(b: &[u8], start: usize) -> usize {
+    let q = b[start];
+    let mut i = start + 1;
+    if q == b'[' {
+        let mut depth = 1usize;
+        while i < b.len() {
+            match b[i] {
+                b'\'' => i += 1,
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i + 1;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        return b.len();
+    }
+    while i < b.len() {
+        if b[i] == q {
+            if b.get(i + 1) == Some(&q) {
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    b.len()
+}
+
+/// Strip Excel's internal name prefixes from a run of formula text that
+/// contains no string literal.
+fn strip_prefixes(s: &str) -> String {
+    s.replace("_xlfn._xlws.", "")
         .replace("_xlfn.", "")
         .replace("_xlws.", "")
-        .replace("_xlpm.", "");
-    let s = rewrite_call(&s, "ANCHORARRAY", |arg| format!("{arg}#"));
-    rewrite_call(&s, "SINGLE", |arg| format!("@{arg}"))
+        .replace("_xlpm.", "")
 }
 
-/// Replace every whole-word `name(arg)` (balanced parens) with `f(arg)`. A match
+/// Replace every whole-word `ANCHORARRAY(arg)` with `arg#` and `SINGLE(arg)`
+/// with `@arg` (balanced parens), outside string literals and quoted sheet
+/// names, and with the
+/// argument rewritten too, so `SINGLE(SINGLE(A1))` gives `@@A1`. A match
 /// preceded by an identifier character is ignored — `NOTSINGLE(A1)` is left
-/// alone rather than becoming `NOT@A1`.
-fn rewrite_call(s: &str, name: &str, f: impl Fn(&str) -> String) -> String {
-    let pat = format!("{name}(");
+/// alone rather than becoming `NOT@A1`. An unbalanced call is left verbatim.
+fn rewrite_calls(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = String::new();
     let mut pos = 0usize;
-    while pos < s.len() {
-        let Some(rel) = s[pos..].find(&pat) else {
-            out.push_str(&s[pos..]);
-            return out;
-        };
-        let i = pos + rel;
-        // Left word boundary: the char before `name` must not continue an
+    let mut i = 0usize;
+    while i < b.len() {
+        if is_quote_open(b[i]) {
+            i = skip_quoted(b, i);
+            continue;
+        }
+        // Left word boundary: the char before the name must not continue an
         // identifier (ASCII letter/digit/underscore). A UTF-8 lead/continuation
         // byte before it counts as a boundary.
         let left_ok = i == 0 || {
             let pc = b[i - 1];
             !(pc.is_ascii_alphanumeric() || pc == b'_')
         };
-        if !left_ok {
-            // Not a whole-word match; emit through this occurrence and continue.
-            out.push_str(&s[pos..i + 1]);
-            pos = i + 1;
+        // Bytes, not `&s[i..]`: `i` steps over every byte, inside a non-ASCII
+        // char too. The names are ASCII, so a match starts on a char
+        // boundary and so do `open`, `close` and `pos`.
+        let Some(pat) = ["ANCHORARRAY(", "SINGLE("]
+            .into_iter()
+            .find(|p| left_ok && b[i..].starts_with(p.as_bytes()))
+        else {
+            i += 1;
             continue;
-        }
-        out.push_str(&s[pos..i]);
-        let after = &s[i + pat.len()..];
+        };
+        let open = i + pat.len();
         let mut depth = 1usize;
-        let mut end = None;
-        for (j, ch) in after.char_indices() {
-            match ch {
-                '(' => depth += 1,
-                ')' => {
+        let mut close = None;
+        let mut j = open;
+        while j < b.len() {
+            match b[j] {
+                c if is_quote_open(c) => {
+                    j = skip_quoted(b, j);
+                    continue;
+                }
+                b'(' => depth += 1,
+                b')' => {
                     depth -= 1;
                     if depth == 0 {
-                        end = Some(j);
+                        close = Some(j);
                         break;
                     }
                 }
                 _ => {}
             }
+            j += 1;
         }
-        match end {
-            Some(e) => {
-                out.push_str(&f(&after[..e]));
-                pos = i + pat.len() + e + 1;
-            }
-            None => {
-                // Unbalanced — leave the rest verbatim.
-                out.push_str(&s[i..]);
-                return out;
-            }
+        let Some(close) = close else {
+            // Unbalanced — leave the rest verbatim.
+            break;
+        };
+        out.push_str(&s[pos..i]);
+        let arg = rewrite_calls(&s[open..close]);
+        if pat == "SINGLE(" {
+            out.push('@');
+            out.push_str(&arg);
+        } else {
+            out.push_str(&arg);
+            out.push('#');
         }
+        pos = close + 1;
+        i = pos;
     }
+    out.push_str(&s[pos..]);
     out
 }
 
@@ -11910,6 +11984,91 @@ mod tests {
     }
 
     #[test]
+    fn display_formula_rewrites_single_around_string_literals() {
+        // The call's parens straddle the literals (#876).
+        assert_eq!(
+            display_formula("_xlfn.SINGLE(_xlfn.SWITCH(2,1,\"one\",2,\"two\",\"other\"))"),
+            "@SWITCH(2,1,\"one\",2,\"two\",\"other\")"
+        );
+        // A paren or a call name inside a literal neither closes the call nor
+        // starts one.
+        assert_eq!(
+            display_formula("_xlfn.SINGLE(IF(A1,\")\",B1))"),
+            "@IF(A1,\")\",B1)"
+        );
+        assert_eq!(
+            display_formula("_xlfn.SINGLE(IF(A1,\"SINGLE(\",\"a\"\")\"))"),
+            "@IF(A1,\"SINGLE(\",\"a\"\")\")"
+        );
+        assert_eq!(
+            display_formula("_xlfn.ANCHORARRAY(INDIRECT(\"B2)\"))"),
+            "INDIRECT(\"B2)\")#"
+        );
+        // Nested calls are rewritten at every level, as the printer spells
+        // them.
+        for stored in [
+            "_xlfn.SINGLE(_xlfn.SINGLE(A1))",
+            "_xlfn.SINGLE(_xlfn.ANCHORARRAY(A1))",
+            "SUM(_xlfn.SINGLE(_xlfn.SINGLE(A1:A3)),1)",
+        ] {
+            let printed = to_string(&parse(&display_formula(stored)).unwrap());
+            assert_eq!(display_formula(stored), printed, "{stored}");
+            assert_eq!(to_string(&parse(stored).unwrap()), printed, "{stored}");
+        }
+        // Unbalanced text stays as it is.
+        assert_eq!(display_formula("_xlfn.SINGLE(A1"), "SINGLE(A1");
+        // Non-ASCII outside a literal: a sheet name, a bare name, a LET
+        // name, one right before a call, and one inside its argument.
+        for (stored, shown) in [
+            ("'Données'!A1", "'Données'!A1"),
+            ("Données!A1+Ünit", "Données!A1+Ünit"),
+            ("_xlfn.LET(_xlpm.größe,2,größe*2)", "LET(größe,2,größe*2)"),
+            ("Données+_xlfn.SINGLE(A1)", "Données+@A1"),
+            ("é_xlfn.SINGLE(A1)", "é@A1"),
+            ("_xlfn.SINGLE(Données!A1:A3)", "@Données!A1:A3"),
+            ("_xlfn.ANCHORARRAY('日本'!B2)", "'日本'!B2#"),
+        ] {
+            assert_eq!(display_formula(stored), shown, "{stored}");
+        }
+        // A quoted sheet name is the name, as a literal is the text: no
+        // rewrite or prefix strip inside it, and a `"` in it opens no
+        // literal.
+        for (stored, shown) in [
+            ("'x SINGLE(1)'!A1", "'x SINGLE(1)'!A1"),
+            ("'_xlfn.x'!A1+_xlfn.SINGLE(B1)", "'_xlfn.x'!A1+@B1"),
+            ("_xlfn.SINGLE('a\"b'!A1)+_xlfn.SINGLE(C1)", "@'a\"b'!A1+@C1"),
+            ("_xlfn.SINGLE('it''s )'!A1)", "@'it''s )'!A1"),
+        ] {
+            assert_eq!(display_formula(stored), shown, "{stored}");
+        }
+        // A structured-reference spec is read as the lexer reads it: a `'`
+        // escapes the next byte, and nothing inside (`'`, `"`, parens, a
+        // function prefix) counts (#876 r3).
+        for (stored, shown) in [
+            ("Table1[Item '#]+_xlfn.SINGLE(A1)", "Table1[Item '#]+@A1"),
+            (
+                "_xlfn.SINGLE(Orders[Order '#])+_xlfn.XLOOKUP(A1,B:B,C:C)",
+                "@Orders[Order '#]+XLOOKUP(A1,B:B,C:C)",
+            ),
+            ("T['#a]+_xlfn.SINGLE(B1)+T['#b]", "T['#a]+@B1+T['#b]"),
+            ("T[a\"b]+_xlfn.SINGLE(A1)", "T[a\"b]+@A1"),
+            (
+                "_xlfn.SINGLE(T[[#This Row],[Item '#]])+_xlfn.SINGLE(C1)",
+                "@T[[#This Row],[Item '#]]+@C1",
+            ),
+            ("_xlfn.SINGLE(T[a)b])", "@T[a)b]"),
+            ("T[x '] y]+_xlfn.SINGLE(A1)", "T[x '] y]+@A1"),
+            ("T[_xlfn.x]+_xlfn.SINGLE(A1)", "T[_xlfn.x]+@A1"),
+            (
+                "_xlfn.LAMBDA(_xlpm.x,[_xlpm.y],_xlpm.x)(1)",
+                "LAMBDA(x,[y],x)(1)",
+            ),
+        ] {
+            assert_eq!(display_formula(stored), shown, "{stored}");
+        }
+    }
+
+    #[test]
     fn frequency_counts_into_bins() {
         let mut cells: Vec<(&str, Value)> = Vec::new();
         let names: Vec<String> = (1..=10).map(|i| format!("A{i}")).collect();
@@ -12875,8 +13034,46 @@ mod tests {
         // Sheet rename touches matching endpoints.
         assert_eq!(
             rename_sheet_in_formula("SUM(One:Three!A1)", "Three", "Last Q").unwrap(),
-            "SUM(One:'Last Q'!A1)"
+            "SUM('One:Last Q'!A1)"
         );
+    }
+
+    /// The printer spells a 3D span as Excel does: bare when both names
+    /// are, else one quoted token (#876).
+    #[test]
+    fn three_d_spans_print_as_one_quoted_token() {
+        for (src, printed) in [
+            ("SUM(Sheet1:Sheet3!A1)", "SUM(Sheet1:Sheet3!A1)"),
+            ("SUM('Jan 2024:Mar 2024'!A1)", "SUM('Jan 2024:Mar 2024'!A1)"),
+            (
+                "SUM('Jan 2024':'Mar 2024'!A1)",
+                "SUM('Jan 2024:Mar 2024'!A1)",
+            ),
+            ("'My First':'My Last'!$A$1", "'My First:My Last'!$A$1"),
+            // One end needing quotes quotes the whole span.
+            ("SUM(Jan:'Mar 2024'!A1:B2)", "SUM('Jan:Mar 2024'!A1:B2)"),
+            // Cell-shaped names, which bare would read as a range.
+            ("SUM('Q1:Q3'!A1)", "SUM('Q1:Q3'!A1)"),
+            ("SUM(Q1:Q3!A1)", "SUM('Q1:Q3'!A1)"),
+            // A `.` (quoted by the single-sheet printer) and non-ASCII
+            // (quoted in chart refs): either rule quotes the span.
+            ("SUM('Sheet.1:Sheet.3'!A1)", "SUM('Sheet.1:Sheet.3'!A1)"),
+            ("SUM('Données:Mar'!A1)", "SUM('Données:Mar'!A1)"),
+            // An apostrophe is doubled inside the one quoted token.
+            ("SUM('Bob''s:Mar'!A1)", "SUM('Bob''s:Mar'!A1)"),
+        ] {
+            let ast = parse(src).unwrap_or_else(|e| panic!("parse {src}: {e}"));
+            assert_eq!(to_string(&ast), printed, "{src}");
+            assert_eq!(parse(printed).unwrap(), ast, "{printed}");
+            // The save spells it the same way (`@` makes it reprint).
+            let saved = file_formula(&format!("{src}+@B1")).into_owned();
+            assert_eq!(saved, format!("{printed}+_xlfn.SINGLE(B1)"), "{src}");
+        }
+        let names = |src: &str| match parse(src).unwrap() {
+            Expr::Ref3D { first, last, .. } => (first, last),
+            e => panic!("{src}: {e:?}"),
+        };
+        assert_eq!(names("'Bob''s:Mar'!A1"), ("Bob's".into(), "Mar".into()));
     }
 
     /// Excel spells a 3D span whose names need quotes as one quoted token,
@@ -12896,7 +13093,7 @@ mod tests {
         }
         assert_eq!(
             rename_sheet_in_formula("SUM('Jan 2024:Mar 2024'!A1)", "Mar 2024", "March").unwrap(),
-            "SUM('Jan 2024':March!A1)"
+            "SUM('Jan 2024:March'!A1)"
         );
         // An external qualifier with a `:` is one (book-qualified) sheet,
         // as before the 3D spelling was read.
