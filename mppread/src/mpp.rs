@@ -138,8 +138,9 @@ pub struct MppTaskFields {
     pub display_as_summary: Option<bool>,
     /// Project keeps Publish on the task's assignment rows, the unassigned
     /// placeholder included, not on the task: a task is published when it has
-    /// assignments and all are marked. Summaries have none. Mixed assignment
-    /// marks, or an unreadable assignment table, leave it absent.
+    /// assignments and all are marked. Summaries normally have none (a direct
+    /// summary assignment counts like any other). Mixed assignment marks, or
+    /// an unreadable assignment table, leave it absent.
     pub is_published: Option<bool>,
     /// The inserted project's path, from the project Props subproject table.
     pub subproject_name: Option<String>,

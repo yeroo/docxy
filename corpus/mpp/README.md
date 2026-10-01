@@ -255,11 +255,13 @@ python corpus/tools/gen_mpp_task_extra_cases.py
 Saving one plan twice with only a task's Publish changed alters nothing in the
 task table: Project keeps Publish on the task's assignment rows. Every
 non-summary task has one, the unassigned placeholder included, and summaries
-have none, which is why every snapshot row matched `!summary && active`. A task
-exports IsPublished=1 when it has assignments and all of them carry the bit;
-mixed marks have no oracle and leave it absent. Project refuses Publish on a
-summary or inactive task and exports 0 for them whatever was set before, so the
-"published summary" direction cannot be produced. The subproject table holds a
+normally have none, which is why every snapshot row matched
+`!summary && active`. A task exports IsPublished=1 when it has assignments and
+all of them carry the bit; mixed marks have no oracle and leave it absent. A
+summary with a direct assignment follows the same rule
+(`task-fields/f9-overalloc-edges` "Direct summary" exports 1). Project refuses
+to set Publish on a summary or inactive task, and `e2-published` shows a task
+published while ordinary exporting 0 once it becomes a summary or inactive. The subproject table holds a
 20-byte header (type 1 in `f6`), the task UID and two OLE File Monikers per
 inserted project; SubprojectName is the path moniker's Unicode extension. Other
 item types and malformed tables leave SubprojectName absent. Project also

@@ -3,24 +3,22 @@
 //! Saving one plan twice with only a task's Publish changed alters nothing in
 //! the task table: the assignment Fixed2Meta entry (53 bytes, one per
 //! FixedMeta entry) clears bit 0x40 of its byte +8. Every non-summary task has
-//! an assignment row, the unassigned placeholder (resource -65535) included,
-//! and summaries have none. Checked against every Project XML row of the
-//! snapshot, task-fields, task-extra and progress corpora: a task exports
-//! IsPublished=1 exactly when it has assignments and all of them carry the bit
-//! (task-extra/e2-published unpublishes an ordinary task; Project exports 0 for
-//! summaries and inactive tasks whatever was set before).
+//! an assignment row, the unassigned placeholder (resource -65535) included;
+//! summaries normally have none, and a summary with a direct assignment
+//! follows the same rule (task-fields/f9-overalloc-edges "Direct summary"
+//! exports 1). Checked against every Project XML row of the local corpora: a
+//! task exports IsPublished=1 exactly when it has assignments and all of them
+//! carry the bit (task-extra/e2-published unpublishes an ordinary task).
+//! Project refuses to set Publish on a summary or inactive task and exports 0
+//! for one without a marked assignment.
 use crate::cfb::Cfb;
-use crate::overalloc::{count, stream};
+use crate::overalloc::{count, live_assignment_rows, stream};
 use std::collections::{HashMap, HashSet};
 
 const ASSIGNMENT_META: usize = 34;
-const ASSIGNMENT_ROW: usize = 110;
 const ASSIGNMENT_FIXED2_META: usize = 53;
 const PUBLISHED: (usize, u8) = (8, 0x40);
 
-fn u16_at(b: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes(b[at..at + 2].try_into().unwrap())
-}
 fn u32_at(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
 }
@@ -37,25 +35,7 @@ pub(crate) fn decode(cfb: &Cfb, tasks: &HashSet<u32>) -> Result<HashMap<u32, boo
         return Err("assignment Fixed2Meta count mismatch".into());
     }
     let mut marks: HashMap<u32, (bool, bool)> = HashMap::new();
-    for i in 0..n {
-        let meta = &fm[16 + i * ASSIGNMENT_META..16 + (i + 1) * ASSIGNMENT_META];
-        let at = u32_at(meta, 4) as usize;
-        let end = if i + 1 < n {
-            u32_at(&fm, 16 + (i + 1) * ASSIGNMENT_META + 4) as usize
-        } else {
-            fd.len()
-        };
-        if end < at || end > fd.len() {
-            return Err("assignment offset mismatch".into());
-        }
-        // Blank (kind 4) and deleted (kind 2) rows carry no live assignment.
-        if u16_at(meta, 0) != 0 {
-            continue;
-        }
-        if end - at != ASSIGNMENT_ROW {
-            return Err("assignment record length mismatch".into());
-        }
-        let row = &fd[at..end];
+    for (i, row) in live_assignment_rows(&fm, &fd)? {
         let (task_uid, resource_uid) = (u32_at(row, 4), u32_at(row, 8));
         if task_uid == 0 && resource_uid == 0 {
             continue; // Internal placeholder absent from Project XML.
@@ -83,6 +63,8 @@ pub(crate) fn decode(cfb: &Cfb, tasks: &HashSet<u32>) -> Result<HashMap<u32, boo
 mod tests {
     use super::*;
     use crate::cfb::{Node, write_cfb_tree};
+
+    const ASSIGNMENT_ROW: usize = 110;
 
     /// Assignment tables of (kind, task UID, resource UID, published) rows.
     fn file(rows: &[(u16, u32, u32, bool)]) -> Vec<u8> {
@@ -167,5 +149,7 @@ mod tests {
             Ok((0..=5).map(|uid| (uid, false)).collect())
         );
         assert!(published(&[(0, 9, UNASSIGNED, true)]).is_err());
+        // An unknown record kind makes the table unreadable, as for OverAllocated.
+        assert!(published(&[(3, 1, UNASSIGNED, true)]).is_err());
     }
 }
