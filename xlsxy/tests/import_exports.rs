@@ -515,3 +515,25 @@ fn recalc_in_place_is_refused_under_read_only() {
     assert!(out.is_file());
     assert_eq!(std::fs::read(&book).unwrap(), before);
 }
+
+/// #882 r2: `--read-only` on a file that does not exist is refused, so a
+/// headless run cannot create the file it was asked to keep.
+#[test]
+fn read_only_refuses_a_missing_input() {
+    let dir = Dir::new("read-only-missing");
+    let book = dir.0.join("new.xlsx");
+    let result = Command::new(env!("CARGO_BIN_EXE_xlsxy"))
+        .arg(&book)
+        .arg("--read-only")
+        .arg("--recalc")
+        .arg(&book)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("read-only: no such file"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!book.exists());
+}
