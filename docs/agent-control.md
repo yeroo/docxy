@@ -583,7 +583,8 @@ id), so it lists alongside terminal instances (`docxy-<pid>` /
 windows that open a same-basename file, which would otherwise mint the same
 `<basename>-<n>` in both and clobber each other's discovery file. A tab exposes
 **exactly** the terminal verb
-surface, nothing more: a couple of internal-only verbs the extension host
+surface, nothing more (except xlsxy's `wb.properties`/`wb.set-properties`, which
+only a terminal xlsxy answers so far; a tab answers `unknown verb`): a couple of internal-only verbs the extension host
 uses to compose its own `doc.path`/`wb.path` replies (`doc.blocks`, `wb.info`)
 are deliberately not in the tab's exposed verb set, and are rejected as
 `"unknown verb"` — same as a terminal instance, which has no arm for them at
@@ -740,7 +741,9 @@ Differences from a terminal pane:
   `unknown verb 'doc.blocks'` externally, same as every other surface.
 
 **Excel tabs** (`xlsxy-jetbrains-<basename>-<pid>-<n>` in xlsxy's ctl dir)
-serve the full xlsxy verb surface through `grid_ctl`, with the same host-verb
+serve the full xlsxy verb surface through `grid_ctl` (except
+`wb.properties`/`wb.set-properties`, terminal xlsxy only for now: a tab answers
+`unknown verb`), with the same host-verb
 split (`wb.path`/`wb.save`/`wb.reload`/`wb.open`; `wb.open` opens a new tab;
 `wb.info` internal). Every mutating agent verb lands as **one IDE undo step**
 driving the engine's own undo stack — the same mechanism the grid UI uses,
@@ -760,12 +763,14 @@ name and defaults to the active sheet):
 | `sheet.list` | — | `{active, sheets:[{index, name, rows, cols}]}` |
 | `sheet.read` | `{sheet?, range?}` | `{sheet, name, rows, cols, cells:[…], truncated}` |
 | `cell.get` | `{ref, sheet?}` | `{ref, row, col, value, formula?, text, format?}` — `format` is present only if the cell has non-default styling (see below) |
-| `cell.set` | `{ref, text, sheet?}` | `{ref, value, text, …}` — typed the way the grid types it: leading `=` is a formula, validated + recalculated; numbers, currency, percents, fractions, dates and times are recognised (a General cell takes the matching number format); a Text-formatted cell keeps the text as typed; a leading `'` stores the rest as text with `quotePrefix`; more than 32,767 characters is refused and the cell is left as it was |
-| `range.clear` | `{range, sheet?}` | `{cleared}` |
+| `cell.set` | `{ref, text, sheet?}` | `{ref, value, text, …}` — typed the way the grid types it: leading `=` is a formula, validated + recalculated; numbers, currency, percents, fractions, dates and times are recognised (a General cell takes the matching number format); a Text-formatted cell keeps the text as typed; a leading `'` stores the rest as text with `quotePrefix`; more than 32,767 characters is refused and the cell is left as it was; an edit that would change part of a legacy CSE array (not its anchor) is refused with `cell.set: You can't change part of an array.` and nothing changes |
+| `range.clear` | `{range, sheet?}` | `{cleared}`; a clear that would change part of a legacy CSE array (not its anchor) is refused with `range.clear: You can't change part of an array.` and nothing changes |
 | `cell.format` | `{range, patch, sheet?}` | `{formatted}` — cell count; ONE undo group over every cell in `range` |
 | `col.width` | `{col, width, sheet?}` | `{col, width}` — `col` accepts a letter or a 0-based index; the reply always echoes the **numeric** index |
 | `find` | `{query, sheet?}` | `{query, count, matches:[…]}` |
 | `wb.recalc` | — | `{recalculated:true}` |
+| `wb.properties` | — | **Terminal xlsxy only for now** (a VS Code or JetBrains tab answers `unknown verb`). `{title, tags, categories, subject, comments, company, manager, hyperlinkBase, author, lastModifiedBy, created, modified, custom:[{name, type, value}]}` — the document properties File › Info shows; an absent one is `null`; a custom `type` is `text`/`number`/`bool`/`date`/`other` (a variant type xlsxy does not model, its raw XML as `value`) |
+| `wb.set-properties` | `{title?, tags?, categories?, subject?, comments?, company?, manager?, hyperlinkBase?, custom?: {name: value\|null}}` | Terminal xlsxy only for now. `wb.properties` + `{changed}`. Only the given keys change; `null` or `""` removes one. A custom value is a string (text), a number, a bool (yes/no) or `{"date":"YYYY-MM-DD[THH:MM:SSZ]"}`; a name that exists (in any case) changes in place, keeping its position. An unknown key is an error and nothing changes, as is a change that would go into a `docProps/core.xml` or `app.xml` xlsxy can't read (e.g. UTF-16): `document properties can't be edited: <part> is unreadable`. Marks the workbook modified when something changed; not on the undo stack (Excel's Info edits aren't either). Author, Last Modified By, Created and Modified are read-only: every `wb.save` stamps Modified (UTC) and Last Modified By (the OS user name, as for comments), and Author and Created are set on a save only when the file has none (its first save, typically) |
 | `wb.save` | — | `{path, …}`; a failed write answers `ok:false` with `save failed: …` (the status-bar text) and the workbook stays modified. When the workbook has Excel's *Always create backup* (`<workbookPr backupFile="1">`), the file being replaced is first kept as `Backup of <stem>.xlk` in the same folder (replacing an older backup); a backup that cannot be written fails the save with `save failed: …` naming the backup, and the workbook file untouched |
 | `wb.reload` | — | `{path, …}` (re-reads the file, dropping unsaved edits). A workbook last saved as CSV UTF-8, CSV (Comma delimited), Text (Tab delimited) or Unicode Text is re-imported from that file (no dialog) and stays bound to it and its type. One last saved as Formatted Text (`.prn`) or Web Page is refused ("… cannot be read back; reload is not available for this file") and nothing changes |
 | `wb.open` | `{path}` | `{path, …}`; a `.csv`/`.tsv` opens as Excel opens it, and a `.txt`/`.prn` is imported with the Text Import Wizard's defaults (tab-delimited, General columns) without showing the wizard — use `sheet.import-text` for other options. An opened `.csv`/`.tsv`/`.txt`/`.prn` is **rebound to `<name>.xlsx`**: `wb.save` writes that workbook (replacing an existing `<name>.xlsx`) and never the text file. A load that fails is the verb's error |
@@ -779,7 +784,7 @@ name and defaults to the active sheet):
 | `pivot.list` | — | `{pivots:[{sheet,rows,cols,values}]}` (persistent pivots, summarized) |
 | `comment.add` | `{ref,text,author?,sheet?}` | `{sheet,ref}` |
 | `comment.remove` | `{ref,sheet?}` | `{removed:bool}` |
-| `range.set` | `{start,rows:[[string]],sheet?}` | `{set:N}` — each string typed like `cell.set`; **atomic**: every formula and length validated first, any invalid (a bad formula, or an entry over 32,767 characters) → an error naming the cell and nothing applied; one undo group |
+| `range.set` | `{start,rows:[[string]],sheet?}` | `{set:N}` — each string typed like `cell.set`; **atomic**: every formula and length validated first, any invalid (a bad formula, or an entry over 32,767 characters) → an error naming the cell and nothing applied; a group that would change part of a legacy CSE array (not its anchor) is refused with `range.set: You can't change part of an array.` and nothing applied; one undo group |
 | `sheet.import-csv` | `{text,name?}` | `{sheet,name,rows,cols}` — always a **new** sheet, never overwrites ; fields convert as opening a `.csv` does (a `sep=` first line, typed-entry dates/percentages/formulas, 15 digits, File › Options › Data) |
 | `sheet.import-text` | `{text\|path,options?,name?}` | `{sheet,name,rows,cols}` — the Text Import Wizard without the dialog, into a **new** sheet. `options`: `kind` (`delimited`/`fixed`), `delimiters` (`tab`, `semicolon`, `comma`, `space` or a character), `consecutive`, `qualifier` (`"`, `'`, `none`), `breaks`, `start_row`, `origin` (`auto`, `utf-8`, `utf-16le`, `windows-1252`), `columns` (`general`, `text`, `date:dmy`…, `skip`), `decimal`, `thousands`, `trailing_minus` |
 | `app.options` | `{convert_leading_zeros?,convert_long_numbers?,convert_e_notation?,convert_dates?}` | all four booleans — File › Options › Data › Automatic Data Conversion, followed by the next `.csv`/text open and `sheet.import-csv`/`sheet.import-text`; the keys given are set first; saved with the app's preferences on exit |
@@ -905,8 +910,9 @@ MCP: `claude mcp add xlsxy -- xlsxy --mcp` → `xlsxy_list`, `xlsxy_new`,
 `xlsxy_sheet_add`, `xlsxy_sheet_remove`, `xlsxy_sheet_rename`,
 `xlsxy_row_insert`, `xlsxy_row_delete`, `xlsxy_col_insert`,
 `xlsxy_col_delete`, `xlsxy_eval`, `xlsxy_stats`, `xlsxy_charts`,
-`xlsxy_pivots`, `xlsxy_format`, `xlsxy_col_width`, `xlsxy_pivot_create` (33
-total; docxy's 31 + xlsxy's 33 = **64 tools** total across both apps).
+`xlsxy_pivots`, `xlsxy_format`, `xlsxy_col_width`, `xlsxy_pivot_create`,
+`xlsxy_properties`, `xlsxy_set_properties` (35 total; docxy's 31 + xlsxy's 35 =
+**66 tools** total across both apps).
 Skill: `xlsxy install skill`.
 
 **yppxy** (project schedule; tasks addressed by UID, durations like `3d`/`4h`):

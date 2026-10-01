@@ -16,6 +16,18 @@ pub trait BackstageHost {
     fn default_save_type(&self) -> Option<usize> {
         None
     }
+    /// Editable rows the Info pane lists below [`BackstageHost::info_lines`]:
+    /// (label, current value). With any (or [`BackstageHost::info_custom_row`]),
+    /// Info takes the focus like Options does, and Enter on a row returns
+    /// [`BackstageEvent::EditInfo`]. None by default: Info stays read-only.
+    fn info_fields(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    /// Whether the Info pane ends with a `Custom property…` row (its
+    /// [`BackstageEvent::EditInfo`] index is `info_fields().len()`).
+    fn info_custom_row(&self) -> bool {
+        false
+    }
 }
 
 /// The app-level action requested by a `key`/`mouse` call on [`crate::Backstage`].
@@ -36,4 +48,7 @@ pub enum BackstageEvent {
     },
     Export,
     Exit,
+    /// Enter (or a second click) on the Info pane's row `i`: one of
+    /// [`BackstageHost::info_fields`], or the custom-property row after them.
+    EditInfo(usize),
 }

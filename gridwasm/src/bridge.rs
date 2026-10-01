@@ -2,7 +2,7 @@
 //! written as plain Rust so it can be unit-tested natively
 //! (`cargo test -p gridwasm`). Mirrors `docxwasm::bridge` in shape.
 
-use gridcore::engine::{Engine, cell_to_value, eval_formula_at};
+use gridcore::engine::{Engine, PART_OF_ARRAY, cell_to_value, eval_formula_at};
 use gridcore::format::{FormatPatch, FormatValue, apply_patch_to_xf, xf_format_fields};
 use gridcore::formula::Value;
 use gridcore::frame::{Agg, Frame, pivot, pivot_spec_from_names, pivot_table_strings, range_stats};
@@ -262,7 +262,9 @@ impl Session {
                     let today = self.engine.clock;
                     let wb = &mut self.pkg.workbook;
                     match gridcore::entry::entry_cell(wb, self.active, r, c, text, today) {
-                        Ok(cell) => self.apply(vec![(r, c, cell)]),
+                        Ok(cell) => {
+                            self.apply(vec![(r, c, cell)]);
+                        }
                         Err(e) => {
                             self.err = Some(e.to_string());
                             return None;
@@ -277,29 +279,27 @@ impl Session {
                         (p[0].parse().unwrap_or(0), p[1].parse().unwrap_or(0));
                     let (r2, c2): (u32, u32) =
                         (p[2].parse().unwrap_or(0), p[3].parse().unwrap_or(0));
-                    let mut changes = Vec::new();
-                    for r in r1..=r2 {
-                        for c in c1..=c2 {
-                            if let Some(cell) = self.pkg.workbook.sheets[self.active].cell(r, c) {
-                                if !cell.is_blank() {
-                                    let style = cell.style;
-                                    let mut blank = Cell::default();
-                                    blank.style = style;
-                                    changes.push((r, c, blank));
-                                }
-                            }
-                        }
-                    }
+                    let changes = self.clear_changes((r1, c1, r2, c2));
                     self.apply(changes);
                 }
             }
             "copy" => return Some(self.record_clip(false)),
             "cut" => {
-                // The cells are recorded before the clear below empties them.
-                let tsv = self.record_clip(true);
                 let (ar, ac) = self.anchor.unwrap_or(self.cur);
                 let (r1, r2) = (self.cur.0.min(ar), self.cur.0.max(ar));
                 let (c1, c2) = (self.cur.1.min(ac), self.cur.1.max(ac));
+                // A cut of part of an array is refused whole, as Excel
+                // refuses it: nothing is copied or cleared.
+                let clears = self.clear_changes((r1, c1, r2, c2));
+                if self
+                    .engine
+                    .refuses(&self.pkg.workbook, self.active, &clears)
+                {
+                    self.err = Some(PART_OF_ARRAY.to_string());
+                    return None;
+                }
+                // The cells are recorded before the clear below empties them.
+                let tsv = self.record_clip(true);
                 // reuse the clear path as one undo group
                 let cmd = format!("clear\t{r1}\t{c1}\t{r2}\t{c2}");
                 self.dispatch(&cmd);
@@ -361,8 +361,7 @@ impl Session {
                             changes.push((r, c, cell));
                         }
                     }
-                    self.apply(changes);
-                    if truncated {
+                    if self.apply(changes) && truncated {
                         self.err = Some(format!("Pasted (clipped to {MAX_PASTE_CELLS} cells)"));
                     }
                 }
@@ -476,13 +475,45 @@ impl Session {
         gridcore::sheet::snapshot_cells(&wb.sheets[sheet_idx], keys, frozen)
     }
 
-    /// Apply cell changes as one undo group, through the engine.
-    fn apply(&mut self, changes: Vec<(u32, u32, Cell)>) {
+    /// Apply cell changes as one undo group, through the engine. Refused
+    /// whole when they would change part of an array ([`Engine::refuses`]):
+    /// nothing is written, no undo group is recorded, the session stays
+    /// clean and the next view says why. False then.
+    fn apply(&mut self, changes: Vec<(u32, u32, Cell)>) -> bool {
+        if self
+            .engine
+            .refuses(&self.pkg.workbook, self.active, &changes)
+        {
+            self.err = Some(PART_OF_ARRAY.to_string());
+            return false;
+        }
         let keys = changes.iter().map(|&(r, c, _)| (r, c)).collect();
         self.record(keys, |s| {
             let sheet_idx = s.active;
-            s.engine.set_cells(&mut s.pkg.workbook, sheet_idx, changes);
+            // Checked above: written without deciding again.
+            s.engine
+                .set_cells_prechecked(&mut s.pkg.workbook, sheet_idx, changes);
         });
+        true
+    }
+
+    /// The blanks a clear of `(r1, c1, r2, c2)` on the active sheet writes:
+    /// each non-blank cell's content goes, its style stays.
+    fn clear_changes(&self, (r1, c1, r2, c2): (u32, u32, u32, u32)) -> Vec<(u32, u32, Cell)> {
+        let sheet = &self.pkg.workbook.sheets[self.active];
+        let mut changes = Vec::new();
+        for r in r1..=r2 {
+            for c in c1..=c2 {
+                if let Some(cell) = sheet.cell(r, c) {
+                    if !cell.is_blank() {
+                        let mut blank = Cell::default();
+                        blank.style = cell.style;
+                        changes.push((r, c, blank));
+                    }
+                }
+            }
+        }
+        changes
     }
 
     /// Run `write`, which edits the cells `keys` names on the active sheet,
@@ -756,13 +787,22 @@ impl Session {
             }
             block.push(out);
         }
+        // Refused whole when it would change part of an array; still our
+        // clip, so it is not pasted again as text.
+        if self
+            .engine
+            .refuses_paste(&self.pkg.workbook, self.active, (r0, c0), &block, &[])
+        {
+            self.err = Some(PART_OF_ARRAY.to_string());
+            return true;
+        }
         // Through `Engine::paste_block`, as one undo group: a pasted spilling
         // array still spills, and an array block pasted back in place keeps
         // its block.
         self.record(keys, |s| {
             let sheet_idx = s.active;
             s.engine
-                .paste_block(&mut s.pkg.workbook, sheet_idx, (r0, c0), &block);
+                .paste_block_prechecked(&mut s.pkg.workbook, sheet_idx, (r0, c0), &block);
         });
         if clip.cut {
             if let Some(c) = self.clip.as_mut() {
@@ -1313,6 +1353,9 @@ impl Session {
         self.dispatch(&format!("set\t{r}\t{c}\t{text}"));
         self.active = prev_active;
         if let Some(e) = self.err.take() {
+            if e == PART_OF_ARRAY {
+                return Err(format!("cell.set: {PART_OF_ARRAY}"));
+            }
             return Err(e);
         }
         let s = &self.pkg.workbook.sheets[si];
@@ -1340,8 +1383,13 @@ impl Session {
             .count();
         let prev_active = self.active;
         self.active = si;
+        // As `ctl_cell_set`: only this clear's own refusal is read back.
+        self.err = None;
         self.dispatch(&format!("clear\t{r1}\t{c1}\t{r2}\t{c2}"));
         self.active = prev_active;
+        if self.err.take().is_some_and(|e| e == PART_OF_ARRAY) {
+            return Err(format!("range.clear: {PART_OF_ARRAY}"));
+        }
         let mut out = String::from("{\"cleared\":");
         out.push_str(&cleared.to_string());
         out.push('}');
@@ -2123,8 +2171,12 @@ impl Session {
         self.active = si;
         let n = changes.len();
         let undo_steps = if changes.is_empty() { 0 } else { 1 };
-        self.apply(changes);
+        let applied = self.apply(changes);
         self.active = prev_active;
+        if !applied {
+            self.err = None;
+            return Err(format!("range.set: {PART_OF_ARRAY}"));
+        }
         let mut out = String::from("{\"set\":");
         out.push_str(&n.to_string());
         out.push_str(",\"undoSteps\":");
@@ -3650,6 +3702,61 @@ mod tests {
             assert_cse_spills(&s, &format!("{verb}: redo"));
             assert_eq!(s.pkg.workbook.sheets[0].cells, after, "{verb}: redo");
         }
+    }
+
+    #[test]
+    fn an_edit_to_part_of_a_cse_block_is_refused_whole() {
+        // r7 M2: typing, clearing, cutting or pasting into part of the block
+        // changes nothing, records no undo group, leaves the session clean
+        // and says why, as Excel does.
+        let refused =
+            |s: &mut Session, cmd: &str, before: &std::collections::BTreeMap<(u32, u32), Cell>| {
+                assert_eq!(s.dispatch(cmd), None, "{cmd}");
+                assert_eq!(&s.pkg.workbook.sheets[0].cells, before, "{cmd}");
+                assert!(s.undo.is_empty(), "{cmd}");
+                assert!(!s.dirty, "{cmd}");
+                assert_eq!(s.err.take().as_deref(), Some(PART_OF_ARRAY), "{cmd}");
+                assert_cse_spills(s, cmd);
+            };
+        let mut s = session_with_spilling_cse();
+        s.pkg.workbook.sheets[0].set_cell(4, 0, Cell::number(7.0));
+        s.pkg.workbook.sheets[0].set_cell(5, 0, Cell::number(8.0));
+        let before = s.pkg.workbook.sheets[0].cells.clone();
+        refused(&mut s, "set\t1\t3\t9", &before);
+        refused(&mut s, "clear\t1\t3\t2\t3", &before);
+        s.dispatch("select\t1\t3\t2\t3"); // D2:D3
+        refused(&mut s, "cut", &before);
+        // A copied column of two pasted at D2: refused whole, D4 too.
+        s.dispatch("select\t4\t0\t5\t0"); // A5:A6
+        let tsv = s.dispatch("copy").unwrap();
+        refused(&mut s, &format!("paste\t1\t3\t{tsv}"), &before);
+        // r8 M4: the agent's range.clear reports the refusal, not success.
+        let out = s.ctl(r#"{"verb":"range.clear","args":{"range":"D2:D3"}}"#);
+        assert!(
+            out.contains("range.clear: You can't change part of an array.")
+                && !out.contains("\"ok\":true"),
+            "{out}"
+        );
+        assert_eq!(s.pkg.workbook.sheets[0].cells, before);
+        assert!(s.undo.is_empty() && !s.dirty && s.err.is_none());
+        // r9: so does the agent's cell.set, in the same form.
+        let out = s.ctl(r#"{"verb":"cell.set","args":{"ref":"D2","text":"9"}}"#);
+        assert!(
+            out.contains("cell.set: You can't change part of an array.")
+                && !out.contains("\"ok\":true"),
+            "{out}"
+        );
+        assert_eq!(s.pkg.workbook.sheets[0].cells, before);
+        assert!(s.undo.is_empty() && !s.dirty && s.err.is_none());
+        // Its anchor taken too, the block goes.
+        s.dispatch("clear\t0\t3\t2\t3");
+        assert!(s.err.is_none());
+        assert_eq!(s.undo.len(), 1);
+        assert!(
+            s.pkg.workbook.sheets[0]
+                .cell(1, 3)
+                .is_none_or(|c| c.value.is_empty())
+        );
     }
 
     #[test]

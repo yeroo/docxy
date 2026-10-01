@@ -1926,6 +1926,8 @@ impl App {
                 self.request_exit();
                 self.quit_requested
             }
+            // docxy lists no editable Info rows, so this never arrives.
+            BackstageEvent::EditInfo(_) => false,
         }
     }
 

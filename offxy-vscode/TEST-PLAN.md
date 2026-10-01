@@ -128,7 +128,7 @@ saves.)*
 Open the sample `.docx` **and** `.xlsx` in tabs first.
 
 - [ ] **C1 Tool discovery** — In Copilot agent mode (or `claude mcp` list), the
-  `offxy` server exposes **64 tools** (`docxy_*` + `xlsxy_*`). Ask the agent to
+  `offxy` server exposes **66 tools** (`docxy_*` + `xlsxy_*`). Ask the agent to
   "list your offxy tools" and confirm the count/names.
 - [ ] **C2 Instance discovery** — Ask the agent to run `docxy_list` /
   `xlsxy_list`. Each open tab appears as a `docxy-vscode-…` / `xlsxy-vscode-…`
