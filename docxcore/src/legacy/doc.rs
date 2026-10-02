@@ -317,23 +317,36 @@ fn cp1252(b: u8) -> char {
     }
 }
 
-/// The main document's characters, in CP order. A piece that runs past its
-/// stream stops where the stream does; nothing past `ccp_text` is read.
+/// The main document's characters, in CP order. Pieces cover ascending,
+/// disjoint CP ranges: one that reaches back over CPs already read is
+/// clipped to the rest, and one wholly behind is skipped. A piece that runs
+/// past its stream stops where the stream does, nothing past `ccp_text` is
+/// read, and there are never more characters than the WordDocument stream
+/// has bytes, however many pieces claim them.
 fn decode_text(word: &[u8], pieces: &[Piece], ccp_text: u32) -> Vec<Ch> {
+    let cap = (ccp_text as usize).min(word.len());
     let mut out = Vec::new();
+    let mut next_cp = 0u32;
     for (i, p) in pieces.iter().enumerate() {
+        let start = p.cp_start.max(next_cp);
         let end = p.cp_end.min(ccp_text);
-        if p.cp_start >= end {
+        if start >= end || out.len() >= cap {
             continue;
         }
         let width = if p.compressed { 1 } else { 2 };
-        // Never more characters than the stream holds from the piece's start.
-        let avail = word.len().saturating_sub(p.fc as usize) / width;
-        let count = ((end - p.cp_start) as usize).min(avail);
+        let Some(first) = ((start - p.cp_start) as usize)
+            .checked_mul(width)
+            .and_then(|skip| (p.fc as usize).checked_add(skip))
+        else {
+            continue;
+        };
+        // Never more characters than the stream holds from there.
+        let avail = word.len().saturating_sub(first) / width;
+        let count = ((end - start) as usize).min(avail).min(cap - out.len());
         let mut k = 0usize;
         while k < count {
-            let fc = p.fc as usize + k * width;
-            let cp = p.cp_start + k as u32;
+            let fc = first + k * width;
+            let cp = start + k as u32;
             if p.compressed {
                 out.push(Ch {
                     c: cp1252(word[fc]),
@@ -366,6 +379,7 @@ fn decode_text(word: &[u8], pieces: &[Piece], ccp_text: u32) -> Vec<Ch> {
             });
             k += used;
         }
+        next_cp = start + k as u32;
     }
     out
 }
@@ -403,10 +417,15 @@ fn fkp_runs(word: &[u8], table: &[u8], bte: FcLcb, kind: FkpKind) -> Vec<FkpRun>
         return Vec::new();
     };
     let n = plc.len().saturating_sub(4) / 8;
+    // Each page once, however often (or in whatever order) the bin table
+    // names it, and only the pages the stream has.
+    let in_stream = (word.len() / 512) as u32;
     let mut pages: Vec<u32> = (0..n)
         .filter_map(|i| u32_at(plc, (n + 1) * 4 + i * 4))
         .map(|pn| pn & 0x003F_FFFF)
+        .filter(|&pn| pn < in_stream)
         .collect();
+    pages.sort_unstable();
     pages.dedup();
     let mut runs = Vec::new();
     for pn in pages {
@@ -941,6 +960,8 @@ impl<'a> Builder<'a> {
         let mut text_props: Option<RunProps> = None;
         // One entry per open field: whether its result has begun.
         let mut fields: Vec<bool> = Vec::new();
+        // How many of them are still in their instructions (hidden).
+        let mut in_instructions = 0usize;
         let body = &chars[..chars.len().saturating_sub(1)];
         let flush = |out: &mut Vec<Inline>, text: &mut String, props: &Option<RunProps>| {
             if !text.is_empty() {
@@ -954,19 +975,23 @@ impl<'a> Builder<'a> {
             match ch.c {
                 '\u{13}' => {
                     fields.push(false);
+                    in_instructions += 1;
                     continue;
                 }
                 '\u{14}' => {
-                    if let Some(top) = fields.last_mut() {
+                    if let Some(top) = fields.last_mut().filter(|result| !**result) {
                         *top = true;
+                        in_instructions -= 1;
                     }
                     continue;
                 }
                 '\u{15}' => {
-                    fields.pop();
+                    if fields.pop() == Some(false) {
+                        in_instructions -= 1;
+                    }
                     continue;
                 }
-                _ if fields.iter().any(|&result| !result) => continue,
+                _ if in_instructions > 0 => continue,
                 _ => {}
             }
             let props = self.run_props(ch, istd);
@@ -1260,6 +1285,97 @@ mod tests {
         let text = "Page \x13 PAGE \x141\x15 of \x13 NUMPAGES \x15here\r";
         let doc = read_doc(&Synth::new(text).bytes()).unwrap();
         assert_eq!(paragraphs(&doc), ["Page 1 of here"]);
+    }
+
+    /// Nested fields: an instruction holding a field shows nothing, and a
+    /// result holding one shows that field's result.
+    #[test]
+    fn nested_fields_show_only_results() {
+        let text = "a\x13 IF \x13 PAGE \x142\x15 \x14b\x13 PAGE \x143\x15c\x15d\r";
+        let doc = read_doc(&Synth::new(text).bytes()).unwrap();
+        assert_eq!(paragraphs(&doc), ["ab3cd"]);
+    }
+
+    /// FIX r1 M1: however many pieces claim the same CPs, and whatever
+    /// ccpText says, the text is read once and never outgrows its stream.
+    #[test]
+    fn overlapping_pieces_are_read_once() {
+        let word = vec![b'x'; 4096];
+        let n = 20_000u32;
+        let pieces: Vec<Piece> = (0..n)
+            .map(|i| Piece {
+                // Alternately the whole CP range and a backwards one.
+                cp_start: if i % 2 == 0 { 0 } else { u32::MAX },
+                cp_end: if i % 2 == 0 { u32::MAX } else { 0 },
+                fc: 0,
+                compressed: true,
+                prm: 0,
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let chars = decode_text(&word, &pieces, u32::MAX);
+        assert_eq!(chars.len(), word.len());
+        assert!(chars.windows(2).all(|w| w[0].cp < w[1].cp));
+        // A piece reaching back is clipped to the CPs after what was read.
+        let clipped = [
+            Piece {
+                cp_start: 0,
+                cp_end: 10,
+                fc: 0,
+                compressed: true,
+                prm: 0,
+            },
+            Piece {
+                cp_start: 5,
+                cp_end: 20,
+                fc: 100,
+                compressed: true,
+                prm: 0,
+            },
+        ];
+        let chars = decode_text(&word, &clipped, 1000);
+        assert_eq!(chars.len(), 20);
+        assert_eq!(chars[10].fc, 105);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// FIX r1 M2: a bin table naming the same pages over and over (in any
+    /// order) parses each page once.
+    #[test]
+    fn a_repeating_bin_table_parses_each_page_once() {
+        let mut word = vec![0u8; 512 * 6];
+        for pn in [3usize, 4] {
+            let page = pn * 512;
+            word[page..page + 4].copy_from_slice(&(pn as u32 * 100).to_le_bytes());
+            word[page + 4..page + 8].copy_from_slice(&(pn as u32 * 100 + 50).to_le_bytes());
+            word[page + 8] = 0x80;
+            word[page + 0x100] = 3;
+            word[page + 0x101..page + 0x104].copy_from_slice(&[0x35, 0x08, 1]);
+            word[page + 511] = 1;
+        }
+        let n = 20_000usize;
+        let mut table = Vec::new();
+        for i in 0..=n {
+            table.extend((i as u32).to_le_bytes());
+        }
+        for i in 0..n {
+            // A, B, A, B, ..., and a page past the stream now and then.
+            let pn: u32 = match i % 3 {
+                0 => 3,
+                1 => 4,
+                _ => 9_999,
+            };
+            table.extend(pn.to_le_bytes());
+        }
+        let bte = FcLcb {
+            fc: 0,
+            lcb: table.len() as u32,
+        };
+        let started = std::time::Instant::now();
+        let runs = fkp_runs(&word, &table, bte, FkpKind::Chpx);
+        assert_eq!(runs.len(), 2);
+        assert_eq!((runs[0].start, runs[1].start), (300, 400));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]
