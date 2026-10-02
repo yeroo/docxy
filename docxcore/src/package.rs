@@ -3609,6 +3609,17 @@ mod tests {
     }
 
     #[test]
+    fn save_keeps_toc_page_numbers_visible_916() {
+        // A saved TOC entry's webHidden tab and page number must not become
+        // hidden text when Word reads the file back.
+        let doc = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:hyperlink w:anchor="_Toc1"><w:r><w:t>Intro</w:t></w:r><w:r><w:rPr><w:webHidden/></w:rPr><w:tab/></w:r><w:r><w:rPr><w:webHidden/></w:rPr><w:t>3</w:t></w:r></w:hyperlink></w:p></w:body></w:document>"#;
+        let pkg = load_package(&make_docx(doc)).expect("load");
+        let saved = saved_document_xml(&save_package(&pkg));
+        assert!(!saved.contains("w:vanish"), "{saved}");
+        assert_eq!(saved.matches("<w:webHidden/>").count(), 2, "{saved}");
+    }
+
+    #[test]
     fn save_keeps_background_after_body_edit() {
         let mut pkg = load_package(&make_docx(&background_doc(PAGE_COLOR))).expect("load");
         if let Block::Paragraph(p) = &mut pkg.document.body[0] {

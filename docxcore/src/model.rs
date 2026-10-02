@@ -33,7 +33,7 @@ pub struct RunProps {
     pub code: bool,
     pub caps: bool,
     pub small_caps: bool,
-    /// Hidden text (`w:vanish` / `w:webHidden`).
+    /// Hidden text (`w:vanish`). `w:webHidden` stays in `raw_props`.
     pub vanish: bool,
     /// Run-level right-to-left text direction (`w:rtl`). The visual layout
     /// layer consumes this as a UBA run hint while editor offsets stay logical.

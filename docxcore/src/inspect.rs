@@ -49,27 +49,10 @@ impl Target {
 }
 
 /// Whether direct run formatting hides the text the way Word's inspector
-/// means it: `w:vanish`. The loader maps `w:webHidden` (hidden only in Web
-/// layout; every TOC puts it on its page numbers) to `vanish` too and keeps
-/// the element in `raw_props`, so a run carrying `webHidden` is not hidden
-/// text. A run with both `vanish` and `webHidden` is therefore missed: the
-/// model cannot tell it from `webHidden` alone.
+/// means it: `w:vanish`. `w:webHidden` (hidden only in Web layout; every TOC
+/// puts it on its page numbers) is not hidden text and is not `vanish`.
 fn is_hidden(props: &RunProps) -> bool {
     props.vanish
-        && !props
-            .raw_props
-            .iter()
-            .any(|r| raw_local_name(r) == "webHidden")
-}
-
-/// The local name of a preserved element's XML (`<w:webHidden/>` -> `webHidden`).
-fn raw_local_name(raw: &str) -> &str {
-    let tag = raw.trim_start().trim_start_matches('<');
-    let end = tag
-        .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
-        .unwrap_or(tag.len());
-    let name = &tag[..end];
-    name.rsplit(':').next().unwrap_or(name)
 }
 
 const MARKER_TAGS: [&str; 3] = [
@@ -137,13 +120,12 @@ fn is_leftover(xml: &str) -> bool {
 }
 
 /// Hidden runs in raw XML, by the rule of [`is_hidden`]: a `w:r` whose own
-/// `w:rPr` turns `w:vanish` on and has no `w:webHidden`. Only leaf runs
+/// `w:rPr` turns `w:vanish` on, whatever its `w:webHidden`. Only leaf runs
 /// count: a drawing run that holds a text box's runs is not itself text.
 fn count_hidden_in_xml(xml: &str) -> usize {
     struct RunFrame {
         depth: usize,
         vanish: bool,
-        web_hidden: bool,
         has_inner_run: bool,
     }
     let mut p = XmlParser::new(xml);
@@ -158,13 +140,8 @@ fn count_hidden_in_xml(xml: &str) -> usize {
                 let own_prop = names.len() >= 2
                     && names[names.len() - 1] == "w:rPr"
                     && names[names.len() - 2] == "w:r";
-                if let Some(run) = runs.last_mut().filter(|_| own_prop) {
-                    let on = !matches!(p.attr("w:val"), "0" | "false" | "off");
-                    match name {
-                        "w:vanish" => run.vanish = on,
-                        "w:webHidden" => run.web_hidden = on,
-                        _ => {}
-                    }
+                if let Some(run) = runs.last_mut().filter(|_| own_prop && name == "w:vanish") {
+                    run.vanish = !matches!(p.attr("w:val"), "0" | "false" | "off");
                 }
                 names.push(name);
                 if name == "w:r" {
@@ -174,7 +151,6 @@ fn count_hidden_in_xml(xml: &str) -> usize {
                     runs.push(RunFrame {
                         depth: names.len(),
                         vanish: false,
-                        web_hidden: false,
                         has_inner_run: false,
                     });
                 }
@@ -182,7 +158,6 @@ fn count_hidden_in_xml(xml: &str) -> usize {
             Event::End => {
                 if let Some(run) = runs.pop_if(|r| r.depth == names.len())
                     && run.vanish
-                    && !run.web_hidden
                     && !run.has_inner_run
                 {
                     count += 1;
@@ -707,6 +682,17 @@ mod tests {
     }
 
     #[test]
+    fn inspect_counts_vanish_plus_web_hidden_as_hidden_916() {
+        // Hidden text that is also webHidden is still hidden text.
+        let body = "<w:p><w:r><w:t>keep</w:t></w:r>\
+            <w:r><w:rPr><w:vanish/><w:webHidden/></w:rPr><w:t>gone</w:t></w:r></w:p>";
+        let mut doc = parse(body);
+        assert_eq!(count_hidden_runs(&doc), 1);
+        assert_eq!(remove_hidden_text(&mut doc), 1);
+        assert_eq!(doc.plain_text().trim(), "keep");
+    }
+
+    #[test]
     fn inspect_removes_all_comment_markers_everywhere() {
         let marked = |id: u32| {
             format!(
@@ -947,8 +933,13 @@ mod tests {
         );
         // A TOC page number: webHidden, not hidden text.
         assert_eq!(
-            count("<w:r><w:rPr><w:vanish/><w:webHidden/></w:rPr><w:t>3</w:t></w:r>"),
+            count("<w:r><w:rPr><w:webHidden/></w:rPr><w:t>3</w:t></w:r>"),
             0
+        );
+        // Hidden text that is also webHidden is hidden, as in the model.
+        assert_eq!(
+            count("<w:r><w:rPr><w:vanish/><w:webHidden/></w:rPr><w:t>3</w:t></w:r>"),
+            1
         );
         // The previous formatting of a tracked change is not the run's own.
         assert_eq!(

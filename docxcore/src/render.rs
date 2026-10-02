@@ -3966,6 +3966,40 @@ mod tests {
     }
 
     #[test]
+    fn web_hidden_toc_entry_is_not_dim_916() {
+        // Word's print layout shows webHidden text: a TOC's tab and its
+        // PAGEREF page number. Only the vanish run below is hidden text.
+        let d = crate::load::parse_document_xml(
+            "<w:document><w:body><w:p><w:hyperlink w:anchor=\"_Toc1\">\
+             <w:r><w:t>Intro</w:t></w:r>\
+             <w:r><w:rPr><w:webHidden/></w:rPr><w:tab/></w:r>\
+             <w:r><w:rPr><w:webHidden/></w:rPr><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+             <w:r><w:rPr><w:webHidden/></w:rPr><w:instrText> PAGEREF _Toc1 </w:instrText></w:r>\
+             <w:r><w:rPr><w:webHidden/></w:rPr><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+             <w:r><w:rPr><w:webHidden/></w:rPr><w:t>3</w:t></w:r>\
+             <w:r><w:rPr><w:webHidden/></w:rPr><w:fldChar w:fldCharType=\"end\"/></w:r>\
+             </w:hyperlink></w:p>\
+             <w:p><w:r><w:rPr><w:webHidden/></w:rPr><w:t>Web</w:t></w:r>\
+             <w:r><w:rPr><w:vanish/><w:webHidden/></w:rPr><w:t>Gone</w:t></w:r></w:p>\
+             </w:body></w:document>",
+            &crate::load::Relationships::default(),
+        );
+        let lines = render(&d, &opts(40));
+        let dim: Vec<&str> = lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .filter(|s| s.style.dim && !s.text.trim().is_empty())
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(dim, ["Gone"], "{lines:?}");
+        let blank_dim = lines[0]
+            .spans
+            .iter()
+            .any(|s| s.style.dim && s.text.trim().is_empty());
+        assert!(!blank_dim, "the TOC tab renders dim: {:?}", lines[0]);
+    }
+
+    #[test]
     fn colored_run_is_quantized() {
         let red = RunProps {
             color: Some("FF0000".to_string()),
