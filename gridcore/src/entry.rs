@@ -549,6 +549,11 @@ fn value_cell(value: CellValue) -> Cell {
 /// first one found (nearest above first). Nothing is proposed for an empty
 /// or `=` entry, when no value or more than one value matches, or when the
 /// typed text already is one of the values.
+///
+/// A text that would not stay text when typed (`007`, `TRUE`, `3/4` held as
+/// text) is never proposed: the host commits the proposal as typed, so it
+/// would come back a number, a boolean or a date. Excel does not complete
+/// entries that are only numbers, dates or times either.
 pub fn autocomplete(sheet: &Sheet, row: u32, col: u32, typed: &str) -> Option<String> {
     if typed.is_empty() || typed.starts_with('=') {
         return None;
@@ -566,7 +571,7 @@ pub fn autocomplete(sheet: &Sheet, row: u32, col: u32, typed: &str) -> Option<St
         let CellValue::Text(text) = &cell.value else {
             continue;
         };
-        if cell.formula.is_some() {
+        if cell.formula.is_some() || !stays_text(text) {
             continue;
         }
         let lower = text.to_lowercase();
@@ -583,6 +588,17 @@ pub fn autocomplete(sheet: &Sheet, row: u32, col: u32, typed: &str) -> Option<St
         }
     }
     found.map(|(_, text)| text)
+}
+
+/// Does `text`, typed into a General cell, stay that same text? With a
+/// clock, so a yearless date such as `3/4` is read as the date it would be.
+fn stays_text(text: &str) -> bool {
+    let ctx = EntryCtx {
+        today: Some(45_000.0),
+        ..EntryCtx::default()
+    };
+    parse_entry(text, &Xf::default(), &ctx)
+        .is_ok_and(|e| e.cell.formula.is_none() && e.cell.value == CellValue::Text(text.into()))
 }
 
 // ---------------------------------------------------------------------------
@@ -2022,6 +2038,18 @@ mod tests {
         // Case-only differences are one value, spelled as found nearest above.
         let sh = column(&[Some("apple"), Some("APPLE"), None, Some("x")]);
         assert_eq!(autocomplete(&sh, 2, 0, "a").as_deref(), Some("APPLE"));
+        // A text a typed entry would read as something else is not a
+        // proposal: it would commit as a number, a boolean or a date.
+        let held_as_text = |t: &str| {
+            let mut sh = Sheet::default();
+            sh.set_cell(0, 0, Cell::text(t));
+            sh
+        };
+        for t in ["007", "TRUE", "3/4", "1E5", "'x"] {
+            assert_eq!(autocomplete(&held_as_text(t), 1, 0, &t[..1]), None, "{t}");
+        }
+        let sh = held_as_text("0abc");
+        assert_eq!(autocomplete(&sh, 1, 0, "0").as_deref(), Some("0abc"));
         // A formula's text result is not a proposal.
         let mut sh = column(&[Some("=\"x\"")]);
         sh.cells.get_mut(&(0, 0)).unwrap().value = CellValue::Text("xyz".into());
