@@ -51,17 +51,36 @@ fn an_instance_on_a_separate_desktop_is_driven_and_captured_but_never_shown() {
         .unwrap_or_else(|e| panic!("the suite never became ready: {e}"));
     assert_eq!(driver.pid(), app.pid());
 
-    // From this thread — still on the user's desktop — the window does not
-    // exist: EnumWindows lists only the calling thread's desktop. That is
-    // the side effect the feature exists for.
+    // The control server answers before gpui has shown the window, so the
+    // wait for the window itself must come first — and it has to run on the
+    // attached thread, because EnumWindows lists only the calling thread's
+    // desktop. Once this returns, the window provably exists — on the
+    // hidden desktop.
+    let pid = app.pid();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            desk.attach_current_thread().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while uiharness::capture::window_of_pid(pid).is_err() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the suite never showed a window on its desktop"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+    });
+
+    // The window exists now. From this thread — still on the user's desktop —
+    // it must not be reachable: EnumWindows lists only the calling thread's
+    // desktop. That is the side effect the feature exists for.
     assert!(
-        uiharness::capture::window_of_pid(app.pid()).is_err(),
+        uiharness::capture::window_of_pid(pid).is_err(),
         "the suite's window must not be reachable from the user's desktop"
     );
 
     // Captures run on a thread attached to the desktop. A fresh thread owns
     // no windows or hooks, so SetThreadDesktop accepts it.
-    let pid = app.pid();
     let capture = std::thread::scope(|scope| {
         scope
             .spawn(|| {

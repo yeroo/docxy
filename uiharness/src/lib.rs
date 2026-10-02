@@ -32,12 +32,15 @@
 //! - [`expect`] — the vocabulary a test states that in, and what a failure in
 //!   it reads like.
 //! - [`script`] — the format a test is written in, and its parser.
+//! - [`desktop`] — a Win32 desktop to start the suite on, never switched in,
+//!   and to attach a capture thread to.
 //! - [`launch`] — starting a sandboxed instance and stopping it again.
 //! - [`runner`] — running a parsed script against one.
 //! - [`run`] — where a run's evidence is filed.
 
 pub mod capture;
 pub mod deflate;
+pub mod desktop;
 pub mod driver;
 pub mod expect;
 pub mod image;

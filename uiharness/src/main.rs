@@ -34,7 +34,7 @@ const USAGE: &str = "\
 uiharness — drive a suite instance started with --harness
 
 usage:
-  uiharness [--config DIR | --ctl DIR] [--instance NAME] <command>
+  uiharness [--config DIR | --ctl DIR] [--instance NAME] [--desktop NAME] <command>
 
 commands:
   run SCRIPT...                 launch a sandboxed instance and run a test script
@@ -62,6 +62,7 @@ options for run:
   --sandbox DIR                 the throwaway config root
                                 (default: <run>/sandbox-<pid>-<timestamp>, retained)
   --keep                        leave the instance running after the script ends
+  --desktop NAME                start the suite on a separate Win32 desktop (never shown)
 
 regions:
   window  title-tabs  tab-prev  tab-next  tab-more  tab-more-item:0
@@ -100,6 +101,7 @@ struct Args {
     config: Option<PathBuf>,
     ctl: Option<PathBuf>,
     instance: Option<String>,
+    desktop: Option<String>,
     run_dir: PathBuf,
     test: String,
     out: Option<PathBuf>,
@@ -122,6 +124,7 @@ where
         config: std::env::var_os("DOCXY_CONFIG_DIR").map(PathBuf::from),
         ctl: None,
         instance: None,
+        desktop: None,
         run_dir: PathBuf::from("uiharness-runs"),
         test: "adhoc".to_string(),
         out: None,
@@ -141,6 +144,7 @@ where
             "--config" => a.config = Some(PathBuf::from(value("--config")?)),
             "--ctl" => a.ctl = Some(PathBuf::from(value("--ctl")?)),
             "--instance" => a.instance = Some(value("--instance")?),
+            "--desktop" => a.desktop = Some(value("--desktop")?),
             "--run" => a.run_dir = PathBuf::from(value("--run")?),
             "--test" => a.test = value("--test")?,
             "--out" => a.out = Some(PathBuf::from(value("--out")?)),
@@ -216,6 +220,18 @@ fn run(a: Args) -> Result<String, String> {
     // live instance the latter may legitimately wait 20 seconds, but a command
     // that cannot be executed should fail locally and immediately.
     let command = command(&a)?;
+    // A kept instance from `run --desktop --keep` lives on that desktop:
+    // attach this thread before anything that enumerates windows or captures,
+    // so `shot`/`window`/`assert` find it. `ping`/`call` only use the control
+    // socket, and attaching costs them nothing.
+    let _desk = match &a.desktop {
+        Some(name) => {
+            let d = uiharness::desktop::Desktop::create(name)?;
+            d.attach_current_thread()?;
+            Some(d)
+        }
+        None => None,
+    };
     let ctl = match (&a.ctl, &a.config) {
         (Some(d), _) => d.clone(),
         (None, Some(c)) => control_dir(c),
@@ -344,7 +360,21 @@ fn run_scripts(a: &Args) -> Result<String, String> {
                 .join(format!("sandbox-{}-{stamp}", std::process::id()))
         }
     };
-    let mut app = uiharness::launch::launch(&exe, &sandbox)?;
+    // The suite starts on the named desktop (or the user's own, as today).
+    // The `Desktop` outlives the run: its handle must stay open while this
+    // thread is attached to it and the suite is running on it.
+    let desk = match &a.desktop {
+        Some(name) => {
+            let d = uiharness::desktop::Desktop::create(name)?;
+            d.attach_current_thread()?;
+            Some(d)
+        }
+        None => None,
+    };
+    let mut app = match &desk {
+        Some(d) => uiharness::launch::launch_on_desktop(&exe, &sandbox, d)?,
+        None => uiharness::launch::launch(&exe, &sandbox)?,
+    };
     let ctl = app.ctl_dir();
 
     let driver = match Driver::connect(&ctl, a.instance.as_deref()) {
@@ -391,10 +421,17 @@ fn run_scripts(a: &Args) -> Result<String, String> {
     out.push_str(&format!("sandbox:  {}\n", sandbox.display()));
 
     if a.keep {
-        out.push_str(&format!(
-            "the instance is still running (pid {}); --keep was given\n",
-            driver.pid()
-        ));
+        match &a.desktop {
+            Some(name) => out.push_str(&format!(
+                "the instance is still running (pid {}) on desktop {name}; --keep was \
+                 given — later shot/window/assert commands need --desktop {name}\n",
+                driver.pid()
+            )),
+            None => out.push_str(&format!(
+                "the instance is still running (pid {}); --keep was given\n",
+                driver.pid()
+            )),
+        }
         app.detach();
     } else {
         app.shutdown(Some(&driver));

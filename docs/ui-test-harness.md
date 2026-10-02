@@ -61,6 +61,33 @@ Useful flags on `run`:
 | `--run DIR` | where evidence is filed (default `./uiharness-runs`, which is git-ignored). The path a capture lands on is `<case>/<line>-<region>.png`, so two runs sharing this directory *at the same time* would file over each other's pictures — give them different `--run` directories if you run them in parallel. The instances themselves never share anything: each gets its own sandbox |
 | `--sandbox DIR` | the throwaway config root (default `<run>/sandbox-<pid>-<timestamp>`). Every default is unique and retained for diagnosis; the harness performs no recursive cleanup. A directory you name yourself is also yours to manage and is kept |
 | `--keep` | leave the instance up after the script ends, to poke at the window a case failed on |
+| `--desktop NAME` | run the suite on a separate Win32 desktop, never shown — see below |
+
+### On a separate desktop
+
+gpui shows the suite's window and takes the foreground when it starts, which
+on a long pass can steal your keyboard mid-sentence. `--desktop NAME` starts
+the suite on a Win32 desktop of its own — `WinSta0\NAME`, created if it is not
+there, reused if it is — that is never switched in: nothing appears on your
+screen and nothing can take the focus. Off Windows the flag is an error.
+
+Captures still work. Window enumeration is per-desktop, so the harness
+attaches its own thread to `NAME` before it touches the instance: the run's
+`shot`/`window`/`assert` and any later
+`uiharness --config <sandbox> --desktop NAME …` see the window exactly as if
+it were on yours. `--keep` leaves the instance reachable only this way — a
+plain `uiharness --config <sandbox> window` from your desktop reports "no
+visible top-level window", which is the truth: the window is not on your
+desktop.
+
+The suite's stdout and stderr go to `<sandbox>/suite-output.log` rather than
+your terminal (a process started with a desktop has no console to inherit);
+when the instance exits before connecting, `run` quotes that log's tail, so a
+refusal from the isolation gate stays visible.
+
+The desktop buys no more than that. The clipboard belongs to the window
+station, not the desktop, so a clipboard case on the separate desktop still
+reads and writes yours.
 
 ### Evidence
 
