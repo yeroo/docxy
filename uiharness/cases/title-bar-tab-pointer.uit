@@ -1,0 +1,91 @@
+# #545: real pointer input through gpui's own hit testing, which the
+# handler-calling verbs cannot express. Cases share one app instance, so the
+# 20-tab case runs last and leaves its state behind.
+test dragging a title chip onto another reorders the tabs
+  open copy:"../fixtures/basic.docx" as drag-01.docx
+  open copy:"../fixtures/basic.docx" as drag-02.docx
+  open copy:"../fixtures/basic.docx" as drag-03.docx
+  open copy:"../fixtures/basic.docx" as drag-04.docx
+  # A fresh instance opens a welcome sample tab; close it so the four copies
+  # alone occupy the strip (title-bar-tabs.uit does the same).
+  call close-tab {"index":0}
+  call window-size {"w":1000,"h":700}
+  call tab-select {"tab":0}
+  shot title-tabs
+  call pointer-drag {"from":"tab-chip:0","to":"tab-chip:2"}
+  call tab-list {}
+  assert reply.active is 2
+  assert reply.tabs.0.title is drag-02.docx
+  assert reply.tabs.1.title is drag-03.docx
+  assert reply.tabs.2.title is drag-01.docx
+  assert reply.tabs.3.title is drag-04.docx
+
+test a plain click on a chip without movement still selects it
+  shot title-tabs
+  call pointer-click {"region":"tab-chip:1"}
+  call title-bar {}
+  assert reply.active is 1
+
+# A press that drifts past gpui's 2px drag threshold arms TabDrag, which
+# cancels the click; a drop back on the source chip must then select it
+# rather than no-op (FIX r1 M1). The offset ends the drag 6px right of
+# chip 1's centre, still well inside it.
+test a small drag that ends back on its chip still selects it
+  call tab-select {"tab":0}
+  shot title-tabs
+  call pointer-drag {"from":"tab-chip:1","to":"tab-chip:1","offset":[6,0]}
+  call title-bar {}
+  assert reply.active is 1
+  call tab-list {}
+  assert reply.tabs.0.title is drag-02.docx
+  assert reply.tabs.1.title is drag-03.docx
+  assert reply.tabs.2.title is drag-01.docx
+  assert reply.tabs.3.title is drag-04.docx
+
+# The more-tabs list (deferred, priority 1) must win a real click over the
+# sheet grid's fill handle (deferred, priority 0) where the two overlap.
+# The asserts after the click read the sheet that owns the handle (index 23;
+# the drag case's four docx tabs come first), not the tab the click selects.
+test the more-tabs list wins a real click over the sheet fill handle
+  open copy:"../fixtures/basic.xlsx" as sheet-01.xlsx
+  open copy:"../fixtures/basic.xlsx" as sheet-02.xlsx
+  open copy:"../fixtures/basic.xlsx" as sheet-03.xlsx
+  open copy:"../fixtures/basic.xlsx" as sheet-04.xlsx
+  open copy:"../fixtures/basic.xlsx" as sheet-05.xlsx
+  open copy:"../fixtures/basic.xlsx" as sheet-06.xlsx
+  open copy:"../fixtures/basic.xlsx" as sheet-07.xlsx
+  open copy:"../fixtures/basic.xlsx" as sheet-08.xlsx
+  open copy:"../fixtures/basic.xlsx" as sheet-09.xlsx
+  open copy:"../fixtures/basic.xlsx" as sheet-10.xlsx
+  open copy:"../fixtures/basic.xlsx" as sheet-11.xlsx
+  open copy:"../fixtures/basic.xlsx" as sheet-12.xlsx
+  open copy:"../fixtures/basic.xlsx" as sheet-13.xlsx
+  open copy:"../fixtures/basic.xlsx" as sheet-14.xlsx
+  open copy:"../fixtures/basic.xlsx" as sheet-15.xlsx
+  open copy:"../fixtures/basic.xlsx" as sheet-16.xlsx
+  open copy:"../fixtures/basic.xlsx" as sheet-17.xlsx
+  open copy:"../fixtures/basic.xlsx" as sheet-18.xlsx
+  open copy:"../fixtures/basic.xlsx" as sheet-19.xlsx
+  open copy:"../fixtures/basic.xlsx" as sheet-20.xlsx
+  call window-size {"w":1000,"h":700}
+  click M3
+  # Around the handle, on sheet-20, which owns the selection.
+  snapshot L2:N6
+  call title-tab {"action":"more"}
+  shot tab-more-item:0
+  call pointer-click {"at":"fill-handle"}
+  # The drift guard: M3's bottom-right corner lands on item 13 (a sheet tab
+  # well over the grid). If layout shifts and it lands elsewhere, the case
+  # fails here instead of passing vacuously.
+  assert reply.item is 13
+  call title-bar {}
+  assert reply.active is 13
+  # The guard is `assert reply.active is 13` above: the fill handle stops
+  # propagation, so a lost hit order would leave tab 23 active and the
+  # item's tab unselected. What follows is belt-and-braces — a press alone
+  # writes nothing, and sheet_fill_start refuses while the list is open, so
+  # these cannot fire on their own.
+  call tab-list {}
+  assert reply.tabs.23.dirty is false
+  call tab-select {"tab":23}
+  assert cells unchanged

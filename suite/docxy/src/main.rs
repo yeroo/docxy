@@ -2698,6 +2698,32 @@ impl Probes {
             .map(|(_, b)| *b)
             .or_else(|| self.get(name))
     }
+
+    /// The frame that is on screen: `next`, or — only when nothing has been
+    /// recorded since the rotation — the finished frame before it. Input
+    /// that hit-tests the displayed frame (dispatched pointer events)
+    /// reasons over this whole list, never per-name against a staler one.
+    fn on_screen_frame(&self) -> &[(String, Bounds<Pixels>)] {
+        if self.next.is_empty() {
+            &self.last
+        } else {
+            &self.next
+        }
+    }
+
+    /// Like `current`, but for input that hit-tests the frame on screen: the
+    /// `next` frame alone, refusing a region that has vanished from it. The
+    /// `last` fallback applies only when `next` is entirely empty — nothing
+    /// recorded since the rotation — so a region that disappeared (a closed
+    /// tab's chip, a dismissed menu) is not aimed at its stale bounds.
+    /// `current`'s per-name fallback stays for callers that only read
+    /// geometry, like split-menu anchoring.
+    fn on_screen(&self, name: &str) -> Option<Bounds<Pixels>> {
+        self.on_screen_frame()
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, b)| *b)
+    }
 }
 
 /// Where a split button's drop-down opens: under the whole button, at its
@@ -2748,6 +2774,23 @@ mod probes_tests {
         p.last.push(("chart-panel".into(), at(5.)));
         assert_eq!(p.current("chart-panel"), Some(at(5.)));
         assert_eq!(p.current("missing"), None);
+    }
+
+    /// FIX r3 m2: a region that vanished from the on-screen frame is refused,
+    /// not aimed at its stale bounds; only an entirely empty `next` (nothing
+    /// recorded since the rotation) falls back to `last`.
+    #[test]
+    fn on_screen_refuses_a_region_the_on_screen_frame_lacks() {
+        let at = |x: f32| Bounds::new(point(px(x), px(0.)), size(px(10.), px(10.)));
+        let mut p = Probes::default();
+        p.last = vec![("tab-chip:4".into(), at(40.))];
+        // Nothing recorded since the rotation: the finished frame answers.
+        assert_eq!(p.on_screen("tab-chip:4"), Some(at(40.)));
+        // A frame is on screen that no longer records the region: refuse.
+        p.next = vec![("tab-chip:5".into(), at(90.))];
+        assert_eq!(p.on_screen("tab-chip:4"), None);
+        assert_eq!(p.on_screen("tab-chip:5"), Some(at(90.)));
+        assert_eq!(p.on_screen("missing"), None);
     }
 }
 
@@ -7483,6 +7526,11 @@ fn window_frame_borders(window: &Window) -> Edges<f32> {
 /// shadows are its padding and each untiled edge adds a snapped inner border.
 /// The pinned TitleBar separately adds left padding and a fullscreen inset.
 fn title_bar_geometry(window: &Window) -> f32 {
+    // Workaround for gpui-component's TitleBar `#bar` having no min_w_0
+    // (suite/docs/upstream-gpui-component-titlebar.md, #545): its automatic
+    // minimum size is the content width, so giving the strip a definite
+    // content width here keeps a wide strip from pushing the window
+    // controls off-screen. Simplify once a pin bump ships the upstream fix.
     #[cfg(target_os = "macos")]
     const TITLE_LEFT_PAD: f32 = 80.0;
     #[cfg(not(target_os = "macos"))]
@@ -7973,10 +8021,12 @@ impl Docxy {
     /// mouse-down (gpui runs bubble-phase listeners in reverse paint order) and
     /// stops propagation — `grid_press` never runs, and nothing is in flight.
     ///
-    /// The UI test harness drives `grid_press_cell`/`grid_drag_over` directly
-    /// and so never goes through the element tree's hitboxes; a case's `assert
-    /// cells unchanged` therefore cannot see a handler added here. This guard
-    /// can. See `docs/ui-test-harness.md`.
+    /// The UI test harness's handler-calling verbs (`drag`, `fill-drag`)
+    /// drive `grid_press_cell`/`grid_drag_over` directly and so never go
+    /// through the element tree's hitboxes — `pointer-click`/`pointer-drag`
+    /// (#545) do hit-test through gpui, but a case built on the handler
+    /// verbs cannot see a handler added here. This guard can. See
+    /// `docs/ui-test-harness.md`.
     fn sheet_fill_start(&mut self, cx: &mut Context<Self>) {
         if self.protected_refused(cx) {
             return;
@@ -9222,10 +9272,16 @@ impl Docxy {
     /// the renderer walks, and the `probe` elements the Chart panel and the
     /// chart cards carry. Nothing here recomputes a position the renderer
     /// already decided, so a region cannot drift from the pixels it names.
-    fn region_bounds(
+    ///
+    /// Probe-backed regions resolve through `lookup`: `rect`/`shot` pass
+    /// `Probes::get` (the last finished frame), pointer verbs pass
+    /// `Probes::on_screen` (the frame on screen, which is what gpui
+    /// hit-tests dispatched input against — FIX r1 i1).
+    fn region_bounds_with(
         &self,
         region: harness::Region,
         window: &Window,
+        lookup: fn(&Probes, &str) -> Option<Bounds<Pixels>>,
     ) -> Result<Bounds<Pixels>, String> {
         use harness::Region;
         match region {
@@ -9234,29 +9290,28 @@ impl Docxy {
                 size: window.viewport_size(),
             }),
             Region::TitleTabs | Region::TabPrev | Region::TabNext | Region::TabMore
-            | Region::TabMoreItem(_) => self.probes.borrow()
-                .get(&harness::region_name(region))
-                .ok_or_else(|| format!("{} is not visible", harness::region_name(region))),
+            | Region::TabMoreItem(_) | Region::TabChip(_) => lookup(
+                &self.probes.borrow(),
+                &harness::region_name(region),
+            )
+            .ok_or_else(|| format!("{} is not visible", harness::region_name(region))),
             Region::Gantt
             | Region::Bar(_)
             | Region::ProjectHbarTable
             | Region::ProjectHbarChart
             | Region::ProjectVbar
             | Region::ProjectTimeline
-            | Region::ProjectSplit => self.project_region_bounds(region),
+            | Region::ProjectSplit => self.project_region_bounds(region, lookup),
             Region::Grid => self.grid_bounds(),
-            Region::Gallery => self.probes.borrow().get("gallery").ok_or_else(|| {
+            Region::Gallery => lookup(&self.probes.borrow(), "gallery").ok_or_else(|| {
                 "the Styles gallery is not shown (it is on a document's Home tab, with the ribbon expanded)"
                     .to_string()
             }),
             Region::Cells(_, _, _, _) if self.active_is_project() => {
-                self.project_region_bounds(region)
+                self.project_region_bounds(region, lookup)
             }
             Region::Cells(r0, c0, r1, c1) => self.cells_bounds((r0, c0), (r1, c1)),
-            Region::ChartPanel => self
-                .probes
-                .borrow()
-                .get("chart-panel")
+            Region::ChartPanel => lookup(&self.probes.borrow(), "chart-panel")
                 .ok_or_else(|| "the Chart panel is not open".to_string()),
             Region::Chart(i) => {
                 let n = self.chart_count();
@@ -9266,16 +9321,34 @@ impl Docxy {
                         _ => format!("no chart {i}; this sheet has {n} (0..{})", n - 1),
                     });
                 }
-                self.probes
-                    .borrow()
-                    .get(&format!("chart:{i}"))
-                    .ok_or_else(|| {
-                        format!(
-                            "chart {i} is scrolled out of the grid's view, so it has no rectangle"
-                        )
-                    })
+                lookup(&self.probes.borrow(), &format!("chart:{i}")).ok_or_else(|| {
+                    format!(
+                        "chart {i} is scrolled out of the grid's view, so it has no rectangle"
+                    )
+                })
             }
         }
+    }
+
+    /// Where a named region is on the last finished frame — what `rect`
+    /// answers from and a `shot` crops to.
+    fn region_bounds(
+        &self,
+        region: harness::Region,
+        window: &Window,
+    ) -> Result<Bounds<Pixels>, String> {
+        self.region_bounds_with(region, window, Probes::get)
+    }
+
+    /// Where a named region is on the frame that is on screen now — what
+    /// pointer verbs aim at, matching the frame gpui hit-tests against.
+    /// Vanished regions refuse instead of falling back to stale bounds.
+    fn region_bounds_live(
+        &self,
+        region: harness::Region,
+        window: &Window,
+    ) -> Result<Bounds<Pixels>, String> {
+        self.region_bounds_with(region, window, Probes::on_screen)
     }
 
     /// The grid's scrolling cell area: the virtualized row list's own measured
@@ -23505,6 +23578,39 @@ impl Docxy {
     }
 }
 
+/// The drag payload for a title-chip drag: the source tab's absolute index,
+/// plus the strip length and the tab's title at drag start — a tab closed or
+/// another reorder landing mid-drag invalidates the snapshot, and the drop
+/// must not guess at what moved. Titles are not unique (new documents are
+/// all `Untitled.*`), so the guard passes if the shifted index happens to
+/// land on a same-title tab; a per-tab id would close that and is out of
+/// scope here. Cloned into the view gpui draws under the cursor — the same
+/// pattern as `TimelineDrag` in `project/timeline.rs`.
+#[derive(Clone)]
+struct TabDrag {
+    ix: usize,
+    len: usize,
+    title: SharedString,
+}
+
+impl Render for TabDrag {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The drag view renders outside the themed Root, so it asks the
+        // theme directly — the same palette the more-tabs popup uses.
+        let pal = Pal::of(cx);
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(pal.panel)
+            .border_1()
+            .border_color(pal.border)
+            .text_color(pal.fg)
+            .text_size(px(12.))
+            .child(self.title.clone())
+    }
+}
+
 impl Docxy {
     fn tab_prev(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active > 0 {
@@ -23537,6 +23643,27 @@ impl Docxy {
         if self.tab_more_open {
             self.select_tab(i, window, cx);
         }
+    }
+
+    /// Reorder the tabs by drag (#545): move the tab at `from` to index `to`.
+    /// A drop back on the source chip is a click that drifted past gpui's
+    /// drag threshold — arming the drag cancels the click, so the drop
+    /// selects the tab instead. Unlike `select_tab`, no grid state is
+    /// dropped: the same document stays active, so the grid under it is
+    /// unchanged.
+    fn move_tab(&mut self, from: usize, to: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if from == to {
+            self.select_tab(from, window, cx);
+            return;
+        }
+        self.flush_project_passes(cx);
+        self.close_menu();
+        self.tab_more_open = false;
+        if tabstrip::move_index(&mut self.tabs, &mut self.active, from, to) {
+            self.persist();
+            cx.notify();
+        }
+        self.refocus(window, cx);
     }
 
     fn tab_more_popup(&self, window: &Window, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
@@ -23791,6 +23918,25 @@ impl Render for Docxy {
                                 this.close_tab(i, window, cx);
                             })),
                     )
+                    // Drag to reorder (#545): the payload names the source
+                    // index, the drop target names its own. The probe is the
+                    // `tab-chip:<i>` region pointer verbs resolve.
+                    .child(probe(&self.probes, format!("tab-chip:{i}")))
+                    .on_drag(
+                        TabDrag {
+                            ix: i,
+                            len: self.tabs.len(),
+                            title: tb.title.clone(),
+                        },
+                        |d, _, _, cx| cx.new(|_| d.clone()),
+                    )
+                    .drag_over::<TabDrag>(move |s, _, _, _| s.bg(border))
+                    .on_drop(cx.listener(move |this, d: &TabDrag, window, cx| {
+                        let title = this.tabs.get(d.ix).map(|t| t.title.as_str());
+                        if tabstrip::drag_applies(d.len, this.tabs.len(), title, d.title.as_str()) {
+                            this.move_tab(d.ix, i, window, cx)
+                        }
+                    }))
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.select_tab(i, window, cx)),
                     )
@@ -25718,9 +25864,12 @@ fn sheet_row(
                     // Adding one back would now be inert rather than harmful:
                     // `sheet_fill_start` refuses while a grid gesture is in
                     // flight. Nothing here may rely on that — the press is
-                    // still the only signal — but no UI test can catch a new
-                    // handler on this element (the harness drives the grid's
-                    // methods, not its hitboxes), so the app has to.
+                    // still the only signal — and the handler-calling verbs
+                    // (`drag`, `fill-drag`) cannot catch a new handler on
+                    // this element either (they drive the grid's methods, not
+                    // its hitboxes; `pointer-click`/`pointer-drag` do
+                    // hit-test, see docs/ui-test-harness.md #545), so the app
+                    // has to.
                     .on_mouse_down(MouseButton::Left, move |_ev, _w, cx2| {
                         cx2.stop_propagation();
                         ent_fill_dn.update(cx2, |this, cx2| this.sheet_fill_start(cx2));

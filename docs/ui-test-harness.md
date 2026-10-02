@@ -239,17 +239,27 @@ because the UI cannot place it by document offset, so it does not test clicking
 or dragging a selection. `window-size` and `window-zoom` are setup exceptions
 that call GPUI window APIs. `title-tab` calls the same handler methods as the
 title-bar arrows and dropdown items, and `tab-select` calls `select_tab`, the
-tab chip's click handler. `proj.new` calls `add_tab(Kind::Project)`, the
+tab chip's click handler. `pointer-click`/`pointer-drag` are the hit-testing
+exception (#545): real `PlatformInput` events dispatched through gpui, for
+overlap order a handler call cannot see. `proj.new` calls `add_tab(Kind::Project)`, the
 Backstage › New › Project card's handler; F11 also commits the active plan's
 pending cell edit first, and `proj.new` does not.
 
-⚠️ **"The same entry point" means the handler, not the hitbox.** A verb calls
+⚠️ **"The same entry point" usually means the handler, not the hitbox.** A verb calls
 the method a handler calls; it does not synthesize a pointer at a coordinate and
 let gpui hit-test the element tree. So the harness sees what a handler *does*,
 and cannot see **which elements carry handlers at all**. `drag A1 -> C5` runs
 `grid_press_cell` → `grid_drag_over` → `grid_release`; it never touches the
 deferred fill-handle hitbox that sits over the cells, so a case's `assert cells
 unchanged` would stay green if someone put a second handler back on that handle.
+
+The exception is `pointer-click`/`pointer-drag` (#545): they queue real
+`PlatformInput` mouse events on the control reply, and the pump dispatches them
+through `Window::dispatch_event` once the entity borrow ends — so hit testing
+runs against the last rendered frame exactly as an OS click would. They exist
+precisely for what handler-calling verbs cannot express: hit order between
+overlapping elements, like the more-tabs list (deferred, priority 1) over the
+sheet's fill handle (deferred, priority 0).
 
 That is exactly how the auto-fill-on-sweep regression arrived, so it is not a
 hypothetical gap. It is closed **in the app, not in a case**:
@@ -384,6 +394,8 @@ footer editor; `selection-set` refuses while it is open.
 | `title-tab {"action":"prev"}` | use the previous/next overflow arrow's tab-selection handler; `more` toggles the dropdown only while its button is shown (overflow or more-only), and `pick` with an `index` selects a tab after `more` has opened the list |
 | `tab-list {}` | read every open tab in strip order: `{active, tabs:[{index, title, kind, path, dirty, imported, caption, read_only, protected, repaired}]}`. `kind` is `docx`, `xlsx`, `project` or `mail`; `path` is `null` for a tab never saved; `imported` is true only for a Project read from `.mpp` |
 | `tab-select {"tab":"schedule"}` | make a tab active as clicking its chip does, and reply with the state. `tab` is an index or a case-insensitive title/path substring over **all** tabs, the rule the `proj.*` verbs use; a miss (`no tab matches 'x'`), an ambiguous match (`several tabs match 'x' (2, 3)`) and an index past the end (`no tab at index 9`) are refused. The Backstage stays as it was, as it does for a chip click |
+| `pointer-click {"region":"tab-chip:1"}` | dispatch a real hover-press-release at the region's centre through gpui's own hit testing (or `{"at":"fill-handle"}`: the active selection's handle point); replies `{x, y, item}` where `item` is the more-tabs list index under the point, or -1 off the list. Refuses under a dialog; a press reaches an open menu's own item or backdrop, so it does not pre-close menus |
+| `pointer-drag {"from":"tab-chip:0","to":"tab-chip:2","offset":[6,0]}` | dispatch a real press, 8 pressed moves and a release from the `from` region's centre to the `to` region's centre — plus the optional logical-pixel `offset` on the target. The drag arms once a pressed move lands more than 2px from the press, so a from→to distance (including `offset`) of about 2.25px or less acts as a click; longer drags (chip reorder) happen exactly as by pointer. Replies `{from:[x,y], to:[x,y]}` |
 | `proj.new {}` | make a blank Project and activate it, as Backstage › New › Project does; replies with `proj.path` for it (`tab`, `path: null`, `name: Project1`, 0 `tasks`, `imported`, the cell state). It takes no `tab` and no `name`: the plan is the app's, so name it by saving it (`proj.save {"path":…}`). The Project control server accepts it too |
 | `window-size {"w":600,"h":700}` | resize the harness window in logical pixels; accepts width 300..4096 and height 200..4096 |
 | `window-zoom {}` | call GPUI's zoom action; on Windows it maximizes, while the native caption Max button uses the OS control area. Use a fresh harness window for restored geometry on Windows |
@@ -485,9 +497,10 @@ before the project start moves the start earlier, and the finish is the leveled
 one while leveling is on.
 `timeline_view_start` and `timeline_view_finish` are the first and last day
 the chart shows (a day partly in view counts), clamped to that span; they are
-what the Timeline's view box covers. Dragging the box scrolls the chart, but
-the harness has no pointer-drag verb for it, so cases move the chart with keys
-(Task › Editing › Scroll to Task, and Alt+Home for the project start) instead.
+what the Timeline's view box covers. Dragging the box scrolls the chart.
+`pointer-drag` drives drags by region endpoints, not the box's own
+coordinates, so cases move the chart with keys (Task › Editing › Scroll to
+Task, and Alt+Home for the project start) instead.
 
 Project cells use Enter/F2 or a double-click to edit the current value; typing
 any printable character replaces it. Left/Right move between columns, and
@@ -938,7 +951,9 @@ have. `word-header-footer.uit` drives these over a three-section document.
 `bar:<id>` (for example `bar:3`), `project-hbar-table`, `project-hbar-chart`,
 `project-vbar`, `project-timeline`, `project-split`, `gallery`, `title-tabs`,
 `tab-prev`, `tab-next`, `tab-more`, `tab-more-item:<index>` (the last exists while
-the more-tabs list is open). `gantt` is the visible Project Gantt chart body,
+the more-tabs list is open), `tab-chip:<index>` — a visible title-bar chip by
+absolute tab index; absent while the chip is scrolled out of the strip. `gantt`
+is the visible Project Gantt chart body,
 excluding its header, divider and vertical scrollbar; `bar:<id>` addresses a task by
 displayed ID. The `project-hbar-*` and `project-vbar` regions are the Project tab's three
 scrollbar strips: under the table, under the chart, and down the right edge of the rows.

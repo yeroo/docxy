@@ -153,9 +153,103 @@ pub fn layout(avail: f32, n: usize, active: usize, first: usize) -> StripLayout 
     }
 }
 
+/// Move the element at `from` to index `to`, remapping `active` so it keeps
+/// naming the same element. A no-op (`from == to`, or either index out of
+/// range) returns false and leaves both untouched.
+pub fn move_index<T>(v: &mut Vec<T>, active: &mut usize, from: usize, to: usize) -> bool {
+    if from == to || from >= v.len() || to >= v.len() {
+        return false;
+    }
+    let item = v.remove(from);
+    v.insert(to, item);
+    *active = if *active == from {
+        to
+    } else if from < *active && *active <= to {
+        *active - 1
+    } else if to <= *active && *active < from {
+        *active + 1
+    } else {
+        *active
+    };
+    true
+}
+
+/// Whether a drag's snapshot of the tab list still describes it. The payload
+/// records the length and the source tab's title when the drag began; a tab
+/// closed or another reorder landing mid-drag invalidates the snapshot, and
+/// the drop must not guess at what moved. `title_at_ix` is the title the
+/// stored index names now — `None` when it names nothing. Documented
+/// limitation: titles are not unique (new documents are all `Untitled.*`),
+/// so a shift that lands the stored index on a same-title tab (at the same
+/// length) passes the guard.
+pub fn drag_applies(
+    len_at_drag: usize,
+    len_now: usize,
+    title_at_ix: Option<&str>,
+    title: &str,
+) -> bool {
+    len_at_drag == len_now && title_at_ix == Some(title)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn move_index_keeps_active_on_the_same_tab() {
+        let titles = |v: &[usize]| v.iter().map(|i| format!("t{i}")).collect::<Vec<_>>();
+        // The active tab itself moves: active follows it to its new index.
+        let (mut v, mut active) = (titles(&[0, 1, 2, 3]), 0);
+        assert!(move_index(&mut v, &mut active, 0, 2));
+        assert_eq!(v, titles(&[1, 2, 0, 3]));
+        assert_eq!(active, 2);
+        // A tab moves right across the active one: active shifts down one.
+        let (mut v, mut active) = (titles(&[0, 1, 2, 3]), 1);
+        assert!(move_index(&mut v, &mut active, 0, 2));
+        assert_eq!(v, titles(&[1, 2, 0, 3]));
+        assert_eq!(active, 0);
+        // A tab moves left across the active one: active shifts up one.
+        let (mut v, mut active) = (titles(&[0, 1, 2, 3]), 1);
+        assert!(move_index(&mut v, &mut active, 3, 0));
+        assert_eq!(v, titles(&[3, 0, 1, 2]));
+        assert_eq!(active, 2);
+        // A move that does not cross the active tab leaves it alone.
+        let (mut v, mut active) = (titles(&[0, 1, 2, 3]), 0);
+        assert!(move_index(&mut v, &mut active, 2, 3));
+        assert_eq!(v, titles(&[0, 1, 3, 2]));
+        assert_eq!(active, 0);
+    }
+
+    #[test]
+    fn move_index_ignores_same_and_out_of_range() {
+        let mut v = vec!["a", "b", "c"];
+        let original = v.clone();
+        for (from, to) in [(1usize, 1usize), (0, 3), (3, 0), (3, 3)] {
+            let mut active = 1usize;
+            assert!(!move_index(&mut v, &mut active, from, to), "{from}->{to}");
+            assert_eq!(v, original);
+            assert_eq!(active, 1);
+        }
+    }
+
+    /// #545 (FIX r1 i2): a drop is honored only while the strip still matches
+    /// the drag's snapshot — same length, and the stored index still names
+    /// the tab the payload recorded.
+    #[test]
+    fn drag_applies_rejects_a_stale_snapshot() {
+        // The strip is exactly as the drag left it.
+        assert!(drag_applies(3, 3, Some("b"), "b"));
+        // A tab closed mid-drag: the length differs.
+        assert!(!drag_applies(3, 2, Some("b"), "b"));
+        // The index now names another tab (a reorder or a close that shifted
+        // the rest).
+        assert!(!drag_applies(3, 3, Some("c"), "b"));
+        // Out of range after closes.
+        assert!(!drag_applies(4, 2, None, "d"));
+        // Documented limitation: titles are not unique, so a shift that
+        // lands the stored index on a tab with the same title passes.
+        assert!(drag_applies(3, 3, Some("Untitled.docx"), "Untitled.docx"));
+    }
 
     #[test]
     fn tabs_fit_shrink_and_overflow_at_minimum() {
