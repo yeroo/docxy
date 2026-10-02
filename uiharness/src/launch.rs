@@ -386,8 +386,11 @@ pub fn launch_on_desktop_with_env(
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
     use windows::Win32::System::Threading::{
-        CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, PROCESS_INFORMATION,
-        STARTF_USESTDHANDLES, STARTUPINFOW,
+        CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+        DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+        InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+        STARTUPINFOEXW, STARTUPINFOW, UpdateProcThreadAttribute,
     };
     use windows::core::{PCWSTR, PWSTR};
 
@@ -415,7 +418,9 @@ pub fn launch_on_desktop_with_env(
     let env_block = environment_block(&child_env(&sandbox, parent));
 
     let si = STARTUPINFOW {
-        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        // With EXTENDED_STARTUPINFO_PRESENT the kernel reads `cb` as the
+        // size of the EX struct this lands in.
+        cb: std::mem::size_of::<STARTUPINFOEXW>() as u32,
         lpDesktop: PWSTR(desktop_name.as_ptr() as *mut u16),
         dwFlags: STARTF_USESTDHANDLES,
         hStdInput: HANDLE::default(),
@@ -423,28 +428,69 @@ pub fn launch_on_desktop_with_env(
         hStdError: log_handle,
         ..Default::default()
     };
-    let mut pi = PROCESS_INFORMATION::default();
-    // SAFETY: every pointer is a live NUL-terminated buffer above; the
-    // environment block is sorted and double-NUL-terminated as
-    // CREATE_UNICODE_ENVIRONMENT requires; `bInheritHandles = true` exposes
-    // the inheritable log handle (and only such handles) to the child, as
-    // std's own spawn does for inherited stdio; `si` and `pi` are sized as
-    // the API requires.
+    // Inherit exactly the log handle, not every inheritable handle this
+    // process happens to hold: a bare `bInheritHandles = true` would let a
+    // kept (or crashed) suite hold the caller's pipe end open, and
+    // `run --desktop --keep | tail` would then outlive the harness without
+    // ever letting the pipe close. std's own spawn restricts inheritance the
+    // same way, which is why the plain launch path does not do this.
+    let mut attr_size = 0usize;
+    // SAFETY: the NULL-list call is the documented size query; its failure
+    // is expected and leaves the required size in `attr_size`.
     unsafe {
-        CreateProcessW(
-            PCWSTR(exe_wide.as_ptr()),
-            Some(PWSTR(cmdline.as_mut_ptr())),
-            None,
-            None,
-            true,
-            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-            Some(env_block.as_ptr().cast()),
-            PCWSTR(cwd.as_ptr()),
-            &si,
-            &mut pi,
-        )
+        let _ = InitializeProcThreadAttributeList(None, 1, None, &mut attr_size);
     }
-    .map_err(|e| format!("{}: {e}", exe.display()))?;
+    let mut attr_buf = vec![0u8; attr_size];
+    let attr_list = LPPROC_THREAD_ATTRIBUTE_LIST(attr_buf.as_mut_ptr().cast());
+    // SAFETY: `attr_list` points at `attr_buf` (`attr_size` bytes from the
+    // size query). On failure nothing was initialized, so there is no list
+    // to delete; `log` closes with this scope.
+    unsafe { InitializeProcThreadAttributeList(Some(attr_list), 1, None, &mut attr_size) }
+        .map_err(|e| format!("{}: InitializeProcThreadAttributeList: {e}", exe.display()))?;
+    let mut inherit = [log_handle];
+    let siex = STARTUPINFOEXW {
+        StartupInfo: si,
+        lpAttributeList: attr_list,
+    };
+    let mut pi = PROCESS_INFORMATION::default();
+    let spawned = (|| -> Result<(), String> {
+        // SAFETY: `attr_list` is initialized; the attribute value names the
+        // one inheritable handle and `inherit` lives until the spawn.
+        unsafe {
+            UpdateProcThreadAttribute(
+                attr_list,
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                Some(inherit.as_mut_ptr().cast()),
+                std::mem::size_of_val(&inherit),
+                None,
+                None,
+            )
+        }
+        .map_err(|e| format!("{}: UpdateProcThreadAttribute: {e}", exe.display()))?;
+        // SAFETY: every pointer is a live NUL-terminated buffer above; the
+        // environment block is sorted and double-NUL-terminated as
+        // CREATE_UNICODE_ENVIRONMENT requires; the attribute list restricts
+        // inheritance to `inherit`, the log handle.
+        unsafe {
+            CreateProcessW(
+                PCWSTR(exe_wide.as_ptr()),
+                Some(PWSTR(cmdline.as_mut_ptr())),
+                None,
+                None,
+                true,
+                CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+                Some(env_block.as_ptr().cast()),
+                PCWSTR(cwd.as_ptr()),
+                &siex.StartupInfo,
+                &mut pi,
+            )
+        }
+        .map_err(|e| format!("{}: {e}", exe.display()))
+    })();
+    // SAFETY: `attr_list` was initialized above and is deleted exactly once.
+    unsafe { DeleteProcThreadAttributeList(attr_list) };
+    spawned?;
     // The child's thread is of no use; the process handle lives in `Proc`.
     // SAFETY: `pi.hThread` is a handle we own from the successful spawn.
     unsafe {
