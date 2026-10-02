@@ -165,7 +165,7 @@ Pivot tables are read + refreshable (partial).
 
 | # | Gap | Corpus weight | Current | Notes |
 |---|-----|--------------|---------|-------|
-| **X1** | **`SUBTOTAL`** | blocks **8 files** (5 solely) | MISSING | Single highest-value function. Not just a sum: filter/hidden-row aware, 1xx vs 10x codes. |
+| **X1** | **`SUBTOTAL`** | blocks **8 files** (5 solely) | DONE | Evaluated with hidden- and filtered-row handling (1–11 vs 101–111) and nested totals skipped. Data ▸ Subtotal writes it with any of Excel's eleven functions, and Remove All takes the totals out again (#693). |
 | **X2** | **`FORMULATEXT`** | blocks **4** (1 sole) | MISSING | Cheap — AST serializer already exists; return a cell's formula source. |
 | **X3** | **`.PRECISE` / `ISO` / `AGGREGATE` cluster** — CEILING.PRECISE, FLOOR.PRECISE, ISO.CEILING, AGGREGATE | ~2-3 files (co-occur) | MISSING | First three are trivial wrappers over existing rounding; AGGREGATE is larger (19 sub-fns × ignore-options). Ship together. |
 | **X4** | **`CELL`, `FREQUENCY`** | 1 file each (both sole blockers) | MISSING | Guaranteed +2 files. Also add `CELL`/`INFO` to the volatile set. |
