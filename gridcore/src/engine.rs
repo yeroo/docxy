@@ -1997,7 +1997,7 @@ fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth:
             None => wb.table_at(sheet, row, col),
         };
         if let Some(t) = t {
-            let info = to_table_info(t);
+            let info = t.info();
             if let Some((r1, c1, r2, c2)) = info.resolve(item, &col1, &col2, row) {
                 out.push((t.sheet, r1, c1, r2, c2));
             }
@@ -2045,16 +2045,6 @@ fn recalc_flags(wb: &Workbook, sheet: usize, ast: &Expr, depth: u32) -> (bool, b
         db |= d;
     }
     (volatile, db)
-}
-
-fn to_table_info(t: &crate::sheet::Table) -> crate::formula::TableInfo {
-    crate::formula::TableInfo {
-        sheet: t.sheet,
-        range: t.range,
-        header_rows: t.header_rows,
-        totals_rows: t.totals_rows,
-        columns: t.columns.clone(),
-    }
 }
 
 /// Engine result → stored cell value. A formula referencing an empty cell
@@ -2139,11 +2129,13 @@ impl Resolver for WbResolver<'_> {
     }
 
     fn table(&self, name: &str) -> Option<formula::TableInfo> {
-        self.wb.table(name).map(to_table_info)
+        self.wb.table(name).map(crate::sheet::Table::info)
     }
 
     fn table_at(&self, sheet: usize, row: u32, col: u32) -> Option<formula::TableInfo> {
-        self.wb.table_at(sheet, row, col).map(to_table_info)
+        self.wb
+            .table_at(sheet, row, col)
+            .map(crate::sheet::Table::info)
     }
 
     fn spill_extent(&self, sheet: usize, row: u32, col: u32) -> Option<(u32, u32)> {

@@ -1509,13 +1509,27 @@ fn group_cells<'a>(
         .collect()
 }
 
-/// Sheets + defined names — the whole calculated state, snapshotted around
-/// structural edits (row/column insert-delete, sheet rename) whose inverse
-/// is not expressible as per-cell changes.
+/// The workbook state around a structural edit whose inverse is not
+/// expressible as per-cell changes (row/column insert-delete, sheet rename,
+/// the table commands — Table Name, Resize Table, Convert to Range): sheets,
+/// defined names, the tables (live, and converted ones whose parts await the
+/// save), the PivotTables' sources, and a table rename to replay on the data
+/// model.
 #[derive(Clone)]
 struct WbSnapshot {
     sheets: Vec<gridcore::sheet::Sheet>,
     names: Vec<gridcore::sheet::DefinedName>,
+    /// Tables move with row edits and change with the table commands; the
+    /// converted ones keep their parts until a save.
+    tables: Vec<gridcore::sheet::Table>,
+    removed_tables: Vec<gridcore::sheet::RemovedTable>,
+    /// Each PivotTable's source: a table rename moves it.
+    pivot_sources: Vec<gridcore::pivot::PivotSource>,
+    /// A table rename (from, to) to replay on the data model when this
+    /// snapshot is restored. Model edits are not on the undo stack, so undo
+    /// renames the tables the *current* model names rather than putting back
+    /// a copy, which would take later model edits with it.
+    model_rename: Option<(String, String)>,
 }
 
 enum UndoAction {
@@ -1535,6 +1549,10 @@ enum PromptKind {
     SaveAs,
     RenameSheet,
     AddSheet,
+    /// Table Name: a new name for the table under the cursor.
+    RenameTable,
+    /// Resize Table: a new range (`A1:D20`) for the table under the cursor.
+    ResizeTable,
     /// `Sales[ProductID] = Products[ID]` — add a model relationship.
     Relate,
     /// `Total = SUM(Sales[Amount])` — add a model measure.
@@ -2514,22 +2532,15 @@ impl App {
         &mut self,
         op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<bool, String>,
     ) -> Result<bool, String> {
-        let before = WbSnapshot {
-            sheets: self.pkg.workbook.sheets.clone(),
-            names: self.pkg.workbook.defined_names.clone(),
-        };
+        let before = self.wb_snapshot();
         match op(&mut self.pkg.workbook) {
             Err(e) => {
-                self.pkg.workbook.sheets = before.sheets;
-                self.pkg.workbook.defined_names = before.names;
+                self.put_back(&before);
                 Err(e)
             }
             Ok(false) => Ok(false),
             Ok(true) => {
-                let after = WbSnapshot {
-                    sheets: self.pkg.workbook.sheets.clone(),
-                    names: self.pkg.workbook.defined_names.clone(),
-                };
+                let after = self.wb_snapshot();
                 self.undo.push(UndoAction::Structural { before, after });
                 self.redo.clear();
                 self.modified = true;
@@ -2541,33 +2552,106 @@ impl App {
     /// Snapshot-run-snapshot for structural edits (row/col ops, renames):
     /// the inverse isn't per-cell, so undo restores the whole grid state.
     fn structural(&mut self, op: impl FnOnce(&mut gridcore::sheet::Workbook)) {
-        let before = WbSnapshot {
-            sheets: self.pkg.workbook.sheets.clone(),
-            names: self.pkg.workbook.defined_names.clone(),
-        };
+        let infallible = self.try_structural(None, |wb| {
+            op(wb);
+            Ok(())
+        });
+        debug_assert!(infallible.is_ok());
+    }
+
+    /// [`Self::structural`] for an edit that can be refused: an `Err` leaves
+    /// the workbook as it was, with nothing on the undo stack. A table rename
+    /// passes `model_rename` (old, new): the data model follows it, and the
+    /// undo step replays it backwards (and redo forwards) on whatever the
+    /// model holds then.
+    fn try_structural(
+        &mut self,
+        model_rename: Option<(&str, &str)>,
+        op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut before = self.wb_snapshot();
         // A structural edit moves cells, so compare how many cells sit on
         // circles rather than where: a circle that merely moved is not new.
         let circles_before = self.engine.circular_refs().len();
-        op(&mut self.pkg.workbook);
+        if let Err(e) = op(&mut self.pkg.workbook) {
+            self.put_back(&before);
+            return Err(e);
+        }
+        let mut after = self.wb_snapshot();
+        if let Some((old, new)) = model_rename {
+            self.rename_table_in_model(old, new);
+            before.model_rename = Some((new.to_string(), old.to_string()));
+            after.model_rename = Some((old.to_string(), new.to_string()));
+        }
         self.rebuild_engine();
         if self.circles_shown() && self.engine.circular_refs().len() > circles_before {
             self.circle_warning_pending = true;
         }
-        let after = WbSnapshot {
-            sheets: self.pkg.workbook.sheets.clone(),
-            names: self.pkg.workbook.defined_names.clone(),
-        };
         self.undo.push(UndoAction::Structural { before, after });
         self.redo.clear();
         self.modified = true;
         self.clamp_cursor();
         self.cancel_cut();
+        Ok(())
+    }
+
+    /// The data model follows table `old` being renamed `new`: its
+    /// relationships' ends and its measures' formulas.
+    fn rename_table_in_model(&mut self, old: &str, new: &str) {
+        for r in &mut self.model_rels {
+            for table in [&mut r.from.0, &mut r.to.0] {
+                if table.eq_ignore_ascii_case(old) {
+                    *table = new.to_string();
+                }
+            }
+        }
+        let map = [(old.to_string(), new.to_string())];
+        for m in &mut self.model_measures {
+            if let Ok(ast) = gridcore::formula::parse(&m.formula) {
+                let out = gridcore::formula::rename_tables_in_expr(&ast, &map);
+                if out != ast {
+                    m.formula = gridcore::formula::to_string(&out);
+                }
+            }
+        }
+    }
+
+    /// The workbook state a structural undo step restores.
+    fn wb_snapshot(&self) -> WbSnapshot {
+        let wb = &self.pkg.workbook;
+        WbSnapshot {
+            sheets: wb.sheets.clone(),
+            names: wb.defined_names.clone(),
+            tables: wb.tables.clone(),
+            removed_tables: wb.removed_tables.clone(),
+            pivot_sources: wb.pivots.iter().map(|p| p.source.clone()).collect(),
+            model_rename: None,
+        }
+    }
+
+    /// Put `snap`'s workbook state back, without recalculating or touching
+    /// the data model (see [`Self::restore`]).
+    fn put_back(&mut self, snap: &WbSnapshot) {
+        let wb = &mut self.pkg.workbook;
+        wb.sheets = snap.sheets.clone();
+        wb.defined_names = snap.names.clone();
+        wb.tables = snap.tables.clone();
+        wb.removed_tables = snap.removed_tables.clone();
+        // Pivots aren't added or removed by a structural edit; if their count
+        // changed since, the sources no longer line up and stay as they are.
+        if wb.pivots.len() == snap.pivot_sources.len() {
+            for (p, source) in wb.pivots.iter_mut().zip(&snap.pivot_sources) {
+                p.source = source.clone();
+            }
+        }
     }
 
     fn restore(&mut self, snap: &WbSnapshot) {
         self.cancel_cut();
-        self.pkg.workbook.sheets = snap.sheets.clone();
-        self.pkg.workbook.defined_names = snap.names.clone();
+        self.put_back(snap);
+        if let Some((old, new)) = &snap.model_rename {
+            self.rename_table_in_model(old, new);
+        }
         self.rebuild_engine();
         self.clamp_cursor();
         self.modified = true;
@@ -4631,6 +4715,9 @@ impl App {
             RemoveDuplicates => self.remove_duplicates(),
             TextToColumns => self.open_text_to_columns(),
             FormatAsTable => self.format_as_table(),
+            TableName => self.table_name_act(),
+            ResizeTable => self.resize_table_act(),
+            ConvertToRange => self.convert_table_act(),
             Subtotal => self.subtotal(),
             GroupOutline => self.group_outline(false),
             UngroupOutline => self.group_outline(true),
@@ -5847,7 +5934,7 @@ impl App {
     /// is recorded only when a sheet actually changed, so a refusal or a
     /// no-op leaves the undo stack alone. A protected sheet refuses, as in
     /// Excel. `Err(())` when refused, else whether anything changed.
-    fn try_structural(
+    fn try_outline_edit(
         &mut self,
         op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<String, String>,
     ) -> Result<bool, ()> {
@@ -5856,14 +5943,10 @@ impl App {
                 Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
             return Err(());
         }
-        let before = WbSnapshot {
-            sheets: self.pkg.workbook.sheets.clone(),
-            names: self.pkg.workbook.defined_names.clone(),
-        };
+        let before = self.wb_snapshot();
         match op(&mut self.pkg.workbook) {
             Err(msg) => {
-                self.pkg.workbook.sheets = before.sheets;
-                self.pkg.workbook.defined_names = before.names;
+                self.put_back(&before);
                 self.status = Some(msg);
                 Err(())
             }
@@ -5873,10 +5956,7 @@ impl App {
                     return Ok(false);
                 }
                 self.rebuild_engine();
-                let after = WbSnapshot {
-                    sheets: self.pkg.workbook.sheets.clone(),
-                    names: self.pkg.workbook.defined_names.clone(),
-                };
+                let after = self.wb_snapshot();
                 self.undo.push(UndoAction::Structural { before, after });
                 self.redo.clear();
                 self.modified = true;
@@ -5920,7 +6000,7 @@ impl App {
             Axis::Rows => "row",
             Axis::Cols => "column",
         };
-        let _ = self.try_structural(|wb| {
+        let _ = self.try_outline_edit(|wb| {
             let sh = &mut wb.sheets[s];
             if ungroup {
                 outline::ungroup(sh, axis, a, b)
@@ -5948,7 +6028,7 @@ impl App {
         } else {
             outline::hide_detail
         };
-        let _ = self.try_structural(|wb| {
+        let _ = self.try_outline_edit(|wb| {
             let sh = &mut wb.sheets[s];
             let tries: &[(Axis, u32)] = if whole_cols {
                 &[(Axis::Cols, c)]
@@ -5975,7 +6055,7 @@ impl App {
         let (r1, c1, r2, c2) = self.selection();
         let area = ((r1, c1) != (r2, c2)).then(|| self.iter_selection());
         let s = self.sheet;
-        let _ = self.try_structural(|wb| {
+        let _ = self.try_outline_edit(|wb| {
             outline::auto_outline(&mut wb.sheets[s], area).map_err(|e| e.to_string())?;
             Ok("Outline created from the summary formulas".into())
         });
@@ -5983,7 +6063,7 @@ impl App {
 
     fn clear_outline(&mut self) {
         let s = self.sheet;
-        let _ = self.try_structural(|wb| {
+        let _ = self.try_outline_edit(|wb| {
             outline::clear_outline(&mut wb.sheets[s]).map_err(|e| e.to_string())?;
             Ok("Outline cleared".into())
         });
@@ -5992,7 +6072,7 @@ impl App {
     /// A level button: show levels below `n`.
     fn outline_show_level(&mut self, axis: Axis, n: u8) {
         let s = self.sheet;
-        let _ = self.try_structural(|wb| {
+        let _ = self.try_outline_edit(|wb| {
             outline::show_level(&mut wb.sheets[s], axis, n);
             Ok(format!("Showing outline level {n}"))
         });
@@ -6001,7 +6081,7 @@ impl App {
     /// A +/- button: collapse or expand that group.
     fn outline_toggle(&mut self, axis: Axis, g: outline::Group) {
         let s = self.sheet;
-        let _ = self.try_structural(|wb| {
+        let _ = self.try_outline_edit(|wb| {
             outline::toggle_group(&mut wb.sheets[s], axis, &g);
             Ok(if g.collapsed { "Expanded" } else { "Collapsed" }.into())
         });
@@ -6046,7 +6126,7 @@ impl App {
                 let Some(outlinedlg::Dialog::Subtotal(d)) = self.outline_dialog.clone() else {
                     return;
                 };
-                let done = self.try_structural(|wb| {
+                let done = self.try_outline_edit(|wb| {
                     let n = gridcore::edit::subtotal(wb, d.sheet, d.area, &opts)
                         .map_err(|e| e.to_string())?;
                     Ok(format!(
@@ -6063,7 +6143,7 @@ impl App {
                 let Some(outlinedlg::Dialog::Subtotal(d)) = self.outline_dialog.take() else {
                     return;
                 };
-                let _ = self.try_structural(|wb| {
+                let _ = self.try_outline_edit(|wb| {
                     let n = gridcore::edit::remove_subtotals(wb, d.sheet, d.area);
                     Ok(format!(
                         "Removed {n} subtotal row{}",
@@ -6075,7 +6155,7 @@ impl App {
                 let Some(outlinedlg::Dialog::Settings(d)) = self.outline_dialog.take() else {
                     return;
                 };
-                let _ = self.try_structural(|wb| {
+                let _ = self.try_outline_edit(|wb| {
                     wb.sheets[d.sheet].outline = o;
                     Ok("Outline settings changed".into())
                 });
@@ -6215,7 +6295,7 @@ impl App {
             .pkg
             .add_table(s, (r1, c1, r2, c2), has_header, "TableStyleMedium2")
         {
-            Some(i) => {
+            Ok(i) => {
                 // add_table rewrites package parts; existing undo snapshots no longer line up.
                 self.undo.clear();
                 self.redo.clear();
@@ -6231,8 +6311,91 @@ impl App {
                     }
                 ));
             }
-            None => self.status = Some("Format as Table failed".into()),
+            Err(why) => self.status = Some(format!("Format as Table: {why}")),
         }
+    }
+
+    /// The table under the cursor, by name.
+    fn table_here(&self) -> Option<String> {
+        self.pkg
+            .workbook
+            .table_at(self.sheet, self.cur.0, self.cur.1)
+            .map(|t| t.name.clone())
+    }
+
+    /// Run a table command on the table under the cursor, or say there is
+    /// none.
+    fn with_table_here(&mut self, f: impl FnOnce(&mut App, String)) {
+        match self.table_here() {
+            Some(name) => f(self, name),
+            None => self.status = Some("Select a cell in a table".into()),
+        }
+    }
+
+    /// Table Name: rename table `old`, every formula that uses it, and the
+    /// data model's relationships and measures that name it. One undo step.
+    fn rename_table(&mut self, old: &str, new: &str) -> Result<(), String> {
+        let cur = self
+            .pkg
+            .workbook
+            .table(old)
+            .map(|t| t.name.clone())
+            .ok_or_else(|| format!("There is no table named {old}"))?;
+        self.try_structural(Some((&cur, new)), |wb| {
+            gridcore::edit::rename_table(wb, &cur, new)
+        })
+    }
+
+    /// Resize Table: move table `name` onto `range` ("A1:D20"). One undo step.
+    fn resize_table(&mut self, name: &str, range: &str) -> Result<(), String> {
+        let rect = gridcore::sheet::parse_range_name(&range.replace('$', ""))
+            .ok_or_else(|| format!("\"{range}\" isn't a range"))?;
+        self.try_structural(None, |wb| gridcore::edit::resize_table(wb, name, rect))
+    }
+
+    /// Convert to Range: table `name` becomes plain cells. Refused while the
+    /// data model names it (a relationship or a measure), as gridcore refuses
+    /// it while a PivotTable does. One undo step; the table part leaves the
+    /// file at the next save.
+    fn convert_table(&mut self, name: &str) -> Result<(), String> {
+        let named = |t: &str| t.eq_ignore_ascii_case(name);
+        let by_rel = self
+            .model_rels
+            .iter()
+            .any(|r| named(&r.from.0) || named(&r.to.0));
+        let by_measure = self.model_measures.iter().any(|m| {
+            gridcore::formula::parse(&m.formula).is_ok_and(|ast| {
+                let (mut refs, mut names) = (Vec::new(), Vec::new());
+                gridcore::formula::collect_structured(&ast, &mut refs);
+                gridcore::formula::collect_names(&ast, &mut names);
+                refs.iter().any(|r| r.0.as_deref().is_some_and(named))
+                    || names.iter().any(|n| named(n))
+            })
+        });
+        if by_rel || by_measure {
+            return Err(format!("The data model uses {name}"));
+        }
+        self.try_structural(None, |wb| gridcore::edit::convert_table_to_range(wb, name))
+    }
+
+    /// The ribbon's Table Name…: prompt for a new name.
+    fn table_name_act(&mut self) {
+        self.with_table_here(|app, _| app.open_prompt(PromptKind::RenameTable));
+    }
+
+    /// The ribbon's Resize Table…: prompt for the new range.
+    fn resize_table_act(&mut self) {
+        self.with_table_here(|app, _| app.open_prompt(PromptKind::ResizeTable));
+    }
+
+    /// The ribbon's Convert to Range.
+    fn convert_table_act(&mut self) {
+        self.with_table_here(|app, name| {
+            app.status = Some(match app.convert_table(&name) {
+                Ok(()) => format!("Converted {name} to a range"),
+                Err(why) => why,
+            });
+        });
     }
 
     /// AutoFilter: hide the rows of the current region whose cursor-column value
@@ -6817,6 +6980,18 @@ impl App {
                 "New sheet name: ",
                 format!("Sheet{}", self.pkg.workbook.sheets.len() + 1),
             ),
+            PromptKind::RenameTable => ("Table name: ", self.table_here().unwrap_or_default()),
+            PromptKind::ResizeTable => {
+                let here = self
+                    .pkg
+                    .workbook
+                    .table_at(self.sheet, self.cur.0, self.cur.1);
+                let range = here.map(|t| {
+                    let (r1, c1, r2, c2) = t.range;
+                    format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2))
+                });
+                ("Resize table to: ", range.unwrap_or_default())
+            }
             PromptKind::Relate => ("Relate  From[Col] = To[Col]: ", String::new()),
             PromptKind::Measure => ("Measure  Name = FORMULA: ", String::new()),
             PromptKind::ModelPivot => ("Report  Base; rows; values[; cols]: ", String::new()),
@@ -6904,6 +7079,22 @@ impl App {
                     self.status = Some(format!("Renamed sheet to {text}"));
                 } else {
                     self.status = Some("Invalid sheet name".to_string());
+                }
+            }
+            PromptKind::RenameTable => {
+                if let Some(old) = self.table_here() {
+                    self.status = Some(match self.rename_table(&old, &text) {
+                        Ok(()) => format!("Renamed table {old} to {text}"),
+                        Err(why) => why,
+                    });
+                }
+            }
+            PromptKind::ResizeTable => {
+                if let Some(name) = self.table_here() {
+                    self.status = Some(match self.resize_table(&name, &text) {
+                        Ok(()) => format!("Resized {name} to {}", text.to_uppercase()),
+                        Err(why) => why,
+                    });
                 }
             }
             PromptKind::Relate => {
@@ -16693,5 +16884,245 @@ mod tests {
         assert_eq!(bs.option_int("edit_fixed_decimal_places"), Some(3));
         assert_eq!(bs.option_choice("edit_move_direction"), Some(3));
         assert_eq!(bs.option_check("edit_in_cell"), Some(false));
+    }
+}
+
+#[cfg(test)]
+mod table_command_tests {
+    use super::*;
+    use gridcore::edit::parse_input;
+    use gridcore::sheet::Cell;
+
+    /// Item/Qty over A1:B3 as `Table1`, `=SUM(Table1[Qty])` in D1, the
+    /// cursor inside the table.
+    fn app_with_table() -> App {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        {
+            let sh = &mut app.pkg.workbook.sheets[0];
+            sh.set_cell(0, 0, Cell::text("Item"));
+            sh.set_cell(0, 1, Cell::text("Qty"));
+            sh.set_cell(1, 0, Cell::text("Pen"));
+            sh.set_cell(1, 1, Cell::number(3.0));
+            sh.set_cell(2, 0, Cell::text("Pad"));
+            sh.set_cell(2, 1, Cell::number(5.0));
+        }
+        app.rebuild_engine();
+        app.cur = (1, 0);
+        app.anchor = None;
+        app.format_as_table();
+        assert_eq!(app.pkg.workbook.tables[0].name, "Table1");
+        app.apply_on(0, vec![(0, 3, parse_input("=SUM(Table1[Qty])"))]);
+        app.cur = (1, 0);
+        app.status = None;
+        app
+    }
+
+    fn formula(app: &App, r: u32, c: u32) -> Option<String> {
+        app.sheet().cell(r, c).and_then(|cl| cl.formula.clone())
+    }
+
+    fn value(app: &App, r: u32, c: u32) -> CellValue {
+        app.sheet()
+            .cell(r, c)
+            .map(|cl| cl.value.clone())
+            .unwrap_or_default()
+    }
+
+    fn type_prompt(app: &mut App, text: &str) {
+        app.prompt.as_mut().expect("a prompt").text = text.to_string();
+        app.commit_prompt();
+    }
+
+    #[test]
+    fn table_commands_need_a_cell_in_a_table() {
+        let mut app = app_with_table();
+        app.cur = (5, 5);
+        for act in [
+            ribbon::Act::TableName,
+            ribbon::Act::ResizeTable,
+            ribbon::Act::ConvertToRange,
+        ] {
+            app.status = None;
+            app.ribbon_act(act);
+            assert_eq!(app.status.as_deref(), Some("Select a cell in a table"));
+            assert!(app.prompt.is_none());
+        }
+        assert_eq!(app.pkg.workbook.tables.len(), 1);
+    }
+
+    #[test]
+    fn table_name_renames_the_table_and_its_users_in_one_undo_step() {
+        let mut app = app_with_table();
+        app.model_measures.push(gridcore::model::Measure {
+            name: "Total".into(),
+            formula: "SUM(Table1[Qty])".into(),
+        });
+        app.model_rels.push(Relationship {
+            from: ("Table1".into(), "Item".into()),
+            to: ("Items".into(), "Item".into()),
+        });
+        app.ribbon_act(ribbon::Act::TableName);
+        assert_eq!(app.prompt.as_ref().unwrap().text, "Table1");
+        type_prompt(&mut app, "Sales");
+        assert_eq!(app.status.as_deref(), Some("Renamed table Table1 to Sales"));
+        assert_eq!(app.pkg.workbook.tables[0].name, "Sales");
+        assert_eq!(formula(&app, 0, 3).as_deref(), Some("SUM(Sales[Qty])"));
+        assert_eq!(value(&app, 0, 3), CellValue::Number(8.0));
+        assert_eq!(app.model_measures[0].formula, "SUM(Sales[Qty])");
+        assert_eq!(app.model_rels[0].from.0, "Sales");
+
+        app.undo();
+        assert_eq!(app.pkg.workbook.tables[0].name, "Table1");
+        assert_eq!(formula(&app, 0, 3).as_deref(), Some("SUM(Table1[Qty])"));
+        assert_eq!(app.model_measures[0].formula, "SUM(Table1[Qty])");
+        assert_eq!(app.model_rels[0].from.0, "Table1");
+        app.redo();
+        assert_eq!(app.pkg.workbook.tables[0].name, "Sales");
+        assert_eq!(app.model_rels[0].from.0, "Sales");
+    }
+
+    #[test]
+    fn undoing_a_rename_keeps_later_model_edits() {
+        let mut app = app_with_table();
+        app.model_rels.push(Relationship {
+            from: ("Table1".into(), "Item".into()),
+            to: ("Items".into(), "Item".into()),
+        });
+        app.rename_table("Table1", "Sales").unwrap();
+        // Model edits are not undo steps: one added, one removed.
+        app.model_measures.push(gridcore::model::Measure {
+            name: "Total".into(),
+            formula: "SUM(Sales[Qty])".into(),
+        });
+        app.model_rels.clear();
+        app.undo();
+        assert_eq!(app.pkg.workbook.tables[0].name, "Table1");
+        assert_eq!(app.model_measures.len(), 1, "the later measure stays");
+        assert_eq!(app.model_measures[0].formula, "SUM(Table1[Qty])");
+        assert!(
+            app.model_rels.is_empty(),
+            "the removed relationship stays gone"
+        );
+        app.redo();
+        assert_eq!(app.model_measures[0].formula, "SUM(Sales[Qty])");
+    }
+
+    #[test]
+    fn undoing_a_rename_puts_the_pivot_source_back() {
+        let mut app = app_with_table();
+        let frame = gridcore::frame::Frame::from_range(&app.pkg.workbook, 0, (0, 0, 2, 1));
+        let dest = app.pkg.add_sheet("Pivot");
+        app.pkg
+            .add_pivot(
+                gridcore::pivot::PivotSource::Table("Table1".into()),
+                frame.names.clone(),
+                gridcore::pivot::DataField {
+                    name: "Sum of Qty".into(),
+                    field: 1,
+                    agg: gridcore::frame::Agg::Sum,
+                },
+                dest,
+                (2, 0),
+            )
+            .unwrap();
+        app.rebuild_engine();
+        app.rename_table("Table1", "Sales").unwrap();
+        let source = |app: &App| app.pkg.workbook.pivots[0].source.clone();
+        assert_eq!(
+            source(&app),
+            gridcore::pivot::PivotSource::Table("Sales".into())
+        );
+        app.undo();
+        assert_eq!(
+            source(&app),
+            gridcore::pivot::PivotSource::Table("Table1".into())
+        );
+        let err = app.convert_table("Table1").unwrap_err();
+        assert!(err.contains("uses this table"), "{err}");
+    }
+
+    #[test]
+    fn table_name_shows_why_a_name_is_refused() {
+        let mut app = app_with_table();
+        let steps = app.undo.len();
+        app.ribbon_act(ribbon::Act::TableName);
+        type_prompt(&mut app, "B2");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("\"B2\" looks like a cell reference")
+        );
+        assert_eq!(app.pkg.workbook.tables[0].name, "Table1");
+        assert_eq!(app.undo.len(), steps, "a refusal is no undo step");
+    }
+
+    #[test]
+    fn resize_table_prefills_the_range_and_resizes() {
+        let mut app = app_with_table();
+        app.ribbon_act(ribbon::Act::ResizeTable);
+        assert_eq!(app.prompt.as_ref().unwrap().text, "A1:B3");
+        type_prompt(&mut app, "a1:c4");
+        assert_eq!(app.status.as_deref(), Some("Resized Table1 to A1:C4"));
+        let t = &app.pkg.workbook.tables[0];
+        assert_eq!(t.range, (0, 0, 3, 2));
+        assert_eq!(t.columns, vec!["Item", "Qty", "Column3"]);
+        assert_eq!(value(&app, 0, 2), CellValue::Text("Column3".into()));
+        app.undo();
+        assert_eq!(app.pkg.workbook.tables[0].range, (0, 0, 2, 1));
+        assert_eq!(app.sheet().cell(0, 2).map(|c| c.value.clone()), None);
+
+        app.ribbon_act(ribbon::Act::ResizeTable);
+        type_prompt(&mut app, "D10:E12");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("The header row must stay in row 1")
+        );
+        app.ribbon_act(ribbon::Act::ResizeTable);
+        type_prompt(&mut app, "nonsense");
+        assert_eq!(app.status.as_deref(), Some("\"nonsense\" isn't a range"));
+        assert_eq!(app.pkg.workbook.tables[0].range, (0, 0, 2, 1));
+    }
+
+    #[test]
+    fn convert_to_range_then_undo_saves_the_table_again() {
+        let mut app = app_with_table();
+        app.ribbon_act(ribbon::Act::ConvertToRange);
+        assert_eq!(app.status.as_deref(), Some("Converted Table1 to a range"));
+        assert!(app.pkg.workbook.tables.is_empty());
+        assert_eq!(formula(&app, 0, 3).as_deref(), Some("SUM($B$2:$B$3)"));
+        assert_eq!(value(&app, 0, 3), CellValue::Number(8.0));
+        let saved = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&app.pkg)).unwrap();
+        assert!(saved.workbook.tables.is_empty());
+
+        app.undo();
+        assert_eq!(app.pkg.workbook.tables.len(), 1);
+        let re = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&app.pkg)).unwrap();
+        assert_eq!(re.workbook.tables.len(), 1);
+        assert_eq!(
+            re.workbook.sheets[0].cell(0, 3).unwrap().formula.as_deref(),
+            Some("SUM(Table1[Qty])")
+        );
+    }
+
+    #[test]
+    fn convert_to_range_is_refused_while_the_data_model_uses_the_table() {
+        let mut app = app_with_table();
+        app.model_measures.push(gridcore::model::Measure {
+            name: "Total".into(),
+            formula: "SUM(table1[Qty])".into(),
+        });
+        app.ribbon_act(ribbon::Act::ConvertToRange);
+        assert_eq!(app.status.as_deref(), Some("The data model uses Table1"));
+        assert_eq!(app.pkg.workbook.tables.len(), 1);
+    }
+
+    #[test]
+    fn undo_of_a_row_insert_puts_the_table_back() {
+        let mut app = app_with_table();
+        app.cur = (0, 0);
+        app.row_op(true);
+        assert_eq!(app.pkg.workbook.tables[0].range, (1, 0, 3, 1));
+        app.undo();
+        assert_eq!(app.pkg.workbook.tables[0].range, (0, 0, 2, 1));
     }
 }

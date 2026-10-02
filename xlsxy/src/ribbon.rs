@@ -55,6 +55,10 @@ pub enum Act {
     RemoveDuplicates,
     TextToColumns,
     FormatAsTable,
+    /// Table Design commands on the table under the cursor.
+    TableName,
+    ResizeTable,
+    ConvertToRange,
     /// Data ▸ Outline.
     Subtotal,
     GroupOutline,
@@ -283,6 +287,21 @@ fn insert_groups() -> Vec<Group> {
                     "Format the region as an Excel Table",
                 )],
                 vec![btn("PivotTable", Todo("PivotTable"), "Insert a PivotTable")],
+            ],
+        },
+        Group {
+            title: "Table",
+            width: 24,
+            rows: [
+                vec![
+                    btn("✎ Name", TableName, "Rename the table under the cursor"),
+                    btn("⤡ Resize", ResizeTable, "Resize the table under the cursor"),
+                ],
+                vec![btn(
+                    "Convert to Range",
+                    ConvertToRange,
+                    "Turn the table under the cursor into plain cells",
+                )],
             ],
         },
         Group {
