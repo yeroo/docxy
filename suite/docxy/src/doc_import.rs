@@ -46,6 +46,23 @@ pub(super) const COMPAT_SUFFIX: &str = " [Compatibility Mode]";
 /// the Save As dialog.
 pub(super) const IMPORTED_HARNESS: &str = "This document was imported from a Word 97-2003 file and saves as .docx, and a harness instance cannot open the Save As dialog; use the harness save-as verb";
 
+/// What a harness instance says when Save of a document bound to a `.doc` or
+/// `.dot` path (not an import: a `.docx` named so) needs the Save As dialog.
+pub(super) const BINARY_PATH_HARNESS: &str = "Word 97-2003 files (.doc, .dot) cannot be written, and a harness instance cannot open the Save As dialog; use the harness save-as verb to save as .docx";
+
+/// Why a harness instance refuses a Save that needs the Save As dialog,
+/// by its cause: the tab was imported from a Word 97-2003 file, it was
+/// never saved, or its path is a `.doc`/`.dot` that nothing writes.
+pub(super) fn harness_save_refusal(tab: &DocTab) -> &'static str {
+    if tab.import.binary_source {
+        IMPORTED_HARNESS
+    } else if tab.path.is_none() {
+        super::DOC_NEVER_SAVED_HARNESS
+    } else {
+        BINARY_PATH_HARNESS
+    }
+}
+
 /// The status of a save refused because its target is a Word 97-2003 file.
 pub(super) const BINARY_TARGET_REFUSED: &str =
     "Word 97-2003 files (.doc, .dot) cannot be written: save as .docx";

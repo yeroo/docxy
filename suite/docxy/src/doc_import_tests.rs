@@ -3,8 +3,9 @@
 //! original, Convert, and the session round trip.
 
 use crate::doc_import::{
-    self, BINARY_TARGET_REFUSED, COMPAT_SUFFIX, DocImport, IMPORTED_STATUS, IN_PLACE_REFUSED,
-    SOURCE_TARGET_REFUSED, convert_tab, is_binary_doc_path, save_dir, save_name,
+    self, BINARY_PATH_HARNESS, BINARY_TARGET_REFUSED, COMPAT_SUFFIX, DocImport, IMPORTED_STATUS,
+    IN_PLACE_REFUSED, SOURCE_TARGET_REFUSED, convert_tab, harness_save_refusal, is_binary_doc_path,
+    save_dir, save_name,
 };
 use crate::open_mode_tests::Scratch;
 use crate::{
@@ -429,4 +430,37 @@ fn a_word_made_doc_opens_imported() {
         _ => false,
     });
     assert!(bold, "{}", text_of(&tab));
+}
+
+/// FIX r2 m3: a harness instance's refusal of Save names its cause: an
+/// import, a document never saved, or a `.docx` named `.doc` (not an
+/// import, but a path nothing writes).
+#[test]
+fn harness_save_refusal_names_its_cause() {
+    let dir = Scratch::new();
+    let imported = tab_from_path(&write_doc(&dir, "Report.doc"));
+    assert_eq!(
+        harness_save_refusal(&imported),
+        doc_import::IMPORTED_HARNESS
+    );
+
+    let misnamed = dir.path("misnamed.doc");
+    let pkg = docxcore::package::new_package(docxcore::markdown::from_markdown("Hi\n"));
+    std::fs::write(&misnamed, docxcore::package::save_package(&pkg)).unwrap();
+    let mut tab = tab_from_path(&misnamed);
+    assert_eq!(tab.import, DocImport::default());
+    assert_eq!(
+        doc_save_target(tab.path.as_deref(), false, true),
+        DocSaveTarget::RefuseHarness
+    );
+    assert_eq!(harness_save_refusal(&tab), BINARY_PATH_HARNESS);
+    for message in [doc_import::IMPORTED_HARNESS, BINARY_PATH_HARNESS] {
+        assert!(
+            message.contains("use the harness save-as verb"),
+            "{message}"
+        );
+    }
+
+    tab.path = None;
+    assert_eq!(harness_save_refusal(&tab), crate::DOC_NEVER_SAVED_HARNESS);
 }

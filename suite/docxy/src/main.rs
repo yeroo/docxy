@@ -13973,12 +13973,7 @@ impl Docxy {
                 // ⚠️ Never in a harness instance: `rfd` runs its own modal loop on
                 // this thread and stops the control pump dead (see `save_sheet_tab`).
                 DocSaveTarget::RefuseHarness => {
-                    self.tabs[self.active].status = if tab.path.is_some() {
-                        doc_import::IMPORTED_HARNESS
-                    } else {
-                        DOC_NEVER_SAVED_HARNESS
-                    }
-                    .into();
+                    self.tabs[self.active].status = doc_import::harness_save_refusal(tab).into();
                     self.refocus(window, cx);
                     return false;
                 }
