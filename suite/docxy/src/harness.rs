@@ -917,18 +917,12 @@ fn pointer_drag_path(from: Point<Pixels>, to: Point<Pixels>) -> Vec<Point<Pixels
 
 /// Which more-tabs item's recorded bounds contain `p` — the drift guard a
 /// `pointer-click` reply reports, or -1 when the point is over no item.
-/// Candidates come from the frame that is on screen (`next`), falling back
-/// to the finished one only when nothing has been recorded since the
-/// rotation: that is the frame gpui hit-tests dispatched input against, and
-/// an item the on-screen frame no longer records is not reported (FIX r3
-/// m3).
+/// Candidates come from the frame that is on screen (`Probes::
+/// on_screen_frame`) — the frame gpui hit-tests dispatched input against.
+/// An item the on-screen frame no longer records is not reported (FIX r3 m3).
 fn item_at_point(probes: &crate::Probes, p: Point<Pixels>) -> i64 {
-    let frame = if probes.next.is_empty() {
-        &probes.last
-    } else {
-        &probes.next
-    };
-    frame
+    probes
+        .on_screen_frame()
         .iter()
         .find_map(|(name, bounds)| {
             name.strip_prefix("tab-more-item:")

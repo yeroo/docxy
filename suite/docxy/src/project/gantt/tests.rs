@@ -423,16 +423,16 @@ fn regions_use_body_origin_clip_both_axes_and_reject_hidden_bars() {
         ..Probes::default()
     };
     assert_eq!(
-        project_region(&v, &probes, harness::Region::Gantt).unwrap(),
+        project_region(&v, &probes, harness::Region::Gantt, Probes::get).unwrap(),
         rect(416., 80., 378., 400.)
     );
     assert!(
-        project_region(&v, &probes, harness::Region::Bar(1))
+        project_region(&v, &probes, harness::Region::Bar(1), Probes::get)
             .unwrap_err()
             .contains("row is not rendered")
     );
     assert!(
-        project_region(&v, &probes, harness::Region::Bar(99))
+        project_region(&v, &probes, harness::Region::Bar(99), Probes::get)
             .unwrap_err()
             .contains("no task")
     );
@@ -440,7 +440,7 @@ fn regions_use_body_origin_clip_both_axes_and_reject_hidden_bars() {
         .last
         .push(("bar:1".into(), rect(400., 75., 40., 14.)));
     assert_eq!(
-        project_region(&v, &probes, harness::Region::Bar(1)).unwrap(),
+        project_region(&v, &probes, harness::Region::Bar(1), Probes::get).unwrap(),
         rect(416., 80., 24., 9.)
     );
     for r in [
@@ -453,7 +453,7 @@ fn regions_use_body_origin_clip_both_axes_and_reject_hidden_bars() {
     ] {
         probes.last[1].1 = r;
         assert!(
-            project_region(&v, &probes, harness::Region::Bar(1))
+            project_region(&v, &probes, harness::Region::Bar(1), Probes::get)
                 .unwrap_err()
                 .contains("outside")
         );
@@ -471,7 +471,7 @@ fn scrollbar_regions_are_their_probed_strips() {
         harness::Region::ProjectVbar,
     ] {
         assert!(
-            project_region(&v, &probes, region)
+            project_region(&v, &probes, region, Probes::get)
                 .unwrap_err()
                 .contains("has not been laid out")
         );
@@ -482,15 +482,15 @@ fn scrollbar_regions_are_their_probed_strips() {
         ("project-vbar".into(), rect(794., 80., 16., 400.)),
     ];
     assert_eq!(
-        project_region(&v, &probes, harness::Region::ProjectHbarTable).unwrap(),
+        project_region(&v, &probes, harness::Region::ProjectHbarTable, Probes::get).unwrap(),
         rect(10., 480., 400., 16.)
     );
     assert_eq!(
-        project_region(&v, &probes, harness::Region::ProjectHbarChart).unwrap(),
+        project_region(&v, &probes, harness::Region::ProjectHbarChart, Probes::get).unwrap(),
         rect(416., 480., 378., 16.)
     );
     assert_eq!(
-        project_region(&v, &probes, harness::Region::ProjectVbar).unwrap(),
+        project_region(&v, &probes, harness::Region::ProjectVbar, Probes::get).unwrap(),
         rect(794., 80., 16., 400.)
     );
 }
@@ -502,19 +502,19 @@ fn the_timeline_region_is_its_probe_while_shown() {
     let mut probes = Probes::default();
     let region = harness::Region::ProjectTimeline;
     assert!(
-        project_region(&v, &probes, region)
+        project_region(&v, &probes, region, Probes::get)
             .unwrap_err()
             .contains("has not been laid out")
     );
     probes.last = vec![("project-timeline".into(), rect(0., 60., 800., 84.))];
     assert_eq!(
-        project_region(&v, &probes, region).unwrap(),
+        project_region(&v, &probes, region, Probes::get).unwrap(),
         rect(0., 60., 800., 84.)
     );
     // Hidden, a probe left over from the last shown frame must not answer.
     v.timeline = false;
     assert!(
-        project_region(&v, &probes, region)
+        project_region(&v, &probes, region, Probes::get)
             .unwrap_err()
             .contains("the Timeline is hidden")
     );

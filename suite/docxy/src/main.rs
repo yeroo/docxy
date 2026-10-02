@@ -2628,6 +2628,18 @@ impl Probes {
             .or_else(|| self.get(name))
     }
 
+    /// The frame that is on screen: `next`, or — only when nothing has been
+    /// recorded since the rotation — the finished frame before it. Input
+    /// that hit-tests the displayed frame (dispatched pointer events)
+    /// reasons over this whole list, never per-name against a staler one.
+    fn on_screen_frame(&self) -> &[(String, Bounds<Pixels>)] {
+        if self.next.is_empty() {
+            &self.last
+        } else {
+            &self.next
+        }
+    }
+
     /// Like `current`, but for input that hit-tests the frame on screen: the
     /// `next` frame alone, refusing a region that has vanished from it. The
     /// `last` fallback applies only when `next` is entirely empty — nothing
@@ -2636,11 +2648,10 @@ impl Probes {
     /// `current`'s per-name fallback stays for callers that only read
     /// geometry, like split-menu anchoring.
     fn on_screen(&self, name: &str) -> Option<Bounds<Pixels>> {
-        if self.next.is_empty() {
-            self.get(name)
-        } else {
-            self.next.iter().find(|(n, _)| n == name).map(|(_, b)| *b)
-        }
+        self.on_screen_frame()
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, b)| *b)
     }
 }
 
@@ -7253,10 +7264,11 @@ fn window_frame_borders(window: &Window) -> Edges<f32> {
 /// shadows are its padding and each untiled edge adds a snapped inner border.
 /// The pinned TitleBar separately adds left padding and a fullscreen inset.
 fn title_bar_geometry(window: &Window) -> f32 {
-    // Workaround for gpui-component's TitleBar `#bar` being flex_shrink_0
-    // (suite/docs/upstream-gpui-component-titlebar.md, #545): a definite
-    // content width keeps a wide strip from pushing the window controls
-    // off-screen. Simplify once a pin bump ships the upstream fix.
+    // Workaround for gpui-component's TitleBar `#bar` having no min_w_0
+    // (suite/docs/upstream-gpui-component-titlebar.md, #545): its automatic
+    // minimum size is the content width, so giving the strip a definite
+    // content width here keeps a wide strip from pushing the window
+    // controls off-screen. Simplify once a pin bump ships the upstream fix.
     #[cfg(target_os = "macos")]
     const TITLE_LEFT_PAD: f32 = 80.0;
     #[cfg(not(target_os = "macos"))]
@@ -8946,14 +8958,14 @@ impl Docxy {
             | Region::ProjectHbarChart
             | Region::ProjectVbar
             | Region::ProjectTimeline
-            | Region::ProjectSplit => self.project_region_bounds(region),
+            | Region::ProjectSplit => self.project_region_bounds(region, lookup),
             Region::Grid => self.grid_bounds(),
             Region::Gallery => lookup(&self.probes.borrow(), "gallery").ok_or_else(|| {
                 "the Styles gallery is not shown (it is on a document's Home tab, with the ribbon expanded)"
                     .to_string()
             }),
             Region::Cells(_, _, _, _) if self.active_is_project() => {
-                self.project_region_bounds(region)
+                self.project_region_bounds(region, lookup)
             }
             Region::Cells(r0, c0, r1, c1) => self.cells_bounds((r0, c0), (r1, c1)),
             Region::ChartPanel => lookup(&self.probes.borrow(), "chart-panel")

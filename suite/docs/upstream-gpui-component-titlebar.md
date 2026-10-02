@@ -24,25 +24,29 @@ h_flex()
 
 ## Defect
 
-`#bar` combines `flex_1()` with `flex_shrink_0()`. Disabling shrink means the
-bar's flex base size is its **content width**; with no `min_w_0()` its automatic
-minimum size is also the content width. Any content wider than the free space —
-e.g. a tab strip with many document tabs — overflows the title bar instead of
-shrinking, and the trailing `WindowControls` child (itself `flex_shrink_0()`, so
-it never yields) is pushed past the window's right edge. The minimize/maximize/
-close buttons end up off-screen and unreachable.
+`#bar` is declared `.flex_shrink_0().flex_1()`, but in gpui `flex_1()` sets
+grow 1, shrink 1, basis 0% — so the earlier `flex_shrink_0()` is dead and the
+bar can in principle shrink. What it cannot do is shrink below its
+**automatic minimum size**: with no `min_w_0()`, the flex item's min-width
+resolves to its content's min-content width. Any content wider than the free
+space — e.g. a tab strip with many document tabs — makes `#bar` overflow the
+title bar instead of shrinking, and the trailing `WindowControls` child
+(itself `flex_shrink_0()`, so it never yields) is pushed past the window's
+right edge. The minimize/maximize/close buttons end up off-screen and
+unreachable.
 
 ## Proposed fix
 
-Let `#bar` shrink and clip:
+Give `#bar` a zero automatic minimum and let excess content clip:
 
 ```rust
 .min_w_0()
 .overflow_hidden()
 ```
 
-`flex_1()` then sizes it within the free space and excess content clips (or the
-content scrolls/manages its own overflow), while `WindowControls` stays visible.
+`flex_1()` then sizes it within the free space and `WindowControls` stays
+visible. Removing the dead `flex_shrink_0()` from the declaration is cleanup
+the same change can carry.
 
 ## How docxy works around it (and what a fix unblocks)
 

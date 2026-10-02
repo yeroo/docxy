@@ -409,15 +409,19 @@ pub(super) fn indent_project(tab: &mut DocTab, delta: i32) {
 }
 
 impl Docxy {
+    /// Project regions resolve their probes through the same `lookup`
+    /// `region_bounds_with` was given (`get` for rect/shot, `on_screen` for
+    /// pointer verbs).
     pub(super) fn project_region_bounds(
         &self,
         region: harness::Region,
+        lookup: fn(&Probes, &str) -> Option<Bounds<Pixels>>,
     ) -> Result<Bounds<Pixels>, String> {
         let Some(Surface::Project(v)) = self.tabs.get(self.active).map(|t| &t.surface) else {
             return Err("the active tab is not a loaded Project".into());
         };
         let probes = self.probes.borrow();
-        project_region(v, &probes, region)
+        project_region(v, &probes, region, lookup)
     }
 }
 
@@ -425,14 +429,14 @@ fn project_region(
     v: &ProjectView,
     probes: &Probes,
     region: harness::Region,
+    lookup: fn(&Probes, &str) -> Option<Bounds<Pixels>>,
 ) -> Result<Bounds<Pixels>, String> {
     // The strips are probed under their region names; they need no Gantt viewport.
     if let harness::Region::ProjectTimeline = region {
         if !v.timeline {
             return Err("the Timeline is hidden (View > Split View > Timeline)".into());
         }
-        return probes
-            .get(&harness::region_name(region))
+        return lookup(probes, &harness::region_name(region))
             .ok_or_else(|| "the Timeline has not been laid out".into());
     }
     if let harness::Region::ProjectHbarTable
@@ -440,18 +444,14 @@ fn project_region(
     | harness::Region::ProjectVbar = region
     {
         let name = harness::region_name(region);
-        return probes
-            .get(&name)
+        return lookup(probes, &name)
             .ok_or_else(|| format!("the {name} scrollbar has not been laid out"));
     }
     if let harness::Region::ProjectSplit = region {
-        return probes
-            .get(&harness::region_name(region))
+        return lookup(probes, &harness::region_name(region))
             .ok_or_else(|| "the split bar has not been laid out".into());
     }
-    let body = probes
-        .get("project-body")
-        .ok_or("the Project body has not been laid out")?;
+    let body = lookup(probes, "project-body").ok_or("the Project body has not been laid out")?;
     let viewport =
         gantt_viewport(body, v.table_w, v.gantt_w).ok_or("the Gantt viewport is empty")?;
     match region {
@@ -465,8 +465,7 @@ fn project_region(
                 Some(ShownRow::Entry) => "entry".into(),
                 None => return Err("No task at this row".into()),
             };
-            let cell = probes
-                .get(&format!("project-cell:{row}:{c0}"))
+            let cell = lookup(probes, &format!("project-cell:{row}:{c0}"))
                 .ok_or("Project cell is not rendered")?;
             // The absolute probe fills the padding box; include the cell's 1px border.
             let cell = Bounds {
@@ -490,8 +489,7 @@ fn project_region(
             if gantt_bar(&v.ed, task, v.scale).is_none() {
                 return Err(format!("task {id} has no schedule result"));
             }
-            let bar = probes
-                .get(&format!("bar:{id}"))
+            let bar = lookup(probes, &format!("bar:{id}"))
                 .ok_or_else(|| format!("task {id} row is not rendered (scrolled out of view)"))?;
             intersect(bar, viewport)
                 .ok_or_else(|| format!("task {id} bar is outside the Gantt viewport"))
