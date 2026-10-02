@@ -24,6 +24,7 @@
 //! | `doc.save` | — | `{path, …}` |
 //! | `doc.reload` | — | `{path, …}` |
 //! | `doc.open` | `{path}` | `{path, …}` |
+//! | `doc.compare` | `{original, revised}` | `{path, insertions, deletions, skipped:[{kind, …}]}` — opens a new unsaved `Compare Result N.docx`; refuses while the open document has unsaved changes |
 //! | `doc.export` | `{format:"markdown"\|"text"}` | `{format, text}` — the live buffer |
 //! | `doc.comments` | — | `{comments:[{id,author,initials,date,text,anchor}]}` |
 //! | `doc.notes` | — | `{notes:[{id,kind:"footnote"\|"endnote",text}]}` |
@@ -46,6 +47,7 @@ use crate::{
 };
 use ctlcore::json::Json;
 use docxcore::agent;
+use docxcore::compare::CompareSkip;
 use docxcore::editor::RevisionLocation;
 use docxcore::export::to_pdf;
 use docxcore::model::{Block, RevisionCategory, RevisionTarget};
@@ -145,6 +147,7 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
             app.open_path(Path::new(&p))?;
             Ok(path_info(app))
         }
+        "doc.compare" => compare(app, args),
         other => Err(format!("unknown verb '{other}'")),
     };
     // Any successful control interaction repaints the view; the edit verbs
@@ -456,7 +459,7 @@ fn revision_location_json(location: &RevisionLocation, current: bool) -> Json {
         fields.push(("parent", Json::Str(parent.0.to_string())));
     }
     match &address.category {
-        RevisionCategory::Inline(_) => {}
+        RevisionCategory::Inline(_) | RevisionCategory::ParagraphMark(_) => {}
         RevisionCategory::Property(scope) => {
             fields.push(("scope", Json::Str(property_scope_name(*scope).to_string())));
         }
@@ -981,6 +984,48 @@ fn export_pdf(app: &App, args: &Json) -> Result<Json, String> {
         "path",
         Json::Str(abs.display().to_string()),
     )]))
+}
+
+/// `doc.compare`: Review ▸ Compare in the running docxy. Like `doc.open` it
+/// changes which document is open rather than editing it, so it is not a
+/// protected mutation; unlike `doc.open` it never discards unsaved changes.
+fn compare(app: &mut App, args: &Json) -> Result<Json, String> {
+    let original = args
+        .get_str("original")
+        .ok_or("doc.compare needs an 'original' path")?
+        .to_string();
+    let revised = args
+        .get_str("revised")
+        .ok_or("doc.compare needs a 'revised' path")?
+        .to_string();
+    let summary = app.compare_paths(&original, &revised, false)?;
+    Ok(Json::obj(vec![
+        ("path", Json::Str(summary.path)),
+        ("insertions", Json::Num(summary.insertions as f64)),
+        ("deletions", Json::Num(summary.deletions as f64)),
+        (
+            "skipped",
+            Json::Arr(summary.skipped.iter().map(compare_skip_json).collect()),
+        ),
+    ]))
+}
+
+/// One skipped item: `{"kind":"table","index":3}`, `{"kind":"object"}`,
+/// `{"kind":"formatting"}`,
+/// `{"kind":"note-ref"}`, `{"kind":"unsupported-revision","revision":"move-from"}`,
+/// `{"kind":"paragraph-mark","index":2}`.
+fn compare_skip_json(skip: &CompareSkip) -> Json {
+    let mut fields = vec![("kind", Json::Str(skip.kind().to_string()))];
+    match skip {
+        CompareSkip::Table { index } | CompareSkip::ParagraphMark { index } => {
+            fields.push(("index", Json::Num(*index as f64)));
+        }
+        CompareSkip::UnsupportedRevision { revision } => {
+            fields.push(("revision", Json::Str(unsupported_revision_name(revision))));
+        }
+        CompareSkip::Object | CompareSkip::Formatting | CompareSkip::NoteRef => {}
+    }
+    Json::obj(fields)
 }
 
 // ---------------------------------------------------------------------------
@@ -2097,6 +2142,7 @@ mod tests {
             "doc.save",
             "doc.reload",
             "doc.open",
+            "doc.compare",
         ] {
             assert_eq!(mutation_kind_for_verb(verb), None, "{verb}");
         }
@@ -3024,5 +3070,76 @@ mod tests {
         let text = out.get_str("text").unwrap();
         assert!(text.contains("# Title"), "heading missing: {text}");
         assert!(text.contains("**body text**"), "bold missing: {text}");
+    }
+
+    #[test]
+    fn doc_compare_opens_the_result_and_refuses_unsaved_changes() {
+        let dir =
+            std::env::temp_dir().join(format!("docxy-control-compare-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, text: &str| {
+            let path = dir.join(name);
+            std::fs::write(
+                &path,
+                docxcore::package::save_package(&new_package(doc_with(&[text]))),
+            )
+            .unwrap();
+            path.display().to_string()
+        };
+        let original = write("orig.docx", "The cat sat on the mat.");
+        let revised = write("rev.docx", "The black cat sat on a mat.");
+        let compare_args = args(vec![
+            ("original", Json::Str(original.clone())),
+            ("revised", Json::Str(revised.clone())),
+        ]);
+
+        let mut app = app_with(&["draft"]);
+        app.modified = true;
+        let err = dispatch(&mut app, "doc.compare", &compare_args).unwrap_err();
+        assert!(err.contains("unsaved"), "{err}");
+        assert_eq!(app.path, "ctl-test.docx");
+
+        app.modified = false;
+        let out = dispatch(&mut app, "doc.compare", &compare_args).unwrap();
+        let expected = dir.join("Compare Result 1.docx").display().to_string();
+        assert_eq!(out.get_str("path"), Some(expected.as_str()));
+        assert_eq!(out.get("insertions").and_then(Json::as_f64), Some(2.0));
+        assert_eq!(out.get("deletions").and_then(Json::as_f64), Some(1.0));
+        assert_eq!(out.get("skipped").unwrap().to_string(), "[]");
+        assert_eq!(app.path, expected);
+        assert!(app.modified);
+        assert_eq!(app.editor.doc.revisions().len(), 3);
+
+        let missing = dispatch(
+            &mut app,
+            "doc.compare",
+            &args(vec![("original", Json::Str(original))]),
+        )
+        .unwrap_err();
+        assert!(missing.contains("'revised'"), "{missing}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compare_skips_serialize_with_their_kind_and_details() {
+        let json = |skip: CompareSkip| compare_skip_json(&skip).to_string();
+        assert_eq!(
+            json(CompareSkip::Table { index: 3 }),
+            r#"{"kind":"table","index":3}"#
+        );
+        assert_eq!(json(CompareSkip::Object), r#"{"kind":"object"}"#);
+        assert_eq!(json(CompareSkip::NoteRef), r#"{"kind":"note-ref"}"#);
+        assert_eq!(json(CompareSkip::Formatting), r#"{"kind":"formatting"}"#);
+        assert_eq!(
+            json(CompareSkip::UnsupportedRevision {
+                revision: docxcore::model::UnsupportedRevisionKind::MoveFrom
+            }),
+            r#"{"kind":"unsupported-revision","revision":"move-from"}"#
+        );
+        assert_eq!(
+            json(CompareSkip::ParagraphMark { index: 2 }),
+            r#"{"kind":"paragraph-mark","index":2}"#
+        );
     }
 }

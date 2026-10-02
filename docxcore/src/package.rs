@@ -896,6 +896,80 @@ impl Package {
             .then(|| "word/settings.xml".to_string()))
     }
 
+    /// Declare on this package's `<w:document>` root every namespace prefix
+    /// `other`'s root binds and this one lacks, and add `other`'s
+    /// `mc:Ignorable` tokens, so XML carried over from `other`'s body (as
+    /// Compare does with deleted content) keeps its prefixes bound when saved.
+    /// Returns the prefixes the two roots bind to different namespaces; XML
+    /// using them cannot be carried over.
+    pub(crate) fn adopt_root_namespaces(&mut self, other: &Package) -> Vec<String> {
+        let own = String::from_utf8_lossy(&self.parts[self.doc_index].1).into_owned();
+        let theirs = String::from_utf8_lossy(&other.parts[other.doc_index].1).into_owned();
+        let (Some(mut attrs), Some(their_attrs)) = (
+            xml_root_attrs(&own, "w:document"),
+            xml_root_attrs(&theirs, "w:document"),
+        ) else {
+            return Vec::new();
+        };
+        let mut conflicts = Vec::new();
+        for (name, value) in &their_attrs {
+            let Some(prefix) = name.strip_prefix("xmlns:") else {
+                continue;
+            };
+            match attrs.iter().find(|(key, _)| key == name) {
+                Some((_, bound)) if bound != value => conflicts.push(prefix.to_string()),
+                Some(_) => {}
+                None => attrs.push((name.clone(), value.clone())),
+            }
+        }
+        if let Some((_, ignorable)) = their_attrs.iter().find(|(k, _)| k == "mc:Ignorable") {
+            let tokens = ignorable
+                .split_whitespace()
+                .filter(|token| !conflicts.iter().any(|c| c == token));
+            match attrs.iter_mut().find(|(k, _)| k == "mc:Ignorable") {
+                Some((_, existing)) => {
+                    for token in tokens {
+                        if !existing.split_whitespace().any(|t| t == token) {
+                            if !existing.is_empty() {
+                                existing.push(' ');
+                            }
+                            existing.push_str(token);
+                        }
+                    }
+                }
+                None => {
+                    let tokens: Vec<&str> = tokens.collect();
+                    if !tokens.is_empty() {
+                        attrs.push(("mc:Ignorable".to_string(), tokens.join(" ")));
+                    }
+                }
+            }
+        }
+        let mut parser = XmlParser::new(&own);
+        let (start, end) = loop {
+            match parser.next() {
+                Event::Start if parser.name() == "w:document" => {
+                    break (parser.start_pos(), parser.pos());
+                }
+                Event::Eof => return conflicts,
+                _ => {}
+            }
+        };
+        let root = attrs
+            .iter()
+            .map(|(name, value)| format!("{name}=\"{}\"", esc_xml_attr(value)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let close = if own[start..end].trim_end().ends_with("/>") {
+            "/>"
+        } else {
+            ">"
+        };
+        let rebuilt = format!("{}<w:document {root}{close}{}", &own[..start], &own[end..]);
+        self.parts[self.doc_index].1 = rebuilt.into_bytes();
+        conflicts
+    }
+
     /// Names of all parts in the container (for inspection/tests).
     pub fn part_names(&self) -> Vec<&str> {
         self.parts.iter().map(|(n, _)| n.as_str()).collect()

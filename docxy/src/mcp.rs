@@ -62,6 +62,7 @@ pub(crate) fn verb_for(name: &str) -> Option<&'static str> {
         "docxy_revision_reject" => "doc.revision-reject",
         "docxy_revisions_accept_all" => "doc.revisions-accept-all",
         "docxy_revisions_reject_all" => "doc.revisions-reject-all",
+        "docxy_compare" => "doc.compare",
         _ => return None,
     })
 }
@@ -485,6 +486,19 @@ fn tool_defs() -> Json {
             vec![target()],
             &[],
         ),
+        tool(
+            "docxy_compare",
+            "Compare an original and a revised .docx (Review > Compare): open a new, unsaved \
+             'Compare Result N.docx' whose tracked changes turn the original into the revised \
+             document, and return its path, insertion/deletion counts and anything skipped. \
+             Neither source file is written. Refuses while the open document has unsaved changes.",
+            vec![
+                ("original", prop("string", "Path of the original .docx.")),
+                ("revised", prop("string", "Path of the revised .docx.")),
+                target(),
+            ],
+            &["original", "revised"],
+        ),
     ])
 }
 
@@ -590,6 +604,7 @@ mod tests {
             "docxy_revision_reject",
             "docxy_revisions_accept_all",
             "docxy_revisions_reject_all",
+            "docxy_compare",
         ];
         let save_pos = names.iter().position(|n| *n == "docxy_save").unwrap();
         assert_eq!(
@@ -641,6 +656,7 @@ mod tests {
         assert_eq!(required_of("docxy_revision_reject"), "[\"revision\"]");
         assert_eq!(required_of("docxy_revisions_accept_all"), "[]");
         assert_eq!(required_of("docxy_revisions_reject_all"), "[]");
+        assert_eq!(required_of("docxy_compare"), "[\"original\",\"revised\"]");
     }
 
     /// Wave-2: `docxy_insert`/`docxy_replace_range`/`docxy_append` gain an
@@ -806,6 +822,7 @@ mod tests {
         ("docxy_revision_reject", "doc.revision-reject"),
         ("docxy_revisions_accept_all", "doc.revisions-accept-all"),
         ("docxy_revisions_reject_all", "doc.revisions-reject-all"),
+        ("docxy_compare", "doc.compare"),
     ];
     /// Tools handled specially in `do_tool` (not simple verb forwards), so
     /// `verb_for` deliberately returns `None` for them.

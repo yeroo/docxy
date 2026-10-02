@@ -71,6 +71,11 @@ docxy assets/sample.docx
   row/cell/section property changes. Review previous/next, accept or reject the
   current change, or confirm accept/reject all; each action is undoable and
   survives save/reload. Unsupported move/custom records stay lossless.
+- **Compare** an original `.docx` with a revised one into tracked insertions
+  and deletions — Accept All gives the revised text, Reject All the original,
+  and neither source file is written. Review ▸ Compare and `doc.compare` open
+  the result as a new, unsaved *Compare Result N.docx*; `docxy compare orig.docx
+  rev.docx -o out.docx` writes it to `out.docx` (never overwriting a file).
 - **DOCX protection** honored across TUI and automation edits: read-only,
   comments-only, and formatting-only restrictions are enforced; unsupported
   forms-only and tracked-changes-only editing fails closed. Recommendation-only
@@ -125,6 +130,7 @@ docxy in.docx  --pdf  out.pdf   # export to PDF
 docxy in.docx  --md   out.md    # convert Word → Markdown
 docxy in.md    --docx out.docx  # convert Markdown → Word
 docxy in.docx  --html in.docx.html  # editable HTML (see below)
+docxy compare orig.docx rev.docx -o diff.docx  # tracked-changes comparison
 ```
 
 ### Editable HTML

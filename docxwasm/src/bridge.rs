@@ -1643,6 +1643,12 @@ fn revision_category_name(category: &RevisionCategory) -> String {
     match category {
         RevisionCategory::Inline(RevisionKind::Insert) => "insertion".to_string(),
         RevisionCategory::Inline(RevisionKind::Delete) => "deletion".to_string(),
+        RevisionCategory::ParagraphMark(RevisionKind::Insert) => {
+            "paragraph mark insertion".to_string()
+        }
+        RevisionCategory::ParagraphMark(RevisionKind::Delete) => {
+            "paragraph mark deletion".to_string()
+        }
         RevisionCategory::Property(scope) => property_scope_name(*scope).to_string(),
         RevisionCategory::Unsupported(kind) => {
             format!("unsupported {}", unsupported_revision_name(kind))
@@ -1697,7 +1703,7 @@ fn push_revision_location(out: &mut String, location: &RevisionLocation, current
         push_string_field(out, "parent", &parent.0.to_string());
     }
     match &address.category {
-        RevisionCategory::Inline(_) => {}
+        RevisionCategory::Inline(_) | RevisionCategory::ParagraphMark(_) => {}
         RevisionCategory::Property(scope) => {
             push_string_field(out, "scope", property_scope_name(*scope));
         }

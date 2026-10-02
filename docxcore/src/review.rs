@@ -156,7 +156,7 @@ impl Document {
     fn apply_all_revision_actions(&mut self, action: RevisionAction) -> Vec<RevisionOutcome> {
         self.initialize_revision_targets();
         let addresses = self.revisions();
-        let targets = revision_postorder(&addresses);
+        let targets = revision_postorder(&addresses, action);
         let mut outcomes = targets
             .into_iter()
             .map(|(ordinal, target)| (ordinal, self.apply_revision_action(target, action)))
@@ -166,24 +166,77 @@ impl Document {
     }
 }
 
-fn revision_postorder(addresses: &[RevisionAddress]) -> Vec<(usize, RevisionTarget)> {
+fn revision_postorder(
+    addresses: &[RevisionAddress],
+    action: RevisionAction,
+) -> Vec<(usize, RevisionTarget)> {
     // `Document::revisions` is pre-order, so reversing it guarantees every
     // descendant is transformed before its ancestor. Original ordinals are
     // retained and used to restore report order after the actions run.
-    addresses
-        .iter()
-        .rev()
+    //
+    // Paragraph-mark records are the exception: removing a mark merges the
+    // next paragraph in and replaces this paragraph's properties, so every
+    // other record of the paragraph (its pPrChange/sectPrChange, a second
+    // mark record that keeps the mark) must act first or it would come back
+    // stale. Marks are therefore deferred until just before the next record
+    // that encloses them (a shallower wrapper, such as a revision around a
+    // text box), or the end. Within a deferred batch the records that keep a
+    // mark go first; keeping changes no structure, and a merge keeps the
+    // absorbed paragraph's records, so the order across paragraphs is free.
+    fn flush<'a>(
+        pending: &mut Vec<&'a RevisionAddress>,
+        order: &mut Vec<&'a RevisionAddress>,
+        above: Option<usize>,
+        action: RevisionAction,
+    ) {
+        // `above: None` flushes every pending mark.
+        let (mut ready, rest): (Vec<_>, Vec<_>) = pending
+            .drain(..)
+            .partition(|mark| above.is_none_or(|depth| mark.depth > depth));
+        ready.sort_by_key(|mark| match mark.category {
+            RevisionCategory::ParagraphMark(kind) => removes_mark(action, kind),
+            _ => false,
+        });
+        order.extend(ready);
+        *pending = rest;
+    }
+    let mut order: Vec<&RevisionAddress> = Vec::with_capacity(addresses.len());
+    let mut pending: Vec<&RevisionAddress> = Vec::new();
+    for address in addresses.iter().rev() {
+        if matches!(address.category, RevisionCategory::ParagraphMark(_)) {
+            pending.push(address);
+            continue;
+        }
+        flush(&mut pending, &mut order, Some(address.depth), action);
+        order.push(address);
+    }
+    flush(&mut pending, &mut order, None, action);
+    order
+        .into_iter()
         .map(|address| (address.ordinal, address.target))
         .collect()
 }
 
+/// Whether acting on a paragraph-mark record removes the mark (merging the
+/// paragraph with the next one) rather than keeping it.
+fn removes_mark(action: RevisionAction, kind: RevisionKind) -> bool {
+    matches!(
+        (action, kind),
+        (RevisionAction::Accept, RevisionKind::Delete)
+            | (RevisionAction::Reject, RevisionKind::Insert)
+    )
+}
+
 fn transform_blocks(
-    blocks: &mut [Block],
+    blocks: &mut Vec<Block>,
     target: RevisionTarget,
     action: RevisionAction,
 ) -> Option<TransformResult> {
-    for block in blocks {
-        let result = match block {
+    for index in 0..blocks.len() {
+        if let Some(result) = transform_paragraph_mark(blocks, index, target, action) {
+            return Some(result);
+        }
+        let result = match &mut blocks[index] {
             Block::Paragraph(paragraph) => {
                 transform_section_props(&mut paragraph.props, target, action)
                     .or_else(|| transform_par_props(&mut paragraph.props, target, action))
@@ -218,6 +271,170 @@ fn transform_blocks(
         }
     }
     None
+}
+
+/// Act on the paragraph mark of `blocks[index]` when it is `target`.
+///
+/// Keeping the mark (accepting an insertion, rejecting a deletion) only drops
+/// the revision record. Removing it (accepting a deletion, rejecting an
+/// insertion) merges the next paragraph of the same container into this one, as
+/// Word does: this paragraph's content, then the next paragraph's content, with
+/// the next paragraph's properties (its mark is the one that survives). When no
+/// paragraph follows in the container (it is the last block, or a table or
+/// other block comes next) there is nothing to merge with, so the record is
+/// dropped and the paragraph stays.
+fn transform_paragraph_mark(
+    blocks: &mut Vec<Block>,
+    index: usize,
+    target: RevisionTarget,
+    action: RevisionAction,
+) -> Option<TransformResult> {
+    let Block::Paragraph(paragraph) = &mut blocks[index] else {
+        return None;
+    };
+    let position = paragraph
+        .props
+        .mark_revisions
+        .iter()
+        .position(|mark| mark.metadata.target == target)?;
+    let kind = paragraph.props.mark_revisions[position].kind;
+    clear_mark_revision(&mut paragraph.props, position);
+    if removes_mark(action, kind) && matches!(blocks.get(index + 1), Some(Block::Paragraph(_))) {
+        let Block::Paragraph(next) = blocks.remove(index + 1) else {
+            unreachable!()
+        };
+        let Block::Paragraph(paragraph) = &mut blocks[index] else {
+            unreachable!()
+        };
+        paragraph.content.extend(next.content);
+        paragraph.props = next.props;
+    }
+    Some(Ok(RevisionCategory::ParagraphMark(kind)))
+}
+
+/// Drop one of a paragraph's mark records (`index` into `mark_revisions`): the
+/// model entry and the matching `w:ins`/`w:del` child of the verbatim
+/// paragraph-mark `w:rPr`, which is removed when that leaves it empty. Both
+/// lists are in source order, so the n-th record is the n-th such child.
+fn clear_mark_revision(props: &mut ParProps, index: usize) {
+    props.mark_revisions.remove(index);
+    let Some(position) = props
+        .raw_props
+        .iter()
+        .position(|raw| local_name(raw) == "rPr")
+    else {
+        return;
+    };
+    match remove_mark_revision_child(&props.raw_props[position], index) {
+        Some(rpr) => props.raw_props[position] = rpr,
+        None => {
+            props.raw_props.remove(position);
+        }
+    }
+}
+
+/// Drop every paragraph-mark record of `props` (model and raw XML).
+pub(crate) fn clear_mark_revisions(props: &mut ParProps) {
+    while !props.mark_revisions.is_empty() {
+        clear_mark_revision(props, 0);
+    }
+}
+
+/// Give `kept` the paragraph-mark records of `gone` (model and raw XML),
+/// replacing its own: when two paragraphs are joined, the surviving physical
+/// mark is the later paragraph's, so its records survive and the earlier
+/// paragraph's go.
+pub(crate) fn adopt_mark_revisions(kept: &mut ParProps, gone: &ParProps) {
+    clear_mark_revisions(kept);
+    let records = mark_revision_xml(gone);
+    if records.is_empty() {
+        return;
+    }
+    kept.mark_revisions = gone.mark_revisions.clone();
+    insert_mark_records(kept, &records.concat());
+}
+
+/// Put raw `w:ins`/`w:del` record XML first in the paragraph-mark `w:rPr`
+/// (where CT_ParaRPr puts it), creating the rPr when there is none. Only the
+/// raw XML changes; callers keep `mark_revisions` in step (or reload).
+pub(crate) fn insert_mark_records(props: &mut ParProps, records: &str) {
+    match props
+        .raw_props
+        .iter_mut()
+        .find(|raw| local_name(raw) == "rPr")
+    {
+        Some(rpr) if rpr.trim_end().ends_with("/>") && !rpr.contains("</") => {
+            *rpr = format!("<w:rPr>{records}</w:rPr>");
+        }
+        Some(rpr) => {
+            let open = rpr.find('>').map_or(rpr.len(), |at| at + 1);
+            rpr.insert_str(open, records);
+        }
+        None => props.raw_props.push(format!("<w:rPr>{records}</w:rPr>")),
+    }
+}
+
+/// The raw `w:ins`/`w:del` children of a paragraph-mark `w:rPr`, in order.
+fn mark_revision_xml(props: &ParProps) -> Vec<String> {
+    let Some(rpr) = props.raw_props.iter().find(|raw| local_name(raw) == "rPr") else {
+        return Vec::new();
+    };
+    let mut parser = XmlParser::new(rpr);
+    let mut out = Vec::new();
+    if parser.next() != Event::Start {
+        return out;
+    }
+    loop {
+        match parser.next() {
+            Event::Start => {
+                let start = parser.start_pos();
+                let record = matches!(parser.name(), "w:ins" | "w:del");
+                parser.skip_element();
+                if record {
+                    out.push(parser.raw_slice(start, parser.pos()).to_string());
+                }
+            }
+            Event::End | Event::Eof => return out,
+            Event::Text => {}
+        }
+    }
+}
+
+/// `rpr` without its `index`-th `w:ins`/`w:del` child, or `None` when nothing
+/// remains.
+fn remove_mark_revision_child(rpr: &str, index: usize) -> Option<String> {
+    let mut parser = XmlParser::new(rpr);
+    if parser.next() != Event::Start {
+        return Some(rpr.to_string());
+    }
+    let open_end = parser.pos();
+    let mut kept = String::new();
+    let mut seen = 0;
+    loop {
+        match parser.next() {
+            Event::Start => {
+                let start = parser.start_pos();
+                let drop = matches!(parser.name(), "w:ins" | "w:del") && {
+                    seen += 1;
+                    seen - 1 == index
+                };
+                parser.skip_element();
+                if !drop {
+                    kept.push_str(parser.raw_slice(start, parser.pos()));
+                }
+            }
+            Event::End | Event::Eof => break,
+            Event::Text => {}
+        }
+    }
+    if kept.is_empty() {
+        return None;
+    }
+    let open = &rpr[..open_end];
+    let open = open
+        .strip_suffix("/>")
+        .map_or(open.to_string(), |o| format!("{o}>"));
+    Some(format!("{open}{kept}</w:rPr>"))
 }
 
 fn transform_row(
@@ -415,6 +632,17 @@ fn transform_par_props(
     // or replace that independent revision record.
     restored.section_break = props.section_break.take();
     restored.section_property_change = props.section_property_change.take();
+    // Nor is the paragraph mark's own rPr (CT_PPrBase has none): keep it, and
+    // any tracked insertion/deletion of the mark it carries.
+    restored.raw_props.retain(|raw| local_name(raw) != "rPr");
+    restored.raw_props.extend(
+        props
+            .raw_props
+            .iter()
+            .filter(|raw| local_name(raw) == "rPr")
+            .cloned(),
+    );
+    restored.mark_revisions = std::mem::take(&mut props.mark_revisions);
     restored.property_change = None;
     *props = restored;
     Some(Ok(RevisionCategory::Property(PropertyScope::Paragraph)))

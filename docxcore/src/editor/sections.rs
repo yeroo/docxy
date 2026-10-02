@@ -192,6 +192,9 @@ impl Editor {
         };
         p.props.section_break = Some(old);
         p.props.section_property_change = None;
+        // A tracked change of the paragraph mark stays with the physical
+        // mark, which ends the second half.
+        crate::review::clear_mark_revisions(&mut p.props);
         self.doc.body.insert(block + 1, Block::Paragraph(second));
         // Section k's sectPr moved one section on; its slot shifts with the
         // inserted paragraph when it was a paragraph at or after the split.
