@@ -13,6 +13,7 @@
 use crate::model::{Block, Document, Inline, Run, RunProps};
 use crate::package::Package;
 use crate::xml::{Event, XmlParser};
+use std::ops::Range;
 
 /// What a body walk removes or counts.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -75,7 +76,7 @@ fn count_markers(xml: &str) -> usize {
         .iter()
         .map(|name| {
             let (mut n, mut from) = (0, 0);
-            while let Some((_, end, _)) = find_element(xml, name, from) {
+            while let Some((_, end, _)) = find_element_from(xml, name, from) {
                 n += 1;
                 from = end;
             }
@@ -89,10 +90,15 @@ fn count_markers(xml: &str) -> usize {
 /// `w:commentReference`, or a `w:customXml` wrapper around a commented
 /// range, keeps everything else.
 fn strip_markers(xml: &str) -> (String, usize) {
+    remove_elements(xml, &MARKER_TAGS)
+}
+
+/// `xml` without any element named in `names`, and how many there were.
+fn remove_elements(xml: &str, names: &[&str]) -> (String, usize) {
     let mut out = xml.to_string();
     let mut removed = 0;
-    for name in MARKER_TAGS {
-        while let Some((start, end, _)) = find_element(&out, name, 0) {
+    for name in names {
+        while let Some((start, end, _)) = find_element_from(&out, name, 0) {
             out.replace_range(start..end, "");
             removed += 1;
         }
@@ -141,23 +147,22 @@ fn count_blocks(blocks: &[Block], target: Target) -> usize {
 
 /// The raw XML of an inline that the walk strips comment markers from.
 /// Hyperlinks and revisions are not here: their children are walked, and a
-/// changed wrapper is rebuilt from them.
+/// changed wrapper is rebuilt from them. Text boxes are not either: their
+/// raw holds copies of their blocks ([`text_box_extra_markers`]).
 fn marker_raw(inline: &Inline) -> Option<&str> {
     match inline {
-        Inline::Raw(raw)
-        | Inline::Field { raw, .. }
-        | Inline::UnsupportedRevision { raw, .. }
-        | Inline::TextBox { raw, .. } => Some(raw),
+        Inline::Raw(raw) | Inline::Field { raw, .. } | Inline::UnsupportedRevision { raw, .. } => {
+            Some(raw)
+        }
         _ => None,
     }
 }
 
 fn marker_raw_mut(inline: &mut Inline) -> Option<&mut String> {
     match inline {
-        Inline::Raw(raw)
-        | Inline::Field { raw, .. }
-        | Inline::UnsupportedRevision { raw, .. }
-        | Inline::TextBox { raw, .. } => Some(raw),
+        Inline::Raw(raw) | Inline::Field { raw, .. } | Inline::UnsupportedRevision { raw, .. } => {
+            Some(raw)
+        }
         _ => None,
     }
 }
@@ -176,7 +181,13 @@ fn count_inlines(content: &[Inline], target: Target) -> usize {
                         + count_inlines(&h.content, target)
                 }
                 Inline::Revision { content, .. } => count_inlines(content, target),
-                Inline::TextBox { blocks, .. } => count_blocks(blocks, target),
+                Inline::TextBox { raw, blocks } => {
+                    count_blocks(blocks, target)
+                        + match target {
+                            Target::CommentMarkers => text_box_extra_markers(raw),
+                            Target::Hidden => 0,
+                        }
+                }
                 _ => 0,
             }
         })
@@ -261,9 +272,16 @@ fn remove_inlines(content: &mut Vec<Inline>, target: Target) -> usize {
                 removed += inside;
             }
             Inline::TextBox { raw, blocks } => {
-                let inside = remove_blocks(blocks, target);
+                // Judged on the loaded XML, before the strip below can make
+                // twin copies differ.
+                let twins = twin_copies(raw);
+                let mut inside = remove_blocks(blocks, target);
+                if target == Target::CommentMarkers {
+                    inside += text_box_extra_markers(raw);
+                    *raw = strip_markers(raw).0;
+                }
                 if inside > 0 {
-                    sync_text_box_copies(raw, blocks);
+                    sync_twin_copies(raw, blocks, &twins);
                 }
                 removed += inside;
             }
@@ -273,34 +291,76 @@ fn remove_inlines(content: &mut Vec<Inline>, target: Target) -> usize {
     removed
 }
 
-/// Save splices a text box's `blocks` into the first `w:txbxContent` of its
-/// `raw` only. Word 2010+ writes a shape twice, a DrawingML `mc:Choice` and
-/// a VML `mc:Fallback`, each with its own `w:txbxContent`; this rewrites the
-/// later copies from `blocks` too, so a removal reaches the copy an older
-/// reader shows. A copy nested in the first one's content is left alone:
-/// the save's own splice does not handle that shape either.
-fn sync_text_box_copies(raw: &mut String, blocks: &[Block]) {
+/// The `w:txbxContent` elements of a text box's `raw`, as byte ranges of
+/// the whole element and of its inner XML. The loader reads `blocks` from
+/// the first one and save splices them back there only. Word 2010+ writes
+/// a shape twice, a DrawingML `mc:Choice` and a VML `mc:Fallback`; a group
+/// shape holds several boxes, each written twice. Empty when the first copy
+/// has another nested in it, a shape the save's splice can't handle either.
+fn text_box_copies(raw: &str) -> Vec<(Range<usize>, Range<usize>)> {
     const NAME: &str = "w:txbxContent";
-    let Some((first_start, first_end, _)) = find_element(raw, NAME, 0) else {
-        return;
+    let mut copies = Vec::new();
+    let mut from = 0;
+    while let Some((start, end, _)) = find_element_from(raw, NAME, from) {
+        from = end;
+        let Some(head) = tag_end(&raw[start..]) else {
+            break;
+        };
+        // A self-closing copy has no content to rewrite or compare.
+        if raw[..start + head].ends_with("/>") {
+            continue;
+        }
+        let inner = start + head..end - NAME.len() - "</>".len();
+        if copies.is_empty() && raw[inner.clone()].contains(&format!("<{NAME}")) {
+            return Vec::new();
+        }
+        copies.push((start..end, inner));
+    }
+    copies
+}
+
+/// For each `w:txbxContent` copy in `raw`, whether it is a twin of the
+/// first: the same inner XML, so it shows the same `blocks`. Only those
+/// may be rewritten from `blocks`; another box of a group keeps its own.
+fn twin_copies(raw: &str) -> Vec<bool> {
+    let copies = text_box_copies(raw);
+    let Some((_, first)) = copies.first() else {
+        return Vec::new();
     };
-    if raw[first_start + 1..first_end].contains(&format!("<{NAME}")) {
+    copies
+        .iter()
+        .map(|(_, inner)| raw[inner.clone()] == raw[first.clone()])
+        .collect()
+}
+
+/// Comment markers in a text box's `raw` that its `blocks` don't stand for:
+/// everything but the first copy and its twins (another box of a group,
+/// the shape around them).
+fn text_box_extra_markers(raw: &str) -> usize {
+    let copies = text_box_copies(raw);
+    let Some((_, first)) = copies.first() else {
+        return 0;
+    };
+    let twins = copies
+        .iter()
+        .filter(|(_, inner)| raw[inner.clone()] == raw[first.clone()])
+        .count();
+    count_markers(raw) - twins * count_markers(&raw[first.clone()])
+}
+
+/// Rewrite the twins of the first copy (`twins`, from [`twin_copies`] on the
+/// loaded XML) from `blocks`, so a removal reaches the copy an older reader
+/// shows. The first copy is left to save's own splice, and any other copy
+/// as it is.
+fn sync_twin_copies(raw: &mut String, blocks: &[Block], twins: &[bool]) {
+    let copies = text_box_copies(raw);
+    if copies.len() != twins.len() {
         return;
     }
     let inner = crate::serialize::blocks_to_xml(blocks);
-    let mut from = first_end;
-    while let Some((start, end, _)) = find_element(raw, NAME, from) {
-        let Some(head_len) = tag_end(&raw[start..]) else {
-            return;
-        };
-        let head = raw[start..start + head_len].to_string();
-        if head.ends_with("/>") {
-            from = end;
-            continue;
-        }
-        let copy = format!("{head}{inner}</{NAME}>");
-        raw.replace_range(start..end, &copy);
-        from = start + copy.len();
+    // Last first, so the earlier ranges stay valid.
+    for ((_, range), _) in copies.iter().zip(twins).skip(1).filter(|(_, t)| **t).rev() {
+        raw.replace_range(range.clone(), &inner);
     }
 }
 
@@ -399,8 +459,11 @@ const CORE_PERSONAL: [&str; 8] = [
 const APP_PERSONAL: [&str; 2] = ["Company", "Manager"];
 const CUSTOM_PERSONAL: [&str; 1] = ["property"];
 
-/// One element named `name`: its byte range and whether it has non-blank content.
-fn find_element(xml: &str, name: &str, from: usize) -> Option<(usize, usize, bool)> {
+/// The first element named `name` at or after byte `from`: its byte range
+/// and whether it has non-blank content. Unlike [`crate::sect::find_element`]
+/// it starts at `from`, skips a `>` inside a quoted attribute value, and
+/// finds nothing when the close tag is missing.
+fn find_element_from(xml: &str, name: &str, from: usize) -> Option<(usize, usize, bool)> {
     let open = format!("<{name}");
     let mut at = from;
     loop {
@@ -425,7 +488,7 @@ fn find_element(xml: &str, name: &str, from: usize) -> Option<(usize, usize, boo
 fn has_filled(xml: &str, names: &[&str]) -> bool {
     names.iter().any(|name| {
         let mut from = 0;
-        while let Some((_, end, filled)) = find_element(xml, name, from) {
+        while let Some((_, end, filled)) = find_element_from(xml, name, from) {
             if filled {
                 return true;
             }
@@ -433,16 +496,6 @@ fn has_filled(xml: &str, names: &[&str]) -> bool {
         }
         false
     })
-}
-
-fn remove_all(xml: &str, names: &[&str]) -> String {
-    let mut out = xml.to_string();
-    for name in names {
-        while let Some((start, end, _)) = find_element(&out, name, 0) {
-            out.replace_range(start..end, "");
-        }
-    }
-    out
 }
 
 fn property_parts() -> [(&'static str, &'static [&'static str]); 3] {
@@ -471,7 +524,7 @@ pub fn remove_personal_properties(pkg: &mut Package) -> bool {
         let Some(xml) = pkg.part_text(part) else {
             continue;
         };
-        let out = remove_all(&xml, names);
+        let (out, _) = remove_elements(&xml, names);
         if out != xml {
             changed |= pkg.set_part_text(part, &out);
         }
@@ -690,10 +743,54 @@ mod tests {
             "<w:p><w:commentRangeStart w:id=\"4\"/>{VISIBLE}<w:commentRangeEnd w:id=\"4\"/></w:p>"
         ));
         let mut doc = parse(&marked);
-        assert!(remove_all_comment_markers(&mut doc) > 0);
+        // Two markers, written twice: the twin copy is not counted again.
+        assert_eq!(count_blocks(&doc.body, Target::CommentMarkers), 2);
+        assert_eq!(remove_all_comment_markers(&mut doc), 2);
         assert!(!has_comment_markers(&doc));
         let xml = document_to_xml(&doc);
         assert!(!xml.contains("comment"), "{xml}");
+        assert_eq!(xml.matches("keep").count(), 2, "{xml}");
+    }
+
+    /// A group shape with boxes A and B: the choice holds A then B, the
+    /// fallback A' then B'. The loader reads A into `blocks`.
+    fn group_of_two_boxes(a: &str, b: &str) -> String {
+        format!(
+            "<w:p><w:r><mc:AlternateContent><mc:Choice Requires=\"wpg\"><w:drawing><wpg:wgp>\
+             <wps:wsp><wps:txbx><w:txbxContent>{a}</w:txbxContent></wps:txbx></wps:wsp>\
+             <wps:wsp><wps:txbx><w:txbxContent>{b}</w:txbxContent></wps:txbx></wps:wsp>\
+             </wpg:wgp></w:drawing></mc:Choice><mc:Fallback><w:pict><v:group>\
+             <v:shape><v:textbox><w:txbxContent>{a}</w:txbxContent></v:textbox></v:shape>\
+             <v:shape><v:textbox><w:txbxContent>{b}</w:txbxContent></v:textbox></v:shape>\
+             </v:group></w:pict></mc:Fallback></mc:AlternateContent></w:r></w:p>"
+        )
+    }
+
+    /// Review r2 C1: syncing the fallback rewrites A's twin only, never the
+    /// group's other box.
+    #[test]
+    fn inspect_text_box_sync_spares_a_group_s_other_box() {
+        let a = format!("<w:p>{VISIBLE}{HIDDEN}</w:p>");
+        let b = "<w:p><w:r><w:t>Box B</w:t></w:r></w:p>";
+        let mut doc = parse(&group_of_two_boxes(&a, b));
+        assert_eq!(count_hidden_runs(&doc), 1);
+        assert_eq!(remove_hidden_text(&mut doc), 1);
+        let xml = document_to_xml(&doc);
+        assert!(!xml.contains("gone"), "A and its twin lose it: {xml}");
+        assert_eq!(xml.matches("keep").count(), 2, "{xml}");
+        assert_eq!(xml.matches("Box B").count(), 2, "B kept in both: {xml}");
+
+        // B's markers live only in raw: found, removed, counted once each.
+        let b = "<w:p><w:commentRangeStart w:id=\"8\"/><w:r><w:t>Box B</w:t></w:r>\
+                 <w:commentRangeEnd w:id=\"8\"/></w:p>";
+        let mut doc = parse(&group_of_two_boxes(&format!("<w:p>{VISIBLE}</w:p>"), b));
+        assert!(has_comment_markers(&doc));
+        assert_eq!(count_blocks(&doc.body, Target::CommentMarkers), 4);
+        assert_eq!(remove_all_comment_markers(&mut doc), 4);
+        assert!(!has_comment_markers(&doc));
+        let xml = document_to_xml(&doc);
+        assert!(!xml.contains("comment"), "{xml}");
+        assert_eq!(xml.matches("Box B").count(), 2, "{xml}");
         assert_eq!(xml.matches("keep").count(), 2, "{xml}");
     }
 
