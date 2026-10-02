@@ -12,6 +12,7 @@
 use crate::model::*;
 use crate::review::{RevisionAction, RevisionOutcome};
 
+mod cover;
 mod flat;
 mod sections;
 mod table_design;
@@ -1188,7 +1189,11 @@ impl Editor {
 
         if n == 1 {
             if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
-                let tail = split_content(&mut p.content, off);
+                // Into an empty content control at the caret, as typing goes.
+                let tail = match empty_sdt_at(&p.content, off) {
+                    Some(at) => p.content.split_off(at),
+                    None => split_content(&mut p.content, off),
+                };
                 let ins = clip.paras[0].clone();
                 let ins_len: usize = ins.iter().map(inline_len).sum();
                 p.content.extend(ins);
@@ -2658,7 +2663,64 @@ fn is_marker(inline: &Inline) -> bool {
     }
 }
 
+/// Where text typed or pasted at caret offset `o` goes when an empty inline
+/// content control (a cleared cover-page placeholder, #652) sits exactly
+/// there: the index just past its opening boundary, so the text lands inside
+/// the control rather than before it, as in Word. Zero-width markers between
+/// the boundaries still count as empty. `None` when there is no such control;
+/// typing next to a control with content keeps the usual rules.
+fn empty_sdt_at(content: &[Inline], o: usize) -> Option<usize> {
+    let mut acc = 0;
+    for (i, inline) in content.iter().enumerate() {
+        if acc > o {
+            return None;
+        }
+        if acc == o {
+            if let Inline::Raw(raw) = inline {
+                if crate::hf::is_sdt_open(raw) {
+                    let close = content[i + 1..]
+                        .iter()
+                        .find(|x| !is_marker(x))
+                        .is_some_and(|x| matches!(x, Inline::Raw(r) if crate::hf::is_sdt_close(r)));
+                    if close {
+                        return Some(i + 1);
+                    }
+                }
+            }
+        }
+        acc += inline_len(inline);
+    }
+    None
+}
+
+/// The formatting of text typed into the empty content control whose
+/// content starts at `at` (see [`empty_sdt_at`]): the control's own run
+/// properties (`w:sdtPr/w:rPr`, which Word and our cover placeholders write),
+/// else the nearest formatting source around it.
+fn sdt_typing_props(content: &[Inline], at: usize) -> RunProps {
+    if let Some(Inline::Raw(open)) = at.checked_sub(1).and_then(|k| content.get(k)) {
+        if let Some(props) = crate::load::sdt_run_props(open) {
+            return props;
+        }
+    }
+    source_before(content, at)
+        .or_else(|| source_from(content, at))
+        .cloned()
+        .unwrap_or_default()
+}
+
 fn content_insert(content: &mut Vec<Inline>, o: usize, ch: char) {
+    if let Some(at) = empty_sdt_at(content, o) {
+        let props = sdt_typing_props(content, at);
+        content.insert(
+            at,
+            Inline::Run(Run {
+                text: ch.to_string(),
+                props,
+            }),
+        );
+        return;
+    }
     let Some((i, local)) = locate(content, o) else {
         if let Some(Inline::Run(r)) = content.last_mut() {
             let rl = r.text.chars().count();

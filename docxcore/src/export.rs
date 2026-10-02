@@ -2933,6 +2933,25 @@ mod tests {
         assert!(pages[2].has("DEF"));
     }
 
+    /// Insert › Cover Page (#652): the cover takes no page number, since
+    /// Different First Page hides the footer there, and the body's first page
+    /// shows it.
+    #[test]
+    fn a_cover_page_shows_no_footer() {
+        let opts = with_parts(&[("rF", "footer1.xml", vec![text_para("FTR")])]);
+        let mut ed = crate::editor::Editor::new(doc(vec![
+            text_para("Body"),
+            trailing(r#"<w:sectPr><w:footerReference w:type="default" r:id="rF"/></w:sectPr>"#),
+        ]));
+        let pages = pages_of(&ed.doc, &opts);
+        assert!(pages[0].has("Body") && pages[0].has("FTR"));
+        ed.set_cover_page(0, &[]).unwrap();
+        let pages = pages_of(&ed.doc, &opts);
+        assert_eq!(pages.len(), 2);
+        assert!(pages[0].has("Document title") && !pages[0].has("FTR"));
+        assert!(pages[1].has("Body") && pages[1].has("FTR"));
+    }
+
     #[test]
     fn a_section_without_a_header_reference_links_to_the_previous_one() {
         let opts = with_parts(&[("rH", "header1.xml", vec![text_para("HDR")])]);

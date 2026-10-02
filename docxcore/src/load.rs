@@ -1123,6 +1123,26 @@ fn parse_inline_sdt(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inlin
     }
 }
 
+/// The run properties a content control declares for its content
+/// (`w:sdtPr/w:rPr`), read from its opening boundary. `None` when it has none.
+pub(crate) fn sdt_run_props(open: &str) -> Option<RunProps> {
+    let (a, b) = crate::sect::find_element(open, "w:sdtPr")?;
+    let sdt_pr = &open[a..b];
+    let (c, d) = crate::sect::find_element(sdt_pr, "w:rPr")?;
+    let mut p = XmlParser::new(&sdt_pr[c..d]);
+    let mut props = RunProps::default();
+    loop {
+        match p.next() {
+            Event::Start if p.name() == "w:rPr" => {
+                parse_rpr(&mut p, &mut props);
+                return Some(props);
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
+}
+
 /// Parse inline content (runs, hyperlinks, nested content controls) up to the
 /// enclosing End, pushing into `out`.
 fn parse_inlines_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inline>) {

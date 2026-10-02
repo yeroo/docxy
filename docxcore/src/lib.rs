@@ -25,6 +25,7 @@ pub mod agent;
 pub mod chart;
 pub mod comments;
 pub mod compare;
+pub mod cover;
 pub mod editor;
 pub mod equation;
 pub mod export;
