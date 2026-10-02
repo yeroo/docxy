@@ -6,39 +6,39 @@
 test the Mailings tab sits between Layout and Review and waits for a list
   open ../fixtures/basic.docx
   call ribbon-read {}
-  assert reply.tabs.3.name is Layout
-  assert reply.tabs.4.name is Mailings
-  assert reply.tabs.4.key_tip is M
-  assert reply.tabs.5.name is Review
-  assert reply.tabs.4.groups.0.title is Create
-  assert reply.tabs.4.groups.0.commands.0.label is Envelopes
-  assert reply.tabs.4.groups.0.commands.0.enabled is true
-  assert reply.tabs.4.groups.1.commands.0.label is Start Mail Merge
-  assert reply.tabs.4.groups.1.commands.0.enabled is true
-  assert reply.tabs.4.groups.1.commands.10.label is Use an Existing List...
-  assert reply.tabs.4.groups.1.commands.10.enabled is true
-  assert reply.tabs.4.groups.1.commands.12.label is Edit Recipient List
-  assert reply.tabs.4.groups.1.commands.12.enabled is false
-  assert reply.tabs.4.groups.2.commands.0.label is Highlight Merge Fields
-  assert reply.tabs.4.groups.2.commands.0.enabled is false
-  assert reply.tabs.4.groups.2.commands.1.enabled is false
-  assert reply.tabs.4.groups.2.commands.2.enabled is false
-  assert reply.tabs.4.groups.2.commands.3.label is Insert Merge Field
-  assert reply.tabs.4.groups.2.commands.3.enabled is false
-  assert reply.tabs.4.groups.2.commands.4.label is Rules
-  assert reply.tabs.4.groups.2.commands.4.enabled is false
-  assert reply.tabs.4.groups.2.commands.14.label is Match Fields
-  assert reply.tabs.4.groups.2.commands.14.enabled is false
-  assert reply.tabs.4.groups.3.commands.0.label is Preview Results
-  assert reply.tabs.4.groups.3.commands.0.enabled is false
-  assert reply.tabs.4.groups.3.commands.4.label is Next Record
-  assert reply.tabs.4.groups.3.commands.4.enabled is false
-  assert reply.tabs.4.groups.3.commands.6.label is Find Recipient
-  assert reply.tabs.4.groups.3.commands.6.enabled is false
-  assert reply.tabs.4.groups.3.commands.7.label is Check for Errors
-  assert reply.tabs.4.groups.3.commands.7.enabled is false
-  assert reply.tabs.4.groups.4.commands.0.label is Finish & Merge
-  assert reply.tabs.4.groups.4.commands.0.enabled is false
+  assert reply.tabs.4.name is Layout
+  assert reply.tabs.5.name is Mailings
+  assert reply.tabs.5.key_tip is M
+  assert reply.tabs.6.name is Review
+  assert reply.tabs.5.groups.0.title is Create
+  assert reply.tabs.5.groups.0.commands.0.label is Envelopes
+  assert reply.tabs.5.groups.0.commands.0.enabled is true
+  assert reply.tabs.5.groups.1.commands.0.label is Start Mail Merge
+  assert reply.tabs.5.groups.1.commands.0.enabled is true
+  assert reply.tabs.5.groups.1.commands.10.label is Use an Existing List...
+  assert reply.tabs.5.groups.1.commands.10.enabled is true
+  assert reply.tabs.5.groups.1.commands.12.label is Edit Recipient List
+  assert reply.tabs.5.groups.1.commands.12.enabled is false
+  assert reply.tabs.5.groups.2.commands.0.label is Highlight Merge Fields
+  assert reply.tabs.5.groups.2.commands.0.enabled is false
+  assert reply.tabs.5.groups.2.commands.1.enabled is false
+  assert reply.tabs.5.groups.2.commands.2.enabled is false
+  assert reply.tabs.5.groups.2.commands.3.label is Insert Merge Field
+  assert reply.tabs.5.groups.2.commands.3.enabled is false
+  assert reply.tabs.5.groups.2.commands.4.label is Rules
+  assert reply.tabs.5.groups.2.commands.4.enabled is false
+  assert reply.tabs.5.groups.2.commands.14.label is Match Fields
+  assert reply.tabs.5.groups.2.commands.14.enabled is false
+  assert reply.tabs.5.groups.3.commands.0.label is Preview Results
+  assert reply.tabs.5.groups.3.commands.0.enabled is false
+  assert reply.tabs.5.groups.3.commands.4.label is Next Record
+  assert reply.tabs.5.groups.3.commands.4.enabled is false
+  assert reply.tabs.5.groups.3.commands.6.label is Find Recipient
+  assert reply.tabs.5.groups.3.commands.6.enabled is false
+  assert reply.tabs.5.groups.3.commands.7.label is Check for Errors
+  assert reply.tabs.5.groups.3.commands.7.enabled is false
+  assert reply.tabs.5.groups.4.commands.0.label is Finish & Merge
+  assert reply.tabs.5.groups.4.commands.0.enabled is false
   key alt m escape escape
   assert ribbon_tab is Mailings
   shot window
@@ -46,12 +46,12 @@ test the Mailings tab sits between Layout and Review and waits for a list
 test the follow-ups are drawn disabled and say so
   open ../fixtures/basic.docx
   call ribbon-read {}
-  assert reply.tabs.4.groups.1.commands.7.label is Step-by-Step Mail Merge Wizard...
-  assert reply.tabs.4.groups.1.commands.7.enabled is false
-  assert reply.tabs.4.groups.1.commands.7.tip.body is Not available yet: the Mail Merge Wizard is a follow-up.
-  assert reply.tabs.4.groups.4.commands.2.label is Print Documents...
-  assert reply.tabs.4.groups.4.commands.2.enabled is false
-  assert reply.tabs.4.groups.4.commands.2.tip.body is Not available yet: printing merged documents is a follow-up.
+  assert reply.tabs.5.groups.1.commands.7.label is Step-by-Step Mail Merge Wizard...
+  assert reply.tabs.5.groups.1.commands.7.enabled is false
+  assert reply.tabs.5.groups.1.commands.7.tip.body is Not available yet: the Mail Merge Wizard is a follow-up.
+  assert reply.tabs.5.groups.4.commands.2.label is Print Documents...
+  assert reply.tabs.5.groups.4.commands.2.enabled is false
+  assert reply.tabs.5.groups.4.commands.2.tip.body is Not available yet: printing merged documents is a follow-up.
   call menu-open {"target":{"ribbon":["Mailings","Start Mail Merge","Start Mail Merge"]}}
   assert reply.items.0.label is Letters
   assert reply.items.0.enabled is true
@@ -76,12 +76,12 @@ test a list enables the tab, Insert Merge Field lists its columns, and Preview s
   assert mail.rows is 3
   assert dirty is true
   call ribbon-read {}
-  assert reply.tabs.4.groups.1.commands.12.enabled is true
-  assert reply.tabs.4.groups.2.commands.0.enabled is true
-  assert reply.tabs.4.groups.2.commands.3.enabled is true
-  assert reply.tabs.4.groups.3.commands.0.enabled is true
-  assert reply.tabs.4.groups.3.commands.4.enabled is true
-  assert reply.tabs.4.groups.4.commands.0.enabled is true
+  assert reply.tabs.5.groups.1.commands.12.enabled is true
+  assert reply.tabs.5.groups.2.commands.0.enabled is true
+  assert reply.tabs.5.groups.2.commands.3.enabled is true
+  assert reply.tabs.5.groups.3.commands.0.enabled is true
+  assert reply.tabs.5.groups.3.commands.4.enabled is true
+  assert reply.tabs.5.groups.4.commands.0.enabled is true
   call menu-open {"target":{"ribbon":["Mailings","Write & Insert Fields","Insert Merge Field"]}}
   assert reply.items.0.label is First Name
   assert reply.items.6.label is Postal Code

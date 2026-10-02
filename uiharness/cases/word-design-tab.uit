@@ -1,0 +1,154 @@
+# #651: Word's Design tab. Its Page Background group sets the page colour
+# (theme, standard, More Colors..., Fill Effects...), a watermark in every
+# section's header (the gallery, Custom Watermark..., Remove Watermark), and
+# page borders through Borders and Shading with its Options... child.
+
+test the Design tab sits between Insert and Layout
+  open copy:../fixtures/basic.docx
+  call ribbon-read {}
+  assert reply.tabs.3.name is Design
+  assert reply.tabs.3.key_tip is G
+  assert reply.tabs.3.groups.0.title is Page Background
+  assert reply.tabs.4.name is Layout
+  key alt g escape escape
+  assert ribbon_tab is Design
+
+test Page Color applies a colour, ticks it, and No Color removes it
+  open copy:../fixtures/basic.docx
+  key alt g p c
+  assert menu.target.ribbon.0 is Design
+  assert menu.target.ribbon.1 is Page Background
+  assert menu.target.ribbon.2 is Page Color
+  call menu-read {}
+  assert reply.items.0.heading is Theme Colors
+  assert reply.items.11.heading is Standard Colors
+  assert reply.items.22.separator is true
+  assert reply.items.23.label is No Color
+  assert reply.items.23.checked is true
+  assert reply.items.24.label is More Colors...
+  assert reply.items.25.label is Fill Effects...
+  call menu-click {"label":"Gold, Accent 4"}
+  assert status is Page color: Gold, Accent 4
+  assert dirty is true
+  # Print Layout paints the page sheet in the page colour.
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  shot window
+  call menu-open {"target":{"ribbon":["Design","Page Background","Page Color"]}}
+  assert reply.items.8.label is Gold, Accent 4
+  assert reply.items.8.checked is true
+  assert reply.items.23.checked is false
+  call menu-click {"label":"No Color"}
+  assert status is Page color: No Color
+  call menu-open {"target":{"ribbon":["Design","Page Background","Page Color"]}}
+  assert reply.items.23.checked is true
+  call menu-close {}
+
+test More Colors and Fill Effects open their dialogs
+  open copy:../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Page Color"]}}
+  call menu-click {"label":"More Colors..."}
+  assert dialog is more-colors
+  call dialog-set {"control":"Hex","value":"zz"}
+  call-error dialog-click {"button":"OK"} => Type a colour as six hex digits (RRGGBB); got 'zz'
+  call dialog-set {"control":"Hex","value":"C00000"}
+  call dialog-click {"button":"OK"}
+  assert dialog is none
+  assert status is Page color: Dark Red
+  call menu-open {"target":{"ribbon":["Design","Page Background","Page Color"]}}
+  call menu-click {"label":"Fill Effects..."}
+  assert dialog is fill-effects
+  call dialog-read {}
+  assert reply.controls.2.enabled is false
+  call dialog-set {"control":"Colors","value":"Two colors"}
+  call dialog-set {"control":"Color 2","value":"Purple"}
+  call dialog-set {"control":"Shading styles","value":"From center"}
+  call dialog-click {"button":"OK"}
+  assert dialog is none
+  assert status is Page color: From center gradient
+
+test a gallery watermark is ticked and Remove Watermark takes it out
+  open copy:../fixtures/header-inherit.docx
+  key alt g p w
+  assert menu.target.ribbon.2 is Watermark
+  call menu-read {}
+  assert reply.items.0.heading is Confidential
+  assert reply.items.5.heading is Disclaimers
+  assert reply.items.6.label is DRAFT 1
+  assert reply.items.6.checked is false
+  call menu-click {"label":"DRAFT 1"}
+  assert status is Watermark: DRAFT 1
+  assert dirty is true
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  assert reply.items.6.checked is true
+  assert reply.items.7.checked is false
+  call menu-click {"label":"Remove Watermark"}
+  assert status is Watermark removed
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  assert reply.items.6.checked is false
+  call menu-close {}
+
+test Custom Watermark writes a text watermark and No watermark removes it
+  open copy:../fixtures/basic.docx
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  call menu-click {"label":"Custom Watermark..."}
+  assert dialog is watermark
+  call dialog-read {}
+  assert reply.title is Printed Watermark
+  assert reply.controls.1.enabled is false
+  call dialog-set {"control":"Watermark","value":"Text watermark"}
+  call dialog-set {"control":"Text","value":"DRAFT"}
+  call dialog-set {"control":"Layout","value":"Horizontal"}
+  call dialog-click {"button":"OK"}
+  assert dialog is none
+  assert status is Watermark: DRAFT
+  call menu-open {"target":{"ribbon":["Design","Page Background","Watermark"]}}
+  assert reply.items.7.label is DRAFT 2
+  assert reply.items.7.checked is true
+  call menu-click {"label":"Custom Watermark..."}
+  call dialog-read {}
+  assert reply.controls.0.value is Text watermark
+  call dialog-set {"control":"Watermark","value":"No watermark"}
+  call dialog-click {"button":"OK"}
+  assert status is Watermark removed
+
+test Page Borders applies a box with Options margins and None removes it
+  open copy:../fixtures/basic.docx
+  key alt g p b
+  assert dialog is page-borders
+  call dialog-read {}
+  assert reply.title is Borders and Shading
+  assert reply.controls.0.value is None
+  assert reply.controls.4.name is top
+  assert reply.controls.4.enabled is false
+  call dialog-set {"control":"Setting","value":"Box"}
+  call dialog-set {"control":"Style","value":"Double"}
+  call dialog-set {"control":"Width","value":"1 1/2 pt"}
+  call dialog-click {"button":"Options..."}
+  assert dialog is page-border-options
+  call dialog-read {}
+  assert reply.depth is 2
+  assert reply.controls.0.value is 24
+  call dialog-set {"control":"Top","value":10}
+  call dialog-click {"button":"OK"}
+  assert dialog is page-borders
+  call dialog-click {"button":"OK"}
+  assert dialog is none
+  assert status is Page borders applied
+  assert dirty is true
+  shot window
+  key alt g p b
+  call dialog-read {}
+  assert reply.controls.0.value is Box
+  assert reply.controls.1.value is Double
+  call dialog-click {"button":"Options..."}
+  call dialog-read {}
+  assert reply.controls.0.value is 10
+  call dialog-click {"button":"Cancel"}
+  call dialog-set {"control":"Setting","value":"None"}
+  call dialog-click {"button":"OK"}
+  assert status is Page borders removed
+  key ctrl+z
+  key alt g p b
+  call dialog-read {}
+  assert reply.controls.0.value is Box
+  call dialog-click {"button":"Cancel"}
