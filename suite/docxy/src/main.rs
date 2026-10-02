@@ -2522,6 +2522,13 @@ struct DocTab {
     /// This document's mail merge (#628): its type, recipient list and
     /// preview state.
     mail: mailings_tab::MailState,
+    /// A converted tab's document as it was converted (#633): what
+    /// Protected View's rollback restores, so it never converts again.
+    converted_docx: Option<std::rc::Rc<Vec<u8>>>,
+    /// A converted tab restored from the session and not converted yet
+    /// (#633): it is, when it is first drawn as the active tab, so a
+    /// startup never waits on more than the tab in front.
+    pending_conversion: bool,
 }
 
 impl DocTab {
@@ -4306,6 +4313,8 @@ struct Loaded {
     /// `doc` was converted from another format, or recovered (#633): the
     /// tab must never write it back over its file.
     converted: Option<open_mode::Converted>,
+    /// The converted `.docx` the tab was built from, kept for rollback.
+    converted_docx: Option<std::rc::Rc<Vec<u8>>>,
 }
 
 impl Loaded {
@@ -4320,25 +4329,10 @@ impl Loaded {
             bundle_html: None,
             load_failed: true,
             converted: None,
+            converted_docx: None,
         }
     }
 
-    /// A document converted from another format (#633), or a load error
-    /// saying why it could not be.
-    fn converted(result: Result<Document, String>, kind: open_mode::Converted) -> Self {
-        match result {
-            Ok(doc) => {
-                let paragraphs = docxcore::import::paragraph_count(&doc);
-                Loaded {
-                    doc,
-                    load_failed: false,
-                    converted: Some(kind),
-                    ..Loaded::empty(kind.loaded_status(paragraphs))
-                }
-            }
-            Err(e) => Loaded::empty(format!("load error: {e}")),
-        }
-    }
     fn into_tab(
         self,
         kind: Kind,
@@ -4367,6 +4361,8 @@ impl Loaded {
                 ..Default::default()
             },
             last_hot: Default::default(),
+            converted_docx: self.converted_docx,
+            pending_conversion: false,
         }
     }
 }
@@ -4389,6 +4385,7 @@ fn load_bytes(bytes: &[u8]) -> Loaded {
             bundle_html: None,
             load_failed: false,
             converted: None,
+            converted_docx: None,
         },
         Err(e) => Loaded::empty(format!("load error: {e:?}")),
     }
@@ -4405,12 +4402,24 @@ fn load_or_recover(path: &std::path::Path, bytes: &[u8]) -> Loaded {
     convert_doc(path, bytes, convert_child::What::Recover).unwrap_or(loaded)
 }
 
-/// Convert `path` (whose content is `bytes`) as `what` (#633). In a child
-/// process ([`convert_child`]), so an import that aborts, runs out of
-/// memory or hangs costs that child only, and is a load error here; in
-/// process for unit tests or with `DOCXY_CONVERT_IN_PROCESS=1`. `None` only
-/// when recovery found no text.
+/// Convert `path` (whose content is `bytes`) as `what` (#633), with the
+/// process's runner: a child process ([`convert_child`]), so an import that
+/// aborts, runs out of memory or hangs costs that child only and is a load
+/// error here; in process for unit tests or `DOCXY_CONVERT_IN_PROCESS=1`.
+/// Either way the tab is built from the same converted `.docx`
+/// ([`loaded_from_converted_docx`]). `None` only when recovery found no
+/// text.
 fn convert_doc(path: &std::path::Path, bytes: &[u8], what: convert_child::What) -> Option<Loaded> {
+    convert_doc_with(path, bytes, what, convert_child::runner())
+}
+
+/// [`convert_doc`] with a given runner (tests pass the real child).
+fn convert_doc_with(
+    path: &std::path::Path,
+    bytes: &[u8],
+    what: convert_child::What,
+    run: convert_child::Runner,
+) -> Option<Loaded> {
     use convert_child::{Outcome, What};
     let kind = match what {
         What::Rtf => open_mode::Converted::Rtf,
@@ -4419,31 +4428,73 @@ fn convert_doc(path: &std::path::Path, bytes: &[u8], what: convert_child::What) 
         What::Recover => open_mode::Converted::Recovered,
         What::RecoverText => open_mode::Converted::RecoveredText,
     };
-    if convert_child::in_process() {
-        return match convert_child::convert_bytes(what, bytes) {
-            Ok(Some(doc)) => Some(Loaded::converted(Ok(doc), kind)),
-            Ok(None) => None,
-            Err(e) => Some(Loaded::empty(format!("load error: {e}"))),
-        };
-    }
-    Some(match convert_child::convert(what, path) {
-        Outcome::Converted(docx) => {
-            let mut l = load_bytes(&docx);
-            if l.load_failed {
-                return Some(Loaded::empty(format!(
-                    "load error: {}",
-                    convert_child::DIED
-                )));
-            }
-            l.status = kind
-                .loaded_status(docxcore::import::paragraph_count(&l.doc))
-                .into();
-            l.converted = Some(kind);
-            l
-        }
+    Some(match run(what, path, bytes) {
+        Outcome::Converted(docx) => loaded_from_converted_docx(docx, kind),
         Outcome::Failed(why) => Loaded::empty(format!("load error: {why}")),
         Outcome::NothingRecovered => return None,
     })
+}
+
+/// The tab a conversion's `.docx` makes: loaded like any Word document (its
+/// Markdown package, which defines its styles and lists, and its final
+/// section), marked converted, its bytes kept for Protected View's rollback.
+fn loaded_from_converted_docx(docx: Vec<u8>, kind: open_mode::Converted) -> Loaded {
+    let mut l = load_bytes(&docx);
+    if l.load_failed {
+        return Loaded::empty(format!("load error: {}", convert_child::DIED));
+    }
+    l.status = kind
+        .loaded_status(docxcore::import::paragraph_count(&l.doc))
+        .into();
+    l.converted = Some(kind);
+    l.converted_docx = Some(std::rc::Rc::new(docx));
+    l
+}
+
+/// A plain document's file loaded again, never converted (#633):
+/// Markdown, a docxy bundle, or a Word package, which may fail to load.
+/// What Protected View's rollback reads, inside a frame.
+fn reload_without_converting(path: &std::path::Path) -> Loaded {
+    match std::fs::read(path) {
+        Ok(bytes) if is_markdown_path(path) => markdown_from_bytes(&bytes),
+        Ok(bytes) if htmlbundle::is_bundle(&bytes) => bundle_from_path(path),
+        Ok(bytes) => load_bytes(&bytes),
+        Err(e) => Loaded::empty(format!("read error: {e}")),
+    }
+}
+
+/// Convert a converted tab restored from the session (#633), now that it is
+/// in front: what its file converts to today.
+fn finish_pending_conversion(tab: &mut DocTab) {
+    if !tab.pending_conversion {
+        return;
+    }
+    tab.pending_conversion = false;
+    let Some(path) = tab.path.clone() else {
+        return;
+    };
+    let l = load_doc_for_tab(&path, tab.access.converted);
+    tab.surface = Surface::Doc(Editor::new(l.doc));
+    tab.comments = l.comments;
+    tab.notes = l.notes;
+    tab.mail = mailings_tab::MailState::from_pkg(l.pkg.as_ref());
+    tab.pkg = l.pkg;
+    tab.status = l.status;
+    tab.load_failed = l.load_failed;
+    tab.converted_docx = l.converted_docx;
+    // A file that no longer converts the same way keeps the session's
+    // mark, so Save still never writes over it.
+    tab.access.converted = tab.access.converted.or(l.converted);
+}
+
+/// A converted tab restored from the session, not converted yet (#633): a
+/// placeholder until it is first drawn as the active tab.
+fn pending_conversion(kind: open_mode::Converted) -> Loaded {
+    Loaded {
+        load_failed: false,
+        converted: Some(kind),
+        ..Loaded::empty("not converted yet: it converts when you open its tab")
+    }
 }
 
 /// What Word 97-2003 binaries and encrypted packages (both OLE compound
@@ -4654,6 +4705,8 @@ fn sheet_tab_from_path(path: &PathBuf, repair: bool) -> DocTab {
         dialogs: crate::dialog::DialogStack::default(),
         access: crate::open_mode::Access::default(),
         last_hot: Default::default(),
+        converted_docx: None,
+        pending_conversion: false,
         mail: Default::default(),
     }
 }
@@ -7270,11 +7323,17 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
 /// stays in its model there, but it cannot be saved: every save is refused
 /// first. Either way both stacks are forgotten and the tab stays clean.
 fn protected_rollback(tab: &mut DocTab) {
-    // A document (#633) is loaded again the way it was opened: converted,
-    // recovered or plain. A protected tab always has its file.
+    // A document (#633) is restored as it was opened: converted or plain.
     if matches!(tab.surface, Surface::Doc(_)) {
-        if let Some(path) = tab.path.clone() {
-            let l = load_doc_for_tab(&path, tab.access.converted);
+        // A converted tab restores the document it was converted to, never
+        // converting again (no child process inside a frame); a tab not
+        // converted yet has nothing to roll back.
+        let reloaded = match (tab.access.converted, tab.converted_docx.clone()) {
+            (Some(kind), Some(docx)) => Some(loaded_from_converted_docx(docx.to_vec(), kind)),
+            (Some(_), None) => None,
+            (None, _) => tab.path.clone().map(|p| reload_without_converting(&p)),
+        };
+        if let Some(l) = reloaded {
             tab.surface = Surface::Doc(Editor::new(l.doc));
             tab.comments = l.comments;
             tab.notes = l.notes;
@@ -7567,7 +7626,15 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
             // unreadable and the tab reopens its file below, rather than
             // showing whatever text Recover Text could read from it.
             let mut l = match std::fs::read(hp) {
-                Ok(bytes) => load_bytes(&bytes),
+                Ok(bytes) => {
+                    let mut l = load_bytes(&bytes);
+                    // A converted tab's sidecar is what it shows: what a
+                    // rollback restores (never converting the file again).
+                    if t.converted.is_some() && !l.load_failed {
+                        l.converted_docx = Some(std::rc::Rc::new(bytes));
+                    }
+                    l
+                }
                 Err(e) => Loaded::empty(format!("read error: {e}")),
             };
             // A 0-byte sidecar is a truncated write, not an empty document:
@@ -7581,11 +7648,17 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 // protect.
                 match &path {
                     Some(p) => {
-                        let mut fresh = load_doc_for_tab(p, t.converted);
-                        if !fresh.load_failed {
+                        // A converted one is converted when it is opened.
+                        let mut fresh = match t.converted {
+                            Some(kind) => pending_conversion(kind),
+                            None => load_doc_for_tab(p, None),
+                        };
+                        if !fresh.load_failed && t.converted.is_none() {
                             fresh.status = "loaded — the restored copy could not be read, so the file was reopened from disk".into();
                         }
-                        fresh.into_tab(t.kind, t.title.clone().into(), path, false)
+                        let mut tab = fresh.into_tab(t.kind, t.title.clone().into(), path, false);
+                        tab.pending_conversion = t.converted.is_some();
+                        tab
                     }
                     None => {
                         l.load_failed = false;
@@ -7662,15 +7735,27 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 dialogs: crate::dialog::DialogStack::default(),
                 access: crate::open_mode::Access::default(),
                 last_hot: Default::default(),
+                converted_docx: None,
+                pending_conversion: false,
                 mail: Default::default(),
             }
         }
         // A document with no sidecar reloads its file, bundle included; the
         // fresh load alone says whether it failed.
-        (Kind::Docx, None) if path.is_some() => {
-            let l = load_doc_for_tab(path.as_ref().unwrap(), t.converted);
-            l.into_tab(t.kind, t.title.clone().into(), path, t.dirty)
-        }
+        // A converted one is converted when its tab is first in front, so a
+        // startup does not wait on every converted tab's file.
+        (Kind::Docx, None) if path.is_some() => match t.converted {
+            Some(kind) => {
+                let mut tab =
+                    pending_conversion(kind).into_tab(t.kind, t.title.clone().into(), path, false);
+                tab.pending_conversion = true;
+                tab
+            }
+            None => {
+                let l = load_doc_for_tab(path.as_ref().unwrap(), None);
+                l.into_tab(t.kind, t.title.clone().into(), path, t.dirty)
+            }
+        },
         _ => {
             let (surface, comments, notes, pkg, status) = build_surface(t.kind, path.as_ref());
             let markdown = path.as_deref().map(is_markdown_path).unwrap_or(false);
@@ -7692,6 +7777,8 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 dialogs: crate::dialog::DialogStack::default(),
                 access: crate::open_mode::Access::default(),
                 last_hot: Default::default(),
+                converted_docx: None,
+                pending_conversion: false,
             }
         }
     };
@@ -7766,14 +7853,12 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
     // spreadsheets → .xlsx, projects → .yppx; restored in preference to `path`.
     // Missing or unreadable project sidecars use restore_project_tab's recovery policy.
     let hot = match &t.surface {
+        // A converted tab not converted yet shows a placeholder, not its
+        // document: no sidecar, so the next start converts it again.
+        Surface::Doc(_) if t.pending_conversion => None,
         Surface::Doc(ed) => {
             let p = hd.join(format!("tab-{i}.docx"));
-            let bytes = doc_to_docx_styled(
-                &ed.doc,
-                &t.comments,
-                t.pkg.as_ref(),
-                t.access.converted.is_some(),
-            );
+            let bytes = doc_to_docx(&ed.doc, &t.comments, t.pkg.as_ref());
             opccore::fsio::write_atomic(&p, &bytes)
                 .ok()
                 .map(|_| p.display().to_string())
@@ -8275,6 +8360,8 @@ impl Docxy {
             dialogs: crate::dialog::DialogStack::default(),
             access: crate::open_mode::Access::default(),
             last_hot: Default::default(),
+            converted_docx: None,
+            pending_conversion: false,
             mail: Default::default(),
         };
         self.tabs.push(match kind {
@@ -14059,6 +14146,10 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
     let Surface::Doc(editor) = &tab.surface else {
         return false;
     };
+    if tab.pending_conversion {
+        tab.status = "this document has not been converted yet: open its tab first".into();
+        return false;
+    }
     if tab.access.protected {
         tab.status = open_mode::PROTECTED_STATUS.into();
         return false;
@@ -14103,14 +14194,9 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
     // bundle the tab holds (or become a new one), everything else is lossless
     // .docx.
     let kind = html_bundle::doc_target(&path, markdown);
-    let docx = || {
-        doc_to_docx_styled(
-            &editor.doc,
-            &tab.comments,
-            tab.pkg.as_ref(),
-            tab.access.converted.is_some(),
-        )
-    };
+    // A converted tab has the package its conversion wrote (#633), so it
+    // saves into it like any other Word document.
+    let docx = || doc_to_docx(&editor.doc, &tab.comments, tab.pkg.as_ref());
     // The Word package written, alone or inside a page.
     let mut package: Option<Vec<u8>> = None;
     let bytes = match kind {
@@ -17758,6 +17844,8 @@ mod sheet_save_tests {
             dialogs: crate::dialog::DialogStack::default(),
             access: crate::open_mode::Access::default(),
             last_hot: Default::default(),
+            converted_docx: None,
+            pending_conversion: false,
             mail: Default::default(),
         }
     }
@@ -24550,6 +24638,11 @@ impl Render for Docxy {
             if t.access.protected && t.dirty {
                 protected_rollback(t);
             }
+        }
+        // A converted tab restored from the session converts when it is
+        // first in front (#633): at most one conversion per tab switch.
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            finish_pending_conversion(t);
         }
         {
             let mut p = self.probes.borrow_mut();

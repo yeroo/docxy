@@ -508,6 +508,8 @@ mod tests {
             dialogs: crate::dialog::DialogStack::default(),
             access: crate::open_mode::Access::default(),
             last_hot: Default::default(),
+            converted_docx: None,
+            pending_conversion: false,
             mail: Default::default(),
         }
     }

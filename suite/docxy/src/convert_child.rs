@@ -24,8 +24,11 @@ use std::time::{Duration, Instant};
 
 /// The hidden flag that makes the suite a converting child.
 pub(crate) const FLAG: &str = "--convert-import";
-/// The longest a conversion may take.
-pub(crate) const TIMEOUT: Duration = Duration::from_secs(60);
+/// The longest a conversion may take. The suite waits on its UI thread, so
+/// this is how long a file that defeats the import budget can freeze it:
+/// the budgets make a real conversion take seconds (the Word fixture PDF
+/// converts in well under one), and this leaves room for a slow machine.
+pub(crate) const TIMEOUT: Duration = Duration::from_secs(20);
 /// The most memory a converting child may commit (Windows only).
 pub(crate) const MEMORY_LIMIT: usize = 2 << 30;
 /// Set to `1` to convert in the suite's own process instead.
@@ -89,6 +92,41 @@ pub(crate) enum Outcome {
 /// Whether conversions run in the suite's own process.
 pub(crate) fn in_process() -> bool {
     cfg!(test) || std::env::var_os(IN_PROCESS_ENV).is_some_and(|v| v == "1")
+}
+
+/// How a conversion is run: `(what, path, its bytes) -> Outcome`. Both kinds
+/// hand back the same `.docx`, so a tab is built the same way from either.
+pub(crate) type Runner = fn(What, &Path, &[u8]) -> Outcome;
+
+/// The runner this process uses: in process for unit tests and
+/// `DOCXY_CONVERT_IN_PROCESS=1`, else a child.
+pub(crate) fn runner() -> Runner {
+    if in_process() {
+        in_process_runner
+    } else {
+        child_runner
+    }
+}
+
+/// Convert in this process, ending as the child does: the document written
+/// with `doc_to_docx_styled(.., converted = true)`.
+pub(crate) fn in_process_runner(what: What, _path: &Path, bytes: &[u8]) -> Outcome {
+    match convert_bytes(what, bytes) {
+        Ok(Some(doc)) => Outcome::Converted(crate::doc_to_docx_styled(&doc, &[], None, true)),
+        Ok(None) => Outcome::NothingRecovered,
+        Err(e) => Outcome::Failed(e),
+    }
+}
+
+/// Convert in a child process ([`convert`]).
+pub(crate) fn child_runner(what: What, path: &Path, _bytes: &[u8]) -> Outcome {
+    convert(what, path)
+}
+
+/// What a conversion that could not even start says, with the system's
+/// reason: not the file's fault.
+fn cannot_start(e: impl std::fmt::Display) -> Outcome {
+    Outcome::Failed(format!("cannot start the conversion: {e}"))
 }
 
 /// The child's side: when the command line asks for a conversion, do it
@@ -158,11 +196,13 @@ pub(crate) fn convert_bytes(
 
 /// The parent's side: convert `path` as `what` in a child process.
 pub(crate) fn convert(what: What, path: &Path) -> Outcome {
-    let Ok(exe) = std::env::current_exe() else {
-        return Outcome::Failed(DIED.into());
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => return cannot_start(e),
     };
-    let Some(dir) = TempDir::new() else {
-        return Outcome::Failed(DIED.into());
+    let dir = match TempDir::new() {
+        Ok(dir) => dir,
+        Err(e) => return cannot_start(e),
     };
     let out = dir.0.join("converted.docx");
     let mut cmd = Command::new(exe);
@@ -181,8 +221,9 @@ fn run_child(
     memory: usize,
 ) -> Outcome {
     let err_path = dir.join("stderr.txt");
-    let Ok(err_file) = std::fs::File::create(&err_path) else {
-        return Outcome::Failed(DIED.into());
+    let err_file = match std::fs::File::create(&err_path) {
+        Ok(f) => f,
+        Err(e) => return cannot_start(e),
     };
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -193,8 +234,9 @@ fn run_child(
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    let Ok(mut child) = cmd.spawn() else {
-        return Outcome::Failed(DIED.into());
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => return cannot_start(e),
     };
     // ⚠️ The child is put in its job just after it starts, so it runs a
     // moment unlimited; the import has not started by then (it reads its
@@ -235,7 +277,7 @@ fn run_child(
 struct TempDir(PathBuf);
 
 impl TempDir {
-    fn new() -> Option<Self> {
+    fn new() -> std::io::Result<Self> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let nanos = std::time::SystemTime::now()
@@ -247,8 +289,8 @@ impl TempDir {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        std::fs::create_dir_all(&dir).ok()?;
-        Some(TempDir(dir))
+        std::fs::create_dir_all(&dir)?;
+        Ok(TempDir(dir))
     }
 }
 
@@ -368,7 +410,7 @@ mod job {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Set to `what|in|out` (and `MODE_ENV` to misbehave) to make the test
@@ -400,6 +442,12 @@ mod tests {
         let parts: Vec<&str> = spec.split('|').collect();
         let what = What::parse(parts[0]).unwrap();
         std::process::exit(run(what, Path::new(parts[1]), Path::new(parts[2])));
+    }
+
+    /// A [`Runner`] that runs this test binary as the converting child: what
+    /// the suite's own tests use to drive the production path end to end.
+    pub(crate) fn test_child_runner(what: What, path: &Path, _bytes: &[u8]) -> Outcome {
+        convert_by_test_child(what, path, None, TIMEOUT, MEMORY_LIMIT)
     }
 
     /// Run this test binary as a converting child of `what` over `input`.
@@ -482,6 +530,22 @@ mod tests {
             convert_by_test_child(What::Recover, &junk, None, TIMEOUT, MEMORY_LIMIT),
             Outcome::NothingRecovered
         ));
+    }
+
+    /// A child that cannot start is the system's failure, said with its
+    /// reason, not "the file could not be converted".
+    #[test]
+    fn a_child_that_cannot_start_says_why() {
+        let dir = TempDir::new().unwrap();
+        let out = dir.0.join("converted.docx");
+        let cmd = Command::new(dir.0.join("no-such-program.exe"));
+        match run_child(cmd, &dir.0, &out, TIMEOUT, MEMORY_LIMIT) {
+            Outcome::Failed(why) => {
+                assert!(why.starts_with("cannot start the conversion: "), "{why}");
+                assert_ne!(why, DIED);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

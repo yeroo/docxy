@@ -2,12 +2,14 @@
 //! window: the format by content, the converted tab, its save gate, Recover
 //! Text from Any File and the session.
 
+use crate::convert_child::{self, What};
 use crate::open_mode::{Access, Converted, OpenMode, converted_refusal};
 use crate::open_mode_tests::Scratch;
 use crate::trusted::TrustStore;
 use crate::{
-    DocTab, Surface, doc_save_as_name, doc_target_allowed, persist_tab, restore_tab, save_doc_tab,
-    tab_from_path, tab_from_path_mode,
+    DocTab, Kind, Surface, convert_doc_with, doc_save_as_name, doc_target_allowed,
+    finish_pending_conversion, persist_tab, restore_tab, save_doc_tab, tab_from_path,
+    tab_from_path_mode,
 };
 use docxcore::model::Block;
 use std::path::{Path, PathBuf};
@@ -273,20 +275,25 @@ fn a_converted_tab_comes_back_converted_from_the_session() {
     assert!(back.dirty);
     assert!(!save_doc_tab(&mut back, None));
     assert_eq!(std::fs::read(&src).unwrap(), RTF);
-    // Clean, with no sidecar: converted again from the file.
+    // Clean, with no sidecar: converted again from the file, when its tab
+    // is first in front (FIX r4 M2), not at restore.
     let mut clean = persist_tab(&hot, 1, &tab_from_path(&src));
     clean.hot = None;
     clean.dirty = false;
-    let back = restore_tab(&clean);
+    let mut back = restore_tab(&clean);
     assert_eq!(back.access.converted, Some(Converted::Rtf));
+    assert!(back.pending_conversion);
+    finish_pending_conversion(&mut back);
+    assert!(!back.pending_conversion);
     assert_eq!(texts(&back), ["Letter", "Dear reader, caf\u{e9}."]);
     // A Recover Text tab restores as recovered text.
     let blob = write(&dir, "blob.bin", b"\x00\x01Some readable text\x00");
     let rt = tab_from_path_mode(&blob, OpenMode::RecoverText, &TrustStore::default()).unwrap();
     let mut p = persist_tab(&hot, 2, &rt);
     p.hot = None;
-    let back = restore_tab(&p);
+    let mut back = restore_tab(&p);
     assert_eq!(back.access.converted, Some(Converted::RecoveredText));
+    finish_pending_conversion(&mut back);
     assert_eq!(texts(&back), ["Some readable text"]);
 }
 
@@ -312,14 +319,15 @@ fn an_old_session_of_a_damaged_file_still_refuses_save_over_it() {
     assert_eq!(std::fs::read(&cut).unwrap(), &bytes[..bytes.len() / 2]);
 }
 
-/// FIX r1 M3: attaching a recipient list gives a converted tab its package
-/// (`mailings_tab::package`); that package must define the heading styles
-/// the conversion uses, or Save As writes `Heading1` with no definition.
+/// FIX r1 M3, r4 M1: a converted tab has the package its conversion wrote
+/// (the Markdown package, which defines the heading styles), so attaching
+/// a recipient list keeps that package and Save As keeps `Heading1`
+/// defined.
 #[test]
 fn a_converted_tab_given_a_mail_merge_package_keeps_its_heading_style() {
     let dir = Scratch::new();
     let mut tab = tab_from_path(&write(&dir, "letter.rtf", RTF));
-    assert!(tab.pkg.is_none());
+    assert!(tab.pkg.is_some(), "the conversion's package");
     let list = write(&dir, "people.csv", b"Name,City\nAda,London\n");
     crate::mailings_tab::attach(&mut tab, &list).unwrap();
     assert!(tab.pkg.is_some());
@@ -328,4 +336,128 @@ fn a_converted_tab_given_a_mail_merge_package_keeps_its_heading_style() {
     let pkg = docxcore::package::load_package(&std::fs::read(&docx).unwrap()).unwrap();
     let styles = String::from_utf8_lossy(pkg.part("word/styles.xml").unwrap()).into_owned();
     assert!(styles.contains("w:styleId=\"Heading1\""), "{styles}");
+}
+
+/// FIX r4 M1: `convert_doc` through the real converting child (this test
+/// binary run as `docxy --convert-import`'s twin) builds the tab every open
+/// builds: converted, its status, the conversion's package, and Save never
+/// over the source. Recovery of a truncated .docx goes the same way.
+#[test]
+fn convert_doc_through_the_real_child_builds_the_production_tab() {
+    let dir = Scratch::new();
+    let rtf = write(&dir, "letter.rtf", RTF);
+    let l = convert_doc_with(
+        &rtf,
+        RTF,
+        What::Rtf,
+        convert_child::tests::test_child_runner,
+    )
+    .unwrap();
+    let mut tab = l.into_tab(Kind::Docx, "letter.rtf".into(), Some(rtf.clone()), false);
+    assert_eq!(tab.access.converted, Some(Converted::Rtf));
+    assert_eq!(tab.status.as_ref(), "loaded (converted from RTF)");
+    assert!(tab.pkg.is_some());
+    assert!(tab.converted_docx.is_some());
+    assert_eq!(texts(&tab), ["Letter", "Dear reader, caf\u{e9}."]);
+    tab.dirty = true;
+    assert!(!save_doc_tab(&mut tab, None));
+    assert!(!save_doc_tab(&mut tab, Some(rtf.clone())));
+    assert_eq!(std::fs::read(&rtf).unwrap(), RTF);
+
+    let whole = long_docx(&dir, "whole.docx", 60);
+    let bytes = std::fs::read(&whole).unwrap();
+    let cut = write(&dir, "cut.docx", &bytes[..bytes.len() / 2]);
+    let cut_bytes = std::fs::read(&cut).unwrap();
+    let l = convert_doc_with(
+        &cut,
+        &cut_bytes,
+        What::Recover,
+        convert_child::tests::test_child_runner,
+    )
+    .unwrap();
+    let mut tab = l.into_tab(Kind::Docx, "cut.docx".into(), Some(cut.clone()), false);
+    assert_eq!(tab.access.converted, Some(Converted::Recovered));
+    assert!(
+        tab.status
+            .starts_with("recovered text from a damaged file ("),
+        "{}",
+        tab.status
+    );
+    assert!(tab.pkg.is_some());
+    tab.dirty = true;
+    assert!(!save_doc_tab(&mut tab, None));
+    assert_eq!(std::fs::read(&cut).unwrap(), cut_bytes);
+    // Nothing to recover: no tab from the child either (the caller keeps
+    // its own load error).
+    let junk = write(&dir, "junk.docx", b"not a zip");
+    assert!(
+        convert_doc_with(
+            &junk,
+            b"not a zip",
+            What::Recover,
+            convert_child::tests::test_child_runner
+        )
+        .is_none()
+    );
+}
+
+/// FIX r4 M1: the in-process runner (unit tests) builds the same tab shape
+/// as the child: from the converted .docx, with its package.
+#[test]
+fn the_in_process_runner_builds_the_same_tab() {
+    let dir = Scratch::new();
+    let rtf = write(&dir, "letter.rtf", RTF);
+    let l = convert_doc_with(&rtf, RTF, What::Rtf, convert_child::in_process_runner).unwrap();
+    let tab = l.into_tab(Kind::Docx, "letter.rtf".into(), Some(rtf), false);
+    assert!(tab.pkg.is_some());
+    assert!(tab.converted_docx.is_some());
+    assert_eq!(tab.access.converted, Some(Converted::Rtf));
+}
+
+/// FIX r4 M2: Protected View's rollback of a converted tab restores what it
+/// was converted to, without converting the file again (here, the file is
+/// gone by then).
+#[test]
+fn a_converted_tabs_rollback_never_converts_again() {
+    let dir = Scratch::new();
+    let src = write(&dir, "letter.rtf", RTF);
+    let mut tab = tab_from_path(&src);
+    tab.access.protected = true;
+    std::fs::remove_file(&src).unwrap();
+    let Surface::Doc(ed) = &mut tab.surface else {
+        panic!()
+    };
+    ed.insert_str("LEAKED ");
+    tab.mark_dirty();
+    assert!(!tab.dirty);
+    assert_eq!(texts(&tab), ["Letter", "Dear reader, caf\u{e9}."]);
+    assert_eq!(tab.access.converted, Some(Converted::Rtf));
+}
+
+/// FIX r4 M2: a clean converted tab restored from the session waits to be
+/// converted; meanwhile it keeps no sidecar and refuses every save.
+#[test]
+fn a_restored_converted_tab_waits_and_saves_nothing() {
+    let dir = Scratch::new();
+    let src = write(&dir, "letter.rtf", RTF);
+    let hot = dir.path("hot");
+    std::fs::create_dir_all(&hot).unwrap();
+    let mut p = persist_tab(&hot, 0, &tab_from_path(&src));
+    p.hot = None;
+    p.dirty = false;
+    // The file is unreadable at restore: restore does not even look at it.
+    std::fs::remove_file(&src).unwrap();
+    let mut back = restore_tab(&p);
+    assert!(back.pending_conversion);
+    assert!(persist_tab(&hot, 1, &back).hot.is_none());
+    assert!(!save_doc_tab(&mut back, Some(dir.path("copy.docx"))));
+    assert!(
+        back.status.contains("not been converted yet"),
+        "{}",
+        back.status
+    );
+    std::fs::write(&src, RTF).unwrap();
+    finish_pending_conversion(&mut back);
+    assert_eq!(texts(&back), ["Letter", "Dear reader, caf\u{e9}."]);
+    assert!(back.converted_docx.is_some());
 }
