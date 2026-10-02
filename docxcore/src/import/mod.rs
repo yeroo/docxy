@@ -14,10 +14,12 @@
 
 pub mod html;
 pub mod pdf;
+pub mod recover;
 pub mod rtf;
 
 pub use html::import_html;
 pub use pdf::import_pdf;
+pub use recover::{paragraph_count, recover_any_text, recover_docx_text};
 pub use rtf::import_rtf;
 
 use crate::model::{
