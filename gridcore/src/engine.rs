@@ -1233,6 +1233,8 @@ impl Engine {
         if seeds.len() > COVER_SEED_LIMIT {
             return self.formulas_reading_scan(seeds, skip);
         }
+        #[cfg(test)]
+        tests::COVER_STABS.with(|n| n.set(n.get() + 1));
         self.ensure_covers();
         let mut out = Vec::new();
         let mut seen: HashSet<Key> = HashSet::new();
@@ -2676,6 +2678,10 @@ mod tests {
         /// How many candidate rects [`CoverIndex::for_each_covering`] has
         /// visited on this thread — the walked axis' stab count.
         pub(super) static COVER_VISITS: StdCell<usize> = const { StdCell::new(0) };
+        /// How many times [`Engine::formulas_reading`] answered through the
+        /// cover index (a seed set at or below [`COVER_SEED_LIMIT`]) on this
+        /// thread, as opposed to delegating to the scan.
+        pub(super) static COVER_STABS: StdCell<usize> = const { StdCell::new(0) };
     }
 
     fn wb_one_sheet(cells: &[(&str, Cell)]) -> Workbook {
@@ -4488,9 +4494,20 @@ mod tests {
         assert_eq!(large.len(), COVER_SEED_LIMIT + 1);
         for seeds in [&small, &large] {
             let want = naive_rect_readers(&eng, seeds, &HashSet::new());
+            COVER_STABS.with(|n| n.set(0));
             let mut cover = eng.formulas_reading(seeds, &HashSet::new());
             cover.sort_unstable();
             assert_eq!(cover, want, "{} seeds, cover branch", seeds.len());
+            // The dispatch boundary itself: exactly COVER_SEED_LIMIT seeds
+            // stab, one more scans (a `>=` at the cutoff would read 0 / 2).
+            let stabs = COVER_STABS.with(StdCell::get);
+            let expect_stabs = usize::from(seeds.len() <= COVER_SEED_LIMIT);
+            assert_eq!(
+                stabs,
+                expect_stabs,
+                "{} seeds: dispatch boundary",
+                seeds.len()
+            );
             let mut scan = eng.formulas_reading_scan(seeds, &HashSet::new());
             scan.sort_unstable();
             assert_eq!(scan, want, "{} seeds, scan branch", seeds.len());
