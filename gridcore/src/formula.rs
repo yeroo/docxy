@@ -2368,8 +2368,8 @@ pub struct FormulaHost {
 /// Rewrite every structured reference to `t` as the cells it covers, as
 /// Excel's Convert to Range does: `Sales[Qty]` → `$B$2:$B$4`,
 /// `[@Qty]` → `$B5` (absolute column, the formula's own row), a reference
-/// from another sheet (or from no cell at all) qualified with the table's
-/// sheet. A bare table name (`ROWS(Sales)`) becomes its data region. A
+/// from a formula not on the table's sheet (`host.same_sheet` false: another
+/// sheet, or a defined name) qualified with the table's sheet. A bare table name (`ROWS(Sales)`) becomes its data region. A
 /// reference that covers nothing (a missing column, `#Totals` with no totals
 /// row) becomes `#REF!`. `[#This Row]` without a row is left alone.
 pub fn table_refs_to_cells_in_expr(e: &Expr, t: &TableToRange, host: FormulaHost) -> Expr {
@@ -5349,6 +5349,16 @@ pub fn file_formula(src: &str) -> Cow<'_, str> {
     }
     out.push_str(&src[at..]);
     Cow::Owned(out)
+}
+
+/// Print `e` as a file stores it: `[#This Row]` for `@`, `_xlfn.` and
+/// `_xlpm.` prefixes ([`file_formula`] for text already parsed).
+pub fn to_file_string(e: &Expr) -> String {
+    let mut p = Printer {
+        file: true,
+        scope: Vec::new(),
+    };
+    p.print(e)
 }
 
 /// Turn a stored formula into the text Excel *shows*: strip the future-function

@@ -1744,6 +1744,24 @@ fn shift_grid(sheet: &mut Sheet, shift: &EditShift) {
 // Tables: rename, resize, convert to range
 // ---------------------------------------------------------------------------
 
+/// The name a new table column takes, as Excel's Format as Table and Resize
+/// Table give it: its header cell's text (a number's digits), else
+/// `Column<n>`; then made unique against `taken`, case-insensitively as table
+/// column names compare, by appending 2, 3, ….
+pub fn table_column_name(header: Option<&CellValue>, n: u32, taken: &[String]) -> String {
+    let base = match header {
+        Some(CellValue::Text(t)) if !t.trim().is_empty() => t.clone(),
+        Some(CellValue::Number(v)) => v.to_string(),
+        _ => format!("Column{n}"),
+    };
+    let (mut name, mut k) = (base.clone(), 1);
+    while taken.iter().any(|x| x.eq_ignore_ascii_case(&name)) {
+        k += 1;
+        name = format!("{base}{k}");
+    }
+    name
+}
+
 fn rects_overlap(a: (u32, u32, u32, u32), b: (u32, u32, u32, u32)) -> bool {
     a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3
 }
@@ -1901,6 +1919,12 @@ pub fn resize_table(
     if r2 - r1 < t.header_rows + t.totals_rows {
         return Err("A table needs at least one data row".into());
     }
+    // The totals row is the table's last row: a new bottom would leave its
+    // cells behind as data (a SUBTOTAL over itself) and make a data row the
+    // totals row. Moving it belongs with the Total Row command.
+    if t.totals_rows > 0 && r2 != t.range.2 {
+        return Err("Turn off the Total Row first".into());
+    }
     if let Some(why) = table_range_conflict(wb, t.sheet, rect, Some(idx)) {
         return Err(why);
     }
@@ -1923,16 +1947,7 @@ pub fn resize_table(
         let header = (header_rows > 0)
             .then(|| wb.sheets[sheet].cell(r1, c).map(|cl| cl.value.clone()))
             .flatten();
-        let base = match &header {
-            Some(CellValue::Text(t)) if !t.trim().is_empty() => t.clone(),
-            Some(CellValue::Number(n)) => n.to_string(),
-            _ => format!("Column{}", c - c1 + 1),
-        };
-        let (mut nm, mut k) = (base.clone(), 1);
-        while taken.iter().any(|x| x.eq_ignore_ascii_case(&nm)) {
-            k += 1;
-            nm = format!("{base}{k}");
-        }
+        let nm = table_column_name(header.as_ref(), c - c1 + 1, &taken);
         taken.push(nm.clone());
         if header_rows > 0 && !matches!(&header, Some(CellValue::Text(t)) if *t == nm) {
             let sh = &mut wb.sheets[sheet];
@@ -1967,14 +1982,17 @@ pub fn convert_table_to_range(wb: &mut Workbook, name: &str) -> Result<(), Strin
     if let Some(p) = pivot {
         return Err(format!("PivotTable {} uses this table", p.name));
     }
-    for sh in &wb.sheets {
-        for (&(r, c), cell) in &sh.cells {
-            let Some(ast) = cell.formula.as_deref().and_then(|f| parse(f).ok()) else {
-                continue;
-            };
+    // Every place the rewrite below reaches (cells, rules, names).
+    let iterates = |src: &str| {
+        parse(src).is_ok_and(|ast| {
             let mut iterated = Vec::new();
             crate::formula::collect_iterated_tables(&ast, &mut iterated);
-            if iterated.iter().any(|n| n.eq_ignore_ascii_case(&t.name)) {
+            iterated.iter().any(|n| n.eq_ignore_ascii_case(&t.name))
+        })
+    };
+    for sh in &wb.sheets {
+        for (&(r, c), cell) in &sh.cells {
+            if cell.formula.as_deref().is_some_and(iterates) {
                 return Err(format!(
                     "The formula in {}!{} iterates this table",
                     sh.name,
@@ -1982,6 +2000,26 @@ pub fn convert_table_to_range(wb: &mut Workbook, name: &str) -> Result<(), Strin
                 ));
             }
         }
+        let cf = sh.cond_formats.iter().flat_map(|cf| &cf.rules);
+        if cf.flat_map(|rule| rule.formulas()).any(|f| iterates(f)) {
+            return Err(format!(
+                "A conditional format on {} iterates this table",
+                sh.name
+            ));
+        }
+        let dv = sh.validations.iter();
+        if dv
+            .flat_map(|v| [&v.formula1, &v.formula2])
+            .any(|f| iterates(f))
+        {
+            return Err(format!(
+                "A data validation rule on {} iterates this table",
+                sh.name
+            ));
+        }
+    }
+    if let Some(dn) = wb.defined_names.iter().find(|d| iterates(&d.formula)) {
+        return Err(format!("The name {} iterates this table", dn.name));
     }
     let info = crate::formula::TableInfo {
         sheet: t.sheet,
@@ -4082,6 +4120,49 @@ mod table_tests {
         assert_eq!(err, "PivotTable PivotTable1 uses this table");
         assert_eq!(wb.tables.len(), 1);
         assert_eq!(formula(&wb, 0, "C2"), "[@Qty]*2");
+
+        // Names and rules are reached by the rewrite too.
+        let mut wb = sales();
+        wb.defined_names.push(DefinedName {
+            name: "Total".into(),
+            scope: None,
+            formula: "SUMX(Sales,[@Qty])".into(),
+        });
+        let err = convert_table_to_range(&mut wb, "Sales").unwrap_err();
+        assert_eq!(err, "The name Total iterates this table");
+        let mut wb = sales();
+        wb.sheets[1].validations.push(crate::sheet::DataValidation {
+            formula1: "SUMX(Sales,[@Qty])>3".into(),
+            ..Default::default()
+        });
+        let err = convert_table_to_range(&mut wb, "Sales").unwrap_err();
+        assert_eq!(err, "A data validation rule on My Data iterates this table");
+        assert_eq!(wb.tables.len(), 1);
+    }
+
+    #[test]
+    fn resize_table_refuses_to_move_a_totals_row() {
+        let mut wb = sales();
+        wb.tables[0].totals_rows = 1;
+        for r2 in [2, 5] {
+            let err = resize_table(&mut wb, "Sales", (0, 0, r2, 2)).unwrap_err();
+            assert_eq!(err, "Turn off the Total Row first");
+        }
+        // Columns may still change: the totals row stays the last row.
+        resize_table(&mut wb, "Sales", (0, 0, 3, 3)).unwrap();
+        assert_eq!(wb.tables[0].range, (0, 0, 3, 3));
+    }
+
+    #[test]
+    fn new_column_names_are_unique_ignoring_case() {
+        let taken = vec!["Qty".to_string(), "Column2".to_string()];
+        let text = CellValue::Text("qty".into());
+        assert_eq!(table_column_name(Some(&text), 1, &taken), "qty2");
+        assert_eq!(table_column_name(None, 2, &taken), "Column22");
+        assert_eq!(
+            table_column_name(Some(&CellValue::Number(2024.0)), 3, &taken),
+            "2024"
+        );
     }
 
     #[test]

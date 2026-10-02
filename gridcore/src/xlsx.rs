@@ -5674,16 +5674,6 @@ fn table_children(xml: &str, name: &str) -> Vec<(usize, usize)> {
     child_spans(xml, (root, root + p.pos()), name)
 }
 
-/// `xml` with the spans in `edits` replaced (they must not overlap).
-fn splice(xml: &str, mut edits: Vec<(usize, usize, String)>) -> String {
-    edits.sort_by_key(|e| std::cmp::Reverse(e.0));
-    let mut out = xml.to_string();
-    for (s, e, text) in edits {
-        out.replace_range(s..e, &text);
-    }
-    out
-}
-
 /// A table converted to a range whose part a save drops: the name other
 /// table parts' formulas know it by, and where its cells are.
 struct ConvertedTable {
@@ -5743,14 +5733,16 @@ fn rewrite_column_formulas(
                 }
                 out = crate::formula::rename_tables_in_expr(&out, renames);
                 if out != ast {
-                    edits.push((body, close, esc_text(&crate::formula::to_string(&out))));
+                    // The file's spelling: `[#This Row]`, `_xlfn.` prefixes.
+                    let text = crate::formula::to_file_string(&out);
+                    edits.push((body, close, esc_text(&text)));
                 }
             }
             Event::Eof => break,
             _ => {}
         }
     }
-    splice(xml, edits)
+    apply_edits(xml.to_string(), edits)
 }
 
 /// Bring a table part's `<tableColumns>` to `columns`: a column the part
@@ -5829,7 +5821,7 @@ fn sync_table_columns(xml: &str, columns: &[String]) -> String {
             }
         }
     }
-    splice(xml, edits)
+    apply_edits(xml.to_string(), edits)
 }
 
 /// `xml` without any `<sortState>` (the table's own or its autoFilter's):
@@ -6906,29 +6898,21 @@ impl SheetPackage {
         }
         // Column names: from the header row (deduped), else generated.
         let mut names: Vec<String> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
         for c in c1..=c2 {
-            let base = if has_header {
-                match self.workbook.sheets[sheet].cell(r1, c).map(|cl| &cl.value) {
-                    Some(crate::sheet::CellValue::Text(t)) if !t.trim().is_empty() => t.clone(),
-                    Some(crate::sheet::CellValue::Number(n)) => n.to_string(),
-                    _ => format!("Column{}", c - c1 + 1),
-                }
-            } else {
-                format!("Column{}", c - c1 + 1)
-            };
-            let (mut nm, mut k) = (base.clone(), 1);
-            while !seen.insert(nm.clone()) {
-                k += 1;
-                nm = format!("{base}{k}");
-            }
-            names.push(nm);
+            let header = has_header
+                .then(|| self.workbook.sheets[sheet].cell(r1, c).map(|cl| &cl.value))
+                .flatten();
+            names.push(crate::edit::table_column_name(header, c - c1 + 1, &names));
         }
-        // Unique table display name.
-        let mut k = self.workbook.tables.len() + 1;
+        // Unique table display name: names compare case-insensitively, and
+        // a table can't take a defined name's.
+        let wb = &self.workbook;
+        let mut k = wb.tables.len() + 1;
         let name = loop {
             let cand = format!("Table{k}");
-            if !self.workbook.tables.iter().any(|t| t.name == cand) {
+            let used = wb.tables.iter().map(|t| &t.name);
+            let used = used.chain(wb.defined_names.iter().map(|d| &d.name));
+            if !used.into_iter().any(|n| n.eq_ignore_ascii_case(&cand)) {
                 break cand;
             }
             k += 1;
@@ -18635,6 +18619,48 @@ mod table_command_tests {
         assert_eq!(column_formula(&re, &part2), "SUM(Sales[Qty])+ROWS(Table1)");
         let names: Vec<&str> = re.workbook.tables.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["Sales", "Table1"]);
+    }
+
+    #[test]
+    fn rewritten_column_formulas_keep_the_file_spelling() {
+        let mut pkg = one_table();
+        let s = &mut pkg.workbook.sheets[0];
+        s.set_cell(5, 0, Cell::text("Key"));
+        s.set_cell(5, 1, Cell::text("Calc"));
+        s.set_cell(6, 0, Cell::text("x"));
+        pkg.add_table(0, (5, 0, 6, 1), true, "TableStyleMedium2")
+            .unwrap();
+        let part2 = pkg.workbook.tables[1].part.clone();
+        calculated(
+            &mut pkg,
+            &part2,
+            "Key",
+            "_xlfn.XLOOKUP(1,Table1[Qty],Table1[Item])",
+        );
+        calculated(&mut pkg, &part2, "Calc", "Table1[[#This Row],[Qty]]*2");
+        rename_table(&mut pkg.workbook, "Table1", "Sales").unwrap();
+        let xml = text(&reload(&pkg), &part2);
+        assert!(
+            xml.contains("_xlfn.XLOOKUP(1,Sales[Qty],Sales[Item])"),
+            "{xml}"
+        );
+        assert!(xml.contains("Sales[[#This Row],[Qty]]*2"), "{xml}");
+    }
+
+    #[test]
+    fn a_new_table_name_is_unique_ignoring_case() {
+        let mut pkg = one_table();
+        rename_table(&mut pkg.workbook, "Table1", "table2").unwrap();
+        pkg.workbook.defined_names.push(DefinedName {
+            name: "TABLE3".into(),
+            scope: None,
+            formula: "1".into(),
+        });
+        pkg.workbook.sheets[0].set_cell(9, 0, Cell::text("H"));
+        let i = pkg
+            .add_table(0, (9, 0, 10, 0), true, "TableStyleMedium2")
+            .unwrap();
+        assert_eq!(pkg.workbook.tables[i].name, "Table4");
     }
 
     #[test]
