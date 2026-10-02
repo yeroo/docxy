@@ -25,12 +25,86 @@
 
 use super::{Builder, heading_props, marker_is_numbered};
 use crate::model::{Document, ParProps, RunProps};
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
-/// Read a PDF. `Err` when it is encrypted, damaged past reading, or has no
-/// text (a scan, or images only).
+/// The most decoded stream data one import may hold (inflate and predictor
+/// output, content streams joined), and the most work it may do (content
+/// tokens, form calls, CMap entries): a hostile file fails with a load error
+/// rather than aborting the process or hanging the UI thread.
+const MAX_DECODED: usize = 256 << 20;
+const MAX_OPS: usize = 20_000_000;
+/// What one ToUnicode CMap may map.
+const MAX_CMAP_ENTRIES: usize = 1 << 20;
+
+const TOO_BIG: &str = "this PDF is too large or too complex to convert";
+
+/// Read a PDF. `Err` when it is encrypted, damaged past reading, has no
+/// text (a scan, or images only), or would cost more than an import may.
 pub fn import_pdf(bytes: &[u8]) -> Result<Document, String> {
-    let file = File::scan(bytes);
+    import_pdf_within(bytes, Budget::new(MAX_DECODED, MAX_OPS))
+}
+
+/// What an import may still spend; once either runs out it stays out.
+struct Budget {
+    bytes: Cell<usize>,
+    ops: Cell<usize>,
+    out: Cell<bool>,
+}
+
+impl Budget {
+    fn new(bytes: usize, ops: usize) -> Self {
+        Budget {
+            bytes: Cell::new(bytes),
+            ops: Cell::new(ops),
+            out: Cell::new(false),
+        }
+    }
+
+    /// Bytes that may still be decoded.
+    fn room(&self) -> usize {
+        if self.out.get() { 0 } else { self.bytes.get() }
+    }
+
+    /// Spend `n` decoded bytes; `false` (and out for good) past the budget.
+    fn take_bytes(&self, n: usize) -> bool {
+        match self.bytes.get().checked_sub(n) {
+            Some(left) if !self.out.get() => {
+                self.bytes.set(left);
+                true
+            }
+            _ => {
+                self.out.set(true);
+                false
+            }
+        }
+    }
+
+    /// Spend one unit of work; `false` (and out for good) past the budget.
+    fn op(&self) -> bool {
+        match self.ops.get().checked_sub(1) {
+            Some(left) if !self.out.get() => {
+                self.ops.set(left);
+                true
+            }
+            _ => {
+                self.out.set(true);
+                false
+            }
+        }
+    }
+
+    fn exhausted(&self) -> bool {
+        self.out.get()
+    }
+}
+
+fn import_pdf_within(bytes: &[u8], budget: Budget) -> Result<Document, String> {
+    let file = File::scan(bytes, budget);
+    if file.budget.exhausted() {
+        return Err(TOO_BIG.into());
+    }
     if file.encrypted {
         return Err("the PDF is encrypted (password-protected), so its text cannot be read".into());
     }
@@ -41,6 +115,9 @@ pub fn import_pdf(bytes: &[u8]) -> Result<Document, String> {
     let mut lines_by_page = Vec::new();
     for page in &pages {
         let glyphs = file.page_glyphs(page);
+        if file.budget.exhausted() {
+            return Err(TOO_BIG.into());
+        }
         lines_by_page.push(make_lines(glyphs));
     }
     let doc = layout(&lines_by_page);
@@ -378,10 +455,16 @@ struct File {
     objects: HashMap<u32, Obj>,
     root: Option<u32>,
     encrypted: bool,
+    budget: Budget,
+    /// Streams decoded so far, by object: a form drawn a thousand times,
+    /// or a content stream listed a thousand times, is decoded once.
+    streams: RefCell<HashMap<u32, Rc<Vec<u8>>>>,
+    /// Fonts loaded so far, by object, for every page.
+    fonts: RefCell<HashMap<u32, Font>>,
 }
 
 impl File {
-    fn scan(bytes: &[u8]) -> File {
+    fn scan(bytes: &[u8], budget: Budget) -> File {
         let mut objects: HashMap<u32, Obj> = HashMap::new();
         let mut root = None;
         let mut encrypted = false;
@@ -435,7 +518,7 @@ impl File {
             })
             .collect();
         for (d, raw) in streams {
-            let data = decode_stream(&d, &raw, &objects);
+            let data = decode_stream(&d, &raw, &objects, &budget);
             let n = dict_get(&d, "N").and_then(Obj::as_num).unwrap_or(0.0) as usize;
             let first = dict_get(&d, "First").and_then(Obj::as_num).unwrap_or(0.0) as usize;
             let mut header = Lexer::new(&data[..first.min(data.len())]);
@@ -478,6 +561,9 @@ impl File {
             objects,
             root,
             encrypted,
+            budget,
+            streams: RefCell::new(HashMap::new()),
+            fonts: RefCell::new(HashMap::new()),
         }
     }
 
@@ -643,11 +729,20 @@ impl File {
         }
     }
 
-    fn stream_data(&self, o: &Obj) -> Option<Vec<u8>> {
-        match self.resolve(o) {
-            Obj::Stream(d, raw) => Some(decode_stream(d, raw, &self.objects)),
-            _ => None,
+    fn stream_data(&self, o: &Obj) -> Option<Rc<Vec<u8>>> {
+        if let Obj::Ref(id) = o {
+            if let Some(data) = self.streams.borrow().get(id) {
+                return Some(data.clone());
+            }
         }
+        let data = match self.resolve(o) {
+            Obj::Stream(d, raw) => Rc::new(decode_stream(d, raw, &self.objects, &self.budget)),
+            _ => return None,
+        };
+        if let Obj::Ref(id) = o {
+            self.streams.borrow_mut().insert(*id, data.clone());
+        }
+        Some(data)
     }
 
     fn page_glyphs(&self, page: &PageRef) -> Vec<Glyph> {
@@ -656,14 +751,19 @@ impl File {
             Some(Obj::Array(parts)) => {
                 for p in parts {
                     if let Some(data) = self.stream_data(p) {
-                        content.extend(data);
+                        // Joined, the parts count again: one stream listed
+                        // many times must not multiply into gigabytes.
+                        if !self.budget.take_bytes(data.len() + 1) {
+                            break;
+                        }
+                        content.extend_from_slice(&data);
                         content.push(b'\n');
                     }
                 }
             }
             Some(o @ Obj::Stream(..)) => {
                 if let Some(data) = self.stream_data(o) {
-                    content = data;
+                    content = data.to_vec();
                 }
             }
             _ => {}
@@ -692,7 +792,10 @@ struct PageRef {
 
 /// A stream's data with its filters undone (Flate, ASCIIHex, ASCII85;
 /// anything else, an image codec among them, gives nothing).
-fn decode_stream(d: &Dict, raw: &[u8], objects: &HashMap<u32, Obj>) -> Vec<u8> {
+///
+/// Decoded bytes are spent from `budget`; a stream that would pass it
+/// stops there, and the import fails.
+fn decode_stream(d: &Dict, raw: &[u8], objects: &HashMap<u32, Obj>, budget: &Budget) -> Vec<u8> {
     let resolve = |o: &Obj| -> Obj {
         match o {
             Obj::Ref(r) => objects.get(r).cloned().unwrap_or(Obj::Null),
@@ -717,8 +820,16 @@ fn decode_stream(d: &Dict, raw: &[u8], objects: &HashMap<u32, Obj>) -> Vec<u8> {
         data = match f.as_str() {
             "FlateDecode" | "Fl" => {
                 let body = zlib_body(&data);
-                let out = opccore::inflate::inflate_raw(body, 0)
-                    .unwrap_or_else(|| opccore::inflate::inflate_partial(body, 1 << 28));
+                // Capped inside each block, at what the budget has left.
+                let room = budget.room();
+                if room == 0 {
+                    return Vec::new();
+                }
+                let out = opccore::inflate::inflate_partial(body, room);
+                if out.len() >= room || !budget.take_bytes(out.len()) {
+                    budget.out.set(true);
+                    return Vec::new();
+                }
                 match parms.get(i).cloned().flatten() {
                     Some(p) => png_predictor(&out, &p),
                     None => out,
@@ -767,8 +878,16 @@ fn png_predictor(data: &[u8], parms: &Dict) -> Vec<u8> {
         .and_then(Obj::as_num)
         .unwrap_or(1.0)
         .max(1.0) as usize;
+    // The sizes come from the file: checked, and a row longer than the
+    // data is nonsense (it would only allocate), so the data is kept as is.
+    let Some(bits) = colors.checked_mul(bpc).and_then(|b| b.checked_mul(columns)) else {
+        return data.to_vec();
+    };
+    let row = bits.div_ceil(8);
+    if row == 0 || row > data.len() {
+        return data.to_vec();
+    }
     let bpp = (colors * bpc).div_ceil(8).max(1);
-    let row = (colors * bpc * columns).div_ceil(8);
     let mut out = Vec::with_capacity(data.len());
     let mut prev = vec![0u8; row];
     for chunk in data.chunks(row + 1) {
@@ -887,7 +1006,7 @@ impl Font {
         }
         if let Some(cmap) = file.lookup(d, "ToUnicode") {
             if let Some(data) = file.stream_data(cmap) {
-                f.to_unicode = parse_cmap(&data);
+                f.to_unicode = parse_cmap(&data, &file.budget);
             }
         }
         if subtype == "Type0" {
@@ -1024,7 +1143,11 @@ impl Font {
 }
 
 /// `bfchar` / `bfrange` mappings of a ToUnicode CMap.
-fn parse_cmap(data: &[u8]) -> HashMap<u32, String> {
+///
+/// Every token and every mapping spends a unit of `budget`, and one CMap
+/// makes at most [`MAX_CMAP_ENTRIES`] mappings: a range is clamped per
+/// entry, so many (or overlapping) ranges must not add up to millions.
+fn parse_cmap(data: &[u8], budget: &Budget) -> HashMap<u32, String> {
     let mut map = HashMap::new();
     let mut lx = Lexer::new(data);
     let code = |s: &[u8]| s.iter().fold(0u32, |a, &b| a << 8 | u32::from(b));
@@ -1039,11 +1162,22 @@ fn parse_cmap(data: &[u8]) -> HashMap<u32, String> {
     };
     let mut toks = Vec::new();
     while let Some(t) = lx.next() {
+        if !budget.op() {
+            return map;
+        }
         toks.push(t);
         if toks.len() > 2_000_000 {
             break;
         }
     }
+    // Whether the map may take no more mappings (spending a unit of work).
+    // Counted per mapping made, not by the map's size: overlapping ranges
+    // overwrite the same codes again and again.
+    let made = Cell::new(0usize);
+    let full = |_: &HashMap<u32, String>| {
+        made.set(made.get() + 1);
+        made.get() > MAX_CMAP_ENTRIES || !budget.op()
+    };
     let mut i = 0;
     while i < toks.len() {
         match &toks[i] {
@@ -1052,10 +1186,16 @@ fn parse_cmap(data: &[u8]) -> HashMap<u32, String> {
                 while i + 1 < toks.len() {
                     match (&toks[i], &toks[i + 1]) {
                         (Tok::Str(src), Tok::Str(dst)) => {
+                            if full(&map) {
+                                return map;
+                            }
                             map.insert(code(src), utf16(dst));
                             i += 2;
                         }
                         (Tok::Str(src), Tok::Name(n)) => {
+                            if full(&map) {
+                                return map;
+                            }
                             if let Some(c) = glyph_char(n) {
                                 map.insert(code(src), c.to_string());
                             }
@@ -1080,6 +1220,9 @@ fn parse_cmap(data: &[u8]) -> HashMap<u32, String> {
                                 .map(|p| u16::from(p[0]) << 8 | u16::from(*p.get(1).unwrap_or(&0)))
                                 .collect();
                             for (k, c) in (lo..=hi).enumerate() {
+                                if full(&map) {
+                                    return map;
+                                }
                                 let mut units = base.clone();
                                 if let Some(last) = units.last_mut() {
                                     *last = last.wrapping_add(k as u16);
@@ -1097,6 +1240,9 @@ fn parse_cmap(data: &[u8]) -> HashMap<u32, String> {
                             while j < toks.len() && toks[j] != Tok::ArrClose {
                                 if let Tok::Str(dst) = &toks[j] {
                                     if c <= hi {
+                                        if full(&map) {
+                                            return map;
+                                        }
                                         map.insert(c, utf16(dst));
                                     }
                                     c += 1;
@@ -1326,10 +1472,16 @@ impl Interp<'_> {
             .lookup(resources, "Font")
             .and_then(|f| f.as_dict());
         let entry = fonts.and_then(|f| dict_get(f, name));
-        let key = match entry {
-            Some(Obj::Ref(r)) => format!("#{r}"),
-            _ => format!("{name}@{:p}", resources),
+        // A font object is loaded once for the document; a font written
+        // inline in a resource dictionary only for this page.
+        let shared = match entry {
+            Some(Obj::Ref(r)) => Some(*r),
+            _ => None,
         };
+        let key = format!("{name}@{:p}", resources);
+        if let Some(f) = shared.and_then(|r| self.file.fonts.borrow().get(&r).cloned()) {
+            return f;
+        }
         if let Some(f) = self.fonts.get(&key) {
             return f.clone();
         }
@@ -1341,7 +1493,14 @@ impl Interp<'_> {
                 encoding: Some(Box::new(std::array::from_fn(|b| win_ansi(b as u8)))),
                 ..Font::default()
             });
-        self.fonts.insert(key, font.clone());
+        match shared {
+            Some(r) => {
+                self.file.fonts.borrow_mut().insert(r, font.clone());
+            }
+            None => {
+                self.fonts.insert(key, font.clone());
+            }
+        }
         font
     }
 
@@ -1365,6 +1524,11 @@ impl Interp<'_> {
         let mut ops: Vec<Obj> = Vec::new();
         let mut lx = Lexer::new(data);
         while let Some(tok) = lx.next() {
+            // Every token is work: a fan of forms drawing forms, or a
+            // stream of a million numbers, runs out of budget, not time.
+            if !self.file.budget.op() {
+                return;
+            }
             let Tok::Kw(op) = tok else {
                 if let Some(o) = lx.object_from(tok, 0) {
                     ops.push(o);
@@ -1469,18 +1633,22 @@ impl Interp<'_> {
                 }
                 b"BI" => {
                     // An inline image: skip its binary data to `EI`.
+                    // `ID` is found once; the data runs from there to the
+                    // first `EI` standing alone.
                     let rest = &data[lx.pos..];
                     let mut at = None;
-                    let mut i = 0;
-                    while let Some(k) = super::find(&rest[i..], b"EI") {
-                        let p = i + k;
-                        let before = p == 0 || is_ws(rest[p - 1]);
-                        let after = rest.get(p + 2).is_none_or(|&b| is_ws(b));
-                        if before && after && super::find(&rest[..p], b"ID").is_some() {
-                            at = Some(p + 2);
-                            break;
+                    if let Some(id) = super::find(rest, b"ID") {
+                        let mut i = id + 2;
+                        while let Some(k) = super::find(&rest[i..], b"EI") {
+                            let p = i + k;
+                            let before = is_ws(rest[p - 1]);
+                            let after = rest.get(p + 2).is_none_or(|&b| is_ws(b));
+                            if before && after {
+                                at = Some(p + 2);
+                                break;
+                            }
+                            i = p + 2;
                         }
-                        i = p + 2;
                     }
                     lx.pos += at.unwrap_or(rest.len());
                 }
@@ -2073,5 +2241,134 @@ mod tests {
         let _ = import_pdf(b"%PDF-1.7 1 0 obj << /Length 99999999999 >> stream\nabc");
         let _ = import_pdf(b"%PDF-1.7 1 0 obj [[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[ endobj");
         let _ = import_pdf(b"%PDF 1 0 obj << /Type /Pages /Kids [1 0 R] >> endobj trailer << /Root 2 0 R >> 2 0 obj << /Pages 1 0 R >> endobj");
+    }
+
+    /// A small budget, so a bomb that got through fails fast and small.
+    fn small() -> Budget {
+        Budget::new(1 << 20, 100_000)
+    }
+
+    /// A zlib stream (no checksum checked) of one fixed-Huffman block: `a`,
+    /// then `matches` copies of 258 bytes at distance 1, about 1000:1.
+    fn zlib_bomb(matches: usize) -> Vec<u8> {
+        let mut bits: Vec<bool> = vec![true, true, false];
+        let push = |code: u32, len: u32, bits: &mut Vec<bool>| {
+            for i in (0..len).rev() {
+                bits.push(code >> i & 1 == 1);
+            }
+        };
+        push(0x30 + u32::from(b'a'), 8, &mut bits);
+        for _ in 0..matches {
+            push(0xC5, 8, &mut bits);
+            push(0, 5, &mut bits);
+        }
+        push(0, 7, &mut bits);
+        let mut out = vec![0x78, 0x01];
+        let start = out.len();
+        out.resize(start + bits.len().div_ceil(8), 0);
+        for (i, bit) in bits.iter().enumerate() {
+            if *bit {
+                out[start + i / 8] |= 1 << (i % 8);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_flate_bomb_fails_the_import_within_its_budget() {
+        // Content that inflates to 100 MiB, against a 1 MiB budget.
+        let bomb = zlib_bomb((100 << 20) / 258);
+        let file = pdf(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>".to_vec(),
+            stream("/Filter /FlateDecode", &bomb),
+        ]);
+        assert_eq!(import_pdf_within(&file, small()).unwrap_err(), TOO_BIG);
+        // An object stream is decoded before any page: the same.
+        let objstm = pdf(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            stream("/Type /ObjStm /N 1 /First 4 /Filter /FlateDecode", &bomb),
+        ]);
+        assert_eq!(import_pdf_within(&objstm, small()).unwrap_err(), TOO_BIG);
+        // One 2 KB stream listed a thousand times joins to 2 MB.
+        let content = b"BT ET ".repeat(400);
+        let parts = "4 0 R ".repeat(1000);
+        let listed = pdf(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            format!("<< /Type /Page /Parent 2 0 R /Contents [{parts}] >>").into_bytes(),
+            stream("", &content),
+        ]);
+        assert_eq!(import_pdf_within(&listed, small()).unwrap_err(), TOO_BIG);
+    }
+
+    #[test]
+    fn predictor_sizes_from_the_file_are_checked() {
+        let data = vec![2u8, 1, 2, 3];
+        for parms in [
+            "/Predictor 12 /Columns 1000000000000000",
+            "/Predictor 12 /Colors 10000000000 /BitsPerComponent 10000000000 /Columns 10000000000",
+        ] {
+            let text = format!("<< {parms} >>");
+            let mut lx = Lexer::new(text.as_bytes());
+            let Some(Obj::Dict(d)) = lx.object(0) else {
+                panic!()
+            };
+            assert_eq!(png_predictor(&data, &d), data, "{parms}");
+        }
+    }
+
+    #[test]
+    fn a_fan_of_forms_runs_out_of_budget_not_time() {
+        // F1 draws F2 ten times, F2 draws F3 ten times ... F8: 10^8 calls
+        // with no cycle and no text.
+        let mut objs = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /XObject << /F 5 0 R >> >> >>".to_vec(),
+            stream("", b"/F Do"),
+        ];
+        for level in 0..8 {
+            let next = 6 + level;
+            let draws = if level < 7 {
+                "/F Do ".repeat(10)
+            } else {
+                String::new()
+            };
+            objs.push(stream(
+                &format!(
+                    "/Type /XObject /Subtype /Form /Resources << /XObject << /F {next} 0 R >> >>"
+                ),
+                draws.as_bytes(),
+            ));
+        }
+        let file = pdf(&objs);
+        assert_eq!(import_pdf_within(&file, small()).unwrap_err(), TOO_BIG);
+        // An inline image with no `ID` and many `EI`s is skipped in one pass.
+        let mut content = b"BT /F1 11 Tf 72 700 Td (Shown) Tj ET BI /W 1 ".to_vec();
+        content.extend(b"xEIx ".repeat(200_000));
+        let file = one_page(&content);
+        assert_eq!(
+            paragraph_texts(&import_pdf_within(&file, Budget::new(1 << 24, 1_000_000)).unwrap()),
+            ["Shown"]
+        );
+    }
+
+    #[test]
+    fn a_cmap_of_huge_ranges_is_bounded() {
+        let mut cmap = b"1 begincodespacerange <0000> <FFFF> endcodespacerange\n".to_vec();
+        cmap.extend(b"1000 beginbfrange\n");
+        for k in 0..1000u32 {
+            cmap.extend(format!("<{:04X}> <FFFF> <0041>\n", k).as_bytes());
+        }
+        cmap.extend(b"endbfrange");
+        let budget = small();
+        let map = parse_cmap(&cmap, &budget);
+        assert!(map.len() <= 100_000, "{}", map.len());
+        assert!(budget.exhausted());
+        // Within budget, still at most MAX_CMAP_ENTRIES.
+        let budget = Budget::new(1 << 20, usize::MAX);
+        assert!(parse_cmap(&cmap, &budget).len() <= MAX_CMAP_ENTRIES);
     }
 }
