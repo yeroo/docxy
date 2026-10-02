@@ -968,6 +968,7 @@ pub fn text_to_columns(
     let ctx = EntryCtx {
         date1904: wb.date1904,
         today,
+        fixed_decimal: None,
     };
     let auto = crate::textio::AutoConvert::default();
     let Workbook { sheets, styles, .. } = wb;

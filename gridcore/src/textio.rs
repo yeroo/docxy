@@ -1079,6 +1079,7 @@ mod tests {
         EntryCtx {
             date1904: false,
             today: Some(TODAY),
+            fixed_decimal: None,
         }
     }
 

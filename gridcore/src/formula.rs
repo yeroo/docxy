@@ -2680,6 +2680,118 @@ pub fn collect_ref3d(e: &Expr, out: &mut Vec<(String, String, u32, u32, u32, u32
     }
 }
 
+/// A sheet index and a rect on it, (r1, c1, r2, c2).
+pub type Area = (usize, (u32, u32, u32, u32));
+
+/// The areas a cell's formula refers to directly, as (sheet index,
+/// (r1, c1, r2, c2)), in the order the formula names them: what a
+/// double-click on a formula cell jumps to when editing directly in cells is
+/// off (Excel's direct precedents, #672).
+///
+/// Plain references and ranges count, whole rows and columns too; a spill
+/// reference (`A1#`) counts as its anchor cell; a 3D reference as its rect on
+/// the first sheet; a defined name (sheet-scoped first) when it is itself one
+/// plain reference or range. Structured references, a name that is a formula,
+/// and anything that names a sheet the workbook does not have (an external
+/// workbook) are skipped. Empty for a constant, a blank or an unparsable
+/// formula.
+pub fn direct_precedents(
+    wb: &crate::sheet::Workbook,
+    sheet: usize,
+    row: u32,
+    col: u32,
+) -> Vec<Area> {
+    let Some(src) = wb
+        .sheets
+        .get(sheet)
+        .and_then(|s| s.cell(row, col))
+        .and_then(|c| c.formula.as_deref())
+    else {
+        return Vec::new();
+    };
+    let Ok(e) = parse(src) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    precedents_in(wb, sheet, &e, true, &mut out);
+    out
+}
+
+/// [`direct_precedents`]' walk over `e`, a formula (or, with `names` off, a
+/// name's definition) on `sheet`.
+fn precedents_in(
+    wb: &crate::sheet::Workbook,
+    sheet: usize,
+    e: &Expr,
+    names: bool,
+    out: &mut Vec<Area>,
+) {
+    let on = |qual: &Option<String>| match qual {
+        None => Some(sheet),
+        Some(name) => wb.sheet_index(name),
+    };
+    match e {
+        Expr::Ref(_)
+        | Expr::SpillRef(_)
+        | Expr::Range(..)
+        | Expr::ColRange { .. }
+        | Expr::RowRange { .. } => {
+            let mut refs = Vec::new();
+            collect_refs(e, &mut refs);
+            for (qual, r1, c1, r2, c2) in refs {
+                if let Some(si) = on(&qual) {
+                    out.push((si, (r1, c1, r2, c2)));
+                }
+            }
+        }
+        Expr::Ref3D { .. } => {
+            let mut refs = Vec::new();
+            collect_ref3d(e, &mut refs);
+            for (first, _, r1, c1, r2, c2) in refs {
+                if let Some(si) = wb.sheet_index(&first) {
+                    out.push((si, (r1, c1, r2, c2)));
+                }
+            }
+        }
+        Expr::Name(name) if names => {
+            let Some(def) = wb.defined_name(name, sheet) else {
+                return;
+            };
+            let Ok(d) = parse(def.strip_prefix('=').unwrap_or(def)) else {
+                return;
+            };
+            if matches!(
+                d,
+                Expr::Ref(_) | Expr::Range(..) | Expr::ColRange { .. } | Expr::RowRange { .. }
+            ) {
+                precedents_in(wb, sheet, &d, false, out);
+            }
+        }
+        Expr::Func(_, args) => {
+            for a in args {
+                precedents_in(wb, sheet, a, names, out);
+            }
+        }
+        Expr::Call(callee, args) => {
+            precedents_in(wb, sheet, callee, names, out);
+            for a in args {
+                precedents_in(wb, sheet, a, names, out);
+            }
+        }
+        Expr::ArrayLit(rows) => {
+            for x in rows.iter().flatten() {
+                precedents_in(wb, sheet, x, names, out);
+            }
+        }
+        Expr::Un(_, x) => precedents_in(wb, sheet, x, names, out),
+        Expr::Bin(_, l, r) => {
+            precedents_in(wb, sheet, l, names, out);
+            precedents_in(wb, sheet, r, names, out);
+        }
+        _ => {}
+    }
+}
+
 /// Collect every structured (table) reference in a formula. `None` table =
 /// the enclosing table of the formula's own cell.
 #[allow(clippy::type_complexity)]
@@ -14836,5 +14948,84 @@ mod tests {
         for src in no {
             assert!(!may_return_array(&parse(src).unwrap()), "{src} is scalar");
         }
+    }
+
+    // ---- #672: direct precedents ----
+
+    fn precedents_wb(formula: &str) -> crate::sheet::Workbook {
+        use crate::sheet::{Cell, DefinedName, Sheet, Workbook};
+        let mut s1 = Sheet {
+            name: "Sheet1".into(),
+            ..Sheet::default()
+        };
+        s1.set_cell(0, 0, Cell::formula(formula));
+        s1.set_cell(9, 9, Cell::number(1.0));
+        let s2 = Sheet {
+            name: "Data Two".into(),
+            ..Sheet::default()
+        };
+        Workbook {
+            sheets: vec![s1, s2],
+            defined_names: vec![
+                DefinedName {
+                    name: "Rates".into(),
+                    scope: None,
+                    formula: "'Data Two'!$B$2:$B$5".into(),
+                },
+                DefinedName {
+                    name: "Twice".into(),
+                    scope: None,
+                    formula: "Sheet1!$A$1*2".into(),
+                },
+                DefinedName {
+                    name: "Local".into(),
+                    scope: Some(0),
+                    formula: "Sheet1!$C$3".into(),
+                },
+            ],
+            ..Workbook::default()
+        }
+    }
+
+    fn precedents_of(formula: &str) -> Vec<(usize, (u32, u32, u32, u32))> {
+        direct_precedents(&precedents_wb(formula), 0, 0, 0)
+    }
+
+    #[test]
+    fn direct_precedents_follow_the_formula_in_order() {
+        assert_eq!(
+            precedents_of("SUM(C2:D4)+B1*'Data Two'!E5"),
+            vec![(0, (1, 2, 3, 3)), (0, (0, 1, 0, 1)), (1, (4, 4, 4, 4))]
+        );
+        assert_eq!(
+            precedents_of("SUM(B:B)"),
+            vec![(0, (0, 1, crate::sheet::MAX_ROWS - 1, 1))]
+        );
+        // A spill reference is its anchor cell.
+        assert_eq!(precedents_of("SUM(F2#)"), vec![(0, (1, 5, 1, 5))]);
+        // A 3D reference is its rect on the first sheet.
+        assert_eq!(
+            precedents_of("SUM(Sheet1:'Data Two'!A1:B2)"),
+            vec![(0, (0, 0, 1, 1))]
+        );
+    }
+
+    #[test]
+    fn direct_precedents_resolve_plain_range_names_only() {
+        assert_eq!(precedents_of("SUM(Rates)"), vec![(1, (1, 1, 4, 1))]);
+        assert_eq!(precedents_of("Local+1"), vec![(0, (2, 2, 2, 2))]);
+        // A name that is a formula is not an area.
+        assert_eq!(precedents_of("Twice+J10"), vec![(0, (9, 9, 9, 9))]);
+    }
+
+    #[test]
+    fn direct_precedents_skip_what_is_not_in_the_workbook() {
+        assert!(precedents_of("1+2").is_empty());
+        assert!(precedents_of("Nowhere!A1").is_empty());
+        assert!(precedents_of("[1]Ext!A1").is_empty());
+        let wb = precedents_wb("A2");
+        assert!(direct_precedents(&wb, 0, 9, 9).is_empty(), "a constant");
+        assert!(direct_precedents(&wb, 0, 5, 5).is_empty(), "a blank");
+        assert!(direct_precedents(&wb, 7, 0, 0).is_empty(), "no such sheet");
     }
 }

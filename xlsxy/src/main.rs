@@ -972,6 +972,7 @@ fn import_text(
     let ctx = gridcore::entry::EntryCtx {
         date1904,
         today: open.today,
+        fixed_decimal: None,
     };
     gridcore::textio::import_records(sheet, styles, 0, 0, &records, opts, &open.auto, &ctx)
 }

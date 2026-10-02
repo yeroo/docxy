@@ -24,7 +24,7 @@
 
 use crate::formula::{ExcelError, days_in_month, norm_year};
 use crate::sheet::{
-    Cell, CellValue, NumFmt, Styles, Workbook, Xf, classify_format_code, parts_to_serial,
+    Cell, CellValue, NumFmt, Sheet, Styles, Workbook, Xf, classify_format_code, parts_to_serial,
     serial_to_parts,
 };
 
@@ -40,6 +40,12 @@ pub struct EntryCtx {
     /// `Engine::clock`). A date typed without a year (`3/4`) takes its year;
     /// with no clock it stays text rather than guess.
     pub today: Option<f64>,
+    /// Excel's "Automatically insert a decimal point": the places a typed
+    /// number without a decimal point, percent or exponent is shifted by
+    /// (`1234` with 2 is 12.34, with -2 is 123400). Only a host's typed
+    /// commit sets it ([`entry_cell_ctx`]); paste, Find & Replace, imports and
+    /// automation leave it `None`, so their numbers are never shifted.
+    pub fixed_decimal: Option<i16>,
 }
 
 /// A parsed entry: the cell (its `style` unset) and what the entry asks of
@@ -162,6 +168,13 @@ pub fn parse_entry(text: &str, xf: &Xf, ctx: &EntryCtx) -> Result<Entry, EntryEr
         ));
     }
     if let Some((mut n, shape)) = parse_number(t) {
+        // The shift comes first: the percent-cell rule below sees the
+        // shifted number, so `5` with 2 places in a 0% cell is 0.05 (5%).
+        if let Some(places) = ctx.fixed_decimal {
+            if !shape.point && !shape.percent && !shape.exponent {
+                n = fixed_decimal(n, places);
+            }
+        }
         if !shape.percent && is_percent(xf) && n.abs() >= 1.0 {
             n /= 100.0;
         }
@@ -208,17 +221,27 @@ pub fn entry_style(styles: &mut Styles, base: u32, e: &Entry) -> u32 {
     if new == old { base } else { styles.intern(new) }
 }
 
-/// The context a workbook gives an entry, with the host's clock.
+/// The context a workbook gives an entry, with the host's clock. It never
+/// shifts a number ([`EntryCtx::fixed_decimal`] is `None`).
 pub fn entry_ctx(wb: &Workbook, today: Option<f64>) -> EntryCtx {
     EntryCtx {
         date1904: wb.date1904,
         today,
+        fixed_decimal: None,
     }
+}
+
+/// `n` with its decimal point moved `places` to the left (right when
+/// negative), kept to 15 digits; a shift that overflows leaves `n` as it was.
+fn fixed_decimal(n: f64, places: i16) -> f64 {
+    let shifted = round15(n / 10f64.powi(i32::from(places)));
+    if shifted.is_finite() { shifted } else { n }
 }
 
 /// Parse `text` typed into (sheet, row, col) and resolve its style: the cell
 /// ready for `Engine::set_cell`. Only the style table is touched here (a new
-/// xf may be interned); the cell itself is left to the caller.
+/// xf may be interned); the cell itself is left to the caller. Never shifts a
+/// number: a host's typed commit uses [`entry_cell_ctx`].
 pub fn entry_cell(
     wb: &mut Workbook,
     sheet: usize,
@@ -227,14 +250,27 @@ pub fn entry_cell(
     text: &str,
     today: Option<f64>,
 ) -> Result<Cell, EntryError> {
+    let ctx = entry_ctx(wb, today);
+    entry_cell_ctx(wb, sheet, row, col, text, &ctx)
+}
+
+/// [`entry_cell`] under an explicit context: what a host's typed commit
+/// calls, with the user's fixed-decimal places in `ctx`.
+pub fn entry_cell_ctx(
+    wb: &mut Workbook,
+    sheet: usize,
+    row: u32,
+    col: u32,
+    text: &str,
+    ctx: &EntryCtx,
+) -> Result<Cell, EntryError> {
     let base = wb
         .sheets
         .get(sheet)
         .and_then(|s| s.cell(row, col))
         .map(|c| c.style)
         .unwrap_or(0);
-    let ctx = entry_ctx(wb, today);
-    let e = parse_entry(text, &wb.styles.xf(base), &ctx)?;
+    let e = parse_entry(text, &wb.styles.xf(base), ctx)?;
     let style = entry_style(&mut wb.styles, base, &e);
     Ok(Cell { style, ..e.cell })
 }
@@ -260,14 +296,30 @@ pub fn range_formula<'a>(
 /// range `(r1, c1, r2, c2)` on `sheet`. Each cell reads the entry under its
 /// own format rules; where that makes a formula (`=A1`, `+A1`, `@SUM(A1:A2)`)
 /// its relative references move with the cell, as a fill would. All or
-/// nothing: a refused entry changes no style.
+/// nothing: a refused entry changes no style. Never shifts a number: a
+/// host's typed commit uses [`entry_range_ctx`].
 pub fn entry_range(
+    wb: &mut Workbook,
+    sheet: usize,
+    range: (u32, u32, u32, u32),
+    active: (u32, u32),
+    text: &str,
+    today: Option<f64>,
+) -> Result<Vec<(u32, u32, Cell)>, EntryError> {
+    let ctx = entry_ctx(wb, today);
+    entry_range_ctx(wb, sheet, range, active, text, &ctx)
+}
+
+/// [`entry_range`] under an explicit context (a typed Ctrl+Enter, with the
+/// user's fixed-decimal places): each cell is read under its own format, so
+/// a Text cell keeps `1234` as text while its neighbours shift.
+pub fn entry_range_ctx(
     wb: &mut Workbook,
     sheet: usize,
     (r1, c1, r2, c2): (u32, u32, u32, u32),
     active: (u32, u32),
     text: &str,
-    today: Option<f64>,
+    ctx: &EntryCtx,
 ) -> Result<Vec<(u32, u32, Cell)>, EntryError> {
     check_len(text)?;
     let mut out = Vec::new();
@@ -275,7 +327,7 @@ pub fn entry_range(
         for c in c1..=c2 {
             let dr = r as i64 - active.0 as i64;
             let dc = c as i64 - active.1 as i64;
-            let mut cell = entry_cell(wb, sheet, r, c, text, today)?;
+            let mut cell = entry_cell_ctx(wb, sheet, r, c, text, ctx)?;
             if let Some(src) = &cell.formula {
                 if let Some(moved) = crate::formula::translate_formula(src, dr, dc) {
                     cell.formula = Some(moved);
@@ -482,12 +534,67 @@ fn value_cell(value: CellValue) -> Cell {
 }
 
 // ---------------------------------------------------------------------------
+// AutoComplete
+// ---------------------------------------------------------------------------
+
+/// Excel's AutoComplete for cell values: the text value `typed` completes to
+/// while it is typed into (row, col) of `sheet`, or `None`.
+///
+/// The candidates are the text values of the column's contiguous non-empty
+/// block around the cell — upward from the cell, then downward, each until
+/// the first empty cell — excluding the cell itself (its own old value is
+/// not a proposal). Numbers, booleans, errors and formulas belong to the
+/// block but are never proposed. The match is a case-insensitive prefix
+/// match; values that differ only by case are one value, spelled as the
+/// first one found (nearest above first). Nothing is proposed for an empty
+/// or `=` entry, when no value or more than one value matches, or when the
+/// typed text already is one of the values.
+pub fn autocomplete(sheet: &Sheet, row: u32, col: u32, typed: &str) -> Option<String> {
+    if typed.is_empty() || typed.starts_with('=') {
+        return None;
+    }
+    let want = typed.to_lowercase();
+    let filled = |r: u32| {
+        sheet
+            .cell(r, col)
+            .filter(|c| !c.value.is_empty() || c.formula.is_some())
+    };
+    let above = (0..row).rev().map_while(&filled);
+    let below = (row.saturating_add(1)..crate::sheet::MAX_ROWS).map_while(&filled);
+    let mut found: Option<(String, String)> = None;
+    for cell in above.chain(below) {
+        let CellValue::Text(text) = &cell.value else {
+            continue;
+        };
+        if cell.formula.is_some() {
+            continue;
+        }
+        let lower = text.to_lowercase();
+        if lower == want {
+            return None;
+        }
+        if !lower.starts_with(&want) {
+            continue;
+        }
+        match &found {
+            Some((seen, _)) if *seen == lower => {}
+            Some(_) => return None,
+            None => found = Some((lower, text.clone())),
+        }
+    }
+    found.map(|(_, text)| text)
+}
+
+// ---------------------------------------------------------------------------
 // Numbers
 // ---------------------------------------------------------------------------
 
 /// What a recognised number looked like, which picks its format.
 #[derive(Clone, Copy, Debug, Default)]
 struct NumShape {
+    /// A decimal point was typed, even a bare or trailing one (`1.`, `.5`):
+    /// Excel's fixed decimal leaves such a number alone.
+    point: bool,
     thousands: bool,
     decimals: bool,
     percent: bool,
@@ -560,7 +667,10 @@ fn parse_number(t: &str) -> Option<(f64, NumShape)> {
         None => (s, None),
     };
     let (int, frac) = match mant.split_once('.') {
-        Some((i, f)) => (i, Some(f)),
+        Some((i, f)) => {
+            shape.point = true;
+            (i, Some(f))
+        }
         None => (mant, None),
     };
     if !frac.is_none_or(|f| f.bytes().all(|b| b.is_ascii_digit())) {
@@ -880,6 +990,7 @@ mod tests {
         EntryCtx {
             date1904: false,
             today: Some(TODAY),
+            fixed_decimal: None,
         }
     }
 
@@ -1043,6 +1154,7 @@ mod tests {
         let c = EntryCtx {
             date1904: true,
             today: Some(TODAY),
+            fixed_decimal: None,
         };
         let serial = |t: &str| match parse_entry(t, &Xf::default(), &c).unwrap().cell.value {
             CellValue::Number(n) => n,
@@ -1713,5 +1825,206 @@ mod tests {
         assert_eq!(wb.styles.xf(cell.style).code.as_deref(), Some("#,##0"));
         let err = entry_cell(wb, 0, 0, 0, &"y".repeat(MAX_CELL_CHARS + 1), None);
         assert!(matches!(err, Err(EntryError::TooLong { .. })));
+    }
+
+    // ---- #672: fixed decimal ----
+
+    fn fixed(text: &str, places: i16, xf: &Xf) -> Entry {
+        let c = EntryCtx {
+            fixed_decimal: Some(places),
+            ..ctx()
+        };
+        parse_entry(text, xf, &c).unwrap()
+    }
+
+    fn fixed_number(text: &str, places: i16) -> f64 {
+        match fixed(text, places, &Xf::default()).cell.value {
+            CellValue::Number(n) => n,
+            other => panic!("{text:?} → {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fixed_decimal_shifts_a_typed_whole_number() {
+        assert_eq!(fixed_number("1234", 2), 12.34);
+        assert_eq!(fixed_number("1234", -2), 123_400.0);
+        assert_eq!(fixed_number("1234", 0), 1234.0);
+        assert_eq!(fixed_number("-1,234", 2), -12.34);
+        assert_eq!(fixed_number("(1234)", 2), -12.34);
+        assert_eq!(fixed_number("$1,234", 2), 12.34);
+        assert_eq!(fixed_number("+5", 3), 0.005);
+        // Off: the number as typed.
+        assert_eq!(number("1234").0, 1234.0);
+    }
+
+    #[test]
+    fn fixed_decimal_leaves_a_typed_point_percent_exponent_and_non_numbers() {
+        for (text, want) in [
+            ("1.5", 1.5),
+            ("1.", 1.0),
+            (".5", 0.5),
+            ("1,234.5", 1234.5),
+            ("5%", 0.05),
+            ("1E3", 1000.0),
+        ] {
+            assert_eq!(fixed_number(text, 2), want, "{text}");
+        }
+        let general = Xf::default();
+        let date = fixed("3/4/2024", 2, &general);
+        assert_eq!(
+            date.format,
+            Some("m/d/yyyy"),
+            "a date is not a number typed"
+        );
+        assert_eq!(
+            fixed("=1234", 2, &general).cell.formula.as_deref(),
+            Some("1234")
+        );
+        assert_eq!(
+            fixed("abc", 2, &general).cell.value,
+            CellValue::Text("abc".into())
+        );
+        let text_cell = Xf {
+            numfmt: NumFmt::Text,
+            ..Xf::default()
+        };
+        assert_eq!(
+            fixed("1234", 2, &text_cell).cell.value,
+            CellValue::Text("1234".into())
+        );
+    }
+
+    #[test]
+    fn fixed_decimal_shifts_before_the_percent_cell_rule() {
+        let pct = Xf {
+            numfmt: NumFmt::Percent { decimals: 0 },
+            ..Xf::default()
+        };
+        // 5 → 0.05, which the percent cell no longer divides: 5%.
+        assert_eq!(fixed("5", 2, &pct).cell.value, CellValue::Number(0.05));
+        // 500 → 5, which it divides as any typed 5: 5%.
+        assert_eq!(fixed("500", 2, &pct).cell.value, CellValue::Number(0.05));
+    }
+
+    #[test]
+    fn fixed_decimal_keeps_15_digits_and_never_overflows() {
+        assert_eq!(fixed_number("1", 300), 1e-300);
+        assert_eq!(fixed_number("123456789012345", 2), 1_234_567_890_123.45);
+        // 1E+300 × 1E+300 is infinite: the number stays as typed.
+        let big = format!("1{}", "0".repeat(300));
+        assert_eq!(fixed_number(&big, -300), 1e300);
+    }
+
+    #[test]
+    fn only_the_ctx_entry_points_shift() {
+        let mut pkg = crate::xlsx::new_xlsx();
+        let wb = &mut pkg.workbook;
+        let c = EntryCtx {
+            fixed_decimal: Some(2),
+            ..entry_ctx(wb, None)
+        };
+        let typed = entry_cell_ctx(wb, 0, 0, 0, "1234", &c).unwrap();
+        assert_eq!(typed.value, CellValue::Number(12.34));
+        // Automation, the DV pick and every other caller of `entry_cell`.
+        let plain = entry_cell(wb, 0, 0, 0, "1234", None).unwrap();
+        assert_eq!(plain.value, CellValue::Number(1234.0));
+        let cells = entry_range(wb, 0, (0, 0, 1, 0), (0, 0), "1234", None).unwrap();
+        assert!(
+            cells
+                .iter()
+                .all(|(_, _, c)| c.value == CellValue::Number(1234.0))
+        );
+        // Paste and Find & Replace build their own ctx: never shifted.
+        let ctx0 = entry_ctx(wb, None);
+        let pasted = paste_cell(&mut wb.styles, 0, "1234", &ctx0);
+        assert_eq!(pasted.value, CellValue::Number(1234.0));
+    }
+
+    #[test]
+    fn a_typed_ctrl_enter_shifts_each_cell_under_its_own_format() {
+        let mut pkg = crate::xlsx::new_xlsx();
+        let wb = &mut pkg.workbook;
+        let text_style = wb.styles.intern(Xf {
+            numfmt: NumFmt::Text,
+            ..Xf::default()
+        });
+        wb.sheets[0].set_cell(
+            1,
+            0,
+            Cell {
+                style: text_style,
+                ..Cell::default()
+            },
+        );
+        let c = EntryCtx {
+            fixed_decimal: Some(2),
+            ..entry_ctx(wb, None)
+        };
+        let cells = entry_range_ctx(wb, 0, (0, 0, 1, 0), (0, 0), "1234", &c).unwrap();
+        assert_eq!(cells[0].2.value, CellValue::Number(12.34));
+        assert_eq!(cells[1].2.value, CellValue::Text("1234".into()));
+    }
+
+    // ---- #672: AutoComplete ----
+
+    fn column(values: &[Option<&str>]) -> Sheet {
+        let mut sh = Sheet::default();
+        for (r, v) in values.iter().enumerate() {
+            match v {
+                Some(t) if t.starts_with('=') => sh.set_cell(r as u32, 0, Cell::formula(&t[1..])),
+                Some(t) => match t.parse::<f64>() {
+                    Ok(n) => sh.set_cell(r as u32, 0, Cell::number(n)),
+                    Err(_) => sh.set_cell(r as u32, 0, Cell::text(t)),
+                },
+                None => {}
+            }
+        }
+        sh
+    }
+
+    #[test]
+    fn autocomplete_proposes_the_one_matching_text_of_the_block() {
+        let sh = column(&[
+            Some("Apple"),
+            Some("Banana"),
+            Some("42"),
+            None,
+            Some("Cherry"),
+        ]);
+        assert_eq!(autocomplete(&sh, 5, 0, "b"), None, "a gap ends the block");
+        assert_eq!(autocomplete(&sh, 5, 0, "c").as_deref(), Some("Cherry"));
+        let sh = column(&[Some("Apple"), Some("Banana"), Some("42"), None]);
+        assert_eq!(autocomplete(&sh, 3, 0, "b").as_deref(), Some("Banana"));
+        assert_eq!(autocomplete(&sh, 3, 0, "AP").as_deref(), Some("Apple"));
+        assert_eq!(
+            autocomplete(&sh, 3, 0, "4"),
+            None,
+            "numbers are never proposed"
+        );
+        assert_eq!(autocomplete(&sh, 3, 0, ""), None);
+        assert_eq!(autocomplete(&sh, 3, 0, "=a"), None);
+        assert_eq!(autocomplete(&sh, 3, 0, "x"), None);
+        assert_eq!(autocomplete(&sh, 3, 0, "apple"), None, "already a value");
+        // Below the cell counts too, up to its gap.
+        let sh = column(&[None, None, Some("Kiwi"), None]);
+        assert_eq!(autocomplete(&sh, 1, 0, "k").as_deref(), Some("Kiwi"));
+    }
+
+    #[test]
+    fn autocomplete_excludes_the_edited_cell_and_needs_one_distinct_value() {
+        let sh = column(&[Some("Apple"), Some("Apricot"), Some("Avocado")]);
+        assert_eq!(autocomplete(&sh, 1, 0, "ap").as_deref(), Some("Apple"));
+        assert_eq!(autocomplete(&sh, 3, 0, "ap"), None, "two values match");
+        assert_eq!(autocomplete(&sh, 0, 0, "a"), None);
+        // Only the edited cell itself matches: nothing to propose.
+        let sh = column(&[Some("Pear"), Some("Plum")]);
+        assert_eq!(autocomplete(&sh, 0, 0, "pe"), None);
+        // Case-only differences are one value, spelled as found nearest above.
+        let sh = column(&[Some("apple"), Some("APPLE"), None, Some("x")]);
+        assert_eq!(autocomplete(&sh, 2, 0, "a").as_deref(), Some("APPLE"));
+        // A formula's text result is not a proposal.
+        let mut sh = column(&[Some("=\"x\"")]);
+        sh.cells.get_mut(&(0, 0)).unwrap().value = CellValue::Text("xyz".into());
+        assert_eq!(autocomplete(&sh, 1, 0, "x"), None);
     }
 }
