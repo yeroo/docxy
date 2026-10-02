@@ -17,19 +17,38 @@
 //! `pre`. Images, links' targets, CSS classes' formatting and forms are not
 //! converted.
 
-use super::{Builder, heading_props, marker_is_numbered};
+use super::{Budget, Builder, MAX_DEPTH, TOO_BIG, heading_props, marker_is_numbered};
 use crate::model::{Align, Document, ParProps, RunProps, VertAlign};
 
 /// Read an HTML page. `Err` only when it holds no text.
 pub fn import_html(bytes: &[u8]) -> Result<Document, String> {
+    import_html_within(bytes, &Budget::standard())
+}
+
+/// [`import_html`] against `budget`. Decoding and the tokenizer are each one
+/// forward pass over the input (charged once here); the element stacks are
+/// at most [`MAX_DEPTH`] deep, so a closing tag's search is bounded; the
+/// document is charged as it is built.
+pub(crate) fn import_html_within(bytes: &[u8], budget: &Budget) -> Result<Document, String> {
+    // Two passes: decoding, then the tokenizer.
+    if !budget.work(2 * (bytes.len() / 16 + 1)) {
+        return Err(TOO_BIG.into());
+    }
     let text = decode(bytes);
-    let mut h = Html::new(&text);
+    let mut h = Html::new(&text, budget);
     h.run();
+    if budget.exhausted() {
+        return Err(TOO_BIG.into());
+    }
     if h.out.is_empty() {
         return Err("the HTML file holds no text".into());
     }
     let props = h.par_props();
-    Ok(h.out.finish(props))
+    let doc = h.out.finish(props);
+    if budget.exhausted() {
+        return Err(TOO_BIG.into());
+    }
+    Ok(doc)
 }
 
 /// The page's text, in the encoding it declares.
@@ -126,7 +145,8 @@ struct Block {
 struct Html<'a> {
     s: &'a str,
     pos: usize,
-    out: Builder,
+    budget: &'a Budget,
+    out: Builder<'a>,
     /// Open inline elements and the run properties inside each.
     inline: Vec<(String, RunProps)>,
     blocks: Vec<(String, Block)>,
@@ -147,11 +167,12 @@ struct Html<'a> {
 }
 
 impl<'a> Html<'a> {
-    fn new(s: &'a str) -> Self {
+    fn new(s: &'a str, budget: &'a Budget) -> Self {
         Html {
             s,
             pos: 0,
-            out: Builder::new(),
+            budget,
+            out: Builder::new(budget),
             inline: Vec::new(),
             blocks: Vec::new(),
             lists: Vec::new(),
@@ -166,7 +187,7 @@ impl<'a> Html<'a> {
     }
 
     fn run(&mut self) {
-        while self.pos < self.s.len() {
+        while self.pos < self.s.len() && !self.budget.exhausted() {
             let rest = &self.s[self.pos..];
             match rest.find('<') {
                 Some(0) => self.markup(),
@@ -307,11 +328,17 @@ impl<'a> Html<'a> {
                         ..Block::default()
                     };
                 }
-                self.blocks.push((name.to_string(), block));
+                // Past MAX_DEPTH an open is ignored (its close finds an
+                // outer element, or nothing).
+                if self.blocks.len() < MAX_DEPTH {
+                    self.blocks.push((name.to_string(), block));
+                }
             }
             "ul" | "ol" | "dir" | "menu" => {
                 self.end_para_if_any();
-                self.lists.push(name == "ol");
+                if self.lists.len() < MAX_DEPTH {
+                    self.lists.push(name == "ol");
+                }
             }
             "table" => {
                 self.end_para_if_any();
@@ -366,7 +393,9 @@ impl<'a> Html<'a> {
                         return;
                     }
                 }
-                self.inline.push((name.to_string(), props));
+                if self.inline.len() < MAX_DEPTH {
+                    self.inline.push((name.to_string(), props));
+                }
             }
         }
     }
@@ -1044,5 +1073,48 @@ mod tests {
             let _ = import_html(&page.as_bytes()[..i]);
         }
         let _ = import_html(b"<<<>>></ / <a b='></p>&#99999999;&#x;&;");
+    }
+
+    /// FIX r2: a ragged table is capped at MAX_COLUMNS, not padded to its
+    /// widest row; against a small budget it fails.
+    #[test]
+    fn a_wide_ragged_table_is_capped_not_padded() {
+        let mut page = String::from("<table><tr>");
+        page.push_str(&"<td>x</td>".repeat(300));
+        page.push_str("</tr>");
+        page.push_str(&"<tr><td>y</td></tr>".repeat(300));
+        page.push_str("</table>");
+        let d = doc(&page);
+        let DocBlock::Table(t) = &d.body[0] else {
+            panic!("{:?}", d.body[0])
+        };
+        assert_eq!(t.grid.len(), crate::import::MAX_COLUMNS);
+        assert!(
+            t.rows
+                .iter()
+                .all(|r| r.cells.len() == crate::import::MAX_COLUMNS)
+        );
+        let small = Budget::new(1 << 20, 2_000);
+        assert_eq!(
+            import_html_within(page.as_bytes(), &small).unwrap_err(),
+            TOO_BIG
+        );
+    }
+
+    /// FIX r2: unclosed tags, then closes that match nothing, were a
+    /// quadratic scan of an unbounded stack; the stacks stop at MAX_DEPTH.
+    #[test]
+    fn element_stacks_stop_at_max_depth() {
+        let page = format!(
+            "<p>{}text{}</p>",
+            "<b><div><ul>".repeat(10_000),
+            "</i></p></ol>".repeat(10_000)
+        );
+        let budget = Budget::standard();
+        let mut h = Html::new(&page, &budget);
+        h.run();
+        assert!(h.inline.len() <= MAX_DEPTH, "{}", h.inline.len());
+        assert!(h.blocks.len() <= MAX_DEPTH, "{}", h.blocks.len());
+        assert!(h.lists.len() <= MAX_DEPTH, "{}", h.lists.len());
     }
 }

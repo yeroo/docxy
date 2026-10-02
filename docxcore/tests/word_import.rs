@@ -205,7 +205,11 @@ fn half_of_word_docx_recovers_a_prefix_of_its_text() {
         docxcore::package::load_package(cut).is_err(),
         "the cut file does not load"
     );
-    let got = paragraph_texts(&import::recover_docx_text(cut).expect("text recovered"));
+    let got = paragraph_texts(
+        &import::recover_docx_text(cut)
+            .expect("within the budget")
+            .expect("text recovered"),
+    );
     assert!(!got.is_empty());
     let (last, whole) = got.split_last().unwrap();
     assert_eq!(whole, &full[..whole.len()]);

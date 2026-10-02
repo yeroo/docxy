@@ -11,6 +11,12 @@
 //!
 //! Format is decided by content first ([`sniff`]), so an RTF or HTML file
 //! named `.doc` or `.docx` still opens as what it is.
+//!
+//! Every import runs against one [`Budget`] (#633 r2): the input it scans,
+//! the bytes it decodes and the document it builds are all charged, so a
+//! hostile file fails with a load error ([`TOO_BIG`]) instead of aborting the
+//! process or hanging the UI thread. A cost that is not charged directly is
+//! O(1) per charged unit, and says so where that is not obvious.
 
 pub mod html;
 pub mod pdf;
@@ -25,6 +31,92 @@ pub use rtf::import_rtf;
 use crate::model::{
     Block, BreakKind, Cell, Document, Inline, ParProps, Paragraph, Row, Run, RunProps, Table,
 };
+use std::cell::Cell as Counter;
+
+/// What any import says when its [`Budget`] runs out.
+pub const TOO_BIG: &str = "the file is too large or too complex to convert";
+
+/// The most stream data one import may decode (inflate and predictor
+/// output, content streams joined).
+pub(crate) const MAX_DECODED: usize = 256 << 20;
+/// The most work one import may do, in units: a token, a glyph, a run, a
+/// paragraph, a cell, a map entry, or 16 bytes of input scanned.
+pub(crate) const MAX_WORK: usize = 64_000_000;
+/// Word's widest table; cells past it in a row join its last cell.
+pub(crate) const MAX_COLUMNS: usize = 63;
+/// The deepest nesting an importer keeps (HTML elements, RTF groups);
+/// opens past it are ignored.
+pub(crate) const MAX_DEPTH: usize = 256;
+
+/// What an import may still spend: decoded bytes and units of work. Once
+/// either runs out it stays out, and the import fails with [`TOO_BIG`].
+pub(crate) struct Budget {
+    bytes: Counter<usize>,
+    work: Counter<usize>,
+    out: Counter<bool>,
+}
+
+impl Budget {
+    pub(crate) fn new(bytes: usize, work: usize) -> Self {
+        Budget {
+            bytes: Counter::new(bytes),
+            work: Counter::new(work),
+            out: Counter::new(false),
+        }
+    }
+
+    /// The budget every import gets.
+    pub(crate) fn standard() -> Self {
+        Self::new(MAX_DECODED, MAX_WORK)
+    }
+
+    /// Decoded bytes that may still be made.
+    pub(crate) fn room(&self) -> usize {
+        if self.out.get() { 0 } else { self.bytes.get() }
+    }
+
+    /// Spend `n` decoded bytes; `false` (and out for good) past the budget.
+    pub(crate) fn take_bytes(&self, n: usize) -> bool {
+        match self.bytes.get().checked_sub(n) {
+            Some(left) if !self.out.get() => {
+                self.bytes.set(left);
+                true
+            }
+            _ => self.fail(),
+        }
+    }
+
+    /// Spend `n` units of work; `false` (and out for good) past the budget.
+    pub(crate) fn work(&self, n: usize) -> bool {
+        match self.work.get().checked_sub(n) {
+            Some(left) if !self.out.get() => {
+                self.work.set(left);
+                true
+            }
+            _ => self.fail(),
+        }
+    }
+
+    /// Spend one unit of work.
+    pub(crate) fn op(&self) -> bool {
+        self.work(1)
+    }
+
+    /// Spend the work of scanning `n` bytes of input once.
+    pub(crate) fn scanned(&self, n: usize) -> bool {
+        self.work(n / 16 + 1)
+    }
+
+    /// Run out now.
+    pub(crate) fn fail(&self) -> bool {
+        self.out.set(true);
+        false
+    }
+
+    pub(crate) fn exhausted(&self) -> bool {
+        self.out.get()
+    }
+}
 
 /// What a file holds, by its first bytes (and its extension when they do
 /// not say).
@@ -123,9 +215,11 @@ pub(crate) fn marker_is_numbered(marker: &str) -> bool {
 }
 
 /// Builds a [`Document`] from a stream of text, breaks, paragraph ends and
-/// table cells, the shape all the importers produce.
-#[derive(Default)]
-pub(crate) struct Builder {
+/// table cells, the shape all the importers produce. Everything it makes is
+/// charged to the import's [`Budget`]; once that is out it makes nothing
+/// more.
+pub(crate) struct Builder<'b> {
+    budget: &'b Budget,
     body: Vec<Block>,
     para: Vec<Inline>,
     table: Option<TableAcc>,
@@ -141,15 +235,20 @@ struct TableAcc {
     cell_has_para: bool,
 }
 
-impl Builder {
-    pub(crate) fn new() -> Self {
-        Self::default()
+impl<'b> Builder<'b> {
+    pub(crate) fn new(budget: &'b Budget) -> Self {
+        Builder {
+            budget,
+            body: Vec::new(),
+            para: Vec::new(),
+            table: None,
+        }
     }
 
     /// Append `text` in `props`, joining the previous run when it has the
     /// same properties.
     pub(crate) fn text(&mut self, text: &str, props: &RunProps) {
-        if text.is_empty() {
+        if text.is_empty() || !self.budget.scanned(text.len()) {
             return;
         }
         if let Some(Inline::Run(run)) = self.para.last_mut() {
@@ -165,17 +264,23 @@ impl Builder {
     }
 
     pub(crate) fn tab(&mut self, props: &RunProps) {
-        self.para.push(Inline::Tab(props.clone()));
+        if self.budget.op() {
+            self.para.push(Inline::Tab(props.clone()));
+        }
     }
 
     pub(crate) fn line_break(&mut self, props: &RunProps) {
-        self.para
-            .push(Inline::Break(BreakKind::Line, props.clone()));
+        if self.budget.op() {
+            self.para
+                .push(Inline::Break(BreakKind::Line, props.clone()));
+        }
     }
 
     pub(crate) fn page_break(&mut self, props: &RunProps) {
-        self.para
-            .push(Inline::Break(BreakKind::Page, props.clone()));
+        if self.budget.op() {
+            self.para
+                .push(Inline::Break(BreakKind::Page, props.clone()));
+        }
     }
 
     /// The text of the paragraph in progress.
@@ -225,6 +330,10 @@ impl Builder {
     /// End the paragraph in progress, with `props`, in the open table cell
     /// when `in_table`, else in the body (closing a table left open).
     pub(crate) fn end_para(&mut self, props: ParProps, in_table: bool) {
+        if !self.budget.op() {
+            self.para.clear();
+            return;
+        }
         let p = Block::Paragraph(Paragraph {
             props,
             content: std::mem::take(&mut self.para),
@@ -247,17 +356,26 @@ impl Builder {
     }
 
     /// End a table cell: text since the last paragraph end is its last
-    /// paragraph, and a cell always has at least one.
+    /// paragraph, and a cell always has at least one. A row keeps at most
+    /// [`MAX_COLUMNS`] cells: past that, a cell's paragraphs join the last.
     pub(crate) fn end_cell(&mut self, props: ParProps) {
         let has_para = self.table.as_ref().is_some_and(|t| t.cell_has_para);
         if !self.para.is_empty() || !has_para {
             self.end_para(props, true);
         }
+        if !self.budget.op() {
+            return;
+        }
         let t = self.table.get_or_insert_with(TableAcc::default);
-        t.cells.push(Cell {
-            blocks: std::mem::take(&mut t.blocks),
-            ..Cell::default()
-        });
+        let blocks = std::mem::take(&mut t.blocks);
+        let full = t.cells.len() >= MAX_COLUMNS;
+        match t.cells.last_mut() {
+            Some(last) if full => last.blocks.extend(blocks),
+            _ => t.cells.push(Cell {
+                blocks,
+                ..Cell::default()
+            }),
+        }
         t.cell_has_para = false;
     }
 
@@ -267,6 +385,9 @@ impl Builder {
             !self.para.is_empty() || self.table.as_ref().is_some_and(|t| !t.blocks.is_empty());
         if open_text {
             self.end_cell(props);
+        }
+        if !self.budget.op() {
+            return;
         }
         if let Some(t) = self.table.as_mut() {
             if !t.cells.is_empty() {
@@ -285,7 +406,7 @@ impl Builder {
         };
         if !t.cells.is_empty() || !t.blocks.is_empty() {
             // Cells with no row end: keep them as a last row.
-            if !t.blocks.is_empty() {
+            if !t.blocks.is_empty() && t.cells.len() < MAX_COLUMNS {
                 t.cells.push(Cell {
                     blocks: std::mem::take(&mut t.blocks),
                     ..Cell::default()
@@ -299,16 +420,18 @@ impl Builder {
         if t.rows.is_empty() {
             return;
         }
+        // At most MAX_COLUMNS (end_cell keeps rows to that), so the padding
+        // below is at most that many cells a row, each charged.
         let ncols = t
             .rows
             .iter()
             .map(|r| r.cells.len())
             .max()
             .unwrap_or(1)
-            .max(1);
+            .clamp(1, MAX_COLUMNS);
         // Rows shorter than the widest get empty cells, so the grid is square.
         for row in &mut t.rows {
-            while row.cells.len() < ncols {
+            while row.cells.len() < ncols && self.budget.op() {
                 row.cells.push(Cell {
                     blocks: vec![Block::Paragraph(Paragraph::default())],
                     ..Cell::default()
@@ -413,7 +536,8 @@ mod tests {
             bold: true,
             ..RunProps::default()
         };
-        let mut b = Builder::new();
+        let budget = Budget::standard();
+        let mut b = Builder::new(&budget);
         b.text("Hello ", &plain);
         b.text("big", &bold);
         b.text(" world", &plain);

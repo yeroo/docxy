@@ -14,24 +14,40 @@
 //! page (`\ansicpg932`, 936, 949, 950) has no table here: each of its byte
 //! pairs comes out as U+FFFD rather than failing the document.
 
-use super::{Builder, heading_props, marker_is_numbered};
+use super::{Budget, Builder, MAX_DEPTH, TOO_BIG, heading_props, marker_is_numbered};
 use crate::model::{Align, Document, ParProps, RunProps, VertAlign};
 use std::collections::HashMap;
 
 /// Read an RTF file. `Err` only when it is not RTF at all or holds no text.
 pub fn import_rtf(bytes: &[u8]) -> Result<Document, String> {
+    import_rtf_within(bytes, &Budget::standard())
+}
+
+/// [`import_rtf`] against `budget`. The reader is one pass over the input
+/// (charged once here); the document it builds is charged as it is built.
+pub(crate) fn import_rtf_within(bytes: &[u8], budget: &Budget) -> Result<Document, String> {
+    if !budget.scanned(bytes.len()) {
+        return Err(TOO_BIG.into());
+    }
     let start = bytes
         .iter()
         .position(|&b| b == b'{')
         .filter(|&i| bytes[i..].starts_with(b"{\\rtf"))
         .ok_or_else(|| "not an RTF file (no {\\rtf header)".to_string())?;
-    let mut r = Reader::new(&bytes[start..]);
+    let mut r = Reader::new(&bytes[start..], budget);
     r.run();
+    if budget.exhausted() {
+        return Err(TOO_BIG.into());
+    }
     if r.out.is_empty() {
         return Err("the RTF file holds no text".into());
     }
     let props = r.par_props();
-    Ok(r.out.finish(props))
+    let doc = r.out.finish(props);
+    if budget.exhausted() {
+        return Err(TOO_BIG.into());
+    }
+    Ok(doc)
 }
 
 /// Where the text of the current group goes.
@@ -74,8 +90,12 @@ struct Reader<'a> {
     src: &'a [u8],
     pos: usize,
     stack: Vec<State>,
+    /// Groups opened past [`MAX_DEPTH`]: not kept, only counted, so their
+    /// closing braces match.
+    deep: usize,
     st: State,
-    out: Builder,
+    budget: &'a Budget,
+    out: Builder<'a>,
     ansi_page: i32,
     default_font: i32,
     fonts: HashMap<i32, Font>,
@@ -96,11 +116,13 @@ struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
-    fn new(src: &'a [u8]) -> Self {
+    fn new(src: &'a [u8], budget: &'a Budget) -> Self {
         Reader {
             src,
             pos: 0,
             stack: Vec::new(),
+            deep: 0,
+            budget,
             st: State {
                 dest: Dest::Body,
                 run: RunProps::default(),
@@ -114,7 +136,7 @@ impl<'a> Reader<'a> {
                 ilvl: 0,
                 pn: None,
             },
-            out: Builder::new(),
+            out: Builder::new(budget),
             ansi_page: 1252,
             default_font: 0,
             fonts: HashMap::new(),
@@ -130,7 +152,7 @@ impl<'a> Reader<'a> {
     }
 
     fn run(&mut self) {
-        while self.pos < self.src.len() {
+        while self.pos < self.src.len() && !self.budget.exhausted() {
             let b = self.src[self.pos];
             self.pos += 1;
             match b {
@@ -148,6 +170,10 @@ impl<'a> Reader<'a> {
     }
 
     fn open_group(&mut self) {
+        if self.stack.len() >= MAX_DEPTH {
+            self.deep += 1;
+            return;
+        }
         self.stack.push(self.st.clone());
         // A stylesheet / font table entry starts with its group.
         if self.st.dest == Dest::StyleSheet && self.stack.len() == self.style_depth + 1 {
@@ -157,6 +183,10 @@ impl<'a> Reader<'a> {
 
     /// Pop a group; `false` when the outermost group closed.
     fn close_group(&mut self) -> bool {
+        if self.deep > 0 {
+            self.deep -= 1;
+            return true;
+        }
         if self.st.dest == Dest::StyleSheet && self.stack.len() == self.style_depth + 1 {
             if let Some((Some(n), name)) = self.style_entry.take() {
                 let name = name
@@ -759,5 +789,58 @@ mod tests {
             let _ = import_rtf(&rtf[..n]);
         }
         let _ = import_rtf(u(r"{\rtf1 }}}}} text \U99999999999 \'zz \uc-5 x").as_bytes());
+    }
+
+    /// FIX r2: one row of 300 cells then 300 one-cell rows asked for
+    /// 300 x 300 padded cells. A row keeps at most MAX_COLUMNS cells (the
+    /// rest join the last), so the grid is 63 wide; every cell is charged.
+    #[test]
+    fn a_wide_ragged_table_is_capped_not_padded() {
+        let mut rtf = String::from(r"{\rtf1 ");
+        rtf.push_str(&r"x\cell ".repeat(300));
+        rtf.push_str(r"\row ");
+        rtf.push_str(&r"y\cell\row ".repeat(300));
+        rtf.push('}');
+        let doc = import_rtf(rtf.as_bytes()).unwrap();
+        let Some(Block::Table(t)) = doc.body.first() else {
+            panic!("{:?}", doc.body.first())
+        };
+        assert_eq!(t.grid.len(), crate::import::MAX_COLUMNS);
+        assert!(
+            t.rows
+                .iter()
+                .all(|r| r.cells.len() == crate::import::MAX_COLUMNS)
+        );
+        assert_eq!(t.rows.len(), 301);
+        // The cells past the 63rd joined the last one: no text is lost.
+        let first_row: String = t.rows[0]
+            .cells
+            .iter()
+            .map(|c| c.blocks.iter().map(Block::plain_text).collect::<String>())
+            .collect();
+        assert_eq!(first_row, "x".repeat(300));
+        // Against a small budget, the same table fails instead.
+        let small = Budget::new(1 << 20, 2_000);
+        assert_eq!(
+            import_rtf_within(rtf.as_bytes(), &small).unwrap_err(),
+            TOO_BIG
+        );
+    }
+
+    #[test]
+    fn deep_groups_are_counted_not_kept() {
+        let rtf = format!(
+            r"{{\rtf1 {}deep{}\par}}",
+            "{".repeat(100_000),
+            "}".repeat(100_000)
+        );
+        assert_eq!(texts(&rtf), ["deep"]);
+        // Opened and never closed: the stack stops at MAX_DEPTH.
+        let open = format!(r"{{\rtf1 {}", "{".repeat(100_000));
+        let budget = Budget::standard();
+        let mut r = Reader::new(open.as_bytes(), &budget);
+        r.run();
+        assert_eq!(r.stack.len(), MAX_DEPTH);
+        assert_eq!(r.deep, 100_001 - MAX_DEPTH);
     }
 }

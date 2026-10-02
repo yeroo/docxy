@@ -13,34 +13,72 @@
 //! 8-bit (ASCII or UTF-8) and in UTF-16LE (how Word 97-2003 stores most
 //! text), each a paragraph.
 
-use super::Builder;
+use super::{Budget, Builder, TOO_BIG};
 use crate::model::{Document, ParProps, RunProps};
 
-/// The text of a damaged Word package's main document part; `None` when no
-/// part can be found or it holds no text.
-pub fn recover_docx_text(bytes: &[u8]) -> Option<Document> {
-    let xml = document_xml(bytes)?;
-    let doc = paragraphs_of(&String::from_utf8_lossy(&xml));
-    paragraph_count(&doc).gt(&0).then_some(doc)
+/// The text of a damaged Word package's main document part: `Ok(None)` when
+/// no part can be found or it holds no text, `Err` when reading it would
+/// cost more than an import may ([`TOO_BIG`]).
+pub fn recover_docx_text(bytes: &[u8]) -> Result<Option<Document>, String> {
+    recover_docx_text_within(bytes, &Budget::standard())
+}
+
+/// [`recover_docx_text`] against `budget`: the header scan is one pass over
+/// the input (charged once), every part decoded is charged, and so is the
+/// document built.
+pub(crate) fn recover_docx_text_within(
+    bytes: &[u8],
+    budget: &Budget,
+) -> Result<Option<Document>, String> {
+    if !budget.scanned(bytes.len()) {
+        return Err(TOO_BIG.into());
+    }
+    let xml = document_xml(bytes, budget);
+    if budget.exhausted() {
+        return Err(TOO_BIG.into());
+    }
+    let Some(xml) = xml else {
+        return Ok(None);
+    };
+    let doc = paragraphs_of(&String::from_utf8_lossy(&xml), budget);
+    if budget.exhausted() {
+        return Err(TOO_BIG.into());
+    }
+    Ok((paragraph_count(&doc) > 0).then_some(doc))
 }
 
 /// Printable text runs of any file as paragraphs: 8-bit runs of at least
-/// four characters and UTF-16LE runs of at least four, in file order.
-/// Always a document; one empty paragraph when nothing is readable.
-pub fn recover_any_text(bytes: &[u8]) -> Document {
+/// four characters and UTF-16LE runs of at least four, in file order. One
+/// empty paragraph when nothing is readable; `Err` past the budget.
+pub fn recover_any_text(bytes: &[u8]) -> Result<Document, String> {
+    recover_any_text_within(bytes, &Budget::standard())
+}
+
+pub(crate) fn recover_any_text_within(bytes: &[u8], budget: &Budget) -> Result<Document, String> {
+    // Three passes: 8-bit, and UTF-16 at both alignments.
+    if !budget.work(3 * (bytes.len() / 16 + 1)) {
+        return Err(TOO_BIG.into());
+    }
     let mut runs = text_runs_8bit(bytes);
     runs.extend(text_runs_utf16(bytes));
     runs.sort_by_key(|(at, _)| *at);
     let plain = RunProps::default();
-    let mut b = Builder::new();
-    for (_, text) in runs.into_iter().take(1_000_000) {
+    let mut b = Builder::new(budget);
+    for (_, text) in runs {
+        if budget.exhausted() {
+            return Err(TOO_BIG.into());
+        }
         b.text(&text, &plain);
         b.end_para(ParProps::default(), false);
     }
     if b.is_empty() {
         b.end_para(ParProps::default(), false);
     }
-    b.finish(ParProps::default())
+    let doc = b.finish(ParProps::default());
+    if budget.exhausted() {
+        return Err(TOO_BIG.into());
+    }
+    Ok(doc)
 }
 
 /// How many paragraphs with text `doc` has: what the status line reports.
@@ -53,9 +91,18 @@ pub fn paragraph_count(doc: &Document) -> usize {
 
 const LOCAL: &[u8] = b"PK\x03\x04";
 
+/// Whether a part name is a main document part: `word/document.xml`, or
+/// one named like it (`word/document2.xml`), never the glossary's
+/// (`word/glossary/document.xml`, the building blocks).
+fn main_part_name(name: &str) -> bool {
+    name.strip_prefix("word/")
+        .is_some_and(|f| !f.contains('/') && f.starts_with("document") && f.ends_with(".xml"))
+}
+
 /// The bytes of `word/document.xml` that can be read from a ZIP, cut short
-/// or not.
-fn document_xml(bytes: &[u8]) -> Option<Vec<u8>> {
+/// or not; failing that, of a part named like it. Every part decoded is
+/// charged to `budget`, and once a fallback is held no other one is decoded.
+fn document_xml(bytes: &[u8], budget: &Budget) -> Option<Vec<u8>> {
     let mut fallback: Option<Vec<u8>> = None;
     let mut at = 0;
     while let Some(i) = super::find(&bytes[at..], LOCAL) {
@@ -83,11 +130,15 @@ fn document_xml(bytes: &[u8]) -> Option<Vec<u8>> {
         let name = String::from_utf8_lossy(name)
             .replace('\\', "/")
             .to_ascii_lowercase();
-        // The main part, or one named like it (`word/document2.xml`).
-        if !(name.starts_with("word/") && name.ends_with("document.xml")) {
+        if !main_part_name(&name) {
             continue;
         }
         let main = name == "word/document.xml";
+        // Only the main part is worth decoding once a fallback is held:
+        // many headers may point at one large compressed body.
+        if !main && fallback.is_some() {
+            continue;
+        }
         let rest = &bytes[data_start..];
         let data = match method {
             0 => {
@@ -100,9 +151,21 @@ fn document_xml(bytes: &[u8]) -> Option<Vec<u8>> {
                         .or_else(|| super::find(rest, b"PK\x01\x02"))
                         .unwrap_or(rest.len())
                 };
+                if !budget.take_bytes(end) {
+                    return None;
+                }
                 rest[..end].to_vec()
             }
-            8 => opccore::inflate::inflate_partial(rest, 1 << 28),
+            8 => {
+                // Capped inside each block at what the budget has left.
+                let room = budget.room();
+                let out = opccore::inflate::inflate_partial(rest, room);
+                if out.len() >= room || !budget.take_bytes(out.len()) {
+                    budget.fail();
+                    return None;
+                }
+                out
+            }
             _ => continue,
         };
         if main {
@@ -115,9 +178,12 @@ fn document_xml(bytes: &[u8]) -> Option<Vec<u8>> {
 
 /// The paragraphs of a (possibly cut) `document.xml`: `w:t` text, `w:tab`
 /// and `w:br`/`w:cr`, one paragraph per `w:p`.
-fn paragraphs_of(xml: &str) -> Document {
+///
+/// One forward pass (charged with the decoded bytes); the paragraphs are
+/// charged by the builder.
+fn paragraphs_of(xml: &str, budget: &Budget) -> Document {
     let plain = RunProps::default();
-    let mut b = Builder::new();
+    let mut b = Builder::new(budget);
     let mut in_text = false;
     let mut in_run = false;
     let mut open_para = false;
@@ -377,7 +443,7 @@ mod tests {
                 let mut zip = local("[Content_Types].xml", 0, b"<Types/>", true);
                 zip.extend(local("word/document.xml", method, &data, sizes));
                 zip.extend(local("word/styles.xml", 0, b"<w:styles/>", true));
-                let whole = recover_docx_text(&zip).unwrap();
+                let whole = recover_docx_text(&zip).unwrap().unwrap();
                 assert_eq!(
                     paragraph_texts(&whole),
                     paras,
@@ -386,7 +452,7 @@ mod tests {
                 // Cut at half: a prefix comes back, its last paragraph
                 // possibly partial.
                 let cut = &zip[..zip.len() / 2];
-                let got = paragraph_texts(&recover_docx_text(cut).unwrap());
+                let got = paragraph_texts(&recover_docx_text(cut).unwrap().unwrap());
                 assert!(got.len() >= 5 && got.len() < paras.len(), "{}", got.len());
                 let (last, full) = got.split_last().unwrap();
                 assert_eq!(full, &paras[..full.len()]);
@@ -400,7 +466,7 @@ mod tests {
         let xml = "<w:body><w:p><w:r><w:t>a</w:t><w:tab/><w:t>b</w:t><w:br/><w:t>c</w:t></w:r><w:del><w:r><w:delText>gone</w:delText></w:r></w:del></w:p><w:p/><w:p><w:r><w:instrText>PAGE</w:instrText><w:t>d&#x416;</w:t></w:r></w:p>";
         let zip = local("word/document.xml", 0, xml.as_bytes(), true);
         assert_eq!(
-            paragraph_texts(&recover_docx_text(&zip).unwrap()),
+            paragraph_texts(&recover_docx_text(&zip).unwrap().unwrap()),
             ["a\tb\nc", "", "d\u{416}"]
         );
     }
@@ -410,19 +476,19 @@ mod tests {
         let xml = "<w:body><w:p><w:pPr><w:tabs><w:tab w:val=\"left\" w:pos=\"720\"/><w:tab w:val=\"right\" w:pos=\"9360\"/></w:tabs></w:pPr><w:r><w:t>Chapter</w:t></w:r><w:r><w:tab/><w:t>7</w:t></w:r></w:p>";
         let zip = local("word/document.xml", 0, xml.as_bytes(), true);
         assert_eq!(
-            paragraph_texts(&recover_docx_text(&zip).unwrap()),
+            paragraph_texts(&recover_docx_text(&zip).unwrap().unwrap()),
             ["Chapter\t7"]
         );
     }
 
     #[test]
     fn nothing_recoverable_is_none() {
-        assert!(recover_docx_text(b"").is_none());
-        assert!(recover_docx_text(b"PK\x03\x04short").is_none());
+        assert!(recover_docx_text(b"").unwrap().is_none());
+        assert!(recover_docx_text(b"PK\x03\x04short").unwrap().is_none());
         let zip = local("word/styles.xml", 0, b"<w:styles/>", true);
-        assert!(recover_docx_text(&zip).is_none());
+        assert!(recover_docx_text(&zip).unwrap().is_none());
         let empty = local("word/document.xml", 0, b"<w:body><w:p/></w:body>", true);
-        assert!(recover_docx_text(&empty).is_none());
+        assert!(recover_docx_text(&empty).unwrap().is_none());
     }
 
     #[test]
@@ -437,12 +503,12 @@ mod tests {
             bytes.extend(u.to_le_bytes());
         }
         bytes.extend([0xff, 0xfe, 0x00, 0xd8]);
-        let doc = recover_any_text(&bytes);
+        let doc = recover_any_text(&bytes).unwrap();
         assert_eq!(
             paragraph_texts(&doc),
             ["Hello world", "Caf\u{e9} UTF-8", "Wide \u{416}\u{436} text"]
         );
-        let none = recover_any_text(&[0, 1, 2, 3]);
+        let none = recover_any_text(&[0, 1, 2, 3]).unwrap();
         assert_eq!(paragraph_texts(&none), [""]);
     }
 
@@ -460,5 +526,71 @@ mod tests {
             let _ = recover_any_text(&zip[..n]);
         }
         let _ = recover_docx_text(b"PK\x03\x04\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff");
+    }
+
+    /// FIX r2: `word/document2.xml` is a main part, the glossary's
+    /// `word/glossary/document.xml` is not.
+    #[test]
+    fn main_part_names() {
+        assert!(main_part_name("word/document.xml"));
+        assert!(main_part_name("word/document2.xml"));
+        assert!(!main_part_name("word/glossary/document.xml"));
+        assert!(!main_part_name("word/xdocument.xml"));
+        assert!(!main_part_name("word/styles.xml"));
+        let glossary = body(&["Building block"]);
+        let main = body(&["The document"]);
+        let mut zip = local("word/glossary/document.xml", 0, glossary.as_bytes(), true);
+        zip.extend(local("word/document2.xml", 0, main.as_bytes(), true));
+        let got = recover_docx_text(&zip).unwrap().unwrap();
+        assert_eq!(paragraph_texts(&got), ["The document"]);
+    }
+
+    /// FIX r2: many headers of main-like parts pointing (through their extra
+    /// field) at one large body decode it once: once a fallback is held,
+    /// another non-main part is not decoded at all.
+    #[test]
+    fn a_held_fallback_skips_decoding_the_others() {
+        let paras: Vec<String> = (0..6000).map(|i| format!("Paragraph {i}")).collect();
+        let refs: Vec<&str> = paras.iter().map(String::as_str).collect();
+        let shared = deflate_stored(body(&refs).as_bytes());
+        assert!(shared.len() > 200_000);
+        // 100 headers, each pointing past the rest at the shared body.
+        let n = 100;
+        let header_len = |i: usize| 30 + format!("word/document{}.xml", i + 2).len();
+        let total: usize = (0..n).map(header_len).sum();
+        let mut zip = Vec::new();
+        let mut at = 0;
+        for i in 0..n {
+            let name = format!("word/document{}.xml", i + 2);
+            at += header_len(i);
+            let extra = (total - at) as u16;
+            zip.extend(LOCAL);
+            zip.extend(20u16.to_le_bytes());
+            zip.extend(8u16.to_le_bytes());
+            zip.extend(8u16.to_le_bytes());
+            zip.extend([0; 8]);
+            zip.extend(0u32.to_le_bytes());
+            zip.extend(0u32.to_le_bytes());
+            zip.extend((name.len() as u16).to_le_bytes());
+            zip.extend(extra.to_le_bytes());
+            zip.extend(name.as_bytes());
+        }
+        zip.extend(&shared);
+        // Decoding it once fits 4 MiB; decoding it for every header would not.
+        let budget = Budget::new(4 << 20, crate::import::MAX_WORK);
+        let got = recover_docx_text_within(&zip, &budget).unwrap().unwrap();
+        assert_eq!(paragraph_texts(&got).len(), 6000);
+    }
+
+    #[test]
+    fn a_bomb_in_the_main_part_fails_within_the_budget() {
+        // A stored stream far larger than the room: Err, not 256 MiB.
+        let big = vec![b'a'; 2 << 20];
+        let zip = local("word/document.xml", 8, &deflate_stored(&big), false);
+        let budget = Budget::new(1 << 20, crate::import::MAX_WORK);
+        assert_eq!(
+            recover_docx_text_within(&zip, &budget).unwrap_err(),
+            TOO_BIG
+        );
     }
 }
