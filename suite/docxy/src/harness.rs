@@ -2251,6 +2251,7 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "ask-on-close"
             | "autorecover"
             | "keep-drafts"
+            | "user-name"
             | "trusted-clear"
             | "open-draft"
             | "dialog-set"
@@ -2419,6 +2420,8 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
             Json::Num(f64::from(app.autorecover_minutes)),
         ),
         ("keep_drafts", Json::Bool(app.keep_drafts)),
+        ("user_name", Json::Str(app.user_name.clone())),
+        ("user_initials", Json::Str(app.user_initials.clone())),
         ("sheet_editing", sheet_editing_json(&app.edit_opts)),
         ("fx_expanded", Json::Bool(app.fx_expanded)),
         (
@@ -3049,6 +3052,13 @@ pub fn dispatch(
                 return Err("'on' must be a boolean".into());
             };
             app.set_keep_drafts(*on, cx);
+            Done::ok(state(app, window))
+        }
+        // Settings' User name... row (#620): opens its dialog on the active
+        // tab, which `dialog-set` and `dialog-click` then drive.
+        "user-name" => {
+            app.open_user_name_dialog()?;
+            cx.notify();
             Done::ok(state(app, window))
         }
         // Settings' Trusted Documents Clear (#895): the same handler as the
@@ -3934,6 +3944,8 @@ mod tests {
             dirty: false,
             status: "".into(),
             comments: vec![],
+            session_comment_ids: Default::default(),
+            used_comment_ids: Default::default(),
             pkg: None,
             notes: vec![],
             markdown: false,

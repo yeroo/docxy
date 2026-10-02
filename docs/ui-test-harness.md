@@ -329,6 +329,7 @@ State keys, as the app reports them after every driving verb:
 | `tabs`, `ask_on_close` | open tab count and whether window close asks about unsaved changes |
 | `autorecover_minutes` | minutes between AutoRecover writes while a tab is unsaved; `0` is off |
 | `keep_drafts` | whether Don't Save keeps a workbook's last AutoRecover copy as a draft |
+| `user_name`, `user_initials` | Settings' User name and Initials for new comments (#620); empty falls back to the OS account name and initials derived from it |
 | `sheet_editing` | Settings' Sheet editing options (#672), by their `session.json` keys: `edit_fixed_decimal`, `edit_fixed_decimal_places`, `edit_move_after_enter`, `edit_move_direction` (`down`/`right`/`up`/`left`), `edit_in_cell`, `edit_autocomplete`, `edit_fill_handle` |
 | `fx_expanded` | whether Ctrl+Shift+U has expanded the sheet formula bar |
 | `menu` | the open menu's `{target}`, or null; `menu-read` has its items |
@@ -516,6 +517,12 @@ than four days unless one is open in a tab. `call open-draft {"index":N}` opens
 the Nth of a fresh listing read-only, as a click on its row in the backstage's
 Recover Unsaved Workbooks does. The ignored desktop test in
 `uiharness/tests/autorecover.rs` walks the issue's scenario.
+
+`call user-name {}` opens Settings' User name... dialog (#620) on the active
+tab, as the backstage row does: `dialog-set` its `user-name` and `initials`
+fields and `dialog-click` OK to store and persist them. New Word comments are
+stamped with that name and those initials (else the OS account name, else
+`docxy`, with initials derived from the name) and the UTC time.
 
 `project-tabs.uit` drives several plans at once: a blank one from `proj.new`
 that takes tasks without a fixture, two opened plans switched between by title
@@ -1020,7 +1027,8 @@ stands for a press outside the menu (`click-cell`, `drag`, `fill-drag`,
 `focus-field`, `ribbon-click`, `title-tab`, `close-tab`, `selection-set`,
 `open`, `backstage` open and close (not `read`), `backstage-close`,
 `inspect` with `remove`,
-`theme-set`, `ask-on-close`, `autorecover`, `keep-drafts`, `trusted-clear`,
+`theme-set`, `ask-on-close`, `autorecover`, `keep-drafts`, `user-name`,
+`trusted-clear`,
 `open-draft`,
 `enable-editing` and the
 `dialog-*` drivers), which closes it first and then goes on, as the press

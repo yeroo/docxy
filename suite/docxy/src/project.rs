@@ -610,6 +610,8 @@ fn project_tab(
         dirty,
         status,
         comments: vec![],
+        session_comment_ids: Default::default(),
+        used_comment_ids: Default::default(),
         pkg: None,
         notes: vec![],
         markdown: false,

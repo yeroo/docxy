@@ -96,6 +96,8 @@ fn apply_dialog(
         | DialogOwner::DesignBorderOptions => {
             Err("a Design dialog applies through the Design tab".into())
         }
+        // Handled in `user_name::click`, before this: it is the app's.
+        DialogOwner::UserName => Err("the user name is an app setting".into()),
         #[cfg(test)]
         DialogOwner::Test | DialogOwner::TestChild => Ok(false),
     }
@@ -253,6 +255,10 @@ impl Docxy {
 
     /// Press a button on the active tab's top dialog.
     pub(crate) fn dialog_press(&mut self, button: &str) -> Result<(), String> {
+        // The user name is the app's setting, not the tab's (#620).
+        if let Some(done) = self.user_name_click(button) {
+            return done;
+        }
         let reopen = reopen_on_top(self.tabs.get(self.active));
         let tab = self.tabs.get_mut(self.active).ok_or(NONE_OPEN)?;
         dialog_click(tab, button)?;
@@ -279,6 +285,26 @@ impl Docxy {
         m: Modifiers,
         cx: &mut Context<Self>,
     ) -> bool {
+        // Enter or Escape on the user name dialog presses through the app.
+        let plain = !m.control && !m.alt && !m.platform;
+        let user_name_button = self
+            .tabs
+            .get(self.active)
+            .filter(|t| {
+                t.dialogs
+                    .top()
+                    .is_some_and(|d| d.owner == DialogOwner::UserName)
+            })
+            .and_then(|t| t.dialogs.key_button(key, plain));
+        if let Some(label) = user_name_button {
+            if let Some(Err(e)) = self.user_name_click(&label) {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.status = e.into();
+                }
+            }
+            cx.notify();
+            return true;
+        }
         let reopen = reopen_on_top(self.tabs.get(self.active));
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return false;

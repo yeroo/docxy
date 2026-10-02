@@ -418,9 +418,30 @@ fn export_html_headless(loaded: &Input, source: &str, out: &str) -> Result<usize
     Ok(page.len())
 }
 
-/// Revisions and comments are attributed to the document's author property,
-/// else to this name.
+/// The reviewer name when the OS gives none ([`App::review_author`]), and
+/// the author `docxy compare` attributes its revisions to.
 const DEFAULT_AUTHOR: &str = "docxy";
+
+/// The comment ids a freshly loaded document holds: its comments' and its
+/// body markers' ([`App::used_comment_ids`]).
+fn used_comment_ids(
+    comments: &[docxcore::comments::Comment],
+    doc: &Document,
+) -> std::collections::BTreeSet<String> {
+    let mut used: std::collections::BTreeSet<String> =
+        comments.iter().map(|c| c.id.clone()).collect();
+    used.extend(docxcore::inspect::comment_marker_ids(doc));
+    used
+}
+
+/// The OS account name (`USERNAME` on Windows, `USER` elsewhere), if set.
+fn os_user_name() -> Option<String> {
+    ["USERNAME", "USER"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .map(|v| v.trim().to_string())
+        .find(|v| !v.is_empty())
+}
 
 /// Now as a UTC ISO-8601 `w:date` (`YYYY-MM-DDTHH:MM:SSZ`).
 fn utc_now_iso() -> String {
@@ -1398,6 +1419,18 @@ struct App {
     /// Review comments parsed from the document, and whether the side panel that
     /// lists them is shown.
     comments: Vec<docxcore::comments::Comment>,
+    /// Comments added since the document was opened, by id. Their records
+    /// live here, not in `pkg`: one is in `comments` and is saved only while
+    /// a marker with its id is in the body, so undoing Add Comment removes
+    /// it and redo brings it back (#620). A Save keeps it; an open, or a
+    /// Save As (which reloads the document and its undo history), clears it.
+    session_comments: std::collections::BTreeMap<String, docxcore::comments::Comment>,
+    /// Every comment id the document has had since it loaded: those of its
+    /// comments and body markers then ([`used_comment_ids`]), and each one
+    /// allocated since. It never shrinks, not on Delete Comment, since an
+    /// undo can bring any of their markers back; a new comment never takes
+    /// one of them (#620). Reseeded wherever `session_comments` is cleared.
+    used_comment_ids: std::collections::BTreeSet<String>,
     show_comments: bool,
     /// The comment highlighted by Prev/Next navigation (only once `comment_active`).
     comment_sel: usize,
@@ -1544,6 +1577,7 @@ impl App {
         let page_parts = PageState::derive(&pkg, &doc);
         let watermark_state = watermark::State::from_package(&pkg);
         let doc_page_borders = pkg.has_page_borders();
+        let used_comment_ids = used_comment_ids(&comments, &doc);
         App {
             pkg,
             editor: Editor::new(doc),
@@ -1598,6 +1632,8 @@ impl App {
             ribbon_focus: ribbon::Focus::None,
             auto_hide_ribbon: false,
             comments,
+            session_comments: Default::default(),
+            used_comment_ids,
             show_comments: false,
             comment_sel: 0,
             comment_active: false,
@@ -2406,6 +2442,7 @@ impl App {
                 (md.into_bytes(), pkg)
             }
             DocFormat::Docx | DocFormat::Html => {
+                self.reconcile_session_comments();
                 let docx = if self.format.is_docx() && !self.modified {
                     save_package_preserving_document(&self.pkg)
                 } else {
@@ -2627,6 +2664,7 @@ impl App {
             .unwrap_or_default();
         self.even_odd = pkg.has_even_odd();
         self.comments = docxcore::comments::parse_comments(&pkg);
+        self.session_comments.clear();
         self.notes = docxcore::notes::parse_notes(&pkg);
         self.notes_scroll = 0;
         self.comments_scroll = 0;
@@ -2645,6 +2683,7 @@ impl App {
         self.footer_part = page_parts.footer_part;
         self.page_parts_sect = page_parts.sect;
         self.pkg = pkg;
+        self.used_comment_ids = used_comment_ids(&self.comments, &doc);
         self.editor = Editor::new(doc);
         self.styles = Rc::new(styles);
         self.numbering = Rc::new(numbering);
@@ -2679,6 +2718,12 @@ impl App {
     /// is being edited).
     fn body_editor(&self) -> &Editor {
         self.hf_edit.as_ref().map_or(&self.editor, |hf| &hf.body)
+    }
+
+    fn body_editor_mut(&mut self) -> &mut Editor {
+        self.hf_edit
+            .as_mut()
+            .map_or(&mut self.editor, |hf| &mut hf.body)
     }
 
     /// Re-derive the header/footer parts, their content and titlePg from the
@@ -2801,9 +2846,18 @@ impl App {
     /// span it anchors to, and its text, scrollable with the wheel.
     /// The next free comment id (max existing + 1).
     fn next_comment_id(&self) -> i32 {
+        // An undone comment keeps its id: redo brings it back. Ids whose
+        // markers are in the body are taken too (a deleted comment's, back
+        // after an undo): a new comment sharing one would stay live after
+        // its own undo.
+        let in_body = docxcore::inspect::comment_marker_ids(&self.body_editor().doc);
         self.comments
             .iter()
-            .filter_map(|c| c.id.parse::<i32>().ok())
+            .map(|c| &c.id)
+            .chain(self.session_comments.keys())
+            .chain(&self.used_comment_ids)
+            .chain(&in_body)
+            .filter_map(|id| id.parse::<i32>().ok())
             .max()
             .unwrap_or(0)
             + 1
@@ -2820,8 +2874,10 @@ impl App {
         self.dirty = true;
     }
 
-    /// Commit the new comment: wrap the selection in markers, add it to comments.xml
-    /// and the live panel.
+    /// Commit the new comment: wrap the selection in markers (one undo step)
+    /// and add it to the live panel. Each save writes it to comments.xml
+    /// while its markers are in the body ([`App::reconcile_session_comments`]);
+    /// one made while editing a header or footer is written at once.
     fn commit_comment(&mut self) {
         if self
             .comment_input
@@ -2847,35 +2903,87 @@ impl App {
             return;
         }
         let author = self.review_author();
-        let initials: String = author
-            .split_whitespace()
-            .filter_map(|w| w.chars().next())
-            .collect();
-        let date = self
-            .field_ctx
-            .now
-            .as_ref()
-            .map(|d| {
-                format!(
-                    "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-                    d.year, d.month, d.day, d.hour, d.min, d.sec
-                )
-            })
-            .unwrap_or_default();
-        self.pkg.add_comment(id, &author, &initials, &date, &text);
-        self.comments.push(docxcore::comments::Comment {
+        let comment = docxcore::comments::Comment {
             id: id.to_string(),
+            initials: docxcore::comments::initials(&author),
             author,
-            initials,
-            date,
+            date: utc_now_iso(),
             text,
             quoted,
-        });
+        };
+        if self.hf_edit.is_some() {
+            // Its markers are in a header or footer, not the body the saves
+            // reconcile against: written now, as before.
+            self.pkg.add_comment(
+                id,
+                &comment.author,
+                &comment.initials,
+                &comment.date,
+                &comment.text,
+            );
+        } else {
+            self.session_comments
+                .insert(comment.id.clone(), comment.clone());
+        }
+        self.used_comment_ids.insert(comment.id.clone());
+        self.comments.push(comment);
         self.comment_active = true;
         self.comment_sel = self.comments.len() - 1;
         self.show_comments = true;
         self.after_edit();
         self.status = Some("Comment added".to_string());
+    }
+
+    /// Show a comment added this session only while a marker with its id is
+    /// in the body: undo of Add Comment hides it, redo shows it again.
+    /// Comments loaded from the file are never touched.
+    fn sync_session_comments(&mut self) {
+        if self.session_comments.is_empty() {
+            return;
+        }
+        let live = docxcore::inspect::comment_marker_ids(&self.body_editor().doc);
+        let session = &self.session_comments;
+        let before = self.comments.len();
+        self.comments
+            .retain(|c| !session.contains_key(&c.id) || live.contains(&c.id));
+        let mut changed = self.comments.len() != before;
+        for (id, c) in session {
+            if live.contains(id) && !self.comments.iter().any(|x| &x.id == id) {
+                self.comments.push(c.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            self.comment_sel = self.comment_sel.min(self.comments.len().saturating_sub(1));
+            self.comment_active &= !self.comments.is_empty();
+        }
+    }
+
+    /// Bring `pkg`'s comments.xml in line with the session's comments before
+    /// a save: write each live one it lacks, drop each undone one it holds.
+    /// `pkg` is reloaded from every save, so it may hold one already.
+    fn reconcile_session_comments(&mut self) {
+        if self.session_comments.is_empty() {
+            return;
+        }
+        let live = docxcore::inspect::comment_marker_ids(&self.body_editor().doc);
+        let saved: std::collections::HashSet<String> =
+            docxcore::comments::parse_comments(&self.pkg)
+                .into_iter()
+                .map(|c| c.id)
+                .collect();
+        for (id, c) in &self.session_comments {
+            let Ok(n) = id.parse::<i32>() else {
+                continue;
+            };
+            match (live.contains(id), saved.contains(id)) {
+                (true, false) => self
+                    .pkg
+                    .add_comment(n, &c.author, &c.initials, &c.date, &c.text),
+                (false, true) => self.pkg.remove_comment(n),
+                _ => {}
+            }
+        }
     }
 
     /// Delete the navigation-selected comment (markers + comments.xml + panel).
@@ -2890,7 +2998,13 @@ impl App {
         }
         let idx = self.comment_sel.min(self.comments.len() - 1);
         let c = self.comments.remove(idx);
-        self.editor.remove_comment_markers(&c.id);
+        // The body's markers, even while a header or footer is being
+        // edited (`editor` is then that part's); and that part's own, for
+        // a comment anchored there. Each is a step only where it removed.
+        self.body_editor_mut().remove_comment_markers(&c.id);
+        if self.hf_edit.is_some() {
+            self.editor.remove_comment_markers(&c.id);
+        }
         if let Ok(id) = c.id.parse::<i32>() {
             self.pkg.remove_comment(id);
         }
@@ -3518,6 +3632,7 @@ impl App {
         self.dirty = true;
         self.status = None;
         self.clear_visual_hint();
+        self.sync_session_comments();
         // An edit with the find bar open (a ribbon Accept, a paste) moves the
         // text under its matches: rebuild them so Replace never acts on a
         // stale range. The caret and selection stay where the edit left them.
@@ -3742,6 +3857,7 @@ impl App {
             self.finish_save(&path, md.as_bytes(), None);
             return;
         }
+        self.reconcile_session_comments();
         let docx = if self.modified {
             self.pkg.document = self.editor.doc.clone();
             save_package(&self.pkg)
@@ -4189,14 +4305,11 @@ impl App {
 
     // ---- Compare dialog ----
 
-    /// Who comments and compare revisions are attributed to: the document's
-    /// author property, else [`DEFAULT_AUTHOR`].
+    /// Who comments and compare revisions are attributed to: the person
+    /// reviewing, as Word's user name is, not the document's author property
+    /// (#620). That is the OS account name, else [`DEFAULT_AUTHOR`].
     fn review_author(&self) -> String {
-        if self.field_ctx.props.author.trim().is_empty() {
-            DEFAULT_AUTHOR.to_string()
-        } else {
-            self.field_ctx.props.author.clone()
-        }
+        os_user_name().unwrap_or_else(|| DEFAULT_AUTHOR.to_string())
     }
 
     /// Review ▸ Compare: replace the open document with a new, unsaved
@@ -9447,6 +9560,8 @@ mod tests {
         }
         comments.on_key(key(KeyCode::Enter));
         assert_eq!(comments.comments.len(), 1);
+        // A new comment reaches comments.xml when a save reconciles (#620).
+        comments.reconcile_session_comments();
         assert!(comments.pkg.part("word/comments.xml").is_some());
         comments.modified = false;
         comments.dirty = false;
@@ -9799,6 +9914,8 @@ mod tests {
         }
         app.on_key(key(KeyCode::Enter));
         assert_eq!(app.comments.len(), 1);
+        // A new comment reaches comments.xml when a save reconciles (#620).
+        app.reconcile_session_comments();
         assert!(app.pkg.part("word/comments.xml").is_some());
         assert!(app.modified);
 
@@ -11418,6 +11535,208 @@ mod tests {
         assert!(app.comments.is_empty());
         assert!(!marked(&app, "commentRange"));
         assert!(!marked(&app, "commentReference"));
+    }
+
+    /// Select all of `app` and add a comment holding `text`, as the keys do.
+    fn add_comment_by_keys(app: &mut App, text: &str) {
+        app.editor.select_all();
+        app.run_act(ribbon::Act::NewComment);
+        for c in text.chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Enter));
+    }
+
+    /// Save `app` to a fresh `t.docx` under the temp dir; returns the path.
+    fn save_to_temp(app: &mut App, tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("docxy-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.docx");
+        app.path = path.to_string_lossy().into_owned();
+        app.save();
+        path
+    }
+
+    /// The saved document.xml and comments.xml (empty when there is none).
+    fn saved_parts(path: &std::path::Path) -> (String, String) {
+        let pkg = load_package(&std::fs::read(path).expect("saved")).unwrap();
+        let text = |name: &str| pkg.part_text(name).unwrap_or_default();
+        (text("word/document.xml"), text("word/comments.xml"))
+    }
+
+    fn is_utc_date_time(s: &str) -> bool {
+        let b = s.as_bytes();
+        b.len() == 20
+            && b.iter().enumerate().all(|(i, c)| match i {
+                4 | 7 => *c == b'-',
+                10 => *c == b'T',
+                13 | 16 => *c == b':',
+                19 => *c == b'Z',
+                _ => c.is_ascii_digit(),
+            })
+    }
+
+    /// #620: a new comment is the reviewer's, not the document creator's,
+    /// and carries the time it was made.
+    #[test]
+    fn new_comment_author_is_not_document_creator_and_date_is_set() {
+        let mut app = app_with(&["The quick brown fox."]);
+        app.field_ctx.props.author = "Document Creator".to_string();
+        add_comment_by_keys(&mut app, "Colour?");
+        let path = save_to_temp(&mut app, "cmt-author");
+        let (_, comments) = saved_parts(&path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let parsed = docxcore::comments::parse_comments_xml(&comments);
+        assert_eq!(parsed.len(), 1, "{comments}");
+        let c = &parsed[0];
+        let expected = os_user_name().unwrap_or_else(|| DEFAULT_AUTHOR.to_string());
+        assert_eq!(c.author, expected);
+        assert_ne!(c.author, "Document Creator");
+        assert_eq!(c.initials, docxcore::comments::initials(&expected));
+        assert!(is_utc_date_time(&c.date), "w:date {:?}", c.date);
+    }
+
+    /// #620: one undo takes the whole comment, markers and comments.xml
+    /// entry alike, and redo brings all of it back.
+    #[test]
+    fn undo_new_comment_then_save_has_no_comment() {
+        let mut app = app_with(&["The quick brown fox."]);
+        add_comment_by_keys(&mut app, "Colour?");
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert!(app.comments.is_empty(), "the panel drops it");
+        let path = save_to_temp(&mut app, "cmt-undo");
+        let (doc, comments) = saved_parts(&path);
+        assert!(!doc.contains("w:id=\"1\""), "{doc}");
+        assert!(!comments.contains("Colour?"), "{comments}");
+
+        app.on_key(ctrl(KeyCode::Char('y')));
+        assert_eq!(app.comments.len(), 1, "the panel shows it again");
+        app.save();
+        let (doc, comments) = saved_parts(&path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert_eq!(doc.matches("w:id=\"1\"").count(), 3, "{doc}");
+        assert!(comments.contains("Colour?"), "{comments}");
+    }
+
+    /// #620: every save reloads `pkg` from the bytes written, so a comment
+    /// saved once is in it; an undo after that save still drops it.
+    #[test]
+    fn add_save_undo_save_has_no_comment() {
+        let mut app = app_with(&["The quick brown fox."]);
+        add_comment_by_keys(&mut app, "Colour?");
+        let path = save_to_temp(&mut app, "cmt-save-undo");
+        assert!(saved_parts(&path).1.contains("Colour?"));
+        app.on_key(ctrl(KeyCode::Char('z')));
+        app.save();
+        let (doc, comments) = saved_parts(&path);
+        assert!(!doc.contains("w:id=\"1\""), "{doc}");
+        assert!(!comments.contains("Colour?"), "{comments}");
+        // And redo after that save writes it again.
+        app.on_key(ctrl(KeyCode::Char('y')));
+        app.save();
+        let (_, comments) = saved_parts(&path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert!(comments.contains("Colour?"), "{comments}");
+    }
+
+    /// FIX r2 #1: deleting a loaded comment and undoing the delete puts its
+    /// markers back without a record; a new comment must not take that id,
+    /// or it would stay live after its own undo.
+    #[test]
+    fn a_new_comment_never_takes_an_id_whose_markers_are_in_the_body() {
+        let mut app = app_with_loaded_comments();
+        let ids =
+            |app: &App| -> Vec<String> { app.comments.iter().map(|c| c.id.clone()).collect() };
+        assert_eq!(ids(&app), ["1", "2"]);
+        app.comment_sel = 1;
+        app.run_act(ribbon::Act::DeleteComment);
+        assert_eq!(ids(&app), ["1"]);
+        app.on_key(ctrl(KeyCode::Char('z')));
+        add_comment_by_keys(&mut app, "Colour?");
+        assert_eq!(ids(&app), ["1", "3"], "a fresh id, not 2");
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(ids(&app), ["1"], "its undo takes it");
+    }
+
+    /// An app on "The quick brown fox." with loaded comments 1 and 2 around
+    /// the whole text, markers and comments.xml alike.
+    fn app_with_loaded_comments() -> App {
+        let mut ed = Editor::new(Document {
+            body: vec![Block::Paragraph(MPara {
+                props: ParProps::default(),
+                content: vec![Inline::Run(Run {
+                    text: "The quick brown fox.".into(),
+                    props: RunProps::default(),
+                })],
+            })],
+        });
+        for id in ["1", "2"] {
+            ed.select_all();
+            assert!(ed.add_comment(id));
+        }
+        let mut pkg = new_package(ed.doc);
+        pkg.add_comment(1, "Ann", "A", "2020-01-02T03:04:05Z", "First");
+        pkg.add_comment(2, "Ann", "A", "2020-01-02T03:04:05Z", "Second");
+        let mut app = App::new(pkg, "test.docx", false);
+        app.os_clip = None;
+        app
+    }
+
+    /// FIX r3 #1: an id freed before the add (comment 2, deleted) must not
+    /// be taken: undoing the add and then the delete brings 2's markers
+    /// back, and the new comment would be live on them.
+    #[test]
+    fn a_new_comment_never_takes_a_deleted_comments_id() {
+        let mut app = app_with_loaded_comments();
+        app.comment_sel = 1;
+        app.run_act(ribbon::Act::DeleteComment);
+        add_comment_by_keys(&mut app, "Colour?");
+        assert_eq!(app.comments.last().map(|c| c.id.as_str()), Some("3"));
+        app.on_key(ctrl(KeyCode::Char('z')));
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert!(
+            app.comments.iter().all(|c| c.text != "Colour?"),
+            "the panel does not list it"
+        );
+        let path = save_to_temp(&mut app, "cmt-freed-id");
+        let (_, comments) = saved_parts(&path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert!(!comments.contains("Colour?"), "{comments}");
+    }
+
+    /// FIX r3 #2: a new comment deleted before any undo or save is in no
+    /// list and no marker any more; the next comment still gets a fresh id.
+    #[test]
+    fn a_comment_added_after_deleting_a_new_one_gets_a_fresh_id() {
+        let mut app = app_with(&["The quick brown fox."]);
+        add_comment_by_keys(&mut app, "one");
+        let first = app.comments[0].id.clone();
+        app.run_act(ribbon::Act::DeleteComment);
+        assert!(app.comments.is_empty());
+        add_comment_by_keys(&mut app, "two");
+        assert_ne!(app.comments[0].id, first);
+    }
+
+    /// FIX r4 #1: Delete Comment while a header is being edited deletes the
+    /// body comment: its markers leave the body, not the header editor, so
+    /// it stays out of the panel and the save.
+    #[test]
+    fn delete_comment_while_editing_a_header_removes_the_body_markers() {
+        let mut app = app_with(&["The quick brown fox."]);
+        add_comment_by_keys(&mut app, "Colour?");
+        app.run_act(ribbon::Act::EditHeader);
+        assert!(app.hf_edit.is_some());
+        app.run_act(ribbon::Act::DeleteComment);
+        assert!(app.comments.is_empty(), "the panel drops it");
+        app.run_act(ribbon::Act::EditDocument);
+        assert!(app.hf_edit.is_none());
+        assert!(app.comments.is_empty(), "and keeps it out");
+        let path = save_to_temp(&mut app, "cmt-hf-delete");
+        let (doc, comments) = saved_parts(&path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert!(!doc.contains("w:id=\"1\""), "{doc}");
+        assert!(!comments.contains("Colour?"), "{comments}");
     }
 
     #[test]
