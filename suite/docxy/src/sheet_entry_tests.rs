@@ -1520,3 +1520,46 @@ fn settings_direction_cycles_every_way() {
     assert_eq!(seen, EnterMove::ALL);
     assert_eq!(next_enter_move(EnterMove::Left), EnterMove::Down);
 }
+
+#[test]
+fn an_inserting_chord_drops_the_proposal_suffix_first() {
+    let mut v = view();
+    text(&mut v, 0, 0, "Apple");
+    select(&mut v, 1, 0);
+    // Alt+Enter: the line feed lands after the typed text.
+    type_chars(&mut v, "ap");
+    v.proposal_before_key("enter", false, true, false, false);
+    v.edit_type("\n");
+    assert_eq!(v.editing.as_deref(), Some("ap\n"));
+    assert_eq!(v.edit_proposal, None);
+    v.end_cell_edit();
+    // Ctrl+; : today's date lands after the typed text.
+    type_chars(&mut v, "ap");
+    v.proposal_before_key(";", true, false, false, false);
+    v.entry_chord(";", false, 45_565.0, false);
+    let buf = v.editing.clone().unwrap();
+    assert!(buf.starts_with("ap") && !buf.contains("ple"), "{buf}");
+    v.end_cell_edit();
+    // A caret move keeps the text and drops only the marker.
+    type_chars(&mut v, "ap");
+    v.proposal_before_key("home", false, false, false, false);
+    assert_eq!(
+        (v.editing.as_deref(), v.edit_proposal.clone()),
+        (Some("apple"), None)
+    );
+    v.end_cell_edit();
+    // Ctrl+Enter commits: the proposal stays for the commit to take.
+    type_chars(&mut v, "ap");
+    v.proposal_before_key("enter", true, false, false, false);
+    assert!(v.edit_proposal.is_some());
+}
+
+#[test]
+fn ctrl_shift_u_is_the_formula_bar_key_even_in_protected_view() {
+    // `sheet_key` asks this before Protected View's gate, which would
+    // refuse a Ctrl chord other than c/a/f.
+    assert!(fx_toggle_key(true, true, "u"));
+    assert!(fx_toggle_key(true, true, "U"));
+    assert!(!fx_toggle_key(true, false, "u"), "Ctrl+U alone is not it");
+    assert!(!open_mode::protected_allows_key("u", true, false));
+}

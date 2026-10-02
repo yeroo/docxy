@@ -579,8 +579,10 @@ struct SheetView {
     /// next render. Only the render pass knows how wide the grid is, so
     /// `reveal_range` can't work out a rightwards scroll itself.
     reveal_col: Option<u32>,
-    /// The app's File › Options › Editing (#672), stamped by
-    /// [`sheet_with_opts`] each time the app reaches this view.
+    /// A copy of the app's File › Options › Editing (#672). `Docxy::edit_opts`
+    /// is the source of truth: [`stamp_edit_opts`] copies it here on restore,
+    /// on a change and every frame, and [`sheet_with_opts`] each time the app
+    /// reaches this view.
     edit_opts: EditOptions,
     /// AutoComplete's proposal (#672): the char index its selected suffix
     /// starts at (the caret stays there) and the value it completes to. Any
@@ -1025,6 +1027,22 @@ fn gesture_in_flight(
     formula_pick: bool,
 ) -> bool {
     drag_anchor || sheet_dragging || range_pick || formula_pick
+}
+
+/// Stamp the app's Editing options on every sheet tab (#672): on restore, on
+/// a change, and at the start of every frame, so a tab created by any path
+/// (new, open, reload, recover, a draft) holds them before its first key.
+fn stamp_edit_opts(tabs: &mut [DocTab], opts: EditOptions) {
+    for t in tabs {
+        if let Surface::Sheet(v) = &mut t.surface {
+            v.edit_opts = opts;
+        }
+    }
+}
+
+/// Is this Ctrl+Shift+U, which expands the sheet formula bar (#672)?
+fn fx_toggle_key(ctrl: bool, shift: bool, key: &str) -> bool {
+    ctrl && shift && key.eq_ignore_ascii_case("u")
 }
 
 /// The sheet a tab holds, with the app's Editing options stamped on it: every
@@ -1484,6 +1502,35 @@ impl SheetView {
         }
         self.edit_caret = from;
         true
+    }
+
+    /// What a key does to a live AutoComplete proposal before it acts. A key
+    /// that inserts text other than a typed character — Alt+Enter's line
+    /// feed, the Ctrl+; / Ctrl+' entry chords — drops the suffix first, as
+    /// typing does, so it lands after the typed text. A caret move (and any
+    /// other editor chord but Ctrl+Enter, which commits) keeps the text and
+    /// drops only the marker. The keys that commit take the proposal in
+    /// `commit_edit`; Backspace, Delete and typing handle it themselves.
+    fn proposal_before_key(
+        &mut self,
+        key: &str,
+        ctrl: bool,
+        alt: bool,
+        modifier: bool,
+        caret_keys: bool,
+    ) {
+        if self.edit_proposal.is_none() {
+            return;
+        }
+        let inserts = (alt && key == "enter") || (ctrl && matches!(key, "'" | "\"" | ";" | ":"));
+        let caret_move = matches!(key, "home" | "end" | "f2" | "f4" | "f9" | "insert")
+            || (caret_keys && matches!(key, "left" | "right"))
+            || (ctrl && !modifier && key != "enter");
+        if inserts {
+            self.drop_proposal();
+        } else if caret_move {
+            self.edit_proposal = None;
+        }
     }
 
     /// A commit takes a live AutoComplete proposal: the buffer becomes the
@@ -8003,6 +8050,7 @@ impl Docxy {
         this.autorecover_minutes = session.autorecover_minutes;
         this.keep_drafts = session.keep_drafts;
         this.edit_opts = EditOptions::from_text(&session.sheet_editing);
+        stamp_edit_opts(&mut this.tabs, this.edit_opts);
         this.persist_to(&root);
         this
     }
@@ -8439,11 +8487,7 @@ impl Docxy {
     /// every open sheet tab at once.
     fn set_edit_opts(&mut self, opts: EditOptions, cx: &mut Context<Self>) {
         self.edit_opts = opts;
-        for t in &mut self.tabs {
-            if let Surface::Sheet(v) = &mut t.surface {
-                v.edit_opts = opts;
-            }
-        }
+        stamp_edit_opts(&mut self.tabs, opts);
         self.persist();
         cx.notify();
     }
@@ -13677,6 +13721,14 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Ctrl+Shift+U expands the formula bar (#672), editing or not. View
+        // state only, so it comes before Protected View's gate: there is
+        // nothing for that to refuse.
+        if fx_toggle_key(ctrl, shift, key) {
+            self.fx_expanded = !self.fx_expanded;
+            cx.notify();
+            return;
+        }
         // Protected View (#610): only keys that look, move or copy reach the
         // workbook. The find bar still takes typing; its Replace is refused
         // where it would write.
@@ -13685,13 +13737,6 @@ impl Docxy {
             && !open_mode::protected_allows_key(key, ctrl, alt)
         {
             self.protected_refused(cx);
-            return;
-        }
-        // Ctrl+Shift+U expands the formula bar (#672), editing or not: view
-        // state only, so it is not a key Protected View has to refuse.
-        if ctrl && shift && key.eq_ignore_ascii_case("u") {
-            self.fx_expanded = !self.fx_expanded;
-            cx.notify();
             return;
         }
         // An inline sheet-tab rename swallows all typing until Enter/Esc.
@@ -13766,17 +13811,11 @@ impl Docxy {
                 v.edit_point = None;
             }
         }
-        // A caret move (or any editor chord but Ctrl+Enter, which commits)
-        // keeps an AutoComplete proposal's text and drops its marker (#672).
-        // The keys that commit take the proposal in `commit_edit`; Backspace,
-        // Delete and typing handle it below.
-        let caret_move = matches!(key, "home" | "end" | "f2" | "f4" | "f9" | "insert")
-            || (caret_keys && matches!(key, "left" | "right"))
-            || (ctrl && !modifier && key != "enter")
-            || (alt && key == "enter");
-        if editing && caret_move {
+        // What the key does to a live AutoComplete proposal (#672) before it
+        // acts: see `SheetView::proposal_before_key`.
+        if editing {
             if let Some(v) = self.active_sheet_mut() {
-                v.edit_proposal = None;
+                v.proposal_before_key(key, ctrl, alt, modifier, caret_keys);
             }
         }
         // Same as the bar fields above: a focused Chart-panel field owns Ctrl+A.
@@ -24785,6 +24824,9 @@ impl Docxy {
 
 impl Render for Docxy {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A tab created since the last frame holds the app's Editing options
+        // before anything can reach it (#672).
+        stamp_edit_opts(&mut self.tabs, self.edit_opts);
         // A new frame: what the probes recorded during the last one is now the
         // complete answer, and they start collecting this one afresh. Stale
         // entries cannot survive — a chart that was deleted simply does not

@@ -1639,6 +1639,25 @@ fn a_sheet_reached_through_the_app_has_its_editing_options() {
     assert!(sheet_with_opts(Some(&mut doc), opts).is_none());
 }
 
+/// #672 r1: every sheet tab, however it was created, holds the app's
+/// Editing options once they are stamped (restore, a change, each frame).
+#[test]
+fn every_sheet_tab_is_stamped_with_the_app_options() {
+    use gridcore::options::EditOptions;
+    let opts = EditOptions {
+        fixed_decimal: true,
+        ..EditOptions::default()
+    };
+    let mut tabs = vec![tab(Kind::Xlsx), tab(Kind::Docx), tab(Kind::Xlsx)];
+    stamp_edit_opts(&mut tabs, opts);
+    for t in &tabs {
+        if let Surface::Sheet(v) = &t.surface {
+            assert_eq!(v.edit_opts, opts);
+        }
+    }
+    assert!(matches!(tabs[2].surface, Surface::Sheet(_)));
+}
+
 #[test]
 fn a_persist_records_the_sidecar_only_while_the_tab_is_unsaved() {
     let root = Root::new("last-hot");
