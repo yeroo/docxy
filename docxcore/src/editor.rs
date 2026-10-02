@@ -2740,6 +2740,7 @@ fn content_insert_with(content: &mut Vec<Inline>, o: usize, ch: char, into_empty
                 props,
             }),
         );
+        clear_showing_placeholder(content, at - 1);
         return;
     }
     let Some((i, local)) = locate(content, o) else {
@@ -2991,7 +2992,10 @@ fn insert_inlines(
     placeholders: bool,
 ) -> usize {
     let tail = match empty_sdt_at(content, o) {
-        Some(at) => content.split_off(at),
+        Some(at) => {
+            clear_showing_placeholder(content, at - 1);
+            content.split_off(at)
+        }
         None => {
             let mut tail = split_content(content, o);
             if before_opens {
@@ -3050,7 +3054,9 @@ fn trailing_placeholder_close(content: &[Inline]) -> Option<usize> {
 /// one again: where `kept` ends with a control's close and `gone` starts with
 /// the reopened copy of that control (markers aside), the close and the copy
 /// go, nested ones in order, so Enter then Backspace inside a control leaves
-/// it as it was.
+/// it as it was. Only a split's copy heals: it is exactly [`reopened`] of
+/// the control before it, with no `w:id`, which Word always writes; two
+/// separate controls, alike but for their ids, stay two.
 fn join_paragraph_content(kept: &mut Vec<Inline>, mut gone: Vec<Inline>) {
     loop {
         let k = kept.iter().rposition(|x| !is_marker(x));
@@ -3067,13 +3073,24 @@ fn join_paragraph_content(kept: &mut Vec<Inline>, mut gone: Vec<Inline>) {
         let Some(o) = open_of(kept, k) else {
             break;
         };
-        if reopened(&kept[o]) != reopened(&gone[g]) {
+        if reopened(&kept[o]) != gone[g] {
             break;
         }
         kept.remove(k);
         gone.remove(g);
     }
     kept.extend(gone);
+}
+
+/// The control opened at `open` holds text now: it no longer shows its
+/// placeholder, so its `w:showingPlcHdr` goes, as Word clears it on typing
+/// (else Word would take the text for the placeholder).
+fn clear_showing_placeholder(content: &mut [Inline], open: usize) {
+    if let Some(Inline::Raw(raw)) = content.get_mut(open) {
+        if raw.contains("<w:showingPlcHdr") {
+            *raw = crate::sect::remove_element(raw, "w:showingPlcHdr");
+        }
+    }
 }
 
 /// The opening boundary of a content control again, for the half of a split

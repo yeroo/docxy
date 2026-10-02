@@ -982,3 +982,110 @@ fn a_paste_at_the_end_of_a_typed_placeholder_is_its_text() {
     let xml = blocks_to_xml(&e.doc.body);
     assert!(xml.contains("</w:sdtContent></w:sdt><w:r>"), "{xml}");
 }
+
+/// Two paragraphs each holding one control, built from the two sdtPr bodies
+/// (each with its own w:id).
+fn two_controls(first: &str, second: &str) -> Editor {
+    ed(&format!(
+        "<w:p><w:sdt><w:sdtPr>{first}</w:sdtPr><w:sdtContent><w:r><w:t>John</w:t></w:r>\
+         </w:sdtContent></w:sdt></w:p><w:p><w:sdt><w:sdtPr>{second}</w:sdtPr><w:sdtContent>\
+         <w:r><w:t>Smith</w:t></w:r></w:sdtContent></w:sdt></w:p>"
+    ))
+}
+
+#[test]
+fn joining_two_separate_controls_keeps_them_two() {
+    let pairs = [
+        // Word's default plain-text controls: alike but for their ids.
+        ("<w:id w:val=\"1\"/>", "<w:id w:val=\"2\"/>"),
+        // Bound to different properties.
+        (
+            "<w:id w:val=\"1\"/><w:dataBinding w:xpath=\"/a\" w:storeItemID=\"{X}\"/>",
+            "<w:id w:val=\"2\"/><w:dataBinding w:xpath=\"/b\" w:storeItemID=\"{X}\"/>",
+        ),
+        // Two checkboxes.
+        (
+            "<w:id w:val=\"1\"/><w14:checkbox/>",
+            "<w:id w:val=\"2\"/><w14:checkbox/>",
+        ),
+    ];
+    for (first, second) in pairs {
+        for how in ["backspace", "delete", "selection"] {
+            let mut e = two_controls(first, second);
+            match how {
+                "backspace" => {
+                    e.caret = Caret {
+                        path: vec![1],
+                        offset: 0,
+                    };
+                    e.backspace();
+                }
+                "delete" => {
+                    e.caret = Caret {
+                        path: vec![0],
+                        offset: 4,
+                    };
+                    e.delete_forward();
+                }
+                _ => {
+                    e.anchor = Some(Caret {
+                        path: vec![0],
+                        offset: 4,
+                    });
+                    e.caret = Caret {
+                        path: vec![1],
+                        offset: 0,
+                    };
+                    e.delete_selection();
+                }
+            }
+            assert_eq!(e.doc.body.len(), 1, "{how}");
+            let xml = blocks_to_xml(&e.doc.body);
+            assert_eq!(xml.matches("<w:sdtContent>").count(), 2, "{how}: {xml}");
+            assert_eq!(crate::cover::sdt_ids(&xml), vec![1, 2], "{how}: {xml}");
+            assert!(xml.contains(first) && xml.contains(second), "{how}: {xml}");
+        }
+    }
+}
+
+#[test]
+fn typing_over_a_word_prompt_clears_showing_placeholder() {
+    let mut e = ed(&format!(
+        "{}<w:p><w:r><w:t>Body text</w:t></w:r></w:p>{SECT}",
+        crate::cover::tests::WORD_COVER
+    ));
+    let title = field_para(&e, Placeholder::Title);
+    let flagged = |e: &Editor| blocks_to_xml(&e.doc.body[title..=title]).contains("showingPlcHdr");
+    assert!(flagged(&e));
+    type_over(&mut e, title, "Mine");
+    assert_eq!(text_at(&e, &[title]), "Mine");
+    assert!(
+        !flagged(&e),
+        "{}",
+        blocks_to_xml(&e.doc.body[title..=title])
+    );
+    let xml = blocks_to_xml(&e.doc.body[title..=title]);
+    let inside = &xml[xml.find("<w:sdtContent>").unwrap()..xml.find("</w:sdtContent>").unwrap()];
+    assert!(inside.contains("Mine"), "{xml}");
+    // Undo brings the prompt back, flag and all.
+    while e.undo() {}
+    assert!(flagged(&e));
+    assert_eq!(text_at(&e, &[title]), "Annual Report");
+
+    // A paste over it clears the flag too.
+    let mut e = ed(&format!(
+        "{}<w:p><w:r><w:t>Body text</w:t></w:r></w:p>{SECT}",
+        crate::cover::tests::WORD_COVER
+    ));
+    let len = text_at(&e, &[title]).chars().count();
+    e.anchor = Some(Caret {
+        path: vec![title],
+        offset: 0,
+    });
+    e.caret = Caret {
+        path: vec![title],
+        offset: len,
+    };
+    e.paste(&Clip::from_text("Pasted"));
+    assert!(!flagged(&e));
+}
