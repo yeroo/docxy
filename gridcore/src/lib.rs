@@ -45,6 +45,7 @@ pub mod formula;
 pub mod frame;
 pub mod legacy;
 pub mod model;
+pub mod names;
 pub mod numfmt;
 pub mod options;
 pub mod pivot;

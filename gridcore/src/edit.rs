@@ -1489,6 +1489,14 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
             }
         }
     }
+    // A converted table keeps the geometry it was converted with; the edits
+    // its cells went through since are replayed at save on the references
+    // to it (see `RemovedTable::edits`).
+    for rt in &mut wb.removed_tables {
+        if rt.table.sheet == idx {
+            rt.edits.push(shift);
+        }
+    }
 }
 
 /// Every conditional-formatting and data-validation formula on `sheet`.
@@ -1739,6 +1747,315 @@ fn shift_grid(sheet: &mut Sheet, shift: &EditShift) {
         // A 1×1 "merge" left over after clamping is meaningless.
         .filter(|&(r1, c1, r2, c2)| !(r1 == r2 && c1 == c2))
         .collect();
+}
+
+// ---------------------------------------------------------------------------
+// Tables: rename, resize, convert to range
+// ---------------------------------------------------------------------------
+
+/// The name a new table column takes, as Excel's Format as Table and Resize
+/// Table give it: its header cell's text (a number's digits), else
+/// `Column<n>`; then made unique against `taken`, case-insensitively as table
+/// column names compare, by appending 2, 3, ….
+pub fn table_column_name(header: Option<&CellValue>, n: u32, taken: &[String]) -> String {
+    let base = match header {
+        Some(CellValue::Text(t)) if !t.trim().is_empty() => t.clone(),
+        Some(CellValue::Number(v)) => v.to_string(),
+        _ => format!("Column{n}"),
+    };
+    let (mut name, mut k) = (base.clone(), 1);
+    while taken.iter().any(|x| x.eq_ignore_ascii_case(&name)) {
+        k += 1;
+        name = format!("{base}{k}");
+    }
+    name
+}
+
+fn rects_overlap(a: (u32, u32, u32, u32), b: (u32, u32, u32, u32)) -> bool {
+    a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3
+}
+
+/// Why a table can't cover `rect` on `sheet`, or `None` when it can: Excel
+/// refuses a table over another table, over a PivotTable, or over part of a
+/// multi-cell array formula. `ignore` is the table being resized, which may
+/// of course overlap itself.
+pub fn table_range_conflict(
+    wb: &Workbook,
+    sheet: usize,
+    rect: (u32, u32, u32, u32),
+    ignore: Option<usize>,
+) -> Option<String> {
+    let other = wb
+        .tables
+        .iter()
+        .enumerate()
+        .find(|&(i, t)| Some(i) != ignore && t.sheet == sheet && rects_overlap(t.range, rect));
+    if let Some((_, t)) = other {
+        return Some(format!("The range overlaps table {}", t.name));
+    }
+    if let Some(p) = wb
+        .pivots
+        .iter()
+        .find(|p| p.sheet == sheet && rects_overlap(p.location, rect))
+    {
+        return Some(format!("The range overlaps PivotTable {}", p.name));
+    }
+    let sh = wb.sheets.get(sheet)?;
+    for (&(r, c), cell) in &sh.cells {
+        let Some((h, w)) = cell.spill.filter(|_| cell.is_array_formula()) else {
+            continue;
+        };
+        if h * w > 1 && rects_overlap((r, c, r + h - 1, c + w - 1), rect) {
+            return Some(format!(
+                "The range contains part of the array formula at {}",
+                cell_name(r, c)
+            ));
+        }
+    }
+    None
+}
+
+/// Where a formula sits, for the table rewrites: its sheet (a defined name
+/// has none) and its cell (a conditional-format or validation rule has none).
+type FormulaSite = (Option<usize>, Option<(u32, u32)>);
+
+/// Rewrite every formula a table rename or conversion can reach: cell
+/// formulas (array formulas included), defined names, and conditional-format
+/// and data-validation rules. A formula `f` leaves unchanged keeps its text
+/// exactly; one held verbatim (a shared or data-table formula) is left alone.
+fn rewrite_workbook_formulas(wb: &mut Workbook, f: impl Fn(&Expr, FormulaSite) -> Expr) {
+    for (s, sheet) in wb.sheets.iter_mut().enumerate() {
+        for (&(r, c), cell) in sheet.cells.iter_mut() {
+            let Some(src) = &cell.formula else {
+                continue;
+            };
+            if cell.f_attrs.as_deref().is_some_and(|a| !is_array_f(a)) {
+                continue;
+            }
+            if let Some(updated) = rewrite_if_changed(src, |e| f(e, (Some(s), Some((r, c))))) {
+                cell.formula = Some(updated);
+            }
+        }
+        for_each_rule_formula(sheet, |src| {
+            if let Some(updated) = rewrite_if_changed(src, |e| f(e, (Some(s), None))) {
+                *src = updated;
+            }
+        });
+    }
+    for dn in &mut wb.defined_names {
+        if let Some(updated) =
+            crate::formula::rewrite_defined_name(&dn.formula, |e| f(e, (None, None)), None)
+        {
+            dn.formula = updated;
+        }
+    }
+}
+
+fn table_index(wb: &Workbook, name: &str) -> Result<usize, String> {
+    wb.tables
+        .iter()
+        .position(|t| t.name.eq_ignore_ascii_case(name))
+        .ok_or_else(|| format!("There is no table named {name}"))
+}
+
+/// Excel's Table Name: give table `old` the name `new` and rewrite every
+/// formula that names it — structured references, bare table names, defined
+/// names, rules — and the PivotTables built on it. The name must follow
+/// Excel's rules ([`crate::names::check_name`]) and be unique among tables
+/// and defined names, case-insensitively; another case of the table's own
+/// name is allowed. The table part takes the name when the file is saved.
+pub fn rename_table(wb: &mut Workbook, old: &str, new: &str) -> Result<(), String> {
+    let idx = table_index(wb, old)?;
+    crate::names::check_name(new)?;
+    let clash = wb
+        .tables
+        .iter()
+        .enumerate()
+        .any(|(i, t)| i != idx && t.name.eq_ignore_ascii_case(new));
+    if clash {
+        return Err(format!("A table named {new} already exists"));
+    }
+    if wb
+        .defined_names
+        .iter()
+        .any(|d| d.name.eq_ignore_ascii_case(new))
+    {
+        return Err(format!("{new} is already a defined name"));
+    }
+    let cur = wb.tables[idx].name.clone();
+    if cur == new {
+        return Ok(());
+    }
+    let map = [(cur.clone(), new.to_string())];
+    rewrite_workbook_formulas(wb, |e, _| crate::formula::rename_tables_in_expr(e, &map));
+    for piv in &mut wb.pivots {
+        if let crate::pivot::PivotSource::Table(n) = &mut piv.source {
+            if n.eq_ignore_ascii_case(&cur) {
+                *n = new.to_string();
+            }
+        }
+    }
+    wb.tables[idx].name = new.to_string();
+    Ok(())
+}
+
+/// Excel's Resize Table: move table `name` onto `rect` (r1, c1, r2, c2,
+/// 0-based). The header row stays where it is, the new range overlaps the
+/// old one, keeps at least one data row ("A table needs at least one data
+/// row"), and covers no other table, PivotTable or array formula
+/// ([`table_range_conflict`]). A table with a totals row keeps its bottom row
+/// ("Turn off the Total Row first"). Columns still covered keep their names;
+/// a new column is named after its header cell, or `Column<n>`, made unique
+/// ignoring case (`Qty` beside a `Qty` becomes `Qty2`, [`table_column_name`]),
+/// and that name is written into the header cell. A dropped column's references go `#REF!` at
+/// evaluation; their text is left alone. Formulas aren't rewritten: the
+/// columns they name are still found by name.
+pub fn resize_table(
+    wb: &mut Workbook,
+    name: &str,
+    rect: (u32, u32, u32, u32),
+) -> Result<(), String> {
+    let idx = table_index(wb, name)?;
+    let t = &wb.tables[idx];
+    let (r1, c1, r2, c2) = rect;
+    if r1 > r2 || c1 > c2 || r2 >= MAX_ROWS || c2 >= MAX_COLS {
+        return Err("That isn't a valid range".into());
+    }
+    if t.header_rows > 0 && r1 != t.range.0 {
+        return Err(format!("The header row must stay in row {}", t.range.0 + 1));
+    }
+    if !rects_overlap(t.range, rect) {
+        return Err("The new range must overlap the table".into());
+    }
+    if r2 - r1 < t.header_rows + t.totals_rows {
+        return Err("A table needs at least one data row".into());
+    }
+    // The totals row is the table's last row: a new bottom would leave its
+    // cells behind as data (a SUBTOTAL over itself) and make a data row the
+    // totals row. Moving it belongs with the Total Row command.
+    if t.totals_rows > 0 && r2 != t.range.2 {
+        return Err("Turn off the Total Row first".into());
+    }
+    if let Some(why) = table_range_conflict(wb, t.sheet, rect, Some(idx)) {
+        return Err(why);
+    }
+    let (sheet, header_rows) = (t.sheet, t.header_rows);
+    let (_, oc1, _, oc2) = t.range;
+    let old_columns = t.columns.clone();
+    let kept = |c: u32| {
+        (oc1..=oc2)
+            .contains(&c)
+            .then(|| old_columns.get((c - oc1) as usize).cloned())
+            .flatten()
+    };
+    let mut taken: Vec<String> = (c1..=c2).filter_map(kept).collect();
+    let mut columns = Vec::new();
+    for c in c1..=c2 {
+        if let Some(n) = kept(c) {
+            columns.push(n);
+            continue;
+        }
+        let header = (header_rows > 0)
+            .then(|| wb.sheets[sheet].cell(r1, c).map(|cl| cl.value.clone()))
+            .flatten();
+        let nm = table_column_name(header.as_ref(), c - c1 + 1, &taken);
+        taken.push(nm.clone());
+        if header_rows > 0 && !matches!(&header, Some(CellValue::Text(t)) if *t == nm) {
+            let sh = &mut wb.sheets[sheet];
+            let mut cell = sh.cell(r1, c).cloned().unwrap_or_default();
+            cell.value = CellValue::Text(nm.clone());
+            cell.formula = None;
+            sh.set_cell(r1, c, cell);
+        }
+        columns.push(nm);
+    }
+    let t = &mut wb.tables[idx];
+    t.range = rect;
+    t.columns = columns;
+    Ok(())
+}
+
+/// Excel's Convert to Range: table `name` stops being a table. Every
+/// structured reference to it — qualified anywhere, unqualified inside it —
+/// becomes the cells it covers ([`crate::formula::table_refs_to_cells_in_expr`]),
+/// and its cell values and formats stay as they are. The table part leaves
+/// the file at the next save (it is kept in [`Workbook::removed_tables`]
+/// until then, so an undo can bring the table back).
+///
+/// Refused while a PivotTable is built on the table, or while a SUMX-family
+/// formula iterates it: neither has a range form that means the same.
+pub fn convert_table_to_range(wb: &mut Workbook, name: &str) -> Result<(), String> {
+    let idx = table_index(wb, name)?;
+    let t = wb.tables[idx].clone();
+    let pivot = wb.pivots.iter().find(|p| {
+        matches!(&p.source, crate::pivot::PivotSource::Table(n) if n.eq_ignore_ascii_case(&t.name))
+    });
+    if let Some(p) = pivot {
+        return Err(format!("PivotTable {} uses this table", p.name));
+    }
+    // Every place the rewrite below reaches (cells, rules, names).
+    let iterates = |src: &str| {
+        parse(src).is_ok_and(|ast| {
+            let mut iterated = Vec::new();
+            crate::formula::collect_iterated_tables(&ast, &mut iterated);
+            iterated.iter().any(|n| n.eq_ignore_ascii_case(&t.name))
+        })
+    };
+    for sh in &wb.sheets {
+        for (&(r, c), cell) in &sh.cells {
+            if cell.formula.as_deref().is_some_and(iterates) {
+                return Err(format!(
+                    "The formula in {}!{} iterates this table",
+                    sh.name,
+                    cell_name(r, c)
+                ));
+            }
+        }
+        let cf = sh.cond_formats.iter().flat_map(|cf| &cf.rules);
+        if cf.flat_map(|rule| rule.formulas()).any(|f| iterates(f)) {
+            return Err(format!(
+                "A conditional format on {} iterates this table",
+                sh.name
+            ));
+        }
+        let dv = sh.validations.iter();
+        if dv
+            .flat_map(|v| [&v.formula1, &v.formula2])
+            .any(|f| iterates(f))
+        {
+            return Err(format!(
+                "A data validation rule on {} iterates this table",
+                sh.name
+            ));
+        }
+    }
+    if let Some(dn) = wb.defined_names.iter().find(|d| iterates(&d.formula)) {
+        return Err(format!("The name {} iterates this table", dn.name));
+    }
+    let info = t.info();
+    let sheet_name = wb.sheets[t.sheet].name.clone();
+    let target = crate::formula::TableToRange {
+        name: &t.name,
+        sheet_name: &sheet_name,
+        info: &info,
+    };
+    rewrite_workbook_formulas(wb, |e, (s, cell)| {
+        let host = crate::formula::FormulaHost {
+            same_sheet: s == Some(t.sheet),
+            row: cell.map(|(r, _)| r),
+            inside: match (s, cell) {
+                (Some(s), Some((r, c))) => t.contains(s, r, c),
+                _ => false,
+            },
+        };
+        crate::formula::table_refs_to_cells_in_expr(e, &target, host)
+    });
+    wb.tables.remove(idx);
+    wb.removed_tables.push(crate::sheet::RemovedTable {
+        table: t,
+        edits: Vec::new(),
+    });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3576,5 +3893,339 @@ mod tests {
         let mut w = block();
         insert_cols(&mut w, 0, 4, 1); // between D and E: w grows, h stays
         assert_eq!(w.sheets[0].cell(0, 3).unwrap().spill, Some((3, 3)));
+    }
+}
+
+#[cfg(test)]
+mod table_tests {
+    use super::*;
+    use crate::engine::Engine;
+    use crate::sheet::{Cell, DefinedName, Table, parse_cell_name};
+
+    /// Sheet1 holds `Sales` over A1:C4 (Item, Qty, Dbl; Dbl = [@Qty]*2); a
+    /// second sheet, `My Data`, holds nothing yet.
+    fn sales() -> Workbook {
+        let mut s1 = Sheet {
+            name: "Sheet1".into(),
+            ..Sheet::default()
+        };
+        s1.set_cell(0, 0, Cell::text("Item"));
+        s1.set_cell(0, 1, Cell::text("Qty"));
+        s1.set_cell(0, 2, Cell::text("Dbl"));
+        for (r, (item, qty)) in [("Pen", 3.0), ("Ink", 4.0), ("Pad", 5.0)]
+            .into_iter()
+            .enumerate()
+        {
+            let r = r as u32 + 1;
+            s1.set_cell(r, 0, Cell::text(item));
+            s1.set_cell(r, 1, Cell::number(qty));
+            s1.set_cell(r, 2, Cell::formula("[@Qty]*2"));
+        }
+        let s2 = Sheet {
+            name: "My Data".into(),
+            ..Sheet::default()
+        };
+        let mut wb = Workbook {
+            sheets: vec![s1, s2],
+            ..Workbook::default()
+        };
+        wb.tables.push(Table {
+            name: "Sales".into(),
+            sheet: 0,
+            range: (0, 0, 3, 2),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: vec!["Item".into(), "Qty".into(), "Dbl".into()],
+            part: "xl/tables/table1.xml".into(),
+        });
+        wb
+    }
+
+    fn pivot(
+        name: &str,
+        sheet: usize,
+        location: (u32, u32, u32, u32),
+        source: &str,
+    ) -> crate::pivot::Pivot {
+        crate::pivot::Pivot {
+            name: name.into(),
+            sheet,
+            location,
+            source: crate::pivot::PivotSource::Table(source.into()),
+            fields: Vec::new(),
+            row_fields: Vec::new(),
+            col_fields: Vec::new(),
+            data_fields: Vec::new(),
+            field_items: Vec::new(),
+            hidden: Vec::new(),
+            page: Vec::new(),
+            items_order: Vec::new(),
+            calc_formulas: Vec::new(),
+            grand_rows: true,
+            grand_cols: true,
+            subtotals: false,
+            data_on_rows: false,
+            unsupported: false,
+            edited: false,
+            part: String::new(),
+            cache_part: String::new(),
+        }
+    }
+
+    fn put(wb: &mut Workbook, sheet: usize, at: &str, src: &str) {
+        let (r, c) = parse_cell_name(at).unwrap();
+        wb.sheets[sheet].set_cell(r, c, Cell::formula(src));
+    }
+
+    fn formula(wb: &Workbook, sheet: usize, at: &str) -> String {
+        let (r, c) = parse_cell_name(at).unwrap();
+        wb.sheets[sheet]
+            .cell(r, c)
+            .unwrap()
+            .formula
+            .clone()
+            .unwrap()
+    }
+
+    fn value(wb: &mut Workbook, sheet: usize, at: &str) -> CellValue {
+        Engine::new(wb).recalc_all(wb);
+        let (r, c) = parse_cell_name(at).unwrap();
+        wb.sheets[sheet].cell(r, c).unwrap().value.clone()
+    }
+
+    fn other_table(name: &str, sheet: usize, range: (u32, u32, u32, u32)) -> Table {
+        Table {
+            name: name.into(),
+            sheet,
+            range,
+            header_rows: 1,
+            totals_rows: 0,
+            columns: (range.1..=range.3).map(|c| format!("C{c}")).collect(),
+            part: format!("xl/tables/{name}.xml"),
+        }
+    }
+
+    #[test]
+    fn rename_table_rewrites_every_formula_that_names_it() {
+        let mut wb = sales();
+        put(&mut wb, 0, "E1", "SUM(Sales[Qty])");
+        put(&mut wb, 1, "A1", "ROWS(sales)+SUM(Sales[[#All],[Qty]])");
+        put(&mut wb, 0, "E2", "SUMX(Sales,[@Qty])");
+        wb.defined_names.push(DefinedName {
+            name: "All".into(),
+            scope: None,
+            formula: "Sales[#All]".into(),
+        });
+        assert_eq!(value(&mut wb, 0, "E1"), CellValue::Number(12.0));
+        rename_table(&mut wb, "Sales", "Revenue").unwrap();
+        assert_eq!(wb.tables[0].name, "Revenue");
+        assert_eq!(formula(&wb, 0, "E1"), "SUM(Revenue[Qty])");
+        assert_eq!(
+            formula(&wb, 1, "A1"),
+            "ROWS(Revenue)+SUM(Revenue[[#All],[Qty]])"
+        );
+        assert_eq!(formula(&wb, 0, "E2"), "SUMX(Revenue,[@Qty])");
+        // Unqualified references name no table.
+        assert_eq!(formula(&wb, 0, "C2"), "[@Qty]*2");
+        assert_eq!(wb.defined_names[0].formula, "Revenue[#All]");
+        assert_eq!(value(&mut wb, 0, "E1"), CellValue::Number(12.0));
+        assert_eq!(value(&mut wb, 0, "E2"), CellValue::Number(12.0));
+        assert_eq!(value(&mut wb, 0, "C3"), CellValue::Number(8.0));
+    }
+
+    #[test]
+    fn rename_table_follows_excel_name_rules() {
+        let mut wb = sales();
+        wb.tables.push(other_table("Other", 1, (0, 0, 1, 0)));
+        wb.defined_names.push(DefinedName {
+            name: "Rate".into(),
+            scope: Some(1),
+            formula: "0.2".into(),
+        });
+        for bad in ["", "1x", "A1", "R1C1", "r", "Two words", "other", "RATE"] {
+            assert!(rename_table(&mut wb, "Sales", bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(wb.tables[0].name, "Sales");
+        assert!(rename_table(&mut wb, "Nope", "X").is_err());
+        // Another case of its own name is a rename.
+        put(&mut wb, 0, "E1", "SUM(Sales[Qty])");
+        rename_table(&mut wb, "Sales", "SALES").unwrap();
+        assert_eq!(wb.tables[0].name, "SALES");
+        assert_eq!(formula(&wb, 0, "E1"), "SUM(SALES[Qty])");
+    }
+
+    #[test]
+    fn rename_table_reaches_rules_and_pivots() {
+        let mut wb = sales();
+        wb.sheets[0].validations.push(crate::sheet::DataValidation {
+            formula1: "Sales[Item]".into(),
+            ..Default::default()
+        });
+        wb.pivots.push(pivot("P", 0, (9, 9, 9, 9), "SALES"));
+        rename_table(&mut wb, "Sales", "Revenue").unwrap();
+        assert_eq!(wb.sheets[0].validations[0].formula1, "Revenue[Item]");
+        assert_eq!(
+            wb.pivots[0].source,
+            crate::pivot::PivotSource::Table("Revenue".into())
+        );
+    }
+
+    #[test]
+    fn convert_to_range_writes_cell_references() {
+        let mut wb = sales();
+        put(&mut wb, 0, "E1", "SUM(Sales[Qty])");
+        put(&mut wb, 0, "E2", "ROWS(Sales[#All])+ROWS(Sales[#Headers])");
+        put(&mut wb, 0, "E3", "SUM(Sales[[Qty]:[Dbl]])");
+        put(&mut wb, 1, "A1", "SUM(Sales[Qty])");
+        put(&mut wb, 1, "A2", "IFERROR(SUM(Sales[Nope]),-1)");
+        put(&mut wb, 1, "A3", "ROWS(Sales)");
+        wb.defined_names.push(DefinedName {
+            name: "Items".into(),
+            scope: None,
+            formula: "Sales[Item]".into(),
+        });
+        let before = value(&mut wb, 0, "E3");
+        convert_table_to_range(&mut wb, "sales").unwrap();
+        assert!(wb.tables.is_empty());
+        assert_eq!(wb.removed_tables.len(), 1);
+        assert_eq!(formula(&wb, 0, "E1"), "SUM($B$2:$B$4)");
+        assert_eq!(formula(&wb, 0, "E2"), "ROWS($A$1:$C$4)+ROWS($A$1:$C$1)");
+        assert_eq!(formula(&wb, 0, "E3"), "SUM($B$2:$C$4)");
+        // `[@Qty]` inside the table: absolute column, its own row.
+        assert_eq!(formula(&wb, 0, "C2"), "$B2*2");
+        assert_eq!(formula(&wb, 0, "C4"), "$B4*2");
+        assert_eq!(formula(&wb, 1, "A1"), "SUM(Sheet1!$B$2:$B$4)");
+        assert_eq!(formula(&wb, 1, "A2"), "IFERROR(SUM(#REF!),-1)");
+        assert_eq!(formula(&wb, 1, "A3"), "ROWS(Sheet1!$A$2:$C$4)");
+        assert_eq!(wb.defined_names[0].formula, "Sheet1!$A$2:$A$4");
+        assert_eq!(value(&mut wb, 0, "E1"), CellValue::Number(12.0));
+        assert_eq!(value(&mut wb, 0, "E3"), before);
+        assert_eq!(value(&mut wb, 0, "C3"), CellValue::Number(8.0));
+        assert_eq!(value(&mut wb, 1, "A3"), CellValue::Number(3.0));
+    }
+
+    #[test]
+    fn convert_to_range_quotes_the_sheet_name() {
+        let mut wb = sales();
+        wb.sheets[0].name = "Q1 Data".into();
+        put(&mut wb, 1, "A1", "SUM(Sales[Qty])");
+        convert_table_to_range(&mut wb, "Sales").unwrap();
+        assert_eq!(formula(&wb, 1, "A1"), "SUM('Q1 Data'!$B$2:$B$4)");
+    }
+
+    #[test]
+    fn convert_to_range_refuses_what_has_no_range_form() {
+        let mut wb = sales();
+        put(&mut wb, 0, "E1", "SUMX(Sales,[@Qty])");
+        let err = convert_table_to_range(&mut wb, "Sales").unwrap_err();
+        assert!(err.contains("iterates"), "{err}");
+        assert_eq!(wb.tables.len(), 1);
+
+        let mut wb = sales();
+        wb.pivots
+            .push(pivot("PivotTable1", 1, (9, 9, 9, 9), "Sales"));
+        let err = convert_table_to_range(&mut wb, "Sales").unwrap_err();
+        assert_eq!(err, "PivotTable PivotTable1 uses this table");
+        assert_eq!(wb.tables.len(), 1);
+        assert_eq!(formula(&wb, 0, "C2"), "[@Qty]*2");
+
+        // Names and rules are reached by the rewrite too.
+        let mut wb = sales();
+        wb.defined_names.push(DefinedName {
+            name: "Total".into(),
+            scope: None,
+            formula: "SUMX(Sales,[@Qty])".into(),
+        });
+        let err = convert_table_to_range(&mut wb, "Sales").unwrap_err();
+        assert_eq!(err, "The name Total iterates this table");
+        let mut wb = sales();
+        wb.sheets[1].validations.push(crate::sheet::DataValidation {
+            formula1: "SUMX(Sales,[@Qty])>3".into(),
+            ..Default::default()
+        });
+        let err = convert_table_to_range(&mut wb, "Sales").unwrap_err();
+        assert_eq!(err, "A data validation rule on My Data iterates this table");
+        assert_eq!(wb.tables.len(), 1);
+    }
+
+    #[test]
+    fn resize_table_refuses_to_move_a_totals_row() {
+        let mut wb = sales();
+        wb.tables[0].totals_rows = 1;
+        for r2 in [2, 5] {
+            let err = resize_table(&mut wb, "Sales", (0, 0, r2, 2)).unwrap_err();
+            assert_eq!(err, "Turn off the Total Row first");
+        }
+        // Columns may still change: the totals row stays the last row.
+        resize_table(&mut wb, "Sales", (0, 0, 3, 3)).unwrap();
+        assert_eq!(wb.tables[0].range, (0, 0, 3, 3));
+    }
+
+    #[test]
+    fn new_column_names_are_unique_ignoring_case() {
+        let taken = vec!["Qty".to_string(), "Column2".to_string()];
+        let text = CellValue::Text("qty".into());
+        assert_eq!(table_column_name(Some(&text), 1, &taken), "qty2");
+        assert_eq!(table_column_name(None, 2, &taken), "Column22");
+        assert_eq!(
+            table_column_name(Some(&CellValue::Number(2024.0)), 3, &taken),
+            "2024"
+        );
+    }
+
+    #[test]
+    fn resize_table_keeps_names_and_names_new_columns() {
+        let mut wb = sales();
+        // E1 holds a header that clashes; D1 is blank.
+        wb.sheets[0].set_cell(0, 4, Cell::text("Qty"));
+        resize_table(&mut wb, "Sales", (0, 0, 5, 4)).unwrap();
+        let t = &wb.tables[0];
+        assert_eq!(t.range, (0, 0, 5, 4));
+        assert_eq!(t.columns, vec!["Item", "Qty", "Dbl", "Column4", "Qty2"]);
+        let header = |c| wb.sheets[0].cell(0, c).map(|cl| cl.value.clone());
+        assert_eq!(header(3), Some(CellValue::Text("Column4".into())));
+        assert_eq!(header(4), Some(CellValue::Text("Qty2".into())));
+        // Shrinking drops a column.
+        resize_table(&mut wb, "Sales", (0, 1, 2, 2)).unwrap();
+        assert_eq!(wb.tables[0].columns, vec!["Qty", "Dbl"]);
+    }
+
+    #[test]
+    fn resize_table_refuses_what_excel_refuses() {
+        let mut wb = sales();
+        let err = |wb: &mut Workbook, r| resize_table(wb, "Sales", r).unwrap_err();
+        assert!(err(&mut wb, (9, 3, 11, 4)).contains("header row"));
+        assert!(err(&mut wb, (1, 0, 3, 2)).contains("header row"));
+        assert!(err(&mut wb, (0, 4, 3, 5)).contains("overlap"));
+        assert!(err(&mut wb, (0, 0, 0, 2)).contains("data row"));
+        wb.tables.push(other_table("Next", 0, (0, 4, 2, 4)));
+        assert_eq!(err(&mut wb, (0, 0, 3, 4)), "The range overlaps table Next");
+        assert_eq!(wb.tables[0].range, (0, 0, 3, 2));
+    }
+
+    #[test]
+    fn table_range_conflicts() {
+        let mut wb = sales();
+        assert_eq!(
+            table_range_conflict(&wb, 0, (2, 2, 5, 5), None).as_deref(),
+            Some("The range overlaps table Sales")
+        );
+        assert_eq!(table_range_conflict(&wb, 0, (2, 2, 5, 5), Some(0)), None);
+        assert_eq!(table_range_conflict(&wb, 1, (0, 0, 5, 5), None), None);
+        wb.pivots.push(pivot("P", 1, (3, 3, 6, 4), "Elsewhere"));
+        assert_eq!(
+            table_range_conflict(&wb, 1, (0, 0, 3, 3), None).as_deref(),
+            Some("The range overlaps PivotTable P")
+        );
+        // A two-cell CSE block at G1:G2.
+        let mut arr = Cell::formula("A1:A2");
+        arr.f_attrs = Some("t=\"array\" ref=\"G1:G2\"".into());
+        arr.spill = Some((2, 1));
+        wb.sheets[1].set_cell(0, 6, arr);
+        assert_eq!(
+            table_range_conflict(&wb, 1, (1, 5, 4, 6), None).as_deref(),
+            Some("The range contains part of the array formula at G1")
+        );
+        assert_eq!(table_range_conflict(&wb, 1, (0, 7, 4, 8), None), None);
     }
 }

@@ -1539,6 +1539,19 @@ impl Table {
             .map(|i| self.range.1 + i as u32)
     }
 
+    /// The table's geometry as the evaluator and the structured-reference
+    /// rewrites read it: the one conversion they all share, so Convert to
+    /// Range and the save convert references alike.
+    pub fn info(&self) -> crate::formula::TableInfo {
+        crate::formula::TableInfo {
+            sheet: self.sheet,
+            range: self.range,
+            header_rows: self.header_rows,
+            totals_rows: self.totals_rows,
+            columns: self.columns.clone(),
+        }
+    }
+
     pub fn contains(&self, sheet: usize, row: u32, col: u32) -> bool {
         sheet == self.sheet
             && row >= self.range.0
@@ -1546,6 +1559,19 @@ impl Table {
             && col >= self.range.1
             && col <= self.range.3
     }
+}
+
+/// A table converted to a range whose part is still in the package (see
+/// [`Workbook::removed_tables`]). The column formulas other table parts hold
+/// that name it are converted at save as the cell formulas were: with its
+/// geometry as converted, then through each row/column edit made on its sheet
+/// since ([`crate::formula::adjust_for_edit`], the same rewrite the cells
+/// went through), so both read the same cells.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RemovedTable {
+    pub table: Table,
+    /// The row/column edits on its sheet since it was converted, in order.
+    pub edits: Vec<crate::formula::EditShift>,
 }
 
 /// A workbook-level defined name: `TaxRate` → `0.21`, `Data` →
@@ -1565,6 +1591,13 @@ pub struct Workbook {
     pub styles: Styles,
     pub defined_names: Vec<DefinedName>,
     pub tables: Vec<Table>,
+    /// Tables converted to a range ([`crate::edit::convert_table_to_range`])
+    /// whose parts are still in the package: a save drops each part that no
+    /// table in [`Self::tables`] uses any more, together with its
+    /// relationship, `<tablePart>` and content type. Only parts named here
+    /// are ever dropped, so a table part the loader couldn't read is kept.
+    /// Undo restores this list with the tables, which brings a part back.
+    pub removed_tables: Vec<RemovedTable>,
     /// Pivot tables (parsed read-only from their preserved parts, so they
     /// can be refreshed from current source data).
     pub pivots: Vec<crate::pivot::Pivot>,

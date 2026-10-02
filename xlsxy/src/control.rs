@@ -41,6 +41,10 @@
 //! | `sheet.add` | `{name?}` | `{sheet,name}` |
 //! | `sheet.remove` | `{sheet}` | `{removed:true}` (last-sheet error) |
 //! | `sheet.rename` | `{sheet,name}` | `{name}` |
+//! | `table.list` | — | `{tables:[{name,sheet,sheet_name,ref,columns,header_rows,totals_rows}]}` |
+//! | `table.rename` | `{name,new}` | the table, as `table.list` shows it — Excel's name rules; every formula naming it follows. One undo step |
+//! | `table.resize` | `{name,ref}` | the table — the header row stays, the new range overlaps the old and keeps a data row; a table with a Total Row keeps its bottom row; new columns' unique names are written into their header cells. One undo step |
+//! | `table.convert` | `{name}` | `{converted}` — structured references become cell references; refused while a PivotTable, a SUMX-style formula or the data model uses the table. One undo step |
 //! | `row.insert` / `row.delete` | `{at,count?,sheet?}` | `{inserted\|deleted}` |
 //! | `col.insert` / `col.delete` | `{at,count?,sheet?}` | `{inserted\|deleted}` |
 //! | `cell.format` | `{range,patch,sheet?}` | `{formatted}` — one undo group; `patch` keys: `numFmt`/`bold`/`italic`/`fontColor`/`fillColor`/`align` (≥1 required) |
@@ -125,6 +129,10 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         "sheet.add" => sheet_add(app, args),
         "sheet.remove" => sheet_remove(app, args),
         "sheet.rename" => sheet_rename(app, args),
+        "table.list" => Ok(table_list(app)),
+        "table.rename" => table_rename(app, args),
+        "table.resize" => table_resize(app, args),
+        "table.convert" => table_convert(app, args),
         "row.insert" => row_op(app, args, true),
         "row.delete" => row_op(app, args, false),
         "col.insert" => col_op(app, args, true),
@@ -182,6 +190,9 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
                 | "sheet.add"
                 | "sheet.remove"
                 | "sheet.rename"
+                | "table.rename"
+                | "table.resize"
+                | "table.convert"
                 | "pivot.create"
                 | "row.insert"
                 | "row.delete"
@@ -1437,6 +1448,86 @@ fn sheet_remove(app: &mut App, args: &Json) -> Result<Json, String> {
     app.rebuild_engine();
     app.modified = true;
     Ok(Json::obj(vec![("removed", Json::Bool(true))]))
+}
+
+// ---------------------------------------------------------------------------
+// Tables
+// ---------------------------------------------------------------------------
+
+fn table_json(app: &App, t: &gridcore::sheet::Table) -> Json {
+    let (r1, c1, r2, c2) = t.range;
+    Json::obj(vec![
+        ("name", Json::Str(t.name.clone())),
+        ("sheet", Json::Num(t.sheet as f64)),
+        (
+            "sheet_name",
+            Json::Str(app.pkg.workbook.sheets[t.sheet].name.clone()),
+        ),
+        (
+            "ref",
+            Json::Str(format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2))),
+        ),
+        (
+            "columns",
+            Json::Arr(t.columns.iter().cloned().map(Json::Str).collect()),
+        ),
+        ("header_rows", Json::Num(t.header_rows as f64)),
+        ("totals_rows", Json::Num(t.totals_rows as f64)),
+    ])
+}
+
+fn table_list(app: &App) -> Json {
+    let tables = app
+        .pkg
+        .workbook
+        .tables
+        .iter()
+        .map(|t| table_json(app, t))
+        .collect();
+    Json::obj(vec![("tables", Json::Arr(tables))])
+}
+
+/// The table named by `name` in `args` (as the workbook spells it).
+fn table_arg(app: &App, args: &Json, verb: &str) -> Result<String, String> {
+    let name = args
+        .get_str("name")
+        .ok_or_else(|| format!("{verb} needs a 'name'"))?;
+    app.pkg
+        .workbook
+        .table(name)
+        .map(|t| t.name.clone())
+        .ok_or_else(|| format!("There is no table named {name}"))
+}
+
+/// The table now named `name`, as `table.list` shows it.
+fn table_reply(app: &App, name: &str) -> Result<Json, String> {
+    let t = app.pkg.workbook.table(name).ok_or("table vanished")?;
+    Ok(table_json(app, t))
+}
+
+/// Table Name — [`App::rename_table`]: one undo step.
+fn table_rename(app: &mut App, args: &Json) -> Result<Json, String> {
+    let name = table_arg(app, args, "table.rename")?;
+    let new = args
+        .get_str("new")
+        .ok_or("table.rename needs a 'new' name")?;
+    app.rename_table(&name, new)?;
+    table_reply(app, new)
+}
+
+/// Resize Table — [`App::resize_table`]: one undo step.
+fn table_resize(app: &mut App, args: &Json) -> Result<Json, String> {
+    let name = table_arg(app, args, "table.resize")?;
+    let range = args.get_str("ref").ok_or("table.resize needs a 'ref'")?;
+    app.resize_table(&name, range)?;
+    table_reply(app, &name)
+}
+
+/// Convert to Range — [`App::convert_table`]: one undo step.
+fn table_convert(app: &mut App, args: &Json) -> Result<Json, String> {
+    let name = table_arg(app, args, "table.convert")?;
+    app.convert_table(&name)?;
+    Ok(Json::obj(vec![("converted", Json::Str(name))]))
 }
 
 /// Rename a sheet and rewrite every formula/defined-name reference to it —
@@ -6034,5 +6125,139 @@ mod print_tests {
         assert_eq!(e, "We didn't find anything to print.");
         assert!(!empty.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod table_verb_tests {
+    use super::*;
+    use gridcore::xlsx::new_xlsx;
+
+    /// Item/Qty over A1:B3 as `Table1`, `=SUM(Table1[Qty])` in D1.
+    fn app() -> App {
+        let mut a = App::new(new_xlsx(), "ctl-table.xlsx");
+        a.os_clip = None;
+        let sh = &mut a.pkg.workbook.sheets[0];
+        sh.set_cell(0, 0, Cell::text("Item"));
+        sh.set_cell(0, 1, Cell::text("Qty"));
+        sh.set_cell(1, 0, Cell::text("Pen"));
+        sh.set_cell(1, 1, Cell::number(3.0));
+        sh.set_cell(2, 0, Cell::text("Pad"));
+        sh.set_cell(2, 1, Cell::number(5.0));
+        a.pkg
+            .add_table(0, (0, 0, 2, 1), true, "TableStyleMedium2")
+            .unwrap();
+        a.rebuild_engine();
+        cell_set(
+            &mut a,
+            &Json::obj(vec![
+                ("ref", Json::Str("D1".into())),
+                ("text", Json::Str("=SUM(Table1[Qty])".into())),
+            ]),
+        )
+        .unwrap();
+        a
+    }
+
+    fn call(a: &mut App, verb: &str, args: Vec<(&str, &str)>) -> Result<Json, String> {
+        let args = Json::obj(
+            args.into_iter()
+                .map(|(k, v)| (k, Json::Str(v.into())))
+                .collect(),
+        );
+        dispatch(a, verb, &args)
+    }
+
+    fn d1(a: &App) -> Option<String> {
+        cell_get(a, &Json::obj(vec![("ref", Json::Str("D1".into()))]))
+            .unwrap()
+            .get_str("formula")
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn table_list_describes_each_table() {
+        let mut a = app();
+        let r = dispatch(&mut a, "table.list", &Json::Null).unwrap();
+        let tables = r.get("tables").unwrap().as_array().unwrap();
+        assert_eq!(tables.len(), 1);
+        let t = &tables[0];
+        assert_eq!(t.get_str("name"), Some("Table1"));
+        assert_eq!(t.get_usize("sheet"), Some(0));
+        assert_eq!(t.get_str("sheet_name"), Some("Sheet1"));
+        assert_eq!(t.get_str("ref"), Some("A1:B3"));
+        let cols: Vec<&str> = t
+            .get("columns")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c.as_str())
+            .collect();
+        assert_eq!(cols, vec!["Item", "Qty"]);
+        assert_eq!(t.get_usize("header_rows"), Some(1));
+        assert_eq!(t.get_usize("totals_rows"), Some(0));
+    }
+
+    #[test]
+    fn table_rename_rewrites_formulas_and_undoes_in_one_step() {
+        let mut a = app();
+        let r = call(
+            &mut a,
+            "table.rename",
+            vec![("name", "table1"), ("new", "Sales")],
+        )
+        .unwrap();
+        assert_eq!(r.get_str("name"), Some("Sales"));
+        assert_eq!(d1(&a).as_deref(), Some("=SUM(Sales[Qty])"));
+        a.undo();
+        assert_eq!(a.pkg.workbook.tables[0].name, "Table1");
+        assert_eq!(d1(&a).as_deref(), Some("=SUM(Table1[Qty])"));
+        let err = call(
+            &mut a,
+            "table.rename",
+            vec![("name", "Table1"), ("new", "R1C1")],
+        )
+        .unwrap_err();
+        assert!(err.contains("cell reference"), "{err}");
+        let err = call(&mut a, "table.rename", vec![("name", "Nope"), ("new", "X")]).unwrap_err();
+        assert_eq!(err, "There is no table named Nope");
+        assert!(call(&mut a, "table.rename", vec![("name", "Table1")]).is_err());
+    }
+
+    #[test]
+    fn table_resize_moves_the_table() {
+        let mut a = app();
+        let r = call(
+            &mut a,
+            "table.resize",
+            vec![("name", "Table1"), ("ref", "A1:C5")],
+        )
+        .unwrap();
+        assert_eq!(r.get_str("ref"), Some("A1:C5"));
+        assert_eq!(r.get("columns").unwrap().as_array().unwrap().len(), 3);
+        let err = call(
+            &mut a,
+            "table.resize",
+            vec![("name", "Table1"), ("ref", "F1:G4")],
+        )
+        .unwrap_err();
+        assert_eq!(err, "The new range must overlap the table");
+        a.undo();
+        assert_eq!(a.pkg.workbook.tables[0].range, (0, 0, 2, 1));
+    }
+
+    #[test]
+    fn table_convert_writes_cell_references() {
+        let mut a = app();
+        let r = call(&mut a, "table.convert", vec![("name", "Table1")]).unwrap();
+        assert_eq!(r.get_str("converted"), Some("Table1"));
+        assert!(a.pkg.workbook.tables.is_empty());
+        assert_eq!(d1(&a).as_deref(), Some("=SUM($B$2:$B$3)"));
+        let err = call(&mut a, "table.convert", vec![("name", "Table1")]).unwrap_err();
+        assert_eq!(err, "There is no table named Table1");
+        a.undo();
+        assert_eq!(a.pkg.workbook.tables.len(), 1);
+        assert_eq!(d1(&a).as_deref(), Some("=SUM(Table1[Qty])"));
     }
 }
