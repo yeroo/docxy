@@ -2841,8 +2841,9 @@ impl App {
     }
 
     /// Commit the new comment: wrap the selection in markers (one undo step)
-    /// and add it to the live panel. Saves write it to comments.xml while its
-    /// markers are in the body ([`App::sync_session_comments`]).
+    /// and add it to the live panel. Each save writes it to comments.xml
+    /// while its markers are in the body ([`App::reconcile_session_comments`]);
+    /// one made while editing a header or footer is written at once.
     fn commit_comment(&mut self) {
         if self
             .comment_input
