@@ -1512,13 +1512,17 @@ impl Package {
     /// `w:autoHyphenation`) in `word/settings.xml`, creating the part (+ its
     /// content-type and relationship) if it doesn't exist yet.
     fn set_settings_flag(&mut self, elem: &str, on: bool) {
-        const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-        const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-        let existing_name = match self.settings_part_name() {
-            Ok(name) => name,
+        match self.settings_part_name() {
+            Ok(Some(_)) => {}
+            // Nothing to turn off, and nothing to create it in.
+            Ok(None) if !on => return,
+            Ok(None) => {}
             Err(_) => return,
+        }
+        let Some(name) = self.ensure_settings_part() else {
+            return;
         };
-        let name = existing_name.as_deref().unwrap_or("word/settings.xml");
+        let name = name.as_str();
         if let Some(b) = self.part(name) {
             let xml = String::from_utf8_lossy(b).into_owned();
             let cur = settings_flag_of(&xml, elem);
@@ -1557,14 +1561,22 @@ impl Package {
                 format!("{}<{elem}/>{}", &xml[..gt + 1], &xml[gt + 1..])
             };
             self.set_part(name, new.into_bytes());
-            return;
         }
-        if !on {
-            return; // nothing to turn off
+    }
+
+    /// The settings part's name, creating an empty `word/settings.xml` (with
+    /// its content-type override and document relationship) when there is
+    /// none. `None` when the document's settings relationship is broken.
+    fn ensure_settings_part(&mut self) -> Option<String> {
+        const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+        const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        if let Some(name) = self.settings_part_name().ok()? {
+            return Some(name);
         }
+        let name = "word/settings.xml";
         let body = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
-             <w:settings xmlns:w=\"{W_NS}\"><{elem}/></w:settings>"
+             <w:settings xmlns:w=\"{W_NS}\"/>"
         );
         self.parts.push((name.to_string(), body.into_bytes()));
         if let Some(b) = self.part("[Content_Types].xml") {
@@ -1591,6 +1603,152 @@ impl Package {
                     rels.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1)
                         .into_bytes(),
                 );
+            }
+        }
+        Some(name.to_string())
+    }
+
+    /// The document's mail-merge setup (`w:mailMerge` in the settings part):
+    /// its main-document type and, when it names one, the data source file
+    /// (the target of its `mailMergeSource` relationship, or the `w:query`'s
+    /// file when there is no relationship). Recorded only: nothing reads the
+    /// data source here (#628).
+    pub fn mail_merge(&self) -> Option<MailMerge> {
+        let name = self.settings_part_name().ok()??;
+        let xml = decode_xml_part(self.part(&name)?)?.into_owned();
+        let (a, b) = crate::sect::find_element(&xml, "w:mailMerge")?;
+        let mm = &xml[a..b];
+        let val = |child: &str| {
+            crate::load::start_tags(mm, child)
+                .into_iter()
+                .find(|(_, el)| el[child.len() + 1..].starts_with([' ', '/', '>']))
+                .and_then(|(_, el)| crate::load::xml_attr_value(el, "w:val"))
+                .map(|v| decode_xml_entities(&v))
+        };
+        let doc_type = val("w:mainDocumentType")
+            .and_then(|v| MainDocType::from_ooxml(&v))
+            .unwrap_or_default();
+        let rid = crate::load::start_tags(mm, "w:dataSource")
+            .into_iter()
+            .find_map(|(_, el)| crate::load::xml_attr_value(el, "r:id"));
+        let by_rel = rid.and_then(|rid| {
+            let rels = decode_xml_part(self.part(&part_rels_name(&name)?)?)?.into_owned();
+            crate::load::start_tags(&rels, "Relationship")
+                .into_iter()
+                .find(|(_, el)| {
+                    crate::load::xml_attr_value(el, "Id").as_deref() == Some(rid.as_str())
+                })
+                .and_then(|(_, el)| crate::load::xml_attr_value(el, "Target"))
+                .map(|t| file_url_to_path(&decode_xml_entities(&t)))
+        });
+        let source = by_rel.or_else(|| {
+            let q = val("w:query")?;
+            let from = q.to_ascii_uppercase().find(" FROM ")? + " FROM ".len();
+            let path = q[from..].trim().trim_matches(['`', '\'', '"', '[', ']']);
+            (!path.is_empty()).then(|| path.to_string())
+        });
+        Some(MailMerge { doc_type, source })
+    }
+
+    /// The data source file the document's mail merge names, if any.
+    pub fn mail_merge_source(&self) -> Option<String> {
+        self.mail_merge()?.source
+    }
+
+    /// Write `w:mailMerge` (at its `CT_Settings` position, replacing any
+    /// there) and its `mailMergeSource` relationship, creating the settings
+    /// part and its relationships part when missing; `None` removes both
+    /// ("Normal Word Document").
+    pub fn set_mail_merge(&mut self, mm: Option<&MailMerge>) {
+        const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+        const PKG_RELS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+        let name = match mm {
+            Some(_) => self.ensure_settings_part(),
+            None => self.settings_part_name().ok().flatten(),
+        };
+        let Some(name) = name else {
+            return;
+        };
+        let Some(xml) = self
+            .part(&name)
+            .and_then(decode_xml_part)
+            .map(Cow::into_owned)
+        else {
+            return;
+        };
+        // Drop the old element and every mailMergeSource relationship.
+        let mut xml = crate::sect::remove_element(&xml, "w:mailMerge");
+        let Some(rels_name) = part_rels_name(&name) else {
+            return;
+        };
+        let mut rels = self
+            .part(&rels_name)
+            .and_then(decode_xml_part)
+            .map(Cow::into_owned);
+        if let Some(r) = rels.as_mut() {
+            let spans: Vec<(usize, usize)> = crate::load::start_tags(r, "Relationship")
+                .into_iter()
+                .filter(|(_, el)| {
+                    let ty = crate::load::xml_attr_value(el, "Type").unwrap_or_default();
+                    ty.ends_with("/mailMergeSource") || ty.ends_with("/recipientData")
+                })
+                .map(|(start, el)| {
+                    let end = if el.ends_with("/>") {
+                        start + el.len()
+                    } else {
+                        r[start..]
+                            .find("</Relationship>")
+                            .map_or(start + el.len(), |e| start + e + "</Relationship>".len())
+                    };
+                    (start, end)
+                })
+                .collect();
+            for (start, end) in spans.into_iter().rev() {
+                r.replace_range(start..end, "");
+            }
+        }
+        if let Some(mm) = mm {
+            let mut el = String::from("<w:mailMerge><w:mainDocumentType w:val=\"");
+            el.push_str(mm.doc_type.as_ooxml());
+            el.push_str("\"/>");
+            if let Some(src) = &mm.source {
+                let r = rels.get_or_insert_with(|| {
+                    format!(
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+                         <Relationships xmlns=\"{PKG_RELS}\"></Relationships>"
+                    )
+                });
+                let rid = next_rid(r);
+                let mut rel =
+                    format!("<Relationship Id=\"{rid}\" Type=\"{R_NS}/mailMergeSource\" Target=\"");
+                crate::serialize::esc_attr(&path_to_file_url(src), &mut rel);
+                rel.push_str("\" TargetMode=\"External\"/>");
+                if r.contains("</Relationships>") {
+                    *r = r.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1);
+                } else if let Some(gt) = r
+                    .find("<Relationships")
+                    .and_then(|s| r[s..].find("/>").map(|e| s + e))
+                {
+                    *r = format!("{}>{rel}</Relationships>{}", &r[..gt], &r[gt + 2..]);
+                }
+                el.push_str("<w:linkToQuery/><w:dataType w:val=\"textFile\"/>");
+                el.push_str("<w:connectString w:val=\"\"/><w:query w:val=\"");
+                crate::serialize::esc_attr(&format!("SELECT * FROM {src}"), &mut el);
+                el.push_str("\"/><w:dataSource xmlns:r=\"");
+                el.push_str(R_NS);
+                el.push_str("\" r:id=\"");
+                el.push_str(&rid);
+                el.push_str("\"/>");
+            } else {
+                el.push_str("<w:dataType w:val=\"textFile\"/>");
+            }
+            el.push_str("</w:mailMerge>");
+            xml = insert_settings_child(&xml, "w:mailMerge", &el);
+        }
+        self.set_part(&name, xml.into_bytes());
+        if let Some(r) = rels {
+            if !self.set_part(&rels_name, r.clone().into_bytes()) {
+                self.parts.push((rels_name, r.into_bytes()));
             }
         }
     }
@@ -2112,6 +2270,147 @@ fn markdown_list_levels(bullet: bool) -> String {
 }
 
 /// The next free relationship id (`rId{max+1}`) for a `.rels` part.
+/// A mail-merge main document's type (`w:mainDocumentType`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MainDocType {
+    #[default]
+    Letters,
+    Email,
+    Envelopes,
+    Labels,
+    Directory,
+}
+
+impl MainDocType {
+    pub fn as_ooxml(self) -> &'static str {
+        match self {
+            MainDocType::Letters => "formLetters",
+            MainDocType::Email => "email",
+            MainDocType::Envelopes => "envelopes",
+            MainDocType::Labels => "mailingLabels",
+            MainDocType::Directory => "catalog",
+        }
+    }
+
+    pub fn from_ooxml(v: &str) -> Option<MainDocType> {
+        Some(match v {
+            "formLetters" => MainDocType::Letters,
+            "email" => MainDocType::Email,
+            "envelopes" => MainDocType::Envelopes,
+            "mailingLabels" => MainDocType::Labels,
+            "catalog" => MainDocType::Directory,
+            _ => return None,
+        })
+    }
+}
+
+/// A document's mail-merge setup: what kind of main document it is and the
+/// data source file it names.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MailMerge {
+    pub doc_type: MainDocType,
+    pub source: Option<String>,
+}
+
+/// A file path as Word writes a mailMergeSource target (`file:///C:\x.csv`).
+fn path_to_file_url(path: &str) -> String {
+    let path = path.replace('%', "%25").replace(' ', "%20");
+    if path.starts_with('/') {
+        format!("file://{path}")
+    } else {
+        format!("file:///{path}")
+    }
+}
+
+/// A mailMergeSource target as a path: `file:` URLs lose their scheme and
+/// `%XX` escapes; anything else is returned as written.
+fn file_url_to_path(target: &str) -> String {
+    let Some(rest) = target
+        .strip_prefix("file:///")
+        .or_else(|| target.strip_prefix("file://"))
+    else {
+        return target.to_string();
+    };
+    // `file:///C:\x` is a drive path; `file:///home/x` a POSIX one.
+    let rest = if rest.as_bytes().get(1) == Some(&b':') {
+        rest.to_string()
+    } else {
+        format!("/{rest}")
+    };
+    let bytes = rest.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&rest[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `CT_Settings` children that come before `w:mailMerge`.
+const SETTINGS_BEFORE_MAIL_MERGE: [&str; 29] = [
+    "w:writeProtection",
+    "w:view",
+    "w:zoom",
+    "w:removePersonalInformation",
+    "w:removeDateAndTime",
+    "w:doNotDisplayPageBoundaries",
+    "w:displayBackgroundShape",
+    "w:printPostScriptOverText",
+    "w:printFractionalCharacterWidth",
+    "w:printFormsData",
+    "w:embedTrueTypeFonts",
+    "w:embedSystemFonts",
+    "w:saveSubsetFonts",
+    "w:saveFormsData",
+    "w:mirrorMargins",
+    "w:alignBordersAndEdges",
+    "w:bordersDoNotSurroundHeader",
+    "w:bordersDoNotSurroundFooter",
+    "w:gutterAtTop",
+    "w:hideSpellingErrors",
+    "w:hideGrammaticalErrors",
+    "w:activeWritingStyle",
+    "w:proofState",
+    "w:formsDesign",
+    "w:attachedTemplate",
+    "w:linkStyles",
+    "w:stylePaneFormatFilter",
+    "w:stylePaneSortMethod",
+    "w:documentType",
+];
+
+/// Insert `child` into the settings root right after the last element that
+/// precedes `w:mailMerge` in `CT_Settings` (every other child follows it),
+/// or first. Expands a self-closing root.
+fn insert_settings_child(xml: &str, _name: &str, child: &str) -> String {
+    let Some(root) = xml.find("<w:settings") else {
+        return xml.to_string();
+    };
+    let Some(gt) = xml[root..].find('>').map(|g| root + g) else {
+        return xml.to_string();
+    };
+    if xml[..gt].ends_with('/') {
+        return format!("{}>{child}</w:settings>{}", &xml[..gt - 1], &xml[gt + 1..]);
+    }
+    let mut at = gt + 1;
+    for name in SETTINGS_BEFORE_MAIL_MERGE {
+        let mut from = gt + 1;
+        while let Some((a, b)) = crate::sect::find_element(&xml[from..], name) {
+            at = at.max(from + b);
+            from += b.max(a + 1);
+        }
+    }
+    format!("{}{child}{}", &xml[..at], &xml[at..])
+}
+
 fn next_rid(rels: &str) -> String {
     format!("rId{}", next_rid_num(rels))
 }
@@ -2840,6 +3139,155 @@ mod tests {
         <w:p><w:r><w:t>World</w:t></w:r></w:p>\
         <w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/></w:sectPr>\
         </w:body></w:document>";
+
+    fn mail_merge_of(pkg: &Package) -> (String, String) {
+        let settings = pkg.part_text("word/settings.xml").unwrap_or_default();
+        let rels = pkg
+            .part_text("word/_rels/settings.xml.rels")
+            .unwrap_or_default();
+        (settings, rels)
+    }
+
+    const DOC_RELS: &str = "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+        <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings\" Target=\"settings.xml\"/>\
+        </Relationships>";
+
+    /// #628: attaching a list writes `w:mailMerge` where CT_Settings puts
+    /// it (after `w:proofState`/`w:documentType`, before `w:defaultTabStop`)
+    /// and an External mailMergeSource relationship; attaching again
+    /// replaces both; "Normal Word Document" removes both.
+    #[test]
+    fn mail_merge_settings_order_replace_and_remove_628() {
+        let settings = "<?xml version=\"1.0\"?><w:settings xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+            <w:zoom w:percent=\"100\"/><w:proofState w:spelling=\"clean\"/><w:defaultTabStop w:val=\"720\"/>\
+            <w:compat/></w:settings>";
+        let mut pkg = load_package(&make_metadata_docx(
+            BODY,
+            Some(settings),
+            Some(DOC_RELS),
+            &[],
+        ))
+        .unwrap();
+        assert_eq!(pkg.mail_merge(), None);
+        pkg.set_mail_merge(Some(&MailMerge {
+            doc_type: MainDocType::Letters,
+            source: Some("C:\\Data\\My List.csv".into()),
+        }));
+        let (xml, rels) = mail_merge_of(&pkg);
+        let proof = xml.find("<w:proofState").unwrap();
+        let mm = xml.find("<w:mailMerge>").unwrap();
+        let tab = xml.find("<w:defaultTabStop").unwrap();
+        assert!(proof < mm && mm < tab, "{xml}");
+        assert!(
+            xml.contains(
+                "<w:mailMerge><w:mainDocumentType w:val=\"formLetters\"/><w:linkToQuery/>\
+             <w:dataType w:val=\"textFile\"/><w:connectString w:val=\"\"/>\
+             <w:query w:val=\"SELECT * FROM C:\\Data\\My List.csv\"/>"
+            ),
+            "{xml}"
+        );
+        assert!(rels.contains("/mailMergeSource\" Target=\"file:///C:\\Data\\My%20List.csv\" TargetMode=\"External\""), "{rels}");
+        let rid = crate::load::start_tags(&xml, "w:dataSource")
+            .first()
+            .and_then(|(_, el)| crate::load::xml_attr_value(el, "r:id"))
+            .unwrap();
+        assert!(rels.contains(&format!("Id=\"{rid}\"")), "{rels}");
+        assert_eq!(
+            pkg.mail_merge(),
+            Some(MailMerge {
+                doc_type: MainDocType::Letters,
+                source: Some("C:\\Data\\My List.csv".into()),
+            })
+        );
+
+        // Again, as labels from another file: one element, one relationship.
+        pkg.set_mail_merge(Some(&MailMerge {
+            doc_type: MainDocType::Labels,
+            source: Some("/home/me/b.csv".into()),
+        }));
+        let (xml, rels) = mail_merge_of(&pkg);
+        assert_eq!(xml.matches("<w:mailMerge>").count(), 1, "{xml}");
+        assert_eq!(rels.matches("mailMergeSource").count(), 1, "{rels}");
+        assert_eq!(pkg.mail_merge_source().as_deref(), Some("/home/me/b.csv"));
+        assert_eq!(pkg.mail_merge().unwrap().doc_type, MainDocType::Labels);
+
+        // A save and reload keeps it.
+        let back = load_package(&save_package(&pkg)).unwrap();
+        assert_eq!(back.mail_merge_source().as_deref(), Some("/home/me/b.csv"));
+
+        pkg.set_mail_merge(None);
+        let (xml, rels) = mail_merge_of(&pkg);
+        assert!(!xml.contains("mailMerge"), "{xml}");
+        assert!(!rels.contains("mailMergeSource"), "{rels}");
+        assert!(xml.contains("<w:defaultTabStop"), "{xml}");
+        assert_eq!(pkg.mail_merge(), None);
+    }
+
+    /// #628: with no settings part at all, attaching creates it, its content
+    /// type, its document relationship and its relationships part.
+    #[test]
+    fn mail_merge_creates_the_settings_part_628() {
+        let ct = "<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
+            <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/></Types>";
+        let rels = "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"></Relationships>";
+        let mut pkg = load_package(&write_zip(&[
+            ("[Content_Types].xml".to_string(), ct.as_bytes().to_vec()),
+            ("word/document.xml".to_string(), BODY.as_bytes().to_vec()),
+            (
+                "word/_rels/document.xml.rels".to_string(),
+                rels.as_bytes().to_vec(),
+            ),
+        ]))
+        .unwrap();
+        assert!(pkg.part("word/settings.xml").is_none());
+        pkg.set_mail_merge(Some(&MailMerge {
+            doc_type: MainDocType::Directory,
+            source: Some("C:\\a.csv".into()),
+        }));
+        let (xml, srels) = mail_merge_of(&pkg);
+        assert!(
+            xml.contains("<w:mailMerge><w:mainDocumentType w:val=\"catalog\"/>"),
+            "{xml}"
+        );
+        assert!(srels.contains("TargetMode=\"External\""), "{srels}");
+        assert!(
+            pkg.part_text("[Content_Types].xml")
+                .unwrap()
+                .contains("settings+xml")
+        );
+        assert!(
+            pkg.part_text("word/_rels/document.xml.rels")
+                .unwrap()
+                .contains("Target=\"settings.xml\"")
+        );
+        let back = load_package(&save_package(&pkg)).unwrap();
+        assert_eq!(back.mail_merge_source().as_deref(), Some("C:\\a.csv"));
+        // Removing from a document that never had one creates nothing.
+        let mut bare = load_package(&make_docx(BODY)).unwrap();
+        bare.set_mail_merge(None);
+        assert!(bare.part("word/settings.xml").is_none());
+    }
+
+    /// A data source named only by `w:query` (no relationship) is still read.
+    #[test]
+    fn mail_merge_source_from_the_query_628() {
+        let settings = "<w:settings xmlns:w=\"w\"><w:mailMerge><w:mainDocumentType w:val=\"email\"/>\
+            <w:query w:val=\"SELECT * FROM `C:\\x\\list.csv` \"/></w:mailMerge></w:settings>";
+        let pkg = load_package(&make_metadata_docx(
+            BODY,
+            Some(settings),
+            Some(DOC_RELS),
+            &[],
+        ))
+        .unwrap();
+        assert_eq!(
+            pkg.mail_merge(),
+            Some(MailMerge {
+                doc_type: MainDocType::Email,
+                source: Some("C:\\x\\list.csv".into()),
+            })
+        );
+    }
 
     /// #628: Word's envelope delivery address carries `w:wrap="auto"`; a
     /// save used to rewrite it as an empty `<w:framePr/>`. Every CT_FramePr
