@@ -1410,23 +1410,32 @@ impl Package {
     /// The header parts `sect_prs` show, once each, in section order: every
     /// section's default header, its first-page header when it has
     /// `w:titlePg`, and its even-page header when the document has
-    /// `w:evenAndOddHeaders`. With `create`, a slot that resolves to no part
-    /// gets a new, empty one, referenced from that section's sectPr (later
-    /// sections inherit it).
-    fn shown_header_parts(&mut self, sect_prs: &mut [String], create: bool) -> Vec<String> {
-        // A new part changes what later sections inherit: look again after each.
-        while let Some((k, variant)) = self
-            .shown_header_slots(sect_prs)
-            .into_iter()
-            .find_map(|(k, variant, part)| part.is_none().then_some((k, variant)))
-            .filter(|_| create)
-        {
+    /// `w:evenAndOddHeaders`. A slot that resolves to no part gets a new,
+    /// empty one, referenced from that section's sectPr (later sections
+    /// inherit it). When a new part cannot be added, or its reference does
+    /// not resolve, the remaining empty slots stay empty.
+    fn shown_header_parts(&mut self, sect_prs: &mut [String]) -> Vec<String> {
+        // A new part changes what later sections inherit: look again after
+        // each, and stop as soon as one makes no progress.
+        let empty_slot = |pkg: &Self, sect_prs: &[String]| {
+            pkg.shown_header_slots(sect_prs)
+                .into_iter()
+                .find_map(|(k, variant, part)| part.is_none().then_some((k, variant)))
+        };
+        while let Some((k, variant)) = empty_slot(self, sect_prs) {
             self.ensure_styles(&["Header"]);
             let Some((rid, _)) = self.create_hf_part(true, "<w:p/>") else {
                 break;
             };
-            sect_prs[k] =
+            let linked =
                 crate::sect::set_hf_reference(&sect_prs[k], true, variant.as_ooxml(), Some(&rid));
+            let before = std::mem::replace(&mut sect_prs[k], linked);
+            if empty_slot(self, sect_prs) == Some((k, variant)) {
+                // The part is in the package but its reference does not
+                // resolve: leave the section as it was.
+                sect_prs[k] = before;
+                break;
+            }
         }
         let mut out: Vec<String> = Vec::new();
         for (_, _, part) in self.shown_header_slots(sect_prs) {
@@ -1513,7 +1522,7 @@ impl Package {
             .unwrap_or(0);
         let referenced = self.referenced_header_parts(sect_prs);
         let shown = match spec {
-            Some(_) => self.shown_header_parts(sect_prs, true),
+            Some(_) => self.shown_header_parts(sect_prs),
             None => Vec::new(),
         };
         let mut visit: Vec<&String> = Vec::new();
@@ -1653,10 +1662,23 @@ impl Package {
         let target = format!("{kind}{n}.xml");
         let part_name = format!("word/{target}");
 
-        // A fresh relationship id from document.xml.rels.
+        // A fresh relationship id from document.xml.rels, and the
+        // relationship and content-type override, worked out before anything
+        // is added: a part the package cannot reference is not added at all.
         let rels_name = "word/_rels/document.xml.rels";
         let rels_xml = String::from_utf8_lossy(self.part(rels_name)?).into_owned();
         let rid = next_rid(&rels_xml);
+        let rel =
+            format!("<Relationship Id=\"{rid}\" Type=\"{R_NS}/{kind}\" Target=\"{target}\"/>");
+        let new_rels = append_relationships(&rels_xml, &rel)?;
+        let new_ct = match self.part("[Content_Types].xml") {
+            Some(b) => {
+                let ct_xml = String::from_utf8_lossy(b).into_owned();
+                let ov = format!("<Override PartName=\"/{part_name}\" ContentType=\"{ct}\"/>");
+                Some(append_to_root(&ct_xml, "Types", &ov)?)
+            }
+            None => None,
+        };
 
         self.parts.push((part_name.clone(), bytes));
         if let (Some(rels), Some(name)) = (own_rels, part_rels_name(&part_name)) {
@@ -1664,17 +1686,8 @@ impl Package {
             self.parts.push((name, rels));
         }
 
-        // Relationship.
-        let rel =
-            format!("<Relationship Id=\"{rid}\" Type=\"{R_NS}/{kind}\" Target=\"{target}\"/>");
-        let new_rels = rels_xml.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1);
         self.set_part(rels_name, new_rels.into_bytes());
-
-        // Content-type override.
-        if let Some(b) = self.part("[Content_Types].xml") {
-            let ct_xml = String::from_utf8_lossy(b).into_owned();
-            let ov = format!("<Override PartName=\"/{part_name}\" ContentType=\"{ct}\"/>");
-            let new_ct = ct_xml.replacen("</Types>", &format!("{ov}</Types>"), 1);
+        if let Some(new_ct) = new_ct {
             self.set_part("[Content_Types].xml", new_ct.into_bytes());
         }
         Some((rid, part_name))
@@ -3200,13 +3213,21 @@ const HYPERLINK_REL: &str =
 /// `rels` (a Relationships part's text) with `added` relationships appended to
 /// its root, or `None` without a `Relationships` root.
 fn append_relationships(rels: &str, added: &str) -> Option<String> {
-    if let Some(close) = rels.rfind("</Relationships>") {
-        return Some(format!("{}{added}{}", &rels[..close], &rels[close..]));
+    append_to_root(rels, "Relationships", added)
+}
+
+/// `added` as the last children of the `root` element (`Relationships`,
+/// `Types`), expanding a self-closing root; `None` when there is no such
+/// root.
+fn append_to_root(xml: &str, root: &str, added: &str) -> Option<String> {
+    let close = format!("</{root}>");
+    if let Some(at) = xml.rfind(&close) {
+        return Some(format!("{}{added}{}", &xml[..at], &xml[at..]));
     }
-    let (start, el) = start_tags(rels, "Relationships").into_iter().next()?;
+    let (start, el) = start_tags(xml, root).into_iter().next()?;
     let at = start + el.len();
     el.ends_with("/>")
-        .then(|| format!("{}>{added}</Relationships>{}", &rels[..at - 2], &rels[at..]))
+        .then(|| format!("{}>{added}{close}{}", &xml[..at - 2], &xml[at..]))
 }
 
 /// A preserved `<w:hyperlink …>` element with its opening tag's `r:id` set to
@@ -5393,6 +5414,57 @@ mod tests {
             assert!(pkg.apply_text_watermark(None));
             assert!(pkg.watermarks().is_empty(), "{run}");
         }
+    }
+
+    /// A self-closing document relationships part takes the new header's
+    /// relationship (the loop that adds headers ends, with one part); a
+    /// relationships part with no Relationships root takes none, and no
+    /// part is added.
+    #[test]
+    fn text_watermark_on_odd_relationship_parts_terminates() {
+        use crate::watermark::TextWatermarkSpec;
+        const RELS: &str = "word/_rels/document.xml.rels";
+        let headers = |pkg: &Package| {
+            pkg.part_names()
+                .iter()
+                .filter(|n| n.starts_with("word/header"))
+                .count()
+        };
+        let mut pkg = hf_pkg();
+        pkg.set_part_text(
+            RELS,
+            "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"/>",
+        );
+        assert!(pkg.apply_text_watermark(Some(&TextWatermarkSpec::preset("DRAFT", true))));
+        assert_eq!(headers(&pkg), 1);
+        assert_eq!(pkg.watermarks().len(), 1, "the reference resolves");
+
+        let mut pkg = hf_pkg();
+        pkg.set_part_text(RELS, "<?xml version=\"1.0\"?><Other/>");
+        let mut sects = vec![pkg.sect_pr().to_string()];
+        assert!(
+            !pkg.set_text_watermark(Some(&TextWatermarkSpec::preset("DRAFT", true)), &mut sects)
+        );
+        assert_eq!(headers(&pkg), 0);
+        assert!(!sects[0].contains("headerReference"));
+        assert!(pkg.create_hf_part(true, "<w:p/>").is_none());
+    }
+
+    /// A self-closing `[Content_Types].xml` root takes the override.
+    #[test]
+    fn create_hf_part_expands_a_self_closing_types_root() {
+        let mut pkg = hf_pkg();
+        pkg.set_part_text(
+            "[Content_Types].xml",
+            "<?xml version=\"1.0\"?><Types xmlns=\"T\"/>",
+        );
+        let (_, name) = pkg.create_hf_part(true, "<w:p/>").unwrap();
+        let ct = pkg.part_text("[Content_Types].xml").unwrap();
+        assert!(
+            ct.contains(&format!("<Override PartName=\"/{name}\"")),
+            "{ct}"
+        );
+        assert!(ct.ends_with("</Types>"), "{ct}");
     }
 
     /// With different odd and even pages, the even-page header gets one too.
