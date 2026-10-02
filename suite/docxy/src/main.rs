@@ -7980,9 +7980,14 @@ fn live_comments(tab: &DocTab, doc: &Document) -> Vec<Comment> {
 /// as one undo step, and the comment is stamped with `identity` (name,
 /// initials) and the UTC time (#620). Its id is one past every id the tab
 /// has used, an undone or deleted one included: one still in the base
-/// package would make the save keep that comment's text on the new markers.
-/// `None` with no selection.
+/// package would make the save keep that comment's text on the new markers,
+/// and one whose markers are in the body would keep the new comment live
+/// after its own undo. `None` with no selection.
 fn add_doc_comment(tab: &mut DocTab, text: String, identity: (String, String)) -> Option<i32> {
+    let Surface::Doc(ed) = &tab.surface else {
+        return None;
+    };
+    let in_body = docxcore::inspect::comment_marker_ids(&ed.doc);
     let base: Vec<String> = tab
         .pkg
         .as_ref()
@@ -7999,6 +8004,7 @@ fn add_doc_comment(tab: &mut DocTab, text: String, identity: (String, String)) -
         .map(|c| &c.id)
         .chain(&tab.session_comment_ids)
         .chain(&base)
+        .chain(&in_body)
         .filter_map(|id| id.parse::<i32>().ok())
         .max()
         .map_or(1, |m| m + 1);

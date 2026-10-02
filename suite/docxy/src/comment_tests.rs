@@ -322,3 +322,23 @@ fn undo_of_remove_all_brings_a_new_comment_back_whole() {
     assert_eq!(markers(&doc, id), 3, "{doc}");
     assert!(comments.contains("Colour?"), "{comments}");
 }
+
+/// FIX r2 #1: Remove All, then its undo, puts a loaded comment's markers
+/// back without a record. A new comment must not take that id: its own
+/// undo would leave it "live" on the old markers, listed and saved.
+#[test]
+fn a_new_comment_never_takes_an_id_whose_markers_are_in_the_body() {
+    use crate::inspector::{InspectCategory, inspect_remove};
+    let dir = Scratch::new();
+    let (mut tab, path) = docx_tab(&dir, &commented_package(&[(1, "Loaded")]));
+    inspect_remove(&mut tab, InspectCategory::Comments).unwrap();
+    assert!(editor(&mut tab).undo(), "the Remove All");
+    let id = comment(&mut tab, "Colour?");
+    assert_ne!(id, 1);
+    assert!(editor(&mut tab).undo(), "the new comment");
+    assert!(listed(&tab).is_empty());
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    let (doc, comments) = saved(&path);
+    assert_eq!(markers(&doc, id), 0, "{doc}");
+    assert!(!comments.contains("Colour?"), "{comments}");
+}
