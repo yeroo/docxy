@@ -236,6 +236,11 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some("compare") && args.len() > 1 {
         return compare_cli(&args[1..]);
     }
+    // `docxy merge <main.docx> <data.csv> -o <out>` runs a mail merge (#628)
+    // headless and exits.
+    if args.first().map(String::as_str) == Some("merge") && args.len() > 1 {
+        return merge_cli(&args[1..]);
+    }
     let parsed = match parse_args(&args) {
         Ok(p) => p,
         Err(msg) => {
@@ -535,6 +540,93 @@ fn compare_cli(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `docxy merge <main.docx> <data.csv> -o <out.docx>`: merge the main
+/// document with every recipient in the CSV (Mailings ▸ Finish & Merge ▸ Edit
+/// Individual Documents) into a new file. Never replaces an existing file.
+fn merge_cli(args: &[String]) -> ExitCode {
+    const USAGE: &str = "usage: docxy merge <main.docx> <data.csv> -o <out.docx>";
+    let mut inputs = Vec::new();
+    let mut out = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" | "--out" => {
+                i += 1;
+                match args.get(i) {
+                    Some(path) => out = Some(path.clone()),
+                    None => {
+                        eprintln!("error: {} requires an output path\n{USAGE}", args[i - 1]);
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            path => inputs.push(path.to_string()),
+        }
+        i += 1;
+    }
+    let (Some(out), [main, data]) = (out, inputs.as_slice()) else {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    };
+    if !out.to_ascii_lowercase().ends_with(".docx") {
+        eprintln!("error: {out}: the merged document must be a .docx file");
+        return ExitCode::from(2);
+    }
+    if Path::new(&out).exists() {
+        eprintln!("error: {out} already exists (merge never overwrites a file)");
+        return ExitCode::FAILURE;
+    }
+    let pkg = match std::fs::read(main)
+        .map_err(|e| e.to_string())
+        .and_then(|b| load_package(&b).map_err(|e| e.to_string()))
+    {
+        Ok(pkg) => pkg,
+        Err(e) => {
+            eprintln!("error: cannot open {main}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let recipients = match std::fs::read(data)
+        .map_err(|e| e.to_string())
+        .and_then(|b| docxcore::merge::Recipients::parse_csv(&b))
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: cannot read the recipient list {data}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let opts = docxcore::merge::MergeOptions {
+        range: docxcore::merge::MergeRange::All,
+        doc_type: pkg.mail_merge().map(|m| m.doc_type).unwrap_or_default(),
+        map: docxcore::merge::FieldMap::auto(&recipients),
+    };
+    let merged = match docxcore::merge::merge_package(&pkg, &recipients, &opts) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: {data}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // create_atomic refuses any existing destination, so a file that appeared
+    // since the check above is refused too.
+    if let Err(e) = opccore::fsio::create_atomic(Path::new(&out), &save_package(&merged)) {
+        if e.kind() == io::ErrorKind::AlreadyExists {
+            eprintln!("error: {out} already exists (merge never overwrites a file)");
+        } else {
+            eprintln!("error: cannot write {out}: {e}");
+        }
+        return ExitCode::FAILURE;
+    }
+    let n = docxcore::merge::merge_rows(&recipients, opts.range).len();
+    println!("wrote {out} ({n} records)");
+    ExitCode::SUCCESS
+}
+
 fn print_usage() {
     eprintln!(
         "Docxy — terminal .docx & Markdown editor\n\n\
@@ -548,6 +640,8 @@ fn print_usage() {
            docxy <file> --html <out.docx.html>  export as editable HTML and exit\n  \
            docxy compare <orig.docx> <rev.docx> -o <out.docx>\n  \
                                            write a tracked-changes comparison and exit\n  \
+           docxy merge <main.docx> <data.csv> -o <out.docx>\n  \
+                                           mail-merge every CSV recipient and exit\n  \
            docxy --mcp                      run the MCP bridge to drive a live docxy\n  \
            docxy install skill              install the agent SKILL.md (self-onboarding)\n  \
            (Save As to a .md/.docx/.docx.html name converts between the formats;\n   \
