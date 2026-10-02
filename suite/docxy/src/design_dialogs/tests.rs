@@ -384,6 +384,67 @@ fn ok_on_an_untouched_dialog_keeps_each_sides_own_look() {
     assert_eq!(borders(&t, 0), None, "This section only");
 }
 
+/// From Custom with differing sides, Box, Shadow and 3-D give all four
+/// sides the look the dialog shows.
+#[test]
+fn custom_to_box_shadow_or_three_d_makes_four_alike_sides() {
+    for (setting, shadow, frame) in [
+        ("Box", false, false),
+        ("Shadow", true, false),
+        ("3-D", false, true),
+    ] {
+        let mut t = three_sections();
+        let side = |style: &str, sz, color| {
+            Some(BorderSide {
+                style: style.into(),
+                sz,
+                space: 4,
+                color,
+                shadow: false,
+                frame: false,
+            })
+        };
+        let pb = PageBorders {
+            sides: [
+                side("double", 10, Some(0xFF0000)),
+                None,
+                side("dotted", 4, None),
+                None,
+            ],
+            ..Default::default()
+        };
+        ed_mut(&mut t).edit_sections(&[1], |raw| PageBorders::apply(Some(&pb), raw));
+        open(&mut t, page_borders_dialog);
+        assert_eq!(control(&t, "setting").text(), "Custom");
+        let shown = (
+            control(&t, "style").text(),
+            control(&t, "width").text(),
+            control(&t, "color").text(),
+        );
+        assert_eq!(shown.0, "Double", "pre-filled from the first side");
+        set(&mut t, "setting", s(setting));
+        click(&mut t, "OK").unwrap();
+        let got = borders(&t, 1).unwrap();
+        let sides: Vec<&BorderSide> = got.sides.iter().flatten().collect();
+        assert_eq!(sides.len(), 4, "{setting}");
+        for side in &sides {
+            assert_eq!(
+                (
+                    side.style.as_str(),
+                    side.sz,
+                    side.color,
+                    side.shadow,
+                    side.frame
+                ),
+                ("double", 12, Some(0xFF0000), shadow, frame),
+                "{setting}: the displayed Double, 1 1/2 pt, Red"
+            );
+        }
+        open(&mut t, page_borders_dialog);
+        assert_eq!(control(&t, "setting").text(), setting);
+    }
+}
+
 /// An Art border (not in the style list) opens as itself.
 #[test]
 fn an_art_border_prefills_without_losing_its_name() {

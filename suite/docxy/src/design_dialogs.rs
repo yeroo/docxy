@@ -641,7 +641,11 @@ fn page_borders_of(d: &Dialog, ed: &Editor) -> Result<(Option<PageBorders>, Vec<
             .filter(|v| *v <= 31)
             .ok_or_else(|| format!("{label} margin must be 0 to 31 pt; got '{raw}'"))?;
         let base = orig.as_ref().and_then(|p| p.sides[k].as_ref());
-        let keep = |control: &str| base.filter(|_| !d.changed(control));
+        // A side keeps a value of its own unless its control changed, or the
+        // Setting moved to Box, Shadow or 3-D, which give all four the look
+        // the dialog shows.
+        let uniform = d.changed("setting") && setting != CUSTOM;
+        let keep = |control: &str| base.filter(|_| !d.changed(control) && !uniform);
         sides[k] = Some(BorderSide {
             style: keep("style").map_or_else(|| style.clone(), |b| b.style.clone()),
             sz: keep("width").map_or(sz, |b| b.sz),
