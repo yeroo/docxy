@@ -2618,6 +2618,11 @@ pub fn dispatch(
     // or not a frame ran in between. The verb that asks for one replies
     // before it runs, with `app_state` "Busy".
     app.flush_project_passes(cx);
+    // A converted tab restored from the session converts before a verb can
+    // reach its placeholder (#633), as `select_tab` does for a person.
+    if let Some(t) = app.tabs.get_mut(app.active) {
+        crate::finish_pending_conversion(t);
+    }
     // A verb that stands for a press outside an open menu closes it first,
     // as that press would (the backdrop closes it, then the press goes on).
     if closes_menu(verb, args) && app.close_menu() {

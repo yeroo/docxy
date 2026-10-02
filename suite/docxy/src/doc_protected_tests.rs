@@ -178,3 +178,19 @@ fn a_downloaded_document_opens_protected_unless_trusted() {
     let tab = tab_from_path_mode(&local, OpenMode::Normal, &TrustStore::default()).unwrap();
     assert!(!tab.access.protected);
 }
+
+/// FIX r5 m2: the rollback's reload is the open's own dispatch, so a 0-byte
+/// document (a new one, as Explorer makes) comes back as one, not as a file
+/// that failed to load.
+#[test]
+fn rolling_back_an_empty_document_keeps_it_loadable() {
+    let dir = Scratch::new();
+    let src = dir.path("new.docx");
+    std::fs::write(&src, b"").unwrap();
+    let mut tab = protected(&src);
+    assert!(!tab.load_failed, "{}", tab.status);
+    leak_edit(&mut tab, "x");
+    tab.mark_dirty();
+    assert!(!tab.load_failed, "{}", tab.status);
+    assert!(!tab.dirty);
+}

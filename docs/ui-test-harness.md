@@ -788,8 +788,10 @@ file that is already open without asking unless `reopen` is `"ask"` (see
   dead instance; a child that cannot start says `cannot start the
   conversion: <reason>`. `DOCXY_CONVERT_IN_PROCESS=1` converts in process
   instead; either way the tab is built from the same converted `.docx`
-  (it has that package). A clean converted tab restored from the session
-  shows `not converted yet …` until its tab is first in front, and a
+  (it has that package). A converted tab restored from the session with no
+  readable sidecar (missing or damaged) shows `not converted yet …` until
+  its tab is first in front (it converts when selected, or before the next
+  harness verb), and a
   Protected View rollback restores what the tab was converted to, never
   converting again.
   `uiharness/tests/open_converted.rs` (desktop-only, `--ignored`) opens the

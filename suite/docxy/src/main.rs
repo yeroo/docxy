@@ -4451,16 +4451,10 @@ fn loaded_from_converted_docx(docx: Vec<u8>, kind: open_mode::Converted) -> Load
     l
 }
 
-/// A plain document's file loaded again, never converted (#633):
-/// Markdown, a docxy bundle, or a Word package, which may fail to load.
-/// What Protected View's rollback reads, inside a frame.
+/// A plain document's file loaded again, never converted (#633): what
+/// Protected View's rollback reads, inside a frame ([`load_doc_file`]).
 fn reload_without_converting(path: &std::path::Path) -> Loaded {
-    match std::fs::read(path) {
-        Ok(bytes) if is_markdown_path(path) => markdown_from_bytes(&bytes),
-        Ok(bytes) if htmlbundle::is_bundle(&bytes) => bundle_from_path(path),
-        Ok(bytes) => load_bytes(&bytes),
-        Err(e) => Loaded::empty(format!("read error: {e}")),
-    }
+    load_doc_file(path, false)
 }
 
 /// Convert a converted tab restored from the session (#633), now that it is
@@ -4474,6 +4468,9 @@ fn finish_pending_conversion(tab: &mut DocTab) {
         return;
     };
     let l = load_doc_for_tab(&path, tab.access.converted);
+    // The whole document is replaced: nothing of the placeholder is kept.
+    tab.dirty = false;
+    tab.hf_edit = None;
     tab.surface = Surface::Doc(Editor::new(l.doc));
     tab.comments = l.comments;
     tab.notes = l.notes;
@@ -4507,6 +4504,15 @@ const DOC_CFB_UNSUPPORTED: &str = "load error: a Word 97-2003 .doc or an encrypt
 /// bytes, Markdown by its extension. RTF, HTML and PDF open converted; a
 /// Word package that will not load opens as its recovered text.
 fn doc_from_path(path: &PathBuf) -> Loaded {
+    load_doc_file(path, true)
+}
+
+/// [`doc_from_path`]'s one dispatch. Without `convert` (Protected View's
+/// rollback, inside a frame) no conversion runs: a file that would need one
+/// (RTF, HTML, PDF, a package that will not load) is a load error instead,
+/// and every other case (Markdown, empty file, OLE, bundle, Word) is the
+/// same as an open's.
+fn load_doc_file(path: &std::path::Path, convert: bool) -> Loaded {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) => return Loaded::empty(format!("read error: {e}")),
@@ -4530,6 +4536,10 @@ fn doc_from_path(path: &PathBuf) -> Loaded {
         .unwrap_or_default();
     match docxcore::import::sniff(&bytes, &ext) {
         Format::Html if htmlbundle::is_bundle(&bytes) => bundle_from_path(path),
+        Format::Html | Format::Rtf | Format::Pdf if !convert => {
+            Loaded::empty("load error: the file now needs converting; open it again")
+        }
+        Format::Docx | Format::Unknown if !convert => load_bytes(&bytes),
         Format::Html => convert_doc(path, &bytes, convert_child::What::Html)
             .unwrap_or_else(|| Loaded::empty("load error: the HTML file holds no text")),
         Format::Rtf => convert_doc(path, &bytes, convert_child::What::Rtf)
@@ -4553,8 +4563,11 @@ fn recovered_text_from_path(path: &std::path::Path) -> Loaded {
 }
 
 /// Load a document the way its tab was opened (#633): converted tabs come
-/// back converted, a Recover Text tab as recovered text. Open, Protected
-/// View's rollback and session restore all go through here.
+/// back converted, a Recover Text tab as recovered text. Open, session
+/// restore of a plain tab, and a restored converted tab's first activation
+/// ([`finish_pending_conversion`]) go through here; Protected View's
+/// rollback never does (it restores `converted_docx`, or calls
+/// [`reload_without_converting`]).
 fn load_doc_for_tab(path: &PathBuf, converted: Option<open_mode::Converted>) -> Loaded {
     match converted {
         Some(open_mode::Converted::RecoveredText) => recovered_text_from_path(path),
@@ -7326,12 +7339,14 @@ fn protected_rollback(tab: &mut DocTab) {
     // A document (#633) is restored as it was opened: converted or plain.
     if matches!(tab.surface, Surface::Doc(_)) {
         // A converted tab restores the document it was converted to, never
-        // converting again (no child process inside a frame); a tab not
-        // converted yet has nothing to roll back.
+        // converting again (no child process inside a frame).
         let reloaded = match (tab.access.converted, tab.converted_docx.clone()) {
             (Some(kind), Some(docx)) => Some(loaded_from_converted_docx(docx.to_vec(), kind)),
-            (Some(_), None) => None,
-            (None, _) => tab.path.clone().map(|p| reload_without_converting(&p)),
+            // Still a placeholder: nothing to roll back.
+            (Some(_), None) if tab.pending_conversion => None,
+            // Converted once but no bytes kept (its file no longer converted
+            // when it was finished): reloaded, never converted.
+            (Some(_), None) | (None, _) => tab.path.clone().map(|p| reload_without_converting(&p)),
         };
         if let Some(l) = reloaded {
             tab.surface = Surface::Doc(Editor::new(l.doc));
@@ -13898,6 +13913,9 @@ impl Docxy {
         self.close_menu();
         if i < self.tabs.len() {
             self.active = i;
+            // A converted tab restored from the session converts as it comes
+            // in front, before any input can reach its placeholder (#633).
+            finish_pending_conversion(&mut self.tabs[i]);
             self.tab_more_open = false;
             self.bs_info_status = None;
             // Same reason as `select_sheet`: these all index the document we

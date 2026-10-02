@@ -434,8 +434,9 @@ fn a_converted_tabs_rollback_never_converts_again() {
     assert_eq!(tab.access.converted, Some(Converted::Rtf));
 }
 
-/// FIX r4 M2: a clean converted tab restored from the session waits to be
-/// converted; meanwhile it keeps no sidecar and refuses every save.
+/// FIX r4 M2: a converted tab restored from the session with no readable
+/// sidecar (missing or damaged) waits to be converted; meanwhile it keeps
+/// no sidecar and refuses every save.
 #[test]
 fn a_restored_converted_tab_waits_and_saves_nothing() {
     let dir = Scratch::new();
@@ -460,4 +461,57 @@ fn a_restored_converted_tab_waits_and_saves_nothing() {
     finish_pending_conversion(&mut back);
     assert_eq!(texts(&back), ["Letter", "Dear reader, caf\u{e9}."]);
     assert!(back.converted_docx.is_some());
+}
+
+/// FIX r5 m1: converting a waiting tab replaces its whole document: what
+/// reached the placeholder is dropped with it, the tab is clean, and no
+/// header/footer editor of the placeholder survives.
+#[test]
+fn finishing_a_pending_conversion_replaces_the_placeholder_cleanly() {
+    let dir = Scratch::new();
+    let src = write(&dir, "letter.rtf", RTF);
+    let hot = dir.path("hot");
+    std::fs::create_dir_all(&hot).unwrap();
+    let mut p = persist_tab(&hot, 0, &tab_from_path(&src));
+    p.hot = None;
+    let mut back = restore_tab(&p);
+    assert!(back.pending_conversion);
+    let Surface::Doc(ed) = &mut back.surface else {
+        panic!()
+    };
+    ed.insert_str("typed into the placeholder");
+    back.dirty = true;
+    finish_pending_conversion(&mut back);
+    assert!(!back.dirty);
+    assert!(back.hf_edit.is_none());
+    assert_eq!(texts(&back), ["Letter", "Dear reader, caf\u{e9}."]);
+}
+
+/// FIX r5 m4: a converted tab whose file no longer converted when it was
+/// finished keeps its converted mark but no converted bytes; a rollback
+/// then reloads the file (never converting), so a leaked edit is undone.
+#[test]
+fn a_converted_tab_without_kept_bytes_rolls_back_from_its_file() {
+    let dir = Scratch::new();
+    let src = write(&dir, "letter.rtf", RTF);
+    let hot = dir.path("hot");
+    std::fs::create_dir_all(&hot).unwrap();
+    let mut p = persist_tab(&hot, 0, &tab_from_path(&src));
+    p.hot = None;
+    let mut back = restore_tab(&p);
+    // The file was replaced by a Word document meanwhile.
+    let docx = long_docx(&dir, "real.docx", 2);
+    std::fs::copy(&docx, &src).unwrap();
+    finish_pending_conversion(&mut back);
+    assert_eq!(back.access.converted, Some(Converted::Rtf));
+    assert!(back.converted_docx.is_none());
+    let before = texts(&back);
+    back.access.protected = true;
+    let Surface::Doc(ed) = &mut back.surface else {
+        panic!()
+    };
+    ed.insert_str("LEAKED ");
+    back.mark_dirty();
+    assert!(!back.dirty);
+    assert_eq!(texts(&back), before);
 }
