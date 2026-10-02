@@ -84,9 +84,11 @@ fn the_tab_has_words_groups_between_layout_and_review() {
     let names: Vec<&str> = ribbon_for(Kind::Docx).tabs.iter().map(|t| t.name).collect();
     assert_eq!(
         names,
-        ["Home", "Insert", "Layout", "Mailings", "Review", "View"]
+        [
+            "Home", "Insert", "Design", "Layout", "Mailings", "Review", "View"
+        ]
     );
-    assert_eq!(ribbon_tab_set(Kind::Docx)[4].1, "Mailings");
+    assert_eq!(ribbon_tab_set(Kind::Docx)[5].1, "Mailings");
     for kind in [Kind::Xlsx, Kind::Project] {
         assert!(ribbon_for(kind).tabs.iter().all(|t| t.name != "Mailings"));
         assert!(ribbon_tab_set(kind).iter().all(|t| t.1 != "Mailings"));

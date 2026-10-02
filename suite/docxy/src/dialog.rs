@@ -89,9 +89,22 @@ pub(crate) enum DialogOwner {
     },
     /// A mail-merge report (Check for Errors' result): OK closes it.
     MailReport,
+    /// The Design tab's dialogs (#651), applied by `design_dialogs`: Page
+    /// Color's More Colors and Fill Effects, Custom Watermark, and Page
+    /// Borders.
+    DesignMoreColors,
+    DesignFillEffects,
+    DesignWatermark,
+    DesignPageBorders,
+    /// Page Borders' Options...: its OK writes back into Page Borders
+    /// ([`ChildDialog::PageBorderOptions`]), never into the document.
+    DesignBorderOptions,
     /// A dialog the model tests build; the app never applies one.
     #[cfg(test)]
     Test,
+    /// A test child whose OK writes back into its parent.
+    #[cfg(test)]
+    TestChild,
 }
 
 /// A dialog a button opens on top of its own, built from the parent when the
@@ -99,15 +112,54 @@ pub(crate) enum DialogOwner {
 /// stay comparable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChildDialog {
+    /// Page Borders' Border and Shading Options (#651).
+    PageBorderOptions,
     #[cfg(test)]
     Test,
+    #[cfg(test)]
+    TestWriteBack,
 }
 
 impl ChildDialog {
-    fn build(self, _parent: &Dialog) -> Dialog {
+    fn build(self, parent: &Dialog) -> Dialog {
         match self {
+            Self::PageBorderOptions => crate::design_dialogs::border_options_dialog(parent),
             #[cfg(test)]
-            Self::Test => tests_support::child(_parent),
+            Self::Test => tests_support::child(parent),
+            #[cfg(test)]
+            Self::TestWriteBack => tests_support::write_back_child(parent),
+        }
+    }
+
+    /// The child an owner belongs to when its OK hands the child's values
+    /// back to the dialog under it rather than to an owner: a sub-dialog of
+    /// options the parent applies with its own OK.
+    fn writing_back(owner: DialogOwner) -> Option<ChildDialog> {
+        match owner {
+            DialogOwner::DesignBorderOptions => Some(Self::PageBorderOptions),
+            #[cfg(test)]
+            DialogOwner::TestChild => Some(Self::TestWriteBack),
+            _ => None,
+        }
+    }
+
+    /// Copy an accepted child's values into its parent.
+    fn write_back(self, child: &Dialog, parent: &mut Dialog) {
+        match self {
+            Self::PageBorderOptions => {
+                crate::design_dialogs::border_options_write_back(child, parent)
+            }
+            #[cfg(test)]
+            Self::Test => {}
+            #[cfg(test)]
+            Self::TestWriteBack => {
+                if let (Some(v), Some(c)) = (
+                    child.value("note").cloned(),
+                    parent.controls.iter_mut().find(|c| c.name == "name"),
+                ) {
+                    c.value = v;
+                }
+            }
         }
     }
 }
@@ -888,6 +940,7 @@ impl DialogStack {
         button: &str,
         apply: impl FnOnce(&Dialog) -> Result<(), String>,
     ) -> Result<(), String> {
+        let depth = self.0.len();
         let top = self.top_mut()?;
         let role = top.buttons[top.button_index(button)?].role;
         match role {
@@ -897,6 +950,13 @@ impl DialogStack {
             ButtonRole::Open(child) => {
                 let child = child.build(top);
                 self.0.push(child);
+            }
+            ButtonRole::Accept if depth > 1 && ChildDialog::writing_back(top.owner).is_some() => {
+                let child = self.0.pop().expect("the top dialog");
+                let parent = self.0.last_mut().expect("a parent under it");
+                if let Some(kind) = ChildDialog::writing_back(child.owner) {
+                    kind.write_back(&child, parent);
+                }
             }
             ButtonRole::Accept | ButtonRole::Apply => {
                 apply(top)?;
@@ -930,6 +990,14 @@ pub(crate) const NONE_OPEN: &str = "no dialog is open";
 #[cfg(test)]
 mod tests_support {
     use super::*;
+
+    /// A child whose OK writes its note into the parent's Name field.
+    pub(super) fn write_back_child(parent: &Dialog) -> Dialog {
+        Dialog {
+            owner: DialogOwner::TestChild,
+            ..child(parent)
+        }
+    }
 
     /// A child that shows the parent's title, so a test can see it was built
     /// from the parent it was opened over.

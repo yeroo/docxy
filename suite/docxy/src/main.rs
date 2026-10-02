@@ -25,6 +25,8 @@ compile_error!(
 mod close;
 mod control;
 mod crashlog;
+mod design_dialogs;
+mod design_tab;
 mod dialog;
 mod dialog_host;
 mod harness;
@@ -332,6 +334,8 @@ enum RibbonTab {
     Project,
     Home,
     Insert,
+    /// Word's Design tab (#651); documents only.
+    Design,
     /// Word's page Layout tab (#649); documents only.
     Layout,
     /// Word's Mailings tab (#628); documents only.
@@ -18228,6 +18232,8 @@ enum Act {
     /// A Header & Footer command (#641, #650), on the Insert tab's Header,
     /// Footer and Page Number menus and the contextual tab.
     Hf(hf_tab::HfAct),
+    /// A Design tab command (#651).
+    Design(design_tab::DesignAct),
     /// A page Layout tab command (#649).
     Layout(layout_tab::LayoutAct),
     /// A Mailings tab command (#628).
@@ -18528,6 +18534,7 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                 ),
             ],
         ),
+        design_tab::design_tab(),
         layout_tab::layout_tab(),
         mailings_tab::mailings_tab(),
         // Review: a large New Comment + a small pane-toggle column, then Editing.
@@ -18627,13 +18634,13 @@ fn ribbon_for(kind: Kind) -> rs::Ribbon<Act> {
     match kind {
         Kind::Project => project_ribbon(),
         Kind::Docx => docxy_ribbon(),
-        // The same tabs as `ribbon_tab_set` gives a workbook: no Layout and
-        // no Mailings.
+        // The same tabs as `ribbon_tab_set` gives a workbook: no Design, no
+        // Layout and no Mailings.
         _ => {
             let mut ribbon = docxy_ribbon();
             ribbon
                 .tabs
-                .retain(|t| t.name != "Layout" && t.name != "Mailings");
+                .retain(|t| !matches!(t.name, "Design" | "Layout" | "Mailings"));
             ribbon
         }
     }
@@ -18655,6 +18662,7 @@ fn ribbon_tab_set(kind: Kind) -> &'static [(Option<RibbonTab>, &'static str, &'s
             (None, "File", "F"),
             (Some(Home), "Home", "H"),
             (Some(Insert), "Insert", "N"),
+            (Some(Design), "Design", "G"),
             (Some(Layout), "Layout", "P"),
             (Some(Mailings), "Mailings", "M"),
             (Some(Review), "Review", "R"),
@@ -18706,6 +18714,7 @@ fn ribbon_tab_name(tab: RibbonTab) -> &'static str {
     match tab {
         RibbonTab::Home => "Home",
         RibbonTab::Insert => "Insert",
+        RibbonTab::Design => "Design",
         RibbonTab::Layout => "Layout",
         RibbonTab::Mailings => "Mailings",
         RibbonTab::Review => "Review",
@@ -20981,6 +20990,11 @@ impl Docxy {
                         (Some(m), Act::Layout(_)) => {
                             layout_tab::menu_items(m, |a| self.act_active(a))
                         }
+                        (_, Act::Design(_)) if design_tab::menu_of(cmd.id).is_some() => {
+                            design_tab::menu_items(design_tab::menu_of(cmd.id)?, |a| {
+                                self.act_active(a)
+                            })
+                        }
                         (_, Act::Mail(_)) if mailings_tab::menu_of(cmd.id).is_some() => {
                             let tab = self.tabs.get(self.active)?;
                             mailings_tab::menu_items(&tab.mail, mailings_tab::menu_of(cmd.id)?)
@@ -21328,6 +21342,7 @@ impl Docxy {
             InsertEquation => self.toggle_picker(PickKind::Equation, window, cx),
             LineSpacing => self.toggle_picker(PickKind::LineSpacing, window, cx),
             Hf(act) => self.hf_act(act, window, cx),
+            Design(act) => self.design_act(act, window, cx),
             Layout(act) => self.layout_act(act, window, cx),
             Mail(act) => self.mail_act(act, window, cx),
             Table(act) => self.table_act(act, window, cx),
@@ -21401,8 +21416,8 @@ impl Docxy {
                 | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide
                 | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField
                 | PageBreak | ToggleNotes | InsertTable | InsertSymbol | InsertEquation
-                | LineSpacing | Hf(_) | Layout(_) | Mail(_) | Table(_) | PrintLayout
-                | ToggleRuler => {}
+                | LineSpacing | Hf(_) | Design(_) | Layout(_) | Mail(_) | Table(_)
+                | PrintLayout | ToggleRuler => {}
             }),
         }
     }
@@ -23240,6 +23255,9 @@ impl Docxy {
     /// table command, the edited story's state (Merge Cells needs a cell
     /// range, Convert Text to Table a selection outside a table).
     pub(crate) fn act_enabled_now(&self, act: Act) -> bool {
+        if let Act::Design(a) = act {
+            return design_tab::design_enabled(self.tabs.get(self.active), a);
+        }
         if let Act::Mail(a) = act {
             return self
                 .tabs
@@ -23291,6 +23309,10 @@ impl Docxy {
                 .tabs
                 .get(self.active)
                 .is_some_and(|t| layout_tab::layout_checked(t, act)),
+            Design(act) => self
+                .tabs
+                .get(self.active)
+                .is_some_and(|t| design_tab::design_checked(t, act)),
             Hf(act) => self
                 .tabs
                 .get(self.active)
@@ -24580,9 +24602,11 @@ impl Render for Docxy {
                     };
                     let body = &editor.doc.body;
                     if self.page_view {
-                        // Print Layout: split the body into discrete white page sheets
-                        // (section margins), stacked on a grey canvas.
+                        // Print Layout: split the body into discrete page sheets
+                        // (section margins), stacked on a grey canvas. A sheet is
+                        // white, or the document's page colour (#651).
                         let geom = final_page_geom(tab);
+                        let sheet = hsla_u(design_tab::page_sheet_color(tab));
                         let zoom = self.zoom;
                         let tw = move |t: i32| px(zoom * (t.max(0) as f32) / 15.0); // twips → px @ ~96dpi, zoomed
                         let canvas = if self.applied == Some(ThemeMode::Dark) {
@@ -24764,7 +24788,7 @@ impl Render for Docxy {
                                 let page_base = v_flex()
                                     .w(tw(geom.w))
                                     .min_h(tw(geom.h))
-                                    .bg(hsla_u(0xffffff))
+                                    .bg(sheet)
                                     .text_color(doc_pal.fg)
                                     .border_1()
                                     .border_color(hsla_u(0xd0d0d0));
