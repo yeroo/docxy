@@ -3442,7 +3442,10 @@ mod tests {
 
         // An existing value is replaced in place; other compat settings stay.
         let mut pkg = with(&format!(
-            "<w:settings {W}><w:compat><w:compatSetting w:name=\"compatibilityMode\"              w:uri=\"http://schemas.microsoft.com/office/word\" w:val=\"14\"/>             <w:compatSetting w:name=\"overrideTableStyleFontSizeAndJustification\"              w:uri=\"http://schemas.microsoft.com/office/word\" w:val=\"1\"/></w:compat></w:settings>"
+            "<w:settings {W}><w:compat><w:compatSetting w:name=\"compatibilityMode\" \
+             w:uri=\"http://schemas.microsoft.com/office/word\" w:val=\"14\"/>\
+             <w:compatSetting w:name=\"overrideTableStyleFontSizeAndJustification\" \
+             w:uri=\"http://schemas.microsoft.com/office/word\" w:val=\"1\"/></w:compat></w:settings>"
         ));
         assert_eq!(pkg.compatibility_mode(), Some(14));
         pkg.set_compatibility_mode(15);

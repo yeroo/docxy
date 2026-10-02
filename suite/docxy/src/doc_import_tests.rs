@@ -3,8 +3,8 @@
 //! original, Convert, and the session round trip.
 
 use crate::doc_import::{
-    self, BINARY_TARGET_REFUSED, COMPAT_SUFFIX, DocImport, IMPORTED_STATUS, convert_tab,
-    is_binary_doc_path, save_name,
+    self, BINARY_TARGET_REFUSED, COMPAT_SUFFIX, DocImport, IMPORTED_STATUS, IN_PLACE_REFUSED,
+    SOURCE_TARGET_REFUSED, convert_tab, is_binary_doc_path, save_dir, save_name,
 };
 use crate::open_mode_tests::Scratch;
 use crate::{
@@ -162,7 +162,7 @@ fn save_never_writes_the_binary_original() {
 
     // In place, and Save As to any .doc or .dot (in any case), refuse.
     assert!(!save_doc_tab(&mut tab, None));
-    assert!(tab.status.contains("use Save As"), "{}", tab.status);
+    assert_eq!(tab.status.as_ref(), IN_PLACE_REFUSED);
     for name in ["Report.doc", "Other.DOC", "Template.dot"] {
         let target = dir.path(name);
         assert!(!save_doc_tab(&mut tab, Some(target.clone())), "{name}");
@@ -270,7 +270,64 @@ fn a_renamed_doc_converted_still_asks_before_saving() {
     );
     assert!(!save_doc_tab(&mut tab, None));
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    assert_eq!(save_name(&tab), "renamed.docx");
+    // The suggestion is never the original's own name.
+    assert_eq!(save_name(&tab), "renamed (converted).docx");
+    assert_eq!(save_dir(&tab), path.parent());
+}
+
+/// FIX r1 M3: Save As (or the harness's `save-as` with overwrite) that
+/// picks the binary original itself is refused, whatever its extension or
+/// the case it is typed in, and its bytes stay; another name saves.
+#[test]
+fn save_as_onto_the_binary_original_is_refused() {
+    let dir = Scratch::new();
+    let path = write_doc(&dir, "renamed.docx");
+    let before = std::fs::read(&path).unwrap();
+    let mut tab = tab_from_path(&path);
+    edit(&mut tab);
+    assert!(!save_doc_tab(&mut tab, Some(path.clone())));
+    assert_eq!(tab.status.as_ref(), SOURCE_TARGET_REFUSED);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    // Windows names files case-insensitively: the same file, typed otherwise.
+    if cfg!(windows) {
+        let shouted = dir.path("RENAMED.DOCX");
+        assert!(!save_doc_tab(&mut tab, Some(shouted)));
+        assert_eq!(tab.status.as_ref(), SOURCE_TARGET_REFUSED);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+    // A relative spelling of it resolves to the same file too.
+    let dotted = dir.path(".").join("renamed.docx");
+    assert!(!save_doc_tab(&mut tab, Some(dotted)));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(tab.dirty && tab.import.binary_source);
+
+    let other = dir.path(&save_name(&tab));
+    assert!(
+        save_doc_tab(&mut tab, Some(other.clone())),
+        "{}",
+        tab.status
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(!tab.import.binary_source);
+    // Rebound to the .docx it wrote, the tab saves there in place.
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    assert_eq!(saved_mode(&other), Some(11));
+}
+
+/// The Save As dialog for a `.doc` opens beside it, suggesting `<stem>.docx`;
+/// a document that isn't an import keeps the dialog's own folder.
+#[test]
+fn save_as_suggests_the_docx_beside_the_original() {
+    let dir = Scratch::new();
+    let path = write_doc(&dir, "Report.doc");
+    let tab = tab_from_path(&path);
+    assert_eq!(save_name(&tab), "Report.docx");
+    assert_eq!(save_dir(&tab), path.parent());
+    let target = dir.path("Report.docx");
+    let mut tab = tab;
+    assert!(save_doc_tab(&mut tab, Some(target)), "{}", tab.status);
+    assert_eq!(save_dir(&tab), None);
+    assert_eq!(save_name(&tab), "Report.docx");
 }
 
 /// A dirty imported tab restores from its `.docx` sidecar, which says

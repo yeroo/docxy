@@ -13810,13 +13810,8 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
     }
     // Nothing writes a Word 97-2003 file, or over the one a document was
     // imported from (#634): those bytes would be a .docx under its name.
-    if doc_import::refuses_target(tab, target.as_deref()) {
-        tab.status = if target.is_none() && tab.import.binary_source {
-            "this document was imported from a Word 97-2003 file: use Save As to save it as .docx"
-        } else {
-            doc_import::BINARY_TARGET_REFUSED
-        }
-        .into();
+    if let Some(refusal) = doc_import::save_refusal(tab, target.as_deref()) {
+        tab.status = refusal.into();
         return false;
     }
     let (path, markdown) = match target {
@@ -14130,6 +14125,11 @@ impl Docxy {
             .is_some_and(doc_html_save_allowed)
         {
             dialog = dialog.add_filter("Editable HTML (*.docx.html)", &["html"]);
+        }
+        // An imported document's .docx goes beside its Word 97-2003 original
+        // (#634); the save refuses the original itself, whatever its name.
+        if let Some(dir) = self.tabs.get(self.active).and_then(doc_import::save_dir) {
+            dialog = dialog.set_directory(dir);
         }
         // The name is written as picked (the dialog already asked about
         // overwriting it): any .html name saves a bundle, found by its content
@@ -16286,7 +16286,8 @@ fn doc_html_save_allowed(tab: &DocTab) -> bool {
 /// Where a document Save goes, decided before anything is written.
 #[derive(Debug, PartialEq, Eq)]
 enum DocSaveTarget {
-    /// The tab has a path: overwrite it.
+    /// The tab has a path, which is neither a `.doc`/`.dot` nor the Word
+    /// 97-2003 original it was imported from (#634): overwrite it.
     InPlace,
     /// Never saved, or imported from a Word 97-2003 file: ask with the Save
     /// As dialog.
@@ -23584,15 +23585,11 @@ impl Docxy {
                 h_flex()
                     .gap_4()
                     .items_center()
-                    .child(
-                        div()
-                            .w(px(420.))
-                            .text_size(px(12.))
-                            .text_color(dim)
-                            .child(
-                                "This document was opened from a Word 97-2003 file. Convert                                  it to the newest file format; saving writes a .docx and                                  leaves the original file as it is.",
-                            ),
-                    )
+                    .child(div().w(px(420.)).text_size(px(12.)).text_color(dim).child(
+                        "This document was opened from a Word 97-2003 file. Convert \
+                                 it to the newest file format; saving writes a .docx and \
+                                 leaves the original file as it is.",
+                    ))
                     .child(
                         div()
                             .id("bs-info-convert")

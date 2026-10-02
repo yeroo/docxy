@@ -7,8 +7,8 @@
 //! apart:
 //!
 //! - the file it is bound to is binary ([`DocImport::binary_source`]), so
-//!   Save never writes it: it asks for a `.docx` beside it, and a save to a
-//!   `.doc` is refused outright;
+//!   no save writes it: Save asks for a `.docx`, offering one beside it,
+//!   and a save to that file or to any `.doc` is refused outright;
 //! - the document is in Compatibility Mode ([`DocImport::compat`]): the tab
 //!   says `[Compatibility Mode]`, a save keeps `compatibilityMode` 11, and
 //!   File > Info > Convert raises it to 15.
@@ -57,18 +57,48 @@ pub(super) fn is_binary_doc_path(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("doc") || e.eq_ignore_ascii_case("dot"))
 }
 
-/// Whether a save of `tab` to `target` (`None`: its own file) must not
-/// write: the target is a `.doc`/`.dot`, or, in place, the tab's file is
-/// the binary original.
-pub(super) fn refuses_target(tab: &DocTab, target: Option<&Path>) -> bool {
-    match target.or(tab.path.as_deref()) {
-        Some(path) => is_binary_doc_path(path) || (target.is_none() && tab.import.binary_source),
-        None => false,
+/// The status of a Save As refused because its target is the binary file the
+/// document was imported from (a `.doc` renamed `.docx`, say).
+pub(super) const SOURCE_TARGET_REFUSED: &str = "this is the Word 97-2003 file the document was imported from: save the .docx under another name";
+
+/// The status of a Save refused because the tab's own file is the binary
+/// original.
+pub(super) const IN_PLACE_REFUSED: &str =
+    "this document was imported from a Word 97-2003 file: use Save As to save it as .docx";
+
+/// Why a save of `tab` to `target` (`None`: its own file) must not write,
+/// or `None` when it may: the target is a `.doc`/`.dot`, or it is the
+/// binary original the tab was imported from, in place or picked again
+/// (compared as the file system resolves it, so in any case on Windows).
+pub(super) fn save_refusal(tab: &DocTab, target: Option<&Path>) -> Option<&'static str> {
+    let path = target.or(tab.path.as_deref())?;
+    if target.is_none() && tab.import.binary_source {
+        return Some(IN_PLACE_REFUSED);
+    }
+    if is_binary_doc_path(path) {
+        return Some(BINARY_TARGET_REFUSED);
+    }
+    match (target, tab.path.as_deref()) {
+        (Some(target), Some(source)) if tab.import.binary_source && same_file(target, source) => {
+            Some(SOURCE_TARGET_REFUSED)
+        }
+        _ => None,
     }
 }
 
+/// Whether two paths name one file: canonically, and on Windows (whose file
+/// names ignore case) also when only the case differs.
+fn same_file(a: &Path, b: &Path) -> bool {
+    let (a, b) = (super::canonical(a), super::canonical(b));
+    a == b
+        || (cfg!(windows)
+            && a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase())
+}
+
 /// The name the Save As dialog suggests: an imported document's own stem
-/// as `.docx` (Word's Save As on a `.doc`), anything else its title.
+/// as `.docx` (Word's Save As on a `.doc`), anything else its title. When
+/// that would be the binary original's own name (a `.doc` renamed `.docx`),
+/// `<stem> (converted).docx`, so the suggestion never points at it.
 pub(super) fn save_name(tab: &DocTab) -> String {
     let binary = tab.import.binary_source || tab.path.as_deref().is_some_and(is_binary_doc_path);
     if !binary {
@@ -79,7 +109,24 @@ pub(super) fn save_name(tab: &DocTab) -> String {
         .as_deref()
         .unwrap_or_else(|| Path::new(tab.title.as_ref()));
     let stem = name.file_stem().unwrap_or_default().to_string_lossy();
-    format!("{stem}.docx")
+    let docx = format!("{stem}.docx");
+    let own = name
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(&docx));
+    if own {
+        format!("{stem} (converted).docx")
+    } else {
+        docx
+    }
+}
+
+/// The folder the Save As dialog opens in for an imported document: its
+/// original's, so the `.docx` goes beside it. `None` for anything else.
+pub(super) fn save_dir(tab: &DocTab) -> Option<&Path> {
+    tab.import
+        .binary_source
+        .then_some(tab.path.as_deref()?.parent()?)
+        .filter(|dir| !dir.as_os_str().is_empty())
 }
 
 /// File > Info > Convert: take the document out of Compatibility Mode
