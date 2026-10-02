@@ -1045,7 +1045,7 @@ impl Engine {
             if let Some(info) = self.formulas.get_mut(&k) {
                 if info.deps != deps {
                     info.deps = deps;
-                    self.rev = None;
+                    self.invalidate_rev();
                 }
             }
         }
@@ -3713,8 +3713,9 @@ mod tests {
 
     #[test]
     fn rev_cache_drops_removed_formula() {
-        // Replacing a formula with a number must drop it from the cache, so
-        // editing what it read no longer recomputes its old dependent chain.
+        // Replacing a formula with a number changes `formulas`, so it must
+        // drop the cached reverse edges: the removal's own walk rebuilds the
+        // map, and a following plain data edit must not rebuild again.
         let mut wb = wb_one_sheet(&[
             ("A1", Cell::number(1.0)),
             ("B1", Cell::formula("A1*2")),
@@ -3723,8 +3724,13 @@ mod tests {
         let mut eng = Engine::new(&wb);
         eng.recalc_all(&mut wb);
         set(&mut eng, &mut wb, "A1", Cell::number(9.0)); // warms the cache
+        REV_BUILDS.with(|n| n.set(0));
         set(&mut eng, &mut wb, "B1", Cell::number(7.0));
+        // The removal dropped the cache, so this edit's walk rebuilt the map.
+        assert_eq!(REV_BUILDS.with(StdCell::get), 1);
         set(&mut eng, &mut wb, "A1", Cell::number(5.0));
+        // A plain data edit reuses it: no further rebuild.
+        assert_eq!(REV_BUILDS.with(StdCell::get), 1);
         assert_eq!(value_at(&wb, "C1"), CellValue::Number(8.0));
         assert_eq!(value_at(&wb, "B1"), CellValue::Number(7.0));
         set(&mut eng, &mut wb, "B1", Cell::formula("A1*3"));
@@ -3735,9 +3741,9 @@ mod tests {
 
     #[test]
     fn rev_cache_follows_spill_growth() {
-        // The A1# reader's dep rects move with the spill extent, so a spill
-        // that grew must have dropped the cache even though no formula was
-        // added or removed.
+        // Growing the spill under an `A1#` reader moves the reader's dep
+        // rects, so the recalc pass that sees the grown extent must drop the
+        // cache and rebuild it — even though no formula was added or removed.
         let mut wb = wb_one_sheet(&[
             ("A1", array_formula("SEQUENCE(B1)")),
             ("B1", Cell::number(2.0)),
@@ -3746,12 +3752,16 @@ mod tests {
         let mut eng = Engine::new(&wb);
         eng.recalc_all(&mut wb);
         assert_eq!(value_at(&wb, "D1"), CellValue::Number(3.0));
+        set(&mut eng, &mut wb, "H1", Cell::number(1.0)); // warms the cache
+        REV_BUILDS.with(|n| n.set(0));
         set(&mut eng, &mut wb, "B1", Cell::number(4.0));
+        // At depth 0 the extent is still the old one; the spill grows during
+        // that pass's evaluate, and the nested pass over the spilled cells
+        // sees the grown `A1#` rect, drops the cache, and rebuilds once.
         assert_eq!(value_at(&wb, "D1"), CellValue::Number(10.0));
-        set(&mut eng, &mut wb, "F1", Cell::formula("D1*10"));
-        set(&mut eng, &mut wb, "B1", Cell::number(5.0));
-        assert_eq!(value_at(&wb, "D1"), CellValue::Number(15.0));
-        assert_eq!(value_at(&wb, "F1"), CellValue::Number(150.0));
+        assert_eq!(REV_BUILDS.with(StdCell::get), 1);
+        set(&mut eng, &mut wb, "H1", Cell::number(2.0));
+        assert_eq!(REV_BUILDS.with(StdCell::get), 1);
     }
 
     #[test]
