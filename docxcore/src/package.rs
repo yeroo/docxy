@@ -214,6 +214,11 @@ pub struct TextWatermark {
     /// The text path's `font-size` in points; `None` when absent or `1pt`,
     /// which is how Word writes "Auto".
     pub font_size_pt: Option<f32>,
+    /// The text path's `font-family`, without its quotes.
+    pub font: Option<String>,
+    /// The shape's `v:fill` opacity, 0..1; `None` when it has none (opaque).
+    /// Word's Semitransparent writes `.5`.
+    pub opacity: Option<f32>,
 }
 
 /// The relationship changes an edited header or footer part needs for its
@@ -684,6 +689,13 @@ pub fn text_watermarks(xml: &str) -> Vec<TextWatermark> {
                     .and_then(|s| css_prop(s, "font-size"))
                     .and_then(css_length_pt)
                     .filter(|&pt| (pt - 1.0).abs() > 0.001),
+                font: look
+                    .text_style
+                    .as_deref()
+                    .and_then(|s| css_prop(s, "font-family"))
+                    .map(|f| f.trim_matches(['"', '\'', ' ']).to_string())
+                    .filter(|f| !f.is_empty()),
+                opacity: look.opacity.as_deref().and_then(vml_fraction),
             })
         })
         .collect()
@@ -696,6 +708,8 @@ struct ShapeLook {
     style: Option<String>,
     fill: Option<String>,
     text_style: Option<String>,
+    /// Its `v:fill`'s `opacity`.
+    opacity: Option<String>,
 }
 
 /// A watermark found in a header part, with the look of the VML shape that
@@ -728,6 +742,7 @@ fn watermark_shapes(xml: &str) -> Vec<WatermarkShape> {
                         style: decoded_attr_by_local(&parser, "style"),
                         fill: decoded_attr_by_local(&parser, "fillcolor"),
                         text_style: None,
+                        opacity: None,
                     },
                     ..Shape::default()
                 });
@@ -744,6 +759,11 @@ fn watermark_shapes(xml: &str) -> Vec<WatermarkShape> {
                     if shape.look.text_style.is_none() {
                         shape.look.text_style = decoded_attr_by_local(&parser, "style");
                     }
+                }
+            }
+            Event::Start if local_name(parser.name()) == "fill" => {
+                if let Some(shape) = shapes.last_mut() {
+                    shape.look.opacity = decoded_attr_by_local(&parser, "opacity");
                 }
             }
             Event::Start if local_name(parser.name()) == "imagedata" => {
@@ -808,6 +828,20 @@ fn leading_number(value: &str) -> Option<f32> {
         .find(|&(i, c)| !(c.is_ascii_digit() || c == '.' || (i == 0 && matches!(c, '-' | '+'))))
         .map_or(value.len(), |(i, _)| i);
     value[..end].parse().ok().filter(|v: &f32| v.is_finite())
+}
+
+/// A VML fraction (`.5`, `50%`, or `32768f` in 65536ths), clamped to 0..1.
+fn vml_fraction(value: &str) -> Option<f32> {
+    let v = value.trim();
+    let n = leading_number(v)?;
+    let f = if v.ends_with('f') {
+        n / 65536.0
+    } else if v.ends_with('%') {
+        n / 100.0
+    } else {
+        n
+    };
+    Some(f.clamp(0.0, 1.0))
 }
 
 /// A CSS length in points: `pt`, `in`, `cm`, `mm` or `px`; anything else is
@@ -1408,12 +1442,28 @@ impl Package {
         out
     }
 
+    /// Every header part `sect_prs` reference, of any variant, shown or not
+    /// (a first-page header while `w:titlePg` is off), once each.
+    fn referenced_header_parts<S: AsRef<str>>(&self, sect_prs: &[S]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for parts in section_header_parts(sect_prs, &self.document_rels()) {
+            for part in parts.headers.into_iter().flatten() {
+                if !out.contains(&part.part_name) {
+                    out.push(part.part_name);
+                }
+            }
+        }
+        out
+    }
+
     /// Put `spec`'s text watermark into every header `sect_prs` show,
     /// replacing any watermark there, or remove every watermark with `None`
-    /// (Remove Watermark, #651). A shown header slot with no part gets a new
-    /// header part (only when adding), and its reference is written into
+    /// (Remove Watermark, #651). Old watermarks go from every header the
+    /// sections reference, shown or not, so turning on a distinct first page
+    /// later cannot bring one back. A shown header slot with no part gets a
+    /// new header part (only when adding), and its reference is written into
     /// that section's entry of `sect_prs`: the caller applies those (an
-    /// editor's sections, see [`crate::editor::Editor::edit_sections`]).
+    /// editor's sections, see [`crate::editor::Editor::replace_sections`]).
     /// Whether any part changed.
     pub fn set_text_watermark(
         &mut self,
@@ -1439,20 +1489,25 @@ impl Package {
             })
             .max()
             .unwrap_or(0);
+        let referenced = self.referenced_header_parts(sect_prs);
+        let shown = match spec {
+            Some(_) => self.shown_header_parts(sect_prs, true),
+            None => Vec::new(),
+        };
         let mut changed = false;
-        for name in self.shown_header_parts(sect_prs, spec.is_some()) {
-            let Some(xml) = self.part_text(&name) else {
+        for name in referenced.iter().chain(&shown) {
+            let Some(xml) = self.part_text(name) else {
                 continue;
             };
             let new = match spec {
-                Some(spec) => {
+                Some(spec) if shown.contains(name) => {
                     n += 1;
                     crate::watermark::insert_watermark(&xml, spec, n)
                 }
-                None => crate::watermark::strip_watermarks(&xml),
+                _ => crate::watermark::strip_watermarks(&xml),
             };
             if new != xml {
-                self.set_part_text(&name, &new);
+                self.set_part_text(name, &new);
                 changed = true;
             }
         }
@@ -1461,11 +1516,9 @@ impl Package {
 
     /// [`Package::set_text_watermark`] over the package's own document: its
     /// sections' sectPrs are read from and written back to
-    /// [`Package::document`].
-    pub fn apply_text_watermark(
-        &mut self,
-        spec: Option<&crate::watermark::TextWatermarkSpec>,
-    ) -> bool {
+    /// [`Package::document`]. The tests' stand-in for an editor.
+    #[cfg(test)]
+    fn apply_text_watermark(&mut self, spec: Option<&crate::watermark::TextWatermarkSpec>) -> bool {
         let mut sect_prs: Vec<String> = self
             .section_sect_prs()
             .into_iter()
@@ -1665,10 +1718,12 @@ impl Package {
     }
 
     /// The page colour (Design > Page Color, #651): the document part's
-    /// `w:background`.
+    /// `w:background`. Cheap enough to call every frame: the part is borrowed (a UTF-8 part
+    /// is not copied) and only the prolog before `<w:body` is read.
     pub fn page_background(&self) -> Option<crate::page_bg::PageBackground> {
-        let name = &self.parts.get(self.doc_index)?.0;
-        crate::page_bg::page_background(&self.part_text(name)?)
+        let doc = decode_xml_part(&self.parts.get(self.doc_index)?.1)?;
+        let prolog = doc.find("<w:body").map_or(&doc[..], |at| &doc[..at]);
+        crate::page_bg::page_background(prolog)
     }
 
     /// Set the page colour, or remove it with `None` (No Color): the
@@ -1693,11 +1748,7 @@ impl Package {
 
     /// Whether the settings part asks Word to show the page colour.
     pub fn has_display_background_shape(&self) -> bool {
-        self.settings_part_name()
-            .ok()
-            .flatten()
-            .and_then(|n| self.part_text(&n))
-            .and_then(|xml| settings_flag_of(&xml, "w:displayBackgroundShape"))
+        self.settings_flag("w:displayBackgroundShape")
             .unwrap_or(false)
     }
 
@@ -5262,6 +5313,42 @@ mod tests {
         );
     }
 
+    /// A first-page header that is not shown (no `w:titlePg`) still loses an
+    /// old watermark on replace and on remove, so turning the distinct first
+    /// page on later shows no stale one; nothing new goes into it.
+    #[test]
+    fn text_watermark_strips_headers_that_are_referenced_but_not_shown() {
+        use crate::watermark::{TextWatermarkSpec, insert_watermark};
+        let mut pkg = hf_pkg();
+        let (rid, first) = pkg.create_hf_part(true, "<w:p/>").unwrap();
+        let old = insert_watermark(
+            &pkg.part_text(&first).unwrap(),
+            &TextWatermarkSpec::preset("DRAFT", true),
+            1,
+        );
+        pkg.set_part_text(&first, &old);
+        let mut sects = vec![crate::sect::set_hf_reference(
+            pkg.sect_pr(),
+            true,
+            "first",
+            Some(&rid),
+        )];
+        pkg.set_text_watermark(Some(&TextWatermarkSpec::preset("SAMPLE", true)), &mut sects);
+        assert!(text_watermarks(&pkg.part_text(&first).unwrap()).is_empty());
+        assert_eq!(
+            pkg.shown_text_watermarks(&sects)
+                .into_iter()
+                .map(|w| w.text)
+                .collect::<Vec<_>>(),
+            ["SAMPLE"],
+            "the default header got it"
+        );
+        // Remove takes the hidden one's out too.
+        pkg.set_part_text(&first, &old);
+        assert!(pkg.set_text_watermark(None, &mut sects));
+        assert!(text_watermarks(&pkg.part_text(&first).unwrap()).is_empty());
+    }
+
     /// With different odd and even pages, the even-page header gets one too.
     #[test]
     fn text_watermark_covers_even_page_headers() {
@@ -5383,6 +5470,8 @@ mod tests {
                     fill: Some((0xc0, 0xc0, 0xc0)),
                     width_pt: Some(468.0),
                     font_size_pt: None,
+                    font: Some("Calibri".to_string()),
+                    opacity: None,
                 },
                 TextWatermark {
                     text: "SECRET".to_string(),
@@ -5390,6 +5479,8 @@ mod tests {
                     fill: Some((0xff, 0, 0)),
                     width_pt: Some(468.0),
                     font_size_pt: Some(36.0),
+                    font: None,
+                    opacity: None,
                 },
                 TextWatermark {
                     text: "ODD".to_string(),
@@ -5397,6 +5488,8 @@ mod tests {
                     fill: Some((0xaa, 0xbb, 0xcc)),
                     width_pt: None,
                     font_size_pt: None,
+                    font: None,
+                    opacity: None,
                 },
             ]
         );

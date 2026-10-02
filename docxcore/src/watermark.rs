@@ -9,7 +9,7 @@
 //! ([`crate::package::text_watermarks`], `Package::watermarks`) are the
 //! oracle the output satisfies.
 
-use crate::page_bg::{OFFICE_NS, VML_NS, ensure_root_namespaces};
+use crate::page_bg::{OFFICE_NS, VML_NS, ensure_root_namespaces, root_start_end};
 use crate::serialize::esc_attr;
 use crate::xml::{Event, XmlParser};
 
@@ -169,21 +169,17 @@ fn cut(xml: &str, mut spans: Vec<(usize, usize)>) -> String {
     out
 }
 
-/// Remove every watermark from a header part's XML: a "Watermarks" gallery
-/// `w:sdt` whole, and anywhere else the run whose `w:pict` holds a
-/// `PowerPlusWaterMarkObject` shape (its paragraph too when nothing else is
-/// left in it). Other content stays byte for byte; a header left with no
-/// paragraph gets an empty one, as the schema requires.
-pub fn strip_watermarks(xml: &str) -> String {
-    if !xml.contains(SHAPE_ID) && !xml.contains("w:val=\"Watermarks\"") {
-        return xml.to_string();
-    }
-    let sdts: Vec<(usize, usize)> = element_spans(xml, "w:sdt")
-        .into_iter()
-        .filter(|&(a, b)| is_watermark_sdt(&xml[a..b]))
-        .collect();
-    let mut out = cut(xml, sdts);
-    // Watermark runs outside a gallery control (older Word, other producers).
+/// Whether a slice holds content of its own: a run, a table or a field.
+fn has_content(xml: &str) -> bool {
+    ["w:r", "w:tbl", "w:hyperlink", "w:fldSimple"]
+        .iter()
+        .any(|n| !element_spans(xml, n).is_empty())
+}
+
+/// Remove every run whose `w:pict` holds a `PowerPlusWaterMarkObject`
+/// shape, and the paragraph it sat in when that keeps no content.
+fn strip_watermark_runs(xml: &str) -> String {
+    let mut out = xml.to_string();
     loop {
         let runs: Vec<(usize, usize)> = element_spans(&out, "w:p")
             .into_iter()
@@ -195,26 +191,42 @@ pub fn strip_watermarks(xml: &str) -> String {
             .filter(|&(a, b)| out[a..b].contains(SHAPE_ID))
             .collect();
         let Some(&(a, b)) = runs.first() else {
-            break;
+            return out;
         };
-        // The paragraph the run sits in goes too when it keeps no run.
         let para = element_spans(&out, "w:p")
             .into_iter()
             .find(|&(pa, pb)| pa <= a && b <= pb);
         let next = cut(&out, vec![(a, b)]);
         out = match para {
-            Some((pa, pb)) => {
-                let rest = &next[pa..pb - (b - a)];
-                if element_spans(rest, "w:r").is_empty() && !rest.contains("<w:hyperlink") {
-                    cut(&next, vec![(pa, pb - (b - a))])
-                } else {
-                    next
-                }
+            Some((pa, pb)) if !has_content(&next[pa..pb - (b - a)]) => {
+                cut(&next, vec![(pa, pb - (b - a))])
             }
-            None => next,
+            _ => next,
         };
     }
-    ensure_a_paragraph(&out)
+}
+
+/// Remove every watermark from a header part's XML: the run whose `w:pict`
+/// holds a `PowerPlusWaterMarkObject` shape (its paragraph too when nothing
+/// else is left in it), and a "Watermarks" gallery `w:sdt` whole when the
+/// watermark was all it held. A gallery control someone typed into keeps
+/// what they typed. Other content stays byte for byte; a header left with no
+/// paragraph gets an empty one, as the schema requires.
+pub fn strip_watermarks(xml: &str) -> String {
+    if !xml.contains(SHAPE_ID) && !xml.contains("w:val=\"Watermarks\"") {
+        return xml.to_string();
+    }
+    let empty_sdts: Vec<(usize, usize)> = element_spans(xml, "w:sdt")
+        .into_iter()
+        .filter(|&(a, b)| {
+            let sdt = &xml[a..b];
+            let content = element_spans(sdt, "w:sdtContent")
+                .first()
+                .map_or("", |&(ca, cb)| &sdt[ca..cb]);
+            is_watermark_sdt(sdt) && !has_content(&strip_watermark_runs(content))
+        })
+        .collect();
+    ensure_a_paragraph(&strip_watermark_runs(&cut(xml, empty_sdts)))
 }
 
 /// A `w:hdr` with no block left gets an empty paragraph.
@@ -233,6 +245,8 @@ fn ensure_a_paragraph(xml: &str) -> String {
 
 /// A header part's XML with `spec`'s watermark as its first block (after
 /// removing any watermark it had), the VML prefixes declared on its root.
+/// The header's own paragraphs stay outside the gallery control, as in Word,
+/// so what is typed in the header is never part of the watermark.
 pub fn insert_watermark(xml: &str, spec: &TextWatermarkSpec, n: u32) -> String {
     let stripped = strip_watermarks(xml);
     let xml = ensure_root_namespaces(
@@ -246,37 +260,14 @@ pub fn insert_watermark(xml: &str, spec: &TextWatermarkSpec, n: u32) -> String {
             ("w10", W10_NS),
         ],
     );
-    let Some(gt) = hdr_start_end(&xml) else {
+    let Some(gt) = root_start_end(&xml, "w:hdr") else {
         return xml;
     };
     let block = watermark_xml(spec, n);
     if xml[..gt].ends_with('/') {
-        return format!("{}>{block}</w:hdr>{}", &xml[..gt - 1], &xml[gt + 1..]);
+        return format!("{}>{block}<w:p/></w:hdr>{}", &xml[..gt - 1], &xml[gt + 1..]);
     }
-    // An empty placeholder paragraph a new or emptied header holds is the
-    // watermark's paragraph now.
-    let rest = &xml[gt + 1..];
-    let rest = match rest.strip_prefix("<w:p/>") {
-        Some(r) if r.trim_start().starts_with("</w:hdr>") => r,
-        _ => rest,
-    };
-    format!("{}{block}{rest}", &xml[..gt + 1])
-}
-
-/// The index of the `>` that ends the `w:hdr` start tag.
-fn hdr_start_end(xml: &str) -> Option<usize> {
-    let mut parser = XmlParser::new(xml);
-    loop {
-        match parser.next() {
-            Event::Start if parser.name() == "w:hdr" => {
-                let end = parser.pos();
-                // A self-closing root reports its End next; pos is past `/>`.
-                return end.checked_sub(1);
-            }
-            Event::Eof => return None,
-            _ => {}
-        }
-    }
+    format!("{}{block}{}", &xml[..gt + 1], &xml[gt + 1..])
 }
 
 #[cfg(test)]
@@ -297,6 +288,8 @@ mod tests {
         assert_eq!(marks[0].rotation, 315.0);
         assert_eq!(marks[0].fill, Some((0xC0, 0xC0, 0xC0)));
         assert_eq!(marks[0].font_size_pt, None, "Auto writes font-size:1pt");
+        assert_eq!(marks[0].font.as_deref(), Some("Calibri"));
+        assert_eq!(marks[0].opacity, Some(0.5));
         assert!(out.contains("<v:fill opacity=\".5\"/>"));
         assert!(out.contains("id=\"PowerPlusWaterMarkObject1\""));
         assert!(out.contains("w:docPartGallery w:val=\"Watermarks\""));
@@ -325,6 +318,8 @@ mod tests {
         assert_eq!(marks[0].rotation, 0.0);
         assert_eq!(marks[0].fill, Some((0xFF, 0, 0)));
         assert_eq!(marks[0].font_size_pt, Some(54.0));
+        assert_eq!(marks[0].font.as_deref(), Some("Times New Roman"));
+        assert_eq!(marks[0].opacity, None, "opaque");
         assert!(!out.contains("opacity"));
         assert!(out.contains("font-family:&quot;Times New Roman&quot;"));
     }
@@ -370,13 +365,10 @@ mod tests {
     }
 
     #[test]
-    fn a_header_holding_only_a_watermark_keeps_a_paragraph_when_stripped() {
+    fn a_header_keeps_its_own_paragraph_outside_the_watermark() {
         let hdr = "<w:hdr xmlns:w=\"W\"><w:p/></w:hdr>";
         let with = insert_watermark(hdr, &TextWatermarkSpec::preset("URGENT", true), 3);
-        assert!(
-            !with.contains("<w:p/>"),
-            "the placeholder becomes the mark: {with}"
-        );
+        assert!(with.ends_with("</w:sdt><w:p/></w:hdr>"), "{with}");
         assert_eq!(strip_watermarks(&with).matches("<w:p/>").count(), 1);
         // A self-closing root takes the block too.
         let empty = insert_watermark(
@@ -385,6 +377,27 @@ mod tests {
             4,
         );
         assert_eq!(text_watermarks(&empty).len(), 1, "{empty}");
-        assert!(empty.ends_with("</w:hdr>"));
+        assert!(empty.ends_with("</w:sdt><w:p/></w:hdr>"), "{empty}");
+    }
+
+    /// Text typed into a Watermarks gallery control's paragraph is not the
+    /// watermark: stripping keeps it, and the control around it.
+    #[test]
+    fn strip_keeps_text_typed_into_the_watermark_control() {
+        let with = insert_watermark(HDR, &TextWatermarkSpec::preset("DRAFT", true), 1);
+        let typed = with.replacen(
+            "<w:rPr><w:noProof/></w:rPr><w:pict>",
+            "<w:rPr><w:noProof/></w:rPr><w:t>Acme Corp</w:t></w:r><w:r><w:pict>",
+            1,
+        );
+        assert_ne!(typed, with);
+        let out = strip_watermarks(&typed);
+        assert!(text_watermarks(&out).is_empty(), "{out}");
+        assert!(out.contains("<w:t>Acme Corp</w:t>"), "{out}");
+        assert!(out.contains("w:docPartGallery"), "the control stays: {out}");
+        // A second watermark goes in beside it, never two.
+        let again = insert_watermark(&typed, &TextWatermarkSpec::preset("SAMPLE", true), 2);
+        assert_eq!(text_watermarks(&again).len(), 1);
+        assert!(again.contains("<w:t>Acme Corp</w:t>"));
     }
 }

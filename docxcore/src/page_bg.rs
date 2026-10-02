@@ -182,22 +182,20 @@ pub fn set_page_background(doc: &str, bg: Option<&PageBackground>) -> String {
     if bg.gradient.is_some() {
         out = ensure_root_namespaces(&out, "w:document", &[("v", VML_NS), ("o", OFFICE_NS)]);
     }
-    let Some(gt) = root_start_end(&out, "w:document") else {
-        return out;
-    };
-    out.insert_str(gt + 1, &background_xml(bg));
+    match root_start_end(&out, "w:document") {
+        Some(gt) if !out[..gt].ends_with('/') => out.insert_str(gt + 1, &background_xml(bg)),
+        _ => {}
+    }
     out
 }
 
-/// The index of the `>` closing `root`'s start tag (not a self-closing one).
-fn root_start_end(xml: &str, root: &str) -> Option<usize> {
+/// The index of the `>` that ends `root`'s start tag; for a self-closing
+/// root, the `>` of its `/>`.
+pub(crate) fn root_start_end(xml: &str, root: &str) -> Option<usize> {
     let mut parser = XmlParser::new(xml);
     loop {
         match parser.next() {
-            Event::Start if parser.name() == root => {
-                let gt = parser.pos().checked_sub(1)?;
-                return (!xml[..gt].ends_with('/')).then_some(gt);
-            }
+            Event::Start if parser.name() == root => return parser.pos().checked_sub(1),
             Event::Eof => return None,
             _ => {}
         }
