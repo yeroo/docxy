@@ -35,7 +35,7 @@
 //! | `range.set` | `{start,rows:[[string]],sheet?}` | `{set}` — atomic, one undo group |
 //! | `sheet.import-csv` | `{text,name?}` | `{sheet,name,rows,cols}` — always a new sheet; fields convert as a `.csv` open does (`sep=`, typed-entry rules, File › Options › Data) |
 //! | `sheet.import-text` | `{text\|path,options?,name?}` | `{sheet,name,rows,cols}` — the Text Import Wizard's options (see `text_options`) into a new sheet |
-//! | `app.options` | `{convert_leading_zeros?,convert_long_numbers?,convert_e_notation?,convert_dates?}` | all four — File › Options › Data › Automatic Data Conversion; given keys are set first |
+//! | `app.options` | `{convert_leading_zeros?,convert_long_numbers?,convert_e_notation?,convert_dates?,edit_fixed_decimal?,edit_fixed_decimal_places?,edit_move_after_enter?,edit_move_direction?,edit_in_cell?,edit_autocomplete?}` | all of them — File › Options › Data › Automatic Data Conversion and Advanced › Editing (places -300..=300, direction `down`/`right`/`up`/`left`); every given key is checked before any is set |
 //! | `range.text-to-columns` | `{range,options?,dest?,replace?,sheet?}` | `{rows}` — one column; refuses with "Do you want to replace the contents of the destination cells?" unless `replace:true`; one undo step |
 //! | `wb.replace-all` | `{query,text}` | `{replaced}` — every sheet, one undo group |
 //! | `sheet.add` | `{name?}` | `{sheet,name}` |
@@ -1167,25 +1167,62 @@ fn text_options(
     Ok((opts, origin))
 }
 
-/// File › Options › Data › Automatic Data Conversion: set any of the four
-/// switches given, and return all four. They apply to the next `.csv`/text
-/// open and are saved with the app's preferences on exit.
+/// File › Options: Data › Automatic Data Conversion's four switches and
+/// Advanced › Editing's options (#672). Every key given is checked before
+/// any is set, so a bad one changes nothing; the reply holds every value,
+/// set or not. The conversion switches apply to the next `.csv`/text open;
+/// all of them are saved with the app's preferences on exit.
 fn app_options(app: &mut App, args: &Json) -> Result<Json, String> {
-    const KEYS: [&str; 4] = [
-        "convert_leading_zeros",
-        "convert_long_numbers",
-        "convert_e_notation",
-        "convert_dates",
+    use gridcore::options::{self as o, EnterMove};
+    const CONVERT: [&str; 4] = crate::CONVERT_KEYS;
+    const EDIT_FLAGS: [&str; 4] = [
+        o::KEY_FIXED_DECIMAL,
+        o::KEY_MOVE_AFTER_ENTER,
+        o::KEY_EDIT_IN_CELL,
+        o::KEY_AUTOCOMPLETE,
     ];
+    let given = |key: &str| args.get(key).filter(|v| **v != Json::Null);
+    let flag = |key: &str| match given(key) {
+        None => Ok(None),
+        Some(Json::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(format!("'{key}' must be true or false")),
+    };
     // Every key is checked before any is set: a bad one changes nothing.
-    let mut given = [None; 4];
-    for (slot, key) in given.iter_mut().zip(KEYS) {
-        *slot = match args.get(key) {
-            None | Some(Json::Null) => None,
-            Some(Json::Bool(b)) => Some(*b),
-            Some(_) => return Err(format!("'{key}' must be true or false")),
-        };
+    let mut convert = [None; 4];
+    for (slot, key) in convert.iter_mut().zip(CONVERT) {
+        *slot = flag(key)?;
     }
+    let mut edit = [None; 4];
+    for (slot, key) in edit.iter_mut().zip(EDIT_FLAGS) {
+        *slot = flag(key)?;
+    }
+    let places = match given(o::KEY_PLACES) {
+        None => None,
+        Some(Json::Num(n))
+            if n.fract() == 0.0
+                && (f64::from(o::PLACES_MIN)..=f64::from(o::PLACES_MAX)).contains(n) =>
+        {
+            Some(*n as i16)
+        }
+        Some(_) => {
+            return Err(format!(
+                "'{}' must be a whole number from {} to {}",
+                o::KEY_PLACES,
+                o::PLACES_MIN,
+                o::PLACES_MAX
+            ));
+        }
+    };
+    let direction = match given(o::KEY_MOVE_DIRECTION) {
+        None => None,
+        Some(Json::Str(s)) if EnterMove::from_label(s).is_some() => EnterMove::from_label(s),
+        Some(_) => {
+            return Err(format!(
+                "'{}' must be down, right, up or left",
+                o::KEY_MOVE_DIRECTION
+            ));
+        }
+    };
     let auto = &mut app.auto_convert;
     let fields: [&mut bool; 4] = [
         &mut auto.remove_leading_zeros,
@@ -1194,12 +1231,36 @@ fn app_options(app: &mut App, args: &Json) -> Result<Json, String> {
         &mut auto.dates,
     ];
     let mut out = Vec::new();
-    for ((key, slot), want) in KEYS.into_iter().zip(fields).zip(given) {
+    for ((key, slot), want) in CONVERT.into_iter().zip(fields).zip(convert) {
         if let Some(b) = want {
             *slot = b;
         }
         out.push((key, Json::Bool(*slot)));
     }
+    let e = &mut app.edit_opts;
+    let fields: [&mut bool; 4] = [
+        &mut e.fixed_decimal,
+        &mut e.move_after_enter,
+        &mut e.edit_in_cell,
+        &mut e.autocomplete,
+    ];
+    for ((key, slot), want) in EDIT_FLAGS.into_iter().zip(fields).zip(edit) {
+        if let Some(b) = want {
+            *slot = b;
+        }
+        out.push((key, Json::Bool(*slot)));
+    }
+    if let Some(p) = places {
+        e.places = p;
+    }
+    if let Some(d) = direction {
+        e.enter_move = d;
+    }
+    out.push((o::KEY_PLACES, Json::Num(f64::from(e.places))));
+    out.push((
+        o::KEY_MOVE_DIRECTION,
+        Json::Str(e.enter_move.label().to_ascii_lowercase()),
+    ));
     Ok(Json::obj(out))
 }
 
@@ -2387,6 +2448,7 @@ mod tests {
             cursor: 3,
             replace: false,
             seed: None,
+            proposal: None,
         });
         assert!(a.commit_edit());
         assert_eq!(get(&mut a, "A1").get_str("value"), Some("=1+"));
@@ -3331,6 +3393,57 @@ mod tests {
         assert!(dispatch(&mut a, "app.options", &bad).is_err());
         // The bad key refused the whole call: the good one was not applied.
         assert!(!a.auto_convert.remove_leading_zeros);
+    }
+
+    /// #672: the Editing options read and set through `app.options`, all or
+    /// nothing like the conversion switches.
+    #[test]
+    fn app_options_set_the_editing_options() {
+        let mut a = app();
+        let all = dispatch(&mut a, "app.options", &Json::Null).unwrap();
+        assert_eq!(all.get("edit_fixed_decimal"), Some(&Json::Bool(false)));
+        assert_eq!(all.get("edit_fixed_decimal_places"), Some(&Json::Num(2.0)));
+        assert_eq!(
+            all.get("edit_move_direction"),
+            Some(&Json::Str("down".into()))
+        );
+        let set = Json::obj(vec![
+            ("edit_fixed_decimal", Json::Bool(true)),
+            ("edit_fixed_decimal_places", Json::Num(-2.0)),
+            ("edit_move_direction", Json::Str("Right".into())),
+            ("edit_autocomplete", Json::Bool(false)),
+        ]);
+        let r = dispatch(&mut a, "app.options", &set).unwrap();
+        assert_eq!(
+            r.get("edit_move_direction"),
+            Some(&Json::Str("right".into()))
+        );
+        assert!(a.edit_opts.fixed_decimal && !a.edit_opts.autocomplete);
+        assert_eq!(a.edit_opts.places, -2);
+        assert_eq!(a.edit_opts.enter_move, gridcore::options::EnterMove::Right);
+        for bad in [
+            ("edit_fixed_decimal_places", Json::Num(301.0)),
+            ("edit_fixed_decimal_places", Json::Num(1.5)),
+            ("edit_move_direction", Json::Str("sideways".into())),
+            ("edit_in_cell", Json::Str("no".into())),
+        ] {
+            let args = Json::obj(vec![("edit_fixed_decimal", Json::Bool(false)), bad]);
+            assert!(dispatch(&mut a, "app.options", &args).is_err());
+            assert!(a.edit_opts.fixed_decimal, "a refused call sets nothing");
+        }
+    }
+
+    /// #672: automation never shifts a number, whatever the user's fixed
+    /// decimal point: only typing into the grid does.
+    #[test]
+    fn cell_set_ignores_the_fixed_decimal() {
+        let mut a = app();
+        a.edit_opts.fixed_decimal = true;
+        set(&mut a, "A1", "1234");
+        assert_eq!(
+            a.pkg.workbook.sheets[0].cell(0, 0).unwrap().value,
+            CellValue::Number(1234.0)
+        );
     }
 
     /// A workbook saved as Text (Tab delimited) is bound to its .txt, so

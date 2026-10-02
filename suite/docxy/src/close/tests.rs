@@ -1345,6 +1345,7 @@ fn prefs() -> Prefs {
         ask_on_close: false,
         autorecover_minutes: 10,
         keep_drafts: true,
+        edit_opts: gridcore::options::EditOptions::default(),
     }
 }
 
@@ -1633,6 +1634,75 @@ fn keeping_drafts_is_on_by_default_and_the_setting_round_trips() {
     };
     write_session(&root.0, &[tab(Kind::Xlsx)], 0, prefs);
     assert!(!root.session().keep_drafts, "off is kept");
+}
+
+/// #672: Settings' Sheet editing options persist in `session.json`, and a
+/// session from before them (or with a bad value) gets Excel's defaults.
+#[test]
+fn sheet_editing_options_round_trip_through_the_session() {
+    use gridcore::options::{EditOptions, EnterMove};
+    let old: Session = serde_json::from_str(r#"{"tabs":[],"active":0}"#).unwrap();
+    assert_eq!(
+        EditOptions::from_text(&old.sheet_editing),
+        EditOptions::default()
+    );
+    let bad: Session = serde_json::from_str(
+        r#"{"tabs":[],"active":0,"sheet_editing":"edit_move_direction=nowhere\n"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        EditOptions::from_text(&bad.sheet_editing).enter_move,
+        EnterMove::Down
+    );
+    let root = Root::new("sheet-editing");
+    let opts = EditOptions {
+        fixed_decimal: true,
+        places: -1,
+        enter_move: EnterMove::Up,
+        fill_handle: false,
+        ..EditOptions::default()
+    };
+    let prefs = Prefs {
+        edit_opts: opts,
+        ..prefs()
+    };
+    write_session(&root.0, &[tab(Kind::Xlsx)], 0, prefs);
+    assert_eq!(EditOptions::from_text(&root.session().sheet_editing), opts);
+}
+
+/// #672: a sheet tab reached through the app gets the app's Editing options,
+/// so one opened after they changed honours them on its first key.
+#[test]
+fn a_sheet_reached_through_the_app_has_its_editing_options() {
+    use gridcore::options::EditOptions;
+    let mut t = tab(Kind::Xlsx);
+    let opts = EditOptions {
+        autocomplete: false,
+        ..EditOptions::default()
+    };
+    let v = sheet_with_opts(Some(&mut t), opts).expect("a sheet tab");
+    assert_eq!(v.edit_opts, opts);
+    let mut doc = tab(Kind::Docx);
+    assert!(sheet_with_opts(Some(&mut doc), opts).is_none());
+}
+
+/// #672 r1: every sheet tab, however it was created, holds the app's
+/// Editing options once they are stamped (restore, a change, each frame).
+#[test]
+fn every_sheet_tab_is_stamped_with_the_app_options() {
+    use gridcore::options::EditOptions;
+    let opts = EditOptions {
+        fixed_decimal: true,
+        ..EditOptions::default()
+    };
+    let mut tabs = vec![tab(Kind::Xlsx), tab(Kind::Docx), tab(Kind::Xlsx)];
+    stamp_edit_opts(&mut tabs, opts);
+    for t in &tabs {
+        if let Surface::Sheet(v) = &t.surface {
+            assert_eq!(v.edit_opts, opts);
+        }
+    }
+    assert!(matches!(tabs[2].surface, Surface::Sheet(_)));
 }
 
 #[test]

@@ -2,7 +2,7 @@
 //! docxy's `main.rs` `backstage_key`/`bs_mouse`/`bs_menu_activate`/
 //! `save_as_key`/`save_as_name_key`/`save_as_browser_key`/`bs_scroll_preview`.
 
-use crate::{Backstage, BackstageEvent, BackstageHost, Item, Pane};
+use crate::{Backstage, BackstageEvent, BackstageHost, Item, OptLine, OptValue, Pane};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Position;
 
@@ -119,6 +119,16 @@ impl Backstage {
                 BackstageEvent::None
             }
             Pane::Options => {
+                // A checkbox has no value to move, so Left still goes back to
+                // the menu from one; a choice or a number takes Left/Right.
+                let value_row = self
+                    .options
+                    .get(self.option_sel)
+                    .is_some_and(|o| !matches!(o.value, OptValue::Check(_)));
+                let int_row = self
+                    .options
+                    .get(self.option_sel)
+                    .is_some_and(|o| matches!(o.value, OptValue::Int { .. }));
                 match key.code {
                     KeyCode::Up => self.option_sel = self.option_sel.saturating_sub(1),
                     KeyCode::Down => {
@@ -126,6 +136,10 @@ impl Backstage {
                             (self.option_sel + 1).min(self.options.len().saturating_sub(1))
                     }
                     KeyCode::Char(' ') | KeyCode::Enter => self.toggle_option(),
+                    KeyCode::Right if value_row => self.step_option(1),
+                    KeyCode::Left if value_row => self.step_option(-1),
+                    KeyCode::PageUp if int_row => self.step_option(10),
+                    KeyCode::PageDown if int_row => self.step_option(-10),
                     KeyCode::Left => self.pane = Pane::Menu,
                     _ => {}
                 }
@@ -437,15 +451,20 @@ impl Backstage {
             }
             return BackstageEvent::None;
         }
-        // An option row (below the heading and a blank line) flips it.
+        // A click on an option row flips its checkbox or moves its value
+        // on; the page's lines start below the panel's top edge.
         if self.item == Item::Options {
-            if let Some(i) = (y as usize)
-                .checked_sub(3)
-                .filter(|&i| i < self.options.len())
-            {
+            let line = (y as usize)
+                .checked_sub(1)
+                .and_then(|l| self.option_lines().get(l).copied());
+            if let Some(OptLine::Row(i)) = line {
                 self.option_sel = i;
                 self.pane = Pane::Options;
-                self.toggle_option();
+                // A choice's or number's `‹` steps back; the rest of the row on.
+                let back = self.options[i]
+                    .back_arrow_col()
+                    .is_some_and(|col| usize::from(x.saturating_sub(self.layout.options_x)) == col);
+                self.step_option(if back { -1 } else { 1 });
             }
             return BackstageEvent::None;
         }
@@ -797,5 +816,52 @@ mod tests {
         assert_eq!(bs.item, Item::New);
         let second = bs.mouse(2, 1, &TestHost);
         assert!(matches!(second, BackstageEvent::New));
+    }
+
+    #[test]
+    fn options_keys_change_value_rows_and_leave_from_a_checkbox() {
+        use crate::OptRow;
+        let mut bs = Backstage::open(std::env::temp_dir(), &["xlsx"]).with_option_rows(vec![
+            OptRow::check("fixed", "Editing", "Fixed", true),
+            OptRow::int("places", "Editing", "Places", 2, -300, 300),
+            OptRow::choice("dir", "Editing", "Direction", &["Down", "Right", "Up"], 0),
+        ]);
+        bs.item = Item::Options;
+        bs.pane = Pane::Options;
+        bs.key(key(KeyCode::Down), &TestHost);
+        bs.key(key(KeyCode::Right), &TestHost);
+        assert_eq!(bs.option_int("places"), Some(3));
+        bs.key(key(KeyCode::Left), &TestHost);
+        bs.key(key(KeyCode::Left), &TestHost);
+        assert_eq!(bs.option_int("places"), Some(1));
+        assert_eq!(bs.pane, Pane::Options, "Left on a value row stays");
+        bs.key(key(KeyCode::PageDown), &TestHost);
+        assert_eq!(bs.option_int("places"), Some(-9));
+        bs.key(key(KeyCode::PageUp), &TestHost);
+        bs.key(key(KeyCode::PageUp), &TestHost);
+        assert_eq!(bs.option_int("places"), Some(11));
+        bs.key(key(KeyCode::Down), &TestHost);
+        bs.key(key(KeyCode::Right), &TestHost);
+        assert_eq!(bs.option_choice("dir"), Some(1));
+        bs.key(key(KeyCode::Enter), &TestHost);
+        assert_eq!(bs.option_choice("dir"), Some(2));
+        bs.key(key(KeyCode::PageUp), &TestHost);
+        assert_eq!(bs.option_choice("dir"), Some(2), "PgUp only moves a number");
+        bs.key(key(KeyCode::Up), &TestHost);
+        bs.key(key(KeyCode::Up), &TestHost);
+        bs.key(key(KeyCode::Right), &TestHost);
+        assert_eq!(
+            bs.option_check("fixed"),
+            Some(true),
+            "Right leaves a checkbox"
+        );
+        bs.key(key(KeyCode::Char(' ')), &TestHost);
+        assert_eq!(bs.option_check("fixed"), Some(false));
+        bs.key(key(KeyCode::Left), &TestHost);
+        assert_eq!(
+            bs.pane,
+            Pane::Menu,
+            "Left on a checkbox returns to the menu"
+        );
     }
 }

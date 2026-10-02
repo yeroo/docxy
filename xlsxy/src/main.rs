@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use std::io;
 use std::process::ExitCode;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 mod backstage;
 mod control;
@@ -34,13 +34,14 @@ use gridcore::comments::Comment;
 use gridcore::docprops::{CustomProperty, CustomValue, DocProperties};
 use gridcore::edit::{fill_changes, replace_all_in_sheet};
 use gridcore::engine::{Engine, PART_OF_ARRAY};
-use gridcore::entry::{entry_cell, entry_ctx, seed_text};
+use gridcore::entry::{EntryCtx, entry_cell, entry_cell_ctx, entry_ctx, seed_text};
 use gridcore::formula::{qualify_sheet_in_formula, translate_formula};
 use gridcore::frame::Agg;
 use gridcore::legacy::{SourceFormat, open_workbook as open_any};
 use gridcore::model::{
     DataModel, MODEL_PART, ModelSpec, Relationship, model_part_xml, model_pivot, parse_model_part,
 };
+use gridcore::options::{EditOptions, EnterMove};
 use gridcore::sheet::{
     Align, Cell, CellValue, MAX_COLS, MAX_ROWS, NumFmt, Sheet, Xf, cell_name, col_name,
     date_unrepresentable, format_with, sheet_to_csv,
@@ -763,6 +764,15 @@ impl TextOpen {
     }
 }
 
+/// The Automatic Data Conversion switches' preference keys, in the order
+/// File › Options lists them.
+pub(crate) const CONVERT_KEYS: [&str; 4] = [
+    "convert_leading_zeros",
+    "convert_long_numbers",
+    "convert_e_notation",
+    "convert_dates",
+];
+
 /// The Automatic Data Conversion switches from the preferences file's text;
 /// a missing key keeps Excel's default (on).
 fn auto_convert_from_prefs(text: &str) -> AutoConvert {
@@ -770,13 +780,14 @@ fn auto_convert_from_prefs(text: &str) -> AutoConvert {
     for line in text.lines() {
         if let Some((k, v)) = line.split_once('=') {
             let on = v.trim() == "1";
-            match k.trim() {
-                "convert_leading_zeros" => auto.remove_leading_zeros = on,
-                "convert_long_numbers" => auto.keep_15_digits = on,
-                "convert_e_notation" => auto.e_notation = on,
-                "convert_dates" => auto.dates = on,
-                _ => {}
-            }
+            let slot = match CONVERT_KEYS.iter().position(|key| *key == k.trim()) {
+                Some(0) => &mut auto.remove_leading_zeros,
+                Some(1) => &mut auto.keep_15_digits,
+                Some(2) => &mut auto.e_notation,
+                Some(3) => &mut auto.dates,
+                _ => continue,
+            };
+            *slot = on;
         }
     }
     auto
@@ -972,6 +983,7 @@ fn import_text(
     let ctx = gridcore::entry::EntryCtx {
         date1904,
         today: open.today,
+        fixed_decimal: None,
     };
     gridcore::textio::import_records(sheet, styles, 0, 0, &records, opts, &open.auto, &ctx)
 }
@@ -1057,7 +1069,8 @@ fn print_usage() {
            xlsxy install skill              install the agent SKILL.md (self-onboarding)\n\n\
          EDITOR KEYS:\n  \
            type to replace · F2 edit in place · = starts a formula\n  \
-           Enter/Tab commit (move down/right) · Esc cancel · Del clear\n  \
+           Enter/Tab commit (move down/right; File › Options sets Enter's way)\n  \
+           Esc cancel · Del clear · Ctrl-Shift-U expand the formula bar\n  \
            arrows / PgUp / PgDn move   (Ctrl-arrows jump to data edge)\n  \
            Shift + move select a range   (stats appear in the status bar)\n  \
            Ctrl-C copy   Ctrl-X cut   Ctrl-V paste (relative refs translate)\n  \
@@ -1067,7 +1080,7 @@ fn print_usage() {
            F5 insert rows  Shift-F5 delete rows  F6/Shift-F6 same for columns\n  \
            Ctrl-T add sheet  Shift-F2 rename sheet  Shift-Del delete sheet\n  \
            F12 Save As   F7 / F8 shrink / widen the current column\n  \
-           mouse: click to move · drag to select · wheel to scroll"
+           mouse: click to move · drag to select · double-click to edit · wheel to scroll"
     );
 }
 
@@ -1447,7 +1460,15 @@ struct EditState {
     /// typing replaced it. Committing it unchanged leaves the cell alone:
     /// re-reading it would round a 17-digit number to Excel's 15.
     seed: Option<String>,
+    /// AutoComplete's proposal (#672): the char index its selected suffix
+    /// starts at (the caret stays there) and the value it completes to. Any
+    /// commit takes the value; Backspace or Delete drops the suffix; a caret
+    /// move keeps the text as typed-plus-suffix and drops the marker.
+    proposal: Option<(usize, String)>,
 }
+
+/// How soon a second press on the same cell makes a double-click.
+const DOUBLE_CLICK: Duration = Duration::from_millis(500);
 
 /// New cell contents by (row, col), applied in order.
 type CellChanges = Vec<(u32, u32, Cell)>;
@@ -1789,6 +1810,13 @@ struct App {
     show_comments: bool,
     /// File › Options › Data › Automatic Data Conversion (persisted).
     auto_convert: AutoConvert,
+    /// File › Options › Editing (persisted, #672).
+    edit_opts: EditOptions,
+    /// Ctrl+Shift+U: the formula bar is four rows of wrapped text. View
+    /// state for this session, not persisted.
+    fx_expanded: bool,
+    /// The last press on a grid cell, for double-click detection.
+    last_click: Option<(Instant, u32, u32)>,
     comment_sel: usize,
     // The File backstage (folder browser / preview / info / save-as).
     backstage: Option<backstage::Backstage>,
@@ -1913,6 +1941,9 @@ impl App {
             comments,
             show_comments: false,
             auto_convert: AutoConvert::default(),
+            edit_opts: EditOptions::default(),
+            fx_expanded: false,
+            last_click: None,
             comment_sel: 0,
             backstage: None,
             start_screen: false,
@@ -2034,8 +2065,139 @@ impl App {
             text,
             cursor,
             replace: initial.is_some(),
+            proposal: None,
         });
         self.anchor = None;
+    }
+
+    /// The context a typed commit reads its entry under: the workbook's, with
+    /// the user's fixed decimal point (only typing shifts a number, #672).
+    fn typed_ctx(&self) -> EntryCtx {
+        EntryCtx {
+            fixed_decimal: self.edit_opts.fixed_places(),
+            ..entry_ctx(&self.pkg.workbook, now_serial())
+        }
+    }
+
+    /// AutoComplete (#672): with the caret at the end of the editor, append
+    /// the rest of the one column value the typed text starts, selected
+    /// ([`EditState::proposal`]).
+    fn propose(&mut self) {
+        if !self.edit_opts.autocomplete {
+            return;
+        }
+        let (r, c) = self.cur;
+        let Some(e) = &self.edit else { return };
+        let n = e.text.chars().count();
+        if e.proposal.is_some() || e.cursor != n {
+            return;
+        }
+        let Some(value) = gridcore::entry::autocomplete(self.sheet(), r, c, &e.text) else {
+            return;
+        };
+        let suffix: String = value.chars().skip(n).collect();
+        if let Some(e) = self.edit.as_mut().filter(|_| !suffix.is_empty()) {
+            e.text.push_str(&suffix);
+            e.proposal = Some((n, value));
+        }
+    }
+
+    /// Drop the AutoComplete proposal's suffix from the editor (Backspace,
+    /// Delete, or a typed character replacing it). True when there was one.
+    fn drop_proposal(&mut self) -> bool {
+        let Some(e) = self.edit.as_mut() else {
+            return false;
+        };
+        let Some((from, _)) = e.proposal.take() else {
+            return false;
+        };
+        e.text = e.text.chars().take(from).collect();
+        e.cursor = from;
+        true
+    }
+
+    /// Enter (Shift+Enter backwards) after a commit or on the grid: File ›
+    /// Options › Editing's direction, or nowhere with "move selection" off.
+    fn enter_move(&mut self, back: bool) {
+        let (dr, dc) = self.edit_opts.enter_delta(back);
+        if (dr, dc) != (0, 0) {
+            self.move_cur(i64::from(dr), i64::from(dc), false);
+        }
+    }
+
+    /// A press on grid cell (row, col) at `at`. A second press on the same
+    /// cell within [`DOUBLE_CLICK`] is a double-click (crossterm reports
+    /// none): it edits the cell or, with editing directly in cells off,
+    /// jumps from a formula to its first precedent. A press that follows a
+    /// hyperlink starts no double-click.
+    fn click_cell(&mut self, row: u32, col: u32, at: Instant) {
+        let double = self.last_click.take().is_some_and(|(t, r, c)| {
+            (r, c) == (row, col)
+                && at
+                    .checked_duration_since(t)
+                    .is_some_and(|d| d <= DOUBLE_CLICK)
+        });
+        self.anchor = None;
+        self.cur = (row, col);
+        if double {
+            self.cell_double_click(row, col);
+            return;
+        }
+        if self.sheet().hyperlinks.contains_key(&(row, col)) {
+            self.follow_hyperlink(row, col);
+        } else {
+            self.last_click = Some((at, row, col));
+        }
+    }
+
+    /// A double-click on (row, col): edit it (as F2), or — editing directly in
+    /// cells off — select a formula's first direct precedent.
+    fn cell_double_click(&mut self, row: u32, col: u32) {
+        let formula = self
+            .sheet()
+            .cell(row, col)
+            .is_some_and(|c| c.formula.is_some());
+        if formula && !self.edit_opts.edit_in_cell {
+            self.goto_precedent(row, col);
+        } else {
+            self.start_edit(None);
+        }
+    }
+
+    /// Select the first area the formula at (row, col) refers to
+    /// ([`gridcore::formula::direct_precedents`]), switching sheet when it is
+    /// on another one. Excel selects every direct precedent; xlsxy's
+    /// selection is one rect, so it takes the first.
+    fn goto_precedent(&mut self, row: u32, col: u32) {
+        let areas = gridcore::formula::direct_precedents(&self.pkg.workbook, self.sheet, row, col);
+        let Some(&(si, (r1, c1, r2, c2))) = areas.first() else {
+            self.status = Some("No precedent cells to go to".into());
+            return;
+        };
+        if self.pkg.workbook.sheets[si].hidden {
+            self.status = Some("The precedent cells are on a hidden sheet".into());
+            return;
+        }
+        if si != self.sheet {
+            self.goto_sheet(si);
+        }
+        self.cur = (r1, c1);
+        self.anchor = ((r1, c1) != (r2, c2)).then_some((r2, c2));
+        self.ensure_visible();
+    }
+
+    /// The words Excel's status bar shows for the options in force.
+    fn status_words(&self) -> Vec<&'static str> {
+        let mut words = Vec::new();
+        if self.edit_opts.fixed_decimal {
+            words.push("Fixed Decimal");
+        }
+        words
+    }
+
+    /// The formula bar's height: one row, or four with Ctrl+Shift+U.
+    fn fx_bar_height(&self) -> u16 {
+        if self.fx_expanded { 4 } else { 1 }
     }
 
     /// What editing an existing cell starts from: the formula with `=`, or
@@ -2055,10 +2217,15 @@ impl App {
     /// (gridcore::entry). Returns false (and stays in edit mode) when a
     /// formula doesn't parse, the entry is over the 32,767-character cell
     /// limit, or it would change part of an array ([`PART_OF_ARRAY`]).
+    /// A live AutoComplete proposal commits as the value it completes to,
+    /// in that value's case; a fixed decimal point shifts a typed number.
     fn commit_edit(&mut self) -> bool {
-        let Some(edit) = self.edit.take() else {
+        let Some(mut edit) = self.edit.take() else {
             return true;
         };
+        if let Some((_, value)) = edit.proposal.take() {
+            edit.text = value;
+        }
         let (text, seed) = (edit.text, edit.seed);
         // A seeded editor left unchanged must not re-read the cell: `007` in
         // a quote-prefixed cell is fine either way, but a stored
@@ -2075,17 +2242,12 @@ impl App {
                 text,
                 replace: false,
                 seed,
+                proposal: None,
             });
             return false;
         }
-        let cell = match entry_cell(
-            &mut self.pkg.workbook,
-            self.sheet,
-            r,
-            c,
-            &text,
-            now_serial(),
-        ) {
+        let ctx = self.typed_ctx();
+        let cell = match entry_cell_ctx(&mut self.pkg.workbook, self.sheet, r, c, &text, &ctx) {
             Ok(cell) => cell,
             Err(e) => {
                 // Refused (too long): keep the editor open with the text.
@@ -2095,6 +2257,7 @@ impl App {
                     text,
                     replace: false,
                     seed,
+                    proposal: None,
                 });
                 return false;
             }
@@ -2106,6 +2269,7 @@ impl App {
                 text,
                 replace: false,
                 seed,
+                proposal: None,
             });
             return false;
         }
@@ -4353,6 +4517,7 @@ impl App {
     /// Apply the preferences file's text.
     fn apply_view_prefs(&mut self, text: &str) {
         self.auto_convert = auto_convert_from_prefs(text);
+        self.edit_opts = EditOptions::from_text(text);
         for line in text.lines() {
             if let Some((k, v)) = line.split_once('=') {
                 let on = v.trim() == "1";
@@ -4383,18 +4548,22 @@ impl App {
     fn view_prefs_text(&self) -> String {
         let auto = self.auto_convert;
         let mut text = format!(
-            "formula_view={}\nlight_theme={}\nauto_hide_ribbon={}\nshow_comments={}\n\
-             convert_leading_zeros={}\nconvert_long_numbers={}\nconvert_e_notation={}\n\
-             convert_dates={}\n",
+            "formula_view={}\nlight_theme={}\nauto_hide_ribbon={}\nshow_comments={}\n",
             self.formula_view as u8,
             self.light_theme as u8,
             self.auto_hide_ribbon as u8,
             self.show_comments as u8,
-            auto.remove_leading_zeros as u8,
-            auto.keep_15_digits as u8,
-            auto.e_notation as u8,
-            auto.dates as u8,
         );
+        let switches = [
+            auto.remove_leading_zeros,
+            auto.keep_15_digits,
+            auto.e_notation,
+            auto.dates,
+        ];
+        for (key, on) in CONVERT_KEYS.into_iter().zip(switches) {
+            text.push_str(&format!("{key}={}\n", u8::from(on)));
+        }
+        text.push_str(&self.edit_opts.to_lines());
         if let Some(dir) = &self.alt_startup {
             text.push_str(&format!("alt_startup_path={dir}\n"));
         }
@@ -4560,31 +4729,9 @@ impl App {
             .filter(|p| !p.as_os_str().is_empty())
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
-        let auto = self.auto_convert;
-        let options = [
-            (
-                "Remove leading zeros and convert to number",
-                auto.remove_leading_zeros,
-            ),
-            (
-                "Keep first 15 digits of long numbers and display in scientific notation if needed",
-                auto.keep_15_digits,
-            ),
-            (
-                "Convert digits surrounding the letter \"E\" to a number in scientific notation",
-                auto.e_notation,
-            ),
-            (
-                "Convert continuous letters and numbers to a date",
-                auto.dates,
-            ),
-        ];
         self.backstage = Some(
             backstage::Backstage::open(dir, self.extensions())
-                .with_options(
-                    "Data › Automatic Data Conversion (opening .csv and text files)",
-                    options.map(|(l, on)| (l.to_string(), on)).to_vec(),
-                )
+                .with_option_rows(self.option_rows())
                 .with_save_types(
                     &SAVE_TYPES,
                     "Export the current sheet as CSV UTF-8 next to the workbook",
@@ -4594,20 +4741,118 @@ impl App {
         self.ribbon_focus = ribbon::Focus::None;
     }
 
-    /// Take File › Options › Data's checkboxes into the app (they are saved
-    /// with the other preferences).
+    /// File › Options' rows: Data's Automatic Data Conversion switches and
+    /// Advanced › Editing's options (#672), each keyed by its preference key.
+    /// Fill handle and drag-and-drop is left out: xlsxy has neither.
+    fn option_rows(&self) -> Vec<backstage::OptRow> {
+        use backstage::OptRow;
+        use gridcore::options as o;
+        let data = "Data › Automatic Data Conversion (opening .csv and text files)";
+        let editing = "Advanced › Editing options";
+        let auto = self.auto_convert;
+        let e = self.edit_opts;
+        let dirs = EnterMove::ALL.map(EnterMove::label);
+        let at = EnterMove::ALL
+            .iter()
+            .position(|m| *m == e.enter_move)
+            .unwrap_or(0);
+        vec![
+            OptRow::check(
+                CONVERT_KEYS[0],
+                data,
+                "Remove leading zeros and convert to number",
+                auto.remove_leading_zeros,
+            ),
+            OptRow::check(
+                CONVERT_KEYS[1],
+                data,
+                "Keep first 15 digits of long numbers and display in scientific notation if needed",
+                auto.keep_15_digits,
+            ),
+            OptRow::check(
+                CONVERT_KEYS[2],
+                data,
+                "Convert digits surrounding the letter \"E\" to a number in scientific notation",
+                auto.e_notation,
+            ),
+            OptRow::check(
+                CONVERT_KEYS[3],
+                data,
+                "Convert continuous letters and numbers to a date",
+                auto.dates,
+            ),
+            OptRow::check(
+                o::KEY_FIXED_DECIMAL,
+                editing,
+                "Automatically insert a decimal point",
+                e.fixed_decimal,
+            ),
+            OptRow::int(
+                o::KEY_PLACES,
+                editing,
+                "Places",
+                i32::from(e.places),
+                i32::from(o::PLACES_MIN),
+                i32::from(o::PLACES_MAX),
+            )
+            .depends_on(o::KEY_FIXED_DECIMAL),
+            OptRow::check(
+                o::KEY_MOVE_AFTER_ENTER,
+                editing,
+                "After pressing Enter, move selection",
+                e.move_after_enter,
+            ),
+            OptRow::choice(o::KEY_MOVE_DIRECTION, editing, "Direction", &dirs, at)
+                .depends_on(o::KEY_MOVE_AFTER_ENTER),
+            OptRow::check(
+                o::KEY_EDIT_IN_CELL,
+                editing,
+                "Allow editing directly in cells",
+                e.edit_in_cell,
+            ),
+            OptRow::check(
+                o::KEY_AUTOCOMPLETE,
+                editing,
+                "Enable AutoComplete for cell values",
+                e.autocomplete,
+            ),
+        ]
+    }
+
+    /// Take File › Options' rows into the app, by key (they are saved with
+    /// the other preferences).
     fn sync_backstage_options(&mut self) {
+        use gridcore::options as o;
         let Some(b) = &self.backstage else {
             return;
         };
-        if let [a, b, c, d] = b.options.as_slice() {
-            self.auto_convert = AutoConvert {
-                remove_leading_zeros: a.1,
-                keep_15_digits: b.1,
-                e_notation: c.1,
-                dates: d.1,
-            };
+        if b.options.is_empty() {
+            return;
         }
+        let check = |k: &str, was: bool| b.option_check(k).unwrap_or(was);
+        let auto = self.auto_convert;
+        self.auto_convert = AutoConvert {
+            remove_leading_zeros: check(CONVERT_KEYS[0], auto.remove_leading_zeros),
+            keep_15_digits: check(CONVERT_KEYS[1], auto.keep_15_digits),
+            e_notation: check(CONVERT_KEYS[2], auto.e_notation),
+            dates: check(CONVERT_KEYS[3], auto.dates),
+        };
+        let e = self.edit_opts;
+        self.edit_opts = EditOptions {
+            fixed_decimal: check(o::KEY_FIXED_DECIMAL, e.fixed_decimal),
+            places: b
+                .option_int(o::KEY_PLACES)
+                .and_then(|p| i16::try_from(p).ok())
+                .unwrap_or(e.places),
+            move_after_enter: check(o::KEY_MOVE_AFTER_ENTER, e.move_after_enter),
+            enter_move: b
+                .option_choice(o::KEY_MOVE_DIRECTION)
+                .and_then(|i| EnterMove::ALL.get(i).copied())
+                .unwrap_or(e.enter_move),
+            edit_in_cell: check(o::KEY_EDIT_IN_CELL, e.edit_in_cell),
+            autocomplete: check(o::KEY_AUTOCOMPLETE, e.autocomplete),
+            fill_handle: e.fill_handle,
+        };
     }
 
     /// Leave the File backstage via a click on the ribbon tab strip. Clicking
@@ -6738,10 +6983,11 @@ fn draw(app: &mut App, f: &mut Frame) {
         y += 6;
     }
 
-    let formula_bar = Rect::new(area.x, y, area.width, 1);
-    let col_hdr = Rect::new(area.x, y + 1, area.width, 1);
-    let grid_h = area.height.saturating_sub(ribbon_h + 4);
-    let mut grid = Rect::new(area.x, y + 2, area.width, grid_h);
+    let fx_h = app.fx_bar_height();
+    let formula_bar = Rect::new(area.x, y, area.width, fx_h);
+    let col_hdr = Rect::new(area.x, y + fx_h, area.width, 1);
+    let grid_h = area.height.saturating_sub(ribbon_h + 3 + fx_h);
+    let mut grid = Rect::new(area.x, y + fx_h + 1, area.width, grid_h);
     let tabs_line = Rect::new(area.x, area.y + area.height - 2, area.width, 1);
     let hint_line = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
 
@@ -6848,7 +7094,20 @@ fn draw(app: &mut App, f: &mut Frame) {
         ),
         RSpan::raw("│ "),
     ];
-    if let Some(e) = &app.edit {
+    if let Some((from, e)) = app
+        .edit
+        .as_ref()
+        .and_then(|e| Some((e.proposal.as_ref()?.0, e)))
+    {
+        // An AutoComplete proposal: the typed text, then its suffix
+        // selected (the caret sits where the suffix starts).
+        let chars: Vec<char> = e.text.chars().collect();
+        spans.push(RSpan::raw(chars[..from].iter().collect::<String>()));
+        spans.push(RSpan::styled(
+            chars[from..].iter().collect::<String>(),
+            Style::new().add_modifier(Modifier::REVERSED),
+        ));
+    } else if let Some(e) = &app.edit {
         // Draw text with a visible cursor block.
         let chars: Vec<char> = e.text.chars().collect();
         let before: String = chars[..e.cursor.min(chars.len())].iter().collect();
@@ -6870,7 +7129,13 @@ fn draw(app: &mut App, f: &mut Frame) {
     } else {
         spans.push(RSpan::raw(content));
     }
-    f.render_widget(Paragraph::new(RLine::from(spans)), formula_bar);
+    let bar = Paragraph::new(RLine::from(spans));
+    let bar = if app.fx_expanded {
+        bar.wrap(ratatui::widgets::Wrap { trim: false })
+    } else {
+        bar
+    };
+    f.render_widget(bar, formula_bar);
 
     // --- column headers ------------------------------------------------------
     let mut hdr_spans: Vec<RSpan> =
@@ -7111,6 +7376,12 @@ fn draw(app: &mut App, f: &mut Frame) {
         tab_spans_ui.push(RSpan::styled(
             format!(" Circular References: {first} "),
             Style::new().fg(Color::Black).bg(Color::Yellow),
+        ));
+    }
+    for word in app.status_words() {
+        tab_spans_ui.push(RSpan::styled(
+            format!(" {word} "),
+            Style::new().fg(Color::Black).bg(Color::Gray),
         ));
     }
     let mut tabs_line_ui = RLine::from(tab_spans_ui);
@@ -7978,6 +8249,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
     app.status = None;
+    app.last_click = None;
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -8130,14 +8402,36 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
 
+    // Ctrl+Shift+U expands the formula bar, editing or not. A legacy
+    // terminal reports it as Ctrl+U (no SHIFT) and Ctrl+U is unbound, so
+    // either toggles; a later Ctrl+U (underline) must keep Ctrl+Shift+U apart.
+    if ctrl && matches!(key.code, KeyCode::Char('u') | KeyCode::Char('U')) {
+        app.fx_expanded = !app.fx_expanded;
+        return false;
+    }
+
     // --- edit mode -----------------------------------------------------------
     if app.edit.is_some() {
         let replace = app.edit.as_ref().is_some_and(|e| e.replace);
+        // A caret move keeps an AutoComplete proposal's text and drops its
+        // marker; the keys that commit take the proposal in `commit_edit`.
+        // Home/End move the caret in every mode; Left/Right only outside
+        // type-over, where they commit instead.
+        let caret_move = match key.code {
+            KeyCode::Home | KeyCode::End => true,
+            KeyCode::Left | KeyCode::Right => !replace,
+            _ => false,
+        };
+        if caret_move {
+            if let Some(e) = &mut app.edit {
+                e.proposal = None;
+            }
+        }
         match key.code {
             KeyCode::Esc => app.cancel_edit(),
             KeyCode::Enter => {
                 if app.commit_edit() {
-                    app.move_cur(if shift { -1 } else { 1 }, 0, false);
+                    app.enter_move(shift);
                 }
             }
             KeyCode::Tab => {
@@ -8182,6 +8476,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 }
             }
             KeyCode::Backspace => {
+                if app.drop_proposal() {
+                    return false;
+                }
                 if let Some(e) = &mut app.edit {
                     if e.cursor > 0 {
                         let idx = char_index(&e.text, e.cursor - 1);
@@ -8191,6 +8488,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 }
             }
             KeyCode::Delete => {
+                if app.drop_proposal() {
+                    return false;
+                }
                 if let Some(e) = &mut app.edit {
                     if e.cursor < e.text.chars().count() {
                         let idx = char_index(&e.text, e.cursor);
@@ -8199,11 +8499,15 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
                 }
             }
             KeyCode::Char(ch) if !ctrl => {
+                // A typed character replaces a proposal's suffix, then the
+                // match runs again on the longer text.
+                app.drop_proposal();
                 if let Some(e) = &mut app.edit {
                     let idx = char_index(&e.text, e.cursor);
                     e.text.insert(idx, ch);
                     e.cursor += 1;
                 }
+                app.propose();
             }
             _ => {}
         }
@@ -8324,7 +8628,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             app.anchor = None;
             app.ensure_visible();
         }
-        KeyCode::Enter => app.move_cur(if shift { -1 } else { 1 }, 0, false),
+        KeyCode::Enter => app.enter_move(shift),
         KeyCode::Tab => app.move_cur(0, 1, false),
         KeyCode::BackTab => app.move_cur(0, -1, false),
         KeyCode::Delete => app.clear_selection(),
@@ -8353,7 +8657,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Esc => {
             app.anchor = None;
         }
-        KeyCode::Char(ch) if !ctrl => app.start_edit(Some(ch)),
+        KeyCode::Char(ch) if !ctrl => {
+            app.start_edit(Some(ch));
+            app.propose();
+        }
         _ => {}
     }
     false
@@ -8481,12 +8788,10 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
                 if app.anchor.is_none() {
                     app.anchor = Some(app.cur);
                 }
+                app.last_click = None;
+                app.cur = (row, col);
             } else {
-                app.anchor = None;
-            }
-            app.cur = (row, col);
-            if !drag {
-                app.follow_hyperlink(row, col);
+                app.click_cell(row, col, Instant::now());
             }
         }
         _ => {}
@@ -9436,10 +9741,13 @@ mod tests {
         app.open_backstage();
         let opts = &app.backstage.as_ref().unwrap().options;
         assert_eq!(
-            opts.iter().map(|o| o.1).collect::<Vec<_>>(),
+            opts.iter()
+                .take(4)
+                .map(|o| o.value == backstage::OptValue::Check(true))
+                .collect::<Vec<_>>(),
             [false, true, true, false]
         );
-        assert!(opts[0].0.starts_with("Remove leading zeros"));
+        assert!(opts[0].label.starts_with("Remove leading zeros"));
     }
 
     /// #607: the four switches persist in the preferences file.
@@ -15286,5 +15594,388 @@ mod tests {
         let b1 = app.sheet().cell(0, 1).unwrap();
         assert_eq!(b1.f_attrs.as_deref(), Some(r#" t="array" ref="B1:B3""#));
         assert!(!b1.is_dynamic());
+    }
+
+    // ---- #672: Excel's editing options ----
+
+    fn opts_app() -> App {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        handle_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn press_mod(app: &mut App, code: KeyCode, m: KeyModifiers) {
+        handle_key(app, KeyEvent::new(code, m));
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            press(app, KeyCode::Char(ch));
+        }
+    }
+
+    fn value_at(app: &App, r: u32, c: u32) -> CellValue {
+        app.sheet()
+            .cell(r, c)
+            .map(|c| c.value.clone())
+            .unwrap_or_default()
+    }
+
+    fn put(app: &mut App, r: u32, c: u32, text: &str) {
+        let cell = entry_cell(&mut app.pkg.workbook, app.sheet, r, c, text, None).unwrap();
+        app.pkg.workbook.sheets[app.sheet].set_cell(r, c, cell);
+        app.rebuild_engine();
+    }
+
+    #[test]
+    fn enter_moves_the_way_the_options_say() {
+        for (dir, want) in [
+            (EnterMove::Down, (3, 2)),
+            (EnterMove::Right, (2, 3)),
+            (EnterMove::Up, (1, 2)),
+            (EnterMove::Left, (2, 1)),
+        ] {
+            let mut app = opts_app();
+            app.edit_opts.enter_move = dir;
+            app.cur = (2, 2);
+            type_text(&mut app, "x");
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.cur, want, "{dir:?} after a commit");
+            assert_eq!(value_at(&app, 2, 2), CellValue::Text("x".into()));
+            // Not editing: Enter moves the same way; Shift+Enter the other.
+            app.cur = (2, 2);
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(app.cur, want, "{dir:?} on the grid");
+            press_mod(&mut app, KeyCode::Enter, KeyModifiers::SHIFT);
+            assert_eq!(app.cur, (2, 2), "{dir:?} Shift+Enter back");
+        }
+        let mut app = opts_app();
+        app.edit_opts.move_after_enter = false;
+        app.cur = (2, 2);
+        type_text(&mut app, "y");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            (app.cur, app.edit.is_none()),
+            ((2, 2), true),
+            "commits and stays"
+        );
+        press_mod(&mut app, KeyCode::Enter, KeyModifiers::SHIFT);
+        assert_eq!(app.cur, (2, 2));
+        // Tab is not an Enter option.
+        type_text(&mut app, "z");
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.cur, (2, 3));
+    }
+
+    #[test]
+    fn a_typed_number_takes_the_fixed_decimal_and_the_status_says_so() {
+        use ratatui::backend::TestBackend;
+        let mut app = opts_app();
+        let screen = |app: &mut App| {
+            let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            term.draw(|f| draw(app, f)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..24)
+                .map(|y| (0..100).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(!screen(&mut app).contains("Fixed Decimal"));
+        app.edit_opts.fixed_decimal = true;
+        app.edit_opts.places = 2;
+        assert!(screen(&mut app).contains("Fixed Decimal"));
+        assert_eq!(app.status_words(), ["Fixed Decimal"]);
+        type_text(&mut app, "1234");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(value_at(&app, 0, 0), CellValue::Number(12.34));
+        type_text(&mut app, "1.5");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(value_at(&app, 1, 0), CellValue::Number(1.5));
+        app.edit_opts.places = -2;
+        type_text(&mut app, "7");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(value_at(&app, 2, 0), CellValue::Number(700.0));
+        // An F2 edit that changes an integer is typed again, so it shifts
+        // (Excel does the same); one left untouched is not re-read.
+        app.edit_opts.places = 2;
+        put(&mut app, 5, 0, "1234");
+        app.cur = (5, 0);
+        press(&mut app, KeyCode::F(2));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(value_at(&app, 5, 0), CellValue::Number(1234.0));
+        app.cur = (5, 0);
+        press(&mut app, KeyCode::F(2));
+        type_text(&mut app, "5");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(value_at(&app, 5, 0), CellValue::Number(123.45));
+    }
+
+    #[test]
+    fn autocomplete_proposes_and_any_commit_takes_it() {
+        let mut app = opts_app();
+        put(&mut app, 0, 0, "Apple");
+        put(&mut app, 1, 0, "Banana");
+        app.cur = (2, 0);
+        type_text(&mut app, "AP");
+        let e = app.edit.as_ref().unwrap();
+        assert_eq!((e.text.as_str(), e.cursor), ("APple", 2));
+        assert_eq!(e.proposal, Some((2, "Apple".to_string())));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            value_at(&app, 2, 0),
+            CellValue::Text("Apple".into()),
+            "the matched value's case"
+        );
+        // Backspace drops only the suffix; a typed char matches again.
+        app.cur = (3, 0);
+        type_text(&mut app, "b");
+        assert_eq!(app.edit.as_ref().unwrap().text, "banana");
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.edit.as_ref().unwrap().text, "b");
+        assert_eq!(app.edit.as_ref().unwrap().proposal, None);
+        type_text(&mut app, "a");
+        assert_eq!(app.edit.as_ref().unwrap().text, "banana");
+        type_text(&mut app, "x");
+        assert_eq!(
+            app.edit.as_ref().unwrap().text,
+            "bax",
+            "x replaced the suffix"
+        );
+        press(&mut app, KeyCode::Delete);
+        press(&mut app, KeyCode::Esc);
+        // A click on another cell commits with the proposal taken.
+        app.cur = (3, 0);
+        type_text(&mut app, "ban");
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        let (x, y) = (app.grid_area.x + app.gutter_w + 1, app.grid_area.y + 8);
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+        assert!(app.edit.is_none());
+        assert_eq!(value_at(&app, 3, 0), CellValue::Text("Banana".into()));
+        // Home in a typed (type-over) entry is a caret move too: the text
+        // stays as shown and typing goes where the caret went.
+        app.cur = (4, 0);
+        type_text(&mut app, "ap");
+        press(&mut app, KeyCode::Home);
+        let e = app.edit.as_ref().unwrap();
+        assert_eq!(
+            (e.text.as_str(), e.cursor, &e.proposal),
+            ("apple", 0, &None)
+        );
+        type_text(&mut app, "x");
+        assert_eq!(app.edit.as_ref().unwrap().text, "xapple");
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(value_at(&app, 4, 0), CellValue::Text("xapple".into()));
+        app.cur = (5, 1);
+        put(&mut app, 4, 1, "Plum");
+        type_text(&mut app, "p");
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            value_at(&app, 5, 1),
+            CellValue::Text("plum".into()),
+            "End kept the text as typed, not the value's case"
+        );
+        // A caret move (in an F2 editor) keeps the text, marker dropped.
+        app.cur = (5, 0);
+        press(&mut app, KeyCode::F(2));
+        type_text(&mut app, "ap");
+        assert_eq!(app.edit.as_ref().unwrap().text, "apple");
+        press(&mut app, KeyCode::Home);
+        assert_eq!(app.edit.as_ref().unwrap().proposal, None);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(value_at(&app, 5, 0), CellValue::Text("apple".into()));
+        // Off: nothing is proposed.
+        app.edit_opts.autocomplete = false;
+        app.cur = (6, 0);
+        type_text(&mut app, "ap");
+        assert_eq!(app.edit.as_ref().unwrap().text, "ap");
+    }
+
+    #[test]
+    fn a_double_click_edits_or_jumps_to_the_precedent() {
+        let mut app = opts_app();
+        put(&mut app, 0, 0, "=SUM(C3:D4)+B1");
+        put(&mut app, 0, 5, "7");
+        // Each pair of presses starts a second after the last one.
+        let base = Instant::now();
+        let mut n = 0u64;
+        let mut pair = |app: &mut App, r: u32, c: u32, gap_ms: u64| {
+            n += 1;
+            let t = base + Duration::from_secs(n);
+            app.last_click = None;
+            app.click_cell(r, c, t);
+            let one = app.edit.is_none();
+            app.click_cell(r, c, t + Duration::from_millis(gap_ms));
+            one
+        };
+        // On: a double-click edits, formula or not.
+        assert!(pair(&mut app, 0, 0, 200), "one click only selects");
+        assert_eq!(app.edit.as_ref().unwrap().text, "=SUM(C3:D4)+B1");
+        app.cancel_edit();
+        // Too slow: not a double-click.
+        pair(&mut app, 0, 5, 900);
+        assert!(app.edit.is_none());
+        // Another cell: not a double-click.
+        app.click_cell(0, 5, base);
+        app.click_cell(0, 0, base + Duration::from_millis(100));
+        assert!(app.edit.is_none());
+        // Off: a formula jumps to its first precedent, a constant edits.
+        app.edit_opts.edit_in_cell = false;
+        pair(&mut app, 0, 0, 200);
+        assert!(app.edit.is_none());
+        assert_eq!((app.cur, app.anchor), ((2, 2), Some((3, 3))));
+        pair(&mut app, 0, 5, 200);
+        assert_eq!(app.edit.as_ref().unwrap().text, "7");
+        app.cancel_edit();
+        // A key between the presses breaks the pair.
+        let t = base + Duration::from_secs(100);
+        app.click_cell(0, 5, t);
+        press(&mut app, KeyCode::Right);
+        app.click_cell(0, 5, t + Duration::from_millis(100));
+        assert!(app.edit.is_none());
+        // A hyperlink is followed and starts no double-click.
+        app.pkg.workbook.sheets[0]
+            .hyperlinks
+            .insert((7, 7), "#Sheet1!H8".into());
+        pair(&mut app, 7, 7, 100);
+        assert!(app.edit.is_none());
+    }
+
+    #[test]
+    fn a_precedent_on_another_sheet_switches_to_it() {
+        let mut app = opts_app();
+        app.pkg.workbook.sheets.push(gridcore::sheet::Sheet {
+            name: "Data".into(),
+            ..Default::default()
+        });
+        put(&mut app, 0, 0, "=Data!B2*2");
+        put(&mut app, 0, 1, "=1+2");
+        app.edit_opts.edit_in_cell = false;
+        app.cur = (0, 1);
+        app.cell_double_click(0, 1);
+        assert_eq!(
+            (app.sheet, app.cur),
+            (0, (0, 1)),
+            "no precedent: nothing moves"
+        );
+        assert!(app.status.as_deref().unwrap().contains("No precedent"));
+        app.pkg.workbook.sheets[1].hidden = true;
+        app.cur = (0, 0);
+        app.cell_double_click(0, 0);
+        assert_eq!(app.sheet, 0, "a hidden sheet is not shown");
+        app.pkg.workbook.sheets[1].hidden = false;
+        app.cell_double_click(0, 0);
+        assert_eq!((app.sheet, app.cur, app.anchor), (1, (1, 1), None));
+    }
+
+    #[test]
+    fn ctrl_shift_u_expands_the_formula_bar_even_mid_edit() {
+        use ratatui::backend::TestBackend;
+        let mut app = opts_app();
+        let grid_h = |app: &mut App| {
+            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            term.draw(|f| draw(app, f)).unwrap();
+            app.grid_area.height
+        };
+        let collapsed = grid_h(&mut app);
+        type_text(&mut app, "abc");
+        // Legacy terminals send Ctrl+U for Ctrl+Shift+U: both toggle.
+        press_mod(
+            &mut app,
+            KeyCode::Char('U'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert!(app.fx_expanded);
+        let e = app.edit.as_ref().unwrap();
+        assert_eq!((e.text.as_str(), e.cursor), ("abc", 3), "the edit goes on");
+        assert_eq!(grid_h(&mut app), collapsed - 3);
+        press_mod(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert!(!app.fx_expanded);
+        assert_eq!(grid_h(&mut app), collapsed);
+        assert_eq!(app.edit.as_ref().unwrap().text, "abc");
+    }
+
+    #[test]
+    fn vim_plain_u_still_undoes() {
+        let mut app = opts_app();
+        type_text(&mut app, "5");
+        press(&mut app, KeyCode::Enter);
+        app.vim = Some(VimState {
+            mode: VimMode::Normal,
+            pending: '\0',
+            cmdline: None,
+        });
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(value_at(&app, 0, 0), CellValue::Empty);
+        press_mod(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert!(app.fx_expanded, "Ctrl+U is the formula bar's, even in vim");
+    }
+
+    #[test]
+    fn the_editing_options_are_set_in_file_options_and_persist() {
+        let mut app = opts_app();
+        app.open_backstage();
+        let rows: Vec<String> = app
+            .backstage
+            .as_ref()
+            .unwrap()
+            .options
+            .iter()
+            .map(|o| o.key.clone())
+            .collect();
+        assert!(rows.contains(&"edit_fixed_decimal".to_string()));
+        assert!(
+            !rows.contains(&"edit_fill_handle".to_string()),
+            "xlsxy has no fill handle"
+        );
+        {
+            let bs = app.backstage.as_mut().unwrap();
+            bs.item = backstage::Item::Options;
+            bs.pane = backstage::Pane::Options;
+            bs.option_sel = rows.iter().position(|k| k == "edit_fixed_decimal").unwrap();
+        }
+        let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        app.backstage_key(key(KeyCode::Char(' ')));
+        app.backstage_key(key(KeyCode::Down));
+        app.backstage_key(key(KeyCode::Right));
+        app.backstage_key(key(KeyCode::Down));
+        app.backstage_key(key(KeyCode::Down));
+        app.backstage_key(key(KeyCode::Left));
+        app.backstage_key(key(KeyCode::Down));
+        app.backstage_key(key(KeyCode::Enter));
+        let want = EditOptions {
+            fixed_decimal: true,
+            places: 3,
+            enter_move: EnterMove::Left,
+            edit_in_cell: false,
+            ..EditOptions::default()
+        };
+        assert_eq!(app.edit_opts, want);
+        // Saved with the other preferences and read back on the next start.
+        let text = app.view_prefs_text();
+        assert!(text.contains("convert_dates=1"), "{text}");
+        let mut again = opts_app();
+        again.apply_view_prefs(&text);
+        assert_eq!(again.edit_opts, want);
+        // And the reopened page shows them.
+        again.open_backstage();
+        let bs = again.backstage.as_ref().unwrap();
+        assert_eq!(bs.option_int("edit_fixed_decimal_places"), Some(3));
+        assert_eq!(bs.option_choice("edit_move_direction"), Some(3));
+        assert_eq!(bs.option_check("edit_in_cell"), Some(false));
     }
 }

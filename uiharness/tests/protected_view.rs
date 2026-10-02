@@ -119,6 +119,27 @@ fn a_downloaded_workbook_opens_protected_until_enable_editing() {
         "{st}"
     );
 
+    // Ctrl+Shift+U expands the formula bar (#672): view state, so Protected
+    // View does not refuse it.
+    let st = ok(
+        &driver,
+        "key",
+        vec![("keys", Json::Arr(vec![s("ctrl+shift+u")]))],
+    );
+    assert_eq!(st.get("fx_expanded"), Some(&Json::Bool(true)), "{st}");
+    assert_ne!(
+        st.get("status").and_then(Json::as_str),
+        Some(protected_status),
+        "{st}"
+    );
+    assert_eq!(st.get("dirty"), Some(&Json::Bool(false)), "{st}");
+    let st = ok(
+        &driver,
+        "key",
+        vec![("keys", Json::Arr(vec![s("ctrl+shift+u")]))],
+    );
+    assert_eq!(st.get("fx_expanded"), Some(&Json::Bool(false)), "{st}");
+
     // Every way of editing is refused and leaves the cells and the tab alone.
     ok(&driver, "click-cell", vec![("cell", s("B2"))]);
     let st = ok(&driver, "type", vec![("text", s("99"))]);

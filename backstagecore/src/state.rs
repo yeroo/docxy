@@ -11,7 +11,7 @@ pub enum Item {
     SaveAs,
     Export,
     /// The host's options page (only hosts that ask for it, see
-    /// [`Backstage::with_options`]).
+    /// [`Backstage::with_option_rows`]).
     Options,
     Exit,
 }
@@ -98,7 +98,7 @@ pub enum Pane {
     Preview,
     /// The Save As dialog (folder browser + typed file name).
     SaveAs,
-    /// The Options page's checkboxes.
+    /// The Options page's rows.
     Options,
     /// Export's list: the host's quick export, then Change File Type.
     Export,
@@ -122,6 +122,126 @@ pub struct BackstageLayout {
     pub info_top: i32,
     /// The Info box's inner rows, `[first, end)`: only a click there counts.
     pub info_view: (u16, u16),
+    /// Left edge of the Options page, where its rows' text starts.
+    pub options_x: u16,
+}
+
+/// What an Options row holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OptValue {
+    /// A checkbox.
+    Check(bool),
+    /// One of `items`, `at` the chosen one (a direction list).
+    Choice { items: Vec<String>, at: usize },
+    /// A whole number in `min..=max` (a count of places).
+    Int { value: i32, min: i32, max: i32 },
+}
+
+/// How far a choice or number row is indented under its checkbox.
+const VALUE_INDENT: usize = 7;
+
+/// One row of the Options page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptRow {
+    /// A stable name the host reads the row back by (labels are UI text).
+    pub key: String,
+    pub label: String,
+    /// The heading the row sits under; a new heading starts where the
+    /// section changes from the row before.
+    pub section: String,
+    pub value: OptValue,
+    /// The key of a checkbox this row only matters with: while that box is
+    /// off the row is drawn dimmed (it stays editable, as in Excel).
+    pub depends_on: Option<String>,
+}
+
+impl OptRow {
+    /// A checkbox row.
+    pub fn check(key: &str, section: &str, label: &str, on: bool) -> OptRow {
+        OptRow {
+            key: key.to_string(),
+            label: label.to_string(),
+            section: section.to_string(),
+            value: OptValue::Check(on),
+            depends_on: None,
+        }
+    }
+
+    /// A row choosing one of `items`.
+    pub fn choice(key: &str, section: &str, label: &str, items: &[&str], at: usize) -> OptRow {
+        OptRow {
+            value: OptValue::Choice {
+                items: items.iter().map(|s| s.to_string()).collect(),
+                at: at.min(items.len().saturating_sub(1)),
+            },
+            ..OptRow::check(key, section, label, false)
+        }
+    }
+
+    /// A row holding a number in `min..=max`.
+    pub fn int(key: &str, section: &str, label: &str, value: i32, min: i32, max: i32) -> OptRow {
+        OptRow {
+            value: OptValue::Int {
+                value: value.clamp(min, max),
+                min,
+                max,
+            },
+            ..OptRow::check(key, section, label, false)
+        }
+    }
+
+    /// How a choice or number row reads: its label, then the value between
+    /// `‹ ›` (a click on `‹` steps back, anywhere else on the row on).
+    pub fn value_text(&self) -> Option<String> {
+        let value = match &self.value {
+            OptValue::Check(_) => return None,
+            OptValue::Choice { items, at } => items.get(*at).cloned().unwrap_or_default(),
+            OptValue::Int { value, .. } => value.to_string(),
+        };
+        Some(format!(
+            "{}{}: ‹ {value} ›",
+            " ".repeat(VALUE_INDENT),
+            self.label
+        ))
+    }
+
+    /// The column of a value row's `‹`, from where its text starts.
+    pub fn back_arrow_col(&self) -> Option<usize> {
+        self.value_text()?;
+        Some(VALUE_INDENT + self.label.chars().count() + 2)
+    }
+
+    /// This row, dimmed while the checkbox `key` is off.
+    pub fn depends_on(mut self, key: &str) -> OptRow {
+        self.depends_on = Some(key.to_string());
+        self
+    }
+
+    /// Step the value: a checkbox flips, a choice moves `by` places
+    /// (wrapping), a number moves `by` (clamped).
+    pub fn step(&mut self, by: i32) {
+        match &mut self.value {
+            OptValue::Check(on) => *on = !*on,
+            OptValue::Choice { items, at } => {
+                let n = items.len() as i32;
+                if n > 0 {
+                    *at = (*at as i32 + by).rem_euclid(n) as usize;
+                }
+            }
+            OptValue::Int { value, min, max } => *value = (*value + by).clamp(*min, *max),
+        }
+    }
+}
+
+/// One line of the Options page, top to bottom: what both the drawing and a
+/// click's hit test lay out (see [`Backstage::option_lines`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptLine {
+    /// A section's heading (the index of its first row).
+    Heading(usize),
+    Blank,
+    /// The row at this index of [`Backstage::options`].
+    Row(usize),
 }
 
 pub struct Backstage {
@@ -150,10 +270,9 @@ pub struct Backstage {
     pub name_focus: bool,
     /// The menu, in display order.
     items: Vec<Item>,
-    /// The Options page: its heading and each checkbox (label, on).
-    pub options_title: String,
-    pub options: Vec<(String, bool)>,
-    /// The highlighted checkbox.
+    /// The Options page's rows, grouped by their sections.
+    pub options: Vec<OptRow>,
+    /// The highlighted row.
     pub option_sel: usize,
     /// Save As's *Save as type* list (empty: no list, as docxy has none).
     pub save_types: &'static [SaveType],
@@ -204,7 +323,6 @@ impl Backstage {
             name_cursor: 0,
             name_focus: false,
             items: ITEMS.to_vec(),
-            options_title: String::new(),
             options: Vec::new(),
             option_sel: 0,
             save_types: &[],
@@ -224,16 +342,71 @@ impl Backstage {
         b
     }
 
-    /// Add an Options page (before Exit) with `title` and these checkboxes.
-    /// The host reads [`Backstage::options`] back after each key or click.
-    pub fn with_options(mut self, title: &str, options: Vec<(String, bool)>) -> Backstage {
+    /// Add an Options page (before Exit) with these rows, which may mix
+    /// checkboxes, choices and numbers under several sections. The host
+    /// reads [`Backstage::options`] back, by key, after each key or click.
+    pub fn with_option_rows(mut self, rows: Vec<OptRow>) -> Backstage {
         if !self.items.contains(&Item::Options) {
             let at = self.items.len().saturating_sub(1);
             self.items.insert(at, Item::Options);
         }
-        self.options_title = title.to_string();
-        self.options = options;
+        self.options = rows;
         self
+    }
+
+    /// The Options page's lines: each section's heading and a blank line,
+    /// then its rows, with a blank line between sections.
+    pub fn option_lines(&self) -> Vec<OptLine> {
+        let mut lines = Vec::new();
+        for (i, row) in self.options.iter().enumerate() {
+            if i == 0 || self.options[i - 1].section != row.section {
+                if i > 0 {
+                    lines.push(OptLine::Blank);
+                }
+                lines.push(OptLine::Heading(i));
+                lines.push(OptLine::Blank);
+            }
+            lines.push(OptLine::Row(i));
+        }
+        lines
+    }
+
+    /// The row keyed `key`.
+    pub fn option(&self, key: &str) -> Option<&OptValue> {
+        self.options.iter().find(|o| o.key == key).map(|o| &o.value)
+    }
+
+    /// The checkbox keyed `key`, if there is one.
+    pub fn option_check(&self, key: &str) -> Option<bool> {
+        match self.option(key)? {
+            OptValue::Check(on) => Some(*on),
+            _ => None,
+        }
+    }
+
+    /// The chosen index of the choice keyed `key`.
+    pub fn option_choice(&self, key: &str) -> Option<usize> {
+        match self.option(key)? {
+            OptValue::Choice { at, .. } => Some(*at),
+            _ => None,
+        }
+    }
+
+    /// The number keyed `key`.
+    pub fn option_int(&self, key: &str) -> Option<i32> {
+        match self.option(key)? {
+            OptValue::Int { value, .. } => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// Is row `i` dimmed: does it depend on a checkbox that is off?
+    pub fn option_dimmed(&self, i: usize) -> bool {
+        self.options
+            .get(i)
+            .and_then(|o| o.depends_on.as_deref())
+            .and_then(|k| self.option_check(k))
+            .is_some_and(|on| !on)
     }
 
     /// Give Save As a *Save as type* list, and Export a page listing
@@ -321,10 +494,15 @@ impl Backstage {
         &self.items
     }
 
-    /// Flip the highlighted option.
+    /// Flip the highlighted checkbox, or move its choice or number on by one.
     pub fn toggle_option(&mut self) {
+        self.step_option(1);
+    }
+
+    /// Step the highlighted row by `by` ([`OptRow::step`]).
+    pub fn step_option(&mut self, by: i32) {
         if let Some(o) = self.options.get_mut(self.option_sel) {
-            o.1 = !o.1;
+            o.step(by);
         }
     }
 
@@ -508,8 +686,10 @@ mod tests {
         let plain = Backstage::open(std::env::temp_dir(), &["docx"]);
         // docxy, lookxy and yppxy keep their seven items.
         assert_eq!(plain.items(), ITEMS);
-        let mut bs = Backstage::open(std::env::temp_dir(), &["xlsx"])
-            .with_options("Data", vec![("One".into(), true), ("Two".into(), false)]);
+        let mut bs = Backstage::open(std::env::temp_dir(), &["xlsx"]).with_option_rows(vec![
+            OptRow::check("One", "Data", "One", true),
+            OptRow::check("Two", "Data", "Two", false),
+        ]);
         assert_eq!(bs.items().len(), 8);
         assert_eq!(bs.items()[6], Item::Options);
         assert_eq!(*bs.items().last().unwrap(), Item::Exit);
@@ -518,7 +698,57 @@ mod tests {
         assert_eq!(bs.item, Item::Options);
         bs.option_sel = 1;
         bs.toggle_option();
-        assert_eq!(bs.options[1], ("Two".to_string(), true));
+        assert_eq!(bs.option_check("Two"), Some(true));
+        assert_eq!(bs.options[1].section, "Data");
+    }
+
+    fn rows() -> Vec<OptRow> {
+        vec![
+            OptRow::check("a", "Data", "A", true),
+            OptRow::check("fixed", "Editing", "Fixed", false),
+            OptRow::int("places", "Editing", "Places", 2, -3, 3).depends_on("fixed"),
+            OptRow::choice("dir", "Editing", "Direction", &["Down", "Right", "Up"], 0),
+        ]
+    }
+
+    #[test]
+    fn option_lines_head_each_section() {
+        let bs = Backstage::open(std::env::temp_dir(), &["xlsx"]).with_option_rows(rows());
+        use OptLine::*;
+        assert_eq!(
+            bs.option_lines(),
+            vec![
+                Heading(0),
+                Blank,
+                Row(0),
+                Blank,
+                Heading(1),
+                Blank,
+                Row(1),
+                Row(2),
+                Row(3)
+            ]
+        );
+        assert!(bs.option_dimmed(2), "Places depends on the off box");
+        assert!(!bs.option_dimmed(3));
+    }
+
+    #[test]
+    fn value_rows_step_clamped_or_wrapping() {
+        let mut bs = Backstage::open(std::env::temp_dir(), &["xlsx"]).with_option_rows(rows());
+        bs.option_sel = 2;
+        bs.step_option(1);
+        assert_eq!(bs.option_int("places"), Some(3));
+        bs.step_option(1);
+        assert_eq!(bs.option_int("places"), Some(3), "clamped at max");
+        bs.step_option(-10);
+        assert_eq!(bs.option_int("places"), Some(-3), "clamped at min");
+        bs.option_sel = 3;
+        bs.step_option(-1);
+        assert_eq!(bs.option_choice("dir"), Some(2), "wraps backwards");
+        bs.toggle_option();
+        assert_eq!(bs.option_choice("dir"), Some(0), "wraps forwards");
+        assert_eq!(bs.option_check("dir"), None, "not a checkbox");
     }
 
     const TYPES: &[SaveType] = &[

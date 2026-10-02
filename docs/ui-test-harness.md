@@ -329,6 +329,8 @@ State keys, as the app reports them after every driving verb:
 | `tabs`, `ask_on_close` | open tab count and whether window close asks about unsaved changes |
 | `autorecover_minutes` | minutes between AutoRecover writes while a tab is unsaved; `0` is off |
 | `keep_drafts` | whether Don't Save keeps a workbook's last AutoRecover copy as a draft |
+| `sheet_editing` | Settings' Sheet editing options (#672), by their `session.json` keys: `edit_fixed_decimal`, `edit_fixed_decimal_places`, `edit_move_after_enter`, `edit_move_direction` (`down`/`right`/`up`/`left`), `edit_in_cell`, `edit_autocomplete`, `edit_fill_handle` |
+| `fx_expanded` | whether Ctrl+Shift+U has expanded the sheet formula bar |
 | `menu` | the open menu's `{target}`, or null; `menu-read` has its items |
 | `sheet`, `sel`, `anchor`, `range` | the sheet and its selection |
 | `editing`, `edit` | whether a cell edit is open, and its text |
@@ -709,10 +711,12 @@ the state plus `filled`, the filled box (`B4:B8`), or `null` when released on
 the source. Refused:
 
 - while the handle is not drawn: `the fill handle is not shown: a cell is being
-  edited`, `… a reference is being pointed at`, `… a chart is selected`
+  edited`, `… a reference is being pointed at`, `… a chart is selected`,
+  `… the fill handle is turned off in Settings` (#672)
   (`fill_handle_hidden`, the grid's own condition), or `… File (backstage) is
   open`; or while `the fill handle is covered: the more-tabs list is open`. An
-  edit, a pointing reference and a cover are refused before `from` is clicked,
+  edit, a pointing reference, the Settings switch and a cover are refused
+  before `from` is clicked,
   so a refused verb changes nothing (a click would land in the edit or the
   reference); a selected chart is refused only if the handle is still hidden
   after `from`'s click, which takes the selection back as the pointer's would.
