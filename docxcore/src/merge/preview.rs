@@ -65,21 +65,48 @@ pub(crate) fn cached_text(raw: &str) -> String {
     }
 }
 
+/// A merge field's text outside preview: its cached result, or its
+/// placeholder when the cache is empty.
+fn unpreviewed_text(raw: &str, kind: &MergeFieldKind) -> String {
+    let cached = cached_text(raw);
+    if cached.is_empty() {
+        kind.placeholder()
+    } else {
+        cached
+    }
+}
+
+/// Put merge fields in copied inlines back to their unpreviewed text.
+pub(crate) fn unpreview_inlines(items: &mut [Inline]) {
+    for inl in items {
+        match inl {
+            Inline::Field { raw, text } => {
+                if let Some(kind) = field_kind(raw) {
+                    *text = unpreviewed_text(raw, &kind);
+                }
+            }
+            Inline::Hyperlink(h) => unpreview_inlines(&mut h.content),
+            Inline::Revision { content, .. } => unpreview_inlines(content),
+            Inline::TextBox { blocks, .. } => unpreview_blocks(blocks),
+            _ => {}
+        }
+    }
+}
+
+fn unpreview_blocks(blocks: &mut [Block]) {
+    visit_fields(blocks, &mut |raw, text| {
+        if let Some(kind) = field_kind(raw) {
+            *text = unpreviewed_text(raw, &kind);
+        }
+    });
+}
+
 /// Show `preview`'s record in every merge field of `doc`, or, with `None`,
 /// each field's cached result again (its `«Name»` placeholder when the cache
 /// is empty, so the field keeps its offset).
 pub fn apply_preview(doc: &mut Document, preview: Option<&MergePreview>) {
     let Some(p) = preview else {
-        visit_fields(&mut doc.body, &mut |raw, text| {
-            if let Some(kind) = field_kind(raw) {
-                let cached = cached_text(raw);
-                *text = if cached.is_empty() {
-                    kind.placeholder()
-                } else {
-                    cached
-                };
-            }
-        });
+        unpreview_blocks(&mut doc.body);
         return;
     };
     let rows = p.recipients.included_rows();
@@ -245,6 +272,20 @@ mod tests {
             shown(&ed.doc),
             "Hi \u{AB}First\u{BB} \u{AB}Company\u{BB}!\n"
         );
+    }
+
+    #[test]
+    fn copy_gives_placeholders_not_the_previewed_record() {
+        let mut ed = Editor::new(letter());
+        ed.set_merge_preview(Some(preview(0)));
+        ed.select_all();
+        let clip = ed.copy().unwrap();
+        assert_eq!(
+            clip.to_text().replace(EMPTY_PREVIEW, ""),
+            "Hi \u{AB}First\u{BB} \u{AB}Company\u{BB}!"
+        );
+        // The document still shows the record.
+        assert_eq!(shown(&ed.doc), "Hi Jane Acme!\n");
     }
 
     #[test]

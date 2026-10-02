@@ -1159,6 +1159,13 @@ impl Editor {
                 paras.push(extract_range(&p.content, s, e));
             }
         }
+        // A previewed record is display only: copied merge fields carry
+        // their placeholders, as a save would.
+        if self.merge_preview.is_some() {
+            for para in &mut paras {
+                crate::merge::preview::unpreview_inlines(para);
+            }
+        }
         Some(Clip { paras })
     }
 

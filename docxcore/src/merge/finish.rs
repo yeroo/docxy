@@ -106,6 +106,39 @@ pub fn merge_package(
     Ok(out)
 }
 
+/// Check for Errors: the merge fields in `doc` that name no column of the
+/// recipient list (through Match Fields where they are mapped), each once, in
+/// document order. Empty when the merge would complete without errors.
+pub fn check_errors(
+    doc: &crate::model::Document,
+    recipients: &Recipients,
+    map: &FieldMap,
+) -> Vec<String> {
+    let mut missing: Vec<String> = Vec::new();
+    let mut body = doc.body.clone();
+    let row = recipients.included_rows().first().copied().unwrap_or(0);
+    super::preview::visit_fields(&mut body, &mut |raw, _| {
+        let Some(kind @ MergeFieldKind::MergeField { .. }) = field_kind(raw) else {
+            return;
+        };
+        let ctx = MergeContext {
+            recipients,
+            map,
+            row,
+            seq: 1,
+        };
+        if eval(&kind, &ctx).is_none() {
+            let MergeFieldKind::MergeField { name, .. } = kind else {
+                return;
+            };
+            if !missing.contains(&name) {
+                missing.push(name);
+            }
+        }
+    });
+    missing
+}
+
 /// End the section at the last paragraph of `blocks` with `sect`, or with a
 /// new empty paragraph when the copy ends in a table or already ends a
 /// section there.
@@ -365,6 +398,24 @@ mod tests {
             .unwrap_or_default();
         assert!(!rels.contains("mailMergeSource"), "{rels}");
         assert!(main.mail_merge().is_some());
+    }
+
+    #[test]
+    fn check_errors_lists_fields_with_no_column() {
+        let r = people();
+        let p = RunProps::default();
+        let doc = crate::model::Document {
+            body: vec![para(vec![
+                merge_field("First", &p),
+                merge_field("Zip", &p),
+                merge_field("City", &p),
+                merge_field("Zip", &p),
+                merge_field("Phone", &p),
+            ])],
+        };
+        let map = FieldMap::auto(&r);
+        assert_eq!(check_errors(&doc, &r, &map), ["Zip", "Phone"]);
+        assert!(check_errors(&letter().document, &r, &map).is_empty());
     }
 
     #[test]
