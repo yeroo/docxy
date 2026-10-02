@@ -699,9 +699,16 @@ pub(crate) fn attach(tab: &mut DocTab, path: &std::path::Path) -> Result<(), Str
     Ok(())
 }
 
-/// Why the document's own data source cannot be read, if it cannot: Word
-/// reads a local .csv/.txt by its full path.
+/// Why the document's own data source will not be offered for reading, if
+/// it will not: Word reads a local .csv/.txt by its full path.
+///
+/// Purely lexical, because it runs before the person has said Yes: nothing
+/// here touches the file system. A network (UNC), verbatim (`\\?\`) or
+/// device (`\\.\`) path is refused outright, since even asking whether it
+/// exists would reach out to the server it names (and, for SMB, hand it the
+/// person's credentials). A missing file is reported by the read after Yes.
 pub(crate) fn pending_problem(source: &str) -> Option<String> {
+    use std::path::{Component, Prefix};
     let path = std::path::Path::new(source);
     let lower = source.to_ascii_lowercase();
     if !(lower.ends_with(".csv") || lower.ends_with(".txt")) {
@@ -709,14 +716,20 @@ pub(crate) fn pending_problem(source: &str) -> Option<String> {
             "The document's data source {source} is not a .csv or .txt list; use Select Recipients"
         ));
     }
+    let remote = source.starts_with("\\\\")
+        || source.starts_with("//")
+        || matches!(
+            path.components().next(),
+            Some(Component::Prefix(p)) if !matches!(p.kind(), Prefix::Disk(_))
+        );
+    if remote {
+        return Some(format!(
+            "The document's data source {source} is not on this computer; use Select Recipients"
+        ));
+    }
     if !path.is_absolute() {
         return Some(format!(
             "The document's data source {source} is not a full path; use Select Recipients"
-        ));
-    }
-    if !path.exists() {
-        return Some(format!(
-            "The document's data source {source} was not found; use Select Recipients"
         ));
     }
     None

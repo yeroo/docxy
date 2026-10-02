@@ -607,7 +607,8 @@ fn is_mail(owner: DialogOwner) -> bool {
 /// Press a button on a Mailings dialog: `None` for any other dialog, and for
 /// a cancel button, which the generic stack handles. An accept button closes
 /// its dialog before it applies (it may open another: a confirm, a report),
-/// and reopens it with its staged values when the apply refuses.
+/// and reopens it with its staged values when the apply refuses (not the
+/// confirm before reading the document's own list: it has nothing to retry).
 pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>> {
     let top = tab.dialogs.top()?;
     if !is_mail(top.owner) {
@@ -627,7 +628,9 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
         ButtonRole::Accept => {
             tab.dialogs.pop();
             let done = apply(tab, &dialog);
-            if done.is_err() {
+            // Yes on reading the document's own list has nothing to retry:
+            // the error says why the read failed.
+            if done.is_err() && !matches!(dialog.owner, DialogOwner::MailAttach { .. }) {
                 tab.dialogs.push(dialog);
             }
             Some(done)

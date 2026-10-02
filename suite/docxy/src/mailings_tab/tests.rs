@@ -377,14 +377,12 @@ fn a_documents_own_source_is_read_only_after_yes() {
     dialog_click(&mut t, "Yes").unwrap();
     assert_eq!(t.mail.recipients.as_ref().unwrap().rows.len(), 3);
     assert_eq!(t.mail.after_attach, Some(MailAct::Preview));
-    // A relative, missing or non-list source is never read.
+    // A relative or non-list source is never offered.
     assert!(
         pending_problem("list.csv")
             .unwrap()
             .contains("not a full path")
     );
-    let missing = fixture("nope.csv").display().to_string();
-    assert!(pending_problem(&missing).unwrap().contains("was not found"));
     assert!(
         pending_problem("C:\\data\\x.mdb")
             .unwrap()
@@ -394,6 +392,36 @@ fn a_documents_own_source_is_read_only_after_yes() {
         pending_problem(&fixture("recipients.csv").display().to_string()),
         None
     );
+}
+
+/// r1 M4: the checks before the question touch no file system, so a source
+/// on another machine is refused before any dialog (asking whether a UNC
+/// path exists would reach its server); a missing local file is asked about
+/// and reported by the read after Yes.
+#[test]
+fn a_remote_source_is_refused_before_the_question() {
+    for remote in [
+        "\\\\attacker\\share\\x.csv",
+        "\\\\?\\UNC\\attacker\\share\\x.csv",
+        "\\\\?\\C:\\data\\x.csv",
+        "\\\\.\\pipe\\x.csv",
+        "//attacker/share/x.csv",
+    ] {
+        let why = pending_problem(remote).unwrap_or_else(|| panic!("{remote} offered"));
+        assert!(why.contains("not on this computer"), "{remote}: {why}");
+    }
+    let missing = fixture("nope.csv").display().to_string();
+    assert_eq!(pending_problem(&missing), None, "asked about, not checked");
+    let mut t = letter_tab();
+    t.mail.pending_source = Some(missing.clone());
+    t.dialogs.push(crate::mailings_dialogs::attach_confirm(
+        &missing,
+        MailAct::Preview,
+    ));
+    let err = dialog_click(&mut t, "Yes").unwrap_err();
+    assert!(err.contains("cannot read"), "{err}");
+    assert!(t.mail.recipients.is_none());
+    assert!(!t.dialogs.is_open(), "nothing to retry");
 }
 
 #[test]
