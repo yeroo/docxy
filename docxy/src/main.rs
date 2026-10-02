@@ -2720,6 +2720,12 @@ impl App {
         self.hf_edit.as_ref().map_or(&self.editor, |hf| &hf.body)
     }
 
+    fn body_editor_mut(&mut self) -> &mut Editor {
+        self.hf_edit
+            .as_mut()
+            .map_or(&mut self.editor, |hf| &mut hf.body)
+    }
+
     /// Re-derive the header/footer parts, their content and titlePg from the
     /// body's final sectPr whenever it changed: undo and redo restore that
     /// sectPr, so the view, save and PDF follow them.
@@ -2992,7 +2998,13 @@ impl App {
         }
         let idx = self.comment_sel.min(self.comments.len() - 1);
         let c = self.comments.remove(idx);
-        self.editor.remove_comment_markers(&c.id);
+        // The body's markers, even while a header or footer is being
+        // edited (`editor` is then that part's); and that part's own, for
+        // a comment anchored there. Each is a step only where it removed.
+        self.body_editor_mut().remove_comment_markers(&c.id);
+        if self.hf_edit.is_some() {
+            self.editor.remove_comment_markers(&c.id);
+        }
         if let Ok(id) = c.id.parse::<i32>() {
             self.pkg.remove_comment(id);
         }
@@ -11704,6 +11716,27 @@ mod tests {
         assert!(app.comments.is_empty());
         add_comment_by_keys(&mut app, "two");
         assert_ne!(app.comments[0].id, first);
+    }
+
+    /// FIX r4 #1: Delete Comment while a header is being edited deletes the
+    /// body comment: its markers leave the body, not the header editor, so
+    /// it stays out of the panel and the save.
+    #[test]
+    fn delete_comment_while_editing_a_header_removes_the_body_markers() {
+        let mut app = app_with(&["The quick brown fox."]);
+        add_comment_by_keys(&mut app, "Colour?");
+        app.run_act(ribbon::Act::EditHeader);
+        assert!(app.hf_edit.is_some());
+        app.run_act(ribbon::Act::DeleteComment);
+        assert!(app.comments.is_empty(), "the panel drops it");
+        app.run_act(ribbon::Act::EditDocument);
+        assert!(app.hf_edit.is_none());
+        assert!(app.comments.is_empty(), "and keeps it out");
+        let path = save_to_temp(&mut app, "cmt-hf-delete");
+        let (doc, comments) = saved_parts(&path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert!(!doc.contains("w:id=\"1\""), "{doc}");
+        assert!(!comments.contains("Colour?"), "{comments}");
     }
 
     #[test]
