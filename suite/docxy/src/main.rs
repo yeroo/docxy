@@ -83,6 +83,7 @@ use gpui_component::{
     tooltip::Tooltip,
     v_flex,
 };
+use gridcore::options::{EditOptions, EnterMove};
 use ribbonspec::{self as rs, Control};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
@@ -255,6 +256,12 @@ struct Session {
     /// saving" (#613). A session written before the setting gets Excel's on.
     #[serde(default = "keep_drafts_default")]
     keep_drafts: bool,
+    /// File › Options › Advanced › Editing for sheet tabs (#672), as the
+    /// `key=value` lines `EditOptions` writes: the reader xlsxy uses too, so
+    /// a session written before the setting (or a bad value) gets Excel's
+    /// defaults.
+    #[serde(default)]
+    sheet_editing: String,
 }
 
 fn autorecover_default() -> u32 {
@@ -285,6 +292,7 @@ impl Default for Session {
             ask_on_close: false,
             autorecover_minutes: recover::DEFAULT_MINUTES,
             keep_drafts: true,
+            sheet_editing: String::new(),
         }
     }
 }
@@ -296,6 +304,7 @@ struct Prefs {
     ask_on_close: bool,
     autorecover_minutes: u32,
     keep_drafts: bool,
+    edit_opts: EditOptions,
 }
 
 /// Environment variable that redirects every file the app persists — the
@@ -570,6 +579,14 @@ struct SheetView {
     /// next render. Only the render pass knows how wide the grid is, so
     /// `reveal_range` can't work out a rightwards scroll itself.
     reveal_col: Option<u32>,
+    /// The app's File › Options › Editing (#672), stamped by
+    /// [`sheet_with_opts`] each time the app reaches this view.
+    edit_opts: EditOptions,
+    /// AutoComplete's proposal (#672): the char index its selected suffix
+    /// starts at (the caret stays there) and the value it completes to. Any
+    /// commit takes the value; Backspace or Delete drops the suffix; a caret
+    /// move keeps the text and drops the marker.
+    edit_proposal: Option<(usize, String)>,
 }
 
 /// A formatting change to one cell's `Xf`, kept for F4 to repeat.
@@ -1010,6 +1027,20 @@ fn gesture_in_flight(
     drag_anchor || sheet_dragging || range_pick || formula_pick
 }
 
+/// The sheet a tab holds, with the app's Editing options stamped on it: every
+/// key, click and command reaches a sheet through here
+/// ([`Docxy::active_sheet_mut`]), so a tab opened after the options changed
+/// still commits, moves and completes under the current ones (#672).
+fn sheet_with_opts(tab: Option<&mut DocTab>, opts: EditOptions) -> Option<&mut SheetView> {
+    match tab.map(|t| &mut t.surface) {
+        Some(Surface::Sheet(v)) => {
+            v.edit_opts = opts;
+            Some(v)
+        }
+        _ => None,
+    }
+}
+
 /// Whether [`Docxy::sheet_fill_start`] may arm an auto-fill. Only a press that
 /// reached the fill handle itself may, so a gesture already in flight refuses —
 /// see that method for why a legitimate fill never trips this.
@@ -1024,14 +1055,18 @@ fn may_arm_fill(already_filling: bool, gesture_in_flight: bool) -> bool {
 ///
 /// A protected sheet refuses too (#699): the fill writes cells, and every other
 /// cell-writing command (`sheet_clear`, `sheet_paste`, …) already refuses there.
+///
+/// File › Options' "Enable fill handle and cell drag-and-drop" off
+/// (`enabled` false) refuses as well: there is no handle to press (#672).
 fn arm_fill(
     fill: &mut Option<FillDrag>,
     src: Option<(u32, u32, u32, u32)>,
     gesture_in_flight: bool,
     tab_more_open: bool,
     protected: bool,
+    enabled: bool,
 ) -> bool {
-    if tab_more_open || protected || !may_arm_fill(fill.is_some(), gesture_in_flight) {
+    if !enabled || tab_more_open || protected || !may_arm_fill(fill.is_some(), gesture_in_flight) {
         return false;
     }
     let Some(src) = src else { return false };
@@ -1057,6 +1092,8 @@ enum HandleHidden {
     Pointing,
     /// A chart holds the selection.
     ChartSelected,
+    /// File › Options turned the fill handle off (#672).
+    Disabled,
 }
 
 impl HandleHidden {
@@ -1065,6 +1102,7 @@ impl HandleHidden {
             HandleHidden::Editing => "a cell is being edited",
             HandleHidden::Pointing => "a reference is being pointed at",
             HandleHidden::ChartSelected => "a chart is selected",
+            HandleHidden::Disabled => "the fill handle is turned off in Settings",
         }
     }
 
@@ -1082,12 +1120,15 @@ impl HandleHidden {
 /// (#699). A handle whose corner sits under a chart card is hidden by layout,
 /// which only the render pass knows; that case is not modelled here.
 fn fill_handle_hidden(
+    enabled: bool,
     editing: bool,
     range_field: bool,
     formula_pick: bool,
     chart_sel: Option<usize>,
 ) -> Option<HandleHidden> {
-    if editing {
+    if !enabled {
+        Some(HandleHidden::Disabled)
+    } else if editing {
         Some(HandleHidden::Editing)
     } else if fill_handle_pointing(range_field, formula_pick) {
         Some(HandleHidden::Pointing)
@@ -1364,6 +1405,131 @@ impl SheetView {
         self.edit_origin = None;
         self.edit_overtype = false;
         self.edit_point = None;
+        self.edit_proposal = None;
+    }
+
+    /// The context a typed commit reads its entry under: the workbook's, with
+    /// the user's fixed decimal point (only typing shifts a number, #672).
+    fn typed_ctx(&self) -> gridcore::entry::EntryCtx {
+        gridcore::entry::EntryCtx {
+            fixed_decimal: self.edit_opts.fixed_places(),
+            ..gridcore::entry::entry_ctx(&self.pkg.workbook, self.engine.clock)
+        }
+    }
+
+    /// Where Enter (Shift+Enter: `back`) moves after its commit: File ›
+    /// Options › Editing's direction, or nowhere with "move selection" off.
+    fn enter_delta(&self, back: bool) -> (i32, i32) {
+        self.edit_opts.enter_delta(back)
+    }
+
+    /// A printable character typed on the grid: into the open editor (over
+    /// an AutoComplete proposal's suffix), or starting a fresh entry; then
+    /// AutoComplete proposes again.
+    fn type_char(&mut self, c: &str) {
+        if self.editing.is_some() {
+            self.drop_proposal();
+            self.edit_type(c);
+        } else {
+            self.begin_cell_edit(Some(String::new()));
+            self.edit_caret = 0;
+            self.edit_insert(c);
+        }
+        self.propose();
+    }
+
+    /// AutoComplete (#672): with the option on and the caret at the end of
+    /// the editor, append the rest of the one column value the typed text
+    /// starts, selected ([`SheetView::edit_proposal`]). Never while pointing
+    /// a formula at cells (a formula is never proposed for anyway).
+    fn propose(&mut self) {
+        if !self.edit_opts.autocomplete || self.edit_proposal.is_some() || self.edit_point.is_some()
+        {
+            return;
+        }
+        let Some(buf) = self.editing.as_deref() else {
+            return;
+        };
+        let n = buf.chars().count();
+        if self.edit_caret != n {
+            return;
+        }
+        let (s, r, c) = self
+            .edit_origin
+            .unwrap_or((self.active, self.sel.0, self.sel.1));
+        let Some(sheet) = self.pkg.workbook.sheets.get(s) else {
+            return;
+        };
+        let Some(value) = gridcore::entry::autocomplete(sheet, r, c, buf) else {
+            return;
+        };
+        let suffix: String = value.chars().skip(n).collect();
+        if suffix.is_empty() {
+            return;
+        }
+        if let Some(buf) = self.editing.as_mut() {
+            buf.push_str(&suffix);
+            self.edit_proposal = Some((n, value));
+        }
+    }
+
+    /// Drop an AutoComplete proposal's suffix from the editor (Backspace,
+    /// Delete, or a typed character replacing it). True when there was one.
+    fn drop_proposal(&mut self) -> bool {
+        let Some((from, _)) = self.edit_proposal.take() else {
+            return false;
+        };
+        if let Some(buf) = self.editing.as_mut() {
+            *buf = buf.chars().take(from).collect();
+        }
+        self.edit_caret = from;
+        true
+    }
+
+    /// A commit takes a live AutoComplete proposal: the buffer becomes the
+    /// value it completes to, in that value's case.
+    fn take_proposal(&mut self) {
+        if let Some((_, value)) = self.edit_proposal.take() {
+            if self.editing.is_some() {
+                self.editing = Some(value);
+                self.edit_caret_to_end();
+            }
+        }
+    }
+
+    /// Where a double-click on (r, c) goes with editing directly in cells
+    /// off: a formula's first direct precedent, selected — switching sheet
+    /// when it is on another one (`Ok(true)`). Excel selects every direct
+    /// precedent; the grid's selection is one rect, so this takes the first.
+    /// `Err` says why nothing moved.
+    fn goto_precedent(&mut self, r: u32, c: u32) -> Result<bool, &'static str> {
+        let areas = gridcore::formula::direct_precedents(&self.pkg.workbook, self.active, r, c);
+        let Some(&(si, (r1, c1, r2, c2))) = areas.first() else {
+            return Err("No precedent cells to go to");
+        };
+        if self.pkg.workbook.sheets[si].hidden {
+            return Err("The precedent cells are on a hidden sheet");
+        }
+        let switched = si != self.active;
+        self.end_cell_edit();
+        self.active = si;
+        self.sel = (r1, c1);
+        self.anchor = (r2, c2);
+        let near = self.row_list_index(r1);
+        self.vlist.scroll_to_reveal_item(near);
+        self.col0 = self.col0.min(c1);
+        self.reveal_col = Some(c1);
+        Ok(switched)
+    }
+
+    /// What a double-click on (r, c) does: edit it, or — editing directly in
+    /// cells off — jump from a formula to its precedent.
+    fn double_click_jumps(&self, r: u32, c: u32) -> bool {
+        !self.edit_opts.edit_in_cell
+            && self
+                .sheet()
+                .cell(r, c)
+                .is_some_and(|cell| cell.formula.is_some())
     }
 
     /// Open the editor on the selected cell. `Some(buf)` starts a fresh entry
@@ -1385,6 +1551,7 @@ impl SheetView {
         self.edit_mode = mode;
         self.edit_overtype = false;
         self.edit_point = None;
+        self.edit_proposal = None;
     }
 
     fn edit_untouched(&self) -> bool {
@@ -1584,6 +1751,7 @@ impl SheetView {
     /// text and [`SheetView::entry_error`] says why.
     fn commit_edit(&mut self) -> bool {
         self.entry_error = None;
+        self.take_proposal();
         let untouched = self.edit_untouched();
         debug_assert!(self.editing.is_none() || self.edit_origin.is_some());
         let Some(buf) = self.editing.as_deref() else {
@@ -1609,8 +1777,9 @@ impl SheetView {
             return false;
         }
         let buf = buf.to_string();
-        let today = self.engine.clock;
-        let cell = gridcore::entry::entry_cell(&mut self.pkg.workbook, s, r, c, &buf, today).ok();
+        let ctx = self.typed_ctx();
+        let cell =
+            gridcore::entry::entry_cell_ctx(&mut self.pkg.workbook, s, r, c, &buf, &ctx).ok();
         // Part of an array: refused, as Excel refuses it, the editor kept.
         if let Some(cell) = &cell {
             if self.refuses(s, &[(r, c, cell.clone())]) {
@@ -1846,6 +2015,7 @@ impl SheetView {
     /// opened with; the editor stays open and the workbook's undo is untouched.
     fn edit_revert(&mut self) {
         if self.editing.is_some() {
+            self.edit_proposal = None;
             self.editing = Some(self.edit_start.clone());
             self.edit_caret_to_end();
         }
@@ -2116,6 +2286,7 @@ impl SheetView {
     /// selection kept. False when nothing was entered (no editor, or refused).
     fn commit_edit_to_selection(&mut self) -> bool {
         self.entry_error = None;
+        self.take_proposal();
         let Some(buf) = self.editing.clone() else {
             return false;
         };
@@ -2137,9 +2308,9 @@ impl SheetView {
             self.entry_error = Some(e);
             return false;
         }
-        let today = self.engine.clock;
+        let ctx = self.typed_ctx();
         let wb = &mut self.pkg.workbook;
-        let cells = gridcore::entry::entry_range(wb, s, range, (r, c), &buf, today).ok();
+        let cells = gridcore::entry::entry_range_ctx(wb, s, range, (r, c), &buf, &ctx).ok();
         if cells.as_ref().is_some_and(|cells| self.refuses(s, cells)) {
             return false;
         }
@@ -2572,6 +2743,14 @@ struct Docxy {
     /// Keep a workbook's last AutoRecover copy as a draft when it is closed
     /// with Don't Save (#613).
     keep_drafts: bool,
+    /// File › Options › Advanced › Editing for every sheet tab (#672),
+    /// persisted in `session.json`. Each `SheetView` keeps a copy, refreshed
+    /// whenever `active_sheet_mut` hands one out and pushed to every open tab
+    /// on a change, so a tab opened later reads the current options.
+    edit_opts: EditOptions,
+    /// Ctrl+Shift+U: the formula bar shows about four lines. View state for
+    /// this session, not persisted.
+    fx_expanded: bool,
     /// Recover Unsaved Workbooks' list, re-read when the backstage opens and
     /// after a draft is kept: listing prunes old drafts, so never per frame.
     drafts: Vec<recover::Draft>,
@@ -4729,7 +4908,15 @@ fn edit_caret_lines(text: &str, caret: usize, color: Hsla, caret_color: Hsla) ->
 /// Render an in-progress edit buffer with a blinking-style caret bar at `caret`
 /// (a char index), each reference the formula mentions in its own colour.
 /// Shared by the in-cell editor and the formula bar.
-fn edit_caret_row(text: &str, caret: usize, color: Hsla, caret_color: Hsla) -> AnyElement {
+///
+/// `sel_from` marks an AutoComplete proposal's suffix, drawn selected (#672).
+fn edit_caret_row(
+    text: &str,
+    caret: usize,
+    sel_from: Option<usize>,
+    color: Hsla,
+    caret_color: Hsla,
+) -> AnyElement {
     let cc = caret.min(text.chars().count());
     let bar = || div().w(px(1.5)).h(px(13.)).bg(caret_color).flex_none();
     let mut row = h_flex().items_center();
@@ -4744,6 +4931,7 @@ fn edit_caret_row(text: &str, caret: usize, color: Hsla, caret_color: Hsla) -> A
             div()
                 .text_size(px(12.))
                 .text_color(c)
+                .when(sel_from.is_some_and(|f| off >= f), |d| d.bg(proposal_bg()))
                 .child(SharedString::from(s)),
         );
     }
@@ -4757,13 +4945,20 @@ fn edit_caret_row(text: &str, caret: usize, color: Hsla, caret_color: Hsla) -> A
 /// TextLayout maps the click position to a char index (`base_off` is the char
 /// offset of this segment within the whole buffer). One per run of
 /// `edit_runs`, so clicking any of them places the caret under the pointer.
-fn fx_segment(s: String, base_off: usize, color: Option<u32>, ent: Entity<Docxy>) -> AnyElement {
+fn fx_segment(
+    s: String,
+    base_off: usize,
+    color: Option<u32>,
+    selected: bool,
+    ent: Entity<Docxy>,
+) -> AnyElement {
     let styled = StyledText::new(SharedString::from(s.clone()));
     let layout = styled.layout().clone();
     div()
         .child(styled)
         .text_size(px(12.))
         .text_color(hsla_u(color.unwrap_or(0x1a1a1a)))
+        .when(selected, |d| d.bg(proposal_bg()))
         .cursor_text()
         .on_mouse_down(MouseButton::Left, move |ev, _window, cx| {
             let byte = layout
@@ -4774,6 +4969,7 @@ fn fx_segment(s: String, base_off: usize, color: Option<u32>, ent: Entity<Docxy>
             ent.update(cx, |this, cx| {
                 if let Some(v) = this.active_sheet_mut() {
                     v.edit_caret = idx;
+                    v.edit_proposal = None;
                 }
                 cx.notify();
             });
@@ -4787,9 +4983,46 @@ const LINE_FEED_GLYPH: &str = "\u{21b5}";
 /// The formula bar's editing content: one click-to-caret segment per run of
 /// `edit_runs` — so each reference is drawn in its grid colour — with the caret
 /// bar sitting between the runs it splits.
-fn fx_edit_row(text: &str, caret: usize, ent: &Entity<Docxy>) -> AnyElement {
+///
+/// `sel_from` marks an AutoComplete proposal's suffix, drawn selected (#672).
+/// `expanded` (Ctrl+Shift+U) lays the buffer out a line per line feed, each
+/// line wrapping its runs: a run wraps as a unit, so the click-to-caret
+/// segments stay one per run.
+fn fx_edit_row(
+    text: &str,
+    caret: usize,
+    sel_from: Option<usize>,
+    expanded: bool,
+    ent: &Entity<Docxy>,
+) -> AnyElement {
     let cc = caret.min(text.chars().count());
     let bar = || div().w(px(1.5)).h(px(13.)).bg(hsla_u(BRAND)).flex_none();
+    let selected = |off: usize| sel_from.is_some_and(|f| off >= f);
+    if expanded {
+        let mut col = v_flex().flex_1().items_start();
+        for (runs, has_caret) in edit_lines(text, cc) {
+            let mut row = h_flex().flex_wrap().items_center().min_h(px(16.));
+            let mut placed = !has_caret;
+            for (off, s, ci) in runs {
+                if off == cc && !placed {
+                    row = row.child(bar());
+                    placed = true;
+                }
+                row = row.child(fx_segment(
+                    s,
+                    off,
+                    ci.map(ref_color),
+                    selected(off),
+                    ent.clone(),
+                ));
+            }
+            if !placed {
+                row = row.child(bar());
+            }
+            col = col.child(row);
+        }
+        return col.into_any_element();
+    }
     let mut row = h_flex().flex_1().h_full().items_center();
     let mut placed = false;
     for (off, s, ci) in edit_runs(text, cc) {
@@ -4801,12 +5034,65 @@ fn fx_edit_row(text: &str, caret: usize, ent: &Entity<Docxy>) -> AnyElement {
         // line tall, and the arrow is one char as the feed is, so a click
         // still maps to the right caret offset.
         let s = s.replace('\n', LINE_FEED_GLYPH);
-        row = row.child(fx_segment(s, off, ci.map(ref_color), ent.clone()));
+        row = row.child(fx_segment(
+            s,
+            off,
+            ci.map(ref_color),
+            selected(off),
+            ent.clone(),
+        ));
     }
     if !placed {
         row = row.child(bar());
     }
     row.into_any_element()
+}
+
+/// The wash an AutoComplete proposal's suffix is drawn in: selected text.
+fn proposal_bg() -> Hsla {
+    Hsla {
+        a: 0.25,
+        ..hsla_u(BRAND)
+    }
+}
+
+/// The formula bar's height in px: one line, or about four with
+/// Ctrl+Shift+U (#672).
+fn fx_bar_height(expanded: bool) -> f32 {
+    if expanded { 80. } else { 26. }
+}
+
+/// How the editing cell is drawn (#672): the in-cell editor, or — editing
+/// directly in cells off — the buffer as plain text, the caret in the
+/// formula bar. `None` for a cell no editor is open on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CellEditDraw {
+    None,
+    Editor,
+    Plain,
+}
+
+fn cell_edit_draw(selected: bool, editing: bool, edit_in_cell: bool) -> CellEditDraw {
+    match (selected && editing, edit_in_cell) {
+        (false, _) => CellEditDraw::None,
+        (true, true) => CellEditDraw::Editor,
+        (true, false) => CellEditDraw::Plain,
+    }
+}
+
+/// The Enter direction after `m`, as Settings' Direction button cycles it.
+fn next_enter_move(m: EnterMove) -> EnterMove {
+    let i = EnterMove::ALL.iter().position(|x| *x == m).unwrap_or(0);
+    EnterMove::ALL[(i + 1) % EnterMove::ALL.len()]
+}
+
+/// The words the sheet status bar shows for the Editing options in force.
+fn sheet_status_words(opts: &EditOptions) -> Vec<&'static str> {
+    let mut words = Vec::new();
+    if opts.fixed_decimal {
+        words.push("Fixed Decimal");
+    }
+    words
 }
 
 /// The sheet row at list index `ix`, skipping hidden rows and the `frozen`
@@ -7016,6 +7302,8 @@ fn new_sheet_surface() -> Surface {
         col0: 0,
         follow_sel: (0, 0),
         reveal_col: None,
+        edit_opts: EditOptions::default(),
+        edit_proposal: None,
     })
 }
 
@@ -7080,6 +7368,8 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
                     col0: 0,
                     follow_sel: (0, 0),
                     reveal_col: None,
+                    edit_opts: EditOptions::default(),
+                    edit_proposal: None,
                 };
                 let mut status = format!("loaded — {n} sheet{}", if n == 1 { "" } else { "s" });
                 if repair {
@@ -7262,6 +7552,7 @@ fn write_session(root: &std::path::Path, tabs: &[DocTab], active: usize, prefs: 
         ask_on_close: prefs.ask_on_close,
         autorecover_minutes: prefs.autorecover_minutes,
         keep_drafts: prefs.keep_drafts,
+        sheet_editing: prefs.edit_opts.to_lines(),
     };
     if let Ok(json) = serde_json::to_string_pretty(&session) {
         let p = session_path_in(root);
@@ -7711,6 +8002,7 @@ impl Docxy {
         let mut this = Self::build(tabs, active, session.theme, session.ask_on_close, cx);
         this.autorecover_minutes = session.autorecover_minutes;
         this.keep_drafts = session.keep_drafts;
+        this.edit_opts = EditOptions::from_text(&session.sheet_editing);
         this.persist_to(&root);
         this
     }
@@ -7744,6 +8036,8 @@ impl Docxy {
             ask_on_close,
             autorecover_minutes: recover::DEFAULT_MINUTES,
             keep_drafts: true,
+            edit_opts: EditOptions::default(),
+            fx_expanded: false,
             drafts: Vec::new(),
             trusted_count: 0,
             trusted_error: None,
@@ -7827,6 +8121,7 @@ impl Docxy {
             ask_on_close: self.ask_on_close,
             autorecover_minutes: self.autorecover_minutes,
             keep_drafts: self.keep_drafts,
+            edit_opts: self.edit_opts,
         }
     }
 
@@ -7989,6 +8284,166 @@ impl Docxy {
 
     fn set_keep_drafts(&mut self, on: bool, cx: &mut Context<Self>) {
         self.keep_drafts = on;
+        self.persist();
+        cx.notify();
+    }
+
+    /// Settings' "Sheet editing" group (#672): Excel's File › Options ›
+    /// Advanced › Editing switches as checkboxes, the Enter direction as a
+    /// button that cycles it, and the places as -/+ steppers. Rows that only
+    /// matter with a box on are dimmed, not disabled, while it is off.
+    fn sheet_editing_settings(
+        &self,
+        fg: Hsla,
+        dim: Hsla,
+        sidebar: Hsla,
+        check: &dyn Fn(bool) -> Div,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let o = self.edit_opts;
+        let row = |id: &'static str| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap_2()
+                .py_1()
+                .cursor_pointer()
+                .rounded_sm()
+                .hover(|d| d.bg(sidebar))
+        };
+        let check_row = |id: &'static str,
+                         on: bool,
+                         label: &'static str,
+                         flip: fn(&mut EditOptions),
+                         cx: &mut Context<Self>| {
+            row(id)
+                .child(check(on))
+                .child(div().text_color(fg).child(label))
+                .on_click(cx.listener(move |this, _, _w, cx| {
+                    let mut o = this.edit_opts;
+                    flip(&mut o);
+                    this.set_edit_opts(o, cx);
+                }))
+        };
+        let boxed = |text: String| {
+            div()
+                .px_2()
+                .rounded(px(3.))
+                .border_1()
+                .border_color(hsla_u(BRAND))
+                .text_color(fg)
+                .child(text)
+        };
+        let step = |id: &'static str, glyph: &'static str, by: i16, cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .px_2()
+                .rounded(px(3.))
+                .border_1()
+                .border_color(hsla_u(BRAND))
+                .cursor_pointer()
+                .hover(|d| d.bg(sidebar))
+                .text_color(fg)
+                .child(glyph)
+                .on_click(cx.listener(move |this, _, _w, cx| {
+                    let mut o = this.edit_opts;
+                    o.places = (o.places + by)
+                        .clamp(gridcore::options::PLACES_MIN, gridcore::options::PLACES_MAX);
+                    this.set_edit_opts(o, cx);
+                }))
+        };
+        v_flex()
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .text_color(rgb(BRAND))
+                    .mt_4()
+                    .child("Sheet editing"),
+            )
+            .child(check_row(
+                "bs-fixed-decimal",
+                o.fixed_decimal,
+                "Automatically insert a decimal point",
+                |o| o.fixed_decimal = !o.fixed_decimal,
+                cx,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .pl_6()
+                    .py_1()
+                    .text_color(if o.fixed_decimal { fg } else { dim })
+                    .child("Places:")
+                    .child(step("bs-places-down", "\u{2212}", -1, cx))
+                    .child(boxed(o.places.to_string()))
+                    .child(step("bs-places-up", "+", 1, cx)),
+            )
+            .child(check_row(
+                "bs-move-after-enter",
+                o.move_after_enter,
+                "After pressing Enter, move selection",
+                |o| o.move_after_enter = !o.move_after_enter,
+                cx,
+            ))
+            .child(
+                div()
+                    .id("bs-enter-direction")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .pl_6()
+                    .py_1()
+                    .cursor_pointer()
+                    .rounded_sm()
+                    .hover(|d| d.bg(sidebar))
+                    .child(
+                        div()
+                            .text_color(if o.move_after_enter { fg } else { dim })
+                            .child("Direction:"),
+                    )
+                    .child(boxed(o.enter_move.label().to_string()))
+                    .on_click(cx.listener(|this, _, _w, cx| {
+                        let mut o = this.edit_opts;
+                        o.enter_move = next_enter_move(o.enter_move);
+                        this.set_edit_opts(o, cx);
+                    })),
+            )
+            .child(check_row(
+                "bs-edit-in-cell",
+                o.edit_in_cell,
+                "Allow editing directly in cells",
+                |o| o.edit_in_cell = !o.edit_in_cell,
+                cx,
+            ))
+            .child(check_row(
+                "bs-autocomplete",
+                o.autocomplete,
+                "Enable AutoComplete for cell values",
+                |o| o.autocomplete = !o.autocomplete,
+                cx,
+            ))
+            .child(check_row(
+                "bs-fill-handle",
+                o.fill_handle,
+                "Enable fill handle and cell drag-and-drop",
+                |o| o.fill_handle = !o.fill_handle,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    /// Settings' Sheet editing options (#672): persisted, and in force in
+    /// every open sheet tab at once.
+    fn set_edit_opts(&mut self, opts: EditOptions, cx: &mut Context<Self>) {
+        self.edit_opts = opts;
+        for t in &mut self.tabs {
+            if let Surface::Sheet(v) = &mut t.surface {
+                v.edit_opts = opts;
+            }
+        }
         self.persist();
         cx.notify();
     }
@@ -8191,6 +8646,7 @@ impl Docxy {
             gesture_in_flight,
             self.tab_more_open,
             protected,
+            self.edit_opts.fill_handle,
         ) {
             cx.notify();
         }
@@ -8201,6 +8657,7 @@ impl Docxy {
     fn fill_handle_hidden_reason(&self) -> Option<HandleHidden> {
         let editing = self.active_sheet().is_some_and(|v| v.editing.is_some());
         fill_handle_hidden(
+            self.edit_opts.fill_handle,
             editing,
             self.range_field_active(),
             self.formula_pick_active(),
@@ -9339,8 +9796,10 @@ impl Docxy {
             if pointing {
                 // the reference is written; nothing else to do
             } else if dbl {
-                // Double-click enters inline edit mode (Excel-style).
-                self.sheet_begin_edit(None, cx);
+                // Double-click enters inline edit mode (Excel-style), or with
+                // editing directly in cells off jumps from a formula to its
+                // precedent (#672).
+                self.sheet_double_click(r, c, cx);
             } else if has_link {
                 self.sheet_follow_hyperlink(r, c, cx);
             }
@@ -10059,10 +10518,10 @@ impl Docxy {
             // range", not "auto-fill". The handle's own guard only covers an
             // in-cell edit, so without this a drag that starts on those few
             // pixels writes cells instead of picking them.
-            handle_hidden: fill_handle_pointing(
-                self.range_field_active(),
-                self.formula_pick_active(),
-            ),
+            handle_hidden: !self.edit_opts.fill_handle
+                || fill_handle_pointing(self.range_field_active(), self.formula_pick_active()),
+            edit_in_cell: self.edit_opts.edit_in_cell,
+            fx_expanded: self.fx_expanded,
             // The border's range and the cap on its dashes both need the
             // visible-row list and the column window, which only `sheet_el`
             // has.
@@ -10428,10 +10887,8 @@ impl Docxy {
         chart_ref_of(text, example, &self.sheet_names(), v.active)
     }
     fn active_sheet_mut(&mut self) -> Option<&mut SheetView> {
-        match self.tabs.get_mut(self.active).map(|t| &mut t.surface) {
-            Some(Surface::Sheet(v)) => Some(v),
-            _ => None,
-        }
+        let opts = self.edit_opts;
+        sheet_with_opts(self.tabs.get_mut(self.active), opts)
     }
     /// Whether the active sheet is protected (cells read-only until unprotected).
     fn sheet_protected(&self) -> bool {
@@ -10612,6 +11069,24 @@ impl Docxy {
             _ => "editing enabled".into(),
         };
         self.persist();
+        cx.notify();
+    }
+
+    /// A double-click on (r, c): edit it (as F2), or — editing directly in
+    /// cells off — select a formula's first direct precedent, switching sheet
+    /// when it is on another one (#672).
+    fn sheet_double_click(&mut self, r: u32, c: u32, cx: &mut Context<Self>) {
+        if !self
+            .active_sheet_mut()
+            .is_some_and(|v| v.double_click_jumps(r, c))
+        {
+            return self.sheet_begin_edit(None, cx);
+        }
+        match self.active_sheet_mut().map(|v| v.goto_precedent(r, c)) {
+            Some(Ok(true)) => self.drop_grid_state(),
+            Some(Err(why)) => self.set_status(why),
+            _ => {}
+        }
         cx.notify();
     }
 
@@ -13212,6 +13687,13 @@ impl Docxy {
             self.protected_refused(cx);
             return;
         }
+        // Ctrl+Shift+U expands the formula bar (#672), editing or not: view
+        // state only, so it is not a key Protected View has to refuse.
+        if ctrl && shift && key.eq_ignore_ascii_case("u") {
+            self.fx_expanded = !self.fx_expanded;
+            cx.notify();
+            return;
+        }
         // An inline sheet-tab rename swallows all typing until Enter/Esc.
         if self.sheet_rename.is_some() {
             return self.sheet_rename_key(ev, key, cx);
@@ -13282,6 +13764,19 @@ impl Docxy {
         if editing && arrow.is_none() && !modifier {
             if let Some(v) = self.active_sheet_mut() {
                 v.edit_point = None;
+            }
+        }
+        // A caret move (or any editor chord but Ctrl+Enter, which commits)
+        // keeps an AutoComplete proposal's text and drops its marker (#672).
+        // The keys that commit take the proposal in `commit_edit`; Backspace,
+        // Delete and typing handle it below.
+        let caret_move = matches!(key, "home" | "end" | "f2" | "f4" | "f9" | "insert")
+            || (caret_keys && matches!(key, "left" | "right"))
+            || (ctrl && !modifier && key != "enter")
+            || (alt && key == "enter");
+        if editing && caret_move {
+            if let Some(v) = self.active_sheet_mut() {
+                v.edit_proposal = None;
             }
         }
         // Same as the bar fields above: a focused Chart-panel field owns Ctrl+A.
@@ -13473,7 +13968,12 @@ impl Docxy {
                 }
                 cx.notify();
             }
-            "enter" => self.sheet_commit(if shift { -1 } else { 1 }, 0, cx),
+            "enter" => {
+                let (dr, dc) = self
+                    .active_sheet_mut()
+                    .map_or((0, 0), |v| v.enter_delta(shift));
+                self.sheet_commit(dr, dc, cx)
+            }
             // F2 while editing switches Enter/Edit mode and keeps the text.
             "f2" if editing => {
                 if let Some(v) = self.active_sheet_mut() {
@@ -13519,7 +14019,9 @@ impl Docxy {
             "backspace" => {
                 if editing {
                     if let Some(v) = self.active_sheet_mut() {
-                        v.edit_backspace();
+                        if !v.drop_proposal() {
+                            v.edit_backspace();
+                        }
                     }
                     cx.notify();
                 } else {
@@ -13531,7 +14033,9 @@ impl Docxy {
             "delete" => {
                 if editing {
                     if let Some(v) = self.active_sheet_mut() {
-                        v.edit_delete();
+                        if !v.drop_proposal() {
+                            v.edit_delete();
+                        }
                     }
                     cx.notify();
                 } else {
@@ -13580,13 +14084,10 @@ impl Docxy {
                     if !c.is_empty() && !c.chars().next().unwrap().is_control() {
                         let protected = self.sheet_protected();
                         if let Some(v) = self.active_sheet_mut() {
-                            if v.editing.is_some() {
-                                v.edit_type(c);
-                            } else if !protected {
-                                // Start a fresh edit with the typed char.
-                                v.begin_cell_edit(Some(String::new()));
-                                v.edit_caret = 0;
-                                v.edit_insert(c);
+                            // Into the editor, or a fresh edit with the
+                            // typed char; AutoComplete proposes either way.
+                            if v.editing.is_some() || !protected {
+                                v.type_char(c);
                             }
                         }
                         cx.notify();
@@ -24048,6 +24549,8 @@ impl Docxy {
                             this.set_keep_drafts(!this.keep_drafts, cx);
                         })),
                 )
+                // File › Options › Advanced › Editing for sheet tabs (#672).
+                .child(self.sheet_editing_settings(fg, dim, sidebar, &check, cx))
                 // Excel's Trust Center > Trusted Documents > Clear (#895):
                 // the backstage half of `trusted::clear`; the harness verb
                 // runs the same `clear_trusted`.
@@ -25259,6 +25762,15 @@ impl Render for Docxy {
                 d.child(div().text_color(dim).child("·"))
                     .child(div().text_color(dim).child(s))
             })
+            // Excel's status-bar words for the Editing options (#672).
+            .when(self.active_is_sheet(), |d| {
+                d.children(sheet_status_words(&self.edit_opts).into_iter().map(|w| {
+                    div()
+                        .id(SharedString::from(format!("status-{}", w.to_lowercase().replace(' ', "-"))))
+                        .text_color(fg)
+                        .child(w)
+                }))
+            })
             .child(div().flex_1())
             .child(if self.active_is_sheet() {
                 "type or F2 to edit · Enter/Tab to move · =formula · Ctrl+S save"
@@ -25952,8 +26464,15 @@ struct GridOverlay {
     /// is selected — which is the whole of the "is this drawn?" question, so
     /// there is no separate flag.
     chart_refs: std::rc::Rc<Vec<ChartSourceArea>>,
-    /// The selection's corner is under a chart card, which owns those pixels.
+    /// The selection's corner is under a chart card, which owns those pixels
+    /// (or the fill handle is turned off in Settings, #672).
     handle_hidden: bool,
+    /// File › Options' "Allow editing directly in cells" (#672): off, an open
+    /// editor draws no box or caret in its cell, which shows the buffer as
+    /// plain text, and the caret lives in the formula bar.
+    edit_in_cell: bool,
+    /// Ctrl+Shift+U: the formula bar is about four lines tall (#672).
+    fx_expanded: bool,
     /// What the dashed brand border outlines this frame: the pointed range,
     /// else a selection spanning more than one cell (`border_range`), with its
     /// rows snapped onto the ones the grid draws (`snap_range_rows`).
@@ -26099,9 +26618,20 @@ fn sheet_row(
             .into_iter()
             .map(|i| ov.chart_refs[i])
             .collect();
-        let cell_editing = selected && editing.is_some();
+        let edit_draw = cell_edit_draw(selected, editing.is_some(), ov.edit_in_cell);
+        let cell_editing = edit_draw == CellEditDraw::Editor;
         let on_freeze = fc > 0 && c + 1 == fc;
         let (text, xf, is_num) = match sh.cell(r, c) {
+            // Editing directly in cells off: the cell shows the entry as
+            // plain text while the caret is in the formula bar (#672).
+            _ if edit_draw == CellEditDraw::Plain => (
+                editing
+                    .as_deref()
+                    .unwrap_or_default()
+                    .replace('\n', LINE_FEED_GLYPH),
+                None,
+                false,
+            ),
             _ if blank_covered => (String::new(), None, false),
             Some(cl) if !cl.is_blank() => {
                 let xf = styles.xf(cl.style);
@@ -26235,6 +26765,7 @@ fn sheet_row(
             cell = cell.justify_start().child(edit_caret_row(
                 &edit_buf,
                 view.edit_caret,
+                view.edit_proposal.as_ref().map(|p| p.0),
                 hsla_u(0x1a1a1a),
                 brand,
             ));
@@ -27761,7 +28292,7 @@ fn sheet_el(
     } else {
         cell_name(sr, sc)
     };
-    let sel_content = if let Some(buf) = &editing {
+    let sel_full = if let Some(buf) = &editing {
         buf.clone()
     } else {
         match sh.cell(sr, sc) {
@@ -27770,12 +28301,15 @@ fn sheet_el(
             }
             _ => view.cell_text(sr, sc),
         }
-    }
-    .replace('\n', LINE_FEED_GLYPH);
+    };
+    let sel_content = sel_full.replace('\n', LINE_FEED_GLYPH);
+    let expanded = ov.fx_expanded;
     let bar = h_flex()
+        .id("fx-bar")
         .w_full()
-        .h(px(26.))
-        .items_center()
+        .h(px(fx_bar_height(expanded)))
+        .when(expanded, |d| d.items_start().py_1().overflow_y_scroll())
+        .when(!expanded, |d| d.items_center())
         .gap_2()
         .px_2()
         .bg(hsla_u(0xfafafa))
@@ -27804,7 +28338,13 @@ fn sheet_el(
             // Editing: the live buffer with the caret; clicking places the caret
             // under the pointer (typing/arrows/backspace land in this buffer via
             // the grid's keyboard focus).
-            fx_edit_row(buf, view.edit_caret, ent)
+            fx_edit_row(
+                buf,
+                view.edit_caret,
+                view.edit_proposal.as_ref().map(|p| p.0),
+                expanded,
+                ent,
+            )
         } else {
             // Not editing: clicking the bar starts editing the selected cell.
             let ent_fx = ent.clone();
@@ -27817,7 +28357,26 @@ fn sheet_el(
                 .cursor_text()
                 .text_size(px(12.))
                 .text_color(hsla_u(0x1a1a1a))
-                .child(SharedString::from(sel_content))
+                .map(|d| {
+                    if expanded {
+                        // Expanded: a line per line feed, each wrapping.
+                        d.items_start().child(
+                            v_flex().w_full().children(
+                                sel_full
+                                    .split('\n')
+                                    .map(|l| {
+                                        div()
+                                            .min_h(px(16.))
+                                            .whitespace_normal()
+                                            .child(SharedString::from(l.to_string()))
+                                    })
+                                    .collect::<Vec<_>>(),
+                            ),
+                        )
+                    } else {
+                        d.child(SharedString::from(sel_content))
+                    }
+                })
                 .on_click(move |_ev, window, cx| {
                     ent_fx.update(cx, |this, cx| {
                         // Clicking the bar opens an editor on the selected
@@ -29046,7 +29605,7 @@ mod grid_geom_tests {
         assert!(!gesture_in_flight(false, false, false, false));
         assert!(may_arm_fill(false, false));
         let mut fill = None;
-        assert!(arm_fill(&mut fill, Some(src), false, false, false));
+        assert!(arm_fill(&mut fill, Some(src), false, false, false, true));
         let armed = fill.expect("the source range becomes a fill drag");
         assert_eq!(armed.src, src);
         assert_eq!(armed.to, (src.2, src.3));
@@ -29073,7 +29632,8 @@ mod grid_geom_tests {
                 Some(src),
                 gesture_in_flight(drag, dragging, range, formula),
                 false,
-                false
+                false,
+                true
             ));
             assert!(fill.is_none(), "a grid gesture must leave the fill unarmed");
         }
@@ -29087,14 +29647,15 @@ mod grid_geom_tests {
             Some((9, 9, 9, 9)),
             false,
             false,
-            false
+            false,
+            true
         ));
         assert_eq!(fill.expect("the first fill stays armed").src, src);
 
         // The priority-1 more-tabs backdrop prevents presses on the deferred
         // handle. Keep the guard as defence in depth if that order changes.
         let mut fill = None;
-        assert!(!arm_fill(&mut fill, Some(src), false, true, false));
+        assert!(!arm_fill(&mut fill, Some(src), false, true, false, true));
         assert!(fill.is_none());
     }
 
@@ -29103,7 +29664,14 @@ mod grid_geom_tests {
     #[test]
     fn a_protected_sheet_cannot_arm_a_fill() {
         let mut fill = None;
-        assert!(!arm_fill(&mut fill, Some((0, 0, 1, 0)), false, false, true));
+        assert!(!arm_fill(
+            &mut fill,
+            Some((0, 0, 1, 0)),
+            false,
+            false,
+            true,
+            true
+        ));
         assert!(fill.is_none());
     }
 
@@ -29112,17 +29680,26 @@ mod grid_geom_tests {
     #[test]
     fn the_fill_handle_says_why_it_is_hidden() {
         use super::HandleHidden::*;
-        assert_eq!(fill_handle_hidden(false, false, false, None), None);
-        assert_eq!(fill_handle_hidden(true, false, false, None), Some(Editing));
-        assert_eq!(fill_handle_hidden(false, true, false, None), Some(Pointing));
-        assert_eq!(fill_handle_hidden(false, false, true, None), Some(Pointing));
+        assert_eq!(fill_handle_hidden(true, false, false, false, None), None);
         assert_eq!(
-            fill_handle_hidden(false, false, false, Some(0)),
+            fill_handle_hidden(true, true, false, false, None),
+            Some(Editing)
+        );
+        assert_eq!(
+            fill_handle_hidden(true, false, true, false, None),
+            Some(Pointing)
+        );
+        assert_eq!(
+            fill_handle_hidden(true, false, false, true, None),
+            Some(Pointing)
+        );
+        assert_eq!(
+            fill_handle_hidden(true, false, false, false, Some(0)),
             Some(ChartSelected)
         );
         // An edit outranks the rest: it is what a click would land in.
         assert_eq!(
-            fill_handle_hidden(true, true, false, Some(0)),
+            fill_handle_hidden(true, true, true, false, Some(0)),
             Some(Editing)
         );
         assert_eq!(Editing.why(), "a cell is being edited");

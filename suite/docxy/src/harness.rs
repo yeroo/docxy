@@ -2377,6 +2377,23 @@ fn load_failed(status: &str) -> bool {
     !status.starts_with("loaded")
 }
 
+/// Settings' Sheet editing options (#672), by their `session.json` keys.
+fn sheet_editing_json(o: &gridcore::options::EditOptions) -> Json {
+    use gridcore::options as k;
+    Json::obj(vec![
+        (k::KEY_FIXED_DECIMAL, Json::Bool(o.fixed_decimal)),
+        (k::KEY_PLACES, Json::Num(f64::from(o.places))),
+        (k::KEY_MOVE_AFTER_ENTER, Json::Bool(o.move_after_enter)),
+        (
+            k::KEY_MOVE_DIRECTION,
+            Json::Str(o.enter_move.label().to_ascii_lowercase()),
+        ),
+        (k::KEY_EDIT_IN_CELL, Json::Bool(o.edit_in_cell)),
+        (k::KEY_AUTOCOMPLETE, Json::Bool(o.autocomplete)),
+        (k::KEY_FILL_HANDLE, Json::Bool(o.fill_handle)),
+    ])
+}
+
 /// The active tab's reason for not being the file that was asked for, if it is
 /// not.
 fn load_failure(app: &crate::Docxy) -> Option<String> {
@@ -2401,6 +2418,8 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
             Json::Num(f64::from(app.autorecover_minutes)),
         ),
         ("keep_drafts", Json::Bool(app.keep_drafts)),
+        ("sheet_editing", sheet_editing_json(&app.edit_opts)),
+        ("fx_expanded", Json::Bool(app.fx_expanded)),
         (
             "ribbon_tab",
             Json::Str(

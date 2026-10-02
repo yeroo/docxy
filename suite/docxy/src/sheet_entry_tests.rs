@@ -1263,3 +1263,260 @@ fn a_drag_fill_from_a_source_holding_the_anchor_is_refused() {
     // Right: the columns past the source.
     assert_eq!(fill_dest((0, 0, 1, 1), (0, 0, 1, 4)), (0, 2, 1, 4));
 }
+
+// ---- #672: Excel's editing options ----------------------------------------
+
+use gridcore::options::{EditOptions, EnterMove};
+
+fn opts_view(opts: EditOptions) -> SheetView {
+    let mut v = view();
+    v.edit_opts = opts;
+    v
+}
+
+fn text(v: &mut SheetView, r: u32, c: u32, t: &str) {
+    put(v, r, c, Cell::text(t));
+}
+
+#[test]
+fn a_typed_commit_takes_the_fixed_decimal() {
+    let mut v = opts_view(EditOptions {
+        fixed_decimal: true,
+        ..EditOptions::default()
+    });
+    type_fresh(&mut v, "1234");
+    assert!(v.commit_edit());
+    assert_eq!(value(&v, 0, 0), CellValue::Number(12.34));
+    select(&mut v, 1, 0);
+    type_fresh(&mut v, "1.");
+    assert!(v.commit_edit());
+    assert_eq!(
+        value(&v, 1, 0),
+        CellValue::Number(1.0),
+        "a typed point wins"
+    );
+    // Ctrl+Enter over A3:A4 shifts each cell.
+    v.sel = (2, 0);
+    v.anchor = (3, 0);
+    v.begin_cell_edit(Some(String::new()));
+    v.edit_insert("5");
+    assert!(v.commit_edit_to_selection());
+    assert_eq!(value(&v, 2, 0), CellValue::Number(0.05));
+    assert_eq!(value(&v, 3, 0), CellValue::Number(0.05));
+    // An untouched F2 edit of an integer is not re-read; a changed one is.
+    select(&mut v, 5, 0);
+    put(&mut v, 5, 0, Cell::number(1234.0));
+    v.begin_cell_edit(None);
+    assert!(!v.commit_edit());
+    assert_eq!(value(&v, 5, 0), CellValue::Number(1234.0));
+    v.begin_cell_edit(None);
+    v.edit_caret_to_end();
+    v.edit_insert("5");
+    assert!(v.commit_edit());
+    assert_eq!(value(&v, 5, 0), CellValue::Number(123.45));
+    // Off: as typed.
+    v.edit_opts.fixed_decimal = false;
+    select(&mut v, 6, 0);
+    type_fresh(&mut v, "1234");
+    assert!(v.commit_edit());
+    assert_eq!(value(&v, 6, 0), CellValue::Number(1234.0));
+}
+
+#[test]
+fn enter_moves_the_way_the_options_say() {
+    for (dir, want) in [
+        (EnterMove::Down, (3, 2)),
+        (EnterMove::Right, (2, 3)),
+        (EnterMove::Up, (1, 2)),
+        (EnterMove::Left, (2, 1)),
+    ] {
+        let mut v = opts_view(EditOptions {
+            enter_move: dir,
+            ..EditOptions::default()
+        });
+        select(&mut v, 2, 2);
+        type_fresh(&mut v, "x");
+        let (dr, dc) = v.enter_delta(false);
+        assert_eq!(v.commit_and_move(dr, dc), Some(true));
+        assert_eq!(v.sel, want, "{dir:?}");
+        let (dr, dc) = v.enter_delta(true);
+        v.commit_and_move(dr, dc);
+        assert_eq!(v.sel, (2, 2), "{dir:?}: Shift+Enter goes back");
+    }
+    let mut v = opts_view(EditOptions {
+        move_after_enter: false,
+        ..EditOptions::default()
+    });
+    select(&mut v, 2, 2);
+    type_fresh(&mut v, "y");
+    assert_eq!(v.enter_delta(false), (0, 0));
+    assert_eq!(v.enter_delta(true), (0, 0));
+    assert_eq!(v.commit_and_move(0, 0), Some(true));
+    assert_eq!(
+        (v.sel, v.editing.is_none()),
+        ((2, 2), true),
+        "commits and stays"
+    );
+    assert_eq!(value(&v, 2, 2), CellValue::Text("y".into()));
+}
+
+fn type_chars(v: &mut SheetView, t: &str) {
+    for ch in t.chars() {
+        v.type_char(&ch.to_string());
+    }
+}
+
+#[test]
+fn autocomplete_proposes_and_any_commit_takes_it() {
+    let mut v = view();
+    text(&mut v, 0, 0, "Apple");
+    text(&mut v, 1, 0, "Banana");
+    select(&mut v, 2, 0);
+    type_chars(&mut v, "AP");
+    assert_eq!(v.editing.as_deref(), Some("APple"));
+    assert_eq!(
+        (v.edit_caret, v.edit_proposal.clone()),
+        (2, Some((2, "Apple".into())))
+    );
+    assert!(v.commit_edit());
+    assert_eq!(value(&v, 2, 0), CellValue::Text("Apple".into()), "its case");
+    // Backspace (or Delete) drops only the suffix; a typed char matches again.
+    select(&mut v, 3, 0);
+    type_chars(&mut v, "b");
+    assert_eq!(v.editing.as_deref(), Some("banana"));
+    assert!(v.drop_proposal());
+    assert_eq!((v.editing.as_deref(), v.edit_caret), (Some("b"), 1));
+    type_chars(&mut v, "a");
+    assert_eq!(v.editing.as_deref(), Some("banana"));
+    type_chars(&mut v, "x");
+    assert_eq!(v.editing.as_deref(), Some("bax"), "x replaced the suffix");
+    v.end_cell_edit();
+    // A commit by moving away (a click, an arrow) takes it too.
+    select(&mut v, 3, 0);
+    type_chars(&mut v, "ban");
+    assert_eq!(v.commit_and_move(0, 1), Some(true));
+    assert_eq!(value(&v, 3, 0), CellValue::Text("Banana".into()));
+    // Ctrl+Enter takes it into every cell.
+    v.sel = (4, 0);
+    v.anchor = (5, 0);
+    type_chars(&mut v, "ap");
+    assert!(v.commit_edit_to_selection());
+    assert_eq!(value(&v, 5, 0), CellValue::Text("Apple".into()));
+    // A caret move drops the marker: the text stays as shown.
+    select(&mut v, 7, 0);
+    put(&mut v, 6, 0, Cell::text("Cherry"));
+    type_chars(&mut v, "c");
+    v.edit_proposal = None;
+    assert!(v.commit_edit());
+    assert_eq!(value(&v, 7, 0), CellValue::Text("cherry".into()));
+    // Off: nothing is proposed.
+    v.edit_opts.autocomplete = false;
+    select(&mut v, 8, 0);
+    type_chars(&mut v, "ch");
+    assert_eq!(v.editing.as_deref(), Some("ch"));
+}
+
+#[test]
+fn autocomplete_waits_for_the_caret_at_the_end() {
+    let mut v = view();
+    text(&mut v, 0, 0, "Apple");
+    select(&mut v, 1, 0);
+    type_chars(&mut v, "p");
+    v.edit_caret = 0;
+    type_chars(&mut v, "a");
+    assert_eq!(v.editing.as_deref(), Some("ap"), "typed before the end");
+}
+
+#[test]
+fn a_double_click_jumps_to_the_precedent_with_editing_in_cells_off() {
+    let mut v = view();
+    put(&mut v, 0, 0, Cell::formula("SUM(C3:D4)+B1"));
+    put(&mut v, 0, 1, Cell::formula("1+2"));
+    put(&mut v, 0, 5, Cell::number(7.0));
+    assert!(!v.double_click_jumps(0, 0), "on: a double-click edits");
+    v.edit_opts.edit_in_cell = false;
+    assert!(v.double_click_jumps(0, 0));
+    assert!(!v.double_click_jumps(0, 5), "a constant still edits");
+    assert_eq!(v.goto_precedent(0, 0), Ok(false));
+    assert_eq!((v.sel, v.anchor), ((2, 2), (3, 3)));
+    assert!(v.goto_precedent(0, 1).is_err(), "no precedent");
+    assert_eq!(v.sel, (2, 2), "nothing moved");
+}
+
+#[test]
+fn a_precedent_on_another_sheet_switches_to_it_unless_hidden() {
+    let mut v = view();
+    v.pkg.workbook.sheets.push(gridcore::sheet::Sheet {
+        name: "Data".into(),
+        ..Default::default()
+    });
+    put(&mut v, 0, 0, Cell::formula("Data!B2*2"));
+    v.edit_opts.edit_in_cell = false;
+    v.pkg.workbook.sheets[1].hidden = true;
+    assert!(v.goto_precedent(0, 0).is_err());
+    assert_eq!(v.active, 0);
+    v.pkg.workbook.sheets[1].hidden = false;
+    assert_eq!(v.goto_precedent(0, 0), Ok(true));
+    assert_eq!((v.active, v.sel, v.anchor), (1, (1, 1), (1, 1)));
+}
+
+#[test]
+fn the_fill_handle_option_hides_and_disarms_the_handle() {
+    let mut fill = None;
+    assert!(!arm_fill(
+        &mut fill,
+        Some((0, 0, 0, 0)),
+        false,
+        false,
+        false,
+        false
+    ));
+    assert!(fill.is_none());
+    assert_eq!(
+        fill_handle_hidden(false, false, false, false, None),
+        Some(HandleHidden::Disabled)
+    );
+    assert!(!HandleHidden::Disabled.cleared_by_a_click());
+    assert!(arm_fill(
+        &mut fill,
+        Some((0, 0, 0, 0)),
+        false,
+        false,
+        false,
+        true
+    ));
+}
+
+#[test]
+fn editing_in_cells_off_draws_the_entry_as_plain_text() {
+    assert_eq!(cell_edit_draw(true, true, true), CellEditDraw::Editor);
+    assert_eq!(cell_edit_draw(true, true, false), CellEditDraw::Plain);
+    assert_eq!(cell_edit_draw(false, true, false), CellEditDraw::None);
+    assert_eq!(cell_edit_draw(true, false, true), CellEditDraw::None);
+}
+
+#[test]
+fn the_status_bar_says_fixed_decimal_while_it_is_on() {
+    let mut o = EditOptions::default();
+    assert!(sheet_status_words(&o).is_empty());
+    o.fixed_decimal = true;
+    assert_eq!(sheet_status_words(&o), ["Fixed Decimal"]);
+}
+
+#[test]
+fn the_formula_bar_expands_to_about_four_lines() {
+    assert_eq!(fx_bar_height(false), 26.);
+    assert!(fx_bar_height(true) >= 4. * 16.);
+}
+
+#[test]
+fn settings_direction_cycles_every_way() {
+    let mut m = EnterMove::Down;
+    let mut seen = vec![m];
+    for _ in 0..3 {
+        m = next_enter_move(m);
+        seen.push(m);
+    }
+    assert_eq!(seen, EnterMove::ALL);
+    assert_eq!(next_enter_move(EnterMove::Left), EnterMove::Down);
+}
