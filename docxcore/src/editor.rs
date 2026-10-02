@@ -158,6 +158,13 @@ pub struct Editor {
     redo: Vec<Snapshot>,
     last: EditKind,
     review_target: Option<RevisionTarget>,
+    /// Mail merge's Preview Results record (#628), shown in merge fields'
+    /// `text` only. Re-applied after undo/redo, since a snapshot holds
+    /// whatever record was shown when it was taken.
+    merge_preview: Option<crate::merge::MergePreview>,
+    /// A preview has been shown since this editor opened, so merge fields'
+    /// text may need putting back.
+    merge_previewed: bool,
 }
 
 impl Editor {
@@ -172,7 +179,50 @@ impl Editor {
             redo: Vec::new(),
             last: EditKind::None,
             review_target: None,
+            merge_preview: None,
+            merge_previewed: false,
         }
+    }
+
+    /// Show a mail-merge record in the merge fields (Preview Results), or
+    /// their placeholders again with `None`. Display only: no undo step, and
+    /// `raw` (what is saved) never changes.
+    pub fn set_merge_preview(&mut self, preview: Option<crate::merge::MergePreview>) {
+        self.merge_preview = preview;
+        self.refresh_merge_preview();
+    }
+
+    /// Re-apply the merge preview (or its absence) to every merge field. Hosts
+    /// call it after an edit that may have added a merge field; undo and redo
+    /// call it themselves. Free when no preview was ever shown.
+    pub fn refresh_merge_preview(&mut self) {
+        if self.merge_preview.is_none() && !self.merge_previewed {
+            return;
+        }
+        self.merge_previewed = true;
+        crate::merge::preview::apply_preview(&mut self.doc, self.merge_preview.as_ref());
+        // A field whose cache was empty now takes an offset; keep the caret
+        // and anchor inside their paragraphs.
+        let clamp = |doc: &Document, c: &mut Caret| {
+            if let Some(p) = resolve_para(&doc.body, &c.path) {
+                c.offset = c.offset.min(para_text_len(p));
+            }
+        };
+        clamp(&self.doc, &mut self.caret);
+        if let Some(a) = self.anchor.as_mut() {
+            clamp(&self.doc, a);
+        }
+    }
+
+    /// The document to export as text (Markdown, HTML, plain text): merge
+    /// fields show their placeholders, not a previewed record.
+    pub fn export_doc(&self) -> std::borrow::Cow<'_, Document> {
+        if self.merge_preview.is_none() {
+            return std::borrow::Cow::Borrowed(&self.doc);
+        }
+        let mut doc = self.doc.clone();
+        crate::merge::preview::apply_preview(&mut doc, None);
+        std::borrow::Cow::Owned(doc)
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -213,6 +263,7 @@ impl Editor {
             self.anchor = prev.anchor;
             self.review_target = prev.review_target;
             self.last = EditKind::None;
+            self.refresh_merge_preview();
             true
         } else {
             false
@@ -227,6 +278,7 @@ impl Editor {
             self.anchor = next.anchor;
             self.review_target = next.review_target;
             self.last = EditKind::None;
+            self.refresh_merge_preview();
             true
         } else {
             false
@@ -1100,6 +1152,13 @@ impl Editor {
         for (path, s, e) in spans {
             if let Some(p) = resolve_para(&self.doc.body, &path) {
                 paras.push(extract_range(&p.content, s, e));
+            }
+        }
+        // A previewed record is display only: copied merge fields carry
+        // their placeholders, as a save would.
+        if self.merge_preview.is_some() {
+            for para in &mut paras {
+                crate::merge::preview::unpreview_inlines(para);
             }
         }
         Some(Clip { paras })

@@ -407,7 +407,7 @@ fn the_tab_sits_between_insert_and_review_for_documents_only() {
     };
     assert_eq!(
         names(Kind::Docx),
-        ["Home", "Insert", "Layout", "Review", "View"]
+        ["Home", "Insert", "Layout", "Mailings", "Review", "View"]
     );
     assert_eq!(names(Kind::Xlsx), ["Home", "Insert", "Review", "View"]);
     for kind in [Kind::Docx, Kind::Xlsx] {

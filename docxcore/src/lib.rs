@@ -35,6 +35,7 @@ pub mod latex;
 pub mod load;
 pub mod markdown;
 pub mod mathbox;
+pub mod merge;
 pub mod mermaid;
 pub mod mermaid_embed;
 pub mod mermaid_seq;

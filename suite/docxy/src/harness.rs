@@ -1455,8 +1455,55 @@ fn live_doc_state(app: &crate::Docxy, window: &Window) -> Result<Json, String> {
     let mut doc = doc_state(active_doc(app)?, &ViewFlags::live(app, window));
     if let Json::Obj(fields) = &mut doc {
         fields.push(("ruler".into(), ruler_state(app)));
+        if let Some(tab) = app.tabs.get(app.active) {
+            fields.push(("mail".into(), mail_state(tab)));
+        }
     }
     Ok(doc)
+}
+
+/// The tab's mail merge (#628): the main document type (`null` for a Normal
+/// Word Document), the attached list's rows and columns, the previewed
+/// record (1-based), the Preview and Highlight toggles, the data source the
+/// document names but has not read, and the body's text as it shows: a
+/// field as its value or placeholder, paragraphs joined by `¶`.
+fn mail_state(tab: &crate::DocTab) -> Json {
+    let m = &tab.mail;
+    let text = match &tab.surface {
+        crate::Surface::Doc(ed) => ed
+            .doc
+            .plain_text()
+            .replace(docxcore::merge::preview::EMPTY_PREVIEW, "")
+            .trim_end_matches('\n')
+            .replace('\n', "\u{b6}"),
+        _ => String::new(),
+    };
+    Json::obj(vec![
+        (
+            "doc_type",
+            m.doc_type.map_or(Json::Null, |t| {
+                Json::Str(crate::mailings_tab::doc_type_name(t).into())
+            }),
+        ),
+        (
+            "rows",
+            Json::Num(m.recipients.as_ref().map_or(0, |r| r.rows.len()) as f64),
+        ),
+        (
+            "columns",
+            Json::Arr(
+                m.recipients
+                    .iter()
+                    .flat_map(|r| r.headers.iter().cloned().map(Json::Str))
+                    .collect(),
+            ),
+        ),
+        ("record", Json::Num((m.record + 1) as f64)),
+        ("preview", Json::Bool(m.preview)),
+        ("highlight", Json::Bool(m.highlight)),
+        ("pending", str_or_null(m.pending_source.clone())),
+        ("text", Json::Str(text)),
+    ])
 }
 
 fn active_doc(app: &crate::Docxy) -> Result<&Editor, String> {
@@ -2002,6 +2049,16 @@ fn split_primary(
             {
                 return Ok(cmd.id);
             }
+            // A box that opens a menu (Mailings' record box, #628).
+            crate::Control::Rows(rows) => {
+                for cell in rows.iter().flatten() {
+                    if let crate::rs::Cell::Combo { cmd, .. } = cell {
+                        if cmd.label == label && crate::mailings_tab::menu_of(cmd.id).is_some() {
+                            return Ok(cmd.id);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -2180,6 +2237,7 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "drag"
             | "fill-drag"
             | "save-as"
+            | "mail-attach"
             | "select-chart"
             | "focus-field"
             | "ribbon-click"
@@ -3185,6 +3243,37 @@ pub fn dispatch(
             Ok(done)
         }
 
+        // Mailings ▸ Select Recipients ▸ Use an Existing List… without the
+        // native file dialog (#628): the path goes to the same attach the
+        // dialog's answer feeds. A relative path resolves against the tab's
+        // folder.
+        "mail-attach" => {
+            app.refuse_under_dialog()?;
+            let raw = match args.get("path") {
+                Some(Json::Str(path)) => path.as_str(),
+                Some(_) => return Err("'path' must be a string".into()),
+                None => return Err("mail-attach needs a 'path'".into()),
+            };
+            let tab = app.tabs.get_mut(app.active).ok_or("no tab is open")?;
+            if tab.kind != crate::Kind::Docx {
+                return Err("mail-attach needs a Word document".into());
+            }
+            let path = match tab.path.as_deref().and_then(Path::parent) {
+                Some(base) if Path::new(raw).is_relative() => base.join(raw),
+                _ => PathBuf::from(raw),
+            };
+            crate::mailings_tab::attach(tab, &path)?;
+            let r = tab.mail.recipients.as_ref().expect("just attached");
+            Done::ok(Json::obj(vec![
+                ("rows", Json::Num(r.rows.len() as f64)),
+                (
+                    "columns",
+                    Json::Arr(r.headers.iter().cloned().map(Json::Str).collect()),
+                ),
+                ("status", Json::Str(tab.status.to_string())),
+            ]))
+        }
+
         // Save As without the native dialog (#699), which a harness instance
         // must never open (its modal loop stops the control pump). The target
         // the dialog would have answered with goes to the same save functions
@@ -3811,6 +3900,7 @@ mod tests {
             dialogs: crate::dialog::DialogStack::default(),
             access: crate::open_mode::Access::default(),
             last_hot: Default::default(),
+            mail: Default::default(),
         };
         let mut word = doc(crate::Kind::Docx, "a.docx");
         word.path = Some("C:/work/a.docx".into());
@@ -4178,7 +4268,9 @@ mod tests {
             tabs.iter()
                 .map(|t| t.get_str("name").unwrap())
                 .collect::<Vec<_>>(),
-            vec!["File", "Home", "Insert", "Layout", "Review", "View"]
+            vec![
+                "File", "Home", "Insert", "Layout", "Mailings", "Review", "View"
+            ]
         );
         let tabs_on = on.get("tabs").unwrap().as_array().unwrap();
         let n = tabs_on.len();

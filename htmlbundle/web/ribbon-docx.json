@@ -1710,6 +1710,645 @@
       ]
     },
     {
+      "name": "Mailings",
+      "keyTip": "M",
+      "kind": "ribbon",
+      "groups": [
+        {
+          "title": "Create",
+          "priority": 20,
+          "launcher": null,
+          "items": [
+            {
+              "kind": "large",
+              "cmd": {
+                "id": "envelopes",
+                "label": "Envelopes",
+                "icon": "mail-envelope",
+                "act": "Mail(Envelopes)",
+                "keyTip": "E",
+                "tip": {
+                  "title": "Envelopes",
+                  "body": "",
+                  "shortcut": ""
+                }
+              }
+            },
+            {
+              "kind": "large",
+              "cmd": {
+                "id": "labels",
+                "label": "Labels",
+                "icon": "mail-labels",
+                "act": "Mail(Labels)",
+                "keyTip": "L",
+                "tip": {
+                  "title": "Labels",
+                  "body": "",
+                  "shortcut": ""
+                }
+              }
+            }
+          ]
+        },
+        {
+          "title": "Start Mail Merge",
+          "priority": 40,
+          "launcher": null,
+          "items": [
+            {
+              "kind": "dropdown",
+              "cmd": {
+                "id": "startmailmerge",
+                "label": "Start Mail Merge",
+                "icon": "mail-merge",
+                "act": "Mail(Menu(StartMailMerge))",
+                "keyTip": "S",
+                "tip": {
+                  "title": "Start Mail Merge",
+                  "body": "",
+                  "shortcut": ""
+                }
+              },
+              "items": [
+                {
+                  "id": "mm-letters",
+                  "label": "Letters",
+                  "icon": "mail-merge",
+                  "act": "Mail(DocType(Letters))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "Letters",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "mm-email",
+                  "label": "E-mail Messages",
+                  "icon": "mail-merge",
+                  "act": "Mail(DocType(Email))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "E-mail Messages",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "mm-envelopes",
+                  "label": "Envelopes...",
+                  "icon": "mail-merge",
+                  "act": "Mail(StartEnvelopes)",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "Envelopes...",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "mm-labels",
+                  "label": "Labels...",
+                  "icon": "mail-merge",
+                  "act": "Mail(StartLabels)",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "Labels...",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "mm-directory",
+                  "label": "Directory",
+                  "icon": "mail-merge",
+                  "act": "Mail(DocType(Directory))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "Directory",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "mm-normal",
+                  "label": "Normal Word Document",
+                  "icon": "mail-merge",
+                  "act": "Mail(NormalDocument)",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "Normal Word Document",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "mm-wizard",
+                  "label": "Step-by-Step Mail Merge Wizard...",
+                  "icon": "mail-merge",
+                  "act": "Mail(Unavailable)",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "Step-by-Step Mail Merge Wizard...",
+                    "body": "Not available yet: the Mail Merge Wizard is a follow-up.",
+                    "shortcut": ""
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "dropdown",
+              "cmd": {
+                "id": "selectrecipients",
+                "label": "Select Recipients",
+                "icon": "mail-recipients",
+                "act": "Mail(Menu(SelectRecipients))",
+                "keyTip": "R",
+                "tip": {
+                  "title": "Select Recipients",
+                  "body": "",
+                  "shortcut": ""
+                }
+              },
+              "items": [
+                {
+                  "id": "rcpt-new",
+                  "label": "Type a New List...",
+                  "icon": "mail-recipients",
+                  "act": "Mail(Unavailable)",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "Type a New List...",
+                    "body": "Not available yet: typing a list and Outlook contacts are a follow-up.",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "rcpt-existing",
+                  "label": "Use an Existing List...",
+                  "icon": "mail-recipients",
+                  "act": "Mail(UseExistingList)",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "Use an Existing List...",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "rcpt-outlook",
+                  "label": "Choose from Outlook Contacts...",
+                  "icon": "mail-recipients",
+                  "act": "Mail(Unavailable)",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "Choose from Outlook Contacts...",
+                    "body": "Not available yet: typing a list and Outlook contacts are a follow-up.",
+                    "shortcut": ""
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "large",
+              "cmd": {
+                "id": "editrecipients",
+                "label": "Edit Recipient List",
+                "icon": "mail-edit-list",
+                "act": "Mail(EditRecipients)",
+                "keyTip": "D",
+                "tip": {
+                  "title": "Edit Recipient List",
+                  "body": "",
+                  "shortcut": ""
+                }
+              }
+            }
+          ]
+        },
+        {
+          "title": "Write & Insert Fields",
+          "priority": 50,
+          "launcher": null,
+          "items": [
+            {
+              "kind": "large",
+              "cmd": {
+                "id": "highlightfields",
+                "label": "Highlight Merge Fields",
+                "icon": "highlight",
+                "act": "Mail(Highlight)",
+                "keyTip": "H",
+                "tip": {
+                  "title": "Highlight Merge Fields",
+                  "body": "",
+                  "shortcut": ""
+                }
+              }
+            },
+            {
+              "kind": "large",
+              "cmd": {
+                "id": "addressblock",
+                "label": "Address Block",
+                "icon": "mail-address-block",
+                "act": "Mail(AddressBlock)",
+                "keyTip": "A",
+                "tip": {
+                  "title": "Address Block",
+                  "body": "",
+                  "shortcut": ""
+                }
+              }
+            },
+            {
+              "kind": "large",
+              "cmd": {
+                "id": "greetingline",
+                "label": "Greeting Line",
+                "icon": "mail-greeting",
+                "act": "Mail(GreetingLine)",
+                "keyTip": "G",
+                "tip": {
+                  "title": "Greeting Line",
+                  "body": "",
+                  "shortcut": ""
+                }
+              }
+            },
+            {
+              "kind": "dropdown",
+              "cmd": {
+                "id": "insertmergefield",
+                "label": "Insert Merge Field",
+                "icon": "mail-field",
+                "act": "Mail(Menu(InsertMergeField))",
+                "keyTip": "I",
+                "tip": {
+                  "title": "Insert Merge Field",
+                  "body": "",
+                  "shortcut": ""
+                }
+              },
+              "items": []
+            },
+            {
+              "kind": "dropdown",
+              "cmd": {
+                "id": "mailrules",
+                "label": "Rules",
+                "icon": "mail-rules",
+                "act": "Mail(Menu(Rules))",
+                "keyTip": "U",
+                "tip": {
+                  "title": "Rules",
+                  "body": "",
+                  "shortcut": ""
+                }
+              },
+              "items": [
+                {
+                  "id": "rule-ask",
+                  "label": "Ask...",
+                  "icon": "mail-rules",
+                  "act": "Mail(Unavailable)",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "Ask...",
+                    "body": "Not available yet: rules with nested fields (Ask, Fill-in, If, Skip) are a follow-up.",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "rule-fillin",
+                  "label": "Fill-in...",
+                  "icon": "mail-rules",
+                  "act": "Mail(Unavailable)",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "Fill-in...",
+                    "body": "Not available yet: rules with nested fields (Ask, Fill-in, If, Skip) are a follow-up.",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "rule-if",
+                  "label": "If...Then...Else...",
+                  "icon": "mail-rules",
+                  "act": "Mail(Unavailable)",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "If...Then...Else...",
+                    "body": "Not available yet: rules with nested fields (Ask, Fill-in, If, Skip) are a follow-up.",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "rule-mergerec",
+                  "label": "Merge Record #",
+                  "icon": "mail-rules",
+                  "act": "Mail(Rule(MergeRecord))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "Merge Record #",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "rule-mergeseq",
+                  "label": "Merge Sequence #",
+                  "icon": "mail-rules",
+                  "act": "Mail(Rule(MergeSequence))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "Merge Sequence #",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "rule-next",
+                  "label": "Next Record",
+                  "icon": "mail-rules",
+                  "act": "Mail(Rule(NextRecord))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "Next Record",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "rule-nextif",
+                  "label": "Next Record If...",
+                  "icon": "mail-rules",
+                  "act": "Mail(Unavailable)",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "Next Record If...",
+                    "body": "Not available yet: rules with nested fields (Ask, Fill-in, If, Skip) are a follow-up.",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "rule-bookmark",
+                  "label": "Set Bookmark...",
+                  "icon": "mail-rules",
+                  "act": "Mail(Unavailable)",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "Set Bookmark...",
+                    "body": "Not available yet: rules with nested fields (Ask, Fill-in, If, Skip) are a follow-up.",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "rule-skipif",
+                  "label": "Skip Record If...",
+                  "icon": "mail-rules",
+                  "act": "Mail(Unavailable)",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "Skip Record If...",
+                    "body": "Not available yet: rules with nested fields (Ask, Fill-in, If, Skip) are a follow-up.",
+                    "shortcut": ""
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "column",
+              "cmds": [
+                {
+                  "id": "matchfields",
+                  "label": "Match Fields",
+                  "icon": "mail-match",
+                  "act": "Mail(MatchFields)",
+                  "keyTip": "T",
+                  "tip": {
+                    "title": "Match Fields",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "updatelabels",
+                  "label": "Update Labels",
+                  "icon": "mail-update",
+                  "act": "Mail(UpdateLabels)",
+                  "keyTip": "B",
+                  "tip": {
+                    "title": "Update Labels",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "title": "Preview Results",
+          "priority": 60,
+          "launcher": null,
+          "items": [
+            {
+              "kind": "large",
+              "cmd": {
+                "id": "previewresults",
+                "label": "Preview Results",
+                "icon": "mail-preview",
+                "act": "Mail(Preview)",
+                "keyTip": "P",
+                "tip": {
+                  "title": "Preview Results",
+                  "body": "",
+                  "shortcut": ""
+                }
+              }
+            },
+            {
+              "kind": "rows",
+              "rows": [
+                [
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "mailfirst",
+                      "label": "First Record",
+                      "icon": "mail-first",
+                      "act": "Mail(First)",
+                      "keyTip": "",
+                      "tip": {
+                        "title": "First Record",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "mailprev",
+                      "label": "Previous Record",
+                      "icon": "mail-prev",
+                      "act": "Mail(Previous)",
+                      "keyTip": "",
+                      "tip": {
+                        "title": "Previous Record",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  },
+                  {
+                    "kind": "combo",
+                    "cmd": {
+                      "id": "mailrecord",
+                      "label": "Go to Record",
+                      "icon": "list-numbered",
+                      "act": "Mail(Menu(Record))",
+                      "keyTip": "",
+                      "tip": {
+                        "title": "Go to Record",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    },
+                    "wide": false
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "mailnext",
+                      "label": "Next Record",
+                      "icon": "mail-next",
+                      "act": "Mail(Next)",
+                      "keyTip": "",
+                      "tip": {
+                        "title": "Next Record",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "maillast",
+                      "label": "Last Record",
+                      "icon": "mail-last",
+                      "act": "Mail(Last)",
+                      "keyTip": "",
+                      "tip": {
+                        "title": "Last Record",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  }
+                ],
+                [
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "findrecipient",
+                      "label": "Find Recipient",
+                      "icon": "find",
+                      "act": "Mail(FindRecipient)",
+                      "keyTip": "N",
+                      "tip": {
+                        "title": "Find Recipient",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "checkerrors",
+                      "label": "Check for Errors",
+                      "icon": "mail-check",
+                      "act": "Mail(CheckErrors)",
+                      "keyTip": "K",
+                      "tip": {
+                        "title": "Check for Errors",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  }
+                ]
+              ]
+            }
+          ]
+        },
+        {
+          "title": "Finish",
+          "priority": 30,
+          "launcher": null,
+          "items": [
+            {
+              "kind": "dropdown",
+              "cmd": {
+                "id": "finishmerge",
+                "label": "Finish & Merge",
+                "icon": "mail-finish",
+                "act": "Mail(Menu(Finish))",
+                "keyTip": "F",
+                "tip": {
+                  "title": "Finish & Merge",
+                  "body": "",
+                  "shortcut": ""
+                }
+              },
+              "items": [
+                {
+                  "id": "finish-edit",
+                  "label": "Edit Individual Documents...",
+                  "icon": "mail-finish",
+                  "act": "Mail(EditIndividual)",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "Edit Individual Documents...",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "finish-print",
+                  "label": "Print Documents...",
+                  "icon": "mail-finish",
+                  "act": "Mail(Unavailable)",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "Print Documents...",
+                    "body": "Not available yet: printing merged documents is a follow-up.",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "finish-email",
+                  "label": "Send Email Messages...",
+                  "icon": "mail-finish",
+                  "act": "Mail(Unavailable)",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "Send Email Messages...",
+                    "body": "Not available yet: sending merged e-mail is a follow-up.",
+                    "shortcut": ""
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
       "name": "Review",
       "keyTip": "R",
       "kind": "ribbon",
@@ -3276,6 +3915,24 @@
     "line-spacing": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<rect x=\"9\" y=\"4.4\" width=\"9\" height=\"1.3\" rx=\"0.65\" fill=\"#212121\"/>\n<rect x=\"9\" y=\"9.35\" width=\"9\" height=\"1.3\" rx=\"0.65\" fill=\"#212121\"/>\n<rect x=\"9\" y=\"14.3\" width=\"9\" height=\"1.3\" rx=\"0.65\" fill=\"#212121\"/>\n<rect x=\"3.45\" y=\"4.2\" width=\"1.1\" height=\"11.6\" fill=\"#212121\"/>\n<path d=\"M4 2.9 L6.1 5.6 L1.9 5.6 Z\" fill=\"#212121\"/>\n<path d=\"M4 17.1 L6.1 14.4 L1.9 14.4 Z\" fill=\"#212121\"/>\n</svg>",
     "list-bullet": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M3 5.5C3.55228 5.5 4 5.05228 4 4.5C4 3.94772 3.55228 3.5 3 3.5C2.44772 3.5 2 3.94772 2 4.5C2 5.05228 2.44772 5.5 3 5.5ZM6 4.5C6 4.22386 6.22386 4 6.5 4H17.5C17.7761 4 18 4.22386 18 4.5C18 4.77614 17.7761 5 17.5 5H6.5C6.22386 5 6 4.77614 6 4.5ZM6 9.5C6 9.22386 6.22386 9 6.5 9H17.5C17.7761 9 18 9.22386 18 9.5C18 9.77614 17.7761 10 17.5 10H6.5C6.22386 10 6 9.77614 6 9.5ZM6.5 14C6.22386 14 6 14.2239 6 14.5C6 14.7761 6.22386 15 6.5 15H17.5C17.7761 15 18 14.7761 18 14.5C18 14.2239 17.7761 14 17.5 14H6.5ZM4 14.5C4 15.0523 3.55228 15.5 3 15.5C2.44772 15.5 2 15.0523 2 14.5C2 13.9477 2.44772 13.5 3 13.5C3.55228 13.5 4 13.9477 4 14.5ZM3 10.5C3.55228 10.5 4 10.0523 4 9.5C4 8.94772 3.55228 8.5 3 8.5C2.44772 8.5 2 8.94772 2 9.5C2 10.0523 2.44772 10.5 3 10.5Z\" fill=\"#212121\"/>\n</svg>",
     "list-numbered": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M5.00011 1.49988C5.00011 1.26799 4.84067 1.06653 4.61499 1.01325C4.38621 0.959243 4.15942 1.07477 4.05148 1.27895C4.0295 1.32085 4.00531 1.36162 3.98053 1.40189C3.92681 1.48918 3.8447 1.61249 3.73468 1.75003C3.51178 2.02864 3.19011 2.34586 2.7765 2.55266C2.52951 2.67616 2.4294 2.97649 2.5529 3.22348C2.67639 3.47047 2.97673 3.57058 3.22372 3.44709C3.52353 3.29718 3.78202 3.11079 4.00011 2.9181V5.49988C4.00011 5.77602 4.22397 5.99988 4.50011 5.99988C4.77625 5.99988 5.00011 5.77602 5.00011 5.49988V1.49988ZM2.64642 7.64639C2.45117 7.84166 2.4512 8.15825 2.64647 8.35349C2.84059 8.54758 3.15457 8.54871 3.35008 8.35691L3.35665 8.35089C3.36458 8.34379 3.37911 8.3312 3.39988 8.31488C3.44165 8.28204 3.50709 8.23533 3.59323 8.18792C3.76518 8.09329 4.01033 8.00073 4.31294 7.99988C4.54021 8.00441 4.72387 8.06465 4.83732 8.14866C4.93306 8.21956 5 8.31935 5 8.49997C5 8.70224 4.92979 8.8191 4.78928 8.93618C4.63792 9.06232 4.44136 9.15961 4.17109 9.29339C4.12524 9.31608 4.07662 9.34015 4.0264 9.36526C3.71266 9.52213 3.32368 9.72875 3.02065 10.0621C2.69919 10.4157 2.5 10.8808 2.5 11.5C2.5 11.7761 2.72386 12 3 12H5.49944C5.77558 12 6 11.7761 6 11.5C6 11.2239 5.77614 11 5.5 11H3.58925C3.63458 10.8933 3.69413 10.8079 3.7606 10.7347C3.92632 10.5524 4.16234 10.4153 4.4736 10.2597C4.51206 10.2405 4.55257 10.2206 4.5946 10.2C4.85655 10.0715 5.17854 9.91351 5.42947 9.7044C5.75771 9.43086 6 9.04771 6 8.49997C6 7.99553 5.77725 7.60036 5.43244 7.34502C5.10604 7.10332 4.69985 7.00626 4.32563 6.99995L4.31722 6.99988C3.80459 6.99985 3.39261 7.15689 3.11107 7.31184C2.97006 7.38944 2.85942 7.46775 2.78191 7.52868C2.74303 7.55924 2.71212 7.58572 2.68951 7.60596C2.67819 7.6161 2.66892 7.62471 2.66173 7.63152L2.65251 7.64038L2.64907 7.64375L2.64765 7.64516L2.64642 7.64639ZM2.66173 7.63152L2.64642 7.64639C2.64642 7.64639 2.7471 7.55664 2.66173 7.63152ZM4.25011 14.9999C3.97397 14.9999 3.75011 15.2237 3.75011 15.4999C3.75011 15.776 3.97397 15.9999 4.25011 15.9999C4.5929 15.9999 4.78233 16.0966 4.87775 16.183C4.97201 16.2683 5.01072 16.3743 5.00671 16.4811C4.99946 16.6746 4.82083 16.9999 4.25011 16.9999C3.8376 16.9999 3.62396 16.8982 3.52746 16.8339C3.4769 16.8001 3.44973 16.7709 3.43891 16.7579L3.43482 16.7528C3.30449 16.5231 3.01552 16.4332 2.7765 16.5527C2.52951 16.6762 2.4294 16.9765 2.5529 17.2235L2.55361 17.2249L2.55435 17.2264L2.55594 17.2295L2.55948 17.2362L2.56815 17.252C2.57465 17.2635 2.58262 17.2768 2.59222 17.2917C2.61141 17.3216 2.63716 17.3579 2.67069 17.3981C2.73799 17.4789 2.83582 17.5746 2.97276 17.6659C3.25126 17.8516 3.66262 17.9999 4.25011 17.9999C5.27939 17.9999 5.97576 17.3251 6.00601 16.5186C6.01979 16.1511 5.88798 15.7829 5.60959 15.4999C5.88798 15.2168 6.01979 14.8486 6.00601 14.4811C5.97576 13.6746 5.27939 12.9999 4.25011 12.9999C3.66262 12.9999 3.25126 13.1482 2.97276 13.3339C2.83582 13.4251 2.73799 13.5209 2.67069 13.6017C2.63716 13.6419 2.61141 13.6782 2.59222 13.708C2.58262 13.7229 2.57465 13.7363 2.56815 13.7478L2.55948 13.7635L2.55594 13.7703L2.55435 13.7734L2.55361 13.7748L2.5529 13.7763C2.4294 14.0233 2.52951 14.3236 2.7765 14.4471C3.01552 14.5666 3.30449 14.4767 3.43482 14.2469L3.43891 14.2418C3.44973 14.2289 3.4769 14.1996 3.52746 14.1659C3.62396 14.1016 3.8376 13.9999 4.25011 13.9999C4.82083 13.9999 4.99946 14.3251 5.00671 14.5186C5.01072 14.6254 4.97201 14.7314 4.87775 14.8168C4.78233 14.9032 4.5929 14.9999 4.25011 14.9999ZM3.43482 14.2469L3.43279 14.2497L3.43339 14.2488C3.43339 14.2488 3.43583 14.2449 3.43817 14.2408L3.44223 14.2334L3.44465 14.2287L3.44596 14.2262L3.44698 14.2242C3.44309 14.2319 3.43904 14.2395 3.43482 14.2469ZM8.49976 3.99988C8.22361 3.99988 7.99976 4.22374 7.99976 4.49988C7.99976 4.77602 8.22361 4.99988 8.49976 4.99988H16.4998C16.7759 4.99988 16.9998 4.77602 16.9998 4.49988C16.9998 4.22374 16.7759 3.99988 16.4998 3.99988H8.49976ZM8.49976 8.99988C8.22361 8.99988 7.99976 9.22374 7.99976 9.49988C7.99976 9.77602 8.22361 9.99988 8.49976 9.99988H16.4998C16.7759 9.99988 16.9998 9.77602 16.9998 9.49988C16.9998 9.22374 16.7759 8.99988 16.4998 8.99988H8.49976ZM7.99976 14.4999C7.99976 14.2237 8.22361 13.9999 8.49976 13.9999H16.4998C16.7759 13.9999 16.9998 14.2237 16.9998 14.4999C16.9998 14.776 16.7759 14.9999 16.4998 14.9999H8.49976C8.22361 14.9999 7.99976 14.776 7.99976 14.4999Z\" fill=\"#212121\"/>\n</svg>",
+    "mail-address-block": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<rect x=\"2.5\" y=\"4.5\" width=\"15\" height=\"11\" rx=\"1.5\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M5.5 8H12.5M5.5 10.5H14.5M5.5 13H10.5\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n</svg>",
+    "mail-check": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M5.5 2.5H11.5L14.5 5.5V17.5H5.5V2.5Z\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M7.5 11L9.5 13L13 9\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n</svg>",
+    "mail-edit-list": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M8 5H17M8 10H17M8 15H17\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M2.5 5L3.5 6L5.5 4M2.5 10L3.5 11L5.5 9M2.5 15L3.5 16L5.5 14\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n</svg>",
+    "mail-envelope": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<rect x=\"2.5\" y=\"4.5\" width=\"15\" height=\"11\" rx=\"1.5\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M3 5.5L10 11L17 5.5\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n</svg>",
+    "mail-field": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M6.5 6L3.5 10L6.5 14M9.5 6L6.5 10L9.5 14M10.5 6L13.5 10L10.5 14M13.5 6L16.5 10L13.5 14\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n</svg>",
+    "mail-finish": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M4.5 4.5L10 10L4.5 15.5M10 10H17.5M14.5 7L17.5 10L14.5 13\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n</svg>",
+    "mail-first": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M5.5 5V15M14.5 5L9.5 10L14.5 15\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n</svg>",
+    "mail-greeting": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M3.5 4.5H16.5V12.5H9L5.5 15.5V12.5H3.5V4.5Z\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M6.5 8.5H13.5\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n</svg>",
+    "mail-labels": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M3.5 3.5H10.3L16.5 9.7L9.7 16.5L3.5 10.3V3.5Z\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><circle cx=\"7\" cy=\"7\" r=\"1.2\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n</svg>",
+    "mail-last": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M14.5 5V15M5.5 5L10.5 10L5.5 15\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n</svg>",
+    "mail-match": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M3.5 6H9M3.5 10H9M3.5 14H9\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M11 6H16.5M11 10H16.5M11 14H16.5\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M9 6L11 10M9 10L11 6\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n</svg>",
+    "mail-merge": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M5.5 2.5H11.5L14.5 5.5V10\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M5.5 2.5V17.5H9\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><rect x=\"10.5\" y=\"11.5\" width=\"7\" height=\"5\" rx=\"1\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M10.8 12L14 14.3L17.2 12\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n</svg>",
+    "mail-next": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M7.5 5L12.5 10L7.5 15\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n</svg>",
+    "mail-prev": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M12.5 5L7.5 10L12.5 15\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n</svg>",
+    "mail-preview": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M2 10C3.8 6.5 6.6 4.5 10 4.5C13.4 4.5 16.2 6.5 18 10C16.2 13.5 13.4 15.5 10 15.5C6.6 15.5 3.8 13.5 2 10Z\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><circle cx=\"10\" cy=\"10\" r=\"2.5\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n</svg>",
+    "mail-recipients": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<circle cx=\"7.5\" cy=\"6.5\" r=\"2.5\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M2.5 16C2.5 13 4.7 11.5 7.5 11.5C10.3 11.5 12.5 13 12.5 16\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><circle cx=\"13.5\" cy=\"7\" r=\"2\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M14 11.6C16 11.8 17.5 13.2 17.5 15.5\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n</svg>",
+    "mail-rules": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M10 3.5V7.5M10 7.5L5 11.5V16.5M10 7.5L15 11.5V16.5\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><circle cx=\"10\" cy=\"3.5\" r=\"1\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n</svg>",
+    "mail-update": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M15.5 8.5A6 6 0 0 0 4.8 6.5M4.5 11.5A6 6 0 0 0 15.2 13.5\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M4.5 3.5V6.5H7.5M15.5 16.5V13.5H12.5\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n</svg>",
     "new": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M6 2C4.89543 2 4 2.89543 4 4V9.20703C4.32228 9.11588 4.65659 9.05337 5 9.02242V4C5 3.44772 5.44772 3 6 3H10V6.5C10 7.32843 10.6716 8 11.5 8H15V16C15 16.5523 14.5523 17 14 17H10.4003C10.2174 17.3578 9.99647 17.6929 9.74284 18H14C15.1046 18 16 17.1046 16 16V7.41421C16 7.01639 15.842 6.63486 15.5607 6.35355L11.6464 2.43934C11.3651 2.15804 10.9836 2 10.5858 2H6ZM14.7929 7H11.5C11.2239 7 11 6.77614 11 6.5V3.20711L14.7929 7ZM10 14.5C10 16.9853 7.98528 19 5.5 19C3.01472 19 1 16.9853 1 14.5C1 12.0147 3.01472 10 5.5 10C7.98528 10 10 12.0147 10 14.5ZM6 12.5C6 12.2239 5.77614 12 5.5 12C5.22386 12 5 12.2239 5 12.5V14H3.5C3.22386 14 3 14.2239 3 14.5C3 14.7761 3.22386 15 3.5 15H5L5 16.5C5 16.7761 5.22386 17 5.5 17C5.77614 17 6 16.7761 6 16.5V15H7.5C7.77614 15 8 14.7761 8 14.5C8 14.2239 7.77614 14 7.5 14H6V12.5Z\" fill=\"#212121\"/>\n</svg>",
     "page-number": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<rect x=\"4.5\" y=\"2.5\" width=\"11\" height=\"15\" rx=\"1\" stroke=\"#212121\" stroke-width=\"1.3\" fill=\"none\"/>\n<line x1=\"7.6\" y1=\"8\" x2=\"12.4\" y2=\"8\" stroke=\"#212121\" stroke-width=\"1.2\" stroke-linecap=\"round\"/>\n<line x1=\"7.6\" y1=\"12\" x2=\"12.4\" y2=\"12\" stroke=\"#212121\" stroke-width=\"1.2\" stroke-linecap=\"round\"/>\n<line x1=\"9.2\" y1=\"6.4\" x2=\"8.4\" y2=\"13.6\" stroke=\"#212121\" stroke-width=\"1.2\" stroke-linecap=\"round\"/>\n<line x1=\"11.6\" y1=\"6.4\" x2=\"10.8\" y2=\"13.6\" stroke=\"#212121\" stroke-width=\"1.2\" stroke-linecap=\"round\"/>\n</svg>",
     "paragraph": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M13.5 8C12.1193 8 11 9.11929 11 10.5C11 11.8807 12.1193 13 13.5 13H14V8H13.5ZM14 14H13.5C11.567 14 10 12.433 10 10.5C10 8.567 11.567 7 13.5 7H17.5C17.7761 7 18 7.22386 18 7.5C18 7.77614 17.7761 8 17.5 8H17V17.5C17 17.7761 16.7761 18 16.5 18C16.2239 18 16 17.7761 16 17.5V8H15V17.5C15 17.7761 14.7761 18 14.5 18C14.2239 18 14 17.7761 14 17.5V14ZM2.5 5C2.22386 5 2 5.22386 2 5.5C2 5.77614 2.22386 6 2.5 6H17.5C17.7761 6 18 5.77614 18 5.5C18 5.22386 17.7761 5 17.5 5H2.5ZM9.25606 9H2.5C2.22386 9 2 9.22386 2 9.5C2 9.77614 2.22386 10 2.5 10H9.02746C9.06579 9.65327 9.14352 9.31841 9.25606 9ZM9.75777 13H2.5C2.22386 13 2 13.2239 2 13.5C2 13.7761 2.22386 14 2.5 14H10.6713C10.319 13.7149 10.0106 13.3776 9.75777 13Z\" fill=\"#212121\"/>\n</svg>",

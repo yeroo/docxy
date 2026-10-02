@@ -355,7 +355,7 @@ replaces the saved reply, and `open` clears it.
 ### Document tabs
 
 `state()` and `call doc {}` report `text`, `textboxes`, `sel`, `anchor`,
-`caret`, `cross_story`, `para`, `run`, `view`, `hf_edit`, and `ruler` from the active body
+`caret`, `cross_story`, `para`, `run`, `view`, `hf_edit`, `ruler`, and `mail` from the active body
 editor. `doc` returns only those document fields. `text` is the main story;
 each paragraph contributes a final `\n`, including a table cell paragraph.
 Tab is `\t`, and line/page/column breaks are `\u000B`/`\u000C`/`\u000E`.
@@ -376,6 +376,14 @@ describes that one table: a selection from an outer table's cell into a table
 nested in another cell reports the nested table, with `range` `null` (the
 range belongs to the outer table, which the table commands act on). `view`
 carries `gridlines`, the Table Layout tab's View Gridlines.
+
+`mail` is the tab's mail merge (#628): `doc_type` (`Letters`, `E-mail
+Messages`, `Envelopes`, `Labels`, `Directory`, or `null` for a Normal Word
+Document), the attached list's `rows` and `columns`, the previewed `record`
+(1-based), the `preview` and `highlight` toggles, `pending` (the data source
+the document names but has not read), and `text`: the body as it shows, a
+merge field as its value or placeholder, paragraphs joined by `¶` (`assert
+mail.text is DearJane¶DearJohn`).
 
 Insert > Table's hover grid is a menu item (`menu-read` reports it as
 `{"table_grid": {"columns": 10, "rows": 8}}`) and is driven with `table-grid`,
@@ -634,6 +642,7 @@ pointer on a few pixels, each driven through the app's own handlers (#699).
 
 | Call | Effect |
 |---|---|
+| `mail-attach {"path":"list.csv"}` | Mailings › Select Recipients › Use an Existing List… without the native dialog (#628): the path goes to the same attach the dialog's answer feeds, on the active Word document. A relative path resolves against the tab's folder. The reply is `{rows, columns, status}`; a file that is not a `.csv`/`.txt` list, cannot be read or has no header row is refused |
 | `save-as {"path":"out.md"}` | Save As the active tab to `path` without the native dialog: the path goes to the same save function the dialog's answer feeds (`save_doc_to`, `save_sheet_as`, `save_project_to`), and the tab is rebound (title, path, clean, a document's Markdown flag) exactly as after a dialog Save As. Optional `format` and `overwrite` |
 | `clipboard {"action":"read"}` | the clipboard's text and what the active tab's paste would use |
 | `clipboard {"action":"write","text":"a\tb\n"}` | put text on the clipboard, as another app's copy would |
@@ -786,6 +795,8 @@ included. Each has a stable id, which the state's `dialog` key reports:
 | `insert-table`, `delete-cells`, `split-cells`, `sort`, `convert-to-text`, `convert-text-to-table` | the table dialogs (#646, #647) |
 | `text-to-columns`, `text-to-columns-replace` | Excel's Convert Text to Columns Wizard and its replace question (#692) |
 | `reopen` | "… is already open … Do you want to reopen …?" before an open discards a workbook's unsaved changes (#610) |
+| `mail-envelopes`, `mail-envelope-options`, `mail-labels`, `mail-label-options`, `mail-replace` | Mailings: Envelopes and Labels (Create), Envelope and Label Options (Start Mail Merge), and the confirm before those replace the document (#628) |
+| `mail-recipients`, `mail-address-block`, `mail-greeting-line`, `mail-match-fields`, `mail-find`, `mail-check-errors`, `mail-merge-new`, `mail-attach`, `mail-report` | Mailings: Edit Recipient List, Address Block, Greeting Line, Match Fields, Find Recipient, Check for Errors, Merge to New Document, "Opening this document will run the following SQL command" and a report (#628) |
 
 `reopen`'s **Yes** is not an undo step and applies nothing to the tab: it
 loads the tab again from its file, in the open mode that was asked for
@@ -883,6 +894,12 @@ Menus open today:
   Baseline (`Set Baseline...`, `Clear Baseline...`);
 - **the document menu** (Cut, Copy, Paste, Bold, Italic, Underline, New
   Comment): right-click a document or sheet body. It never opens on a Project;
+- **the Mailings tab's drop-downs** on a document (#628): Start Mail Merge,
+  Select Recipients, Insert Merge Field (the attached list's columns), Rules,
+  Finish & Merge, and the Preview Results record box (the attached rows).
+  `menu-open {"ribbon": ["Mailings", "Write & Insert Fields", "Insert Merge
+  Field"]}` opens one. Commands Word has that are follow-ups are drawn
+  disabled, and their tip says so;
 - **the Layout tab's drop-downs** on a document (#649): Layout › Page Setup's
   Margins, Orientation, Size, Columns, Breaks, Line Numbers and Hyphenation. A
   press anywhere on the button opens its menu, and so does its KeyTip (Alt, P,

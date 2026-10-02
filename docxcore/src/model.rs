@@ -645,6 +645,20 @@ pub struct FramePr {
     /// Keyword vertical placement (`top|center|bottom|inside|outside|inline`),
     /// used instead of `y`.
     pub y_align: Option<String>,
+    /// `w:dropCap` (`none|drop|margin`).
+    pub drop_cap: Option<String>,
+    /// `w:lines`: drop-cap height in lines.
+    pub lines: Option<i32>,
+    /// `w:hSpace` / `w:vSpace`: distance from surrounding text, in twips.
+    pub h_space: Option<i32>,
+    pub v_space: Option<i32>,
+    /// `w:wrap` (`auto|notBeside|around|tight|through|none`); Word's envelope
+    /// delivery address carries `auto`.
+    pub wrap: Option<String>,
+    /// `w:hRule` (`auto|exact|atLeast`): how `h` is read.
+    pub h_rule: Option<String>,
+    /// `w:anchorLock`, kept as written (`1`, `true`, …).
+    pub anchor_lock: Option<String>,
 }
 
 /// A tab stop alignment (`w:tab w:val`).

@@ -202,6 +202,42 @@ impl Editor {
         self.table_at_caret().is_some()
     }
 
+    /// Run `f` on a copy of the outermost table holding the caret and, when
+    /// it reports a change, put the copy back as one undo step. `Err` when
+    /// the caret is not in a table.
+    pub fn edit_table_at_caret(
+        &mut self,
+        f: impl FnOnce(&mut Table) -> bool,
+    ) -> Result<bool, String> {
+        let Some(pos) = table_steps(&self.doc.body, &self.caret.path)
+            .into_iter()
+            .next()
+        else {
+            return Err("the caret is not in a table".into());
+        };
+        let Some(mut table) = table_at(&self.doc.body, &pos.table).cloned() else {
+            return Err("the caret is not in a table".into());
+        };
+        if !f(&mut table) {
+            return Ok(false);
+        }
+        self.checkpoint(EditKind::Structural);
+        if let Some(t) = table_at_mut(&mut self.doc.body, &pos.table) {
+            *t = table;
+        }
+        // The caret's cell may have new content; keep it at the cell's start.
+        if resolve_para(&self.doc.body, &self.caret.path).is_none() {
+            let mut path = pos.table.clone();
+            path.extend([pos.row, pos.cell, 0]);
+            self.caret = Caret::at(path, 0);
+        } else {
+            self.caret.offset = 0;
+        }
+        self.anchor = None;
+        self.doc.initialize_revision_targets();
+        Ok(true)
+    }
+
     /// The table a path names.
     pub fn table(&self, path: &[usize]) -> Option<&Table> {
         table_at(&self.doc.body, path)

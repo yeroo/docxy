@@ -117,7 +117,7 @@ fn field_args(s: &str) -> Vec<String> {
 /// Split a field's argument string into the part before the first `\switch` and
 /// the `(switch-letter, argument)` pairs that follow. Field expressions don't
 /// contain backslashes, so the first `\` reliably begins the switches.
-fn split_switches(s: &str) -> (String, Vec<(char, String)>) {
+pub(crate) fn split_switches(s: &str) -> (String, Vec<(char, String)>) {
     let cut = s.find('\\').unwrap_or(s.len());
     let head = s[..cut].trim().to_string();
     let mut switches = Vec::new();
@@ -465,9 +465,26 @@ fn group_thousands(int_part: &str) -> String {
     out
 }
 
+/// Whether a `\*` switch is a number format (Arabic, Roman, Ordinal, …),
+/// which [`apply_star`] applies to the number, not the text.
+pub(crate) fn is_number_format(fmt: &str) -> bool {
+    matches!(
+        fmt.trim().to_ascii_lowercase().as_str(),
+        "arabic"
+            | "roman"
+            | "roman_lower"
+            | "lroman"
+            | "ordinal"
+            | "cardinal"
+            | "alphabetic"
+            | "alphabetic_lower"
+            | "alphabetic-lower"
+    )
+}
+
 /// Apply a `\*` format switch: a number format (Arabic/roman/ordinal/cardinal/
 /// alphabetic) on the integer value, or a text case transform on the string.
-fn apply_star(text: &str, value: f64, fmt: &str) -> String {
+pub(crate) fn apply_star(text: &str, value: f64, fmt: &str) -> String {
     let n = value.round() as i64;
     match fmt.trim().to_ascii_lowercase().as_str() {
         "arabic" => n.to_string(),
@@ -864,7 +881,7 @@ pub fn parse_iso(s: &str) -> Option<DateTime> {
     })
 }
 
-fn xml_unescape(s: &str) -> String {
+pub(crate) fn xml_unescape(s: &str) -> String {
     s.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
@@ -932,6 +949,25 @@ pub(crate) fn instr_of(raw: &str) -> Option<String> {
         }
     }
     instr.map(|i| xml_unescape(&i))
+}
+
+/// A `<w:fldSimple>` field with instruction `instr` whose cached result is
+/// `text`, shown with `props` (the caret's formatting where it is inserted, as
+/// Word does). Both the suite's and the terminal's Insert Field build their
+/// fields here, and so do mail-merge fields.
+pub fn fld_simple(instr: &str, text: &str, props: &crate::model::RunProps) -> crate::model::Inline {
+    let mut raw = String::from("<w:fldSimple w:instr=\"");
+    crate::serialize::esc_attr(instr, &mut raw);
+    raw.push_str("\">");
+    raw.push_str(&crate::serialize::run_xml(&crate::model::Run {
+        text: text.to_string(),
+        props: props.clone(),
+    }));
+    raw.push_str("</w:fldSimple>");
+    crate::model::Inline::Field {
+        raw,
+        text: text.to_string(),
+    }
 }
 
 /// Recompute every simple field in the document against `ctx`, replacing its

@@ -87,9 +87,9 @@ test table context follows the caret and exposes the table tabs
   call selection-set {"start":7,"end":7}
   assert para.index is 1
   call ribbon-read {}
-  assert reply.tab_count is 8
-  assert reply.tabs.6.name is Table Design
-  assert reply.tabs.7.name is Table Layout
+  assert reply.tab_count is 9
+  assert reply.tabs.7.name is Table Design
+  assert reply.tabs.8.name is Table Layout
   key alt t escape escape
   assert ribbon_tab is Table Design
   key alt j escape escape
@@ -97,7 +97,7 @@ test table context follows the caret and exposes the table tabs
   call selection-set {"start":0,"end":0}
   assert ribbon_tab is Home
   call ribbon-read {}
-  assert reply.tab_count is 6
+  assert reply.tab_count is 7
 
 test header editing is reported separately from the body
   open copy:../fixtures/basic.docx

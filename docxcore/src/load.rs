@@ -1567,6 +1567,13 @@ fn parse_ppr(p: &mut XmlParser, props: &mut ParProps) {
                         v_anchor: frame_str(p, "w:vAnchor"),
                         x_align: frame_str(p, "w:xAlign"),
                         y_align: frame_str(p, "w:yAlign"),
+                        drop_cap: frame_str(p, "w:dropCap"),
+                        lines: frame_int(p, "w:lines"),
+                        h_space: frame_int(p, "w:hSpace"),
+                        v_space: frame_int(p, "w:vSpace"),
+                        wrap: frame_str(p, "w:wrap"),
+                        h_rule: frame_str(p, "w:hRule"),
+                        anchor_lock: frame_str(p, "w:anchorLock"),
                     });
                     p.skip_element();
                 }

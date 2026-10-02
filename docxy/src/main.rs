@@ -236,6 +236,11 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some("compare") && args.len() > 1 {
         return compare_cli(&args[1..]);
     }
+    // `docxy merge <main.docx> <data.csv> -o <out>` runs a mail merge (#628)
+    // headless and exits.
+    if args.first().map(String::as_str) == Some("merge") && args.len() > 1 {
+        return merge_cli(&args[1..]);
+    }
     let parsed = match parse_args(&args) {
         Ok(p) => p,
         Err(msg) => {
@@ -469,10 +474,17 @@ fn next_compare_result_path(revised: &Path) -> String {
         .to_string()
 }
 
-/// `docxy compare <original.docx> <revised.docx> -o <out.docx>`: write the
-/// comparison as a new file. Never replaces an existing file.
-fn compare_cli(args: &[String]) -> ExitCode {
-    const USAGE: &str = "usage: docxy compare <original.docx> <revised.docx> -o <out.docx>";
+/// The two input paths and the `.docx` output of a headless subcommand
+/// (`docxy <cmd> <a> <b> -o <out.docx>`), or the exit code it ends with:
+/// success after `--help`, 2 for a usage error, failure when the output
+/// already exists. `what` names the output in the errors ("the compare
+/// result"), `cmd` the subcommand.
+fn two_inputs_and_out(
+    args: &[String],
+    usage: &str,
+    what: &str,
+    cmd: &str,
+) -> Result<(String, String, String), ExitCode> {
     let mut inputs = Vec::new();
     let mut out = None;
     let mut i = 0;
@@ -483,47 +495,69 @@ fn compare_cli(args: &[String]) -> ExitCode {
                 match args.get(i) {
                     Some(path) => out = Some(path.clone()),
                     None => {
-                        eprintln!("error: {} requires an output path\n{USAGE}", args[i - 1]);
-                        return ExitCode::from(2);
+                        eprintln!("error: {} requires an output path\n{usage}", args[i - 1]);
+                        return Err(ExitCode::from(2));
                     }
                 }
             }
             "-h" | "--help" => {
-                println!("{USAGE}");
-                return ExitCode::SUCCESS;
+                println!("{usage}");
+                return Err(ExitCode::SUCCESS);
             }
             path => inputs.push(path.to_string()),
         }
         i += 1;
     }
-    let (Some(out), [original, revised]) = (out, inputs.as_slice()) else {
-        eprintln!("{USAGE}");
-        return ExitCode::from(2);
+    let (Some(out), [a, b]) = (out, inputs.as_slice()) else {
+        eprintln!("{usage}");
+        return Err(ExitCode::from(2));
     };
     if !out.to_ascii_lowercase().ends_with(".docx") {
-        eprintln!("error: {out}: the compare result must be a .docx file");
-        return ExitCode::from(2);
+        eprintln!("error: {out}: {what} must be a .docx file");
+        return Err(ExitCode::from(2));
     }
     if Path::new(&out).exists() {
-        eprintln!("error: {out} already exists (compare never overwrites a file)");
-        return ExitCode::FAILURE;
+        eprintln!("error: {out} already exists ({cmd} never overwrites a file)");
+        return Err(ExitCode::FAILURE);
     }
-    let result = match compare_files(original, revised, DEFAULT_AUTHOR) {
+    Ok((a.clone(), b.clone(), out))
+}
+
+/// Write a headless subcommand's result to `out`, which must not exist:
+/// `create_atomic` refuses any existing destination, so a file that appeared
+/// since [`two_inputs_and_out`] checked is refused too.
+fn write_new(out: &str, bytes: &[u8], cmd: &str) -> Result<(), ExitCode> {
+    match opccore::fsio::create_atomic(Path::new(out), bytes) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                eprintln!("error: {out} already exists ({cmd} never overwrites a file)");
+            } else {
+                eprintln!("error: cannot write {out}: {e}");
+            }
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+/// `docxy compare <original.docx> <revised.docx> -o <out.docx>`: write the
+/// comparison as a new file. Never replaces an existing file.
+fn compare_cli(args: &[String]) -> ExitCode {
+    const USAGE: &str = "usage: docxy compare <original.docx> <revised.docx> -o <out.docx>";
+    let (original, revised, out) =
+        match two_inputs_and_out(args, USAGE, "the compare result", "compare") {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+    let result = match compare_files(&original, &revised, DEFAULT_AUTHOR) {
         Ok(result) => result,
         Err(e) => {
             eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
     };
-    // create_atomic refuses any existing destination, so a file that appeared
-    // since the check above is refused too.
-    if let Err(e) = opccore::fsio::create_atomic(Path::new(&out), &save_package(&result.package)) {
-        if e.kind() == io::ErrorKind::AlreadyExists {
-            eprintln!("error: {out} already exists (compare never overwrites a file)");
-        } else {
-            eprintln!("error: cannot write {out}: {e}");
-        }
-        return ExitCode::FAILURE;
+    if let Err(code) = write_new(&out, &save_package(&result.package), "compare") {
+        return code;
     }
     println!(
         "wrote {out} ({} insertions, {} deletions)",
@@ -532,6 +566,55 @@ fn compare_cli(args: &[String]) -> ExitCode {
     for (kind, n) in docxcore::compare::skip_counts(&result.skipped) {
         println!("skipped: {n} {kind}");
     }
+    ExitCode::SUCCESS
+}
+
+/// `docxy merge <main.docx> <data.csv> -o <out.docx>`: merge the main
+/// document with every recipient in the CSV (Mailings ▸ Finish & Merge ▸ Edit
+/// Individual Documents) into a new file. Never replaces an existing file.
+fn merge_cli(args: &[String]) -> ExitCode {
+    const USAGE: &str = "usage: docxy merge <main.docx> <data.csv> -o <out.docx>";
+    let (main, data, out) = match two_inputs_and_out(args, USAGE, "the merged document", "merge") {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    let pkg = match std::fs::read(&main)
+        .map_err(|e| e.to_string())
+        .and_then(|b| load_package(&b).map_err(|e| e.to_string()))
+    {
+        Ok(pkg) => pkg,
+        Err(e) => {
+            eprintln!("error: cannot open {main}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let recipients = match std::fs::read(&data)
+        .map_err(|e| e.to_string())
+        .and_then(|b| docxcore::merge::Recipients::parse_csv(&b))
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: cannot read the recipient list {data}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let opts = docxcore::merge::MergeOptions {
+        range: docxcore::merge::MergeRange::All,
+        doc_type: pkg.mail_merge().map(|m| m.doc_type).unwrap_or_default(),
+        map: docxcore::merge::FieldMap::auto(&recipients),
+    };
+    let merged = match docxcore::merge::merge_package(&pkg, &recipients, &opts) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: {data}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(code) = write_new(&out, &save_package(&merged), "merge") {
+        return code;
+    }
+    let n = docxcore::merge::merge_rows(&recipients, opts.range).len();
+    println!("wrote {out} ({n} records)");
     ExitCode::SUCCESS
 }
 
@@ -548,6 +631,8 @@ fn print_usage() {
            docxy <file> --html <out.docx.html>  export as editable HTML and exit\n  \
            docxy compare <orig.docx> <rev.docx> -o <out.docx>\n  \
                                            write a tracked-changes comparison and exit\n  \
+           docxy merge <main.docx> <data.csv> -o <out.docx>\n  \
+                                           mail-merge every CSV recipient and exit\n  \
            docxy --mcp                      run the MCP bridge to drive a live docxy\n  \
            docxy install skill              install the agent SKILL.md (self-onboarding)\n  \
            (Save As to a .md/.docx/.docx.html name converts between the formats;\n   \
@@ -3920,12 +4005,7 @@ impl App {
 
     fn build_field(&self, kind: FieldKind) -> Inline {
         let text = self.field_value(kind);
-        let raw = format!(
-            "<w:fldSimple w:instr=\"{}\"><w:r><w:t xml:space=\"preserve\">{}</w:t></w:r></w:fldSimple>",
-            xml_esc_attr(kind.instr()),
-            xml_esc_text(&text),
-        );
-        Inline::Field { raw, text }
+        docxcore::field::fld_simple(kind.instr(), &text, &self.editor.caret_props())
     }
 
     fn apply_insert_field(&mut self) {
@@ -7026,16 +7106,6 @@ fn safe_url(url: &str) -> bool {
     }
     let lower = url.to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
-}
-
-fn xml_esc_text(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-fn xml_esc_attr(s: &str) -> String {
-    xml_esc_text(s).replace('"', "&quot;")
 }
 
 /// Whether the clipboard text looks like a single URL (so Paste Special can offer
