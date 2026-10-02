@@ -1501,33 +1501,15 @@ impl Editor {
         true
     }
 
-    /// Remove every comment marker (range start/end + reference) for comment `id`.
-    pub fn remove_comment_markers(&mut self, id: &str) {
-        self.checkpoint(EditKind::Structural);
-        let needles = [
-            format!("commentRangeStart w:id=\"{id}\""),
-            format!("commentRangeEnd w:id=\"{id}\""),
-            format!("commentReference w:id=\"{id}\""),
-        ];
-        fn walk(blocks: &mut [Block], needles: &[String]) {
-            for b in blocks {
-                match b {
-                    Block::Paragraph(p) => p.content.retain(|inl| match inl {
-                        Inline::Raw(raw) => !needles.iter().any(|n| raw.contains(n.as_str())),
-                        _ => true,
-                    }),
-                    Block::Table(t) => {
-                        for row in &mut t.rows {
-                            for cell in &mut row.cells {
-                                walk(&mut cell.blocks, needles);
-                            }
-                        }
-                    }
-                    Block::SectionProperties(_) | Block::Raw(_) => {}
-                }
-            }
-        }
-        walk(&mut self.doc.body, &needles);
+    /// Remove the markers (range start/end + reference) of comment `id`
+    /// wherever they are ([`crate::inspect::remove_comment_markers`]), keeping
+    /// any text or wrapper that shares raw XML with them, as one undo step,
+    /// none when there were none. Returns how many were removed.
+    pub fn remove_comment_markers(&mut self, id: &str) -> usize {
+        let before = self.snapshot();
+        let removed = crate::inspect::remove_comment_markers(&mut self.doc, id);
+        self.finish_review_transaction(before);
+        removed
     }
 
     /// Sort the selected top-level paragraphs alphabetically (Word's A→Z Sort).
@@ -3757,6 +3739,31 @@ mod tests {
         assert!(ed.undo());
         assert_eq!(top_text(&ed), ["first", "seen unseen"]);
         assert_eq!(ed.caret.offset, "seen unseen".len());
+        assert!(!ed.undo());
+    }
+
+    /// #917: deleting one comment keeps the text that shares a raw run with
+    /// its reference, leaves other comments alone, and is one undo step.
+    #[test]
+    fn editor_remove_comment_markers_keeps_text_and_is_one_undo_step_917() {
+        let mut d = doc(&["a"]);
+        if let Block::Paragraph(p) = &mut d.body[0] {
+            p.content.extend([
+                Inline::Raw("<w:commentRangeStart w:id=\"10\"/>".into()),
+                Inline::Raw("<w:r><w:t>hello</w:t><w:commentReference w:id=\"0\"/></w:r>".into()),
+                Inline::Raw("<w:r><w:commentReference w:id=\"10\"/></w:r>".into()),
+            ]);
+        }
+        let mut ed = Editor::new(d.clone());
+        assert_eq!(ed.remove_comment_markers("0"), 1);
+        let xml = crate::serialize::document_to_xml(&ed.doc);
+        assert!(xml.contains("<w:r><w:t>hello</w:t></w:r>"), "{xml}");
+        assert!(!xml.contains("w:id=\"0\""), "{xml}");
+        assert_eq!(xml.matches("w:id=\"10\"").count(), 2, "{xml}");
+        // Nothing left of comment 0: no change, no undo step.
+        assert_eq!(ed.remove_comment_markers("0"), 0);
+        assert!(ed.undo());
+        assert_eq!(ed.doc, d);
         assert!(!ed.undo());
     }
 
