@@ -458,10 +458,14 @@ pub(crate) fn page_borders_dialog(tab: &DocTab) -> Result<Dialog, String> {
             .position(|w| w.0 >= s.sz)
             .unwrap_or(WIDTHS.len() - 1)
     });
+    // Whole document only when every section has these borders, so OK on
+    // an untouched dialog changes nothing.
+    let whole = ed.sections().iter().all(|s| PageBorders::parse(s) == pb);
     let apply_at = match pb.as_ref().map(|p| p.display) {
         Some(PgBorderDisplay::FirstPage) => 2,
         Some(PgBorderDisplay::NotFirstPage) => 3,
-        _ => 0,
+        _ if whole => 0,
+        _ => 1,
     };
     // Word's defaults: 24 pt from the edge of the page.
     let from_page = pb
@@ -505,6 +509,9 @@ pub(crate) fn page_borders_dialog(tab: &DocTab) -> Result<Dialog, String> {
         controls.push(hidden(name, space.to_string()));
     }
     controls.push(hidden("from", usize::from(from_page).to_string()));
+    // The borders the dialog opened on: a side keeps its own style, width,
+    // colour and Shadow/3-D unless the matching control was changed.
+    controls.push(hidden("orig", crate::page_setup::caret_raw(ed)));
     controls.push(hidden(
         "zorder",
         if pb.as_ref().is_some_and(|p| p.z_order_back) {
@@ -615,6 +622,7 @@ fn page_borders_of(d: &Dialog, ed: &Editor) -> Result<(Option<PageBorders>, Vec<
     );
     let sz = WIDTHS[get_choice(d, "width").min(WIDTHS.len() - 1)].0;
     let color = chosen_color(d, "color");
+    let orig = PageBorders::parse(&get_text(d, "orig"));
     let mut sides: [Option<BorderSide>; 4] = Default::default();
     for (k, (name, label)) in SIDES.iter().enumerate() {
         let on = match setting {
@@ -632,13 +640,15 @@ fn page_borders_of(d: &Dialog, ed: &Editor) -> Result<(Option<PageBorders>, Vec<
             .ok()
             .filter(|v| *v <= 31)
             .ok_or_else(|| format!("{label} margin must be 0 to 31 pt; got '{raw}'"))?;
+        let base = orig.as_ref().and_then(|p| p.sides[k].as_ref());
+        let keep = |control: &str| base.filter(|_| !d.changed(control));
         sides[k] = Some(BorderSide {
-            style: style.clone(),
-            sz,
+            style: keep("style").map_or_else(|| style.clone(), |b| b.style.clone()),
+            sz: keep("width").map_or(sz, |b| b.sz),
             space,
-            color,
-            shadow: setting == SHADOW,
-            frame: setting == THREE_D,
+            color: keep("color").map_or(color, |b| b.color),
+            shadow: keep("setting").map_or(setting == SHADOW, |b| b.shadow),
+            frame: keep("setting").map_or(setting == THREE_D, |b| b.frame),
         });
     }
     let apply = get_choice(d, "apply");

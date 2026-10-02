@@ -24563,8 +24563,9 @@ impl Render for Docxy {
                     let spans = editor.selection_spans();
                     let markers = list_markers(&editor.doc.body);
                     let ent = cx.entity();
-                    // In Print Layout the sheet is always a light page (dark ink on
-                    // white) regardless of the app theme, like Word's document surface.
+                    // In Print Layout the sheet is white, or the document's page
+                    // colour (#651), whatever the app theme, like Word's document
+                    // surface; its ink comes from `design_tab::page_ink`.
                     let doc_pal = if self.page_view {
                         // Automatic text stays readable on a dark page colour.
                         let (fg, dim) = design_tab::page_ink(design_tab::page_sheet_color(tab));

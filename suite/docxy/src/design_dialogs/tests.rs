@@ -329,6 +329,61 @@ fn setting_none_removes_page_borders() {
     assert_eq!(t.status.as_ref(), "Page borders removed");
 }
 
+/// Sides that differ, and a width not in the list, survive an OK that
+/// changed nothing; changing Color recolours every side but keeps the rest.
+#[test]
+fn ok_on_an_untouched_dialog_keeps_each_sides_own_look() {
+    let mut t = three_sections();
+    let side = |style: &str, sz, color| {
+        Some(BorderSide {
+            style: style.into(),
+            sz,
+            space: 4,
+            color,
+            shadow: false,
+            frame: false,
+        })
+    };
+    let pb = PageBorders {
+        sides: [
+            side("double", 10, Some(0xFF0000)),
+            None,
+            side("dotted", 4, None),
+            None,
+        ],
+        ..Default::default()
+    };
+    ed_mut(&mut t).edit_sections(&[1], |raw| PageBorders::apply(Some(&pb), raw));
+    t.dirty = false;
+    let before = ed(&t).sections();
+    open(&mut t, page_borders_dialog);
+    assert_eq!(control(&t, "setting").text(), "Custom");
+    assert_eq!(
+        control(&t, "apply").text(),
+        "This section",
+        "only section 2 has them"
+    );
+    click(&mut t, "OK").unwrap();
+    assert_eq!(ed(&t).sections(), before, "byte for byte");
+    assert!(!t.dirty);
+
+    open(&mut t, page_borders_dialog);
+    set(&mut t, "color", s("Blue"));
+    click(&mut t, "OK").unwrap();
+    let got = borders(&t, 1).unwrap();
+    let top = got.sides[0].as_ref().unwrap();
+    let bottom = got.sides[2].as_ref().unwrap();
+    assert_eq!(
+        (top.style.as_str(), top.sz, top.color),
+        ("double", 10, Some(0x0070C0))
+    );
+    assert_eq!(
+        (bottom.style.as_str(), bottom.sz, bottom.color),
+        ("dotted", 4, Some(0x0070C0))
+    );
+    assert_eq!(borders(&t, 0), None, "This section only");
+}
+
 /// An Art border (not in the style list) opens as itself.
 #[test]
 fn an_art_border_prefills_without_losing_its_name() {
