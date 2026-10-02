@@ -15,6 +15,9 @@ struct BitReader<'a> {
     bitbuf: u32,
     bitcnt: i32,
     error: bool,
+    /// [`inflate_partial`]: a stored block cut short still yields the bytes
+    /// that are there.
+    partial: bool,
 }
 
 impl<'a> BitReader<'a> {
@@ -25,6 +28,7 @@ impl<'a> BitReader<'a> {
             bitbuf: 0,
             bitcnt: 0,
             error: false,
+            partial: false,
         }
     }
     fn bits(&mut self, need: i32) -> i32 {
@@ -211,6 +215,10 @@ fn stored_block(br: &mut BitReader, out: &mut Vec<u8>, cap: usize) -> bool {
     }
     br.pos += 4;
     if br.pos + len > br.data.len() {
+        if br.partial {
+            out.extend_from_slice(&br.data[br.pos..]);
+            br.pos = br.data.len();
+        }
         return false;
     }
     if cap != 0 && out.len() + len > cap {
@@ -327,6 +335,42 @@ pub fn inflate_raw(src: &[u8], expected_size: usize) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Decompresses as much of a raw DEFLATE stream as can be read: everything
+/// decoded before the input ran out or turned malformed (#633's Recover Text
+/// from a truncated `.docx`). It never fails, and it ignores any size a ZIP
+/// header declared, so an entry whose sizes sit in a data descriptor after
+/// the data (flag bit 3, sizes 0 in the local header) decodes too. Output is
+/// capped at `cap` bytes when non-zero.
+pub fn inflate_partial(src: &[u8], cap: usize) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut br = BitReader::new(src);
+    br.partial = true;
+    loop {
+        let last = br.bits(1);
+        let typ = br.bits(2);
+        if br.error {
+            break;
+        }
+        let ok = match typ {
+            0 => stored_block(&mut br, &mut out, 0),
+            1 => {
+                let (lencode, distcode) = fixed_tables();
+                codes(&mut br, &mut out, &lencode, &distcode, 0)
+            }
+            2 => dynamic_block(&mut br, &mut out, 0),
+            _ => false,
+        };
+        if cap != 0 && out.len() >= cap {
+            out.truncate(cap);
+            break;
+        }
+        if !ok || last != 0 {
+            break;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,5 +440,68 @@ mod tests {
         //   byte0 = 0b0000_0_0_1_1 = 0x03 ; byte1 = 0x00
         let out = inflate_raw(&[0x03, 0x00], 0).expect("fixed empty block");
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn partial_returns_whole_output_of_a_complete_stream() {
+        let stream = stored_stream(b"complete");
+        assert_eq!(inflate_partial(&stream, 0), b"complete");
+    }
+
+    #[test]
+    fn partial_keeps_the_readable_prefix_of_a_cut_stored_block() {
+        let stream = stored_stream(b"abcdefgh");
+        let cut = &stream[..stream.len() - 3];
+        assert_eq!(inflate_partial(cut, 0), b"abcde");
+        // `inflate_raw` still refuses it.
+        assert!(inflate_raw(cut, 0).is_none());
+    }
+
+    #[test]
+    fn partial_keeps_the_symbols_decoded_before_a_cut_huffman_block() {
+        // A fixed-Huffman stream of a long repetitive text, made by hand:
+        // literals 'a'..'z' (8-bit codes 0x30+c), then EOB. Every prefix of
+        // the stream yields a prefix of the text.
+        let text: Vec<u8> = (0..200u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let stream = fixed_literals(&text);
+        assert_eq!(inflate_raw(&stream, 0).unwrap(), text);
+        for n in 0..stream.len() {
+            let got = inflate_partial(&stream[..n], 0);
+            assert!(text.starts_with(&got), "prefix {n}: {got:?}");
+        }
+        assert!(inflate_partial(&stream[..stream.len() / 2], 0).len() > 50);
+    }
+
+    #[test]
+    fn partial_honours_the_cap_and_survives_garbage() {
+        let stream = stored_stream(b"0123456789");
+        assert_eq!(inflate_partial(&stream, 4), b"0123");
+        for b in 0..=255u8 {
+            let _ = inflate_partial(&[b, b ^ 0x5a, 0xff, 0x00, b], 0);
+        }
+    }
+
+    /// One final fixed-Huffman block holding `text` as literals (bytes < 144,
+    /// whose fixed codes are 8 bits: 0x30 + byte), then end-of-block.
+    fn fixed_literals(text: &[u8]) -> Vec<u8> {
+        let mut bits: Vec<bool> = vec![true, true, false]; // BFINAL=1, BTYPE=01
+        let push_code = |code: u32, len: u32, bits: &mut Vec<bool>| {
+            // Huffman codes go most-significant bit first.
+            for i in (0..len).rev() {
+                bits.push(code >> i & 1 == 1);
+            }
+        };
+        for &b in text {
+            assert!(b < 144);
+            push_code(0x30 + u32::from(b), 8, &mut bits);
+        }
+        push_code(0, 7, &mut bits); // EOB (256) is seven zero bits
+        let mut out = vec![0u8; bits.len().div_ceil(8)];
+        for (i, bit) in bits.iter().enumerate() {
+            if *bit {
+                out[i / 8] |= 1 << (i % 8);
+            }
+        }
+        out
     }
 }

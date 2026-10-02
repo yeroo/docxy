@@ -7,6 +7,7 @@
 //! functions over bytes; `fsio` provides atomic filesystem writes.
 //!
 //! Layers (built bottom-up):
+//! - [`codepage`] — Windows single-byte code pages (RTF, legacy HTML).
 //! - [`inflate`] — DEFLATE (RFC 1951) decompressor.
 //! - [`zip`] — read-only ZIP reader (stored + deflate).
 //! - [`zipwrite`] — ZIP writer (STORED entries, correct CRC-32).
@@ -15,6 +16,7 @@
 //!   container of legacy `.xls`, `.doc` and `.mpp` files.
 
 pub mod cfb;
+pub mod codepage;
 pub mod fsio;
 pub mod inflate;
 pub mod xml;
