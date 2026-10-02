@@ -13,7 +13,7 @@
 //! recalculation on every edit.
 
 use opccore::fsio::{export_atomic, write_atomic};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use std::io;
 use std::process::ExitCode;
@@ -1173,13 +1173,93 @@ fn file_name_of(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-/// Path of the persisted view-preferences file (XDG / APPDATA).
-fn view_prefs_path() -> Option<std::path::PathBuf> {
+/// xlsxy's configuration folder (XDG / APPDATA).
+fn config_dir() -> Option<PathBuf> {
     let dir = std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
-        .or_else(|| std::env::var_os("APPDATA").map(std::path::PathBuf::from))?;
-    Some(dir.join("xlsxy").join("view.conf"))
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))?;
+    Some(dir.join("xlsxy"))
+}
+
+/// Path of the persisted view-preferences file.
+fn view_prefs_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("view.conf"))
+}
+
+/// xlsxy's XLSTART folder: its `book.xltx` is the template a new workbook
+/// starts from, and its workbooks open at launch. xlsxy's own, not Excel's
+/// `%APPDATA%\Microsoft\Excel\XLSTART`, which usually holds `PERSONAL.XLSB`
+/// (a hidden macro workbook) that would otherwise become the window's only
+/// workbook on every launch.
+fn xlstart_dir() -> Option<PathBuf> {
+    Some(config_dir()?.join("XLSTART"))
+}
+
+/// The files a startup folder opens: workbooks xlsxy reads without a
+/// dialog. Templates are not opened, and a `.txt`/`.prn` would open the Text
+/// Import Wizard at launch.
+const STARTUP_EXTENSIONS: &[&str] = &["xlsx", "xlsm", "xlsb", "xls", "ods", "csv", "tsv"];
+
+/// The workbooks to open at launch, as Excel opens them: those in the
+/// XLSTART folder, then those in the alternate startup folder (File ›
+/// Options › Advanced › *At startup, open all files in*), each folder's
+/// sorted by name. Not templates, not lock files (`~$book.xlsx`) or hidden
+/// files, not folders; a file in both folders (the alternate folder may be
+/// XLSTART itself) is listed once. A folder that is missing is skipped.
+fn startup_workbooks(dirs: &[&Path]) -> Vec<PathBuf> {
+    let mut seen = Vec::new();
+    let mut out = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let mut files: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| is_startup_workbook(p))
+            .collect();
+        files.sort_by_key(|p| file_name_of(&p.to_string_lossy()).to_lowercase());
+        for file in files {
+            let key = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+            if !seen.contains(&key) {
+                seen.push(key);
+                out.push(file);
+            }
+        }
+    }
+    out
+}
+
+/// Whether a startup folder opens `path` (see [`startup_workbooks`]).
+fn is_startup_workbook(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    !name.starts_with("~$")
+        && !name.starts_with('.')
+        && path.is_file()
+        && path
+            .extension()
+            .is_some_and(|e| STARTUP_EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x)))
+}
+
+/// The template a new workbook starts from: `book.xltx` in `dir` (the
+/// XLSTART folder), its name matched in any case.
+fn default_template(dir: &Path) -> Option<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("book.xltx"))
+                && p.is_file()
+        })
+        .collect();
+    found.sort();
+    found.into_iter().next()
 }
 
 /// Parse an A1 cell reference (`A1`, `$A$1`) into 0-based (row, col).
@@ -1765,6 +1845,12 @@ struct App {
     /// ([`Self::startup_import`]), as do an Open that fails or is cancelled,
     /// a reload, and the control surface's scripted `wb.open`/`wb.reload`.
     read_only: Option<std::path::PathBuf>,
+    /// The XLSTART folder ([`xlstart_dir`]): its `book.xltx` is what New
+    /// starts from. `None` (tests, and no config folder) starts New blank.
+    xlstart: Option<PathBuf>,
+    /// File › Options › Advanced › *At startup, open all files in*: the
+    /// alternate startup folder (`alt_startup_path` in the preferences).
+    alt_startup: Option<String>,
     /// The Text Import Wizard `xlsxy -r notes.txt` opened at startup: its
     /// finish keeps read-only, unlike an interactive import. Cleared when
     /// that wizard finishes or is cancelled.
@@ -1859,6 +1945,8 @@ impl App {
             replace_find: None,
             vim: None,
             read_only: None,
+            xlstart: None,
+            alt_startup: None,
             startup_import: false,
             sheet_picker: None,
             dv_picker: None,
@@ -3253,7 +3341,34 @@ impl App {
             self.status = Some(msg);
             return;
         }
+        if self.ask_where_to_save_template_workbook() {
+            return;
+        }
         let _ = self.save_current();
+    }
+
+    /// A workbook started from a template has no file of its own until this
+    /// session writes one, so an interactive save opens Save As instead, as
+    /// Excel does, with the name the workbook was bound to (`Budget1.xlsx`),
+    /// or the next free one when that has been taken since it opened.
+    /// Returns whether it did. The control surface's `wb.save` is scripted
+    /// and writes the bound name directly, as Excel's `Workbook.Save` does.
+    fn ask_where_to_save_template_workbook(&mut self) -> bool {
+        let Some(template) = self.template.clone() else {
+            return false;
+        };
+        if Path::new(&self.path).exists() {
+            if let Some(free) = template_binding(&template) {
+                self.path = free;
+            }
+        }
+        self.open_prompt(PromptKind::SaveAs);
+        self.status = Some(format!(
+            "{} is a new workbook from {}: choose where to save it",
+            file_name_of(&self.path),
+            file_name_of(&template)
+        ));
+        true
     }
 
     /// The `.txt`/`.prn` named on the command line: its Text Import Wizard,
@@ -4242,6 +4357,9 @@ impl App {
                     "light_theme" => self.light_theme = on,
                     "auto_hide_ribbon" => self.auto_hide_ribbon = on,
                     "show_comments" => self.show_comments = on,
+                    "alt_startup_path" => {
+                        self.alt_startup = Some(v.trim().to_string()).filter(|d| !d.is_empty())
+                    }
                     _ => {}
                 }
             }
@@ -4260,7 +4378,7 @@ impl App {
     /// The preferences file's text.
     fn view_prefs_text(&self) -> String {
         let auto = self.auto_convert;
-        format!(
+        let mut text = format!(
             "formula_view={}\nlight_theme={}\nauto_hide_ribbon={}\nshow_comments={}\n\
              convert_leading_zeros={}\nconvert_long_numbers={}\nconvert_e_notation={}\n\
              convert_dates={}\n",
@@ -4272,7 +4390,14 @@ impl App {
             auto.keep_15_digits as u8,
             auto.e_notation as u8,
             auto.dates as u8,
-        )
+        );
+        if let Some(dir) = &self.alt_startup {
+            text.push_str(&format!(
+                "alt_startup_path={dir}
+"
+            ));
+        }
+        text
     }
 
     /// Dispatch a ribbon command to the matching editor operation.
@@ -4654,8 +4779,26 @@ impl App {
         self.clip_text = None;
     }
 
-    /// Start a fresh blank workbook (discarding the current one).
+    /// Start a new workbook (discarding the current one): from `book.xltx`
+    /// in the XLSTART folder when there is one, as Excel's Ctrl+N does, else
+    /// blank. Either way it is `untitled.xlsx`, never bound into XLSTART.
     fn new_workbook(&mut self) {
+        let mut failed = None;
+        if let Some(t) = self.xlstart.as_deref().and_then(default_template) {
+            let name = file_name_of(&t.to_string_lossy());
+            match std::fs::read(&t)
+                .map_err(|e| e.to_string())
+                .and_then(|data| open_any(&data).map_err(|e| e.to_string()))
+            {
+                Ok((pkg, _)) => {
+                    self.install_workbook(pkg, "untitled.xlsx".to_string(), None);
+                    self.read_only = None;
+                    self.status = Some(format!("New workbook from {name}"));
+                    return;
+                }
+                Err(e) => failed = Some(format!("New workbook ({name} not used: {e})")),
+            }
+        }
         let pkg = new_xlsx();
         let mut engine = Engine::new(&pkg.workbook);
         engine.clock = now_serial();
@@ -4675,7 +4818,42 @@ impl App {
         self.modified = false;
         self.backstage = None;
         self.start_screen = false;
-        self.status = Some("New workbook".to_string());
+        self.status = Some(failed.unwrap_or_else(|| "New workbook".to_string()));
+    }
+
+    /// At launch with no file: open the first of `files` (see
+    /// [`startup_workbooks`]) that loads, instead of the welcome screen, as
+    /// Excel opens its startup workbooks instead of a blank one. xlsxy holds
+    /// one workbook per window, so the status counts the ones not opened. A
+    /// file that fails to load is named and the next one is tried; when none
+    /// loads, the welcome screen stays.
+    fn open_startup_workbooks(&mut self, files: &[PathBuf]) {
+        let mut failed = Vec::new();
+        for (i, file) in files.iter().enumerate() {
+            let path = file.to_string_lossy();
+            match self.open_without_wizard(&path) {
+                Ok(()) => {
+                    let mut status = self.status.take().unwrap_or_default();
+                    for f in &failed {
+                        status.push_str(&format!("; {f}"));
+                    }
+                    let rest = files.len() - i - 1;
+                    if rest > 0 {
+                        let s = if rest == 1 { "" } else { "s" };
+                        status.push_str(&format!(
+                            "; {rest} more startup workbook{s} not opened: \
+                             xlsxy shows one workbook per window"
+                        ));
+                    }
+                    self.status = Some(status);
+                    return;
+                }
+                Err(e) => failed.push(format!("{} not opened: {e}", file_name_of(&path))),
+            }
+        }
+        if !failed.is_empty() {
+            self.status = Some(format!("Startup workbook {}", failed.join("; ")));
+        }
     }
 
     fn reset_view(&mut self) {
@@ -4968,6 +5146,12 @@ impl App {
 
     /// Route a key on the welcome screen. Returns true to exit.
     fn start_screen_key(&mut self, key: KeyEvent) -> bool {
+        // Ctrl+N is Blank workbook, as on Excel's start screen.
+        if matches!(key.code, KeyCode::Char('n' | 'N'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            return self.start_choose(0);
+        }
         match self.start.key(key) {
             backstage::StartEvent::Choose(i) => self.start_choose(i),
             // The welcome screen has no open workbook to lose, so Quit exits
@@ -6078,7 +6262,7 @@ impl App {
             // (the workbook stays modified), keeps the editor open with the
             // reason on the status line.
             "wq" | "x" => {
-                if self.save_current().is_err() {
+                if self.ask_where_to_save_template_workbook() || self.save_current().is_err() {
                     return false;
                 }
                 if self.modified {
@@ -8031,6 +8215,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             return false;
         }
         KeyCode::Char('s') | KeyCode::Char('S') if ctrl => app.save(),
+        KeyCode::Char('n') | KeyCode::Char('N') if ctrl => app.request_discard(Next::New),
         KeyCode::Char('z') | KeyCode::Char('Z') if ctrl => app.undo(),
         KeyCode::Char('y') | KeyCode::Char('Y') if ctrl => app.redo(),
         KeyCode::Char('c') | KeyCode::Char('C') if ctrl => app.copy(false),
@@ -8362,6 +8547,7 @@ fn run_tui(
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(pkg, path);
+    app.xlstart = xlstart_dir();
     let format = import.as_ref().and_then(|(_, f)| *f);
     app.import_source = import.map(|(s, _)| s);
     app.note_import(format);
@@ -8377,6 +8563,14 @@ fn run_tui(
         });
     }
     app.start_screen = welcome;
+    // With no file to open, the startup folders' workbooks open instead of
+    // the welcome screen.
+    if welcome {
+        let alt = app.alt_startup.as_deref().map(Path::new);
+        let dirs: Vec<&Path> = app.xlstart.as_deref().into_iter().chain(alt).collect();
+        let files = startup_workbooks(&dirs);
+        app.open_startup_workbooks(&files);
+    }
     if let Some(source) = flags.read_only {
         app.set_read_only(&source);
     }
@@ -9914,6 +10108,360 @@ mod tests {
         assert_eq!(Path::new(&app.path), new_book);
         assert!(app.template.is_none());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A template's new workbook in `dir`: `Budget.xltx` written as a
+    /// template and opened, A1 typed. Returns the template's bytes.
+    fn template_workbook(dir: &Path) -> (App, Vec<u8>) {
+        let template = dir.join("Budget.xltx");
+        let bytes = gridcore::xlsx::save_xlsx_as(&new_xlsx(), SpreadsheetKind::Template);
+        std::fs::write(&template, &bytes).unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.os_clip = None;
+        app.open_workbook(template.to_str().unwrap());
+        assert!(app.template.is_some());
+        app.pkg.workbook.sheets[0].set_cell(0, 0, gridcore::sheet::Cell::number(7.0));
+        app.modified = true;
+        (app, bytes)
+    }
+
+    fn prompts_save_as(app: &App) -> bool {
+        matches!(
+            app.prompt.as_ref().map(|p| &p.kind),
+            Some(PromptKind::SaveAs)
+        )
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// #614: Ctrl+S on a workbook started from a template opens Save As
+    /// with the name it was bound to and writes nothing, as Excel does;
+    /// confirming writes a workbook, never the template.
+    #[test]
+    fn saving_a_template_workbook_opens_save_as() {
+        let dir = macro_dir("tmpl-save-as");
+        let (mut app, bytes) = template_workbook(&dir);
+        let new_book = dir.join("Budget1.xlsx");
+        handle_key(&mut app, ctrl('s'));
+        assert!(prompts_save_as(&app), "Ctrl+S opens Save As");
+        assert_eq!(
+            Path::new(&app.prompt.as_ref().unwrap().text),
+            new_book.as_path()
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Budget1.xlsx is a new workbook from Budget.xltx: choose where to save it")
+        );
+        assert!(!new_book.exists(), "nothing written yet");
+        assert!(app.modified);
+
+        app.commit_prompt();
+        assert!(app.status.as_deref().unwrap().starts_with("Saved"));
+        let ct = saved_content_types(&new_book);
+        assert!(
+            ct.contains("spreadsheetml.sheet.main+xml") && !ct.contains("template"),
+            "{ct}"
+        );
+        assert_eq!(std::fs::read(dir.join("Budget.xltx")).unwrap(), bytes);
+        assert!(app.template.is_none() && !app.modified);
+        // Once it has a file, Ctrl+S saves to it.
+        handle_key(&mut app, ctrl('s'));
+        assert!(app.prompt.is_none());
+        assert!(app.status.as_deref().unwrap().starts_with("Saved"));
+
+        // `:w`, the ribbon's Save and File › Save ask the same way.
+        type Route = fn(&mut App);
+        let routes: [(&str, Route); 3] = [
+            (":w", |app| {
+                app.vim_run_command("w");
+            }),
+            ("ribbon", |app| app.ribbon_act(ribbon::Act::Save)),
+            ("backstage", |app| {
+                app.open_backstage();
+                app.apply_backstage_event(backstage::BackstageEvent::Save);
+            }),
+        ];
+        for (route, save) in routes {
+            let (mut app, _) = template_workbook(&dir);
+            let bound = PathBuf::from(&app.path);
+            save(&mut app);
+            assert!(prompts_save_as(&app), "{route} opens Save As");
+            assert!(app.backstage.is_none(), "{route}: the prompt is visible");
+            assert!(!bound.exists(), "{route} writes nothing");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #614: `:wq` and `:x` on a template's workbook open Save As and do
+    /// not quit (vim's "no file name"), writing nothing.
+    #[test]
+    fn vim_wq_on_a_template_workbook_opens_save_as_and_stays() {
+        let dir = macro_dir("tmpl-wq");
+        for cmd in ["wq", "x"] {
+            let (mut app, _) = template_workbook(&dir);
+            let bound = PathBuf::from(&app.path);
+            assert!(!app.vim_run_command(cmd), ":{cmd} does not quit");
+            assert!(prompts_save_as(&app), ":{cmd} opens Save As");
+            assert!(!bound.exists(), ":{cmd} writes nothing");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #614 (keeping #727 r1): when the bound name has been taken since the
+    /// template opened (another session), Save As offers the next free one,
+    /// and confirming leaves the other file alone.
+    #[test]
+    fn save_as_prefill_moves_past_a_taken_template_binding() {
+        let dir = macro_dir("tmpl-taken-prompt");
+        let (mut app, _) = template_workbook(&dir);
+        let taken = dir.join("Budget1.xlsx");
+        std::fs::write(&taken, b"another session").unwrap();
+        app.save();
+        let free = dir.join("Budget2.xlsx");
+        assert_eq!(
+            Path::new(&app.prompt.as_ref().unwrap().text),
+            free.as_path()
+        );
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap()
+                .starts_with("Budget2.xlsx is")
+        );
+        app.commit_prompt();
+        assert_eq!(std::fs::read(&taken).unwrap(), b"another session");
+        assert!(load_xlsx(&std::fs::read(&free).unwrap()).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #614: the control surface's `wb.save` is scripted: it writes a
+    /// template's workbook to its bound name without a dialog, as Excel's
+    /// `Workbook.Save` does.
+    #[test]
+    fn wb_save_writes_a_template_workbook_without_asking() {
+        use ctlcore::json::Json;
+        let dir = macro_dir("tmpl-wb-save");
+        let (mut app, bytes) = template_workbook(&dir);
+        control::dispatch(&mut app, "wb.save", &Json::obj(vec![])).unwrap();
+        assert!(app.prompt.is_none());
+        assert!(load_xlsx(&std::fs::read(dir.join("Budget1.xlsx")).unwrap()).is_ok());
+        assert_eq!(std::fs::read(dir.join("Budget.xltx")).unwrap(), bytes);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #614: Ctrl+N is File › New: it asks before discarding changes.
+    #[test]
+    fn ctrl_n_starts_a_new_workbook() {
+        let mut app = App::new(new_xlsx(), "kept.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0].set_cell(0, 0, gridcore::sheet::Cell::number(1.0));
+        handle_key(&mut app, ctrl('n'));
+        assert_eq!(app.path, "untitled.xlsx");
+        assert!(app.sheet().cell(0, 0).is_none());
+        assert_eq!(app.status.as_deref(), Some("New workbook"));
+
+        let mut app = App::new(new_xlsx(), "kept.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0].set_cell(0, 0, gridcore::sheet::Cell::number(1.0));
+        app.modified = true;
+        handle_key(&mut app, ctrl('n'));
+        assert!(matches!(
+            app.confirm.as_ref().map(|c| c.action()),
+            Some(ConfirmAction::Discard(Next::New))
+        ));
+        assert_eq!(app.path, "kept.xlsx");
+        assert!(app.sheet().cell(0, 0).is_some());
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('y')));
+        assert_eq!(app.path, "untitled.xlsx");
+        assert!(app.sheet().cell(0, 0).is_none());
+    }
+
+    /// #614: Ctrl+N on the welcome screen is Blank workbook, as on Excel's
+    /// start screen.
+    #[test]
+    fn ctrl_n_on_the_welcome_screen_is_blank_workbook() {
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.start_screen = true;
+        assert!(!handle_key(&mut app, ctrl('n')));
+        assert!(!app.start_screen);
+        assert_eq!(app.status.as_deref(), Some("New workbook"));
+    }
+
+    /// #614: `book.xltx` in XLSTART is what a new workbook starts from,
+    /// cells, styles and comments, as an unsaved `untitled.xlsx` (never
+    /// bound into XLSTART); its name matches in any case.
+    #[test]
+    fn new_workbook_starts_from_book_xltx_in_xlstart() {
+        let dir = macro_dir("xlstart-book");
+        let xlstart = dir.join("XLSTART");
+        std::fs::create_dir_all(&xlstart).unwrap();
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].set_cell(0, 0, gridcore::sheet::Cell::text("hello"));
+        assert!(pkg.set_comment(0, 0, 0, "me", "from the template"));
+        let book = xlstart.join("Book.XLTX");
+        let bytes = gridcore::xlsx::save_xlsx_as(&pkg, SpreadsheetKind::Template);
+        std::fs::write(&book, &bytes).unwrap();
+
+        let mut app = App::new(new_xlsx(), "kept.xlsx");
+        app.os_clip = None;
+        app.xlstart = Some(xlstart.clone());
+        handle_key(&mut app, ctrl('n'));
+        assert_eq!(
+            app.sheet().cell(0, 0).map(|c| &c.value),
+            Some(&CellValue::Text("hello".into()))
+        );
+        assert_eq!(app.comments.len(), 1, "the template's comment is kept");
+        assert_eq!(app.path, "untitled.xlsx");
+        assert!(!app.modified && app.template.is_none());
+        assert_eq!(app.status.as_deref(), Some("New workbook from Book.XLTX"));
+
+        // Saved, it is a workbook; the template is untouched.
+        let out = dir.join("untitled.xlsx");
+        assert!(app.save_as(out.to_string_lossy().into_owned()));
+        let ct = saved_content_types(&out);
+        assert!(
+            ct.contains("spreadsheetml.sheet.main+xml") && !ct.contains("template"),
+            "{ct}"
+        );
+        assert_eq!(std::fs::read(&book).unwrap(), bytes);
+
+        // File › New and the welcome screen's Blank workbook go the same way.
+        app.request_discard(Next::New);
+        assert_eq!(app.status.as_deref(), Some("New workbook from Book.XLTX"));
+        app.start_screen = true;
+        app.start_choose(0);
+        assert_eq!(app.status.as_deref(), Some("New workbook from Book.XLTX"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #614: a `book.xltx` that cannot be read gives a blank workbook and
+    /// says why.
+    #[test]
+    fn a_broken_book_xltx_falls_back_to_blank() {
+        let dir = macro_dir("xlstart-broken");
+        std::fs::write(dir.join("book.xltx"), b"not a workbook").unwrap();
+        let mut app = App::new(new_xlsx(), "kept.xlsx");
+        app.pkg.workbook.sheets[0].set_cell(0, 0, gridcore::sheet::Cell::number(1.0));
+        app.xlstart = Some(dir.clone());
+        app.new_workbook();
+        assert!(app.sheet().cell(0, 0).is_none());
+        assert_eq!(app.path, "untitled.xlsx");
+        let status = app.status.clone().unwrap();
+        assert!(
+            status.starts_with("New workbook (book.xltx not used: "),
+            "{status}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #614: the startup folders open their workbooks, XLSTART's first,
+    /// each sorted by name: not templates, lock or hidden files, text files
+    /// that would open the wizard, or folders; a file listed once.
+    #[test]
+    fn startup_workbooks_skip_templates_and_sort() {
+        let dir = macro_dir("startup-list");
+        let xlstart = dir.join("XLSTART");
+        let alt = dir.join("alt");
+        std::fs::create_dir_all(xlstart.join("s.xlsx")).unwrap();
+        std::fs::create_dir_all(&alt).unwrap();
+        for name in [
+            "b.xlsx",
+            "A.XLSX",
+            "d.tsv",
+            "book.xltx",
+            "x.xltm",
+            "~$a.xlsx",
+            ".hidden.xlsx",
+            "notes.txt",
+        ] {
+            std::fs::write(xlstart.join(name), b"").unwrap();
+        }
+        std::fs::write(alt.join("c.xlsm"), b"").unwrap();
+        let names = |dirs: &[&Path]| -> Vec<String> {
+            startup_workbooks(dirs)
+                .iter()
+                .map(|p| file_name_of(&p.to_string_lossy()))
+                .collect()
+        };
+        let want = ["A.XLSX", "b.xlsx", "d.tsv", "c.xlsm"];
+        assert_eq!(names(&[&xlstart, &alt]), want);
+        // The alternate folder may be XLSTART itself; a missing one is skipped.
+        assert_eq!(names(&[&xlstart, &alt, &xlstart]), want);
+        assert_eq!(names(&[&dir.join("missing"), &alt]), ["c.xlsm"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #614: at launch with no file, the first startup workbook that loads
+    /// opens instead of the welcome screen, bound to its own path; one that
+    /// fails is named and skipped, and the status counts those not opened.
+    #[test]
+    fn startup_opens_the_first_startup_workbook() {
+        let dir = macro_dir("startup-open");
+        let broken = dir.join("broken.xlsx");
+        std::fs::write(&broken, b"not a workbook").unwrap();
+        let mut files = vec![broken.clone()];
+        for name in ["one.xlsx", "two.xlsx", "three.xlsx"] {
+            let mut pkg = new_xlsx();
+            pkg.workbook.sheets[0].set_cell(0, 0, gridcore::sheet::Cell::text(name));
+            std::fs::write(dir.join(name), save_xlsx(&pkg)).unwrap();
+            files.push(dir.join(name));
+        }
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.start_screen = true;
+        app.open_startup_workbooks(&files);
+        assert!(!app.start_screen, "no welcome screen");
+        assert_eq!(Path::new(&app.path), dir.join("one.xlsx"));
+        assert_eq!(
+            app.sheet().cell(0, 0).map(|c| &c.value),
+            Some(&CellValue::Text("one.xlsx".into()))
+        );
+        let status = app.status.clone().unwrap();
+        assert!(status.contains("broken.xlsx not opened"), "{status}");
+        assert!(
+            status.ends_with(
+                "2 more startup workbooks not opened: xlsxy shows one workbook per window"
+            ),
+            "{status}"
+        );
+
+        // When none loads, the welcome screen stays and says why.
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.start_screen = true;
+        app.open_startup_workbooks(&[broken]);
+        assert!(app.start_screen);
+        assert_eq!(app.path, "untitled.xlsx");
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap()
+                .contains("broken.xlsx not opened")
+        );
+        // No startup workbooks: nothing changes.
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.start_screen = true;
+        app.open_startup_workbooks(&[]);
+        assert!(app.start_screen);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #614: the alternate startup folder is the `alt_startup_path`
+    /// preference, kept when the preferences are written back.
+    #[test]
+    fn alt_startup_path_survives_prefs_round_trip() {
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.apply_view_prefs("formula_view=1\nalt_startup_path= D:\\a=b\\start \n");
+        assert_eq!(app.alt_startup.as_deref(), Some("D:\\a=b\\start"));
+        let text = app.view_prefs_text();
+        assert!(text.contains("alt_startup_path=D:\\a=b\\start\n"), "{text}");
+        let mut again = App::new(new_xlsx(), "untitled.xlsx");
+        again.apply_view_prefs(&text);
+        assert_eq!(again.alt_startup, app.alt_startup);
+        // Empty means none, and none is not written.
+        again.apply_view_prefs("alt_startup_path=\n");
+        assert_eq!(again.alt_startup, None);
+        assert!(!again.view_prefs_text().contains("alt_startup_path"));
     }
 
     /// #727 r1: the name a template's workbook was bound to at open can be
