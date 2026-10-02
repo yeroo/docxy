@@ -81,11 +81,11 @@ pub(crate) fn decode(bytes: &[u8]) -> String {
 }
 
 fn utf16(bytes: &[u8], big_endian: bool) -> String {
-    let units = bytes.chunks_exact(2).map(|p| {
+    let units = bytes.as_chunks::<2>().0.iter().map(|&p| {
         if big_endian {
-            u16::from_be_bytes([p[0], p[1]])
+            u16::from_be_bytes(p)
         } else {
-            u16::from_le_bytes([p[0], p[1]])
+            u16::from_le_bytes(p)
         }
     });
     char::decode_utf16(units)
