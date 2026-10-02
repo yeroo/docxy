@@ -305,6 +305,20 @@ pub(crate) fn page_sheet_color(tab: &DocTab) -> u32 {
     page_background(tab).map_or(0xFFFFFF, |b| b.color)
 }
 
+/// The text and dimmed-text colours Print Layout draws on a sheet of colour
+/// `sheet`: dark ink on a light page, light ink on a dark one, as Word draws
+/// automatic text.
+pub(crate) fn page_ink(sheet: u32) -> (u32, u32) {
+    let [r, g, b] = [16, 8, 0].map(|s| f32::from(((sheet >> s) & 0xFF) as u8) / 255.0);
+    // Relative luminance (Rec. 709 weights on the gamma-encoded channels is
+    // close enough to pick a side).
+    if 0.2126 * r + 0.7152 * g + 0.0722 * b < 0.45 {
+        (0xF2F2F2, 0xB0B0B0)
+    } else {
+        (0x202020, 0x808080)
+    }
+}
+
 /// Whether a Design command's choice is the current one, for the check mark.
 pub(crate) fn design_checked(tab: &DocTab, act: DesignAct) -> bool {
     match act {

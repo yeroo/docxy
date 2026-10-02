@@ -137,6 +137,16 @@ fn custom_watermark_writes_text_size_colour_and_layout_then_removes() {
     assert_eq!(control(&t, "text").text(), "Internal & <draft>");
     assert_eq!(control(&t, "size").text(), "72");
     assert_eq!(control(&t, "layout").text(), "Horizontal");
+    assert_eq!(control(&t, "font").text(), "Georgia");
+    assert_eq!(control(&t, "semi").value, Value::Bool(false));
+    assert_eq!(control(&t, "color").text(), "Red");
+    // OK on it unchanged keeps the font and the opacity.
+    click(&mut t, "OK").unwrap();
+    let pkg = reopen(&t);
+    let shown = pkg.shown_text_watermarks(&ed(&t).sections());
+    assert_eq!(shown[0].font.as_deref(), Some("Georgia"));
+    assert_eq!(shown[0].opacity, None);
+    open(&mut t, watermark_dialog);
     set(&mut t, "kind", s("No watermark"));
     click(&mut t, "OK").unwrap();
     assert!(crate::design_tab::current_watermark(&t).is_none());

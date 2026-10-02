@@ -24566,9 +24566,11 @@ impl Render for Docxy {
                     // In Print Layout the sheet is always a light page (dark ink on
                     // white) regardless of the app theme, like Word's document surface.
                     let doc_pal = if self.page_view {
+                        // Automatic text stays readable on a dark page colour.
+                        let (fg, dim) = design_tab::page_ink(design_tab::page_sheet_color(tab));
                         Pal {
-                            fg: hsla_u(0x202020),
-                            dim: hsla_u(0x808080),
+                            fg: hsla_u(fg),
+                            dim: hsla_u(dim),
                             border: hsla_u(0xcccccc),
                             panel: hsla_u(0xf0f0f0),
                             hover: Hsla {

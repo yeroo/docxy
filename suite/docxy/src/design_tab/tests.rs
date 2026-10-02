@@ -246,6 +246,40 @@ fn a_watermark_with_the_header_open_survives_closing_it() {
     assert_eq!(pkg.watermarks().len(), 3);
 }
 
+/// What is typed into a header the watermark created is the header's own
+/// text: Remove Watermark leaves it.
+#[test]
+fn text_typed_into_a_watermarks_new_header_survives_remove() {
+    let mut t = three_sections();
+    apply(&mut t, DesignAct::Watermark(0));
+    assert!(crate::hf::open(&mut t, 0, true, HeaderVariant::Default));
+    t.hf_edit.as_mut().unwrap().editor.insert_str("Acme Corp");
+    exit_hf_tab(&mut t);
+    apply(&mut t, DesignAct::RemoveWatermark);
+    assert!(watermark_texts(&t).is_empty());
+    let pkg = reopen(&t);
+    let hdr: String = pkg
+        .part_names()
+        .iter()
+        .filter(|n| n.starts_with("word/header"))
+        .map(|n| pkg.part_text(n).unwrap())
+        .collect();
+    assert!(hdr.contains("Acme Corp"), "{hdr}");
+}
+
+/// Dark page colours get light text in Print Layout; light ones keep dark.
+#[test]
+fn ink_follows_the_page_colours_lightness() {
+    let dark = (0xF2F2F2, 0xB0B0B0);
+    let light = (0x202020, 0x808080);
+    for rgb in [0x000000, 0x002060, 0x44546A, 0xC00000, 0x7030A0, 0x0070C0] {
+        assert_eq!(page_ink(rgb), dark, "{rgb:06X}");
+    }
+    for rgb in [0xFFFFFF, 0xFFC000, 0xFFFF00, 0xE7E6E6, 0x92D050, 0x00B0F0] {
+        assert_eq!(page_ink(rgb), light, "{rgb:06X}");
+    }
+}
+
 /// Without a package (Markdown, or a new document), Page Color and
 /// Watermark say why; Page Borders works on a new document but not on
 /// Markdown.

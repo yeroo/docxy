@@ -934,7 +934,10 @@ impl DialogStack {
     /// Press a button on the top dialog. Cancel drops it; Open pushes its
     /// child; Accept and Apply hand it to `apply` (the owner), and Accept
     /// closes it once the owner took it. An owner that refuses leaves the
-    /// dialog open with its staged values, and the refusal is the error.
+    /// dialog open with its staged values, and the refusal is the error. The
+    /// exception is a write-back child ([`ChildDialog::writing_back`]): its
+    /// Accept never reaches `apply`; it copies its values into the dialog
+    /// under it, which stays open, and closes.
     pub fn click(
         &mut self,
         button: &str,

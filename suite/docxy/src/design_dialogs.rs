@@ -262,10 +262,21 @@ pub(crate) fn watermark_dialog(tab: &DocTab) -> Result<Dialog, String> {
                 "Text:",
                 cur.as_ref().map_or("ASAP", |w| w.text.as_str()),
             ),
-            text("font", "Font:", "Calibri"),
+            text(
+                "font",
+                "Font:",
+                cur.as_ref()
+                    .and_then(|w| w.font.as_deref())
+                    .unwrap_or("Calibri"),
+            ),
             text("size", "Size:", &size),
             color_control("color", "Color:", &["Silver"], Some(color)),
-            check("semi", "Semitransparent", true),
+            check(
+                "semi",
+                "Semitransparent",
+                cur.as_ref()
+                    .is_none_or(|w| w.opacity.is_some_and(|o| o < 1.0)),
+            ),
             choice(
                 "layout",
                 "Layout:",
