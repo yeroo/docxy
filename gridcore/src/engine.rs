@@ -1127,17 +1127,7 @@ impl Engine {
                 let Some(cells) = by_sheet.get(&ds) else {
                     continue;
                 };
-                // Cells are (row, col)-ordered, so the rect's rows are the
-                // contiguous slice from the first row ≥ r1 up to the last ≤ r2.
-                let start = cells.partition_point(|&(r, _, _)| r < r1);
-                for &(r, c, g) in &cells[start..] {
-                    if r > r2 {
-                        break;
-                    }
-                    if c >= c1 && c <= c2 {
-                        srcs.push(g);
-                    }
-                }
+                srcs.extend(cells_in_rect(cells, r1, c1, r2, c2).map(|&(_, _, g)| g));
             }
             // One edge per (dependent, source) even if several rects overlap it.
             srcs.sort_unstable();
@@ -1153,9 +1143,9 @@ impl Engine {
     /// for its first row plus a walk over the seeds in its row band — not a
     /// test against every seed.
     fn formulas_reading(&self, seeds: &[Key], skip: &HashSet<Key>) -> Vec<Key> {
-        let mut by_sheet: HashMap<usize, Vec<(u32, u32)>> = HashMap::new();
+        let mut by_sheet: HashMap<usize, Vec<(u32, u32, ())>> = HashMap::new();
         for &(s, r, c) in seeds {
-            by_sheet.entry(s).or_default().push((r, c));
+            by_sheet.entry(s).or_default().push((r, c, ()));
         }
         if by_sheet.is_empty() {
             return Vec::new();
@@ -1173,17 +1163,9 @@ impl Engine {
                 let Some(cells) = by_sheet.get(&ds) else {
                     continue;
                 };
-                // Cells are (row, col)-ordered, so the rect's rows are the
-                // contiguous slice from the first row ≥ r1 up to the last ≤ r2.
-                let start = cells.partition_point(|&(r, _)| r < r1);
-                for &(r, c) in &cells[start..] {
-                    if r > r2 {
-                        break;
-                    }
-                    if c >= c1 && c <= c2 {
-                        out.push(fk);
-                        continue 'formulas;
-                    }
+                if cells_in_rect(cells, r1, c1, r2, c2).next().is_some() {
+                    out.push(fk);
+                    continue 'formulas;
                 }
             }
         }
@@ -1795,6 +1777,25 @@ struct SpillOwner {
     /// For a frozen array anchor, whether its block holds the cell: `Some(false)`
     /// when its stored `ref` is not its own or leaves the cell out.
     frozen_ref_covers: Option<bool>,
+}
+
+/// The entries of `cells` — sorted by (row, col) — inside the inclusive
+/// rectangle rows r1..=r2, cols c1..=c2. Cells are (row, col)-ordered, so the
+/// rect's rows are the contiguous slice from the first row ≥ r1 up to the
+/// last ≤ r2: a binary search for the first row, then a walk over that row
+/// band only.
+fn cells_in_rect<T>(
+    cells: &[(u32, u32, T)],
+    r1: u32,
+    c1: u32,
+    r2: u32,
+    c2: u32,
+) -> impl Iterator<Item = &(u32, u32, T)> {
+    let start = cells.partition_point(|&(r, _, _)| r < r1);
+    cells[start..]
+        .iter()
+        .take_while(move |&&(r, _, _)| r <= r2)
+        .filter(move |&&(_, c, _)| c >= c1 && c <= c2)
 }
 
 /// Clear the plain-value cells of a spill (keeping styles) outside the
