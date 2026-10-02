@@ -106,7 +106,7 @@ pub(crate) fn is_sdt_close(raw: &str) -> bool {
 }
 
 /// The `w:docPartGallery` value in an SDT's properties, if any.
-fn doc_part_gallery(raw: &str) -> Option<String> {
+pub(crate) fn doc_part_gallery(raw: &str) -> Option<String> {
     let (a, b) = crate::sect::find_element(raw, "w:docPartGallery")?;
     crate::load::xml_attr_value(&raw[a..b], "w:val")
 }
@@ -119,7 +119,7 @@ pub fn is_page_number_open(block: &Block) -> bool {
 }
 
 /// The index of the boundary closing the content control opened at `open`.
-fn matching_close(blocks: &[Block], open: usize) -> Option<usize> {
+pub(crate) fn matching_close(blocks: &[Block], open: usize) -> Option<usize> {
     let mut depth = 0usize;
     for (i, block) in blocks.iter().enumerate().skip(open) {
         let Block::Raw(raw) = block else { continue };

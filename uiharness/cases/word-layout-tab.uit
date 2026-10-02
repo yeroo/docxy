@@ -8,11 +8,12 @@ test the Layout tab sits between Insert and Review
   assert reply.tabs.0.name is File
   assert reply.tabs.1.name is Home
   assert reply.tabs.2.name is Insert
-  assert reply.tabs.3.name is Layout
-  assert reply.tabs.3.key_tip is P
-  assert reply.tabs.4.name is Mailings
-  assert reply.tabs.5.name is Review
-  assert reply.tabs.6.name is View
+  assert reply.tabs.3.name is Design
+  assert reply.tabs.4.name is Layout
+  assert reply.tabs.4.key_tip is P
+  assert reply.tabs.5.name is Mailings
+  assert reply.tabs.6.name is Review
+  assert reply.tabs.7.name is View
   key alt p escape escape
   assert ribbon_tab is Layout
 

@@ -8,7 +8,7 @@
 //! in. Every edit here is one undo step on the editor's document, which is
 //! what the page view and Save read.
 
-use super::{Caret, EditKind, Editor, resolve_para, split_content, tab_props_at};
+use super::{Caret, EditKind, Editor, resolve_para, split_paragraph_content, tab_props_at};
 use crate::model::{Block, BreakKind, Inline, Paragraph, SectionProperties};
 use crate::sect::{SectionSetup, SectionStart};
 
@@ -16,7 +16,7 @@ use super::Clip;
 
 /// Where one section's properties live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SectAt {
+pub(super) enum SectAt {
     /// The `section_break` of the body paragraph at this index.
     Para(usize),
     /// The body-level trailing section properties.
@@ -27,7 +27,7 @@ enum SectAt {
 const EMPTY_SECT: &str = "<w:sectPr></w:sectPr>";
 
 impl Editor {
-    fn section_slots(&self) -> Vec<SectAt> {
+    pub(super) fn section_slots(&self) -> Vec<SectAt> {
         let mut out: Vec<SectAt> = self
             .doc
             .body
@@ -51,7 +51,7 @@ impl Editor {
             .collect()
     }
 
-    fn sect_raw(&self, at: SectAt) -> &str {
+    pub(super) fn sect_raw(&self, at: SectAt) -> &str {
         match at {
             SectAt::Para(i) => match &self.doc.body[i] {
                 Block::Paragraph(p) => p.props.section_break.as_deref().unwrap_or(EMPTY_SECT),
@@ -117,6 +117,29 @@ impl Editor {
         true
     }
 
+    /// Replace whole sectPrs, `(section, raw)`, as one undo step: for edits
+    /// computed elsewhere, such as the header references a watermark adds
+    /// (`Package::set_text_watermark`). Nothing is recorded when none
+    /// changes. Whether any did.
+    pub fn replace_sections(&mut self, raws: &[(usize, String)]) -> bool {
+        let slots = self.section_slots();
+        let changes: Vec<(SectAt, String)> = raws
+            .iter()
+            .filter_map(|(k, raw)| {
+                let at = *slots.get(*k)?;
+                (self.sect_raw(at) != raw).then(|| (at, raw.clone()))
+            })
+            .collect();
+        if changes.is_empty() {
+            return false;
+        }
+        self.checkpoint(EditKind::Structural);
+        for (at, raw) in changes {
+            self.set_sect_raw(at, raw);
+        }
+        true
+    }
+
     /// [`Editor::edit_sections`] through the typed [`SectionSetup`] view.
     pub fn edit_section_setups(
         &mut self,
@@ -130,7 +153,7 @@ impl Editor {
         })
     }
 
-    fn set_sect_raw(&mut self, at: SectAt, raw: String) {
+    pub(super) fn set_sect_raw(&mut self, at: SectAt, raw: String) {
         match at {
             SectAt::Para(i) => {
                 if let Some(Block::Paragraph(p)) = self.doc.body.get_mut(i) {
@@ -185,7 +208,7 @@ impl Editor {
         let Some(Block::Paragraph(p)) = self.doc.body.get_mut(block) else {
             return Err("A section break needs the caret in a paragraph".into());
         };
-        let right = split_content(&mut p.content, self.caret.offset);
+        let right = split_paragraph_content(&mut p.content, self.caret.offset);
         let second = Paragraph {
             props: p.props.clone(),
             content: right,
@@ -417,6 +440,22 @@ mod tests {
 
     fn before_sections(doc: &Document) -> Vec<String> {
         Editor::new(doc.clone()).sections()
+    }
+
+    #[test]
+    fn replace_sections_is_one_undo_step() {
+        let mut e = three();
+        let before = e.doc.clone();
+        let mut want = e.sections();
+        want[0] =
+            "<w:sectPr><w:headerReference w:type=\"default\" r:id=\"rId9\"/></w:sectPr>".into();
+        want[2] = "<w:sectPr><w:pgSz w:w=\"100\"/></w:sectPr>".into();
+        let raws = [(0, want[0].clone()), (2, want[2].clone()), (9, "x".into())];
+        assert!(e.replace_sections(&raws));
+        assert_eq!(e.sections(), want);
+        assert!(!e.replace_sections(&raws), "unchanged records nothing");
+        assert!(e.undo());
+        assert_eq!(e.doc, before);
     }
 
     #[test]

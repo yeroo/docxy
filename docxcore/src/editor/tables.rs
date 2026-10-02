@@ -9,7 +9,7 @@
 
 use super::{
     Caret, EditKind, Editor, all_paragraph_paths, container_mut, para_text_len, resolve_para,
-    split_content,
+    split_paragraph_content,
 };
 use crate::model::{Block, Inline, Paragraph, Table, VMerge};
 use crate::sect::SectionSetup;
@@ -494,7 +494,7 @@ impl Editor {
             let Some(Block::Paragraph(p)) = cont.get_mut(idx) else {
                 return Err("the caret is not in a paragraph".into());
             };
-            let right = split_content(&mut p.content, off);
+            let right = split_paragraph_content(&mut p.content, off);
             let props = p.props.clone();
             // The section break ends the section after the split, so it (and
             // its tracked change) moves with the paragraph's second half. A

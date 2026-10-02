@@ -27,9 +27,15 @@ mod control;
 mod convert_child;
 #[cfg(test)]
 mod convert_tests;
+mod cover_page;
 mod crashlog;
+mod design_dialogs;
+mod design_tab;
 mod dialog;
 mod dialog_host;
+mod doc_import;
+#[cfg(test)]
+mod doc_import_tests;
 #[cfg(test)]
 mod doc_protected_tests;
 mod harness;
@@ -234,6 +240,13 @@ struct PersistTab {
     /// which Save must never write.
     #[serde(default)]
     converted: Option<open_mode::Converted>,
+    /// The document's [`doc_import::DocImport`] (#634). A dirty tab restores
+    /// from its `.docx` sidecar, which says neither, so without these its
+    /// Save would write over the `.doc` it was imported from.
+    #[serde(default)]
+    binary_source: bool,
+    #[serde(default)]
+    compat: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -342,6 +355,8 @@ enum RibbonTab {
     Project,
     Home,
     Insert,
+    /// Word's Design tab (#651); documents only.
+    Design,
     /// Word's page Layout tab (#649); documents only.
     Layout,
     /// Word's Mailings tab (#628); documents only.
@@ -2529,14 +2544,22 @@ struct DocTab {
     /// (#633): it is, when it is first drawn as the active tab, so a
     /// startup never waits on more than the tab in front.
     pending_conversion: bool,
+    /// Whether this document was imported from a Word 97-2003 file, and
+    /// whether it is still in Compatibility Mode (#634).
+    import: doc_import::DocImport,
 }
 
 impl DocTab {
     /// What the tab strip shows for this tab: its file name, then Excel's
-    /// `[Protected View]`, `[Repaired]` or `[Read-Only]` (#610). `title`
-    /// itself stays the plain name, because it seeds Save As.
+    /// `[Protected View]`, `[Repaired]` or `[Read-Only]` (#610), or Word's
+    /// `[Compatibility Mode]` (#634). `title` itself stays the plain name,
+    /// because it seeds Save As.
     fn caption(&self) -> String {
-        open_mode::caption(&self.title, self.access)
+        let mut caption = open_mode::caption(&self.title, self.access);
+        if self.import.compat {
+            caption.push_str(doc_import::COMPAT_SUFFIX);
+        }
+        caption
     }
 
     /// A document edit landed. In Protected View (#633) a gate before it
@@ -4315,6 +4338,8 @@ struct Loaded {
     converted: Option<open_mode::Converted>,
     /// The converted `.docx` the tab was built from, kept for rollback.
     converted_docx: Option<std::rc::Rc<Vec<u8>>>,
+    /// The document was imported from a Word 97-2003 file (#634).
+    import: doc_import::DocImport,
 }
 
 impl Loaded {
@@ -4330,6 +4355,7 @@ impl Loaded {
             load_failed: true,
             converted: None,
             converted_docx: None,
+            import: Default::default(),
         }
     }
 
@@ -4363,6 +4389,7 @@ impl Loaded {
             last_hot: Default::default(),
             converted_docx: self.converted_docx,
             pending_conversion: false,
+            import: self.import,
         }
     }
 }
@@ -4373,21 +4400,33 @@ fn is_markdown_path(path: &std::path::Path) -> bool {
 }
 
 /// Load a `.docx` from bytes, keeping the whole package so save stays lossless.
+/// An OLE2 file is imported as a Word 97-2003 document (#634), whatever its
+/// extension.
 fn load_bytes(bytes: &[u8]) -> Loaded {
-    match docxcore::package::load_package(bytes) {
-        Ok(pkg) => Loaded {
-            doc: with_final_section(pkg.document.clone(), &pkg),
-            comments: docxcore::comments::parse_comments(&pkg),
-            notes: docxcore::notes::parse_notes(&pkg),
-            pkg: Some(pkg),
-            markdown: false,
-            status: "loaded".into(),
-            bundle_html: None,
-            load_failed: false,
-            converted: None,
-            converted_docx: None,
+    let (pkg, status, import) = match docxcore::package::load_package(bytes) {
+        Ok(pkg) => (pkg, "loaded".into(), doc_import::DocImport::default()),
+        Err(docxcore::load::LoadError::Ole2) => match docxcore::legacy::doc::import_doc(bytes) {
+            Ok(pkg) => (
+                pkg,
+                doc_import::IMPORTED_STATUS.into(),
+                doc_import::DocImport::IMPORTED,
+            ),
+            Err(e) => return Loaded::empty(format!("load error: {e}")),
         },
-        Err(e) => Loaded::empty(format!("load error: {e:?}")),
+        Err(e) => return Loaded::empty(format!("load error: {e:?}")),
+    };
+    Loaded {
+        doc: with_final_section(pkg.document.clone(), &pkg),
+        comments: docxcore::comments::parse_comments(&pkg),
+        notes: docxcore::notes::parse_notes(&pkg),
+        pkg: Some(pkg),
+        markdown: false,
+        status,
+        bundle_html: None,
+        load_failed: false,
+        converted: None,
+        converted_docx: None,
+        import,
     }
 }
 
@@ -4494,10 +4533,6 @@ fn pending_conversion(kind: open_mode::Converted) -> Loaded {
     }
 }
 
-/// What Word 97-2003 binaries and encrypted packages (both OLE compound
-/// files) say: neither is read.
-const DOC_CFB_UNSUPPORTED: &str = "load error: a Word 97-2003 .doc or an encrypted (password-protected) document is not supported";
-
 /// Load a document tab's file. The format is decided by the content first
 /// (#633), so an RTF or a Web Page named `.doc` or `.docx` opens as what it
 /// is: a docxy bundle, any other HTML, RTF and PDF are told apart by their
@@ -4546,7 +4581,9 @@ fn load_doc_file(path: &std::path::Path, convert: bool) -> Loaded {
             .unwrap_or_else(|| Loaded::empty("load error: the RTF file holds no text")),
         Format::Pdf => convert_doc(path, &bytes, convert_child::What::Pdf)
             .unwrap_or_else(|| Loaded::empty("load error: the PDF has no text to convert")),
-        Format::Cfb => Loaded::empty(DOC_CFB_UNSUPPORTED),
+        // An OLE compound file: a Word 97-2003 document, imported in
+        // Compatibility Mode (#634), never converted.
+        Format::Cfb => load_bytes(&bytes),
         Format::Docx | Format::Unknown => load_or_recover(path, &bytes),
     }
 }
@@ -4645,6 +4682,14 @@ fn sheet_bytes(v: &SheetView, target: Option<&std::path::Path>) -> (Vec<u8>, usi
     }
 }
 
+/// What the Open dialog's "All supported" filter lists: documents
+/// (Word 97-2003 `.doc` imports, #634; RTF, web pages and PDFs opened
+/// converted, #633), workbooks and project schedules.
+const OPEN_EXTENSIONS: [&str; 15] = [
+    "docx", "doc", "md", "markdown", "html", "htm", "rtf", "pdf", "xlsx", "xlsm", "xltx", "xltm",
+    "yppx", "xml", "mpp",
+];
+
 /// The extensions a workbook opens from and saves to.
 const SHEET_EXTENSIONS: [&str; 4] = ["xlsx", "xlsm", "xltx", "xltm"];
 
@@ -4721,6 +4766,7 @@ fn sheet_tab_from_path(path: &PathBuf, repair: bool) -> DocTab {
         converted_docx: None,
         pending_conversion: false,
         mail: Default::default(),
+        import: Default::default(),
     }
 }
 
@@ -7761,6 +7807,7 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 converted_docx: None,
                 pending_conversion: false,
                 mail: Default::default(),
+                import: Default::default(),
             }
         }
         // A document with no sidecar reloads its file, bundle included; the
@@ -7791,6 +7838,7 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 status,
                 comments,
                 mail: mailings_tab::MailState::from_pkg(pkg.as_ref()),
+                import: Default::default(),
                 pkg,
                 notes,
                 markdown,
@@ -7807,6 +7855,12 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
     };
     // The hot sidecar is always .docx; restore the Markdown flag from session.
     tab.markdown = t.markdown || tab.markdown;
+    // Nor does the sidecar say the tab was imported from a Word 97-2003 file
+    // (#634). A tab reloaded from that file knows it from the load.
+    if t.kind == Kind::Docx {
+        tab.import.binary_source |= t.binary_source;
+        tab.import.compat |= t.compat;
+    }
     // A repaired tab with no readable sidecar reopens its damaged file
     // the way it was opened, or the strict load would refuse it.
     if t.kind == Kind::Xlsx
@@ -7920,6 +7974,8 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
         repaired: t.access.repaired,
         stamp: t.access.stamp,
         converted: t.access.converted,
+        binary_source: t.import.binary_source,
+        compat: t.import.compat,
     }
 }
 
@@ -8386,6 +8442,7 @@ impl Docxy {
             converted_docx: None,
             pending_conversion: false,
             mail: Default::default(),
+            import: Default::default(),
         };
         self.tabs.push(match kind {
             Kind::Project => new_project_tab(),
@@ -14098,13 +14155,14 @@ fn canonical(path: &std::path::Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.into())
 }
 
-/// The name Save As suggests for a document tab: its title, or for a tab
+/// The name Save As suggests for a document tab: [`doc_import::save_name`]
+/// (its title, or an imported Word 97-2003 document's `.docx`), or for a tab
 /// converted from another format (#633) the same name as a Word document.
 fn doc_save_as_name(tab: &DocTab) -> String {
-    let title = tab.title.to_string();
     if tab.access.converted.is_none() {
-        return title;
+        return doc_import::save_name(tab);
     }
+    let title = tab.title.to_string();
     let stem = std::path::Path::new(&title)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -14193,6 +14251,12 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
         tab.status = DOC_LOAD_FAILED_SAVE.into();
         return false;
     }
+    // Nothing writes a Word 97-2003 file, or over the one a document was
+    // imported from (#634): those bytes would be a .docx under its name.
+    if let Some(refusal) = doc_import::save_refusal(tab, target.as_deref()) {
+        tab.status = refusal.into();
+        return false;
+    }
     if let Some(t) = target.as_deref().filter(|t| !doc_target_allowed(t)) {
         tab.status = format!(
             "cannot save a document as \"{}\": save it as .docx, .docm, .md or .html",
@@ -14256,6 +14320,9 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
             if tab.access.converted.take().is_some() {
                 tab.pkg = package.and_then(|p| docxcore::package::load_package(&p).ok());
             }
+            // The tab's file is now the one just written, not the binary
+            // original; Compatibility Mode stays until Convert (#634).
+            tab.import.binary_source = false;
             // The page just written is the one the next save rewraps.
             tab.bundle_html = match kind {
                 html_bundle::DocTarget::Html => String::from_utf8(bytes).ok(),
@@ -14369,12 +14436,12 @@ impl Docxy {
                 self.refocus(window, cx);
                 return false;
             }
-            None => match doc_save_target(path, self.harness.is_some()) {
+            None => match doc_save_target(path, tab.import.binary_source, self.harness.is_some()) {
                 DocSaveTarget::InPlace => None,
                 // ⚠️ Never in a harness instance: `rfd` runs its own modal loop on
                 // this thread and stops the control pump dead (see `save_sheet_tab`).
                 DocSaveTarget::RefuseHarness => {
-                    self.tabs[self.active].status = DOC_NEVER_SAVED_HARNESS.into();
+                    self.tabs[self.active].status = doc_import::harness_save_refusal(tab).into();
                     self.refocus(window, cx);
                     return false;
                 }
@@ -14522,6 +14589,11 @@ impl Docxy {
         {
             dialog = dialog.add_filter("Editable HTML (*.docx.html)", &["html"]);
         }
+        // An imported document's .docx goes beside its Word 97-2003 original
+        // (#634); the save refuses the original itself, whatever its name.
+        if let Some(dir) = self.tabs.get(self.active).and_then(doc_import::save_dir) {
+            dialog = dialog.set_directory(dir);
+        }
         // The name is written as picked (the dialog already asked about
         // overwriting it): any .html name saves a bundle, found by its content
         // when opened again.
@@ -14530,17 +14602,12 @@ impl Docxy {
 
     fn open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter(
-                "All supported",
-                &[
-                    "docx", "md", "markdown", "html", "htm", "rtf", "pdf", "xlsx", "xlsm", "xltx",
-                    "xltm", "yppx", "xml", "mpp",
-                ],
-            )
+            .add_filter("All supported", &OPEN_EXTENSIONS)
             .add_filter("Project schedule", &["yppx", "xml", "mpp"])
             .add_filter("Word or Markdown", &["docx", "md", "markdown"])
             // Opened converted (#633); Save writes a Word document.
             .add_filter("Rich Text, Web Page or PDF", &["rtf", "htm", "html", "pdf"])
+            .add_filter("Word 97-2003 Document", &["doc"])
             .add_filter("Editable HTML (*.docx.html)", &["html"])
             .add_filter("Excel workbook", &SHEET_EXTENSIONS)
             .pick_file()
@@ -16734,19 +16801,28 @@ fn doc_html_save_allowed(tab: &DocTab) -> bool {
 /// Where a document Save goes, decided before anything is written.
 #[derive(Debug, PartialEq, Eq)]
 enum DocSaveTarget {
-    /// The tab has a path: overwrite it.
+    /// The tab has a path, which is neither a `.doc`/`.dot` nor the Word
+    /// 97-2003 original it was imported from (#634): overwrite it.
     InPlace,
-    /// Never saved: ask with the Save As dialog.
+    /// Never saved, or imported from a Word 97-2003 file: ask with the Save
+    /// As dialog.
     NeedsDialog,
-    /// Never saved, in a harness instance that must not open a native dialog.
+    /// As `NeedsDialog`, in a harness instance that must not open a native
+    /// dialog.
     RefuseHarness,
 }
 
-fn doc_save_target(path: Option<&std::path::Path>, harness: bool) -> DocSaveTarget {
+/// `binary_source`: the tab's file is the Word 97-2003 document it was
+/// imported from (#634), which Save never writes; nor any `.doc` path.
+fn doc_save_target(
+    path: Option<&std::path::Path>,
+    binary_source: bool,
+    harness: bool,
+) -> DocSaveTarget {
     match path {
-        Some(_) => DocSaveTarget::InPlace,
-        None if harness => DocSaveTarget::RefuseHarness,
-        None => DocSaveTarget::NeedsDialog,
+        Some(p) if !binary_source && !doc_import::is_binary_doc_path(p) => DocSaveTarget::InPlace,
+        _ if harness => DocSaveTarget::RefuseHarness,
+        _ => DocSaveTarget::NeedsDialog,
     }
 }
 
@@ -17456,14 +17532,23 @@ mod doc_save_target_tests {
     fn a_saved_document_saves_in_place_harness_or_not() {
         let path = Path::new("report.docx");
         for harness in [false, true] {
-            assert_eq!(doc_save_target(Some(path), harness), DocSaveTarget::InPlace);
+            assert_eq!(
+                doc_save_target(Some(path), false, harness),
+                DocSaveTarget::InPlace
+            );
         }
     }
 
     #[test]
     fn a_never_saved_document_asks_or_refuses_but_never_picks_a_path() {
-        assert_eq!(doc_save_target(None, false), DocSaveTarget::NeedsDialog);
-        assert_eq!(doc_save_target(None, true), DocSaveTarget::RefuseHarness);
+        assert_eq!(
+            doc_save_target(None, false, false),
+            DocSaveTarget::NeedsDialog
+        );
+        assert_eq!(
+            doc_save_target(None, false, true),
+            DocSaveTarget::RefuseHarness
+        );
     }
 }
 
@@ -17873,6 +17958,7 @@ mod sheet_save_tests {
             converted_docx: None,
             pending_conversion: false,
             mail: Default::default(),
+            import: Default::default(),
         }
     }
 
@@ -18756,6 +18842,10 @@ enum Act {
     AutoHideRibbon,
     InsertField,
     PageBreak,
+    /// Insert › Blank Page: two page breaks at the body caret (#652).
+    BlankPage,
+    /// An Insert › Cover Page menu command (#652).
+    Cover(cover_page::CoverAct),
     ToggleNotes,
     InsertTable,
     InsertSymbol,
@@ -18763,6 +18853,8 @@ enum Act {
     /// A Header & Footer command (#641, #650), on the Insert tab's Header,
     /// Footer and Page Number menus and the contextual tab.
     Hf(hf_tab::HfAct),
+    /// A Design tab command (#651).
+    Design(design_tab::DesignAct),
     /// A page Layout tab command (#649).
     Layout(layout_tab::LayoutAct),
     /// A Mailings tab command (#628).
@@ -19025,13 +19117,7 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
             "Insert",
             "N",
             vec![
-                rs::group(
-                    "Pages",
-                    40,
-                    vec![Control::Large(
-                        cmdt("pagebreak", "rule", "Page Break", PageBreak, "").key("B"),
-                    )],
-                ),
+                rs::group("Pages", 40, cover_page::pages_group()),
                 rs::group(
                     "Tables",
                     35,
@@ -19063,6 +19149,7 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                 ),
             ],
         ),
+        design_tab::design_tab(),
         layout_tab::layout_tab(),
         mailings_tab::mailings_tab(),
         // Review: a large New Comment + a small pane-toggle column, then Editing.
@@ -19162,13 +19249,13 @@ fn ribbon_for(kind: Kind) -> rs::Ribbon<Act> {
     match kind {
         Kind::Project => project_ribbon(),
         Kind::Docx => docxy_ribbon(),
-        // The same tabs as `ribbon_tab_set` gives a workbook: no Layout and
-        // no Mailings.
+        // The same tabs as `ribbon_tab_set` gives a workbook: no Design, no
+        // Layout and no Mailings.
         _ => {
             let mut ribbon = docxy_ribbon();
             ribbon
                 .tabs
-                .retain(|t| t.name != "Layout" && t.name != "Mailings");
+                .retain(|t| !matches!(t.name, "Design" | "Layout" | "Mailings"));
             ribbon
         }
     }
@@ -19190,6 +19277,7 @@ fn ribbon_tab_set(kind: Kind) -> &'static [(Option<RibbonTab>, &'static str, &'s
             (None, "File", "F"),
             (Some(Home), "Home", "H"),
             (Some(Insert), "Insert", "N"),
+            (Some(Design), "Design", "G"),
             (Some(Layout), "Layout", "P"),
             (Some(Mailings), "Mailings", "M"),
             (Some(Review), "Review", "R"),
@@ -19241,6 +19329,7 @@ fn ribbon_tab_name(tab: RibbonTab) -> &'static str {
     match tab {
         RibbonTab::Home => "Home",
         RibbonTab::Insert => "Insert",
+        RibbonTab::Design => "Design",
         RibbonTab::Layout => "Layout",
         RibbonTab::Mailings => "Mailings",
         RibbonTab::Review => "Review",
@@ -21509,12 +21598,18 @@ impl Docxy {
                         label: cmd.label.into(),
                     },
                     match (layout_tab::menu_of(cmd.id), cmd.act) {
+                        (_, Act::Cover(_)) => cover_page::menu_items(self.tabs.get(self.active)),
                         (_, Act::InsertTable) => table_tab::insert_table_menu(
                             self.edit_target_ref()
                                 .is_some_and(|e| e.has_selection() && e.cell_range().is_none()),
                         ),
                         (Some(m), Act::Layout(_)) => {
                             layout_tab::menu_items(m, |a| self.act_active(a))
+                        }
+                        (_, Act::Design(_)) if design_tab::menu_of(cmd.id).is_some() => {
+                            design_tab::menu_items(design_tab::menu_of(cmd.id)?, |a| {
+                                self.act_active(a)
+                            })
                         }
                         (_, Act::Mail(_)) if mailings_tab::menu_of(cmd.id).is_some() => {
                             let tab = self.tabs.get(self.active)?;
@@ -21868,6 +21963,7 @@ impl Docxy {
             InsertEquation => self.toggle_picker(PickKind::Equation, window, cx),
             LineSpacing => self.toggle_picker(PickKind::LineSpacing, window, cx),
             Hf(act) => self.hf_act(act, window, cx),
+            Design(act) => self.design_act(act, window, cx),
             Layout(act) => self.layout_act(act, window, cx),
             Mail(act) => self.mail_act(act, window, cx),
             Table(act) => self.table_act(act, window, cx),
@@ -21883,6 +21979,8 @@ impl Docxy {
                 self.refocus(window, cx);
             }
             PageBreak => self.insert_page_break(window, cx),
+            BlankPage => self.insert_blank_page(window, cx),
+            Cover(act) => self.cover_act(act, window, cx),
             ToggleNotes => {
                 self.show_notes = !self.show_notes;
                 self.refocus(window, cx);
@@ -21940,9 +22038,9 @@ impl Docxy {
                 Project(_) | Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find
                 | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide
                 | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField
-                | PageBreak | ToggleNotes | InsertTable | InsertSymbol | InsertEquation
-                | LineSpacing | Hf(_) | Layout(_) | Mail(_) | Table(_) | PrintLayout
-                | ToggleRuler => {}
+                | PageBreak | BlankPage | Cover(_) | ToggleNotes | InsertTable | InsertSymbol
+                | InsertEquation | LineSpacing | Hf(_) | Design(_) | Layout(_) | Mail(_)
+                | Table(_) | PrintLayout | ToggleRuler => {}
             }),
         }
     }
@@ -23780,6 +23878,15 @@ impl Docxy {
     /// table command, the edited story's state (Merge Cells needs a cell
     /// range, Convert Text to Table a selection outside a table).
     pub(crate) fn act_enabled_now(&self, act: Act) -> bool {
+        if let Act::Design(a) = act {
+            return design_tab::design_enabled(self.tabs.get(self.active), a);
+        }
+        if let Act::Cover(a) = act {
+            return cover_page::cover_enabled(self.tabs.get(self.active), a);
+        }
+        if matches!(act, Act::BlankPage) {
+            return cover_page::blank_page_enabled(self.tabs.get(self.active));
+        }
         if let Act::Mail(a) = act {
             return self
                 .tabs
@@ -23831,6 +23938,10 @@ impl Docxy {
                 .tabs
                 .get(self.active)
                 .is_some_and(|t| layout_tab::layout_checked(t, act)),
+            Design(act) => self
+                .tabs
+                .get(self.active)
+                .is_some_and(|t| design_tab::design_checked(t, act)),
             Hf(act) => self
                 .tabs
                 .get(self.active)
@@ -23982,8 +24093,11 @@ impl Docxy {
                         .text_color(fg)
                         .child("Info"),
                 )
-                .child(div().text_color(fg).child(tab.title.clone()))
+                .child(div().text_color(fg).child(tab.caption()))
                 .child(div().text_size(px(12.)).text_color(dim).child(path))
+                .when(tab.import.compat, |d| {
+                    d.child(self.compat_section(fg, dim, cx))
+                })
                 .child(
                     div()
                         .pt_2()
@@ -24013,6 +24127,66 @@ impl Docxy {
                 )
                 .into_any_element(),
         )
+    }
+
+    /// File > Info's Compatibility Mode section (#634): what the mode means
+    /// and Word's Convert button.
+    fn compat_section(&self, fg: Hsla, dim: Hsla, cx: &mut Context<Self>) -> AnyElement {
+        v_flex()
+            .gap_2()
+            .child(
+                div()
+                    .pt_2()
+                    .text_size(px(16.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(fg)
+                    .child("Compatibility Mode"),
+            )
+            .child(
+                h_flex()
+                    .gap_4()
+                    .items_center()
+                    .child(div().w(px(420.)).text_size(px(12.)).text_color(dim).child(
+                        "This document was opened from a Word 97-2003 file. Convert \
+                                 it to the newest file format; saving writes a .docx and \
+                                 leaves the original file as it is.",
+                    ))
+                    .child(
+                        div()
+                            .id("bs-info-convert")
+                            .px_3()
+                            .py_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(dim)
+                            .text_color(fg)
+                            .cursor_pointer()
+                            .hover(|d| d.border_color(rgb(BRAND)))
+                            .child("Convert")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let _ = this.convert_active();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// File > Info > Convert on the active tab (#634): the page's button and
+    /// the harness's `convert` verb both come here. A conversion shows on
+    /// the page like a Remove All; a refusal (a tab not in Compatibility
+    /// Mode, which has no button) only on the status line.
+    fn convert_active(&mut self) -> Result<String, String> {
+        let tab = self
+            .tabs
+            .get_mut(self.active)
+            .ok_or("there is no active tab")?;
+        let result = doc_import::convert_tab(tab);
+        match &result {
+            Ok(status) => self.bs_info_status = Some((self.active, Ok(status.clone()))),
+            Err(e) => tab.status = e.clone().into(),
+        }
+        result
     }
 
     /// Remove All for `category` on the active document tab: the page's
@@ -25101,12 +25275,15 @@ impl Render for Docxy {
                     let spans = editor.selection_spans();
                     let markers = list_markers(&editor.doc.body);
                     let ent = cx.entity();
-                    // In Print Layout the sheet is always a light page (dark ink on
-                    // white) regardless of the app theme, like Word's document surface.
+                    // In Print Layout the sheet is white, or the document's page
+                    // colour (#651), whatever the app theme, like Word's document
+                    // surface; its ink comes from `design_tab::page_ink`.
                     let doc_pal = if self.page_view {
+                        // Automatic text stays readable on a dark page colour.
+                        let (fg, dim) = design_tab::page_ink(design_tab::page_sheet_color(tab));
                         Pal {
-                            fg: hsla_u(0x202020),
-                            dim: hsla_u(0x808080),
+                            fg: hsla_u(fg),
+                            dim: hsla_u(dim),
                             border: hsla_u(0xcccccc),
                             panel: hsla_u(0xf0f0f0),
                             hover: Hsla {
@@ -25140,9 +25317,11 @@ impl Render for Docxy {
                     };
                     let body = &editor.doc.body;
                     if self.page_view {
-                        // Print Layout: split the body into discrete white page sheets
-                        // (section margins), stacked on a grey canvas.
+                        // Print Layout: split the body into discrete page sheets
+                        // (section margins), stacked on a grey canvas. A sheet is
+                        // white, or the document's page colour (#651).
                         let geom = final_page_geom(tab);
+                        let sheet = hsla_u(design_tab::page_sheet_color(tab));
                         let zoom = self.zoom;
                         let tw = move |t: i32| px(zoom * (t.max(0) as f32) / 15.0); // twips → px @ ~96dpi, zoomed
                         let canvas = if self.applied == Some(ThemeMode::Dark) {
@@ -25324,7 +25503,7 @@ impl Render for Docxy {
                                 let page_base = v_flex()
                                     .w(tw(geom.w))
                                     .min_h(tw(geom.h))
-                                    .bg(hsla_u(0xffffff))
+                                    .bg(sheet)
                                     .text_color(doc_pal.fg)
                                     .border_1()
                                     .border_color(hsla_u(0xd0d0d0));
@@ -25333,16 +25512,8 @@ impl Render for Docxy {
                                     a: 0.5,
                                     ..hsla_u(0xeef4ff)
                                 };
-                                let hdr_bg = if edit_hdr_here {
-                                    tint
-                                } else {
-                                    hsla_u(0xffffff)
-                                };
-                                let ftr_bg = if edit_ftr_here {
-                                    tint
-                                } else {
-                                    hsla_u(0xffffff)
-                                };
+                                let hdr_bg = if edit_hdr_here { tint } else { sheet };
+                                let ftr_bg = if edit_ftr_here { tint } else { sheet };
                                 // Header in the top margin, content in the middle, footer in
                                 // the bottom margin, on every page, so each area can be
                                 // double-clicked (PAG-064). While a header or footer is

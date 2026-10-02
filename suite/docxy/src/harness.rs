@@ -2237,6 +2237,7 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "drag"
             | "fill-drag"
             | "save-as"
+            | "convert"
             | "mail-attach"
             | "select-chart"
             | "focus-field"
@@ -2852,6 +2853,19 @@ pub fn dispatch(
                 fields.push(("status".into(), Json::Str(status)));
             }
             Done::ok(out)
+        }
+        "convert" => {
+            // File > Info > Convert (#634): take an imported Word 97-2003
+            // document out of Compatibility Mode, as the page's button does.
+            app.refuse_under_dialog()?;
+            let status = app.convert_active()?;
+            cx.notify();
+            let tab = &app.tabs[app.active];
+            Done::ok(Json::obj(vec![
+                ("status", Json::Str(status)),
+                ("caption", Json::Str(tab.caption())),
+                ("dirty", Json::Bool(tab.dirty)),
+            ]))
         }
         "status-read" => {
             let tab = app.tabs.get(app.active).ok_or("there is no active tab")?;
@@ -3913,6 +3927,7 @@ mod tests {
             converted_docx: None,
             pending_conversion: false,
             mail: Default::default(),
+            import: Default::default(),
         };
         let mut word = doc(crate::Kind::Docx, "a.docx");
         word.path = Some("C:/work/a.docx".into());
@@ -4281,7 +4296,7 @@ mod tests {
                 .map(|t| t.get_str("name").unwrap())
                 .collect::<Vec<_>>(),
             vec![
-                "File", "Home", "Insert", "Layout", "Mailings", "Review", "View"
+                "File", "Home", "Insert", "Design", "Layout", "Mailings", "Review", "View"
             ]
         );
         let tabs_on = on.get("tabs").unwrap().as_array().unwrap();
@@ -4615,6 +4630,7 @@ mod tests {
             "drag",
             "fill-drag",
             "save-as",
+            "convert",
             "ribbon-click",
             "title-tab",
             "close-tab",

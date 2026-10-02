@@ -1080,6 +1080,8 @@ fn a_restore_without_a_sidecar_takes_the_fresh_load_s_mark() {
         repaired: false,
         stamp: None,
         converted: None,
+        binary_source: false,
+        compat: false,
     };
     // Repaired since the session was saved: a normal, saveable document.
     let mut t = restore_tab(&persisted(&good));
@@ -1491,6 +1493,8 @@ fn persisted_tab(
         repaired: false,
         stamp: None,
         converted: None,
+        binary_source: false,
+        compat: false,
     }
 }
 

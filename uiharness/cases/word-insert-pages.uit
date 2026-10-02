@@ -1,0 +1,74 @@
+# #652: Insert > Pages is Word's Cover Page, Blank Page and Page Break. A cover
+# design goes at the start of the document as a `Cover Pages` content control
+# ending in a page break; another design replaces it and keeps the text typed
+# into its placeholders; Remove Current Cover Page takes it out. Blank Page
+# inserts two page breaks at the caret.
+
+test the Pages group is Cover Page, Blank Page, Page Break
+  open copy:../fixtures/basic.docx
+  call ribbon-read {}
+  assert reply.tabs.2.name is Insert
+  assert reply.tabs.2.groups.0.title is Pages
+  assert reply.tabs.2.groups.0.commands.0.label is Cover Page
+  assert reply.tabs.2.groups.0.commands.0.key_tip is V
+  assert reply.tabs.2.groups.0.commands.1.label is Plain
+  assert reply.tabs.2.groups.0.commands.4.label is Ruled
+  assert reply.tabs.2.groups.0.commands.5.label is Remove Current Cover Page
+  assert reply.tabs.2.groups.0.commands.5.enabled is false
+  assert reply.tabs.2.groups.0.commands.6.label is Blank Page
+  assert reply.tabs.2.groups.0.commands.6.key_tip is NP
+  assert reply.tabs.2.groups.0.commands.7.label is Page Break
+
+test a cover is inserted, replaced keeping typed text, and removed
+  open copy:../fixtures/basic.docx
+  key alt n v
+  assert menu.target.ribbon.0 is Insert
+  assert menu.target.ribbon.1 is Pages
+  assert menu.target.ribbon.2 is Cover Page
+  call menu-read {}
+  assert reply.items.0.heading is Built-in
+  assert reply.items.1.label is Plain
+  assert reply.items.6.label is Remove Current Cover Page
+  assert reply.items.6.enabled is false
+  call menu-click {"label":"Title Band"}
+  assert status is Cover page: Title Band
+  assert dirty is true
+  call doc {}
+  assert reply.mail.text is ¶[Document title]¶[Document subtitle]¶[Abstract]¶[Author name]¶[Company name]¶[Date]
+  # The title placeholder is the cover's first paragraph: select its prompt and type.
+  call selection-set {"start":0,"end":16}
+  type Annual Report
+  call ribbon-click {"tab":"Insert","command":"Centered"}
+  assert status is Cover page: Centered
+  call ribbon-read {}
+  assert reply.tabs.2.groups.0.commands.5.enabled is true
+  call doc {}
+  # Centered has no Abstract: the typed title carries, the rest are prompts.
+  assert reply.mail.text is ¶Annual Report¶[Document subtitle]¶[Author name]¶[Company name]¶[Date]
+  shot window
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  shot window
+  call ribbon-click {"tab":"Insert","command":"Remove Current Cover Page"}
+  assert status is Cover page removed
+  call ribbon-read {}
+  assert reply.tabs.2.groups.0.commands.5.enabled is false
+  call doc {}
+  assert reply.mail.text is empty
+  key ctrl+z
+  call ribbon-read {}
+  assert reply.tabs.2.groups.0.commands.5.enabled is true
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+
+test Blank Page puts an empty page at the caret
+  open copy:../fixtures/header-inherit.docx
+  call selection-set {"start":2,"end":2}
+  key alt n n p
+  assert dirty is true
+  call doc {}
+  # "On" and its page break end a paragraph, the empty page is a paragraph
+  # holding the second break, and "e" starts the page after it, with the
+  # caret (a break and a paragraph mark each read as a ¶ here).
+  assert reply.mail.text is On¶¶¶¶e¶Two¶Three
+  assert reply.caret.offset is 6
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  shot window

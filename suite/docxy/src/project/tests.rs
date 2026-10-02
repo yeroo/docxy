@@ -104,6 +104,8 @@ fn persisted(path: Option<&Path>, hot: Option<&Path>, dirty: bool) -> PersistTab
         repaired: false,
         stamp: None,
         converted: None,
+        binary_source: false,
+        compat: false,
     }
 }
 
