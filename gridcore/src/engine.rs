@@ -1448,10 +1448,11 @@ impl Engine {
         if let Some((h, w)) = cse {
             return self.fill_cse(sheet, key, (h, w), old, result);
         }
+        let array_result = shaped && spill;
         // A modern formula of ours (not a loaded `t="array"` one, which keeps
         // its `<f>` attributes) that produced an array is a dynamic array from
         // now on, whatever it evaluates to later: it saves with a `cm`.
-        if shaped && spill {
+        if array_result {
             if let Some(cell) = sheet.cells.get_mut(&(r, c)) {
                 if cell.f_attrs.is_none() && !cell.is_dynamic() {
                     cell.meta.get_or_insert_default().dynamic = true;
@@ -1462,9 +1463,14 @@ impl Engine {
         match result {
             DynResult::Scalar(v) => {
                 changed.extend(clear_spill(sheet, s, (r, c), old, None));
+                // A 1x1 computed array (SEQUENCE(1)) is still a spill anchor:
+                // A1# resolves to the anchor cell, as in Excel (#934).
                 let entry = sheet.cells.entry((r, c)).or_default();
                 entry.value = value_to_cell(v);
-                entry.spill = None;
+                entry.spill = array_result.then_some((1, 1));
+                if array_result {
+                    self.note_spill(key, 1);
+                }
                 self.spill_blocked.remove(&key);
             }
             DynResult::Array(m) => {
@@ -3331,6 +3337,75 @@ mod tests {
         assert_eq!(value_at(&wb, "A3"), CellValue::Empty);
         assert_eq!(value_at(&wb, "A4"), CellValue::Empty);
         assert_eq!(value_at(&wb, "C1"), CellValue::Number(3.0));
+    }
+
+    #[test]
+    fn spill_ref_to_a_dynamic_array_shrunk_to_one_cell_is_its_anchor() {
+        // #934: a dynamic array that shrinks to a 1x1 result keeps its spill
+        // extent, so A1# resolves to the anchor cell (ROWS = 1), as in Excel.
+        let mut wb = wb_one_sheet(&[
+            ("A1", array_formula("SEQUENCE(B1)")),
+            ("B1", Cell::number(2.0)),
+            ("C1", Cell::formula("ROWS(A1#)")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "A1"), CellValue::Number(1.0));
+        assert_eq!(value_at(&wb, "A2"), CellValue::Number(2.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(2.0));
+        // Shrinking to one row keeps a 1x1 extent; the spill ref still resolves.
+        set(&mut eng, &mut wb, "B1", Cell::number(1.0));
+        assert_eq!(value_at(&wb, "A1"), CellValue::Number(1.0));
+        assert_eq!(value_at(&wb, "A2"), CellValue::Empty);
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(1.0));
+        assert_eq!(wb.sheets[0].cell(0, 0).unwrap().spill, Some((1, 1)));
+        // Growing again restores the full spill.
+        set(&mut eng, &mut wb, "B1", Cell::number(3.0));
+        assert_eq!(value_at(&wb, "A3"), CellValue::Number(3.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(3.0));
+    }
+
+    #[test]
+    fn typed_one_by_one_array_is_a_spill_anchor() {
+        // #934 AC2: a typed formula whose computed array is 1x1 serves A1#.
+        let mut wb = wb_one_sheet(&[]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "A1", Cell::formula("SEQUENCE(1,1,7)"));
+        set(&mut eng, &mut wb, "B1", Cell::formula("ROWS(A1#)"));
+        set(&mut eng, &mut wb, "C1", Cell::formula("SUM(A1#)"));
+        assert_eq!(value_at(&wb, "A1"), CellValue::Number(7.0));
+        assert_eq!(value_at(&wb, "B1"), CellValue::Number(1.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(7.0));
+    }
+
+    #[test]
+    fn scalar_results_are_not_spill_anchors() {
+        // #934 AC3: only an array-shaped result gets an extent. A typed
+        // scalar, a typed single-cell range, and a legacy (no t="array")
+        // formula never serve a spill reference.
+        let mut wb = wb_one_sheet(&[
+            ("C1", Cell::formula("SEQUENCE(1)")), // loaded plain: legacy
+            ("D1", Cell::number(2.0)),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        // A legacy SEQUENCE(1) implicit-intersects to its value; no extent.
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(1.0));
+        assert_eq!(spill_of(&wb, "C1"), None, "legacy");
+        set(&mut eng, &mut wb, "A1", Cell::formula("5"));
+        set(&mut eng, &mut wb, "B1", Cell::formula("D1"));
+        assert_eq!(spill_of(&wb, "A1"), None, "typed scalar");
+        assert_eq!(spill_of(&wb, "B1"), None, "typed single-cell range");
+        set(&mut eng, &mut wb, "E1", Cell::formula("ROWS(A1#)"));
+        set(&mut eng, &mut wb, "F1", Cell::formula("ROWS(B1#)"));
+        set(&mut eng, &mut wb, "G1", Cell::formula("ROWS(C1#)"));
+        for name in ["E1", "F1", "G1"] {
+            assert_eq!(
+                value_at(&wb, name),
+                CellValue::Error("#REF!".into()),
+                "{name}"
+            );
+        }
     }
 
     #[test]

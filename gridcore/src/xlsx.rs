@@ -3486,8 +3486,10 @@ fn cell_xml(
     let anchor = cell_name(row, col);
     let (f_xml, array_f) = match (&cell.formula, &cell.f_attrs) {
         // A spilling anchor writes fresh array attributes — its extent may
-        // have changed since load, so any stored ref would be stale.
-        (Some(src), _) if cell.spill.is_some() && !src.is_empty() => {
+        // have changed since load, so any stored ref would be stale. A 1x1
+        // extent is no spill beyond the anchor: it falls to the arms below,
+        // which write the anchor-only ref (or a plain `<f>`) as before.
+        (Some(src), _) if cell.spill.is_some_and(|ext| ext != (1, 1)) && !src.is_empty() => {
             let (h, w) = cell.spill.unwrap();
             let f = format!(
                 "<f t=\"array\" ref=\"{}:{}\">{}</f>",
@@ -11195,6 +11197,27 @@ b",
             ),
             "{ws}"
         );
+    }
+
+    #[test]
+    fn one_by_one_spill_anchor_survives_save_and_reload() {
+        // #934 AC4+AC5: a 1x1 dynamic array saves exactly as before (an
+        // anchor-only ref, never B1:B1) and reloads as a spill anchor, so
+        // B1# still resolves after the round trip.
+        let (pkg, _) = typed_book(&[((0, 1), "SEQUENCE(1)"), ((0, 2), "ROWS(B1#)")]);
+        assert_eq!(val(&pkg, "B1"), CellValue::Number(1.0));
+        assert_eq!(val(&pkg, "C1"), CellValue::Number(1.0));
+        let (mut re, ws) = resaved(&pkg);
+        assert!(
+            ws.contains(
+                r#"<c r="B1" cm="1"><f t="array" ref="B1">_xlfn.SEQUENCE(1)</f><v>1</v></c>"#
+            ),
+            "{ws}"
+        );
+        let mut eng = crate::engine::Engine::new(&re.workbook);
+        eng.recalc_all(&mut re.workbook);
+        assert_eq!(val(&re, "B1"), CellValue::Number(1.0));
+        assert_eq!(val(&re, "C1"), CellValue::Number(1.0));
     }
 
     #[test]

@@ -127,8 +127,10 @@ pub struct Cell {
     /// (rows, cols) of the array anchored here, including this cell: a
     /// dynamic array's spill, or the fixed block a legacy CSE array filled —
     /// set by the recalc engine (or from `<f t="array" ref="…">` at load).
-    /// The other cells are plain values owned by this anchor. `None` for a
-    /// scalar dynamic-array result, a one-cell CSE block, or a blocked one.
+    /// The other cells are plain values owned by this anchor. `Some((1, 1))`
+    /// for a modern formula whose array-shaped result is 1x1 (`SEQUENCE(1)`),
+    /// so `A1#` resolves to the anchor; `None` for a non-array result (a
+    /// scalar or a single-cell range), a one-cell CSE block, or a blocked one.
     pub spill: Option<(u32, u32)>,
     /// `<c>` metadata attributes kept from the file (`cm`, `vm`, `ph`), and
     /// what the engine knows about a formula typed here (`modern`,
