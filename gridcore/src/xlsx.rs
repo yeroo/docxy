@@ -3616,13 +3616,20 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
         }
     }
 
-    // <cols> — regenerate from the model when we have definitions.
-    if !sheet.col_defs.is_empty() {
+    // <cols> — regenerate from the model when we have definitions, and drop
+    // the element when the last one went (an ungrouped column's).
+    if sheet.col_defs.is_empty() {
+        if worksheet_child_span(&out, "cols").is_some() {
+            out = remove_worksheet_child(&out, "cols");
+        }
+    } else {
         let mut cols_xml = String::from("<cols>");
         for d in &sheet.col_defs {
+            // Excel reads a `<col>` with no width as zero wide: one created
+            // for an outline or a hide gets the sheet's default.
             let width = match d.width {
                 Some(w) => format!(" width=\"{w}\" customWidth=\"1\""),
-                None => String::new(),
+                None => format!(" width=\"{}\"", sheet.default_col_file_width()),
             };
             cols_xml.push_str(&format!(
                 "<col min=\"{}\" max=\"{}\"{width}{}/>",
@@ -17016,7 +17023,52 @@ mod ct_worksheet_order_tests {
         let ws = saved_sheet(&pkg);
         assert!(ws.contains(r#"<row r="1" hidden="1">"#), "{ws}");
         assert!(ws.contains(r#"<row r="4" outlineLevel="1"/>"#), "{ws}");
-        assert!(ws.contains(r#"<col min="3" max="3" hidden="1"/>"#), "{ws}");
+        assert!(
+            ws.contains(r#"<col min="3" max="3" width="9.140625" hidden="1"/>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn grouped_columns_keep_a_width_and_ungrouped_ones_go() {
+        use crate::outline::{Axis, group, ungroup};
+        // No `<cols>` at all: the definitions Group makes need a width, or
+        // Excel opens the columns zero wide.
+        let mut pkg = loaded(&format!(r#"<dimension ref="A1:B2"/>{ROWS}{MARGINS}"#));
+        group(&mut pkg.workbook.sheets[0], Axis::Cols, 2, 3).unwrap();
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert!(
+            ws.contains(r#"<cols><col min="3" max="4" width="9.140625" outlineLevel="1"/></cols>"#),
+            "{ws}"
+        );
+        // Ungrouped in the same session, nothing is left to say: the element
+        // goes.
+        let mut fresh = pkg.clone();
+        ungroup(&mut fresh.workbook.sheets[0], Axis::Cols, 2, 3).unwrap();
+        assert!(fresh.workbook.sheets[0].col_defs.is_empty());
+        let ws = saved_sheet(&fresh);
+        assert!(!ws.contains("<col"), "{ws}");
+        // After a reload the definition holds the width it was saved with,
+        // and keeps it.
+        let mut pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        ungroup(&mut pkg.workbook.sheets[0], Axis::Cols, 2, 3).unwrap();
+        let ws = saved_sheet(&pkg);
+        assert!(
+            ws.contains(r#"<col min="3" max="4" width="9.140625""#),
+            "{ws}"
+        );
+        assert!(!ws.contains("outlineLevel"), "{ws}");
+        // A sheet's own default width is the one written.
+        let mut pkg = loaded(&format!(
+            r#"<sheetFormatPr defaultColWidth="12.5" defaultRowHeight="15"/>{ROWS}{MARGINS}"#
+        ));
+        group(&mut pkg.workbook.sheets[0], Axis::Cols, 0, 0).unwrap();
+        let ws = saved_sheet(&pkg);
+        assert!(
+            ws.contains(r#"<col min="1" max="1" width="12.5" outlineLevel="1"/>"#),
+            "{ws}"
+        );
     }
 }
 

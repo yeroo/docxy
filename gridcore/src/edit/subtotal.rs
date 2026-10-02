@@ -158,7 +158,8 @@ pub fn is_subtotal_row(s: &Sheet, row: u32) -> bool {
 
 /// The block of non-blank rows around `row` that Subtotal and Remove All
 /// work on, as (top, bottom, has_header): the first row is a header when its
-/// cell in `col` is text. `None` when `row` is blank.
+/// cell in `col` is text and it is not a total row (a grand total placed on
+/// top, with summaries above). `None` when `row` is blank.
 pub fn subtotal_region(s: &Sheet, row: u32, col: u32) -> Option<(u32, u32, bool)> {
     let used = |r: u32| {
         s.cells
@@ -363,6 +364,21 @@ pub fn subtotal(
         }
     }
     Ok(groups.len() + 1)
+}
+
+/// Whether any sheet differs in what the outline and Subtotal commands
+/// change: cells, row attributes (levels, hidden, collapsed), column
+/// definitions, the outline settings and page breaks. The apps use it to
+/// record an undo step only for a command that changed something.
+pub fn sheets_differ(a: &[Sheet], b: &[Sheet]) -> bool {
+    a.len() != b.len()
+        || a.iter().zip(b).any(|(x, y)| {
+            x.cells != y.cells
+                || x.row_attrs != y.row_attrs
+                || x.col_defs != y.col_defs
+                || x.outline != y.outline
+                || x.row_breaks != y.row_breaks
+        })
 }
 
 /// The group key as the total's label shows it.

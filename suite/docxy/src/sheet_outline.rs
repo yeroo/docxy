@@ -62,20 +62,6 @@ fn selected_axis(v: &SheetView) -> Option<(Axis, u32, u32)> {
     }
 }
 
-/// Whether any sheet differs in what Subtotal and Remove All change: cells,
-/// row attributes (levels, hidden, collapsed), columns, the outline settings
-/// and page breaks.
-fn sheets_changed(a: &[Sheet], b: &[Sheet]) -> bool {
-    a.len() != b.len()
-        || a.iter().zip(b).any(|(x, y)| {
-            x.cells != y.cells
-                || x.row_attrs != y.row_attrs
-                || x.col_defs != y.col_defs
-                || x.outline != y.outline
-                || x.row_breaks != y.row_breaks
-        })
-}
-
 /// Excel's refusal on a protected sheet: the outline is an edit.
 const PROTECTED: &str =
     "The sheet is protected: unprotect it (Review › Protect Sheet) to change the outline.";
@@ -176,7 +162,7 @@ pub(crate) fn run(tab: &mut DocTab, cmd: Cmd) {
                     .filter(|&a| outline::max_level(s, a) > 0)
                     .collect();
                 if axes.is_empty() {
-                    return Err(OutlineError::NotGrouped);
+                    return Err(OutlineError::NoOutline);
                 }
                 for a in axes {
                     outline::show_level(s, a, n);
@@ -530,7 +516,7 @@ fn apply_subtotal(
     };
     // Remove All also drops page breaks, levels and hidden flags, so only a
     // comparison tells whether it did anything.
-    if !sheets_changed(&before, &v.pkg.workbook.sheets) {
+    if !gridcore::edit::sheets_differ(&before, &v.pkg.workbook.sheets) {
         tab.dialogs.pop();
         tab.status = "There are no subtotals to remove".into();
         return Ok(());
@@ -720,8 +706,10 @@ mod tests {
         assert_eq!(undo_len(&mut t), 8);
         run(&mut t, Cmd::ClearOutline);
         assert_eq!(undo_len(&mut t), 8, "nothing left to clear");
+        assert_eq!(&*t.status, OutlineError::NoOutline.to_string());
         run(&mut t, Cmd::ShowLevel(1));
         assert_eq!(undo_len(&mut t), 8, "no outline to show a level of");
+        assert_eq!(&*t.status, "There is no outline on this sheet.");
     }
 
     #[test]

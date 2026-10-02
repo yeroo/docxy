@@ -5869,7 +5869,7 @@ impl App {
             }
             Ok(msg) => {
                 self.status = Some(msg);
-                if !sheets_differ(&before.sheets, &self.pkg.workbook.sheets) {
+                if !gridcore::edit::sheets_differ(&before.sheets, &self.pkg.workbook.sheets) {
                     return Ok(false);
                 }
                 self.rebuild_engine();
@@ -6010,7 +6010,7 @@ impl App {
     /// Settings…: the outline direction dialog.
     fn open_outline_settings(&mut self) {
         self.outline_dialog = Some(outlinedlg::Dialog::Settings(
-            outlinedlg::SettingsDialog::new(self.sheet().outline),
+            outlinedlg::SettingsDialog::new(self.sheet, self.sheet().outline),
         ));
     }
 
@@ -6044,7 +6044,7 @@ impl App {
             .collect();
         let checked = gridcore::edit::numeric_columns(sh, top + u32::from(header), bottom, c);
         self.outline_dialog = Some(outlinedlg::Dialog::Subtotal(
-            outlinedlg::SubtotalDialog::new((top, bottom, header), cols, c, &checked),
+            outlinedlg::SubtotalDialog::new(self.sheet, (top, bottom, header), cols, c, &checked),
         ));
     }
 
@@ -6054,7 +6054,6 @@ impl App {
             return;
         };
         let outcome = d.key(code);
-        let s = self.sheet;
         match outcome {
             outlinedlg::Outcome::Pending => {}
             outlinedlg::Outcome::Cancel => self.outline_dialog = None,
@@ -6063,7 +6062,7 @@ impl App {
                     return;
                 };
                 let done = self.try_structural(|wb| {
-                    let n = gridcore::edit::subtotal(wb, s, d.top, d.bottom, &opts)
+                    let n = gridcore::edit::subtotal(wb, d.sheet, d.top, d.bottom, &opts)
                         .map_err(|e| e.to_string())?;
                     Ok(format!(
                         "Inserted {n} subtotal row{}",
@@ -6080,7 +6079,7 @@ impl App {
                     return;
                 };
                 let _ = self.try_structural(|wb| {
-                    let n = gridcore::edit::remove_subtotals(wb, s, d.top, d.bottom);
+                    let n = gridcore::edit::remove_subtotals(wb, d.sheet, d.top, d.bottom);
                     Ok(format!(
                         "Removed {n} subtotal row{}",
                         if n == 1 { "" } else { "s" }
@@ -6088,9 +6087,11 @@ impl App {
                 });
             }
             outlinedlg::Outcome::Settings(o) => {
-                self.outline_dialog = None;
+                let Some(outlinedlg::Dialog::Settings(d)) = self.outline_dialog.take() else {
+                    return;
+                };
                 let _ = self.try_structural(|wb| {
-                    wb.sheets[s].outline = o;
+                    wb.sheets[d.sheet].outline = o;
                     Ok("Outline settings changed".into())
                 });
             }
@@ -9026,6 +9027,11 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
         }
         return false;
     }
+    // An outline dialog is modal: a click under it (a sheet tab, a ribbon
+    // command) must not change what its OK acts on.
+    if app.outline_dialog.is_some() {
+        return false;
+    }
     // The welcome screen owns the whole terminal; handle its clicks here so
     // nothing leaks to the hidden workbook behind it. Hovering highlights an
     // item, clicking activates it.
@@ -9145,19 +9151,6 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
         _ => {}
     }
     false
-}
-
-/// Whether any sheet differs in what an outline or subtotal command can
-/// change, so a command that changed nothing records no undo step.
-fn sheets_differ(a: &[Sheet], b: &[Sheet]) -> bool {
-    a.len() != b.len()
-        || a.iter().zip(b).any(|(x, y)| {
-            x.cells != y.cells
-                || x.row_attrs != y.row_attrs
-                || x.col_defs != y.col_defs
-                || x.outline != y.outline
-                || x.row_breaks != y.row_breaks
-        })
 }
 
 /// The outline level buttons `1 2 …` (one per level, plus one), in a field
@@ -12616,6 +12609,39 @@ mod tests {
         assert_eq!(app.undo.len(), undo_len);
         app.outline_dialog_key(KeyCode::Esc);
         assert!(app.outline_dialog.is_none());
+    }
+
+    #[test]
+    fn an_outline_dialog_acts_on_its_own_sheet_and_holds_the_mouse() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = subtotal_app();
+        app.pkg.workbook.sheets.push(Sheet {
+            name: "Sheet2".into(),
+            ..Sheet::default()
+        });
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        app.ribbon_act(ribbon::Act::Subtotal);
+        // A click on the Sheet2 tab under the dialog does nothing.
+        let &(_, x, _) = app.tab_spans.iter().find(|&&(i, _, _)| i == 1).unwrap();
+        let y = app.grid_area.y + app.grid_area.height;
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+        assert_eq!(app.sheet, 0);
+        assert!(app.outline_dialog.is_some());
+        // Even with another sheet active, OK lands where the dialog opened.
+        app.sheet = 1;
+        app.outline_dialog_key(KeyCode::Enter);
+        assert_eq!(app.pkg.workbook.sheets[0].max_row_outline(), 2);
+        assert!(app.pkg.workbook.sheets[1].cells.is_empty());
+        assert_eq!(app.pkg.workbook.sheets[1].max_row_outline(), 0);
     }
 
     #[test]

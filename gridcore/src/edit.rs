@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 mod subtotal;
 pub use subtotal::{
     SubtotalError, SubtotalFunc, SubtotalOptions, is_subtotal_row, numeric_columns,
-    remove_subtotals, subtotal, subtotal_region,
+    remove_subtotals, sheets_differ, subtotal, subtotal_region,
 };
 
 use crate::entry::EntryCtx;

@@ -1618,11 +1618,15 @@ impl Sheet {
 
     /// Merge adjacent definitions that say the same thing, so a per-column
     /// edit across a range leaves one `<col>` for the range, not one per
-    /// column.
+    /// column; and drop the ones left saying nothing (no width, no
+    /// attributes), such as a column's after Ungroup.
     fn coalesce_cols(&mut self) {
         let same = |a: &str, b: &str| xml_attr_items(a) == xml_attr_items(b);
         let mut out: Vec<ColDef> = Vec::with_capacity(self.col_defs.len());
         for d in self.col_defs.drain(..) {
+            if d.width.is_none() && xml_attr_items(&d.attrs).is_empty() {
+                continue;
+            }
             match out.last_mut() {
                 Some(p) if p.max + 1 == d.min && p.width == d.width && same(&p.attrs, &d.attrs) => {
                     p.max = d.max;
@@ -1631,6 +1635,17 @@ impl Sheet {
             }
         }
         self.col_defs = out;
+    }
+
+    /// The width, in `<col width>` units, of a column with none of its own:
+    /// `<sheetFormatPr defaultColWidth>`, else Excel's from `baseColWidth`
+    /// with the default font (9.140625 for the usual 8 characters).
+    pub fn default_col_file_width(&self) -> f64 {
+        self.format.default_col_width.unwrap_or_else(|| {
+            const MDW: f64 = 7.0; // Calibri 11's maximum digit width, px
+            let px = ((f64::from(self.format.base_col_width) * MDW + 5.0) / 8.0).ceil() * 8.0;
+            (px / MDW * 256.0).trunc() / 256.0
+        })
     }
 
     /// Set one column's width, splitting any range definition that covers it.

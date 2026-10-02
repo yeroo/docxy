@@ -34,6 +34,8 @@ pub enum Outcome {
 /// The Subtotal dialog over one region.
 #[derive(Clone, Debug)]
 pub struct SubtotalDialog {
+    /// The sheet the dialog opened on: OK and Remove All act there.
+    pub sheet: usize,
     /// The region (top, bottom) and whether its first row is a header.
     pub top: u32,
     pub bottom: u32,
@@ -69,6 +71,7 @@ impl SubtotalDialog {
     /// Excel's defaults: group at `group_col`, Sum, the `checked` columns,
     /// Replace and Summary below on.
     pub fn new(
+        sheet: usize,
         (top, bottom, has_header): (u32, u32, bool),
         cols: Vec<(u32, String)>,
         group_col: u32,
@@ -77,6 +80,7 @@ impl SubtotalDialog {
         let group = cols.iter().position(|(c, _)| *c == group_col).unwrap_or(0);
         let add_to = cols.iter().map(|(c, _)| checked.contains(c)).collect();
         SubtotalDialog {
+            sheet,
             top,
             bottom,
             has_header,
@@ -206,13 +210,19 @@ impl SubtotalDialog {
 /// The outline Settings dialog.
 #[derive(Clone, Debug)]
 pub struct SettingsDialog {
+    /// The sheet the dialog opened on.
+    pub sheet: usize,
     pub settings: OutlineSettings,
     pub focus: usize,
 }
 
 impl SettingsDialog {
-    pub fn new(settings: OutlineSettings) -> SettingsDialog {
-        SettingsDialog { settings, focus: 0 }
+    pub fn new(sheet: usize, settings: OutlineSettings) -> SettingsDialog {
+        SettingsDialog {
+            sheet,
+            settings,
+            focus: 0,
+        }
     }
 
     pub fn key(&mut self, code: KeyCode) -> Outcome {
@@ -387,6 +397,7 @@ mod tests {
 
     fn dialog() -> SubtotalDialog {
         SubtotalDialog::new(
+            0,
             (0, 5, true),
             vec![(0, "Grp".into()), (1, "Amt".into()), (2, "Qty".into())],
             0,
@@ -450,7 +461,7 @@ mod tests {
 
     #[test]
     fn settings_dialog_toggles_and_confirms() {
-        let mut d = SettingsDialog::new(OutlineSettings::default());
+        let mut d = SettingsDialog::new(0, OutlineSettings::default());
         d.key(KeyCode::Char(' '));
         d.key(KeyCode::Down);
         d.key(KeyCode::Char(' '));

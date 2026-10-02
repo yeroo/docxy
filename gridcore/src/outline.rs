@@ -41,6 +41,8 @@ pub enum OutlineError {
     NoGroup,
     /// Auto Outline found no summary formulas.
     NoSummaries,
+    /// A level button or Clear Outline on a sheet with no outline.
+    NoOutline,
 }
 
 impl fmt::Display for OutlineError {
@@ -50,6 +52,7 @@ impl fmt::Display for OutlineError {
             OutlineError::NotGrouped => "Cannot ungroup: there is no outline here.",
             OutlineError::NoGroup => "There is no group here to show or hide.",
             OutlineError::NoSummaries => "Cannot create an outline: no summary formulas found.",
+            OutlineError::NoOutline => "There is no outline on this sheet.",
         })
     }
 }
@@ -400,7 +403,7 @@ pub fn hide_detail(s: &mut Sheet, axis: Axis, i: u32) -> Result<(), OutlineError
 /// the sheet has no outline.
 pub fn clear_outline(s: &mut Sheet) -> Result<(), OutlineError> {
     if max_level(s, Axis::Rows) == 0 && max_level(s, Axis::Cols) == 0 {
-        return Err(OutlineError::NotGrouped);
+        return Err(OutlineError::NoOutline);
     }
     clear_axis(s, Axis::Rows);
     clear_axis(s, Axis::Cols);
@@ -692,7 +695,7 @@ mod tests {
         assert!(!(0..10).any(|r| s.row_collapsed(r)));
         assert!(!s.col_collapsed(4));
         assert!(s.row_hidden(2) && s.col_hidden(2), "hidden stays hidden");
-        assert_eq!(clear_outline(&mut s), Err(OutlineError::NotGrouped));
+        assert_eq!(clear_outline(&mut s), Err(OutlineError::NoOutline));
     }
 
     #[test]
