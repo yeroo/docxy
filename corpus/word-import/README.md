@@ -41,6 +41,7 @@ The rule is that **the `.docx` Word saved is the truth**. When an importer disag
 
 - The generator drives a real Word through COM and needs a human-attended Word.
 - Word may stop a save on a prompt that only a person can answer (`-Visible` shows it).
-- On a machine where docxy's own `wordcomshim` is registered for `Word.Application`, `New-Object -ComObject Word.Application` is the shim, not Word. The script starts `WINWORD.EXE` itself for that reason.
+- On a machine where docxy's own `wordcomshim` is registered for `Word.Application`, that ProgID gets the shim, not Word, and the shim ignores the save format. The script refuses when `Word.Application` resolves to anything but `WINWORD.EXE`. Unregister the shim for the run: under `HKCU\Software\Classes`, remove `Word.Application`, `Word.Application.16` and `CLSID\{000209FF-0000-0000-C000-000000000046}`.
+- The script refuses while any Word is running, because it ends by quitting the Word it drove.
 - Tests never need Word: the files are committed as Word wrote them.
 - `.gitattributes` marks this folder `-text`, so the CRLF in the `.rtf` and `.htm` is kept.
