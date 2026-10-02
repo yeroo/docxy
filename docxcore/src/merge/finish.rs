@@ -246,32 +246,79 @@ impl Fill<'_> {
     }
 }
 
-/// Whether raw XML is a marker whose `w:id` must stay unique.
-fn is_id_marker(raw: &str) -> bool {
-    [
-        "<w:bookmarkStart",
-        "<w:bookmarkEnd",
-        "<w:commentRangeStart",
-        "<w:commentRangeEnd",
-        "w:commentReference",
-    ]
-    .iter()
-    .any(|m| raw.contains(m))
+/// The elements whose `w:id` must stay unique across the copies.
+const ID_MARKERS: [&str; 7] = [
+    "w:bookmarkStart",
+    "w:bookmarkEnd",
+    "w:commentRangeStart",
+    "w:commentRangeEnd",
+    "w:commentReference",
+    "w:footnoteReference",
+    "w:endnoteReference",
+];
+
+/// `raw` without its id markers, and without a run that held nothing but
+/// one (and its properties). Everything else stays: the text of a moved
+/// range, a content control or a custom XML element is kept in every copy.
+fn strip_marker_xml(raw: &str) -> String {
+    let mut xml = raw.to_string();
+    for name in ID_MARKERS {
+        while let Some((a, b)) = crate::sect::find_element(&xml, name) {
+            xml.replace_range(a..b, "");
+        }
+    }
+    if xml.len() == raw.len() {
+        return xml;
+    }
+    // Runs the markers emptied.
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml.as_str();
+    while let Some((a, b)) = crate::sect::find_element(rest, "w:r") {
+        out.push_str(&rest[..a]);
+        let run = &rest[a..b];
+        // What the run holds besides its properties (nothing for `<w:r/>`).
+        let open_end = run.find('>').map_or(run.len(), |gt| gt + 1);
+        let inner = if run[..open_end].ends_with("/>") {
+            ""
+        } else {
+            run[open_end..]
+                .strip_suffix("</w:r>")
+                .unwrap_or(&run[open_end..])
+        };
+        let inner = crate::sect::remove_element(inner, "w:rPr");
+        if !inner.trim().is_empty() {
+            out.push_str(run);
+        }
+        rest = &rest[b..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Drop bookmarks, comment anchors and note references from a later copy,
 /// also inside links and tracked changes (whose raw XML is then rebuilt from
-/// their content on save).
+/// their content on save). A container holding one keeps all but the
+/// marker; nothing that holds text is dropped.
 fn strip_ids(blocks: &mut Vec<Block>) {
-    /// Whether anything was dropped.
+    /// Whether anything was dropped or changed.
     fn inlines(items: &mut Vec<Inline>) -> bool {
-        let n = items.len();
-        items.retain(|i| match i {
-            Inline::Raw(raw) | Inline::UnsupportedRevision { raw, .. } => !is_id_marker(raw),
-            Inline::FootnoteRef { .. } => false,
+        let mut changed = false;
+        items.retain_mut(|i| match i {
+            Inline::Raw(raw) | Inline::UnsupportedRevision { raw, .. } => {
+                let kept = strip_marker_xml(raw);
+                if kept.len() == raw.len() {
+                    return true;
+                }
+                changed = true;
+                *raw = kept;
+                !raw.trim().is_empty()
+            }
+            Inline::FootnoteRef { .. } => {
+                changed = true;
+                false
+            }
             _ => true,
         });
-        let mut changed = items.len() != n;
         for i in items.iter_mut() {
             match i {
                 Inline::Hyperlink(h) => {
@@ -296,7 +343,13 @@ fn strip_ids(blocks: &mut Vec<Block>) {
         }
         changed
     }
-    blocks.retain(|b| !matches!(b, Block::Raw(raw) if is_id_marker(raw.trim_start())));
+    blocks.retain_mut(|b| match b {
+        Block::Raw(raw) => {
+            *raw = strip_marker_xml(raw);
+            !raw.trim().is_empty()
+        }
+        _ => true,
+    });
     for b in blocks {
         match b {
             Block::Paragraph(p) => {
@@ -564,6 +617,71 @@ mod tests {
         assert!(xml.contains("Amy"), "{xml}");
         // The insertion's own text is in every copy.
         assert_eq!(xml.matches(">ins<").count(), 3, "{xml}");
+    }
+
+    /// r2 M1: a container that holds a marker loses only the marker. The
+    /// moved text of a w:moveTo and a custom XML element's run stay in every
+    /// copy; their bookmark and comment reference only in the first.
+    #[test]
+    fn containers_keep_their_text_and_lose_only_their_markers() {
+        let r = people();
+        let xml = format!(
+            "<w:document xmlns:w=\"{W}\"><w:body><w:p>\
+             <w:moveTo w:id=\"70\" w:author=\"A\" w:date=\"2026-01-01T00:00:00Z\">\
+             <w:r><w:t>moved</w:t></w:r><w:r><w:commentReference w:id=\"5\"/></w:r>\
+             </w:moveTo>\
+             <w:customXml w:element=\"x\"><w:bookmarkStart w:id=\"6\" w:name=\"c\"/>\
+             <w:r><w:t>custom</w:t></w:r><w:bookmarkEnd w:id=\"6\"/></w:customXml>\
+             </w:p></w:body></w:document>"
+        );
+        let doc = crate::load::parse_document_xml(&xml, &Default::default());
+        let Block::Paragraph(p) = &doc.body[0] else {
+            panic!()
+        };
+        assert!(
+            p.content.iter().any(
+                |i| matches!(i, Inline::UnsupportedRevision { raw, .. } if raw.contains("moved"))
+            ),
+            "{:?}",
+            p.content
+        );
+        let main = new_package(doc);
+        let out = merge_package(&main, &r, &opts(&r, MainDocType::Letters)).unwrap();
+        let xml = crate::serialize::document_to_xml(&out.document);
+        assert_eq!(xml.matches(">moved<").count(), 3, "{xml}");
+        assert_eq!(xml.matches(">custom<").count(), 3, "{xml}");
+        assert_eq!(xml.matches("<w:moveTo ").count(), 3, "{xml}");
+        assert_eq!(
+            xml.matches("<w:commentReference w:id=\"5\"").count(),
+            1,
+            "{xml}"
+        );
+        assert_eq!(
+            xml.matches("<w:bookmarkStart w:id=\"6\"").count(),
+            1,
+            "{xml}"
+        );
+        assert_eq!(xml.matches("<w:bookmarkEnd w:id=\"6\"").count(), 1, "{xml}");
+    }
+
+    #[test]
+    fn strip_marker_xml_keeps_everything_else() {
+        assert_eq!(
+            strip_marker_xml("<w:bookmarkStart w:id=\"1\" w:name=\"a\"/>"),
+            ""
+        );
+        assert_eq!(
+            strip_marker_xml("<w:r><w:rPr><w:b/></w:rPr><w:endnoteReference w:id=\"2\"/></w:r>"),
+            ""
+        );
+        assert_eq!(
+            strip_marker_xml(
+                "<w:sdt><w:sdtContent><w:r><w:t>k</w:t></w:r><w:r><w:footnoteReference w:id=\"3\"/></w:r></w:sdtContent></w:sdt>"
+            ),
+            "<w:sdt><w:sdtContent><w:r><w:t>k</w:t></w:r></w:sdtContent></w:sdt>"
+        );
+        let plain = "<w:r><w:t>text</w:t></w:r>";
+        assert_eq!(strip_marker_xml(plain), plain);
     }
 
     const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
