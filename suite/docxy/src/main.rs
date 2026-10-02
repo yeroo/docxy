@@ -2736,6 +2736,12 @@ struct DocTab {
     /// the body ([`live_comments`]), so undoing Add Comment removes it and
     /// redo brings it back. Saves keep the set; a load starts it empty.
     session_comment_ids: std::collections::HashSet<String>,
+    /// Every comment id this document has had since it loaded: those of
+    /// its comments and body markers then ([`seed_used_comment_ids`]), and
+    /// each one allocated since. It never shrinks, not on Delete Comment or
+    /// Remove All, since an undo can bring any of their markers back; a new
+    /// comment never takes one of them (#620).
+    used_comment_ids: std::collections::HashSet<String>,
     /// The original package this doc was loaded from, kept so a save re-serializes
     /// only document.xml back into it and preserves every other part (footnotes,
     /// headers/footers, images, themes, …). `None` for a new empty document.
@@ -4614,7 +4620,7 @@ impl Loaded {
         path: Option<PathBuf>,
         dirty: bool,
     ) -> DocTab {
-        DocTab {
+        let mut tab = DocTab {
             kind,
             title,
             path,
@@ -4623,6 +4629,7 @@ impl Loaded {
             status: self.status,
             comments: self.comments,
             session_comment_ids: Default::default(),
+            used_comment_ids: Default::default(),
             mail: mailings_tab::MailState::from_pkg(self.pkg.as_ref()),
             pkg: self.pkg,
             notes: self.notes,
@@ -4639,7 +4646,9 @@ impl Loaded {
             converted_docx: self.converted_docx,
             pending_conversion: false,
             import: self.import,
-        }
+        };
+        seed_used_comment_ids(&mut tab);
+        tab
     }
 }
 
@@ -4762,6 +4771,7 @@ fn finish_pending_conversion(tab: &mut DocTab) {
     tab.surface = Surface::Doc(Editor::new(l.doc));
     tab.comments = l.comments;
     tab.session_comment_ids.clear();
+    seed_used_comment_ids(tab);
     tab.notes = l.notes;
     tab.mail = mailings_tab::MailState::from_pkg(l.pkg.as_ref());
     tab.pkg = l.pkg;
@@ -5005,6 +5015,7 @@ fn sheet_tab_from_path(path: &PathBuf, repair: bool) -> DocTab {
         status,
         comments: vec![],
         session_comment_ids: Default::default(),
+        used_comment_ids: Default::default(),
         pkg: None,
         notes: vec![],
         markdown: false,
@@ -7768,6 +7779,7 @@ fn protected_rollback(tab: &mut DocTab) {
             tab.surface = Surface::Doc(Editor::new(l.doc));
             tab.comments = l.comments;
             tab.session_comment_ids.clear();
+            seed_used_comment_ids(tab);
             tab.notes = l.notes;
             tab.mail = mailings_tab::MailState::from_pkg(l.pkg.as_ref());
             tab.pkg = l.pkg;
@@ -7960,6 +7972,18 @@ fn autorecover_prepare(tabs: &mut [DocTab]) -> bool {
     tabs.iter().any(|t| t.dirty)
 }
 
+/// Start `tab`'s used comment ids afresh from what it holds now: its
+/// comments' ids and the ids of the comment markers in its body. Called
+/// wherever a document is loaded into the tab (#620).
+fn seed_used_comment_ids(tab: &mut DocTab) {
+    let mut used: std::collections::HashSet<String> =
+        tab.comments.iter().map(|c| c.id.clone()).collect();
+    if let Surface::Doc(ed) = &tab.surface {
+        used.extend(docxcore::inspect::comment_marker_ids(&ed.doc));
+    }
+    tab.used_comment_ids = used;
+}
+
 /// The comments `tab` lists and saves (#620): every one it loaded, and each
 /// one added since while a marker with its id is in `doc`'s body. Undo of
 /// Add Comment takes the markers, so the comment goes; [`doc_to_docx`] then
@@ -8003,6 +8027,7 @@ fn add_doc_comment(tab: &mut DocTab, text: String, identity: (String, String)) -
         .iter()
         .map(|c| &c.id)
         .chain(&tab.session_comment_ids)
+        .chain(&tab.used_comment_ids)
         .chain(&base)
         .chain(&in_body)
         .filter_map(|id| id.parse::<i32>().ok())
@@ -8025,6 +8050,7 @@ fn add_doc_comment(tab: &mut DocTab, text: String, identity: (String, String)) -
         quoted,
     });
     tab.session_comment_ids.insert(id.to_string());
+    tab.used_comment_ids.insert(id.to_string());
     Some(id)
 }
 
@@ -8260,6 +8286,7 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 status: status.into(),
                 comments: vec![],
                 session_comment_ids: Default::default(),
+                used_comment_ids: Default::default(),
                 pkg: None,
                 notes: vec![],
                 markdown: false,
@@ -8303,6 +8330,7 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 status,
                 comments,
                 session_comment_ids: Default::default(),
+                used_comment_ids: Default::default(),
                 mail: mailings_tab::MailState::from_pkg(pkg.as_ref()),
                 import: Default::default(),
                 pkg,
@@ -8321,6 +8349,7 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
     };
     // The hot sidecar is always .docx; restore the Markdown flag from session.
     tab.markdown = t.markdown || tab.markdown;
+    seed_used_comment_ids(&mut tab);
     // Nor does the sidecar say the tab was imported from a Word 97-2003 file
     // (#634). A tab reloaded from that file knows it from the load.
     if t.kind == Kind::Docx {
@@ -9064,6 +9093,7 @@ impl Docxy {
             status: "new".into(),
             comments: vec![],
             session_comment_ids: Default::default(),
+            used_comment_ids: Default::default(),
             pkg: None,
             notes: vec![],
             markdown: false,
@@ -18615,6 +18645,7 @@ mod sheet_save_tests {
             status: "new".into(),
             comments: vec![],
             session_comment_ids: Default::default(),
+            used_comment_ids: Default::default(),
             pkg: None,
             notes: vec![],
             markdown: true,

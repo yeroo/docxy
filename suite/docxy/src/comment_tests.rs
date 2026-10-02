@@ -253,20 +253,24 @@ fn a_new_comment_never_takes_a_deleted_loaded_comments_id() {
     assert_eq!(markers(&doc, 3), 3, "{doc}");
 }
 
-/// FIX r1 #4: a comment added and deleted before any save is in neither
-/// `comments` nor the base; undoing the delete brings its markers back, so
-/// the next comment must still not take its id.
+/// FIX r1 #4, r3 #2: a new comment deleted before any undo or save is in
+/// no list, no marker and no base any more; the next comment still gets a
+/// fresh id, so undoing it and then the delete never makes it live on the
+/// first one's markers.
 #[test]
-fn an_undone_delete_of_a_new_comment_keeps_its_id_taken() {
+fn a_comment_added_after_deleting_a_new_one_gets_a_fresh_id() {
     let dir = Scratch::new();
-    let (mut tab, _) = docx_tab(&dir, &fox_package());
+    let (mut tab, path) = docx_tab(&dir, &fox_package());
     let first = comment(&mut tab, "one");
     delete_as_the_pane_does(&mut tab, first);
-    assert!(editor(&mut tab).undo(), "the delete");
     let second = comment(&mut tab, "two");
     assert_ne!(first, second);
-    let doc = docxcore::serialize::document_to_xml(&editor(&mut tab).doc);
-    assert_eq!(markers(&doc, second), 3, "{doc}");
+    assert!(editor(&mut tab).undo(), "the second add");
+    assert!(editor(&mut tab).undo(), "the delete");
+    assert!(listed(&tab).iter().all(|c| c.text != "two"));
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    let (_, comments) = saved(&path);
+    assert!(!comments.contains("two"), "{comments}");
 }
 
 /// FIX r1 #3: the inspector counts what the pane lists, so an undone new
@@ -340,5 +344,25 @@ fn a_new_comment_never_takes_an_id_whose_markers_are_in_the_body() {
     assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
     let (doc, comments) = saved(&path);
     assert_eq!(markers(&doc, id), 0, "{doc}");
+    assert!(!comments.contains("Colour?"), "{comments}");
+}
+
+/// FIX r3 #1: an id freed before the add (Remove All emptied comments, the
+/// base and the body of comment 1) must not be taken: undoing the add and
+/// then Remove All brings 1's markers back, and the new comment would be
+/// live on them.
+#[test]
+fn a_new_comment_never_takes_an_id_freed_by_remove_all() {
+    use crate::inspector::{InspectCategory, inspect_remove};
+    let dir = Scratch::new();
+    let (mut tab, path) = docx_tab(&dir, &commented_package(&[(1, "Loaded")]));
+    inspect_remove(&mut tab, InspectCategory::Comments).unwrap();
+    let id = comment(&mut tab, "Colour?");
+    assert_ne!(id, 1);
+    assert!(editor(&mut tab).undo(), "the new comment");
+    assert!(editor(&mut tab).undo(), "the Remove All");
+    assert!(listed(&tab).iter().all(|c| c.text != "Colour?"));
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    let (_, comments) = saved(&path);
     assert!(!comments.contains("Colour?"), "{comments}");
 }
