@@ -474,10 +474,17 @@ fn next_compare_result_path(revised: &Path) -> String {
         .to_string()
 }
 
-/// `docxy compare <original.docx> <revised.docx> -o <out.docx>`: write the
-/// comparison as a new file. Never replaces an existing file.
-fn compare_cli(args: &[String]) -> ExitCode {
-    const USAGE: &str = "usage: docxy compare <original.docx> <revised.docx> -o <out.docx>";
+/// The two input paths and the `.docx` output of a headless subcommand
+/// (`docxy <cmd> <a> <b> -o <out.docx>`), or the exit code it ends with:
+/// success after `--help`, 2 for a usage error, failure when the output
+/// already exists. `what` names the output in the errors ("the compare
+/// result"), `cmd` the subcommand.
+fn two_inputs_and_out(
+    args: &[String],
+    usage: &str,
+    what: &str,
+    cmd: &str,
+) -> Result<(String, String, String), ExitCode> {
     let mut inputs = Vec::new();
     let mut out = None;
     let mut i = 0;
@@ -488,47 +495,69 @@ fn compare_cli(args: &[String]) -> ExitCode {
                 match args.get(i) {
                     Some(path) => out = Some(path.clone()),
                     None => {
-                        eprintln!("error: {} requires an output path\n{USAGE}", args[i - 1]);
-                        return ExitCode::from(2);
+                        eprintln!("error: {} requires an output path\n{usage}", args[i - 1]);
+                        return Err(ExitCode::from(2));
                     }
                 }
             }
             "-h" | "--help" => {
-                println!("{USAGE}");
-                return ExitCode::SUCCESS;
+                println!("{usage}");
+                return Err(ExitCode::SUCCESS);
             }
             path => inputs.push(path.to_string()),
         }
         i += 1;
     }
-    let (Some(out), [original, revised]) = (out, inputs.as_slice()) else {
-        eprintln!("{USAGE}");
-        return ExitCode::from(2);
+    let (Some(out), [a, b]) = (out, inputs.as_slice()) else {
+        eprintln!("{usage}");
+        return Err(ExitCode::from(2));
     };
     if !out.to_ascii_lowercase().ends_with(".docx") {
-        eprintln!("error: {out}: the compare result must be a .docx file");
-        return ExitCode::from(2);
+        eprintln!("error: {out}: {what} must be a .docx file");
+        return Err(ExitCode::from(2));
     }
     if Path::new(&out).exists() {
-        eprintln!("error: {out} already exists (compare never overwrites a file)");
-        return ExitCode::FAILURE;
+        eprintln!("error: {out} already exists ({cmd} never overwrites a file)");
+        return Err(ExitCode::FAILURE);
     }
-    let result = match compare_files(original, revised, DEFAULT_AUTHOR) {
+    Ok((a.clone(), b.clone(), out))
+}
+
+/// Write a headless subcommand's result to `out`, which must not exist:
+/// `create_atomic` refuses any existing destination, so a file that appeared
+/// since [`two_inputs_and_out`] checked is refused too.
+fn write_new(out: &str, bytes: &[u8], cmd: &str) -> Result<(), ExitCode> {
+    match opccore::fsio::create_atomic(Path::new(out), bytes) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                eprintln!("error: {out} already exists ({cmd} never overwrites a file)");
+            } else {
+                eprintln!("error: cannot write {out}: {e}");
+            }
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+/// `docxy compare <original.docx> <revised.docx> -o <out.docx>`: write the
+/// comparison as a new file. Never replaces an existing file.
+fn compare_cli(args: &[String]) -> ExitCode {
+    const USAGE: &str = "usage: docxy compare <original.docx> <revised.docx> -o <out.docx>";
+    let (original, revised, out) =
+        match two_inputs_and_out(args, USAGE, "the compare result", "compare") {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
+    let result = match compare_files(&original, &revised, DEFAULT_AUTHOR) {
         Ok(result) => result,
         Err(e) => {
             eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
     };
-    // create_atomic refuses any existing destination, so a file that appeared
-    // since the check above is refused too.
-    if let Err(e) = opccore::fsio::create_atomic(Path::new(&out), &save_package(&result.package)) {
-        if e.kind() == io::ErrorKind::AlreadyExists {
-            eprintln!("error: {out} already exists (compare never overwrites a file)");
-        } else {
-            eprintln!("error: cannot write {out}: {e}");
-        }
-        return ExitCode::FAILURE;
+    if let Err(code) = write_new(&out, &save_package(&result.package), "compare") {
+        return code;
     }
     println!(
         "wrote {out} ({} insertions, {} deletions)",
@@ -545,42 +574,11 @@ fn compare_cli(args: &[String]) -> ExitCode {
 /// Individual Documents) into a new file. Never replaces an existing file.
 fn merge_cli(args: &[String]) -> ExitCode {
     const USAGE: &str = "usage: docxy merge <main.docx> <data.csv> -o <out.docx>";
-    let mut inputs = Vec::new();
-    let mut out = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-o" | "--out" => {
-                i += 1;
-                match args.get(i) {
-                    Some(path) => out = Some(path.clone()),
-                    None => {
-                        eprintln!("error: {} requires an output path\n{USAGE}", args[i - 1]);
-                        return ExitCode::from(2);
-                    }
-                }
-            }
-            "-h" | "--help" => {
-                println!("{USAGE}");
-                return ExitCode::SUCCESS;
-            }
-            path => inputs.push(path.to_string()),
-        }
-        i += 1;
-    }
-    let (Some(out), [main, data]) = (out, inputs.as_slice()) else {
-        eprintln!("{USAGE}");
-        return ExitCode::from(2);
+    let (main, data, out) = match two_inputs_and_out(args, USAGE, "the merged document", "merge") {
+        Ok(v) => v,
+        Err(code) => return code,
     };
-    if !out.to_ascii_lowercase().ends_with(".docx") {
-        eprintln!("error: {out}: the merged document must be a .docx file");
-        return ExitCode::from(2);
-    }
-    if Path::new(&out).exists() {
-        eprintln!("error: {out} already exists (merge never overwrites a file)");
-        return ExitCode::FAILURE;
-    }
-    let pkg = match std::fs::read(main)
+    let pkg = match std::fs::read(&main)
         .map_err(|e| e.to_string())
         .and_then(|b| load_package(&b).map_err(|e| e.to_string()))
     {
@@ -590,7 +588,7 @@ fn merge_cli(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let recipients = match std::fs::read(data)
+    let recipients = match std::fs::read(&data)
         .map_err(|e| e.to_string())
         .and_then(|b| docxcore::merge::Recipients::parse_csv(&b))
     {
@@ -612,15 +610,8 @@ fn merge_cli(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // create_atomic refuses any existing destination, so a file that appeared
-    // since the check above is refused too.
-    if let Err(e) = opccore::fsio::create_atomic(Path::new(&out), &save_package(&merged)) {
-        if e.kind() == io::ErrorKind::AlreadyExists {
-            eprintln!("error: {out} already exists (merge never overwrites a file)");
-        } else {
-            eprintln!("error: cannot write {out}: {e}");
-        }
-        return ExitCode::FAILURE;
+    if let Err(code) = write_new(&out, &save_package(&merged), "merge") {
+        return code;
     }
     let n = docxcore::merge::merge_rows(&recipients, opts.range).len();
     println!("wrote {out} ({n} records)");
