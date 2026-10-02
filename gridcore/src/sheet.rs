@@ -1549,15 +1549,16 @@ impl Table {
 }
 
 /// A table converted to a range whose part is still in the package (see
-/// [`Workbook::removed_tables`]). Its geometry follows later row and column
-/// edits as the cells it covered do, so the column formulas other table parts
-/// hold can still be rewritten onto them at save.
+/// [`Workbook::removed_tables`]). The column formulas other table parts hold
+/// that name it are converted at save as the cell formulas were: with its
+/// geometry as converted, then through each row/column edit made on its sheet
+/// since ([`crate::formula::adjust_for_edit`], the same rewrite the cells
+/// went through), so both read the same cells.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RemovedTable {
     pub table: Table,
-    /// A later edit deleted every cell it covered: references to it are
-    /// `#REF!`.
-    pub deleted: bool,
+    /// The row/column edits on its sheet since it was converted, in order.
+    pub edits: Vec<crate::formula::EditShift>,
 }
 
 /// A workbook-level defined name: `TaxRate` → `0.21`, `Data` →

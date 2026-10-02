@@ -1488,64 +1488,13 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
             }
         }
     }
+    // A converted table keeps the geometry it was converted with; the edits
+    // its cells went through since are replayed at save on the references
+    // to it (see `RemovedTable::edits`).
     for rt in &mut wb.removed_tables {
         if rt.table.sheet == idx {
-            shift_removed_table(rt, &shift);
+            rt.edits.push(shift);
         }
-    }
-}
-
-/// Move a converted table's tombstone through a row or column edit as the
-/// cell references to its cells move: rows and columns shift, a deleted row
-/// or column leaves it (a deleted header or totals row stops being one, a
-/// deleted column's name goes, so references to it turn `#REF!`), a column
-/// inserted inside it widens it with a column no reference names, and
-/// deleting all of it marks it [`crate::sheet::RemovedTable::deleted`].
-fn shift_removed_table(rt: &mut crate::sheet::RemovedTable, shift: &EditShift) {
-    if rt.deleted {
-        return;
-    }
-    let t = &mut rt.table;
-    let (r1, c1, r2, c2) = t.range;
-    let n = shift.delta.unsigned_abs().min(u64::from(u32::MAX)) as u32;
-    let deleted = |x: u32| shift.delta < 0 && x >= shift.at && x - shift.at < n;
-    if shift.rows {
-        if t.header_rows > 0 && deleted(r1) {
-            t.header_rows = 0;
-        }
-        if t.totals_rows > 0 && deleted(r2) {
-            t.totals_rows = 0;
-        }
-        match span(r1, r2, shift) {
-            Some((lo, hi)) => t.range = (lo, c1, hi, c2),
-            None => rt.deleted = true,
-        }
-        return;
-    }
-    if shift.delta > 0 {
-        let moved = |x: u32| x.saturating_add(n).min(MAX_COLS - 1);
-        if shift.at <= c1 {
-            t.range = (r1, moved(c1), r2, moved(c2));
-        } else if shift.at <= c2 {
-            let at = (shift.at - c1) as usize;
-            let blanks = std::iter::repeat_n(String::new(), n as usize);
-            t.columns
-                .splice(at.min(t.columns.len())..at.min(t.columns.len()), blanks);
-            t.range = (r1, c1, r2, moved(c2));
-        }
-        return;
-    }
-    let kept: Vec<(u32, String)> = (c1..=c2)
-        .zip(std::mem::take(&mut t.columns))
-        .filter(|&(x, _)| !deleted(x))
-        .map(|(x, name)| (if x < shift.at { x } else { x - n }, name))
-        .collect();
-    match (kept.first(), kept.last()) {
-        (Some(&(lo, _)), Some(&(hi, _))) => {
-            t.range = (r1, lo, r2, hi);
-            t.columns = kept.into_iter().map(|(_, name)| name).collect();
-        }
-        _ => rt.deleted = true,
     }
 }
 
@@ -2094,7 +2043,6 @@ pub fn convert_table_to_range(wb: &mut Workbook, name: &str) -> Result<(), Strin
         name: &t.name,
         sheet_name: &sheet_name,
         info: &info,
-        deleted: false,
     };
     rewrite_workbook_formulas(wb, |e, (s, cell)| {
         let host = crate::formula::FormulaHost {
@@ -2110,7 +2058,7 @@ pub fn convert_table_to_range(wb: &mut Workbook, name: &str) -> Result<(), Strin
     wb.tables.remove(idx);
     wb.removed_tables.push(crate::sheet::RemovedTable {
         table: t,
-        deleted: false,
+        edits: Vec::new(),
     });
     Ok(())
 }

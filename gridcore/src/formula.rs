@@ -1965,7 +1965,7 @@ pub fn translate_formula(src: &str, dr: i64, dc: i64) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// A row/column insertion or deletion on one sheet, as seen by formulas.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EditShift {
     /// True = rows, false = columns.
     pub rows: bool,
@@ -2349,9 +2349,6 @@ pub struct TableToRange<'a> {
     /// The sheet the table is on, as references spell it.
     pub sheet_name: &'a str,
     pub info: &'a TableInfo,
-    /// The cells it covered were deleted after the conversion: every
-    /// reference to it is `#REF!`, as the cell formulas that read them are.
-    pub deleted: bool,
 }
 
 /// Where a formula being rewritten by [`table_refs_to_cells_in_expr`] lives.
@@ -2411,9 +2408,6 @@ pub fn table_refs_to_cells_in_expr(e: &Expr, t: &TableToRange, host: FormulaHost
             if !ours {
                 return None;
             }
-            if t.deleted {
-                return Some(Expr::Err(ExcelError::Ref));
-            }
             let this_row = *item == TableItem::ThisRow;
             let row = match (this_row, host.row) {
                 (true, None) => return None,
@@ -2426,7 +2420,6 @@ pub fn table_refs_to_cells_in_expr(e: &Expr, t: &TableToRange, host: FormulaHost
         }
         Expr::Name(n) if n.eq_ignore_ascii_case(t.name) => {
             Some(match t.info.resolve(TableItem::Data, &None, &None, 0) {
-                _ if t.deleted => Expr::Err(ExcelError::Ref),
                 Some(r) => rect(r, true),
                 None => Expr::Err(ExcelError::Ref),
             })

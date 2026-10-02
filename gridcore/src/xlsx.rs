@@ -5679,7 +5679,7 @@ fn table_children(xml: &str, name: &str) -> Vec<(usize, usize)> {
 struct ConvertedTable {
     part: String,
     loaded_name: String,
-    deleted: bool,
+    edits: Vec<crate::formula::EditShift>,
     sheet: usize,
     sheet_name: String,
     info: crate::formula::TableInfo,
@@ -5724,14 +5724,29 @@ fn rewrite_column_formulas(
                         name: &c.loaded_name,
                         sheet_name: &c.sheet_name,
                         info: &c.info,
-                        deleted: c.deleted,
                     };
                     let host = crate::formula::FormulaHost {
                         same_sheet: c.sheet == own_sheet,
                         row: None,
                         inside: false,
                     };
-                    out = crate::formula::table_refs_to_cells_in_expr(&out, &target, host);
+                    // Converted as the cells were, then moved through the
+                    // edits since, by the rewrite that moved the cells.
+                    out = crate::formula::map_expr(&out, &|x| {
+                        if !matches!(
+                            x,
+                            crate::formula::Expr::Structured { .. } | crate::formula::Expr::Name(_)
+                        ) {
+                            return None;
+                        }
+                        let cells = crate::formula::table_refs_to_cells_in_expr(x, &target, host);
+                        (cells != *x).then(|| {
+                            c.edits.iter().fold(cells, |e, shift| {
+                                let home = host.same_sheet;
+                                crate::formula::adjust_for_edit(&e, home, &c.sheet_name, shift)
+                            })
+                        })
+                    });
                 }
                 out = crate::formula::rename_tables_in_expr(&out, renames);
                 if out != ast {
@@ -5914,7 +5929,7 @@ fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
             Some(ConvertedTable {
                 part: r.part.clone(),
                 loaded_name,
-                deleted: removed.deleted,
+                edits: removed.edits.clone(),
                 sheet: r.sheet,
                 sheet_name: wb.sheets.get(r.sheet)?.name.clone(),
                 info: crate::formula::TableInfo {
@@ -18699,15 +18714,23 @@ mod table_command_tests {
         assert!(!ct.contains(&format!("/{part1}")), "{ct}");
     }
 
-    /// Table1 (A1:B3) converted to a range after Table2 (A6:B7) took a
-    /// column formula over it.
-    fn converted_under_a_column_formula(formula: &str) -> (SheetPackage, String) {
+    /// Table1 (A1:B3, or A1:B4 with a totals row) converted to a range after
+    /// Table2 (A11:B12) took the column formula `formula` over it, and a cell
+    /// far off (Z100) held the same formula.
+    fn converted_under_a_column_formula(formula: &str, totals: bool) -> (SheetPackage, String) {
         let mut pkg = one_table();
         let s = &mut pkg.workbook.sheets[0];
-        s.set_cell(5, 0, Cell::text("Key"));
-        s.set_cell(5, 1, Cell::text("Calc"));
-        s.set_cell(6, 0, Cell::text("x"));
-        pkg.add_table(0, (5, 0, 6, 1), true, "TableStyleMedium2")
+        s.set_cell(10, 0, Cell::text("Key"));
+        s.set_cell(10, 1, Cell::text("Calc"));
+        s.set_cell(11, 0, Cell::text("x"));
+        s.set_cell(99, 25, Cell::formula(formula));
+        if totals {
+            s.set_cell(3, 0, Cell::text("Total"));
+            s.set_cell(3, 1, Cell::formula("SUBTOTAL(109,[Qty])"));
+            pkg.workbook.tables[0].range = (0, 0, 3, 1);
+            pkg.workbook.tables[0].totals_rows = 1;
+        }
+        pkg.add_table(0, (10, 0, 11, 1), true, "TableStyleMedium2")
             .unwrap();
         let part2 = pkg.workbook.tables[1].part.clone();
         calculated(&mut pkg, &part2, "Calc", formula);
@@ -18715,45 +18738,108 @@ mod table_command_tests {
         (pkg, part2)
     }
 
+    /// The formula of the one cell in column Z (the parity cell, wherever
+    /// the edits moved it).
+    fn parity_cell(pkg: &SheetPackage) -> String {
+        let cells = &pkg.workbook.sheets[0].cells;
+        let mut z = cells.iter().filter(|((_, c), _)| *c >= 20);
+        let (_, cell) = z.next().expect("the parity cell");
+        assert!(z.next().is_none());
+        cell.formula.clone().unwrap()
+    }
+
     #[test]
-    fn a_converted_table_follows_later_row_and_column_edits() {
-        let (mut pkg, part2) = converted_under_a_column_formula("SUM(Table1[Qty])");
+    fn a_converted_tables_column_formulas_read_what_its_cell_formulas_read() {
+        use crate::edit::{delete_cols, delete_rows, insert_cols, insert_rows};
+        type Edit = fn(&mut Workbook);
+        let cases: Vec<(&str, bool, Vec<Edit>)> = vec![
+            // A row above, two columns to the left.
+            (
+                "SUM(Table1[Qty])",
+                false,
+                vec![|wb| insert_rows(wb, 0, 0, 1), |wb| insert_cols(wb, 0, 0, 2)],
+            ),
+            // A column inside widens it.
+            (
+                "SUM(Table1[[Item]:[Qty]])",
+                false,
+                vec![|wb| insert_cols(wb, 0, 1, 1)],
+            ),
+            // Deleting the first column of a span keeps the rest (r3 M1).
+            (
+                "SUM(Table1[[Item]:[Qty]])&COUNTA(Table1[Item])",
+                false,
+                vec![|wb| delete_cols(wb, 0, 0, 1)],
+            ),
+            // A row inserted at the first data row moves the data (r3 M2).
+            (
+                "SUM(Table1[Qty])+ROWS(Table1[#All])",
+                false,
+                vec![|wb| insert_rows(wb, 0, 1, 1)],
+            ),
+            // …and at the totals row.
+            (
+                "SUM(Table1[Qty])+SUM(Table1[#Totals])",
+                true,
+                vec![|wb| insert_rows(wb, 0, 3, 2)],
+            ),
+            // Deleting the header row, then a data row. (A `#REF!` range
+            // such as `#REF!:#REF!` stops a cell formula following later
+            // edits, since its text no longer parses, so none is made here.)
+            (
+                "SUM(Table1[Qty])+ROWS(Table1[#All])",
+                false,
+                vec![|wb| delete_rows(wb, 0, 0, 1), |wb| delete_rows(wb, 0, 1, 1)],
+            ),
+            // All of its rows go.
+            (
+                "SUM(Table1[Qty])",
+                false,
+                vec![|wb| delete_rows(wb, 0, 0, 3)],
+            ),
+        ];
+        for (formula, totals, edits) in cases {
+            let (mut pkg, part2) = converted_under_a_column_formula(formula, totals);
+            for edit in &edits {
+                edit(&mut pkg.workbook);
+            }
+            let re = reload(&pkg);
+            assert_eq!(
+                column_formula(&re, &part2),
+                parity_cell(&re),
+                "{formula} after {} edits",
+                edits.len()
+            );
+        }
+    }
+
+    #[test]
+    fn a_converted_tables_column_formulas_follow_the_edits() {
+        // Pins the parity test to real cell references.
+        let (mut pkg, part2) = converted_under_a_column_formula("SUM(Table1[Qty])", false);
+        crate::edit::insert_rows(&mut pkg.workbook, 0, 1, 1);
+        assert_eq!(column_formula(&reload(&pkg), &part2), "SUM($B$3:$B$4)");
+    }
+
+    #[test]
+    fn a_column_formula_on_another_sheet_follows_only_the_tables_sheet() {
+        let mut pkg = one_table();
+        let s2 = pkg.add_sheet("Other");
+        let s = &mut pkg.workbook.sheets[s2];
+        s.set_cell(0, 0, Cell::text("Key"));
+        s.set_cell(0, 1, Cell::text("Calc"));
+        s.set_cell(1, 0, Cell::text("x"));
+        pkg.add_table(s2, (0, 0, 1, 1), true, "TableStyleMedium2")
+            .unwrap();
+        let part2 = pkg.workbook.tables[1].part.clone();
+        calculated(&mut pkg, &part2, "Calc", "SUM(Table1[Qty])");
+        convert_table_to_range(&mut pkg.workbook, "Table1").unwrap();
         crate::edit::insert_rows(&mut pkg.workbook, 0, 0, 1);
-        crate::edit::insert_cols(&mut pkg.workbook, 0, 0, 2);
-        let re = reload(&pkg);
-        // The cell formula and the column formula read the same cells.
-        let d = re.workbook.sheets[0].cell(1, 5).unwrap();
-        assert_eq!(d.formula.as_deref(), Some("SUM($D$3:$D$4)"));
-        assert_eq!(column_formula(&re, &part2), "SUM($D$3:$D$4)");
-    }
-
-    #[test]
-    fn a_column_inserted_inside_a_converted_table_widens_it() {
-        let (mut pkg, part2) = converted_under_a_column_formula("SUM(Table1[Qty])");
-        crate::edit::insert_cols(&mut pkg.workbook, 0, 1, 1);
-        let re = reload(&pkg);
-        let d = re.workbook.sheets[0].cell(0, 4).unwrap();
-        assert_eq!(d.formula.as_deref(), Some("SUM($C$2:$C$3)"));
-        assert_eq!(column_formula(&re, &part2), "SUM($C$2:$C$3)");
-    }
-
-    #[test]
-    fn a_converted_tables_deleted_cells_are_ref_errors() {
-        // Its Item column goes: Qty moves left, Item references go.
-        let (mut pkg, part2) =
-            converted_under_a_column_formula("SUM(Table1[Qty])&COUNTA(Table1[Item])");
-        crate::edit::delete_cols(&mut pkg.workbook, 0, 0, 1);
+        crate::edit::insert_rows(&mut pkg.workbook, s2, 0, 5);
         assert_eq!(
             column_formula(&reload(&pkg), &part2),
-            "SUM($A$2:$A$3)&COUNTA(#REF!)"
+            "SUM(Sheet1!$B$3:$B$4)"
         );
-        // All of its rows go.
-        let (mut pkg, part2) = converted_under_a_column_formula("SUM(Table1[Qty])");
-        crate::edit::delete_rows(&mut pkg.workbook, 0, 0, 3);
-        let re = reload(&pkg);
-        assert_eq!(column_formula(&re, &part2), "SUM(#REF!)");
-        let d = re.workbook.sheets[0].cell(0, 3);
-        assert!(d.is_none(), "D1 went with its row");
     }
 
     #[test]
