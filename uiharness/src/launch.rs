@@ -128,10 +128,29 @@ enum Proc {
     Std(Child),
     #[cfg(windows)]
     Raw {
-        process: windows::Win32::Foundation::HANDLE,
+        process: OwnedProcess,
         pid: u32,
     },
 }
+
+/// An owned process handle from `CreateProcessW`, so `Launched` stays
+/// `Send + Sync` on Windows exactly as it was around the std `Child` — a
+/// property of the public type the desktop mode must not change. The raw
+/// value never escapes: `Proc`'s drop and `Launched`'s kill path are the
+/// only users, and they close it.
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct OwnedProcess(windows::Win32::Foundation::HANDLE);
+
+// SAFETY: the handle is owned and closed exactly once, by `Proc`'s drop or
+// `Launched`'s kill path, so it is valid for every call made through a
+// borrow. Both uses are system calls that take the handle by value; sharing
+// them across threads cannot race a close, because a borrow cannot outlive
+// the owner that closes it.
+#[cfg(windows)]
+unsafe impl Send for OwnedProcess {}
+#[cfg(windows)]
+unsafe impl Sync for OwnedProcess {}
 
 impl Proc {
     fn id(&self) -> u32 {
@@ -154,7 +173,7 @@ impl Proc {
 
                 // SAFETY: `process` is a live handle this variant owns until
                 // `Drop`.
-                let waited = unsafe { WaitForSingleObject(*process, 0) };
+                let waited = unsafe { WaitForSingleObject(process.0, 0) };
                 if waited == WAIT_TIMEOUT {
                     return Ok(None);
                 }
@@ -166,7 +185,7 @@ impl Proc {
                 // SAFETY: the wait says the process has gone; `code` is
                 // written on success.
                 let mut code = 0u32;
-                unsafe { GetExitCodeProcess(*process, &mut code) }
+                unsafe { GetExitCodeProcess(process.0, &mut code) }
                     .map_err(|e| std::io::Error::other(format!("GetExitCodeProcess: {e}")))?;
                 Ok(Some(format!("exit code: {code}")))
             }
@@ -182,25 +201,33 @@ impl Proc {
 
                 // SAFETY: `process` is a live handle this variant owns until
                 // `Drop`; any exit code does, `1` says the kill did it.
-                unsafe { TerminateProcess(*process, 1) }
+                unsafe { TerminateProcess(process.0, 1) }
                     .map_err(|e| std::io::Error::other(format!("TerminateProcess: {e}")))
             }
         }
     }
 
-    /// Wait until it has gone, for the kill-on-drop and shutdown paths.
+    /// Wait until it has gone, for the path that just killed it. The result
+    /// is checked: INFINITE cannot time out, but a failed wait (a
+    /// `TerminateProcess` that failed leaves the process alive) must read as
+    /// an error, not as success — the callers only wait after a successful
+    /// kill, and a hang here would hang them.
     fn wait(&mut self) -> std::io::Result<()> {
         match self {
             Proc::Std(child) => child.wait().map(|_| ()),
             #[cfg(windows)]
             Proc::Raw { process, .. } => {
+                use windows::Win32::Foundation::WAIT_OBJECT_0;
                 use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};
 
                 // SAFETY: `process` is a live handle this variant owns until
-                // `Drop`; INFINITE waits, so the return says it has gone
-                // (barring a kill that itself failed, which `wait` reported).
-                let _ = unsafe { WaitForSingleObject(*process, INFINITE) };
-                Ok(())
+                // `Drop`.
+                let waited = unsafe { WaitForSingleObject(process.0, INFINITE) };
+                if waited == WAIT_OBJECT_0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
             }
         }
     }
@@ -214,7 +241,7 @@ impl Drop for Proc {
 
             // SAFETY: the handle is ours and `Drop` runs exactly once.
             unsafe {
-                let _ = CloseHandle(*process);
+                let _ = CloseHandle(process.0);
             }
         }
     }
@@ -303,16 +330,22 @@ impl Launched {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        let _ = self.proc_.kill();
-        let _ = self.proc_.wait();
+        // Only a successful kill is waited on: a failed kill leaves the
+        // process alive, and an INFINITE wait for a live process would hang
+        // the run exactly as a hung instance would have.
+        if self.proc_.kill().is_ok() {
+            let _ = self.proc_.wait();
+        }
     }
 }
 
 impl Drop for Launched {
     fn drop(&mut self) {
         if !self.detached && matches!(self.proc_.try_wait(), Ok(None)) {
-            let _ = self.proc_.kill();
-            let _ = self.proc_.wait();
+            // See `shutdown`: wait only when the kill landed.
+            if self.proc_.kill().is_ok() {
+                let _ = self.proc_.wait();
+            }
         }
     }
 }
@@ -362,8 +395,10 @@ pub fn launch_with_env(
 /// instance's stdout and stderr go to `<sandbox>/suite-output.log`, so a
 /// refusal from the isolation gate is filed rather than lost; the caller's
 /// thread must attach to the desktop ([`crate::desktop::Desktop`]) for
-/// captures to find the window.
-#[cfg(windows)]
+/// captures to find the window. Off Windows this is the same error
+/// [`Desktop::create`] gives: a separate desktop is Windows-only.
+///
+/// [`Desktop::create`]: crate::desktop::Desktop::create
 pub fn launch_on_desktop(
     exe: &Path,
     sandbox: &Path,
@@ -432,8 +467,12 @@ pub fn launch_on_desktop_with_env(
     // process happens to hold: a bare `bInheritHandles = true` would let a
     // kept (or crashed) suite hold the caller's pipe end open, and
     // `run --desktop --keep | tail` would then outlive the harness without
-    // ever letting the pipe close. std's own spawn restricts inheritance the
-    // same way, which is why the plain launch path does not do this.
+    // ever letting the pipe close. The plain launch path inherits whatever
+    // its own spawn held — pre-existing, and out of scope here. And the
+    // window between SetHandleInformation and the spawn is not serialised
+    // against a concurrent std spawn on another thread, which could then
+    // inherit a stray handle on the log: harmless — the same file the
+    // suite writes anyway.
     let mut attr_size = 0usize;
     // SAFETY: the NULL-list call is the documented size query; its failure
     // is expected and leaves the required size in `attr_size`.
@@ -500,7 +539,7 @@ pub fn launch_on_desktop_with_env(
     drop(log);
     Ok(Launched {
         proc_: Proc::Raw {
-            process: pi.hProcess,
+            process: OwnedProcess(pi.hProcess),
             pid: pi.dwProcessId,
         },
         sandbox,
@@ -510,20 +549,8 @@ pub fn launch_on_desktop_with_env(
     })
 }
 
-/// Off Windows, [`launch_on_desktop`] is the same error [`Desktop::create`]
-/// gives: a separate desktop is Windows-only.
-///
-/// [`Desktop::create`]: crate::desktop::Desktop::create
-#[cfg(not(windows))]
-pub fn launch_on_desktop(
-    exe: &Path,
-    sandbox: &Path,
-    desktop: &crate::desktop::Desktop,
-) -> Result<Launched, String> {
-    launch_on_desktop_with_env(exe, sandbox, desktop, std::env::vars_os())
-}
-
-/// Off Windows counterpart of the cfg'd twin above.
+/// Off Windows, [`launch_on_desktop_with_env`] is where the Windows-only
+/// error is raised: a separate desktop is Windows-only.
 #[cfg(not(windows))]
 pub fn launch_on_desktop_with_env(
     exe: &Path,
@@ -569,8 +596,11 @@ pub fn child_env(
     env
 }
 
-/// The ASCII case fold Windows sorts environment names by, applied to one
-/// UTF-16 unit: only `a-z` fold; every other unit compares as-is.
+/// The case fold this sorts environment names by, applied to one UTF-16
+/// unit: only ASCII `a-z` fold; every other unit compares as-is. That is an
+/// approximation — Windows' own sort and std's fold non-ASCII letters too —
+/// exact for ASCII names, which is what environment variables are in
+/// practice.
 #[cfg(windows)]
 fn upper(unit: &u16) -> u16 {
     match unit {
@@ -579,11 +609,13 @@ fn upper(unit: &u16) -> u16 {
     }
 }
 
-/// `env` as a `CreateProcessW` environment block: entries `name=value\0` in
-/// the order Windows keeps them — sorted with the name ASCII-case-
-/// insensitive on the UTF-16 units (its rule, and what std's own block
-/// does), names that differ only in case ordered by their exact units — then
-/// a double NUL. An empty env is two zero words.
+/// `env` as a `CreateProcessW` environment block: entries `name=value\0`,
+/// sorted by name — ASCII case-insensitive on the UTF-16 units, with names
+/// that differ only in case ordered by their exact units — then a double
+/// NUL. The fold is the ASCII-only [`upper`], an approximation of the
+/// ordinal case-insensitive sort Windows and std apply; it is exact for the
+/// ASCII names environment variables actually have. An empty env is two
+/// zero words.
 #[cfg(windows)]
 pub fn environment_block(env: &[(OsString, OsString)]) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
@@ -766,18 +798,23 @@ mod tests {
     }
 
     /// Windows keeps an environment block sorted by name; std sorts its own
-    /// block the same way. Ours must agree, and be NUL-separated, value-less
-    /// entries carried byte-faithfully (the hidden `=C:` ones), and
+    /// block the same way. Ours must agree: `a` sorts before `_x` only under
+    /// the fold (`A` < `_`), so this fails if the fold is dropped, and the
+    /// hidden `=C:` entry must survive — leading `=` and all — sorting ahead
+    /// of everything (`=` < letters). Entries are NUL-separated, the block
     /// double-NUL-terminated.
     #[cfg(windows)]
     #[test]
     fn the_environment_block_is_sorted_nul_separated_and_double_terminated() {
         use std::os::windows::ffi::OsStrExt;
         let block = environment_block(&[
-            (OsString::from("b"), OsString::from("2")),
-            (OsString::from("A"), OsString::from("1")),
+            (OsString::from("_x"), OsString::from("1")),
+            (OsString::from("a"), OsString::from("2")),
+            (OsString::from("=C:"), OsString::from(r"C:\w")),
         ]);
-        let want: Vec<u16> = std::ffi::OsStr::new("A=1\0b=2\0\0").encode_wide().collect();
+        let want: Vec<u16> = std::ffi::OsStr::new("=C:=C:\\w\0a=2\0_x=1\0\0")
+            .encode_wide()
+            .collect();
         assert_eq!(block, want);
         assert_eq!(environment_block(&[]), [0, 0]);
     }
@@ -866,5 +903,14 @@ mod tests {
         assert!(msg.contains("suite.exe exited: "), "{msg}");
         assert!(!msg.contains("last 20 lines"), "{msg}");
         assert!(!msg.contains('\n'), "{msg}");
+    }
+
+    /// `Launched` was `Send + Sync` around a std `Child`; the desktop
+    /// launch's raw process handle is wrapped so the public type keeps both
+    /// (#722 review).
+    #[test]
+    fn launched_stays_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Launched>();
     }
 }

@@ -80,10 +80,11 @@ plain `uiharness --config <sandbox> window` from your desktop reports "no
 visible top-level window", which is the truth: the window is not on your
 desktop.
 
-The suite's stdout and stderr go to `<sandbox>/suite-output.log` rather than
-your terminal (a process started with a desktop has no console to inherit);
-when the instance exits before connecting, `run` quotes that log's tail, so a
-refusal from the isolation gate stays visible.
+The launch retargets the suite's stdout and stderr at
+`<sandbox>/suite-output.log` (`STARTF_USESTDHANDLES`) and creates no console
+for it (`CREATE_NO_WINDOW`), so its output goes to the log rather than your
+terminal; when the instance exits before connecting, `run` quotes that log's
+tail, so a refusal from the isolation gate stays visible.
 
 The desktop buys no more than that. The clipboard belongs to the window
 station, not the desktop, so a clipboard case on the separate desktop still
