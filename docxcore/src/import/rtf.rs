@@ -15,10 +15,14 @@
 //! pairs comes out as U+FFFD rather than failing the document.
 
 use super::{Budget, Builder, MAX_DEPTH, TOO_BIG, heading_props, marker_is_numbered};
+
+/// The longest list marker or style name kept, in bytes.
+const MAX_NAME: usize = 64;
 use crate::model::{Align, Document, ParProps, RunProps, VertAlign};
 use std::collections::HashMap;
 
-/// Read an RTF file. `Err` only when it is not RTF at all or holds no text.
+/// Read an RTF file. `Err` when it is not RTF at all, holds no text, or
+/// would cost more than an import may ([`TOO_BIG`]).
 pub fn import_rtf(bytes: &[u8]) -> Result<Document, String> {
     import_rtf_within(bytes, &Budget::standard())
 }
@@ -198,7 +202,9 @@ impl<'a> Reader<'a> {
                     .strip_prefix("heading")
                     .and_then(|r| r.trim().parse::<u8>().ok())
                 {
-                    self.headings.insert(n, level);
+                    if self.headings.contains_key(&n) || self.budget.keep::<(i32, u8)>(0) {
+                        self.headings.insert(n, level);
+                    }
                 }
             }
         }
@@ -477,12 +483,28 @@ impl<'a> Reader<'a> {
         match w {
             b"f" => {
                 self.font_entry = n;
-                self.fonts.entry(n).or_default();
+                self.font_slot(n);
             }
-            b"fcharset" => self.fonts.entry(self.font_entry).or_default().charset = Some(n),
-            b"cpg" => self.fonts.entry(self.font_entry).or_default().codepage = Some(n),
+            b"fcharset" => {
+                if let Some(f) = self.font_slot(self.font_entry) {
+                    f.charset = Some(n);
+                }
+            }
+            b"cpg" => {
+                if let Some(f) = self.font_slot(self.font_entry) {
+                    f.codepage = Some(n);
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Font table entry `n`, a new one charged as kept memory.
+    fn font_slot(&mut self, n: i32) -> Option<&mut Font> {
+        if !self.fonts.contains_key(&n) && !self.budget.keep::<(i32, Font)>(0) {
+            return None;
+        }
+        Some(self.fonts.entry(n).or_default())
     }
 
     fn visible(&self) -> bool {
@@ -500,10 +522,19 @@ impl<'a> Reader<'a> {
         };
         match self.st.dest {
             Dest::Body if !self.st.hidden => self.out.text(s, &self.st.run),
-            Dest::ListText => self.list_text.push_str(s),
+            // A list marker or a style name is a few characters; what is
+            // past MAX_NAME is not kept (each is read again per paragraph,
+            // per cell and per row).
+            Dest::ListText => {
+                if self.list_text.len() < MAX_NAME {
+                    self.list_text.push_str(s);
+                }
+            }
             Dest::StyleSheet => {
                 if let Some((_, name)) = self.style_entry.as_mut() {
-                    name.push_str(s);
+                    if name.len() < MAX_NAME {
+                        name.push_str(s);
+                    }
                 }
             }
             _ => {}
@@ -513,7 +544,7 @@ impl<'a> Reader<'a> {
     fn tab(&mut self) {
         match self.st.dest {
             Dest::Body if !self.st.hidden => self.out.tab(&self.st.run),
-            Dest::ListText => self.list_text.push('\t'),
+            Dest::ListText if self.list_text.len() < MAX_NAME => self.list_text.push('\t'),
             _ => {}
         }
     }
@@ -842,5 +873,31 @@ mod tests {
         r.run();
         assert_eq!(r.stack.len(), MAX_DEPTH);
         assert_eq!(r.deep, 100_001 - MAX_DEPTH);
+    }
+
+    /// FIX r3: a list marker is read again for every cell and row; only its
+    /// first MAX_NAME bytes are kept.
+    #[test]
+    fn a_huge_list_marker_is_cut() {
+        let mut rtf = String::from(r"{\rtf1\ls1{\listtext ");
+        rtf.push_str(&"a".repeat(1_000_000));
+        rtf.push_str(".}");
+        rtf.push_str(&r"x\cell ".repeat(1000));
+        let budget = Budget::standard();
+        let mut r = Reader::new(rtf.as_bytes(), &budget);
+        r.run();
+        assert!(r.list_text.len() <= MAX_NAME, "{}", r.list_text.len());
+    }
+
+    /// FIX r3: a row of 63 cells, then a table paragraph with no cell end:
+    /// its text joins the last cell.
+    #[test]
+    fn text_after_a_full_row_is_kept() {
+        let mut rtf = String::from(r"{\rtf1 ");
+        rtf.push_str(&r"\intbl c\cell ".repeat(crate::import::MAX_COLUMNS));
+        rtf.push_str(r"\intbl tail\par\pard after\par}");
+        let all = texts(&rtf).join("|");
+        assert!(all.contains("tail"), "{all}");
+        assert!(all.contains("after"), "{all}");
     }
 }

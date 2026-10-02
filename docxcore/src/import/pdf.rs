@@ -23,7 +23,7 @@
 //! larger than the body's. Images, vector graphics and annotations are not
 //! converted.
 
-use super::{Budget, Builder, TOO_BIG, heading_props, marker_is_numbered};
+use super::{Budget, Builder, TOO_BIG, heading_props, inflate_within, marker_is_numbered};
 use crate::model::{Document, ParProps, RunProps};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -31,6 +31,15 @@ use std::rc::Rc;
 
 /// What one font's ToUnicode CMap, or its widths, may map.
 const MAX_CMAP_ENTRIES: usize = 1 << 20;
+/// The longest ToUnicode destination kept, in UTF-16 units: a ligature is a
+/// few, so a long one is cut, and no glyph's text can be large.
+const MAX_CMAP_DST: usize = 32;
+/// PDF's longest name, in bytes; a longer one is cut.
+const MAX_NAME: usize = 127;
+/// The most glyphs one import keeps.
+const MAX_GLYPHS: usize = 2_000_000;
+/// The most filters a stream is decoded through.
+const MAX_FILTERS: usize = 8;
 
 /// Read a PDF. `Err` when it is encrypted, damaged past reading, has no
 /// text (a scan, or images only), or would cost more than an import may.
@@ -133,6 +142,9 @@ struct Lexer<'a> {
     /// comments, strings and nested operands included); `None` for the
     /// few lexers that read a bounded slice. Once it is out the lexer ends.
     budget: Option<&'a Budget>,
+    /// The tokens are kept (the file's objects, a CMap's tokens): each is
+    /// also charged as memory built. A content stream's are not.
+    keeps: bool,
 }
 
 fn is_ws(b: u8) -> bool {
@@ -152,6 +164,7 @@ impl<'a> Lexer<'a> {
             s,
             pos: 0,
             budget: None,
+            keeps: false,
         }
     }
 
@@ -160,6 +173,15 @@ impl<'a> Lexer<'a> {
             s,
             pos: 0,
             budget: Some(budget),
+            keeps: false,
+        }
+    }
+
+    /// A charged lexer whose tokens are kept.
+    fn building(s: &'a [u8], budget: &'a Budget) -> Self {
+        Lexer {
+            keeps: true,
+            ..Lexer::charged(s, budget)
         }
     }
 
@@ -168,7 +190,14 @@ impl<'a> Lexer<'a> {
         let start = self.pos;
         let tok = self.next_token();
         if let Some(b) = self.budget {
-            if !b.scanned(self.pos - start) {
+            let heap = match &tok {
+                Some(Tok::Str(v) | Tok::Kw(v)) => v.len(),
+                Some(Tok::Name(n)) => n.len(),
+                _ => 0,
+            };
+            // A kept token becomes an object of about its size.
+            let kept = !self.keeps || b.alloc(std::mem::size_of::<Obj>() + heap);
+            if !b.scanned(self.pos - start) || !kept {
                 self.pos = self.s.len();
                 return None;
             }
@@ -333,12 +362,16 @@ impl<'a> Lexer<'a> {
                     .and_then(|h| std::str::from_utf8(h).ok())
                     .and_then(|h| u8::from_str_radix(h, 16).ok())
                 {
-                    out.push(v);
+                    if out.len() < MAX_NAME {
+                        out.push(v);
+                    }
                     self.pos += 2;
                     continue;
                 }
             }
-            out.push(b);
+            if out.len() < MAX_NAME {
+                out.push(b);
+            }
         }
         String::from_utf8_lossy(&out).into_owned()
     }
@@ -429,9 +462,9 @@ struct File {
     /// Streams decoded so far, by object: a form drawn a thousand times,
     /// or a content stream listed a thousand times, is decoded once.
     streams: RefCell<HashMap<u32, Rc<Vec<u8>>>>,
-    /// Fonts loaded so far, by object, for every page; shared, never
-    /// copied on a lookup.
-    fonts: RefCell<HashMap<u32, Rc<Font>>>,
+    /// Fonts loaded so far, for every page; shared, never copied on a
+    /// lookup.
+    fonts: RefCell<HashMap<FontKey, Rc<Font>>>,
 }
 
 impl File {
@@ -439,7 +472,7 @@ impl File {
         let mut objects: HashMap<u32, Obj> = HashMap::new();
         let mut root = None;
         let mut encrypted = false;
-        let mut lx = Lexer::charged(bytes, &budget);
+        let mut lx = Lexer::building(bytes, &budget);
         // The last two tokens, to recognise `n g obj`.
         let mut prev: [Option<Tok>; 2] = [None, None];
         while let Some(tok) = lx.next() {
@@ -513,7 +546,7 @@ impl File {
                 if objects.contains_key(&id) || at >= end || at >= data.len() {
                     continue;
                 }
-                let mut lx = Lexer::charged(&data[at..end.min(data.len())], &budget);
+                let mut lx = Lexer::building(&data[at..end.min(data.len())], &budget);
                 if let Some(o) = lx.object(0) {
                     objects.insert(id, o);
                 }
@@ -636,7 +669,7 @@ impl File {
     }
 
     /// The pages in order, each with its (possibly inherited) resources.
-    fn pages(&self) -> Vec<PageRef> {
+    fn pages(&self) -> Vec<PageRef<'_>> {
         let mut out = Vec::new();
         let root = self
             .root
@@ -661,49 +694,51 @@ impl File {
                 .collect();
             ids.sort_unstable();
             for id in ids {
-                let d = self
-                    .get(id)
-                    .and_then(Obj::as_dict)
-                    .cloned()
-                    .unwrap_or_default();
-                let resources = dict_get(&d, "Resources").cloned().map(Rc::new);
-                out.push(PageRef { dict: d, resources });
+                if !self.budget.keep::<PageRef>(0) {
+                    break;
+                }
+                if let Some(d) = self.get(id).and_then(Obj::as_dict) {
+                    let resources = dict_get(d, "Resources");
+                    out.push(PageRef { dict: d, resources });
+                }
             }
         }
         out
     }
 
-    fn walk_pages(
-        &self,
-        node: &Obj,
-        inherited: Option<&Rc<Obj>>,
-        out: &mut Vec<PageRef>,
-        seen: &mut HashSet<u32>,
+    /// Every call is a unit of work. A node is walked once, and so is a
+    /// `/Kids` array, by identity (address in the object map), whether they
+    /// are reached by reference or written inline: shared arrays cannot make
+    /// the walk quadratic or exponential. Pages borrow their dictionaries.
+    fn walk_pages<'f>(
+        &'f self,
+        node: &'f Obj,
+        inherited: Option<&'f Obj>,
+        out: &mut Vec<PageRef<'f>>,
+        seen: &mut HashSet<usize>,
         depth: usize,
     ) {
-        if depth > 64 || out.len() > 100_000 {
+        if depth > 64 || out.len() > 100_000 || !self.budget.op() {
             return;
         }
-        if let Obj::Ref(r) = node {
-            if !seen.insert(*r) {
-                return;
-            }
-        }
         let Some(d) = self.dict_of(node) else { return };
-        // A node's own resources are copied once and shared by every page
-        // under it, never copied per page.
-        let own = dict_get(d, "Resources").map(|r| Rc::new(r.clone()));
-        let resources = own.as_ref().or(inherited);
+        if !seen.insert(d as *const Dict as usize) {
+            return;
+        }
+        let resources = dict_get(d, "Resources").or(inherited);
         match dict_get(d, "Kids").map(|k| self.resolve(k)) {
             Some(Obj::Array(kids)) => {
-                for kid in kids {
-                    self.walk_pages(kid, resources, out, seen, depth + 1);
+                if seen.insert(kids as *const Vec<Obj> as usize) {
+                    for kid in kids {
+                        self.walk_pages(kid, resources, out, seen, depth + 1);
+                    }
                 }
             }
-            _ => out.push(PageRef {
-                dict: d.clone(),
-                resources: resources.cloned(),
-            }),
+            _ => {
+                if self.budget.keep::<PageRef>(0) {
+                    out.push(PageRef { dict: d, resources });
+                }
+            }
         }
     }
 
@@ -725,7 +760,9 @@ impl File {
 
     fn page_glyphs(&self, page: &PageRef) -> Vec<Glyph> {
         let mut content: Rc<Vec<u8>> = Rc::default();
-        match dict_get(&page.dict, "Contents").map(|c| self.resolve(c)) {
+        // Passed on unresolved, so a shared stream hits the decode cache.
+        let contents = dict_get(page.dict, "Contents");
+        match contents.map(|c| self.resolve(c)) {
             Some(Obj::Array(parts)) => {
                 for p in parts {
                     if let Some(data) = self.stream_data(p) {
@@ -741,8 +778,8 @@ impl File {
                 }
             }
             // Shared, not copied: the lexer charges every pass over it.
-            Some(o @ Obj::Stream(..)) => {
-                if let Some(data) = self.stream_data(o) {
+            Some(Obj::Stream(..)) => {
+                if let Some(data) = contents.and_then(|c| self.stream_data(c)) {
                     content = data;
                 }
             }
@@ -751,13 +788,11 @@ impl File {
         let empty = Dict::new();
         let resources = page
             .resources
-            .as_deref()
             .and_then(|r| self.dict_of(r))
             .unwrap_or(&empty);
         let mut run = Interp {
             file: self,
             glyphs: Vec::new(),
-            fonts: HashMap::new(),
             form_stack: Vec::new(),
         };
         run.content(&content, resources, IDENTITY, 0);
@@ -765,74 +800,91 @@ impl File {
     }
 }
 
-struct PageRef {
-    dict: Dict,
-    resources: Option<Rc<Obj>>,
+/// A page and its (possibly inherited) resources, borrowed from the file's
+/// objects: nothing is copied per page.
+struct PageRef<'f> {
+    dict: &'f Dict,
+    resources: Option<&'f Obj>,
 }
 
 /// A stream's data with its filters undone (Flate, ASCIIHex, ASCII85;
 /// anything else, an image codec among them, gives nothing).
 ///
-/// Decoded bytes are spent from `budget`; a stream that would pass it
-/// stops there, and the import fails.
+/// The raw data is charged as scanned; every stage's output is spent from
+/// the decoded bytes, and a stream that would pass them stops there and the
+/// import fails. `/Filter` and `/DecodeParms` are borrowed, never copied,
+/// and at most [`MAX_FILTERS`] of them are read.
 fn decode_stream(d: &Dict, raw: &[u8], objects: &HashMap<u32, Obj>, budget: &Budget) -> Vec<u8> {
-    let resolve = |o: &Obj| -> Obj {
+    fn resolve<'o>(o: &'o Obj, objects: &'o HashMap<u32, Obj>) -> &'o Obj {
         match o {
-            Obj::Ref(r) => objects.get(r).cloned().unwrap_or(Obj::Null),
-            _ => o.clone(),
+            Obj::Ref(r) => objects.get(r).unwrap_or(&Obj::Null),
+            _ => o,
         }
-    };
-    let filters: Vec<String> = match dict_get(d, "Filter").map(resolve) {
-        Some(Obj::Name(n)) => vec![n],
+    }
+    let filters: Vec<&str> = match dict_get(d, "Filter").map(|f| resolve(f, objects)) {
+        Some(Obj::Name(n)) => vec![n.as_str()],
         Some(Obj::Array(a)) => a
             .iter()
-            .filter_map(|f| resolve(f).as_name().map(str::to_string))
+            .take(MAX_FILTERS)
+            .filter_map(|f| resolve(f, objects).as_name())
             .collect(),
         _ => Vec::new(),
     };
-    let parms: Vec<Option<Dict>> = match dict_get(d, "DecodeParms").map(resolve) {
+    let parms: Vec<Option<&Dict>> = match dict_get(d, "DecodeParms").map(|p| resolve(p, objects)) {
         Some(Obj::Dict(p)) => vec![Some(p)],
-        Some(Obj::Array(a)) => a.iter().map(|p| resolve(p).as_dict().cloned()).collect(),
+        Some(Obj::Array(a)) => a
+            .iter()
+            .take(filters.len())
+            .map(|p| resolve(p, objects).as_dict())
+            .collect(),
         _ => Vec::new(),
     };
-    let mut data = raw.to_vec();
+    if !budget.scanned(raw.len()) || !budget.work(d.len()) {
+        return Vec::new();
+    }
+    let mut data = std::borrow::Cow::Borrowed(raw);
     for (i, f) in filters.iter().enumerate() {
-        data = match f.as_str() {
+        let out = match *f {
             "FlateDecode" | "Fl" => {
                 let Ok(out) = inflate_within(zlib_body(&data), budget) else {
                     return Vec::new();
                 };
-                match parms.get(i).cloned().flatten() {
-                    Some(p) => png_predictor(&out, &p),
+                match parms.get(i).copied().flatten() {
+                    // The predictor's output is a second stage, charged too.
+                    Some(p) => {
+                        let undone = png_predictor(&out, p);
+                        if !budget.take_bytes(undone.len()) {
+                            return Vec::new();
+                        }
+                        undone
+                    }
                     None => out,
                 }
             }
             "ASCIIHexDecode" | "AHx" => {
                 let mut lx = Lexer::new(&data);
-                lx.hex_string()
+                let out = lx.hex_string();
+                if !budget.take_bytes(out.len()) {
+                    return Vec::new();
+                }
+                out
             }
-            "ASCII85Decode" | "A85" => ascii85(&data),
+            "ASCII85Decode" | "A85" => {
+                // `z` makes four bytes of one: capped at the room as made.
+                let Some(out) = ascii85(&data, budget.room()) else {
+                    budget.fail();
+                    return Vec::new();
+                };
+                if !budget.take_bytes(out.len()) {
+                    return Vec::new();
+                }
+                out
+            }
             _ => return Vec::new(),
         };
+        data = std::borrow::Cow::Owned(out);
     }
-    data
-}
-
-/// Inflate `body` spending decoded bytes from `budget`, capped inside each
-/// block at what is left. Past it: `Err` with what was decoded up to the cap
-/// (no more), and the budget out.
-fn inflate_within(body: &[u8], budget: &Budget) -> Result<Vec<u8>, Vec<u8>> {
-    let room = budget.room();
-    if room == 0 {
-        budget.fail();
-        return Err(Vec::new());
-    }
-    let out = opccore::inflate::inflate_partial(body, room);
-    if out.len() >= room || !budget.take_bytes(out.len()) {
-        budget.fail();
-        return Err(out);
-    }
-    Ok(out)
+    data.into_owned()
 }
 
 /// A zlib stream's DEFLATE body (its two-byte header skipped when present).
@@ -918,11 +970,15 @@ fn png_predictor(data: &[u8], parms: &Dict) -> Vec<u8> {
     out
 }
 
-fn ascii85(data: &[u8]) -> Vec<u8> {
+/// ASCII85 data decoded; `None` once the output would pass `cap` bytes.
+fn ascii85(data: &[u8], cap: usize) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let mut group = [0u8; 5];
     let mut n = 0;
     for &b in data {
+        if out.len() >= cap {
+            return None;
+        }
         match b {
             b'~' => break,
             b'z' if n == 0 => out.extend_from_slice(&[0, 0, 0, 0]),
@@ -945,7 +1001,7 @@ fn ascii85(data: &[u8]) -> Vec<u8> {
         let v = group.iter().fold(0u64, |a, &d| a * 85 + u64::from(d));
         out.extend_from_slice(&(v as u32).to_be_bytes()[..n - 1]);
     }
-    out
+    (out.len() < cap).then_some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -966,11 +1022,17 @@ struct Font {
 }
 
 impl Font {
+    /// Its work is charged: the font dictionary's entries and the 256-entry
+    /// table; the descendant's, the encoding's, every width and every
+    /// /Differences entry as they are read.
     fn load(file: &File, d: &Dict) -> Font {
         let mut f = Font {
             default_width: 500.0,
             ..Font::default()
         };
+        if !file.budget.work(256 + d.len()) {
+            return f;
+        }
         let subtype = file
             .lookup(d, "Subtype")
             .and_then(Obj::as_name)
@@ -993,7 +1055,8 @@ impl Font {
         if face.starts_with("courier") {
             f.default_width = 600.0;
         }
-        if let Some(cmap) = file.lookup(d, "ToUnicode") {
+        // Unresolved, so a CMap shared by many fonts is decoded once.
+        if let Some(cmap) = dict_get(d, "ToUnicode") {
             if let Some(data) = file.stream_data(cmap) {
                 f.to_unicode = parse_cmap(&data, &file.budget);
             }
@@ -1007,7 +1070,7 @@ impl Font {
                 Some(Obj::Array(a)) => a.first().and_then(|x| file.dict_of(x)),
                 _ => None,
             };
-            if let Some(desc) = desc {
+            if let Some(desc) = desc.filter(|desc| file.budget.work(desc.len())) {
                 f.default_width = file
                     .lookup(desc, "DW")
                     .and_then(Obj::as_num)
@@ -1033,6 +1096,10 @@ impl Font {
                         match w.get(i + 1).map(|o| file.resolve(o)) {
                             Some(Obj::Array(list)) => {
                                 for (k, wd) in list.iter().enumerate() {
+                                    // Every entry is read, number or not.
+                                    if !file.budget.op() {
+                                        break 'w;
+                                    }
                                     if let Some(wd) = file.resolve(wd).as_num() {
                                         let c = c0.saturating_add(k as u32);
                                         if !put(&mut f.widths, c, wd) {
@@ -1081,16 +1148,18 @@ impl Font {
                 Some(Obj::Name(n)) if n == "MacRomanEncoding" => {
                     table = std::array::from_fn(|b| mac_roman(b as u8));
                 }
-                Some(o @ Obj::Dict(_)) => {
-                    let ed = o.as_dict().cloned().unwrap_or_default();
-                    if file.lookup(&ed, "BaseEncoding").and_then(Obj::as_name)
+                Some(Obj::Dict(ed)) if file.budget.work(ed.len()) => {
+                    if file.lookup(ed, "BaseEncoding").and_then(Obj::as_name)
                         == Some("MacRomanEncoding")
                     {
                         table = std::array::from_fn(|b| mac_roman(b as u8));
                     }
-                    if let Some(Obj::Array(diffs)) = file.lookup(&ed, "Differences") {
+                    if let Some(Obj::Array(diffs)) = file.lookup(ed, "Differences") {
                         let mut code = 0usize;
                         for o in diffs {
+                            if !file.budget.op() {
+                                break;
+                            }
                             match file.resolve(o) {
                                 Obj::Num(n) => code = *n as usize,
                                 Obj::Name(g) => {
@@ -1161,11 +1230,14 @@ impl Font {
 /// entry, so many (or overlapping) ranges must not add up to millions.
 fn parse_cmap(data: &[u8], budget: &Budget) -> HashMap<u32, String> {
     let mut map = HashMap::new();
-    let mut lx = Lexer::charged(data, budget);
+    let mut lx = Lexer::building(data, budget);
     let code = |s: &[u8]| s.iter().fold(0u32, |a, &b| a << 8 | u32::from(b));
+    // A destination is at most MAX_CMAP_DST units (the rest is cut), so no
+    // mapping, and no glyph's text copied from it, is large.
     let utf16 = |s: &[u8]| -> String {
         let units: Vec<u16> = s
             .chunks(2)
+            .take(MAX_CMAP_DST)
             .map(|p| u16::from(p[0]) << 8 | u16::from(*p.get(1).unwrap_or(&0)))
             .collect();
         char::decode_utf16(units)
@@ -1226,6 +1298,7 @@ fn parse_cmap(data: &[u8], budget: &Budget) -> HashMap<u32, String> {
                         Tok::Str(dst) => {
                             let base: Vec<u16> = dst
                                 .chunks(2)
+                                .take(MAX_CMAP_DST)
                                 .map(|p| u16::from(p[0]) << 8 | u16::from(*p.get(1).unwrap_or(&0)))
                                 .collect();
                             for (k, c) in (lo..=hi).enumerate() {
@@ -1457,7 +1530,8 @@ struct Glyph {
 #[derive(Clone)]
 struct GState {
     ctm: Matrix,
-    font: Option<String>,
+    /// The font in use: `q`/`Q` copy a pointer, not a name or a map.
+    font: Option<Rc<Font>>,
     size: f64,
     char_space: f64,
     word_space: f64,
@@ -1468,31 +1542,58 @@ struct GState {
 struct Interp<'a> {
     file: &'a File,
     glyphs: Vec<Glyph>,
-    fonts: HashMap<String, Rc<Font>>,
     /// Form XObjects being run, against a form that draws itself.
     form_stack: Vec<u32>,
 }
 
-impl Interp<'_> {
-    fn font(&mut self, resources: &Dict, name: &str) -> Rc<Font> {
-        // Keyed by the font dictionary's identity, so two forms' `/F1` differ.
-        let fonts = self
-            .file
-            .lookup(resources, "Font")
-            .and_then(|f| f.as_dict());
-        let entry = fonts.and_then(|f| dict_get(f, name));
-        // A font object is loaded once for the document; a font written
-        // inline in a resource dictionary only for this page.
-        let shared = match entry {
-            Some(Obj::Ref(r)) => Some(*r),
-            _ => None,
+/// A content run's `/Font` and `/XObject` resources, indexed once when the
+/// run starts (charged per entry), so each `Tf` and `Do` is a hash lookup,
+/// not a scan of the dictionary.
+struct ResIndex<'r> {
+    fonts: HashMap<&'r str, &'r Obj>,
+    xobjects: HashMap<&'r str, &'r Obj>,
+}
+
+impl<'r> ResIndex<'r> {
+    fn new(file: &'r File, resources: &'r Dict) -> Self {
+        // Each run reads the resources dictionary to find its two entries.
+        file.budget.work(resources.len());
+        let index = |key: &str| -> HashMap<&'r str, &'r Obj> {
+            let Some(d) = file.lookup(resources, key).and_then(|o| o.as_dict()) else {
+                return HashMap::new();
+            };
+            if !file.budget.work(d.len()) {
+                return HashMap::new();
+            }
+            d.iter().map(|(k, v)| (k.as_str(), v)).collect()
         };
-        let key = format!("{name}@{:p}", resources);
-        if let Some(f) = shared.and_then(|r| self.file.fonts.borrow().get(&r).cloned()) {
-            return f;
+        ResIndex {
+            fonts: index("Font"),
+            xobjects: index("XObject"),
         }
-        if let Some(f) = self.fonts.get(&key) {
-            return f.clone();
+    }
+}
+
+/// What a loaded font is cached by: its object, or (written inline in a
+/// resource dictionary) its address in the file's objects, which do not
+/// move while the import runs.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum FontKey {
+    Ref(u32),
+    Inline(usize),
+}
+
+impl Interp<'_> {
+    /// The font `name` names in this run's resources, loaded once for the
+    /// document (by object, or by address when written inline).
+    fn font(&mut self, index: &ResIndex, name: &str) -> Rc<Font> {
+        let entry = index.fonts.get(name).copied();
+        let key = entry.map(|e| match e {
+            Obj::Ref(r) => FontKey::Ref(*r),
+            _ => FontKey::Inline(e as *const Obj as usize),
+        });
+        if let Some(f) = key.and_then(|k| self.file.fonts.borrow().get(&k).cloned()) {
+            return f;
         }
         let font = Rc::new(
             entry
@@ -1504,21 +1605,18 @@ impl Interp<'_> {
                     ..Font::default()
                 }),
         );
-        match shared {
-            Some(r) => {
-                self.file.fonts.borrow_mut().insert(r, font.clone());
-            }
-            None => {
-                self.fonts.insert(key, font.clone());
-            }
+        if let Some(k) = key {
+            self.file.fonts.borrow_mut().insert(k, font.clone());
         }
         font
     }
 
     fn content(&mut self, data: &[u8], resources: &Dict, ctm: Matrix, depth: usize) {
-        if depth > 8 || self.glyphs.len() > 2_000_000 {
+        if depth > 8 || self.glyphs.len() >= MAX_GLYPHS {
             return;
         }
+        let file = self.file;
+        let index = ResIndex::new(file, resources);
         let mut gs = GState {
             ctm,
             font: None,
@@ -1563,8 +1661,8 @@ impl Interp<'_> {
                 b"Q" => {
                     if let Some(prev) = stack.pop() {
                         gs = prev;
-                        if let Some(name) = gs.font.clone() {
-                            font = self.font(resources, &name);
+                        if let Some(f) = &gs.font {
+                            font = f.clone();
                         }
                     }
                 }
@@ -1578,9 +1676,8 @@ impl Interp<'_> {
                 }
                 b"Tf" => {
                     if let Some(name) = ops.len().checked_sub(2).and_then(|k| ops[k].as_name()) {
-                        let name = name.to_string();
-                        font = self.font(resources, &name);
-                        gs.font = Some(name);
+                        font = self.font(&index, name);
+                        gs.font = Some(font.clone());
                     }
                     gs.size = num(1);
                 }
@@ -1634,8 +1731,7 @@ impl Interp<'_> {
                 }
                 b"Do" => {
                     if let Some(name) = ops.last().and_then(Obj::as_name) {
-                        let name = name.to_string();
-                        self.form(resources, &name, &gs.ctm, depth);
+                        self.form(&index, resources, name, &gs.ctm, depth);
                     }
                 }
                 b"BI" => {
@@ -1669,12 +1765,8 @@ impl Interp<'_> {
         }
     }
 
-    fn form(&mut self, resources: &Dict, name: &str, ctm: &Matrix, depth: usize) {
-        let xobjects = self
-            .file
-            .lookup(resources, "XObject")
-            .and_then(|x| x.as_dict());
-        let Some(entry) = xobjects.and_then(|x| dict_get(x, name)) else {
+    fn form(&mut self, index: &ResIndex, resources: &Dict, name: &str, ctm: &Matrix, depth: usize) {
+        let Some(&entry) = index.xobjects.get(name) else {
             return;
         };
         let id = match entry {
@@ -1687,6 +1779,10 @@ impl Interp<'_> {
         let Obj::Stream(d, _) = self.file.resolve(entry) else {
             return;
         };
+        // Its dictionary is read on every draw: charged every draw.
+        if !self.file.budget.work(d.len()) {
+            return;
+        }
         if dict_get(d, "Subtype")
             .map(|s| self.file.resolve(s))
             .and_then(Obj::as_name)
@@ -1723,11 +1819,16 @@ impl Interp<'_> {
     /// of them for free.
     fn show(&mut self, s: &[u8], font: &Font, gs: &GState, tm: &mut Matrix) {
         for code in font.codes(s) {
-            if !self.file.budget.op() {
+            // Capped here, inside one string, not only between streams.
+            if self.glyphs.len() >= MAX_GLYPHS {
+                self.file.budget.fail();
                 return;
             }
             let w0 = font.width(code);
             let text = font.text(code);
+            if !self.file.budget.keep::<Glyph>(text.len()) {
+                return;
+            }
             let is_space = !font.two_byte && code == 32;
             let trm = mul(
                 &[gs.size * gs.scale, 0.0, 0.0, gs.size, 0.0, 0.0],
@@ -1965,7 +2066,7 @@ fn layout(pages: &[Vec<Line>], budget: &Budget) -> Document {
                 _ => 0,
             };
             for piece in &line.pieces {
-                let mut t: String = piece.text.chars().skip(skip).collect();
+                let t: String = piece.text.chars().skip(skip).collect();
                 skip = skip.saturating_sub(piece.text.chars().count());
                 if t.is_empty() {
                     continue;
@@ -1975,13 +2076,14 @@ fn layout(pages: &[Vec<Line>], budget: &Budget) -> Document {
                     italic: piece.italic,
                     ..RunProps::default()
                 };
-                // Tabs between columns stay tabs.
-                while let Some(i) = t.find('\t') {
-                    out.text(&t[..i], &props);
-                    out.tab(&props);
-                    t = t[i + 1..].to_string();
+                // Tabs between columns stay tabs (each segment once, not the
+                // rest copied again per tab).
+                for (k, seg) in t.split('\t').enumerate() {
+                    if k > 0 {
+                        out.tab(&props);
+                    }
+                    out.text(seg, &props);
                 }
-                out.text(&t, &props);
             }
             prev = Some(line);
         }
@@ -2472,20 +2574,19 @@ mod tests {
         let file = one_page(b"BT /F1 11 Tf ET");
         let f = File::scan(&file, Budget::standard());
         let pages = f.pages();
-        let resources = pages[0]
-            .resources
-            .as_deref()
-            .and_then(|r| f.dict_of(r))
-            .unwrap();
+        let resources = pages[0].resources.and_then(|r| f.dict_of(r)).unwrap();
         let mut run = Interp {
             file: &f,
             glyphs: Vec::new(),
-            fonts: HashMap::new(),
             form_stack: Vec::new(),
         };
-        let a = run.font(resources, "F1");
-        let b = run.font(resources, "F1");
+        let index = ResIndex::new(&f, resources);
+        let a = run.font(&index, "F1");
+        let b = run.font(&index, "F1");
         assert!(Rc::ptr_eq(&a, &b));
+        // A second page's run, indexed again, still gets the same font.
+        let again = ResIndex::new(&f, resources);
+        assert!(Rc::ptr_eq(&a, &run.font(&again, "F1")));
     }
 
     /// FIX r2: CID widths are capped per font, charged, and their code
@@ -2516,5 +2617,264 @@ mod tests {
         let f = File::scan(b"", Budget::standard());
         let top = Font::load(&f, &font("4294967295 [500 600] 4294967290 4294967295 700"));
         assert_eq!(top.widths.get(&u32::MAX), Some(&700.0));
+    }
+
+    /// FIX r3: a ToUnicode destination is cut at MAX_CMAP_DST units, in a
+    /// bfrange (copied per code) and a bfchar alike.
+    #[test]
+    fn cmap_destinations_are_cut() {
+        let long = "0041".repeat(100_000);
+        let cmap = format!(
+            "1 beginbfrange <0000> <00FF> <{long}> endbfrange 1 beginbfchar <0100> <{long}> endbfchar"
+        );
+        let map = parse_cmap(cmap.as_bytes(), &Budget::standard());
+        assert_eq!(map.len(), 257);
+        assert!(map.values().all(|v| v.chars().count() <= MAX_CMAP_DST));
+    }
+
+    /// FIX r3: a /Kids array shared by inline nodes is walked once: this
+    /// tree would take 2^64 calls walking every path.
+    #[test]
+    fn a_shared_kids_array_is_walked_once() {
+        let file = pdf(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Kids 3 0 R >>".to_vec(),
+            b"[<< /Kids 3 0 R >> << /Kids 3 0 R >>]".to_vec(),
+        ]);
+        let f = File::scan(&file, Budget::standard());
+        assert!(f.pages().is_empty());
+        // M nodes, each naming one array of all M: walked once, not M^2.
+        let m = 20_000;
+        let refs: String = (0..m).map(|i| format!("{} 0 R ", 4 + i)).collect();
+        let mut objs = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Kids 3 0 R >>".to_vec(),
+            format!("[{refs}]").into_bytes(),
+        ];
+        for _ in 0..m {
+            objs.push(b"<< /Kids 3 0 R >>".to_vec());
+        }
+        let f = File::scan(&pdf(&objs), Budget::standard());
+        assert!(f.pages().is_empty());
+        assert!(!f.budget.exhausted());
+    }
+
+    /// FIX r3: a line with many column gaps is split once, not copied again
+    /// for every tab.
+    #[test]
+    fn many_tabs_in_a_line_split_in_one_pass() {
+        let line = Line {
+            y: 700.0,
+            x1: 500.0,
+            size: 10.0,
+            pieces: vec![Piece {
+                text: "a\t".repeat(100_000),
+                bold: false,
+                italic: false,
+            }],
+        };
+        let budget = Budget::with_built(MAX_DECODED_TEST, usize::MAX, usize::MAX);
+        let doc = layout(&[vec![line]], &budget);
+        let Block::Paragraph(p) = &doc.body[0] else {
+            panic!()
+        };
+        let tabs = p
+            .content
+            .iter()
+            .filter(|i| matches!(i, Inline::Tab(_)))
+            .count();
+        assert_eq!(tabs, 100_000);
+        // 4M tabs: the split itself is one pass (the builder, out of memory
+        // at once, keeps nothing); copying the rest per tab would move
+        // 8e12 bytes.
+        let line = Line {
+            y: 700.0,
+            x1: 500.0,
+            size: 10.0,
+            pieces: vec![Piece {
+                text: "\t".repeat(4_000_000),
+                bold: false,
+                italic: false,
+            }],
+        };
+        let budget = Budget::with_built(MAX_DECODED_TEST, usize::MAX, 0);
+        layout(&[vec![line]], &budget);
+        assert!(budget.exhausted());
+    }
+
+    /// FIX r3: resources are indexed once per run, so a big /Font
+    /// dictionary and many Tf cost a hash lookup each; a long name is cut
+    /// at 127 bytes.
+    #[test]
+    fn many_tf_against_a_big_font_dictionary_are_cheap() {
+        let fonts: String = (0..200_000).map(|i| format!("/G{i} 5 0 R ")).collect();
+        // A linear lookup per Tf would compare about 1e11 names.
+        let content = "/G199999 11 Tf ".repeat(1_000_000);
+        let file = pdf(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << {fonts} >> >> >>").into_bytes(),
+            stream("", content.as_bytes()),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        ]);
+        let f = File::scan(&file, Budget::standard());
+        let pages = f.pages();
+        f.page_glyphs(&pages[0]);
+        assert!(!f.budget.exhausted());
+        let name = format!("/{}", "n".repeat(1 << 20));
+        let mut lx = Lexer::new(name.as_bytes());
+        let Some(Tok::Name(n)) = lx.next() else {
+            panic!()
+        };
+        assert_eq!(n.len(), MAX_NAME);
+    }
+
+    /// FIX r3: pages sharing one /Contents stream, and fonts sharing one
+    /// /ToUnicode, decode it once (the cache sees the reference).
+    #[test]
+    fn shared_streams_are_decoded_once() {
+        let cmap = b"1 beginbfchar <41> <0042> endbfchar";
+        let file = pdf(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 /Resources << /Font << /F1 7 0 R /F2 8 0 R >> >> >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>".to_vec(),
+            stream("", b"BT /F1 11 Tf 72 700 Td (A) Tj /F2 11 Tf (A) Tj ET"),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 9 0 R >>".to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier /ToUnicode 9 0 R >>".to_vec(),
+            stream("", cmap),
+        ]);
+        let f = File::scan(&file, Budget::standard());
+        for page in &f.pages() {
+            f.page_glyphs(page);
+        }
+        let cached: Vec<u32> = {
+            let mut ids: Vec<u32> = f.streams.borrow().keys().copied().collect();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(cached, [6, 9]);
+    }
+
+    /// FIX r3: an inline font in shared resources is loaded once for the
+    /// document, not once a page; its /Differences are charged.
+    #[test]
+    fn an_inline_font_is_loaded_once_for_every_page() {
+        let kids: String = (0..50).map(|i| format!("{} 0 R ", 4 + i)).collect();
+        let mut objs = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            format!("<< /Type /Pages /Kids [{kids}] /Resources << /Font << /F1 << /Subtype /Type1 /BaseFont /Times /Encoding << /Differences [1 /eacute] >> >> >> >> >>").into_bytes(),
+            stream("", b"BT /F1 11 Tf 72 700 Td (\\001) Tj ET"),
+        ];
+        for _ in 0..50 {
+            objs.push(b"<< /Type /Page /Parent 2 0 R /Contents 3 0 R >>".to_vec());
+        }
+        let f = File::scan(&pdf(&objs), Budget::standard());
+        let pages = f.pages();
+        assert_eq!(pages.len(), 50);
+        for page in &pages {
+            f.page_glyphs(page);
+        }
+        assert_eq!(f.fonts.borrow().len(), 1);
+    }
+
+    /// FIX r3: the raw data and every filter stage are charged: a big
+    /// unknown-filter stream, ASCII85 `z` (1 byte -> 4) and ASCIIHex.
+    #[test]
+    fn raw_data_and_every_stage_are_charged() {
+        let raw = vec![b'x'; 1 << 20];
+        let mut lx = Lexer::new(b"<< /Filter /DCTDecode >>");
+        let Some(Obj::Dict(d)) = lx.object(0) else {
+            panic!()
+        };
+        let budget = Budget::new(MAX_DECODED_TEST, 1_000);
+        assert!(decode_stream(&d, &raw, &HashMap::new(), &budget).is_empty());
+        assert!(budget.exhausted(), "the raw megabyte was scanned for free");
+        let z = vec![b'z'; 1 << 20];
+        let mut lx = Lexer::new(b"<< /Filter /ASCII85Decode >>");
+        let Some(Obj::Dict(d)) = lx.object(0) else {
+            panic!()
+        };
+        let budget = Budget::new(1 << 20, usize::MAX);
+        assert!(decode_stream(&d, &z, &HashMap::new(), &budget).is_empty());
+        assert!(budget.exhausted());
+        let hex = b"41".repeat(1 << 20);
+        let mut lx = Lexer::new(b"<< /Filter /ASCIIHexDecode >>");
+        let Some(Obj::Dict(d)) = lx.object(0) else {
+            panic!()
+        };
+        let budget = Budget::new(1 << 19, usize::MAX);
+        assert!(decode_stream(&d, &hex, &HashMap::new(), &budget).is_empty());
+        assert!(budget.exhausted());
+    }
+
+    const MAX_DECODED_TEST: usize = 256 << 20;
+
+    /// FIX r3: every glyph is charged as memory, so one long string fails
+    /// against the memory allowance even with work to spare.
+    #[test]
+    fn glyphs_are_charged_as_memory() {
+        let mut content = b"BT /F1 11 Tf 72 700 Td (".to_vec();
+        content.extend(vec![b'a'; 100_000]);
+        content.extend(b") Tj ET");
+        let budget = Budget::with_built(MAX_DECODED_TEST, usize::MAX, 1 << 20);
+        assert_eq!(
+            import_pdf_within(&one_page(&content), budget).unwrap_err(),
+            TOO_BIG
+        );
+    }
+
+    /// FIX r3: /DecodeParms is borrowed and read only as far as the filters
+    /// go: 100 000 references to one large dictionary decode at once.
+    #[test]
+    fn decode_parms_are_borrowed() {
+        let parms = "5 0 R ".repeat(100_000);
+        let big: String = (0..1000).map(|i| format!("/K{i} {i} ")).collect();
+        let text = format!("<< /Filter /AHx /DecodeParms [{parms}] >>");
+        let mut lx = Lexer::new(text.as_bytes());
+        let Some(Obj::Dict(d)) = lx.object(0) else {
+            panic!()
+        };
+        let mut objects = HashMap::new();
+        let text = format!("<< {big} >>");
+        let mut lx = Lexer::new(text.as_bytes());
+        objects.insert(5, lx.object(0).unwrap());
+        let out = decode_stream(&d, b"4142>", &objects, &Budget::standard());
+        assert_eq!(out, b"AB");
+    }
+
+    /// Audit (r3): a form's dictionary is read on every draw, so a large
+    /// one drawn many times is charged every time.
+    #[test]
+    fn a_large_form_dictionary_is_charged_per_draw() {
+        let entries: String = (0..20_000).map(|i| format!("/K{i} {i} ")).collect();
+        let content = "/F Do ".repeat(2_000);
+        let file = pdf(&[
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /XObject << /F 5 0 R >> >> >>".to_vec(),
+            stream("", content.as_bytes()),
+            stream(&format!("/Type /XObject /Subtype /Form {entries}"), b""),
+        ]);
+        // 2000 draws x 20000 entries is 4e7 units; scanning it all is ~1e5.
+        let budget = Budget::new(MAX_DECODED_TEST, 10_000_000);
+        assert_eq!(import_pdf_within(&file, budget).unwrap_err(), TOO_BIG);
+    }
+
+    /// Audit (r3): every /W entry read is charged, number or not, so a
+    /// shared /W walked by each font is paid for each time.
+    #[test]
+    fn non_numeric_widths_are_charged() {
+        let junk = "/x ".repeat(50_000);
+        let text =
+            format!("<< /Subtype /Type0 /BaseFont /X /DescendantFonts [<< /W [0 [{junk}]] >>] >>");
+        let mut lx = Lexer::new(text.as_bytes());
+        let Some(Obj::Dict(d)) = lx.object(0) else {
+            panic!()
+        };
+        let f = File::scan(b"", Budget::new(MAX_DECODED_TEST, 10_000));
+        Font::load(&f, &d);
+        assert!(f.budget.exhausted());
     }
 }

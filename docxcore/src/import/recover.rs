@@ -13,7 +13,11 @@
 //! 8-bit (ASCII or UTF-8) and in UTF-16LE (how Word 97-2003 stores most
 //! text), each a paragraph.
 
-use super::{Budget, Builder, TOO_BIG};
+use super::{Budget, Builder, TOO_BIG, inflate_within};
+
+/// The longest part name considered (a Word part name is short); a longer
+/// one is skipped before it is copied.
+const MAX_PART_NAME: usize = 260;
 use crate::model::{Document, ParProps, RunProps};
 
 /// The text of a damaged Word package's main document part: `Ok(None)` when
@@ -123,6 +127,15 @@ fn document_xml(bytes: &[u8], budget: &Budget) -> Option<Vec<u8>> {
         let Some(name) = bytes.get(name_start..name_start + name_len) else {
             break;
         };
+        // Headers may overlap every few bytes; a name too long to be a
+        // part's, or not under word/, is rejected before it is copied.
+        if name_len > MAX_PART_NAME
+            || !name.get(..5).is_some_and(|p| {
+                p.eq_ignore_ascii_case(b"word/") || p.eq_ignore_ascii_case(b"word\\")
+            })
+        {
+            continue;
+        }
         let data_start = name_start + name_len + extra_len;
         if data_start > bytes.len() {
             break;
@@ -156,16 +169,10 @@ fn document_xml(bytes: &[u8], budget: &Budget) -> Option<Vec<u8>> {
                 }
                 rest[..end].to_vec()
             }
-            8 => {
-                // Capped inside each block at what the budget has left.
-                let room = budget.room();
-                let out = opccore::inflate::inflate_partial(rest, room);
-                if out.len() >= room || !budget.take_bytes(out.len()) {
-                    budget.fail();
-                    return None;
-                }
-                out
-            }
+            8 => match inflate_within(rest, budget) {
+                Ok(out) => out,
+                Err(_) => return None,
+            },
             _ => continue,
         };
         if main {
@@ -253,7 +260,9 @@ fn unescape(s: &str) -> String {
     while let Some(i) = rest.find('&') {
         out.push_str(&rest[..i]);
         rest = &rest[i..];
-        let Some(semi) = rest.find(';').filter(|&j| j <= 10) else {
+        // A reference is at most 10 bytes: look for its `;` only there.
+        let window = &rest.as_bytes()[..rest.len().min(11)];
+        let Some(semi) = window.iter().position(|&b| b == b';') else {
             out.push('&');
             rest = &rest[1..];
             continue;
@@ -584,13 +593,53 @@ mod tests {
 
     #[test]
     fn a_bomb_in_the_main_part_fails_within_the_budget() {
-        // A stored stream far larger than the room: Err, not 256 MiB.
+        // A stream far larger than the room: Err, decoded only up to the
+        // room (document_xml decodes through the shared inflate_within,
+        // whose cap is checked in mod.rs's inflate_within_never_runs_uncapped).
         let big = vec![b'a'; 2 << 20];
-        let zip = local("word/document.xml", 8, &deflate_stored(&big), false);
+        let body = deflate_stored(&big);
+        let zip = local("word/document.xml", 8, &body, false);
         let budget = Budget::new(1 << 20, crate::import::MAX_WORK);
         assert_eq!(
             recover_docx_text_within(&zip, &budget).unwrap_err(),
             TOO_BIG
         );
+        // The budget's bytes spent exactly by an earlier part leave a room of
+        // 0: the main part must fail, not inflate uncapped.
+        let stored = vec![b'b'; 1000];
+        let mut zip = local("word/document2.xml", 0, &stored, true);
+        zip.extend(local("word/document.xml", 8, &body, false));
+        let budget = Budget::new(1000, crate::import::MAX_WORK);
+        assert_eq!(
+            recover_docx_text_within(&zip, &budget).unwrap_err(),
+            TOO_BIG
+        );
+    }
+
+    /// FIX r3: a run of ampersands with no `;` near them costs a bounded
+    /// look each, not a search of the rest of the text.
+    #[test]
+    fn many_ampersands_unescape_in_one_pass() {
+        // Searching the rest per `&` would compare 8e12 bytes.
+        let amps = "&".repeat(4_000_000);
+        assert_eq!(unescape(&amps), amps);
+        assert_eq!(
+            unescape("a &amp; b &#x416; &notreal; &"),
+            "a & b \u{416} &notreal; &"
+        );
+    }
+
+    /// FIX r3: headers overlapping every 16 bytes with 64 KB names are
+    /// rejected before their names are copied.
+    #[test]
+    fn overlapping_headers_with_long_names_are_skipped_cheaply() {
+        let mut period = [0u8; 16];
+        period[..4].copy_from_slice(LOCAL);
+        // name_len at offset 26 lies past a 16-byte period: put the header's
+        // name length in the next period's bytes 10..12 (26 - 16).
+        period[10] = 0xFF;
+        period[11] = 0xFF;
+        let file: Vec<u8> = period.iter().copied().cycle().take(4 << 20).collect();
+        assert!(recover_docx_text(&file).unwrap().is_none());
     }
 }

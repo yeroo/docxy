@@ -18,9 +18,13 @@
 //! converted.
 
 use super::{Budget, Builder, MAX_DEPTH, TOO_BIG, heading_props, marker_is_numbered};
+
+/// The longest tag name or list marker kept, in bytes.
+const MAX_TAG: usize = 32;
 use crate::model::{Align, Document, ParProps, RunProps, VertAlign};
 
-/// Read an HTML page. `Err` only when it holds no text.
+/// Read an HTML page. `Err` when it holds no text, or would cost more
+/// than an import may ([`TOO_BIG`]).
 pub fn import_html(bytes: &[u8]) -> Result<Document, String> {
     import_html_within(bytes, &Budget::standard())
 }
@@ -251,7 +255,10 @@ impl<'a> Html<'a> {
             self.pos += 1;
             return self.text("<");
         }
-        let name = rest[name_start..name_start + name_len].to_ascii_lowercase();
+        // A tag name is ASCII (the scan above takes only alphanumerics, `:`
+        // and `-`); only its first MAX_TAG bytes are kept and matched, so a
+        // long one is not copied onto a stack.
+        let name = rest[name_start..name_start + name_len.min(MAX_TAG)].to_ascii_lowercase();
         // The attributes run to the `>` (one byte, a char boundary), or to
         // the end of a page cut inside the tag, never into a character.
         let (end, attrs_end) = match tag_end(rest) {
@@ -481,7 +488,9 @@ impl<'a> Html<'a> {
         let text = entities(raw);
         if self.in_marker {
             if let Some(m) = self.marker.as_mut() {
-                m.push_str(&text);
+                if m.len() < MAX_TAG {
+                    m.push_str(&text);
+                }
             }
             return;
         }
@@ -1105,16 +1114,18 @@ mod tests {
     /// quadratic scan of an unbounded stack; the stacks stop at MAX_DEPTH.
     #[test]
     fn element_stacks_stop_at_max_depth() {
+        // Opens on every stack, then closes that match nothing on any:
+        // each stack must have stopped at exactly MAX_DEPTH.
         let page = format!(
-            "<p>{}text{}</p>",
+            "{}text{}",
             "<b><div><ul>".repeat(10_000),
-            "</i></p></ol>".repeat(10_000)
+            "</i></h6></caption>".repeat(10_000)
         );
         let budget = Budget::standard();
         let mut h = Html::new(&page, &budget);
         h.run();
-        assert!(h.inline.len() <= MAX_DEPTH, "{}", h.inline.len());
-        assert!(h.blocks.len() <= MAX_DEPTH, "{}", h.blocks.len());
-        assert!(h.lists.len() <= MAX_DEPTH, "{}", h.lists.len());
+        assert_eq!(h.inline.len(), MAX_DEPTH);
+        assert_eq!(h.blocks.len(), MAX_DEPTH);
+        assert_eq!(h.lists.len(), MAX_DEPTH);
     }
 }
