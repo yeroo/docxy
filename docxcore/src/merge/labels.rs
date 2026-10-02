@@ -503,7 +503,7 @@ mod tests {
                     panic!()
                 };
                 match (r, c) {
-                    (0, 0) => assert_eq!(p.content, [ab.clone()]),
+                    (0, 0) => assert_eq!(p.content, std::slice::from_ref(&ab)),
                     (_, 1) => assert!(p.content.is_empty(), "spacer"),
                     _ => {
                         assert_eq!(p.content.len(), 2, "({r},{c})");
