@@ -1414,37 +1414,51 @@ impl Package {
     /// gets a new, empty one, referenced from that section's sectPr (later
     /// sections inherit it).
     fn shown_header_parts(&mut self, sect_prs: &mut [String], create: bool) -> Vec<String> {
-        let even = self.has_even_odd();
+        // A new part changes what later sections inherit: look again after each.
+        while let Some((k, variant)) = self
+            .shown_header_slots(sect_prs)
+            .into_iter()
+            .find_map(|(k, variant, part)| part.is_none().then_some((k, variant)))
+            .filter(|_| create)
+        {
+            self.ensure_styles(&["Header"]);
+            let Some((rid, _)) = self.create_hf_part(true, "<w:p/>") else {
+                break;
+            };
+            sect_prs[k] =
+                crate::sect::set_hf_reference(&sect_prs[k], true, variant.as_ooxml(), Some(&rid));
+        }
         let mut out: Vec<String> = Vec::new();
-        for k in 0..sect_prs.len() {
-            let applied = section_header_parts(&sect_prs[..], &self.document_rels());
-            let title = crate::sect::has_flag(&sect_prs[k], "w:titlePg");
+        for (_, _, part) in self.shown_header_slots(sect_prs) {
+            if let Some(name) = part.filter(|n| !out.contains(n)) {
+                out.push(name);
+            }
+        }
+        out
+    }
+
+    /// Every header slot `sect_prs` show, in order: each section's default
+    /// header, its first-page header when it has `w:titlePg`, and its
+    /// even-page header when the document has `w:evenAndOddHeaders`, with
+    /// the part it resolves to (inherited included), `None` when it has none.
+    /// The one rule the watermark writer and reader share.
+    fn shown_header_slots<S: AsRef<str>>(
+        &self,
+        sect_prs: &[S],
+    ) -> Vec<(usize, HeaderVariant, Option<String>)> {
+        let even = self.has_even_odd();
+        let applied = section_header_parts(sect_prs, &self.document_rels());
+        let mut out = Vec::new();
+        for (k, (sect, parts)) in sect_prs.iter().zip(&applied).enumerate() {
+            let title = crate::sect::has_flag(sect.as_ref(), "w:titlePg");
             for variant in HeaderVariant::ALL {
                 if (variant == HeaderVariant::First && !title)
                     || (variant == HeaderVariant::Even && !even)
                 {
                     continue;
                 }
-                let name = match applied[k].get(true, variant) {
-                    Some(part) => part.part_name.clone(),
-                    None if create => {
-                        self.ensure_styles(&["Header"]);
-                        let Some((rid, name)) = self.create_hf_part(true, "<w:p/>") else {
-                            continue;
-                        };
-                        sect_prs[k] = crate::sect::set_hf_reference(
-                            &sect_prs[k],
-                            true,
-                            variant.as_ooxml(),
-                            Some(&rid),
-                        );
-                        name
-                    }
-                    None => continue,
-                };
-                if !out.contains(&name) {
-                    out.push(name);
-                }
+                let part = parts.get(true, variant).map(|p| p.part_name.clone());
+                out.push((k, variant, part));
             }
         }
         out
@@ -1561,29 +1575,16 @@ impl Package {
     /// what Design > Watermark reads as current while sections are being
     /// edited, unlike [`Package::watermarks`], which reads the loaded ones.
     pub fn shown_text_watermarks<S: AsRef<str>>(&self, sect_prs: &[S]) -> Vec<TextWatermark> {
-        let even = self.has_even_odd();
-        let applied = section_header_parts(sect_prs, &self.document_rels());
-        let mut seen: Vec<&str> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
         let mut out = Vec::new();
-        for (sect, parts) in sect_prs.iter().zip(&applied) {
-            let title = crate::sect::has_flag(sect.as_ref(), "w:titlePg");
-            for variant in HeaderVariant::ALL {
-                if (variant == HeaderVariant::First && !title)
-                    || (variant == HeaderVariant::Even && !even)
-                {
-                    continue;
-                }
-                let Some(part) = parts.get(true, variant) else {
-                    continue;
-                };
-                if seen.contains(&part.part_name.as_str()) {
-                    continue;
-                }
-                seen.push(&part.part_name);
-                if let Some(xml) = self.part(&part.part_name).and_then(decode_xml_part) {
-                    out.extend(text_watermarks(&xml));
-                }
+        for (_, _, part) in self.shown_header_slots(sect_prs) {
+            let Some(name) = part.filter(|n| !seen.contains(n)) else {
+                continue;
+            };
+            if let Some(xml) = self.part(&name).and_then(decode_xml_part) {
+                out.extend(text_watermarks(&xml));
             }
+            seen.push(name);
         }
         out
     }

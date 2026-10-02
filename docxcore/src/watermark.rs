@@ -172,7 +172,7 @@ fn cut(xml: &str, mut spans: Vec<(usize, usize)>) -> String {
 /// What makes a paragraph or a gallery control more than an emptied shell:
 /// runs, tables, fields and links, equations, and the range markers
 /// (bookmarks, comments, permissions, moves) that anchor elsewhere.
-const CONTENT: [&str; 18] = [
+const CONTENT: [&str; 19] = [
     "w:r",
     "w:tbl",
     "w:hyperlink",
@@ -191,6 +191,7 @@ const CONTENT: [&str; 18] = [
     "w:moveFromRangeStart",
     "w:moveToRangeStart",
     "w:moveFromRangeEnd",
+    "w:moveToRangeEnd",
 ];
 
 /// Whether a slice holds content of its own (see [`CONTENT`]).
@@ -297,7 +298,9 @@ fn strip_watermark_runs(xml: &str) -> String {
 /// (its paragraph too when nothing else is left in it), and a "Watermarks"
 /// gallery `w:sdt` whole when the watermark was all it held. A gallery
 /// control someone typed into keeps what they typed. Other content stays
-/// byte for byte; nothing is left without the block the schema requires.
+/// byte for byte. Nothing is left without the block the schema requires:
+/// every removal first asks [`sole_block`], so a header, cell or control
+/// keeps its last one.
 pub fn strip_watermarks(xml: &str) -> String {
     if !crate::package::holds_watermark(xml) && !xml.contains("w:val=\"Watermarks\"") {
         return xml.to_string();
@@ -320,21 +323,7 @@ pub fn strip_watermarks(xml: &str) -> String {
         let keep = if sole_block(&out, a, b) { "<w:p/>" } else { "" };
         out.replace_range(a..b, keep);
     }
-    ensure_a_paragraph(&strip_watermark_runs(&out))
-}
-
-/// A `w:hdr` with no block left gets an empty paragraph.
-fn ensure_a_paragraph(xml: &str) -> String {
-    let has_block = ["w:p", "w:tbl", "w:sdt", "w:customXml", "w:altChunk"]
-        .iter()
-        .any(|n| !element_spans(xml, n).is_empty());
-    if has_block {
-        return xml.to_string();
-    }
-    match xml.rfind("</w:hdr>") {
-        Some(at) => format!("{}<w:p/>{}", &xml[..at], &xml[at..]),
-        None => xml.to_string(),
-    }
+    strip_watermark_runs(&out)
 }
 
 /// A header part's XML with `spec`'s watermark as its first block (after
@@ -548,6 +537,7 @@ mod tests {
             "<m:oMath><m:r><m:t>x</m:t></m:r></m:oMath>",
             "<w:bookmarkStart w:id=\"0\" w:name=\"b\"/><w:bookmarkEnd w:id=\"0\"/>",
             "<w:commentRangeStart w:id=\"1\"/>",
+            "<w:moveToRangeEnd w:id=\"2\"/>",
         ] {
             let hdr = format!(
                 "<w:hdr xmlns:w=\"W\" xmlns:v=\"V\" xmlns:m=\"M\"><w:p>{anchor}{mark}</w:p><w:p/></w:hdr>"
