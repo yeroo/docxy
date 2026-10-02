@@ -85,9 +85,16 @@ with a Myers diff; similar paragraphs get a word-level diff (unchanged and
 inserted text keep the revised run formatting, deleted text the original's),
 and whole-paragraph insertions/deletions also mark their paragraph mark. A
 container's final mark cannot be marked, so the mark before a trailing run of
-changes is marked instead (Word's convention) — unless a section break is involved (the borrowed mark or the run ends a section), in which case the change is compared in place and reported as a skipped `paragraph-mark`; an inserted paragraph left that way that ends a section also gets a `w:sectPrChange` with no prior properties, so Reject All removes its break. After a merge the surviving
-paragraph takes the later paragraph's properties, so accepting the deletion of
-a container's last paragraph leaves the original's last paragraph properties.
+changes is marked instead (Word's convention) — unless there is no paragraph
+before the run (it opens the container or follows a table) or a section break is
+involved (the borrowed mark or the run ends a section). Then the change is
+compared in place and reported as a skipped `paragraph-mark`: resolving it
+leaves an extra empty paragraph. An inserted paragraph left that way that ends a
+section also gets a `w:sectPrChange` with no prior properties, so Reject All
+removes its break. After a merge the surviving paragraph takes the later
+paragraph's properties (Word's rule), so when a mark is borrowed the run's last
+paragraph also carries a `w:pPrChange`: Reject All of an inserted run, and Accept
+All of a deleted one, leave the borrowed-from paragraph with its own properties.
 
 Comparison is by text: formatting-only differences, headers/footers, notes and
 comments are not compared (they come from the revised package). Zero-width

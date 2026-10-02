@@ -23,7 +23,13 @@
 //!    before the end of a container (or before a table) cannot be marked: the
 //!    mark *before* the changed run is marked instead, which is Word's own
 //!    convention, and a mixed run of deletions and insertions at the end pairs
-//!    its last deletion and insertion as one modified paragraph.
+//!    its last deletion and insertion as one modified paragraph. A borrowed
+//!    mark's merge would hand the run's last paragraph properties to the
+//!    lender, so that paragraph also carries a `w:pPrChange` that leaves the
+//!    lender its own properties. When there is no paragraph before the run (it
+//!    opens the container or follows a table) or a section break is involved,
+//!    nothing is borrowed: the change stays in place and is reported as a
+//!    skipped `paragraph-mark` (resolving it leaves an extra empty paragraph).
 //!
 //! Limits (reported in [`CompareResult::skipped`] where content is involved):
 //! formatting-only differences are not marked; headers, footers, notes and
@@ -33,10 +39,8 @@
 //! references cannot be carried into the revised package. Zero-width markers
 //! (bookmarks, comment ranges, proofing marks, field characters) are not
 //! compared: the original's are dropped and the revised document's are kept
-//! where they are. After a paragraph merge the surviving paragraph takes the
-//! properties of the later paragraph (Word's rule), so accepting the deletion
-//! of a container's last paragraph leaves the original's last paragraph
-//! properties on the merged paragraph.
+//! where they are. Deleted paragraphs lose section breaks and any style or
+//! list the revised package lacks.
 
 use std::collections::HashSet;
 
@@ -231,6 +235,9 @@ struct Compare<'o> {
     dropped_conflicting: bool,
 }
 
+/// A borrowed mark: `(lender, last, kind)` item indices and the run's kind.
+type Borrowed = (usize, usize, RevisionKind);
+
 /// One aligned unit of a container's result.
 enum Item<'a> {
     /// A block unchanged between the documents (emitted from the revised one).
@@ -305,19 +312,27 @@ impl<'o> Compare<'o> {
         let revised_keys: Vec<String> = revised.iter().map(block_key).collect();
         let mut items: Vec<Item> = Vec::new();
         let (mut deleted, mut inserted): (Vec<&Block>, Vec<&Block>) = (Vec::new(), Vec::new());
+        // Where original-only tables were dropped, as "before item k".
+        let mut dropped = Vec::new();
         for op in diff(&original_keys, &revised_keys) {
             match op {
                 Op::Equal(_, j) => {
-                    self.flush_gap(&mut deleted, &mut inserted, &mut items, top);
+                    self.flush_gap(&mut deleted, &mut inserted, &mut items, &mut dropped);
                     items.push(Item::Same(&revised[j]));
                 }
                 Op::Delete(i) => deleted.push(&original[i]),
                 Op::Insert(j) => inserted.push(&revised[j]),
             }
         }
-        self.flush_gap(&mut deleted, &mut inserted, &mut items, top);
-        fix_mixed_tails(&mut items);
-        let marks = self.plan_marks(&items, top);
+        self.flush_gap(&mut deleted, &mut inserted, &mut items, &mut dropped);
+        fix_mixed_tails(&mut items, &mut dropped);
+        // Items map one-to-one onto result blocks, so an anchor is the index.
+        for anchor in dropped {
+            self.skipped.push(CompareSkip::Table {
+                index: top.unwrap_or(anchor),
+            });
+        }
+        let (marks, borrowed) = self.plan_marks(&items, top);
 
         let mut out = Vec::with_capacity(items.len());
         for (item, mark) in items.into_iter().zip(marks) {
@@ -360,7 +375,61 @@ impl<'o> Compare<'o> {
             }
             out.push(block);
         }
+        for (lender, last, kind) in borrowed {
+            self.keep_lender_props(&mut out, lender, last, kind);
+        }
         out
+    }
+
+    /// Removing a borrowed mark merges the run into the lender, which then
+    /// takes the run's last paragraph's properties. Track a paragraph
+    /// property change on that last paragraph so the merged paragraph ends
+    /// up with the right side's properties: for an inserted run (removed by
+    /// Reject) its current props stay and the prior snapshot is the lender's;
+    /// for a deleted run (removed by Accept) it shows the lender's props and
+    /// the prior snapshot is its own original props. Bulk actions apply
+    /// property records before merging marks.
+    fn keep_lender_props(
+        &mut self,
+        out: &mut [Block],
+        lender: usize,
+        last: usize,
+        kind: RevisionKind,
+    ) {
+        let Block::Paragraph(lending) = &out[lender] else {
+            return;
+        };
+        let lender_props = lending.props.clone();
+        let Block::Paragraph(p) = &mut out[last] else {
+            return;
+        };
+        if p.props.property_change.is_some() {
+            return;
+        }
+        let previous = if kind == RevisionKind::Delete {
+            let original = std::mem::replace(&mut p.props, lender_props);
+            crate::review::clear_mark_revisions(&mut p.props);
+            p.props.section_break = None;
+            p.props.section_property_change = None;
+            original
+        } else {
+            lender_props
+        };
+        let (id, attrs) = self.metadata();
+        p.props.property_change = Some(PropertyChange {
+            scope: PropertyScope::Paragraph,
+            metadata: RevisionMetadata {
+                id: Some(id.to_string()),
+                author: Some(self.opts.author.clone()),
+                date: Some(self.opts.date.clone()),
+                ..RevisionMetadata::default()
+            },
+            raw: format!(
+                "<w:pPrChange{attrs}>{}</w:pPrChange>",
+                crate::serialize::ppr_base_xml(&previous)
+            ),
+            previous: PropertySnapshot::Absent,
+        });
     }
 
     /// Turn a gap (unmatched original blocks, unmatched revised blocks) into
@@ -370,7 +439,7 @@ impl<'o> Compare<'o> {
         deleted: &mut Vec<&'a Block>,
         inserted: &mut Vec<&'a Block>,
         items: &mut Vec<Item<'a>>,
-        top: Option<usize>,
+        dropped: &mut Vec<usize>,
     ) {
         // How far ahead a deleted block looks for a partner, so a large
         // rewrite stays linear.
@@ -392,9 +461,7 @@ impl<'o> Compare<'o> {
                 }
                 None => match d {
                     Block::Paragraph(o) => items.push(Item::Deleted(o)),
-                    Block::Table(_) => self.skipped.push(CompareSkip::Table {
-                        index: top.unwrap_or(items.len()),
-                    }),
+                    Block::Table(_) => dropped.push(items.len()),
                     _ => self.skipped.push(CompareSkip::Object),
                 },
             }
@@ -406,8 +473,16 @@ impl<'o> Compare<'o> {
     }
 
     /// Which paragraph marks to mark, per item (see the module docs).
-    fn plan_marks(&mut self, items: &[Item], top: Option<usize>) -> Vec<Option<RevisionKind>> {
+    /// Also returns, per borrowed mark, `(lender, last, kind)`: the item whose
+    /// mark was borrowed, the run's last item (whose properties the lender
+    /// takes when the borrowed record removes its mark) and the run's kind.
+    fn plan_marks(
+        &mut self,
+        items: &[Item],
+        top: Option<usize>,
+    ) -> (Vec<Option<RevisionKind>>, Vec<Borrowed>) {
         let mut marks = vec![None; items.len()];
+        let mut borrowed = Vec::new();
         for (start, end) in paragraph_segments(items) {
             for k in start..end.saturating_sub(1) {
                 marks[k] = items[k].change_kind();
@@ -427,13 +502,16 @@ impl<'o> Compare<'o> {
             let kind = items[end - 1].change_kind();
             if tail > start && !items[tail - 1..end].iter().any(Item::ends_section) {
                 marks[tail - 1] = kind;
+                if let Some(kind) = kind {
+                    borrowed.push((tail - 1, end - 1, kind));
+                }
             } else {
                 self.skipped.push(CompareSkip::ParagraphMark {
                     index: top.unwrap_or(end - 1),
                 });
             }
         }
-        marks
+        (marks, borrowed)
     }
 
     fn compare_tables(&mut self, original: &Table, revised: &Table, index: usize) -> Table {
@@ -781,7 +859,7 @@ fn paragraph_segments(items: &[Item]) -> Vec<(usize, usize)> {
 /// insertions, neither kind can borrow the mark before the run for the other,
 /// so the run's last deletion and last insertion become one modified
 /// paragraph at the segment end.
-fn fix_mixed_tails(items: &mut Vec<Item>) {
+fn fix_mixed_tails(items: &mut Vec<Item>, anchors: &mut [usize]) {
     let segments = paragraph_segments(items);
     for &(start, end) in segments.iter().rev() {
         let mut tail = end;
@@ -800,9 +878,18 @@ fn fix_mixed_tails(items: &mut Vec<Item>) {
             unreachable!()
         };
         let modified = Item::Modified(o, r);
-        items.remove(d.max(i));
-        items.remove(d.min(i));
+        for at in [d.max(i), d.min(i)] {
+            items.remove(at);
+            anchors
+                .iter_mut()
+                .filter(|a| **a > at)
+                .for_each(|a| *a -= 1);
+        }
         items.insert(end - 2, modified);
+        anchors
+            .iter_mut()
+            .filter(|a| **a >= end - 2)
+            .for_each(|a| *a += 1);
     }
 }
 

@@ -262,6 +262,24 @@ fn with_property_change(
     out
 }
 
+/// `props` as a `CT_PPrBase` snapshot (a `w:pPrChange` prior state): no
+/// paragraph-mark `w:rPr`, section properties or change record.
+pub(crate) fn ppr_base_xml(props: &ParProps) -> String {
+    let mut base = props.clone();
+    base.section_break = None;
+    base.section_property_change = None;
+    base.property_change = None;
+    base.mark_revisions.clear();
+    base.raw_props
+        .retain(|raw| !matches!(local_name(raw), "rPr" | "sectPr" | "pPrChange"));
+    let mut out = String::new();
+    write_ppr(&mut out, &base);
+    if out.is_empty() {
+        out.push_str("<w:pPr/>");
+    }
+    out
+}
+
 fn write_ppr(s: &mut String, props: &ParProps) {
     // Effective paragraph style: explicit style, else a synthesized heading style.
     let style = props

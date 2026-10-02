@@ -800,3 +800,43 @@ fn a_deleted_paragraphs_dropped_section_break_does_not_block_borrowing() {
         assert_eq!(texts(&resolved(&document, false)), texts(&doc(&original)));
     }
 }
+
+#[test]
+fn resolving_a_borrowed_mark_leaves_each_paragraph_its_own_properties() {
+    use docxcore::model::Align;
+    let centered = |t: &str| {
+        format!("<w:p><w:pPr><w:jc w:val=\"center\"/></w:pPr><w:r><w:t>{t}</w:t></w:r></w:p>")
+    };
+    let aligns = |d: &Document| -> Vec<(String, Align)> {
+        d.body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => Some((p.plain_text(), p.props.align)),
+                _ => None,
+            })
+            .collect()
+    };
+    let plain = p("Intro");
+    let with_tail = format!("{}{}", p("Intro"), centered("Conclusion"));
+    // An inserted tail (resolved away by Reject) and a deleted one (by Accept).
+    for (original, revised) in [(plain.clone(), with_tail.clone()), (with_tail, plain)] {
+        let result = compare(&pkg(&original), &pkg(&revised));
+        for document in [result.package.document.clone(), reloaded(&result)] {
+            assert_eq!(aligns(&resolved(&document, true)), aligns(&doc(&revised)));
+            assert_eq!(aligns(&resolved(&document, false)), aligns(&doc(&original)));
+        }
+    }
+}
+
+#[test]
+fn a_dropped_tables_index_counts_paired_paragraphs() {
+    let original = format!("{}{CELL_TABLE}{}{CELL_TABLE}", p("Alpha words"), p("Q"));
+    let revised = format!("{}{CELL_TABLE}{}", p("Beta other"), p("Q"));
+    let result = compare(&pkg(&original), &pkg(&revised));
+    assert_eq!(result.skipped, [CompareSkip::Table { index: 3 }]);
+    assert_eq!(
+        texts(&result.package.document).len(),
+        3,
+        "M, the table cell, Q"
+    );
+}
