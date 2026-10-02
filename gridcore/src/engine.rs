@@ -92,6 +92,11 @@ pub struct Engine {
     /// first use and reused across edits; `None` whenever `formulas` changed
     /// since it was built.
     rev: Option<HashMap<Key, Vec<Key>>>,
+    /// Per sheet, every formula's dependency rects indexed for point stabbing
+    /// ([`CoverIndex`]), a pure function of `formulas`. Built on first use and
+    /// reused across edits; `None` whenever `formulas` changed since it was
+    /// built — dropped together with `rev` by [`Engine::invalidate_rev`].
+    covers: Option<HashMap<usize, CoverIndex>>,
 }
 
 /// One sheet's spill anchors by the rows their extents cover
@@ -120,6 +125,11 @@ impl RowCover {
 /// Spill chains (an anchor whose array feeds another anchor's spill cells)
 /// resolve through repeated post-passes; this bounds pathological loops.
 const MAX_SPILL_PASSES: u32 = 8;
+
+/// Above this many seeds, `formulas_reading` answers with one scan of the
+/// dep rects against a seed index (see [`Engine::formulas_reading_scan`])
+/// instead of a cover-index stab per seed.
+const COVER_SEED_LIMIT: usize = 64;
 
 /// Excel's message for an edit refused because it would change part of a
 /// legacy CSE array ([`Engine::refuses`]).
@@ -1109,28 +1119,64 @@ impl Engine {
         self.evaluate(wb, dirty, depth);
     }
 
-    /// Drop the cached reverse edges; call after any change to `formulas`.
+    /// Drop the cached reverse edges and the cover index; call after any
+    /// change to `formulas`.
     fn invalidate_rev(&mut self) {
         self.rev = None;
+        self.covers = None;
     }
 
-    /// The reverse edges, rebuilt from `dependency_edges` only when invalidated.
+    /// The reverse edges, rebuilt from the cover index only when invalidated.
     fn take_rev(&mut self) -> HashMap<Key, Vec<Key>> {
         match self.rev.take() {
             Some(rev) => rev,
             None => {
                 #[cfg(test)]
                 tests::REV_BUILDS.with(|n| n.set(n.get() + 1));
-                let all: Vec<Key> = self.formulas.keys().copied().collect();
+                self.ensure_covers();
+                // The same edge set as `dependency_edges(&all)`: `f` is in
+                // `rev[g]` iff one of `f`'s dep rects covers formula cell
+                // `g`. One edge per (dependent, source) even if several
+                // rects overlap it — hence sort + dedup, as there.
                 let mut rev: HashMap<Key, Vec<Key>> = HashMap::new();
-                for (f, srcs) in self.dependency_edges(&all) {
-                    for g in srcs {
-                        rev.entry(g).or_default().push(f);
+                let mut srcs: Vec<Key> = Vec::new();
+                for &g in self.formulas.keys() {
+                    srcs.clear();
+                    if let Some(idx) = self.covers.as_ref().and_then(|m| m.get(&g.0)) {
+                        idx.for_each_covering(g.1, g.2, |fk| srcs.push(fk));
+                    }
+                    srcs.sort_unstable();
+                    srcs.dedup();
+                    if !srcs.is_empty() {
+                        rev.insert(g, srcs.clone());
                     }
                 }
                 rev
             }
         }
+    }
+
+    /// The per-sheet cover index over every formula's dependency rects, a
+    /// pure function of `formulas`; built on first use, dropped by
+    /// [`Engine::invalidate_rev`] together with `rev`.
+    fn ensure_covers(&mut self) {
+        if self.covers.is_some() {
+            return;
+        }
+        #[cfg(test)]
+        tests::COVER_BUILDS.with(|n| n.set(n.get() + 1));
+        let mut by_sheet: HashMap<usize, Vec<CoverRect>> = HashMap::new();
+        for (&fk, info) in &self.formulas {
+            for &(ds, r1, c1, r2, c2) in &info.deps {
+                by_sheet.entry(ds).or_default().push((r1, c1, r2, c2, fk));
+            }
+        }
+        self.covers = Some(
+            by_sheet
+                .into_iter()
+                .map(|(s, rects)| (s, CoverIndex::new(rects)))
+                .collect(),
+        );
     }
 
     /// For each formula in `scope`, the deduped list of formulas *also in
@@ -1172,11 +1218,43 @@ impl Engine {
     }
 
     /// The formulas not in `skip` with a dependency rectangle covering one of
-    /// `seeds` (plain-value cells, which `rev` cannot reach). Seeds are indexed
-    /// per sheet in both (row, col) and (col, row) order, so each rectangle is
-    /// answered from the narrower of its row band and its column band — not a
-    /// test against every seed.
-    fn formulas_reading(&self, seeds: &[Key], skip: &HashSet<Key>) -> Vec<Key> {
+    /// `seeds` (plain-value cells, which `rev` cannot reach).
+    ///
+    /// Up to [`COVER_SEED_LIMIT`] seeds (a typical edit) answer each seed with
+    /// one point stab of the cached cover index (see [`Engine::ensure_covers`]);
+    /// larger seed sets use the scan in [`Engine::formulas_reading_scan`],
+    /// where one pass of the dep rects against a seed index is cheaper than a
+    /// stab per seed.
+    fn formulas_reading(&mut self, seeds: &[Key], skip: &HashSet<Key>) -> Vec<Key> {
+        if seeds.is_empty() {
+            return Vec::new();
+        }
+        if seeds.len() > COVER_SEED_LIMIT {
+            return self.formulas_reading_scan(seeds, skip);
+        }
+        self.ensure_covers();
+        let mut out = Vec::new();
+        let mut seen: HashSet<Key> = HashSet::new();
+        for &(s, r, c) in seeds {
+            let Some(idx) = self.covers.as_ref().and_then(|m| m.get(&s)) else {
+                continue;
+            };
+            idx.for_each_covering(r, c, |fk| {
+                if !skip.contains(&fk) && seen.insert(fk) {
+                    out.push(fk);
+                }
+            });
+        }
+        out
+    }
+
+    /// The scan behind [`Engine::formulas_reading`] for seed sets above
+    /// [`COVER_SEED_LIMIT`]: the formulas not in `skip` with a dependency
+    /// rectangle covering one of `seeds` (plain-value cells, which `rev`
+    /// cannot reach). Seeds are indexed per sheet in both (row, col) and
+    /// (col, row) order, so each rectangle is answered from the narrower of
+    /// its row band and its column band — not a test against every seed.
+    fn formulas_reading_scan(&self, seeds: &[Key], skip: &HashSet<Key>) -> Vec<Key> {
         let mut cells_by_sheet: HashMap<usize, Vec<(u32, u32, ())>> = HashMap::new();
         for &(s, r, c) in seeds {
             cells_by_sheet.entry(s).or_default().push((r, c, ()));
@@ -1868,6 +1946,186 @@ impl<T: Copy + Ord> RectIndex<T> {
     }
 }
 
+/// Closed intervals `lo..=hi`, each tagged with an id, in a centred
+/// interval tree, for point-stabbing queries.
+struct StabTree {
+    nodes: Vec<StabNode>,
+    root: Option<usize>,
+}
+
+struct StabNode {
+    center: u32,
+    /// The intervals containing `center`, as (lo, id) sorted by lo ascending.
+    by_lo: Vec<(u32, u32)>,
+    /// The same intervals, as (hi, id) sorted by hi descending.
+    by_hi: Vec<(u32, u32)>,
+    left: Option<usize>,  // intervals entirely below center
+    right: Option<usize>, // intervals entirely above center
+}
+
+impl StabTree {
+    /// Indexes `intervals`, given as (lo, hi, id); the tree is centred on the
+    /// median of the midpoints, so each side of a node holds at most half the
+    /// intervals (an interval past `center` has its midpoint past it too) and
+    /// the depth is O(log n).
+    fn new(intervals: Vec<(u32, u32, u32)>) -> Self {
+        let mut nodes = Vec::new();
+        let root = Self::build(&mut nodes, intervals);
+        Self { nodes, root }
+    }
+
+    fn build(nodes: &mut Vec<StabNode>, intervals: Vec<(u32, u32, u32)>) -> Option<usize> {
+        if intervals.is_empty() {
+            return None;
+        }
+        let mut mids: Vec<u32> = intervals
+            .iter()
+            .map(|&(lo, hi, _)| lo + (hi - lo) / 2)
+            .collect();
+        mids.sort_unstable();
+        let center = mids[mids.len() / 2];
+        let mut here = Vec::new();
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        for iv @ (lo, hi, _) in intervals {
+            if hi < center {
+                left.push(iv);
+            } else if lo > center {
+                right.push(iv);
+            } else {
+                here.push(iv); // contains center
+            }
+        }
+        // The median's own interval contains `center`, so `here` is non-empty
+        // and the recursion terminates.
+        let left = Self::build(nodes, left);
+        let right = Self::build(nodes, right);
+        let mut by_lo: Vec<(u32, u32)> = here.iter().map(|&(lo, _, id)| (lo, id)).collect();
+        by_lo.sort_unstable();
+        let mut by_hi: Vec<(u32, u32)> = here.iter().map(|&(_, hi, id)| (hi, id)).collect();
+        by_hi.sort_unstable_by(|a, b| b.cmp(a));
+        let idx = nodes.len();
+        nodes.push(StabNode {
+            center,
+            by_lo,
+            by_hi,
+            left,
+            right,
+        });
+        Some(idx)
+    }
+
+    /// How many intervals contain `x` — O(log² n), without visiting them.
+    fn stab_count(&self, x: u32) -> usize {
+        let mut count = 0;
+        let mut cur = self.root;
+        while let Some(i) = cur {
+            let node = &self.nodes[i];
+            if x < node.center {
+                count += node.by_lo.partition_point(|&(lo, _)| lo <= x);
+                cur = node.left;
+            } else if x > node.center {
+                count += node.by_hi.partition_point(|&(hi, _)| hi >= x);
+                cur = node.right;
+            } else {
+                count += node.by_lo.len();
+                break;
+            }
+        }
+        count
+    }
+
+    /// Calls `f` for the id of every interval containing `x`, in tree order
+    /// (unspecified).
+    fn for_each_stab(&self, x: u32, mut f: impl FnMut(u32)) {
+        let mut cur = self.root;
+        while let Some(i) = cur {
+            let node = &self.nodes[i];
+            if x < node.center {
+                let n = node.by_lo.partition_point(|&(lo, _)| lo <= x);
+                for &(_, id) in &node.by_lo[..n] {
+                    f(id);
+                }
+                cur = node.left;
+            } else if x > node.center {
+                let n = node.by_hi.partition_point(|&(hi, _)| hi >= x);
+                for &(_, id) in &node.by_hi[..n] {
+                    f(id);
+                }
+                cur = node.right;
+            } else {
+                for &(_, id) in &node.by_lo {
+                    f(id);
+                }
+                break;
+            }
+        }
+    }
+}
+
+/// A dependency rectangle tagged with the key of the formula that owns it,
+/// as stored in [`CoverIndex::rects`]: (r1, c1, r2, c2, formula).
+type CoverRect = (u32, u32, u32, u32, Key);
+
+/// A sheet's formula dependency rects, indexed for "which formulas cover
+/// this cell": one stab tree over the rects' row intervals, one over their
+/// column intervals; a query walks the axis with fewer hits.
+struct CoverIndex {
+    /// (r1, c1, r2, c2, formula); a rect's id is its position here.
+    rects: Vec<CoverRect>,
+    rows: StabTree,
+    cols: StabTree,
+}
+
+impl CoverIndex {
+    fn new(rects: Vec<CoverRect>) -> Self {
+        let rows = StabTree::new(
+            rects
+                .iter()
+                .enumerate()
+                .map(|(id, &(r1, _, r2, _, _))| (r1, r2, id as u32))
+                .collect(),
+        );
+        let cols = StabTree::new(
+            rects
+                .iter()
+                .enumerate()
+                .map(|(id, &(_, c1, _, c2, _))| (c1, c2, id as u32))
+                .collect(),
+        );
+        Self { rects, rows, cols }
+    }
+
+    /// How many rects the point query below would examine: the smaller of the
+    /// two axes' stab counts. Used only by tests.
+    #[cfg(test)]
+    fn walk_len(&self, r: u32, c: u32) -> usize {
+        self.rows.stab_count(r).min(self.cols.stab_count(c))
+    }
+
+    /// Calls `f` for every rect covering `(r, c)`, stabbing the axis with
+    /// fewer hits (the rows on ties) and checking the other axis per
+    /// candidate. A formula with several rects covering the point is reported
+    /// once per rect; callers dedupe.
+    fn for_each_covering(&self, r: u32, c: u32, mut f: impl FnMut(Key)) {
+        if self.rows.stab_count(r) <= self.cols.stab_count(c) {
+            self.rows.for_each_stab(r, |id| {
+                let rect = &self.rects[id as usize];
+                if c >= rect.1 && c <= rect.3 {
+                    f(rect.4);
+                }
+            });
+        } else {
+            self.cols.for_each_stab(c, |id| {
+                let rect = &self.rects[id as usize];
+                if r >= rect.0 && r <= rect.2 {
+                    f(rect.4);
+                }
+            });
+        }
+    }
+}
+
 /// Clear the plain-value cells of a spill (keeping styles) outside the
 /// surviving extent `keep` (None = clear all but the anchor). Returns the
 /// cleared keys. Cells holding formulas are left alone.
@@ -2347,6 +2605,9 @@ mod tests {
         /// How many times [`Engine::take_rev`] has rebuilt the reverse
         /// dependency map on this thread.
         pub(super) static REV_BUILDS: StdCell<usize> = const { StdCell::new(0) };
+        /// How many times [`Engine::ensure_covers`] has built the cover index
+        /// on this thread.
+        pub(super) static COVER_BUILDS: StdCell<usize> = const { StdCell::new(0) };
     }
 
     fn wb_one_sheet(cells: &[(&str, Cell)]) -> Workbook {
@@ -3953,6 +4214,273 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The #948 two-sheet workbook: readers of several shapes on sheet 0,
+    /// one of them reading Sheet2.
+    fn cover_match_workbook() -> (Workbook, Engine) {
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("A2", Cell::number(2.0)),
+            ("A3", Cell::number(3.0)),
+            ("A5", Cell::number(5.0)),
+            ("B1", Cell::number(7.0)),
+            ("C1", Cell::formula("SUM(A1:A3)")),
+            ("D1", Cell::formula("A5*2")),
+            ("C2", Cell::formula("SUM(B1:B9)")),
+            ("D2", Cell::formula("C2+1")), // reads a formula's cell
+            ("C3", Cell::formula("SUM(A:A)")),
+            ("C4", Cell::formula("SUM(1:1)")),
+            ("C5", Cell::formula("SUM(A1:Z1000)")),
+            ("C6", Cell::formula("SUM(Sheet2!A1:C3)")),
+        ]);
+        let mut sheet2 = Sheet {
+            name: "Sheet2".to_string(),
+            ..Sheet::default()
+        };
+        for r in 0..3u32 {
+            for c in 0..3u32 {
+                sheet2.set_cell(r, c, Cell::number(f64::from(r * 3 + c + 1)));
+            }
+        }
+        wb.sheets.push(sheet2);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        (wb, eng)
+    }
+
+    #[test]
+    fn cover_index_matches_naive_filter() {
+        // #948: at every probe point, `for_each_covering` reports exactly the
+        // rects whose inclusive bounds contain the point — with whole-column
+        // and whole-row rects at the MAX bounds, a duplicate rect (its own
+        // key, so reported alongside the original), and an empty index.
+        let bounds = [0u32, 1, 5, 11];
+        let mut rects: Vec<CoverRect> = Vec::new();
+        let mut id = 0u32;
+        for &r1 in &bounds {
+            for &r2 in &bounds {
+                if r1 > r2 {
+                    continue;
+                }
+                for &c1 in &bounds {
+                    for &c2 in &bounds {
+                        if c1 > c2 {
+                            continue;
+                        }
+                        rects.push((r1, c1, r2, c2, (0, id, 0)));
+                        id += 1;
+                    }
+                }
+            }
+        }
+        rects.push((0, 3, crate::sheet::MAX_ROWS - 1, 3, (0, id, 0)));
+        id += 1;
+        rects.push((4, 0, 4, crate::sheet::MAX_COLS - 1, (0, id, 0)));
+        id += 1;
+        let dup = rects[0];
+        rects.push((dup.0, dup.1, dup.2, dup.3, (0, id, 0)));
+        let idx = CoverIndex::new(rects.clone());
+
+        let r_probes = [0u32, 1, 4, 5, 6, 11, 12, 20, crate::sheet::MAX_ROWS - 1];
+        let c_probes = [0u32, 1, 4, 5, 6, 11, 12, 20, crate::sheet::MAX_COLS - 1];
+        for &r in &r_probes {
+            for &c in &c_probes {
+                let mut got: Vec<Key> = Vec::new();
+                idx.for_each_covering(r, c, |fk| got.push(fk));
+                got.sort_unstable();
+                let mut want: Vec<Key> = rects
+                    .iter()
+                    .filter(|rr| r >= rr.0 && r <= rr.2 && c >= rr.1 && c <= rr.3)
+                    .map(|rr| rr.4)
+                    .collect();
+                want.sort_unstable();
+                assert_eq!(got, want, "probe ({r}, {c})");
+            }
+        }
+
+        let empty = CoverIndex::new(Vec::new());
+        assert_eq!(empty.walk_len(4, 4), 0);
+        let mut nothing = Vec::new();
+        empty.for_each_covering(4, 4, |fk| nothing.push(fk));
+        assert!(nothing.is_empty());
+    }
+
+    #[test]
+    fn cover_index_walks_fewer_matches() {
+        // #948: a query walks the axis with fewer stabbed intervals, and both
+        // axes' counts match the naive counts.
+        let mut rects: Vec<CoverRect> = Vec::new();
+        for r in 0..1000u32 {
+            rects.push((r, 0, r, crate::sheet::MAX_COLS - 1, (0, r, 0))); // wide
+        }
+        for c in 0..10u32 {
+            rects.push((0, c, crate::sheet::MAX_ROWS - 1, c, (0, 1000 + c, 0))); // tall
+        }
+        let idx = CoverIndex::new(rects);
+        assert_eq!(idx.rows.stab_count(500), 11);
+        assert_eq!(idx.cols.stab_count(5), 1001);
+        assert_eq!(idx.walk_len(500, 5), 11);
+        let mut got = Vec::new();
+        idx.for_each_covering(500, 5, |fk| got.push(fk));
+        got.sort_unstable();
+        assert_eq!(got, vec![(0, 500, 0), (0, 1005, 0)]);
+
+        // Transposed — 1000 tall, 10 wide: the same walk length, now from the
+        // column side; only the tall rect at col 5 actually covers (500, 5).
+        let mut trects: Vec<CoverRect> = Vec::new();
+        for c in 0..1000u32 {
+            trects.push((0, c, crate::sheet::MAX_ROWS - 1, c, (0, c, 0))); // tall
+        }
+        for r in 0..10u32 {
+            trects.push((r, 0, r, crate::sheet::MAX_COLS - 1, (0, 1000 + r, 0))); // wide
+        }
+        let tidx = CoverIndex::new(trects);
+        assert_eq!(tidx.walk_len(500, 5), 11);
+        let mut tgot = Vec::new();
+        tidx.for_each_covering(500, 5, |fk| tgot.push(fk));
+        tgot.sort_unstable();
+        assert_eq!(tgot, vec![(0, 5, 0)]);
+
+        // stab_count equals the naive count at every x.
+        let row_intervals: Vec<(u32, u32, u32)> = (0..1000u32).map(|r| (r, r, r)).collect();
+        let tree = StabTree::new(row_intervals.clone());
+        for x in 0..=1100u32 {
+            let want = row_intervals
+                .iter()
+                .filter(|&&(lo, hi, _)| lo <= x && x <= hi)
+                .count();
+            assert_eq!(tree.stab_count(x), want, "x = {x}");
+        }
+    }
+
+    #[test]
+    fn formulas_reading_cover_matches_scan() {
+        // #948 plan-seed-index: below the cutoff the cover index answers the
+        // same set as the scan, for every single seed, with a skip set, and
+        // across the cutoff in both directions.
+        let (_wb, mut eng) = cover_match_workbook();
+        let skips = [HashSet::new(), HashSet::from([(0, 1, 2)])]; // C2 left out
+        for skip in &skips {
+            for s in 0..2usize {
+                for r in 0..13u32 {
+                    for c in 0..6u32 {
+                        let seeds = [(s, r, c)];
+                        let mut cover = eng.formulas_reading(&seeds, skip);
+                        cover.sort_unstable();
+                        let mut scan = eng.formulas_reading_scan(&seeds, skip);
+                        scan.sort_unstable();
+                        assert_eq!(cover, scan, "seed ({s}, {r}, {c})");
+                    }
+                }
+            }
+        }
+        // Exactly COVER_SEED_LIMIT seeds takes the cover branch, one more
+        // takes the scan branch: equal sets both ways.
+        let small: Vec<Key> = (0..COVER_SEED_LIMIT).map(|r| (0, r as u32, 0)).collect();
+        let large: Vec<Key> = (0..=COVER_SEED_LIMIT).map(|r| (0, r as u32, 0)).collect();
+        assert_eq!(small.len(), COVER_SEED_LIMIT);
+        assert_eq!(large.len(), COVER_SEED_LIMIT + 1);
+        for seeds in [&small, &large] {
+            let mut cover = eng.formulas_reading(seeds, &HashSet::new());
+            cover.sort_unstable();
+            let mut scan = eng.formulas_reading_scan(seeds, &HashSet::new());
+            scan.sort_unstable();
+            assert_eq!(cover, scan, "{} seeds", seeds.len());
+        }
+    }
+
+    #[test]
+    fn rev_from_covers_matches_dependency_edges() {
+        // #948 plan-rect-both: the cover index yields the same reverse map as
+        // `dependency_edges` (each value as a set), key set included.
+        let (_wb, mut eng) = cover_match_workbook();
+        eng.invalidate_rev();
+        let rev = eng.take_rev();
+        let all: Vec<Key> = eng.formulas.keys().copied().collect();
+        let mut want: HashMap<Key, Vec<Key>> = HashMap::new();
+        for (f, srcs) in eng.dependency_edges(&all) {
+            for g in srcs {
+                want.entry(g).or_default().push(f);
+            }
+        }
+        let mut got: Vec<(Key, Vec<Key>)> = rev
+            .into_iter()
+            .map(|(k, mut v)| {
+                v.sort_unstable();
+                (k, v)
+            })
+            .collect();
+        got.sort_unstable();
+        let mut want: Vec<(Key, Vec<Key>)> = want
+            .into_iter()
+            .map(|(k, mut v)| {
+                v.sort_unstable();
+                v.dedup();
+                (k, v)
+            })
+            .collect();
+        want.sort_unstable();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn cover_cache_reused_and_invalidated() {
+        // #948: the cover index is built once and reused across plain data
+        // edits; adding or removing a formula, or an `A1#` dep rect moving
+        // with its spill, drops it and the next use rebuilds — with correct
+        // values throughout.
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("A2", Cell::number(2.0)),
+            ("A3", Cell::number(3.0)),
+            ("C1", Cell::formula("SUM(A1:A3)")),
+            ("D1", Cell::formula("C1*2")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        set(&mut eng, &mut wb, "A1", Cell::number(10.0)); // warms the cache
+        COVER_BUILDS.with(|n| n.set(0));
+        set(&mut eng, &mut wb, "A2", Cell::number(20.0));
+        set(&mut eng, &mut wb, "A3", Cell::number(30.0));
+        // Plain data edits reuse the index: no rebuild.
+        assert_eq!(COVER_BUILDS.with(StdCell::get), 0);
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(60.0));
+        assert_eq!(value_at(&wb, "D1"), CellValue::Number(120.0));
+        // A formula added by an edit invalidates; its own walk rebuilds the
+        // index (in take_rev's None arm), and the next data edit reuses that
+        // build while finding the new formula.
+        set(&mut eng, &mut wb, "E1", Cell::formula("A1*100"));
+        assert_eq!(COVER_BUILDS.with(StdCell::get), 1);
+        set(&mut eng, &mut wb, "A1", Cell::number(5.0));
+        assert_eq!(COVER_BUILDS.with(StdCell::get), 1);
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(500.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(55.0));
+        assert_eq!(value_at(&wb, "D1"), CellValue::Number(110.0));
+        // Replacing a formula with a number invalidates; the removal's own
+        // walk rebuilds once, and a following plain data edit must not build
+        // again. Stale covers would wrongly reattach C1 to A1:A3 on the A2
+        // edit and overwrite the typed number (as C1=52, D1=104).
+        COVER_BUILDS.with(|n| n.set(0));
+        set(&mut eng, &mut wb, "C1", Cell::number(7.0));
+        assert_eq!(COVER_BUILDS.with(StdCell::get), 1);
+        set(&mut eng, &mut wb, "A2", Cell::number(2.0));
+        assert_eq!(COVER_BUILDS.with(StdCell::get), 1);
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(7.0));
+        assert_eq!(value_at(&wb, "D1"), CellValue::Number(14.0));
+        // An `A1#` reader's dep rect moves twice with its spill; the data
+        // edits of B1 must still reach A1 and then D1.
+        let mut wb = wb_one_sheet(&[
+            ("A1", array_formula("SEQUENCE(B1)")),
+            ("B1", Cell::number(2.0)),
+            ("D1", Cell::formula("SUM(A1#)")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        set(&mut eng, &mut wb, "B1", Cell::number(4.0));
+        assert_eq!(value_at(&wb, "D1"), CellValue::Number(10.0));
+        set(&mut eng, &mut wb, "B1", Cell::number(3.0));
+        assert_eq!(value_at(&wb, "D1"), CellValue::Number(6.0));
     }
 
     #[test]
