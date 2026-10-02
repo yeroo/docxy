@@ -1497,10 +1497,13 @@ struct WbSnapshot {
     /// converted ones keep their parts until a save.
     tables: Vec<gridcore::sheet::Table>,
     removed_tables: Vec<gridcore::sheet::Table>,
-    /// The data model's definitions, held only by an edit that changed them
-    /// (a table rename): model edits of their own are not on the undo stack,
-    /// so any other undo must leave them as they are.
-    model: Option<(Vec<Relationship>, Vec<gridcore::model::Measure>)>,
+    /// Each PivotTable's source: a table rename moves it.
+    pivot_sources: Vec<gridcore::pivot::PivotSource>,
+    /// A table rename (from, to) to replay on the data model when this
+    /// snapshot is restored. Model edits are not on the undo stack, so undo
+    /// renames the tables the *current* model names rather than putting back
+    /// a copy, which would take later model edits with it.
+    model_rename: Option<(String, String)>,
 }
 
 enum UndoAction {
@@ -2366,56 +2369,68 @@ impl App {
     /// Snapshot-run-snapshot for structural edits (row/col ops, renames):
     /// the inverse isn't per-cell, so undo restores the whole grid state.
     fn structural(&mut self, op: impl FnOnce(&mut gridcore::sheet::Workbook)) {
-        let before = self.wb_snapshot();
+        let infallible = self.try_structural(None, |wb| {
+            op(wb);
+            Ok(())
+        });
+        debug_assert!(infallible.is_ok());
+    }
+
+    /// [`Self::structural`] for an edit that can be refused: an `Err` leaves
+    /// the workbook as it was, with nothing on the undo stack. A table rename
+    /// passes `model_rename` (old, new): the data model follows it, and the
+    /// undo step replays it backwards (and redo forwards) on whatever the
+    /// model holds then.
+    fn try_structural(
+        &mut self,
+        model_rename: Option<(&str, &str)>,
+        op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut before = self.wb_snapshot();
         // A structural edit moves cells, so compare how many cells sit on
         // circles rather than where: a circle that merely moved is not new.
         let circles_before = self.engine.circular_refs().len();
-        op(&mut self.pkg.workbook);
-        self.rebuild_engine();
-        if self.circles_shown() && self.engine.circular_refs().len() > circles_before {
-            self.circle_warning_pending = true;
-        }
-        let after = self.wb_snapshot();
-        self.undo.push(UndoAction::Structural { before, after });
-        self.redo.clear();
-        self.modified = true;
-        self.clamp_cursor();
-        self.cancel_cut();
-    }
-
-    /// [`Self::structural`] for an edit that can be refused, run on the whole
-    /// App so it can reach the data model too (`with_model`: the undo step
-    /// then holds the model's definitions). An `Err` leaves everything as it
-    /// was, with nothing on the undo stack.
-    fn try_structural(
-        &mut self,
-        with_model: bool,
-        op: impl FnOnce(&mut App) -> Result<(), String>,
-    ) -> Result<(), String> {
-        let model = || (self.model_rels.clone(), self.model_measures.clone());
-        let before = WbSnapshot {
-            model: with_model.then(model),
-            ..self.wb_snapshot()
-        };
-        let circles_before = self.engine.circular_refs().len();
-        if let Err(e) = op(self) {
+        if let Err(e) = op(&mut self.pkg.workbook) {
             self.put_back(&before);
             return Err(e);
         }
+        let mut after = self.wb_snapshot();
+        if let Some((old, new)) = model_rename {
+            self.rename_table_in_model(old, new);
+            before.model_rename = Some((new.to_string(), old.to_string()));
+            after.model_rename = Some((old.to_string(), new.to_string()));
+        }
         self.rebuild_engine();
         if self.circles_shown() && self.engine.circular_refs().len() > circles_before {
             self.circle_warning_pending = true;
         }
-        let after = WbSnapshot {
-            model: with_model.then(|| (self.model_rels.clone(), self.model_measures.clone())),
-            ..self.wb_snapshot()
-        };
         self.undo.push(UndoAction::Structural { before, after });
         self.redo.clear();
         self.modified = true;
         self.clamp_cursor();
         self.cancel_cut();
         Ok(())
+    }
+
+    /// The data model follows table `old` being renamed `new`: its
+    /// relationships' ends and its measures' formulas.
+    fn rename_table_in_model(&mut self, old: &str, new: &str) {
+        for r in &mut self.model_rels {
+            for table in [&mut r.from.0, &mut r.to.0] {
+                if table.eq_ignore_ascii_case(old) {
+                    *table = new.to_string();
+                }
+            }
+        }
+        let map = [(old.to_string(), new.to_string())];
+        for m in &mut self.model_measures {
+            if let Ok(ast) = gridcore::formula::parse(&m.formula) {
+                let out = gridcore::formula::rename_tables_in_expr(&ast, &map);
+                if out != ast {
+                    m.formula = gridcore::formula::to_string(&out);
+                }
+            }
+        }
     }
 
     /// The workbook state a structural undo step restores.
@@ -2426,26 +2441,34 @@ impl App {
             names: wb.defined_names.clone(),
             tables: wb.tables.clone(),
             removed_tables: wb.removed_tables.clone(),
-            model: None,
+            pivot_sources: wb.pivots.iter().map(|p| p.source.clone()).collect(),
+            model_rename: None,
         }
     }
 
-    /// Put `snap` back without recalculating (see [`Self::restore`]).
+    /// Put `snap`'s workbook state back, without recalculating or touching
+    /// the data model (see [`Self::restore`]).
     fn put_back(&mut self, snap: &WbSnapshot) {
         let wb = &mut self.pkg.workbook;
         wb.sheets = snap.sheets.clone();
         wb.defined_names = snap.names.clone();
         wb.tables = snap.tables.clone();
         wb.removed_tables = snap.removed_tables.clone();
-        if let Some((rels, measures)) = &snap.model {
-            self.model_rels = rels.clone();
-            self.model_measures = measures.clone();
+        // Pivots aren't added or removed by a structural edit; if their count
+        // changed since, the sources no longer line up and stay as they are.
+        if wb.pivots.len() == snap.pivot_sources.len() {
+            for (p, source) in wb.pivots.iter_mut().zip(&snap.pivot_sources) {
+                p.source = source.clone();
+            }
         }
     }
 
     fn restore(&mut self, snap: &WbSnapshot) {
         self.cancel_cut();
         self.put_back(snap);
+        if let Some((old, new)) = &snap.model_rename {
+            self.rename_table_in_model(old, new);
+        }
         self.rebuild_engine();
         self.clamp_cursor();
         self.modified = true;
@@ -5815,25 +5838,8 @@ impl App {
             .table(old)
             .map(|t| t.name.clone())
             .ok_or_else(|| format!("There is no table named {old}"))?;
-        self.try_structural(true, |app| {
-            gridcore::edit::rename_table(&mut app.pkg.workbook, &cur, new)?;
-            let map = [(cur.clone(), new.to_string())];
-            for r in &mut app.model_rels {
-                for table in [&mut r.from.0, &mut r.to.0] {
-                    if table.eq_ignore_ascii_case(&cur) {
-                        *table = new.to_string();
-                    }
-                }
-            }
-            for m in &mut app.model_measures {
-                if let Ok(ast) = gridcore::formula::parse(&m.formula) {
-                    let out = gridcore::formula::rename_tables_in_expr(&ast, &map);
-                    if out != ast {
-                        m.formula = gridcore::formula::to_string(&out);
-                    }
-                }
-            }
-            Ok(())
+        self.try_structural(Some((&cur, new)), |wb| {
+            gridcore::edit::rename_table(wb, &cur, new)
         })
     }
 
@@ -5841,9 +5847,7 @@ impl App {
     fn resize_table(&mut self, name: &str, range: &str) -> Result<(), String> {
         let rect = gridcore::sheet::parse_range_name(&range.replace('$', ""))
             .ok_or_else(|| format!("\"{range}\" isn't a range"))?;
-        self.try_structural(false, |app| {
-            gridcore::edit::resize_table(&mut app.pkg.workbook, name, rect)
-        })
+        self.try_structural(None, |wb| gridcore::edit::resize_table(wb, name, rect))
     }
 
     /// Convert to Range: table `name` becomes plain cells. Refused while the
@@ -5858,16 +5862,17 @@ impl App {
             .any(|r| named(&r.from.0) || named(&r.to.0));
         let by_measure = self.model_measures.iter().any(|m| {
             gridcore::formula::parse(&m.formula).is_ok_and(|ast| {
-                let gone = [(name.to_string(), String::new())];
-                gridcore::formula::rename_tables_in_expr(&ast, &gone) != ast
+                let (mut refs, mut names) = (Vec::new(), Vec::new());
+                gridcore::formula::collect_structured(&ast, &mut refs);
+                gridcore::formula::collect_names(&ast, &mut names);
+                refs.iter().any(|r| r.0.as_deref().is_some_and(named))
+                    || names.iter().any(|n| named(n))
             })
         });
         if by_rel || by_measure {
             return Err(format!("The data model uses {name}"));
         }
-        self.try_structural(false, |app| {
-            gridcore::edit::convert_table_to_range(&mut app.pkg.workbook, name)
-        })
+        self.try_structural(None, |wb| gridcore::edit::convert_table_to_range(wb, name))
     }
 
     /// The ribbon's Table Name…: prompt for a new name.
@@ -15572,6 +15577,66 @@ mod table_command_tests {
         app.redo();
         assert_eq!(app.pkg.workbook.tables[0].name, "Sales");
         assert_eq!(app.model_rels[0].from.0, "Sales");
+    }
+
+    #[test]
+    fn undoing_a_rename_keeps_later_model_edits() {
+        let mut app = app_with_table();
+        app.model_rels.push(Relationship {
+            from: ("Table1".into(), "Item".into()),
+            to: ("Items".into(), "Item".into()),
+        });
+        app.rename_table("Table1", "Sales").unwrap();
+        // Model edits are not undo steps: one added, one removed.
+        app.model_measures.push(gridcore::model::Measure {
+            name: "Total".into(),
+            formula: "SUM(Sales[Qty])".into(),
+        });
+        app.model_rels.clear();
+        app.undo();
+        assert_eq!(app.pkg.workbook.tables[0].name, "Table1");
+        assert_eq!(app.model_measures.len(), 1, "the later measure stays");
+        assert_eq!(app.model_measures[0].formula, "SUM(Table1[Qty])");
+        assert!(
+            app.model_rels.is_empty(),
+            "the removed relationship stays gone"
+        );
+        app.redo();
+        assert_eq!(app.model_measures[0].formula, "SUM(Sales[Qty])");
+    }
+
+    #[test]
+    fn undoing_a_rename_puts_the_pivot_source_back() {
+        let mut app = app_with_table();
+        let frame = gridcore::frame::Frame::from_range(&app.pkg.workbook, 0, (0, 0, 2, 1));
+        let dest = app.pkg.add_sheet("Pivot");
+        app.pkg
+            .add_pivot(
+                gridcore::pivot::PivotSource::Table("Table1".into()),
+                frame.names.clone(),
+                gridcore::pivot::DataField {
+                    name: "Sum of Qty".into(),
+                    field: 1,
+                    agg: gridcore::frame::Agg::Sum,
+                },
+                dest,
+                (2, 0),
+            )
+            .unwrap();
+        app.rebuild_engine();
+        app.rename_table("Table1", "Sales").unwrap();
+        let source = |app: &App| app.pkg.workbook.pivots[0].source.clone();
+        assert_eq!(
+            source(&app),
+            gridcore::pivot::PivotSource::Table("Sales".into())
+        );
+        app.undo();
+        assert_eq!(
+            source(&app),
+            gridcore::pivot::PivotSource::Table("Table1".into())
+        );
+        let err = app.convert_table("Table1").unwrap_err();
+        assert!(err.contains("uses this table"), "{err}");
     }
 
     #[test]
