@@ -20221,8 +20221,11 @@ fn paragraph_el(
                 }
                 let selected = width == 1 && sel.is_some_and(|(s, e)| s < e && s <= pos && pos < e);
                 // Highlight Merge Fields (#628): merge fields, not PAGE or DATE,
-                // take a stronger shade. The keyword test rules most fields out
-                // before any parse.
+                // take a stronger shade. The allocation-free keyword test rules
+                // most fields out before the parse, which this paint runs per
+                // field per frame; a complex field whose keyword Word split
+                // across instrText runs goes unshaded (shading only: merging
+                // and preview parse it).
                 let merge = merge_hl
                     && docxcore::merge::might_be_merge_field(raw)
                     && docxcore::merge::field_kind(raw).is_some();

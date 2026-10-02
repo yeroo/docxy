@@ -21,8 +21,11 @@ pub enum MergeFieldKind {
         after: Option<String>,
         /// `\m`: `name` is a Match Fields name (First Name, City, …).
         mapped: bool,
-        /// `\*`: a text format (Upper, Lower, Caps, FirstCap, MERGEFORMAT).
-        format: Option<String>,
+        /// Every `\*` switch, in order: text formats (Upper, Lower, Caps,
+        /// FirstCap), number formats (Arabic, Roman, Ordinal, alphabetic…),
+        /// which apply only to a value that is a number, and MERGEFORMAT /
+        /// CHARFORMAT, which change no text.
+        formats: Vec<String>,
     },
     /// `ADDRESSBLOCK [\f format] [\e country-to-omit] [\c 0|1|2]`.
     AddressBlock {
@@ -61,20 +64,33 @@ impl MergeFieldKind {
 /// The mail-merge field `raw` (a `w:fldSimple` or collapsed complex field)
 /// is, if any. A field nested in the instruction is never one.
 pub fn field_kind(raw: &str) -> Option<MergeFieldKind> {
-    if !might_be_merge_field(raw) {
+    // A complex field's instruction can be split over several w:instrText
+    // runs (`ADDRESS` + `BLOCK`), so only a simple field is ruled out by the
+    // keyword test.
+    if !raw.contains("w:instrText") && !might_be_merge_field(raw) {
         return None;
     }
     instr_kind(&instr_of(raw)?)
 }
 
-/// A cheap test that rules out most fields without parsing: every merge
-/// field's keyword is in its XML, in any case. Used where a frame paints
-/// every field, so it allocates nothing.
+/// A cheap test that rules out most fields without parsing: a merge field's
+/// keyword (MERGEFIELD, MERGEREC, MERGESEQ, ADDRESSBLOCK, GREETINGLINE, NEXT)
+/// is in its XML, in any case. `NEXT` also lets NEXTIF through; the parse
+/// decides. It allocates nothing, for code that runs per field per frame,
+/// and it misses a complex field whose keyword Word split across instrText
+/// runs: [`field_kind`] parses those regardless.
 pub fn might_be_merge_field(raw: &str) -> bool {
     let raw = raw.as_bytes();
-    [&b"MERGE"[..], b"ADDRESSBLOCK", b"GREETINGLINE", b"NEXT"]
-        .iter()
-        .any(|k| raw.windows(k.len()).any(|w| w.eq_ignore_ascii_case(k)))
+    [
+        &b"MERGEFIELD"[..],
+        b"MERGEREC",
+        b"MERGESEQ",
+        b"ADDRESSBLOCK",
+        b"GREETINGLINE",
+        b"NEXT",
+    ]
+    .iter()
+    .any(|k| raw.windows(k.len()).any(|w| w.eq_ignore_ascii_case(k)))
 }
 
 /// The mail-merge field an (entity-decoded) instruction is, if any.
@@ -101,7 +117,11 @@ pub fn instr_kind(instr: &str) -> Option<MergeFieldKind> {
                 before: switch('b'),
                 after: switch('f'),
                 mapped: switches.iter().any(|(l, _)| l.eq_ignore_ascii_case(&'m')),
-                format: switch('*'),
+                formats: switches
+                    .iter()
+                    .filter(|(l, _)| *l == '*')
+                    .map(|(_, a)| a.clone())
+                    .collect(),
             }
         }
         "ADDRESSBLOCK" => MergeFieldKind::AddressBlock {
@@ -137,7 +157,7 @@ pub fn merge_field(name: &str, props: &RunProps) -> Inline {
         before: None,
         after: None,
         mapped: false,
-        format: None,
+        formats: Vec::new(),
     };
     crate::field::fld_simple(
         &format!(" MERGEFIELD {} ", quote_name(name)),
@@ -427,15 +447,15 @@ pub fn eval(kind: &MergeFieldKind, ctx: &MergeContext) -> Option<String> {
             before,
             after,
             mapped,
-            format,
+            formats,
         } => {
             let col = ctx.column_of(name, *mapped)?;
             let mut value = ctx.recipients.value(ctx.row, col).to_string();
             if value.is_empty() {
                 return Some(value);
             }
-            if let Some(fmt) = format {
-                value = apply_star(&value, 0.0, fmt);
+            for fmt in formats {
+                value = star_format(&value, fmt);
             }
             format!(
                 "{}{value}{}",
@@ -477,6 +497,30 @@ pub fn eval(kind: &MergeFieldKind, ctx: &MergeContext) -> Option<String> {
         MergeFieldKind::MergeRec => (ctx.row + 1).to_string(),
         MergeFieldKind::MergeSeq => ctx.seq.to_string(),
     })
+}
+
+/// Apply one `\*` switch to a merged value: a number format only when the
+/// value is a number (Word leaves other text as it is), a text format always.
+fn star_format(value: &str, fmt: &str) -> String {
+    let numeric = matches!(
+        fmt.trim().to_ascii_lowercase().as_str(),
+        "arabic"
+            | "roman"
+            | "roman_lower"
+            | "lroman"
+            | "ordinal"
+            | "cardinal"
+            | "alphabetic"
+            | "alphabetic_lower"
+            | "alphabetic-lower"
+    );
+    if !numeric {
+        return apply_star(value, 0.0, fmt);
+    }
+    match value.trim().parse::<f64>() {
+        Ok(n) if n.is_finite() => apply_star(value, n, fmt),
+        _ => value.to_string(),
+    }
 }
 
 /// The `_CODE_` in a `<<…>>` group, with the text before and after it.
@@ -559,7 +603,7 @@ mod tests {
             before: None,
             after: None,
             mapped: false,
-            format: None,
+            formats: Vec::new(),
         }
     }
 
@@ -573,7 +617,7 @@ mod tests {
                 before: None,
                 after: None,
                 mapped: false,
-                format: Some("MERGEFORMAT".into()),
+                formats: vec!["MERGEFORMAT".into()],
             })
         );
         let complex = "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
@@ -587,7 +631,7 @@ mod tests {
                 before: Some("Dear ".into()),
                 after: Some(",".into()),
                 mapped: true,
-                format: None,
+                formats: Vec::new(),
             })
         );
         for (instr, kind) in [
@@ -606,6 +650,57 @@ mod tests {
         assert!(matches!(
             instr_kind(" GREETINGLINE \\e \"Hello,\" "),
             Some(MergeFieldKind::GreetingLine { format: None, fallback: Some(f) }) if f == "Hello,"
+        ));
+    }
+
+    /// Numeric `\*` formats apply to a number, every switch counts, and
+    /// text that is not a number is left alone (#628 r1).
+    #[test]
+    fn star_formats_number_and_text() {
+        let r = Recipients::parse_csv(b"Qty,Name\n3,jane doe\n").unwrap();
+        let map = FieldMap::auto(&r);
+        let ctx = MergeContext {
+            recipients: &r,
+            map: &map,
+            row: 0,
+            seq: 1,
+        };
+        let ev = |instr: &str| eval(&instr_kind(instr).unwrap(), &ctx).unwrap();
+        assert_eq!(ev(" MERGEFIELD Qty \\* Arabic "), "3");
+        assert_eq!(ev(" MERGEFIELD Qty \\* Roman "), "III");
+        assert_eq!(ev(" MERGEFIELD Qty \\* Ordinal \\* MERGEFORMAT "), "3rd");
+        assert_eq!(ev(" MERGEFIELD Qty \\* MERGEFORMAT \\* Ordinal "), "3rd");
+        assert_eq!(ev(" MERGEFIELD Name \\* Ordinal "), "jane doe");
+        assert_eq!(ev(" MERGEFIELD Name \\* Caps \\* MERGEFORMAT "), "Jane Doe");
+        assert_eq!(ev(" MERGEFIELD Name \\* Upper "), "JANE DOE");
+    }
+
+    /// Word may split a complex field's keyword across instrText runs.
+    #[test]
+    fn split_keywords_are_still_merge_fields() {
+        let split = |a: &str, b: &str| {
+            format!(
+                "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+                 <w:r><w:instrText>{a}</w:instrText></w:r>\
+                 <w:r><w:instrText>{b}</w:instrText></w:r>\
+                 <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+                 <w:r><w:t>x</w:t></w:r><w:r><w:fldChar w:fldCharType=\"end\"/></w:r>"
+            )
+        };
+        assert!(matches!(
+            field_kind(&split(" ADDRESS", "BLOCK ")),
+            Some(MergeFieldKind::AddressBlock { .. })
+        ));
+        assert_eq!(
+            field_kind(&split(" MERGE", "FIELD City ")),
+            Some(mf("City"))
+        );
+        // The paint path's prefilter: keywords, not MERGEFORMAT.
+        assert!(!might_be_merge_field(
+            "<w:fldSimple w:instr=\" PAGE \\* MERGEFORMAT \"/>"
+        ));
+        assert!(might_be_merge_field(
+            "<w:fldSimple w:instr=\" mergeseq \"/>"
         ));
     }
 
