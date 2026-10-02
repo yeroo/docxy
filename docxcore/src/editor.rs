@@ -558,7 +558,7 @@ impl Editor {
             let Some(Block::Paragraph(p)) = cont.get_mut(idx) else {
                 return;
             };
-            let right = split_content(&mut p.content, off);
+            let right = split_paragraph_content(&mut p.content, off);
             let props = p.props.clone();
             // A section break ends the section after the split, so it (and
             // its tracked change, which Save also writes as a sectPr) moves
@@ -1219,7 +1219,7 @@ impl Editor {
             // As does a tracked change of the paragraph mark.
             crate::review::clear_mark_revisions(&mut p.props);
             let inner = p.props.clone();
-            let tail = split_content(&mut p.content, off);
+            let tail = split_paragraph_content(&mut p.content, off);
             p.content.extend(clip.paras[0].clone());
 
             let mut news: Vec<Block> = Vec::new();
@@ -2949,6 +2949,61 @@ fn split_content(content: &mut Vec<Inline>, o: usize) -> Vec<Inline> {
     Vec::new()
 }
 
+/// Split a paragraph's content at caret offset `o` for a paragraph break
+/// (Enter, a multi-paragraph paste, Blank Page, a section break, a table
+/// inserted mid-paragraph): as [`split_content`], then each inline content
+/// control the split cuts is closed at the end of the first half and opened
+/// again at the start of the second, as Word does, so both paragraphs
+/// serialize to well-formed XML (#652). The reopened copy has no `w:id`
+/// (optional in `w:sdtPr`), so ids stay unique. Only a control whose close
+/// is in the second half is reopened.
+fn split_paragraph_content(content: &mut Vec<Inline>, o: usize) -> Vec<Inline> {
+    let mut tail = split_content(content, o);
+    let mut open: Vec<usize> = Vec::new();
+    for (i, inline) in content.iter().enumerate() {
+        match inline {
+            Inline::Raw(raw) if crate::hf::is_sdt_open(raw) => open.push(i),
+            Inline::Raw(raw) if crate::hf::is_sdt_close(raw) => {
+                open.pop();
+            }
+            _ => {}
+        }
+    }
+    // The closes in the second half with no open there: the cut controls',
+    // innermost first.
+    let mut depth = 0usize;
+    let mut closes = 0usize;
+    for inline in &tail {
+        match inline {
+            Inline::Raw(raw) if crate::hf::is_sdt_open(raw) => depth += 1,
+            Inline::Raw(raw) if crate::hf::is_sdt_close(raw) => {
+                if depth == 0 {
+                    closes += 1;
+                } else {
+                    depth -= 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    let cut = &open[open.len() - closes.min(open.len())..];
+    if cut.is_empty() {
+        return tail;
+    }
+    let reopened: Vec<Inline> = cut
+        .iter()
+        .filter_map(|&i| match &content[i] {
+            Inline::Raw(raw) => Some(Inline::Raw(crate::sect::remove_element(raw, "w:id"))),
+            _ => None,
+        })
+        .collect();
+    for _ in cut {
+        content.push(Inline::Raw(crate::load::SDT_BLOCK_CLOSE.to_string()));
+    }
+    tail.splice(0..0, reopened);
+    tail
+}
+
 /// Split a hyperlink at `local`, strictly inside its text: `h` keeps what is
 /// before it, and the returned link, with the same target, anchor and
 /// relationship, takes the rest. Each half keeps its own children. A link
@@ -3247,6 +3302,10 @@ fn title_case(s: &str) -> String {
 
 /// Run properties that `content_insert` will give a character at this caret.
 fn run_props_at(content: &[Inline], offset: usize) -> RunProps {
+    // Typing into an emptied content control takes the control's formatting.
+    if let Some(at) = empty_sdt_at(content, offset) {
+        return sdt_typing_props(content, at);
+    }
     let Some((i, local)) = locate(content, offset) else {
         return match content.last() {
             Some(Inline::Run(r)) => r.props.clone(),
@@ -3281,6 +3340,8 @@ fn run_props_at(content: &[Inline], offset: usize) -> RunProps {
 /// link's style.
 fn tab_props_at(content: &[Inline], offset: usize) -> RunProps {
     match locate(content, offset) {
+        // A tab into an emptied content control goes inside it, as typing.
+        _ if empty_sdt_at(content, offset).is_some() => run_props_at(content, offset),
         Some((i, _)) if matches!(content[i], Inline::Hyperlink(_)) => {
             source_before(content, i).cloned().unwrap_or_default()
         }

@@ -8,7 +8,7 @@
 //! in. Every edit here is one undo step on the editor's document, which is
 //! what the page view and Save read.
 
-use super::{Caret, EditKind, Editor, resolve_para, split_content, tab_props_at};
+use super::{Caret, EditKind, Editor, resolve_para, split_paragraph_content, tab_props_at};
 use crate::model::{Block, BreakKind, Inline, Paragraph, SectionProperties};
 use crate::sect::{SectionSetup, SectionStart};
 
@@ -208,7 +208,7 @@ impl Editor {
         let Some(Block::Paragraph(p)) = self.doc.body.get_mut(block) else {
             return Err("A section break needs the caret in a paragraph".into());
         };
-        let right = split_content(&mut p.content, self.caret.offset);
+        let right = split_paragraph_content(&mut p.content, self.caret.offset);
         let second = Paragraph {
             props: p.props.clone(),
             content: right,

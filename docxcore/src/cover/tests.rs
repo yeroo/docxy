@@ -146,6 +146,17 @@ fn ids_avoid_the_used_ones() {
     );
     assert_eq!(free_sdt_ids(&[-7, 12], 3), vec![13, 14, 15]);
     assert_eq!(free_sdt_ids(&[], 2), vec![1, 2]);
+    // Ids Word cannot write are none of ours to avoid.
+    assert_eq!(
+        sdt_ids("<w:id w:val=\"9223372036854775807\"/><w:id w:val=\"2147483648\"/>"),
+        Vec::<i64>::new()
+    );
+    assert_eq!(free_sdt_ids(&[i64::MAX], 2), vec![1, 2]);
+    assert_eq!(free_sdt_ids(&[i64::from(i32::MAX)], 1), vec![1]);
+    assert_eq!(
+        free_sdt_ids(&[i64::from(i32::MAX) - 1], 1),
+        vec![i64::from(i32::MAX)]
+    );
     // Past Word's range: the smallest free positive ones.
     assert_eq!(
         free_sdt_ids(&[1, 3, i64::from(i32::MAX) - 1], 3),

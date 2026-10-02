@@ -340,18 +340,21 @@ fn placeholder_of(open: &str) -> Option<Placeholder> {
     })
 }
 
-/// Collect the text of every placeholder control in `content` into `out`,
-/// innermost first, keeping the first text found for each placeholder.
-fn inline_placeholders(content: &[Inline], out: &mut Typed) {
+/// The text of each placeholder control, piece by piece in document order: a
+/// paragraph break inside a placeholder splits its control in two (the editor
+/// closes it and opens it again, as Word does), so one placeholder may come in
+/// several pieces.
+type Pieces = HashMap<Placeholder, Vec<String>>;
+
+/// Collect the text of every placeholder control in `content` into `out`.
+fn inline_placeholders(content: &[Inline], out: &mut Pieces) {
     let mut open: Vec<(Option<Placeholder>, String)> = Vec::new();
     for inline in content {
         match inline {
             Inline::Raw(raw) if is_sdt_open(raw) => open.push((placeholder_of(raw), String::new())),
             Inline::Raw(raw) if is_sdt_close(raw) => {
                 if let Some((Some(field), text)) = open.pop() {
-                    if is_typed(&text) {
-                        out.entry(field).or_insert_with(|| text.trim().to_string());
-                    }
+                    out.entry(field).or_default().push(text);
                 }
             }
             other => {
@@ -367,11 +370,12 @@ fn inline_placeholders(content: &[Inline], out: &mut Typed) {
 /// The text typed into the placeholders of the cover `blocks` (from its
 /// opening boundary through its closing one): inline placeholder controls,
 /// and block-level ones such as Word's Abstract, whose paragraphs are joined
-/// with line breaks. Blank and still-bracketed placeholders are left out.
+/// with line breaks, as are the pieces of a placeholder split over several
+/// paragraphs. Blank and still-bracketed placeholders are left out.
 /// `w:showingPlcHdr` is not consulted: the editor never clears it, so it
 /// would hide text a person typed into a Word cover here.
 pub fn typed_placeholders(blocks: &[Block]) -> Typed {
-    let mut out = Typed::new();
+    let mut pieces = Pieces::new();
     for (i, block) in blocks.iter().enumerate() {
         match block {
             Block::Raw(raw) if i > 0 && is_sdt_open(raw) => {
@@ -384,16 +388,31 @@ pub fn typed_placeholders(blocks: &[Block]) -> Typed {
                     .filter(|b| matches!(b, Block::Paragraph(_) | Block::Table(_)))
                     .map(Block::plain_text)
                     .collect::<Vec<_>>()
-                    .join("\n");
-                if is_typed(&text) {
-                    out.entry(field).or_insert_with(|| text.trim().to_string());
-                }
+                    .join(
+                        "
+",
+                    );
+                pieces.entry(field).or_default().push(text);
             }
-            Block::Paragraph(p) => inline_placeholders(&p.content, &mut out),
+            Block::Paragraph(p) => inline_placeholders(&p.content, &mut pieces),
             _ => {}
         }
     }
-    out
+    pieces
+        .into_iter()
+        .filter_map(|(field, parts)| {
+            let text = parts
+                .iter()
+                .map(|t| t.trim())
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join(
+                    "
+",
+                );
+            is_typed(&text).then_some((field, text))
+        })
+        .collect()
 }
 
 /// Every content control `w:id` in `xml` (a part, or serialized blocks).
@@ -404,8 +423,9 @@ pub fn sdt_ids(xml: &str) -> Vec<i64> {
         rest = &rest[at..];
         let end = rest.find('>').unwrap_or(rest.len());
         if let Some(v) = crate::load::xml_attr_value(&rest[..end], "w:val") {
-            if let Ok(n) = v.trim().parse::<i64>() {
-                out.push(n);
+            // Word's ids are signed 32-bit; anything else cannot meet ours.
+            if let Ok(n) = v.trim().parse::<i32>() {
+                out.push(i64::from(n));
             }
         }
         rest = &rest[end..];
@@ -418,8 +438,12 @@ pub fn sdt_ids(xml: &str) -> Vec<i64> {
 /// positive ones.
 pub fn free_sdt_ids(used: &[i64], n: usize) -> Vec<i64> {
     let max = used.iter().copied().max().unwrap_or(0).max(0);
-    if max + (n as i64) < i64::from(i32::MAX) {
-        return (1..=n as i64).map(|k| max + k).collect();
+    let count = i64::try_from(n).unwrap_or(i64::MAX);
+    if max
+        .checked_add(count)
+        .is_some_and(|last| last <= i64::from(i32::MAX))
+    {
+        return (1..=count).map(|k| max + k).collect();
     }
     let taken: std::collections::HashSet<i64> = used.iter().copied().collect();
     (1..).filter(|k| !taken.contains(k)).take(n).collect()

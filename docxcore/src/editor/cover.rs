@@ -20,9 +20,9 @@ impl Editor {
 
     /// Put the cover `design` (an index into [`COVER_DESIGNS`]) at the start
     /// of the document, or in place of the cover it has, carrying the text
-    /// typed into the old cover's placeholders into the new one's. The first
-    /// section gets Different First Page (`w:titlePg`), so the cover shows no
-    /// page number. One undo step. `used_ids` are the content-control ids
+    /// typed into the old cover's placeholders into the new one's. The
+    /// cover's section gets Different First Page (`w:titlePg`), so the cover
+    /// shows no page number. One undo step. `used_ids` are the content-control ids
     /// the document's other parts (headers, footers) hold; the new controls'
     /// ids avoid them and the body's.
     pub fn set_cover_page(&mut self, design: usize, used_ids: &[i64]) -> Result<(), String> {
@@ -44,7 +44,8 @@ impl Editor {
         self.doc.body.splice(at..at + removed, blocks);
         self.follow_blocks(at, removed, added, at + added);
 
-        let slot = self.section_slots()[self.section_of_block(0)];
+        // The cover's own section: a Word cover need not open the body.
+        let slot = self.section_slots()[self.section_of_block(at)];
         let raw = crate::sect::set_flag(self.sect_raw(slot), "w:titlePg", true);
         if raw != self.sect_raw(slot) {
             self.set_sect_raw(slot, raw);

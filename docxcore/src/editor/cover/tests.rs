@@ -388,3 +388,171 @@ fn blank_page_is_two_page_breaks_in_one_step() {
     assert_eq!(e.doc.body.len(), 3, "two paragraphs and the sectPr");
     assert!(!e.undo(), "one step");
 }
+
+/// Whether every paragraph's inline content controls open and close in pairs,
+/// so the body serializes to well-formed XML.
+fn inline_controls_balance(e: &Editor) -> bool {
+    e.doc.body.iter().all(|b| {
+        let Block::Paragraph(p) = b else {
+            return true;
+        };
+        let mut depth = 0i32;
+        for i in &p.content {
+            match i {
+                Inline::Raw(r) if crate::hf::is_sdt_open(r) => depth += 1,
+                Inline::Raw(r) if crate::hf::is_sdt_close(r) => depth -= 1,
+                _ => {}
+            }
+            if depth < 0 {
+                return false;
+            }
+        }
+        depth == 0
+    })
+}
+
+/// Save and reload through the package, as a person would.
+fn reloaded(e: &Editor) -> Editor {
+    let pkg = crate::package::new_package(e.doc.clone());
+    let bytes = crate::package::save_package(&pkg);
+    Editor::new(
+        crate::package::load_package(&bytes)
+            .expect("reload")
+            .document,
+    )
+}
+
+/// A Plain cover with "My title" typed into its Title, the caret in the
+/// title paragraph at `offset`.
+fn typed_title(offset: usize) -> (Editor, usize) {
+    let mut e = body_doc();
+    e.set_cover_page(0, &[]).unwrap();
+    let title = field_para(&e, Placeholder::Title);
+    type_over(&mut e, title, "My title");
+    e.anchor = None;
+    e.caret = Caret {
+        path: vec![title],
+        offset,
+    };
+    (e, title)
+}
+
+fn all_text(e: &Editor) -> String {
+    e.doc.body.iter().map(Block::plain_text).collect()
+}
+
+#[test]
+fn enter_inside_a_placeholder_closes_and_reopens_it() {
+    let (mut e, title) = typed_title(2);
+    e.insert_newline();
+    assert!(
+        inline_controls_balance(&e),
+        "{}",
+        blocks_to_xml(&e.doc.body)
+    );
+    assert_eq!(text_at(&e, &[title]), "My");
+    assert_eq!(text_at(&e, &[title + 1]), " title");
+    // The reopened half has no id of its own, so ids stay unique.
+    let xml = blocks_to_xml(&e.doc.body);
+    let mut ids = crate::cover::sdt_ids(&xml);
+    let n = ids.len();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), n, "{xml}");
+    assert_eq!(xml.matches("<w:alias w:val=\"Title\"/>").count(), 2);
+
+    let mut r = reloaded(&e);
+    assert!(inline_controls_balance(&r));
+    assert_eq!(all_text(&r), all_text(&e));
+    // Both pieces carry into another design, a line apart.
+    r.set_cover_page(1, &[]).unwrap();
+    assert_eq!(
+        text_at(&r, &[field_para(&r, Placeholder::Title)]),
+        "My\ntitle"
+    );
+}
+
+#[test]
+fn blank_page_inside_a_placeholder_keeps_it_balanced() {
+    for offset in [2, 0] {
+        let (mut e, _) = typed_title(offset);
+        e.insert_blank_page();
+        assert!(
+            inline_controls_balance(&e),
+            "offset {offset}: {}",
+            blocks_to_xml(&e.doc.body)
+        );
+        let r = reloaded(&e);
+        assert!(inline_controls_balance(&r));
+        assert_eq!(all_text(&r), all_text(&e), "offset {offset}");
+        assert!(r.has_cover_page());
+    }
+}
+
+#[test]
+fn a_paste_of_paragraphs_inside_a_placeholder_keeps_it_balanced() {
+    let (mut e, title) = typed_title(2);
+    e.paste(&Clip::from_text("one\ntwo\nthree"));
+    assert!(
+        inline_controls_balance(&e),
+        "{}",
+        blocks_to_xml(&e.doc.body)
+    );
+    assert_eq!(text_at(&e, &[title]), "Myone");
+    assert_eq!(text_at(&e, &[title + 2]), "three title");
+    let r = reloaded(&e);
+    assert!(inline_controls_balance(&r));
+    assert_eq!(all_text(&r), all_text(&e));
+}
+
+#[test]
+fn the_caret_at_an_emptied_placeholder_reads_its_formatting() {
+    let mut e = body_doc();
+    e.set_cover_page(2, &[]).unwrap(); // Title Band: bold 32 pt title
+    let title = field_para(&e, Placeholder::Title);
+    let len = text_at(&e, &[title]).chars().count();
+    e.anchor = Some(Caret {
+        path: vec![title],
+        offset: 0,
+    });
+    e.caret = Caret {
+        path: vec![title],
+        offset: len,
+    };
+    e.delete_selection();
+    let props = e.caret_props();
+    assert!(props.bold && props.size_half_pts == Some(64), "{props:?}");
+    // A tab there goes inside the control, formatted as typing would be.
+    e.insert_tab();
+    let Block::Paragraph(p) = &e.doc.body[title] else {
+        panic!()
+    };
+    let tab = p
+        .content
+        .iter()
+        .skip_while(|i| !matches!(i, Inline::Raw(r) if crate::hf::is_sdt_open(r)))
+        .find_map(|i| match i {
+            Inline::Tab(props) => Some(props),
+            _ => None,
+        })
+        .expect("a tab inside the control");
+    assert!(tab.bold && tab.size_half_pts == Some(64));
+}
+
+#[test]
+fn title_page_goes_on_the_section_the_cover_is_in() {
+    let first = "<w:sectPr><w:type w:val=\"continuous\"/></w:sectPr>";
+    let mut e = ed(&format!(
+        "<w:p><w:pPr>{first}</w:pPr><w:r><w:t>Before</w:t></w:r></w:p>{}\
+         <w:p><w:r><w:t>Body text</w:t></w:r></w:p>{SECT}",
+        crate::cover::tests::WORD_COVER
+    ));
+    let before = e.sections()[0].clone();
+    e.set_cover_page(1, &[]).unwrap();
+    let sections = e.sections();
+    assert_eq!(sections[0], before, "section 0 is not the cover's");
+    assert!(
+        crate::sect::has_flag(&sections[1], "w:titlePg"),
+        "{sections:?}"
+    );
+}
