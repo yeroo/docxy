@@ -3,12 +3,18 @@
 //! changes are resolved by accepting them ([`Document::accept_all_revisions`]),
 //! so they need nothing here beyond a count.
 //!
-//! The body walk descends into everything that can hold runs or markers:
-//! paragraphs, table cells, hyperlinks (both `runs` and `content`), tracked
-//! change wrappers and text boxes. A hyperlink or revision wrapper that loaded
-//! from the file saves its original `raw` XML until `content_changed` is set,
-//! so removing anything inside one sets that flag; otherwise the save would
-//! quietly write the removed content back.
+//! The body walk descends into the modeled tree: paragraphs, table cells,
+//! hyperlinks (both `runs` and `content`), tracked change wrappers and text
+//! boxes. A hyperlink or revision wrapper that loaded from the file saves its
+//! original `raw` XML until `content_changed` is set, so removing anything
+//! inside one sets that flag; otherwise the save would quietly write the
+//! removed content back.
+//!
+//! Some content stays raw XML: fields, tracked moves, unmodeled inline and
+//! block elements, and a group shape's other text boxes. Comment markers are
+//! cut out of that XML too. Hidden runs in it are counted
+//! ([`count_unremovable_hidden_runs`]) but not removed, since that would
+//! mean editing run XML the model doesn't hold.
 
 use crate::model::{Block, Document, Inline, Run, RunProps};
 use crate::package::Package;
@@ -22,6 +28,8 @@ enum Target {
     Hidden,
     /// `w:commentRangeStart`, `w:commentRangeEnd` and `w:commentReference`.
     CommentMarkers,
+    /// Hidden runs inside raw XML ([`count_hidden_in_xml`]). Counted only.
+    RawHidden,
 }
 
 impl Target {
@@ -128,6 +136,74 @@ fn is_leftover(xml: &str) -> bool {
     }
 }
 
+/// Hidden runs in raw XML, by the rule of [`is_hidden`]: a `w:r` whose own
+/// `w:rPr` turns `w:vanish` on and has no `w:webHidden`. Only leaf runs
+/// count: a drawing run that holds a text box's runs is not itself text.
+fn count_hidden_in_xml(xml: &str) -> usize {
+    struct RunFrame {
+        depth: usize,
+        vanish: bool,
+        web_hidden: bool,
+        has_inner_run: bool,
+    }
+    let mut p = XmlParser::new(xml);
+    let mut names: Vec<&str> = Vec::new();
+    let mut runs: Vec<RunFrame> = Vec::new();
+    let mut count = 0;
+    loop {
+        match p.next() {
+            Event::Start => {
+                let name = p.name();
+                // The run's own properties: `w:r` > `w:rPr` > this element.
+                let own_prop = names.len() >= 2
+                    && names[names.len() - 1] == "w:rPr"
+                    && names[names.len() - 2] == "w:r";
+                if let Some(run) = runs.last_mut().filter(|_| own_prop) {
+                    let on = !matches!(p.attr("w:val"), "0" | "false" | "off");
+                    match name {
+                        "w:vanish" => run.vanish = on,
+                        "w:webHidden" => run.web_hidden = on,
+                        _ => {}
+                    }
+                }
+                names.push(name);
+                if name == "w:r" {
+                    if let Some(outer) = runs.last_mut() {
+                        outer.has_inner_run = true;
+                    }
+                    runs.push(RunFrame {
+                        depth: names.len(),
+                        vanish: false,
+                        web_hidden: false,
+                        has_inner_run: false,
+                    });
+                }
+            }
+            Event::End => {
+                if let Some(run) = runs.pop_if(|r| r.depth == names.len())
+                    && run.vanish
+                    && !run.web_hidden
+                    && !run.has_inner_run
+                {
+                    count += 1;
+                }
+                names.pop();
+            }
+            Event::Text => {}
+            Event::Eof => return count,
+        }
+    }
+}
+
+/// What `target` counts in a piece of raw XML.
+fn count_in_raw(xml: &str, target: Target) -> usize {
+    match target {
+        Target::CommentMarkers => count_markers(xml),
+        Target::RawHidden => count_hidden_in_xml(xml),
+        Target::Hidden => 0,
+    }
+}
+
 fn count_blocks(blocks: &[Block], target: Target) -> usize {
     blocks
         .iter()
@@ -139,8 +215,8 @@ fn count_blocks(blocks: &[Block], target: Target) -> usize {
                 .flat_map(|row| &row.cells)
                 .map(|cell| count_blocks(&cell.blocks, target))
                 .sum(),
-            Block::Raw(raw) if target == Target::CommentMarkers => count_markers(raw),
-            Block::SectionProperties(_) | Block::Raw(_) => 0,
+            Block::Raw(raw) => count_in_raw(raw, target),
+            Block::SectionProperties(_) => 0,
         })
         .sum()
 }
@@ -148,7 +224,7 @@ fn count_blocks(blocks: &[Block], target: Target) -> usize {
 /// The raw XML of an inline that the walk strips comment markers from.
 /// Hyperlinks and revisions are not here: their children are walked, and a
 /// changed wrapper is rebuilt from them. Text boxes are not either: their
-/// raw holds copies of their blocks ([`text_box_extra_markers`]).
+/// raw holds copies of their blocks ([`text_box_extra`]).
 fn marker_raw(inline: &Inline) -> Option<&str> {
     match inline {
         Inline::Raw(raw) | Inline::Field { raw, .. } | Inline::UnsupportedRevision { raw, .. } => {
@@ -172,8 +248,8 @@ fn count_inlines(content: &[Inline], target: Target) -> usize {
         .iter()
         .map(|inline| {
             let own = match marker_raw(inline) {
-                Some(raw) if target == Target::CommentMarkers => count_markers(raw),
-                _ => usize::from(target.matches(inline)),
+                Some(raw) => count_in_raw(raw, target),
+                None => usize::from(target.matches(inline)),
             };
             own + match inline {
                 Inline::Hyperlink(h) => {
@@ -182,11 +258,7 @@ fn count_inlines(content: &[Inline], target: Target) -> usize {
                 }
                 Inline::Revision { content, .. } => count_inlines(content, target),
                 Inline::TextBox { raw, blocks } => {
-                    count_blocks(blocks, target)
-                        + match target {
-                            Target::CommentMarkers => text_box_extra_markers(raw),
-                            Target::Hidden => 0,
-                        }
+                    count_blocks(blocks, target) + text_box_extra(raw, target)
                 }
                 _ => 0,
             }
@@ -274,10 +346,10 @@ fn remove_inlines(content: &mut Vec<Inline>, target: Target) -> usize {
             Inline::TextBox { raw, blocks } => {
                 // Judged on the loaded XML, before the strip below can make
                 // twin copies differ.
-                let twins = twin_copies(raw);
+                let twins: Vec<bool> = text_box_copies(raw).iter().map(|c| c.twin).collect();
                 let mut inside = remove_blocks(blocks, target);
                 if target == Target::CommentMarkers {
-                    inside += text_box_extra_markers(raw);
+                    inside += text_box_extra(raw, target);
                     *raw = strip_markers(raw).0;
                 }
                 if inside > 0 {
@@ -291,67 +363,69 @@ fn remove_inlines(content: &mut Vec<Inline>, target: Target) -> usize {
     removed
 }
 
-/// The `w:txbxContent` elements of a text box's `raw`, as byte ranges of
-/// the whole element and of its inner XML. The loader reads `blocks` from
-/// the first one and save splices them back there only. Word 2010+ writes
-/// a shape twice, a DrawingML `mc:Choice` and a VML `mc:Fallback`; a group
-/// shape holds several boxes, each written twice. Empty when the first copy
-/// has another nested in it, a shape the save's splice can't handle either.
-fn text_box_copies(raw: &str) -> Vec<(Range<usize>, Range<usize>)> {
+/// One `w:txbxContent` element of a text box's `raw`.
+struct TextBoxCopy {
+    /// Byte range of its inner XML.
+    inner: Range<usize>,
+    /// Whether its inner XML equals the first copy's, so it shows the same
+    /// `blocks`. The first copy is its own twin. Only twins may be rewritten
+    /// from `blocks`; another box of a group keeps its own content.
+    twin: bool,
+}
+
+/// The `w:txbxContent` copies in a text box's `raw`. The loader reads
+/// `blocks` from the first one and save splices them back there only. Word
+/// 2010+ writes a shape twice, a DrawingML `mc:Choice` and a VML
+/// `mc:Fallback`; a group shape holds several boxes, each written twice.
+/// Self-closing copies are skipped. Empty when the first copy has another
+/// nested in it, a shape the save's splice can't handle either.
+fn text_box_copies(raw: &str) -> Vec<TextBoxCopy> {
     const NAME: &str = "w:txbxContent";
-    let mut copies = Vec::new();
+    let mut inners: Vec<Range<usize>> = Vec::new();
     let mut from = 0;
     while let Some((start, end, _)) = find_element_from(raw, NAME, from) {
         from = end;
         let Some(head) = tag_end(&raw[start..]) else {
             break;
         };
-        // A self-closing copy has no content to rewrite or compare.
         if raw[..start + head].ends_with("/>") {
             continue;
         }
         let inner = start + head..end - NAME.len() - "</>".len();
-        if copies.is_empty() && raw[inner.clone()].contains(&format!("<{NAME}")) {
+        if inners.is_empty() && raw[inner.clone()].contains(&format!("<{NAME}")) {
             return Vec::new();
         }
-        copies.push((start..end, inner));
+        inners.push(inner);
     }
-    copies
-}
-
-/// For each `w:txbxContent` copy in `raw`, whether it is a twin of the
-/// first: the same inner XML, so it shows the same `blocks`. Only those
-/// may be rewritten from `blocks`; another box of a group keeps its own.
-fn twin_copies(raw: &str) -> Vec<bool> {
-    let copies = text_box_copies(raw);
-    let Some((_, first)) = copies.first() else {
+    let Some(first) = inners.first().map(|r| &raw[r.clone()]) else {
         return Vec::new();
     };
-    copies
+    inners
         .iter()
-        .map(|(_, inner)| raw[inner.clone()] == raw[first.clone()])
+        .map(|inner| TextBoxCopy {
+            twin: raw[inner.clone()] == *first,
+            inner: inner.clone(),
+        })
         .collect()
 }
 
-/// Comment markers in a text box's `raw` that its `blocks` don't stand for:
-/// everything but the first copy and its twins (another box of a group,
-/// the shape around them).
-fn text_box_extra_markers(raw: &str) -> usize {
+/// What `target` counts in a text box's `raw` beyond what its `blocks`
+/// stand for: everything but the first copy and its twins (another box of a
+/// group, the shape around them).
+fn text_box_extra(raw: &str, target: Target) -> usize {
     let copies = text_box_copies(raw);
-    let Some((_, first)) = copies.first() else {
+    let Some(first) = copies.first() else {
         return 0;
     };
-    let twins = copies
-        .iter()
-        .filter(|(_, inner)| raw[inner.clone()] == raw[first.clone()])
-        .count();
-    count_markers(raw) - twins * count_markers(&raw[first.clone()])
+    let twins = copies.iter().filter(|c| c.twin).count();
+    count_in_raw(raw, target)
+        .saturating_sub(twins * count_in_raw(&raw[first.inner.clone()], target))
 }
 
-/// Rewrite the twins of the first copy (`twins`, from [`twin_copies`] on the
-/// loaded XML) from `blocks`, so a removal reaches the copy an older reader
-/// shows. The first copy is left to save's own splice, and any other copy
-/// as it is.
+/// Rewrite every twin of the first copy (`twins`, read from the loaded XML)
+/// from `blocks`, the first included, so the copies stay byte-identical and
+/// a later removal still finds them twins, and a removal reaches the copy an
+/// older reader shows. Any other copy stays as it is.
 fn sync_twin_copies(raw: &mut String, blocks: &[Block], twins: &[bool]) {
     let copies = text_box_copies(raw);
     if copies.len() != twins.len() {
@@ -359,17 +433,26 @@ fn sync_twin_copies(raw: &mut String, blocks: &[Block], twins: &[bool]) {
     }
     let inner = crate::serialize::blocks_to_xml(blocks);
     // Last first, so the earlier ranges stay valid.
-    for ((_, range), _) in copies.iter().zip(twins).skip(1).filter(|(_, t)| **t).rev() {
-        raw.replace_range(range.clone(), &inner);
+    for (copy, _) in copies.iter().zip(twins).filter(|(_, t)| **t).rev() {
+        raw.replace_range(copy.inner.clone(), &inner);
     }
 }
 
-/// Hidden runs, tabs and breaks in the body (see [`is_hidden`]).
+/// Hidden runs, tabs and breaks in the modeled body (see [`is_hidden`]):
+/// the ones [`remove_hidden_text`] removes.
 pub fn count_hidden_runs(doc: &Document) -> usize {
     count_blocks(&doc.body, Target::Hidden)
 }
 
-/// Remove every hidden run, tab and break from the body. Returns how many.
+/// Hidden runs that stay raw XML (fields, tracked moves, unmodeled
+/// elements, a group shape's other text boxes): found, but not removed by
+/// [`remove_hidden_text`].
+pub fn count_unremovable_hidden_runs(doc: &Document) -> usize {
+    count_blocks(&doc.body, Target::RawHidden)
+}
+
+/// Remove every hidden run, tab and break from the modeled body (see
+/// [`count_hidden_runs`]). Returns how many.
 pub fn remove_hidden_text(doc: &mut Document) -> usize {
     remove_blocks(&mut doc.body, Target::Hidden)
 }
@@ -792,6 +875,97 @@ mod tests {
         assert!(!xml.contains("comment"), "{xml}");
         assert_eq!(xml.matches("Box B").count(), 2, "{xml}");
         assert_eq!(xml.matches("keep").count(), 2, "{xml}");
+    }
+
+    /// A two-copy text box whose paragraph carries Word's rsids, a comment
+    /// range and a hidden run.
+    fn rsid_box() -> String {
+        two_copy_text_box(&format!(
+            "<w:p w:rsidR=\"00A1B2C3\" w:rsidRDefault=\"00A1B2C3\">\
+             <w:commentRangeStart w:id=\"5\"/>{VISIBLE}<w:commentRangeEnd w:id=\"5\"/>{HIDDEN}</w:p>"
+        ))
+    }
+
+    /// Review r3 M1: after one Remove All rewrites the copies, a second still
+    /// sees them as twins, in either order.
+    #[test]
+    fn inspect_second_removal_still_reaches_the_fallback() {
+        // Comments, then hidden text.
+        let mut doc = parse(&rsid_box());
+        assert_eq!(remove_all_comment_markers(&mut doc), 1 + 1);
+        assert_eq!(count_hidden_runs(&doc), 1);
+        assert_eq!(remove_hidden_text(&mut doc), 1);
+        let xml = document_to_xml(&doc);
+        assert!(!xml.contains("gone"), "{xml}");
+        assert!(!xml.contains("comment"), "{xml}");
+        assert_eq!(xml.matches("keep").count(), 2, "{xml}");
+
+        // Hidden text, then comments: the second pass counts what it removes.
+        let mut doc = parse(&rsid_box());
+        assert_eq!(remove_hidden_text(&mut doc), 1);
+        let markers = count_blocks(&doc.body, Target::CommentMarkers);
+        assert_eq!(markers, 2);
+        assert_eq!(remove_all_comment_markers(&mut doc), markers);
+        let xml = document_to_xml(&doc);
+        assert!(!xml.contains("gone"), "{xml}");
+        assert!(!xml.contains("comment"), "{xml}");
+        assert_eq!(xml.matches("keep").count(), 2, "{xml}");
+    }
+
+    /// Review r3 M2: hidden runs that stay raw XML are counted (not removed).
+    #[test]
+    fn inspect_counts_hidden_runs_left_in_raw_xml() {
+        let body = format!(
+            "<w:p><w:moveTo w:id=\"3\" w:author=\"A\">{HIDDEN}{VISIBLE}</w:moveTo></w:p>\
+             <w:p><w:fldSimple w:instr=\" XE &quot;term&quot; \">{HIDDEN}</w:fldSimple></w:p>\
+             {}",
+            group_of_two_boxes(
+                &format!("<w:p>{VISIBLE}</w:p>"),
+                &format!("<w:p>{HIDDEN}</w:p>")
+            )
+        );
+        let mut doc = parse(&body);
+        assert_eq!(count_hidden_runs(&doc), 0, "none of it is modeled");
+        // One in the move, one in the field, B and its fallback twin B'.
+        assert_eq!(count_unremovable_hidden_runs(&doc), 4);
+        assert_eq!(remove_hidden_text(&mut doc), 0);
+        assert_eq!(count_unremovable_hidden_runs(&doc), 4, "left in place");
+    }
+
+    #[test]
+    fn hidden_in_xml_counts_leaf_runs_by_their_own_props() {
+        let count = count_hidden_in_xml;
+        assert_eq!(count(HIDDEN), 1);
+        assert_eq!(count(VISIBLE), 0);
+        assert_eq!(
+            count("<w:r><w:rPr><w:vanish w:val=\"0\"/></w:rPr><w:t>x</w:t></w:r>"),
+            0
+        );
+        assert_eq!(
+            count("<w:r><w:rPr><w:vanish w:val=\"false\"/></w:rPr><w:t>x</w:t></w:r>"),
+            0
+        );
+        // A TOC page number: webHidden, not hidden text.
+        assert_eq!(
+            count("<w:r><w:rPr><w:vanish/><w:webHidden/></w:rPr><w:t>3</w:t></w:r>"),
+            0
+        );
+        // The previous formatting of a tracked change is not the run's own.
+        assert_eq!(
+            count(
+                "<w:r><w:rPr><w:b/><w:rPrChange w:id=\"1\"><w:rPr><w:vanish/></w:rPr>\
+                 </w:rPrChange></w:rPr><w:t>x</w:t></w:r>"
+            ),
+            0
+        );
+        // A drawing run holding a text box's runs: only the inner run counts.
+        assert_eq!(
+            count(&format!(
+                "<w:r><w:rPr><w:vanish/></w:rPr><w:pict><w:txbxContent><w:p>{HIDDEN}</w:p>\
+                 </w:txbxContent></w:pict></w:r>"
+            )),
+            1
+        );
     }
 
     #[test]
