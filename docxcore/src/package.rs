@@ -2336,14 +2336,19 @@ fn path_to_file_url(path: &str) -> String {
 }
 
 /// `%XX` escapes decoded.
+/// Works on bytes: a `%` before a multibyte character (or at the end) is
+/// kept as it is, never sliced through.
 fn percent_decode(s: &str) -> String {
+    fn hex(b: u8) -> Option<u8> {
+        (b as char).to_digit(16).map(|d| d as u8)
+    }
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(b);
+            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(hi << 4 | lo);
                 i += 3;
                 continue;
             }
@@ -3312,11 +3317,47 @@ mod tests {
             assert_eq!(file_url_to_path(url), path, "{url}");
         }
         assert_eq!(file_url_to_path("file://localhost/C:/x.csv"), "C:/x.csv");
+        // r2 C1: a `%` that is not an escape, before a multibyte character
+        // or at the end, is kept; nothing panics.
+        for (url, path) in [
+            ("file:///C:/%a\u{e9}.csv", "C:/%a\u{e9}.csv"),
+            ("file:///C:/50%\u{e9}.csv", "C:/50%\u{e9}.csv"),
+            ("file:///C:/x%", "C:/x%"),
+            ("file:///C:/x%4", "C:/x%4"),
+            ("file:///C:/x%41", "C:/xA"),
+            ("file:///C:/%zz.csv", "C:/%zz.csv"),
+        ] {
+            assert_eq!(file_url_to_path(url), path, "{url}");
+        }
         // What the first version wrote for a UNC path is left alone.
         assert_eq!(
             file_url_to_path("file:///\\\\server\\s\\x.csv"),
             "\\\\server\\s\\x.csv"
         );
+    }
+
+    /// r2 C1: a document whose mailMergeSource target has a `%` before a
+    /// multibyte character opens: reading its merge setup does not panic.
+    #[test]
+    fn mail_merge_source_with_a_stray_percent_does_not_panic_628() {
+        let settings = "<w:settings xmlns:w=\"w\"><w:mailMerge><w:mainDocumentType w:val=\"formLetters\"/>\
+            <w:dataSource r:id=\"rId1\"/></w:mailMerge></w:settings>";
+        let srels = "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+            <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/mailMergeSource\" \
+            Target=\"file:///C:/%a\u{e9}.csv\" TargetMode=\"External\"/></Relationships>";
+        let mut docx = load_package(&make_metadata_docx(
+            BODY,
+            Some(settings),
+            Some(DOC_RELS),
+            &[],
+        ))
+        .unwrap();
+        docx.parts.push((
+            "word/_rels/settings.xml.rels".into(),
+            srels.as_bytes().to_vec(),
+        ));
+        let pkg = load_package(&save_package(&docx)).unwrap();
+        assert_eq!(pkg.mail_merge_source().as_deref(), Some("C:/%a\u{e9}.csv"));
     }
 
     /// A data source named only by `w:query` (no relationship) is still read.
