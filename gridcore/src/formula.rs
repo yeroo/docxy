@@ -1961,6 +1961,189 @@ pub fn translate_formula(src: &str, dr: i64, dc: i64) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Cut and paste (a move)
+// ---------------------------------------------------------------------------
+
+/// A cut-and-paste of the cells in `rect` (r0, c0, r1, c1, 0-based) on sheet
+/// `src` to sheet `dst`, `dr` rows down and `dc` columns across, as seen by
+/// formulas. Unlike a copy, a move shifts the references that point at the
+/// moved cells, `$` parts too: they follow the cells.
+#[derive(Clone, Copy, Debug)]
+pub struct CellMove<'a> {
+    pub src: &'a str,
+    pub dst: &'a str,
+    pub rect: (u32, u32, u32, u32),
+    pub dr: i64,
+    pub dc: i64,
+}
+
+impl CellMove<'_> {
+    fn same_sheet(&self) -> bool {
+        self.src.eq_ignore_ascii_case(self.dst)
+    }
+
+    /// Whether `r`, read on sheet `home` when it is unqualified, names a
+    /// moved cell.
+    fn holds(&self, r: &CellRef, home: Option<&str>) -> bool {
+        let sheet = r.sheet.as_deref().or(home);
+        let (r0, c0, r1, c1) = self.rect;
+        sheet.is_some_and(|s| s.eq_ignore_ascii_case(self.src))
+            && (r0 as i64..=r1 as i64).contains(&r.row)
+            && (c0 as i64..=c1 as i64).contains(&r.col)
+    }
+
+    /// `r` moved with its cell, with qualifier `sheet`; a cell pushed off the
+    /// grid's edge poisons it (`#REF!`).
+    fn shifted(&self, r: &CellRef, sheet: Option<String>) -> CellRef {
+        let (row, col) = (r.row + self.dr, r.col + self.dc);
+        let on_grid = (0..axis_max(true)).contains(&row) && (0..axis_max(false)).contains(&col);
+        CellRef {
+            sheet,
+            row: if on_grid { row } else { -1 },
+            col: if on_grid { col } else { -1 },
+            ..r.clone()
+        }
+    }
+}
+
+/// Rewrite `e`, a formula on sheet `home` (`None` for a defined name, whose
+/// unqualified references name no sheet), for the move `mv`: a reference to
+/// a moved cell, or a range whose both corners were moved, follows them, and
+/// is qualified with the destination sheet when the move changed sheets.
+/// Anything else is left alone, as are 3-D, whole-row and whole-column
+/// references.
+pub fn move_ref_expr(e: &Expr, home: Option<&str>, mv: &CellMove) -> Expr {
+    let recur = |x: &Expr| move_ref_expr(x, home, mv);
+    let sheet_of = |r: &CellRef| {
+        if mv.same_sheet() {
+            r.sheet.clone()
+        } else {
+            Some(mv.dst.to_string())
+        }
+    };
+    match e {
+        Expr::Ref(r) if mv.holds(r, home) => Expr::Ref(mv.shifted(r, sheet_of(r))),
+        Expr::SpillRef(r) if mv.holds(r, home) => Expr::SpillRef(mv.shifted(r, sheet_of(r))),
+        Expr::Range(p, q) => {
+            // The first corner's qualifier covers the range.
+            let q_home = p.sheet.as_deref().or(home);
+            if mv.holds(p, home) && mv.holds(q, q_home) {
+                Expr::Range(mv.shifted(p, sheet_of(p)), mv.shifted(q, q.sheet.clone()))
+            } else {
+                e.clone()
+            }
+        }
+        Expr::ArrayLit(rows) => Expr::ArrayLit(
+            rows.iter()
+                .map(|row| row.iter().map(recur).collect())
+                .collect(),
+        ),
+        Expr::Func(n, args) => Expr::Func(n.clone(), args.iter().map(recur).collect()),
+        Expr::Call(callee, args) => {
+            Expr::Call(Box::new(recur(callee)), args.iter().map(recur).collect())
+        }
+        Expr::Un(op, x) => Expr::Un(*op, Box::new(recur(x))),
+        Expr::Bin(op, l, r) => Expr::Bin(*op, Box::new(recur(l)), Box::new(recur(r))),
+        other => other.clone(),
+    }
+}
+
+/// Rewrite `e`, the formula of a moved cell, for the move `mv`: it lived on
+/// `mv.src` and now lives on `mv.dst`. A reference to another moved cell
+/// follows it and names the cell's new home unqualified; any other
+/// unqualified reference is qualified with the source sheet when the move
+/// changed sheets, so it keeps reading the cells it read.
+pub fn move_block_expr(e: &Expr, mv: &CellMove) -> Expr {
+    let recur = |x: &Expr| move_block_expr(x, mv);
+    let home = Some(mv.src);
+    // A moved reference lands on the formula's own new sheet.
+    let inside = |r: &CellRef| {
+        let sheet = if mv.same_sheet() {
+            r.sheet.clone()
+        } else {
+            None
+        };
+        mv.shifted(r, sheet)
+    };
+    let outside = |s: &Option<String>| match s {
+        None if !mv.same_sheet() => Some(mv.src.to_string()),
+        s => s.clone(),
+    };
+    match e {
+        Expr::Ref(r) if mv.holds(r, home) => Expr::Ref(inside(r)),
+        Expr::SpillRef(r) if mv.holds(r, home) => Expr::SpillRef(inside(r)),
+        Expr::Ref(r) => Expr::Ref(CellRef {
+            sheet: outside(&r.sheet),
+            ..r.clone()
+        }),
+        Expr::SpillRef(r) => Expr::SpillRef(CellRef {
+            sheet: outside(&r.sheet),
+            ..r.clone()
+        }),
+        Expr::Range(p, q) => {
+            let q_home = p.sheet.as_deref().or(home);
+            if mv.holds(p, home) && mv.holds(q, q_home) {
+                Expr::Range(inside(p), mv.shifted(q, q.sheet.clone()))
+            } else {
+                Expr::Range(
+                    CellRef {
+                        sheet: outside(&p.sheet),
+                        ..p.clone()
+                    },
+                    q.clone(),
+                )
+            }
+        }
+        Expr::ColRange {
+            sheet,
+            c1,
+            c2,
+            abs1,
+            abs2,
+        } => Expr::ColRange {
+            sheet: outside(sheet),
+            c1: *c1,
+            c2: *c2,
+            abs1: *abs1,
+            abs2: *abs2,
+        },
+        Expr::RowRange {
+            sheet,
+            r1,
+            r2,
+            abs1,
+            abs2,
+        } => Expr::RowRange {
+            sheet: outside(sheet),
+            r1: *r1,
+            r2: *r2,
+            abs1: *abs1,
+            abs2: *abs2,
+        },
+        Expr::ArrayLit(rows) => Expr::ArrayLit(
+            rows.iter()
+                .map(|row| row.iter().map(recur).collect())
+                .collect(),
+        ),
+        Expr::Func(n, args) => Expr::Func(n.clone(), args.iter().map(recur).collect()),
+        Expr::Call(callee, args) => {
+            Expr::Call(Box::new(recur(callee)), args.iter().map(recur).collect())
+        }
+        Expr::Un(op, x) => Expr::Un(*op, Box::new(recur(x))),
+        Expr::Bin(op, l, r) => Expr::Bin(*op, Box::new(recur(l)), Box::new(recur(r))),
+        other => other.clone(),
+    }
+}
+
+/// [`move_block_expr`] on formula text: `None` when it doesn't parse or the
+/// move changes nothing, so the text then stays byte-for-byte.
+pub fn move_block_formula(src: &str, mv: &CellMove) -> Option<String> {
+    let ast = parse(src).ok()?;
+    let out = move_block_expr(&ast, mv);
+    (out != ast).then(|| to_string(&out))
+}
+
+// ---------------------------------------------------------------------------
 // Structural edits (insert / delete rows & columns)
 // ---------------------------------------------------------------------------
 
