@@ -198,6 +198,7 @@ fn number_formats_apply_and_a_number_too_wide_shows_hashes() {
         max: 0,
         width: Some(5.0),
         attrs: String::new(),
+        default_width: false,
     });
     wb.sheets.push(s);
     let t = &page_texts(&pdf_of(&wb, vec![0]).unwrap())[0];

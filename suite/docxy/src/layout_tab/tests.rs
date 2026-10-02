@@ -411,7 +411,10 @@ fn the_tab_sits_between_insert_and_review_for_documents_only() {
             "Home", "Insert", "Design", "Layout", "Mailings", "Review", "View"
         ]
     );
-    assert_eq!(names(Kind::Xlsx), ["Home", "Insert", "Review", "View"]);
+    assert_eq!(
+        names(Kind::Xlsx),
+        ["Home", "Insert", "Data", "Review", "View"]
+    );
     for kind in [Kind::Docx, Kind::Xlsx] {
         let set: Vec<&str> = ribbon_tab_set(kind)[1..].iter().map(|t| t.1).collect();
         assert_eq!(set, names(kind), "tab set and ribbon agree");

@@ -59,8 +59,15 @@ pub enum Act {
     TableName,
     ResizeTable,
     ConvertToRange,
+    /// Data ▸ Outline.
     Subtotal,
-    Outline,
+    GroupOutline,
+    UngroupOutline,
+    ShowDetail,
+    HideDetail,
+    AutoOutline,
+    ClearOutline,
+    OutlineSettings,
     /// Review ▸ Comments.
     NewComment,
     NewNote,
@@ -96,11 +103,12 @@ pub struct Ribbon(CoreRibbon<Act>);
 
 impl Ribbon {
     pub fn new() -> Ribbon {
-        let tabs = vec!["File", "Home", "Insert", "Review", "View"];
+        let tabs = vec!["File", "Home", "Insert", "Data", "Review", "View"];
         let tab_groups = vec![
             Vec::new(), // File → backstage
             home_groups(),
             insert_groups(),
+            data_groups(),
             review_groups(),
             view_groups(),
         ];
@@ -312,8 +320,15 @@ fn insert_groups() -> Vec<Group> {
                 )],
             ],
         },
+    ]
+}
+
+/// Excel's Data tab: the data tools that were on Insert, and the outline.
+fn data_groups() -> Vec<Group> {
+    use Act::*;
+    vec![
         Group {
-            title: "Data",
+            title: "Data Tools",
             width: 20,
             rows: [
                 vec![
@@ -342,17 +357,57 @@ fn insert_groups() -> Vec<Group> {
         },
         Group {
             title: "Outline",
-            width: 18,
+            width: 26,
+            rows: [
+                vec![
+                    btn(
+                        "⊞ Group",
+                        GroupOutline,
+                        "Group rows or columns (Alt+Shift+Right)",
+                    ),
+                    Seg::Gap(" "),
+                    btn(
+                        "⊟ Ungroup",
+                        UngroupOutline,
+                        "Ungroup rows or columns (Alt+Shift+Left)",
+                    ),
+                ],
+                vec![
+                    btn("+ Show", ShowDetail, "Show Detail: expand the group here"),
+                    Seg::Gap(" "),
+                    btn("- Hide", HideDetail, "Hide Detail: collapse the group here"),
+                ],
+            ],
+        },
+        Group {
+            title: "Subtotal",
+            width: 12,
             rows: [
                 vec![btn(
-                    "Σ Subtotal",
+                    "Σ Subtotal…",
                     Subtotal,
-                    "Insert subtotals at each change in the current column",
+                    "Insert subtotals (or Remove All) at each change in a column",
                 )],
+                vec![],
+            ],
+        },
+        Group {
+            title: "Auto",
+            width: 26,
+            rows: [
+                vec![
+                    btn(
+                        "Auto Outline",
+                        AutoOutline,
+                        "Build the outline from summary formulas",
+                    ),
+                    Seg::Gap(" "),
+                    btn("Clear", ClearOutline, "Clear Outline: remove every group"),
+                ],
                 vec![btn(
-                    "⊟ Group ▾",
-                    Outline,
-                    "Collapse/expand the grouped detail rows",
+                    "Settings…",
+                    OutlineSettings,
+                    "Summary rows below detail, summary columns to the right",
                 )],
             ],
         },
@@ -484,6 +539,7 @@ mod tests {
         for groups in [
             home_groups(),
             insert_groups(),
+            data_groups(),
             review_groups(),
             view_groups(),
         ] {
