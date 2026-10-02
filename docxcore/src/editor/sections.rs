@@ -240,6 +240,23 @@ impl Editor {
         self.doc.initialize_revision_targets();
     }
 
+    /// Replace the whole body with `blocks` as one section whose sectPr is
+    /// the final section's rewritten by `edit`, as one undo step (Start Mail
+    /// Merge ▸ Labels, after Word's "delete the contents" confirmation). The
+    /// caret goes to the first paragraph.
+    pub fn replace_body(&mut self, blocks: Vec<Block>, edit: impl FnOnce(&str) -> String) {
+        self.checkpoint(EditKind::Structural);
+        let last = *self.section_slots().last().expect("a final section");
+        let sect = edit(self.sect_raw(last));
+        let keep = self.doc.content_block_count();
+        self.doc.body.splice(0..keep, blocks);
+        self.set_sect_raw(SectAt::Trailing, sect);
+        self.anchor = None;
+        let first = super::first_paragraph_path(&self.doc.body).unwrap_or_else(|| vec![0]);
+        self.caret = Caret::at(first, 0);
+        self.doc.initialize_revision_targets();
+    }
+
     /// Where a section break goes: the selection's start, else the caret; its
     /// body block; and the section it lands in, the one whose setup the
     /// section after the break takes. Refused outside a body paragraph.

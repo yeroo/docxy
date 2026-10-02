@@ -10,6 +10,7 @@ pub mod csv;
 pub mod envelope;
 pub mod fields;
 pub mod finish;
+pub mod labels;
 pub mod preview;
 
 pub use csv::Recipients;
