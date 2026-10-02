@@ -1,0 +1,421 @@
+//! File > Info > Inspect Document (#627): what the active document holds of
+//! Word's inspector categories, and their Remove All. The page and the
+//! harness's `inspect` verb both come here, so a test of these functions
+//! tests the button.
+
+use crate::{DocTab, Surface};
+
+/// One of the inspector's categories, in the order the page lists them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InspectCategory {
+    Comments,
+    Revisions,
+    Hidden,
+    Properties,
+}
+
+impl InspectCategory {
+    pub(crate) const ALL: [InspectCategory; 4] = [
+        InspectCategory::Comments,
+        InspectCategory::Revisions,
+        InspectCategory::Hidden,
+        InspectCategory::Properties,
+    ];
+
+    /// The harness's name for it (`"remove": "<key>"`).
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            InspectCategory::Comments => "comments",
+            InspectCategory::Revisions => "revisions",
+            InspectCategory::Hidden => "hidden",
+            InspectCategory::Properties => "properties",
+        }
+    }
+
+    pub(crate) fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.key() == key)
+    }
+
+    /// The page's heading for it, as Word names it.
+    pub(crate) fn title(self) -> &'static str {
+        match self {
+            InspectCategory::Comments => "Comments",
+            InspectCategory::Revisions => "Revisions",
+            InspectCategory::Hidden => "Hidden Text",
+            InspectCategory::Properties => "Document Properties and Personal Information",
+        }
+    }
+
+    /// The control id of its Remove All button.
+    pub(crate) fn button_id(self) -> &'static str {
+        match self {
+            InspectCategory::Comments => "inspect-remove-comments",
+            InspectCategory::Revisions => "inspect-remove-revisions",
+            InspectCategory::Hidden => "inspect-remove-hidden",
+            InspectCategory::Properties => "inspect-remove-properties",
+        }
+    }
+}
+
+/// What a document tab holds, per category.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Inspection {
+    /// Comments in the tab's comment list.
+    pub(crate) comments: usize,
+    /// Whether any comment marker is in the body (one can outlive its comment).
+    pub(crate) comment_markers: bool,
+    /// Tracked changes, property changes and unsupported records included.
+    pub(crate) revisions: usize,
+    /// Hidden runs, tabs and breaks.
+    pub(crate) hidden: usize,
+    pub(crate) properties: bool,
+}
+
+impl Inspection {
+    pub(crate) fn found(&self, category: InspectCategory) -> bool {
+        match category {
+            InspectCategory::Comments => self.comments > 0 || self.comment_markers,
+            InspectCategory::Revisions => self.revisions > 0,
+            InspectCategory::Hidden => self.hidden > 0,
+            InspectCategory::Properties => self.properties,
+        }
+    }
+
+    /// The count the page and the harness report; properties have none.
+    pub(crate) fn count(&self, category: InspectCategory) -> Option<usize> {
+        match category {
+            InspectCategory::Comments => Some(self.comments),
+            InspectCategory::Revisions => Some(self.revisions),
+            InspectCategory::Hidden => Some(self.hidden),
+            InspectCategory::Properties => None,
+        }
+    }
+
+    /// The page's result line for `category`.
+    pub(crate) fn line(&self, category: InspectCategory) -> String {
+        let n = self.count(category).unwrap_or(0);
+        let s = if n == 1 { "" } else { "s" };
+        match (category, self.found(category)) {
+            (InspectCategory::Comments, true) => format!("{n} comment{s} found."),
+            (InspectCategory::Comments, false) => "No comments were found.".into(),
+            (InspectCategory::Revisions, true) => format!("{n} revision{s} found."),
+            (InspectCategory::Revisions, false) => "No revisions were found.".into(),
+            (InspectCategory::Hidden, true) => format!("{n} hidden run{s} found."),
+            (InspectCategory::Hidden, false) => "No hidden text was found.".into(),
+            (InspectCategory::Properties, true) => {
+                "Document properties and personal information were found.".into()
+            }
+            (InspectCategory::Properties, false) => {
+                "No document properties or personal information were found.".into()
+            }
+        }
+    }
+}
+
+/// Inspect a document tab; `None` for any other kind of tab.
+pub(crate) fn inspect_doc_tab(tab: &DocTab) -> Option<Inspection> {
+    let Surface::Doc(editor) = &tab.surface else {
+        return None;
+    };
+    let doc = &editor.doc;
+    Some(Inspection {
+        comments: tab.comments.len(),
+        comment_markers: docxcore::inspect::has_comment_markers(doc),
+        revisions: doc.revisions().len(),
+        hidden: docxcore::inspect::count_hidden_runs(doc),
+        properties: tab
+            .pkg
+            .as_ref()
+            .is_some_and(docxcore::inspect::has_personal_properties),
+    })
+}
+
+/// Remove All for `category`: the status line it leaves on the tab, or why
+/// it can't run. Removing something marks the tab dirty; a category that
+/// was not found changes nothing. Revisions are accepted, never deleted
+/// with their text.
+pub(crate) fn inspect_remove(
+    tab: &mut DocTab,
+    category: InspectCategory,
+) -> Result<String, String> {
+    let found = inspect_doc_tab(tab)
+        .ok_or("the active tab is not a document")?
+        .found(category);
+    if !found {
+        return Ok(format!("{}: nothing to remove", category.title()));
+    }
+    let Surface::Doc(editor) = &mut tab.surface else {
+        unreachable!("inspected above");
+    };
+    let (status, changed) = match category {
+        InspectCategory::Comments => {
+            let markers = editor.remove_all_comment_markers();
+            let comments = std::mem::take(&mut tab.comments).len();
+            // The save reconciles comments.xml against `comments` by exact
+            // id prefix; emptying the part directly misses none.
+            let part = tab
+                .pkg
+                .as_mut()
+                .is_some_and(docxcore::inspect::empty_comments_part);
+            (
+                format!("Removed all comments ({comments})"),
+                markers > 0 || comments > 0 || part,
+            )
+        }
+        InspectCategory::Revisions => {
+            let outcomes = editor.accept_all_revisions();
+            let accepted = outcomes.iter().filter(|o| o.is_applied()).count();
+            let failed = outcomes.len() - accepted;
+            let status = if failed == 0 {
+                format!("Accepted all revisions ({accepted})")
+            } else {
+                format!(
+                    "Accepted {accepted} revision{}; {failed} revision{} could not be accepted",
+                    if accepted == 1 { "" } else { "s" },
+                    if failed == 1 { "" } else { "s" },
+                )
+            };
+            (status, accepted > 0)
+        }
+        InspectCategory::Hidden => {
+            let removed = editor.remove_hidden_text();
+            (format!("Removed all hidden text ({removed})"), removed > 0)
+        }
+        InspectCategory::Properties => {
+            let changed = tab
+                .pkg
+                .as_mut()
+                .is_some_and(docxcore::inspect::remove_personal_properties);
+            (
+                "Removed document properties and personal information".to_string(),
+                changed,
+            )
+        }
+    };
+    if changed {
+        tab.dirty = true;
+    }
+    tab.status = status.clone().into();
+    Ok(status)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Kind, save_doc_tab, tab_from_path};
+    use std::path::{Path, PathBuf};
+
+    /// A fresh directory under the target dir. Not `std::env::temp_dir()`:
+    /// see `session_and_hot_both_follow_the_override`.
+    fn temp(tag: &str) -> PathBuf {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/inspect-tests")
+            .join(format!("{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    const W: &str = "xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"";
+
+    /// A .docx holding one of everything the inspector finds: two comments
+    /// (one with its author before its id), an insertion and a deletion (a
+    /// comment marker and a hidden run inside the insertion), hidden text,
+    /// and core/app properties.
+    fn inspected_docx() -> Vec<u8> {
+        let document = format!(
+            "<w:document {W}><w:body>\
+             <w:p><w:commentRangeStart w:id=\"0\"/><w:r><w:t>Visible</w:t></w:r>\
+             <w:commentRangeEnd w:id=\"0\"/><w:r><w:commentReference w:id=\"0\"/></w:r>\
+             <w:r><w:rPr><w:vanish/></w:rPr><w:t>Secret</w:t></w:r></w:p>\
+             <w:p><w:ins w:id=\"5\" w:author=\"A\" w:date=\"2026-01-01T00:00:00Z\">\
+             <w:r><w:t>Added</w:t></w:r><w:commentRangeStart w:id=\"1\"/>\
+             <w:r><w:rPr><w:vanish/></w:rPr><w:t>Buried</w:t></w:r><w:commentRangeEnd w:id=\"1\"/>\
+             <w:r><w:commentReference w:id=\"1\"/></w:r></w:ins>\
+             <w:del w:id=\"6\" w:author=\"A\" w:date=\"2026-01-01T00:00:00Z\">\
+             <w:r><w:delText>Dropped</w:delText></w:r></w:del></w:p>\
+             </w:body></w:document>"
+        );
+        let comments = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+             <w:comments {W}>\
+             <w:comment w:id=\"0\" w:author=\"Ann\" w:initials=\"A\"><w:p><w:r><w:t>one</w:t></w:r></w:p></w:comment>\
+             <w:comment w:author=\"Bob\" w:id=\"1\" w:initials=\"B\"><w:p><w:r><w:t>two</w:t></w:r></w:p></w:comment>\
+             </w:comments>"
+        );
+        let core = "<?xml version=\"1.0\"?><cp:coreProperties xmlns:cp=\"c\" xmlns:dc=\"d\" xmlns:dcterms=\"t\">\
+            <dc:creator>Ann</dc:creator><cp:lastModifiedBy>Bob</cp:lastModifiedBy>\
+            <dcterms:created>2026-01-01T00:00:00Z</dcterms:created></cp:coreProperties>";
+        let app = "<Properties xmlns=\"p\"><Company>Acme</Company></Properties>";
+        let rels = "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+            <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/></Relationships>";
+        let parts: Vec<(String, Vec<u8>)> = [
+            ("[Content_Types].xml", "<?xml version=\"1.0\"?><Types/>"),
+            ("_rels/.rels", rels),
+            ("word/document.xml", &document),
+            ("word/styles.xml", "<?xml version=\"1.0\"?><w:styles/>"),
+            ("word/comments.xml", &comments),
+            ("docProps/core.xml", core),
+            ("docProps/app.xml", app),
+        ]
+        .into_iter()
+        .map(|(n, x)| (n.to_string(), x.as_bytes().to_vec()))
+        .collect();
+        docxcore::zipwrite::write_zip(&parts)
+    }
+
+    fn open(tag: &str) -> (PathBuf, DocTab) {
+        let dir = temp(tag);
+        let path = dir.join("inspected.docx");
+        std::fs::write(&path, inspected_docx()).unwrap();
+        let tab = tab_from_path(&path);
+        assert!(matches!(tab.kind, Kind::Docx));
+        assert!(!tab.load_failed, "{}", tab.status);
+        (path, tab)
+    }
+
+    fn body_text(tab: &DocTab) -> String {
+        let Surface::Doc(ed) = &tab.surface else {
+            panic!("not a document")
+        };
+        ed.doc.body.iter().map(|b| b.plain_text()).collect()
+    }
+
+    fn part(path: &Path, name: &str) -> String {
+        let pkg = docxcore::package::load_package(&std::fs::read(path).unwrap()).unwrap();
+        pkg.part_text(name).unwrap_or_default()
+    }
+
+    #[test]
+    fn inspect_doc_tab_reports_all_four_categories() {
+        let (_, tab) = open("report");
+        let found = inspect_doc_tab(&tab).unwrap();
+        assert_eq!(found.comments, 2);
+        assert!(found.comment_markers);
+        assert_eq!(found.revisions, 2);
+        assert_eq!(found.hidden, 2);
+        assert!(found.properties);
+        for category in InspectCategory::ALL {
+            assert!(found.found(category), "{category:?}");
+        }
+        assert_eq!(found.line(InspectCategory::Comments), "2 comments found.");
+    }
+
+    #[test]
+    fn inspect_is_none_for_other_tabs() {
+        let mut tab = crate::sheet_tab_from_path(&PathBuf::from("missing.xlsx"), false);
+        assert!(inspect_doc_tab(&tab).is_none());
+        assert!(inspect_remove(&mut tab, InspectCategory::Comments).is_err());
+    }
+
+    #[test]
+    fn inspect_remove_revisions_accepts_not_deletes() {
+        let (_, mut tab) = open("revisions");
+        let status = inspect_remove(&mut tab, InspectCategory::Revisions).unwrap();
+        assert_eq!(status, "Accepted all revisions (2)");
+        assert!(tab.dirty);
+        let text = body_text(&tab);
+        assert!(text.contains("Added"), "inserted text kept: {text}");
+        assert!(!text.contains("Dropped"), "deleted text gone: {text}");
+        assert!(
+            !inspect_doc_tab(&tab)
+                .unwrap()
+                .found(InspectCategory::Revisions)
+        );
+    }
+
+    #[test]
+    fn inspect_remove_noop_leaves_tab_clean() {
+        let (_, mut tab) = open("noop");
+        inspect_remove(&mut tab, InspectCategory::Hidden).unwrap();
+        tab.dirty = false;
+        let status = inspect_remove(&mut tab, InspectCategory::Hidden).unwrap();
+        assert_eq!(status, "Hidden Text: nothing to remove");
+        assert!(!tab.dirty);
+        let Surface::Doc(ed) = &mut tab.surface else {
+            unreachable!()
+        };
+        // The first removal's undo step is the only one.
+        assert!(ed.undo());
+        assert!(!ed.undo());
+    }
+
+    #[test]
+    fn inspect_remove_all_then_save_round_trips() {
+        let (path, mut tab) = open("round-trip");
+        for category in InspectCategory::ALL {
+            inspect_remove(&mut tab, category).unwrap();
+            let after = inspect_doc_tab(&tab).unwrap();
+            assert!(!after.found(category), "{category:?}: {after:?}");
+        }
+        assert!(tab.dirty);
+        assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+
+        let comments = part(&path, "word/comments.xml");
+        assert!(!comments.contains("<w:comment "), "{comments}");
+        let document = part(&path, "word/document.xml");
+        for gone in [
+            "commentRangeStart",
+            "commentRangeEnd",
+            "commentReference",
+            "<w:ins ",
+            "<w:del ",
+            "<w:vanish",
+            "Secret",
+            "Buried",
+            "Dropped",
+        ] {
+            assert!(!document.contains(gone), "{gone}: {document}");
+        }
+        for kept in ["Visible", "Added"] {
+            assert!(document.contains(kept), "{kept}: {document}");
+        }
+        let core = part(&path, "docProps/core.xml");
+        assert!(!core.contains("dc:creator"), "{core}");
+        assert!(!core.contains("cp:lastModifiedBy"), "{core}");
+        assert!(core.contains("dcterms:created"), "{core}");
+        assert!(!part(&path, "docProps/app.xml").contains("Company"));
+
+        // Reopened, the document has nothing left to inspect.
+        let reopened = tab_from_path(&path);
+        let found = inspect_doc_tab(&reopened).unwrap();
+        for category in InspectCategory::ALL {
+            assert!(!found.found(category), "{category:?}: {found:?}");
+        }
+    }
+
+    #[test]
+    fn backstage_rail_info_only_for_documents() {
+        let ids = |project, doc| {
+            crate::backstage_rail_items(project, doc)
+                .map(|item| item.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(false, true),
+            [
+                "bs-back",
+                "bs-info",
+                "bs-new",
+                "bs-open",
+                "bs-save",
+                "bs-saveas",
+                "bs-close"
+            ]
+        );
+        // A workbook, a placeholder: no Info.
+        assert!(!ids(false, false).contains(&"bs-info"));
+        // A project: Export, no Info.
+        let project = ids(true, false);
+        assert!(!project.contains(&"bs-info"));
+        assert!(project.contains(&"bs-export"));
+    }
+
+    #[test]
+    fn inspect_category_keys_round_trip() {
+        for category in InspectCategory::ALL {
+            assert_eq!(InspectCategory::from_key(category.key()), Some(category));
+        }
+        assert_eq!(InspectCategory::from_key("macros"), None);
+    }
+}

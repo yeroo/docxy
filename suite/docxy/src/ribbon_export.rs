@@ -264,13 +264,16 @@ pub(crate) fn docx_snapshot() -> Result<String, String> {
             })
         })
         .collect();
-    let backstage: Vec<Value> = crate::backstage_rail_items(false)
+    // Not a document rail: the editable-HTML page has no Info page (#627),
+    // so its snapshot keeps the rail it can act on.
+    let backstage: Vec<Value> = crate::backstage_rail_items(false, false)
         .map(|item| {
             json!({
                 "id": item.id,
                 "label": item.display,
                 "action": match item.action {
                     crate::BackstageRailAction::Back => "back",
+                    crate::BackstageRailAction::Info => "info",
                     crate::BackstageRailAction::New => "new",
                     crate::BackstageRailAction::Open => "open",
                     crate::BackstageRailAction::Save => "save",

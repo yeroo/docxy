@@ -2139,6 +2139,23 @@ fn cover_refusal(backstage: bool, tab_more_open: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// The `inspect` verb's reading: `{comments:{found,count}, revisions:…,
+/// hidden:…, properties:{found}}`.
+fn inspection_json(found: &crate::inspector::Inspection) -> Json {
+    Json::obj(
+        crate::inspector::InspectCategory::ALL
+            .into_iter()
+            .map(|category| {
+                let mut fields = vec![("found", Json::Bool(found.found(category)))];
+                if let Some(n) = found.count(category) {
+                    fields.push(("count", Json::Num(n as f64)));
+                }
+                (category.key(), Json::obj(fields))
+            })
+            .collect(),
+    )
+}
+
 /// Whether `verb` stands for a press outside an open menu, which closes it
 /// (#397). Reads leave it open, `key` and `type` reach the menu's own key
 /// gate, the `menu-*` verbs act on it, and a control-pipe verb closes it
@@ -2147,6 +2164,10 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
     // Reading the backstage is a read; opening or closing it is a press.
     if verb == "backstage" {
         return args.get_str("action") != Some("read");
+    }
+    // Inspecting is a read; a Remove All is a press (#627).
+    if verb == "inspect" {
+        return args.get_str("remove").is_some();
     }
     matches!(
         verb,
@@ -2736,6 +2757,32 @@ pub fn dispatch(
             }
             Done::ok(Json::Obj(out))
         }
+        "inspect" => {
+            // File > Info > Inspect Document (#627): read the categories, or
+            // with `remove` run that category's Remove All as its button does.
+            let status = match args.get_str("remove") {
+                Some(key) => {
+                    app.refuse_under_dialog()?;
+                    let category = crate::inspector::InspectCategory::from_key(key)
+                        .ok_or("'remove' must be comments, revisions, hidden or properties")?;
+                    if !app.active_is_doc() {
+                        return Err("the active tab is not a document".into());
+                    }
+                    let status = app.inspect_remove_active(category)?;
+                    cx.notify();
+                    Some(status)
+                }
+                None => None,
+            };
+            let tab = app.tabs.get(app.active).ok_or("there is no active tab")?;
+            let found =
+                crate::inspector::inspect_doc_tab(tab).ok_or("the active tab is not a document")?;
+            let mut out = inspection_json(&found);
+            if let (Some(status), Json::Obj(fields)) = (status, &mut out) {
+                fields.push(("status".into(), Json::Str(status)));
+            }
+            Done::ok(out)
+        }
         "status-read" => {
             let tab = app.tabs.get(app.active).ok_or("there is no active tab")?;
             Done::ok(status_json(&crate::status_items(tab)))
@@ -2750,7 +2797,7 @@ pub fn dispatch(
                 "read" => {}
                 _ => return Err("'action' must be open, close or read".into()),
             }
-            let items = crate::backstage_rail_items(app.active_is_project());
+            let items = crate::backstage_rail_items(app.active_is_project(), app.active_is_doc());
             Done::ok(Json::obj(vec![
                 ("open", Json::Bool(app.backstage)),
                 (
@@ -4490,6 +4537,35 @@ mod tests {
         assert!(closes_menu("backstage", &action("open")));
         assert!(closes_menu("backstage", &action("close")));
         assert!(!closes_menu("backstage", &action("read")), "a read");
+        // #627: inspecting reads; a Remove All presses.
+        assert!(!closes_menu("inspect", &Json::obj(vec![])), "a read");
+        let remove = Json::obj(vec![("remove", Json::Str("comments".into()))]);
+        assert!(closes_menu("inspect", &remove));
+    }
+
+    /// #627: `inspect` reports every category, a count for all but properties.
+    #[test]
+    fn inspection_json_reports_four_categories() {
+        let found = crate::inspector::Inspection {
+            comments: 2,
+            comment_markers: true,
+            revisions: 0,
+            hidden: 1,
+            properties: true,
+        };
+        let json = inspection_json(&found);
+        let comments = json.get("comments").unwrap();
+        assert_eq!(comments.get("found"), Some(&Json::Bool(true)));
+        assert_eq!(comments.get("count"), Some(&Json::Num(2.0)));
+        let revisions = json.get("revisions").unwrap();
+        assert_eq!(revisions.get("found"), Some(&Json::Bool(false)));
+        assert_eq!(
+            json.get("hidden").unwrap().get("count"),
+            Some(&Json::Num(1.0))
+        );
+        let properties = json.get("properties").unwrap();
+        assert_eq!(properties.get("found"), Some(&Json::Bool(true)));
+        assert_eq!(properties.get("count"), None);
     }
 
     /// #545: a real pointer event reaches the menu's own backdrop or item, so
