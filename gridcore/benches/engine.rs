@@ -128,6 +128,26 @@ fn rect_readers_workbook(rows: u32, cols: u32) -> gridcore::xlsx::SheetPackage {
     pkg
 }
 
+/// The #948 plan-rect-both shape: a data block plus both-tall-and-wide
+/// readers (`SUM(A1:T5000)`-style) whose dep rects cover the whole block.
+fn block_readers_workbook(rows: u32, cols: u32) -> gridcore::xlsx::SheetPackage {
+    let mut pkg = new_xlsx();
+    let sheet = &mut pkg.workbook.sheets[0];
+    for r in 0..rows {
+        for c in 0..cols {
+            sheet.set_cell(r, c, Cell::number((r * cols + c + 1) as f64));
+        }
+    }
+    // 50 block readers in row 0, right of the data block (no overlap with it
+    // or each other): identical `A1:{last}{rows}` dep rects, all covering
+    // every data seed.
+    let last = col_name(cols - 1);
+    for c in cols + 1..=cols + 50 {
+        sheet.set_cell(0, c, Cell::formula(&format!("SUM(A1:{last}{rows})")));
+    }
+    pkg
+}
+
 fn bench_edit_rect_readers(c: &mut Criterion) {
     // Steady-state: one data-cell edit at a time against tall/wide readers,
     // cycling through the data block so successive edits hit different seeds.
@@ -157,9 +177,50 @@ fn bench_edit_rect_readers(c: &mut Criterion) {
     g.finish();
 }
 
+fn bench_edit_block_readers(c: &mut Criterion) {
+    // Steady-state: one data-cell edit at a time against block readers that
+    // all cover the edited cell.
+    let mut g = c.benchmark_group("edit_block_readers");
+    for (rows, cols) in [(1000u32, 10u32), (5000, 20)] {
+        let pkg = block_readers_workbook(rows, cols);
+        let mut wb = pkg.workbook.clone();
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        let total = (rows * cols) as usize;
+        let mut n = 0usize;
+        g.bench_with_input(
+            BenchmarkId::from_parameter(format!("{rows}x{cols}")),
+            &(rows, cols),
+            |b, _| {
+                b.iter(|| {
+                    let i = n % total;
+                    n += 1;
+                    let r = (i / cols as usize) as u32;
+                    let c = (i % cols as usize) as u32;
+                    eng.set_cell(&mut wb, (0, r, c), Cell::number(black_box(n as f64)));
+                    black_box(&wb);
+                });
+            },
+        );
+    }
+    g.finish();
+}
+
 fn bench_recalc_rect_readers(c: &mut Criterion) {
     let pkg = rect_readers_workbook(1000, 10);
     c.bench_function("recalc_rect_readers_1000x10", |b| {
+        b.iter(|| {
+            let mut wb = pkg.workbook.clone();
+            let mut eng = Engine::new(&wb);
+            eng.recalc_all(&mut wb);
+            black_box(&wb);
+        })
+    });
+}
+
+fn bench_recalc_block_readers(c: &mut Criterion) {
+    let pkg = block_readers_workbook(1000, 10);
+    c.bench_function("recalc_block_readers_1000x10", |b| {
         b.iter(|| {
             let mut wb = pkg.workbook.clone();
             let mut eng = Engine::new(&wb);
@@ -211,7 +272,9 @@ criterion_group!(
     bench_recalc_grid,
     bench_incremental_edit,
     bench_edit_rect_readers,
+    bench_edit_block_readers,
     bench_recalc_rect_readers,
+    bench_recalc_block_readers,
     bench_xlsx_roundtrip,
     bench_formula_parse
 );
