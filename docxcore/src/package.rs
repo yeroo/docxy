@@ -1743,7 +1743,7 @@ impl Package {
                 el.push_str("<w:dataType w:val=\"textFile\"/>");
             }
             el.push_str("</w:mailMerge>");
-            xml = insert_settings_child(&xml, "w:mailMerge", &el);
+            xml = insert_mail_merge(&xml, &el);
         }
         self.set_part(&name, xml.into_bytes());
         if let Some(r) = rels {
@@ -2269,8 +2269,8 @@ fn markdown_list_levels(bullet: bool) -> String {
     out
 }
 
-/// The next free relationship id (`rId{max+1}`) for a `.rels` part.
-/// A mail-merge main document's type (`w:mainDocumentType`).
+/// A mail-merge main document's type (`w:mainDocumentType`): what Finish &
+/// Merge makes of it and how its copies are separated.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MainDocType {
     #[default]
@@ -2312,37 +2312,37 @@ pub struct MailMerge {
     pub source: Option<String>,
 }
 
-/// A file path as Word writes a mailMergeSource target (`file:///C:\x.csv`).
+/// A file path as Word writes a mailMergeSource target: a drive path as
+/// `file:///C:\x.csv`, a POSIX one as `file:///home/x.csv`, a UNC one as
+/// `file://server/share/x.csv`. A path that is none of those (relative) is
+/// written as it is.
 fn path_to_file_url(path: &str) -> String {
-    let path = path.replace('%', "%25").replace(' ', "%20");
-    if path.starts_with('/') {
-        format!("file://{path}")
-    } else {
-        format!("file:///{path}")
+    let esc = |p: &str| p.replace('%', "%25").replace(' ', "%20");
+    let b = path.as_bytes();
+    if let Some(unc) = path
+        .strip_prefix("\\\\")
+        .or_else(|| path.strip_prefix("//"))
+        .filter(|rest| !rest.starts_with(['?', '.']))
+    {
+        return format!("file://{}", esc(&unc.replace('\\', "/")));
     }
+    if b.get(1) == Some(&b':') && b[0].is_ascii_alphabetic() {
+        return format!("file:///{}", esc(path));
+    }
+    if path.starts_with('/') {
+        return format!("file://{}", esc(path));
+    }
+    path.to_string()
 }
 
-/// A mailMergeSource target as a path: `file:` URLs lose their scheme and
-/// `%XX` escapes; anything else is returned as written.
-fn file_url_to_path(target: &str) -> String {
-    let Some(rest) = target
-        .strip_prefix("file:///")
-        .or_else(|| target.strip_prefix("file://"))
-    else {
-        return target.to_string();
-    };
-    // `file:///C:\x` is a drive path; `file:///home/x` a POSIX one.
-    let rest = if rest.as_bytes().get(1) == Some(&b':') {
-        rest.to_string()
-    } else {
-        format!("/{rest}")
-    };
-    let bytes = rest.as_bytes();
+/// `%XX` escapes decoded.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(&rest[i + 1..i + 3], 16) {
+            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
                 out.push(b);
                 i += 3;
                 continue;
@@ -2352,6 +2352,31 @@ fn file_url_to_path(target: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A mailMergeSource target as a path, the inverse of [`path_to_file_url`]:
+/// `file:///C:\x` is a drive path, `file:///home/x` a POSIX one,
+/// `file://server/share/x` the UNC path `\\server\share\x` (`localhost`
+/// names this machine). Anything that is not a `file:` URL is returned as
+/// written.
+fn file_url_to_path(target: &str) -> String {
+    if let Some(rest) = target.strip_prefix("file:///") {
+        let b = rest.as_bytes();
+        let path = if b.get(1) == Some(&b':') || rest.starts_with(['\\', '/']) {
+            rest.to_string()
+        } else {
+            format!("/{rest}")
+        };
+        return percent_decode(&path);
+    }
+    if let Some(rest) = target.strip_prefix("file://") {
+        let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+        if host.eq_ignore_ascii_case("localhost") {
+            return file_url_to_path(&format!("file:///{path}"));
+        }
+        return percent_decode(&format!("\\\\{host}\\{}", path.replace('/', "\\")));
+    }
+    target.to_string()
 }
 
 /// `CT_Settings` children that come before `w:mailMerge`.
@@ -2387,10 +2412,10 @@ const SETTINGS_BEFORE_MAIL_MERGE: [&str; 29] = [
     "w:documentType",
 ];
 
-/// Insert `child` into the settings root right after the last element that
-/// precedes `w:mailMerge` in `CT_Settings` (every other child follows it),
-/// or first. Expands a self-closing root.
-fn insert_settings_child(xml: &str, _name: &str, child: &str) -> String {
+/// Insert a `w:mailMerge` element into the settings root right after the
+/// last element that precedes it in `CT_Settings` (every other child follows
+/// it), or first. Expands a self-closing root.
+fn insert_mail_merge(xml: &str, child: &str) -> String {
     let Some(root) = xml.find("<w:settings") else {
         return xml.to_string();
     };
@@ -2411,6 +2436,7 @@ fn insert_settings_child(xml: &str, _name: &str, child: &str) -> String {
     format!("{}{child}{}", &xml[..at], &xml[at..])
 }
 
+/// The next free relationship id (`rId{max+1}`) for a `.rels` part.
 fn next_rid(rels: &str) -> String {
     format!("rId{}", next_rid_num(rels))
 }
@@ -3266,6 +3292,31 @@ mod tests {
         let mut bare = load_package(&make_docx(BODY)).unwrap();
         bare.set_mail_merge(None);
         assert!(bare.part("word/settings.xml").is_none());
+    }
+
+    /// Every kind of path a mailMergeSource target holds comes back as it
+    /// was written (r1 m3).
+    #[test]
+    fn mail_merge_source_urls_round_trip_628() {
+        for (path, url) in [
+            ("C:\\Data\\My List.csv", "file:///C:\\Data\\My%20List.csv"),
+            ("/home/me/b.csv", "file:///home/me/b.csv"),
+            (
+                "\\\\server\\share\\l s.csv",
+                "file://server/share/l%20s.csv",
+            ),
+            ("list.csv", "list.csv"),
+            ("C:\\100%.csv", "file:///C:\\100%25.csv"),
+        ] {
+            assert_eq!(path_to_file_url(path), url, "{path}");
+            assert_eq!(file_url_to_path(url), path, "{url}");
+        }
+        assert_eq!(file_url_to_path("file://localhost/C:/x.csv"), "C:/x.csv");
+        // What the first version wrote for a UNC path is left alone.
+        assert_eq!(
+            file_url_to_path("file:///\\\\server\\s\\x.csv"),
+            "\\\\server\\s\\x.csv"
+        );
     }
 
     /// A data source named only by `w:query` (no relationship) is still read.
