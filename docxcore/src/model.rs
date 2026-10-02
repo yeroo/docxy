@@ -509,9 +509,11 @@ pub struct ParProps {
     pub property_change: Option<PropertyChange>,
     /// A `w:sectPrChange` nested in this paragraph's section-break properties.
     pub section_property_change: Option<PropertyChange>,
-    /// A tracked insertion/deletion of this paragraph's mark, parsed from the
-    /// paragraph-mark `w:rPr` (which itself stays verbatim in `raw_props`).
-    pub mark_revision: Option<ParagraphMarkRevision>,
+    /// Tracked insertion/deletion records of this paragraph's mark, in source
+    /// order, parsed from the paragraph-mark `w:rPr` (which itself stays
+    /// verbatim in `raw_props`). A mark inserted by one reviewer and deleted by
+    /// another carries both an `ins` and a `del`.
+    pub mark_revisions: Vec<ParagraphMarkRevision>,
 }
 
 /// A tracked change on a paragraph mark (`w:pPr/w:rPr/w:ins` or `w:del`).
@@ -1241,7 +1243,7 @@ fn assign_block_revision_targets(
                 assign_inline_revision_targets(inline, next, seen);
             }
             // The mark ends the paragraph, so it follows the content in order.
-            if let Some(mark) = &mut paragraph.props.mark_revision {
+            for mark in &mut paragraph.props.mark_revisions {
                 assign_metadata_target(&mut mark.metadata, next, seen);
             }
         }
@@ -1381,7 +1383,7 @@ fn collect_block_revisions(
             for inline in &paragraph.content {
                 collect_inline_revisions(inline, parent, depth, out);
             }
-            if let Some(mark) = &paragraph.props.mark_revision {
+            for mark in &paragraph.props.mark_revisions {
                 push_revision_address(
                     &mark.metadata,
                     RevisionCategory::ParagraphMark(mark.kind),

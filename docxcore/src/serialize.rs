@@ -112,7 +112,7 @@ fn esc_text(s: &str, out: &mut String) {
     }
 }
 
-fn esc_attr(s: &str, out: &mut String) {
+pub(crate) fn esc_attr(s: &str, out: &mut String) {
     for ch in s.chars() {
         match ch {
             '&' => out.push_str("&amp;"),

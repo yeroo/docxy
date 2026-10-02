@@ -3,7 +3,7 @@
 
 use docxcore::compare::{CompareOptions, CompareResult, CompareSkip, compare_packages};
 use docxcore::load::{Relationships, parse_document_xml};
-use docxcore::model::{Block, Document, RevisionCategory, RevisionKind};
+use docxcore::model::{Block, Document, RevisionCategory, RevisionKind, UnsupportedRevisionKind};
 use docxcore::package::{Package, load_package, new_markdown_package, new_package, save_package};
 use docxcore::review::RevisionOutcome;
 use docxcore::serialize::document_to_xml;
@@ -254,7 +254,7 @@ fn unsupported_input_revisions_are_reported_and_not_carried() {
     let result = compare(&original, &pkg(&p("other text")));
     assert!(
         result.skipped.contains(&CompareSkip::UnsupportedRevision {
-            revision: "move-from".to_string()
+            revision: UnsupportedRevisionKind::MoveFrom
         }),
         "{:?}",
         result.skipped
@@ -494,4 +494,48 @@ fn a_deleted_note_reference_is_reported() {
         result.skipped
     );
     assert!(!document_to_xml(&result.package.document).contains("footnoteReference"));
+}
+
+#[test]
+fn a_change_before_a_table_never_borrows_a_section_ending_mark() {
+    let sect = "<w:p><w:pPr><w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/></w:sectPr></w:pPr>\
+        <w:r><w:t>P</w:t></w:r></w:p>";
+    let table = "<w:tbl><w:tr><w:tc><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>";
+    let non_empty =
+        |d: &Document| -> Vec<String> { texts(d).into_iter().filter(|t| !t.is_empty()).collect() };
+    let p_section = |d: &Document| -> bool {
+        d.body.iter().any(|b| match b {
+            Block::Paragraph(p) => p.plain_text() == "P" && p.props.section_break.is_some(),
+            _ => false,
+        })
+    };
+    // A deleted paragraph, then an inserted one, between P (which ends a
+    // section) and a table.
+    for (original, revised) in [
+        (
+            format!("{sect}{}{table}{}", p("Gone"), p("Q")),
+            format!("{sect}{table}{}", p("Q")),
+        ),
+        (
+            format!("{sect}{table}{}", p("Q")),
+            format!("{sect}{}{table}{}", p("Added"), p("Q")),
+        ),
+    ] {
+        let result = compare(&pkg(&original), &pkg(&revised));
+        assert!(
+            result
+                .skipped
+                .contains(&CompareSkip::ParagraphMark { index: 1 }),
+            "{:?}",
+            result.skipped
+        );
+        for document in [result.package.document.clone(), reloaded(&result)] {
+            let accepted = resolved(&document, true);
+            let rejected = resolved(&document, false);
+            assert!(p_section(&accepted), "{}", document_to_xml(&accepted));
+            assert!(p_section(&rejected), "{}", document_to_xml(&rejected));
+            assert_eq!(non_empty(&accepted), non_empty(&doc(&revised)));
+            assert_eq!(non_empty(&rejected), non_empty(&doc(&original)));
+        }
+    }
 }

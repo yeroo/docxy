@@ -1860,7 +1860,7 @@ fn collect_block_revision_positions(
                     positions,
                 );
                 // A paragraph mark sits at the paragraph's end.
-                if let Some(mark) = &paragraph.props.mark_revision {
+                for mark in &paragraph.props.mark_revisions {
                     let (start, end) = forced_span(&forced).unwrap_or_else(|| {
                         let end = paragraph_span(prefix, paragraph).1;
                         (end.clone(), end)

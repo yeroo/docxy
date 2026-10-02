@@ -47,7 +47,7 @@ use crate::model::{
 };
 use crate::package::Package;
 use crate::review::RevisionOutcome;
-use crate::serialize::document_to_xml;
+use crate::serialize::{document_to_xml, esc_attr};
 use crate::xml::{Event, XmlParser};
 
 /// Who and when the comparison's revisions are attributed to.
@@ -71,7 +71,7 @@ pub enum CompareSkip {
     NoteRef,
     /// A tracked change in an input that could not be accepted first
     /// (moves, custom-XML ranges, table-cell revisions).
-    UnsupportedRevision { revision: String },
+    UnsupportedRevision { revision: UnsupportedRevisionKind },
     /// A whole-paragraph change whose paragraph mark could not be marked; it
     /// was compared in place, so accepting or rejecting leaves an extra empty
     /// paragraph. `index` is the top-level block index in the result.
@@ -154,27 +154,10 @@ fn accepted(document: &Document, skipped: &mut Vec<CompareSkip>) -> Document {
     let mut document = document.clone();
     for outcome in document.accept_all_revisions() {
         if let RevisionOutcome::Unsupported { kind, .. } = outcome {
-            skipped.push(CompareSkip::UnsupportedRevision {
-                revision: unsupported_name(&kind),
-            });
+            skipped.push(CompareSkip::UnsupportedRevision { revision: kind });
         }
     }
     document
-}
-
-/// A kebab-case name for an unsupported revision kind (`move-from`, …).
-fn unsupported_name(kind: &UnsupportedRevisionKind) -> String {
-    if let UnsupportedRevisionKind::Other(name) = kind {
-        return name.clone();
-    }
-    let mut out = String::new();
-    for c in format!("{kind:?}").chars() {
-        if c.is_ascii_uppercase() && !out.is_empty() {
-            out.push('-');
-        }
-        out.push(c.to_ascii_lowercase());
-    }
-    out
 }
 
 /// Every `attr` value on `element` start tags in a package part.
@@ -252,6 +235,16 @@ impl Item<'_> {
             Item::Modified(..) | Item::Inserted(_) | Item::Deleted(_) => true,
             Item::Tables(..) | Item::RevisedOnly(_) => false,
         }
+    }
+
+    /// Whether this paragraph's mark carries a section break.
+    fn ends_section(&self) -> bool {
+        let props = match self {
+            Item::Same(Block::Paragraph(p)) => &p.props,
+            Item::Modified(_, p) => &p.props,
+            _ => return false,
+        };
+        props.section_break.is_some() || props.section_property_change.is_some()
     }
 
     fn change_kind(&self) -> Option<RevisionKind> {
@@ -400,9 +393,11 @@ impl<'o> Compare<'o> {
                 continue;
             }
             // A single-kind run of changes ends the segment (mixed tails were
-            // paired by `fix_mixed_tails`): mark the mark before it.
+            // paired by `fix_mixed_tails`): mark the mark before it, unless
+            // that mark ends a section — removing it would merge the section
+            // break away.
             let kind = items[end - 1].change_kind();
-            if tail > start {
+            if tail > start && !items[tail - 1].ends_section() {
                 marks[tail - 1] = kind;
             } else {
                 self.skipped.push(CompareSkip::ParagraphMark {
@@ -590,9 +585,9 @@ impl<'o> Compare<'o> {
         let id = self.next_id;
         self.next_id += 1;
         let mut attrs = format!(" w:id=\"{id}\" w:author=\"");
-        escape_attr(&self.opts.author, &mut attrs);
+        esc_attr(&self.opts.author, &mut attrs);
         attrs.push_str("\" w:date=\"");
-        escape_attr(&self.opts.date, &mut attrs);
+        esc_attr(&self.opts.date, &mut attrs);
         attrs.push('"');
         (id, attrs)
     }
@@ -650,7 +645,7 @@ impl<'o> Compare<'o> {
         props.section_break = None;
         props.section_property_change = None;
         props.property_change = None;
-        props.mark_revision = None;
+        props.mark_revisions.clear();
         if props
             .style_id
             .as_ref()
@@ -1064,18 +1059,6 @@ fn blank_relationships(raw: &str) -> String {
     }
     out.push_str(rest);
     out
-}
-
-fn escape_attr(value: &str, out: &mut String) {
-    for c in value.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            _ => out.push(c),
-        }
-    }
 }
 
 /// Merge diff steps with the revised paragraph's anchors: each anchor is

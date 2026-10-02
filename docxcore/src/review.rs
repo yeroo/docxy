@@ -156,7 +156,7 @@ impl Document {
     fn apply_all_revision_actions(&mut self, action: RevisionAction) -> Vec<RevisionOutcome> {
         self.initialize_revision_targets();
         let addresses = self.revisions();
-        let targets = revision_postorder(&addresses);
+        let targets = revision_postorder(&addresses, action);
         let mut outcomes = targets
             .into_iter()
             .map(|(ordinal, target)| (ordinal, self.apply_revision_action(target, action)))
@@ -166,15 +166,50 @@ impl Document {
     }
 }
 
-fn revision_postorder(addresses: &[RevisionAddress]) -> Vec<(usize, RevisionTarget)> {
+fn revision_postorder(
+    addresses: &[RevisionAddress],
+    action: RevisionAction,
+) -> Vec<(usize, RevisionTarget)> {
     // `Document::revisions` is pre-order, so reversing it guarantees every
     // descendant is transformed before its ancestor. Original ordinals are
     // retained and used to restore report order after the actions run.
-    addresses
-        .iter()
-        .rev()
+    let mut order: Vec<&RevisionAddress> = addresses.iter().rev().collect();
+    // A mark inserted by one reviewer and deleted by another carries two
+    // records. Removing the mark merges the paragraph away, taking the other
+    // record with it, so within each run of adjacent mark records the ones
+    // that keep the mark go first. Order across paragraphs does not matter:
+    // a merge keeps the absorbed paragraph's records.
+    let removes = |address: &RevisionAddress| match address.category {
+        RevisionCategory::ParagraphMark(kind) => removes_mark(action, kind),
+        _ => false,
+    };
+    let mut start = 0;
+    while start < order.len() {
+        let is_mark =
+            |a: &RevisionAddress| matches!(a.category, RevisionCategory::ParagraphMark(_));
+        let mut end = start + 1;
+        if is_mark(order[start]) {
+            while end < order.len() && is_mark(order[end]) {
+                end += 1;
+            }
+            order[start..end].sort_by_key(|a| removes(a));
+        }
+        start = end;
+    }
+    order
+        .into_iter()
         .map(|address| (address.ordinal, address.target))
         .collect()
+}
+
+/// Whether acting on a paragraph-mark record removes the mark (merging the
+/// paragraph with the next one) rather than keeping it.
+fn removes_mark(action: RevisionAction, kind: RevisionKind) -> bool {
+    matches!(
+        (action, kind),
+        (RevisionAction::Accept, RevisionKind::Delete)
+            | (RevisionAction::Reject, RevisionKind::Insert)
+    )
 }
 
 fn transform_blocks(
@@ -242,17 +277,14 @@ fn transform_paragraph_mark(
     let Block::Paragraph(paragraph) = &mut blocks[index] else {
         return None;
     };
-    let kind = match &paragraph.props.mark_revision {
-        Some(mark) if mark.metadata.target == target => mark.kind,
-        _ => return None,
-    };
-    clear_mark_revision(&mut paragraph.props);
-    let remove = matches!(
-        (action, kind),
-        (RevisionAction::Accept, RevisionKind::Delete)
-            | (RevisionAction::Reject, RevisionKind::Insert)
-    );
-    if remove && matches!(blocks.get(index + 1), Some(Block::Paragraph(_))) {
+    let position = paragraph
+        .props
+        .mark_revisions
+        .iter()
+        .position(|mark| mark.metadata.target == target)?;
+    let kind = paragraph.props.mark_revisions[position].kind;
+    clear_mark_revision(&mut paragraph.props, position);
+    if removes_mark(action, kind) && matches!(blocks.get(index + 1), Some(Block::Paragraph(_))) {
         let Block::Paragraph(next) = blocks.remove(index + 1) else {
             unreachable!()
         };
@@ -265,11 +297,12 @@ fn transform_paragraph_mark(
     Some(Ok(RevisionCategory::ParagraphMark(kind)))
 }
 
-/// Drop a paragraph's mark revision: the model field and the `w:ins`/`w:del`
-/// child of the verbatim paragraph-mark `w:rPr` (which is removed when that
-/// leaves it empty).
-fn clear_mark_revision(props: &mut ParProps) {
-    props.mark_revision = None;
+/// Drop one of a paragraph's mark records (`index` into `mark_revisions`): the
+/// model entry and the matching `w:ins`/`w:del` child of the verbatim
+/// paragraph-mark `w:rPr`, which is removed when that leaves it empty. Both
+/// lists are in source order, so the n-th record is the n-th such child.
+fn clear_mark_revision(props: &mut ParProps, index: usize) {
+    props.mark_revisions.remove(index);
     let Some(position) = props
         .raw_props
         .iter()
@@ -277,7 +310,7 @@ fn clear_mark_revision(props: &mut ParProps) {
     else {
         return;
     };
-    match remove_mark_revision_child(&props.raw_props[position]) {
+    match remove_mark_revision_child(&props.raw_props[position], index) {
         Some(rpr) => props.raw_props[position] = rpr,
         None => {
             props.raw_props.remove(position);
@@ -285,19 +318,24 @@ fn clear_mark_revision(props: &mut ParProps) {
     }
 }
 
-/// `rpr` without its `w:ins`/`w:del` children, or `None` when nothing remains.
-fn remove_mark_revision_child(rpr: &str) -> Option<String> {
+/// `rpr` without its `index`-th `w:ins`/`w:del` child, or `None` when nothing
+/// remains.
+fn remove_mark_revision_child(rpr: &str, index: usize) -> Option<String> {
     let mut parser = XmlParser::new(rpr);
     if parser.next() != Event::Start {
         return Some(rpr.to_string());
     }
     let open_end = parser.pos();
     let mut kept = String::new();
+    let mut seen = 0;
     loop {
         match parser.next() {
             Event::Start => {
                 let start = parser.start_pos();
-                let drop = matches!(parser.name(), "w:ins" | "w:del");
+                let drop = matches!(parser.name(), "w:ins" | "w:del") && {
+                    seen += 1;
+                    seen - 1 == index
+                };
                 parser.skip_element();
                 if !drop {
                     kept.push_str(parser.raw_slice(start, parser.pos()));
@@ -522,7 +560,7 @@ fn transform_par_props(
             .filter(|raw| local_name(raw) == "rPr")
             .cloned(),
     );
-    restored.mark_revision = props.mark_revision.take();
+    restored.mark_revisions = std::mem::take(&mut props.mark_revisions);
     restored.property_change = None;
     *props = restored;
     Some(Ok(RevisionCategory::Property(PropertyScope::Paragraph)))

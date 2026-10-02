@@ -314,3 +314,119 @@ fn editor_navigates_to_a_mark_at_the_paragraph_end_and_accept_all_is_one_step() 
     assert!(editor.undo());
     assert!(!editor.undo(), "accept-all is a single checkpoint");
 }
+
+/// A paragraph inserted by one reviewer and deleted by another: its mark rPr
+/// holds both an `ins` and a `del`.
+fn inserted_then_deleted() -> Document {
+    doc(concat!(
+        "<w:p><w:pPr><w:rPr><w:ins w:id=\"1\" w:author=\"Ada\"/><w:del w:id=\"2\" w:author=\"Bo\"/>",
+        "</w:rPr></w:pPr><w:r><w:t>X</w:t></w:r></w:p>",
+        "<w:p><w:r><w:t>Y</w:t></w:r></w:p>"
+    ))
+}
+
+#[test]
+fn a_mark_with_both_an_insertion_and_a_deletion_lists_and_acts_on_each() {
+    let document = inserted_then_deleted();
+    let revisions = document.revisions();
+    let listed: Vec<(String, RevisionCategory)> = revisions
+        .iter()
+        .map(|r| (r.metadata.id.clone().unwrap(), r.category.clone()))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            (
+                "1".into(),
+                RevisionCategory::ParagraphMark(RevisionKind::Insert)
+            ),
+            (
+                "2".into(),
+                RevisionCategory::ParagraphMark(RevisionKind::Delete)
+            ),
+        ]
+    );
+    assert_ne!(revisions[0].target, revisions[1].target);
+    let first = document_to_xml(&document);
+    assert_eq!(document_to_xml(&parse(&first)), first, "round trip");
+
+    // Accepting the insertion keeps the mark and only its own record.
+    let mut accepted_ins = inserted_then_deleted();
+    assert!(
+        accepted_ins
+            .accept_revision(target_with_id(&accepted_ins, "1"))
+            .is_applied()
+    );
+    assert_eq!(texts(&accepted_ins), ["X", "Y"]);
+    let xml = document_to_xml(&accepted_ins);
+    assert!(
+        xml.contains("<w:del w:id=\"2\"") && !xml.contains("<w:ins w:id=\"1\""),
+        "{xml}"
+    );
+    assert_eq!(accepted_ins.revisions().len(), 1);
+
+    // Rejecting the deletion keeps the mark and the insertion record.
+    let mut rejected_del = inserted_then_deleted();
+    assert!(
+        rejected_del
+            .reject_revision(target_with_id(&rejected_del, "2"))
+            .is_applied()
+    );
+    assert_eq!(texts(&rejected_del), ["X", "Y"]);
+    let xml = document_to_xml(&rejected_del);
+    assert!(
+        xml.contains("<w:ins w:id=\"1\"") && !xml.contains("<w:del w:id=\"2\""),
+        "{xml}"
+    );
+
+    // Accepting the deletion removes the mark, and with it the insertion.
+    let mut accepted_del = inserted_then_deleted();
+    assert!(
+        accepted_del
+            .accept_revision(target_with_id(&accepted_del, "2"))
+            .is_applied()
+    );
+    assert_eq!(texts(&accepted_del), ["XY"]);
+    assert!(accepted_del.revisions().is_empty());
+}
+
+#[test]
+fn accept_all_and_reject_all_both_remove_an_inserted_then_deleted_mark() {
+    for accept in [true, false] {
+        let mut document = inserted_then_deleted();
+        let outcomes = if accept {
+            document.accept_all_revisions()
+        } else {
+            document.reject_all_revisions()
+        };
+        assert_eq!(outcomes.len(), 2);
+        assert!(
+            outcomes.iter().all(RevisionOutcome::is_applied),
+            "accept={accept}: {outcomes:?}"
+        );
+        assert_eq!(texts(&document), ["XY"], "accept={accept}");
+        let xml = document_to_xml(&document);
+        assert!(!xml.contains("<w:ins") && !xml.contains("<w:del"), "{xml}");
+    }
+}
+
+#[test]
+fn removing_a_section_ending_mark_merges_the_section_away_as_word_does() {
+    // The merged paragraph takes the next paragraph's properties, so its
+    // content joins the following section (whose sectPr comes later).
+    let mut document = doc(concat!(
+        "<w:p><w:pPr><w:rPr><w:del w:id=\"1\"/></w:rPr><w:sectPr><w:pgSz w:w=\"11906\"/></w:sectPr>",
+        "</w:pPr><w:r><w:t>A</w:t></w:r></w:p>",
+        "<w:p><w:r><w:t>B</w:t></w:r></w:p>"
+    ));
+    assert!(
+        document
+            .accept_revision(target_with_id(&document, "1"))
+            .is_applied()
+    );
+    assert_eq!(texts(&document), ["AB"]);
+    let Block::Paragraph(merged) = &document.body[0] else {
+        panic!("paragraph")
+    };
+    assert_eq!(merged.props.section_break, None);
+}
