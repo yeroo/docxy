@@ -36,6 +36,7 @@ use std::process::ExitCode;
 // for the `impl backstage::BackstageHost for App` call sites below.
 use backstage::BackstageHost as _;
 
+use docxcore::compare::{CompareOptions, CompareResult, CompareSkip, compare_packages};
 use docxcore::editor::{Caret, Clip, Editor, FoundMatch};
 use docxcore::export::{PdfOptions, to_pdf};
 #[cfg(test)]
@@ -230,6 +231,11 @@ fn main() -> ExitCode {
             }
         };
     }
+    // `docxy compare <original> <revised> -o <out>` writes a Review ▸ Compare
+    // result headless and exits.
+    if args.first().map(String::as_str) == Some("compare") && args.len() > 1 {
+        return compare_cli(&args[1..]);
+    }
     let parsed = match parse_args(&args) {
         Ok(p) => p,
         Err(msg) => {
@@ -404,6 +410,127 @@ fn export_html_headless(loaded: &Input, source: &str, out: &str) -> Result<usize
     Ok(page.len())
 }
 
+/// Revisions and comments are attributed to the document's author property,
+/// else to this name.
+const DEFAULT_AUTHOR: &str = "docxy";
+
+/// Now as a UTC ISO-8601 `w:date` (`YYYY-MM-DDTHH:MM:SSZ`).
+fn utc_now_iso() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    docxcore::field::format_iso(&docxcore::field::civil_from_unix(secs))
+}
+
+/// Review ▸ Compare over two `.docx` files: the result's tracked changes turn
+/// `original` into `revised`. Neither file is written.
+fn compare_files(original: &str, revised: &str, author: &str) -> Result<CompareResult, String> {
+    let load = |path: &str| -> Result<Package, String> {
+        if !path.to_ascii_lowercase().ends_with(".docx") {
+            return Err(format!(
+                "{path} is not a .docx file (compare takes Word documents)"
+            ));
+        }
+        let data = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+        load_package(&data).map_err(|e| format!("{path}: {e}"))
+    };
+    let (original, revised) = (load(original)?, load(revised)?);
+    let opts = CompareOptions {
+        author: author.to_string(),
+        date: utc_now_iso(),
+    };
+    Ok(compare_packages(&original, &revised, &opts))
+}
+
+/// `3 insertions, 2 deletions`, plus `; skipped: 1 table, 2 object` when the
+/// comparison left anything out.
+fn compare_summary(insertions: usize, deletions: usize, skipped: &[CompareSkip]) -> String {
+    let mut summary = format!("{insertions} insertions, {deletions} deletions");
+    let counts = docxcore::compare::skip_counts(skipped);
+    if !counts.is_empty() {
+        let parts: Vec<String> = counts.iter().map(|(k, n)| format!("{n} {k}")).collect();
+        summary.push_str(&format!("; skipped: {}", parts.join(", ")));
+    }
+    summary
+}
+
+/// Where a terminal compare result is titled: `Compare Result N.docx` next to
+/// the revised file, with the smallest N not already on disk.
+fn next_compare_result_path(revised: &Path) -> String {
+    let dir = revised.parent().filter(|d| !d.as_os_str().is_empty());
+    (1..)
+        .map(|n| {
+            let name = format!("Compare Result {n}.docx");
+            dir.map_or_else(|| std::path::PathBuf::from(&name), |d| d.join(&name))
+        })
+        .find(|candidate| !candidate.exists())
+        .expect("an unused compare result name")
+        .display()
+        .to_string()
+}
+
+/// `docxy compare <original.docx> <revised.docx> -o <out.docx>`: write the
+/// comparison as a new file. Never replaces an existing file.
+fn compare_cli(args: &[String]) -> ExitCode {
+    const USAGE: &str = "usage: docxy compare <original.docx> <revised.docx> -o <out.docx>";
+    let mut inputs = Vec::new();
+    let mut out = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" | "--out" => {
+                i += 1;
+                match args.get(i) {
+                    Some(path) => out = Some(path.clone()),
+                    None => {
+                        eprintln!("error: {} requires an output path\n{USAGE}", args[i - 1]);
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            path => inputs.push(path.to_string()),
+        }
+        i += 1;
+    }
+    let (Some(out), [original, revised]) = (out, inputs.as_slice()) else {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    };
+    if !out.to_ascii_lowercase().ends_with(".docx") {
+        eprintln!("error: {out}: the compare result must be a .docx file");
+        return ExitCode::from(2);
+    }
+    if Path::new(&out).exists() {
+        eprintln!("error: {out} already exists (compare never overwrites a file)");
+        return ExitCode::FAILURE;
+    }
+    let result = match compare_files(original, revised, DEFAULT_AUTHOR) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // write_atomic never replaces an existing path, so a file that appeared
+    // since the check above (or an input named as the output) is refused too.
+    if let Err(e) = write_atomic(Path::new(&out), &save_package(&result.package)) {
+        eprintln!("error: cannot write {out}: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "wrote {out} ({} insertions, {} deletions)",
+        result.insertions, result.deletions
+    );
+    for (kind, n) in docxcore::compare::skip_counts(&result.skipped) {
+        println!("skipped: {n} {kind}");
+    }
+    ExitCode::SUCCESS
+}
+
 fn print_usage() {
     eprintln!(
         "Docxy — terminal .docx & Markdown editor\n\n\
@@ -415,6 +542,8 @@ fn print_usage() {
            docxy <file> --md <out.md>      convert to Markdown and exit\n  \
            docxy <file> --docx <out.docx>  convert to Word .docx and exit\n  \
            docxy <file> --html <out.docx.html>  export as editable HTML and exit\n  \
+           docxy compare <orig.docx> <rev.docx> -o <out.docx>\n  \
+                                           write a tracked-changes comparison and exit\n  \
            docxy --mcp                      run the MCP bridge to drive a live docxy\n  \
            docxy install skill              install the agent SKILL.md (self-onboarding)\n  \
            (Save As to a .md/.docx/.docx.html name converts between the formats;\n   \
@@ -577,6 +706,11 @@ enum ConfirmAction {
     OverwritePdf(std::path::PathBuf),
     /// Apply one undoable action to every tracked change in the document.
     ReviewAll(RevisionAction),
+    /// Discard unsaved changes and open a Review ▸ Compare result.
+    Compare {
+        original: String,
+        revised: String,
+    },
 }
 
 // The Yes/No modal itself lives in `backstage::Confirm<ConfirmAction>` (shared
@@ -786,6 +920,32 @@ impl ParagraphDialog {
             _ => self.by = (self.by + dir * Self::STEP).max(0),
         }
     }
+}
+
+/// The Review ▸ Compare dialog: the original and revised `.docx` paths.
+struct CompareDialog {
+    original: String,
+    revised: String,
+    /// Focused field: 0 = original, 1 = revised.
+    field: usize,
+}
+
+impl CompareDialog {
+    fn focused(&mut self) -> &mut String {
+        if self.field == 0 {
+            &mut self.original
+        } else {
+            &mut self.revised
+        }
+    }
+}
+
+/// What a Review ▸ Compare produced (see [`App::compare_paths`]).
+pub(crate) struct CompareSummary {
+    pub path: String,
+    pub insertions: usize,
+    pub deletions: usize,
+    pub skipped: Vec<CompareSkip>,
 }
 
 /// Format twips as inches for display, e.g. 720 → `0.50"`.
@@ -1079,6 +1239,10 @@ struct App {
     para_dialog: Option<ParagraphDialog>,
     pd_rows: Vec<Rect>,
     pd_btns: [Rect; 2],
+    /// The modal Review ▸ Compare dialog, plus its field/button rects.
+    compare_dialog: Option<CompareDialog>,
+    cd_rows: Vec<Rect>,
+    cd_btns: [Rect; 2],
     /// The modal Apply-Styles dialog, plus its visible row rects and buttons.
     styles_dialog: Option<StylesDialog>,
     sd_rows: Vec<Rect>,
@@ -1258,6 +1422,9 @@ impl App {
             if_rows: Vec::new(),
             if_btns: [Rect::default(); 2],
             para_dialog: None,
+            compare_dialog: None,
+            cd_rows: Vec::new(),
+            cd_btns: [Rect::default(); 2],
             pd_rows: Vec::new(),
             pd_btns: [Rect::default(); 2],
             styles_dialog: None,
@@ -1777,6 +1944,7 @@ impl App {
             AcceptRevision => self.review_current_revision(RevisionAction::Accept),
             RejectRevision => self.review_current_revision(RevisionAction::Reject),
             AcceptAllRevisions => self.request_review_all(RevisionAction::Accept),
+            Compare => self.open_compare_dialog(),
             RejectAllRevisions => self.request_review_all(RevisionAction::Reject),
             ReadMode => self.set_page_view(false),
             PrintLayout => self.set_page_view(true),
@@ -2099,6 +2267,10 @@ impl App {
                     }
                     ConfirmAction::ReviewAll(action) => {
                         self.apply_review_all(action);
+                        false
+                    }
+                    ConfirmAction::Compare { original, revised } => {
+                        self.run_compare(&original, &revised, true);
                         false
                     }
                 }
@@ -2467,11 +2639,7 @@ impl App {
             self.dirty = true;
             return;
         }
-        let author = if self.field_ctx.props.author.trim().is_empty() {
-            "docxy".to_string()
-        } else {
-            self.field_ctx.props.author.clone()
-        };
+        let author = self.review_author();
         let initials: String = author
             .split_whitespace()
             .filter_map(|w| w.chars().next())
@@ -3815,6 +3983,139 @@ impl App {
     // ---- Paragraph dialog (precise indent) ----
 
     /// Open the Paragraph dialog seeded from the caret paragraph's indents.
+    /// Who comments and compare revisions are attributed to: the document's
+    /// author property, else [`DEFAULT_AUTHOR`].
+    fn review_author(&self) -> String {
+        if self.field_ctx.props.author.trim().is_empty() {
+            DEFAULT_AUTHOR.to_string()
+        } else {
+            self.field_ctx.props.author.clone()
+        }
+    }
+
+    /// Review ▸ Compare: replace the open document with a new, unsaved
+    /// `Compare Result N.docx` (beside the revised file) whose tracked changes
+    /// turn `original` into `revised`; neither source file is written. Refuses
+    /// while the open document has unsaved changes unless `discard` (the
+    /// terminal asks first; the control surface never discards).
+    pub(crate) fn compare_paths(
+        &mut self,
+        original: &str,
+        revised: &str,
+        discard: bool,
+    ) -> Result<CompareSummary, String> {
+        if self.modified && !discard {
+            return Err("unsaved changes; save or reload first".to_string());
+        }
+        let result = compare_files(original, revised, &self.review_author())?;
+        let summary = CompareSummary {
+            path: next_compare_result_path(Path::new(revised)),
+            insertions: result.insertions,
+            deletions: result.deletions,
+            skipped: result.skipped,
+        };
+        self.load_package_state(result.package, summary.path.clone());
+        // A new document that exists only in memory until saved.
+        self.modified = true;
+        self.status = Some(format!(
+            "compared: {}",
+            compare_summary(summary.insertions, summary.deletions, &summary.skipped)
+        ));
+        Ok(summary)
+    }
+
+    fn run_compare(&mut self, original: &str, revised: &str, discard: bool) {
+        if let Err(e) = self.compare_paths(original, revised, discard) {
+            self.status = Some(format!("compare failed: {e}"));
+        }
+        self.dirty = true;
+    }
+
+    fn open_compare_dialog(&mut self) {
+        // The open document is the natural original when it is a saved .docx.
+        let saved_docx = self.format == DocFormat::Docx
+            && self.path.to_ascii_lowercase().ends_with(".docx")
+            && Path::new(&self.path).is_file();
+        let original = if saved_docx {
+            self.path.clone()
+        } else {
+            String::new()
+        };
+        let field = usize::from(!original.is_empty());
+        self.compare_dialog = Some(CompareDialog {
+            original,
+            revised: String::new(),
+            field,
+        });
+        self.dirty = true;
+    }
+
+    fn submit_compare_dialog(&mut self) {
+        let Some(d) = self.compare_dialog.as_ref() else {
+            return;
+        };
+        // Paths pasted or dropped from a file manager often arrive quoted.
+        let clean = |s: &str| s.trim().trim_matches('"').to_string();
+        let (original, revised) = (clean(&d.original), clean(&d.revised));
+        self.dirty = true;
+        if original.is_empty() || revised.is_empty() {
+            self.status = Some("Compare needs an original and a revised .docx".to_string());
+            return;
+        }
+        self.compare_dialog = None;
+        if self.modified {
+            self.confirm = Some(
+                backstage::Confirm::new(
+                    "Discard unsaved changes and compare?",
+                    ConfirmAction::Compare { original, revised },
+                    Color::LightBlue,
+                )
+                .default_no(),
+            );
+            return;
+        }
+        self.run_compare(&original, &revised, false);
+    }
+
+    fn compare_dialog_key(&mut self, key: KeyEvent) -> bool {
+        let Some(d) = self.compare_dialog.as_mut() else {
+            return false;
+        };
+        self.dirty = true;
+        match key.code {
+            KeyCode::Up | KeyCode::BackTab => d.field = 0,
+            KeyCode::Down | KeyCode::Tab => d.field = 1,
+            KeyCode::Backspace => {
+                d.focused().pop();
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                d.focused().push(c);
+            }
+            KeyCode::Enter => self.submit_compare_dialog(),
+            KeyCode::Esc => self.compare_dialog = None,
+            _ => {}
+        }
+        false
+    }
+
+    fn compare_dialog_mouse(&mut self, x: u16, y: u16) {
+        let p = Position { x, y };
+        self.dirty = true;
+        if let Some(i) = self.cd_rows.iter().position(|r| r.contains(p)) {
+            if let Some(d) = self.compare_dialog.as_mut() {
+                d.field = i;
+            }
+        } else if self.cd_btns[0].contains(p) {
+            self.submit_compare_dialog();
+        } else if self.cd_btns[1].contains(p) {
+            self.compare_dialog = None;
+        }
+    }
+
     fn open_para_dialog(&mut self) {
         let (left, fl) = self.editor.caret_para_indent();
         let (special, by) = match fl.cmp(&0) {
@@ -4262,6 +4563,12 @@ impl App {
         if self.para_dialog.is_some() {
             if m.kind == MouseEventKind::Down(MouseButton::Left) {
                 self.para_dialog_mouse(m.column, m.row);
+            }
+            return;
+        }
+        if self.compare_dialog.is_some() {
+            if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.compare_dialog_mouse(m.column, m.row);
             }
             return;
         }
@@ -5124,6 +5431,9 @@ impl App {
         if self.para_dialog.is_some() {
             return self.para_dialog_key(key);
         }
+        if self.compare_dialog.is_some() {
+            return self.compare_dialog_key(key);
+        }
         if self.styles_dialog.is_some() {
             return self.styles_dialog_key(key);
         }
@@ -5845,6 +6155,9 @@ impl App {
         if self.para_dialog.is_some() {
             self.draw_para_dialog(f, f.area());
         }
+        if self.compare_dialog.is_some() {
+            self.draw_compare_dialog(f, f.area());
+        }
         if self.styles_dialog.is_some() {
             self.draw_styles_dialog(f, f.area());
         }
@@ -6136,6 +6449,83 @@ impl App {
         f.render_widget(Paragraph::new(ol).style(on_style), ok_rect);
         f.render_widget(Paragraph::new(cl).style(unsel), cancel_rect);
         self.pd_btns = [ok_rect, cancel_rect];
+    }
+
+    fn draw_compare_dialog(&mut self, f: &mut Frame, area: Rect) {
+        let Some(d) = &self.compare_dialog else {
+            return;
+        };
+        // 2 path rows + blank + hint + blank + buttons, inside a border.
+        let inner_h = 2 + 1 + 1 + 1 + 1;
+        let w = 64u16
+            .min(area.width.saturating_sub(2))
+            .max(30.min(area.width));
+        let h = (inner_h + 2).min(area.height);
+        let rect = Rect {
+            x: area.x + area.width.saturating_sub(w) / 2,
+            y: area.y + area.height.saturating_sub(h) / 2,
+            width: w,
+            height: h,
+        };
+        f.render_widget(Clear, rect);
+        let block = RBlock::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" Compare Documents ");
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+
+        let line = |row: u16| Rect {
+            x: inner.x + 1,
+            y: inner.y + row,
+            width: inner.width.saturating_sub(2),
+            height: 1,
+        };
+        let on_style = Style::default().fg(Color::Black).bg(Color::Cyan);
+        self.cd_rows.clear();
+        for (i, (label, value)) in [("Original", &d.original), ("Revised", &d.revised)]
+            .into_iter()
+            .enumerate()
+        {
+            let r = line(i as u16);
+            let on = i == d.field;
+            // Show the end of a long path (the file name), plus a caret.
+            let room = (r.width as usize).saturating_sub(12);
+            let chars: Vec<char> = value.chars().collect();
+            let shown: String = chars[chars.len().saturating_sub(room)..].iter().collect();
+            let caret = if on { "▏" } else { "" };
+            let text = format!(" {:<10}{shown}{caret}", format!("{label}:"));
+            let style = if on { on_style } else { Style::default() };
+            f.render_widget(Paragraph::new(text).style(style), r);
+            self.cd_rows.push(r);
+        }
+        f.render_widget(
+            Paragraph::new("Tab field · type a .docx path · Enter compare")
+                .style(Style::default().add_modifier(Modifier::DIM)),
+            line(3),
+        );
+
+        let (ol, cl) = (" Compare ", " Cancel ");
+        let (ow, cw) = (ol.len() as u16, cl.len() as u16);
+        let total = ow + 2 + cw;
+        let bx = inner.x + inner.width.saturating_sub(total) / 2;
+        let by = inner.y + inner.height.saturating_sub(1);
+        let ok_rect = Rect {
+            x: bx,
+            y: by,
+            width: ow,
+            height: 1,
+        };
+        let cancel_rect = Rect {
+            x: bx + ow + 2,
+            y: by,
+            width: cw,
+            height: 1,
+        };
+        let unsel = Style::default().add_modifier(Modifier::REVERSED);
+        f.render_widget(Paragraph::new(ol).style(on_style), ok_rect);
+        f.render_widget(Paragraph::new(cl).style(unsel), cancel_rect);
+        self.cd_btns = [ok_rect, cancel_rect];
     }
 
     fn draw_styles_dialog(&mut self, f: &mut Frame, area: Rect) {
@@ -12047,6 +12437,138 @@ mod tests {
         fn into_key(self) -> KeyEvent {
             KeyEvent::new(self, KeyModifiers::NONE)
         }
+    }
+    /// An original and a revised .docx (the #626 example) in a fresh directory.
+    fn compare_fixture(tag: &str) -> (std::path::PathBuf, String, String) {
+        let dir = std::env::temp_dir().join(format!("docxy-compare-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, text: &str| {
+            let path = dir.join(name);
+            let doc = Document {
+                body: vec![Block::Paragraph(MPara {
+                    props: ParProps::default(),
+                    content: vec![Inline::Run(Run {
+                        text: text.to_string(),
+                        props: RunProps::default(),
+                    })],
+                })],
+            };
+            std::fs::write(&path, save_package(&new_package(doc))).unwrap();
+            path.display().to_string()
+        };
+        let original = write("orig.docx", "The cat sat on the mat.");
+        let revised = write("rev.docx", "The black cat sat on a mat.");
+        (dir, original, revised)
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    #[test]
+    fn compare_opens_an_unsaved_compare_result_beside_the_revised_file() {
+        let (dir, original, revised) = compare_fixture("open");
+        let (before_o, before_r) = (
+            std::fs::read(&original).unwrap(),
+            std::fs::read(&revised).unwrap(),
+        );
+        let input = load_input(&original).unwrap();
+        let mut app = App::new(input.pkg, &original, false);
+        app.os_clip = None;
+
+        let summary = app.compare_paths(&original, &revised, false).unwrap();
+        let expected = dir.join("Compare Result 1.docx").display().to_string();
+        assert_eq!(summary.path, expected);
+        assert_eq!(app.path, expected);
+        assert!(app.modified, "the result exists only in memory");
+        assert!(
+            !Path::new(&expected).exists(),
+            "nothing is written until saved"
+        );
+        assert_eq!((summary.insertions, summary.deletions), (2, 1));
+        assert_eq!(app.editor.doc.revisions().len(), 3);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("compared: 2 insertions, 1 deletions")
+        );
+        assert_eq!(std::fs::read(&original).unwrap(), before_o);
+        assert_eq!(std::fs::read(&revised).unwrap(), before_r);
+
+        app.editor.accept_all_revisions();
+        assert_eq!(app.editor.doc.plain_text(), "The black cat sat on a mat.\n");
+
+        // The name skips results already on disk.
+        std::fs::write(&expected, b"taken").unwrap();
+        app.modified = false;
+        let second = app.compare_paths(&original, &revised, false).unwrap();
+        assert_eq!(
+            second.path,
+            dir.join("Compare Result 2.docx").display().to_string()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compare_refuses_unsaved_changes_unless_the_terminal_confirms() {
+        let (dir, original, revised) = compare_fixture("unsaved");
+        let mut app = app_with(&["draft"]);
+        app.modified = true;
+        let err = app.compare_paths(&original, &revised, false).err().unwrap();
+        assert!(err.contains("unsaved"), "{err}");
+        assert_eq!(app.path, "test.docx");
+        assert_eq!(app.editor.doc.plain_text(), "draft\n");
+
+        // Review ▸ Compare: test.docx is not on disk, so both paths are typed.
+        app.run_act(ribbon::Act::Compare);
+        let d = app.compare_dialog.as_ref().expect("compare dialog");
+        assert_eq!((d.original.as_str(), d.field), ("", 0));
+        type_text(&mut app, &original);
+        app.on_key(key(KeyCode::Tab));
+        type_text(&mut app, &format!("\"{revised}\""));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.compare_dialog.is_none());
+        let prompt = app
+            .confirm
+            .as_ref()
+            .expect("discard prompt")
+            .prompt()
+            .to_string();
+        assert!(prompt.contains("Discard unsaved changes"), "{prompt}");
+        assert_eq!(app.path, "test.docx", "nothing happens before Yes");
+        app.on_key(key(KeyCode::Char('y')));
+        assert!(app.path.ends_with("Compare Result 1.docx"), "{}", app.path);
+        assert_eq!(app.editor.doc.revisions().len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compare_dialog_defaults_the_original_to_the_saved_docx() {
+        let (dir, original, revised) = compare_fixture("dialog");
+        let input = load_input(&original).unwrap();
+        let mut app = App::new(input.pkg, &original, false);
+        app.os_clip = None;
+        app.run_act(ribbon::Act::Compare);
+        let d = app.compare_dialog.as_ref().expect("compare dialog");
+        assert_eq!((d.original.as_str(), d.field), (original.as_str(), 1));
+        // A non-.docx revised path is refused with a clear status.
+        type_text(&mut app, "notes.md");
+        app.on_key(key(KeyCode::Enter));
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.contains("compare failed") && status.contains("not a .docx"),
+            "{status}"
+        );
+        assert_eq!(app.path, original);
+        // Esc closes without comparing.
+        app.run_act(ribbon::Act::Compare);
+        type_text(&mut app, &revised);
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.compare_dialog.is_none());
+        assert_eq!(app.path, original);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

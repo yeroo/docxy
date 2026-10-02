@@ -604,6 +604,31 @@
     }
   },
   {
+    "name": "docxy_compare",
+    "description": "Compare an original and a revised .docx (Review > Compare): open a new, unsaved 'Compare Result N.docx' whose tracked changes turn the original into the revised document, and return its path, insertion/deletion counts and anything skipped. Neither source file is written. Refuses while the open document has unsaved changes.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "original": {
+          "type": "string",
+          "description": "Path of the original .docx."
+        },
+        "revised": {
+          "type": "string",
+          "description": "Path of the revised .docx."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "original",
+        "revised"
+      ]
+    }
+  },
+  {
     "name": "xlsxy_list",
     "description": "List the xlsxy editors currently running on this machine (instance/pane id, port, pid).",
     "inputSchema": {
