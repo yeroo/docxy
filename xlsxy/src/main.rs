@@ -1,7 +1,7 @@
 //! `xlsxy` — terminal viewer/**editor** for `.xlsx` workbooks.
 //!
 //! Usage:
-//!   xlsxy                               open a new blank workbook
+//!   xlsxy                               open a new workbook, or XLSTART's first
 //!   xlsxy <file.xlsx>                   open in the editor
 //!   xlsxy <in.xlsx> --recalc <out>      headless: recalculate and save
 //!   xlsxy <in.xlsx> --csv <out.csv>     headless: export the active sheet as CSV UTF-8
@@ -1042,7 +1042,7 @@ fn print_usage() {
     eprintln!(
         "Xlsxy — terminal .xlsx spreadsheet editor with a real calc engine\n\n\
          USAGE:\n  \
-           xlsxy                            new blank workbook\n  \
+           xlsxy                            new workbook (or the first workbook in XLSTART)\n  \
            xlsxy <file.xlsx>                open a workbook\n  \
            xlsxy <file.csv|.tsv>            import CSV/TSV as a new workbook\n  \
            xlsxy <file.txt|.prn>            import text through the Text Import Wizard\n  \
@@ -1061,7 +1061,7 @@ fn print_usage() {
            arrows / PgUp / PgDn move   (Ctrl-arrows jump to data edge)\n  \
            Shift + move select a range   (stats appear in the status bar)\n  \
            Ctrl-C copy   Ctrl-X cut   Ctrl-V paste (relative refs translate)\n  \
-           Ctrl-Z undo   Ctrl-Y redo   Ctrl-S save   Ctrl-Q quit\n  \
+           Ctrl-Z undo   Ctrl-Y redo   Ctrl-S save   Ctrl-N new   Ctrl-Q quit\n  \
            Ctrl-PgUp/PgDn or click tabs to switch sheets\n  \
            Ctrl-D/Ctrl-R fill down/right   Ctrl-F find (F3 next)\n  \
            F5 insert rows  Shift-F5 delete rows  F6/Shift-F6 same for columns\n  \
@@ -1851,6 +1851,9 @@ struct App {
     /// File › Options › Advanced › *At startup, open all files in*: the
     /// alternate startup folder (`alt_startup_path` in the preferences).
     alt_startup: Option<String>,
+    /// Why no startup workbook opened, held while the welcome screen (which
+    /// draws no status line) is up and shown when it closes.
+    startup_note: Option<String>,
     /// The Text Import Wizard `xlsxy -r notes.txt` opened at startup: its
     /// finish keeps read-only, unlike an interactive import. Cleared when
     /// that wizard finishes or is cancelled.
@@ -1947,6 +1950,7 @@ impl App {
             read_only: None,
             xlstart: None,
             alt_startup: None,
+            startup_note: None,
             startup_import: false,
             sheet_picker: None,
             dv_picker: None,
@@ -4392,10 +4396,7 @@ impl App {
             auto.dates as u8,
         );
         if let Some(dir) = &self.alt_startup {
-            text.push_str(&format!(
-                "alt_startup_path={dir}
-"
-            ));
+            text.push_str(&format!("alt_startup_path={dir}\n"));
         }
         text
     }
@@ -4852,7 +4853,7 @@ impl App {
             }
         }
         if !failed.is_empty() {
-            self.status = Some(format!("Startup workbook {}", failed.join("; ")));
+            self.startup_note = Some(format!("Startup workbook {}", failed.join("; ")));
         }
     }
 
@@ -5174,6 +5175,12 @@ impl App {
                 }
             }
             _ => return true, // Quit — nothing open to lose, exit directly
+        }
+        if let Some(note) = self.startup_note.take() {
+            self.status = Some(match self.status.take() {
+                Some(status) => format!("{note}; {status}"),
+                None => note,
+            });
         }
         false
     }
@@ -10426,18 +10433,34 @@ mod tests {
             "{status}"
         );
 
-        // When none loads, the welcome screen stays and says why.
-        let mut app = App::new(new_xlsx(), "untitled.xlsx");
-        app.start_screen = true;
-        app.open_startup_workbooks(&[broken]);
-        assert!(app.start_screen);
-        assert_eq!(app.path, "untitled.xlsx");
-        assert!(
-            app.status
-                .as_deref()
-                .unwrap()
-                .contains("broken.xlsx not opened")
-        );
+        // When none loads, the welcome screen stays; it draws no status
+        // line, so the reason shows when it closes, on Blank workbook or
+        // Ctrl+N, and only once.
+        let routes: [fn(&mut App); 2] = [
+            |app| {
+                app.start_choose(0);
+            },
+            |app| {
+                handle_key(app, ctrl('n'));
+            },
+        ];
+        for close in routes {
+            let mut app = App::new(new_xlsx(), "untitled.xlsx");
+            app.start_screen = true;
+            app.open_startup_workbooks(std::slice::from_ref(&broken));
+            assert!(app.start_screen);
+            assert_eq!(app.path, "untitled.xlsx");
+            close(&mut app);
+            assert!(!app.start_screen);
+            let status = app.status.clone().unwrap();
+            assert!(
+                status.starts_with("Startup workbook broken.xlsx not opened: ")
+                    && status.ends_with("; New workbook"),
+                "{status}"
+            );
+            app.new_workbook();
+            assert_eq!(app.status.as_deref(), Some("New workbook"));
+        }
         // No startup workbooks: nothing changes.
         let mut app = App::new(new_xlsx(), "untitled.xlsx");
         app.start_screen = true;

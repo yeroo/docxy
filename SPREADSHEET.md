@@ -501,7 +501,13 @@ The strategic piece: **conformance is measured, not claimed.**
   + `splice_styles`) that adds fonts/fills/numFmts/xfs without disturbing
   a single existing style byte, so it round-trips. **View toggles**:
   formula view (Ctrl+`), freeze panes, light/dark theme, ribbon
-  auto-hide, all persisted to `~/.config/xlsxy/view.conf`. **Navigation**:
+  auto-hide, all persisted to `~/.config/xlsxy/view.conf`. **Templates
+  and XLSTART** (#614): a workbook started from a template (`.xltx`/`.xltm`)
+  asks Save As on its first save; `book.xltx` in `~/.config/xlsxy/XLSTART`
+  is the template File › New and Ctrl+N start from; launched with no file,
+  xlsxy opens the first workbook in XLSTART, then in the folder named by
+  `alt_startup_path=<dir>` in `view.conf`, instead of the welcome screen
+  (one workbook per window: the rest are counted, not opened). **Navigation**:
   Find & Replace (Ctrl+H, literal replace across formulas and values) and
   Go To (Ctrl+G) for A1 refs, `Sheet!A1`, and defined names. And a
   **`--vim` modal mode**: Normal/Visual/VisualLine with hjkl, `gg`/`G`/
