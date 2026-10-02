@@ -847,3 +847,138 @@ fn a_continued_placeholder_drops_the_originals_binding() {
         "{second}"
     );
 }
+
+/// A checkbox control (id 7) before "Milk", with "ab" before it on the line
+/// when `mid` is set.
+fn checkbox_doc(mid: bool) -> Editor {
+    let before = if mid { "<w:r><w:t>ab</w:t></w:r>" } else { "" };
+    ed(&format!(
+        "<w:p>{before}<w:sdt><w:sdtPr><w:id w:val=\"7\"/><w14:checkbox/></w:sdtPr>\
+         <w:sdtContent><w:r><w:t>☐</w:t></w:r></w:sdtContent></w:sdt><w:r><w:t>Milk</w:t></w:r></w:p>"
+    ))
+}
+
+#[test]
+fn blank_page_and_a_paste_at_a_controls_start_move_it_down_whole() {
+    for mid in [false, true] {
+        let at = if mid { 2 } else { 0 };
+        for blank in [true, false] {
+            let mut e = checkbox_doc(mid);
+            e.caret = Caret {
+                path: vec![0],
+                offset: at,
+            };
+            if blank {
+                e.insert_blank_page();
+            } else {
+                e.paste(&Clip::from_text("X\nY"));
+            }
+            assert!(inline_controls_balance(&e));
+            let xml = blocks_to_xml(&e.doc.body);
+            assert_eq!(xml.matches("<w:sdtContent>").count(), 1, "{xml}");
+            let last = e
+                .doc
+                .body
+                .iter()
+                .rposition(|b| matches!(b, Block::Paragraph(_)))
+                .unwrap();
+            let last_xml = blocks_to_xml(&e.doc.body[last..=last]);
+            assert!(
+                last_xml.contains("<w:id w:val=\"7\"/>") && last_xml.contains("Milk"),
+                "mid {mid}, blank {blank}: {xml}"
+            );
+        }
+    }
+}
+
+fn plain_doc_control(offset: usize) -> (Editor, String) {
+    let e = ed(
+        "<w:p><w:r><w:t xml:space=\"preserve\">Say </w:t></w:r><w:sdt><w:sdtPr>\
+         <w:id w:val=\"4\"/><w:dataBinding w:xpath=\"/a\" w:storeItemID=\"{X}\"/></w:sdtPr>\
+         <w:sdtContent><w:r><w:t>abcd</w:t></w:r></w:sdtContent></w:sdt></w:p>",
+    );
+    let before = blocks_to_xml(&e.doc.body);
+    let mut e = e;
+    e.caret = Caret {
+        path: vec![0],
+        offset,
+    };
+    (e, before)
+}
+
+#[test]
+fn enter_then_backspace_or_delete_inside_a_control_is_undone_exactly() {
+    for delete in [false, true] {
+        let (mut e, before) = plain_doc_control(6);
+        e.insert_newline();
+        assert_eq!(e.doc.body.len(), 2);
+        if delete {
+            e.caret = Caret {
+                path: vec![0],
+                offset: 6,
+            };
+            e.delete_forward();
+        } else {
+            e.backspace();
+        }
+        // Enter splits the run and the join keeps the two halves as two runs,
+        // as it does in any paragraph; the control is whole again, with its id
+        // and binding.
+        let after =
+            blocks_to_xml(&e.doc.body).replace("</w:t></w:r><w:r><w:t xml:space=\"preserve\">", "");
+        assert_eq!(after, before, "delete {delete}");
+    }
+}
+
+#[test]
+fn enter_then_backspace_in_a_cover_title_keeps_one_placeholder() {
+    for offset in [2, 8] {
+        let (mut e, title) = typed_title(offset);
+        e.insert_newline();
+        e.backspace();
+        let Block::Paragraph(p) = &e.doc.body[title] else {
+            panic!()
+        };
+        let opens = p
+            .content
+            .iter()
+            .filter(|i| matches!(i, Inline::Raw(r) if crate::hf::is_sdt_open(r)))
+            .count();
+        assert_eq!(opens, 1, "offset {offset}: {:?}", p.content);
+        // Typing at the end goes into the original placeholder.
+        e.caret.offset = text_at(&e, &[title]).chars().count();
+        e.insert_str("!");
+        e.set_cover_page(1, &[]).unwrap();
+        assert_eq!(
+            text_at(&e, &[field_para(&e, Placeholder::Title)]),
+            "My title!",
+            "offset {offset}"
+        );
+    }
+}
+
+#[test]
+fn a_paste_at_the_end_of_a_typed_placeholder_is_its_text() {
+    let (mut e, _) = typed_title(8);
+    e.paste(&Clip::from_text(" 2026"));
+    e.set_cover_page(1, &[]).unwrap();
+    assert_eq!(
+        text_at(&e, &[field_para(&e, Placeholder::Title)]),
+        "My title 2026"
+    );
+
+    let (mut e, _) = typed_title(8);
+    e.paste(&Clip::from_text("A\nB"));
+    assert!(inline_controls_balance(&e));
+    e.set_cover_page(1, &[]).unwrap();
+    assert_eq!(
+        text_at(&e, &[field_para(&e, Placeholder::Title)]),
+        "My titleA\nB"
+    );
+
+    // An ordinary control keeps its paste placement: after its end.
+    let (mut e, _) = plain_doc_control(8);
+    e.paste(&Clip::from_text("!"));
+    let xml = blocks_to_xml(&e.doc.body);
+    assert!(xml.contains("</w:sdtContent></w:sdt><w:r>"), "{xml}");
+}
