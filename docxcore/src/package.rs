@@ -1723,13 +1723,8 @@ impl Package {
                     format!("<Relationship Id=\"{rid}\" Type=\"{R_NS}/mailMergeSource\" Target=\"");
                 crate::serialize::esc_attr(&path_to_file_url(src), &mut rel);
                 rel.push_str("\" TargetMode=\"External\"/>");
-                if r.contains("</Relationships>") {
-                    *r = r.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1);
-                } else if let Some(gt) = r
-                    .find("<Relationships")
-                    .and_then(|s| r[s..].find("/>").map(|e| s + e))
-                {
-                    *r = format!("{}>{rel}</Relationships>{}", &r[..gt], &r[gt + 2..]);
+                if let Some(appended) = append_relationships(r, &rel) {
+                    *r = appended;
                 }
                 el.push_str("<w:linkToQuery/><w:dataType w:val=\"textFile\"/>");
                 el.push_str("<w:connectString w:val=\"\"/><w:query w:val=\"");
