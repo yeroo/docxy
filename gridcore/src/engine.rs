@@ -87,6 +87,11 @@ pub struct Engine {
     /// ([`Engine::foreign_spills`]). Built on first use, extended by every
     /// spill the pass writes, never pruned: a superset, re-read before use.
     pass_anchors: HashMap<usize, RowCover>,
+    /// Reverse dependency edges among formulas (source cell → the formulas
+    /// whose dep rects cover it), a pure function of `formulas`. Built on
+    /// first use and reused across edits; `None` whenever `formulas` changed
+    /// since it was built.
+    rev: Option<HashMap<Key, Vec<Key>>>,
 }
 
 /// One sheet's spill anchors by the rows their extents cover
@@ -271,6 +276,7 @@ impl Engine {
                         deps,
                     },
                 );
+                self.invalidate_rev();
             }
             Err(_) => {
                 self.unsupported.insert(key);
@@ -875,8 +881,11 @@ impl Engine {
                 }
             }
         }
-        // Drop stale bookkeeping for this address.
-        self.formulas.remove(&key);
+        // Drop stale bookkeeping for this address. Only a removed formula
+        // changes `formulas`, so only that drops the cached reverse edges.
+        if self.formulas.remove(&key).is_some() {
+            self.invalidate_rev();
+        }
         self.circular.remove(&key);
         self.unsupported.remove(&key);
         self.supported.remove(&key);
@@ -1034,20 +1043,18 @@ impl Engine {
                 collect_deps(wb, k, &info.ast, &mut deps, 0);
             }
             if let Some(info) = self.formulas.get_mut(&k) {
-                info.deps = deps;
+                if info.deps != deps {
+                    info.deps = deps;
+                    self.invalidate_rev();
+                }
             }
         }
         // Reverse dependency edges among formulas (source cell → the formulas
-        // that read it), built once so the transitive walk follows edges
-        // instead of rescanning every formula for each cell it touches —
-        // O(edges) rather than O(dirty × formulas).
-        let all: Vec<Key> = self.formulas.keys().copied().collect();
-        let mut rev: HashMap<Key, Vec<Key>> = HashMap::new();
-        for (f, srcs) in self.dependency_edges(&all) {
-            for g in srcs {
-                rev.entry(g).or_default().push(f);
-            }
-        }
+        // that read it), so the transitive walk follows edges instead of
+        // rescanning every formula for each cell it touches — O(edges) rather
+        // than O(dirty × formulas). Cached across edits, rebuilt only when
+        // `formulas` changed (see `take_rev`).
+        let rev = self.take_rev();
 
         let mut dirty: HashSet<Key> = HashSet::new();
         let mut frontier: VecDeque<Key> = VecDeque::new();
@@ -1098,7 +1105,32 @@ impl Engine {
                 }
             }
         }
+        self.rev = Some(rev);
         self.evaluate(wb, dirty, depth);
+    }
+
+    /// Drop the cached reverse edges; call after any change to `formulas`.
+    fn invalidate_rev(&mut self) {
+        self.rev = None;
+    }
+
+    /// The reverse edges, rebuilt from `dependency_edges` only when invalidated.
+    fn take_rev(&mut self) -> HashMap<Key, Vec<Key>> {
+        match self.rev.take() {
+            Some(rev) => rev,
+            None => {
+                #[cfg(test)]
+                tests::REV_BUILDS.with(|n| n.set(n.get() + 1));
+                let all: Vec<Key> = self.formulas.keys().copied().collect();
+                let mut rev: HashMap<Key, Vec<Key>> = HashMap::new();
+                for (f, srcs) in self.dependency_edges(&all) {
+                    for g in srcs {
+                        rev.entry(g).or_default().push(f);
+                    }
+                }
+                rev
+            }
+        }
     }
 
     /// For each formula in `scope`, the deduped list of formulas *also in
@@ -1346,14 +1378,8 @@ impl Engine {
 
     /// The formulas that depend on `seeds`, directly or transitively (the
     /// seeds themselves excluded unless one depends on another).
-    fn dependents_of(&self, seeds: &[Key]) -> HashSet<Key> {
-        let all: Vec<Key> = self.formulas.keys().copied().collect();
-        let mut rev: HashMap<Key, Vec<Key>> = HashMap::new();
-        for (f, srcs) in self.dependency_edges(&all) {
-            for g in srcs {
-                rev.entry(g).or_default().push(f);
-            }
-        }
+    fn dependents_of(&mut self, seeds: &[Key]) -> HashSet<Key> {
+        let rev = self.take_rev();
         let mut out: HashSet<Key> = HashSet::new();
         let mut frontier: VecDeque<Key> = seeds.iter().copied().collect();
         while let Some(src) = frontier.pop_front() {
@@ -1363,6 +1389,7 @@ impl Engine {
                 }
             }
         }
+        self.rev = Some(rev);
         out
     }
 
@@ -2317,6 +2344,9 @@ mod tests {
         /// How many formulas [`Engine::is_frozen`] has evaluated on this
         /// thread.
         pub(super) static FROZEN_EVALS: StdCell<usize> = const { StdCell::new(0) };
+        /// How many times [`Engine::take_rev`] has rebuilt the reverse
+        /// dependency map on this thread.
+        pub(super) static REV_BUILDS: StdCell<usize> = const { StdCell::new(0) };
     }
 
     fn wb_one_sheet(cells: &[(&str, Cell)]) -> Workbook {
@@ -3639,6 +3669,99 @@ mod tests {
         assert_eq!(value_at(&wb, "C1"), CellValue::Number(21.0));
         set(&mut eng, &mut wb, "A1", Cell::formula("SEQUENCE(3,1,5,5)"));
         assert_eq!(value_at(&wb, "C1"), CellValue::Number(11.0));
+    }
+
+    #[test]
+    fn rev_cache_reused_across_data_edits() {
+        // #938 plan-rev-cache: two consecutive data edits with no formula
+        // change must not rebuild the reverse dependency map.
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("A2", Cell::number(2.0)),
+            ("A3", Cell::number(3.0)),
+            ("C1", Cell::formula("SUM(A1:A3)")),
+            ("D1", Cell::formula("C1*2")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        set(&mut eng, &mut wb, "A1", Cell::number(10.0)); // warms the cache
+        REV_BUILDS.with(|n| n.set(0));
+        set(&mut eng, &mut wb, "A2", Cell::number(20.0));
+        set(&mut eng, &mut wb, "A3", Cell::number(30.0));
+        assert_eq!(REV_BUILDS.with(StdCell::get), 0);
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(60.0));
+        assert_eq!(value_at(&wb, "D1"), CellValue::Number(120.0));
+    }
+
+    #[test]
+    fn rev_cache_sees_formula_added_by_edit() {
+        // A formula added by an edit must be reachable by a later edit of
+        // the cell it reads — only an invalidated cache gets this right.
+        let mut wb = wb_one_sheet(&[("A1", Cell::number(1.0)), ("C1", Cell::formula("A1+1"))]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        set(&mut eng, &mut wb, "A1", Cell::number(5.0)); // warms the cache
+        set(&mut eng, &mut wb, "B1", Cell::formula("A1*100"));
+        set(&mut eng, &mut wb, "A1", Cell::number(2.0));
+        assert_eq!(value_at(&wb, "B1"), CellValue::Number(200.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(3.0));
+        // A new formula reading another formula is reached through `rev`.
+        set(&mut eng, &mut wb, "E1", Cell::formula("B1+1"));
+        set(&mut eng, &mut wb, "A1", Cell::number(3.0));
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(301.0));
+    }
+
+    #[test]
+    fn rev_cache_drops_removed_formula() {
+        // Replacing a formula with a number changes `formulas`, so it must
+        // drop the cached reverse edges: the removal's own walk rebuilds the
+        // map, and a following plain data edit must not rebuild again.
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("B1", Cell::formula("A1*2")),
+            ("C1", Cell::formula("B1+1")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        set(&mut eng, &mut wb, "A1", Cell::number(9.0)); // warms the cache
+        REV_BUILDS.with(|n| n.set(0));
+        set(&mut eng, &mut wb, "B1", Cell::number(7.0));
+        // The removal dropped the cache, so this edit's walk rebuilt the map.
+        assert_eq!(REV_BUILDS.with(StdCell::get), 1);
+        set(&mut eng, &mut wb, "A1", Cell::number(5.0));
+        // A plain data edit reuses it: no further rebuild.
+        assert_eq!(REV_BUILDS.with(StdCell::get), 1);
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(8.0));
+        assert_eq!(value_at(&wb, "B1"), CellValue::Number(7.0));
+        set(&mut eng, &mut wb, "B1", Cell::formula("A1*3"));
+        set(&mut eng, &mut wb, "A1", Cell::number(2.0));
+        assert_eq!(value_at(&wb, "B1"), CellValue::Number(6.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(7.0));
+    }
+
+    #[test]
+    fn rev_cache_follows_spill_growth() {
+        // Growing the spill under an `A1#` reader moves the reader's dep
+        // rects, so the recalc pass that sees the grown extent must drop the
+        // cache and rebuild it — even though no formula was added or removed.
+        let mut wb = wb_one_sheet(&[
+            ("A1", array_formula("SEQUENCE(B1)")),
+            ("B1", Cell::number(2.0)),
+            ("D1", Cell::formula("SUM(A1#)")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "D1"), CellValue::Number(3.0));
+        set(&mut eng, &mut wb, "H1", Cell::number(1.0)); // warms the cache
+        REV_BUILDS.with(|n| n.set(0));
+        set(&mut eng, &mut wb, "B1", Cell::number(4.0));
+        // At depth 0 the extent is still the old one; the spill grows during
+        // that pass's evaluate, and the nested pass over the spilled cells
+        // sees the grown `A1#` rect, drops the cache, and rebuilds once.
+        assert_eq!(value_at(&wb, "D1"), CellValue::Number(10.0));
+        assert_eq!(REV_BUILDS.with(StdCell::get), 1);
+        set(&mut eng, &mut wb, "H1", Cell::number(2.0));
+        assert_eq!(REV_BUILDS.with(StdCell::get), 1);
     }
 
     #[test]
