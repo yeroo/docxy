@@ -984,12 +984,9 @@ fn status_matches_project_on_the_x_status_corpus() {
     for (file, want) in cases {
         let text = std::fs::read_to_string(dir.join(file)).unwrap();
         let ed = Editor::new(crate::mspdi::read_mspdi(&text).unwrap());
-        for (uid, want) in want.iter().enumerate() {
-            assert_eq!(
-                tv(&ed, uid as i32 + 1, "Status").0,
-                s(want),
-                "{file} uid {uid}"
-            );
+        for (i, want) in want.iter().enumerate() {
+            let uid = i as i32 + 1;
+            assert_eq!(tv(&ed, uid, "Status").0, s(want), "{file} uid {uid}");
         }
     }
 }
@@ -1002,10 +999,13 @@ fn status_matches_project_over_the_x_status_sweep() {
     // values are minute-precise and parse as MSPDI datetimes as-is.
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/snapshots");
     let Ok(text) = std::fs::read_to_string(dir.join("x-status-sweep.json")) else {
+        eprintln!("SKIPPED: corpus/mpp/snapshots/x-status-sweep.json absent");
+        return;
+    };
+    let Ok(base_text) = std::fs::read_to_string(dir.join("x-status.xml")) else {
         eprintln!("SKIPPED: corpus/mpp/snapshots/x-status.xml absent");
         return;
     };
-    let base_text = std::fs::read_to_string(dir.join("x-status.xml")).unwrap();
     let base = crate::mspdi::read_mspdi(&base_text).unwrap();
     // (date, status_date_is_na, wants)
     type Row = (String, bool, Vec<(i32, String)>);

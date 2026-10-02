@@ -92,9 +92,11 @@ plan has neither. Earned-value and custom fields are not readable yet.
 - `value` is what lies underneath: dates `YYYY-MM-DD HH:MM`; durations, work
   and slack signed minutes; money a number of currency units; percents
   integers; flags booleans; enums (Task Mode, Constraint Type, Type, Fixed
-  Cost Accrual) their display names; text strings. It is `null` only for a date
-  that shows `NA` and for a stored quantity the plan does not have (unset %
-  Complete reads `"0%"` and `null`; a stored 0 reads `"0%"` and `0`). Fields
+  Cost Accrual, Status) their display names; text strings. It is `null` only
+  for a date that shows `NA`, for a stored quantity the plan does not have
+  (unset % Complete reads `"0%"` and `null`; a stored 0 reads `"0%"` and `0`),
+  and for Status when the plan has no StatusDate or CurrentDate (or the task
+  no start), which then reads `""` and `null`. Fields
   with a Project default read the default: Active Yes, Priority 500, Type and
   Effort Driven the plan's new-task defaults, Fixed Cost Accrual Prorated.
 - Variances follow the live schedule, not the values a file stores. They

@@ -6,11 +6,13 @@
 //! `($40,000.00)`, `50%`, `Yes`), except for the Entry columns, which keep
 //! the grid's (`2d`, `2026-03-02`). Dates show `YYYY-MM-DD`, `NA` when unset.
 //!
-//! `value` is [`FieldValue::Null`] only for a date that shows `NA` and for a
+//! `value` is [`FieldValue::Null`] only for a date that shows `NA`, for a
 //! stored quantity the plan does not have (percents, actuals, remaining
-//! values, work, cost, fixed cost, baseline values, notes), so a test can
-//! tell it from `0`; such a field's `text` is what Project shows for it (`0%`,
-//! `0 days`, `0 hrs`, `$0.00`). Fields with a Project default read that
+//! values, work, cost, fixed cost, baseline values, notes), and for Status
+//! when the plan has no StatusDate or CurrentDate (or the task no start), so a
+//! test can tell it from `0`; such a field's `text` is what Project shows for
+//! it (`0%`, `0 days`, `0 hrs`, `$0.00`), empty for Status. Fields with a
+//! Project default read that
 //! default in both: Active (Yes), Priority (500), Effort Driven and Type (the
 //! plan's defaults for new tasks), Fixed Cost Accrual (Prorated, as costs
 //! accrue when it is absent or Invalid), Constraint Type (As Soon As
@@ -540,8 +542,8 @@ fn status(ed: &Editor, task: &Task) -> FieldRead {
 /// at % Complete = 100, whatever the status date; Future Task before the
 /// task's Start (minute precision); Late when the status date's calendar day
 /// is after the resume point's; On Schedule otherwise. Days compare as
-/// (year, month, day) pairs, not working time.
-pub(crate) fn task_status(
+/// calendar days, not working time.
+fn task_status(
     percent: Option<u8>,
     start: DateTime,
     resume_point: DateTime,
@@ -553,11 +555,7 @@ pub(crate) fn task_status(
     if status_date < start {
         return "Future Task";
     }
-    let day = |d: DateTime| {
-        let p = d.parts();
-        (p.year, p.month, p.day)
-    };
-    if day(status_date) > day(resume_point) {
+    if status_date.day_number() > resume_point.day_number() {
         return "Late";
     }
     "On Schedule"
