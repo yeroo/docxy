@@ -1185,6 +1185,15 @@ impl Editor {
             self.delete_selection();
         }
         self.checkpoint(EditKind::Structural);
+        self.paste_at_caret(clip);
+    }
+
+    /// [`Editor::paste`]'s insertion at the caret, with no undo step of its
+    /// own: a caller that inserts several pieces as one edit checkpoints once.
+    fn paste_at_caret(&mut self, clip: &Clip) {
+        if clip.paras.is_empty() {
+            return;
+        }
         let off = self.caret.offset;
         let n = clip.paras.len();
         let in_cover = self.caret_in_cover();
@@ -1540,8 +1549,8 @@ impl Editor {
     }
 
     /// Wrap the current selection in comment markers for comment `id` (the
-    /// reference run + range start/end go around the selected text). Returns false
-    /// if there is no selection.
+    /// reference run + range start/end go around the selected text), as one
+    /// undo step. Returns false if there is no selection.
     pub fn add_comment(&mut self, id: &str) -> bool {
         let spans = self.selection_spans();
         let (Some((spath, soff, _)), Some((epath, _, eoff))) = (spans.first(), spans.last()) else {
@@ -1555,7 +1564,7 @@ impl Editor {
             path: epath,
             offset: eoff,
         };
-        self.paste(&Clip {
+        self.paste_at_caret(&Clip {
             paras: vec![vec![
                 Inline::Raw(format!("<w:commentRangeEnd w:id=\"{id}\"/>")),
                 Inline::Raw(format!("<w:r><w:commentReference w:id=\"{id}\"/></w:r>")),
@@ -1565,7 +1574,7 @@ impl Editor {
             path: spath,
             offset: soff,
         };
-        self.paste(&Clip {
+        self.paste_at_caret(&Clip {
             paras: vec![vec![Inline::Raw(format!(
                 "<w:commentRangeStart w:id=\"{id}\"/>"
             ))]],
@@ -4186,6 +4195,34 @@ mod tests {
         assert!(ed.undo());
         assert_eq!(ed.doc, d);
         assert!(!ed.undo());
+    }
+
+    /// #620: adding a comment is one undo step that takes all three markers,
+    /// and redo puts all three back where they were.
+    #[test]
+    fn add_comment_is_one_undo_step() {
+        let before = doc(&["The quick brown fox."]);
+        let mut ed = Editor::new(before.clone());
+        ed.anchor = Some(Caret {
+            path: vec![0],
+            offset: 10,
+        });
+        ed.caret.offset = 15;
+        assert!(ed.add_comment("1"));
+        let added = ed.doc.clone();
+        let xml = crate::serialize::document_to_xml(&added);
+        assert_eq!(xml.matches("w:id=\"1\"").count(), 3, "{xml}");
+        assert!(ed.undo());
+        assert_eq!(ed.doc, before);
+        assert!(!ed.undo(), "one step only");
+        assert!(ed.redo());
+        assert_eq!(ed.doc, added);
+        assert_eq!(
+            crate::inspect::comment_marker_ids(&ed.doc)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["1"]
+        );
     }
 
     #[test]

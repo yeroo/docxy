@@ -24,6 +24,15 @@ pub struct Comment {
     pub quoted: String,
 }
 
+/// A reviewer's initials as Word derives them from the user name: the first
+/// letter of each word, uppercased (`Jane doe` is `JD`).
+pub fn initials(name: &str) -> String {
+    name.split_whitespace()
+        .filter_map(|w| w.chars().next())
+        .flat_map(char::to_uppercase)
+        .collect()
+}
+
 /// Parse every comment in `pkg`, ordered by where each is anchored in the body.
 pub fn parse_comments(pkg: &Package) -> Vec<Comment> {
     let xml = match pkg.part("word/comments.xml") {
@@ -184,6 +193,14 @@ fn anchors(doc: &str) -> (HashMap<String, usize>, HashMap<String, String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initials_of_name() {
+        assert_eq!(initials("Jane doe"), "JD");
+        assert_eq!(initials("  ada   lovelace byron "), "ALB");
+        assert_eq!(initials("boris"), "B");
+        assert_eq!(initials(""), "");
+    }
 
     #[test]
     fn parses_author_date_and_text() {

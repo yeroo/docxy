@@ -478,6 +478,63 @@ pub fn has_comment_markers(doc: &Document) -> bool {
     count_blocks(&doc.body, Target::CommentMarkers(None)) > 0
 }
 
+/// The `w:id` of every comment marker (range start/end or reference) in the
+/// body, wherever [`has_comment_markers`] would find it. A host uses it to
+/// tell whether a comment it added is still anchored (#620).
+pub fn comment_marker_ids(doc: &Document) -> std::collections::BTreeSet<String> {
+    let mut ids = std::collections::BTreeSet::new();
+    marker_ids_in_blocks(&doc.body, &mut ids);
+    ids
+}
+
+fn marker_ids_in_blocks(blocks: &[Block], ids: &mut std::collections::BTreeSet<String>) {
+    for b in blocks {
+        match b {
+            Block::Paragraph(p) => marker_ids_in_inlines(&p.content, ids),
+            Block::Table(t) => {
+                for cell in t.rows.iter().flat_map(|row| &row.cells) {
+                    marker_ids_in_blocks(&cell.blocks, ids);
+                }
+            }
+            Block::Raw(raw) => marker_ids_in_xml(raw, ids),
+            Block::SectionProperties(_) => {}
+        }
+    }
+}
+
+fn marker_ids_in_inlines(content: &[Inline], ids: &mut std::collections::BTreeSet<String>) {
+    for inline in content {
+        if let Some(raw) = marker_raw(inline) {
+            marker_ids_in_xml(raw, ids);
+        }
+        match inline {
+            Inline::Hyperlink(h) => marker_ids_in_inlines(&h.content, ids),
+            Inline::Revision { content, .. } => marker_ids_in_inlines(content, ids),
+            // The raw holds the loaded copies; the blocks hold any edit.
+            Inline::TextBox { raw, blocks } => {
+                marker_ids_in_xml(raw, ids);
+                marker_ids_in_blocks(blocks, ids);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn marker_ids_in_xml(xml: &str, ids: &mut std::collections::BTreeSet<String>) {
+    for name in MARKER_TAGS {
+        let mut from = 0;
+        while let Some((start, end, _)) = find_element_from(xml, name, from) {
+            if let Some(head) = tag_end(&xml[start..end]) {
+                let mut p = XmlParser::new(&xml[start..start + head]);
+                if p.next() == Event::Start {
+                    ids.insert(p.attr("w:id").to_string());
+                }
+            }
+            from = end;
+        }
+    }
+}
+
 /// Remove every comment marker of every comment from the body. Returns how many.
 pub fn remove_all_comment_markers(doc: &mut Document) -> usize {
     remove_blocks(&mut doc.body, Target::CommentMarkers(None))
@@ -674,6 +731,16 @@ mod tests {
             parts.push((name.to_string(), xml.as_bytes().to_vec()));
         }
         load_package(&write_zip(&parts)).unwrap()
+    }
+
+    #[test]
+    fn comment_marker_ids_collects_start_end_and_reference() {
+        let doc = parse(
+            "<w:p><w:commentRangeStart w:id=\"1\"/><w:r><w:t>a</w:t></w:r>             <w:commentRangeEnd w:id=\"1\"/><w:r><w:commentReference w:id=\"1\"/></w:r></w:p>             <w:commentRangeStart w:id=\"4\"/>             <w:tbl><w:tr><w:tc><w:p><w:hyperlink w:anchor=\"x\"><w:r><w:t>b</w:t></w:r>             <w:commentRangeEnd w:id=\"4\"/></w:hyperlink></w:p></w:tc></w:tr></w:tbl>             <w:p><w:r><w:t>c</w:t><w:commentReference w:id=\"10\"/></w:r></w:p>",
+        );
+        let ids: Vec<String> = comment_marker_ids(&doc).into_iter().collect();
+        assert_eq!(ids, ["1", "10", "4"]);
+        assert!(comment_marker_ids(&parse("<w:p><w:r><w:t>x</w:t></w:r></w:p>")).is_empty());
     }
 
     const VISIBLE: &str = "<w:r><w:t>keep</w:t></w:r>";
