@@ -1423,10 +1423,10 @@ impl Package {
                 .find_map(|(k, variant, part)| part.is_none().then_some((k, variant)))
         };
         while let Some((k, variant)) = empty_slot(self, sect_prs) {
-            self.ensure_styles(&["Header"]);
             let Some((rid, _)) = self.create_hf_part(true, "<w:p/>") else {
                 break;
             };
+            self.ensure_styles(&["Header"]);
             let linked =
                 crate::sect::set_hf_reference(&sect_prs[k], true, variant.as_ooxml(), Some(&rid));
             let before = std::mem::replace(&mut sect_prs[k], linked);
@@ -1538,8 +1538,22 @@ impl Package {
             };
             let new = match spec {
                 Some(spec) if shown.contains(name) => {
-                    n += 1;
-                    crate::watermark::insert_watermark(&xml, spec, n)
+                    // The same watermark again, under its own number, is no
+                    // change: the part stays as it is.
+                    let own = xml.find(crate::watermark::SHAPE_ID).and_then(|i| {
+                        xml[i + crate::watermark::SHAPE_ID.len()..]
+                            .split(|c: char| !c.is_ascii_digit())
+                            .next()?
+                            .parse::<u32>()
+                            .ok()
+                    });
+                    match own.map(|m| crate::watermark::insert_watermark(&xml, spec, m)) {
+                        Some(same) if same == xml => same,
+                        _ => {
+                            n += 1;
+                            crate::watermark::insert_watermark(&xml, spec, n)
+                        }
+                    }
                 }
                 _ => crate::watermark::strip_watermarks(&xml),
             };
@@ -1602,7 +1616,9 @@ impl Package {
     /// block XML inside `w:hdr`/`w:ftr`), with its `[Content_Types].xml`
     /// override and a `document.xml.rels` relationship, but no section
     /// reference: the caller decides which section references it (see
-    /// [`crate::sect::set_hf_reference`]). The relationship id and part name.
+    /// [`crate::sect::set_hf_reference`]). The relationship id and part name;
+    /// `None` when the package cannot reference a new part (see
+    /// [`Package::add_hf_part`]), and then nothing is added.
     pub fn create_hf_part(
         &mut self,
         is_header: bool,
@@ -1623,7 +1639,9 @@ impl Package {
     /// Previous turned off): the bytes as they are, and its own `_rels` part
     /// when it has one, so the copy's pictures and links resolve through the
     /// same relationship ids. The kind follows the source's root element. The
-    /// new relationship id and part name; `None` when `src` is missing.
+    /// new relationship id and part name; `None` when `src` is missing or
+    /// the package cannot reference a new part (see [`Package::add_hf_part`]),
+    /// and then nothing is added.
     pub fn copy_hf_part(&mut self, src: &str) -> Option<(String, String)> {
         let bytes = self.part(src)?.to_vec();
         let is_header = decode_xml_part(&bytes)
@@ -1635,7 +1653,11 @@ impl Package {
 
     /// Store a header/footer part under a fresh `word/{header|footer}N.xml`
     /// name, with its optional own `_rels`, a content-type override and a
-    /// document relationship.
+    /// document relationship. A missing `document.xml.rels` is created (as
+    /// [`Package::add_media_part`] does). `None`, with nothing added, when
+    /// the package cannot reference a new part: `document.xml.rels` has no
+    /// `Relationships` root, or `[Content_Types].xml` (when present) has no
+    /// `Types` root.
     fn add_hf_part(
         &mut self,
         is_header: bool,
@@ -1665,8 +1687,15 @@ impl Package {
         // A fresh relationship id from document.xml.rels, and the
         // relationship and content-type override, worked out before anything
         // is added: a part the package cannot reference is not added at all.
+        const RELS_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
         let rels_name = "word/_rels/document.xml.rels";
-        let rels_xml = String::from_utf8_lossy(self.part(rels_name)?).into_owned();
+        let rels_xml = match self.part(rels_name) {
+            Some(b) => String::from_utf8_lossy(b).into_owned(),
+            None => format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n\
+                 <Relationships xmlns=\"{RELS_NS}\"></Relationships>"
+            ),
+        };
         let rid = next_rid(&rels_xml);
         let rel =
             format!("<Relationship Id=\"{rid}\" Type=\"{R_NS}/{kind}\" Target=\"{target}\"/>");
@@ -1686,7 +1715,10 @@ impl Package {
             self.parts.push((name, rels));
         }
 
-        self.set_part(rels_name, new_rels.into_bytes());
+        if !self.set_part(rels_name, new_rels.clone().into_bytes()) {
+            self.parts
+                .push((rels_name.to_string(), new_rels.into_bytes()));
+        }
         if let Some(new_ct) = new_ct {
             self.set_part("[Content_Types].xml", new_ct.into_bytes());
         }
@@ -5448,6 +5480,20 @@ mod tests {
         assert_eq!(headers(&pkg), 0);
         assert!(!sects[0].contains("headerReference"));
         assert!(pkg.create_hf_part(true, "<w:p/>").is_none());
+    }
+
+    /// A document with no `document.xml.rels` gets one with the header's
+    /// relationship, so its watermark resolves.
+    #[test]
+    fn text_watermark_creates_missing_document_relationships() {
+        use crate::watermark::TextWatermarkSpec;
+        let mut pkg = hf_pkg();
+        pkg.parts
+            .retain(|(n, _)| n != "word/_rels/document.xml.rels");
+        assert!(pkg.apply_text_watermark(Some(&TextWatermarkSpec::preset("DRAFT", true))));
+        assert_eq!(pkg.watermarks().len(), 1);
+        let rels = pkg.part_text("word/_rels/document.xml.rels").unwrap();
+        assert!(rels.contains("Target=\"header1.xml\""), "{rels}");
     }
 
     /// A self-closing `[Content_Types].xml` root takes the override.
