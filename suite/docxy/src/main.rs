@@ -11964,6 +11964,7 @@ impl Docxy {
     /// text.
     fn sheet_format_as_table(&mut self, cx: &mut Context<Self>) {
         use gridcore::sheet::CellValue;
+        let mut refused = None;
         self.sheet_try_edit(true, |v| {
             let s = v.active;
             let (max_r, max_c) = v.extent();
@@ -12005,13 +12006,25 @@ impl Docxy {
                     let has_header = (c1..=c2).all(|c| {
                         matches!(sh.cell(r1, c).map(|cl| &cl.value), Some(CellValue::Text(_)))
                     });
-                    v.pkg
+                    match v
+                        .pkg
                         .add_table(s, (r1, c1, r2, c2), has_header, "TableStyleMedium2")
-                        .is_some()
+                    {
+                        Ok(_) => true,
+                        Err(why) => {
+                            refused = Some(why);
+                            false
+                        }
+                    }
                 }
                 None => true,
             }
         });
+        // Say why Excel's rules refused it (over another table, a PivotTable
+        // or an array formula), not that the sheet is damaged.
+        if let Some(why) = refused {
+            self.set_status(why);
+        }
         cx.notify();
     }
 

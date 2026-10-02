@@ -1565,6 +1565,13 @@ pub struct Workbook {
     pub styles: Styles,
     pub defined_names: Vec<DefinedName>,
     pub tables: Vec<Table>,
+    /// Tables converted to a range ([`crate::edit::convert_table_to_range`])
+    /// whose parts are still in the package: a save drops each part that no
+    /// table in [`Self::tables`] uses any more, together with its
+    /// relationship, `<tablePart>` and content type. Only parts named here
+    /// are ever dropped, so a table part the loader couldn't read is kept.
+    /// Undo restores this list with the tables, which brings a part back.
+    pub removed_tables: Vec<Table>,
     /// Pivot tables (parsed read-only from their preserved parts, so they
     /// can be refreshed from current source data).
     pub pivots: Vec<crate::pivot::Pivot>,

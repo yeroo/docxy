@@ -480,6 +480,7 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
             styles,
             defined_names,
             tables,
+            removed_tables: Vec::new(),
             pivots,
             date1904,
             iterate,
@@ -3013,21 +3014,8 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
         }
     }
 
-    // --- table geometry: row edits move table ranges; the part must follow --
-    for t in &wb.tables {
-        let Some(p) = parts.iter_mut().find(|(n, _)| n == &t.part) else {
-            continue;
-        };
-        let xml = String::from_utf8_lossy(&p.1).into_owned();
-        let (r1, c1, r2, c2) = t.range;
-        let full = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
-        let mut updated = patch_ref_attr(&xml, "<table", &full);
-        // autoFilter covers the table minus its totals row.
-        let af_r2 = r2.saturating_sub(t.totals_rows).max(r1);
-        let af = format!("{}:{}", cell_name(r1, c1), cell_name(af_r2, c2));
-        updated = patch_ref_attr(&updated, "<autoFilter", &af);
-        p.1 = updated.into_bytes();
-    }
+    // --- tables: geometry, names, columns and conversions reach the parts --
+    sync_table_parts(&mut parts, wb);
 
     // --- pivots: patch the refreshed location, ask Excel to rebuild --------
     // Refresh may have grown/shrunk the output region; the location ref must
@@ -3052,8 +3040,14 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
             // and would force a wholesale table-definition rewrite it doesn't
             // need), so this is the only place the persisted source-sheet name
             // gets corrected.
-            if let crate::pivot::PivotSource::Range { sheet, .. } = &piv.source {
-                xml = patch_worksheet_source_sheet(&xml, sheet);
+            match &piv.source {
+                crate::pivot::PivotSource::Range { sheet, .. } => {
+                    xml = patch_worksheet_source_sheet(&xml, sheet);
+                }
+                // A renamed source table: the cache names it.
+                crate::pivot::PivotSource::Table(name) => {
+                    xml = patch_worksheet_source_name(&xml, name);
+                }
             }
             p.1 = set_refresh_on_load(&xml).into_bytes();
         }
@@ -5624,6 +5618,353 @@ fn set_refresh_on_load(xml: &str) -> String {
     }
 }
 
+/// The `<table>` root of a table part: its start position and an attribute's
+/// decoded value (empty when it has none).
+fn table_root_attr(xml: &str, attr: &str) -> Option<(usize, String)> {
+    let mut p = XmlParser::new(xml);
+    loop {
+        match p.next() {
+            Event::Start => {
+                let value = p
+                    .attrs()
+                    .iter()
+                    .find(|a| local(a.name) == attr)
+                    .map(|a| decode(a.value))
+                    .unwrap_or_default();
+                return Some((p.start_pos(), value));
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
+}
+
+/// The name formulas knew a table part by when it was loaded (or written by
+/// [`SheetPackage::add_table`]): its `displayName`, else its `name`. Save
+/// never changes the package's own parts, so this is still the loaded name
+/// after any number of renames and saves.
+fn table_part_name(xml: &str) -> Option<String> {
+    let (_, display) = table_root_attr(xml, "displayName")?;
+    if !display.is_empty() {
+        return Some(display);
+    }
+    table_root_attr(xml, "name").map(|(_, n)| n)
+}
+
+/// Every child element of the element spanning `xml[span]` whose local name
+/// is `name`: (start, end) in `xml`.
+fn child_spans(xml: &str, span: (usize, usize), name: &str) -> Vec<(usize, usize)> {
+    element_children(&xml[span.0..span.1])
+        .into_iter()
+        .filter(|(n, _, _)| n == name)
+        .map(|(_, s, e)| (span.0 + s, span.0 + e))
+        .collect()
+}
+
+/// The table part's `<table>` children named `name`: (start, end).
+fn table_children(xml: &str, name: &str) -> Vec<(usize, usize)> {
+    let Some((root, _)) = table_root_attr(xml, "ref") else {
+        return Vec::new();
+    };
+    let mut p = XmlParser::new(&xml[root..]);
+    p.next();
+    if !p.skip_element_complete() {
+        return Vec::new();
+    }
+    child_spans(xml, (root, root + p.pos()), name)
+}
+
+/// `xml` with the spans in `edits` replaced (they must not overlap).
+fn splice(xml: &str, mut edits: Vec<(usize, usize, String)>) -> String {
+    edits.sort_by_key(|e| std::cmp::Reverse(e.0));
+    let mut out = xml.to_string();
+    for (s, e, text) in edits {
+        out.replace_range(s..e, &text);
+    }
+    out
+}
+
+/// A table converted to a range whose part a save drops: the name other
+/// table parts' formulas know it by, and where its cells are.
+struct ConvertedTable {
+    part: String,
+    loaded_name: String,
+    sheet: usize,
+    sheet_name: String,
+    info: crate::formula::TableInfo,
+}
+
+/// The formulas a table part holds in its columns (`calculatedColumnFormula`,
+/// `totalsRowFormula`) with tables renamed (`renames`, old → new, applied at
+/// once) and converted tables' references turned into cells. `own_sheet` is
+/// the sheet of the table whose part this is. A formula that doesn't parse,
+/// or that nothing touches, keeps its text.
+fn rewrite_column_formulas(
+    xml: &str,
+    own_sheet: usize,
+    renames: &[(String, String)],
+    converted: &[ConvertedTable],
+) -> String {
+    let mut edits = Vec::new();
+    let mut p = XmlParser::new(xml);
+    loop {
+        match p.next() {
+            Event::Start
+                if matches!(
+                    local(p.name()),
+                    "calculatedColumnFormula" | "totalsRowFormula"
+                ) =>
+            {
+                let start = p.start_pos();
+                let body = tag_end(xml, start);
+                if !p.skip_element_complete() || xml[..body].ends_with("/>") {
+                    continue;
+                }
+                let end = p.pos();
+                let Some(close) = xml[..end].rfind("</").filter(|&c| c >= body) else {
+                    continue;
+                };
+                let Ok(ast) = crate::formula::parse(&decode(&xml[body..close])) else {
+                    continue;
+                };
+                let mut out = ast.clone();
+                for c in converted {
+                    let target = crate::formula::TableToRange {
+                        name: &c.loaded_name,
+                        sheet_name: &c.sheet_name,
+                        info: &c.info,
+                    };
+                    let host = crate::formula::FormulaHost {
+                        same_sheet: c.sheet == own_sheet,
+                        row: None,
+                        inside: false,
+                    };
+                    out = crate::formula::table_refs_to_cells_in_expr(&out, &target, host);
+                }
+                out = crate::formula::rename_tables_in_expr(&out, renames);
+                if out != ast {
+                    edits.push((body, close, esc_text(&crate::formula::to_string(&out))));
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    splice(xml, edits)
+}
+
+/// Bring a table part's `<tableColumns>` to `columns`: a column the part
+/// already has (by name) keeps its element, id and children; a new one gets
+/// the next free id; a dropped one goes. The autoFilter's `filterColumn`s
+/// follow their columns (`colId` is a column index) or go with them.
+fn sync_table_columns(xml: &str, columns: &[String]) -> String {
+    let Some(&span) = table_children(xml, "tableColumns").first() else {
+        return xml.to_string();
+    };
+    let elements: Vec<(String, u32, &str)> = child_spans(xml, span, "tableColumn")
+        .into_iter()
+        .map(|(s, e)| {
+            let tag = &xml[s..tag_end(xml, s)];
+            let name = tag_attr(tag, "name").map(decode).unwrap_or_default();
+            let id = tag_attr(tag, "id")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            (name, id, &xml[s..e])
+        })
+        .collect();
+    let old: Vec<&str> = elements.iter().map(|(n, _, _)| n.as_str()).collect();
+    if old.len() == columns.len() && old.iter().zip(columns).all(|(a, b)| *a == b) {
+        return xml.to_string();
+    }
+    let open = &xml[span.0..tag_end(xml, span.0)];
+    let qname = open[1..]
+        .split(|c: char| c.is_whitespace() || c == '/' || c == '>')
+        .next()
+        .unwrap_or("tableColumns");
+    let prefix = qname
+        .rsplit_once(':')
+        .map_or(String::new(), |(p, _)| format!("{p}:"));
+    let mut next_id = elements.iter().map(|(_, id, _)| *id).max().unwrap_or(0);
+    let mut used = vec![false; elements.len()];
+    let mut body = String::new();
+    for name in columns {
+        let found = (0..elements.len())
+            .find(|&i| !used[i] && elements[i].0 == *name)
+            .or_else(|| {
+                (0..elements.len()).find(|&i| !used[i] && elements[i].0.eq_ignore_ascii_case(name))
+            });
+        match found {
+            Some(i) => {
+                used[i] = true;
+                body.push_str(elements[i].2);
+            }
+            None => {
+                next_id += 1;
+                body.push_str(&format!(
+                    "<{prefix}tableColumn id=\"{next_id}\" name=\"{}\"/>",
+                    esc_attr(name)
+                ));
+            }
+        }
+    }
+    let block = format!("<{qname} count=\"{}\">{body}</{qname}>", columns.len());
+    let mut edits = vec![(span.0, span.1, block)];
+    // A filter on column k of the old columns moves to that column's new
+    // index, or goes when the column did.
+    if let Some(&af) = table_children(xml, "autoFilter").first() {
+        for (s, e) in child_spans(xml, af, "filterColumn") {
+            let tag_end_at = tag_end(xml, s);
+            let col_id =
+                tag_attr(&xml[s..tag_end_at], "colId").and_then(|v| v.parse::<usize>().ok());
+            let moved = col_id
+                .and_then(|k| old.get(k))
+                .and_then(|n| columns.iter().position(|c| c.eq_ignore_ascii_case(n)));
+            match moved {
+                Some(k) if Some(k) == col_id => {}
+                Some(k) => {
+                    let el = set_tag_attr(&xml[s..e], 0, "colId", Some(&k.to_string()));
+                    edits.push((s, e, el));
+                }
+                None => edits.push((s, e, String::new())),
+            }
+        }
+    }
+    splice(xml, edits)
+}
+
+/// `xml` without any `<sortState>` (the table's own or its autoFilter's):
+/// its refs name the old range, and Excel repairs a file whose sort state
+/// lies outside its table.
+fn drop_sort_state(xml: &str) -> String {
+    let mut out = xml.to_string();
+    while let Some((s, e)) = element_span_by_tags(&out, "sortState") {
+        out.replace_range(s..e, "");
+    }
+    out
+}
+
+/// Remove a converted table's part from the package: the worksheet
+/// relationship naming it, that worksheet's `<tablePart>` (and `<tableParts>`
+/// when it was the last), then the part itself with its content type.
+fn drop_table_part(parts: &mut Vec<(String, Vec<u8>)>, part: &str) {
+    let mut owner: Option<(String, String)> = None;
+    for (name, bytes) in parts.iter_mut() {
+        let Some((dir, file)) = name
+            .rsplit_once("/_rels/")
+            .and_then(|(d, f)| Some((d.to_string(), f.strip_suffix(".rels")?.to_string())))
+        else {
+            continue;
+        };
+        let mut xml = String::from_utf8_lossy(bytes).into_owned();
+        let hit = parse_rels(&xml)
+            .into_iter()
+            .find(|(_, ty, t)| ty.ends_with("/table") && resolve_relative(&dir, t) == part);
+        let Some((id, _, _)) = hit else {
+            continue;
+        };
+        if let Some(el) = find_element_by_attr(&xml, "Relationship", "Id", |v| v == id) {
+            xml.replace_range(el.start..el.end, "");
+        }
+        *bytes = xml.into_bytes();
+        owner = Some((format!("{dir}/{file}"), id));
+        break;
+    }
+    if let Some((ws, id)) = owner {
+        if let Some(p) = parts.iter_mut().find(|(n, _)| *n == ws) {
+            let mut xml = String::from_utf8_lossy(&p.1).into_owned();
+            if let Some(el) = find_element_by_attr(&xml, "tablePart", "id", |v| v == id) {
+                xml.replace_range(el.start..el.end, "");
+                if let Some((s, e)) = worksheet_child_span(&xml, "tableParts") {
+                    let left = element_children(&xml[s..e])
+                        .iter()
+                        .filter(|(n, _, _)| n == "tablePart")
+                        .count();
+                    xml = if left == 0 {
+                        remove_worksheet_child(&xml, "tableParts")
+                    } else {
+                        set_tag_attr(&xml, s, "count", Some(&left.to_string()))
+                    };
+                }
+            }
+            p.1 = xml.into_bytes();
+        }
+    }
+    drop_parts_cascading(parts, part);
+}
+
+/// Bring the table parts in line with the model: each table's range, name
+/// and columns, the column formulas of every part (renamed and converted
+/// tables), and the parts of tables converted to a range dropped.
+fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
+    let part_xml = |parts: &[(String, Vec<u8>)], name: &str| {
+        parts
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
+    };
+    let renames: Vec<(String, String)> = wb
+        .tables
+        .iter()
+        .filter_map(|t| {
+            let loaded = table_part_name(&part_xml(parts, &t.part)?)?;
+            (loaded != t.name).then(|| (loaded, t.name.clone()))
+        })
+        .collect();
+    let converted: Vec<ConvertedTable> = wb
+        .removed_tables
+        .iter()
+        .filter(|r| !wb.tables.iter().any(|t| t.part == r.part))
+        .filter_map(|r| {
+            let loaded_name = table_part_name(&part_xml(parts, &r.part)?)?;
+            Some(ConvertedTable {
+                part: r.part.clone(),
+                loaded_name,
+                sheet: r.sheet,
+                sheet_name: wb.sheets.get(r.sheet)?.name.clone(),
+                info: crate::formula::TableInfo {
+                    sheet: r.sheet,
+                    range: r.range,
+                    header_rows: r.header_rows,
+                    totals_rows: r.totals_rows,
+                    columns: r.columns.clone(),
+                },
+            })
+        })
+        .collect();
+    for t in &wb.tables {
+        let Some(p) = parts.iter_mut().find(|(n, _)| n == &t.part) else {
+            continue;
+        };
+        let xml = String::from_utf8_lossy(&p.1).into_owned();
+        let (r1, c1, r2, c2) = t.range;
+        let full = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
+        let moved = table_root_attr(&xml, "ref").is_some_and(|(_, r)| r != full);
+        let mut updated = patch_ref_attr(&xml, "<table", &full);
+        // autoFilter covers the table minus its totals row.
+        let af_r2 = r2.saturating_sub(t.totals_rows).max(r1);
+        let af = format!("{}:{}", cell_name(r1, c1), cell_name(af_r2, c2));
+        updated = patch_ref_attr(&updated, "<autoFilter", &af);
+        if moved {
+            updated = drop_sort_state(&updated);
+        }
+        if table_part_name(&updated).is_some_and(|n| n != t.name) {
+            for attr in ["name", "displayName"] {
+                if let Some((root, _)) = table_root_attr(&updated, attr) {
+                    updated = set_tag_attr(&updated, root, attr, Some(&esc_attr(&t.name)));
+                }
+            }
+        }
+        updated = sync_table_columns(&updated, &t.columns);
+        if !renames.is_empty() || !converted.is_empty() {
+            updated = rewrite_column_formulas(&updated, t.sheet, &renames, &converted);
+        }
+        p.1 = updated.into_bytes();
+    }
+    for c in &converted {
+        drop_table_part(parts, &c.part);
+    }
+}
+
 fn patch_ref_attr(xml: &str, prefix: &str, new_ref: &str) -> String {
     let Some(el) = xml.find(prefix) else {
         return xml.to_string();
@@ -5664,6 +6005,18 @@ fn patch_worksheet_source_sheet(xml: &str, new_sheet: &str) -> String {
     let mut out = xml.to_string();
     out.replace_range(vs..vs + ve, &esc_attr(new_sheet));
     out
+}
+
+/// Point a pivot cache's `<worksheetSource name="…">` at table `name`; a
+/// no-op for a range source (no `name`) or when it already does.
+fn patch_worksheet_source_name(xml: &str, name: &str) -> String {
+    let Some(el) = xml.find("<worksheetSource") else {
+        return xml.to_string();
+    };
+    match attr_at(xml, el, "name") {
+        Some(cur) if decode(cur) != name => set_tag_attr(xml, el, "name", Some(&esc_attr(name))),
+        _ => xml.to_string(),
+    }
 }
 
 /// Update count/uniqueCount attributes on `<sst …>`.
@@ -6524,18 +6877,27 @@ impl SheetPackage {
     /// from the header row when `has_header` (else "Column1"…). Wires the OPC (a
     /// `xl/tables/table*.xml` part, its content type, a worksheet `/table` rel +
     /// `<tableParts>`) and the model, so it round-trips and Excel styles it with
-    /// the given `style` (e.g. "TableStyleMedium2"). Returns the table index.
+    /// the given `style` (e.g. "TableStyleMedium2"). Returns the table index,
+    /// or why it can't: as Excel does, a table can't overlap another table, a
+    /// PivotTable or part of a multi-cell array formula
+    /// ([`crate::edit::table_range_conflict`]).
     pub fn add_table(
         &mut self,
         sheet: usize,
         range: (u32, u32, u32, u32),
         has_header: bool,
         style: &str,
-    ) -> Option<usize> {
+    ) -> Result<usize, String> {
         // Asked before any part, rel or content type is written, so a refusal
         // leaves the package exactly as it was.
-        if sheet >= self.workbook.sheets.len() || !self.sheet_takes(sheet, "tableParts", true) {
-            return None;
+        if sheet >= self.workbook.sheets.len() {
+            return Err("There is no such sheet".into());
+        }
+        if let Some(why) = crate::edit::table_range_conflict(&self.workbook, sheet, range, None) {
+            return Err(why);
+        }
+        if !self.sheet_takes(sheet, "tableParts", true) {
+            return Err("This sheet's file can't take a table".into());
         }
         let (r1, c1, r2, c2) = range;
         let mut tn = 1;
@@ -6630,7 +6992,7 @@ impl SheetPackage {
             columns: names,
             part,
         });
-        Some(self.workbook.tables.len() - 1)
+        Ok(self.workbook.tables.len() - 1)
     }
 
     /// Remove all conditional-formatting rules from `sheet` (model + the
@@ -7374,7 +7736,9 @@ impl SheetPackage {
         // tables, printer settings), each with its content-type Override.
         drop_parts_cascading(&mut self.parts, &part_name);
         self.workbook.tables.retain(|t| t.sheet != idx);
-        for t in &mut self.workbook.tables {
+        self.workbook.removed_tables.retain(|t| t.sheet != idx);
+        let wb = &mut self.workbook;
+        for t in wb.tables.iter_mut().chain(wb.removed_tables.iter_mut()) {
             if t.sheet > idx {
                 t.sheet -= 1;
             }
@@ -7647,6 +8011,7 @@ pub(crate) fn new_xlsx_sheets(names: &[String]) -> SheetPackage {
                 xfs: vec![Xf::default()],
                 ..Default::default()
             },
+            removed_tables: Vec::new(),
             defined_names: Vec::new(),
             tables: Vec::new(),
             pivots: Vec::new(),
@@ -16500,7 +16865,7 @@ mod ct_worksheet_order_tests {
         assert!(pkg.add_data_validation(0, (0, 1, 1, 1), "whole", "between", "1", Some("9")));
         assert!(
             pkg.add_table(0, (0, 0, 1, 1), true, "TableStyleMedium2")
-                .is_some()
+                .is_ok()
         );
         assert!(pkg.add_chart(0, (0, 3), (10, 8), &chart()));
         assert!(pkg.set_comment(0, 0, 0, "A", "note"));
@@ -16633,7 +16998,7 @@ mod ct_worksheet_order_tests {
         let workbook = pkg.workbook.clone();
         assert!(
             pkg.add_table(0, (0, 0, 1, 1), true, "TableStyleMedium2")
-                .is_none()
+                .is_err()
         );
         assert!(!pkg.add_chart(0, (0, 3), (10, 8), &chart()));
         assert!(!pkg.set_comment(0, 0, 0, "A", "note"));
@@ -18173,5 +18538,316 @@ mod rule_shift_tests {
             expr_cf("B1", "B1=2")
         );
         add_into_misordered(&body, 1, &[("A2", "A2=1"), ("B2", "B2=2")]);
+    }
+}
+
+#[cfg(test)]
+mod table_command_tests {
+    use super::*;
+    use crate::edit::{convert_table_to_range, rename_table, resize_table};
+    use crate::sheet::{Cell, DefinedName};
+
+    fn text(pkg: &SheetPackage, part: &str) -> String {
+        String::from_utf8(pkg.part(part).unwrap_or_default().to_vec()).unwrap()
+    }
+
+    fn reload(pkg: &SheetPackage) -> SheetPackage {
+        load_xlsx(&save_xlsx(pkg)).unwrap()
+    }
+
+    /// Sheet1: Item/Qty over A1:B3 as `Table1`, `=SUM(Table1[Qty])` in D1.
+    fn one_table() -> SheetPackage {
+        let mut pkg = new_xlsx();
+        let s = &mut pkg.workbook.sheets[0];
+        s.set_cell(0, 0, Cell::text("Item"));
+        s.set_cell(0, 1, Cell::text("Qty"));
+        s.set_cell(1, 0, Cell::text("Pen"));
+        s.set_cell(1, 1, Cell::number(3.0));
+        s.set_cell(2, 0, Cell::text("Ink"));
+        s.set_cell(2, 1, Cell::number(4.0));
+        s.set_cell(0, 3, Cell::formula("SUM(Table1[Qty])"));
+        pkg.add_table(0, (0, 0, 2, 1), true, "TableStyleMedium2")
+            .unwrap();
+        pkg
+    }
+
+    /// Give the `name` column of the table in `part` a calculated-column
+    /// formula, as Excel writes them.
+    fn calculated(pkg: &mut SheetPackage, part: &str, name: &str, formula: &str) {
+        let xml = text(pkg, part);
+        let at = xml.find(&format!("name=\"{name}\"/>")).unwrap();
+        let end = at + format!("name=\"{name}\"/>").len();
+        let el = format!(
+            "name=\"{name}\"><calculatedColumnFormula>{}</calculatedColumnFormula></tableColumn>",
+            esc_text(formula)
+        );
+        let xml = format!("{}{el}{}", &xml[..at], &xml[end..]);
+        pkg.parts.iter_mut().find(|(n, _)| n == part).unwrap().1 = xml.into_bytes();
+    }
+
+    fn column_formula(pkg: &SheetPackage, part: &str) -> String {
+        let xml = text(pkg, part);
+        let s = xml.find("<calculatedColumnFormula>").unwrap() + "<calculatedColumnFormula>".len();
+        let e = xml.find("</calculatedColumnFormula>").unwrap();
+        decode(&xml[s..e])
+    }
+
+    #[test]
+    fn a_renamed_table_saves_under_its_new_name() {
+        let mut pkg = one_table();
+        pkg.workbook.defined_names.push(DefinedName {
+            name: "Everything".into(),
+            scope: None,
+            formula: "Table1[#All]".into(),
+        });
+        rename_table(&mut pkg.workbook, "Table1", "Revenue").unwrap();
+        let re = reload(&pkg);
+        assert_eq!(re.workbook.tables[0].name, "Revenue");
+        let part = text(&re, &re.workbook.tables[0].part);
+        assert!(part.contains("name=\"Revenue\""), "{part}");
+        assert!(part.contains("displayName=\"Revenue\""), "{part}");
+        assert!(!part.contains("Table1"), "{part}");
+        let d1 = re.workbook.sheets[0].cell(0, 3).unwrap();
+        assert_eq!(d1.formula.as_deref(), Some("SUM(Revenue[Qty])"));
+        let value = crate::engine::eval_formula_at(&re.workbook, 0, 0, 3, "SUM(Revenue[Qty])");
+        assert_eq!(value, crate::formula::Value::Num(7.0));
+        assert_eq!(re.workbook.defined_names[0].formula, "Revenue[#All]");
+        // A second save of the same package says the same thing.
+        let again = reload(&re);
+        assert_eq!(again.workbook.tables[0].name, "Revenue");
+    }
+
+    #[test]
+    fn renames_reach_the_column_formulas_of_every_table_part() {
+        let mut pkg = one_table();
+        let s = &mut pkg.workbook.sheets[0];
+        s.set_cell(5, 0, Cell::text("Key"));
+        s.set_cell(5, 1, Cell::text("Calc"));
+        s.set_cell(6, 0, Cell::text("x"));
+        pkg.add_table(0, (5, 0, 6, 1), true, "TableStyleMedium2")
+            .unwrap();
+        let part2 = pkg.workbook.tables[1].part.clone();
+        calculated(&mut pkg, &part2, "Calc", "SUM(Table1[Qty])+ROWS(Table2)");
+        // A -> C, then B -> A: one substitution, not two in a row.
+        rename_table(&mut pkg.workbook, "Table1", "Sales").unwrap();
+        rename_table(&mut pkg.workbook, "Table2", "Table1").unwrap();
+        let re = reload(&pkg);
+        assert_eq!(column_formula(&re, &part2), "SUM(Sales[Qty])+ROWS(Table1)");
+        let names: Vec<&str> = re.workbook.tables.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["Sales", "Table1"]);
+    }
+
+    #[test]
+    fn a_converted_table_leaves_the_file() {
+        let mut pkg = one_table();
+        let s = &mut pkg.workbook.sheets[0];
+        s.set_cell(5, 0, Cell::text("Key"));
+        s.set_cell(5, 1, Cell::text("Calc"));
+        s.set_cell(6, 0, Cell::text("x"));
+        pkg.add_table(0, (5, 0, 6, 1), true, "TableStyleMedium2")
+            .unwrap();
+        let part2 = pkg.workbook.tables[1].part.clone();
+        calculated(&mut pkg, &part2, "Calc", "SUM(Table1[Qty])");
+        let part1 = pkg.workbook.tables[0].part.clone();
+        convert_table_to_range(&mut pkg.workbook, "Table1").unwrap();
+        let re = reload(&pkg);
+        assert_eq!(re.workbook.tables.len(), 1);
+        assert!(re.part(&part1).is_none(), "the table part is dropped");
+        let d1 = re.workbook.sheets[0].cell(0, 3).unwrap();
+        assert_eq!(d1.formula.as_deref(), Some("SUM($B$2:$B$3)"));
+        assert_eq!(column_formula(&re, &part2), "SUM($B$2:$B$3)");
+        let ws = text(&re, &re.sheet_parts[0].clone());
+        assert_eq!(ws.matches("<tablePart ").count(), 1, "{ws}");
+        assert!(ws.contains("<tableParts count=\"1\">"), "{ws}");
+        let rels = text(&re, "xl/worksheets/_rels/sheet1.xml.rels");
+        let file = part1.rsplit('/').next().unwrap();
+        assert!(!rels.contains(file), "{rels}");
+        let ct = text(&re, "[Content_Types].xml");
+        assert!(!ct.contains(&format!("/{part1}")), "{ct}");
+    }
+
+    #[test]
+    fn converting_the_only_table_removes_table_parts() {
+        let mut pkg = one_table();
+        let part = pkg.workbook.tables[0].part.clone();
+        convert_table_to_range(&mut pkg.workbook, "Table1").unwrap();
+        let re = reload(&pkg);
+        assert!(re.workbook.tables.is_empty());
+        assert!(re.part(&part).is_none());
+        assert!(!re.parts.iter().any(|(n, _)| n.starts_with("xl/tables/")));
+        let ws = text(&re, &re.sheet_parts[0].clone());
+        assert!(!ws.contains("tablePart"), "{ws}");
+        let rels = text(&re, "xl/worksheets/_rels/sheet1.xml.rels");
+        assert!(!rels.contains("/table\""), "{rels}");
+    }
+
+    #[test]
+    fn an_undone_conversion_saves_the_table() {
+        let mut pkg = one_table();
+        let (tables, removed) = (
+            pkg.workbook.tables.clone(),
+            pkg.workbook.removed_tables.clone(),
+        );
+        let cells = pkg.workbook.sheets.clone();
+        convert_table_to_range(&mut pkg.workbook, "Table1").unwrap();
+        // Undo restores the snapshot: tables, removed tables, cells.
+        pkg.workbook.tables = tables;
+        pkg.workbook.removed_tables = removed;
+        pkg.workbook.sheets = cells;
+        let re = reload(&pkg);
+        assert_eq!(re.workbook.tables.len(), 1);
+        let d1 = re.workbook.sheets[0].cell(0, 3).unwrap();
+        assert_eq!(d1.formula.as_deref(), Some("SUM(Table1[Qty])"));
+    }
+
+    #[test]
+    fn a_table_part_the_loader_skips_is_never_dropped() {
+        let mut pkg = one_table();
+        let part = pkg.workbook.tables[0].part.clone();
+        let xml = text(&pkg, &part).replace("ref=\"A1:B3\"", "ref=\"bogus\"");
+        pkg.parts.iter_mut().find(|(n, _)| *n == part).unwrap().1 = xml.clone().into_bytes();
+        // As a load would have it: the part is there, the table isn't.
+        pkg.workbook.tables.clear();
+        let loaded = reload(&pkg);
+        assert!(loaded.workbook.tables.is_empty(), "the bad ref isn't read");
+        let re = reload(&loaded);
+        assert_eq!(text(&re, &part), xml);
+        let ws = text(&re, &re.sheet_parts[0].clone());
+        assert!(ws.contains("<tablePart "), "{ws}");
+    }
+
+    #[test]
+    fn a_resized_table_saves_its_columns() {
+        let mut pkg = one_table();
+        let part = pkg.workbook.tables[0].part.clone();
+        resize_table(&mut pkg.workbook, "Table1", (0, 0, 4, 2)).unwrap();
+        let re = reload(&pkg);
+        let t = &re.workbook.tables[0];
+        assert_eq!(t.range, (0, 0, 4, 2));
+        assert_eq!(t.columns, vec!["Item", "Qty", "Column3"]);
+        let xml = text(&re, &part);
+        assert!(xml.contains("<tableColumns count=\"3\">"), "{xml}");
+        assert!(
+            xml.contains("<tableColumn id=\"3\" name=\"Column3\"/>"),
+            "{xml}"
+        );
+        assert!(xml.contains("<autoFilter ref=\"A1:C5\""), "{xml}");
+        let c1 = re.workbook.sheets[0].cell(0, 2).map(|c| c.value.clone());
+        assert_eq!(c1, Some(CellValue::Text("Column3".into())));
+        // Shrink to one column: Item goes, Qty keeps its id.
+        let mut pkg = re;
+        resize_table(&mut pkg.workbook, "Table1", (0, 1, 4, 1)).unwrap();
+        let xml = text(&reload(&pkg), &part);
+        assert!(
+            xml.contains(
+                "<tableColumns count=\"1\"><tableColumn id=\"2\" name=\"Qty\"/></tableColumns>"
+            ),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn a_resize_moves_filters_with_their_columns() {
+        let mut pkg = one_table();
+        resize_table(&mut pkg.workbook, "Table1", (0, 0, 2, 2)).unwrap();
+        let mut pkg = reload(&pkg);
+        let part = pkg.workbook.tables[0].part.clone();
+        let xml = text(&pkg, &part).replace(
+            "<autoFilter ref=\"A1:C3\"/>",
+            "<autoFilter ref=\"A1:C3\"><filterColumn colId=\"0\"><filters><filter val=\"Pen\"/></filters></filterColumn><filterColumn colId=\"2\"><filters><filter val=\"x\"/></filters></filterColumn></autoFilter><sortState ref=\"A2:C3\"><sortCondition ref=\"C2:C3\"/></sortState>",
+        );
+        assert!(xml.contains("colId=\"2\""), "{xml}");
+        pkg.parts.iter_mut().find(|(n, _)| *n == part).unwrap().1 = xml.into_bytes();
+        resize_table(&mut pkg.workbook, "Table1", (0, 1, 2, 2)).unwrap();
+        let xml = text(&reload(&pkg), &part);
+        assert!(
+            xml.contains("<filterColumn colId=\"1\"><filters><filter val=\"x\"/>"),
+            "{xml}"
+        );
+        assert!(
+            !xml.contains("Pen"),
+            "the dropped column's filter goes: {xml}"
+        );
+        assert!(!xml.contains("sortState"), "{xml}");
+    }
+
+    #[test]
+    fn a_renamed_source_table_reaches_the_pivot_cache() {
+        let mut pkg = one_table();
+        let frame = crate::frame::Frame::from_range(&pkg.workbook, 0, (0, 0, 2, 1));
+        let measure = crate::pivot::DataField {
+            name: "Sum of Qty".into(),
+            field: 1,
+            agg: crate::frame::Agg::Sum,
+        };
+        let dest = pkg.add_sheet("Pivot");
+        pkg.add_pivot(
+            crate::pivot::PivotSource::Table("Table1".into()),
+            frame.names.clone(),
+            measure,
+            dest,
+            (2, 0),
+        )
+        .unwrap();
+        let re = reload(&pkg);
+        let mut pkg = re;
+        rename_table(&mut pkg.workbook, "Table1", "Sales").unwrap();
+        let re = reload(&pkg);
+        assert_eq!(
+            re.workbook.pivots[0].source,
+            crate::pivot::PivotSource::Table("Sales".into())
+        );
+        let err = convert_table_to_range(&mut pkg.workbook, "Sales").unwrap_err();
+        assert!(err.contains("uses this table"), "{err}");
+    }
+
+    #[test]
+    fn add_table_refuses_what_excel_refuses() {
+        let mut pkg = one_table();
+        let before = pkg.parts.clone();
+        let err = pkg
+            .add_table(0, (1, 1, 4, 3), true, "TableStyleMedium2")
+            .unwrap_err();
+        assert_eq!(err, "The range overlaps table Table1");
+        // A two-cell CSE array at F1:F2.
+        let mut arr = Cell::formula("B2:B3*2");
+        arr.f_attrs = Some("t=\"array\" ref=\"F1:F2\"".into());
+        arr.spill = Some((2, 1));
+        pkg.workbook.sheets[0].set_cell(0, 5, arr);
+        let err = pkg
+            .add_table(0, (1, 4, 3, 6), true, "TableStyleMedium2")
+            .unwrap_err();
+        assert!(err.contains("array formula"), "{err}");
+        assert_eq!(pkg.parts, before, "a refusal writes nothing");
+        assert_eq!(pkg.workbook.tables.len(), 1);
+    }
+
+    #[test]
+    fn add_table_refuses_a_pivot_table_location() {
+        let mut pkg = one_table();
+        let frame = crate::frame::Frame::from_range(&pkg.workbook, 0, (0, 0, 2, 1));
+        let measure = crate::pivot::DataField {
+            name: "Sum of Qty".into(),
+            field: 1,
+            agg: crate::frame::Agg::Sum,
+        };
+        let dest = pkg.add_sheet("Pivot");
+        let idx = pkg
+            .add_pivot(
+                crate::pivot::PivotSource::Range {
+                    sheet: "Sheet1".into(),
+                    rect: (0, 0, 2, 1),
+                },
+                frame.names.clone(),
+                measure,
+                dest,
+                (2, 0),
+            )
+            .unwrap();
+        let (r1, c1, _, _) = pkg.workbook.pivots[idx].location;
+        let err = pkg
+            .add_table(dest, (r1, c1, r1 + 3, c1 + 1), true, "TableStyleMedium2")
+            .unwrap_err();
+        assert!(err.contains("PivotTable"), "{err}");
     }
 }

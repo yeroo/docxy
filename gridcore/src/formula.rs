@@ -2291,6 +2291,143 @@ pub fn rename_sheet_in_expr(e: &Expr, old: &str, new: &str) -> Expr {
     walk(e, old, new)
 }
 
+/// Rebuild `e`, letting `f` replace any node: where `f` returns `Some`, that
+/// replacement stands in for the node (its children are not visited);
+/// elsewhere the walk descends into arguments, operands and array items.
+pub fn map_expr(e: &Expr, f: &dyn Fn(&Expr) -> Option<Expr>) -> Expr {
+    if let Some(x) = f(e) {
+        return x;
+    }
+    match e {
+        Expr::ArrayLit(rows) => Expr::ArrayLit(
+            rows.iter()
+                .map(|row| row.iter().map(|x| map_expr(x, f)).collect())
+                .collect(),
+        ),
+        Expr::Func(n, args) => Expr::Func(n.clone(), args.iter().map(|a| map_expr(a, f)).collect()),
+        Expr::Call(callee, args) => Expr::Call(
+            Box::new(map_expr(callee, f)),
+            args.iter().map(|a| map_expr(a, f)).collect(),
+        ),
+        Expr::Un(op, x) => Expr::Un(*op, Box::new(map_expr(x, f))),
+        Expr::Bin(op, l, r) => Expr::Bin(*op, Box::new(map_expr(l, f)), Box::new(map_expr(r, f))),
+        other => other.clone(),
+    }
+}
+
+/// Rename tables: every structured reference qualified by, and every bare
+/// name (`ROWS(Sales)`, `SUMX(Sales,…)`) equal to, an old name in `map`
+/// (case-insensitive) takes the new one. The map applies all at once, so
+/// `[(A, C), (B, A)]` renames B to A without then renaming it to C.
+/// Unqualified references (`[@Qty]`) name no table and stay as they are.
+pub fn rename_tables_in_expr(e: &Expr, map: &[(String, String)]) -> Expr {
+    let new_of = |n: &str| {
+        map.iter()
+            .find(|(old, _)| old.eq_ignore_ascii_case(n))
+            .map(|(_, new)| new.clone())
+    };
+    map_expr(e, &|x| match x {
+        Expr::Structured {
+            table: Some(t),
+            item,
+            col1,
+            col2,
+        } => new_of(t).map(|n| Expr::Structured {
+            table: Some(n),
+            item: *item,
+            col1: col1.clone(),
+            col2: col2.clone(),
+        }),
+        Expr::Name(n) => new_of(n).map(Expr::Name),
+        _ => None,
+    })
+}
+
+/// A table being converted to a range: what its references become.
+pub struct TableToRange<'a> {
+    pub name: &'a str,
+    /// The sheet the table is on, as references spell it.
+    pub sheet_name: &'a str,
+    pub info: &'a TableInfo,
+}
+
+/// Where a formula being rewritten by [`table_refs_to_cells_in_expr`] lives.
+#[derive(Clone, Copy)]
+pub struct FormulaHost {
+    /// Whether the formula is on the table's own sheet (references to it
+    /// then need no sheet qualifier).
+    pub same_sheet: bool,
+    /// The formula's row, for `[#This Row]` / `@`; `None` where there is no
+    /// cell (a calculated-column formula held in another table's part).
+    pub row: Option<u32>,
+    /// Whether the formula's cell is inside the table, so that unqualified
+    /// references (`[@Qty]`, `[Qty]`) are references to it.
+    pub inside: bool,
+}
+
+/// Rewrite every structured reference to `t` as the cells it covers, as
+/// Excel's Convert to Range does: `Sales[Qty]` → `$B$2:$B$4`,
+/// `[@Qty]` → `$B5` (absolute column, the formula's own row), a reference
+/// from another sheet (or from no cell at all) qualified with the table's
+/// sheet. A bare table name (`ROWS(Sales)`) becomes its data region. A
+/// reference that covers nothing (a missing column, `#Totals` with no totals
+/// row) becomes `#REF!`. `[#This Row]` without a row is left alone.
+pub fn table_refs_to_cells_in_expr(e: &Expr, t: &TableToRange, host: FormulaHost) -> Expr {
+    let sheet = (!host.same_sheet).then(|| t.sheet_name.to_string());
+    let cell = |r: u32, c: u32, abs_row: bool| CellRef {
+        sheet: sheet.clone(),
+        row: r as i64,
+        col: c as i64,
+        abs_row,
+        abs_col: true,
+    };
+    let rect = |(r1, c1, r2, c2): (u32, u32, u32, u32), abs_row: bool| {
+        if (r1, c1) == (r2, c2) {
+            Expr::Ref(cell(r1, c1, abs_row))
+        } else {
+            Expr::Range(
+                cell(r1, c1, abs_row),
+                CellRef {
+                    sheet: None,
+                    ..cell(r2, c2, abs_row)
+                },
+            )
+        }
+    };
+    map_expr(e, &|x| match x {
+        Expr::Structured {
+            table,
+            item,
+            col1,
+            col2,
+        } => {
+            let ours = match table {
+                Some(n) => n.eq_ignore_ascii_case(t.name),
+                None => host.inside,
+            };
+            if !ours {
+                return None;
+            }
+            let this_row = *item == TableItem::ThisRow;
+            let row = match (this_row, host.row) {
+                (true, None) => return None,
+                (_, r) => r.unwrap_or(0),
+            };
+            Some(match t.info.resolve(*item, col1, col2, row) {
+                Some(r) => rect(r, !this_row),
+                None => Expr::Err(ExcelError::Ref),
+            })
+        }
+        Expr::Name(n) if n.eq_ignore_ascii_case(t.name) => {
+            Some(match t.info.resolve(TableItem::Data, &None, &None, 0) {
+                Some(r) => rect(r, true),
+                None => Expr::Err(ExcelError::Ref),
+            })
+        }
+        _ => None,
+    })
+}
+
 /// Give every unqualified reference the sheet qualifier `sheet`: a cut moved
 /// to another sheet keeps reading the cells it read (Excel writes `=B1`
 /// moved off Sheet2 as `=Sheet2!B1`). Qualified references, 3-D spans, names

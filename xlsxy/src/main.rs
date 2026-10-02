@@ -5708,7 +5708,7 @@ impl App {
             .pkg
             .add_table(s, (r1, c1, r2, c2), has_header, "TableStyleMedium2")
         {
-            Some(i) => {
+            Ok(i) => {
                 // add_table rewrites package parts; existing undo snapshots no longer line up.
                 self.undo.clear();
                 self.redo.clear();
@@ -5724,7 +5724,7 @@ impl App {
                     }
                 ));
             }
-            None => self.status = Some("Format as Table failed".into()),
+            Err(why) => self.status = Some(format!("Format as Table: {why}")),
         }
     }
 
