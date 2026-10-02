@@ -1045,10 +1045,11 @@ fn fx_toggle_key(ctrl: bool, shift: bool, key: &str) -> bool {
     ctrl && shift && key.eq_ignore_ascii_case("u")
 }
 
-/// The sheet a tab holds, with the app's Editing options stamped on it: every
-/// key, click and command reaches a sheet through here
-/// ([`Docxy::active_sheet_mut`]), so a tab opened after the options changed
-/// still commits, moves and completes under the current ones (#672).
+/// The sheet a tab holds, with the app's Editing options stamped on it: what
+/// [`Docxy::active_sheet_mut`] hands out. A second guard beside
+/// [`stamp_edit_opts`], which is the mechanism: it stamps every tab on
+/// restore, on a change and each frame, including the tabs that commit
+/// outside this accessor (`close::commit_changed_cell`) (#672).
 fn sheet_with_opts(tab: Option<&mut DocTab>, opts: EditOptions) -> Option<&mut SheetView> {
     match tab.map(|t| &mut t.surface) {
         Some(Surface::Sheet(v)) => {
@@ -1507,25 +1508,23 @@ impl SheetView {
     /// What a key does to a live AutoComplete proposal before it acts. A key
     /// that inserts text other than a typed character — Alt+Enter's line
     /// feed, the Ctrl+; / Ctrl+' entry chords — drops the suffix first, as
-    /// typing does, so it lands after the typed text. A caret move (and any
-    /// other editor chord but Ctrl+Enter, which commits) keeps the text and
-    /// drops only the marker. The keys that commit take the proposal in
-    /// `commit_edit`; Backspace, Delete and typing handle it themselves.
-    fn proposal_before_key(
-        &mut self,
-        key: &str,
-        ctrl: bool,
-        alt: bool,
-        modifier: bool,
-        caret_keys: bool,
-    ) {
+    /// typing does, so it lands after the typed text. A key that moves the
+    /// caret or rewrites the buffer (Home/End, F2/F4/F9, Insert, Edit-mode
+    /// Left/Right, Ctrl+Left/Right/Delete/Z) keeps the text and drops only
+    /// the marker. Every other key leaves it live: the keys that commit
+    /// (Enter, Tab, Ctrl+Enter, Ctrl+S's save) take it in `commit_edit`, and
+    /// Backspace, Delete and typing handle it themselves.
+    fn proposal_before_key(&mut self, key: &str, ctrl: bool, alt: bool) {
         if self.edit_proposal.is_none() {
             return;
         }
         let inserts = (alt && key == "enter") || (ctrl && matches!(key, "'" | "\"" | ";" | ":"));
-        let caret_move = matches!(key, "home" | "end" | "f2" | "f4" | "f9" | "insert")
-            || (caret_keys && matches!(key, "left" | "right"))
-            || (ctrl && !modifier && key != "enter");
+        let caret_move = if ctrl {
+            matches!(key, "left" | "right" | "delete" | "z")
+        } else {
+            matches!(key, "home" | "end" | "f2" | "f4" | "f9" | "insert")
+                || (self.edit_arrows_move_caret() && matches!(key, "left" | "right"))
+        };
         if inserts {
             self.drop_proposal();
         } else if caret_move {
@@ -2791,9 +2790,9 @@ struct Docxy {
     /// with Don't Save (#613).
     keep_drafts: bool,
     /// File › Options › Advanced › Editing for every sheet tab (#672),
-    /// persisted in `session.json`. Each `SheetView` keeps a copy, refreshed
-    /// whenever `active_sheet_mut` hands one out and pushed to every open tab
-    /// on a change, so a tab opened later reads the current options.
+    /// persisted in `session.json`: the source of truth. Each `SheetView`
+    /// keeps a copy that [`stamp_edit_opts`] refreshes on restore, on a
+    /// change and every frame (and `active_sheet_mut` on each use).
     edit_opts: EditOptions,
     /// Ctrl+Shift+U: the formula bar shows about four lines. View state for
     /// this session, not persisted.
@@ -13815,7 +13814,7 @@ impl Docxy {
         // acts: see `SheetView::proposal_before_key`.
         if editing {
             if let Some(v) = self.active_sheet_mut() {
-                v.proposal_before_key(key, ctrl, alt, modifier, caret_keys);
+                v.proposal_before_key(key, ctrl, alt);
             }
         }
         // Same as the bar fields above: a focused Chart-panel field owns Ctrl+A.

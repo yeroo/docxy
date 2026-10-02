@@ -1528,21 +1528,21 @@ fn an_inserting_chord_drops_the_proposal_suffix_first() {
     select(&mut v, 1, 0);
     // Alt+Enter: the line feed lands after the typed text.
     type_chars(&mut v, "ap");
-    v.proposal_before_key("enter", false, true, false, false);
+    v.proposal_before_key("enter", false, true);
     v.edit_type("\n");
     assert_eq!(v.editing.as_deref(), Some("ap\n"));
     assert_eq!(v.edit_proposal, None);
     v.end_cell_edit();
     // Ctrl+; : today's date lands after the typed text.
     type_chars(&mut v, "ap");
-    v.proposal_before_key(";", true, false, false, false);
+    v.proposal_before_key(";", true, false);
     v.entry_chord(";", false, 45_565.0, false);
     let buf = v.editing.clone().unwrap();
     assert!(buf.starts_with("ap") && !buf.contains("ple"), "{buf}");
     v.end_cell_edit();
     // A caret move keeps the text and drops only the marker.
     type_chars(&mut v, "ap");
-    v.proposal_before_key("home", false, false, false, false);
+    v.proposal_before_key("home", false, false);
     assert_eq!(
         (v.editing.as_deref(), v.edit_proposal.clone()),
         (Some("apple"), None)
@@ -1550,8 +1550,18 @@ fn an_inserting_chord_drops_the_proposal_suffix_first() {
     v.end_cell_edit();
     // Ctrl+Enter commits: the proposal stays for the commit to take.
     type_chars(&mut v, "ap");
-    v.proposal_before_key("enter", true, false, false, false);
+    v.proposal_before_key("enter", true, false);
     assert!(v.edit_proposal.is_some());
+    // So does Ctrl+S: saving commits the open editor, which takes it.
+    v.proposal_before_key("s", true, false);
+    assert!(v.edit_proposal.is_some());
+    assert!(v.commit_edit());
+    assert_eq!(value(&v, 1, 0), CellValue::Text("Apple".into()));
+    // Ctrl+Left moves the caret by a word: the marker goes.
+    select(&mut v, 2, 0);
+    type_chars(&mut v, "ap");
+    v.proposal_before_key("left", true, false);
+    assert_eq!(v.edit_proposal, None);
 }
 
 #[test]
