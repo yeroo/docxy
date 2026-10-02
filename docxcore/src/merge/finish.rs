@@ -115,9 +115,8 @@ pub fn check_errors(
     map: &FieldMap,
 ) -> Vec<String> {
     let mut missing: Vec<String> = Vec::new();
-    let mut body = doc.body.clone();
     let row = recipients.included_rows().first().copied().unwrap_or(0);
-    super::preview::visit_fields(&mut body, &mut |raw, _| {
+    super::preview::each_field(&doc.body, &mut |raw| {
         let Some(kind @ MergeFieldKind::MergeField { .. }) = field_kind(raw) else {
             return;
         };

@@ -745,7 +745,7 @@ pub(crate) fn insert_inline(
     ed.paste(&docxcore::editor::Clip {
         paras: vec![vec![field]],
     });
-    ed.refresh_merge_preview();
+    // Only the body previews (a header or footer editor never does).
     if let Surface::Doc(body) = &mut tab.surface {
         body.refresh_merge_preview();
     }

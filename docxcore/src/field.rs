@@ -465,6 +465,23 @@ fn group_thousands(int_part: &str) -> String {
     out
 }
 
+/// Whether a `\*` switch is a number format (Arabic, Roman, Ordinal, …),
+/// which [`apply_star`] applies to the number, not the text.
+pub(crate) fn is_number_format(fmt: &str) -> bool {
+    matches!(
+        fmt.trim().to_ascii_lowercase().as_str(),
+        "arabic"
+            | "roman"
+            | "roman_lower"
+            | "lroman"
+            | "ordinal"
+            | "cardinal"
+            | "alphabetic"
+            | "alphabetic_lower"
+            | "alphabetic-lower"
+    )
+}
+
 /// Apply a `\*` format switch: a number format (Arabic/roman/ordinal/cardinal/
 /// alphabetic) on the integer value, or a text case transform on the string.
 pub(crate) fn apply_star(text: &str, value: f64, fmt: &str) -> String {

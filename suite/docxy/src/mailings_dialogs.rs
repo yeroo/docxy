@@ -784,11 +784,11 @@ fn apply(tab: &mut DocTab, d: &Dialog) -> Result<(), String> {
         }
         DialogOwner::MailCheckErrors => {
             let r = recipients(tab)?;
-            let doc = match &tab.surface {
-                Surface::Doc(ed) => ed.export_doc().into_owned(),
-                _ => return Err("Mail merge needs a document".into()),
+            // Only the fields' instructions count, so a preview does not matter.
+            let Surface::Doc(ed) = &tab.surface else {
+                return Err("Mail merge needs a document".into());
             };
-            let missing = docxcore::merge::check_errors(&doc, r, &tab.mail.map);
+            let missing = docxcore::merge::check_errors(&ed.doc, r, &tab.mail.map);
             let text = if missing.is_empty() {
                 "No mail merge errors have been found.".to_string()
             } else {

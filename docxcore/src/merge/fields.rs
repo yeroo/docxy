@@ -6,7 +6,7 @@
 //! `<<…_CODE_…>>` groups.
 
 use super::csv::{Recipients, name_key};
-use crate::field::{apply_star, instr_of, split_switches};
+use crate::field::{apply_star, instr_of, is_number_format, split_switches};
 use crate::model::{Inline, RunProps};
 
 /// A field mail merge evaluates.
@@ -502,19 +502,7 @@ pub fn eval(kind: &MergeFieldKind, ctx: &MergeContext) -> Option<String> {
 /// Apply one `\*` switch to a merged value: a number format only when the
 /// value is a number (Word leaves other text as it is), a text format always.
 fn star_format(value: &str, fmt: &str) -> String {
-    let numeric = matches!(
-        fmt.trim().to_ascii_lowercase().as_str(),
-        "arabic"
-            | "roman"
-            | "roman_lower"
-            | "lroman"
-            | "ordinal"
-            | "cardinal"
-            | "alphabetic"
-            | "alphabetic_lower"
-            | "alphabetic-lower"
-    );
-    if !numeric {
+    if !is_number_format(fmt) {
         return apply_star(value, 0.0, fmt);
     }
     match value.trim().parse::<f64>() {

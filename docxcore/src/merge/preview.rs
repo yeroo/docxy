@@ -52,6 +52,35 @@ pub(crate) fn visit_fields(blocks: &mut [Block], f: &mut dyn FnMut(&str, &mut St
     }
 }
 
+/// [`visit_fields`] for reading: `f(raw)` for every field in `blocks`, in
+/// document order.
+pub(crate) fn each_field(blocks: &[Block], f: &mut dyn FnMut(&str)) {
+    fn inlines(items: &[Inline], f: &mut dyn FnMut(&str)) {
+        for inl in items {
+            match inl {
+                Inline::Field { raw, .. } => f(raw),
+                Inline::TextBox { blocks, .. } => each_field(blocks, f),
+                Inline::Hyperlink(h) => inlines(&h.content, f),
+                Inline::Revision { content, .. } => inlines(content, f),
+                _ => {}
+            }
+        }
+    }
+    for b in blocks {
+        match b {
+            Block::Paragraph(p) => inlines(&p.content, f),
+            Block::Table(t) => {
+                for row in &t.rows {
+                    for cell in &row.cells {
+                        each_field(&cell.blocks, f);
+                    }
+                }
+            }
+            Block::SectionProperties(_) | Block::Raw(_) => {}
+        }
+    }
+}
+
 /// The result a field's `raw` caches (what Word last showed).
 pub(crate) fn cached_text(raw: &str) -> String {
     let xml = format!(
