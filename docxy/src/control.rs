@@ -307,7 +307,7 @@ fn export(app: &App, args: &Json) -> Result<Json, String> {
 }
 
 /// `doc.comments`: the review comments parsed at load (or last reload), in
-/// anchor order.
+/// anchor order, then those added since while their markers are in the body.
 fn comments(app: &App) -> Json {
     let items = app
         .comments
@@ -1040,6 +1040,9 @@ fn finish_edit(app: &mut App) {
     app.modified = true;
     app.dirty = true;
     app.refresh_watermark_state_if_needed();
+    // An undo or redo may take a new comment's markers or bring them back:
+    // `doc.comments` and the panel follow (#620).
+    app.sync_session_comments();
 }
 
 /// Resolve an optional block range from `{start, end}` or `{range:"a..b"}`,
@@ -1824,6 +1827,25 @@ mod tests {
         let app = app_with(&["x"]);
         let err = export(&app, &Json::Null).unwrap_err();
         assert!(err.contains("format"), "{err}");
+    }
+
+    /// FIX r2 #2: `doc.undo` of Add Comment empties `doc.comments`, and
+    /// `doc.redo` lists it again, as the keys do (#620).
+    #[test]
+    fn doc_undo_and_redo_of_a_new_comment_update_doc_comments() {
+        let mut app = app_with(&["review me"]);
+        app.editor.select_all();
+        app.comment_input = Some("note".into());
+        app.commit_comment();
+        let listed = |app: &mut App| {
+            let r = dispatch(app, "doc.comments", &Json::Null).unwrap();
+            r.get("comments").unwrap().as_array().unwrap().len()
+        };
+        assert_eq!(listed(&mut app), 1);
+        dispatch(&mut app, "doc.undo", &Json::Null).unwrap();
+        assert_eq!(listed(&mut app), 0);
+        dispatch(&mut app, "doc.redo", &Json::Null).unwrap();
+        assert_eq!(listed(&mut app), 1);
     }
 
     #[test]

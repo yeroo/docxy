@@ -418,8 +418,8 @@ fn export_html_headless(loaded: &Input, source: &str, out: &str) -> Result<usize
     Ok(page.len())
 }
 
-/// Revisions and comments are attributed to the OS account name, else to
-/// this name.
+/// The reviewer name when the OS gives none ([`App::review_author`]), and
+/// the author `docxy compare` attributes its revisions to.
 const DEFAULT_AUTHOR: &str = "docxy";
 
 /// The OS account name (`USERNAME` on Windows, `USER` elsewhere), if set.
@@ -2818,11 +2818,16 @@ impl App {
     /// span it anchors to, and its text, scrollable with the wheel.
     /// The next free comment id (max existing + 1).
     fn next_comment_id(&self) -> i32 {
-        // An undone comment keeps its id: redo brings it back.
+        // An undone comment keeps its id: redo brings it back. Ids whose
+        // markers are in the body are taken too (a deleted comment's, back
+        // after an undo): a new comment sharing one would stay live after
+        // its own undo.
+        let in_body = docxcore::inspect::comment_marker_ids(&self.body_editor().doc);
         self.comments
             .iter()
             .map(|c| &c.id)
             .chain(self.session_comments.keys())
+            .chain(&in_body)
             .filter_map(|id| id.parse::<i32>().ok())
             .max()
             .unwrap_or(0)
@@ -11597,6 +11602,42 @@ mod tests {
         let (_, comments) = saved_parts(&path);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         assert!(comments.contains("Colour?"), "{comments}");
+    }
+
+    /// FIX r2 #1: deleting a loaded comment and undoing the delete puts its
+    /// markers back without a record; a new comment must not take that id,
+    /// or it would stay live after its own undo.
+    #[test]
+    fn a_new_comment_never_takes_an_id_whose_markers_are_in_the_body() {
+        let mut ed = Editor::new(Document {
+            body: vec![Block::Paragraph(MPara {
+                props: ParProps::default(),
+                content: vec![Inline::Run(Run {
+                    text: "The quick brown fox.".into(),
+                    props: RunProps::default(),
+                })],
+            })],
+        });
+        for id in ["1", "2"] {
+            ed.select_all();
+            assert!(ed.add_comment(id));
+        }
+        let mut pkg = new_package(ed.doc);
+        pkg.add_comment(1, "Ann", "A", "2020-01-02T03:04:05Z", "First");
+        pkg.add_comment(2, "Ann", "A", "2020-01-02T03:04:05Z", "Second");
+        let mut app = App::new(pkg, "test.docx", false);
+        app.os_clip = None;
+        let ids =
+            |app: &App| -> Vec<String> { app.comments.iter().map(|c| c.id.clone()).collect() };
+        assert_eq!(ids(&app), ["1", "2"]);
+        app.comment_sel = 1;
+        app.run_act(ribbon::Act::DeleteComment);
+        assert_eq!(ids(&app), ["1"]);
+        app.on_key(ctrl(KeyCode::Char('z')));
+        add_comment_by_keys(&mut app, "Colour?");
+        assert_eq!(ids(&app), ["1", "3"], "a fresh id, not 2");
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(ids(&app), ["1"], "its undo takes it");
     }
 
     #[test]
