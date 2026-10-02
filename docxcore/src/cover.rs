@@ -331,7 +331,7 @@ fn is_typed(text: &str) -> bool {
 
 /// The placeholder a content control's opening boundary names: its
 /// `w:alias`, else its `w:tag`.
-fn placeholder_of(open: &str) -> Option<Placeholder> {
+pub(crate) fn placeholder_of(open: &str) -> Option<Placeholder> {
     let (a, b) = crate::sect::find_element(open, "w:sdtPr")?;
     let pr = &open[a..b];
     ["w:alias", "w:tag"].iter().find_map(|name| {

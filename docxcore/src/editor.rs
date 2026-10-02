@@ -551,6 +551,7 @@ impl Editor {
         self.drop_collapsed_anchor();
         self.checkpoint(EditKind::Structural);
         let off = self.caret.offset;
+        let in_cover = self.caret_in_cover();
         let new_idx = {
             let Some((cont, idx)) = container_mut(&mut self.doc.body, &self.caret.path) else {
                 return;
@@ -558,7 +559,7 @@ impl Editor {
             let Some(Block::Paragraph(p)) = cont.get_mut(idx) else {
                 return;
             };
-            let right = split_paragraph_content(&mut p.content, off);
+            let right = split_paragraph_at(&mut p.content, off, in_cover).0;
             let props = p.props.clone();
             // A section break ends the section after the split, so it (and
             // its tracked change, which Save also writes as a sectPr) moves
@@ -1197,6 +1198,7 @@ impl Editor {
             return;
         }
 
+        let in_cover = self.caret_in_cover();
         let placed = {
             let Some((cont, idx)) = container_mut(&mut self.doc.body, &self.caret.path) else {
                 return;
@@ -1217,7 +1219,7 @@ impl Editor {
             // splits after it: the content controls the split continues are
             // closed after it and open again around the last piece.
             let first_len = insert_inlines(&mut p.content, off, clip.paras[0].clone());
-            let (tail, inside) = split_paragraph_at(&mut p.content, off + first_len);
+            let (tail, inside) = split_paragraph_at(&mut p.content, off + first_len, in_cover);
 
             // A middle piece pasted inside content controls is inside them
             // too: a copy of each opens and closes around it.
@@ -2981,10 +2983,18 @@ fn insert_inlines(content: &mut Vec<Inline>, o: usize, ins: Vec<Inline>) -> usiz
 
 /// The opening boundary of a content control again, for the half of a split
 /// it continues into: without its `w:id` (optional in `w:sdtPr`), so ids stay
-/// unique.
+/// unique, and without `w:showingPlcHdr` and `w:dataBinding`, which belong
+/// to the original (a second control bound to the same property would show
+/// its value; a copy is not showing the placeholder).
 fn reopened(open: &Inline) -> Inline {
     match open {
-        Inline::Raw(raw) => Inline::Raw(crate::sect::remove_element(raw, "w:id")),
+        Inline::Raw(raw) => {
+            let mut raw = raw.clone();
+            for name in ["w:id", "w:showingPlcHdr", "w:dataBinding"] {
+                raw = crate::sect::remove_element(&raw, name);
+            }
+            Inline::Raw(raw)
+        }
         other => other.clone(),
     }
 }
@@ -3057,28 +3067,51 @@ fn open_of(content: &[Inline], close: usize) -> Option<usize> {
 /// Split a paragraph's content at caret offset `o` for a paragraph break
 /// (Enter, a multi-paragraph paste, Blank Page, a section break, a table
 /// inserted mid-paragraph), keeping inline content controls whole (#652):
+/// - a control that starts right at `o` (nothing of its content before `o`,
+///   zero-width markers aside) moves to the second half whole, with its id;
 /// - a control the split cuts is closed at the end of the first half and
 ///   opened again at the start of the second ([`repair_cut_controls`]);
-/// - a split right at the end of a control's content, where the first half
-///   ends with its close (zero-width markers aside), counts as cutting it
-///   too: the second half starts with an empty copy of the control, so text
-///   typed or pasted at its start goes into the control (a placeholder takes
-///   a second line). A paragraph whose last inline is not a control's close
-///   splits as before.
+/// - with `placeholders` (the split is in a cover page), a split right at the
+///   end of a cover placeholder's content, where the first half ends with its
+///   close (markers aside), counts as cutting it too: the second half starts
+///   with an empty copy of it, so text typed or pasted there goes into the
+///   placeholder, as a second line. Any other control, and a split whose
+///   first half does not end with a placeholder's close, splits as before: a
+///   caret at a control's end is also just after it, and Enter there in Word
+///   gives a plain paragraph.
 ///
 /// The second half, and the index in it where its own content starts: after
 /// the reopened boundaries, inside the controls the split continues.
-fn split_paragraph_at(content: &mut Vec<Inline>, o: usize) -> (Vec<Inline>, usize) {
+fn split_paragraph_at(
+    content: &mut Vec<Inline>,
+    o: usize,
+    placeholders: bool,
+) -> (Vec<Inline>, usize) {
     let mut tail = split_content(content, o);
-    // The controls whose content ends right at the split: the closes ending
-    // the first half, outermost first.
+    // Controls opening right at the split go down whole: the trailing run of
+    // zero-width inlines from the first open in it.
+    let mut k = content.len();
+    while k > 0
+        && (is_marker(&content[k - 1])
+            || matches!(&content[k - 1], Inline::Raw(r) if crate::hf::is_sdt_open(r)))
+    {
+        k -= 1;
+    }
+    if let Some(m) = (k..content.len())
+        .find(|&i| matches!(&content[i], Inline::Raw(r) if crate::hf::is_sdt_open(r)))
+    {
+        let moved: Vec<Inline> = content.drain(m..).collect();
+        tail.splice(0..0, moved);
+    }
+    // The placeholders whose content ends right at the split: the closes
+    // ending the first half, outermost first.
     let mut ends: Vec<Inline> = Vec::new();
     let mut k = content.len();
-    while k > 0 {
+    while placeholders && k > 0 {
         match &content[k - 1] {
             Inline::Raw(raw) if crate::hf::is_sdt_close(raw) => match open_of(content, k - 1) {
-                Some(i) => ends.push(reopened(&content[i])),
-                None => break,
+                Some(i) if is_placeholder_open(&content[i]) => ends.push(reopened(&content[i])),
+                _ => break,
             },
             x if is_marker(x) => {}
             _ => break,
@@ -3093,9 +3126,16 @@ fn split_paragraph_at(content: &mut Vec<Inline>, o: usize) -> (Vec<Inline>, usiz
     (tail, cut + n)
 }
 
-/// [`split_paragraph_at`]'s second half.
+/// Whether an inline opens a cover-page placeholder control (one whose
+/// alias or tag names a [`crate::cover::Placeholder`]).
+fn is_placeholder_open(inline: &Inline) -> bool {
+    matches!(inline, Inline::Raw(raw) if crate::hf::is_sdt_open(raw)
+        && crate::cover::placeholder_of(raw).is_some())
+}
+
+/// [`split_paragraph_at`]'s second half, outside a cover page.
 fn split_paragraph_content(content: &mut Vec<Inline>, o: usize) -> Vec<Inline> {
-    split_paragraph_at(content, o).0
+    split_paragraph_at(content, o, false).0
 }
 
 /// Split a hyperlink at `local`, strictly inside its text: `h` keeps what is

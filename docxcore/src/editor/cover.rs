@@ -18,6 +18,15 @@ impl Editor {
         find_cover(&self.doc.body).is_some()
     }
 
+    /// Whether the caret is in the cover page, where a paragraph break at
+    /// the end of a placeholder continues it (see `split_paragraph_at`).
+    pub(super) fn caret_in_cover(&self) -> bool {
+        let Some(&block) = self.caret.path.first() else {
+            return false;
+        };
+        find_cover(&self.doc.body).is_some_and(|(open, close)| (open..=close).contains(&block))
+    }
+
     /// Put the cover `design` (an index into [`COVER_DESIGNS`]) at the start
     /// of the document, or in place of the cover it has, carrying the text
     /// typed into the old cover's placeholders into the new one's. The

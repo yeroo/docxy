@@ -734,3 +734,116 @@ fn a_word_cover_with_text_boxes_and_tables_carries_their_text() {
     );
     assert_eq!(text_at(&e, &[field_para(&e, Placeholder::Author)]), "Ada");
 }
+
+fn has_boundaries(p: &Block) -> bool {
+    matches!(p, Block::Paragraph(p) if p.content.iter().any(
+        |i| matches!(i, Inline::Raw(r) if crate::hf::is_sdt_open(r) || crate::hf::is_sdt_close(r))
+    ))
+}
+
+/// A date picker named "Date" (a placeholder's name, but not in a cover).
+const DATE_LINE: &str = "<w:p><w:r><w:t xml:space=\"preserve\">Date: </w:t></w:r>\
+    <w:sdt><w:sdtPr><w:alias w:val=\"Date\"/><w:id w:val=\"8\"/><w:date/></w:sdtPr>\
+    <w:sdtContent><w:r><w:t>2026-10-02</w:t></w:r></w:sdtContent></w:sdt></w:p>";
+
+/// A checkbox control after text.
+const CHECKBOX_LINE: &str = "<w:p><w:r><w:t xml:space=\"preserve\">I agree </w:t></w:r>\
+    <w:sdt><w:sdtPr><w:id w:val=\"9\"/><w14:checkbox><w14:checked w14:val=\"0\"/></w14:checkbox>\
+    </w:sdtPr><w:sdtContent><w:r><w:t>☐</w:t></w:r></w:sdtContent></w:sdt></w:p>";
+
+#[test]
+fn enter_at_the_end_of_a_line_ending_in_a_control_gives_a_plain_paragraph() {
+    for line in [DATE_LINE, CHECKBOX_LINE] {
+        let mut e = ed(line);
+        let len = text_at(&e, &[0]).chars().count();
+        let before = blocks_to_xml(&e.doc.body);
+        e.caret = Caret {
+            path: vec![0],
+            offset: len,
+        };
+        e.insert_newline();
+        let Block::Paragraph(p) = &e.doc.body[1] else {
+            panic!()
+        };
+        assert!(p.content.is_empty(), "{line}: {:?}", p.content);
+        // Backspace joins them back as they were.
+        e.backspace();
+        assert_eq!(blocks_to_xml(&e.doc.body), before, "{line}");
+    }
+}
+
+#[test]
+fn enter_just_after_a_control_mid_line_starts_with_plain_text() {
+    let mut e = ed(
+        "<w:p><w:sdt><w:sdtPr><w:id w:val=\"3\"/></w:sdtPr><w:sdtContent>\
+         <w:r><w:t>x</w:t></w:r></w:sdtContent></w:sdt><w:r><w:t>tail</w:t></w:r></w:p>",
+    );
+    e.caret = Caret {
+        path: vec![0],
+        offset: 1,
+    };
+    e.insert_newline();
+    let Block::Paragraph(p) = &e.doc.body[1] else {
+        panic!()
+    };
+    assert!(
+        matches!(&p.content[..], [Inline::Run(r)] if r.text == "tail"),
+        "{:?}",
+        p.content
+    );
+    assert!(inline_controls_balance(&e));
+}
+
+#[test]
+fn enter_before_a_control_moves_it_down_whole() {
+    let mut e = ed(
+        "<w:p><w:sdt><w:sdtPr><w:id w:val=\"7\"/><w14:checkbox/></w:sdtPr>\
+         <w:sdtContent><w:r><w:t>☐</w:t></w:r></w:sdtContent></w:sdt><w:r><w:t>Milk</w:t></w:r></w:p>",
+    );
+    e.insert_newline();
+    assert!(
+        !has_boundaries(&e.doc.body[0]),
+        "{}",
+        blocks_to_xml(&e.doc.body)
+    );
+    let xml = blocks_to_xml(&e.doc.body[1..2]);
+    assert!(
+        xml.contains("<w:id w:val=\"7\"/>") && xml.contains("Milk"),
+        "{xml}"
+    );
+    assert!(inline_controls_balance(&e));
+
+    // The same for a cover's title: the control, with its id, goes down.
+    let (mut e, title) = typed_title(0);
+    let id = |e: &Editor, k: usize| crate::cover::sdt_ids(&blocks_to_xml(&e.doc.body[k..=k]));
+    let ids = id(&e, title);
+    e.insert_newline();
+    assert!(!has_boundaries(&e.doc.body[title]));
+    assert_eq!(id(&e, title + 1), ids);
+    assert_eq!(text_at(&e, &[title + 1]), "My title");
+}
+
+#[test]
+fn a_continued_placeholder_drops_the_originals_binding() {
+    let mut e = ed(&format!(
+        "{}<w:p><w:r><w:t>Body text</w:t></w:r></w:p>{SECT}",
+        crate::cover::tests::WORD_COVER
+    ));
+    let title = field_para(&e, Placeholder::Title);
+    e.caret = Caret {
+        path: vec![title],
+        offset: 6,
+    };
+    e.insert_newline();
+    assert!(inline_controls_balance(&e));
+    let first = blocks_to_xml(&e.doc.body[title..=title]);
+    let second = blocks_to_xml(&e.doc.body[title + 1..=title + 1]);
+    assert!(first.contains("w:showingPlcHdr") && first.contains("w:dataBinding"));
+    assert!(
+        second.contains("<w:alias w:val=\"Title\"/>")
+            && !second.contains("w:showingPlcHdr")
+            && !second.contains("w:dataBinding")
+            && !second.contains("<w:id "),
+        "{second}"
+    );
+}
