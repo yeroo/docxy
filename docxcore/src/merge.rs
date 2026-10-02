@@ -8,6 +8,7 @@
 
 pub mod csv;
 pub mod fields;
+pub mod finish;
 pub mod preview;
 
 pub use csv::Recipients;
@@ -15,4 +16,5 @@ pub use fields::{
     AddressField, FieldMap, GreetingName, MergeContext, MergeFieldKind, address_block_field, eval,
     field_kind, greeting_line_field, instr_kind, merge_field, might_be_merge_field, rule_field,
 };
+pub use finish::{MergeOptions, MergeRange, merge_package, merge_rows};
 pub use preview::MergePreview;

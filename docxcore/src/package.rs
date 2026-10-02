@@ -3308,7 +3308,7 @@ mod tests {
         // A real edit, so the body is re-serialized rather than kept verbatim.
         pkg.document
             .body
-            .push(crate::model::Block::Paragraph(Default::default()));
+            .insert(0, crate::model::Block::Paragraph(Default::default()));
         let saved = load_package(&save_package(&pkg)).unwrap();
         let xml = saved.part_text("word/document.xml").unwrap();
         assert!(xml.contains("<w:framePr w:wrap=\"auto\"/>"), "{xml}");
