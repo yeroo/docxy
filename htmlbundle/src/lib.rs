@@ -260,7 +260,6 @@ fn payload_block_text(meta: &Meta, payload: &[u8]) -> String {
     format!("\n{}\n{}\n", meta.to_json(), base64::encode(payload))
 }
 
-/// Byte range of the payload element's text.
 /// Whether a file's bytes are a docxy bundle (they hold the payload block),
 /// before decoding them as text: any other page, a Word Web Page in
 /// windows-1252 among them, is opened as HTML instead (#633). A bundle whose
@@ -270,6 +269,7 @@ pub fn is_bundle(bytes: &[u8]) -> bool {
     bytes.len() >= open.len() && bytes.windows(open.len()).any(|w| w == open)
 }
 
+/// Byte range of the payload element's text.
 fn payload_span(html: &str) -> Result<(usize, usize), Error> {
     let open = html.rfind(PAYLOAD_OPEN).ok_or(Error::NotABundle)?;
     let start = open + PAYLOAD_OPEN.len();
