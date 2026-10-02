@@ -3,7 +3,7 @@
 ; Per-user (no UAC): installs suite.exe, a Start-Menu shortcut, and OPTIONAL
 ; file associations for .docx / .xlsx. Compile in CI with:
 ;   iscc /DAppVersion=%VER% /DSrcDir=<staging> packaging\inno\suite.iss
-; where <staging> holds suite.exe and docxy.ico.
+; where <staging> holds suite.exe, suite.pdb and docxy.ico.
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
@@ -41,6 +41,7 @@ VersionInfoDescription=docxy desktop suite installer
 
 [Files]
 Source: "{#SrcDir}\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SrcDir}\suite.pdb"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#IcoDir}\docxy.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]

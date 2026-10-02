@@ -116,8 +116,12 @@ is often the only place a panic shows up. An entry has a UTC timestamp, pid,
 version, thread, message, `file:line:col` and a backtrace. Past 256 KiB the log
 moves to `crash.log.1`. A stack overflow, a native or GPU access violation, an
 abort and `taskkill` never reach it, so for those the exit code is the only
-evidence. A release backtrace resolves function names only through `suite.pdb`
-next to the exe, and has no line numbers.
+evidence. On Windows and Linux a release build carries line tables
+(`debug = "line-tables-only"` in `suite/Cargo.toml`), so its backtrace names
+each frame's file and line. On Windows they resolve through `suite.pdb` next
+to the exe, which the installer ships; without it every frame reads
+`<unknown>`. The macOS `.app` ships no dSYM, so its backtraces have no line
+numbers.
 
 ## Driving one by hand
 
