@@ -218,13 +218,50 @@ fn bench_recalc_rect_readers(c: &mut Criterion) {
     });
 }
 
-fn bench_recalc_block_readers(c: &mut Criterion) {
+/// The Use-2 shape (#948 plan-rect-both): each iteration replaces one
+/// formula, so `set_cell` drops the cached reverse map and the recalc
+/// rebuilds it through `take_rev` — the build this change rewrote. (`recalc_all`
+/// alone never reaches `take_rev`: it goes straight to `evaluate`.)
+fn bench_edit_formula_block_readers(c: &mut Criterion) {
     let pkg = block_readers_workbook(1000, 10);
-    c.bench_function("recalc_block_readers_1000x10", |b| {
+    let mut wb = pkg.workbook.clone();
+    let mut eng = Engine::new(&wb);
+    eng.recalc_all(&mut wb);
+    let cell = (0, 2, 70); // free: right of the 50 readers
+    let mut toggle = false;
+    c.bench_function("edit_formula_block_readers_1000x10", |b| {
         b.iter(|| {
-            let mut wb = pkg.workbook.clone();
-            let mut eng = Engine::new(&wb);
-            eng.recalc_all(&mut wb);
+            // Two texts, so every iteration really changes `formulas` and
+            // invalidates the cache.
+            toggle = !toggle;
+            let f = if toggle {
+                "SUM(A1:J1000)"
+            } else {
+                "SUM(A1:J999)"
+            };
+            eng.set_cell(&mut wb, cell, Cell::formula(f));
+            black_box(&wb);
+        })
+    });
+}
+
+/// The same rebuild shape over the tall/wide readers of #878/#935.
+fn bench_edit_formula_rect_readers(c: &mut Criterion) {
+    let pkg = rect_readers_workbook(1000, 10);
+    let mut wb = pkg.workbook.clone();
+    let mut eng = Engine::new(&wb);
+    eng.recalc_all(&mut wb);
+    let cell = (0, 2, 70); // free: right of the wide readers
+    let mut toggle = false;
+    c.bench_function("edit_formula_rect_readers_1000x10", |b| {
+        b.iter(|| {
+            toggle = !toggle;
+            let f = if toggle {
+                "SUM(A1:J1000)"
+            } else {
+                "SUM(A1:J999)"
+            };
+            eng.set_cell(&mut wb, cell, Cell::formula(f));
             black_box(&wb);
         })
     });
@@ -274,7 +311,8 @@ criterion_group!(
     bench_edit_rect_readers,
     bench_edit_block_readers,
     bench_recalc_rect_readers,
-    bench_recalc_block_readers,
+    bench_edit_formula_rect_readers,
+    bench_edit_formula_block_readers,
     bench_xlsx_roundtrip,
     bench_formula_parse
 );
