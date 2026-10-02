@@ -4402,8 +4402,10 @@ fn load_or_recover(bytes: &[u8]) -> Loaded {
         return loaded;
     }
     match docxcore::import::recover_docx_text(bytes) {
-        Some(doc) => Loaded::converted(Ok(doc), open_mode::Converted::Recovered),
-        None => loaded,
+        Ok(Some(doc)) => Loaded::converted(Ok(doc), open_mode::Converted::Recovered),
+        Ok(None) => loaded,
+        // Too large or too complex to recover: say so, not the zip error.
+        Err(e) => Loaded::empty(format!("load error: {e}")),
     }
 }
 
@@ -4462,9 +4464,12 @@ fn doc_from_path(path: &PathBuf) -> Loaded {
 fn recovered_text_from_path(path: &std::path::Path) -> Loaded {
     match std::fs::read(path) {
         Ok(bytes) => {
-            let doc = docxcore::import::recover_docx_text(&bytes)
-                .unwrap_or_else(|| docxcore::import::recover_any_text(&bytes));
-            Loaded::converted(Ok(doc), open_mode::Converted::RecoveredText)
+            let doc = match docxcore::import::recover_docx_text(&bytes) {
+                Ok(Some(doc)) => Ok(doc),
+                Ok(None) => docxcore::import::recover_any_text(&bytes),
+                Err(e) => Err(e),
+            };
+            Loaded::converted(doc, open_mode::Converted::RecoveredText)
         }
         Err(e) => Loaded::empty(format!("read error: {e}")),
     }
@@ -4627,6 +4632,19 @@ fn sheet_tab_from_path(path: &PathBuf, repair: bool) -> DocTab {
     }
 }
 
+/// The mode `path` actually opens in: a workbook takes Excel's modes, a
+/// document only Recover Text (#633), a project none. The one rule
+/// `open_path` (for its reopen check) and `tab_from_path_mode` both use.
+fn effective_mode(path: &std::path::Path, mode: OpenMode) -> OpenMode {
+    match (is_project_path(path), is_sheet_path(path), mode) {
+        (true, _, _) => OpenMode::Normal,
+        (false, true, OpenMode::RecoverText) => OpenMode::Normal,
+        (false, true, mode) => mode,
+        (false, false, OpenMode::RecoverText) => OpenMode::RecoverText,
+        (false, false, _) => OpenMode::Normal,
+    }
+}
+
 /// A document tab for `path` opened in `mode`: Recover Text from Any File
 /// (#633) opens its recovered text; every other mode opens it as usual. A
 /// downloaded document opens in Protected View, as a workbook does (#610),
@@ -4659,17 +4677,13 @@ fn tab_from_path_mode(
     mode: OpenMode,
     trusted: &trusted::TrustStore,
 ) -> Result<DocTab, String> {
+    let mode = effective_mode(path, mode);
     if is_project_path(path) {
         return Ok(tab_from_path(path));
     }
     if !is_sheet_path(path) {
         return Ok(doc_tab_from_path_mode(path, mode, trusted));
     }
-    // Recover Text is a document's; a workbook opens as usual.
-    let mode = match mode {
-        OpenMode::RecoverText => OpenMode::Normal,
-        mode => mode,
-    };
     let protected = open_mode::is_protected_zone(open_mode::zone_id(path))
         && !trusted.is_trusted(path, trusted::Stamp::of(path));
     // A template already opens as a new, untitled workbook, which is what a
@@ -13975,21 +13989,26 @@ fn doc_target_allowed(path: &std::path::Path) -> bool {
 /// What a Save onto the file a tab could not load says (#209).
 const DOC_LOAD_FAILED_SAVE: &str = "this file could not be opened; use Save As to save a new copy";
 
+/// Whether a save to `target` would write the tab's own file: in place
+/// (`target` `None`), or a Save As that picks that same file (compared
+/// canonically, falling back to the paths as given when either cannot be
+/// resolved). A tab with no file of its own writes it only in place.
+fn writes_own_file(own: Option<&std::path::Path>, target: Option<&std::path::Path>) -> bool {
+    match (own, target) {
+        (_, None) => true,
+        (Some(own), Some(target)) => own == target || canonical(own) == canonical(target),
+        (None, Some(_)) => false,
+    }
+}
+
 /// Whether a save must be refused because it would write a load-failed tab's
-/// placeholder over the file it could not load: in place (`target` `None`),
-/// or a Save As that picks that same file (compared canonically, falling back
-/// to the paths as given when either cannot be resolved).
+/// placeholder over the file it could not load ([`writes_own_file`]).
 fn refuses_load_failed_save(
     load_failed: bool,
     own: Option<&std::path::Path>,
     target: Option<&std::path::Path>,
 ) -> bool {
-    load_failed
-        && match (own, target) {
-            (_, None) => true,
-            (Some(own), Some(target)) => own == target || canonical(own) == canonical(target),
-            (None, Some(_)) => false,
-        }
+    load_failed && writes_own_file(own, target)
 }
 
 /// Write a document tab to `target` (Save As, or the first save of a
@@ -14018,9 +14037,7 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
         tab.status = open_mode::PROTECTED_STATUS.into();
         return false;
     }
-    if tab.access.converted.is_some()
-        && refuses_load_failed_save(true, tab.path.as_deref(), target.as_deref())
-    {
+    if tab.access.converted.is_some() && writes_own_file(tab.path.as_deref(), target.as_deref()) {
         let name = tab
             .path
             .as_deref()
@@ -14450,13 +14467,7 @@ impl Docxy {
         self.project_prompt_cancel();
         let path = path.to_path_buf();
         // A workbook takes Excel's modes, a document Recover Text (#633).
-        let mode = match (is_project_path(&path), is_sheet_path(&path), mode) {
-            (true, _, _) => OpenMode::Normal,
-            (false, true, OpenMode::RecoverText) => OpenMode::Normal,
-            (false, true, mode) => mode,
-            (false, false, OpenMode::RecoverText) => OpenMode::RecoverText,
-            (false, false, _) => OpenMode::Normal,
-        };
+        let mode = effective_mode(&path, mode);
         let open = (mode != OpenMode::Copy)
             .then(|| {
                 let key = canonical(&path);

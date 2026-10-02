@@ -1261,7 +1261,9 @@ fn a_corrupt_sidecar_reopens_the_file_from_disk() {
     let cut = at + name.len() + size * 2 / 3;
     std::fs::write(p.hot.as_ref().unwrap(), &hot[..cut]).unwrap();
     assert!(
-        docxcore::import::recover_docx_text(&hot[..cut]).is_some(),
+        docxcore::import::recover_docx_text(&hot[..cut])
+            .unwrap()
+            .is_some(),
         "the cut sidecar has text Recover Text could read"
     );
     let r = restore_tab(&p);
