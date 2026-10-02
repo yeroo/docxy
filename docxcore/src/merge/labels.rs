@@ -332,7 +332,9 @@ pub fn insert_labels(editor: &mut crate::editor::Editor, spec: &LabelSpec, fill:
 
 /// Update Labels on the table holding the caret, as one undo step.
 pub fn update_labels_at_caret(editor: &mut crate::editor::Editor) -> Result<bool, String> {
-    editor.edit_table_at_caret(update_labels)
+    editor
+        .edit_table_at_caret(update_labels)
+        .map_err(|_| "Put the cursor in the label table first".to_string())
 }
 
 /// Whether grid column `c` of a label table is a label (not a spacer): the
@@ -449,7 +451,14 @@ mod tests {
         assert!(ed.undo());
         assert!(ed.doc.plain_text().contains("old"));
         // Outside a table there is nothing to update.
-        assert!(update_labels_at_caret(&mut ed).is_err());
+        assert_eq!(
+            update_labels_at_caret(&mut ed),
+            Err("Put the cursor in the label table first".into())
+        );
+        assert_eq!(
+            ed.edit_table_at_caret(|_| true),
+            Err("the caret is not in a table".into())
+        );
     }
 
     #[test]

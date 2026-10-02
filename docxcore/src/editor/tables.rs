@@ -213,10 +213,10 @@ impl Editor {
             .into_iter()
             .next()
         else {
-            return Err("Put the cursor in the label table first".into());
+            return Err("the caret is not in a table".into());
         };
         let Some(mut table) = table_at(&self.doc.body, &pos.table).cloned() else {
-            return Err("Put the cursor in the label table first".into());
+            return Err("the caret is not in a table".into());
         };
         if !f(&mut table) {
             return Ok(false);
