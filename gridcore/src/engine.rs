@@ -1431,10 +1431,11 @@ impl Engine {
         if let Some((h, w)) = cse {
             return self.fill_cse(sheet, key, (h, w), old, result);
         }
+        let array_result = shaped && spill;
         // A modern formula of ours (not a loaded `t="array"` one, which keeps
         // its `<f>` attributes) that produced an array is a dynamic array from
         // now on, whatever it evaluates to later: it saves with a `cm`.
-        if shaped && spill {
+        if array_result {
             if let Some(cell) = sheet.cells.get_mut(&(r, c)) {
                 if cell.f_attrs.is_none() && !cell.is_dynamic() {
                     cell.meta.get_or_insert_default().dynamic = true;
@@ -1447,11 +1448,10 @@ impl Engine {
                 changed.extend(clear_spill(sheet, s, (r, c), old, None));
                 // A 1x1 computed array (SEQUENCE(1)) is still a spill anchor:
                 // A1# resolves to the anchor cell, as in Excel (#934).
-                let one_by_one = shaped && spill;
                 let entry = sheet.cells.entry((r, c)).or_default();
                 entry.value = value_to_cell(v);
-                entry.spill = one_by_one.then_some((1, 1));
-                if one_by_one {
+                entry.spill = array_result.then_some((1, 1));
+                if array_result {
                     self.note_spill(key, 1);
                 }
                 self.spill_blocked.remove(&key);
