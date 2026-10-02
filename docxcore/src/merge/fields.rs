@@ -68,14 +68,13 @@ pub fn field_kind(raw: &str) -> Option<MergeFieldKind> {
 }
 
 /// A cheap test that rules out most fields without parsing: every merge
-/// field's keyword is in its XML. Used where a frame paints every field.
+/// field's keyword is in its XML, in any case. Used where a frame paints
+/// every field, so it allocates nothing.
 pub fn might_be_merge_field(raw: &str) -> bool {
-    ["MERGE", "ADDRESSBLOCK", "GREETINGLINE", "NEXT"]
+    let raw = raw.as_bytes();
+    [&b"MERGE"[..], b"ADDRESSBLOCK", b"GREETINGLINE", b"NEXT"]
         .iter()
-        .any(|k| raw.contains(k))
-        || ["merge", "addressblock", "greetingline", "next"]
-            .iter()
-            .any(|k| raw.to_ascii_lowercase().contains(k))
+        .any(|k| raw.windows(k.len()).any(|w| w.eq_ignore_ascii_case(k)))
 }
 
 /// The mail-merge field an (entity-decoded) instruction is, if any.
