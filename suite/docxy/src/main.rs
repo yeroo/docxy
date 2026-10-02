@@ -24,6 +24,7 @@ compile_error!(
 
 mod close;
 mod control;
+mod convert_child;
 #[cfg(test)]
 mod convert_tests;
 mod crashlog;
@@ -4396,17 +4397,53 @@ fn load_bytes(bytes: &[u8]) -> Loaded {
 /// [`load_bytes`], or for a Word package that will not load, the text that
 /// can still be read from it, as a converted tab (#633); the load error
 /// stays when nothing can be.
-fn load_or_recover(bytes: &[u8]) -> Loaded {
+fn load_or_recover(path: &std::path::Path, bytes: &[u8]) -> Loaded {
     let loaded = load_bytes(bytes);
     if !loaded.load_failed {
         return loaded;
     }
-    match docxcore::import::recover_docx_text(bytes) {
-        Ok(Some(doc)) => Loaded::converted(Ok(doc), open_mode::Converted::Recovered),
-        Ok(None) => loaded,
-        // Too large or too complex to recover: say so, not the zip error.
-        Err(e) => Loaded::empty(format!("load error: {e}")),
+    convert_doc(path, bytes, convert_child::What::Recover).unwrap_or(loaded)
+}
+
+/// Convert `path` (whose content is `bytes`) as `what` (#633). In a child
+/// process ([`convert_child`]), so an import that aborts, runs out of
+/// memory or hangs costs that child only, and is a load error here; in
+/// process for unit tests or with `DOCXY_CONVERT_IN_PROCESS=1`. `None` only
+/// when recovery found no text.
+fn convert_doc(path: &std::path::Path, bytes: &[u8], what: convert_child::What) -> Option<Loaded> {
+    use convert_child::{Outcome, What};
+    let kind = match what {
+        What::Rtf => open_mode::Converted::Rtf,
+        What::Html => open_mode::Converted::Html,
+        What::Pdf => open_mode::Converted::Pdf,
+        What::Recover => open_mode::Converted::Recovered,
+        What::RecoverText => open_mode::Converted::RecoveredText,
+    };
+    if convert_child::in_process() {
+        return match convert_child::convert_bytes(what, bytes) {
+            Ok(Some(doc)) => Some(Loaded::converted(Ok(doc), kind)),
+            Ok(None) => None,
+            Err(e) => Some(Loaded::empty(format!("load error: {e}"))),
+        };
     }
+    Some(match convert_child::convert(what, path) {
+        Outcome::Converted(docx) => {
+            let mut l = load_bytes(&docx);
+            if l.load_failed {
+                return Some(Loaded::empty(format!(
+                    "load error: {}",
+                    convert_child::DIED
+                )));
+            }
+            l.status = kind
+                .loaded_status(docxcore::import::paragraph_count(&l.doc))
+                .into();
+            l.converted = Some(kind);
+            l
+        }
+        Outcome::Failed(why) => Loaded::empty(format!("load error: {why}")),
+        Outcome::NothingRecovered => return None,
+    })
 }
 
 /// What Word 97-2003 binaries and encrypted packages (both OLE compound
@@ -4442,20 +4479,14 @@ fn doc_from_path(path: &PathBuf) -> Loaded {
         .unwrap_or_default();
     match docxcore::import::sniff(&bytes, &ext) {
         Format::Html if htmlbundle::is_bundle(&bytes) => bundle_from_path(path),
-        Format::Html => Loaded::converted(
-            docxcore::import::import_html(&bytes),
-            open_mode::Converted::Html,
-        ),
-        Format::Rtf => Loaded::converted(
-            docxcore::import::import_rtf(&bytes),
-            open_mode::Converted::Rtf,
-        ),
-        Format::Pdf => Loaded::converted(
-            docxcore::import::import_pdf(&bytes),
-            open_mode::Converted::Pdf,
-        ),
+        Format::Html => convert_doc(path, &bytes, convert_child::What::Html)
+            .unwrap_or_else(|| Loaded::empty("load error: the HTML file holds no text")),
+        Format::Rtf => convert_doc(path, &bytes, convert_child::What::Rtf)
+            .unwrap_or_else(|| Loaded::empty("load error: the RTF file holds no text")),
+        Format::Pdf => convert_doc(path, &bytes, convert_child::What::Pdf)
+            .unwrap_or_else(|| Loaded::empty("load error: the PDF has no text to convert")),
         Format::Cfb => Loaded::empty(DOC_CFB_UNSUPPORTED),
-        Format::Docx | Format::Unknown => load_or_recover(&bytes),
+        Format::Docx | Format::Unknown => load_or_recover(path, &bytes),
     }
 }
 
@@ -4463,14 +4494,9 @@ fn doc_from_path(path: &PathBuf) -> Loaded {
 /// it has any, else the printable text of whatever the file is.
 fn recovered_text_from_path(path: &std::path::Path) -> Loaded {
     match std::fs::read(path) {
-        Ok(bytes) => {
-            let doc = match docxcore::import::recover_docx_text(&bytes) {
-                Ok(Some(doc)) => Ok(doc),
-                Ok(None) => docxcore::import::recover_any_text(&bytes),
-                Err(e) => Err(e),
-            };
-            Loaded::converted(doc, open_mode::Converted::RecoveredText)
-        }
+        // Recover Text always finds something (one empty paragraph at least).
+        Ok(bytes) => convert_doc(path, &bytes, convert_child::What::RecoverText)
+            .unwrap_or_else(|| Loaded::empty(format!("load error: {}", convert_child::DIED))),
         Err(e) => Loaded::empty(format!("read error: {e}")),
     }
 }
@@ -28867,6 +28893,10 @@ fn quit_mode() -> QuitMode {
 }
 
 fn main() {
+    // A converting child (#633): the importer and nothing else, no window.
+    if let Some(code) = convert_child::child_main(&std::env::args_os().collect::<Vec<_>>()) {
+        std::process::exit(code);
+    }
     // First, before anything can panic: the release build has no console, so
     // a panic's only trace is the crash log (#733).
     crashlog::install(config_root());

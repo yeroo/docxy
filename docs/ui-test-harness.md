@@ -780,6 +780,14 @@ file that is already open without asking unless `reopen` is `"ask"` (see
   converted from another format, so Save needs Save As …`), and `save-as`
   over the file is refused (`"name.rtf" was converted; save it as a Word
   document under a new name.`).
+- **Conversions run in a child process** (#633): an RTF, Web Page, PDF,
+  damaged `.docx` or Recover Text open spawns the suite itself as
+  `--convert-import <what> <in> <out.docx>` (at most 60 s; on Windows in a
+  Job object limited to 2 GiB), so a conversion that dies or hangs is a
+  `load error: the file could not be converted` / `… took too long`, not a
+  dead instance. `DOCXY_CONVERT_IN_PROCESS=1` converts in process instead.
+  `uiharness/tests/open_converted.rs` (desktop-only, `--ignored`) opens the
+  Word fixtures through it.
 - **Trusted documents** (#882): Enable Editing records the file in
   `<DOCXY_CONFIG_DIR>/docxy/trusted.json` by its canonical path, length and
   modified time as it was opened. That file opens again without Protected
