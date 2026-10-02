@@ -375,7 +375,11 @@ mod tests {
     /// profile must keep them.
     #[test]
     fn release_profile_keeps_line_tables() {
-        let manifest = include_str!("../../Cargo.toml");
+        // Not `include_str!` (see uiharness/src/expect.rs): a missing file must
+        // fail the test rather than break the build of the whole test target.
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../Cargo.toml");
+        let manifest =
+            std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
         let mut in_release = false;
         let mut has_line_tables = false;
         for line in manifest.lines() {
@@ -398,7 +402,8 @@ mod tests {
     /// to suite.exe (#795), so the installer must ship it into {app}.
     #[test]
     fn the_suite_installer_ships_the_pdb() {
-        let iss = include_str!("../../../packaging/inno/suite.iss");
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/inno/suite.iss");
+        let iss = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
         assert!(
             iss.lines().any(|line| {
                 let line = line.trim();
