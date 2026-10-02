@@ -644,3 +644,31 @@ fn clicks_toggle_pick_and_step_through_set() {
     );
     assert_eq!(focused_name(&s), Some("calendar"));
 }
+
+#[test]
+fn a_write_back_child_hands_its_values_to_the_open_parent() {
+    // The form's Details... opens a write-back child here.
+    let mut parent = form();
+    for b in &mut parent.buttons {
+        if b.label == "Details..." {
+            b.role = ButtonRole::Open(ChildDialog::TestWriteBack);
+        }
+    }
+    let mut s = DialogStack::default();
+    s.push(parent);
+    s.click("Details...", |_| panic!("opening a child is not an apply"))
+        .unwrap();
+    s.set("Note", &args(r#"{"value":"from the child"}"#))
+        .unwrap();
+    // OK never reaches an owner: the parent takes the values and stays open.
+    s.click("OK", |_| panic!("a write-back child applies nothing"))
+        .unwrap();
+    assert_eq!(s.depth(), 1);
+    assert_eq!(s.top_id(), "form");
+    assert_eq!(text(&s, "name"), "from the child");
+    // Cancel on the child changes nothing.
+    s.click("Details...", |_| Ok(())).unwrap();
+    s.set("Note", &args(r#"{"value":"dropped"}"#)).unwrap();
+    s.click("Cancel", |_| Ok(())).unwrap();
+    assert_eq!(text(&s, "name"), "from the child");
+}

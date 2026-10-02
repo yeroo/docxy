@@ -4269,7 +4269,7 @@ mod tests {
                 .map(|t| t.get_str("name").unwrap())
                 .collect::<Vec<_>>(),
             vec![
-                "File", "Home", "Insert", "Layout", "Mailings", "Review", "View"
+                "File", "Home", "Insert", "Design", "Layout", "Mailings", "Review", "View"
             ]
         );
         let tabs_on = on.get("tabs").unwrap().as_array().unwrap();

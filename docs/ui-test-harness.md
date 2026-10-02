@@ -445,8 +445,9 @@ footer editor; `selection-set` refuses while it is open.
 command's `enabled` is the predicate its button draws with (every document and
 Project ribbon command is enabled today except the document Layout tab's
 placeholders, `LayoutAct::Unavailable`: Line Numbering Options..., Manual and
-Hyphenation Options...; sheet placeholders, drawn but doing nothing yet, report
-`enabled: false`, see below), and a command inside a split button's or a
+Hyphenation Options..., and the Design tab's Page Borders on a Markdown tab,
+which keeps no section properties; sheet placeholders, drawn but doing nothing
+yet, report `enabled: false`, see below), and a command inside a split button's or a
 drop-down's menu carries `menu`, its button's id (Set Baseline's `Set Baseline...` and `Clear
 Baseline...` read `menu: "pr-baseline"`). Each command carries a `label` and a
 screentip `tip.title`; on the Project ribbon they are Microsoft Project 2024's,
@@ -791,6 +792,7 @@ included. Each has a stable id, which the state's `dialog` key reports:
 |---|---|
 | `delete-summary` | Project: delete a summary task and its subtasks (`project-dialog.uit`) |
 | `page-setup`, `columns` | Word's Page Setup and Columns (#649) |
+| `more-colors`, `fill-effects`, `watermark`, `page-borders`, `page-border-options` | the Design tab (#651): Page Color's More Colors and Fill Effects, Custom Watermark (Word's Printed Watermark), and Borders and Shading's Page Border tab with its Options... child, whose OK writes its margins back into `page-borders` instead of the document |
 | `hf-distance`, `page-number-format` | the Header & Footer tab's distance box (#641) and Page Number Format (#650) |
 | `insert-table`, `delete-cells`, `split-cells`, `sort`, `convert-to-text`, `convert-text-to-table` | the table dialogs (#646, #647) |
 | `text-to-columns`, `text-to-columns-replace` | Excel's Convert Text to Columns Wizard and its replace question (#692) |
@@ -911,7 +913,18 @@ Menus open today:
   and the document's hyphenation). Line Numbering Options..., Manual and
   Hyphenation Options... read `enabled: false`. Custom Margins... and More
   Paper Sizes... open the `page-setup` dialog, and More Columns... the
-  `columns` one.
+  `columns` one;
+- **the Design tab's Page Color and Watermark** (#651): drop-downs whose press,
+  or KeyTip (Alt, G, P, C and Alt, G, P, W), opens the menu;
+  `menu-open {"ribbon": ["Design", "Page Background", "Page Color"]}` opens
+  one. Page Color has `Theme Colors` and `Standard Colors` headings over ten
+  colours each, then No Color, More Colors... (the `more-colors` dialog) and
+  Fill Effects... (`fill-effects`); the document's solid page colour, or No
+  Color, is `checked`. Watermark has Word's gallery under `Confidential`,
+  `Disclaimers` and `Urgent` headings (each text diagonal, 1, and horizontal,
+  2), then Custom Watermark... (`watermark`) and Remove Watermark; the
+  watermark the document shows is `checked`. Page Borders (Alt, G, P, B) is a
+  button that opens `page-borders`.
 
 | Verb | Args | Reply |
 |---|---|---|

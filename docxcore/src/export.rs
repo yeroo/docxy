@@ -3874,6 +3874,8 @@ mod tests {
             fill: None,
             width_pt,
             font_size_pt,
+            font: None,
+            opacity: None,
         }
     }
 

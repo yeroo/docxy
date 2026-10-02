@@ -258,10 +258,11 @@ fn ribbon_context_survives_valid_switches_only() {
     assert_eq!(ribbon_tab_index(RibbonTab::View, Kind::Project), 4);
     assert_eq!(ribbon_tab_index(RibbonTab::Project, Kind::Project), 3);
     assert_eq!(ribbon_tab_name(RibbonTab::Project), "Project");
-    // Documents have the page Layout (#649) and Mailings (#628) tabs before
-    // Review and View; workbooks have neither.
-    assert_eq!(ribbon_tab_index(RibbonTab::View, Kind::Docx), 5);
-    assert_eq!(ribbon_tab_index(RibbonTab::Mailings, Kind::Docx), 3);
+    // Documents have the Design (#651), page Layout (#649) and Mailings
+    // (#628) tabs before Review and View; workbooks have none of them.
+    assert_eq!(ribbon_tab_index(RibbonTab::View, Kind::Docx), 6);
+    assert_eq!(ribbon_tab_index(RibbonTab::Design, Kind::Docx), 2);
+    assert_eq!(ribbon_tab_index(RibbonTab::Mailings, Kind::Docx), 4);
     assert!(
         valid_ribbon_tab(Kind::Docx, RibbonTab::Mailings, false, false, false)
             == RibbonTab::Mailings

@@ -81,8 +81,17 @@ fn apply_dialog(
         | DialogOwner::MailMergeToNew
         | DialogOwner::MailAttach { .. }
         | DialogOwner::MailReport => Err("a mail merge dialog applies through Mailings".into()),
+        // Handled in `design_dialogs::click`, before this; Options... writes
+        // back into Page Borders in the dialog stack.
+        DialogOwner::DesignMoreColors
+        | DialogOwner::DesignFillEffects
+        | DialogOwner::DesignWatermark
+        | DialogOwner::DesignPageBorders
+        | DialogOwner::DesignBorderOptions => {
+            Err("a Design dialog applies through the Design tab".into())
+        }
         #[cfg(test)]
-        DialogOwner::Test => Ok(false),
+        DialogOwner::Test | DialogOwner::TestChild => Ok(false),
     }
 }
 
@@ -128,6 +137,9 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Result<(), String>
         return done;
     }
     if let Some(done) = crate::mailings_dialogs::click(tab, button) {
+        return done;
+    }
+    if let Some(done) = crate::design_dialogs::click(tab, button) {
         return done;
     }
     let DocTab {

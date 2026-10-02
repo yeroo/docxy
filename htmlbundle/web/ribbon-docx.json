@@ -1109,6 +1109,513 @@
       ]
     },
     {
+      "name": "Design",
+      "keyTip": "G",
+      "kind": "ribbon",
+      "groups": [
+        {
+          "title": "Page Background",
+          "priority": 30,
+          "launcher": null,
+          "items": [
+            {
+              "kind": "dropdown",
+              "cmd": {
+                "id": "pagecolor",
+                "label": "Page Color",
+                "icon": "page-color",
+                "act": "Design(Menu(PageColor))",
+                "keyTip": "PC",
+                "tip": {
+                  "title": "Page Color",
+                  "body": "",
+                  "shortcut": ""
+                }
+              },
+              "items": [
+                {
+                  "id": "color-white",
+                  "label": "White, Background 1",
+                  "icon": "page-color",
+                  "act": "Design(PageColor(Some(16777215)))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "color-black",
+                  "label": "Black, Text 1",
+                  "icon": "page-color",
+                  "act": "Design(PageColor(Some(0)))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "color-bg2",
+                  "label": "Gray, Background 2",
+                  "icon": "page-color",
+                  "act": "Design(PageColor(Some(15197926)))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "color-text2",
+                  "label": "Blue-Gray, Text 2",
+                  "icon": "page-color",
+                  "act": "Design(PageColor(Some(4478058)))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "color-accent1",
+                  "label": "Blue, Accent 1",
+                  "icon": "page-color",
+                  "act": "Design(PageColor(Some(4485828)))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "color-accent2",
+                  "label": "Orange, Accent 2",
+                  "icon": "page-color",
+                  "act": "Design(PageColor(Some(15564081)))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "color-accent3",
+                  "label": "Gray, Accent 3",
+                  "icon": "page-color",
+                  "act": "Design(PageColor(Some(10855845)))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "color-accent4",
+                  "label": "Gold, Accent 4",
+                  "icon": "page-color",
+                  "act": "Design(PageColor(Some(16760832)))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "color-accent5",
+                  "label": "Blue, Accent 5",
+                  "icon": "page-color",
+                  "act": "Design(PageColor(Some(6003669)))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "color-accent6",
+                  "label": "Green, Accent 6",
+                  "icon": "page-color",
+                  "act": "Design(PageColor(Some(7384391)))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "color-darkred",
+                  "label": "Dark Red",
+                  "icon": "page-color",
+                  "act": "Design(PageColor(Some(12582912)))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "color-red",
+                  "label": "Red",
+                  "icon": "page-color",
+                  "act": "Design(PageColor(Some(16711680)))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "color-orange",
+                  "label": "Orange",
+                  "icon": "page-color",
+                  "act": "Design(PageColor(Some(16760832)))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "color-yellow",
+                  "label": "Yellow",
+                  "icon": "page-color",
+                  "act": "Design(PageColor(Some(16776960)))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "color-lightgreen",
+                  "label": "Light Green",
+                  "icon": "page-color",
+                  "act": "Design(PageColor(Some(9621584)))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "color-green",
+                  "label": "Green",
+                  "icon": "page-color",
+                  "act": "Design(PageColor(Some(45136)))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "color-lightblue",
+                  "label": "Light Blue",
+                  "icon": "page-color",
+                  "act": "Design(PageColor(Some(45296)))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "color-blue",
+                  "label": "Blue",
+                  "icon": "page-color",
+                  "act": "Design(PageColor(Some(28864)))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "color-darkblue",
+                  "label": "Dark Blue",
+                  "icon": "page-color",
+                  "act": "Design(PageColor(Some(8288)))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "color-purple",
+                  "label": "Purple",
+                  "icon": "page-color",
+                  "act": "Design(PageColor(Some(7352480)))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "color-none",
+                  "label": "No Color",
+                  "icon": "page-color",
+                  "act": "Design(PageColor(None))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "color-more",
+                  "label": "More Colors...",
+                  "icon": "page-color",
+                  "act": "Design(MoreColors)",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "color-fill",
+                  "label": "Fill Effects...",
+                  "icon": "page-color",
+                  "act": "Design(FillEffects)",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "dropdown",
+              "cmd": {
+                "id": "watermark",
+                "label": "Watermark",
+                "icon": "watermark",
+                "act": "Design(Menu(Watermark))",
+                "keyTip": "PW",
+                "tip": {
+                  "title": "Watermark",
+                  "body": "",
+                  "shortcut": ""
+                }
+              },
+              "items": [
+                {
+                  "id": "wm-confidential-1",
+                  "label": "CONFIDENTIAL 1",
+                  "icon": "watermark",
+                  "act": "Design(Watermark(0))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "wm-confidential-2",
+                  "label": "CONFIDENTIAL 2",
+                  "icon": "watermark",
+                  "act": "Design(Watermark(1))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "wm-donotcopy-1",
+                  "label": "DO NOT COPY 1",
+                  "icon": "watermark",
+                  "act": "Design(Watermark(2))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "wm-donotcopy-2",
+                  "label": "DO NOT COPY 2",
+                  "icon": "watermark",
+                  "act": "Design(Watermark(3))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "wm-draft-1",
+                  "label": "DRAFT 1",
+                  "icon": "watermark",
+                  "act": "Design(Watermark(4))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "wm-draft-2",
+                  "label": "DRAFT 2",
+                  "icon": "watermark",
+                  "act": "Design(Watermark(5))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "wm-sample-1",
+                  "label": "SAMPLE 1",
+                  "icon": "watermark",
+                  "act": "Design(Watermark(6))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "wm-sample-2",
+                  "label": "SAMPLE 2",
+                  "icon": "watermark",
+                  "act": "Design(Watermark(7))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "wm-asap-1",
+                  "label": "ASAP 1",
+                  "icon": "watermark",
+                  "act": "Design(Watermark(8))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "wm-asap-2",
+                  "label": "ASAP 2",
+                  "icon": "watermark",
+                  "act": "Design(Watermark(9))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "wm-urgent-1",
+                  "label": "URGENT 1",
+                  "icon": "watermark",
+                  "act": "Design(Watermark(10))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "wm-urgent-2",
+                  "label": "URGENT 2",
+                  "icon": "watermark",
+                  "act": "Design(Watermark(11))",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "wm-custom",
+                  "label": "Custom Watermark...",
+                  "icon": "watermark",
+                  "act": "Design(CustomWatermark)",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "wm-remove",
+                  "label": "Remove Watermark",
+                  "icon": "watermark",
+                  "act": "Design(RemoveWatermark)",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                }
+              ]
+            },
+            {
+              "kind": "large",
+              "cmd": {
+                "id": "pageborders",
+                "label": "Page Borders",
+                "icon": "page-borders",
+                "act": "Design(PageBorders)",
+                "keyTip": "PB",
+                "tip": {
+                  "title": "Page Borders",
+                  "body": "",
+                  "shortcut": ""
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
       "name": "Layout",
       "keyTip": "P",
       "kind": "ribbon",
@@ -3934,6 +4441,8 @@
     "mail-rules": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M10 3.5V7.5M10 7.5L5 11.5V16.5M10 7.5L15 11.5V16.5\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><circle cx=\"10\" cy=\"3.5\" r=\"1\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n</svg>",
     "mail-update": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M15.5 8.5A6 6 0 0 0 4.8 6.5M4.5 11.5A6 6 0 0 0 15.2 13.5\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M4.5 3.5V6.5H7.5M15.5 16.5V13.5H12.5\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n</svg>",
     "new": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M6 2C4.89543 2 4 2.89543 4 4V9.20703C4.32228 9.11588 4.65659 9.05337 5 9.02242V4C5 3.44772 5.44772 3 6 3H10V6.5C10 7.32843 10.6716 8 11.5 8H15V16C15 16.5523 14.5523 17 14 17H10.4003C10.2174 17.3578 9.99647 17.6929 9.74284 18H14C15.1046 18 16 17.1046 16 16V7.41421C16 7.01639 15.842 6.63486 15.5607 6.35355L11.6464 2.43934C11.3651 2.15804 10.9836 2 10.5858 2H6ZM14.7929 7H11.5C11.2239 7 11 6.77614 11 6.5V3.20711L14.7929 7ZM10 14.5C10 16.9853 7.98528 19 5.5 19C3.01472 19 1 16.9853 1 14.5C1 12.0147 3.01472 10 5.5 10C7.98528 10 10 12.0147 10 14.5ZM6 12.5C6 12.2239 5.77614 12 5.5 12C5.22386 12 5 12.2239 5 12.5V14H3.5C3.22386 14 3 14.2239 3 14.5C3 14.7761 3.22386 15 3.5 15H5L5 16.5C5 16.7761 5.22386 17 5.5 17C5.77614 17 6 16.7761 6 16.5V15H7.5C7.77614 15 8 14.7761 8 14.5C8 14.2239 7.77614 14 7.5 14H6V12.5Z\" fill=\"#212121\"/>\n</svg>",
+    "page-borders": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<rect x=\"4.5\" y=\"2.5\" width=\"11\" height=\"15\" rx=\"1\" stroke=\"#212121\"/>\n<rect x=\"6.5\" y=\"4.5\" width=\"7\" height=\"11\" stroke=\"#212121\" stroke-dasharray=\"1.5 1.5\"/>\n</svg>",
+    "page-color": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M5.5 2.5H11.5L15.5 6.5V15.5C15.5 16.05 15.05 16.5 14.5 16.5H5.5C4.95 16.5 4.5 16.05 4.5 15.5V3.5C4.5 2.95 4.95 2.5 5.5 2.5Z\" stroke=\"#212121\" stroke-linejoin=\"round\"/>\n<path d=\"M11.5 2.5V6.5H15.5\" stroke=\"#212121\" stroke-linejoin=\"round\"/>\n<path d=\"M4 18H16\" stroke=\"#212121\" stroke-width=\"2\" stroke-linecap=\"round\"/>\n<path d=\"M10 8.5C10 8.5 11.75 10.6 11.75 11.75C11.75 12.72 10.97 13.5 10 13.5C9.03 13.5 8.25 12.72 8.25 11.75C8.25 10.6 10 8.5 10 8.5Z\" fill=\"#212121\"/>\n</svg>",
     "page-number": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<rect x=\"4.5\" y=\"2.5\" width=\"11\" height=\"15\" rx=\"1\" stroke=\"#212121\" stroke-width=\"1.3\" fill=\"none\"/>\n<line x1=\"7.6\" y1=\"8\" x2=\"12.4\" y2=\"8\" stroke=\"#212121\" stroke-width=\"1.2\" stroke-linecap=\"round\"/>\n<line x1=\"7.6\" y1=\"12\" x2=\"12.4\" y2=\"12\" stroke=\"#212121\" stroke-width=\"1.2\" stroke-linecap=\"round\"/>\n<line x1=\"9.2\" y1=\"6.4\" x2=\"8.4\" y2=\"13.6\" stroke=\"#212121\" stroke-width=\"1.2\" stroke-linecap=\"round\"/>\n<line x1=\"11.6\" y1=\"6.4\" x2=\"10.8\" y2=\"13.6\" stroke=\"#212121\" stroke-width=\"1.2\" stroke-linecap=\"round\"/>\n</svg>",
     "paragraph": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M13.5 8C12.1193 8 11 9.11929 11 10.5C11 11.8807 12.1193 13 13.5 13H14V8H13.5ZM14 14H13.5C11.567 14 10 12.433 10 10.5C10 8.567 11.567 7 13.5 7H17.5C17.7761 7 18 7.22386 18 7.5C18 7.77614 17.7761 8 17.5 8H17V17.5C17 17.7761 16.7761 18 16.5 18C16.2239 18 16 17.7761 16 17.5V8H15V17.5C15 17.7761 14.7761 18 14.5 18C14.2239 18 14 17.7761 14 17.5V14ZM2.5 5C2.22386 5 2 5.22386 2 5.5C2 5.77614 2.22386 6 2.5 6H17.5C17.7761 6 18 5.77614 18 5.5C18 5.22386 17.7761 5 17.5 5H2.5ZM9.25606 9H2.5C2.22386 9 2 9.22386 2 9.5C2 9.77614 2.22386 10 2.5 10H9.02746C9.06579 9.65327 9.14352 9.31841 9.25606 9ZM9.75777 13H2.5C2.22386 13 2 13.2239 2 13.5C2 13.7761 2.22386 14 2.5 14H10.6713C10.319 13.7149 10.0106 13.3776 9.75777 13Z\" fill=\"#212121\"/>\n</svg>",
     "paste": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M4.5 4H6.08535C6.29127 4.5826 6.84689 5 7.5 5H10.5C11.1531 5 11.7087 4.5826 11.9146 4H13.5C13.7761 4 14 4.22386 14 4.5V5.5C14 5.77614 14.2239 6 14.5 6C14.7761 6 15 5.77614 15 5.5V4.5C15 3.67157 14.3284 3 13.5 3H11.9146C11.7087 2.4174 11.1531 2 10.5 2H7.5C6.84689 2 6.29127 2.4174 6.08535 3H4.5C3.67157 3 3 3.67157 3 4.5V16.5C3 17.3284 3.67157 18 4.5 18H7.5C7.77614 18 8 17.7761 8 17.5C8 17.2239 7.77614 17 7.5 17H4.5C4.22386 17 4 16.7761 4 16.5V4.5C4 4.22386 4.22386 4 4.5 4ZM7.5 4C7.22386 4 7 3.77614 7 3.5C7 3.22386 7.22386 3 7.5 3H10.5C10.7761 3 11 3.22386 11 3.5C11 3.77614 10.7761 4 10.5 4H7.5ZM10.5 7C9.67157 7 9 7.67157 9 8.5V16.5C9 17.3284 9.67157 18 10.5 18H15.5C16.3284 18 17 17.3284 17 16.5V8.5C17 7.67157 16.3284 7 15.5 7H10.5ZM10 8.5C10 8.22386 10.2239 8 10.5 8H15.5C15.7761 8 16 8.22386 16 8.5V16.5C16 16.7761 15.7761 17 15.5 17H10.5C10.2239 17 10 16.7761 10 16.5V8.5Z\" fill=\"#212121\"/>\n</svg>",
@@ -3962,6 +4471,7 @@
     "text-color": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M10.4642 2.3143C10.3883 2.12448 10.2045 2 10 2C9.79556 2 9.6117 2.12448 9.53577 2.3143L6.53577 9.8143C6.43322 10.0707 6.55792 10.3617 6.81432 10.4642C7.07071 10.5668 7.36169 10.4421 7.46425 10.1857L8.53707 7.50364H11.4629L12.5358 10.1857C12.6383 10.4421 12.9293 10.5668 13.1857 10.4642C13.4421 10.3617 13.5668 10.0707 13.4642 9.8143L10.4642 2.3143ZM10 3.84629L11.0629 6.50364H8.93707L10 3.84629ZM4.5 12C3.67157 12 3 12.6716 3 13.5V16.5C3 17.3284 3.67157 18 4.5 18H15.5C16.3284 18 17 17.3284 17 16.5V13.5C17 12.6716 16.3284 12 15.5 12H4.5ZM4 13.5C4 13.2239 4.22386 13 4.5 13H15.5C15.7761 13 16 13.2239 16 13.5V16.5C16 16.7761 15.7761 17 15.5 17H4.5C4.22386 17 4 16.7761 4 16.5V13.5Z\" fill=\"#212121\"/>\n</svg>",
     "text-direction": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M5 4.5H11M8 4.5V13.5\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/><path d=\"M14.5 5.5V15.5M14.5 15.5L12.5 13.5M14.5 15.5L16.5 13.5\" stroke=\"#212121\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n</svg>",
     "underline": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M6 3.5C6 3.22386 5.77614 3 5.5 3C5.22386 3 5 3.22386 5 3.5V9.95455C5 12.7363 7.23385 15 10 15C12.7661 15 15 12.7363 15 9.95455V3.5C15 3.22386 14.7761 3 14.5 3C14.2239 3 14 3.22386 14 3.5V9.95455C14 12.1935 12.2044 14 10 14C7.79559 14 6 12.1935 6 9.95455V3.5ZM5 16.5C5 16.2239 5.22386 16 5.5 16H14.5C14.7761 16 15 16.2239 15 16.5C15 16.7761 14.7761 17 14.5 17H5.5C5.22386 17 5 16.7761 5 16.5Z\" fill=\"#212121\"/>\n</svg>",
-    "undo": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M5 2.5C5 2.22386 4.77614 2 4.5 2C4.22386 2 4 2.22386 4 2.5V7.4C4 7.73137 4.26863 8 4.6 8H9.5C9.77614 8 10 7.77614 10 7.5C10 7.22386 9.77614 7 9.5 7H5.90603L9.37872 3.98124C11.046 2.53191 13.5725 2.70858 15.0218 4.37584C16.4711 6.0431 16.2945 8.56959 14.6272 10.0189L6.45529 17.1226C6.24688 17.3038 6.2248 17.6196 6.40596 17.828C6.58713 18.0364 6.90294 18.0585 7.11135 17.8774L15.2833 10.7736C17.3673 8.96197 17.5882 5.80385 15.7765 3.71978C13.9648 1.63571 10.8067 1.41487 8.72266 3.22653L5 6.46259V2.5Z\" fill=\"#212121\"/>\n</svg>"
+    "undo": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M5 2.5C5 2.22386 4.77614 2 4.5 2C4.22386 2 4 2.22386 4 2.5V7.4C4 7.73137 4.26863 8 4.6 8H9.5C9.77614 8 10 7.77614 10 7.5C10 7.22386 9.77614 7 9.5 7H5.90603L9.37872 3.98124C11.046 2.53191 13.5725 2.70858 15.0218 4.37584C16.4711 6.0431 16.2945 8.56959 14.6272 10.0189L6.45529 17.1226C6.24688 17.3038 6.2248 17.6196 6.40596 17.828C6.58713 18.0364 6.90294 18.0585 7.11135 17.8774L15.2833 10.7736C17.3673 8.96197 17.5882 5.80385 15.7765 3.71978C13.9648 1.63571 10.8067 1.41487 8.72266 3.22653L5 6.46259V2.5Z\" fill=\"#212121\"/>\n</svg>",
+    "watermark": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M5.5 2.5H11.5L15.5 6.5V16.5C15.5 17.05 15.05 17.5 14.5 17.5H5.5C4.95 17.5 4.5 17.05 4.5 16.5V3.5C4.5 2.95 4.95 2.5 5.5 2.5Z\" stroke=\"#212121\" stroke-linejoin=\"round\"/>\n<path d=\"M11.5 2.5V6.5H15.5\" stroke=\"#212121\" stroke-linejoin=\"round\"/>\n<path d=\"M7 14.5L13 8.5\" stroke=\"#212121\" stroke-width=\"2\" stroke-linecap=\"round\"/>\n</svg>"
   }
 }

@@ -556,6 +556,154 @@ impl PageNumberFormat {
     }
 }
 
+/// Which pages of a section show its page borders (`w:pgBorders/@w:display`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PgBorderDisplay {
+    #[default]
+    AllPages,
+    FirstPage,
+    NotFirstPage,
+}
+
+impl PgBorderDisplay {
+    fn val(self) -> Option<&'static str> {
+        match self {
+            Self::AllPages => None,
+            Self::FirstPage => Some("firstPage"),
+            Self::NotFirstPage => Some("notFirstPage"),
+        }
+    }
+}
+
+/// What a page border's `w:space` is measured from (`w:offsetFrom`): the
+/// text, Word's schema default, or the edge of the page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PgBorderOffset {
+    #[default]
+    Text,
+    Page,
+}
+
+/// One side of a page border (`w:top`, `w:left`, `w:bottom`, `w:right`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BorderSide {
+    /// `w:val`: `single`, `double`, `dotted`, … (an Art border's name reads
+    /// back here too).
+    pub style: String,
+    /// `w:sz`, in eighths of a point.
+    pub sz: u32,
+    /// `w:space`, in points.
+    pub space: u32,
+    /// `w:color` as RRGGBB; `None` is `auto`.
+    pub color: Option<u32>,
+    /// `w:shadow`: the Shadow setting.
+    pub shadow: bool,
+    /// `w:frame`: the 3-D setting.
+    pub frame: bool,
+}
+
+/// A section's page borders (`w:pgBorders`, the Page Border tab of Borders
+/// and Shading). `sides` is top, left, bottom, right: `CT_PageBorders` order.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PageBorders {
+    pub sides: [Option<BorderSide>; 4],
+    pub display: PgBorderDisplay,
+    pub offset_from: PgBorderOffset,
+    /// `w:zOrder="back"`: drawn behind the text.
+    pub z_order_back: bool,
+}
+
+const PG_BORDER_SIDES: [&str; 4] = ["w:top", "w:left", "w:bottom", "w:right"];
+
+impl PageBorders {
+    /// The section's page borders; `None` when it has no `w:pgBorders` or the
+    /// element names no side.
+    pub fn parse(sect: &str) -> Option<PageBorders> {
+        let own = own_children(sect);
+        let (a, b) = find_element(own, "w:pgBorders")?;
+        let el = &own[a..b];
+        let tag = start_tag(el, "w:pgBorders")?;
+        let inner = &el[tag.len() + 2..];
+        let mut pb = PageBorders {
+            display: match attr(tag, "w:display").as_deref() {
+                Some("firstPage") => PgBorderDisplay::FirstPage,
+                Some("notFirstPage") => PgBorderDisplay::NotFirstPage,
+                _ => PgBorderDisplay::AllPages,
+            },
+            offset_from: match attr(tag, "w:offsetFrom").as_deref() {
+                Some("page") => PgBorderOffset::Page,
+                _ => PgBorderOffset::Text,
+            },
+            z_order_back: attr(tag, "w:zOrder").as_deref() == Some("back"),
+            ..PageBorders::default()
+        };
+        for (slot, name) in pb.sides.iter_mut().zip(PG_BORDER_SIDES) {
+            let Some(t) = start_tag(inner, name) else {
+                continue;
+            };
+            let style = attr(t, "w:val").unwrap_or_default();
+            if matches!(style.as_str(), "" | "nil" | "none") {
+                continue;
+            }
+            *slot = Some(BorderSide {
+                style,
+                sz: num(t, "w:sz").unwrap_or(4).max(0) as u32,
+                space: num(t, "w:space").unwrap_or(0).max(0) as u32,
+                color: attr(t, "w:color").and_then(|c| u32::from_str_radix(&c, 16).ok()),
+                shadow: attr(t, "w:shadow").is_some_and(|v| on(&v)),
+                frame: attr(t, "w:frame").is_some_and(|v| on(&v)),
+            });
+        }
+        pb.sides.iter().any(Option::is_some).then_some(pb)
+    }
+
+    /// Write `pb` into `sect` in schema order, or remove `w:pgBorders` with
+    /// `None` (Setting: None) or when no side is set. Unchanged when the
+    /// section already holds it.
+    pub fn apply(pb: Option<&PageBorders>, sect: &str) -> String {
+        let pb = pb.filter(|p| p.sides.iter().any(Option::is_some));
+        if PageBorders::parse(sect).as_ref() == pb {
+            return sect.to_string();
+        }
+        let s = remove_own(sect, "w:pgBorders");
+        let Some(pb) = pb else {
+            return s;
+        };
+        let mut el = "<w:pgBorders".to_string();
+        if let Some(v) = pb.display.val() {
+            el.push_str(&format!(" w:display=\"{v}\""));
+        }
+        if pb.offset_from == PgBorderOffset::Page {
+            el.push_str(" w:offsetFrom=\"page\"");
+        }
+        if pb.z_order_back {
+            el.push_str(" w:zOrder=\"back\"");
+        }
+        el.push('>');
+        for (side, name) in pb.sides.iter().zip(PG_BORDER_SIDES) {
+            let Some(side) = side else {
+                continue;
+            };
+            let color = side
+                .color
+                .map_or_else(|| "auto".to_string(), |c| format!("{c:06X}"));
+            el.push_str(&format!(
+                "<{name} w:val=\"{}\" w:sz=\"{}\" w:space=\"{}\" w:color=\"{color}\"",
+                side.style, side.sz, side.space
+            ));
+            if side.shadow {
+                el.push_str(" w:shadow=\"1\"");
+            }
+            if side.frame {
+                el.push_str(" w:frame=\"1\"");
+            }
+            el.push_str("/>");
+        }
+        el.push_str("</w:pgBorders>");
+        insert_ordered(&s, "w:pgBorders", &el)
+    }
+}
+
 /// The relationship id of the section's own header (`is_header`) or footer
 /// reference of `variant` (`default`, `first`, `even`; a reference with no
 /// `w:type` is the default one). `None` when the section links to the
@@ -1182,5 +1330,118 @@ mod tests {
         assert_eq!(PageNumberFormat::parse(&ch.apply(sect)), ch);
         let dec = "<w:sectPr><w:pgNumType w:fmt=\"decimal\"/></w:sectPr>";
         assert_eq!(PageNumberFormat::parse(dec), PageNumberFormat::default());
+    }
+
+    fn side(style: &str, sz: u32, space: u32) -> Option<BorderSide> {
+        Some(BorderSide {
+            style: style.into(),
+            sz,
+            space,
+            color: None,
+            shadow: false,
+            frame: false,
+        })
+    }
+
+    #[test]
+    fn page_borders_write_in_schema_order_and_round_trip() {
+        let sect = "<w:sectPr><w:headerReference w:type=\"default\" r:id=\"rId7\"/>\
+            <w:pgSz w:w=\"12240\" w:h=\"15840\"/><w:pgMar w:top=\"1440\"/>\
+            <w:pgNumType w:start=\"3\"/><w:cols w:space=\"720\"/><w:titlePg/></w:sectPr>";
+        assert_eq!(PageBorders::parse(sect), None);
+        // Box: all four sides, measured from the page edge, with a colour.
+        let mut pb = PageBorders {
+            sides: std::array::from_fn(|_| side("single", 4, 24)),
+            offset_from: PgBorderOffset::Page,
+            ..Default::default()
+        };
+        pb.sides[0].as_mut().unwrap().color = Some(0xFF0000);
+        let out = PageBorders::apply(Some(&pb), sect);
+        assert!(in_schema_order(&out), "{out}");
+        assert_eq!(
+            order(&out),
+            [
+                "w:headerReference",
+                "w:pgSz",
+                "w:pgMar",
+                "w:pgBorders",
+                "w:pgNumType",
+                "w:cols",
+                "w:titlePg"
+            ]
+        );
+        assert!(
+            out.contains(
+                "<w:pgBorders w:offsetFrom=\"page\"><w:top w:val=\"single\" w:sz=\"4\" w:space=\"24\" w:color=\"FF0000\"/>\
+                 <w:left w:val=\"single\" w:sz=\"4\" w:space=\"24\" w:color=\"auto\"/>"
+            ),
+            "{out}"
+        );
+        assert_eq!(PageBorders::parse(&out), Some(pb.clone()));
+        // Unchanged rewrites nothing; None removes the element entirely.
+        assert_eq!(PageBorders::apply(Some(&pb), &out), out);
+        assert_eq!(PageBorders::apply(None, &out), sect);
+        // No side set is the same as None.
+        assert_eq!(
+            PageBorders::apply(Some(&PageBorders::default()), &out),
+            sect
+        );
+    }
+
+    #[test]
+    fn page_borders_settings_apply_to_and_custom_sides() {
+        let sect = "<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr>";
+        // Shadow and 3-D are per-side flags; Apply to is w:display.
+        let mut shadow = side("single", 12, 24).unwrap();
+        shadow.shadow = true;
+        let mut frame = side("double", 6, 4).unwrap();
+        frame.frame = true;
+        for (pb, needle) in [
+            (
+                PageBorders {
+                    sides: std::array::from_fn(|_| Some(shadow.clone())),
+                    display: PgBorderDisplay::FirstPage,
+                    ..Default::default()
+                },
+                "<w:pgBorders w:display=\"firstPage\"><w:top w:val=\"single\" w:sz=\"12\" w:space=\"24\" w:color=\"auto\" w:shadow=\"1\"/>",
+            ),
+            (
+                PageBorders {
+                    sides: std::array::from_fn(|_| Some(frame.clone())),
+                    display: PgBorderDisplay::NotFirstPage,
+                    z_order_back: true,
+                    ..Default::default()
+                },
+                "<w:pgBorders w:display=\"notFirstPage\" w:zOrder=\"back\"><w:top w:val=\"double\" w:sz=\"6\" w:space=\"4\" w:color=\"auto\" w:frame=\"1\"/>",
+            ),
+            (
+                // Custom: only the bottom side.
+                PageBorders {
+                    sides: [None, None, side("dotted", 8, 1), None],
+                    ..Default::default()
+                },
+                "<w:pgBorders><w:bottom w:val=\"dotted\" w:sz=\"8\" w:space=\"1\" w:color=\"auto\"/></w:pgBorders>",
+            ),
+        ] {
+            let out = PageBorders::apply(Some(&pb), sect);
+            assert!(out.contains(needle), "{out}");
+            assert_eq!(PageBorders::parse(&out), Some(pb));
+        }
+    }
+
+    #[test]
+    fn page_borders_read_art_sides_and_skip_nil_ones() {
+        let sect = "<w:sectPr><w:pgBorders w:offsetFrom=\"text\">\
+            <w:top w:val=\"apples\" w:sz=\"20\" w:space=\"1\" w:color=\"auto\"/>\
+            <w:left w:val=\"nil\"/></w:pgBorders>\
+            <w:sectPrChange><w:sectPr><w:pgBorders><w:top w:val=\"single\"/></w:pgBorders></w:sectPr></w:sectPrChange></w:sectPr>";
+        let pb = PageBorders::parse(sect).unwrap();
+        assert_eq!(pb.sides[0].as_ref().unwrap().style, "apples");
+        assert_eq!(pb.sides[1], None);
+        assert_eq!(pb.offset_from, PgBorderOffset::Text);
+        // Removing touches the section's own element, never the tracked one.
+        let out = PageBorders::apply(None, sect);
+        assert!(out.starts_with("<w:sectPr><w:sectPrChange>"), "{out}");
+        assert!(out.contains("<w:top w:val=\"single\"/>"), "{out}");
     }
 }

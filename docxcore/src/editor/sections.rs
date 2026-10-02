@@ -117,6 +117,29 @@ impl Editor {
         true
     }
 
+    /// Replace whole sectPrs, `(section, raw)`, as one undo step: for edits
+    /// computed elsewhere, such as the header references a watermark adds
+    /// (`Package::set_text_watermark`). Nothing is recorded when none
+    /// changes. Whether any did.
+    pub fn replace_sections(&mut self, raws: &[(usize, String)]) -> bool {
+        let slots = self.section_slots();
+        let changes: Vec<(SectAt, String)> = raws
+            .iter()
+            .filter_map(|(k, raw)| {
+                let at = *slots.get(*k)?;
+                (self.sect_raw(at) != raw).then(|| (at, raw.clone()))
+            })
+            .collect();
+        if changes.is_empty() {
+            return false;
+        }
+        self.checkpoint(EditKind::Structural);
+        for (at, raw) in changes {
+            self.set_sect_raw(at, raw);
+        }
+        true
+    }
+
     /// [`Editor::edit_sections`] through the typed [`SectionSetup`] view.
     pub fn edit_section_setups(
         &mut self,
@@ -417,6 +440,22 @@ mod tests {
 
     fn before_sections(doc: &Document) -> Vec<String> {
         Editor::new(doc.clone()).sections()
+    }
+
+    #[test]
+    fn replace_sections_is_one_undo_step() {
+        let mut e = three();
+        let before = e.doc.clone();
+        let mut want = e.sections();
+        want[0] =
+            "<w:sectPr><w:headerReference w:type=\"default\" r:id=\"rId9\"/></w:sectPr>".into();
+        want[2] = "<w:sectPr><w:pgSz w:w=\"100\"/></w:sectPr>".into();
+        let raws = [(0, want[0].clone()), (2, want[2].clone()), (9, "x".into())];
+        assert!(e.replace_sections(&raws));
+        assert_eq!(e.sections(), want);
+        assert!(!e.replace_sections(&raws), "unchanged records nothing");
+        assert!(e.undo());
+        assert_eq!(e.doc, before);
     }
 
     #[test]
