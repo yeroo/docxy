@@ -623,6 +623,12 @@ pub(crate) fn revision_category_name(category: &RevisionCategory) -> String {
     match category {
         RevisionCategory::Inline(RevisionKind::Insert) => "insertion".to_string(),
         RevisionCategory::Inline(RevisionKind::Delete) => "deletion".to_string(),
+        RevisionCategory::ParagraphMark(RevisionKind::Insert) => {
+            "paragraph mark insertion".to_string()
+        }
+        RevisionCategory::ParagraphMark(RevisionKind::Delete) => {
+            "paragraph mark deletion".to_string()
+        }
         RevisionCategory::Property(scope) => property_scope_name(*scope).to_string(),
         RevisionCategory::Unsupported(kind) => {
             format!("unsupported {}", unsupported_revision_name(kind))

@@ -1859,6 +1859,18 @@ fn collect_block_revision_positions(
                     forced.clone(),
                     positions,
                 );
+                // A paragraph mark sits at the paragraph's end.
+                if let Some(mark) = &paragraph.props.mark_revision {
+                    let (start, end) = forced_span(&forced).unwrap_or_else(|| {
+                        let end = paragraph_span(prefix, paragraph).1;
+                        (end.clone(), end)
+                    });
+                    positions.push(RevisionPosition {
+                        target: mark.metadata.target,
+                        start,
+                        end,
+                    });
+                }
             }
             Block::Table(table) => {
                 let table_span =

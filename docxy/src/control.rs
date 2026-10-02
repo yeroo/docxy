@@ -456,7 +456,7 @@ fn revision_location_json(location: &RevisionLocation, current: bool) -> Json {
         fields.push(("parent", Json::Str(parent.0.to_string())));
     }
     match &address.category {
-        RevisionCategory::Inline(_) => {}
+        RevisionCategory::Inline(_) | RevisionCategory::ParagraphMark(_) => {}
         RevisionCategory::Property(scope) => {
             fields.push(("scope", Json::Str(property_scope_name(*scope).to_string())));
         }
