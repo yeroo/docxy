@@ -684,7 +684,8 @@ mod tests {
     #[test]
     fn inspect_counts_vanish_plus_web_hidden_as_hidden_916() {
         // Hidden text that is also webHidden is still hidden text.
-        let body = "<w:p><w:r><w:t>keep</w:t></w:r>            <w:r><w:rPr><w:vanish/><w:webHidden/></w:rPr><w:t>gone</w:t></w:r></w:p>";
+        let body = "<w:p><w:r><w:t>keep</w:t></w:r>\
+            <w:r><w:rPr><w:vanish/><w:webHidden/></w:rPr><w:t>gone</w:t></w:r></w:p>";
         let mut doc = parse(body);
         assert_eq!(count_hidden_runs(&doc), 1);
         assert_eq!(remove_hidden_text(&mut doc), 1);
