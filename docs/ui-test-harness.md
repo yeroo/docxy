@@ -388,7 +388,8 @@ footer editor; `selection-set` refuses while it is open.
 | `ribbon-read {}` | list File, ribbon tabs and the contextual tabs — Header & Footer while a header or footer is being edited, Table while the caret is in a table, Gantt Chart Format while a Project's Gantt shows — with groups, commands, galleries and Quick Access Toolbar. The Header from Top and Footer from Bottom boxes carry the `value` they show (`0.5"`) |
 | `ribbon-click {"tab":"Home","command":"Bold"}` | resolve a command on a valid tab, contextual tabs included, by id, else by unique label, else by unique screentip title, and invoke the same action handler as its button |
 | `status-read {}` | read the tab's status line as an ordered `items` array of `{id, text}`: on a Project tab `state` (Ready/Edit/Busy), `new-tasks` (`New Tasks: …`) and `message`; on other tabs only `message` (a document's word-count stats are not reported) |
-| `backstage {"action":"open"}` | enter File; `read` reports its open state and rail items; `close` returns to the tab |
+| `backstage {"action":"open"}` | enter File; `read` reports its open state and rail items (`Info` only while the active tab is a document); `close` returns to the tab |
+| `inspect {}` | File > Info > Inspect Document on the active document tab (refused for any other tab): `{comments:{found,count}, revisions:{found,count}, hidden:{found,count,unremovable}, properties:{found}}`; hidden's `count` includes the `unremovable` runs inside tracked moves, fields, a group shape's other text boxes or other preserved XML (`w:customXml`, unmodeled blocks), which Remove All leaves in place. With `"remove":"comments"` (or `revisions`, `hidden`, `properties`) it runs that category's Remove All, the same handler as the page's button, and adds the `status` line it left; revisions are accepted. A category not found changes nothing but the tab's status line, which says `<Category>: nothing to remove`; the Info page shows the last Remove All's line under its rows |
 | `theme-set {"theme":"dark"}` | set the window theme as the title bar's theme button does (`light`, `dark` or `auto`); replies with the preference and the mode it resolved to |
 | `title-bar {}` | read the measured title content, active chip, tab strip, theme button and drag space; reports tab count, active/first/visible indices, layout mode, `overflow`, `controls_clear`, `active_visible`, `active_dirty_visible` (the active tab is dirty and its bullet lies inside the chip), `theme_visible`, `drag_w`, `drag_ok`, and logical-pixel right edges. `caption_left` comes from a separate probe of Root's inner box minus the pinned caption-control width (102 px on Windows/Linux, zero on macOS) |
 | `title-tab {"action":"prev"}` | use the previous/next overflow arrow's tab-selection handler; `more` toggles the dropdown only while its button is shown (overflow or more-only), and `pick` with an `index` selects a tab after `more` has opened the list |
@@ -921,6 +922,7 @@ stands for a press outside the menu (`click-cell`, `drag`, `fill-drag`,
 `save-as`, `select-chart`,
 `focus-field`, `ribbon-click`, `title-tab`, `close-tab`, `selection-set`,
 `open`, `backstage` open and close (not `read`), `backstage-close`,
+`inspect` with `remove`,
 `theme-set`, `ask-on-close`, `autorecover`, `keep-drafts`, `trusted-clear`,
 `open-draft`,
 `enable-editing` and the

@@ -30,6 +30,7 @@ pub mod equation;
 pub mod export;
 pub mod field;
 pub mod hf;
+pub mod inspect;
 pub mod latex;
 pub mod load;
 pub mod markdown;

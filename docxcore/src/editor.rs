@@ -393,6 +393,26 @@ impl Editor {
         self.apply_all_revision_actions(RevisionAction::Reject)
     }
 
+    /// Document Inspector: remove every hidden run, tab and break
+    /// ([`crate::inspect::remove_hidden_text`]) as one undo step, none when
+    /// nothing was hidden. Returns how many were removed.
+    pub fn remove_hidden_text(&mut self) -> usize {
+        let before = self.snapshot();
+        let removed = crate::inspect::remove_hidden_text(&mut self.doc);
+        self.finish_review_transaction(before);
+        removed
+    }
+
+    /// Document Inspector: remove the markers of every comment
+    /// ([`crate::inspect::remove_all_comment_markers`]) as one undo step, none
+    /// when there were none. Returns how many were removed.
+    pub fn remove_all_comment_markers(&mut self) -> usize {
+        let before = self.snapshot();
+        let removed = crate::inspect::remove_all_comment_markers(&mut self.doc);
+        self.finish_review_transaction(before);
+        removed
+    }
+
     fn apply_revision_action(
         &mut self,
         target: RevisionTarget,
@@ -3708,6 +3728,57 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn editor_remove_hidden_text_one_undo_step_and_caret_clamped() {
+        let hidden = RunProps {
+            vanish: true,
+            ..RunProps::default()
+        };
+        let mut d = doc(&["first", "seen"]);
+        if let Block::Paragraph(p) = &mut d.body[1] {
+            p.content.push(Inline::Run(Run {
+                text: " unseen".into(),
+                props: hidden,
+            }));
+        }
+        let mut ed = Editor::new(d);
+        ed.caret = Caret {
+            path: vec![1],
+            offset: "seen unseen".len(),
+        };
+        assert_eq!(ed.remove_hidden_text(), 1);
+        assert_eq!(top_text(&ed), ["first", "seen"]);
+        assert_eq!(ed.caret.offset, "seen".len(), "caret clamped");
+        // A no-op pushes no undo step: one undo restores the hidden run and
+        // the caret, and there is nothing further to undo.
+        assert_eq!(ed.remove_hidden_text(), 0);
+        assert!(ed.undo());
+        assert_eq!(top_text(&ed), ["first", "seen unseen"]);
+        assert_eq!(ed.caret.offset, "seen unseen".len());
+        assert!(!ed.undo());
+    }
+
+    #[test]
+    fn editor_remove_all_comment_markers_is_one_undo_step() {
+        let mut d = doc(&["a", "b"]);
+        for (i, b) in d.body.iter_mut().enumerate() {
+            if let Block::Paragraph(p) = b {
+                p.content.insert(
+                    0,
+                    Inline::Raw(format!("<w:commentRangeStart w:id=\"{i}\"/>")),
+                );
+                p.content
+                    .push(Inline::Raw(format!("<w:commentRangeEnd w:id=\"{i}\"/>")));
+            }
+        }
+        let mut ed = Editor::new(d.clone());
+        assert_eq!(ed.remove_all_comment_markers(), 4);
+        assert_eq!(ed.remove_all_comment_markers(), 0);
+        assert!(ed.undo());
+        assert_eq!(ed.doc, d);
+        assert!(!ed.undo());
     }
 
     #[test]

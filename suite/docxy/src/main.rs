@@ -31,6 +31,7 @@ mod harness;
 mod hf;
 mod hf_tab;
 mod html_bundle;
+mod inspector;
 mod layout_tab;
 mod menu;
 mod open_mode;
@@ -350,6 +351,7 @@ enum RibbonTab {
 #[derive(Clone, Copy)]
 enum BackstageRailAction {
     Back,
+    Info,
     New,
     Open,
     Save,
@@ -363,6 +365,8 @@ struct BackstageRailItem {
     display: &'static str,
     action: BackstageRailAction,
     project_only: bool,
+    /// Shown only for a document tab (Word's Info page, #627).
+    doc_only: bool,
 }
 
 const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
@@ -371,49 +375,68 @@ const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
         display: "← Back",
         action: BackstageRailAction::Back,
         project_only: false,
+        doc_only: false,
+    },
+    BackstageRailItem {
+        id: "bs-info",
+        display: "Info",
+        action: BackstageRailAction::Info,
+        project_only: false,
+        doc_only: true,
     },
     BackstageRailItem {
         id: "bs-new",
         display: "New",
         action: BackstageRailAction::New,
         project_only: false,
+        doc_only: false,
     },
     BackstageRailItem {
         id: "bs-open",
         display: "Open…",
         action: BackstageRailAction::Open,
         project_only: false,
+        doc_only: false,
     },
     BackstageRailItem {
         id: "bs-save",
         display: "Save",
         action: BackstageRailAction::Save,
         project_only: false,
+        doc_only: false,
     },
     BackstageRailItem {
         id: "bs-saveas",
         display: "Save As…",
         action: BackstageRailAction::SaveAs,
         project_only: false,
+        doc_only: false,
     },
     BackstageRailItem {
         id: "bs-export",
         display: "Export…",
         action: BackstageRailAction::Export,
         project_only: true,
+        doc_only: false,
     },
     BackstageRailItem {
         id: "bs-close",
         display: "Close",
         action: BackstageRailAction::Close,
         project_only: false,
+        doc_only: false,
     },
 ];
 
-fn backstage_rail_items(project: bool) -> impl Iterator<Item = &'static BackstageRailItem> {
+/// The rail for the active tab: `project` and `doc` say whether it is a
+/// project or a document tab.
+fn backstage_rail_items(
+    project: bool,
+    doc: bool,
+) -> impl Iterator<Item = &'static BackstageRailItem> {
     BACKSTAGE_RAIL
         .iter()
-        .filter(move |item| !item.project_only || project)
+        .filter(move |item| (!item.project_only || project) && (!item.doc_only || doc))
 }
 
 #[derive(Clone, Copy)]
@@ -2500,6 +2523,14 @@ struct Docxy {
     ribbon_min: bool,
     backstage: bool,
     bs_new: bool,
+    /// The backstage shows the Info page (Inspect Document, #627). Cleared
+    /// wherever `bs_new` is; New and Info clear each other.
+    bs_info: bool,
+    /// The last Remove All on the Info page and the tab index it ran on:
+    /// the backstage draws no status bar, so the page shows it under the
+    /// rows. Cleared with `bs_info`, on a tab switch, and when a tab is
+    /// closed, moved or reloaded.
+    bs_info_status: Option<(usize, Result<String, String>)>,
     clip: Option<DocClip>,
     theme_pref: ThemePref,
     /// When set, closing the window with unsaved tabs shows a confirm dialog.
@@ -7636,6 +7667,8 @@ impl Docxy {
             ribbon_min: false,
             backstage: false,
             bs_new: false,
+            bs_info: false,
+            bs_info_status: None,
             clip: None,
             theme_pref,
             ask_on_close,
@@ -7781,6 +7814,8 @@ impl Docxy {
         self.close_menu();
         self.backstage = true;
         self.bs_new = false;
+        self.bs_info = false;
+        self.bs_info_status = None;
         self.refresh_drafts();
         self.trusted_count = trusted::count(&config_root());
         self.trusted_error = None;
@@ -7790,6 +7825,8 @@ impl Docxy {
     fn backstage_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.backstage = false;
         self.bs_new = false;
+        self.bs_info = false;
+        self.bs_info_status = None;
         self.refocus(window, cx);
     }
 
@@ -7822,8 +7859,16 @@ impl Docxy {
     ) {
         match action {
             BackstageRailAction::Back => self.backstage_back(window, cx),
+            BackstageRailAction::Info => {
+                self.bs_info = true;
+                self.bs_info_status = None;
+                self.bs_new = false;
+                cx.notify();
+            }
             BackstageRailAction::New => {
                 self.bs_new = true;
+                self.bs_info = false;
+                self.bs_info_status = None;
                 cx.notify();
             }
             BackstageRailAction::Open => self.open_file(window, cx),
@@ -7961,6 +8006,8 @@ impl Docxy {
         self.active = self.tabs.len() - 1;
         self.backstage = false;
         self.bs_new = false;
+        self.bs_info = false;
+        self.bs_info_status = None;
         self.drop_grid_state();
         self.persist();
         self.refocus(window, cx);
@@ -10372,8 +10419,17 @@ impl Docxy {
         }
         self.backstage = false;
         self.bs_new = false;
+        self.bs_info = false;
+        self.bs_info_status = None;
         self.persist();
         self.refocus(window, cx);
+    }
+
+    fn active_is_doc(&self) -> bool {
+        matches!(
+            self.tabs.get(self.active).map(|t| &t.surface),
+            Some(Surface::Doc(_))
+        )
     }
 
     fn active_is_sheet(&self) -> bool {
@@ -13476,6 +13532,7 @@ impl Docxy {
         if i < self.tabs.len() {
             self.active = i;
             self.tab_more_open = false;
+            self.bs_info_status = None;
             // Same reason as `select_sheet`: these all index the document we
             // were just on.
             self.drop_grid_state();
@@ -13852,6 +13909,8 @@ impl Docxy {
         let saved = save_doc_tab(&mut self.tabs[self.active], target);
         self.backstage = false;
         self.bs_new = false;
+        self.bs_info = false;
+        self.bs_info_status = None;
         self.persist();
         self.refocus(window, cx);
         saved
@@ -13886,6 +13945,8 @@ impl Docxy {
         }
         self.backstage = false;
         self.bs_new = false;
+        self.bs_info = false;
+        self.bs_info_status = None;
         self.persist();
         self.refocus(window, cx);
     }
@@ -13905,6 +13966,8 @@ impl Docxy {
         let saved = save_sheet_to(tab, target);
         self.backstage = false;
         self.bs_new = false;
+        self.bs_info = false;
+        self.bs_info_status = None;
         self.persist();
         self.refocus(window, cx);
         saved
@@ -13926,6 +13989,8 @@ impl Docxy {
         let result = apply_save(&mut self.tabs[self.active], target);
         self.backstage = false;
         self.bs_new = false;
+        self.bs_info = false;
+        self.bs_info_status = None;
         self.persist();
         self.refocus(window, cx);
         result
@@ -14000,6 +14065,8 @@ impl Docxy {
         }
         self.backstage = false;
         self.bs_new = false;
+        self.bs_info = false;
+        self.bs_info_status = None;
         self.persist();
         self.refocus(window, cx);
     }
@@ -14015,6 +14082,8 @@ impl Docxy {
         }
         self.backstage = false;
         self.bs_new = false;
+        self.bs_info = false;
+        self.bs_info_status = None;
         self.persist();
         self.refocus(window, cx);
     }
@@ -14074,6 +14143,8 @@ impl Docxy {
         Ok(match reopen_step(reopen, tab.dirty, tab.access, mode) {
             ReopenStep::Reload => {
                 self.tabs[i] = tab_from_path_mode(&path, mode, &trusted)?;
+                // A reloaded tab has none of the last Remove All's edits.
+                self.bs_info_status = None;
                 true
             }
             ReopenStep::Ask => {
@@ -23220,6 +23291,132 @@ impl Docxy {
             .into_any_element()
     }
 
+    /// File > Info for a document tab (#627): its name and path, then Word's
+    /// Inspect Document with a Remove All per category found. `None` unless
+    /// the Info page is selected and the active tab is a document.
+    fn info_page(
+        &self,
+        bg: Hsla,
+        fg: Hsla,
+        dim: Hsla,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.bs_info {
+            return None;
+        }
+        let tab = self.tabs.get(self.active)?;
+        let found = inspector::inspect_doc_tab(tab)?;
+        let path = tab
+            .path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "not saved yet".into());
+        let mut rows = v_flex().gap_3();
+        for category in inspector::InspectCategory::ALL {
+            let has = found.found(category);
+            rows = rows.child(
+                h_flex()
+                    .gap_4()
+                    .items_center()
+                    .child(
+                        v_flex()
+                            .w(px(420.))
+                            .child(
+                                div()
+                                    .text_color(fg)
+                                    .font_weight(FontWeight::BOLD)
+                                    .child(category.title()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(dim)
+                                    .child(found.line(category)),
+                            ),
+                    )
+                    .when(has, |d| {
+                        d.child(
+                            div()
+                                .id(category.button_id())
+                                .px_3()
+                                .py_1()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(dim)
+                                .text_color(fg)
+                                .cursor_pointer()
+                                .hover(|d| d.border_color(rgb(BRAND)))
+                                .child("Remove All")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let _ = this.inspect_remove_active(category);
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            );
+        }
+        Some(
+            v_flex()
+                .flex_1()
+                .h_full()
+                .p_8()
+                .gap_4()
+                .bg(bg)
+                .child(
+                    div()
+                        .text_size(px(20.))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(fg)
+                        .child("Info"),
+                )
+                .child(div().text_color(fg).child(tab.title.clone()))
+                .child(div().text_size(px(12.)).text_color(dim).child(path))
+                .child(
+                    div()
+                        .pt_2()
+                        .text_size(px(16.))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(fg)
+                        .child("Inspect Document"),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(dim)
+                        .child("Some changes cannot be undone."),
+                )
+                .child(rows)
+                .when_some(
+                    inspector::status_line(self.bs_info_status.as_ref(), self.active),
+                    |d, text| {
+                        d.child(
+                            div()
+                                .id("inspect-status")
+                                .text_size(px(12.))
+                                .text_color(fg)
+                                .child(text),
+                        )
+                    },
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Remove All for `category` on the active document tab: the page's
+    /// button and the harness's `inspect` verb both come here.
+    /// Its result is also kept for the page to show (`bs_info_status`).
+    fn inspect_remove_active(
+        &mut self,
+        category: inspector::InspectCategory,
+    ) -> Result<String, String> {
+        let result = match self.tabs.get_mut(self.active) {
+            Some(tab) => inspector::inspect_remove(tab, category),
+            None => Err("there is no active tab".to_string()),
+        };
+        self.bs_info_status = Some((self.active, result.clone()));
+        result
+    }
+
     fn backstage_view(
         &self,
         bg: Hsla,
@@ -23229,7 +23426,7 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut rail = v_flex().w(px(220.)).h_full().py_3().gap_1().bg(sidebar);
-        for item in backstage_rail_items(self.active_is_project()) {
+        for item in backstage_rail_items(self.active_is_project(), self.active_is_doc()) {
             let action = item.action;
             rail = rail.child(
                 div()
@@ -23334,6 +23531,8 @@ impl Docxy {
                         )),
                 )
                 .into_any_element()
+        } else if let Some(page) = self.info_page(bg, fg, dim, cx) {
+            page
         } else {
             let active = self.tabs.get(self.active);
             let (cur_title, cur_path) = active
@@ -23733,6 +23932,8 @@ impl Docxy {
         self.close_menu();
         self.tab_more_open = false;
         if tabstrip::move_index(&mut self.tabs, &mut self.active, from, to) {
+            // The Info page's result is keyed by tab index (#627).
+            self.bs_info_status = None;
             self.persist();
             cx.notify();
         }
