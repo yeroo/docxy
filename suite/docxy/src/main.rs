@@ -235,10 +235,28 @@ struct Session {
     /// A session written before the setting existed gets Word's 10.
     #[serde(default = "autorecover_default")]
     autorecover_minutes: u32,
+    /// Excel's "Keep the last AutoRecovered version if I close without
+    /// saving" (#613). A session written before the setting gets Excel's on.
+    #[serde(default = "keep_drafts_default")]
+    keep_drafts: bool,
 }
 
 fn autorecover_default() -> u32 {
     recover::DEFAULT_MINUTES
+}
+
+fn keep_drafts_default() -> bool {
+    true
+}
+
+/// The status of a tab opened from Recover Unsaved Workbooks (#613).
+const DRAFT_OPENED: &str = "recovered unsaved workbook — read-only; use Save As to keep it";
+
+/// Whether a tab just opened from a draft gets [`DRAFT_OPENED`]: only when the
+/// workbook loaded. An unreadable draft opens as a placeholder whose load
+/// error must stay its status.
+fn draft_loaded(tab: &DocTab) -> bool {
+    matches!(tab.surface, Surface::Sheet(_))
 }
 
 // Not derived: a fresh install (no session.json) must get AutoRecover on, not 0.
@@ -250,6 +268,7 @@ impl Default for Session {
             theme: ThemePref::default(),
             ask_on_close: false,
             autorecover_minutes: recover::DEFAULT_MINUTES,
+            keep_drafts: true,
         }
     }
 }
@@ -260,6 +279,7 @@ struct Prefs {
     theme: ThemePref,
     ask_on_close: bool,
     autorecover_minutes: u32,
+    keep_drafts: bool,
 }
 
 /// Environment variable that redirects every file the app persists — the
@@ -2436,6 +2456,11 @@ struct DocTab {
     /// How this tab may use its file (#610): opened read-only, repaired, or
     /// in Protected View. Only a workbook tab ever sets any of it.
     access: open_mode::Access,
+    /// The hot-exit sidecar the last persist wrote while this tab was
+    /// unsaved; `None` when that persist found it clean or could not write it
+    /// (#613). Don't Save keeps a copy of it as the tab's draft. A `RefCell`
+    /// because `persist` takes `&self`.
+    last_hot: std::cell::RefCell<Option<PathBuf>>,
 }
 
 impl DocTab {
@@ -2483,6 +2508,12 @@ struct Docxy {
     ask_on_close: bool,
     /// Minutes between AutoRecover writes while a tab is unsaved (#632); 0 is off.
     autorecover_minutes: u32,
+    /// Keep a workbook's last AutoRecover copy as a draft when it is closed
+    /// with Don't Save (#613).
+    keep_drafts: bool,
+    /// Recover Unsaved Workbooks' list, re-read when the backstage opens and
+    /// after a draft is kept: listing prunes old drafts, so never per frame.
+    drafts: Vec<recover::Draft>,
     /// When the hot-exit state was last written by any `persist`, or an
     /// AutoRecover tick last found nothing to write: the timer's clock. A
     /// `Cell` because `persist` takes `&self`.
@@ -4179,6 +4210,7 @@ impl Loaded {
             load_failed: self.load_failed,
             dialogs: crate::dialog::DialogStack::default(),
             access: crate::open_mode::Access::default(),
+            last_hot: Default::default(),
         }
     }
 }
@@ -4360,6 +4392,7 @@ fn sheet_tab_from_path(path: &PathBuf, repair: bool) -> DocTab {
         load_failed: false,
         dialogs: crate::dialog::DialogStack::default(),
         access: crate::open_mode::Access::default(),
+        last_hot: Default::default(),
     }
 }
 
@@ -7072,7 +7105,17 @@ fn write_session(root: &std::path::Path, tabs: &[DocTab], active: usize, prefs: 
     let tabs = tabs
         .iter()
         .enumerate()
-        .map(|(i, t)| persist_tab(&hd, i, t))
+        .map(|(i, t)| {
+            let persisted = persist_tab(&hd, i, t);
+            // Every tab is rewritten in this one call, so the path names this
+            // tab's content even after a later close shifts the indices.
+            *t.last_hot.borrow_mut() = persisted
+                .hot
+                .as_ref()
+                .filter(|_| t.dirty)
+                .map(PathBuf::from);
+            persisted
+        })
         .collect();
     let session = Session {
         tabs,
@@ -7080,6 +7123,7 @@ fn write_session(root: &std::path::Path, tabs: &[DocTab], active: usize, prefs: 
         theme: prefs.theme,
         ask_on_close: prefs.ask_on_close,
         autorecover_minutes: prefs.autorecover_minutes,
+        keep_drafts: prefs.keep_drafts,
     };
     if let Ok(json) = serde_json::to_string_pretty(&session) {
         let p = session_path_in(root);
@@ -7274,6 +7318,7 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 load_failed: false,
                 dialogs: crate::dialog::DialogStack::default(),
                 access: crate::open_mode::Access::default(),
+                last_hot: Default::default(),
             }
         }
         // A document with no sidecar reloads its file, bundle included; the
@@ -7301,6 +7346,7 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 load_failed: false,
                 dialogs: crate::dialog::DialogStack::default(),
                 access: crate::open_mode::Access::default(),
+                last_hot: Default::default(),
             }
         }
     };
@@ -7509,6 +7555,7 @@ impl Docxy {
         let active = session.active.min(tabs.len().saturating_sub(1));
         let mut this = Self::build(tabs, active, session.theme, session.ask_on_close, cx);
         this.autorecover_minutes = session.autorecover_minutes;
+        this.keep_drafts = session.keep_drafts;
         this.persist_to(&root);
         this
     }
@@ -7539,6 +7586,8 @@ impl Docxy {
             theme_pref,
             ask_on_close,
             autorecover_minutes: recover::DEFAULT_MINUTES,
+            keep_drafts: true,
+            drafts: Vec::new(),
             last_persist: std::cell::Cell::new(std::time::Instant::now()),
             applied: None,
             find_open: false,
@@ -7618,6 +7667,7 @@ impl Docxy {
             theme: self.theme_pref,
             ask_on_close: self.ask_on_close,
             autorecover_minutes: self.autorecover_minutes,
+            keep_drafts: self.keep_drafts,
         }
     }
 
@@ -7675,6 +7725,7 @@ impl Docxy {
         self.close_menu();
         self.backstage = true;
         self.bs_new = false;
+        self.refresh_drafts();
         cx.notify();
     }
 
@@ -7763,6 +7814,44 @@ impl Docxy {
         cx.notify();
     }
 
+    fn set_keep_drafts(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.keep_drafts = on;
+        self.persist();
+        cx.notify();
+    }
+
+    /// Re-read the drafts (pruning old ones, but never a draft open in a
+    /// tab) into the backstage's list, and return it.
+    fn refresh_drafts(&mut self) -> &[recover::Draft] {
+        let open: Vec<PathBuf> = self.tabs.iter().filter_map(|t| t.path.clone()).collect();
+        self.drafts = recover::list_drafts(&config_root(), std::time::SystemTime::now(), &open);
+        &self.drafts
+    }
+
+    /// Open a kept draft read-only (Recover Unsaved Workbooks, #613): Save
+    /// refuses to write over it, so keeping it takes Save As.
+    fn open_draft_path(
+        &mut self,
+        path: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.open_path(path, OpenMode::ReadOnly, Reopen::Ask) {
+            Ok(true) => {
+                if self.tabs.get(self.active).is_some_and(draft_loaded) {
+                    self.set_status(DRAFT_OPENED);
+                }
+            }
+            // Already open: `open_path` focused it or queued the reopen question.
+            Ok(false) => {}
+            Err(e) => self.set_status(e),
+        }
+        self.backstage = false;
+        self.drop_grid_state();
+        self.persist();
+        self.refocus(window, cx);
+    }
+
     fn add_tab(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
         self.project_prompt_cancel();
         let new_tab = |title: &str, surface| DocTab {
@@ -7781,6 +7870,7 @@ impl Docxy {
             load_failed: false,
             dialogs: crate::dialog::DialogStack::default(),
             access: crate::open_mode::Access::default(),
+            last_hot: Default::default(),
         };
         self.tabs.push(match kind {
             Kind::Project => new_project_tab(),
@@ -17057,6 +17147,7 @@ mod sheet_save_tests {
             load_failed: false,
             dialogs: crate::dialog::DialogStack::default(),
             access: crate::open_mode::Access::default(),
+            last_hot: Default::default(),
         }
     }
 
@@ -23172,6 +23263,63 @@ impl Docxy {
                         .into_any_element()
                 })
                 .collect();
+            let now = std::time::SystemTime::now();
+            // Recover Unsaved Workbooks (#613). The row keeps the draft's
+            // path, not its index: the list can change before the click.
+            let drafts: Vec<AnyElement> = self
+                .drafts
+                .iter()
+                .enumerate()
+                .map(|(i, d)| {
+                    let path = d.path.clone();
+                    div()
+                        .id(("draft", i))
+                        .flex()
+                        .gap_3()
+                        .px_3()
+                        .py_1p5()
+                        .cursor_pointer()
+                        .rounded_sm()
+                        .hover(|d| d.bg(sidebar))
+                        .child(div().text_color(fg).child(format!(
+                            "{} {}",
+                            Kind::Xlsx.glyph(),
+                            d.name
+                        )))
+                        .child(
+                            div()
+                                .text_color(dim)
+                                .child(recover::draft_age_label(d.saved, now)),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_draft_path(&path, window, cx);
+                        }))
+                        .into_any_element()
+                })
+                .collect();
+            let check = |on: bool| {
+                div()
+                    .size(px(16.))
+                    .rounded(px(3.))
+                    .border_1()
+                    .border_color(if on { hsla_u(BRAND) } else { dim })
+                    .bg(if on {
+                        hsla_u(BRAND)
+                    } else {
+                        Hsla { a: 0., ..fg }
+                    })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(on, |d| {
+                        d.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(FILE_FG))
+                                .child("\u{2713}"),
+                        )
+                    })
+            };
             v_flex()
                 .flex_1()
                 .h_full()
@@ -23239,6 +23387,25 @@ impl Docxy {
                         .text_size(px(13.))
                         .text_color(rgb(BRAND))
                         .mt_4()
+                        .child("Recover Unsaved Workbooks"),
+                )
+                .map(|d| {
+                    if drafts.is_empty() {
+                        d.child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(dim)
+                                .child("No unsaved workbooks"),
+                        )
+                    } else {
+                        d.child(v_flex().gap_0p5().children(drafts))
+                    }
+                })
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(rgb(BRAND))
+                        .mt_4()
                         .child("Settings"),
                 )
                 .child(
@@ -23251,33 +23418,7 @@ impl Docxy {
                         .cursor_pointer()
                         .rounded_sm()
                         .hover(|d| d.bg(sidebar))
-                        .child(
-                            div()
-                                .size(px(16.))
-                                .rounded(px(3.))
-                                .border_1()
-                                .border_color(if self.ask_on_close {
-                                    hsla_u(BRAND)
-                                } else {
-                                    dim
-                                })
-                                .bg(if self.ask_on_close {
-                                    hsla_u(BRAND)
-                                } else {
-                                    Hsla { a: 0., ..fg }
-                                })
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .when(self.ask_on_close, |d| {
-                                    d.child(
-                                        div()
-                                            .text_size(px(11.))
-                                            .text_color(rgb(FILE_FG))
-                                            .child("\u{2713}"),
-                                    )
-                                }),
-                        )
+                        .child(check(self.ask_on_close))
                         .child(
                             div()
                                 .text_color(fg)
@@ -23325,6 +23466,33 @@ impl Docxy {
                 .child(div().text_size(px(11.)).text_color(dim).child(
                     "While a document has unsaved changes, a recovery copy is kept this often. After a crash it reopens as recovered and unsaved; the original file is not changed until you save.",
                 ))
+                // Excel's "Keep the last AutoRecovered version if I close
+                // without saving" (#613). Dimmed, not disabled, while
+                // AutoRecover is off: it does nothing until that is on.
+                .child(
+                    div()
+                        .id("bs-keep-drafts")
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .py_1()
+                        .cursor_pointer()
+                        .rounded_sm()
+                        .hover(|d| d.bg(sidebar))
+                        .child(check(self.keep_drafts))
+                        .child(
+                            div()
+                                .text_color(if self.autorecover_minutes > 0 { fg } else { dim })
+                                .child(if self.autorecover_minutes > 0 {
+                                    "Keep the last AutoRecovered version if I close without saving"
+                                } else {
+                                    "Keep the last AutoRecovered version if I close without saving (needs AutoRecover)"
+                                }),
+                        )
+                        .on_click(cx.listener(|this, _, _w, cx| {
+                            this.set_keep_drafts(!this.keep_drafts, cx);
+                        })),
+                )
                 .into_any_element()
         };
 

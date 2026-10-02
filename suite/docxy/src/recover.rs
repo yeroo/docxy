@@ -128,6 +128,130 @@ pub(crate) fn recovered_status(saved: Option<SystemTime>, now: SystemTime) -> St
     )
 }
 
+/// Excel keeps an unsaved workbook's draft for four days.
+pub(crate) const DRAFT_RETENTION: Duration = Duration::from_secs(4 * 86_400);
+
+/// Where workbooks closed with Don't Save keep their last AutoRecover copy (#613).
+pub(crate) fn drafts_dir(root: &Path) -> PathBuf {
+    root.join("docxy").join("drafts")
+}
+
+/// One kept draft, as Recover Unsaved Workbooks lists it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Draft {
+    /// The file stem: the workbook's title and Excel's `((Unsaved-…))` stamp.
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
+    /// When it was kept (the file's modification time).
+    pub(crate) saved: SystemTime,
+}
+
+/// The draft file name for a workbook titled `title`, kept at `secs` since the
+/// epoch: `Book1 ((Unsaved-1759363200)).xlsx`, as Excel names its drafts. The
+/// title loses its extension and any character a file name cannot hold.
+pub(crate) fn draft_file_name(title: &str, secs: u64) -> String {
+    // Sanitized before taking the stem: on Windows `a:b` would parse as a
+    // drive prefix and lose the `a`.
+    let safe: String = title
+        .chars()
+        .map(|c| {
+            if c.is_control() || r#"\/:*?"<>|"#.contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let stem = Path::new(&safe)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stem = stem.trim();
+    let stem = if stem.is_empty() { "Book" } else { stem };
+    format!("{stem} ((Unsaved-{secs})).xlsx")
+}
+
+/// Keep a copy of `sidecar` (a tab's last AutoRecover copy) as the draft of
+/// the workbook titled `title`, and return where it went. The sidecar is
+/// copied, never moved: the next persist rewrites it for whichever tab then
+/// has its index. A name already taken gets `-2`, `-3`, … before `.xlsx`.
+pub(crate) fn keep_draft(
+    root: &Path,
+    title: &str,
+    sidecar: &Path,
+    now: SystemTime,
+) -> Result<PathBuf, String> {
+    let bytes = std::fs::read(sidecar).map_err(|e| format!("draft not kept: {e}"))?;
+    let dir = drafts_dir(root);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("draft not kept: {e}"))?;
+    let secs = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let name = draft_file_name(title, secs);
+    let base = name.trim_end_matches(".xlsx");
+    let path = (1..)
+        .map(|n| match n {
+            1 => dir.join(&name),
+            n => dir.join(format!("{base}-{n}.xlsx")),
+        })
+        .find(|p| !p.exists())
+        .expect("an unbounded range always finds a free name");
+    // Atomic: a half-written draft would be listed and fail to open.
+    opccore::fsio::write_atomic(&path, &bytes).map_err(|e| format!("draft not kept: {e}"))?;
+    Ok(path)
+}
+
+/// The drafts under `root`, newest first. Deletes drafts older than
+/// [`DRAFT_RETENTION`] unless one of `open` (the tabs' paths) names it, so
+/// call it on an explicit listing, not on every frame. A missing or
+/// unreadable directory is an empty list.
+pub(crate) fn list_drafts(root: &Path, now: SystemTime, open: &[PathBuf]) -> Vec<Draft> {
+    let Ok(entries) = std::fs::read_dir(drafts_dir(root)) else {
+        return Vec::new();
+    };
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let open: Vec<PathBuf> = open.iter().map(|p| canonical(p)).collect();
+    let mut drafts: Vec<Draft> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("xlsx"))
+        })
+        .filter_map(|path| {
+            let saved = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+            let old = now
+                .duration_since(saved)
+                .is_ok_and(|age| age > DRAFT_RETENTION);
+            if old && !open.contains(&canonical(&path)) {
+                let _ = std::fs::remove_file(&path);
+                return None;
+            }
+            let name = path.file_stem()?.to_string_lossy().into_owned();
+            Some(Draft { name, path, saved })
+        })
+        .collect();
+    drafts.sort_by(|a, b| b.saved.cmp(&a.saved).then_with(|| a.name.cmp(&b.name)));
+    drafts
+}
+
+/// How old a draft is, for the list: relative, like [`recovered_status`].
+pub(crate) fn draft_age_label(saved: SystemTime, now: SystemTime) -> String {
+    match now.duration_since(saved) {
+        Ok(age) if age < Duration::from_secs(60) => "less than a minute ago".into(),
+        Ok(age) if age < Duration::from_secs(2 * 3600) => {
+            format!("{} min ago", age.as_secs() / 60)
+        }
+        Ok(age) if age < Duration::from_secs(2 * 86_400) => {
+            format!("{} h ago", age.as_secs() / 3600)
+        }
+        Ok(age) => format!("{} days ago", age.as_secs() / 86_400),
+        Err(_) => "just now".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +352,105 @@ mod tests {
         );
         assert!(recovered_status(None, now).contains("from the last session"));
         assert!(recovered_status(Some(now), now).contains("less than a minute"));
+    }
+
+    fn set_age(path: &Path, now: SystemTime, age: Duration) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(now - age)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_draft_name_is_the_title_without_extension_and_unsafe_characters() {
+        assert_eq!(draft_file_name("Book1", 7), "Book1 ((Unsaved-7)).xlsx");
+        assert_eq!(
+            draft_file_name("Budget.xlsx", 7),
+            "Budget ((Unsaved-7)).xlsx"
+        );
+        assert_eq!(
+            draft_file_name("a:b*c?\"<x>|\u{1}.xlsx", 7),
+            "a_b_c___x___ ((Unsaved-7)).xlsx"
+        );
+        assert_eq!(draft_file_name("", 7), "Book ((Unsaved-7)).xlsx");
+        assert_eq!(draft_file_name("  .xlsx", 7), "Book ((Unsaved-7)).xlsx");
+    }
+
+    #[test]
+    fn keeping_a_draft_copies_the_sidecar_and_never_overwrites_one() {
+        let root = Scratch::new();
+        let sidecar = root.0.join("tab-0.xlsx");
+        std::fs::write(&sidecar, b"first").unwrap();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let a = keep_draft(&root.0, "Book1", &sidecar, now).unwrap();
+        assert_eq!(a, drafts_dir(&root.0).join("Book1 ((Unsaved-1000)).xlsx"));
+        assert_eq!(std::fs::read(&a).unwrap(), b"first");
+        assert!(sidecar.exists(), "copied, not moved");
+        std::fs::write(&sidecar, b"second").unwrap();
+        let b = keep_draft(&root.0, "Book1", &sidecar, now).unwrap();
+        assert_eq!(b, drafts_dir(&root.0).join("Book1 ((Unsaved-1000))-2.xlsx"));
+        assert_eq!(std::fs::read(&a).unwrap(), b"first", "the first is kept");
+        assert_eq!(std::fs::read(&b).unwrap(), b"second");
+        let gone = root.0.join("missing.xlsx");
+        assert!(keep_draft(&root.0, "Book1", &gone, now).is_err());
+    }
+
+    #[test]
+    fn drafts_list_newest_first_and_only_workbooks() {
+        let root = Scratch::new();
+        assert_eq!(list_drafts(&root.0, SystemTime::now(), &[]), vec![]);
+        let dir = drafts_dir(&root.0);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+        for (name, age) in [("old.xlsx", 3600), ("new.xlsx", 60), ("note.txt", 0)] {
+            let p = dir.join(name);
+            std::fs::write(&p, b"x").unwrap();
+            set_age(&p, now, Duration::from_secs(age));
+        }
+        std::fs::create_dir_all(dir.join("folder.xlsx")).unwrap();
+        let names: Vec<_> = list_drafts(&root.0, now, &[])
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(names, ["new", "old"]);
+    }
+
+    #[test]
+    fn drafts_older_than_four_days_are_deleted_unless_open() {
+        let root = Scratch::new();
+        let dir = drafts_dir(&root.0);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+        let day = Duration::from_secs(86_400);
+        let stale = dir.join("stale.xlsx");
+        let open = dir.join("open.xlsx");
+        let fresh = dir.join("fresh.xlsx");
+        for (p, age) in [(&stale, day * 5), (&open, day * 5), (&fresh, day * 3)] {
+            std::fs::write(p, b"x").unwrap();
+            set_age(p, now, age);
+        }
+        let names: Vec<_> = list_drafts(&root.0, now, std::slice::from_ref(&open))
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(names, ["fresh", "open"]);
+        assert!(!stale.exists(), "pruned");
+        assert!(open.exists(), "a draft open in a tab is never pruned");
+    }
+
+    #[test]
+    fn a_draft_age_is_relative() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let ago = |s| draft_age_label(now - Duration::from_secs(s), now);
+        assert_eq!(ago(5), "less than a minute ago");
+        assert_eq!(ago(12 * 60), "12 min ago");
+        assert_eq!(ago(5 * 3600), "5 h ago");
+        assert_eq!(ago(3 * 86_400), "3 days ago");
+        assert_eq!(
+            draft_age_label(now + Duration::from_secs(5), now),
+            "just now"
+        );
     }
 }

@@ -2016,6 +2016,8 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "theme-set"
             | "ask-on-close"
             | "autorecover"
+            | "keep-drafts"
+            | "open-draft"
             | "dialog-set"
             | "dialog-tab"
             | "dialog-click"
@@ -2163,6 +2165,7 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
             "autorecover_minutes",
             Json::Num(f64::from(app.autorecover_minutes)),
         ),
+        ("keep_drafts", Json::Bool(app.keep_drafts)),
         (
             "ribbon_tab",
             Json::Str(
@@ -2713,8 +2716,12 @@ pub fn dispatch(
                 }),
                 Some(_) => return Err("'answer' must be save, discard or cancel".into()),
             };
-            app.close_tab_with(index, answer, window, cx);
-            Done::ok(state(app, window))
+            let draft_error = app.close_tab_with(index, answer, window, cx);
+            let mut reply = state(app, window);
+            if let (Json::Obj(fields), Some(e)) = (&mut reply, draft_error) {
+                fields.push(("draft_error".into(), Json::Str(e)));
+            }
+            Done::ok(reply)
         }
         // The same handler as the Backstage rail item, not a synthetic click.
         "backstage-close" => {
@@ -2734,6 +2741,47 @@ pub fn dispatch(
             let minutes = u32::try_from(arg_usize(args, "minutes")?)
                 .map_err(|_| "'minutes' is too large".to_string())?;
             app.set_autorecover_minutes(minutes, cx);
+            Done::ok(state(app, window))
+        }
+        // Settings' "Keep the last AutoRecovered version if I close without
+        // saving" (#613).
+        "keep-drafts" => {
+            let Some(Json::Bool(on)) = args.get("on") else {
+                return Err("'on' must be a boolean".into());
+            };
+            app.set_keep_drafts(*on, cx);
+            Done::ok(state(app, window))
+        }
+        // Recover Unsaved Workbooks' list, re-read (and pruned) as opening
+        // the backstage does, newest first.
+        "drafts" => {
+            let now = std::time::SystemTime::now();
+            let drafts = app
+                .refresh_drafts()
+                .iter()
+                .map(|d| {
+                    let age = now.duration_since(d.saved).unwrap_or_default();
+                    Json::obj(vec![
+                        ("name", Json::Str(d.name.clone())),
+                        ("path", Json::Str(d.path.display().to_string())),
+                        ("age_secs", Json::Num(age.as_secs() as f64)),
+                    ])
+                })
+                .collect();
+            cx.notify();
+            Done::ok(Json::obj(vec![("drafts", Json::Arr(drafts))]))
+        }
+        // Open the `index`th draft of a fresh `drafts` listing read-only,
+        // through the method a click on its backstage row calls.
+        "open-draft" => {
+            app.refuse_under_dialog()?;
+            let index = arg_usize(args, "index")?;
+            let path = app
+                .refresh_drafts()
+                .get(index)
+                .map(|d| d.path.clone())
+                .ok_or_else(|| format!("no draft {index}"))?;
+            app.open_draft_path(&path, window, cx);
             Done::ok(state(app, window))
         }
         // One AutoRecover tick now, as the timer would run it once the
@@ -3491,6 +3539,7 @@ mod tests {
             load_failed: false,
             dialogs: crate::dialog::DialogStack::default(),
             access: crate::open_mode::Access::default(),
+            last_hot: Default::default(),
         };
         let mut word = doc(crate::Kind::Docx, "a.docx");
         word.path = Some("C:/work/a.docx".into());
