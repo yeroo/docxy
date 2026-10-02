@@ -214,14 +214,25 @@ fn stored_block(br: &mut BitReader, out: &mut Vec<u8>, cap: usize) -> bool {
         return false;
     }
     br.pos += 4;
+    // What a partial decode keeps when the block is cut short or would pass
+    // the cap: the bytes that are there, up to the cap.
+    let room = if cap == 0 {
+        usize::MAX
+    } else {
+        cap.saturating_sub(out.len())
+    };
     if br.pos + len > br.data.len() {
         if br.partial {
-            out.extend_from_slice(&br.data[br.pos..]);
+            let end = br.data.len().min(br.pos.saturating_add(room));
+            out.extend_from_slice(&br.data[br.pos..end]);
             br.pos = br.data.len();
         }
         return false;
     }
-    if cap != 0 && out.len() + len > cap {
+    if len > room {
+        if br.partial {
+            out.extend_from_slice(&br.data[br.pos..br.pos + room]);
+        }
         return false;
     }
     out.extend_from_slice(&br.data[br.pos..br.pos + len]);
@@ -351,13 +362,15 @@ pub fn inflate_partial(src: &[u8], cap: usize) -> Vec<u8> {
         if br.error {
             break;
         }
+        // The cap holds inside each block too: one block of back-references
+        // can expand a thousandfold.
         let ok = match typ {
-            0 => stored_block(&mut br, &mut out, 0),
+            0 => stored_block(&mut br, &mut out, cap),
             1 => {
                 let (lencode, distcode) = fixed_tables();
-                codes(&mut br, &mut out, &lencode, &distcode, 0)
+                codes(&mut br, &mut out, &lencode, &distcode, cap)
             }
-            2 => dynamic_block(&mut br, &mut out, 0),
+            2 => dynamic_block(&mut br, &mut out, cap),
             _ => false,
         };
         if cap != 0 && out.len() >= cap {
@@ -479,6 +492,51 @@ mod tests {
         for b in 0..=255u8 {
             let _ = inflate_partial(&[b, b ^ 0x5a, 0xff, 0x00, b], 0);
         }
+    }
+
+    /// One fixed-Huffman block of back-references that expands to 100 MiB
+    /// (a decompression bomb): the cap holds inside the block, not only
+    /// between blocks.
+    #[test]
+    fn partial_caps_inside_one_block() {
+        let matches = (100 << 20) / 258;
+        let bomb = fixed_bomb(matches);
+        assert!(bomb.len() < 1 << 20, "{}", bomb.len());
+        let out = inflate_partial(&bomb, 1 << 20);
+        assert_eq!(out.len(), 1 << 20);
+        // Truncating afterwards would keep the 100 MiB it grew to.
+        assert!(out.capacity() <= 4 << 20, "grew to {}", out.capacity());
+        assert!(out.iter().all(|&b| b == b'a'));
+        // A stored block over the cap keeps what fits.
+        assert_eq!(
+            inflate_partial(&stored_stream(b"0123456789"), 7),
+            b"0123456"
+        );
+    }
+
+    /// A final fixed-Huffman block: literal `a`, then `matches` copies of
+    /// length 258 at distance 1 (symbol 285, 8 bits; distance code 0, 5 bits),
+    /// then end-of-block.
+    fn fixed_bomb(matches: usize) -> Vec<u8> {
+        let mut bits: Vec<bool> = vec![true, true, false];
+        let push = |code: u32, len: u32, bits: &mut Vec<bool>| {
+            for i in (0..len).rev() {
+                bits.push(code >> i & 1 == 1);
+            }
+        };
+        push(0x30 + u32::from(b'a'), 8, &mut bits);
+        for _ in 0..matches {
+            push(0xC0 + (285 - 280), 8, &mut bits);
+            push(0, 5, &mut bits);
+        }
+        push(0, 7, &mut bits);
+        let mut out = vec![0u8; bits.len().div_ceil(8)];
+        for (i, bit) in bits.iter().enumerate() {
+            if *bit {
+                out[i / 8] |= 1 << (i % 8);
+            }
+        }
+        out
     }
 
     /// One final fixed-Huffman block holding `text` as literals (bytes < 144,
