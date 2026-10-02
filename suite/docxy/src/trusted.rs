@@ -17,7 +17,10 @@
 //! The store fails to *protected*: a missing, unreadable or malformed
 //! `trusted.json` trusts nothing. Two instances that each read, add and
 //! write can lose one of the two records; that file is then protected
-//! again, which is the safe side, so there is no locking.
+//! again, which is the safe side, so there is no locking. A `remember` in
+//! another instance racing a [`clear`] can likewise restore the cleared
+//! records; that needs two instances and a window of one load-and-save,
+//! and is accepted. No locking or retry code.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -132,6 +135,23 @@ pub(crate) fn remember(root: &Path, path: &Path, stamp: Stamp) -> String {
         Ok(()) => "editing enabled".into(),
         Err(e) => format!("editing enabled (not remembered: {e})"),
     }
+}
+
+/// How many records the store under `root` holds; 0 when it is missing or
+/// malformed (the fail-to-protected rule). The backstage's Settings row.
+pub(crate) fn count(root: &Path) -> usize {
+    TrustStore::load(root).records.len()
+}
+
+/// Clear every trusted document under `root` (#895), as Excel's Trust
+/// Center > Trusted Documents > Clear does. Returns how many records the
+/// store held. The empty store is written, not deleted: a malformed file is
+/// replaced with a valid empty one, and an unwritable root reports the error
+/// through the same `save` path [`remember`] uses, with nothing cleared.
+pub(crate) fn clear(root: &Path) -> std::io::Result<usize> {
+    let n = count(root);
+    TrustStore::default().save(root)?;
+    Ok(n)
 }
 
 #[cfg(test)]
@@ -275,5 +295,70 @@ mod tests {
             status.starts_with("editing enabled (not remembered: "),
             "{status}"
         );
+    }
+
+    /// Clearing empties the store and says how many records it held (#895):
+    /// afterwards nothing is trusted, and the store file remains, valid and
+    /// empty.
+    #[test]
+    fn clearing_forgets_every_trusted_file() {
+        let dir = Scratch::new("clear");
+        let a = dir.file("a.xlsx", b"a");
+        let b = dir.file("b.xlsx", b"b");
+        let root = dir.0.join("root");
+        remember(&root, &a, stamp(1, 1));
+        remember(&root, &b, stamp(1, 2));
+        assert_eq!(clear(&root).ok(), Some(2));
+        let store = TrustStore::load(&root);
+        assert!(!store.is_trusted(&a, Some(stamp(1, 1))));
+        assert!(!store.is_trusted(&b, Some(stamp(1, 2))));
+        assert!(store_path_in(&root).is_file());
+        assert_eq!(count(&root), 0);
+    }
+
+    /// Clearing a store that does not exist is not an error; it leaves a
+    /// valid empty store behind (#895).
+    #[test]
+    fn clearing_a_missing_store_is_zero() {
+        let dir = Scratch::new("clear-missing");
+        let root = dir.0.join("root");
+        assert_eq!(clear(&root).ok(), Some(0));
+        assert!(store_path_in(&root).is_file());
+    }
+
+    /// Clearing replaces a malformed store with a valid empty one (#895),
+    /// so the next read trusts nothing and parses.
+    #[test]
+    fn clearing_replaces_a_malformed_store() {
+        let dir = Scratch::new("clear-malformed");
+        let root = dir.0.join("root");
+        std::fs::create_dir_all(root.join("docxy")).unwrap();
+        std::fs::write(store_path_in(&root), b"not json").unwrap();
+        assert_eq!(clear(&root).ok(), Some(0));
+        let bytes = std::fs::read(store_path_in(&root)).unwrap();
+        let store: TrustStore = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(store, TrustStore::default());
+    }
+
+    /// A store that cannot be written is not cleared (#895): the error comes
+    /// through the same `save` path `remember` reports.
+    #[test]
+    fn a_store_that_cannot_be_cleared_says_so() {
+        let dir = Scratch::new("clear-unwritable");
+        // The root is a file, so `<root>/docxy` cannot be made.
+        let root = dir.file("root", b"in the way");
+        assert!(clear(&root).is_err());
+    }
+
+    /// The count behind the backstage's Settings row: 0 for a missing store,
+    /// the record count after remembering (#895).
+    #[test]
+    fn count_reads_the_store() {
+        let dir = Scratch::new("count");
+        let a = dir.file("a.xlsx", b"a");
+        let root = dir.0.join("root");
+        assert_eq!(count(&root), 0, "missing");
+        remember(&root, &a, stamp(1, 7));
+        assert_eq!(count(&root), 1);
     }
 }
