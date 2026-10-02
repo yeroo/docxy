@@ -119,3 +119,157 @@ test the clipboard verb refuses what it does not do
   call-error clipboard {"action":"copy"} => press the app's own key
   call-error clipboard {"action":"write"} => text
   call-error clipboard {"action":"shuffle"} => unknown clipboard action
+
+# #664: Excel's sheet clipboard. Each case builds the issue's book in an
+# unused corner of basic.xlsx: M20 1, M21 2, N20 =M20*10, N21 =M21*10,
+# P20:P25 old, T20 =M20+N20.
+
+test a sheet copy tiles over a paste area of whole copies
+  open copy:../fixtures/basic.xlsx
+  click M20
+  type 1
+  key enter
+  type 2
+  key enter
+  click N20
+  type =M20*10
+  key enter
+  type =M21*10
+  key enter
+  click N20
+  click N21 shift
+  key ctrl+c
+  click P20
+  click P25 shift
+  key ctrl+v
+  call cell {"cell":"P20"}
+  assert reply.value is =O20*10
+  call cell {"cell":"P25"}
+  assert reply.value is =O25*10
+  assert cell P26 is nothing
+  assert range is P20:P25
+  assert sel is P20
+
+test a sheet paste area that is not whole copies is refused
+  open copy:../fixtures/basic.xlsx
+  click N20
+  type =M20*10
+  key enter
+  type =M21*10
+  key enter
+  click P20
+  type old
+  key enter
+  click N20
+  click N21 shift
+  key ctrl+c
+  click P20
+  click P22 shift
+  key ctrl+v
+  assert status is The information cannot be pasted because the Copy area and the paste area aren't the same size and shape.
+  assert cell P20 is old
+
+test a pasted sheet copy translates its references
+  open copy:../fixtures/basic.xlsx
+  click N20
+  type =M20*10
+  key enter
+  type =M21*10
+  key enter
+  click N20
+  click N21 shift
+  key ctrl+c
+  click Q20
+  key ctrl+v
+  call cell {"cell":"Q20"}
+  assert reply.value is =P20*10
+  call cell {"cell":"Q21"}
+  assert reply.value is =P21*10
+
+test enter pastes a sheet copy and ends copy mode
+  open copy:../fixtures/basic.xlsx
+  click N20
+  type =M20*10
+  key enter
+  type =M21*10
+  key enter
+  click N20
+  click N21 shift
+  key ctrl+c
+  click R20
+  key enter
+  call cell {"cell":"R21"}
+  assert reply.value is =Q21*10
+  assert sel is R20
+  call clipboard {"action":"read"}
+  assert reply.app.kind is none
+  click S20
+  key ctrl+v
+  assert cell S20 is nothing
+
+test escape ends sheet copy mode
+  open copy:../fixtures/basic.xlsx
+  click N20
+  type =M20*10
+  key enter
+  click N20
+  key ctrl+c
+  key escape
+  call clipboard {"action":"read"}
+  assert reply.app.kind is none
+  click S20
+  key ctrl+v
+  assert cell S20 is nothing
+  # Enter moves again once copy mode is over.
+  key enter
+  assert sel is S21
+
+test a sheet cut moves its cells and the references to them, once
+  open copy:../fixtures/basic.xlsx
+  click M20
+  type 1
+  key enter
+  click N20
+  type =M20*10
+  key enter
+  click T20
+  type =M20+N20
+  key enter
+  click M20
+  click N20 shift
+  key ctrl+x
+  assert cell M20 is 1
+  click M30
+  key ctrl+v
+  assert cell M30 is 1
+  call cell {"cell":"N30"}
+  assert reply.value is =M30*10
+  assert cell M20 is nothing
+  assert cell N20 is nothing
+  call cell {"cell":"T20"}
+  assert reply.value is =M30+N30
+  assert cell T20 is 11
+  click V20
+  key ctrl+v
+  assert cell V20 is nothing
+  key ctrl+z
+  assert cell M20 is 1
+  assert cell M30 is nothing
+  call cell {"cell":"T20"}
+  assert reply.value is =M20+N20
+
+test an edit after a sheet cut cancels it
+  open copy:../fixtures/basic.xlsx
+  click M20
+  type 1
+  key enter
+  click M20
+  key ctrl+x
+  click M20
+  type 5
+  key enter
+  click M30
+  key ctrl+v
+  assert cell M30 is nothing
+  assert cell M20 is 5
+  assert status is The cut was cancelled: the workbook changed since it was cut (nothing pasted)
