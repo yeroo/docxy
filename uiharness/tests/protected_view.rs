@@ -368,6 +368,11 @@ fn enable_editing_trusts_the_file_until_it_is_replaced() {
     assert!(flag(&open(&driver), "protected"));
     let st = ok(&driver, "enable-editing", vec![]);
     assert_eq!(st.get("protected"), Some(&Json::Bool(false)), "{st}");
+    assert_eq!(
+        st.get("status").and_then(Json::as_str),
+        Some("editing enabled"),
+        "{st}"
+    );
 
     // Downloaded again to the same path: another file, protected again.
     ok(&driver, "close-tab", vec![]);

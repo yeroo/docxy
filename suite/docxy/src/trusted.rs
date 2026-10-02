@@ -17,7 +17,10 @@
 //! The store fails to *protected*: a missing, unreadable or malformed
 //! `trusted.json` trusts nothing. Two instances that each read, add and
 //! write can lose one of the two records; that file is then protected
-//! again, which is the safe side, so there is no locking.
+//! again, which is the safe side, so there is no locking. A `remember` in
+//! another instance racing a [`clear`] can likewise restore the cleared
+//! records; that needs two instances and a window of one load-and-save,
+//! and is accepted. No locking or retry code.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};

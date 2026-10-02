@@ -2517,6 +2517,9 @@ struct Docxy {
     /// Trusted Documents' count for the backstage's Settings, re-read when
     /// the backstage opens and after a clear (#895): never per frame.
     trusted_count: usize,
+    /// Why the last Clear failed, shown under the backstage row until the
+    /// backstage reopens or a Clear succeeds (#895).
+    trusted_error: Option<String>,
     /// When the hot-exit state was last written by any `persist`, or an
     /// AutoRecover tick last found nothing to write: the timer's clock. A
     /// `Cell` because `persist` takes `&self`.
@@ -7592,6 +7595,7 @@ impl Docxy {
             keep_drafts: true,
             drafts: Vec::new(),
             trusted_count: 0,
+            trusted_error: None,
             last_persist: std::cell::Cell::new(std::time::Instant::now()),
             applied: None,
             find_open: false,
@@ -7731,6 +7735,7 @@ impl Docxy {
         self.bs_new = false;
         self.refresh_drafts();
         self.trusted_count = trusted::count(&config_root());
+        self.trusted_error = None;
         cx.notify();
     }
 
@@ -7832,12 +7837,14 @@ impl Docxy {
         match trusted::clear(&config_root()) {
             Ok(n) => {
                 self.trusted_count = 0;
+                self.trusted_error = None;
                 self.set_status("trusted documents cleared");
                 cx.notify();
                 Ok(n)
             }
             Err(e) => {
                 self.trusted_count = trusted::count(&config_root());
+                self.trusted_error = Some(format!("Not cleared: {e}"));
                 self.set_status(format!("trusted documents not cleared: {e}"));
                 cx.notify();
                 Err(e.to_string())
@@ -23547,6 +23554,7 @@ impl Docxy {
                                 .child("Clear"),
                         )
                         .on_click(cx.listener(|this, _, _w, cx| {
+                            // The row shows the outcome: the count, or `trusted_error`.
                             let _ = this.clear_trusted(cx);
                         })),
                 )
@@ -23555,6 +23563,9 @@ impl Docxy {
                     n = self.trusted_count,
                     s = if self.trusted_count == 1 { "" } else { "s" },
                 )))
+                .when_some(self.trusted_error.clone(), |d, e| {
+                    d.child(div().text_size(px(12.)).text_color(fg).child(e))
+                })
                 .into_any_element()
         };
 
