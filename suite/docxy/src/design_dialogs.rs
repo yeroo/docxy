@@ -417,7 +417,8 @@ pub(crate) fn page_borders_dialog(tab: &DocTab) -> Result<Dialog, String> {
         .is_some_and(|p| p.sides.iter().all(Option::is_some));
     let setting = match (&pb, first) {
         (None, _) | (_, None) => NONE,
-        (Some(_), Some(s)) if all_four && sides.iter().all(|x| *x == s) => {
+        // The setting is the sides' look; Options... margins may differ.
+        (Some(_), Some(s)) if all_four && sides.iter().all(|x| same_look(x, s)) => {
             if s.shadow {
                 SHADOW
             } else if s.frame {
@@ -515,6 +516,14 @@ pub(crate) fn page_borders_dialog(tab: &DocTab) -> Result<Dialog, String> {
     d.react = Some(Reaction(page_borders_react));
     d.mark_opened();
     Ok(d)
+}
+
+/// Whether two sides look alike: all but their margin (`w:space`).
+fn same_look(a: &BorderSide, b: &BorderSide) -> bool {
+    BorderSide {
+        space: b.space,
+        ..a.clone()
+    } == *b
 }
 
 /// The side boxes are for Custom; Box, Shadow and 3-D tick all four, None

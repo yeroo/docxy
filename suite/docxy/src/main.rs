@@ -24797,16 +24797,8 @@ impl Render for Docxy {
                                     a: 0.5,
                                     ..hsla_u(0xeef4ff)
                                 };
-                                let hdr_bg = if edit_hdr_here {
-                                    tint
-                                } else {
-                                    hsla_u(0xffffff)
-                                };
-                                let ftr_bg = if edit_ftr_here {
-                                    tint
-                                } else {
-                                    hsla_u(0xffffff)
-                                };
+                                let hdr_bg = if edit_hdr_here { tint } else { sheet };
+                                let ftr_bg = if edit_ftr_here { tint } else { sheet };
                                 // Header in the top margin, content in the middle, footer in
                                 // the bottom margin, on every page, so each area can be
                                 // double-clicked (PAG-064). While a header or footer is

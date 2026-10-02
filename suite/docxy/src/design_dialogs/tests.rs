@@ -263,6 +263,21 @@ fn custom_sides_this_section_first_page_and_options() {
     assert!(!t.dialogs.is_open());
 }
 
+/// Options... margins that differ per side leave Box a Box.
+#[test]
+fn box_with_one_different_margin_reopens_as_box() {
+    let mut t = three_sections();
+    open(&mut t, page_borders_dialog);
+    set(&mut t, "setting", s("Box"));
+    click(&mut t, "Options...").unwrap();
+    set(&mut t, "top", s("10"));
+    click(&mut t, "OK").unwrap();
+    click(&mut t, "OK").unwrap();
+    open(&mut t, page_borders_dialog);
+    assert_eq!(control(&t, "setting").text(), "Box");
+    assert!(!control(&t, "top").enabled);
+}
+
 #[test]
 fn all_except_first_page_and_a_bad_margin() {
     let mut t = three_sections();
