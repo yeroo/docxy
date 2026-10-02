@@ -1090,8 +1090,9 @@ impl Engine {
 
         // An edited *data* cell (or a spill write in a recursive pass) isn't a
         // formula key, so `rev` can't reach its dependents. Find those first-
-        // level dependents via the seed index in `formulas_reading`;
-        // everything reachable from them is a formula and expands via `rev`.
+        // level dependents with `formulas_reading` (a cover-index stab per
+        // seed, or a seed-index scan for large seed sets); everything
+        // reachable from them is a formula and expands via `rev`.
         let data_seeds: Vec<Key> = changed
             .iter()
             .copied()
@@ -2096,20 +2097,32 @@ impl CoverIndex {
         Self { rects, rows, cols }
     }
 
-    /// How many rects the point query below would examine: the smaller of the
-    /// two axes' stab counts. Used only by tests.
+    /// Which axis `for_each_covering` stabs for `(r, c)`: the one with fewer
+    /// stabbed intervals (the rows on ties).
+    fn stab_rows(&self, r: u32, c: u32) -> bool {
+        self.rows.stab_count(r) <= self.cols.stab_count(c)
+    }
+
+    /// How many rects the point query below would examine: the stab count of
+    /// the axis [`CoverIndex::stab_rows`] picks. Used only by tests.
     #[cfg(test)]
     fn walk_len(&self, r: u32, c: u32) -> usize {
-        self.rows.stab_count(r).min(self.cols.stab_count(c))
+        if self.stab_rows(r, c) {
+            self.rows.stab_count(r)
+        } else {
+            self.cols.stab_count(c)
+        }
     }
 
     /// Calls `f` for every rect covering `(r, c)`, stabbing the axis with
-    /// fewer hits (the rows on ties) and checking the other axis per
-    /// candidate. A formula with several rects covering the point is reported
-    /// once per rect; callers dedupe.
+    /// fewer hits (the rows on ties, per [`CoverIndex::stab_rows`]) and
+    /// checking the other axis per candidate. A formula with several rects
+    /// covering the point is reported once per rect; callers dedupe.
     fn for_each_covering(&self, r: u32, c: u32, mut f: impl FnMut(Key)) {
-        if self.rows.stab_count(r) <= self.cols.stab_count(c) {
+        if self.stab_rows(r, c) {
             self.rows.for_each_stab(r, |id| {
+                #[cfg(test)]
+                tests::COVER_VISITS.with(|n| n.set(n.get() + 1));
                 let rect = &self.rects[id as usize];
                 if c >= rect.1 && c <= rect.3 {
                     f(rect.4);
@@ -2117,6 +2130,8 @@ impl CoverIndex {
             });
         } else {
             self.cols.for_each_stab(c, |id| {
+                #[cfg(test)]
+                tests::COVER_VISITS.with(|n| n.set(n.get() + 1));
                 let rect = &self.rects[id as usize];
                 if r >= rect.0 && r <= rect.2 {
                     f(rect.4);
@@ -2608,6 +2623,9 @@ mod tests {
         /// How many times [`Engine::ensure_covers`] has built the cover index
         /// on this thread.
         pub(super) static COVER_BUILDS: StdCell<usize> = const { StdCell::new(0) };
+        /// How many candidate rects [`CoverIndex::for_each_covering`] has
+        /// visited on this thread — the walked axis' stab count.
+        pub(super) static COVER_VISITS: StdCell<usize> = const { StdCell::new(0) };
     }
 
     fn wb_one_sheet(cells: &[(&str, Cell)]) -> Workbook {
@@ -4249,6 +4267,27 @@ mod tests {
         (wb, eng)
     }
 
+    /// The formulas not in `skip` with a dependency rectangle covering one of
+    /// `seeds`, by the naive inclusive filter over every formula's `deps` —
+    /// the oracle both `formulas_reading` paths are checked against.
+    fn naive_rect_readers(eng: &Engine, seeds: &[Key], skip: &HashSet<Key>) -> Vec<Key> {
+        let mut out: Vec<Key> = eng
+            .formulas
+            .iter()
+            .filter(|(fk, info)| {
+                !skip.contains(fk)
+                    && info.deps.iter().any(|&(ds, r1, c1, r2, c2)| {
+                        seeds
+                            .iter()
+                            .any(|&(s, r, c)| ds == s && r >= r1 && r <= r2 && c >= c1 && c <= c2)
+                    })
+            })
+            .map(|(fk, _)| *fk)
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
     #[test]
     fn cover_index_matches_naive_filter() {
         // #948: at every probe point, `for_each_covering` reports exactly the
@@ -4321,8 +4360,15 @@ mod tests {
         assert_eq!(idx.rows.stab_count(500), 11);
         assert_eq!(idx.cols.stab_count(5), 1001);
         assert_eq!(idx.walk_len(500, 5), 11);
+        assert!(idx.stab_rows(500, 5)); // 11 <= 1001: the rows get stabbed
+        COVER_VISITS.with(|n| n.set(0));
         let mut got = Vec::new();
         idx.for_each_covering(500, 5, |fk| got.push(fk));
+        assert_eq!(
+            COVER_VISITS.with(StdCell::get),
+            11,
+            "the walk visits only the chosen axis' candidates"
+        );
         got.sort_unstable();
         assert_eq!(got, vec![(0, 500, 0), (0, 1005, 0)]);
 
@@ -4337,8 +4383,15 @@ mod tests {
         }
         let tidx = CoverIndex::new(trects);
         assert_eq!(tidx.walk_len(500, 5), 11);
+        assert!(!tidx.stab_rows(500, 5)); // 1000 > 11: the columns get stabbed
+        COVER_VISITS.with(|n| n.set(0));
         let mut tgot = Vec::new();
         tidx.for_each_covering(500, 5, |fk| tgot.push(fk));
+        assert_eq!(
+            COVER_VISITS.with(StdCell::get),
+            11,
+            "the walk visits only the chosen axis' candidates"
+        );
         tgot.sort_unstable();
         assert_eq!(tgot, vec![(0, 5, 0)]);
 
@@ -4376,17 +4429,21 @@ mod tests {
             }
         }
         // Exactly COVER_SEED_LIMIT seeds takes the cover branch, one more
-        // takes the scan branch: equal sets both ways.
+        // takes the scan branch. Both are checked against the naive filter —
+        // for `large` that is the only meaningful check, since
+        // `formulas_reading` above the cutoff *is* the scan.
         let small: Vec<Key> = (0..COVER_SEED_LIMIT).map(|r| (0, r as u32, 0)).collect();
         let large: Vec<Key> = (0..=COVER_SEED_LIMIT).map(|r| (0, r as u32, 0)).collect();
         assert_eq!(small.len(), COVER_SEED_LIMIT);
         assert_eq!(large.len(), COVER_SEED_LIMIT + 1);
         for seeds in [&small, &large] {
+            let want = naive_rect_readers(&eng, seeds, &HashSet::new());
             let mut cover = eng.formulas_reading(seeds, &HashSet::new());
             cover.sort_unstable();
+            assert_eq!(cover, want, "{} seeds, cover branch", seeds.len());
             let mut scan = eng.formulas_reading_scan(seeds, &HashSet::new());
             scan.sort_unstable();
-            assert_eq!(cover, scan, "{} seeds", seeds.len());
+            assert_eq!(scan, want, "{} seeds, scan branch", seeds.len());
         }
     }
 
@@ -4459,8 +4516,14 @@ mod tests {
         assert_eq!(value_at(&wb, "D1"), CellValue::Number(110.0));
         // Replacing a formula with a number invalidates; the removal's own
         // walk rebuilds once, and a following plain data edit must not build
-        // again. Stale covers would wrongly reattach C1 to A1:A3 on the A2
-        // edit and overwrite the typed number (as C1=52, D1=104).
+        // again. The build count is the guard here: without the invalidation,
+        // `ensure_covers` would early-return on the stale index and the count
+        // would stay 0 instead of reading 1. (The value assertions alone
+        // would still pass — `evaluate` drops dirty keys that are no longer
+        // in `formulas`, so a stale C1 entry would be filtered out. The
+        // value-level guard for a stale *add* is the E1 block above: without
+        // a rebuild, editing A1 would not find E1 and E1 would keep 1000,
+        // not 500.)
         COVER_BUILDS.with(|n| n.set(0));
         set(&mut eng, &mut wb, "C1", Cell::number(7.0));
         assert_eq!(COVER_BUILDS.with(StdCell::get), 1);
