@@ -346,7 +346,8 @@ fn placeholder_of(open: &str) -> Option<Placeholder> {
 /// several pieces.
 type Pieces = HashMap<Placeholder, Vec<String>>;
 
-/// Collect the text of every placeholder control in `content` into `out`.
+/// Collect the text of every placeholder control in `content` into `out`,
+/// and of those in its text boxes.
 fn inline_placeholders(content: &[Inline], out: &mut Pieces) {
     let mut open: Vec<(Option<Placeholder>, String)> = Vec::new();
     for inline in content {
@@ -358,6 +359,9 @@ fn inline_placeholders(content: &[Inline], out: &mut Pieces) {
                 }
             }
             other => {
+                if let Inline::TextBox { blocks, .. } = other {
+                    block_placeholders(blocks, out);
+                }
                 let t = other.text();
                 for (_, text) in open.iter_mut() {
                     text.push_str(&t);
@@ -367,18 +371,14 @@ fn inline_placeholders(content: &[Inline], out: &mut Pieces) {
     }
 }
 
-/// The text typed into the placeholders of the cover `blocks` (from its
-/// opening boundary through its closing one): inline placeholder controls,
-/// and block-level ones such as Word's Abstract, whose paragraphs are joined
-/// with line breaks, as are the pieces of a placeholder split over several
-/// paragraphs. Blank and still-bracketed placeholders are left out.
-/// `w:showingPlcHdr` is not consulted: the editor never clears it, so it
-/// would hide text a person typed into a Word cover here.
-pub fn typed_placeholders(blocks: &[Block]) -> Typed {
-    let mut pieces = Pieces::new();
+/// Collect the text of every placeholder control in `blocks` into `out`:
+/// block-level ones (their paragraphs joined with line breaks) and inline
+/// ones, in paragraphs, table cells and text boxes, where Word's built-in
+/// covers keep most of theirs.
+fn block_placeholders(blocks: &[Block], out: &mut Pieces) {
     for (i, block) in blocks.iter().enumerate() {
         match block {
-            Block::Raw(raw) if i > 0 && is_sdt_open(raw) => {
+            Block::Raw(raw) if is_sdt_open(raw) => {
                 let (Some(field), Some(end)) = (placeholder_of(raw), matching_close(blocks, i))
                 else {
                     continue;
@@ -388,16 +388,36 @@ pub fn typed_placeholders(blocks: &[Block]) -> Typed {
                     .filter(|b| matches!(b, Block::Paragraph(_) | Block::Table(_)))
                     .map(Block::plain_text)
                     .collect::<Vec<_>>()
-                    .join(
-                        "
-",
-                    );
-                pieces.entry(field).or_default().push(text);
+                    .join("\n");
+                out.entry(field).or_default().push(text);
             }
-            Block::Paragraph(p) => inline_placeholders(&p.content, &mut pieces),
+            Block::Paragraph(p) => inline_placeholders(&p.content, out),
+            Block::Table(t) => {
+                for cell in t.rows.iter().flat_map(|r| &r.cells) {
+                    block_placeholders(&cell.blocks, out);
+                }
+            }
             _ => {}
         }
     }
+}
+
+/// The text typed into the placeholders of the cover `blocks` (from its
+/// opening boundary through its closing one): inline placeholder controls,
+/// and block-level ones such as Word's Abstract, whose paragraphs are joined
+/// with line breaks, as are the pieces of a placeholder split over several
+/// paragraphs; in paragraphs, table cells and text boxes. Blank and
+/// still-bracketed placeholders are left out. `w:showingPlcHdr` is not
+/// consulted: the editor never clears it, so it would hide text a person
+/// typed into a Word cover here.
+pub fn typed_placeholders(blocks: &[Block]) -> Typed {
+    let mut pieces = Pieces::new();
+    // The cover's own boundaries are not a placeholder's.
+    let inner = match blocks {
+        [first, rest @ .., _] if is_cover_open(first) => rest,
+        _ => blocks,
+    };
+    block_placeholders(inner, &mut pieces);
     pieces
         .into_iter()
         .filter_map(|(field, parts)| {
@@ -406,10 +426,7 @@ pub fn typed_placeholders(blocks: &[Block]) -> Typed {
                 .map(|t| t.trim())
                 .filter(|t| !t.is_empty())
                 .collect::<Vec<_>>()
-                .join(
-                    "
-",
-                );
+                .join("\n");
             is_typed(&text).then_some((field, text))
         })
         .collect()

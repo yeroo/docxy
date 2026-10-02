@@ -527,16 +527,15 @@ fn the_caret_at_an_emptied_placeholder_reads_its_formatting() {
     let Block::Paragraph(p) = &e.doc.body[title] else {
         panic!()
     };
-    let tab = p
-        .content
-        .iter()
-        .skip_while(|i| !matches!(i, Inline::Raw(r) if crate::hf::is_sdt_open(r)))
-        .find_map(|i| match i {
-            Inline::Tab(props) => Some(props),
-            _ => None,
-        })
-        .expect("a tab inside the control");
-    assert!(tab.bold && tab.size_half_pts == Some(64));
+    let at = |pred: &dyn Fn(&Inline) -> bool| p.content.iter().position(pred).unwrap();
+    let open = at(&|i| matches!(i, Inline::Raw(r) if crate::hf::is_sdt_open(r)));
+    let close = at(&|i| matches!(i, Inline::Raw(r) if crate::hf::is_sdt_close(r)));
+    let tab = at(&|i| matches!(i, Inline::Tab(_)));
+    assert!(open < tab && tab < close, "{:?}", p.content);
+    let Inline::Tab(props) = &p.content[tab] else {
+        unreachable!()
+    };
+    assert!(props.bold && props.size_half_pts == Some(64));
 }
 
 #[test]
@@ -555,4 +554,183 @@ fn title_page_goes_on_the_section_the_cover_is_in() {
         crate::sect::has_flag(&sections[1], "w:titlePg"),
         "{sections:?}"
     );
+}
+
+/// "Title:" in italics, then an emptied bold Title control.
+const BEFORE_EMPTY: &str = "<w:p><w:r><w:rPr><w:i/></w:rPr><w:t>Title:</w:t></w:r>\
+    <w:sdt><w:sdtPr><w:rPr><w:b/></w:rPr><w:alias w:val=\"Title\"/></w:sdtPr>\
+    <w:sdtContent></w:sdtContent></w:sdt></w:p>";
+
+#[test]
+fn replacing_text_next_to_an_emptied_control_leaves_it_empty() {
+    let check = |e: &Editor| {
+        let xml = blocks_to_xml(&e.doc.body);
+        assert!(
+            xml.contains("<w:sdtContent></w:sdtContent>"),
+            "the control stays empty: {xml}"
+        );
+        let Block::Paragraph(p) = &e.doc.body[0] else {
+            panic!()
+        };
+        let Inline::Run(r) = &p.content[0] else {
+            panic!("{xml}")
+        };
+        assert_eq!(r.text, "Title;");
+        assert!(r.props.italic && !r.props.bold, "{xml}");
+    };
+    let mut e = ed(BEFORE_EMPTY);
+    e.anchor = Some(Caret {
+        path: vec![0],
+        offset: 5,
+    });
+    e.caret = Caret {
+        path: vec![0],
+        offset: 6,
+    };
+    e.replace_current_with(";");
+    check(&e);
+
+    let mut e = ed(BEFORE_EMPTY);
+    assert_eq!(e.replace_all(":", ";", true), 1);
+    check(&e);
+}
+
+/// Whether every inline content control in `content`, and in the hyperlinks
+/// it holds, opens and closes in pairs.
+fn content_balances(content: &[Inline]) -> bool {
+    let mut depth = 0i32;
+    for i in content {
+        match i {
+            Inline::Raw(r) if crate::hf::is_sdt_open(r) => depth += 1,
+            Inline::Raw(r) if crate::hf::is_sdt_close(r) => depth -= 1,
+            Inline::Hyperlink(h) if !content_balances(&h.content) => return false,
+            _ => {}
+        }
+        if depth < 0 {
+            return false;
+        }
+    }
+    depth == 0
+}
+
+#[test]
+fn enter_at_the_end_of_a_placeholder_continues_it() {
+    let mut e = body_doc();
+    e.set_cover_page(0, &[]).unwrap();
+    let title = field_para(&e, Placeholder::Title);
+    type_over(&mut e, title, "Line1");
+    e.insert_newline();
+    e.insert_str("Line2");
+    assert!(
+        inline_controls_balance(&e),
+        "{}",
+        blocks_to_xml(&e.doc.body)
+    );
+    let xml = blocks_to_xml(&e.doc.body);
+    assert!(
+        xml.contains("<w:sdtContent><w:r><w:rPr><w:sz w:val=\"72\"/></w:rPr><w:t xml:space=\"preserve\">Line2</w:t>"),
+        "the new line is in the control, formatted as it: {xml}"
+    );
+    let mut r = reloaded(&e);
+    r.set_cover_page(1, &[]).unwrap();
+    assert_eq!(
+        text_at(&r, &[field_para(&r, Placeholder::Title)]),
+        "Line1\nLine2"
+    );
+}
+
+#[test]
+fn a_paste_of_paragraphs_into_an_emptied_placeholder_is_all_carried() {
+    let mut e = body_doc();
+    e.set_cover_page(0, &[]).unwrap();
+    let title = field_para(&e, Placeholder::Title);
+    let len = text_at(&e, &[title]).chars().count();
+    e.anchor = Some(Caret {
+        path: vec![title],
+        offset: 0,
+    });
+    e.caret = Caret {
+        path: vec![title],
+        offset: len,
+    };
+    e.paste(&Clip::from_text("A\nB\nC"));
+    assert!(
+        inline_controls_balance(&e),
+        "{}",
+        blocks_to_xml(&e.doc.body)
+    );
+    e.set_cover_page(1, &[]).unwrap();
+    assert_eq!(
+        text_at(&e, &[field_para(&e, Placeholder::Title)]),
+        "A\nB\nC"
+    );
+}
+
+#[test]
+fn enter_after_text_that_follows_a_control_splits_as_before() {
+    let mut e = ed(
+        "<w:p><w:sdt><w:sdtPr><w:alias w:val=\"Title\"/></w:sdtPr><w:sdtContent>\
+         <w:r><w:t>x</w:t></w:r></w:sdtContent></w:sdt><w:r><w:t>end</w:t></w:r></w:p>",
+    );
+    e.caret = Caret {
+        path: vec![0],
+        offset: 4,
+    };
+    e.insert_newline();
+    let Block::Paragraph(p) = &e.doc.body[1] else {
+        panic!()
+    };
+    assert!(p.content.is_empty(), "{:?}", p.content);
+    assert!(inline_controls_balance(&e));
+}
+
+#[test]
+fn a_split_inside_a_link_keeps_its_control_whole() {
+    let mut e = ed(
+        "<w:p><w:hyperlink w:anchor=\"top\"><w:sdt><w:sdtPr><w:alias w:val=\"Title\"/>\
+         </w:sdtPr><w:sdtContent><w:r><w:t>abcd</w:t></w:r></w:sdtContent></w:sdt></w:hyperlink></w:p>",
+    );
+    e.caret = Caret {
+        path: vec![0],
+        offset: 2,
+    };
+    e.insert_newline();
+    for k in 0..2 {
+        let Block::Paragraph(p) = &e.doc.body[k] else {
+            panic!()
+        };
+        assert!(
+            content_balances(&p.content),
+            "{}",
+            blocks_to_xml(&e.doc.body)
+        );
+    }
+    let r = reloaded(&e);
+    assert_eq!(all_text(&r), all_text(&e));
+}
+
+/// A Word cover keeping its title in a text box and its author in a table.
+const BOXED_COVER: &str = "<w:sdt><w:sdtPr><w:id w:val=\"5\"/><w:docPartObj>\
+    <w:docPartGallery w:val=\"Cover Pages\"/><w:docPartUnique/></w:docPartObj></w:sdtPr><w:sdtContent>\
+    <w:p><w:r><w:pict><v:shape><v:textbox><w:txbxContent><w:p><w:sdt><w:sdtPr>\
+    <w:alias w:val=\"Title\"/><w:id w:val=\"6\"/><w:showingPlcHdr/></w:sdtPr><w:sdtContent>\
+    <w:r><w:t>Boxed Title</w:t></w:r></w:sdtContent></w:sdt></w:p></w:txbxContent></v:textbox>\
+    </v:shape></w:pict></w:r></w:p>\
+    <w:tbl><w:tblGrid><w:gridCol w:w=\"5000\"/></w:tblGrid><w:tr><w:tc><w:p><w:sdt><w:sdtPr>\
+    <w:alias w:val=\"Author\"/><w:id w:val=\"7\"/></w:sdtPr><w:sdtContent><w:r><w:t>Ada</w:t></w:r>\
+    </w:sdtContent></w:sdt></w:p></w:tc></w:tr></w:tbl>\
+    <w:p><w:r><w:br w:type=\"page\"/></w:r></w:p></w:sdtContent></w:sdt>";
+
+#[test]
+fn a_word_cover_with_text_boxes_and_tables_carries_their_text() {
+    let mut e = ed(&format!(
+        "{BOXED_COVER}<w:p><w:r><w:t>Body text</w:t></w:r></w:p>{SECT}"
+    ));
+    e.set_cover_page(0, &[]).unwrap();
+    assert_eq!(covers(&e), 1);
+    assert_eq!(
+        text_at(&e, &[field_para(&e, Placeholder::Title)]),
+        "Boxed Title"
+    );
+    assert_eq!(text_at(&e, &[field_para(&e, Placeholder::Author)]), "Ada");
 }

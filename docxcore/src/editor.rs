@@ -1190,14 +1190,7 @@ impl Editor {
         if n == 1 {
             if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
                 // Into an empty content control at the caret, as typing goes.
-                let tail = match empty_sdt_at(&p.content, off) {
-                    Some(at) => p.content.split_off(at),
-                    None => split_content(&mut p.content, off),
-                };
-                let ins = clip.paras[0].clone();
-                let ins_len: usize = ins.iter().map(inline_len).sum();
-                p.content.extend(ins);
-                p.content.extend(tail);
+                let ins_len = insert_inlines(&mut p.content, off, clip.paras[0].clone());
                 self.caret.offset = off + ins_len;
             }
             self.doc.initialize_revision_targets();
@@ -1219,20 +1212,30 @@ impl Editor {
             // As does a tracked change of the paragraph mark.
             crate::review::clear_mark_revisions(&mut p.props);
             let inner = p.props.clone();
-            let tail = split_paragraph_content(&mut p.content, off);
-            p.content.extend(clip.paras[0].clone());
+            // The first piece goes in at the caret as a one-paragraph paste
+            // does (into an emptied content control there), and the paragraph
+            // splits after it: the content controls the split continues are
+            // closed after it and open again around the last piece.
+            let first_len = insert_inlines(&mut p.content, off, clip.paras[0].clone());
+            let (tail, inside) = split_paragraph_at(&mut p.content, off + first_len);
 
+            // A middle piece pasted inside content controls is inside them
+            // too: a copy of each opens and closes around it.
+            let close = || Inline::Raw(crate::load::SDT_BLOCK_CLOSE.to_string());
             let mut news: Vec<Block> = Vec::new();
             for mid in &clip.paras[1..n - 1] {
+                let mut content = tail[..inside].to_vec();
+                content.extend(mid.iter().cloned());
+                content.extend((0..inside).map(|_| close()));
                 news.push(Block::Paragraph(Paragraph {
                     props: inner.clone(),
-                    content: mid.clone(),
+                    content,
                 }));
             }
             let last_pasted = clip.paras[n - 1].clone();
             let last_len: usize = last_pasted.iter().map(inline_len).sum();
-            let mut last_content = last_pasted;
-            last_content.extend(tail);
+            let mut last_content = tail;
+            last_content.splice(inside..inside, last_pasted);
             news.push(Block::Paragraph(Paragraph {
                 props,
                 content: last_content,
@@ -2415,13 +2418,13 @@ fn replace_range_in_content(content: &mut Vec<Inline>, start: usize, end: usize,
     let with = &without_field_chars(with);
     if end <= start {
         for (k, ch) in with.chars().enumerate() {
-            content_insert(content, start + k, ch);
+            content_insert_at(content, start + k, ch);
         }
         return;
     }
     let w = with.chars().count();
     for (k, ch) in with.chars().enumerate() {
-        content_insert(content, start + 1 + k, ch);
+        content_insert_at(content, start + 1 + k, ch);
     }
     content_delete(content, start);
     for _ in start + 1..end {
@@ -2709,8 +2712,21 @@ fn sdt_typing_props(content: &[Inline], at: usize) -> RunProps {
         .unwrap_or_default()
 }
 
+/// Type `ch` at caret offset `o`: into an empty content control there (see
+/// [`empty_sdt_at`]), else as [`content_insert_at`] places it.
 fn content_insert(content: &mut Vec<Inline>, o: usize, ch: char) {
-    if let Some(at) = empty_sdt_at(content, o) {
+    content_insert_with(content, o, ch, true);
+}
+
+/// Insert `ch` at caret offset `o` into the inline holding it, never into an
+/// empty content control at `o`: Replace's edits inside a match, which must
+/// stay where the matched text was.
+fn content_insert_at(content: &mut Vec<Inline>, o: usize, ch: char) {
+    content_insert_with(content, o, ch, false);
+}
+
+fn content_insert_with(content: &mut Vec<Inline>, o: usize, ch: char, into_empty: bool) {
+    if let Some(at) = empty_sdt_at(content, o).filter(|_| into_empty) {
         let props = sdt_typing_props(content, at);
         content.insert(
             at,
@@ -2739,7 +2755,7 @@ fn content_insert(content: &mut Vec<Inline>, o: usize, ch: char) {
         Inline::Hyperlink(h) => match link_part(h, local) {
             LinkPart::Runs(local) => runs_insert(&mut h.runs, local, ch),
             LinkPart::Content(local) => {
-                content_insert(&mut h.content, local, ch);
+                content_insert_with(&mut h.content, local, ch, into_empty);
                 h.content_changed = true;
             }
         },
@@ -2949,18 +2965,39 @@ fn split_content(content: &mut Vec<Inline>, o: usize) -> Vec<Inline> {
     Vec::new()
 }
 
-/// Split a paragraph's content at caret offset `o` for a paragraph break
-/// (Enter, a multi-paragraph paste, Blank Page, a section break, a table
-/// inserted mid-paragraph): as [`split_content`], then each inline content
-/// control the split cuts is closed at the end of the first half and opened
-/// again at the start of the second, as Word does, so both paragraphs
-/// serialize to well-formed XML (#652). The reopened copy has no `w:id`
-/// (optional in `w:sdtPr`), so ids stay unique. Only a control whose close
-/// is in the second half is reopened.
-fn split_paragraph_content(content: &mut Vec<Inline>, o: usize) -> Vec<Inline> {
-    let mut tail = split_content(content, o);
+/// Insert `ins` at caret offset `o`, as a one-paragraph paste does: into an
+/// empty content control there (see [`empty_sdt_at`]), else splitting a run
+/// or a link `o` falls inside. The length inserted.
+fn insert_inlines(content: &mut Vec<Inline>, o: usize, ins: Vec<Inline>) -> usize {
+    let tail = match empty_sdt_at(content, o) {
+        Some(at) => content.split_off(at),
+        None => split_content(content, o),
+    };
+    let len = ins.iter().map(inline_len).sum();
+    content.extend(ins);
+    content.extend(tail);
+    len
+}
+
+/// The opening boundary of a content control again, for the half of a split
+/// it continues into: without its `w:id` (optional in `w:sdtPr`), so ids stay
+/// unique.
+fn reopened(open: &Inline) -> Inline {
+    match open {
+        Inline::Raw(raw) => Inline::Raw(crate::sect::remove_element(raw, "w:id")),
+        other => other.clone(),
+    }
+}
+
+/// After `head` and `tail` were split apart: close each inline content
+/// control the split cut (opened in `head`, closed in `tail`) at the end of
+/// `head`, and open it again at the start of `tail`, outermost first, as Word
+/// does, so both halves serialize to well-formed XML. Only a control whose
+/// close is in `tail` is reopened. The number of boundaries put at `tail`'s
+/// start.
+fn repair_cut_controls(head: &mut Vec<Inline>, tail: &mut Vec<Inline>) -> usize {
     let mut open: Vec<usize> = Vec::new();
-    for (i, inline) in content.iter().enumerate() {
+    for (i, inline) in head.iter().enumerate() {
         match inline {
             Inline::Raw(raw) if crate::hf::is_sdt_open(raw) => open.push(i),
             Inline::Raw(raw) if crate::hf::is_sdt_close(raw) => {
@@ -2969,11 +3006,11 @@ fn split_paragraph_content(content: &mut Vec<Inline>, o: usize) -> Vec<Inline> {
             _ => {}
         }
     }
-    // The closes in the second half with no open there: the cut controls',
-    // innermost first.
+    // The closes in `tail` with no open there: the cut controls', innermost
+    // first.
     let mut depth = 0usize;
     let mut closes = 0usize;
-    for inline in &tail {
+    for inline in tail.iter() {
         match inline {
             Inline::Raw(raw) if crate::hf::is_sdt_open(raw) => depth += 1,
             Inline::Raw(raw) if crate::hf::is_sdt_close(raw) => {
@@ -2987,21 +3024,78 @@ fn split_paragraph_content(content: &mut Vec<Inline>, o: usize) -> Vec<Inline> {
         }
     }
     let cut = &open[open.len() - closes.min(open.len())..];
-    if cut.is_empty() {
-        return tail;
-    }
-    let reopened: Vec<Inline> = cut
-        .iter()
-        .filter_map(|&i| match &content[i] {
-            Inline::Raw(raw) => Some(Inline::Raw(crate::sect::remove_element(raw, "w:id"))),
-            _ => None,
-        })
-        .collect();
+    let copies: Vec<Inline> = cut.iter().map(|&i| reopened(&head[i])).collect();
     for _ in cut {
-        content.push(Inline::Raw(crate::load::SDT_BLOCK_CLOSE.to_string()));
+        head.push(Inline::Raw(crate::load::SDT_BLOCK_CLOSE.to_string()));
     }
-    tail.splice(0..0, reopened);
-    tail
+    let n = copies.len();
+    tail.splice(0..0, copies);
+    n
+}
+
+/// The index of the opening boundary that the closing one at `close` pairs
+/// with, walking back through `content`.
+fn open_of(content: &[Inline], close: usize) -> Option<usize> {
+    let mut nest = 0usize;
+    content[..close].iter().rposition(|x| match x {
+        Inline::Raw(r) if crate::hf::is_sdt_close(r) => {
+            nest += 1;
+            false
+        }
+        Inline::Raw(r) if crate::hf::is_sdt_open(r) => {
+            if nest == 0 {
+                true
+            } else {
+                nest -= 1;
+                false
+            }
+        }
+        _ => false,
+    })
+}
+
+/// Split a paragraph's content at caret offset `o` for a paragraph break
+/// (Enter, a multi-paragraph paste, Blank Page, a section break, a table
+/// inserted mid-paragraph), keeping inline content controls whole (#652):
+/// - a control the split cuts is closed at the end of the first half and
+///   opened again at the start of the second ([`repair_cut_controls`]);
+/// - a split right at the end of a control's content, where the first half
+///   ends with its close (zero-width markers aside), counts as cutting it
+///   too: the second half starts with an empty copy of the control, so text
+///   typed or pasted at its start goes into the control (a placeholder takes
+///   a second line). A paragraph whose last inline is not a control's close
+///   splits as before.
+///
+/// The second half, and the index in it where its own content starts: after
+/// the reopened boundaries, inside the controls the split continues.
+fn split_paragraph_at(content: &mut Vec<Inline>, o: usize) -> (Vec<Inline>, usize) {
+    let mut tail = split_content(content, o);
+    // The controls whose content ends right at the split: the closes ending
+    // the first half, outermost first.
+    let mut ends: Vec<Inline> = Vec::new();
+    let mut k = content.len();
+    while k > 0 {
+        match &content[k - 1] {
+            Inline::Raw(raw) if crate::hf::is_sdt_close(raw) => match open_of(content, k - 1) {
+                Some(i) => ends.push(reopened(&content[i])),
+                None => break,
+            },
+            x if is_marker(x) => {}
+            _ => break,
+        }
+        k -= 1;
+    }
+    let cut = repair_cut_controls(content, &mut tail);
+    let n = ends.len();
+    let closes = (0..n).map(|_| Inline::Raw(crate::load::SDT_BLOCK_CLOSE.to_string()));
+    let empties: Vec<Inline> = ends.into_iter().chain(closes).collect();
+    tail.splice(cut..cut, empties);
+    (tail, cut + n)
+}
+
+/// [`split_paragraph_at`]'s second half.
+fn split_paragraph_content(content: &mut Vec<Inline>, o: usize) -> Vec<Inline> {
+    split_paragraph_at(content, o).0
 }
 
 /// Split a hyperlink at `local`, strictly inside its text: `h` keeps what is
@@ -3015,7 +3109,13 @@ fn split_link(h: &mut Hyperlink, local: usize) -> Hyperlink {
             split_runs(&mut h.runs, local),
             std::mem::take(&mut h.content),
         ),
-        LinkPart::Content(local) => (Vec::new(), split_content(&mut h.content, local)),
+        LinkPart::Content(local) => {
+            let mut rest = split_content(&mut h.content, local);
+            // A content control in the link that the split cuts closes in
+            // each half.
+            repair_cut_controls(&mut h.content, &mut rest);
+            (Vec::new(), rest)
+        }
     };
     h.content_changed |= h.raw.is_some();
     Hyperlink {
