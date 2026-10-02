@@ -9,6 +9,11 @@ and to drive the corpus verify sweeps.
   whose expected results are known. The `gridcore` conformance test
   (`gridcore/tests/conformance.rs`) recalculates these and diffs against the
   oracle, so they ship with the repo.
+- `word-import/` — one document Word saved as `.docx`, `.rtf`, filtered Web
+  Page and `.pdf` (#633); the `.docx` is the oracle `docxcore/tests/word_import.rs`
+  compares the RTF, HTML and PDF importers against. Made by
+  `tools/gen_word_import.ps1`, which needs a real, human-attended Word; see
+  [`word-import/README.md`](word-import/README.md).
 - `tools/classify.py`, `tools/classify_xlsx.py` — regenerate the manifests by
   scanning each file's parts/XML.
 
