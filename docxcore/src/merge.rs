@@ -7,6 +7,7 @@
 //! is saved, `text` is what is shown, so a preview only changes `text`.
 
 pub mod csv;
+pub mod envelope;
 pub mod fields;
 pub mod finish;
 pub mod preview;

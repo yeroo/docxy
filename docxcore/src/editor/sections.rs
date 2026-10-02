@@ -209,6 +209,37 @@ impl Editor {
         Ok(())
     }
 
+    /// Put `blocks` at the start of the document as a section of their own,
+    /// closed by `sect` (carried by their last paragraph, or a new empty one
+    /// when they end in a table), as one undo step. The section that was
+    /// first now starts on a new page and keeps its own sectPr (headers,
+    /// footers, page setup). Mail merge's envelope (#628) uses it.
+    pub fn insert_section_at_start(&mut self, mut blocks: Vec<Block>, sect: String) {
+        match blocks.last_mut() {
+            Some(Block::Paragraph(p)) if p.props.section_break.is_none() => {
+                p.props.section_break = Some(sect);
+            }
+            _ => {
+                let mut p = Paragraph::default();
+                p.props.section_break = Some(sect);
+                blocks.push(Block::Paragraph(p));
+            }
+        }
+        self.checkpoint(EditKind::Structural);
+        let first = self.section_slots()[0];
+        let old = self.sect_raw(first).to_string();
+        let mut setup = SectionSetup::parse(&old);
+        setup.start = SectionStart::NextPage;
+        let next = setup.apply(&old);
+        if next != old {
+            self.set_sect_raw(first, next);
+        }
+        self.doc.body.splice(0..0, blocks);
+        self.anchor = None;
+        self.caret = Caret::at(vec![0], 0);
+        self.doc.initialize_revision_targets();
+    }
+
     /// Where a section break goes: the selection's start, else the caret; its
     /// body block; and the section it lands in, the one whose setup the
     /// section after the break takes. Refused outside a body paragraph.
