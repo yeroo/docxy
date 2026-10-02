@@ -1628,7 +1628,18 @@ fn make_lines(glyphs: Vec<Glyph>) -> Vec<Line> {
             .last()
             .is_none_or(|p| p.text.ends_with(char::is_whitespace));
         let mut sep = "";
-        if gap > 0.8 * g.size.max(line.size) {
+        // A wide gap is a tab stop or a table column. Right after a space
+        // glyph a smaller one is too: Word draws a list marker, a space, then
+        // jumps to the text (0.45 em on after `1.`, 0.75 em after a bullet),
+        // while ordinary and justified text leaves no gap after a space (a
+        // justified line widens the space's own advance).
+        let em = g.size.max(line.size);
+        let wide = if ends_blank { 0.3 * em } else { 0.6 * em };
+        if gap > wide && !blank && !line.pieces.is_empty() {
+            if let Some(p) = line.pieces.last_mut() {
+                let kept = p.text.trim_end().len();
+                p.text.truncate(kept);
+            }
             sep = "\t";
         } else if gap > 0.18 * g.size && !blank && !ends_blank {
             sep = " ";
