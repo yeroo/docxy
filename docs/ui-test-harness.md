@@ -451,7 +451,9 @@ version if I close without saving" (#613, on by default). With it and
 AutoRecover on, a workbook closed with Don't Save after a hot-exit write while
 it was unsaved (a tick, or any other persist such as switching tabs) leaves a
 copy of that write in `<config>/docxy/drafts/`. An open cell edit is not in it:
-commit the cell (Enter) before the tick. `call drafts {}` replies
+commit the cell (Enter) before the tick. If the draft could not be kept, the
+`close-tab` reply carries the reason as `draft_error` (outside the harness it is
+the status line, or a warning when no tab is left). `call drafts {}` replies
 `{"drafts":[{name,path,age_secs}]}`, newest first, and deletes drafts older
 than four days unless one is open in a tab. `call open-draft {"index":N}` opens
 the Nth of a fresh listing read-only, as a click on its row in the backstage's

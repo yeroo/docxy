@@ -1676,3 +1676,37 @@ fn no_draft_without_a_write_while_unsaved_or_without_discard() {
     );
     assert_eq!(recover::list_drafts(&root.0, now, &[]), vec![]);
 }
+
+#[test]
+fn a_draft_that_could_not_be_kept_is_reported_where_it_can_be_seen() {
+    assert_eq!(draft_error_to(true, false), DraftErrorTo::Status);
+    assert_eq!(draft_error_to(true, true), DraftErrorTo::Status);
+    assert_eq!(
+        draft_error_to(false, false),
+        DraftErrorTo::Dialog,
+        "the last tab closed: no status line is left"
+    );
+    assert_eq!(
+        draft_error_to(false, true),
+        DraftErrorTo::Reply,
+        "no native modal under the harness"
+    );
+}
+
+#[test]
+fn only_a_draft_that_loads_is_labelled_recovered() {
+    let root = Root::new("draft-loads");
+    let trusted = crate::trusted::TrustStore::default();
+    let good = root.0.join("good ((Unsaved-1)).xlsx");
+    std::fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures/basic.xlsx"),
+        &good,
+    )
+    .unwrap();
+    let bad = root.0.join("bad ((Unsaved-1)).xlsx");
+    std::fs::write(&bad, b"not a workbook").unwrap();
+    let opened = tab_from_path_mode(&good, OpenMode::ReadOnly, &trusted).unwrap();
+    assert!(draft_loaded(&opened));
+    let broken = tab_from_path_mode(&bad, OpenMode::ReadOnly, &trusted).unwrap();
+    assert!(!draft_loaded(&broken), "{}", broken.status);
+}

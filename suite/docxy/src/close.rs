@@ -67,6 +67,25 @@ fn keep_closed_draft(
     sidecar.map(|s| recover::keep_draft(root, &tab.title, s, now))
 }
 
+/// Where a draft that could not be kept is reported. The tab is already
+/// gone, so the status line of whichever tab is left; with none left, a
+/// warning, except under the harness (no native modal there), whose
+/// `close-tab` reply carries it.
+#[derive(Debug, PartialEq, Eq)]
+enum DraftErrorTo {
+    Status,
+    Dialog,
+    Reply,
+}
+
+fn draft_error_to(tabs_left: bool, harness: bool) -> DraftErrorTo {
+    match (tabs_left, harness) {
+        (true, _) => DraftErrorTo::Status,
+        (false, false) => DraftErrorTo::Dialog,
+        (false, true) => DraftErrorTo::Reply,
+    }
+}
+
 fn commit_pending_for_close(tab: &mut DocTab) -> Result<(), String> {
     if !commit_project_cell(tab) {
         // Keep the exact error: Project clears it on correction by comparing
@@ -169,15 +188,19 @@ impl Docxy {
         self.close_tab_with(i, None, window, cx);
     }
 
+    /// Close tab `i`, asking about unsaved work (or taking `answer` under the
+    /// harness). Returns why a Don't Save draft was not kept, if it was not
+    /// (#613): the harness reports it, since with no tab left there is no
+    /// status line to carry it.
     pub(super) fn close_tab_with(
         &mut self,
         i: usize,
         answer: Option<CloseAnswer>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Option<String> {
         if i >= self.tabs.len() {
-            return;
+            return None;
         }
         self.flush_project_passes(cx);
         self.project_prompt_cancel();
@@ -250,11 +273,23 @@ impl Docxy {
             remove_tab(&mut self.tabs, &mut self.active, i);
             self.drop_grid_state();
         }
-        if let Some(e) = draft_error {
-            self.set_status(e);
+        if let Some(e) = &draft_error {
+            match draft_error_to(!self.tabs.is_empty(), harness) {
+                DraftErrorTo::Status => self.set_status(e.clone()),
+                DraftErrorTo::Dialog => {
+                    rfd::MessageDialog::new()
+                        .set_title("docxy")
+                        .set_level(rfd::MessageLevel::Warning)
+                        .set_description(e)
+                        .set_buttons(rfd::MessageButtons::Ok)
+                        .show();
+                }
+                DraftErrorTo::Reply => {}
+            }
         }
         self.persist();
         self.refocus(window, cx);
+        draft_error
     }
 }
 

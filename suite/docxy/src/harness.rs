@@ -2716,8 +2716,12 @@ pub fn dispatch(
                 }),
                 Some(_) => return Err("'answer' must be save, discard or cancel".into()),
             };
-            app.close_tab_with(index, answer, window, cx);
-            Done::ok(state(app, window))
+            let draft_error = app.close_tab_with(index, answer, window, cx);
+            let mut reply = state(app, window);
+            if let (Json::Obj(fields), Some(e)) = (&mut reply, draft_error) {
+                fields.push(("draft_error".into(), Json::Str(e)));
+            }
+            Done::ok(reply)
         }
         // The same handler as the Backstage rail item, not a synthetic click.
         "backstage-close" => {
@@ -2739,10 +2743,6 @@ pub fn dispatch(
             app.set_autorecover_minutes(minutes, cx);
             Done::ok(state(app, window))
         }
-        // One AutoRecover tick now, as the timer would run it once the
-        // interval is up, so a test need not wait minutes. `wrote` says
-        // whether anything was unsaved and so written. Runs even when the
-        // setting is off: it is the tick, not the schedule.
         // Settings' "Keep the last AutoRecovered version if I close without
         // saving" (#613).
         "keep-drafts" => {
@@ -2784,6 +2784,10 @@ pub fn dispatch(
             app.open_draft_path(&path, window, cx);
             Done::ok(state(app, window))
         }
+        // One AutoRecover tick now, as the timer would run it once the
+        // interval is up, so a test need not wait minutes. `wrote` says
+        // whether anything was unsaved and so written. Runs even when the
+        // setting is off: it is the tick, not the schedule.
         "autorecover-now" => {
             let wrote = app.autorecover_tick();
             cx.notify();

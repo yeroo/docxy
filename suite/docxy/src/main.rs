@@ -252,6 +252,13 @@ fn keep_drafts_default() -> bool {
 /// The status of a tab opened from Recover Unsaved Workbooks (#613).
 const DRAFT_OPENED: &str = "recovered unsaved workbook — read-only; use Save As to keep it";
 
+/// Whether a tab just opened from a draft gets [`DRAFT_OPENED`]: only when the
+/// workbook loaded. An unreadable draft opens as a placeholder whose load
+/// error must stay its status.
+fn draft_loaded(tab: &DocTab) -> bool {
+    matches!(tab.surface, Surface::Sheet(_))
+}
+
 // Not derived: a fresh install (no session.json) must get AutoRecover on, not 0.
 impl Default for Session {
     fn default() -> Self {
@@ -7831,7 +7838,9 @@ impl Docxy {
     ) {
         match self.open_path(path, OpenMode::ReadOnly, Reopen::Ask) {
             Ok(true) => {
-                self.set_status(DRAFT_OPENED);
+                if self.tabs.get(self.active).is_some_and(draft_loaded) {
+                    self.set_status(DRAFT_OPENED);
+                }
             }
             // Already open: `open_path` focused it or queued the reopen question.
             Ok(false) => {}
