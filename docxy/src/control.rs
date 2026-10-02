@@ -1020,7 +1020,7 @@ fn compare_skip_json(skip: &CompareSkip) -> Json {
             fields.push(("index", Json::Num(*index as f64)));
         }
         CompareSkip::UnsupportedRevision { revision } => {
-            fields.push(("revision", Json::Str(revision.clone())));
+            fields.push(("revision", Json::Str(unsupported_revision_name(revision))));
         }
         CompareSkip::Object | CompareSkip::NoteRef => {}
     }
@@ -3131,7 +3131,7 @@ mod tests {
         assert_eq!(json(CompareSkip::NoteRef), r#"{"kind":"note-ref"}"#);
         assert_eq!(
             json(CompareSkip::UnsupportedRevision {
-                revision: "move-from".into()
+                revision: docxcore::model::UnsupportedRevisionKind::MoveFrom
             }),
             r#"{"kind":"unsupported-revision","revision":"move-from"}"#
         );

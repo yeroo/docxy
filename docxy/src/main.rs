@@ -515,10 +515,14 @@ fn compare_cli(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // write_atomic never replaces an existing path, so a file that appeared
-    // since the check above (or an input named as the output) is refused too.
-    if let Err(e) = write_atomic(Path::new(&out), &save_package(&result.package)) {
-        eprintln!("error: cannot write {out}: {e}");
+    // create_atomic refuses any existing destination, so a file that appeared
+    // since the check above is refused too.
+    if let Err(e) = opccore::fsio::create_atomic(Path::new(&out), &save_package(&result.package)) {
+        if e.kind() == io::ErrorKind::AlreadyExists {
+            eprintln!("error: {out} already exists (compare never overwrites a file)");
+        } else {
+            eprintln!("error: cannot write {out}: {e}");
+        }
         return ExitCode::FAILURE;
     }
     println!(
@@ -2454,6 +2458,8 @@ impl App {
             self.page_view = false;
         }
         self.md_source = false;
+        // A header/footer edit belongs to the document being replaced.
+        self.hf_edit = None;
         self.path = path;
         self.modified = false;
         self.scroll = 0;
@@ -3980,9 +3986,8 @@ impl App {
         }
     }
 
-    // ---- Paragraph dialog (precise indent) ----
+    // ---- Compare dialog ----
 
-    /// Open the Paragraph dialog seeded from the caret paragraph's indents.
     /// Who comments and compare revisions are attributed to: the document's
     /// author property, else [`DEFAULT_AUTHOR`].
     fn review_author(&self) -> String {
@@ -4004,6 +4009,9 @@ impl App {
         revised: &str,
         discard: bool,
     ) -> Result<CompareSummary, String> {
+        // Leave header/footer editing first: committing makes its edits count
+        // as unsaved, and its swapped-out body must not outlive the document.
+        self.exit_hf_edit(true);
         if self.modified && !discard {
             return Err("unsaved changes; save or reload first".to_string());
         }
@@ -4063,6 +4071,7 @@ impl App {
             return;
         }
         self.compare_dialog = None;
+        self.exit_hf_edit(true);
         if self.modified {
             self.confirm = Some(
                 backstage::Confirm::new(
@@ -4116,6 +4125,9 @@ impl App {
         }
     }
 
+    // ---- Paragraph dialog (precise indent) ----
+
+    /// Open the Paragraph dialog seeded from the caret paragraph's indents.
     fn open_para_dialog(&mut self) {
         let (left, fl) = self.editor.caret_para_indent();
         let (special, by) = match fl.cmp(&0) {
@@ -12541,6 +12553,37 @@ mod tests {
         app.on_key(key(KeyCode::Char('y')));
         assert!(app.path.ends_with("Compare Result 1.docx"), "{}", app.path);
         assert_eq!(app.editor.doc.revisions().len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compare_during_header_editing_leaves_it_and_shows_the_result() {
+        let (dir, original, revised) = compare_fixture("header");
+        let input = load_input(&original).unwrap();
+        let mut app = App::new(input.pkg, &original, false);
+        app.os_clip = None;
+        app.enter_hf_edit(true);
+        assert!(app.hf_edit.is_some());
+        type_text(&mut app, "H");
+
+        // Uncommitted header edits count as unsaved changes.
+        let err = app.compare_paths(&original, &revised, false).err().unwrap();
+        assert!(err.contains("unsaved"), "{err}");
+        assert!(app.hf_edit.is_none(), "header editing was left");
+
+        app.compare_paths(&original, &revised, true).unwrap();
+        assert!(app.hf_edit.is_none());
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.editor.doc.revisions().len(), 3, "the result stays open");
+        assert!(
+            app.header_part.is_none(),
+            "the revised package has no header"
+        );
+        assert!(
+            app.pkg.part_names().iter().all(|n| !n.contains("header")),
+            "{:?}",
+            app.pkg.part_names()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
