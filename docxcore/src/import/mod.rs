@@ -12,8 +12,10 @@
 //! Format is decided by content first ([`sniff`]), so an RTF or HTML file
 //! named `.doc` or `.docx` still opens as what it is.
 
+pub mod html;
 pub mod rtf;
 
+pub use html::import_html;
 pub use rtf::import_rtf;
 
 use crate::model::{
@@ -168,6 +170,50 @@ impl Builder {
     pub(crate) fn page_break(&mut self, props: &RunProps) {
         self.para
             .push(Inline::Break(BreakKind::Page, props.clone()));
+    }
+
+    /// The text of the paragraph in progress.
+    pub(crate) fn para_text(&self) -> String {
+        self.para.iter().map(|i| i.text()).collect()
+    }
+
+    /// Drop everything in the paragraph in progress (text only made of
+    /// spaces that stands for an empty paragraph).
+    pub(crate) fn clear_para(&mut self) {
+        self.para.clear();
+    }
+
+    /// Remove a list marker typed at the start of the paragraph in progress
+    /// (`·`, `1.`, then spaces or a tab) and return it; `None`, changing
+    /// nothing, when the paragraph does not start with a short word followed
+    /// by white space.
+    pub(crate) fn take_leading_marker(&mut self) -> Option<String> {
+        let text = self.para_text();
+        let marker: String = text.chars().take_while(|c| !c.is_whitespace()).collect();
+        let n = marker.chars().count();
+        if n == 0 || n > 6 {
+            return None;
+        }
+        let rest = text.chars().skip(n);
+        let gap = rest.take_while(|c| c.is_whitespace()).count();
+        if gap == 0 {
+            return None;
+        }
+        // Drop `n + gap` characters from the front, run by run.
+        let mut drop = n + gap;
+        while drop > 0 && !self.para.is_empty() {
+            let len = self.para[0].text().chars().count();
+            if len <= drop {
+                self.para.remove(0);
+                drop -= len;
+            } else if let Inline::Run(run) = &mut self.para[0] {
+                run.text = run.text.chars().skip(drop).collect();
+                drop = 0;
+            } else {
+                break;
+            }
+        }
+        Some(marker)
     }
 
     /// End the paragraph in progress, with `props`, in the open table cell
