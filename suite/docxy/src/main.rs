@@ -4568,7 +4568,7 @@ fn recovered_text_from_path(path: &std::path::Path) -> Loaded {
 /// ([`finish_pending_conversion`]) go through here; Protected View's
 /// rollback never does (it restores `converted_docx`, or calls
 /// [`reload_without_converting`]).
-fn load_doc_for_tab(path: &PathBuf, converted: Option<open_mode::Converted>) -> Loaded {
+fn load_doc_for_tab(path: &std::path::Path, converted: Option<open_mode::Converted>) -> Loaded {
     match converted {
         Some(open_mode::Converted::RecoveredText) => recovered_text_from_path(path),
         _ => doc_from_path(path),
@@ -4741,15 +4741,23 @@ fn effective_mode(path: &std::path::Path, mode: OpenMode) -> OpenMode {
 /// (#633) opens its recovered text; every other mode opens it as usual. A
 /// downloaded document opens in Protected View, as a workbook does (#610),
 /// unless `trusted` holds it as it is now (#882).
-fn doc_tab_from_path_mode(path: &PathBuf, mode: OpenMode, trusted: &trusted::TrustStore) -> DocTab {
+fn doc_tab_from_path_mode(
+    path: &std::path::Path,
+    mode: OpenMode,
+    trusted: &trusted::TrustStore,
+) -> DocTab {
     let protected = open_mode::is_protected_zone(open_mode::zone_id(path))
         && !trusted.is_trusted(path, trusted::Stamp::of(path));
     // Taken before the load, as for a workbook.
     let stamp = protected.then(|| trusted::Stamp::of(path)).flatten();
     let converted = (mode == OpenMode::RecoverText).then_some(open_mode::Converted::RecoveredText);
     let title: SharedString = file_name(path).into();
-    let mut tab =
-        load_doc_for_tab(path, converted).into_tab(Kind::Docx, title, Some(path.clone()), false);
+    let mut tab = load_doc_for_tab(path, converted).into_tab(
+        Kind::Docx,
+        title,
+        Some(path.to_path_buf()),
+        false,
+    );
     tab.access.protected = protected;
     tab.access.stamp = stamp;
     tab
