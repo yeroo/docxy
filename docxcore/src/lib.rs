@@ -32,6 +32,7 @@ pub mod field;
 pub mod hf;
 pub mod inspect;
 pub mod latex;
+pub mod legacy;
 pub mod load;
 pub mod markdown;
 pub mod mathbox;

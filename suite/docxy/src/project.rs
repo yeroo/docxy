@@ -577,8 +577,14 @@ pub(super) fn is_project_path(path: &Path) -> bool {
     ["yppx", "xml", "mpp"].iter().any(|e| ext_is(path, e))
 }
 
+/// Whether the tab's file is one its Save never writes: a project imported
+/// from `.mpp`, or a document imported from a Word 97-2003 file (#634).
 pub(super) fn is_imported(tab: &DocTab) -> bool {
-    tab.kind == Kind::Project && tab.path.as_deref().is_some_and(|p| ext_is(p, "mpp"))
+    match tab.kind {
+        Kind::Project => tab.path.as_deref().is_some_and(|p| ext_is(p, "mpp")),
+        Kind::Docx => tab.import.binary_source,
+        _ => false,
+    }
 }
 
 fn imported_status(status: String, path: Option<&Path>) -> SharedString {
@@ -614,6 +620,7 @@ fn project_tab(
         access: crate::open_mode::Access::default(),
         last_hot: Default::default(),
         mail: Default::default(),
+        import: Default::default(),
     }
 }
 

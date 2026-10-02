@@ -509,6 +509,7 @@ mod tests {
             access: crate::open_mode::Access::default(),
             last_hot: Default::default(),
             mail: Default::default(),
+            import: Default::default(),
         }
     }
 

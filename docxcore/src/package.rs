@@ -2086,6 +2086,64 @@ impl Package {
         }
     }
 
+    /// The Word version whose layout rules the document asks for
+    /// (`w:compat/w:compatSetting[@w:name="compatibilityMode"]`): 15 for a
+    /// current document, 11 for one kept in Word 2003's Compatibility Mode,
+    /// `None` when the settings don't say.
+    pub fn compatibility_mode(&self) -> Option<u32> {
+        let name = self.settings_part_name().ok()??;
+        let xml = decode_xml_part(self.part(&name)?)?;
+        compatibility_mode_setting(&xml).and_then(|(_, el)| {
+            crate::load::xml_attr_value(el, "w:val").and_then(|v| v.trim().parse().ok())
+        })
+    }
+
+    /// Set `compatibilityMode` to `mode`, replacing the value already there or
+    /// adding the setting (and its `w:compat`, and the settings part) when
+    /// missing. Word's Convert writes 15; a document imported from a Word
+    /// 97-2003 file is 11 until it is converted.
+    pub fn set_compatibility_mode(&mut self, mode: u32) {
+        let Some(name) = self.ensure_settings_part() else {
+            return;
+        };
+        let Some(xml) = self
+            .part(&name)
+            .and_then(decode_xml_part)
+            .map(Cow::into_owned)
+        else {
+            return;
+        };
+        let setting = format!(
+            "<w:compatSetting w:name=\"compatibilityMode\" \
+             w:uri=\"http://schemas.microsoft.com/office/word\" w:val=\"{mode}\"/>"
+        );
+        let xml = if let Some((start, el)) = compatibility_mode_setting(&xml) {
+            let end = start + el.len();
+            // `<w:compatSetting …>` with content is not Word's, but keep the
+            // part well formed if a writer used one.
+            let end = if el.ends_with("/>") {
+                end
+            } else {
+                xml[end..]
+                    .find("</w:compatSetting>")
+                    .map_or(end, |e| end + e + "</w:compatSetting>".len())
+            };
+            format!("{}{setting}{}", &xml[..start], &xml[end..])
+        } else if let Some((a, b)) = crate::sect::find_element(&xml, "w:compat") {
+            // `w:compatSetting` is the last child `CT_Compat` allows.
+            if xml[a..b].ends_with("/>") {
+                let open = xml[a..b - 2].trim_end();
+                format!("{}{open}>{setting}</w:compat>{}", &xml[..a], &xml[b..])
+            } else {
+                let close = b - "</w:compat>".len();
+                format!("{}{setting}{}", &xml[..close], &xml[close..])
+            }
+        } else {
+            insert_compat(&xml, &format!("<w:compat>{setting}</w:compat>"))
+        };
+        self.set_part(&name, xml.into_bytes());
+    }
+
     /// The number of newspaper columns in the body section (`w:cols w:num`).
     pub fn columns(&self) -> i32 {
         self.page_geom().cols
@@ -2779,6 +2837,82 @@ fn insert_settings_child(xml: &str, child: &str, before: &[&str]) -> String {
         }
     }
     format!("{}{child}{}", &xml[..at], &xml[at..])
+}
+
+/// The `w:compatSetting` start tag naming `compatibilityMode`, with its
+/// offset in `xml`.
+fn compatibility_mode_setting(xml: &str) -> Option<(usize, &str)> {
+    crate::load::start_tags(xml, "w:compatSetting")
+        .into_iter()
+        .find(|(_, el)| {
+            crate::load::xml_attr_value(el, "w:name").as_deref() == Some("compatibilityMode")
+        })
+}
+
+/// `CT_Settings` children that come after `w:compat`, and the prefixes of
+/// the extension elements Word writes at the end of the part.
+const SETTINGS_AFTER_COMPAT: [&str; 21] = [
+    "<w:docVars",
+    "<w:rsids",
+    "<m:mathPr",
+    "<w:attachedSchema",
+    "<w:themeFontLang",
+    "<w:clrSchemeMapping",
+    "<w:doNotIncludeSubdocsInStats",
+    "<w:doNotAutoCompressPictures",
+    "<w:forceUpgrade",
+    "<w:captions",
+    "<w:readModeInkLockDown",
+    "<w:smartTagType",
+    "<sl:schemaLibrary",
+    "<w:shapeDefaults",
+    "<w:doNotEmbedSmartTags",
+    "<w:decimalSymbol",
+    "<w:listSeparator",
+    "<w14:",
+    "<w15:",
+    "<w16",
+    "<mc:AlternateContent",
+];
+
+/// Insert a `w:compat` element into the settings root before the first
+/// element `CT_Settings` puts after it, or last. Expands a self-closing root.
+fn insert_compat(xml: &str, child: &str) -> String {
+    let Some(root) = xml.find("<w:settings") else {
+        return xml.to_string();
+    };
+    let Some(gt) = xml[root..].find('>').map(|g| root + g) else {
+        return xml.to_string();
+    };
+    if xml[..gt].ends_with('/') {
+        return format!("{}>{child}</w:settings>{}", &xml[..gt - 1], &xml[gt + 1..]);
+    }
+    let body = gt + 1;
+    let at = SETTINGS_AFTER_COMPAT
+        .iter()
+        .filter_map(|open| {
+            // `<w:rsids` must not match `<w:rsidsX`; a namespace prefix
+            // (`<w14:`, `<w16…:`) matches any of its elements.
+            let mut from = body;
+            while let Some(rel) = xml[from..].find(open) {
+                let at = from + rel;
+                let next = xml[at + open.len()..].chars().next();
+                if open.ends_with(':')
+                    || *open == "<w16"
+                    || next.is_some_and(|c| " />\t\r\n".contains(c))
+                {
+                    return Some(at);
+                }
+                from = at + open.len();
+            }
+            None
+        })
+        .min()
+        .or_else(|| xml.rfind("</w:settings>"));
+    match at {
+        Some(at) => format!("{}{child}{}", &xml[..at], &xml[at..]),
+        None => xml.to_string(),
+    }
 }
 
 /// The next free relationship id (`rId{max+1}`) for a `.rels` part.
@@ -3600,6 +3734,80 @@ mod tests {
         assert!(!rels.contains("mailMergeSource"), "{rels}");
         assert!(xml.contains("<w:defaultTabStop"), "{xml}");
         assert_eq!(pkg.mail_merge(), None);
+    }
+
+    /// #634: `compatibilityMode` reads back what was set, whether the
+    /// package had no settings part, settings without `w:compat`, a bare
+    /// `<w:compat/>`, or a value already there (replaced, not duplicated).
+    #[test]
+    fn compatibility_mode_set_and_replace_634() {
+        let count = |pkg: &Package| {
+            pkg.part_text("word/settings.xml")
+                .unwrap_or_default()
+                .matches("compatibilityMode")
+                .count()
+        };
+        // No settings part: one is created, with its relationship.
+        let mut pkg = new_package(Document::default());
+        assert_eq!(pkg.compatibility_mode(), None);
+        pkg.set_compatibility_mode(11);
+        assert_eq!(pkg.compatibility_mode(), Some(11));
+        pkg.set_compatibility_mode(15);
+        assert_eq!(pkg.compatibility_mode(), Some(15));
+        assert_eq!(count(&pkg), 1);
+        let reloaded = load_package(&save_package(&pkg)).unwrap();
+        assert_eq!(reloaded.compatibility_mode(), Some(15));
+
+        let with = |settings: &str| {
+            load_package(&make_metadata_docx(
+                BODY,
+                Some(settings),
+                Some(DOC_RELS),
+                &[],
+            ))
+            .unwrap()
+        };
+        const W: &str = "xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"";
+        // Settings without w:compat: it goes before w:rsids, as CT_Settings orders it.
+        let mut pkg = with(&format!(
+            "<w:settings {W}><w:zoom w:percent=\"100\"/><w:rsids><w:rsidRoot w:val=\"1\"/></w:rsids></w:settings>"
+        ));
+        pkg.set_compatibility_mode(15);
+        let xml = pkg.part_text("word/settings.xml").unwrap();
+        let (zoom, compat, rsids) = (
+            xml.find("<w:zoom").unwrap(),
+            xml.find("<w:compat>").unwrap(),
+            xml.find("<w:rsids>").unwrap(),
+        );
+        assert!(zoom < compat && compat < rsids, "{xml}");
+        assert_eq!(pkg.compatibility_mode(), Some(15));
+
+        // A bare `<w:compat/>` is expanded around the setting.
+        let mut pkg = with(&format!("<w:settings {W}><w:compat/></w:settings>"));
+        pkg.set_compatibility_mode(11);
+        let xml = pkg.part_text("word/settings.xml").unwrap();
+        assert!(
+            xml.contains("<w:compat><w:compatSetting w:name=\"compatibilityMode\""),
+            "{xml}"
+        );
+        assert_eq!(pkg.compatibility_mode(), Some(11));
+
+        // An existing value is replaced in place; other compat settings stay.
+        let mut pkg = with(&format!(
+            "<w:settings {W}><w:compat><w:compatSetting w:name=\"compatibilityMode\" \
+             w:uri=\"http://schemas.microsoft.com/office/word\" w:val=\"14\"/>\
+             <w:compatSetting w:name=\"overrideTableStyleFontSizeAndJustification\" \
+             w:uri=\"http://schemas.microsoft.com/office/word\" w:val=\"1\"/></w:compat></w:settings>"
+        ));
+        assert_eq!(pkg.compatibility_mode(), Some(14));
+        pkg.set_compatibility_mode(15);
+        assert_eq!(pkg.compatibility_mode(), Some(15));
+        assert_eq!(count(&pkg), 1);
+        let xml = pkg.part_text("word/settings.xml").unwrap();
+        assert!(
+            xml.contains("overrideTableStyleFontSizeAndJustification"),
+            "{xml}"
+        );
     }
 
     /// #628: with no settings part at all, attaching creates it, its content
