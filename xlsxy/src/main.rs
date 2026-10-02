@@ -4601,12 +4601,13 @@ impl App {
         let Some(b) = &self.backstage else {
             return;
         };
+        let on = |o: &backstage::OptRow| matches!(o.value, backstage::OptValue::Check(true));
         if let [a, b, c, d] = b.options.as_slice() {
             self.auto_convert = AutoConvert {
-                remove_leading_zeros: a.1,
-                keep_15_digits: b.1,
-                e_notation: c.1,
-                dates: d.1,
+                remove_leading_zeros: on(a),
+                keep_15_digits: on(b),
+                e_notation: on(c),
+                dates: on(d),
             };
         }
     }
@@ -9437,10 +9438,12 @@ mod tests {
         app.open_backstage();
         let opts = &app.backstage.as_ref().unwrap().options;
         assert_eq!(
-            opts.iter().map(|o| o.1).collect::<Vec<_>>(),
+            opts.iter()
+                .map(|o| o.value == backstage::OptValue::Check(true))
+                .collect::<Vec<_>>(),
             [false, true, true, false]
         );
-        assert!(opts[0].0.starts_with("Remove leading zeros"));
+        assert!(opts[0].label.starts_with("Remove leading zeros"));
     }
 
     /// #607: the four switches persist in the preferences file.

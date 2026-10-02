@@ -1,7 +1,7 @@
 //! Rendering for [`crate::Backstage`], ported from docxy's `draw_backstage` /
 //! `draw_bs_open` / `draw_bs_save_as` / `draw_bs_info` (main.rs).
 
-use crate::{Backstage, BackstageHost, Item, Pane};
+use crate::{Backstage, BackstageHost, Item, OptLine, OptValue, Pane};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -344,33 +344,51 @@ fn draw_export(f: &mut Frame, area: Rect, bs: &Backstage, host: &dyn BackstageHo
     f.render_widget(Paragraph::new(lines), area);
 }
 
-/// The Options page: a heading and its checkboxes. Rows sit at fixed offsets
-/// (heading, blank, then one per option) so `mouse` can map a click.
+/// The Options page: each section's heading and its rows, laid out by
+/// [`Backstage::option_lines`] so `mouse` maps a click to the same row.
 fn draw_options(f: &mut Frame, area: Rect, bs: &Backstage, host: &dyn BackstageHost) {
     let focus = bs.pane == Pane::Options;
     let accent = Style::default().fg(Color::Black).bg(host.accent());
-    let mut lines = vec![
-        RLine::styled(
-            format!(" {}", bs.options_title),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        RLine::raw(""),
-    ];
-    for (i, (label, on)) in bs.options.iter().enumerate() {
-        let text = format!(" [{}] {label}", if *on { "x" } else { " " });
-        let style = if focus && i == bs.option_sel {
-            accent
-        } else {
-            Style::default()
-        };
-        lines.push(RLine::styled(text, style));
+    let has_values = bs
+        .options
+        .iter()
+        .any(|o| !matches!(o.value, OptValue::Check(_)));
+    let mut lines = Vec::new();
+    for line in bs.option_lines() {
+        lines.push(match line {
+            OptLine::Heading(i) => RLine::styled(
+                format!(" {}", bs.options[i].section),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            OptLine::Blank => RLine::raw(""),
+            OptLine::Row(i) => {
+                let row = &bs.options[i];
+                let label = &row.label;
+                let text = match &row.value {
+                    OptValue::Check(on) => format!(" [{}] {label}", if *on { "x" } else { " " }),
+                    OptValue::Choice { items, at } => format!(
+                        "       {label}: ‹ {} ›",
+                        items.get(*at).map_or("", String::as_str)
+                    ),
+                    OptValue::Int { value, .. } => format!("       {label}: ‹ {value} ›"),
+                };
+                let style = if focus && i == bs.option_sel {
+                    accent
+                } else if bs.option_dimmed(i) {
+                    Style::default().add_modifier(Modifier::DIM)
+                } else {
+                    Style::default()
+                };
+                RLine::styled(text, style)
+            }
+        });
     }
     lines.push(RLine::raw(""));
     lines.push(RLine::styled(
-        if focus {
-            " ↑↓ choose · Space toggle · ← menu · Esc close"
-        } else {
-            " Enter to change these options · Esc to close"
+        match (focus, has_values) {
+            (true, true) => " ↑↓ choose · Space toggle · ←→ change · PgUp/PgDn ±10 · Esc close",
+            (true, false) => " ↑↓ choose · Space toggle · ← menu · Esc close",
+            (false, _) => " Enter to change these options · Esc to close",
         },
         Style::default().add_modifier(Modifier::DIM),
     ));
@@ -569,6 +587,61 @@ mod tests {
             "heading missing"
         );
         assert!(text.contains("[x] Keep zeros"), "checkbox missing");
+    }
+
+    fn sectioned() -> Backstage {
+        use crate::OptRow;
+        Backstage::open(std::env::temp_dir(), &["xlsx"]).with_option_rows(vec![
+            OptRow::check("zeros", "Data", "Keep zeros", true),
+            OptRow::check("dates", "Data", "Convert dates", false),
+            OptRow::check("fixed", "Editing", "Insert a decimal point", false),
+            OptRow::int("places", "Editing", "Places", 2, -300, 300).depends_on("fixed"),
+            OptRow::choice("dir", "Editing", "Direction", &["Down", "Right"], 1),
+        ])
+    }
+
+    fn draw_bs(bs: &mut Backstage) -> Terminal<TestBackend> {
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| {
+            let a = f.area();
+            super::draw(f, a, bs, &H);
+        })
+        .unwrap();
+        term
+    }
+
+    #[test]
+    fn draws_sections_and_value_rows() {
+        let mut bs = sectioned();
+        bs.item = Item::Options;
+        let text = screen(&draw_bs(&mut bs));
+        assert!(text.contains(" Data"), "first heading");
+        assert!(text.contains(" Editing"), "second heading");
+        assert!(text.contains("[ ] Insert a decimal point"));
+        assert!(text.contains("Places: ‹ 2 ›"));
+        assert!(text.contains("Direction: ‹ Right ›"));
+    }
+
+    #[test]
+    fn a_click_lands_on_the_row_drawn_there() {
+        let mut bs = sectioned();
+        bs.item = Item::Options;
+        let term = draw_bs(&mut bs);
+        let rows: Vec<String> = screen(&term).lines().map(str::to_string).collect();
+        let y = rows
+            .iter()
+            .position(|r| r.contains("Insert a decimal point"))
+            .unwrap() as u16;
+        bs.mouse(40, y, &H);
+        assert_eq!(bs.option_sel, 2, "the first Editing row");
+        assert_eq!(bs.option_check("fixed"), Some(true));
+        // A click on the Places row moves it on by one.
+        bs.mouse(40, y + 1, &H);
+        assert_eq!(bs.option_int("places"), Some(3));
+        // A click on a heading changes nothing.
+        let head = rows.iter().position(|r| r.contains(" Editing")).unwrap() as u16;
+        bs.mouse(40, head, &H);
+        assert_eq!(bs.option_sel, 3);
     }
 
     struct Editable;
