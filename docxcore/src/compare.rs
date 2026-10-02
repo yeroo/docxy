@@ -122,6 +122,11 @@ pub fn compare_packages(
     opts: &CompareOptions,
 ) -> CompareResult {
     let mut skipped = Vec::new();
+    // Deleted content is original XML: the result's root must bind its
+    // namespace prefixes too. A prefix bound differently in the two roots
+    // cannot be carried; markup using it is dropped and reported.
+    let mut package = revised.clone();
+    let conflicts = package.adopt_root_namespaces(original);
     let original_doc = accepted(&original.document, &mut skipped);
     let revised_doc = accepted(&revised.document, &mut skipped);
     let mut cx = Compare {
@@ -132,14 +137,14 @@ pub fn compare_packages(
         insertions: 0,
         deletions: 0,
         skipped,
+        conflicts,
+        dropped_conflicting: false,
     };
     let body = cx.compare_document(&original_doc, &revised_doc);
     let rels = revised.document_rels();
     // Round-trip through WordprocessingML so the loader builds the revision
     // nodes (targets, raw wrappers, display cues) exactly as for a file.
-    let document = parse_document_xml(&document_to_xml(&body), &rels);
-    let mut package = revised.clone();
-    package.document = document;
+    package.document = parse_document_xml(&document_to_xml(&body), &rels);
     CompareResult {
         package,
         insertions: cx.insertions,
@@ -214,6 +219,10 @@ struct Compare<'o> {
     insertions: usize,
     deletions: usize,
     skipped: Vec<CompareSkip>,
+    /// Namespace prefixes the original and revised roots bind differently.
+    conflicts: Vec<String>,
+    /// Whether markup using one of them was dropped (reported once).
+    dropped_conflicting: bool,
 }
 
 /// One aligned unit of a container's result.
@@ -547,7 +556,9 @@ impl<'o> Compare<'o> {
             let mut content = Vec::new();
             for step in &steps[k..end] {
                 match step {
-                    Op::Equal(_, j) | Op::Insert(j) => push_atom(&mut content, &revised[*j]),
+                    Op::Equal(_, j) | Op::Insert(j) => {
+                        push_atom(&mut content, &revised[*j], kind.is_some())
+                    }
                     Op::Delete(i) => self.push_deleted_atom(&mut content, &original[*i]),
                 }
             }
@@ -572,7 +583,9 @@ impl<'o> Compare<'o> {
             AtomKind::Break(kind, props) => {
                 content.push(Inline::Break(*kind, self.original_run_props(props)))
             }
-            AtomKind::Object(inline) => match deletable_object(inline) {
+            AtomKind::Object(inline) => match deletable_object(inline)
+                .filter(|inline| !self.uses_conflicting_prefix(object_xml(inline)))
+            {
                 Some(inline) => content.push(inline),
                 None => self.skipped.push(CompareSkip::Object),
             },
@@ -640,12 +653,13 @@ impl<'o> Compare<'o> {
     /// Original paragraph properties made safe for the revised package: no
     /// section break (its header/footer references belong to the original),
     /// and only styles and lists the revised package defines.
-    fn original_par_props(&self, props: &ParProps) -> ParProps {
+    fn original_par_props(&mut self, props: &ParProps) -> ParProps {
         let mut props = props.clone();
         props.section_break = None;
         props.section_property_change = None;
         props.property_change = None;
         props.mark_revisions.clear();
+        self.drop_conflicting(&mut props.raw_props);
         if props
             .style_id
             .as_ref()
@@ -664,10 +678,11 @@ impl<'o> Compare<'o> {
         props
     }
 
-    fn original_run_props(&self, props: &RunProps) -> RunProps {
+    fn original_run_props(&mut self, props: &RunProps) -> RunProps {
         let mut props = props.clone();
         props.property_change = None;
         props.revision_cues = Default::default();
+        self.drop_conflicting(&mut props.raw_props);
         if props
             .style_id
             .as_ref()
@@ -676,6 +691,33 @@ impl<'o> Compare<'o> {
             props.style_id = None;
         }
         props
+    }
+}
+
+impl Compare<'_> {
+    /// Whether original XML uses a prefix the result binds to another
+    /// namespace.
+    fn uses_conflicting_prefix(&self, xml: &str) -> bool {
+        self.conflicts.iter().any(|prefix| {
+            xml.contains(&format!("<{prefix}:")) || xml.contains(&format!(" {prefix}:"))
+        })
+    }
+
+    /// Drop preserved original property children that use such a prefix.
+    fn drop_conflicting(&mut self, raw_props: &mut Vec<String>) {
+        let before = raw_props.len();
+        raw_props.retain(|raw| !self.uses_conflicting_prefix(raw));
+        if raw_props.len() < before && !self.dropped_conflicting {
+            self.dropped_conflicting = true;
+            self.skipped.push(CompareSkip::Object);
+        }
+    }
+}
+
+fn object_xml(inline: &Inline) -> &str {
+    match inline {
+        Inline::Field { raw, .. } | Inline::Equation { raw, .. } | Inline::Raw(raw) => raw,
+        _ => "",
     }
 }
 
@@ -971,8 +1013,15 @@ fn tokenize(segments: &[Segment], link: Option<usize>, out: &mut Vec<Atom>) {
     }
 }
 
-fn push_atom(content: &mut Vec<Inline>, atom: &Atom) {
+/// Append a revised atom; `in_revision` when it goes inside a `w:ins`.
+fn push_atom(content: &mut Vec<Inline>, atom: &Atom, in_revision: bool) {
     match &atom.kind {
+        AtomKind::Object(Inline::Field { raw, text }) if in_revision => {
+            content.push(Inline::Field {
+                raw: run_level_field(raw),
+                text: text.clone(),
+            })
+        }
         AtomKind::Text(pieces) => {
             for (text, props) in pieces {
                 push_text(content, text, props.clone());
@@ -1007,13 +1056,42 @@ fn deletable_object(inline: &Inline) -> Option<Inline> {
     let carry = |raw: &str| (!has_relationship(raw)).then(|| deleted_text_xml(raw));
     match inline {
         Inline::Field { raw, text } => Some(Inline::Field {
-            raw: carry(raw)?,
+            raw: carry(&run_level_field(raw))?,
             text: text.clone(),
         }),
         Inline::Equation { raw, .. } if !has_relationship(raw) => Some(inline.clone()),
         Inline::Raw(raw) => Some(Inline::Raw(carry(raw)?)),
         _ => None,
     }
+}
+
+/// A field as run-level XML, which `w:ins`/`w:del` may contain: a
+/// `w:fldSimple` (paragraph-level content) becomes the equivalent complex
+/// field — begin, instruction, separate, its result runs, end. Other field
+/// forms (complex fields, `w:sym` runs) are already runs.
+fn run_level_field(raw: &str) -> String {
+    let mut parser = XmlParser::new(raw);
+    if parser.next() != Event::Start || parser.name() != "w:fldSimple" {
+        return raw.to_string();
+    }
+    let mut instr = String::new();
+    XmlParser::append_decoded(parser.attr("w:instr"), &mut instr);
+    let open_end = parser.pos();
+    let self_closing = raw[..open_end].trim_end().ends_with("/>");
+    let result = if self_closing {
+        ""
+    } else {
+        let close = raw.rfind("</w:fldSimple>").unwrap_or(raw.len());
+        &raw[open_end.min(close)..close]
+    };
+    let mut out = String::from(
+        "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r><w:r><w:instrText xml:space=\"preserve\">",
+    );
+    esc_attr(&instr, &mut out);
+    out.push_str("</w:instrText></w:r><w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>");
+    out.push_str(result);
+    out.push_str("<w:r><w:fldChar w:fldCharType=\"end\"/></w:r>");
+    out
 }
 
 fn has_relationship(raw: &str) -> bool {

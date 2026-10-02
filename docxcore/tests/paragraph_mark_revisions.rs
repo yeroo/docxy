@@ -430,3 +430,48 @@ fn removing_a_section_ending_mark_merges_the_section_away_as_word_does() {
     };
     assert_eq!(merged.props.section_break, None);
 }
+
+/// A centered paragraph with a tracked pPrChange (previously unformatted) and
+/// a tracked mark record of `kind`, followed by "B".
+fn property_change_and_mark(kind: &str) -> Document {
+    doc(&format!(
+        "<w:p><w:pPr><w:jc w:val=\"center\"/><w:rPr><w:{kind} w:id=\"1\"/></w:rPr>\
+         <w:pPrChange w:id=\"2\"><w:pPr/></w:pPrChange></w:pPr>\
+         <w:r><w:t>A</w:t></w:r></w:p><w:p><w:r><w:t>B</w:t></w:r></w:p>"
+    ))
+}
+
+#[test]
+fn bulk_actions_apply_a_paragraphs_property_change_before_merging_it_away() {
+    use docxcore::model::Align;
+    let align = |d: &Document| match &d.body[0] {
+        Block::Paragraph(p) => p.props.align,
+        _ => panic!("paragraph"),
+    };
+    // (mark kind, accept?) -> expected paragraphs and first alignment.
+    for (kind, accept, expected, centered) in [
+        ("del", true, vec!["AB"], false),
+        ("del", false, vec!["A", "B"], false),
+        ("ins", true, vec!["A", "B"], true),
+        ("ins", false, vec!["AB"], false),
+    ] {
+        let mut document = property_change_and_mark(kind);
+        let outcomes = if accept {
+            document.accept_all_revisions()
+        } else {
+            document.reject_all_revisions()
+        };
+        assert_eq!(outcomes.len(), 2);
+        assert!(
+            outcomes.iter().all(RevisionOutcome::is_applied),
+            "{kind} accept={accept}: {outcomes:?}"
+        );
+        assert_eq!(texts(&document), expected, "{kind} accept={accept}");
+        assert_eq!(
+            align(&document) == Align::Center,
+            centered,
+            "{kind} accept={accept}"
+        );
+        assert!(document.revisions().is_empty());
+    }
+}

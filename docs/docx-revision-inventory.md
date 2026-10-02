@@ -93,7 +93,11 @@ Comparison is by text: formatting-only differences, headers/footers, notes and
 comments are not compared (they come from the revised package). Zero-width
 markers (bookmarks, comment ranges, field characters) come from the revised
 side only. Deleted paragraphs lose section breaks and any style or list the
-revised package lacks. What cannot be expressed is reported as skipped: a table
+revised package lacks. The result's root also declares the original's namespace
+prefixes (and `mc:Ignorable` tokens) so deleted original markup stays bound; markup
+using a prefix the two documents bind differently is dropped. A simple field
+(`w:fldSimple`) inside an insertion or deletion is written as the equivalent
+complex field, since tracked-change wrappers hold only run-level content. What cannot be expressed is reported as skipped: a table
 whose shape changed (kept as revised), a deleted object or hyperlink target
 that references the original package, a deleted note reference, and input
 revisions that cannot be accepted (moves, custom-XML ranges, cell records).

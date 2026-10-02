@@ -173,29 +173,44 @@ fn revision_postorder(
     // `Document::revisions` is pre-order, so reversing it guarantees every
     // descendant is transformed before its ancestor. Original ordinals are
     // retained and used to restore report order after the actions run.
-    let mut order: Vec<&RevisionAddress> = addresses.iter().rev().collect();
-    // A mark inserted by one reviewer and deleted by another carries two
-    // records. Removing the mark merges the paragraph away, taking the other
-    // record with it, so within each run of adjacent mark records the ones
-    // that keep the mark go first. Order across paragraphs does not matter:
-    // a merge keeps the absorbed paragraph's records.
-    let removes = |address: &RevisionAddress| match address.category {
-        RevisionCategory::ParagraphMark(kind) => removes_mark(action, kind),
-        _ => false,
-    };
-    let mut start = 0;
-    while start < order.len() {
-        let is_mark =
-            |a: &RevisionAddress| matches!(a.category, RevisionCategory::ParagraphMark(_));
-        let mut end = start + 1;
-        if is_mark(order[start]) {
-            while end < order.len() && is_mark(order[end]) {
-                end += 1;
-            }
-            order[start..end].sort_by_key(|a| removes(a));
-        }
-        start = end;
+    //
+    // Paragraph-mark records are the exception: removing a mark merges the
+    // next paragraph in and replaces this paragraph's properties, so every
+    // other record of the paragraph (its pPrChange/sectPrChange, a second
+    // mark record that keeps the mark) must act first or it would come back
+    // stale. Marks are therefore deferred until just before the next record
+    // that encloses them (a shallower wrapper, such as a revision around a
+    // text box), or the end. Within a deferred batch the records that keep a
+    // mark go first; keeping changes no structure, and a merge keeps the
+    // absorbed paragraph's records, so the order across paragraphs is free.
+    fn flush<'a>(
+        pending: &mut Vec<&'a RevisionAddress>,
+        order: &mut Vec<&'a RevisionAddress>,
+        above: Option<usize>,
+        action: RevisionAction,
+    ) {
+        // `above: None` flushes every pending mark.
+        let (mut ready, rest): (Vec<_>, Vec<_>) = pending
+            .drain(..)
+            .partition(|mark| above.is_none_or(|depth| mark.depth > depth));
+        ready.sort_by_key(|mark| match mark.category {
+            RevisionCategory::ParagraphMark(kind) => removes_mark(action, kind),
+            _ => false,
+        });
+        order.extend(ready);
+        *pending = rest;
     }
+    let mut order: Vec<&RevisionAddress> = Vec::with_capacity(addresses.len());
+    let mut pending: Vec<&RevisionAddress> = Vec::new();
+    for address in addresses.iter().rev() {
+        if matches!(address.category, RevisionCategory::ParagraphMark(_)) {
+            pending.push(address);
+            continue;
+        }
+        flush(&mut pending, &mut order, Some(address.depth), action);
+        order.push(address);
+    }
+    flush(&mut pending, &mut order, None, action);
     order
         .into_iter()
         .map(|address| (address.ordinal, address.target))

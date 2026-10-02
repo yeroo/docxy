@@ -539,3 +539,111 @@ fn a_change_before_a_table_never_borrows_a_section_ending_mark() {
         }
     }
 }
+
+/// A package whose stored document part has `root` as its `<w:document>`
+/// start tag, so a save re-emits those declarations.
+fn pkg_with_root(root: &str, body: &str) -> Package {
+    let xml = format!("{root}<w:body>{body}</w:body></w:document>");
+    let mut package = new_package(parse_document_xml(&xml, &Relationships::default()));
+    assert!(package.set_part_text("word/document.xml", &xml));
+    package
+}
+
+fn saved_document_xml(result: &CompareResult) -> String {
+    load_package(&save_package(&result.package))
+        .expect("result reloads")
+        .part_text("word/document.xml")
+        .unwrap()
+}
+
+const W14: &str = "http://schemas.microsoft.com/office/word/2010/wordml";
+const MC: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+
+#[test]
+fn deleted_original_markup_keeps_its_namespace_prefixes_bound() {
+    let original = pkg_with_root(
+        &format!(
+            "<w:document xmlns:w=\"{W_NS}\" xmlns:mc=\"{MC}\" xmlns:w14=\"{W14}\" mc:Ignorable=\"w14\">"
+        ),
+        "<w:p><w:r><w:t xml:space=\"preserve\">Keep </w:t></w:r>\
+         <w:r><w:rPr><w14:ligatures w14:val=\"standard\"/></w:rPr><w:t>gone</w:t></w:r></w:p>",
+    );
+    let revised = pkg(&p("Keep "));
+    let result = compare(&original, &revised);
+    let xml = saved_document_xml(&result);
+    let root = &xml[xml.find("<w:document").unwrap()..];
+    let root = &root[..root.find('>').unwrap()];
+    assert!(root.contains(&format!("xmlns:w14=\"{W14}\"")), "{root}");
+    assert!(root.contains(&format!("xmlns:mc=\"{MC}\"")), "{root}");
+    assert!(root.contains("mc:Ignorable=\"w14\""), "{root}");
+    let del = &xml[xml.find("<w:del ").expect("a deletion")..];
+    assert!(
+        del[..del.find("</w:del>").unwrap()].contains("<w14:ligatures"),
+        "{xml}"
+    );
+    assert!(result.skipped.is_empty(), "{:?}", result.skipped);
+    assert_eq!(texts(&resolved(&reloaded(&result), false)), ["Keep gone"]);
+}
+
+#[test]
+fn markup_whose_prefix_the_revised_root_binds_differently_is_dropped() {
+    let original = pkg_with_root(
+        &format!("<w:document xmlns:w=\"{W_NS}\" xmlns:w14=\"urn:not-w14\">"),
+        "<w:p><w:r><w:t xml:space=\"preserve\">Keep </w:t></w:r>\
+         <w:r><w:rPr><w14:odd/></w:rPr><w:t>gone</w:t></w:r></w:p>",
+    );
+    let revised = pkg_with_root(
+        &format!("<w:document xmlns:w=\"{W_NS}\" xmlns:w14=\"{W14}\">"),
+        &p("Keep "),
+    );
+    let result = compare(&original, &revised);
+    let xml = saved_document_xml(&result);
+    assert!(!xml.contains("w14:odd"), "{xml}");
+    assert!(!xml.contains("urn:not-w14"), "{xml}");
+    assert_eq!(result.skipped, [CompareSkip::Object]);
+    assert_eq!(texts(&resolved(&reloaded(&result), false)), ["Keep gone"]);
+}
+
+#[test]
+fn simple_fields_inside_revisions_become_run_level_complex_fields() {
+    let field = |result: &str| {
+        format!(
+            "<w:fldSimple w:instr=\" DATE &amp; TIME \"><w:r><w:t>{result}</w:t></w:r></w:fldSimple>"
+        )
+    };
+    let para =
+        |field: &str| format!("<w:p><w:r><w:t xml:space=\"preserve\">On </w:t></w:r>{field}</w:p>");
+    // Deleted, inserted, and a changed cached result.
+    for (original, revised) in [
+        (para(&field("1/2")), para("")),
+        (para(""), para(&field("1/2"))),
+        (para(&field("1/2")), para(&field("3/4"))),
+    ] {
+        let result = compare(&pkg(&original), &pkg(&revised));
+        let xml = saved_document_xml(&result);
+        for tag in ["<w:ins ", "<w:del "] {
+            let mut rest = xml.as_str();
+            while let Some(at) = rest.find(tag) {
+                let close = if tag == "<w:ins " {
+                    "</w:ins>"
+                } else {
+                    "</w:del>"
+                };
+                let wrapper = &rest[at..at + rest[at..].find(close).unwrap()];
+                assert!(!wrapper.contains("<w:fldSimple"), "{wrapper}");
+                rest = &rest[at + wrapper.len()..];
+            }
+        }
+        assert!(xml.contains("<w:ins ") || xml.contains("<w:del "), "{xml}");
+        let reloaded = reloaded(&result);
+        let resolve = |accept| {
+            resolved(&reloaded, accept)
+                .plain_text()
+                .trim_end()
+                .to_string()
+        };
+        let plain = |body: &str| doc(body).plain_text().trim_end().to_string();
+        assert_eq!(resolve(true), plain(&revised), "{xml}");
+        assert_eq!(resolve(false), plain(&original), "{xml}");
+    }
+}
