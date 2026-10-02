@@ -1073,7 +1073,7 @@ impl Engine {
 
         // An edited *data* cell (or a spill write in a recursive pass) isn't a
         // formula key, so `rev` can't reach its dependents. Find those first-
-        // level dependents with a single scan over the (few) such seed cells;
+        // level dependents via the seed index in `formulas_reading`;
         // everything reachable from them is a formula and expands via `rev`.
         let data_seeds: Vec<Key> = changed
             .iter()
@@ -1081,16 +1081,8 @@ impl Engine {
             .filter(|k| !self.formulas.contains_key(k))
             .collect();
         if !data_seeds.is_empty() {
-            for (&fk, info) in &self.formulas {
-                if dirty.contains(&fk) {
-                    continue;
-                }
-                let hit = data_seeds.iter().any(|&(s, r, c)| {
-                    info.deps.iter().any(|&(ds, r1, c1, r2, c2)| {
-                        ds == s && r >= r1 && r <= r2 && c >= c1 && c <= c2
-                    })
-                });
-                if hit && dirty.insert(fk) {
+            for fk in self.formulas_reading(&data_seeds, &dirty) {
+                if dirty.insert(fk) {
                     frontier.push_back(fk);
                 }
             }
@@ -1135,22 +1127,47 @@ impl Engine {
                 let Some(cells) = by_sheet.get(&ds) else {
                     continue;
                 };
-                // Cells are (row, col)-ordered, so the rect's rows are the
-                // contiguous slice from the first row ≥ r1 up to the last ≤ r2.
-                let start = cells.partition_point(|&(r, _, _)| r < r1);
-                for &(r, c, g) in &cells[start..] {
-                    if r > r2 {
-                        break;
-                    }
-                    if c >= c1 && c <= c2 {
-                        srcs.push(g);
-                    }
-                }
+                srcs.extend(cells_in_rect(cells, r1, c1, r2, c2).map(|&(_, _, g)| g));
             }
             // One edge per (dependent, source) even if several rects overlap it.
             srcs.sort_unstable();
             srcs.dedup();
             out.push((f, srcs.clone()));
+        }
+        out
+    }
+
+    /// The formulas not in `skip` with a dependency rectangle covering one of
+    /// `seeds` (plain-value cells, which `rev` cannot reach). Seeds are indexed
+    /// per sheet, sorted by (row, col), so each rectangle costs a binary search
+    /// for its first row plus a walk over the seeds in its row band — not a
+    /// test against every seed.
+    fn formulas_reading(&self, seeds: &[Key], skip: &HashSet<Key>) -> Vec<Key> {
+        let mut by_sheet: HashMap<usize, Vec<(u32, u32, ())>> = HashMap::new();
+        for &(s, r, c) in seeds {
+            by_sheet.entry(s).or_default().push((r, c, ()));
+        }
+        if by_sheet.is_empty() {
+            return Vec::new();
+        }
+        for cells in by_sheet.values_mut() {
+            cells.sort_unstable();
+            cells.dedup();
+        }
+        let mut out = Vec::new();
+        'formulas: for (&fk, info) in &self.formulas {
+            if skip.contains(&fk) {
+                continue;
+            }
+            for &(ds, r1, c1, r2, c2) in &info.deps {
+                let Some(cells) = by_sheet.get(&ds) else {
+                    continue;
+                };
+                if cells_in_rect(cells, r1, c1, r2, c2).next().is_some() {
+                    out.push(fk);
+                    continue 'formulas;
+                }
+            }
         }
         out
     }
@@ -1480,14 +1497,27 @@ impl Engine {
                     for (i, row) in m.into_iter().enumerate() {
                         for (j, v) in row.into_iter().enumerate() {
                             let (rr, cc) = (r + i as u32, c + j as u32);
+                            let v = value_to_cell(v);
                             let entry = sheet.cells.entry((rr, cc)).or_default();
-                            entry.value = value_to_cell(v);
                             if (rr, cc) != (r, c) {
+                                // Outside the previous extent the cell newly
+                                // belongs to this spill (report it, as on
+                                // growth); inside, only a real content change
+                                // is reported.
+                                let fresh = rr >= r + old.0 || cc >= c + old.1;
+                                let differs = fresh
+                                    || entry.value != v
+                                    || entry.formula.is_some()
+                                    || entry.f_attrs.is_some()
+                                    || entry.spill.is_some();
                                 entry.formula = None;
                                 entry.f_attrs = None;
                                 entry.spill = None;
-                                changed.push((s, rr, cc));
+                                if differs {
+                                    changed.push((s, rr, cc));
+                                }
                             }
+                            entry.value = v;
                         }
                     }
                     let entry = sheet.cells.entry((r, c)).or_default();
@@ -1747,6 +1777,25 @@ struct SpillOwner {
     /// For a frozen array anchor, whether its block holds the cell: `Some(false)`
     /// when its stored `ref` is not its own or leaves the cell out.
     frozen_ref_covers: Option<bool>,
+}
+
+/// The entries of `cells` — sorted by (row, col) — inside the inclusive
+/// rectangle rows r1..=r2, cols c1..=c2. Cells are (row, col)-ordered, so the
+/// rect's rows are the contiguous slice from the first row ≥ r1 up to the
+/// last ≤ r2: a binary search for the first row, then a walk over that row
+/// band only.
+fn cells_in_rect<T>(
+    cells: &[(u32, u32, T)],
+    r1: u32,
+    c1: u32,
+    r2: u32,
+    c2: u32,
+) -> impl Iterator<Item = &(u32, u32, T)> {
+    let start = cells.partition_point(|&(r, _, _)| r < r1);
+    cells[start..]
+        .iter()
+        .take_while(move |&&(r, _, _)| r <= r2)
+        .filter(move |&&(_, c, _)| c >= c1 && c <= c2)
 }
 
 /// Clear the plain-value cells of a spill (keeping styles) outside the
@@ -3499,6 +3548,148 @@ mod tests {
         set(&mut eng, &mut wb, "A4", Cell::number(80.0));
         assert_eq!(value_at(&wb, "C3"), CellValue::Number(80.0));
         assert_eq!(value_at(&wb, "E1"), CellValue::Number(3.0));
+    }
+
+    #[test]
+    fn formulas_reading_finds_rect_readers() {
+        // #878: the data-seed lookup finds exactly the formulas whose dep
+        // rect covers a seed, with rect bounds treated as inclusive.
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("A2", Cell::number(2.0)),
+            ("A3", Cell::number(3.0)),
+            ("A4", Cell::number(4.0)),
+            ("A5", Cell::number(5.0)),
+            ("C1", Cell::formula("SUM(A1:A3)")),
+            ("D1", Cell::formula("A5*2")),
+            ("E1", Cell::formula("SUM(B1:B9)")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        let none = HashSet::new();
+        assert_eq!(eng.formulas_reading(&[(0, 1, 0)], &none), vec![(0, 0, 2)]); // A2 -> C1
+        assert_eq!(eng.formulas_reading(&[(0, 4, 0)], &none), vec![(0, 0, 3)]); // A5 -> D1
+        assert!(eng.formulas_reading(&[(0, 3, 0)], &none).is_empty()); // A4 -> none
+        let mut both = eng.formulas_reading(&[(0, 1, 0), (0, 4, 0)], &none);
+        both.sort_unstable();
+        assert_eq!(both, vec![(0, 0, 2), (0, 0, 3)]); // C1 and D1
+        // Rect boundaries are inclusive: A3 is inside A1:A3, A4 is not.
+        assert_eq!(eng.formulas_reading(&[(0, 2, 0)], &none), vec![(0, 0, 2)]);
+        assert!(eng.formulas_reading(&[(0, 3, 0)], &none).is_empty());
+    }
+
+    #[test]
+    fn formulas_reading_skips_and_respects_sheet() {
+        // #878: seeds only match dep rects on their own sheet, and a formula
+        // named in `skip` is not returned.
+        let mut wb = wb_one_sheet(&[("C1", Cell::formula("SUM(Sheet2!A1:A3)"))]);
+        let mut sheet2 = Sheet {
+            name: "Sheet2".to_string(),
+            ..Sheet::default()
+        };
+        for r in 0..3 {
+            sheet2.set_cell(r, 0, Cell::number(f64::from(r + 1)));
+        }
+        wb.sheets.push(sheet2);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        // Sheet2's A1 (sheet 1, row 0, col 0) hits the cross-sheet reader…
+        assert_eq!(
+            eng.formulas_reading(&[(1, 0, 0)], &HashSet::new()),
+            vec![(0, 0, 2)]
+        );
+        // …the same row/col on sheet 0 does not.
+        assert!(
+            eng.formulas_reading(&[(0, 0, 0)], &HashSet::new())
+                .is_empty()
+        );
+        // skip holds the formula's key: nothing.
+        assert!(
+            eng.formulas_reading(&[(1, 0, 0)], &HashSet::from([(0, 0, 2)]))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn formulas_reading_tall_rect_ignores_other_columns() {
+        // #878: a tall rect (A1:A1000) walks only the seeds in its row band;
+        // seeds in other columns don't match, one inside the column does.
+        let mut wb = wb_one_sheet(&[("C1", Cell::formula("SUM(A1:A1000)"))]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        let mut b_seeds: Vec<Key> = (0..100).map(|r| (0, r, 1)).collect(); // B1..B100
+        assert!(eng.formulas_reading(&b_seeds, &HashSet::new()).is_empty());
+        b_seeds.push((0, 699, 0)); // A700
+        assert_eq!(
+            eng.formulas_reading(&b_seeds, &HashSet::new()),
+            vec![(0, 0, 2)]
+        );
+    }
+
+    #[test]
+    fn respill_with_unchanged_values_reports_no_cells() {
+        // #878: re-evaluating an unchanged dynamic array must not report its
+        // spill cells — thousands of them would seed the recalc's data-cell
+        // scan for nothing.
+        let mut wb = wb_one_sheet(&[("A1", array_formula("SEQUENCE(50)"))]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(eng.eval_one(&mut wb, (0, 0, 0)), Vec::new());
+    }
+
+    #[test]
+    fn respill_reports_only_changed_cells() {
+        // #878: only the spilled cell whose value actually changed (A3) is
+        // reported, not the whole spill.
+        let mut wb = wb_one_sheet(&[
+            ("A1", array_formula("IF(SEQUENCE(5)=3,B1,SEQUENCE(5))")),
+            ("B1", Cell::number(3.0)),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "A3"), CellValue::Number(3.0));
+        // Edit B1's stored value directly: only A3's element depends on it.
+        wb.sheets[0].cells.get_mut(&(0, 1)).unwrap().value = CellValue::Number(100.0);
+        assert_eq!(eng.eval_one(&mut wb, (0, 0, 0)), vec![(0, 2, 0)]);
+        assert_eq!(value_at(&wb, "A3"), CellValue::Number(100.0));
+    }
+
+    #[test]
+    fn dependent_of_respilled_cell_still_updates() {
+        // #878 side effect: a changed spilled value still seeds its
+        // dependents (C1 reads the spilled cell A3, which is a plain value).
+        let mut wb = wb_one_sheet(&[
+            ("A1", array_formula("SEQUENCE(3,1,B1,1)")),
+            ("B1", Cell::number(10.0)),
+            ("C1", Cell::formula("A3*2")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(24.0));
+        set(&mut eng, &mut wb, "B1", Cell::number(20.0));
+        assert_eq!(value_at(&wb, "A3"), CellValue::Number(22.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(44.0));
+    }
+
+    #[test]
+    fn spill_growth_updates_rows_of_spillref() {
+        // #878 side effect: growing and shrinking a spill still refreshes a
+        // ROWS(A1#) reader, and a shrunk spill still clears its old cells.
+        let mut wb = wb_one_sheet(&[
+            ("A1", array_formula("SEQUENCE(B1)")),
+            ("B1", Cell::number(2.0)),
+            ("C1", Cell::formula("ROWS(A1#)")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(2.0));
+        set(&mut eng, &mut wb, "B1", Cell::number(4.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(4.0));
+        assert_eq!(value_at(&wb, "A4"), CellValue::Number(4.0));
+        set(&mut eng, &mut wb, "B1", Cell::number(2.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(2.0));
+        assert_eq!(value_at(&wb, "A3"), CellValue::Empty);
+        assert_eq!(value_at(&wb, "A4"), CellValue::Empty);
     }
 
     #[test]
