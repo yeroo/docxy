@@ -7522,7 +7522,14 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
     let hot = t.hot.as_ref().map(PathBuf::from).filter(|p| p.exists());
     let mut tab = match (t.kind, &hot) {
         (Kind::Docx, Some(hp)) => {
-            let mut l = doc_from_path(hp);
+            // The sidecar is always a .docx this app wrote: loaded strictly,
+            // never sniffed or recovered (#633), so a damaged one is
+            // unreadable and the tab reopens its file below, rather than
+            // showing whatever text Recover Text could read from it.
+            let mut l = match std::fs::read(hp) {
+                Ok(bytes) => load_bytes(&bytes),
+                Err(e) => Loaded::empty(format!("read error: {e}")),
+            };
             // A 0-byte sidecar is a truncated write, not an empty document:
             // the user-file rule that opens one as new must not apply here.
             let unreadable = l.load_failed || std::fs::metadata(hp).is_ok_and(|m| m.len() == 0);
