@@ -359,6 +359,16 @@ fn enable_editing_trusts_the_file_until_it_is_replaced() {
     let again = open(&driver);
     assert!(!flag(&again, "protected"), "{again}");
 
+    // Clearing the trusted documents list (#895): the file opens protected
+    // again. The tab stays open after this: the replace step's own
+    // close-tab closes it (a second close with no tab open is an error).
+    ok(&driver, "close-tab", vec![]);
+    let cleared = ok(&driver, "trusted-clear", vec![]);
+    assert_eq!(cleared.get("cleared"), Some(&Json::Num(1.0)), "{cleared}");
+    assert!(flag(&open(&driver), "protected"));
+    let st = ok(&driver, "enable-editing", vec![]);
+    assert_eq!(st.get("protected"), Some(&Json::Bool(false)), "{st}");
+
     // Downloaded again to the same path: another file, protected again.
     ok(&driver, "close-tab", vec![]);
     std::fs::copy(root.join("fixtures/chart-kinds.xlsx"), &book).unwrap();
