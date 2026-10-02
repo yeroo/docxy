@@ -202,7 +202,15 @@ impl Fill<'_> {
                     }
                 }
                 Inline::TextBox { blocks, .. } => self.blocks(blocks),
-                Inline::Hyperlink(h) => self.inlines(&mut h.content),
+                // A loaded link is saved from its raw XML unless its content
+                // is marked changed, which would keep the field in the copy.
+                Inline::Hyperlink(h) => {
+                    let before = h.content.clone();
+                    self.inlines(&mut h.content);
+                    if h.content != before {
+                        h.content_changed = true;
+                    }
+                }
                 Inline::Revision {
                     content,
                     content_changed,
@@ -251,26 +259,49 @@ fn is_id_marker(raw: &str) -> bool {
     .any(|m| raw.contains(m))
 }
 
-/// Drop bookmarks, comment anchors and note references from a later copy.
+/// Drop bookmarks, comment anchors and note references from a later copy,
+/// also inside links and tracked changes (whose raw XML is then rebuilt from
+/// their content on save).
 fn strip_ids(blocks: &mut Vec<Block>) {
-    fn inlines(items: &mut Vec<Inline>) {
+    /// Whether anything was dropped.
+    fn inlines(items: &mut Vec<Inline>) -> bool {
+        let n = items.len();
         items.retain(|i| match i {
-            Inline::Raw(raw) => !is_id_marker(raw),
+            Inline::Raw(raw) | Inline::UnsupportedRevision { raw, .. } => !is_id_marker(raw),
             Inline::FootnoteRef { .. } => false,
             _ => true,
         });
+        let mut changed = items.len() != n;
         for i in items.iter_mut() {
             match i {
-                Inline::Hyperlink(h) => inlines(&mut h.content),
+                Inline::Hyperlink(h) => {
+                    if inlines(&mut h.content) {
+                        h.content_changed = true;
+                        changed = true;
+                    }
+                }
+                Inline::Revision {
+                    content,
+                    content_changed,
+                    ..
+                } => {
+                    if inlines(content) {
+                        *content_changed = true;
+                        changed = true;
+                    }
+                }
                 Inline::TextBox { blocks, .. } => strip_ids(blocks),
                 _ => {}
             }
         }
+        changed
     }
     blocks.retain(|b| !matches!(b, Block::Raw(raw) if is_id_marker(raw.trim_start())));
     for b in blocks {
         match b {
-            Block::Paragraph(p) => inlines(&mut p.content),
+            Block::Paragraph(p) => {
+                inlines(&mut p.content);
+            }
             Block::Table(t) => {
                 for row in &mut t.rows {
                     for cell in &mut row.cells {
@@ -512,11 +543,16 @@ mod tests {
                     },
                     Inline::Raw("<w:bookmarkEnd w:id=\"7\"/>".into()),
                 ]),
+                // The same markers inside a tracked insertion, as Word loads it.
+                tracked_markers(),
             ],
         });
         let out = merge_package(&main, &r, &opts(&r, MainDocType::Letters)).unwrap();
         let xml = crate::serialize::document_to_xml(&out.document);
         for (marker, n) in [
+            ("<w:bookmarkStart w:id=\"8\"", 1),
+            ("<w:commentReference w:id=\"3\"", 1),
+            ("<w:footnoteReference w:id=\"2\"", 1),
             ("<w:bookmarkStart w:id=\"7\"", 1),
             ("<w:bookmarkEnd w:id=\"7\"", 1),
             ("<w:commentRangeStart w:id=\"0\"", 1),
@@ -526,5 +562,81 @@ mod tests {
             assert_eq!(xml.matches(marker).count(), n, "{marker}: {xml}");
         }
         assert!(xml.contains("Amy"), "{xml}");
+        // The insertion's own text is in every copy.
+        assert_eq!(xml.matches(">ins<").count(), 3, "{xml}");
+    }
+
+    const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+
+    /// A paragraph whose tracked insertion holds a bookmark, a comment
+    /// reference and a footnote reference (r1 M3).
+    fn tracked_markers() -> Block {
+        let xml = format!(
+            "<w:document xmlns:w=\"{W}\"><w:body><w:p>\
+             <w:ins w:id=\"90\" w:author=\"A\" w:date=\"2026-01-01T00:00:00Z\">\
+             <w:bookmarkStart w:id=\"8\" w:name=\"b\"/>\
+             <w:r><w:t>ins</w:t></w:r>\
+             <w:r><w:commentReference w:id=\"3\"/></w:r>\
+             <w:r><w:footnoteReference w:id=\"2\"/></w:r>\
+             <w:bookmarkEnd w:id=\"8\"/>\
+             </w:ins></w:p></w:body></w:document>"
+        );
+        let doc = crate::load::parse_document_xml(&xml, &Default::default());
+        assert!(
+            matches!(&doc.body[0], Block::Paragraph(p) if matches!(p.content[0], Inline::Revision { .. })),
+            "{:?}",
+            doc.body
+        );
+        doc.body[0].clone()
+    }
+
+    /// A loaded hyperlink is saved from its raw XML unless its content is
+    /// marked changed: a merge field inside one must still merge (r1 M2).
+    #[test]
+    fn a_merge_field_inside_a_loaded_hyperlink_merges() {
+        let r = Recipients::parse_csv(b"Email\njane@x.org\njohn@y.org\n").unwrap();
+        let body = format!(
+            "<?xml version=\"1.0\"?><w:document xmlns:w=\"{W}\" \
+             xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
+             <w:body><w:p><w:hyperlink r:id=\"rId9\">\
+             <w:r><w:t xml:space=\"preserve\">Mail </w:t></w:r>\
+             <w:fldSimple w:instr=\" MERGEFIELD Email \"><w:r><w:t>\u{AB}Email\u{BB}</w:t></w:r></w:fldSimple>\
+             </w:hyperlink></w:p><w:sectPr/></w:body></w:document>"
+        );
+        let docx = crate::zipwrite::write_zip(&[
+            (
+                "[Content_Types].xml".into(),
+                b"<?xml version=\"1.0\"?><Types/>".to_vec(),
+            ),
+            (
+                "_rels/.rels".into(),
+                b"<?xml version=\"1.0\"?><Relationships><Relationship Id=\"rId1\" Target=\"word/document.xml\"/></Relationships>"
+                    .to_vec(),
+            ),
+            ("word/document.xml".into(), body.into_bytes()),
+            (
+                "word/_rels/document.xml.rels".into(),
+                b"<?xml version=\"1.0\"?><Relationships><Relationship Id=\"rId9\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"mailto:x@y.z\" TargetMode=\"External\"/></Relationships>"
+                    .to_vec(),
+            ),
+        ]);
+        let main = load_package(&docx).unwrap();
+        let Block::Paragraph(p) = &main.document.body[0] else {
+            panic!()
+        };
+        assert!(
+            matches!(&p.content[0], Inline::Hyperlink(h) if h.raw.is_some() && !h.content.is_empty()),
+            "{:?}",
+            p.content
+        );
+        let out = merge_package(&main, &r, &opts(&r, MainDocType::Letters)).unwrap();
+        let saved = load_package(&save_package(&out)).unwrap();
+        let xml = saved.part_text("word/document.xml").unwrap();
+        assert!(!xml.contains("MERGEFIELD"), "{xml}");
+        assert!(
+            xml.contains("jane@x.org") && xml.contains("john@y.org"),
+            "{xml}"
+        );
+        assert_eq!(xml.matches("<w:hyperlink").count(), 2, "{xml}");
     }
 }
