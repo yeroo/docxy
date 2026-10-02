@@ -12,9 +12,10 @@
 
 use crate::model::{Block, Document, Inline, Run, RunProps};
 use crate::package::Package;
+use crate::xml::{Event, XmlParser};
 
 /// What a body walk removes or counts.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Target {
     /// Runs, tabs and breaks formatted `w:vanish`.
     Hidden,
@@ -23,17 +24,18 @@ enum Target {
 }
 
 impl Target {
+    /// Whether the walk drops this modeled inline whole. Comment markers
+    /// live in raw XML and are stripped from it instead ([`strip_markers`]).
     fn matches(self, inline: &Inline) -> bool {
         match (self, inline) {
             (Target::Hidden, Inline::Run(r)) => is_hidden(&r.props),
             (Target::Hidden, Inline::Tab(p) | Inline::Break(_, p)) => is_hidden(p),
-            (Target::CommentMarkers, Inline::Raw(raw)) => is_comment_marker(raw),
             _ => false,
         }
     }
 
     fn matches_run(self, run: &Run) -> bool {
-        matches!(self, Target::Hidden) && is_hidden(&run.props)
+        self == Target::Hidden && is_hidden(&run.props)
     }
 }
 
@@ -61,14 +63,63 @@ fn raw_local_name(raw: &str) -> &str {
     name.rsplit(':').next().unwrap_or(name)
 }
 
-fn is_comment_marker(raw: &str) -> bool {
-    [
-        "w:commentRangeStart",
-        "w:commentRangeEnd",
-        "w:commentReference",
-    ]
-    .iter()
-    .any(|tag| raw.contains(tag))
+const MARKER_TAGS: [&str; 3] = [
+    "w:commentRangeStart",
+    "w:commentRangeEnd",
+    "w:commentReference",
+];
+
+/// Comment marker elements in raw XML.
+fn count_markers(xml: &str) -> usize {
+    MARKER_TAGS
+        .iter()
+        .map(|name| {
+            let (mut n, mut from) = (0, 0);
+            while let Some((_, end, _)) = find_element(xml, name, from) {
+                n += 1;
+                from = end;
+            }
+            n
+        })
+        .sum()
+}
+
+/// `xml` without its comment marker elements, and how many there were.
+/// Only the markers go: a raw run that holds text and a
+/// `w:commentReference`, or a `w:customXml` wrapper around a commented
+/// range, keeps everything else.
+fn strip_markers(xml: &str) -> (String, usize) {
+    let mut out = xml.to_string();
+    let mut removed = 0;
+    for name in MARKER_TAGS {
+        while let Some((start, end, _)) = find_element(&out, name, 0) {
+            out.replace_range(start..end, "");
+            removed += 1;
+        }
+    }
+    (out, removed)
+}
+
+/// Whether what stripping left of a raw inline is nothing worth keeping:
+/// nothing at all, or a `w:r` with no child but its `w:rPr` (the run a
+/// `w:commentReference` sat in).
+fn is_leftover(xml: &str) -> bool {
+    let xml = xml.trim();
+    if xml.is_empty() {
+        return true;
+    }
+    let mut p = XmlParser::new(xml);
+    if p.next() != Event::Start || p.name() != "w:r" {
+        return false;
+    }
+    loop {
+        match p.next() {
+            Event::Start if p.name() == "w:rPr" => p.skip_element(),
+            Event::Start | Event::Eof => return false,
+            Event::End => return xml[p.pos()..].trim().is_empty(),
+            Event::Text => {}
+        }
+    }
 }
 
 fn count_blocks(blocks: &[Block], target: Target) -> usize {
@@ -82,16 +133,43 @@ fn count_blocks(blocks: &[Block], target: Target) -> usize {
                 .flat_map(|row| &row.cells)
                 .map(|cell| count_blocks(&cell.blocks, target))
                 .sum(),
+            Block::Raw(raw) if target == Target::CommentMarkers => count_markers(raw),
             Block::SectionProperties(_) | Block::Raw(_) => 0,
         })
         .sum()
+}
+
+/// The raw XML of an inline that the walk strips comment markers from.
+/// Hyperlinks and revisions are not here: their children are walked, and a
+/// changed wrapper is rebuilt from them.
+fn marker_raw(inline: &Inline) -> Option<&str> {
+    match inline {
+        Inline::Raw(raw)
+        | Inline::Field { raw, .. }
+        | Inline::UnsupportedRevision { raw, .. }
+        | Inline::TextBox { raw, .. } => Some(raw),
+        _ => None,
+    }
+}
+
+fn marker_raw_mut(inline: &mut Inline) -> Option<&mut String> {
+    match inline {
+        Inline::Raw(raw)
+        | Inline::Field { raw, .. }
+        | Inline::UnsupportedRevision { raw, .. }
+        | Inline::TextBox { raw, .. } => Some(raw),
+        _ => None,
+    }
 }
 
 fn count_inlines(content: &[Inline], target: Target) -> usize {
     content
         .iter()
         .map(|inline| {
-            let own = usize::from(target.matches(inline));
+            let own = match marker_raw(inline) {
+                Some(raw) if target == Target::CommentMarkers => count_markers(raw),
+                _ => usize::from(target.matches(inline)),
+            };
             own + match inline {
                 Inline::Hyperlink(h) => {
                     h.runs.iter().filter(|r| target.matches_run(r)).count()
@@ -115,6 +193,20 @@ fn remove_blocks(blocks: &mut [Block], target: Target) -> usize {
                     removed += remove_blocks(&mut cell.blocks, target);
                 }
             }
+            // A body-level range marker (one before a table) is a raw block.
+            // An emptied block stays, as an empty one, so the block paths
+            // the editor holds keep pointing where they did.
+            Block::Raw(raw) if target == Target::CommentMarkers => {
+                let (out, n) = strip_markers(raw);
+                if n > 0 {
+                    *raw = if out.trim().is_empty() {
+                        String::new()
+                    } else {
+                        out
+                    };
+                    removed += n;
+                }
+            }
             Block::SectionProperties(_) | Block::Raw(_) => {}
         }
     }
@@ -122,9 +214,30 @@ fn remove_blocks(blocks: &mut [Block], target: Target) -> usize {
 }
 
 fn remove_inlines(content: &mut Vec<Inline>, target: Target) -> usize {
-    let before = content.len();
-    content.retain(|inline| !target.matches(inline));
-    let mut removed = before - content.len();
+    let mut removed = 0;
+    content.retain_mut(|inline| {
+        if target.matches(inline) {
+            removed += 1;
+            return false;
+        }
+        if target != Target::CommentMarkers {
+            return true;
+        }
+        let plain_raw = matches!(inline, Inline::Raw(_));
+        let Some(raw) = marker_raw_mut(inline) else {
+            return true;
+        };
+        let (out, n) = strip_markers(raw);
+        if n == 0 {
+            return true;
+        }
+        removed += n;
+        if plain_raw && is_leftover(&out) {
+            return false;
+        }
+        *raw = out;
+        true
+    });
     for inline in content.iter_mut() {
         match inline {
             Inline::Hyperlink(h) => {
@@ -147,12 +260,48 @@ fn remove_inlines(content: &mut Vec<Inline>, target: Target) -> usize {
                 }
                 removed += inside;
             }
-            // A text box's `txbxContent` is always rewritten from `blocks`.
-            Inline::TextBox { blocks, .. } => removed += remove_blocks(blocks, target),
+            Inline::TextBox { raw, blocks } => {
+                let inside = remove_blocks(blocks, target);
+                if inside > 0 {
+                    sync_text_box_copies(raw, blocks);
+                }
+                removed += inside;
+            }
             _ => {}
         }
     }
     removed
+}
+
+/// Save splices a text box's `blocks` into the first `w:txbxContent` of its
+/// `raw` only. Word 2010+ writes a shape twice, a DrawingML `mc:Choice` and
+/// a VML `mc:Fallback`, each with its own `w:txbxContent`; this rewrites the
+/// later copies from `blocks` too, so a removal reaches the copy an older
+/// reader shows. A copy nested in the first one's content is left alone:
+/// the save's own splice does not handle that shape either.
+fn sync_text_box_copies(raw: &mut String, blocks: &[Block]) {
+    const NAME: &str = "w:txbxContent";
+    let Some((first_start, first_end, _)) = find_element(raw, NAME, 0) else {
+        return;
+    };
+    if raw[first_start + 1..first_end].contains(&format!("<{NAME}")) {
+        return;
+    }
+    let inner = crate::serialize::blocks_to_xml(blocks);
+    let mut from = first_end;
+    while let Some((start, end, _)) = find_element(raw, NAME, from) {
+        let Some(head_len) = tag_end(&raw[start..]) else {
+            return;
+        };
+        let head = raw[start..start + head_len].to_string();
+        if head.ends_with("/>") {
+            from = end;
+            continue;
+        }
+        let copy = format!("{head}{inner}</{NAME}>");
+        raw.replace_range(start..end, &copy);
+        from = start + copy.len();
+    }
 }
 
 /// Hidden runs, tabs and breaks in the body (see [`is_hidden`]).
@@ -447,6 +596,115 @@ mod tests {
         assert!(!xml.contains("comment"), "{xml}");
         assert!(xml.contains("w:bookmarkStart"), "other raw kept: {xml}");
         assert_eq!(xml.matches("keep").count(), 6, "{xml}");
+    }
+
+    /// Review r1 C1: a marker shares its raw XML with visible content. Only
+    /// the marker goes, through removal and save.
+    #[test]
+    fn inspect_comment_removal_keeps_text_sharing_raw_with_a_marker() {
+        let body = "<w:p><w:r><w:t>hello</w:t><w:commentReference w:id=\"0\"/></w:r></w:p>\
+            <w:p><w:customXml w:element=\"note\"><w:commentRangeStart w:id=\"1\"/>\
+            <w:r><w:t>Body text</w:t></w:r><w:commentRangeEnd w:id=\"1\"/></w:customXml></w:p>\
+            <w:p><w:r><w:rPr><w:rStyle w:val=\"CommentReference\"/></w:rPr>\
+            <w:commentReference w:id=\"2\"/></w:r>\
+            <w:r><w:t>after</w:t></w:r></w:p>";
+        let mut doc = parse(body);
+        assert_eq!(count_blocks(&doc.body, Target::CommentMarkers), 4);
+        assert_eq!(remove_all_comment_markers(&mut doc), 4);
+        assert!(!has_comment_markers(&doc));
+        let xml = document_to_xml(&doc);
+        assert!(!xml.contains("comment"), "{xml}");
+        for kept in ["hello", "Body text", "w:customXml", "after"] {
+            assert!(xml.contains(kept), "{kept}: {xml}");
+        }
+        // The run that held only the reference is gone, not left empty.
+        assert!(!xml.contains("CommentReference"), "{xml}");
+    }
+
+    /// Review r1 m1: markers in a body-level raw block, inside a move and
+    /// inside a field's raw XML are found and removed.
+    #[test]
+    fn inspect_removes_markers_in_raw_blocks_moves_and_fields() {
+        let body = "<w:commentRangeStart w:id=\"0\"/>\
+            <w:tbl><w:tr><w:tc><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>\
+            <w:commentRangeEnd w:id=\"0\"/>\
+            <w:p><w:moveTo w:id=\"3\" w:author=\"A\"><w:commentRangeStart w:id=\"1\"/>\
+            <w:r><w:t>moved</w:t></w:r><w:commentRangeEnd w:id=\"1\"/></w:moveTo></w:p>\
+            <w:p><w:fldSimple w:instr=\" PAGE \"><w:commentRangeStart w:id=\"2\"/>\
+            <w:r><w:t>7</w:t></w:r><w:commentRangeEnd w:id=\"2\"/></w:fldSimple></w:p>";
+        let mut doc = parse(body);
+        // The shapes under test: a raw block, a move record, a field.
+        assert!(matches!(&doc.body[0], Block::Raw(r) if r.contains("commentRangeStart")));
+        let inlines: Vec<&Inline> = doc
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => Some(&p.content),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(inlines.iter().any(|i| matches!(
+            i,
+            Inline::UnsupportedRevision { raw, .. } if raw.contains("commentRangeStart")
+        )));
+        assert!(inlines.iter().any(|i| matches!(
+            i,
+            Inline::Field { raw, .. } if raw.contains("commentRangeStart")
+        )));
+        assert!(has_comment_markers(&doc));
+        let found = count_blocks(&doc.body, Target::CommentMarkers);
+        assert_eq!(remove_all_comment_markers(&mut doc), found);
+        assert!(!has_comment_markers(&doc));
+        let xml = document_to_xml(&doc);
+        assert!(!xml.contains("comment"), "{xml}");
+        for kept in ["cell", "moved", "w:moveTo", "PAGE"] {
+            assert!(xml.contains(kept), "{kept}: {xml}");
+        }
+    }
+
+    /// A Word 2010+ text box: a DrawingML choice and a VML fallback, each
+    /// with its own copy of the content.
+    fn two_copy_text_box(content: &str) -> String {
+        format!(
+            "<w:p><w:r><mc:AlternateContent><mc:Choice Requires=\"wps\"><w:drawing><wps:txbx>\
+             <w:txbxContent>{content}</w:txbxContent></wps:txbx></w:drawing></mc:Choice>\
+             <mc:Fallback><w:pict><v:shape><v:textbox><w:txbxContent>{content}</w:txbxContent>\
+             </v:textbox></v:shape></w:pict></mc:Fallback></mc:AlternateContent></w:r></w:p>"
+        )
+    }
+
+    /// Review r1 m2: removal reaches the fallback copy of a text box too.
+    #[test]
+    fn inspect_removal_reaches_a_text_box_fallback_copy() {
+        let hidden = two_copy_text_box(&format!("<w:p>{VISIBLE}{HIDDEN}</w:p>"));
+        let mut doc = parse(&hidden);
+        assert_eq!(count_hidden_runs(&doc), 1);
+        assert_eq!(remove_hidden_text(&mut doc), 1);
+        let xml = document_to_xml(&doc);
+        assert!(!xml.contains("gone"), "{xml}");
+        assert_eq!(xml.matches("keep").count(), 2, "both copies keep: {xml}");
+        assert!(xml.contains("<mc:Fallback>"), "{xml}");
+
+        let marked = two_copy_text_box(&format!(
+            "<w:p><w:commentRangeStart w:id=\"4\"/>{VISIBLE}<w:commentRangeEnd w:id=\"4\"/></w:p>"
+        ));
+        let mut doc = parse(&marked);
+        assert!(remove_all_comment_markers(&mut doc) > 0);
+        assert!(!has_comment_markers(&doc));
+        let xml = document_to_xml(&doc);
+        assert!(!xml.contains("comment"), "{xml}");
+        assert_eq!(xml.matches("keep").count(), 2, "{xml}");
+    }
+
+    #[test]
+    fn leftover_is_only_nothing_or_a_bare_run() {
+        assert!(is_leftover("  "));
+        assert!(is_leftover("<w:r></w:r>"));
+        assert!(is_leftover("<w:r><w:rPr><w:b/></w:rPr></w:r>"));
+        assert!(!is_leftover("<w:r><w:t>x</w:t></w:r>"));
+        assert!(!is_leftover("<w:r></w:r><w:r><w:t>x</w:t></w:r>"));
+        assert!(!is_leftover("<w:customXml w:element=\"e\"></w:customXml>"));
     }
 
     #[test]
