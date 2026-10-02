@@ -5932,13 +5932,7 @@ fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
                 edits: removed.edits.clone(),
                 sheet: r.sheet,
                 sheet_name: wb.sheets.get(r.sheet)?.name.clone(),
-                info: crate::formula::TableInfo {
-                    sheet: r.sheet,
-                    range: r.range,
-                    header_rows: r.header_rows,
-                    totals_rows: r.totals_rows,
-                    columns: r.columns.clone(),
-                },
+                info: r.info(),
             })
         })
         .collect();

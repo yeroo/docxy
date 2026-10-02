@@ -1539,6 +1539,19 @@ impl Table {
             .map(|i| self.range.1 + i as u32)
     }
 
+    /// The table's geometry as the evaluator and the structured-reference
+    /// rewrites read it: the one conversion they all share, so Convert to
+    /// Range and the save convert references alike.
+    pub fn info(&self) -> crate::formula::TableInfo {
+        crate::formula::TableInfo {
+            sheet: self.sheet,
+            range: self.range,
+            header_rows: self.header_rows,
+            totals_rows: self.totals_rows,
+            columns: self.columns.clone(),
+        }
+    }
+
     pub fn contains(&self, sheet: usize, row: u32, col: u32) -> bool {
         sheet == self.sheet
             && row >= self.range.0

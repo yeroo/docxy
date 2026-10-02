@@ -2031,13 +2031,7 @@ pub fn convert_table_to_range(wb: &mut Workbook, name: &str) -> Result<(), Strin
     if let Some(dn) = wb.defined_names.iter().find(|d| iterates(&d.formula)) {
         return Err(format!("The name {} iterates this table", dn.name));
     }
-    let info = crate::formula::TableInfo {
-        sheet: t.sheet,
-        range: t.range,
-        header_rows: t.header_rows,
-        totals_rows: t.totals_rows,
-        columns: t.columns.clone(),
-    };
+    let info = t.info();
     let sheet_name = wb.sheets[t.sheet].name.clone();
     let target = crate::formula::TableToRange {
         name: &t.name,
