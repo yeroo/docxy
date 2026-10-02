@@ -24,6 +24,7 @@ compile_error!(
 
 mod close;
 mod control;
+mod cover_page;
 mod crashlog;
 mod design_dialogs;
 mod design_tab;
@@ -18310,6 +18311,10 @@ enum Act {
     AutoHideRibbon,
     InsertField,
     PageBreak,
+    /// Insert › Blank Page: two page breaks at the body caret (#652).
+    BlankPage,
+    /// An Insert › Cover Page menu command (#652).
+    Cover(cover_page::CoverAct),
     ToggleNotes,
     InsertTable,
     InsertSymbol,
@@ -18581,13 +18586,7 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
             "Insert",
             "N",
             vec![
-                rs::group(
-                    "Pages",
-                    40,
-                    vec![Control::Large(
-                        cmdt("pagebreak", "rule", "Page Break", PageBreak, "").key("B"),
-                    )],
-                ),
+                rs::group("Pages", 40, cover_page::pages_group()),
                 rs::group(
                     "Tables",
                     35,
@@ -21068,6 +21067,7 @@ impl Docxy {
                         label: cmd.label.into(),
                     },
                     match (layout_tab::menu_of(cmd.id), cmd.act) {
+                        (_, Act::Cover(_)) => cover_page::menu_items(self.tabs.get(self.active)),
                         (_, Act::InsertTable) => table_tab::insert_table_menu(
                             self.edit_target_ref()
                                 .is_some_and(|e| e.has_selection() && e.cell_range().is_none()),
@@ -21443,6 +21443,8 @@ impl Docxy {
                 self.refocus(window, cx);
             }
             PageBreak => self.insert_page_break(window, cx),
+            BlankPage => self.insert_blank_page(window, cx),
+            Cover(act) => self.cover_act(act, window, cx),
             ToggleNotes => {
                 self.show_notes = !self.show_notes;
                 self.refocus(window, cx);
@@ -21500,9 +21502,9 @@ impl Docxy {
                 Project(_) | Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find
                 | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide
                 | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField
-                | PageBreak | ToggleNotes | InsertTable | InsertSymbol | InsertEquation
-                | LineSpacing | Hf(_) | Design(_) | Layout(_) | Mail(_) | Table(_)
-                | PrintLayout | ToggleRuler => {}
+                | PageBreak | BlankPage | Cover(_) | ToggleNotes | InsertTable | InsertSymbol
+                | InsertEquation | LineSpacing | Hf(_) | Design(_) | Layout(_) | Mail(_)
+                | Table(_) | PrintLayout | ToggleRuler => {}
             }),
         }
     }
@@ -23342,6 +23344,12 @@ impl Docxy {
     pub(crate) fn act_enabled_now(&self, act: Act) -> bool {
         if let Act::Design(a) = act {
             return design_tab::design_enabled(self.tabs.get(self.active), a);
+        }
+        if let Act::Cover(a) = act {
+            return cover_page::cover_enabled(self.tabs.get(self.active), a);
+        }
+        if matches!(act, Act::BlankPage) {
+            return cover_page::blank_page_enabled(self.tabs.get(self.active));
         }
         if let Act::Mail(a) = act {
             return self

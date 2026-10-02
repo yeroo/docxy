@@ -709,7 +709,7 @@ fn parse_sdt_block(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Block>
 }
 
 /// The closing boundary for a preserved block-level content control.
-const SDT_BLOCK_CLOSE: &str = "</w:sdtContent></w:sdt>";
+pub(crate) const SDT_BLOCK_CLOSE: &str = "</w:sdtContent></w:sdt>";
 
 /// Whether a `Block::Raw` is a content-control wrapper boundary (produced by
 /// [`parse_sdt_block`]) rather than real embedded content — such boundaries
@@ -1120,6 +1120,26 @@ fn parse_inline_sdt(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inlin
     // `parse_sdt_block`): keep the wrapper as one self-contained boundary.
     if !saw_content {
         out.push(Inline::Raw(format!("<w:sdt>{props}</w:sdt>")));
+    }
+}
+
+/// The run properties a content control declares for its content
+/// (`w:sdtPr/w:rPr`), read from its opening boundary. `None` when it has none.
+pub(crate) fn sdt_run_props(open: &str) -> Option<RunProps> {
+    let (a, b) = crate::sect::find_element(open, "w:sdtPr")?;
+    let sdt_pr = &open[a..b];
+    let (c, d) = crate::sect::find_element(sdt_pr, "w:rPr")?;
+    let mut p = XmlParser::new(&sdt_pr[c..d]);
+    let mut props = RunProps::default();
+    loop {
+        match p.next() {
+            Event::Start if p.name() == "w:rPr" => {
+                parse_rpr(&mut p, &mut props);
+                return Some(props);
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
     }
 }
 

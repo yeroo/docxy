@@ -378,6 +378,14 @@
   var BROWSER_UNSUPPORTED = {
     InsertTable: NOT_YET,
     PageBreak: NOT_YET,
+    // Insert > Pages: Cover Page and Blank Page (#652).
+    BlankPage: NOT_YET,
+    'Cover(Design(0))': NOT_YET,
+    'Cover(Design(1))': NOT_YET,
+    'Cover(Design(2))': NOT_YET,
+    'Cover(Design(3))': NOT_YET,
+    'Cover(Menu)': NOT_YET,
+    'Cover(Remove)': NOT_YET,
     InsertField: NOT_YET,
     InsertEquation: NOT_YET,
     // The table tabs and Insert > Table's items (#646-#648).

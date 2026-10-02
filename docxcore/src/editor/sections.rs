@@ -8,7 +8,7 @@
 //! in. Every edit here is one undo step on the editor's document, which is
 //! what the page view and Save read.
 
-use super::{Caret, EditKind, Editor, resolve_para, split_content, tab_props_at};
+use super::{Caret, EditKind, Editor, resolve_para, split_paragraph_content, tab_props_at};
 use crate::model::{Block, BreakKind, Inline, Paragraph, SectionProperties};
 use crate::sect::{SectionSetup, SectionStart};
 
@@ -16,7 +16,7 @@ use super::Clip;
 
 /// Where one section's properties live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SectAt {
+pub(super) enum SectAt {
     /// The `section_break` of the body paragraph at this index.
     Para(usize),
     /// The body-level trailing section properties.
@@ -27,7 +27,7 @@ enum SectAt {
 const EMPTY_SECT: &str = "<w:sectPr></w:sectPr>";
 
 impl Editor {
-    fn section_slots(&self) -> Vec<SectAt> {
+    pub(super) fn section_slots(&self) -> Vec<SectAt> {
         let mut out: Vec<SectAt> = self
             .doc
             .body
@@ -51,7 +51,7 @@ impl Editor {
             .collect()
     }
 
-    fn sect_raw(&self, at: SectAt) -> &str {
+    pub(super) fn sect_raw(&self, at: SectAt) -> &str {
         match at {
             SectAt::Para(i) => match &self.doc.body[i] {
                 Block::Paragraph(p) => p.props.section_break.as_deref().unwrap_or(EMPTY_SECT),
@@ -153,7 +153,7 @@ impl Editor {
         })
     }
 
-    fn set_sect_raw(&mut self, at: SectAt, raw: String) {
+    pub(super) fn set_sect_raw(&mut self, at: SectAt, raw: String) {
         match at {
             SectAt::Para(i) => {
                 if let Some(Block::Paragraph(p)) = self.doc.body.get_mut(i) {
@@ -208,7 +208,7 @@ impl Editor {
         let Some(Block::Paragraph(p)) = self.doc.body.get_mut(block) else {
             return Err("A section break needs the caret in a paragraph".into());
         };
-        let right = split_content(&mut p.content, self.caret.offset);
+        let right = split_paragraph_content(&mut p.content, self.caret.offset);
         let second = Paragraph {
             props: p.props.clone(),
             content: right,
