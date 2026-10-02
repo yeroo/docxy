@@ -63,12 +63,12 @@ fn issue_book() -> SheetView {
 
 fn copy(v: &mut SheetView, from: &str, to: &str) -> GridClip {
     select(v, from, to);
-    v.grid_clip(false)
+    v.grid_clip(false).expect("something to copy")
 }
 
 fn cut(v: &mut SheetView, from: &str, to: &str) -> GridClip {
     select(v, from, to);
-    v.grid_clip(true)
+    v.grid_clip(true).expect("something to cut")
 }
 
 // ---- 1. a copy tiles over a paste area of whole copies ---------------------
@@ -377,10 +377,11 @@ fn a_cut_pasted_in_another_workbook_is_a_copy() {
 #[test]
 fn a_cut_off_a_protected_sheet_is_a_copy() {
     let mut v = issue_book();
-    let clip = cut(&mut v, "A1", "B1");
-    // Protected without an undo step (as a direct path would): the content
-    // check still holds, and the move would edit a locked sheet.
+    // Cut off a sheet that is already protected: the move would edit a
+    // locked sheet. (Protecting it after the cut is an edit, which cancels
+    // the cut instead.)
     v.pkg.workbook.sheets[0].set_protected(true);
+    let clip = cut(&mut v, "A1", "B1");
     select(&mut v, "A10", "A10");
     assert!(matches!(
         v.paste_grid_clip(&clip),
@@ -440,4 +441,104 @@ fn a_cut_of_a_filtered_range_moves_every_row() {
     let mut v = filtered_book();
     let clip = cut(&mut v, "A1", "B6");
     assert_eq!(clip.rows, [0, 1, 2, 3, 4, 5]);
+}
+
+// ---- r1 review: the grid's edge, edits ending copy mode, empty copies -------
+
+#[test]
+fn a_cut_that_would_run_past_the_grids_edge_is_refused_and_stays_live() {
+    let mut v = view();
+    put(&mut v, "A1", Cell::number(1.0));
+    put(&mut v, "A2", Cell::number(2.0));
+    put(&mut v, "H1", Cell::formula("A2"));
+    let clip = cut(&mut v, "A1", "A2");
+    let before = v.sheet().cells.clone();
+    // The last row: A2 would land one row past it.
+    let last = gridcore::sheet::MAX_ROWS - 1;
+    v.sel = (last, 0);
+    v.anchor = (last, 0);
+    assert_eq!(
+        v.paste_grid_clip(&clip),
+        Err(GridPasteError::Refused(PAST_THE_EDGE.into()))
+    );
+    assert_eq!(v.sheet().cells, before);
+    assert!(v.undo.is_empty());
+    // Past the last column too.
+    let edge = gridcore::sheet::MAX_COLS - 1;
+    let clip_wide = cut(&mut v, "A1", "B1");
+    v.sel = (0, edge);
+    v.anchor = (0, edge);
+    assert_eq!(
+        v.paste_grid_clip(&clip_wide),
+        Err(GridPasteError::Refused(PAST_THE_EDGE.into()))
+    );
+    // Still live: it moves to A10.
+    select(&mut v, "A10", "A10");
+    assert_eq!(v.paste_grid_clip(&clip), Ok(GridPasted::Done));
+    assert_eq!(formula(&v, "H1").as_deref(), Some("A11"));
+    assert_eq!(value(&v, "H1"), CellValue::Number(2.0));
+}
+
+#[test]
+fn an_edit_in_its_own_workbook_ends_copy_mode() {
+    let mut v = issue_book();
+    let clip = copy(&mut v, "A1", "A3");
+    assert!(!clip.stale_in(&v));
+    // Click C1, type 5, Enter: Enter would now move, not paste.
+    select(&mut v, "C1", "C1");
+    v.begin_cell_edit(Some("5".into()));
+    assert_eq!(v.commit_and_move(1, 0), Some(true));
+    assert!(clip.stale_in(&v));
+    // Another workbook's edits don't count.
+    let mut other = view();
+    put(&mut other, "A1", Cell::number(1.0));
+    other.push_undo();
+    let fresh = copy(&mut v, "A1", "A3");
+    assert!(!fresh.stale_in(&other));
+    assert!(!fresh.stale_in(&v));
+}
+
+#[test]
+fn a_copy_pasted_into_its_own_workbook_stays_in_copy_mode() {
+    let mut v = issue_book();
+    let mut clip = copy(&mut v, "B1", "B2");
+    select(&mut v, "E1", "E1");
+    assert_eq!(v.paste_grid_clip(&clip), Ok(GridPasted::Done));
+    // The paste's own undo step would read as an edit; the restamp says not.
+    assert!(clip.stale_in(&v));
+    clip.restamp(&v);
+    assert!(!clip.stale_in(&v));
+    select(&mut v, "F1", "F1");
+    assert_eq!(v.paste_grid_clip(&clip), Ok(GridPasted::Done));
+    assert_eq!(formula(&v, "F1").as_deref(), Some("E1*10"));
+    // A paste into another workbook leaves the stamp alone.
+    let mut other = view();
+    let gen_before = clip.view_gen;
+    other.push_undo();
+    clip.restamp(&other);
+    assert_eq!(clip.view_gen, gen_before);
+}
+
+#[test]
+fn an_edit_after_a_cut_makes_it_stale_for_enter() {
+    let mut v = issue_book();
+    let clip = cut(&mut v, "A1", "B1");
+    select(&mut v, "C1", "C1");
+    v.begin_cell_edit(Some("5".into()));
+    assert_eq!(v.commit_and_move(1, 0), Some(true));
+    assert!(clip.stale_in(&v), "Enter then moves; Ctrl+V pastes nothing");
+}
+
+#[test]
+fn a_copy_of_only_filtered_out_rows_is_nothing_to_copy() {
+    let mut v = filtered_book();
+    select(&mut v, "A3", "B3");
+    assert!(v.grid_clip(false).is_none());
+    // A cut of the same rows still moves them.
+    assert!(v.grid_clip(true).is_some());
+    // An empty clip pastes nothing: no undo step, not landed.
+    let empty = GridClip::default();
+    select(&mut v, "D1", "D1");
+    assert_eq!(v.paste_grid_clip(&empty), Ok(GridPasted::Nothing));
+    assert!(v.undo.is_empty());
 }

@@ -273,3 +273,64 @@ test an edit after a sheet cut cancels it
   assert cell M30 is nothing
   assert cell M20 is 5
   assert status is The cut was cancelled: the workbook changed since it was cut (nothing pasted)
+
+# #664 r1: an edit ends copy mode, as typing into a cell does in Excel, so a
+# later Enter moves instead of pasting the old clip.
+test an edit after a sheet copy ends copy mode and enter moves
+  open copy:../fixtures/basic.xlsx
+  click M20
+  type 1
+  key enter
+  click M20
+  key ctrl+c
+  click P20
+  type 5
+  key enter
+  assert sel is P21
+  key enter
+  assert sel is P22
+  assert cell P21 is nothing
+  call clipboard {"action":"read"}
+  assert reply.app.kind is none
+  click Q20
+  key ctrl+v
+  assert cell Q20 is nothing
+
+test a sheet copy pastes with ctrl+v again and again, then enter ends it
+  open copy:../fixtures/basic.xlsx
+  click M20
+  type 1
+  key enter
+  click M20
+  key ctrl+c
+  click P20
+  key ctrl+v
+  assert cell P20 is 1
+  click Q20
+  key ctrl+v
+  assert cell Q20 is 1
+  click R20
+  key enter
+  assert cell R20 is 1
+  assert sel is R20
+  call clipboard {"action":"read"}
+  assert reply.app.kind is none
+
+test an edit after a sheet cut lets enter move
+  open copy:../fixtures/basic.xlsx
+  click M20
+  type 1
+  key enter
+  click M20
+  key ctrl+x
+  click P20
+  type 5
+  key enter
+  assert sel is P21
+  key enter
+  assert sel is P22
+  click M30
+  key ctrl+v
+  assert cell M30 is nothing
+  assert cell M20 is 1
+  assert status is The cut was cancelled: the workbook changed since it was cut (nothing pasted)

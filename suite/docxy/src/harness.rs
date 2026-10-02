@@ -2354,7 +2354,8 @@ fn clipboard_app_json(
 fn clipboard_json(app: &crate::Docxy, cx: &App) -> Json {
     let now = app.clipboard_read(cx);
     let surface = app.tabs.get(app.active).map(|t| &t.surface);
-    let used = clipboard_app_json(surface, app.clip.as_ref(), app.grid_clip.as_ref(), &now);
+    // A grid clip whose workbook was edited since is over (#664).
+    let used = clipboard_app_json(surface, app.clip.as_ref(), app.grid_clip_current(), &now);
     Json::obj(vec![
         ("text", str_or_null(now.text().map(str::to_string))),
         ("app", used),

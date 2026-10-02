@@ -1276,9 +1276,10 @@ struct GridClip {
     rows: Vec<u32>,
     /// A cut: its paste moves the cells, once (#664).
     cut: bool,
-    /// The source's [`SheetView::edit_gen`] when it was cut: an edit since
-    /// cancels the cut.
-    cut_gen: u64,
+    /// The source's [`SheetView::edit_gen`] when it was taken (or last
+    /// pasted there): an edit since in its own workbook ends copy mode, as
+    /// typing into a cell does in Excel, and cancels a cut.
+    view_gen: u64,
     /// Copy mode is over (an Enter paste, a pasted cut, Esc): while the
     /// clipboard still holds `text`, a paste pastes nothing, as in Excel.
     spent: bool,
@@ -1297,6 +1298,21 @@ impl GridClip {
         self.spent && clip_still_ours(&self.text, now)
     }
 
+    /// Whether `v` is the clip's own workbook and has been edited since the
+    /// clip was taken or last pasted there ([`Self::view_gen`]): copy mode
+    /// is then over (#664). Edits in other workbooks don't count.
+    fn stale_in(&self, v: &SheetView) -> bool {
+        v.id == self.view && v.edit_gen != self.view_gen
+    }
+
+    /// After a paste of this copy into `v`: the paste's own undo step is not
+    /// an edit that ends copy mode, so a copy pastes again and again.
+    fn restamp(&mut self, v: &SheetView) {
+        if v.id == self.view {
+            self.view_gen = v.edit_gen;
+        }
+    }
+
     /// End copy mode; only the text is kept, to recognise the clipboard.
     fn spend(&mut self) {
         self.spent = true;
@@ -1310,6 +1326,8 @@ impl GridClip {
 enum GridPasted {
     /// A copy, or a cut moved.
     Done,
+    /// An empty clip: nothing was written.
+    Nothing,
     /// A cut pasted as a copy, its source kept; the status says why.
     KeptAsCopy(&'static str),
 }
@@ -1323,6 +1341,10 @@ enum GridPasteError {
     /// The workbook changed since the cut: the cut is over.
     CutCancelled,
 }
+
+/// The status of a cut whose paste would run past the sheet's edge.
+const PAST_THE_EDGE: &str =
+    "The cut cannot be pasted there: it would run past the edge of the sheet (nothing pasted)";
 
 /// The status of a cut the workbook's edits cancelled.
 const CUT_CANCELLED_STATUS: &str =
@@ -2791,14 +2813,18 @@ impl SheetView {
     /// The selection as a grid clip (Ctrl+C, Ctrl+X): its cells, and as TSV
     /// the text it puts on the clipboard. A copy leaves out the rows a filter
     /// hides, as Excel does (rows hidden by Hide are copied); a cut keeps
-    /// every row, since it moves the whole range (#664).
-    fn grid_clip(&self, cut: bool) -> GridClip {
+    /// every row, since it moves the whole range (#664). `None` when a
+    /// filter hides every selected row: there is nothing to copy.
+    fn grid_clip(&self, cut: bool) -> Option<GridClip> {
         let rect = self.range();
         let (r0, c0, r1, c1) = rect;
         let sheet = self.sheet();
         let rows: Vec<u32> = (r0..=r1)
             .filter(|&r| cut || !sheet.row_filtered(r))
             .collect();
+        if rows.is_empty() {
+            return None;
+        }
         let mut cells = Vec::with_capacity(rows.len());
         let mut tsv = String::new();
         for &r in &rows {
@@ -2821,7 +2847,7 @@ impl SheetView {
             cells.push(row);
             tsv.push('\n');
         }
-        GridClip {
+        Some(GridClip {
             cells,
             text: tsv,
             view: self.id,
@@ -2830,9 +2856,9 @@ impl SheetView {
             rect,
             rows,
             cut,
-            cut_gen: self.edit_gen,
+            view_gen: self.edit_gen,
             spent: false,
-        }
+        })
     }
 
     /// Select the block just written at `at`: the active cell at its
@@ -2874,11 +2900,12 @@ impl SheetView {
     /// Paste the grid clip `clip` over the selection (#664). A cut taken in
     /// this workbook moves its cells ([`Self::paste_move`]); anything else is
     /// a copy, tiled over the selection ([`Self::paste_copy`]). A cut from
-    /// another workbook, or off a sheet protected since, is pasted as a
-    /// copy and keeps its source.
+    /// another workbook, or off a protected sheet, is pasted as a copy and
+    /// keeps its source. (Protecting the sheet after the cut is an edit,
+    /// which cancels it.)
     fn paste_grid_clip(&mut self, clip: &GridClip) -> Result<GridPasted, GridPasteError> {
         if !clip.cut {
-            return self.paste_copy(clip).map(|()| GridPasted::Done);
+            return self.paste_copy(clip);
         }
         if clip.view != self.id {
             self.paste_copy(clip)?;
@@ -2904,12 +2931,12 @@ impl SheetView {
     /// ([`gridcore::edit::tiled_block`]); a paste area of any other shape is
     /// refused, as is one that would write more than
     /// [`gridcore::edit::MAX_PASTE_CELLS`] cells.
-    fn paste_copy(&mut self, clip: &GridClip) -> Result<(), GridPasteError> {
+    fn paste_copy(&mut self, clip: &GridClip) -> Result<GridPasted, GridPasteError> {
         use gridcore::edit::{MAX_PASTE_CELLS, PASTE_SHAPE, paste_tiles, tiled_block};
         let h = clip.cells.len() as u32;
         let w = clip.cells.iter().map(Vec::len).max().unwrap_or(0) as u32;
         if h == 0 || w == 0 {
-            return Ok(());
+            return Ok(GridPasted::Nothing);
         }
         let sel = self.range();
         let used = self.sheet().used_size();
@@ -2923,7 +2950,7 @@ impl SheetView {
         }
         let at = (sel.0, sel.1);
         let block = tiled_block(&clip.cells, &clip.rows, clip.rect.1, at, tiles);
-        self.write_block(at, &block)
+        self.write_block(at, &block).map(|()| GridPasted::Done)
     }
 
     /// Whether the cut `clip` still names the cells it was cut from: nothing
@@ -2932,7 +2959,7 @@ impl SheetView {
     /// there still hold what was cut (formula text, constant, style; not a
     /// recalculated value).
     fn cut_still_live(&self, clip: &GridClip) -> bool {
-        if clip.cut_gen != self.edit_gen {
+        if clip.view_gen != self.edit_gen {
             return false;
         }
         let Some(sheet) = self.pkg.workbook.sheets.get(clip.sheet) else {
@@ -2961,7 +2988,8 @@ impl SheetView {
     /// follows it ([`gridcore::edit::move_refs`]), and the moved cells' own
     /// references to cells outside the cut keep reading them
     /// ([`gridcore::formula::move_block_formula`]). One undo step; refused
-    /// whole, before anything changes, when it would change part of an array.
+    /// whole, before anything changes, when it would change part of an array
+    /// or run past the sheet's edge.
     fn paste_move(&mut self, clip: &GridClip) -> Result<(), GridPasteError> {
         use gridcore::sheet::{Cell, MAX_COLS, MAX_ROWS, is_array_f};
         let (fr0, fc0, fr1, fc1) = clip.rect;
@@ -2972,6 +3000,13 @@ impl SheetView {
                 gridcore::edit::PASTE_SHAPE.to_string(),
             ));
         }
+        // Moved whole or not at all: a block cut short at the edge would
+        // leave cells behind while the references to them moved.
+        if u64::from(r0) + u64::from(h) > u64::from(MAX_ROWS)
+            || u64::from(c0) + u64::from(w) > u64::from(MAX_COLS)
+        {
+            return Err(GridPasteError::Refused(PAST_THE_EDGE.to_string()));
+        }
         let (src, dst) = (clip.sheet, self.active);
         let dst_name = self.pkg.workbook.sheets[dst].name.clone();
         let mv = gridcore::formula::CellMove {
@@ -2981,22 +3016,13 @@ impl SheetView {
             dr: i64::from(r0) - i64::from(fr0),
             dc: i64::from(c0) - i64::from(fc0),
         };
-        // The cells as the source holds them now, their formulas moved; a
-        // cell pushed off the grid's edge isn't written, so its source stays.
+        // The cells as the source holds them now, their formulas moved.
         let sheet = &self.pkg.workbook.sheets[src];
         let mut block = Vec::new();
         let mut clears = Vec::new();
-        for (i, r) in (fr0..=fr1).enumerate() {
-            let tr = r0 + i as u32;
-            if tr >= MAX_ROWS {
-                break;
-            }
+        for r in fr0..=fr1 {
             let mut row = Vec::new();
-            for (j, c) in (fc0..=fc1).enumerate() {
-                let tc = c0 + j as u32;
-                if tc >= MAX_COLS {
-                    break;
-                }
+            for c in fc0..=fc1 {
                 let mut cell = sheet.cell(r, c).cloned().unwrap_or_default();
                 // A formula held verbatim (a shared one) keeps its text.
                 let verbatim = cell.f_attrs.as_deref().is_some_and(|a| !is_array_f(a));
@@ -12268,7 +12294,14 @@ impl Docxy {
         if cut && (self.protected_refused(cx) || self.sheet_clear_refused(cx)) {
             return;
         }
-        let Some(mut clip) = self.active_sheet().map(|v| v.grid_clip(cut)) else {
+        let Some(v) = self.active_sheet() else {
+            return;
+        };
+        // A filter hiding every selected row leaves nothing to copy; the
+        // clipboard and copy mode stay as they were.
+        let Some(mut clip) = v.grid_clip(cut) else {
+            self.set_status("Nothing to copy: a filter hides every selected row");
+            cx.notify();
             return;
         };
         clip.text = self.clipboard_write_recorded(std::mem::take(&mut clip.text), cx);
@@ -12276,9 +12309,34 @@ impl Docxy {
         cx.notify();
     }
 
-    /// The grid clip the next paste takes, if any ([`GridClip::live`]).
+    /// The grid clip the next paste takes, if any: copy mode is on, the
+    /// clipboard still holds its text ([`GridClip::live`]), and its own
+    /// workbook has not been edited since ([`Self::grid_clip_current`]).
     fn grid_clip_live(&self, now: &ClipRead) -> Option<&GridClip> {
-        self.grid_clip.as_ref().filter(|clip| clip.live(now))
+        self.grid_clip_current().filter(|clip| clip.live(now))
+    }
+
+    /// The grid clip unless its own workbook has been edited since it was
+    /// taken, which ends copy mode as typing into a cell does in Excel.
+    fn grid_clip_current(&self) -> Option<&GridClip> {
+        self.grid_clip.as_ref().filter(|clip| {
+            !self.tabs.iter().any(|t| match &t.surface {
+                Surface::Sheet(v) => clip.stale_in(v),
+                _ => false,
+            })
+        })
+    }
+
+    /// Spend a clip whose workbook has been edited since
+    /// ([`Self::grid_clip_current`]); true when that cancelled a cut.
+    fn grid_clip_expire(&mut self) -> bool {
+        let live = self.grid_clip.as_ref().is_some_and(|clip| !clip.spent);
+        if !live || self.grid_clip_current().is_some() {
+            return false;
+        }
+        let cut = self.grid_clip.as_ref().is_some_and(|clip| clip.cut);
+        self.grid_clip_spend();
+        cut
     }
 
     /// End copy mode (Esc, an Enter paste, a pasted cut).
@@ -12297,18 +12355,29 @@ impl Docxy {
         if self.sheet_protected() || self.protected_refused(cx) {
             return false;
         }
+        let cut_cancelled = self.grid_clip_expire();
         let now = self.clipboard_read(cx);
         if let Some(clip) = self.grid_clip_live(&now).cloned() {
             let Some(v) = self.active_sheet_mut() else {
                 return false;
             };
             let res = v.paste_grid_clip(&clip);
-            let landed = res.is_ok();
+            let landed = matches!(res, Ok(GridPasted::Done | GridPasted::KeptAsCopy(_)));
+            // Copy mode stays on after a Ctrl+V: the paste's own undo step
+            // does not end it.
+            if landed && !clip.cut {
+                if let Some(mut ours) = self.grid_clip.take() {
+                    if let Some(v) = self.active_sheet() {
+                        ours.restamp(v);
+                    }
+                    self.grid_clip = Some(ours);
+                }
+            }
             // A cut pastes once; a cancelled one is over too. A refused paste
             // keeps it, to paste somewhere else.
             let over = clip.cut && !matches!(res, Err(GridPasteError::Refused(_)));
             match res {
-                Ok(GridPasted::Done) => {}
+                Ok(GridPasted::Done | GridPasted::Nothing) => {}
                 Ok(GridPasted::KeptAsCopy(why)) => self.set_status(why),
                 Err(GridPasteError::Refused(why)) => self.set_status(why),
                 Err(GridPasteError::CutCancelled) => self.set_status(CUT_CANCELLED_STATUS),
@@ -12327,6 +12396,10 @@ impl Docxy {
             .as_ref()
             .is_some_and(|clip| clip.spent_here(&now))
         {
+            if cut_cancelled {
+                self.set_status(CUT_CANCELLED_STATUS);
+                cx.notify();
+            }
             return false;
         }
         let ClipRead::Text(text) = now else {
@@ -12376,8 +12449,13 @@ impl Docxy {
     /// Enter on the grid, not editing, while copy mode is on: paste over the
     /// selection and end copy mode, as Excel does (#664). A refused paste
     /// keeps copy mode. False (Enter moves as usual) when there is no clip
-    /// to paste.
+    /// to paste, an edit having ended copy mode included.
     fn sheet_enter_paste(&mut self, cx: &mut Context<Self>) -> bool {
+        // An edit since the copy ended copy mode: Enter moves (and says so
+        // when that was a cut).
+        if self.grid_clip_expire() {
+            self.set_status(CUT_CANCELLED_STATUS);
+        }
         let now = self.clipboard_read(cx);
         if self.grid_clip_live(&now).is_none() {
             return false;
