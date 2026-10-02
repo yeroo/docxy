@@ -90,6 +90,13 @@ impl PairExclusions {
                 new_tasks_mode: true,
                 ..Self::default()
             },
+            Some("x-status") => Self {
+                // Project regenerated task GUIDs between the .mpp save and the XML
+                // export: 1 of the XML's 25 GUIDs occurs in the binary (x-status-nodate's
+                // 25 all do). The binary-vs-imported GUID check still runs.
+                guid: true,
+                ..Self::default()
+            },
             Some("x-overallocated") => Self {
                 guid: true,
                 root_name: true,
