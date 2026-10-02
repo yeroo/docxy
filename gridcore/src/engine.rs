@@ -1810,29 +1810,28 @@ impl<T: Copy + Ord> RectIndex<T> {
         Self { by_row, by_col }
     }
 
+    /// The band `in_rect` walks for this rectangle — the narrower of the row
+    /// band and the column band (the row band on ties) — with the minor-key
+    /// bounds for filtering it.
+    fn chosen_band(&self, r1: u32, c1: u32, r2: u32, c2: u32) -> (&[(u32, u32, T)], u32, u32) {
+        let row_band = band(&self.by_row, r1, r2);
+        let col_band = band(&self.by_col, c1, c2);
+        if col_band.len() < row_band.len() {
+            (col_band, r1, r2) // minor key is the row
+        } else {
+            (row_band, c1, c2) // minor key is the col
+        }
+    }
+
     /// The payloads inside the inclusive rectangle rows `r1..=r2`, cols
     /// `c1..=c2`, from whichever order's band is narrower (the row band on
     /// ties), filtered by the minor key.
     fn in_rect(&self, r1: u32, c1: u32, r2: u32, c2: u32) -> impl Iterator<Item = &T> {
-        let row_band = band(&self.by_row, r1, r2);
-        let col_band = band(&self.by_col, c1, c2);
-        let (slice, lo, hi) = if col_band.len() < row_band.len() {
-            (col_band, r1, r2) // minor key is the row
-        } else {
-            (row_band, c1, c2) // minor key is the col
-        };
+        let (slice, lo, hi) = self.chosen_band(r1, c1, r2, c2);
         slice
             .iter()
             .filter(move |&&(_, m, _)| m >= lo && m <= hi)
             .map(|(_, _, p)| p)
-    }
-
-    /// The number of entries a query for this rectangle would walk.
-    #[cfg(test)]
-    fn band_len(&self, r1: u32, c1: u32, r2: u32, c2: u32) -> usize {
-        band(&self.by_row, r1, r2)
-            .len()
-            .min(band(&self.by_col, c1, c2).len())
     }
 }
 
@@ -3650,8 +3649,9 @@ mod tests {
 
     #[test]
     fn formulas_reading_tall_rect_ignores_other_columns() {
-        // #878: a tall rect (A1:A1000) walks only the seeds in its row band;
-        // seeds in other columns don't match, one inside the column does.
+        // #878: a tall rect (A1:A1000) walks only the narrower of its row and
+        // column bands; seeds in other columns don't match, one inside the
+        // column does.
         let mut wb = wb_one_sheet(&[("C1", Cell::formula("SUM(A1:A1000)"))]);
         let mut eng = Engine::new(&wb);
         eng.recalc_all(&mut wb);
@@ -3671,29 +3671,31 @@ mod tests {
         // the narrower band — not every indexed cell in the row band.
         let col_b: Vec<(u32, u32, ())> = (0..10_000u32).map(|r| (r, 1, ())).collect();
         let idx = RectIndex::new(col_b);
-        // A1:A1048576 — every row, column A only; no entry is in it.
+        // A1:A1048576 — every row, column A only; no entry is in it, and the
+        // chosen band (which `in_rect` walks) is the empty column band.
         let tall = (0, 0, crate::sheet::MAX_ROWS - 1, 0);
-        assert_eq!(idx.band_len(tall.0, tall.1, tall.2, tall.3), 0);
+        assert_eq!(idx.chosen_band(tall.0, tall.1, tall.2, tall.3).0.len(), 0);
         assert!(idx.in_rect(tall.0, tall.1, tall.2, tall.3).next().is_none());
 
         let row_2: Vec<(u32, u32, ())> = (0..10_000u32).map(|c| (1, c, ())).collect();
         let idx = RectIndex::new(row_2);
-        // Row 1 across every column; no entry is in it.
+        // Row 1 across every column; no entry is in it, and the chosen band
+        // is the empty row band.
         let wide = (0, 0, 0, crate::sheet::MAX_COLS - 1);
-        assert_eq!(idx.band_len(wide.0, wide.1, wide.2, wide.3), 0);
+        assert_eq!(idx.chosen_band(wide.0, wide.1, wide.2, wide.3).0.len(), 0);
         assert!(idx.in_rect(wide.0, wide.1, wide.2, wide.3).next().is_none());
 
         // One entry inside each rect: the walk covers exactly it.
         let mut col_b: Vec<(u32, u32, ())> = (0..10_000u32).map(|r| (r, 1, ())).collect();
         col_b.push((699, 0, ()));
         let idx = RectIndex::new(col_b);
-        assert_eq!(idx.band_len(tall.0, tall.1, tall.2, tall.3), 1);
+        assert_eq!(idx.chosen_band(tall.0, tall.1, tall.2, tall.3).0.len(), 1);
         assert_eq!(idx.in_rect(tall.0, tall.1, tall.2, tall.3).count(), 1);
 
         let mut row_2: Vec<(u32, u32, ())> = (0..10_000u32).map(|c| (1, c, ())).collect();
         row_2.push((0, 5, ()));
         let idx = RectIndex::new(row_2);
-        assert_eq!(idx.band_len(wide.0, wide.1, wide.2, wide.3), 1);
+        assert_eq!(idx.chosen_band(wide.0, wide.1, wide.2, wide.3).0.len(), 1);
         assert_eq!(idx.in_rect(wide.0, wide.1, wide.2, wide.3).count(), 1);
     }
 
@@ -3760,7 +3762,8 @@ mod tests {
         // #935 side effect: a whole-column and a whole-row reader recalc
         // through the seed index on edits to cells they cover — and not on
         // edits elsewhere. The dual-order index preserves this behaviour;
-        // the test guards the swap.
+        // this test guards the values, and
+        // rect_index_walks_narrower_band guards the band choice.
         let mut wb = wb_one_sheet(&[
             ("A1", Cell::number(1.0)),
             ("A2", Cell::number(2.0)),
