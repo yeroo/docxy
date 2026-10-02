@@ -667,9 +667,30 @@ fn apply(tab: &mut DocTab, d: &Dialog) -> Result<(), String> {
         DialogOwner::MailLabels => {
             let spec = spec_of(d)?;
             let address = lines(&get_text(d, "address"));
-            let mut ed = Editor::new(empty_doc());
-            insert_labels(&mut ed, &spec, &LabelFill::Same(address));
-            let pkg = docxcore::package::new_package(ed.doc.clone());
+            // The new document is this one's package (styles, theme,
+            // numbering) with the sheet as its body, in a section of its own
+            // (no header or footer), and none of its comments or merge.
+            let Surface::Doc(ed) = &tab.surface else {
+                return Err("Labels need a document".into());
+            };
+            let bytes = doc_to_docx(&ed.export_doc(), &tab.comments, tab.pkg.as_ref());
+            let mut pkg = docxcore::package::load_package(&bytes).map_err(|e| e.to_string())?;
+            let mut sheet = Editor::new(docxcore::model::Document {
+                body: vec![Block::SectionProperties(
+                    docxcore::model::SectionProperties {
+                        raw: "<w:sectPr></w:sectPr>".into(),
+                        property_change: None,
+                    },
+                )],
+            });
+            insert_labels(&mut sheet, &spec, &LabelFill::Same(address));
+            pkg.document = sheet.doc;
+            for c in docxcore::comments::parse_comments(&pkg) {
+                if let Ok(id) = c.id.parse() {
+                    pkg.remove_comment(id);
+                }
+            }
+            pkg.set_mail_merge(None);
             tab.mail.new_tab = Some((pkg, "Labels1.docx".into()));
             tab.status = format!("Labels: {}", spec.name).into();
         }

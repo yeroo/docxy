@@ -534,6 +534,16 @@ fn envelopes_and_labels() {
         panic!("a label table")
     };
     assert_eq!(table.rows.len(), 10);
+    // r1 m6: the new document is this one's package, styles and all, with
+    // the sheet's page and no header or footer.
+    let styles = |p: &Package| p.part("word/styles.xml").map(<[u8]>::to_vec);
+    assert!(styles(&pkg).is_some());
+    assert_eq!(styles(&pkg), styles(t.pkg.as_ref().unwrap()));
+    let sect = pkg.sect_pr();
+    assert!(!sect.contains("headerReference"), "{sect}");
+    let setup = docxcore::sect::SectionSetup::parse(sect);
+    assert_eq!((setup.page.w, setup.margins.top), (12240, 720));
+    assert_eq!(pkg.mail_merge(), None);
     // A custom size is checked.
     open_dialog(&mut t, MailAct::Labels);
     set(&mut t, "product", Json::Str("Custom".into()));
