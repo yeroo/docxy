@@ -732,7 +732,7 @@ Repair… call after their file pick:
 
 | Call | Effect |
 |---|---|
-| `open {"path":"book.xlsx","mode":"read-only"}` | `mode` is `normal` (the default), `read-only`, `copy` or `repair`; a document or Project ignores it |
+| `open {"path":"book.xlsx","mode":"read-only"}` | `mode` is `normal` (the default), `read-only`, `copy`, `repair` or `recover-text`; a workbook ignores `recover-text`, a document takes only `recover-text` (Recover Text from Any File, #633), and a Project ignores every mode |
 | `open {"path":"book.xlsx","reopen":"ask"}` | a person's open of a file already open: a dirty tab asks first (the `reopen` dialog), a clean one reloads only in another mode |
 | `enable-editing {}` | the PROTECTED VIEW message bar's Enable Editing button; refused off a protected tab |
 

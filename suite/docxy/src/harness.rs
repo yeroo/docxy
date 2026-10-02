@@ -2371,9 +2371,10 @@ fn sheet(app: &crate::Docxy) -> Result<&SheetView, String> {
 /// error: …` when they did not — and the failing branches hand back a real tab
 /// either way (an empty document, or a placeholder surface). So "it starts with
 /// `loaded`" is the whole test, and anything else is the app saying it did not
-/// open the file.
+/// open the file, except Recover Text's `recovered text …` (#633), which is
+/// the text it could read.
 fn load_failed(status: &str) -> bool {
-    !status.starts_with("loaded")
+    !(status.starts_with("loaded") || status.starts_with("recovered text"))
 }
 
 /// The active tab's reason for not being the file that was asked for, if it is
@@ -3099,7 +3100,7 @@ pub fn dispatch(
             let mode = match args.get("mode") {
                 None => crate::open_mode::OpenMode::Normal,
                 Some(Json::Str(m)) => crate::open_mode::OpenMode::parse(m)
-                    .ok_or("'mode' must be normal, read-only, copy or repair")?,
+                    .ok_or("'mode' must be normal, read-only, copy, repair or recover-text")?,
                 Some(_) => return Err("'mode' must be a string".into()),
             };
             let reopen = match args.get("reopen") {
@@ -5157,6 +5158,9 @@ mod tests {
             "loaded (markdown)",
             "loaded \u{2014} 1 sheet",
             "loaded \u{2014} 3 sheets",
+            "loaded (converted from PDF)",
+            "recovered text from a damaged file (12 paragraphs)",
+            "recovered text (3 paragraphs)",
         ] {
             assert!(!load_failed(ok), "{ok}");
         }

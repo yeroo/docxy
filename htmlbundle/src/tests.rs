@@ -96,6 +96,18 @@ fn plain_html_is_not_a_bundle() {
 }
 
 #[test]
+fn is_bundle_reads_the_bytes_whatever_their_encoding() {
+    let html = bundle(b"payload");
+    assert!(is_bundle(html.as_bytes()));
+    // Damaged payload: still a bundle, so opening it says what is wrong.
+    let damaged = html.replacen("payloadSha256", "payloadShaXXX", 1);
+    assert!(is_bundle(damaged.as_bytes()));
+    // A Word Web Page in windows-1252 is not UTF-8 and not a bundle.
+    assert!(!is_bundle(b"<html><body><p>Caf\xe9</p></body></html>"));
+    assert!(!is_bundle(b""));
+}
+
+#[test]
 fn rewrap_changes_only_the_payload_and_its_hash() {
     let html = bundle(b"version one");
     let next = rewrap(&html, b"version two, longer").unwrap();
