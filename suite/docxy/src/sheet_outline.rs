@@ -62,6 +62,20 @@ fn selected_axis(v: &SheetView) -> Option<(Axis, u32, u32)> {
     }
 }
 
+/// Whether any sheet differs in what Subtotal and Remove All change: cells,
+/// row attributes (levels, hidden, collapsed), columns, the outline settings
+/// and page breaks.
+fn sheets_changed(a: &[Sheet], b: &[Sheet]) -> bool {
+    a.len() != b.len()
+        || a.iter().zip(b).any(|(x, y)| {
+            x.cells != y.cells
+                || x.row_attrs != y.row_attrs
+                || x.col_defs != y.col_defs
+                || x.outline != y.outline
+                || x.row_breaks != y.row_breaks
+        })
+}
+
 /// Excel's refusal on a protected sheet: the outline is an edit.
 const PROTECTED: &str =
     "The sheet is protected: unprotect it (Review › Protect Sheet) to change the outline.";
@@ -497,29 +511,30 @@ fn apply_subtotal(
         return Err(PROTECTED.into());
     }
     let snap = v.snapshot();
+    let before = v.pkg.workbook.sheets.clone();
     let status = match opts {
-        Some(o) => {
-            // Replace may have taken rows out before a refusal: put them back.
-            let before = v.pkg.workbook.sheets[sheet].clone();
-            let n = match subtotal(&mut v.pkg.workbook, sheet, r1, r2, o) {
-                Ok(n) => n,
-                Err(e) => {
-                    v.pkg.workbook.sheets[sheet] = before;
-                    return Err(e.to_string());
-                }
-            };
-            format!("Inserted {n} subtotal row{}", if n == 1 { "" } else { "s" })
-        }
+        Some(o) => match subtotal(&mut v.pkg.workbook, sheet, r1, r2, o) {
+            Ok(n) => format!("Inserted {n} subtotal row{}", if n == 1 { "" } else { "s" }),
+            Err(e) => {
+                // gridcore refuses before it changes anything; should that
+                // ever slip, a row delete reaches every sheet, so the whole
+                // workbook goes back.
+                v.restore(snap);
+                return Err(e.to_string());
+            }
+        },
         None => {
             let n = remove_subtotals(&mut v.pkg.workbook, sheet, r1, r2);
-            if n == 0 && v.pkg.workbook.sheets[sheet].max_row_outline() == 0 {
-                tab.dialogs.pop();
-                tab.status = "There are no subtotals to remove".into();
-                return Ok(());
-            }
             format!("Removed {n} subtotal row{}", if n == 1 { "" } else { "s" })
         }
     };
+    // Remove All also drops page breaks, levels and hidden flags, so only a
+    // comparison tells whether it did anything.
+    if !sheets_changed(&before, &v.pkg.workbook.sheets) {
+        tab.dialogs.pop();
+        tab.status = "There are no subtotals to remove".into();
+        return Ok(());
+    }
     v.push_undo_snapshot(snap);
     v.engine = crate::sheet_engine(&v.pkg.workbook);
     tab.dirty = true;
@@ -846,6 +861,85 @@ mod tests {
         let err = crate::dialog_host::dialog_click(&mut t, "OK").unwrap_err();
         assert_eq!(err, gridcore::edit::SubtotalError::NoColumns.to_string());
         assert_eq!(t.dialogs.top().map(|d| d.id), Some("subtotal"));
+        assert_eq!(undo_len(&mut t), 0);
+    }
+
+    /// Remove All on the region around the cursor, through the dialog.
+    fn remove_all(t: &mut DocTab) {
+        select(t, 2, 0, 2, 0);
+        t.dialogs.push(subtotal_dialog(t).unwrap());
+        press(t, "Remove All");
+        assert!(t.dialogs.top().is_none());
+    }
+
+    #[test]
+    fn remove_all_records_breaks_and_outline_it_took_and_nothing_else() {
+        // (a) Only a manual page break in the list, no outline.
+        let mut t = sales();
+        let s = view(&mut t).active;
+        gridcore::print::area::insert_page_break(&mut view(&mut t).pkg.workbook.sheets[s], 3, 0);
+        remove_all(&mut t);
+        assert!(
+            gridcore::print::area::manual_breaks(sheet(&mut t))
+                .0
+                .is_empty()
+        );
+        assert_eq!(undo_len(&mut t), 1);
+        assert!(t.dirty);
+        // (b) A collapsed group and no total rows: ungrouped and shown.
+        let mut t = sales();
+        {
+            let sh = &mut view(&mut t).pkg.workbook.sheets[s];
+            outline::group(sh, Axis::Rows, 1, 3).unwrap();
+            let g = outline::groups(sh, Axis::Rows)[0];
+            outline::collapse_group(sh, Axis::Rows, &g);
+        }
+        remove_all(&mut t);
+        assert_eq!(sheet(&mut t).max_row_outline(), 0);
+        assert!(!(1..=3).any(|r| sheet(&mut t).row_hidden(r)));
+        assert_eq!(undo_len(&mut t), 1);
+        assert!(t.dirty);
+        // (c) An outline elsewhere on the sheet, nothing in the region.
+        let mut t = sales();
+        outline::group(&mut view(&mut t).pkg.workbook.sheets[s], Axis::Rows, 20, 22).unwrap();
+        remove_all(&mut t);
+        assert_eq!(undo_len(&mut t), 0);
+        assert!(!t.dirty);
+        assert_eq!(&*t.status, "There are no subtotals to remove");
+        assert_eq!(sheet(&mut t).row_outline(21), 1);
+    }
+
+    #[test]
+    fn a_refused_replace_leaves_every_sheet_as_it_was() {
+        // A header and nothing but total rows; another sheet points at the
+        // grand total.
+        let mut t = tab();
+        let v = view(&mut t);
+        let s = &mut v.pkg.workbook.sheets[0];
+        s.set_cell(0, 0, Cell::text("Grp"));
+        s.set_cell(0, 1, Cell::text("Amt"));
+        s.set_cell(1, 0, Cell::text("A Total"));
+        s.set_cell(1, 1, Cell::formula("SUBTOTAL(9,B2:B2)"));
+        s.set_cell(2, 0, Cell::text("Grand Total"));
+        s.set_cell(2, 1, Cell::formula("SUBTOTAL(9,B2:B3)"));
+        let mut other = Sheet {
+            name: "Other".into(),
+            ..Sheet::default()
+        };
+        other.set_cell(0, 0, Cell::formula("Sheet1!B3"));
+        v.pkg.workbook.sheets.push(other);
+        select(&mut t, 1, 0, 1, 0);
+        t.dialogs.push(subtotal_dialog(&t).unwrap());
+        set(&mut t, "Amt", Json::Bool(true));
+        let err = crate::dialog_host::dialog_click(&mut t, "OK").unwrap_err();
+        assert_eq!(err, gridcore::edit::SubtotalError::Empty.to_string());
+        let f = view(&mut t).pkg.workbook.sheets[1]
+            .cell(0, 0)
+            .unwrap()
+            .formula
+            .clone();
+        assert_eq!(f.as_deref(), Some("Sheet1!B3"));
+        assert_eq!(sheet(&mut t).used_size().0, 3);
         assert_eq!(undo_len(&mut t), 0);
     }
 

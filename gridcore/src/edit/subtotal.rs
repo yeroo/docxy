@@ -176,7 +176,10 @@ pub fn subtotal_region(s: &Sheet, row: u32, col: u32) -> Option<(u32, u32, bool)
     while used(bottom + 1) {
         bottom += 1;
     }
-    let header = matches!(s.cell(top, col).map(|c| &c.value), Some(CellValue::Text(_)));
+    // A total row on top (a grand total with summaries above, in a list with
+    // no header) is no header: Replace takes it out.
+    let header = matches!(s.cell(top, col).map(|c| &c.value), Some(CellValue::Text(_)))
+        && !is_subtotal_row(s, top);
     Some((top, bottom, header))
 }
 
@@ -225,12 +228,20 @@ pub fn subtotal(
     if wb.sheets.get(sheet).is_none() || r2 < start {
         return Err(SubtotalError::Empty);
     }
+    // Refuse before changing anything: a region of nothing but total rows
+    // has nothing to total, and Replace must not delete them first.
+    if !(start..=r2).any(|r| !is_subtotal_row(&wb.sheets[sheet], r)) {
+        return Err(SubtotalError::Empty);
+    }
     let mut r2 = r2;
     if opts.replace {
-        r2 -= remove_subtotals(wb, sheet, r1, r2) as u32;
-        if r2 < start {
-            return Err(SubtotalError::Empty);
-        }
+        // Below the header only; at least one row stays, so `r2` stays at or
+        // after `start`.
+        let removed = remove_subtotals(wb, sheet, start, r2) as u32;
+        r2 = r2
+            .checked_sub(removed)
+            .filter(|&e| e >= start)
+            .expect("a region with a non-total row keeps it through Remove All");
     }
     let below = opts.summary_below;
     let code = opts.func.code();
@@ -790,6 +801,96 @@ mod tests {
         // Remove All takes both layers out.
         assert_eq!(remove_subtotals(&mut w, 0, 0, 10), 7);
         assert_eq!(levels(&w, 0, 3), [0; 4]);
+    }
+
+    /// Every row a total: no data left to total.
+    fn totals_only(at: u32) -> Workbook {
+        let mut w = Workbook {
+            sheets: vec![
+                sheet_with("Sheet1", &[]),
+                sheet_with(
+                    "Other",
+                    &[("A1", Cell::formula(&format!("Sheet1!B{}", at + 2)))],
+                ),
+            ],
+            ..Workbook::default()
+        };
+        let s = &mut w.sheets[0];
+        s.set_cell(at, 0, Cell::text("A Total"));
+        s.set_cell(at, 1, Cell::formula("SUBTOTAL(9,B1:B1)"));
+        s.set_cell(at + 1, 0, Cell::text("Grand Total"));
+        s.set_cell(at + 1, 1, Cell::formula("SUBTOTAL(9,B1:B2)"));
+        w
+    }
+
+    #[test]
+    fn replace_over_nothing_but_totals_refuses_and_changes_nothing() {
+        for at in [0, 3] {
+            let mut w = totals_only(at);
+            let before = (w.sheets[0].cells.clone(), w.sheets[1].cells.clone());
+            let o = SubtotalOptions::new(0, vec![1], false);
+            assert_eq!(
+                subtotal(&mut w, 0, at, at + 1, &o),
+                Err(SubtotalError::Empty)
+            );
+            assert_eq!(
+                (w.sheets[0].cells.clone(), w.sheets[1].cells.clone()),
+                before
+            );
+            // With a header row above them, the same.
+            let mut w = totals_only(at + 1);
+            w.sheets[0].set_cell(at, 0, Cell::text("Grp"));
+            let before = (w.sheets[0].cells.clone(), w.sheets[1].cells.clone());
+            let o = SubtotalOptions::new(0, vec![1], true);
+            assert_eq!(
+                subtotal(&mut w, 0, at, at + 2, &o),
+                Err(SubtotalError::Empty)
+            );
+            assert_eq!(
+                (w.sheets[0].cells.clone(), w.sheets[1].cells.clone()),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn a_grand_total_on_top_is_not_a_header_and_replace_repeats_the_layout() {
+        // No header, a numeric key, summaries above: the grand total lands
+        // on the region's first row.
+        let mut w = Workbook {
+            sheets: vec![sheet_with(
+                "Sheet1",
+                &[
+                    ("A1", Cell::number(1.0)),
+                    ("B1", Cell::number(10.0)),
+                    ("A2", Cell::number(1.0)),
+                    ("B2", Cell::number(20.0)),
+                    ("A3", Cell::number(2.0)),
+                    ("B3", Cell::number(30.0)),
+                ],
+            )],
+            ..Workbook::default()
+        };
+        let run = |w: &mut Workbook| {
+            let (top, bottom, header) = subtotal_region(&w.sheets[0], 0, 0).unwrap();
+            assert!(!header, "neither the data nor a grand total is a header");
+            let o = SubtotalOptions {
+                summary_below: false,
+                ..SubtotalOptions::new(0, vec![1], header)
+            };
+            subtotal(w, 0, top, bottom, &o).unwrap();
+        };
+        run(&mut w);
+        let layout = |w: &Workbook| -> Vec<(String, String)> {
+            (1..=6)
+                .map(|r| (text(w, &format!("A{r}")), formula(w, 0, &format!("B{r}"))))
+                .collect()
+        };
+        let first = layout(&w);
+        assert_eq!(first[0].0, "Grand Total");
+        run(&mut w);
+        assert_eq!(layout(&w), first);
+        assert_eq!(num(&mut w, "B1"), 60.0);
     }
 
     #[test]

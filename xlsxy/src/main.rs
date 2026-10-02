@@ -12619,6 +12619,33 @@ mod tests {
     }
 
     #[test]
+    fn remove_all_records_the_page_breaks_it_drops() {
+        let mut app = subtotal_app();
+        gridcore::print::area::insert_page_break(&mut app.pkg.workbook.sheets[0], 2, 0);
+        let undo_len = app.undo.len();
+        app.ribbon_act(ribbon::Act::Subtotal);
+        app.outline_dialog_key(KeyCode::Up); // Cancel
+        app.outline_dialog_key(KeyCode::Up); // Remove All
+        app.outline_dialog_key(KeyCode::Enter);
+        assert!(
+            gridcore::print::area::manual_breaks(app.sheet())
+                .0
+                .is_empty()
+        );
+        assert_eq!(app.undo.len(), undo_len + 1);
+        app.undo();
+        assert_eq!(gridcore::print::area::manual_breaks(app.sheet()).0, [2]);
+        // Redo removes them again; then there is nothing left, so no step.
+        app.redo();
+        let undo_len = app.undo.len();
+        app.ribbon_act(ribbon::Act::Subtotal);
+        app.outline_dialog_key(KeyCode::Up);
+        app.outline_dialog_key(KeyCode::Up);
+        app.outline_dialog_key(KeyCode::Enter);
+        assert_eq!(app.undo.len(), undo_len);
+    }
+
+    #[test]
     fn alt_shift_arrows_group_whole_rows_and_columns() {
         let mut app = App::new(new_xlsx(), "t.xlsx");
         // Whole rows 2..=4 selected.
