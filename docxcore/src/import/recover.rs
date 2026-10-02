@@ -119,6 +119,7 @@ fn paragraphs_of(xml: &str) -> Document {
     let plain = RunProps::default();
     let mut b = Builder::new();
     let mut in_text = false;
+    let mut in_run = false;
     let mut open_para = false;
     let mut pos = 0;
     while pos < xml.len() {
@@ -163,10 +164,14 @@ fn paragraphs_of(xml: &str) -> Document {
                     open_para = false;
                 }
             }
+            ("w:r", false) => in_run = !tag.ends_with('/'),
+            ("w:r", true) => in_run = false,
             ("w:t", false) => in_text = !tag.ends_with('/'),
             ("w:t", true) => in_text = false,
-            ("w:tab", false) if open_para => b.tab(&plain),
-            ("w:br" | "w:cr", false) if open_para => b.line_break(&plain),
+            // Only a run's tab is text; `w:tab` in `w:pPr/w:tabs` is a tab
+            // stop's definition.
+            ("w:tab", false) if open_para && in_run => b.tab(&plain),
+            ("w:br" | "w:cr", false) if open_para && in_run => b.line_break(&plain),
             _ => {}
         }
     }
@@ -397,6 +402,16 @@ mod tests {
         assert_eq!(
             paragraph_texts(&recover_docx_text(&zip).unwrap()),
             ["a\tb\nc", "", "d\u{416}"]
+        );
+    }
+
+    #[test]
+    fn tab_stop_definitions_are_not_tabs() {
+        let xml = "<w:body><w:p><w:pPr><w:tabs><w:tab w:val=\"left\" w:pos=\"720\"/><w:tab w:val=\"right\" w:pos=\"9360\"/></w:tabs></w:pPr><w:r><w:t>Chapter</w:t></w:r><w:r><w:tab/><w:t>7</w:t></w:r></w:p>";
+        let zip = local("word/document.xml", 0, xml.as_bytes(), true);
+        assert_eq!(
+            paragraph_texts(&recover_docx_text(&zip).unwrap()),
+            ["Chapter\t7"]
         );
     }
 
