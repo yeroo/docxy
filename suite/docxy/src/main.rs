@@ -29,6 +29,8 @@ mod convert_tests;
 mod crashlog;
 mod dialog;
 mod dialog_host;
+#[cfg(test)]
+mod doc_protected_tests;
 mod harness;
 mod hf;
 mod hf_tab;
@@ -790,6 +792,27 @@ fn protected_view_allows_act(act: SheetAct) -> bool {
     matches!(
         act,
         SheetAct::Copy | SheetAct::PrevComment | SheetAct::NextComment | SheetAct::Todo
+    )
+}
+
+/// The document commands Protected View lets through (#633): copying,
+/// selecting, finding and what only changes the view. Everything else edits,
+/// or opens a picker, menu or dialog that would.
+fn protected_view_allows_doc_act(act: Act) -> bool {
+    matches!(
+        act,
+        Act::Copy
+            | Act::SelectAll
+            | Act::Find
+            | Act::ShowHide
+            | Act::ToggleComments
+            | Act::ToggleNav
+            | Act::ToggleNotes
+            | Act::DarkMode
+            | Act::AutoHideRibbon
+            | Act::PrintLayout
+            | Act::ToggleRuler
+            | Act::Project(_)
     )
 }
 
@@ -2506,6 +2529,17 @@ impl DocTab {
     /// itself stays the plain name, because it seeds Save As.
     fn caption(&self) -> String {
         open_mode::caption(&self.title, self.access)
+    }
+
+    /// A document edit landed. In Protected View (#633) a gate before it
+    /// leaked, so the edit is rolled back instead ([`protected_rollback`])
+    /// and the tab never turns dirty.
+    fn mark_dirty(&mut self) {
+        if self.access.protected {
+            protected_rollback(self);
+        } else {
+            self.dirty = true;
+        }
     }
 }
 
@@ -4594,11 +4628,21 @@ fn sheet_tab_from_path(path: &PathBuf, repair: bool) -> DocTab {
 }
 
 /// A document tab for `path` opened in `mode`: Recover Text from Any File
-/// (#633) opens its recovered text; every other mode opens it as usual.
-fn doc_tab_from_path_mode(path: &PathBuf, mode: OpenMode) -> DocTab {
+/// (#633) opens its recovered text; every other mode opens it as usual. A
+/// downloaded document opens in Protected View, as a workbook does (#610),
+/// unless `trusted` holds it as it is now (#882).
+fn doc_tab_from_path_mode(path: &PathBuf, mode: OpenMode, trusted: &trusted::TrustStore) -> DocTab {
+    let protected = open_mode::is_protected_zone(open_mode::zone_id(path))
+        && !trusted.is_trusted(path, trusted::Stamp::of(path));
+    // Taken before the load, as for a workbook.
+    let stamp = protected.then(|| trusted::Stamp::of(path)).flatten();
     let converted = (mode == OpenMode::RecoverText).then_some(open_mode::Converted::RecoveredText);
     let title: SharedString = file_name(path).into();
-    load_doc_for_tab(path, converted).into_tab(Kind::Docx, title, Some(path.clone()), false)
+    let mut tab =
+        load_doc_for_tab(path, converted).into_tab(Kind::Docx, title, Some(path.clone()), false);
+    tab.access.protected = protected;
+    tab.access.stamp = stamp;
+    tab
 }
 
 /// [`tab_from_path`] in an open mode (#610). A workbook takes every mode but
@@ -4619,7 +4663,7 @@ fn tab_from_path_mode(
         return Ok(tab_from_path(path));
     }
     if !is_sheet_path(path) {
-        return Ok(doc_tab_from_path_mode(path, mode));
+        return Ok(doc_tab_from_path_mode(path, mode, trusted));
     }
     // Recover Text is a document's; a workbook opens as usual.
     let mode = match mode {
@@ -7186,6 +7230,25 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
 /// stays in its model there, but it cannot be saved: every save is refused
 /// first. Either way both stacks are forgotten and the tab stays clean.
 fn protected_rollback(tab: &mut DocTab) {
+    // A document (#633) is loaded again the way it was opened: converted,
+    // recovered or plain. A protected tab always has its file.
+    if matches!(tab.surface, Surface::Doc(_)) {
+        if let Some(path) = tab.path.clone() {
+            let l = load_doc_for_tab(&path, tab.access.converted);
+            tab.surface = Surface::Doc(Editor::new(l.doc));
+            tab.comments = l.comments;
+            tab.notes = l.notes;
+            tab.mail = mailings_tab::MailState::from_pkg(l.pkg.as_ref());
+            tab.pkg = l.pkg;
+            tab.markdown = l.markdown;
+            tab.bundle_html = l.bundle_html;
+            tab.load_failed = l.load_failed;
+        }
+        tab.hf_edit = None;
+        tab.dirty = false;
+        tab.status = open_mode::PROTECTED_STATUS.into();
+        return;
+    }
     let reloaded = tab
         .path
         .as_ref()
@@ -13751,6 +13814,10 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Editing a header or footer is editing the document (#633).
+        if self.protected_refused(cx) {
+            return self.refocus(window, cx);
+        }
         let idx = self.active;
         let Some(tab) = self.tabs.get_mut(idx) else {
             return;
@@ -13802,7 +13869,7 @@ fn toggle_title_pg_tab(tab: &mut DocTab) -> bool {
     ed.edit_sections(&[section], |raw| {
         docxcore::sect::set_flag(raw, "w:titlePg", on)
     });
-    tab.dirty = true;
+    tab.mark_dirty();
     on
 }
 
@@ -13822,7 +13889,7 @@ fn set_page_margins_tab(
     {
         return false;
     }
-    tab.dirty = true;
+    tab.mark_dirty();
     final_sect_pr(tab).map(str::to_owned) != before
 }
 
@@ -13844,7 +13911,7 @@ fn flush_hf_tab(tab: &mut DocTab) {
         return;
     }
     hf_tab::rewrite_part(pkg, &hf.part_name, hf.is_header, &inner);
-    tab.dirty = true;
+    tab.mark_dirty();
 }
 
 /// The part of a print-layout page a double-click lands in.
@@ -14531,16 +14598,21 @@ impl Docxy {
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut Editor),
     ) {
+        // Every ribbon edit, ruler drag and paste comes here: Protected View
+        // (#633) refuses it before it touches the document.
+        if self.protected_refused(cx) {
+            return self.refocus(window, cx);
+        }
         if let Some(tab) = self.tabs.get_mut(self.active) {
             // Route to the header/footer editor while it's open, else the body.
             if let Some(hf) = tab.hf_edit.as_mut() {
                 f(&mut hf.editor);
-                tab.dirty = true;
+                tab.mark_dirty();
             } else if let Surface::Doc(ed) = &mut tab.surface {
                 f(ed);
                 // A merge field the edit added shows the previewed record too.
                 ed.refresh_merge_preview();
-                tab.dirty = true;
+                tab.mark_dirty();
             }
         }
         self.refocus(window, cx);
@@ -14549,6 +14621,10 @@ impl Docxy {
     /// Copy (or cut) the selection into the document clip and, as plain text,
     /// the system clipboard (#755).
     fn do_copy(&mut self, cut: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // Copy only looks; cut would edit (#633).
+        if cut && self.protected_refused(cx) {
+            return self.refocus(window, cx);
+        }
         let clip = self
             .edit_target()
             .and_then(|ed| if cut { ed.cut() } else { ed.copy() });
@@ -14557,7 +14633,7 @@ impl Docxy {
             self.clip = Some(DocClip { clip, text });
             if cut {
                 if let Some(t) = self.tabs.get_mut(self.active) {
-                    t.dirty = true;
+                    t.mark_dirty();
                 }
             }
         }
@@ -14567,6 +14643,9 @@ impl Docxy {
     /// Paste at the caret: the document clip while it is still what the
     /// clipboard holds (formatting intact), else the clipboard's text.
     fn do_paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return self.refocus(window, cx);
+        }
         let now = self.clipboard_read(cx);
         let clip = match self.clip.as_ref() {
             Some(ours) if clip_still_ours(&ours.text, &now) => Some(ours.clip.clone()),
@@ -14630,6 +14709,10 @@ impl Docxy {
     /// Replace the current match, if it is editable and still selected, and
     /// advance to the next; a read-only match is skipped.
     fn replace_one(&mut self, cx: &mut Context<Self>) {
+        // Find looks; Replace would edit (#633).
+        if self.protected_refused(cx) {
+            return;
+        }
         let with = self.replace_text.clone();
         let q = self.find_query.clone();
         let cs = self.find_case;
@@ -14642,7 +14725,7 @@ impl Docxy {
         }
         if let Some(t) = self.tabs.get_mut(self.active) {
             match outcome {
-                Some(ReplaceOne::Replaced) => t.dirty = true,
+                Some(ReplaceOne::Replaced) => t.mark_dirty(),
                 Some(ReplaceOne::ReadOnly) => t.status = "read-only match skipped".into(),
                 _ => {}
             }
@@ -14652,6 +14735,9 @@ impl Docxy {
 
     /// Replace every editable match; report the count in the status line.
     fn replace_all_now(&mut self, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return;
+        }
         let with = self.replace_text.clone();
         let q = self.find_query.clone();
         let cs = self.find_case;
@@ -14662,7 +14748,7 @@ impl Docxy {
         self.find_cur = None;
         if let Some(t) = self.tabs.get_mut(self.active) {
             if n > 0 {
-                t.dirty = true;
+                t.mark_dirty();
             }
             if read_only > 0 {
                 t.status = format!("replaced {n}; {read_only} read-only match(es) skipped").into();
@@ -14848,7 +14934,7 @@ impl Docxy {
             .map(|ed| ed.insert_table(rows, cols, fit));
         if let Some(t) = self.tabs.get_mut(self.active) {
             match result {
-                Some(Ok(())) => t.dirty = true,
+                Some(Ok(())) => t.mark_dirty(),
                 Some(Err(e)) => t.status = e.into(),
                 None => {}
             }
@@ -15101,6 +15187,9 @@ impl Docxy {
 
     /// Begin a new comment on the current selection (opens the comment entry bar).
     fn start_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return self.refocus(window, cx);
+        }
         let has_sel = matches!(self.tabs.get(self.active).map(|t| &t.surface), Some(Surface::Doc(ed)) if ed.has_selection());
         if !has_sel {
             if let Some(t) = self.tabs.get_mut(self.active) {
@@ -15140,7 +15229,7 @@ impl Docxy {
                     text,
                     quoted,
                 });
-                t.dirty = true;
+                t.mark_dirty();
                 t.status = format!("Comment {id} added").into();
             }
         }
@@ -15178,6 +15267,9 @@ impl Docxy {
 
     /// Begin dragging a ruler marker.
     fn ruler_drag_start(&mut self, handle: RulerHandle, x: f32, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return;
+        }
         let Some(g) = self.ruler_probe.borrow().painted.clone() else {
             return;
         };
@@ -15608,12 +15700,15 @@ impl Docxy {
 
     /// Delete a comment: strip its markers from the body and drop it from the list.
     fn delete_comment(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return self.refocus(window, cx);
+        }
         if let Some(t) = self.tabs.get_mut(self.active) {
             if let Surface::Doc(ed) = &mut t.surface {
                 ed.remove_comment_markers(&id);
             }
             t.comments.retain(|c| c.id != id);
-            t.dirty = true;
+            t.mark_dirty();
         }
         self.refocus(window, cx);
     }
@@ -16168,6 +16263,15 @@ impl Docxy {
         if !ed.in_table() {
             return false;
         }
+        // Moving between cells only looks; Tab in the last cell adds a row,
+        // which Protected View refuses (#633).
+        if !back && ed.table_tab_adds_row() && self.protected_refused(cx) {
+            self.refocus(window, cx);
+            return true;
+        }
+        let Some(ed) = self.edit_target() else {
+            return false;
+        };
         let edited = if back {
             ed.table_prev_cell();
             false
@@ -16178,7 +16282,7 @@ impl Docxy {
         };
         if edited {
             if let Some(t) = self.tabs.get_mut(self.active) {
-                t.dirty = true;
+                t.mark_dirty();
             }
         }
         self.scroll_to_caret();
@@ -16317,6 +16421,16 @@ impl Docxy {
         if key == "escape" && self.hf_active() {
             return self.exit_hf(window, cx);
         }
+        // Protected View (#633): only keys that look, move or copy reach the
+        // document. The find bar still takes typing; its Replace is refused
+        // where it would write.
+        if self.protected_view()
+            && !self.find_open
+            && !open_mode::protected_allows_doc_key(key.as_str(), ctrl, m.alt)
+        {
+            self.protected_refused(cx);
+            return;
+        }
         // Ctrl+F toggles the find bar; while it's open, all keys go to it.
         if ctrl && key == "f" {
             return self.toggle_find(window, cx);
@@ -16425,7 +16539,7 @@ impl Docxy {
         };
         if changed {
             if let Some(t) = self.tabs.get_mut(self.active) {
-                t.dirty = true;
+                t.mark_dirty();
             }
         }
         self.scroll_to_caret();
@@ -21547,6 +21661,11 @@ impl Docxy {
         use Act::*;
         // A command run from anywhere ends an open menu's moment (#397).
         self.close_menu();
+        // Protected View (#633): the ribbon is hidden, but shortcuts, KeyTips,
+        // context menus and the harness's `ribbon-click` still come here.
+        if !protected_view_allows_doc_act(act) && self.protected_refused(cx) {
+            return self.refocus(window, cx);
+        }
         match act {
             Project(p) => self.project_act(p, window, cx),
             Cut => self.do_copy(true, window, cx),
@@ -24379,6 +24498,15 @@ impl Render for Docxy {
         // record itself again.
         self.frame = self.frame.wrapping_add(1);
         self.schedule_project_passes(window, cx);
+        // Protected View's last backstop (#633): an edit that reached a
+        // protected document by a way no gate or `mark_dirty` covers (one of
+        // the tab's other modules) is rolled back before it is ever drawn,
+        // saved or written to the hot-exit sidecar as unsaved work.
+        for t in self.tabs.iter_mut() {
+            if t.access.protected && t.dirty {
+                protected_rollback(t);
+            }
+        }
         {
             let mut p = self.probes.borrow_mut();
             p.last = std::mem::take(&mut p.next);
@@ -24744,9 +24872,9 @@ impl Render for Docxy {
         );
         let vw = f32::from(window.viewport_size().width);
         let ribbon_tabs = self.ribbon_tabs(fg, dim, panel, cx);
-        // Protected View (#610) hides the ribbon's commands, as Excel greys
-        // them out; its message bar takes their place.
-        let protected = self.active_is_sheet() && self.protected_view();
+        // Protected View (#610, documents #633) hides the ribbon's commands,
+        // as Excel and Word grey them out; its message bar takes their place.
+        let protected = (self.active_is_sheet() || is_doc) && self.protected_view();
         let ribbon_body = (!self.ribbon_min
             && !protected
             && (is_doc || self.active_is_sheet() || self.active_is_project()))

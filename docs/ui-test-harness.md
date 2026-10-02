@@ -763,9 +763,23 @@ file that is already open without asking unless `reopen` is `"ask"` (see
   Save goes to Save As, which may pick the file itself.
 - **Protected View** is the file's, not a mode: a workbook whose
   `Zone.Identifier` stream says zone 3 or 4 opens protected in every mode,
-  Copy included, and so does that copy when it is opened again later. Edits and saves are refused with `Protected View — select
-  Enable Editing to edit`. A script cannot write that stream, so
-  `uiharness/tests/protected_view.rs` (desktop-only, `--ignored`) covers it.
+  Copy included, and so does that copy when it is opened again later. A
+  document (`.docx`, RTF, Web Page, PDF, Markdown, #633) opens protected the
+  same way. Edits and saves are refused with `Protected View — select
+  Enable Editing to edit`: on a document only moving, selecting, copying,
+  Find and view commands pass, and `mail-attach` is refused too. A script
+  cannot write that stream, so `uiharness/tests/protected_view.rs`
+  (desktop-only, `--ignored`) covers it.
+- **recover-text** (#633, documents only): Word's Recover Text from Any File.
+  A Word package gives its recovered text, anything else its printable text
+  runs; the status says `recovered text (N paragraphs)` (a successful open).
+  Like a document converted from RTF, a Web Page or a PDF (`loaded
+  (converted from …)`) or a damaged `.docx` opened normally (`recovered text
+  from a damaged file (N paragraphs)`), the tab never writes its file: Save
+  needs Save As (a harness instance refuses `key ctrl+s` in words, `… was
+  converted from another format, so Save needs Save As …`), and `save-as`
+  over the file is refused (`"name.rtf" was converted; save it as a Word
+  document under a new name.`).
 - **Trusted documents** (#882): Enable Editing records the file in
   `<DOCXY_CONFIG_DIR>/docxy/trusted.json` by its canonical path, length and
   modified time as it was opened. That file opens again without Protected

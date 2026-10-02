@@ -382,3 +382,149 @@ fn enable_editing_trusts_the_file_until_it_is_replaced() {
     assert!(flag(&replaced, "protected"), "{replaced}");
     let _ = ok(&driver, "quit", vec![]);
 }
+
+/// The body text the `doc` verb reports (paragraphs joined by a pilcrow).
+fn body_text(driver: &Driver) -> String {
+    ok(driver, "doc", vec![])
+        .get("mail")
+        .and_then(|m| m.get("text"))
+        .and_then(Json::as_str)
+        .unwrap()
+        .to_string()
+}
+
+/// #633: a downloaded document opens in Protected View as a workbook does.
+/// Moving, selecting, copying and Find work; typing, every editing key,
+/// ribbon commands, Save and Save As are refused and leave the file alone;
+/// Enable Editing lets an edit stick.
+#[test]
+#[ignore = "requires a built suite and an interactive desktop"]
+fn a_downloaded_document_opens_protected_until_enable_editing() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let run = Run::create(
+        root.join("../target/protected-view-tests")
+            .join(format!("doc-{}-{stamp}", std::process::id())),
+    )
+    .unwrap();
+    let sandbox = run.dir().join("sandbox");
+    let files = run.dir().join("files");
+    std::fs::create_dir_all(&files).unwrap();
+    let doc = files.join("letter.docx");
+    std::fs::copy(root.join("fixtures/basic.docx"), &doc).unwrap();
+    if !mark_downloaded(&doc) {
+        return;
+    }
+    let original = std::fs::read(&doc).unwrap();
+
+    let exe = launch::find_suite(None).unwrap();
+    let app = launch::launch(&exe, &sandbox).unwrap();
+    let driver = Driver::connect(&app.ctl_dir(), None).unwrap();
+    ok(
+        &driver,
+        "open",
+        vec![("path", s(&doc.display().to_string()))],
+    );
+    let tab = active_tab(&driver);
+    assert!(flag(&tab, "protected"), "{tab}");
+    assert_eq!(
+        tab.get("caption").and_then(Json::as_str),
+        Some("letter.docx [Protected View]")
+    );
+    let text = body_text(&driver);
+    let protected_status = "Protected View — select Enable Editing to edit";
+
+    // Looking still works.
+    let st = ok(
+        &driver,
+        "key",
+        vec![(
+            "keys",
+            Json::Arr(vec![s("right"), s("shift+right"), s("ctrl+c"), s("ctrl+f")]),
+        )],
+    );
+    assert_ne!(
+        st.get("status").and_then(Json::as_str),
+        Some(protected_status),
+        "{st}"
+    );
+    ok(&driver, "key", vec![("keys", Json::Arr(vec![s("escape")]))]);
+
+    // Every way of editing is refused and the body stays as it was.
+    let st = ok(&driver, "type", vec![("text", s("typed"))]);
+    assert_eq!(
+        st.get("status").and_then(Json::as_str),
+        Some(protected_status),
+        "{st}"
+    );
+    for key in [
+        "enter",
+        "tab",
+        "backspace",
+        "delete",
+        "ctrl+b",
+        "ctrl+x",
+        "ctrl+v",
+        "ctrl+z",
+        "ctrl+y",
+        "ctrl+m",
+    ] {
+        let st = ok(&driver, "key", vec![("keys", Json::Arr(vec![s(key)]))]);
+        assert_eq!(st.get("dirty"), Some(&Json::Bool(false)), "{key}: {st}");
+        assert_eq!(
+            st.get("status").and_then(Json::as_str),
+            Some(protected_status),
+            "{key}: {st}"
+        );
+    }
+    for (tab, command) in [
+        ("Home", "Bold"),
+        ("Home", "Paste"),
+        ("Insert", "Page Break"),
+    ] {
+        let st = ok(
+            &driver,
+            "ribbon-click",
+            vec![("tab", s(tab)), ("command", s(command))],
+        );
+        assert_eq!(
+            st.get("status").and_then(Json::as_str),
+            Some(protected_status),
+            "{command}: {st}"
+        );
+        assert_eq!(st.get("dirty"), Some(&Json::Bool(false)), "{command}: {st}");
+    }
+    assert_eq!(body_text(&driver), text, "the body did not change");
+
+    // Nothing is saved, Save As included.
+    let st = ok(&driver, "key", vec![("keys", Json::Arr(vec![s("ctrl+s")]))]);
+    assert_eq!(
+        st.get("status").and_then(Json::as_str),
+        Some(protected_status),
+        "{st}"
+    );
+    let out = files.join("out.docx");
+    let refused = call(
+        &driver,
+        "save-as",
+        vec![("path", s(&out.display().to_string()))],
+    );
+    assert_eq!(refused.unwrap_err(), protected_status);
+    assert!(!out.exists());
+    assert_eq!(
+        std::fs::read(&doc).unwrap(),
+        original,
+        "the file is untouched"
+    );
+
+    // Enable Editing: an edit now sticks.
+    let st = ok(&driver, "enable-editing", vec![]);
+    assert_eq!(st.get("protected"), Some(&Json::Bool(false)), "{st}");
+    let st = ok(&driver, "type", vec![("text", s("X"))]);
+    assert_eq!(st.get("dirty"), Some(&Json::Bool(true)), "{st}");
+    assert_ne!(body_text(&driver), text);
+    let _ = ok(&driver, "quit", vec![]);
+}

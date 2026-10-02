@@ -3256,6 +3256,10 @@ pub fn dispatch(
                 None => return Err("mail-attach needs a 'path'".into()),
             };
             let tab = app.tabs.get_mut(app.active).ok_or("no tab is open")?;
+            // Attaching a data source changes what the document saves (#633).
+            if tab.access.protected {
+                return Err(crate::open_mode::PROTECTED_STATUS.into());
+            }
             if tab.kind != crate::Kind::Docx {
                 return Err("mail-attach needs a Word document".into());
             }

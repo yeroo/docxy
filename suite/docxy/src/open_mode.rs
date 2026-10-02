@@ -415,9 +415,74 @@ pub(crate) fn protected_allows_key(key: &str, ctrl: bool, alt: bool) -> bool {
     }
 }
 
+/// Whether a key may reach a document in Protected View (#633): moving the
+/// caret and extending the selection (with Shift, by word with Ctrl),
+/// copying, selecting all, finding, zooming, KeyTips and the modifiers on
+/// their own. Everything else would edit: Enter, Tab, Backspace, Delete, any
+/// character, and Ctrl+X, V, Z, Y, B, I, U, M, S.
+pub(crate) fn protected_allows_doc_key(key: &str, ctrl: bool, alt: bool) -> bool {
+    match key {
+        "shift" | "control" | "alt" | "platform" | "function" => true,
+        "left" | "right" | "up" | "down" | "pageup" | "pagedown" | "home" | "end" | "escape" => {
+            !alt
+        }
+        // KeyTips: the commands they reach are refused there.
+        "f10" => !ctrl,
+        "c" | "a" | "f" | "=" | "+" | "-" | "0" | "f1" => ctrl && !alt,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protected_documents_take_only_keys_that_look_move_or_copy() {
+        for (key, ctrl) in [
+            ("left", false),
+            ("right", true),
+            ("home", true),
+            ("end", false),
+            ("pagedown", false),
+            ("up", false),
+            ("escape", false),
+            ("c", true),
+            ("a", true),
+            ("f", true),
+            ("=", true),
+            ("shift", false),
+            ("f10", false),
+        ] {
+            assert!(
+                protected_allows_doc_key(key, ctrl, false),
+                "{key} ctrl={ctrl}"
+            );
+        }
+        for (key, ctrl) in [
+            ("enter", false),
+            ("tab", false),
+            ("backspace", false),
+            ("delete", false),
+            ("a", false),
+            ("space", false),
+            ("x", true),
+            ("v", true),
+            ("z", true),
+            ("y", true),
+            ("b", true),
+            ("i", true),
+            ("u", true),
+            ("m", true),
+            ("s", true),
+            ("tab", true),
+        ] {
+            assert!(
+                !protected_allows_doc_key(key, ctrl, false),
+                "{key} ctrl={ctrl}"
+            );
+        }
+    }
 
     #[test]
     fn modes_parse_from_the_harness_spelling() {
