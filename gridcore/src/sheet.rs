@@ -1548,6 +1548,18 @@ impl Table {
     }
 }
 
+/// A table converted to a range whose part is still in the package (see
+/// [`Workbook::removed_tables`]). Its geometry follows later row and column
+/// edits as the cells it covered do, so the column formulas other table parts
+/// hold can still be rewritten onto them at save.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RemovedTable {
+    pub table: Table,
+    /// A later edit deleted every cell it covered: references to it are
+    /// `#REF!`.
+    pub deleted: bool,
+}
+
 /// A workbook-level defined name: `TaxRate` → `0.21`, `Data` →
 /// `Sheet1!$A$1:$B$9`. `scope` restricts the name to one sheet
 /// (`localSheetId`); None = workbook-global.
@@ -1571,7 +1583,7 @@ pub struct Workbook {
     /// relationship, `<tablePart>` and content type. Only parts named here
     /// are ever dropped, so a table part the loader couldn't read is kept.
     /// Undo restores this list with the tables, which brings a part back.
-    pub removed_tables: Vec<Table>,
+    pub removed_tables: Vec<RemovedTable>,
     /// Pivot tables (parsed read-only from their preserved parts, so they
     /// can be refreshed from current source data).
     pub pivots: Vec<crate::pivot::Pivot>,

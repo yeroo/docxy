@@ -1486,9 +1486,12 @@ fn group_cells<'a>(
         .collect()
 }
 
-/// Sheets + defined names — the whole calculated state, snapshotted around
-/// structural edits (row/column insert-delete, sheet rename) whose inverse
-/// is not expressible as per-cell changes.
+/// The workbook state around a structural edit whose inverse is not
+/// expressible as per-cell changes (row/column insert-delete, sheet rename,
+/// the table commands — Table Name, Resize Table, Convert to Range): sheets,
+/// defined names, the tables (live, and converted ones whose parts await the
+/// save), the PivotTables' sources, and a table rename to replay on the data
+/// model.
 #[derive(Clone)]
 struct WbSnapshot {
     sheets: Vec<gridcore::sheet::Sheet>,
@@ -1496,7 +1499,7 @@ struct WbSnapshot {
     /// Tables move with row edits and change with the table commands; the
     /// converted ones keep their parts until a save.
     tables: Vec<gridcore::sheet::Table>,
-    removed_tables: Vec<gridcore::sheet::Table>,
+    removed_tables: Vec<gridcore::sheet::RemovedTable>,
     /// Each PivotTable's source: a table rename moves it.
     pivot_sources: Vec<gridcore::pivot::PivotSource>,
     /// A table rename (from, to) to replay on the data model when this

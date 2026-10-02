@@ -5679,6 +5679,7 @@ fn table_children(xml: &str, name: &str) -> Vec<(usize, usize)> {
 struct ConvertedTable {
     part: String,
     loaded_name: String,
+    deleted: bool,
     sheet: usize,
     sheet_name: String,
     info: crate::formula::TableInfo,
@@ -5723,6 +5724,7 @@ fn rewrite_column_formulas(
                         name: &c.loaded_name,
                         sheet_name: &c.sheet_name,
                         info: &c.info,
+                        deleted: c.deleted,
                     };
                     let host = crate::formula::FormulaHost {
                         same_sheet: c.sheet == own_sheet,
@@ -5905,12 +5907,14 @@ fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
     let converted: Vec<ConvertedTable> = wb
         .removed_tables
         .iter()
-        .filter(|r| !wb.tables.iter().any(|t| t.part == r.part))
-        .filter_map(|r| {
+        .filter(|r| !wb.tables.iter().any(|t| t.part == r.table.part))
+        .filter_map(|removed| {
+            let r = &removed.table;
             let loaded_name = table_part_name(&part_xml(parts, &r.part)?)?;
             Some(ConvertedTable {
                 part: r.part.clone(),
                 loaded_name,
+                deleted: removed.deleted,
                 sheet: r.sheet,
                 sheet_name: wb.sheets.get(r.sheet)?.name.clone(),
                 info: crate::formula::TableInfo {
@@ -7720,9 +7724,12 @@ impl SheetPackage {
         // tables, printer settings), each with its content-type Override.
         drop_parts_cascading(&mut self.parts, &part_name);
         self.workbook.tables.retain(|t| t.sheet != idx);
-        self.workbook.removed_tables.retain(|t| t.sheet != idx);
+        self.workbook
+            .removed_tables
+            .retain(|t| t.table.sheet != idx);
         let wb = &mut self.workbook;
-        for t in wb.tables.iter_mut().chain(wb.removed_tables.iter_mut()) {
+        let removed = wb.removed_tables.iter_mut().map(|r| &mut r.table);
+        for t in wb.tables.iter_mut().chain(removed) {
             if t.sheet > idx {
                 t.sheet -= 1;
             }
@@ -18690,6 +18697,63 @@ mod table_command_tests {
         assert!(!rels.contains(file), "{rels}");
         let ct = text(&re, "[Content_Types].xml");
         assert!(!ct.contains(&format!("/{part1}")), "{ct}");
+    }
+
+    /// Table1 (A1:B3) converted to a range after Table2 (A6:B7) took a
+    /// column formula over it.
+    fn converted_under_a_column_formula(formula: &str) -> (SheetPackage, String) {
+        let mut pkg = one_table();
+        let s = &mut pkg.workbook.sheets[0];
+        s.set_cell(5, 0, Cell::text("Key"));
+        s.set_cell(5, 1, Cell::text("Calc"));
+        s.set_cell(6, 0, Cell::text("x"));
+        pkg.add_table(0, (5, 0, 6, 1), true, "TableStyleMedium2")
+            .unwrap();
+        let part2 = pkg.workbook.tables[1].part.clone();
+        calculated(&mut pkg, &part2, "Calc", formula);
+        convert_table_to_range(&mut pkg.workbook, "Table1").unwrap();
+        (pkg, part2)
+    }
+
+    #[test]
+    fn a_converted_table_follows_later_row_and_column_edits() {
+        let (mut pkg, part2) = converted_under_a_column_formula("SUM(Table1[Qty])");
+        crate::edit::insert_rows(&mut pkg.workbook, 0, 0, 1);
+        crate::edit::insert_cols(&mut pkg.workbook, 0, 0, 2);
+        let re = reload(&pkg);
+        // The cell formula and the column formula read the same cells.
+        let d = re.workbook.sheets[0].cell(1, 5).unwrap();
+        assert_eq!(d.formula.as_deref(), Some("SUM($D$3:$D$4)"));
+        assert_eq!(column_formula(&re, &part2), "SUM($D$3:$D$4)");
+    }
+
+    #[test]
+    fn a_column_inserted_inside_a_converted_table_widens_it() {
+        let (mut pkg, part2) = converted_under_a_column_formula("SUM(Table1[Qty])");
+        crate::edit::insert_cols(&mut pkg.workbook, 0, 1, 1);
+        let re = reload(&pkg);
+        let d = re.workbook.sheets[0].cell(0, 4).unwrap();
+        assert_eq!(d.formula.as_deref(), Some("SUM($C$2:$C$3)"));
+        assert_eq!(column_formula(&re, &part2), "SUM($C$2:$C$3)");
+    }
+
+    #[test]
+    fn a_converted_tables_deleted_cells_are_ref_errors() {
+        // Its Item column goes: Qty moves left, Item references go.
+        let (mut pkg, part2) =
+            converted_under_a_column_formula("SUM(Table1[Qty])&COUNTA(Table1[Item])");
+        crate::edit::delete_cols(&mut pkg.workbook, 0, 0, 1);
+        assert_eq!(
+            column_formula(&reload(&pkg), &part2),
+            "SUM($A$2:$A$3)&COUNTA(#REF!)"
+        );
+        // All of its rows go.
+        let (mut pkg, part2) = converted_under_a_column_formula("SUM(Table1[Qty])");
+        crate::edit::delete_rows(&mut pkg.workbook, 0, 0, 3);
+        let re = reload(&pkg);
+        assert_eq!(column_formula(&re, &part2), "SUM(#REF!)");
+        let d = re.workbook.sheets[0].cell(0, 3);
+        assert!(d.is_none(), "D1 went with its row");
     }
 
     #[test]

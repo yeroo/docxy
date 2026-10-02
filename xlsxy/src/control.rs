@@ -43,7 +43,7 @@
 //! | `sheet.rename` | `{sheet,name}` | `{name}` |
 //! | `table.list` | — | `{tables:[{name,sheet,sheet_name,ref,columns,header_rows,totals_rows}]}` |
 //! | `table.rename` | `{name,new}` | the table, as `table.list` shows it — Excel's name rules; every formula naming it follows. One undo step |
-//! | `table.resize` | `{name,ref}` | the table — the header row stays, the new range overlaps the old. One undo step |
+//! | `table.resize` | `{name,ref}` | the table — the header row stays, the new range overlaps the old and keeps a data row; a table with a Total Row keeps its bottom row; new columns' unique names are written into their header cells. One undo step |
 //! | `table.convert` | `{name}` | `{converted}` — structured references become cell references; refused while a PivotTable, a SUMX-style formula or the data model uses the table. One undo step |
 //! | `row.insert` / `row.delete` | `{at,count?,sheet?}` | `{inserted\|deleted}` |
 //! | `col.insert` / `col.delete` | `{at,count?,sheet?}` | `{inserted\|deleted}` |
