@@ -7960,8 +7960,6 @@ fn autorecover_prepare(tabs: &mut [DocTab]) -> bool {
     tabs.iter().any(|t| t.dirty)
 }
 
-/// Serialize a document to `.docx` bytes, adding a numbering part when it uses
-/// lists (so markers survive the round-trip and open correctly in Word).
 /// The comments `tab` lists and saves (#620): every one it loaded, and each
 /// one added since while a marker with its id is in `doc`'s body. Undo of
 /// Add Comment takes the markers, so the comment goes; [`doc_to_docx`] then
@@ -7981,13 +7979,26 @@ fn live_comments(tab: &DocTab, doc: &Document) -> Vec<Comment> {
 /// Add a comment on `tab`'s selection: its markers go around the selection
 /// as one undo step, and the comment is stamped with `identity` (name,
 /// initials) and the UTC time (#620). Its id is one past every id the tab
-/// has used, an undone or deleted one included. `None` with no selection.
+/// has used, an undone or deleted one included: one still in the base
+/// package would make the save keep that comment's text on the new markers.
+/// `None` with no selection.
 fn add_doc_comment(tab: &mut DocTab, text: String, identity: (String, String)) -> Option<i32> {
+    let base: Vec<String> = tab
+        .pkg
+        .as_ref()
+        .map(|p| {
+            docxcore::comments::parse_comments(p)
+                .into_iter()
+                .map(|c| c.id)
+                .collect()
+        })
+        .unwrap_or_default();
     let id = tab
         .comments
         .iter()
         .map(|c| &c.id)
         .chain(&tab.session_comment_ids)
+        .chain(&base)
         .filter_map(|id| id.parse::<i32>().ok())
         .max()
         .map_or(1, |m| m + 1);
@@ -8041,6 +8052,8 @@ fn utc_now_iso() -> String {
     docxcore::field::format_iso(&docxcore::field::civil_from_unix(secs))
 }
 
+/// Serialize a document to `.docx` bytes, adding a numbering part when it uses
+/// lists (so markers survive the round-trip and open correctly in Word).
 fn doc_to_docx(doc: &Document, comments: &[Comment], base: Option<&Package>) -> Vec<u8> {
     doc_to_docx_styled(doc, comments, base, false)
 }

@@ -3,7 +3,7 @@
 //! harness's `inspect` verb both come here, so a test of these functions
 //! tests the button.
 
-use crate::{DocTab, Surface};
+use crate::{DocTab, Surface, live_comments};
 
 /// One of the inspector's categories, in the order the page lists them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,7 +145,9 @@ pub(crate) fn inspect_doc_tab(tab: &DocTab) -> Option<Inspection> {
     };
     let doc = &editor.doc;
     Some(Inspection {
-        comments: tab.comments.len(),
+        // What the pane lists and a save writes: an undone new comment is
+        // not there (#620).
+        comments: live_comments(tab, doc).len(),
         comment_markers: docxcore::inspect::has_comment_markers(doc),
         revisions: doc.revisions().len(),
         hidden: docxcore::inspect::count_hidden_runs(doc),
@@ -165,9 +167,8 @@ pub(crate) fn inspect_remove(
     tab: &mut DocTab,
     category: InspectCategory,
 ) -> Result<String, String> {
-    let found = inspect_doc_tab(tab)
-        .ok_or("the active tab is not a document")?
-        .found(category);
+    let inspection = inspect_doc_tab(tab).ok_or("the active tab is not a document")?;
+    let found = inspection.found(category);
     if !found {
         let status = format!("{}: nothing to remove", category.title());
         tab.status = status.clone().into();
@@ -179,7 +180,14 @@ pub(crate) fn inspect_remove(
     let (status, changed) = match category {
         InspectCategory::Comments => {
             let markers = editor.remove_all_comment_markers();
-            let comments = std::mem::take(&mut tab.comments).len();
+            // A comment added this session keeps its record, unlisted and
+            // unsaved now its markers are gone, so undoing this brings it
+            // back whole with them (#620).
+            let before = tab.comments.len();
+            let session = &tab.session_comment_ids;
+            tab.comments.retain(|c| session.contains(&c.id));
+            let dropped = before - tab.comments.len();
+            let comments = inspection.comments;
             // The save reconciles comments.xml against `comments` by exact
             // id prefix; emptying the part directly misses none.
             let part = tab
@@ -188,7 +196,7 @@ pub(crate) fn inspect_remove(
                 .is_some_and(docxcore::inspect::empty_comments_part);
             (
                 format!("Removed all comments ({comments})"),
-                markers > 0 || comments > 0 || part,
+                markers > 0 || dropped > 0 || part,
             )
         }
         InspectCategory::Revisions => {

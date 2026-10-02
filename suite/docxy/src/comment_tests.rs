@@ -206,3 +206,119 @@ fn user_name_round_trips_through_the_session_and_old_sessions_load() {
     assert_eq!(old.user_name, "");
     assert_eq!(old.user_initials, "");
 }
+
+/// A package whose body carries the markers of each of `comments` (around
+/// the whole text) and whose comments.xml holds them, as Word saves them.
+fn commented_package(comments: &[(i32, &str)]) -> Package {
+    let mut ed = docxcore::editor::Editor::new(docxcore::markdown::from_markdown(FOX));
+    for (id, _) in comments {
+        ed.select_all();
+        assert!(ed.add_comment(&id.to_string()));
+    }
+    let mut pkg = new_package(ed.doc);
+    for (id, text) in comments {
+        pkg.add_comment(*id, "Ann", "A", "2020-01-02T03:04:05Z", text);
+    }
+    pkg
+}
+
+/// The comments pane's delete: the markers, then the record.
+fn delete_as_the_pane_does(tab: &mut DocTab, id: i32) {
+    editor(tab).remove_comment_markers(&id.to_string());
+    tab.comments.retain(|c| c.id != id.to_string());
+}
+
+/// FIX r1 #1: a deleted loaded comment's id is still in the base package;
+/// a new comment that took it would be saved with the old text.
+#[test]
+fn a_new_comment_never_takes_a_deleted_loaded_comments_id() {
+    let dir = Scratch::new();
+    let (mut tab, path) = docx_tab(&dir, &commented_package(&[(1, "First"), (2, "Second")]));
+    assert_eq!(tab.comments.len(), 2);
+    delete_as_the_pane_does(&mut tab, 2);
+    let id = comment(&mut tab, "Colour?");
+    assert_eq!(id, 3);
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    let (doc, comments) = saved(&path);
+    let parsed = docxcore::comments::parse_comments_xml(&comments);
+    let texts: Vec<(String, String)> = parsed.into_iter().map(|c| (c.id, c.text)).collect();
+    assert_eq!(
+        texts,
+        [
+            ("1".to_string(), "First".to_string()),
+            ("3".to_string(), "Colour?".to_string())
+        ]
+    );
+    assert_eq!(markers(&doc, 2), 0, "{doc}");
+    assert_eq!(markers(&doc, 3), 3, "{doc}");
+}
+
+/// FIX r1 #4: a comment added and deleted before any save is in neither
+/// `comments` nor the base; undoing the delete brings its markers back, so
+/// the next comment must still not take its id.
+#[test]
+fn an_undone_delete_of_a_new_comment_keeps_its_id_taken() {
+    let dir = Scratch::new();
+    let (mut tab, _) = docx_tab(&dir, &fox_package());
+    let first = comment(&mut tab, "one");
+    delete_as_the_pane_does(&mut tab, first);
+    assert!(editor(&mut tab).undo(), "the delete");
+    let second = comment(&mut tab, "two");
+    assert_ne!(first, second);
+    let doc = docxcore::serialize::document_to_xml(&editor(&mut tab).doc);
+    assert_eq!(markers(&doc, second), 3, "{doc}");
+}
+
+/// FIX r1 #3: the inspector counts what the pane lists, so an undone new
+/// comment is not "found".
+#[test]
+fn the_inspector_does_not_count_an_undone_comment() {
+    use crate::inspector::{InspectCategory, inspect_doc_tab};
+    let dir = Scratch::new();
+    let (mut tab, _) = docx_tab(&dir, &fox_package());
+    comment(&mut tab, "Colour?");
+    assert_eq!(inspect_doc_tab(&tab).unwrap().comments, 1);
+    assert!(editor(&mut tab).undo());
+    let after = inspect_doc_tab(&tab).unwrap();
+    assert_eq!(after.comments, 0);
+    assert!(!after.found(InspectCategory::Comments));
+}
+
+/// FIX r1 #3: add, undo, Remove All, redo, save. With no markers left,
+/// Remove All pushes no undo step, so redo still brings the markers back:
+/// their comment must come back with them, never bare markers.
+#[test]
+fn remove_all_after_an_undone_comment_then_redo_saves_it_whole() {
+    use crate::inspector::{InspectCategory, inspect_remove};
+    let dir = Scratch::new();
+    let (mut tab, path) = docx_tab(&dir, &fox_package());
+    let id = comment(&mut tab, "Colour?");
+    assert!(editor(&mut tab).undo());
+    inspect_remove(&mut tab, InspectCategory::Comments).unwrap();
+    assert!(
+        editor(&mut tab).redo(),
+        "redo survives a Remove All that found nothing"
+    );
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    let (doc, comments) = saved(&path);
+    assert_eq!(markers(&doc, id), 3, "{doc}");
+    assert!(comments.contains("Colour?"), "orphan markers: {comments}");
+}
+
+/// FIX r1 #3: Remove All keeps a new comment's record, so undoing it brings
+/// the comment back with its markers.
+#[test]
+fn undo_of_remove_all_brings_a_new_comment_back_whole() {
+    use crate::inspector::{InspectCategory, inspect_remove};
+    let dir = Scratch::new();
+    let (mut tab, path) = docx_tab(&dir, &fox_package());
+    let id = comment(&mut tab, "Colour?");
+    inspect_remove(&mut tab, InspectCategory::Comments).unwrap();
+    assert!(listed(&tab).is_empty());
+    assert!(editor(&mut tab).undo(), "the Remove All");
+    assert_eq!(listed(&tab).len(), 1);
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    let (doc, comments) = saved(&path);
+    assert_eq!(markers(&doc, id), 3, "{doc}");
+    assert!(comments.contains("Colour?"), "{comments}");
+}
