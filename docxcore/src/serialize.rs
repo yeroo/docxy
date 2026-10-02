@@ -320,38 +320,34 @@ fn write_ppr(s: &mut String, props: &ParProps) {
     }
     if let Some(f) = &props.frame {
         let mut x = String::from("<w:framePr");
-        if let Some(v) = f.w {
-            x.push_str(&format!(" w:w=\"{v}\""));
-        }
-        if let Some(v) = f.h {
-            x.push_str(&format!(" w:h=\"{v}\""));
-        }
-        if let Some(a) = &f.h_anchor {
-            x.push_str(" w:hAnchor=\"");
-            esc_attr(a, &mut x);
-            x.push('"');
-        }
-        if let Some(a) = &f.v_anchor {
-            x.push_str(" w:vAnchor=\"");
-            esc_attr(a, &mut x);
-            x.push('"');
-        }
-        if let Some(a) = &f.x_align {
-            x.push_str(" w:xAlign=\"");
-            esc_attr(a, &mut x);
-            x.push('"');
-        }
-        if let Some(a) = &f.y_align {
-            x.push_str(" w:yAlign=\"");
-            esc_attr(a, &mut x);
-            x.push('"');
-        }
-        if let Some(v) = f.x {
-            x.push_str(&format!(" w:x=\"{v}\""));
-        }
-        if let Some(v) = f.y {
-            x.push_str(&format!(" w:y=\"{v}\""));
-        }
+        // CT_FramePr's attribute order.
+        let int = |x: &mut String, name: &str, v: Option<i32>| {
+            if let Some(v) = v {
+                x.push_str(&format!(" w:{name}=\"{v}\""));
+            }
+        };
+        let text = |x: &mut String, name: &str, v: &Option<String>| {
+            if let Some(v) = v {
+                x.push_str(&format!(" w:{name}=\""));
+                esc_attr(v, x);
+                x.push('"');
+            }
+        };
+        text(&mut x, "dropCap", &f.drop_cap);
+        int(&mut x, "lines", f.lines);
+        int(&mut x, "w", f.w);
+        int(&mut x, "h", f.h);
+        int(&mut x, "vSpace", f.v_space);
+        int(&mut x, "hSpace", f.h_space);
+        text(&mut x, "wrap", &f.wrap);
+        text(&mut x, "hAnchor", &f.h_anchor);
+        text(&mut x, "vAnchor", &f.v_anchor);
+        int(&mut x, "x", f.x);
+        text(&mut x, "xAlign", &f.x_align);
+        int(&mut x, "y", f.y);
+        text(&mut x, "yAlign", &f.y_align);
+        text(&mut x, "hRule", &f.h_rule);
+        text(&mut x, "anchorLock", &f.anchor_lock);
         x.push_str("/>");
         parts.push((ppr_rank("framePr"), x));
     }
@@ -1707,8 +1703,7 @@ mod tests {
             h: None,
             h_anchor: Some("page".to_string()),
             v_anchor: Some("page".to_string()),
-            x_align: None,
-            y_align: None,
+            ..Default::default()
         };
         let pp = ParProps {
             frame: Some(frame),

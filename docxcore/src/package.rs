@@ -2841,6 +2841,32 @@ mod tests {
         <w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/></w:sectPr>\
         </w:body></w:document>";
 
+    /// #628: Word's envelope delivery address carries `w:wrap="auto"`; a
+    /// save used to rewrite it as an empty `<w:framePr/>`. Every CT_FramePr
+    /// attribute survives too.
+    #[test]
+    fn frame_pr_attributes_survive_save_628() {
+        const ALL: &str = "<w:framePr w:dropCap=\"drop\" w:lines=\"3\" w:w=\"4320\" \
+            w:h=\"1440\" w:vSpace=\"10\" w:hSpace=\"180\" w:wrap=\"around\" w:hAnchor=\"page\" \
+            w:vAnchor=\"text\" w:x=\"100\" w:xAlign=\"center\" w:y=\"200\" w:yAlign=\"bottom\" \
+            w:hRule=\"exact\" w:anchorLock=\"1\"/>";
+        let doc = format!(
+            "<?xml version=\"1.0\"?><w:document xmlns:w=\"x\"><w:body>\
+             <w:p><w:pPr><w:framePr w:wrap=\"auto\"/></w:pPr><w:r><w:t>A</w:t></w:r></w:p>\
+             <w:p><w:pPr>{ALL}</w:pPr><w:r><w:t>B</w:t></w:r></w:p>\
+             <w:sectPr/></w:body></w:document>"
+        );
+        let mut pkg = load_package(&make_docx(&doc)).unwrap();
+        // A real edit, so the body is re-serialized rather than kept verbatim.
+        pkg.document
+            .body
+            .push(crate::model::Block::Paragraph(Default::default()));
+        let saved = load_package(&save_package(&pkg)).unwrap();
+        let xml = saved.part_text("word/document.xml").unwrap();
+        assert!(xml.contains("<w:framePr w:wrap=\"auto\"/>"), "{xml}");
+        assert!(xml.contains(ALL), "{xml}");
+    }
+
     #[test]
     fn protection_boolean_lexical_forms_and_enforcement_defaults() {
         for value in ["1", "true", "on", "TRUE", "ON", " true ", "\tON\r\n"] {
