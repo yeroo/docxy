@@ -1651,7 +1651,8 @@ impl Package {
     }
 
     /// The data source file the document's mail merge names, if any.
-    pub fn mail_merge_source(&self) -> Option<String> {
+    #[cfg(test)]
+    fn mail_merge_source(&self) -> Option<String> {
         self.mail_merge()?.source
     }
 

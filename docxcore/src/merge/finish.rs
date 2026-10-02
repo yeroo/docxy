@@ -50,9 +50,11 @@ pub fn merge_rows(recipients: &Recipients, range: MergeRange) -> Vec<usize> {
 /// (a sheet of labels). Letters, e-mail, envelopes and labels put each copy
 /// in its own next-page section; a directory runs them on.
 ///
-/// Bookmarks, comment anchors and footnote/endnote references are kept in
-/// the first copy only, so no `w:id` repeats. Merge fields in headers and
-/// footers (shared parts) stay fields. The result has no `w:mailMerge`.
+/// Bookmarks, comment ranges and references, and footnote/endnote
+/// references are kept in the first copy only, so their ids do not repeat.
+/// Tracked changes (`w:ins`, `w:del`, `w:moveTo`, move ranges) keep their own
+/// ids in every copy. Merge fields in headers and footers (shared parts) stay
+/// fields. The result has no `w:mailMerge`.
 pub fn merge_package(
     main: &Package,
     recipients: &Recipients,
@@ -136,6 +138,74 @@ pub fn check_errors(
         }
     });
     missing
+}
+
+/// The merge fields in `doc` that a merge leaves as they are: inside a
+/// tracked move (`w:moveTo`/`w:moveFrom`) or another element docxy keeps as
+/// raw XML (an inline `w:customXml`, a block content control), which merging,
+/// previewing and Check for Errors's column test do not reach. Each is named
+/// as Check for Errors lists it: a MERGEFIELD by its column, any other by its
+/// placeholder.
+pub fn unmerged_fields(doc: &crate::model::Document) -> Vec<String> {
+    fn scan(raw: &str, out: &mut Vec<String>) {
+        let mut instrs: Vec<String> = crate::load::start_tags(raw, "w:fldSimple")
+            .into_iter()
+            .filter_map(|(_, el)| crate::load::xml_attr_value(el, "w:instr"))
+            .map(|i| crate::field::xml_unescape(&i))
+            .collect();
+        let mut cur: Option<String> = None;
+        for event in crate::field::field_events(raw) {
+            match event {
+                crate::field::FieldEvent::Begin => cur = Some(String::new()),
+                crate::field::FieldEvent::Instr(t) => {
+                    if let Some(c) = cur.as_mut() {
+                        c.push_str(&crate::field::xml_unescape(&t));
+                    }
+                }
+                _ => instrs.extend(cur.take()),
+            }
+        }
+        for instr in instrs {
+            let name = match super::fields::instr_kind(&instr) {
+                Some(MergeFieldKind::MergeField { name, .. }) => name,
+                Some(kind) => kind.placeholder(),
+                None => continue,
+            };
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+    }
+    fn inlines(items: &[Inline], out: &mut Vec<String>) {
+        for i in items {
+            match i {
+                Inline::Raw(raw) | Inline::UnsupportedRevision { raw, .. } => scan(raw, out),
+                Inline::Hyperlink(h) => inlines(&h.content, out),
+                Inline::Revision { content, .. } => inlines(content, out),
+                Inline::TextBox { blocks, .. } => walk(blocks, out),
+                _ => {}
+            }
+        }
+    }
+    fn walk(blocks: &[Block], out: &mut Vec<String>) {
+        for b in blocks {
+            match b {
+                Block::Paragraph(p) => inlines(&p.content, out),
+                Block::Table(t) => {
+                    for row in &t.rows {
+                        for cell in &row.cells {
+                            walk(&cell.blocks, out);
+                        }
+                    }
+                }
+                Block::Raw(raw) => scan(raw, out),
+                Block::SectionProperties(_) => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&doc.body, &mut out);
+    out
 }
 
 /// End the section at the last paragraph of `blocks` with `sect`, or with a
@@ -355,6 +425,14 @@ fn strip_ids(blocks: &mut Vec<Block>) {
                 inlines(&mut p.content);
             }
             Block::Table(t) => {
+                // Bookmarks and comment ranges between rows.
+                t.row_boundaries.retain_mut(|b| match &mut b.kind {
+                    crate::model::TableRowBoundaryKind::Raw(raw) => {
+                        *raw = strip_marker_xml(raw);
+                        !raw.trim().is_empty()
+                    }
+                    _ => true,
+                });
                 for row in &mut t.rows {
                     for cell in &mut row.cells {
                         strip_ids(&mut cell.blocks);
@@ -661,6 +739,67 @@ mod tests {
             "{xml}"
         );
         assert_eq!(xml.matches("<w:bookmarkEnd w:id=\"6\"").count(), 1, "{xml}");
+    }
+
+    /// r3 m1: a merge field a merge cannot reach is reported, not lost.
+    #[test]
+    fn unmerged_fields_lists_fields_inside_moves_and_raw_wrappers() {
+        let xml = format!(
+            "<w:document xmlns:w=\"{W}\"><w:body><w:p>\
+             <w:moveTo w:id=\"70\" w:author=\"A\" w:date=\"2026-01-01T00:00:00Z\">\
+             <w:fldSimple w:instr=\" MERGEFIELD City \"><w:r><w:t>\u{AB}City\u{BB}</w:t></w:r></w:fldSimple>\
+             </w:moveTo>\
+             <w:customXml w:element=\"x\">\
+             <w:r><w:fldChar w:fldCharType=\"begin\"/></w:r><w:r><w:instrText> GREETING</w:instrText></w:r>\
+             <w:r><w:instrText>LINE </w:instrText></w:r><w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+             <w:r><w:t>x</w:t></w:r><w:r><w:fldChar w:fldCharType=\"end\"/></w:r></w:customXml>\
+             <w:fldSimple w:instr=\" MERGEFIELD First \"><w:r><w:t>f</w:t></w:r></w:fldSimple>\
+             </w:p></w:body></w:document>"
+        );
+        let doc = crate::load::parse_document_xml(&xml, &Default::default());
+        assert_eq!(
+            unmerged_fields(&doc),
+            ["City".to_string(), "\u{AB}GreetingLine\u{BB}".to_string()]
+        );
+        assert!(unmerged_fields(&letter().document).is_empty());
+    }
+
+    /// r3 m2: a bookmark between table rows is a row boundary; it too is
+    /// kept in the first copy only.
+    #[test]
+    fn table_row_boundary_markers_only_in_the_first_copy() {
+        let r = people();
+        let xml = format!(
+            "<w:document xmlns:w=\"{W}\"><w:body><w:tbl><w:tblGrid><w:gridCol w:w=\"100\"/></w:tblGrid>\
+             <w:bookmarkStart w:id=\"40\" w:name=\"rows\"/>\
+             <w:tr><w:tc><w:p><w:fldSimple w:instr=\" MERGEFIELD First \"><w:r><w:t>f</w:t></w:r></w:fldSimple></w:p></w:tc></w:tr>\
+             <w:bookmarkEnd w:id=\"40\"/>\
+             </w:tbl><w:p/></w:body></w:document>"
+        );
+        let doc = crate::load::parse_document_xml(&xml, &Default::default());
+        assert!(
+            matches!(&doc.body[0], Block::Table(t) if !t.row_boundaries.is_empty()),
+            "{:?}",
+            doc.body[0]
+        );
+        let out = merge_package(&new_package(doc), &r, &opts(&r, MainDocType::Letters)).unwrap();
+        for b in &out.document.body {
+            if let Block::Table(t) = b {
+                assert_eq!(t.validate_row_boundaries(), Ok(()));
+            }
+        }
+        let xml = crate::serialize::document_to_xml(&out.document);
+        assert_eq!(
+            xml.matches("<w:bookmarkStart w:id=\"40\"").count(),
+            1,
+            "{xml}"
+        );
+        assert_eq!(
+            xml.matches("<w:bookmarkEnd w:id=\"40\"").count(),
+            1,
+            "{xml}"
+        );
+        assert!(xml.contains("Amy"), "{xml}");
     }
 
     #[test]

@@ -881,7 +881,7 @@ pub fn parse_iso(s: &str) -> Option<DateTime> {
     })
 }
 
-fn xml_unescape(s: &str) -> String {
+pub(crate) fn xml_unescape(s: &str) -> String {
     s.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")

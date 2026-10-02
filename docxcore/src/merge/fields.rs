@@ -94,7 +94,7 @@ pub fn might_be_merge_field(raw: &str) -> bool {
 }
 
 /// The mail-merge field an (entity-decoded) instruction is, if any.
-pub fn instr_kind(instr: &str) -> Option<MergeFieldKind> {
+pub(crate) fn instr_kind(instr: &str) -> Option<MergeFieldKind> {
     let s = instr.trim();
     let name_end = s.find(char::is_whitespace).unwrap_or(s.len());
     let keyword = s[..name_end].to_ascii_uppercase();

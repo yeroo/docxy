@@ -789,18 +789,31 @@ fn apply(tab: &mut DocTab, d: &Dialog) -> Result<(), String> {
                 return Err("Mail merge needs a document".into());
             };
             let missing = docxcore::merge::check_errors(&ed.doc, r, &tab.mail.map);
-            let text = if missing.is_empty() {
-                "No mail merge errors have been found.".to_string()
-            } else {
-                format!(
+            let unmerged = docxcore::merge::unmerged_fields(&ed.doc);
+            let mut parts = Vec::new();
+            if !missing.is_empty() {
+                parts.push(format!(
                     "These merge fields name no column of the recipient list:\n\n{}",
                     missing.join("\n")
-                )
+                ));
+            }
+            if !unmerged.is_empty() {
+                parts.push(format!(
+                    "These merge fields are inside a tracked move or an unsupported \
+                     wrapper and are not merged; accept the change first:\n\n{}",
+                    unmerged.join("\n")
+                ));
+            }
+            let n = missing.len() + unmerged.len();
+            let text = if parts.is_empty() {
+                "No mail merge errors have been found.".to_string()
+            } else {
+                parts.join("\n\n")
             };
-            tab.status = if missing.is_empty() {
+            tab.status = if n == 0 {
                 "No mail merge errors".to_string()
             } else {
-                format!("{} merge field errors", missing.len())
+                format!("{n} merge field errors")
             }
             .into();
             tab.dialogs

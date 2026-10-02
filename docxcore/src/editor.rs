@@ -192,11 +192,6 @@ impl Editor {
         self.refresh_merge_preview();
     }
 
-    /// The record Preview Results shows, if it is on.
-    pub fn merge_preview(&self) -> Option<&crate::merge::MergePreview> {
-        self.merge_preview.as_ref()
-    }
-
     /// Re-apply the merge preview (or its absence) to every merge field. Hosts
     /// call it after an edit that may have added a merge field; undo and redo
     /// call it themselves. Free when no preview was ever shown.
