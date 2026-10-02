@@ -311,3 +311,21 @@ fn an_old_session_of_a_damaged_file_still_refuses_save_over_it() {
     assert!(!save_doc_tab(&mut back, None));
     assert_eq!(std::fs::read(&cut).unwrap(), &bytes[..bytes.len() / 2]);
 }
+
+/// FIX r1 M3: attaching a recipient list gives a converted tab its package
+/// (`mailings_tab::package`); that package must define the heading styles
+/// the conversion uses, or Save As writes `Heading1` with no definition.
+#[test]
+fn a_converted_tab_given_a_mail_merge_package_keeps_its_heading_style() {
+    let dir = Scratch::new();
+    let mut tab = tab_from_path(&write(&dir, "letter.rtf", RTF));
+    assert!(tab.pkg.is_none());
+    let list = write(&dir, "people.csv", b"Name,City\nAda,London\n");
+    crate::mailings_tab::attach(&mut tab, &list).unwrap();
+    assert!(tab.pkg.is_some());
+    let docx = dir.path("letter.docx");
+    assert!(save_doc_tab(&mut tab, Some(docx.clone())), "{}", tab.status);
+    let pkg = docxcore::package::load_package(&std::fs::read(&docx).unwrap()).unwrap();
+    let styles = String::from_utf8_lossy(pkg.part("word/styles.xml").unwrap()).into_owned();
+    assert!(styles.contains("w:styleId=\"Heading1\""), "{styles}");
+}

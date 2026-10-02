@@ -629,7 +629,10 @@ fn package(tab: &mut DocTab) -> Result<&mut Package, String> {
         let Surface::Doc(ed) = &tab.surface else {
             return Err("Mail merge needs a document".into());
         };
-        let bytes = doc_to_docx(&ed.doc, &tab.comments, None);
+        // A tab converted from RTF, a Web Page or a PDF (#633) gets the
+        // Markdown package, which defines the heading styles it uses.
+        let bytes =
+            crate::doc_to_docx_styled(&ed.doc, &tab.comments, None, tab.access.converted.is_some());
         tab.pkg = Some(docxcore::package::load_package(&bytes).map_err(|e| e.to_string())?);
     }
     Ok(tab.pkg.as_mut().expect("just made"))
