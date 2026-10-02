@@ -8411,11 +8411,14 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         let replace = app.edit.as_ref().is_some_and(|e| e.replace);
         // A caret move keeps an AutoComplete proposal's text and drops its
         // marker; the keys that commit take the proposal in `commit_edit`.
-        if matches!(
-            key.code,
-            KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End
-        ) && !replace
-        {
+        // Home/End move the caret in every mode; Left/Right only outside
+        // type-over, where they commit instead.
+        let caret_move = match key.code {
+            KeyCode::Home | KeyCode::End => true,
+            KeyCode::Left | KeyCode::Right => !replace,
+            _ => false,
+        };
+        if caret_move {
             if let Some(e) = &mut app.edit {
                 e.proposal = None;
             }
@@ -15757,15 +15760,40 @@ mod tests {
         );
         assert!(app.edit.is_none());
         assert_eq!(value_at(&app, 3, 0), CellValue::Text("Banana".into()));
-        // A caret move (in an F2 editor) keeps the text, marker dropped.
+        // Home in a typed (type-over) entry is a caret move too: the text
+        // stays as shown and typing goes where the caret went.
         app.cur = (4, 0);
+        type_text(&mut app, "ap");
+        press(&mut app, KeyCode::Home);
+        let e = app.edit.as_ref().unwrap();
+        assert_eq!(
+            (e.text.as_str(), e.cursor, &e.proposal),
+            ("apple", 0, &None)
+        );
+        type_text(&mut app, "x");
+        assert_eq!(app.edit.as_ref().unwrap().text, "xapple");
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(value_at(&app, 4, 0), CellValue::Text("xapple".into()));
+        app.cur = (5, 1);
+        put(&mut app, 4, 1, "Plum");
+        type_text(&mut app, "p");
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            value_at(&app, 5, 1),
+            CellValue::Text("plum".into()),
+            "End kept the text as typed, not the value's case"
+        );
+        // A caret move (in an F2 editor) keeps the text, marker dropped.
+        app.cur = (5, 0);
         press(&mut app, KeyCode::F(2));
         type_text(&mut app, "ap");
         assert_eq!(app.edit.as_ref().unwrap().text, "apple");
         press(&mut app, KeyCode::Home);
         assert_eq!(app.edit.as_ref().unwrap().proposal, None);
         press(&mut app, KeyCode::Enter);
-        assert_eq!(value_at(&app, 4, 0), CellValue::Text("apple".into()));
+        assert_eq!(value_at(&app, 5, 0), CellValue::Text("apple".into()));
         // Off: nothing is proposed.
         app.edit_opts.autocomplete = false;
         app.cur = (6, 0);

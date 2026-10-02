@@ -1167,9 +1167,11 @@ fn text_options(
     Ok((opts, origin))
 }
 
-/// File › Options › Data › Automatic Data Conversion: set any of the four
-/// switches given, and return all four. They apply to the next `.csv`/text
-/// open and are saved with the app's preferences on exit.
+/// File › Options: Data › Automatic Data Conversion's four switches and
+/// Advanced › Editing's options (#672). Every key given is checked before
+/// any is set, so a bad one changes nothing; the reply holds every value,
+/// set or not. The conversion switches apply to the next `.csv`/text open;
+/// all of them are saved with the app's preferences on exit.
 fn app_options(app: &mut App, args: &Json) -> Result<Json, String> {
     use gridcore::options::{self as o, EnterMove};
     const CONVERT: [&str; 4] = [
