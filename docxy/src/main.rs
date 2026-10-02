@@ -52,13 +52,16 @@ use docxcore::package::{
     Package, Protection, load_package, new_markdown_package, new_package, save_package,
     save_package_preserving_document,
 };
+use docxcore::page_bg::PageBackground;
 use docxcore::render::{
     Color as DocColor, ImageBox, Line as DocLine, LineCaret, LineMap, PageParts, RenderOptions,
     Span as DocSpan, Style as DocStyle, render_with_images, render_with_page_layout,
 };
 use docxcore::review::{RevisionAction, RevisionOutcome};
+use docxcore::sect::{BorderSide, PageBorders, PgBorderDisplay, PgBorderOffset};
 use docxcore::serialize::blocks_to_xml;
 use docxcore::styles::{StyleSheet, parse_styles_xml};
+use docxcore::watermark::TextWatermarkSpec;
 use std::rc::Rc;
 
 use ratatui::backend::CrosstermBackend;
@@ -1062,6 +1065,9 @@ enum PickerKind {
     Symbol,
     LineSpacing,
     Equation,
+    PageColor,
+    Watermark,
+    PageBorders,
 }
 
 /// Common equation templates for Insert ▸ Equation: (label, LaTeX). The engine
@@ -1079,6 +1085,104 @@ const EQUATIONS: &[(&str, &str)] = &[
     ("Quadratic", "x = \\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}"),
 ];
 
+/// Design ▸ Page Color's palette (the suite's `design_tab.rs` palette): the
+/// Office theme's ten base colours, then Word's ten standard ones, as
+/// (label, RRGGBB). The labels back both the picker items and the status line.
+const PAGE_COLORS: [(&str, u32); 20] = [
+    ("White, Background 1", 0xFFFFFF),
+    ("Black, Text 1", 0x000000),
+    ("Gray, Background 2", 0xE7E6E6),
+    ("Blue-Gray, Text 2", 0x44546A),
+    ("Blue, Accent 1", 0x4472C4),
+    ("Orange, Accent 2", 0xED7D31),
+    ("Gray, Accent 3", 0xA5A5A5),
+    ("Gold, Accent 4", 0xFFC000),
+    ("Blue, Accent 5", 0x5B9BD5),
+    ("Green, Accent 6", 0x70AD47),
+    ("Dark Red", 0xC00000),
+    ("Red", 0xFF0000),
+    ("Orange", 0xFFC000),
+    ("Yellow", 0xFFFF00),
+    ("Light Green", 0x92D050),
+    ("Green", 0x00B050),
+    ("Light Blue", 0x00B0F0),
+    ("Blue", 0x0070C0),
+    ("Dark Blue", 0x002060),
+    ("Purple", 0x7030A0),
+];
+
+/// Word's watermark gallery (the suite's `design_tab.rs` PRESETS): each text
+/// diagonal (1) and horizontal (2), as (label, text, diagonal).
+const WATERMARK_PRESETS: [(&str, &str, bool); 12] = [
+    ("CONFIDENTIAL 1", "CONFIDENTIAL", true),
+    ("CONFIDENTIAL 2", "CONFIDENTIAL", false),
+    ("DO NOT COPY 1", "DO NOT COPY", true),
+    ("DO NOT COPY 2", "DO NOT COPY", false),
+    ("DRAFT 1", "DRAFT", true),
+    ("DRAFT 2", "DRAFT", false),
+    ("SAMPLE 1", "SAMPLE", true),
+    ("SAMPLE 2", "SAMPLE", false),
+    ("ASAP 1", "ASAP", true),
+    ("ASAP 2", "ASAP", false),
+    ("URGENT 1", "URGENT", true),
+    ("URGENT 2", "URGENT", false),
+];
+
+/// Design ▸ Page Border's fixed choices: None removes `w:pgBorders`; Box and
+/// Shadow write a single-line box (Word's default 24pt from the page edge).
+const PAGE_BORDER_ITEMS: &[&str] = &["None", "Box", "Shadow"];
+
+/// [`PAGE_COLORS`]' labels then No Color, in picker order.
+const PAGE_COLOR_ITEMS: &[&str] = &[
+    "White, Background 1",
+    "Black, Text 1",
+    "Gray, Background 2",
+    "Blue-Gray, Text 2",
+    "Blue, Accent 1",
+    "Orange, Accent 2",
+    "Gray, Accent 3",
+    "Gold, Accent 4",
+    "Blue, Accent 5",
+    "Green, Accent 6",
+    "Dark Red",
+    "Red",
+    "Orange",
+    "Yellow",
+    "Light Green",
+    "Green",
+    "Light Blue",
+    "Blue",
+    "Dark Blue",
+    "Purple",
+    "No Color",
+];
+
+/// [`WATERMARK_PRESETS`]' labels then Remove Watermark, in picker order.
+const WATERMARK_ITEMS: &[&str] = &[
+    "CONFIDENTIAL 1",
+    "CONFIDENTIAL 2",
+    "DO NOT COPY 1",
+    "DO NOT COPY 2",
+    "DRAFT 1",
+    "DRAFT 2",
+    "SAMPLE 1",
+    "SAMPLE 2",
+    "ASAP 1",
+    "ASAP 2",
+    "URGENT 1",
+    "URGENT 2",
+    "Remove Watermark",
+];
+
+/// A palette colour's name for the status line, else its hex (the suite's
+/// `color_name`).
+fn page_color_name(rgb: u32) -> String {
+    PAGE_COLORS
+        .iter()
+        .find(|c| c.1 == rgb)
+        .map_or_else(|| format!("#{rgb:06X}"), |c| c.0.to_string())
+}
+
 impl PickerKind {
     fn title(self) -> &'static str {
         match self {
@@ -1089,6 +1193,9 @@ impl PickerKind {
             PickerKind::Symbol => " Symbol ",
             PickerKind::LineSpacing => " Line Spacing ",
             PickerKind::Equation => " Equation ",
+            PickerKind::PageColor => " Page Color ",
+            PickerKind::Watermark => " Watermark ",
+            PickerKind::PageBorders => " Page Borders ",
         }
     }
     fn items(self) -> &'static [&'static str] {
@@ -1153,6 +1260,9 @@ impl PickerKind {
                 "a\u{00B2}+b\u{00B2}=c\u{00B2}",
                 "Quadratic",
             ],
+            PickerKind::PageColor => PAGE_COLOR_ITEMS,
+            PickerKind::Watermark => WATERMARK_ITEMS,
+            PickerKind::PageBorders => PAGE_BORDER_ITEMS,
         }
     }
 }
@@ -1882,6 +1992,9 @@ impl App {
             InsertSymbol => self.open_picker(PickerKind::Symbol),
             InsertEquation => self.open_picker(PickerKind::Equation),
             LineSpacing => self.open_picker(PickerKind::LineSpacing),
+            PageColor => self.open_design_picker(PickerKind::PageColor),
+            Watermark => self.open_design_picker(PickerKind::Watermark),
+            PageBorders => self.open_design_picker(PickerKind::PageBorders),
             PageNumber => {
                 let inl = self.build_field(FieldKind::Page);
                 self.editor.paste(&Clip {
@@ -2607,6 +2720,9 @@ impl App {
         }
         if let Some(w) = self.watermark_state.label() {
             parts.push(format!("Watermark: {w}"));
+        }
+        if let Some(bg) = self.pkg.page_background() {
+            parts.push(format!("Page color: {}", page_color_name(bg.color)));
         }
         if self.doc_page_borders {
             parts.push("Page border".to_string());
@@ -3417,6 +3533,11 @@ impl App {
         // edits use a temporary editor and refresh when that part is committed.
         if self.hf_edit.is_none() {
             self.refresh_watermark_state_if_needed();
+            self.doc_page_borders = self
+                .editor
+                .sections()
+                .iter()
+                .any(|s| s.contains("<w:pgBorders"));
         }
     }
 
@@ -4447,6 +4568,21 @@ impl App {
         self.dirty = true;
     }
 
+    /// Open a Design ▸ Page Background picker. Unlike the font pickers these
+    /// act on the whole document, not the selection, and they need a .docx.
+    fn open_design_picker(&mut self, kind: PickerKind) {
+        if self.format == DocFormat::Markdown {
+            self.status = Some(format!(
+                "{} needs a .docx (not Markdown)",
+                kind.title().trim()
+            ));
+            self.dirty = true;
+            return;
+        }
+        self.font_picker = Some(FontPicker { kind, sel: 0 });
+        self.dirty = true;
+    }
+
     fn apply_picker(&mut self) {
         let Some(kind) = self.font_picker.as_ref().map(|p| p.kind) else {
             return;
@@ -4485,9 +4621,118 @@ impl App {
                     self.editor.insert_equation(latex, false);
                 }
             }
+            PickerKind::PageColor | PickerKind::Watermark | PickerKind::PageBorders => {
+                // The design picks set their own status; the generic one below
+                // must not overwrite it.
+                return self.apply_design_pick(p.kind, item);
+            }
         }
         self.after_edit();
         self.status = Some(format!("{}: {item}", p.kind.title().trim()));
+    }
+
+    /// Apply a Design ▸ Page Background pick. The open header/footer edit is
+    /// committed first so its editor cannot write a header part back over a
+    /// watermark and the section edits hit the body editor. Page Color is a
+    /// package edit with no undo (as Hyphenation); a watermark's header parts
+    /// are package edits and its new header references one undo step; Page
+    /// Borders rewrite every section as one undo step.
+    fn apply_design_pick(&mut self, kind: PickerKind, item: &str) {
+        if self.hf_edit.is_some() {
+            self.exit_hf_edit(true);
+        }
+        match kind {
+            PickerKind::PageColor => {
+                let bg = PAGE_COLORS
+                    .iter()
+                    .find(|c| c.0 == item)
+                    .map(|c| PageBackground {
+                        color: c.1,
+                        gradient: None,
+                    });
+                let changed = self.pkg.set_page_background(bg.as_ref());
+                if changed {
+                    self.modified = true;
+                }
+                self.status = Some(match bg {
+                    Some(_) => format!("Page color: {item}"),
+                    None => "Page color: No Color".to_string(),
+                });
+            }
+            PickerKind::Watermark => {
+                let spec = WATERMARK_PRESETS
+                    .iter()
+                    .find(|w| w.0 == item)
+                    .map(|w| TextWatermarkSpec::preset(w.1, w.2));
+                let mut sects = self.editor.sections();
+                let before = sects.clone();
+                let parts = self.pkg.set_text_watermark(spec.as_ref(), &mut sects);
+                let raws: Vec<(usize, String)> = sects
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(k, raw)| *raw != before[*k])
+                    .collect();
+                let refs = self.editor.replace_sections(&raws);
+                let changed = parts || refs;
+                self.page_parts_sect.clear();
+                self.sync_page_parts();
+                self.refresh_watermark_state();
+                if changed {
+                    self.modified = true;
+                }
+                self.status = Some(
+                    if spec.is_some()
+                        && self
+                            .pkg
+                            .shown_text_watermarks(&self.editor.sections())
+                            .is_empty()
+                    {
+                        "Could not add the watermark: the document cannot take a header".to_string()
+                    } else {
+                        match spec {
+                            Some(_) => format!("Watermark: {item}"),
+                            None => "Watermark removed".to_string(),
+                        }
+                    },
+                );
+            }
+            PickerKind::PageBorders => {
+                let side = |shadow: bool| {
+                    Some(BorderSide {
+                        style: "single".into(),
+                        sz: 4,
+                        space: 24,
+                        color: None,
+                        shadow,
+                        frame: false,
+                    })
+                };
+                let pb = (item != "None").then(|| PageBorders {
+                    sides: [
+                        side(item == "Shadow"),
+                        side(item == "Shadow"),
+                        side(item == "Shadow"),
+                        side(item == "Shadow"),
+                    ],
+                    display: PgBorderDisplay::AllPages,
+                    offset_from: PgBorderOffset::Page,
+                    z_order_back: false,
+                });
+                let n = self.editor.sections().len();
+                let changed = self
+                    .editor
+                    .edit_sections(&(0..n).collect::<Vec<_>>(), |raw| {
+                        PageBorders::apply(pb.as_ref(), raw)
+                    });
+                if changed {
+                    self.after_edit();
+                }
+                // after_edit clears the status: report the pick after it.
+                self.status = Some(format!("Page borders: {item}"));
+            }
+            _ => unreachable!("not a Design picker: {kind:?}"),
+        }
+        self.dirty = true;
     }
 
     fn picker_key(&mut self, key: KeyEvent) -> bool {
@@ -8866,7 +9111,7 @@ mod tests {
     #[test]
     fn view_tab_shows_markdown_group_only_for_md() {
         let mut r = ribbon::Ribbon::home();
-        r.set_active(5); // View
+        r.set_active(6); // View
         // For .docx: Read/Print Layout present, no Markdown switch.
         assert!(r.has_act(ribbon::Act::PrintLayout));
         assert!(!r.has_act(ribbon::Act::MdRendered));
@@ -9985,6 +10230,225 @@ mod tests {
         );
     }
 
+    /// Set the open picker's selection to `label` and apply it.
+    fn pick(app: &mut App, kind: PickerKind, label: &str) {
+        assert_eq!(
+            app.font_picker.as_ref().map(|p| p.kind),
+            Some(kind),
+            "{label}: no {kind:?} picker is open"
+        );
+        let idx = kind
+            .items()
+            .iter()
+            .position(|&s| s == label)
+            .unwrap_or_else(|| panic!("{label} not in the {kind:?} items"));
+        app.font_picker.as_mut().unwrap().sel = idx;
+        app.apply_picker();
+    }
+
+    #[test]
+    fn design_picker_items_match_their_tables() {
+        let mut colors: Vec<&str> = PAGE_COLORS.iter().map(|c| c.0).collect();
+        colors.push("No Color");
+        assert_eq!(PAGE_COLOR_ITEMS, colors.as_slice());
+        let mut marks: Vec<&str> = WATERMARK_PRESETS.iter().map(|w| w.0).collect();
+        marks.push("Remove Watermark");
+        assert_eq!(WATERMARK_ITEMS, marks.as_slice());
+        assert_eq!(PAGE_BORDER_ITEMS, &["None", "Box", "Shadow"]);
+    }
+
+    #[test]
+    fn page_color_pick_sets_background_and_survives_save() {
+        let mut app = app_with(&["body"]);
+        app.run_act(ribbon::Act::PageColor);
+        pick(&mut app, PickerKind::PageColor, "Red");
+        assert_eq!(app.pkg.page_background().map(|b| b.color), Some(0xFF0000));
+        assert!(app.pkg.has_display_background_shape());
+        assert!(app.modified);
+        let reloaded = save_and_reload(&mut app, "design-page-color");
+        assert_eq!(reloaded.page_background().map(|b| b.color), Some(0xFF0000));
+        assert!(reloaded.has_display_background_shape());
+        // No Color removes the background and the display flag again.
+        app.run_act(ribbon::Act::PageColor);
+        pick(&mut app, PickerKind::PageColor, "No Color");
+        assert!(app.pkg.page_background().is_none());
+        assert!(!app.pkg.has_display_background_shape());
+        // The status names the picked label even when two colours share an RGB
+        // ("Orange" and "Gold, Accent 4" are both 0xFFC000).
+        app.run_act(ribbon::Act::PageColor);
+        pick(&mut app, PickerKind::PageColor, "Orange");
+        assert_eq!(app.status.as_deref(), Some("Page color: Orange"));
+    }
+
+    #[test]
+    fn watermark_pick_adds_header_watermark_and_round_trips() {
+        let mut app = app_with(&["body"]); // no header at all
+        app.run_act(ribbon::Act::Watermark);
+        pick(&mut app, PickerKind::Watermark, "DRAFT 1");
+        let marks = app.pkg.shown_text_watermarks(&app.editor.sections());
+        assert_eq!(marks.len(), 1, "{marks:?}");
+        assert_eq!(marks[0].text, "DRAFT");
+        assert!((marks[0].rotation - 315.0).abs() < 0.5, "{marks:?}");
+        assert!(app.watermark_state.label().is_some());
+        assert!(app.doc_notice().contains("Watermark"));
+        assert!(app.modified);
+        let reloaded = save_and_reload(&mut app, "design-watermark");
+        let app2 = App::new(reloaded, "t.docx", false);
+        let marks = app2.pkg.shown_text_watermarks(&app2.editor.sections());
+        assert_eq!(marks.len(), 1, "{marks:?}");
+        assert_eq!(marks[0].text, "DRAFT");
+        // Remove Watermark strips it from the shown headers.
+        app.run_act(ribbon::Act::Watermark);
+        pick(&mut app, PickerKind::Watermark, "Remove Watermark");
+        assert!(
+            app.pkg
+                .shown_text_watermarks(&app.editor.sections())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn watermark_pick_commits_open_header_edit_first() {
+        let mut app = app_with(&["body"]);
+        app.run_act(ribbon::Act::EditHeader);
+        app.editor.insert_str("H");
+        app.run_act(ribbon::Act::Watermark);
+        pick(&mut app, PickerKind::Watermark, "SAMPLE 2");
+        assert!(app.hf_edit.is_none(), "the open header edit was committed");
+        let part = app.header_part.clone().expect("a header part");
+        let xml = app.pkg.part_text(&part).expect("header part text");
+        assert!(xml.contains(">H<"), "{xml}");
+        assert!(xml.contains("SAMPLE"), "{xml}");
+        let reloaded = save_and_reload(&mut app, "design-wm-header");
+        let app2 = App::new(reloaded, "t.docx", false);
+        let part = app2.header_part.clone().expect("a header part");
+        let xml = app2.pkg.part_text(&part).expect("header part text");
+        assert!(xml.contains(">H<"), "{xml}");
+        assert!(xml.contains("SAMPLE"), "{xml}");
+    }
+
+    #[test]
+    fn page_borders_pick_applies_to_every_section_and_undoes() {
+        let first = MPara {
+            props: ParProps {
+                section_break: Some("<w:sectPr/>".to_string()),
+                ..ParProps::default()
+            },
+            content: vec![Inline::Run(Run {
+                text: "one".to_string(),
+                props: RunProps::default(),
+            })],
+        };
+        let second = MPara {
+            props: ParProps::default(),
+            content: vec![Inline::Run(Run {
+                text: "two".to_string(),
+                props: RunProps::default(),
+            })],
+        };
+        let mut app = app_with_blocks(vec![Block::Paragraph(first), Block::Paragraph(second)]);
+        app.run_act(ribbon::Act::PageBorders);
+        pick(&mut app, PickerKind::PageBorders, "Box");
+        let sects = app.editor.sections();
+        assert_eq!(sects.len(), 2, "{sects:?}");
+        for s in &sects {
+            let pb = PageBorders::parse(s)
+                .unwrap_or_else(|| panic!("page borders in every section: {s}"));
+            assert_eq!(pb.offset_from, PgBorderOffset::Page);
+            for side in &pb.sides {
+                let side = side.as_ref().expect("all four sides set");
+                assert_eq!(side.style, "single");
+                assert_eq!(side.sz, 4);
+                assert_eq!(side.space, 24);
+                assert!(side.color.is_none());
+                assert!(!side.shadow);
+            }
+        }
+        assert!(app.doc_page_borders);
+        // One undo step restores every section.
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert!(
+            !app.editor
+                .sections()
+                .iter()
+                .any(|s| s.contains("<w:pgBorders"))
+        );
+        assert!(!app.doc_page_borders);
+        // Shadow writes w:shadow on every side and survives save.
+        app.run_act(ribbon::Act::PageBorders);
+        pick(&mut app, PickerKind::PageBorders, "Shadow");
+        assert!(
+            app.editor
+                .sections()
+                .iter()
+                .all(|s| s.contains("w:shadow=\"1\""))
+        );
+        let reloaded = save_and_reload(&mut app, "design-borders");
+        assert!(reloaded.sect_pr().contains("w:shadow=\"1\""));
+        // None removes the borders again.
+        app.run_act(ribbon::Act::PageBorders);
+        pick(&mut app, PickerKind::PageBorders, "None");
+        assert!(
+            app.editor
+                .sections()
+                .iter()
+                .all(|s| PageBorders::parse(s).is_none())
+        );
+        assert!(!app.doc_page_borders);
+    }
+
+    #[test]
+    fn design_commands_refuse_markdown() {
+        let body = vec![Block::Paragraph(docxcore::model::Paragraph::default())];
+        let mut app = App::new(new_markdown_package(Document { body }), "a.md", false);
+        for act in [
+            ribbon::Act::PageColor,
+            ribbon::Act::Watermark,
+            ribbon::Act::PageBorders,
+        ] {
+            app.run_act(act);
+            assert!(
+                app.font_picker.is_none(),
+                "{act:?} opened a picker for Markdown"
+            );
+            let status = app
+                .status
+                .take()
+                .unwrap_or_else(|| panic!("status for {act:?}"));
+            assert!(status.contains(".docx"), "{status}");
+        }
+    }
+
+    #[test]
+    fn design_picks_respect_protection() {
+        let mut app = app_with(&["body"]);
+        protect(&mut app, ProtectionEditMode::ReadOnly, false);
+        for act in [
+            ribbon::Act::PageColor,
+            ribbon::Act::Watermark,
+            ribbon::Act::PageBorders,
+        ] {
+            // Opening the picker is allowed; applying is denied.
+            app.run_act(act);
+            assert!(app.font_picker.is_some(), "{act:?} did not open its picker");
+            app.apply_picker(); // sel 0 = the picker's first item
+            assert!(app.font_picker.is_some(), "{act:?} applied under read-only");
+        }
+        assert!(app.pkg.page_background().is_none());
+        assert!(
+            app.pkg
+                .shown_text_watermarks(&app.editor.sections())
+                .is_empty()
+        );
+        assert!(
+            !app.editor
+                .sections()
+                .iter()
+                .any(|s| s.contains("<w:pgBorders"))
+        );
+        assert!(!app.modified);
+    }
+
     #[test]
     fn inserting_a_section_mirrors_the_final_sect_pr_and_undo_restores_it() {
         let mut app = app_with_trailing_sect_pr();
@@ -10382,11 +10846,11 @@ mod tests {
     #[test]
     fn review_tab_present_and_toggle_flips_the_panel() {
         let mut app = app_with(&["body text"]);
-        // The ribbon has a Review tab after File, Home, Styles and Insert.
-        assert_eq!(app.ribbon.tab_label(4), Some("Review"));
+        // The ribbon has a Review tab after File, Home, Styles, Insert and Design.
+        assert_eq!(app.ribbon.tab_label(5), Some("Review"));
         // Switching to it activates the Review ribbon.
-        app.ribbon.set_active(4);
-        assert_eq!(app.ribbon.active_tab(), 4);
+        app.ribbon.set_active(5);
+        assert_eq!(app.ribbon.active_tab(), 5);
         // The Comments toggle flips the side-panel flag.
         assert!(!app.show_comments);
         app.run_act(ribbon::Act::ToggleComments);
@@ -10428,7 +10892,7 @@ mod tests {
     #[test]
     fn view_ribbon_actions_toggle_their_state() {
         let mut app = app_with(&["heading"]);
-        assert_eq!(app.ribbon.tab_label(5), Some("View"));
+        assert_eq!(app.ribbon.tab_label(6), Some("View"));
         app.run_act(ribbon::Act::PrintLayout);
         assert!(app.page_view);
         app.run_act(ribbon::Act::ReadMode);

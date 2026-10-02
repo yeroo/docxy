@@ -122,6 +122,12 @@ pub enum Act {
     Hyphenation,
     /// Open the equation-template picker and insert the chosen formula.
     InsertEquation,
+    /// Open the Page Color picker (colour the page background).
+    PageColor,
+    /// Open the Watermark picker (DRAFT, CONFIDENTIAL, …).
+    Watermark,
+    /// Open the Page Borders picker (a box around every page).
+    PageBorders,
     /// Not yet implemented; the `&str` is the feature name for the hint.
     Todo(&'static str),
 }
@@ -144,7 +150,7 @@ type Group = ribboncore::Group<Act>;
 /// xlsxy green, yppxy yellow).
 const ACCENT: Color = Color::LightBlue;
 const HOME_TAB: usize = 1;
-const VIEW_TAB: usize = 5;
+const VIEW_TAB: usize = 6;
 
 /// A focusable button (docxy hand-counts widths — some glyphs render one column
 /// where unicode-width reports two).
@@ -161,12 +167,15 @@ pub struct Ribbon {
 
 impl Ribbon {
     pub fn home() -> Ribbon {
-        let tabs = vec!["File", "Home", "Styles", "Insert", "Review", "View"];
+        let tabs = vec![
+            "File", "Home", "Styles", "Insert", "Design", "Review", "View",
+        ];
         let tab_groups = vec![
             Vec::new(), // File → backstage
             home_groups(false),
             styles_groups(),
             insert_groups(),
+            design_groups(),
             review_groups(),
             view_groups(false),
         ];
@@ -487,6 +496,38 @@ fn insert_groups() -> Vec<Group> {
     ]
 }
 
+/// The Design tab's groups (Page Background).
+fn design_groups() -> Vec<Group> {
+    use Act::*;
+    vec![Group {
+        title: "Page Background",
+        width: 20,
+        rows: [
+            vec![
+                btn(
+                    "Page Color",
+                    10,
+                    PageColor,
+                    "Page Color — colour the page background",
+                ),
+                Seg::Gap(" "),
+                btn(
+                    "Watermark",
+                    9,
+                    Watermark,
+                    "Watermark — DRAFT, CONFIDENTIAL, …",
+                ),
+            ],
+            vec![btn(
+                "Page Borders",
+                12,
+                PageBorders,
+                "Page Borders — a box around every page",
+            )],
+        ],
+    }]
+}
+
 fn review_groups() -> Vec<Group> {
     use Act::*;
     vec![
@@ -726,6 +767,7 @@ mod tests {
                 home_groups(md),
                 styles_groups(),
                 insert_groups(),
+                design_groups(),
                 review_groups(),
                 view_groups(md),
             ];
@@ -777,9 +819,21 @@ mod tests {
     #[test]
     fn review_tab_offers_compare() {
         let mut r = Ribbon::home();
-        r.set_active(4);
-        assert_eq!(r.tab_label(4), Some("Review"));
+        r.set_active(5);
+        assert_eq!(r.tab_label(5), Some("Review"));
         assert!(r.has_act(Act::Compare));
+    }
+
+    #[test]
+    fn design_tab_offers_page_background() {
+        let mut r = Ribbon::home();
+        assert_eq!(r.tab_label(4), Some("Design"));
+        assert_eq!(r.tab_label(5), Some("Review"));
+        assert_eq!(r.tab_label(6), Some("View"));
+        r.set_active(4);
+        assert!(r.has_act(Act::PageColor));
+        assert!(r.has_act(Act::Watermark));
+        assert!(r.has_act(Act::PageBorders));
     }
 
     #[test]
