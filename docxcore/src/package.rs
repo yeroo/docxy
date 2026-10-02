@@ -1365,6 +1365,162 @@ impl Package {
         Some(part_name)
     }
 
+    /// The header parts `sect_prs` show, once each, in section order: every
+    /// section's default header, its first-page header when it has
+    /// `w:titlePg`, and its even-page header when the document has
+    /// `w:evenAndOddHeaders`. With `create`, a slot that resolves to no part
+    /// gets a new, empty one, referenced from that section's sectPr (later
+    /// sections inherit it).
+    fn shown_header_parts(&mut self, sect_prs: &mut [String], create: bool) -> Vec<String> {
+        let even = self.has_even_odd();
+        let mut out: Vec<String> = Vec::new();
+        for k in 0..sect_prs.len() {
+            let applied = section_header_parts(&sect_prs[..], &self.document_rels());
+            let title = crate::sect::has_flag(&sect_prs[k], "w:titlePg");
+            for variant in HeaderVariant::ALL {
+                if (variant == HeaderVariant::First && !title)
+                    || (variant == HeaderVariant::Even && !even)
+                {
+                    continue;
+                }
+                let name = match applied[k].get(true, variant) {
+                    Some(part) => part.part_name.clone(),
+                    None if create => {
+                        self.ensure_styles(&["Header"]);
+                        let Some((rid, name)) = self.create_hf_part(true, "<w:p/>") else {
+                            continue;
+                        };
+                        sect_prs[k] = crate::sect::set_hf_reference(
+                            &sect_prs[k],
+                            true,
+                            variant.as_ooxml(),
+                            Some(&rid),
+                        );
+                        name
+                    }
+                    None => continue,
+                };
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
+        out
+    }
+
+    /// Put `spec`'s text watermark into every header `sect_prs` show,
+    /// replacing any watermark there, or remove every watermark with `None`
+    /// (Remove Watermark, #651). A shown header slot with no part gets a new
+    /// header part (only when adding), and its reference is written into
+    /// that section's entry of `sect_prs`: the caller applies those (an
+    /// editor's sections, see [`crate::editor::Editor::edit_sections`]).
+    /// Whether any part changed.
+    pub fn set_text_watermark(
+        &mut self,
+        spec: Option<&crate::watermark::TextWatermarkSpec>,
+        sect_prs: &mut [String],
+    ) -> bool {
+        // Number shapes past any the headers already hold, so ids stay unique.
+        let mut n = self
+            .parts
+            .iter()
+            .filter(|(name, _)| name.starts_with("word/header"))
+            .filter_map(|(_, b)| decode_xml_part(b).map(Cow::into_owned))
+            .flat_map(|xml| {
+                xml.match_indices(crate::watermark::SHAPE_ID)
+                    .filter_map(|(i, m)| {
+                        let digits: String = xml[i + m.len()..]
+                            .chars()
+                            .take_while(char::is_ascii_digit)
+                            .collect();
+                        digits.parse::<u32>().ok()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .max()
+            .unwrap_or(0);
+        let mut changed = false;
+        for name in self.shown_header_parts(sect_prs, spec.is_some()) {
+            let Some(xml) = self.part_text(&name) else {
+                continue;
+            };
+            let new = match spec {
+                Some(spec) => {
+                    n += 1;
+                    crate::watermark::insert_watermark(&xml, spec, n)
+                }
+                None => crate::watermark::strip_watermarks(&xml),
+            };
+            if new != xml {
+                self.set_part_text(&name, &new);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// [`Package::set_text_watermark`] over the package's own document: its
+    /// sections' sectPrs are read from and written back to
+    /// [`Package::document`].
+    pub fn apply_text_watermark(
+        &mut self,
+        spec: Option<&crate::watermark::TextWatermarkSpec>,
+    ) -> bool {
+        let mut sect_prs: Vec<String> = self
+            .section_sect_prs()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let before = sect_prs.clone();
+        let changed = self.set_text_watermark(spec, &mut sect_prs);
+        if sect_prs != before {
+            let trailing = sect_prs.pop().unwrap_or_default();
+            let mut breaks = sect_prs.into_iter();
+            for block in &mut self.document.body {
+                if let Block::Paragraph(p) = block {
+                    if p.props.section_break.is_some() {
+                        if let Some(raw) = breaks.next() {
+                            p.props.section_break = Some(raw);
+                        }
+                    }
+                }
+            }
+            self.set_current_sect_pr_raw(trailing);
+        }
+        changed
+    }
+
+    /// The text watermarks in the headers `sect_prs` show (each part once):
+    /// what Design > Watermark reads as current while sections are being
+    /// edited, unlike [`Package::watermarks`], which reads the loaded ones.
+    pub fn shown_text_watermarks<S: AsRef<str>>(&self, sect_prs: &[S]) -> Vec<TextWatermark> {
+        let even = self.has_even_odd();
+        let applied = section_header_parts(sect_prs, &self.document_rels());
+        let mut seen: Vec<&str> = Vec::new();
+        let mut out = Vec::new();
+        for (sect, parts) in sect_prs.iter().zip(&applied) {
+            let title = crate::sect::has_flag(sect.as_ref(), "w:titlePg");
+            for variant in HeaderVariant::ALL {
+                if (variant == HeaderVariant::First && !title)
+                    || (variant == HeaderVariant::Even && !even)
+                {
+                    continue;
+                }
+                let Some(part) = parts.get(true, variant) else {
+                    continue;
+                };
+                if seen.contains(&part.part_name.as_str()) {
+                    continue;
+                }
+                seen.push(&part.part_name);
+                if let Some(xml) = self.part(&part.part_name).and_then(decode_xml_part) {
+                    out.extend(text_watermarks(&xml));
+                }
+            }
+        }
+        out
+    }
+
     /// Add a header (`is_header`) or footer part holding `content_xml` (the
     /// block XML inside `w:hdr`/`w:ftr`), with its `[Content_Types].xml`
     /// override and a `document.xml.rels` relationship, but no section
@@ -1506,6 +1662,76 @@ impl Package {
     /// flag when it lays the document out for print.
     pub fn set_auto_hyphenation(&mut self, on: bool) {
         self.set_settings_flag("w:autoHyphenation", on);
+    }
+
+    /// The page colour (Design > Page Color, #651): the document part's
+    /// `w:background`.
+    pub fn page_background(&self) -> Option<crate::page_bg::PageBackground> {
+        let name = &self.parts.get(self.doc_index)?.0;
+        crate::page_bg::page_background(&self.part_text(name)?)
+    }
+
+    /// Set the page colour, or remove it with `None` (No Color): the
+    /// document part's `w:background`, and `w:displayBackgroundShape` in the
+    /// settings, without which Word does not show it. Whether anything
+    /// changed.
+    pub fn set_page_background(&mut self, bg: Option<&crate::page_bg::PageBackground>) -> bool {
+        let Some(name) = self.parts.get(self.doc_index).map(|p| p.0.clone()) else {
+            return false;
+        };
+        let Some(doc) = self.part_text(&name) else {
+            return false;
+        };
+        let new = crate::page_bg::set_page_background(&doc, bg);
+        let changed = new != doc;
+        if changed {
+            self.set_part_text(&name, &new);
+        }
+        let settings = self.set_display_background_shape(bg.is_some());
+        changed || settings
+    }
+
+    /// Whether the settings part asks Word to show the page colour.
+    pub fn has_display_background_shape(&self) -> bool {
+        self.settings_part_name()
+            .ok()
+            .flatten()
+            .and_then(|n| self.part_text(&n))
+            .and_then(|xml| settings_flag_of(&xml, "w:displayBackgroundShape"))
+            .unwrap_or(false)
+    }
+
+    /// Add `w:displayBackgroundShape` at its `CT_Settings` position, or
+    /// remove it. Whether the settings changed.
+    fn set_display_background_shape(&mut self, on: bool) -> bool {
+        const ELEM: &str = "w:displayBackgroundShape";
+        if self.has_display_background_shape() == on {
+            return false;
+        }
+        let name = if on {
+            self.ensure_settings_part()
+        } else {
+            self.settings_part_name().ok().flatten()
+        };
+        let Some(name) = name else {
+            return false;
+        };
+        let Some(xml) = self.part_text(&name) else {
+            return false;
+        };
+        // An explicit `w:val="false"` is replaced, not kept beside a new one.
+        let mut xml = xml;
+        while crate::sect::find_element(&xml, ELEM).is_some() {
+            xml = crate::sect::remove_element(&xml, ELEM);
+        }
+        if on {
+            let before = SETTINGS_BEFORE_MAIL_MERGE
+                .iter()
+                .position(|n| *n == ELEM)
+                .map_or(&[][..], |i| &SETTINGS_BEFORE_MAIL_MERGE[..i]);
+            xml = insert_settings_child(&xml, &format!("<{ELEM}/>"), before);
+        }
+        self.set_part_text(&name, &xml)
     }
 
     /// Add or remove a boolean flag element (e.g. `w:evenAndOddHeaders`,
@@ -2417,6 +2643,13 @@ const SETTINGS_BEFORE_MAIL_MERGE: [&str; 29] = [
 /// last element that precedes it in `CT_Settings` (every other child follows
 /// it), or first. Expands a self-closing root.
 fn insert_mail_merge(xml: &str, child: &str) -> String {
+    insert_settings_child(xml, child, &SETTINGS_BEFORE_MAIL_MERGE)
+}
+
+/// Insert `child` into the settings root right after the last of the
+/// elements `before` (its `CT_Settings` predecessors) present, or first.
+/// Expands a self-closing root.
+fn insert_settings_child(xml: &str, child: &str, before: &[&str]) -> String {
     let Some(root) = xml.find("<w:settings") else {
         return xml.to_string();
     };
@@ -2427,7 +2660,7 @@ fn insert_mail_merge(xml: &str, child: &str) -> String {
         return format!("{}>{child}</w:settings>{}", &xml[..gt - 1], &xml[gt + 1..]);
     }
     let mut at = gt + 1;
-    for name in SETTINGS_BEFORE_MAIL_MERGE {
+    for &name in before {
         let mut from = gt + 1;
         while let Some((a, b)) = crate::sect::find_element(&xml[from..], name) {
             at = at.max(from + b);
@@ -4195,6 +4428,91 @@ mod tests {
         assert_eq!(reloaded.document.plain_text().trim(), "Goodbye");
     }
 
+    /// #651: Page Color writes `w:background` first in the document and
+    /// `w:displayBackgroundShape` at its CT_Settings position; No Color
+    /// removes both; the result survives save and reload.
+    #[test]
+    fn set_page_background_writes_settings_in_order_and_round_trips() {
+        use crate::page_bg::{Gradient, GradientStyle, PageBackground};
+        let doc = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Hello</w:t></w:r></w:p></w:body></w:document>"#;
+        let settings = "<?xml version=\"1.0\"?><w:settings xmlns:w=\"x\"><w:zoom w:percent=\"100\"/><w:proofState w:spelling=\"clean\"/><w:defaultTabStop w:val=\"720\"/></w:settings>";
+        let bytes = make_metadata_docx(doc, Some(settings), Some(DOC_RELS), &[]);
+        let mut pkg = load_package(&bytes).expect("load");
+        assert_eq!(pkg.page_background(), None);
+        let bg = PageBackground {
+            color: 0xFFF2CC,
+            gradient: None,
+        };
+        assert!(pkg.set_page_background(Some(&bg)));
+        let s = pkg.part_text("word/settings.xml").unwrap();
+        assert!(
+            s.contains("<w:zoom w:percent=\"100\"/><w:displayBackgroundShape/><w:proofState"),
+            "{s}"
+        );
+        assert!(
+            !pkg.set_page_background(Some(&bg)),
+            "the same colour changes nothing"
+        );
+        let saved = save_package(&pkg);
+        assert_eq!(prolog_of(&saved_document_xml(&saved)), PAGE_COLOR);
+        let mut back = load_package(&saved).expect("reload");
+        assert_eq!(back.page_background(), Some(bg));
+        assert!(back.has_display_background_shape());
+
+        // A gradient declares the VML prefixes it uses and survives save.
+        let grad = PageBackground {
+            color: 0x0070C0,
+            gradient: Some(Gradient {
+                color2: 0xFFFFFF,
+                style: GradientStyle::DiagonalDown,
+            }),
+        };
+        back.set_page_background(Some(&grad));
+        let saved = save_package(&back);
+        let doc_xml = saved_document_xml(&saved);
+        assert!(
+            doc_xml.contains("xmlns:v=\"urn:schemas-microsoft-com:vml\""),
+            "{doc_xml}"
+        );
+        let mut back = load_package(&saved).expect("reload");
+        assert_eq!(back.page_background(), Some(grad));
+
+        // No Color removes the element and the flag.
+        assert!(back.set_page_background(None));
+        assert_eq!(back.page_background(), None);
+        assert!(!back.has_display_background_shape());
+        let s = back.part_text("word/settings.xml").unwrap();
+        assert!(!s.contains("displayBackgroundShape"), "{s}");
+        let saved = save_package(&back);
+        assert_eq!(prolog_of(&saved_document_xml(&saved)), "");
+    }
+
+    /// A document without a settings part gets one for the flag; an
+    /// explicit off is replaced rather than kept beside it.
+    #[test]
+    fn set_page_background_creates_settings_and_replaces_explicit_off() {
+        use crate::page_bg::PageBackground;
+        let bg = PageBackground {
+            color: 0xFF0000,
+            gradient: None,
+        };
+        let mut pkg = load_package(&make_docx(&background_doc(""))).expect("load");
+        assert!(pkg.set_page_background(Some(&bg)));
+        assert!(pkg.has_display_background_shape());
+        let off = "<?xml version=\"1.0\"?><w:settings xmlns:w=\"x\"><w:displayBackgroundShape w:val=\"false\"/></w:settings>";
+        let mut pkg = load_package(&make_metadata_docx(
+            &background_doc(""),
+            Some(off),
+            Some(DOC_RELS),
+            &[],
+        ))
+        .expect("load");
+        pkg.set_page_background(Some(&bg));
+        let s = pkg.part_text("word/settings.xml").unwrap();
+        assert_eq!(s.matches("displayBackgroundShape").count(), 1, "{s}");
+        assert!(pkg.has_display_background_shape());
+    }
+
     #[test]
     fn rejects_non_docx() {
         assert_eq!(load_package(b"nope").unwrap_err(), LoadError::NotZip);
@@ -4801,6 +5119,162 @@ mod tests {
         new_package(Document {
             body: vec![Block::Paragraph(crate::model::Paragraph::default())],
         })
+    }
+
+    /// A two-paragraph document whose first paragraph ends a section with a
+    /// distinct first page (`w:titlePg`); the trailing section has none.
+    fn two_section_pkg() -> Package {
+        let mut first = crate::model::Paragraph::default();
+        first.props.section_break =
+            Some("<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/><w:titlePg/></w:sectPr>".into());
+        let mut pkg = new_package(Document {
+            body: vec![
+                Block::Paragraph(first),
+                Block::Paragraph(crate::model::Paragraph::default()),
+            ],
+        });
+        pkg.set_sect_pr("<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr>".into());
+        pkg
+    }
+
+    fn watermark_slots(pkg: &Package) -> Vec<(usize, HeaderVariant, String)> {
+        pkg.watermarks()
+            .into_iter()
+            .map(|w| {
+                let WatermarkKind::Text(t) = w.kind else {
+                    panic!("text watermark expected");
+                };
+                (w.header.section_index, w.header.variant, t)
+            })
+            .collect()
+    }
+
+    /// #651: a watermark goes into every header any section shows, creating
+    /// headers where a section has none, and survives save and reload.
+    #[test]
+    fn text_watermark_reaches_every_shown_header_and_round_trips() {
+        use crate::watermark::TextWatermarkSpec;
+        let mut pkg = two_section_pkg();
+        assert!(pkg.watermarks().is_empty());
+        assert!(pkg.apply_text_watermark(Some(&TextWatermarkSpec::preset("DRAFT", true))));
+        // Section 1 has its own default and first-page headers now; section
+        // 2 inherits the default one (no title page there).
+        let expect = vec![
+            (0, HeaderVariant::Default, "DRAFT".to_string()),
+            (0, HeaderVariant::First, "DRAFT".to_string()),
+            (1, HeaderVariant::Default, "DRAFT".to_string()),
+        ];
+        assert_eq!(watermark_slots(&pkg), expect);
+        let headers = pkg
+            .part_names()
+            .iter()
+            .filter(|n| n.starts_with("word/header"))
+            .count();
+        assert_eq!(headers, 2, "one default and one first-page header");
+        let sects = pkg.section_sect_prs();
+        assert!(sects[0].contains("w:type=\"first\""), "{}", sects[0]);
+        assert!(
+            !sects[1].contains("headerReference"),
+            "inherits: {}",
+            sects[1]
+        );
+        let reloaded = load_package(&save_package(&pkg)).expect("reload");
+        assert_eq!(watermark_slots(&reloaded), expect);
+        let texts: Vec<String> = reloaded
+            .shown_text_watermarks(&reloaded.section_sect_prs())
+            .into_iter()
+            .map(|w| w.text)
+            .collect();
+        assert_eq!(texts, ["DRAFT", "DRAFT"], "each shown part once");
+    }
+
+    /// A second watermark replaces the first in every header (never two),
+    /// Remove takes them all out, and other header content stays.
+    #[test]
+    fn text_watermark_replaces_and_removes_keeping_header_text() {
+        use crate::watermark::TextWatermarkSpec;
+        let mut pkg = two_section_pkg();
+        // Each section has its own default header with text.
+        let mut sects: Vec<String> = pkg
+            .section_sect_prs()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for (k, text) in ["Left", "Right"].iter().enumerate() {
+            let (rid, _) = pkg
+                .create_hf_part(true, &format!("<w:p><w:r><w:t>{text}</w:t></w:r></w:p>"))
+                .unwrap();
+            sects[k] = crate::sect::set_hf_reference(&sects[k], true, "default", Some(&rid));
+        }
+        let mut changed = sects.clone();
+        pkg.set_text_watermark(
+            Some(&TextWatermarkSpec::preset("CONFIDENTIAL", true)),
+            &mut changed,
+        );
+        // Only the first-page slot needed a new header.
+        assert_eq!(changed[1], sects[1]);
+        assert!(changed[0].contains("w:type=\"first\""));
+        pkg.set_text_watermark(
+            Some(&TextWatermarkSpec::preset("SAMPLE", false)),
+            &mut changed,
+        );
+        let marks = pkg.shown_text_watermarks(&changed);
+        assert_eq!(marks.len(), 3, "{marks:?}");
+        assert!(
+            marks
+                .iter()
+                .all(|m| m.text == "SAMPLE" && m.rotation == 0.0)
+        );
+        let all: String = pkg
+            .part_names()
+            .iter()
+            .filter(|n| n.starts_with("word/header"))
+            .map(|n| pkg.part_text(n).unwrap())
+            .collect();
+        assert_eq!(
+            all.matches(crate::watermark::SHAPE_ID).count(),
+            3,
+            "never two in a part"
+        );
+        // Shape ids are unique across the parts.
+        let mut ids: Vec<&str> = all
+            .match_indices("id=\"PowerPlusWaterMarkObject")
+            .map(|(i, _)| &all[i..i + 32])
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 3, "{ids:?}");
+
+        let before = changed.clone();
+        assert!(pkg.set_text_watermark(None, &mut changed));
+        assert_eq!(changed, before, "removing creates no header");
+        assert!(pkg.shown_text_watermarks(&changed).is_empty());
+        let all: String = pkg
+            .part_names()
+            .iter()
+            .filter(|n| n.starts_with("word/header"))
+            .map(|n| pkg.part_text(n).unwrap())
+            .collect();
+        assert!(all.contains("<w:t>Left</w:t>") && all.contains("<w:t>Right</w:t>"));
+        assert!(
+            !pkg.set_text_watermark(None, &mut changed),
+            "nothing left to remove"
+        );
+    }
+
+    /// With different odd and even pages, the even-page header gets one too.
+    #[test]
+    fn text_watermark_covers_even_page_headers() {
+        use crate::watermark::TextWatermarkSpec;
+        let mut pkg = hf_pkg();
+        pkg.set_even_odd(true);
+        pkg.apply_text_watermark(Some(&TextWatermarkSpec::preset("URGENT", true)));
+        let variants: Vec<HeaderVariant> = pkg
+            .watermarks()
+            .into_iter()
+            .map(|w| w.header.variant)
+            .collect();
+        assert_eq!(variants, [HeaderVariant::Default, HeaderVariant::Even]);
     }
 
     #[test]
