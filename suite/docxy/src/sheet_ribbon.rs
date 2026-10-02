@@ -486,34 +486,6 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                             Some("table"),
                             SheetAct::FormatAsTable,
                         )),
-                        Item::One(large(
-                            "data-validation",
-                            "Data Validation",
-                            None,
-                            SheetAct::DataValidation,
-                        )),
-                        Item::One(large(
-                            "text-to-columns",
-                            "Text to Columns",
-                            None,
-                            SheetAct::TextToColumns,
-                        )),
-                    ],
-                },
-            },
-            Group {
-                title: "Outline",
-                launcher: false,
-                body: Body::Strip {
-                    gap: GAP_1,
-                    items: &[
-                        Item::One(large("subtotal", "Subtotal", None, SheetAct::Subtotal)),
-                        Item::One(large(
-                            "group-ungroup",
-                            "Group / Ungroup",
-                            None,
-                            SheetAct::Outline,
-                        )),
                     ],
                 },
             },
@@ -549,6 +521,92 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                         )),
                     ],
                 },
+            },
+        ],
+    },
+    // Excel's Data tab (#693): Data Validation and Text to Columns moved
+    // here from Insert, where they never were in Excel.
+    Tab {
+        tab: RibbonTab::Data,
+        titles: Titles::Plain,
+        groups: &[
+            Group {
+                title: "Data Tools",
+                launcher: false,
+                body: Body::Strip {
+                    gap: GAP_1,
+                    items: &[
+                        Item::One(large(
+                            "text-to-columns",
+                            "Text to Columns",
+                            None,
+                            SheetAct::TextToColumns,
+                        )),
+                        Item::One(large(
+                            "data-validation",
+                            "Data Validation",
+                            None,
+                            SheetAct::DataValidation,
+                        )),
+                    ],
+                },
+            },
+            Group {
+                title: "Outline",
+                launcher: false,
+                body: Body::Strip {
+                    gap: GAP_1,
+                    items: &[
+                        Item::One(large("group", "Group", None, SheetAct::Group)),
+                        Item::One(large("ungroup", "Ungroup", None, SheetAct::Ungroup)),
+                        Item::One(large("subtotal", "Subtotal", None, SheetAct::Subtotal)),
+                        Item::Col {
+                            gap: COL,
+                            cmds: &[
+                                row("show-detail", "Show Detail", None, SheetAct::ShowDetail),
+                                row("hide-detail", "Hide Detail", None, SheetAct::HideDetail),
+                            ],
+                        },
+                        Item::Col {
+                            gap: COL,
+                            cmds: &[
+                                row("auto-outline", "Auto Outline", None, SheetAct::AutoOutline),
+                                row(
+                                    "clear-outline",
+                                    "Clear Outline",
+                                    None,
+                                    SheetAct::ClearOutline,
+                                ),
+                                row(
+                                    "outline-settings",
+                                    "Settings...",
+                                    None,
+                                    SheetAct::OutlineSettings,
+                                ),
+                            ],
+                        },
+                    ],
+                },
+            },
+            // The outline's level buttons, as Excel draws them over the row
+            // numbers: 1 shows only the top level, 8 everything.
+            Group {
+                title: "Show Level",
+                launcher: false,
+                body: Body::Rows(&[
+                    &[
+                        glyph("level-1", "Show Level 1", "1", SheetAct::ShowLevel(1)),
+                        glyph("level-2", "Show Level 2", "2", SheetAct::ShowLevel(2)),
+                        glyph("level-3", "Show Level 3", "3", SheetAct::ShowLevel(3)),
+                        glyph("level-4", "Show Level 4", "4", SheetAct::ShowLevel(4)),
+                    ],
+                    &[
+                        glyph("level-5", "Show Level 5", "5", SheetAct::ShowLevel(5)),
+                        glyph("level-6", "Show Level 6", "6", SheetAct::ShowLevel(6)),
+                        glyph("level-7", "Show Level 7", "7", SheetAct::ShowLevel(7)),
+                        glyph("level-8", "Show Level 8", "8", SheetAct::ShowLevel(8)),
+                    ],
+                ]),
             },
         ],
     },

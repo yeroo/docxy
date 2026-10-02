@@ -60,6 +60,7 @@ mod ribbon_export;
 mod sect_pr_tests;
 #[cfg(test)]
 mod sheet_entry_tests;
+mod sheet_outline;
 mod sheet_ribbon;
 mod style_gallery;
 mod table_dialogs;
@@ -364,6 +365,8 @@ enum RibbonTab {
     Project,
     Home,
     Insert,
+    /// Excel's Data tab (#693); workbooks only.
+    Data,
     /// Word's Design tab (#651); documents only.
     Design,
     /// Word's page Layout tab (#649); documents only.
@@ -822,7 +825,9 @@ fn bar_target(act: SheetAct) -> Option<RefTarget> {
 
 /// The workbook commands Protected View lets through (#610): copying and
 /// moving between comments only look. Everything else edits, opens a bar or
-/// dialog that would, or changes what the file saves (Freeze Panes, Outline).
+/// dialog that would, or changes what the file saves (Freeze Panes, and every
+/// outline command: a level button or Show Detail writes `hidden` and
+/// `collapsed` into the file).
 fn protected_view_allows_act(act: SheetAct) -> bool {
     matches!(
         act,
@@ -863,13 +868,20 @@ fn protected_view_allows_doc_act(act: Act) -> bool {
 /// Almost everything here targets cells, including the ones that only look
 /// sheet-wide: Freeze Panes freezes AT the selected cell, the comment steps
 /// move the selection, and the colour pickers paint it. The exceptions are the
-/// four that never touch it — protection and outlining are properties of the
-/// whole sheet, the Number format combo only opens or closes its strip (a
-/// format picked there is what acts on cells), and `Todo` does nothing at all.
+/// ones that never touch it — protection, the outline level buttons, Clear
+/// Outline and the outline Settings are properties of the whole sheet, the
+/// Number format combo only opens or closes its strip (a format picked there
+/// is what acts on cells), and `Todo` does nothing at all. Group, Ungroup,
+/// Show/Hide Detail, Auto Outline and Subtotal read the selection.
 fn act_targets_cells(act: SheetAct) -> bool {
     !matches!(
         act,
-        SheetAct::ProtectSheet | SheetAct::Outline | SheetAct::NumberFormatMenu | SheetAct::Todo
+        SheetAct::ProtectSheet
+            | SheetAct::ShowLevel(_)
+            | SheetAct::ClearOutline
+            | SheetAct::OutlineSettings
+            | SheetAct::NumberFormatMenu
+            | SheetAct::Todo
     )
 }
 
@@ -1381,8 +1393,18 @@ enum SheetAct {
     TextToColumns,
     FormatAsTable,
     ProtectSheet,
+    /// Data › Subtotal...: Excel's Subtotal dialog (#693).
     Subtotal,
-    Outline,
+    /// Data › Outline (#693): Group, Ungroup, Show and Hide Detail, a level
+    /// button (1..=8), Auto Outline, Clear Outline and Settings....
+    Group,
+    Ungroup,
+    ShowDetail,
+    HideDetail,
+    ShowLevel(u8),
+    AutoOutline,
+    ClearOutline,
+    OutlineSettings,
     /// The Number group's format combo: opens or closes the format strip.
     NumberFormatMenu,
     Todo,
@@ -12419,65 +12441,6 @@ impl Docxy {
         cx.notify();
     }
 
-    /// Subtotal: at each change in the selected column's value, insert a
-    /// SUBTOTAL(9,…) row over the numeric columns plus a grand total; detail
-    /// rows are grouped (outline level 1) for collapse. The region should be
-    /// sorted by that column first.
-    fn sheet_subtotal(&mut self, cx: &mut Context<Self>) {
-        use gridcore::sheet::CellValue;
-        self.sheet_snapshot();
-        if let Some(v) = self.active_sheet_mut() {
-            let s = v.active;
-            let sc = v.sel.1;
-            let cur_r = v.sel.0;
-            let (max_r, max_c) = v.extent();
-            let sh = &v.pkg.workbook.sheets[s];
-            let used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
-            if !used(cur_r) {
-                return;
-            }
-            let mut top = cur_r;
-            while top > 0 && used(top - 1) {
-                top -= 1;
-            }
-            let mut bottom = cur_r;
-            while bottom < max_r && used(bottom + 1) {
-                bottom += 1;
-            }
-            let header = matches!(sh.cell(top, sc).map(|c| &c.value), Some(CellValue::Text(_)));
-            let add_to = gridcore::edit::numeric_columns(sh, top, bottom, sc);
-            let opts = gridcore::edit::SubtotalOptions::new(sc, add_to, header);
-            let _ = gridcore::edit::subtotal(&mut v.pkg.workbook, s, top, bottom, &opts);
-            v.engine = sheet_engine(&v.pkg.workbook);
-        }
-        self.mark_sheet_dirty();
-        cx.notify();
-    }
-
-    /// Collapse (hide) or expand all grouped detail rows (outline level ≥ 1),
-    /// leaving the subtotal rows visible.
-    fn sheet_toggle_outline(&mut self, cx: &mut Context<Self>) {
-        if let Some(v) = self.active_sheet_mut() {
-            let s = v.active;
-            let sh = &v.pkg.workbook.sheets[s];
-            let outlined: Vec<u32> = sh
-                .row_attrs
-                .keys()
-                .copied()
-                .filter(|&r| sh.row_outline(r) >= 1)
-                .collect();
-            if outlined.is_empty() {
-                return;
-            }
-            let any_visible = outlined.iter().any(|&r| !sh.row_hidden(r));
-            for &r in &outlined {
-                v.pkg.workbook.sheets[s].set_row_hidden(r, any_visible);
-            }
-        }
-        self.mark_sheet_dirty();
-        cx.notify();
-    }
-
     /// Format as Table: wrap the active multi-cell selection (or the contiguous
     /// region grown around the cursor) in an Excel Table — banded, filterable,
     /// and styled by Excel on open. The first row becomes headers when it is all
@@ -14063,8 +14026,42 @@ impl Docxy {
             SheetAct::RemoveDuplicates => self.sheet_remove_duplicates(cx),
             SheetAct::FormatAsTable => self.sheet_format_as_table(cx),
             SheetAct::ProtectSheet => self.sheet_toggle_protection(cx),
-            SheetAct::Subtotal => self.sheet_subtotal(cx),
-            SheetAct::Outline => self.sheet_toggle_outline(cx),
+            SheetAct::Subtotal | SheetAct::OutlineSettings => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    let d = if act == SheetAct::Subtotal {
+                        sheet_outline::subtotal_dialog(tab)
+                    } else {
+                        sheet_outline::settings_dialog(tab)
+                    };
+                    match d {
+                        Ok(d) => tab.dialogs.push(d),
+                        Err(e) => tab.status = e.into(),
+                    }
+                }
+                cx.notify();
+            }
+            SheetAct::Group
+            | SheetAct::Ungroup
+            | SheetAct::ShowDetail
+            | SheetAct::HideDetail
+            | SheetAct::ShowLevel(_)
+            | SheetAct::AutoOutline
+            | SheetAct::ClearOutline => {
+                use sheet_outline::Cmd;
+                let cmd = match act {
+                    SheetAct::Group => Cmd::Group,
+                    SheetAct::Ungroup => Cmd::Ungroup,
+                    SheetAct::ShowDetail => Cmd::ShowDetail,
+                    SheetAct::HideDetail => Cmd::HideDetail,
+                    SheetAct::ShowLevel(n) => Cmd::ShowLevel(n),
+                    SheetAct::AutoOutline => Cmd::AutoOutline,
+                    _ => Cmd::ClearOutline,
+                };
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    sheet_outline::run(tab, cmd);
+                }
+                cx.notify();
+            }
             // Excel's Convert Text to Columns Wizard, as a form dialog.
             SheetAct::TextToColumns => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
@@ -14361,6 +14358,17 @@ impl Docxy {
         {
             cx.notify();
             return;
+        }
+        // Alt+Shift+Right/Left: Group and Ungroup (#693), before the Shift
+        // arms below take them for extending the selection.
+        if let Some(ungroup) = sheet_outline::group_key(key, ctrl, shift, alt).filter(|_| !editing)
+        {
+            let act = if ungroup {
+                SheetAct::Ungroup
+            } else {
+                SheetAct::Group
+            };
+            return self.run_sheet_act(act, window, cx);
         }
         match key {
             "escape" => {
@@ -17139,6 +17147,12 @@ impl Docxy {
             self.keytips = KeyTip::Off;
             return self.project_key(ev, window, cx);
         }
+        // Alt+Shift+Right/Left group and ungroup (#693). Alt has raised the
+        // KeyTips by the time the arrow comes, so they go down unasked.
+        if self.active_is_sheet() && sheet_outline::group_key(&key, ctrl, shift, m.alt).is_some() {
+            self.keytips = KeyTip::Off;
+            return self.sheet_key(ev, ctrl, shift, m.alt, key.as_str(), window, cx);
+        }
         // KeyTips (Alt / F10 access keys): toggle the overlay; while it's showing,
         // letters pick a tab / run a command instead of typing.
         if (key == "alt" || key == "f10") && !ctrl {
@@ -19791,12 +19805,20 @@ fn ribbon_for(kind: Kind) -> rs::Ribbon<Act> {
         Kind::Project => project_ribbon(),
         Kind::Docx => docxy_ribbon(),
         // The same tabs as `ribbon_tab_set` gives a workbook: no Design, no
-        // Layout and no Mailings.
+        // Layout and no Mailings, and Excel's Data tab (#693) after Insert.
+        // A sheet draws its commands from `sheet_ribbon`; these entries name
+        // the tabs and their KeyTips.
         _ => {
             let mut ribbon = docxy_ribbon();
             ribbon
                 .tabs
                 .retain(|t| !matches!(t.name, "Design" | "Layout" | "Mailings"));
+            let at = ribbon
+                .tabs
+                .iter()
+                .position(|t| t.name == "Insert")
+                .map_or(0, |i| i + 1);
+            ribbon.tabs.insert(at, rs::tab("Data", "A", Vec::new()));
             ribbon
         }
     }
@@ -19830,6 +19852,7 @@ fn ribbon_tab_set(kind: Kind) -> &'static [(Option<RibbonTab>, &'static str, &'s
             (None, "File", "F"),
             (Some(Home), "Home", "H"),
             (Some(Insert), "Insert", "N"),
+            (Some(Data), "Data", "A"),
             (Some(Review), "Review", "R"),
             (Some(View), "View", "W"),
         ]
@@ -19870,6 +19893,7 @@ fn ribbon_tab_name(tab: RibbonTab) -> &'static str {
     match tab {
         RibbonTab::Home => "Home",
         RibbonTab::Insert => "Insert",
+        RibbonTab::Data => "Data",
         RibbonTab::Design => "Design",
         RibbonTab::Layout => "Layout",
         RibbonTab::Mailings => "Mailings",
@@ -33695,10 +33719,45 @@ mod grid_geom_tests {
         }
         // The Text to Columns wizard converts the selected column.
         assert!(act_targets_cells(SheetAct::TextToColumns));
-        // The three exceptions: two whole-sheet properties and the inert stub.
+        // The outline commands that read the selection: Group and Ungroup
+        // span it, Show/Hide Detail act at the cursor, Auto Outline takes a
+        // block, Subtotal the region around the cursor (#693).
+        for act in [
+            SheetAct::Group,
+            SheetAct::Ungroup,
+            SheetAct::ShowDetail,
+            SheetAct::HideDetail,
+            SheetAct::AutoOutline,
+            SheetAct::Subtotal,
+        ] {
+            assert!(act_targets_cells(act), "{act:?}");
+        }
+        // The exceptions: whole-sheet properties and the inert stub.
         assert!(!act_targets_cells(SheetAct::ProtectSheet));
-        assert!(!act_targets_cells(SheetAct::Outline));
+        assert!(!act_targets_cells(SheetAct::ShowLevel(1)));
+        assert!(!act_targets_cells(SheetAct::ClearOutline));
+        assert!(!act_targets_cells(SheetAct::OutlineSettings));
         assert!(!act_targets_cells(SheetAct::Todo));
+    }
+
+    #[test]
+    fn protected_view_refuses_every_outline_command() {
+        use super::SheetAct;
+        // Each writes the outline, `hidden` or `collapsed` into the file.
+        for act in [
+            SheetAct::Group,
+            SheetAct::Ungroup,
+            SheetAct::ShowDetail,
+            SheetAct::HideDetail,
+            SheetAct::ShowLevel(2),
+            SheetAct::AutoOutline,
+            SheetAct::ClearOutline,
+            SheetAct::OutlineSettings,
+            SheetAct::Subtotal,
+        ] {
+            assert!(!super::protected_view_allows_act(act), "{act:?}");
+        }
+        assert!(super::protected_view_allows_act(SheetAct::Copy));
     }
 
     #[test]
