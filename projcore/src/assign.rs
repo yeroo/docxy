@@ -37,7 +37,12 @@ pub(crate) fn task_calendar(proj: &Project, task: &Task) -> WorkCalendar {
 /// false) an instant at the end of a working period moves on to the next
 /// period's start, as a task starting there starts the next morning; as a
 /// finish it stays at the end. `None` when the horizon has no such time.
-fn advance(cal: &WorkCalendar, from: DateTime, minutes: i64, finish: bool) -> Option<DateTime> {
+pub(crate) fn advance(
+    cal: &WorkCalendar,
+    from: DateTime,
+    minutes: i64,
+    finish: bool,
+) -> Option<DateTime> {
     let from = from.minutes();
     let mut left = minutes.max(0);
     if finish && left == 0 {
