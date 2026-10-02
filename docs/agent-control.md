@@ -69,7 +69,7 @@ read, so a test can tell "not supported" from "empty":
 Each task then carries `fields: {"<name as asked>": {"text": …, "value": …}}`.
 Names match ignoring ASCII case and surrounding space. An unknown name, or a
 `fields` that is not a list of strings, fails the whole call
-(`unknown task field 'Status'`). The verbs that reply with a task (`task.set`,
+(`unknown task field 'Bogus'`). The verbs that reply with a task (`task.set`,
 `task.add`, `link.add`, `link.del`) take `fields` too and check it before they
 edit anything, so a bad list leaves the plan and its undo history unchanged. The fields are the Entry columns (ID, Task
 Mode, Name, Duration, Start, Finish, Predecessors, Resource Names), % Complete,
@@ -79,8 +79,9 @@ Baseline and Baseline1–Baseline10 Start/Finish/Duration/Work/Cost, Start,
 Finish, Duration, Work and Cost Variance, Total, Free, Start and Finish Slack,
 Early and Late Start/Finish, Critical, Constraint Type and Date, Deadline,
 Active, Outline Number, Outline Level, WBS, Leveling Delay, Type, Effort Driven,
-Priority, Notes, Milestone, Summary, Estimated and Unique ID. Earned-value,
-Status and custom fields are not readable yet.
+Priority, Notes, Milestone, Summary, Estimated, Status and Unique ID. Status is
+measured at the plan's StatusDate, else its CurrentDate, and is empty when the
+plan has neither. Earned-value and custom fields are not readable yet.
 
 - `text` is what the sheet shows. The Entry columns use the grid's own text,
   which the harness `cell` verb also returns (`2d`, `2026-03-02`); the other
