@@ -2,6 +2,7 @@
 * text=auto eol=lf
 *.png binary
 *.docx binary
+*.doc binary
 *.pdf binary
 *.wmf binary
 tools/comshim/docxy-excel.tlb binary

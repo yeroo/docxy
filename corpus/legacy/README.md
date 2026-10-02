@@ -34,6 +34,11 @@ SUPBOOK (0x3A01). That SUPBOOK also holds the Analysis ToolPak's functions
 (EDATE in `calc-dates.xls`), which the `.xlsx` spells bare, so the import
 prefixes `_xll.` only to a name that isn't a built-in function (#890).
 
+`word/` holds the Word 97-2003 documents (`.doc`) that Word made for
+docxcore's Word import (`docxcore::legacy::doc`, #634), each with Word's own
+`.docx` reading of it as the oracle; `word/README.md` says how they were made
+and what each covers, and `docxcore/tests/legacy_doc.rs` is their test.
+
 ## The test over this corpus (runs in CI)
 
 `gridcore/tests/legacy.rs` opens each file with `open_workbook` and checks it
