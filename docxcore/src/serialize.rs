@@ -1620,6 +1620,57 @@ mod tests {
         );
     }
 
+    /// A Word TOC entry: text, then a webHidden tab and page number.
+    const TOC_ENTRY: &str = "<w:document><w:body><w:p><w:hyperlink w:anchor=\"_Toc1\">\
+        <w:r><w:t>Intro</w:t></w:r>\
+        <w:r><w:rPr><w:webHidden/></w:rPr><w:tab/></w:r>\
+        <w:r><w:rPr><w:webHidden/></w:rPr><w:t>3</w:t></w:r>\
+        </w:hyperlink></w:p></w:body></w:document>";
+
+    #[test]
+    fn toc_web_hidden_runs_round_trip_without_vanish_916() {
+        // The entry is rebuilt from the model (split around its tab), so its
+        // webHidden runs must not come back as hidden text.
+        let d = parse_document_xml(TOC_ENTRY, &Relationships::default());
+        let xml = document_to_xml(&d);
+        assert!(!xml.contains("w:vanish"), "{xml}");
+        assert_eq!(xml.matches("<w:webHidden/>").count(), 2, "{xml}");
+        assert_eq!(parse_document_xml(&xml, &Relationships::default()), d);
+    }
+
+    #[test]
+    fn edited_toc_entry_with_pageref_field_saves_without_vanish_916() {
+        // Word's own shape: the page number is a PAGEREF field. Such a link is
+        // kept raw until something inside it changes; then its tab is rebuilt.
+        let toc = "<w:document><w:body><w:p><w:hyperlink w:anchor=\"_Toc1\" w:history=\"1\">\
+            <w:r><w:t>Intro</w:t></w:r>\
+            <w:r><w:rPr><w:webHidden/></w:rPr><w:tab/></w:r>\
+            <w:r><w:rPr><w:webHidden/></w:rPr><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+            <w:r><w:rPr><w:webHidden/></w:rPr><w:instrText> PAGEREF _Toc1 </w:instrText></w:r>\
+            <w:r><w:rPr><w:webHidden/></w:rPr><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+            <w:r><w:rPr><w:webHidden/></w:rPr><w:t>3</w:t></w:r>\
+            <w:r><w:rPr><w:webHidden/></w:rPr><w:fldChar w:fldCharType=\"end\"/></w:r>\
+            </w:hyperlink></w:p></w:body></w:document>";
+        let mut d = parse_document_xml(toc, &Relationships::default());
+        let link = |d: &Document| match &d.body[0] {
+            Block::Paragraph(p) => match &p.content[..] {
+                [Inline::Hyperlink(h)] => h.clone(),
+                other => panic!("expected one link, got {other:?}"),
+            },
+            _ => panic!("no paragraph"),
+        };
+        if let Block::Paragraph(p) = &mut d.body[0]
+            && let Inline::Hyperlink(h) = &mut p.content[0]
+        {
+            h.content_changed = true;
+        }
+        let xml = document_to_xml(&d);
+        assert!(!xml.contains("w:vanish"), "{xml}");
+        assert_eq!(xml.matches("<w:webHidden/>").count(), 6, "{xml}");
+        let back = parse_document_xml(&xml, &Relationships::default());
+        assert_eq!(link(&back).content, link(&d).content);
+    }
+
     #[test]
     fn run_properties_roundtrip() {
         let props = RunProps {

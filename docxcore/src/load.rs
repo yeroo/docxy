@@ -1794,10 +1794,10 @@ fn parse_rpr(p: &mut XmlParser, props: &mut RunProps) {
                         props.vanish = toggle_on(val);
                         modeled = props.vanish;
                     }
-                    "w:webHidden" => {
-                        props.vanish = toggle_on(val);
-                        modeled = false;
-                    }
+                    // Hidden in Web layout only: Word shows it in print
+                    // layout (every TOC puts it on its tab and page number),
+                    // so it is not `vanish`. Kept raw and written back as is.
+                    "w:webHidden" => modeled = false,
                     "w:rtl" => {
                         props.rtl = toggle_on(val);
                         modeled = props.rtl;
@@ -3174,6 +3174,50 @@ mod tests {
         assert!(nested.italic && !nested.bold);
         let plain = field_result_props(PAGE_FIELD);
         assert!(!plain.bold && !plain.italic && !plain.vanish);
+    }
+
+    /// The props of a paragraph's single run, tab or field result.
+    fn only_run_props(inner: &str) -> RunProps {
+        match &first_para(&para_doc(inner)).content[..] {
+            [Inline::Run(r)] => r.props.clone(),
+            [Inline::Tab(p)] => p.clone(),
+            [Inline::Field { raw, .. }] => field_result_props(raw),
+            other => panic!("expected one inline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn web_hidden_is_not_vanish_916() {
+        // Hidden only in Web layout: Word shows it in print layout, and every
+        // TOC puts it on its tab and page number. It stays raw, never vanish.
+        let web = only_run_props("<w:r><w:rPr><w:webHidden/></w:rPr><w:t>3</w:t></w:r>");
+        assert!(!web.vanish);
+        assert_eq!(web.raw_props, ["<w:webHidden/>"]);
+        let tab = only_run_props("<w:r><w:rPr><w:webHidden/></w:rPr><w:tab/></w:r>");
+        assert!(!tab.vanish);
+        let off =
+            only_run_props("<w:r><w:rPr><w:webHidden w:val=\"0\"/></w:rPr><w:t>3</w:t></w:r>");
+        assert!(!off.vanish);
+        assert_eq!(off.raw_props, ["<w:webHidden w:val=\"0\"/>"]);
+        // Genuinely hidden text that is also webHidden stays hidden.
+        let both =
+            only_run_props("<w:r><w:rPr><w:vanish/><w:webHidden/></w:rPr><w:t>3</w:t></w:r>");
+        assert!(both.vanish);
+        assert_eq!(both.raw_props, ["<w:webHidden/>"]);
+        // ... whatever webHidden says, in either order.
+        let vanish_then_off = only_run_props(
+            "<w:r><w:rPr><w:vanish/><w:webHidden w:val=\"0\"/></w:rPr><w:t>3</w:t></w:r>",
+        );
+        assert!(vanish_then_off.vanish);
+        // A TOC page number is a PAGEREF field whose runs are all webHidden.
+        let page = only_run_props(
+            "<w:r><w:rPr><w:webHidden/></w:rPr><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+             <w:r><w:rPr><w:webHidden/></w:rPr><w:instrText> PAGEREF _Toc1 </w:instrText></w:r>\
+             <w:r><w:rPr><w:webHidden/></w:rPr><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+             <w:r><w:rPr><w:webHidden/></w:rPr><w:t>3</w:t></w:r>\
+             <w:r><w:rPr><w:webHidden/></w:rPr><w:fldChar w:fldCharType=\"end\"/></w:r>",
+        );
+        assert!(!page.vanish);
     }
 
     #[test]
