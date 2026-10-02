@@ -571,14 +571,16 @@ pub fn autocomplete(sheet: &Sheet, row: u32, col: u32, typed: &str) -> Option<St
         let CellValue::Text(text) = &cell.value else {
             continue;
         };
-        if cell.formula.is_some() || !stays_text(text) {
+        if cell.formula.is_some() {
             continue;
         }
         let lower = text.to_lowercase();
+        // Any text value counts for "already one of the values"; only a
+        // matching one pays for the stays-text parse.
         if lower == want {
             return None;
         }
-        if !lower.starts_with(&want) {
+        if !lower.starts_with(&want) || !stays_text(text) {
             continue;
         }
         match &found {
@@ -2050,6 +2052,11 @@ mod tests {
         }
         let sh = held_as_text("0abc");
         assert_eq!(autocomplete(&sh, 1, 0, "0").as_deref(), Some("0abc"));
+        // A value that would not stay text still is one of the values: `007`
+        // typed over a block holding `007` and `007x` proposes nothing.
+        let mut sh = held_as_text("007");
+        sh.set_cell(1, 0, Cell::text("007x"));
+        assert_eq!(autocomplete(&sh, 2, 0, "007"), None);
         // A formula's text result is not a proposal.
         let mut sh = column(&[Some("=\"x\"")]);
         sh.cells.get_mut(&(0, 0)).unwrap().value = CellValue::Text("xyz".into());
