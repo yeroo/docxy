@@ -691,3 +691,112 @@ fn an_inserted_section_ending_paragraph_never_lends_or_borrows_a_break() {
         }
     }
 }
+
+const CELL_TABLE: &str =
+    "<w:tbl><w:tr><w:tc><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>";
+
+fn non_empty_texts(d: &Document) -> Vec<String> {
+    texts(d).into_iter().filter(|t| !t.is_empty()).collect()
+}
+
+#[test]
+fn a_whole_changed_segment_before_a_table_does_not_panic() {
+    let in_cell = |body: &str| {
+        format!(
+            "<w:tbl><w:tr><w:tc>{body}</w:tc></w:tr></w:tbl>{}",
+            p("End")
+        )
+    };
+    for (original, revised) in [
+        (
+            format!("{}{CELL_TABLE}{}", p("Title"), p("End")),
+            format!("{CELL_TABLE}{}", p("End")),
+        ),
+        (
+            format!("{CELL_TABLE}{}", p("End")),
+            format!("{}{CELL_TABLE}{}", p("Intro"), p("End")),
+        ),
+        // A cell whose paragraphs before a nested table all changed.
+        (
+            in_cell(&format!(
+                "{}{}{CELL_TABLE}{}",
+                p("Old one"),
+                p("Old two"),
+                p("tail")
+            )),
+            in_cell(&format!("{CELL_TABLE}{}", p("tail"))),
+        ),
+    ] {
+        let result = compare(&pkg(&original), &pkg(&revised));
+        assert!(
+            result
+                .skipped
+                .iter()
+                .any(|s| matches!(s, CompareSkip::ParagraphMark { .. })),
+            "{:?}",
+            result.skipped
+        );
+        for document in [result.package.document.clone(), reloaded(&result)] {
+            assert_eq!(
+                non_empty_texts(&resolved(&document, true)),
+                non_empty_texts(&doc(&revised))
+            );
+            assert_eq!(
+                non_empty_texts(&resolved(&document, false)),
+                non_empty_texts(&doc(&original))
+            );
+        }
+    }
+}
+
+#[test]
+fn compare_never_panics_across_small_container_shapes() {
+    let shapes: Vec<String> = vec![
+        String::new(),
+        p("P"),
+        CELL_TABLE.to_string(),
+        format!("{}{CELL_TABLE}", p("P")),
+        format!("{CELL_TABLE}{}", p("P")),
+        format!("{}{CELL_TABLE}{}", p("P"), p("Q")),
+        format!("{CELL_TABLE}{CELL_TABLE}"),
+        format!("{}{}", p("X"), p("Y")),
+    ];
+    // Also inside a table cell (a cell is a container too).
+    let celled: Vec<String> = shapes
+        .iter()
+        .map(|s| format!("<w:tbl><w:tr><w:tc>{s}</w:tc></w:tr></w:tbl>{}", p("End")))
+        .collect();
+    for set in [&shapes, &celled] {
+        for original in set.iter() {
+            for revised in set.iter() {
+                let result = compare(&pkg(original), &pkg(revised));
+                for accept in [true, false] {
+                    let mut document = reloaded(&result);
+                    let outcomes = if accept {
+                        document.accept_all_revisions()
+                    } else {
+                        document.reject_all_revisions()
+                    };
+                    assert!(
+                        outcomes.iter().all(RevisionOutcome::is_applied),
+                        "{original} -> {revised}: {outcomes:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_deleted_paragraphs_dropped_section_break_does_not_block_borrowing() {
+    let deleted = "<w:p><w:pPr><w:sectPr><w:pgSz w:w=\"11906\"/></w:sectPr></w:pPr>\
+        <w:r><w:t>Gone</w:t></w:r></w:p>";
+    let original = format!("{}{deleted}{CELL_TABLE}{}", p("Intro"), p("End"));
+    let revised = format!("{}{CELL_TABLE}{}", p("Intro"), p("End"));
+    let result = compare(&pkg(&original), &pkg(&revised));
+    assert!(result.skipped.is_empty(), "{:?}", result.skipped);
+    for document in [result.package.document.clone(), reloaded(&result)] {
+        assert_eq!(texts(&resolved(&document, true)), texts(&doc(&revised)));
+        assert_eq!(texts(&resolved(&document, false)), texts(&doc(&original)));
+    }
+}

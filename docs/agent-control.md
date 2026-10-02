@@ -401,8 +401,12 @@ Supported kinds are insertions, deletions, and property changes in run,
 paragraph, table, row, cell, and section scopes. Accepting an insertion keeps
 its content; rejecting it removes the content. Accepting a deletion removes its
 content; rejecting it restores ordinary content. Accepting a property change
-keeps current properties, while rejecting restores the prior snapshot. Nested
-bulk changes are transformed innermost-first and reported in their original
+keeps current properties, while rejecting restores the prior snapshot. A
+`paragraph mark insertion`/`paragraph mark deletion` is a tracked change of a
+paragraph mark: accepting a mark deletion or rejecting a mark insertion joins the
+paragraph with the next paragraph in its container (taking that paragraph's
+properties), so top-level block indices shift — refresh them from `doc.outline`
+or `doc.read` afterwards. Nested bulk changes are transformed innermost-first and reported in their original
 document order. See [`docx-revision-inventory.md`](docx-revision-inventory.md)
 for the complete fidelity and exclusion contract.
 

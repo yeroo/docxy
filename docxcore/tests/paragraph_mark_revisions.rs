@@ -641,3 +641,73 @@ fn bulk_actions_resolve_marks_inside_text_boxes_within_revisions() {
         }
     }
 }
+
+#[test]
+fn new_table_cells_and_a_table_split_keep_records_with_the_physical_mark() {
+    use docxcore::table::AutoFit;
+    // Tab in the last cell adds a row templated on it: its first paragraph
+    // has a tracked mark, but the new cells' marks are new and untracked.
+    let mut editor = editor_with(&format!(
+        "<w:tbl><w:tr><w:tc>{}</w:tc></w:tr></w:tbl>{}",
+        marked("cell", "del", "1", "S"),
+        para("after")
+    ));
+    editor.caret = Caret::at(vec![0, 0, 0, 0], 2);
+    assert!(editor.table_tab_adds_row());
+    assert!(editor.table_next_cell());
+    let Block::Table(table) = &editor.doc.body[0] else {
+        panic!("table")
+    };
+    assert_eq!(table.rows.len(), 2);
+    let Block::Paragraph(new_cell) = &table.rows[1].cells[0].blocks[0] else {
+        panic!("paragraph")
+    };
+    assert!(new_cell.props.mark_revisions.is_empty());
+    assert_eq!(mark_record_count(&document_to_xml(&editor.doc)), 1);
+
+    // A table inserted mid-paragraph: the record stays on the second half.
+    let mut editor = editor_with(&format!(
+        "{}{}",
+        marked("HelloWorld", "del", "1", "S"),
+        para("Z")
+    ));
+    editor.caret = Caret::at(vec![0], 5);
+    editor.insert_table(1, 1, AutoFit::Default).unwrap();
+    let holders: Vec<String> = editor
+        .doc
+        .body
+        .iter()
+        .filter_map(|b| match b {
+            Block::Paragraph(p) if !p.props.mark_revisions.is_empty() => Some(p.plain_text()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(holders, ["World"]);
+    assert_eq!(mark_record_count(&document_to_xml(&editor.doc)), 1);
+}
+
+#[test]
+fn text_to_table_keeps_the_record_on_the_last_piece_only() {
+    use docxcore::editor::CellSep;
+    let mut editor = editor_with(&format!(
+        "<w:p><w:pPr><w:rPr><w:del w:id=\"1\"/></w:rPr></w:pPr><w:r><w:t>a</w:t></w:r>\
+         <w:r><w:tab/></w:r><w:r><w:t>b</w:t></w:r></w:p>{}",
+        para("after")
+    ));
+    editor.anchor = Some(Caret::at(vec![0], 0));
+    editor.caret = Caret::at(vec![0], 3);
+    editor.text_to_table(CellSep::Tab, None).unwrap();
+    let Block::Table(table) = &editor.doc.body[0] else {
+        panic!("table")
+    };
+    let records: Vec<usize> = table.rows[0]
+        .cells
+        .iter()
+        .map(|c| match &c.blocks[0] {
+            Block::Paragraph(p) => p.props.mark_revisions.len(),
+            _ => 0,
+        })
+        .collect();
+    assert_eq!(records, [0, 1]);
+    assert_eq!(mark_record_count(&document_to_xml(&editor.doc)), 1);
+}

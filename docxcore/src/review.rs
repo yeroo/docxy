@@ -351,8 +351,14 @@ pub(crate) fn adopt_mark_revisions(kept: &mut ParProps, gone: &ParProps) {
         return;
     }
     kept.mark_revisions = gone.mark_revisions.clone();
-    let records = records.concat();
-    match kept
+    insert_mark_records(kept, &records.concat());
+}
+
+/// Put raw `w:ins`/`w:del` record XML first in the paragraph-mark `w:rPr`
+/// (where CT_ParaRPr puts it), creating the rPr when there is none. Only the
+/// raw XML changes; callers keep `mark_revisions` in step (or reload).
+pub(crate) fn insert_mark_records(props: &mut ParProps, records: &str) {
+    match props
         .raw_props
         .iter_mut()
         .find(|raw| local_name(raw) == "rPr")
@@ -360,12 +366,11 @@ pub(crate) fn adopt_mark_revisions(kept: &mut ParProps, gone: &ParProps) {
         Some(rpr) if rpr.trim_end().ends_with("/>") && !rpr.contains("</") => {
             *rpr = format!("<w:rPr>{records}</w:rPr>");
         }
-        // CT_ParaRPr puts the ins/del records first.
         Some(rpr) => {
             let open = rpr.find('>').map_or(rpr.len(), |at| at + 1);
-            rpr.insert_str(open, &records);
+            rpr.insert_str(open, records);
         }
-        None => kept.raw_props.push(format!("<w:rPr>{records}</w:rPr>")),
+        None => props.raw_props.push(format!("<w:rPr>{records}</w:rPr>")),
     }
 }
 

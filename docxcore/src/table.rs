@@ -270,6 +270,8 @@ pub fn template_cell(cell: &Cell) -> Cell {
             props.property_change = None;
             props.section_property_change = None;
             props.section_break = None;
+            // A new cell's mark is a new, untracked mark.
+            crate::review::clear_mark_revisions(&mut props);
             Paragraph {
                 props,
                 content: Vec::new(),

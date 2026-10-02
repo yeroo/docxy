@@ -256,7 +256,9 @@ impl Item<'_> {
     fn ends_section(&self) -> bool {
         let props = match self {
             Item::Same(Block::Paragraph(p)) => &p.props,
-            Item::Modified(_, p) | Item::Inserted(p) | Item::Deleted(p) => &p.props,
+            Item::Modified(_, p) | Item::Inserted(p) => &p.props,
+            // A deleted paragraph is emitted without its section break
+            // (`original_par_props`), so it never lends or takes one.
             _ => return false,
         };
         props.section_break.is_some() || props.section_property_change.is_some()
@@ -423,8 +425,7 @@ impl<'o> Compare<'o> {
             // merges the break away; merging into a run paragraph that ends a
             // section takes its break. Either way the change stays in place.
             let kind = items[end - 1].change_kind();
-            let sections = items[tail - 1..end].iter().any(Item::ends_section);
-            if tail > start && !sections {
+            if tail > start && !items[tail - 1..end].iter().any(Item::ends_section) {
                 marks[tail - 1] = kind;
             } else {
                 self.skipped.push(CompareSkip::ParagraphMark {
@@ -653,19 +654,7 @@ impl<'o> Compare<'o> {
         self.count(kind);
         let (_, attrs) = self.metadata();
         let record = format!("<w:{}{attrs}/>", revision_tag(kind));
-        match props.raw_props.iter_mut().find(|raw| {
-            raw.strip_prefix("<w:rPr")
-                .is_some_and(|rest| rest.starts_with(['>', ' ', '/']))
-        }) {
-            Some(rpr) if rpr.trim_end().ends_with("/>") && !rpr.contains("</") => {
-                *rpr = format!("<w:rPr>{record}</w:rPr>");
-            }
-            Some(rpr) => {
-                let open = rpr.find('>').map_or(rpr.len(), |at| at + 1);
-                rpr.insert_str(open, &record);
-            }
-            None => props.raw_props.push(format!("<w:rPr>{record}</w:rPr>")),
-        }
+        crate::review::insert_mark_records(props, &record);
     }
 
     /// A `w:sectPrChange` with no prior section properties: rejecting it
