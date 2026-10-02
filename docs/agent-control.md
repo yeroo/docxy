@@ -274,6 +274,9 @@ One JSON object per line; one reply line per request:
 | `doc.undo` / `doc.redo` | — | `{done}` (`false` = nothing to undo/redo) |
 | `doc.format` | `{start, end?, patch}` | `{formatted}` — block count; ONE undo checkpoint over the whole range |
 | `doc.set-style` | `{start, end?, style?, align?}` | `{styled}` — block count; ONE undo checkpoint |
+| `doc.page-color` | `{color:"#RRGGBB"\|"none"}` | `{pageColor, changed}` — Design ▸ Page Color; a package edit with no undo step; refuses Markdown (unlike `doc.format`/`doc.set-style`) |
+| `doc.watermark` | `{text, layout?, font?, color?}` or `{remove:true}` | `{watermark, changed}` — Design ▸ Watermark; the header parts are package edits and the new header references are ONE undo step; refuses Markdown |
+| `doc.page-borders` | `{border:"none"\|"box"\|"shadow", color?}` | `{pageBorders, changed}` — Design ▸ Page Borders on every section as ONE undo step; refuses Markdown |
 | `doc.revisions` | — | `{count,revisions:[…]}` in document order, including stable target, kind, metadata, support state, nesting, and editor-safe locations |
 | `doc.revision-current` | — | `{count,revision}` for the navigation selection or change at the caret; `revision:null` when none |
 | `doc.revision-next` / `doc.revision-previous` | — | `{count,revision}` after selecting the wrapping next/previous change |
@@ -353,7 +356,8 @@ The current mutating control/MCP operations cover Structure
 (`doc.replace-range`, `doc.insert`, `doc.append`), Content (`doc.replace-all`,
 `doc.undo`, `doc.redo`, `doc.revision-accept`, `doc.revision-reject`,
 `doc.revisions-accept-all`, `doc.revisions-reject-all`), and Formatting
-(`doc.format`, `doc.set-style`). There
+(`doc.format`, `doc.set-style`, `doc.page-color`, `doc.watermark`,
+`doc.page-borders`). There
 is no comment-writing control verb yet, so comments-only protection denies all
 current automation edits even though comment mutations in the TUI are allowed.
 Markdown control/MCP inserts that carry styles, numbering, or direct run

@@ -63,6 +63,9 @@ pub(crate) fn verb_for(name: &str) -> Option<&'static str> {
         "docxy_revisions_accept_all" => "doc.revisions-accept-all",
         "docxy_revisions_reject_all" => "doc.revisions-reject-all",
         "docxy_compare" => "doc.compare",
+        "docxy_page_color" => "doc.page-color",
+        "docxy_watermark" => "doc.watermark",
+        "docxy_page_borders" => "doc.page-borders",
         _ => return None,
     })
 }
@@ -499,6 +502,67 @@ fn tool_defs() -> Json {
             ],
             &["original", "revised"],
         ),
+        tool(
+            "docxy_page_color",
+            "Set or remove the document's page colour (Design > Page Background > Page Color): \
+             the colour Print Layout tints each page sheet with. A package edit with no undo \
+             step. Refuses on a Markdown document.",
+            vec![
+                (
+                    "color",
+                    prop(
+                        "string",
+                        "\"#RRGGBB\" to set the page colour, or \"none\" to remove it.",
+                    ),
+                ),
+                target(),
+            ],
+            &["color"],
+        ),
+        tool(
+            "docxy_watermark",
+            "Write or remove the text watermark shown behind the pages (Design > Page \
+             Background > Watermark). The new header references are one undo step. Refuses on a \
+             Markdown document.",
+            vec![
+                (
+                    "text",
+                    prop("string", "Watermark text (non-empty after trimming)."),
+                ),
+                (
+                    "layout",
+                    prop("string", "\"diagonal\" (default) or \"horizontal\"."),
+                ),
+                ("font", prop("string", "Font name (default \"Calibri\").")),
+                (
+                    "color",
+                    prop("string", "\"#RRGGBB\" text colour (default \"#C0C0C0\")."),
+                ),
+                (
+                    "remove",
+                    prop(
+                        "boolean",
+                        "Remove the watermark (instead of setting 'text').",
+                    ),
+                ),
+                target(),
+            ],
+            &[],
+        ),
+        tool(
+            "docxy_page_borders",
+            "Write or remove page borders on every section (Design > Page Background > Page \
+             Borders) as one undo step. Refuses on a Markdown document.",
+            vec![
+                ("border", prop("string", "\"none\", \"box\" or \"shadow\".")),
+                (
+                    "color",
+                    prop("string", "Optional \"#RRGGBB\" border colour."),
+                ),
+                target(),
+            ],
+            &["border"],
+        ),
     ])
 }
 
@@ -605,6 +669,10 @@ mod tests {
             "docxy_revisions_accept_all",
             "docxy_revisions_reject_all",
             "docxy_compare",
+            // #955: Design-tab page background commands.
+            "docxy_page_color",
+            "docxy_watermark",
+            "docxy_page_borders",
         ];
         let save_pos = names.iter().position(|n| *n == "docxy_save").unwrap();
         assert_eq!(
@@ -657,6 +725,9 @@ mod tests {
         assert_eq!(required_of("docxy_revisions_accept_all"), "[]");
         assert_eq!(required_of("docxy_revisions_reject_all"), "[]");
         assert_eq!(required_of("docxy_compare"), "[\"original\",\"revised\"]");
+        assert_eq!(required_of("docxy_page_color"), "[\"color\"]");
+        assert_eq!(required_of("docxy_watermark"), "[]");
+        assert_eq!(required_of("docxy_page_borders"), "[\"border\"]");
     }
 
     /// Wave-2: `docxy_insert`/`docxy_replace_range`/`docxy_append` gain an
@@ -823,6 +894,9 @@ mod tests {
         ("docxy_revisions_accept_all", "doc.revisions-accept-all"),
         ("docxy_revisions_reject_all", "doc.revisions-reject-all"),
         ("docxy_compare", "doc.compare"),
+        ("docxy_page_color", "doc.page-color"),
+        ("docxy_watermark", "doc.watermark"),
+        ("docxy_page_borders", "doc.page-borders"),
     ];
     /// Tools handled specially in `do_tool` (not simple verb forwards), so
     /// `verb_for` deliberately returns `None` for them.
@@ -881,6 +955,9 @@ mod tests {
             ("docxy_redo", Content),
             ("docxy_format", Formatting),
             ("docxy_set_style", Formatting),
+            ("docxy_page_color", Formatting),
+            ("docxy_watermark", Formatting),
+            ("docxy_page_borders", Formatting),
             ("docxy_revision_accept", Content),
             ("docxy_revision_reject", Content),
             ("docxy_revisions_accept_all", Content),
