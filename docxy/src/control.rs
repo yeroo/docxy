@@ -1011,6 +1011,7 @@ fn compare(app: &mut App, args: &Json) -> Result<Json, String> {
 }
 
 /// One skipped item: `{"kind":"table","index":3}`, `{"kind":"object"}`,
+/// `{"kind":"formatting"}`,
 /// `{"kind":"note-ref"}`, `{"kind":"unsupported-revision","revision":"move-from"}`,
 /// `{"kind":"paragraph-mark","index":2}`.
 fn compare_skip_json(skip: &CompareSkip) -> Json {
@@ -1022,7 +1023,7 @@ fn compare_skip_json(skip: &CompareSkip) -> Json {
         CompareSkip::UnsupportedRevision { revision } => {
             fields.push(("revision", Json::Str(unsupported_revision_name(revision))));
         }
-        CompareSkip::Object | CompareSkip::NoteRef => {}
+        CompareSkip::Object | CompareSkip::Formatting | CompareSkip::NoteRef => {}
     }
     Json::obj(fields)
 }
@@ -3129,6 +3130,7 @@ mod tests {
         );
         assert_eq!(json(CompareSkip::Object), r#"{"kind":"object"}"#);
         assert_eq!(json(CompareSkip::NoteRef), r#"{"kind":"note-ref"}"#);
+        assert_eq!(json(CompareSkip::Formatting), r#"{"kind":"formatting"}"#);
         assert_eq!(
             json(CompareSkip::UnsupportedRevision {
                 revision: docxcore::model::UnsupportedRevisionKind::MoveFrom

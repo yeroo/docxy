@@ -11,7 +11,7 @@ the control/MCP surface. Review changes survive DOCX save and reload.
 | --- | --- | --- |
 | Inline insertion | `w:ins` | Accept unwraps and keeps the inserted content; reject removes the wrapper and its content. |
 | Inline deletion | `w:del`, including `w:delText` and `w:delInstrText` | Accept removes the wrapper and its content; reject restores ordinary text/content and removes only the display cue contributed by the deletion wrapper. |
-| Paragraph mark | `w:pPr/w:rPr/w:ins` or `w:del` | Keeping the mark (accept an insertion, reject a deletion) drops the record. Removing it (accept a deletion, reject an insertion) merges the next paragraph of the same container into this one, with the next paragraph's properties, as Word does; with no paragraph to merge with (the container's last paragraph, or a table next) only the record is dropped; a section break on the removed mark goes with it, so the merged text joins the following section. A mark inserted by one reviewer and deleted by another carries both records: each is listed and acted on separately, removing the mark also resolves the other, and Accept All / Reject All both remove the paragraph. Listed after the paragraph's content and located at its end. |
+| Paragraph mark | `w:pPr/w:rPr/w:ins` or `w:del` | Keeping the mark (accept an insertion, reject a deletion) drops the record. Removing it (accept a deletion, reject an insertion) merges the next paragraph of the same container into this one, with the next paragraph's properties, as Word does; with no paragraph to merge with (the container's last paragraph, or a table next) only the record is dropped; a section break on the removed mark goes with it, so the merged text joins the following section. A mark inserted by one reviewer and deleted by another carries both records: each is listed and acted on separately, removing the mark also resolves the other, and Accept All / Reject All both remove the paragraph. Listed after the paragraph's content and located at its end. Editing keeps the records with the physical mark: Enter, a multi-paragraph paste or a section break leaves them on the last part, and joining two paragraphs keeps the later paragraph's records. |
 | Run properties | `w:rPrChange` | Accept keeps the current `w:rPr`; reject restores the prior `w:rPr` snapshot. |
 | Paragraph properties | `w:pPrChange` | Accept keeps the current `w:pPr`; reject restores the prior `w:pPr` snapshot without consuming an independent section change. |
 | Table properties | `w:tblPrChange` | Accept keeps current table properties; reject restores the prior property container. |
@@ -85,7 +85,7 @@ with a Myers diff; similar paragraphs get a word-level diff (unchanged and
 inserted text keep the revised run formatting, deleted text the original's),
 and whole-paragraph insertions/deletions also mark their paragraph mark. A
 container's final mark cannot be marked, so the mark before a trailing run of
-changes is marked instead (Word's convention) — unless that mark ends a section, in which case the change is compared in place and reported as a skipped `paragraph-mark`. After a merge the surviving
+changes is marked instead (Word's convention) — unless a section break is involved (the borrowed mark or the run ends a section), in which case the change is compared in place and reported as a skipped `paragraph-mark`; an inserted paragraph left that way that ends a section also gets a `w:sectPrChange` with no prior properties, so Reject All removes its break. After a merge the surviving
 paragraph takes the later paragraph's properties, so accepting the deletion of
 a container's last paragraph leaves the original's last paragraph properties.
 
@@ -95,7 +95,8 @@ markers (bookmarks, comment ranges, field characters) come from the revised
 side only. Deleted paragraphs lose section breaks and any style or list the
 revised package lacks. The result's root also declares the original's namespace
 prefixes (and `mc:Ignorable` tokens) so deleted original markup stays bound; markup
-using a prefix the two documents bind differently is dropped. A simple field
+using a prefix the two documents bind differently is dropped (reported as skipped
+`formatting` for property children, `object` for objects). A simple field
 (`w:fldSimple`) inside an insertion or deletion is written as the equivalent
 complex field, since tracked-change wrappers hold only run-level content. What cannot be expressed is reported as skipped: a table
 whose shape changed (kept as revised), a deleted object or hyperlink target

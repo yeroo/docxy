@@ -475,3 +475,169 @@ fn bulk_actions_apply_a_paragraphs_property_change_before_merging_it_away() {
         assert!(document.revisions().is_empty());
     }
 }
+
+fn editor_with(body: &str) -> Editor {
+    Editor::new(doc(body))
+}
+
+fn type_text(editor: &mut Editor, text: &str) {
+    for c in text.chars() {
+        editor.insert_char(c);
+    }
+}
+
+fn mark_record_count(xml: &str) -> usize {
+    xml.matches("<w:del w:id=\"1\"").count() + xml.matches("<w:ins w:id=\"1\"").count()
+}
+
+#[test]
+fn enter_keeps_the_mark_record_on_the_paragraph_that_ends_with_the_mark() {
+    // Enter at the end of a paragraph whose mark is deleted, then type: the
+    // deleted mark is the one after "New", so Accept All joins "New" and
+    // "World" and leaves "Hello" alone, as Word does.
+    let mut editor = editor_with(&format!(
+        "{}{}",
+        marked("Hello", "del", "1", "S"),
+        para("World")
+    ));
+    editor.caret = Caret::at(vec![0], 5);
+    editor.insert_newline();
+    type_text(&mut editor, "New");
+    assert_eq!(editor.doc.revisions().len(), 1);
+    assert_eq!(
+        mark_record_count(&document_to_xml(&editor.doc)),
+        1,
+        "one record"
+    );
+    editor.accept_all_revisions();
+    assert_eq!(texts(&editor.doc), ["Hello", "NewWorld"]);
+
+    // A split in the middle: one record, on the second half.
+    let mut editor = editor_with(&format!(
+        "{}{}",
+        marked("Hello", "del", "1", "S"),
+        para("World")
+    ));
+    let before = editor.doc.clone();
+    editor.caret = Caret::at(vec![0], 2);
+    editor.insert_newline();
+    assert_eq!(texts(&editor.doc), ["He", "llo", "World"]);
+    let revisions = editor.doc.revisions();
+    assert_eq!(revisions.len(), 1);
+    let xml = document_to_xml(&editor.doc);
+    assert_eq!(mark_record_count(&xml), 1, "{xml}");
+    let Block::Paragraph(second) = &editor.doc.body[1] else {
+        panic!("paragraph")
+    };
+    assert_eq!(second.props.mark_revisions.len(), 1);
+    assert!(editor.undo());
+    assert_eq!(editor.doc, before, "undo restores the record");
+}
+
+#[test]
+fn pasting_paragraphs_into_a_marked_paragraph_keeps_the_record_on_the_last() {
+    use docxcore::editor::Clip;
+    use docxcore::model::{Inline, Run, RunProps};
+    let run = |t: &str| {
+        vec![Inline::Run(Run {
+            text: t.to_string(),
+            props: RunProps::default(),
+        })]
+    };
+    let mut editor = editor_with(&format!("{}{}", marked("AB", "ins", "1", "S"), para("Z")));
+    editor.caret = Caret::at(vec![0], 1);
+    editor.paste(&Clip {
+        paras: vec![run("x"), run("y"), run("z")],
+    });
+    assert_eq!(texts(&editor.doc), ["Ax", "y", "zB", "Z"]);
+    let holders: Vec<usize> = editor
+        .doc
+        .body
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| match b {
+            Block::Paragraph(p) if !p.props.mark_revisions.is_empty() => Some(i),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(holders, [2]);
+    assert_eq!(mark_record_count(&document_to_xml(&editor.doc)), 1);
+}
+
+#[test]
+fn joining_paragraphs_keeps_the_later_marks_records() {
+    // Backspace at the start of B joins A (deleted mark) into one paragraph
+    // ending with B's (untracked) mark: no record survives.
+    let mut editor = editor_with(&format!("{}{}", marked("A", "del", "1", "S"), para("B")));
+    let before = editor.doc.clone();
+    editor.caret = Caret::at(vec![1], 0);
+    editor.backspace();
+    assert_eq!(texts(&editor.doc), ["AB"]);
+    assert!(editor.doc.revisions().is_empty());
+    assert_eq!(mark_record_count(&document_to_xml(&editor.doc)), 0);
+    assert!(editor.undo());
+    assert_eq!(editor.doc, before);
+
+    // Delete at the end of A joins B (inserted mark): B's record is kept.
+    let mut editor = editor_with(&format!(
+        "{}{}{}",
+        para("A"),
+        marked("B", "ins", "1", "S"),
+        para("C")
+    ));
+    editor.caret = Caret::at(vec![0], 1);
+    editor.delete_forward();
+    assert_eq!(texts(&editor.doc), ["AB", "C"]);
+    let revisions = editor.doc.revisions();
+    assert_eq!(revisions.len(), 1);
+    assert_eq!(
+        revisions[0].category,
+        RevisionCategory::ParagraphMark(RevisionKind::Insert)
+    );
+    let xml = document_to_xml(&editor.doc);
+    assert_eq!(mark_record_count(&xml), 1, "{xml}");
+    assert!(
+        editor
+            .reject_all_revisions()
+            .iter()
+            .all(RevisionOutcome::is_applied)
+    );
+    assert_eq!(texts(&editor.doc), ["ABC"]);
+}
+
+#[test]
+fn bulk_actions_resolve_marks_inside_text_boxes_within_revisions() {
+    // A text box inside a tracked insertion/deletion run, whose first
+    // paragraph has a tracked mark: the mark acts before its wrapper.
+    for (wrapper, mark) in [
+        ("del", "del"),
+        ("del", "ins"),
+        ("ins", "del"),
+        ("ins", "ins"),
+    ] {
+        let text = if wrapper == "del" { "w:delText" } else { "w:t" };
+        let body = format!(
+            "<w:p><w:r><w:t>host</w:t></w:r><w:{wrapper} w:id=\"9\"><w:r><w:pict><v:shape><v:textbox>\
+             <w:txbxContent><w:p><w:pPr><w:rPr><w:{mark} w:id=\"1\"/></w:rPr></w:pPr>\
+             <w:r><{text}>one</{text}></w:r></w:p><w:p><w:r><{text}>two</{text}></w:r></w:p>\
+             </w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:{wrapper}></w:p>"
+        );
+        for accept in [true, false] {
+            let mut document = doc(&body);
+            assert_eq!(document.revisions().len(), 2, "{wrapper}/{mark}");
+            let outcomes = if accept {
+                document.accept_all_revisions()
+            } else {
+                document.reject_all_revisions()
+            };
+            assert!(
+                outcomes.iter().all(RevisionOutcome::is_applied),
+                "{wrapper}/{mark} accept={accept}: {outcomes:?}"
+            );
+            assert!(
+                document.revisions().is_empty(),
+                "{wrapper}/{mark} accept={accept}"
+            );
+        }
+    }
+}

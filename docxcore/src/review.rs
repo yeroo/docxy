@@ -333,6 +333,68 @@ fn clear_mark_revision(props: &mut ParProps, index: usize) {
     }
 }
 
+/// Drop every paragraph-mark record of `props` (model and raw XML).
+pub(crate) fn clear_mark_revisions(props: &mut ParProps) {
+    while !props.mark_revisions.is_empty() {
+        clear_mark_revision(props, 0);
+    }
+}
+
+/// Give `kept` the paragraph-mark records of `gone` (model and raw XML),
+/// replacing its own: when two paragraphs are joined, the surviving physical
+/// mark is the later paragraph's, so its records survive and the earlier
+/// paragraph's go.
+pub(crate) fn adopt_mark_revisions(kept: &mut ParProps, gone: &ParProps) {
+    clear_mark_revisions(kept);
+    let records = mark_revision_xml(gone);
+    if records.is_empty() {
+        return;
+    }
+    kept.mark_revisions = gone.mark_revisions.clone();
+    let records = records.concat();
+    match kept
+        .raw_props
+        .iter_mut()
+        .find(|raw| local_name(raw) == "rPr")
+    {
+        Some(rpr) if rpr.trim_end().ends_with("/>") && !rpr.contains("</") => {
+            *rpr = format!("<w:rPr>{records}</w:rPr>");
+        }
+        // CT_ParaRPr puts the ins/del records first.
+        Some(rpr) => {
+            let open = rpr.find('>').map_or(rpr.len(), |at| at + 1);
+            rpr.insert_str(open, &records);
+        }
+        None => kept.raw_props.push(format!("<w:rPr>{records}</w:rPr>")),
+    }
+}
+
+/// The raw `w:ins`/`w:del` children of a paragraph-mark `w:rPr`, in order.
+fn mark_revision_xml(props: &ParProps) -> Vec<String> {
+    let Some(rpr) = props.raw_props.iter().find(|raw| local_name(raw) == "rPr") else {
+        return Vec::new();
+    };
+    let mut parser = XmlParser::new(rpr);
+    let mut out = Vec::new();
+    if parser.next() != Event::Start {
+        return out;
+    }
+    loop {
+        match parser.next() {
+            Event::Start => {
+                let start = parser.start_pos();
+                let record = matches!(parser.name(), "w:ins" | "w:del");
+                parser.skip_element();
+                if record {
+                    out.push(parser.raw_slice(start, parser.pos()).to_string());
+                }
+            }
+            Event::End | Event::Eof => return out,
+            Event::Text => {}
+        }
+    }
+}
+
 /// `rpr` without its `index`-th `w:ins`/`w:del` child, or `None` when nothing
 /// remains.
 fn remove_mark_revision_child(rpr: &str, index: usize) -> Option<String> {

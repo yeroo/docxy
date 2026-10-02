@@ -42,8 +42,9 @@ use std::collections::HashSet;
 
 use crate::load::parse_document_xml;
 use crate::model::{
-    Block, BreakKind, Document, Hyperlink, Inline, ParProps, Paragraph, RevisionKind,
-    RevisionMetadata, Run, RunProps, Table, UnsupportedRevisionKind,
+    Block, BreakKind, Document, Hyperlink, Inline, ParProps, Paragraph, PropertyChange,
+    PropertyScope, PropertySnapshot, RevisionKind, RevisionMetadata, Run, RunProps, Table,
+    UnsupportedRevisionKind,
 };
 use crate::package::Package;
 use crate::review::RevisionOutcome;
@@ -67,6 +68,10 @@ pub enum CompareSkip {
     /// A deleted object that references the original package, or a block-level
     /// element (such as a content control) present in only one document.
     Object,
+    /// Deleted original run/paragraph property children (formatting) dropped
+    /// because they use a namespace prefix the revised package binds to
+    /// another namespace. Reported once per comparison.
+    Formatting,
     /// A deleted footnote/endnote reference.
     NoteRef,
     /// A tracked change in an input that could not be accepted first
@@ -79,12 +84,13 @@ pub enum CompareSkip {
 }
 
 impl CompareSkip {
-    /// The stable kind name (`table`, `object`, `note-ref`,
+    /// The stable kind name (`table`, `object`, `formatting`, `note-ref`,
     /// `unsupported-revision`, `paragraph-mark`).
     pub fn kind(&self) -> &'static str {
         match self {
             CompareSkip::Table { .. } => "table",
             CompareSkip::Object => "object",
+            CompareSkip::Formatting => "formatting",
             CompareSkip::NoteRef => "note-ref",
             CompareSkip::UnsupportedRevision { .. } => "unsupported-revision",
             CompareSkip::ParagraphMark { .. } => "paragraph-mark",
@@ -250,7 +256,7 @@ impl Item<'_> {
     fn ends_section(&self) -> bool {
         let props = match self {
             Item::Same(Block::Paragraph(p)) => &p.props,
-            Item::Modified(_, p) => &p.props,
+            Item::Modified(_, p) | Item::Inserted(p) | Item::Deleted(p) => &p.props,
             _ => return false,
         };
         props.section_break.is_some() || props.section_property_change.is_some()
@@ -314,6 +320,7 @@ impl<'o> Compare<'o> {
         let mut out = Vec::with_capacity(items.len());
         for (item, mark) in items.into_iter().zip(marks) {
             let index = top.unwrap_or(out.len());
+            let inserted = matches!(item, Item::Inserted(_));
             let mut block = match item {
                 Item::Same(block) => block.clone(),
                 Item::Modified(o, r) => Block::Paragraph(Paragraph {
@@ -339,6 +346,15 @@ impl<'o> Compare<'o> {
             };
             if let (Some(kind), Block::Paragraph(p)) = (mark, &mut block) {
                 self.mark_paragraph(&mut p.props, kind);
+            }
+            // An inserted paragraph whose mark could not be marked stays on
+            // Reject All; when it ends a section, track the break itself as
+            // new (a section change from no section properties) so rejecting
+            // removes it.
+            if let (None, true, Block::Paragraph(p)) = (mark, inserted, &mut block) {
+                if p.props.section_break.is_some() && p.props.section_property_change.is_none() {
+                    p.props.section_property_change = Some(self.new_section_change());
+                }
             }
             out.push(block);
         }
@@ -402,11 +418,13 @@ impl<'o> Compare<'o> {
                 continue;
             }
             // A single-kind run of changes ends the segment (mixed tails were
-            // paired by `fix_mixed_tails`): mark the mark before it, unless
-            // that mark ends a section — removing it would merge the section
-            // break away.
+            // paired by `fix_mixed_tails`): mark the mark before it, unless a
+            // section break is involved. Removing a mark that ends a section
+            // merges the break away; merging into a run paragraph that ends a
+            // section takes its break. Either way the change stays in place.
             let kind = items[end - 1].change_kind();
-            if tail > start && !items[tail - 1].ends_section() {
+            let sections = items[tail - 1..end].iter().any(Item::ends_section);
+            if tail > start && !sections {
                 marks[tail - 1] = kind;
             } else {
                 self.skipped.push(CompareSkip::ParagraphMark {
@@ -650,6 +668,23 @@ impl<'o> Compare<'o> {
         }
     }
 
+    /// A `w:sectPrChange` with no prior section properties: rejecting it
+    /// removes the section break it is attached to.
+    fn new_section_change(&mut self) -> PropertyChange {
+        let (id, attrs) = self.metadata();
+        PropertyChange {
+            scope: PropertyScope::Section,
+            metadata: RevisionMetadata {
+                id: Some(id.to_string()),
+                author: Some(self.opts.author.clone()),
+                date: Some(self.opts.date.clone()),
+                ..RevisionMetadata::default()
+            },
+            raw: format!("<w:sectPrChange{attrs}/>"),
+            previous: PropertySnapshot::Absent,
+        }
+    }
+
     /// Original paragraph properties made safe for the revised package: no
     /// section break (its header/footer references belong to the original),
     /// and only styles and lists the revised package defines.
@@ -709,7 +744,7 @@ impl Compare<'_> {
         raw_props.retain(|raw| !self.uses_conflicting_prefix(raw));
         if raw_props.len() < before && !self.dropped_conflicting {
             self.dropped_conflicting = true;
-            self.skipped.push(CompareSkip::Object);
+            self.skipped.push(CompareSkip::Formatting);
         }
     }
 }

@@ -259,7 +259,7 @@ One JSON object per line; one reply line per request:
 | `doc.save` | — | `{path, …}` |
 | `doc.reload` | — | `{path, …}` (re-reads the file, dropping unsaved edits) |
 | `doc.open` | `{path}` | `{path, …}` |
-| `doc.compare` | `{original, revised}` | `{path, insertions, deletions, skipped:[{kind, index?, revision?}]}` — Review ▸ Compare: opens a new, unsaved `Compare Result N.docx` (beside the revised file) whose tracked changes turn the original into the revised `.docx`; neither source is written. Refuses while the open document has unsaved changes. `skipped` kinds: `table`, `object`, `note-ref`, `unsupported-revision`, `paragraph-mark` |
+| `doc.compare` | `{original, revised}` | `{path, insertions, deletions, skipped:[{kind, index?, revision?}]}` — Review ▸ Compare: opens a new, unsaved `Compare Result N.docx` (beside the revised file) whose tracked changes turn the original into the revised `.docx`; neither source is written. Refuses while the open document has unsaved changes. `skipped` kinds: `table`, `object`, `formatting` (original property markup whose namespace prefix the revised document binds differently; reported once), `note-ref`, `unsupported-revision`, `paragraph-mark` |
 | `doc.export` | `{format:"markdown"\|"text"}` | `{format, text}` — the **live buffer** |
 | `doc.export-pdf` | `{path}` | `{path}` (absolutized; refuses to overwrite — same `already exists:`/`bad path:`/`create failed:` error family as creating a new file) |
 | `doc.comments` | — | `{comments:[{id,author,initials,date,text,anchor}]}` |

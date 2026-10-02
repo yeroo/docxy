@@ -600,7 +600,7 @@ fn markup_whose_prefix_the_revised_root_binds_differently_is_dropped() {
     let xml = saved_document_xml(&result);
     assert!(!xml.contains("w14:odd"), "{xml}");
     assert!(!xml.contains("urn:not-w14"), "{xml}");
-    assert_eq!(result.skipped, [CompareSkip::Object]);
+    assert_eq!(result.skipped, [CompareSkip::Formatting]);
     assert_eq!(texts(&resolved(&reloaded(&result), false)), ["Keep gone"]);
 }
 
@@ -645,5 +645,49 @@ fn simple_fields_inside_revisions_become_run_level_complex_fields() {
         let plain = |body: &str| doc(body).plain_text().trim_end().to_string();
         assert_eq!(resolve(true), plain(&revised), "{xml}");
         assert_eq!(resolve(false), plain(&original), "{xml}");
+    }
+}
+
+#[test]
+fn an_inserted_section_ending_paragraph_never_lends_or_borrows_a_break() {
+    let sect = "<w:p><w:pPr><w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/></w:sectPr></w:pPr>\
+        <w:r><w:t>P</w:t></w:r></w:p>";
+    let table = "<w:tbl><w:tr><w:tc><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>";
+    let breaks = |d: &Document| -> Vec<String> {
+        d.body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) if p.props.section_break.is_some() => Some(p.plain_text()),
+                _ => None,
+            })
+            .collect()
+    };
+    let non_empty =
+        |d: &Document| -> Vec<String> { texts(d).into_iter().filter(|t| !t.is_empty()).collect() };
+    // Before a table (a tail, so no mark of its own) and mid-segment.
+    for (original, revised) in [
+        (
+            format!("{}{table}{}", p("Intro"), p("Q")),
+            format!("{}{sect}{table}{}", p("Intro"), p("Q")),
+        ),
+        (
+            format!("{}{}", p("Intro"), p("Q")),
+            format!("{}{sect}{}", p("Intro"), p("Q")),
+        ),
+    ] {
+        let result = compare(&pkg(&original), &pkg(&revised));
+        for document in [result.package.document.clone(), reloaded(&result)] {
+            let accepted = resolved(&document, true);
+            let rejected = resolved(&document, false);
+            assert_eq!(breaks(&accepted), ["P"], "{}", document_to_xml(&accepted));
+            assert_eq!(
+                breaks(&rejected),
+                Vec::<String>::new(),
+                "{}",
+                document_to_xml(&rejected)
+            );
+            assert_eq!(non_empty(&accepted), non_empty(&doc(&revised)));
+            assert_eq!(non_empty(&rejected), non_empty(&doc(&original)));
+        }
     }
 }
