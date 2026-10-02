@@ -231,8 +231,13 @@ impl<'a> Html<'a> {
             return self.text("<");
         }
         let name = rest[name_start..name_start + name_len].to_ascii_lowercase();
-        let end = tag_end(rest).unwrap_or(rest.len());
-        let attrs = &rest[name_start + name_len..end.saturating_sub(1).max(name_start + name_len)];
+        // The attributes run to the `>` (one byte, a char boundary), or to
+        // the end of a page cut inside the tag, never into a character.
+        let (end, attrs_end) = match tag_end(rest) {
+            Some(end) => (end, end - 1),
+            None => (rest.len(), rest.len()),
+        };
+        let attrs = &rest[name_start + name_len..attrs_end.max(name_start + name_len)];
         self.pos += end;
         if close {
             self.close_tag(&name);
@@ -1019,6 +1024,15 @@ mod tests {
     fn pre_keeps_white_space() {
         let d = doc("<pre>a  b\n\tc</pre>");
         assert_eq!(paragraph_texts(&d), ["a  b\n\tc"]);
+    }
+
+    #[test]
+    fn an_unclosed_tag_ending_in_a_non_ascii_character_does_not_panic() {
+        // A truncated download: the page stops inside a tag's attribute.
+        assert!(import_html("<p>ok</p><p title=\"caf\u{e9}".as_bytes()).is_ok());
+        assert!(import_html("<p>ok</p><img alt=na\u{ef}".as_bytes()).is_ok());
+        // Windows-1252 bytes decode to multi-byte characters too.
+        assert!(import_html(b"<p>ok</p><img alt=\"na\xefve").is_ok());
     }
 
     #[test]
