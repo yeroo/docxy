@@ -4503,7 +4503,7 @@ const DOC_CFB_UNSUPPORTED: &str = "load error: a Word 97-2003 .doc or an encrypt
 /// is: a docxy bundle, any other HTML, RTF and PDF are told apart by their
 /// bytes, Markdown by its extension. RTF, HTML and PDF open converted; a
 /// Word package that will not load opens as its recovered text.
-fn doc_from_path(path: &PathBuf) -> Loaded {
+fn doc_from_path(path: &std::path::Path) -> Loaded {
     load_doc_file(path, true)
 }
 
