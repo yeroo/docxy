@@ -54,3 +54,9 @@ psm = { git = "https://github.com/rust-lang/stacker", branch = "master" }
 opt-level = 1
 [profile.dev.package.gpui_platform]
 opt-level = 1
+
+# Line tables in release builds, so a backtrace in crash.log names the source
+# line of each frame (#795). On Windows they live in suite.pdb, which the
+# installer ships next to suite.exe; on Linux they are in the binary.
+[profile.release]
+debug = "line-tables-only"

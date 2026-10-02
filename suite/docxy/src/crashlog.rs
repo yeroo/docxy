@@ -369,4 +369,43 @@ mod tests {
         );
         assert!(main.contains("backtrace:\n"), "{main}");
     }
+
+    /// A release crash.log backtrace names the source line of each frame only
+    /// when the release build carries line tables (#795), so the workspace
+    /// profile must keep them.
+    #[test]
+    fn release_profile_keeps_line_tables() {
+        let manifest = include_str!("../../Cargo.toml");
+        let mut in_release = false;
+        let mut has_line_tables = false;
+        for line in manifest.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_release = trimmed == "[profile.release]";
+                continue;
+            }
+            if in_release && trimmed == "debug = \"line-tables-only\"" {
+                has_line_tables = true;
+            }
+        }
+        assert!(
+            has_line_tables,
+            "suite/Cargo.toml [profile.release] must set debug = \"line-tables-only\""
+        );
+    }
+
+    /// The field crash.log resolves file:line only when suite.pdb sits next
+    /// to suite.exe (#795), so the installer must ship it into {app}.
+    #[test]
+    fn the_suite_installer_ships_the_pdb() {
+        let iss = include_str!("../../../packaging/inno/suite.iss");
+        assert!(
+            iss.lines().any(|line| {
+                let line = line.trim();
+                line.starts_with("Source: \"{#SrcDir}\\suite.pdb\"")
+                    && line.contains("DestDir: \"{app}\"")
+            }),
+            "suite.iss [Files] must install suite.pdb next to suite.exe"
+        );
+    }
 }
