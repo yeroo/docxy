@@ -422,6 +422,18 @@ fn export_html_headless(loaded: &Input, source: &str, out: &str) -> Result<usize
 /// the author `docxy compare` attributes its revisions to.
 const DEFAULT_AUTHOR: &str = "docxy";
 
+/// The comment ids a freshly loaded document holds: its comments' and its
+/// body markers' ([`App::used_comment_ids`]).
+fn used_comment_ids(
+    comments: &[docxcore::comments::Comment],
+    doc: &Document,
+) -> std::collections::BTreeSet<String> {
+    let mut used: std::collections::BTreeSet<String> =
+        comments.iter().map(|c| c.id.clone()).collect();
+    used.extend(docxcore::inspect::comment_marker_ids(doc));
+    used
+}
+
 /// The OS account name (`USERNAME` on Windows, `USER` elsewhere), if set.
 fn os_user_name() -> Option<String> {
     ["USERNAME", "USER"]
@@ -1410,8 +1422,15 @@ struct App {
     /// Comments added since the document was opened, by id. Their records
     /// live here, not in `pkg`: one is in `comments` and is saved only while
     /// a marker with its id is in the body, so undoing Add Comment removes
-    /// it and redo brings it back (#620). Saves keep it; an open clears it.
+    /// it and redo brings it back (#620). A Save keeps it; an open, or a
+    /// Save As (which reloads the document and its undo history), clears it.
     session_comments: std::collections::BTreeMap<String, docxcore::comments::Comment>,
+    /// Every comment id the document has had since it loaded: those of its
+    /// comments and body markers then ([`used_comment_ids`]), and each one
+    /// allocated since. It never shrinks, not on Delete Comment, since an
+    /// undo can bring any of their markers back; a new comment never takes
+    /// one of them (#620). Reseeded wherever `session_comments` is cleared.
+    used_comment_ids: std::collections::BTreeSet<String>,
     show_comments: bool,
     /// The comment highlighted by Prev/Next navigation (only once `comment_active`).
     comment_sel: usize,
@@ -1558,6 +1577,7 @@ impl App {
         let page_parts = PageState::derive(&pkg, &doc);
         let watermark_state = watermark::State::from_package(&pkg);
         let doc_page_borders = pkg.has_page_borders();
+        let used_comment_ids = used_comment_ids(&comments, &doc);
         App {
             pkg,
             editor: Editor::new(doc),
@@ -1613,6 +1633,7 @@ impl App {
             auto_hide_ribbon: false,
             comments,
             session_comments: Default::default(),
+            used_comment_ids,
             show_comments: false,
             comment_sel: 0,
             comment_active: false,
@@ -2662,6 +2683,7 @@ impl App {
         self.footer_part = page_parts.footer_part;
         self.page_parts_sect = page_parts.sect;
         self.pkg = pkg;
+        self.used_comment_ids = used_comment_ids(&self.comments, &doc);
         self.editor = Editor::new(doc);
         self.styles = Rc::new(styles);
         self.numbering = Rc::new(numbering);
@@ -2827,6 +2849,7 @@ impl App {
             .iter()
             .map(|c| &c.id)
             .chain(self.session_comments.keys())
+            .chain(&self.used_comment_ids)
             .chain(&in_body)
             .filter_map(|id| id.parse::<i32>().ok())
             .max()
@@ -2896,6 +2919,7 @@ impl App {
             self.session_comments
                 .insert(comment.id.clone(), comment.clone());
         }
+        self.used_comment_ids.insert(comment.id.clone());
         self.comments.push(comment);
         self.comment_active = true;
         self.comment_sel = self.comments.len() - 1;
@@ -11609,6 +11633,23 @@ mod tests {
     /// or it would stay live after its own undo.
     #[test]
     fn a_new_comment_never_takes_an_id_whose_markers_are_in_the_body() {
+        let mut app = app_with_loaded_comments();
+        let ids =
+            |app: &App| -> Vec<String> { app.comments.iter().map(|c| c.id.clone()).collect() };
+        assert_eq!(ids(&app), ["1", "2"]);
+        app.comment_sel = 1;
+        app.run_act(ribbon::Act::DeleteComment);
+        assert_eq!(ids(&app), ["1"]);
+        app.on_key(ctrl(KeyCode::Char('z')));
+        add_comment_by_keys(&mut app, "Colour?");
+        assert_eq!(ids(&app), ["1", "3"], "a fresh id, not 2");
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(ids(&app), ["1"], "its undo takes it");
+    }
+
+    /// An app on "The quick brown fox." with loaded comments 1 and 2 around
+    /// the whole text, markers and comments.xml alike.
+    fn app_with_loaded_comments() -> App {
         let mut ed = Editor::new(Document {
             body: vec![Block::Paragraph(MPara {
                 props: ParProps::default(),
@@ -11627,17 +11668,42 @@ mod tests {
         pkg.add_comment(2, "Ann", "A", "2020-01-02T03:04:05Z", "Second");
         let mut app = App::new(pkg, "test.docx", false);
         app.os_clip = None;
-        let ids =
-            |app: &App| -> Vec<String> { app.comments.iter().map(|c| c.id.clone()).collect() };
-        assert_eq!(ids(&app), ["1", "2"]);
+        app
+    }
+
+    /// FIX r3 #1: an id freed before the add (comment 2, deleted) must not
+    /// be taken: undoing the add and then the delete brings 2's markers
+    /// back, and the new comment would be live on them.
+    #[test]
+    fn a_new_comment_never_takes_a_deleted_comments_id() {
+        let mut app = app_with_loaded_comments();
         app.comment_sel = 1;
         app.run_act(ribbon::Act::DeleteComment);
-        assert_eq!(ids(&app), ["1"]);
-        app.on_key(ctrl(KeyCode::Char('z')));
         add_comment_by_keys(&mut app, "Colour?");
-        assert_eq!(ids(&app), ["1", "3"], "a fresh id, not 2");
+        assert_eq!(app.comments.last().map(|c| c.id.as_str()), Some("3"));
         app.on_key(ctrl(KeyCode::Char('z')));
-        assert_eq!(ids(&app), ["1"], "its undo takes it");
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert!(
+            app.comments.iter().all(|c| c.text != "Colour?"),
+            "the panel does not list it"
+        );
+        let path = save_to_temp(&mut app, "cmt-freed-id");
+        let (_, comments) = saved_parts(&path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert!(!comments.contains("Colour?"), "{comments}");
+    }
+
+    /// FIX r3 #2: a new comment deleted before any undo or save is in no
+    /// list and no marker any more; the next comment still gets a fresh id.
+    #[test]
+    fn a_comment_added_after_deleting_a_new_one_gets_a_fresh_id() {
+        let mut app = app_with(&["The quick brown fox."]);
+        add_comment_by_keys(&mut app, "one");
+        let first = app.comments[0].id.clone();
+        app.run_act(ribbon::Act::DeleteComment);
+        assert!(app.comments.is_empty());
+        add_comment_by_keys(&mut app, "two");
+        assert_ne!(app.comments[0].id, first);
     }
 
     #[test]
