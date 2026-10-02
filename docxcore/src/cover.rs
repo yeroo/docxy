@@ -264,9 +264,10 @@ fn runs_xml(text: &str, rpr: &str) -> String {
 /// controls' `w:id`s, the cover's first; it needs one more than the design
 /// has placeholders.
 ///
-/// No `w:showingPlcHdr`: our editor never clears it, so Word would take text
-/// typed here for a placeholder. No `w:dataBinding` to the document
-/// properties either.
+/// No `w:showingPlcHdr`: the editor clears it only when text goes into an
+/// emptied control; typing beside or inside a prompt that still has text
+/// keeps it, and Word would then take that text for the placeholder. No
+/// `w:dataBinding` to the document properties either.
 pub fn cover_sdt_xml(design: &CoverDesign, typed: &Typed, ids: &[i64]) -> String {
     let id = |k: usize| ids.get(k).copied().unwrap_or(k as i64 + 1);
     let mut body = String::new();
@@ -408,8 +409,10 @@ fn block_placeholders(blocks: &[Block], out: &mut Pieces) {
 /// with line breaks, as are the pieces of a placeholder split over several
 /// paragraphs; in paragraphs, table cells and text boxes. Blank and
 /// still-bracketed placeholders are left out. `w:showingPlcHdr` is not
-/// consulted: the editor never clears it, so it would hide text a person
-/// typed into a Word cover here.
+/// consulted: the editor clears it only when text goes into an emptied
+/// control, and typing beside or inside a prompt that still has text keeps
+/// it, so it cannot be relied on and would hide text a person typed into a
+/// Word cover here.
 pub fn typed_placeholders(blocks: &[Block]) -> Typed {
     let mut pieces = Pieces::new();
     // The cover's own boundaries are not a placeholder's.
