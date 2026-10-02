@@ -11,10 +11,60 @@ pub(crate) enum CloseAnswer {
 
 #[derive(Debug, PartialEq, Eq)]
 enum CloseStep {
+    /// Clean: remove it.
     Remove,
+    /// Dirty, answered Don't Save: remove it, keeping a draft if it qualifies.
+    Discard,
     Save,
     Keep,
     Refuse(String),
+}
+
+impl CloseStep {
+    /// Whether the tab goes away without saving. Neither kind of removal
+    /// activates the tab first, so the previous active tab is kept.
+    fn removes(&self) -> bool {
+        matches!(self, Self::Remove | Self::Discard)
+    }
+}
+
+/// Whether closing a tab keeps its last AutoRecover copy as a draft (#613):
+/// a workbook `discarded` with Don't Save, with AutoRecover on (`minutes`)
+/// and "Keep the last AutoRecovered version" on (`keep`), and a hot-exit
+/// write while it was unsaved (`last_hot`). Window close never comes here:
+/// hot exit keeps those tabs as tabs.
+fn should_keep_draft(
+    kind: Kind,
+    minutes: u32,
+    keep: bool,
+    discarded: bool,
+    last_hot: Option<&std::path::Path>,
+) -> bool {
+    discarded && kind == Kind::Xlsx && minutes > 0 && keep && last_hot.is_some()
+}
+
+/// Keep `tab`'s draft under `root` when [`should_keep_draft`] says so:
+/// `None` when it does not, else where the draft went or why it was not kept.
+fn keep_closed_draft(
+    root: &std::path::Path,
+    tab: &DocTab,
+    step: &CloseStep,
+    minutes: u32,
+    keep: bool,
+    now: std::time::SystemTime,
+) -> Option<Result<PathBuf, String>> {
+    let last_hot = tab.last_hot.borrow();
+    let sidecar = last_hot.as_deref();
+    if !should_keep_draft(
+        tab.kind,
+        minutes,
+        keep,
+        *step == CloseStep::Discard,
+        sidecar,
+    ) {
+        return None;
+    }
+    sidecar.map(|s| recover::keep_draft(root, &tab.title, s, now))
 }
 
 fn commit_pending_for_close(tab: &mut DocTab) -> Result<(), String> {
@@ -94,7 +144,7 @@ fn close_step(
     }
     match ask(tab) {
         Ok(CloseAnswer::Save) => CloseStep::Save,
-        Ok(CloseAnswer::Discard) => CloseStep::Remove,
+        Ok(CloseAnswer::Discard) => CloseStep::Discard,
         Ok(CloseAnswer::Cancel) => CloseStep::Keep,
         Err(message) => CloseStep::Refuse(message),
     }
@@ -158,12 +208,31 @@ impl Docxy {
                 _ => CloseAnswer::Cancel,
             })
         });
-        if step != CloseStep::Remove && self.active != i {
+        if !step.removes() && self.active != i {
             self.active = i;
             self.drop_grid_state();
         }
+        // Kept before removal: the sidecar is rewritten for whichever tab
+        // takes this index at the persist below.
+        let mut draft_error = None;
+        if let Some(kept) = keep_closed_draft(
+            &config_root(),
+            &self.tabs[i],
+            &step,
+            self.autorecover_minutes,
+            self.keep_drafts,
+            std::time::SystemTime::now(),
+        ) {
+            match kept {
+                Ok(_) => {
+                    self.refresh_drafts();
+                }
+                // Never blocks the close: the user chose to discard.
+                Err(e) => draft_error = Some(e),
+            }
+        }
         let remove = match step {
-            CloseStep::Remove => true,
+            CloseStep::Remove | CloseStep::Discard => true,
             CloseStep::Keep => false,
             CloseStep::Refuse(message) => {
                 self.tabs[i].status = message.into();
@@ -180,6 +249,9 @@ impl Docxy {
             self.active = previous_active;
             remove_tab(&mut self.tabs, &mut self.active, i);
             self.drop_grid_state();
+        }
+        if let Some(e) = draft_error {
+            self.set_status(e);
         }
         self.persist();
         self.refocus(window, cx);

@@ -2016,6 +2016,8 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "theme-set"
             | "ask-on-close"
             | "autorecover"
+            | "keep-drafts"
+            | "open-draft"
             | "dialog-set"
             | "dialog-tab"
             | "dialog-click"
@@ -2163,6 +2165,7 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
             "autorecover_minutes",
             Json::Num(f64::from(app.autorecover_minutes)),
         ),
+        ("keep_drafts", Json::Bool(app.keep_drafts)),
         (
             "ribbon_tab",
             Json::Str(
@@ -2740,6 +2743,47 @@ pub fn dispatch(
         // interval is up, so a test need not wait minutes. `wrote` says
         // whether anything was unsaved and so written. Runs even when the
         // setting is off: it is the tick, not the schedule.
+        // Settings' "Keep the last AutoRecovered version if I close without
+        // saving" (#613).
+        "keep-drafts" => {
+            let Some(Json::Bool(on)) = args.get("on") else {
+                return Err("'on' must be a boolean".into());
+            };
+            app.set_keep_drafts(*on, cx);
+            Done::ok(state(app, window))
+        }
+        // Recover Unsaved Workbooks' list, re-read (and pruned) as opening
+        // the backstage does, newest first.
+        "drafts" => {
+            let now = std::time::SystemTime::now();
+            let drafts = app
+                .refresh_drafts()
+                .iter()
+                .map(|d| {
+                    let age = now.duration_since(d.saved).unwrap_or_default();
+                    Json::obj(vec![
+                        ("name", Json::Str(d.name.clone())),
+                        ("path", Json::Str(d.path.display().to_string())),
+                        ("age_secs", Json::Num(age.as_secs() as f64)),
+                    ])
+                })
+                .collect();
+            cx.notify();
+            Done::ok(Json::obj(vec![("drafts", Json::Arr(drafts))]))
+        }
+        // Open the `index`th draft of a fresh `drafts` listing read-only,
+        // through the method a click on its backstage row calls.
+        "open-draft" => {
+            app.refuse_under_dialog()?;
+            let index = arg_usize(args, "index")?;
+            let path = app
+                .refresh_drafts()
+                .get(index)
+                .map(|d| d.path.clone())
+                .ok_or_else(|| format!("no draft {index}"))?;
+            app.open_draft_path(&path, window, cx);
+            Done::ok(state(app, window))
+        }
         "autorecover-now" => {
             let wrote = app.autorecover_tick();
             cx.notify();
@@ -3491,6 +3535,7 @@ mod tests {
             load_failed: false,
             dialogs: crate::dialog::DialogStack::default(),
             access: crate::open_mode::Access::default(),
+            last_hot: Default::default(),
         };
         let mut word = doc(crate::Kind::Docx, "a.docx");
         word.path = Some("C:/work/a.docx".into());

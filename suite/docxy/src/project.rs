@@ -614,6 +614,7 @@ fn project_tab(
         load_failed: false,
         dialogs: crate::dialog::DialogStack::default(),
         access: crate::open_mode::Access::default(),
+        last_hot: Default::default(),
     }
 }
 

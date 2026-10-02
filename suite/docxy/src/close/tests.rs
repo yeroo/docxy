@@ -28,7 +28,7 @@ fn clean_tabs_never_ask_and_dirty_tabs_honor_each_answer() {
         assert_eq!(t.status, status);
         for (answer, expected) in [
             (CloseAnswer::Save, CloseStep::Save),
-            (CloseAnswer::Discard, CloseStep::Remove),
+            (CloseAnswer::Discard, CloseStep::Discard),
             (CloseAnswer::Cancel, CloseStep::Keep),
         ] {
             let mut t = tab(kind);
@@ -211,7 +211,7 @@ fn an_unfinished_formula_refuses_close_and_save_until_corrected() {
             assert_eq!(a1.as_deref(), Some("SUM(A1)"));
             Ok(CloseAnswer::Discard)
         }),
-        CloseStep::Remove
+        CloseStep::Discard
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1296,6 +1296,7 @@ fn prefs() -> Prefs {
         theme: ThemePref::default(),
         ask_on_close: false,
         autorecover_minutes: 10,
+        keep_drafts: true,
     }
 }
 
@@ -1522,4 +1523,156 @@ fn a_crash_still_labels_sheet_and_project_sidecars_it_read() {
 /// it is never asked.
 fn no_macros(features: &[&'static str]) -> bool {
     panic!("asked about {features:?}")
+}
+
+// ---- Drafts kept by Don't Save (#613) --------------------------------------
+
+#[test]
+fn only_removals_leave_the_active_tab_alone() {
+    assert!(CloseStep::Remove.removes());
+    assert!(
+        CloseStep::Discard.removes(),
+        "Don't Save keeps previous_active"
+    );
+    assert!(!CloseStep::Save.removes());
+    assert!(!CloseStep::Keep.removes());
+    assert!(!CloseStep::Refuse("no".into()).removes());
+}
+
+#[test]
+fn a_draft_is_kept_only_for_a_discarded_workbook_with_autorecover_and_a_write() {
+    let hot = PathBuf::from("tab-0.xlsx");
+    let hot = Some(hot.as_path());
+    assert!(should_keep_draft(Kind::Xlsx, 1, true, true, hot));
+    assert!(
+        !should_keep_draft(Kind::Xlsx, 1, true, false, hot),
+        "clean, Save or Cancel"
+    );
+    assert!(
+        !should_keep_draft(Kind::Xlsx, 1, true, true, None),
+        "no hot-exit write while unsaved"
+    );
+    assert!(
+        !should_keep_draft(Kind::Xlsx, 0, true, true, hot),
+        "AutoRecover off"
+    );
+    assert!(
+        !should_keep_draft(Kind::Xlsx, 1, false, true, hot),
+        "keep off"
+    );
+    assert!(
+        !should_keep_draft(Kind::Docx, 1, true, true, hot),
+        "a document"
+    );
+    assert!(
+        !should_keep_draft(Kind::Project, 1, true, true, hot),
+        "a plan"
+    );
+}
+
+#[test]
+fn keeping_drafts_is_on_by_default_and_the_setting_round_trips() {
+    assert!(Session::default().keep_drafts);
+    let old: Session = serde_json::from_str(r#"{"tabs":[],"active":0}"#).unwrap();
+    assert!(old.keep_drafts, "a session from before the setting");
+    let root = Root::new("keep-setting");
+    let prefs = Prefs {
+        keep_drafts: false,
+        ..prefs()
+    };
+    write_session(&root.0, &[tab(Kind::Xlsx)], 0, prefs);
+    assert!(!root.session().keep_drafts, "off is kept");
+}
+
+#[test]
+fn a_persist_records_the_sidecar_only_while_the_tab_is_unsaved() {
+    let root = Root::new("last-hot");
+    let mut tabs = vec![tab(Kind::Docx), tab(Kind::Xlsx)];
+    tabs[1].dirty = true;
+    write_session(&root.0, &tabs, 0, prefs());
+    assert_eq!(*tabs[0].last_hot.borrow(), None, "clean");
+    let hot = tabs[1].last_hot.borrow().clone().unwrap();
+    assert_eq!(hot, hot_dir_in(&root.0).join("tab-1.xlsx"));
+    assert!(hot.exists());
+    // Saved since: the next persist forgets it.
+    tabs[1].dirty = false;
+    write_session(&root.0, &tabs, 0, prefs());
+    assert_eq!(*tabs[1].last_hot.borrow(), None);
+    // A sibling closed: the path follows the tab to its new index.
+    tabs[1].dirty = true;
+    tabs.remove(0);
+    write_session(&root.0, &tabs, 0, prefs());
+    assert_eq!(
+        tabs[0].last_hot.borrow().as_deref(),
+        Some(hot_dir_in(&root.0).join("tab-0.xlsx").as_path())
+    );
+}
+
+/// A1 committed to `text`, as Enter leaves it.
+fn commit_a1(t: &mut DocTab, text: &str) {
+    let Surface::Sheet(v) = &mut t.surface else {
+        panic!()
+    };
+    v.sel = (0, 0);
+    v.anchor = (0, 0);
+    v.begin_cell_edit(Some(text.into()));
+    commit_changed_cell(t).unwrap();
+    assert!(t.dirty);
+}
+
+/// The issue's scenario below the window: type in a workbook and commit, an
+/// AutoRecover write, more typing, Don't Save. The draft is the AutoRecover
+/// write, not the content at close, and opens read-only.
+#[test]
+fn dont_save_keeps_the_last_autorecover_copy_as_a_read_only_draft() {
+    let root = Root::new("keep-draft");
+    let mut tabs = vec![tab(Kind::Xlsx)];
+    commit_a1(&mut tabs[0], "Draft me");
+    assert!(autorecover_prepare(&mut tabs));
+    write_session(&root.0, &tabs, 0, prefs());
+    commit_a1(&mut tabs[0], "After the tick");
+    let step = close_step(&mut tabs[0], |_| Ok(CloseAnswer::Discard));
+    assert_eq!(step, CloseStep::Discard);
+    let now = std::time::SystemTime::now();
+    let draft = keep_closed_draft(&root.0, &tabs[0], &step, 1, true, now)
+        .unwrap()
+        .unwrap();
+    let drafts = recover::list_drafts(&root.0, now, &[]);
+    assert_eq!(drafts.len(), 1, "{drafts:?}");
+    assert_eq!(drafts[0].path, draft);
+    assert!(drafts[0].name.starts_with("basic ((Unsaved-"), "{drafts:?}");
+
+    let opened = tab_from_path_mode(
+        &draft,
+        OpenMode::ReadOnly,
+        &crate::trusted::TrustStore::default(),
+    )
+    .unwrap();
+    assert_eq!(sheet_a1(&opened), "Draft me");
+    assert!(opened.access.read_only);
+}
+
+#[test]
+fn no_draft_without_a_write_while_unsaved_or_without_discard() {
+    let root = Root::new("no-draft");
+    let now = std::time::SystemTime::now();
+    // Typed and committed, but closed before any persist.
+    let mut t = tab(Kind::Xlsx);
+    commit_a1(&mut t, "Never written");
+    let step = close_step(&mut t, |_| Ok(CloseAnswer::Discard));
+    assert_eq!(keep_closed_draft(&root.0, &t, &step, 1, true, now), None);
+    // Written while unsaved, but the answer was Cancel.
+    let tabs = vec![t];
+    write_session(&root.0, &tabs, 0, prefs());
+    let mut t = tabs.into_iter().next().unwrap();
+    let step = close_step(&mut t, |_| Ok(CloseAnswer::Cancel));
+    assert_eq!(keep_closed_draft(&root.0, &t, &step, 1, true, now), None);
+    // A clean tab is removed without a draft.
+    let mut clean = tab(Kind::Xlsx);
+    let step = close_step(&mut clean, |_| panic!("clean tab asked"));
+    assert_eq!(
+        keep_closed_draft(&root.0, &clean, &step, 1, true, now),
+        None
+    );
+    assert_eq!(recover::list_drafts(&root.0, now, &[]), vec![]);
 }
