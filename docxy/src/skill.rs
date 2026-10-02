@@ -33,6 +33,7 @@ use its tools:
 - `docxy_insert` `{at, text}` — insert before a block
 - `docxy_append` `{text}`
 - `docxy_save`
+- `docxy_compare` `{original, revised}` — open a tracked-changes comparison of two .docx files
 
 When several docxy editors are open, pass `target` (a substring of the pane id;
 `docxy_list` shows them). Typical flow: `docxy_outline` or `docxy_read` to see the
@@ -52,7 +53,7 @@ where instance is `docxy-<AGWINTERM_SESSION_ID>` — the pane id shown by
 ```
 
 Verbs: `doc.path`, `doc.outline`, `doc.read`, `doc.find`, `doc.replace-range`,
-`doc.insert`, `doc.append`, `doc.save`, `doc.reload`, `doc.open`.
+`doc.insert`, `doc.append`, `doc.save`, `doc.reload`, `doc.open`, `doc.compare`.
 
 ## Two panes in one agwinterm session
 `agwintermctl split on`, then launch `docxy <file>` in the new pane (or press

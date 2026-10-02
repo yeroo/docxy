@@ -259,6 +259,7 @@ One JSON object per line; one reply line per request:
 | `doc.save` | — | `{path, …}` |
 | `doc.reload` | — | `{path, …}` (re-reads the file, dropping unsaved edits) |
 | `doc.open` | `{path}` | `{path, …}` |
+| `doc.compare` | `{original, revised}` | `{path, insertions, deletions, skipped:[{kind, index?, revision?}]}` — Review ▸ Compare: opens a new, unsaved `Compare Result N.docx` (beside the revised file) whose tracked changes turn the original into the revised `.docx`; neither source is written. Refuses while the open document has unsaved changes. `skipped` kinds: `table`, `object`, `note-ref`, `unsupported-revision`, `paragraph-mark` |
 | `doc.export` | `{format:"markdown"\|"text"}` | `{format, text}` — the **live buffer** |
 | `doc.export-pdf` | `{path}` | `{path}` (absolutized; refuses to overwrite — same `already exists:`/`bad path:`/`create failed:` error family as creating a new file) |
 | `doc.comments` | — | `{comments:[{id,author,initials,date,text,anchor}]}` |
@@ -354,8 +355,8 @@ is no comment-writing control verb yet, so comments-only protection denies all
 current automation edits even though comment mutations in the TUI are allowed.
 Markdown control/MCP inserts that carry styles, numbering, or direct run
 formatting additionally require Formatting authorization.
-Read, navigation, inspection, export, same-format save, open/reload, and new-file
-operations remain available. Cross-format Save As in the TUI is package
+Read, navigation, inspection, export, same-format save, open/reload, compare, and
+new-file operations remain available. Cross-format Save As in the TUI is package
 metadata and is protected; same-format save only persists already-authorized
 changes and is not a new mutation. When nothing was edited, the original main
 document XML is preserved verbatim rather than regenerated.
@@ -545,8 +546,8 @@ Tools: `docxy_list`, `docxy_new`, `docxy_status`, `docxy_outline`, `docxy_read`,
 `docxy_replace_all`, `docxy_undo`, `docxy_redo`, `docxy_format`,
 `docxy_set_style`, `docxy_revisions`, `docxy_revision_current`,
 `docxy_revision_next`, `docxy_revision_previous`, `docxy_revision_accept`,
-`docxy_revision_reject`, `docxy_revisions_accept_all`, and
-`docxy_revisions_reject_all` (31 total). Each edit
+`docxy_revision_reject`, `docxy_revisions_accept_all`,
+`docxy_revisions_reject_all`, and `docxy_compare` (32 total). Each edit
 tool maps to the matching verb — except `docxy_new`, which composes a file
 create with a `doc.open` — and results come back as JSON text. When several
 docxy editors are open, pass `target` (a substring of the instance/pane id) to

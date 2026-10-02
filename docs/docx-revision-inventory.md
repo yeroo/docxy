@@ -11,6 +11,7 @@ the control/MCP surface. Review changes survive DOCX save and reload.
 | --- | --- | --- |
 | Inline insertion | `w:ins` | Accept unwraps and keeps the inserted content; reject removes the wrapper and its content. |
 | Inline deletion | `w:del`, including `w:delText` and `w:delInstrText` | Accept removes the wrapper and its content; reject restores ordinary text/content and removes only the display cue contributed by the deletion wrapper. |
+| Paragraph mark | `w:pPr/w:rPr/w:ins` or `w:del` | Keeping the mark (accept an insertion, reject a deletion) drops the record. Removing it (accept a deletion, reject an insertion) merges the next paragraph of the same container into this one, with the next paragraph's properties, as Word does; with no paragraph to merge with (the container's last paragraph, or a table next) only the record is dropped. Listed after the paragraph's content and located at its end. |
 | Run properties | `w:rPrChange` | Accept keeps the current `w:rPr`; reject restores the prior `w:rPr` snapshot. |
 | Paragraph properties | `w:pPrChange` | Accept keeps the current `w:pPr`; reject restores the prior `w:pPr` snapshot without consuming an independent section change. |
 | Table properties | `w:tblPrChange` | Accept keeps current table properties; reject restores the prior property container. |
@@ -71,8 +72,31 @@ removed by an earlier action returns `stale_revision`.
 docxy reviews imported changes but does not record new edits as tracked changes.
 Consequently, an enforced tracked-changes-only protection mode still fails
 closed for ordinary edits and for accept/reject actions. Move tracking,
-comparison, revision balloons, real-time collaboration, authorship
-configuration, and automatic tracking of new edits are out of scope.
+revision balloons, real-time collaboration, authorship configuration, and
+automatic tracking of new edits are out of scope.
+
+## Compare
+
+Review ▸ Compare (`docxcore::compare`, the terminal Review tab, `doc.compare`,
+`docxy compare`) builds a copy of the *revised* package whose body carries
+`w:ins`/`w:del` records: Accept All yields the revised text and Reject All the
+original. Both inputs are compared in their accepted state. Blocks are aligned
+with a Myers diff; similar paragraphs get a word-level diff (unchanged and
+inserted text keep the revised run formatting, deleted text the original's),
+and whole-paragraph insertions/deletions also mark their paragraph mark. A
+container's final mark cannot be marked, so the mark before a trailing run of
+changes is marked instead (Word's convention). After a merge the surviving
+paragraph takes the later paragraph's properties, so accepting the deletion of
+a container's last paragraph leaves the original's last paragraph properties.
+
+Comparison is by text: formatting-only differences, headers/footers, notes and
+comments are not compared (they come from the revised package). Zero-width
+markers (bookmarks, comment ranges, field characters) come from the revised
+side only. Deleted paragraphs lose section breaks and any style or list the
+revised package lacks. What cannot be expressed is reported as skipped: a table
+whose shape changed (kept as revised), a deleted object or hyperlink target
+that references the original package, a deleted note reference, and input
+revisions that cannot be accepted (moves, custom-XML ranges, cell records).
 
 ## Interoperability evidence
 
