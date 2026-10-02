@@ -322,7 +322,7 @@ fn every_name_reads_on_a_leaf_a_summary_a_milestone_and_a_blank_row() {
 #[test]
 fn names_list_the_families_and_match_loosely() {
     let names = field_names();
-    assert_eq!(names.len(), 23 + 11 * 5 + 30);
+    assert_eq!(names.len(), 23 + 11 * 5 + 31);
     assert_eq!(names[..3], [s("ID"), s("Task Mode"), s("Name")]);
     for name in [
         "Baseline Start",
@@ -344,10 +344,8 @@ fn names_list_the_families_and_match_loosely() {
         Field::parse("Baseline11 Start"),
         Err(s("unknown task field 'Baseline11 Start'"))
     );
-    assert_eq!(
-        Field::parse("Status"),
-        Err(s("unknown task field 'Status'"))
-    );
+    assert_eq!(Field::parse("Bogus"), Err(s("unknown task field 'Bogus'")));
+    assert_eq!(Field::parse(" status "), Ok(Field::Status));
     let ed = editor(vec![task(1, "A", 480)]);
     assert_eq!(read_field(&ed, 9, "Name"), Err(s("no task with uid 9")));
 }
@@ -666,4 +664,397 @@ fn a_baseline_set_while_leveled_records_the_saved_schedule() {
     variances(&reopened);
     reopened.toggle_level();
     variances(&reopened);
+}
+
+/// A March 2026 instant, the month the x-status oracle uses.
+fn dt(day: u32, hour: u32, minute: u32) -> DateTime {
+    DateTime::from_ymd_hm(2026, 3, day, hour, minute)
+}
+
+/// `YYYY-MM-DD HH:MM`, for assertion messages.
+fn show(d: DateTime) -> String {
+    let p = d.parts();
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        p.year, p.month, p.day, p.hour, p.minute
+    )
+}
+
+#[test]
+fn status_rule_matches_the_oracle_transitions() {
+    // The x-status oracle's tasks, resume points and transition instants,
+    // transcribed from corpus/mpp/snapshots/extras.json (key x-status) and
+    // corpus/mpp/snapshots/x-status-sweep.json (key transitions), measured by
+    // Project 2024 over COM (yeroo/mpp-corpus 644e3a9). Resume points: a
+    // started task's stored resume snapped to the next working start (S:
+    // Resume 3/10 17:00 -> 3/11 08:00); a 0% task's raw Start (M, at 17:00,
+    // never snapped).
+    let feb27 = DateTime::from_ymd_hm(2026, 2, 27, 0, 0);
+    let sweep_end = dt(23, 23, 59);
+    type OracleTask<'a> = (
+        &'a str,
+        Option<u8>,
+        DateTime,
+        DateTime,
+        &'a [(DateTime, &'a str)],
+    );
+    let tasks: [OracleTask; 11] = [
+        (
+            "C",
+            Some(100),
+            dt(2, 8, 0),
+            dt(4, 17, 0),
+            &[(feb27, "Complete")],
+        ),
+        (
+            "H",
+            Some(50),
+            dt(9, 8, 0),
+            dt(11, 8, 0),
+            &[
+                (feb27, "Future Task"),
+                (dt(9, 8, 0), "On Schedule"),
+                (dt(12, 0, 0), "Late"),
+            ],
+        ),
+        (
+            "Q",
+            Some(25),
+            dt(9, 8, 0),
+            dt(10, 8, 0),
+            &[
+                (feb27, "Future Task"),
+                (dt(9, 8, 0), "On Schedule"),
+                (dt(11, 0, 0), "Late"),
+            ],
+        ),
+        (
+            "Z",
+            Some(0),
+            dt(2, 8, 0),
+            dt(2, 8, 0),
+            &[
+                (feb27, "Future Task"),
+                (dt(2, 8, 0), "On Schedule"),
+                (dt(3, 0, 0), "Late"),
+            ],
+        ),
+        (
+            "F",
+            Some(0),
+            dt(16, 8, 0),
+            dt(16, 8, 0),
+            &[
+                (feb27, "Future Task"),
+                (dt(16, 8, 0), "On Schedule"),
+                (dt(17, 0, 0), "Late"),
+            ],
+        ),
+        (
+            "M",
+            Some(0),
+            dt(11, 17, 0),
+            dt(11, 17, 0),
+            &[
+                (feb27, "Future Task"),
+                (dt(11, 17, 0), "On Schedule"),
+                (dt(12, 0, 0), "Late"),
+            ],
+        ),
+        (
+            "S",
+            Some(50),
+            dt(9, 8, 0),
+            dt(11, 8, 0),
+            &[
+                (feb27, "Future Task"),
+                (dt(9, 8, 0), "On Schedule"),
+                (dt(12, 0, 0), "Late"),
+            ],
+        ),
+        (
+            "S1",
+            Some(100),
+            dt(9, 8, 0),
+            dt(10, 17, 0),
+            &[(feb27, "Complete")],
+        ),
+        (
+            "S2",
+            Some(0),
+            dt(11, 8, 0),
+            dt(11, 8, 0),
+            &[
+                (feb27, "Future Task"),
+                (dt(11, 8, 0), "On Schedule"),
+                (dt(12, 0, 0), "Late"),
+            ],
+        ),
+        (
+            "P",
+            Some(25),
+            dt(9, 8, 0),
+            dt(13, 8, 0),
+            &[
+                (feb27, "Future Task"),
+                (dt(9, 8, 0), "On Schedule"),
+                (dt(14, 0, 0), "Late"),
+            ],
+        ),
+        (
+            "U",
+            Some(30),
+            dt(9, 8, 0),
+            dt(10, 9, 36),
+            &[
+                (feb27, "Future Task"),
+                (dt(9, 8, 0), "On Schedule"),
+                (dt(11, 0, 0), "Late"),
+            ],
+        ),
+    ];
+    for (name, percent, start, resume_point, transitions) in tasks {
+        for (i, (at, want)) in transitions.iter().enumerate() {
+            let got = task_status(percent, start, resume_point, *at);
+            assert_eq!(got, *want, "{name} at {}", show(*at));
+            if i > 0 {
+                let before = at.add_minutes(-1);
+                let got = task_status(percent, start, resume_point, before);
+                assert_eq!(got, transitions[i - 1].1, "{name} at {}", show(before));
+            }
+        }
+        let got = task_status(percent, start, resume_point, sweep_end);
+        assert_eq!(
+            got,
+            transitions.last().unwrap().1,
+            "{name} at {}",
+            show(sweep_end)
+        );
+    }
+}
+
+#[test]
+fn status_resume_point_snaps_to_the_next_working_start() {
+    // The oracle's S (Resume 3/10 17:00) resumes at the next working start,
+    // 3/11 08:00 on the Standard calendar, so it stays On Schedule through
+    // 3/11; a 0% task compares against its raw Start, so M (Start 3/11 17:00)
+    // is Late from 3/12 00:00 rather than 3/13. extras.json key x-status.rule.
+    let half = || Task {
+        percent_complete: Some(50),
+        stop: Some(dt(10, 17, 0)),
+        resume: Some(dt(10, 17, 0)),
+        constraint: ConstraintType::StartNoEarlierThan,
+        constraint_date: Some(dt(9, 8, 0)),
+        ..task(1, "Half", 1920)
+    };
+    let zero = || Task {
+        constraint: ConstraintType::StartNoEarlierThan,
+        constraint_date: Some(dt(11, 17, 0)),
+        ..task(2, "Zero", 0)
+    };
+    for (status_date, half_want, zero_want) in [
+        ("2026-03-11T23:59", "On Schedule", "On Schedule"),
+        ("2026-03-12T00:00", "Late", "Late"),
+    ] {
+        let mut p = untitled_project();
+        p.options.push(("StatusDate".into(), status_date.into()));
+        p.tasks = vec![half(), zero()];
+        let ed = Editor::new(p);
+        assert_eq!(
+            tv(&ed, 1, "Status").0,
+            s(half_want),
+            "StatusDate {status_date}"
+        );
+        assert_eq!(
+            tv(&ed, 2, "Status").0,
+            s(zero_want),
+            "StatusDate {status_date}"
+        );
+    }
+}
+
+#[test]
+fn status_uses_status_date_then_current_date_then_empty() {
+    // extras.json key x-status.no_status_date: with StatusDate = NA Project
+    // measures Status at CurrentDate, never the wall clock; with neither (or
+    // an unparsable StatusDate and no CurrentDate) the field reads ("", Null),
+    // never an error.
+    let build = |options: &[(&str, &str)]| {
+        let mut p = untitled_project();
+        p.options
+            .extend(options.iter().map(|(n, v)| (n.to_string(), v.to_string())));
+        p.tasks = vec![Task {
+            constraint: ConstraintType::StartNoEarlierThan,
+            constraint_date: Some(dt(9, 8, 0)),
+            ..task(1, "T", 480)
+        }];
+        Editor::new(p)
+    };
+    // StatusDate wins over CurrentDate: on 3/9, the calendar day the 0% task
+    // starting 3/9 08:00 reads On Schedule, where CurrentDate 3/13 would make
+    // it Late.
+    let on_schedule = (s("On Schedule"), FieldValue::Text(s("On Schedule")));
+    let both = build(&[
+        ("StatusDate", "2026-03-09T17:00"),
+        ("CurrentDate", "2026-03-13T17:00"),
+    ]);
+    assert_eq!(tv(&both, 1, "Status"), on_schedule);
+    let current_only = build(&[("CurrentDate", "2026-03-09T17:00")]);
+    assert_eq!(tv(&current_only, 1, "Status"), on_schedule);
+    let garbage = build(&[
+        ("StatusDate", "garbage"),
+        ("CurrentDate", "2026-03-09T17:00"),
+    ]);
+    assert_eq!(tv(&garbage, 1, "Status"), on_schedule);
+    for options in [&[][..], &[("StatusDate", "NA")][..]] {
+        let ed = build(options);
+        assert_eq!(tv(&ed, 1, "Status"), (s(""), FieldValue::Null));
+    }
+}
+
+#[test]
+fn status_follows_an_edit_and_survives_a_save() {
+    // extras.json x-status: F (0%, Start 3/16) is Future Task at StatusDate
+    // 2026-03-10T17:00; moved to 3/9 it is Late, and a save keeps both the
+    // Status and the StatusDate option.
+    let mut p = untitled_project();
+    p.options
+        .push(("StatusDate".into(), "2026-03-10T17:00".into()));
+    p.tasks = vec![Task {
+        constraint: ConstraintType::StartNoEarlierThan,
+        constraint_date: Some(dt(16, 8, 0)),
+        ..task(1, "F", 480)
+    }];
+    let mut ed = Editor::new(p);
+    assert_eq!(tv(&ed, 1, "Status").0, s("Future Task"));
+    ed.set_start(1, dt(9, 8, 0)).unwrap();
+    assert_eq!(tv(&ed, 1, "Status").0, s("Late"));
+    let xml = crate::mspdi::write_mspdi(ed.project());
+    let reread = crate::mspdi::read_mspdi(&xml).unwrap();
+    assert_eq!(reread.option("StatusDate"), Some("2026-03-10T17:00"));
+    let ed2 = Editor::new(reread);
+    assert_eq!(tv(&ed2, 1, "Status").0, s("Late"));
+}
+
+#[test]
+fn status_matches_project_on_the_x_status_corpus() {
+    // Expected Status for x-status.xml (StatusDate 2026-03-10T17:00) and
+    // x-status-nodate.xml (no StatusDate, CurrentDate 2026-03-13T17:00),
+    // transcribed from corpus/mpp/snapshots/extras.json key x-status.status
+    // (Project 2024 over COM, yeroo/mpp-corpus 644e3a9).
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/snapshots");
+    if !dir.join("x-status.xml").exists() {
+        eprintln!("SKIPPED: corpus/mpp/snapshots/x-status.xml absent");
+        return;
+    }
+    let cases = [
+        (
+            "x-status.xml",
+            [
+                "Complete",
+                "On Schedule",
+                "On Schedule",
+                "Late",
+                "Future Task",
+                "Future Task",
+                "On Schedule",
+                "Complete",
+                "Future Task",
+                "On Schedule",
+                "On Schedule",
+            ],
+        ),
+        (
+            "x-status-nodate.xml",
+            [
+                "Complete",
+                "Late",
+                "Late",
+                "Late",
+                "Future Task",
+                "Late",
+                "Late",
+                "Complete",
+                "Late",
+                "On Schedule",
+                "Late",
+            ],
+        ),
+    ];
+    for (file, want) in cases {
+        let text = std::fs::read_to_string(dir.join(file)).unwrap();
+        let ed = Editor::new(crate::mspdi::read_mspdi(&text).unwrap());
+        for (i, want) in want.iter().enumerate() {
+            let uid = i as i32 + 1;
+            assert_eq!(tv(&ed, uid, "Status").0, s(want), "{file} uid {uid}");
+        }
+    }
+}
+
+#[test]
+fn status_matches_project_over_the_x_status_sweep() {
+    // x-status-sweep.json holds Project 2024's Status for the x-status plan at
+    // 181 StatusDate rows plus 4 StatusDate=NA rows keyed by CurrentDate.
+    // Line-scanned, since projcore keeps no JSON dependency. The sweep date
+    // values are minute-precise and parse as MSPDI datetimes as-is.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/snapshots");
+    let Ok(text) = std::fs::read_to_string(dir.join("x-status-sweep.json")) else {
+        eprintln!("SKIPPED: corpus/mpp/snapshots/x-status-sweep.json absent");
+        return;
+    };
+    let Ok(base_text) = std::fs::read_to_string(dir.join("x-status.xml")) else {
+        eprintln!("SKIPPED: corpus/mpp/snapshots/x-status.xml absent");
+        return;
+    };
+    let base = crate::mspdi::read_mspdi(&base_text).unwrap();
+    // (date, status_date_is_na, wants)
+    type Row = (String, bool, Vec<(i32, String)>);
+    let mut rows: Vec<Row> = Vec::new();
+    for line in text.lines() {
+        if let Some(rest) = line.split("\"status_date\": \"").nth(1) {
+            rows.push((
+                rest.split('"').next().unwrap().to_string(),
+                false,
+                Vec::new(),
+            ));
+        } else if let Some(rest) = line.split("\"current_date\": \"").nth(1) {
+            rows.push((
+                rest.split('"').next().unwrap().to_string(),
+                true,
+                Vec::new(),
+            ));
+        } else if let Some(row) = rows.last_mut() {
+            let Some(rest) = line.trim().strip_prefix('"') else {
+                continue;
+            };
+            let Some((uid, rest)) = rest.split_once("\": \"") else {
+                continue;
+            };
+            let Ok(uid) = uid.parse::<i32>() else {
+                continue;
+            };
+            row.2
+                .push((uid, rest.trim_end_matches([',', '"']).to_string()));
+        }
+    }
+    assert_eq!(rows.len(), 181 + 4, "sweep row count");
+    for (date, is_na, wants) in &rows {
+        assert_eq!(wants.len(), 11, "row {date} expectations");
+        let mut proj = base.clone();
+        proj.options
+            .retain(|(n, _)| n != "StatusDate" && n != "CurrentDate");
+        if *is_na {
+            proj.options.push(("CurrentDate".into(), date.clone()));
+        } else {
+            proj.options.push(("StatusDate".into(), date.clone()));
+        }
+        let ed = Editor::new(proj);
+        for (uid, want) in wants {
+            assert_eq!(
+                &tv(&ed, *uid, "Status").0,
+                want,
+                "status date {date} uid {uid}"
+            );
+        }
+    }
 }

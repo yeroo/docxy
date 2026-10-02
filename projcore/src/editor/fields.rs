@@ -6,11 +6,13 @@
 //! `($40,000.00)`, `50%`, `Yes`), except for the Entry columns, which keep
 //! the grid's (`2d`, `2026-03-02`). Dates show `YYYY-MM-DD`, `NA` when unset.
 //!
-//! `value` is [`FieldValue::Null`] only for a date that shows `NA` and for a
+//! `value` is [`FieldValue::Null`] only for a date that shows `NA`, for a
 //! stored quantity the plan does not have (percents, actuals, remaining
-//! values, work, cost, fixed cost, baseline values, notes), so a test can
-//! tell it from `0`; such a field's `text` is what Project shows for it (`0%`,
-//! `0 days`, `0 hrs`, `$0.00`). Fields with a Project default read that
+//! values, work, cost, fixed cost, baseline values, notes), and for Status
+//! when the plan has no StatusDate or CurrentDate (or the task no start), so a
+//! test can tell it from `0`; such a field's `text` is what Project shows for
+//! it (`0%`, `0 days`, `0 hrs`, `$0.00`), empty for Status. Fields with a
+//! Project default read that
 //! default in both: Active (Yes), Priority (500), Effort Driven and Type (the
 //! plan's defaults for new tasks), Fixed Cost Accrual (Prorated, as costs
 //! accrue when it is absent or Invalid), Constraint Type (As Soon As
@@ -36,6 +38,13 @@
 //! the Baseline date to the scheduled one (negative when early; 0 without a
 //! Baseline date), and Duration, Work and Cost Variance are the current value
 //! less the Baseline one, an absent Baseline value counting as 0.
+//!
+//! Status is Project's own derivation, measured at the plan's StatusDate,
+//! else its CurrentDate, else empty: Complete at % Complete = 100; Future
+//! Task before the task's Start (minute precision); Late when the status
+//! date's calendar day is after the resume point's — a started task's stored
+//! resume snapped to the next working start on its calendar, a 0% task's raw
+//! Start; On Schedule otherwise.
 
 use super::*;
 use crate::model::{AccrueAt, Rate, outline_numbers};
@@ -100,6 +109,7 @@ pub enum Field {
     Milestone,
     Summary,
     Estimated,
+    Status,
     UniqueId,
 }
 
@@ -191,6 +201,7 @@ const TAIL: &[(Field, &str)] = &[
     (Field::Milestone, "Milestone"),
     (Field::Summary, "Summary"),
     (Field::Estimated, "Estimated"),
+    (Field::Status, "Status"),
     (Field::UniqueId, "Unique ID"),
 ];
 
@@ -452,6 +463,7 @@ impl<'a> FieldReader<'a> {
             Field::Milestone => flag(task.milestone || (!task.summary && task.duration_min == 0)),
             Field::Summary => flag(task.summary),
             Field::Estimated => flag(!duration_suffix(proj, task.uid).is_empty()),
+            Field::Status => status(ed, task),
             Field::UniqueId => int(i64::from(task.uid)),
         }
     }
@@ -494,6 +506,59 @@ fn int(n: i64) -> FieldRead {
 fn text(s: impl Into<String>) -> FieldRead {
     let s = s.into();
     FieldRead::new(s.clone(), FieldValue::Text(s))
+}
+
+/// Status as Project computes it, at the plan's status date (see
+/// [`Project::status_date`]); `("", Null)` when the plan has no StatusDate or
+/// CurrentDate, or the task has no start. The resume point is a started
+/// task's stored `resume` (else `stop`, else start) snapped to the next
+/// working start on its calendar, or a 0% task's raw start.
+fn status(ed: &Editor, task: &Task) -> FieldRead {
+    let proj = ed.project();
+    let Some(status_date) = proj.status_date() else {
+        return FieldRead::new("", FieldValue::Null);
+    };
+    let Some(start) = ed.disp_start(task.uid).or(task.stored_start) else {
+        return FieldRead::new("", FieldValue::Null);
+    };
+    let resume_point = match task.percent_complete {
+        Some(0) | None => start,
+        Some(_) => {
+            let r = task.resume.or(task.stop).unwrap_or(start);
+            crate::assign::advance(&crate::assign::task_calendar(proj, task), r, 0, false)
+                .unwrap_or(r)
+        }
+    };
+    text(task_status(
+        task.percent_complete,
+        start,
+        resume_point,
+        status_date,
+    ))
+}
+
+/// Project's Status rule, from the x-status oracle
+/// (`corpus/mpp/snapshots/x-status-sweep.json`, key `transitions`): Complete
+/// at % Complete = 100, whatever the status date; Future Task before the
+/// task's Start (minute precision); Late when the status date's calendar day
+/// is after the resume point's; On Schedule otherwise. Days compare as
+/// calendar days, not working time.
+fn task_status(
+    percent: Option<u8>,
+    start: DateTime,
+    resume_point: DateTime,
+    status_date: DateTime,
+) -> &'static str {
+    if percent == Some(100) {
+        return "Complete";
+    }
+    if status_date < start {
+        return "Future Task";
+    }
+    if status_date.day_number() > resume_point.day_number() {
+        return "Late";
+    }
+    "On Schedule"
 }
 
 fn optional_text(s: Option<&str>) -> FieldRead {

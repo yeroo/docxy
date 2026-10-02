@@ -1438,7 +1438,7 @@ mod tests {
             ),
         ];
         for (verb, extra) in edits {
-            for bad in [names(&["Name", "Status"]), Json::Str("x".into())] {
+            for bad in [names(&["Name", "Bogus2"]), Json::Str("x".into())] {
                 let mut args = extra.clone();
                 args.push(("fields", bad));
                 assert!(call(&mut ed, verb, args).is_err(), "{verb}");
@@ -1480,10 +1480,10 @@ mod tests {
             ("find", vec![("query", Json::Str("task".into()))]),
         ] {
             let mut args = extra.clone();
-            args.push(("fields", names(&["Name", "Status", "Bogus"])));
+            args.push(("fields", names(&["Name", "Bogus2", "Bogus"])));
             assert_eq!(
                 call(&mut ed, verb, args),
-                Err("unknown task field 'Status'".into()),
+                Err("unknown task field 'Bogus2'".into()),
                 "{verb}"
             );
             for bad in [Json::Str("Name".into()), Json::Arr(vec![Json::Num(1.0)])] {

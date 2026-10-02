@@ -90,6 +90,13 @@ impl PairExclusions {
                 new_tasks_mode: true,
                 ..Self::default()
             },
+            Some("x-status") => Self {
+                // Project regenerated task GUIDs between the .mpp save and the XML
+                // export: 1 of the XML's 25 GUIDs occurs in the binary (x-status-nodate's
+                // 25 all do). The binary-vs-imported GUID check still runs.
+                guid: true,
+                ..Self::default()
+            },
             Some("x-overallocated") => Self {
                 guid: true,
                 root_name: true,
@@ -1552,8 +1559,8 @@ fn project_2024_oracles() {
             .filter(|(p, _)| !p.file_stem().unwrap().to_string_lossy().ends_with("-mpp12"))
             .collect::<Vec<_>>();
         let older = pairs(&snapshots, "-mpp12");
-        assert_eq!(newest.len(), 48);
-        assert_eq!(older.len(), 48);
+        assert_eq!(newest.len(), 50);
+        assert_eq!(older.len(), 50);
         for stem in ["x-recurring", "x-overallocated"] {
             assert!(
                 newest
@@ -1713,7 +1720,7 @@ fn project_2024_oracles() {
             }
         }
         assert_eq!(constraint_counts[2], 167, "MSO count in newest snapshots");
-        assert_eq!(constraint_counts[4], 34, "SNET count in newest snapshots");
+        assert_eq!(constraint_counts[4], 49, "SNET count in newest snapshots");
         assert_eq!(constraint_counts[7], 28, "FNLT count in newest snapshots");
         assert_eq!(
             start_divergence_pins, 0,

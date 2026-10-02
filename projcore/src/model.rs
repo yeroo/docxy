@@ -1775,6 +1775,15 @@ impl Project {
             .map(|(_, v)| v.as_str())
     }
 
+    /// The date Status is measured at: the `StatusDate` header option, else
+    /// `CurrentDate` (Project's own fallback), else `None`. Never the wall
+    /// clock.
+    pub fn status_date(&self) -> Option<DateTime> {
+        ["StatusDate", "CurrentDate"]
+            .iter()
+            .find_map(|n| self.option(n).and_then(DateTime::parse_mspdi))
+    }
+
     /// Working days per month, using Project's default when the option is invalid.
     pub fn days_per_month(&self) -> f64 {
         self.option("DaysPerMonth")
