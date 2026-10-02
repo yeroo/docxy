@@ -12,3 +12,6 @@ tools/wordshim/docxy-word.tlb binary
 # LF-only file. Check these out with CRLF whatever the global rule says.
 *.cmd text eol=crlf
 *.bat text eol=crlf
+
+# Word-written import fixtures: keep the bytes Word wrote (CRLF in .rtf/.htm).
+corpus/word-import/** -text

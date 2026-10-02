@@ -28,7 +28,6 @@ mod props;
 mod publish;
 mod rscdecode;
 mod rtf;
-mod rtf_codepage;
 mod tabledecode;
 mod taskdecode;
 pub mod vardata;

@@ -29,33 +29,15 @@ fn decode_note_byte(value: u8, state: State, fonts: &HashMap<i32, FontInfo>) -> 
         .codepage
         .or_else(|| {
             font.charset
-                .map(|charset| charset_page(charset, state.codepage))
+                .map(|charset| opccore::codepage::charset_page(charset, state.codepage))
                 .unwrap_or(Some(state.codepage))
         })
         .ok_or(())?;
     if page == 42 {
         char::from_u32(0xf000 + u32::from(value)).ok_or(())
     } else {
-        crate::rtf_codepage::decode(page, value).ok_or(())
+        opccore::codepage::decode(page, value).ok_or(())
     }
-}
-
-fn charset_page(charset: i32, ansi_page: i32) -> Option<i32> {
-    Some(match charset {
-        0 => 1252,
-        1 => ansi_page,
-        2 => 42, // Windows SYMBOL_CHARSET: U+F000 + byte.
-        161 => 1253,
-        162 => 1254,
-        163 => 1258,
-        177 => 1255,
-        178 => 1256,
-        186 => 1257,
-        204 => 1251,
-        222 => 874,
-        238 => 1250,
-        _ => return None,
-    })
 }
 
 fn hidden_destination(word: &[u8]) -> bool {

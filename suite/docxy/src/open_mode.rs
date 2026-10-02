@@ -1,5 +1,7 @@
 //! Excel's open modes for a workbook (#610): Open Read-Only, Open as Copy,
-//! Open and Repair, and the Protected View a downloaded file opens in.
+//! Open and Repair, and the Protected View a downloaded file opens in; and
+//! Word's for a document (#633): Recover Text from Any File, Protected View,
+//! and the converted tab an RTF, Web Page or PDF opens as.
 //!
 //! Everything here is pure or touches only the file system, so it is tested
 //! without a window; `main.rs` wires it into opening, saving and editing.
@@ -7,8 +9,8 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// How a workbook is opened. A document or project ignores every mode but
-/// [`OpenMode::Normal`].
+/// How a workbook is opened. A document takes [`OpenMode::Normal`] and
+/// [`OpenMode::RecoverText`]; a project only Normal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum OpenMode {
     /// Editable in place.
@@ -21,16 +23,21 @@ pub(crate) enum OpenMode {
     /// A lenient load that empties or drops the parts it cannot read; Save
     /// goes to Save As.
     Repair,
+    /// Word's Recover Text from Any File, for a document: the text that can
+    /// be read from any file, as a converted tab.
+    RecoverText,
 }
 
 impl OpenMode {
-    /// The harness spelling: `normal`, `read-only`, `copy` or `repair`.
+    /// The harness spelling: `normal`, `read-only`, `copy`, `repair` or
+    /// `recover-text`.
     pub(crate) fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "normal" => Self::Normal,
             "read-only" => Self::ReadOnly,
             "copy" => Self::Copy,
             "repair" => Self::Repair,
+            "recover-text" => Self::RecoverText,
             _ => return None,
         })
     }
@@ -43,8 +50,43 @@ impl OpenMode {
             repaired: self == Self::Repair,
             protected: false,
             stamp: None,
+            converted: None,
         }
     }
+}
+
+/// What a document tab was converted from (#633). A converted tab never
+/// writes its source: Save goes to Save As, which refuses the source file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Converted {
+    Rtf,
+    Html,
+    Pdf,
+    /// The text recovered from a damaged `.docx` that would not load.
+    Recovered,
+    /// Opened with Recover Text from Any File.
+    RecoveredText,
+}
+
+impl Converted {
+    /// The status line a converted tab opens with.
+    pub(crate) fn loaded_status(self, paragraphs: usize) -> String {
+        match self {
+            Self::Rtf => "loaded (converted from RTF)".into(),
+            Self::Html => "loaded (converted from HTML)".into(),
+            Self::Pdf => "loaded (converted from PDF)".into(),
+            Self::Recovered => {
+                format!("recovered text from a damaged file ({paragraphs} paragraphs)")
+            }
+            Self::RecoveredText => format!("recovered text ({paragraphs} paragraphs)"),
+        }
+    }
+}
+
+/// What Save As over a converted tab's own file says.
+pub(crate) fn converted_refusal(name: &str) -> String {
+    format!("\"{name}\" was converted; save it as a Word document under a new name.")
 }
 
 /// What a tab may do with its file. All false is an ordinary tab.
@@ -61,12 +103,14 @@ pub(crate) struct Access {
     /// A protected tab's file as it was when opened (#882): what Enable
     /// Editing trusts, so a file replaced since is not trusted with it.
     pub(crate) stamp: Option<crate::trusted::Stamp>,
+    /// The tab was converted from another format, or recovered (#633).
+    pub(crate) converted: Option<Converted>,
 }
 
 impl Access {
     /// Save must ask where to write instead of overwriting the tab's file.
     pub(crate) fn save_needs_dialog(self) -> bool {
-        self.read_only || self.repaired
+        self.read_only || self.repaired || self.converted.is_some()
     }
 
     /// The caption's suffix, Excel's words; Protected View says the most.
@@ -85,9 +129,13 @@ impl Access {
     /// Whether a tab with this access is what opening in `mode` would give.
     /// Protected View is the file's, not the mode's, so it is left out: a
     /// Normal open of a downloaded file would otherwise reload every time.
+    /// A converted tab is what Normal gives, unless it was opened with
+    /// Recover Text, which only that mode gives.
     pub(crate) fn opened_as(self, mode: OpenMode) -> bool {
         let want = mode.access();
-        self.read_only == want.read_only && self.repaired == want.repaired
+        self.read_only == want.read_only
+            && self.repaired == want.repaired
+            && (self.converted == Some(Converted::RecoveredText)) == (mode == OpenMode::RecoverText)
     }
 }
 
@@ -367,9 +415,74 @@ pub(crate) fn protected_allows_key(key: &str, ctrl: bool, alt: bool) -> bool {
     }
 }
 
+/// Whether a key may reach a document in Protected View (#633): moving the
+/// caret and extending the selection (with Shift, by word with Ctrl),
+/// copying, selecting all, finding, zooming, KeyTips and the modifiers on
+/// their own. Everything else would edit: Enter, Tab, Backspace, Delete, any
+/// character, and Ctrl+X, V, Z, Y, B, I, U, M, S.
+pub(crate) fn protected_allows_doc_key(key: &str, ctrl: bool, alt: bool) -> bool {
+    match key {
+        "shift" | "control" | "alt" | "platform" | "function" => true,
+        "left" | "right" | "up" | "down" | "pageup" | "pagedown" | "home" | "end" | "escape" => {
+            !alt
+        }
+        // KeyTips: the commands they reach are refused there.
+        "f10" => !ctrl,
+        "c" | "a" | "f" | "=" | "+" | "-" | "0" | "f1" => ctrl && !alt,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protected_documents_take_only_keys_that_look_move_or_copy() {
+        for (key, ctrl) in [
+            ("left", false),
+            ("right", true),
+            ("home", true),
+            ("end", false),
+            ("pagedown", false),
+            ("up", false),
+            ("escape", false),
+            ("c", true),
+            ("a", true),
+            ("f", true),
+            ("=", true),
+            ("shift", false),
+            ("f10", false),
+        ] {
+            assert!(
+                protected_allows_doc_key(key, ctrl, false),
+                "{key} ctrl={ctrl}"
+            );
+        }
+        for (key, ctrl) in [
+            ("enter", false),
+            ("tab", false),
+            ("backspace", false),
+            ("delete", false),
+            ("a", false),
+            ("space", false),
+            ("x", true),
+            ("v", true),
+            ("z", true),
+            ("y", true),
+            ("b", true),
+            ("i", true),
+            ("u", true),
+            ("m", true),
+            ("s", true),
+            ("tab", true),
+        ] {
+            assert!(
+                !protected_allows_doc_key(key, ctrl, false),
+                "{key} ctrl={ctrl}"
+            );
+        }
+    }
 
     #[test]
     fn modes_parse_from_the_harness_spelling() {

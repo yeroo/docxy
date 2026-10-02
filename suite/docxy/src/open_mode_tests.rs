@@ -362,7 +362,7 @@ fn a_protected_tab_without_a_file_falls_back_to_its_oldest_snapshot() {
 /// Mark `path` as downloaded from the Internet, or `None` when this volume
 /// keeps no alternate data streams.
 #[cfg(windows)]
-fn mark_downloaded(path: &Path) -> Option<()> {
+pub(crate) fn mark_downloaded(path: &Path) -> Option<()> {
     let mut stream = path.as_os_str().to_owned();
     stream.push(":Zone.Identifier");
     match std::fs::write(PathBuf::from(stream), "[ZoneTransfer]\r\nZoneId=3\r\n") {

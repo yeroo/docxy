@@ -734,7 +734,7 @@ Repair… call after their file pick:
 
 | Call | Effect |
 |---|---|
-| `open {"path":"book.xlsx","mode":"read-only"}` | `mode` is `normal` (the default), `read-only`, `copy` or `repair`; a document or Project ignores it |
+| `open {"path":"book.xlsx","mode":"read-only"}` | `mode` is `normal` (the default), `read-only`, `copy`, `repair` or `recover-text`; a workbook ignores `recover-text`, a document takes only `recover-text` (Recover Text from Any File, #633), and a Project ignores every mode |
 | `open {"path":"book.xlsx","reopen":"ask"}` | a person's open of a file already open: a dirty tab asks first (the `reopen` dialog), a clean one reloads only in another mode |
 | `enable-editing {}` | the PROTECTED VIEW message bar's Enable Editing button; refused off a protected tab |
 
@@ -765,9 +765,39 @@ file that is already open without asking unless `reopen` is `"ask"` (see
   Save goes to Save As, which may pick the file itself.
 - **Protected View** is the file's, not a mode: a workbook whose
   `Zone.Identifier` stream says zone 3 or 4 opens protected in every mode,
-  Copy included, and so does that copy when it is opened again later. Edits and saves are refused with `Protected View — select
-  Enable Editing to edit`. A script cannot write that stream, so
-  `uiharness/tests/protected_view.rs` (desktop-only, `--ignored`) covers it.
+  Copy included, and so does that copy when it is opened again later. A
+  document (`.docx`, RTF, Web Page, PDF, Markdown, #633) opens protected the
+  same way. Edits and saves are refused with `Protected View — select
+  Enable Editing to edit`: on a document only moving, selecting, copying,
+  Find and view commands pass, and `mail-attach` is refused too. A script
+  cannot write that stream, so `uiharness/tests/protected_view.rs`
+  (desktop-only, `--ignored`) covers it.
+- **recover-text** (#633, documents only): Word's Recover Text from Any File.
+  A Word package gives its recovered text, anything else its printable text
+  runs; the status says `recovered text (N paragraphs)` (a successful open).
+  Like a document converted from RTF, a Web Page or a PDF (`loaded
+  (converted from …)`) or a damaged `.docx` opened normally (`recovered text
+  from a damaged file (N paragraphs)`), the tab never writes its file: Save
+  needs Save As (a harness instance refuses `key ctrl+s` in words, `… was
+  converted from another format, so Save needs Save As …`), and `save-as`
+  over the file is refused (`"name.rtf" was converted; save it as a Word
+  document under a new name.`).
+- **Conversions run in a child process** (#633): an RTF, Web Page, PDF,
+  damaged `.docx` or Recover Text open spawns the suite itself as
+  `--convert-import <what> <in> <out.docx>` (at most 20 s; on Windows in a
+  Job object limited to 2 GiB), so a conversion that dies or hangs is a
+  `load error: the file could not be converted` / `… took too long`, not a
+  dead instance; a child that cannot start says `cannot start the
+  conversion: <reason>`. `DOCXY_CONVERT_IN_PROCESS=1` converts in process
+  instead; either way the tab is built from the same converted `.docx`
+  (it has that package). A converted tab restored from the session with no
+  readable sidecar (missing or damaged) shows `not converted yet …` until
+  its tab is first in front (it converts when selected, or before the next
+  harness verb), and a
+  Protected View rollback restores what the tab was converted to, never
+  converting again.
+  `uiharness/tests/open_converted.rs` (desktop-only, `--ignored`) opens the
+  Word fixtures through it.
 - **Trusted documents** (#882): Enable Editing records the file in
   `<DOCXY_CONFIG_DIR>/docxy/trusted.json` by its canonical path, length and
   modified time as it was opened. That file opens again without Protected

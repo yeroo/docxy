@@ -1079,6 +1079,7 @@ fn a_restore_without_a_sidecar_takes_the_fresh_load_s_mark() {
         protected: false,
         repaired: false,
         stamp: None,
+        converted: None,
         binary_source: false,
         compat: false,
     };
@@ -1226,6 +1227,51 @@ fn a_corrupt_sidecar_reopens_the_file_from_disk() {
         );
         assert_eq!(doc_text(&saved), on_disk);
     }
+    // A sidecar cut in half (FIX r1 m4) still has readable local entries,
+    // which Recover Text would read; a sidecar is never recovered, so the
+    // tab reopens its intact file instead of showing partial text.
+    let long = dir.join("long.docx");
+    let md: String = (1..=40)
+        .map(|i| {
+            format!(
+                "Paragraph {i} of a long one.
+
+"
+            )
+        })
+        .collect();
+    std::fs::write(
+        &long,
+        docxcore::package::save_package(&docxcore::package::new_package(
+            docxcore::markdown::from_markdown(&md),
+        )),
+    )
+    .unwrap();
+    let long_text = doc_text(&tab_from_path(&long));
+    let t = tab_from_path(&long);
+    let p = persist_tab(&dir, 3, &t);
+    let hot = std::fs::read(p.hot.as_ref().unwrap()).unwrap();
+    // Cut inside word/document.xml's own data, past its local header.
+    let name = b"word/document.xml";
+    // The part's own local header (the name also appears in
+    // [Content_Types].xml): 30 header bytes, then the name.
+    let at = (30..hot.len() - name.len())
+        .find(|&i| &hot[i..i + name.len()] == name && &hot[i - 30..i - 26] == b"PK\x03\x04")
+        .unwrap();
+    // Two thirds into its (stored) data, by the size the header gives.
+    let size = u32::from_le_bytes(hot[at - 12..at - 8].try_into().unwrap()) as usize;
+    let cut = at + name.len() + size * 2 / 3;
+    std::fs::write(p.hot.as_ref().unwrap(), &hot[..cut]).unwrap();
+    assert!(
+        docxcore::import::recover_docx_text(&hot[..cut])
+            .unwrap()
+            .is_some(),
+        "the cut sidecar has text Recover Text could read"
+    );
+    let r = restore_tab(&p);
+    assert!(r.status.contains("restored copy"), "{}", r.status);
+    assert_eq!(r.access.converted, None);
+    assert_eq!(doc_text(&r), long_text);
     // A file that is itself broken stays marked, by the fresh load.
     let broken = dir.join("broken.docx");
     std::fs::write(&broken, b"not a zip").unwrap();
@@ -1446,6 +1492,7 @@ fn persisted_tab(
         protected: false,
         repaired: false,
         stamp: None,
+        converted: None,
         binary_source: false,
         compat: false,
     }

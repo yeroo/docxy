@@ -629,6 +629,8 @@ fn package(tab: &mut DocTab) -> Result<&mut Package, String> {
         let Surface::Doc(ed) = &tab.surface else {
             return Err("Mail merge needs a document".into());
         };
+        // A new document's. A converted tab (#633) never comes here: it has
+        // the package its conversion wrote, which defines its styles.
         let bytes = doc_to_docx(&ed.doc, &tab.comments, None);
         tab.pkg = Some(docxcore::package::load_package(&bytes).map_err(|e| e.to_string())?);
     }

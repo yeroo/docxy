@@ -24,6 +24,9 @@ compile_error!(
 
 mod close;
 mod control;
+mod convert_child;
+#[cfg(test)]
+mod convert_tests;
 mod cover_page;
 mod crashlog;
 mod design_dialogs;
@@ -33,6 +36,8 @@ mod dialog_host;
 mod doc_import;
 #[cfg(test)]
 mod doc_import_tests;
+#[cfg(test)]
+mod doc_protected_tests;
 mod harness;
 mod hf;
 mod hf_tab;
@@ -230,6 +235,11 @@ struct PersistTab {
     /// after a restart.
     #[serde(default)]
     stamp: Option<trusted::Stamp>,
+    /// What a document tab was converted from (#633): its sidecar is a
+    /// `.docx`, but `path` still names the RTF, page, PDF or damaged file,
+    /// which Save must never write.
+    #[serde(default)]
+    converted: Option<open_mode::Converted>,
     /// The document's [`doc_import::DocImport`] (#634). A dirty tab restores
     /// from its `.docx` sidecar, which says neither, so without these its
     /// Save would write over the `.doc` it was imported from.
@@ -798,6 +808,27 @@ fn protected_view_allows_act(act: SheetAct) -> bool {
     matches!(
         act,
         SheetAct::Copy | SheetAct::PrevComment | SheetAct::NextComment | SheetAct::Todo
+    )
+}
+
+/// The document commands Protected View lets through (#633): copying,
+/// selecting, finding and what only changes the view. Everything else edits,
+/// or opens a picker, menu or dialog that would.
+fn protected_view_allows_doc_act(act: Act) -> bool {
+    matches!(
+        act,
+        Act::Copy
+            | Act::SelectAll
+            | Act::Find
+            | Act::ShowHide
+            | Act::ToggleComments
+            | Act::ToggleNav
+            | Act::ToggleNotes
+            | Act::DarkMode
+            | Act::AutoHideRibbon
+            | Act::PrintLayout
+            | Act::ToggleRuler
+            | Act::Project(_)
     )
 }
 
@@ -2506,6 +2537,13 @@ struct DocTab {
     /// This document's mail merge (#628): its type, recipient list and
     /// preview state.
     mail: mailings_tab::MailState,
+    /// A converted tab's document as it was converted (#633): what
+    /// Protected View's rollback restores, so it never converts again.
+    converted_docx: Option<std::rc::Rc<Vec<u8>>>,
+    /// A converted tab restored from the session and not converted yet
+    /// (#633): it is, when it is first drawn as the active tab, so a
+    /// startup never waits on more than the tab in front.
+    pending_conversion: bool,
     /// Whether this document was imported from a Word 97-2003 file, and
     /// whether it is still in Compatibility Mode (#634).
     import: doc_import::DocImport,
@@ -2522,6 +2560,17 @@ impl DocTab {
             caption.push_str(doc_import::COMPAT_SUFFIX);
         }
         caption
+    }
+
+    /// A document edit landed. In Protected View (#633) a gate before it
+    /// leaked, so the edit is rolled back instead ([`protected_rollback`])
+    /// and the tab never turns dirty.
+    fn mark_dirty(&mut self) {
+        if self.access.protected {
+            protected_rollback(self);
+        } else {
+            self.dirty = true;
+        }
     }
 }
 
@@ -4284,6 +4333,11 @@ struct Loaded {
     bundle_html: Option<String>,
     /// `doc` is a placeholder because the file could not be loaded.
     load_failed: bool,
+    /// `doc` was converted from another format, or recovered (#633): the
+    /// tab must never write it back over its file.
+    converted: Option<open_mode::Converted>,
+    /// The converted `.docx` the tab was built from, kept for rollback.
+    converted_docx: Option<std::rc::Rc<Vec<u8>>>,
     /// The document was imported from a Word 97-2003 file (#634).
     import: doc_import::DocImport,
 }
@@ -4299,9 +4353,12 @@ impl Loaded {
             status: status.into(),
             bundle_html: None,
             load_failed: true,
+            converted: None,
+            converted_docx: None,
             import: Default::default(),
         }
     }
+
     fn into_tab(
         self,
         kind: Kind,
@@ -4325,8 +4382,13 @@ impl Loaded {
             bundle_html: self.bundle_html,
             load_failed: self.load_failed,
             dialogs: crate::dialog::DialogStack::default(),
-            access: crate::open_mode::Access::default(),
+            access: crate::open_mode::Access {
+                converted: self.converted,
+                ..Default::default()
+            },
             last_hot: Default::default(),
+            converted_docx: self.converted_docx,
+            pending_conversion: false,
             import: self.import,
         }
     }
@@ -4362,59 +4424,229 @@ fn load_bytes(bytes: &[u8]) -> Loaded {
         status,
         bundle_html: None,
         load_failed: false,
+        converted: None,
+        converted_docx: None,
         import,
     }
 }
 
-fn doc_from_path(path: &PathBuf) -> Loaded {
-    if html_bundle::doc_target(path, false) == html_bundle::DocTarget::Html {
-        return match html_bundle::open(path) {
-            Ok(opened) => {
-                let mut loaded = load_bytes(&opened.docx);
-                loaded.bundle_html = Some(opened.html);
-                // A payload that is not a docx keeps its `load error: …`
-                // rather than reporting an empty document as loaded.
-                if !loaded.load_failed {
-                    loaded.status = match opened.warning {
-                        Some(w) => format!("loaded (editable HTML) \u{00b7} {w}").into(),
-                        None => "loaded (editable HTML)".into(),
-                    };
-                }
-                loaded
-            }
-            Err(e) => Loaded::empty(format!("load error: {e}")),
-        };
+/// [`load_bytes`], or for a Word package that will not load, the text that
+/// can still be read from it, as a converted tab (#633); the load error
+/// stays when nothing can be.
+fn load_or_recover(path: &std::path::Path, bytes: &[u8]) -> Loaded {
+    let loaded = load_bytes(bytes);
+    if !loaded.load_failed {
+        return loaded;
     }
-    match std::fs::read(path) {
-        Ok(bytes) if is_markdown_path(path) => match docxcore::markdown::decode_markdown(&bytes) {
-            Ok((text, encoding)) => Loaded {
-                doc: docxcore::markdown::from_markdown(&text),
-                comments: vec![],
-                notes: vec![],
-                pkg: None,
-                markdown: true,
-                status: match encoding {
-                    Some(name) => format!("loaded (markdown, {name}; saves as UTF-8)").into(),
-                    None => "loaded (markdown)".into(),
-                },
-                bundle_html: None,
-                load_failed: false,
-                import: Default::default(),
-            },
-            Err(e) => Loaded {
-                markdown: true,
-                ..Loaded::empty(format!("load error: {e}"))
-            },
-        },
-        // A 0-byte file (Explorer's "New → Word Document") has nothing to
-        // lose: it opens as a new document that saves over it.
-        Ok(bytes) if bytes.is_empty() => Loaded {
+    convert_doc(path, bytes, convert_child::What::Recover).unwrap_or(loaded)
+}
+
+/// Convert `path` (whose content is `bytes`) as `what` (#633), with the
+/// process's runner: a child process ([`convert_child`]), so an import that
+/// aborts, runs out of memory or hangs costs that child only and is a load
+/// error here; in process for unit tests or `DOCXY_CONVERT_IN_PROCESS=1`.
+/// Either way the tab is built from the same converted `.docx`
+/// ([`loaded_from_converted_docx`]). `None` only when recovery found no
+/// text.
+fn convert_doc(path: &std::path::Path, bytes: &[u8], what: convert_child::What) -> Option<Loaded> {
+    convert_doc_with(path, bytes, what, convert_child::runner())
+}
+
+/// [`convert_doc`] with a given runner (tests pass the real child).
+fn convert_doc_with(
+    path: &std::path::Path,
+    bytes: &[u8],
+    what: convert_child::What,
+    run: convert_child::Runner,
+) -> Option<Loaded> {
+    use convert_child::{Outcome, What};
+    let kind = match what {
+        What::Rtf => open_mode::Converted::Rtf,
+        What::Html => open_mode::Converted::Html,
+        What::Pdf => open_mode::Converted::Pdf,
+        What::Recover => open_mode::Converted::Recovered,
+        What::RecoverText => open_mode::Converted::RecoveredText,
+    };
+    Some(match run(what, path, bytes) {
+        Outcome::Converted(docx) => loaded_from_converted_docx(docx, kind),
+        Outcome::Failed(why) => Loaded::empty(format!("load error: {why}")),
+        Outcome::NothingRecovered => return None,
+    })
+}
+
+/// The tab a conversion's `.docx` makes: loaded like any Word document (its
+/// Markdown package, which defines its styles and lists, and its final
+/// section), marked converted, its bytes kept for Protected View's rollback.
+fn loaded_from_converted_docx(docx: Vec<u8>, kind: open_mode::Converted) -> Loaded {
+    let mut l = load_bytes(&docx);
+    if l.load_failed {
+        return Loaded::empty(format!("load error: {}", convert_child::DIED));
+    }
+    l.status = kind
+        .loaded_status(docxcore::import::paragraph_count(&l.doc))
+        .into();
+    l.converted = Some(kind);
+    l.converted_docx = Some(std::rc::Rc::new(docx));
+    l
+}
+
+/// A plain document's file loaded again, never converted (#633): what
+/// Protected View's rollback reads, inside a frame ([`load_doc_file`]).
+fn reload_without_converting(path: &std::path::Path) -> Loaded {
+    load_doc_file(path, false)
+}
+
+/// Convert a converted tab restored from the session (#633), now that it is
+/// in front: what its file converts to today.
+fn finish_pending_conversion(tab: &mut DocTab) {
+    if !tab.pending_conversion {
+        return;
+    }
+    tab.pending_conversion = false;
+    let Some(path) = tab.path.clone() else {
+        return;
+    };
+    let l = load_doc_for_tab(&path, tab.access.converted);
+    // The whole document is replaced: nothing of the placeholder is kept.
+    tab.dirty = false;
+    tab.hf_edit = None;
+    tab.surface = Surface::Doc(Editor::new(l.doc));
+    tab.comments = l.comments;
+    tab.notes = l.notes;
+    tab.mail = mailings_tab::MailState::from_pkg(l.pkg.as_ref());
+    tab.pkg = l.pkg;
+    tab.status = l.status;
+    tab.load_failed = l.load_failed;
+    tab.converted_docx = l.converted_docx;
+    // A file that no longer converts the same way keeps the session's
+    // mark, so Save still never writes over it.
+    tab.access.converted = tab.access.converted.or(l.converted);
+}
+
+/// A converted tab restored from the session, not converted yet (#633): a
+/// placeholder until it is first drawn as the active tab.
+fn pending_conversion(kind: open_mode::Converted) -> Loaded {
+    Loaded {
+        load_failed: false,
+        converted: Some(kind),
+        ..Loaded::empty("not converted yet: it converts when you open its tab")
+    }
+}
+
+/// Load a document tab's file. The format is decided by the content first
+/// (#633), so an RTF or a Web Page named `.doc` or `.docx` opens as what it
+/// is: a docxy bundle, any other HTML, RTF and PDF are told apart by their
+/// bytes, Markdown by its extension. RTF, HTML and PDF open converted; a
+/// Word package that will not load opens as its recovered text.
+fn doc_from_path(path: &std::path::Path) -> Loaded {
+    load_doc_file(path, true)
+}
+
+/// [`doc_from_path`]'s one dispatch. Without `convert` (Protected View's
+/// rollback, inside a frame) no conversion runs: a file that would need one
+/// (RTF, HTML, PDF, a package that will not load) is a load error instead,
+/// and every other case (Markdown, empty file, OLE, bundle, Word) is the
+/// same as an open's.
+fn load_doc_file(path: &std::path::Path, convert: bool) -> Loaded {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) => return Loaded::empty(format!("read error: {e}")),
+    };
+    if is_markdown_path(path) {
+        return markdown_from_bytes(&bytes);
+    }
+    // A 0-byte file (Explorer's "New → Word Document") has nothing to
+    // lose: it opens as a new document that saves over it.
+    if bytes.is_empty() {
+        return Loaded {
             status: "loaded (empty file)".into(),
             load_failed: false,
             ..Loaded::empty("")
-        },
-        Ok(bytes) => load_bytes(&bytes),
+        };
+    }
+    use docxcore::import::Format;
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match docxcore::import::sniff(&bytes, &ext) {
+        Format::Html if htmlbundle::is_bundle(&bytes) => bundle_from_path(path),
+        Format::Html | Format::Rtf | Format::Pdf if !convert => {
+            Loaded::empty("load error: the file now needs converting; open it again")
+        }
+        Format::Docx | Format::Unknown if !convert => load_bytes(&bytes),
+        Format::Html => convert_doc(path, &bytes, convert_child::What::Html)
+            .unwrap_or_else(|| Loaded::empty("load error: the HTML file holds no text")),
+        Format::Rtf => convert_doc(path, &bytes, convert_child::What::Rtf)
+            .unwrap_or_else(|| Loaded::empty("load error: the RTF file holds no text")),
+        Format::Pdf => convert_doc(path, &bytes, convert_child::What::Pdf)
+            .unwrap_or_else(|| Loaded::empty("load error: the PDF has no text to convert")),
+        // An OLE compound file: a Word 97-2003 document, imported in
+        // Compatibility Mode (#634), never converted.
+        Format::Cfb => load_bytes(&bytes),
+        Format::Docx | Format::Unknown => load_or_recover(path, &bytes),
+    }
+}
+
+/// Recover Text from Any File (#633): a Word package's recovered text when
+/// it has any, else the printable text of whatever the file is.
+fn recovered_text_from_path(path: &std::path::Path) -> Loaded {
+    match std::fs::read(path) {
+        // Recover Text always finds something (one empty paragraph at least).
+        Ok(bytes) => convert_doc(path, &bytes, convert_child::What::RecoverText)
+            .unwrap_or_else(|| Loaded::empty(format!("load error: {}", convert_child::DIED))),
         Err(e) => Loaded::empty(format!("read error: {e}")),
+    }
+}
+
+/// Load a document the way its tab was opened (#633): converted tabs come
+/// back converted, a Recover Text tab as recovered text. Open, session
+/// restore of a plain tab, and a restored converted tab's first activation
+/// ([`finish_pending_conversion`]) go through here; Protected View's
+/// rollback never does (it restores `converted_docx`, or calls
+/// [`reload_without_converting`]).
+fn load_doc_for_tab(path: &std::path::Path, converted: Option<open_mode::Converted>) -> Loaded {
+    match converted {
+        Some(open_mode::Converted::RecoveredText) => recovered_text_from_path(path),
+        _ => doc_from_path(path),
+    }
+}
+
+fn markdown_from_bytes(bytes: &[u8]) -> Loaded {
+    match docxcore::markdown::decode_markdown(bytes) {
+        Ok((text, encoding)) => Loaded {
+            doc: docxcore::markdown::from_markdown(&text),
+            markdown: true,
+            status: match encoding {
+                Some(name) => format!("loaded (markdown, {name}; saves as UTF-8)").into(),
+                None => "loaded (markdown)".into(),
+            },
+            load_failed: false,
+            ..Loaded::empty("")
+        },
+        Err(e) => Loaded {
+            markdown: true,
+            ..Loaded::empty(format!("load error: {e}"))
+        },
+    }
+}
+
+fn bundle_from_path(path: &std::path::Path) -> Loaded {
+    match html_bundle::open(path) {
+        Ok(opened) => {
+            let mut loaded = load_bytes(&opened.docx);
+            loaded.bundle_html = Some(opened.html);
+            // A payload that is not a docx keeps its `load error: …`
+            // rather than reporting an empty document as loaded.
+            if !loaded.load_failed {
+                loaded.status = match opened.warning {
+                    Some(w) => format!("loaded (editable HTML) \u{00b7} {w}").into(),
+                    None => "loaded (editable HTML)".into(),
+                };
+            }
+            loaded
+        }
+        Err(e) => Loaded::empty(format!("load error: {e}")),
     }
 }
 
@@ -4451,9 +4683,11 @@ fn sheet_bytes(v: &SheetView, target: Option<&std::path::Path>) -> (Vec<u8>, usi
 }
 
 /// What the Open dialog's "All supported" filter lists: documents
-/// (Word 97-2003 `.doc` imports, #634), workbooks and project schedules.
-const OPEN_EXTENSIONS: [&str; 12] = [
-    "docx", "doc", "md", "markdown", "html", "xlsx", "xlsm", "xltx", "xltm", "yppx", "xml", "mpp",
+/// (Word 97-2003 `.doc` imports, #634; RTF, web pages and PDFs opened
+/// converted, #633), workbooks and project schedules.
+const OPEN_EXTENSIONS: [&str; 15] = [
+    "docx", "doc", "md", "markdown", "html", "htm", "rtf", "pdf", "xlsx", "xlsm", "xltx", "xltm",
+    "yppx", "xml", "mpp",
 ];
 
 /// The extensions a workbook opens from and saves to.
@@ -4529,13 +4763,55 @@ fn sheet_tab_from_path(path: &PathBuf, repair: bool) -> DocTab {
         dialogs: crate::dialog::DialogStack::default(),
         access: crate::open_mode::Access::default(),
         last_hot: Default::default(),
+        converted_docx: None,
+        pending_conversion: false,
         mail: Default::default(),
         import: Default::default(),
     }
 }
 
-/// [`tab_from_path`] in an open mode (#610). Only a workbook takes a mode;
-/// anything else opens as usual. Protected View comes from the source file's
+/// The mode `path` actually opens in: a workbook takes Excel's modes, a
+/// document only Recover Text (#633), a project none. The one rule
+/// `open_path` (for its reopen check) and `tab_from_path_mode` both use.
+fn effective_mode(path: &std::path::Path, mode: OpenMode) -> OpenMode {
+    match (is_project_path(path), is_sheet_path(path), mode) {
+        (true, _, _) => OpenMode::Normal,
+        (false, true, OpenMode::RecoverText) => OpenMode::Normal,
+        (false, true, mode) => mode,
+        (false, false, OpenMode::RecoverText) => OpenMode::RecoverText,
+        (false, false, _) => OpenMode::Normal,
+    }
+}
+
+/// A document tab for `path` opened in `mode`: Recover Text from Any File
+/// (#633) opens its recovered text; every other mode opens it as usual. A
+/// downloaded document opens in Protected View, as a workbook does (#610),
+/// unless `trusted` holds it as it is now (#882).
+fn doc_tab_from_path_mode(
+    path: &std::path::Path,
+    mode: OpenMode,
+    trusted: &trusted::TrustStore,
+) -> DocTab {
+    let protected = open_mode::is_protected_zone(open_mode::zone_id(path))
+        && !trusted.is_trusted(path, trusted::Stamp::of(path));
+    // Taken before the load, as for a workbook.
+    let stamp = protected.then(|| trusted::Stamp::of(path)).flatten();
+    let converted = (mode == OpenMode::RecoverText).then_some(open_mode::Converted::RecoveredText);
+    let title: SharedString = file_name(path).into();
+    let mut tab = load_doc_for_tab(path, converted).into_tab(
+        Kind::Docx,
+        title,
+        Some(path.to_path_buf()),
+        false,
+    );
+    tab.access.protected = protected;
+    tab.access.stamp = stamp;
+    tab
+}
+
+/// [`tab_from_path`] in an open mode (#610). A workbook takes every mode but
+/// Recover Text, a document only Recover Text (#633); a project opens as
+/// usual. Protected View comes from the source file's
 /// zone, so Open as Copy of a downloaded file is protected too, unless
 /// `trusted` holds the source as it is now (#882). `Err` only when the copy
 /// could not be written; a failed load is still a tab, whose status says why.
@@ -4547,8 +4823,12 @@ fn tab_from_path_mode(
     mode: OpenMode,
     trusted: &trusted::TrustStore,
 ) -> Result<DocTab, String> {
-    if is_project_path(path) || !is_sheet_path(path) {
+    let mode = effective_mode(path, mode);
+    if is_project_path(path) {
         return Ok(tab_from_path(path));
+    }
+    if !is_sheet_path(path) {
+        return Ok(doc_tab_from_path_mode(path, mode, trusted));
     }
     let protected = open_mode::is_protected_zone(open_mode::zone_id(path))
         && !trusted.is_trusted(path, trusted::Stamp::of(path));
@@ -7110,6 +7390,33 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
 /// stays in its model there, but it cannot be saved: every save is refused
 /// first. Either way both stacks are forgotten and the tab stays clean.
 fn protected_rollback(tab: &mut DocTab) {
+    // A document (#633) is restored as it was opened: converted or plain.
+    if matches!(tab.surface, Surface::Doc(_)) {
+        // A converted tab restores the document it was converted to, never
+        // converting again (no child process inside a frame).
+        let reloaded = match (tab.access.converted, tab.converted_docx.clone()) {
+            (Some(kind), Some(docx)) => Some(loaded_from_converted_docx(docx.to_vec(), kind)),
+            // Still a placeholder: nothing to roll back.
+            (Some(_), None) if tab.pending_conversion => None,
+            // Converted once but no bytes kept (its file no longer converted
+            // when it was finished): reloaded, never converted.
+            (Some(_), None) | (None, _) => tab.path.clone().map(|p| reload_without_converting(&p)),
+        };
+        if let Some(l) = reloaded {
+            tab.surface = Surface::Doc(Editor::new(l.doc));
+            tab.comments = l.comments;
+            tab.notes = l.notes;
+            tab.mail = mailings_tab::MailState::from_pkg(l.pkg.as_ref());
+            tab.pkg = l.pkg;
+            tab.markdown = l.markdown;
+            tab.bundle_html = l.bundle_html;
+            tab.load_failed = l.load_failed;
+        }
+        tab.hf_edit = None;
+        tab.dirty = false;
+        tab.status = open_mode::PROTECTED_STATUS.into();
+        return;
+    }
     let reloaded = tab
         .path
         .as_ref()
@@ -7290,6 +7597,19 @@ fn autorecover_prepare(tabs: &mut [DocTab]) -> bool {
 /// Serialize a document to `.docx` bytes, adding a numbering part when it uses
 /// lists (so markers survive the round-trip and open correctly in Word).
 fn doc_to_docx(doc: &Document, comments: &[Comment], base: Option<&Package>) -> Vec<u8> {
+    doc_to_docx_styled(doc, comments, base, false)
+}
+
+/// [`doc_to_docx`] for a document converted from another format (#633)
+/// when `converted`: with no package of its own, it is written into the
+/// Markdown package, which defines the heading styles and lists the
+/// importers use, so they survive the save.
+fn doc_to_docx_styled(
+    doc: &Document,
+    comments: &[Comment],
+    base: Option<&Package>,
+    converted: bool,
+) -> Vec<u8> {
     use std::collections::HashSet;
     // With the original package in hand, re-serialize just document.xml back into
     // it — every other part (footnotes, headers/footers, images, themes, …) is
@@ -7305,7 +7625,7 @@ fn doc_to_docx(doc: &Document, comments: &[Comment], base: Option<&Package>) -> 
                 .body
                 .iter()
                 .any(|b| matches!(b, Block::Paragraph(p) if p.props.num_id.is_some()));
-            if has_list {
+            if has_list || converted {
                 docxcore::package::new_markdown_package(doc.clone())
             } else {
                 docxcore::package::new_package(doc.clone())
@@ -7370,7 +7690,22 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
     let hot = t.hot.as_ref().map(PathBuf::from).filter(|p| p.exists());
     let mut tab = match (t.kind, &hot) {
         (Kind::Docx, Some(hp)) => {
-            let mut l = doc_from_path(hp);
+            // The sidecar is always a .docx this app wrote: loaded strictly,
+            // never sniffed or recovered (#633), so a damaged one is
+            // unreadable and the tab reopens its file below, rather than
+            // showing whatever text Recover Text could read from it.
+            let mut l = match std::fs::read(hp) {
+                Ok(bytes) => {
+                    let mut l = load_bytes(&bytes);
+                    // A converted tab's sidecar is what it shows: what a
+                    // rollback restores (never converting the file again).
+                    if t.converted.is_some() && !l.load_failed {
+                        l.converted_docx = Some(std::rc::Rc::new(bytes));
+                    }
+                    l
+                }
+                Err(e) => Loaded::empty(format!("read error: {e}")),
+            };
             // A 0-byte sidecar is a truncated write, not an empty document:
             // the user-file rule that opens one as new must not apply here.
             let unreadable = l.load_failed || std::fs::metadata(hp).is_ok_and(|m| m.len() == 0);
@@ -7382,11 +7717,17 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 // protect.
                 match &path {
                     Some(p) => {
-                        let mut fresh = doc_from_path(p);
-                        if !fresh.load_failed {
+                        // A converted one is converted when it is opened.
+                        let mut fresh = match t.converted {
+                            Some(kind) => pending_conversion(kind),
+                            None => load_doc_for_tab(p, None),
+                        };
+                        if !fresh.load_failed && t.converted.is_none() {
                             fresh.status = "loaded — the restored copy could not be read, so the file was reopened from disk".into();
                         }
-                        fresh.into_tab(t.kind, t.title.clone().into(), path, false)
+                        let mut tab = fresh.into_tab(t.kind, t.title.clone().into(), path, false);
+                        tab.pending_conversion = t.converted.is_some();
+                        tab
                     }
                     None => {
                         l.load_failed = false;
@@ -7411,9 +7752,15 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                                 is_markdown_path(p) && p.exists() && doc_from_path(p).load_failed
                             })
                     }
-                    None => path
-                        .as_ref()
-                        .is_some_and(|p| p.exists() && doc_from_path(p).load_failed),
+                    // A file that now opens converted (a damaged .docx an
+                    // older build could not load, #633) is still not one
+                    // its placeholder may be written over.
+                    None => path.as_ref().is_some_and(|p| {
+                        p.exists() && {
+                            let fresh = doc_from_path(p);
+                            fresh.load_failed || fresh.converted.is_some()
+                        }
+                    }),
                 };
                 // A load-failed tab's sidecar holds only the placeholder.
                 from_hot = !l.load_failed;
@@ -7457,16 +7804,28 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 dialogs: crate::dialog::DialogStack::default(),
                 access: crate::open_mode::Access::default(),
                 last_hot: Default::default(),
+                converted_docx: None,
+                pending_conversion: false,
                 mail: Default::default(),
                 import: Default::default(),
             }
         }
         // A document with no sidecar reloads its file, bundle included; the
         // fresh load alone says whether it failed.
-        (Kind::Docx, None) if path.is_some() => {
-            let l = doc_from_path(path.as_ref().unwrap());
-            l.into_tab(t.kind, t.title.clone().into(), path, t.dirty)
-        }
+        // A converted one is converted when its tab is first in front, so a
+        // startup does not wait on every converted tab's file.
+        (Kind::Docx, None) if path.is_some() => match t.converted {
+            Some(kind) => {
+                let mut tab =
+                    pending_conversion(kind).into_tab(t.kind, t.title.clone().into(), path, false);
+                tab.pending_conversion = true;
+                tab
+            }
+            None => {
+                let l = load_doc_for_tab(path.as_ref().unwrap(), None);
+                l.into_tab(t.kind, t.title.clone().into(), path, t.dirty)
+            }
+        },
         _ => {
             let (surface, comments, notes, pkg, status) = build_surface(t.kind, path.as_ref());
             let markdown = path.as_deref().map(is_markdown_path).unwrap_or(false);
@@ -7489,6 +7848,8 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 dialogs: crate::dialog::DialogStack::default(),
                 access: crate::open_mode::Access::default(),
                 last_hot: Default::default(),
+                converted_docx: None,
+                pending_conversion: false,
             }
         }
     };
@@ -7500,14 +7861,18 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
         tab.import.binary_source |= t.binary_source;
         tab.import.compat |= t.compat;
     }
-    if t.kind == Kind::Xlsx {
-        // A repaired tab with no readable sidecar reopens its damaged file
-        // the way it was opened, or the strict load would refuse it.
-        if t.repaired && !from_hot && matches!(tab.surface, Surface::Placeholder) {
-            if let Some(p) = tab.path.clone() {
-                (tab.surface, tab.status) = sheet_from_path_mode(&p, true);
-            }
+    // A repaired tab with no readable sidecar reopens its damaged file
+    // the way it was opened, or the strict load would refuse it.
+    if t.kind == Kind::Xlsx
+        && t.repaired
+        && !from_hot
+        && matches!(tab.surface, Surface::Placeholder)
+    {
+        if let Some(p) = tab.path.clone() {
+            (tab.surface, tab.status) = sheet_from_path_mode(&p, true);
         }
+    }
+    if matches!(t.kind, Kind::Xlsx | Kind::Docx) {
         // The tab shows its sidecar, the content opened with `t.stamp`, so
         // protection drops only when the file is still that one and it is
         // trusted. A tab with no persisted stamp stays protected.
@@ -7521,6 +7886,9 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
             protected,
             repaired: t.repaired,
             stamp: t.stamp.filter(|_| protected),
+            // A sidecar loads as a plain .docx; the session says what it was
+            // converted from, and a fresh load of the file says so too.
+            converted: t.converted.or(tab.access.converted),
         };
     }
     (tab, from_hot)
@@ -7562,9 +7930,13 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
     // spreadsheets → .xlsx, projects → .yppx; restored in preference to `path`.
     // Missing or unreadable project sidecars use restore_project_tab's recovery policy.
     let hot = match &t.surface {
+        // A converted tab not converted yet shows a placeholder, not its
+        // document: no sidecar, so the next start converts it again.
+        Surface::Doc(_) if t.pending_conversion => None,
         Surface::Doc(ed) => {
             let p = hd.join(format!("tab-{i}.docx"));
-            opccore::fsio::write_atomic(&p, &doc_to_docx(&ed.doc, &t.comments, t.pkg.as_ref()))
+            let bytes = doc_to_docx(&ed.doc, &t.comments, t.pkg.as_ref());
+            opccore::fsio::write_atomic(&p, &bytes)
                 .ok()
                 .map(|_| p.display().to_string())
         }
@@ -7601,6 +7973,7 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
         protected: t.access.protected,
         repaired: t.access.repaired,
         stamp: t.access.stamp,
+        converted: t.access.converted,
         binary_source: t.import.binary_source,
         compat: t.import.compat,
     }
@@ -8066,6 +8439,8 @@ impl Docxy {
             dialogs: crate::dialog::DialogStack::default(),
             access: crate::open_mode::Access::default(),
             last_hot: Default::default(),
+            converted_docx: None,
+            pending_conversion: false,
             mail: Default::default(),
             import: Default::default(),
         };
@@ -13603,6 +13978,9 @@ impl Docxy {
         self.close_menu();
         if i < self.tabs.len() {
             self.active = i;
+            // A converted tab restored from the session converts as it comes
+            // in front, before any input can reach its placeholder (#633).
+            finish_pending_conversion(&mut self.tabs[i]);
             self.tab_more_open = false;
             self.bs_info_status = None;
             // Same reason as `select_sheet`: these all index the document we
@@ -13653,6 +14031,10 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Editing a header or footer is editing the document (#633).
+        if self.protected_refused(cx) {
+            return self.refocus(window, cx);
+        }
         let idx = self.active;
         let Some(tab) = self.tabs.get_mut(idx) else {
             return;
@@ -13704,7 +14086,7 @@ fn toggle_title_pg_tab(tab: &mut DocTab) -> bool {
     ed.edit_sections(&[section], |raw| {
         docxcore::sect::set_flag(raw, "w:titlePg", on)
     });
-    tab.dirty = true;
+    tab.mark_dirty();
     on
 }
 
@@ -13724,7 +14106,7 @@ fn set_page_margins_tab(
     {
         return false;
     }
-    tab.dirty = true;
+    tab.mark_dirty();
     final_sect_pr(tab).map(str::to_owned) != before
 }
 
@@ -13746,7 +14128,7 @@ fn flush_hf_tab(tab: &mut DocTab) {
         return;
     }
     hf_tab::rewrite_part(pkg, &hf.part_name, hf.is_header, &inner);
-    tab.dirty = true;
+    tab.mark_dirty();
 }
 
 /// The part of a print-layout page a double-click lands in.
@@ -13773,24 +14155,57 @@ fn canonical(path: &std::path::Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.into())
 }
 
+/// The name Save As suggests for a document tab: [`doc_import::save_name`]
+/// (its title, or an imported Word 97-2003 document's `.docx`), or for a tab
+/// converted from another format (#633) the same name as a Word document.
+fn doc_save_as_name(tab: &DocTab) -> String {
+    if tab.access.converted.is_none() {
+        return doc_import::save_name(tab);
+    }
+    let title = tab.title.to_string();
+    let stem = std::path::Path::new(&title)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or(title);
+    format!("{stem}.docx")
+}
+
+/// Whether a document may be saved as `path` (#633): the bytes written are
+/// Word, Markdown or an editable-HTML page, so only those names.
+fn doc_target_allowed(path: &std::path::Path) -> bool {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(
+        ext.as_str(),
+        "docx" | "docm" | "md" | "markdown" | "mdown" | "htm" | "html"
+    )
+}
+
 /// What a Save onto the file a tab could not load says (#209).
 const DOC_LOAD_FAILED_SAVE: &str = "this file could not be opened; use Save As to save a new copy";
 
+/// Whether a save to `target` would write the tab's own file: in place
+/// (`target` `None`), or a Save As that picks that same file (compared
+/// canonically, falling back to the paths as given when either cannot be
+/// resolved). A tab with no file of its own writes it only in place.
+fn writes_own_file(own: Option<&std::path::Path>, target: Option<&std::path::Path>) -> bool {
+    match (own, target) {
+        (_, None) => true,
+        (Some(own), Some(target)) => own == target || canonical(own) == canonical(target),
+        (None, Some(_)) => false,
+    }
+}
+
 /// Whether a save must be refused because it would write a load-failed tab's
-/// placeholder over the file it could not load: in place (`target` `None`),
-/// or a Save As that picks that same file (compared canonically, falling back
-/// to the paths as given when either cannot be resolved).
+/// placeholder over the file it could not load ([`writes_own_file`]).
 fn refuses_load_failed_save(
     load_failed: bool,
     own: Option<&std::path::Path>,
     target: Option<&std::path::Path>,
 ) -> bool {
-    load_failed
-        && match (own, target) {
-            (_, None) => true,
-            (Some(own), Some(target)) => own == target || canonical(own) == canonical(target),
-            (None, Some(_)) => false,
-        }
+    load_failed && writes_own_file(own, target)
 }
 
 /// Write a document tab to `target` (Save As, or the first save of a
@@ -13805,10 +14220,33 @@ fn refuses_load_failed_save(
 ///
 /// A tab whose file failed to load never writes back to that file: its content
 /// is a placeholder, not the document (#209).
+///
+/// Every document save ends here, so this is the last word (#633): a tab in
+/// Protected View writes nothing; a converted tab (RTF, Web Page, PDF,
+/// recovered text) never writes over its source, in place or by Save As;
+/// and Save As writes only to a Word, Markdown or HTML name, since the bytes
+/// are one of those.
 fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
     let Surface::Doc(editor) = &tab.surface else {
         return false;
     };
+    if tab.pending_conversion {
+        tab.status = "this document has not been converted yet: open its tab first".into();
+        return false;
+    }
+    if tab.access.protected {
+        tab.status = open_mode::PROTECTED_STATUS.into();
+        return false;
+    }
+    if tab.access.converted.is_some() && writes_own_file(tab.path.as_deref(), target.as_deref()) {
+        let name = tab
+            .path
+            .as_deref()
+            .map(file_name)
+            .unwrap_or_else(|| tab.title.to_string());
+        tab.status = open_mode::converted_refusal(&name).into();
+        return false;
+    }
     if refuses_load_failed_save(tab.load_failed, tab.path.as_deref(), target.as_deref()) {
         tab.status = DOC_LOAD_FAILED_SAVE.into();
         return false;
@@ -13817,6 +14255,14 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
     // imported from (#634): those bytes would be a .docx under its name.
     if let Some(refusal) = doc_import::save_refusal(tab, target.as_deref()) {
         tab.status = refusal.into();
+        return false;
+    }
+    if let Some(t) = target.as_deref().filter(|t| !doc_target_allowed(t)) {
+        tab.status = format!(
+            "cannot save a document as \"{}\": save it as .docx, .docm, .md or .html",
+            file_name(t)
+        )
+        .into();
         return false;
     }
     let (path, markdown) = match target {
@@ -13838,14 +14284,19 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
     // bundle the tab holds (or become a new one), everything else is lossless
     // .docx.
     let kind = html_bundle::doc_target(&path, markdown);
+    // A converted tab has the package its conversion wrote (#633), so it
+    // saves into it like any other Word document.
+    let docx = || doc_to_docx(&editor.doc, &tab.comments, tab.pkg.as_ref());
+    // The Word package written, alone or inside a page.
+    let mut package: Option<Vec<u8>> = None;
     let bytes = match kind {
         // Without a mail-merge preview: the record is display only.
         html_bundle::DocTarget::Markdown => {
             docxcore::markdown::to_markdown(&editor.export_doc()).into_bytes()
         }
-        html_bundle::DocTarget::Docx => doc_to_docx(&editor.doc, &tab.comments, tab.pkg.as_ref()),
+        html_bundle::DocTarget::Docx => package.insert(docx()).clone(),
         html_bundle::DocTarget::Html => {
-            let docx = doc_to_docx(&editor.doc, &tab.comments, tab.pkg.as_ref());
+            let docx = package.insert(docx()).clone();
             match html_bundle::bundle_bytes(&path, tab.bundle_html.as_deref(), &docx) {
                 Ok(page) => page.into_bytes(),
                 Err(e) => {
@@ -13863,6 +14314,12 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
             tab.path = Some(path);
             tab.dirty = false;
             tab.load_failed = false;
+            // A converted tab is now that Word document (#633): the package
+            // just written, with the styles it defines, is what later saves
+            // keep, and Save writes in place again.
+            if tab.access.converted.take().is_some() {
+                tab.pkg = package.and_then(|p| docxcore::package::load_package(&p).ok());
+            }
             // The tab's file is now the one just written, not the binary
             // original; Compatibility Mode stays until Convert (#634).
             tab.import.binary_source = false;
@@ -13967,13 +14424,19 @@ impl Docxy {
         // workbook, instead of writing `<cwd>/<title>` over whatever is there.
         // The picked path is saved to like Save As: the tab is rebound only
         // once that write succeeds.
+        // A converted tab (#633) never writes its source: Save is Save As.
+        let path = tab
+            .path
+            .as_deref()
+            .filter(|_| !tab.access.save_needs_dialog());
         let target = match target {
             Some(target) => Some(target),
-            None => match doc_save_target(
-                tab.path.as_deref(),
-                tab.import.binary_source,
-                self.harness.is_some(),
-            ) {
+            None if tab.path.is_some() && path.is_none() && self.harness.is_some() => {
+                self.tabs[self.active].status = DOC_CONVERTED_HARNESS.into();
+                self.refocus(window, cx);
+                return false;
+            }
+            None => match doc_save_target(path, tab.import.binary_source, self.harness.is_some()) {
                 DocSaveTarget::InPlace => None,
                 // ⚠️ Never in a harness instance: `rfd` runs its own modal loop on
                 // this thread and stops the control pump dead (see `save_sheet_tab`).
@@ -14112,7 +14575,7 @@ impl Docxy {
         let start = self
             .tabs
             .get(self.active)
-            .map(doc_import::save_name)
+            .map(doc_save_as_name)
             .unwrap_or_else(|| "Untitled.docx".into());
         let mut dialog = rfd::FileDialog::new()
             .add_filter("Word document", &["docx"])
@@ -14142,6 +14605,8 @@ impl Docxy {
             .add_filter("All supported", &OPEN_EXTENSIONS)
             .add_filter("Project schedule", &["yppx", "xml", "mpp"])
             .add_filter("Word or Markdown", &["docx", "md", "markdown"])
+            // Opened converted (#633); Save writes a Word document.
+            .add_filter("Rich Text, Web Page or PDF", &["rtf", "htm", "html", "pdf"])
             .add_filter("Word 97-2003 Document", &["doc"])
             .add_filter("Editable HTML (*.docx.html)", &["html"])
             .add_filter("Excel workbook", &SHEET_EXTENSIONS)
@@ -14159,11 +14624,13 @@ impl Docxy {
 
     /// The backstage's Open Read-Only…, Open as Copy… and Open and Repair…
     /// (#610): the same pick as Open…, for workbooks only, then the mode.
+    /// Recover Text from Any File… (#633) picks any file.
     fn open_file_mode(&mut self, mode: OpenMode, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Excel workbook", &SHEET_EXTENSIONS)
-            .pick_file()
-        {
+        let dialog = match mode {
+            OpenMode::RecoverText => rfd::FileDialog::new().add_filter("All files", &["*"]),
+            _ => rfd::FileDialog::new().add_filter("Excel workbook", &SHEET_EXTENSIONS),
+        };
+        if let Some(path) = dialog.pick_file() {
             self.open_picked(&path, mode);
         }
         self.backstage = false;
@@ -14204,11 +14671,8 @@ impl Docxy {
     ) -> Result<bool, String> {
         self.project_prompt_cancel();
         let path = path.to_path_buf();
-        let mode = if is_sheet_path(&path) && !is_project_path(&path) {
-            mode
-        } else {
-            OpenMode::Normal
-        };
+        // A workbook takes Excel's modes, a document Recover Text (#633).
+        let mode = effective_mode(&path, mode);
         let open = (mode != OpenMode::Copy)
             .then(|| {
                 let key = canonical(&path);
@@ -14357,16 +14821,21 @@ impl Docxy {
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut Editor),
     ) {
+        // Every ribbon edit, ruler drag and paste comes here: Protected View
+        // (#633) refuses it before it touches the document.
+        if self.protected_refused(cx) {
+            return self.refocus(window, cx);
+        }
         if let Some(tab) = self.tabs.get_mut(self.active) {
             // Route to the header/footer editor while it's open, else the body.
             if let Some(hf) = tab.hf_edit.as_mut() {
                 f(&mut hf.editor);
-                tab.dirty = true;
+                tab.mark_dirty();
             } else if let Surface::Doc(ed) = &mut tab.surface {
                 f(ed);
                 // A merge field the edit added shows the previewed record too.
                 ed.refresh_merge_preview();
-                tab.dirty = true;
+                tab.mark_dirty();
             }
         }
         self.refocus(window, cx);
@@ -14375,6 +14844,10 @@ impl Docxy {
     /// Copy (or cut) the selection into the document clip and, as plain text,
     /// the system clipboard (#755).
     fn do_copy(&mut self, cut: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // Copy only looks; cut would edit (#633).
+        if cut && self.protected_refused(cx) {
+            return self.refocus(window, cx);
+        }
         let clip = self
             .edit_target()
             .and_then(|ed| if cut { ed.cut() } else { ed.copy() });
@@ -14383,7 +14856,7 @@ impl Docxy {
             self.clip = Some(DocClip { clip, text });
             if cut {
                 if let Some(t) = self.tabs.get_mut(self.active) {
-                    t.dirty = true;
+                    t.mark_dirty();
                 }
             }
         }
@@ -14393,6 +14866,9 @@ impl Docxy {
     /// Paste at the caret: the document clip while it is still what the
     /// clipboard holds (formatting intact), else the clipboard's text.
     fn do_paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return self.refocus(window, cx);
+        }
         let now = self.clipboard_read(cx);
         let clip = match self.clip.as_ref() {
             Some(ours) if clip_still_ours(&ours.text, &now) => Some(ours.clip.clone()),
@@ -14456,6 +14932,10 @@ impl Docxy {
     /// Replace the current match, if it is editable and still selected, and
     /// advance to the next; a read-only match is skipped.
     fn replace_one(&mut self, cx: &mut Context<Self>) {
+        // Find looks; Replace would edit (#633).
+        if self.protected_refused(cx) {
+            return;
+        }
         let with = self.replace_text.clone();
         let q = self.find_query.clone();
         let cs = self.find_case;
@@ -14468,7 +14948,7 @@ impl Docxy {
         }
         if let Some(t) = self.tabs.get_mut(self.active) {
             match outcome {
-                Some(ReplaceOne::Replaced) => t.dirty = true,
+                Some(ReplaceOne::Replaced) => t.mark_dirty(),
                 Some(ReplaceOne::ReadOnly) => t.status = "read-only match skipped".into(),
                 _ => {}
             }
@@ -14478,6 +14958,9 @@ impl Docxy {
 
     /// Replace every editable match; report the count in the status line.
     fn replace_all_now(&mut self, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return;
+        }
         let with = self.replace_text.clone();
         let q = self.find_query.clone();
         let cs = self.find_case;
@@ -14488,7 +14971,7 @@ impl Docxy {
         self.find_cur = None;
         if let Some(t) = self.tabs.get_mut(self.active) {
             if n > 0 {
-                t.dirty = true;
+                t.mark_dirty();
             }
             if read_only > 0 {
                 t.status = format!("replaced {n}; {read_only} read-only match(es) skipped").into();
@@ -14674,7 +15157,7 @@ impl Docxy {
             .map(|ed| ed.insert_table(rows, cols, fit));
         if let Some(t) = self.tabs.get_mut(self.active) {
             match result {
-                Some(Ok(())) => t.dirty = true,
+                Some(Ok(())) => t.mark_dirty(),
                 Some(Err(e)) => t.status = e.into(),
                 None => {}
             }
@@ -14927,6 +15410,9 @@ impl Docxy {
 
     /// Begin a new comment on the current selection (opens the comment entry bar).
     fn start_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return self.refocus(window, cx);
+        }
         let has_sel = matches!(self.tabs.get(self.active).map(|t| &t.surface), Some(Surface::Doc(ed)) if ed.has_selection());
         if !has_sel {
             if let Some(t) = self.tabs.get_mut(self.active) {
@@ -14966,7 +15452,7 @@ impl Docxy {
                     text,
                     quoted,
                 });
-                t.dirty = true;
+                t.mark_dirty();
                 t.status = format!("Comment {id} added").into();
             }
         }
@@ -15004,6 +15490,9 @@ impl Docxy {
 
     /// Begin dragging a ruler marker.
     fn ruler_drag_start(&mut self, handle: RulerHandle, x: f32, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return;
+        }
         let Some(g) = self.ruler_probe.borrow().painted.clone() else {
             return;
         };
@@ -15434,12 +15923,15 @@ impl Docxy {
 
     /// Delete a comment: strip its markers from the body and drop it from the list.
     fn delete_comment(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.protected_refused(cx) {
+            return self.refocus(window, cx);
+        }
         if let Some(t) = self.tabs.get_mut(self.active) {
             if let Surface::Doc(ed) = &mut t.surface {
                 ed.remove_comment_markers(&id);
             }
             t.comments.retain(|c| c.id != id);
-            t.dirty = true;
+            t.mark_dirty();
         }
         self.refocus(window, cx);
     }
@@ -15994,6 +16486,15 @@ impl Docxy {
         if !ed.in_table() {
             return false;
         }
+        // Moving between cells only looks; Tab in the last cell adds a row,
+        // which Protected View refuses (#633).
+        if !back && ed.table_tab_adds_row() && self.protected_refused(cx) {
+            self.refocus(window, cx);
+            return true;
+        }
+        let Some(ed) = self.edit_target() else {
+            return false;
+        };
         let edited = if back {
             ed.table_prev_cell();
             false
@@ -16004,7 +16505,7 @@ impl Docxy {
         };
         if edited {
             if let Some(t) = self.tabs.get_mut(self.active) {
-                t.dirty = true;
+                t.mark_dirty();
             }
         }
         self.scroll_to_caret();
@@ -16143,6 +16644,16 @@ impl Docxy {
         if key == "escape" && self.hf_active() {
             return self.exit_hf(window, cx);
         }
+        // Protected View (#633): only keys that look, move or copy reach the
+        // document. The find bar still takes typing; its Replace is refused
+        // where it would write.
+        if self.protected_view()
+            && !self.find_open
+            && !open_mode::protected_allows_doc_key(key.as_str(), ctrl, m.alt)
+        {
+            self.protected_refused(cx);
+            return;
+        }
         // Ctrl+F toggles the find bar; while it's open, all keys go to it.
         if ctrl && key == "f" {
             return self.toggle_find(window, cx);
@@ -16251,7 +16762,7 @@ impl Docxy {
         };
         if changed {
             if let Some(t) = self.tabs.get_mut(self.active) {
-                t.dirty = true;
+                t.mark_dirty();
             }
         }
         self.scroll_to_caret();
@@ -16261,6 +16772,10 @@ impl Docxy {
 
 /// What a harness instance says when asked to Save As a document.
 const DOC_SAVE_AS_HARNESS: &str = "This document needs Save As, and a harness instance cannot open the Save As dialog; use the harness save-as verb";
+
+/// What a harness instance says when Save of a converted document (#633)
+/// needs the Save As dialog.
+const DOC_CONVERTED_HARNESS: &str = "This document was converted from another format, so Save needs Save As, and a harness instance cannot open the Save As dialog; use the harness save-as verb";
 
 /// Where a document Save As goes: always the dialog, which a harness instance
 /// must not open.
@@ -17307,12 +17822,26 @@ mod load_failed_save_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A plain page is not a bundle: since #633 it opens converted from HTML
+    /// rather than failing, and is still never written over, in place or by
+    /// Save As onto it.
     #[test]
-    fn a_plain_html_page_opened_as_a_document_is_refused() {
+    fn a_plain_html_page_opens_converted_and_is_never_overwritten() {
         let dir = temp("plain-html");
         let path = dir.join("broken.docx.html");
         std::fs::write(&path, "<html>mine</html>").unwrap();
-        refused_in_place(&path);
+        let mut tab = tab_from_path(&path);
+        assert!(!tab.load_failed, "{}", tab.status);
+        assert_eq!(tab.access.converted, Some(open_mode::Converted::Html));
+        tab.dirty = true;
+        for target in [None, Some(path.clone())] {
+            assert!(!save_doc_tab(&mut tab, target));
+            assert_eq!(
+                tab.status.as_ref(),
+                open_mode::converted_refusal("broken.docx.html")
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"<html>mine</html>");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -17426,6 +17955,8 @@ mod sheet_save_tests {
             dialogs: crate::dialog::DialogStack::default(),
             access: crate::open_mode::Access::default(),
             last_hot: Default::default(),
+            converted_docx: None,
+            pending_conversion: false,
             mail: Default::default(),
             import: Default::default(),
         }
@@ -21383,6 +21914,11 @@ impl Docxy {
         use Act::*;
         // A command run from anywhere ends an open menu's moment (#397).
         self.close_menu();
+        // Protected View (#633): the ribbon is hidden, but shortcuts, KeyTips,
+        // context menus and the harness's `ribbon-click` still come here.
+        if !protected_view_allows_doc_act(act) && self.protected_refused(cx) {
+            return self.refocus(window, cx);
+        }
         match act {
             Project(p) => self.project_act(p, window, cx),
             Cut => self.do_copy(true, window, cx),
@@ -23912,12 +24448,18 @@ impl Docxy {
                         .child("Open"),
                 )
                 // Excel's other ways to open a workbook (#610), beside the
-                // rail's Open…: each picks a workbook, then opens it so.
-                .child(h_flex().gap_2().children(
+                // rail's Open…: each picks a workbook, then opens it so; and
+                // Word's Recover Text from Any File (#633), for any file.
+                .child(h_flex().gap_2().flex_wrap().children(
                     [
                         ("bs-open-readonly", "Open Read-Only…", OpenMode::ReadOnly),
                         ("bs-open-copy", "Open as Copy…", OpenMode::Copy),
                         ("bs-open-repair", "Open and Repair…", OpenMode::Repair),
+                        (
+                            "bs-recover-text",
+                            "Recover Text from Any File…",
+                            OpenMode::RecoverText,
+                        ),
                     ]
                     .map(|(id, label, mode)| {
                         div()
@@ -24288,6 +24830,20 @@ impl Render for Docxy {
         // record itself again.
         self.frame = self.frame.wrapping_add(1);
         self.schedule_project_passes(window, cx);
+        // Protected View's last backstop (#633): an edit that reached a
+        // protected document by a way no gate or `mark_dirty` covers (one of
+        // the tab's other modules) is rolled back before it is ever drawn,
+        // saved or written to the hot-exit sidecar as unsaved work.
+        for t in self.tabs.iter_mut() {
+            if t.access.protected && t.dirty {
+                protected_rollback(t);
+            }
+        }
+        // A converted tab restored from the session converts when it is
+        // first in front (#633): at most one conversion per tab switch.
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            finish_pending_conversion(t);
+        }
         {
             let mut p = self.probes.borrow_mut();
             p.last = std::mem::take(&mut p.next);
@@ -24653,9 +25209,9 @@ impl Render for Docxy {
         );
         let vw = f32::from(window.viewport_size().width);
         let ribbon_tabs = self.ribbon_tabs(fg, dim, panel, cx);
-        // Protected View (#610) hides the ribbon's commands, as Excel greys
-        // them out; its message bar takes their place.
-        let protected = self.active_is_sheet() && self.protected_view();
+        // Protected View (#610, documents #633) hides the ribbon's commands,
+        // as Excel and Word grey them out; its message bar takes their place.
+        let protected = (self.active_is_sheet() || is_doc) && self.protected_view();
         let ribbon_body = (!self.ribbon_min
             && !protected
             && (is_doc || self.active_is_sheet() || self.active_is_project()))
@@ -28627,6 +29183,10 @@ fn quit_mode() -> QuitMode {
 }
 
 fn main() {
+    // A converting child (#633): the importer and nothing else, no window.
+    if let Some(code) = convert_child::child_main(&std::env::args_os().collect::<Vec<_>>()) {
+        std::process::exit(code);
+    }
     // First, before anything can panic: the release build has no console, so
     // a panic's only trace is the crash log (#733).
     crashlog::install(config_root());
