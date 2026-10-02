@@ -62,6 +62,12 @@ fn apply_dialog(
         DialogOwner::TextToColumns { .. } | DialogOwner::TextToColumnsReplace => {
             Err("Text to Columns applies through its own wizard".into())
         }
+        // Handled in `sheet_outline::click`, before this.
+        DialogOwner::Subtotal { .. }
+        | DialogOwner::OutlineSettings
+        | DialogOwner::OutlineAxis { .. } => {
+            Err("an outline dialog applies through the Data tab".into())
+        }
         // Handled in `reopen_click`, before this: Yes replaces the whole tab.
         DialogOwner::Reopen { .. } => Err("reopening replaces the tab".into()),
         // Handled in `mailings_dialogs::click`, before this: they act on the
@@ -133,6 +139,10 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Result<(), String>
     flush_level_pass(tab);
     // Text to Columns asks its own question before it applies.
     if let Some(done) = crate::ttc_dialog::click(tab, button) {
+        return done;
+    }
+    // So do the outline dialogs (#693): Subtotal's OK and Remove All.
+    if let Some(done) = crate::sheet_outline::click(tab, button) {
         return done;
     }
     if let Some(done) = reopen_click(tab, button) {

@@ -1714,6 +1714,12 @@ fn parse_worksheet(
                     let min: u32 = p.attr("min").parse().unwrap_or(1);
                     let max: u32 = p.attr("max").parse().unwrap_or(min);
                     let width = p.attr("width").parse::<f64>().ok();
+                    // A width that is just the sheet's default, not marked
+                    // custom, is the default: it shows like its neighbours
+                    // and is written back as it was.
+                    let custom = matches!(p.attr("customWidth").trim(), "1" | "true");
+                    let default_width = !custom && width == Some(sheet.default_col_file_width());
+                    let width = if default_width { None } else { width };
                     let mut attrs = String::new();
                     for a in p.attrs() {
                         if !matches!(a.name, "min" | "max" | "width" | "customWidth") {
@@ -1729,6 +1735,7 @@ fn parse_worksheet(
                         max: max.saturating_sub(1),
                         width,
                         attrs,
+                        default_width,
                     });
                 }
                 "row" => {
@@ -2045,6 +2052,8 @@ fn parse_worksheet(
     cap_array_refs(&mut sheet);
     sheet.page_setup = page::read_page_setup(xml);
     sheet.page_setup_loaded = sheet.page_setup.clone();
+    sheet.outline = page::read_outline_pr(xml);
+    sheet.outline_loaded = sheet.outline;
     sheet
 }
 
@@ -3094,6 +3103,17 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
     parts
 }
 
+/// Raw leftover attributes ready to follow another attribute: the loader
+/// keeps a leading space, but strings built in code may lack one, and
+/// `r="1"hidden="1"` is not well-formed.
+fn attr_tail(attrs: &str) -> std::borrow::Cow<'_, str> {
+    if attrs.is_empty() || attrs.starts_with(char::is_whitespace) {
+        attrs.into()
+    } else {
+        format!(" {attrs}").into()
+    }
+}
+
 /// `<sheetData>` for one sheet: rows in order, preserved row attrs, cells
 /// with values/formulas/styles.
 fn sheet_data_xml(
@@ -3110,7 +3130,7 @@ fn sheet_data_xml(
     rows.dedup();
 
     for &row in &rows {
-        let attrs = sheet.row_attrs.get(&row).map(|s| s.as_str()).unwrap_or("");
+        let attrs = attr_tail(sheet.row_attrs.get(&row).map(|s| s.as_str()).unwrap_or(""));
         let cells: Vec<(&(u32, u32), &Cell)> =
             sheet.cells.range((row, 0)..=(row, u32::MAX)).collect();
         if cells.is_empty() {
@@ -3597,19 +3617,30 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
         }
     }
 
-    // <cols> — regenerate from the model when we have definitions.
-    if !sheet.col_defs.is_empty() {
+    // <cols> — regenerate from the model when we have definitions, and drop
+    // the element when the last one went (an ungrouped column's).
+    if sheet.col_defs.is_empty() {
+        if worksheet_child_span(&out, "cols").is_some() {
+            out = remove_worksheet_child(&out, "cols");
+        }
+    } else {
         let mut cols_xml = String::from("<cols>");
         for d in &sheet.col_defs {
+            // Excel reads a `<col>` with no width as zero wide: one created
+            // for an outline or a hide gets the sheet's default. One loaded
+            // without a width keeps its spelling.
             let width = match d.width {
                 Some(w) => format!(" width=\"{w}\" customWidth=\"1\""),
+                None if d.default_width => {
+                    format!(" width=\"{}\"", sheet.default_col_file_width())
+                }
                 None => String::new(),
             };
             cols_xml.push_str(&format!(
                 "<col min=\"{}\" max=\"{}\"{width}{}/>",
                 d.min + 1,
                 d.max + 1,
-                d.attrs
+                attr_tail(&d.attrs)
             ));
         }
         cols_xml.push_str("</cols>");
@@ -3629,6 +3660,15 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
     let out = set_page_breaks(out, "colBreaks", &sheet.col_breaks);
     // Page setup: only the attributes that changed since the load.
     let out = page::set_page_setup(&out, &sheet.page_setup, &sheet.page_setup_loaded);
+    // Outline: `outlinePr` only when its settings changed; the level
+    // summary in `sheetFormatPr` from the live rows and columns.
+    let out = page::set_outline_pr(&out, sheet.outline, sheet.outline_loaded);
+    let out = page::set_outline_levels(
+        &out,
+        sheet.max_row_outline(),
+        sheet.max_col_outline(),
+        sheet.format.default_row_height,
+    );
     // The sheet's autoFilter: rewritten only where a structural edit moved it.
     let out = set_auto_filter(out, sheet.auto_filter.as_ref());
     // Conditional formatting and data validation: likewise.
@@ -17201,6 +17241,245 @@ mod ct_worksheet_order_tests {
             }
         }
         assert!(checked > 0, "no corpus sheets checked");
+    }
+    /// An Excel-shaped outline: rows 2..=4 and 6..=7 nested in 2..=8 (row 4's
+    /// group collapsed), columns B..C grouped, summaries above.
+    const OUTLINED: &str = r#"<sheetPr><outlinePr summaryBelow="0" summaryRight="1"/></sheetPr><dimension ref="A1:D9"/><sheetFormatPr defaultRowHeight="15" outlineLevelRow="2" outlineLevelCol="1"/><cols><col min="2" max="3" width="9.140625" outlineLevel="1" collapsed="1"/></cols><sheetData><row r="1"><c r="A1"><v>1</v></c></row><row r="2" outlineLevel="1" collapsed="1"><c r="A2"><v>2</v></c></row><row r="3" hidden="1" outlineLevel="2"><c r="A3"><v>3</v></c></row><row r="4" hidden="1" outlineLevel="2"><c r="A4"><v>4</v></c></row><row r="5" outlineLevel="1"><c r="A5"><v>5</v></c></row><row r="6" outlineLevel="2"><c r="A6"><v>6</v></c></row><row r="7" outlineLevel="2"><c r="A7"><v>7</v></c></row><row r="8" outlineLevel="1"><c r="A8"><v>8</v></c></row></sheetData>"#;
+
+    #[test]
+    fn an_excel_outline_loads_and_round_trips() {
+        use crate::outline::{Axis, groups};
+        let pkg = loaded(&format!("{OUTLINED}{MARGINS}"));
+        let s = &pkg.workbook.sheets[0];
+        assert!(!s.outline.summary_below && s.outline.summary_right);
+        assert_eq!(
+            (0..9).map(|r| s.row_outline(r)).collect::<Vec<_>>(),
+            [0, 1, 2, 2, 1, 2, 2, 1, 0]
+        );
+        assert!(s.row_collapsed(1) && s.row_hidden(2));
+        assert_eq!(
+            (s.col_outline(1), s.col_outline(2), s.col_outline(3)),
+            (1, 1, 0)
+        );
+        assert!(s.col_collapsed(1));
+        // Summaries above: row 2 heads the inner group 3..=4.
+        let g = groups(s, Axis::Rows);
+        let inner = g.iter().find(|g| g.start == 2).unwrap();
+        assert_eq!((inner.summary, inner.collapsed), (Some(1), true));
+        // Untouched, the outline elements stay as they were.
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert!(
+            ws.contains(r#"<outlinePr summaryBelow="0" summaryRight="1"/>"#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(r#"outlineLevelRow="2" outlineLevelCol="1""#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(r#"outlineLevel="1" collapsed="1"/></cols>"#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(r#"<row r="2" outlineLevel="1" collapsed="1">"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn outline_settings_and_levels_are_written_back() {
+        let mut pkg = loaded(&format!("{OUTLINED}{MARGINS}"));
+        let s = &mut pkg.workbook.sheets[0];
+        s.outline.summary_below = true;
+        s.outline.summary_right = false;
+        crate::outline::group(s, crate::outline::Axis::Rows, 2, 3).unwrap(); // level 3
+        crate::outline::ungroup(s, crate::outline::Axis::Cols, 1, 2).unwrap();
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        // Patched in place: attribute order is the patcher's.
+        let pr = &ws[at(&ws, "<outlinePr")..];
+        let pr = &pr[..pr.find("/>").unwrap()];
+        assert!(
+            pr.contains(r#"summaryBelow="1""#) && pr.contains(r#"summaryRight="0""#),
+            "{ws}"
+        );
+        assert!(ws.contains(r#"outlineLevelRow="3""#), "{ws}");
+        assert!(!ws.contains("outlineLevelCol"), "level 0 is left out: {ws}");
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let s = &re.workbook.sheets[0];
+        assert!(s.outline.summary_below && !s.outline.summary_right);
+        assert_eq!(s.row_outline(2), 3);
+        assert_eq!(s.col_outline(1), 0);
+        assert!(!s.col_collapsed(1), "the flag went with the group");
+    }
+
+    #[test]
+    fn a_new_outline_adds_sheet_format_pr_and_outline_pr_in_place() {
+        // No sheetPr, no sheetFormatPr.
+        let mut pkg = loaded(&format!(r#"<dimension ref="A1:B2"/>{ROWS}{MARGINS}"#));
+        let s = &mut pkg.workbook.sheets[0];
+        crate::outline::group(s, crate::outline::Axis::Rows, 0, 1).unwrap();
+        crate::outline::group(s, crate::outline::Axis::Cols, 0, 0).unwrap();
+        s.outline.summary_below = false;
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert!(
+            ws.contains(
+                r#"<sheetFormatPr defaultRowHeight="15" outlineLevelRow="1" outlineLevelCol="1"/>"#
+            ),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(r#"<sheetPr><outlinePr summaryBelow="0" summaryRight="1"/></sheetPr>"#),
+            "{ws}"
+        );
+        // An existing sheetPr keeps tabColor first and pageSetUpPr last.
+        let mut pkg = loaded(&format!(
+            r#"<sheetPr><tabColor rgb="FFFF0000"/><pageSetUpPr fitToPage="1"/></sheetPr>{ROWS}{MARGINS}"#
+        ));
+        pkg.workbook.sheets[0].outline.summary_right = false;
+        let ws = saved_sheet(&pkg);
+        assert!(
+            ws.contains(r#"<tabColor rgb="FFFF0000"/><outlinePr summaryBelow="1" summaryRight="0"/><pageSetUpPr"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn clearing_the_outline_drops_the_level_attributes() {
+        let mut pkg = loaded(&format!("{OUTLINED}{MARGINS}"));
+        crate::outline::clear_outline(&mut pkg.workbook.sheets[0]).unwrap();
+        let ws = saved_sheet(&pkg);
+        assert!(
+            ws.contains(r#"<sheetFormatPr defaultRowHeight="15"/>"#),
+            "{ws}"
+        );
+        assert!(!ws.contains("outlineLevel"), "{ws}");
+        assert!(!ws.contains("collapsed"), "{ws}");
+    }
+
+    #[test]
+    fn an_untouched_outline_pr_is_kept_byte_for_byte() {
+        // oracle-basic.xlsx spells it with a space before `/>` and an empty
+        // pageSetUpPr; nothing about the outline changes, so neither do they.
+        let data = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../corpus/xlsx/oracle-basic.xlsx"
+        ))
+        .unwrap();
+        let pkg = load_xlsx(&data).unwrap();
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let ws = String::from_utf8(re.part(SHEET).unwrap().to_vec()).unwrap();
+        assert!(
+            ws.contains(r#"<sheetPr><outlinePr summaryBelow="1" summaryRight="1" /><pageSetUpPr /></sheetPr>"#),
+            "{ws}"
+        );
+        assert!(
+            ws.contains(r#"<sheetFormatPr baseColWidth="8" defaultRowHeight="15" />"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn rows_and_columns_built_in_code_are_well_formed() {
+        // A test or a UI may write attributes without the loader's leading
+        // space; the writer must still separate them from `r="…"`.
+        let mut pkg = new_xlsx();
+        let s = &mut pkg.workbook.sheets[0];
+        s.set_cell(0, 0, Cell::number(1.0));
+        s.row_attrs.insert(0, "hidden=\"1\"".into());
+        s.row_attrs.insert(3, "outlineLevel=\"1\"".into());
+        s.col_defs.push(crate::sheet::ColDef {
+            min: 2,
+            max: 2,
+            width: None,
+            attrs: "hidden=\"1\"".into(),
+            default_width: false,
+        });
+        let ws = saved_sheet(&pkg);
+        assert!(ws.contains(r#"<row r="1" hidden="1">"#), "{ws}");
+        assert!(ws.contains(r#"<row r="4" outlineLevel="1"/>"#), "{ws}");
+        assert!(ws.contains(r#"<col min="3" max="3" hidden="1"/>"#), "{ws}");
+    }
+
+    #[test]
+    fn a_loaded_col_without_a_width_keeps_its_spelling() {
+        let pkg = loaded(&format!(
+            r#"<cols><col min="2" max="2" style="5"/></cols>{ROWS}{MARGINS}"#
+        ));
+        assert!(saved_sheet(&pkg).contains(r#"<cols><col min="2" max="2" style="5"/></cols>"#));
+        // Grouping elsewhere doesn't touch it either.
+        let mut pkg = pkg;
+        crate::outline::group(
+            &mut pkg.workbook.sheets[0],
+            crate::outline::Axis::Cols,
+            4,
+            4,
+        )
+        .unwrap();
+        let ws = saved_sheet(&pkg);
+        assert!(
+            ws.contains(r#"<col min="2" max="2" style="5"/><col min="5" max="5" width="9.140625" outlineLevel="1"/>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn grouped_columns_keep_a_width_and_ungrouped_ones_go() {
+        use crate::outline::{Axis, group, ungroup};
+        // No `<cols>` at all: the definitions Group makes need a width, or
+        // Excel opens the columns zero wide.
+        let mut pkg = loaded(&format!(r#"<dimension ref="A1:B2"/>{ROWS}{MARGINS}"#));
+        group(&mut pkg.workbook.sheets[0], Axis::Cols, 2, 3).unwrap();
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert!(
+            ws.contains(r#"<cols><col min="3" max="4" width="9.140625" outlineLevel="1"/></cols>"#),
+            "{ws}"
+        );
+        // Ungrouped in the same session, nothing is left to say: the element
+        // goes.
+        let mut fresh = pkg.clone();
+        ungroup(&mut fresh.workbook.sheets[0], Axis::Cols, 2, 3).unwrap();
+        assert!(fresh.workbook.sheets[0].col_defs.is_empty());
+        let ws = saved_sheet(&fresh);
+        assert!(!ws.contains("<col"), "{ws}");
+        // After a reload it is still a default-width column: as wide as its
+        // neighbours, saved again without customWidth, and gone once
+        // ungrouped.
+        let mut pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.col_width(2), s.col_width(5));
+        let ws = saved_sheet(&pkg);
+        assert!(
+            ws.contains(r#"<cols><col min="3" max="4" width="9.140625" outlineLevel="1"/></cols>"#),
+            "{ws}"
+        );
+        ungroup(&mut pkg.workbook.sheets[0], Axis::Cols, 2, 3).unwrap();
+        let ws = saved_sheet(&pkg);
+        assert!(!ws.contains("<col"), "{ws}");
+        // A width the user set stays custom.
+        let mut pkg = loaded(&format!(
+            r#"<cols><col min="2" max="2" width="9.140625" customWidth="1"/></cols>{ROWS}{MARGINS}"#
+        ));
+        assert_eq!(pkg.workbook.sheets[0].col_defs[0].width, Some(9.140625));
+        pkg.workbook.sheets[0].set_col_width(3, 20.0);
+        assert!(
+            saved_sheet(&pkg)
+                .contains(r#"<col min="2" max="2" width="9.140625" customWidth="1"/>"#)
+        );
+        assert!(!ws.contains("outlineLevel"), "{ws}");
+        // A sheet's own default width is the one written.
+        let mut pkg = loaded(&format!(
+            r#"<sheetFormatPr defaultColWidth="12.5" defaultRowHeight="15"/>{ROWS}{MARGINS}"#
+        ));
+        group(&mut pkg.workbook.sheets[0], Axis::Cols, 0, 0).unwrap();
+        let ws = saved_sheet(&pkg);
+        assert!(
+            ws.contains(r#"<col min="1" max="1" width="12.5" outlineLevel="1"/>"#),
+            "{ws}"
+        );
     }
 }
 

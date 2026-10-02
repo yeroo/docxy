@@ -22,6 +22,7 @@ use std::time::{Duration, Instant, SystemTime};
 mod backstage;
 mod control;
 mod mcp;
+mod outlinedlg;
 mod ribbon;
 mod skill;
 mod textdlg;
@@ -42,6 +43,7 @@ use gridcore::model::{
     DataModel, MODEL_PART, ModelSpec, Relationship, model_part_xml, model_pivot, parse_model_part,
 };
 use gridcore::options::{EditOptions, EnterMove};
+use gridcore::outline::{self, Axis, OutlineError};
 use gridcore::sheet::{
     Align, Cell, CellValue, MAX_COLS, MAX_ROWS, NumFmt, Sheet, Xf, cell_name, col_name,
     date_unrepresentable, format_with, sheet_to_csv,
@@ -1846,6 +1848,8 @@ struct App {
     format_dialog: Option<FormatDialog>,
     /// The Text Import Wizard or Convert Text to Columns Wizard.
     text_dialog: Option<textdlg::TextDialog>,
+    /// Data ▸ Outline's open dialog: Subtotal, Settings, or Rows/Columns.
+    outline_dialog: Option<outlinedlg::Dialog>,
     /// The text Save As type (index into [`SAVE_TYPES`]) the workbook was
     /// last saved as; Ctrl+S keeps writing it while the path has its extension.
     text_type: Option<usize>,
@@ -1874,6 +1878,14 @@ struct App {
     // Geometry captured during draw, for mouse hit-testing.
     grid_area: Rect,
     gutter_w: u16,
+    /// Of `gutter_w`, the row outline's share on its left: one column per
+    /// level plus one (0 without a row outline).
+    outline_w: u16,
+    /// The screen line of the column outline (level buttons, group bars and
+    /// +/-), above the column header; `None` without a column outline.
+    col_outline_y: Option<u16>,
+    /// The column header's screen line (row level buttons on its left).
+    col_hdr_y: u16,
     vis_cols: Vec<(u32, u16, u16)>, // (col, x, width)
     vis_rows: Vec<u32>,             // sheet row per screen line (freeze-aware)
     vis_subline: Vec<u8>,           // which wrapped sub-line of that row (parallel to vis_rows)
@@ -1986,6 +1998,7 @@ impl App {
             format_picker: None,
             format_dialog: None,
             text_dialog: None,
+            outline_dialog: None,
             text_type: None,
             formula_view: false,
             light_theme: false,
@@ -2005,6 +2018,9 @@ impl App {
             dv_picker: None,
             grid_area: Rect::default(),
             gutter_w: 4,
+            outline_w: 0,
+            col_outline_y: None,
+            col_hdr_y: 0,
             vis_cols: Vec::new(),
             vis_rows: Vec::new(),
             vis_subline: Vec::new(),
@@ -4703,7 +4719,13 @@ impl App {
             ResizeTable => self.resize_table_act(),
             ConvertToRange => self.convert_table_act(),
             Subtotal => self.subtotal(),
-            Outline => self.toggle_outline(),
+            GroupOutline => self.group_outline(false),
+            UngroupOutline => self.group_outline(true),
+            ShowDetail => self.outline_detail(true),
+            HideDetail => self.outline_detail(false),
+            AutoOutline => self.auto_outline(),
+            ClearOutline => self.clear_outline(),
+            OutlineSettings => self.open_outline_settings(),
             NewComment => self.start_comment(),
             NewNote => self.start_note(),
             DeleteComment => self.delete_comment(),
@@ -5905,80 +5927,313 @@ impl App {
         ));
     }
 
-    /// Subtotal: at each change in the cursor column's value, insert a
-    /// SUBTOTAL(9,…) row over the numeric columns, plus a grand total. The
-    /// region must already be sorted by that column. Detail rows are grouped
-    /// (outline level 1) so they can be collapsed with Group.
-    fn subtotal(&mut self) {
-        use gridcore::sheet::CellValue;
-        let s = self.sheet;
-        let sc = self.cur.1;
-        let cur_r = self.cur.0;
-        let (rc, cc) = self.sheet().used_size();
-        if rc == 0 || cc == 0 {
-            self.status = Some("Subtotal: the sheet is empty".into());
-            return;
+    // --- Data ▸ Outline -----------------------------------------------------
+
+    /// A structural edit that may refuse. On `Err` the workbook is put back
+    /// and the message shown; on `Ok` its message is shown, and an undo step
+    /// is recorded only when a sheet actually changed, so a refusal or a
+    /// no-op leaves the undo stack alone. A protected sheet refuses, as in
+    /// Excel. `Err(())` when refused, else whether anything changed.
+    fn try_outline_edit(
+        &mut self,
+        op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<String, String>,
+    ) -> Result<bool, ()> {
+        if self.protected() {
+            self.status =
+                Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
+            return Err(());
         }
-        let (max_r, max_c) = (rc - 1, cc - 1);
-        let (top, bottom, header) = {
-            let sh = self.sheet();
-            let used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
-            if !used(cur_r) {
-                self.status = Some("Subtotal: put the cursor in the data".into());
-                return;
+        let before = self.wb_snapshot();
+        match op(&mut self.pkg.workbook) {
+            Err(msg) => {
+                self.put_back(&before);
+                self.status = Some(msg);
+                Err(())
             }
-            let mut top = cur_r;
-            while top > 0 && used(top - 1) {
-                top -= 1;
+            Ok(msg) => {
+                self.status = Some(msg);
+                if !gridcore::edit::sheets_differ(&before.sheets, &self.pkg.workbook.sheets) {
+                    return Ok(false);
+                }
+                self.rebuild_engine();
+                let after = self.wb_snapshot();
+                self.undo.push(UndoAction::Structural { before, after });
+                self.redo.clear();
+                self.modified = true;
+                self.cancel_cut();
+                self.ensure_visible();
+                Ok(true)
             }
-            let mut bottom = cur_r;
-            while bottom < max_r && used(bottom + 1) {
-                bottom += 1;
-            }
-            let header = matches!(sh.cell(top, sc).map(|c| &c.value), Some(CellValue::Text(_)));
-            (top, bottom, header)
-        };
-        let mut added = 0;
-        self.structural(|wb| {
-            added = gridcore::edit::subtotal(wb, s, top, bottom, sc, &[], header);
-        });
-        self.status = Some(if added == 0 {
-            "Subtotal: nothing to total".into()
+        }
+    }
+
+    /// The rows or columns the selection covers whole, for Group and
+    /// Ungroup; `None` when it is neither, which asks Rows or Columns.
+    fn outline_target(&self) -> Option<(Axis, u32, u32)> {
+        let (r1, c1, r2, c2) = self.selection();
+        if c1 == 0 && c2 == MAX_COLS - 1 {
+            Some((Axis::Rows, r1, r2))
+        } else if r1 == 0 && r2 == MAX_ROWS - 1 {
+            Some((Axis::Cols, c1, c2))
         } else {
-            format!(
-                "Inserted {added} subtotal row{} — use Group to collapse",
-                if added == 1 { "" } else { "s" }
-            )
+            None
+        }
+    }
+
+    /// Group (Alt+Shift+Right) or Ungroup (Alt+Shift+Left) the selection.
+    fn group_outline(&mut self, ungroup: bool) {
+        match self.outline_target() {
+            Some((axis, a, b)) => self.apply_group(axis, a, b, ungroup),
+            None => {
+                self.outline_dialog = Some(outlinedlg::Dialog::Axis(outlinedlg::AxisDialog::new(
+                    ungroup,
+                )));
+            }
+        }
+    }
+
+    /// Group or ungroup rows (columns) `a..=b`.
+    fn apply_group(&mut self, axis: Axis, a: u32, b: u32, ungroup: bool) {
+        let s = self.sheet;
+        let n = b - a + 1;
+        let what = match axis {
+            Axis::Rows => "row",
+            Axis::Cols => "column",
+        };
+        let _ = self.try_outline_edit(|wb| {
+            let sh = &mut wb.sheets[s];
+            if ungroup {
+                outline::ungroup(sh, axis, a, b)
+            } else {
+                outline::group(sh, axis, a, b)
+            }
+            .map_err(|e| e.to_string())?;
+            Ok(format!(
+                "{} {n} {what}{}",
+                if ungroup { "Ungrouped" } else { "Grouped" },
+                if n == 1 { "" } else { "s" }
+            ))
         });
     }
 
-    /// Toggle the outline: collapse (hide) all grouped detail rows to show just
-    /// the subtotals, or expand them again. Operates on rows with outline level
-    /// ≥ 1 anywhere on the sheet.
-    fn toggle_outline(&mut self) {
+    /// Show Detail / Hide Detail at the cursor: its row's group, else its
+    /// column's (only the column's when whole columns are selected).
+    fn outline_detail(&mut self, show: bool) {
+        let (r1, _, r2, _) = self.selection();
+        let whole_cols = r1 == 0 && r2 == MAX_ROWS - 1;
+        let (r, c) = self.cur;
         let s = self.sheet;
-        let sh = &self.pkg.workbook.sheets[s];
-        let outlined: Vec<u32> = sh
-            .row_attrs
-            .keys()
-            .copied()
-            .filter(|&r| sh.row_outline(r) >= 1)
-            .collect();
-        if outlined.is_empty() {
-            self.status = Some("No grouped rows — run Subtotal first".into());
-            return;
-        }
-        let any_visible = outlined.iter().any(|&r| !sh.row_hidden(r));
-        for &r in &outlined {
-            self.pkg.workbook.sheets[s].set_row_hidden(r, any_visible);
-        }
-        self.clamp_cursor();
-        self.modified = true;
-        self.status = Some(if any_visible {
-            "Outline collapsed".into()
+        let act: fn(&mut gridcore::sheet::Sheet, Axis, u32) -> Result<(), OutlineError> = if show {
+            outline::show_detail
         } else {
-            "Outline expanded".into()
+            outline::hide_detail
+        };
+        let _ = self.try_outline_edit(|wb| {
+            let sh = &mut wb.sheets[s];
+            let tries: &[(Axis, u32)] = if whole_cols {
+                &[(Axis::Cols, c)]
+            } else {
+                &[(Axis::Rows, r), (Axis::Cols, c)]
+            };
+            for &(axis, i) in tries {
+                if act(sh, axis, i).is_ok() {
+                    return Ok(if show {
+                        "Detail shown"
+                    } else {
+                        "Detail hidden"
+                    }
+                    .into());
+                }
+            }
+            Err(OutlineError::NoGroup.to_string())
         });
+    }
+
+    /// Auto Outline over the selection when it is more than one cell, else
+    /// the whole sheet.
+    fn auto_outline(&mut self) {
+        let (r1, c1, r2, c2) = self.selection();
+        let area = ((r1, c1) != (r2, c2)).then(|| self.iter_selection());
+        let s = self.sheet;
+        let _ = self.try_outline_edit(|wb| {
+            outline::auto_outline(&mut wb.sheets[s], area).map_err(|e| e.to_string())?;
+            Ok("Outline created from the summary formulas".into())
+        });
+    }
+
+    fn clear_outline(&mut self) {
+        let s = self.sheet;
+        let _ = self.try_outline_edit(|wb| {
+            outline::clear_outline(&mut wb.sheets[s]).map_err(|e| e.to_string())?;
+            Ok("Outline cleared".into())
+        });
+    }
+
+    /// A level button: show levels below `n`.
+    fn outline_show_level(&mut self, axis: Axis, n: u8) {
+        let s = self.sheet;
+        let _ = self.try_outline_edit(|wb| {
+            outline::show_level(&mut wb.sheets[s], axis, n);
+            Ok(format!("Showing outline level {n}"))
+        });
+    }
+
+    /// A +/- button: collapse or expand that group.
+    fn outline_toggle(&mut self, axis: Axis, g: outline::Group) {
+        let s = self.sheet;
+        let _ = self.try_outline_edit(|wb| {
+            outline::toggle_group(&mut wb.sheets[s], axis, &g);
+            Ok(if g.collapsed { "Expanded" } else { "Collapsed" }.into())
+        });
+    }
+
+    /// Settings…: the outline direction dialog.
+    fn open_outline_settings(&mut self) {
+        self.outline_dialog = Some(outlinedlg::Dialog::Settings(
+            outlinedlg::SettingsDialog::new(self.sheet, self.sheet().outline),
+        ));
+    }
+
+    /// Subtotal…: the dialog over the region around the cursor, grouping at
+    /// the cursor's column, with its numeric columns checked.
+    fn subtotal(&mut self) {
+        let (r, c) = self.cur;
+        let sh = self.sheet();
+        let Some((area, header)) = gridcore::edit::subtotal_region(sh, r, c) else {
+            self.status = Some("Subtotal: put the cursor in the data".into());
+            return;
+        };
+        let (top, c1, bottom, c2) = area;
+        let cols = gridcore::edit::subtotal_columns(sh, area, header);
+        let data = (top + u32::from(header), c1, bottom, c2);
+        let checked = gridcore::edit::numeric_columns(sh, data, c);
+        let defaults = gridcore::edit::SubtotalOptions::new(c, checked, header);
+        self.outline_dialog = Some(outlinedlg::Dialog::Subtotal(
+            outlinedlg::SubtotalDialog::new(self.sheet, area, cols, &defaults),
+        ));
+    }
+
+    /// A key for the open outline dialog.
+    fn outline_dialog_key(&mut self, code: KeyCode) {
+        let Some(d) = self.outline_dialog.as_mut() else {
+            return;
+        };
+        let outcome = d.key(code);
+        match outcome {
+            outlinedlg::Outcome::Pending => {}
+            outlinedlg::Outcome::Cancel => self.outline_dialog = None,
+            outlinedlg::Outcome::Subtotal(opts) => {
+                let Some(outlinedlg::Dialog::Subtotal(d)) = self.outline_dialog.clone() else {
+                    return;
+                };
+                let done = self.try_outline_edit(|wb| {
+                    let n = gridcore::edit::subtotal(wb, d.sheet, d.area, &opts)
+                        .map_err(|e| e.to_string())?;
+                    Ok(format!(
+                        "Inserted {n} subtotal row{}",
+                        if n == 1 { "" } else { "s" }
+                    ))
+                });
+                // A refusal (no column chosen) leaves the dialog open.
+                if done.is_ok() {
+                    self.outline_dialog = None;
+                }
+            }
+            outlinedlg::Outcome::RemoveAll => {
+                let Some(outlinedlg::Dialog::Subtotal(d)) = self.outline_dialog.take() else {
+                    return;
+                };
+                let _ = self.try_outline_edit(|wb| {
+                    let n = gridcore::edit::remove_subtotals(wb, d.sheet, d.area);
+                    Ok(format!(
+                        "Removed {n} subtotal row{}",
+                        if n == 1 { "" } else { "s" }
+                    ))
+                });
+            }
+            outlinedlg::Outcome::Settings(o) => {
+                let Some(outlinedlg::Dialog::Settings(d)) = self.outline_dialog.take() else {
+                    return;
+                };
+                let _ = self.try_outline_edit(|wb| {
+                    wb.sheets[d.sheet].outline = o;
+                    Ok("Outline settings changed".into())
+                });
+            }
+            outlinedlg::Outcome::Axis(axis) => {
+                let Some(outlinedlg::Dialog::Axis(d)) = self.outline_dialog.take() else {
+                    return;
+                };
+                let (r1, c1, r2, c2) = self.selection();
+                let (a, b) = match axis {
+                    Axis::Rows => (r1, r2),
+                    Axis::Cols => (c1, c2),
+                };
+                self.apply_group(axis, a, b, d.ungroup);
+            }
+        }
+    }
+
+    /// A click on an outline control: a level button (row levels left of the
+    /// column header, column levels left of the column outline line), or a
+    /// +/- button (in the row outline gutter, or on the column outline line).
+    /// `true` when the click landed on the outline area.
+    fn outline_click(&mut self, x: u16, y: u16) -> bool {
+        let g = self.grid_area;
+        let sh = self.sheet();
+        let (row_max, col_max) = (sh.max_row_outline(), sh.max_col_outline());
+        if x < g.x {
+            return false;
+        }
+        let dx = x - g.x;
+        if self.col_outline_y == Some(y) {
+            if dx < self.gutter_w {
+                let n = dx as u8 + 1;
+                if n <= col_max + 1 {
+                    self.outline_show_level(Axis::Cols, n);
+                }
+                return true;
+            }
+            let col = self
+                .vis_cols
+                .iter()
+                .find(|&&(_, cx, w)| x >= cx && x < cx + w)
+                .map(|&(c, _, _)| c);
+            let hit = col.and_then(|c| {
+                outline::groups(sh, Axis::Cols)
+                    .into_iter()
+                    .filter(|gr| gr.summary == Some(c))
+                    .max_by_key(|gr| gr.level)
+            });
+            if let Some(gr) = hit {
+                self.outline_toggle(Axis::Cols, gr);
+            }
+            return true;
+        }
+        if dx >= self.outline_w {
+            return false;
+        }
+        if y == self.col_hdr_y {
+            let n = dx as u8 + 1;
+            if n <= row_max + 1 {
+                self.outline_show_level(Axis::Rows, n);
+            }
+            return true;
+        }
+        if y < g.y || y >= g.y + g.height {
+            return false;
+        }
+        let Some(&row) = self.vis_rows.get((y - g.y) as usize) else {
+            return true;
+        };
+        let level = dx as u8 + 1;
+        let hit = outline::groups(sh, Axis::Rows)
+            .into_iter()
+            .find(|gr| gr.level == level && gr.summary == Some(row));
+        if let Some(gr) = hit {
+            self.outline_toggle(Axis::Rows, gr);
+        }
+        true
     }
 
     /// Format as Table: wrap the contiguous region around the cursor (or the
@@ -7183,9 +7438,20 @@ fn draw(app: &mut App, f: &mut Frame) {
 
     let fx_h = app.fx_bar_height();
     let formula_bar = Rect::new(area.x, y, area.width, fx_h);
-    let col_hdr = Rect::new(area.x, y + fx_h, area.width, 1);
-    let grid_h = area.height.saturating_sub(ribbon_h + 3 + fx_h);
-    let mut grid = Rect::new(area.x, y + fx_h + 1, area.width, grid_h);
+    // A column outline takes a line above the column header.
+    let (row_levels, col_levels) = {
+        let sh = app.sheet();
+        (sh.max_row_outline(), sh.max_col_outline())
+    };
+    let col_outline_h = u16::from(col_levels > 0);
+    let col_outline = Rect::new(area.x, y + fx_h, area.width, col_outline_h);
+    let col_hdr = Rect::new(area.x, y + fx_h + col_outline_h, area.width, 1);
+    let grid_h = area
+        .height
+        .saturating_sub(ribbon_h + 3 + fx_h + col_outline_h);
+    let mut grid = Rect::new(area.x, y + fx_h + 1 + col_outline_h, area.width, grid_h);
+    app.col_outline_y = (col_outline_h > 0).then_some(col_outline.y);
+    app.col_hdr_y = col_hdr.y;
     let tabs_line = Rect::new(area.x, area.y + area.height - 2, area.width, 1);
     let hint_line = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
 
@@ -7213,9 +7479,15 @@ fn draw(app: &mut App, f: &mut Frame) {
         app.top = fr;
     }
 
-    // Row gutter sized for the largest visible row number.
+    // Row gutter sized for the largest visible row number, after the row
+    // outline's columns (one per level, plus one).
     let max_row = app.top + grid.height as u32;
-    app.gutter_w = (max_row + 1).to_string().len().max(3) as u16 + 1;
+    app.outline_w = if row_levels > 0 {
+        u16::from(row_levels) + 1
+    } else {
+        0
+    };
+    app.gutter_w = app.outline_w + (max_row + 1).to_string().len().max(3) as u16 + 1;
 
     // Visible columns: frozen columns (0..fc) pinned, then scrollable from left.
     app.vis_cols.clear();
@@ -7335,9 +7607,37 @@ fn draw(app: &mut App, f: &mut Frame) {
     };
     f.render_widget(bar, formula_bar);
 
+    // --- column outline -----------------------------------------------------
+    if col_levels > 0 {
+        let groups = outline::groups(app.sheet(), Axis::Cols);
+        let mut spans = vec![RSpan::styled(
+            level_buttons(col_levels, app.gutter_w as usize),
+            HDR_STYLE,
+        )];
+        for &(col, _, w) in &app.vis_cols {
+            let summary = groups
+                .iter()
+                .filter(|g| g.summary == Some(col))
+                .max_by_key(|g| g.level);
+            let text = match summary {
+                Some(g) => center(if g.collapsed { "+" } else { "-" }, w as usize),
+                None if app.sheet().col_outline(col) > 0 => "─".repeat(w as usize),
+                None => " ".repeat(w as usize),
+            };
+            spans.push(RSpan::raw(text));
+        }
+        f.render_widget(Paragraph::new(RLine::from(spans)), col_outline);
+    }
+
     // --- column headers ------------------------------------------------------
-    let mut hdr_spans: Vec<RSpan> =
-        vec![RSpan::styled(" ".repeat(app.gutter_w as usize), HDR_STYLE)];
+    let mut hdr_spans: Vec<RSpan> = vec![RSpan::styled(
+        format!(
+            "{}{}",
+            level_buttons(row_levels, app.outline_w as usize),
+            " ".repeat((app.gutter_w - app.outline_w) as usize)
+        ),
+        HDR_STYLE,
+    )];
     for &(col, _, w) in &app.vis_cols {
         let name = col_name(col);
         let style = if col == c { HDR_CUR } else { HDR_STYLE };
@@ -7362,17 +7662,29 @@ fn draw(app: &mut App, f: &mut Frame) {
     let styles = &app.pkg.workbook.styles;
     let date1904 = app.pkg.workbook.date1904;
     let merges = sheet.merges.clone();
+    let row_groups = if row_levels > 0 {
+        outline::groups(sheet, Axis::Rows)
+    } else {
+        Vec::new()
+    };
+    let num_w = (app.gutter_w - app.outline_w) as usize;
     let mut lines: Vec<RLine> = Vec::with_capacity(grid.height as usize);
     for (li, &row) in vis_rows.iter().enumerate() {
         let sub = vis_subline.get(li).copied().unwrap_or(0) as usize;
-        let mut spans: Vec<RSpan> = Vec::with_capacity(app.vis_cols.len() + 1);
+        let mut spans: Vec<RSpan> = Vec::with_capacity(app.vis_cols.len() + 2);
         let gut_style = if row == r { HDR_CUR } else { HDR_STYLE };
+        if row_levels > 0 {
+            spans.push(RSpan::styled(
+                row_outline_cells(sheet, &row_groups, row, row_levels, sub == 0),
+                HDR_STYLE,
+            ));
+        }
         // The row number shows only on the row's first line.
         spans.push(RSpan::styled(
             if sub == 0 {
-                format!("{:>w$} ", row + 1, w = app.gutter_w as usize - 1)
+                format!("{:>w$} ", row + 1, w = num_w - 1)
             } else {
-                " ".repeat(app.gutter_w as usize)
+                " ".repeat(num_w)
             },
             gut_style,
         ));
@@ -7520,6 +7832,9 @@ fn draw(app: &mut App, f: &mut Frame) {
         draw_format_dialog(app, d, f, grid);
     }
     if let Some(d) = &app.text_dialog {
+        d.draw(f, grid);
+    }
+    if let Some(d) = &app.outline_dialog {
         d.draw(f, grid);
     }
 
@@ -8484,6 +8799,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         || app.format_picker.is_some()
         || app.format_dialog.is_some()
         || app.text_dialog.is_some()
+        || app.outline_dialog.is_some()
         || app.sheet_picker.is_some()
         || app.dv_picker.is_some();
     // Plain F9 engages the ribbon (docxy parity); Shift/Ctrl+F9 stays recalc.
@@ -8511,6 +8827,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     }
     if app.text_dialog.is_some() {
         app.text_dialog_key(key.code);
+        return false;
+    }
+    if app.outline_dialog.is_some() {
+        app.outline_dialog_key(key.code);
         return false;
     }
 
@@ -8778,6 +9098,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         }
         // Alt-↓ on a validated cell opens its dropdown (Excel parity).
         KeyCode::Down if alt => app.open_dv_dropdown(),
+        // Excel's Group / Ungroup.
+        KeyCode::Right if alt && shift => app.group_outline(false),
+        KeyCode::Left if alt && shift => app.group_outline(true),
         KeyCode::Up if ctrl => app.jump(-1, 0, shift),
         KeyCode::Down if ctrl => app.jump(1, 0, shift),
         KeyCode::Left if ctrl => app.jump(0, -1, shift),
@@ -8880,6 +9203,11 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
         }
         return false;
     }
+    // An outline dialog is modal: a click under it (a sheet tab, a ribbon
+    // command) must not change what its OK acts on.
+    if app.outline_dialog.is_some() {
+        return false;
+    }
     // The welcome screen owns the whole terminal; handle its clicks here so
     // nothing leaks to the hidden workbook behind it. Hovering highlights an
     // item, clicking activates it.
@@ -8955,6 +9283,10 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
                 }
                 return false;
             }
+            // Outline level and +/- buttons.
+            if !drag && app.outline_click(m.column, m.row) {
+                return false;
+            }
             // Grid?
             let g = app.grid_area;
             if m.row < g.y || m.row >= g.y + g.height || m.column < g.x + app.gutter_w {
@@ -8995,6 +9327,50 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
         _ => {}
     }
     false
+}
+
+/// The outline level buttons `1 2 …` (one per level, plus one), in a field
+/// `width` wide.
+fn level_buttons(levels: u8, width: usize) -> String {
+    let mut s: String = if levels == 0 {
+        String::new()
+    } else {
+        (1..=levels + 1).map(|n| char::from(b'0' + n)).collect()
+    };
+    s.truncate(width);
+    format!("{s:<width$}")
+}
+
+/// One row's outline gutter: a column per level holding a bar while the row
+/// is in a group at that level, or the `+`/`-` of the group it summarizes
+/// (only on the row's first screen line), then a blank.
+fn row_outline_cells(
+    sheet: &Sheet,
+    groups: &[outline::Group],
+    row: u32,
+    levels: u8,
+    first_line: bool,
+) -> String {
+    let lvl = sheet.row_outline(row);
+    let mut s = String::new();
+    for l in 1..=levels {
+        let sum = groups
+            .iter()
+            .find(|g| g.level == l && g.summary == Some(row));
+        s.push(match sum {
+            Some(g) if first_line => {
+                if g.collapsed {
+                    '+'
+                } else {
+                    '-'
+                }
+            }
+            _ if lvl >= l => '│',
+            _ => ' ',
+        });
+    }
+    s.push(' ');
+    s
 }
 
 /// Only http/https links may be opened, and only via a direct process exec (no
@@ -12318,9 +12694,9 @@ mod tests {
         assert_eq!(app.pkg.workbook.sheets[0].row_height(5), Some(45.0));
     }
 
-    #[test]
-    fn subtotal_and_outline_collapse() {
-        use gridcore::sheet::{Cell, CellValue};
+    /// Grp/Amt with two A rows and one B row (A1:B4), cursor in the data.
+    fn subtotal_app() -> App {
+        use gridcore::sheet::Cell;
         let mut app = App::new(new_xlsx(), "t.xlsx");
         app.os_clip = None;
         {
@@ -12335,21 +12711,354 @@ mod tests {
         app.rebuild_engine();
         app.cur = (1, 0); // group by column A
         app.anchor = None;
-        app.subtotal();
-        // Grand total row appears with the summed value.
-        let v = |r, c| app.sheet().cell(r, c).map(|cl| cl.value.clone());
-        assert_eq!(v(3, 0), Some(CellValue::Text("A Total".into())));
-        assert_eq!(v(6, 0), Some(CellValue::Text("Grand Total".into())));
-        assert_eq!(app.sheet().row_outline(1), 1);
-
-        // Collapse hides detail rows (outline ≥ 1); expand restores them.
-        app.toggle_outline();
-        assert!(app.sheet().row_hidden(1));
-        assert!(!app.sheet().row_hidden(3)); // subtotal row stays visible
-        app.toggle_outline();
-        assert!(!app.sheet().row_hidden(1));
+        app
     }
 
+    #[test]
+    fn subtotal_and_outline_collapse() {
+        use gridcore::sheet::CellValue;
+        let mut app = subtotal_app();
+        app.ribbon_act(ribbon::Act::Subtotal);
+        let Some(outlinedlg::Dialog::Subtotal(d)) = &app.outline_dialog else {
+            panic!("the Subtotal dialog opens");
+        };
+        assert_eq!((d.area, d.has_header), ((0, 0, 3, 1), true));
+        assert_eq!(d.options().add_to, [1], "the numeric column is checked");
+        app.outline_dialog_key(KeyCode::Enter);
+        assert!(app.outline_dialog.is_none());
+        let v = |app: &App, r, c| app.sheet().cell(r, c).map(|cl| cl.value.clone());
+        assert_eq!(v(&app, 3, 0), Some(CellValue::Text("A Total".into())));
+        assert_eq!(v(&app, 6, 0), Some(CellValue::Text("Grand Total".into())));
+        assert_eq!(v(&app, 6, 1), Some(CellValue::Number(7.0)));
+        let levels: Vec<u8> = (0..7).map(|r| app.sheet().row_outline(r)).collect();
+        assert_eq!(levels, [0, 2, 2, 1, 2, 1, 0]);
+
+        // Level 2 hides the detail; level 3 shows it; each is one undo step.
+        app.outline_show_level(Axis::Rows, 2);
+        assert!(app.sheet().row_hidden(1) && !app.sheet().row_hidden(3));
+        app.outline_show_level(Axis::Rows, 3);
+        assert!(!app.sheet().row_hidden(1));
+        app.undo();
+        assert!(app.sheet().row_hidden(1));
+        app.undo();
+        assert!(!app.sheet().row_hidden(1));
+        // Undo takes the subtotals out too.
+        app.undo();
+        assert_eq!(v(&app, 3, 0), Some(CellValue::Text("B".into())));
+        assert_eq!(app.sheet().max_row_outline(), 0);
+    }
+
+    #[test]
+    fn subtotal_dialog_remove_all_and_refusal() {
+        let mut app = subtotal_app();
+        app.ribbon_act(ribbon::Act::Subtotal);
+        app.outline_dialog_key(KeyCode::Enter);
+        assert_eq!(app.sheet().used_size().0, 7);
+        // Reopen at a total row: Remove All takes them out again.
+        app.cur = (3, 0);
+        app.ribbon_act(ribbon::Act::Subtotal);
+        if let Some(outlinedlg::Dialog::Subtotal(d)) = &mut app.outline_dialog {
+            d.focus = 0;
+        }
+        app.outline_dialog_key(KeyCode::Up); // Cancel
+        app.outline_dialog_key(KeyCode::Up); // Remove All
+        app.outline_dialog_key(KeyCode::Enter);
+        assert!(app.outline_dialog.is_none());
+        assert_eq!(app.sheet().used_size().0, 4);
+        assert_eq!(app.sheet().max_row_outline(), 0);
+        // No column checked: the dialog says so and stays open; nothing to undo.
+        let undo_len = app.undo.len();
+        app.ribbon_act(ribbon::Act::Subtotal);
+        if let Some(outlinedlg::Dialog::Subtotal(d)) = &mut app.outline_dialog {
+            d.add_to.iter_mut().for_each(|on| *on = false);
+        }
+        app.outline_dialog_key(KeyCode::Enter);
+        assert!(app.outline_dialog.is_some());
+        assert_eq!(
+            app.status.as_deref(),
+            Some(
+                gridcore::edit::SubtotalError::NoColumns
+                    .to_string()
+                    .as_str()
+            )
+        );
+        assert_eq!(app.undo.len(), undo_len);
+        app.outline_dialog_key(KeyCode::Esc);
+        assert!(app.outline_dialog.is_none());
+    }
+
+    #[test]
+    fn an_outline_dialog_acts_on_its_own_sheet_and_holds_the_mouse() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = subtotal_app();
+        app.pkg.workbook.sheets.push(Sheet {
+            name: "Sheet2".into(),
+            ..Sheet::default()
+        });
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        app.ribbon_act(ribbon::Act::Subtotal);
+        // A click on the Sheet2 tab under the dialog does nothing.
+        let &(_, x, _) = app.tab_spans.iter().find(|&&(i, _, _)| i == 1).unwrap();
+        let y = app.grid_area.y + app.grid_area.height;
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::empty(),
+            },
+        );
+        assert_eq!(app.sheet, 0);
+        assert!(app.outline_dialog.is_some());
+        // Even with another sheet active, OK lands where the dialog opened.
+        app.sheet = 1;
+        app.outline_dialog_key(KeyCode::Enter);
+        assert_eq!(app.pkg.workbook.sheets[0].max_row_outline(), 2);
+        assert!(app.pkg.workbook.sheets[1].cells.is_empty());
+        assert_eq!(app.pkg.workbook.sheets[1].max_row_outline(), 0);
+    }
+
+    #[test]
+    fn remove_all_records_the_page_breaks_it_drops() {
+        let mut app = subtotal_app();
+        gridcore::print::area::insert_page_break(&mut app.pkg.workbook.sheets[0], 2, 0);
+        let undo_len = app.undo.len();
+        app.ribbon_act(ribbon::Act::Subtotal);
+        app.outline_dialog_key(KeyCode::Up); // Cancel
+        app.outline_dialog_key(KeyCode::Up); // Remove All
+        app.outline_dialog_key(KeyCode::Enter);
+        assert!(
+            gridcore::print::area::manual_breaks(app.sheet())
+                .0
+                .is_empty()
+        );
+        assert_eq!(app.undo.len(), undo_len + 1);
+        app.undo();
+        assert_eq!(gridcore::print::area::manual_breaks(app.sheet()).0, [2]);
+        // Redo removes them again; then there is nothing left, so no step.
+        app.redo();
+        let undo_len = app.undo.len();
+        app.ribbon_act(ribbon::Act::Subtotal);
+        app.outline_dialog_key(KeyCode::Up);
+        app.outline_dialog_key(KeyCode::Up);
+        app.outline_dialog_key(KeyCode::Enter);
+        assert_eq!(app.undo.len(), undo_len);
+    }
+
+    #[test]
+    fn alt_shift_arrows_group_whole_rows_and_columns() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        // Whole rows 2..=4 selected.
+        app.anchor = Some((1, 0));
+        app.cur = (3, MAX_COLS - 1);
+        press_mod(
+            &mut app,
+            KeyCode::Right,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        );
+        let levels: Vec<u8> = (0..5).map(|r| app.sheet().row_outline(r)).collect();
+        assert_eq!(levels, [0, 1, 1, 1, 0]);
+        assert!(app.outline_dialog.is_none());
+        press_mod(
+            &mut app,
+            KeyCode::Right,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        );
+        assert_eq!(app.sheet().row_outline(2), 2);
+        press_mod(
+            &mut app,
+            KeyCode::Left,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        );
+        assert_eq!(app.sheet().row_outline(2), 1);
+        // Whole columns C..D.
+        app.anchor = Some((0, 2));
+        app.cur = (MAX_ROWS - 1, 3);
+        press_mod(
+            &mut app,
+            KeyCode::Right,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        );
+        assert_eq!(
+            (app.sheet().col_outline(2), app.sheet().col_outline(3)),
+            (1, 1)
+        );
+        // Plain Shift+Right still extends the selection.
+        app.anchor = None;
+        app.cur = (5, 5);
+        press_mod(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+        assert_eq!((app.anchor, app.cur), (Some((5, 5)), (5, 6)));
+        assert_eq!(app.sheet().col_outline(5), 0);
+    }
+
+    #[test]
+    fn group_on_a_cell_range_asks_rows_or_columns() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.anchor = Some((1, 1));
+        app.cur = (2, 3);
+        app.ribbon_act(ribbon::Act::GroupOutline);
+        assert!(matches!(
+            app.outline_dialog,
+            Some(outlinedlg::Dialog::Axis(_))
+        ));
+        app.outline_dialog_key(KeyCode::Down); // Columns
+        app.outline_dialog_key(KeyCode::Enter);
+        assert!(app.outline_dialog.is_none());
+        let cols: Vec<u8> = (0..5).map(|c| app.sheet().col_outline(c)).collect();
+        assert_eq!(cols, [0, 1, 1, 1, 0]);
+        assert_eq!(app.sheet().max_row_outline(), 0);
+        // Ungroup, Rows: nothing grouped refuses, with no undo step.
+        let undo_len = app.undo.len();
+        app.ribbon_act(ribbon::Act::UngroupOutline);
+        app.outline_dialog_key(KeyCode::Enter);
+        assert_eq!(app.undo.len(), undo_len);
+        assert_eq!(
+            app.status.as_deref(),
+            Some(OutlineError::NotGrouped.to_string().as_str())
+        );
+        // Undo takes the column group away.
+        app.undo();
+        assert_eq!(app.sheet().max_col_outline(), 0);
+    }
+
+    #[test]
+    fn detail_auto_and_clear_outline_from_the_ribbon() {
+        use gridcore::sheet::Cell;
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        {
+            let sh = &mut app.pkg.workbook.sheets[0];
+            for r in 0..3 {
+                sh.set_cell(r, 0, Cell::number(r as f64 + 1.0));
+            }
+            sh.set_cell(3, 0, Cell::formula("SUM(A1:A3)"));
+        }
+        app.rebuild_engine();
+        app.ribbon_act(ribbon::Act::AutoOutline);
+        assert_eq!(app.sheet().row_outline(1), 1);
+        // Hide Detail at the summary row, then Show Detail.
+        app.cur = (3, 0);
+        app.ribbon_act(ribbon::Act::HideDetail);
+        assert!(app.sheet().row_hidden(0) && app.sheet().row_collapsed(3));
+        app.ribbon_act(ribbon::Act::ShowDetail);
+        assert!(!app.sheet().row_hidden(0));
+        // Show Detail with nothing collapsed refuses without an undo step.
+        let undo_len = app.undo.len();
+        app.ribbon_act(ribbon::Act::ShowDetail);
+        assert_eq!(app.undo.len(), undo_len);
+        app.ribbon_act(ribbon::Act::ClearOutline);
+        assert_eq!(app.sheet().max_row_outline(), 0);
+        app.undo();
+        assert_eq!(app.sheet().row_outline(1), 1);
+        // On a protected sheet every outline command refuses.
+        app.pkg.workbook.sheets[0].set_protected(true);
+        let undo_len = app.undo.len();
+        app.ribbon_act(ribbon::Act::ClearOutline);
+        assert_eq!(app.sheet().row_outline(1), 1);
+        assert_eq!(app.undo.len(), undo_len);
+        assert!(app.status.as_deref().unwrap().contains("protected"));
+    }
+
+    #[test]
+    fn outline_settings_dialog_sets_the_direction() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.ribbon_act(ribbon::Act::OutlineSettings);
+        app.outline_dialog_key(KeyCode::Char(' ')); // Summary rows below: off
+        app.outline_dialog_key(KeyCode::Enter);
+        assert!(app.outline_dialog.is_none());
+        assert!(!app.sheet().outline.summary_below);
+        assert!(app.sheet().outline.summary_right);
+        app.undo();
+        assert!(app.sheet().outline.summary_below);
+    }
+
+    #[test]
+    fn outline_gutter_and_buttons_answer_the_mouse() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = subtotal_app();
+        app.ribbon_act(ribbon::Act::Subtotal);
+        app.outline_dialog_key(KeyCode::Enter);
+        // A column group too, so both outlines show.
+        outline::group(&mut app.pkg.workbook.sheets[0], Axis::Cols, 1, 1).unwrap();
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        assert_eq!(app.outline_w, 3, "two row levels plus one");
+        let g = app.grid_area;
+        let hdr = app.col_hdr_y;
+        let col_line = app.col_outline_y.expect("a column outline line");
+        assert_eq!((col_line + 1, hdr + 1), (hdr, g.y));
+        let screen = |term: &Terminal<TestBackend>, y: u16| -> String {
+            let buf = term.backend().buffer();
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect()
+        };
+        // Level buttons 1 2 3 left of the header; the gutter shows a bar on
+        // detail rows and "-" on the totals; the column line has its group.
+        assert!(
+            screen(&term, hdr).starts_with("123"),
+            "{}",
+            screen(&term, hdr)
+        );
+        assert!(screen(&term, col_line).starts_with("12"));
+        let row_line =
+            |app: &App, r: u32| g.y + app.vis_rows.iter().position(|&x| x == r).unwrap() as u16;
+        assert!(
+            screen(&term, row_line(&app, 1)).starts_with("││"),
+            "{}",
+            screen(&term, row_line(&app, 1))
+        );
+        assert!(
+            screen(&term, row_line(&app, 3)).starts_with("│-"),
+            "{}",
+            screen(&term, row_line(&app, 3))
+        );
+        assert!(
+            screen(&term, row_line(&app, 6)).starts_with("- "),
+            "{}",
+            screen(&term, row_line(&app, 6))
+        );
+
+        let click = |app: &mut App, x: u16, y: u16| {
+            handle_mouse(
+                app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: x,
+                    row: y,
+                    modifiers: KeyModifiers::empty(),
+                },
+            );
+        };
+        // A cell click lands on that cell despite the gutter and the line.
+        let (_, bx, _) = *app.vis_cols.iter().find(|&&(c, _, _)| c == 1).unwrap();
+        let y = row_line(&app, 2);
+        click(&mut app, bx + 1, y);
+        assert_eq!(app.cur, (2, 1));
+        // "-" on "A Total" (level 2) collapses its group.
+        let y = row_line(&app, 3);
+        click(&mut app, g.x + 1, y);
+        assert!(app.sheet().row_hidden(1) && app.sheet().row_hidden(2));
+        assert!(app.sheet().row_collapsed(3));
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        assert!(screen(&term, row_line(&app, 3)).starts_with("│+"));
+        let y = row_line(&app, 3);
+        click(&mut app, g.x + 1, y);
+        assert!(!app.sheet().row_hidden(1));
+        // Level button 1 leaves only the grand total.
+        click(&mut app, g.x, hdr);
+        let shown: Vec<u32> = (0..7).filter(|&r| !app.sheet().row_hidden(r)).collect();
+        assert_eq!(shown, [0, 6]);
+        // The column line's "-" over C (the summary of B) hides column B.
+        term.draw(|f| draw(&mut app, f)).unwrap();
+        let (_, cx, _) = *app.vis_cols.iter().find(|&&(c, _, _)| c == 2).unwrap();
+        click(&mut app, cx + 1, col_line);
+        assert!(app.sheet().col_hidden(1) && app.sheet().col_collapsed(2));
+        // Its level button 2 shows it again.
+        click(&mut app, g.x + 1, col_line);
+        assert!(!app.sheet().col_hidden(1));
+    }
     #[test]
     fn commit_filter_hides_nonmatching_rows() {
         use gridcore::sheet::Cell;

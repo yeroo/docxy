@@ -97,6 +97,20 @@ Cell
   style: u32                 # xf index, preserved
 ```
 
+**Outline.** Row and column outline levels, `hidden` and `collapsed` stay
+where the file keeps them, in `row_attrs` and `ColDef.attrs`, read and
+edited by whole attribute name. `Sheet.outline` holds `<outlinePr
+summaryBelow summaryRight>`. `gridcore::outline` derives the groups from the
+levels: maximal runs at a level or deeper, each with a summary row after it
+(or before it, with summaries above). It provides Group/Ungroup (up to level
+7), collapse/expand, the level buttons, Show/Hide Detail, Clear Outline and
+Auto Outline. `gridcore::edit::subtotal` inserts its totals through
+`insert_rows`, one group at a time from the bottom up, so formulas and row
+attributes move as they would for a hand insert, and `remove_subtotals`
+deletes them through `delete_rows`. The save writes `outlinePr` only when
+the settings changed, and `sheetFormatPr outlineLevelRow/Col` from the live
+levels.
+
 Numbers are `f64` (as in Excel); dates are serial numbers plus the workbook's
 1900/1904 flag, interpreted at display/function level. Text cells remember
 whether they came from a shared string so unedited rich-text cells keep their
@@ -334,6 +348,11 @@ is data entry plus semantics tests, not architecture.
   internal paste translates relative refs Excel-style.
 - **Display fidelity (read-only in v1):** number formats (General, dates,
   percent), bold/italic/color resolved from `styles.xml`.
+- **Outline (Data tab):** Group/Ungroup (Alt+Shift+Right/Left), Show/Hide
+  Detail, Subtotal… (Excel's dialog, with Remove All), Auto Outline, Clear
+  Outline and Settings…. A row outline gutter sits left of the row numbers,
+  and a column outline line above the headers, with clickable level and
+  +/- buttons. Every command is one undo step; refusals record none.
 - **Headless:** `--recalc out.xlsx` (load → full recalc → save) and
   `--csv out.csv` — the engine with no terminal, scriptable and CI-testable.
 - Cross-suggestion: `docxy book.xlsx` says "try xlsxy"; `xlsxy report.docx`

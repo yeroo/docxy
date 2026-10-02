@@ -267,7 +267,7 @@ fn manual_attrs(row: bool) -> &'static str {
 /// Add (or make manual) the break whose page starts at `id`. The list keeps
 /// the file's order, which need not be sorted, so it is searched in full; a
 /// new break goes before the first one with a larger id.
-fn add_break(breaks: &mut Vec<PageBreak>, id: u32, row: bool) -> bool {
+pub(crate) fn add_break(breaks: &mut Vec<PageBreak>, id: u32, row: bool) -> bool {
     match breaks.iter().position(|b| b.id == id) {
         Some(i) if breaks[i].is_manual() => false,
         Some(i) => {

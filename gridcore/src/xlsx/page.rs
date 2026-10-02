@@ -17,6 +17,7 @@ use super::{
 use crate::print::setup::{
     CellComments, HeaderFooter, HfSlot, Orientation, PageOrder, PageSetup, PrintErrors, xml_bool,
 };
+use crate::sheet::OutlineSettings;
 
 /// The elements [`read_page_setup`] reads. A part naming none of them has
 /// the default page setup, and isn't walked.
@@ -577,6 +578,106 @@ fn patch_fit_to_page(mut xml: String, now: bool, was: bool) -> String {
         None => {}
     }
     xml
+}
+
+/// `<sheetPr><outlinePr summaryBelow summaryRight>`. Both default to true.
+pub(super) fn read_outline_pr(xml: &str) -> OutlineSettings {
+    let mut s = OutlineSettings::default();
+    if !xml.contains("outlinePr") {
+        return s;
+    }
+    let Some((start, end)) = worksheet_child_span(xml, "sheetPr") else {
+        return s;
+    };
+    let frag = &xml[start..end];
+    for (name, cs, _) in element_children(frag) {
+        if name == "outlinePr" {
+            let a = StartTag::read(&frag[cs..]);
+            s.summary_below = a.flag("summaryBelow").unwrap_or(true);
+            s.summary_right = a.flag("summaryRight").unwrap_or(true);
+        }
+    }
+    s
+}
+
+/// Sync `<sheetPr><outlinePr>` where `now` differs from `was` (what the part
+/// held at load), so an untouched element stays byte-for-byte. `outlinePr`
+/// follows `tabColor` and precedes `pageSetUpPr` in `CT_SheetPr`.
+pub(super) fn set_outline_pr(xml: &str, now: OutlineSettings, was: OutlineSettings) -> String {
+    let mut xml = xml.to_string();
+    if now == was {
+        return xml;
+    }
+    let flag = |b: bool| if b { "1" } else { "0" };
+    let element = |prefix: &str| {
+        format!(
+            "<{prefix}outlinePr summaryBelow=\"{}\" summaryRight=\"{}\"/>",
+            flag(now.summary_below),
+            flag(now.summary_right)
+        )
+    };
+    let Some((start, end)) = worksheet_child_span(&xml, "sheetPr") else {
+        let block = format!("<sheetPr>{}</sheetPr>", element(""));
+        return put_worksheet_child(&xml, "sheetPr", &block, None, false);
+    };
+    let prefix = prefix_at(&xml, start).to_string();
+    let children = element_children(&xml[start..end]);
+    match children.iter().find(|(n, _, _)| n == "outlinePr") {
+        Some(&(_, cs, _)) => {
+            let at = start + cs;
+            xml = set_tag_attr(&xml, at, "summaryBelow", Some(flag(now.summary_below)));
+            xml = set_tag_attr(&xml, at, "summaryRight", Some(flag(now.summary_right)));
+        }
+        None => {
+            let after = children
+                .iter()
+                .filter(|(n, _, _)| n == "tabColor")
+                .map(|&(_, _, ce)| start + ce)
+                .max();
+            let content = open_up(&mut xml, start);
+            let at = after.unwrap_or(content);
+            xml.insert_str(at, &element(&prefix));
+        }
+    }
+    xml
+}
+
+/// Sync `<sheetFormatPr outlineLevelRow outlineLevelCol>` with the deepest
+/// row and column outline levels. Excel sizes its outline gutter from these.
+/// A level of 0 removes the attribute; an element is added only when there is
+/// an outline, with the `defaultRowHeight` the schema requires.
+pub(super) fn set_outline_levels(
+    xml: &str,
+    rows: u8,
+    cols: u8,
+    default_row_height: Option<f64>,
+) -> String {
+    let want = |n: u8| (n > 0).then(|| n.to_string());
+    let Some((start, _)) = worksheet_child_span(xml, "sheetFormatPr") else {
+        if rows == 0 && cols == 0 {
+            return xml.to_string();
+        }
+        let mut block = format!(
+            "<sheetFormatPr defaultRowHeight=\"{}\"",
+            default_row_height.unwrap_or(15.0)
+        );
+        for (attr, n) in [("outlineLevelRow", rows), ("outlineLevelCol", cols)] {
+            if let Some(v) = want(n) {
+                block.push_str(&format!(" {attr}=\"{v}\""));
+            }
+        }
+        block.push_str("/>");
+        return put_worksheet_child(xml, "sheetFormatPr", &block, None, false);
+    };
+    let a = StartTag::read(&xml[start..]);
+    let mut out = xml.to_string();
+    for (attr, n) in [("outlineLevelRow", rows), ("outlineLevelCol", cols)] {
+        let have = a.num::<u8>(attr).unwrap_or(0);
+        if have != n {
+            out = set_tag_attr(&out, start, attr, want(n).as_deref());
+        }
+    }
+    out
 }
 
 #[cfg(test)]

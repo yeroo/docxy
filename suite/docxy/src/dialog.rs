@@ -102,6 +102,25 @@ pub(crate) enum DialogOwner {
     /// Settings' User name... (#620): the reviewer name and initials new
     /// comments carry. An app setting, applied by `user_name::click`.
     UserName,
+    /// Excel's Subtotal dialog (#693) over the region `(r1, c1, r2, c2)` of
+    /// `sheet`: its column choices start at `c1` (at most 64 of them), and
+    /// `c2` ends the region, so total rows are found only in `c1..=c2`;
+    /// `header` when `r1` is a header row. OK and Remove All apply in
+    /// `sheet_outline::click`.
+    Subtotal {
+        sheet: usize,
+        r1: u32,
+        r2: u32,
+        c1: u32,
+        c2: u32,
+        header: bool,
+    },
+    /// The outline Settings (#693): where summary rows and columns sit.
+    OutlineSettings,
+    /// Group's (Ungroup's) "Rows or Columns?" over a block selection (#693).
+    OutlineAxis {
+        ungroup: bool,
+    },
     /// A dialog the model tests build; the app never applies one.
     #[cfg(test)]
     Test,

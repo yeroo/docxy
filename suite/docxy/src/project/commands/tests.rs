@@ -270,7 +270,12 @@ fn ribbon_context_survives_valid_switches_only() {
     assert!(
         valid_ribbon_tab(Kind::Xlsx, RibbonTab::Mailings, false, false, false) == RibbonTab::Home
     );
-    assert_eq!(ribbon_tab_index(RibbonTab::View, Kind::Xlsx), 3);
+    // Workbooks have Excel's Data tab (#693) between Insert and Review;
+    // documents do not.
+    assert_eq!(ribbon_tab_index(RibbonTab::View, Kind::Xlsx), 4);
+    assert_eq!(ribbon_tab_index(RibbonTab::Data, Kind::Xlsx), 2);
+    assert!(valid_ribbon_tab(Kind::Xlsx, RibbonTab::Data, false, false, false) == RibbonTab::Data);
+    assert!(valid_ribbon_tab(Kind::Docx, RibbonTab::Data, false, false, false) == RibbonTab::Home);
     assert!(
         valid_ribbon_tab(Kind::Docx, RibbonTab::Layout, false, false, false) == RibbonTab::Layout
     );
