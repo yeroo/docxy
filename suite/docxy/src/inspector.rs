@@ -96,6 +96,8 @@ impl Inspection {
         let n = self.count(category).unwrap_or(0);
         let s = if n == 1 { "" } else { "s" };
         match (category, self.found(category)) {
+            // Markers whose comments are gone: nothing to count, still found.
+            (InspectCategory::Comments, true) if n == 0 => "Comment markers were found.".into(),
             (InspectCategory::Comments, true) => format!("{n} comment{s} found."),
             (InspectCategory::Comments, false) => "No comments were found.".into(),
             (InspectCategory::Revisions, true) => format!("{n} revision{s} found."),
@@ -314,6 +316,31 @@ mod tests {
             assert!(found.found(category), "{category:?}");
         }
         assert_eq!(found.line(InspectCategory::Comments), "2 comments found.");
+    }
+
+    /// Review r2 m1: markers with no comment left are found, not "0 comments".
+    #[test]
+    fn orphan_comment_markers_have_their_own_line() {
+        let orphans = Inspection {
+            comments: 0,
+            comment_markers: true,
+            revisions: 0,
+            hidden: 0,
+            properties: false,
+        };
+        assert!(orphans.found(InspectCategory::Comments));
+        assert_eq!(
+            orphans.line(InspectCategory::Comments),
+            "Comment markers were found."
+        );
+        let none = Inspection {
+            comment_markers: false,
+            ..orphans
+        };
+        assert_eq!(
+            none.line(InspectCategory::Comments),
+            "No comments were found."
+        );
     }
 
     #[test]
