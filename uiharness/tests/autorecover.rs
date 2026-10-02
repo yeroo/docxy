@@ -94,3 +94,69 @@ fn a_killed_instance_relaunches_with_the_autorecover_copy() {
     );
     app.shutdown(Some(&driver));
 }
+
+/// #613: Excel's "Keep the last AutoRecovered version if I close without
+/// saving". A workbook typed into (the cell committed), an AutoRecover tick,
+/// then Don't Save: one draft is listed and opens read-only with the text.
+/// The harness has no blank-workbook verb, so the workbook is a fixture copy;
+/// a draft is the same either way.
+#[test]
+#[ignore = "requires a built suite and an interactive desktop"]
+fn dont_save_keeps_a_draft_that_opens_read_only() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let run = Run::create(
+        root.join("../target/autorecover-tests")
+            .join(format!("drafts-{}-{stamp}", std::process::id())),
+    )
+    .unwrap();
+    let sandbox = run.dir().join("sandbox");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    let book = sandbox.join("basic.xlsx");
+    std::fs::copy(root.join("fixtures/basic.xlsx"), &book).unwrap();
+    let exe = launch::find_suite(None).unwrap();
+
+    let app = launch::launch(&exe, &sandbox).unwrap();
+    let driver = Driver::connect(&app.ctl_dir(), None).unwrap();
+    let on = call(&driver, "selection", &[]);
+    assert_eq!(on.get("keep_drafts"), Some(&Json::Bool(true)), "{on}");
+    let drafts = call(&driver, "drafts", &[]);
+    assert_eq!(drafts.get("drafts"), Some(&Json::Arr(vec![])), "{drafts}");
+    call(&driver, "autorecover", &[("minutes", Json::Num(1.))]);
+    call(
+        &driver,
+        "open",
+        &[("path", Json::Str(book.display().to_string()))],
+    );
+    call(&driver, "click-cell", &[("cell", Json::Str("A1".into()))]);
+    call(&driver, "type", &[("text", Json::Str("draft me".into()))]);
+    let typed = call(&driver, "key", &[("key", Json::Str("enter".into()))]);
+    assert_eq!(typed.get("dirty"), Some(&Json::Bool(true)), "{typed}");
+    let tick = call(&driver, "autorecover-now", &[]);
+    assert_eq!(tick.get("wrote"), Some(&Json::Bool(true)), "{tick}");
+    call(
+        &driver,
+        "close-tab",
+        &[("answer", Json::Str("discard".into()))],
+    );
+
+    let drafts = call(&driver, "drafts", &[]);
+    let Some(Json::Arr(list)) = drafts.get("drafts") else {
+        panic!("{drafts}")
+    };
+    assert_eq!(list.len(), 1, "{drafts}");
+    assert!(
+        list[0]
+            .get_str("name")
+            .is_some_and(|n| n.starts_with("basic ((Unsaved-")),
+        "{drafts}"
+    );
+    let opened = call(&driver, "open-draft", &[("index", Json::Num(0.))]);
+    assert_eq!(opened.get("read_only"), Some(&Json::Bool(true)), "{opened}");
+    let cell = call(&driver, "cell", &[("cell", Json::Str("A1".into()))]);
+    assert_eq!(cell.get_str("value"), Some("draft me"), "{cell}");
+    app.shutdown(Some(&driver));
+}

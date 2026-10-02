@@ -286,6 +286,7 @@ State keys, as the app reports them after every driving verb:
 | `dialog` | the active tab's top dialog's id, or `none`, on every surface; `dialog-click`'s reply carries the `dialog-read` object under this key instead |
 | `tabs`, `ask_on_close` | open tab count and whether window close asks about unsaved changes |
 | `autorecover_minutes` | minutes between AutoRecover writes while a tab is unsaved; `0` is off |
+| `keep_drafts` | whether Don't Save keeps a workbook's last AutoRecover copy as a draft |
 | `menu` | the open menu's `{target}`, or null; `menu-read` has its items |
 | `sheet`, `sel`, `anchor`, `range` | the sheet and its selection |
 | `editing`, `edit` | whether a cell edit is open, and its text |
@@ -444,6 +445,18 @@ exit (window close or `quit`) removes it; a relaunch that finds it labels its
 dirty restored tabs `recovered — AutoRecover copy …`. The ignored desktop test
 `uiharness/tests/autorecover.rs` kills an instance after a tick and checks the
 relaunch.
+
+`call keep-drafts {"on":bool}` sets Settings' "Keep the last AutoRecovered
+version if I close without saving" (#613, on by default). With it and
+AutoRecover on, a workbook closed with Don't Save after a hot-exit write while
+it was unsaved (a tick, or any other persist such as switching tabs) leaves a
+copy of that write in `<config>/docxy/drafts/`. An open cell edit is not in it:
+commit the cell (Enter) before the tick. `call drafts {}` replies
+`{"drafts":[{name,path,age_secs}]}`, newest first, and deletes drafts older
+than four days unless one is open in a tab. `call open-draft {"index":N}` opens
+the Nth of a fresh listing read-only, as a click on its row in the backstage's
+Recover Unsaved Workbooks does. The ignored desktop test in
+`uiharness/tests/autorecover.rs` walks the issue's scenario.
 
 `project-tabs.uit` drives several plans at once: a blank one from `proj.new`
 that takes tasks without a fixture, two opened plans switched between by title
@@ -890,7 +903,8 @@ stands for a press outside the menu (`click-cell`, `drag`, `fill-drag`,
 `save-as`, `select-chart`,
 `focus-field`, `ribbon-click`, `title-tab`, `close-tab`, `selection-set`,
 `open`, `backstage` open and close (not `read`), `backstage-close`,
-`theme-set`, `ask-on-close`, `autorecover`, `enable-editing` and the
+`theme-set`, `ask-on-close`, `autorecover`, `keep-drafts`, `open-draft`,
+`enable-editing` and the
 `dialog-*` drivers), which closes it first and then goes on, as the press
 would. Reads leave it open.
 
