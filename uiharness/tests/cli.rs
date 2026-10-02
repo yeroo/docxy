@@ -39,3 +39,24 @@ fn a_bad_command_fails_before_trying_to_connect() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn desktop_without_a_name_is_a_usage_error() {
+    let started = Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_uiharness"))
+        .arg("run")
+        .arg("--desktop")
+        .output()
+        .expect("run uiharness run --desktop");
+    let elapsed = started.elapsed();
+    assert!(!out.status.success());
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "a usage error waited on something: {elapsed:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--desktop needs a value"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

@@ -475,4 +475,22 @@ mod tests {
                 .contains("not JSON")
         );
     }
+
+    /// `--desktop` is an option like the others: it may sit before the
+    /// command and is lifted out of the words the command itself parses.
+    #[test]
+    fn desktop_is_parsed_as_an_option_anywhere_on_the_line() {
+        let a = parsed(&["--desktop", "qa", "run", "x.uit"]);
+        assert_eq!(a.desktop.as_deref(), Some("qa"));
+        assert_eq!(a.rest, ["run", "x.uit"]);
+    }
+
+    #[test]
+    fn desktop_without_a_value_is_a_parse_error() {
+        let e = match parse_from(std::iter::once("--desktop".to_string())) {
+            Ok(_) => panic!("a bare --desktop parsed"),
+            Err(e) => e,
+        };
+        assert!(e.contains("--desktop needs a value"), "{e}");
+    }
 }

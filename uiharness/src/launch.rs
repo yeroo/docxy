@@ -342,4 +342,135 @@ mod tests {
         let e = find_suite(Some(Path::new("no-such-suite.exe"))).unwrap_err();
         assert!(e.contains("no-such-suite.exe"), "{e}");
     }
+
+    /// The desktop launch builds its environment block itself, so the rule
+    /// `command()` gets from std — parent minus the agwinterm variables, one
+    /// `DOCXY_CONFIG_DIR` whatever case the parent used it in — is pinned
+    /// here as a pure function. A stale `docxy_config_dir` reaching the suite
+    /// would point the isolation gate's check at the wrong directory.
+    #[test]
+    fn the_desktop_child_env_strips_agwinterm_and_sets_one_config_dir() {
+        let parent = [
+            ("AGWINTERM_PIPE", "x"),
+            ("docxy_config_dir", "stale"),
+            ("=C:", r"C:\w"),
+            ("PATH", "p"),
+        ]
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let env = child_env(Path::new("S"), parent);
+        let mut names: Vec<String> = env
+            .iter()
+            .map(|(k, _)| k.to_string_lossy().to_ascii_uppercase())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["=C:", "DOCXY_CONFIG_DIR", "PATH"]);
+        let config_dirs = env
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(CONFIG_DIR_ENV))
+            .map(|(_, v)| v.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(config_dirs, [OsString::from("S")]);
+    }
+
+    /// Windows keeps an environment block sorted by name; std sorts its own
+    /// block the same way. Ours must agree, and be NUL-separated, value-less
+    /// entries carried byte-faithfully (the hidden `=C:` ones), and
+    /// double-NUL-terminated.
+    #[cfg(windows)]
+    #[test]
+    fn the_environment_block_is_sorted_nul_separated_and_double_terminated() {
+        use std::os::windows::ffi::OsStrExt;
+        let block = environment_block(&[
+            (OsString::from("b"), OsString::from("2")),
+            (OsString::from("A"), OsString::from("1")),
+        ]);
+        let want: Vec<u16> = std::ffi::OsStr::new("A=1\0b=2\0\0").encode_wide().collect();
+        assert_eq!(block, want);
+        assert_eq!(environment_block(&[]), [0, 0]);
+    }
+
+    /// `CreateProcessW` takes the command line as one writable string, the
+    /// quoted exe and the flag together — the oracle launcher's exact shape.
+    #[test]
+    fn the_command_line_quotes_the_exe_and_passes_harness() {
+        assert_eq!(
+            command_line(Path::new(r"C:\a b\suite.exe")),
+            r#""C:\a b\suite.exe" --harness"#
+        );
+    }
+
+    /// A scratch directory per test: the suite's unit tests run on several
+    /// threads in one process, so the process id alone is not unique.
+    fn temp_dir(tag: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("uiharness-{tag}-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The stub the `exited` tests drive: this test binary again, with a
+    /// flag that makes it exit at once with a failure status. Waiting for it
+    /// here keeps `exited()`'s single poll deterministic.
+    fn exited_stub() -> std::process::Child {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--definitely-not-a-real-test-flag")
+            .spawn()
+            .unwrap();
+        child.wait().unwrap();
+        child
+    }
+
+    /// #722, criterion 4: when the instance exits before connecting, the
+    /// `run` error must carry the tail of the desktop launch's output log —
+    /// a refusal from the isolation gate is written to stderr and is the one
+    /// message a caller most needs to see. The log here holds more than the
+    /// 20 lines reported, so the cut is checked: the first line is absent,
+    /// the last present.
+    #[test]
+    fn the_exited_report_carries_the_output_log_tail() {
+        let dir = temp_dir("log-tail");
+        let log = dir.join("suite-output.log");
+        let mut text = String::new();
+        for i in 0..25 {
+            text.push_str(&format!("log line {i:03}\n"));
+        }
+        std::fs::write(&log, &text).unwrap();
+        let mut app = Launched {
+            proc_: Proc::Std(exited_stub()),
+            sandbox: dir,
+            exe: PathBuf::from("suite.exe"),
+            detached: false,
+            output_log: Some(log.clone()),
+        };
+        let msg = app.exited().expect("the stub has exited");
+        assert!(msg.contains("suite.exe exited: "), "{msg}");
+        assert!(
+            msg.contains(&format!("--- {} (last 20 lines) ---", log.display())),
+            "{msg}"
+        );
+        assert!(msg.contains("log line 024"), "{msg}");
+        assert!(!msg.contains("log line 000"), "{msg}");
+        assert!(!msg.contains("log line 004"), "{msg}");
+    }
+
+    /// Without a log — the plain launch path — `exited()` stays the one line
+    /// it always was, so a desktop run cannot change what a caller of the
+    /// ordinary one sees (#722, criterion 2).
+    #[test]
+    fn the_exited_report_without_a_log_stays_one_line() {
+        let mut app = Launched {
+            proc_: Proc::Std(exited_stub()),
+            sandbox: temp_dir("no-log"),
+            exe: PathBuf::from("suite.exe"),
+            detached: false,
+            output_log: None,
+        };
+        let msg = app.exited().expect("the stub has exited");
+        assert!(msg.contains("suite.exe exited: "), "{msg}");
+        assert!(!msg.contains("last 20 lines"), "{msg}");
+        assert!(!msg.contains('\n'), "{msg}");
+    }
 }
