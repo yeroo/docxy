@@ -1948,18 +1948,24 @@ impl<T: Copy + Ord> RectIndex<T> {
 }
 
 /// Closed intervals `lo..=hi`, each tagged with an id, in a centred
-/// interval tree, for point-stabbing queries.
+/// interval tree, for point-stabbing queries. The per-node lists live in two
+/// arenas (`by_lo`, `by_hi`) that nodes point into by range, so building the
+/// tree costs O(1) allocations no matter how many nodes it has.
 struct StabTree {
     nodes: Vec<StabNode>,
+    /// (lo, id) sorted by lo ascending; `StabNode::by_lo` is a range here.
+    by_lo: Vec<(u32, u32)>,
+    /// (hi, id) sorted by hi descending; `StabNode::by_hi` is a range here.
+    by_hi: Vec<(u32, u32)>,
     root: Option<usize>,
 }
 
 struct StabNode {
     center: u32,
-    /// The intervals containing `center`, as (lo, id) sorted by lo ascending.
-    by_lo: Vec<(u32, u32)>,
-    /// The same intervals, as (hi, id) sorted by hi descending.
-    by_hi: Vec<(u32, u32)>,
+    /// (start, len) into `StabTree::by_lo`.
+    by_lo: (u32, u32),
+    /// (start, len) into `StabTree::by_hi`.
+    by_hi: (u32, u32),
     left: Option<usize>,  // intervals entirely below center
     right: Option<usize>, // intervals entirely above center
 }
@@ -1970,50 +1976,98 @@ impl StabTree {
     /// intervals (an interval past `center` has its midpoint past it too) and
     /// the depth is O(log n).
     fn new(intervals: Vec<(u32, u32, u32)>) -> Self {
-        let mut nodes = Vec::new();
-        let root = Self::build(&mut nodes, intervals);
-        Self { nodes, root }
+        let mut tree = StabTree {
+            nodes: Vec::new(),
+            by_lo: Vec::new(),
+            by_hi: Vec::new(),
+            root: None,
+        };
+        let mut work = intervals;
+        let mut scratch: Vec<(u32, u32, u32)> = Vec::with_capacity(work.len());
+        let mut mids: Vec<u32> = Vec::with_capacity(work.len());
+        tree.root = tree.build(&mut work, &mut scratch, &mut mids);
+        tree
     }
 
-    fn build(nodes: &mut Vec<StabNode>, intervals: Vec<(u32, u32, u32)>) -> Option<usize> {
+    fn build(
+        &mut self,
+        intervals: &mut [(u32, u32, u32)],
+        scratch: &mut Vec<(u32, u32, u32)>,
+        mids: &mut Vec<u32>,
+    ) -> Option<usize> {
         if intervals.is_empty() {
             return None;
         }
-        let mut mids: Vec<u32> = intervals
-            .iter()
-            .map(|&(lo, hi, _)| lo + (hi - lo) / 2)
-            .collect();
-        mids.sort_unstable();
-        let center = mids[mids.len() / 2];
-        let mut here = Vec::new();
-        let mut left = Vec::new();
-        let mut right = Vec::new();
-        for iv @ (lo, hi, _) in intervals {
-            if hi < center {
-                left.push(iv);
-            } else if lo > center {
-                right.push(iv);
-            } else {
-                here.push(iv); // contains center
+        // Center on the median midpoint (lo + (hi - lo) / 2 — no overflow).
+        mids.clear();
+        mids.extend(intervals.iter().map(|&(lo, hi, _)| lo + (hi - lo) / 2));
+        let mid = mids.len() / 2;
+        let (_, center, _) = mids.select_nth_unstable(mid);
+        let center = *center;
+        // Three-way partition in place — left (hi < center), here (contains
+        // center), right (lo > center) — stable, via the reused scratch.
+        scratch.clear();
+        scratch.extend_from_slice(intervals);
+        let mut left_len = 0usize;
+        let mut here_len = 0usize;
+        for &iv in scratch.iter() {
+            if iv.1 < center {
+                left_len += 1;
+            } else if iv.0 <= center {
+                here_len += 1;
             }
         }
+        let (mut li, mut hi_i, mut ri) = (0usize, left_len, left_len + here_len);
+        for &iv in scratch.iter() {
+            if iv.1 < center {
+                intervals[li] = iv;
+                li += 1;
+            } else if iv.0 <= center {
+                intervals[hi_i] = iv;
+                hi_i += 1;
+            } else {
+                intervals[ri] = iv;
+                ri += 1;
+            }
+        }
+        let (left, rest) = intervals.split_at_mut(left_len);
+        let (here, right) = rest.split_at_mut(here_len);
         // The median's own interval contains `center`, so `here` is non-empty
         // and the recursion terminates.
-        let left = Self::build(nodes, left);
-        let right = Self::build(nodes, right);
-        let mut by_lo: Vec<(u32, u32)> = here.iter().map(|&(lo, _, id)| (lo, id)).collect();
-        by_lo.sort_unstable();
-        let mut by_hi: Vec<(u32, u32)> = here.iter().map(|&(_, hi, id)| (hi, id)).collect();
-        by_hi.sort_unstable_by(|a, b| b.cmp(a));
-        let idx = nodes.len();
-        nodes.push(StabNode {
+        let left = self.build(left, scratch, mids);
+        let right = self.build(right, scratch, mids);
+        let lo_start = self.by_lo.len() as u32;
+        self.by_lo.extend(here.iter().map(|&(lo, _, id)| (lo, id)));
+        self.by_lo[lo_start as usize..].sort_unstable();
+        let hi_start = self.by_hi.len() as u32;
+        self.by_hi.extend(here.iter().map(|&(_, hi, id)| (hi, id)));
+        self.by_hi[hi_start as usize..].sort_unstable_by(|a, b| b.cmp(a));
+        let idx = self.nodes.len();
+        self.nodes.push(StabNode {
             center,
-            by_lo,
-            by_hi,
+            by_lo: (lo_start, here.len() as u32),
+            by_hi: (hi_start, here.len() as u32),
             left,
             right,
         });
         Some(idx)
+    }
+
+    /// The node's list for a query below/above center (or all of it at
+    /// center, where every interval matches).
+    fn matches(&self, node: &StabNode, x: u32) -> &[(u32, u32)] {
+        if x < node.center {
+            let (s, l) = node.by_lo;
+            let n = self.by_lo[s as usize..(s + l) as usize].partition_point(|&(lo, _)| lo <= x);
+            &self.by_lo[s as usize..s as usize + n]
+        } else if x > node.center {
+            let (s, l) = node.by_hi;
+            let n = self.by_hi[s as usize..(s + l) as usize].partition_point(|&(hi, _)| hi >= x);
+            &self.by_hi[s as usize..s as usize + n]
+        } else {
+            let (s, l) = node.by_lo;
+            &self.by_lo[s as usize..(s + l) as usize]
+        }
     }
 
     /// How many intervals contain `x` — O(log² n), without visiting them.
@@ -2022,16 +2076,16 @@ impl StabTree {
         let mut cur = self.root;
         while let Some(i) = cur {
             let node = &self.nodes[i];
-            if x < node.center {
-                count += node.by_lo.partition_point(|&(lo, _)| lo <= x);
-                cur = node.left;
-            } else if x > node.center {
-                count += node.by_hi.partition_point(|&(hi, _)| hi >= x);
-                cur = node.right;
-            } else {
-                count += node.by_lo.len();
+            if x == node.center {
+                count += node.by_lo.1 as usize;
                 break;
             }
+            count += self.matches(node, x).len();
+            cur = if x < node.center {
+                node.left
+            } else {
+                node.right
+            };
         }
         count
     }
@@ -2042,24 +2096,20 @@ impl StabTree {
         let mut cur = self.root;
         while let Some(i) = cur {
             let node = &self.nodes[i];
-            if x < node.center {
-                let n = node.by_lo.partition_point(|&(lo, _)| lo <= x);
-                for &(_, id) in &node.by_lo[..n] {
-                    f(id);
-                }
-                cur = node.left;
-            } else if x > node.center {
-                let n = node.by_hi.partition_point(|&(hi, _)| hi >= x);
-                for &(_, id) in &node.by_hi[..n] {
-                    f(id);
-                }
-                cur = node.right;
-            } else {
-                for &(_, id) in &node.by_lo {
+            if x == node.center {
+                for &(_, id) in self.matches(node, x) {
                     f(id);
                 }
                 break;
             }
+            for &(_, id) in self.matches(node, x) {
+                f(id);
+            }
+            cur = if x < node.center {
+                node.left
+            } else {
+                node.right
+            };
         }
     }
 }
