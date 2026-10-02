@@ -271,6 +271,8 @@ impl Docxy {
             // preserve the same previous tab as a clean close or Don't Save.
             self.active = previous_active;
             remove_tab(&mut self.tabs, &mut self.active, i);
+            // The Info page's result is keyed by tab index (#627).
+            self.bs_info_status = None;
             self.drop_grid_state();
         }
         if let Some(e) = &draft_error {

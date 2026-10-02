@@ -2528,7 +2528,8 @@ struct Docxy {
     bs_info: bool,
     /// The last Remove All on the Info page and the tab index it ran on:
     /// the backstage draws no status bar, so the page shows it under the
-    /// rows. Cleared with `bs_info` and on a tab switch.
+    /// rows. Cleared with `bs_info`, on a tab switch, and when a tab is
+    /// closed, moved or reloaded.
     bs_info_status: Option<(usize, Result<String, String>)>,
     clip: Option<DocClip>,
     theme_pref: ThemePref,
@@ -14110,6 +14111,8 @@ impl Docxy {
         Ok(match reopen_step(reopen, tab.dirty, tab.access, mode) {
             ReopenStep::Reload => {
                 self.tabs[i] = tab_from_path_mode(&path, mode, &trusted)?;
+                // A reloaded tab has none of the last Remove All's edits.
+                self.bs_info_status = None;
                 true
             }
             ReopenStep::Ask => {
@@ -23856,6 +23859,8 @@ impl Docxy {
         self.close_menu();
         self.tab_more_open = false;
         if tabstrip::move_index(&mut self.tabs, &mut self.active, from, to) {
+            // The Info page's result is keyed by tab index (#627).
+            self.bs_info_status = None;
             self.persist();
             cx.notify();
         }

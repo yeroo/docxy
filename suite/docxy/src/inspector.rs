@@ -58,7 +58,7 @@ impl InspectCategory {
 }
 
 /// Where the hidden runs Remove All leaves are.
-const UNREMOVABLE_HIDDEN: &str = "inside tracked moves, fields or shapes";
+const UNREMOVABLE_HIDDEN: &str = "inside tracked moves, fields, shapes or other preserved XML";
 
 /// What a document tab holds, per category.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,7 +72,8 @@ pub(crate) struct Inspection {
     /// Hidden runs, tabs and breaks Remove All can remove.
     pub(crate) hidden: usize,
     /// Hidden runs left in raw XML (tracked moves, fields, a group shape's
-    /// other text boxes): found and counted, but Remove All leaves them.
+    /// other text boxes, other preserved XML such as `w:customXml` or an
+    /// unmodeled block): found and counted, but Remove All leaves them.
     pub(crate) hidden_unremovable: usize,
     pub(crate) properties: bool,
 }
@@ -532,12 +533,12 @@ mod tests {
         assert_eq!(found.count(InspectCategory::Hidden), Some(3));
         assert_eq!(
             found.line(InspectCategory::Hidden),
-            "3 hidden runs found (2 inside tracked moves, fields or shapes cannot be removed)."
+            "3 hidden runs found (2 inside tracked moves, fields, shapes or other preserved XML cannot be removed)."
         );
         let status = inspect_remove(&mut tab, InspectCategory::Hidden).unwrap();
         assert_eq!(
             status,
-            "Removed 1 hidden run; 2 inside tracked moves, fields or shapes could not be removed"
+            "Removed 1 hidden run; 2 inside tracked moves, fields, shapes or other preserved XML could not be removed"
         );
         assert!(tab.dirty);
         let after = inspect_doc_tab(&tab).unwrap();
