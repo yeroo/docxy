@@ -128,12 +128,61 @@ fn rect_readers_workbook(rows: u32, cols: u32) -> gridcore::xlsx::SheetPackage {
     pkg
 }
 
+/// The #948 plan-rect-both shape: a data block plus both-tall-and-wide
+/// readers (`SUM(A1:T5000)`-style) whose dep rects cover the whole block.
+fn block_readers_workbook(rows: u32, cols: u32) -> gridcore::xlsx::SheetPackage {
+    let mut pkg = new_xlsx();
+    let sheet = &mut pkg.workbook.sheets[0];
+    for r in 0..rows {
+        for c in 0..cols {
+            sheet.set_cell(r, c, Cell::number((r * cols + c + 1) as f64));
+        }
+    }
+    // 50 block readers in row 0, right of the data block (no overlap with it
+    // or each other): identical `A1:{last}{rows}` dep rects, all covering
+    // every data seed.
+    let last = col_name(cols - 1);
+    for c in cols + 1..=cols + 50 {
+        sheet.set_cell(0, c, Cell::formula(&format!("SUM(A1:{last}{rows})")));
+    }
+    pkg
+}
+
 fn bench_edit_rect_readers(c: &mut Criterion) {
     // Steady-state: one data-cell edit at a time against tall/wide readers,
     // cycling through the data block so successive edits hit different seeds.
     let mut g = c.benchmark_group("edit_rect_readers");
     for (rows, cols) in [(1000u32, 10u32), (5000, 20)] {
         let pkg = rect_readers_workbook(rows, cols);
+        let mut wb = pkg.workbook.clone();
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        let total = (rows * cols) as usize;
+        let mut n = 0usize;
+        g.bench_with_input(
+            BenchmarkId::from_parameter(format!("{rows}x{cols}")),
+            &(rows, cols),
+            |b, _| {
+                b.iter(|| {
+                    let i = n % total;
+                    n += 1;
+                    let r = (i / cols as usize) as u32;
+                    let c = (i % cols as usize) as u32;
+                    eng.set_cell(&mut wb, (0, r, c), Cell::number(black_box(n as f64)));
+                    black_box(&wb);
+                });
+            },
+        );
+    }
+    g.finish();
+}
+
+fn bench_edit_block_readers(c: &mut Criterion) {
+    // Steady-state: one data-cell edit at a time against block readers that
+    // all cover the edited cell.
+    let mut g = c.benchmark_group("edit_block_readers");
+    for (rows, cols) in [(1000u32, 10u32), (5000, 20)] {
+        let pkg = block_readers_workbook(rows, cols);
         let mut wb = pkg.workbook.clone();
         let mut eng = Engine::new(&wb);
         eng.recalc_all(&mut wb);
@@ -164,6 +213,55 @@ fn bench_recalc_rect_readers(c: &mut Criterion) {
             let mut wb = pkg.workbook.clone();
             let mut eng = Engine::new(&wb);
             eng.recalc_all(&mut wb);
+            black_box(&wb);
+        })
+    });
+}
+
+/// The Use-2 shape (#948 plan-rect-both): each iteration replaces one
+/// formula, so `set_cell` drops the cached reverse map and the recalc
+/// rebuilds it through `take_rev` — the build this change rewrote. (`recalc_all`
+/// alone never reaches `take_rev`: it goes straight to `evaluate`.)
+fn bench_edit_formula_block_readers(c: &mut Criterion) {
+    let pkg = block_readers_workbook(1000, 10);
+    let mut wb = pkg.workbook.clone();
+    let mut eng = Engine::new(&wb);
+    eng.recalc_all(&mut wb);
+    let cell = (0, 2, 70); // free: right of the 50 readers
+    let mut toggle = false;
+    c.bench_function("edit_formula_block_readers_1000x10", |b| {
+        b.iter(|| {
+            // Two texts, so every iteration really changes `formulas` and
+            // invalidates the cache.
+            toggle = !toggle;
+            let f = if toggle {
+                "SUM(A1:J1000)"
+            } else {
+                "SUM(A1:J999)"
+            };
+            eng.set_cell(&mut wb, cell, Cell::formula(f));
+            black_box(&wb);
+        })
+    });
+}
+
+/// The same rebuild shape over the tall/wide readers of #878/#935.
+fn bench_edit_formula_rect_readers(c: &mut Criterion) {
+    let pkg = rect_readers_workbook(1000, 10);
+    let mut wb = pkg.workbook.clone();
+    let mut eng = Engine::new(&wb);
+    eng.recalc_all(&mut wb);
+    let cell = (0, 2, 70); // free: right of the wide readers
+    let mut toggle = false;
+    c.bench_function("edit_formula_rect_readers_1000x10", |b| {
+        b.iter(|| {
+            toggle = !toggle;
+            let f = if toggle {
+                "SUM(A1:J1000)"
+            } else {
+                "SUM(A1:J999)"
+            };
+            eng.set_cell(&mut wb, cell, Cell::formula(f));
             black_box(&wb);
         })
     });
@@ -211,7 +309,10 @@ criterion_group!(
     bench_recalc_grid,
     bench_incremental_edit,
     bench_edit_rect_readers,
+    bench_edit_block_readers,
     bench_recalc_rect_readers,
+    bench_edit_formula_rect_readers,
+    bench_edit_formula_block_readers,
     bench_xlsx_roundtrip,
     bench_formula_parse
 );
