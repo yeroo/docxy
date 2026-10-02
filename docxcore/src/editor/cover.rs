@@ -81,8 +81,14 @@ impl Editor {
     }
 
     /// Insert two page breaks at the caret (Blank Page), replacing any
-    /// selection, as Page Break does. The breaks take the formatting typing
-    /// at the caret would.
+    /// selection, as Page Break does: the caret's paragraph ends with the
+    /// first, a paragraph of its own holds the second, and the text after the
+    /// caret starts the page after the blank one, where the caret goes. A
+    /// break ending each paragraph is what pages a paragraph-by-paragraph
+    /// layout (the suite's page view) as Word does: one break in the middle
+    /// of a paragraph would leave the blank page to a renderer that splits
+    /// paragraphs. One undo step (a selection's deletion aside). The breaks
+    /// take the formatting typing at the caret would.
     pub fn insert_blank_page(&mut self) {
         if self.has_selection() {
             self.delete_selection();
@@ -91,10 +97,11 @@ impl Editor {
             .map(|p| tab_props_at(&p.content, self.caret.offset))
             .unwrap_or_default();
         self.paste(&Clip {
-            paras: vec![vec![
-                Inline::Break(BreakKind::Page, props.clone()),
-                Inline::Break(BreakKind::Page, props),
-            ]],
+            paras: vec![
+                vec![Inline::Break(BreakKind::Page, props.clone())],
+                vec![Inline::Break(BreakKind::Page, props)],
+                Vec::new(),
+            ],
         });
     }
 

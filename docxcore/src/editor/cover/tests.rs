@@ -358,18 +358,33 @@ fn blank_page_is_two_page_breaks_in_one_step() {
         offset: 4,
     };
     e.insert_blank_page();
-    let Block::Paragraph(p) = &e.doc.body[0] else {
-        panic!()
+    let page_breaks = |b: &Block| match b {
+        Block::Paragraph(p) => p
+            .content
+            .iter()
+            .filter(|i| matches!(i, Inline::Break(BreakKind::Page, _)))
+            .count(),
+        _ => 0,
     };
-    let breaks = p
-        .content
-        .iter()
-        .filter(|i| matches!(i, Inline::Break(BreakKind::Page, _)))
-        .count();
-    assert_eq!(breaks, 2);
-    assert_eq!(p.plain_text(), "Body\n\n text");
-    assert_eq!(e.caret.offset, 6);
+    // "Body" ends its page, the blank page is a paragraph of its own, and
+    // " text" starts the page after it, with the caret.
+    let breaks: Vec<usize> = e.doc.body[..3].iter().map(page_breaks).collect();
+    assert_eq!(breaks, [1, 1, 0]);
+    assert_eq!(
+        text_at(&e, &[0]),
+        "Body
+"
+    );
+    assert_eq!(
+        text_at(&e, &[1]),
+        "
+"
+    );
+    assert_eq!(text_at(&e, &[2]), " text");
+    assert_eq!(e.caret.path, vec![2]);
+    assert_eq!(e.caret.offset, 0);
     assert!(e.undo());
     assert_eq!(text_at(&e, &[0]), "Body text");
+    assert_eq!(e.doc.body.len(), 3, "two paragraphs and the sectPr");
     assert!(!e.undo(), "one step");
 }
