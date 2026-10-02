@@ -64,6 +64,23 @@ fn apply_dialog(
         }
         // Handled in `reopen_click`, before this: Yes replaces the whole tab.
         DialogOwner::Reopen { .. } => Err("reopening replaces the tab".into()),
+        // Handled in `mailings_dialogs::click`, before this: they act on the
+        // whole tab and may open a document.
+        DialogOwner::MailEnvelopes
+        | DialogOwner::MailEnvelopeOptions
+        | DialogOwner::MailEnvelopesReplace(_)
+        | DialogOwner::MailLabels
+        | DialogOwner::MailLabelOptions
+        | DialogOwner::MailLabelsReplace(_)
+        | DialogOwner::MailRecipients
+        | DialogOwner::MailAddressBlock
+        | DialogOwner::MailGreetingLine
+        | DialogOwner::MailMatchFields
+        | DialogOwner::MailFind
+        | DialogOwner::MailCheckErrors
+        | DialogOwner::MailMergeToNew
+        | DialogOwner::MailAttach { .. }
+        | DialogOwner::MailReport => Err("a mail merge dialog applies through Mailings".into()),
         #[cfg(test)]
         DialogOwner::Test => Ok(false),
     }
@@ -108,6 +125,9 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Result<(), String>
         return done;
     }
     if let Some(done) = reopen_click(tab, button) {
+        return done;
+    }
+    if let Some(done) = crate::mailings_dialogs::click(tab, button) {
         return done;
     }
     let DocTab {
@@ -217,6 +237,8 @@ impl Docxy {
         if reopen {
             self.after_reopen();
         }
+        // A merge or a sheet of labels opens as a new document.
+        self.take_mail_outputs();
         Ok(())
     }
 
@@ -244,6 +266,7 @@ impl Docxy {
             if reopen {
                 self.after_reopen();
             }
+            self.take_mail_outputs();
             cx.notify();
         }
         taken

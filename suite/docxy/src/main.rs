@@ -33,6 +33,8 @@ mod hf_tab;
 mod html_bundle;
 mod inspector;
 mod layout_tab;
+mod mailings_dialogs;
+mod mailings_tab;
 mod menu;
 mod open_mode;
 #[cfg(test)]
@@ -332,6 +334,8 @@ enum RibbonTab {
     Insert,
     /// Word's page Layout tab (#649); documents only.
     Layout,
+    /// Word's Mailings tab (#628); documents only.
+    Mailings,
     Review,
     View,
     /// Word's contextual Table Design tab (#648) — only while the caret is
@@ -2484,6 +2488,9 @@ struct DocTab {
     /// (#613). Don't Save keeps a copy of it as the tab's draft. A `RefCell`
     /// because `persist` takes `&self`.
     last_hot: std::cell::RefCell<Option<PathBuf>>,
+    /// This document's mail merge (#628): its type, recipient list and
+    /// preview state.
+    mail: mailings_tab::MailState,
 }
 
 impl DocTab {
@@ -4105,6 +4112,8 @@ struct RenderCtx<'a> {
     tbl: &'a TableCtx<'a>,
     /// The story's cell-range selection, highlighted cell by cell.
     cell_range: Option<&'a docxcore::editor::CellRange>,
+    /// Mailings ▸ Highlight Merge Fields is on: merge fields draw shaded.
+    merge_hl: bool,
 }
 
 /// What drawing a table needs beyond the table: the package's styles part
@@ -4282,6 +4291,7 @@ impl Loaded {
             dirty,
             status: self.status,
             comments: self.comments,
+            mail: mailings_tab::MailState::from_pkg(self.pkg.as_ref()),
             pkg: self.pkg,
             notes: self.notes,
             markdown: self.markdown,
@@ -4473,6 +4483,7 @@ fn sheet_tab_from_path(path: &PathBuf, repair: bool) -> DocTab {
         dialogs: crate::dialog::DialogStack::default(),
         access: crate::open_mode::Access::default(),
         last_hot: Default::default(),
+        mail: Default::default(),
     }
 }
 
@@ -7399,6 +7410,7 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 dialogs: crate::dialog::DialogStack::default(),
                 access: crate::open_mode::Access::default(),
                 last_hot: Default::default(),
+                mail: Default::default(),
             }
         }
         // A document with no sidecar reloads its file, bundle included; the
@@ -7418,6 +7430,7 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 dirty: t.dirty,
                 status,
                 comments,
+                mail: mailings_tab::MailState::from_pkg(pkg.as_ref()),
                 pkg,
                 notes,
                 markdown,
@@ -7996,6 +8009,7 @@ impl Docxy {
             dialogs: crate::dialog::DialogStack::default(),
             access: crate::open_mode::Access::default(),
             last_hot: Default::default(),
+            mail: Default::default(),
         };
         self.tabs.push(match kind {
             Kind::Project => new_project_tab(),
@@ -13761,8 +13775,9 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
     // .docx.
     let kind = html_bundle::doc_target(&path, markdown);
     let bytes = match kind {
+        // Without a mail-merge preview: the record is display only.
         html_bundle::DocTarget::Markdown => {
-            docxcore::markdown::to_markdown(&editor.doc).into_bytes()
+            docxcore::markdown::to_markdown(&editor.export_doc()).into_bytes()
         }
         html_bundle::DocTarget::Docx => doc_to_docx(&editor.doc, &tab.comments, tab.pkg.as_ref()),
         html_bundle::DocTarget::Html => {
@@ -14278,6 +14293,8 @@ impl Docxy {
                 tab.dirty = true;
             } else if let Surface::Doc(ed) = &mut tab.surface {
                 f(ed);
+                // A merge field the edit added shows the previewed record too.
+                ed.refresh_merge_preview();
                 tab.dirty = true;
             }
         }
@@ -17320,6 +17337,7 @@ mod sheet_save_tests {
             dialogs: crate::dialog::DialogStack::default(),
             access: crate::open_mode::Access::default(),
             last_hot: Default::default(),
+            mail: Default::default(),
         }
     }
 
@@ -18212,6 +18230,8 @@ enum Act {
     Hf(hf_tab::HfAct),
     /// A page Layout tab command (#649).
     Layout(layout_tab::LayoutAct),
+    /// A Mailings tab command (#628).
+    Mail(mailings_tab::MailAct),
     InsertEquation,
     /// A Table Design or table Layout command, or an Insert > Table item
     /// (#646-#648).
@@ -18509,6 +18529,7 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
             ],
         ),
         layout_tab::layout_tab(),
+        mailings_tab::mailings_tab(),
         // Review: a large New Comment + a small pane-toggle column, then Editing.
         rs::tab(
             "Review",
@@ -18606,10 +18627,13 @@ fn ribbon_for(kind: Kind) -> rs::Ribbon<Act> {
     match kind {
         Kind::Project => project_ribbon(),
         Kind::Docx => docxy_ribbon(),
-        // The same tabs as `ribbon_tab_set` gives a workbook: no Layout.
+        // The same tabs as `ribbon_tab_set` gives a workbook: no Layout and
+        // no Mailings.
         _ => {
             let mut ribbon = docxy_ribbon();
-            ribbon.tabs.retain(|t| t.name != "Layout");
+            ribbon
+                .tabs
+                .retain(|t| t.name != "Layout" && t.name != "Mailings");
             ribbon
         }
     }
@@ -18632,6 +18656,7 @@ fn ribbon_tab_set(kind: Kind) -> &'static [(Option<RibbonTab>, &'static str, &'s
             (Some(Home), "Home", "H"),
             (Some(Insert), "Insert", "N"),
             (Some(Layout), "Layout", "P"),
+            (Some(Mailings), "Mailings", "M"),
             (Some(Review), "Review", "R"),
             (Some(View), "View", "W"),
         ]
@@ -18682,6 +18707,7 @@ fn ribbon_tab_name(tab: RibbonTab) -> &'static str {
         RibbonTab::Home => "Home",
         RibbonTab::Insert => "Insert",
         RibbonTab::Layout => "Layout",
+        RibbonTab::Mailings => "Mailings",
         RibbonTab::Review => "Review",
         RibbonTab::View => "View",
         RibbonTab::TableDesign => table_tab::DESIGN_TAB,
@@ -18704,6 +18730,8 @@ fn ribbon_tab_name(tab: RibbonTab) -> &'static str {
 fn act_enabled(act: Act) -> bool {
     match act {
         Act::Layout(act) => layout_tab::layout_enabled(act),
+        // As a document with no recipient list has them.
+        Act::Mail(act) => mailings_tab::mail_enabled(&mailings_tab::MailState::default(), act),
         Act::Table(act) => act != table_tab::TableAct::Unavailable,
         _ => true,
     }
@@ -19745,6 +19773,7 @@ fn hf_els(blocks: &[Block], pal: Pal, meas: &Measurer, hf_width: f32) -> Vec<Any
                 pal,
                 Some(meas),
                 Some(hf_width),
+                false,
             )),
             _ => None,
         })
@@ -20000,6 +20029,7 @@ fn paragraph_el(
     pal: Pal,
     meas: Option<&Measurer>,
     hf_width: Option<f32>,
+    merge_hl: bool,
 ) -> AnyElement {
     use docxcore::model::TabAlign;
     let base = zoom
@@ -20172,7 +20202,7 @@ fn paragraph_el(
                     );
                 }
             }
-            Inline::Field { text, .. } => {
+            Inline::Field { raw, text } => {
                 // Show the field's cached value with a subtle shade so it reads as a
                 // field, not plain text. A field showing a result is ONE char in the
                 // engine (#642), edited as a unit: it takes the caret before it, a
@@ -20190,11 +20220,23 @@ fn paragraph_el(
                     caret = None;
                 }
                 let selected = width == 1 && sel.is_some_and(|(s, e)| s < e && s <= pos && pos < e);
+                // Highlight Merge Fields (#628): merge fields, not PAGE or DATE,
+                // take a stronger shade. The keyword test rules most fields out
+                // before any parse.
+                let merge = merge_hl
+                    && docxcore::merge::might_be_merge_field(raw)
+                    && docxcore::merge::field_kind(raw).is_some();
                 spans.push(
                     div()
                         .px(px(2.))
                         .rounded_sm()
-                        .bg(if selected { pal.sel } else { pal.panel })
+                        .bg(if selected {
+                            pal.sel
+                        } else if merge {
+                            Hsla { a: 0.35, ..pal.dim }
+                        } else {
+                            pal.panel
+                        })
                         .text_size(px(base))
                         .text_color(pal.fg)
                         .child(SharedString::from(shown))
@@ -20615,6 +20657,7 @@ fn block_el(b: &Block, path: Vec<usize>, marker: Option<&str>, ctx: RenderCtx) -
                 ctx.pal,
                 Some(ctx.meas),
                 ctx.hf_width,
+                ctx.merge_hl,
             )
         }
         Block::Table(t) => table_el(t, &path, ctx),
@@ -20935,6 +20978,10 @@ impl Docxy {
                         (Some(m), Act::Layout(_)) => {
                             layout_tab::menu_items(m, |a| self.act_active(a))
                         }
+                        (_, Act::Mail(_)) if mailings_tab::menu_of(cmd.id).is_some() => {
+                            let tab = self.tabs.get(self.active)?;
+                            mailings_tab::menu_items(&tab.mail, mailings_tab::menu_of(cmd.id)?)
+                        }
                         (None, _) if hf_tab::menu_of(cmd.id).is_some() => {
                             hf_tab::menu_items(self.tabs.get(self.active), hf_tab::menu_of(cmd.id)?)
                         }
@@ -20954,7 +21001,16 @@ impl Docxy {
                             group: group.title.into(),
                             label: cmd.label.into(),
                         },
-                        hf_tab::menu_items(self.tabs.get(self.active), hf_tab::menu_of(cmd.id)?),
+                        match mailings_tab::menu_of(cmd.id) {
+                            // The record box lists the attached rows.
+                            Some(menu) => {
+                                mailings_tab::menu_items(&self.tabs.get(self.active)?.mail, menu)
+                            }
+                            None => hf_tab::menu_items(
+                                self.tabs.get(self.active),
+                                hf_tab::menu_of(cmd.id)?,
+                            ),
+                        },
                     )),
                     _ => None,
                 }),
@@ -21270,6 +21326,7 @@ impl Docxy {
             LineSpacing => self.toggle_picker(PickKind::LineSpacing, window, cx),
             Hf(act) => self.hf_act(act, window, cx),
             Layout(act) => self.layout_act(act, window, cx),
+            Mail(act) => self.mail_act(act, window, cx),
             Table(act) => self.table_act(act, window, cx),
             // Home > Sort with the caret in a table opens the table's Sort
             // dialog (#647); elsewhere it sorts the selected paragraphs.
@@ -21341,7 +21398,8 @@ impl Docxy {
                 | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide
                 | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField
                 | PageBreak | ToggleNotes | InsertTable | InsertSymbol | InsertEquation
-                | LineSpacing | Hf(_) | Layout(_) | Table(_) | PrintLayout | ToggleRuler => {}
+                | LineSpacing | Hf(_) | Layout(_) | Mail(_) | Table(_) | PrintLayout
+                | ToggleRuler => {}
             }),
         }
     }
@@ -22982,6 +23040,12 @@ impl Docxy {
                 .and_then(|t| hf_tab::distance_text(t, is_header))
                 .unwrap_or_default()
                 .into()
+        } else if cmd.id == "mailrecord" {
+            self.tabs
+                .get(self.active)
+                .map(|t| t.mail.record_text())
+                .unwrap_or_default()
+                .into()
         } else if cmd.id == "fontname" {
             props
                 .and_then(|p| p.font)
@@ -23173,6 +23237,12 @@ impl Docxy {
     /// table command, the edited story's state (Merge Cells needs a cell
     /// range, Convert Text to Table a selection outside a table).
     pub(crate) fn act_enabled_now(&self, act: Act) -> bool {
+        if let Act::Mail(a) = act {
+            return self
+                .tabs
+                .get(self.active)
+                .is_some_and(|t| mailings_tab::mail_enabled(&t.mail, a));
+        }
         act_enabled(act)
             && match act {
                 Act::Table(a) => table_tab::table_enabled(self.edit_target_ref(), a),
@@ -23222,6 +23292,10 @@ impl Docxy {
                 .tabs
                 .get(self.active)
                 .is_some_and(|t| hf_tab::hf_checked(t, act)),
+            Mail(act) => self
+                .tabs
+                .get(self.active)
+                .is_some_and(|t| mailings_tab::mail_checked(&t.mail, act)),
             Table(act) => {
                 table_tab::table_checked(self.edit_target_ref(), self.view_gridlines, act)
             }
@@ -24499,6 +24573,7 @@ impl Render for Docxy {
                         hf_width: None,
                         tbl: &tbl,
                         cell_range: body_range.as_ref(),
+                        merge_hl: tab.mail.highlight,
                     };
                     let body = &editor.doc.body;
                     if self.page_view {
@@ -24584,6 +24659,7 @@ impl Render for Docxy {
                             hf_width: Some(hf_w),
                             tbl: &tbl,
                             cell_range: hf_range.as_ref(),
+                            merge_hl: tab.mail.highlight,
                         });
                         // The first page showing the edited section and variant is the
                         // editable page (see `hf::edit_page`).

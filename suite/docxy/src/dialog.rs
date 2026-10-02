@@ -65,6 +65,30 @@ pub(crate) enum DialogOwner {
     Reopen {
         mode: crate::open_mode::OpenMode,
     },
+    /// The Mailings tab's dialogs (#628), applied by `mailings_dialogs`:
+    /// Envelopes (Create) and Envelope Options (Start Mail Merge), and its
+    /// confirm before it replaces the document with an envelope of `size`.
+    MailEnvelopes,
+    MailEnvelopeOptions,
+    MailEnvelopesReplace(docxcore::merge::envelope::EnvelopeSize),
+    /// Labels (Create), Label Options (Start Mail Merge), and its confirm.
+    MailLabels,
+    MailLabelOptions,
+    MailLabelsReplace(docxcore::merge::labels::LabelSpec),
+    MailRecipients,
+    MailAddressBlock,
+    MailGreetingLine,
+    MailMatchFields,
+    MailFind,
+    MailCheckErrors,
+    MailMergeToNew,
+    /// "Opening this document will run the following SQL command": Yes reads
+    /// the document's own data source, then runs `then`.
+    MailAttach {
+        then: crate::mailings_tab::MailAct,
+    },
+    /// A mail-merge report (Check for Errors' result): OK closes it.
+    MailReport,
     /// A dialog the model tests build; the app never applies one.
     #[cfg(test)]
     Test,
