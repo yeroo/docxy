@@ -349,3 +349,27 @@ fn binary_paths_and_the_open_filter() {
     assert!(OPEN_EXTENSIONS.contains(&"doc"));
     assert!(OPEN_EXTENSIONS.contains(&"docx"));
 }
+
+/// A document Word itself saved as Word 97-2003 opens the same way, with
+/// its formatting.
+#[test]
+fn a_word_made_doc_opens_imported() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/legacy/word/formatting.doc");
+    let tab = tab_from_path(&path);
+    assert!(!tab.load_failed, "{}", tab.status);
+    assert_eq!(tab.status.as_ref(), IMPORTED_STATUS);
+    assert_eq!(tab.caption(), "formatting.doc [Compatibility Mode]");
+    assert!(is_imported(&tab));
+    assert_eq!(save_name(&tab), "formatting.docx");
+    let Surface::Doc(ed) = &tab.surface else {
+        panic!("not a document tab")
+    };
+    let bold = ed.doc.body.iter().any(|b| match b {
+        docxcore::model::Block::Paragraph(p) => p.content.iter().any(
+            |i| matches!(i, docxcore::model::Inline::Run(r) if r.text == "bold" && r.props.bold),
+        ),
+        _ => false,
+    });
+    assert!(bold, "{}", text_of(&tab));
+}
