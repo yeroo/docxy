@@ -14479,14 +14479,10 @@ impl Docxy {
         let ctx = self.field_context();
         let val =
             docxcore::field::eval_field_ctx(instr, &ctx).unwrap_or_else(|| fallback.to_string());
-        let raw = format!(
-            "<w:fldSimple w:instr=\"{}\"><w:r><w:t xml:space=\"preserve\">{}</w:t></w:r></w:fldSimple>",
-            xml_escape(instr),
-            xml_escape(&val)
-        );
         self.with_editor(window, cx, |e| {
+            let field = docxcore::field::fld_simple(instr, &val, &e.caret_props());
             e.paste(&Clip {
-                paras: vec![vec![Inline::Field { raw, text: val }]],
+                paras: vec![vec![field]],
             })
         });
     }

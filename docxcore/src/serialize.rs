@@ -657,6 +657,13 @@ fn write_changed_revision(s: &mut String, kind: RevisionKind, raw: &str, content
     s.push('>');
 }
 
+/// One run's XML (`<w:r>` with its `w:rPr` and `w:t`).
+pub(crate) fn run_xml(r: &Run) -> String {
+    let mut s = String::new();
+    write_run(&mut s, r, RunTextKind::Normal);
+    s
+}
+
 fn write_run(s: &mut String, r: &Run, text_kind: RunTextKind) {
     s.push_str("<w:r>");
     write_rpr(s, &r.props);

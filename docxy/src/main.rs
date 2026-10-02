@@ -3920,12 +3920,7 @@ impl App {
 
     fn build_field(&self, kind: FieldKind) -> Inline {
         let text = self.field_value(kind);
-        let raw = format!(
-            "<w:fldSimple w:instr=\"{}\"><w:r><w:t xml:space=\"preserve\">{}</w:t></w:r></w:fldSimple>",
-            xml_esc_attr(kind.instr()),
-            xml_esc_text(&text),
-        );
-        Inline::Field { raw, text }
+        docxcore::field::fld_simple(kind.instr(), &text, &self.editor.caret_props())
     }
 
     fn apply_insert_field(&mut self) {
@@ -7026,16 +7021,6 @@ fn safe_url(url: &str) -> bool {
     }
     let lower = url.to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
-}
-
-fn xml_esc_text(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-fn xml_esc_attr(s: &str) -> String {
-    xml_esc_text(s).replace('"', "&quot;")
 }
 
 /// Whether the clipboard text looks like a single URL (so Paste Special can offer
