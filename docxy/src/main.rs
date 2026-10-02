@@ -4601,13 +4601,6 @@ impl App {
         let Some(item) = p.kind.items().get(p.sel).copied() else {
             return;
         };
-        if matches!(
-            p.kind,
-            PickerKind::PageColor | PickerKind::Watermark | PickerKind::PageBorders
-        ) {
-            self.apply_design_pick(p.kind, item);
-            return;
-        }
         match p.kind {
             PickerKind::FontName => self.editor.set_font(item),
             PickerKind::FontSize => {
@@ -4628,7 +4621,11 @@ impl App {
                     self.editor.insert_equation(latex, false);
                 }
             }
-            PickerKind::PageColor | PickerKind::Watermark | PickerKind::PageBorders => {}
+            PickerKind::PageColor | PickerKind::Watermark | PickerKind::PageBorders => {
+                // The design picks set their own status; the generic one below
+                // must not overwrite it.
+                return self.apply_design_pick(p.kind, item);
+            }
         }
         self.after_edit();
         self.status = Some(format!("{}: {item}", p.kind.title().trim()));
@@ -4658,7 +4655,7 @@ impl App {
                     self.modified = true;
                 }
                 self.status = Some(match bg {
-                    Some(b) => format!("Page color: {}", page_color_name(b.color)),
+                    Some(_) => format!("Page color: {item}"),
                     None => "Page color: No Color".to_string(),
                 });
             }
@@ -4733,7 +4730,7 @@ impl App {
                 // after_edit clears the status: report the pick after it.
                 self.status = Some(format!("Page borders: {item}"));
             }
-            _ => {}
+            _ => unreachable!("not a Design picker: {kind:?}"),
         }
         self.dirty = true;
     }
@@ -10276,6 +10273,11 @@ mod tests {
         pick(&mut app, PickerKind::PageColor, "No Color");
         assert!(app.pkg.page_background().is_none());
         assert!(!app.pkg.has_display_background_shape());
+        // The status names the picked label even when two colours share an RGB
+        // ("Orange" and "Gold, Accent 4" are both 0xFFC000).
+        app.run_act(ribbon::Act::PageColor);
+        pick(&mut app, PickerKind::PageColor, "Orange");
+        assert_eq!(app.status.as_deref(), Some("Page color: Orange"));
     }
 
     #[test]
@@ -10350,7 +10352,8 @@ mod tests {
         let sects = app.editor.sections();
         assert_eq!(sects.len(), 2, "{sects:?}");
         for s in &sects {
-            let pb = PageBorders::parse(s).expect("page borders in every section: {s}");
+            let pb = PageBorders::parse(s)
+                .unwrap_or_else(|| panic!("page borders in every section: {s}"));
             assert_eq!(pb.offset_from, PgBorderOffset::Page);
             for side in &pb.sides {
                 let side = side.as_ref().expect("all four sides set");
@@ -10408,7 +10411,10 @@ mod tests {
                 app.font_picker.is_none(),
                 "{act:?} opened a picker for Markdown"
             );
-            let status = app.status.take().expect("status for {act:?}");
+            let status = app
+                .status
+                .take()
+                .unwrap_or_else(|| panic!("status for {act:?}"));
             assert!(status.contains(".docx"), "{status}");
         }
     }

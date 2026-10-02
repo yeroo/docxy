@@ -38,7 +38,7 @@ part, and adding a comment is Comment even though it also adds body anchors.
 | Lists | bullets and numbering, including numbering-part creation | Formatting |
 | Insert ribbon/dialogs | symbols, fields, page number, equations | Content |
 | Insert ribbon/dialogs | table, page break, section break | Structure |
-| Document layout | columns, hyphenation, section orientation | Formatting |
+| Document layout | columns, hyphenation, section orientation, page colour, watermark, page borders | Formatting |
 | Review | commit new comment and delete comment | Comment |
 | Review | accept/reject current or confirmed accept/reject all tracked changes | Content |
 | Header/footer | typing, deletion, formatting, paste, and committing the edited part | same Content, Structure, or Formatting class as the body operation |
@@ -62,7 +62,8 @@ ShrinkFont, ChangeCase, ClearFormatting, Bullets, Numbering, IncreaseIndent,
 DecreaseIndent, FirstLineIndent, HangingIndent, Sort, ParaBorders, AlignLeft,
 AlignCenter, AlignRight, Justify, ApplyStyle, NewComment, DeleteComment, and the
 commits made by InsertField, InsertSymbol, InsertEquation, LineSpacing,
-ParagraphDialog, StylesDialog, and font/size/color/highlight pickers. Dialog
+ParagraphDialog, StylesDialog, font/size/color/highlight pickers, and the
+PageColor, Watermark, and PageBorders pickers. Dialog
 open, navigation, and cancel paths are non-mutating.
 
 ## Control and MCP routes
