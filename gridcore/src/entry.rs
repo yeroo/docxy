@@ -233,8 +233,22 @@ pub fn entry_ctx(wb: &Workbook, today: Option<f64>) -> EntryCtx {
 
 /// `n` with its decimal point moved `places` to the left (right when
 /// negative), kept to 15 digits; a shift that overflows leaves `n` as it was.
+///
+/// The shift is done on the decimal text, not by dividing by `10^places`:
+/// `powi` is not correctly rounded on every platform, while parsing a
+/// decimal is, so every platform stores the same number.
 fn fixed_decimal(n: f64, places: i16) -> f64 {
-    let shifted = round15(n / 10f64.powi(i32::from(places)));
+    let text = format!("{n:e}");
+    let Some((mantissa, exp)) = text.split_once('e') else {
+        return n;
+    };
+    let Ok(exp) = exp.parse::<i32>() else {
+        return n;
+    };
+    let shifted: f64 = format!("{mantissa}e{}", exp - i32::from(places))
+        .parse()
+        .unwrap_or(f64::INFINITY);
+    let shifted = round15(shifted);
     if shifted.is_finite() { shifted } else { n }
 }
 
@@ -1931,6 +1945,17 @@ mod tests {
         // 1E+300 × 1E+300 is infinite: the number stays as typed.
         let big = format!("1{}", "0".repeat(300));
         assert_eq!(fixed_number(&big, -300), 1e300);
+        // Exact at the far ends of Places, on every platform: the shift is
+        // decimal, so no power of ten is rounded along the way.
+        assert_eq!(fixed_number("7", 299), 7e-299);
+        assert_eq!(fixed_number("123", -290), 1.23e292);
+        assert_eq!(fixed_number("1", -300), 1e300);
+        assert_eq!(fixed_number("-45", 3), -0.045);
+        assert_eq!(fixed_number("0", 300), 0.0);
+        for places in -300..=300 {
+            let want: f64 = format!("1e{}", -places).parse().unwrap();
+            assert_eq!(fixed_number("1", places), want, "1 at {places}");
+        }
     }
 
     #[test]
