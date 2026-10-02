@@ -1106,17 +1106,19 @@ impl Engine {
     /// reference rectangles).
     ///
     /// The naive form is O(n²) — every formula tested against every other. This
-    /// indexes the scope's cells per sheet, sorted by (row, col), so each
-    /// dependency rectangle is answered by a binary search for its first row
-    /// plus a walk over only the cells actually inside it. That turns a full
-    /// recalc of an `n`-cell dependency chain from O(n²) into ~O(n log n).
+    /// indexes the scope's cells per sheet in both (row, col) and (col, row)
+    /// order, so each dependency rectangle is answered from the narrower of
+    /// its row band and its column band — not a walk over every cell in the
+    /// row band. That turns a full recalc of an `n`-cell dependency chain
+    /// from O(n²) into ~O(n log n).
     fn dependency_edges(&self, scope: &[Key]) -> Vec<(Key, Vec<Key>)> {
-        let mut by_sheet: HashMap<usize, Vec<(u32, u32, Key)>> = HashMap::new();
+        let mut cells_by_sheet: HashMap<usize, Vec<(u32, u32, Key)>> = HashMap::new();
         for &k in scope {
-            by_sheet.entry(k.0).or_default().push((k.1, k.2, k));
+            cells_by_sheet.entry(k.0).or_default().push((k.1, k.2, k));
         }
-        for cells in by_sheet.values_mut() {
-            cells.sort_unstable_by_key(|&(r, c, _)| (r, c));
+        let mut by_sheet: HashMap<usize, RectIndex<Key>> = HashMap::new();
+        for (s, cells) in cells_by_sheet {
+            by_sheet.insert(s, RectIndex::new(cells));
         }
         let mut out: Vec<(Key, Vec<Key>)> = Vec::with_capacity(scope.len());
         let mut srcs: Vec<Key> = Vec::new();
@@ -1124,10 +1126,10 @@ impl Engine {
             let info = &self.formulas[&f];
             srcs.clear();
             for &(ds, r1, c1, r2, c2) in &info.deps {
-                let Some(cells) = by_sheet.get(&ds) else {
+                let Some(idx) = by_sheet.get(&ds) else {
                     continue;
                 };
-                srcs.extend(cells_in_rect(cells, r1, c1, r2, c2).map(|&(_, _, g)| g));
+                srcs.extend(idx.in_rect(r1, c1, r2, c2).copied());
             }
             // One edge per (dependent, source) even if several rects overlap it.
             srcs.sort_unstable();
@@ -1139,20 +1141,20 @@ impl Engine {
 
     /// The formulas not in `skip` with a dependency rectangle covering one of
     /// `seeds` (plain-value cells, which `rev` cannot reach). Seeds are indexed
-    /// per sheet, sorted by (row, col), so each rectangle costs a binary search
-    /// for its first row plus a walk over the seeds in its row band — not a
+    /// per sheet in both (row, col) and (col, row) order, so each rectangle is
+    /// answered from the narrower of its row band and its column band — not a
     /// test against every seed.
     fn formulas_reading(&self, seeds: &[Key], skip: &HashSet<Key>) -> Vec<Key> {
-        let mut by_sheet: HashMap<usize, Vec<(u32, u32, ())>> = HashMap::new();
+        let mut cells_by_sheet: HashMap<usize, Vec<(u32, u32, ())>> = HashMap::new();
         for &(s, r, c) in seeds {
-            by_sheet.entry(s).or_default().push((r, c, ()));
+            cells_by_sheet.entry(s).or_default().push((r, c, ()));
         }
-        if by_sheet.is_empty() {
+        if cells_by_sheet.is_empty() {
             return Vec::new();
         }
-        for cells in by_sheet.values_mut() {
-            cells.sort_unstable();
-            cells.dedup();
+        let mut by_sheet: HashMap<usize, RectIndex<()>> = HashMap::new();
+        for (s, cells) in cells_by_sheet {
+            by_sheet.insert(s, RectIndex::new(cells));
         }
         let mut out = Vec::new();
         'formulas: for (&fk, info) in &self.formulas {
@@ -1160,10 +1162,10 @@ impl Engine {
                 continue;
             }
             for &(ds, r1, c1, r2, c2) in &info.deps {
-                let Some(cells) = by_sheet.get(&ds) else {
+                let Some(idx) = by_sheet.get(&ds) else {
                     continue;
                 };
-                if cells_in_rect(cells, r1, c1, r2, c2).next().is_some() {
+                if idx.in_rect(r1, c1, r2, c2).next().is_some() {
                     out.push(fk);
                     continue 'formulas;
                 }
@@ -1785,23 +1787,58 @@ struct SpillOwner {
     frozen_ref_covers: Option<bool>,
 }
 
-/// The entries of `cells` — sorted by (row, col) — inside the inclusive
-/// rectangle rows r1..=r2, cols c1..=c2. Cells are (row, col)-ordered, so the
-/// rect's rows are the contiguous slice from the first row ≥ r1 up to the
-/// last ≤ r2: a binary search for the first row, then a walk over that row
-/// band only.
-fn cells_in_rect<T>(
-    cells: &[(u32, u32, T)],
-    r1: u32,
-    c1: u32,
-    r2: u32,
-    c2: u32,
-) -> impl Iterator<Item = &(u32, u32, T)> {
-    let start = cells.partition_point(|&(r, _, _)| r < r1);
-    cells[start..]
-        .iter()
-        .take_while(move |&&(r, _, _)| r <= r2)
-        .filter(move |&&(_, c, _)| c >= c1 && c <= c2)
+/// Cells indexed for rectangle queries in both (row, col) and (col, row)
+/// order, so a query walks only the narrower of its row band and its column
+/// band. Both orders hold the same entries; `by_col` swaps the key order to
+/// (col, row), so when it is chosen the minor key is the row.
+struct RectIndex<T> {
+    by_row: Vec<(u32, u32, T)>, // (row, col, payload), sorted
+    by_col: Vec<(u32, u32, T)>, // (col, row, payload), sorted
+}
+
+/// The contiguous slice of `cells` — sorted by major key — whose major key is
+/// in `a1..=a2`: two binary searches, O(log n).
+fn band<T>(cells: &[(u32, u32, T)], a1: u32, a2: u32) -> &[(u32, u32, T)] {
+    let start = cells.partition_point(|&(a, _, _)| a < a1);
+    let end = cells.partition_point(|&(a, _, _)| a <= a2);
+    &cells[start..end]
+}
+
+impl<T: Copy + Ord> RectIndex<T> {
+    /// Indexes `cells`, given as (row, col, payload); both orders are sorted
+    /// and deduped.
+    fn new(cells: Vec<(u32, u32, T)>) -> Self {
+        let mut by_row = cells;
+        by_row.sort_unstable();
+        by_row.dedup();
+        let mut by_col: Vec<(u32, u32, T)> = by_row.iter().map(|&(r, c, p)| (c, r, p)).collect();
+        by_col.sort_unstable();
+        Self { by_row, by_col }
+    }
+
+    /// The band `in_rect` walks for this rectangle — the narrower of the row
+    /// band and the column band (the row band on ties) — with the minor-key
+    /// bounds for filtering it.
+    fn chosen_band(&self, r1: u32, c1: u32, r2: u32, c2: u32) -> (&[(u32, u32, T)], u32, u32) {
+        let row_band = band(&self.by_row, r1, r2);
+        let col_band = band(&self.by_col, c1, c2);
+        if col_band.len() < row_band.len() {
+            (col_band, r1, r2) // minor key is the row
+        } else {
+            (row_band, c1, c2) // minor key is the col
+        }
+    }
+
+    /// The payloads inside the inclusive rectangle rows `r1..=r2`, cols
+    /// `c1..=c2`, from whichever order's band is narrower (the row band on
+    /// ties), filtered by the minor key.
+    fn in_rect(&self, r1: u32, c1: u32, r2: u32, c2: u32) -> impl Iterator<Item = &T> {
+        let (slice, lo, hi) = self.chosen_band(r1, c1, r2, c2);
+        slice
+            .iter()
+            .filter(move |&&(_, m, _)| m >= lo && m <= hi)
+            .map(|(_, _, p)| p)
+    }
 }
 
 /// Clear the plain-value cells of a spill (keeping styles) outside the
@@ -3687,8 +3724,9 @@ mod tests {
 
     #[test]
     fn formulas_reading_tall_rect_ignores_other_columns() {
-        // #878: a tall rect (A1:A1000) walks only the seeds in its row band;
-        // seeds in other columns don't match, one inside the column does.
+        // #878: a tall rect (A1:A1000) walks only the narrower of its row and
+        // column bands; seeds in other columns don't match, one inside the
+        // column does.
         let mut wb = wb_one_sheet(&[("C1", Cell::formula("SUM(A1:A1000)"))]);
         let mut eng = Engine::new(&wb);
         eng.recalc_all(&mut wb);
@@ -3699,6 +3737,141 @@ mod tests {
             eng.formulas_reading(&b_seeds, &HashSet::new()),
             vec![(0, 0, 2)]
         );
+    }
+
+    #[test]
+    fn rect_index_walks_narrower_band() {
+        // #935: a tall narrow rect is answered from the (col, row) order and a
+        // wide short rect from the (row, col) order, so the walk covers only
+        // the narrower band — not every indexed cell in the row band.
+        let col_b: Vec<(u32, u32, ())> = (0..10_000u32).map(|r| (r, 1, ())).collect();
+        let idx = RectIndex::new(col_b);
+        // A1:A1048576 — every row, column A only; no entry is in it, and the
+        // chosen band (which `in_rect` walks) is the empty column band.
+        let tall = (0, 0, crate::sheet::MAX_ROWS - 1, 0);
+        assert_eq!(idx.chosen_band(tall.0, tall.1, tall.2, tall.3).0.len(), 0);
+        assert!(idx.in_rect(tall.0, tall.1, tall.2, tall.3).next().is_none());
+
+        let row_2: Vec<(u32, u32, ())> = (0..10_000u32).map(|c| (1, c, ())).collect();
+        let idx = RectIndex::new(row_2);
+        // Row 1 across every column; no entry is in it, and the chosen band
+        // is the empty row band.
+        let wide = (0, 0, 0, crate::sheet::MAX_COLS - 1);
+        assert_eq!(idx.chosen_band(wide.0, wide.1, wide.2, wide.3).0.len(), 0);
+        assert!(idx.in_rect(wide.0, wide.1, wide.2, wide.3).next().is_none());
+
+        // One entry inside each rect: the walk covers exactly it.
+        let mut col_b: Vec<(u32, u32, ())> = (0..10_000u32).map(|r| (r, 1, ())).collect();
+        col_b.push((699, 0, ()));
+        let idx = RectIndex::new(col_b);
+        assert_eq!(idx.chosen_band(tall.0, tall.1, tall.2, tall.3).0.len(), 1);
+        assert_eq!(idx.in_rect(tall.0, tall.1, tall.2, tall.3).count(), 1);
+
+        let mut row_2: Vec<(u32, u32, ())> = (0..10_000u32).map(|c| (1, c, ())).collect();
+        row_2.push((0, 5, ()));
+        let idx = RectIndex::new(row_2);
+        assert_eq!(idx.chosen_band(wide.0, wide.1, wide.2, wide.3).0.len(), 1);
+        assert_eq!(idx.in_rect(wide.0, wide.1, wide.2, wide.3).count(), 1);
+    }
+
+    #[test]
+    fn rect_index_matches_naive_filter() {
+        // #935: for every rect, the dual-order query equals the naive
+        // inclusive filter — with edge rects, a duplicate input entry
+        // (deduped) and an empty index.
+        let mut cells: Vec<(u32, u32, (u32, u32))> = Vec::new();
+        for r in 0..12u32 {
+            for c in 0..12u32 {
+                if (r * 7 + c * 3) % 5 != 0 {
+                    cells.push((r, c, (r, c)));
+                }
+            }
+        }
+        cells.push(cells[cells.len() - 1]); // one duplicate input entry
+        let idx = RectIndex::new(cells.clone());
+
+        let bounds = [0u32, 1, 5, 11, 12, 20];
+        for &r1 in &bounds {
+            for &r2 in &bounds {
+                if r1 > r2 {
+                    continue;
+                }
+                for &c1 in &bounds {
+                    for &c2 in &bounds {
+                        if c1 > c2 {
+                            continue;
+                        }
+                        let mut got: Vec<(u32, u32)> =
+                            idx.in_rect(r1, c1, r2, c2).copied().collect();
+                        got.sort_unstable();
+                        let mut want: Vec<(u32, u32)> = cells
+                            .iter()
+                            .filter(|&&(r, c, _)| r >= r1 && r <= r2 && c >= c1 && c <= c2)
+                            .map(|&(_, _, p)| p)
+                            .collect();
+                        want.sort_unstable();
+                        want.dedup();
+                        assert_eq!(got, want, "rect rows {r1}..={r2}, cols {c1}..={c2}");
+                    }
+                }
+            }
+        }
+
+        let empty: RectIndex<(u32, u32)> = RectIndex::new(Vec::new());
+        for &r1 in &bounds {
+            for &r2 in &bounds {
+                for &c1 in &bounds {
+                    for &c2 in &bounds {
+                        assert!(
+                            empty.in_rect(r1, c1, r2, c2).next().is_none(),
+                            "empty rect rows {r1}..={r2}, cols {c1}..={c2}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn whole_row_and_column_readers_recalc_after_edits() {
+        // #935 side effect: a whole-column and a whole-row reader recalc
+        // through the seed index on edits to cells they cover — and not on
+        // edits elsewhere. The dual-order index preserves this behaviour;
+        // this test guards the values, and
+        // rect_index_walks_narrower_band guards the band choice.
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("A2", Cell::number(2.0)),
+            ("A3", Cell::number(3.0)),
+            ("A4", Cell::number(4.0)),
+            ("A5", Cell::number(5.0)),
+            ("B1", Cell::number(10.0)),
+            ("B2", Cell::number(10.0)),
+            ("B3", Cell::number(10.0)),
+            ("B4", Cell::number(10.0)),
+            ("B5", Cell::number(10.0)),
+            ("C1", Cell::formula("SUM(A:A)")),
+            ("E1", Cell::formula("SUM(2:2)")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(15.0));
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(12.0));
+
+        // A seed in another column of the tall rect, outside row 2: neither moves.
+        set(&mut eng, &mut wb, "B3", Cell::number(100.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(15.0));
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(12.0));
+
+        // A seed in the column: the column reader moves, the row reader does not.
+        set(&mut eng, &mut wb, "A3", Cell::number(30.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(42.0));
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(12.0));
+
+        // A seed in the row: the row reader moves, the column reader does not.
+        set(&mut eng, &mut wb, "B2", Cell::number(20.0));
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(22.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(42.0));
     }
 
     #[test]
