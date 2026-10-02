@@ -51,16 +51,18 @@ pub fn sniff(bytes: &[u8], ext: &str) -> Format {
     if bytes.starts_with(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]) {
         return Format::Cfb;
     }
-    // A PDF reader accepts junk before the header, within the first 1 KB.
-    if find(&bytes[..bytes.len().min(1024)], b"%PDF-").is_some() {
-        return Format::Pdf;
-    }
+    // The signatures that must start the file come first, so a page or an
+    // RTF that only mentions `%PDF-` near its top is still what it is.
     let text = trim_text_start(bytes);
     if text.starts_with(b"{\\rtf") {
         return Format::Rtf;
     }
     if looks_like_html(text) {
         return Format::Html;
+    }
+    // A PDF reader accepts junk before the header, within the first 1 KB.
+    if find(&bytes[..bytes.len().min(1024)], b"%PDF-").is_some() {
+        return Format::Pdf;
     }
     match ext.to_ascii_lowercase().as_str() {
         "rtf" => Format::Rtf,
@@ -383,6 +385,15 @@ mod tests {
         assert_eq!(sniff(b"plain words", "DOCX"), Format::Docx);
         assert_eq!(sniff(b"plain words", "txt"), Format::Unknown);
         assert_eq!(sniff(b"<note>xml</note>", "xml"), Format::Unknown);
+        // Mentioning the PDF header does not make a page or an RTF a PDF.
+        assert_eq!(
+            sniff(
+                b"<html><head><title>Notes on %PDF-1.7 headers</title>",
+                "htm"
+            ),
+            Format::Html
+        );
+        assert_eq!(sniff(b"{\\rtf1 about %PDF-1.4}", "rtf"), Format::Rtf);
     }
 
     #[test]
