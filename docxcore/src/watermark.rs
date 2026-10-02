@@ -169,15 +169,97 @@ fn cut(xml: &str, mut spans: Vec<(usize, usize)>) -> String {
     out
 }
 
-/// Whether a slice holds content of its own: a run, a table or a field.
+/// What makes a paragraph or a gallery control more than an emptied shell:
+/// runs, tables, fields and links, equations, and the range markers
+/// (bookmarks, comments, permissions, moves) that anchor elsewhere.
+const CONTENT: [&str; 18] = [
+    "w:r",
+    "w:tbl",
+    "w:hyperlink",
+    "w:fldSimple",
+    "w:sdt",
+    "w:smartTag",
+    "w:customXml",
+    "m:oMath",
+    "m:oMathPara",
+    "w:bookmarkStart",
+    "w:bookmarkEnd",
+    "w:commentRangeStart",
+    "w:commentRangeEnd",
+    "w:permStart",
+    "w:permEnd",
+    "w:moveFromRangeStart",
+    "w:moveToRangeStart",
+    "w:moveFromRangeEnd",
+];
+
+/// Whether a slice holds content of its own (see [`CONTENT`]).
 fn has_content(xml: &str) -> bool {
-    ["w:r", "w:tbl", "w:hyperlink", "w:fldSimple"]
-        .iter()
-        .any(|n| !element_spans(xml, n).is_empty())
+    CONTENT.iter().any(|n| !element_spans(xml, n).is_empty())
 }
 
-/// Remove every run whose `w:pict` holds a `PowerPlusWaterMarkObject`
-/// shape, and the paragraph it sat in when that keeps no content.
+/// Elements whose children are blocks, and which must keep one.
+const CONTAINERS: [&str; 6] = [
+    "w:hdr",
+    "w:ftr",
+    "w:tc",
+    "w:sdtContent",
+    "w:txbxContent",
+    "w:body",
+];
+const BLOCKS: [&str; 5] = ["w:p", "w:tbl", "w:sdt", "w:customXml", "w:altChunk"];
+
+/// Whether the element at `a..b` is the only block its innermost container
+/// holds: removing it would leave a header, a cell or a control with none.
+fn sole_block(xml: &str, a: usize, b: usize) -> bool {
+    // The innermost container around a..b: open containers as a stack.
+    let mut parser = XmlParser::new(xml);
+    let mut open: Vec<Option<usize>> = Vec::new();
+    let mut best: Option<(usize, usize)> = None;
+    loop {
+        match parser.next() {
+            Event::Start => {
+                let container = CONTAINERS.contains(&parser.name());
+                open.push(container.then(|| parser.start_pos()));
+            }
+            Event::End => {
+                if let Some(Some(s)) = open.pop() {
+                    let e = parser.pos();
+                    if s < a && b <= e && best.is_none_or(|(bs, be)| e - s < be - bs) {
+                        best = Some((s, e));
+                    }
+                }
+            }
+            Event::Eof => break,
+            Event::Text => {}
+        }
+    }
+    let Some((s, e)) = best else {
+        return false;
+    };
+    // Its direct block children.
+    let mut parser = XmlParser::new(&xml[s..e]);
+    let mut depth = 0usize;
+    let mut blocks = 0usize;
+    loop {
+        match parser.next() {
+            Event::Start => {
+                depth += 1;
+                if depth == 2 && BLOCKS.contains(&parser.name()) {
+                    blocks += 1;
+                }
+            }
+            Event::End => depth = depth.saturating_sub(1),
+            Event::Eof => return blocks <= 1,
+            Event::Text => {}
+        }
+    }
+}
+
+/// Remove every run that holds a watermark (by the readers' own test,
+/// [`crate::package::holds_watermark`]: a text, picture or DrawingML one),
+/// and the paragraph it sat in when that keeps no content and is not the
+/// last block of its header, cell or control.
 fn strip_watermark_runs(xml: &str) -> String {
     let mut out = xml.to_string();
     loop {
@@ -188,7 +270,7 @@ fn strip_watermark_runs(xml: &str) -> String {
                     .into_iter()
                     .map(move |(a, b)| (pa + a, pa + b))
             })
-            .filter(|&(a, b)| out[a..b].contains(SHAPE_ID))
+            .filter(|&(a, b)| crate::package::holds_watermark(&out[a..b]))
             .collect();
         let Some(&(a, b)) = runs.first() else {
             return out;
@@ -198,25 +280,29 @@ fn strip_watermark_runs(xml: &str) -> String {
             .find(|&(pa, pb)| pa <= a && b <= pb);
         let next = cut(&out, vec![(a, b)]);
         out = match para {
-            Some((pa, pb)) if !has_content(&next[pa..pb - (b - a)]) => {
-                cut(&next, vec![(pa, pb - (b - a))])
+            Some((pa, pb)) => {
+                let pb = pb - (b - a);
+                if !has_content(&next[pa..pb]) && !sole_block(&next, pa, pb) {
+                    cut(&next, vec![(pa, pb)])
+                } else {
+                    next
+                }
             }
-            _ => next,
+            None => next,
         };
     }
 }
 
-/// Remove every watermark from a header part's XML: the run whose `w:pict`
-/// holds a `PowerPlusWaterMarkObject` shape (its paragraph too when nothing
-/// else is left in it), and a "Watermarks" gallery `w:sdt` whole when the
-/// watermark was all it held. A gallery control someone typed into keeps
-/// what they typed. Other content stays byte for byte; a header left with no
-/// paragraph gets an empty one, as the schema requires.
+/// Remove every watermark from a header part's XML: a run that holds one
+/// (its paragraph too when nothing else is left in it), and a "Watermarks"
+/// gallery `w:sdt` whole when the watermark was all it held. A gallery
+/// control someone typed into keeps what they typed. Other content stays
+/// byte for byte; nothing is left without the block the schema requires.
 pub fn strip_watermarks(xml: &str) -> String {
-    if !xml.contains(SHAPE_ID) && !xml.contains("w:val=\"Watermarks\"") {
+    if !crate::package::holds_watermark(xml) && !xml.contains("w:val=\"Watermarks\"") {
         return xml.to_string();
     }
-    let empty_sdts: Vec<(usize, usize)> = element_spans(xml, "w:sdt")
+    let mut empty_sdts: Vec<(usize, usize)> = element_spans(xml, "w:sdt")
         .into_iter()
         .filter(|&(a, b)| {
             let sdt = &xml[a..b];
@@ -226,7 +312,15 @@ pub fn strip_watermarks(xml: &str) -> String {
             is_watermark_sdt(sdt) && !has_content(&strip_watermark_runs(content))
         })
         .collect();
-    ensure_a_paragraph(&strip_watermark_runs(&cut(xml, empty_sdts)))
+    // From the end, so earlier spans stay put; a control that is the only
+    // block of its container leaves an empty paragraph in its place.
+    empty_sdts.sort_unstable();
+    let mut out = xml.to_string();
+    for &(a, b) in empty_sdts.iter().rev() {
+        let keep = if sole_block(&out, a, b) { "<w:p/>" } else { "" };
+        out.replace_range(a..b, keep);
+    }
+    ensure_a_paragraph(&strip_watermark_runs(&out))
 }
 
 /// A `w:hdr` with no block left gets an empty paragraph.
@@ -399,5 +493,76 @@ mod tests {
         let again = insert_watermark(&typed, &TextWatermarkSpec::preset("SAMPLE", true), 2);
         assert_eq!(text_watermarks(&again).len(), 1);
         assert!(again.contains("<w:t>Acme Corp</w:t>"));
+    }
+
+    /// A gallery control holding Word's picture watermark (or a DrawingML
+    /// one) is a watermark too: strip removes it, and a new watermark
+    /// replaces it rather than joining it.
+    #[test]
+    fn picture_and_drawingml_watermarks_are_stripped_and_replaced() {
+        let gallery = |run: &str| {
+            format!(
+                "<w:hdr xmlns:w=\"W\" xmlns:v=\"V\" xmlns:wp=\"WP\"><w:sdt><w:sdtPr><w:docPartObj>\
+                 <w:docPartGallery w:val=\"Watermarks\"/></w:docPartObj></w:sdtPr><w:sdtContent>\
+                 <w:p><w:r>{run}</w:r></w:p></w:sdtContent></w:sdt><w:p><w:r><w:t>Keep</w:t></w:r></w:p></w:hdr>"
+            )
+        };
+        let vml = gallery(
+            "<w:pict><v:shape id=\"WordPictureWatermark123\"><v:imagedata r:id=\"rImg\"/></v:shape></w:pict>",
+        );
+        let dml = gallery(
+            "<w:drawing><wp:anchor><wp:docPr id=\"1\" name=\"Picture 1 Watermark\"/></wp:anchor></w:drawing>",
+        );
+        for hdr in [vml, dml] {
+            assert!(crate::package::holds_watermark(&hdr));
+            let out = strip_watermarks(&hdr);
+            assert!(!crate::package::holds_watermark(&out), "{out}");
+            assert!(!out.contains("<w:sdt>"), "the emptied control goes: {out}");
+            assert!(out.contains("<w:t>Keep</w:t>"));
+            let replaced = insert_watermark(&hdr, &TextWatermarkSpec::preset("DRAFT", true), 1);
+            assert_eq!(replaced.matches("<w:sdt>").count(), 1, "{replaced}");
+            assert_eq!(text_watermarks(&replaced).len(), 1);
+            assert!(
+                !replaced.contains("WordPictureWatermark")
+                    && !replaced.contains("Picture 1 Watermark")
+            );
+        }
+    }
+
+    /// A watermark alone in a table cell's paragraph leaves the paragraph
+    /// (a cell needs one); equations and bookmarks keep a paragraph too.
+    #[test]
+    fn an_emptied_paragraph_stays_when_its_container_needs_it_or_it_anchors_something() {
+        let mark = "<w:r><w:pict><v:shape id=\"PowerPlusWaterMarkObject1\"><v:textpath string=\"X\"/></v:shape></w:pict></w:r>";
+        let cell = format!(
+            "<w:hdr xmlns:w=\"W\" xmlns:v=\"V\"><w:tbl><w:tr><w:tc><w:tcPr/><w:p><w:pPr><w:jc w:val=\"center\"/></w:pPr>{mark}</w:p></w:tc></w:tr></w:tbl><w:p/></w:hdr>"
+        );
+        let out = strip_watermarks(&cell);
+        assert!(
+            out.contains(
+                "<w:tc><w:tcPr/><w:p><w:pPr><w:jc w:val=\"center\"/></w:pPr></w:p></w:tc>"
+            ),
+            "{out}"
+        );
+        for anchor in [
+            "<m:oMath><m:r><m:t>x</m:t></m:r></m:oMath>",
+            "<w:bookmarkStart w:id=\"0\" w:name=\"b\"/><w:bookmarkEnd w:id=\"0\"/>",
+            "<w:commentRangeStart w:id=\"1\"/>",
+        ] {
+            let hdr = format!(
+                "<w:hdr xmlns:w=\"W\" xmlns:v=\"V\" xmlns:m=\"M\"><w:p>{anchor}{mark}</w:p><w:p/></w:hdr>"
+            );
+            let out = strip_watermarks(&hdr);
+            assert!(out.contains(anchor), "{out}");
+            assert!(!out.contains("PowerPlus"));
+        }
+        // Two paragraphs: the emptied one goes.
+        let two = format!(
+            "<w:hdr xmlns:w=\"W\" xmlns:v=\"V\"><w:p>{mark}</w:p><w:p><w:r><w:t>T</w:t></w:r></w:p></w:hdr>"
+        );
+        assert_eq!(
+            strip_watermarks(&two),
+            "<w:hdr xmlns:w=\"W\" xmlns:v=\"V\"><w:p><w:r><w:t>T</w:t></w:r></w:p></w:hdr>"
+        );
     }
 }

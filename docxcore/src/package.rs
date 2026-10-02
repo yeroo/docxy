@@ -659,6 +659,14 @@ fn marker_in_attrs(parser: &XmlParser<'_>) -> bool {
     })
 }
 
+/// Whether `xml` holds a watermark the readers would report: a VML shape or
+/// a DrawingML `docPr` whose id, name, title or description names one (a
+/// `PowerPlusWaterMarkObject` text, Word's `WordPictureWatermark`, …). The
+/// writer strips by the same test (#651).
+pub(crate) fn holds_watermark(xml: &str) -> bool {
+    !watermark_shapes(xml).is_empty()
+}
+
 fn watermark_kinds(xml: &str) -> Vec<WatermarkKind> {
     watermark_shapes(xml)
         .into_iter()
@@ -1494,8 +1502,14 @@ impl Package {
             Some(_) => self.shown_header_parts(sect_prs, true),
             None => Vec::new(),
         };
-        let mut changed = false;
+        let mut visit: Vec<&String> = Vec::new();
         for name in referenced.iter().chain(&shown) {
+            if !visit.contains(&name) {
+                visit.push(name);
+            }
+        }
+        let mut changed = false;
+        for name in visit {
             let Some(xml) = self.part_text(name) else {
                 continue;
             };
@@ -5347,6 +5361,37 @@ mod tests {
         pkg.set_part_text(&first, &old);
         assert!(pkg.set_text_watermark(None, &mut sects));
         assert!(text_watermarks(&pkg.part_text(&first).unwrap()).is_empty());
+    }
+
+    /// Word's picture watermark (VML or DrawingML, in its gallery control)
+    /// is replaced by a text one, never kept beside it, and Remove takes it.
+    #[test]
+    fn text_watermark_replaces_and_removes_picture_watermarks() {
+        use crate::watermark::TextWatermarkSpec;
+        for run in [
+            "<w:pict><v:shape id=\"WordPictureWatermark1\"><v:imagedata r:id=\"rImg\"/></v:shape></w:pict>",
+            "<w:drawing><wp:anchor><wp:docPr id=\"1\" name=\"Watermark\"/></wp:anchor></w:drawing>",
+        ] {
+            let mut pkg = hf_pkg();
+            let gallery = format!(
+                "<w:sdt><w:sdtPr><w:docPartObj><w:docPartGallery w:val=\"Watermarks\"/></w:docPartObj>\
+                 </w:sdtPr><w:sdtContent><w:p><w:r>{run}</w:r></w:p></w:sdtContent></w:sdt><w:p/>"
+            );
+            let (rid, _) = pkg.create_hf_part(true, &gallery).unwrap();
+            let sect = crate::sect::set_hf_reference(pkg.sect_pr(), true, "default", Some(&rid));
+            pkg.set_sect_pr(sect);
+            assert_eq!(pkg.watermarks().len(), 1);
+            assert!(pkg.apply_text_watermark(Some(&TextWatermarkSpec::preset("DRAFT", true))));
+            let kinds: Vec<WatermarkKind> = pkg.watermarks().into_iter().map(|w| w.kind).collect();
+            assert_eq!(kinds, [WatermarkKind::Text("DRAFT".into())], "{run}");
+            // Back to the picture, then Remove.
+            pkg.set_part_text(
+                &pkg.watermarks()[0].header.part_name.clone(),
+                &format!("<w:hdr xmlns:w=\"W\">{gallery}</w:hdr>"),
+            );
+            assert!(pkg.apply_text_watermark(None));
+            assert!(pkg.watermarks().is_empty(), "{run}");
+        }
     }
 
     /// With different odd and even pages, the even-page header gets one too.
