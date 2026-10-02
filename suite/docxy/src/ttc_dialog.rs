@@ -499,6 +499,7 @@ mod tests {
             dirty: false,
             status: "".into(),
             comments: vec![],
+            session_comment_ids: Default::default(),
             pkg: None,
             notes: vec![],
             markdown: false,

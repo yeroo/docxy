@@ -99,6 +99,9 @@ pub(crate) enum DialogOwner {
     /// Page Borders' Options...: its OK writes back into Page Borders
     /// ([`ChildDialog::PageBorderOptions`]), never into the document.
     DesignBorderOptions,
+    /// Settings' User name... (#620): the reviewer name and initials new
+    /// comments carry. An app setting, applied by `user_name::click`.
+    UserName,
     /// A dialog the model tests build; the app never applies one.
     #[cfg(test)]
     Test,

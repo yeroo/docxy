@@ -1346,6 +1346,8 @@ fn prefs() -> Prefs {
         autorecover_minutes: 10,
         keep_drafts: true,
         edit_opts: gridcore::options::EditOptions::default(),
+        user_name: String::new(),
+        user_initials: String::new(),
     }
 }
 

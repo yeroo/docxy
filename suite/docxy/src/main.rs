@@ -23,6 +23,8 @@ compile_error!(
 );
 
 mod close;
+#[cfg(test)]
+mod comment_tests;
 mod control;
 mod convert_child;
 #[cfg(test)]
@@ -68,6 +70,7 @@ mod table_view;
 mod tabstrip;
 mod trusted;
 mod ttc_dialog;
+mod user_name;
 use open_mode::{OpenMode, Reopen, ReopenStep, reopen_step};
 use project::*;
 
@@ -272,6 +275,13 @@ struct Session {
     /// defaults.
     #[serde(default)]
     sheet_editing: String,
+    /// File › Options › General › "Personalize your copy": the name and
+    /// initials new comments are stamped with (#620). Empty means the OS
+    /// account name and the initials derived from it ([`review_identity`]).
+    #[serde(default)]
+    user_name: String,
+    #[serde(default)]
+    user_initials: String,
 }
 
 fn autorecover_default() -> u32 {
@@ -303,18 +313,22 @@ impl Default for Session {
             autorecover_minutes: recover::DEFAULT_MINUTES,
             keep_drafts: true,
             sheet_editing: String::new(),
+            user_name: String::new(),
+            user_initials: String::new(),
         }
     }
 }
 
 /// The settings `session.json` carries besides the tabs.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Prefs {
     theme: ThemePref,
     ask_on_close: bool,
     autorecover_minutes: u32,
     keep_drafts: bool,
     edit_opts: EditOptions,
+    user_name: String,
+    user_initials: String,
 }
 
 /// Environment variable that redirects every file the app persists — the
@@ -2717,6 +2731,11 @@ struct DocTab {
     /// Review comments anchored in this document (markers live in the body; the
     /// text/author is stored here and written to comments.xml on save).
     comments: Vec<Comment>,
+    /// The ids in `comments` added since the tab loaded (#620). Such a
+    /// comment is listed and saved only while a marker with its id is in
+    /// the body ([`live_comments`]), so undoing Add Comment removes it and
+    /// redo brings it back. Saves keep the set; a load starts it empty.
+    session_comment_ids: std::collections::HashSet<String>,
     /// The original package this doc was loaded from, kept so a save re-serializes
     /// only document.xml back into it and preserves every other part (footnotes,
     /// headers/footers, images, themes, …). `None` for a new empty document.
@@ -2843,6 +2862,10 @@ struct Docxy {
     /// keeps a copy that [`stamp_edit_opts`] refreshes on restore, on a
     /// change and every frame (and `active_sheet_mut` on each use).
     edit_opts: EditOptions,
+    /// The reviewer's name and initials for new comments (#620), as set in
+    /// Settings › User name; empty falls back ([`review_identity`]).
+    user_name: String,
+    user_initials: String,
     /// Ctrl+Shift+U: the formula bar shows about four lines. View state for
     /// this session, not persisted.
     fx_expanded: bool,
@@ -4599,6 +4622,7 @@ impl Loaded {
             dirty,
             status: self.status,
             comments: self.comments,
+            session_comment_ids: Default::default(),
             mail: mailings_tab::MailState::from_pkg(self.pkg.as_ref()),
             pkg: self.pkg,
             notes: self.notes,
@@ -4737,6 +4761,7 @@ fn finish_pending_conversion(tab: &mut DocTab) {
     tab.hf_edit = None;
     tab.surface = Surface::Doc(Editor::new(l.doc));
     tab.comments = l.comments;
+    tab.session_comment_ids.clear();
     tab.notes = l.notes;
     tab.mail = mailings_tab::MailState::from_pkg(l.pkg.as_ref());
     tab.pkg = l.pkg;
@@ -4979,6 +5004,7 @@ fn sheet_tab_from_path(path: &PathBuf, repair: bool) -> DocTab {
         dirty: false,
         status,
         comments: vec![],
+        session_comment_ids: Default::default(),
         pkg: None,
         notes: vec![],
         markdown: false,
@@ -7741,6 +7767,7 @@ fn protected_rollback(tab: &mut DocTab) {
         if let Some(l) = reloaded {
             tab.surface = Surface::Doc(Editor::new(l.doc));
             tab.comments = l.comments;
+            tab.session_comment_ids.clear();
             tab.notes = l.notes;
             tab.mail = mailings_tab::MailState::from_pkg(l.pkg.as_ref());
             tab.pkg = l.pkg;
@@ -7906,6 +7933,8 @@ fn write_session(root: &std::path::Path, tabs: &[DocTab], active: usize, prefs: 
         autorecover_minutes: prefs.autorecover_minutes,
         keep_drafts: prefs.keep_drafts,
         sheet_editing: prefs.edit_opts.to_lines(),
+        user_name: prefs.user_name,
+        user_initials: prefs.user_initials,
     };
     if let Ok(json) = serde_json::to_string_pretty(&session) {
         let p = session_path_in(root);
@@ -7933,6 +7962,85 @@ fn autorecover_prepare(tabs: &mut [DocTab]) -> bool {
 
 /// Serialize a document to `.docx` bytes, adding a numbering part when it uses
 /// lists (so markers survive the round-trip and open correctly in Word).
+/// The comments `tab` lists and saves (#620): every one it loaded, and each
+/// one added since while a marker with its id is in `doc`'s body. Undo of
+/// Add Comment takes the markers, so the comment goes; [`doc_to_docx`] then
+/// drops it from a base that a save already wrote it to.
+fn live_comments(tab: &DocTab, doc: &Document) -> Vec<Comment> {
+    if tab.session_comment_ids.is_empty() {
+        return tab.comments.clone();
+    }
+    let live = docxcore::inspect::comment_marker_ids(doc);
+    tab.comments
+        .iter()
+        .filter(|c| !tab.session_comment_ids.contains(&c.id) || live.contains(&c.id))
+        .cloned()
+        .collect()
+}
+
+/// Add a comment on `tab`'s selection: its markers go around the selection
+/// as one undo step, and the comment is stamped with `identity` (name,
+/// initials) and the UTC time (#620). Its id is one past every id the tab
+/// has used, an undone or deleted one included. `None` with no selection.
+fn add_doc_comment(tab: &mut DocTab, text: String, identity: (String, String)) -> Option<i32> {
+    let id = tab
+        .comments
+        .iter()
+        .map(|c| &c.id)
+        .chain(&tab.session_comment_ids)
+        .filter_map(|id| id.parse::<i32>().ok())
+        .max()
+        .map_or(1, |m| m + 1);
+    let Surface::Doc(ed) = &mut tab.surface else {
+        return None;
+    };
+    let quoted = ed.selection_text();
+    if !ed.add_comment(&id.to_string()) {
+        return None;
+    }
+    let (author, initials) = identity;
+    tab.comments.push(Comment {
+        id: id.to_string(),
+        author,
+        initials,
+        date: utc_now_iso(),
+        text,
+        quoted,
+    });
+    tab.session_comment_ids.insert(id.to_string());
+    Some(id)
+}
+
+/// The name and initials new comments are stamped with (#620), as Word's
+/// user name and initials: the configured ones, else the OS account name
+/// (`USERNAME`, else `USER`), else `docxy`; initials not configured are
+/// derived from the name.
+fn review_identity(user_name: &str, user_initials: &str) -> (String, String) {
+    let name = Some(user_name.trim().to_string())
+        .into_iter()
+        .chain(
+            ["USERNAME", "USER"]
+                .iter()
+                .filter_map(|k| std::env::var(k).ok())
+                .map(|v| v.trim().to_string()),
+        )
+        .find(|v| !v.is_empty())
+        .unwrap_or_else(|| "docxy".to_string());
+    let initials = match user_initials.trim() {
+        "" => docxcore::comments::initials(&name),
+        set => set.to_string(),
+    };
+    (name, initials)
+}
+
+/// Now as a UTC ISO-8601 `w:date` (`YYYY-MM-DDTHH:MM:SSZ`).
+fn utc_now_iso() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    docxcore::field::format_iso(&docxcore::field::civil_from_unix(secs))
+}
+
 fn doc_to_docx(doc: &Document, comments: &[Comment], base: Option<&Package>) -> Vec<u8> {
     doc_to_docx_styled(doc, comments, base, false)
 }
@@ -8132,6 +8240,7 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 dirty: t.dirty,
                 status: status.into(),
                 comments: vec![],
+                session_comment_ids: Default::default(),
                 pkg: None,
                 notes: vec![],
                 markdown: false,
@@ -8174,6 +8283,7 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 dirty: t.dirty,
                 status,
                 comments,
+                session_comment_ids: Default::default(),
                 mail: mailings_tab::MailState::from_pkg(pkg.as_ref()),
                 import: Default::default(),
                 pkg,
@@ -8272,7 +8382,7 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
         Surface::Doc(_) if t.pending_conversion => None,
         Surface::Doc(ed) => {
             let p = hd.join(format!("tab-{i}.docx"));
-            let bytes = doc_to_docx(&ed.doc, &t.comments, t.pkg.as_ref());
+            let bytes = doc_to_docx(&ed.doc, &live_comments(t, &ed.doc), t.pkg.as_ref());
             opccore::fsio::write_atomic(&p, &bytes)
                 .ok()
                 .map(|_| p.display().to_string())
@@ -8423,6 +8533,8 @@ impl Docxy {
         this.keep_drafts = session.keep_drafts;
         this.edit_opts = EditOptions::from_text(&session.sheet_editing);
         stamp_edit_opts(&mut this.tabs, this.edit_opts);
+        this.user_name = session.user_name;
+        this.user_initials = session.user_initials;
         this.persist_to(&root);
         this
     }
@@ -8457,6 +8569,8 @@ impl Docxy {
             autorecover_minutes: recover::DEFAULT_MINUTES,
             keep_drafts: true,
             edit_opts: EditOptions::default(),
+            user_name: String::new(),
+            user_initials: String::new(),
             fx_expanded: false,
             drafts: Vec::new(),
             trusted_count: 0,
@@ -8542,6 +8656,8 @@ impl Docxy {
             autorecover_minutes: self.autorecover_minutes,
             keep_drafts: self.keep_drafts,
             edit_opts: self.edit_opts,
+            user_name: self.user_name.clone(),
+            user_initials: self.user_initials.clone(),
         }
     }
 
@@ -8928,6 +9044,7 @@ impl Docxy {
             dirty: false,
             status: "new".into(),
             comments: vec![],
+            session_comment_ids: Default::default(),
             pkg: None,
             notes: vec![],
             markdown: false,
@@ -11931,12 +12048,10 @@ impl Docxy {
 
     // ---- cell comments -----------------------------------------------------
 
-    /// The comment author to stamp on new comments (the OS user, else "docxy").
-    fn comment_author() -> String {
-        std::env::var("USERNAME")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "docxy".to_string())
+    /// The comment author to stamp on new comments: the same reviewer as a
+    /// document comment's ([`review_identity`]), so Excel and Word agree.
+    fn comment_author(&self) -> String {
+        review_identity(&self.user_name, &self.user_initials).0
     }
 
     /// The comment text on the active sheet's selected cell, if any.
@@ -12264,7 +12379,7 @@ impl Docxy {
         let Some(text) = self.sheet_comment_edit.take() else {
             return;
         };
-        let author = Self::comment_author();
+        let author = self.comment_author();
         // The view takes the undo step itself: the whole package.
         self.sheet_try_edit(false, |v| v.comment_cell(&author, &text));
         cx.notify();
@@ -14838,7 +14953,13 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
     let kind = html_bundle::doc_target(&path, markdown);
     // A converted tab has the package its conversion wrote (#633), so it
     // saves into it like any other Word document.
-    let docx = || doc_to_docx(&editor.doc, &tab.comments, tab.pkg.as_ref());
+    let docx = || {
+        doc_to_docx(
+            &editor.doc,
+            &live_comments(tab, &editor.doc),
+            tab.pkg.as_ref(),
+        )
+    };
     // The Word package written, alone or inside a page.
     let mut package: Option<Vec<u8>> = None;
     let bytes = match kind {
@@ -15945,21 +16066,6 @@ impl Docxy {
 
     // ---- comments ----------------------------------------------------------
 
-    /// The next numeric comment id for the active tab (max existing + 1).
-    fn next_comment_id(&self) -> i32 {
-        self.tabs
-            .get(self.active)
-            .map(|t| {
-                t.comments
-                    .iter()
-                    .filter_map(|c| c.id.parse::<i32>().ok())
-                    .max()
-                    .map(|m| m + 1)
-                    .unwrap_or(1)
-            })
-            .unwrap_or(1)
-    }
-
     /// Begin a new comment on the current selection (opens the comment entry bar).
     fn start_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.protected_refused(cx) {
@@ -15986,26 +16092,14 @@ impl Docxy {
         if text.is_empty() {
             return self.refocus(window, cx);
         }
-        let id = self.next_comment_id();
-        let idx = self.active;
-        if let Some(t) = self.tabs.get_mut(idx) {
-            if let Surface::Doc(ed) = &mut t.surface {
-                let quoted = ed.selection_text();
-                if !ed.add_comment(&id.to_string()) {
-                    t.status = "No selection to comment on".into();
-                    return self.refocus(window, cx);
+        let identity = review_identity(&self.user_name, &self.user_initials);
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            match add_doc_comment(t, text, identity) {
+                Some(id) => {
+                    t.mark_dirty();
+                    t.status = format!("Comment {id} added").into();
                 }
-                let author = "docxy".to_string();
-                t.comments.push(Comment {
-                    id: id.to_string(),
-                    author,
-                    initials: "D".into(),
-                    date: String::new(),
-                    text,
-                    quoted,
-                });
-                t.mark_dirty();
-                t.status = format!("Comment {id} added").into();
+                None => t.status = "No selection to comment on".into(),
             }
         }
         self.refocus(window, cx);
@@ -16506,7 +16600,10 @@ impl Docxy {
         let comments = self
             .tabs
             .get(self.active)
-            .map(|t| t.comments.clone())
+            .map(|t| match &t.surface {
+                Surface::Doc(ed) => live_comments(t, &ed.doc),
+                _ => t.comments.clone(),
+            })
             .unwrap_or_default();
         let mut list = v_flex()
             .id("cmt-list")
@@ -18498,6 +18595,7 @@ mod sheet_save_tests {
             dirty: true,
             status: "new".into(),
             comments: vec![],
+            session_comment_ids: Default::default(),
             pkg: None,
             notes: vec![],
             markdown: true,
@@ -25142,6 +25240,42 @@ impl Docxy {
                             this.set_keep_drafts(!this.keep_drafts, cx);
                         })),
                 )
+                // Word's File › Options › General › User name and Initials
+                // (#620), stamped on new comments. Its dialog sits on a tab's
+                // stack, so the row needs a tab.
+                .when(!self.tabs.is_empty(), |d| {
+                    let (name, initials) =
+                        review_identity(&self.user_name, &self.user_initials);
+                    d.child(
+                        div()
+                            .id("bs-user-name")
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .mt_2()
+                            .py_1()
+                            .cursor_pointer()
+                            .rounded_sm()
+                            .hover(|d| d.bg(sidebar))
+                            .child(div().text_color(fg).child("User name..."))
+                            .child(
+                                div()
+                                    .text_color(dim)
+                                    .child(SharedString::from(format!("{name} ({initials})"))),
+                            )
+                            .on_click(cx.listener(|this, _, _w, cx| {
+                                if let Err(e) = this.open_user_name_dialog() {
+                                    if let Some(t) = this.tabs.get_mut(this.active) {
+                                        t.status = e.into();
+                                    }
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().text_size(px(11.)).text_color(dim).child(
+                        "New comments are stamped with this name and these initials.",
+                    ))
+                })
                 // File › Options › Advanced › Editing for sheet tabs (#672).
                 .child(self.sheet_editing_settings(fg, dim, sidebar, &check, cx))
                 // Excel's Trust Center > Trusted Documents > Clear (#895):
