@@ -12445,7 +12445,9 @@ impl Docxy {
                 bottom += 1;
             }
             let header = matches!(sh.cell(top, sc).map(|c| &c.value), Some(CellValue::Text(_)));
-            gridcore::edit::subtotal(&mut v.pkg.workbook, s, top, bottom, sc, &[], header);
+            let add_to = gridcore::edit::numeric_columns(sh, top, bottom, sc);
+            let opts = gridcore::edit::SubtotalOptions::new(sc, add_to, header);
+            let _ = gridcore::edit::subtotal(&mut v.pkg.workbook, s, top, bottom, &opts);
             v.engine = sheet_engine(&v.pkg.workbook);
         }
         self.mark_sheet_dirty();

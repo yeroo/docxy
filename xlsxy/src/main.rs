@@ -5851,9 +5851,11 @@ impl App {
             let header = matches!(sh.cell(top, sc).map(|c| &c.value), Some(CellValue::Text(_)));
             (top, bottom, header)
         };
+        let add_to = gridcore::edit::numeric_columns(self.sheet(), top, bottom, sc);
+        let opts = gridcore::edit::SubtotalOptions::new(sc, add_to, header);
         let mut added = 0;
         self.structural(|wb| {
-            added = gridcore::edit::subtotal(wb, s, top, bottom, sc, &[], header);
+            added = gridcore::edit::subtotal(wb, s, top, bottom, &opts).unwrap_or(0);
         });
         self.status = Some(if added == 0 {
             "Subtotal: nothing to total".into()
