@@ -2545,6 +2545,12 @@ struct Docxy {
     /// Recover Unsaved Workbooks' list, re-read when the backstage opens and
     /// after a draft is kept: listing prunes old drafts, so never per frame.
     drafts: Vec<recover::Draft>,
+    /// Trusted Documents' count for the backstage's Settings, re-read when
+    /// the backstage opens and after a clear (#895): never per frame.
+    trusted_count: usize,
+    /// Why the last Clear failed, shown under the backstage row until the
+    /// backstage reopens or a Clear succeeds (#895).
+    trusted_error: Option<String>,
     /// When the hot-exit state was last written by any `persist`, or an
     /// AutoRecover tick last found nothing to write: the timer's clock. A
     /// `Cell` because `persist` takes `&self`.
@@ -7669,6 +7675,8 @@ impl Docxy {
             autorecover_minutes: recover::DEFAULT_MINUTES,
             keep_drafts: true,
             drafts: Vec::new(),
+            trusted_count: 0,
+            trusted_error: None,
             last_persist: std::cell::Cell::new(std::time::Instant::now()),
             applied: None,
             find_open: false,
@@ -7809,6 +7817,8 @@ impl Docxy {
         self.bs_info = false;
         self.bs_info_status = None;
         self.refresh_drafts();
+        self.trusted_count = trusted::count(&config_root());
+        self.trusted_error = None;
         cx.notify();
     }
 
@@ -7911,6 +7921,28 @@ impl Docxy {
         self.keep_drafts = on;
         self.persist();
         cx.notify();
+    }
+
+    /// Settings' Trusted Documents Clear (#895): the one handler the
+    /// backstage row and the harness verb both call. A tab already open
+    /// editable stays editable; clearing affects the next open.
+    pub(crate) fn clear_trusted(&mut self, cx: &mut Context<Self>) -> Result<usize, String> {
+        match trusted::clear(&config_root()) {
+            Ok(n) => {
+                self.trusted_count = 0;
+                self.trusted_error = None;
+                self.set_status("trusted documents cleared");
+                cx.notify();
+                Ok(n)
+            }
+            Err(e) => {
+                self.trusted_count = trusted::count(&config_root());
+                self.trusted_error = Some(format!("Not cleared: {e}"));
+                self.set_status(format!("trusted documents not cleared: {e}"));
+                cx.notify();
+                Err(e.to_string())
+            }
+        }
     }
 
     /// Re-read the drafts (pruning old ones, but never a draft open in a
@@ -23765,6 +23797,47 @@ impl Docxy {
                             this.set_keep_drafts(!this.keep_drafts, cx);
                         })),
                 )
+                // Excel's Trust Center > Trusted Documents > Clear (#895):
+                // the backstage half of `trusted::clear`; the harness verb
+                // runs the same `clear_trusted`.
+                .child(
+                    div()
+                        .id("bs-trusted-clear")
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .mt_2()
+                        .py_1()
+                        .cursor_pointer()
+                        .rounded_sm()
+                        .hover(|d| d.bg(sidebar))
+                        .child(
+                            div()
+                                .text_color(fg)
+                                .child("Trusted Documents:"),
+                        )
+                        .child(
+                            div()
+                                .px_2()
+                                .rounded(px(3.))
+                                .border_1()
+                                .border_color(hsla_u(BRAND))
+                                .text_color(fg)
+                                .child("Clear"),
+                        )
+                        .on_click(cx.listener(|this, _, _w, cx| {
+                            // The row shows the outcome: the count, or `trusted_error`.
+                            let _ = this.clear_trusted(cx);
+                        })),
+                )
+                .child(div().text_size(px(11.)).text_color(dim).child(format!(
+                    "Clear all Trusted Documents so that they are no longer trusted. {n} trusted document{s} now; a cleared file opens in Protected View again.",
+                    n = self.trusted_count,
+                    s = if self.trusted_count == 1 { "" } else { "s" },
+                )))
+                .when_some(self.trusted_error.clone(), |d, e| {
+                    d.child(div().text_size(px(12.)).text_color(fg).child(e))
+                })
                 .into_any_element()
         };
 

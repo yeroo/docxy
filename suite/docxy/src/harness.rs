@@ -2192,6 +2192,7 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "ask-on-close"
             | "autorecover"
             | "keep-drafts"
+            | "trusted-clear"
             | "open-draft"
             | "dialog-set"
             | "dialog-tab"
@@ -2952,6 +2953,12 @@ pub fn dispatch(
             };
             app.set_keep_drafts(*on, cx);
             Done::ok(state(app, window))
+        }
+        // Settings' Trusted Documents Clear (#895): the same handler as the
+        // backstage button.
+        "trusted-clear" => {
+            let n = app.clear_trusted(cx)?;
+            Done::ok(Json::obj(vec![("cleared", Json::Num(n as f64))]))
         }
         // Recover Unsaved Workbooks' list, re-read (and pruned) as opening
         // the backstage does, newest first.

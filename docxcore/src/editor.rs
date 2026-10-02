@@ -513,6 +513,9 @@ impl Editor {
             // last (#748).
             p.props.section_break = None;
             p.props.section_property_change = None;
+            // Likewise a tracked insertion/deletion of the paragraph mark:
+            // the physical mark stays at the end, on the second half.
+            crate::review::clear_mark_revisions(&mut p.props);
             cont.insert(
                 idx + 1,
                 Block::Paragraph(Paragraph {
@@ -1149,6 +1152,8 @@ impl Editor {
             let props = p.props.clone();
             p.props.section_break = None;
             p.props.section_property_change = None;
+            // As does a tracked change of the paragraph mark.
+            crate::review::clear_mark_revisions(&mut p.props);
             let inner = p.props.clone();
             let tail = split_content(&mut p.content, off);
             p.content.extend(clip.paras[0].clone());
@@ -1879,6 +1884,18 @@ fn collect_block_revision_positions(
                     forced.clone(),
                     positions,
                 );
+                // A paragraph mark sits at the paragraph's end.
+                for mark in &paragraph.props.mark_revisions {
+                    let (start, end) = forced_span(&forced).unwrap_or_else(|| {
+                        let end = paragraph_span(prefix, paragraph).1;
+                        (end.clone(), end)
+                    });
+                    positions.push(RevisionPosition {
+                        target: mark.metadata.target,
+                        start,
+                        end,
+                    });
+                }
             }
             Block::Table(table) => {
                 let table_span =
@@ -2784,8 +2801,10 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
 /// A merge that removes the paragraph `gone` into `kept`: when `gone` closes
 /// a section, its section mark (the break and its tracked change) ends the
 /// merged paragraph, as in Word, replacing any `kept` had (#748). Otherwise
-/// `kept`'s props stay as they are.
+/// `kept`'s props stay as they are. The surviving paragraph mark is `gone`'s,
+/// so its tracked insertion/deletion records replace `kept`'s.
 fn keep_section_mark(kept: &mut ParProps, gone: ParProps) {
+    crate::review::adopt_mark_revisions(kept, &gone);
     if gone.section_break.is_some() || gone.section_property_change.is_some() {
         kept.section_break = gone.section_break;
         kept.section_property_change = gone.section_property_change;

@@ -1289,6 +1289,8 @@ fn parse_present_property_snapshot(raw: &str, scope: PropertyScope) -> Option<Pr
             let mut props = ParProps::default();
             parse_ppr(&mut parser, &mut props);
             props.property_change = None;
+            // CT_PPrBase has no paragraph-mark rPr; never act on one here.
+            props.mark_revisions.clear();
             if props.heading_level.is_none() {
                 if let Some(style_id) = &props.style_id {
                     props.heading_level = heading_level(style_id);
@@ -1545,6 +1547,16 @@ fn parse_ppr(p: &mut XmlParser, props: &mut ParProps) {
                     props.property_change =
                         Some(parse_property_change(p, PropertyScope::Paragraph));
                 }
+                // The paragraph-mark run properties stay verbatim; a tracked
+                // insertion/deletion of the mark inside them is also modeled.
+                "w:rPr" => {
+                    capture_element(p, &mut props.raw_props);
+                    props.mark_revisions = props
+                        .raw_props
+                        .last()
+                        .map(|raw| parse_mark_revisions(raw))
+                        .unwrap_or_default();
+                }
                 "w:framePr" => {
                     props.frame = Some(FramePr {
                         x: frame_int(p, "w:x"),
@@ -1563,6 +1575,35 @@ fn parse_ppr(p: &mut XmlParser, props: &mut ParProps) {
                 _ => capture_element(p, &mut props.raw_props),
             },
             Event::End | Event::Eof => break,
+            Event::Text => {}
+        }
+    }
+}
+
+/// The `w:ins`/`w:del` children of a paragraph-mark `w:rPr`, in order.
+pub(crate) fn parse_mark_revisions(rpr: &str) -> Vec<ParagraphMarkRevision> {
+    let mut out = Vec::new();
+    let mut parser = XmlParser::new(rpr);
+    if parser.next() != Event::Start {
+        return out;
+    }
+    loop {
+        match parser.next() {
+            Event::Start => {
+                let kind = match parser.name() {
+                    "w:ins" => Some(RevisionKind::Insert),
+                    "w:del" => Some(RevisionKind::Delete),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    out.push(ParagraphMarkRevision {
+                        kind,
+                        metadata: parse_revision_metadata(&parser),
+                    });
+                }
+                parser.skip_element();
+            }
+            Event::End | Event::Eof => return out,
             Event::Text => {}
         }
     }

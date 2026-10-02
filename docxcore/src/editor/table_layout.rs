@@ -913,11 +913,19 @@ impl Editor {
                 let split: Vec<Vec<Paragraph>> = paras
                     .iter()
                     .map(|p| {
-                        split_inlines(&p.content, sep)
+                        let pieces = split_inlines(&p.content, sep);
+                        let last = pieces.len().saturating_sub(1);
+                        pieces
                             .into_iter()
-                            .map(|content| Paragraph {
-                                props: p.props.clone(),
-                                content,
+                            .enumerate()
+                            .map(|(i, content)| {
+                                let mut props = p.props.clone();
+                                // The paragraph's mark, and any tracked change
+                                // of it, ends the last piece only.
+                                if i < last {
+                                    crate::review::clear_mark_revisions(&mut props);
+                                }
+                                Paragraph { props, content }
                             })
                             .collect()
                     })

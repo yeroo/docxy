@@ -76,6 +76,9 @@ pub enum Act {
     RejectRevision,
     AcceptAllRevisions,
     RejectAllRevisions,
+    /// Open the Compare dialog: compare an original and a revised document
+    /// into a new document of tracked changes.
+    Compare,
     /// Toggle the footnotes/endnotes side panel.
     ToggleNotes,
     // View tab
@@ -586,6 +589,19 @@ fn review_groups() -> Vec<Group> {
                 ],
             ],
         },
+        Group {
+            title: "Compare",
+            width: 9,
+            rows: [
+                vec![btn(
+                    "⇄ Compare",
+                    9,
+                    Compare,
+                    "Compare an original and a revised document into a new one with tracked changes",
+                )],
+                vec![],
+            ],
+        },
     ]
 }
 
@@ -756,6 +772,14 @@ mod tests {
         assert!(body(&r).contains('☀')); // dark page → sun
         r.set_light_page(true);
         assert!(body(&r).contains('☾')); // light page → moon
+    }
+
+    #[test]
+    fn review_tab_offers_compare() {
+        let mut r = Ribbon::home();
+        r.set_active(4);
+        assert_eq!(r.tab_label(4), Some("Review"));
+        assert!(r.has_act(Act::Compare));
     }
 
     #[test]

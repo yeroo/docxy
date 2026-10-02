@@ -620,6 +620,19 @@ function docxyToolDefs() {
       Object.fromEntries([target()]),
       [],
     ),
+    tool(
+      'docxy_compare',
+      "Compare an original and a revised .docx (Review > Compare): open a new, unsaved " +
+        "'Compare Result N.docx' whose tracked changes turn the original into the revised " +
+        'document, and return its path, insertion/deletion counts and anything skipped. ' +
+        'Neither source file is written. Refuses while the open document has unsaved changes.',
+      Object.fromEntries([
+        ['original', prop('string', 'Path of the original .docx.')],
+        ['revised', prop('string', 'Path of the revised .docx.')],
+        target(),
+      ]),
+      ['original', 'revised'],
+    ),
   ];
 }
 
@@ -1218,6 +1231,7 @@ const DOCXY_VERBS = {
   docxy_revision_reject: 'doc.revision-reject',
   docxy_revisions_accept_all: 'doc.revisions-accept-all',
   docxy_revisions_reject_all: 'doc.revisions-reject-all',
+  docxy_compare: 'doc.compare',
 };
 
 const XLSXY_VERBS = {

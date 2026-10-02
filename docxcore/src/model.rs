@@ -412,6 +412,10 @@ pub struct UnsupportedPropertyRevision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RevisionCategory {
     Inline(RevisionKind),
+    /// A tracked insertion or deletion of a paragraph mark
+    /// (`w:pPr/w:rPr/w:ins|w:del`). Removing the mark (accepting a deletion or
+    /// rejecting an insertion) merges the paragraph with the next one.
+    ParagraphMark(RevisionKind),
     Property(PropertyScope),
     Unsupported(UnsupportedRevisionKind),
 }
@@ -505,6 +509,18 @@ pub struct ParProps {
     pub property_change: Option<PropertyChange>,
     /// A `w:sectPrChange` nested in this paragraph's section-break properties.
     pub section_property_change: Option<PropertyChange>,
+    /// Tracked insertion/deletion records of this paragraph's mark, in source
+    /// order, parsed from the paragraph-mark `w:rPr` (which itself stays
+    /// verbatim in `raw_props`). A mark inserted by one reviewer and deleted by
+    /// another carries both an `ins` and a `del`.
+    pub mark_revisions: Vec<ParagraphMarkRevision>,
+}
+
+/// A tracked change on a paragraph mark (`w:pPr/w:rPr/w:ins` or `w:del`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParagraphMarkRevision {
+    pub kind: RevisionKind,
+    pub metadata: RevisionMetadata,
 }
 
 /// Paragraph spacing (`w:spacing`). Every CT_Spacing attribute is modeled so a
@@ -1226,6 +1242,10 @@ fn assign_block_revision_targets(
             for inline in &mut paragraph.content {
                 assign_inline_revision_targets(inline, next, seen);
             }
+            // The mark ends the paragraph, so it follows the content in order.
+            for mark in &mut paragraph.props.mark_revisions {
+                assign_metadata_target(&mut mark.metadata, next, seen);
+            }
         }
         Block::Table(table) => {
             assign_property_target(&mut table.property_change, next, seen);
@@ -1362,6 +1382,15 @@ fn collect_block_revisions(
             collect_property_revision(&paragraph.props.property_change, parent, depth, out);
             for inline in &paragraph.content {
                 collect_inline_revisions(inline, parent, depth, out);
+            }
+            for mark in &paragraph.props.mark_revisions {
+                push_revision_address(
+                    &mark.metadata,
+                    RevisionCategory::ParagraphMark(mark.kind),
+                    parent,
+                    depth,
+                    out,
+                );
             }
         }
         Block::Table(table) => {

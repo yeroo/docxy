@@ -465,6 +465,8 @@ impl Editor {
             // tracked pPrChange stays on both halves, as every split does (#801).
             p.props.section_break = None;
             p.props.section_property_change = None;
+            // So does a tracked change of the paragraph mark.
+            crate::review::clear_mark_revisions(&mut p.props);
             cont.insert(
                 idx + 1,
                 Block::Paragraph(Paragraph {

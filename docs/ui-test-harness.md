@@ -732,6 +732,9 @@ file that is already open without asking unless `reopen` is `"ask"` (see
   match and is protected again. A copy of a trusted file opens editable, but
   the copy is not trusted itself. A store that cannot be written leaves
   editing enabled and the status says `editing enabled (not remembered: …)`.
+  `call trusted-clear {}` (and the backstage Settings' Trusted Documents
+  Clear, #895) empties the store and replies `{"cleared":N}`; a store that
+  cannot be written is the error and nothing is cleared.
 
 `open-modes.uit` covers the rest.
 
@@ -920,7 +923,8 @@ stands for a press outside the menu (`click-cell`, `drag`, `fill-drag`,
 `focus-field`, `ribbon-click`, `title-tab`, `close-tab`, `selection-set`,
 `open`, `backstage` open and close (not `read`), `backstage-close`,
 `inspect` with `remove`,
-`theme-set`, `ask-on-close`, `autorecover`, `keep-drafts`, `open-draft`,
+`theme-set`, `ask-on-close`, `autorecover`, `keep-drafts`, `trusted-clear`,
+`open-draft`,
 `enable-editing` and the
 `dialog-*` drivers), which closes it first and then goes on, as the press
 would. Reads leave it open.
