@@ -105,7 +105,9 @@ pub struct SubtotalOptions {
     pub replace: bool,
     /// "Page break between groups".
     pub page_breaks: bool,
-    /// "Summary below data"; false puts each total above its group.
+    /// "Summary below data"; false puts each total above its group. A run
+    /// nested in existing totals (Replace off) ignores it and follows the
+    /// sheet's outline direction: a sheet has one.
     pub summary_below: bool,
     /// The region's first row is a header and is left alone.
     pub has_header: bool,
@@ -163,9 +165,11 @@ pub fn is_subtotal_row(s: &Sheet, row: u32, c1: u32, c2: u32) -> bool {
 
 /// Excel's current region around (`row`, `col`): the block of cells bounded
 /// by blank rows and columns, which Subtotal and Remove All work on. Also
-/// whether its first row is a header: its cell in `col` is text, and it is
-/// not a total row (a grand total placed on top, with summaries above).
-/// `None` when there is no data there.
+/// whether its first row is a header: it holds text in some column of the
+/// region (a header of years still has its text labels), and it is not a
+/// total row (a grand total placed on top, with summaries above). Like
+/// Excel's, the guess can't tell a headerless list whose first row has text
+/// from one with headers. `None` when there is no data there.
 pub fn subtotal_region(s: &Sheet, row: u32, col: u32) -> Option<(Area, bool)> {
     use crate::sheet::{MAX_COLS, MAX_ROWS};
     let row_filled =
@@ -202,7 +206,10 @@ pub fn subtotal_region(s: &Sheet, row: u32, col: u32) -> Option<(Area, bool)> {
     if (r1, c1, r2, c2) == (row, col, row, col) && !row_filled(row, col, col) {
         return None;
     }
-    let header = matches!(s.cell(r1, col).map(|c| &c.value), Some(CellValue::Text(_)))
+    let header = s
+        .cells
+        .range((r1, c1)..=(r1, c2))
+        .any(|(_, c)| matches!(c.value, CellValue::Text(_)))
         && !is_subtotal_row(s, r1, c1, c2);
     Some(((r1, c1, r2, c2), header))
 }
@@ -244,7 +251,10 @@ pub fn numeric_columns(s: &Sheet, (r1, c1, r2, c2): Area, group_col: u32) -> Vec
 /// as Excel requires). Each run of equal values gets a total row, and a grand
 /// total goes after them all (before, with summaries above). The outline
 /// follows Excel's: detail at level 2, group totals at 1, the grand total
-/// at 0. Without `replace`, the new totals nest inside the existing ones.
+/// at 0. Without `replace`, the new totals nest inside the existing ones and
+/// go the way the sheet's outline already does, whatever
+/// `opts.summary_below` says. Total rows are recognised only in the area's
+/// columns. Refuses, changing nothing, when there is nothing to total.
 /// Returns the number of rows inserted.
 pub fn subtotal(
     wb: &mut Workbook,
@@ -286,10 +296,11 @@ pub fn subtotal(
     // The runs to total: equal keys, never across an existing total row.
     let (groups, nested) = {
         let s = &wb.sheets[sheet];
+        // A cleared (styled, empty) cell and a missing one are the same blank.
         let key = |r: u32| {
             s.cell(r, opts.group_col)
-                .map(|c| format!("{:?}", c.value))
-                .unwrap_or_default()
+                .map(|c| &c.value)
+                .filter(|v| !matches!(v, CellValue::Empty))
         };
         let mut groups: Vec<(String, u32, u32)> = Vec::new();
         let mut nested = false;
@@ -1006,6 +1017,64 @@ mod tests {
         let mut s = s.clone();
         s.set_cell(0, 1, Cell::number(2024.0));
         assert_eq!(subtotal_columns(&s, (0, 0, 5, 1), true)[1].1, "2024");
+    }
+
+    #[test]
+    fn a_header_is_found_from_the_whole_first_row() {
+        // "Region" over text, 2024 over numbers: the cursor sits in the
+        // numeric column, and the row is still a header.
+        let w = Workbook {
+            sheets: vec![sheet_with(
+                "Sheet1",
+                &[
+                    ("A1", Cell::text("Region")),
+                    ("B1", Cell::number(2024.0)),
+                    ("A2", Cell::text("E")),
+                    ("B2", Cell::number(1.0)),
+                    ("A3", Cell::text("W")),
+                    ("B3", Cell::number(2.0)),
+                ],
+            )],
+            ..Workbook::default()
+        };
+        assert_eq!(
+            subtotal_region(&w.sheets[0], 2, 1),
+            Some(((0, 0, 2, 1), true))
+        );
+        // All numbers: no header.
+        let w = Workbook {
+            sheets: vec![sheet_with(
+                "Sheet1",
+                &[("A1", Cell::number(1.0)), ("B1", Cell::number(2.0))],
+            )],
+            ..Workbook::default()
+        };
+        assert_eq!(
+            subtotal_region(&w.sheets[0], 0, 1),
+            Some(((0, 0, 0, 1), false))
+        );
+    }
+
+    #[test]
+    fn cleared_and_missing_key_cells_are_one_blank_group() {
+        let mut w = sales();
+        let s = &mut w.sheets[0];
+        // Rows 5 and 6: one key cleared (styled, empty), one never filled.
+        s.set_cell(
+            4,
+            0,
+            Cell {
+                style: 3,
+                ..Cell::default()
+            },
+        );
+        s.cells.remove(&(5, 0));
+        subtotal(&mut w, 0, (0, 0, 5, 1), &opts()).unwrap();
+        assert_eq!(
+            column_a(&w, 8),
+            ["Grp", "A", "A", "A", "A Total", "", "", "Total"]
+        );
+        assert_eq!(formula(&w, 0, "B8"), "SUBTOTAL(9,B6:B7)");
     }
 
     /// Region / Product / Amt: E has products p and q, W has q.

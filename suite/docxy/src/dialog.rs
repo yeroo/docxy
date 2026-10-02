@@ -99,9 +99,11 @@ pub(crate) enum DialogOwner {
     /// Page Borders' Options...: its OK writes back into Page Borders
     /// ([`ChildDialog::PageBorderOptions`]), never into the document.
     DesignBorderOptions,
-    /// Excel's Subtotal dialog (#693) over rows `r1..=r2` of `sheet`, whose
-    /// column choices start at `c1`; `header` when `r1` is a header row.
-    /// OK and Remove All apply in `sheet_outline::click`.
+    /// Excel's Subtotal dialog (#693) over the region `(r1, c1, r2, c2)` of
+    /// `sheet`: its column choices start at `c1` (at most 64 of them), and
+    /// `c2` ends the region, so total rows are found only in `c1..=c2`;
+    /// `header` when `r1` is a header row. OK and Remove All apply in
+    /// `sheet_outline::click`.
     Subtotal {
         sheet: usize,
         r1: u32,

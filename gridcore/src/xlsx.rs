@@ -1713,6 +1713,12 @@ fn parse_worksheet(
                     let min: u32 = p.attr("min").parse().unwrap_or(1);
                     let max: u32 = p.attr("max").parse().unwrap_or(min);
                     let width = p.attr("width").parse::<f64>().ok();
+                    // A width that is just the sheet's default, not marked
+                    // custom, is the default: it shows like its neighbours
+                    // and is written back as it was.
+                    let custom = matches!(p.attr("customWidth").trim(), "1" | "true");
+                    let default_width = !custom && width == Some(sheet.default_col_file_width());
+                    let width = if default_width { None } else { width };
                     let mut attrs = String::new();
                     for a in p.attrs() {
                         if !matches!(a.name, "min" | "max" | "width" | "customWidth") {
@@ -1728,7 +1734,7 @@ fn parse_worksheet(
                         max: max.saturating_sub(1),
                         width,
                         attrs,
-                        default_width: false,
+                        default_width,
                     });
                 }
                 "row" => {
@@ -17074,14 +17080,29 @@ mod ct_worksheet_order_tests {
         assert!(fresh.workbook.sheets[0].col_defs.is_empty());
         let ws = saved_sheet(&fresh);
         assert!(!ws.contains("<col"), "{ws}");
-        // After a reload the definition holds the width it was saved with,
-        // and keeps it.
+        // After a reload it is still a default-width column: as wide as its
+        // neighbours, saved again without customWidth, and gone once
+        // ungrouped.
         let mut pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
-        ungroup(&mut pkg.workbook.sheets[0], Axis::Cols, 2, 3).unwrap();
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.col_width(2), s.col_width(5));
         let ws = saved_sheet(&pkg);
         assert!(
-            ws.contains(r#"<col min="3" max="4" width="9.140625""#),
+            ws.contains(r#"<cols><col min="3" max="4" width="9.140625" outlineLevel="1"/></cols>"#),
             "{ws}"
+        );
+        ungroup(&mut pkg.workbook.sheets[0], Axis::Cols, 2, 3).unwrap();
+        let ws = saved_sheet(&pkg);
+        assert!(!ws.contains("<col"), "{ws}");
+        // A width the user set stays custom.
+        let mut pkg = loaded(&format!(
+            r#"<cols><col min="2" max="2" width="9.140625" customWidth="1"/></cols>{ROWS}{MARGINS}"#
+        ));
+        assert_eq!(pkg.workbook.sheets[0].col_defs[0].width, Some(9.140625));
+        pkg.workbook.sheets[0].set_col_width(3, 20.0);
+        assert!(
+            saved_sheet(&pkg)
+                .contains(r#"<col min="2" max="2" width="9.140625" customWidth="1"/>"#)
         );
         assert!(!ws.contains("outlineLevel"), "{ws}");
         // A sheet's own default width is the one written.

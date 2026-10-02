@@ -476,8 +476,10 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
     }
 }
 
-/// Subtotal (`Some(options)`) or Remove All (`None`) over rows `r1..=r2` as
-/// one undo step, and close the dialog. A refusal keeps it open.
+/// Subtotal (`Some(options)`) or Remove All (`None`) over `area`, the region
+/// `(r1, c1, r2, c2)`, as one undo step, and close the dialog. Total rows are
+/// found only in columns `c1..=c2`, so a SUBTOTAL beside the list is data. A
+/// refusal keeps the dialog open.
 fn apply_subtotal(
     tab: &mut DocTab,
     sheet: usize,
