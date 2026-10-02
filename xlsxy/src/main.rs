@@ -6019,32 +6019,17 @@ impl App {
     fn subtotal(&mut self) {
         let (r, c) = self.cur;
         let sh = self.sheet();
-        let Some((top, bottom, header)) = gridcore::edit::subtotal_region(sh, r, c) else {
+        let Some((area, header)) = gridcore::edit::subtotal_region(sh, r, c) else {
             self.status = Some("Subtotal: put the cursor in the data".into());
             return;
         };
-        let used: Vec<u32> = sh
-            .cells
-            .range((top, 0)..=(bottom, u32::MAX))
-            .filter(|(_, cell)| !cell.is_blank())
-            .map(|(&(_, cc), _)| cc)
-            .collect();
-        let (lo, hi) = (
-            used.iter().copied().min().unwrap_or(c).min(c),
-            used.iter().copied().max().unwrap_or(c).max(c),
-        );
-        let cols = (lo..=hi)
-            .map(|cc| {
-                let name = match sh.cell(top, cc).map(|x| &x.value) {
-                    Some(CellValue::Text(t)) if header => t.clone(),
-                    _ => format!("Column {}", col_name(cc)),
-                };
-                (cc, name)
-            })
-            .collect();
-        let checked = gridcore::edit::numeric_columns(sh, top + u32::from(header), bottom, c);
+        let (top, c1, bottom, c2) = area;
+        let cols = gridcore::edit::subtotal_columns(sh, area, header);
+        let data = (top + u32::from(header), c1, bottom, c2);
+        let checked = gridcore::edit::numeric_columns(sh, data, c);
+        let defaults = gridcore::edit::SubtotalOptions::new(c, checked, header);
         self.outline_dialog = Some(outlinedlg::Dialog::Subtotal(
-            outlinedlg::SubtotalDialog::new(self.sheet, (top, bottom, header), cols, c, &checked),
+            outlinedlg::SubtotalDialog::new(self.sheet, area, cols, &defaults),
         ));
     }
 
@@ -6062,7 +6047,7 @@ impl App {
                     return;
                 };
                 let done = self.try_structural(|wb| {
-                    let n = gridcore::edit::subtotal(wb, d.sheet, d.top, d.bottom, &opts)
+                    let n = gridcore::edit::subtotal(wb, d.sheet, d.area, &opts)
                         .map_err(|e| e.to_string())?;
                     Ok(format!(
                         "Inserted {n} subtotal row{}",
@@ -6079,7 +6064,7 @@ impl App {
                     return;
                 };
                 let _ = self.try_structural(|wb| {
-                    let n = gridcore::edit::remove_subtotals(wb, d.sheet, d.top, d.bottom);
+                    let n = gridcore::edit::remove_subtotals(wb, d.sheet, d.area);
                     Ok(format!(
                         "Removed {n} subtotal row{}",
                         if n == 1 { "" } else { "s" }
@@ -12546,7 +12531,7 @@ mod tests {
         let Some(outlinedlg::Dialog::Subtotal(d)) = &app.outline_dialog else {
             panic!("the Subtotal dialog opens");
         };
-        assert_eq!((d.top, d.bottom, d.has_header), (0, 3, true));
+        assert_eq!((d.area, d.has_header), ((0, 0, 3, 1), true));
         assert_eq!(d.options().add_to, [1], "the numeric column is checked");
         app.outline_dialog_key(KeyCode::Enter);
         assert!(app.outline_dialog.is_none());

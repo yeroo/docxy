@@ -7,7 +7,7 @@
 //! focused button), Esc is Cancel. The dialogs only stage options; the app
 //! applies them.
 
-use gridcore::edit::{SubtotalFunc, SubtotalOptions};
+use gridcore::edit::{Area, SubtotalFunc, SubtotalOptions};
 use gridcore::outline::{Axis, OutlineSettings};
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyCode;
@@ -36,9 +36,8 @@ pub enum Outcome {
 pub struct SubtotalDialog {
     /// The sheet the dialog opened on: OK and Remove All act there.
     pub sheet: usize,
-    /// The region (top, bottom) and whether its first row is a header.
-    pub top: u32,
-    pub bottom: u32,
+    /// The region (rows and columns) and whether its first row is a header.
+    pub area: Area,
     pub has_header: bool,
     /// The region's columns and how the dialog names them.
     pub cols: Vec<(u32, String)>,
@@ -68,29 +67,33 @@ enum SubField {
 }
 
 impl SubtotalDialog {
-    /// Excel's defaults: group at `group_col`, Sum, the `checked` columns,
-    /// Replace and Summary below on.
+    /// The dialog over `area`, its `cols`, showing `defaults` (Excel's are
+    /// [`SubtotalOptions::new`]).
     pub fn new(
         sheet: usize,
-        (top, bottom, has_header): (u32, u32, bool),
+        area: Area,
         cols: Vec<(u32, String)>,
-        group_col: u32,
-        checked: &[u32],
+        defaults: &SubtotalOptions,
     ) -> SubtotalDialog {
-        let group = cols.iter().position(|(c, _)| *c == group_col).unwrap_or(0);
-        let add_to = cols.iter().map(|(c, _)| checked.contains(c)).collect();
+        let group = cols
+            .iter()
+            .position(|(c, _)| *c == defaults.group_col)
+            .unwrap_or(0);
+        let add_to = cols
+            .iter()
+            .map(|(c, _)| defaults.add_to.contains(c))
+            .collect();
         SubtotalDialog {
             sheet,
-            top,
-            bottom,
-            has_header,
+            area,
+            has_header: defaults.has_header,
             cols,
             group,
-            func: SubtotalFunc::Sum,
+            func: defaults.func,
             add_to,
-            replace: true,
-            page_breaks: false,
-            summary_below: true,
+            replace: defaults.replace,
+            page_breaks: defaults.page_breaks,
+            summary_below: defaults.summary_below,
             focus: 0,
         }
     }
@@ -398,10 +401,9 @@ mod tests {
     fn dialog() -> SubtotalDialog {
         SubtotalDialog::new(
             0,
-            (0, 5, true),
+            (0, 0, 5, 2),
             vec![(0, "Grp".into()), (1, "Amt".into()), (2, "Qty".into())],
-            0,
-            &[1],
+            &SubtotalOptions::new(0, vec![1], true),
         )
     }
 

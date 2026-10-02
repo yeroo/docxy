@@ -18,7 +18,8 @@
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
 use crate::{DocTab, SheetView, Surface};
 use gridcore::edit::{
-    SubtotalFunc, SubtotalOptions, numeric_columns, remove_subtotals, subtotal, subtotal_region,
+    Area, SubtotalFunc, SubtotalOptions, numeric_columns, remove_subtotals, subtotal,
+    subtotal_columns, subtotal_region,
 };
 use gridcore::outline::{self, Axis, OutlineError};
 use gridcore::sheet::{MAX_COLS, MAX_ROWS, Sheet};
@@ -233,32 +234,6 @@ const ADD_NAMES: [&str; MAX_SUBTOTAL_COLS] = [
     "add-55", "add-56", "add-57", "add-58", "add-59", "add-60", "add-61", "add-62", "add-63",
 ];
 
-/// The columns of the region `r1..=r2`: from the first to the last one
-/// holding anything, capped at [`MAX_SUBTOTAL_COLS`].
-fn region_cols(s: &Sheet, r1: u32, r2: u32) -> (u32, u32) {
-    let cols = s
-        .cells
-        .range((r1, 0)..=(r2, u32::MAX))
-        .filter(|(_, c)| !c.is_blank())
-        .map(|(&(_, c), _)| c);
-    let (lo, hi) = cols.fold((u32::MAX, 0), |(lo, hi), c| (lo.min(c), hi.max(c)));
-    let lo = lo.min(hi);
-    (lo, hi.min(lo + MAX_SUBTOTAL_COLS as u32 - 1))
-}
-
-/// A column's name in the dialog: its header, or "Column B" without one.
-fn col_label(s: &Sheet, header: Option<u32>, c: u32) -> String {
-    let named = header
-        .and_then(|r| s.cell(r, c))
-        .map(|cell| match &cell.value {
-            gridcore::sheet::CellValue::Text(t) => t.clone(),
-            gridcore::sheet::CellValue::Number(n) => n.to_string(),
-            _ => String::new(),
-        })
-        .filter(|t| !t.trim().is_empty());
-    named.unwrap_or_else(|| format!("Column {}", gridcore::sheet::col_name(c)))
-}
-
 /// Excel's Subtotal dialog over the region around the cursor, or why it
 /// cannot open.
 pub(crate) fn subtotal_dialog(tab: &DocTab) -> Result<Dialog, String> {
@@ -267,19 +242,22 @@ pub(crate) fn subtotal_dialog(tab: &DocTab) -> Result<Dialog, String> {
     };
     let s = v.sheet();
     let (row, col) = v.sel;
-    let (r1, r2, header) = subtotal_region(s, row, col)
+    let (area, header) = subtotal_region(s, row, col)
         .ok_or("Subtotal: put the cursor in the list of data to total")?;
-    let (c1, c2) = region_cols(s, r1, r2);
-    let header_row = header.then_some(r1);
-    let start = r1 + u32::from(header);
-    let numeric = numeric_columns(s, start, r2, col);
-    let labels: Vec<String> = (c1..=c2).map(|c| col_label(s, header_row, c)).collect();
+    let (r1, c1, r2, c2) = area;
+    // The dialog lists at most MAX_SUBTOTAL_COLS columns; Remove All and the
+    // total-row test still see the whole region.
+    let mut cols = subtotal_columns(s, area, header);
+    cols.truncate(MAX_SUBTOTAL_COLS);
+    let labels: Vec<String> = cols.iter().map(|(_, n)| n.clone()).collect();
+    let numeric = numeric_columns(s, (r1 + u32::from(header), c1, r2, c2), col);
+    let defaults = SubtotalOptions::new(col, numeric, header);
     let mut controls = Vec::new();
     let mut group = Control::new(
         "group",
         "At each change in:",
         ControlKind::Dropdown,
-        Value::Choice(Some((col.clamp(c1, c2) - c1) as usize)),
+        Value::Choice(cols.iter().position(|&(c, _)| c == defaults.group_col)),
     );
     group.items = labels.clone();
     controls.push(group);
@@ -287,7 +265,7 @@ pub(crate) fn subtotal_dialog(tab: &DocTab) -> Result<Dialog, String> {
         "function",
         "Use function:",
         ControlKind::Dropdown,
-        Value::Choice(Some(0)),
+        Value::Choice(SubtotalFunc::ALL.iter().position(|&f| f == defaults.func)),
     );
     func.items = SubtotalFunc::ALL.iter().map(|f| f.name().into()).collect();
     controls.push(func);
@@ -297,24 +275,28 @@ pub(crate) fn subtotal_dialog(tab: &DocTab) -> Result<Dialog, String> {
         ControlKind::Label,
         Value::Text(String::new()),
     ));
-    for (i, c) in (c1..=c2).enumerate() {
+    for (i, (c, _)) in cols.iter().enumerate() {
         controls.push(Control::new(
             ADD_NAMES[i],
             &labels[i],
             ControlKind::Checkbox,
-            Value::Bool(numeric.contains(&c)),
+            Value::Bool(defaults.add_to.contains(c)),
         ));
     }
-    for (name, label) in [
-        ("replace", "Replace current subtotals"),
-        ("page-breaks", "Page break between groups"),
-        ("below", "Summary below data"),
+    for (name, label, on) in [
+        ("replace", "Replace current subtotals", defaults.replace),
+        (
+            "page-breaks",
+            "Page break between groups",
+            defaults.page_breaks,
+        ),
+        ("below", "Summary below data", defaults.summary_below),
     ] {
         controls.push(Control::new(
             name,
             label,
             ControlKind::Checkbox,
-            Value::Bool(name != "page-breaks"),
+            Value::Bool(on),
         ));
     }
     let mut d = Dialog::message(
@@ -331,6 +313,7 @@ pub(crate) fn subtotal_dialog(tab: &DocTab) -> Result<Dialog, String> {
             r1,
             r2,
             c1,
+            c2,
             header,
         },
     );
@@ -437,7 +420,14 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
     let ok = presses(top, button, "OK");
     let remove = presses(top, button, "Remove All");
     match owner {
-        DialogOwner::Subtotal { sheet, r1, r2, .. } if ok || remove => {
+        DialogOwner::Subtotal {
+            sheet,
+            r1,
+            r2,
+            c1,
+            c2,
+            ..
+        } if ok || remove => {
             let staged = if ok {
                 match subtotal_options(top) {
                     Ok(o) => Some(o),
@@ -446,7 +436,12 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
             } else {
                 None
             };
-            Some(apply_subtotal(tab, sheet, r1, r2, staged.as_ref()))
+            Some(apply_subtotal(
+                tab,
+                sheet,
+                (r1, c1, r2, c2),
+                staged.as_ref(),
+            ))
         }
         DialogOwner::OutlineSettings if ok => {
             let below = checked(top, "below");
@@ -486,8 +481,7 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
 fn apply_subtotal(
     tab: &mut DocTab,
     sheet: usize,
-    r1: u32,
-    r2: u32,
+    area: Area,
     opts: Option<&SubtotalOptions>,
 ) -> Result<(), String> {
     let Surface::Sheet(v) = &mut tab.surface else {
@@ -499,7 +493,7 @@ fn apply_subtotal(
     let snap = v.snapshot();
     let before = v.pkg.workbook.sheets.clone();
     let status = match opts {
-        Some(o) => match subtotal(&mut v.pkg.workbook, sheet, r1, r2, o) {
+        Some(o) => match subtotal(&mut v.pkg.workbook, sheet, area, o) {
             Ok(n) => format!("Inserted {n} subtotal row{}", if n == 1 { "" } else { "s" }),
             Err(e) => {
                 // gridcore refuses before it changes anything; should that
@@ -510,7 +504,7 @@ fn apply_subtotal(
             }
         },
         None => {
-            let n = remove_subtotals(&mut v.pkg.workbook, sheet, r1, r2);
+            let n = remove_subtotals(&mut v.pkg.workbook, sheet, area);
             format!("Removed {n} subtotal row{}", if n == 1 { "" } else { "s" })
         }
     };
@@ -765,6 +759,7 @@ mod tests {
                 r1: 0,
                 r2: 5,
                 c1: 0,
+                c2: 1,
                 header: true
             }
         );

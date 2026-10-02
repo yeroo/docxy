@@ -146,55 +146,92 @@ impl fmt::Display for SubtotalError {
 
 impl std::error::Error for SubtotalError {}
 
-/// Whether the row holds a `SUBTOTAL` formula (any case, `_xlfn.` or not):
-/// what Remove All deletes and nesting treats as an existing total.
-pub fn is_subtotal_row(s: &Sheet, row: u32) -> bool {
-    s.cells.range((row, 0)..=(row, u32::MAX)).any(|(_, c)| {
+/// A Subtotal region: rows and columns `(r1, c1, r2, c2)`, 0-based and
+/// inclusive, like a selection.
+pub type Area = (u32, u32, u32, u32);
+
+/// Whether the row holds a `SUBTOTAL` formula (any case, `_xlfn.` or not) in
+/// columns `c1..=c2`: what Remove All deletes and nesting treats as an
+/// existing total. A formula beside the list doesn't make a data row a total.
+pub fn is_subtotal_row(s: &Sheet, row: u32, c1: u32, c2: u32) -> bool {
+    s.cells.range((row, c1)..=(row, c2)).any(|(_, c)| {
         c.formula
             .as_deref()
             .is_some_and(|f| f.to_ascii_uppercase().contains("SUBTOTAL("))
     })
 }
 
-/// The block of non-blank rows around `row` that Subtotal and Remove All
-/// work on, as (top, bottom, has_header): the first row is a header when its
-/// cell in `col` is text and it is not a total row (a grand total placed on
-/// top, with summaries above). `None` when `row` is blank.
-pub fn subtotal_region(s: &Sheet, row: u32, col: u32) -> Option<(u32, u32, bool)> {
-    let used = |r: u32| {
-        s.cells
-            .range((r, 0)..=(r, u32::MAX))
-            .any(|(_, c)| !c.is_blank())
-    };
-    if !used(row) {
+/// Excel's current region around (`row`, `col`): the block of cells bounded
+/// by blank rows and columns, which Subtotal and Remove All work on. Also
+/// whether its first row is a header: its cell in `col` is text, and it is
+/// not a total row (a grand total placed on top, with summaries above).
+/// `None` when there is no data there.
+pub fn subtotal_region(s: &Sheet, row: u32, col: u32) -> Option<(Area, bool)> {
+    use crate::sheet::{MAX_COLS, MAX_ROWS};
+    let row_filled =
+        |r: u32, c1: u32, c2: u32| s.cells.range((r, c1)..=(r, c2)).any(|(_, c)| !c.is_blank());
+    let col_filled =
+        |c: u32, r1: u32, r2: u32| (r1..=r2).any(|r| s.cell(r, c).is_some_and(|x| !x.is_blank()));
+    let (mut r1, mut c1, mut r2, mut c2) = (row, col, row, col);
+    loop {
+        // Rows first (cheap per row), then columns, until neither grows; a
+        // diagonal neighbour counts, as in Excel.
+        let (lo, hi) = (c1.saturating_sub(1), (c2 + 1).min(MAX_COLS - 1));
+        let mut grew = false;
+        while r1 > 0 && row_filled(r1 - 1, lo, hi) {
+            r1 -= 1;
+            grew = true;
+        }
+        while r2 + 1 < MAX_ROWS && row_filled(r2 + 1, lo, hi) {
+            r2 += 1;
+            grew = true;
+        }
+        let (top, bot) = (r1.saturating_sub(1), (r2 + 1).min(MAX_ROWS - 1));
+        while c1 > 0 && col_filled(c1 - 1, top, bot) {
+            c1 -= 1;
+            grew = true;
+        }
+        while c2 + 1 < MAX_COLS && col_filled(c2 + 1, top, bot) {
+            c2 += 1;
+            grew = true;
+        }
+        if !grew {
+            break;
+        }
+    }
+    if (r1, c1, r2, c2) == (row, col, row, col) && !row_filled(row, col, col) {
         return None;
     }
-    let mut top = row;
-    while top > 0 && used(top - 1) {
-        top -= 1;
-    }
-    let mut bottom = row;
-    while used(bottom + 1) {
-        bottom += 1;
-    }
-    // A total row on top (a grand total with summaries above, in a list with
-    // no header) is no header: Replace takes it out.
-    let header = matches!(s.cell(top, col).map(|c| &c.value), Some(CellValue::Text(_)))
-        && !is_subtotal_row(s, top);
-    Some((top, bottom, header))
+    let header = matches!(s.cell(r1, col).map(|c| &c.value), Some(CellValue::Text(_)))
+        && !is_subtotal_row(s, r1, c1, c2);
+    Some(((r1, c1, r2, c2), header))
 }
 
-/// The columns holding numbers in rows `r1..=r2` other than `group_col` and
-/// the total rows: what the dialog offers checked by default.
-pub fn numeric_columns(s: &Sheet, r1: u32, r2: u32, group_col: u32) -> Vec<u32> {
+/// The columns the dialog lists for an area, named by the header row's text
+/// (a number as it reads) or, without a header, "Column B".
+pub fn subtotal_columns(s: &Sheet, (r1, c1, _, c2): Area, has_header: bool) -> Vec<(u32, String)> {
+    (c1..=c2)
+        .map(|c| {
+            let name = Some(label_of(s, r1, c))
+                .filter(|n| has_header && !n.is_empty())
+                .unwrap_or_else(|| format!("Column {}", crate::sheet::col_name(c)));
+            (c, name)
+        })
+        .collect()
+}
+
+/// The columns of `area` (its data rows) holding numbers, other than
+/// `group_col` and the total rows: what the dialog offers checked by default.
+pub fn numeric_columns(s: &Sheet, (r1, c1, r2, c2): Area, group_col: u32) -> Vec<u32> {
     let mut cols: Vec<u32> = s
         .cells
         .range((r1, 0)..=(r2, u32::MAX))
         .filter(|&(&(r, c), cell)| {
-            c != group_col
+            (c1..=c2).contains(&c)
+                && c != group_col
                 && matches!(cell.value, CellValue::Number(_))
                 && cell.formula.is_none()
-                && !is_subtotal_row(s, r)
+                && !is_subtotal_row(s, r, c1, c2)
         })
         .map(|(&(_, c), _)| c)
         .collect();
@@ -212,8 +249,7 @@ pub fn numeric_columns(s: &Sheet, r1: u32, r2: u32, group_col: u32) -> Vec<u32> 
 pub fn subtotal(
     wb: &mut Workbook,
     sheet: usize,
-    r1: u32,
-    r2: u32,
+    (r1, c1, r2, c2): Area,
     opts: &SubtotalOptions,
 ) -> Result<usize, SubtotalError> {
     let add_to: Vec<u32> = opts
@@ -231,20 +267,19 @@ pub fn subtotal(
     }
     // Refuse before changing anything: a region of nothing but total rows
     // has nothing to total, and Replace must not delete them first.
-    if !(start..=r2).any(|r| !is_subtotal_row(&wb.sheets[sheet], r)) {
+    if !(start..=r2).any(|r| !is_subtotal_row(&wb.sheets[sheet], r, c1, c2)) {
         return Err(SubtotalError::Empty);
     }
     let mut r2 = r2;
     if opts.replace {
         // Below the header only; at least one row stays, so `r2` stays at or
         // after `start`.
-        let removed = remove_subtotals(wb, sheet, start, r2) as u32;
+        let removed = remove_subtotals(wb, sheet, (start, c1, r2, c2)) as u32;
         r2 = r2
             .checked_sub(removed)
             .filter(|&e| e >= start)
             .expect("a region with a non-total row keeps it through Remove All");
     }
-    let below = opts.summary_below;
     let code = opts.func.code();
     let word = opts.func.label();
 
@@ -260,7 +295,7 @@ pub fn subtotal(
         let mut nested = false;
         let mut open: Option<(u32, u32)> = None;
         for r in start..=r2 {
-            if is_subtotal_row(s, r) {
+            if is_subtotal_row(s, r, c1, c2) {
                 nested = true;
                 if let Some((a, b)) = open.take() {
                     groups.push((label_of(s, a, opts.group_col), a, b));
@@ -285,12 +320,29 @@ pub fn subtotal(
         return Err(SubtotalError::Empty);
     }
     let grand_level = wb.sheets[sheet].row_outline(start);
+    // A sheet's outline has one summary direction, so new totals nested in
+    // existing ones follow the existing outline's, whatever the dialog says.
+    let below = if nested {
+        wb.sheets[sheet].outline.summary_below
+    } else {
+        opts.summary_below
+    };
+    // The grand total already there, found before any row goes in: the
+    // region's last row (summaries below) or first (above).
+    let mut old_grand = nested
+        .then_some(if below { r2 } else { start })
+        .filter(|&r| is_subtotal_row(&wb.sheets[sheet], r, c1, c2));
 
-    // Where the new total rows are now, kept up to date as rows go in.
+    // Where the new total rows (and the old grand total) are now, kept up to
+    // date as rows go in.
     let mut totals: Vec<u32> = Vec::with_capacity(groups.len());
-    let insert = |wb: &mut Workbook, at: u32, totals: &mut Vec<u32>| {
+    let insert = |wb: &mut Workbook, at: u32, totals: &mut Vec<u32>, grand: &mut Option<u32>| {
         insert_rows(wb, sheet, at, 1);
-        for t in totals.iter_mut().filter(|t| **t >= at) {
+        for t in totals
+            .iter_mut()
+            .chain(grand.iter_mut())
+            .filter(|t| **t >= at)
+        {
             *t += 1;
         }
     };
@@ -308,7 +360,7 @@ pub fn subtotal(
             s.set_row_outline(r, detail_level.min(crate::outline::MAX_LEVEL));
         }
         let at = if below { last + 1 } else { *first };
-        insert(wb, at, &mut totals);
+        insert(wb, at, &mut totals, &mut old_grand);
         let (f, l) = if below {
             (*first, *last)
         } else {
@@ -334,18 +386,16 @@ pub fn subtotal(
     totals.sort_unstable();
 
     // The grand total: after (before) everything; when nesting, right
-    // beside the grand total already there.
+    // beside the grand total already there, at its level.
     let end = r2 + groups.len() as u32;
     let s = &wb.sheets[sheet];
-    let (at, range, level) = match (below, nested) {
-        (true, true) if is_subtotal_row(s, end) => (end, (start, end - 1), s.row_outline(end)),
-        (false, true) if is_subtotal_row(s, start) => {
-            (start + 1, (start + 2, end + 1), s.row_outline(start))
-        }
-        (true, _) => (end + 1, (start, end), grand_level),
-        (false, _) => (start, (start + 1, end + 1), grand_level),
+    let (at, range, level) = match (below, old_grand) {
+        (true, Some(g)) => (g, (start, g - 1), s.row_outline(g)),
+        (false, Some(g)) => (g + 1, (g + 2, end + 1), s.row_outline(g)),
+        (true, None) => (end + 1, (start, end), grand_level),
+        (false, None) => (start, (start + 1, end + 1), grand_level),
     };
-    insert(wb, at, &mut totals);
+    insert(wb, at, &mut totals, &mut old_grand);
     let grand = format!("Grand {word}");
     let s = &mut wb.sheets[sheet];
     write_total(s, at, opts.group_col, &grand, range, &add_to, code);
@@ -415,15 +465,17 @@ fn write_total(
     }
 }
 
-/// Remove All: delete the rows in `r1..=r2` that hold a `SUBTOTAL` formula
+/// Remove All: delete the rows of `area` that hold a `SUBTOTAL` formula
 /// (through the formula-adjusting row delete), then take the outline off the
 /// rows left, show the ones it hid, and drop the manual page breaks inside.
 /// Returns the number of rows deleted.
-pub fn remove_subtotals(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32) -> usize {
+pub fn remove_subtotals(wb: &mut Workbook, sheet: usize, (r1, c1, r2, c2): Area) -> usize {
     let Some(s) = wb.sheets.get(sheet) else {
         return 0;
     };
-    let rows: Vec<u32> = (r1..=r2).filter(|&r| is_subtotal_row(s, r)).collect();
+    let rows: Vec<u32> = (r1..=r2)
+        .filter(|&r| is_subtotal_row(s, r, c1, c2))
+        .collect();
     // Bottom-up, one delete per run of adjacent rows.
     let mut i = rows.len();
     while i > 0 {
@@ -546,7 +598,7 @@ mod tests {
     #[test]
     fn subtotal_inserts_group_and_grand_totals() {
         let mut w = sales();
-        assert_eq!(subtotal(&mut w, 0, 0, 5, &opts()), Ok(3));
+        assert_eq!(subtotal(&mut w, 0, (0, 0, 5, 1), &opts()), Ok(3));
         assert_eq!(
             column_a(&w, 9),
             [
@@ -577,7 +629,7 @@ mod tests {
         for f in SubtotalFunc::ALL {
             let mut w = sales();
             let o = SubtotalOptions { func: f, ..opts() };
-            subtotal(&mut w, 0, 0, 5, &o).unwrap();
+            subtotal(&mut w, 0, (0, 0, 5, 1), &o).unwrap();
             let word = f.label();
             assert_eq!(text(&w, "A5"), format!("A {word}"));
             assert_eq!(text(&w, "A9"), format!("Grand {word}"));
@@ -591,7 +643,7 @@ mod tests {
             func: SubtotalFunc::Average,
             ..opts()
         };
-        subtotal(&mut w, 0, 0, 5, &o).unwrap();
+        subtotal(&mut w, 0, (0, 0, 5, 1), &o).unwrap();
         assert_eq!(num(&mut w, "B5"), 2.0);
         assert_eq!(num(&mut w, "B9"), 3.0);
         assert_eq!(SubtotalFunc::CountNums.label(), "Count");
@@ -605,7 +657,7 @@ mod tests {
             summary_below: false,
             ..opts()
         };
-        subtotal(&mut w, 0, 0, 5, &o).unwrap();
+        subtotal(&mut w, 0, (0, 0, 5, 1), &o).unwrap();
         assert_eq!(
             column_a(&w, 9),
             [
@@ -641,7 +693,7 @@ mod tests {
             page_breaks: true,
             ..opts()
         };
-        subtotal(&mut w, 0, 0, 5, &o).unwrap();
+        subtotal(&mut w, 0, (0, 0, 5, 1), &o).unwrap();
         // After "A Total" (row 5), not after "B Total".
         assert_eq!(crate::print::area::manual_breaks(&w.sheets[0]).0, [5]);
         let mut w = sales();
@@ -650,11 +702,11 @@ mod tests {
             summary_below: false,
             ..opts()
         };
-        subtotal(&mut w, 0, 0, 5, &o).unwrap();
+        subtotal(&mut w, 0, (0, 0, 5, 1), &o).unwrap();
         // Before "B Total" (row 7).
         assert_eq!(crate::print::area::manual_breaks(&w.sheets[0]).0, [6]);
         // Remove All takes them out again.
-        remove_subtotals(&mut w, 0, 0, 8);
+        remove_subtotals(&mut w, 0, (0, 0, 8, 1));
         assert!(crate::print::area::manual_breaks(&w.sheets[0]).0.is_empty());
     }
 
@@ -667,7 +719,7 @@ mod tests {
         w.sheets
             .push(sheet_with("Other", &[("A1", Cell::formula("Sheet1!B5"))]));
         w.sheets[0].set_row_height(2, Some(30.0));
-        subtotal(&mut w, 0, 0, 5, &opts()).unwrap();
+        subtotal(&mut w, 0, (0, 0, 5, 1), &opts()).unwrap();
         // B3 stays (inserted rows are all below it); B5 (first B) moved to B6.
         assert_eq!(formula(&w, 0, "A11"), "B3*10");
         assert_eq!(formula(&w, 1, "A1"), "Sheet1!B6");
@@ -681,18 +733,18 @@ mod tests {
             summary_below: false,
             ..opts()
         };
-        subtotal(&mut v, 0, 0, 5, &above).unwrap();
+        subtotal(&mut v, 0, (0, 0, 5, 1), &above).unwrap();
         assert_eq!(formula(&v, 0, "A11"), "B5*10");
         assert_eq!(v.sheets[0].row_height(4), Some(30.0));
         assert_eq!(num(&mut v, "A11"), 20.0);
         // Remove All is the inverse.
-        assert_eq!(remove_subtotals(&mut w, 0, 0, 8), 3);
+        assert_eq!(remove_subtotals(&mut w, 0, (0, 0, 8, 1)), 3);
         assert_eq!(formula(&w, 0, "A8"), "B3*10");
         assert_eq!(formula(&w, 1, "A1"), "Sheet1!B5");
         assert_eq!(w.sheets[0].row_height(2), Some(30.0));
         assert_eq!(levels(&w, 0, 7), [0; 8]);
         assert_eq!(column_a(&w, 6), ["Grp", "A", "A", "A", "B", "B"]);
-        assert_eq!(remove_subtotals(&mut v, 0, 0, 8), 3);
+        assert_eq!(remove_subtotals(&mut v, 0, (0, 0, 8, 1)), 3);
         assert_eq!(formula(&v, 0, "A8"), "B3*10");
         assert_eq!(v.sheets[0].row_height(2), Some(30.0));
     }
@@ -700,10 +752,10 @@ mod tests {
     #[test]
     fn remove_all_shows_rows_the_outline_hid_but_not_filtered_ones() {
         let mut w = sales();
-        subtotal(&mut w, 0, 0, 5, &opts()).unwrap();
+        subtotal(&mut w, 0, (0, 0, 5, 1), &opts()).unwrap();
         crate::outline::show_level(&mut w.sheets[0], crate::outline::Axis::Rows, 2);
         w.sheets[0].set_row_filtered(6, true);
-        remove_subtotals(&mut w, 0, 0, 8);
+        remove_subtotals(&mut w, 0, (0, 0, 8, 1));
         let s = &w.sheets[0];
         let hidden: Vec<u32> = (0..8).filter(|&r| s.row_hidden(r)).collect();
         // Row 7 ("B", filtered) was row 6 before the deletes above it.
@@ -714,12 +766,12 @@ mod tests {
     #[test]
     fn replace_takes_out_the_old_subtotals_first() {
         let mut w = sales();
-        subtotal(&mut w, 0, 0, 5, &opts()).unwrap();
+        subtotal(&mut w, 0, (0, 0, 5, 1), &opts()).unwrap();
         let o = SubtotalOptions {
             func: SubtotalFunc::Count,
             ..opts()
         };
-        assert_eq!(subtotal(&mut w, 0, 0, 8, &o), Ok(3));
+        assert_eq!(subtotal(&mut w, 0, (0, 0, 8, 1), &o), Ok(3));
         assert_eq!(
             column_a(&w, 9),
             [
@@ -761,7 +813,7 @@ mod tests {
             ..Workbook::default()
         };
         let by_region = SubtotalOptions::new(0, vec![2], true);
-        subtotal(&mut w, 0, 0, 3, &by_region).unwrap();
+        subtotal(&mut w, 0, (0, 0, 3, 2), &by_region).unwrap();
         // Grp, E, E, E Total, W, W Total, Grand Total.
         let by_product = SubtotalOptions {
             group_col: 1,
@@ -771,7 +823,7 @@ mod tests {
         };
         // "q" in E and "q" in W are separate groups: the total between them
         // splits the run.
-        assert_eq!(subtotal(&mut w, 0, 0, 6, &by_product), Ok(4));
+        assert_eq!(subtotal(&mut w, 0, (0, 0, 6, 2), &by_product), Ok(4));
         let col =
             |c: &str| -> Vec<String> { (1..=11).map(|r| text(&w, &format!("{c}{r}"))).collect() };
         assert_eq!(
@@ -815,7 +867,7 @@ mod tests {
         assert_eq!(num(&mut w, "C10"), 3.0, "COUNTA skips the nested totals");
         assert_eq!(num(&mut w, "C11"), 7.0);
         // Remove All takes both layers out.
-        assert_eq!(remove_subtotals(&mut w, 0, 0, 10), 7);
+        assert_eq!(remove_subtotals(&mut w, 0, (0, 0, 10, 2)), 7);
         assert_eq!(levels(&w, 0, 3), [0; 4]);
     }
 
@@ -846,7 +898,7 @@ mod tests {
             let before = (w.sheets[0].cells.clone(), w.sheets[1].cells.clone());
             let o = SubtotalOptions::new(0, vec![1], false);
             assert_eq!(
-                subtotal(&mut w, 0, at, at + 1, &o),
+                subtotal(&mut w, 0, (at, 0, at + 1, 1), &o),
                 Err(SubtotalError::Empty)
             );
             assert_eq!(
@@ -859,7 +911,7 @@ mod tests {
             let before = (w.sheets[0].cells.clone(), w.sheets[1].cells.clone());
             let o = SubtotalOptions::new(0, vec![1], true);
             assert_eq!(
-                subtotal(&mut w, 0, at, at + 2, &o),
+                subtotal(&mut w, 0, (at, 0, at + 2, 1), &o),
                 Err(SubtotalError::Empty)
             );
             assert_eq!(
@@ -888,13 +940,13 @@ mod tests {
             ..Workbook::default()
         };
         let run = |w: &mut Workbook| {
-            let (top, bottom, header) = subtotal_region(&w.sheets[0], 0, 0).unwrap();
+            let (area, header) = subtotal_region(&w.sheets[0], 0, 0).unwrap();
             assert!(!header, "neither the data nor a grand total is a header");
             let o = SubtotalOptions {
                 summary_below: false,
                 ..SubtotalOptions::new(0, vec![1], header)
             };
-            subtotal(w, 0, top, bottom, &o).unwrap();
+            subtotal(w, 0, area, &o).unwrap();
         };
         run(&mut w);
         let layout = |w: &Workbook| -> Vec<(String, String)> {
@@ -915,16 +967,16 @@ mod tests {
         let before = w.sheets[0].cells.clone();
         let none = SubtotalOptions::new(0, vec![], true);
         assert_eq!(
-            subtotal(&mut w, 0, 0, 5, &none),
+            subtotal(&mut w, 0, (0, 0, 5, 1), &none),
             Err(SubtotalError::NoColumns)
         );
         let own = SubtotalOptions::new(0, vec![0], true);
         assert_eq!(
-            subtotal(&mut w, 0, 0, 5, &own),
+            subtotal(&mut w, 0, (0, 0, 5, 1), &own),
             Err(SubtotalError::NoColumns)
         );
         assert_eq!(
-            subtotal(&mut w, 0, 0, 0, &opts()),
+            subtotal(&mut w, 0, (0, 0, 0, 1), &opts()),
             Err(SubtotalError::Empty)
         );
         assert_eq!(w.sheets[0].cells, before);
@@ -934,9 +986,181 @@ mod tests {
     fn the_region_and_its_numeric_columns() {
         let w = sales();
         let s = &w.sheets[0];
-        assert_eq!(subtotal_region(s, 3, 0), Some((0, 5, true)));
-        assert_eq!(subtotal_region(s, 3, 1), Some((0, 5, true)));
+        assert_eq!(subtotal_region(s, 3, 0), Some(((0, 0, 5, 1), true)));
+        assert_eq!(subtotal_region(s, 3, 1), Some(((0, 0, 5, 1), true)));
         assert_eq!(subtotal_region(s, 9, 0), None);
-        assert_eq!(numeric_columns(s, 1, 5, 0), [1]);
+        // A blank cell inside the list still finds it, as in Excel.
+        let mut gap = s.clone();
+        gap.cells.remove(&(2, 1));
+        assert_eq!(subtotal_region(&gap, 2, 1), Some(((0, 0, 5, 1), true)));
+        assert_eq!(numeric_columns(s, (1, 0, 5, 1), 0), [1]);
+        assert_eq!(
+            subtotal_columns(s, (0, 0, 5, 1), true),
+            [(0, "Grp".to_string()), (1, "Amt".to_string())]
+        );
+        assert_eq!(
+            subtotal_columns(s, (0, 0, 5, 1), false),
+            [(0, "Column A".to_string()), (1, "Column B".to_string())]
+        );
+        // A numeric header names its column as it reads.
+        let mut s = s.clone();
+        s.set_cell(0, 1, Cell::number(2024.0));
+        assert_eq!(subtotal_columns(&s, (0, 0, 5, 1), true)[1].1, "2024");
+    }
+
+    /// Region / Product / Amt: E has products p and q, W has q.
+    fn regions() -> Workbook {
+        Workbook {
+            sheets: vec![sheet_with(
+                "Sheet1",
+                &[
+                    ("A1", Cell::text("Region")),
+                    ("B1", Cell::text("Product")),
+                    ("C1", Cell::text("Amt")),
+                    ("A2", Cell::text("E")),
+                    ("B2", Cell::text("p")),
+                    ("C2", Cell::number(1.0)),
+                    ("A3", Cell::text("E")),
+                    ("B3", Cell::text("q")),
+                    ("C3", Cell::number(2.0)),
+                    ("A4", Cell::text("W")),
+                    ("B4", Cell::text("q")),
+                    ("C4", Cell::number(4.0)),
+                ],
+            )],
+            ..Workbook::default()
+        }
+    }
+
+    /// The grand rows are level 0, side by side, and in no group.
+    fn assert_grands_outside(w: &Workbook, rows: [u32; 2]) {
+        let s = &w.sheets[0];
+        assert_eq!(rows[1], rows[0] + 1);
+        for r in rows {
+            assert_eq!(s.row_outline(r), 0, "row {r}");
+            let groups = crate::outline::groups(s, crate::outline::Axis::Rows);
+            assert!(!groups.iter().any(|g| g.contains(r)), "row {r} in a group");
+        }
+    }
+
+    #[test]
+    fn nesting_follows_the_outline_already_there() {
+        // Summaries above first, then a nested run whose dialog still says
+        // below: it nests above, and the grand rows stay together on top.
+        let mut w = regions();
+        let above = SubtotalOptions {
+            summary_below: false,
+            ..SubtotalOptions::new(0, vec![2], true)
+        };
+        subtotal(&mut w, 0, (0, 0, 3, 2), &above).unwrap();
+        let nested = SubtotalOptions {
+            func: SubtotalFunc::Count,
+            replace: false,
+            ..SubtotalOptions::new(1, vec![2], true)
+        };
+        assert!(nested.summary_below);
+        assert_eq!(subtotal(&mut w, 0, (0, 0, 6, 2), &nested), Ok(4));
+        let col =
+            |c: &str| -> Vec<String> { (1..=11).map(|r| text(&w, &format!("{c}{r}"))).collect() };
+        assert_eq!(
+            col("A"),
+            [
+                "Region",
+                "Grand Total",
+                "",
+                "E Total",
+                "",
+                "E",
+                "",
+                "E",
+                "W Total",
+                "",
+                "W"
+            ]
+        );
+        assert_eq!(
+            col("B"),
+            [
+                "Product",
+                "",
+                "Grand Count",
+                "",
+                "p Count",
+                "p",
+                "q Count",
+                "q",
+                "",
+                "q Count",
+                "q"
+            ]
+        );
+        assert_eq!(levels(&w, 0, 10), [0, 0, 0, 1, 2, 3, 2, 3, 1, 2, 3]);
+        assert_grands_outside(&w, [1, 2]);
+        assert_eq!(formula(&w, 0, "C3"), "SUBTOTAL(3,C4:C11)");
+        assert!(!w.sheets[0].outline.summary_below);
+        assert_eq!(num(&mut w, "C3"), 3.0);
+        assert_eq!(num(&mut w, "C2"), 7.0);
+
+        // And the mirror: below first, then a nested run asking for above.
+        let mut w = regions();
+        subtotal(
+            &mut w,
+            0,
+            (0, 0, 3, 2),
+            &SubtotalOptions::new(0, vec![2], true),
+        )
+        .unwrap();
+        let nested = SubtotalOptions {
+            func: SubtotalFunc::Count,
+            replace: false,
+            summary_below: false,
+            ..SubtotalOptions::new(1, vec![2], true)
+        };
+        assert_eq!(subtotal(&mut w, 0, (0, 0, 6, 2), &nested), Ok(4));
+        assert_eq!(
+            col_of(&w, "B", 11),
+            [
+                "Product",
+                "p",
+                "p Count",
+                "q",
+                "q Count",
+                "",
+                "q",
+                "q Count",
+                "",
+                "Grand Count",
+                ""
+            ]
+        );
+        assert_eq!(levels(&w, 0, 10), [0, 3, 2, 3, 2, 1, 3, 2, 1, 0, 0]);
+        assert_grands_outside(&w, [9, 10]);
+        assert!(w.sheets[0].outline.summary_below);
+    }
+
+    fn col_of(w: &Workbook, c: &str, rows: u32) -> Vec<String> {
+        (1..=rows).map(|r| text(w, &format!("{c}{r}"))).collect()
+    }
+
+    #[test]
+    fn a_subtotal_beside_the_list_is_not_a_total_row() {
+        // A1:B6, and a running SUBTOTAL off to the side in D2.
+        let mut w = sales();
+        w.sheets[0].set_cell(1, 3, Cell::formula("SUBTOTAL(109,B2:B6)"));
+        let (area, header) = subtotal_region(&w.sheets[0], 2, 0).unwrap();
+        assert_eq!((area, header), ((0, 0, 5, 1), true));
+        // Remove All on a list with no totals leaves every row.
+        assert_eq!(remove_subtotals(&mut w, 0, area), 0);
+        assert_eq!(column_a(&w, 6), ["Grp", "A", "A", "A", "B", "B"]);
+        // Replace keeps row 2 and totals it with its group.
+        subtotal(&mut w, 0, area, &opts()).unwrap();
+        assert_eq!(column_a(&w, 5), ["Grp", "A", "A", "A", "A Total"]);
+        assert_eq!(formula(&w, 0, "B5"), "SUBTOTAL(9,B2:B4)");
+        assert!(w.sheets[0].cell(1, 3).is_some(), "the side formula stays");
+        let (area, _) = subtotal_region(&w.sheets[0], 2, 0).unwrap();
+        subtotal(&mut w, 0, area, &opts()).unwrap();
+        assert_eq!(column_a(&w, 5), ["Grp", "A", "A", "A", "A Total"]);
+        assert_eq!(remove_subtotals(&mut w, 0, area), 3);
+        assert_eq!(column_a(&w, 6), ["Grp", "A", "A", "A", "B", "B"]);
     }
 }

@@ -14,8 +14,8 @@ use std::collections::BTreeMap;
 
 mod subtotal;
 pub use subtotal::{
-    SubtotalError, SubtotalFunc, SubtotalOptions, is_subtotal_row, numeric_columns,
-    remove_subtotals, sheets_differ, subtotal, subtotal_region,
+    Area, SubtotalError, SubtotalFunc, SubtotalOptions, is_subtotal_row, numeric_columns,
+    remove_subtotals, sheets_differ, subtotal, subtotal_columns, subtotal_region,
 };
 
 use crate::entry::EntryCtx;
@@ -2661,6 +2661,7 @@ mod tests {
             max: crate::sheet::MAX_COLS - 1,
             width: Some(20.0),
             attrs: String::new(),
+            default_width: false,
         });
         insert_cols(&mut w, 0, 3, 1);
         let d = &w.sheets[0].col_defs[0];

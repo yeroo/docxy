@@ -107,6 +107,7 @@ pub(crate) enum DialogOwner {
         r1: u32,
         r2: u32,
         c1: u32,
+        c2: u32,
         header: bool,
     },
     /// The outline Settings (#693): where summary rows and columns sit.

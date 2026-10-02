@@ -1728,6 +1728,7 @@ fn parse_worksheet(
                         max: max.saturating_sub(1),
                         width,
                         attrs,
+                        default_width: false,
                     });
                 }
                 "row" => {
@@ -3626,10 +3627,14 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
         let mut cols_xml = String::from("<cols>");
         for d in &sheet.col_defs {
             // Excel reads a `<col>` with no width as zero wide: one created
-            // for an outline or a hide gets the sheet's default.
+            // for an outline or a hide gets the sheet's default. One loaded
+            // without a width keeps its spelling.
             let width = match d.width {
                 Some(w) => format!(" width=\"{w}\" customWidth=\"1\""),
-                None => format!(" width=\"{}\"", sheet.default_col_file_width()),
+                None if d.default_width => {
+                    format!(" width=\"{}\"", sheet.default_col_file_width())
+                }
+                None => String::new(),
             };
             cols_xml.push_str(&format!(
                 "<col min=\"{}\" max=\"{}\"{width}{}/>",
@@ -17019,12 +17024,32 @@ mod ct_worksheet_order_tests {
             max: 2,
             width: None,
             attrs: "hidden=\"1\"".into(),
+            default_width: false,
         });
         let ws = saved_sheet(&pkg);
         assert!(ws.contains(r#"<row r="1" hidden="1">"#), "{ws}");
         assert!(ws.contains(r#"<row r="4" outlineLevel="1"/>"#), "{ws}");
+        assert!(ws.contains(r#"<col min="3" max="3" hidden="1"/>"#), "{ws}");
+    }
+
+    #[test]
+    fn a_loaded_col_without_a_width_keeps_its_spelling() {
+        let pkg = loaded(&format!(
+            r#"<cols><col min="2" max="2" style="5"/></cols>{ROWS}{MARGINS}"#
+        ));
+        assert!(saved_sheet(&pkg).contains(r#"<cols><col min="2" max="2" style="5"/></cols>"#));
+        // Grouping elsewhere doesn't touch it either.
+        let mut pkg = pkg;
+        crate::outline::group(
+            &mut pkg.workbook.sheets[0],
+            crate::outline::Axis::Cols,
+            4,
+            4,
+        )
+        .unwrap();
+        let ws = saved_sheet(&pkg);
         assert!(
-            ws.contains(r#"<col min="3" max="3" width="9.140625" hidden="1"/>"#),
+            ws.contains(r#"<col min="2" max="2" style="5"/><col min="5" max="5" width="9.140625" outlineLevel="1"/>"#),
             "{ws}"
         );
     }

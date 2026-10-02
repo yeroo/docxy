@@ -35,7 +35,7 @@ pub enum Axis {
 pub enum OutlineError {
     /// Grouping would go deeper than [`MAX_LEVEL`].
     TooDeep,
-    /// Ungroup or Clear Outline found nothing grouped.
+    /// Ungroup found nothing grouped in the range.
     NotGrouped,
     /// Show/Hide Detail found no group at that row or column.
     NoGroup,
@@ -706,6 +706,7 @@ mod tests {
             max: 9,
             width: Some(12.0),
             attrs: " style=\"3\"".into(),
+            default_width: false,
         });
         group(&mut s, Axis::Cols, 2, 4).unwrap();
         assert_eq!(

@@ -429,6 +429,11 @@ pub struct ColDef {
     pub width: Option<f64>,
     /// Raw leftover attributes (everything but min/max/width/customWidth).
     pub attrs: String,
+    /// Made in this session for a column no definition covered (to hold an
+    /// outline level or a hide), not loaded: saved with the sheet's default
+    /// width, since Excel reads a `<col>` with no width as zero wide. A
+    /// loaded definition without a width is written back without one.
+    pub default_width: bool,
 }
 
 /// Excel's default column width in character units.
@@ -1606,6 +1611,7 @@ impl Sheet {
                 max: col,
                 width: None,
                 attrs: String::new(),
+                default_width: true,
             });
         }
         out.sort_by_key(|d| d.min);
@@ -1628,7 +1634,12 @@ impl Sheet {
                 continue;
             }
             match out.last_mut() {
-                Some(p) if p.max + 1 == d.min && p.width == d.width && same(&p.attrs, &d.attrs) => {
+                Some(p)
+                    if p.max + 1 == d.min
+                        && p.width == d.width
+                        && p.default_width == d.default_width
+                        && same(&p.attrs, &d.attrs) =>
+                {
                     p.max = d.max;
                 }
                 _ => out.push(d),
@@ -2963,6 +2974,7 @@ mod tests {
             max: 4,
             width: Some(12.0),
             attrs: String::new(),
+            default_width: false,
         });
         s.set_col_width(2, 20.0);
         assert_eq!(s.col_width(1), 12.0);
@@ -3027,6 +3039,7 @@ mod tests {
             max: 4,
             width: None,
             attrs: "hidden=\"1\"".into(),
+            default_width: false,
         });
         assert!(s.col_hidden(2) && s.col_hidden(4));
         assert!(!s.col_hidden(1) && !s.col_hidden(5));
