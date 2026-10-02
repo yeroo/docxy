@@ -76,6 +76,12 @@ docxy assets/sample.docx
   and neither source file is written. Review ▸ Compare and `doc.compare` open
   the result as a new, unsaved *Compare Result N.docx*; `docxy compare orig.docx
   rev.docx -o out.docx` writes it to `out.docx` (never overwriting a file).
+- **Mail merge** — the desktop suite's Mailings tab: attach a CSV recipient
+  list, insert merge fields, an Address Block or a Greeting Line, preview each
+  record in place, check for errors, and Finish & Merge into a new document;
+  Envelopes and Labels lay out an envelope section or a sheet of labels.
+  `docxy merge main.docx list.csv -o out.docx` runs the merge headless (never
+  overwriting a file).
 - **DOCX protection** honored across TUI and automation edits: read-only,
   comments-only, and formatting-only restrictions are enforced; unsupported
   forms-only and tracked-changes-only editing fails closed. Recommendation-only
@@ -131,6 +137,7 @@ docxy in.docx  --md   out.md    # convert Word → Markdown
 docxy in.md    --docx out.docx  # convert Markdown → Word
 docxy in.docx  --html in.docx.html  # editable HTML (see below)
 docxy compare orig.docx rev.docx -o diff.docx  # tracked-changes comparison
+docxy merge main.docx list.csv -o letters.docx  # mail merge, one copy per recipient
 ```
 
 ### Editable HTML
