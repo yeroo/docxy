@@ -112,6 +112,19 @@ impl Inspection {
     }
 }
 
+/// The line the Info page shows under its rows for the last Remove All
+/// (`status`, with the tab index it ran on), while `active` is still that tab.
+pub(crate) fn status_line(
+    status: Option<&(usize, Result<String, String>)>,
+    active: usize,
+) -> Option<String> {
+    let (_, result) = status.filter(|(tab, _)| *tab == active)?;
+    Some(match result {
+        Ok(text) => text.clone(),
+        Err(e) => format!("Could not remove: {e}"),
+    })
+}
+
 /// Inspect a document tab; `None` for any other kind of tab.
 pub(crate) fn inspect_doc_tab(tab: &DocTab) -> Option<Inspection> {
     let Surface::Doc(editor) = &tab.surface else {
@@ -132,8 +145,8 @@ pub(crate) fn inspect_doc_tab(tab: &DocTab) -> Option<Inspection> {
 
 /// Remove All for `category`: the status line it leaves on the tab, or why
 /// it can't run. Removing something marks the tab dirty; a category that
-/// was not found changes nothing. Revisions are accepted, never deleted
-/// with their text.
+/// was not found changes nothing but that status line ("… nothing to
+/// remove"). Revisions are accepted, never deleted with their text.
 pub(crate) fn inspect_remove(
     tab: &mut DocTab,
     category: InspectCategory,
@@ -142,7 +155,9 @@ pub(crate) fn inspect_remove(
         .ok_or("the active tab is not a document")?
         .found(category);
     if !found {
-        return Ok(format!("{}: nothing to remove", category.title()));
+        let status = format!("{}: nothing to remove", category.title());
+        tab.status = status.clone().into();
+        return Ok(status);
     }
     let Surface::Doc(editor) = &mut tab.surface else {
         unreachable!("inspected above");
@@ -331,6 +346,11 @@ mod tests {
         tab.dirty = false;
         let status = inspect_remove(&mut tab, InspectCategory::Hidden).unwrap();
         assert_eq!(status, "Hidden Text: nothing to remove");
+        assert_eq!(
+            tab.status.as_ref(),
+            status,
+            "the tab's status line says so too"
+        );
         assert!(!tab.dirty);
         let Surface::Doc(ed) = &mut tab.surface else {
             unreachable!()
@@ -409,6 +429,27 @@ mod tests {
         let project = ids(true, false);
         assert!(!project.contains(&"bs-info"));
         assert!(project.contains(&"bs-export"));
+    }
+
+    /// Review r1 m3: the Info page shows the last Remove All's result, an
+    /// error included, only on the tab it ran on.
+    #[test]
+    fn status_line_shows_the_result_on_its_own_tab() {
+        let ok = (
+            2,
+            Ok("Accepted 1 revision; 1 revision could not be accepted".to_string()),
+        );
+        assert_eq!(
+            status_line(Some(&ok), 2).as_deref(),
+            Some("Accepted 1 revision; 1 revision could not be accepted")
+        );
+        assert_eq!(status_line(Some(&ok), 0), None);
+        assert_eq!(status_line(None, 2), None);
+        let err = (0, Err("the active tab is not a document".to_string()));
+        assert_eq!(
+            status_line(Some(&err), 0).as_deref(),
+            Some("Could not remove: the active tab is not a document")
+        );
     }
 
     #[test]

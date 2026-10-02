@@ -2526,6 +2526,10 @@ struct Docxy {
     /// The backstage shows the Info page (Inspect Document, #627). Cleared
     /// wherever `bs_new` is; New and Info clear each other.
     bs_info: bool,
+    /// The last Remove All on the Info page and the tab index it ran on:
+    /// the backstage draws no status bar, so the page shows it under the
+    /// rows. Cleared with `bs_info` and on a tab switch.
+    bs_info_status: Option<(usize, Result<String, String>)>,
     clip: Option<DocClip>,
     theme_pref: ThemePref,
     /// When set, closing the window with unsaved tabs shows a confirm dialog.
@@ -7657,6 +7661,7 @@ impl Docxy {
             backstage: false,
             bs_new: false,
             bs_info: false,
+            bs_info_status: None,
             clip: None,
             theme_pref,
             ask_on_close,
@@ -7801,6 +7806,7 @@ impl Docxy {
         self.backstage = true;
         self.bs_new = false;
         self.bs_info = false;
+        self.bs_info_status = None;
         self.refresh_drafts();
         cx.notify();
     }
@@ -7809,6 +7815,7 @@ impl Docxy {
         self.backstage = false;
         self.bs_new = false;
         self.bs_info = false;
+        self.bs_info_status = None;
         self.refocus(window, cx);
     }
 
@@ -7843,12 +7850,14 @@ impl Docxy {
             BackstageRailAction::Back => self.backstage_back(window, cx),
             BackstageRailAction::Info => {
                 self.bs_info = true;
+                self.bs_info_status = None;
                 self.bs_new = false;
                 cx.notify();
             }
             BackstageRailAction::New => {
                 self.bs_new = true;
                 self.bs_info = false;
+                self.bs_info_status = None;
                 cx.notify();
             }
             BackstageRailAction::Open => self.open_file(window, cx),
@@ -7965,6 +7974,7 @@ impl Docxy {
         self.backstage = false;
         self.bs_new = false;
         self.bs_info = false;
+        self.bs_info_status = None;
         self.drop_grid_state();
         self.persist();
         self.refocus(window, cx);
@@ -10377,6 +10387,7 @@ impl Docxy {
         self.backstage = false;
         self.bs_new = false;
         self.bs_info = false;
+        self.bs_info_status = None;
         self.persist();
         self.refocus(window, cx);
     }
@@ -13488,6 +13499,7 @@ impl Docxy {
         if i < self.tabs.len() {
             self.active = i;
             self.tab_more_open = false;
+            self.bs_info_status = None;
             // Same reason as `select_sheet`: these all index the document we
             // were just on.
             self.drop_grid_state();
@@ -13865,6 +13877,7 @@ impl Docxy {
         self.backstage = false;
         self.bs_new = false;
         self.bs_info = false;
+        self.bs_info_status = None;
         self.persist();
         self.refocus(window, cx);
         saved
@@ -13900,6 +13913,7 @@ impl Docxy {
         self.backstage = false;
         self.bs_new = false;
         self.bs_info = false;
+        self.bs_info_status = None;
         self.persist();
         self.refocus(window, cx);
     }
@@ -13920,6 +13934,7 @@ impl Docxy {
         self.backstage = false;
         self.bs_new = false;
         self.bs_info = false;
+        self.bs_info_status = None;
         self.persist();
         self.refocus(window, cx);
         saved
@@ -13942,6 +13957,7 @@ impl Docxy {
         self.backstage = false;
         self.bs_new = false;
         self.bs_info = false;
+        self.bs_info_status = None;
         self.persist();
         self.refocus(window, cx);
         result
@@ -14017,6 +14033,7 @@ impl Docxy {
         self.backstage = false;
         self.bs_new = false;
         self.bs_info = false;
+        self.bs_info_status = None;
         self.persist();
         self.refocus(window, cx);
     }
@@ -14033,6 +14050,7 @@ impl Docxy {
         self.backstage = false;
         self.bs_new = false;
         self.bs_info = false;
+        self.bs_info_status = None;
         self.persist();
         self.refocus(window, cx);
     }
@@ -23333,21 +23351,35 @@ impl Docxy {
                         .child("Some changes cannot be undone."),
                 )
                 .child(rows)
+                .when_some(
+                    inspector::status_line(self.bs_info_status.as_ref(), self.active),
+                    |d, text| {
+                        d.child(
+                            div()
+                                .id("inspect-status")
+                                .text_size(px(12.))
+                                .text_color(fg)
+                                .child(text),
+                        )
+                    },
+                )
                 .into_any_element(),
         )
     }
 
     /// Remove All for `category` on the active document tab: the page's
     /// button and the harness's `inspect` verb both come here.
+    /// Its result is also kept for the page to show (`bs_info_status`).
     fn inspect_remove_active(
         &mut self,
         category: inspector::InspectCategory,
     ) -> Result<String, String> {
-        let tab = self
-            .tabs
-            .get_mut(self.active)
-            .ok_or("there is no active tab")?;
-        inspector::inspect_remove(tab, category)
+        let result = match self.tabs.get_mut(self.active) {
+            Some(tab) => inspector::inspect_remove(tab, category),
+            None => Err("there is no active tab".to_string()),
+        };
+        self.bs_info_status = Some((self.active, result.clone()));
+        result
     }
 
     fn backstage_view(
