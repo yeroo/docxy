@@ -339,7 +339,10 @@ pub(crate) fn design_checked(tab: &DocTab, act: DesignAct) -> bool {
 
 /// Set or remove the text watermark in every header the document shows.
 /// An open header or footer is closed first, so its editor cannot later
-/// write the part back over the watermark. Whether anything changed.
+/// write the part back over the watermark. Whether anything changed (the
+/// same watermark again changes nothing, and is not an error); an error when
+/// a watermark was asked for and afterwards no shown header holds one,
+/// because the package could not take a header.
 pub(crate) fn set_watermark(
     tab: &mut DocTab,
     spec: Option<&TextWatermarkSpec>,
@@ -356,7 +359,12 @@ pub(crate) fn set_watermark(
         .filter(|(k, raw)| *raw != before[*k])
         .collect();
     let refs = ed.replace_sections(&raws);
-    Ok(parts || refs)
+    let changed = parts || refs;
+    if spec.is_some() && pkg.shown_text_watermarks(&ed.sections()).is_empty() {
+        tab.dirty |= changed;
+        return Err("Could not add the watermark: the document cannot take a header".into());
+    }
+    Ok(changed)
 }
 
 /// Run a Design command that edits the document (Page Color's colours and

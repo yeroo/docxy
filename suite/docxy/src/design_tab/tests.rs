@@ -280,6 +280,29 @@ fn ink_follows_the_page_colours_lightness() {
     }
 }
 
+/// A package that cannot take a header says so and stays clean; the same
+/// watermark applied twice is still a success.
+#[test]
+fn a_refused_header_is_an_error_and_a_repeat_is_not() {
+    let mut t = three_sections();
+    let draft = PRESETS.iter().position(|p| p.label == "DRAFT 1").unwrap();
+    apply(&mut t, DesignAct::Watermark(draft));
+    t.dirty = false;
+    apply(&mut t, DesignAct::Watermark(draft));
+    assert_eq!(t.status.as_ref(), "Watermark: DRAFT 1");
+    assert!(!t.dirty, "nothing changed");
+
+    let mut t = three_sections();
+    t.pkg.as_mut().unwrap().set_part_text(
+        "word/_rels/document.xml.rels",
+        "<?xml version=\"1.0\"?><Other/>",
+    );
+    let err = design_apply(&mut t, DesignAct::Watermark(draft)).unwrap_err();
+    assert!(err.contains("Could not add the watermark"), "{err}");
+    assert!(!t.dirty);
+    assert!(watermark_texts(&t).is_empty());
+}
+
 /// Without a package (Markdown, or a new document), Page Color and
 /// Watermark say why; Page Borders works on a new document but not on
 /// Markdown.
