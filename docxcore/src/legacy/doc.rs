@@ -1103,14 +1103,42 @@ mod tests {
 
     /// A minimal Word 97 `.doc`: a FIB, `text` as one piece (compressed when
     /// every unit fits a byte), and, when given, a CHPX page giving all of it
-    /// `chpx`, a PAPX page giving every paragraph `papx`, and a style sheet.
+    /// `chpx`, a PAPX page giving every paragraph `papx` (and style 0), and a
+    /// style sheet `stsh` (see [`normal_style_sheet`]). The WordDocument
+    /// stream grows to hold a long text, which then can't have CHPX or PAPX
+    /// pages (they sit at fixed pages after the text's start).
     struct Synth {
         text: Vec<u16>,
         compressed: bool,
         chpx: Option<Vec<u8>>,
         papx: Option<Vec<u8>>,
+        stsh: Option<Vec<u8>>,
         nfib: u16,
         flags: u16,
+    }
+
+    /// A style sheet whose only style, 0 (Normal, a paragraph style), has
+    /// the character formatting `chpx`.
+    fn normal_style_sheet(chpx: &[u8]) -> Vec<u8> {
+        let mut std = Vec::new();
+        std.extend(0u16.to_le_bytes()); // sti 0: Normal
+        std.extend((1u16 | 0x0FFF << 4).to_le_bytes()); // stk paragraph, no base
+        std.extend(2u16.to_le_bytes()); // cupx 2: a PAPX and a CHPX
+        std.extend([0; 4]); // bchUpe, grfstd
+        std.extend(1u16.to_le_bytes()); // the name: 1 unit,
+        std.extend(u16::from(b'N').to_le_bytes()); // "N",
+        std.extend(0u16.to_le_bytes()); // and its terminator
+        std.extend(2u16.to_le_bytes()); // UpxPapx: just the istd
+        std.extend(0u16.to_le_bytes());
+        std.extend((chpx.len() as u16).to_le_bytes()); // UpxChpx
+        std.extend(chpx);
+        let mut stsh = Vec::new();
+        stsh.extend(4u16.to_le_bytes()); // cbStshi
+        stsh.extend(1u16.to_le_bytes()); // cstd
+        stsh.extend(10u16.to_le_bytes()); // cbSTDBaseInFile
+        stsh.extend((std.len() as u16).to_le_bytes());
+        stsh.extend(std);
+        stsh
     }
 
     impl Synth {
@@ -1120,6 +1148,7 @@ mod tests {
                 compressed: text.chars().all(|c| (c as u32) < 0x80),
                 chpx: None,
                 papx: None,
+                stsh: None,
                 nfib: 0x00C1,
                 flags: 0x0200, // fWhichTblStm: 1Table
             }
@@ -1131,7 +1160,14 @@ mod tests {
         }
 
         fn streams(&self) -> (Vec<u8>, Vec<u8>) {
-            let mut word = vec![0u8; 512 * 5];
+            let width = if self.compressed { 1 } else { 2 };
+            let text_bytes = TEXT_AT + self.text.len() * width;
+            assert!(
+                text_bytes <= (CHPX_PAGE * 512) as usize
+                    || (self.chpx.is_none() && self.papx.is_none()),
+                "a long text has no room for CHPX or PAPX pages"
+            );
+            let mut word = vec![0u8; text_bytes.max(512 * 5)];
             let put16 = |b: &mut Vec<u8>, at: usize, v: u16| {
                 b[at..at + 2].copy_from_slice(&v.to_le_bytes())
             };
@@ -1149,7 +1185,6 @@ mod tests {
                 put32(word, 154 + i * 8, fc);
                 put32(word, 154 + i * 8 + 4, lcb);
             };
-            let width = if self.compressed { 1 } else { 2 };
             for (k, &u) in self.text.iter().enumerate() {
                 if self.compressed {
                     word[TEXT_AT + k] = u as u8;
@@ -1157,7 +1192,7 @@ mod tests {
                     put16(&mut word, TEXT_AT + k * 2, u);
                 }
             }
-            let text_end = (TEXT_AT + self.text.len() * width) as u32;
+            let text_end = text_bytes as u32;
 
             let mut table = Vec::new();
             // Clx: a Pcdt with one piece.
@@ -1215,6 +1250,11 @@ mod tests {
                 table.extend(text_end.to_le_bytes());
                 table.extend(PAPX_PAGE.to_le_bytes());
                 pair(&mut word, 13, at, 12);
+            }
+            if let Some(stsh) = &self.stsh {
+                let at = table.len() as u32;
+                table.extend(stsh);
+                pair(&mut word, 1, at, stsh.len() as u32); // fcStshf
             }
             (word, table)
         }
@@ -1294,6 +1334,64 @@ mod tests {
         let text = "a\x13 IF \x13 PAGE \x142\x15 \x14b\x13 PAGE \x143\x15c\x15d\r";
         let doc = read_doc(&Synth::new(text).bytes()).unwrap();
         assert_eq!(paragraphs(&doc), ["ab3cd"]);
+    }
+
+    /// FIX r2 m1: a paragraph of 100k fields, each left in its result, then
+    /// 100k characters, reads in linear time (a scan of every open field per
+    /// character would be 10^10 steps).
+    #[test]
+    fn many_open_fields_read_in_linear_time() {
+        let n = 100_000;
+        let mut text = "\x13\x14".repeat(n);
+        text.push_str(&"x".repeat(n));
+        text.push('\r');
+        let bytes = Synth::new(&text).bytes();
+        let started = std::time::Instant::now();
+        let doc = read_doc(&bytes).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(paragraphs(&doc), ["x".repeat(n)]);
+    }
+
+    /// FIX r2 m2: bold toggles against a style that is bold. MS-DOC's
+    /// toggle operands are 0 (off), 1 (on), 0x80 (as the style has it) and
+    /// 0x81 (the opposite of the style). RunProps holds direct formatting:
+    /// an explicit off over a bold style is Word's `<w:b w:val="0"/>`, kept
+    /// in `raw_props`; "as the style has it" is no direct formatting.
+    #[test]
+    fn bold_toggles_resolve_against_a_bold_style() {
+        const OFF: &str = "<w:b w:val=\"0\"/>";
+        let run = |op: Option<u8>| {
+            let mut synth = Synth::new("x\r");
+            synth.stsh = Some(normal_style_sheet(&[0x35, 0x08, 1]));
+            synth.chpx = op.map(|op| vec![0x35, 0x08, op]);
+            first_run(&read_doc(&synth.bytes()).unwrap())
+        };
+        for (op, bold, raw) in [
+            (Some(0x00), false, true),
+            (Some(0x81), false, true),
+            (Some(0x01), true, false),
+            (Some(0x80), false, false),
+            (None, false, false),
+        ] {
+            let p = run(op);
+            assert_eq!(p.bold, bold, "{op:?}");
+            assert_eq!(p.raw_props.iter().any(|r| r == OFF), raw, "{op:?}");
+        }
+        // Over a style that is not bold, 0x81 turns bold on and an off
+        // is nothing to write.
+        let plain = |op: u8| {
+            let mut synth = Synth::new("x\r");
+            synth.stsh = Some(normal_style_sheet(&[]));
+            synth.chpx = Some(vec![0x35, 0x08, op]);
+            first_run(&read_doc(&synth.bytes()).unwrap())
+        };
+        assert!(plain(0x81).bold);
+        let off = plain(0x00);
+        assert!(!off.bold && off.raw_props.is_empty());
     }
 
     /// FIX r1 M1: however many pieces claim the same CPs, and whatever
