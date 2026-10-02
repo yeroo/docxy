@@ -569,10 +569,9 @@ mod tests {
     #[test]
     fn draws_the_options_page() {
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        let mut bs = Backstage::open(std::env::temp_dir(), &["xlsx"]).with_options(
-            "Automatic Data Conversion",
-            vec![("Keep zeros".into(), true)],
-        );
+        let mut bs = Backstage::open(std::env::temp_dir(), &["xlsx"]).with_option_rows(vec![
+            crate::OptRow::check("zeros", "Automatic Data Conversion", "Keep zeros", true),
+        ]);
         bs.item = Item::Options;
         term.draw(|f| {
             let a = f.area();
@@ -595,7 +594,7 @@ mod tests {
             OptRow::check("dates", "Data", "Convert dates", false),
             OptRow::check("fixed", "Editing", "Insert a decimal point", false),
             OptRow::int("places", "Editing", "Places", 2, -300, 300).depends_on("fixed"),
-            OptRow::choice("dir", "Editing", "Direction", &["Down", "Right"], 1),
+            OptRow::choice("dir", "Editing", "Direction", &["Down", "Right", "Up"], 1),
         ])
     }
 
@@ -642,7 +641,8 @@ mod tests {
         bs.mouse(back_x, y + 1, &H);
         bs.mouse(back_x, y + 1, &H);
         assert_eq!(bs.option_int("places"), Some(1));
-        // The Direction row's `‹` steps back too (wrapping).
+        // The Direction row's `‹` steps back too (Right to Down; on would
+        // be Up).
         bs.mouse(back_x + 3, y + 2, &H);
         assert_eq!(bs.option_choice("dir"), Some(0));
         // A click on a heading changes nothing.

@@ -11,7 +11,7 @@ pub enum Item {
     SaveAs,
     Export,
     /// The host's options page (only hosts that ask for it, see
-    /// [`Backstage::with_options`]).
+    /// [`Backstage::with_option_rows`]).
     Options,
     Exit,
 }
@@ -342,19 +342,9 @@ impl Backstage {
         b
     }
 
-    /// Add an Options page (before Exit) with `title` and these checkboxes,
-    /// each keyed by its label. The host reads [`Backstage::options`] back
-    /// after each key or click.
-    pub fn with_options(self, title: &str, options: Vec<(String, bool)>) -> Backstage {
-        let rows = options
-            .into_iter()
-            .map(|(label, on)| OptRow::check(&label, title, &label, on))
-            .collect();
-        self.with_option_rows(rows)
-    }
-
     /// Add an Options page (before Exit) with these rows, which may mix
-    /// checkboxes, choices and numbers under several sections.
+    /// checkboxes, choices and numbers under several sections. The host
+    /// reads [`Backstage::options`] back, by key, after each key or click.
     pub fn with_option_rows(mut self, rows: Vec<OptRow>) -> Backstage {
         if !self.items.contains(&Item::Options) {
             let at = self.items.len().saturating_sub(1);
@@ -696,8 +686,10 @@ mod tests {
         let plain = Backstage::open(std::env::temp_dir(), &["docx"]);
         // docxy, lookxy and yppxy keep their seven items.
         assert_eq!(plain.items(), ITEMS);
-        let mut bs = Backstage::open(std::env::temp_dir(), &["xlsx"])
-            .with_options("Data", vec![("One".into(), true), ("Two".into(), false)]);
+        let mut bs = Backstage::open(std::env::temp_dir(), &["xlsx"]).with_option_rows(vec![
+            OptRow::check("One", "Data", "One", true),
+            OptRow::check("Two", "Data", "Two", false),
+        ]);
         assert_eq!(bs.items().len(), 8);
         assert_eq!(bs.items()[6], Item::Options);
         assert_eq!(*bs.items().last().unwrap(), Item::Exit);

@@ -766,7 +766,7 @@ impl TextOpen {
 
 /// The Automatic Data Conversion switches' preference keys, in the order
 /// File › Options lists them.
-const CONVERT_KEYS: [&str; 4] = [
+pub(crate) const CONVERT_KEYS: [&str; 4] = [
     "convert_leading_zeros",
     "convert_long_numbers",
     "convert_e_notation",
@@ -780,13 +780,14 @@ fn auto_convert_from_prefs(text: &str) -> AutoConvert {
     for line in text.lines() {
         if let Some((k, v)) = line.split_once('=') {
             let on = v.trim() == "1";
-            match k.trim() {
-                "convert_leading_zeros" => auto.remove_leading_zeros = on,
-                "convert_long_numbers" => auto.keep_15_digits = on,
-                "convert_e_notation" => auto.e_notation = on,
-                "convert_dates" => auto.dates = on,
-                _ => {}
-            }
+            let slot = match CONVERT_KEYS.iter().position(|key| *key == k.trim()) {
+                Some(0) => &mut auto.remove_leading_zeros,
+                Some(1) => &mut auto.keep_15_digits,
+                Some(2) => &mut auto.e_notation,
+                Some(3) => &mut auto.dates,
+                _ => continue,
+            };
+            *slot = on;
         }
     }
     auto
@@ -4547,18 +4548,21 @@ impl App {
     fn view_prefs_text(&self) -> String {
         let auto = self.auto_convert;
         let mut text = format!(
-            "formula_view={}\nlight_theme={}\nauto_hide_ribbon={}\nshow_comments={}\n\
-             convert_leading_zeros={}\nconvert_long_numbers={}\nconvert_e_notation={}\n\
-             convert_dates={}\n",
+            "formula_view={}\nlight_theme={}\nauto_hide_ribbon={}\nshow_comments={}\n",
             self.formula_view as u8,
             self.light_theme as u8,
             self.auto_hide_ribbon as u8,
             self.show_comments as u8,
-            auto.remove_leading_zeros as u8,
-            auto.keep_15_digits as u8,
-            auto.e_notation as u8,
-            auto.dates as u8,
         );
+        let switches = [
+            auto.remove_leading_zeros,
+            auto.keep_15_digits,
+            auto.e_notation,
+            auto.dates,
+        ];
+        for (key, on) in CONVERT_KEYS.into_iter().zip(switches) {
+            text.push_str(&format!("{key}={}\n", u8::from(on)));
+        }
         text.push_str(&self.edit_opts.to_lines());
         if let Some(dir) = &self.alt_startup {
             text.push_str(&format!("alt_startup_path={dir}\n"));

@@ -1174,12 +1174,7 @@ fn text_options(
 /// all of them are saved with the app's preferences on exit.
 fn app_options(app: &mut App, args: &Json) -> Result<Json, String> {
     use gridcore::options::{self as o, EnterMove};
-    const CONVERT: [&str; 4] = [
-        "convert_leading_zeros",
-        "convert_long_numbers",
-        "convert_e_notation",
-        "convert_dates",
-    ];
+    const CONVERT: [&str; 4] = crate::CONVERT_KEYS;
     const EDIT_FLAGS: [&str; 4] = [
         o::KEY_FIXED_DECIMAL,
         o::KEY_MOVE_AFTER_ENTER,
