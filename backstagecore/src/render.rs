@@ -73,7 +73,10 @@ pub fn draw(f: &mut Frame, area: Rect, bs: &mut Backstage, host: &dyn BackstageH
         Item::Open => draw_open(f, cols[1], bs, host),
         Item::SaveAs => draw_save_as(f, cols[1], bs, host),
         Item::Info => draw_info(f, cols[1], bs, host),
-        Item::Options => draw_options(f, cols[1], bs, host),
+        Item::Options => {
+            bs.layout.options_x = cols[1].x;
+            draw_options(f, cols[1], bs, host)
+        }
         Item::Export if !bs.save_types.is_empty() => draw_export(f, cols[1], bs, host),
         other => {
             // App-neutral: the same crate serves docxy (PDF), xlsxy (CSV) and
@@ -366,11 +369,7 @@ fn draw_options(f: &mut Frame, area: Rect, bs: &Backstage, host: &dyn BackstageH
                 let label = &row.label;
                 let text = match &row.value {
                     OptValue::Check(on) => format!(" [{}] {label}", if *on { "x" } else { " " }),
-                    OptValue::Choice { items, at } => format!(
-                        "       {label}: ‹ {} ›",
-                        items.get(*at).map_or("", String::as_str)
-                    ),
-                    OptValue::Int { value, .. } => format!("       {label}: ‹ {value} ›"),
+                    _ => row.value_text().unwrap_or_default(),
                 };
                 let style = if focus && i == bs.option_sel {
                     accent
@@ -635,13 +634,21 @@ mod tests {
         bs.mouse(40, y, &H);
         assert_eq!(bs.option_sel, 2, "the first Editing row");
         assert_eq!(bs.option_check("fixed"), Some(true));
-        // A click on the Places row moves it on by one.
+        // A click on the Places row moves it on by one; one on its `‹` back.
         bs.mouse(40, y + 1, &H);
         assert_eq!(bs.option_int("places"), Some(3));
+        let back = rows[y as usize + 1].find('‹').unwrap();
+        let back_x = rows[y as usize + 1][..back].chars().count() as u16;
+        bs.mouse(back_x, y + 1, &H);
+        bs.mouse(back_x, y + 1, &H);
+        assert_eq!(bs.option_int("places"), Some(1));
+        // The Direction row's `‹` steps back too (wrapping).
+        bs.mouse(back_x + 3, y + 2, &H);
+        assert_eq!(bs.option_choice("dir"), Some(0));
         // A click on a heading changes nothing.
         let head = rows.iter().position(|r| r.contains(" Editing")).unwrap() as u16;
         bs.mouse(40, head, &H);
-        assert_eq!(bs.option_sel, 3);
+        assert_eq!(bs.option_sel, 4, "still the Direction row");
     }
 
     struct Editable;

@@ -122,6 +122,8 @@ pub struct BackstageLayout {
     pub info_top: i32,
     /// The Info box's inner rows, `[first, end)`: only a click there counts.
     pub info_view: (u16, u16),
+    /// Left edge of the Options page, where its rows' text starts.
+    pub options_x: u16,
 }
 
 /// What an Options row holds.
@@ -134,6 +136,9 @@ pub enum OptValue {
     /// A whole number in `min..=max` (a count of places).
     Int { value: i32, min: i32, max: i32 },
 }
+
+/// How far a choice or number row is indented under its checkbox.
+const VALUE_INDENT: usize = 7;
 
 /// One row of the Options page.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +188,27 @@ impl OptRow {
             },
             ..OptRow::check(key, section, label, false)
         }
+    }
+
+    /// How a choice or number row reads: its label, then the value between
+    /// `‹ ›` (a click on `‹` steps back, anywhere else on the row on).
+    pub fn value_text(&self) -> Option<String> {
+        let value = match &self.value {
+            OptValue::Check(_) => return None,
+            OptValue::Choice { items, at } => items.get(*at).cloned().unwrap_or_default(),
+            OptValue::Int { value, .. } => value.to_string(),
+        };
+        Some(format!(
+            "{}{}: ‹ {value} ›",
+            " ".repeat(VALUE_INDENT),
+            self.label
+        ))
+    }
+
+    /// The column of a value row's `‹`, from where its text starts.
+    pub fn back_arrow_col(&self) -> Option<usize> {
+        self.value_text()?;
+        Some(VALUE_INDENT + self.label.chars().count() + 2)
     }
 
     /// This row, dimmed while the checkbox `key` is off.

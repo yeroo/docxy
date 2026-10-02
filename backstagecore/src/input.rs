@@ -460,7 +460,11 @@ impl Backstage {
             if let Some(OptLine::Row(i)) = line {
                 self.option_sel = i;
                 self.pane = Pane::Options;
-                self.toggle_option();
+                // A choice's or number's `‹` steps back; the rest of the row on.
+                let back = self.options[i]
+                    .back_arrow_col()
+                    .is_some_and(|col| usize::from(x.saturating_sub(self.layout.options_x)) == col);
+                self.step_option(if back { -1 } else { 1 });
             }
             return BackstageEvent::None;
         }
