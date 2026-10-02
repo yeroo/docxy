@@ -57,6 +57,9 @@ impl InspectCategory {
     }
 }
 
+/// Where the hidden runs Remove All leaves are.
+const UNREMOVABLE_HIDDEN: &str = "inside tracked moves, fields or shapes";
+
 /// What a document tab holds, per category.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Inspection {
@@ -66,8 +69,11 @@ pub(crate) struct Inspection {
     pub(crate) comment_markers: bool,
     /// Tracked changes, property changes and unsupported records included.
     pub(crate) revisions: usize,
-    /// Hidden runs, tabs and breaks.
+    /// Hidden runs, tabs and breaks Remove All can remove.
     pub(crate) hidden: usize,
+    /// Hidden runs left in raw XML (tracked moves, fields, a group shape's
+    /// other text boxes): found and counted, but Remove All leaves them.
+    pub(crate) hidden_unremovable: usize,
     pub(crate) properties: bool,
 }
 
@@ -76,7 +82,7 @@ impl Inspection {
         match category {
             InspectCategory::Comments => self.comments > 0 || self.comment_markers,
             InspectCategory::Revisions => self.revisions > 0,
-            InspectCategory::Hidden => self.hidden > 0,
+            InspectCategory::Hidden => self.hidden + self.hidden_unremovable > 0,
             InspectCategory::Properties => self.properties,
         }
     }
@@ -86,7 +92,7 @@ impl Inspection {
         match category {
             InspectCategory::Comments => Some(self.comments),
             InspectCategory::Revisions => Some(self.revisions),
-            InspectCategory::Hidden => Some(self.hidden),
+            InspectCategory::Hidden => Some(self.hidden + self.hidden_unremovable),
             InspectCategory::Properties => None,
         }
     }
@@ -102,6 +108,10 @@ impl Inspection {
             (InspectCategory::Comments, false) => "No comments were found.".into(),
             (InspectCategory::Revisions, true) => format!("{n} revision{s} found."),
             (InspectCategory::Revisions, false) => "No revisions were found.".into(),
+            (InspectCategory::Hidden, true) if self.hidden_unremovable > 0 => format!(
+                "{n} hidden run{s} found ({} {UNREMOVABLE_HIDDEN} cannot be removed).",
+                self.hidden_unremovable
+            ),
             (InspectCategory::Hidden, true) => format!("{n} hidden run{s} found."),
             (InspectCategory::Hidden, false) => "No hidden text was found.".into(),
             (InspectCategory::Properties, true) => {
@@ -138,6 +148,7 @@ pub(crate) fn inspect_doc_tab(tab: &DocTab) -> Option<Inspection> {
         comment_markers: docxcore::inspect::has_comment_markers(doc),
         revisions: doc.revisions().len(),
         hidden: docxcore::inspect::count_hidden_runs(doc),
+        hidden_unremovable: docxcore::inspect::count_unremovable_hidden_runs(doc),
         properties: tab
             .pkg
             .as_ref()
@@ -196,7 +207,16 @@ pub(crate) fn inspect_remove(
         }
         InspectCategory::Hidden => {
             let removed = editor.remove_hidden_text();
-            (format!("Removed all hidden text ({removed})"), removed > 0)
+            let left = docxcore::inspect::count_unremovable_hidden_runs(&editor.doc);
+            let status = if left == 0 {
+                format!("Removed all hidden text ({removed})")
+            } else {
+                format!(
+                    "Removed {removed} hidden run{}; {left} {UNREMOVABLE_HIDDEN} could not be removed",
+                    if removed == 1 { "" } else { "s" },
+                )
+            };
+            (status, removed > 0)
         }
         InspectCategory::Properties => {
             let changed = tab
@@ -326,6 +346,7 @@ mod tests {
             comment_markers: true,
             revisions: 0,
             hidden: 0,
+            hidden_unremovable: 0,
             properties: false,
         };
         assert!(orphans.found(InspectCategory::Comments));
@@ -477,6 +498,54 @@ mod tests {
             status_line(Some(&err), 0).as_deref(),
             Some("Could not remove: the active tab is not a document")
         );
+    }
+
+    /// Review r3 M2: hidden runs Remove All can't reach still count as
+    /// found, and both the line and the status say how many stay.
+    #[test]
+    fn hidden_runs_left_in_raw_xml_are_reported() {
+        let dir = temp("raw-hidden");
+        let path = dir.join("raw-hidden.docx");
+        let hidden = "<w:r><w:rPr><w:vanish/></w:rPr><w:t>Secret</w:t></w:r>";
+        let document = format!(
+            "<w:document {W}><w:body>\
+             <w:p><w:moveTo w:id=\"3\" w:author=\"A\">{hidden}</w:moveTo></w:p>\
+             <w:p><w:fldSimple w:instr=\" XE &quot;term&quot; \">{hidden}</w:fldSimple></w:p>\
+             <w:p>{hidden}<w:r><w:t>Visible</w:t></w:r></w:p>\
+             </w:body></w:document>"
+        );
+        let rels = "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+            <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/></Relationships>";
+        let parts: Vec<(String, Vec<u8>)> = [
+            ("[Content_Types].xml", "<?xml version=\"1.0\"?><Types/>"),
+            ("_rels/.rels", rels),
+            ("word/document.xml", &document),
+        ]
+        .into_iter()
+        .map(|(n, x)| (n.to_string(), x.as_bytes().to_vec()))
+        .collect();
+        std::fs::write(&path, docxcore::zipwrite::write_zip(&parts)).unwrap();
+        let mut tab = tab_from_path(&path);
+
+        let found = inspect_doc_tab(&tab).unwrap();
+        assert_eq!((found.hidden, found.hidden_unremovable), (1, 2));
+        assert_eq!(found.count(InspectCategory::Hidden), Some(3));
+        assert_eq!(
+            found.line(InspectCategory::Hidden),
+            "3 hidden runs found (2 inside tracked moves, fields or shapes cannot be removed)."
+        );
+        let status = inspect_remove(&mut tab, InspectCategory::Hidden).unwrap();
+        assert_eq!(
+            status,
+            "Removed 1 hidden run; 2 inside tracked moves, fields or shapes could not be removed"
+        );
+        assert!(tab.dirty);
+        let after = inspect_doc_tab(&tab).unwrap();
+        assert!(
+            after.found(InspectCategory::Hidden),
+            "the raw ones stay found"
+        );
+        assert_eq!((after.hidden, after.hidden_unremovable), (0, 2));
     }
 
     #[test]

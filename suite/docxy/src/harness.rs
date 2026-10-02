@@ -2140,7 +2140,8 @@ fn cover_refusal(backstage: bool, tab_more_open: bool) -> Result<(), String> {
 }
 
 /// The `inspect` verb's reading: `{comments:{found,count}, revisions:…,
-/// hidden:…, properties:{found}}`.
+/// hidden:{found,count,unremovable}, properties:{found}}`. Hidden's `count`
+/// includes the `unremovable` runs left in raw XML.
 fn inspection_json(found: &crate::inspector::Inspection) -> Json {
     Json::obj(
         crate::inspector::InspectCategory::ALL
@@ -2149,6 +2150,10 @@ fn inspection_json(found: &crate::inspector::Inspection) -> Json {
                 let mut fields = vec![("found", Json::Bool(found.found(category)))];
                 if let Some(n) = found.count(category) {
                     fields.push(("count", Json::Num(n as f64)));
+                }
+                if category == crate::inspector::InspectCategory::Hidden {
+                    let n = found.hidden_unremovable;
+                    fields.push(("unremovable", Json::Num(n as f64)));
                 }
                 (category.key(), Json::obj(fields))
             })
@@ -4551,6 +4556,7 @@ mod tests {
             comment_markers: true,
             revisions: 0,
             hidden: 1,
+            hidden_unremovable: 2,
             properties: true,
         };
         let json = inspection_json(&found);
@@ -4559,10 +4565,9 @@ mod tests {
         assert_eq!(comments.get("count"), Some(&Json::Num(2.0)));
         let revisions = json.get("revisions").unwrap();
         assert_eq!(revisions.get("found"), Some(&Json::Bool(false)));
-        assert_eq!(
-            json.get("hidden").unwrap().get("count"),
-            Some(&Json::Num(1.0))
-        );
+        let hidden = json.get("hidden").unwrap();
+        assert_eq!(hidden.get("count"), Some(&Json::Num(3.0)));
+        assert_eq!(hidden.get("unremovable"), Some(&Json::Num(2.0)));
         let properties = json.get("properties").unwrap();
         assert_eq!(properties.get("found"), Some(&Json::Bool(true)));
         assert_eq!(properties.get("count"), None);
