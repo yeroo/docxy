@@ -23,16 +23,17 @@ use std::ops::Range;
 
 /// What a body walk removes or counts.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Target {
+enum Target<'a> {
     /// Runs, tabs and breaks formatted `w:vanish`.
     Hidden,
-    /// `w:commentRangeStart`, `w:commentRangeEnd` and `w:commentReference`.
-    CommentMarkers,
+    /// `w:commentRangeStart`, `w:commentRangeEnd` and `w:commentReference`:
+    /// every comment's, or only those whose `w:id` is the given one.
+    CommentMarkers(Option<&'a str>),
     /// Hidden runs inside raw XML ([`count_hidden_in_xml`]). Counted only.
     RawHidden,
 }
 
-impl Target {
+impl Target<'_> {
     /// Whether the walk drops this modeled inline whole. Comment markers
     /// live in raw XML and are stripped from it instead ([`strip_markers`]).
     fn matches(self, inline: &Inline) -> bool {
@@ -61,14 +62,14 @@ const MARKER_TAGS: [&str; 3] = [
     "w:commentReference",
 ];
 
-/// Comment marker elements in raw XML.
-fn count_markers(xml: &str) -> usize {
+/// Comment marker elements in raw XML: every comment's, or only `id`'s.
+fn count_markers(xml: &str, id: Option<&str>) -> usize {
     MARKER_TAGS
         .iter()
         .map(|name| {
             let (mut n, mut from) = (0, 0);
-            while let Some((_, end, _)) = find_element_from(xml, name, from) {
-                n += 1;
+            while let Some((start, end, _)) = find_element_from(xml, name, from) {
+                n += usize::from(has_id(&xml[start..end], id));
                 from = end;
             }
             n
@@ -76,12 +77,49 @@ fn count_markers(xml: &str) -> usize {
         .sum()
 }
 
-/// `xml` without its comment marker elements, and how many there were.
-/// Only the markers go: a raw run that holds text and a
-/// `w:commentReference`, or a `w:customXml` wrapper around a commented
-/// range, keeps everything else.
-fn strip_markers(xml: &str) -> (String, usize) {
-    remove_elements(xml, &MARKER_TAGS)
+/// `xml` without its comment marker elements (every comment's, or only
+/// `id`'s), and how many there were. Only the markers go: a raw run that
+/// holds text and a `w:commentReference`, or a `w:customXml` wrapper around
+/// a commented range, keeps everything else.
+fn strip_markers(xml: &str, id: Option<&str>) -> (String, usize) {
+    match id {
+        None => remove_elements(xml, &MARKER_TAGS),
+        Some(id) => remove_markers_of(xml, &MARKER_TAGS, id),
+    }
+}
+
+/// Whether the element at the start of `element` has `w:id` equal to `id`
+/// (always, for no `id`). Only its start tag is read, so attribute order
+/// and quote style don't matter, and `1` is not `10`.
+fn has_id(element: &str, id: Option<&str>) -> bool {
+    let Some(id) = id else {
+        return true;
+    };
+    let Some(head) = tag_end(element) else {
+        return false;
+    };
+    let mut p = XmlParser::new(&element[..head]);
+    p.next() == Event::Start && p.attr("w:id") == id
+}
+
+/// `xml` without any element named in `names` whose `w:id` is `id`, and how
+/// many there were. Elements of other ids stay.
+fn remove_markers_of(xml: &str, names: &[&str], id: &str) -> (String, usize) {
+    let mut out = xml.to_string();
+    let mut removed = 0;
+    for name in names {
+        let mut from = 0;
+        while let Some((start, end, _)) = find_element_from(&out, name, from) {
+            if has_id(&out[start..end], Some(id)) {
+                out.replace_range(start..end, "");
+                removed += 1;
+                from = start;
+            } else {
+                from = end;
+            }
+        }
+    }
+    (out, removed)
 }
 
 /// `xml` without any element named in `names`, and how many there were.
@@ -173,7 +211,7 @@ fn count_hidden_in_xml(xml: &str) -> usize {
 /// What `target` counts in a piece of raw XML.
 fn count_in_raw(xml: &str, target: Target) -> usize {
     match target {
-        Target::CommentMarkers => count_markers(xml),
+        Target::CommentMarkers(id) => count_markers(xml, id),
         Target::RawHidden => count_hidden_in_xml(xml),
         Target::Hidden => 0,
     }
@@ -254,8 +292,11 @@ fn remove_blocks(blocks: &mut [Block], target: Target) -> usize {
             // A body-level range marker (one before a table) is a raw block.
             // An emptied block stays, as an empty one, so the block paths
             // the editor holds keep pointing where they did.
-            Block::Raw(raw) if target == Target::CommentMarkers => {
-                let (out, n) = strip_markers(raw);
+            Block::Raw(raw) => {
+                let Target::CommentMarkers(id) = target else {
+                    continue;
+                };
+                let (out, n) = strip_markers(raw, id);
                 if n > 0 {
                     *raw = if out.trim().is_empty() {
                         String::new()
@@ -265,7 +306,7 @@ fn remove_blocks(blocks: &mut [Block], target: Target) -> usize {
                     removed += n;
                 }
             }
-            Block::SectionProperties(_) | Block::Raw(_) => {}
+            Block::SectionProperties(_) => {}
         }
     }
     removed
@@ -278,14 +319,14 @@ fn remove_inlines(content: &mut Vec<Inline>, target: Target) -> usize {
             removed += 1;
             return false;
         }
-        if target != Target::CommentMarkers {
+        let Target::CommentMarkers(id) = target else {
             return true;
-        }
+        };
         let plain_raw = matches!(inline, Inline::Raw(_));
         let Some(raw) = marker_raw_mut(inline) else {
             return true;
         };
-        let (out, n) = strip_markers(raw);
+        let (out, n) = strip_markers(raw, id);
         if n == 0 {
             return true;
         }
@@ -323,9 +364,9 @@ fn remove_inlines(content: &mut Vec<Inline>, target: Target) -> usize {
                 // twin copies differ.
                 let twins: Vec<bool> = text_box_copies(raw).iter().map(|c| c.twin).collect();
                 let mut inside = remove_blocks(blocks, target);
-                if target == Target::CommentMarkers {
+                if let Target::CommentMarkers(id) = target {
                     inside += text_box_extra(raw, target);
-                    *raw = strip_markers(raw).0;
+                    *raw = strip_markers(raw, id).0;
                 }
                 if inside > 0 {
                     sync_twin_copies(raw, blocks, &twins);
@@ -434,12 +475,19 @@ pub fn remove_hidden_text(doc: &mut Document) -> usize {
 
 /// Whether any comment marker (range start/end or reference) is in the body.
 pub fn has_comment_markers(doc: &Document) -> bool {
-    count_blocks(&doc.body, Target::CommentMarkers) > 0
+    count_blocks(&doc.body, Target::CommentMarkers(None)) > 0
 }
 
 /// Remove every comment marker of every comment from the body. Returns how many.
 pub fn remove_all_comment_markers(doc: &mut Document) -> usize {
-    remove_blocks(&mut doc.body, Target::CommentMarkers)
+    remove_blocks(&mut doc.body, Target::CommentMarkers(None))
+}
+
+/// Remove the markers of comment `id` from the body, wherever they are, and
+/// nothing else: text that shares raw XML with a marker stays. Returns how
+/// many.
+pub fn remove_comment_markers(doc: &mut Document, id: &str) -> usize {
+    remove_blocks(&mut doc.body, Target::CommentMarkers(Some(id)))
 }
 
 const COMMENTS_PART: &str = "word/comments.xml";
@@ -731,7 +779,7 @@ mod tests {
             <w:commentReference w:id=\"2\"/></w:r>\
             <w:r><w:t>after</w:t></w:r></w:p>";
         let mut doc = parse(body);
-        assert_eq!(count_blocks(&doc.body, Target::CommentMarkers), 4);
+        assert_eq!(count_blocks(&doc.body, Target::CommentMarkers(None)), 4);
         assert_eq!(remove_all_comment_markers(&mut doc), 4);
         assert!(!has_comment_markers(&doc));
         let xml = document_to_xml(&doc);
@@ -775,7 +823,7 @@ mod tests {
             Inline::Field { raw, .. } if raw.contains("commentRangeStart")
         )));
         assert!(has_comment_markers(&doc));
-        let found = count_blocks(&doc.body, Target::CommentMarkers);
+        let found = count_blocks(&doc.body, Target::CommentMarkers(None));
         assert_eq!(remove_all_comment_markers(&mut doc), found);
         assert!(!has_comment_markers(&doc));
         let xml = document_to_xml(&doc);
@@ -813,7 +861,7 @@ mod tests {
         ));
         let mut doc = parse(&marked);
         // Two markers, written twice: the twin copy is not counted again.
-        assert_eq!(count_blocks(&doc.body, Target::CommentMarkers), 2);
+        assert_eq!(count_blocks(&doc.body, Target::CommentMarkers(None)), 2);
         assert_eq!(remove_all_comment_markers(&mut doc), 2);
         assert!(!has_comment_markers(&doc));
         let xml = document_to_xml(&doc);
@@ -854,7 +902,7 @@ mod tests {
                  <w:commentRangeEnd w:id=\"8\"/></w:p>";
         let mut doc = parse(&group_of_two_boxes(&format!("<w:p>{VISIBLE}</w:p>"), b));
         assert!(has_comment_markers(&doc));
-        assert_eq!(count_blocks(&doc.body, Target::CommentMarkers), 4);
+        assert_eq!(count_blocks(&doc.body, Target::CommentMarkers(None)), 4);
         assert_eq!(remove_all_comment_markers(&mut doc), 4);
         assert!(!has_comment_markers(&doc));
         let xml = document_to_xml(&doc);
@@ -889,13 +937,173 @@ mod tests {
         // Hidden text, then comments: the second pass counts what it removes.
         let mut doc = parse(&rsid_box());
         assert_eq!(remove_hidden_text(&mut doc), 1);
-        let markers = count_blocks(&doc.body, Target::CommentMarkers);
+        let markers = count_blocks(&doc.body, Target::CommentMarkers(None));
         assert_eq!(markers, 2);
         assert_eq!(remove_all_comment_markers(&mut doc), markers);
         let xml = document_to_xml(&doc);
         assert!(!xml.contains("gone"), "{xml}");
         assert!(!xml.contains("comment"), "{xml}");
         assert_eq!(xml.matches("keep").count(), 2, "{xml}");
+    }
+
+    /// #917: deleting one comment strips only its markers. Text in the same
+    /// raw run and a `w:customXml` wrapper around its range stay; a run left
+    /// holding only `w:rPr` goes; the other comments' markers stay.
+    #[test]
+    fn remove_one_comment_keeps_text_sharing_raw_with_its_marker_917() {
+        let body = "<w:p><w:r><w:t>hello</w:t><w:commentReference w:id=\"0\"/></w:r></w:p>\
+            <w:p><w:customXml w:element=\"note\"><w:commentRangeStart w:id=\"1\"/>\
+            <w:r><w:t>Body text</w:t></w:r><w:commentRangeEnd w:id=\"1\"/></w:customXml></w:p>\
+            <w:p><w:r><w:rPr><w:rStyle w:val=\"CommentReference\"/></w:rPr>\
+            <w:commentReference w:id=\"2\"/></w:r>\
+            <w:r><w:t>after</w:t></w:r></w:p>";
+        let mut doc = parse(body);
+        assert_eq!(remove_comment_markers(&mut doc, "0"), 1);
+        let xml = document_to_xml(&doc);
+        assert!(xml.contains("hello"), "{xml}");
+        assert_eq!(count_markers(&xml, Some("0")), 0, "{xml}");
+        assert_eq!(count_markers(&xml, None), 3, "others kept: {xml}");
+
+        assert_eq!(remove_comment_markers(&mut doc, "1"), 2);
+        let xml = document_to_xml(&doc);
+        assert!(xml.contains("w:customXml"), "{xml}");
+        assert!(xml.contains("Body text"), "{xml}");
+        assert_eq!(count_markers(&xml, Some("1")), 0, "{xml}");
+        assert_eq!(count_markers(&xml, Some("2")), 1, "{xml}");
+
+        assert_eq!(remove_comment_markers(&mut doc, "2"), 1);
+        let xml = document_to_xml(&doc);
+        assert!(!xml.contains("comment"), "{xml}");
+        // The run that held only the reference is gone, not saved empty.
+        assert!(!xml.contains("CommentReference"), "{xml}");
+        for kept in ["hello", "Body text", "w:customXml", "after"] {
+            assert!(xml.contains(kept), "{kept}: {xml}");
+        }
+        assert_eq!(remove_comment_markers(&mut doc, "2"), 0);
+    }
+
+    /// #917: one comment's markers are removed from every place the walk
+    /// reaches (hyperlink, revision, table cell, field, move, body-level raw
+    /// block, both copies of a text box); comment 10's stay everywhere.
+    #[test]
+    fn remove_one_comment_reaches_every_container_917() {
+        let marked = |inner: &str| {
+            format!(
+                "<w:commentRangeStart w:id=\"1\"/><w:commentRangeStart w:id=\"10\"/>{inner}\
+                 <w:commentRangeEnd w:id=\"1\"/><w:commentRangeEnd w:id=\"10\"/>\
+                 <w:r><w:commentReference w:id=\"1\"/></w:r>\
+                 <w:r><w:commentReference w:id=\"10\"/></w:r>"
+            )
+        };
+        let body = format!(
+            "<w:commentRangeStart w:id=\"1\"/><w:commentRangeStart w:id=\"10\"/>\
+             <w:tbl><w:tr><w:tc><w:p>{}</w:p></w:tc></w:tr></w:tbl>\
+             <w:commentRangeEnd w:id=\"1\"/><w:commentRangeEnd w:id=\"10\"/>\
+             <w:p><w:hyperlink w:anchor=\"a\">{}</w:hyperlink></w:p>\
+             <w:p><w:ins w:id=\"9\" w:author=\"A\">{}</w:ins></w:p>\
+             <w:p><w:moveTo w:id=\"3\" w:author=\"A\">{}</w:moveTo></w:p>\
+             <w:p><w:fldSimple w:instr=\" PAGE \">{}</w:fldSimple></w:p>\
+             {}",
+            marked("<w:r><w:t>cell</w:t></w:r>"),
+            marked("<w:r><w:t>link</w:t></w:r>"),
+            marked("<w:r><w:t>inserted</w:t></w:r>"),
+            marked("<w:r><w:t>moved</w:t></w:r>"),
+            marked("<w:r><w:t>7</w:t></w:r>"),
+            two_copy_text_box(&format!("<w:p>{}</w:p>", marked(VISIBLE))),
+        );
+        let mut doc = parse(&body);
+        // The shapes under test.
+        assert!(matches!(&doc.body[0], Block::Raw(r) if r.contains("commentRangeStart")));
+        let inlines: Vec<&Inline> = doc
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => Some(&p.content),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        for shape in [
+            "Hyperlink",
+            "Revision",
+            "UnsupportedRevision",
+            "Field",
+            "TextBox",
+        ] {
+            assert!(
+                inlines.iter().any(|i| format!("{i:?}").starts_with(shape)),
+                "{shape}: {inlines:?}"
+            );
+        }
+        let before = document_to_xml(&doc);
+        let ones = count_blocks(&doc.body, Target::CommentMarkers(Some("1")));
+        let tens = count_blocks(&doc.body, Target::CommentMarkers(Some("10")));
+        // 6 containers + the raw blocks' 2, the text box counted once.
+        assert_eq!(ones, 6 * 3 + 2, "{before}");
+        assert_eq!(tens, ones);
+
+        assert_eq!(remove_comment_markers(&mut doc, "1"), ones);
+        assert_eq!(
+            count_blocks(&doc.body, Target::CommentMarkers(Some("1"))),
+            0
+        );
+        assert_eq!(
+            count_blocks(&doc.body, Target::CommentMarkers(Some("10"))),
+            tens
+        );
+        let xml = document_to_xml(&doc);
+        assert_eq!(count_markers(&xml, Some("1")), 0, "{xml}");
+        assert_eq!(
+            count_markers(&xml, Some("10")),
+            count_markers(&before, Some("10")),
+            "{xml}"
+        );
+        for kept in [
+            "cell",
+            "link",
+            "inserted",
+            "moved",
+            "w:moveTo",
+            "PAGE",
+            "<mc:Fallback>",
+        ] {
+            assert!(xml.contains(kept), "{kept}: {xml}");
+        }
+        assert_eq!(xml.matches("keep").count(), 2, "both box copies: {xml}");
+    }
+
+    /// #917: `w:id` is compared whole, whatever the attribute order, quote
+    /// style or element form.
+    #[test]
+    fn remove_one_comment_matches_the_id_exactly_917() {
+        let xml = "<w:commentRangeStart w:id=\"10\"/><w:commentRangeStart w:id=\"11\"/>\
+            <w:commentRangeStart w:id=\"21\"/><w:commentRangeStart w:id='1'/>\
+            <w:commentRangeEnd w:displacedByCustomXml=\"prev\" w:id=\"1\"/>\
+            <w:commentRangeEnd w:id=\"1\" w:displacedByCustomXml=\"next\"/>\
+            <w:commentRangeStart w:id=\"1\"></w:commentRangeStart>\
+            <w:r><w:commentReference w:id=\"1\" /></w:r>\
+            <w:bookmarkStart w:id=\"1\" w:name=\"b\"/>";
+        assert_eq!(count_markers(xml, Some("1")), 5);
+        let (out, n) = strip_markers(xml, Some("1"));
+        assert_eq!(n, 5);
+        assert_eq!(
+            out,
+            "<w:commentRangeStart w:id=\"10\"/><w:commentRangeStart w:id=\"11\"/>\
+             <w:commentRangeStart w:id=\"21\"/><w:r></w:r>\
+             <w:bookmarkStart w:id=\"1\" w:name=\"b\"/>"
+        );
+        assert_eq!(strip_markers(xml, Some("2")).1, 0);
+        assert_eq!(strip_markers(xml, None).1, 8);
+
+        // Through a document: comment 1's markers go, 10's, 11's and 21's stay.
+        let mut doc = parse(&format!("<w:p>{xml}<w:r><w:t>x</w:t></w:r></w:p>"));
+        assert_eq!(remove_comment_markers(&mut doc, "1"), 5);
+        let saved = document_to_xml(&doc);
+        assert_eq!(count_markers(&saved, Some("1")), 0, "{saved}");
+        for other in ["10", "11", "21"] {
+            assert_eq!(count_markers(&saved, Some(other)), 1, "{other}: {saved}");
+        }
+        assert!(saved.contains("w:bookmarkStart"), "{saved}");
     }
 
     /// Review r3 M2: hidden runs that stay raw XML are counted (not removed).
