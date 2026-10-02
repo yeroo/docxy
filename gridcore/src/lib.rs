@@ -47,6 +47,7 @@ pub mod legacy;
 pub mod model;
 pub mod numfmt;
 pub mod options;
+pub mod outline;
 pub mod pivot;
 pub mod pivotcalc;
 pub mod print;

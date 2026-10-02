@@ -434,24 +434,87 @@ pub struct ColDef {
 /// Excel's default column width in character units.
 pub const DEFAULT_COL_WIDTH: f64 = 8.43;
 
-/// Whether a raw attribute string carries a truthy `hidden` flag.
-fn attr_hidden(attrs: &str) -> bool {
-    attrs.contains("hidden=\"1\"") || attrs.contains("hidden=\"true\"")
+/// The `name="value"` attributes of a raw attribute string (`<row>`/`<col>`
+/// leftovers), split on attribute boundaries: each item is (name, value,
+/// the attribute's raw text). Matching whole names keeps `ht` from finding
+/// `customHeight`.
+fn xml_attr_items(s: &str) -> Vec<(&str, &str, &str)> {
+    let mut out = Vec::new();
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let start = i;
+        while i < b.len() && b[i] != b'=' && !b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let name = &s[start..i];
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= b.len() || b[i] != b'=' {
+            break;
+        }
+        i += 1;
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= b.len() || !matches!(b[i], b'"' | b'\'') {
+            break;
+        }
+        let q = b[i];
+        let vstart = i + 1;
+        let Some(len) = b[vstart..].iter().position(|&c| c == q) else {
+            break;
+        };
+        i = vstart + len + 1;
+        out.push((name, &s[vstart..vstart + len], &s[start..i]));
+    }
+    out
 }
 
-/// Remove `name="…"` from a space-separated attribute string, tidying whitespace.
-fn strip_xml_attr(s: &str, name: &str) -> String {
-    let key = format!("{name}=\"");
-    let out = if let Some(i) = s.find(&key) {
-        let after = i + key.len();
-        match s[after..].find('"') {
-            Some(q) => format!("{}{}", &s[..i], &s[after + q + 1..]),
-            None => s.to_string(),
+/// The value of attribute `name` in a raw attribute string.
+pub(crate) fn xml_attr<'a>(s: &'a str, name: &str) -> Option<&'a str> {
+    xml_attr_items(s)
+        .into_iter()
+        .find(|(n, _, _)| *n == name)
+        .map(|(_, v, _)| v)
+}
+
+/// `s` with attribute `name` set to `value` (in place when present, else
+/// appended) or removed (`None`). The result is in the loader's form, each
+/// attribute preceded by a space, so the writer can splice it after `r="…"`.
+pub(crate) fn with_xml_attr(s: &str, name: &str, value: Option<&str>) -> String {
+    let mut out = String::new();
+    let mut placed = false;
+    for (n, _, raw) in xml_attr_items(s) {
+        if n == name {
+            if let (Some(v), false) = (value, placed) {
+                out.push_str(&format!(" {name}=\"{v}\""));
+                placed = true;
+            }
+        } else {
+            out.push(' ');
+            out.push_str(raw);
         }
-    } else {
-        s.to_string()
-    };
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+    if let (Some(v), false) = (value, placed) {
+        out.push_str(&format!(" {name}=\"{v}\""));
+    }
+    out
+}
+
+/// Whether a raw attribute string carries a truthy boolean `name`
+/// (`"1"`/`"true"`; `"0"`/`"false"` and absence are false).
+pub(crate) fn xml_attr_flag(s: &str, name: &str) -> bool {
+    matches!(xml_attr(s, name).map(str::trim), Some("1" | "true"))
+}
+
+/// Whether a raw attribute string carries a truthy `hidden` flag.
+fn attr_hidden(attrs: &str) -> bool {
+    xml_attr_flag(attrs, "hidden")
 }
 
 #[derive(Clone, Debug, Default)]
@@ -534,6 +597,30 @@ pub struct Sheet {
     /// rewrites the element only when this differs from what the part holds,
     /// and never adds one the file didn't have.
     pub auto_filter: Option<SheetAutoFilter>,
+    /// `<sheetPr><outlinePr>`: where a group's summary row and column sit.
+    /// Edit this; a save writes it only when it differs from
+    /// [`Sheet::outline_loaded`].
+    pub outline: OutlineSettings,
+    /// The outline settings the worksheet part held at load.
+    pub outline_loaded: OutlineSettings,
+}
+
+/// Excel's outline settings (`<outlinePr summaryBelow summaryRight>`): a
+/// group's summary row sits below its detail, and its summary column to the
+/// right, unless these say otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutlineSettings {
+    pub summary_below: bool,
+    pub summary_right: bool,
+}
+
+impl Default for OutlineSettings {
+    fn default() -> Self {
+        OutlineSettings {
+            summary_below: true,
+            summary_right: true,
+        }
+    }
 }
 
 /// A worksheet's `<sheetFormatPr>` sizes.
@@ -1336,24 +1423,21 @@ impl Sheet {
         }
     }
 
-    /// Hide or unhide a row, preserving its other `<row>` attributes (e.g. `ht`).
-    pub fn set_row_hidden(&mut self, row: u32, hidden: bool) {
-        let cur = self.row_attrs.get(&row).cloned().unwrap_or_default();
-        let cleaned = strip_xml_attr(&cur, "hidden");
-        let next = if hidden {
-            if cleaned.is_empty() {
-                "hidden=\"1\"".to_string()
-            } else {
-                format!("{cleaned} hidden=\"1\"")
-            }
-        } else {
-            cleaned
-        };
+    /// Set (`Some`) or remove (`None`) one `<row>` attribute, keeping the
+    /// others; a row left with none drops out of `row_attrs`.
+    fn set_row_attr(&mut self, row: u32, name: &str, value: Option<&str>) {
+        let cur = self.row_attrs.get(&row).map(String::as_str).unwrap_or("");
+        let next = with_xml_attr(cur, name, value);
         if next.is_empty() {
             self.row_attrs.remove(&row);
         } else {
             self.row_attrs.insert(row, next);
         }
+    }
+
+    /// Hide or unhide a row, preserving its other `<row>` attributes (e.g. `ht`).
+    pub fn set_row_hidden(&mut self, row: u32, hidden: bool) {
+        self.set_row_attr(row, "hidden", hidden.then_some("1"));
     }
 
     /// The row's outline (grouping) level from its `<row outlineLevel="N">`
@@ -1361,37 +1445,29 @@ impl Sheet {
     pub fn row_outline(&self, row: u32) -> u8 {
         self.row_attrs
             .get(&row)
-            .and_then(|a| {
-                a.find("outlineLevel=\"")
-                    .map(|i| i + "outlineLevel=\"".len())
-                    .and_then(|s| {
-                        a[s..]
-                            .find('"')
-                            .and_then(|e| a[s..s + e].parse::<u8>().ok())
-                    })
-            })
+            .and_then(|a| xml_attr(a, "outlineLevel"))
+            .and_then(|v| v.trim().parse::<u8>().ok())
             .unwrap_or(0)
     }
 
     /// Set the row's outline (grouping) level, preserving its other `<row>`
     /// attributes. Level 0 removes the grouping.
     pub fn set_row_outline(&mut self, row: u32, level: u8) {
-        let cur = self.row_attrs.get(&row).cloned().unwrap_or_default();
-        let cleaned = strip_xml_attr(&cur, "outlineLevel");
-        let next = if level > 0 {
-            if cleaned.is_empty() {
-                format!("outlineLevel=\"{level}\"")
-            } else {
-                format!("{cleaned} outlineLevel=\"{level}\"")
-            }
-        } else {
-            cleaned
-        };
-        if next.is_empty() {
-            self.row_attrs.remove(&row);
-        } else {
-            self.row_attrs.insert(row, next);
-        }
+        let v = level.to_string();
+        self.set_row_attr(row, "outlineLevel", (level > 0).then_some(v.as_str()));
+    }
+
+    /// Whether the row carries a truthy `collapsed`: the summary row of a
+    /// group whose detail is hidden.
+    pub fn row_collapsed(&self, row: u32) -> bool {
+        self.row_attrs
+            .get(&row)
+            .is_some_and(|a| xml_attr_flag(a, "collapsed"))
+    }
+
+    /// Set or clear the row's `collapsed` flag, preserving its other attributes.
+    pub fn set_row_collapsed(&mut self, row: u32, collapsed: bool) {
+        self.set_row_attr(row, "collapsed", collapsed.then_some("1"));
     }
 
     /// The deepest outline level used by any row (for `<sheetFormatPr
@@ -1407,48 +1483,94 @@ impl Sheet {
     /// The row's explicit height in points (`<row ht="…">`), or `None` when it
     /// uses the sheet default.
     pub fn row_height(&self, row: u32) -> Option<f64> {
-        self.row_attrs.get(&row).and_then(|a| {
-            a.find("ht=\"").map(|i| i + "ht=\"".len()).and_then(|s| {
-                a[s..]
-                    .find('"')
-                    .and_then(|e| a[s..s + e].parse::<f64>().ok())
-            })
-        })
+        self.row_attrs
+            .get(&row)
+            .and_then(|a| xml_attr(a, "ht"))
+            .and_then(|v| v.parse::<f64>().ok())
     }
 
     /// Set (or clear, with `None`) the row's explicit height in points,
     /// preserving its other `<row>` attributes. A concrete height also stamps
     /// `customHeight="1"` so Excel honours it rather than auto-fitting.
     pub fn set_row_height(&mut self, row: u32, pts: Option<f64>) {
-        let cur = self.row_attrs.get(&row).cloned().unwrap_or_default();
-        let cleaned = strip_xml_attr(&strip_xml_attr(&cur, "ht"), "customHeight");
-        let next = match pts {
-            Some(h) => {
-                let h = format!("ht=\"{h}\" customHeight=\"1\"");
-                if cleaned.is_empty() {
-                    h
-                } else {
-                    format!("{cleaned} {h}")
-                }
-            }
-            None => cleaned,
-        };
-        if next.is_empty() {
-            self.row_attrs.remove(&row);
-        } else {
-            self.row_attrs.insert(row, next);
-        }
+        let h = pts.map(|h| h.to_string());
+        self.set_row_attr(row, "ht", h.as_deref());
+        self.set_row_attr(row, "customHeight", pts.map(|_| "1"));
+    }
+
+    /// The `<col>` definition covering `col`, if any.
+    fn col_def(&self, col: u32) -> Option<&ColDef> {
+        self.col_defs.iter().find(|d| col >= d.min && col <= d.max)
     }
 
     /// Whether a column is hidden (its `<col>` definition carries `hidden="1"`).
     pub fn col_hidden(&self, col: u32) -> bool {
-        self.col_defs
-            .iter()
-            .any(|d| col >= d.min && col <= d.max && attr_hidden(&d.attrs))
+        self.col_def(col).is_some_and(|d| attr_hidden(&d.attrs))
     }
 
-    /// Set one column's width, splitting any range definition that covers it.
-    pub fn set_col_width(&mut self, col: u32, width: f64) {
+    /// The column's outline (grouping) level from its `<col outlineLevel>`;
+    /// 0 when ungrouped.
+    pub fn col_outline(&self, col: u32) -> u8 {
+        self.col_def(col)
+            .and_then(|d| xml_attr(&d.attrs, "outlineLevel"))
+            .and_then(|v| v.trim().parse::<u8>().ok())
+            .unwrap_or(0)
+    }
+
+    /// Whether the column carries a truthy `collapsed` (the summary column of
+    /// a collapsed group).
+    pub fn col_collapsed(&self, col: u32) -> bool {
+        self.col_def(col)
+            .is_some_and(|d| xml_attr_flag(&d.attrs, "collapsed"))
+    }
+
+    /// The deepest outline level used by any column. 0 when flat.
+    pub fn max_col_outline(&self) -> u8 {
+        self.col_defs
+            .iter()
+            .filter_map(|d| xml_attr(&d.attrs, "outlineLevel"))
+            .filter_map(|v| v.trim().parse::<u8>().ok())
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Set the column's outline level, splitting any range definition that
+    /// covers it. Level 0 removes the grouping.
+    pub fn set_col_outline(&mut self, col: u32, level: u8) {
+        let v = level.to_string();
+        self.set_col_attr(col, "outlineLevel", (level > 0).then_some(v.as_str()));
+    }
+
+    /// Hide or unhide one column, splitting any range definition that covers it.
+    pub fn set_col_hidden(&mut self, col: u32, hidden: bool) {
+        self.set_col_attr(col, "hidden", hidden.then_some("1"));
+    }
+
+    /// Set or clear the column's `collapsed` flag.
+    pub fn set_col_collapsed(&mut self, col: u32, collapsed: bool) {
+        self.set_col_attr(col, "collapsed", collapsed.then_some("1"));
+    }
+
+    /// Set (`Some`) or remove (`None`) one attribute on column `col`'s
+    /// definition. Removing one from a column with no definition is a no-op.
+    fn set_col_attr(&mut self, col: u32, name: &str, value: Option<&str>) {
+        let Some(cur) = self.col_def(col).map(|d| d.attrs.clone()) else {
+            if value.is_some() {
+                self.isolate_col(col).attrs = with_xml_attr("", name, value);
+                self.coalesce_cols();
+            }
+            return;
+        };
+        let next = with_xml_attr(&cur, name, value);
+        if next != cur {
+            self.isolate_col(col).attrs = next;
+            self.coalesce_cols();
+        }
+    }
+
+    /// Split the definitions so `col` has one of its own (creating a
+    /// default-width one when none covers it), and return it.
+    fn isolate_col(&mut self, col: u32) -> &mut ColDef {
         let mut out: Vec<ColDef> = Vec::with_capacity(self.col_defs.len() + 2);
         let mut placed = false;
         for d in self.col_defs.drain(..) {
@@ -1467,8 +1589,7 @@ impl Sheet {
             out.push(ColDef {
                 min: col,
                 max: col,
-                width: Some(width),
-                attrs: d.attrs.clone(),
+                ..d.clone()
             });
             if d.max > col {
                 out.push(ColDef {
@@ -1483,12 +1604,38 @@ impl Sheet {
             out.push(ColDef {
                 min: col,
                 max: col,
-                width: Some(width),
+                width: None,
                 attrs: String::new(),
             });
         }
         out.sort_by_key(|d| d.min);
         self.col_defs = out;
+        self.col_defs
+            .iter_mut()
+            .find(|d| d.min == col)
+            .expect("isolate_col just placed this column")
+    }
+
+    /// Merge adjacent definitions that say the same thing, so a per-column
+    /// edit across a range leaves one `<col>` for the range, not one per
+    /// column.
+    fn coalesce_cols(&mut self) {
+        let same = |a: &str, b: &str| xml_attr_items(a) == xml_attr_items(b);
+        let mut out: Vec<ColDef> = Vec::with_capacity(self.col_defs.len());
+        for d in self.col_defs.drain(..) {
+            match out.last_mut() {
+                Some(p) if p.max + 1 == d.min && p.width == d.width && same(&p.attrs, &d.attrs) => {
+                    p.max = d.max;
+                }
+                _ => out.push(d),
+            }
+        }
+        self.col_defs = out;
+    }
+
+    /// Set one column's width, splitting any range definition that covers it.
+    pub fn set_col_width(&mut self, col: u32, width: f64) {
+        self.isolate_col(col).width = Some(width);
     }
 
     /// The merged region containing (row, col), if any.
@@ -2807,6 +2954,46 @@ mod tests {
         assert_eq!(s.col_width(2), 20.0);
         assert_eq!(s.col_width(3), 12.0);
         assert_eq!(s.col_width(9), DEFAULT_COL_WIDTH);
+    }
+
+    #[test]
+    fn row_attributes_match_whole_names() {
+        // `ht` must not be found inside `customHeight`, nor `hidden` inside
+        // some longer name.
+        let mut s = Sheet::default();
+        s.row_attrs.insert(
+            1,
+            " customHeight=\"1\" ht=\"20\" outlineLevel=\"1\" x14ac:dyDescent=\"0.25\"".into(),
+        );
+        assert_eq!(s.row_height(1), Some(20.0));
+        s.set_row_outline(1, 3);
+        s.set_row_hidden(1, true);
+        s.set_row_collapsed(1, true);
+        assert_eq!(s.row_height(1), Some(20.0));
+        assert_eq!(s.row_outline(1), 3);
+        assert!(s.row_hidden(1) && s.row_collapsed(1));
+        s.set_row_height(1, None);
+        assert_eq!(s.row_height(1), None);
+        assert_eq!(s.row_outline(1), 3, "clearing ht leaves the level");
+        s.set_row_outline(1, 0);
+        s.set_row_hidden(1, false);
+        s.set_row_collapsed(1, false);
+        assert_eq!(s.row_attrs[&1], " x14ac:dyDescent=\"0.25\"");
+        s.set_row_height(1, Some(30.0));
+        assert_eq!(
+            s.row_attrs[&1],
+            " x14ac:dyDescent=\"0.25\" ht=\"30\" customHeight=\"1\""
+        );
+        // A row left with nothing drops out.
+        let mut t = Sheet::default();
+        t.set_row_hidden(4, true);
+        t.set_row_hidden(4, false);
+        assert!(t.row_attrs.is_empty());
+        // An attribute named like the tail of another is a different one.
+        let mut u = Sheet::default();
+        u.row_attrs
+            .insert(2, " thickBot=\"1\" xhidden=\"1\"".into());
+        assert!(!u.row_hidden(2));
     }
 
     #[test]
