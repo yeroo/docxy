@@ -187,8 +187,8 @@ pub fn parse_consolidate_ref(
 }
 
 /// [`parse_consolidate_ref`] against the workbook's sheet names alone, in
-/// order: what a dialog holds to show a reference the way the list keeps it.
-pub fn parse_consolidate_ref_in(
+/// order.
+fn parse_consolidate_ref_in(
     names: &[&str],
     dest: usize,
     text: &str,
@@ -210,7 +210,9 @@ pub fn parse_consolidate_ref_in(
 }
 
 /// A reference as the list keeps it (`Sheet!$A$1:$D$4`) when it parses
-/// against `names`; otherwise the text as typed, so OK reports it.
+/// against `names`; otherwise the text as typed, so OK reports it. The
+/// dialogs hold the sheet names, not the workbook, to spell an added
+/// reference the way the list shows it.
 pub fn canonical_consolidate_ref(names: &[&str], dest: usize, text: &str) -> String {
     match parse_consolidate_ref_in(names, dest, text) {
         Ok(r) => format_consolidate_ref(&r),
@@ -353,10 +355,6 @@ fn aggregate(func: ConsolidateFunc, vals: &[&CellValue]) -> Option<CellValue> {
     })
 }
 
-fn overlaps((a1, b1, a2, b2): Area, (c1, d1, c2, d2): Area) -> bool {
-    a1 <= c2 && c1 <= a2 && b1 <= d2 && d1 <= b2
-}
-
 /// Consolidate `opts.refs` into sheet `dest` at (`row`, `col`), and keep
 /// the settings on that sheet. A reference repeated in another spelling
 /// (`East!A1:B3`, `east!$A$1:$B$3`) counts once. Refuses, changing nothing,
@@ -364,11 +362,14 @@ fn overlaps((a1, b1, a2, b2): Area, (c1, d1, c2, d2): Area) -> bool {
 /// sheet, a source overlapping the output, sources with nothing in them, or
 /// output that would run off the sheet. Returns the output area.
 ///
-/// With links, each output row becomes one hidden detail row per
-/// contributing source row (formulas such as `=East!$B$2`, written only for
-/// source cells that hold something, so a count or an average agrees with
-/// the static result; a source cell filled in later is not picked up), then
-/// a summary row totalling them, grouped in an outline below its detail.
+/// With links, each output row becomes hidden detail rows: one per
+/// contributing source row, and one more for each further cell that row
+/// puts under the same output column (a source whose top row repeats a
+/// label, `Jan` and `jan`). Their formulas, such as `=East!$B$2`, are
+/// written only for source cells that hold something, so a count or an
+/// average agrees with the static result; a source cell filled in later is
+/// not picked up. A summary row below them totals them, and the detail is
+/// grouped in an outline.
 pub fn consolidate(
     wb: &mut Workbook,
     dest: usize,
@@ -560,7 +561,7 @@ pub fn consolidate(
     let out: Area = (row, col, cur - 1, last_col as u32);
     if refs
         .iter()
-        .any(|r| r.sheet == *dest_name && overlaps(r.area, out))
+        .any(|r| r.sheet == *dest_name && super::rects_overlap(r.area, out))
     {
         return Err(ConsolidateError::OverlapsDest);
     }
