@@ -818,7 +818,9 @@ struct TrackedComment {
     /// Its `<w:comment>` exactly as `pkg` held it when Delete Comment took
     /// its markers, written back as is when an undo restores them: a
     /// loaded comment's paragraphs, formatting and `w14:paraId` survive.
-    /// `None` for one added in the session and never saved before.
+    /// `None` while it has not been deleted, or when `pkg` held no XML for
+    /// it then (added and never saved, or an id that isn't a number): a
+    /// restore then writes it from `comment`.
     raw: Option<String>,
     /// Where it sat in `comments`, so a restored one goes back there.
     index: usize,
@@ -3064,6 +3066,11 @@ impl App {
             }
         } else if let Some(t) = self.tracked_comments.get_mut(&c.id) {
             t.index = idx;
+            // A comment added this session and saved since is in `pkg`
+            // now: keep that XML too.
+            if t.raw.is_none() {
+                t.raw = n.and_then(|n| self.pkg.comment_xml(n));
+            }
         } else {
             let raw = n.and_then(|n| self.pkg.comment_xml(n));
             self.tracked_comments.insert(
@@ -11835,6 +11842,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         assert!(!doc.contains("w:id=\"1\""), "{doc}");
         assert_eq!(saved_comment_ids(&comments), ["2"], "{comments}");
+    }
+
+    /// #971 FIX r1 m2: a comment added this session and saved, then
+    /// deleted, keeps the XML the save wrote for its undo.
+    #[test]
+    fn delete_of_a_saved_session_comment_keeps_its_xml() {
+        let mut app = app_with(&["The quick brown fox."]);
+        add_comment_by_keys(&mut app, "Colour?");
+        let path = save_to_temp(&mut app, "cmt-session-raw");
+        let written = app.pkg.comment_xml(1).expect("saved");
+        app.run_act(ribbon::Act::DeleteComment);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert_eq!(
+            app.tracked_comments.get("1").and_then(|t| t.raw.as_deref()),
+            Some(written.as_str())
+        );
     }
 
     /// #971 A14: a comment an undo restores goes back to its place in the
