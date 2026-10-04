@@ -153,27 +153,54 @@ impl DataForm {
         };
         self.rec = rec;
         self.mode = Mode::Form;
-        let last = self.area.2;
-        for f in &mut self.fields {
-            let (text, formula) = match rec {
-                Rec::Row(r) => match s.cell(r, f.col) {
-                    Some(c) if c.formula.is_some() => {
-                        (format_with(&styles.xf(c.style), &c.value, date1904), true)
-                    }
-                    Some(c) => (seed_text(c, &styles.xf(c.style)), false),
-                    None => (String::new(), false),
-                },
-                // A new record's computed fields fill from the last record.
-                Rec::New => (
-                    String::new(),
-                    last > self.area.0 && is_formula_field(s, last, f.col),
-                ),
-            };
+        for i in 0..self.fields.len() {
+            let (text, formula) = self.read_field(s, styles, date1904, self.fields[i].col);
+            let f = &mut self.fields[i];
             f.text = text.clone();
             f.orig = text;
             f.formula = formula;
         }
         self.focus_on(prev);
+    }
+
+    /// Read the shown record again from sheet `s` after it changed in place,
+    /// keeping the fields the user has changed (text, and whether it's
+    /// computed) and the caret.
+    pub fn refresh(&mut self, s: &Sheet, styles: &Styles, date1904: bool) {
+        let (prev, cursor) = (self.focused(), self.cursor);
+        for i in 0..self.fields.len() {
+            if self.fields[i].text != self.fields[i].orig {
+                continue;
+            }
+            let (text, formula) = self.read_field(s, styles, date1904, self.fields[i].col);
+            let f = &mut self.fields[i];
+            f.text = text.clone();
+            f.orig = text;
+            f.formula = formula;
+        }
+        self.focus_on(prev);
+        if self.focused() == prev {
+            let len = self.focused_text().map_or(0, |t| t.chars().count());
+            self.cursor = cursor.min(len);
+        }
+    }
+
+    /// The field of `col` in the shown record, as the sheet holds it: its
+    /// input text, or a computed field's value as the grid shows it; and
+    /// whether it is computed. A new record's computed fields are the last
+    /// record's: they fill from it.
+    fn read_field(&self, s: &Sheet, styles: &Styles, date1904: bool, col: u32) -> (String, bool) {
+        let (top, _, last, _) = self.area;
+        match self.rec {
+            Rec::Row(r) => match s.cell(r, col) {
+                Some(c) if c.formula.is_some() => {
+                    (format_with(&styles.xf(c.style), &c.value, date1904), true)
+                }
+                Some(c) => (seed_text(c, &styles.xf(c.style)), false),
+                None => (String::new(), false),
+            },
+            Rec::New => (String::new(), last > top && is_formula_field(s, last, col)),
+        }
     }
 
     /// Show the criteria, the first field focused for typing.

@@ -121,12 +121,14 @@ pub fn delete_splits_array(s: &Sheet, (_, c1, bottom, c2): Area, row: u32) -> bo
 /// list's last row is left blank; cells beside the list stay where they are.
 /// A reference to a moved cell follows it, a reference to a deleted cell (a
 /// range: both corners) becomes `#REF!`, and the moved cells' own formulas
-/// move with them ([`super::move_refs`], as a cut does). A range only partly in the
-/// moved cells keeps its text (`SUM(B3:B4)` with row 3 deleted still reads
-/// `B3:B4`). Comments, merges, hyperlinks, and conditional-format and
+/// move with them ([`super::move_refs`], as a cut does). A range only partly
+/// in the moved cells keeps its text (`SUM(B3:B4)` with row 3 deleted still
+/// reads `B3:B4`). Comments, merges, hyperlinks, and conditional-format and
 /// validation ranges don't move, so the formulas of the rules over the
-/// shifted cells are left as they are too (any other rule's follow). A moved array anchor takes its `ref` along. The caller refuses
-/// a delete that would cut an array first ([`delete_splits_array`]).
+/// shifted cells are left as they are too; any other rule's formulas follow
+/// the cells they name. A moved array anchor takes its `ref` along. The
+/// caller refuses a delete that would cut an array first
+/// ([`delete_splits_array`]).
 pub fn delete_record(wb: &mut Workbook, sheet: usize, (_, c1, bottom, c2): Area, row: u32) {
     let name = wb.sheets[sheet].name.clone();
     // Pushed off the grid, a reference to the deleted cells is poisoned.

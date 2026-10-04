@@ -99,8 +99,6 @@ const READ_CAP: usize = 5000;
 /// The most matches one `find` returns.
 const FIND_CAP: usize = 200;
 
-/// Route one control verb against the live workbook, returning the JSON result
-/// or an error message.
 /// Whether `verb` is an agent edit of the workbook: its cells, sheets,
 /// tables or layout.
 fn edits(verb: &str) -> bool {
@@ -137,6 +135,29 @@ pub fn mutates(verb: &str) -> bool {
     edits(verb) || matches!(verb, "wb.open" | "wb.reload")
 }
 
+/// Whether `verb`, when it [`mutates`] the workbook, leaves every cell and
+/// sheet where it was: it writes, formats or annotates cells in place, or
+/// appends a sheet. A dialog over the workbook can stay open then, reading
+/// what it shows again; any other change (rows or columns moved, a sheet
+/// removed or renamed, a workbook opened, an import) may move what it
+/// shows.
+pub fn keeps_cells_in_place(verb: &str) -> bool {
+    matches!(
+        verb,
+        "cell.set"
+            | "range.set"
+            | "range.clear"
+            | "cell.format"
+            | "col.width"
+            | "comment.add"
+            | "wb.replace-all"
+            | "sheet.add"
+            | "table.rename"
+    )
+}
+
+/// Route one control verb against the live workbook, returning the JSON result
+/// or an error message.
 pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> {
     let out = match verb {
         "wb.path" => Ok(path_info(app)),

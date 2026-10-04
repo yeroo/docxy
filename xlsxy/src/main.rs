@@ -6242,6 +6242,20 @@ impl App {
         false
     }
 
+    /// Read the shown record's fields again after the workbook changed in
+    /// place, keeping what the user has typed and not yet written.
+    fn data_form_refresh(&mut self) {
+        if !self.data_form_sheet_ok() {
+            return;
+        }
+        let Some(mut d) = self.data_form.take() else {
+            return;
+        };
+        let wb = &self.pkg.workbook;
+        d.refresh(&wb.sheets[d.sheet], &wb.styles, wb.date1904);
+        self.data_form = Some(d);
+    }
+
     /// The form shows `rec`, read afresh from the sheet.
     fn data_form_show(&mut self, rec: dataform::Rec) {
         let Some(mut d) = self.data_form.take() else {
@@ -6465,7 +6479,8 @@ impl App {
 
     /// Yes to Delete: the shown record goes and the records below it move
     /// up ([`gridcore::edit::delete_record`]), as one undo step. Refused,
-    /// changing nothing, when part of an array sits in the rows that move
+    /// changing nothing, when it would cut an array: one with cells in the
+    /// rows that move that doesn't go whole
     /// ([`gridcore::edit::delete_splits_array`]).
     /// The form then shows the record that took its place (the one before,
     /// when it was the last) and closes when none is left.
@@ -9074,9 +9089,14 @@ fn run_control(
     if app.status.is_none() && !app.circle_warning_pending {
         app.status = before;
     }
-    // The data form's record, list and sheet may be gone under it.
+    // The data form's record, list or sheet may have moved under it: it
+    // closes. An edit that leaves the cells in place only refreshes it.
     if result.is_ok() && control::mutates(verb) && app.data_form.is_some() {
-        app.close_data_form();
+        if control::keeps_cells_in_place(verb) {
+            app.data_form_refresh();
+        } else {
+            app.close_data_form();
+        }
     }
     app.flush_circle_warning();
     result
@@ -17935,6 +17955,42 @@ mod tests {
         assert!(!app.confirm_key(KeyEvent::from(KeyCode::Char('y'))));
         assert!(app.data_form.is_none());
         assert_eq!(value_at(&app, 1, 0), CellValue::Text("Ann".into()));
+    }
+
+    #[test]
+    fn data_form_stays_open_over_an_agents_cell_edit() {
+        use ctlcore::json::Json;
+        let set = |app: &mut App, r: &str, t: &str| {
+            let args = Json::obj(vec![
+                ("ref", Json::Str(r.into())),
+                ("text", Json::Str(t.into())),
+            ]);
+            run_control(app, "cell.set", &args).unwrap();
+        };
+        let mut app = data_form_app();
+        app.ribbon_act(ribbon::Act::DataForm);
+        form_type(&mut app, "x"); // Name: Annx, not yet written
+        set(&mut app, "B2", "9"); // this record's Qty, untouched in the form
+        set(&mut app, "A3", "Bea"); // another record
+        assert!(app.data_form.is_some(), "a cell edit leaves the form open");
+        let d = form(&app);
+        assert_eq!(d.fields[0].text, "Annx", "the typed text stays");
+        assert_eq!(d.fields[1].text, "9", "an untouched field reads the edit");
+        assert_eq!(d.fields[2].text, "18", "and so does a computed one");
+        form_type(&mut app, "y"); // the caret stayed at the end
+        form_key(&mut app, KeyCode::Down);
+        assert_eq!(value_at(&app, 1, 0), CellValue::Text("Annxy".into()));
+        assert_eq!(value_at(&app, 1, 1), CellValue::Number(9.0));
+        assert_eq!(form(&app).fields[0].text, "Bea");
+        // Appending a sheet leaves it open too; renaming its sheet closes it.
+        run_control(&mut app, "sheet.add", &Json::obj(vec![])).unwrap();
+        assert!(app.data_form.is_some());
+        let args = Json::obj(vec![
+            ("sheet", Json::Num(0.0)),
+            ("name", Json::Str("Moved".into())),
+        ]);
+        run_control(&mut app, "sheet.rename", &args).unwrap();
+        assert!(app.data_form.is_none());
     }
 
     #[test]
