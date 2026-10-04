@@ -429,8 +429,9 @@ pub fn subtotal(
 
 /// Whether any sheet differs in what the outline and Subtotal commands
 /// change: cells, row attributes (levels, hidden, collapsed), column
-/// definitions, the outline settings and page breaks. The apps use it to
-/// record an undo step only for a command that changed something.
+/// definitions, the outline settings, page breaks and the Consolidate
+/// settings. The apps use it to record an undo step only for a command
+/// that changed something.
 pub fn sheets_differ(a: &[Sheet], b: &[Sheet]) -> bool {
     a.len() != b.len()
         || a.iter().zip(b).any(|(x, y)| {
@@ -439,6 +440,7 @@ pub fn sheets_differ(a: &[Sheet], b: &[Sheet]) -> bool {
                 || x.col_defs != y.col_defs
                 || x.outline != y.outline
                 || x.row_breaks != y.row_breaks
+                || x.consolidate != y.consolidate
         })
 }
 

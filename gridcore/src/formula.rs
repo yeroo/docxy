@@ -6840,7 +6840,9 @@ impl<'a> Eval<'a> {
                 Ok(v) => num(v.iter().sum()),
                 Err(e) => Value::Err(e),
             },
+            // No number to multiply is 0 in Excel, not the empty product.
             "PRODUCT" => match self.collect_values(args, true) {
+                Ok(v) if v.is_empty() => num(0.0),
                 Ok(v) => num(v.iter().product()),
                 Err(e) => Value::Err(e),
             },
@@ -12558,6 +12560,9 @@ mod tests {
         assert_eq!(n("COUNT(A1:B3)", &g), 3.0);
         assert_eq!(n("COUNTA(A1:B3)", &g), 4.0);
         assert_eq!(n("COUNTBLANK(A1:B3)", &g), 2.0);
+        // No number to multiply: 0, as in Excel, not the empty product.
+        assert_eq!(n("PRODUCT(B1:B3)", &g), 0.0);
+        assert_eq!(n("PRODUCT(A2:B3)", &g), 6.0);
     }
 
     #[test]
