@@ -673,11 +673,9 @@ fn apply(tab: &mut DocTab, d: &Dialog) -> Result<(), String> {
             let Surface::Doc(ed) = &tab.surface else {
                 return Err("Labels need a document".into());
             };
-            let bytes = doc_to_docx(
-                &ed.export_doc(),
-                &live_comments(tab, &ed.doc),
-                tab.pkg.as_ref(),
-            );
+            let live = live_comments(tab, &ed.doc);
+            let base = save_base(tab, &ed.doc, &live);
+            let bytes = doc_to_docx(&ed.export_doc(), &live, base.as_deref());
             let mut pkg = docxcore::package::load_package(&bytes).map_err(|e| e.to_string())?;
             let mut sheet = Editor::new(docxcore::model::Document {
                 body: vec![Block::SectionProperties(
@@ -689,10 +687,9 @@ fn apply(tab: &mut DocTab, d: &Dialog) -> Result<(), String> {
             });
             insert_labels(&mut sheet, &spec, &LabelFill::Same(address));
             pkg.document = sheet.doc;
-            for c in docxcore::comments::parse_comments(&pkg) {
-                if let Ok(id) = c.id.parse() {
-                    pkg.remove_comment(id);
-                }
+            // Every one, by the id as written, whatever the list can parse.
+            for id in pkg.comment_ids() {
+                pkg.remove_comment_id(&id);
             }
             pkg.set_mail_merge(None);
             tab.mail.new_tab = Some((pkg, "Labels1.docx".into()));
@@ -893,11 +890,9 @@ pub(crate) fn merge_to_new(tab: &mut DocTab, range: MergeRange) -> Result<(), St
     let Surface::Doc(ed) = &tab.surface else {
         return Err("Mail merge needs a document".into());
     };
-    let bytes = doc_to_docx(
-        &ed.export_doc(),
-        &live_comments(tab, &ed.doc),
-        tab.pkg.as_ref(),
-    );
+    let live = live_comments(tab, &ed.doc);
+    let base = save_base(tab, &ed.doc, &live);
+    let bytes = doc_to_docx(&ed.export_doc(), &live, base.as_deref());
     let main = docxcore::package::load_package(&bytes).map_err(|e| e.to_string())?;
     let doc_type = tab.mail.doc_type.unwrap_or_default();
     let merged = docxcore::merge::merge_package(

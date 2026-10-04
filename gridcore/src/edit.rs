@@ -12,7 +12,16 @@
 
 use std::collections::BTreeMap;
 
+mod clip;
+pub use clip::{MAX_PASTE_CELLS, PASTE_SHAPE, move_refs, paste_tiles, tiled_block};
+mod consolidate;
 mod subtotal;
+pub(crate) use consolidate::split_ref_text;
+pub use consolidate::{
+    ConsolidateError, ConsolidateFunc, ConsolidateOptions, ConsolidateRef, ConsolidateSettings,
+    canonical_consolidate_ref, consolidate, consolidate_fn_name, consolidate_token,
+    format_consolidate_ref, parse_consolidate_func, parse_consolidate_ref,
+};
 pub use subtotal::{
     Area, SubtotalError, SubtotalFunc, SubtotalOptions, is_subtotal_row, numeric_columns,
     remove_subtotals, sheets_differ, subtotal, subtotal_columns, subtotal_region,

@@ -37,6 +37,7 @@
 //! | `sheet.import-text` | `{text\|path,options?,name?}` | `{sheet,name,rows,cols}` — the Text Import Wizard's options (see `text_options`) into a new sheet |
 //! | `app.options` | `{convert_leading_zeros?,convert_long_numbers?,convert_e_notation?,convert_dates?,edit_fixed_decimal?,edit_fixed_decimal_places?,edit_move_after_enter?,edit_move_direction?,edit_in_cell?,edit_autocomplete?}` | all of them — File › Options › Data › Automatic Data Conversion and Advanced › Editing (places -300..=300, direction `down`/`right`/`up`/`left`); every given key is checked before any is set |
 //! | `range.text-to-columns` | `{range,options?,dest?,replace?,sheet?}` | `{rows}` — one column; refuses with "Do you want to replace the contents of the destination cells?" unless `replace:true`; one undo step |
+//! | `wb.consolidate` | `{refs,dest?,fn?,top?,left?,links?}` | `{sheet,range}` — Data › Consolidate: `refs` like `East!A1:C4` (a bare range is on the destination's sheet); `dest` a cell, `Sheet!B2` or `B2` (default: the cursor on the active sheet); `fn` a dialog name or file token (`Sum` default, `Count Numbers`/`countNums`, …); `top`/`left` match by labels; `links` writes linked formulas in an outline (refused for a source on the destination sheet). A refusal changes nothing. One undo step |
 //! | `wb.replace-all` | `{query,text}` | `{replaced}` — every sheet, one undo group |
 //! | `sheet.add` | `{name?}` | `{sheet,name}` |
 //! | `sheet.remove` | `{sheet}` | `{removed:true}` (last-sheet error) |
@@ -126,6 +127,7 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         "range.text-to-columns" => range_text_to_columns(app, args),
         "app.options" => app_options(app, args),
         "wb.replace-all" => wb_replace_all(app, args),
+        "wb.consolidate" => wb_consolidate(app, args),
         "sheet.add" => sheet_add(app, args),
         "sheet.remove" => sheet_remove(app, args),
         "sheet.rename" => sheet_rename(app, args),
@@ -187,6 +189,7 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
                 | "sheet.import-text"
                 | "range.text-to-columns"
                 | "wb.replace-all"
+                | "wb.consolidate"
                 | "sheet.add"
                 | "sheet.remove"
                 | "sheet.rename"
@@ -1315,6 +1318,55 @@ fn range_text_to_columns(app: &mut App, args: &Json) -> Result<Json, String> {
     }
     let rows = app.apply_text_to_columns(&src, &opts);
     Ok(Json::obj(vec![("rows", Json::Num(rows as f64))]))
+}
+
+/// Data › Consolidate, as the dialog's OK does it.
+fn wb_consolidate(app: &mut App, args: &Json) -> Result<Json, String> {
+    let refs = args
+        .get("refs")
+        .and_then(Json::as_array)
+        .ok_or("wb.consolidate needs 'refs' (an array of references)")?
+        .iter()
+        .map(|r| {
+            r.as_str()
+                .map(str::to_string)
+                .ok_or("each ref must be a string")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let func = match args.get_str("fn") {
+        Some(f) => gridcore::edit::parse_consolidate_func(f)
+            .ok_or_else(|| format!("unknown function '{f}'"))?,
+        None => Default::default(),
+    };
+    let (sheet, at) = match args.get_str("dest") {
+        Some(d) => {
+            let r = gridcore::edit::parse_consolidate_ref(&app.pkg.workbook, app.sheet, d)
+                .map_err(|_| format!("bad destination '{d}'"))?;
+            let ix = app.pkg.workbook.sheet_index(&r.sheet).unwrap_or(app.sheet);
+            (ix, (r.area.0, r.area.1))
+        }
+        None => (app.sheet, app.cur),
+    };
+    let flag = |k: &str| args.get(k).and_then(Json::as_bool).unwrap_or(false);
+    let opts = gridcore::edit::ConsolidateOptions {
+        func,
+        refs,
+        top_row: flag("top"),
+        left_col: flag("left"),
+        links: flag("links"),
+        book_name: String::new(),
+    };
+    let (r1, c1, r2, c2) = app.apply_consolidate(sheet, at, opts)?;
+    Ok(Json::obj(vec![
+        (
+            "sheet",
+            Json::Str(app.pkg.workbook.sheets[sheet].name.clone()),
+        ),
+        (
+            "range",
+            Json::Str(format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2))),
+        ),
+    ]))
 }
 
 /// Import CSV text as a brand-new sheet (never overwrites an existing one —
@@ -6433,5 +6485,166 @@ mod table_verb_tests {
             formula_value(&mut a, "F2"),
             (Some("=SUM(Calc[Line])".into()), Some("66".into()))
         );
+    }
+}
+
+#[cfg(test)]
+mod consolidate_tests {
+    use super::*;
+    use gridcore::xlsx::new_xlsx;
+
+    fn app() -> App {
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].name = "East".into();
+        pkg.add_sheet("West");
+        pkg.add_sheet("Summary");
+        for (s, v) in [(0, 1.0), (1, 10.0)] {
+            let sh = &mut pkg.workbook.sheets[s];
+            sh.set_cell(0, 0, Cell::text("k"));
+            sh.set_cell(0, 1, Cell::number(v));
+        }
+        let mut a = App::new(pkg, "Book.xlsx");
+        a.os_clip = None;
+        a
+    }
+
+    fn args(pairs: Vec<(&str, Json)>) -> Json {
+        Json::obj(pairs)
+    }
+
+    fn refs(r: &[&str]) -> Json {
+        Json::Arr(r.iter().map(|s| Json::Str(s.to_string())).collect())
+    }
+
+    fn value(a: &App, sheet: usize, r: u32, c: u32) -> Option<CellValue> {
+        a.pkg.workbook.sheets[sheet]
+            .cell(r, c)
+            .map(|c| c.value.clone())
+    }
+
+    #[test]
+    fn wb_consolidate_writes_at_dest_as_one_undo_step() {
+        let mut a = app();
+        let undo_len = a.undo.len();
+        let r = dispatch(
+            &mut a,
+            "wb.consolidate",
+            &args(vec![
+                ("refs", refs(&["East!A1:B1", "West!A1:B1"])),
+                ("dest", Json::Str("Summary!C3".into())),
+                ("fn", Json::Str("count numbers".into())),
+                ("left", Json::Bool(true)),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(r.get_str("sheet"), Some("Summary"));
+        assert_eq!(r.get_str("range"), Some("C3:D3"));
+        assert_eq!(value(&a, 2, 2, 2), Some(CellValue::Text("k".into())));
+        assert_eq!(value(&a, 2, 2, 3), Some(CellValue::Number(2.0)));
+        assert_eq!(a.undo.len(), undo_len + 1);
+        // The file token works too.
+        dispatch(
+            &mut a,
+            "wb.consolidate",
+            &args(vec![
+                ("refs", refs(&["East!A1:B1", "West!A1:B1"])),
+                ("dest", Json::Str("Summary!C3".into())),
+                ("fn", Json::Str("countNums".into())),
+                ("left", Json::Bool(true)),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(value(&a, 2, 2, 3), Some(CellValue::Number(2.0)));
+        assert_eq!(
+            a.pkg.workbook.sheets[2]
+                .consolidate
+                .as_ref()
+                .map(|c| c.func),
+            Some(gridcore::edit::SubtotalFunc::CountNums)
+        );
+        // Without `fn` it is Sum.
+        dispatch(
+            &mut a,
+            "wb.consolidate",
+            &args(vec![
+                ("refs", refs(&["East!B1", "West!B1"])),
+                ("dest", Json::Str("Summary!A1".into())),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(value(&a, 2, 0, 0), Some(CellValue::Number(11.0)));
+    }
+
+    #[test]
+    fn wb_consolidate_follows_the_destination_sheets_protection() {
+        let mut a = app();
+        // The active sheet is protected, the destination is not: allowed.
+        a.sheet = 0;
+        a.pkg.workbook.sheets[0].set_protected(true);
+        let call = |a: &mut App| {
+            dispatch(
+                a,
+                "wb.consolidate",
+                &args(vec![
+                    ("refs", refs(&["East!B1", "West!B1"])),
+                    ("dest", Json::Str("Summary!A1".into())),
+                ]),
+            )
+        };
+        call(&mut a).unwrap();
+        assert_eq!(value(&a, 2, 0, 0), Some(CellValue::Number(11.0)));
+        // A protected destination refuses, whatever the active sheet.
+        a.pkg.workbook.sheets[0].set_protected(false);
+        a.pkg.workbook.sheets[2].set_protected(true);
+        let undo_len = a.undo.len();
+        let err = call(&mut a).unwrap_err();
+        assert!(err.contains("protected"), "{err}");
+        assert_eq!(a.undo.len(), undo_len);
+    }
+
+    #[test]
+    fn wb_consolidate_refusals_change_nothing() {
+        let mut a = app();
+        let before = a.pkg.workbook.sheets.clone();
+        let undo_len = a.undo.len();
+        let err = |a: &mut App, pairs: Vec<(&str, Json)>| {
+            dispatch(a, "wb.consolidate", &args(pairs)).unwrap_err()
+        };
+        assert!(err(&mut a, vec![]).contains("needs 'refs'"));
+        assert!(
+            err(
+                &mut a,
+                vec![
+                    ("refs", refs(&["East!A1:B1"])),
+                    ("fn", Json::Str("median".into()))
+                ]
+            )
+            .contains("unknown function")
+        );
+        let e = err(
+            &mut a,
+            vec![
+                ("refs", refs(&["East!A1:B1", "Nowhere!A1"])),
+                ("dest", Json::Str("Summary!A1".into())),
+            ],
+        );
+        assert!(e.contains("Nowhere!A1"), "{e}");
+        let e = err(
+            &mut a,
+            vec![
+                ("refs", refs(&["East!A1:B1", "West!A1:B1"])),
+                ("dest", Json::Str("West!A5".into())),
+                ("links", Json::Bool(true)),
+            ],
+        );
+        assert_eq!(
+            e,
+            gridcore::edit::ConsolidateError::LinksOnDestSheet.to_string()
+        );
+        assert!(!gridcore::edit::sheets_differ(
+            &before,
+            &a.pkg.workbook.sheets
+        ));
+        assert_eq!(a.undo.len(), undo_len);
     }
 }

@@ -62,6 +62,8 @@ fn apply_dialog(
         DialogOwner::TextToColumns { .. } | DialogOwner::TextToColumnsReplace => {
             Err("Text to Columns applies through its own wizard".into())
         }
+        // Handled in `sheet_consolidate::click`, before this.
+        DialogOwner::Consolidate { .. } => Err("Consolidate applies through the Data tab".into()),
         // Handled in `sheet_outline::click`, before this.
         DialogOwner::Subtotal { .. }
         | DialogOwner::OutlineSettings
@@ -143,6 +145,10 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Result<(), String>
     }
     // So do the outline dialogs (#693): Subtotal's OK and Remove All.
     if let Some(done) = crate::sheet_outline::click(tab, button) {
+        return done;
+    }
+    // Consolidate's Add and Delete edit its list; OK consolidates (#694).
+    if let Some(done) = crate::sheet_consolidate::click(tab, button) {
         return done;
     }
     if let Some(done) = reopen_click(tab, button) {

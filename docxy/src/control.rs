@@ -5,6 +5,10 @@
 //! Every mutating verb goes through [`docxcore::editor::Editor`], so an agent's
 //! edits land on the *same* undo stack as keyboard edits and repaint the view
 //! live; reads serialize `editor.doc`, so they always reflect unsaved changes.
+//! Exception: the Design verbs' package edits (`doc.page-color`, a
+//! watermark's header parts) bypass the undo stack — only their section
+//! edits (`doc.watermark`'s header references, `doc.page-borders`) are undo
+//! steps.
 //!
 //! Addressing is by **top-level block index** (position in `doc.body`): a
 //! paragraph or table. `doc.read` / `doc.outline` report each block's `kind`, so
@@ -40,10 +44,13 @@
 //! | `doc.export-pdf` | `{path}` | `{path}` (absolutized; refuses to overwrite) |
 //! | `doc.format` | `{start, end?, patch}` | `{formatted}` — one undo checkpoint; `patch` keys: `bold`/`italic`/`underline`/`strike`/`color`/`highlight`/`font`/`size` (≥1 required), set-to-value semantics |
 //! | `doc.set-style` | `{start, end?, style?, align?}` | `{styled}` — one undo checkpoint; ≥1 of `style`/`align` required |
+//! | `doc.page-color` | `{color:"#RRGGBB"\|"none"}` | `{pageColor, changed}` — a package edit with no undo step; refuses Markdown |
+//! | `doc.watermark` | `{text, layout?, font?, color?}` or `{remove:true}` | `{watermark, changed}` — the header parts are package edits and the new header references one undo step; refuses Markdown |
+//! | `doc.page-borders` | `{border:"none"\|"box"\|"shadow", color?}` | `{pageBorders, changed}` — every section as one undo step; refuses Markdown |
 
 use crate::{
-    App, DocFormat, property_scope_name, protection::MutationKind, revision_category_name,
-    unsupported_revision_name,
+    App, DocFormat, box_page_borders, property_scope_name, protection::MutationKind,
+    revision_category_name, unsupported_revision_name,
 };
 use ctlcore::json::Json;
 use docxcore::agent;
@@ -52,6 +59,7 @@ use docxcore::editor::RevisionLocation;
 use docxcore::export::to_pdf;
 use docxcore::model::{Block, RevisionCategory, RevisionTarget};
 use docxcore::review::{MalformedRevisionReason, RevisionAction, RevisionOutcome};
+use docxcore::watermark::TextWatermarkSpec;
 use std::path::Path;
 
 /// The directory where docxy publishes its control discovery files:
@@ -83,7 +91,8 @@ pub(crate) fn mutation_kind_for_verb(verb: &str) -> Option<MutationKind> {
         | "doc.revision-reject"
         | "doc.revisions-accept-all"
         | "doc.revisions-reject-all" => MutationKind::Content,
-        "doc.format" | "doc.set-style" => MutationKind::Formatting,
+        "doc.format" | "doc.set-style" | "doc.page-color" | "doc.watermark"
+        | "doc.page-borders" => MutationKind::Formatting,
         _ => return None,
     })
 }
@@ -127,6 +136,9 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         "doc.replace-all" => replace_all(app, args),
         "doc.format" => format(app, args),
         "doc.set-style" => set_style(app, args),
+        "doc.page-color" => page_color(app, args),
+        "doc.watermark" => watermark(app, args),
+        "doc.page-borders" => page_borders(app, args),
         "doc.undo" => Ok(undo(app)),
         "doc.redo" => Ok(redo(app)),
         "doc.export-pdf" => export_pdf(app, args),
@@ -929,6 +941,145 @@ fn set_style(app: &mut App, args: &Json) -> Result<Json, String> {
     Ok(Json::obj(vec![("styled", Json::Num(styled as f64))]))
 }
 
+/// The Design verbs need a .docx: a Markdown package has no page background,
+/// headers, or section properties.
+fn ensure_docx(app: &App, verb: &str) -> Result<(), String> {
+    if app.format == DocFormat::Markdown {
+        return Err(format!("{verb} needs a .docx (not Markdown)"));
+    }
+    Ok(())
+}
+
+/// Parse `"#RRGGBB"` (case-insensitive hex) into a colour value.
+fn parse_rgb(s: &str) -> Result<u32, String> {
+    let bad = || format!("bad color '{s}' (want \"#RRGGBB\")");
+    let Some(hex) = s.strip_prefix('#') else {
+        return Err(bad());
+    };
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(bad());
+    }
+    u32::from_str_radix(hex, 16).map_err(|_| bad())
+}
+
+/// `doc.page-color {color:"#RRGGBB"|"none"}` → `{pageColor, changed}`. Sets or
+/// removes the page background through the same code as the Design ▸ Page
+/// Color picker: a package edit with no undo step. Refuses Markdown.
+fn page_color(app: &mut App, args: &Json) -> Result<Json, String> {
+    ensure_docx(app, "doc.page-color")?;
+    let color = args
+        .get_str("color")
+        .ok_or("doc.page-color needs a 'color' (\"#RRGGBB\" or \"none\")")?;
+    let rgb = if color == "none" {
+        None
+    } else {
+        Some(parse_rgb(color)?)
+    };
+    let changed = app.set_page_color(rgb);
+    if changed {
+        ctlcore::signal_activity();
+    }
+    Ok(Json::obj(vec![
+        (
+            "pageColor",
+            rgb.map_or(Json::Null, |c| Json::Str(format!("#{c:06X}"))),
+        ),
+        ("changed", Json::Bool(changed)),
+    ]))
+}
+
+/// `doc.watermark {text, layout?, font?, color?}` or `{remove:true}` →
+/// `{watermark, changed}`. Writes or removes the text watermark through the
+/// same code as the Design ▸ Watermark picker: the header parts are package
+/// edits and the new header references are one undo step. Refuses Markdown.
+fn watermark(app: &mut App, args: &Json) -> Result<Json, String> {
+    ensure_docx(app, "doc.watermark")?;
+    let text = args.get_str("text");
+    let remove = args.get("remove").and_then(Json::as_bool).unwrap_or(false);
+    if text.is_some() && remove {
+        return Err("doc.watermark takes 'text' or 'remove', not both".to_string());
+    }
+    let spec = if remove {
+        None
+    } else {
+        let text = text
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .ok_or("doc.watermark needs a 'text' (or 'remove': true)")?;
+        let diagonal = match args.get_str("layout") {
+            None | Some("diagonal") => true,
+            Some("horizontal") => false,
+            Some(v) => {
+                return Err(format!(
+                    "bad layout '{v}' (want \"diagonal\" or \"horizontal\")"
+                ));
+            }
+        };
+        let mut spec = TextWatermarkSpec::preset(text, diagonal);
+        if let Some(font) = args.get_str("font") {
+            spec.font = font.to_string();
+        }
+        if let Some(color) = args.get_str("color") {
+            spec.color = parse_rgb(color)?;
+        }
+        Some(spec)
+    };
+    let changed = app
+        .set_text_watermark(spec.as_ref())
+        .map_err(|(changed, msg)| {
+            // The error can follow a partial edit (existing watermarks were
+            // removed before the header failed): repaint and flag activity like
+            // a successful change, and say so in the message.
+            if changed {
+                app.dirty = true;
+                ctlcore::signal_activity();
+                format!("{msg} (the document was changed: existing watermarks were removed)")
+            } else {
+                msg
+            }
+        })?;
+    if changed {
+        ctlcore::signal_activity();
+    }
+    Ok(Json::obj(vec![
+        (
+            "watermark",
+            spec.as_ref()
+                .map_or(Json::Null, |s| Json::Str(s.text.clone())),
+        ),
+        ("changed", Json::Bool(changed)),
+    ]))
+}
+
+/// `doc.page-borders {border:"none"|"box"|"shadow", color?}` →
+/// `{pageBorders, changed}`. Writes or removes the four-sided page borders
+/// on every section through the same code as the Design ▸ Page Borders
+/// picker, as one undo step. Refuses Markdown.
+fn page_borders(app: &mut App, args: &Json) -> Result<Json, String> {
+    ensure_docx(app, "doc.page-borders")?;
+    let border = args
+        .get_str("border")
+        .ok_or("doc.page-borders needs a 'border' (\"none\", \"box\" or \"shadow\")")?;
+    if !matches!(border, "none" | "box" | "shadow") {
+        return Err(
+            "doc.page-borders needs a 'border' (\"none\", \"box\" or \"shadow\")".to_string(),
+        );
+    }
+    let color = match args.get_str("color") {
+        Some(c) => Some(parse_rgb(c)?),
+        None => None,
+    };
+    let pb = (border != "none").then(|| box_page_borders(border == "shadow", color));
+    let changed = app.set_page_borders(pb.as_ref());
+    if changed {
+        ctlcore::signal_activity();
+    }
+    Ok(Json::obj(vec![
+        ("pageBorders", Json::Str(border.to_string())),
+        ("changed", Json::Bool(changed)),
+    ]))
+}
+
 /// `doc.undo`: unwind the last edit, if any. A no-op (`{done:false}`, empty
 /// undo stack) must not mark the document modified or flash the agent-status
 /// dot — nothing actually changed.
@@ -1042,7 +1193,7 @@ fn finish_edit(app: &mut App) {
     app.refresh_watermark_state_if_needed();
     // An undo or redo may take a new comment's markers or bring them back:
     // `doc.comments` and the panel follow (#620).
-    app.sync_session_comments();
+    app.sync_tracked_comments();
 }
 
 /// Resolve an optional block range from `{start, end}` or `{range:"a..b"}`,
@@ -1094,7 +1245,8 @@ mod tests {
         RunProps, UnsupportedRevisionKind,
     };
     use docxcore::package::{
-        ProtectionEditMode, ProtectionEnforcement, load_package, new_package, save_package,
+        ProtectionEditMode, ProtectionEnforcement, load_package, new_markdown_package, new_package,
+        save_package,
     };
 
     /// A document of simple text paragraphs.
@@ -2135,6 +2287,9 @@ mod tests {
             ("doc.redo", Content),
             ("doc.format", Formatting),
             ("doc.set-style", Formatting),
+            ("doc.page-color", Formatting),
+            ("doc.watermark", Formatting),
+            ("doc.page-borders", Formatting),
             ("doc.revision-accept", Content),
             ("doc.revision-reject", Content),
             ("doc.revisions-accept-all", Content),
@@ -2208,6 +2363,15 @@ mod tests {
                     ("start", Json::Num(0.0)),
                     ("align", Json::Str("center".into())),
                 ]),
+            ),
+            (
+                "doc.page-color",
+                args(vec![("color", Json::Str("#FF0000".into()))]),
+            ),
+            ("doc.watermark", args(vec![("text", Json::Str("X".into()))])),
+            (
+                "doc.page-borders",
+                args(vec![("border", Json::Str("box".into()))]),
             ),
             ("doc.undo", Json::Null),
             ("doc.redo", Json::Null),
@@ -3069,6 +3233,280 @@ mod tests {
             panic!()
         };
         assert_eq!(p.props.style_id.as_deref(), Some("Quote"));
+    }
+
+    #[test]
+    fn page_color_verb_sets_removes_and_survives_save() {
+        let mut app = app_with(&["body"]);
+        let out = dispatch(
+            &mut app,
+            "doc.page-color",
+            &args(vec![("color", Json::Str("#ff0000".into()))]),
+        )
+        .unwrap();
+        assert_eq!(out.get_str("pageColor"), Some("#FF0000"));
+        assert_eq!(out.get("changed").and_then(Json::as_bool), Some(true));
+
+        let dir = std::env::temp_dir().join(format!("docxy-ctl-page-color-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        app.path = dir.join("t.docx").to_string_lossy().into_owned();
+        app.save();
+        let bytes = std::fs::read(dir.join("t.docx")).expect("saved");
+        let reloaded = load_package(&bytes).unwrap();
+        assert_eq!(reloaded.page_background().map(|b| b.color), Some(0xFF0000));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let out = dispatch(
+            &mut app,
+            "doc.page-color",
+            &args(vec![("color", Json::Str("none".into()))]),
+        )
+        .unwrap();
+        assert_eq!(out.get_str("pageColor"), None);
+        assert_eq!(out.get("changed").and_then(Json::as_bool), Some(true));
+        assert!(app.pkg.page_background().is_none());
+    }
+
+    #[test]
+    fn watermark_verb_adds_custom_text_and_removes() {
+        let mut app = app_with(&["body"]); // no header at all
+        let out = dispatch(
+            &mut app,
+            "doc.watermark",
+            &args(vec![
+                ("text", Json::Str("Internal".into())),
+                ("layout", Json::Str("horizontal".into())),
+                ("font", Json::Str("Arial".into())),
+                ("color", Json::Str("#FF0000".into())),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(out.get_str("watermark"), Some("Internal"));
+        assert_eq!(out.get("changed").and_then(Json::as_bool), Some(true));
+        let marks = app.pkg.shown_text_watermarks(&app.editor.sections());
+        assert_eq!(marks.len(), 1, "{marks:?}");
+        assert_eq!(marks[0].text, "Internal");
+        assert!(marks[0].rotation.abs() < 0.5, "horizontal: {marks:?}");
+        assert_eq!(marks[0].fill, Some((255, 0, 0)), "{marks:?}");
+        assert_eq!(marks[0].font.as_deref(), Some("Arial"), "{marks:?}");
+        assert!(app.modified);
+
+        // The watermark survives save.
+        let dir = std::env::temp_dir().join(format!("docxy-ctl-watermark-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        app.path = dir.join("t.docx").to_string_lossy().into_owned();
+        app.save();
+        let bytes = std::fs::read(dir.join("t.docx")).expect("saved");
+        let app2 = App::new(load_package(&bytes).unwrap(), "t.docx", false);
+        let marks = app2.pkg.shown_text_watermarks(&app2.editor.sections());
+        assert_eq!(marks.len(), 1, "{marks:?}");
+        assert_eq!(marks[0].text, "Internal");
+        assert_eq!(marks[0].fill, Some((255, 0, 0)), "{marks:?}");
+        assert_eq!(marks[0].font.as_deref(), Some("Arial"), "{marks:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let out = dispatch(
+            &mut app,
+            "doc.watermark",
+            &args(vec![("remove", Json::Bool(true))]),
+        )
+        .unwrap();
+        assert_eq!(out.get_str("watermark"), None);
+        assert!(
+            app.pkg
+                .shown_text_watermarks(&app.editor.sections())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn page_borders_verb_writes_every_section_in_one_undo_step() {
+        use docxcore::sect::{PageBorders, PgBorderOffset};
+        let first = Paragraph {
+            props: ParProps {
+                section_break: Some("<w:sectPr/>".to_string()),
+                ..ParProps::default()
+            },
+            content: vec![Inline::Run(Run {
+                text: "one".to_string(),
+                props: RunProps::default(),
+            })],
+        };
+        let second = Paragraph {
+            props: ParProps::default(),
+            content: vec![Inline::Run(Run {
+                text: "two".to_string(),
+                props: RunProps::default(),
+            })],
+        };
+        let mut app = App::new(
+            new_package(Document {
+                body: vec![Block::Paragraph(first), Block::Paragraph(second)],
+            }),
+            "ctl-test.docx",
+            false,
+        );
+        let out = dispatch(
+            &mut app,
+            "doc.page-borders",
+            &args(vec![
+                ("border", Json::Str("shadow".into())),
+                ("color", Json::Str("#00FF00".into())),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(out.get_str("pageBorders"), Some("shadow"));
+        assert_eq!(out.get("changed").and_then(Json::as_bool), Some(true));
+        let sects = app.editor.sections();
+        assert_eq!(sects.len(), 2, "{sects:?}");
+        for s in &sects {
+            let pb = PageBorders::parse(s).unwrap_or_else(|| panic!("page borders in {s}"));
+            assert_eq!(pb.offset_from, PgBorderOffset::Page);
+            for side in &pb.sides {
+                let side = side.as_ref().expect("all four sides set");
+                assert!(side.shadow);
+                assert_eq!(side.color, Some(0x00FF00));
+            }
+        }
+        // One undo step removes every section's borders.
+        let out = dispatch(&mut app, "doc.undo", &Json::Null).unwrap();
+        assert_eq!(out.get("done").and_then(Json::as_bool), Some(true));
+        assert!(
+            !app.editor
+                .sections()
+                .iter()
+                .any(|s| s.contains("<w:pgBorders"))
+        );
+
+        // Re-applied borders survive save.
+        dispatch(
+            &mut app,
+            "doc.page-borders",
+            &args(vec![("border", Json::Str("shadow".into()))]),
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("docxy-ctl-borders-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        app.path = dir.join("t.docx").to_string_lossy().into_owned();
+        app.save();
+        let bytes = std::fs::read(dir.join("t.docx")).expect("saved");
+        let reloaded = load_package(&bytes).unwrap();
+        assert!(reloaded.sect_pr().contains("w:shadow=\"1\""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn design_verbs_validate_arguments() {
+        let cases: Vec<(&str, Json, &str)> = vec![
+            (
+                "doc.page-color",
+                args(vec![]),
+                "doc.page-color needs a 'color' (\"#RRGGBB\" or \"none\")",
+            ),
+            (
+                "doc.page-color",
+                args(vec![("color", Json::Str("red".into()))]),
+                "bad color 'red' (want \"#RRGGBB\")",
+            ),
+            (
+                "doc.watermark",
+                args(vec![]),
+                "doc.watermark needs a 'text' (or 'remove': true)",
+            ),
+            (
+                "doc.watermark",
+                args(vec![("text", Json::Str("   ".into()))]),
+                "doc.watermark needs a 'text' (or 'remove': true)",
+            ),
+            (
+                "doc.watermark",
+                args(vec![
+                    ("text", Json::Str("X".into())),
+                    ("remove", Json::Bool(true)),
+                ]),
+                "doc.watermark takes 'text' or 'remove', not both",
+            ),
+            (
+                "doc.watermark",
+                args(vec![
+                    ("text", Json::Str("X".into())),
+                    ("layout", Json::Str("vertical".into())),
+                ]),
+                "bad layout 'vertical' (want \"diagonal\" or \"horizontal\")",
+            ),
+            (
+                "doc.watermark",
+                args(vec![
+                    ("text", Json::Str("X".into())),
+                    ("color", Json::Str("red".into())),
+                ]),
+                "bad color 'red' (want \"#RRGGBB\")",
+            ),
+            (
+                "doc.page-borders",
+                args(vec![]),
+                "doc.page-borders needs a 'border' (\"none\", \"box\" or \"shadow\")",
+            ),
+            (
+                "doc.page-borders",
+                args(vec![("border", Json::Str("fancy".into()))]),
+                "doc.page-borders needs a 'border' (\"none\", \"box\" or \"shadow\")",
+            ),
+            (
+                "doc.page-borders",
+                args(vec![
+                    ("border", Json::Str("box".into())),
+                    ("color", Json::Str("green".into())),
+                ]),
+                "bad color 'green' (want \"#RRGGBB\")",
+            ),
+        ];
+        for (verb, verb_args, want) in cases {
+            let mut app = app_with(&["A"]);
+            let err = dispatch(&mut app, verb, &verb_args).unwrap_err();
+            assert_eq!(err, want, "{verb}");
+            assert!(!app.modified, "{verb} modified the document");
+            assert!(
+                app.pkg.page_background().is_none(),
+                "{verb} set a page colour"
+            );
+            assert!(
+                app.pkg
+                    .shown_text_watermarks(&app.editor.sections())
+                    .is_empty(),
+                "{verb} set a watermark"
+            );
+            assert!(
+                !app.editor
+                    .sections()
+                    .iter()
+                    .any(|s| s.contains("<w:pgBorders")),
+                "{verb} set page borders"
+            );
+        }
+    }
+
+    #[test]
+    fn design_verbs_refuse_markdown() {
+        let body = vec![Block::Paragraph(Paragraph::default())];
+        let mut app = App::new(new_markdown_package(Document { body }), "a.md", false);
+        for (verb, verb_args) in [
+            (
+                "doc.page-color",
+                args(vec![("color", Json::Str("#FF0000".into()))]),
+            ),
+            ("doc.watermark", args(vec![("text", Json::Str("X".into()))])),
+            (
+                "doc.page-borders",
+                args(vec![("border", Json::Str("box".into()))]),
+            ),
+        ] {
+            let err = dispatch(&mut app, verb, &verb_args).unwrap_err();
+            assert!(err.contains("needs a .docx"), "{verb}: {err}");
+        }
     }
 
     #[test]

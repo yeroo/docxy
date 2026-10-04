@@ -4850,6 +4850,7 @@ impl App {
             TableName => self.table_name_act(),
             ResizeTable => self.resize_table_act(),
             ConvertToRange => self.convert_table_act(),
+            Consolidate => self.open_consolidate(),
             Subtotal => self.subtotal(),
             GroupOutline => self.group_outline(false),
             UngroupOutline => self.group_outline(true),
@@ -6070,7 +6071,23 @@ impl App {
         &mut self,
         op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<String, String>,
     ) -> Result<bool, ()> {
-        if self.protected() {
+        self.try_outline_edit_on(self.sheet, op)
+    }
+
+    /// [`App::try_outline_edit`] for an edit of `sheet`, which need not be
+    /// the active one: that sheet's protection is what refuses it.
+    fn try_outline_edit_on(
+        &mut self,
+        sheet: usize,
+        op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<String, String>,
+    ) -> Result<bool, ()> {
+        if self
+            .pkg
+            .workbook
+            .sheets
+            .get(sheet)
+            .is_some_and(|s| s.is_protected())
+        {
             self.status =
                 Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
             return Err(());
@@ -6245,6 +6262,50 @@ impl App {
         ));
     }
 
+    /// Consolidate…: the dialog writing at the cursor, starting from the
+    /// settings this sheet kept.
+    fn open_consolidate(&mut self) {
+        let kept = self.sheet().consolidate.as_ref();
+        let names = self
+            .pkg
+            .workbook
+            .sheets
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        self.outline_dialog = Some(outlinedlg::Dialog::Consolidate(
+            outlinedlg::ConsolidateDialog::new(self.sheet, self.cur, kept, names),
+        ));
+    }
+
+    /// Consolidate into `sheet` at `at` as one undo step. The detail rows of
+    /// a linked consolidation carry the workbook's name: the file's stem.
+    /// A refusal changes nothing and says why.
+    pub(crate) fn apply_consolidate(
+        &mut self,
+        sheet: usize,
+        at: (u32, u32),
+        mut opts: gridcore::edit::ConsolidateOptions,
+    ) -> Result<gridcore::edit::Area, String> {
+        opts.book_name = file_stem(&self.path);
+        let mut out = None;
+        let done = self.try_outline_edit_on(sheet, |wb| {
+            let area =
+                gridcore::edit::consolidate(wb, sheet, at, &opts).map_err(|e| e.to_string())?;
+            out = Some(area);
+            let (r1, c1, r2, c2) = area;
+            Ok(format!(
+                "Consolidated into {}:{}",
+                cell_name(r1, c1),
+                cell_name(r2, c2)
+            ))
+        });
+        match (done, out) {
+            (Ok(_), Some(area)) => Ok(area),
+            _ => Err(self.status.clone().unwrap_or_default()),
+        }
+    }
+
     /// A key for the open outline dialog.
     fn outline_dialog_key(&mut self, code: KeyCode) {
         let Some(d) = self.outline_dialog.as_mut() else {
@@ -6268,6 +6329,15 @@ impl App {
                 });
                 // A refusal (no column chosen) leaves the dialog open.
                 if done.is_ok() {
+                    self.outline_dialog = None;
+                }
+            }
+            outlinedlg::Outcome::Consolidate(opts) => {
+                let Some(outlinedlg::Dialog::Consolidate(d)) = self.outline_dialog.clone() else {
+                    return;
+                };
+                // A refusal leaves the dialog open, with the reason showing.
+                if self.apply_consolidate(d.sheet, d.at, opts).is_ok() {
                     self.outline_dialog = None;
                 }
             }
@@ -12824,6 +12894,148 @@ mod tests {
         term.draw(|f| draw(&mut app, f)).unwrap();
         assert!(app.vis_rows.iter().filter(|&&r| r == 5).count() >= 2);
         assert_eq!(app.pkg.workbook.sheets[0].row_height(5), Some(45.0));
+    }
+
+    /// East and West (labels over A1:B3) and an empty Summary, the cursor
+    /// on Summary!A1.
+    fn consolidate_app() -> App {
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].name = "East".into();
+        pkg.add_sheet("West");
+        pkg.add_sheet("Summary");
+        for (s, rows) in [
+            (0, [("A", 1.0), ("B", 2.0)]),
+            (1, [("b", 10.0), ("C", 20.0)]),
+        ] {
+            let sh = &mut pkg.workbook.sheets[s];
+            sh.set_cell(0, 1, Cell::text("Jan"));
+            for (i, (k, v)) in rows.iter().enumerate() {
+                sh.set_cell(i as u32 + 1, 0, Cell::text(k));
+                sh.set_cell(i as u32 + 1, 1, Cell::number(*v));
+            }
+        }
+        let mut app = App::new(pkg, "Sales.xlsx");
+        app.os_clip = None;
+        app.sheet = 2;
+        app.cur = (0, 0);
+        app.anchor = None;
+        app.rebuild_engine();
+        app
+    }
+
+    fn consolidate_dialog(app: &mut App) -> &mut outlinedlg::ConsolidateDialog {
+        match &mut app.outline_dialog {
+            Some(outlinedlg::Dialog::Consolidate(d)) => d,
+            other => panic!("the Consolidate dialog opens: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn consolidate_ok_is_one_undo_step_and_the_dialog_remembers() {
+        use gridcore::sheet::CellValue;
+        let mut app = consolidate_app();
+        let undo_len = app.undo.len();
+        app.ribbon_act(ribbon::Act::Consolidate);
+        let d = consolidate_dialog(&mut app);
+        d.refs = vec!["East!A1:B3".into(), "west!a1:b3".into()];
+        (d.top_row, d.left_col, d.links) = (true, true, true);
+        app.outline_dialog_key(KeyCode::Enter);
+        assert!(app.outline_dialog.is_none());
+        assert_eq!(app.undo.len(), undo_len + 1);
+        let v = |app: &App, r, c| app.sheet().cell(r, c).map(|cl| cl.value.clone());
+        // Jan over the data column; A (East), B (East + West's b), C (West).
+        assert_eq!(v(&app, 0, 2), Some(CellValue::Text("Jan".into())));
+        assert_eq!(
+            v(&app, 1, 1),
+            Some(CellValue::Text("Sales".into())),
+            "the book's name"
+        );
+        assert_eq!(v(&app, 2, 0), Some(CellValue::Text("A".into())));
+        assert_eq!(v(&app, 2, 2), Some(CellValue::Number(1.0)), "recalculated");
+        assert_eq!(v(&app, 5, 2), Some(CellValue::Number(12.0)));
+        assert!(app.sheet().row_hidden(1) && app.sheet().row_collapsed(2));
+        // Reopened, the dialog starts from what OK kept.
+        app.ribbon_act(ribbon::Act::Consolidate);
+        let d = consolidate_dialog(&mut app);
+        assert_eq!(d.refs, ["East!$A$1:$B$3", "West!$A$1:$B$3"]);
+        assert!(d.top_row && d.left_col && d.links);
+        app.outline_dialog_key(KeyCode::Esc);
+        app.undo();
+        assert_eq!(app.sheet().cell(0, 2), None);
+        assert_eq!(app.sheet().consolidate, None);
+        assert_eq!(app.sheet().max_row_outline(), 0);
+    }
+
+    #[test]
+    fn consolidate_refusal_keeps_the_dialog_open() {
+        let mut app = consolidate_app();
+        let undo_len = app.undo.len();
+        let before = app.pkg.workbook.sheets.clone();
+        app.ribbon_act(ribbon::Act::Consolidate);
+        let d = consolidate_dialog(&mut app);
+        d.refs = vec!["East!A1:B3".into(), "A1:B3".into()];
+        d.links = true;
+        app.outline_dialog_key(KeyCode::Enter);
+        assert!(app.outline_dialog.is_some());
+        assert_eq!(
+            app.status.as_deref(),
+            Some(
+                gridcore::edit::ConsolidateError::LinksOnDestSheet
+                    .to_string()
+                    .as_str()
+            )
+        );
+        assert!(!gridcore::edit::sheets_differ(
+            &before,
+            &app.pkg.workbook.sheets
+        ));
+        assert_eq!(app.undo.len(), undo_len);
+        // Nothing to consolidate: refused too.
+        consolidate_dialog(&mut app).refs.clear();
+        app.outline_dialog_key(KeyCode::Enter);
+        assert!(app.outline_dialog.is_some());
+        assert_eq!(
+            app.status.as_deref(),
+            Some(
+                gridcore::edit::ConsolidateError::NoRefs
+                    .to_string()
+                    .as_str()
+            )
+        );
+        // A protected sheet refuses it like Subtotal.
+        app.outline_dialog_key(KeyCode::Esc);
+        app.pkg.workbook.sheets[2].set_protected(true);
+        app.ribbon_act(ribbon::Act::Consolidate);
+        consolidate_dialog(&mut app).refs = vec!["East!A1:B3".into()];
+        app.outline_dialog_key(KeyCode::Enter);
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|s| s.contains("protected"))
+        );
+        assert_eq!(app.sheet().cell(0, 0), None);
+        assert_eq!(app.undo.len(), undo_len);
+    }
+
+    #[test]
+    fn space_on_the_function_row_does_not_run_consolidate() {
+        let mut app = consolidate_app();
+        let before = app.pkg.workbook.sheets.clone();
+        app.ribbon_act(ribbon::Act::Consolidate);
+        consolidate_dialog(&mut app).refs = vec!["East!A1:B3".into()];
+        app.outline_dialog_key(KeyCode::Char(' '));
+        assert!(app.outline_dialog.is_some());
+        assert!(!gridcore::edit::sheets_differ(
+            &before,
+            &app.pkg.workbook.sheets
+        ));
+        // Enter there is OK.
+        app.outline_dialog_key(KeyCode::Enter);
+        assert!(app.outline_dialog.is_none());
+        assert!(gridcore::edit::sheets_differ(
+            &before,
+            &app.pkg.workbook.sheets
+        ));
     }
 
     /// Grp/Amt with two A rows and one B row (A1:B4), cursor in the data.

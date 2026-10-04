@@ -2313,8 +2313,9 @@ fn resolve_commands(
 
 /// What the active tab's paste would take besides the clipboard's text: the
 /// document's rich clip or the sheet's grid clip, while the clipboard still
-/// holds what that copy put there (`clip_still_ours`); otherwise `none`, and a
-/// paste takes `text`.
+/// holds what that copy put there (`clip_still_ours`) and, for a grid clip,
+/// copy mode is on (`GridClip::live`); otherwise `none`, and a paste takes
+/// `text` (or, over a spent grid clip's own text, nothing).
 fn clipboard_app_json(
     surface: Option<&crate::Surface>,
     doc: Option<&crate::DocClip>,
@@ -2331,7 +2332,7 @@ fn clipboard_app_json(
             }
         }
         Some(crate::Surface::Sheet(_)) => {
-            if let Some(clip) = grid.filter(|c| crate::clip_still_ours(&c.text, now)) {
+            if let Some(clip) = grid.filter(|c| c.live(now)) {
                 return Json::obj(vec![
                     ("kind", Json::Str("grid".into())),
                     ("text", Json::Str(clip.text.clone())),
@@ -2353,7 +2354,8 @@ fn clipboard_app_json(
 fn clipboard_json(app: &crate::Docxy, cx: &App) -> Json {
     let now = app.clipboard_read(cx);
     let surface = app.tabs.get(app.active).map(|t| &t.surface);
-    let used = clipboard_app_json(surface, app.clip.as_ref(), app.grid_clip.as_ref(), &now);
+    // A grid clip whose workbook was edited since is over (#664).
+    let used = clipboard_app_json(surface, app.clip.as_ref(), app.grid_clip_current(), &now);
     Json::obj(vec![
         ("text", str_or_null(now.text().map(str::to_string))),
         ("app", used),
@@ -3875,6 +3877,7 @@ mod tests {
         let grid = crate::GridClip {
             cells: vec![vec![Default::default(); 3]; 2],
             text: "a\tb\tc\nd\te\tf\n".into(),
+            ..Default::default()
         };
         let kind = |j: Json| j.get_str("kind").unwrap().to_string();
         let nothing = ClipRead::Nothing;
@@ -3908,6 +3911,12 @@ mod tests {
         assert_eq!(kind(image), "none");
         let unread = clipboard_app_json(Some(&sheet), None, Some(&grid), &nothing);
         assert_eq!(kind(unread), "grid");
+        // #664: once copy mode is over (an Enter paste, a pasted cut, Esc),
+        // the next paste pastes nothing though the text is still ours.
+        let mut spent = grid.clone();
+        spent.spend();
+        let over = clipboard_app_json(Some(&sheet), None, Some(&spent), &text(&grid.text));
+        assert_eq!(kind(over), "none");
 
         let placeholder = crate::Surface::Placeholder;
         assert_eq!(
@@ -3944,7 +3953,8 @@ mod tests {
             dirty: false,
             status: "".into(),
             comments: vec![],
-            session_comment_ids: Default::default(),
+            tracked_comment_ids: Default::default(),
+            comments_removed_all: false,
             used_comment_ids: Default::default(),
             pkg: None,
             notes: vec![],

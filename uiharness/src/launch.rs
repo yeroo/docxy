@@ -69,10 +69,16 @@ fn default_roots() -> Vec<PathBuf> {
 
 /// Find a built `suite`: what the caller named, else `UIHARNESS_SUITE`, else
 /// the first of [`candidate_exes`] that is there.
+///
+/// ⚠️ The path is made absolute before it is handed over. The child is
+/// started with the sandbox as its working directory, so a relative program
+/// path would be looked up there instead of against this process (#975) —
+/// `absolute` rather than `canonicalize`, which returns a `\\?\` verbatim
+/// path.
 pub fn find_suite(explicit: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(p) = explicit {
         return if p.is_file() {
-            Ok(p.to_path_buf())
+            std::path::absolute(p).map_err(|e| format!("{}: {e}", p.display()))
         } else {
             Err(format!("{}: not a file", p.display()))
         };
@@ -80,7 +86,7 @@ pub fn find_suite(explicit: Option<&Path>) -> Result<PathBuf, String> {
     if let Some(v) = std::env::var_os("UIHARNESS_SUITE") {
         let p = PathBuf::from(v);
         return if p.is_file() {
-            Ok(p)
+            std::path::absolute(&p).map_err(|e| format!("UIHARNESS_SUITE={}: {e}", p.display()))
         } else {
             Err(format!("UIHARNESS_SUITE={}: not a file", p.display()))
         };
@@ -352,6 +358,9 @@ impl Drop for Launched {
 
 /// Start `exe` with the harness on and its config root in `sandbox`.
 ///
+/// `exe` must be absolute, as [`find_suite`] returns it, because the child's
+/// working directory is the sandbox (#975).
+///
 /// The sandbox is created if it is not there. `open` is left to the script:
 /// passing the file on the command line would work too, but then half a case's
 /// setup would live in the runner and half in the script.
@@ -397,6 +406,9 @@ pub fn launch_with_env(
 /// thread must attach to the desktop ([`crate::desktop::Desktop`]) for
 /// captures to find the window. Off Windows this is the same error
 /// [`Desktop::create`] gives: a separate desktop is Windows-only.
+///
+/// `exe` must be absolute, as [`find_suite`] returns it, because the child's
+/// working directory is the sandbox (#975).
 ///
 /// [`Desktop::create`]: crate::desktop::Desktop::create
 pub fn launch_on_desktop(
@@ -766,6 +778,16 @@ mod tests {
     fn a_named_binary_that_is_not_there_is_reported_rather_than_searched_past() {
         let e = find_suite(Some(Path::new("no-such-suite.exe"))).unwrap_err();
         assert!(e.contains("no-such-suite.exe"), "{e}");
+    }
+
+    /// #975: a relative `--suite` path must come back absolute — the child is
+    /// spawned with the sandbox as its working directory, so a relative
+    /// program path would be resolved there instead of against this process.
+    #[test]
+    fn a_relative_named_binary_is_made_absolute() {
+        let found = find_suite(Some(Path::new("Cargo.toml"))).unwrap();
+        assert!(found.is_absolute(), "{found:?}");
+        assert_eq!(found, std::path::absolute("Cargo.toml").unwrap());
     }
 
     /// The desktop launch builds its environment block itself, so the rule

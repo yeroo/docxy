@@ -811,6 +811,22 @@ struct HfEdit {
     saved_page_view: bool,
 }
 
+/// A comment whose record follows its markers ([`App::tracked_comments`]).
+#[derive(Clone, Debug)]
+struct TrackedComment {
+    comment: docxcore::comments::Comment,
+    /// Its `<w:comment>` exactly as `pkg` held it when Delete Comment took
+    /// its markers, written back as is when an undo restores them: a
+    /// loaded comment's paragraphs, formatting and `w14:paraId` survive.
+    /// `None` while it has not been deleted, or when `pkg` held no XML for
+    /// it then (added and never saved): a restore then writes it from
+    /// `comment`, which needs a numeric id (new comments always have one;
+    /// any other is not written back).
+    raw: Option<String>,
+    /// Where it sat in `comments`, so a restored one goes back there.
+    index: usize,
+}
+
 /// What a confirmed (Yes) modal should do.
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum ConfirmAction {
@@ -1419,17 +1435,21 @@ struct App {
     /// Review comments parsed from the document, and whether the side panel that
     /// lists them is shown.
     comments: Vec<docxcore::comments::Comment>,
-    /// Comments added since the document was opened, by id. Their records
-    /// live here, not in `pkg`: one is in `comments` and is saved only while
-    /// a marker with its id is in the body, so undoing Add Comment removes
-    /// it and redo brings it back (#620). A Save keeps it; an open, or a
-    /// Save As (which reloads the document and its undo history), clears it.
-    session_comments: std::collections::BTreeMap<String, docxcore::comments::Comment>,
+    /// Comments whose records follow their markers, by id: each one added
+    /// since the document was opened (#620), and each one Delete Comment
+    /// took all the markers of (#971). Their records live here, not in
+    /// `pkg`: one is in `comments` and is saved only while a marker with its
+    /// id is in the body or a header or footer
+    /// ([`App::comment_marker_ids_everywhere`]), so undoing Add Comment
+    /// removes it, undoing Delete Comment brings it back, and redo goes the
+    /// other way. A Save keeps it; an open, or a Save As (which reloads the
+    /// document and its undo history), clears it.
+    tracked_comments: std::collections::BTreeMap<String, TrackedComment>,
     /// Every comment id the document has had since it loaded: those of its
     /// comments and body markers then ([`used_comment_ids`]), and each one
     /// allocated since. It never shrinks, not on Delete Comment, since an
     /// undo can bring any of their markers back; a new comment never takes
-    /// one of them (#620). Reseeded wherever `session_comments` is cleared.
+    /// one of them (#620). Reseeded wherever `tracked_comments` is cleared.
     used_comment_ids: std::collections::BTreeSet<String>,
     show_comments: bool,
     /// The comment highlighted by Prev/Next navigation (only once `comment_active`).
@@ -1632,7 +1652,7 @@ impl App {
             ribbon_focus: ribbon::Focus::None,
             auto_hide_ribbon: false,
             comments,
-            session_comments: Default::default(),
+            tracked_comments: Default::default(),
             used_comment_ids,
             show_comments: false,
             comment_sel: 0,
@@ -2442,7 +2462,7 @@ impl App {
                 (md.into_bytes(), pkg)
             }
             DocFormat::Docx | DocFormat::Html => {
-                self.reconcile_session_comments();
+                self.reconcile_tracked_comments();
                 let docx = if self.format.is_docx() && !self.modified {
                     save_package_preserving_document(&self.pkg)
                 } else {
@@ -2664,7 +2684,7 @@ impl App {
             .unwrap_or_default();
         self.even_odd = pkg.has_even_odd();
         self.comments = docxcore::comments::parse_comments(&pkg);
-        self.session_comments.clear();
+        self.tracked_comments.clear();
         self.notes = docxcore::notes::parse_notes(&pkg);
         self.notes_scroll = 0;
         self.comments_scroll = 0;
@@ -2847,16 +2867,16 @@ impl App {
     /// The next free comment id (max existing + 1).
     fn next_comment_id(&self) -> i32 {
         // An undone comment keeps its id: redo brings it back. Ids whose
-        // markers are in the body are taken too (a deleted comment's, back
-        // after an undo): a new comment sharing one would stay live after
-        // its own undo.
-        let in_body = docxcore::inspect::comment_marker_ids(&self.body_editor().doc);
+        // markers are in the body, a header or a footer are taken too (an
+        // orphan's): a new comment sharing one would stay live after its
+        // own undo.
+        let marked = self.comment_marker_ids_everywhere();
         self.comments
             .iter()
             .map(|c| &c.id)
-            .chain(self.session_comments.keys())
+            .chain(self.tracked_comments.keys())
             .chain(&self.used_comment_ids)
-            .chain(&in_body)
+            .chain(&marked)
             .filter_map(|id| id.parse::<i32>().ok())
             .max()
             .unwrap_or(0)
@@ -2876,8 +2896,8 @@ impl App {
 
     /// Commit the new comment: wrap the selection in markers (one undo step)
     /// and add it to the live panel. Each save writes it to comments.xml
-    /// while its markers are in the body ([`App::reconcile_session_comments`]);
-    /// one made while editing a header or footer is written at once.
+    /// while its markers are in the body, or the header or footer it was
+    /// made in ([`App::reconcile_tracked_comments`]).
     fn commit_comment(&mut self) {
         if self
             .comment_input
@@ -2911,20 +2931,14 @@ impl App {
             text,
             quoted,
         };
-        if self.hf_edit.is_some() {
-            // Its markers are in a header or footer, not the body the saves
-            // reconcile against: written now, as before.
-            self.pkg.add_comment(
-                id,
-                &comment.author,
-                &comment.initials,
-                &comment.date,
-                &comment.text,
-            );
-        } else {
-            self.session_comments
-                .insert(comment.id.clone(), comment.clone());
-        }
+        self.tracked_comments.insert(
+            comment.id.clone(),
+            TrackedComment {
+                comment: comment.clone(),
+                raw: None,
+                index: self.comments.len(),
+            },
+        );
         self.used_comment_ids.insert(comment.id.clone());
         self.comments.push(comment);
         self.comment_active = true;
@@ -2934,59 +2948,96 @@ impl App {
         self.status = Some("Comment added".to_string());
     }
 
-    /// Show a comment added this session only while a marker with its id is
-    /// in the body: undo of Add Comment hides it, redo shows it again.
-    /// Comments loaded from the file are never touched.
-    fn sync_session_comments(&mut self) {
-        if self.session_comments.is_empty() {
-            return;
-        }
-        let live = docxcore::inspect::comment_marker_ids(&self.body_editor().doc);
-        let session = &self.session_comments;
-        let before = self.comments.len();
-        self.comments
-            .retain(|c| !session.contains_key(&c.id) || live.contains(&c.id));
-        let mut changed = self.comments.len() != before;
-        for (id, c) in session {
-            if live.contains(id) && !self.comments.iter().any(|x| &x.id == id) {
-                self.comments.push(c.clone());
-                changed = true;
+    /// Every comment id with a marker in the body, in any header or footer
+    /// part (every section's), or in the header or footer being edited,
+    /// whose part in `pkg` is stale until the edit is committed.
+    fn comment_marker_ids_everywhere(&self) -> std::collections::BTreeSet<String> {
+        let mut ids = docxcore::inspect::comment_marker_ids(&self.body_editor().doc);
+        let editing = self.hf_edit.as_ref().map(|hf| hf.part.as_str());
+        for name in self.pkg.part_names() {
+            let hf = name.starts_with("word/header") || name.starts_with("word/footer");
+            if hf && name.ends_with(".xml") && Some(name) != editing {
+                if let Some(xml) = self.pkg.part_text(name) {
+                    ids.extend(docxcore::inspect::comment_marker_ids_in_xml(&xml));
+                }
             }
         }
+        if self.hf_edit.is_some() {
+            ids.extend(docxcore::inspect::comment_marker_ids_in_blocks(
+                &self.editor.doc.body,
+            ));
+        }
+        ids
+    }
+
+    /// Show a tracked comment only while a marker with its id is in the
+    /// body or a header or footer: undo of Add Comment hides it, undo of
+    /// Delete Comment shows it again, where it was. Untracked comments
+    /// (loaded and never deleted) are never touched.
+    fn sync_tracked_comments(&mut self) {
+        if self.tracked_comments.is_empty() {
+            return;
+        }
+        let live = self.comment_marker_ids_everywhere();
+        let tracked = &self.tracked_comments;
+        let selected = self.comments.get(self.comment_sel).map(|c| c.id.clone());
+        let before = self.comments.len();
+        self.comments
+            .retain(|c| !tracked.contains_key(&c.id) || live.contains(&c.id));
+        let mut changed = self.comments.len() != before;
+        let mut revived: Vec<&TrackedComment> = tracked
+            .iter()
+            .filter(|(id, _)| live.contains(*id) && !self.comments.iter().any(|x| &x.id == *id))
+            .map(|(_, t)| t)
+            .collect();
+        revived.sort_by_key(|t| t.index);
+        for t in revived {
+            let at = t.index.min(self.comments.len());
+            self.comments.insert(at, t.comment.clone());
+            changed = true;
+        }
         if changed {
-            self.comment_sel = self.comment_sel.min(self.comments.len().saturating_sub(1));
+            self.comment_sel = selected
+                .and_then(|id| self.comments.iter().position(|c| c.id == id))
+                .unwrap_or(self.comment_sel)
+                .min(self.comments.len().saturating_sub(1));
             self.comment_active &= !self.comments.is_empty();
         }
     }
 
-    /// Bring `pkg`'s comments.xml in line with the session's comments before
-    /// a save: write each live one it lacks, drop each undone one it holds.
+    /// Bring `pkg`'s comments.xml in line with the tracked comments before
+    /// a save: write each live one it lacks (a deleted loaded one as its
+    /// original XML), drop each one with no marker left that it holds.
     /// `pkg` is reloaded from every save, so it may hold one already.
-    fn reconcile_session_comments(&mut self) {
-        if self.session_comments.is_empty() {
+    fn reconcile_tracked_comments(&mut self) {
+        if self.tracked_comments.is_empty() {
             return;
         }
-        let live = docxcore::inspect::comment_marker_ids(&self.body_editor().doc);
-        let saved: std::collections::HashSet<String> =
-            docxcore::comments::parse_comments(&self.pkg)
-                .into_iter()
-                .map(|c| c.id)
-                .collect();
-        for (id, c) in &self.session_comments {
-            let Ok(n) = id.parse::<i32>() else {
-                continue;
-            };
-            match (live.contains(id), saved.contains(id)) {
-                (true, false) => self
-                    .pkg
-                    .add_comment(n, &c.author, &c.initials, &c.date, &c.text),
-                (false, true) => self.pkg.remove_comment(n),
+        let live = self.comment_marker_ids_everywhere();
+        // Ids as written, from the part as decoded: `03` is not `3`, and a
+        // UTF-16 part's comments count (#971).
+        let saved: std::collections::HashSet<String> = self.pkg.comment_ids().into_iter().collect();
+        for (id, t) in &self.tracked_comments {
+            let c = &t.comment;
+            match (live.contains(id), saved.contains(id), &t.raw) {
+                (true, false, Some(raw)) => self.pkg.insert_comment_xml(raw),
+                (true, false, None) => {
+                    if let Ok(n) = id.parse::<i32>() {
+                        self.pkg
+                            .add_comment(n, &c.author, &c.initials, &c.date, &c.text)
+                    }
+                }
+                (false, true, _) => self.pkg.remove_comment_id(id),
                 _ => {}
             }
         }
     }
 
-    /// Delete the navigation-selected comment (markers + comments.xml + panel).
+    /// Delete the navigation-selected comment: its markers (one undo step)
+    /// and its panel entry. Its record stays, tracked, so the save leaves it
+    /// out and an undo brings it back whole (#971); one with markers left
+    /// in a header or footer not being edited is removed from `pkg` now,
+    /// as before, since nothing could take those markers.
     fn delete_comment(&mut self) {
         if self.comments.is_empty() {
             self.status = Some("No comments to delete".to_string());
@@ -3005,8 +3056,26 @@ impl App {
         if self.hf_edit.is_some() {
             self.editor.remove_comment_markers(&c.id);
         }
-        if let Ok(id) = c.id.parse::<i32>() {
-            self.pkg.remove_comment(id);
+        if self.comment_marker_ids_everywhere().contains(&c.id) {
+            self.tracked_comments.remove(&c.id);
+            self.pkg.remove_comment_id(&c.id);
+        } else if let Some(t) = self.tracked_comments.get_mut(&c.id) {
+            t.index = idx;
+            // A comment added this session and saved since is in `pkg`
+            // now: keep that XML too.
+            if t.raw.is_none() {
+                t.raw = self.pkg.comment_xml(&c.id);
+            }
+        } else {
+            let raw = self.pkg.comment_xml(&c.id);
+            self.tracked_comments.insert(
+                c.id.clone(),
+                TrackedComment {
+                    comment: c.clone(),
+                    raw,
+                    index: idx,
+                },
+            );
         }
         self.comment_sel = idx.min(self.comments.len().saturating_sub(1));
         self.comment_active = !self.comments.is_empty();
@@ -3632,7 +3701,7 @@ impl App {
         self.dirty = true;
         self.status = None;
         self.clear_visual_hint();
-        self.sync_session_comments();
+        self.sync_tracked_comments();
         // An edit with the find bar open (a ribbon Accept, a paste) moves the
         // text under its matches: rebuild them so Replace never acts on a
         // stale range. The caret and selection stay where the edit left them.
@@ -3784,6 +3853,9 @@ impl App {
             }
         }
         self.page_view = hf.saved_page_view;
+        // The part's markers are now its stored XML's, or gone with a
+        // discarded edit: the panel follows (#971).
+        self.sync_tracked_comments();
         self.dirty = true;
     }
 
@@ -3857,7 +3929,7 @@ impl App {
             self.finish_save(&path, md.as_bytes(), None);
             return;
         }
-        self.reconcile_session_comments();
+        self.reconcile_tracked_comments();
         let docx = if self.modified {
             self.pkg.document = self.editor.doc.clone();
             save_package(&self.pkg)
@@ -4744,30 +4816,18 @@ impl App {
         self.status = Some(format!("{}: {item}", p.kind.title().trim()));
     }
 
-    /// Apply a Design ▸ Page Background pick. The open header/footer edit is
-    /// committed first so its editor cannot write a header part back over a
-    /// watermark and the section edits hit the body editor. Page Color is a
-    /// package edit with no undo (as Hyphenation); a watermark's header parts
-    /// are package edits and its new header references one undo step; Page
-    /// Borders rewrite every section as one undo step.
+    /// Apply a Design ▸ Page Background pick. Page Color is a package edit
+    /// with no undo (as Hyphenation); a watermark's header parts are package
+    /// edits and its new header references one undo step; Page Borders
+    /// rewrite every section as one undo step. Each edit commits an open
+    /// header/footer edit first so its editor cannot write a header part
+    /// back over a watermark and the section edits hit the body editor.
     fn apply_design_pick(&mut self, kind: PickerKind, item: &str) {
-        if self.hf_edit.is_some() {
-            self.exit_hf_edit(true);
-        }
         match kind {
             PickerKind::PageColor => {
-                let bg = PAGE_COLORS
-                    .iter()
-                    .find(|c| c.0 == item)
-                    .map(|c| PageBackground {
-                        color: c.1,
-                        gradient: None,
-                    });
-                let changed = self.pkg.set_page_background(bg.as_ref());
-                if changed {
-                    self.modified = true;
-                }
-                self.status = Some(match bg {
+                let rgb = PAGE_COLORS.iter().find(|c| c.0 == item).map(|c| c.1);
+                self.set_page_color(rgb);
+                self.status = Some(match rgb {
                     Some(_) => format!("Page color: {item}"),
                     None => "Page color: No Color".to_string(),
                 });
@@ -4777,75 +4837,105 @@ impl App {
                     .iter()
                     .find(|w| w.0 == item)
                     .map(|w| TextWatermarkSpec::preset(w.1, w.2));
-                let mut sects = self.editor.sections();
-                let before = sects.clone();
-                let parts = self.pkg.set_text_watermark(spec.as_ref(), &mut sects);
-                let raws: Vec<(usize, String)> = sects
-                    .into_iter()
-                    .enumerate()
-                    .filter(|(k, raw)| *raw != before[*k])
-                    .collect();
-                let refs = self.editor.replace_sections(&raws);
-                let changed = parts || refs;
-                self.page_parts_sect.clear();
-                self.sync_page_parts();
-                self.refresh_watermark_state();
-                if changed {
-                    self.modified = true;
-                }
-                self.status = Some(
-                    if spec.is_some()
-                        && self
-                            .pkg
-                            .shown_text_watermarks(&self.editor.sections())
-                            .is_empty()
-                    {
-                        "Could not add the watermark: the document cannot take a header".to_string()
-                    } else {
-                        match spec {
-                            Some(_) => format!("Watermark: {item}"),
-                            None => "Watermark removed".to_string(),
-                        }
-                    },
-                );
+                let result = self.set_text_watermark(spec.as_ref());
+                self.status = Some(if result.is_err() {
+                    "Could not add the watermark: the document cannot take a header".to_string()
+                } else {
+                    match spec {
+                        Some(_) => format!("Watermark: {item}"),
+                        None => "Watermark removed".to_string(),
+                    }
+                });
             }
             PickerKind::PageBorders => {
-                let side = |shadow: bool| {
-                    Some(BorderSide {
-                        style: "single".into(),
-                        sz: 4,
-                        space: 24,
-                        color: None,
-                        shadow,
-                        frame: false,
-                    })
-                };
-                let pb = (item != "None").then(|| PageBorders {
-                    sides: [
-                        side(item == "Shadow"),
-                        side(item == "Shadow"),
-                        side(item == "Shadow"),
-                        side(item == "Shadow"),
-                    ],
-                    display: PgBorderDisplay::AllPages,
-                    offset_from: PgBorderOffset::Page,
-                    z_order_back: false,
-                });
-                let n = self.editor.sections().len();
-                let changed = self
-                    .editor
-                    .edit_sections(&(0..n).collect::<Vec<_>>(), |raw| {
-                        PageBorders::apply(pb.as_ref(), raw)
-                    });
-                if changed {
-                    self.after_edit();
-                }
+                let pb = (item != "None").then(|| box_page_borders(item == "Shadow", None));
+                self.set_page_borders(pb.as_ref());
                 // after_edit clears the status: report the pick after it.
                 self.status = Some(format!("Page borders: {item}"));
             }
             _ => unreachable!("not a Design picker: {kind:?}"),
         }
         self.dirty = true;
+    }
+
+    /// Set or remove the page colour (Design ▸ Page Color): the package's
+    /// `w:background` and `w:displayBackgroundShape`. A package edit with no
+    /// undo. Returns whether anything changed.
+    pub(crate) fn set_page_color(&mut self, rgb: Option<u32>) -> bool {
+        if self.hf_edit.is_some() {
+            self.exit_hf_edit(true);
+        }
+        let bg = rgb.map(|color| PageBackground {
+            color,
+            gradient: None,
+        });
+        let changed = self.pkg.set_page_background(bg.as_ref());
+        if changed {
+            self.modified = true;
+        }
+        changed
+    }
+
+    /// Write or remove the text watermark in every shown header (Design ▸
+    /// Watermark). The header parts are package edits and the new header
+    /// references one undo step. Returns whether anything changed; errs when
+    /// a watermark was requested but the document cannot take a header. An
+    /// Err may follow a partial edit (the removed watermark's header parts
+    /// and section references are already gone) — the Err carries `changed`
+    /// so callers can report whether one happened.
+    pub(crate) fn set_text_watermark(
+        &mut self,
+        spec: Option<&TextWatermarkSpec>,
+    ) -> Result<bool, (bool, String)> {
+        if self.hf_edit.is_some() {
+            self.exit_hf_edit(true);
+        }
+        let mut sects = self.editor.sections();
+        let before = sects.clone();
+        let parts = self.pkg.set_text_watermark(spec, &mut sects);
+        let raws: Vec<(usize, String)> = sects
+            .into_iter()
+            .enumerate()
+            .filter(|(k, raw)| *raw != before[*k])
+            .collect();
+        let refs = self.editor.replace_sections(&raws);
+        let changed = parts || refs;
+        self.page_parts_sect.clear();
+        self.sync_page_parts();
+        self.refresh_watermark_state();
+        if changed {
+            self.modified = true;
+        }
+        if spec.is_some()
+            && self
+                .pkg
+                .shown_text_watermarks(&self.editor.sections())
+                .is_empty()
+        {
+            return Err((
+                changed,
+                "could not add the watermark: the document cannot take a header".into(),
+            ));
+        }
+        Ok(changed)
+    }
+
+    /// Write or remove page borders on every section (Design ▸ Page Borders)
+    /// as one undo step. Returns whether anything changed.
+    pub(crate) fn set_page_borders(&mut self, pb: Option<&PageBorders>) -> bool {
+        if self.hf_edit.is_some() {
+            self.exit_hf_edit(true);
+        }
+        let n = self.editor.sections().len();
+        let changed = self
+            .editor
+            .edit_sections(&(0..n).collect::<Vec<_>>(), |raw| {
+                PageBorders::apply(pb, raw)
+            });
+        if changed {
+            self.after_edit();
+        }
+        changed
     }
 
     fn picker_key(&mut self, key: KeyEvent) -> bool {
@@ -6405,11 +6495,24 @@ impl App {
         self.doc_hscroll = self.comments_hscroll as u16;
 
         let rlines: Vec<_> = visible.iter().map(doc_line_to_ratatui).collect();
-        // Light page: black on white. In page view the page sits on a black
-        // "desktop" (Word-style) — each line's page region is painted white and the
-        // centering margins / inter-page gaps stay black. In continuous view there
-        // is no page frame, so the whole content area is white.
-        let mut para = if self.light_page {
+        // A set page colour tints the page sheet in Print Layout (in both
+        // terminal themes), with the ink picked by the sheet's luminance; the
+        // centering margins and inter-page gaps stay black. Otherwise: light
+        // page is black on white. In page view the page sits on a black
+        // "desktop" (Word-style) — each line's page region is painted white
+        // and the centering margins / inter-page gaps stay black. In
+        // continuous view there is no page frame, so the whole content area
+        // is white.
+        let page_bg = self.page_view.then(|| self.pkg.page_background()).flatten();
+        let mut para = if let Some(bg) = page_bg {
+            let sheet = rgb_color(bg.color);
+            let ink = rgb_color(page_ink(bg.color).0);
+            let painted: Vec<_> = rlines
+                .into_iter()
+                .map(|l| paint_page(l, sheet, ink))
+                .collect();
+            Paragraph::new(Text::from(painted)).style(Style::default().bg(Color::Black))
+        } else if self.light_page {
             if self.page_view {
                 let painted: Vec<_> = rlines.into_iter().map(paint_page_on_black).collect();
                 Paragraph::new(Text::from(painted)).style(Style::default().bg(Color::Black))
@@ -7583,16 +7686,61 @@ fn map_color(c: DocColor) -> Color {
     }
 }
 
-/// Style one page-view line as a white page on a black desktop: the cells before
-/// the first non-blank one (the centering margin) are painted black, and the page
-/// itself — from the left border to the end of the line — is painted white with
-/// black default text (coloured text keeps its colour). Fully-blank lines (the gaps
-/// between pages) become all black.
-fn paint_page_on_black(line: RLine<'static>) -> RLine<'static> {
-    let white = |sp: RSpan<'static>| -> RSpan<'static> {
-        let mut st = sp.style.bg(Color::White);
+/// The four-sided Box/Shadow page borders the Design picker and the
+/// `doc.page-borders` verb write: single 4 (0.5pt) sides 24pt from the page
+/// edge, on every page, in front of the sheet, with an optional side colour.
+pub(crate) fn box_page_borders(shadow: bool, color: Option<u32>) -> PageBorders {
+    let side = || {
+        Some(BorderSide {
+            style: "single".into(),
+            sz: 4,
+            space: 24,
+            color,
+            shadow,
+            frame: false,
+        })
+    };
+    PageBorders {
+        sides: [side(), side(), side(), side()],
+        display: PgBorderDisplay::AllPages,
+        offset_from: PgBorderOffset::Page,
+        z_order_back: false,
+    }
+}
+
+/// The text and dimmed-text colours to draw on a page sheet of colour
+/// `sheet`: dark ink on a light sheet, light ink on a dark one, as Word
+/// draws automatic text. A copy of the suite oracle (`page_ink` in
+/// suite/docxy/src/design_tab.rs); painting uses the first element.
+fn page_ink(sheet: u32) -> (u32, u32) {
+    let [r, g, b] = [16, 8, 0].map(|s| f32::from(((sheet >> s) & 0xFF) as u8) / 255.0);
+    // Relative luminance (Rec. 709 weights on the gamma-encoded channels is
+    // close enough to pick a side).
+    if 0.2126 * r + 0.7152 * g + 0.0722 * b < 0.45 {
+        (0xF2F2F2, 0xB0B0B0)
+    } else {
+        (0x202020, 0x808080)
+    }
+}
+
+fn rgb_color(rgb: u32) -> Color {
+    Color::Rgb(
+        ((rgb >> 16) & 0xFF) as u8,
+        ((rgb >> 8) & 0xFF) as u8,
+        (rgb & 0xFF) as u8,
+    )
+}
+
+/// Style one page-view line as a sheet-coloured page on a black desktop: the
+/// cells before the first non-blank one (the centering margin) are painted
+/// black, and the page itself — from the left border to the end of the line —
+/// is painted with `sheet`, defaulting the text to `ink` (coloured text keeps
+/// its colour). Fully-blank lines (the gaps between pages) become all black.
+fn paint_page(line: RLine<'static>, sheet: Color, ink: Color) -> RLine<'static> {
+    let paint = |sp: RSpan<'static>| -> RSpan<'static> {
+        let mut st = sp.style.bg(sheet);
         if st.fg.is_none() {
-            st = st.fg(Color::Black);
+            st = st.fg(ink);
         }
         RSpan::styled(sp.content, st)
     };
@@ -7600,7 +7748,7 @@ fn paint_page_on_black(line: RLine<'static>) -> RLine<'static> {
     let mut out: Vec<RSpan<'static>> = Vec::new();
     for span in line.spans {
         if in_page {
-            out.push(white(span));
+            out.push(paint(span));
             continue;
         }
         let text = span.content.into_owned();
@@ -7613,12 +7761,18 @@ fn paint_page_on_black(line: RLine<'static>) -> RLine<'static> {
                         span.style.bg(Color::Black),
                     ));
                 }
-                out.push(white(RSpan::styled(text[i..].to_string(), span.style)));
+                out.push(paint(RSpan::styled(text[i..].to_string(), span.style)));
                 in_page = true;
             }
         }
     }
     RLine::from(out)
+}
+
+/// Style one page-view line as a white page on a black desktop — the light
+/// terminal theme's sheet. See [`paint_page`].
+fn paint_page_on_black(line: RLine<'static>) -> RLine<'static> {
+    paint_page(line, Color::White, Color::Black)
 }
 
 fn doc_line_to_ratatui(line: &DocLine) -> RLine<'static> {
@@ -8245,6 +8399,106 @@ mod tests {
         // The gap between pages (all whitespace) is fully black.
         let out = paint_page_on_black(RLine::from(vec![RSpan::raw("        ")]));
         assert!(out.spans.iter().all(|s| s.style.bg == Some(Color::Black)));
+    }
+
+    #[test]
+    fn page_ink_picks_a_side_by_luminance() {
+        assert_eq!(page_ink(0xFFFFFF), (0x202020, 0x808080));
+        assert_eq!(page_ink(0x000000), (0xF2F2F2, 0xB0B0B0));
+        assert_eq!(page_ink(0xFF0000).0, 0xF2F2F2);
+        assert_eq!(page_ink(0xFFFF00).0, 0x202020);
+    }
+
+    #[test]
+    fn page_color_paints_the_print_layout_sheet() {
+        let mut app = app_with(&["body"]);
+        assert!(app.set_page_color(Some(0xFF0000)));
+        app.page_view = true; // light_page stays false: the dark terminal theme
+        app.dirty = true;
+        let mut term = Terminal::new(TestBackend::new(100, 70)).unwrap();
+        term.draw(|frame| app.draw(frame)).unwrap();
+        let buf = term.backend().buffer();
+        let at = buf
+            .content
+            .iter()
+            .position(|c| c.symbol() == "b")
+            .expect("the page shows the body text");
+        let cell = &buf.content[at];
+        assert_eq!(cell.bg, Color::Rgb(255, 0, 0), "the sheet is red");
+        assert_eq!(
+            cell.fg,
+            Color::Rgb(0xF2, 0xF2, 0xF2),
+            "dark sheet, light ink"
+        );
+        let (_, row) = buf.pos_of(at);
+        assert!(
+            row > 0,
+            "the body sits inside the page frame, not on the first row"
+        );
+        assert_eq!(
+            buf.cell((0, row)).unwrap().bg,
+            Color::Black,
+            "the centering margin stays black"
+        );
+    }
+
+    #[test]
+    fn page_color_light_sheet_uses_dark_ink() {
+        let mut app = app_with(&["body"]);
+        assert!(app.set_page_color(Some(0xFFFF00)));
+        app.page_view = true;
+        app.light_page = true;
+        app.dirty = true;
+        let mut term = Terminal::new(TestBackend::new(100, 70)).unwrap();
+        term.draw(|frame| app.draw(frame)).unwrap();
+        let buf = term.backend().buffer();
+        let cell = buf
+            .content
+            .iter()
+            .find(|c| c.symbol() == "b")
+            .expect("the page shows the body text");
+        assert_eq!(cell.bg, Color::Rgb(255, 255, 0), "the sheet is yellow");
+        assert_eq!(
+            cell.fg,
+            Color::Rgb(0x20, 0x20, 0x20),
+            "light sheet, dark ink"
+        );
+    }
+
+    #[test]
+    fn page_color_not_painted_outside_print_layout() {
+        let mut app = app_with(&["body"]);
+        assert!(app.set_page_color(Some(0xFF0000)));
+        app.page_view = false; // Read Mode: continuous, no page frame
+        app.dirty = true;
+        let mut term = Terminal::new(TestBackend::new(100, 70)).unwrap();
+        term.draw(|frame| app.draw(frame)).unwrap();
+        assert!(
+            term.backend()
+                .buffer()
+                .content
+                .iter()
+                .all(|c| c.bg != Color::Rgb(255, 0, 0)),
+            "read mode must not paint the page colour"
+        );
+    }
+
+    #[test]
+    fn picker_and_page_color_method_write_the_same_document_xml() {
+        // The control verb and the ribbon picker share set_page_color, so both
+        // paths must produce the same package parts.
+        let mut picked = app_with(&["body"]);
+        picked.run_act(ribbon::Act::PageColor);
+        pick(&mut picked, PickerKind::PageColor, "Red");
+        let mut direct = app_with(&["body"]);
+        assert!(direct.set_page_color(Some(0xFF0000)));
+        for part in ["word/document.xml", "word/settings.xml"] {
+            assert_eq!(
+                picked.pkg.part_text(part),
+                direct.pkg.part_text(part),
+                "{part} must not depend on how the colour was set"
+            );
+        }
     }
 
     #[test]
@@ -9561,7 +9815,7 @@ mod tests {
         comments.on_key(key(KeyCode::Enter));
         assert_eq!(comments.comments.len(), 1);
         // A new comment reaches comments.xml when a save reconciles (#620).
-        comments.reconcile_session_comments();
+        comments.reconcile_tracked_comments();
         assert!(comments.pkg.part("word/comments.xml").is_some());
         comments.modified = false;
         comments.dirty = false;
@@ -9915,7 +10169,7 @@ mod tests {
         app.on_key(key(KeyCode::Enter));
         assert_eq!(app.comments.len(), 1);
         // A new comment reaches comments.xml when a save reconciles (#620).
-        app.reconcile_session_comments();
+        app.reconcile_tracked_comments();
         assert!(app.pkg.part("word/comments.xml").is_some());
         assert!(app.modified);
 
@@ -11641,22 +11895,323 @@ mod tests {
     }
 
     /// FIX r2 #1: deleting a loaded comment and undoing the delete puts its
-    /// markers back without a record; a new comment must not take that id,
-    /// or it would stay live after its own undo.
+    /// markers back (and, since #971, its record); a new comment must not
+    /// take that id, or it would stay live after its own undo.
     #[test]
     fn a_new_comment_never_takes_an_id_whose_markers_are_in_the_body() {
         let mut app = app_with_loaded_comments();
-        let ids =
-            |app: &App| -> Vec<String> { app.comments.iter().map(|c| c.id.clone()).collect() };
-        assert_eq!(ids(&app), ["1", "2"]);
+        assert_eq!(comment_ids(&app), ["1", "2"]);
         app.comment_sel = 1;
         app.run_act(ribbon::Act::DeleteComment);
-        assert_eq!(ids(&app), ["1"]);
+        assert_eq!(comment_ids(&app), ["1"]);
         app.on_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(comment_ids(&app), ["1", "2"], "the undo brings it back");
         add_comment_by_keys(&mut app, "Colour?");
-        assert_eq!(ids(&app), ["1", "3"], "a fresh id, not 2");
+        assert_eq!(comment_ids(&app), ["1", "2", "3"], "a fresh id, not 2");
         app.on_key(ctrl(KeyCode::Char('z')));
-        assert_eq!(ids(&app), ["1"], "its undo takes it");
+        assert_eq!(comment_ids(&app), ["1", "2"], "its undo takes it");
+    }
+
+    /// The ids the comments panel lists, in order.
+    fn comment_ids(app: &App) -> Vec<String> {
+        app.comments.iter().map(|c| c.id.clone()).collect()
+    }
+
+    /// The ids of the `<w:comment>`s in a comments.xml, in order.
+    fn saved_comment_ids(comments_xml: &str) -> Vec<String> {
+        docxcore::comments::parse_comments_xml(comments_xml)
+            .into_iter()
+            .map(|c| c.id)
+            .collect()
+    }
+
+    /// A loaded comment Word could have written: two paragraphs, a bold
+    /// run, a `w14:paraId`. A re-creation from its parsed record would lose
+    /// all of that, so finding it byte-for-byte in a save proves its XML
+    /// was kept (#971).
+    const RICH_COMMENT: &str = "<w:comment w:id=\"1\" w:author=\"Ann\" w:initials=\"A\" \
+        w:date=\"2020-01-02T03:04:05Z\" w14:paraId=\"1A2B\"><w:p><w:r><w:rPr><w:b/></w:rPr>\
+        <w:t>Bold</w:t></w:r></w:p><w:p><w:r><w:t>second</w:t></w:r></w:p></w:comment>";
+
+    /// "The quick brown fox." with loaded comments `1..=n` around it, 1
+    /// written as [`RICH_COMMENT`].
+    fn app_with_rich_comments(n: i32) -> App {
+        let mut ed = Editor::new(Document {
+            body: vec![Block::Paragraph(MPara {
+                props: ParProps::default(),
+                content: vec![Inline::Run(Run {
+                    text: "The quick brown fox.".into(),
+                    props: RunProps::default(),
+                })],
+            })],
+        });
+        for id in 1..=n {
+            ed.select_all();
+            assert!(ed.add_comment(&id.to_string()));
+        }
+        let mut pkg = new_package(ed.doc);
+        pkg.insert_comment_xml(RICH_COMMENT);
+        for id in 2..=n {
+            pkg.add_comment(
+                id,
+                "Bob",
+                "B",
+                "2020-01-02T03:04:05Z",
+                &format!("note {id}"),
+            );
+        }
+        let mut app = App::new(pkg, "test.docx", false);
+        app.os_clip = None;
+        app
+    }
+
+    /// #971 A6: Delete Comment, then undo, lists a loaded comment again and
+    /// saves its original XML.
+    #[test]
+    fn undo_delete_loaded_comment_restores_its_xml() {
+        let mut app = app_with_rich_comments(2);
+        assert_eq!(comment_ids(&app), ["1", "2"]);
+        app.comment_sel = 0;
+        app.run_act(ribbon::Act::DeleteComment);
+        assert_eq!(comment_ids(&app), ["2"]);
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(comment_ids(&app), ["1", "2"]);
+        let path = save_to_temp(&mut app, "cmt-undo-delete");
+        let (doc, comments) = saved_parts(&path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert_eq!(doc.matches("w:id=\"1\"").count(), 3, "{doc}");
+        assert!(comments.contains(RICH_COMMENT), "{comments}");
+    }
+
+    /// #971 A7: every save reloads `pkg`, so the deleted comment's XML must
+    /// outlive the save between the delete and its undo.
+    #[test]
+    fn delete_save_undo_save_restores_the_comment() {
+        let mut app = app_with_rich_comments(2);
+        app.comment_sel = 0;
+        app.run_act(ribbon::Act::DeleteComment);
+        let path = save_to_temp(&mut app, "cmt-delete-save-undo");
+        assert_eq!(saved_comment_ids(&saved_parts(&path).1), ["2"]);
+        app.on_key(ctrl(KeyCode::Char('z')));
+        app.save();
+        let (doc, comments) = saved_parts(&path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert_eq!(doc.matches("w:id=\"1\"").count(), 3, "{doc}");
+        assert!(comments.contains(RICH_COMMENT), "{comments}");
+    }
+
+    /// #971 A8: a delete that stays leaves the comment and its markers out
+    /// of the save, also after undo and redo.
+    #[test]
+    fn delete_comment_saves_without_it() {
+        let mut app = app_with_rich_comments(2);
+        app.comment_sel = 0;
+        app.run_act(ribbon::Act::DeleteComment);
+        let path = save_to_temp(&mut app, "cmt-delete-save");
+        let (doc, comments) = saved_parts(&path);
+        assert!(!doc.contains("w:id=\"1\""), "{doc}");
+        assert_eq!(saved_comment_ids(&comments), ["2"], "{comments}");
+        app.on_key(ctrl(KeyCode::Char('z')));
+        app.on_key(ctrl(KeyCode::Char('y')));
+        assert_eq!(comment_ids(&app), ["2"]);
+        app.save();
+        let (doc, comments) = saved_parts(&path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert!(!doc.contains("w:id=\"1\""), "{doc}");
+        assert_eq!(saved_comment_ids(&comments), ["2"], "{comments}");
+    }
+
+    /// #971 FIX r1 m2: a comment added this session and saved, then
+    /// deleted, keeps the XML the save wrote for its undo.
+    #[test]
+    fn delete_of_a_saved_session_comment_keeps_its_xml() {
+        let mut app = app_with(&["The quick brown fox."]);
+        add_comment_by_keys(&mut app, "Colour?");
+        let path = save_to_temp(&mut app, "cmt-session-raw");
+        let written = app.pkg.comment_xml("1").expect("saved");
+        app.run_act(ribbon::Act::DeleteComment);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert_eq!(
+            app.tracked_comments.get("1").and_then(|t| t.raw.as_deref()),
+            Some(written.as_str())
+        );
+    }
+
+    /// "The quick brown fox." with loaded comments `03` and `3` around it:
+    /// one id as some producer wrote it, one that reads as the same number.
+    fn app_with_03_and_3() -> App {
+        let mut ed = Editor::new(Document {
+            body: vec![Block::Paragraph(MPara {
+                props: ParProps::default(),
+                content: vec![Inline::Run(Run {
+                    text: "The quick brown fox.".into(),
+                    props: RunProps::default(),
+                })],
+            })],
+        });
+        for id in ["03", "3"] {
+            ed.select_all();
+            assert!(ed.add_comment(id));
+        }
+        let mut pkg = new_package(ed.doc);
+        pkg.insert_comment_xml(ZERO_THREE);
+        pkg.insert_comment_xml(THREE);
+        let mut app = App::new(pkg, "test.docx", false);
+        app.os_clip = None;
+        app
+    }
+
+    const ZERO_THREE: &str = "<w:comment w:author=\"Ann\" w:id=\"03\"><w:p><w:r><w:t>oh-three</w:t></w:r></w:p></w:comment>";
+    const THREE: &str =
+        "<w:comment w:id=\"3\" w:author=\"Bob\"><w:p><w:r><w:t>three</w:t></w:r></w:p></w:comment>";
+
+    /// #971 FIX r2 f4: Delete Comment of `w:id="03"` leaves it out of the
+    /// save and leaves comment 3 alone; its undo writes `03` back verbatim.
+    #[test]
+    fn delete_comment_matches_the_id_as_written() {
+        let mut app = app_with_03_and_3();
+        let at = comment_ids(&app)
+            .iter()
+            .position(|id| id == "03")
+            .expect("03 loaded");
+        app.comment_sel = at;
+        app.run_act(ribbon::Act::DeleteComment);
+        assert_eq!(comment_ids(&app), ["3"]);
+        let path = save_to_temp(&mut app, "cmt-03");
+        let (_, comments) = saved_parts(&path);
+        assert_eq!(saved_comment_ids(&comments), ["3"], "{comments}");
+        assert!(comments.contains(THREE), "{comments}");
+        app.on_key(ctrl(KeyCode::Char('z')));
+        app.save();
+        let (_, comments) = saved_parts(&path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert!(comments.contains(ZERO_THREE), "{comments}");
+        assert!(comments.contains(THREE), "{comments}");
+    }
+
+    /// #971 A14: a comment an undo restores goes back to its place in the
+    /// panel, and the selection stays on the comment it was on.
+    #[test]
+    fn undo_delete_keeps_panel_order() {
+        let mut app = app_with_rich_comments(3);
+        let loaded = comment_ids(&app);
+        assert_eq!(loaded.len(), 3);
+        app.comment_sel = 1;
+        app.run_act(ribbon::Act::DeleteComment);
+        assert_eq!(comment_ids(&app), [loaded[0].clone(), loaded[2].clone()]);
+        app.comment_sel = 1;
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(comment_ids(&app), loaded);
+        assert_eq!(app.comment_sel, 2, "still on {}", loaded[2]);
+    }
+
+    /// `app` in header editing, with a comment holding `text` on the header
+    /// text "Head".
+    fn header_comment(app: &mut App, text: &str) {
+        app.run_act(ribbon::Act::EditHeader);
+        assert!(app.hf_edit.is_some());
+        for c in "Head".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        add_comment_by_keys(app, text);
+        assert_eq!(app.comments.len(), 1, "listed");
+    }
+
+    /// The saved header part's XML.
+    fn saved_header(app: &App, path: &std::path::Path) -> String {
+        let part = app.header_part.clone().expect("a header part");
+        let pkg = load_package(&std::fs::read(path).expect("saved")).unwrap();
+        pkg.part_text(&part).unwrap_or_default()
+    }
+
+    /// #971 A9: undoing a comment made in a header takes it out of the
+    /// panel and the save, as for the body.
+    #[test]
+    fn undo_header_comment_then_save_has_no_comment() {
+        let mut app = app_with(&["The quick brown fox."]);
+        header_comment(&mut app, "Colour?");
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert!(app.comments.is_empty(), "the panel drops it");
+        // Saving commits the header edit first, as Ctrl+S does.
+        let path = save_to_temp(&mut app, "cmt-hf-undo");
+        let (_, comments) = saved_parts(&path);
+        let header = saved_header(&app, &path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert!(app.comments.is_empty());
+        assert!(!comments.contains("Colour?"), "{comments}");
+        assert!(!header.contains("commentReference"), "{header}");
+    }
+
+    /// #971 A10: a header comment that stays is saved with its markers in
+    /// the header part, also after undo and redo.
+    #[test]
+    fn header_comment_is_saved_with_its_markers() {
+        let mut app = app_with(&["The quick brown fox."]);
+        header_comment(&mut app, "Colour?");
+        let path = save_to_temp(&mut app, "cmt-hf-save");
+        let (_, comments) = saved_parts(&path);
+        let header = saved_header(&app, &path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert_eq!(app.comments.len(), 1);
+        assert!(comments.contains("Colour?"), "{comments}");
+        assert!(header.contains("commentReference"), "{header}");
+    }
+
+    #[test]
+    fn header_comment_undo_redo_is_saved() {
+        let mut app = app_with(&["The quick brown fox."]);
+        header_comment(&mut app, "Colour?");
+        app.on_key(ctrl(KeyCode::Char('z')));
+        app.on_key(ctrl(KeyCode::Char('y')));
+        assert_eq!(app.comments.len(), 1, "listed again");
+        let path = save_to_temp(&mut app, "cmt-hf-redo");
+        let (_, comments) = saved_parts(&path);
+        let header = saved_header(&app, &path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert!(comments.contains("Colour?"), "{comments}");
+        assert!(header.contains("commentReference"), "{header}");
+    }
+
+    /// #971 A13: a header edit left without committing takes its comment's
+    /// markers with it, so the panel and the save drop the comment.
+    #[test]
+    fn header_comment_discarded_on_exit_is_not_listed() {
+        let mut app = app_with(&["The quick brown fox."]);
+        header_comment(&mut app, "Colour?");
+        app.exit_hf_edit(false);
+        assert!(app.comments.is_empty(), "the panel drops it");
+        let path = save_to_temp(&mut app, "cmt-hf-discard");
+        let (_, comments) = saved_parts(&path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert!(!comments.contains("Colour?"), "{comments}");
+    }
+
+    /// #971 A12: a loaded comment anchored in a header, deleted from the
+    /// body, leaves the panel and the save at once: nothing can take its
+    /// header markers, so it is not kept for an undo (they stay orphaned,
+    /// as before).
+    #[test]
+    fn delete_header_anchored_comment_from_body_removes_it() {
+        let mut first = app_with(&["The quick brown fox."]);
+        header_comment(&mut first, "Colour?");
+        let path = save_to_temp(&mut first, "cmt-hf-loaded");
+        let bytes = std::fs::read(&path).unwrap();
+        let mut app = App::new(
+            load_package(&bytes).unwrap(),
+            &path.to_string_lossy(),
+            false,
+        );
+        app.os_clip = None;
+        assert_eq!(app.comments.len(), 1, "loaded");
+        assert!(app.hf_edit.is_none());
+        app.run_act(ribbon::Act::DeleteComment);
+        assert!(app.comments.is_empty(), "the panel drops it");
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(app.comments.is_empty(), "and keeps it out");
+        app.save();
+        let (_, comments) = saved_parts(&path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert!(!comments.contains("Colour?"), "{comments}");
     }
 
     /// An app on "The quick brown fox." with loaded comments 1 and 2 around

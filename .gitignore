@@ -39,3 +39,6 @@
 
 # The test XLL scripts/make-legacy-fixtures.ps1 builds (-Sections xll).
 /scripts/xll-fixture/target/
+
+# Python bytecode from running the scripts/ unit tests.
+__pycache__/
