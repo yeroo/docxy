@@ -12446,9 +12446,10 @@ impl Docxy {
     /// Enter on the grid, not editing, while copy mode is on: paste over the
     /// selection and end copy mode, as Excel does (#664). A refused paste
     /// keeps copy mode. False (Enter moves as usual) when there is no clip
-    /// to paste, an edit having ended copy mode included, and on a
-    /// protected sheet, which refuses a paste as silently as it refuses
-    /// typing and Delete; copy mode then stays on.
+    /// to paste, an edit having ended copy mode included, and where a paste
+    /// is refused: on a protected sheet, which refuses it as silently as it
+    /// refuses typing and Delete, and in Protected View; copy mode then
+    /// stays on.
     fn sheet_enter_paste(&mut self, cx: &mut Context<Self>) -> bool {
         // An edit since the copy ended copy mode: Enter moves (and says so
         // when that was a cut).
@@ -12456,7 +12457,7 @@ impl Docxy {
             self.set_status(CUT_CANCELLED_STATUS);
         }
         let now = self.clipboard_read(cx);
-        if self.sheet_protected() || self.grid_clip_live(&now).is_none() {
+        if self.sheet_protected() || self.protected_view() || self.grid_clip_live(&now).is_none() {
             return false;
         }
         if self.sheet_paste(cx) {

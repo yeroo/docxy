@@ -118,6 +118,12 @@ fn a_downloaded_workbook_opens_protected_until_enable_editing() {
         Some(protected_status),
         "{st}"
     );
+    // #664 r3: in copy mode Enter would paste, which Protected View refuses,
+    // so it moves as it does with nothing copied.
+    ok(&driver, "click-cell", vec![("cell", s("D2"))]);
+    let st = ok(&driver, "key", vec![("keys", Json::Arr(vec![s("enter")]))]);
+    assert_eq!(st.get("sel").and_then(Json::as_str), Some("D3"), "{st}");
+    assert_eq!(st.get("dirty"), Some(&Json::Bool(false)), "{st}");
 
     // Ctrl+Shift+U expands the formula bar (#672): view state, so Protected
     // View does not refuse it.

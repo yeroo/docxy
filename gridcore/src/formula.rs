@@ -2050,9 +2050,10 @@ pub fn move_ref_expr(e: &Expr, home: Option<&str>, mv: &CellMove) -> Expr {
 
 /// Rewrite `e`, the formula of a moved cell, for the move `mv`: it lived on
 /// `mv.src` and now lives on `mv.dst`. A reference to another moved cell
-/// follows it and names the cell's new home unqualified; any other
-/// unqualified reference is qualified with the source sheet when the move
-/// changed sheets, so it keeps reading the cells it read.
+/// follows it: unqualified when the move changed sheets (it names the
+/// formula's own new sheet), its qualifier kept on a move within the sheet.
+/// Any other unqualified reference is qualified with the source sheet when
+/// the move changed sheets, so it keeps reading the cells it read.
 pub fn move_block_expr(e: &Expr, mv: &CellMove) -> Expr {
     let recur = |x: &Expr| move_block_expr(x, mv);
     let home = Some(mv.src);
