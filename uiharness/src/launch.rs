@@ -358,6 +358,9 @@ impl Drop for Launched {
 
 /// Start `exe` with the harness on and its config root in `sandbox`.
 ///
+/// `exe` must be absolute, as [`find_suite`] returns it, because the child's
+/// working directory is the sandbox (#975).
+///
 /// The sandbox is created if it is not there. `open` is left to the script:
 /// passing the file on the command line would work too, but then half a case's
 /// setup would live in the runner and half in the script.
@@ -403,6 +406,9 @@ pub fn launch_with_env(
 /// thread must attach to the desktop ([`crate::desktop::Desktop`]) for
 /// captures to find the window. Off Windows this is the same error
 /// [`Desktop::create`] gives: a separate desktop is Windows-only.
+///
+/// `exe` must be absolute, as [`find_suite`] returns it, because the child's
+/// working directory is the sandbox (#975).
 ///
 /// [`Desktop::create`]: crate::desktop::Desktop::create
 pub fn launch_on_desktop(

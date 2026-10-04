@@ -72,6 +72,10 @@ fn fake_suite_dir(tag: &str) -> (PathBuf, String) {
     let dir = std::env::temp_dir().join(format!("uiharness-975-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    // The child absolutizes the relative name against getcwd(), the physical
+    // path — resolve symlinks so the expected path matches what it reports.
+    #[cfg(unix)]
+    let dir = std::fs::canonicalize(&dir).unwrap();
     let name = format!("fake-suite{}", std::env::consts::EXE_SUFFIX);
     std::fs::copy(env!("CARGO_BIN_EXE_uiharness"), dir.join(&name)).unwrap();
     (dir, name)
