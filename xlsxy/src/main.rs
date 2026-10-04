@@ -2430,6 +2430,10 @@ impl App {
         if let (true, Some(before)) = (renamed, wb_before) {
             let after = self.wb_snapshot();
             self.rebuild_engine();
+            // As every structural step does (`try_structural`): a pending
+            // cut's cells were captured before the formulas were rewritten.
+            // When this step is the cut-paste itself, the cut is spent.
+            self.cancel_cut();
             self.undo.push(UndoAction::Structural { before, after });
             self.redo.clear();
             self.modified = true;
@@ -13704,6 +13708,20 @@ mod tests {
             .cell(5, 0)
             .map(|c| c.value.clone());
         assert_eq!(a6, Some(CellValue::Text("Units".into())));
+    }
+
+    #[test]
+    fn a_header_rename_cancels_a_pending_cut_683() {
+        // Cut D1, rename the Qty header, paste at F1: the rename rewrote
+        // D1, so the cut is a copy now and D1 stays.
+        let mut app = header_app();
+        clip_range(&mut app, (0, 3), (0, 3), true);
+        app.apply_on(0, vec![(0, 1, parse_input("Units"))]);
+        app.cur = (0, 5);
+        app.paste();
+        let d1 = app.pkg.workbook.sheets[0].cell(0, 3).unwrap();
+        assert_eq!(d1.formula.as_deref(), Some("SUM(Sales[Units])"));
+        assert_eq!(d1.value, CellValue::Number(7.0));
     }
 
     const PROTECTED_STATUS: &str = "Sheet is protected — unprotect it to edit (Review ▸ Protect)";
