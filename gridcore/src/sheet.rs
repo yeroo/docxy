@@ -1691,6 +1691,12 @@ pub struct Table {
     pub totals_rows: u32,
     /// Column names, left to right.
     pub columns: Vec<String>,
+    /// The `tableColumn id` of each column in [`Self::columns`], so a save
+    /// finds a column's element again after a rename; 0 for a column the
+    /// part doesn't have yet. Empty when unknown (a table not loaded from a
+    /// part, or one whose ids don't tell its columns apart): the save then
+    /// matches columns by name.
+    pub column_ids: Vec<u32>,
     /// The xl/tables/*.xml part backing this table (its `ref` is patched on
     /// save when the range moved).
     pub part: String,

@@ -2410,9 +2410,38 @@ impl App {
                 .map(|(s, cells)| app.snapshot(*s, cells))
                 .collect()
         };
+        // A header cell of a table names its column: an edit there renames
+        // the column in every formula (`sync_table_headers`), which only a
+        // whole-workbook step can undo. Snapshotted only when one is hit.
+        let headers = keys
+            .iter()
+            .any(|(s, cells)| self.hits_table_header(*s, cells));
+        let wb_before = headers.then(|| self.wb_snapshot());
         let befores = snapshot(self);
         write(self);
+        let mut written = None;
+        let mut renamed = false;
+        if headers {
+            written = Some(snapshot(self));
+            for (s, cells) in &keys {
+                renamed |= gridcore::edit::sync_table_headers(&mut self.pkg.workbook, *s, cells);
+            }
+        }
+        if let (true, Some(before)) = (renamed, wb_before) {
+            let after = self.wb_snapshot();
+            self.rebuild_engine();
+            self.undo.push(UndoAction::Structural { before, after });
+            self.redo.clear();
+            self.modified = true;
+            self.warn_new_circles(&circles_before);
+            return;
+        }
         let afters = snapshot(self);
+        // A header written back as its column's name (a formula, a
+        // duplicate) changed under the engine.
+        if written.is_some_and(|w| w != afters) {
+            self.rebuild_engine();
+        }
         let undo = keys
             .iter()
             .zip(befores.into_iter().zip(afters))
@@ -2430,6 +2459,18 @@ impl App {
         self.redo.clear();
         self.modified = true;
         self.warn_new_circles(&circles_before);
+    }
+
+    /// Whether any of `cells` on sheet `sheet` is a header cell of a table.
+    fn hits_table_header(&self, sheet: usize, cells: &[(u32, u32)]) -> bool {
+        self.pkg.workbook.tables.iter().any(|t| {
+            let (r1, c1, _, c2) = t.range;
+            t.sheet == sheet
+                && t.header_rows > 0
+                && cells
+                    .iter()
+                    .any(|&(r, c)| r == r1 && (c1..=c2).contains(&c))
+        })
     }
 
     /// Restyle cells on sheet `sheet_idx` — `(row, col, style index)` — as one
@@ -13582,6 +13623,89 @@ mod tests {
         app.anchor = None;
     }
 
+    /// #683: `Sales` over A1:B3 (Item, Qty), `=SUM(Sales[Qty])` in D1.
+    fn header_app() -> App {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        let sh = &mut app.pkg.workbook.sheets[0];
+        sh.set_cell(0, 0, Cell::text("Item"));
+        sh.set_cell(0, 1, Cell::text("Qty"));
+        sh.set_cell(1, 1, Cell::number(3.0));
+        sh.set_cell(2, 1, Cell::number(4.0));
+        app.pkg
+            .add_table(0, (0, 0, 2, 1), true, "TableStyleMedium2")
+            .unwrap();
+        gridcore::edit::rename_table(&mut app.pkg.workbook, "Table1", "Sales").unwrap();
+        app.rebuild_engine();
+        app.apply_on(0, vec![(0, 3, parse_input("=SUM(Sales[Qty])"))]);
+        app
+    }
+
+    fn header_state(app: &App) -> (String, Vec<String>, String) {
+        let sh = &app.pkg.workbook.sheets[0];
+        let text = |r, c| match sh.cell(r, c).map(|x| &x.value) {
+            Some(CellValue::Text(t)) => t.clone(),
+            other => format!("{other:?}"),
+        };
+        let d1 = sh
+            .cell(0, 3)
+            .and_then(|c| c.formula.clone())
+            .unwrap_or_default();
+        (text(0, 1), app.pkg.workbook.tables[0].columns.clone(), d1)
+    }
+
+    #[test]
+    fn header_rename_is_one_undo_step_683() {
+        let mut app = header_app();
+        let before = header_state(&app);
+        app.apply_on(0, vec![(0, 1, parse_input("Units"))]);
+        let after = header_state(&app);
+        assert_eq!(after.0, "Units");
+        assert_eq!(after.1, ["Item", "Units"]);
+        assert_eq!(after.2, "SUM(Sales[Units])");
+        assert!(matches!(
+            app.undo.last(),
+            Some(UndoAction::Structural { .. })
+        ));
+        app.undo();
+        assert_eq!(header_state(&app), before);
+        app.redo();
+        assert_eq!(header_state(&app), after);
+        let d1 = app.pkg.workbook.sheets[0].cell(0, 3).unwrap();
+        assert_eq!(d1.value, CellValue::Number(7.0));
+        // A header edit that keeps the name is an ordinary cell step.
+        app.apply_on(0, vec![(0, 1, parse_input("Units"))]);
+        assert!(matches!(app.undo.last(), Some(UndoAction::Cells(_))));
+        // A cleared header takes `Column2`, written into the cell.
+        app.apply_on(0, vec![(0, 1, Cell::default())]);
+        assert_eq!(header_state(&app).0, "Column2");
+        assert_eq!(header_state(&app).2, "SUM(Sales[Column2])");
+    }
+
+    #[test]
+    fn cut_paste_onto_a_header_renames_the_column_683() {
+        let mut app = header_app();
+        app.apply_on(0, vec![(5, 0, parse_input("Units"))]);
+        clip_range(&mut app, (5, 0), (5, 0), true);
+        app.cur = (0, 1);
+        app.paste();
+        assert_eq!(header_state(&app).1, ["Item", "Units"]);
+        assert_eq!(header_state(&app).2, "SUM(Sales[Units])");
+        assert!(
+            app.pkg.workbook.sheets[0]
+                .cell(5, 0)
+                .is_none_or(|c| c.value.is_empty())
+        );
+        // One undo puts back the header, the formula and the cut cell.
+        app.undo();
+        assert_eq!(header_state(&app).1, ["Item", "Qty"]);
+        assert_eq!(header_state(&app).2, "SUM(Sales[Qty])");
+        let a6 = app.pkg.workbook.sheets[0]
+            .cell(5, 0)
+            .map(|c| c.value.clone());
+        assert_eq!(a6, Some(CellValue::Text("Units".into())));
+    }
+
     const PROTECTED_STATUS: &str = "Sheet is protected — unprotect it to edit (Review ▸ Protect)";
 
     #[test]
@@ -15517,6 +15641,7 @@ mod tests {
             totals_rows: 0,
             columns: cols.iter().map(|s| s.to_string()).collect(),
             part: String::new(),
+            column_ids: Vec::new(),
         };
         pkg.workbook
             .tables

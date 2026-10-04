@@ -6260,4 +6260,131 @@ mod table_verb_tests {
         assert_eq!(a.pkg.workbook.tables.len(), 1);
         assert_eq!(d1(&a).as_deref(), Some("=SUM(Table1[Qty])"));
     }
+
+    /// #683: `name` over A1 with `columns` as headers and `rows` data rows
+    /// (column k of row r holds `10 * k + r`).
+    fn app_683(name: &str, columns: &[&str], rows: u32) -> App {
+        let mut a = App::new(new_xlsx(), "ctl-683.xlsx");
+        a.os_clip = None;
+        let sh = &mut a.pkg.workbook.sheets[0];
+        for (k, col) in columns.iter().enumerate() {
+            sh.set_cell(0, k as u32, Cell::text(col));
+            for r in 1..=rows {
+                sh.set_cell(r, k as u32, Cell::number((10 * k as u32 + r) as f64));
+            }
+        }
+        let last = columns.len() as u32 - 1;
+        a.pkg
+            .add_table(0, (0, 0, rows, last), true, "TableStyleMedium2")
+            .unwrap();
+        gridcore::edit::rename_table(&mut a.pkg.workbook, "Table1", name).unwrap();
+        a.rebuild_engine();
+        a
+    }
+
+    fn put(a: &mut App, at: &str, text: &str) {
+        call(a, "cell.set", vec![("ref", at), ("text", text)]).unwrap();
+    }
+
+    fn formula_value(a: &mut App, at: &str) -> (Option<String>, Option<String>) {
+        let g = call(a, "cell.get", vec![("ref", at)]).unwrap();
+        (
+            g.get_str("formula").map(str::to_string),
+            g.get_str("text").map(str::to_string),
+        )
+    }
+
+    fn table_columns(a: &mut App) -> Vec<String> {
+        let r = dispatch(a, "table.list", &Json::Null).unwrap();
+        let t = &r.get("tables").unwrap().as_array().unwrap()[0];
+        let cols = t.get("columns").unwrap().as_array().unwrap();
+        cols.iter()
+            .filter_map(|c| c.as_str())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn col_delete(a: &mut App, at: usize, count: usize) {
+        let args = Json::obj(vec![
+            ("at", Json::Num(at as f64)),
+            ("count", Json::Num(count as f64)),
+        ]);
+        dispatch(a, "col.delete", &args).unwrap();
+    }
+
+    #[test]
+    fn header_rename_rewrites_structured_refs_683() {
+        let mut a = app_683("Sales", &["Item", "Qty", "Price", "Region"], 4);
+        put(&mut a, "F2", "=SUM(Sales[Qty])");
+        let (_, before) = formula_value(&mut a, "F2");
+        assert_eq!(before.as_deref(), Some("50"));
+        put(&mut a, "B1", "Units");
+        let (f, v) = formula_value(&mut a, "F2");
+        assert_eq!(f.as_deref(), Some("=SUM(Sales[Units])"));
+        assert_eq!(v, before);
+        assert_eq!(table_columns(&mut a), ["Item", "Units", "Price", "Region"]);
+    }
+
+    #[test]
+    fn col_delete_refs_to_a_deleted_column_go_ref_683() {
+        let mut a = app_683("Sales", &["Item", "Qty", "Price", "Region"], 4);
+        put(&mut a, "F2", "=SUM(Sales[Qty])");
+        put(&mut a, "G2", "=SUM(Sales[Price])");
+        put(&mut a, "B1", "Units");
+        col_delete(&mut a, 2, 1);
+        assert_eq!(
+            formula_value(&mut a, "F2"),
+            (Some("=SUM(#REF!)".into()), Some("#REF!".into()))
+        );
+        assert_eq!(
+            formula_value(&mut a, "E2"),
+            (Some("=SUM(Sales[Units])".into()), Some("50".into()))
+        );
+        let t = &a.pkg.workbook.tables[0];
+        assert_eq!(t.range, (0, 0, 4, 2));
+        assert_eq!(table_columns(&mut a), ["Item", "Units", "Region"]);
+        // One undo brings the column, the table and the formulas back.
+        a.undo();
+        assert_eq!(table_columns(&mut a), ["Item", "Units", "Price", "Region"]);
+        assert_eq!(
+            formula_value(&mut a, "G2"),
+            (Some("=SUM(Sales[Price])".into()), Some("90".into()))
+        );
+    }
+
+    #[test]
+    fn col_delete_of_a_whole_table_removes_it_on_save_683() {
+        let tmp = std::env::temp_dir().join(format!("xlsxy-683-{}.xlsx", std::process::id()));
+        let mut a = app_683("Calc", &["Qty", "Price", "Line"], 3);
+        a.path = tmp.to_string_lossy().into_owned();
+        put(&mut a, "F2", "=SUM(Calc[Line])");
+        col_delete(&mut a, 0, 3);
+        assert!(a.pkg.workbook.tables.is_empty());
+        let ref_err = (Some("=SUM(#REF!)".to_string()), Some("#REF!".to_string()));
+        assert_eq!(formula_value(&mut a, "C2"), ref_err);
+        dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+        let re = gridcore::xlsx::load_xlsx(&std::fs::read(&tmp).unwrap()).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert!(re.workbook.tables.is_empty());
+        assert!(re.part("xl/tables/table1.xml").is_none());
+        let ws = String::from_utf8(re.part("xl/worksheets/sheet1.xml").unwrap().to_vec()).unwrap();
+        assert!(!ws.contains("tablePart"), "{ws}");
+        let rels = re
+            .part("xl/worksheets/_rels/sheet1.xml.rels")
+            .map(|b| String::from_utf8(b.to_vec()).unwrap())
+            .unwrap_or_default();
+        assert!(!rels.contains("/table\""), "{rels}");
+        // The reloaded cell still says #REF!, not #CYCLE!.
+        let mut b = App::new(re, "re-683.xlsx");
+        b.os_clip = None;
+        b.rebuild_engine();
+        assert_eq!(formula_value(&mut b, "C2"), ref_err);
+        // Undo brings the table back.
+        a.undo();
+        assert_eq!(a.pkg.workbook.tables.len(), 1);
+        assert_eq!(
+            formula_value(&mut a, "F2"),
+            (Some("=SUM(Calc[Line])".into()), Some("66".into()))
+        );
+    }
 }

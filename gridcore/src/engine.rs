@@ -3080,6 +3080,7 @@ mod tests {
             totals_rows: 0,
             columns: vec!["Item".into(), "Qty".into(), "Amount".into()],
             part: String::new(),
+            column_ids: Vec::new(),
         });
         let mut eng = Engine::new(&wb);
         eng.recalc_all(&mut wb);
@@ -4846,6 +4847,7 @@ mod tests {
             totals_rows: 0,
             columns: vec!["Qty".into(), "Price".into()],
             part: String::new(),
+            column_ids: Vec::new(),
         });
         let mut eng = Engine::new(&wb);
         eng.recalc_all(&mut wb);
@@ -4915,6 +4917,7 @@ mod tests {
             totals_rows: 0,
             columns: vec!["Qty".into(), "Price".into(), "Amount".into()],
             part: String::new(),
+            column_ids: Vec::new(),
         });
         let mut eng = Engine::new(&wb);
         let scalar = [

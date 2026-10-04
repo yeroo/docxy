@@ -587,6 +587,7 @@ fn parse_table_xml(xml: &str, sheet_idx: usize, part: &str) -> Option<Table> {
     let mut header_rows = 1u32;
     let mut totals_rows = 0u32;
     let mut columns = Vec::new();
+    let mut ids: Vec<Option<u32>> = Vec::new();
     loop {
         match p.next() {
             Event::Start => match local(p.name()) {
@@ -603,12 +604,24 @@ fn parse_table_xml(xml: &str, sheet_idx: usize, part: &str) -> Option<Table> {
                         totals_rows = t;
                     }
                 }
-                "tableColumn" => columns.push(decode(p.attr("name"))),
+                "tableColumn" => {
+                    columns.push(decode(p.attr("name")));
+                    ids.push(p.attr("id").parse().ok().filter(|&id| id != 0));
+                }
                 _ => {}
             },
             Event::Eof => break,
             _ => {}
         }
+    }
+    // Ids the part doesn't give for every column, or gives twice, can't
+    // tell its columns apart: the save then matches them by name.
+    let mut column_ids: Vec<u32> = ids.iter().flatten().copied().collect();
+    let mut sorted = column_ids.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if column_ids.len() != columns.len() || sorted.len() != column_ids.len() {
+        column_ids.clear();
     }
     Some(Table {
         name,
@@ -617,6 +630,7 @@ fn parse_table_xml(xml: &str, sheet_idx: usize, part: &str) -> Option<Table> {
         header_rows,
         totals_rows,
         columns,
+        column_ids,
         part: part.to_string(),
     })
 }
@@ -5725,14 +5739,26 @@ struct ConvertedTable {
     info: crate::formula::TableInfo,
 }
 
+/// A table's columns renamed since its part was loaded: the name formulas in
+/// the parts know the table by, and its columns' (old, new) names.
+struct ColumnRenames {
+    part: String,
+    loaded_name: String,
+    map: Vec<(String, String)>,
+}
+
 /// The formulas a table part holds in its columns (`calculatedColumnFormula`,
-/// `totalsRowFormula`) with tables renamed (`renames`, old → new, applied at
-/// once) and converted tables' references turned into cells. `own_sheet` is
-/// the sheet of the table whose part this is. A formula that doesn't parse,
+/// `totalsRowFormula`) with table columns renamed (`columns`: qualified
+/// references in every part, unqualified ones in the table's own), tables
+/// renamed (`renames`, old → new, applied at once) and converted tables'
+/// references turned into cells. `own_sheet` and `own_part` are the sheet
+/// and part of the table whose part this is. A formula that doesn't parse,
 /// or that nothing touches, keeps its text.
 fn rewrite_column_formulas(
     xml: &str,
     own_sheet: usize,
+    own_part: &str,
+    columns: &[ColumnRenames],
     renames: &[(String, String)],
     converted: &[ConvertedTable],
 ) -> String {
@@ -5788,6 +5814,16 @@ fn rewrite_column_formulas(
                         })
                     });
                 }
+                // By the names the file knows, before the tables' renames.
+                for cr in columns {
+                    let inside = cr.part == own_part;
+                    out = crate::formula::rename_table_columns_in_expr(
+                        &out,
+                        &cr.loaded_name,
+                        inside,
+                        &cr.map,
+                    );
+                }
                 out = crate::formula::rename_tables_in_expr(&out, renames);
                 if out != ast {
                     // The file's spelling: `[#This Row]`, `_xlfn.` prefixes.
@@ -5803,10 +5839,15 @@ fn rewrite_column_formulas(
 }
 
 /// Bring a table part's `<tableColumns>` to `columns`: a column the part
-/// already has (by name) keeps its element, id and children; a new one gets
-/// the next free id; a dropped one goes. The autoFilter's `filterColumn`s
-/// follow their columns (`colId` is a column index) or go with them.
-fn sync_table_columns(xml: &str, columns: &[String]) -> String {
+/// already has keeps its element, id and children (its `name` set when it
+/// was renamed); a new one gets the next free id; a dropped one goes. With
+/// `ids` (the model's `tableColumn id` per column, see
+/// [`crate::sheet::Table::column_ids`]) columns are found by id alone, so a
+/// renamed column keeps its element and a new column named like a dropped
+/// one gets a new element; without, by name. The autoFilter's
+/// `filterColumn`s follow their columns (`colId` is a column index) or go
+/// with them.
+fn sync_table_columns(xml: &str, columns: &[String], ids: &[u32]) -> String {
     let Some(&span) = table_children(xml, "tableColumns").first() else {
         return xml.to_string();
     };
@@ -5821,8 +5862,35 @@ fn sync_table_columns(xml: &str, columns: &[String]) -> String {
             (name, id, &xml[s..e])
         })
         .collect();
-    let old: Vec<&str> = elements.iter().map(|(n, _, _)| n.as_str()).collect();
-    if old.len() == columns.len() && old.iter().zip(columns).all(|(a, b)| *a == b) {
+    let by_id = !ids.is_empty() && ids.len() == columns.len();
+    let mut used = vec![false; elements.len()];
+    // The element each column keeps, if any.
+    let found: Vec<Option<usize>> = columns
+        .iter()
+        .enumerate()
+        .map(|(j, name)| {
+            let i = if by_id {
+                (0..elements.len()).find(|&i| !used[i] && ids[j] != 0 && elements[i].1 == ids[j])
+            } else {
+                (0..elements.len())
+                    .find(|&i| !used[i] && elements[i].0 == *name)
+                    .or_else(|| {
+                        (0..elements.len())
+                            .find(|&i| !used[i] && elements[i].0.eq_ignore_ascii_case(name))
+                    })
+            };
+            if let Some(i) = i {
+                used[i] = true;
+            }
+            i
+        })
+        .collect();
+    let unchanged = elements.len() == columns.len()
+        && found
+            .iter()
+            .enumerate()
+            .all(|(j, &i)| i == Some(j) && elements[j].0 == columns[j]);
+    if unchanged {
         return xml.to_string();
     }
     let open = &xml[span.0..tag_end(xml, span.0)];
@@ -5834,19 +5902,16 @@ fn sync_table_columns(xml: &str, columns: &[String]) -> String {
         .rsplit_once(':')
         .map_or(String::new(), |(p, _)| format!("{p}:"));
     let mut next_id = elements.iter().map(|(_, id, _)| *id).max().unwrap_or(0);
-    let mut used = vec![false; elements.len()];
     let mut body = String::new();
-    for name in columns {
-        let found = (0..elements.len())
-            .find(|&i| !used[i] && elements[i].0 == *name)
-            .or_else(|| {
-                (0..elements.len()).find(|&i| !used[i] && elements[i].0.eq_ignore_ascii_case(name))
-            });
-        match found {
-            Some(i) => {
-                used[i] = true;
-                body.push_str(elements[i].2);
-            }
+    for (name, &i) in columns.iter().zip(&found) {
+        match i {
+            Some(i) if elements[i].0 == *name => body.push_str(elements[i].2),
+            Some(i) => body.push_str(&set_tag_attr(
+                elements[i].2,
+                0,
+                "name",
+                Some(&esc_attr(name)),
+            )),
             None => {
                 next_id += 1;
                 body.push_str(&format!(
@@ -5865,9 +5930,7 @@ fn sync_table_columns(xml: &str, columns: &[String]) -> String {
             let tag_end_at = tag_end(xml, s);
             let col_id =
                 tag_attr(&xml[s..tag_end_at], "colId").and_then(|v| v.parse::<usize>().ok());
-            let moved = col_id
-                .and_then(|k| old.get(k))
-                .and_then(|n| columns.iter().position(|c| c.eq_ignore_ascii_case(n)));
+            let moved = col_id.and_then(|k| found.iter().position(|&i| i == Some(k)));
             match moved {
                 Some(k) if Some(k) == col_id => {}
                 Some(k) => {
@@ -5959,6 +6022,33 @@ fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
             (loaded != t.name).then(|| (loaded, t.name.clone()))
         })
         .collect();
+    // A column keeps its id through a rename (`Table::column_ids`): the
+    // part's element with that id still has the old name.
+    let column_renames: Vec<ColumnRenames> = wb
+        .tables
+        .iter()
+        .filter_map(|t| {
+            let xml = part_xml(parts, &t.part)?;
+            let loaded = parse_table_xml(&xml, t.sheet, &t.part)?;
+            let map: Vec<(String, String)> = t
+                .column_ids
+                .iter()
+                .zip(&t.columns)
+                .filter(|&(&id, _)| id != 0)
+                .filter_map(|(id, new)| {
+                    let k = loaded.column_ids.iter().position(|x| x == id)?;
+                    let old = loaded.columns.get(k)?;
+                    (old != new).then(|| (old.clone(), new.clone()))
+                })
+                .collect();
+            let loaded_name = table_part_name(&xml)?;
+            (!map.is_empty()).then(|| ColumnRenames {
+                part: t.part.clone(),
+                loaded_name,
+                map,
+            })
+        })
+        .collect();
     let converted: Vec<ConvertedTable> = wb
         .removed_tables
         .iter()
@@ -5999,9 +6089,16 @@ fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
                 }
             }
         }
-        updated = sync_table_columns(&updated, &t.columns);
-        if !renames.is_empty() || !converted.is_empty() {
-            updated = rewrite_column_formulas(&updated, t.sheet, &renames, &converted);
+        updated = sync_table_columns(&updated, &t.columns, &t.column_ids);
+        if !column_renames.is_empty() || !renames.is_empty() || !converted.is_empty() {
+            updated = rewrite_column_formulas(
+                &updated,
+                t.sheet,
+                &t.part,
+                &column_renames,
+                &renames,
+                &converted,
+            );
         }
         p.1 = updated.into_bytes();
     }
@@ -7026,6 +7123,7 @@ impl SheetPackage {
             range,
             header_rows: u32::from(has_header),
             totals_rows: 0,
+            column_ids: (1..=names.len() as u32).collect(),
             columns: names,
             part,
         });
@@ -19193,6 +19291,102 @@ mod table_command_tests {
             ),
             "{xml}"
         );
+    }
+
+    /// Type `text` into header cell (r, c) of sheet 0, as a host does.
+    fn type_header(pkg: &mut SheetPackage, r: u32, c: u32, text: &str) -> bool {
+        pkg.workbook.sheets[0].set_cell(r, c, Cell::text(text));
+        crate::edit::sync_table_headers(&mut pkg.workbook, 0, &[(r, c)])
+    }
+
+    #[test]
+    fn a_renamed_header_keeps_its_table_column_element() {
+        let mut pkg = one_table();
+        let s = &mut pkg.workbook.sheets[0];
+        s.set_cell(5, 0, Cell::text("Key"));
+        s.set_cell(5, 1, Cell::text("Calc"));
+        s.set_cell(6, 0, Cell::text("x"));
+        pkg.add_table(0, (5, 0, 6, 1), true, "TableStyleMedium2")
+            .unwrap();
+        let (part, part2) = (
+            pkg.workbook.tables[0].part.clone(),
+            pkg.workbook.tables[1].part.clone(),
+        );
+        calculated(&mut pkg, &part, "Item", "[@Qty]*2");
+        calculated(&mut pkg, &part2, "Calc", "SUM(Table1[Qty])+COUNT([Calc])");
+        let xml = text(&pkg, &part).replace(
+            "<autoFilter ref=\"A1:B3\"/>",
+            "<autoFilter ref=\"A1:B3\"><filterColumn colId=\"1\"><filters><filter val=\"3\"/></filters></filterColumn></autoFilter>",
+        );
+        assert!(xml.contains("colId=\"1\""), "{xml}");
+        pkg.parts.iter_mut().find(|(n, _)| *n == part).unwrap().1 = xml.into_bytes();
+        let mut pkg = reload(&pkg);
+        assert!(type_header(&mut pkg, 0, 1, "Units"));
+        // The table's own rename goes with it: the parts know the old names.
+        rename_table(&mut pkg.workbook, "Table1", "Sales").unwrap();
+        let re = reload(&pkg);
+        assert_eq!(re.workbook.tables[0].columns, ["Item", "Units"]);
+        let xml = text(&re, &part);
+        assert!(xml.contains("<tableColumns count=\"2\">"), "{xml}");
+        assert!(xml.contains("id=\"2\""), "{xml}");
+        assert!(xml.contains("name=\"Units\""), "{xml}");
+        assert!(!xml.contains("id=\"3\""), "no new element: {xml}");
+        assert!(!xml.contains("Qty"), "{xml}");
+        assert!(xml.contains("<filterColumn colId=\"1\">"), "{xml}");
+        // The file's spelling of `[@Units]`.
+        assert_eq!(column_formula(&re, &part), "[[#This Row],[Units]]*2");
+        // Another table's unqualified `[Calc]` is its own column.
+        assert_eq!(
+            column_formula(&re, &part2),
+            "SUM(Sales[Units])+COUNT([Calc])"
+        );
+        let d1 = re.workbook.sheets[0].cell(0, 3).unwrap();
+        assert_eq!(d1.formula.as_deref(), Some("SUM(Sales[Units])"));
+        // Saved again, nothing more changes.
+        assert_eq!(text(&reload(&re), &part), xml);
+    }
+
+    #[test]
+    fn a_new_column_named_like_a_deleted_one_gets_a_new_element() {
+        let mut pkg = one_table();
+        resize_table(&mut pkg.workbook, "Table1", (0, 0, 2, 2)).unwrap();
+        let mut pkg = reload(&pkg);
+        let part = pkg.workbook.tables[0].part.clone();
+        calculated(&mut pkg, &part, "Qty", "[@Item]");
+        let mut pkg = reload(&pkg);
+        assert_eq!(pkg.workbook.tables[0].column_ids, [1, 2, 3]);
+        crate::edit::delete_cols(&mut pkg.workbook, 0, 1, 1);
+        assert_eq!(pkg.workbook.tables[0].columns, ["Item", "Column3"]);
+        pkg.workbook.sheets[0].set_cell(0, 2, Cell::text("Qty"));
+        resize_table(&mut pkg.workbook, "Table1", (0, 0, 2, 2)).unwrap();
+        assert_eq!(pkg.workbook.tables[0].columns, ["Item", "Column3", "Qty"]);
+        let xml = text(&reload(&pkg), &part);
+        assert!(
+            xml.contains("<tableColumn id=\"4\" name=\"Qty\"/>"),
+            "{xml}"
+        );
+        assert!(!xml.contains("calculatedColumnFormula"), "{xml}");
+        assert!(!xml.contains("id=\"2\""), "{xml}");
+    }
+
+    #[test]
+    fn a_table_whose_columns_were_all_deleted_leaves_the_package() {
+        let mut pkg = one_table();
+        let part = pkg.workbook.tables[0].part.clone();
+        crate::edit::delete_cols(&mut pkg.workbook, 0, 0, 2);
+        assert!(pkg.workbook.tables.is_empty());
+        let re = reload(&pkg);
+        assert!(re.workbook.tables.is_empty());
+        assert!(re.part(&part).is_none());
+        let ws = text(&re, &re.sheet_parts[0].clone());
+        assert!(!ws.contains("tablePart"), "{ws}");
+        let rels = text(&re, "xl/worksheets/_rels/sheet1.xml.rels");
+        assert!(!rels.contains("/table\""), "{rels}");
+        let types = text(&re, "[Content_Types].xml");
+        assert!(!types.contains(&part), "{types}");
+        // D1 moved to B1; its reference to the table went with it.
+        let b1 = re.workbook.sheets[0].cell(0, 1).unwrap();
+        assert_eq!(b1.formula.as_deref(), Some("SUM(#REF!)"));
     }
 
     #[test]
