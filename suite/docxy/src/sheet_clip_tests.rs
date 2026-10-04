@@ -145,6 +145,22 @@ fn a_whole_column_paste_area_fills_the_used_rows() {
 }
 
 #[test]
+fn a_copy_bigger_than_the_cap_pasted_once_lands() {
+    // The cap stops a tiling, not a copy pasted once: 50,001 rows x 2
+    // columns is 100,002 cells, written as they were copied.
+    let mut v = view();
+    put(&mut v, "A1", Cell::number(1.0));
+    put(&mut v, "B50001", Cell::formula("A1+1"));
+    let clip = copy(&mut v, "A1", "B50001");
+    assert!(clip.cells.len() as u64 * 2 > gridcore::edit::MAX_PASTE_CELLS);
+    select(&mut v, "D1", "D1");
+    assert_eq!(v.paste_grid_clip(&clip), Ok(GridPasted::Done));
+    assert_eq!(value(&v, "D1"), CellValue::Number(1.0));
+    assert_eq!(formula(&v, "E50001").as_deref(), Some("D1+1"));
+    assert_eq!((v.sel, v.anchor), (at("D1"), at("E50001")));
+}
+
+#[test]
 fn a_paste_of_more_than_the_cap_is_refused() {
     let mut v = issue_book();
     let clip = copy(&mut v, "B1", "B2");
@@ -489,11 +505,15 @@ fn an_edit_in_its_own_workbook_ends_copy_mode() {
     v.begin_cell_edit(Some("5".into()));
     assert_eq!(v.commit_and_move(1, 0), Some(true));
     assert!(clip.stale_in(&v));
-    // Another workbook's edits don't count.
+    // Another workbook's edits don't count: its edit_gen differs from the
+    // clip's, so only the workbook id tells them apart.
     let mut other = view();
     put(&mut other, "A1", Cell::number(1.0));
-    other.push_undo();
+    for _ in 0..3 {
+        other.push_undo();
+    }
     let fresh = copy(&mut v, "A1", "A3");
+    assert_ne!(other.edit_gen, fresh.view_gen);
     assert!(!fresh.stale_in(&other));
     assert!(!fresh.stale_in(&v));
 }
@@ -514,7 +534,10 @@ fn a_copy_pasted_into_its_own_workbook_stays_in_copy_mode() {
     // A paste into another workbook leaves the stamp alone.
     let mut other = view();
     let gen_before = clip.view_gen;
-    other.push_undo();
+    for _ in 0..3 {
+        other.push_undo();
+    }
+    assert_ne!(other.edit_gen, gen_before);
     clip.restamp(&other);
     assert_eq!(clip.view_gen, gen_before);
 }
@@ -536,9 +559,4 @@ fn a_copy_of_only_filtered_out_rows_is_nothing_to_copy() {
     assert!(v.grid_clip(false).is_none());
     // A cut of the same rows still moves them.
     assert!(v.grid_clip(true).is_some());
-    // An empty clip pastes nothing: no undo step, not landed.
-    let empty = GridClip::default();
-    select(&mut v, "D1", "D1");
-    assert_eq!(v.paste_grid_clip(&empty), Ok(GridPasted::Nothing));
-    assert!(v.undo.is_empty());
 }

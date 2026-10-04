@@ -334,3 +334,17 @@ test an edit after a sheet cut lets enter move
   assert cell M30 is nothing
   assert cell M20 is 1
   assert status is The cut was cancelled: the workbook changed since it was cut (nothing pasted)
+
+# #664 r2: a protected sheet refuses a paste as silently as it refuses
+# typing, so Enter in copy mode moves, and copy mode stays on.
+test enter in copy mode on a protected sheet moves
+  open copy:../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Review","command":"Protect Sheet"}
+  click A1
+  key ctrl+c
+  click P20
+  key enter
+  assert sel is P21
+  assert cell P20 is nothing
+  call clipboard {"action":"read"}
+  assert reply.app.kind is grid

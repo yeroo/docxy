@@ -1257,7 +1257,8 @@ fn fill_dest(src: (u32, u32, u32, u32), bx: (u32, u32, u32, u32)) -> (u32, u32, 
 }
 
 /// The grid clipboard: a rectangular block of cells copied from a sheet.
-#[derive(Clone, Default)]
+#[derive(Clone)]
+#[cfg_attr(test, derive(Default))]
 struct GridClip {
     cells: Vec<Vec<gridcore::sheet::Cell>>,
     /// The TSV this copy put on the clipboard. While the clipboard still holds
@@ -1326,8 +1327,6 @@ impl GridClip {
 enum GridPasted {
     /// A copy, or a cut moved.
     Done,
-    /// An empty clip: nothing was written.
-    Nothing,
     /// A cut pasted as a copy, its source kept; the status says why.
     KeptAsCopy(&'static str),
 }
@@ -2929,21 +2928,19 @@ impl SheetView {
     /// whole number of copies, each tile's formulas translated to its own
     /// corner and each row by the row it came from
     /// ([`gridcore::edit::tiled_block`]); a paste area of any other shape is
-    /// refused, as is one that would write more than
-    /// [`gridcore::edit::MAX_PASTE_CELLS`] cells.
+    /// refused, as is a tiling that would write more than
+    /// [`gridcore::edit::MAX_PASTE_CELLS`] cells (a copy pasted once is
+    /// written whatever its size, as before #664).
     fn paste_copy(&mut self, clip: &GridClip) -> Result<GridPasted, GridPasteError> {
         use gridcore::edit::{MAX_PASTE_CELLS, PASTE_SHAPE, paste_tiles, tiled_block};
         let h = clip.cells.len() as u32;
         let w = clip.cells.iter().map(Vec::len).max().unwrap_or(0) as u32;
-        if h == 0 || w == 0 {
-            return Ok(GridPasted::Nothing);
-        }
         let sel = self.range();
         let used = self.sheet().used_size();
         let tiles = paste_tiles((h, w), sel, used)
             .ok_or_else(|| GridPasteError::Refused(PASTE_SHAPE.to_string()))?;
         let cells = u64::from(h * tiles.0) * u64::from(w * tiles.1);
-        if cells > MAX_PASTE_CELLS {
+        if tiles != (1, 1) && cells > MAX_PASTE_CELLS {
             return Err(GridPasteError::Refused(format!(
                 "That paste would write {cells} cells, more than {MAX_PASTE_CELLS} (nothing pasted)"
             )));
@@ -12377,7 +12374,7 @@ impl Docxy {
             // keeps it, to paste somewhere else.
             let over = clip.cut && !matches!(res, Err(GridPasteError::Refused(_)));
             match res {
-                Ok(GridPasted::Done | GridPasted::Nothing) => {}
+                Ok(GridPasted::Done) => {}
                 Ok(GridPasted::KeptAsCopy(why)) => self.set_status(why),
                 Err(GridPasteError::Refused(why)) => self.set_status(why),
                 Err(GridPasteError::CutCancelled) => self.set_status(CUT_CANCELLED_STATUS),
@@ -12449,7 +12446,9 @@ impl Docxy {
     /// Enter on the grid, not editing, while copy mode is on: paste over the
     /// selection and end copy mode, as Excel does (#664). A refused paste
     /// keeps copy mode. False (Enter moves as usual) when there is no clip
-    /// to paste, an edit having ended copy mode included.
+    /// to paste, an edit having ended copy mode included, and on a
+    /// protected sheet, which refuses a paste as silently as it refuses
+    /// typing and Delete; copy mode then stays on.
     fn sheet_enter_paste(&mut self, cx: &mut Context<Self>) -> bool {
         // An edit since the copy ended copy mode: Enter moves (and says so
         // when that was a cut).
@@ -12457,7 +12456,7 @@ impl Docxy {
             self.set_status(CUT_CANCELLED_STATUS);
         }
         let now = self.clipboard_read(cx);
-        if self.grid_clip_live(&now).is_none() {
+        if self.sheet_protected() || self.grid_clip_live(&now).is_none() {
             return false;
         }
         if self.sheet_paste(cx) {
