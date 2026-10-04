@@ -6210,6 +6210,38 @@ impl App {
         self.data_form_follow();
     }
 
+    /// Close the data form because the workbook changed under it (an agent
+    /// edit, a sheet gone), with a Delete it was asking about.
+    fn close_data_form(&mut self) {
+        self.data_form = None;
+        if self
+            .confirm
+            .as_ref()
+            .is_some_and(|c| *c.action() == ConfirmAction::DataFormDelete)
+        {
+            self.confirm = None;
+        }
+        self.status = Some("Data Form closed: the workbook changed".into());
+    }
+
+    /// Whether the data form's sheet is still the one it opened on; when
+    /// not, the form is closed ([`Self::close_data_form`]).
+    fn data_form_sheet_ok(&mut self) -> bool {
+        let Some(d) = &self.data_form else {
+            return false;
+        };
+        let wb = &self.pkg.workbook;
+        if wb
+            .sheets
+            .get(d.sheet)
+            .is_some_and(|s| s.name == d.sheet_name)
+        {
+            return true;
+        }
+        self.close_data_form();
+        false
+    }
+
     /// The form shows `rec`, read afresh from the sheet.
     fn data_form_show(&mut self, rec: dataform::Rec) {
         let Some(mut d) = self.data_form.take() else {
@@ -6242,7 +6274,7 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let altgr = ctrl && alt && matches!(key.code, KeyCode::Char(_));
-        if (ctrl || alt) && !altgr {
+        if (ctrl || alt) && !altgr || !self.data_form_sheet_ok() {
             return;
         }
         let Some(d) = self.data_form.as_mut() else {
@@ -6438,6 +6470,9 @@ impl App {
     /// The form then shows the record that took its place (the one before,
     /// when it was the last) and closes when none is left.
     fn data_form_delete(&mut self) {
+        if !self.data_form_sheet_ok() {
+            return;
+        }
         let Some(d) = self.data_form.clone() else {
             return;
         };
@@ -9038,6 +9073,10 @@ fn run_control(
     let result = control::dispatch(app, verb, args);
     if app.status.is_none() && !app.circle_warning_pending {
         app.status = before;
+    }
+    // The data form's record, list and sheet may be gone under it.
+    if result.is_ok() && control::mutates(verb) && app.data_form.is_some() {
+        app.close_data_form();
     }
     app.flush_circle_warning();
     result
@@ -17839,6 +17878,80 @@ mod tests {
             (code.formula.as_deref(), &code.value),
             (None, &CellValue::Text("=A1".into()))
         );
+    }
+
+    /// [`data_form_app`]'s list on the second of two sheets, the form open.
+    fn data_form_on_second_sheet() -> App {
+        let mut app = data_form_app();
+        let si = app.pkg.add_sheet("Data");
+        let sheets = &mut app.pkg.workbook.sheets;
+        sheets[si].cells = std::mem::take(&mut sheets[0].cells);
+        app.sheet = si;
+        app.rebuild_engine();
+        app.ribbon_act(ribbon::Act::DataForm);
+        assert_eq!(
+            (form(&app).sheet, form(&app).sheet_name.as_str()),
+            (1, "Data")
+        );
+        app
+    }
+
+    #[test]
+    fn data_form_closes_when_an_agent_removes_its_sheet() {
+        use ctlcore::json::Json;
+        let mut app = data_form_on_second_sheet();
+        let args = Json::obj(vec![("sheet", Json::Num(1.0))]);
+        run_control(&mut app, "sheet.remove", &args).unwrap();
+        assert!(app.data_form.is_none());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Data Form closed: the workbook changed")
+        );
+        press(&mut app, KeyCode::Down);
+        // A read-only verb leaves the form open.
+        let mut app = data_form_on_second_sheet();
+        run_control(&mut app, "sheet.list", &Json::obj(vec![])).unwrap();
+        assert!(app.data_form.is_some());
+    }
+
+    #[test]
+    fn data_form_closes_when_its_sheet_is_gone() {
+        // However the sheet went, the next key closes the form, no panic.
+        let mut app = data_form_on_second_sheet();
+        assert!(app.pkg.remove_sheet(1));
+        app.sheet = 0;
+        form_key(&mut app, KeyCode::Down);
+        assert!(app.data_form.is_none());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Data Form closed: the workbook changed")
+        );
+        // Another sheet in its place (same index, other name) counts too.
+        // Yes to a Delete asked before it went deletes nothing.
+        let mut app = data_form_on_second_sheet();
+        form_button(&mut app, dataform::Button::Delete);
+        form_key(&mut app, KeyCode::Enter);
+        app.pkg.workbook.sheets[1].name = "Renamed".into();
+        assert!(!app.confirm_key(KeyEvent::from(KeyCode::Char('y'))));
+        assert!(app.data_form.is_none());
+        assert_eq!(value_at(&app, 1, 0), CellValue::Text("Ann".into()));
+    }
+
+    #[test]
+    fn data_form_closes_when_an_agent_inserts_a_row() {
+        use ctlcore::json::Json;
+        let mut app = data_form_app();
+        app.ribbon_act(ribbon::Act::DataForm);
+        form_keys(&mut app, &[KeyCode::Down, KeyCode::Down]);
+        assert_eq!(form_rec(&app), dataform::Rec::Row(3));
+        form_button(&mut app, dataform::Button::Delete);
+        form_key(&mut app, KeyCode::Enter);
+        assert!(app.confirm.is_some(), "Delete is asking");
+        let args = Json::obj(vec![("at", Json::Num(0.0))]);
+        run_control(&mut app, "row.insert", &args).unwrap();
+        assert!(app.data_form.is_none());
+        assert!(app.confirm.is_none(), "the pending Delete is gone");
+        assert_eq!(value_at(&app, 4, 0), CellValue::Text("Cara".into()));
     }
 
     #[test]

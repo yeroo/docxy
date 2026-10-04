@@ -101,6 +101,42 @@ const FIND_CAP: usize = 200;
 
 /// Route one control verb against the live workbook, returning the JSON result
 /// or an error message.
+/// Whether `verb` is an agent edit of the workbook: its cells, sheets,
+/// tables or layout.
+fn edits(verb: &str) -> bool {
+    matches!(
+        verb,
+        "cell.set"
+            | "range.clear"
+            | "comment.add"
+            | "range.set"
+            | "sheet.import-csv"
+            | "sheet.import-text"
+            | "range.text-to-columns"
+            | "wb.replace-all"
+            | "sheet.add"
+            | "sheet.remove"
+            | "sheet.rename"
+            | "table.rename"
+            | "table.resize"
+            | "table.convert"
+            | "pivot.create"
+            | "row.insert"
+            | "row.delete"
+            | "col.insert"
+            | "col.delete"
+            | "cell.format"
+            | "col.width"
+    )
+}
+
+/// Whether `verb` changes the workbook: an edit ([`edits`]), or another
+/// workbook opened or read back in its place. What a dialog over it shows
+/// may then be gone.
+pub fn mutates(verb: &str) -> bool {
+    edits(verb) || matches!(verb, "wb.open" | "wb.reload")
+}
+
 pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> {
     let out = match verb {
         "wb.path" => Ok(path_info(app)),
@@ -177,30 +213,7 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
     if out.is_ok() {
         // An agent edit flashes this pane's status dot, so a watcher sees the
         // workbook being worked on.
-        if matches!(
-            verb,
-            "cell.set"
-                | "range.clear"
-                | "comment.add"
-                | "range.set"
-                | "sheet.import-csv"
-                | "sheet.import-text"
-                | "range.text-to-columns"
-                | "wb.replace-all"
-                | "sheet.add"
-                | "sheet.remove"
-                | "sheet.rename"
-                | "table.rename"
-                | "table.resize"
-                | "table.convert"
-                | "pivot.create"
-                | "row.insert"
-                | "row.delete"
-                | "col.insert"
-                | "col.delete"
-                | "cell.format"
-                | "col.width"
-        ) {
+        if edits(verb) {
             ctlcore::signal_activity();
         }
         // `comment.remove` can legitimately no-op (nothing on the cell), so it
