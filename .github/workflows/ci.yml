@@ -129,11 +129,13 @@ jobs:
       - name: System packages gpui needs on Linux
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends             pkg-config clang cmake             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev             libx11-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev             libwayland-dev libvulkan-dev mesa-vulkan-drivers             libfontconfig-dev libfreetype-dev libasound2-dev libssl-dev libzstd-dev             xvfb
+          sudo apt-get install -y --no-install-recommends             pkg-config clang cmake             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev             libx11-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev             libwayland-dev libvulkan-dev mesa-vulkan-drivers             libfontconfig-dev libfreetype-dev libasound2-dev libssl-dev libzstd-dev             xvfb openbox x11-utils
       - name: Clippy
         run: cargo clippy --manifest-path suite/Cargo.toml --all-targets --locked -- -D warnings
       - name: Test
         run: xvfb-run -a cargo test --manifest-path suite/Cargo.toml --locked
+      - name: Linux window capture
+        run: python3 scripts/ui-linux.py -- cargo test -p uiharness --locked --test linux_capture -- --ignored
 
   suite-macos:
     name: desktop suite (macos)

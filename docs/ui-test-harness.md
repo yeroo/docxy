@@ -38,8 +38,8 @@ cargo run -p uiharness -- run uiharness/cases/sheet-selection.uit
 
 That one command starts a sandboxed instance, runs every case in the file
 against it, files a PNG per `shot`, and stops it again. It exits non-zero if any
-case failed. It needs a **desktop session** — `PrintWindow` has nothing to draw
-into without one — so this is a local, on-demand tool, not a CI step.
+case failed. Windows needs a desktop session for `PrintWindow`. Linux can run
+on a private virtual display, including on CI; see [Capture on Linux](#capture-on-linux).
 
 Output is a line per step, passing or not, because a transcript that mentions
 only the failure leaves you guessing whether the setup even worked:
@@ -1247,10 +1247,62 @@ when an assertion fails in a way that makes no sense.
 There is no image crate in the dependency list either: `uiharness` writes real
 PNGs through its own DEFLATE (`deflate.rs`, `png.rs`, round-tripped in tests
 against `opccore`'s inflater). Its only dependencies are `ctlcore` and `opccore`
-from this repo, `windows` for the Win32 capture, and `gridcore` as a
+from this repo, `windows` for Win32 capture, `x11rb` for Linux capture, and `gridcore` as a
 dev-dependency solely to generate and check the fixture workbook — the binary
 itself has no spreadsheet engine in it and wants none, since it reads pixels and
 JSON.
+
+### Capture on Linux
+
+The normal Linux build supports screenshots and pixel assertions through X11
+`GetImage`. The harness finds the largest mapped client with its suite PID in
+the window manager's `_NET_CLIENT_LIST`, reads the client pixels, and translates
+the client origin to physical desktop coordinates for cropping. It reports
+`via X11 GetImage`. No `harness-capture` build is needed.
+
+Run on an isolated Xvfb display with Openbox so the suite cannot steal your
+focus and other apps cannot cover its pixels:
+
+```sh
+sudo apt install xvfb openbox x11-utils
+cargo build --release --manifest-path suite/Cargo.toml
+scripts/ui-linux.py -- cargo run -p uiharness -- run uiharness/cases/sheet-selection.uit
+# Exercise capture itself (PID, colors, movement, resize, repaint and occlusion):
+scripts/ui-linux.py -- cargo test -p uiharness --test linux_capture -- --ignored
+```
+
+Run each committed script in a fresh suite instance: several assume the
+initial tab count or default view settings. Passing all files to one `run`
+shares an instance and carries those settings into the next file.
+
+```sh
+scripts/ui-linux.py -- sh -c '
+  status=0
+  for script in uiharness/cases/*.uit; do
+    cargo run -p uiharness -- run "$script" \
+      --run "$PWD/uiharness-runs/$(basename "$script" .uit)" || status=1
+  done
+  exit "$status"
+'
+```
+
+The wrapper waits for both the X server and window manager, removes
+`WAYLAND_DISPLAY` from the child environment, and stops its command group,
+Openbox and Xvfb on exit. The real desktop and config are untouched; the
+harness still creates its own config sandbox. The wrapper prints its server
+log directory. `--screen`, `--xvfb`, `--wm` and `--logs` override its defaults.
+Tools are found on `PATH`, then in `~/.local/bin` for per-user installations.
+The virtual display lasts only as long as the wrapped command, so `--keep`
+does not keep a suite alive after the wrapper exits. To attach interactively,
+wrap a shell and run the harness and attach commands inside that shell.
+
+X11 does not guarantee obscured pixels. The backend refuses an off-screen
+client or any overlapping, mapped root sibling above its window-manager frame;
+it also refuses blank images and geometry that changes during capture. This
+conservatively rejects transparent overlays too. Existing frame waits and
+region stability checks still run around captures. TrueColor 16/24/32-bit
+pixels are decoded with the server's byte order, row padding and RGB masks;
+the returned RGBA alpha is opaque. Native Wayland capture remains unsupported.
 
 ### Capture on macOS
 
@@ -1400,10 +1452,8 @@ stale pixels is exactly the failure a pixel assertion cannot notice by itself.
   tab strip, not a `Project1 - <app>` title, and Backstage's Open lists the
   open tabs, not a recent-files list, so neither is there to report.
 
-- **Capture on Linux.** `shot`, `window` and every pixel assertion work on
-  Windows through `PrintWindow` and on macOS through the app's own offscreen
-  render, which needs the `harness-capture` build. Linux has neither yet.
-- **CI.** It needs a desktop session for `PrintWindow`.
+- **Native Wayland capture.** Linux pixel tests use X11 on a private virtual
+  display. They do not exercise the Wayland backend or desktop portal dialogs.
 - **Mail editing and advanced document UI.** Document text, selection, ribbon,
   status and File rail are covered, and dialogs have the `dialog-*` verbs.
   Menus, pane contents and pointer gestures in document text still need

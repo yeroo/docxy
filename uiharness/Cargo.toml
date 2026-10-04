@@ -1,6 +1,6 @@
 [package]
 name = "uiharness"
-description = "The driver side of the suite's UI test harness: talks to a --harness instance over ctlcore, captures its window with PrintWindow, and crops the result to the regions the app reports."
+description = "The suite's UI test driver: control verbs, window capture and pixel assertions."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -19,6 +19,10 @@ ctlcore = { path = "../ctlcore" }
 # or compression crate: the encoder here is ~200 lines of RFC 1951 and RFC 2083,
 # and it is round-tripped in tests against opccore's own inflater.
 opccore = { path = "../opccore" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Read the actual X11 client window; no gpui test-support/offscreen build.
+x11rb = "0.13"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [

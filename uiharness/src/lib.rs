@@ -15,9 +15,9 @@
 //!   starts, where `A1` is at this scroll position, or how big a chart card
 //!   became. It answers the `rect` verb in physical desktop pixels.
 //! - **The harness supplies the pixels.** gpui has no window readback in a
-//!   shipping build, so [`capture`] uses Win32 `PrintWindow` against the test
-//!   window's HWND — which captures that window alone even when it is partly
-//!   occluded, so a test does not have to own the desktop.
+//!   shipping build, so [`capture`] uses Win32 `PrintWindow` or Linux X11
+//!   `GetImage` against the test window. Linux runs on a private Xvfb display
+//!   with a window manager; `scripts/ui-linux.py` manages that lifetime.
 //!
 //! Neither side has to guess at the other's layout.
 //!
@@ -25,7 +25,7 @@
 //!
 //! - [`image`] — an RGBA buffer, and the arithmetic of cropping one.
 //! - [`deflate`] / [`png`] — writing a real PNG with no image crate.
-//! - [`capture`] — HWND from PID, and the window capture itself.
+//! - [`capture`] — window from PID, and the window capture itself.
 //! - [`driver`] — the control client, `rect`, and `shot`.
 //! - [`probe`] — reading a captured region: solid, dashed or absent, and in
 //!   what colour.
