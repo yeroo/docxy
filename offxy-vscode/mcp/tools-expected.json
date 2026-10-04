@@ -629,6 +629,84 @@
     }
   },
   {
+    "name": "docxy_page_color",
+    "description": "Set or remove the document's page colour (Design > Page Background > Page Color): the colour Print Layout tints each page sheet with. A package edit with no undo step. Refuses on a Markdown document.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "color": {
+          "type": "string",
+          "description": "\"#RRGGBB\" to set the page colour, or \"none\" to remove it."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "color"
+      ]
+    }
+  },
+  {
+    "name": "docxy_watermark",
+    "description": "Write or remove the text watermark shown behind the pages (Design > Page Background > Watermark). The new header references are one undo step. Refuses on a Markdown document.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "description": "Watermark text (non-empty after trimming)."
+        },
+        "layout": {
+          "type": "string",
+          "description": "\"diagonal\" (default) or \"horizontal\"."
+        },
+        "font": {
+          "type": "string",
+          "description": "Font name (default \"Calibri\")."
+        },
+        "color": {
+          "type": "string",
+          "description": "\"#RRGGBB\" text colour (default \"#C0C0C0\")."
+        },
+        "remove": {
+          "type": "boolean",
+          "description": "Remove the watermark (instead of setting 'text')."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "docxy_page_borders",
+    "description": "Write or remove page borders on every section (Design > Page Background > Page Borders) as one undo step. Refuses on a Markdown document.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "border": {
+          "type": "string",
+          "description": "\"none\", \"box\" or \"shadow\"."
+        },
+        "color": {
+          "type": "string",
+          "description": "Optional \"#RRGGBB\" border colour."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "border"
+      ]
+    }
+  },
+  {
     "name": "xlsxy_list",
     "description": "List the xlsxy editors currently running on this machine (instance/pane id, port, pid).",
     "inputSchema": {

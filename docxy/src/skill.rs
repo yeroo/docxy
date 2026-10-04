@@ -34,6 +34,9 @@ use its tools:
 - `docxy_append` `{text}`
 - `docxy_save`
 - `docxy_compare` `{original, revised}` — open a tracked-changes comparison of two .docx files
+- `docxy_page_color` `{color}` — set/remove the page colour (`#RRGGBB` or `none`)
+- `docxy_watermark` `{text?, layout?, font?, color?, remove?}` — set/remove the text watermark
+- `docxy_page_borders` `{border, color?}` — set/remove page borders (`"none"`, `"box"`, `"shadow"`)
 
 When several docxy editors are open, pass `target` (a substring of the pane id;
 `docxy_list` shows them). Typical flow: `docxy_outline` or `docxy_read` to see the
@@ -53,7 +56,8 @@ where instance is `docxy-<AGWINTERM_SESSION_ID>` — the pane id shown by
 ```
 
 Verbs: `doc.path`, `doc.outline`, `doc.read`, `doc.find`, `doc.replace-range`,
-`doc.insert`, `doc.append`, `doc.save`, `doc.reload`, `doc.open`, `doc.compare`.
+`doc.insert`, `doc.append`, `doc.save`, `doc.reload`, `doc.open`, `doc.compare`,
+`doc.page-color`, `doc.watermark`, `doc.page-borders`.
 
 ## Two panes in one agwinterm session
 `agwintermctl split on`, then launch `docxy <file>` in the new pane (or press

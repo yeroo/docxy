@@ -633,6 +633,46 @@ function docxyToolDefs() {
       ]),
       ['original', 'revised'],
     ),
+    tool(
+      'docxy_page_color',
+      "Set or remove the document's page colour (Design > Page Background > Page Color): " +
+        'the colour Print Layout tints each page sheet with. A package edit with no undo ' +
+        'step. Refuses on a Markdown document.',
+      Object.fromEntries([
+        [
+          'color',
+          prop('string', '"#RRGGBB" to set the page colour, or "none" to remove it.'),
+        ],
+        target(),
+      ]),
+      ['color'],
+    ),
+    tool(
+      'docxy_watermark',
+      'Write or remove the text watermark shown behind the pages (Design > Page ' +
+        'Background > Watermark). The new header references are one undo step. Refuses on a ' +
+        'Markdown document.',
+      Object.fromEntries([
+        ['text', prop('string', 'Watermark text (non-empty after trimming).')],
+        ['layout', prop('string', '"diagonal" (default) or "horizontal".')],
+        ['font', prop('string', 'Font name (default "Calibri").')],
+        ['color', prop('string', '"#RRGGBB" text colour (default "#C0C0C0").')],
+        ['remove', prop('boolean', 'Remove the watermark (instead of setting \'text\').')],
+        target(),
+      ]),
+      [],
+    ),
+    tool(
+      'docxy_page_borders',
+      'Write or remove page borders on every section (Design > Page Background > Page ' +
+        'Borders) as one undo step. Refuses on a Markdown document.',
+      Object.fromEntries([
+        ['border', prop('string', '"none", "box" or "shadow".')],
+        ['color', prop('string', 'Optional "#RRGGBB" border colour.')],
+        target(),
+      ]),
+      ['border'],
+    ),
   ];
 }
 
@@ -1232,6 +1272,9 @@ const DOCXY_VERBS = {
   docxy_revisions_accept_all: 'doc.revisions-accept-all',
   docxy_revisions_reject_all: 'doc.revisions-reject-all',
   docxy_compare: 'doc.compare',
+  docxy_page_color: 'doc.page-color',
+  docxy_watermark: 'doc.watermark',
+  docxy_page_borders: 'doc.page-borders',
 };
 
 const XLSXY_VERBS = {
