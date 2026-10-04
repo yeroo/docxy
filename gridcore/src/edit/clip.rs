@@ -57,17 +57,17 @@ pub fn paste_tiles(
 }
 
 /// The copied `cells` written at `at`, each formula translated from where it
-/// was copied to where it lands: row `i` came from sheet row `src_rows[i]`
-/// (a filtered copy skips rows, so each row has its own offset) and every
-/// row from column `src_col`. A formula that lands where it came from, or
-/// that doesn't parse, keeps its text as it was.
-fn translated_block(
+/// was copied to where it lands: cell `(i, j)` came from sheet row
+/// `src_rows[i]` and column `src_cols[j]` (a filtered copy skips rows and a
+/// multi-area copy skips rows or columns, so each has its own offset). A
+/// formula that lands where it came from, or that doesn't parse, keeps its
+/// text as it was.
+pub fn translated_block(
     cells: &[Vec<Cell>],
     src_rows: &[u32],
-    src_col: u32,
+    src_cols: &[u32],
     at: (u32, u32),
 ) -> Vec<Vec<Cell>> {
-    let dc = at.1 as i64 - src_col as i64;
     cells
         .iter()
         .zip(src_rows)
@@ -75,7 +75,10 @@ fn translated_block(
         .map(|(i, (row, &src_row))| {
             let dr = at.0 as i64 + i as i64 - src_row as i64;
             row.iter()
-                .map(|cell| {
+                .zip(src_cols)
+                .enumerate()
+                .map(|(j, (cell, &src_col))| {
+                    let dc = at.1 as i64 + j as i64 - src_col as i64;
                     let mut cell = cell.clone();
                     if (dr, dc) != (0, 0) {
                         if let Some(t) = cell
@@ -99,7 +102,7 @@ fn translated_block(
 pub fn tiled_block(
     cells: &[Vec<Cell>],
     src_rows: &[u32],
-    src_col: u32,
+    src_cols: &[u32],
     at: (u32, u32),
     tiles: (u32, u32),
 ) -> Vec<Vec<Cell>> {
@@ -119,7 +122,7 @@ pub fn tiled_block(
             if c >= MAX_COLS as u64 {
                 break;
             }
-            let tile = translated_block(cells, src_rows, src_col, (r as u32, c as u32));
+            let tile = translated_block(cells, src_rows, src_cols, (r as u32, c as u32));
             for (row, tile_row) in band.iter_mut().zip(tile) {
                 // A short row is padded, so the next tile lands in its column.
                 let mut tile_row = tile_row;

@@ -2958,7 +2958,8 @@ impl SheetView {
             )));
         }
         let at = (sel.0, sel.1);
-        let block = tiled_block(&clip.cells, &clip.rows, clip.rect.1, at, tiles);
+        let cols: Vec<u32> = (clip.rect.1..=clip.rect.3).collect();
+        let block = tiled_block(&clip.cells, &clip.rows, &cols, at, tiles);
         self.write_block(at, &block).map(|()| GridPasted::Done)
     }
 

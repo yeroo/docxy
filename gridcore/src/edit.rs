@@ -14,12 +14,20 @@ use std::collections::BTreeMap;
 
 mod clip;
 pub(crate) mod series;
-pub use clip::{MAX_PASTE_CELLS, PASTE_SHAPE, move_refs, paste_tiles, tiled_block};
+pub use clip::{
+    MAX_PASTE_CELLS, PASTE_SHAPE, move_refs, paste_tiles, tiled_block, translated_block,
+};
 pub use series::{
     FillDir, FillKind, FillTarget, JUSTIFY_OVERFLOW, SeriesSpec, SeriesType, builtin_lists,
     fill_target, justify_lines, series_rows_for,
 };
 mod consolidate;
+mod paste_special;
+pub use paste_special::{
+    ClipBlock, ClipNote, ClipRule, MULTI_SELECTION, PasteExtras, PasteOp, PasteSpec, PasteWhat,
+    Pasted, cells_to_rects, clear_validation, multi_area_shape, paste_link_changes, paste_special,
+    paste_special_changes, paste_special_extras,
+};
 mod subtotal;
 pub(crate) use consolidate::split_ref_text;
 pub use consolidate::{
