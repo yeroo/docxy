@@ -1799,7 +1799,7 @@ const UNEVALUATED_BUILTINS: &[&str] = &[
 /// computes from the resolver alone (`NoCells` answers nothing: no cells,
 /// clock, random source or names), so the probe panics on none and touches
 /// nothing outside it (`builtin_probe_is_safe_for_every_name`).
-fn is_builtin(name: &str) -> bool {
+pub(crate) fn is_builtin(name: &str) -> bool {
     if future_prefix(name).is_some()
         || UNEVALUATED_BUILTINS
             .iter()

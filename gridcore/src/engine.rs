@@ -2371,9 +2371,9 @@ fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth:
 /// ranges, whole rows/columns, structured references, bare table names and
 /// defined names that are one of those go; a spill reference (its extent
 /// follows the anchor), a computed definition (OFFSET, INDEX…) and any
-/// computed argument keep their dependencies. Inside a LET or LAMBDA that
-/// binds one of the four names nothing is pruned: `row(B1)` there may call
-/// the bound lambda, which reads B1.
+/// computed argument keep their dependencies. Where a LET or LAMBDA binds
+/// one of the four names to what may be a lambda, a call of that name keeps
+/// its arguments: `row(B1)` there may call the lambda, which reads B1.
 fn without_position_refs(wb: &Workbook, sheet: usize, ast: &Expr) -> Option<Expr> {
     fn is_position_fn(name: &str) -> bool {
         ["ROW", "COLUMN", "ROWS", "COLUMNS"]
@@ -2411,45 +2411,109 @@ fn without_position_refs(wb: &Workbook, sheet: usize, ast: &Expr) -> Option<Expr
             _ => false,
         }
     }
-    // LET variables and LAMBDA parameters a call binds.
-    fn binds_position_name(name: &str, args: &[Expr]) -> bool {
-        let last = args.len().saturating_sub(1);
-        let let_fn = name.eq_ignore_ascii_case("LET");
-        if !let_fn && !name.eq_ignore_ascii_case("LAMBDA") {
-            return false;
+    // May a LET value be a lambda, so that a ROW/COLUMN/ROWS/COLUMNS bound
+    // to it calls the lambda instead of the builtin? Only a value that
+    // can't be one is ruled out: literals, references, array constants,
+    // operators, and builtins other than LAMBDA, LET and the ones that pass
+    // an argument through (IF, IFS, SWITCH, CHOOSE, IFERROR, IFNA). A name,
+    // a call of an expression, and a custom function may be a lambda.
+    fn may_be_lambda(v: &Expr) -> bool {
+        const PASS_THROUGH: [&str; 8] = [
+            "LAMBDA", "LET", "IF", "IFS", "SWITCH", "CHOOSE", "IFERROR", "IFNA",
+        ];
+        match v {
+            Expr::Name(_) | Expr::Call(..) => true,
+            Expr::Func(name, _) => {
+                PASS_THROUGH.iter().any(|f| f.eq_ignore_ascii_case(name))
+                    || !formula::is_builtin(name)
+            }
+            _ => false,
         }
-        args.iter().enumerate().any(|(i, a)| {
-            let bound = match a {
-                Expr::Name(n) if i < last && (!let_fn || i % 2 == 0) => n,
-                Expr::Structured {
-                    table: None,
-                    col1: Some(n),
-                    ..
-                } if i < last && !let_fn => n,
-                _ => return false,
-            };
-            is_position_fn(formula::bare_param(bound))
-        })
     }
-    fn prune(wb: &Workbook, sheet: usize, e: &Expr) -> Expr {
-        formula::map_expr(e, &|x| match x {
-            Expr::Func(name, args) if binds_position_name(name, args) => Some(x.clone()),
-            Expr::Func(name, args) if is_position_fn(name) => Some(Expr::Func(
-                name.clone(),
-                args.iter()
+    // `shadow` holds the position-function names bound, at this point of
+    // the walk, to something that may be a lambda: a LET variable from the
+    // slot after its value, a LAMBDA parameter (any) within its body. Calls
+    // of a shadowed name keep their arguments.
+    fn prune(wb: &Workbook, sheet: usize, e: &Expr, shadow: &mut Vec<String>) -> Expr {
+        let each = |args: &[Expr], shadow: &mut Vec<String>| -> Vec<Expr> {
+            args.iter().map(|a| prune(wb, sheet, a, shadow)).collect()
+        };
+        match e {
+            Expr::Func(name, args) if name.eq_ignore_ascii_case("LET") => {
+                let (mark, last) = (shadow.len(), args.len().saturating_sub(1));
+                let mut pending = None;
+                let mut out = Vec::with_capacity(args.len());
+                for (i, a) in args.iter().enumerate() {
+                    match a {
+                        Expr::Name(n) if i < last && i % 2 == 0 => {
+                            pending = Some(formula::bare_param(n).to_string());
+                            out.push(a.clone());
+                        }
+                        _ => {
+                            out.push(prune(wb, sheet, a, shadow));
+                            if let Some(n) = pending.take() {
+                                if is_position_fn(&n) && may_be_lambda(a) {
+                                    shadow.push(n);
+                                }
+                            }
+                        }
+                    }
+                }
+                shadow.truncate(mark);
+                Expr::Func(name.clone(), out)
+            }
+            Expr::Func(name, args) if name.eq_ignore_ascii_case("LAMBDA") => {
+                let (mark, last) = (shadow.len(), args.len().saturating_sub(1));
+                for p in &args[..last] {
+                    if let Expr::Name(n)
+                    | Expr::Structured {
+                        table: None,
+                        col1: Some(n),
+                        ..
+                    } = p
+                    {
+                        let n = formula::bare_param(n);
+                        if is_position_fn(n) {
+                            shadow.push(n.to_string());
+                        }
+                    }
+                }
+                let out = each(args, shadow);
+                shadow.truncate(mark);
+                Expr::Func(name.clone(), out)
+            }
+            Expr::Func(name, args)
+                if is_position_fn(name) && !shadow.iter().any(|s| s.eq_ignore_ascii_case(name)) =>
+            {
+                let out = args
+                    .iter()
                     .map(|a| {
                         if position_only(wb, sheet, a, 0) {
                             Expr::Missing
                         } else {
-                            prune(wb, sheet, a)
+                            prune(wb, sheet, a, shadow)
                         }
                     })
-                    .collect(),
-            )),
-            _ => None,
-        })
+                    .collect();
+                Expr::Func(name.clone(), out)
+            }
+            Expr::Func(name, args) => Expr::Func(name.clone(), each(args, shadow)),
+            Expr::Call(callee, args) => {
+                let callee = prune(wb, sheet, callee, shadow);
+                Expr::Call(Box::new(callee), each(args, shadow))
+            }
+            Expr::ArrayLit(rows) => {
+                Expr::ArrayLit(rows.iter().map(|row| each(row, shadow)).collect())
+            }
+            Expr::Un(op, x) => Expr::Un(*op, Box::new(prune(wb, sheet, x, shadow))),
+            Expr::Bin(op, l, r) => {
+                let l = prune(wb, sheet, l, shadow);
+                Expr::Bin(*op, Box::new(l), Box::new(prune(wb, sheet, r, shadow)))
+            }
+            other => other.clone(),
+        }
     }
-    has_position_fn(ast).then(|| prune(wb, sheet, ast))
+    has_position_fn(ast).then(|| prune(wb, sheet, ast, &mut Vec::new()))
 }
 
 /// (always recalculate, calls a D-function) for a formula, looking through
@@ -5112,6 +5176,31 @@ mod tests {
         set(&mut eng, &mut wb, "B1", Cell::number(10.0));
         assert_eq!(value_at(&wb, "C1"), CellValue::Number(20.0));
         assert_eq!(value_at(&wb, "C2"), CellValue::Number(11.0));
+    }
+
+    #[test]
+    fn let_variables_named_like_position_functions_keep_pruning() {
+        // #679 FIX r3 M1: a LET variable `rows`/`row` holding a number is no
+        // lambda, so ROWS/ROW in its scope are still the builtins and measure
+        // the table without reading it. A lambda bound to the name shadows
+        // the builtin only inside the LET's scope, not in its own value.
+        for (calc, d2, d3) in [
+            ("LET(rows,ROWS(Sales),[@Qty]/rows)", 1.5, 2.0),
+            ("LET(row,ROW()-ROW(Sales)+1,row)", 1.0, 2.0),
+            (
+                "LET(columns,4,rows,ROWS(Sales),columns*rows+COLUMNS(Sales))",
+                12.0,
+                12.0,
+            ),
+            ("LET(row,LAMBDA(x,x*ROWS(Sales)),row(2))", 4.0, 4.0),
+        ] {
+            let mut wb = calc_column_wb("Sales", calc);
+            let mut eng = Engine::new(&wb);
+            eng.recalc_all(&mut wb);
+            assert_eq!(eng.circular_refs(), Vec::<Key>::new(), "{calc}");
+            assert_eq!(value_at(&wb, "D2"), CellValue::Number(d2), "{calc}");
+            assert_eq!(value_at(&wb, "D3"), CellValue::Number(d3), "{calc}");
+        }
     }
 
     #[test]
