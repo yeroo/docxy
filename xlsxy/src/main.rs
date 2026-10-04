@@ -2369,7 +2369,7 @@ impl App {
             .collect();
         // Decided once above, for every group: written without deciding
         // again against what the earlier groups recalculated.
-        self.record_groups(keys, |app| {
+        self.record_groups(keys, None, |app| {
             for (sheet_idx, changes) in groups {
                 app.engine
                     .set_cells_prechecked(&mut app.pkg.workbook, sheet_idx, changes);
@@ -2383,9 +2383,14 @@ impl App {
     /// its after once the last is done, so each group is one snapshot of its
     /// cells, as [`Engine::restore_cells`] needs: taken cell by cell, a spill
     /// anchor's after could still claim a cell a later write blocked it with.
+    ///
+    /// `cut_from` is a cut's source (sheet, rect) when `write` pastes one: a
+    /// table lying wholly inside it was cut whole, so clearing its headers
+    /// renames none of its columns.
     fn record_groups(
         &mut self,
         keys: Vec<(usize, Vec<(u32, u32)>)>,
+        cut_from: Option<(usize, (u32, u32, u32, u32))>,
         write: impl FnOnce(&mut Self),
     ) {
         let keys: Vec<_> = keys.into_iter().filter(|(_, k)| !k.is_empty()).collect();
@@ -2423,8 +2428,22 @@ impl App {
         let mut renamed = false;
         if headers {
             written = Some(snapshot(self));
+            let inside = |a: (u32, u32, u32, u32), b: (u32, u32, u32, u32)| {
+                b.0 <= a.0 && a.2 <= b.2 && b.1 <= a.1 && a.3 <= b.3
+            };
+            let cut_whole: Vec<(usize, (u32, u32, u32, u32))> = (self.pkg.workbook.tables.iter())
+                .filter(|t| cut_from.is_some_and(|(s, rect)| t.sheet == s && inside(t.range, rect)))
+                .map(|t| (t.sheet, t.range))
+                .collect();
             for (s, cells) in &keys {
-                renamed |= gridcore::edit::sync_table_headers(&mut self.pkg.workbook, *s, cells);
+                let cells: Vec<(u32, u32)> = (cells.iter().copied())
+                    .filter(|&(r, c)| {
+                        !cut_whole
+                            .iter()
+                            .any(|&(ts, rect)| ts == *s && inside((r, c, r, c), rect))
+                    })
+                    .collect();
+                renamed |= gridcore::edit::sync_table_headers(&mut self.pkg.workbook, *s, &cells);
             }
         }
         if let (true, Some(before)) = (renamed, wb_before) {
@@ -3430,7 +3449,15 @@ impl App {
                 } else {
                     vec![(src, clear_keys), (here, writes)]
                 };
-                self.record_groups(keys, |app| {
+                // The cut's source block, whose whole tables move rather than
+                // lose their headers.
+                let cut_from = cut.then(|| {
+                    let (fr, fc) = clip.from;
+                    let h = clip.cells.len().max(1) as u32;
+                    let w = clip.cells.iter().map(Vec::len).max().unwrap_or(1).max(1) as u32;
+                    (src, (fr, fc, fr + h - 1, fc + w - 1))
+                });
+                self.record_groups(keys, cut_from, |app| {
                     let (clears, late) = if same_sheet {
                         app.engine
                             .split_frozen_blanks(&app.pkg.workbook, src, clears)
@@ -13789,6 +13816,26 @@ mod tests {
         assert_eq!(app.pkg.workbook.tables[0].columns, ["Name", "City"]);
         let f10 = app.pkg.workbook.sheets[0].cell(9, 5).unwrap();
         assert_eq!(f10.formula.as_deref(), Some("COUNTA(Table1[City])"));
+    }
+
+    #[test]
+    fn cutting_a_whole_table_renames_nothing_683() {
+        let mut app = header_app();
+        clip_range(&mut app, (0, 0), (2, 1), true);
+        app.cur = (9, 5);
+        app.paste();
+        assert_eq!(header_state(&app).1, ["Item", "Qty"]);
+        assert_eq!(header_state(&app).2, "SUM(Sales[Qty])");
+        let f10 = app.pkg.workbook.sheets[0]
+            .cell(9, 5)
+            .map(|c| c.value.clone());
+        assert_eq!(f10, Some(CellValue::Text("Item".into())));
+        // Cutting a header alone still clears it to `Column<n>`.
+        let mut app = header_app();
+        clip_range(&mut app, (0, 1), (0, 1), true);
+        app.cur = (9, 5);
+        app.paste();
+        assert_eq!(header_state(&app).1, ["Item", "Column2"]);
     }
 
     #[test]
