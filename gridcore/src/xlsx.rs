@@ -5848,10 +5848,10 @@ fn rewrite_column_formulas(
 /// renamed column keeps its element and a new column named like a dropped
 /// one gets a new element; without, by name. The autoFilter's
 /// `filterColumn`s follow their columns (`colId` is a column index) or go
-/// with them.
-fn sync_table_columns(xml: &str, columns: &[String], ids: &[u32]) -> String {
+/// with them. Also returns the ids of the elements dropped.
+fn sync_table_columns(xml: &str, columns: &[String], ids: &[u32]) -> (String, Vec<u32>) {
     let Some(&span) = table_children(xml, "tableColumns").first() else {
-        return xml.to_string();
+        return (xml.to_string(), Vec::new());
     };
     let elements: Vec<(String, u32, &str)> = child_spans(xml, span, "tableColumn")
         .into_iter()
@@ -5893,8 +5893,12 @@ fn sync_table_columns(xml: &str, columns: &[String], ids: &[u32]) -> String {
             .enumerate()
             .all(|(j, &i)| i == Some(j) && elements[j].0 == columns[j]);
     if unchanged {
-        return xml.to_string();
+        return (xml.to_string(), Vec::new());
     }
+    let dropped: Vec<u32> = (elements.iter().zip(&used))
+        .filter(|&(e, &kept)| !kept && e.1 != 0)
+        .map(|(e, _)| e.1)
+        .collect();
     let open = &xml[span.0..tag_end(xml, span.0)];
     let qname = open[1..]
         .split(|c: char| c.is_whitespace() || c == '/' || c == '>')
@@ -5943,7 +5947,7 @@ fn sync_table_columns(xml: &str, columns: &[String], ids: &[u32]) -> String {
             }
         }
     }
-    apply_edits(xml.to_string(), edits)
+    (apply_edits(xml.to_string(), edits), dropped)
 }
 
 /// `xml` without any `<sortState>` (the table's own or its autoFilter's):
@@ -6109,13 +6113,8 @@ fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
                 }
             }
         }
-        let ids_before = table_column_ids(&updated);
-        updated = sync_table_columns(&updated, &t.columns, &t.column_ids);
-        let ids_after = table_column_ids(&updated);
-        let dropped: Vec<u32> = ids_before
-            .into_iter()
-            .filter(|id| !ids_after.contains(id))
-            .collect();
+        let dropped;
+        (updated, dropped) = sync_table_columns(&updated, &t.columns, &t.column_ids);
         if !dropped.is_empty() {
             dropped_columns.push((t.part.clone(), dropped));
         }
@@ -6137,21 +6136,6 @@ fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
     for c in &converted {
         drop_table_part(parts, &c.part);
     }
-}
-
-/// The `tableColumn id`s a table part holds, in order (0 for one without).
-fn table_column_ids(xml: &str) -> Vec<u32> {
-    let Some(&span) = table_children(xml, "tableColumns").first() else {
-        return Vec::new();
-    };
-    child_spans(xml, span, "tableColumn")
-        .into_iter()
-        .map(|(s, _)| {
-            tag_attr(&xml[s..tag_end(xml, s)], "id")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0)
-        })
-        .collect()
 }
 
 /// Table `part` lost the columns whose ids are `dropped`: the query table
