@@ -351,7 +351,7 @@ pub(crate) fn item(text: String, focused: bool) -> Line<'static> {
     Line::from(Span::styled(text, style))
 }
 
-pub(crate) fn heading(text: &'static str) -> Line<'static> {
+pub(crate) fn heading(text: impl Into<std::borrow::Cow<'static, str>>) -> Line<'static> {
     Line::from(Span::styled(
         text,
         Style::new().add_modifier(Modifier::BOLD),

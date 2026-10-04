@@ -14,8 +14,6 @@ use gridcore::sheet::{Sheet, Styles, format_with};
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
 
 /// The record a form shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,9 +140,17 @@ impl DataForm {
     }
 
     /// Show `rec`, read from sheet `s`: every field's text as the sheet holds
-    /// it, no changes pending. Focus stays on the same field (moved off a
-    /// field that became read-only).
+    /// it, no changes pending. Focus stays on the same field or button (the
+    /// nearest editable field when its field is computed in this record); a
+    /// new record focuses its first editable field.
     pub fn show(&mut self, s: &Sheet, styles: &Styles, date1904: bool, rec: Rec) {
+        // What has the focus, not where: the fields Tab visits differ
+        // between records and between the criteria and the form.
+        let prev = if rec == Rec::New {
+            Item::Field(0)
+        } else {
+            self.focused()
+        };
         self.rec = rec;
         self.mode = Mode::Form;
         let last = self.area.2;
@@ -167,19 +173,14 @@ impl DataForm {
             f.orig = text;
             f.formula = formula;
         }
-        // A new record is for typing: its first field takes the focus.
-        if rec == Rec::New {
-            self.focus = 0;
-        }
-        self.settle_focus();
+        self.focus_on(prev);
     }
 
     /// Show the criteria, the first field focused for typing.
     pub fn show_criteria(&mut self) {
         self.back = self.rec;
         self.mode = Mode::Criteria;
-        self.focus = 0;
-        self.settle_focus();
+        self.focus_on(Item::Field(0));
     }
 
     /// The `(col, criterion)` pairs Find Prev and Find Next use: the
@@ -262,15 +263,30 @@ impl DataForm {
         items[self.focus.min(items.len() - 1)]
     }
 
-    fn settle_focus(&mut self) {
-        let n = self.items().len();
-        self.focus = self.focus.min(n - 1);
-        self.cursor = self.focused_text().map_or(0, |t| t.chars().count());
-    }
-
-    /// Focus the item `item` (the first item when it isn't there).
+    /// Focus `item`; a field Tab doesn't visit here (computed in this
+    /// record) gives way to the nearest one it does, the later on a tie;
+    /// anything else missing, to the first item.
     fn focus_on(&mut self, item: Item) {
-        self.focus = self.items().iter().position(|i| *i == item).unwrap_or(0);
+        let items = self.items();
+        let nearest = |f: usize| {
+            items
+                .iter()
+                .enumerate()
+                .filter_map(|(k, it)| match it {
+                    Item::Field(j) => Some((j.abs_diff(f), *j < f, k)),
+                    Item::Button(_) => None,
+                })
+                .min()
+                .map(|(.., k)| k)
+        };
+        self.focus = items
+            .iter()
+            .position(|i| *i == item)
+            .or_else(|| match item {
+                Item::Field(f) => nearest(f),
+                Item::Button(_) => None,
+            })
+            .unwrap_or(0);
         self.cursor = self.focused_text().map_or(0, |t| t.chars().count());
     }
 
@@ -376,6 +392,15 @@ impl DataForm {
         self.cursor = cursor;
     }
 
+    /// The column of the focused field.
+    #[cfg(test)]
+    pub fn focused_col(&self) -> Option<u32> {
+        match self.focused() {
+            Item::Field(i) => Some(self.fields[i].col),
+            Item::Button(_) => None,
+        }
+    }
+
     #[cfg(test)]
     pub fn focused_button(&self) -> Option<Button> {
         match self.focused() {
@@ -400,7 +425,7 @@ impl DataForm {
             .max()
             .unwrap_or(0)
             .min(20);
-        let mut lines = vec![heading_owned(self.position()), heading("")];
+        let mut lines = vec![heading(self.position()), heading("")];
         for (i, fld) in self.fields.iter().enumerate() {
             let label: String = fld.label.chars().take(w).collect();
             let has_focus = focused == Item::Field(i);
@@ -456,13 +481,6 @@ impl DataForm {
             Button::Close => "Close",
         }
     }
-}
-
-fn heading_owned(text: String) -> Line<'static> {
-    Line::from(Span::styled(
-        text,
-        Style::new().add_modifier(Modifier::BOLD),
-    ))
 }
 
 #[cfg(test)]

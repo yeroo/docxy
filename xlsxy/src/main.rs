@@ -6341,19 +6341,25 @@ impl App {
                 Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
             return false;
         }
-        let (_, _, bottom, _) = d.area;
-        let row = match d.rec {
-            Rec::Row(r) => r,
-            Rec::New => bottom + 1,
+        let (top, _, bottom, _) = d.area;
+        // A field is read under its cell's format; a new record's, under the
+        // format of the field above it (its column's): a `0%` column takes
+        // `15` as 15%, a Text column keeps `007` as text.
+        let (row, style_row) = match d.rec {
+            Rec::Row(r) => (r, Some(r)),
+            Rec::New => (bottom + 1, (bottom > top).then_some(bottom)),
         };
         let ctx = self.typed_ctx();
         let mut cells = Vec::new();
         for (c, text) in changes {
             let wb = &self.pkg.workbook;
-            let formula = gridcore::entry::typed_formula(wb, d.sheet, row, c, &text);
+            let base = style_row
+                .and_then(|r| wb.sheets[d.sheet].cell(r, c))
+                .map_or(0, |cell| cell.style);
+            let formula = gridcore::entry::typed_formula_styled(wb, base, &text);
             let built = match formula.map(Engine::validate) {
                 Some(Err(e)) => Err(format!("formula error: {e}")),
-                _ => entry_cell_ctx(&mut self.pkg.workbook, d.sheet, row, c, &text, &ctx)
+                _ => gridcore::entry::entry_cell_styled(&mut self.pkg.workbook, base, &text, &ctx)
                     .map_err(|e| e.to_string()),
             };
             match built {
@@ -17676,6 +17682,163 @@ mod tests {
         assert_eq!(app.undo.len(), undo_len);
         assert_eq!(value_at(&app, 2, 0), CellValue::Text("Bob".into()));
         assert_eq!(form_rec(&app), dataform::Rec::Row(2));
+    }
+
+    #[test]
+    fn data_form_focus_stays_on_its_field_across_computed_columns() {
+        use dataform::Rec::Row;
+        // Calc is computed in records 1 and 3 but a constant in record 2.
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        for (c, h) in ["Calc", "Name", "Note"].iter().enumerate() {
+            put(&mut app, 0, c as u32, h);
+        }
+        for (r, calc, name) in [
+            (1, "=LEN(B2)", "Ann"),
+            (2, "x", "Bob"),
+            (3, "=LEN(B4)", "Cy"),
+        ] {
+            put(&mut app, r, 0, calc);
+            put(&mut app, r, 1, name);
+        }
+        app.cur = (1, 1);
+        app.ribbon_act(ribbon::Act::DataForm);
+        assert_eq!(form(&app).focused_col(), Some(1), "Calc is read-only here");
+        form_key(&mut app, KeyCode::Tab);
+        assert_eq!(form(&app).focused_col(), Some(2));
+        form_key(&mut app, KeyCode::Down);
+        assert_eq!(form_rec(&app), Row(2));
+        assert_eq!(form(&app).focused_col(), Some(2), "Note keeps the focus");
+        form_type(&mut app, "zz");
+        form_key(&mut app, KeyCode::Down);
+        assert_eq!(value_at(&app, 2, 2), CellValue::Text("zz".into()));
+        assert_eq!(value_at(&app, 2, 1), CellValue::Text("Bob".into()));
+        assert_eq!(form(&app).focused_col(), Some(2));
+        // A field computed in the next record gives way to the nearest one.
+        form_keys(&mut app, &[KeyCode::Up, KeyCode::BackTab, KeyCode::BackTab]);
+        assert_eq!(form(&app).focused_col(), Some(0));
+        form_key(&mut app, KeyCode::Down);
+        assert_eq!(form(&app).focused_col(), Some(1));
+    }
+
+    #[test]
+    fn data_form_find_next_from_criteria_keeps_searching() {
+        use dataform::{Button, Mode, Rec::Row};
+        let mut app = data_form_app();
+        app.ribbon_act(ribbon::Act::DataForm);
+        form_button(&mut app, Button::Criteria);
+        form_key(&mut app, KeyCode::Enter);
+        form_key(&mut app, KeyCode::Tab);
+        form_type(&mut app, ">10");
+        form_button(&mut app, Button::FindNext);
+        form_key(&mut app, KeyCode::Enter);
+        assert_eq!((form_rec(&app), form(&app).mode), (Row(2), Mode::Form));
+        assert_eq!(form(&app).focused_button(), Some(Button::FindNext));
+        form_key(&mut app, KeyCode::Enter);
+        assert_eq!((form_rec(&app), form(&app).mode), (Row(3), Mode::Form));
+        form_key(&mut app, KeyCode::Enter);
+        assert_eq!(form_rec(&app), Row(3));
+        assert_eq!(app.status.as_deref(), Some("No matching record"));
+    }
+
+    #[test]
+    fn data_form_form_button_keeps_its_focus() {
+        use dataform::{Button, Mode};
+        let mut app = data_form_app();
+        app.ribbon_act(ribbon::Act::DataForm);
+        form_button(&mut app, Button::Criteria);
+        form_key(&mut app, KeyCode::Enter);
+        form_button(&mut app, Button::Criteria); // reads Form
+        form_key(&mut app, KeyCode::Enter);
+        assert_eq!(form(&app).mode, Mode::Form);
+        assert_eq!(form(&app).focused_button(), Some(Button::Criteria));
+        form_key(&mut app, KeyCode::Enter);
+        assert!(
+            app.data_form.is_some(),
+            "Enter again opens the criteria, not Close"
+        );
+        assert_eq!(form(&app).mode, Mode::Criteria);
+    }
+
+    #[test]
+    fn data_form_new_record_reads_fields_under_the_columns_format() {
+        use gridcore::sheet::Xf;
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        let styles = &mut app.pkg.workbook.styles;
+        let mut text_xf = Xf::default();
+        text_xf.set_code(Some("@".into()));
+        let text_fmt = styles.intern(text_xf);
+        let decorated = styles.intern(Xf {
+            bold: true,
+            fill: Some((255, 255, 0)),
+            ..Xf::default()
+        });
+        for (c, h) in ["Name", "Code", "Rate", "Price"].iter().enumerate() {
+            put(&mut app, 0, c as u32, h);
+        }
+        for r in 1..=2 {
+            put(&mut app, r, 0, "Ann");
+            app.pkg.workbook.sheets[0].set_cell(
+                r,
+                1,
+                Cell {
+                    style: text_fmt,
+                    ..Cell::text("001")
+                },
+            );
+            put(&mut app, r, 2, "5%");
+            app.pkg.workbook.sheets[0].set_cell(
+                r,
+                3,
+                Cell {
+                    style: decorated,
+                    ..Cell::number(1.0)
+                },
+            );
+        }
+        app.rebuild_engine();
+        app.ribbon_act(ribbon::Act::DataForm);
+        form_button(&mut app, dataform::Button::New);
+        form_key(&mut app, KeyCode::Enter);
+        for (i, text) in ["Dan", "007", "15", "$5"].iter().enumerate() {
+            if i > 0 {
+                form_key(&mut app, KeyCode::Tab);
+            }
+            form_type(&mut app, text);
+        }
+        form_key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            value_at(&app, 3, 1),
+            CellValue::Text("007".into()),
+            "Text column"
+        );
+        assert_eq!(
+            value_at(&app, 3, 2),
+            CellValue::Number(0.15),
+            "percent column"
+        );
+        assert_eq!(value_at(&app, 3, 3), CellValue::Number(5.0));
+        let xf = |app: &App, r, c| {
+            let style = app.sheet().cell(r, c).unwrap().style;
+            app.pkg.workbook.styles.xf(style)
+        };
+        assert_eq!(xf(&app, 3, 2).numfmt, xf(&app, 2, 2).numfmt);
+        let price = xf(&app, 3, 3);
+        assert!(
+            price.bold && price.fill == Some((255, 255, 0)),
+            "the column's look stays"
+        );
+        // A formula typed into the Text column is text.
+        form_type(&mut app, "Eve");
+        form_key(&mut app, KeyCode::Tab);
+        form_type(&mut app, "=A1");
+        form_key(&mut app, KeyCode::Enter);
+        let code = app.sheet().cell(4, 1).unwrap();
+        assert_eq!(
+            (code.formula.as_deref(), &code.value),
+            (None, &CellValue::Text("=A1".into()))
+        );
     }
 
     #[test]
