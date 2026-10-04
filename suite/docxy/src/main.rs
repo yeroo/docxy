@@ -15333,7 +15333,7 @@ impl Docxy {
     }
 
     fn open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(path) = rfd::FileDialog::new()
+        let dialog = rfd::FileDialog::new()
             .add_filter("All supported", &OPEN_EXTENSIONS)
             .add_filter("Project schedule", &["yppx", "xml", "mpp"])
             .add_filter("Word or Markdown", &["docx", "md", "markdown"])
@@ -15341,10 +15341,45 @@ impl Docxy {
             .add_filter("Rich Text, Web Page or PDF", &["rtf", "htm", "html", "pdf"])
             .add_filter("Word 97-2003 Document", &["doc"])
             .add_filter("Editable HTML (*.docx.html)", &["html"])
-            .add_filter("Excel workbook", &SHEET_EXTENSIONS)
-            .pick_file()
+            .add_filter("Excel workbook", &SHEET_EXTENSIONS);
+        self.pick_open_file(dialog, OpenMode::Normal, window, cx);
+    }
+
+    fn pick_open_file(
+        &mut self,
+        dialog: rfd::FileDialog,
+        mode: OpenMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The Linux portal waits for a D-Bus response. Keep dispatching window
+        // events while it is open, including Wayland compositor pings.
+        #[cfg(target_os = "linux")]
         {
-            self.open_picked(&path, OpenMode::Normal);
+            let picked = cx
+                .background_executor()
+                .spawn(async move { dialog.pick_file() });
+            cx.spawn_in(window, async move |this, cx| {
+                let path = picked.await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.finish_open_file(path, mode, window, cx);
+                });
+            })
+            .detach();
+        }
+        #[cfg(not(target_os = "linux"))]
+        self.finish_open_file(dialog.pick_file(), mode, window, cx);
+    }
+
+    fn finish_open_file(
+        &mut self,
+        path: Option<PathBuf>,
+        mode: OpenMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(path) = path {
+            self.open_picked(&path, mode);
         }
         self.backstage = false;
         self.bs_new = false;
@@ -15362,15 +15397,7 @@ impl Docxy {
             OpenMode::RecoverText => rfd::FileDialog::new().add_filter("All files", &["*"]),
             _ => rfd::FileDialog::new().add_filter("Excel workbook", &SHEET_EXTENSIONS),
         };
-        if let Some(path) = dialog.pick_file() {
-            self.open_picked(&path, mode);
-        }
-        self.backstage = false;
-        self.bs_new = false;
-        self.bs_info = false;
-        self.bs_info_status = None;
-        self.persist();
-        self.refocus(window, cx);
+        self.pick_open_file(dialog, mode, window, cx);
     }
 
     /// Open a path a person picked; a copy that could not be written says
@@ -29959,6 +29986,7 @@ fn placeholder(kind: Kind, bg: Hsla, dim: Hsla) -> impl IntoElement {
 /// steal the keyboard while you are typing in another app.
 fn window_options(bounds: Bounds<Pixels>, harness: bool) -> WindowOptions {
     WindowOptions {
+        app_id: Some("io.github.yeroo.docxy".into()),
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitleBar::title_bar_options()),
         window_min_size: Some(size(px(460.), px(420.))),

@@ -1,4 +1,4 @@
-//! Taking the pixels. On Windows: find the test instance's window from its
+//! Taking the pixels. On Windows and Linux/X11: find the test instance's window from its
 //! process id, and read that window's contents into an [`Image`]. On macOS: ask
 //! the app to render itself offscreen, and read what it wrote
 //! ([`offscreen_capture`]).
@@ -11,7 +11,8 @@
 //! one that sounds right — is behind `cfg(any(test, feature = "test-support"))`
 //! and re-renders the scene to an offscreen texture rather than reading what
 //! the compositor actually put on screen. So on Windows the app reports
-//! geometry and the harness takes the picture.
+//! geometry and the harness takes the picture. Linux uses X11 GetImage on an
+//! unobscured client, normally on a private Xvfb display with Openbox.
 //!
 //! macOS is the exception, because there the harness *cannot* take it: the
 //! window is never on screen, and reading another process's pixels needs Screen
@@ -32,6 +33,11 @@
 
 use crate::image::Image;
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::capture_pid;
+
 /// A window's pixels, and where its top-left corner sits on the desktop —
 /// which is what turns a screen rectangle into a crop.
 pub struct Capture {
@@ -42,7 +48,7 @@ pub struct Capture {
     pub how: How,
 }
 
-/// Which route [`capture_window`] took.
+/// Which route a capture took.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum How {
     /// `PrintWindow`: the window alone, occluded or not.
@@ -53,6 +59,8 @@ pub enum How {
     /// macOS: the app rendered its last drawn frame to an offscreen texture
     /// (the `capture` verb). Not what the compositor showed, and never on screen.
     Offscreen,
+    /// Linux: X11 GetImage of the unobscured client window (no WM frame).
+    X11,
 }
 
 impl std::fmt::Display for How {
@@ -61,6 +69,7 @@ impl std::fmt::Display for How {
             How::PrintWindow => write!(f, "PrintWindow"),
             How::Screen => write!(f, "screen copy (PrintWindow came back blank)"),
             How::Offscreen => write!(f, "offscreen render"),
+            How::X11 => write!(f, "X11 GetImage"),
         }
     }
 }
@@ -314,12 +323,10 @@ mod win {
 #[cfg(windows)]
 pub use win::{become_dpi_aware, capture_pid, capture_window, window_of_pid};
 
-/// Off Windows there is nothing to capture with yet: `PrintWindow` is a Win32
-/// call, and the plan defers a portable route until there is a second platform
-/// to run the suite's tests on.
-#[cfg(not(windows))]
+/// Other platforms use an app-provided offscreen route, if available.
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn capture_pid(_pid: u32) -> Result<Capture, String> {
-    Err("window capture is implemented on Windows only".to_string())
+    Err("external window capture is implemented on Windows and Linux/X11 only".to_string())
 }
 
 #[cfg(not(windows))]

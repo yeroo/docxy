@@ -84,7 +84,7 @@ and the metadata property sets (MS-OLEPS).
 The importer now uses `mppread::mpp::decode_tasks`, which checks FixedMeta and
 VarMeta counts, task UIDs, keyed UTF-16 names, record lengths, and predecessor
 UIDs before returning rows. It decodes the newest Project task layout and the
-validated MPP9 layout. MPP12 files whose table does not match a known layout
+validated MPP9 and MPP12 core task layouts. Files whose table does not match a known layout
 return an error; the Project tab and `yppxy` report that error instead of
 opening a guessed plan. UID 0 is Project's summary row and is omitted from the
 imported task list.
@@ -96,8 +96,11 @@ $env:MPP_PAIRED_CORPUS='C:/path/to/docxy-project-spec/corpus/paired'
 cargo test -p mppread --test oracle_corpus -- --nocapture
 ```
 
-The test also checks the 46 generated snapshots under `snapshots/`, including
-the MPP12 match-or-refuse cases. It skips an absent corpus, and checks expected
+The test also checks the 50 generated snapshots under `snapshots/`, including
+all 50 MPP12 variants, which must decode and import their core task tables.
+Project's Save As conversion removes inactive rows and converts manual tasks;
+the comparisons pin those differences and compare dependency lags in minutes.
+It skips an absent corpus, and checks expected
 file counts when one is present. The external paired corpus has 27 plans. It
 also checks five local row-order cases in `order/` when present: blank rows,
 inserted tasks, inserted hierarchy, moved rows, and rows sorted with permanent
@@ -325,12 +328,12 @@ curl -sSL -o corpus/mpp/construction.mpp \
 
 The importer validates the newest Project 2024 task layout and the MPP9 layout
 used by the three local legacy samples. The newest layout is checked against
-generated snapshots and paired Project 2024 XML exports. MPP12 files may pass
-through the limited legacy task decoder; other MPP12 task tables are refused
-until their layout has a validated field map.
-Task Notes are decoded only on the current-layout path. Every Project-written
-MPP12 snapshot (FixedMeta kind 0, 264-byte task records) is refused before
-task decoding, so its Notes are not read either; the MPP9 legacy path has no
+generated snapshots and paired Project 2024 XML exports. MPP12 now imports
+core task names, dates, outline and dependencies from validated 264-byte
+records, including minute/day lags and leads. Its calendars, resources,
+assignments, baselines, progress, Notes and other task fields remain outside
+the task-only import. Unknown blank-row shapes and lag formats are refused.
+Task Notes are retained only on the current-layout path; the MPP9 legacy path has no
 paired XML and Project 16 cannot save MPP9, so legacy Notes have no oracle.
 StatusManager is not decoded: Project desktop drops a seeded StatusManager when
 it saves `.mpp` (`task-extra/e10-status-manager`), so there is no oracle.

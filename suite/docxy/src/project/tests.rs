@@ -3,6 +3,29 @@ use core::prelude::v1::test;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
+fn mpp12_snapshots_open_as_project_tabs_with_task_only_notice_when_present() {
+    let snapshots = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/mpp/snapshots");
+    for (name, count) in [("01-empty-mpp12.mpp", 0), ("03-first-task-mpp12.mpp", 1)] {
+        let path = snapshots.join(name);
+        if !path.exists() {
+            continue;
+        }
+        let tab = project_tab_from_path(&path);
+        assert_eq!(view(&tab).ed.project().tasks.len(), count);
+        assert!(
+            tab.status.contains("MPP12 task-only import"),
+            "{}",
+            tab.status
+        );
+        assert!(is_imported(&tab));
+        assert!(!tab.dirty);
+        if count == 1 {
+            assert_eq!(view(&tab).ed.project().tasks[0].name, "S03 design widget");
+        }
+    }
+}
+
+#[test]
 fn inactive_row_decision_inherits_summary_state_and_skips_blanks() {
     let mut proj = projcore::Project::default();
     let mut summary = Task {

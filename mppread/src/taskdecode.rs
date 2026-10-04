@@ -1,4 +1,4 @@
-//! Validated task-table decoding for current Project and MPP9 storage.
+//! Validated task-table decoding for current Project, MPP12 and MPP9 storage.
 use crate::{
     cfb::Cfb,
     fixedmeta,
@@ -612,6 +612,7 @@ pub(crate) struct Table {
     pub tasks: Vec<MppTask>,
     pub new_tasks_are_manual: Result<bool, String>,
     pub project_start: Result<Option<String>, String>,
+    /// Use task-only import and legacy scheduling rules (MPP9/MPP12).
     pub legacy: bool,
 }
 
@@ -652,6 +653,26 @@ pub(crate) fn decode_table(bytes: &[u8]) -> Result<Table, String> {
     let vm = read("VarMeta")?;
     let v2 = read("Var2Data")?;
     match fixedmeta::index(&fm, &fd)? {
+        fixedmeta::TaskIndex::Mpp12(indexed) => {
+            if prefix != "   112/TBkndTask/" || !paths.iter().any(|p| p == "Props12") {
+                return Err("264-byte task records outside recognized MPP12 storage".into());
+            }
+            let tasks = decode_mpp12(&cfb, prefix, &fd, &vm, &v2, indexed)?;
+            let project_start = tasks
+                .iter()
+                .find(|t| t.uid == 0)
+                .and_then(|t| t.start.clone());
+            Ok(Table {
+                tasks,
+                // Project 2007 predates manual scheduling. Newer Project
+                // converts manual tasks and removes inactive rows on Save As.
+                new_tasks_are_manual: Ok(false),
+                project_start: Ok(project_start),
+                // Calendars/resources/assignments have not been validated for
+                // this format. Use the established legacy task-only import.
+                legacy: true,
+            })
+        }
         fixedmeta::TaskIndex::Current(indexed) => {
             let fixed_count = u32_at(&fm, 8) as usize;
             let (f2m, f2d) = (read("Fixed2Meta")?, read("Fixed2Data")?);
@@ -835,6 +856,73 @@ fn decode_current(
     Ok(out)
 }
 
+/// Project 2007 task records: UID +0, ID +4, outline level +40,
+/// Start/Finish +88/+92. VarMeta uses the current 12-byte keyed entries.
+/// Only the core task table is imported; unvalidated fields remain absent.
+fn decode_mpp12(
+    cfb: &Cfb,
+    prefix: &str,
+    fd: &[u8],
+    vm: &[u8],
+    v2: &[u8],
+    indexed: Vec<fixedmeta::CurrentRecord>,
+) -> Result<Vec<MppTask>, String> {
+    if indexed.is_empty() {
+        return Err("MPP12 task table has no live project summary".into());
+    }
+    let uids = indexed.iter().map(|r| r.uid).collect();
+    let var = var_fields(vm, v2, &uids)?;
+    let mut tasks = Vec::new();
+    let mut previous_level = 0;
+    for (i, row) in indexed.iter().enumerate() {
+        let rec = &fd[row.offset..row.offset + row.len];
+        let level = u32_at(rec, 40);
+        validate_legacy_level(i, row.uid, level, previous_level)?;
+        previous_level = level;
+        let date = |offset| {
+            crate::mpp::decode_checked_timestamp(rec, offset)
+                .map_err(|_| format!("invalid MPP12 task date for UID {}", row.uid))
+        };
+        let (start, finish) = (date(88)?, date(92)?);
+        if start
+            .as_ref()
+            .zip(finish.as_ref())
+            .is_none_or(|(s, f)| s > f)
+        {
+            return Err(format!(
+                "missing or inverted MPP12 task dates for UID {}",
+                row.uid
+            ));
+        }
+        tasks.push(MppTask {
+            id: row.id,
+            uid: row.uid,
+            name: var.names[&row.uid].clone(),
+            start,
+            finish,
+            outline_level: Some(level),
+            ..MppTask::default()
+        });
+    }
+    links(
+        cfb,
+        prefix,
+        &mut tasks,
+        LinkLayout {
+            lag: 16,
+            format: 14,
+            // The corpus validates minute and day lags, including a lead.
+            // Other encodings remain refused until their layout has an oracle.
+            format_of: |code| {
+                matches!(code, 3 | 7)
+                    .then(|| LagFormat::from_code(i64::from(code)))
+                    .flatten()
+            },
+        },
+    )?;
+    Ok(tasks)
+}
+
 fn decode_legacy(
     cfb: &Cfb,
     prefix: &str,
@@ -967,6 +1055,129 @@ mod tests {
             props: props(&[0, 0]),
         }
     }
+    fn mpp12_fixture() -> Streams {
+        let mut s = fixture();
+        s.fd.resize(48 + 2 * 264, 0);
+        s.fd[48..].fill(0);
+        for (i, uid) in [0u32, 42].into_iter().enumerate() {
+            let off = 48 + i * 264;
+            s.fd[off..off + 4].copy_from_slice(&uid.to_le_bytes());
+            s.fd[off + 4..off + 8].copy_from_slice(&(i as u32).to_le_bytes());
+            s.fd[off + 40..off + 44].copy_from_slice(&(i as u32).to_le_bytes());
+            for date in [88, 92] {
+                s.fd[off + date..off + date + 4].copy_from_slice(&[0xc0, 0x12, 0x86, 0x3a]);
+            }
+        }
+        s.fm[16 + 4 * 47 + 4..16 + 4 * 47 + 8].copy_from_slice(&312u32.to_le_bytes());
+        s.vm[36..40].copy_from_slice(&42u32.to_le_bytes());
+        s
+    }
+
+    fn mpp12_file(s: &Streams) -> Vec<u8> {
+        write_cfb_tree(&[
+            Node::Stream("Props12", vec![]),
+            Node::Storage(
+                "   112",
+                vec![
+                    Node::Storage(
+                        "TBkndTask",
+                        vec![
+                            Node::Stream("FixedMeta", s.fm.clone()),
+                            Node::Stream("FixedData", s.fd.clone()),
+                            Node::Stream("VarMeta", s.vm.clone()),
+                            Node::Stream("Var2Data", s.v2.clone()),
+                        ],
+                    ),
+                    Node::Storage("TBkndCons", vec![Node::Stream("FixedData", s.cons.clone())]),
+                ],
+            ),
+        ])
+    }
+
+    #[test]
+    fn mpp12_keeps_uid_separate_from_row_id_and_imports_a_task() {
+        let bytes = mpp12_file(&mpp12_fixture());
+        assert!(crate::mpp::is_mpp12(&bytes));
+        let tasks = decode(&bytes).unwrap();
+        assert_eq!((tasks[1].id, tasks[1].uid), (1, 42));
+        assert_eq!(tasks[1].name, "B");
+        assert_eq!(tasks[1].start.as_deref(), Some("2025-01-06 08:00"));
+        let project = crate::project::project_from_mpp(&bytes).unwrap();
+        assert_eq!(project.tasks.len(), 1);
+        assert_eq!(project.tasks[0].uid, 42);
+        assert!(!project.new_tasks_are_manual);
+        assert!(!crate::mpp::is_mpp12(&file(&fixture(), true)));
+    }
+
+    #[test]
+    fn empty_mpp12_imports_without_a_phantom_task_and_keeps_its_start() {
+        let mut s = mpp12_fixture();
+        s.fm.truncate(16 + 4 * 47);
+        s.fm[8..12].copy_from_slice(&4u32.to_le_bytes());
+        s.fd.truncate(48 + 264);
+        s.vm.truncate(24 + 12);
+        s.vm[8..12].copy_from_slice(&1u32.to_le_bytes());
+        s.vm[20..24].copy_from_slice(&8u32.to_le_bytes());
+        s.v2.truncate(8);
+        let project = crate::project::project_from_mpp(&mpp12_file(&s)).unwrap();
+        assert!(project.tasks.is_empty());
+        assert_eq!(
+            project.start_date.unwrap().to_mspdi(),
+            "2025-01-06T08:00:00"
+        );
+    }
+
+    #[test]
+    fn mpp12_skips_deleted_versions_but_refuses_unvalidated_records() {
+        let mut s = mpp12_fixture();
+        let mut deleted = [0u8; 47];
+        deleted[..2].copy_from_slice(&2u16.to_le_bytes());
+        deleted[4..8].copy_from_slice(&(s.fd.len() as u32).to_le_bytes());
+        s.fm.extend_from_slice(&deleted);
+        s.fm[8..12].copy_from_slice(&6u32.to_le_bytes());
+        s.fd.extend_from_within(312..576);
+        assert_eq!(decode(&mpp12_file(&s)).unwrap().len(), 2);
+        // An unknown kind, a blank-row shape not validated for this format,
+        // or a truncated task must fail rather than return an incomplete plan.
+        s.fm[16 + 5 * 47..18 + 5 * 47].copy_from_slice(&3u16.to_le_bytes());
+        assert!(decode(&mpp12_file(&s)).is_err());
+        s.fm[16 + 5 * 47..18 + 5 * 47].copy_from_slice(&4u16.to_le_bytes());
+        s.fd.truncate(576 + 16);
+        assert!(decode(&mpp12_file(&s)).is_err());
+        s = mpp12_fixture();
+        s.fd.pop();
+        assert!(decode(&mpp12_file(&s)).is_err());
+    }
+
+    #[test]
+    fn mpp12_rejects_bad_ids_names_dates_links_and_storage_version() {
+        let mut s = mpp12_fixture();
+        s.fd[316..320].copy_from_slice(&0u32.to_le_bytes());
+        assert!(decode(&mpp12_file(&s)).is_err()); // duplicate row ID
+        s = mpp12_fixture();
+        s.fd[312..316].copy_from_slice(&0u32.to_le_bytes());
+        assert!(decode(&mpp12_file(&s)).is_err()); // duplicate UID
+        s = mpp12_fixture();
+        s.v2[12..14].copy_from_slice(&0xd800u16.to_le_bytes());
+        assert!(decode(&mpp12_file(&s)).is_err()); // unpaired UTF-16 surrogate
+        s = mpp12_fixture();
+        s.vm.pop();
+        assert!(decode(&mpp12_file(&s)).is_err());
+        s = mpp12_fixture();
+        s.fd[400..402].copy_from_slice(&14400u16.to_le_bytes());
+        assert!(decode(&mpp12_file(&s)).is_err()); // time outside day
+        s = mpp12_fixture();
+        s.cons = vec![0; 20];
+        s.cons[4..8].copy_from_slice(&42u32.to_le_bytes());
+        s.cons[8..12].copy_from_slice(&99u32.to_le_bytes());
+        s.cons[14..16].copy_from_slice(&3u16.to_le_bytes());
+        assert!(decode(&mpp12_file(&s)).is_err()); // unknown endpoint
+        s.cons[8..12].copy_from_slice(&42u32.to_le_bytes());
+        s.cons[14..16].copy_from_slice(&19u16.to_le_bytes());
+        assert!(decode(&mpp12_file(&s)).is_err()); // unvalidated percentage lag
+        assert!(decode(&file(&mpp12_fixture(), true)).is_err()); // wrong storage version
+    }
+
     /// Fixed2 streams that match `fm`: a GUID and a rising sort key for each
     /// task entry, nothing for the schema stubs and blank rows.
     fn fixed2_for(fm: &[u8]) -> (Vec<u8>, Vec<u8>) {

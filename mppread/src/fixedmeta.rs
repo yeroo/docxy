@@ -22,6 +22,7 @@ pub(crate) struct LegacyRecord {
 
 pub(crate) enum TaskIndex {
     Current(Vec<CurrentRecord>),
+    Mpp12(Vec<CurrentRecord>),
     Legacy(Vec<LegacyRecord>),
 }
 
@@ -56,18 +57,33 @@ pub(crate) fn index(meta: &[u8], data: &[u8]) -> Result<TaskIndex, String> {
         }
     }
     if stub == 16 {
-        current_index(meta, data, &offsets).map(TaskIndex::Current)
+        // Project 2007 has 16-byte schema stubs but 264-byte task records,
+        // with UID before ID. The first live row is the project summary.
+        let first_len = offsets.get(3).and_then(|start| {
+            offsets
+                .get(4)
+                .copied()
+                .unwrap_or(data.len())
+                .checked_sub(*start)
+        });
+        if first_len == Some(264) {
+            current_index(meta, data, &offsets, 264, false).map(TaskIndex::Mpp12)
+        } else {
+            current_index(meta, data, &offsets, 202, true).map(TaskIndex::Current)
+        }
     } else {
         legacy_index(data, &offsets).map(TaskIndex::Legacy)
     }
 }
 
-/// Current Project keeps active records in creation order. A 16-byte kind-4
-/// record is a null grid row; a 202-byte kind-2 record is a deleted version.
+/// Counted current/MPP12 records. Kind 2 is deleted; kind 0 is active.
+/// Current Project also has validated 16-byte kind-4 null grid rows.
 fn current_index(
     meta: &[u8],
     data: &[u8],
     offsets: &[usize],
+    task_len: usize,
+    id_first: bool,
 ) -> Result<Vec<CurrentRecord>, String> {
     let mut rows = Vec::new();
     let mut ids = HashSet::new();
@@ -80,18 +96,20 @@ fn current_index(
         let len = end
             .checked_sub(begin)
             .ok_or_else(|| format!("FixedMeta record {i} offset out of range"))?;
+        let id_offset = begin + if id_first { 0 } else { 4 };
+        let uid_offset = begin + if id_first { 4 } else { 0 };
         let (id, uid, is_null) = match (kind, len) {
-            (0, 202) => (
-                u32::from_le_bytes(data[begin..begin + 4].try_into().unwrap()),
-                u32::from_le_bytes(data[begin + 4..begin + 8].try_into().unwrap()),
+            (0, n) if n == task_len => (
+                u32::from_le_bytes(data[id_offset..id_offset + 4].try_into().unwrap()),
+                u32::from_le_bytes(data[uid_offset..uid_offset + 4].try_into().unwrap()),
                 false,
             ),
-            (4, 16) => (
+            (4, 16) if id_first => (
                 u32::from_le_bytes(data[begin + 4..begin + 8].try_into().unwrap()),
                 u32::from_le_bytes(data[begin..begin + 4].try_into().unwrap()),
                 true,
             ),
-            (2, 202) => continue,
+            (2, n) if n == task_len => continue,
             _ => {
                 return Err(format!(
                     "unrecognized FixedMeta kind {kind} with record length {len}"

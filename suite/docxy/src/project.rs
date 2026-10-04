@@ -589,7 +589,15 @@ pub(super) fn is_imported(tab: &DocTab) -> bool {
 
 fn imported_status(status: String, path: Option<&Path>) -> SharedString {
     if path.is_some_and(|p| ext_is(p, "mpp")) {
-        format!("{status}, imported from .mpp; Save As .yppx or MSPDI to keep edits").into()
+        let task_only = path
+            .and_then(|p| std::fs::read(p).ok())
+            .is_some_and(|bytes| mppread::mpp::is_mpp12(&bytes));
+        let source = if task_only {
+            "MPP12 task-only import"
+        } else {
+            "imported from .mpp"
+        };
+        format!("{status}, {source}; Save As .yppx or MSPDI to keep edits").into()
     } else {
         status.into()
     }
