@@ -11,7 +11,9 @@
 
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
 use crate::{DocTab, Surface};
-use gridcore::edit::{ConsolidateOptions, SubtotalFunc, consolidate, sheets_differ};
+use gridcore::edit::{
+    ConsolidateOptions, SubtotalFunc, canonical_consolidate_ref, consolidate, sheets_differ,
+};
 use gridcore::sheet::cell_name;
 
 /// Excel's refusal on a protected sheet.
@@ -150,9 +152,10 @@ pub(crate) fn consolidate_options(d: &Dialog) -> ConsolidateOptions {
     }
 }
 
-/// Add: the typed reference joins the list (once), and the box empties.
-fn add(d: &mut Dialog) {
-    let t = typed(d);
+/// Add: the typed reference joins the list (once), as `canon` spells it,
+/// and the box empties.
+fn add(d: &mut Dialog, canon: &dyn Fn(&str) -> String) {
+    let t = canon(&typed(d));
     if t.is_empty() {
         return;
     }
@@ -168,8 +171,8 @@ fn add(d: &mut Dialog) {
 }
 
 /// Delete: the chosen entry, or the one the box names, leaves the list.
-fn delete(d: &mut Dialog) {
-    let t = typed(d);
+fn delete(d: &mut Dialog, canon: &dyn Fn(&str) -> String) {
+    let t = canon(&typed(d));
     let Some(list) = control_mut(d, "refs") else {
         return;
     };
@@ -200,11 +203,27 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
     };
     if presses(top, button, "Add") || presses(top, button, "Delete") {
         let adding = presses(top, button, "Add");
+        // A reference that parses is kept the way the list shows it, so
+        // one spelled two ways is one entry.
+        let names: Vec<String> = match &tab.surface {
+            Surface::Sheet(v) => v
+                .pkg
+                .workbook
+                .sheets
+                .iter()
+                .map(|s| s.name.clone())
+                .collect(),
+            _ => Vec::new(),
+        };
+        let canon = |text: &str| {
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            canonical_consolidate_ref(&names, sheet, text)
+        };
         let d = tab.dialogs.top_dialog_mut().ok()?;
         if adding {
-            add(d);
+            add(d, &canon);
         } else {
-            delete(d);
+            delete(d, &canon);
         }
         return Some(Ok(()));
     }
@@ -255,7 +274,10 @@ fn apply(
         return Ok(());
     }
     v.push_undo_snapshot(snap);
+    // Linked output is formulas: evaluate them now, or they show (and
+    // save) blank.
     v.engine = crate::sheet_engine(&v.pkg.workbook);
+    v.engine.recalc_all(&mut v.pkg.workbook);
     tab.dirty = true;
     tab.status = format!(
         "Consolidated into {}:{}",
@@ -381,8 +403,9 @@ mod tests {
             consolidate_options(t.dialogs.top().unwrap()),
             ConsolidateOptions {
                 func: SubtotalFunc::CountNums,
-                // The typed reference counts on OK without Add.
-                refs: vec!["East!A1:B3".into(), "West!A1:B3".into()],
+                // Added, a reference is kept the way the list shows it; a
+                // typed one counts on OK without Add.
+                refs: vec!["East!$A$1:$B$3".into(), "West!A1:B3".into()],
                 top_row: true,
                 left_col: false,
                 links: true,
@@ -397,17 +420,22 @@ mod tests {
         open(&mut t);
         add(&mut t, "East!A1:B3");
         add(&mut t, "West!A1:B3");
-        add(&mut t, "east!a1:b3");
+        // The same range spelled another way is not a second entry; a
+        // reference that does not parse is kept as typed, for OK to report.
+        add(&mut t, "east!$a$1:b3");
+        add(&mut t, "Nowhere!A1");
         assert_eq!(
             listed(t.dialogs.top().unwrap()),
-            ["East!A1:B3", "West!A1:B3"]
+            ["East!$A$1:$B$3", "West!$A$1:$B$3", "Nowhere!A1"]
         );
         assert_eq!(typed(t.dialogs.top().unwrap()), "");
         // Delete takes the chosen entry...
-        set(&mut t, "refs", Json::Str("East!A1:B3".into()));
+        set(&mut t, "refs", Json::Str("Nowhere!A1".into()));
         press(&mut t, "Delete").unwrap();
-        assert_eq!(listed(t.dialogs.top().unwrap()), ["West!A1:B3"]);
-        // ...or the one the box names.
+        set(&mut t, "refs", Json::Str("East!$A$1:$B$3".into()));
+        press(&mut t, "Delete").unwrap();
+        assert_eq!(listed(t.dialogs.top().unwrap()), ["West!$A$1:$B$3"]);
+        // ...or the one the box names, in any spelling.
         set(&mut t, "reference", Json::Str("west!A1:B3".into()));
         press(&mut t, "Delete").unwrap();
         assert!(listed(t.dialogs.top().unwrap()).is_empty());
@@ -442,6 +470,9 @@ mod tests {
             Some("SUM(C4:C5)")
         );
         assert!(s.row_hidden(1) && s.row_collapsed(2));
+        // The formulas are evaluated: B's summary is East 2 + West's b 10.
+        assert_eq!(value(&mut t, 2, 5, 2), Some(CellValue::Number(12.0)));
+        assert_eq!(value(&mut t, 2, 2, 2), Some(CellValue::Number(1.0)));
         // It reopens on what OK kept.
         open(&mut t);
         let top = t.dialogs.top().unwrap();
