@@ -327,8 +327,9 @@ fn undo_of_remove_all_brings_a_new_comment_back_whole() {
 }
 
 /// FIX r2 #1: Remove All, then its undo, puts a loaded comment's markers
-/// back without a record. A new comment must not take that id: its own
-/// undo would leave it "live" on the old markers, listed and saved.
+/// back (and, since #971, its record). A new comment must not take that
+/// id: its own undo would leave it "live" on the old markers, listed and
+/// saved.
 #[test]
 fn a_new_comment_never_takes_an_id_whose_markers_are_in_the_body() {
     use crate::inspector::{InspectCategory, inspect_remove};
@@ -351,10 +352,10 @@ fn a_new_comment_never_takes_an_id_whose_markers_are_in_the_body() {
     assert!(!comments.contains("Colour?"), "{comments}");
 }
 
-/// FIX r3 #1: an id freed before the add (Remove All emptied comments, the
-/// base and the body of comment 1) must not be taken: undoing the add and
-/// then Remove All brings 1's markers back, and the new comment would be
-/// live on them.
+/// FIX r3 #1: an id freed before the add (Remove All took comment 1's
+/// markers, so it is listed and saved no more) must not be taken: undoing
+/// the add and then Remove All brings 1's markers back, and the new
+/// comment would be live on them.
 #[test]
 fn a_new_comment_never_takes_an_id_freed_by_remove_all() {
     use crate::inspector::{InspectCategory, inspect_remove};
@@ -512,4 +513,82 @@ fn comment_ids(comments_xml: &str) -> Vec<String> {
         .into_iter()
         .map(|c| c.id)
         .collect()
+}
+
+/// [`rich_package`] with its comments.xml re-encoded as UTF-16LE with a
+/// BOM: the loader decodes it, but the comment list (and so the per-id
+/// save) sees no comment in it.
+fn utf16_comments_package() -> Package {
+    let mut pkg = rich_package();
+    let xml = pkg.part_text("word/comments.xml").unwrap();
+    let mut bytes = vec![0xff, 0xfe];
+    for unit in xml.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    assert!(pkg.set_part("word/comments.xml", bytes));
+    pkg
+}
+
+/// #971 FIX r1 M1: Remove All leaves no comment in a save, also one in a
+/// comments.xml the comment list can't read.
+#[test]
+fn remove_all_clears_a_utf16_comments_part() {
+    use crate::inspector::{InspectCategory, inspect_remove};
+    let dir = Scratch::new();
+    let (mut tab, path) = docx_tab(&dir, &utf16_comments_package());
+    inspect_remove(&mut tab, InspectCategory::Comments).unwrap();
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    let (doc, comments) = saved(&path);
+    assert_eq!((markers(&doc, 1), markers(&doc, 2)), (0, 0), "{doc}");
+    assert!(!comments.contains("<w:comment "), "{comments}");
+}
+
+/// #971 FIX r1 M1: … and its undo keeps the comments whose markers came
+/// back, as they were.
+#[test]
+fn undo_remove_all_keeps_a_utf16_comments_part() {
+    use crate::inspector::{InspectCategory, inspect_remove};
+    let dir = Scratch::new();
+    let (mut tab, path) = docx_tab(&dir, &utf16_comments_package());
+    inspect_remove(&mut tab, InspectCategory::Comments).unwrap();
+    assert!(editor(&mut tab).undo(), "the Remove All");
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    let (doc, comments) = saved(&path);
+    assert_eq!((markers(&doc, 1), markers(&doc, 2)), (3, 3), "{doc}");
+    assert!(comments.contains(RICH), "{comments}");
+    assert!(comments.contains(REORDERED), "{comments}");
+}
+
+/// #971 FIX r1 M1: without a Remove All, a save keeps the comments of a
+/// part the comment list can't read.
+#[test]
+fn a_save_keeps_a_utf16_comments_part() {
+    let dir = Scratch::new();
+    let (mut tab, path) = docx_tab(&dir, &utf16_comments_package());
+    editor(&mut tab).insert_str("x");
+    tab.mark_dirty();
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    let (_, comments) = saved(&path);
+    assert!(comments.contains(RICH), "{comments}");
+    assert!(comments.contains(REORDERED), "{comments}");
+}
+
+/// #971 FIX r1 M1: an id the per-id save reads as another number (`03` as
+/// 3) is still removed by Remove All.
+#[test]
+fn remove_all_clears_a_comment_whose_id_is_not_canonical() {
+    use crate::inspector::{InspectCategory, inspect_remove};
+    let mut ed = docxcore::editor::Editor::new(docxcore::markdown::from_markdown(FOX));
+    ed.select_all();
+    assert!(ed.add_comment("03"));
+    let mut pkg = new_package(ed.doc);
+    pkg.insert_comment_xml("<w:comment w:id=\"03\" w:author=\"Ann\"><w:p/></w:comment>");
+    let dir = Scratch::new();
+    let (mut tab, path) = docx_tab(&dir, &pkg);
+    assert_eq!(listed_ids(&tab), ["03"]);
+    inspect_remove(&mut tab, InspectCategory::Comments).unwrap();
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    let (doc, comments) = saved(&path);
+    assert!(!doc.contains("w:id=\"03\""), "{doc}");
+    assert!(!comments.contains("<w:comment "), "{comments}");
 }

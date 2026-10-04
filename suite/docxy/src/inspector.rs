@@ -188,6 +188,8 @@ pub(crate) fn inspect_remove(
             let before = tracked.len();
             tracked.extend(tab.comments.iter().map(|c| c.id.clone()));
             let grew = tracked.len() > before;
+            // And the save drops the base comments it can't match per id.
+            tab.comments_removed_all = true;
             let comments = inspection.comments;
             (
                 format!("Removed all comments ({comments})"),

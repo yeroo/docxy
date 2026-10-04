@@ -2320,6 +2320,12 @@ impl Package {
     /// Remove the `<w:comment>` whose `w:id` is `id` from `comments.xml`,
     /// whatever the order of its attributes.
     pub fn remove_comment(&mut self, id: i32) {
+        self.remove_comment_id(&id.to_string());
+    }
+
+    /// [`Package::remove_comment`] by the `w:id` exactly as written: `03`
+    /// is not `3`.
+    pub fn remove_comment_id(&mut self, id: &str) {
         let name = "word/comments.xml";
         let Some(xml) = self.part_text(name) else {
             return;
@@ -2336,7 +2342,26 @@ impl Package {
     /// writes back losslessly.
     pub fn comment_xml(&self, id: i32) -> Option<String> {
         let xml = self.part_text("word/comments.xml")?;
-        comment_range(&xml, id).map(|range| xml[range].to_string())
+        comment_range(&xml, &id.to_string()).map(|range| xml[range].to_string())
+    }
+
+    /// The `w:id` of every `<w:comment>` in `comments.xml`, exactly as
+    /// written and in order, read the way the loader decodes the part
+    /// (UTF-16 included).
+    pub fn comment_ids(&self) -> Vec<String> {
+        let Some(xml) = self.part_text("word/comments.xml") else {
+            return Vec::new();
+        };
+        let mut ids = Vec::new();
+        let mut from = 0;
+        while let Some((start, end, _)) = crate::inspect::find_element_from(&xml, "w:comment", from)
+        {
+            if let Some(id) = comment_id_at(&xml, start) {
+                ids.push(id);
+            }
+            from = end;
+        }
+        ids
     }
 
     /// Ensure `numbering.xml` defines a simple bullet (or decimal) list and return
@@ -3528,21 +3553,25 @@ fn extract_sectpr(xml: &str) -> String {
 }
 
 /// The byte range of the `<w:comment>` element in `xml` (a `comments.xml`)
-/// whose `w:id` attribute is `id`, wherever that attribute sits in its
-/// opening tag. Not `<w:comments>` or a `<w:commentRangeStart>`, and `3`
-/// never matches `w:id="30"`.
-fn comment_range(xml: &str, id: i32) -> Option<std::ops::Range<usize>> {
-    let id = id.to_string();
+/// whose `w:id` attribute is `id` as written, wherever that attribute sits
+/// in its opening tag. Not `<w:comments>` or a `<w:commentRangeStart>`, and
+/// `3` never matches `w:id="30"` or `w:id="03"`.
+fn comment_range(xml: &str, id: &str) -> Option<std::ops::Range<usize>> {
     let mut from = 0;
     while let Some((start, end, _)) = crate::inspect::find_element_from(xml, "w:comment", from) {
-        let head = crate::inspect::tag_end(&xml[start..])?;
-        let mut p = XmlParser::new(&xml[start..start + head]);
-        if p.next() == Event::Start && p.attr("w:id") == id {
+        if comment_id_at(xml, start).as_deref() == Some(id) {
             return Some(start..end);
         }
         from = end;
     }
     None
+}
+
+/// The `w:id` of the `<w:comment>` opening tag at `start` in `xml`.
+fn comment_id_at(xml: &str, start: usize) -> Option<String> {
+    let head = crate::inspect::tag_end(&xml[start..])?;
+    let mut p = XmlParser::new(&xml[start..start + head]);
+    (p.next() == Event::Start).then(|| p.attr("w:id").to_string())
 }
 
 #[cfg(test)]
@@ -6292,5 +6321,47 @@ mod tests {
         assert!(rels.contains("Target=\"comments.xml\""), "{rels}");
         let reloaded = load_package(&save_package(&p)).unwrap();
         assert_eq!(reloaded.comment_xml(5).as_deref(), Some(c));
+    }
+
+    /// #971 FIX r1 M1: ids are matched as written, so a producer's `03` is
+    /// found (and listed) as `03`, never as `3`, and the reverse.
+    #[test]
+    fn comment_ids_and_removal_use_the_id_as_written() {
+        let three = "<w:comment w:id=\"3\"><w:p/></w:comment>";
+        let mut p = with_comments(&format!(
+            "{COMMENTS_OPEN}<w:comment w:author=\"A\" w:id=\"03\"><w:p/></w:comment>{three}</w:comments>"
+        ));
+        assert_eq!(p.comment_ids(), ["03", "3"]);
+        p.remove_comment_id("03");
+        assert_eq!(
+            p.part_text("word/comments.xml").unwrap(),
+            format!("{COMMENTS_OPEN}{three}</w:comments>")
+        );
+        p.remove_comment_id("03");
+        assert_eq!(p.comment_ids(), ["3"], "3 is not 03");
+    }
+
+    /// #971 FIX r1 M1: a UTF-16 comments.xml is listed and edited in place,
+    /// and stays UTF-16.
+    #[test]
+    fn comment_ids_read_a_utf16_part() {
+        let xml = format!(
+            "{COMMENTS_OPEN}<w:comment w:id=\"1\"><w:p/></w:comment>\
+             <w:comment w:id=\"2\"><w:p/></w:comment></w:comments>"
+        );
+        let mut bytes = vec![0xff, 0xfe];
+        for unit in xml.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let mut p = load_package(&make_docx("<w:document/>")).unwrap();
+        p.parts.push(("word/comments.xml".to_string(), bytes));
+        assert_eq!(p.comment_ids(), ["1", "2"]);
+        p.remove_comment_id("1");
+        assert_eq!(p.comment_ids(), ["2"]);
+        assert!(
+            p.part("word/comments.xml")
+                .unwrap()
+                .starts_with(&[0xff, 0xfe])
+        );
     }
 }

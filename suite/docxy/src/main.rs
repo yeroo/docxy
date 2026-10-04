@@ -2762,6 +2762,11 @@ struct DocTab {
     /// holds), and redo goes the other way. Saves keep the set; a load
     /// starts it empty.
     tracked_comment_ids: std::collections::HashSet<String>,
+    /// Remove All took every comment since the tab loaded: each save then
+    /// also drops the base comments a per-id save can't see (an id like
+    /// `03`, a comments.xml the parser can't read), unless an undo brought
+    /// their markers back ([`save_base`], #971). A load clears it.
+    comments_removed_all: bool,
     /// Every comment id this document has had since it loaded: those of
     /// its comments and body markers then ([`seed_used_comment_ids`]), and
     /// each one allocated since. It never shrinks, not on Delete Comment or
@@ -4655,6 +4660,7 @@ impl Loaded {
             status: self.status,
             comments: self.comments,
             tracked_comment_ids: Default::default(),
+            comments_removed_all: false,
             used_comment_ids: Default::default(),
             mail: mailings_tab::MailState::from_pkg(self.pkg.as_ref()),
             pkg: self.pkg,
@@ -4797,6 +4803,7 @@ fn finish_pending_conversion(tab: &mut DocTab) {
     tab.surface = Surface::Doc(Editor::new(l.doc));
     tab.comments = l.comments;
     tab.tracked_comment_ids.clear();
+    tab.comments_removed_all = false;
     seed_used_comment_ids(tab);
     tab.notes = l.notes;
     tab.mail = mailings_tab::MailState::from_pkg(l.pkg.as_ref());
@@ -5041,6 +5048,7 @@ fn sheet_tab_from_path(path: &PathBuf, repair: bool) -> DocTab {
         status,
         comments: vec![],
         tracked_comment_ids: Default::default(),
+        comments_removed_all: false,
         used_comment_ids: Default::default(),
         pkg: None,
         notes: vec![],
@@ -7805,6 +7813,7 @@ fn protected_rollback(tab: &mut DocTab) {
             tab.surface = Surface::Doc(Editor::new(l.doc));
             tab.comments = l.comments;
             tab.tracked_comment_ids.clear();
+            tab.comments_removed_all = false;
             seed_used_comment_ids(tab);
             tab.notes = l.notes;
             tab.mail = mailings_tab::MailState::from_pkg(l.pkg.as_ref());
@@ -8026,6 +8035,38 @@ fn live_comments(tab: &DocTab, doc: &Document) -> Vec<Comment> {
         .filter(|c| !tab.tracked_comment_ids.contains(&c.id) || live.contains(&c.id))
         .cloned()
         .collect()
+}
+
+/// The base package a save of `tab` writes `doc` into ([`doc_to_docx`],
+/// with `live` its [`live_comments`]): its own, or after a Remove All of
+/// comments a copy without each `<w:comment>` neither in `live` nor marked
+/// in `doc`'s body. Remove All used to empty comments.xml; now that its
+/// undo can bring comments back, those the per-id save would miss (an id
+/// it reads as a different number, a part it can't parse) go here (#971).
+fn save_base<'a>(
+    tab: &'a DocTab,
+    doc: &Document,
+    live: &[Comment],
+) -> Option<std::borrow::Cow<'a, Package>> {
+    let pkg = tab.pkg.as_ref()?;
+    if !tab.comments_removed_all {
+        return Some(std::borrow::Cow::Borrowed(pkg));
+    }
+    let mut keep = docxcore::inspect::comment_marker_ids(doc);
+    keep.extend(live.iter().map(|c| c.id.clone()));
+    let stale: Vec<String> = pkg
+        .comment_ids()
+        .into_iter()
+        .filter(|id| !keep.contains(id))
+        .collect();
+    if stale.is_empty() {
+        return Some(std::borrow::Cow::Borrowed(pkg));
+    }
+    let mut pruned = pkg.clone();
+    for id in &stale {
+        pruned.remove_comment_id(id);
+    }
+    Some(std::borrow::Cow::Owned(pruned))
 }
 
 /// Add a comment on `tab`'s selection: its markers go around the selection
@@ -8325,6 +8366,7 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 status: status.into(),
                 comments: vec![],
                 tracked_comment_ids: Default::default(),
+                comments_removed_all: false,
                 used_comment_ids: Default::default(),
                 pkg: None,
                 notes: vec![],
@@ -8369,6 +8411,7 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 status,
                 comments,
                 tracked_comment_ids: Default::default(),
+                comments_removed_all: false,
                 used_comment_ids: Default::default(),
                 mail: mailings_tab::MailState::from_pkg(pkg.as_ref()),
                 import: Default::default(),
@@ -8469,7 +8512,9 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
         Surface::Doc(_) if t.pending_conversion => None,
         Surface::Doc(ed) => {
             let p = hd.join(format!("tab-{i}.docx"));
-            let bytes = doc_to_docx(&ed.doc, &live_comments(t, &ed.doc), t.pkg.as_ref());
+            let live = live_comments(t, &ed.doc);
+            let base = save_base(t, &ed.doc, &live);
+            let bytes = doc_to_docx(&ed.doc, &live, base.as_deref());
             opccore::fsio::write_atomic(&p, &bytes)
                 .ok()
                 .map(|_| p.display().to_string())
@@ -9132,6 +9177,7 @@ impl Docxy {
             status: "new".into(),
             comments: vec![],
             tracked_comment_ids: Default::default(),
+            comments_removed_all: false,
             used_comment_ids: Default::default(),
             pkg: None,
             notes: vec![],
@@ -15030,11 +15076,9 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
     // A converted tab has the package its conversion wrote (#633), so it
     // saves into it like any other Word document.
     let docx = || {
-        doc_to_docx(
-            &editor.doc,
-            &live_comments(tab, &editor.doc),
-            tab.pkg.as_ref(),
-        )
+        let live = live_comments(tab, &editor.doc);
+        let base = save_base(tab, &editor.doc, &live);
+        doc_to_docx(&editor.doc, &live, base.as_deref())
     };
     // The Word package written, alone or inside a page.
     let mut package: Option<Vec<u8>> = None;
@@ -18701,6 +18745,7 @@ mod sheet_save_tests {
             status: "new".into(),
             comments: vec![],
             tracked_comment_ids: Default::default(),
+            comments_removed_all: false,
             used_comment_ids: Default::default(),
             pkg: None,
             notes: vec![],

@@ -673,11 +673,9 @@ fn apply(tab: &mut DocTab, d: &Dialog) -> Result<(), String> {
             let Surface::Doc(ed) = &tab.surface else {
                 return Err("Labels need a document".into());
             };
-            let bytes = doc_to_docx(
-                &ed.export_doc(),
-                &live_comments(tab, &ed.doc),
-                tab.pkg.as_ref(),
-            );
+            let live = live_comments(tab, &ed.doc);
+            let base = save_base(tab, &ed.doc, &live);
+            let bytes = doc_to_docx(&ed.export_doc(), &live, base.as_deref());
             let mut pkg = docxcore::package::load_package(&bytes).map_err(|e| e.to_string())?;
             let mut sheet = Editor::new(docxcore::model::Document {
                 body: vec![Block::SectionProperties(
@@ -893,11 +891,9 @@ pub(crate) fn merge_to_new(tab: &mut DocTab, range: MergeRange) -> Result<(), St
     let Surface::Doc(ed) = &tab.surface else {
         return Err("Mail merge needs a document".into());
     };
-    let bytes = doc_to_docx(
-        &ed.export_doc(),
-        &live_comments(tab, &ed.doc),
-        tab.pkg.as_ref(),
-    );
+    let live = live_comments(tab, &ed.doc);
+    let base = save_base(tab, &ed.doc, &live);
+    let bytes = doc_to_docx(&ed.export_doc(), &live, base.as_deref());
     let main = docxcore::package::load_package(&bytes).map_err(|e| e.to_string())?;
     let doc_type = tab.mail.doc_type.unwrap_or_default();
     let merged = docxcore::merge::merge_package(
