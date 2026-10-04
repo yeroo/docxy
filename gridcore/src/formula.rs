@@ -1681,7 +1681,7 @@ impl Printer {
 }
 
 /// `n` with a leading `_xlpm.` (Excel's LET/LAMBDA name prefix) removed.
-fn bare_param(n: &str) -> &str {
+pub(crate) fn bare_param(n: &str) -> &str {
     match n.get(..6) {
         Some(p) if p.eq_ignore_ascii_case("_xlpm.") => &n[6..],
         _ => n,
@@ -5069,8 +5069,23 @@ impl<'a> Eval<'a> {
 
     /// `INDIRECT(ref_text)` — build a reference from a string at runtime.
     fn indirect(&mut self, args: &[Expr]) -> Arg {
+        match self.indirect_target(args) {
+            Ok(ast) => {
+                self.depth += 1;
+                let arg = self.eval_arg(&ast);
+                self.depth -= 1;
+                arg
+            }
+            Err(v) => Arg::Scalar(v),
+        }
+    }
+
+    /// The reference `INDIRECT(args…)` names, parsed but not evaluated: a
+    /// cell, range, whole rows/columns or a name. Errors are the value
+    /// INDIRECT gives.
+    fn indirect_target(&mut self, args: &[Expr]) -> Result<Expr, Value> {
         if args.is_empty() || args.len() > 2 {
-            return Arg::Scalar(Value::Err(ExcelError::Value));
+            return Err(Value::Err(ExcelError::Value));
         }
         if let Some(e) = args.get(1) {
             // Only A1-style (the default). R1C1 requests are unsupported.
@@ -5078,14 +5093,14 @@ impl<'a> Eval<'a> {
                 Ok(true) => {}
                 Ok(false) => {
                     self.unsupported = true;
-                    return Arg::Scalar(Value::Err(ExcelError::Ref));
+                    return Err(Value::Err(ExcelError::Ref));
                 }
-                Err(er) => return Arg::Scalar(Value::Err(er)),
+                Err(er) => return Err(Value::Err(er)),
             }
         }
         let text = match to_text(&self.eval(&args[0])) {
             Ok(t) => t,
-            Err(er) => return Arg::Scalar(Value::Err(er)),
+            Err(er) => return Err(Value::Err(er)),
         };
         // Parse the text as a reference expression; only refs/ranges qualify.
         match parse(&text) {
@@ -5094,14 +5109,9 @@ impl<'a> Eval<'a> {
                 | Expr::Range(..)
                 | Expr::ColRange { .. }
                 | Expr::RowRange { .. }),
-            ) => self.eval_arg(&ast),
-            Ok(Expr::Name(_)) if self.depth < 32 => {
-                self.depth += 1;
-                let arg = self.eval_arg(&Expr::Name(text));
-                self.depth -= 1;
-                arg
-            }
-            _ => Arg::Scalar(Value::Err(ExcelError::Ref)),
+            ) => Ok(ast),
+            Ok(Expr::Name(_)) if self.depth < 32 => Ok(Expr::Name(text)),
+            _ => Err(Value::Err(ExcelError::Ref)),
         }
     }
 
@@ -11164,13 +11174,58 @@ impl<'a> Eval<'a> {
         }
     }
 
+    /// `e` as [`Self::eval_arg`] gives it, except that a single cell stays a
+    /// reference: a cell, a defined name whose definition is (or leads to)
+    /// one, and `INDIRECT(…)` give a 1x1 `Arg::Range` without reading the
+    /// cell, so ROW/COLUMN/ROWS/COLUMNS measure where it is, not what it
+    /// holds. A LET binding is its bound value, as eval_arg gives it.
+    fn area_of(&mut self, e: &Expr) -> Arg {
+        match e {
+            Expr::Ref(r) if r.row >= 0 && r.col >= 0 => match self.resolve_sheet(&r.sheet) {
+                Ok(s) => {
+                    let (row, col) = (r.row as u32, r.col as u32);
+                    Arg::Range(s, row, col, row, col)
+                }
+                Err(v) => Arg::Scalar(v),
+            },
+            Expr::Name(n)
+                if self.depth < 32
+                    && !self
+                        .lets
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case(bare_param(n))) =>
+            {
+                match self.res.defined_name(n, self.sheet).map(|def| parse(&def)) {
+                    Some(Ok(ast)) => {
+                        self.depth += 1;
+                        let arg = self.area_of(&ast);
+                        self.depth -= 1;
+                        arg
+                    }
+                    _ => self.eval_arg(e),
+                }
+            }
+            Expr::Func(name, args) if name == "INDIRECT" => match self.indirect_target(args) {
+                Ok(ast) => {
+                    self.depth += 1;
+                    let arg = self.area_of(&ast);
+                    self.depth -= 1;
+                    arg
+                }
+                Err(v) => Arg::Scalar(v),
+            },
+            _ => self.eval_arg(e),
+        }
+    }
+
     /// ROW/COLUMN of a reference that isn't a literal cell or range (a
-    /// structured reference, a table or defined name, `A1#`, OFFSET…): the
-    /// top-left cell's row or column, 1-based, as the `Expr::Range` arms
-    /// give. Errors propagate; a LAMBDA is `#CALC!`, and anything else that
-    /// isn't a reference is `#VALUE!`.
+    /// structured reference, a table or defined name, `A1#`, INDIRECT,
+    /// OFFSET…): the top-left cell's row or column, 1-based, as the
+    /// `Expr::Range` arms give, found by [`Self::area_of`] without reading
+    /// any cell. Errors propagate; a LAMBDA is `#CALC!`, and anything else
+    /// that isn't a reference is `#VALUE!`.
     fn position_of(&mut self, e: &Expr, row: bool) -> Value {
-        match self.eval_arg(e) {
+        match self.area_of(e) {
             Arg::Range(_, r1, c1, ..) => Value::Num(if row { r1 } else { c1 } as f64 + 1.0),
             Arg::Scalar(Value::Err(e)) => Value::Err(e),
             Arg::Lambda(_) => Value::Err(ExcelError::Calc),
@@ -11182,7 +11237,7 @@ impl<'a> Eval<'a> {
     /// name, table or spill reference gives its extent, a computed array its
     /// dimensions, and a scalar 1.
     fn extent_of(&mut self, e: &Expr, rows: bool) -> Value {
-        match self.eval_arg(e) {
+        match self.area_of(e) {
             Arg::Range(_, r1, c1, r2, c2) => Value::Num(if rows {
                 (r2 - r1 + 1) as f64
             } else {
@@ -13680,6 +13735,50 @@ mod tests {
         ] {
             assert_eq!(eval_outside(src, &g).0, Value::Num(want), "{src}");
         }
+    }
+
+    #[test]
+    fn position_functions_keep_single_cell_references() {
+        // #679 FIX r2 M1: a single cell reached through a defined name or
+        // INDIRECT is still a reference — ROW/COLUMN give its position and
+        // never read (or propagate) its value.
+        let at = |src: &str, g: &Grid, row: u32, col: u32| {
+            let ast = parse(src).unwrap_or_else(|e| panic!("parse {src}: {e}"));
+            Eval::new(g, 0, (row, col)).eval(&ast)
+        };
+        for b5 in [Value::Num(9.0), Value::Err(ExcelError::NA)] {
+            let mut g = issue_679_grid(0, 0).with_name("StartCell", "Sheet1!$B$5");
+            g.cells.insert((4, 1), b5.clone());
+            for (src, want) in [
+                ("ROW(StartCell)", 5.0),
+                ("COLUMN(StartCell)", 2.0),
+                ("ROWS(StartCell)", 1.0),
+                ("COLUMNS(StartCell)", 1.0),
+                ("ROW(INDIRECT(\"B5\"))", 5.0),
+                ("COLUMN(INDIRECT(\"C1\"))", 3.0),
+                ("ROW(INDIRECT(\"StartCell\"))", 5.0),
+            ] {
+                assert_eq!(at(src, &g, 99, 25), Value::Num(want), "{src} (B5 = {b5:?})");
+            }
+            assert_eq!(at("ROW()-ROW(StartCell)", &g, 6, 25), Value::Num(2.0));
+        }
+        // Single-cell structured references are references too.
+        let g = issue_679_grid(0, 0);
+        assert_eq!(
+            at("ROW(Sales[[#Headers],[Qty]])", &g, 99, 25),
+            Value::Num(1.0)
+        );
+        assert_eq!(
+            at("COLUMN(Sales[[#Headers],[Qty]])", &g, 99, 25),
+            Value::Num(2.0)
+        );
+        assert_eq!(at("COLUMN(Sales[@Price])", &g, 2, 6), Value::Num(3.0));
+        assert_eq!(at("ROW(Sales[@Price])", &g, 2, 6), Value::Num(3.0));
+        // A bad INDIRECT target is still #REF!.
+        assert_eq!(
+            at("ROW(INDIRECT(\"nope nope\"))", &g, 99, 25),
+            Value::Err(ExcelError::Ref)
+        );
     }
 
     #[test]

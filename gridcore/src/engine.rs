@@ -2368,17 +2368,21 @@ fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth:
 /// or `None` when it has none. Those functions read where a reference is,
 /// not the values in it, so a literal reference there is no dependency:
 /// `=ROWS(Sales)` in a calculated column of `Sales` is no circle. Cells,
-/// ranges, whole rows/columns, structured references and bare table names
-/// go; a spill reference (its extent follows the anchor), a defined name
-/// (its definition may compute the reference) and any computed argument
-/// keep their dependencies.
+/// ranges, whole rows/columns, structured references, bare table names and
+/// defined names that are one of those go; a spill reference (its extent
+/// follows the anchor), a computed definition (OFFSET, INDEX…) and any
+/// computed argument keep their dependencies. Inside a LET or LAMBDA that
+/// binds one of the four names nothing is pruned: `row(B1)` there may call
+/// the bound lambda, which reads B1.
 fn without_position_refs(wb: &Workbook, sheet: usize, ast: &Expr) -> Option<Expr> {
+    fn is_position_fn(name: &str) -> bool {
+        ["ROW", "COLUMN", "ROWS", "COLUMNS"]
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(name))
+    }
     fn has_position_fn(e: &Expr) -> bool {
         match e {
-            Expr::Func(name, args) => {
-                matches!(name.as_str(), "ROW" | "COLUMN" | "ROWS" | "COLUMNS")
-                    || args.iter().any(has_position_fn)
-            }
+            Expr::Func(name, args) => is_position_fn(name) || args.iter().any(has_position_fn),
             Expr::Call(callee, args) => has_position_fn(callee) || args.iter().any(has_position_fn),
             Expr::ArrayLit(rows) => rows.iter().flatten().any(has_position_fn),
             Expr::Un(_, x) => has_position_fn(x),
@@ -2386,53 +2390,64 @@ fn without_position_refs(wb: &Workbook, sheet: usize, ast: &Expr) -> Option<Expr
             _ => false,
         }
     }
-    fn prune(wb: &Workbook, sheet: usize, e: &Expr) -> Expr {
-        let position_only = |a: &Expr| match a {
+    // A reference whose position alone is read: a literal reference form, a
+    // table name, or a defined name whose definition is one (depth-capped as
+    // collect_deps expands names).
+    fn position_only(wb: &Workbook, sheet: usize, a: &Expr, depth: u32) -> bool {
+        match a {
             Expr::Ref(_)
             | Expr::Range(..)
             | Expr::ColRange { .. }
             | Expr::RowRange { .. }
             | Expr::Structured { .. } => true,
-            Expr::Name(n) => wb.defined_name(n, sheet).is_none() && wb.table(n).is_some(),
+            Expr::Name(n) => match wb.defined_name(n, sheet) {
+                Some(def) => {
+                    depth < 8
+                        && formula::parse(def)
+                            .is_ok_and(|d| position_only(wb, sheet, &d, depth + 1))
+                }
+                None => wb.table(n).is_some(),
+            },
             _ => false,
-        };
-        match e {
-            Expr::Func(name, args)
-                if matches!(name.as_str(), "ROW" | "COLUMN" | "ROWS" | "COLUMNS") =>
-            {
-                let args = args
-                    .iter()
+        }
+    }
+    // LET variables and LAMBDA parameters a call binds.
+    fn binds_position_name(name: &str, args: &[Expr]) -> bool {
+        let last = args.len().saturating_sub(1);
+        let let_fn = name.eq_ignore_ascii_case("LET");
+        if !let_fn && !name.eq_ignore_ascii_case("LAMBDA") {
+            return false;
+        }
+        args.iter().enumerate().any(|(i, a)| {
+            let bound = match a {
+                Expr::Name(n) if i < last && (!let_fn || i % 2 == 0) => n,
+                Expr::Structured {
+                    table: None,
+                    col1: Some(n),
+                    ..
+                } if i < last && !let_fn => n,
+                _ => return false,
+            };
+            is_position_fn(formula::bare_param(bound))
+        })
+    }
+    fn prune(wb: &Workbook, sheet: usize, e: &Expr) -> Expr {
+        formula::map_expr(e, &|x| match x {
+            Expr::Func(name, args) if binds_position_name(name, args) => Some(x.clone()),
+            Expr::Func(name, args) if is_position_fn(name) => Some(Expr::Func(
+                name.clone(),
+                args.iter()
                     .map(|a| {
-                        if position_only(a) {
+                        if position_only(wb, sheet, a, 0) {
                             Expr::Missing
                         } else {
                             prune(wb, sheet, a)
                         }
                     })
-                    .collect();
-                Expr::Func(name.clone(), args)
-            }
-            Expr::Func(name, args) => Expr::Func(
-                name.clone(),
-                args.iter().map(|a| prune(wb, sheet, a)).collect(),
-            ),
-            Expr::Call(callee, args) => Expr::Call(
-                Box::new(prune(wb, sheet, callee)),
-                args.iter().map(|a| prune(wb, sheet, a)).collect(),
-            ),
-            Expr::ArrayLit(rows) => Expr::ArrayLit(
-                rows.iter()
-                    .map(|row| row.iter().map(|x| prune(wb, sheet, x)).collect())
                     .collect(),
-            ),
-            Expr::Un(op, x) => Expr::Un(*op, Box::new(prune(wb, sheet, x))),
-            Expr::Bin(op, l, r) => Expr::Bin(
-                *op,
-                Box::new(prune(wb, sheet, l)),
-                Box::new(prune(wb, sheet, r)),
-            ),
-            other => other.clone(),
-        }
+            )),
+            _ => None,
+        })
     }
     has_position_fn(ast).then(|| prune(wb, sheet, ast))
 }
@@ -5076,6 +5091,66 @@ mod tests {
         assert_eq!(value_at(&wb, "G1"), CellValue::Number(1.0));
         set(&mut eng, &mut wb, "B2", Cell::number(9.0));
         assert_eq!(value_at(&wb, "G1"), CellValue::Number(2.0));
+    }
+
+    #[test]
+    fn a_lambda_named_like_a_position_function_keeps_its_dependencies() {
+        // #679 FIX r2 m1: `row` bound by LET is the lambda, not ROW — its
+        // argument is a value read.
+        let mut wb = wb_one_sheet(&[
+            ("B1", Cell::number(3.0)),
+            ("C1", Cell::formula("LET(row,LAMBDA(r,r*2),row(B1))")),
+            (
+                "C2",
+                Cell::formula("LAMBDA(columns,columns(B1))(LAMBDA(x,x+1))"),
+            ),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(6.0));
+        assert_eq!(value_at(&wb, "C2"), CellValue::Number(4.0));
+        set(&mut eng, &mut wb, "B1", Cell::number(10.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(20.0));
+        assert_eq!(value_at(&wb, "C2"), CellValue::Number(11.0));
+    }
+
+    #[test]
+    fn position_functions_of_reference_names_are_no_circle() {
+        // #679 FIX r2: a defined name that is a plain reference (or names a
+        // table) is measured, not read, so using it inside its own range is
+        // no circle. A computed definition keeps its dependency.
+        let mut wb = calc_column_wb("Sales", "ROWS(MySales)+ROW()-ROW(Data)");
+        wb.sheets[0].set_cell(5, 0, Cell::formula("ROW()-ROW(Data)+1"));
+        wb.sheets[0].set_cell(6, 0, Cell::formula("ROW()-ROW(Data)+1"));
+        for (name, def) in [("Data", "Sheet1!$A$6:$A$100"), ("MySales", "Sales")] {
+            wb.defined_names.push(crate::sheet::DefinedName {
+                name: name.into(),
+                scope: None,
+                formula: def.into(),
+            });
+        }
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(eng.circular_refs(), Vec::<Key>::new());
+        assert_eq!(value_at(&wb, "A6"), CellValue::Number(1.0));
+        assert_eq!(value_at(&wb, "A7"), CellValue::Number(2.0));
+        assert_eq!(value_at(&wb, "D2"), CellValue::Number(-2.0));
+        assert_eq!(value_at(&wb, "D3"), CellValue::Number(-1.0));
+        // OFFSET-based: the definition reads A6, so the dependency stays.
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(2.0)),
+            ("C1", Cell::formula("ROWS(Grow)")),
+        ]);
+        wb.defined_names.push(crate::sheet::DefinedName {
+            name: "Grow".into(),
+            scope: None,
+            formula: "OFFSET(Sheet1!$B$1,0,0,Sheet1!$A$1,1)".into(),
+        });
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(2.0));
+        set(&mut eng, &mut wb, "A1", Cell::number(5.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(5.0));
     }
 
     #[test]
