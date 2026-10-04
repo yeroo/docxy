@@ -284,6 +284,19 @@ pub fn entry_cell_ctx(
         .and_then(|s| s.cell(row, col))
         .map(|c| c.style)
         .unwrap_or(0);
+    entry_cell_styled(wb, base, text, ctx)
+}
+
+/// [`entry_cell_ctx`] for a cell of style `base`, whatever the cell holds
+/// now: the data form's new record is read under the format of the field
+/// above it, as its column's (a `0%` column takes `15` as 15%, a Text
+/// column keeps `007`).
+pub fn entry_cell_styled(
+    wb: &mut Workbook,
+    base: u32,
+    text: &str,
+    ctx: &EntryCtx,
+) -> Result<Cell, EntryError> {
     let e = parse_entry(text, &wb.styles.xf(base), ctx)?;
     let style = entry_style(&mut wb.styles, base, &e);
     Ok(Cell { style, ..e.cell })
@@ -397,12 +410,17 @@ pub fn typed_formula<'a>(
     col: u32,
     text: &'a str,
 ) -> Option<&'a str> {
-    let body = text.strip_prefix('=').filter(|b| !b.is_empty())?;
     let style = wb
         .sheets
         .get(sheet)
         .and_then(|s| s.cell(row, col))
         .map_or(0, |c| c.style);
+    typed_formula_styled(wb, style, text)
+}
+
+/// [`typed_formula`] for a cell of style `style` ([`entry_cell_styled`]).
+pub fn typed_formula_styled<'a>(wb: &Workbook, style: u32, text: &'a str) -> Option<&'a str> {
+    let body = text.strip_prefix('=').filter(|b| !b.is_empty())?;
     (!is_text(&wb.styles.xf(style))).then_some(body)
 }
 

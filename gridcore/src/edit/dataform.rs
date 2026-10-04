@@ -7,7 +7,7 @@
 //! that a new record made adjacent. These are the form's edits and searches;
 //! the app supplies the dialog.
 
-use super::{Area, fill_changes, move_refs};
+use super::{Area, array_rect, fill_changes, move_refs};
 use crate::engine::cell_to_value;
 use crate::formula::{CellMove, Value, db_criterion_matches, move_block_formula};
 use crate::sheet::{Cell, CellValue, MAX_ROWS, Sheet, Workbook, is_array_f};
@@ -60,9 +60,10 @@ pub fn find_record(
 }
 
 /// The cells New writes for a record holding `values` (`(col, cell)`, as
-/// typed) at the row below `area`: the typed cells, each taking the style of
-/// the field above it when it has none of its own, and every formula field
-/// of the last record filled down with its relative references moved. No
+/// typed, read under the style of the field above:
+/// [`crate::entry::entry_cell_styled`]) at the row below `area`: the typed
+/// cells, and every formula field of the last record filled down with its
+/// relative references moved and its style. No
 /// changes when every value is blank. Refused with [`CANNOT_EXTEND`] when
 /// that row holds anything in the list's columns or is past the grid.
 pub fn new_record_changes(
@@ -85,12 +86,7 @@ pub fn new_record_changes(
     let mut changes: Vec<(u32, u32, Cell)> = values
         .into_iter()
         .filter(|(c, cell)| (c1..=c2).contains(c) && !formula_col(*c) && !cell.is_blank())
-        .map(|(c, mut cell)| {
-            if cell.style == 0 && bottom > top {
-                cell.style = s.cell(bottom, c).map_or(0, |a| a.style);
-            }
-            (at, c, cell)
-        })
+        .map(|(c, cell)| (at, c, cell))
         .collect();
     for c in (c1..=c2).filter(|&c| formula_col(c)) {
         changes.extend(fill_changes(s, (at, c, at, c), true));
@@ -100,13 +96,14 @@ pub fn new_record_changes(
 
 /// Whether deleting the record in `row` of `area` would move or cut part of
 /// an array: some array formula's cells (its anchor and the block it spills
-/// or fills) lie in the list's columns from `row` down to the last record.
+/// or fills, or the `ref` a legacy CSE formula with one value owns) lie in
+/// the list's columns from `row` down to the last record.
 /// Delete is refused then, as a cut that splits an array is.
 pub fn delete_splits_array(s: &Sheet, (_, c1, bottom, c2): Area, row: u32) -> bool {
     let hits =
         |r1: u32, k1: u32, r2: u32, k2: u32| r1 <= bottom && r2 >= row && k1 <= c2 && k2 >= c1;
     s.cells.iter().any(|(&(r, c), cell)| {
-        let (h, w) = cell.spill.unwrap_or((1, 1));
+        let (h, w) = array_rect(cell, (r, c)).unwrap_or((1, 1));
         (cell.is_array_formula() || h * w > 1) && hits(r, c, r + h - 1, c + w - 1)
     })
 }
@@ -303,20 +300,12 @@ mod tests {
     }
 
     #[test]
-    fn new_record_carries_style_down() {
-        let mut wb = list();
-        wb.sheets[0].cells.get_mut(&(3, 1)).unwrap().style = 7;
-        let ch = new_record_changes(&wb.sheets[0], AREA, vec![(1, Cell::number(1.0))]).unwrap();
-        let qty = ch.iter().find(|x| x.1 == 1).unwrap();
-        assert_eq!(qty.2.style, 7);
+    fn new_record_keeps_the_typed_styles() {
+        let wb = list();
         let mut own = Cell::number(1.0);
         own.style = 3;
         let ch = new_record_changes(&wb.sheets[0], AREA, vec![(1, own)]).unwrap();
-        assert_eq!(
-            ch.iter().find(|x| x.1 == 1).unwrap().2.style,
-            3,
-            "its own style wins"
-        );
+        assert_eq!(ch.iter().find(|x| x.1 == 1).unwrap().2.style, 3);
     }
 
     #[test]
@@ -434,6 +423,16 @@ mod tests {
         let c = wb.sheets[0].cells.get_mut(&(3, 2)).unwrap();
         c.f_attrs = Some("t=\"array\" ref=\"C4\"".into());
         assert!(delete_splits_array(&wb.sheets[0], AREA, 1));
+        assert!(delete_splits_array(&wb.sheets[0], AREA, 3));
+        // A legacy CSE block with one value (no spill extent) owns its `ref`.
+        let mut wb = list();
+        let mut cse = Cell::formula("SUM(B2:B4)");
+        cse.value = CellValue::Number(117.0);
+        cse.f_attrs = Some("t=\"array\" ref=\"C2:C4\"".into());
+        wb.sheets[0].set_cell(1, 2, cse);
+        wb.sheets[0].cells.remove(&(2, 2));
+        wb.sheets[0].cells.remove(&(3, 2));
+        assert!(delete_splits_array(&wb.sheets[0], AREA, 2));
         assert!(delete_splits_array(&wb.sheets[0], AREA, 3));
     }
 

@@ -480,7 +480,7 @@ pub fn sort_cuts_spill(wb: &Workbook, sheet: usize, r1: u32, r2: u32) -> bool {
 /// the `ref` it owns (one that starts at `at`). A CSE formula evaluated to
 /// one value (`SUM` over its block) has no extent, but save keeps that
 /// `ref`, and Excel fills the block from it.
-fn array_rect(cell: &Cell, at: (u32, u32)) -> Option<(u32, u32)> {
+pub(super) fn array_rect(cell: &Cell, at: (u32, u32)) -> Option<(u32, u32)> {
     if cell.spill.is_some() {
         return cell.spill;
     }
