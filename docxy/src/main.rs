@@ -4807,11 +4807,14 @@ impl App {
     /// Write or remove the text watermark in every shown header (Design ▸
     /// Watermark). The header parts are package edits and the new header
     /// references one undo step. Returns whether anything changed; errs when
-    /// a watermark was requested but the document cannot take a header.
+    /// a watermark was requested but the document cannot take a header. An
+    /// Err may follow a partial edit (the removed watermark's header parts
+    /// and section references are already gone) — the Err carries `changed`
+    /// so callers can report whether one happened.
     pub(crate) fn set_text_watermark(
         &mut self,
         spec: Option<&TextWatermarkSpec>,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, (bool, String)> {
         if self.hf_edit.is_some() {
             self.exit_hf_edit(true);
         }
@@ -4837,7 +4840,10 @@ impl App {
                 .shown_text_watermarks(&self.editor.sections())
                 .is_empty()
         {
-            return Err("could not add the watermark: the document cannot take a header".into());
+            return Err((
+                changed,
+                "could not add the watermark: the document cannot take a header".into(),
+            ));
         }
         Ok(changed)
     }

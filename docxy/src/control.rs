@@ -5,6 +5,10 @@
 //! Every mutating verb goes through [`docxcore::editor::Editor`], so an agent's
 //! edits land on the *same* undo stack as keyboard edits and repaint the view
 //! live; reads serialize `editor.doc`, so they always reflect unsaved changes.
+//! Exception: the Design verbs' package edits (`doc.page-color`, a
+//! watermark's header parts) bypass the undo stack — only their section
+//! edits (`doc.watermark`'s header references, `doc.page-borders`) are undo
+//! steps.
 //!
 //! Addressing is by **top-level block index** (position in `doc.body`): a
 //! paragraph or table. `doc.read` / `doc.outline` report each block's `kind`, so
@@ -40,6 +44,9 @@
 //! | `doc.export-pdf` | `{path}` | `{path}` (absolutized; refuses to overwrite) |
 //! | `doc.format` | `{start, end?, patch}` | `{formatted}` — one undo checkpoint; `patch` keys: `bold`/`italic`/`underline`/`strike`/`color`/`highlight`/`font`/`size` (≥1 required), set-to-value semantics |
 //! | `doc.set-style` | `{start, end?, style?, align?}` | `{styled}` — one undo checkpoint; ≥1 of `style`/`align` required |
+//! | `doc.page-color` | `{color:"#RRGGBB"\|"none"}` | `{pageColor, changed}` — a package edit with no undo step; refuses Markdown |
+//! | `doc.watermark` | `{text, layout?, font?, color?}` or `{remove:true}` | `{watermark, changed}` — the header parts are package edits and the new header references one undo step; refuses Markdown |
+//! | `doc.page-borders` | `{border:"none"\|"box"\|"shadow", color?}` | `{pageBorders, changed}` — every section as one undo step; refuses Markdown |
 
 use crate::{
     App, DocFormat, box_page_borders, property_scope_name, protection::MutationKind,
@@ -1017,7 +1024,20 @@ fn watermark(app: &mut App, args: &Json) -> Result<Json, String> {
         }
         Some(spec)
     };
-    let changed = app.set_text_watermark(spec.as_ref())?;
+    let changed = app
+        .set_text_watermark(spec.as_ref())
+        .map_err(|(changed, msg)| {
+            // The error can follow a partial edit (existing watermarks were
+            // removed before the header failed): repaint and flag activity like
+            // a successful change, and say so in the message.
+            if changed {
+                app.dirty = true;
+                ctlcore::signal_activity();
+                format!("{msg} (the document was changed: existing watermarks were removed)")
+            } else {
+                msg
+            }
+        })?;
     if changed {
         ctlcore::signal_activity();
     }
@@ -3257,6 +3277,7 @@ mod tests {
             &args(vec![
                 ("text", Json::Str("Internal".into())),
                 ("layout", Json::Str("horizontal".into())),
+                ("font", Json::Str("Arial".into())),
                 ("color", Json::Str("#FF0000".into())),
             ]),
         )
@@ -3267,6 +3288,8 @@ mod tests {
         assert_eq!(marks.len(), 1, "{marks:?}");
         assert_eq!(marks[0].text, "Internal");
         assert!(marks[0].rotation.abs() < 0.5, "horizontal: {marks:?}");
+        assert_eq!(marks[0].fill, Some((255, 0, 0)), "{marks:?}");
+        assert_eq!(marks[0].font.as_deref(), Some("Arial"), "{marks:?}");
         assert!(app.modified);
 
         // The watermark survives save.
@@ -3280,6 +3303,8 @@ mod tests {
         let marks = app2.pkg.shown_text_watermarks(&app2.editor.sections());
         assert_eq!(marks.len(), 1, "{marks:?}");
         assert_eq!(marks[0].text, "Internal");
+        assert_eq!(marks[0].fill, Some((255, 0, 0)), "{marks:?}");
+        assert_eq!(marks[0].font.as_deref(), Some("Arial"), "{marks:?}");
         let _ = std::fs::remove_dir_all(&dir);
 
         let out = dispatch(
