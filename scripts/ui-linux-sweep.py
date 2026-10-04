@@ -130,10 +130,11 @@ class Transcript:
     summary: tuple = None
 
 
-# A failing run's report goes to stderr behind `uiharness: `, on its first line.
-CASE_RE = re.compile(r'^(?:uiharness: )?case: (.*) — (ok|FAILED)$')
+# A failing run's report goes to stderr behind `uiharness: `, which lands on
+# its first line, `suite:`; case and summary lines are unprefixed either way.
+CASE_RE = re.compile(r'^case: (.*) — (ok|FAILED)$')
 STEP_RE = re.compile(r'^  (ok|FAIL|ERROR) ')
-SUMMARY_RE = re.compile(r'^(?:uiharness: )?(\d+) cases? — (\d+) passed, (\d+) failed$')
+SUMMARY_RE = re.compile(r'^(\d+) cases? — (\d+) passed, (\d+) failed$')
 
 
 def parse_transcript(text):

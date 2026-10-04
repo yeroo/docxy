@@ -86,9 +86,12 @@ class Transcript(unittest.TestCase):
         self.assertEqual((t.cases['second'].fail_steps, t.cases['second'].error_steps), (1, 0))
         self.assertEqual(t.summary, (2, 1, 1))
 
-    def test_prefixed_case_and_summary_lines(self):
-        t = sweep.parse_transcript('uiharness: case: only — FAILED\n  ERROR x\n'
-                                   'uiharness: 1 case — 0 passed, 1 failed\n')
+    def test_the_error_prefix_lands_on_the_suite_line_only(self):
+        t = sweep.parse_transcript('uiharness: suite:    /repo/suite\n'
+                                   '/repo/uiharness/cases/a.uit\n'
+                                   'case: only — FAILED\n  ERROR x\n\n'
+                                   '1 case — 0 passed, 1 failed\n')
+        self.assertEqual(list(t.cases), ['only'])
         self.assertEqual(t.cases['only'].error_steps, 1)
         self.assertEqual(t.summary, (1, 0, 1))
 
