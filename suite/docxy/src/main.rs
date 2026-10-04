@@ -60,6 +60,7 @@ mod recover;
 mod ribbon_export;
 #[cfg(test)]
 mod sect_pr_tests;
+mod sheet_consolidate;
 #[cfg(test)]
 mod sheet_entry_tests;
 mod sheet_outline;
@@ -886,7 +887,8 @@ fn protected_view_allows_doc_act(act: Act) -> bool {
 /// Outline and the outline Settings are properties of the whole sheet, the
 /// Number format combo only opens or closes its strip (a format picked there
 /// is what acts on cells), and `Todo` does nothing at all. Group, Ungroup,
-/// Show/Hide Detail, Auto Outline and Subtotal read the selection.
+/// Show/Hide Detail, Auto Outline and Subtotal read the selection, and
+/// Consolidate writes at the selected cell.
 fn act_targets_cells(act: SheetAct) -> bool {
     !matches!(
         act,
@@ -1407,6 +1409,8 @@ enum SheetAct {
     TextToColumns,
     FormatAsTable,
     ProtectSheet,
+    /// Data › Data Tools › Consolidate: Excel's Consolidate dialog (#694).
+    Consolidate,
     /// Data › Subtotal...: Excel's Subtotal dialog (#693).
     Subtotal,
     /// Data › Outline (#693): Group, Ungroup, Show and Hide Detail, a level
@@ -14269,6 +14273,15 @@ impl Docxy {
             SheetAct::RemoveDuplicates => self.sheet_remove_duplicates(cx),
             SheetAct::FormatAsTable => self.sheet_format_as_table(cx),
             SheetAct::ProtectSheet => self.sheet_toggle_protection(cx),
+            SheetAct::Consolidate => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    match sheet_consolidate::consolidate_dialog(tab) {
+                        Ok(d) => tab.dialogs.push(d),
+                        Err(e) => tab.status = e.into(),
+                    }
+                }
+                cx.notify();
+            }
             SheetAct::Subtotal | SheetAct::OutlineSettings => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     let d = if act == SheetAct::Subtotal {
@@ -33977,6 +33990,7 @@ mod grid_geom_tests {
             SheetAct::SortAsc,
             SheetAct::RemoveDuplicates,
             SheetAct::Subtotal,
+            SheetAct::Consolidate,
         ] {
             assert!(act_targets_cells(act));
         }
@@ -34040,6 +34054,8 @@ mod grid_geom_tests {
             SheetAct::ClearOutline,
             SheetAct::OutlineSettings,
             SheetAct::Subtotal,
+            // Consolidate writes cells, and an outline when it links.
+            SheetAct::Consolidate,
         ] {
             assert!(!super::protected_view_allows_act(act), "{act:?}");
         }
