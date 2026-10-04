@@ -1180,13 +1180,13 @@ fn parse_spec_part(raw: &str) -> Result<SpecPart, String> {
         };
         return Ok(SpecPart::Span(name(a)?, name(b)?));
     }
-    // Strip one level of brackets: `[#Totals]` → `#Totals`.
-    let t = t
-        .strip_prefix('[')
-        .and_then(|y| y.strip_suffix(']'))
-        .unwrap_or(t)
-        .trim();
-    if let Some(rest) = t.strip_prefix('#') {
+    // Strip one level of brackets: `[#Totals]` → `#Totals`. Inside them a
+    // column name is exact: `[[Qty ]]` names `Qty ` (its space and all).
+    let (t, bracketed) = match t.strip_prefix('[').and_then(|y| y.strip_suffix(']')) {
+        Some(inner) => (inner, true),
+        None => (t, false),
+    };
+    if let Some(rest) = t.trim_start().strip_prefix('#') {
         return match rest.trim().to_ascii_lowercase().as_str() {
             "all" => Ok(SpecPart::Item(TableItem::All)),
             "data" => Ok(SpecPart::Item(TableItem::Data)),
@@ -1196,7 +1196,7 @@ fn parse_spec_part(raw: &str) -> Result<SpecPart, String> {
             other => Err(format!("unknown table item #{other}")),
         };
     }
-    if let Some(rest) = t.strip_prefix('@') {
+    if let Some(rest) = t.trim_start().strip_prefix('@') {
         let rest = rest.trim();
         if rest.is_empty() {
             return Ok(SpecPart::ThisRow(None));
@@ -1207,6 +1207,7 @@ fn parse_spec_part(raw: &str) -> Result<SpecPart, String> {
             .unwrap_or(rest);
         return Ok(SpecPart::ThisRow(Some(unescape_spec(inner))));
     }
+    let t = if bracketed { t } else { t.trim() };
     Ok(SpecPart::Col(unescape_spec(t)))
 }
 
@@ -1291,6 +1292,20 @@ fn escape_spec(name: &str) -> String {
     out
 }
 
+/// A column name as one bracketed spec part: `[Qty]`, `[Price, USD]`.
+fn bracket_spec(name: &str) -> String {
+    format!("[{}]", escape_spec(name))
+}
+
+/// Whether column name `name` needs its own brackets to read back where a
+/// bare name could stand (`Sales[Qty]`, `[@Qty]`): a `,` or `:` would split
+/// the spec, and the bare form is trimmed of edge whitespace.
+fn needs_brackets(name: &str) -> bool {
+    name.contains([',', ':'])
+        || name.starts_with(char::is_whitespace)
+        || name.ends_with(char::is_whitespace)
+}
+
 /// Print a structured reference back to canonical text. `file` spells the
 /// this-row item as a file stores it, `[#This Row],[c]`: the file grammar has
 /// no `@`.
@@ -1304,9 +1319,17 @@ fn structured_to_string(
     let prefix = table.clone().unwrap_or_default();
     // The column part: `[a]` or the span `[a]:[b]`.
     let cols = col1.as_ref().map(|a| match col2 {
-        Some(b) => format!("[{}]:[{}]", escape_spec(a), escape_spec(b)),
-        None => format!("[{}]", escape_spec(a)),
+        Some(b) => format!("{}:{}", bracket_spec(a), bracket_spec(b)),
+        None => bracket_spec(a),
     });
+    // A lone column name stands bare unless it can't (`needs_brackets`).
+    let bare = |c: &str| {
+        if needs_brackets(c) {
+            bracket_spec(c)
+        } else {
+            escape_spec(c)
+        }
+    };
     let tag = match item {
         TableItem::Data => "#Data",
         TableItem::All => "#All",
@@ -1316,10 +1339,10 @@ fn structured_to_string(
     };
     let body = match (item, col1, col2, cols) {
         (TableItem::Data, None, _, _) => String::new(),
-        (TableItem::Data, Some(c), None, _) => escape_spec(c),
+        (TableItem::Data, Some(c), None, _) => bare(c),
         (TableItem::Data, _, _, Some(span)) => span,
         (TableItem::ThisRow, None, _, _) if !file => "@".to_string(),
-        (TableItem::ThisRow, Some(c), None, _) if !file => format!("@{}", escape_spec(c)),
+        (TableItem::ThisRow, Some(c), None, _) if !file => format!("@{}", bare(c)),
         (_, None, _, _) => tag.to_string(),
         (_, _, _, Some(cols)) => format!("[{tag}],{cols}"),
         (_, Some(_), _, None) => unreachable!("cols is set whenever col1 is"),
@@ -15377,5 +15400,50 @@ mod tests {
         );
         assert_eq!(del("[@Qty]", true), "#REF!");
         assert_eq!(del("[@Qty]+Other[Qty]", false), "[@Qty]+Other[Qty]");
+    }
+
+    #[test]
+    fn column_names_that_need_brackets_round_trip() {
+        let sales = |col: &str, item: TableItem| Expr::Structured {
+            table: Some("Sales".into()),
+            item,
+            col1: Some(col.into()),
+            col2: None,
+        };
+        let cases = [
+            ("Price, USD", "Sales[[Price, USD]]"),
+            ("Qty:kg", "Sales[[Qty:kg]]"),
+            ("Qty ", "Sales[[Qty ]]"),
+            (" Qty", "Sales[[ Qty]]"),
+            ("Price USD", "Sales[Price USD]"),
+        ];
+        for (col, text) in cases {
+            let e = sales(col, TableItem::Data);
+            assert_eq!(to_string(&e), text);
+            assert_eq!(parse(text).unwrap(), e, "{text}");
+            assert_eq!(parse(&to_file_string(&e)).unwrap(), e, "{text}");
+            let row = sales(col, TableItem::ThisRow);
+            assert_eq!(parse(&to_string(&row)).unwrap(), row, "{}", to_string(&row));
+            assert_eq!(parse(&to_file_string(&row)).unwrap(), row);
+        }
+        assert_eq!(
+            to_string(&sales("Qty ", TableItem::ThisRow)),
+            "Sales[@[Qty ]]"
+        );
+        // A span and a totals row bracket every name already.
+        let span = parse("SUM(Sales[[Qty ]:[Price, USD]])").unwrap();
+        assert_eq!(to_string(&span), "SUM(Sales[[Qty ]:[Price, USD]])");
+        let totals = parse("Sales[[#Totals],[Qty ]]").unwrap();
+        assert_eq!(to_string(&totals), "Sales[[#Totals],[Qty ]]");
+        // Bare names are still read trimmed.
+        assert_eq!(
+            parse("Sales[ Qty ]").unwrap(),
+            sales("Qty", TableItem::Data)
+        );
+        // A rename to such a name prints a formula that reads back.
+        let map = [("Qty".to_string(), "Price, USD".to_string())];
+        let e =
+            rename_table_columns_in_expr(&parse("SUM(Sales[Qty])").unwrap(), "Sales", false, &map);
+        assert_eq!(parse(&to_string(&e)).unwrap(), e);
     }
 }

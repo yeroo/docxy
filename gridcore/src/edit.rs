@@ -1365,9 +1365,10 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
             }
         }
     }
-    // A converted table keeps the geometry it was converted with; the edits
-    // its cells went through since are replayed at save on the references
-    // to it (see `RemovedTable::edits`).
+    // A table converted to a range, or deleted with all its columns (by
+    // this edit, too), keeps the geometry it was removed with; the edits its
+    // cells went through since are replayed at save on the references to it
+    // (see `RemovedTable::edits`).
     for rt in &mut wb.removed_tables {
         if rt.table.sheet == idx {
             rt.edits.push(shift);

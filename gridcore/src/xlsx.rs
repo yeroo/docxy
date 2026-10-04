@@ -5728,8 +5728,10 @@ fn table_children(xml: &str, name: &str) -> Vec<(usize, usize)> {
     child_spans(xml, (root, root + p.pos()), name)
 }
 
-/// A table converted to a range whose part a save drops: the name other
-/// table parts' formulas know it by, and where its cells are.
+/// A table converted to a range, or deleted with all its columns, whose part
+/// a save drops: the name other table parts' formulas know it by, and where
+/// its cells are (a deleted table's went with its delete, so those formulas
+/// go `#REF!`).
 struct ConvertedTable {
     part: String,
     loaded_name: String,
@@ -6083,6 +6085,7 @@ fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
             })
         })
         .collect();
+    let mut dropped_columns: Vec<(String, Vec<u32>)> = Vec::new();
     for t in &wb.tables {
         let Some(p) = parts.iter_mut().find(|(n, _)| n == &t.part) else {
             continue;
@@ -6106,7 +6109,16 @@ fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
                 }
             }
         }
+        let ids_before = table_column_ids(&updated);
         updated = sync_table_columns(&updated, &t.columns, &t.column_ids);
+        let ids_after = table_column_ids(&updated);
+        let dropped: Vec<u32> = ids_before
+            .into_iter()
+            .filter(|id| !ids_after.contains(id))
+            .collect();
+        if !dropped.is_empty() {
+            dropped_columns.push((t.part.clone(), dropped));
+        }
         if !column_renames.is_empty() || !renames.is_empty() || !converted.is_empty() {
             updated = rewrite_column_formulas(
                 &updated,
@@ -6119,8 +6131,77 @@ fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
         }
         p.1 = updated.into_bytes();
     }
+    for (part, dropped) in &dropped_columns {
+        drop_query_table_fields(parts, part, dropped);
+    }
     for c in &converted {
         drop_table_part(parts, &c.part);
+    }
+}
+
+/// The `tableColumn id`s a table part holds, in order (0 for one without).
+fn table_column_ids(xml: &str) -> Vec<u32> {
+    let Some(&span) = table_children(xml, "tableColumns").first() else {
+        return Vec::new();
+    };
+    child_spans(xml, span, "tableColumn")
+        .into_iter()
+        .map(|(s, _)| {
+            tag_attr(&xml[s..tag_end(xml, s)], "id")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
+/// Table `part` lost the columns whose ids are `dropped`: the query table
+/// behind it (`tableType="queryTable"`, reached through the part's
+/// relationships) loses the `queryTableField`s bound to them, and its
+/// `queryTableFields count` follows. Nothing else in that part changes; a
+/// table with no query table, or one whose part can't be found, is left
+/// alone.
+fn drop_query_table_fields(parts: &mut [(String, Vec<u8>)], part: &str, dropped: &[u32]) {
+    let Some((dir, file)) = part.rsplit_once('/') else {
+        return;
+    };
+    let rels_name = format!("{dir}/_rels/{file}.rels");
+    let Some((_, rels)) = parts.iter().find(|(n, _)| *n == rels_name) else {
+        return;
+    };
+    let targets: Vec<String> = parse_rels(&String::from_utf8_lossy(rels))
+        .into_iter()
+        .filter(|(_, ty, _)| ty.ends_with("/queryTable"))
+        .map(|(_, _, target)| resolve_relative(dir, &target))
+        .collect();
+    for target in targets {
+        let Some(p) = parts.iter_mut().find(|(n, _)| *n == target) else {
+            continue;
+        };
+        let xml = String::from_utf8_lossy(&p.1).into_owned();
+        let Some(span) = element_span_by_tags(&xml, "queryTableFields") else {
+            continue;
+        };
+        let fields = child_spans(&xml, span, "queryTableField");
+        let gone: Vec<(usize, usize, String)> = fields
+            .iter()
+            .filter(|&&(s, _)| {
+                tag_attr(&xml[s..tag_end(&xml, s)], "tableColumnId")
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .is_some_and(|id| dropped.contains(&id))
+            })
+            .map(|&(s, e)| (s, e, String::new()))
+            .collect();
+        if gone.is_empty() {
+            continue;
+        }
+        let left = (fields.len() - gone.len()).to_string();
+        let xml = apply_edits(xml, gone);
+        let Some((start, _)) = element_span_by_tags(&xml, "queryTableFields") else {
+            continue;
+        };
+        let end = tag_end(&xml, start);
+        let tag = set_tag_attr_in_place(xml[start..end].to_string(), "count", &left);
+        p.1 = apply_edits(xml, vec![(start, end, tag)]).into_bytes();
     }
 }
 
@@ -19381,6 +19462,70 @@ mod table_command_tests {
         assert_eq!(d1.formula.as_deref(), Some("SUM($B$2:$B$3)"));
         // The part still says `Qty`: it reads the cells D1 reads.
         assert_eq!(column_formula(&reload(&pkg), &part2), "SUM($B$2:$B$3)");
+    }
+
+    #[test]
+    fn a_header_renamed_to_a_name_that_needs_brackets_reads_back() {
+        for (name, d1) in [
+            ("Price, USD", "SUM(Table1[[Price, USD]])"),
+            ("Qty:kg", "SUM(Table1[[Qty:kg]])"),
+            ("Qty ", "SUM(Table1[[Qty ]])"),
+        ] {
+            let mut pkg = reload(&one_table());
+            assert!(type_header(&mut pkg, 0, 1, name));
+            assert_eq!(pkg.workbook.tables[0].columns, ["Item", name]);
+            let re = reload(&pkg);
+            assert_eq!(re.workbook.tables[0].columns, ["Item", name]);
+            let cell = re.workbook.sheets[0].cell(0, 3).unwrap();
+            assert_eq!(cell.formula.as_deref(), Some(d1));
+            let value = crate::engine::eval_formula_at(&re.workbook, 0, 0, 3, d1);
+            assert_eq!(value, crate::formula::Value::Num(7.0), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_deleted_column_leaves_its_query_table_field() {
+        let mut pkg = one_table();
+        resize_table(&mut pkg.workbook, "Table1", (0, 0, 2, 2)).unwrap();
+        let part = pkg.workbook.tables[0].part.clone();
+        let xml = text(&pkg, &part).replacen(" ref=", " tableType=\"queryTable\" ref=", 1);
+        pkg.parts.iter_mut().find(|(n, _)| *n == part).unwrap().1 = xml.into_bytes();
+        let (dir, file) = part.rsplit_once('/').unwrap();
+        pkg.parts.push((
+            format!("{dir}/_rels/{file}.rels"),
+            br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/queryTable" Target="../queryTables/queryTable1.xml"/></Relationships>"#
+                .to_vec(),
+        ));
+        let field = |id: u32, name: &str| {
+            format!(r#"<queryTableField id="{id}" name="{name}" tableColumnId="{id}"/>"#)
+        };
+        let query = |fields: &str, count: usize| {
+            format!(
+                r#"<queryTable xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="Q" connectionId="1" autoFormatId="16" applyNumberFormats="0"><queryTableRefresh nextId="4"><queryTableFields count="{count}">{fields}</queryTableFields></queryTableRefresh></queryTable>"#
+            )
+        };
+        let all = format!(
+            "{}{}{}",
+            field(1, "Item"),
+            field(2, "Qty"),
+            field(3, "Column3")
+        );
+        pkg.parts.push((
+            "xl/queryTables/queryTable1.xml".into(),
+            query(&all, 3).into_bytes(),
+        ));
+        let mut pkg = reload(&pkg);
+        // Saved untouched while no column goes.
+        assert_eq!(
+            text(&reload(&pkg), "xl/queryTables/queryTable1.xml"),
+            query(&all, 3)
+        );
+        crate::edit::delete_cols(&mut pkg.workbook, 0, 1, 1);
+        let re = reload(&pkg);
+        let kept = format!("{}{}", field(1, "Item"), field(3, "Column3"));
+        assert_eq!(text(&re, "xl/queryTables/queryTable1.xml"), query(&kept, 2));
+        assert_eq!(re.workbook.tables[0].column_ids, [1, 3]);
     }
 
     #[test]
