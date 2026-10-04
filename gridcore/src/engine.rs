@@ -1091,7 +1091,6 @@ impl Engine {
                 frontier.push_back(k);
             }
         }
-        self.ensure_flagged();
         if let Some(f) = &self.flagged {
             for &k in &f.volatile {
                 if dirty.insert(k) {
