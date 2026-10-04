@@ -574,7 +574,7 @@ fn check(on: bool) -> &'static str {
     if on { "[x]" } else { "[ ]" }
 }
 
-fn item(text: String, focused: bool) -> Line<'static> {
+pub(crate) fn item(text: String, focused: bool) -> Line<'static> {
     let style = if focused {
         Style::new().add_modifier(Modifier::REVERSED)
     } else {
@@ -583,20 +583,20 @@ fn item(text: String, focused: bool) -> Line<'static> {
     Line::from(Span::styled(text, style))
 }
 
-fn heading(text: &'static str) -> Line<'static> {
+pub(crate) fn heading(text: impl Into<std::borrow::Cow<'static, str>>) -> Line<'static> {
     Line::from(Span::styled(
         text,
         Style::new().add_modifier(Modifier::BOLD),
     ))
 }
 
-fn hint(text: &'static str) -> Line<'static> {
+pub(crate) fn hint(text: &'static str) -> Line<'static> {
     Line::from(Span::styled(text, Style::new().fg(Color::DarkGray)))
 }
 
 /// Draw `lines` in a bordered box centred over `area`, scrolled so the
 /// focused (reversed) line stays in view when the box is too short.
-fn modal(f: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>, width: u16) {
+pub(crate) fn modal(f: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>, width: u16) {
     let w = width.min(area.width.saturating_sub(2));
     let h = (lines.len() as u16 + 2).min(area.height);
     if w < 20 || h < 4 {
