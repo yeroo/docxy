@@ -98,6 +98,19 @@ pub fn new_record_changes(
     Ok(changes)
 }
 
+/// Whether deleting the record in `row` of `area` would move or cut part of
+/// an array: some array formula's cells (its anchor and the block it spills
+/// or fills) lie in the list's columns from `row` down to the last record.
+/// Delete is refused then, as a cut that splits an array is.
+pub fn delete_splits_array(s: &Sheet, (_, c1, bottom, c2): Area, row: u32) -> bool {
+    let hits =
+        |r1: u32, k1: u32, r2: u32, k2: u32| r1 <= bottom && r2 >= row && k1 <= c2 && k2 >= c1;
+    s.cells.iter().any(|(&(r, c), cell)| {
+        let (h, w) = cell.spill.unwrap_or((1, 1));
+        (cell.is_array_formula() || h * w > 1) && hits(r, c, r + h - 1, c + w - 1)
+    })
+}
+
 /// Delete the record in `row` of `area` on sheet `sheet`, as Excel's form
 /// does: within the list's columns, the records below move up a row and the
 /// list's last row is left blank; cells beside the list stay where they are.
@@ -107,7 +120,7 @@ pub fn new_record_changes(
 /// moved cells keeps its text (`SUM(B3:B4)` with row 3 deleted still reads
 /// `B3:B4`). Comments, merges, hyperlinks, and conditional-format and
 /// validation ranges don't move. The caller refuses a delete that would
-/// change part of an array first.
+/// move part of an array first ([`delete_splits_array`]).
 pub fn delete_record(wb: &mut Workbook, sheet: usize, (_, c1, bottom, c2): Area, row: u32) {
     let name = wb.sheets[sheet].name.clone();
     // Pushed off the grid, a reference to the deleted cells is poisoned.
@@ -388,6 +401,40 @@ mod tests {
         delete_record(&mut wb, 0, AREA, 2);
         assert_eq!(formula(&wb, 10, 4).as_deref(), Some("SUM(B3:B4)"));
         assert_eq!(formula(&wb, 11, 4).as_deref(), Some("SUM(B2:B4)"));
+    }
+
+    #[test]
+    fn delete_refused_over_an_array() {
+        let mut wb = list();
+        assert!(!delete_splits_array(&wb.sheets[0], AREA, 1));
+        // A spill from above the list into its column B rows 1..=2.
+        let mut anchor = Cell::formula("SEQUENCE(3)");
+        anchor.spill = Some((3, 1));
+        wb.sheets[0].set_cell(10, 1, anchor.clone());
+        assert!(
+            !delete_splits_array(&wb.sheets[0], AREA, 1),
+            "below the list"
+        );
+        wb.sheets[0].cells.remove(&(10, 1));
+        wb.sheets[0].set_cell(0, 6, anchor.clone());
+        assert!(
+            !delete_splits_array(&wb.sheets[0], AREA, 1),
+            "beside the list"
+        );
+        let mut short = anchor;
+        short.spill = Some((2, 1));
+        wb.sheets[0].set_cell(0, 1, short);
+        assert!(delete_splits_array(&wb.sheets[0], AREA, 1));
+        assert!(
+            !delete_splits_array(&wb.sheets[0], AREA, 2),
+            "above the deleted row"
+        );
+        // A one-cell CSE array formula in a moved row.
+        let mut wb = list();
+        let c = wb.sheets[0].cells.get_mut(&(3, 2)).unwrap();
+        c.f_attrs = Some("t=\"array\" ref=\"C4\"".into());
+        assert!(delete_splits_array(&wb.sheets[0], AREA, 1));
+        assert!(delete_splits_array(&wb.sheets[0], AREA, 3));
     }
 
     #[test]

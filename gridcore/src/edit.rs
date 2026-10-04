@@ -16,8 +16,8 @@ mod clip;
 pub use clip::{MAX_PASTE_CELLS, PASTE_SHAPE, move_refs, paste_tiles, tiled_block};
 mod dataform;
 pub use dataform::{
-    CANNOT_EXTEND, criterion_matches, delete_record, find_record, is_formula_field,
-    new_record_changes, record_matches,
+    CANNOT_EXTEND, criterion_matches, delete_record, delete_splits_array, find_record,
+    is_formula_field, new_record_changes, record_matches,
 };
 mod subtotal;
 pub use subtotal::{
