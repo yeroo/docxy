@@ -6353,6 +6353,35 @@ mod table_verb_tests {
     }
 
     #[test]
+    fn replace_all_through_a_header_renames_the_column_683() {
+        let mut a = app_683("Sales", &["Item", "Qty", "Price", "Region"], 4);
+        put(&mut a, "F2", "=SUM(Sales[Qty])");
+        put(&mut a, "G2", "=SUM(Sales[Price])");
+        call(
+            &mut a,
+            "wb.replace-all",
+            vec![("query", "Qty"), ("text", "Units")],
+        )
+        .unwrap();
+        assert_eq!(table_columns(&mut a), ["Item", "Units", "Price", "Region"]);
+        assert_eq!(
+            formula_value(&mut a, "F2"),
+            (Some("=SUM(Sales[Units])".into()), Some("50".into()))
+        );
+        // A header it didn't write keeps its column, and its name.
+        assert_eq!(
+            formula_value(&mut a, "G2"),
+            (Some("=SUM(Sales[Price])".into()), Some("90".into()))
+        );
+        a.undo();
+        assert_eq!(table_columns(&mut a), ["Item", "Qty", "Price", "Region"]);
+        assert_eq!(
+            formula_value(&mut a, "F2"),
+            (Some("=SUM(Sales[Qty])".into()), Some("50".into()))
+        );
+    }
+
+    #[test]
     fn col_delete_of_a_whole_table_removes_it_on_save_683() {
         let tmp = std::env::temp_dir().join(format!("xlsxy-683-{}.xlsx", std::process::id()));
         let mut a = app_683("Calc", &["Qty", "Price", "Line"], 3);

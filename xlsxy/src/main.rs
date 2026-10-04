@@ -2622,6 +2622,7 @@ impl App {
             self.put_back(&before);
             return Err(e);
         }
+        self.sync_written_headers(&before);
         let mut after = self.wb_snapshot();
         if let Some((old, new)) = model_rename {
             self.rename_table_in_model(old, new);
@@ -2638,6 +2639,38 @@ impl App {
         self.clamp_cursor();
         self.cancel_cut();
         Ok(())
+    }
+
+    /// A structural edit that wrote a table's header cells (Replace All,
+    /// Text to Columns, a sort, AutoSum…) renames those columns as typing
+    /// there does ([`gridcore::edit::sync_table_headers`]). Only a header that
+    /// differs from `before` while its table kept its name and range counts:
+    /// a table the edit moved, resized or renamed had its header text moved
+    /// with it, not written, and a loaded header that merely reads otherwise
+    /// than its column's name (a number, say) is left as the file has it.
+    fn sync_written_headers(&mut self, before: &WbSnapshot) {
+        let wb = &self.pkg.workbook;
+        let mut written: Vec<(usize, Vec<(u32, u32)>)> = Vec::new();
+        for t in &wb.tables {
+            let kept = before.tables.iter().any(|b| {
+                b.sheet == t.sheet && b.range == t.range && b.name.eq_ignore_ascii_case(&t.name)
+            });
+            if t.header_rows == 0 || !kept {
+                continue;
+            }
+            let (r1, c1, _, c2) = t.range;
+            let was = |c| before.sheets.get(t.sheet).and_then(|s| s.cell(r1, c));
+            let cells: Vec<(u32, u32)> = (c1..=c2)
+                .filter(|&c| was(c) != wb.sheets[t.sheet].cell(r1, c))
+                .map(|c| (r1, c))
+                .collect();
+            if !cells.is_empty() {
+                written.push((t.sheet, cells));
+            }
+        }
+        for (s, cells) in written {
+            gridcore::edit::sync_table_headers(&mut self.pkg.workbook, s, &cells);
+        }
     }
 
     /// The data model follows table `old` being renamed `new`: its
@@ -5997,6 +6030,7 @@ impl App {
             }
             Ok(msg) => {
                 self.status = Some(msg);
+                self.sync_written_headers(&before);
                 if !gridcore::edit::sheets_differ(&before.sheets, &self.pkg.workbook.sheets) {
                     return Ok(false);
                 }
@@ -13684,6 +13718,19 @@ mod tests {
         app.apply_on(0, vec![(0, 1, Cell::default())]);
         assert_eq!(header_state(&app).0, "Column2");
         assert_eq!(header_state(&app).2, "SUM(Sales[Column2])");
+    }
+
+    #[test]
+    fn text_to_columns_over_a_header_renames_the_columns_683() {
+        // A1 `Item;Units` split on `;` writes B1, the Qty header.
+        let mut app = header_app();
+        app.apply_on(0, vec![(0, 0, parse_input("Item;Units"))]);
+        let src = gridcore::edit::TtcSource::new(0, (0, 0, 0, 0)).unwrap();
+        app.apply_text_to_columns(&src, &TextParse::csv(';'));
+        assert_eq!(header_state(&app).1, ["Item", "Units"]);
+        assert_eq!(header_state(&app).2, "SUM(Sales[Units])");
+        let d1 = app.pkg.workbook.sheets[0].cell(0, 3).unwrap();
+        assert_eq!(d1.value, CellValue::Number(7.0));
     }
 
     #[test]
