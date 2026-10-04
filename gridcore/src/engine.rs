@@ -2268,6 +2268,8 @@ fn spill_owner(sheet: &Sheet, r: u32, c: u32) -> Option<((u32, u32), (u32, u32))
 /// (a whole-table dep would make calculated columns self-referential).
 fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth: u32) {
     let (sheet, row, col) = key;
+    let pruned = without_position_refs(wb, sheet, ast);
+    let ast = pruned.as_ref().unwrap_or(ast);
     let mut named = Vec::new();
     collect_refs(ast, &mut named);
     for (sheet_name, r1, c1, r2, c2) in named {
@@ -2328,6 +2330,22 @@ fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth:
             }
         }
     }
+    // A bare table name (`=SUM(Sales)`) reads the data body. Names a LET or
+    // LAMBDA binds, and function names (`PRODUCT(…)` beside a table
+    // `Product`), are not tables; a defined name wins over a table.
+    let mut free = Vec::new();
+    formula::collect_free_names(ast, &mut free);
+    for n in free {
+        if wb.defined_name(&n, sheet).is_some() {
+            continue;
+        }
+        if let Some(t) = wb.table(&n) {
+            let info = t.info();
+            if let Some(rect) = info.resolve(formula::TableItem::Data, &None, &None, row) {
+                out.push((t.sheet, rect.0, rect.1, rect.2, rect.3));
+            }
+        }
+    }
     if depth >= 8 {
         return;
     }
@@ -2344,6 +2362,147 @@ fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth:
             }
         }
     }
+}
+
+/// `ast` without the reference arguments of ROW, COLUMN, ROWS and COLUMNS,
+/// or `None` when it has none. Those functions read where a reference is,
+/// not the values in it, so a literal reference there is no dependency:
+/// `=ROWS(Sales)` in a calculated column of `Sales` is no circle. Cells,
+/// ranges, whole rows/columns, structured references, bare table names and
+/// defined names that are one of those go; a spill reference (its extent
+/// follows the anchor), a computed definition (OFFSET, INDEX…) and any
+/// computed argument keep their dependencies. Where a LET or LAMBDA binds
+/// one of the four names to what may be a lambda, a call of that name keeps
+/// its arguments: `row(B1)` there may call the lambda, which reads B1.
+fn without_position_refs(wb: &Workbook, sheet: usize, ast: &Expr) -> Option<Expr> {
+    fn is_position_fn(name: &str) -> bool {
+        ["ROW", "COLUMN", "ROWS", "COLUMNS"]
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(name))
+    }
+    fn has_position_fn(e: &Expr) -> bool {
+        match e {
+            Expr::Func(name, args) => is_position_fn(name) || args.iter().any(has_position_fn),
+            Expr::Call(callee, args) => has_position_fn(callee) || args.iter().any(has_position_fn),
+            Expr::ArrayLit(rows) => rows.iter().flatten().any(has_position_fn),
+            Expr::Un(_, x) => has_position_fn(x),
+            Expr::Bin(_, l, r) => has_position_fn(l) || has_position_fn(r),
+            _ => false,
+        }
+    }
+    // A reference whose position alone is read: a literal reference form, a
+    // table name, or a defined name whose definition is one (depth-capped as
+    // collect_deps expands names).
+    fn position_only(wb: &Workbook, sheet: usize, a: &Expr, depth: u32) -> bool {
+        match a {
+            Expr::Ref(_)
+            | Expr::Range(..)
+            | Expr::ColRange { .. }
+            | Expr::RowRange { .. }
+            | Expr::Structured { .. } => true,
+            Expr::Name(n) => match wb.defined_name(n, sheet) {
+                Some(def) => {
+                    depth < 8
+                        && formula::parse(def)
+                            .is_ok_and(|d| position_only(wb, sheet, &d, depth + 1))
+                }
+                None => wb.table(n).is_some(),
+            },
+            _ => false,
+        }
+    }
+    // `scope` holds every LET variable and LAMBDA parameter bound at this
+    // point of the walk, with whether it may hold a lambda
+    // ([`formula::may_bind_lambda`]; a parameter always may). A LET
+    // variable is bound from the slot after its value. A call of ROW,
+    // COLUMN, ROWS or COLUMNS that a binding in scope may hold a lambda for
+    // keeps its arguments: the evaluator's `let_lambda` calls that lambda.
+    fn prune(wb: &Workbook, sheet: usize, e: &Expr, scope: &mut Vec<(String, bool)>) -> Expr {
+        let each = |args: &[Expr], scope: &mut Vec<(String, bool)>| -> Vec<Expr> {
+            args.iter().map(|a| prune(wb, sheet, a, scope)).collect()
+        };
+        match e {
+            Expr::Func(name, args) if name.eq_ignore_ascii_case("LET") => {
+                let (mark, last) = (scope.len(), args.len().saturating_sub(1));
+                let mut pending = None;
+                let mut out = Vec::with_capacity(args.len());
+                for (i, a) in args.iter().enumerate() {
+                    match a {
+                        Expr::Name(n) if i < last && i % 2 == 0 => {
+                            pending = Some(formula::bare_param(n).to_string());
+                            out.push(a.clone());
+                        }
+                        _ => {
+                            out.push(prune(wb, sheet, a, scope));
+                            if let Some(n) = pending.take() {
+                                let lambda = formula::may_bind_lambda(a, |m| {
+                                    let m = formula::bare_param(m);
+                                    let mut hits =
+                                        scope.iter().filter(|(s, _)| s.eq_ignore_ascii_case(m));
+                                    let first = hits.next()?;
+                                    Some(first.1 || hits.any(|(_, l)| *l))
+                                });
+                                scope.push((n, lambda));
+                            }
+                        }
+                    }
+                }
+                scope.truncate(mark);
+                Expr::Func(name.clone(), out)
+            }
+            Expr::Func(name, args) if name.eq_ignore_ascii_case("LAMBDA") => {
+                let (mark, last) = (scope.len(), args.len().saturating_sub(1));
+                for p in &args[..last] {
+                    if let Expr::Name(n)
+                    | Expr::Structured {
+                        table: None,
+                        item: formula::TableItem::Data,
+                        col1: Some(n),
+                        col2: None,
+                    } = p
+                    {
+                        scope.push((formula::bare_param(n).to_string(), true));
+                    }
+                }
+                let out = each(args, scope);
+                scope.truncate(mark);
+                Expr::Func(name.clone(), out)
+            }
+            Expr::Func(name, args)
+                if is_position_fn(name)
+                    && !scope
+                        .iter()
+                        .any(|(s, lambda)| *lambda && s.eq_ignore_ascii_case(name)) =>
+            {
+                let out = args
+                    .iter()
+                    .map(|a| {
+                        if position_only(wb, sheet, a, 0) {
+                            Expr::Missing
+                        } else {
+                            prune(wb, sheet, a, scope)
+                        }
+                    })
+                    .collect();
+                Expr::Func(name.clone(), out)
+            }
+            Expr::Func(name, args) => Expr::Func(name.clone(), each(args, scope)),
+            Expr::Call(callee, args) => {
+                let callee = prune(wb, sheet, callee, scope);
+                Expr::Call(Box::new(callee), each(args, scope))
+            }
+            Expr::ArrayLit(rows) => {
+                Expr::ArrayLit(rows.iter().map(|row| each(row, scope)).collect())
+            }
+            Expr::Un(op, x) => Expr::Un(*op, Box::new(prune(wb, sheet, x, scope))),
+            Expr::Bin(op, l, r) => {
+                let l = prune(wb, sheet, l, scope);
+                Expr::Bin(*op, Box::new(l), Box::new(prune(wb, sheet, r, scope)))
+            }
+            other => other.clone(),
+        }
+    }
+    has_position_fn(ast).then(|| prune(wb, sheet, ast, &mut Vec::new()))
 }
 
 /// (always recalculate, calls a D-function) for a formula, looking through
@@ -4853,6 +5012,230 @@ mod tests {
         // Editing a row inside the iterated table recalculates the SUMX.
         set(&mut eng, &mut wb, "B3", Cell::number(100.0));
         assert_eq!(value_at(&wb, "D1"), CellValue::Number(320.0));
+    }
+
+    #[test]
+    fn bare_table_names_measure_and_track_dependencies() {
+        // #679: a bare table name is its data body — ROWS/ROW/COLUMN measure
+        // it, and `=SUM(Sales)` recalculates when a data cell changes. The
+        // table sits at B2:C4 so positions are the sheet's, not the table's.
+        let mut wb = wb_one_sheet(&[
+            ("B2", Cell::text("Qty")),
+            ("C2", Cell::text("Price")),
+            ("B3", Cell::number(2.0)),
+            ("C3", Cell::number(10.0)),
+            ("B4", Cell::number(3.0)),
+            ("C4", Cell::number(5.0)),
+            ("E1", Cell::formula("ROWS(Sales)")),
+            ("E2", Cell::formula("COLUMN(Sales[Price])")),
+            ("E3", Cell::formula("ROW(Sales[#Headers])")),
+            ("E4", Cell::formula("SUM(Sales)")),
+            ("E5", Cell::formula("Total")),
+        ]);
+        wb.tables.push(crate::sheet::Table {
+            name: "Sales".to_string(),
+            sheet: 0,
+            range: (1, 1, 3, 2),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: vec!["Qty".into(), "Price".into()],
+            part: String::new(),
+        });
+        // A defined name whose definition is the bare table name.
+        wb.defined_names.push(crate::sheet::DefinedName {
+            name: "Total".into(),
+            scope: None,
+            formula: "SUM(Sales)".into(),
+        });
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(2.0));
+        assert_eq!(value_at(&wb, "E2"), CellValue::Number(3.0));
+        assert_eq!(value_at(&wb, "E3"), CellValue::Number(2.0));
+        assert_eq!(value_at(&wb, "E4"), CellValue::Number(20.0));
+        assert_eq!(value_at(&wb, "E5"), CellValue::Number(20.0));
+        // Editing a data cell recalculates the bare-name SUMs.
+        set(&mut eng, &mut wb, "B4", Cell::number(30.0));
+        assert_eq!(value_at(&wb, "E4"), CellValue::Number(47.0));
+        assert_eq!(value_at(&wb, "E5"), CellValue::Number(47.0));
+    }
+
+    /// A two-row table `name` on A1:D3 (Item, Qty, Price, Calc) whose Calc
+    /// column holds `calc` in both data rows.
+    fn calc_column_wb(name: &str, calc: &str) -> Workbook {
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::text("Item")),
+            ("B1", Cell::text("Qty")),
+            ("C1", Cell::text("Price")),
+            ("D1", Cell::text("Calc")),
+            ("A2", Cell::text("pen")),
+            ("B2", Cell::number(3.0)),
+            ("C2", Cell::number(2.0)),
+            ("D2", Cell::formula(calc)),
+            ("A3", Cell::text("pad")),
+            ("B3", Cell::number(4.0)),
+            ("C3", Cell::number(5.0)),
+            ("D3", Cell::formula(calc)),
+        ]);
+        wb.tables.push(crate::sheet::Table {
+            name: name.to_string(),
+            sheet: 0,
+            range: (0, 0, 2, 3),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: vec!["Item".into(), "Qty".into(), "Price".into(), "Calc".into()],
+            part: String::new(),
+        });
+        wb
+    }
+
+    #[test]
+    fn function_and_let_names_do_not_depend_on_a_same_named_table() {
+        // #679 FIX r1 M1: a call `PRODUCT(…)` or a LET variable `Product` is
+        // not the table `Product`; neither may make its calculated column
+        // depend on itself.
+        for (calc, d2, d3) in [
+            ("PRODUCT([@Qty],[@Price])", 6.0, 20.0),
+            ("LET(Product,[@Qty],Product*[@Price])", 6.0, 20.0),
+            ("LET(_xlpm.Product,[@Qty],_xlpm.Product*2)", 6.0, 8.0),
+            ("LAMBDA(Product,Product+1)([@Qty])", 4.0, 5.0),
+        ] {
+            let mut wb = calc_column_wb("Product", calc);
+            let mut eng = Engine::new(&wb);
+            eng.recalc_all(&mut wb);
+            assert_eq!(eng.circular_refs(), Vec::<Key>::new(), "{calc}");
+            assert_eq!(value_at(&wb, "D2"), CellValue::Number(d2), "{calc}");
+            assert_eq!(value_at(&wb, "D3"), CellValue::Number(d3), "{calc}");
+        }
+    }
+
+    #[test]
+    fn position_functions_do_not_read_their_reference_arguments() {
+        // #679 FIX r1 M2: ROW/COLUMN/ROWS/COLUMNS read where a reference is,
+        // not its values, so a calculated column measuring its own table is
+        // no circle.
+        for (calc, d2, d3) in [
+            ("ROWS(Sales)", 2.0, 2.0),
+            ("COLUMNS(Sales)", 4.0, 4.0),
+            ("ROW()-ROW(Sales)+1", 1.0, 2.0),
+            ("COLUMN(Sales[Calc])", 4.0, 4.0),
+            ("ROWS(Sales[#All])", 3.0, 3.0),
+            ("ROWS(A1:D3)+COLUMN(D2)", 7.0, 7.0),
+        ] {
+            let mut wb = calc_column_wb("Sales", calc);
+            wb.sheets[0].set_cell(0, 6, Cell::formula("ROWS(Sales)"));
+            let mut eng = Engine::new(&wb);
+            eng.recalc_all(&mut wb);
+            assert_eq!(eng.circular_refs(), Vec::<Key>::new(), "{calc}");
+            assert_eq!(value_at(&wb, "D2"), CellValue::Number(d2), "{calc}");
+            assert_eq!(value_at(&wb, "D3"), CellValue::Number(d3), "{calc}");
+            assert_eq!(value_at(&wb, "G1"), CellValue::Number(2.0), "{calc}");
+        }
+        // Reading the values is still a circle.
+        let mut wb = calc_column_wb("Sales", "SUM(Sales[Qty])+COUNT(Sales)");
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(eng.circular_refs(), vec![(0, 1, 3), (0, 2, 3)]);
+        // A computed argument keeps its dependencies.
+        let mut wb = calc_column_wb("Sales", "ROWS(FILTER(B2:B3,B2:B3>3))");
+        wb.sheets[0].set_cell(0, 6, Cell::formula("ROWS(FILTER(B2:B3,B2:B3>3))"));
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "G1"), CellValue::Number(1.0));
+        set(&mut eng, &mut wb, "B2", Cell::number(9.0));
+        assert_eq!(value_at(&wb, "G1"), CellValue::Number(2.0));
+    }
+
+    #[test]
+    fn a_lambda_named_like_a_position_function_keeps_its_dependencies() {
+        // #679 FIX r2 m1: `row` bound by LET is the lambda, not ROW — its
+        // argument is a value read.
+        let mut wb = wb_one_sheet(&[
+            ("B1", Cell::number(3.0)),
+            ("C1", Cell::formula("LET(row,LAMBDA(r,r*2),row(B1))")),
+            (
+                "C2",
+                Cell::formula("LAMBDA(columns,columns(B1))(LAMBDA(x,x+1))"),
+            ),
+            // #679 FIX r4 m1: `sum` is a local lambda, so `sum(1)` may be one.
+            (
+                "C3",
+                Cell::formula("LET(sum,LAMBDA(a,LAMBDA(b,b*2)),row,sum(1),row(B1))"),
+            ),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(6.0));
+        assert_eq!(value_at(&wb, "C2"), CellValue::Number(4.0));
+        assert_eq!(value_at(&wb, "C3"), CellValue::Number(6.0));
+        set(&mut eng, &mut wb, "B1", Cell::number(10.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(20.0));
+        assert_eq!(value_at(&wb, "C2"), CellValue::Number(11.0));
+        assert_eq!(value_at(&wb, "C3"), CellValue::Number(20.0));
+    }
+
+    #[test]
+    fn let_variables_named_like_position_functions_keep_pruning() {
+        // #679 FIX r3 M1: a LET variable `rows`/`row` holding a number is no
+        // lambda, so ROWS/ROW in its scope are still the builtins and measure
+        // the table without reading it. A lambda bound to the name shadows
+        // the builtin only inside the LET's scope, not in its own value.
+        for (calc, d2, d3) in [
+            ("LET(rows,ROWS(Sales),[@Qty]/rows)", 1.5, 2.0),
+            ("LET(row,ROW()-ROW(Sales)+1,row)", 1.0, 2.0),
+            (
+                "LET(columns,4,rows,ROWS(Sales),columns*rows+COLUMNS(Sales))",
+                12.0,
+                12.0,
+            ),
+            ("LET(row,LAMBDA(x,x*ROWS(Sales)),row(2))", 4.0, 4.0),
+        ] {
+            let mut wb = calc_column_wb("Sales", calc);
+            let mut eng = Engine::new(&wb);
+            eng.recalc_all(&mut wb);
+            assert_eq!(eng.circular_refs(), Vec::<Key>::new(), "{calc}");
+            assert_eq!(value_at(&wb, "D2"), CellValue::Number(d2), "{calc}");
+            assert_eq!(value_at(&wb, "D3"), CellValue::Number(d3), "{calc}");
+        }
+    }
+
+    #[test]
+    fn position_functions_of_reference_names_are_no_circle() {
+        // #679 FIX r2: a defined name that is a plain reference (or names a
+        // table) is measured, not read, so using it inside its own range is
+        // no circle. A computed definition keeps its dependency.
+        let mut wb = calc_column_wb("Sales", "ROWS(MySales)+ROW()-ROW(Data)");
+        wb.sheets[0].set_cell(5, 0, Cell::formula("ROW()-ROW(Data)+1"));
+        wb.sheets[0].set_cell(6, 0, Cell::formula("ROW()-ROW(Data)+1"));
+        for (name, def) in [("Data", "Sheet1!$A$6:$A$100"), ("MySales", "Sales")] {
+            wb.defined_names.push(crate::sheet::DefinedName {
+                name: name.into(),
+                scope: None,
+                formula: def.into(),
+            });
+        }
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(eng.circular_refs(), Vec::<Key>::new());
+        assert_eq!(value_at(&wb, "A6"), CellValue::Number(1.0));
+        assert_eq!(value_at(&wb, "A7"), CellValue::Number(2.0));
+        assert_eq!(value_at(&wb, "D2"), CellValue::Number(-2.0));
+        assert_eq!(value_at(&wb, "D3"), CellValue::Number(-1.0));
+        // OFFSET-based: the definition reads A6, so the dependency stays.
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(2.0)),
+            ("C1", Cell::formula("ROWS(Grow)")),
+        ]);
+        wb.defined_names.push(crate::sheet::DefinedName {
+            name: "Grow".into(),
+            scope: None,
+            formula: "OFFSET(Sheet1!$B$1,0,0,Sheet1!$A$1,1)".into(),
+        });
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(2.0));
+        set(&mut eng, &mut wb, "A1", Cell::number(5.0));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(5.0));
     }
 
     #[test]
