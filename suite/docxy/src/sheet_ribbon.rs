@@ -548,6 +548,12 @@ pub(crate) const SHEET_RIBBON: &[Tab] = &[
                             None,
                             SheetAct::DataValidation,
                         )),
+                        Item::One(large(
+                            "consolidate",
+                            "Consolidate",
+                            None,
+                            SheetAct::Consolidate,
+                        )),
                     ],
                 },
             },

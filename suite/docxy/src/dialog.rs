@@ -115,6 +115,13 @@ pub(crate) enum DialogOwner {
         c2: u32,
         header: bool,
     },
+    /// Excel's Consolidate (#694), writing at (`row`, `col`) of `sheet`.
+    /// Add, Delete and OK apply in `sheet_consolidate::click`.
+    Consolidate {
+        sheet: usize,
+        row: u32,
+        col: u32,
+    },
     /// The outline Settings (#693): where summary rows and columns sit.
     OutlineSettings,
     /// Group's (Ungroup's) "Rows or Columns?" over a block selection (#693).

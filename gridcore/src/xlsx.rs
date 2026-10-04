@@ -22,6 +22,7 @@ use opccore::xml::{Event, XmlParser};
 use opccore::zip::ZipArchive;
 use opccore::zipwrite::write_zip;
 
+mod consolidate;
 mod page;
 mod repair;
 pub use repair::{Repairs, load_xlsx_repair};
@@ -2054,6 +2055,8 @@ fn parse_worksheet(
     sheet.page_setup_loaded = sheet.page_setup.clone();
     sheet.outline = page::read_outline_pr(xml);
     sheet.outline_loaded = sheet.outline;
+    sheet.consolidate = consolidate::read(xml);
+    sheet.consolidate_loaded = sheet.consolidate.clone();
     sheet
 }
 
@@ -3668,6 +3671,12 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
         sheet.max_row_outline(),
         sheet.max_col_outline(),
         sheet.format.default_row_height,
+    );
+    // Data > Consolidate's settings: only when they changed.
+    let out = consolidate::write(
+        &out,
+        sheet.consolidate.as_ref(),
+        sheet.consolidate_loaded.as_ref(),
     );
     // The sheet's autoFilter: rewritten only where a structural edit moved it.
     let out = set_auto_filter(out, sheet.auto_filter.as_ref());
@@ -17480,6 +17489,137 @@ mod ct_worksheet_order_tests {
             ws.contains(r#"<col min="1" max="1" width="12.5" outlineLevel="1"/>"#),
             "{ws}"
         );
+    }
+
+    const CONSOLIDATED: &str = r#"<dataConsolidate function="average" startLabels="1" topLabels="1"><dataRefs count="3"><dataRef ref="A1:B2" sheet="My sheet"/><dataRef name="Totals"/><dataRef ref="A1" sheet="X" r:id="rId9"/></dataRefs></dataConsolidate>"#;
+
+    #[test]
+    fn data_consolidate_settings_load_and_an_untouched_element_keeps_its_bytes() {
+        let pkg = loaded(&format!(
+            r#"{ROWS}<autoFilter ref="A1:B2"/>{CONSOLIDATED}<mergeCells count="1"><mergeCell ref="D1:E1"/></mergeCells>{MARGINS}"#
+        ));
+        let s = &pkg.workbook.sheets[0];
+        let want = crate::edit::ConsolidateSettings {
+            func: crate::edit::SubtotalFunc::Average,
+            // Another workbook's reference (r:id) is left out.
+            refs: vec!["'My sheet'!$A$1:$B$2".into(), "Totals".into()],
+            top_row: true,
+            left_col: true,
+            links: false,
+        };
+        assert_eq!(s.consolidate.as_ref(), Some(&want));
+        assert_eq!(s.consolidate_loaded, s.consolidate);
+        let ws = saved_sheet(&pkg);
+        assert!(ws.contains(CONSOLIDATED), "{ws}");
+        // Nothing else on the sheet is a Consolidate setting.
+        let plain = loaded(&format!("{ROWS}{MARGINS}"));
+        assert_eq!(plain.workbook.sheets[0].consolidate, None);
+    }
+
+    #[test]
+    fn settings_are_remembered_and_round_trip_through_data_consolidate() {
+        let mut pkg = loaded(&format!(
+            r#"{ROWS}<autoFilter ref="A1:B2"/>{CONSOLIDATED}<mergeCells count="1"><mergeCell ref="D1:E1"/></mergeCells>{MARGINS}"#
+        ));
+        let changed = crate::edit::ConsolidateSettings {
+            func: crate::edit::SubtotalFunc::CountNums,
+            refs: vec![
+                "'My sheet'!$A$1:$B$2".into(),
+                "East!$C$3".into(),
+                "Totals".into(),
+            ],
+            top_row: false,
+            left_col: true,
+            links: true,
+        };
+        pkg.workbook.sheets[0].consolidate = Some(changed.clone());
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert!(
+            ws.contains(r#"<dataConsolidate function="countNums" leftLabels="1" link="1"><dataRefs count="3"><dataRef ref="A1:B2" sheet="My sheet"/><dataRef ref="C3" sheet="East"/><dataRef name="Totals"/></dataRefs></dataConsolidate>"#),
+            "{ws}"
+        );
+        assert_eq!(ws.matches("<dataConsolidate").count(), 1, "{ws}");
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(re.workbook.sheets[0].consolidate, Some(changed));
+        // Cleared, the element goes.
+        pkg.workbook.sheets[0].consolidate = None;
+        let ws = saved_sheet(&pkg);
+        assert!(!ws.contains("dataConsolidate"), "{ws}");
+    }
+
+    #[test]
+    fn a_new_data_consolidate_lands_in_schema_order() {
+        let mut pkg = loaded(&format!(
+            r#"{ROWS}<sortState ref="A2:B2"><sortCondition ref="A2:A2"/></sortState><mergeCells count="1"><mergeCell ref="D1:E1"/></mergeCells>{MARGINS}"#
+        ));
+        pkg.workbook.sheets[0].consolidate = Some(crate::edit::ConsolidateSettings {
+            refs: vec!["Sheet1!$A$1:$B$2".into()],
+            ..Default::default()
+        });
+        let ws = saved_sheet(&pkg);
+        assert_ct_worksheet_order(&ws);
+        assert!(
+            ws.contains(r#"<dataConsolidate><dataRefs count="1"><dataRef ref="A1:B2" sheet="Sheet1"/></dataRefs></dataConsolidate>"#),
+            "{ws}"
+        );
+        assert!(
+            at(&ws, "</sortState>") < at(&ws, "<dataConsolidate"),
+            "{ws}"
+        );
+        assert!(
+            at(&ws, "</dataConsolidate>") < at(&ws, "<mergeCells"),
+            "{ws}"
+        );
+    }
+
+    /// DAT-CASE-035: a linked consolidation as Excel leaves it (formulas
+    /// with cached values, hidden level-1 detail rows, collapsed summary
+    /// rows), saved and reopened, recalculates to the values it cached.
+    #[test]
+    fn a_saved_linked_consolidation_recalculates_to_its_cached_values() {
+        let mut pkg = new_xlsx_sheets(&["East".into(), "West".into(), "Summary".into()]);
+        let part = |pkg: &SheetPackage, i: usize| pkg.sheet_parts[i].clone();
+        let sheet = |rows: &str| {
+            format!(
+                r#"<?xml version="1.0"?><worksheet xmlns="{NS}" xmlns:r="{R}"><sheetData>{rows}</sheetData>{MARGINS}</worksheet>"#
+            )
+        };
+        let east = sheet(
+            r#"<row r="1"><c r="B1" t="inlineStr"><is><t>Jan</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>A</t></is></c><c r="B2"><v>1</v></c></row><row r="3"><c r="A3" t="inlineStr"><is><t>B</t></is></c><c r="B3"><v>3</v></c></row>"#,
+        );
+        let west = sheet(
+            r#"<row r="1"><c r="B1" t="inlineStr"><is><t>jan</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>a</t></is></c><c r="B2"><v>40</v></c></row>"#,
+        );
+        let summary = format!(
+            r#"<?xml version="1.0"?><worksheet xmlns="{NS}" xmlns:r="{R}"><sheetPr><outlinePr summaryBelow="1"/></sheetPr><sheetFormatPr defaultRowHeight="15" outlineLevelRow="1"/><sheetData><row r="1"><c r="C1" t="inlineStr"><is><t>Jan</t></is></c></row><row r="2" hidden="1" outlineLevel="1"><c r="B2" t="inlineStr"><is><t>Book1</t></is></c><c r="C2"><f>East!$B$2</f><v>1</v></c></row><row r="3" hidden="1" outlineLevel="1"><c r="B3" t="inlineStr"><is><t>Book1</t></is></c><c r="C3"><f>West!$B$2</f><v>40</v></c></row><row r="4" collapsed="1"><c r="A4" t="inlineStr"><is><t>A</t></is></c><c r="C4"><f>SUM(C2:C3)</f><v>41</v></c></row><row r="5" hidden="1" outlineLevel="1"><c r="B5" t="inlineStr"><is><t>Book1</t></is></c><c r="C5"><f>East!$B$3</f><v>3</v></c></row><row r="6" collapsed="1"><c r="A6" t="inlineStr"><is><t>B</t></is></c><c r="C6"><f>SUM(C5)</f><v>3</v></c></row></sheetData><dataConsolidate topLabels="1" leftLabels="1" link="1"><dataRefs count="2"><dataRef ref="A1:B3" sheet="East"/><dataRef ref="A1:B2" sheet="West"/></dataRefs></dataConsolidate>{MARGINS}</worksheet>"#
+        );
+        for (i, xml) in [east, west, summary].into_iter().enumerate() {
+            let p = part(&pkg, i);
+            pkg.set_part(&p, xml.into_bytes());
+        }
+        let mut pkg = load_xlsx(&write_zip(&pkg.parts)).expect("load");
+        let mut re = load_xlsx(&save_xlsx(&pkg)).expect("reload");
+        for p in [&mut pkg, &mut re] {
+            let cached: Vec<CellValue> = ["C2", "C3", "C4", "C5", "C6"]
+                .iter()
+                .map(|n| {
+                    let (r, c) = crate::sheet::parse_cell_name(n).unwrap();
+                    p.workbook.sheets[2].cell(r, c).unwrap().value.clone()
+                })
+                .collect();
+            let mut eng = crate::engine::Engine::new(&p.workbook);
+            eng.recalc_all(&mut p.workbook);
+            let s = &p.workbook.sheets[2];
+            let now: Vec<CellValue> = [(1, 2), (2, 2), (3, 2), (4, 2), (5, 2)]
+                .iter()
+                .map(|&(r, c)| s.cell(r, c).unwrap().value.clone())
+                .collect();
+            assert_eq!(now, cached);
+            assert_eq!(now[2], CellValue::Number(41.0));
+            assert!(s.row_hidden(1) && s.row_outline(1) == 1 && s.row_collapsed(3));
+            assert!(s.consolidate.as_ref().is_some_and(|c| c.links));
+        }
     }
 }
 

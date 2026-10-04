@@ -608,6 +608,12 @@ pub struct Sheet {
     pub outline: OutlineSettings,
     /// The outline settings the worksheet part held at load.
     pub outline_loaded: OutlineSettings,
+    /// Data ▸ Consolidate's settings for this sheet as destination
+    /// (`<dataConsolidate>`): the dialog starts from them. A save writes the
+    /// element only when they differ from [`Sheet::consolidate_loaded`].
+    pub consolidate: Option<crate::edit::ConsolidateSettings>,
+    /// The Consolidate settings the worksheet part held at load.
+    pub consolidate_loaded: Option<crate::edit::ConsolidateSettings>,
 }
 
 /// Excel's outline settings (`<outlinePr summaryBelow summaryRight>`): a

@@ -1,13 +1,16 @@
 //! Data ▸ Outline's dialogs: Subtotal (with Remove All), Settings, and the
 //! Rows/Columns choice Group and Ungroup ask when the selection is neither
-//! whole rows nor whole columns.
+//! whole rows nor whole columns; and Data Tools' Consolidate, which writes
+//! an outline when it links to its sources.
 //!
 //! ↑/↓ (Tab/Shift+Tab) move between fields, ←/→ change a choice, Space
 //! toggles a check box or presses the focused button. Enter is OK (or the
 //! focused button), Esc is Cancel. The dialogs only stage options; the app
 //! applies them.
 
-use gridcore::edit::{Area, SubtotalFunc, SubtotalOptions};
+use gridcore::edit::{
+    Area, ConsolidateOptions, ConsolidateSettings, SubtotalFunc, SubtotalOptions,
+};
 use gridcore::outline::{Axis, OutlineSettings};
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyCode;
@@ -29,6 +32,8 @@ pub enum Outcome {
     Settings(OutlineSettings),
     /// The Rows/Columns choice made.
     Axis(Axis),
+    /// Consolidate's OK (the app fills in the book name).
+    Consolidate(ConsolidateOptions),
 }
 
 /// The Subtotal dialog over one region.
@@ -308,12 +313,237 @@ impl AxisDialog {
     }
 }
 
+/// The Consolidate dialog, writing at the cell it opened on.
+#[derive(Clone, Debug)]
+pub struct ConsolidateDialog {
+    /// The destination: sheet, row and column.
+    pub sheet: usize,
+    pub at: (u32, u32),
+    pub func: SubtotalFunc,
+    /// The "Reference" box.
+    pub reference: String,
+    /// "All references".
+    pub refs: Vec<String>,
+    /// The list entry last picked, which Delete takes out.
+    pub picked: Option<usize>,
+    pub top_row: bool,
+    pub left_col: bool,
+    pub links: bool,
+    pub focus: usize,
+    /// The workbook's sheet names, in order: Add keeps a reference the way
+    /// the list shows it (`East!$A$1:$C$4`), so one spelled two ways is
+    /// one entry.
+    pub sheet_names: Vec<String>,
+}
+
+/// A Consolidate dialog row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConsField {
+    Func,
+    Reference,
+    Ref(usize),
+    Add,
+    Delete,
+    Top,
+    Left,
+    Links,
+    Ok,
+    Close,
+}
+
+impl ConsolidateDialog {
+    /// The dialog for a destination, starting from the settings the sheet
+    /// kept (Excel's defaults, Sum and nothing checked, without).
+    pub fn new(
+        sheet: usize,
+        at: (u32, u32),
+        kept: Option<&ConsolidateSettings>,
+        sheet_names: Vec<String>,
+    ) -> ConsolidateDialog {
+        let s = kept.cloned().unwrap_or_default();
+        ConsolidateDialog {
+            sheet,
+            at,
+            func: s.func,
+            reference: String::new(),
+            refs: s.refs,
+            picked: None,
+            top_row: s.top_row,
+            left_col: s.left_col,
+            links: s.links,
+            focus: 0,
+            sheet_names,
+        }
+    }
+
+    /// `text` as the list keeps it, when it parses; as typed otherwise.
+    fn canonical(&self, text: &str) -> String {
+        let names: Vec<&str> = self.sheet_names.iter().map(String::as_str).collect();
+        gridcore::edit::canonical_consolidate_ref(&names, self.sheet, text)
+    }
+
+    fn fields(&self) -> Vec<ConsField> {
+        let mut f = vec![ConsField::Func, ConsField::Reference];
+        f.extend((0..self.refs.len()).map(ConsField::Ref));
+        f.extend([
+            ConsField::Add,
+            ConsField::Delete,
+            ConsField::Top,
+            ConsField::Left,
+            ConsField::Links,
+            ConsField::Ok,
+            ConsField::Close,
+        ]);
+        f
+    }
+
+    /// The options OK applies: the list, plus a reference typed but not
+    /// added. The book name is the app's to fill in.
+    pub fn options(&self) -> ConsolidateOptions {
+        let mut refs = self.refs.clone();
+        let typed = self.canonical(&self.reference);
+        if !typed.is_empty() && !refs.iter().any(|r| r.eq_ignore_ascii_case(&typed)) {
+            refs.push(typed);
+        }
+        ConsolidateOptions {
+            func: self.func,
+            refs,
+            top_row: self.top_row,
+            left_col: self.left_col,
+            links: self.links,
+            book_name: String::new(),
+        }
+    }
+
+    /// A list entry picked: it goes into the Reference box, and Delete
+    /// takes it out.
+    fn pick(&mut self, i: usize) {
+        self.reference = self.refs[i].clone();
+        self.picked = Some(i);
+    }
+
+    /// Add: the Reference box's text joins the list (once).
+    fn add(&mut self) {
+        let typed = self.canonical(&self.reference);
+        if typed.is_empty() {
+            return;
+        }
+        if !self.refs.iter().any(|r| r.eq_ignore_ascii_case(&typed)) {
+            self.refs.push(typed);
+            // Focus stays on Add, which moved down a row.
+            self.focus += 1;
+        }
+        self.reference.clear();
+        self.picked = None;
+    }
+
+    /// Delete: the picked entry (or the one the box names) leaves the list.
+    fn delete(&mut self) {
+        let typed = self.canonical(&self.reference);
+        let at = self.picked.filter(|&i| i < self.refs.len()).or_else(|| {
+            self.refs
+                .iter()
+                .position(|r| r.eq_ignore_ascii_case(&typed))
+        });
+        if let Some(i) = at {
+            self.refs.remove(i);
+            self.reference.clear();
+            self.picked = None;
+            // Focus stays on Delete, which moved up a row.
+            self.focus = self.focus.saturating_sub(1);
+        }
+    }
+
+    pub fn key(&mut self, code: KeyCode) -> Outcome {
+        let fields = self.fields();
+        let n = fields.len();
+        let field = fields[self.focus.min(n - 1)];
+        match code {
+            KeyCode::Esc => return Outcome::Cancel,
+            KeyCode::Up | KeyCode::BackTab => self.focus = (self.focus + n - 1) % n,
+            KeyCode::Down | KeyCode::Tab => self.focus = (self.focus + 1) % n,
+            KeyCode::Left | KeyCode::Right if field == ConsField::Func => {
+                let step = if code == KeyCode::Left { -1 } else { 1 };
+                let all = SubtotalFunc::ALL;
+                let i = all.iter().position(|f| *f == self.func).unwrap_or(0);
+                self.func = all[cycle(i, all.len(), step)];
+            }
+            KeyCode::Backspace if field == ConsField::Reference => {
+                self.reference.pop();
+            }
+            KeyCode::Char(c) if field == ConsField::Reference => self.reference.push(c),
+            // Space presses what it is on: a list entry, a button, a box.
+            // On the Function row it does nothing (Enter is OK there).
+            KeyCode::Char(' ') => match field {
+                ConsField::Ref(i) => self.pick(i),
+                ConsField::Add => self.add(),
+                ConsField::Delete => self.delete(),
+                ConsField::Top => self.top_row = !self.top_row,
+                ConsField::Left => self.left_col = !self.left_col,
+                ConsField::Links => self.links = !self.links,
+                ConsField::Ok => return Outcome::Consolidate(self.options()),
+                ConsField::Close => return Outcome::Cancel,
+                ConsField::Func | ConsField::Reference => {}
+            },
+            // Enter presses a button or picks an entry; anywhere else it is OK.
+            KeyCode::Enter => match field {
+                ConsField::Ref(i) => self.pick(i),
+                ConsField::Add => self.add(),
+                ConsField::Delete => self.delete(),
+                ConsField::Close => return Outcome::Cancel,
+                _ => return Outcome::Consolidate(self.options()),
+            },
+            _ => {}
+        }
+        Outcome::Pending
+    }
+
+    fn line(&self, f: ConsField) -> String {
+        match f {
+            ConsField::Func => format!("Function:   < {} >", self.func.name()),
+            ConsField::Reference => format!("Reference:  {}_", self.reference),
+            ConsField::Ref(i) => format!("  {}", self.refs[i]),
+            ConsField::Add => "[ Add ]".into(),
+            ConsField::Delete => "[ Delete ]".into(),
+            ConsField::Top => format!("{} Top row", check(self.top_row)),
+            ConsField::Left => format!("{} Left column", check(self.left_col)),
+            ConsField::Links => format!("{} Create links to source data", check(self.links)),
+            ConsField::Ok => "[ OK ]".into(),
+            ConsField::Close => "[ Close ]".into(),
+        }
+    }
+
+    pub fn draw(&self, f: &mut Frame, area: Rect) {
+        let fields = self.fields();
+        let mut lines = Vec::new();
+        for (i, fld) in fields.iter().enumerate() {
+            match fld {
+                ConsField::Add => {
+                    if self.refs.is_empty() {
+                        lines.push(heading("All references:"));
+                        lines.push(hint("  (none)"));
+                    }
+                }
+                ConsField::Ref(0) => lines.push(heading("All references:")),
+                ConsField::Top => lines.push(heading("Use labels in:")),
+                _ => {}
+            }
+            lines.push(item(self.line(*fld), i == self.focus));
+        }
+        lines.push(hint(
+            "Up/Down field  Type a reference  Space pick/toggle  Enter OK  Esc Close",
+        ));
+        modal(f, area, " Consolidate ", lines, 60);
+    }
+}
+
 /// One open outline dialog.
 #[derive(Clone, Debug)]
 pub enum Dialog {
     Subtotal(SubtotalDialog),
     Settings(SettingsDialog),
     Axis(AxisDialog),
+    Consolidate(ConsolidateDialog),
 }
 
 impl Dialog {
@@ -322,6 +552,7 @@ impl Dialog {
             Dialog::Subtotal(d) => d.key(code),
             Dialog::Settings(d) => d.key(code),
             Dialog::Axis(d) => d.key(code),
+            Dialog::Consolidate(d) => d.key(code),
         }
     }
 
@@ -330,6 +561,7 @@ impl Dialog {
             Dialog::Subtotal(d) => d.draw(f, area),
             Dialog::Settings(d) => d.draw(f, area),
             Dialog::Axis(d) => d.draw(f, area),
+            Dialog::Consolidate(d) => d.draw(f, area),
         }
     }
 }
@@ -486,6 +718,106 @@ mod tests {
         d.key(KeyCode::Down);
         assert_eq!(d.key(KeyCode::Enter), Outcome::Axis(Axis::Cols));
         assert_eq!(d.key(KeyCode::Char('r')), Outcome::Axis(Axis::Rows));
+        assert_eq!(d.key(KeyCode::Esc), Outcome::Cancel);
+    }
+
+    #[test]
+    fn consolidate_dialog_maps_its_fields_to_options() {
+        let names = ["East", "West", "Summary"].map(String::from).to_vec();
+        let mut d = ConsolidateDialog::new(2, (0, 0), None, names);
+        assert_eq!(d.options(), ConsolidateOptions::default());
+        // Space on the Function row is not OK.
+        assert_eq!(d.key(KeyCode::Char(' ')), Outcome::Pending);
+        d.key(KeyCode::Left); // Function: Varp
+        d.key(KeyCode::Right); // Sum
+        d.key(KeyCode::Right); // Count
+        d.key(KeyCode::Down); // Reference
+        for c in "East!A1:C4".chars() {
+            d.key(KeyCode::Char(c));
+        }
+        d.key(KeyCode::Down); // Add
+        d.key(KeyCode::Enter);
+        assert_eq!(d.refs, ["East!$A$1:$C$4"], "kept the way the list shows it");
+        assert!(d.reference.is_empty());
+        assert_eq!(d.fields()[d.focus], ConsField::Add, "focus stays on Add");
+        d.focus = 1; // Reference
+        for c in "West!A1:C9".chars() {
+            d.key(KeyCode::Char(c));
+        }
+        d.key(KeyCode::Backspace);
+        d.key(KeyCode::Char('4'));
+        d.key(KeyCode::Down); // East entry
+        d.key(KeyCode::Down); // Add
+        d.key(KeyCode::Char(' '));
+        assert_eq!(d.refs, ["East!$A$1:$C$4", "West!$A$1:$C$4"]);
+        // The same range spelled another way is not a second entry.
+        d.focus = 1;
+        for c in "east!$a$1:c4".chars() {
+            d.key(KeyCode::Char(c));
+        }
+        d.focus = 4; // Add
+        d.key(KeyCode::Enter);
+        assert_eq!(d.refs, ["East!$A$1:$C$4", "West!$A$1:$C$4"]);
+        assert_eq!(d.fields()[d.focus], ConsField::Add);
+        d.key(KeyCode::Down); // Delete
+        d.key(KeyCode::Down); // Top row
+        d.key(KeyCode::Char(' '));
+        d.key(KeyCode::Down); // Left column
+        d.key(KeyCode::Char(' '));
+        d.key(KeyCode::Down); // Create links
+        d.key(KeyCode::Char(' '));
+        let o = match d.key(KeyCode::Enter) {
+            Outcome::Consolidate(o) => o,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            o,
+            ConsolidateOptions {
+                func: SubtotalFunc::Count,
+                refs: vec!["East!$A$1:$C$4".into(), "West!$A$1:$C$4".into()],
+                top_row: true,
+                left_col: true,
+                links: true,
+                book_name: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn consolidate_dialog_picks_deletes_and_starts_from_kept_settings() {
+        let kept = ConsolidateSettings {
+            func: SubtotalFunc::Max,
+            refs: vec!["A!$A$1".into(), "B!$A$1".into(), "C!$A$1".into()],
+            top_row: true,
+            left_col: false,
+            links: true,
+        };
+        let mut d = ConsolidateDialog::new(0, (3, 4), Some(&kept), Vec::new());
+        assert_eq!(
+            (d.func, d.top_row, d.left_col, d.links),
+            (SubtotalFunc::Max, true, false, true)
+        );
+        d.focus = 3; // B's entry
+        d.key(KeyCode::Enter);
+        assert_eq!((d.reference.as_str(), d.picked), ("B!$A$1", Some(1)));
+        d.focus = 6; // Delete
+        d.key(KeyCode::Enter);
+        assert_eq!(d.refs, ["A!$A$1", "C!$A$1"]);
+        assert_eq!(
+            d.fields()[d.focus],
+            ConsField::Delete,
+            "focus stays on Delete"
+        );
+        // A reference typed but not added still counts on OK.
+        d.focus = 1;
+        d.key(KeyCode::Char('D'));
+        d.key(KeyCode::Char('1'));
+        assert_eq!(d.options().refs, ["A!$A$1", "C!$A$1", "D1"]);
+        // Space in the box is text, not a toggle; Close cancels.
+        d.key(KeyCode::Char(' '));
+        assert_eq!(d.reference, "D1 ");
+        d.focus = d.fields().len() - 1;
+        assert_eq!(d.key(KeyCode::Enter), Outcome::Cancel);
         assert_eq!(d.key(KeyCode::Esc), Outcome::Cancel);
     }
 }
