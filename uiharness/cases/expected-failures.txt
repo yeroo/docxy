@@ -1,0 +1,21 @@
+# Cases known to fail on the Linux sweep (scripts/ui-linux-sweep.py).
+#
+#   <script>.uit | <exact test name> | #<tracking issue> [| error]
+#
+# A listed case must fail and an unlisted one must pass, so remove the entry in
+# the change that fixes its issue. An entry covers failed expectations (FAIL
+# steps); `| error` also lets the case have a step that could not run (ERROR).
+# See docs/ui-test-harness.md, "Expected failures".
+
+# vbottom_inset at 200% is 323, the case expects 241.
+doc-rulers.uit | ruler positions follow the document geometry at 100 and 200 percent | #808
+
+# The refusal now also lists recover-text.
+open-modes.uit | open refuses an unknown mode and enable-editing outside Protected View | #976
+
+# The sheet ribbon gained Review: tab indices and the count moved.
+sheet-ribbon.uit | sheet ribbon read lists the drawn Home tab | #976
+sheet-ribbon.uit | sheet ribbon click selects the tab and reads a toggle's current label | #976
+
+# Table Design moved from tab 7, so a path under it no longer exists (an ERROR step).
+word-tables.uit | design tab styles, options, shading and borders (648) | #976 | error
