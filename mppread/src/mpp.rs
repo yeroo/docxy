@@ -11,6 +11,16 @@ use std::collections::HashMap;
 const SUMMARY: &str = "\u{5}SummaryInformation";
 const DOC_SUMMARY: &str = "\u{5}DocumentSummaryInformation";
 
+/// Whether the container declares Project 2007 storage. This identifies the
+/// format for an import notice; it does not validate or decode the task table.
+pub fn is_mpp12(bytes: &[u8]) -> bool {
+    Cfb::open(bytes).is_ok_and(|cfb| {
+        let paths = cfb.paths();
+        paths.iter().any(|p| p == "Props12")
+            && paths.iter().any(|p| p == "   112/TBkndTask/FixedMeta")
+    })
+}
+
 // SummaryInformation property ids.
 const PID_TITLE: u32 = 2;
 const PID_SUBJECT: u32 = 3;

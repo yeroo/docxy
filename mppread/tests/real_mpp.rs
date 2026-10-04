@@ -310,9 +310,9 @@ fn new_task_default_decodes_when_present() {
     if let Ok(bytes) = std::fs::read(corpus("corpus/mpp/new-product.mpp")) {
         assert_eq!(mppread::mpp::decode_new_tasks_are_manual(&bytes), Ok(false));
     }
-    // MPP12's layout is not decoded, so its default is not guessed.
+    // Project 2007 predates manual scheduling, including downgraded plans.
     if let Ok(bytes) = std::fs::read(corpus("corpus/mpp/snapshots/10-manual-task-mpp12.mpp")) {
-        assert!(mppread::mpp::decode_new_tasks_are_manual(&bytes).is_err());
+        assert_eq!(mppread::mpp::decode_new_tasks_are_manual(&bytes), Ok(false));
     }
 }
 

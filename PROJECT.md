@@ -272,10 +272,16 @@ task: its bookings are placed first, and auto tasks level around them.
 - **`.mpp`** — the legacy binary. It's an OLE2 **Compound File** (MS-CFB), which
   `mppread` reads exactly — including the **storage tree**, so nested blocks are
   addressable by path (`read_path("TBkndTask/FixedData")`). Its metadata streams
-  are OLE **property sets** (MS-OLEPS). For recognized MPP9 and current Project
+  are OLE **property sets** (MS-OLEPS). For recognized MPP9, MPP12 and current Project
   task layouts, `mppread` uses counted `FixedMeta` and `VarMeta` records to
   locate rows and names, then reads dates, outline levels and validated task
-  fields at known offsets. Current Project blank rows keep their ID and UID;
+  fields at known offsets. MPP12 (Project 2007) currently imports only core
+  task names, dates, outline and dependencies; calendars, resources,
+  assignments, progress and other task fields remain unsupported. Its 50
+  snapshots are checked against XML with pinned downgrade differences:
+  inactive rows disappear, manual tasks become automatic, and lag units may
+  become minutes. Unvalidated blank-row shapes and lag formats are refused.
+  Current Project blank rows keep their ID and UID;
   GUID, type, flags, priority, deadline, Notes and leveling options survive an
   import and MSPDI save. Explicit WBS codes and generated codes under the
   default numeric mask also survive; generated codes under a custom mask

@@ -1730,11 +1730,10 @@ fn project_2024_oracles() {
             recurring_count, 5,
             "recurring summary plus four occurrences"
         );
-        let matched = older
-            .iter()
-            .filter(|(mpp, xml)| check_pair(mpp, xml, true, Oracle::Project))
-            .count();
-        eprintln!("MPP12 matched {matched}, refused {}", older.len() - matched);
+        for (mpp, xml) in &older {
+            check_mpp12_pair(mpp, xml);
+        }
+        eprintln!("MPP12 core task tables matched: {}", older.len());
     }
     let order = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/order");
     if order.exists() {
@@ -1865,5 +1864,91 @@ fn project_2024_oracles() {
             }
             check_pair(mpp, xml, false, Oracle::Project);
         }
+    }
+}
+
+/// Project's 2007 Save As is a conversion, not a byte-layout-only change:
+/// inactive tasks disappear, IDs close up, manual tasks become automatic,
+/// and dependency lag units may become minutes. Validate the core fields
+/// this importer supports, with narrowly pinned conversion differences.
+fn check_mpp12_pair(mpp: &Path, xml: &Path) {
+    let bytes = std::fs::read(mpp).unwrap();
+    let oracle = projcore::mspdi::read_mspdi(&std::fs::read_to_string(xml).unwrap()).unwrap();
+    let raw =
+        mppread::mpp::decode_tasks(&bytes).unwrap_or_else(|e| panic!("{}: {e}", mpp.display()));
+    let project = mppread::project::project_from_mpp(&bytes)
+        .unwrap_or_else(|e| panic!("{}: {e}", mpp.display()));
+    let expected: Vec<_> = oracle
+        .tasks
+        .iter()
+        .filter(|t| t.uid != 0 && t.active != Some(false))
+        .collect();
+    let actual: Vec<_> = raw.iter().filter(|t| t.uid != 0).collect();
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "{}: task count",
+        mpp.display()
+    );
+    assert_eq!(project.tasks.len(), expected.len());
+    assert!(!project.new_tasks_are_manual);
+    let step = mpp
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .get(..2)
+        .and_then(|s| s.parse::<u32>().ok());
+    let dt = |d: projcore::DateTime| d.to_mspdi().replace('T', " ")[..16].to_string();
+    for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
+        let context = format!("{} UID {}", mpp.display(), e.uid);
+        assert_eq!(a.id, i as u32 + 1, "{context}: ID after conversion");
+        assert_eq!(a.uid as i32, e.uid, "{context}: UID");
+        assert_eq!(a.name, e.name, "{context}: name");
+        assert_eq!(a.outline_level, Some(e.outline_level), "{context}: outline");
+        assert!(!a.manual && !a.is_null, "{context}: mode/null row");
+        // Steps 31..46 change calendar hours to 08:30. On downgrade,
+        // Project shifts the formerly manual UID 16 by exactly 30 minutes.
+        let shift = if e.uid == 16 && step.is_some_and(|s| (31..=46).contains(&s)) {
+            assert!(e.manual);
+            30
+        } else {
+            0
+        };
+        assert_eq!(
+            a.start,
+            e.stored_start.map(|d| dt(d.add_minutes(shift))),
+            "{context}: start"
+        );
+        assert_eq!(
+            a.finish,
+            e.stored_finish.map(|d| dt(d.add_minutes(shift))),
+            "{context}: finish"
+        );
+        let mut got: Vec<_> = a
+            .predecessors
+            .iter()
+            .map(|p| {
+                assert!(matches!(p.lag_format, 3 | 7));
+                (p.pred_uid as i32, i64::from(p.kind), p.lag)
+            })
+            .collect();
+        let mut want: Vec<_> = e
+            .predecessors
+            .iter()
+            .map(|p| (p.uid, p.link.code(), p.lag))
+            .collect();
+        got.sort();
+        want.sort();
+        assert_eq!(got, want, "{context}: predecessor UID/type/lag");
+        assert_eq!(project.tasks[i].name, a.name);
+        assert_eq!(project.tasks[i].stored_start.map(dt), a.start);
+        assert_eq!(project.tasks[i].stored_finish.map(dt), a.finish);
+    }
+    if actual.is_empty() {
+        assert_eq!(
+            project.start_date.map(dt),
+            raw[0].start,
+            "empty plan keeps its project start"
+        );
     }
 }
