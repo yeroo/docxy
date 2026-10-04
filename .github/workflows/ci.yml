@@ -143,7 +143,8 @@ jobs:
     # Openbox display, checked against uiharness/cases/expected-failures.txt (#979).
     # A job of its own so the release build runs beside suite-linux's debug tests.
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Two cold release builds come first; the sweep itself took 105 s locally.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -162,10 +163,15 @@ jobs:
         run: cargo build --release --locked -p uiharness
       - name: Sweep runner unit tests
         run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
+      # The slowest script took 13 s locally: a per-script --timeout turns a hang
+      # into an ERROR row with a summary written, well inside the step's limit.
       - name: Sweep
-        run: python3 scripts/ui-linux-sweep.py --run "$GITHUB_WORKSPACE/uiharness-runs/sweep"
+        timeout-minutes: 30
+        run: python3 scripts/ui-linux-sweep.py --timeout 120 --run "$GITHUB_WORKSPACE/uiharness-runs/sweep"
+      # cancelled() too: a job that hits timeout-minutes is cancelled, not failed,
+      # and that is when the transcripts matter most.
       - name: Upload the sweep's transcripts and evidence
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v7
         with:
           name: ui-sweep-linux
