@@ -1069,7 +1069,7 @@ impl Engine {
             if let Some(info) = self.formulas.get_mut(&k) {
                 if info.deps != deps {
                     info.deps = deps;
-                    self.invalidate_rev();
+                    self.invalidate_edges();
                 }
             }
         }
@@ -1140,9 +1140,16 @@ impl Engine {
     /// Drop the cached reverse edges, the cover index and the flag lists;
     /// call after any change to `formulas`.
     fn invalidate_rev(&mut self) {
+        self.invalidate_edges();
+        self.flagged = None;
+    }
+
+    /// Drop the cached reverse edges and the cover index; call after a
+    /// change to a formula's `deps` only (the flag lists are a function of
+    /// `formulas`' membership, not of `deps`, so they stay valid).
+    fn invalidate_edges(&mut self) {
         self.rev = None;
         self.covers = None;
-        self.flagged = None;
     }
 
     /// The reverse edges, rebuilt from the cover index only when invalidated.
@@ -4188,6 +4195,8 @@ mod tests {
         set(&mut eng, &mut wb, "A1", Cell::formula("B1*2"));
         // The removal dropped the cache, so this edit's walk rebuilt the lists.
         assert_eq!(FLAG_BUILDS.with(StdCell::get), 1);
+        // The replacement is not seeded as volatile by the rebuilt lists.
+        assert!(!eng.flagged.as_ref().unwrap().volatile.contains(&(0, 0, 0)));
         eng.clock = Some(45_400.5);
         set(&mut eng, &mut wb, "B1", Cell::number(5.0));
         assert_eq!(value_at(&wb, "A1"), CellValue::Number(10.0));
@@ -4215,7 +4224,20 @@ mod tests {
         set(&mut eng, &mut wb, "D1", Cell::number(2.0)); // warms the cache
         set(&mut eng, &mut wb, "C1", Cell::formula("ROWS(A1#)"));
         assert_eq!(value_at(&wb, "C1"), CellValue::Number(2.0));
+        // The inserted reader is in the cached list, and a plain data edit
+        // keeps it there: the value assertions below would still pass through
+        // rev[A1] if the list were stale, so this checks the list itself.
+        set(&mut eng, &mut wb, "D1", Cell::number(3.0));
+        assert!(eng.flagged.as_ref().unwrap().spillref.contains(&(0, 0, 2)));
+        // The growth edit moves the reader's dep rect, which drops rev/covers
+        // but not the flag lists.
+        FLAG_BUILDS.with(|n| n.set(0));
         set(&mut eng, &mut wb, "B1", Cell::number(4.0)); // grows the spill
+        assert_eq!(FLAG_BUILDS.with(StdCell::get), 0);
+        assert_eq!(
+            eng.formulas[&(0, 0, 2)].deps,
+            vec![(0, 0, 0, 0, 0), (0, 0, 0, 3, 0)]
+        );
         assert_eq!(value_at(&wb, "C1"), CellValue::Number(4.0));
         assert_eq!(value_at(&wb, "A4"), CellValue::Number(4.0));
     }
