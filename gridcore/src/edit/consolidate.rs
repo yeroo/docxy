@@ -182,17 +182,40 @@ pub fn parse_consolidate_ref(
     dest: usize,
     text: &str,
 ) -> Result<ConsolidateRef, ConsolidateError> {
+    let names: Vec<&str> = wb.sheets.iter().map(|s| s.name.as_str()).collect();
+    parse_consolidate_ref_in(&names, dest, text)
+}
+
+/// [`parse_consolidate_ref`] against the workbook's sheet names alone, in
+/// order: what a dialog holds to show a reference the way the list keeps it.
+pub fn parse_consolidate_ref_in(
+    names: &[&str],
+    dest: usize,
+    text: &str,
+) -> Result<ConsolidateRef, ConsolidateError> {
     let bad = || ConsolidateError::BadRef(text.trim().to_string());
     let t = text.trim();
     let t = t.strip_prefix('=').unwrap_or(t).trim();
     let (sheet, range) = split_sheet(t).map_err(|_| bad())?;
     let area = parse_range_name(range.trim()).ok_or_else(bad)?;
     let ix = match sheet {
-        Some(name) => wb.sheet_index(&name).ok_or_else(bad)?,
+        Some(name) => names
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(&name))
+            .ok_or_else(bad)?,
         None => dest,
     };
-    let sheet = wb.sheets.get(ix).ok_or_else(bad)?.name.clone();
+    let sheet = names.get(ix).ok_or_else(bad)?.to_string();
     Ok(ConsolidateRef { sheet, area })
+}
+
+/// A reference as the list keeps it (`Sheet!$A$1:$D$4`) when it parses
+/// against `names`; otherwise the text as typed, so OK reports it.
+pub fn canonical_consolidate_ref(names: &[&str], dest: usize, text: &str) -> String {
+    match parse_consolidate_ref_in(names, dest, text) {
+        Ok(r) => format_consolidate_ref(&r),
+        Err(_) => text.trim().to_string(),
+    }
 }
 
 /// `Sheet!$A$1:$D$4` (`Sheet!$A$1` for one cell): how the list shows a
@@ -228,7 +251,7 @@ fn label_key(c: Option<&Cell>) -> Option<String> {
         CellValue::Empty => None,
         CellValue::Text(t) if t.trim().is_empty() => None,
         CellValue::Text(t) => Some(t.to_lowercase()),
-        CellValue::Number(n) => Some(n.to_string()),
+        CellValue::Number(n) => Some(crate::sheet::fmt_general(*n).to_lowercase()),
         CellValue::Bool(b) => Some(if *b { "true" } else { "false" }.into()),
         CellValue::Error(e) => Some(e.to_lowercase()),
     }
@@ -335,10 +358,11 @@ fn overlaps((a1, b1, a2, b2): Area, (c1, d1, c2, d2): Area) -> bool {
 }
 
 /// Consolidate `opts.refs` into sheet `dest` at (`row`, `col`), and keep
-/// the settings on that sheet. Refuses, changing nothing, on an empty or
-/// bad reference list, links to a source on the destination sheet, a
-/// source overlapping the output, or sources with nothing in them. Returns
-/// the output area.
+/// the settings on that sheet. A reference repeated in another spelling
+/// (`East!A1:B3`, `east!$A$1:$B$3`) counts once. Refuses, changing nothing,
+/// on an empty or bad reference list, links to a source on the destination
+/// sheet, a source overlapping the output, sources with nothing in them, or
+/// output that would run off the sheet. Returns the output area.
 ///
 /// With links, each output row becomes one hidden detail row per
 /// contributing source row (formulas such as `=East!$B$2`, written only for
@@ -357,11 +381,13 @@ pub fn consolidate(
     if opts.refs.is_empty() {
         return Err(ConsolidateError::NoRefs);
     }
-    let refs = opts
-        .refs
-        .iter()
-        .map(|t| parse_consolidate_ref(wb, dest, t))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut refs: Vec<ConsolidateRef> = Vec::with_capacity(opts.refs.len());
+    for t in &opts.refs {
+        let r = parse_consolidate_ref(wb, dest, t)?;
+        if !refs.contains(&r) {
+            refs.push(r);
+        }
+    }
     let dest_name = &wb.sheets[dest].name;
     if opts.links && refs.iter().any(|r| r.sheet == *dest_name) {
         return Err(ConsolidateError::LinksOnDestSheet);
@@ -1129,6 +1155,44 @@ mod tests {
         consolidate(&mut w, 2, (0, 0), &o).unwrap();
         assert_eq!(before[2].cells, w.sheets[2].cells);
         assert!(super::super::sheets_differ(&before, &w.sheets));
+    }
+
+    #[test]
+    fn number_labels_match_by_their_general_text() {
+        // 0.1 + 0.2 reads 0.3 in General, so it is the text label "0.3".
+        let mut w = Workbook {
+            sheets: vec![
+                sheet_with("S1", &[("A1", n(0.1 + 0.2)), ("B1", n(1.0))]),
+                sheet_with("S2", &[("A1", t("0.3")), ("B1", n(2.0))]),
+                sheet_with("Out", &[]),
+            ],
+            ..Workbook::default()
+        };
+        let o = opts(&["S1!A1:B1", "S2!A1:B1"], false, true);
+        assert_eq!(consolidate(&mut w, 2, (0, 0), &o), Ok((0, 0, 0, 1)));
+        assert_eq!(val(&w, 2, "B1"), num(3.0));
+    }
+
+    #[test]
+    fn a_reference_repeated_in_another_spelling_counts_once() {
+        let mut w = east_west();
+        let o = opts(&["East!A1:C4", "east!$A$1:$C$4", "West!A1:C4"], true, true);
+        consolidate(&mut w, 2, (0, 0), &o).unwrap();
+        assert_eq!(val(&w, 2, "B2"), num(41.0), "East's A Jan once: 1 + 40");
+        assert_eq!(
+            w.sheets[2].consolidate.as_ref().unwrap().refs,
+            ["East!$A$1:$C$4", "West!$A$1:$C$4"]
+        );
+        let names = ["East", "West", "Summary"];
+        assert_eq!(
+            canonical_consolidate_ref(&names, 2, "west!a1:b2"),
+            "West!$A$1:$B$2"
+        );
+        assert_eq!(canonical_consolidate_ref(&names, 2, "B2"), "Summary!$B$2");
+        assert_eq!(
+            canonical_consolidate_ref(&names, 2, " Nowhere!A1 "),
+            "Nowhere!A1"
+        );
     }
 
     #[test]

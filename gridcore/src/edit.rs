@@ -17,8 +17,9 @@ mod subtotal;
 pub(crate) use consolidate::split_ref_text;
 pub use consolidate::{
     ConsolidateError, ConsolidateFunc, ConsolidateOptions, ConsolidateRef, ConsolidateSettings,
-    consolidate, consolidate_fn_name, consolidate_token, format_consolidate_ref,
-    parse_consolidate_func, parse_consolidate_ref,
+    canonical_consolidate_ref, consolidate, consolidate_fn_name, consolidate_token,
+    format_consolidate_ref, parse_consolidate_func, parse_consolidate_ref,
+    parse_consolidate_ref_in,
 };
 pub use subtotal::{
     Area, SubtotalError, SubtotalFunc, SubtotalOptions, is_subtotal_row, numeric_columns,
