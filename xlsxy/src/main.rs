@@ -3449,8 +3449,8 @@ impl App {
                 } else {
                     vec![(src, clear_keys), (here, writes)]
                 };
-                // The cut's source block, whose whole tables move rather than
-                // lose their headers.
+                // The cut's source block: a table lying wholly inside it keeps
+                // its column names (it does not move with the cells).
                 let cut_from = cut.then(|| {
                     let (fr, fc) = clip.from;
                     let h = clip.cells.len().max(1) as u32;
