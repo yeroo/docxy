@@ -12,6 +12,8 @@
 
 use std::collections::BTreeMap;
 
+mod clip;
+pub use clip::{MAX_PASTE_CELLS, PASTE_SHAPE, move_refs, paste_tiles, tiled_block};
 mod consolidate;
 mod subtotal;
 pub(crate) use consolidate::split_ref_text;

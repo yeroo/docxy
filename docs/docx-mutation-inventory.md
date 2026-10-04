@@ -76,6 +76,9 @@ open, navigation, and cancel paths are non-mutating.
 | `doc.replace-all` | Content |
 | `doc.format` | Formatting |
 | `doc.set-style` | Formatting |
+| `doc.page-color` | Formatting |
+| `doc.watermark` | Formatting |
+| `doc.page-borders` | Formatting |
 | `doc.undo`, `doc.redo` | Content |
 | `doc.revision-accept`, `doc.revision-reject` | Content |
 | `doc.revisions-accept-all`, `doc.revisions-reject-all` | Content |
@@ -86,10 +89,14 @@ direct formatting. All other current control verbs
 are read, export, persistence, or document-lifecycle operations. MCP has no
 independent mutation implementation: `docxy_replace_range`, `docxy_insert`,
 `docxy_append`, `docxy_replace_all`, `docxy_format`, `docxy_set_style`,
+`docxy_page_color`, `docxy_watermark`, `docxy_page_borders`,
 `docxy_undo`, `docxy_redo`, `docxy_revision_accept`, `docxy_revision_reject`,
 `docxy_revisions_accept_all`, and `docxy_revisions_reject_all` map one-to-one
 to the control verbs above. Revision listing/current/previous/next are
-non-mutating navigation and inspection routes.
+non-mutating navigation and inspection routes. The three Design verbs
+(`doc.page-color`, `doc.watermark`, `doc.page-borders`) refuse Markdown
+documents outright; the Design ribbon pickers they share their edits with do
+the same.
 
 ## Authorization matrix
 

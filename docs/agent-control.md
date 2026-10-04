@@ -274,6 +274,9 @@ One JSON object per line; one reply line per request:
 | `doc.undo` / `doc.redo` | — | `{done}` (`false` = nothing to undo/redo) |
 | `doc.format` | `{start, end?, patch}` | `{formatted}` — block count; ONE undo checkpoint over the whole range |
 | `doc.set-style` | `{start, end?, style?, align?}` | `{styled}` — block count; ONE undo checkpoint |
+| `doc.page-color` | `{color:"#RRGGBB"\|"none"}` | `{pageColor, changed}` — Design ▸ Page Color; a package edit with no undo step; refuses Markdown (unlike `doc.format`/`doc.set-style`) |
+| `doc.watermark` | `{text, layout?, font?, color?}` or `{remove:true}` | `{watermark, changed}` — Design ▸ Watermark; the header parts are package edits and the new header references are ONE undo step; refuses Markdown. When the document cannot take a header the error can follow a partial edit (existing watermarks already removed) — the message says so |
+| `doc.page-borders` | `{border:"none"\|"box"\|"shadow", color?}` | `{pageBorders, changed}` — Design ▸ Page Borders on every section as ONE undo step; refuses Markdown |
 | `doc.revisions` | — | `{count,revisions:[…]}` in document order, including stable target, kind, metadata, support state, nesting, and editor-safe locations |
 | `doc.revision-current` | — | `{count,revision}` for the navigation selection or change at the caret; `revision:null` when none |
 | `doc.revision-next` / `doc.revision-previous` | — | `{count,revision}` after selecting the wrapping next/previous change |
@@ -353,7 +356,8 @@ The current mutating control/MCP operations cover Structure
 (`doc.replace-range`, `doc.insert`, `doc.append`), Content (`doc.replace-all`,
 `doc.undo`, `doc.redo`, `doc.revision-accept`, `doc.revision-reject`,
 `doc.revisions-accept-all`, `doc.revisions-reject-all`), and Formatting
-(`doc.format`, `doc.set-style`). There
+(`doc.format`, `doc.set-style`, `doc.page-color`, `doc.watermark`,
+`doc.page-borders`). There
 is no comment-writing control verb yet, so comments-only protection denies all
 current automation edits even though comment mutations in the TUI are allowed.
 Markdown control/MCP inserts that carry styles, numbering, or direct run
@@ -554,7 +558,8 @@ Tools: `docxy_list`, `docxy_new`, `docxy_status`, `docxy_outline`, `docxy_read`,
 `docxy_set_style`, `docxy_revisions`, `docxy_revision_current`,
 `docxy_revision_next`, `docxy_revision_previous`, `docxy_revision_accept`,
 `docxy_revision_reject`, `docxy_revisions_accept_all`,
-`docxy_revisions_reject_all`, and `docxy_compare` (32 total). Each edit
+`docxy_revisions_reject_all`, `docxy_compare`, `docxy_page_color`,
+`docxy_watermark`, and `docxy_page_borders` (35 total). Each edit
 tool maps to the matching verb — except `docxy_new`, which composes a file
 create with a `doc.open` — and results come back as JSON text. When several
 docxy editors are open, pass `target` (a substring of the instance/pane id) to
@@ -594,7 +599,9 @@ windows that open a same-basename file, which would otherwise mint the same
 surface, nothing more (except xlsxy's `wb.properties`/`wb.set-properties` and the
 page-layout and printing verbs (`page.*`, `print-area.*`, `print-titles.set`,
 `page-break.*`, `print.pages`, `wb.export-pdf`), which only a terminal xlsxy
-answers so far; a tab answers `unknown verb`): a couple of internal-only verbs the extension host
+answers so far; and docxy's `doc.page-color`, `doc.watermark`,
+`doc.page-borders` and `doc.compare`, which only a terminal docxy answers so
+far — a tab answers `unknown verb`): a couple of internal-only verbs the extension host
 uses to compose its own `doc.path`/`wb.path` replies (`doc.blocks`, `wb.info`)
 are deliberately not in the tab's exposed verb set, and are rejected as
 `"unknown verb"` — same as a terminal instance, which has no arm for them at

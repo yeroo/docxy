@@ -4816,30 +4816,18 @@ impl App {
         self.status = Some(format!("{}: {item}", p.kind.title().trim()));
     }
 
-    /// Apply a Design ▸ Page Background pick. The open header/footer edit is
-    /// committed first so its editor cannot write a header part back over a
-    /// watermark and the section edits hit the body editor. Page Color is a
-    /// package edit with no undo (as Hyphenation); a watermark's header parts
-    /// are package edits and its new header references one undo step; Page
-    /// Borders rewrite every section as one undo step.
+    /// Apply a Design ▸ Page Background pick. Page Color is a package edit
+    /// with no undo (as Hyphenation); a watermark's header parts are package
+    /// edits and its new header references one undo step; Page Borders
+    /// rewrite every section as one undo step. Each edit commits an open
+    /// header/footer edit first so its editor cannot write a header part
+    /// back over a watermark and the section edits hit the body editor.
     fn apply_design_pick(&mut self, kind: PickerKind, item: &str) {
-        if self.hf_edit.is_some() {
-            self.exit_hf_edit(true);
-        }
         match kind {
             PickerKind::PageColor => {
-                let bg = PAGE_COLORS
-                    .iter()
-                    .find(|c| c.0 == item)
-                    .map(|c| PageBackground {
-                        color: c.1,
-                        gradient: None,
-                    });
-                let changed = self.pkg.set_page_background(bg.as_ref());
-                if changed {
-                    self.modified = true;
-                }
-                self.status = Some(match bg {
+                let rgb = PAGE_COLORS.iter().find(|c| c.0 == item).map(|c| c.1);
+                self.set_page_color(rgb);
+                self.status = Some(match rgb {
                     Some(_) => format!("Page color: {item}"),
                     None => "Page color: No Color".to_string(),
                 });
@@ -4849,75 +4837,105 @@ impl App {
                     .iter()
                     .find(|w| w.0 == item)
                     .map(|w| TextWatermarkSpec::preset(w.1, w.2));
-                let mut sects = self.editor.sections();
-                let before = sects.clone();
-                let parts = self.pkg.set_text_watermark(spec.as_ref(), &mut sects);
-                let raws: Vec<(usize, String)> = sects
-                    .into_iter()
-                    .enumerate()
-                    .filter(|(k, raw)| *raw != before[*k])
-                    .collect();
-                let refs = self.editor.replace_sections(&raws);
-                let changed = parts || refs;
-                self.page_parts_sect.clear();
-                self.sync_page_parts();
-                self.refresh_watermark_state();
-                if changed {
-                    self.modified = true;
-                }
-                self.status = Some(
-                    if spec.is_some()
-                        && self
-                            .pkg
-                            .shown_text_watermarks(&self.editor.sections())
-                            .is_empty()
-                    {
-                        "Could not add the watermark: the document cannot take a header".to_string()
-                    } else {
-                        match spec {
-                            Some(_) => format!("Watermark: {item}"),
-                            None => "Watermark removed".to_string(),
-                        }
-                    },
-                );
+                let result = self.set_text_watermark(spec.as_ref());
+                self.status = Some(if result.is_err() {
+                    "Could not add the watermark: the document cannot take a header".to_string()
+                } else {
+                    match spec {
+                        Some(_) => format!("Watermark: {item}"),
+                        None => "Watermark removed".to_string(),
+                    }
+                });
             }
             PickerKind::PageBorders => {
-                let side = |shadow: bool| {
-                    Some(BorderSide {
-                        style: "single".into(),
-                        sz: 4,
-                        space: 24,
-                        color: None,
-                        shadow,
-                        frame: false,
-                    })
-                };
-                let pb = (item != "None").then(|| PageBorders {
-                    sides: [
-                        side(item == "Shadow"),
-                        side(item == "Shadow"),
-                        side(item == "Shadow"),
-                        side(item == "Shadow"),
-                    ],
-                    display: PgBorderDisplay::AllPages,
-                    offset_from: PgBorderOffset::Page,
-                    z_order_back: false,
-                });
-                let n = self.editor.sections().len();
-                let changed = self
-                    .editor
-                    .edit_sections(&(0..n).collect::<Vec<_>>(), |raw| {
-                        PageBorders::apply(pb.as_ref(), raw)
-                    });
-                if changed {
-                    self.after_edit();
-                }
+                let pb = (item != "None").then(|| box_page_borders(item == "Shadow", None));
+                self.set_page_borders(pb.as_ref());
                 // after_edit clears the status: report the pick after it.
                 self.status = Some(format!("Page borders: {item}"));
             }
             _ => unreachable!("not a Design picker: {kind:?}"),
         }
         self.dirty = true;
+    }
+
+    /// Set or remove the page colour (Design ▸ Page Color): the package's
+    /// `w:background` and `w:displayBackgroundShape`. A package edit with no
+    /// undo. Returns whether anything changed.
+    pub(crate) fn set_page_color(&mut self, rgb: Option<u32>) -> bool {
+        if self.hf_edit.is_some() {
+            self.exit_hf_edit(true);
+        }
+        let bg = rgb.map(|color| PageBackground {
+            color,
+            gradient: None,
+        });
+        let changed = self.pkg.set_page_background(bg.as_ref());
+        if changed {
+            self.modified = true;
+        }
+        changed
+    }
+
+    /// Write or remove the text watermark in every shown header (Design ▸
+    /// Watermark). The header parts are package edits and the new header
+    /// references one undo step. Returns whether anything changed; errs when
+    /// a watermark was requested but the document cannot take a header. An
+    /// Err may follow a partial edit (the removed watermark's header parts
+    /// and section references are already gone) — the Err carries `changed`
+    /// so callers can report whether one happened.
+    pub(crate) fn set_text_watermark(
+        &mut self,
+        spec: Option<&TextWatermarkSpec>,
+    ) -> Result<bool, (bool, String)> {
+        if self.hf_edit.is_some() {
+            self.exit_hf_edit(true);
+        }
+        let mut sects = self.editor.sections();
+        let before = sects.clone();
+        let parts = self.pkg.set_text_watermark(spec, &mut sects);
+        let raws: Vec<(usize, String)> = sects
+            .into_iter()
+            .enumerate()
+            .filter(|(k, raw)| *raw != before[*k])
+            .collect();
+        let refs = self.editor.replace_sections(&raws);
+        let changed = parts || refs;
+        self.page_parts_sect.clear();
+        self.sync_page_parts();
+        self.refresh_watermark_state();
+        if changed {
+            self.modified = true;
+        }
+        if spec.is_some()
+            && self
+                .pkg
+                .shown_text_watermarks(&self.editor.sections())
+                .is_empty()
+        {
+            return Err((
+                changed,
+                "could not add the watermark: the document cannot take a header".into(),
+            ));
+        }
+        Ok(changed)
+    }
+
+    /// Write or remove page borders on every section (Design ▸ Page Borders)
+    /// as one undo step. Returns whether anything changed.
+    pub(crate) fn set_page_borders(&mut self, pb: Option<&PageBorders>) -> bool {
+        if self.hf_edit.is_some() {
+            self.exit_hf_edit(true);
+        }
+        let n = self.editor.sections().len();
+        let changed = self
+            .editor
+            .edit_sections(&(0..n).collect::<Vec<_>>(), |raw| {
+                PageBorders::apply(pb, raw)
+            });
+        if changed {
+            self.after_edit();
+        }
+        changed
     }
 
     fn picker_key(&mut self, key: KeyEvent) -> bool {
@@ -6477,11 +6495,24 @@ impl App {
         self.doc_hscroll = self.comments_hscroll as u16;
 
         let rlines: Vec<_> = visible.iter().map(doc_line_to_ratatui).collect();
-        // Light page: black on white. In page view the page sits on a black
-        // "desktop" (Word-style) — each line's page region is painted white and the
-        // centering margins / inter-page gaps stay black. In continuous view there
-        // is no page frame, so the whole content area is white.
-        let mut para = if self.light_page {
+        // A set page colour tints the page sheet in Print Layout (in both
+        // terminal themes), with the ink picked by the sheet's luminance; the
+        // centering margins and inter-page gaps stay black. Otherwise: light
+        // page is black on white. In page view the page sits on a black
+        // "desktop" (Word-style) — each line's page region is painted white
+        // and the centering margins / inter-page gaps stay black. In
+        // continuous view there is no page frame, so the whole content area
+        // is white.
+        let page_bg = self.page_view.then(|| self.pkg.page_background()).flatten();
+        let mut para = if let Some(bg) = page_bg {
+            let sheet = rgb_color(bg.color);
+            let ink = rgb_color(page_ink(bg.color).0);
+            let painted: Vec<_> = rlines
+                .into_iter()
+                .map(|l| paint_page(l, sheet, ink))
+                .collect();
+            Paragraph::new(Text::from(painted)).style(Style::default().bg(Color::Black))
+        } else if self.light_page {
             if self.page_view {
                 let painted: Vec<_> = rlines.into_iter().map(paint_page_on_black).collect();
                 Paragraph::new(Text::from(painted)).style(Style::default().bg(Color::Black))
@@ -7655,16 +7686,61 @@ fn map_color(c: DocColor) -> Color {
     }
 }
 
-/// Style one page-view line as a white page on a black desktop: the cells before
-/// the first non-blank one (the centering margin) are painted black, and the page
-/// itself — from the left border to the end of the line — is painted white with
-/// black default text (coloured text keeps its colour). Fully-blank lines (the gaps
-/// between pages) become all black.
-fn paint_page_on_black(line: RLine<'static>) -> RLine<'static> {
-    let white = |sp: RSpan<'static>| -> RSpan<'static> {
-        let mut st = sp.style.bg(Color::White);
+/// The four-sided Box/Shadow page borders the Design picker and the
+/// `doc.page-borders` verb write: single 4 (0.5pt) sides 24pt from the page
+/// edge, on every page, in front of the sheet, with an optional side colour.
+pub(crate) fn box_page_borders(shadow: bool, color: Option<u32>) -> PageBorders {
+    let side = || {
+        Some(BorderSide {
+            style: "single".into(),
+            sz: 4,
+            space: 24,
+            color,
+            shadow,
+            frame: false,
+        })
+    };
+    PageBorders {
+        sides: [side(), side(), side(), side()],
+        display: PgBorderDisplay::AllPages,
+        offset_from: PgBorderOffset::Page,
+        z_order_back: false,
+    }
+}
+
+/// The text and dimmed-text colours to draw on a page sheet of colour
+/// `sheet`: dark ink on a light sheet, light ink on a dark one, as Word
+/// draws automatic text. A copy of the suite oracle (`page_ink` in
+/// suite/docxy/src/design_tab.rs); painting uses the first element.
+fn page_ink(sheet: u32) -> (u32, u32) {
+    let [r, g, b] = [16, 8, 0].map(|s| f32::from(((sheet >> s) & 0xFF) as u8) / 255.0);
+    // Relative luminance (Rec. 709 weights on the gamma-encoded channels is
+    // close enough to pick a side).
+    if 0.2126 * r + 0.7152 * g + 0.0722 * b < 0.45 {
+        (0xF2F2F2, 0xB0B0B0)
+    } else {
+        (0x202020, 0x808080)
+    }
+}
+
+fn rgb_color(rgb: u32) -> Color {
+    Color::Rgb(
+        ((rgb >> 16) & 0xFF) as u8,
+        ((rgb >> 8) & 0xFF) as u8,
+        (rgb & 0xFF) as u8,
+    )
+}
+
+/// Style one page-view line as a sheet-coloured page on a black desktop: the
+/// cells before the first non-blank one (the centering margin) are painted
+/// black, and the page itself — from the left border to the end of the line —
+/// is painted with `sheet`, defaulting the text to `ink` (coloured text keeps
+/// its colour). Fully-blank lines (the gaps between pages) become all black.
+fn paint_page(line: RLine<'static>, sheet: Color, ink: Color) -> RLine<'static> {
+    let paint = |sp: RSpan<'static>| -> RSpan<'static> {
+        let mut st = sp.style.bg(sheet);
         if st.fg.is_none() {
-            st = st.fg(Color::Black);
+            st = st.fg(ink);
         }
         RSpan::styled(sp.content, st)
     };
@@ -7672,7 +7748,7 @@ fn paint_page_on_black(line: RLine<'static>) -> RLine<'static> {
     let mut out: Vec<RSpan<'static>> = Vec::new();
     for span in line.spans {
         if in_page {
-            out.push(white(span));
+            out.push(paint(span));
             continue;
         }
         let text = span.content.into_owned();
@@ -7685,12 +7761,18 @@ fn paint_page_on_black(line: RLine<'static>) -> RLine<'static> {
                         span.style.bg(Color::Black),
                     ));
                 }
-                out.push(white(RSpan::styled(text[i..].to_string(), span.style)));
+                out.push(paint(RSpan::styled(text[i..].to_string(), span.style)));
                 in_page = true;
             }
         }
     }
     RLine::from(out)
+}
+
+/// Style one page-view line as a white page on a black desktop — the light
+/// terminal theme's sheet. See [`paint_page`].
+fn paint_page_on_black(line: RLine<'static>) -> RLine<'static> {
+    paint_page(line, Color::White, Color::Black)
 }
 
 fn doc_line_to_ratatui(line: &DocLine) -> RLine<'static> {
@@ -8317,6 +8399,106 @@ mod tests {
         // The gap between pages (all whitespace) is fully black.
         let out = paint_page_on_black(RLine::from(vec![RSpan::raw("        ")]));
         assert!(out.spans.iter().all(|s| s.style.bg == Some(Color::Black)));
+    }
+
+    #[test]
+    fn page_ink_picks_a_side_by_luminance() {
+        assert_eq!(page_ink(0xFFFFFF), (0x202020, 0x808080));
+        assert_eq!(page_ink(0x000000), (0xF2F2F2, 0xB0B0B0));
+        assert_eq!(page_ink(0xFF0000).0, 0xF2F2F2);
+        assert_eq!(page_ink(0xFFFF00).0, 0x202020);
+    }
+
+    #[test]
+    fn page_color_paints_the_print_layout_sheet() {
+        let mut app = app_with(&["body"]);
+        assert!(app.set_page_color(Some(0xFF0000)));
+        app.page_view = true; // light_page stays false: the dark terminal theme
+        app.dirty = true;
+        let mut term = Terminal::new(TestBackend::new(100, 70)).unwrap();
+        term.draw(|frame| app.draw(frame)).unwrap();
+        let buf = term.backend().buffer();
+        let at = buf
+            .content
+            .iter()
+            .position(|c| c.symbol() == "b")
+            .expect("the page shows the body text");
+        let cell = &buf.content[at];
+        assert_eq!(cell.bg, Color::Rgb(255, 0, 0), "the sheet is red");
+        assert_eq!(
+            cell.fg,
+            Color::Rgb(0xF2, 0xF2, 0xF2),
+            "dark sheet, light ink"
+        );
+        let (_, row) = buf.pos_of(at);
+        assert!(
+            row > 0,
+            "the body sits inside the page frame, not on the first row"
+        );
+        assert_eq!(
+            buf.cell((0, row)).unwrap().bg,
+            Color::Black,
+            "the centering margin stays black"
+        );
+    }
+
+    #[test]
+    fn page_color_light_sheet_uses_dark_ink() {
+        let mut app = app_with(&["body"]);
+        assert!(app.set_page_color(Some(0xFFFF00)));
+        app.page_view = true;
+        app.light_page = true;
+        app.dirty = true;
+        let mut term = Terminal::new(TestBackend::new(100, 70)).unwrap();
+        term.draw(|frame| app.draw(frame)).unwrap();
+        let buf = term.backend().buffer();
+        let cell = buf
+            .content
+            .iter()
+            .find(|c| c.symbol() == "b")
+            .expect("the page shows the body text");
+        assert_eq!(cell.bg, Color::Rgb(255, 255, 0), "the sheet is yellow");
+        assert_eq!(
+            cell.fg,
+            Color::Rgb(0x20, 0x20, 0x20),
+            "light sheet, dark ink"
+        );
+    }
+
+    #[test]
+    fn page_color_not_painted_outside_print_layout() {
+        let mut app = app_with(&["body"]);
+        assert!(app.set_page_color(Some(0xFF0000)));
+        app.page_view = false; // Read Mode: continuous, no page frame
+        app.dirty = true;
+        let mut term = Terminal::new(TestBackend::new(100, 70)).unwrap();
+        term.draw(|frame| app.draw(frame)).unwrap();
+        assert!(
+            term.backend()
+                .buffer()
+                .content
+                .iter()
+                .all(|c| c.bg != Color::Rgb(255, 0, 0)),
+            "read mode must not paint the page colour"
+        );
+    }
+
+    #[test]
+    fn picker_and_page_color_method_write_the_same_document_xml() {
+        // The control verb and the ribbon picker share set_page_color, so both
+        // paths must produce the same package parts.
+        let mut picked = app_with(&["body"]);
+        picked.run_act(ribbon::Act::PageColor);
+        pick(&mut picked, PickerKind::PageColor, "Red");
+        let mut direct = app_with(&["body"]);
+        assert!(direct.set_page_color(Some(0xFF0000)));
+        for part in ["word/document.xml", "word/settings.xml"] {
+            assert_eq!(
+                picked.pkg.part_text(part),
+                direct.pkg.part_text(part),
+                "{part} must not depend on how the colour was set"
+            );
+        }
     }
 
     #[test]

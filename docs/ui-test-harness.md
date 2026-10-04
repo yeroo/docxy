@@ -1273,21 +1273,6 @@ scripts/ui-linux.py -- cargo run -p uiharness -- run uiharness/cases/sheet-selec
 scripts/ui-linux.py -- cargo test -p uiharness --test linux_capture -- --ignored
 ```
 
-Run each committed script in a fresh suite instance: several assume the
-initial tab count or default view settings. Passing all files to one `run`
-shares an instance and carries those settings into the next file.
-
-```sh
-scripts/ui-linux.py -- sh -c '
-  status=0
-  for script in uiharness/cases/*.uit; do
-    cargo run -p uiharness -- run "$script" \
-      --run "$PWD/uiharness-runs/$(basename "$script" .uit)" || status=1
-  done
-  exit "$status"
-'
-```
-
 The wrapper waits for both the X server and window manager, removes
 `WAYLAND_DISPLAY` from the child environment, and stops its command group,
 Openbox and Xvfb on exit. The real desktop and config are untouched; the
@@ -1305,6 +1290,65 @@ conservatively rejects transparent overlays too. Existing frame waits and
 region stability checks still run around captures. TrueColor 16/24/32-bit
 pixels are decoded with the server's byte order, row padding and RGB masks;
 the returned RGBA alpha is opaque. Native Wayland capture remains unsupported.
+
+#### Sweeping every script
+
+Run each committed script in a fresh suite instance: several assume the
+initial tab count or default view settings. Passing all files to one `run`
+shares an instance and carries those settings into the next file. The sweep
+runner does that for every script, each on a private display of its own:
+
+```sh
+cargo build --release --manifest-path suite/Cargo.toml
+cargo build --release -p uiharness
+python3 scripts/ui-linux-sweep.py                                # every script
+python3 scripts/ui-linux-sweep.py uiharness/cases/doc-state.uit  # just these
+```
+
+It runs `scripts/ui-linux.py -- uiharness run <script>` per script with
+absolute `--suite`, script and `--run` paths, prints a line per script as it
+finishes and a table at the end, and exits non-zero unless every script is
+`PASS` or `XFAIL`. `--suite` and `--uiharness` default to the release builds;
+it builds nothing itself. `--timeout` (default 600 s) stops a hung script.
+Everything lands under `--run` (default `uiharness-runs/sweep-<timestamp>`,
+which must be new or empty):
+
+```text
+<run>/summary.txt, summary.json   the table, and the same as data
+<run>/<script>/transcript.txt     uiharness and suite output
+<run>/<script>/x11/               the Xvfb and Openbox logs
+<run>/<script>/harness/           the harness's captures and sandbox
+```
+
+A script is `ERROR`, never satisfied by an expected failure, when it timed
+out or its report is incomplete or inconsistent: no case lines, no summary
+line, cases that differ from the script's `test` lines, or an exit code that
+disagrees with them.
+
+#### Expected failures
+
+`uiharness/cases/expected-failures.txt` lists the cases known to fail on the
+sweep, one per line, each with the issue that tracks it:
+
+```text
+doc-rulers.uit | <exact test name> | #808
+```
+
+A listed case that fails is `XFAIL`; an unlisted failure is `FAIL`, and a
+listed case that passes is `XPASS` — both fail the sweep, so the entry is
+removed in the change that fixes its issue. An entry covers a case whose
+expectations failed (`FAIL` steps); a step that could not run at all
+(`ERROR`, such as a refused verb or a failed capture) is still a new failure.
+An entry ending in `| error` is the reverse: the case must fail with an
+`ERROR` step (`FAIL` steps may appear too), and one that fails on `FAIL`
+steps only is a new failure, so a partial fix shows up and the entry goes
+back to the default kind. Every entry must name an existing script
+and `test` line, checked before anything starts, even when only some scripts
+are run.
+
+CI's `ui sweep (linux)` job runs the sweep on `ubuntu-latest` after release
+builds, and uploads the run directory as the `ui-sweep-linux` artifact when
+it fails.
 
 ### Capture on macOS
 
