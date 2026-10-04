@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 
 mod consolidate;
 mod subtotal;
+pub(crate) use consolidate::split_ref_text;
 pub use consolidate::{
     ConsolidateError, ConsolidateFunc, ConsolidateOptions, ConsolidateRef, ConsolidateSettings,
     consolidate, consolidate_fn_name, consolidate_token, format_consolidate_ref,

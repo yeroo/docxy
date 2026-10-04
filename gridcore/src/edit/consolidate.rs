@@ -164,6 +164,17 @@ fn split_sheet(text: &str) -> Result<(Option<String>, &str), ()> {
     Ok((Some(name), rest))
 }
 
+/// A kept reference's sheet (unquoted; `None` for a bare one) and its
+/// range text, without the workbook to check them against: what the file
+/// writes as `<dataRef sheet ref>`.
+pub(crate) fn split_ref_text(text: &str) -> Option<(Option<String>, &str)> {
+    let t = text.trim();
+    let t = t.strip_prefix('=').unwrap_or(t).trim();
+    split_sheet(t)
+        .ok()
+        .map(|(sheet, range)| (sheet, range.trim()))
+}
+
 /// Read a source reference. A bare range is on sheet `dest`; `$` anchors
 /// and a leading `=` are accepted; the sheet is matched ignoring case.
 pub fn parse_consolidate_ref(
@@ -1104,6 +1115,20 @@ mod tests {
         assert_eq!(formula(&w, 2, "C4"), "");
         assert!((0..5).all(|r| s.row_outline(r) == 0 && !s.row_hidden(r)));
         assert_eq!(val(&w, 2, "B2"), num(41.0));
+    }
+
+    #[test]
+    fn a_settings_only_change_is_an_undoable_difference() {
+        // Same output cells, a different reference list: the apps record
+        // an undo step (and a dirty workbook) only when sheets_differ.
+        let mut w = east_west();
+        let o = opts(&["East!A1:C4", "West!A1:C4"], true, true);
+        consolidate(&mut w, 2, (0, 0), &o).unwrap();
+        let before = w.sheets.clone();
+        let o = opts(&["East!A1:C4", "West!A1:C4", "East!Z90:Z99"], true, true);
+        consolidate(&mut w, 2, (0, 0), &o).unwrap();
+        assert_eq!(before[2].cells, w.sheets[2].cells);
+        assert!(super::super::sheets_differ(&before, &w.sheets));
     }
 
     #[test]
