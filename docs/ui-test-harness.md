@@ -1336,8 +1336,11 @@ A listed case that fails is `XFAIL`; an unlisted failure is `FAIL`, and a
 listed case that passes is `XPASS` — both fail the sweep, so the entry is
 removed in the change that fixes its issue. An entry covers a case whose
 expectations failed (`FAIL` steps); a step that could not run at all
-(`ERROR`, such as a refused verb or a failed capture) is still a new failure
-unless the entry ends in `| error`. Every entry must name an existing script
+(`ERROR`, such as a refused verb or a failed capture) is still a new failure.
+An entry ending in `| error` is the reverse: the case must fail with an
+`ERROR` step (`FAIL` steps may appear too), and one that fails on `FAIL`
+steps only is a new failure, so a partial fix shows up and the entry goes
+back to the default kind. Every entry must name an existing script
 and `test` line, checked before anything starts, even when only some scripts
 are run.
 

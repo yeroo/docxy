@@ -3,8 +3,10 @@
 #   <script>.uit | <exact test name> | #<tracking issue> [| error]
 #
 # A listed case must fail and an unlisted one must pass, so remove the entry in
-# the change that fixes its issue. An entry covers failed expectations (FAIL
-# steps); `| error` also lets the case have a step that could not run (ERROR).
+# the change that fixes its issue. An entry covers failed expectations: FAIL
+# steps and no step that could not run (ERROR). An entry ending `| error`
+# instead requires an ERROR step (FAIL steps may appear too); if the case then
+# fails on FAIL steps only, that is a new failure: drop the `| error`.
 # See docs/ui-test-harness.md, "Expected failures".
 
 # vbottom_inset at 200% is 323, the case expects 241.
