@@ -678,7 +678,7 @@ pub fn remove_personal_properties(pkg: &mut Package) -> bool {
 mod tests {
     use super::*;
     use crate::load::{Relationships, parse_document_xml};
-    use crate::package::{load_package, save_package};
+    use crate::package::load_package;
     use crate::serialize::document_to_xml;
     use crate::zipwrite::write_zip;
 
