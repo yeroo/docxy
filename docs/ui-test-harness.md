@@ -461,7 +461,7 @@ The Project ribbon holds only Project's commands, and its Report tab has no
 groups yet (`groups: []`). Extend Selection mode, native prompts,
 and backstage pages are not represented by these verbs.
 
-On a sheet tab the reply lists File, Home, Insert, Review and View from
+On a sheet tab the reply lists File, Home, Insert, Data, Review and View from
 `sheet_ribbon::SHEET_RIBBON`, the table the sheet ribbon is drawn from, so a
 button cannot be drawn without being listed. Ids are kebab-case and unique
 across the sheet ribbon (`bold`, `sort-a-z`, `freeze-panes`); icon and glyph
