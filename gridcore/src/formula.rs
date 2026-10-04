@@ -1585,30 +1585,9 @@ impl Printer {
             .map(|(s, lambda)| (s.as_str(), *lambda))
     }
 
-    /// May a LET value bind a lambda? Yes unless it provably can't: a
-    /// literal, a reference, an operator, or a builtin call that never passes
-    /// a lambda through. A call of a local that may hold one, an unbound name
-    /// or a call of one (a defined name or UDF may be or make a lambda), an
-    /// immediate call (`LAMBDA(n,LAMBDA(…))(2)`) and the choosing functions
-    /// (`IF(c,LAMBDA(…),LAMBDA(…))`) may.
+    /// May a LET value bind a lambda? See [`may_bind_lambda`].
     fn binds_lambda(&self, value: &Expr) -> bool {
-        match value {
-            Expr::Name(n) => self.bound(n).is_none_or(|(_, lambda)| lambda),
-            Expr::Call(..) => true,
-            Expr::Func(n, _) => match self.bound(n) {
-                Some((_, lambda)) => lambda,
-                None => {
-                    [
-                        "LAMBDA", "LET", "IF", "IFS", "CHOOSE", "SWITCH", "IFERROR", "IFNA",
-                        "INDEX",
-                    ]
-                    .iter()
-                    .any(|f| f.eq_ignore_ascii_case(n))
-                        || !is_builtin(n)
-                }
-            },
-            _ => false,
-        }
+        may_bind_lambda(value, |n| self.bound(n).map(|(_, lambda)| lambda))
     }
 
     fn func(&mut self, name: &str, args: &[Expr]) -> String {
@@ -1677,6 +1656,33 @@ impl Printer {
         }
         self.scope.truncate(mark);
         format!("{head}({})", parts.join(","))
+    }
+}
+
+/// May a LET value bind a lambda? Yes unless it provably can't: a
+/// literal, a reference, an operator, or a builtin call that never passes
+/// a lambda through. A call of a local that may hold one, an unbound name
+/// or a call of one (a defined name or UDF may be or make a lambda), an
+/// immediate call (`LAMBDA(n,LAMBDA(…))(2)`) and the choosing functions
+/// (`IF(c,LAMBDA(…),LAMBDA(…))`) may. `bound(n)` says whether a LET/LAMBDA
+/// name in scope around the value may hold a lambda (`None` when nothing
+/// binds `n`). Shared by the printer and the engine's dependency pruning.
+pub(crate) fn may_bind_lambda(value: &Expr, bound: impl Fn(&str) -> Option<bool>) -> bool {
+    match value {
+        Expr::Name(n) => bound(n).unwrap_or(true),
+        Expr::Call(..) => true,
+        Expr::Func(n, _) => match bound(n) {
+            Some(lambda) => lambda,
+            None => {
+                [
+                    "LAMBDA", "LET", "IF", "IFS", "CHOOSE", "SWITCH", "IFERROR", "IFNA", "INDEX",
+                ]
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(n))
+                    || !is_builtin(n)
+            }
+        },
+        _ => false,
     }
 }
 
@@ -1799,7 +1805,7 @@ const UNEVALUATED_BUILTINS: &[&str] = &[
 /// computes from the resolver alone (`NoCells` answers nothing: no cells,
 /// clock, random source or names), so the probe panics on none and touches
 /// nothing outside it (`builtin_probe_is_safe_for_every_name`).
-pub(crate) fn is_builtin(name: &str) -> bool {
+fn is_builtin(name: &str) -> bool {
     if future_prefix(name).is_some()
         || UNEVALUATED_BUILTINS
             .iter()

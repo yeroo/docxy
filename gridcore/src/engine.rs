@@ -2411,36 +2411,19 @@ fn without_position_refs(wb: &Workbook, sheet: usize, ast: &Expr) -> Option<Expr
             _ => false,
         }
     }
-    // May a LET value be a lambda, so that a ROW/COLUMN/ROWS/COLUMNS bound
-    // to it calls the lambda instead of the builtin? Only a value that
-    // can't be one is ruled out: literals, references, array constants,
-    // operators, and builtins other than LAMBDA, LET and the ones that pass
-    // an argument through (IF, IFS, SWITCH, CHOOSE, IFERROR, IFNA). A name,
-    // a call of an expression, and a custom function may be a lambda.
-    fn may_be_lambda(v: &Expr) -> bool {
-        const PASS_THROUGH: [&str; 8] = [
-            "LAMBDA", "LET", "IF", "IFS", "SWITCH", "CHOOSE", "IFERROR", "IFNA",
-        ];
-        match v {
-            Expr::Name(_) | Expr::Call(..) => true,
-            Expr::Func(name, _) => {
-                PASS_THROUGH.iter().any(|f| f.eq_ignore_ascii_case(name))
-                    || !formula::is_builtin(name)
-            }
-            _ => false,
-        }
-    }
-    // `shadow` holds the position-function names bound, at this point of
-    // the walk, to something that may be a lambda: a LET variable from the
-    // slot after its value, a LAMBDA parameter (any) within its body. Calls
-    // of a shadowed name keep their arguments.
-    fn prune(wb: &Workbook, sheet: usize, e: &Expr, shadow: &mut Vec<String>) -> Expr {
-        let each = |args: &[Expr], shadow: &mut Vec<String>| -> Vec<Expr> {
-            args.iter().map(|a| prune(wb, sheet, a, shadow)).collect()
+    // `scope` holds every LET variable and LAMBDA parameter bound at this
+    // point of the walk, with whether it may hold a lambda
+    // ([`formula::may_bind_lambda`]; a parameter always may). A LET
+    // variable is bound from the slot after its value. A call of ROW,
+    // COLUMN, ROWS or COLUMNS that a binding in scope may hold a lambda for
+    // keeps its arguments: the evaluator's `let_lambda` calls that lambda.
+    fn prune(wb: &Workbook, sheet: usize, e: &Expr, scope: &mut Vec<(String, bool)>) -> Expr {
+        let each = |args: &[Expr], scope: &mut Vec<(String, bool)>| -> Vec<Expr> {
+            args.iter().map(|a| prune(wb, sheet, a, scope)).collect()
         };
         match e {
             Expr::Func(name, args) if name.eq_ignore_ascii_case("LET") => {
-                let (mark, last) = (shadow.len(), args.len().saturating_sub(1));
+                let (mark, last) = (scope.len(), args.len().saturating_sub(1));
                 let mut pending = None;
                 let mut out = Vec::with_capacity(args.len());
                 for (i, a) in args.iter().enumerate() {
@@ -2450,40 +2433,46 @@ fn without_position_refs(wb: &Workbook, sheet: usize, ast: &Expr) -> Option<Expr
                             out.push(a.clone());
                         }
                         _ => {
-                            out.push(prune(wb, sheet, a, shadow));
+                            out.push(prune(wb, sheet, a, scope));
                             if let Some(n) = pending.take() {
-                                if is_position_fn(&n) && may_be_lambda(a) {
-                                    shadow.push(n);
-                                }
+                                let lambda = formula::may_bind_lambda(a, |m| {
+                                    let m = formula::bare_param(m);
+                                    let mut hits =
+                                        scope.iter().filter(|(s, _)| s.eq_ignore_ascii_case(m));
+                                    let first = hits.next()?;
+                                    Some(first.1 || hits.any(|(_, l)| *l))
+                                });
+                                scope.push((n, lambda));
                             }
                         }
                     }
                 }
-                shadow.truncate(mark);
+                scope.truncate(mark);
                 Expr::Func(name.clone(), out)
             }
             Expr::Func(name, args) if name.eq_ignore_ascii_case("LAMBDA") => {
-                let (mark, last) = (shadow.len(), args.len().saturating_sub(1));
+                let (mark, last) = (scope.len(), args.len().saturating_sub(1));
                 for p in &args[..last] {
                     if let Expr::Name(n)
                     | Expr::Structured {
                         table: None,
+                        item: formula::TableItem::Data,
                         col1: Some(n),
-                        ..
+                        col2: None,
                     } = p
                     {
-                        let n = formula::bare_param(n);
-                        if is_position_fn(n) {
-                            shadow.push(n.to_string());
-                        }
+                        scope.push((formula::bare_param(n).to_string(), true));
                     }
                 }
-                let out = each(args, shadow);
-                shadow.truncate(mark);
+                let out = each(args, scope);
+                scope.truncate(mark);
                 Expr::Func(name.clone(), out)
             }
             Expr::Func(name, args)
-                if is_position_fn(name) && !shadow.iter().any(|s| s.eq_ignore_ascii_case(name)) =>
+                if is_position_fn(name)
+                    && !scope
+                        .iter()
+                        .any(|(s, lambda)| *lambda && s.eq_ignore_ascii_case(name)) =>
             {
                 let out = args
                     .iter()
@@ -2491,24 +2480,24 @@ fn without_position_refs(wb: &Workbook, sheet: usize, ast: &Expr) -> Option<Expr
                         if position_only(wb, sheet, a, 0) {
                             Expr::Missing
                         } else {
-                            prune(wb, sheet, a, shadow)
+                            prune(wb, sheet, a, scope)
                         }
                     })
                     .collect();
                 Expr::Func(name.clone(), out)
             }
-            Expr::Func(name, args) => Expr::Func(name.clone(), each(args, shadow)),
+            Expr::Func(name, args) => Expr::Func(name.clone(), each(args, scope)),
             Expr::Call(callee, args) => {
-                let callee = prune(wb, sheet, callee, shadow);
-                Expr::Call(Box::new(callee), each(args, shadow))
+                let callee = prune(wb, sheet, callee, scope);
+                Expr::Call(Box::new(callee), each(args, scope))
             }
             Expr::ArrayLit(rows) => {
-                Expr::ArrayLit(rows.iter().map(|row| each(row, shadow)).collect())
+                Expr::ArrayLit(rows.iter().map(|row| each(row, scope)).collect())
             }
-            Expr::Un(op, x) => Expr::Un(*op, Box::new(prune(wb, sheet, x, shadow))),
+            Expr::Un(op, x) => Expr::Un(*op, Box::new(prune(wb, sheet, x, scope))),
             Expr::Bin(op, l, r) => {
-                let l = prune(wb, sheet, l, shadow);
-                Expr::Bin(*op, Box::new(l), Box::new(prune(wb, sheet, r, shadow)))
+                let l = prune(wb, sheet, l, scope);
+                Expr::Bin(*op, Box::new(l), Box::new(prune(wb, sheet, r, scope)))
             }
             other => other.clone(),
         }
@@ -5168,14 +5157,21 @@ mod tests {
                 "C2",
                 Cell::formula("LAMBDA(columns,columns(B1))(LAMBDA(x,x+1))"),
             ),
+            // #679 FIX r4 m1: `sum` is a local lambda, so `sum(1)` may be one.
+            (
+                "C3",
+                Cell::formula("LET(sum,LAMBDA(a,LAMBDA(b,b*2)),row,sum(1),row(B1))"),
+            ),
         ]);
         let mut eng = Engine::new(&wb);
         eng.recalc_all(&mut wb);
         assert_eq!(value_at(&wb, "C1"), CellValue::Number(6.0));
         assert_eq!(value_at(&wb, "C2"), CellValue::Number(4.0));
+        assert_eq!(value_at(&wb, "C3"), CellValue::Number(6.0));
         set(&mut eng, &mut wb, "B1", Cell::number(10.0));
         assert_eq!(value_at(&wb, "C1"), CellValue::Number(20.0));
         assert_eq!(value_at(&wb, "C2"), CellValue::Number(11.0));
+        assert_eq!(value_at(&wb, "C3"), CellValue::Number(20.0));
     }
 
     #[test]
