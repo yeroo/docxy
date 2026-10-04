@@ -1369,9 +1369,9 @@ fn import_new_sheet(
 
 /// Literal find/replace across every cell's input text, on **every sheet** —
 /// the workbook-wide counterpart of the TUI's per-sheet `replace_all`. Runs
-/// through [`App::structural`] (not `apply_on`) so the whole multi-sheet
-/// edit lands as a single undo group; `structural` already rebuilds the
-/// engine and recalculates afterward.
+/// through [`App::structural_writing_cells`] (not `apply_on`) so the whole
+/// multi-sheet edit lands as a single undo group, a rewritten table header
+/// renames its column, and the engine is rebuilt and recalculated afterward.
 fn wb_replace_all(app: &mut App, args: &Json) -> Result<Json, String> {
     let query = args
         .get_str("query")
@@ -1382,7 +1382,7 @@ fn wb_replace_all(app: &mut App, args: &Json) -> Result<Json, String> {
     let text = args.get_str("text").ok_or("wb.replace-all needs 'text'")?;
     let mut replaced = 0usize;
     let today = now_serial();
-    app.structural(|wb| {
+    app.structural_writing_cells(|wb| {
         let ctx = gridcore::entry::entry_ctx(wb, today);
         for sheet in &mut wb.sheets {
             let changes =
@@ -6378,6 +6378,24 @@ mod table_verb_tests {
         assert_eq!(
             formula_value(&mut a, "F2"),
             (Some("=SUM(Sales[Qty])".into()), Some("50".into()))
+        );
+    }
+
+    #[test]
+    fn col_insert_inside_a_table_renames_nothing_683() {
+        let mut a = app_683("Sales", &["Item", "Qty", "Price", "Region"], 4);
+        put(&mut a, "F2", "=SUM(Sales[Price])");
+        put(&mut a, "G2", "=COUNTA(Sales[Region])");
+        let args = Json::obj(vec![("at", Json::Num(2.0))]);
+        dispatch(&mut a, "col.insert", &args).unwrap();
+        assert_eq!(table_columns(&mut a), ["Item", "Qty", "Price", "Region"]);
+        assert_eq!(
+            formula_value(&mut a, "G2").0.as_deref(),
+            Some("=SUM(Sales[Price])")
+        );
+        assert_eq!(
+            formula_value(&mut a, "H2").0.as_deref(),
+            Some("=COUNTA(Sales[Region])")
         );
     }
 

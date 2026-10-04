@@ -2614,6 +2614,31 @@ impl App {
         model_rename: Option<(&str, &str)>,
         op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<(), String>,
     ) -> Result<(), String> {
+        self.structural_step(model_rename, false, op)
+    }
+
+    /// [`Self::structural`] for an edit that writes cell content in place
+    /// (Replace All, Text to Columns, AutoSum): a table header it rewrote
+    /// renames that column, as typing there does
+    /// ([`Self::sync_written_headers`]). An edit that moves cells (rows,
+    /// columns, a sort) must not use it: its moved headers aren't written.
+    fn structural_writing_cells(&mut self, op: impl FnOnce(&mut gridcore::sheet::Workbook)) {
+        let infallible = self.structural_step(None, true, |wb| {
+            op(wb);
+            Ok(())
+        });
+        debug_assert!(infallible.is_ok());
+    }
+
+    /// The one structural step behind [`Self::try_structural`] and
+    /// [`Self::structural_writing_cells`]; `sync_headers` says whether the
+    /// edit wrote cells in place, whose header cells then rename columns.
+    fn structural_step(
+        &mut self,
+        model_rename: Option<(&str, &str)>,
+        sync_headers: bool,
+        op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<(), String>,
+    ) -> Result<(), String> {
         let mut before = self.wb_snapshot();
         // A structural edit moves cells, so compare how many cells sit on
         // circles rather than where: a circle that merely moved is not new.
@@ -2622,7 +2647,9 @@ impl App {
             self.put_back(&before);
             return Err(e);
         }
-        self.sync_written_headers(&before);
+        if sync_headers {
+            self.sync_written_headers(&before);
+        }
         let mut after = self.wb_snapshot();
         if let Some((old, new)) = model_rename {
             self.rename_table_in_model(old, new);
@@ -2641,13 +2668,13 @@ impl App {
         Ok(())
     }
 
-    /// A structural edit that wrote a table's header cells (Replace All,
-    /// Text to Columns, a sort, AutoSum…) renames those columns as typing
-    /// there does ([`gridcore::edit::sync_table_headers`]). Only a header that
-    /// differs from `before` while its table kept its name and range counts:
-    /// a table the edit moved, resized or renamed had its header text moved
-    /// with it, not written, and a loaded header that merely reads otherwise
-    /// than its column's name (a number, say) is left as the file has it.
+    /// A structural edit that wrote cells in place (Replace All, Text to
+    /// Columns, AutoSum; see [`Self::structural_writing_cells`]) renames the
+    /// columns whose header cells it rewrote, as typing there does
+    /// ([`gridcore::edit::sync_table_headers`]). Only a header that differs
+    /// from `before` while its table kept its name and range counts, so a
+    /// loaded header that merely reads otherwise than its column's name (a
+    /// number, say) is left as the file has it.
     fn sync_written_headers(&mut self, before: &WbSnapshot) {
         let wb = &self.pkg.workbook;
         let mut written: Vec<(usize, Vec<(u32, u32)>)> = Vec::new();
@@ -5851,7 +5878,7 @@ impl App {
         };
         let style = self.sheet().cell(r, c).map(|x| x.style).unwrap_or(0);
         self.status = Some(format!("AutoSum: =SUM({range})"));
-        self.structural(move |wb| {
+        self.structural_writing_cells(move |wb| {
             let cell = Cell {
                 style,
                 ..Cell::formula(&format!("SUM({range})"))
@@ -5956,7 +5983,7 @@ impl App {
     ) -> usize {
         let today = now_serial();
         let mut n = 0;
-        self.structural(|wb| {
+        self.structural_writing_cells(|wb| {
             n = gridcore::edit::text_to_columns(wb, src, opts, today);
         });
         self.status = Some(format!(
@@ -6030,7 +6057,6 @@ impl App {
             }
             Ok(msg) => {
                 self.status = Some(msg);
-                self.sync_written_headers(&before);
                 if !gridcore::edit::sheets_differ(&before.sheets, &self.pkg.workbook.sheets) {
                     return Ok(false);
                 }
@@ -13731,6 +13757,38 @@ mod tests {
         assert_eq!(header_state(&app).2, "SUM(Sales[Units])");
         let d1 = app.pkg.workbook.sheets[0].cell(0, 3).unwrap();
         assert_eq!(d1.value, CellValue::Number(7.0));
+    }
+
+    #[test]
+    fn a_sort_over_a_tables_header_renames_nothing_683() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        let sh = &mut app.pkg.workbook.sheets[0];
+        for (r, row) in [["Name", "City"], ["Zed", "Oslo"], ["Amy", "Rome"]]
+            .into_iter()
+            .enumerate()
+        {
+            for (c, t) in row.into_iter().enumerate() {
+                sh.set_cell(r as u32, c as u32, Cell::text(t));
+            }
+        }
+        app.pkg
+            .add_table(0, (0, 0, 2, 1), true, "TableStyleMedium2")
+            .unwrap();
+        app.rebuild_engine();
+        // Away from the region the sort moves.
+        app.apply_on(0, vec![(9, 5, parse_input("=COUNTA(Table1[City])"))]);
+        let header = |app: &App| {
+            let sh = &app.pkg.workbook.sheets[0];
+            [0, 1].map(|c| sh.cell(0, c).map(|x| x.value.clone()))
+        };
+        let before = header(&app);
+        app.cur = (1, 0);
+        app.sort_region(true);
+        assert_ne!(header(&app), before, "the sort moved the header row");
+        assert_eq!(app.pkg.workbook.tables[0].columns, ["Name", "City"]);
+        let f10 = app.pkg.workbook.sheets[0].cell(9, 5).unwrap();
+        assert_eq!(f10.formula.as_deref(), Some("COUNTA(Table1[City])"));
     }
 
     #[test]
