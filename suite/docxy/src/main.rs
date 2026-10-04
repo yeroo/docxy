@@ -1502,8 +1502,9 @@ enum SheetAct {
     CondFormat,
     DataValidation,
     Filter,
-    /// Data › Sort & Filter › Clear: unhide the filtered rows around the
-    /// cursor, as `clear` typed in the Filter bar does (#696).
+    /// Data › Sort & Filter › Clear: unhide every hidden row of the region
+    /// around the cursor (hand-hidden ones too) and drop its filter marks,
+    /// as `clear` typed in the Filter bar does (#696).
     ClearFilter,
     RemoveDuplicates,
     TextToColumns,
@@ -12760,38 +12761,42 @@ impl Docxy {
         if self.protected_refused(cx) {
             return;
         }
-        if let Some(v) = self.active_sheet_mut()
-            && let Some((top, bottom)) = v.filter_region()
-        {
-            let s = v.active;
-            let sc = v.sel.1;
-            let sh = &v.pkg.workbook.sheets[s];
-            let header = matches!(sh.cell(top, sc).map(|c| &c.value), Some(CellValue::Text(_)));
-            let start = if header { top + 1 } else { top };
-            // Rows are marked filter-hidden (not hidden by hand) so SUBTOTAL
-            // 1-11 skips them and still counts hand-hidden rows.
-            if let Some((op, operand)) = gridcore::filter::parse(text) {
-                let keep: Vec<bool> = (start..=bottom)
-                    .map(|r| {
-                        let val = v.pkg.workbook.sheets[s]
-                            .cell(r, sc)
-                            .map(|c| c.value.clone());
-                        gridcore::filter::matches(val.as_ref(), op, &operand)
-                    })
-                    .collect();
-                for (i, r) in (start..=bottom).enumerate() {
-                    v.pkg.workbook.sheets[s].set_row_filtered(r, !keep[i]);
-                }
-            }
-        } else {
+        // An empty or unreadable criteria changes nothing, so it leaves the
+        // tab clean; the bar has already closed.
+        let Some((op, operand)) = gridcore::filter::parse(text) else {
+            return cx.notify();
+        };
+        let Some(v) = self.active_sheet_mut() else {
             return;
+        };
+        let Some((top, bottom)) = v.filter_region() else {
+            return;
+        };
+        let s = v.active;
+        let sc = v.sel.1;
+        let sh = &v.pkg.workbook.sheets[s];
+        let header = matches!(sh.cell(top, sc).map(|c| &c.value), Some(CellValue::Text(_)));
+        let start = if header { top + 1 } else { top };
+        // Rows are marked filter-hidden (not hidden by hand) so SUBTOTAL
+        // 1-11 skips them and still counts hand-hidden rows.
+        let keep: Vec<bool> = (start..=bottom)
+            .map(|r| {
+                let val = v.pkg.workbook.sheets[s]
+                    .cell(r, sc)
+                    .map(|c| c.value.clone());
+                gridcore::filter::matches(val.as_ref(), op, &operand)
+            })
+            .collect();
+        for (i, r) in (start..=bottom).enumerate() {
+            v.pkg.workbook.sheets[s].set_row_filtered(r, !keep[i]);
         }
         self.mark_sheet_dirty();
         cx.notify();
     }
 
     /// Data › Sort & Filter › Clear (and `clear` in the Filter bar): unhide
-    /// the filtered rows around the cursor; dirty only when a row changed.
+    /// every hidden row of the region around the cursor (hand-hidden ones
+    /// too) and drop its filter marks; dirty only when a row changed.
     fn sheet_clear_filter(&mut self, cx: &mut Context<Self>) {
         if self.protected_refused(cx) {
             return;

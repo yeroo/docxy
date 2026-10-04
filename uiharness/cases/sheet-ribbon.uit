@@ -99,12 +99,22 @@ test sheet ribbon data tab clears a filter
   assert reply.app.rows is 3
   click B4
   call ribbon-click {"tab":"Data","command":"Clear"}
-  assert dirty is true
   click A1
   click B5 shift
   key ctrl+c
   call clipboard {"action":"read"}
   assert reply.app.rows is 5
+
+# Clear with nothing filtered, and an empty criteria, change no row, so the
+# workbook stays clean.
+test sheet ribbon data tab clear with no filter leaves the workbook clean
+  open ../fixtures/basic.xlsx
+  click B2
+  call ribbon-click {"tab":"Data","command":"Clear"}
+  assert dirty is false
+  call ribbon-click {"tab":"Data","command":"Filter"}
+  key enter
+  assert dirty is false
 
 test sheet ribbon data tab refuses its placeholders
   open ../fixtures/basic.xlsx
