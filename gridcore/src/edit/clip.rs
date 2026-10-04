@@ -7,8 +7,9 @@ use super::rewrite_workbook_formulas;
 use crate::formula::{CellMove, move_ref_expr, translate_formula};
 use crate::sheet::{Cell, MAX_COLS, MAX_ROWS, Workbook};
 
-/// The most cells one paste writes; a bigger paste is refused whole (the
-/// cap xlsxy and gridwasm put on a text paste).
+/// The most cells a tiled paste writes; a bigger one is refused whole (the
+/// cap xlsxy and gridwasm put on a text paste). A copy pasted once is not
+/// capped: it writes no more than it copied.
 pub const MAX_PASTE_CELLS: u64 = 100_000;
 
 /// Excel's refusal of a paste area that is not a whole number of copies.
@@ -60,7 +61,7 @@ pub fn paste_tiles(
 /// (a filtered copy skips rows, so each row has its own offset) and every
 /// row from column `src_col`. A formula that lands where it came from, or
 /// that doesn't parse, keeps its text as it was.
-pub fn translated_block(
+fn translated_block(
     cells: &[Vec<Cell>],
     src_rows: &[u32],
     src_col: u32,

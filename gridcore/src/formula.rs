@@ -2065,61 +2065,26 @@ pub fn move_block_expr(e: &Expr, mv: &CellMove) -> Expr {
         };
         mv.shifted(r, sheet)
     };
-    let outside = |s: &Option<String>| match s {
-        None if !mv.same_sheet() => Some(mv.src.to_string()),
-        s => s.clone(),
+    // Anything else keeps reading what it read: qualified with the source
+    // sheet when the move changed sheets.
+    let outside = |x: &Expr| {
+        if mv.same_sheet() {
+            x.clone()
+        } else {
+            qualify_sheet_in_expr(x, mv.src)
+        }
     };
     match e {
         Expr::Ref(r) if mv.holds(r, home) => Expr::Ref(inside(r)),
         Expr::SpillRef(r) if mv.holds(r, home) => Expr::SpillRef(inside(r)),
-        Expr::Ref(r) => Expr::Ref(CellRef {
-            sheet: outside(&r.sheet),
-            ..r.clone()
-        }),
-        Expr::SpillRef(r) => Expr::SpillRef(CellRef {
-            sheet: outside(&r.sheet),
-            ..r.clone()
-        }),
-        Expr::Range(p, q) => {
-            let q_home = p.sheet.as_deref().or(home);
-            if mv.holds(p, home) && mv.holds(q, q_home) {
-                Expr::Range(inside(p), mv.shifted(q, q.sheet.clone()))
-            } else {
-                Expr::Range(
-                    CellRef {
-                        sheet: outside(&p.sheet),
-                        ..p.clone()
-                    },
-                    q.clone(),
-                )
-            }
+        Expr::Range(p, q) if mv.holds(p, home) && mv.holds(q, p.sheet.as_deref().or(home)) => {
+            Expr::Range(inside(p), mv.shifted(q, q.sheet.clone()))
         }
-        Expr::ColRange {
-            sheet,
-            c1,
-            c2,
-            abs1,
-            abs2,
-        } => Expr::ColRange {
-            sheet: outside(sheet),
-            c1: *c1,
-            c2: *c2,
-            abs1: *abs1,
-            abs2: *abs2,
-        },
-        Expr::RowRange {
-            sheet,
-            r1,
-            r2,
-            abs1,
-            abs2,
-        } => Expr::RowRange {
-            sheet: outside(sheet),
-            r1: *r1,
-            r2: *r2,
-            abs1: *abs1,
-            abs2: *abs2,
-        },
+        Expr::Ref(_)
+        | Expr::SpillRef(_)
+        | Expr::Range(..)
+        | Expr::ColRange { .. }
+        | Expr::RowRange { .. } => outside(e),
         Expr::ArrayLit(rows) => Expr::ArrayLit(
             rows.iter()
                 .map(|row| row.iter().map(recur).collect())

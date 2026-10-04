@@ -13,9 +13,7 @@
 use std::collections::BTreeMap;
 
 mod clip;
-pub use clip::{
-    MAX_PASTE_CELLS, PASTE_SHAPE, move_refs, paste_tiles, tiled_block, translated_block,
-};
+pub use clip::{MAX_PASTE_CELLS, PASTE_SHAPE, move_refs, paste_tiles, tiled_block};
 mod subtotal;
 pub use subtotal::{
     Area, SubtotalError, SubtotalFunc, SubtotalOptions, is_subtotal_row, numeric_columns,
