@@ -5042,6 +5042,7 @@ mod tests {
             totals_rows: 0,
             columns: vec!["Qty".into(), "Price".into()],
             part: String::new(),
+            column_ids: Vec::new(),
         });
         // A defined name whose definition is the bare table name.
         wb.defined_names.push(crate::sheet::DefinedName {
@@ -5087,6 +5088,7 @@ mod tests {
             totals_rows: 0,
             columns: vec!["Item".into(), "Qty".into(), "Price".into(), "Calc".into()],
             part: String::new(),
+            column_ids: Vec::new(),
         });
         wb
     }
