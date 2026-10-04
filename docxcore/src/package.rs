@@ -2251,8 +2251,6 @@ impl Package {
     /// Add a `<w:comment>` to `comments.xml`, creating the part + relationship +
     /// content-type if absent. `text` is the comment body (XML-escaped here).
     pub fn add_comment(&mut self, id: i32, author: &str, initials: &str, date: &str, text: &str) {
-        const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-        const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
         let esc = |s: &str| {
             s.replace('&', "&amp;")
                 .replace('<', "&lt;")
@@ -2267,14 +2265,23 @@ impl Package {
             esc(date),
             esc(text),
         );
+        self.insert_comment_xml(&comment);
+    }
+
+    /// Append `comment`, one whole `<w:comment>…</w:comment>` element (as
+    /// [`Package::comment_xml`] returns it), to `comments.xml`, creating the
+    /// part + relationship + content-type if absent.
+    pub fn insert_comment_xml(&mut self, comment: &str) {
+        const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+        const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
         let name = "word/comments.xml";
-        if let Some(b) = self.part(name) {
-            let xml = String::from_utf8_lossy(b).into_owned();
-            self.set_part(
-                name,
-                xml.replacen("</w:comments>", &format!("{comment}</w:comments>"), 1)
-                    .into_bytes(),
-            );
+        if self.part(name).is_some() {
+            // Decoded and written back in the part's own encoding: a
+            // UTF-16 comments.xml stays UTF-16 (#971).
+            if let Some(xml) = self.part_text(name) {
+                let xml = xml.replacen("</w:comments>", &format!("{comment}</w:comments>"), 1);
+                self.set_part_text(name, &xml);
+            }
             return;
         }
         let body = format!(
@@ -2310,22 +2317,52 @@ impl Package {
         }
     }
 
-    /// Remove the `<w:comment w:id="id">…</w:comment>` from `comments.xml`.
+    /// Remove the `<w:comment>` whose `w:id` is `id` from `comments.xml`,
+    /// whatever the order of its attributes.
     pub fn remove_comment(&mut self, id: i32) {
+        self.remove_comment_id(&id.to_string());
+    }
+
+    /// [`Package::remove_comment`] by the `w:id` exactly as written: `03`
+    /// is not `3`.
+    pub fn remove_comment_id(&mut self, id: &str) {
         let name = "word/comments.xml";
-        let Some(b) = self.part(name) else {
+        let Some(xml) = self.part_text(name) else {
             return;
         };
-        let xml = String::from_utf8_lossy(b).into_owned();
-        let open = format!("<w:comment w:id=\"{id}\"");
-        if let Some(start) = xml.find(&open) {
-            if let Some(rel_end) = xml[start..].find("</w:comment>") {
-                let end = start + rel_end + "</w:comment>".len();
-                let mut out = xml.clone();
-                out.replace_range(start..end, "");
-                self.set_part(name, out.into_bytes());
-            }
+        if let Some(range) = comment_range(&xml, id) {
+            let mut out = xml;
+            out.replace_range(range, "");
+            self.set_part_text(name, &out);
         }
+    }
+
+    /// The `<w:comment>…</w:comment>` element whose `w:id` is `id`, exactly
+    /// as `comments.xml` holds it: what [`Package::insert_comment_xml`]
+    /// writes back losslessly.
+    /// `id` is the `w:id` as written (`03` is not `3`).
+    pub fn comment_xml(&self, id: &str) -> Option<String> {
+        let xml = self.part_text("word/comments.xml")?;
+        comment_range(&xml, id).map(|range| xml[range].to_string())
+    }
+
+    /// The `w:id` of every `<w:comment>` in `comments.xml`, exactly as
+    /// written and in order, read the way the loader decodes the part
+    /// (UTF-16 included).
+    pub fn comment_ids(&self) -> Vec<String> {
+        let Some(xml) = self.part_text("word/comments.xml") else {
+            return Vec::new();
+        };
+        let mut ids = Vec::new();
+        let mut from = 0;
+        while let Some((start, end, _)) = crate::inspect::find_element_from(&xml, "w:comment", from)
+        {
+            if let Some(id) = comment_id_at(&xml, start) {
+                ids.push(id);
+            }
+            from = end;
+        }
+        ids
     }
 
     /// Ensure `numbering.xml` defines a simple bullet (or decimal) list and return
@@ -3514,6 +3551,28 @@ fn extract_sectpr(xml: &str) -> String {
         }
     }
     best.map_or_else(String::new, |(s, e)| xml[s..e].to_string())
+}
+
+/// The byte range of the `<w:comment>` element in `xml` (a `comments.xml`)
+/// whose `w:id` attribute is `id` as written, wherever that attribute sits
+/// in its opening tag. Not `<w:comments>` or a `<w:commentRangeStart>`, and
+/// `3` never matches `w:id="30"` or `w:id="03"`.
+fn comment_range(xml: &str, id: &str) -> Option<std::ops::Range<usize>> {
+    let mut from = 0;
+    while let Some((start, end, _)) = crate::inspect::find_element_from(xml, "w:comment", from) {
+        if comment_id_at(xml, start).as_deref() == Some(id) {
+            return Some(start..end);
+        }
+        from = end;
+    }
+    None
+}
+
+/// The `w:id` of the `<w:comment>` opening tag at `start` in `xml`.
+fn comment_id_at(xml: &str, start: usize) -> Option<String> {
+    let head = crate::inspect::tag_end(&xml[start..])?;
+    let mut p = XmlParser::new(&xml[start..start + head]);
+    (p.next() == Event::Start).then(|| p.attr("w:id").to_string())
 }
 
 #[cfg(test)]
@@ -6172,5 +6231,161 @@ mod tests {
             pkg.link_part_hyperlinks("word/header1.xml", &mut blocks),
             Ok(None)
         );
+    }
+
+    /// A package whose `comments.xml` is `comments` (#971).
+    fn with_comments(comments: &str) -> Package {
+        let mut p = load_package(&make_docx("<w:document/>")).unwrap();
+        p.parts.push((
+            "word/comments.xml".to_string(),
+            comments.as_bytes().to_vec(),
+        ));
+        p
+    }
+
+    const COMMENTS_OPEN: &str = "<?xml version=\"1.0\"?><w:comments xmlns:w=\"w\">";
+
+    /// #971: a producer that writes `w:id` after other attributes still has
+    /// its comment removed (the suite's Remove All relies on it).
+    #[test]
+    fn remove_comment_ignores_attribute_order() {
+        let mut p = with_comments(&format!(
+            "{COMMENTS_OPEN}<w:comment w:author=\"A\" w:id=\"3\"><w:p/></w:comment>\
+             <w:comment w:id=\"4\" w:author=\"B\"><w:p/></w:comment></w:comments>"
+        ));
+        p.remove_comment(3);
+        assert_eq!(
+            p.part_text("word/comments.xml").unwrap(),
+            format!(
+                "{COMMENTS_OPEN}<w:comment w:id=\"4\" w:author=\"B\"><w:p/></w:comment></w:comments>"
+            )
+        );
+    }
+
+    /// #971: id 3 is not `w:id="30"`, nor a `w14:paraId`, and the root
+    /// `<w:comments>` is never taken for a comment.
+    #[test]
+    fn remove_comment_matches_whole_id() {
+        let xml = format!(
+            "{COMMENTS_OPEN}<w:comment w:id=\"30\" w14:paraId=\"3\"><w:p/></w:comment></w:comments>"
+        );
+        let mut p = with_comments(&xml);
+        p.remove_comment(3);
+        assert_eq!(p.part_text("word/comments.xml").unwrap(), xml);
+        assert_eq!(p.comment_xml("3"), None);
+        p.remove_comment(30);
+        assert_eq!(
+            p.part_text("word/comments.xml").unwrap(),
+            format!("{COMMENTS_OPEN}</w:comments>")
+        );
+    }
+
+    /// #971: a comment's XML comes back byte-for-byte through
+    /// `comment_xml` → `remove_comment` → `insert_comment_xml`.
+    #[test]
+    fn comment_xml_round_trips_through_insert() {
+        let c2 = "<w:comment w:author=\"Ann &amp; Bob\" w:id=\"2\" w14:paraId=\"1A\">\
+                  <w:p><w:r><w:rPr><w:b/></w:rPr><w:t>one</w:t></w:r></w:p>\
+                  <w:p><w:r><w:t>two</w:t></w:r></w:p></w:comment>";
+        let mut p = with_comments(&format!("{COMMENTS_OPEN}{c2}</w:comments>"));
+        let raw = p.comment_xml("2").unwrap();
+        assert_eq!(raw, c2);
+        p.remove_comment(2);
+        assert_eq!(p.comment_xml("2"), None);
+        p.insert_comment_xml(&raw);
+        assert_eq!(
+            p.part_text("word/comments.xml").unwrap(),
+            format!("{COMMENTS_OPEN}{c2}</w:comments>")
+        );
+    }
+
+    /// #971: inserting into a package with no comments part creates it, its
+    /// relationship and its content type, as `add_comment` does.
+    #[test]
+    fn insert_comment_xml_creates_the_part() {
+        let mut p = load_package(&make_docx("<w:document/>")).unwrap();
+        p.parts.push((
+            "word/_rels/document.xml.rels".to_string(),
+            br#"<Relationships><Relationship Id="rId1" Target="styles.xml"/></Relationships>"#
+                .to_vec(),
+        ));
+        p.set_part(
+            "[Content_Types].xml",
+            br#"<?xml version="1.0"?><Types></Types>"#.to_vec(),
+        );
+        let c = "<w:comment w:id=\"5\"><w:p/></w:comment>";
+        p.insert_comment_xml(c);
+        assert_eq!(p.comment_xml("5").as_deref(), Some(c));
+        let ct = p.part_text("[Content_Types].xml").unwrap();
+        assert!(ct.contains("/word/comments.xml"), "{ct}");
+        let rels = p.part_text("word/_rels/document.xml.rels").unwrap();
+        assert!(rels.contains("Target=\"comments.xml\""), "{rels}");
+        let reloaded = load_package(&save_package(&p)).unwrap();
+        assert_eq!(reloaded.comment_xml("5").as_deref(), Some(c));
+    }
+
+    /// #971 FIX r1 M1: ids are matched as written, so a producer's `03` is
+    /// found (and listed) as `03`, never as `3`, and the reverse.
+    #[test]
+    fn comment_ids_and_removal_use_the_id_as_written() {
+        let three = "<w:comment w:id=\"3\"><w:p/></w:comment>";
+        let mut p = with_comments(&format!(
+            "{COMMENTS_OPEN}<w:comment w:author=\"A\" w:id=\"03\"><w:p/></w:comment>{three}</w:comments>"
+        ));
+        assert_eq!(p.comment_ids(), ["03", "3"]);
+        p.remove_comment_id("03");
+        assert_eq!(
+            p.part_text("word/comments.xml").unwrap(),
+            format!("{COMMENTS_OPEN}{three}</w:comments>")
+        );
+        p.remove_comment_id("03");
+        assert_eq!(p.comment_ids(), ["3"], "3 is not 03");
+    }
+
+    /// #971 FIX r1 M1: a UTF-16 comments.xml is listed and edited in place,
+    /// and stays UTF-16.
+    #[test]
+    fn comment_ids_read_a_utf16_part() {
+        let xml = format!(
+            "{COMMENTS_OPEN}<w:comment w:id=\"1\"><w:p/></w:comment>\
+             <w:comment w:id=\"2\"><w:p/></w:comment></w:comments>"
+        );
+        let mut bytes = vec![0xff, 0xfe];
+        for unit in xml.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let mut p = load_package(&make_docx("<w:document/>")).unwrap();
+        p.parts.push(("word/comments.xml".to_string(), bytes));
+        assert_eq!(p.comment_ids(), ["1", "2"]);
+        p.remove_comment_id("1");
+        assert_eq!(p.comment_ids(), ["2"]);
+        assert!(
+            p.part("word/comments.xml")
+                .unwrap()
+                .starts_with(&[0xff, 0xfe])
+        );
+    }
+
+    /// #971 FIX r2 f2: appending to a UTF-16 comments.xml keeps it UTF-16
+    /// (BOM included) with both comments readable.
+    #[test]
+    fn insert_comment_xml_keeps_a_utf16_part() {
+        let one = "<w:comment w:id=\"1\"><w:p/></w:comment>";
+        let xml = format!("{COMMENTS_OPEN}{one}</w:comments>");
+        let mut bytes = vec![0xff, 0xfe];
+        for unit in xml.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let mut p = load_package(&make_docx("<w:document/>")).unwrap();
+        p.parts.push(("word/comments.xml".to_string(), bytes));
+        let two = "<w:comment w:id=\"2\"><w:p/></w:comment>";
+        p.insert_comment_xml(two);
+        assert!(
+            p.part("word/comments.xml")
+                .unwrap()
+                .starts_with(&[0xff, 0xfe, b'<', 0])
+        );
+        assert_eq!(p.comment_ids(), ["1", "2"]);
+        assert_eq!(p.comment_xml("2").as_deref(), Some(two));
     }
 }

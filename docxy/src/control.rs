@@ -1042,7 +1042,7 @@ fn finish_edit(app: &mut App) {
     app.refresh_watermark_state_if_needed();
     // An undo or redo may take a new comment's markers or bring them back:
     // `doc.comments` and the panel follow (#620).
-    app.sync_session_comments();
+    app.sync_tracked_comments();
 }
 
 /// Resolve an optional block range from `{start, end}` or `{range:"a..b"}`,

@@ -482,8 +482,22 @@ pub fn has_comment_markers(doc: &Document) -> bool {
 /// body, wherever [`has_comment_markers`] would find it. A host uses it to
 /// tell whether a comment it added is still anchored (#620).
 pub fn comment_marker_ids(doc: &Document) -> std::collections::BTreeSet<String> {
+    comment_marker_ids_in_blocks(&doc.body)
+}
+
+/// [`comment_marker_ids`] of any block list: a header's or footer's
+/// content, say.
+pub fn comment_marker_ids_in_blocks(blocks: &[Block]) -> std::collections::BTreeSet<String> {
     let mut ids = std::collections::BTreeSet::new();
-    marker_ids_in_blocks(&doc.body, &mut ids);
+    marker_ids_in_blocks(blocks, &mut ids);
+    ids
+}
+
+/// The `w:id` of every comment marker in a part's raw XML (a header or
+/// footer part as the package holds it).
+pub fn comment_marker_ids_in_xml(xml: &str) -> std::collections::BTreeSet<String> {
+    let mut ids = std::collections::BTreeSet::new();
+    marker_ids_in_xml(xml, &mut ids);
     ids
 }
 
@@ -547,48 +561,9 @@ pub fn remove_comment_markers(doc: &mut Document, id: &str) -> usize {
     remove_blocks(&mut doc.body, Target::CommentMarkers(Some(id)))
 }
 
-const COMMENTS_PART: &str = "word/comments.xml";
-
-/// Rewrite `word/comments.xml` to its root element alone: the opening
-/// `<w:comments …>` tag (namespaces kept) and its close, no comments. Done
-/// directly rather than per id, since removing one comment matches its
-/// opening tag literally and misses a producer's other attribute order.
-/// Returns false when there is no such part or it already has no children.
-pub fn empty_comments_part(pkg: &mut Package) -> bool {
-    let Some(xml) = pkg.part_text(COMMENTS_PART) else {
-        return false;
-    };
-    match emptied_root(&xml) {
-        Some(emptied) if emptied != xml => pkg.set_part_text(COMMENTS_PART, &emptied),
-        _ => false,
-    }
-}
-
-/// `xml` with everything inside its root element dropped, or `None` when it
-/// has no root element. A self-closing root is returned unchanged.
-fn emptied_root(xml: &str) -> Option<String> {
-    let mut from = 0;
-    let start = loop {
-        let at = from + xml[from..].find('<')?;
-        if xml[at + 1..].starts_with(['?', '!']) {
-            from = at + 1;
-        } else {
-            break at;
-        }
-    };
-    let end = start + tag_end(&xml[start..])?;
-    let opening = &xml[..end];
-    if opening.ends_with("/>") {
-        return Some(xml.to_string());
-    }
-    let name = &xml[start + 1..]
-        [..xml[start + 1..].find(|c: char| c.is_whitespace() || c == '>' || c == '/')?];
-    Some(format!("{opening}</{name}>"))
-}
-
 /// The byte length of the tag starting at `s[0] == '<'`, through its `>`,
 /// skipping `>` inside quoted attribute values.
-fn tag_end(s: &str) -> Option<usize> {
+pub(crate) fn tag_end(s: &str) -> Option<usize> {
     let mut quote = None;
     for (i, c) in s.char_indices() {
         match (quote, c) {
@@ -626,7 +601,11 @@ const CUSTOM_PERSONAL: [&str; 1] = ["property"];
 /// and whether it has non-blank content. Unlike [`crate::sect::find_element`]
 /// it starts at `from`, skips a `>` inside a quoted attribute value, and
 /// finds nothing when the close tag is missing.
-fn find_element_from(xml: &str, name: &str, from: usize) -> Option<(usize, usize, bool)> {
+pub(crate) fn find_element_from(
+    xml: &str,
+    name: &str,
+    from: usize,
+) -> Option<(usize, usize, bool)> {
     let open = format!("<{name}");
     let mut at = from;
     loop {
@@ -699,7 +678,7 @@ pub fn remove_personal_properties(pkg: &mut Package) -> bool {
 mod tests {
     use super::*;
     use crate::load::{Relationships, parse_document_xml};
-    use crate::package::{load_package, save_package};
+    use crate::package::load_package;
     use crate::serialize::document_to_xml;
     use crate::zipwrite::write_zip;
 
@@ -1245,33 +1224,6 @@ mod tests {
     }
 
     #[test]
-    fn inspect_empties_comments_part_author_before_id() {
-        let comments = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n\
-            <w:comments xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" xmlns:w14=\"x\">\
-            <w:comment w:author=\"Ann\" w:id=\"0\" w:date=\"2026-01-01T00:00:00Z\"><w:p><w:r><w:t>a &gt; b</w:t></w:r></w:p></w:comment>\
-            <w:comment w:initials=\"B\" w:id=\"1\"><w:p/></w:comment></w:comments>";
-        let mut pkg = docx(
-            &format!("<w:document {W}><w:body><w:p/></w:body></w:document>"),
-            &[("word/comments.xml", comments)],
-        );
-        assert!(empty_comments_part(&mut pkg));
-        let xml = pkg.part_text("word/comments.xml").unwrap();
-        assert_eq!(
-            xml,
-            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n\
-             <w:comments xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" xmlns:w14=\"x\"></w:comments>"
-        );
-        assert!(!empty_comments_part(&mut pkg), "already empty");
-        let saved = load_package(&save_package(&pkg)).unwrap();
-        assert!(
-            !saved
-                .part_text("word/comments.xml")
-                .unwrap()
-                .contains("<w:comment ")
-        );
-    }
-
-    #[test]
     fn inspect_removes_personal_core_and_app_properties() {
         let core = "<?xml version=\"1.0\"?><cp:coreProperties xmlns:cp=\"c\" xmlns:dc=\"d\" xmlns:dcterms=\"t\">\
             <dc:title xml:lang=\"en\">Plan</dc:title><dc:creator>Ann</dc:creator>\
@@ -1340,6 +1292,5 @@ mod tests {
         );
         assert!(!has_personal_properties(&pkg));
         assert!(!remove_personal_properties(&mut pkg));
-        assert!(!empty_comments_part(&mut pkg));
     }
 }

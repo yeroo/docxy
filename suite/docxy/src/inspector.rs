@@ -180,23 +180,20 @@ pub(crate) fn inspect_remove(
     let (status, changed) = match category {
         InspectCategory::Comments => {
             let markers = editor.remove_all_comment_markers();
-            // A comment added this session keeps its record, unlisted and
-            // unsaved now its markers are gone, so undoing this brings it
-            // back whole with them (#620).
-            let before = tab.comments.len();
-            let session = &tab.session_comment_ids;
-            tab.comments.retain(|c| session.contains(&c.id));
-            let dropped = before - tab.comments.len();
+            // Every comment keeps its record, tracked: unlisted and unsaved
+            // now its markers are gone, so undoing this brings each back
+            // whole with them, and the save removes the rest from the base
+            // per id (#620, #971).
+            let tracked = &mut tab.tracked_comment_ids;
+            let before = tracked.len();
+            tracked.extend(tab.comments.iter().map(|c| c.id.clone()));
+            let grew = tracked.len() > before;
+            // And the save drops the base comments it can't match per id.
+            tab.comments_removed_all = true;
             let comments = inspection.comments;
-            // The save reconciles comments.xml against `comments` by exact
-            // id prefix; emptying the part directly misses none.
-            let part = tab
-                .pkg
-                .as_mut()
-                .is_some_and(docxcore::inspect::empty_comments_part);
             (
                 format!("Removed all comments ({comments})"),
-                markers > 0 || dropped > 0 || part,
+                markers > 0 || grew,
             )
         }
         InspectCategory::Revisions => {
