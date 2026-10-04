@@ -137,6 +137,41 @@ jobs:
       - name: Linux window capture
         run: python3 scripts/ui-linux.py -- cargo test -p uiharness --locked --test linux_capture -- --ignored
 
+  ui-sweep-linux:
+    name: ui sweep (linux)
+    # Every uiharness/cases/*.uit, each in a fresh release suite on a private Xvfb +
+    # Openbox display, checked against uiharness/cases/expected-failures.txt (#979).
+    # A job of its own so the release build runs beside suite-linux's debug tests.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            suite -> target
+            . -> target
+      - name: System packages gpui needs on Linux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends             pkg-config clang cmake             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev             libx11-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev             libwayland-dev libvulkan-dev mesa-vulkan-drivers             libfontconfig-dev libfreetype-dev libasound2-dev libssl-dev libzstd-dev             xvfb openbox x11-utils
+      - name: Build release suite
+        run: cargo build --release --locked --manifest-path suite/Cargo.toml
+      - name: Build release uiharness
+        run: cargo build --release --locked -p uiharness
+      - name: Sweep runner unit tests
+        run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
+      - name: Sweep
+        run: python3 scripts/ui-linux-sweep.py --run "$GITHUB_WORKSPACE/uiharness-runs/sweep"
+      - name: Upload the sweep's transcripts and evidence
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ui-sweep-linux
+          path: uiharness-runs/sweep
+          if-no-files-found: ignore
+
   suite-macos:
     name: desktop suite (macos)
     # Releases already build the suite on macOS; this catches a macOS break in the PR
