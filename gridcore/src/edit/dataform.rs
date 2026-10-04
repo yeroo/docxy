@@ -124,8 +124,8 @@ pub fn delete_splits_array(s: &Sheet, (_, c1, bottom, c2): Area, row: u32) -> bo
 /// move with them ([`super::move_refs`], as a cut does). A range only partly in the
 /// moved cells keeps its text (`SUM(B3:B4)` with row 3 deleted still reads
 /// `B3:B4`). Comments, merges, hyperlinks, and conditional-format and
-/// validation ranges don't move, so their rules' formulas are left as they
-/// are too. A moved array anchor takes its `ref` along. The caller refuses
+/// validation ranges don't move, so the formulas of the rules over the
+/// shifted cells are left as they are too (any other rule's follow). A moved array anchor takes its `ref` along. The caller refuses
 /// a delete that would cut an array first ([`delete_splits_array`]).
 pub fn delete_record(wb: &mut Workbook, sheet: usize, (_, c1, bottom, c2): Area, row: u32) {
     let name = wb.sheets[sheet].name.clone();
@@ -137,14 +137,23 @@ pub fn delete_record(wb: &mut Workbook, sheet: usize, (_, c1, bottom, c2): Area,
         dr: -i64::from(MAX_ROWS),
         dc: 0,
     };
-    move_refs_with(wb, sheet, &gone, false);
+    // A rule over the cells that shift keeps its range, so it keeps its
+    // formula too; any other rule follows the cells it names.
+    let (r1, k1, r2, k2) = (row, c1, bottom, c2);
+    let rules = |s: usize, ranges: &[Area]| {
+        s != sheet
+            || !ranges
+                .iter()
+                .any(|&(a, b, c, d)| a <= r2 && c >= r1 && b <= k2 && d >= k1)
+    };
+    move_refs_with(wb, sheet, &gone, rules);
     let up = CellMove {
         rect: (row + 1, c1, bottom, c2),
         dr: -1,
         ..gone
     };
     if row < bottom {
-        move_refs_with(wb, sheet, &up, false);
+        move_refs_with(wb, sheet, &up, rules);
     }
     let s = &mut wb.sheets[sheet];
     for c in c1..=c2 {
@@ -526,6 +535,40 @@ mod tests {
         assert_eq!(s.cond_formats[0].ranges, [(1, 0, 3, 2)]);
         assert_eq!(s.validations[0].formula1, "ISNUMBER(B2)");
         assert_eq!(s.validations[0].ranges, [(1, 1, 3, 1)]);
+    }
+
+    #[test]
+    fn delete_moves_refs_in_rules_beside_the_list() {
+        use crate::sheet::DataValidation;
+        let mut wb = list();
+        // On E1, beside the list: it follows the cells it names.
+        wb.sheets[0].validations.push(DataValidation {
+            ranges: vec![(0, 4, 0, 4)],
+            kind: "decimal".into(),
+            operator: "between".into(),
+            formula1: "$B$2".into(),
+            formula2: "$B$4".into(),
+            ..DataValidation::default()
+        });
+        // On another sheet, naming the list.
+        let mut other = Sheet {
+            name: "Other".into(),
+            ..Sheet::default()
+        };
+        other.validations.push(DataValidation {
+            ranges: vec![(1, 1, 3, 1)],
+            kind: "custom".into(),
+            formula1: "Sheet1!$B$3>0".into(),
+            ..DataValidation::default()
+        });
+        wb.sheets.push(other);
+        delete_record(&mut wb, 0, AREA, 1);
+        let dv = &wb.sheets[0].validations[0];
+        assert_eq!(
+            (dv.formula1.as_str(), dv.formula2.as_str()),
+            ("#REF!", "$B$3")
+        );
+        assert_eq!(wb.sheets[1].validations[0].formula1, "Sheet1!$B$2>0");
     }
 
     #[test]

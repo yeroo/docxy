@@ -919,7 +919,7 @@ pub fn rename_sheet(wb: &mut Workbook, idx: usize, new_name: &str) {
     // too (a list on another sheet). Only one the rename touches is
     // reprinted, so the loaded spelling stays otherwise.
     for sheet in &mut wb.sheets {
-        for_each_rule_formula(sheet, |src| {
+        for_each_rule_formula(sheet, |_, src| {
             if let Some(updated) =
                 rewrite_if_changed(src, |e| rename_sheet_in_expr(e, &old, new_name))
             {
@@ -1380,15 +1380,17 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
 }
 
 /// Every conditional-formatting and data-validation formula on `sheet`.
-fn for_each_rule_formula(sheet: &mut Sheet, mut f: impl FnMut(&mut String)) {
+fn for_each_rule_formula(sheet: &mut Sheet, mut f: impl FnMut(&[Area], &mut String)) {
     for cf in &mut sheet.cond_formats {
         for rule in &mut cf.rules {
-            rule.formulas_mut().into_iter().for_each(&mut f);
+            for src in rule.formulas_mut() {
+                f(&cf.ranges, src);
+            }
         }
     }
     for dv in &mut sheet.validations {
-        f(&mut dv.formula1);
-        f(&mut dv.formula2);
+        f(&dv.ranges, &mut dv.formula1);
+        f(&dv.ranges, &mut dv.formula2);
     }
 }
 
@@ -1700,13 +1702,13 @@ pub fn table_range_conflict(
 type FormulaSite = (Option<usize>, Option<(u32, u32)>);
 
 /// Rewrite every formula a table rename or conversion can reach: cell
-/// formulas (array formulas included), defined names, and, with `rules`,
-/// conditional-format and data-validation rules. A formula `f` leaves
-/// unchanged keeps its text exactly; one held verbatim (a shared or
-/// data-table formula) is left alone.
+/// formulas (array formulas included), defined names, and the
+/// conditional-format and data-validation rules `rules` takes (given the
+/// rule's sheet and ranges). A formula `f` leaves unchanged keeps its text
+/// exactly; one held verbatim (a shared or data-table formula) is left alone.
 fn rewrite_workbook_formulas(
     wb: &mut Workbook,
-    rules: bool,
+    rules: impl Fn(usize, &[Area]) -> bool,
     f: impl Fn(&Expr, FormulaSite) -> Expr,
 ) {
     for (s, sheet) in wb.sheets.iter_mut().enumerate() {
@@ -1721,10 +1723,10 @@ fn rewrite_workbook_formulas(
                 cell.formula = Some(updated);
             }
         }
-        if !rules {
-            continue;
-        }
-        for_each_rule_formula(sheet, |src| {
+        for_each_rule_formula(sheet, |ranges, src| {
+            if !rules(s, ranges) {
+                return;
+            }
             if let Some(updated) = rewrite_if_changed(src, |e| f(e, (Some(s), None))) {
                 *src = updated;
             }
@@ -1775,9 +1777,11 @@ pub fn rename_table(wb: &mut Workbook, old: &str, new: &str) -> Result<(), Strin
         return Ok(());
     }
     let map = [(cur.clone(), new.to_string())];
-    rewrite_workbook_formulas(wb, true, |e, _| {
-        crate::formula::rename_tables_in_expr(e, &map)
-    });
+    rewrite_workbook_formulas(
+        wb,
+        |_, _| true,
+        |e, _| crate::formula::rename_tables_in_expr(e, &map),
+    );
     for piv in &mut wb.pivots {
         if let crate::pivot::PivotSource::Table(n) = &mut piv.source {
             if n.eq_ignore_ascii_case(&cur) {
@@ -1929,17 +1933,21 @@ pub fn convert_table_to_range(wb: &mut Workbook, name: &str) -> Result<(), Strin
         sheet_name: &sheet_name,
         info: &info,
     };
-    rewrite_workbook_formulas(wb, true, |e, (s, cell)| {
-        let host = crate::formula::FormulaHost {
-            same_sheet: s == Some(t.sheet),
-            row: cell.map(|(r, _)| r),
-            inside: match (s, cell) {
-                (Some(s), Some((r, c))) => t.contains(s, r, c),
-                _ => false,
-            },
-        };
-        crate::formula::table_refs_to_cells_in_expr(e, &target, host)
-    });
+    rewrite_workbook_formulas(
+        wb,
+        |_, _| true,
+        |e, (s, cell)| {
+            let host = crate::formula::FormulaHost {
+                same_sheet: s == Some(t.sheet),
+                row: cell.map(|(r, _)| r),
+                inside: match (s, cell) {
+                    (Some(s), Some((r, c))) => t.contains(s, r, c),
+                    _ => false,
+                },
+            };
+            crate::formula::table_refs_to_cells_in_expr(e, &target, host)
+        },
+    );
     wb.tables.remove(idx);
     wb.removed_tables.push(crate::sheet::RemovedTable {
         table: t,
