@@ -706,32 +706,10 @@ fn render_date(sect: &Section, serial: f64, date1904: bool) -> String {
     };
     let twelve_hour = sect.toks.iter().any(|t| matches!(t, Tok::AmPm));
     let mut out = String::new();
-    const MONTHS: [&str; 12] = [
-        "January",
-        "February",
-        "March",
-        "April",
-        "May",
-        "June",
-        "July",
-        "August",
-        "September",
-        "October",
-        "November",
-        "December",
-    ];
+    use crate::edit::series::{DAYS, MONTHS};
     // Day-of-week from the serial: Excel's WEEKDAY convention has serial 1
     // as a "Sunday", so Sunday-index = (serial - 1) mod 7.
     let dow = (serial.floor() as i64 - 1).rem_euclid(7);
-    const DAYS: [&str; 7] = [
-        "Sunday",
-        "Monday",
-        "Tuesday",
-        "Wednesday",
-        "Thursday",
-        "Friday",
-        "Saturday",
-    ];
     for t in &sect.toks {
         match t {
             Tok::Lit(l) => out.push_str(l),

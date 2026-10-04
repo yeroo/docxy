@@ -13,7 +13,12 @@
 use std::collections::BTreeMap;
 
 mod clip;
+pub(crate) mod series;
 pub use clip::{MAX_PASTE_CELLS, PASTE_SHAPE, move_refs, paste_tiles, tiled_block};
+pub use series::{
+    FillDir, FillKind, FillTarget, JUSTIFY_OVERFLOW, SeriesSpec, SeriesType, builtin_lists,
+    fill_target, justify_lines, series_rows_for,
+};
 mod consolidate;
 mod subtotal;
 pub(crate) use consolidate::split_ref_text;
@@ -163,18 +168,19 @@ pub fn replace_all_in_sheet(
     out
 }
 
-/// Excel's Fill Down / Fill Right (Ctrl+D / Ctrl+R) over the selection
-/// `(r1, c1, r2, c2)`: a range copies its first row down (or first column
-/// right); a selection one row high (for Fill Down) or one column wide (for
-/// Fill Right) — a single cell included — pulls from the row above (or the
-/// column to the left).
+/// Excel's Fill Down / Right / Up / Left (Ctrl+D, Ctrl+R, Home › Fill) over
+/// the selection `(r1, c1, r2, c2)`: a range copies its first row down (its
+/// first column right, its last row up, its last column left); a selection
+/// one cell deep along the fill — a single cell included — pulls from the
+/// neighbour before it (the row above for Down, below for Up, the column to
+/// the left for Right, to the right for Left).
 /// Relative references move with the copy and the source's style comes
 /// along; its file metadata does not ([`copy_meta`]). Pure: returns the
 /// `(row, col, cell)` changes.
 pub fn fill_changes(
     sheet: &Sheet,
     (r1, c1, r2, c2): (u32, u32, u32, u32),
-    down: bool,
+    dir: FillDir,
 ) -> Vec<(u32, u32, Cell)> {
     let mut changes = Vec::new();
     let mut copy_from = |sr: u32, sc: u32, tr: u32, tc: u32| {
@@ -187,28 +193,61 @@ pub fn fill_changes(
         }
         changes.push((tr, tc, cell));
     };
-    if down && r1 == r2 {
-        if r1 > 0 {
+    match dir {
+        FillDir::Down if r1 == r2 => {
+            if r1 > 0 {
+                for c in c1..=c2 {
+                    copy_from(r1 - 1, c, r1, c);
+                }
+            }
+        }
+        FillDir::Up if r1 == r2 => {
+            if r2 + 1 < MAX_ROWS {
+                for c in c1..=c2 {
+                    copy_from(r2 + 1, c, r2, c);
+                }
+            }
+        }
+        FillDir::Right if c1 == c2 => {
+            if c1 > 0 {
+                for r in r1..=r2 {
+                    copy_from(r, c1 - 1, r, c1);
+                }
+            }
+        }
+        FillDir::Left if c1 == c2 => {
+            if c2 + 1 < MAX_COLS {
+                for r in r1..=r2 {
+                    copy_from(r, c2 + 1, r, c2);
+                }
+            }
+        }
+        FillDir::Down => {
             for c in c1..=c2 {
-                copy_from(r1 - 1, c, r1, c);
+                for r in r1 + 1..=r2 {
+                    copy_from(r1, c, r, c);
+                }
             }
         }
-    } else if !down && c1 == c2 {
-        if c1 > 0 {
+        FillDir::Up => {
+            for c in c1..=c2 {
+                for r in r1..r2 {
+                    copy_from(r2, c, r, c);
+                }
+            }
+        }
+        FillDir::Right => {
             for r in r1..=r2 {
-                copy_from(r, c1 - 1, r, c1);
+                for c in c1 + 1..=c2 {
+                    copy_from(r, c1, r, c);
+                }
             }
         }
-    } else if down {
-        for c in c1..=c2 {
-            for r in r1 + 1..=r2 {
-                copy_from(r1, c, r, c);
-            }
-        }
-    } else {
-        for r in r1..=r2 {
-            for c in c1 + 1..=c2 {
-                copy_from(r, c1, r, c);
+        FillDir::Left => {
+            for r in r1..=r2 {
+                for c in c1..c2 {
+                    copy_from(r, c2, r, c);
+                }
             }
         }
     }
@@ -530,33 +569,79 @@ fn move_own_array_ref(cell: &mut Cell, (from, col): (u32, u32), to: u32) {
     cell.f_attrs = Some(with_ref(fa, &block));
 }
 
-/// Auto-fill from a source range by dragging its fill handle. `to` is the far
-/// corner the handle reached; the dominant axis (down or right) decides the
-/// direction. A source line of ≥2 numbers extends as a linear series (step =
-/// difference of the last two); otherwise the source cells are copied/cycled.
-/// Copied formulas are re-based like Excel's: relative references shift by the
-/// copy's row/column distance, absolute (`$`) ones stay put. Returns the count
-/// of filled cells.
-pub fn autofill(
-    wb: &mut Workbook,
-    sheet: usize,
-    src: (u32, u32, u32, u32),
-    to: (u32, u32),
-) -> usize {
-    let (sr0, sc0, sr1, sc1) = src;
-    let (tr, tc) = to;
-    // A denormalized source has no cells to read, and the pattern walk below
-    // divides by their count.
-    if sr0 > sr1 || sc0 > sc1 {
-        return 0;
+/// What [`autofill`] is asked to do: the fill handle of `src` dragged to the
+/// cell `to`, filling `kind` (Ctrl held swaps a plain drag's copy and
+/// series), with the user's custom `lists` beside the built-in ones.
+#[derive(Clone, Copy, Debug)]
+pub struct FillReq<'a> {
+    pub src: (u32, u32, u32, u32),
+    pub to: (u32, u32),
+    pub kind: FillKind,
+    pub ctrl: bool,
+    pub lists: &'a [Vec<String>],
+}
+
+impl<'a> FillReq<'a> {
+    /// A plain drag of `src`'s handle to `to`.
+    pub fn new(src: (u32, u32, u32, u32), to: (u32, u32)) -> Self {
+        FillReq {
+            src,
+            to,
+            kind: FillKind::Auto,
+            ctrl: false,
+            lists: &[],
+        }
     }
-    let dr = tr.saturating_sub(sr1);
-    let dc = tc.saturating_sub(sc1);
-    if dr == 0 && dc == 0 {
-        return 0;
-    }
-    let Some(s) = wb.sheets.get_mut(sheet) else {
-        return 0;
+}
+
+/// What a fill-handle drag did ([`autofill`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Filled {
+    /// These cells were filled, beside the source.
+    Extended((u32, u32, u32, u32)),
+    /// The handle was dragged back inside the source: these cells' contents
+    /// were cleared.
+    Cleared((u32, u32, u32, u32)),
+}
+
+/// Auto-fill from a source range by dragging its fill handle to `req.to`
+/// ([`fill_target`]): down, up, right or left along the axis pulled
+/// furthest, or, dragged back inside the source, clearing the cells left
+/// behind (contents only, as Excel does). Each line continues by Excel's
+/// series rules ([`series`]): numbers by their step or least-squares trend,
+/// dates by day, month or year, counted text, ordinals, quarters and list
+/// items; anything else is copied, cycling through the source. A fill up or
+/// left runs the series backwards. Copied formulas are re-based like Excel's:
+/// relative references shift by the copy's row/column distance, absolute
+/// (`$`) ones stay put. `None` when nothing changed.
+pub fn autofill(wb: &mut Workbook, sheet: usize, req: &FillReq) -> Option<Filled> {
+    let (sr0, sc0, sr1, sc1) = req.src;
+    let target = fill_target(req.src, req.to);
+    let date1904 = wb.date1904;
+    let Workbook { sheets, styles, .. } = wb;
+    let s = sheets.get_mut(sheet)?;
+    let (dir, dest) = match target {
+        FillTarget::None => return None,
+        FillTarget::Clear(rect) => {
+            let (r0, c0, r1, c1) = rect;
+            for r in r0..=r1 {
+                for c in c0..=c1 {
+                    if let Some(cell) = s.cell(r, c) {
+                        let style = cell.style;
+                        s.set_cell(
+                            r,
+                            c,
+                            Cell {
+                                style,
+                                ..Cell::default()
+                            },
+                        );
+                    }
+                }
+            }
+            return Some(Filled::Cleared(rect));
+        }
+        FillTarget::Extend { dir, dest } => (dir, dest),
     };
     // A source cell spilled by an anchor that is filled with it is copied
     // blank (keeping its style): the anchor's copy refills it, where a copied
@@ -587,45 +672,122 @@ pub fn autofill(
             }
         })
     };
-    let mut filled = 0;
-    if dr >= dc {
-        // Fill DOWN: extend each column into rows sr1+1..=tr.
-        let count = (tr - sr1) as usize;
-        for c in sc0..=sc1 {
-            let srcvals: Vec<Option<Cell>> = (sr0..=sr1).map(|r| source(s, r, c)).collect();
-            let len = srcvals.len();
-            for (k, mut cell) in extend_series(&srcvals, count).into_iter().enumerate() {
-                let dst = sr1 + 1 + k as u32;
-                // A copied cell came from src[k % len]; shift its formula by the
-                // distance it travelled.
-                rebase(
-                    &mut cell,
-                    i64::from(dst) - i64::from(sr0 + (k % len) as u32),
-                    0,
-                );
-                s.set_cell(dst, c, cell);
-                filled += 1;
-            }
-        }
+    let ctx = series::SeedCtx {
+        styles,
+        date1904,
+        lists: req.lists,
+    };
+    let vertical = matches!(dir, FillDir::Down | FillDir::Up);
+    let backwards = matches!(dir, FillDir::Up | FillDir::Left);
+    let (dr0, dc0, dr1, dc1) = dest;
+    let count = if vertical {
+        dr1 - dr0 + 1
     } else {
-        // Fill RIGHT: extend each row into columns sc1+1..=tc.
-        let count = (tc - sc1) as usize;
-        for r in sr0..=sr1 {
-            let srcvals: Vec<Option<Cell>> = (sc0..=sc1).map(|c| source(s, r, c)).collect();
-            let len = srcvals.len();
-            for (k, mut cell) in extend_series(&srcvals, count).into_iter().enumerate() {
-                let dst = sc1 + 1 + k as u32;
-                rebase(
-                    &mut cell,
-                    0,
-                    i64::from(dst) - i64::from(sc0 + (k % len) as u32),
-                );
-                s.set_cell(r, dst, cell);
-                filled += 1;
+        dc1 - dc0 + 1
+    } as usize;
+    let lines: Vec<u32> = if vertical {
+        (sc0..=sc1).collect()
+    } else {
+        (sr0..=sr1).collect()
+    };
+    let mut writes = Vec::new();
+    for line in lines {
+        // The source line's cells, seed 0 nearest the fill.
+        let mut pos: Vec<(u32, u32)> = if vertical {
+            (sr0..=sr1).map(|r| (r, line)).collect()
+        } else {
+            (sc0..=sc1).map(|c| (line, c)).collect()
+        };
+        if backwards {
+            pos.reverse();
+        }
+        let srcvals: Vec<Option<Cell>> = pos.iter().map(|&(r, c)| source(s, r, c)).collect();
+        let outs = series::extend_line(&srcvals, count, req.kind, req.ctrl, backwards, &ctx);
+        for (k, out) in outs.into_iter().enumerate() {
+            let step = k as u32 + 1;
+            let (r, c) = match dir {
+                FillDir::Down => (sr1 + step, line),
+                FillDir::Up => (sr0 - step, line),
+                FillDir::Right => (line, sc1 + step),
+                FillDir::Left => (line, sc0 - step),
+            };
+            let (mut cell, from_style) = match out {
+                series::LineOut::Copy(j) => {
+                    let mut cell = srcvals[j].clone().unwrap_or_default();
+                    let (fr, fc) = pos[j];
+                    rebase(
+                        &mut cell,
+                        i64::from(r) - i64::from(fr),
+                        i64::from(c) - i64::from(fc),
+                    );
+                    let style = cell.style;
+                    (cell, style)
+                }
+                series::LineOut::Value(cell) => {
+                    let style = cell.style;
+                    (cell, style)
+                }
+            };
+            let here = s.cell(r, c);
+            match req.kind {
+                // The source's style over the destination's own contents.
+                FillKind::FormatsOnly => {
+                    let mut kept = here.cloned().unwrap_or_default();
+                    kept.style = from_style;
+                    cell = kept;
+                }
+                // The series' values in the destination's own style.
+                FillKind::WithoutFormatting => {
+                    cell.style = here.map_or(0, |h| h.style);
+                }
+                _ => {}
             }
+            writes.push((r, c, cell));
         }
     }
-    filled
+    for (r, c, cell) in writes {
+        s.set_cell(r, c, cell);
+    }
+    Some(Filled::Extended(dest))
+}
+
+/// Home › Fill › Series… over `rect` ([`SeriesSpec`]): one call, the writes
+/// made. Returns how many cells were written.
+pub fn fill_series(
+    wb: &mut Workbook,
+    sheet: usize,
+    rect: (u32, u32, u32, u32),
+    spec: &SeriesSpec,
+    lists: &[Vec<String>],
+) -> usize {
+    let changes = series_changes_for(wb, sheet, rect, spec, lists);
+    let n = changes.len();
+    if let Some(s) = wb.sheets.get_mut(sheet) {
+        for (r, c, cell) in changes {
+            s.set_cell(r, c, cell);
+        }
+    }
+    n
+}
+
+/// The `(row, col, cell)` writes [`fill_series`] would make, for a host that
+/// checks them (an array in the way) before writing.
+pub fn series_changes_for(
+    wb: &Workbook,
+    sheet: usize,
+    rect: (u32, u32, u32, u32),
+    spec: &SeriesSpec,
+    lists: &[Vec<String>],
+) -> Vec<(u32, u32, Cell)> {
+    let Some(s) = wb.sheets.get(sheet) else {
+        return Vec::new();
+    };
+    let ctx = series::SeedCtx {
+        styles: &wb.styles,
+        date1904: wb.date1904,
+        lists,
+    };
+    series::series_changes(s, rect, spec, &ctx)
 }
 
 /// Shift a filled cell's formula by (`dr`, `dc`).
@@ -683,51 +845,6 @@ fn copy_meta(cell: &mut Cell) {
             ..Default::default()
         })
     });
-}
-
-/// Produce `count` cells continuing a source line: a numeric series when every
-/// source cell is a number (≥2 of them), else the source pattern copied/cycled.
-fn extend_series(src: &[Option<Cell>], count: usize) -> Vec<Cell> {
-    // Formulas carry a cached numeric result; extending them as a linear series
-    // would silently replace the formulas with numbers, so copy them instead.
-    if src
-        .iter()
-        .flatten()
-        .any(|c| c.formula.is_some() || c.f_attrs.is_some())
-    {
-        return (0..count)
-            .map(|k| src[k % src.len()].clone().unwrap_or_default())
-            .collect();
-    }
-    let nums: Option<Vec<f64>> = src
-        .iter()
-        .map(|c| match c.as_ref().map(|x| &x.value) {
-            Some(CellValue::Number(n)) => Some(*n),
-            _ => None,
-        })
-        .collect();
-    if let Some(nums) = nums {
-        if nums.len() >= 2 {
-            let step = nums[nums.len() - 1] - nums[nums.len() - 2];
-            let last = nums[nums.len() - 1];
-            let style = src
-                .last()
-                .and_then(|c| c.as_ref())
-                .map(|c| c.style)
-                .unwrap_or(0);
-            return (0..count)
-                .map(|k| {
-                    let mut cell = Cell::number(last + step * (k as f64 + 1.0));
-                    cell.style = style; // carry the source formatting
-                    cell
-                })
-                .collect();
-        }
-    }
-    // Copy / cycle the source cells (single value → repeat it).
-    (0..count)
-        .map(|k| src[k % src.len()].clone().unwrap_or_default())
-        .collect()
 }
 
 /// Excel's refusal when Text to Columns is given more than one column.
@@ -2096,6 +2213,14 @@ mod tests {
         }
     }
 
+    /// A plain fill-handle drag; how many cells it wrote (0: none).
+    fn af(w: &mut Workbook, src: (u32, u32, u32, u32), to: (u32, u32)) -> usize {
+        match autofill(w, 0, &FillReq::new(src, to)) {
+            Some(Filled::Extended((r0, c0, r1, c1))) => ((r1 - r0 + 1) * (c1 - c0 + 1)) as usize,
+            _ => 0,
+        }
+    }
+
     #[test]
     fn sort_rows_multi_key_breaks_ties() {
         // Group asc, then Score desc within each group. Rows 2..=5 (0-based 1..=4).
@@ -2187,7 +2312,7 @@ mod tests {
     fn autofill_series_down_and_copy_right() {
         // A1=1, A2=2  → fill down to A5 should give the series 3,4,5.
         let mut w = wb(&[("A1", Cell::number(1.0)), ("A2", Cell::number(2.0))]);
-        let n = autofill(&mut w, 0, (0, 0, 1, 0), (4, 0));
+        let n = af(&mut w, (0, 0, 1, 0), (4, 0));
         assert_eq!(n, 3);
         let s = &w.sheets[0];
         let num = |r: u32| match s.cell(r, 0).map(|c| c.value.clone()) {
@@ -2198,7 +2323,7 @@ mod tests {
 
         // A single text cell copied to the right (B1..D1 = "x").
         let mut w2 = wb(&[("A1", Cell::text("x"))]);
-        let n2 = autofill(&mut w2, 0, (0, 0, 0, 0), (0, 3));
+        let n2 = af(&mut w2, (0, 0, 0, 0), (0, 3));
         assert_eq!(n2, 3);
         let s2 = &w2.sheets[0];
         for c in 1..=3 {
@@ -2213,14 +2338,14 @@ mod tests {
     fn autofill_step_of_five_and_no_op() {
         // 0,5 → 10,15,20 (step 5).
         let mut w = wb(&[("A1", Cell::number(0.0)), ("A2", Cell::number(5.0))]);
-        autofill(&mut w, 0, (0, 0, 1, 0), (4, 0));
+        af(&mut w, (0, 0, 1, 0), (4, 0));
         let s = &w.sheets[0];
         assert_eq!(
             s.cell(4, 0).map(|c| c.value.clone()),
             Some(CellValue::Number(20.0))
         );
         // Dragging back onto the source (no extension) fills nothing.
-        assert_eq!(autofill(&mut w, 0, (0, 0, 1, 0), (1, 0)), 0);
+        assert_eq!(af(&mut w, (0, 0, 1, 0), (1, 0)), 0);
     }
 
     #[test]
@@ -2243,7 +2368,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(autofill(&mut w, 0, (0, 3, 0, 3), (2, 3)), 2);
+        assert_eq!(af(&mut w, (0, 3, 0, 3), (2, 3)), 2);
         let f = |r: u32| w.sheets[0].cell(r, 3).and_then(|c| c.formula.clone());
         assert_eq!(f(1).as_deref(), Some("B2*C2*$A$1"));
         assert_eq!(f(2).as_deref(), Some("B3*C3*$A$1"));
@@ -2266,7 +2391,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(autofill(&mut w, 0, (0, 1, 0, 1), (0, 3)), 2);
+        assert_eq!(af(&mut w, (0, 1, 0, 1), (0, 3)), 2);
         let f = |c: u32| w.sheets[0].cell(0, c).and_then(|x| x.formula.clone());
         assert_eq!(f(2).as_deref(), Some("C2+C3"));
         assert_eq!(f(3).as_deref(), Some("D2+D3"));
@@ -2277,7 +2402,7 @@ mod tests {
         // "x","y" filled down five rows repeats the pair, rather than trying to
         // read a series out of text.
         let mut w = wb(&[("A1", Cell::text("x")), ("A2", Cell::text("y"))]);
-        assert_eq!(autofill(&mut w, 0, (0, 0, 1, 0), (6, 0)), 5);
+        assert_eq!(af(&mut w, (0, 0, 1, 0), (6, 0)), 5);
         let t = |r: u32| match w.sheets[0].cell(r, 0).map(|c| c.value.clone()) {
             Some(CellValue::Text(s)) => s,
             v => panic!("A{} not text: {v:?}", r + 1),
@@ -2305,7 +2430,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(autofill(&mut w, 0, (0, 1, 0, 1), (2, 1)), 2);
+        assert_eq!(af(&mut w, (0, 1, 0, 1), (2, 1)), 2);
         let cell = |r: u32| w.sheets[0].cell(r, 1).cloned().unwrap();
         assert_eq!(
             cell(1).formula.as_deref(),
@@ -2333,7 +2458,7 @@ mod tests {
         let mut eng = crate::engine::Engine::new(&w);
         eng.set_cell(&mut w, (0, 0, 1), Cell::formula("A1:A3*2"));
         assert_eq!(w.sheets[0].cell(0, 1).unwrap().spill, Some((3, 1)));
-        assert_eq!(autofill(&mut w, 0, (0, 1, 0, 1), (0, 2)), 1);
+        assert_eq!(af(&mut w, (0, 1, 0, 1), (0, 2)), 1);
         assert_eq!(w.sheets[0].cell(0, 2).unwrap().spill, None);
         let mut eng = crate::engine::Engine::new(&w);
         eng.recalc_all(&mut w);
@@ -2400,7 +2525,7 @@ mod tests {
             assert_eq!(w.sheets[0].cell(0, 3).unwrap().spill, Some((3, 1)));
             let d1 = w.sheets[0].cell(0, 3).unwrap();
             assert_eq!(d1.f_attrs.is_some(), loaded);
-            assert_eq!(autofill(&mut w, 0, (0, 3, 2, 3), (5, 3)), 3);
+            assert_eq!(af(&mut w, (0, 3, 2, 3), (5, 3)), 3);
             let mut eng = Engine::new(&w);
             eng.recalc_all(&mut w);
             let d = ["D1", "D2", "D3", "D4", "D5", "D6"];
@@ -2413,7 +2538,7 @@ mod tests {
         let mut w = wb(&[]);
         let mut eng = Engine::new(&w);
         eng.set_cell(&mut w, (0, 4, 0), Cell::formula("SEQUENCE(1,3)"));
-        assert_eq!(autofill(&mut w, 0, (4, 0, 4, 2), (4, 5)), 3);
+        assert_eq!(af(&mut w, (4, 0, 4, 2), (4, 5)), 3);
         let mut eng = Engine::new(&w);
         eng.recalc_all(&mut w);
         let row = ["A5", "B5", "C5", "D5", "E5", "F5"];
@@ -2435,7 +2560,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(autofill(&mut w, 0, (0, 1, 0, 1), (1, 1)), 1);
+        assert_eq!(af(&mut w, (0, 1, 0, 1), (1, 1)), 1);
         // Nothing left to write: a blank copy isn't stored at all.
         let copy = w.sheets[0].cell(1, 1).cloned().unwrap_or_default();
         assert!(copy.formula.is_none() && copy.f_attrs.is_none());
@@ -2446,8 +2571,8 @@ mod tests {
         // A backwards range has no cells to read, and the pattern walk divides
         // by their count — this used to panic rather than decline.
         let mut w = wb(&[("A1", Cell::number(1.0))]);
-        assert_eq!(autofill(&mut w, 0, (3, 0, 1, 0), (9, 0)), 0);
-        assert_eq!(autofill(&mut w, 0, (0, 3, 0, 1), (0, 9)), 0);
+        assert_eq!(af(&mut w, (3, 0, 1, 0), (9, 0)), 0);
+        assert_eq!(af(&mut w, (0, 3, 0, 1), (0, 9)), 0);
     }
 
     #[test]
@@ -2471,7 +2596,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        autofill(&mut w, 0, (0, 1, 1, 1), (3, 1));
+        af(&mut w, (0, 1, 1, 1), (3, 1));
         let f = |r: u32| w.sheets[0].cell(r, 1).and_then(|c| c.formula.clone());
         assert_eq!(f(2).as_deref(), Some("A3"));
         assert_eq!(f(3).as_deref(), Some("A4"));
@@ -3623,14 +3748,14 @@ mod tests {
             },
         );
         // Fill Down over A1:B3: A2:A3 copy the loaded cell, B2:B3 the typed one.
-        let down = fill_changes(&sheet, (0, 0, 2, 1), true);
+        let down = fill_changes(&sheet, (0, 0, 2, 1), FillDir::Down);
         assert_eq!(down.len(), 4);
         for (r, c, cell) in &down {
             let want = if *c == 0 { None } else { Some(&typed) };
             assert_eq!(cell.meta.as_deref(), want, "{r},{c}");
         }
         // Fill Right over A1:C1: B1:C1 copy the loaded cell.
-        let right = fill_changes(&sheet, (0, 0, 0, 2), false);
+        let right = fill_changes(&sheet, (0, 0, 0, 2), FillDir::Right);
         assert_eq!(right.len(), 2);
         assert!(right.iter().all(|(_, _, cell)| cell.meta.is_none()));
     }
@@ -3647,12 +3772,12 @@ mod tests {
             },
         );
         sheet.set_cell(0, 3, Cell::text("x"));
-        let down = fill_changes(&sheet, (0, 1, 3, 1), true);
+        let down = fill_changes(&sheet, (0, 1, 3, 1), FillDir::Down);
         assert_eq!(down.len(), 3);
         assert_eq!(down[2].0, 3);
         assert_eq!(down[2].2.formula.as_deref(), Some("A4*2"));
         assert_eq!(down[2].2.style, 3);
-        let right = fill_changes(&sheet, (0, 3, 0, 5), false);
+        let right = fill_changes(&sheet, (0, 3, 0, 5), FillDir::Right);
         assert_eq!(right.len(), 2);
         assert!(
             right
@@ -3660,16 +3785,16 @@ mod tests {
                 .all(|(_, _, c)| c.value == CellValue::Text("x".into()))
         );
         // A single cell pulls from above; nothing above row 0.
-        let one = fill_changes(&sheet, (1, 1, 1, 1), true);
+        let one = fill_changes(&sheet, (1, 1, 1, 1), FillDir::Down);
         assert_eq!(one[0].2.formula.as_deref(), Some("A2*2"));
-        assert!(fill_changes(&sheet, (0, 0, 0, 0), true).is_empty());
+        assert!(fill_changes(&sheet, (0, 0, 0, 0), FillDir::Down).is_empty());
         // One row, several columns, Ctrl+D: each pulls from the row above.
-        let row = fill_changes(&sheet, (1, 1, 1, 3), true);
+        let row = fill_changes(&sheet, (1, 1, 1, 3), FillDir::Down);
         assert_eq!(row.len(), 3);
         assert_eq!(row[0].2.formula.as_deref(), Some("A2*2"));
         assert_eq!(row[2].2.value, CellValue::Text("x".into()));
         // One column, several rows, Ctrl+R: each pulls from the column left.
-        let col = fill_changes(&sheet, (0, 2, 1, 2), false);
+        let col = fill_changes(&sheet, (0, 2, 1, 2), FillDir::Right);
         assert_eq!(col.len(), 2);
         assert_eq!(col[0].2.formula.as_deref(), Some("B1*2"));
     }
@@ -3717,7 +3842,7 @@ mod tests {
             ..Default::default()
         }));
         wb.sheets[0].set_cell(0, 0, cell);
-        autofill(&mut wb, 0, (0, 0, 0, 0), (0, 1));
+        af(&mut wb, (0, 0, 0, 0), (0, 1));
         let copy = wb.sheets[0].cell(0, 1).unwrap();
         assert_eq!(
             copy.meta.as_deref(),
@@ -3735,7 +3860,7 @@ mod tests {
             ..Default::default()
         }));
         wb.sheets[0].set_cell(1, 0, plain);
-        autofill(&mut wb, 0, (1, 0, 1, 0), (1, 1));
+        af(&mut wb, (1, 0, 1, 0), (1, 1));
         assert_eq!(
             wb.sheets[0].cell(1, 1).unwrap().meta.as_deref(),
             Some(&crate::sheet::CellMeta {

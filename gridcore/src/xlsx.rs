@@ -12888,7 +12888,11 @@ b",
     fn autofill_copy_is_typed_and_drops_source_cm_vm() {
         let mut pkg = load_xlsx(&cell_meta_fixture(&sort_anchor_rows(5, SORT_ANCHOR))).unwrap();
         assert!(pkg.workbook.sheets[0].cell(0, 3).unwrap().meta.is_some());
-        crate::edit::autofill(&mut pkg.workbook, 0, (0, 3, 0, 3), (0, 4));
+        crate::edit::autofill(
+            &mut pkg.workbook,
+            0,
+            &crate::edit::FillReq::new((0, 3, 0, 3), (0, 4)),
+        );
         let copy = pkg.workbook.sheets[0].cell(0, 4).unwrap();
         assert!(copy.formula.is_some());
         // Typed there (#785): modern, and none of the source's `cm`/`vm`.
@@ -12934,16 +12938,22 @@ b",
                 })
                 .collect();
             let mut auto = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
-            crate::edit::autofill(&mut auto.workbook, 0, (0, 2, 0, 2), (0, 3));
+            crate::edit::autofill(
+                &mut auto.workbook,
+                0,
+                &crate::edit::FillReq::new((0, 2, 0, 2), (0, 3)),
+            );
             let mut eng = crate::engine::Engine::new(&auto.workbook);
             eng.recalc_all(&mut auto.workbook);
 
             let mut fill = load_xlsx(&cell_meta_fixture(&rows)).unwrap();
             let mut eng = crate::engine::Engine::new(&fill.workbook);
             eng.recalc_all(&mut fill.workbook);
-            for (r, c, cell) in
-                crate::edit::fill_changes(&fill.workbook.sheets[0], (0, 2, 0, 3), false)
-            {
+            for (r, c, cell) in crate::edit::fill_changes(
+                &fill.workbook.sheets[0],
+                (0, 2, 0, 3),
+                crate::edit::FillDir::Right,
+            ) {
                 eng.set_cell(&mut fill.workbook, (0, r, c), cell);
             }
 
@@ -13550,7 +13560,15 @@ b",
         let mut eng = crate::engine::Engine::new(&pkg.workbook);
         eng.recalc_all(&mut pkg.workbook);
         let sel = (target.0, target.1, target.0, target.1);
-        for (r, c, cell) in crate::edit::fill_changes(&pkg.workbook.sheets[0], sel, down) {
+        for (r, c, cell) in crate::edit::fill_changes(
+            &pkg.workbook.sheets[0],
+            sel,
+            if down {
+                crate::edit::FillDir::Down
+            } else {
+                crate::edit::FillDir::Right
+            },
+        ) {
             eng.set_cell(&mut pkg.workbook, (0, r, c), cell);
         }
     }

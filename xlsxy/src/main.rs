@@ -33,7 +33,7 @@ use backstage::BackstageHost as _;
 
 use gridcore::comments::Comment;
 use gridcore::docprops::{CustomProperty, CustomValue, DocProperties};
-use gridcore::edit::{fill_changes, replace_all_in_sheet};
+use gridcore::edit::{FillDir, fill_changes, replace_all_in_sheet};
 use gridcore::engine::{Engine, PART_OF_ARRAY};
 use gridcore::entry::{EntryCtx, entry_cell, entry_cell_ctx, entry_ctx, seed_text};
 use gridcore::formula::{qualify_sheet_in_formula, translate_formula};
@@ -6804,7 +6804,11 @@ impl App {
     /// (Ctrl-D) or one column wide (Ctrl-R), a single cell included, pull
     /// each cell from the row above / the column to the left.
     fn fill(&mut self, down: bool) {
-        let changes = fill_changes(self.sheet(), self.selection(), down);
+        let changes = fill_changes(
+            self.sheet(),
+            self.selection(),
+            if down { FillDir::Down } else { FillDir::Right },
+        );
         if changes.is_empty() {
             return;
         }

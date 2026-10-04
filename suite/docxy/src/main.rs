@@ -2542,7 +2542,15 @@ impl SheetView {
     /// was nothing to fill, or the fill was refused as part of an array
     /// ([`SheetView::entry_error`] says so).
     fn fill_selection(&mut self, down: bool) -> bool {
-        let changes = gridcore::edit::fill_changes(self.sheet(), self.range(), down);
+        let changes = gridcore::edit::fill_changes(
+            self.sheet(),
+            self.range(),
+            if down {
+                gridcore::edit::FillDir::Down
+            } else {
+                gridcore::edit::FillDir::Right
+            },
+        );
         if changes.is_empty() || self.refuses(self.active, &changes) {
             return false;
         }
@@ -11623,7 +11631,11 @@ impl Docxy {
             // to cover them (during the drag it was just an outline).
             v.anchor = (br0, bc0);
             v.sel = (br1, bc1);
-            gridcore::edit::autofill(&mut v.pkg.workbook, s, f.src, f.to);
+            gridcore::edit::autofill(
+                &mut v.pkg.workbook,
+                s,
+                &gridcore::edit::FillReq::new(f.src, f.to),
+            );
             // Filled formulas were re-based, so their copied results are stale.
             v.engine = sheet_engine(&v.pkg.workbook);
             v.engine.recalc_all(&mut v.pkg.workbook);
