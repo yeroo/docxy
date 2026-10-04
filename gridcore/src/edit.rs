@@ -1817,7 +1817,8 @@ pub fn table_range_conflict(
 /// has none) and its cell (a conditional-format or validation rule has none).
 type FormulaSite = (Option<usize>, Option<(u32, u32)>);
 
-/// Rewrite every formula a table rename or conversion can reach: cell
+/// Rewrite every formula a table edit can reach (a table or column rename, a
+/// conversion, a column delete through a table): cell
 /// formulas (array formulas included), defined names, and conditional-format
 /// and data-validation rules. A formula `f` leaves unchanged keeps its text
 /// exactly; one held verbatim (a shared or data-table formula) is left alone.

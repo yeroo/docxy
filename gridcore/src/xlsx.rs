@@ -6004,9 +6004,27 @@ fn drop_table_part(parts: &mut Vec<(String, Vec<u8>)>, part: &str) {
     drop_parts_cascading(parts, part);
 }
 
+/// Table `t`'s columns by the names its part (`xml`) knows them by: a column
+/// renamed since the part was written ([`crate::sheet::Table::column_ids`])
+/// has the part's name for it, every other column its own.
+fn part_column_names(t: &Table, xml: &str) -> Vec<String> {
+    let loaded = parse_table_xml(xml, t.sheet, &t.part);
+    let part_name = |j: usize| {
+        let id = *t.column_ids.get(j).filter(|&&id| id != 0)?;
+        let loaded = loaded.as_ref()?;
+        let k = loaded.column_ids.iter().position(|&x| x == id)?;
+        loaded.columns.get(k).cloned()
+    };
+    (t.columns.iter().enumerate())
+        .map(|(j, name)| part_name(j).unwrap_or_else(|| name.clone()))
+        .collect()
+}
+
 /// Bring the table parts in line with the model: each table's range, name
-/// and columns, the column formulas of every part (renamed and converted
-/// tables), and the parts of tables converted to a range dropped.
+/// and columns (renamed ones by id, deleted ones dropped), the column
+/// formulas of every part (renamed tables and columns, converted tables),
+/// and the parts of tables converted to a range or deleted with all their
+/// columns dropped.
 fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
     let part_xml = |parts: &[(String, Vec<u8>)], name: &str| {
         parts
@@ -6029,17 +6047,11 @@ fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
         .iter()
         .filter_map(|t| {
             let xml = part_xml(parts, &t.part)?;
-            let loaded = parse_table_xml(&xml, t.sheet, &t.part)?;
-            let map: Vec<(String, String)> = t
-                .column_ids
-                .iter()
+            let map: Vec<(String, String)> = part_column_names(t, &xml)
+                .into_iter()
                 .zip(&t.columns)
-                .filter(|&(&id, _)| id != 0)
-                .filter_map(|(id, new)| {
-                    let k = loaded.column_ids.iter().position(|x| x == id)?;
-                    let old = loaded.columns.get(k)?;
-                    (old != new).then(|| (old.clone(), new.clone()))
-                })
+                .filter(|(old, new)| old != *new)
+                .map(|(old, new)| (old, new.clone()))
                 .collect();
             let loaded_name = table_part_name(&xml)?;
             (!map.is_empty()).then(|| ColumnRenames {
@@ -6055,14 +6067,19 @@ fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
         .filter(|r| !wb.tables.iter().any(|t| t.part == r.table.part))
         .filter_map(|removed| {
             let r = &removed.table;
-            let loaded_name = table_part_name(&part_xml(parts, &r.part)?)?;
+            let xml = part_xml(parts, &r.part)?;
+            let loaded_name = table_part_name(&xml)?;
+            // Other parts' formulas name its columns as its part does: a
+            // column renamed before the conversion goes by its old name.
+            let mut info = r.info();
+            info.columns = part_column_names(r, &xml);
             Some(ConvertedTable {
                 part: r.part.clone(),
                 loaded_name,
                 edits: removed.edits.clone(),
                 sheet: r.sheet,
                 sheet_name: wb.sheets.get(r.sheet)?.name.clone(),
-                info: r.info(),
+                info,
             })
         })
         .collect();
@@ -19344,6 +19361,26 @@ mod table_command_tests {
         assert_eq!(d1.formula.as_deref(), Some("SUM(Sales[Units])"));
         // Saved again, nothing more changes.
         assert_eq!(text(&reload(&re), &part), xml);
+    }
+
+    #[test]
+    fn a_renamed_then_converted_tables_column_formulas_read_its_cells() {
+        let mut pkg = one_table();
+        let s = &mut pkg.workbook.sheets[0];
+        s.set_cell(5, 0, Cell::text("Key"));
+        s.set_cell(5, 1, Cell::text("Calc"));
+        s.set_cell(6, 0, Cell::text("x"));
+        pkg.add_table(0, (5, 0, 6, 1), true, "TableStyleMedium2")
+            .unwrap();
+        let part2 = pkg.workbook.tables[1].part.clone();
+        calculated(&mut pkg, &part2, "Calc", "SUM(Table1[Qty])");
+        let mut pkg = reload(&pkg);
+        assert!(type_header(&mut pkg, 0, 1, "Units"));
+        convert_table_to_range(&mut pkg.workbook, "Table1").unwrap();
+        let d1 = pkg.workbook.sheets[0].cell(0, 3).unwrap();
+        assert_eq!(d1.formula.as_deref(), Some("SUM($B$2:$B$3)"));
+        // The part still says `Qty`: it reads the cells D1 reads.
+        assert_eq!(column_formula(&reload(&pkg), &part2), "SUM($B$2:$B$3)");
     }
 
     #[test]
