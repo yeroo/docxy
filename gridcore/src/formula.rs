@@ -2781,6 +2781,70 @@ pub fn collect_names(e: &Expr, out: &mut Vec<String>) {
     }
 }
 
+/// [`collect_names`] without the names a `LET` or `LAMBDA` binds: only the
+/// names the workbook resolves (`LET(Sales,2,Sales*3)` reads no table
+/// `Sales`). Scoping follows the printer: a LET value sees the names bound
+/// before it, a LAMBDA body sees every parameter.
+pub fn collect_free_names(e: &Expr, out: &mut Vec<String>) {
+    fn walk(e: &Expr, bound: &mut Vec<String>, out: &mut Vec<String>) {
+        let is_bound =
+            |bound: &[String], n: &str| bound.iter().any(|b| b.eq_ignore_ascii_case(bare_param(n)));
+        match e {
+            Expr::Name(n) if !is_bound(bound, n) => out.push(n.clone()),
+            Expr::Func(name, args) if name.eq_ignore_ascii_case("LET") => {
+                let (mark, last) = (bound.len(), args.len().saturating_sub(1));
+                let mut pending = None;
+                for (i, a) in args.iter().enumerate() {
+                    match a {
+                        Expr::Name(n) if i < last && i % 2 == 0 => {
+                            pending = Some(bare_param(n).to_string());
+                        }
+                        _ => {
+                            walk(a, bound, out);
+                            bound.extend(pending.take());
+                        }
+                    }
+                }
+                bound.truncate(mark);
+            }
+            Expr::Func(name, args) if name.eq_ignore_ascii_case("LAMBDA") => {
+                let (mark, last) = (bound.len(), args.len().saturating_sub(1));
+                for (i, a) in args.iter().enumerate() {
+                    match a {
+                        Expr::Name(n)
+                        | Expr::Structured {
+                            table: None,
+                            item: TableItem::Data,
+                            col1: Some(n),
+                            col2: None,
+                        } if i < last => bound.push(bare_param(n).to_string()),
+                        _ => walk(a, bound, out),
+                    }
+                }
+                bound.truncate(mark);
+            }
+            Expr::Func(_, args) => {
+                for a in args {
+                    walk(a, bound, out);
+                }
+            }
+            Expr::Call(callee, args) => {
+                walk(callee, bound, out);
+                for a in args {
+                    walk(a, bound, out);
+                }
+            }
+            Expr::Un(_, x) => walk(x, bound, out),
+            Expr::Bin(_, l, r) => {
+                walk(l, bound, out);
+                walk(r, bound, out);
+            }
+            _ => {}
+        }
+    }
+    walk(e, &mut Vec::new(), out);
+}
+
 /// Collect every 3D span in a formula: (first, last, r1, c1, r2, c2).
 #[allow(clippy::type_complexity)]
 pub fn collect_ref3d(e: &Expr, out: &mut Vec<(String, String, u32, u32, u32, u32)>) {
@@ -11100,13 +11164,11 @@ impl<'a> Eval<'a> {
         }
     }
 
-    /// ROWS/COLUMNS of anything that is not a literal reference form: a
-    /// name, table or spill reference gives its extent, a computed array its
-    /// dimensions, and a scalar 1.
     /// ROW/COLUMN of a reference that isn't a literal cell or range (a
     /// structured reference, a table or defined name, `A1#`, OFFSET…): the
     /// top-left cell's row or column, 1-based, as the `Expr::Range` arms
-    /// give. Errors propagate; anything that isn't a reference is `#VALUE!`.
+    /// give. Errors propagate; a LAMBDA is `#CALC!`, and anything else that
+    /// isn't a reference is `#VALUE!`.
     fn position_of(&mut self, e: &Expr, row: bool) -> Value {
         match self.eval_arg(e) {
             Arg::Range(_, r1, c1, ..) => Value::Num(if row { r1 } else { c1 } as f64 + 1.0),
@@ -11116,6 +11178,9 @@ impl<'a> Eval<'a> {
         }
     }
 
+    /// ROWS/COLUMNS of anything that is not a literal reference form: a
+    /// name, table or spill reference gives its extent, a computed array its
+    /// dimensions, and a scalar 1.
     fn extent_of(&mut self, e: &Expr, rows: bool) -> Value {
         match self.eval_arg(e) {
             Arg::Range(_, r1, c1, r2, c2) => Value::Num(if rows {

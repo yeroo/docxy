@@ -2268,6 +2268,8 @@ fn spill_owner(sheet: &Sheet, r: u32, c: u32) -> Option<((u32, u32), (u32, u32))
 /// (a whole-table dep would make calculated columns self-referential).
 fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth: u32) {
     let (sheet, row, col) = key;
+    let pruned = without_position_refs(wb, sheet, ast);
+    let ast = pruned.as_ref().unwrap_or(ast);
     let mut named = Vec::new();
     collect_refs(ast, &mut named);
     for (sheet_name, r1, c1, r2, c2) in named {
@@ -2328,6 +2330,22 @@ fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth:
             }
         }
     }
+    // A bare table name (`=SUM(Sales)`) reads the data body. Names a LET or
+    // LAMBDA binds, and function names (`PRODUCT(…)` beside a table
+    // `Product`), are not tables; a defined name wins over a table.
+    let mut free = Vec::new();
+    formula::collect_free_names(ast, &mut free);
+    for n in free {
+        if wb.defined_name(&n, sheet).is_some() {
+            continue;
+        }
+        if let Some(t) = wb.table(&n) {
+            let info = t.info();
+            if let Some(rect) = info.resolve(formula::TableItem::Data, &None, &None, row) {
+                out.push((t.sheet, rect.0, rect.1, rect.2, rect.3));
+            }
+        }
+    }
     if depth >= 8 {
         return;
     }
@@ -2342,16 +2360,81 @@ fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth:
             if let Ok(def_ast) = formula::parse(def) {
                 collect_deps(wb, key, &def_ast, out, depth + 1);
             }
-        } else if let Some(t) = wb.table(&n) {
-            // A bare table name (`=SUM(Sales)`) reads the data body.
-            let info = t.info();
-            if let Some((r1, c1, r2, c2)) =
-                info.resolve(formula::TableItem::Data, &None, &None, row)
-            {
-                out.push((t.sheet, r1, c1, r2, c2));
-            }
         }
     }
+}
+
+/// `ast` without the reference arguments of ROW, COLUMN, ROWS and COLUMNS,
+/// or `None` when it has none. Those functions read where a reference is,
+/// not the values in it, so a literal reference there is no dependency:
+/// `=ROWS(Sales)` in a calculated column of `Sales` is no circle. Cells,
+/// ranges, whole rows/columns, structured references and bare table names
+/// go; a spill reference (its extent follows the anchor), a defined name
+/// (its definition may compute the reference) and any computed argument
+/// keep their dependencies.
+fn without_position_refs(wb: &Workbook, sheet: usize, ast: &Expr) -> Option<Expr> {
+    fn has_position_fn(e: &Expr) -> bool {
+        match e {
+            Expr::Func(name, args) => {
+                matches!(name.as_str(), "ROW" | "COLUMN" | "ROWS" | "COLUMNS")
+                    || args.iter().any(has_position_fn)
+            }
+            Expr::Call(callee, args) => has_position_fn(callee) || args.iter().any(has_position_fn),
+            Expr::ArrayLit(rows) => rows.iter().flatten().any(has_position_fn),
+            Expr::Un(_, x) => has_position_fn(x),
+            Expr::Bin(_, l, r) => has_position_fn(l) || has_position_fn(r),
+            _ => false,
+        }
+    }
+    fn prune(wb: &Workbook, sheet: usize, e: &Expr) -> Expr {
+        let position_only = |a: &Expr| match a {
+            Expr::Ref(_)
+            | Expr::Range(..)
+            | Expr::ColRange { .. }
+            | Expr::RowRange { .. }
+            | Expr::Structured { .. } => true,
+            Expr::Name(n) => wb.defined_name(n, sheet).is_none() && wb.table(n).is_some(),
+            _ => false,
+        };
+        match e {
+            Expr::Func(name, args)
+                if matches!(name.as_str(), "ROW" | "COLUMN" | "ROWS" | "COLUMNS") =>
+            {
+                let args = args
+                    .iter()
+                    .map(|a| {
+                        if position_only(a) {
+                            Expr::Missing
+                        } else {
+                            prune(wb, sheet, a)
+                        }
+                    })
+                    .collect();
+                Expr::Func(name.clone(), args)
+            }
+            Expr::Func(name, args) => Expr::Func(
+                name.clone(),
+                args.iter().map(|a| prune(wb, sheet, a)).collect(),
+            ),
+            Expr::Call(callee, args) => Expr::Call(
+                Box::new(prune(wb, sheet, callee)),
+                args.iter().map(|a| prune(wb, sheet, a)).collect(),
+            ),
+            Expr::ArrayLit(rows) => Expr::ArrayLit(
+                rows.iter()
+                    .map(|row| row.iter().map(|x| prune(wb, sheet, x)).collect())
+                    .collect(),
+            ),
+            Expr::Un(op, x) => Expr::Un(*op, Box::new(prune(wb, sheet, x))),
+            Expr::Bin(op, l, r) => Expr::Bin(
+                *op,
+                Box::new(prune(wb, sheet, l)),
+                Box::new(prune(wb, sheet, r)),
+            ),
+            other => other.clone(),
+        }
+    }
+    has_position_fn(ast).then(|| prune(wb, sheet, ast))
 }
 
 /// (always recalculate, calls a D-function) for a formula, looking through
@@ -4907,6 +4990,92 @@ mod tests {
         set(&mut eng, &mut wb, "B4", Cell::number(30.0));
         assert_eq!(value_at(&wb, "E4"), CellValue::Number(47.0));
         assert_eq!(value_at(&wb, "E5"), CellValue::Number(47.0));
+    }
+
+    /// A two-row table `name` on A1:D3 (Item, Qty, Price, Calc) whose Calc
+    /// column holds `calc` in both data rows.
+    fn calc_column_wb(name: &str, calc: &str) -> Workbook {
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::text("Item")),
+            ("B1", Cell::text("Qty")),
+            ("C1", Cell::text("Price")),
+            ("D1", Cell::text("Calc")),
+            ("A2", Cell::text("pen")),
+            ("B2", Cell::number(3.0)),
+            ("C2", Cell::number(2.0)),
+            ("D2", Cell::formula(calc)),
+            ("A3", Cell::text("pad")),
+            ("B3", Cell::number(4.0)),
+            ("C3", Cell::number(5.0)),
+            ("D3", Cell::formula(calc)),
+        ]);
+        wb.tables.push(crate::sheet::Table {
+            name: name.to_string(),
+            sheet: 0,
+            range: (0, 0, 2, 3),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: vec!["Item".into(), "Qty".into(), "Price".into(), "Calc".into()],
+            part: String::new(),
+        });
+        wb
+    }
+
+    #[test]
+    fn function_and_let_names_do_not_depend_on_a_same_named_table() {
+        // #679 FIX r1 M1: a call `PRODUCT(…)` or a LET variable `Product` is
+        // not the table `Product`; neither may make its calculated column
+        // depend on itself.
+        for (calc, d2, d3) in [
+            ("PRODUCT([@Qty],[@Price])", 6.0, 20.0),
+            ("LET(Product,[@Qty],Product*[@Price])", 6.0, 20.0),
+            ("LET(_xlpm.Product,[@Qty],_xlpm.Product*2)", 6.0, 8.0),
+            ("LAMBDA(Product,Product+1)([@Qty])", 4.0, 5.0),
+        ] {
+            let mut wb = calc_column_wb("Product", calc);
+            let mut eng = Engine::new(&wb);
+            eng.recalc_all(&mut wb);
+            assert_eq!(eng.circular_refs(), Vec::<Key>::new(), "{calc}");
+            assert_eq!(value_at(&wb, "D2"), CellValue::Number(d2), "{calc}");
+            assert_eq!(value_at(&wb, "D3"), CellValue::Number(d3), "{calc}");
+        }
+    }
+
+    #[test]
+    fn position_functions_do_not_read_their_reference_arguments() {
+        // #679 FIX r1 M2: ROW/COLUMN/ROWS/COLUMNS read where a reference is,
+        // not its values, so a calculated column measuring its own table is
+        // no circle.
+        for (calc, d2, d3) in [
+            ("ROWS(Sales)", 2.0, 2.0),
+            ("COLUMNS(Sales)", 4.0, 4.0),
+            ("ROW()-ROW(Sales)+1", 1.0, 2.0),
+            ("COLUMN(Sales[Calc])", 4.0, 4.0),
+            ("ROWS(Sales[#All])", 3.0, 3.0),
+            ("ROWS(A1:D3)+COLUMN(D2)", 7.0, 7.0),
+        ] {
+            let mut wb = calc_column_wb("Sales", calc);
+            wb.sheets[0].set_cell(0, 6, Cell::formula("ROWS(Sales)"));
+            let mut eng = Engine::new(&wb);
+            eng.recalc_all(&mut wb);
+            assert_eq!(eng.circular_refs(), Vec::<Key>::new(), "{calc}");
+            assert_eq!(value_at(&wb, "D2"), CellValue::Number(d2), "{calc}");
+            assert_eq!(value_at(&wb, "D3"), CellValue::Number(d3), "{calc}");
+            assert_eq!(value_at(&wb, "G1"), CellValue::Number(2.0), "{calc}");
+        }
+        // Reading the values is still a circle.
+        let mut wb = calc_column_wb("Sales", "SUM(Sales[Qty])+COUNT(Sales)");
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(eng.circular_refs(), vec![(0, 1, 3), (0, 2, 3)]);
+        // A computed argument keeps its dependencies.
+        let mut wb = calc_column_wb("Sales", "ROWS(FILTER(B2:B3,B2:B3>3))");
+        wb.sheets[0].set_cell(0, 6, Cell::formula("ROWS(FILTER(B2:B3,B2:B3>3))"));
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "G1"), CellValue::Number(1.0));
+        set(&mut eng, &mut wb, "B2", Cell::number(9.0));
+        assert_eq!(value_at(&wb, "G1"), CellValue::Number(2.0));
     }
 
     #[test]
