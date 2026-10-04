@@ -2342,6 +2342,14 @@ fn collect_deps(wb: &Workbook, key: Key, ast: &Expr, out: &mut Vec<Rect>, depth:
             if let Ok(def_ast) = formula::parse(def) {
                 collect_deps(wb, key, &def_ast, out, depth + 1);
             }
+        } else if let Some(t) = wb.table(&n) {
+            // A bare table name (`=SUM(Sales)`) reads the data body.
+            let info = t.info();
+            if let Some((r1, c1, r2, c2)) =
+                info.resolve(formula::TableItem::Data, &None, &None, row)
+            {
+                out.push((t.sheet, r1, c1, r2, c2));
+            }
         }
     }
 }
@@ -4853,6 +4861,52 @@ mod tests {
         // Editing a row inside the iterated table recalculates the SUMX.
         set(&mut eng, &mut wb, "B3", Cell::number(100.0));
         assert_eq!(value_at(&wb, "D1"), CellValue::Number(320.0));
+    }
+
+    #[test]
+    fn bare_table_names_measure_and_track_dependencies() {
+        // #679: a bare table name is its data body — ROWS/ROW/COLUMN measure
+        // it, and `=SUM(Sales)` recalculates when a data cell changes. The
+        // table sits at B2:C4 so positions are the sheet's, not the table's.
+        let mut wb = wb_one_sheet(&[
+            ("B2", Cell::text("Qty")),
+            ("C2", Cell::text("Price")),
+            ("B3", Cell::number(2.0)),
+            ("C3", Cell::number(10.0)),
+            ("B4", Cell::number(3.0)),
+            ("C4", Cell::number(5.0)),
+            ("E1", Cell::formula("ROWS(Sales)")),
+            ("E2", Cell::formula("COLUMN(Sales[Price])")),
+            ("E3", Cell::formula("ROW(Sales[#Headers])")),
+            ("E4", Cell::formula("SUM(Sales)")),
+            ("E5", Cell::formula("Total")),
+        ]);
+        wb.tables.push(crate::sheet::Table {
+            name: "Sales".to_string(),
+            sheet: 0,
+            range: (1, 1, 3, 2),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: vec!["Qty".into(), "Price".into()],
+            part: String::new(),
+        });
+        // A defined name whose definition is the bare table name.
+        wb.defined_names.push(crate::sheet::DefinedName {
+            name: "Total".into(),
+            scope: None,
+            formula: "SUM(Sales)".into(),
+        });
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(2.0));
+        assert_eq!(value_at(&wb, "E2"), CellValue::Number(3.0));
+        assert_eq!(value_at(&wb, "E3"), CellValue::Number(2.0));
+        assert_eq!(value_at(&wb, "E4"), CellValue::Number(20.0));
+        assert_eq!(value_at(&wb, "E5"), CellValue::Number(20.0));
+        // Editing a data cell recalculates the bare-name SUMs.
+        set(&mut eng, &mut wb, "B4", Cell::number(30.0));
+        assert_eq!(value_at(&wb, "E4"), CellValue::Number(47.0));
+        assert_eq!(value_at(&wb, "E5"), CellValue::Number(47.0));
     }
 
     #[test]

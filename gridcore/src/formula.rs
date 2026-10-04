@@ -3702,6 +3702,15 @@ impl<'a> Eval<'a> {
                         }
                     },
                     Some(_) => Arg::Scalar(Value::Err(ExcelError::Name)),
+                    // A bare table name (`Sales`) is the table's data body,
+                    // as `Sales[]` is. Tables and defined names share one
+                    // namespace in Excel, so the order here is moot.
+                    None if self.res.table(n).is_some() => self.eval_arg(&Expr::Structured {
+                        table: Some(n.clone()),
+                        item: TableItem::Data,
+                        col1: None,
+                        col2: None,
+                    }),
                     None => {
                         self.unsupported = true;
                         Arg::Scalar(Value::Err(ExcelError::Name))
@@ -8115,12 +8124,14 @@ impl<'a> Eval<'a> {
                 [] => Value::Num(self.cell.0 as f64 + 1.0),
                 [Expr::Ref(r)] => Value::Num(r.row as f64 + 1.0),
                 [Expr::Range(a, _)] => Value::Num(a.row as f64 + 1.0),
+                [e] => self.position_of(e, true),
                 _ => Value::Err(ExcelError::Value),
             },
             "COLUMN" => match args {
                 [] => Value::Num(self.cell.1 as f64 + 1.0),
                 [Expr::Ref(r)] => Value::Num(r.col as f64 + 1.0),
                 [Expr::Range(a, _)] => Value::Num(a.col as f64 + 1.0),
+                [e] => self.position_of(e, false),
                 _ => Value::Err(ExcelError::Value),
             },
             "ROWS" => match args {
@@ -11092,6 +11103,19 @@ impl<'a> Eval<'a> {
     /// ROWS/COLUMNS of anything that is not a literal reference form: a
     /// name, table or spill reference gives its extent, a computed array its
     /// dimensions, and a scalar 1.
+    /// ROW/COLUMN of a reference that isn't a literal cell or range (a
+    /// structured reference, a table or defined name, `A1#`, OFFSET…): the
+    /// top-left cell's row or column, 1-based, as the `Expr::Range` arms
+    /// give. Errors propagate; anything that isn't a reference is `#VALUE!`.
+    fn position_of(&mut self, e: &Expr, row: bool) -> Value {
+        match self.eval_arg(e) {
+            Arg::Range(_, r1, c1, ..) => Value::Num(if row { r1 } else { c1 } as f64 + 1.0),
+            Arg::Scalar(Value::Err(e)) => Value::Err(e),
+            Arg::Lambda(_) => Value::Err(ExcelError::Calc),
+            Arg::Scalar(_) | Arg::Matrix(_) => Value::Err(ExcelError::Value),
+        }
+    }
+
     fn extent_of(&mut self, e: &Expr, rows: bool) -> Value {
         match self.eval_arg(e) {
             Arg::Range(_, r1, c1, r2, c2) => Value::Num(if rows {
@@ -13487,6 +13511,109 @@ mod tests {
             assert_eq!(file(typed), saved);
             assert_eq!(at_row_3(typed), Value::Num(want), "{typed}");
             assert_eq!(at_row_3(saved), Value::Num(want), "{saved}");
+        }
+    }
+
+    /// The #679 table: `Sales` with Item/Qty/Price/Region, four data rows,
+    /// no totals row, its header at 0-based (`r0`, `c0`) — A1:D5 at (0, 0).
+    fn issue_679_grid(r0: u32, c0: u32) -> Grid {
+        let rows = [
+            ["Item", "Qty", "Price", "Region"],
+            ["pen", "10", "1.5", "North"],
+            ["pad", "12", "4", "South"],
+            ["ink", "7", "2", "East"],
+            ["cap", "8", "3", "West"],
+        ];
+        let mut g = Grid::new(&[]);
+        for (r, row) in rows.iter().enumerate() {
+            for (c, text) in row.iter().enumerate() {
+                let v = match text.parse::<f64>() {
+                    Ok(x) if r > 0 => Value::Num(x),
+                    _ => Value::Str(text.to_string()),
+                };
+                g.cells.insert((r0 + r as u32, c0 + c as u32), v);
+            }
+        }
+        g.with_table(TableInfo {
+            sheet: 0,
+            range: (r0, c0, r0 + 4, c0 + 3),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: rows[0].iter().map(|s| s.to_string()).collect(),
+        })
+    }
+
+    /// Evaluate `src` from a cell outside the #679 table (Z100).
+    fn eval_outside(src: &str, g: &Grid) -> (Value, bool) {
+        let ast = parse(src).unwrap_or_else(|e| panic!("parse {src}: {e}"));
+        let mut ev = Eval::new(g, 0, (99, 25));
+        let v = ev.eval(&ast);
+        (v, ev.unsupported)
+    }
+
+    #[test]
+    fn structured_refs_measure_with_rows_columns_row_column() {
+        // #679: Excel's answers for every form in the issue's table.
+        let g = issue_679_grid(0, 0);
+        for (src, want) in [
+            ("ROWS(Sales)", 4.0),
+            ("COLUMNS(Sales)", 4.0),
+            ("ROWS(Sales[#All])", 5.0),
+            ("ROWS(Sales[#Headers])", 1.0),
+            ("COLUMNS(Sales[[Item]:[Price]])", 3.0),
+            ("ROWS(Sales[[#All],[Qty]])", 5.0),
+            ("MIN(ROW(Sales[#Data]))", 2.0),
+            ("ROW(Sales[#Headers])", 1.0),
+            ("COLUMN(Sales[Price])", 3.0),
+            ("SUM(Sales[Qty])", 37.0),
+            ("ROWS(A1:D5)", 5.0),
+            // A bare table name is its data body everywhere.
+            ("ROW(Sales)", 2.0),
+            ("COLUMN(Sales)", 1.0),
+            ("SUM(Sales)", 37.0 + 1.5 + 4.0 + 2.0 + 3.0),
+            ("ROWS(INDIRECT(\"Sales\"))", 4.0),
+            // ROW/COLUMN of any other reference-valued argument.
+            ("ROW(OFFSET(A1,4,0))", 5.0),
+            ("COLUMN(OFFSET(A1,0,3))", 4.0),
+        ] {
+            let (v, unsupported) = eval_outside(src, &g);
+            assert_eq!(v, Value::Num(want), "{src}");
+            assert!(!unsupported, "{src} flagged unsupported");
+        }
+        // A bad column is #REF!, not #VALUE!; a non-reference stays #VALUE!.
+        for (src, want) in [
+            ("ROW(Sales[Nope])", ExcelError::Ref),
+            ("COLUMN(Sales[Nope])", ExcelError::Ref),
+            ("ROW({1,2})", ExcelError::Value),
+            ("COLUMN(\"A1\")", ExcelError::Value),
+        ] {
+            assert_eq!(eval_outside(src, &g).0, Value::Err(want), "{src}");
+        }
+        // An unknown bare name is still #NAME? and unsupported.
+        let (v, unsupported) = eval_outside("ROWS(Nope)", &g);
+        assert_eq!(v, Value::Err(ExcelError::Name));
+        assert!(unsupported);
+        // A defined name is looked up before a table of the same name.
+        let named = issue_679_grid(0, 0).with_name("Sales", "Sheet1!$A$1:$A$2");
+        assert_eq!(eval_outside("ROWS(Sales)", &named).0, Value::Num(2.0));
+    }
+
+    #[test]
+    fn structured_ref_positions_are_sheet_coordinates() {
+        // #679: the same table at C3:F7 — ROW/COLUMN give the sheet's row
+        // and column, not the position inside the table.
+        let g = issue_679_grid(2, 2);
+        for (src, want) in [
+            ("ROW(Sales[#Headers])", 3.0),
+            ("COLUMN(Sales[Price])", 5.0),
+            ("MIN(ROW(Sales[#Data]))", 4.0),
+            ("ROW(Sales)", 4.0),
+            ("COLUMN(Sales)", 3.0),
+            ("ROWS(Sales)", 4.0),
+            ("COLUMNS(Sales)", 4.0),
+            ("SUM(Sales[Qty])", 37.0),
+        ] {
+            assert_eq!(eval_outside(src, &g).0, Value::Num(want), "{src}");
         }
     }
 
