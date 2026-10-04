@@ -6579,6 +6579,14 @@ fn db_begins_with(v: &Value) -> bool {
     }
 }
 
+/// Whether `v` meets `criterion`, typed as text the way a D-function's
+/// criteria cell holds it (`>10`, `<>x`, `=abc`, `Sm*`, plain text begins
+/// with). The Data Form's Criteria use it, so they read as DGET's do.
+pub(crate) fn db_criterion_matches(criterion: &str, v: &Value) -> bool {
+    let crit = Value::Str(criterion.to_string());
+    db_criteria_match(&parse_criteria(&crit), db_begins_with(&crit), v)
+}
+
 /// [`criteria_match`] for the D-functions: a plain-text criterion matches a
 /// text cell that begins with it (wildcards still apply).
 fn db_criteria_match(c: &Criteria, begins_with: bool, v: &Value) -> bool {
