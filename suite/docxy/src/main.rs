@@ -2753,11 +2753,15 @@ struct DocTab {
     /// Review comments anchored in this document (markers live in the body; the
     /// text/author is stored here and written to comments.xml on save).
     comments: Vec<Comment>,
-    /// The ids in `comments` added since the tab loaded (#620). Such a
-    /// comment is listed and saved only while a marker with its id is in
-    /// the body ([`live_comments`]), so undoing Add Comment removes it and
-    /// redo brings it back. Saves keep the set; a load starts it empty.
-    session_comment_ids: std::collections::HashSet<String>,
+    /// The ids in `comments` whose comment follows its markers: one added
+    /// since the tab loaded (#620), or one Delete Comment or Remove All
+    /// took the markers of (#971). Such a comment is listed and saved only
+    /// while a marker with its id is in the body ([`live_comments`]), so
+    /// undoing Add Comment removes it, undoing a delete brings it back (a
+    /// loaded one with its original XML, which the base package still
+    /// holds), and redo goes the other way. Saves keep the set; a load
+    /// starts it empty.
+    tracked_comment_ids: std::collections::HashSet<String>,
     /// Every comment id this document has had since it loaded: those of
     /// its comments and body markers then ([`seed_used_comment_ids`]), and
     /// each one allocated since. It never shrinks, not on Delete Comment or
@@ -4650,7 +4654,7 @@ impl Loaded {
             dirty,
             status: self.status,
             comments: self.comments,
-            session_comment_ids: Default::default(),
+            tracked_comment_ids: Default::default(),
             used_comment_ids: Default::default(),
             mail: mailings_tab::MailState::from_pkg(self.pkg.as_ref()),
             pkg: self.pkg,
@@ -4792,7 +4796,7 @@ fn finish_pending_conversion(tab: &mut DocTab) {
     tab.hf_edit = None;
     tab.surface = Surface::Doc(Editor::new(l.doc));
     tab.comments = l.comments;
-    tab.session_comment_ids.clear();
+    tab.tracked_comment_ids.clear();
     seed_used_comment_ids(tab);
     tab.notes = l.notes;
     tab.mail = mailings_tab::MailState::from_pkg(l.pkg.as_ref());
@@ -5036,7 +5040,7 @@ fn sheet_tab_from_path(path: &PathBuf, repair: bool) -> DocTab {
         dirty: false,
         status,
         comments: vec![],
-        session_comment_ids: Default::default(),
+        tracked_comment_ids: Default::default(),
         used_comment_ids: Default::default(),
         pkg: None,
         notes: vec![],
@@ -7800,7 +7804,7 @@ fn protected_rollback(tab: &mut DocTab) {
         if let Some(l) = reloaded {
             tab.surface = Surface::Doc(Editor::new(l.doc));
             tab.comments = l.comments;
-            tab.session_comment_ids.clear();
+            tab.tracked_comment_ids.clear();
             seed_used_comment_ids(tab);
             tab.notes = l.notes;
             tab.mail = mailings_tab::MailState::from_pkg(l.pkg.as_ref());
@@ -8006,18 +8010,20 @@ fn seed_used_comment_ids(tab: &mut DocTab) {
     tab.used_comment_ids = used;
 }
 
-/// The comments `tab` lists and saves (#620): every one it loaded, and each
-/// one added since while a marker with its id is in `doc`'s body. Undo of
-/// Add Comment takes the markers, so the comment goes; [`doc_to_docx`] then
-/// drops it from a base that a save already wrote it to.
+/// The comments `tab` lists and saves (#620): each untracked one, and each
+/// tracked one (added, deleted or removed since the load, #971) while a
+/// marker with its id is in `doc`'s body. Undo of Add Comment, or Delete
+/// Comment, takes the markers, so the comment goes; [`doc_to_docx`] then
+/// drops it from the base. Undo of Delete Comment brings the markers back,
+/// so it is listed again and the base keeps its original XML.
 fn live_comments(tab: &DocTab, doc: &Document) -> Vec<Comment> {
-    if tab.session_comment_ids.is_empty() {
+    if tab.tracked_comment_ids.is_empty() {
         return tab.comments.clone();
     }
     let live = docxcore::inspect::comment_marker_ids(doc);
     tab.comments
         .iter()
-        .filter(|c| !tab.session_comment_ids.contains(&c.id) || live.contains(&c.id))
+        .filter(|c| !tab.tracked_comment_ids.contains(&c.id) || live.contains(&c.id))
         .cloned()
         .collect()
 }
@@ -8048,7 +8054,7 @@ fn add_doc_comment(tab: &mut DocTab, text: String, identity: (String, String)) -
         .comments
         .iter()
         .map(|c| &c.id)
-        .chain(&tab.session_comment_ids)
+        .chain(&tab.tracked_comment_ids)
         .chain(&tab.used_comment_ids)
         .chain(&base)
         .chain(&in_body)
@@ -8071,9 +8077,20 @@ fn add_doc_comment(tab: &mut DocTab, text: String, identity: (String, String)) -
         text,
         quoted,
     });
-    tab.session_comment_ids.insert(id.to_string());
+    tab.tracked_comment_ids.insert(id.to_string());
     tab.used_comment_ids.insert(id.to_string());
     Some(id)
+}
+
+/// Delete comment `id` from `tab`: its markers leave the body as one undo
+/// step, and its record stays, tracked, so it is unlisted and unsaved now
+/// ([`live_comments`]) and an undo brings it back whole (#971).
+fn delete_doc_comment(tab: &mut DocTab, id: &str) {
+    if let Surface::Doc(ed) = &mut tab.surface {
+        ed.remove_comment_markers(id);
+    }
+    tab.tracked_comment_ids.insert(id.to_string());
+    tab.mark_dirty();
 }
 
 /// The name and initials new comments are stamped with (#620), as Word's
@@ -8307,7 +8324,7 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 dirty: t.dirty,
                 status: status.into(),
                 comments: vec![],
-                session_comment_ids: Default::default(),
+                tracked_comment_ids: Default::default(),
                 used_comment_ids: Default::default(),
                 pkg: None,
                 notes: vec![],
@@ -8351,7 +8368,7 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 dirty: t.dirty,
                 status,
                 comments,
-                session_comment_ids: Default::default(),
+                tracked_comment_ids: Default::default(),
                 used_comment_ids: Default::default(),
                 mail: mailings_tab::MailState::from_pkg(pkg.as_ref()),
                 import: Default::default(),
@@ -9114,7 +9131,7 @@ impl Docxy {
             dirty: false,
             status: "new".into(),
             comments: vec![],
-            session_comment_ids: Default::default(),
+            tracked_comment_ids: Default::default(),
             used_comment_ids: Default::default(),
             pkg: None,
             notes: vec![],
@@ -16653,17 +16670,13 @@ impl Docxy {
             .into_any_element()
     }
 
-    /// Delete a comment: strip its markers from the body and drop it from the list.
+    /// Delete a comment: strip its markers from the body ([`delete_doc_comment`]).
     fn delete_comment(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         if self.protected_refused(cx) {
             return self.refocus(window, cx);
         }
         if let Some(t) = self.tabs.get_mut(self.active) {
-            if let Surface::Doc(ed) = &mut t.surface {
-                ed.remove_comment_markers(&id);
-            }
-            t.comments.retain(|c| c.id != id);
-            t.mark_dirty();
+            delete_doc_comment(t, &id);
         }
         self.refocus(window, cx);
     }
@@ -18687,7 +18700,7 @@ mod sheet_save_tests {
             dirty: true,
             status: "new".into(),
             comments: vec![],
-            session_comment_ids: Default::default(),
+            tracked_comment_ids: Default::default(),
             used_comment_ids: Default::default(),
             pkg: None,
             notes: vec![],
