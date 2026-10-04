@@ -5939,7 +5939,23 @@ impl App {
         &mut self,
         op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<String, String>,
     ) -> Result<bool, ()> {
-        if self.protected() {
+        self.try_outline_edit_on(self.sheet, op)
+    }
+
+    /// [`App::try_outline_edit`] for an edit of `sheet`, which need not be
+    /// the active one: that sheet's protection is what refuses it.
+    fn try_outline_edit_on(
+        &mut self,
+        sheet: usize,
+        op: impl FnOnce(&mut gridcore::sheet::Workbook) -> Result<String, String>,
+    ) -> Result<bool, ()> {
+        if self
+            .pkg
+            .workbook
+            .sheets
+            .get(sheet)
+            .is_some_and(|s| s.is_protected())
+        {
             self.status =
                 Some("Sheet is protected — unprotect it to edit (Review ▸ Protect)".into());
             return Err(());
@@ -6118,8 +6134,15 @@ impl App {
     /// settings this sheet kept.
     fn open_consolidate(&mut self) {
         let kept = self.sheet().consolidate.as_ref();
+        let names = self
+            .pkg
+            .workbook
+            .sheets
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
         self.outline_dialog = Some(outlinedlg::Dialog::Consolidate(
-            outlinedlg::ConsolidateDialog::new(self.sheet, self.cur, kept),
+            outlinedlg::ConsolidateDialog::new(self.sheet, self.cur, kept, names),
         ));
     }
 
@@ -6132,20 +6155,9 @@ impl App {
         at: (u32, u32),
         mut opts: gridcore::edit::ConsolidateOptions,
     ) -> Result<gridcore::edit::Area, String> {
-        if self
-            .pkg
-            .workbook
-            .sheets
-            .get(sheet)
-            .is_some_and(|s| s.is_protected())
-        {
-            let msg = "Sheet is protected — unprotect it to edit (Review ▸ Protect)";
-            self.status = Some(msg.into());
-            return Err(msg.into());
-        }
         opts.book_name = file_stem(&self.path);
         let mut out = None;
-        let done = self.try_outline_edit(|wb| {
+        let done = self.try_outline_edit_on(sheet, |wb| {
             let area =
                 gridcore::edit::consolidate(wb, sheet, at, &opts).map_err(|e| e.to_string())?;
             out = Some(area);
@@ -12752,7 +12764,6 @@ mod tests {
         assert_eq!(app.pkg.workbook.sheets[0].row_height(5), Some(45.0));
     }
 
-    /// Grp/Amt with two A rows and one B row (A1:B4), cursor in the data.
     /// East and West (labels over A1:B3) and an empty Summary, the cursor
     /// on Summary!A1.
     fn consolidate_app() -> App {
@@ -12874,6 +12885,28 @@ mod tests {
         assert_eq!(app.undo.len(), undo_len);
     }
 
+    #[test]
+    fn space_on_the_function_row_does_not_run_consolidate() {
+        let mut app = consolidate_app();
+        let before = app.pkg.workbook.sheets.clone();
+        app.ribbon_act(ribbon::Act::Consolidate);
+        consolidate_dialog(&mut app).refs = vec!["East!A1:B3".into()];
+        app.outline_dialog_key(KeyCode::Char(' '));
+        assert!(app.outline_dialog.is_some());
+        assert!(!gridcore::edit::sheets_differ(
+            &before,
+            &app.pkg.workbook.sheets
+        ));
+        // Enter there is OK.
+        app.outline_dialog_key(KeyCode::Enter);
+        assert!(app.outline_dialog.is_none());
+        assert!(gridcore::edit::sheets_differ(
+            &before,
+            &app.pkg.workbook.sheets
+        ));
+    }
+
+    /// Grp/Amt with two A rows and one B row (A1:B4), cursor in the data.
     fn subtotal_app() -> App {
         use gridcore::sheet::Cell;
         let mut app = App::new(new_xlsx(), "t.xlsx");

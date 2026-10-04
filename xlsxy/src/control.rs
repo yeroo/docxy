@@ -6368,7 +6368,27 @@ mod consolidate_tests {
         assert_eq!(value(&a, 2, 2, 2), Some(CellValue::Text("k".into())));
         assert_eq!(value(&a, 2, 2, 3), Some(CellValue::Number(2.0)));
         assert_eq!(a.undo.len(), undo_len + 1);
-        // The file token works too, and Sum is the default.
+        // The file token works too.
+        dispatch(
+            &mut a,
+            "wb.consolidate",
+            &args(vec![
+                ("refs", refs(&["East!A1:B1", "West!A1:B1"])),
+                ("dest", Json::Str("Summary!C3".into())),
+                ("fn", Json::Str("countNums".into())),
+                ("left", Json::Bool(true)),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(value(&a, 2, 2, 3), Some(CellValue::Number(2.0)));
+        assert_eq!(
+            a.pkg.workbook.sheets[2]
+                .consolidate
+                .as_ref()
+                .map(|c| c.func),
+            Some(gridcore::edit::SubtotalFunc::CountNums)
+        );
+        // Without `fn` it is Sum.
         dispatch(
             &mut a,
             "wb.consolidate",
@@ -6379,10 +6399,33 @@ mod consolidate_tests {
         )
         .unwrap();
         assert_eq!(value(&a, 2, 0, 0), Some(CellValue::Number(11.0)));
-        assert_eq!(
-            gridcore::edit::parse_consolidate_func("countNums"),
-            Some(gridcore::edit::SubtotalFunc::CountNums)
-        );
+    }
+
+    #[test]
+    fn wb_consolidate_follows_the_destination_sheets_protection() {
+        let mut a = app();
+        // The active sheet is protected, the destination is not: allowed.
+        a.sheet = 0;
+        a.pkg.workbook.sheets[0].set_protected(true);
+        let call = |a: &mut App| {
+            dispatch(
+                a,
+                "wb.consolidate",
+                &args(vec![
+                    ("refs", refs(&["East!B1", "West!B1"])),
+                    ("dest", Json::Str("Summary!A1".into())),
+                ]),
+            )
+        };
+        call(&mut a).unwrap();
+        assert_eq!(value(&a, 2, 0, 0), Some(CellValue::Number(11.0)));
+        // A protected destination refuses, whatever the active sheet.
+        a.pkg.workbook.sheets[0].set_protected(false);
+        a.pkg.workbook.sheets[2].set_protected(true);
+        let undo_len = a.undo.len();
+        let err = call(&mut a).unwrap_err();
+        assert!(err.contains("protected"), "{err}");
+        assert_eq!(a.undo.len(), undo_len);
     }
 
     #[test]
