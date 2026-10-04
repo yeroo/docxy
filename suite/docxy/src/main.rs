@@ -8204,24 +8204,27 @@ fn doc_to_docx_styled(
     };
     // Reconcile comments.xml with the tab's comment list: the base already holds the
     // comments it was loaded with, so only remove the deleted ones and add the new.
-    let existing: Vec<i32> = base
+    // Ids as written: `03` is not `3` (#971). `existing` stays what the
+    // comment list could parse, so a base whose comments it can't read
+    // (UTF-16) keeps them all.
+    let existing: Vec<String> = base
         .map(|p| {
             docxcore::comments::parse_comments(p)
-                .iter()
-                .filter_map(|c| c.id.parse().ok())
+                .into_iter()
+                .map(|c| c.id)
                 .collect()
         })
         .unwrap_or_default();
-    let current: HashSet<i32> = comments.iter().filter_map(|c| c.id.parse().ok()).collect();
+    let current: HashSet<&str> = comments.iter().map(|c| c.id.as_str()).collect();
     for id in &existing {
-        if !current.contains(id) {
-            pkg.remove_comment(*id);
+        if !current.contains(id.as_str()) {
+            pkg.remove_comment_id(id);
         }
     }
-    let existing_set: HashSet<i32> = existing.iter().copied().collect();
+    let existing_set: HashSet<&str> = existing.iter().map(String::as_str).collect();
     for c in comments {
         if let Ok(id) = c.id.parse::<i32>() {
-            if !existing_set.contains(&id) {
+            if !existing_set.contains(c.id.as_str()) {
                 pkg.add_comment(id, &c.author, &c.initials, &c.date, &c.text);
             }
         }

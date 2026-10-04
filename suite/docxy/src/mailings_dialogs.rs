@@ -687,10 +687,9 @@ fn apply(tab: &mut DocTab, d: &Dialog) -> Result<(), String> {
             });
             insert_labels(&mut sheet, &spec, &LabelFill::Same(address));
             pkg.document = sheet.doc;
-            for c in docxcore::comments::parse_comments(&pkg) {
-                if let Ok(id) = c.id.parse() {
-                    pkg.remove_comment(id);
-                }
+            // Every one, by the id as written, whatever the list can parse.
+            for id in pkg.comment_ids() {
+                pkg.remove_comment_id(&id);
             }
             pkg.set_mail_merge(None);
             tab.mail.new_tab = Some((pkg, "Labels1.docx".into()));

@@ -605,3 +605,24 @@ fn highlight_and_normal_document() {
     assert!(mail_checked(&t.mail, MailAct::NormalDocument));
     assert!(mail_apply(&mut t, MailAct::Preview).is_err());
 }
+
+/// #971 FIX r2 f3: Labels drops every comment of this document, also one
+/// in a comments.xml the comment list can't read (UTF-16).
+#[test]
+fn labels_drop_comments_the_list_cannot_read() {
+    let mut t = letter_tab();
+    let pkg = t.pkg.as_mut().unwrap();
+    pkg.insert_comment_xml("<w:comment w:id=\"03\" w:author=\"Ann\"><w:p/></w:comment>");
+    let xml = pkg.part_text("word/comments.xml").unwrap();
+    let mut bytes = vec![0xff, 0xfe];
+    for unit in xml.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    assert!(pkg.set_part("word/comments.xml", bytes));
+    assert_eq!(pkg.comment_ids(), ["03"]);
+    open_dialog(&mut t, MailAct::Labels);
+    set(&mut t, "address", Json::Str("Jane".into()));
+    dialog_click(&mut t, "New Document").unwrap();
+    let (pkg, _) = t.mail.new_tab.take().unwrap();
+    assert!(pkg.comment_ids().is_empty());
+}

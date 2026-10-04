@@ -819,8 +819,9 @@ struct TrackedComment {
     /// its markers, written back as is when an undo restores them: a
     /// loaded comment's paragraphs, formatting and `w14:paraId` survive.
     /// `None` while it has not been deleted, or when `pkg` held no XML for
-    /// it then (added and never saved, or an id that isn't a number): a
-    /// restore then writes it from `comment`.
+    /// it then (added and never saved): a restore then writes it from
+    /// `comment`, which needs a numeric id (new comments always have one;
+    /// any other is not written back).
     raw: Option<String>,
     /// Where it sat in `comments`, so a restored one goes back there.
     index: usize,
@@ -3013,23 +3014,20 @@ impl App {
             return;
         }
         let live = self.comment_marker_ids_everywhere();
-        let saved: std::collections::HashSet<String> =
-            docxcore::comments::parse_comments(&self.pkg)
-                .into_iter()
-                .map(|c| c.id)
-                .collect();
+        // Ids as written, from the part as decoded: `03` is not `3`, and a
+        // UTF-16 part's comments count (#971).
+        let saved: std::collections::HashSet<String> = self.pkg.comment_ids().into_iter().collect();
         for (id, t) in &self.tracked_comments {
-            let Ok(n) = id.parse::<i32>() else {
-                continue;
-            };
             let c = &t.comment;
             match (live.contains(id), saved.contains(id), &t.raw) {
                 (true, false, Some(raw)) => self.pkg.insert_comment_xml(raw),
                 (true, false, None) => {
-                    self.pkg
-                        .add_comment(n, &c.author, &c.initials, &c.date, &c.text)
+                    if let Ok(n) = id.parse::<i32>() {
+                        self.pkg
+                            .add_comment(n, &c.author, &c.initials, &c.date, &c.text)
+                    }
                 }
-                (false, true, _) => self.pkg.remove_comment(n),
+                (false, true, _) => self.pkg.remove_comment_id(id),
                 _ => {}
             }
         }
@@ -3058,21 +3056,18 @@ impl App {
         if self.hf_edit.is_some() {
             self.editor.remove_comment_markers(&c.id);
         }
-        let n = c.id.parse::<i32>().ok();
         if self.comment_marker_ids_everywhere().contains(&c.id) {
             self.tracked_comments.remove(&c.id);
-            if let Some(n) = n {
-                self.pkg.remove_comment(n);
-            }
+            self.pkg.remove_comment_id(&c.id);
         } else if let Some(t) = self.tracked_comments.get_mut(&c.id) {
             t.index = idx;
             // A comment added this session and saved since is in `pkg`
             // now: keep that XML too.
             if t.raw.is_none() {
-                t.raw = n.and_then(|n| self.pkg.comment_xml(n));
+                t.raw = self.pkg.comment_xml(&c.id);
             }
         } else {
-            let raw = n.and_then(|n| self.pkg.comment_xml(n));
+            let raw = self.pkg.comment_xml(&c.id);
             self.tracked_comments.insert(
                 c.id.clone(),
                 TrackedComment {
@@ -11851,13 +11846,65 @@ mod tests {
         let mut app = app_with(&["The quick brown fox."]);
         add_comment_by_keys(&mut app, "Colour?");
         let path = save_to_temp(&mut app, "cmt-session-raw");
-        let written = app.pkg.comment_xml(1).expect("saved");
+        let written = app.pkg.comment_xml("1").expect("saved");
         app.run_act(ribbon::Act::DeleteComment);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         assert_eq!(
             app.tracked_comments.get("1").and_then(|t| t.raw.as_deref()),
             Some(written.as_str())
         );
+    }
+
+    /// "The quick brown fox." with loaded comments `03` and `3` around it:
+    /// one id as some producer wrote it, one that reads as the same number.
+    fn app_with_03_and_3() -> App {
+        let mut ed = Editor::new(Document {
+            body: vec![Block::Paragraph(MPara {
+                props: ParProps::default(),
+                content: vec![Inline::Run(Run {
+                    text: "The quick brown fox.".into(),
+                    props: RunProps::default(),
+                })],
+            })],
+        });
+        for id in ["03", "3"] {
+            ed.select_all();
+            assert!(ed.add_comment(id));
+        }
+        let mut pkg = new_package(ed.doc);
+        pkg.insert_comment_xml(ZERO_THREE);
+        pkg.insert_comment_xml(THREE);
+        let mut app = App::new(pkg, "test.docx", false);
+        app.os_clip = None;
+        app
+    }
+
+    const ZERO_THREE: &str = "<w:comment w:author=\"Ann\" w:id=\"03\"><w:p><w:r><w:t>oh-three</w:t></w:r></w:p></w:comment>";
+    const THREE: &str =
+        "<w:comment w:id=\"3\" w:author=\"Bob\"><w:p><w:r><w:t>three</w:t></w:r></w:p></w:comment>";
+
+    /// #971 FIX r2 f4: Delete Comment of `w:id="03"` leaves it out of the
+    /// save and leaves comment 3 alone; its undo writes `03` back verbatim.
+    #[test]
+    fn delete_comment_matches_the_id_as_written() {
+        let mut app = app_with_03_and_3();
+        let at = comment_ids(&app)
+            .iter()
+            .position(|id| id == "03")
+            .expect("03 loaded");
+        app.comment_sel = at;
+        app.run_act(ribbon::Act::DeleteComment);
+        assert_eq!(comment_ids(&app), ["3"]);
+        let path = save_to_temp(&mut app, "cmt-03");
+        let (_, comments) = saved_parts(&path);
+        assert_eq!(saved_comment_ids(&comments), ["3"], "{comments}");
+        assert!(comments.contains(THREE), "{comments}");
+        app.on_key(ctrl(KeyCode::Char('z')));
+        app.save();
+        let (_, comments) = saved_parts(&path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        assert!(comments.contains(ZERO_THREE), "{comments}");
+        assert!(comments.contains(THREE), "{comments}");
     }
 
     /// #971 A14: a comment an undo restores goes back to its place in the

@@ -592,3 +592,53 @@ fn remove_all_clears_a_comment_whose_id_is_not_canonical() {
     assert!(!doc.contains("w:id=\"03\""), "{doc}");
     assert!(!comments.contains("<w:comment "), "{comments}");
 }
+
+/// #971 FIX r2 f4: Delete Comment of `w:id="03"` leaves it out of the
+/// save and comment 3 (the same number, written plainly) in it.
+#[test]
+fn delete_comment_matches_the_id_as_written() {
+    let three =
+        "<w:comment w:id=\"3\" w:author=\"Bob\"><w:p><w:r><w:t>three</w:t></w:r></w:p></w:comment>";
+    let mut ed = docxcore::editor::Editor::new(docxcore::markdown::from_markdown(FOX));
+    for id in ["03", "3"] {
+        ed.select_all();
+        assert!(ed.add_comment(id));
+    }
+    let mut pkg = new_package(ed.doc);
+    pkg.insert_comment_xml("<w:comment w:author=\"Ann\" w:id=\"03\"><w:p/></w:comment>");
+    pkg.insert_comment_xml(three);
+    let dir = Scratch::new();
+    let (mut tab, path) = docx_tab(&dir, &pkg);
+    delete_doc_comment(&mut tab, "03");
+    assert_eq!(listed_ids(&tab), ["3"]);
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    let (doc, comments) = saved(&path);
+    assert!(!doc.contains("w:id=\"03\""), "{doc}");
+    assert_eq!(comment_ids(&comments), ["3"], "{comments}");
+    assert!(comments.contains(three), "{comments}");
+}
+
+/// #971 FIX r2 f2: a comment added to a document whose comments.xml is
+/// UTF-16 is saved beside the original, both readable.
+#[test]
+fn a_new_comment_joins_a_utf16_comments_part() {
+    let dir = Scratch::new();
+    let (mut tab, path) = docx_tab(&dir, &utf16_comments_package());
+    let id = comment(&mut tab, "Colour?");
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    let saved_pkg = load_package(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(
+        saved_pkg
+            .part("word/comments.xml")
+            .unwrap()
+            .starts_with(&[0xff, 0xfe])
+    );
+    let (_, comments) = saved(&path);
+    assert!(comments.contains(RICH), "{comments}");
+    assert!(comments.contains(REORDERED), "{comments}");
+    assert_eq!(
+        saved_pkg.comment_ids(),
+        ["1".to_string(), "2".to_string(), id.to_string()]
+    );
+    assert!(comments.contains("Colour?"), "{comments}");
+}
