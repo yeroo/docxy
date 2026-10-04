@@ -3239,6 +3239,7 @@ mod tests {
             totals_rows: 0,
             columns: vec!["Item".into(), "Qty".into(), "Amount".into()],
             part: String::new(),
+            column_ids: Vec::new(),
         });
         let mut eng = Engine::new(&wb);
         eng.recalc_all(&mut wb);
@@ -5005,6 +5006,7 @@ mod tests {
             totals_rows: 0,
             columns: vec!["Qty".into(), "Price".into()],
             part: String::new(),
+            column_ids: Vec::new(),
         });
         let mut eng = Engine::new(&wb);
         eng.recalc_all(&mut wb);
@@ -5040,6 +5042,7 @@ mod tests {
             totals_rows: 0,
             columns: vec!["Qty".into(), "Price".into()],
             part: String::new(),
+            column_ids: Vec::new(),
         });
         // A defined name whose definition is the bare table name.
         wb.defined_names.push(crate::sheet::DefinedName {
@@ -5085,6 +5088,7 @@ mod tests {
             totals_rows: 0,
             columns: vec!["Item".into(), "Qty".into(), "Price".into(), "Calc".into()],
             part: String::new(),
+            column_ids: Vec::new(),
         });
         wb
     }
@@ -5298,6 +5302,7 @@ mod tests {
             totals_rows: 0,
             columns: vec!["Qty".into(), "Price".into(), "Amount".into()],
             part: String::new(),
+            column_ids: Vec::new(),
         });
         let mut eng = Engine::new(&wb);
         let scalar = [

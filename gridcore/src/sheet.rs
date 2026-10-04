@@ -1697,6 +1697,12 @@ pub struct Table {
     pub totals_rows: u32,
     /// Column names, left to right.
     pub columns: Vec<String>,
+    /// The `tableColumn id` of each column in [`Self::columns`], so a save
+    /// finds a column's element again after a rename; 0 for a column the
+    /// part doesn't have yet. Empty when unknown (a table not loaded from a
+    /// part, or one whose ids don't tell its columns apart): the save then
+    /// matches columns by name.
+    pub column_ids: Vec<u32>,
     /// The xl/tables/*.xml part backing this table (its `ref` is patched on
     /// save when the range moved).
     pub part: String,
@@ -1740,16 +1746,18 @@ impl Table {
     }
 }
 
-/// A table converted to a range whose part is still in the package (see
-/// [`Workbook::removed_tables`]). The column formulas other table parts hold
-/// that name it are converted at save as the cell formulas were: with its
-/// geometry as converted, then through each row/column edit made on its sheet
-/// since ([`crate::formula::adjust_for_edit`], the same rewrite the cells
-/// went through), so both read the same cells.
+/// A table converted to a range, or deleted with all its columns, whose part
+/// is still in the package (see [`Workbook::removed_tables`]). The column
+/// formulas other table parts hold that name it are converted at save as the
+/// cell formulas were: with its geometry as it was removed, then through each
+/// row/column edit made on its sheet since ([`crate::formula::adjust_for_edit`],
+/// the same rewrite the cells went through), so both read the same cells. A
+/// deleted table's columns went with that delete (its first edit), so those
+/// formulas go `#REF!`, as its cell formulas did.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RemovedTable {
     pub table: Table,
-    /// The row/column edits on its sheet since it was converted, in order.
+    /// The row/column edits on its sheet since it was removed, in order.
     pub edits: Vec<crate::formula::EditShift>,
 }
 
@@ -1771,7 +1779,8 @@ pub struct Workbook {
     pub defined_names: Vec<DefinedName>,
     pub tables: Vec<Table>,
     /// Tables converted to a range ([`crate::edit::convert_table_to_range`])
-    /// whose parts are still in the package: a save drops each part that no
+    /// or deleted with all their columns ([`crate::edit::delete_cols`]) whose
+    /// parts are still in the package: a save drops each part that no
     /// table in [`Self::tables`] uses any more, together with its
     /// relationship, `<tablePart>` and content type. Only parts named here
     /// are ever dropped, so a table part the loader couldn't read is kept.
