@@ -146,9 +146,16 @@ pub fn tiled_block(
 /// doesn't reach keeps its text exactly, and a shared formula held verbatim
 /// is left alone, as an insert or delete leaves it.
 pub fn move_refs(wb: &mut Workbook, src: usize, mv: &CellMove) {
+    move_refs_with(wb, src, mv, true);
+}
+
+/// [`move_refs`], with conditional-format and validation rule formulas left
+/// alone unless `rules`: for a move whose rules' ranges stay put (the data
+/// form's Delete), so each rule keeps reading relative to its own range.
+pub(super) fn move_refs_with(wb: &mut Workbook, src: usize, mv: &CellMove, rules: bool) {
     let names: Vec<String> = wb.sheets.iter().map(|s| s.name.clone()).collect();
     let (r0, c0, r1, c1) = mv.rect;
-    rewrite_workbook_formulas(wb, |e, (sheet, cell)| {
+    rewrite_workbook_formulas(wb, rules, |e, (sheet, cell)| {
         let moved = sheet == Some(src)
             && cell.is_some_and(|(r, c)| (r0..=r1).contains(&r) && (c0..=c1).contains(&c));
         if moved {

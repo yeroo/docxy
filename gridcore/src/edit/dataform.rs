@@ -7,7 +7,8 @@
 //! that a new record made adjacent. These are the form's edits and searches;
 //! the app supplies the dialog.
 
-use super::{Area, array_rect, fill_changes, move_refs};
+use super::clip::move_refs_with;
+use super::{Area, array_rect, fill_changes, move_own_array_ref};
 use crate::engine::cell_to_value;
 use crate::formula::{CellMove, Value, db_criterion_matches, move_block_formula};
 use crate::sheet::{Cell, CellValue, MAX_ROWS, Sheet, Workbook, is_array_f};
@@ -94,17 +95,24 @@ pub fn new_record_changes(
     Ok(changes)
 }
 
-/// Whether deleting the record in `row` of `area` would move or cut part of
-/// an array: some array formula's cells (its anchor and the block it spills
-/// or fills, or the `ref` a legacy CSE formula with one value owns) lie in
-/// the list's columns from `row` down to the last record.
-/// Delete is refused then, as a cut that splits an array is.
+/// Whether deleting the record in `row` of `area` would cut an array: some
+/// array formula's block (the cells it spills or fills, or the `ref` a
+/// legacy CSE formula with one value owns) has cells in the list's columns
+/// from `row` down to the last record without going whole. A block goes
+/// whole when it lies in the list's columns on one row: deleted with the
+/// record, or moved up a row with the records below it (a column of
+/// one-cell array formulas, say). Delete is refused then, as a cut that
+/// splits an array is.
 pub fn delete_splits_array(s: &Sheet, (_, c1, bottom, c2): Area, row: u32) -> bool {
-    let hits =
-        |r1: u32, k1: u32, r2: u32, k2: u32| r1 <= bottom && r2 >= row && k1 <= c2 && k2 >= c1;
     s.cells.iter().any(|(&(r, c), cell)| {
         let (h, w) = array_rect(cell, (r, c)).unwrap_or((1, 1));
-        (cell.is_array_formula() || h * w > 1) && hits(r, c, r + h - 1, c + w - 1)
+        if !cell.is_array_formula() && h * w == 1 {
+            return false;
+        }
+        let (r2, k2) = (r + h - 1, c + w - 1);
+        let touches = r <= bottom && r2 >= row && c <= c2 && k2 >= c1;
+        let whole = h == 1 && c >= c1 && k2 <= c2;
+        touches && !whole
     })
 }
 
@@ -113,11 +121,12 @@ pub fn delete_splits_array(s: &Sheet, (_, c1, bottom, c2): Area, row: u32) -> bo
 /// list's last row is left blank; cells beside the list stay where they are.
 /// A reference to a moved cell follows it, a reference to a deleted cell (a
 /// range: both corners) becomes `#REF!`, and the moved cells' own formulas
-/// move with them ([`move_refs`], as a cut does). A range only partly in the
+/// move with them ([`super::move_refs`], as a cut does). A range only partly in the
 /// moved cells keeps its text (`SUM(B3:B4)` with row 3 deleted still reads
 /// `B3:B4`). Comments, merges, hyperlinks, and conditional-format and
-/// validation ranges don't move. The caller refuses a delete that would
-/// move part of an array first ([`delete_splits_array`]).
+/// validation ranges don't move, so their rules' formulas are left as they
+/// are too. A moved array anchor takes its `ref` along. The caller refuses
+/// a delete that would cut an array first ([`delete_splits_array`]).
 pub fn delete_record(wb: &mut Workbook, sheet: usize, (_, c1, bottom, c2): Area, row: u32) {
     let name = wb.sheets[sheet].name.clone();
     // Pushed off the grid, a reference to the deleted cells is poisoned.
@@ -128,14 +137,14 @@ pub fn delete_record(wb: &mut Workbook, sheet: usize, (_, c1, bottom, c2): Area,
         dr: -i64::from(MAX_ROWS),
         dc: 0,
     };
-    move_refs(wb, sheet, &gone);
+    move_refs_with(wb, sheet, &gone, false);
     let up = CellMove {
         rect: (row + 1, c1, bottom, c2),
         dr: -1,
         ..gone
     };
     if row < bottom {
-        move_refs(wb, sheet, &up);
+        move_refs_with(wb, sheet, &up, false);
     }
     let s = &mut wb.sheets[sheet];
     for c in c1..=c2 {
@@ -157,6 +166,7 @@ pub fn delete_record(wb: &mut Workbook, sheet: usize, (_, c1, bottom, c2): Area,
                     cell.formula = Some(moved);
                 }
             }
+            move_own_array_ref(&mut cell, (r, c), r - 1);
             s.cells.insert((r - 1, c), cell);
         }
     }
@@ -418,22 +428,104 @@ mod tests {
             !delete_splits_array(&wb.sheets[0], AREA, 2),
             "above the deleted row"
         );
-        // A one-cell CSE array formula in a moved row.
+        // A one-cell CSE array formula goes whole: moved up, or deleted.
         let mut wb = list();
         let c = wb.sheets[0].cells.get_mut(&(3, 2)).unwrap();
-        c.f_attrs = Some("t=\"array\" ref=\"C4\"".into());
-        assert!(delete_splits_array(&wb.sheets[0], AREA, 1));
-        assert!(delete_splits_array(&wb.sheets[0], AREA, 3));
+        c.f_attrs = Some(" t=\"array\" ref=\"C4\"".into());
+        assert!(!delete_splits_array(&wb.sheets[0], AREA, 1));
+        assert!(!delete_splits_array(&wb.sheets[0], AREA, 3));
+        // A spill reaching into the list from beside it is cut.
+        let mut wide = Cell::formula("SEQUENCE(1,3)");
+        wide.spill = Some((1, 3));
+        wb.sheets[0].set_cell(2, 5, wide.clone());
+        assert!(
+            !delete_splits_array(&wb.sheets[0], AREA, 1),
+            "outside the columns"
+        );
+        wb.sheets[0].cells.remove(&(2, 5));
+        wb.sheets[0].set_cell(2, 1, wide);
+        assert!(
+            delete_splits_array(&wb.sheets[0], AREA, 1),
+            "runs past column C"
+        );
         // A legacy CSE block with one value (no spill extent) owns its `ref`.
         let mut wb = list();
         let mut cse = Cell::formula("SUM(B2:B4)");
         cse.value = CellValue::Number(117.0);
-        cse.f_attrs = Some("t=\"array\" ref=\"C2:C4\"".into());
+        cse.f_attrs = Some(" t=\"array\" ref=\"C2:C4\"".into());
         wb.sheets[0].set_cell(1, 2, cse);
         wb.sheets[0].cells.remove(&(2, 2));
         wb.sheets[0].cells.remove(&(3, 2));
         assert!(delete_splits_array(&wb.sheets[0], AREA, 2));
         assert!(delete_splits_array(&wb.sheets[0], AREA, 3));
+    }
+
+    #[test]
+    fn delete_moves_one_cell_arrays_and_their_refs() {
+        let mut pkg = crate::xlsx::new_xlsx();
+        pkg.workbook = list();
+        for r in 1..=3 {
+            let c = pkg.workbook.sheets[0].cells.get_mut(&(r, 2)).unwrap();
+            c.f_attrs = Some(format!(" t=\"array\" ref=\"C{}\"", r + 1));
+        }
+        let s = &pkg.workbook.sheets[0];
+        assert!(!delete_splits_array(s, AREA, 1));
+        delete_record(&mut pkg.workbook, 0, AREA, 1);
+        let attrs = |wb: &Workbook, r, c| wb.sheets[0].cell(r, c).and_then(|x| x.f_attrs.clone());
+        let at = |r: u32| Some(format!(" t=\"array\" ref=\"C{}\"", r + 1));
+        assert_eq!(attrs(&pkg.workbook, 1, 2), at(1));
+        assert_eq!(attrs(&pkg.workbook, 2, 2), at(2));
+        assert_eq!(formula(&pkg.workbook, 1, 2).as_deref(), Some("B2*2"));
+        assert!(pkg.workbook.sheets[0].cell(3, 2).is_none());
+        // Saved and read back, each block is its own cell.
+        let back = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&pkg)).unwrap();
+        for r in 1..=2 {
+            let fa = attrs(&back.workbook, r, 2).unwrap();
+            assert!(fa.contains(&format!("ref=\"C{}\"", r + 1)), "{fa}");
+        }
+        // The last record's one-cell array goes with it.
+        let mut wb = list();
+        let c = wb.sheets[0].cells.get_mut(&(3, 2)).unwrap();
+        c.f_attrs = Some(" t=\"array\" ref=\"C4\"".into());
+        assert!(!delete_splits_array(&wb.sheets[0], AREA, 3));
+        delete_record(&mut wb, 0, AREA, 3);
+        assert!(wb.sheets[0].cell(3, 2).is_none());
+    }
+
+    #[test]
+    fn delete_leaves_rule_formulas_alone() {
+        use crate::sheet::{CfKind, CfRule, CondFormat, DataValidation};
+        let mut wb = list();
+        let s = &mut wb.sheets[0];
+        s.cond_formats.push(CondFormat {
+            ranges: vec![(1, 0, 3, 2)],
+            rules: vec![CfRule {
+                kind: CfKind::Expression {
+                    formula: "$B2>10".into(),
+                },
+                dxf_id: None,
+                priority: 1,
+            }],
+            ix: None,
+        });
+        s.validations.push(DataValidation {
+            ranges: vec![(1, 1, 3, 1)],
+            kind: "custom".into(),
+            operator: String::new(),
+            formula1: "ISNUMBER(B2)".into(),
+            formula2: String::new(),
+            prompt: None,
+            ix: None,
+        });
+        delete_record(&mut wb, 0, AREA, 1);
+        let s = &wb.sheets[0];
+        assert_eq!(
+            s.cond_formats[0].rules[0].formulas(),
+            [&"$B2>10".to_string()]
+        );
+        assert_eq!(s.cond_formats[0].ranges, [(1, 0, 3, 2)]);
+        assert_eq!(s.validations[0].formula1, "ISNUMBER(B2)");
+        assert_eq!(s.validations[0].ranges, [(1, 1, 3, 1)]);
     }
 
     #[test]

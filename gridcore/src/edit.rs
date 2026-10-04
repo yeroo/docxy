@@ -511,7 +511,7 @@ fn sort_span(s: &Sheet, r1: u32, r2: u32) -> Option<(u32, u32)> {
 /// ([`array_rect`]) at the new row. Left behind, it would name the old rows:
 /// the cached block of an anchor the engine can't evaluate would no longer
 /// count as its own, and a CSE block would save as its anchor alone.
-fn move_own_array_ref(cell: &mut Cell, (from, col): (u32, u32), to: u32) {
+pub(super) fn move_own_array_ref(cell: &mut Cell, (from, col): (u32, u32), to: u32) {
     let Some((h, w)) = array_rect(cell, (from, col)) else {
         return;
     };
@@ -1700,10 +1700,15 @@ pub fn table_range_conflict(
 type FormulaSite = (Option<usize>, Option<(u32, u32)>);
 
 /// Rewrite every formula a table rename or conversion can reach: cell
-/// formulas (array formulas included), defined names, and conditional-format
-/// and data-validation rules. A formula `f` leaves unchanged keeps its text
-/// exactly; one held verbatim (a shared or data-table formula) is left alone.
-fn rewrite_workbook_formulas(wb: &mut Workbook, f: impl Fn(&Expr, FormulaSite) -> Expr) {
+/// formulas (array formulas included), defined names, and, with `rules`,
+/// conditional-format and data-validation rules. A formula `f` leaves
+/// unchanged keeps its text exactly; one held verbatim (a shared or
+/// data-table formula) is left alone.
+fn rewrite_workbook_formulas(
+    wb: &mut Workbook,
+    rules: bool,
+    f: impl Fn(&Expr, FormulaSite) -> Expr,
+) {
     for (s, sheet) in wb.sheets.iter_mut().enumerate() {
         for (&(r, c), cell) in sheet.cells.iter_mut() {
             let Some(src) = &cell.formula else {
@@ -1715,6 +1720,9 @@ fn rewrite_workbook_formulas(wb: &mut Workbook, f: impl Fn(&Expr, FormulaSite) -
             if let Some(updated) = rewrite_if_changed(src, |e| f(e, (Some(s), Some((r, c))))) {
                 cell.formula = Some(updated);
             }
+        }
+        if !rules {
+            continue;
         }
         for_each_rule_formula(sheet, |src| {
             if let Some(updated) = rewrite_if_changed(src, |e| f(e, (Some(s), None))) {
@@ -1767,7 +1775,9 @@ pub fn rename_table(wb: &mut Workbook, old: &str, new: &str) -> Result<(), Strin
         return Ok(());
     }
     let map = [(cur.clone(), new.to_string())];
-    rewrite_workbook_formulas(wb, |e, _| crate::formula::rename_tables_in_expr(e, &map));
+    rewrite_workbook_formulas(wb, true, |e, _| {
+        crate::formula::rename_tables_in_expr(e, &map)
+    });
     for piv in &mut wb.pivots {
         if let crate::pivot::PivotSource::Table(n) = &mut piv.source {
             if n.eq_ignore_ascii_case(&cur) {
@@ -1919,7 +1929,7 @@ pub fn convert_table_to_range(wb: &mut Workbook, name: &str) -> Result<(), Strin
         sheet_name: &sheet_name,
         info: &info,
     };
-    rewrite_workbook_formulas(wb, |e, (s, cell)| {
+    rewrite_workbook_formulas(wb, true, |e, (s, cell)| {
         let host = crate::formula::FormulaHost {
             same_sheet: s == Some(t.sheet),
             row: cell.map(|(r, _)| r),
